@@ -246,13 +246,3 @@ If you are evaluating the codebase, start with:
 3. `src/app/`
 4. `src/gateway/`
 5. `docs/user/runtime-execution-model.md`
-
-## Inspiration for This README Structure
-
-This README intentionally follows a structure closer to project-facing agent repositories that lead with product positioning, fast onboarding, operational workflows, and system capabilities, while still reflecting Metis-specific behavior and commands.
-
-Reference repositories consulted for structure and tone:
-
-- OpenClaw: https://github.com/openclaw/openclaw
-- Hermes Agent: https://github.com/NousResearch/hermes-agent
-- Evolver: https://github.com/EvoMap/evolver
