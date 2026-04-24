@@ -55,16 +55,16 @@ public class GatewayControlUiHelpersTest {
     public func recentMessagesResolveUnifiedAgentStore(): Unit {
         withGatewayControlUiHelpersTestHome {
             let user = GatewayUserSettings()
-            let store = gatewaySessionStoreForUserWithAgentId(user, "main")
-            let sessionKey = "cli:main"
+            let store = gatewaySessionStoreForUserWithAgentId(user, "general")
+            let sessionKey = "agent:general:main"
             store.deleteSession(sessionKey)
             store.appendUser(sessionKey, "hello")
             store.appendAssistant(sessionKey, "world")
 
             let lines = gatewayControlUiBuildRecentMessagesResolved(user, [sessionKey], 10)
             @Expect(lines.size, 2)
-            @Expect(lines[0].contains("CLI [user] hello"), true)
-            @Expect(lines[1].contains("CLI [assistant] world"), true)
+            @Expect(lines[0].contains("main [user] hello"), true)
+            @Expect(lines[1].contains("main [assistant] world"), true)
 
             store.deleteSession(sessionKey)
         }
@@ -74,8 +74,8 @@ public class GatewayControlUiHelpersTest {
     public func recentMessagesForConversationsUseDisplayName(): Unit {
         withGatewayControlUiHelpersTestHome {
             let user = GatewayUserSettings()
-            let store = gatewaySessionStoreForUserWithAgentId(user, "main")
-            let sessionKey = "cli:main"
+            let store = gatewaySessionStoreForUserWithAgentId(user, "general")
+            let sessionKey = "agent:general:main"
             store.deleteSession(sessionKey)
             store.appendUser(sessionKey, "hello")
             store.appendAssistant(sessionKey, "world")
@@ -87,8 +87,8 @@ public class GatewayControlUiHelpersTest {
                 10
             )
             @Expect(lines.size, 2)
-            @Expect(lines[0].contains("CLI [user] hello"), true)
-            @Expect(lines[1].contains("CLI [assistant] world"), true)
+            @Expect(lines[0].contains("main [user] hello"), true)
+            @Expect(lines[1].contains("main [assistant] world"), true)
 
             store.deleteSession(sessionKey)
         }

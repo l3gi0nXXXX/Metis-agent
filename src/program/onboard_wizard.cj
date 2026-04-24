@@ -72,37 +72,6 @@ private func printOnboardHeader(): Unit {
     PrintUtils.printLine("")
 }
 
-private func printSecurityNote(): Unit {
-    let text =
-        "Security warning — please read.\n" +
-        "\n" +
-        "Metis is a hobby project and still in beta. Expect sharp edges.\n" +
-        "By default, Metis is a personal agent: one trusted operator boundary.\n" +
-        "This bot can read files and run actions if tools are enabled.\n" +
-        "A bad prompt can trick it into doing unsafe things.\n" +
-        "\n" +
-        "Metis is not a hostile multi-tenant boundary by default.\n" +
-        "If multiple users can message one tool-enabled agent, they share that delegated tool authority.\n" +
-        "\n" +
-        "If you are not comfortable with security hardening and access control, do not run Metis.\n" +
-        "Ask someone experienced to help before enabling tools or exposing it to the internet.\n" +
-        "\n" +
-        "Recommended baseline:\n" +
-        "- Pairing/allowlists + mention gating.\n" +
-        "- Multi-user/shared inbox: split trust boundaries (separate gateway/credentials, ideally separate OS users/hosts).\n" +
-        "- Sandbox + least-privilege tools.\n" +
-        "- Shared inboxes: isolate DM sessions (`session.dmScope: per-channel-peer`) and keep tool access minimal.\n" +
-        "- Keep secrets out of the agent's reachable filesystem.\n" +
-        "- Use the strongest available model for any bot with tools or untrusted inboxes.\n" +
-        "\n" +
-        "Run regularly:\n" +
-        "metis security audit --deep\n" +
-        "metis security audit --fix\n" +
-        "\n" +
-        "Must read: https://docs.metis.ai/gateway/security\n"
-    PrintUtils.printNoteBox("Security", text)
-}
-
 private func promptRiskAcceptance(): Bool {
     PrintUtils.printNoteBox(
         "Confirm",
@@ -1058,7 +1027,6 @@ public func runOnboardWizard(): Int64 {
     let root = loadOnboardRoot()
 
     printOnboardHeader()
-    printSecurityNote()
     if (!promptRiskAcceptance()) {
         PrintUtils.printLine("Onboarding cancelled.")
         return CLI_EXIT_USAGE_ERROR

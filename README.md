@@ -4,9 +4,9 @@
 
 
 
-Metis is a Cangjie-native agent runtime for building a personal AI assistant that can work through the terminal, structured tools, MCP, scheduled jobs, workspace memory, and multi-channel gateways.
+Metis is a high performance and personal AI assistant which is build with Cangjie program language. And this project is based on magic-cli and CangjeMagic.
 
-It combines an interactive CLI, a unified Gateway-first runtime, channel adapters, skills, persistent sessions, and operational surfaces for running agents in real workflows instead of one-off chat demos.
+It combines an interactive CLI, a unified Gateway-first runtime, channel adapters, skills, persistent sessions, and operational surfaces for running agents in real workflows instead of one-off chat demos. Supported channels include: Telegram, QQ, Feishu.
 
 ## Why Metis
 
@@ -24,74 +24,20 @@ That gives the project a few defining characteristics:
 - Channel delivery for Feishu, QQ, Telegram, and plugin-driven IM integrations
 - Control and observability surfaces for dashboard, HTTP, and runtime inspection
 
-## Highlights
-
-### Unified Runtime
-
-Metis routes its default interactive and `agent --message` flows through the unified Gateway main runtime rather than treating the gateway as an optional sidecar. CLI, dashboard, control UI, and IM-facing entry points are converging on the same runtime profile and tool surface.
-
-### Practical Tooling
-
-The runtime includes real toolsets for filesystem access, shell execution, weather, planning, session transcripts, managed sessions, gateway operations, message delivery, memory access, and cron orchestration.
-
-### Skills and Memory
-
-Metis supports discoverable skills from bundled, user, and workspace directories. It also maintains durable memory and session transcripts, with local indexing and promotion flows for workspace knowledge.
-
-### Channel and Gateway Operations
-
-Metis is not limited to a terminal assistant. It can serve as a gateway-backed agent system that connects to built-in or plugin-based channels and exposes status, configuration, policy, session, and runtime controls.
-
-## Feature Overview
-
-### Core Agent Experience
-
-- Interactive CLI chat
-- Single-turn agent execution
-- Explicit embedded local fallback mode
-- Conversation save and resume flows
-- Project-level instruction injection through `AGENTS.md`
-- Custom prompt commands via `/cmd`
-- Custom subagents via `AGENT.md`
-
-### Runtime and Operations
-
-- Unified Gateway runtime
-- Gateway control and health surfaces
-- Dashboard and control UI support
-- Managed sessions and transcript inspection
-- Runtime policy and authorization hooks
-- Telemetry and OpenTelemetry-related modules
-
-### Automation and Extension
-
-- Cron-based recurring agent jobs
-- MCP server management and MCP bridge support
-- Skill discovery, inspection, installation, and execution
-- Plugin-based channel and gateway integrations
-
-### Channel Support
-
-- Feishu
-- QQ
-- Telegram
-- Plugin-backed IM channels such as DingTalk, Weixin, and generic webhook-style integrations
-
 ## Quick Start
 
 ### Prerequisites
 
 - Cangjie `1.0.0+`
-- A working `MAGIC_PATH` that points to your Cangjie Magic installation
-- brew install openssl3 
-- export DYLD_LIBRARY_PATH="/opt/homebrew/opt/openssl@3/lib:$DYLD_LIBRARY_PATH"
+- A working `MAGIC_PATH` that points to your Cangjie Magic installation: https://gitcode.com/Cangjie-TPC/CangjieMagic
+- install openssl3 and config DYLD_LIBRARY_PATH in env
 - Model provider credentials stored in `~/.metis/metis.json`
 
 ### 1. Configure env
 
 ```bash
 export MAGIC_PATH="/path/to/CangjieMagic"
-brew install openssl@3 
+brew install openssl@3
 export DYLD_LIBRARY_PATH="/opt/homebrew/opt/openssl@3/lib:$DYLD_LIBRARY_PATH"
 ```
 
@@ -107,12 +53,13 @@ cjpm run --skip-build --name metis --run-args "chat"
 
 ```bash
 cjpm run --skip-build --name metis --run-args "gateway run"
-cjpm run --skip-build --name metis --run-args "serve"
+cjpm run --skip-build --name metis --run-args "gateway serve"
 ```
 
 ### 4. Others
 
 ```bash
+cjpm run --skip-build --name metis --run-args "dashboard"
 cjpm run --skip-build --name metis --run-args "gateway help"
 ```
 
@@ -154,10 +101,10 @@ Skills are packaged as directories containing `SKILL.md` and can be discovered f
 Examples:
 
 ```text
-/weather Shanghai
 /skills list
 /skills info weather
 /skills search weather
+/weather Shanghai
 ```
 
 ### MCP
@@ -246,3 +193,13 @@ If you are evaluating the codebase, start with:
 3. `src/app/`
 4. `src/gateway/`
 5. `docs/user/runtime-execution-model.md`
+
+## Thanks
+
+This is a personal project which is based on magic-cli and CangjieMagic. I found a lot of inspiration from the OpenClaw, Evolver,  hermes-agent project.
+
+* https://gitcode.com/Cangjie-TPC/CangjieMagic
+* https://gitcode.com/cangjie-sig/magic-cli
+* https://github.com/openclaw/openclaw#
+* https://github.com/nousresearch/hermes-agent
+* https://github.com/EvoMap/evolver

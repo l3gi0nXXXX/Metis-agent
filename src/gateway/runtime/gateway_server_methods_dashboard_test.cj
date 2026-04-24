@@ -340,8 +340,8 @@ public class GatewayServerMethodsDashboardTest {
     public func dashboardRecentMessagesUseConversationDisplayName(): Unit {
         withGatewayDashboardTestHome("/tmp/metis-dashboard-recent-messages-test-home") {
             let user = GatewayUserSettings()
-            let store = gatewaySessionStoreForUserWithAgentId(user, "main")
-            let sessionKey = "cli:main"
+            let store = gatewaySessionStoreForUserWithAgentId(user, "general")
+            let sessionKey = "agent:general:main"
             store.deleteSession(sessionKey)
             store.appendUser(sessionKey, "hello")
             store.appendAssistant(sessionKey, "world")
@@ -349,8 +349,8 @@ public class GatewayServerMethodsDashboardTest {
             let views = dashboardTakeMostRecentSessionViews(user, 10)
             let lines = dashboardBuildRecentMessagesForViews(user, views, 10)
             @Expect(lines.size >= 2, true)
-            @Expect(lines[0].contains("CLI [user] hello"), true)
-            @Expect(lines[1].contains("CLI [assistant] world"), true)
+            @Expect(lines[0].contains("main [user] hello"), true)
+            @Expect(lines[1].contains("main [assistant] world"), true)
 
             store.deleteSession(sessionKey)
         }
