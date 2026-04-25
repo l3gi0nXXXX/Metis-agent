@@ -6,6 +6,7 @@ import metis.gateway.config.buildGatewayConfigFromUserSettings
 
 import magic.jsonable.*
 import std.collection.HashMap
+import std.env.setVariable
 import std.fs.{Directory, File, Path, exists, remove}
 import std.unittest.testmacro.*
 import stdx.encoding.json.{JsonArray, JsonObject, JsonString, JsonValue}
@@ -20,6 +21,14 @@ private func gatewaySkillsTestString(obj: JsonObject, key: String): String {
 
 @Test
 public class GatewayServerMethodsSkillsTest {
+    @BeforeAll
+    public func isolateMetisHome(): Unit {
+        setVariable("METIS_HOME", "/tmp/metis-gateway-server-methods-skills-test-home")
+        MetisConfigManager.invalidate()
+        CliSettingManager.invalidate()
+        SkillsPrompt.invalidate()
+    }
+
     private func clearTestState(skillDir: Path): Unit {
         SkillsPrompt.invalidate()
         setClawHubHttpGetForTest(None)

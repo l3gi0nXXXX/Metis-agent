@@ -1,6 +1,7 @@
 package metis.gateway.runtime
 
 import metis.core.config.{CliSettingManager, MetisConfigManager}
+import std.env.setVariable
 import stdx.encoding.json.JsonString
 
 import std.unittest.testmacro.*
@@ -28,6 +29,13 @@ private func gatewayRpcMutationsTestConfigRoot(): JsonObject {
 
 @Test
 public class GatewayRpcMutationsTest {
+    @BeforeAll
+    public func isolateMetisHome(): Unit {
+        setVariable("METIS_HOME", "/tmp/metis-gateway-rpc-mutations-test-home")
+        MetisConfigManager.invalidate()
+        CliSettingManager.invalidate()
+    }
+
     @TestCase
     public func configPatchStillSupportsPointPathUpdates(): Unit {
         let originalRoot = MetisConfigManager.rawConfig() ?? JsonObject()

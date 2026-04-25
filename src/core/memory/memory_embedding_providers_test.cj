@@ -2,6 +2,7 @@ package metis.core.memory
 
 import metis.core.config.MetisConfigManager
 
+import std.env.setVariable
 import std.fs.{File, exists, remove}
 import std.unittest.testmacro.*
 import stdx.encoding.json.{JsonObject, JsonString}
@@ -29,6 +30,12 @@ private func memoryEmbeddingProvidersRestoreConfigText(previous: Option<String>)
 
 @Test
 public class MemoryEmbeddingProvidersTest {
+    @BeforeAll
+    public func isolateMetisHome(): Unit {
+        setVariable("METIS_HOME", "/tmp/metis-memory-embedding-providers-test-home")
+        MetisConfigManager.invalidate()
+    }
+
     @TestCase
     public func listsBuiltinAdaptersInStableOrder(): Unit {
         clearMemoryEmbeddingProviders()

@@ -2,12 +2,19 @@ package metis.core.skills
 
 import metis.core.config.{CliConfig, MetisConfigManager}
 
+import std.env.setVariable
 import std.fs.{Directory, File, OpenMode, Path, exists, remove}
 import stdx.encoding.json.{JsonObject, JsonString}
 import std.unittest.testmacro.*
 
 @Test
 public class SkillsCommandOpsTest {
+    @BeforeAll
+    public func isolateMetisHome(): Unit {
+        setVariable("METIS_HOME", "/tmp/metis-skills-command-ops-test-home")
+        MetisConfigManager.invalidate()
+    }
+
     private func clearTestState(skillDir: Path): Unit {
         SkillsPrompt.invalidate()
         setSkillsCommandRunnerForTest(None)

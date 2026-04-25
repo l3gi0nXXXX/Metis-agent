@@ -5,6 +5,7 @@ import magic.jsonable.*
 import metis.core.config.CliConfig
 import metis.core.config.MetisConfigManager
 
+import std.env.setVariable
 import std.fs.{Directory, File, exists, remove}
 import std.unittest.testmacro.*
 import stdx.encoding.json.{JsonArray, JsonObject, JsonString, JsonValue}
@@ -59,6 +60,12 @@ private func memoryRuntimeTestRestoreConfigText(previous: Option<String>): Unit 
 
 @Test
 public class MemoryRuntimeRegistryTest {
+    @BeforeAll
+    public func isolateMetisHome(): Unit {
+        setVariable("METIS_HOME", "/tmp/metis-memory-runtime-registry-test-home")
+        MetisConfigManager.invalidate()
+    }
+
     @TestCase
     public func resolveBackendConfigCarriesResolvedMetadata(): Unit {
         let resolved = MemoryRuntimeRegistry.resolveBackendConfig(agentId: "general", purpose: "tool-search")

@@ -2,6 +2,7 @@ package metis.core.memory
 
 import metis.core.config.MetisConfigManager
 
+import std.env.setVariable
 import std.fs.{File, exists, remove}
 import std.unittest.testmacro.*
 import stdx.encoding.json.{JsonObject, JsonString}
@@ -37,6 +38,12 @@ private func memoryEmbeddingRuntimeString(obj: JsonObject, key: String): String 
 
 @Test
 public class MemoryEmbeddingProviderRuntimeTest {
+    @BeforeAll
+    public func isolateMetisHome(): Unit {
+        setVariable("METIS_HOME", "/tmp/metis-memory-embedding-provider-runtime-test-home")
+        MetisConfigManager.invalidate()
+    }
+
     @TestCase
     public func createRuntimeReturnsProviderAndRuntimeSummary(): Unit {
         clearMemoryEmbeddingProviders()

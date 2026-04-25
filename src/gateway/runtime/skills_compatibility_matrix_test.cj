@@ -4,6 +4,7 @@ import metis.core.config.{MetisConfigManager, CliConfig}
 import metis.core.skills.{SkillsPrompt, tryHandleSkillsCommand}
 
 import std.collection.ArrayList
+import std.env.setVariable
 import std.fs.{Directory, File, OpenMode, Path, exists, remove}
 import std.unittest.testmacro.*
 import stdx.encoding.json.{JsonArray, JsonObject, JsonString, JsonValue}
@@ -41,6 +42,13 @@ private func matrixReportRowByName(rows: JsonArray, name: String): Option<JsonOb
 
 @Test
 public class SkillsCompatibilityMatrixTest {
+    @BeforeAll
+    public func isolateMetisHome(): Unit {
+        setVariable("METIS_HOME", "/tmp/metis-skills-compatibility-matrix-test-home")
+        MetisConfigManager.invalidate()
+        SkillsPrompt.invalidate()
+    }
+
     private func clearSkill(skillDir: Path): Unit {
         SkillsPrompt.invalidate()
         let _ = MetisConfigManager.setSkillsEntries(None)

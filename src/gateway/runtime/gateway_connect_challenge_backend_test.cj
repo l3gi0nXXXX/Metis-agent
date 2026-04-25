@@ -3,6 +3,7 @@ package metis.gateway.runtime
 import metis.core.config.{CliSettingManager, MetisConfigManager}
 import metis.gateway.protocol.{GatewayClientInfo, GatewayConnectParams, GatewayProtocolRequest, GATEWAY_ERROR_CONNECT_CHALLENGE_REQUIRED}
 
+import std.env.setVariable
 import std.unittest.testmacro.*
 import stdx.encoding.json.{JsonObject, JsonString}
 
@@ -46,6 +47,13 @@ private func challengeTestConfigRoot(): JsonObject {
 
 @Test
 public class GatewayConnectChallengeBackendTest {
+    @BeforeAll
+    public func isolateMetisHome(): Unit {
+        setVariable("METIS_HOME", "/tmp/metis-gateway-connect-challenge-backend-test-home")
+        MetisConfigManager.invalidate()
+        CliSettingManager.invalidate()
+    }
+
     @TestCase
     public func repeatedClientReconnectDoesNotChallengeGateAcceptedOlderConnection(): Unit {
         let originalRoot = MetisConfigManager.rawConfig() ?? JsonObject()

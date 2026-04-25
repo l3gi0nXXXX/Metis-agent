@@ -11,6 +11,13 @@ import std.unittest.testmacro.*
 
 @Test
 public class SkillsRuntimeParityTest {
+    @BeforeAll
+    public func isolateMetisHome(): Unit {
+        setVariable("METIS_HOME", "/tmp/metis-skills-runtime-parity-test-home")
+        MetisConfigManager.invalidate()
+        CliSettingManager.invalidate()
+    }
+
     private func clearTestSkill(skillDir: Path): Unit {
         SkillsPrompt.invalidate()
         if (exists(skillDir)) {
