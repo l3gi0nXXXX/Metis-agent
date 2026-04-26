@@ -3,7 +3,7 @@ package metis.core.config
 import std.env.{getVariable, setVariable}
 import std.fs.{Directory, Path, remove}
 import std.unittest.testmacro.*
-import stdx.encoding.json.{JsonObject, JsonString}
+import stdx.encoding.json.{JsonArray, JsonBool, JsonInt, JsonObject, JsonString}
 
 @Test
 public class CliSettingManagerTest {
@@ -105,6 +105,54 @@ public class CliSettingManagerTest {
 
         CliSettingManager.invalidate()
         @Expect(CliSettingManager.setting.model, "dashscope:qwen3.6-plus")
+
+        match (oldHome) {
+            case Some(value) => setVariable("METIS_HOME", value)
+            case None => setVariable("METIS_HOME", "")
+        }
+        MetisConfigManager.invalidate()
+        CliSettingManager.invalidate()
+    }
+
+    @TestCase
+    public func gatewaySettingsReadKeepsAuthAndChannelFlagsWhenTelegramAllowFromHasNumber(): Unit {
+        let testHome = "/tmp/metis-phase3-gateway-field-tolerant-read"
+        try {
+            remove(Path(testHome), recursive: true)
+        } catch (_: Exception) {
+            ()
+        }
+        Directory.create(testHome, recursive: true)
+        let oldHome = getVariable("METIS_HOME")
+        setVariable("METIS_HOME", testHome)
+        MetisConfigManager.invalidate()
+        CliSettingManager.invalidate()
+
+        let root = JsonObject()
+        let gateway = JsonObject()
+        let auth = JsonObject()
+        auth.put("mode", JsonString("token"))
+        auth.put("token", JsonString("existing-token"))
+        gateway.put("auth", auth)
+
+        let telegram = JsonObject()
+        telegram.put("enabled", JsonBool(true))
+        telegram.put("allowFrom", JsonArray([JsonInt(8734062810)]))
+        gateway.put("telegram", telegram)
+
+        let qq = JsonObject()
+        qq.put("enabled", JsonBool(true))
+        gateway.put("qq", qq)
+        root.put("gateway", gateway)
+        MetisConfigManager.writeRoot(root)
+        CliSettingManager.invalidate()
+
+        let parsed = CliSettingManager.readGatewaySettings()
+        @Expect(parsed.auth.token, "existing-token")
+        @Expect(parsed.telegram.enabled, true)
+        @Expect(parsed.telegram.allowFrom.size, 1)
+        @Expect(parsed.telegram.allowFrom[0], "8734062810")
+        @Expect(parsed.qq.enabled, true)
 
         match (oldHome) {
             case Some(value) => setVariable("METIS_HOME", value)

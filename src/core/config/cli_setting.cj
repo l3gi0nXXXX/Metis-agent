@@ -237,6 +237,85 @@ protected class CliSettingManager {
         }
     }
 
+    private static func cloneJsonObjectShallow(root: JsonObject): JsonObject {
+        let out = JsonObject()
+        for ((key, value) in root.getFields()) {
+            out.put(key, value)
+        }
+        out
+    }
+
+    private static func gatewayJsonScalarAsString(value: JsonValue): Option<String> {
+        try {
+            return Some(value.asString().getValue())
+        } catch (_: Exception) {
+            ()
+        }
+        match (value) {
+            case v: JsonInt => Some(v.getValue().toString())
+            case v: JsonFloat => Some(v.getValue().toString())
+            case _ => None
+        }
+    }
+
+    private static func gatewayStringArrayCompat(value: JsonValue): Option<JsonArray> {
+        try {
+            let arr = value.asArray()
+            let out = JsonArray([])
+            for (item in arr.getItems()) {
+                match (gatewayJsonScalarAsString(item)) {
+                    case Some(text) => out.add(JsonString(text))
+                    case None => out.add(item)
+                }
+            }
+            Some(out)
+        } catch (_: Exception) {
+            None<JsonArray>
+        }
+    }
+
+    private static func normalizeGatewayTelegramCompat(gateway: JsonObject): JsonObject {
+        let normalized = cloneJsonObjectShallow(gateway)
+        match (rootGetObject(gateway, "telegram")) {
+            case Some(telegram) =>
+                let normalizedTelegram = cloneJsonObjectShallow(telegram)
+                for (key in ["allowFrom", "groupAllowFrom"]) {
+                    match (telegram.get(key)) {
+                        case Some(value) =>
+                            match (gatewayStringArrayCompat(value)) {
+                                case Some(arr) => normalizedTelegram.put(key, arr)
+                                case None => ()
+                            }
+                        case None => ()
+                    }
+                }
+                normalized.put("telegram", normalizedTelegram)
+            case None => ()
+        }
+        normalized
+    }
+
+    private static func readGatewaySettingsFromConfigValue(
+        value: JsonValue,
+        fallback: GatewayUserSettings
+    ): GatewayUserSettings {
+        try {
+            return GatewayUserSettings.fromJsonValue(value)
+        } catch (initial: Exception) {
+            try {
+                let gateway = value.asObject()
+                let normalized = normalizeGatewayTelegramCompat(gateway)
+                return GatewayUserSettings.fromJsonValue(normalized)
+            } catch (compat: Exception) {
+                LogUtils.error(
+                    "Failed to parse gateway settings from metis.json; keeping previous/default gateway settings. " +
+                    "initial=${initial.message}; compat=${compat.message}"
+                )
+            }
+        }
+        fallback
+    }
+
     protected static func resolvedPrimaryModelForSave(setting: CliSetting, root: JsonObject): String {
         match (rootGetObject(root, "agents")) {
             case Some(agents) =>
@@ -405,11 +484,7 @@ protected class CliSettingManager {
         }
         match (root.get("gateway")) {
             case Some(value) =>
-                try {
-                    merged.gateway = GatewayUserSettings.fromJsonValue(value)
-                } catch (_: Exception) {
-                    ()
-                }
+                merged.gateway = readGatewaySettingsFromConfigValue(value, merged.gateway)
             case None => ()
         }
         match (rootGetObject(root, "session")) {
