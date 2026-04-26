@@ -104,7 +104,7 @@ public func runGatewayService(): Unit {
     let startMs = gatewayServeNowMs()
     gatewayServeTimingLog("enter", startMs)
     let persistedUser = CliSettingManager.readGatewaySettings()
-    let (user, generatedAuthToken, persistedGeneratedAuthToken) = gatewayPrepareStartupAuth(persistedUser)
+    let (user, generatedAuthToken, _) = gatewayPrepareStartupAuth(persistedUser)
     LogUtils.info("Gateway.serve: read settings gateway.enabled=${user.enabled}")
     gatewayServeTimingLog("settings-ready", startMs)
     if (!user.enabled) {
@@ -140,11 +140,9 @@ public func runGatewayService(): Unit {
     )
     try {
         if (generatedAuthToken) {
-            if (persistedGeneratedAuthToken) {
-                LogUtils.info("Gateway.serve: startup auth generated missing gateway.auth.token and persisted it.")
-            } else {
-                LogUtils.error("Gateway.serve: startup auth generated runtime-only gateway.auth.token for this startup.")
-            }
+            LogUtils.info(
+                "Gateway.serve: startup auth generated runtime-only gateway.auth.token for this startup; config was not modified."
+            )
         }
         let reconcileOut = DreamingPhaseRuntime.reconcileManagedCronJobs()
         if (!reconcileOut.trimAscii().isEmpty()) {

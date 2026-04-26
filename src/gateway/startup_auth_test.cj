@@ -10,8 +10,8 @@ import stdx.encoding.json.{JsonObject, JsonString}
 @Test
 public class GatewayStartupAuthTest {
     @TestCase
-    public func startupAuthPersistencePreservesExistingPrimaryModel(): Unit {
-        let testHome = "/tmp/metis-phase1-startup-auth-preserves-model"
+    public func startupAuthGeneratesRuntimeTokenWithoutPersistingConfig(): Unit {
+        let testHome = "/tmp/metis-phase4-startup-auth-runtime-only-token"
         try {
             remove(Path(testHome), recursive: true)
         } catch (_: Exception) {
@@ -42,11 +42,17 @@ public class GatewayStartupAuthTest {
         root.put("wizard", JsonObject())
 
         MetisConfigManager.writeRoot(root)
+        MetisConfigManager.invalidate()
+        CliSettingManager.invalidate()
+        let before = String.fromUtf8(File.readFrom(MetisConfigManager.configPath()))
 
         let configured = CliSettingManager.readGatewaySettings()
-        let (_, generated, persisted) = gatewayPrepareStartupAuth(configured)
+        let (updated, generated, persisted) = gatewayPrepareStartupAuth(configured)
         @Expect(generated, true)
-        @Expect(persisted, true)
+        @Expect(persisted, false)
+        @Expect(updated.auth.token.isEmpty(), false)
+        @Expect(gatewayRuntimeEffectiveAuthToken(configured).isEmpty(), false)
+        @Expect(String.fromUtf8(File.readFrom(MetisConfigManager.configPath())), before)
 
         let persistedRoot = MetisConfigManager.rawConfig().getOrThrow()
         let persistedPrimary = persistedRoot
@@ -55,11 +61,10 @@ public class GatewayStartupAuthTest {
             .get("model").getOrThrow().asObject()
             .get("primary").getOrThrow().asString().getValue()
         @Expect(persistedPrimary, "qwen/qwen3.6-plus")
-        let persistedToken = persistedRoot
+        let persistedAuth = persistedRoot
             .get("gateway").getOrThrow().asObject()
             .get("auth").getOrThrow().asObject()
-            .get("token").getOrThrow().asString().getValue()
-        @Expect(persistedToken.isEmpty(), false)
+        @Expect(persistedAuth.get("token").isNone(), true)
 
         match (oldHome) {
             case Some(value) => setVariable("METIS_HOME", value)

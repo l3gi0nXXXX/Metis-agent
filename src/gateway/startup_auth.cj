@@ -1,6 +1,6 @@
 package metis.gateway
 
-import metis.core.config.{CliSettingManager, GatewayUserSettings, MetisConfigManager}
+import metis.core.config.GatewayUserSettings
 
 import magic.log.LogUtils
 
@@ -61,27 +61,8 @@ public func gatewayPrepareStartupAuth(user: GatewayUserSettings): (GatewayUserSe
     updated.auth.token = generatedToken
     gatewayRuntimeAuthTokenOverride = generatedToken
 
-    var persisted = false
-    try {
-        CliSettingManager.writeGatewaySettings(updated)
-        let reloaded = CliSettingManager.readGatewaySettings()
-        persisted = reloaded.auth.token.trimAscii() == generatedToken
-    } catch (e: Exception) {
-        match (MetisConfigManager.currentConfigParseError()) {
-            case Some(parseError) =>
-                LogUtils.error(
-                    "Gateway startup auth persistence skipped because metis.json is invalid: ${parseError}"
-                )
-            case None =>
-                LogUtils.error("Gateway startup auth persistence failed: ${e.message}")
-        }
-    }
-
-    if (persisted) {
-        gatewayRuntimeAuthTokenOverride = ""
-        LogUtils.info("Gateway startup auth: generated missing gateway.auth.token and persisted it to config.")
-    } else {
-        LogUtils.error("Gateway startup auth: generated runtime gateway.auth.token for this startup only; config still has no persisted token.")
-    }
-    (updated, true, persisted)
+    LogUtils.info(
+        "Gateway startup auth: generated runtime-only gateway.auth.token for this startup; config was not modified."
+    )
+    (updated, true, false)
 }
