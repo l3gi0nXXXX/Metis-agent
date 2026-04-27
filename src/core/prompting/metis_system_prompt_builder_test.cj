@@ -245,6 +245,52 @@ public class MetisSystemPromptBuilderTest {
     }
 
     @TestCase
+    public func subagentNaturalLanguageGuidanceAppearsWithSessionsSpawn(): Unit {
+        let params = MetisSystemPromptParams()
+        params.promptMode = PromptMode.FullMode
+        params.toolNames = ["sessions_spawn", "subagents"]
+        let prompt = MetisSystemPromptBuilder.build(params, cangjieMode: false)
+        @Expect(prompt.contains("## Subagent Orchestration"), true)
+        @Expect(prompt.contains("call `sessions_spawn` with `runtime: \"subagent\"`"), true)
+        @Expect(prompt.contains("\"后台\""), true)
+        @Expect(prompt.contains("\"并行\""), true)
+        @Expect(prompt.contains("\"完成后通知\""), true)
+        @Expect(prompt.contains("do not wait for the subagent to finish"), true)
+        @Expect(prompt.contains("Completion notification is push-based"), true)
+        @Expect(prompt.contains("multiple requested background agents"), true)
+        @Expect(prompt.contains("one `sessions_spawn` call per role/task"), true)
+        @Expect(prompt.contains("Do the work yourself for small, quick, single-focus tasks"), true)
+        @Expect(prompt.contains("Use `subagents` only for on-demand list/status/logs/kill/steer/send control"), true)
+    }
+
+    @TestCase
+    public func subagentNaturalLanguageGuidanceRequiresSessionsSpawnTool(): Unit {
+        let params = MetisSystemPromptParams()
+        params.promptMode = PromptMode.FullMode
+        params.toolNames = ["subagents"]
+        let prompt = MetisSystemPromptBuilder.build(params, cangjieMode: false)
+        @Expect(prompt.contains("## Subagent Orchestration"), false)
+        @Expect(prompt.contains("call `sessions_spawn` with `runtime: \"subagent\"`"), false)
+    }
+
+    @TestCase
+    public func acpHarnessGuidanceStaysCapabilityGated(): Unit {
+        let blocked = MetisSystemPromptParams()
+        blocked.promptMode = PromptMode.FullMode
+        blocked.toolNames = ["sessions_spawn"]
+        blocked.acpEnabled = false
+        let blockedPrompt = MetisSystemPromptBuilder.build(blocked, cangjieMode: false)
+        @Expect(blockedPrompt.contains("For ACP harness requests like Codex/Claude Code/Cursor/Gemini"), false)
+
+        let allowed = MetisSystemPromptParams()
+        allowed.promptMode = PromptMode.FullMode
+        allowed.toolNames = ["sessions_spawn"]
+        allowed.acpEnabled = true
+        let allowedPrompt = MetisSystemPromptBuilder.build(allowed, cangjieMode: false)
+        @Expect(allowedPrompt.contains("For ACP harness requests like Codex/Claude Code/Cursor/Gemini"), true)
+    }
+
+    @TestCase
     public func sandboxLiteralFieldsAreSanitizedToSingleLine(): Unit {
         let params = MetisSystemPromptParams()
         params.promptMode = PromptMode.FullMode

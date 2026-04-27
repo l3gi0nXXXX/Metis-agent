@@ -509,6 +509,32 @@ private func buildVoiceSection(isMinimal: Bool, ttsHint: String): Array<String> 
     return ["## Voice (TTS)", trimmed, ""]
 }
 
+private func buildSubagentOrchestrationGuidance(hasSessionsSpawn: Bool, hasSubagentsTool: Bool, acpHarnessSpawnAllowed: Bool): Array<String> {
+    if (!hasSessionsSpawn) {
+        return []
+    }
+    let lines = ArrayList<String>([
+        "## Subagent Orchestration",
+        "- When the user asks to start a subagent, run work in the background, run tasks in parallel, or notify them when finished, call `sessions_spawn` with `runtime: \"subagent\"`.",
+        "- Treat phrases like \"启动 subagent\", \"后台\", \"并行\", \"完成后通知\", \"do this in the background\", and \"spawn a reviewer/explorer\" as explicit subagent intent.",
+        "- After `sessions_spawn` returns accepted, report the run id/session key briefly and continue serving the current session; do not wait for the subagent to finish.",
+        "- Completion notification is push-based and delivered by the runtime back to the requester session/thread. Do not simulate completion by polling.",
+        "- For multiple requested background agents, issue one `sessions_spawn` call per role/task and let policy/concurrency controls accept, queue, or reject each run.",
+        "- Do the work yourself for small, quick, single-focus tasks unless the user explicitly asks for subagent/background/parallel execution."
+    ])
+    if (acpHarnessSpawnAllowed) {
+        lines.add("- For ACP harness requests like Codex/Claude Code/Cursor/Gemini, call `sessions_spawn` with `runtime: \"acp\"` and the requested harness in `agentId`.")
+        lines.add("- Do not route ACP harness requests through local PTY exec flows.")
+    }
+    if (hasSubagentsTool) {
+        lines.add("- Use `subagents` only for on-demand list/status/logs/kill/steer/send control, not for busy polling.")
+    } else {
+        lines.add("- If the control tool is unavailable, rely on the accepted spawn response and runtime completion notice.")
+    }
+    lines.add("")
+    lines.toArray()
+}
+
 private func buildDocsSection(isMinimal: Bool, docsPath: String): Array<String> {
     let trimmed = docsPath.trimAscii()
     if (isMinimal || trimmed.isEmpty()) {
@@ -822,11 +848,7 @@ public class MetisSystemPromptBuilder {
             lines.add("For non-trivial multi-step work, use the planning tools available in this build and keep the plan updated.")
         }
 
-        lines.add("If a task is more complex or takes longer, spawn a sub-agent. Completion is push-based: it will auto-announce when done.")
-        if (acpHarnessSpawnAllowed) {
-            lines.add("For ACP harness requests like Codex/Claude Code/Cursor/Gemini, treat it as ACP harness intent and call `sessions_spawn` with `runtime: \"acp\"`.")
-            lines.add("Do not route ACP harness requests through local PTY exec flows.")
-        }
+        appendLines(lines, buildSubagentOrchestrationGuidance(hasSessionsSpawn, hasSubagentsTool, acpHarnessSpawnAllowed))
         if (hasSubagentsTool) {
             lines.add("Do not poll `subagents list` / `sessions_list` in a loop; only check status on-demand.")
         } else {

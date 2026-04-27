@@ -854,11 +854,11 @@ public class GatewayManagedSessionsToolset {
     }
 
     @tool[
-        description: "Gateway main-runtime sessions_spawn tool. Creates a managed session, records spawn metadata, and can launch a background subagent or ACP harness run inside the Gateway process.",
+        description: "Gateway main-runtime sessions_spawn tool. Creates a managed session, records spawn metadata, and can launch a background subagent or ACP harness run inside the Gateway process. Use this when the user naturally asks to start a subagent, run work in the background or in parallel, or notify the current session when finished. Return after the accepted response; completion is reported later by runtime notification.",
         parameters: {
-            task: "Task or prompt for the spawned session.",
+            task: "Task or prompt for the spawned session. Include enough context for the background run to complete without blocking the current session.",
             label: "Optional label for the spawned session.",
-            runtime: "Optional runtime hint: subagent or acp.",
+            runtime: "Optional runtime hint: subagent or acp. Use subagent for Metis built-in/background agents.",
             agentId: "Optional target agent identifier hint. For runtime=acp this can be codex, claude, gemini, cursor-agent, or cmd:<shell-command-with-{task}>.",
             resumeSessionId: "Optional ACP resume session id hint forwarded to supported harnesses.",
             model: "Optional model override hint forwarded to ACP harnesses and stored in session metadata.",
