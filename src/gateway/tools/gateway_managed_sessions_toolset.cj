@@ -5,7 +5,7 @@ import magic.prelude.*
 
 import metis.core.config.{CliConfig, CliSettingManager}
 import metis.core.memory.{MemorySessionTranscriptStore, memorySessionStoreForGatewayUser}
-import metis.core.{gatewayCurrentToolRuntimeContext, gatewaySubagentBuildBuiltinPrompt, gatewaySubagentControllerCanAccessRun, gatewaySubagentCreateRunRecord, gatewaySubagentEvaluateSpawnPolicy, gatewaySubagentFindRunBySessionKey, gatewaySubagentIsBuiltinAgent, gatewaySubagentListRunRecords, gatewaySubagentMarkRunCancelled, gatewaySubagentMarkRunState, gatewaySubagentNormalizeBuiltinAgentId, gatewaySubagentNoticeShouldDeliver, gatewaySubagentNoticeTargetSession, gatewaySubagentPolicyDecisionToJson, gatewaySubagentPolicyRejectionJson, gatewaySubagentRenderNotice, gatewaySubagentResolveRunRecord, gatewaySubagentRunMatchesControlFilter, gatewaySubagentRunRecordInt, gatewaySubagentRunRecordString, gatewaySubagentRunStatusIsTerminal, gatewaySubagentUpdateNoticeStatus, gatewaySubagentWriteRunRecord}
+import metis.core.{GatewaySubagentAgentSpec, gatewayCurrentToolRuntimeContext, gatewaySubagentBuildBuiltinPrompt, gatewaySubagentBuildCustomPrompt, gatewaySubagentControllerCanAccessRun, gatewaySubagentCreateRunRecord, gatewaySubagentEvaluateSpawnPolicy, gatewaySubagentFindRunBySessionKey, gatewaySubagentIsBuiltinAgent, gatewaySubagentListRunRecords, gatewaySubagentMarkRunCancelled, gatewaySubagentMarkRunState, gatewaySubagentNormalizeBuiltinAgentId, gatewaySubagentNoticeShouldDeliver, gatewaySubagentNoticeTargetSession, gatewaySubagentPolicyDecisionToJson, gatewaySubagentPolicyRejectionJson, gatewaySubagentRenderNotice, gatewaySubagentResolveAgent, gatewaySubagentResolveRunRecord, gatewaySubagentRunMatchesControlFilter, gatewaySubagentRunRecordInt, gatewaySubagentRunRecordString, gatewaySubagentRunStatusIsTerminal, gatewaySubagentUpdateNoticeStatus, gatewaySubagentWriteRunRecord}
 import metis.io.PrintUtils
 
 import std.collection.{ArrayList, HashMap}
@@ -339,11 +339,18 @@ public class GatewayManagedSessionsToolset {
         }
     }
 
-    private func buildManagedSubagentPrompt(task: String, cwdHint: String, sessionKey: String, agentId: String): String {
+    private func buildManagedSubagentPrompt(task: String, cwdHint: String, sessionKey: String, agentId: String, agentSpec!: Option<GatewaySubagentAgentSpec> = None): String {
         let effectiveCwd = if (cwdHint.trimAscii().isEmpty()) {
             CliConfig.cwd.toString()
         } else {
             cwdHint.trimAscii()
+        }
+        match (agentSpec) {
+            case Some(spec) =>
+                if (spec.source == "custom") {
+                    return gatewaySubagentBuildCustomPrompt(task, effectiveCwd, sessionKey, spec)
+                }
+            case None => ()
         }
         gatewaySubagentBuildBuiltinPrompt(task, effectiveCwd, sessionKey, agentId)
     }
@@ -422,7 +429,14 @@ public class GatewayManagedSessionsToolset {
         path
     }
 
-    private func internalSubagentCommandSpec(sessionKey: String, agentId: String, task: String, cwdHint: String): (String, Array<String>, Path) {
+    private func internalSubagentCommandSpec(
+        sessionKey: String,
+        agentId: String,
+        task: String,
+        cwdHint: String,
+        agentDir!: String = "",
+        modelHint!: String = ""
+    ): (String, Array<String>, Path) {
         let effectiveCwd = if (cwdHint.trimAscii().isEmpty()) { CliConfig.cwd } else { Path(cwdHint.trimAscii()) }
         let promptFile = this.internalSubagentPromptFile(sessionKey, task)
         let args = ArrayList<String>()
@@ -431,19 +445,25 @@ public class GatewayManagedSessionsToolset {
         args.add("--name")
         args.add("metis")
         let runArgs = ArrayList<String>()
-        runArgs.add("--internal-subagent")
-        runArgs.add(agentId)
+        if (!agentDir.trimAscii().isEmpty()) {
+            runArgs.add("--language")
+            runArgs.add("agent:${agentDir.trimAscii()}")
+        } else {
+            runArgs.add("--internal-subagent")
+            runArgs.add(agentId)
+        }
         runArgs.add("--prompt-file")
         runArgs.add(promptFile.toString())
         runArgs.add("--output-format")
         runArgs.add("plain")
-        if (!CliConfig.language.trimAscii().isEmpty()) {
+        if (agentDir.trimAscii().isEmpty() && !CliConfig.language.trimAscii().isEmpty()) {
             runArgs.add("--language")
             runArgs.add(CliConfig.language)
         }
-        if (!CliConfig.model.trimAscii().isEmpty()) {
+        let effectiveModel = if (!modelHint.trimAscii().isEmpty()) { modelHint.trimAscii() } else { CliConfig.model.trimAscii() }
+        if (!effectiveModel.isEmpty()) {
             runArgs.add("--model")
-            runArgs.add(CliConfig.model)
+            runArgs.add(effectiveModel)
         }
         args.add("--run-args")
         args.add(String.join(runArgs.toArray(), delimiter: " "))
@@ -730,25 +750,37 @@ public class GatewayManagedSessionsToolset {
         agentId: String,
         task: String,
         cwdHint: String,
-        runTimeoutSeconds!: Int64 = -1
+        runTimeoutSeconds!: Int64 = -1,
+        agentSpec!: Option<GatewaySubagentAgentSpec> = None
     ): Bool {
-        let normalized = this.normalizeManagedAgentId(agentId)
-        if (!this.supportsRealManagedSubagent(normalized)) {
+        let resolvedSpec = match (agentSpec) {
+            case Some(spec) => spec
+            case None => gatewaySubagentResolveAgent(agentId)
+        }
+        if (!resolvedSpec.found) {
             return false
         }
-        if (!this.tryQueueManagedRun(sessionKey, normalized)) {
+        let resolvedAgentId = resolvedSpec.agentId.trimAscii()
+        if (!this.tryQueueManagedRun(sessionKey, resolvedAgentId)) {
             return false
         }
-        let prompt = this.buildManagedSubagentPrompt(task, cwdHint, sessionKey, normalized)
-        let spec = this.internalSubagentCommandSpec(sessionKey, normalized, prompt, cwdHint)
+        let prompt = this.buildManagedSubagentPrompt(task, cwdHint, sessionKey, resolvedAgentId, agentSpec: Some(resolvedSpec))
+        let spec = this.internalSubagentCommandSpec(
+            sessionKey,
+            resolvedAgentId,
+            prompt,
+            cwdHint,
+            agentDir: resolvedSpec.agentDir,
+            modelHint: resolvedSpec.model
+        )
         let command = spec[0]
         let args = spec[1]
         let workDir = spec[2]
         let st = this.gwStore()
-        st.appendTranscriptEntry(sessionKey, "system", "subagent dispatch accepted: agentId=${normalized}")
+        st.appendTranscriptEntry(sessionKey, "system", "subagent dispatch accepted: agentId=${resolvedAgentId}, source=${resolvedSpec.source}")
         let future = spawn {
             this.setManagedState(sessionKey, "running")
-            st.appendTranscriptEntry(sessionKey, "system", "subagent started: agentId=${normalized}")
+            st.appendTranscriptEntry(sessionKey, "system", "subagent started: agentId=${resolvedAgentId}, source=${resolvedSpec.source}")
             try {
                 let process = launch(
                     command,
@@ -783,7 +815,7 @@ public class GatewayManagedSessionsToolset {
                 let stderr = (try { stderrFuture.get() } catch (_: Exception) { "" }).trimAscii()
                 let outputPath = st.transcriptPath(sessionKey).toString()
                 if (timedOut) {
-                    st.appendTranscriptEntry(sessionKey, "system", "subagent timed out: agentId=${normalized} timeoutSeconds=${runTimeoutSeconds}")
+                    st.appendTranscriptEntry(sessionKey, "system", "subagent timed out: agentId=${resolvedAgentId} timeoutSeconds=${runTimeoutSeconds}")
                     this.setManagedState(sessionKey, "timed_out", error: "subagent timed out after ${runTimeoutSeconds}s", exitCode: -1, outputPath: outputPath)
                     return
                 }
@@ -797,14 +829,14 @@ public class GatewayManagedSessionsToolset {
                 }
                 if (exitCode == 0 && !content.isEmpty()) {
                     st.appendTranscriptEntry(sessionKey, "assistant", content)
-                    st.appendTranscriptEntry(sessionKey, "system", "subagent completed: agentId=${normalized}")
+                    st.appendTranscriptEntry(sessionKey, "system", "subagent completed: agentId=${resolvedAgentId}")
                     this.setManagedState(sessionKey, "succeeded", resultSummary: content, exitCode: exitCode, outputPath: outputPath)
                 } else if (exitCode == 0) {
                     st.appendTranscriptEntry(sessionKey, "system", "subagent completed with empty response")
                     this.setManagedState(sessionKey, "succeeded", resultSummary: "subagent completed with empty response", exitCode: exitCode, outputPath: outputPath)
                 } else {
-                    st.appendTranscriptEntry(sessionKey, "system", "subagent failed: agentId=${normalized} exitCode=${exitCode}")
-                    this.setManagedState(sessionKey, "failed", error: "subagent failed: agentId=${normalized} exitCode=${exitCode}", exitCode: exitCode, outputPath: outputPath)
+                    st.appendTranscriptEntry(sessionKey, "system", "subagent failed: agentId=${resolvedAgentId} exitCode=${exitCode}")
+                    this.setManagedState(sessionKey, "failed", error: "subagent failed: agentId=${resolvedAgentId} exitCode=${exitCode}", exitCode: exitCode, outputPath: outputPath)
                 }
             } catch (e: Exception) {
                 let outputPath = st.transcriptPath(sessionKey).toString()
@@ -987,10 +1019,26 @@ public class GatewayManagedSessionsToolset {
             case Some(v) => v.trimAscii()
             case None => ""
         }
+        let resolvedAgentSpec = if (runtimeText == "subagent") {
+            gatewaySubagentResolveAgent(requestedAgentId)
+        } else {
+            GatewaySubagentAgentSpec()
+        }
+        if (runtimeText == "subagent" && !resolvedAgentSpec.found) {
+            let err = JsonObject()
+            err.put("ok", JsonBool(false))
+            err.put("status", JsonString("error"))
+            err.put("error", JsonString(resolvedAgentSpec.error))
+            err.put("agentId", JsonString(resolvedAgentSpec.agentId))
+            err.put("runtime", JsonString(runtimeText))
+            let out = err.toJsonString()
+            PrintUtils.printToolResult(out)
+            return out
+        }
         let agentIdText = if (runtimeText == "acp") {
             if (requestedAgentId.isEmpty()) { "codex" } else { requestedAgentId }
         } else {
-            this.normalizeManagedAgentId(requestedAgentId)
+            resolvedAgentSpec.agentId
         }
         let st = this.gwStore()
         var effectiveTimeout = if (let Some(v) <- runTimeoutSeconds) { v } else { timeoutSeconds ?? -1 }
@@ -1020,7 +1068,7 @@ public class GatewayManagedSessionsToolset {
             case Some(v) => v.trimAscii()
             case None => ""
         }
-        let agentSourceText = if (runtimeText == "acp") { "acp" } else { "builtin" }
+        let agentSourceText = if (runtimeText == "acp") { "acp" } else { resolvedAgentSpec.source }
         let policyDecision = gatewaySubagentEvaluateSpawnPolicy(
             CliSettingManager.readGatewaySettings().subagents,
             st.sessionsRoot(),
@@ -1055,6 +1103,10 @@ public class GatewayManagedSessionsToolset {
         metadata.add("runtime=${runtimeText}")
         if (!labelText.isEmpty()) { metadata.add("label=${labelText}") }
         if (!agentIdText.isEmpty()) { metadata.add("agentId=${agentIdText}") }
+        if (!agentSourceText.isEmpty()) { metadata.add("agentSource=${agentSourceText}") }
+        if (runtimeText == "subagent" && !resolvedAgentSpec.agentDir.trimAscii().isEmpty()) {
+            metadata.add("agentDir=${resolvedAgentSpec.agentDir.trimAscii()}")
+        }
         match (resumeSessionId) {
             case Some(v) =>
                 let t = v.trimAscii()
@@ -1145,6 +1197,7 @@ public class GatewayManagedSessionsToolset {
         result.put("sessionKey", JsonString(sessionKey))
         result.put("runtime", JsonString(runtimeText))
         result.put("agentId", JsonString(agentIdText))
+        result.put("agentSource", JsonString(agentSourceText))
         result.put("task", JsonString(trimmedTask))
         result.put("cwd", JsonString(if (cwdHint.isEmpty()) { CliConfig.cwd.toString() } else { cwdHint }))
         if (!labelText.isEmpty()) { result.put("label", JsonString(labelText)) }
@@ -1167,7 +1220,7 @@ public class GatewayManagedSessionsToolset {
             requesterChannel: requesterChannelText,
             requesterThreadId: requesterThreadIdText,
             agentId: agentIdText,
-            agentSource: if (runtimeText == "acp") { "acp" } else { "builtin" },
+            agentSource: agentSourceText,
             runtime: runtimeText,
             task: trimmedTask,
             label: labelText,
@@ -1180,6 +1233,29 @@ public class GatewayManagedSessionsToolset {
         )
         let runMetadata = JsonObject()
         runMetadata.put("policy", gatewaySubagentPolicyDecisionToJson(policyDecision))
+        if (runtimeText == "subagent") {
+            let agentJson = JsonObject()
+            agentJson.put("source", JsonString(resolvedAgentSpec.source))
+            agentJson.put("name", JsonString(resolvedAgentSpec.name))
+            agentJson.put("description", JsonString(resolvedAgentSpec.description))
+            agentJson.put("agentDir", JsonString(resolvedAgentSpec.agentDir))
+            agentJson.put("model", JsonString(resolvedAgentSpec.model))
+            agentJson.put("background", resolvedAgentSpec.background.toJsonValue())
+            agentJson.put("isolation", JsonString(resolvedAgentSpec.isolation))
+            agentJson.put("maxTurns", resolvedAgentSpec.maxTurns.toJsonValue())
+            let toolsJson = JsonArray([])
+            for (tool in resolvedAgentSpec.tools) {
+                toolsJson.add(JsonString(tool))
+            }
+            agentJson.put("tools", toolsJson)
+            runMetadata.put("agent", agentJson)
+            if (!resolvedAgentSpec.model.trimAscii().isEmpty()) {
+                result.put("model", JsonString(resolvedAgentSpec.model.trimAscii()))
+            }
+            if (!resolvedAgentSpec.agentDir.trimAscii().isEmpty()) {
+                result.put("agentDir", JsonString(resolvedAgentSpec.agentDir.trimAscii()))
+            }
+        }
         runRecord.put("metadata", runMetadata)
         let _ = gatewaySubagentWriteRunRecord(st.sessionsRoot(), runRecord)
         let runId = gatewaySubagentRunRecordString(runRecord, "runId")
@@ -1188,8 +1264,12 @@ public class GatewayManagedSessionsToolset {
         if (!streamToText.isEmpty()) {
             result.put("compatNote", JsonString("streamTo is recorded, but this Gateway-managed toolset currently only streams output back into the managed session transcript."))
         }
-        if (runtimeText == "subagent" && this.supportsRealManagedSubagent(agentIdText)) {
-            result.put("liveRunStarted", this.launchManagedSubagentRun(sessionKey, agentIdText, trimmedTask, cwdHint, runTimeoutSeconds: effectiveTimeout).toJsonValue())
+        if (runtimeText == "subagent" && resolvedAgentSpec.background) {
+            result.put("liveRunStarted", this.launchManagedSubagentRun(sessionKey, agentIdText, trimmedTask, cwdHint, runTimeoutSeconds: effectiveTimeout, agentSpec: Some(resolvedAgentSpec)).toJsonValue())
+        } else if (runtimeText == "subagent") {
+            st.appendTranscriptEntry(sessionKey, "user", trimmedTask)
+            result.put("liveRunStarted", JsonBool(false))
+            result.put("compatNote", JsonString("The resolved subagent has background=false, so the task was recorded without launching a background turn."))
         } else if (runtimeText == "acp") {
             let effectiveHarness = match (agentIdText.trimAscii().toAsciiLower()) {
                 case "" | "codex" | "codex-cli" => "codex"

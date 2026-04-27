@@ -41,6 +41,7 @@ protected class CliConfig {
     public static func invalidatePathCache(): Unit {
         _dotDir = None<Path>
         _cwd = None<Path>
+        _subagentDirs = None<ArrayList<Path>>
     }
 
     /**

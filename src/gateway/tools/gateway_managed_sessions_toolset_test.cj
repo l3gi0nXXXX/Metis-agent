@@ -1,11 +1,11 @@
 package metis.gateway.tools
 
-import metis.core.{GatewayToolRuntimeContext, gatewaySubagentCreateRunRecord, gatewaySubagentResolveRunRecord, gatewaySubagentRunRecordString, gatewayWithToolRuntimeContext}
+import metis.core.{GatewayToolRuntimeContext, gatewaySubagentCreateRunRecord, gatewaySubagentResolveAgent, gatewaySubagentResolveRunRecord, gatewaySubagentRunRecordString, gatewayWithToolRuntimeContext}
 import metis.core.config.{CliConfig, CliSettingManager, MetisConfigManager}
 import metis.core.memory.memorySessionStoreForGatewayUser
 
 import std.env.{getVariable, setVariable}
-import std.fs.{Directory, Path, exists, remove}
+import std.fs.{Directory, File, Path, exists, remove}
 import std.time.DateTime
 import std.unittest.testmacro.*
 import stdx.encoding.json.{JsonObject, JsonValue}
@@ -54,6 +54,29 @@ private func managedSubagentsString(obj: JsonObject, key: String): String {
         case Some(v) => try { v.asString().getValue() } catch (_: Exception) { "" }
         case None => ""
     }
+}
+
+private func createManagedSubagentsCustomAgentFixture(id: String, background: Bool): Path {
+    let agentDir = CliConfig.dotDir.join("agents").join(id)
+    Directory.create(agentDir, recursive: true)
+    File.writeTo(
+        agentDir.join("AGENT.md"),
+        (
+            "id: ${id}\n" +
+            "name: ${id}\n" +
+            "description: Phase 9 custom subagent fixture\n" +
+            "model: openai/gpt-test\n" +
+            "tools: fileRead,grepSearch\n" +
+            "background: ${background}\n" +
+            "isolation: shared\n" +
+            "maxTurns: 7\n" +
+            "---\n" +
+            "# Fixture Instructions\n" +
+            "Always answer as the phase 9 custom fixture.\n"
+        ).toArray()
+    )
+    CliConfig.invalidatePathCache()
+    agentDir
 }
 
 @Test
@@ -179,23 +202,109 @@ public class GatewayManagedSessionsToolsetTest {
     }
 
     @TestCase
-    public func subagentsCommandSpawnRecordsRunAndStatusInRequesterSession(): Unit {
+    public func subagentsCommandSpawnRejectsUnknownAgent(): Unit {
         withManagedSessionsToolsetTestHome("/tmp/metis-managed-subagents-command-spawn-record") {
             gatewayWithToolRuntimeContext(GatewayToolRuntimeContext("telegram", sessionKey: "telegram:chat:phase7")) {
                 let spawned = managedSubagentsJson(gatewayHandleSubagentsCommandLine("/subagents spawn observer \"inspect unicode 任务\"").getOrThrow())
-                @Expect(managedSubagentsString(spawned, "status"), "accepted")
+                @Expect(managedSubagentsString(spawned, "status"), "error")
                 @Expect(managedSubagentsString(spawned, "agentId"), "observer")
-                @Expect(managedSubagentsString(spawned, "task"), "inspect unicode 任务")
-                @Expect(spawned.get("liveRunStarted").getOrThrow().asBool().getValue(), false)
+                @Expect(managedSubagentsString(spawned, "error").contains("unknown subagent agent"), true)
+            }
+        }
+    }
 
+    @TestCase
+    public func customSubagentResolverReadsAgentMarkdownMetadata(): Unit {
+        withManagedSessionsToolsetTestHome("/tmp/metis-managed-subagents-custom-resolver") {
+            let agentDir = createManagedSubagentsCustomAgentFixture("phase9-custom", false)
+            let spec = gatewaySubagentResolveAgent("phase9-custom")
+            @Expect(spec.found, true)
+            @Expect(spec.source, "custom")
+            @Expect(spec.agentId, "phase9-custom")
+            @Expect(spec.agentDir, agentDir.toString())
+            @Expect(spec.model, "openai/gpt-test")
+            @Expect(spec.tools.size, 2)
+            @Expect(spec.background, false)
+            @Expect(spec.isolation, "shared")
+            @Expect(spec.maxTurns, 7)
+        }
+    }
+
+    @TestCase
+    public func sessionsSpawnCustomAgentRequiresPolicyAllow(): Unit {
+        withManagedSessionsToolsetTestHome("/tmp/metis-managed-subagents-custom-policy-deny") {
+            createManagedSubagentsCustomAgentFixture("phase9-custom", false)
+            let toolset = GatewayManagedSessionsToolset()
+            gatewayWithToolRuntimeContext(GatewayToolRuntimeContext("telegram", sessionKey: "telegram:chat:phase9")) {
+                let spawned = managedSubagentsJson(toolset.sessionsSpawnForCommand(
+                    "inspect unicode 任务",
+                    Some("custom"),
+                    Some("subagent"),
+                    Some("phase9-custom"),
+                    None<String>,
+                    None<String>,
+                    None<String>,
+                    None<String>,
+                    None<Int64>,
+                    None<Int64>,
+                    None<Bool>,
+                    None<String>,
+                    None<String>,
+                    None<String>,
+                    None<String>
+                ))
+                @Expect(managedSubagentsString(spawned, "status"), "rejected")
+                @Expect(managedSubagentsString(spawned, "reason"), "custom agents disabled")
+                @Expect(managedSubagentsString(spawned, "agentId"), "phase9-custom")
+            }
+        }
+    }
+
+    @TestCase
+    public func sessionsSpawnCustomAgentRecordsRunWhenPolicyAllows(): Unit {
+        withManagedSessionsToolsetTestHome("/tmp/metis-managed-subagents-custom-spawn-record") {
+            createManagedSubagentsCustomAgentFixture("phase9-custom", false)
+            var settings = CliSettingManager.readGatewaySettings()
+            settings.subagents.allowCustomAgents = true
+            let _ = MetisConfigManager.setGatewaySettings(settings)
+            CliSettingManager.invalidate()
+            let toolset = GatewayManagedSessionsToolset()
+            gatewayWithToolRuntimeContext(GatewayToolRuntimeContext("telegram", sessionKey: "telegram:chat:phase9")) {
+                let spawned = managedSubagentsJson(toolset.sessionsSpawnForCommand(
+                    "inspect unicode 任务",
+                    Some("custom"),
+                    Some("subagent"),
+                    Some("phase9-custom"),
+                    None<String>,
+                    None<String>,
+                    None<String>,
+                    None<String>,
+                    None<Int64>,
+                    None<Int64>,
+                    None<Bool>,
+                    None<String>,
+                    None<String>,
+                    None<String>,
+                    None<String>
+                ))
+                @Expect(managedSubagentsString(spawned, "status"), "accepted")
+                @Expect(managedSubagentsString(spawned, "agentId"), "phase9-custom")
+                @Expect(managedSubagentsString(spawned, "agentSource"), "custom")
+                @Expect(managedSubagentsString(spawned, "model"), "openai/gpt-test")
+                @Expect(spawned.get("liveRunStarted").getOrThrow().asBool().getValue(), false)
                 let runId = managedSubagentsString(spawned, "runId")
-                let status = managedSubagentsJson(gatewayHandleSubagentsCommandLine("/subagents status ${runId}").getOrThrow())
+                let status = managedSubagentsJson(toolset.subagentsForTest(managedSubagentsSome("status"), managedSubagentsSome(runId), None<String>, None<Int64>))
                 @Expect(managedSubagentsString(status, "status"), "ok")
                 @Expect(managedSubagentsString(status, "runId"), runId)
                 let run = status.get("run").getOrThrow().asObject()
                 @Expect(managedSubagentsString(run, "status"), "queued")
-                @Expect(managedSubagentsString(run, "requesterSessionKey"), "telegram:chat:phase7")
+                @Expect(managedSubagentsString(run, "requesterSessionKey"), "telegram:chat:phase9")
                 @Expect(managedSubagentsString(run, "requesterChannel"), "telegram")
+                @Expect(managedSubagentsString(run, "agentSource"), "custom")
+                let metadata = run.get("metadata").getOrThrow().asObject()
+                let agent = metadata.get("agent").getOrThrow().asObject()
+                @Expect(managedSubagentsString(agent, "source"), "custom")
+                @Expect(managedSubagentsString(agent, "model"), "openai/gpt-test")
             }
         }
     }
