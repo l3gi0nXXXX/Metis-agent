@@ -5,6 +5,7 @@ import magic.prelude.*
 
 import metis.core.config.{CliConfig, CliSettingManager}
 import metis.core.memory.{MemorySessionTranscriptStore, memorySessionStoreForGatewayUser}
+import metis.core.{gatewaySubagentCreateRunRecord, gatewaySubagentFindRunBySessionKey, gatewaySubagentResolveRunRecord, gatewaySubagentRunRecordString, gatewaySubagentUpdateRunStatus}
 import metis.io.PrintUtils
 
 import std.collection.{ArrayList, HashMap}
@@ -222,7 +223,7 @@ public class GatewayManagedSessionsToolset {
     }
 
     private func tryQueueManagedRun(sessionKey: String, agentId: String): Bool {
-        synchronized(gatewayManagedSessionLock) {
+        let queued = synchronized(gatewayManagedSessionLock) {
             if (let Some(state) <- gatewayManagedStates.get(sessionKey)) {
                 if (state == "queued" || state == "running") {
                     return false
@@ -232,12 +233,17 @@ public class GatewayManagedSessionsToolset {
             gatewayManagedStates.add(sessionKey, "queued")
             true
         }
+        if (queued) {
+            let _ = gatewaySubagentUpdateRunStatus(this.gwStore().sessionsRoot(), sessionKey, "queued")
+        }
+        queued
     }
 
     private func setManagedState(sessionKey: String, state: String): Unit {
         synchronized(gatewayManagedSessionLock) {
             gatewayManagedStates.add(sessionKey, state)
         }
+        let _ = gatewaySubagentUpdateRunStatus(this.gwStore().sessionsRoot(), sessionKey, state)
     }
 
     private func setManagedFuture(sessionKey: String, future: Future<Unit>): Unit {
@@ -891,6 +897,26 @@ public class GatewayManagedSessionsToolset {
         if (effectiveTimeout >= 0) {
             result.put("timeoutSeconds", effectiveTimeout.toJsonValue())
         }
+        let runRecord = gatewaySubagentCreateRunRecord(
+            st.sessionsRoot(),
+            sessionKey,
+            parentSessionKey: "",
+            requesterSessionKey: "",
+            requesterChannel: "gateway",
+            agentId: agentIdText,
+            agentSource: if (runtimeText == "acp") { "acp" } else { "builtin" },
+            runtime: runtimeText,
+            task: trimmedTask,
+            label: labelText,
+            status: "queued",
+            cwd: if (cwdHint.isEmpty()) { CliConfig.cwd.toString() } else { cwdHint },
+            model: match (model) { case Some(v) => v.trimAscii() case None => "" },
+            thinking: match (thinking) { case Some(v) => v.trimAscii() case None => "" },
+            timeoutSeconds: effectiveTimeout,
+            transcriptPath: st.transcriptPath(sessionKey).toString()
+        )
+        let runId = gatewaySubagentRunRecordString(runRecord, "runId")
+        result.put("runId", JsonString(runId))
         if (!streamToText.isEmpty()) {
             result.put("compatNote", JsonString("streamTo is recorded, but this Gateway-managed toolset currently only streams output back into the managed session transcript."))
         }
@@ -1085,6 +1111,14 @@ public class GatewayManagedSessionsToolset {
             var count: Int64 = 0
             for (sessionKey in this.listManagedSpawnSessions()) {
                 let row = JsonObject()
+                match (gatewaySubagentFindRunBySessionKey(this.gwStore().sessionsRoot(), sessionKey)) {
+                    case Some(record) =>
+                        let runId = gatewaySubagentRunRecordString(record, "runId")
+                        if (!runId.isEmpty()) { row.put("runId", JsonString(runId)) }
+                        let persistedStatus = gatewaySubagentRunRecordString(record, "status")
+                        if (!persistedStatus.isEmpty()) { row.put("status", JsonString(persistedStatus)) }
+                    case None => row.put("runId", JsonString(sessionKey))
+                }
                 row.put("sessionKey", JsonString(sessionKey))
                 row.put("transcriptPath", JsonString(this.gwStore().transcriptPath(sessionKey).toString()))
                 row.put("runtime", JsonString(this.managedRuntime(sessionKey)))
@@ -1135,6 +1169,67 @@ public class GatewayManagedSessionsToolset {
                     result.put("compatNote", JsonString("recentMinutes=${v} was provided, but subagents list does not currently filter by recency."))
                 }
             }
+            let out = result.toJsonString()
+            PrintUtils.printToolResult(out)
+            return out
+        }
+
+        if (act == "status" || act == "poll" || act == "logs") {
+            let tgt = match (target) {
+                case Some(v) => v.trimAscii()
+                case None => ""
+            }
+            let recordOpt = gatewaySubagentResolveRunRecord(this.gwStore().sessionsRoot(), tgt)
+            let resolved = match (recordOpt) {
+                case Some(record) => gatewaySubagentRunRecordString(record, "sessionKey")
+                case None => this.resolveManagedSpawnTarget(tgt)
+            }
+            if (resolved.isEmpty()) {
+                let err = JsonObject()
+                err.put("ok", JsonBool(false))
+                err.put("status", JsonString("error"))
+                err.put("action", JsonString(act))
+                err.put("target", JsonString(tgt))
+                err.put("error", JsonString("Unknown subagent target."))
+                let out = err.toJsonString()
+                PrintUtils.printToolResult(out)
+                return out
+            }
+            let record = match (recordOpt) {
+                case Some(value) => value
+                case None =>
+                    match (gatewaySubagentFindRunBySessionKey(this.gwStore().sessionsRoot(), resolved)) {
+                        case Some(value) => value
+                        case None => JsonObject()
+                    }
+            }
+            if (act == "logs") {
+                let result = JsonObject()
+                result.put("ok", JsonBool(true))
+                result.put("status", JsonString("ok"))
+                result.put("action", JsonString("logs"))
+                result.put("runId", JsonString(if (gatewaySubagentRunRecordString(record, "runId").isEmpty()) { resolved } else { gatewaySubagentRunRecordString(record, "runId") }))
+                result.put("sessionKey", JsonString(resolved))
+                result.put("logs", JsonString(this.gwStore().formatHistoryAsText(resolved, 40)))
+                let out = result.toJsonString()
+                PrintUtils.printToolResult(out)
+                return out
+            }
+            let result = JsonObject()
+            result.put("ok", JsonBool(true))
+            result.put("status", JsonString("ok"))
+            result.put("action", JsonString(act))
+            if (!gatewaySubagentRunRecordString(record, "runId").isEmpty()) {
+                result.put("run", record)
+                result.put("runId", JsonString(gatewaySubagentRunRecordString(record, "runId")))
+            }
+            result.put("sessionKey", JsonString(resolved))
+            result.put("runtime", JsonString(this.managedRuntime(resolved)))
+            result.put("agentId", JsonString(this.managedAgentId(resolved)))
+            result.put("state", JsonString(this.managedState(resolved)))
+            result.put("hasLiveFuture", JsonBool(this.managedHasLiveFuture(resolved)))
+            result.put("hasLiveProcess", JsonBool(this.managedHasLiveProcess(resolved)))
+            result.put("transcriptPath", JsonString(this.gwStore().transcriptPath(resolved).toString()))
             let out = result.toJsonString()
             PrintUtils.printToolResult(out)
             return out
