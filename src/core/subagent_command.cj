@@ -31,12 +31,15 @@ public class GatewaySubagentCommandRequest {
 }
 
 public func gatewaySubagentCommandUsage(): String {
-    "Usage: /subagents spawn <agentId> \"<task>\" | list [current|all|agent:<id>] | status <runId> | logs <runId> | poll <runId> | kill <runId> | steer <runId> \"<message>\" | send <runId> \"<message>\""
+    "Usage: /subagents spawn <agentId> \"<task>\" | list [current|active|stale|history|all|agent:<id>] | status <runId> | logs <runId> | poll <runId> | kill <runId> | steer <runId> \"<message>\" | send <runId> \"<message>\""
 }
 
 public func gatewaySubagentCommandExamples(): Array<String> {
     [
         "/subagents",
+        "/subagents list active",
+        "/subagents list stale",
+        "/subagents list history",
         "/subagents list all",
         "/subagents spawn explorer \"inspect the current implementation\"",
         "/subagents status <runId>",

@@ -153,6 +153,80 @@ public class GatewayManagedSessionsToolsetTest {
     }
 
     @TestCase
+    public func subagentsListSeparatesActiveRowsFromStaleAndHistoryRows(): Unit {
+        withManagedSessionsToolsetTestHome("/tmp/metis-managed-subagents-toolset-list-active-history") {
+            let store = memorySessionStoreForGatewayUser(CliSettingManager.readGatewaySettings())
+            let staleRunning = gatewaySubagentCreateRunRecord(
+                store.sessionsRoot(),
+                "child-session-stale-running",
+                requesterSessionKey: "cli:main",
+                agentId: "explorer",
+                status: "running"
+            )
+            let succeeded = gatewaySubagentCreateRunRecord(
+                store.sessionsRoot(),
+                "child-session-succeeded",
+                requesterSessionKey: "cli:main",
+                agentId: "reviewer",
+                status: "succeeded"
+            )
+            let failed = gatewaySubagentCreateRunRecord(
+                store.sessionsRoot(),
+                "child-session-failed",
+                requesterSessionKey: "cli:main",
+                agentId: "planner",
+                status: "failed"
+            )
+            let staleRunId = gatewaySubagentRunRecordString(staleRunning, "runId")
+            let succeededRunId = gatewaySubagentRunRecordString(succeeded, "runId")
+            let failedRunId = gatewaySubagentRunRecordString(failed, "runId")
+            let toolset = GatewayManagedSessionsToolset()
+
+            gatewayWithToolRuntimeContext(GatewayToolRuntimeContext("cli", sessionKey: "cli:main")) {
+                let all = managedSubagentsJson(toolset.subagentsForTest(managedSubagentsSome("list"), managedSubagentsSome("all"), None<String>, None<Int64>))
+                @Expect(managedSubagentsString(all, "filter"), "all")
+                @Expect(managedSubagentsInt(all, "total"), 3)
+                @Expect(managedSubagentsInt(all, "activeCount"), 0)
+                @Expect(managedSubagentsInt(all, "staleCount"), 1)
+                @Expect(managedSubagentsInt(all, "terminalCount"), 2)
+                @Expect(all.get("sessions").getOrThrow().asArray().size(), 3)
+                @Expect(all.get("runs").getOrThrow().asArray().size(), 3)
+                @Expect(all.get("active").getOrThrow().asArray().size(), 0)
+                @Expect(all.get("stale").getOrThrow().asArray().size(), 1)
+                @Expect(managedSubagentsString(all.get("stale").getOrThrow().asArray()[0].asObject(), "runId"), staleRunId)
+                @Expect(all.get("stale").getOrThrow().asArray()[0].asObject().get("isStale").getOrThrow().asBool().getValue(), true)
+
+                let active = managedSubagentsJson(toolset.subagentsForTest(managedSubagentsSome("list"), managedSubagentsSome("active"), None<String>, None<Int64>))
+                @Expect(managedSubagentsString(active, "filter"), "active")
+                @Expect(managedSubagentsInt(active, "total"), 0)
+                @Expect(managedSubagentsInt(active, "activeCount"), 0)
+                @Expect(managedSubagentsInt(active, "terminalCount"), 0)
+                @Expect(managedSubagentsInt(active, "staleCount"), 0)
+                @Expect(active.get("sessions").getOrThrow().asArray().size(), 0)
+
+                let stale = managedSubagentsJson(toolset.subagentsForTest(managedSubagentsSome("list"), managedSubagentsSome("stale"), None<String>, None<Int64>))
+                @Expect(managedSubagentsString(stale, "filter"), "stale")
+                @Expect(managedSubagentsInt(stale, "total"), 1)
+                @Expect(managedSubagentsInt(stale, "activeCount"), 0)
+                @Expect(managedSubagentsInt(stale, "staleCount"), 1)
+                @Expect(managedSubagentsInt(stale, "terminalCount"), 0)
+                @Expect(managedSubagentsString(stale.get("sessions").getOrThrow().asArray()[0].asObject(), "runId"), staleRunId)
+
+                let history = managedSubagentsJson(toolset.subagentsForTest(managedSubagentsSome("list"), managedSubagentsSome("history"), None<String>, None<Int64>))
+                @Expect(managedSubagentsString(history, "filter"), "history")
+                @Expect(managedSubagentsInt(history, "total"), 2)
+                @Expect(managedSubagentsInt(history, "activeCount"), 0)
+                @Expect(managedSubagentsInt(history, "staleCount"), 0)
+                @Expect(managedSubagentsInt(history, "terminalCount"), 2)
+                @Expect(history.get("active").getOrThrow().asArray().size(), 0)
+                let historyJson = history.get("sessions").getOrThrow().asArray().toJsonString()
+                @Expect(historyJson.contains(succeededRunId), true)
+                @Expect(historyJson.contains(failedRunId), true)
+            }
+        }
+    }
+
+    @TestCase
     public func subagentsKillCancelsStaleNonTerminalRunWithoutDeletingTranscript(): Unit {
         withManagedSessionsToolsetTestHome("/tmp/metis-managed-subagents-toolset-kill-running") {
             let store = memorySessionStoreForGatewayUser(CliSettingManager.readGatewaySettings())

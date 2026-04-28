@@ -1983,23 +1983,50 @@ public class GatewayManagedSessionsToolset {
         PrintUtils.printTool("subagents", shortMessage: act)
 
         if (act == "list") {
-            let filter = match (target) {
+            let rawFilter = match (target) {
                 case Some(v) =>
                     let t = v.trimAscii()
                     if (t.isEmpty()) { "current" } else { t }
                 case None => "current"
             }
+            let normalizedFilter = rawFilter.trimAscii().toAsciiLower()
+            let activeOnly = normalizedFilter == "active" || normalizedFilter == "running"
+            let historyOnly = normalizedFilter == "history" || normalizedFilter == "terminal" || normalizedFilter == "completed"
+            let staleOnly = normalizedFilter == "stale" || normalizedFilter == "orphaned"
+            let filter = if (activeOnly || historyOnly || staleOnly) { "all" } else { rawFilter }
+            let active = JsonArray([])
+            let stale = JsonArray([])
             let sessions = JsonArray([])
+            let runs = JsonArray([])
             var count: Int64 = 0
+            var activeCount: Int64 = 0
+            var terminalCount: Int64 = 0
+            var staleCount: Int64 = 0
             for (record in gatewaySubagentListRunRecords(this.gwStore().sessionsRoot())) {
                 if (!this.managedRunMatchesListFilter(record, filter)) {
                     continue
                 }
-                let row = this.runRecordToManagedRow(record)
+                let isTerminal = gatewaySubagentRunStatusIsTerminal(gatewaySubagentRunRecordString(record, "status"))
                 let sessionKey = gatewaySubagentRunRecordString(record, "sessionKey")
+                let hasLiveFuture = this.managedHasLiveFuture(sessionKey)
+                let hasLiveProcess = this.managedHasLiveProcess(sessionKey)
+                let isLive = hasLiveFuture || hasLiveProcess
+                let isStale = !isTerminal && !isLive
+                let isActive = !isTerminal && isLive
+                if (activeOnly && !isActive) {
+                    continue
+                }
+                if (historyOnly && !isTerminal) {
+                    continue
+                }
+                if (staleOnly && !isStale) {
+                    continue
+                }
+                let row = this.runRecordToManagedRow(record)
                 let runtimeText = gatewaySubagentRunRecordString(record, "runtime")
                 let state = this.managedState(sessionKey)
                 if (!state.isEmpty()) { row.put("state", JsonString(state)) }
+                row.put("isStale", JsonBool(isStale))
                 if (runtimeText == "acp") {
                     let modeText = this.managedMode(sessionKey)
                     let sandboxText = this.managedSandbox(sessionKey)
@@ -2009,16 +2036,30 @@ public class GatewayManagedSessionsToolset {
                     row.put("effectiveSessionPersistence", JsonString(this.acpEffectiveSessionPersistence(modeText, threadText.trimAscii().toAsciiLower() == "true")))
                 }
                 sessions.add(row)
+                runs.add(row)
+                if (isTerminal) {
+                    terminalCount += 1
+                } else if (isActive) {
+                    active.add(row)
+                    activeCount += 1
+                } else {
+                    stale.add(row)
+                    staleCount += 1
+                }
                 count += 1
             }
             let result = JsonObject()
             result.put("ok", JsonBool(true))
             result.put("status", JsonString("ok"))
             result.put("action", JsonString("list"))
-            result.put("filter", JsonString(filter))
+            result.put("filter", JsonString(rawFilter))
             result.put("total", count.toJsonValue())
-            result.put("activeCount", count.toJsonValue())
-            result.put("active", sessions)
+            result.put("activeCount", activeCount.toJsonValue())
+            result.put("terminalCount", terminalCount.toJsonValue())
+            result.put("staleCount", staleCount.toJsonValue())
+            result.put("active", active)
+            result.put("stale", stale)
+            result.put("runs", runs)
             result.put("sessions", sessions)
             if (let Some(v) <- recentMinutes) {
                 if (v > 0) {
