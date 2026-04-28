@@ -197,6 +197,10 @@ public func gatewaySubagentCreateRunRecord(
     thinking!: String = "",
     timeoutSeconds!: Int64 = -1,
     contextMode!: String = "fresh",
+    isolationMode!: String = "shared",
+    worktreePath!: String = "",
+    sandbox!: String = "inherit",
+    cleanupMode!: String = "keep",
     transcriptPath!: String = ""
 ): JsonObject {
     let now = subagentNowMs()
@@ -226,10 +230,10 @@ public func gatewaySubagentCreateRunRecord(
     record.put("parentRunId", JsonString(""))
     record.put("children", JsonArray([]))
     record.put("contextMode", JsonString(gatewaySubagentNormalizeContextMode(contextMode)))
-    record.put("isolationMode", JsonString("shared"))
+    record.put("isolationMode", JsonString(gatewaySubagentNormalizeIsolationMode(isolationMode)))
     record.put("cwd", JsonString(cwd.trimAscii()))
-    record.put("worktreePath", JsonString(""))
-    record.put("sandbox", JsonString("inherit"))
+    record.put("worktreePath", JsonString(worktreePath.trimAscii()))
+    record.put("sandbox", JsonString(gatewaySubagentNormalizeSandboxMode(sandbox)))
     record.put("model", JsonString(model.trimAscii()))
     record.put("thinking", JsonString(thinking.trimAscii()))
     record.put("timeoutSeconds", timeoutSeconds.toJsonValue())
@@ -246,7 +250,7 @@ public func gatewaySubagentCreateRunRecord(
     record.put("noticeStatus", JsonString("none"))
     record.put("noticeAttempts", 0.toJsonValue())
     record.put("lastNoticeError", JsonString(""))
-    record.put("cleanupMode", JsonString("keep"))
+    record.put("cleanupMode", JsonString(gatewaySubagentNormalizeCleanupMode(cleanupMode)))
     record.put("fileReads", JsonArray([]))
     record.put("fileWrites", JsonArray([]))
     record.put("locks", JsonArray([]))

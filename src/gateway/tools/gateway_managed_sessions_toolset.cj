@@ -5,13 +5,13 @@ import magic.prelude.*
 
 import metis.core.config.{CliConfig, CliSettingManager}
 import metis.core.memory.{MemorySessionTranscriptStore, memorySessionStoreForGatewayUser}
-import metis.core.{GatewaySubagentAgentSpec, gatewayCurrentToolRuntimeContext, gatewaySubagentBuildBuiltinPrompt, gatewaySubagentBuildContextPrompt, gatewaySubagentBuildCustomPrompt, gatewaySubagentControllerCanAccessRun, gatewaySubagentCreateRunRecord, gatewaySubagentEvaluateSpawnPolicy, gatewaySubagentFindRunBySessionKey, gatewaySubagentIsBuiltinAgent, gatewaySubagentListRunRecords, gatewaySubagentMarkRunCancelled, gatewaySubagentMarkRunState, gatewaySubagentNormalizeBuiltinAgentId, gatewaySubagentNormalizeContextMode, gatewaySubagentNoticeShouldDeliver, gatewaySubagentNoticeTargetSession, gatewaySubagentPolicyDecisionToJson, gatewaySubagentPolicyRejectionJson, gatewaySubagentRenderNotice, gatewaySubagentResolveAgent, gatewaySubagentResolveRunRecord, gatewaySubagentRunMatchesControlFilter, gatewaySubagentRunRecordInt, gatewaySubagentRunRecordString, gatewaySubagentRunStatusIsTerminal, gatewaySubagentUpdateNoticeStatus, gatewaySubagentWriteRunRecord}
+import metis.core.{GatewaySubagentAgentSpec, gatewayCurrentToolRuntimeContext, gatewaySubagentBuildBuiltinPrompt, gatewaySubagentBuildContextPrompt, gatewaySubagentBuildCustomPrompt, gatewaySubagentControllerCanAccessRun, gatewaySubagentCreateRunRecord, gatewaySubagentEvaluateSpawnPolicy, gatewaySubagentFindRunBySessionKey, gatewaySubagentIsBuiltinAgent, gatewaySubagentListRunRecords, gatewaySubagentMarkRunCancelled, gatewaySubagentMarkRunState, gatewaySubagentNormalizeBuiltinAgentId, gatewaySubagentNormalizeCleanupMode, gatewaySubagentNormalizeContextMode, gatewaySubagentNormalizeIsolationMode, gatewaySubagentNormalizeSandboxMode, gatewaySubagentNoticeShouldDeliver, gatewaySubagentNoticeTargetSession, gatewaySubagentPolicyDecisionToJson, gatewaySubagentPolicyRejectionJson, gatewaySubagentRenderNotice, gatewaySubagentResolveAgent, gatewaySubagentResolveRunRecord, gatewaySubagentRunMatchesControlFilter, gatewaySubagentRunRecordInt, gatewaySubagentRunRecordString, gatewaySubagentRunStatusIsTerminal, gatewaySubagentUpdateNoticeStatus, gatewaySubagentWriteRunRecord}
 import metis.io.PrintUtils
 
 import std.collection.{ArrayList, HashMap}
 import std.convert.Parsable
 import std.core.Duration
-import std.fs.{Directory, File, OpenMode, Path, exists}
+import std.fs.{Directory, File, OpenMode, Path, exists, remove}
 import std.io.StringReader
 import std.process.*
 import std.sync.Mutex
@@ -23,6 +23,18 @@ private var gatewayManagedAgentIds = HashMap<String, String>()
 private var gatewayManagedStates = HashMap<String, String>()
 private var gatewayManagedFutures = HashMap<String, Future<Unit>>()
 private var gatewayManagedProcesses = HashMap<String, SubProcess>()
+
+private class GatewayManagedWorkspaceSpec {
+    public var ok: Bool = true
+    public var isolationMode: String = "shared"
+    public var cwd: String = ""
+    public var worktreePath: String = ""
+    public var sandbox: String = "inherit"
+    public var cleanupMode: String = "keep"
+    public var error: String = ""
+
+    public init() {}
+}
 
 @toolset
 public class GatewayManagedSessionsToolset {
@@ -49,6 +61,128 @@ public class GatewayManagedSessionsToolset {
 
     private func normalizeManagedAgentId(agentId: String): String {
         gatewaySubagentNormalizeBuiltinAgentId(agentId)
+    }
+
+    private func safeWorkspaceStem(raw: String): String {
+        var s = raw.trimAscii()
+        let bad = ["<", ">", ":", "\"", "/", "\\", "|", "?", "*", "\r", "\n", "\t", " "]
+        for (b in bad) {
+            s = s.replace(b, "_")
+        }
+        if (s.size > 80) {
+            s = s[0..80]
+        }
+        if (s.isEmpty()) {
+            return "subagent"
+        }
+        s
+    }
+
+    private func ensureManagedDir(path: Path): Unit {
+        if (!exists(path)) {
+            Directory.create(path, recursive: true)
+        }
+    }
+
+    private func createManagedWorktree(sessionKey: String, sourceDir: Path): (Bool, String, String) {
+        let root = CliConfig.dotDir.join("subagents").join("worktrees")
+        this.ensureManagedDir(root)
+        let worktree = root.join(this.safeWorkspaceStem(sessionKey))
+        if (exists(worktree)) {
+            return (true, worktree.toString(), "")
+        }
+        try {
+            let process = launch(
+                "git",
+                ["-C", sourceDir.toString(), "worktree", "add", "--detach", worktree.toString(), "HEAD"],
+                stdOut: ProcessRedirect.Pipe,
+                stdErr: ProcessRedirect.Pipe,
+                workingDirectory: Some(sourceDir)
+            )
+            let stdoutFuture = spawn {
+                let reader = StringReader(process.stdOutPipe)
+                try { reader.readToEnd() } catch (_: Exception) { "" }
+            }
+            let stderrFuture = spawn {
+                let reader = StringReader(process.stdErrPipe)
+                try { reader.readToEnd() } catch (_: Exception) { "" }
+            }
+            let exitCode = process.wait(timeout: Duration.second * 60)
+            let stdout = try { stdoutFuture.get() } catch (_: Exception) { "" }
+            let stderr = try { stderrFuture.get() } catch (_: Exception) { "" }
+            if (exitCode == 0) {
+                return (true, worktree.toString(), "")
+            }
+            return (false, worktree.toString(), "git worktree add failed: exitCode=${exitCode}; ${stderr.trimAscii()} ${stdout.trimAscii()}".trimAscii())
+        } catch (e: Exception) {
+            return (false, worktree.toString(), "git worktree add failed: ${e.message}")
+        }
+    }
+
+    private func prepareManagedWorkspace(
+        sessionKey: String,
+        cwdHint: String,
+        isolation: String,
+        cleanup: String,
+        sandbox: String
+    ): GatewayManagedWorkspaceSpec {
+        let spec = GatewayManagedWorkspaceSpec()
+        spec.isolationMode = gatewaySubagentNormalizeIsolationMode(isolation)
+        spec.cleanupMode = gatewaySubagentNormalizeCleanupMode(cleanup)
+        spec.sandbox = gatewaySubagentNormalizeSandboxMode(sandbox)
+        let hinted = cwdHint.trimAscii()
+        let source = if (hinted.isEmpty()) { CliConfig.cwd } else { Path(hinted) }
+
+        if (spec.isolationMode == "shared") {
+            spec.cwd = CliConfig.cwd.toString()
+            return spec
+        }
+        if (spec.isolationMode == "cwd") {
+            if (!exists(source)) {
+                spec.ok = false
+                spec.error = "cwd isolation path does not exist: ${source.toString()}"
+                return spec
+            }
+            spec.cwd = source.toString()
+            return spec
+        }
+
+        if (!exists(source)) {
+            spec.ok = false
+            spec.error = "worktree source path does not exist: ${source.toString()}"
+            return spec
+        }
+        let created = this.createManagedWorktree(sessionKey, source)
+        if (!created[0]) {
+            spec.ok = false
+            spec.worktreePath = created[1]
+            spec.error = created[2]
+            return spec
+        }
+        spec.worktreePath = created[1]
+        spec.cwd = created[1]
+        spec
+    }
+
+    private func cleanupManagedWorkspace(spec: GatewayManagedWorkspaceSpec): Unit {
+        if (spec.isolationMode != "worktree" || spec.cleanupMode != "delete" || spec.worktreePath.trimAscii().isEmpty()) {
+            return
+        }
+        try {
+            let process = launch(
+                "git",
+                ["worktree", "remove", "--force", spec.worktreePath],
+                stdOut: ProcessRedirect.Pipe,
+                stdErr: ProcessRedirect.Pipe,
+                workingDirectory: Some(CliConfig.cwd)
+            )
+            let exitCode = process.wait(timeout: Duration.second * 60)
+            if (exitCode != 0 && exists(Path(spec.worktreePath))) {
+                try { remove(Path(spec.worktreePath), recursive: true) } catch (_inner: Exception) { () }
+            }
+        } catch (_: Exception) {
+            try { remove(Path(spec.worktreePath), recursive: true) } catch (_inner: Exception) { () }
+        }
     }
 
     private func supportsRealManagedSubagent(agentId: String): Bool {
@@ -620,7 +754,7 @@ public class GatewayManagedSessionsToolset {
     }
 
     private func maybeDeleteManagedSessionAfterRun(sessionKey: String): Unit {
-        if (this.managedCleanup(sessionKey).trimAscii().toAsciiLower() == "delete") {
+        if (this.managedCleanup(sessionKey).trimAscii().toAsciiLower() == "delete-session") {
             let _ = this.gwStore().deleteSession(sessionKey)
             this.forgetManagedSession(sessionKey)
         }
@@ -776,7 +910,8 @@ public class GatewayManagedSessionsToolset {
         agentSpec!: Option<GatewaySubagentAgentSpec> = None,
         contextMode!: String = "fresh",
         parentSessionKey!: String = "",
-        parentHistory!: String = ""
+        parentHistory!: String = "",
+        workspaceSpec!: Option<GatewayManagedWorkspaceSpec> = None
     ): Bool {
         let resolvedSpec = match (agentSpec) {
             case Some(spec) => spec
@@ -789,9 +924,13 @@ public class GatewayManagedSessionsToolset {
         if (!this.tryQueueManagedRun(sessionKey, resolvedAgentId)) {
             return false
         }
+        let effectiveCwdHint = match (workspaceSpec) {
+            case Some(spec) => if (spec.cwd.trimAscii().isEmpty()) { cwdHint } else { spec.cwd }
+            case None => cwdHint
+        }
         let prompt = this.buildManagedSubagentPrompt(
             task,
-            cwdHint,
+            effectiveCwdHint,
             sessionKey,
             resolvedAgentId,
             agentSpec: Some(resolvedSpec),
@@ -803,7 +942,7 @@ public class GatewayManagedSessionsToolset {
             sessionKey,
             resolvedAgentId,
             prompt,
-            cwdHint,
+            effectiveCwdHint,
             agentDir: resolvedSpec.agentDir,
             modelHint: resolvedSpec.model
         )
@@ -882,6 +1021,10 @@ public class GatewayManagedSessionsToolset {
                     this.setManagedState(sessionKey, "failed", error: "subagent failed: ${e.message}", exitCode: 1, outputPath: outputPath)
                 }
             } finally {
+                match (workspaceSpec) {
+                    case Some(ws) => this.cleanupManagedWorkspace(ws)
+                    case None => ()
+                }
                 this.clearManagedProcess(sessionKey)
                 this.clearManagedFuture(sessionKey)
                 this.maybeDeleteManagedSessionAfterRun(sessionKey)
@@ -933,6 +1076,7 @@ public class GatewayManagedSessionsToolset {
             runTimeoutSeconds: "Optional run timeout hint.",
             timeoutSeconds: "Optional legacy timeout hint. Used only when runTimeoutSeconds is omitted.",
             contextMode: "Optional context inheritance mode for runtime=subagent: fresh, with_context, fork, or thread. Defaults to fresh.",
+            isolation: "Optional workspace isolation mode for runtime=subagent: shared, cwd, or worktree. Defaults to shared.",
             thread: "Optional thread mode hint.",
             mode: "Optional spawn mode hint: run or session.",
             cleanup: "Optional cleanup hint: delete or keep.",
@@ -952,6 +1096,7 @@ public class GatewayManagedSessionsToolset {
         runTimeoutSeconds: Option<Int64>,
         timeoutSeconds: Option<Int64>,
         contextMode: Option<String>,
+        isolation: Option<String>,
         thread: Option<Bool>,
         mode: Option<String>,
         cleanup: Option<String>,
@@ -970,6 +1115,7 @@ public class GatewayManagedSessionsToolset {
             runTimeoutSeconds,
             timeoutSeconds,
             contextMode,
+            isolation,
             thread,
             mode,
             cleanup,
@@ -990,6 +1136,7 @@ public class GatewayManagedSessionsToolset {
         runTimeoutSeconds: Option<Int64>,
         timeoutSeconds: Option<Int64>,
         contextMode: Option<String>,
+        isolation: Option<String>,
         thread: Option<Bool>,
         mode: Option<String>,
         cleanup: Option<String>,
@@ -1008,6 +1155,7 @@ public class GatewayManagedSessionsToolset {
             runTimeoutSeconds,
             timeoutSeconds,
             contextMode,
+            isolation,
             thread,
             mode,
             cleanup,
@@ -1028,6 +1176,7 @@ public class GatewayManagedSessionsToolset {
         runTimeoutSeconds: Option<Int64>,
         timeoutSeconds: Option<Int64>,
         contextMode: Option<String>,
+        isolation: Option<String>,
         thread: Option<Bool>,
         mode: Option<String>,
         cleanup: Option<String>,
@@ -1108,6 +1257,15 @@ public class GatewayManagedSessionsToolset {
             case Some(v) => v.trimAscii()
             case None => ""
         }
+        let isolationText = gatewaySubagentNormalizeIsolationMode(match (isolation) {
+            case Some(v) => v
+            case None => "shared"
+        })
+        let cleanupModeText = gatewaySubagentNormalizeCleanupMode(match (cleanup) {
+            case Some(v) => v
+            case None => "keep"
+        })
+        let sandboxModeText = gatewaySubagentNormalizeSandboxMode(requestedSandboxText)
         let contextModeText = gatewaySubagentNormalizeContextMode(match (contextMode) {
             case Some(v) => v
             case None => "fresh"
@@ -1122,7 +1280,7 @@ public class GatewayManagedSessionsToolset {
             runtimeText,
             effectiveTimeout,
             currentDepth,
-            requestedSandboxText
+            isolationText
         )
         effectiveTimeout = policyDecision.effectiveTimeoutSeconds
         if (!policyDecision.allowed) {
@@ -1138,6 +1296,36 @@ public class GatewayManagedSessionsToolset {
             err.put("ok", JsonBool(false))
             err.put("status", JsonString("error"))
             err.put("error", JsonString(sessionKey))
+            let out = err.toJsonString()
+            PrintUtils.printToolResult(out)
+            return out
+        }
+
+        let cwdHint = match (cwd) {
+            case Some(v) => v.trimAscii()
+            case None => ""
+        }
+        let workspaceSpec = if (runtimeText == "subagent") {
+            this.prepareManagedWorkspace(sessionKey, cwdHint, isolationText, cleanupModeText, sandboxModeText)
+        } else {
+            let ws = GatewayManagedWorkspaceSpec()
+            ws.cwd = if (cwdHint.isEmpty()) { CliConfig.cwd.toString() } else { cwdHint }
+            ws.isolationMode = "shared"
+            ws.cleanupMode = cleanupModeText
+            ws.sandbox = sandboxModeText
+            ws
+        }
+        if (!workspaceSpec.ok) {
+            st.appendTranscriptEntry(sessionKey, "system", "subagent workspace preparation failed: ${workspaceSpec.error}")
+            let err = JsonObject()
+            err.put("ok", JsonBool(false))
+            err.put("status", JsonString("error"))
+            err.put("error", JsonString(workspaceSpec.error))
+            err.put("sessionKey", JsonString(sessionKey))
+            err.put("runtime", JsonString(runtimeText))
+            err.put("agentId", JsonString(agentIdText))
+            err.put("isolationMode", JsonString(workspaceSpec.isolationMode))
+            err.put("worktreePath", JsonString(workspaceSpec.worktreePath))
             let out = err.toJsonString()
             PrintUtils.printToolResult(out)
             return out
@@ -1207,13 +1395,15 @@ public class GatewayManagedSessionsToolset {
             metadata.add("timeoutSeconds=${effectiveTimeout}")
         }
         metadata.add("contextMode=${contextModeText}")
+        metadata.add("isolationMode=${workspaceSpec.isolationMode}")
+        metadata.add("cleanupMode=${workspaceSpec.cleanupMode}")
+        metadata.add("sandbox=${workspaceSpec.sandbox}")
+        if (!workspaceSpec.worktreePath.trimAscii().isEmpty()) {
+            metadata.add("worktreePath=${workspaceSpec.worktreePath}")
+        }
 
         st.appendTranscriptEntry(sessionKey, "system", "sessions_spawn metadata: ${String.join(metadata.toArray(), delimiter: ", ")}")
 
-        let cwdHint = match (cwd) {
-            case Some(v) => v.trimAscii()
-            case None => ""
-        }
         let modeText = match (mode) {
             case Some(v) => v.trimAscii()
             case None => ""
@@ -1244,11 +1434,16 @@ public class GatewayManagedSessionsToolset {
         result.put("agentId", JsonString(agentIdText))
         result.put("agentSource", JsonString(agentSourceText))
         result.put("task", JsonString(trimmedTask))
-        result.put("cwd", JsonString(if (cwdHint.isEmpty()) { CliConfig.cwd.toString() } else { cwdHint }))
+        result.put("cwd", JsonString(workspaceSpec.cwd))
+        result.put("isolationMode", JsonString(workspaceSpec.isolationMode))
+        result.put("cleanupMode", JsonString(workspaceSpec.cleanupMode))
+        result.put("sandbox", JsonString(workspaceSpec.sandbox))
+        if (!workspaceSpec.worktreePath.trimAscii().isEmpty()) {
+            result.put("worktreePath", JsonString(workspaceSpec.worktreePath))
+        }
         if (!labelText.isEmpty()) { result.put("label", JsonString(labelText)) }
         if (!modeText.isEmpty()) { result.put("mode", JsonString(modeText)) }
         if (!cleanupText.isEmpty()) { result.put("cleanup", JsonString(cleanupText)) }
-        if (!sandboxText.isEmpty()) { result.put("sandbox", JsonString(sandboxText)) }
         if (!streamToText.isEmpty()) { result.put("streamTo", JsonString(streamToText)) }
         match (thread) {
             case Some(v) => result.put("thread", v.toJsonValue())
@@ -1271,11 +1466,15 @@ public class GatewayManagedSessionsToolset {
             task: trimmedTask,
             label: labelText,
             status: "queued",
-            cwd: if (cwdHint.isEmpty()) { CliConfig.cwd.toString() } else { cwdHint },
+            cwd: workspaceSpec.cwd,
             model: match (model) { case Some(v) => v.trimAscii() case None => "" },
             thinking: match (thinking) { case Some(v) => v.trimAscii() case None => "" },
             timeoutSeconds: effectiveTimeout,
             contextMode: contextModeText,
+            isolationMode: workspaceSpec.isolationMode,
+            worktreePath: workspaceSpec.worktreePath,
+            sandbox: workspaceSpec.sandbox,
+            cleanupMode: workspaceSpec.cleanupMode,
             transcriptPath: st.transcriptPath(sessionKey).toString()
         )
         let runMetadata = JsonObject()
@@ -1317,15 +1516,17 @@ public class GatewayManagedSessionsToolset {
                 sessionKey,
                 agentIdText,
                 trimmedTask,
-                cwdHint,
+                workspaceSpec.cwd,
                 runTimeoutSeconds: effectiveTimeout,
                 agentSpec: Some(resolvedAgentSpec),
                 contextMode: contextModeText,
                 parentSessionKey: requesterSessionKey,
-                parentHistory: parentHistory
+                parentHistory: parentHistory,
+                workspaceSpec: Some(workspaceSpec)
             ).toJsonValue())
         } else if (runtimeText == "subagent") {
             st.appendTranscriptEntry(sessionKey, "user", trimmedTask)
+            this.cleanupManagedWorkspace(workspaceSpec)
             result.put("liveRunStarted", JsonBool(false))
             result.put("compatNote", JsonString("The resolved subagent has background=false, so the task was recorded without launching a background turn."))
         } else if (runtimeText == "acp") {

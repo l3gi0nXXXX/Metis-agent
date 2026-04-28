@@ -3,9 +3,12 @@ package metis.gateway.tools
 import metis.core.{GatewayToolRuntimeContext, gatewaySubagentCreateRunRecord, gatewaySubagentResolveAgent, gatewaySubagentResolveRunRecord, gatewaySubagentRunRecordString, gatewayWithToolRuntimeContext}
 import metis.core.config.{CliConfig, CliSettingManager, MetisConfigManager}
 import metis.core.memory.memorySessionStoreForGatewayUser
+import metis.utils.ShellUtils
 
 import std.env.{getVariable, setVariable}
+import std.collection.ArrayList
 import std.fs.{Directory, File, Path, exists, remove}
+import std.core.Duration
 import std.time.DateTime
 import std.unittest.testmacro.*
 import stdx.encoding.json.{JsonObject, JsonValue}
@@ -77,6 +80,28 @@ private func createManagedSubagentsCustomAgentFixture(id: String, background: Bo
     )
     CliConfig.invalidatePathCache()
     agentDir
+}
+
+private func managedSubagentsRunGit(repo: Path, args: Array<String>): Bool {
+    let command = ArrayList<String>()
+    command.add("git")
+    for (arg in args) {
+        command.add(arg)
+    }
+    let result = ShellUtils.execute(command.toArray(), timeout: Some(Duration.second * 30), workDir: Some(repo), withWrap: false)
+    result[0] == 0
+}
+
+private func createManagedSubagentsGitRepo(name: String): Path {
+    let repo = CliConfig.dotDir.join(name)
+    Directory.create(repo, recursive: true)
+    File.writeTo(repo.join("README.md"), "# phase 11\n".toArray())
+    @Expect(managedSubagentsRunGit(repo, ["init"]), true)
+    @Expect(managedSubagentsRunGit(repo, ["config", "user.email", "metis-test@example.invalid"]), true)
+    @Expect(managedSubagentsRunGit(repo, ["config", "user.name", "Metis Test"]), true)
+    @Expect(managedSubagentsRunGit(repo, ["add", "README.md"]), true)
+    @Expect(managedSubagentsRunGit(repo, ["commit", "-m", "init"]), true)
+    repo
 }
 
 @Test
@@ -248,6 +273,7 @@ public class GatewayManagedSessionsToolsetTest {
                     None<Int64>,
                     None<Int64>,
                     None<String>,
+                    None<String>,
                     None<Bool>,
                     None<String>,
                     None<String>,
@@ -282,6 +308,7 @@ public class GatewayManagedSessionsToolsetTest {
                     None<String>,
                     None<Int64>,
                     None<Int64>,
+                    None<String>,
                     None<String>,
                     None<Bool>,
                     None<String>,
@@ -336,6 +363,7 @@ public class GatewayManagedSessionsToolsetTest {
                     None<Int64>,
                     None<Int64>,
                     Some("with-context"),
+                    None<String>,
                     None<Bool>,
                     None<String>,
                     None<String>,
@@ -350,6 +378,93 @@ public class GatewayManagedSessionsToolsetTest {
                 @Expect(managedSubagentsString(run, "contextMode"), "with_context")
                 @Expect(managedSubagentsString(run, "parentSessionKey"), "telegram:chat:phase10:topic:42")
                 @Expect(managedSubagentsString(run, "requesterThreadId"), "42")
+            }
+        }
+    }
+
+    @TestCase
+    public func sessionsSpawnCwdIsolationRecordsSpecifiedWorkspace(): Unit {
+        withManagedSessionsToolsetTestHome("/tmp/metis-managed-subagents-cwd-isolation") {
+            createManagedSubagentsCustomAgentFixture("phase11-cwd", false)
+            let workspace = CliConfig.dotDir.join("phase11-workspace")
+            Directory.create(workspace, recursive: true)
+            var settings = CliSettingManager.readGatewaySettings()
+            settings.subagents.allowCustomAgents = true
+            let _ = MetisConfigManager.setGatewaySettings(settings)
+            CliSettingManager.invalidate()
+            let toolset = GatewayManagedSessionsToolset()
+
+            gatewayWithToolRuntimeContext(GatewayToolRuntimeContext("cli", sessionKey: "cli:phase11")) {
+                let spawned = managedSubagentsJson(toolset.sessionsSpawnForCommand(
+                    "inspect cwd workspace",
+                    Some("cwd"),
+                    Some("subagent"),
+                    Some("phase11-cwd"),
+                    None<String>,
+                    None<String>,
+                    None<String>,
+                    Some(workspace.toString()),
+                    None<Int64>,
+                    None<Int64>,
+                    None<String>,
+                    Some("cwd"),
+                    None<Bool>,
+                    None<String>,
+                    None<String>,
+                    None<String>,
+                    None<String>
+                ))
+                @Expect(managedSubagentsString(spawned, "status"), "accepted")
+                @Expect(managedSubagentsString(spawned, "isolationMode"), "cwd")
+                @Expect(managedSubagentsString(spawned, "cwd"), workspace.toString())
+                let status = managedSubagentsJson(toolset.subagentsForTest(managedSubagentsSome("status"), managedSubagentsSome(managedSubagentsString(spawned, "runId")), None<String>, None<Int64>))
+                let run = status.get("run").getOrThrow().asObject()
+                @Expect(managedSubagentsString(run, "isolationMode"), "cwd")
+                @Expect(managedSubagentsString(run, "cwd"), workspace.toString())
+            }
+        }
+    }
+
+    @TestCase
+    public func sessionsSpawnWorktreeIsolationCreatesAndDeletesWorktreeWhenRequested(): Unit {
+        withManagedSessionsToolsetTestHome("/tmp/metis-managed-subagents-worktree-isolation") {
+            createManagedSubagentsCustomAgentFixture("phase11-worktree", false)
+            let repo = createManagedSubagentsGitRepo("phase11-source-repo")
+            var settings = CliSettingManager.readGatewaySettings()
+            settings.subagents.allowCustomAgents = true
+            let _ = MetisConfigManager.setGatewaySettings(settings)
+            CliSettingManager.invalidate()
+            let toolset = GatewayManagedSessionsToolset()
+
+            gatewayWithToolRuntimeContext(GatewayToolRuntimeContext("cli", sessionKey: "cli:phase11-worktree")) {
+                let spawned = managedSubagentsJson(toolset.sessionsSpawnForCommand(
+                    "inspect isolated worktree",
+                    Some("worktree"),
+                    Some("subagent"),
+                    Some("phase11-worktree"),
+                    None<String>,
+                    None<String>,
+                    None<String>,
+                    Some(repo.toString()),
+                    None<Int64>,
+                    None<Int64>,
+                    None<String>,
+                    Some("worktree"),
+                    None<Bool>,
+                    None<String>,
+                    Some("delete"),
+                    None<String>,
+                    None<String>
+                ))
+                @Expect(managedSubagentsString(spawned, "status"), "accepted")
+                @Expect(managedSubagentsString(spawned, "isolationMode"), "worktree")
+                let worktreePath = managedSubagentsString(spawned, "worktreePath")
+                @Expect(worktreePath.isEmpty(), false)
+                @Expect(exists(Path(worktreePath)), false)
+                let status = managedSubagentsJson(toolset.subagentsForTest(managedSubagentsSome("status"), managedSubagentsSome(managedSubagentsString(spawned, "runId")), None<String>, None<Int64>))
+                let run = status.get("run").getOrThrow().asObject()
+                @Expect(managedSubagentsString(run, "worktreePath"), worktreePath)
+                @Expect(managedSubagentsString(run, "cleanupMode"), "delete")
             }
         }
     }
