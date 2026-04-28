@@ -198,10 +198,26 @@ public class GatewayClient {
         this.request("events.pull", params: params)
     }
 
-    public func streamEvents(limit!: Int64 = 32, waitMs!: Int64 = 0, sinceId!: String = "", close!: Bool = false): GatewayRpcResponse {
+    public func streamEvents(
+        limit!: Int64 = 32,
+        waitMs!: Int64 = 0,
+        sinceId!: String = "",
+        close!: Bool = false,
+        eventKinds!: Array<String> = []
+    ): GatewayRpcResponse {
         let params = JsonObject()
         params.put("limit", limit.toJsonValue())
         params.put("waitMs", waitMs.toJsonValue())
+        if (eventKinds.size > 0) {
+            let kinds = JsonArray([])
+            for (kind in eventKinds) {
+                let normalized = kind.trimAscii()
+                if (!normalized.isEmpty()) {
+                    kinds.add(JsonString(normalized))
+                }
+            }
+            params.put("eventKinds", kinds)
+        }
         if (!sinceId.trimAscii().isEmpty()) {
             params.put("sinceId", sinceId.trimAscii().toJsonValue())
         }
@@ -227,11 +243,11 @@ public class GatewayClient {
         this.streamEvents(limit: 0, waitMs: 0, close: true)
     }
 
-    public func nextStream(waitMs!: Int64 = 0): GatewayRpcResponse {
+    public func nextStream(waitMs!: Int64 = 0, eventKinds!: Array<String> = []): GatewayRpcResponse {
         let sinceId = synchronized(gatewayClientRuntimeLock) {
             gatewayClientStringOr(this.connectParams.client.id, gatewayClientLastStreamCursorById, "")
         }
-        this.streamEvents(limit: 1, waitMs: waitMs, sinceId: sinceId)
+        this.streamEvents(limit: 1, waitMs: waitMs, sinceId: sinceId, eventKinds: eventKinds)
     }
 
     public func attachStream(waitMs!: Int64 = 0): GatewayRpcResponse {

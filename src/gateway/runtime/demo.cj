@@ -1,5 +1,6 @@
 package metis.gateway.runtime
 
+import metis.core.{gatewayClearSubagentNoticeDeliveryHook, gatewayClearSubagentNoticeEventHook, gatewayRegisterSubagentNoticeDeliveryHook}
 import metis.core.config.CliSettingManager
 import metis.gateway.config.buildGatewayConfigFromUserSettings
 import metis.gateway.gatewayPrepareStartupAuth
@@ -132,6 +133,17 @@ public func runGatewayService(): Unit {
     let gatewayCfg = buildGatewayConfigFromUserSettings(user)
     gatewayServeTimingLog("service-built", startMs)
     gatewayRegisterActiveService(gateway)
+    gatewayRegisterSubagentNoticeDeliveryHook({ channelName, accountId, peerId, notice, replyToMessageId, replyInThread =>
+        gateway.sendTextToPeerDetailed(
+            channelName,
+            peerId,
+            notice,
+            replyToMessageId: if (replyToMessageId.trimAscii().isEmpty()) { None<String> } else { Some<String>(replyToMessageId.trimAscii()) },
+            replyInThread: replyInThread,
+            accountId: accountId
+        )
+    })
+    gatewayEnsureSubagentNoticeEventPublisherRegistered()
     GatewayServer.startGatewayServer(options: gatewayServerOptionsFromConfig(gatewayCfg))
     gatewayServeTimingLog("rpc-server-started", startMs)
     let cronRunner = CronRunner(
@@ -221,6 +233,9 @@ public func runGatewayService(): Unit {
             ()
         }
         gatewayClearActiveService()
+        gatewayClearSubagentNoticeDeliveryHook()
+        gatewayClearSubagentNoticeEventHook()
+        gatewayResetSubagentNoticeEventPublisherRegistration()
         GatewayHttpSurface.stopIfRunning()
         GatewayServer.defaultServer().stopServer(reason: "gateway-serve-shutdown")
         gatewayPlatformMarkStopped(gatewayCfg)

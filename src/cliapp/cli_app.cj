@@ -143,19 +143,24 @@ protected class CliApp {
                 let _ = gatewayLaunchDedicatedConsole()
             }
         }
-        // Simplified event loop
-        while (true) {
-            // Update the context usage footnote after each input processing
-            this.setContextUsageFootnote()
+        let subagentNoticeWatcher = startCliSubagentNoticeWatcher()
+        try {
+            // Simplified event loop
+            while (true) {
+                // Update the context usage footnote after each input processing
+                this.setContextUsageFootnote()
 
-            let input = InputUtils.getUserInput()
-            if (input.trimAscii().isEmpty()) {
-                continue
+                let input = InputUtils.getUserInput()
+                if (input.trimAscii().isEmpty()) {
+                    continue
+                }
+                // Process input and check whether to continue
+                if (!processInput(this, input)) {
+                    break
+                }
             }
-            // Process input and check whether to continue
-            if (!processInput(this, input)) {
-                break
-            }
+        } finally {
+            subagentNoticeWatcher.stop()
         }
     }
 

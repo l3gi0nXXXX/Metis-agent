@@ -2270,6 +2270,34 @@ public func gatewayServerPublishSessionTranscriptEvent(
     published
 }
 
+public func gatewayServerPublishSubagentNoticeEvent(
+    sessionKey: String,
+    runId: String,
+    status: String,
+    notice: String,
+    detail!: String = "subagent-terminal-notice"
+): Int64 {
+    let normalizedSessionKey = sessionKey.trimAscii()
+    if (normalizedSessionKey.isEmpty()) {
+        return 0
+    }
+    let payload = gatewayServerBuildSessionMessageEventPayload(normalizedSessionKey)
+    payload.put("sessionKey", JsonString(normalizedSessionKey))
+    payload.put("runId", JsonString(runId.trimAscii()))
+    payload.put("status", JsonString(status.trimAscii()))
+    payload.put("notice", JsonString(notice))
+    payload.put("text", JsonString(notice))
+    payload.put("ts", gatewayServerNowMs().toJsonValue())
+    gatewayServerPublishSessionEventToTargets(
+        "session.subagent.notice",
+        detail,
+        payload,
+        { _clientId, _clientName, _clientMode =>
+            false
+        }
+    )
+}
+
 private func gatewayServerPublishSessionLifecycleForClient(
     clientId: String,
     state: String,

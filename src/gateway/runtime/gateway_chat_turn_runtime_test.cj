@@ -290,6 +290,48 @@ public class GatewayChatTurnRuntimeTest {
     }
 
     @TestCase
+    public func cliStreamCanReceiveSubagentNoticeEventsThroughGateway(): Unit {
+        let user = GatewayUserSettings()
+        let store = gatewaySessionStoreForUserWithAgentId(user, "general")
+        let sessionKey = "agent:general:subagent-notice-stream-test"
+        store.deleteSession(sessionKey)
+        store.appendAssistant(sessionKey, "hello")
+
+        let params = JsonObject()
+        let eventKinds = JsonArray([])
+        eventKinds.add(JsonString("session.subagent.notice"))
+        params.put("eventKinds", eventKinds)
+        let request = GatewayProtocolRequest(
+            "events.stream",
+            runtimeTestConnectParams("cli-subagent-notice-stream-test", "", sessionKey),
+            params: params
+        )
+        GatewayServer.defaultServer().request(request)
+
+        let published = gatewayServerPublishSubagentNoticeEvent(
+            sessionKey,
+            "subrun_gateway_event_test",
+            "succeeded",
+            "[Subagent succeeded] reviewer subrun_gateway_event_test"
+        )
+        @Expect(published, 1)
+
+        let stream = GatewayServer.defaultServer().streamEvents("cli-subagent-notice-stream-test", limit: 8)
+        let pull = stream.get("pull").getOrThrow().asObject()
+        let events = pull.get("events").getOrThrow().asArray()
+        @Expect(events.size(), 1)
+        let event = events[0].asObject()
+        @Expect(runtimeTestString(event, "kind"), "session.subagent.notice")
+        let payload = event.get("payload").getOrThrow().asObject()
+        @Expect(runtimeTestString(payload, "sessionKey"), sessionKey)
+        @Expect(runtimeTestString(payload, "runId"), "subrun_gateway_event_test")
+        @Expect(runtimeTestString(payload, "notice").contains("[Subagent succeeded]"), true)
+
+        GatewayServer.defaultServer().stopAndWait(clientId: "cli-subagent-notice-stream-test", timeoutMs: 1000)
+        store.deleteSession(sessionKey)
+    }
+
+    @TestCase
     public func sessionEventSubscriberRegistryAppearsInSnapshot(): Unit {
         let user = GatewayUserSettings()
         let store = gatewaySessionStoreForUserWithAgentId(user, "general")

@@ -57,6 +57,26 @@ private func normalizeSubagentStatus(status: String): String {
     }
 }
 
+private func subagentRecordLatestScore(record: JsonObject): Int64 {
+    let updatedAt = subagentJsonInt(record, "lastUpdatedAtMs")
+    let createdAt = subagentJsonInt(record, "createdAtMs")
+    if (updatedAt > 0) { updatedAt } else { createdAt }
+}
+
+private func subagentRecordIsNewer(candidate: JsonObject, current: JsonObject): Bool {
+    let candidateScore = subagentRecordLatestScore(candidate)
+    let currentScore = subagentRecordLatestScore(current)
+    if (candidateScore != currentScore) {
+        return candidateScore > currentScore
+    }
+    let candidateCreatedAt = subagentJsonInt(candidate, "createdAtMs")
+    let currentCreatedAt = subagentJsonInt(current, "createdAtMs")
+    if (candidateCreatedAt != currentCreatedAt) {
+        return candidateCreatedAt > currentCreatedAt
+    }
+    subagentJsonString(candidate, "runId") > subagentJsonString(current, "runId")
+}
+
 public func gatewaySubagentRunsRoot(sessionsRoot: Path): Path {
     sessionsRoot.parent.join("subagents").join("runs")
 }
@@ -253,6 +273,13 @@ public func gatewaySubagentCreateRunRecord(
     record.put("noticeStatus", JsonString("none"))
     record.put("noticeAttempts", 0.toJsonValue())
     record.put("lastNoticeError", JsonString(""))
+    record.put("channelNoticeStatus", JsonString("none"))
+    record.put("channelNoticeAttempts", 0.toJsonValue())
+    record.put("lastChannelNoticeError", JsonString(""))
+    record.put("channelNoticeMessageId", JsonString(""))
+    record.put("realtimeNoticeStatus", JsonString("none"))
+    record.put("realtimeNoticeAttempts", 0.toJsonValue())
+    record.put("lastRealtimeNoticeError", JsonString(""))
     record.put("cleanupMode", JsonString(gatewaySubagentNormalizeCleanupMode(cleanupMode)))
     record.put("fileReads", JsonArray([]))
     record.put("fileWrites", JsonArray([]))
@@ -268,15 +295,14 @@ public func gatewaySubagentFindRunBySessionKey(sessionsRoot: Path, sessionKey: S
         return None
     }
     var found: Option<JsonObject> = None<JsonObject>
-    var foundUpdatedAt: Int64 = -1
     for (record in gatewaySubagentListRunRecords(sessionsRoot)) {
         if (subagentJsonString(record, "sessionKey") == target) {
-            let updatedAt = subagentJsonInt(record, "lastUpdatedAtMs")
-            let createdAt = subagentJsonInt(record, "createdAtMs")
-            let score = if (updatedAt > 0) { updatedAt } else { createdAt }
-            if (found.isNone() || score >= foundUpdatedAt) {
-                found = Some<JsonObject>(record)
-                foundUpdatedAt = score
+            match (found) {
+                case Some(current) =>
+                    if (subagentRecordIsNewer(record, current)) {
+                        found = Some<JsonObject>(record)
+                    }
+                case None => found = Some<JsonObject>(record)
             }
         }
     }
@@ -293,7 +319,6 @@ public func gatewaySubagentResolveRunRecord(sessionsRoot: Path, target: String):
         case None => ()
     }
     var exactSession: Option<JsonObject> = None<JsonObject>
-    var exactSessionUpdatedAt: Int64 = -1
     let fuzzyMatches = ArrayList<JsonObject>()
     for (record in gatewaySubagentListRunRecords(sessionsRoot)) {
         let runId = subagentJsonString(record, "runId")
@@ -303,12 +328,12 @@ public func gatewaySubagentResolveRunRecord(sessionsRoot: Path, target: String):
             return Some(record)
         }
         if (sessionKey == trimmed) {
-            let updatedAt = subagentJsonInt(record, "lastUpdatedAtMs")
-            let createdAt = subagentJsonInt(record, "createdAtMs")
-            let score = if (updatedAt > 0) { updatedAt } else { createdAt }
-            if (exactSession.isNone() || score >= exactSessionUpdatedAt) {
-                exactSession = Some<JsonObject>(record)
-                exactSessionUpdatedAt = score
+            match (exactSession) {
+                case Some(current) =>
+                    if (subagentRecordIsNewer(record, current)) {
+                        exactSession = Some<JsonObject>(record)
+                    }
+                case None => exactSession = Some<JsonObject>(record)
             }
             continue
         }

@@ -5,7 +5,7 @@ import magic.prelude.*
 
 import metis.core.config.{CliConfig, CliSettingManager}
 import metis.core.memory.{MemorySessionTranscriptStore, memorySessionStoreForGatewayUser}
-import metis.core.{GatewaySubagentAgentSpec, GatewaySubagentEffectiveState, gatewayCurrentToolRuntimeContext, gatewaySubagentBuildBuiltinPrompt, gatewaySubagentBuildContextPrompt, gatewaySubagentBuildCustomPrompt, gatewaySubagentControllerCanAccessRun, gatewaySubagentCreateRunRecord, gatewaySubagentEvaluateSpawnPolicy, gatewaySubagentFindRunBySessionKey, gatewaySubagentIsBuiltinAgent, gatewaySubagentListRunRecords, gatewaySubagentMarkRunCancelled, gatewaySubagentMarkRunState, gatewaySubagentMarkRunTimedOut, gatewaySubagentNormalizeBuiltinAgentId, gatewaySubagentNormalizeCleanupMode, gatewaySubagentNormalizeContextMode, gatewaySubagentNormalizeIsolationMode, gatewaySubagentNormalizeSandboxMode, gatewaySubagentNoticeShouldDeliver, gatewaySubagentNoticeTargetSession, gatewaySubagentPolicyDecisionToJson, gatewaySubagentPolicyRejectionJson, gatewaySubagentPutEffectiveState, gatewaySubagentRenderNotice, gatewaySubagentResolveAgent, gatewaySubagentResolveEffectiveState, gatewaySubagentResolveRunRecord, gatewaySubagentRunMatchesControlFilter, gatewaySubagentRunRecordInt, gatewaySubagentRunRecordString, gatewaySubagentRunStatusIsTerminal, gatewaySubagentUpdateNoticeStatus, gatewaySubagentWriteRunRecord}
+import metis.core.{GatewaySubagentAgentSpec, GatewaySubagentEffectiveState, gatewayCurrentToolRuntimeContext, gatewaySubagentBuildBuiltinPrompt, gatewaySubagentBuildContextPrompt, gatewaySubagentBuildCustomPrompt, gatewaySubagentControllerCanAccessRun, gatewaySubagentCreateRunRecord, gatewaySubagentDeliverNoticeToChannel, gatewaySubagentEvaluateSpawnPolicy, gatewaySubagentFindRunBySessionKey, gatewaySubagentIsBuiltinAgent, gatewaySubagentListRunRecords, gatewaySubagentMarkRunCancelled, gatewaySubagentMarkRunState, gatewaySubagentMarkRunTimedOut, gatewaySubagentNormalizeBuiltinAgentId, gatewaySubagentNormalizeCleanupMode, gatewaySubagentNormalizeContextMode, gatewaySubagentNormalizeIsolationMode, gatewaySubagentNormalizeSandboxMode, gatewaySubagentNoticeShouldDeliver, gatewaySubagentNoticeTargetSession, gatewaySubagentPolicyDecisionToJson, gatewaySubagentPolicyRejectionJson, gatewaySubagentPublishNoticeEvent, gatewaySubagentPutEffectiveState, gatewaySubagentRenderNotice, gatewaySubagentResolveAgent, gatewaySubagentResolveEffectiveState, gatewaySubagentResolveRunRecord, gatewaySubagentRunMatchesControlFilter, gatewaySubagentRunRecordInt, gatewaySubagentRunRecordString, gatewaySubagentRunStatusIsTerminal, gatewaySubagentUpdateChannelNoticeStatus, gatewaySubagentUpdateNoticeStatus, gatewaySubagentWriteRunRecord}
 import metis.io.PrintUtils
 
 import std.collection.{ArrayList, HashMap}
@@ -316,6 +316,20 @@ public class GatewayManagedSessionsToolset {
         }
     }
 
+    private func jsonStringField(obj: JsonObject, key: String): String {
+        match (obj.get(key)) {
+            case Some(v) => try { v.asString().getValue().trimAscii() } catch (_: Exception) { "" }
+            case None => ""
+        }
+    }
+
+    private func jsonBoolField(obj: JsonObject, key: String): Bool {
+        match (obj.get(key)) {
+            case Some(v) => try { v.asBool().getValue() } catch (_: Exception) { false }
+            case None => false
+        }
+    }
+
     private func currentControllerSessionKey(): String {
         match (gatewayCurrentToolRuntimeContext()) {
             case Some(ctx) => ctx.sessionKey.trimAscii()
@@ -414,6 +428,7 @@ public class GatewayManagedSessionsToolset {
         row.put("agentId", JsonString(gatewaySubagentRunRecordString(record, "agentId")))
         row.put("requesterSessionKey", JsonString(gatewaySubagentRunRecordString(record, "requesterSessionKey")))
         row.put("noticeStatus", JsonString(gatewaySubagentRunRecordString(record, "noticeStatus")))
+        row.put("channelNoticeStatus", JsonString(gatewaySubagentRunRecordString(record, "channelNoticeStatus")))
         row.put("hasLiveFuture", this.managedHasLiveFuture(sessionKey).toJsonValue())
         row.put("hasLiveProcess", this.managedHasLiveProcess(sessionKey).toJsonValue())
         row.put("transcriptPath", JsonString(this.gwStore().transcriptPath(sessionKey).toString()))
@@ -484,6 +499,41 @@ public class GatewayManagedSessionsToolset {
         }
     }
 
+    private func deliverManagedChannelTerminalNotice(record: JsonObject, notice: String): Unit {
+        let requesterSessionKey = gatewaySubagentNoticeTargetSession(record)
+        if (requesterSessionKey.trimAscii().isEmpty()) {
+            return
+        }
+        let snapshot = this.gwStore().readLatestBindingSnapshot(requesterSessionKey)
+        let channelName = this.jsonStringField(snapshot, "channel")
+        let peerId = this.jsonStringField(snapshot, "peer")
+        if (channelName.isEmpty() || peerId.isEmpty()) {
+            return
+        }
+        match (channelName) {
+            case "telegram" | "feishu" | "qq" => ()
+            case _ => return
+        }
+        let accountId = this.jsonStringField(snapshot, "accountId")
+        let replyToMessageId = this.jsonStringField(snapshot, "replyToMessageId")
+        let replyInThread = this.jsonBoolField(snapshot, "replyInThread")
+        let runId = gatewaySubagentRunRecordString(record, "runId")
+        let target = if (!runId.isEmpty()) { runId } else { gatewaySubagentRunRecordString(record, "sessionKey") }
+        try {
+            let messageId = gatewaySubagentDeliverNoticeToChannel(
+                channelName,
+                accountId,
+                peerId,
+                notice,
+                replyToMessageId: replyToMessageId,
+                replyInThread: replyInThread
+            )
+            let _ = gatewaySubagentUpdateChannelNoticeStatus(this.gwStore().sessionsRoot(), target, "delivered", messageId: messageId)
+        } catch (e: Exception) {
+            let _ = gatewaySubagentUpdateChannelNoticeStatus(this.gwStore().sessionsRoot(), target, "failed", error: e.message)
+        }
+    }
+
     private func deliverManagedTerminalNotice(sessionKey: String): Unit {
         let st = this.gwStore()
         let record = match (gatewaySubagentResolveRunRecord(st.sessionsRoot(), sessionKey)) {
@@ -499,6 +549,10 @@ public class GatewayManagedSessionsToolset {
         try {
             st.appendTranscriptEntry(effectiveTarget, "system", notice)
             let _ = gatewaySubagentUpdateNoticeStatus(st.sessionsRoot(), sessionKey, "delivered")
+            let runId = gatewaySubagentRunRecordString(record, "runId")
+            let status = gatewaySubagentRunRecordString(record, "status")
+            let _ = gatewaySubagentPublishNoticeEvent(effectiveTarget, runId, status, notice)
+            this.deliverManagedChannelTerminalNotice(record, notice)
         } catch (e: Exception) {
             let _ = gatewaySubagentUpdateNoticeStatus(st.sessionsRoot(), sessionKey, "failed", error: e.message)
         }

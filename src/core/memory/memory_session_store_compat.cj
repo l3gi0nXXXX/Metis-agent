@@ -8,7 +8,7 @@ import std.collection.ArrayList
 import std.fs.{Path, File, Directory, FileInfo, exists, remove, OpenMode, copy, FSException}
 import std.time.DateTime
 
-import stdx.encoding.json.{JsonObject, JsonString, JsonValue}
+import stdx.encoding.json.{JsonBool, JsonObject, JsonString, JsonValue}
 
 public func memorySanitizeGatewayAgentId(raw: String): String {
     var s = raw.trimAscii().replace("/", "_").replace("\\", "_").replace("..", "_").replace(":", "_")
@@ -191,6 +191,23 @@ public class MemorySessionTranscriptStore {
         }
     }
 
+    public func readLatestBindingSnapshot(sessionKeyOrStem: String): JsonObject {
+        match (this.readTranscriptRaw(sessionKeyOrStem)) {
+            case Some(raw) =>
+                let objs = MemorySessionTranscriptStore.parseJsonlTextToObjects(raw)
+                var i = objs.size - 1
+                while (i >= 0) {
+                    match (MemorySessionTranscriptStore.parseBindingSnapshotFromObject(objs[i])) {
+                        case Some(binding) => return binding
+                        case None => ()
+                    }
+                    i -= 1
+                }
+                JsonObject()
+            case None => JsonObject()
+        }
+    }
+
     public func deleteSession(sessionKeyOrStem: String): Bool {
         var p = this.transcriptPath(sessionKeyOrStem)
         if (!exists(p) && !sessionKeyOrStem.contains(":")) {
@@ -293,6 +310,29 @@ public class MemorySessionTranscriptStore {
             case None => return None
         }
         Some((role, txt))
+    }
+
+    private static func parseBindingSnapshotFromObject(o: JsonObject): Option<JsonObject> {
+        match (o.get("kind")) {
+            case Some(kindVal) =>
+                if (kindVal.asString().getValue() != "binding") {
+                    return None
+                }
+            case None => return None
+        }
+        let normalized = JsonObject()
+        normalized.put("channel", o.get("channel") ?? JsonString(""))
+        normalized.put("peer", o.get("peer") ?? JsonString(""))
+        normalized.put("accountId", o.get("accountId") ?? JsonString(""))
+        normalized.put("conversationId", o.get("conversationId") ?? JsonString(""))
+        normalized.put("threadId", o.get("threadId") ?? JsonString(""))
+        normalized.put("sourceMessageId", o.get("sourceMessageId") ?? JsonString(""))
+        normalized.put("replyToMessageId", o.get("replyToMessageId") ?? JsonString(""))
+        normalized.put("replyTargetMessageId", o.get("replyTargetMessageId") ?? o.get("replyToMessageId") ?? JsonString(""))
+        normalized.put("replyInThread", o.get("replyInThread") ?? JsonBool(false))
+        normalized.put("deliverable", o.get("deliverable") ?? JsonBool(false))
+        normalized.put("mode", o.get("mode") ?? JsonString("binding-snapshot"))
+        Some(normalized)
     }
 
     private static func readMetaSessionKey(path: Path): Option<String> {
