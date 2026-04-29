@@ -110,6 +110,13 @@ public class TelegramAdapter <: ChannelAdapter {
     private var webhookCleanupError: String = ""
     private var webhookCleanupAtMs: Int64 = 0
     private var pollingWebhookCleared: Bool = false
+    private var lastInboundDecision: String = "none"
+    private var lastInboundReason: String = ""
+    private var lastInboundUpdateKind: String = ""
+    private var lastInboundUpdateIdForPolicy: String = ""
+    private var lastInboundPeerId: String = ""
+    private var lastInboundSenderId: String = ""
+    private var lastInboundMessageIdForPolicy: String = ""
 
     public init(
         config!: TelegramConfig = TelegramConfig(),
@@ -339,6 +346,10 @@ public class TelegramAdapter <: ChannelAdapter {
         this.buildWebhookLifecycleDiagnostics()
     }
 
+    public func debugBuildInboundPolicyDiagnostics(): JsonObject {
+        this.buildInboundPolicyDiagnostics()
+    }
+
     public func debugValidateWebhookSecretForTest(secretHeader: String): Bool {
         this.validateWebhookSecretHeader(secretHeader)
     }
@@ -464,6 +475,7 @@ public class TelegramAdapter <: ChannelAdapter {
         }
         let updateId = this.readIntStringField(root, "update_id")
         if (!this.beginUpdateProcessing(updateId, dedupeByOffset: dedupeByOffset)) {
+            this.recordInboundDecision(updateId, this.primaryUpdateKind(root), "ignored", "duplicate_update")
             return "{\"ok\":true,\"ignored\":true,\"duplicate\":true}"
         }
         try {
@@ -472,6 +484,15 @@ public class TelegramAdapter <: ChannelAdapter {
                     this.inboundQueue.add(inbound)
                 }
                 this.maybeAckInboundReaction(inbound)
+                this.recordInboundDecision(
+                    updateId,
+                    this.primaryUpdateKind(root),
+                    "accepted",
+                    "",
+                    peerId: inbound.peerId,
+                    senderId: inbound.senderId,
+                    messageId: inbound.messageId
+                )
                 this.completeUpdateProcessing(updateId)
                 return "{\"ok\":true}"
             }
@@ -826,12 +847,20 @@ public class TelegramAdapter <: ChannelAdapter {
         }
         let message = this.pickPrimaryUpdateObject(root)
         if (message.isNone()) {
+            this.recordInboundDecision(this.readIntStringField(root, "update_id"), this.primaryUpdateKind(root), "ignored", "unsupported_update_kind")
             return None
         }
         let msg = message.getOrThrow()
         let messageId = this.readIntStringField(msg, "message_id")
         let text = this.normalizeInboundTelegramCommandText(this.readInboundTelegramText(msg))
         if (messageId.isEmpty() || text.isEmpty()) {
+            this.recordInboundDecision(
+                this.readIntStringField(root, "update_id"),
+                this.primaryUpdateKind(root),
+                "ignored",
+                "unsupported_or_empty_message",
+                messageId: messageId
+            )
             return None
         }
         let chat = this.readObjectField(msg, "chat")
@@ -868,7 +897,17 @@ public class TelegramAdapter <: ChannelAdapter {
                 this.persistInboundMedia(kind, fileId, caption: this.readStringField(msg, "caption").trimAscii())
             case None => ()
         }
-        if (!this.acceptsInbound(inbound)) {
+        let rejectReason = this.inboundRejectReason(inbound)
+        if (!rejectReason.isEmpty()) {
+            this.recordInboundDecision(
+                this.readIntStringField(root, "update_id"),
+                this.primaryUpdateKind(root),
+                "ignored",
+                rejectReason,
+                peerId: inbound.peerId,
+                senderId: inbound.senderId,
+                messageId: inbound.messageId
+            )
             return None
         }
         Some(inbound)
@@ -1097,7 +1136,17 @@ public class TelegramAdapter <: ChannelAdapter {
             raw: Some(raw),
             accountId: this.effectiveAccountId()
         )
-        if (!this.acceptsInbound(inbound)) {
+        let rejectReason = this.inboundRejectReason(inbound)
+        if (!rejectReason.isEmpty()) {
+            this.recordInboundDecision(
+                this.readIntStringField(root, "update_id"),
+                "message_reaction",
+                "ignored",
+                rejectReason,
+                peerId: inbound.peerId,
+                senderId: inbound.senderId,
+                messageId: inbound.messageId
+            )
             return None
         }
         Some(inbound)
@@ -1327,6 +1376,9 @@ public class TelegramAdapter <: ChannelAdapter {
         summary.put("pollingState", polling.get("state") ?? JsonString("idle"))
         summary.put("pollingConsecutiveFailures", polling.get("consecutiveFailures") ?? 0.toJsonValue())
         summary.put("pollingLastOutcome", polling.get("lastOutcome") ?? JsonString("idle"))
+        let inboundPolicy = this.buildInboundPolicyDiagnostics()
+        summary.put("lastInboundDecision", inboundPolicy.get("lastDecision") ?? JsonString("none"))
+        summary.put("lastInboundReason", inboundPolicy.get("lastReason") ?? JsonString(""))
         summary.put("healthy", (this.readJsonBoolField(getMe, "ok", false) && this.readJsonBoolField(webhookInfo, "ok", false)).toJsonValue())
         let bot = JsonObject()
         match (getMe.get("result")) {
@@ -1369,6 +1421,7 @@ public class TelegramAdapter <: ChannelAdapter {
         out.put("account", account)
         out.put("media", media)
         out.put("polling", polling)
+        out.put("inboundPolicy", inboundPolicy)
         out.put("webhookLifecycle", this.buildWebhookLifecycleDiagnostics())
         out.put("nativeCommands", this.buildNativeCommandDiagnostics())
         out.put("getMe", getMe)
@@ -1387,6 +1440,18 @@ public class TelegramAdapter <: ChannelAdapter {
         out.put("cleanupAtMs", this.webhookCleanupAtMs.toJsonValue())
         out.put("pollingWebhookCleared", this.pollingWebhookCleared.toJsonValue())
         out.put("secretConfigured", (!this.config.webhookSecret.trimAscii().isEmpty()).toJsonValue())
+        out
+    }
+
+    private func buildInboundPolicyDiagnostics(): JsonObject {
+        let out = JsonObject()
+        out.put("lastDecision", JsonString(this.lastInboundDecision))
+        out.put("lastReason", JsonString(this.lastInboundReason))
+        out.put("lastUpdateKind", JsonString(this.lastInboundUpdateKind))
+        out.put("lastUpdateId", JsonString(this.lastInboundUpdateIdForPolicy))
+        out.put("lastPeerId", JsonString(this.lastInboundPeerId))
+        out.put("lastSenderId", JsonString(this.lastInboundSenderId))
+        out.put("lastMessageId", JsonString(this.lastInboundMessageIdForPolicy))
         out
     }
 
@@ -2670,6 +2735,33 @@ public class TelegramAdapter <: ChannelAdapter {
         None
     }
 
+    private func primaryUpdateKind(root: JsonObject): String {
+        for (key in ["message", "edited_message", "channel_post", "edited_channel_post", "message_reaction", "callback_query"]) {
+            if (root.get(key).isSome()) {
+                return key
+            }
+        }
+        "unknown"
+    }
+
+    private func recordInboundDecision(
+        updateId: String,
+        updateKind: String,
+        decision: String,
+        reason: String,
+        peerId!: String = "",
+        senderId!: String = "",
+        messageId!: String = ""
+    ): Unit {
+        this.lastInboundDecision = decision.trimAscii()
+        this.lastInboundReason = reason.trimAscii()
+        this.lastInboundUpdateKind = updateKind.trimAscii()
+        this.lastInboundUpdateIdForPolicy = updateId.trimAscii()
+        this.lastInboundPeerId = peerId.trimAscii()
+        this.lastInboundSenderId = senderId.trimAscii()
+        this.lastInboundMessageIdForPolicy = messageId.trimAscii()
+    }
+
     private func detectMention(text: String): Bool {
         let normalized = text.trimAscii()
         if (normalized.isEmpty()) {
@@ -2685,35 +2777,45 @@ public class TelegramAdapter <: ChannelAdapter {
     }
 
     private func acceptsInbound(message: InboundMessage): Bool {
+        this.inboundRejectReason(message).isEmpty()
+    }
+
+    private func inboundRejectReason(message: InboundMessage): String {
         match (message.chatType) {
-            case ChatType.Direct => return this.acceptsDirectInbound(message)
-            case ChatType.Group => return this.acceptsGroupInbound(message)
+            case ChatType.Direct => return this.directInboundRejectReason(message)
+            case ChatType.Group => return this.groupInboundRejectReason(message)
         }
     }
 
-    private func acceptsDirectInbound(message: InboundMessage): Bool {
+    private func directInboundRejectReason(message: InboundMessage): String {
         let policy = this.config.dmPolicy.trimAscii().toAsciiLower()
         if (policy == "disabled") {
-            return false
+            return "dm_disabled"
         }
         if (policy == "open") {
-            return this.allowlistContainsWildcard(this.config.allowFrom)
+            if (this.allowlistContainsWildcard(this.config.allowFrom)) {
+                return ""
+            }
+            return "dm_open_requires_wildcard"
         }
         if (policy == "allowlist") {
-            return this.senderAllowed(this.config.allowFrom, message.senderId)
+            if (this.senderAllowed(this.config.allowFrom, message.senderId)) {
+                return ""
+            }
+            return "dm_sender_not_allowed"
         }
         if (policy == "pairing") {
             if (this.pairingStore.isApproved(message.senderId)) {
-                return true
+                return ""
             }
             let existingCode = this.pairingStore.pendingCodeForSender(message.senderId)
             let code = this.pairingStore.ensurePending(message.senderId)
             if (existingCode.isEmpty() && !code.isEmpty()) {
                 this.sendPairingPrompt(message.senderId, code)
             }
-            return false
+            return "dm_pairing_required"
         }
-        true
+        ""
     }
 
     private func sendPairingPrompt(senderId: String, code: String): Unit {
@@ -2737,24 +2839,27 @@ public class TelegramAdapter <: ChannelAdapter {
         }
     }
 
-    private func acceptsGroupInbound(message: InboundMessage): Bool {
+    private func groupInboundRejectReason(message: InboundMessage): String {
         if (!this.groupIsAllowed(message.peerId)) {
-            return false
+            return "group_not_allowed"
         }
         let entry = this.resolveGroupEntry(message.peerId)
         let requireMention = this.groupRequiresMention(entry)
         if (requireMention && !message.mentioned) {
-            return false
+            return "group_mention_required"
         }
         let senderPolicy = this.effectiveGroupSenderPolicy(entry)
         if (senderPolicy == "disabled") {
-            return false
+            return "group_sender_policy_disabled"
         }
         if (senderPolicy == "open") {
-            return true
+            return ""
         }
         let allowFrom = this.effectiveGroupAllowFrom(entry)
-        return this.senderAllowed(allowFrom, message.senderId)
+        if (this.senderAllowed(allowFrom, message.senderId)) {
+            return ""
+        }
+        "group_sender_not_allowed"
     }
 
     private func groupIsAllowed(peerId: String): Bool {

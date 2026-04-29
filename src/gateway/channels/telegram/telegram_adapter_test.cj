@@ -612,6 +612,29 @@ public class TelegramAdapterTest {
     }
 
     @TestCase
+    public func directAllowlistRejectionIsVisibleInInboundPolicyDiagnostics(): Unit {
+        let cfg = TelegramConfig(
+            enabled: true,
+            botToken: "telegram-token",
+            dmPolicy: "allowlist",
+            allowFrom: ["8734062810"]
+        )
+        let adapter = TelegramAdapter(config: cfg)
+        adapter.start()
+        let payload = "{\"update_id\":31,\"message\":{\"message_id\":11,\"text\":\"hello\",\"chat\":{\"id\":745123456,\"type\":\"private\"},\"from\":{\"id\":745123456}}}"
+        let ack = adapter.ingestWebhookPayload(payload)
+        @Expect(ack.contains("\"ignored\":true"), true)
+
+        let diag = adapter.debugBuildInboundPolicyDiagnostics()
+        @Expect(diag.get("lastDecision").getOrThrow().asString().getValue(), "ignored")
+        @Expect(diag.get("lastReason").getOrThrow().asString().getValue(), "dm_sender_not_allowed")
+        @Expect(diag.get("lastUpdateKind").getOrThrow().asString().getValue(), "message")
+        @Expect(diag.get("lastUpdateId").getOrThrow().asString().getValue(), "31")
+        @Expect(diag.get("lastPeerId").getOrThrow().asString().getValue(), "user:745123456")
+        @Expect(diag.get("lastSenderId").getOrThrow().asString().getValue(), "745123456")
+    }
+
+    @TestCase
     public func disabledGroupsDropWebhookMessagesBeforeQueueing(): Unit {
         let cfg = TelegramConfig(
             enabled: true,
@@ -624,6 +647,65 @@ public class TelegramAdapterTest {
         let ack = adapter.ingestWebhookPayload(payload)
         @Expect(ack.contains("\"ignored\":true"), true)
         @Expect(adapter.pullInbound().isEmpty(), true)
+    }
+
+    @TestCase
+    public func groupMentionRejectionIsVisibleInInboundPolicyDiagnostics(): Unit {
+        let cfg = TelegramConfig(
+            enabled: true,
+            botToken: "telegram-token",
+            groupPolicy: "open"
+        )
+        let adapter = TelegramAdapter(config: cfg)
+        adapter.start()
+        let payload = "{\"update_id\":32,\"message\":{\"message_id\":101,\"text\":\"status\",\"chat\":{\"id\":-1001234567890,\"type\":\"supergroup\"},\"from\":{\"id\":8734062810}}}"
+        let ack = adapter.ingestWebhookPayload(payload)
+        @Expect(ack.contains("\"ignored\":true"), true)
+
+        let diag = adapter.debugBuildInboundPolicyDiagnostics()
+        @Expect(diag.get("lastDecision").getOrThrow().asString().getValue(), "ignored")
+        @Expect(diag.get("lastReason").getOrThrow().asString().getValue(), "group_mention_required")
+        @Expect(diag.get("lastUpdateKind").getOrThrow().asString().getValue(), "message")
+        @Expect(diag.get("lastPeerId").getOrThrow().asString().getValue(), "group:-1001234567890")
+        @Expect(diag.get("lastSenderId").getOrThrow().asString().getValue(), "8734062810")
+    }
+
+    @TestCase
+    public func editedAndChannelPostPolicyDiagnosticsPreserveTelegramUpdateKind(): Unit {
+        let adapter = TelegramAdapter(config: TelegramConfig(enabled: true, botToken: "telegram-token", groupPolicy: "disabled"))
+        adapter.start()
+
+        let editedPayload = "{\"update_id\":33,\"edited_message\":{\"message_id\":101,\"text\":\"/status\",\"chat\":{\"id\":-1001234567890,\"type\":\"supergroup\"},\"from\":{\"id\":8734062810}}}"
+        let editedAck = adapter.ingestWebhookPayload(editedPayload)
+        @Expect(editedAck.contains("\"ignored\":true"), true)
+        var diag = adapter.debugBuildInboundPolicyDiagnostics()
+        @Expect(diag.get("lastUpdateKind").getOrThrow().asString().getValue(), "edited_message")
+        @Expect(diag.get("lastReason").getOrThrow().asString().getValue(), "group_not_allowed")
+
+        let channelPayload = "{\"update_id\":34,\"channel_post\":{\"message_id\":102,\"text\":\"/status\",\"chat\":{\"id\":-100222333,\"type\":\"channel\"}}}"
+        let channelAck = adapter.ingestWebhookPayload(channelPayload)
+        @Expect(channelAck.contains("\"ignored\":true"), true)
+        diag = adapter.debugBuildInboundPolicyDiagnostics()
+        @Expect(diag.get("lastUpdateKind").getOrThrow().asString().getValue(), "channel_post")
+        @Expect(diag.get("lastReason").getOrThrow().asString().getValue(), "group_not_allowed")
+        @Expect(diag.get("lastPeerId").getOrThrow().asString().getValue(), "group:-100222333")
+    }
+
+    @TestCase
+    public func topicServiceMessageIsIgnoredWithVisibleInboundPolicyReason(): Unit {
+        let adapter = TelegramAdapter(config: TelegramConfig(enabled: true, botToken: "telegram-token", groupPolicy: "open"))
+        adapter.start()
+        let payload = "{\"update_id\":35,\"message\":{\"message_id\":103,\"message_thread_id\":42,\"forum_topic_created\":{\"name\":\"topic\"},\"chat\":{\"id\":-1001234567890,\"type\":\"supergroup\"},\"from\":{\"id\":8734062810}}}"
+        let ack = adapter.ingestWebhookPayload(payload)
+        @Expect(ack.contains("\"ignored\":true"), true)
+        @Expect(adapter.pullInbound().isEmpty(), true)
+
+        let diag = adapter.debugBuildInboundPolicyDiagnostics()
+        @Expect(diag.get("lastDecision").getOrThrow().asString().getValue(), "ignored")
+        @Expect(diag.get("lastReason").getOrThrow().asString().getValue(), "unsupported_or_empty_message")
+        @Expect(diag.get("lastUpdateKind").getOrThrow().asString().getValue(), "message")
+        @Expect(diag.get("lastUpdateId").getOrThrow().asString().getValue(), "35")
+        @Expect(diag.get("lastMessageId").getOrThrow().asString().getValue(), "103")
     }
 
     @TestCase
