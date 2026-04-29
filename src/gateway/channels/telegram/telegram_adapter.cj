@@ -5,11 +5,9 @@ import metis.gateway.core.ChannelAdapter
 import metis.gateway.model.*
 import metis.io.PrintUtils
 import metis.core.config.CliConfig
-import metis.utils.ShellUtils
 
 import magic.log.LogUtils
 import magic.jsonable.*
-import magic.utils.http.*
 
 import std.collection.{ArrayList, HashMap}
 import std.convert.Parsable
@@ -19,10 +17,60 @@ import std.time.*
 import stdx.encoding.json.*
 import stdx.net.http.*
 
-private var telegramCurlRunnerOverride: Option<(Array<String>) -> (Int64, String, String)> = None<(Array<String>) -> (Int64, String, String)>
+private let TELEGRAM_DEFAULT_ACCOUNT_ID = "default"
 
-public func setTelegramCurlRunnerForTest(runner: Option<(Array<String>) -> (Int64, String, String)>): Unit {
-    telegramCurlRunnerOverride = runner
+private class TelegramTokenResolution {
+    public let token: String
+    public let source: String
+    public let tokenFile: String
+    public let error: String
+
+    public init(token!: String = "", source!: String = "none", tokenFile!: String = "", error!: String = "") {
+        this.token = token
+        this.source = source
+        this.tokenFile = tokenFile
+        this.error = error
+    }
+}
+
+private func normalizeTelegramAccountIdForState(raw: String): String {
+    let trimmed = raw.trimAscii()
+    if (trimmed.isEmpty() || trimmed == "telegram:default") {
+        return TELEGRAM_DEFAULT_ACCOUNT_ID
+    }
+    if (trimmed.startsWith("telegram:")) {
+        return trimmed["telegram:".size..].trimAscii().toAsciiLower()
+    }
+    trimmed.toAsciiLower()
+}
+
+private func safeTelegramStateSegment(raw: String): String {
+    let trimmed = raw.trimAscii()
+    if (trimmed.isEmpty()) {
+        return TELEGRAM_DEFAULT_ACCOUNT_ID
+    }
+    let out = StringBuilder()
+    for (r in trimmed.runes()) {
+        if ((r >= r'a' && r <= r'z') || (r >= r'A' && r <= r'Z') || (r >= r'0' && r <= r'9') || r == r'.' || r == r'_' || r == r'-') {
+            out.append(r)
+        } else {
+            out.append(r'_')
+        }
+    }
+    let normalized = out.toString().trimAscii()
+    if (normalized.isEmpty()) { TELEGRAM_DEFAULT_ACCOUNT_ID } else { normalized }
+}
+
+private func telegramAccountStateDirFor(rootDir: Path, accountId: String): Path {
+    let root = rootDir.join("gateway-telegram")
+    if (!exists(root)) {
+        Directory.create(root, recursive: true)
+    }
+    let dir = root.join("accounts").join(safeTelegramStateSegment(normalizeTelegramAccountIdForState(accountId)))
+    if (!exists(dir)) {
+        Directory.create(dir, recursive: true)
+    }
+    dir
 }
 
 /**
@@ -40,33 +88,32 @@ public class TelegramAdapter <: ChannelAdapter {
     private let stateRoot: Path
     private let registerNativeCommandsOnStart: Bool
     private let queueMutex = Mutex()
-    private let pollStateMutex = Mutex()
     private let inboundQueue = ArrayList<InboundMessage>()
     private let outboundLog = ArrayList<OutboundMessage>()
+    private var pollingRunner: Option<TelegramPollingRunner> = None<TelegramPollingRunner>
+    private var telegramTransportRebuildCount: Int64 = 0
     private var running = false
     private var webhookServer: Option<Server> = None
     private var lastSendError: String = ""
-    private var pollingState: String = "idle"
-    private var lastPollError: String = ""
-    private var lastPollErrorAtMs: Int64 = 0
-    private var lastPollSuccessAtMs: Int64 = 0
-    private var lastPollStartedAtMs: Int64 = 0
-    private var lastPollFinishedAtMs: Int64 = 0
-    private var consecutivePollFailures: Int64 = 0
-    private var nextPollRetryAtMs: Int64 = 0
-    private var lastPollOutcome: String = "idle"
 
     public init(
         config!: TelegramConfig = TelegramConfig(),
         pairingRoot!: String = "",
         registerNativeCommandsOnStart!: Bool = false
     ) {
+        let resolvedStateRoot = if (pairingRoot.trimAscii().isEmpty()) { CliConfig.dotDir } else { Path(pairingRoot.trimAscii()) }
         this.config = config
         this.registerNativeCommandsOnStart = registerNativeCommandsOnStart
-        this.stateRoot = if (pairingRoot.trimAscii().isEmpty()) { CliConfig.dotDir } else { Path(pairingRoot.trimAscii()) }
+        this.stateRoot = resolvedStateRoot
         this.pairingStore = TelegramPairingStore(
-            rootDir: this.stateRoot
+            rootDir: telegramAccountStateDirFor(resolvedStateRoot, config.accountId)
         )
+        this.pollingRunner = Some(TelegramPollingRunner(
+            { => this.fetchTelegramUpdates() },
+            { raw: String => this.ingestPollingResponse(raw) },
+            { => this.running && !this.usesWebhookMode() },
+            rebuildTransport: { => this.markTelegramTransportDirtyForPollingWatchdog() }
+        ))
     }
 
     public prop name: String {
@@ -108,6 +155,7 @@ public class TelegramAdapter <: ChannelAdapter {
                 this.webhookServer = None
             }
         }
+        this.pollingRunnerOrThrow().stop()
     }
 
     public func pullInbound(): Array<InboundMessage> {
@@ -216,7 +264,8 @@ public class TelegramAdapter <: ChannelAdapter {
             DateTime.now(),
             threadId: threadId,
             replyInThread: threadId != None,
-            raw: Some(text)
+            raw: Some(text),
+            accountId: this.effectiveAccountId()
         )
         synchronized(this.queueMutex) {
             this.inboundQueue.add(msg)
@@ -272,6 +321,14 @@ public class TelegramAdapter <: ChannelAdapter {
         this.currentPollBackoffMs()
     }
 
+    public func debugSetPollingWatchdogForTest(stallMs: Int64, intervalMs: Int64): Unit {
+        this.pollingRunnerOrThrow().debugSetWatchdogForTest(stallMs, intervalMs)
+    }
+
+    public func debugTelegramTransportRebuildCountForTest(): Int64 {
+        this.telegramTransportRebuildCount
+    }
+
     public func debugLastSendErrorForTest(): String {
         this.lastSendError
     }
@@ -298,6 +355,10 @@ public class TelegramAdapter <: ChannelAdapter {
         out.put("healthy", (getMeOk && webhookInfoOk).toJsonValue())
         out.put("snapshot", snapshot)
         out
+    }
+
+    public func debugRedactTelegramUrlForTest(url: String): String {
+        this.telegramTransport().redactUrl(url)
     }
 
     public func debugIngestPollingResponse(raw: String): Int64 {
@@ -382,11 +443,130 @@ public class TelegramAdapter <: ChannelAdapter {
     }
 
     private func effectiveBotToken(): String {
+        this.resolveTelegramToken().token
+    }
+
+    private func effectiveAccountId(): String {
+        this.normalizeTelegramAccountId(this.config.accountId)
+    }
+
+    private func normalizeTelegramAccountId(raw: String): String {
+        normalizeTelegramAccountIdForState(raw)
+    }
+
+    private func resolveTelegramToken(): TelegramTokenResolution {
+        let accountId = this.effectiveAccountId()
+        let accountCfg = this.resolveTelegramAccountConfig(accountId)
+        if (accountId != TELEGRAM_DEFAULT_ACCOUNT_ID && accountCfg.isNone() && this.config.accounts.isSome()) {
+            return TelegramTokenResolution(source: "none", error: "unknown accountId: ${accountId}")
+        }
+        match (accountCfg) {
+            case Some(account) =>
+                let accountTokenFile = this.readStringField(account, "tokenFile").trimAscii()
+                if (!accountTokenFile.isEmpty()) {
+                    return this.readTelegramTokenFile(accountTokenFile, source: "tokenFile")
+                }
+                let accountToken = this.readStringField(account, "botToken").trimAscii()
+                if (!accountToken.isEmpty()) {
+                    return TelegramTokenResolution(token: accountToken, source: "config")
+                }
+            case None => ()
+        }
+        let tokenFile = this.config.tokenFile.trimAscii()
+        if (!tokenFile.isEmpty()) {
+            return this.readTelegramTokenFile(tokenFile, source: "tokenFile")
+        }
         let inline = this.config.botToken.trimAscii()
         if (!inline.isEmpty()) {
-            return inline
+            return TelegramTokenResolution(token: inline, source: "config")
         }
-        ""
+        TelegramTokenResolution(source: "none")
+    }
+
+    private func resolveTelegramAccountConfig(accountId: String): Option<JsonObject> {
+        match (this.config.accounts) {
+            case Some(accounts) =>
+                match (accounts.get(accountId)) {
+                    case Some(v) => try { Some(v.asObject()) } catch (_: Exception) { None }
+                    case None =>
+                        if (accountId == TELEGRAM_DEFAULT_ACCOUNT_ID) {
+                            match (accounts.get("telegram:default")) {
+                                case Some(v) => try { Some(v.asObject()) } catch (_: Exception) { None }
+                                case None => None
+                            }
+                        } else {
+                            None
+                        }
+                }
+            case None => None
+        }
+    }
+
+    private func readTelegramTokenFile(pathText: String, source!: String): TelegramTokenResolution {
+        let path = Path(pathText.trimAscii())
+        if (!exists(path)) {
+            return TelegramTokenResolution(source: "none", tokenFile: pathText.trimAscii(), error: "tokenFile not found")
+        }
+        try {
+            let token = String.fromUtf8(File.readFrom(path)).trimAscii()
+            if (token.isEmpty()) {
+                return TelegramTokenResolution(source: "none", tokenFile: pathText.trimAscii(), error: "tokenFile is empty")
+            }
+            TelegramTokenResolution(token: token, source: source, tokenFile: pathText.trimAscii())
+        } catch (e: Exception) {
+            TelegramTokenResolution(source: "none", tokenFile: pathText.trimAscii(), error: "tokenFile unreadable: ${e.message}")
+        }
+    }
+
+    private func buildTelegramAccountDiagnostics(): JsonObject {
+        let resolved = this.resolveTelegramToken()
+        let out = JsonObject()
+        out.put("accountId", JsonString(this.effectiveAccountId()))
+        out.put("tokenSource", JsonString(resolved.source))
+        out.put("tokenConfigured", (!resolved.token.trimAscii().isEmpty()).toJsonValue())
+        out.put("tokenRedacted", JsonString(this.redactTelegramToken(resolved.token)))
+        out.put("tokenFile", JsonString(resolved.tokenFile))
+        out.put("tokenError", JsonString(resolved.error))
+        out.put("botId", JsonString(this.extractBotIdFromToken(resolved.token)))
+        out
+    }
+
+    private func redactTelegramToken(token: String): String {
+        let trimmed = token.trimAscii()
+        if (trimmed.isEmpty()) {
+            return ""
+        }
+        let botId = this.extractBotIdFromToken(trimmed)
+        if (!botId.isEmpty()) {
+            return "${botId}:<redacted>"
+        }
+        "<redacted>"
+    }
+
+    private func effectiveBotId(): String {
+        this.extractBotIdFromToken(this.effectiveBotToken())
+    }
+
+    private func extractBotIdFromToken(token: String): String {
+        let trimmed = token.trimAscii()
+        match (trimmed.indexOf(":")) {
+            case Some(idx) =>
+                if (idx <= 0) {
+                    return ""
+                }
+                let botId = trimmed[..idx]
+                for (r in botId.runes()) {
+                    if (r < r'0' || r > r'9') {
+                        return ""
+                    }
+                }
+                botId
+            case None => ""
+        }
+    }
+
+    public func debugTelegramAccountDiagnosticsForTest(): JsonObject {
+        this.buildTelegramAccountDiagnostics()
     }
 
     private func startWebhookServer(): Unit {
@@ -413,150 +593,55 @@ public class TelegramAdapter <: ChannelAdapter {
     }
 
     private func startPollingLoop(): Unit {
-        spawn {
-            this.runPollingLoop()
-        }
+        this.pollingRunnerOrThrow().start()
     }
 
     private func runPollingLoop(): Unit {
-        while (this.running && !this.usesWebhookMode()) {
-            let _ = this.runPollingIteration()
-            let backoffMs = this.currentPollBackoffMs()
-            if (backoffMs > 0) {
-                this.markPollBackoff(backoffMs)
-                this.waitForPollBackoff(backoffMs)
-            }
-        }
+        this.pollingRunnerOrThrow().start()
     }
 
     private func runPollingIteration(): Int64 {
-        this.markPollStarted()
-        try {
-            let raw = this.fetchTelegramUpdates()
-            if (!raw.trimAscii().isEmpty()) {
-                return this.ingestPollingResponse(raw)
-            }
-        } catch (e: Exception) {
-            this.recordPollError("polling iteration exception: ${e.message}", outcome: "exception")
-            LogUtils.info("Telegram polling iteration failed: ${e.message}")
-        }
-        0
+        this.pollingRunnerOrThrow().runIteration()
     }
 
-    private func pollNowMs(): Int64 {
-        DateTime.now().toUnixTimeStamp().toMilliseconds()
+    private func pollingRunnerOrThrow(): TelegramPollingRunner {
+        match (this.pollingRunner) {
+            case Some(runner) => runner
+            case None => throw Exception("telegram polling runner is not initialized")
+        }
+    }
+
+    private func markTelegramTransportDirtyForPollingWatchdog(): Unit {
+        this.telegramTransportRebuildCount += 1
+        LogUtils.info("Telegram polling watchdog marked transport dirty; future requests will use a fresh native transport")
     }
 
     private func markPollingIdle(): Unit {
-        synchronized(this.pollStateMutex) {
-            this.pollingState = "idle"
-            this.lastPollOutcome = "idle"
-            this.nextPollRetryAtMs = 0
-        }
+        this.pollingRunnerOrThrow().markIdle()
     }
 
     private func markPollingStopped(): Unit {
-        synchronized(this.pollStateMutex) {
-            this.pollingState = "stopped"
-            this.lastPollOutcome = "stopped"
-            this.nextPollRetryAtMs = 0
-        }
-    }
-
-    private func markPollStarted(): Unit {
-        let now = this.pollNowMs()
-        synchronized(this.pollStateMutex) {
-            this.pollingState = "polling"
-            this.lastPollStartedAtMs = now
-            this.lastPollOutcome = "started"
-            this.nextPollRetryAtMs = 0
-        }
+        this.pollingRunnerOrThrow().stop()
     }
 
     private func markPollSuccess(outcome!: String = "success"): Unit {
-        let now = this.pollNowMs()
-        synchronized(this.pollStateMutex) {
-            this.pollingState = "polling"
-            this.lastPollSuccessAtMs = now
-            this.lastPollFinishedAtMs = now
-            this.consecutivePollFailures = 0
-            this.nextPollRetryAtMs = 0
-            this.lastPollOutcome = outcome
-        }
+        this.pollingRunnerOrThrow().recordSuccess(outcome: outcome)
     }
 
     private func recordPollError(error: String, outcome!: String = "error"): Unit {
-        let now = this.pollNowMs()
-        synchronized(this.pollStateMutex) {
-            this.pollingState = "recovering"
-            this.lastPollError = error.trimAscii()
-            this.lastPollErrorAtMs = now
-            this.lastPollFinishedAtMs = now
-            this.consecutivePollFailures += 1
-            this.lastPollOutcome = outcome
-        }
-    }
-
-    private func markPollBackoff(backoffMs: Int64): Unit {
-        let now = this.pollNowMs()
-        synchronized(this.pollStateMutex) {
-            if (this.consecutivePollFailures > 0) {
-                this.pollingState = "backoff"
-                this.nextPollRetryAtMs = now + backoffMs
-                this.lastPollOutcome = "backoff"
-            }
-        }
+        this.pollingRunnerOrThrow().recordError(error, outcome: outcome)
     }
 
     private func pollErrorRecordedForCurrentIteration(): Bool {
-        var recorded = false
-        synchronized(this.pollStateMutex) {
-            recorded = this.consecutivePollFailures > 0 && this.lastPollErrorAtMs >= this.lastPollStartedAtMs
-        }
-        recorded
+        this.pollingRunnerOrThrow().errorRecordedForCurrentIteration()
     }
 
     private func currentPollBackoffMs(): Int64 {
-        var failures: Int64 = 0
-        synchronized(this.pollStateMutex) {
-            failures = this.consecutivePollFailures
-        }
-        if (failures <= 0) {
-            return 0
-        }
-        var delay: Int64 = 2000
-        var i: Int64 = 1
-        while (i < failures) {
-            let next = delay * 2
-            delay = if (next > 30000) { 30000 } else { next }
-            i += 1
-        }
-        delay
-    }
-
-    private func waitForPollBackoff(backoffMs: Int64): Unit {
-        var remaining = backoffMs
-        while (this.running && !this.usesWebhookMode() && remaining > 0) {
-            let chunk = if (remaining < 100) { remaining } else { 100 }
-            sleep(Duration.millisecond * chunk)
-            remaining -= chunk
-        }
+        this.pollingRunnerOrThrow().currentBackoffMs()
     }
 
     private func buildPollingDiagnosticSnapshot(): JsonObject {
-        let out = JsonObject()
-        synchronized(this.pollStateMutex) {
-            out.put("state", JsonString(this.pollingState))
-            out.put("lastError", JsonString(this.lastPollError))
-            out.put("lastErrorAtMs", this.lastPollErrorAtMs.toJsonValue())
-            out.put("lastSuccessAtMs", this.lastPollSuccessAtMs.toJsonValue())
-            out.put("lastStartedAtMs", this.lastPollStartedAtMs.toJsonValue())
-            out.put("lastFinishedAtMs", this.lastPollFinishedAtMs.toJsonValue())
-            out.put("consecutiveFailures", this.consecutivePollFailures.toJsonValue())
-            out.put("nextRetryAtMs", this.nextPollRetryAtMs.toJsonValue())
-            out.put("lastOutcome", JsonString(this.lastPollOutcome))
-        }
-        out
+        this.pollingRunnerOrThrow().diagnostics()
     }
 
     private func readRequestBody(ctx: HttpContext): String {
@@ -617,7 +702,8 @@ public class TelegramAdapter <: ChannelAdapter {
             threadId: if (threadIdRaw.isEmpty()) { None } else { Some(threadIdRaw) },
             replyTargetMessageId: replyTarget,
             replyInThread: !threadIdRaw.isEmpty(),
-            raw: Some(raw)
+            raw: Some(raw),
+            accountId: this.effectiveAccountId()
         )
         match (this.readTelegramMediaFileId(msg)) {
             case Some((kind, fileId)) =>
@@ -844,7 +930,8 @@ public class TelegramAdapter <: ChannelAdapter {
             threadId: this.reactionInboundThreadId(peerId),
             replyTargetMessageId: Some(messageId),
             replyInThread: peerId.contains(":topic:"),
-            raw: Some(raw)
+            raw: Some(raw),
+            accountId: this.effectiveAccountId()
         )
         if (!this.acceptsInbound(inbound)) {
             return None
@@ -1032,7 +1119,11 @@ public class TelegramAdapter <: ChannelAdapter {
         let webhookInfo = this.parseTelegramProbeResult(webhookInfoRaw)
         let lastInboundUpdateId = this.readLastInboundUpdateId()
         let summary = JsonObject()
+        let account = this.buildTelegramAccountDiagnostics()
         summary.put("mode", JsonString(if (this.usesWebhookMode()) { "webhook" } else { "polling" }))
+        summary.put("accountId", account.get("accountId") ?? JsonString(this.effectiveAccountId()))
+        summary.put("tokenSource", account.get("tokenSource") ?? JsonString("none"))
+        summary.put("tokenConfigured", account.get("tokenConfigured") ?? false.toJsonValue())
         summary.put("allowedUpdates", this.buildAllowedUpdates())
         summary.put("webhookConfigured", this.usesWebhookMode().toJsonValue())
         summary.put("offsetPersistenceEnabled", true.toJsonValue())
@@ -1078,7 +1169,10 @@ public class TelegramAdapter <: ChannelAdapter {
         offset.put("lastInboundUpdateId", JsonString(lastInboundUpdateId))
         offset.put("statePath", JsonString(this.offsetStatePath().toString()))
         offset.put("persistenceEnabled", true.toJsonValue())
+        offset.put("accountId", JsonString(this.effectiveAccountId()))
+        offset.put("botId", JsonString(this.effectiveBotId()))
         out.put("offset", offset)
+        out.put("account", account)
         out.put("media", media)
         out.put("polling", polling)
         out.put("getMe", getMe)
@@ -1100,16 +1194,30 @@ public class TelegramAdapter <: ChannelAdapter {
         dir
     }
 
+    private func telegramAccountStateDir(): Path {
+        let dir = this.telegramStateDir().join("accounts").join(this.safeStateSegment(this.effectiveAccountId()))
+        if (!exists(dir)) {
+            try {
+                Directory.create(dir, recursive: true)
+            } catch (_e: Exception) {
+                if (!exists(dir)) {
+                    throw _e
+                }
+            }
+        }
+        dir
+    }
+
     private func offsetStatePath(): Path {
-        this.telegramStateDir().join("offset-state.json")
+        this.telegramAccountStateDir().join("offset-state.json")
     }
 
     private func mediaStatePath(): Path {
-        this.telegramStateDir().join("media-state.json")
+        this.telegramAccountStateDir().join("media-state.json")
     }
 
     private func mediaDownloadDir(): Path {
-        let dir = this.telegramStateDir().join("media")
+        let dir = this.telegramAccountStateDir().join("media")
         if (!exists(dir)) {
             Directory.create(dir, recursive: true)
         }
@@ -1123,7 +1231,14 @@ public class TelegramAdapter <: ChannelAdapter {
         }
         return try {
             let root = JsonValue.fromStr(String.fromUtf8(File.readFrom(path))).asObject()
-            this.readStringField(root, "lastInboundUpdateId").trimAscii()
+            if (this.offsetStateBelongsToCurrentBot(root)) {
+                let latest = this.readStringField(root, "lastUpdateId").trimAscii()
+                if (!latest.isEmpty()) {
+                    return latest
+                }
+                return this.readStringField(root, "lastInboundUpdateId").trimAscii()
+            }
+            ""
         } catch (_: Exception) {
             ""
         }
@@ -1135,8 +1250,34 @@ public class TelegramAdapter <: ChannelAdapter {
             return
         }
         let root = JsonObject()
+        root.put("version", 2.toJsonValue())
+        root.put("accountId", JsonString(this.effectiveAccountId()))
+        root.put("botId", JsonString(this.effectiveBotId()))
+        root.put("lastUpdateId", JsonString(normalized))
         root.put("lastInboundUpdateId", JsonString(normalized))
+        root.put("updatedAtMs", DateTime.now().toUnixTimeStamp().toMilliseconds().toJsonValue())
         File.writeTo(this.offsetStatePath(), root.toJsonString().toArray())
+    }
+
+    private func offsetStateBelongsToCurrentBot(root: JsonObject): Bool {
+        let expectedAccountId = this.effectiveAccountId()
+        let storedAccountId = this.readStringField(root, "accountId").trimAscii()
+        if (!storedAccountId.isEmpty() && storedAccountId != expectedAccountId) {
+            return false
+        }
+        let expectedBotId = this.effectiveBotId()
+        if (expectedBotId.isEmpty()) {
+            return true
+        }
+        let storedBotId = this.readStringField(root, "botId").trimAscii()
+        if (storedBotId.isEmpty()) {
+            return false
+        }
+        storedBotId == expectedBotId
+    }
+
+    private func safeStateSegment(raw: String): String {
+        safeTelegramStateSegment(raw)
     }
 
     private func readMediaState(): JsonObject {
@@ -1146,6 +1287,7 @@ public class TelegramAdapter <: ChannelAdapter {
             empty.put("statePath", JsonString(path.toString()))
             empty.put("persistenceEnabled", true.toJsonValue())
             empty.put("downloadEnabled", true.toJsonValue())
+            empty.put("accountId", JsonString(this.effectiveAccountId()))
             empty.put("lastPersistedMediaId", JsonString(""))
             empty.put("lastMedia", JsonObject())
             return empty
@@ -1155,12 +1297,14 @@ public class TelegramAdapter <: ChannelAdapter {
             root.put("statePath", JsonString(path.toString()))
             root.put("persistenceEnabled", true.toJsonValue())
             root.put("downloadEnabled", true.toJsonValue())
+            root.put("accountId", JsonString(this.effectiveAccountId()))
             root
         } catch (_: Exception) {
             let empty = JsonObject()
             empty.put("statePath", JsonString(path.toString()))
             empty.put("persistenceEnabled", true.toJsonValue())
             empty.put("downloadEnabled", true.toJsonValue())
+            empty.put("accountId", JsonString(this.effectiveAccountId()))
             empty.put("lastPersistedMediaId", JsonString(""))
             empty.put("lastMedia", JsonObject())
             empty
@@ -1210,6 +1354,7 @@ public class TelegramAdapter <: ChannelAdapter {
         lastMedia.put("downloadPath", JsonString(downloadPath))
         lastMedia.put("persistedAtMs", DateTime.now().toUnixTimeStamp().toMilliseconds().toJsonValue())
         let root = JsonObject()
+        root.put("accountId", JsonString(this.effectiveAccountId()))
         root.put("lastPersistedMediaId", JsonString(normalizedFileId))
         root.put("lastMedia", lastMedia)
         File.writeTo(this.mediaStatePath(), root.toJsonString().toArray())
@@ -2397,10 +2542,6 @@ public class TelegramAdapter <: ChannelAdapter {
         raw
     }
 
-    private func telegramProxyConfigured(): Bool {
-        !this.config.proxy.trimAscii().isEmpty()
-    }
-
     private func isPollingContext(context: String): Bool {
         context.trimAscii() == "getUpdates"
     }
@@ -2414,105 +2555,30 @@ public class TelegramAdapter <: ChannelAdapter {
         }
     }
 
-    private func telegramCurlTimeoutSeconds(): Int64 {
-        let base = if (this.config.timeoutSeconds > 0) { this.config.timeoutSeconds } else { 30 }
-        base + 5
+    private func telegramTransport(): TelegramTransport {
+        TelegramTransport(
+            proxy: this.config.proxy,
+            timeoutSeconds: if (this.config.timeoutSeconds > 0) { this.config.timeoutSeconds } else { 30 }
+        )
     }
 
     private func telegramGet(url: String, accept!: String, context!: String): Option<String> {
-        if (!this.telegramProxyConfigured()) {
-            let headers = HashMap<String, String>()
-            headers["Accept"] = accept
-            return match (
-                try {
-                    HttpUtils.get(url, headers, None)
-                } catch (e: Exception) {
-                    this.recordTelegramRequestError(context, "exception: ${e.message}", outcome: "exception")
-                    LogUtils.info("Telegram ${context} failed: ${context} exception: ${e.message}")
-                    None<String>
-                }
-            ) {
-                case Some(raw) => Some(raw)
-                case None => None<String>
-            }
-        }
-        let args = ArrayList<String>()
-        args.add("curl")
-        args.add("--silent")
-        args.add("--show-error")
-        args.add("--location")
-        args.add("--proxy")
-        args.add(this.config.proxy.trimAscii())
-        args.add("--max-time")
-        args.add(this.telegramCurlTimeoutSeconds().toString())
-        args.add("-H")
-        args.add("Accept: ${accept}")
-        args.add(url)
-        this.runTelegramCurl(args.toArray(), context)
+        this.handleTelegramTransportResponse(this.telegramTransport().get(url, accept: accept, context: context), context)
     }
 
     private func telegramJsonPost(url: String, body: JsonObject, context!: String): Option<String> {
-        if (!this.telegramProxyConfigured()) {
-            let headers = HashMap<String, String>()
-            headers["Content-Type"] = "application/json; charset=utf-8"
-            return match (
-                try {
-                    HttpUtils.post(url, headers, body)
-                } catch (e: Exception) {
-                    this.recordTelegramRequestError(context, "exception: ${e.message}", outcome: "exception")
-                    LogUtils.info("Telegram ${context} failed: ${context} exception: ${e.message}")
-                    None<String>
-                }
-            ) {
-                case Some(raw) => Some(raw)
-                case None => None<String>
-            }
-        }
-        let args = ArrayList<String>()
-        args.add("curl")
-        args.add("--silent")
-        args.add("--show-error")
-        args.add("--location")
-        args.add("--proxy")
-        args.add(this.config.proxy.trimAscii())
-        args.add("--max-time")
-        args.add(this.telegramCurlTimeoutSeconds().toString())
-        args.add("-H")
-        args.add("Content-Type: application/json; charset=utf-8")
-        args.add("--data")
-        args.add(body.toJsonString())
-        args.add(url)
-        this.runTelegramCurl(args.toArray(), context)
+        this.handleTelegramTransportResponse(this.telegramTransport().postJson(url, body, context: context), context)
     }
 
-    private func runTelegramCurl(args: Array<String>, context: String): Option<String> {
-        let (exitCode, stdout, stderr) = try {
-            if (telegramCurlRunnerOverride.isSome()) {
-                telegramCurlRunnerOverride.getOrThrow()(args)
-            } else {
-                ShellUtils.execute(
-                    args,
-                    timeout: Some(Duration.second * this.telegramCurlTimeoutSeconds()),
-                    withWrap: false
-                )
-            }
-        } catch (e: Exception) {
-            this.recordTelegramRequestError(context, "curl exception: ${e.message}", outcome: "exception")
-            LogUtils.info("Telegram ${context} failed: ${context} curl exception: ${e.message}")
-            return None
+    private func handleTelegramTransportResponse(response: TelegramTransportResponse, context: String): Option<String> {
+        if (response.ok) {
+            return Some(response.body)
         }
-        if (exitCode != 0) {
-            let detail = if (!stderr.trimAscii().isEmpty()) {
-                stderr.trimAscii()
-            } else {
-                stdout.trimAscii()
-            }
-            let outcome = if (exitCode == 28) { "timeout" } else { "curl-error" }
-            this.recordTelegramRequestError(context, "curl failed (exit=${exitCode}): ${detail}", outcome: outcome)
-            LogUtils.info("Telegram ${context} failed: ${context} curl failed (exit=${exitCode}): ${detail}")
-            return None
-        }
-        Some(stdout)
+        let outcome = if (response.outcome.trimAscii().isEmpty()) { "request-error" } else { response.outcome.trimAscii() }
+        let detail = if (response.error.trimAscii().isEmpty()) { "transport failed" } else { response.error.trimAscii() }
+        this.recordTelegramRequestError(context, "transport failed: ${detail}", outcome: outcome)
+        LogUtils.info("Telegram ${context} failed: ${context} transport failed: ${detail}")
+        None
     }
 
     private func readStringField(obj: JsonObject, key: String): String {

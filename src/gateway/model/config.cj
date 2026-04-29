@@ -591,6 +591,7 @@ public class TelegramCustomCommandConfig {
 }
 
 public class TelegramConfig {
+    public let accountId: String
     public let enabled: Bool
     public let botToken: String
     public let tokenFile: String
@@ -628,6 +629,7 @@ public class TelegramConfig {
     public let policy: ChannelPolicyConfig
 
     public init(
+        accountId!: String = "default",
         enabled!: Bool = false,
         botToken!: String = "",
         tokenFile!: String = "",
@@ -664,6 +666,7 @@ public class TelegramConfig {
         network!: TelegramNetworkConfig = TelegramNetworkConfig(),
         policy!: ChannelPolicyConfig = ChannelPolicyConfig()
     ) {
+        this.accountId = accountId
         this.enabled = enabled
         this.botToken = botToken
         this.tokenFile = tokenFile

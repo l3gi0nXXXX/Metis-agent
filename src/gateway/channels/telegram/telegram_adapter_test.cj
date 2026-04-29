@@ -4,15 +4,15 @@ import metis.gateway.model.*
 
 import magic.jsonable.*
 import std.collection.ArrayList
-import std.fs.Path
-import std.time.DateTime
+import std.fs.{File, Path}
+import std.time.*
 import std.unittest.testmacro.*
 import stdx.encoding.json.*
 
 @Test
 public class TelegramAdapterTest {
     public init() {
-        setTelegramCurlRunnerForTest(None)
+        setTelegramTransportRunnerForTest(None)
     }
 
     @TestCase
@@ -197,6 +197,139 @@ public class TelegramAdapterTest {
         @Expect(probe.get("executed").getOrThrow().asBool().getValue(), true)
         @Expect(probe.get("status").isSome(), true)
         @Expect(probe.get("snapshot").isSome(), true)
+    }
+
+    @TestCase
+    public func accountDiagnosticsResolveNamedAccountConfigBeforeTopLevelToken(): Unit {
+        let accounts = JsonObject()
+        let work = JsonObject()
+        work.put("botToken", JsonString("999001:WORK"))
+        accounts.put("work", work)
+        let adapter = TelegramAdapter(
+            config: TelegramConfig(
+                accountId: "work",
+                enabled: true,
+                botToken: "111001:TOP",
+                accounts: Some(accounts)
+            )
+        )
+        let account = adapter.debugTelegramAccountDiagnosticsForTest()
+        @Expect(account.get("accountId").getOrThrow().asString().getValue(), "work")
+        @Expect(account.get("tokenSource").getOrThrow().asString().getValue(), "config")
+        @Expect(account.get("tokenConfigured").getOrThrow().asBool().getValue(), true)
+        @Expect(account.get("tokenRedacted").getOrThrow().asString().getValue(), "999001:<redacted>")
+        @Expect(account.get("botId").getOrThrow().asString().getValue(), "999001")
+    }
+
+    @TestCase
+    public func accountDiagnosticsUseAccountTokenFileBeforeTopLevelFallbacks(): Unit {
+        let root = "/tmp/metis-telegram-tokenfile-${DateTime.now().toUnixTimeStamp().toMilliseconds()}"
+        let topToken = "${root}-top.txt"
+        let accountToken = "${root}-account.txt"
+        File.writeTo(Path(topToken), "111001:TOP\n".toArray())
+        File.writeTo(Path(accountToken), "999001:WORK\n".toArray())
+        let accounts = JsonObject()
+        let work = JsonObject()
+        work.put("tokenFile", JsonString(accountToken))
+        accounts.put("work", work)
+        let adapter = TelegramAdapter(
+            config: TelegramConfig(
+                accountId: "work",
+                enabled: true,
+                tokenFile: topToken,
+                accounts: Some(accounts)
+            )
+        )
+        let account = adapter.debugTelegramAccountDiagnosticsForTest()
+        @Expect(account.get("tokenSource").getOrThrow().asString().getValue(), "tokenFile")
+        @Expect(account.get("tokenFile").getOrThrow().asString().getValue(), accountToken)
+        @Expect(account.get("tokenRedacted").getOrThrow().asString().getValue(), "999001:<redacted>")
+    }
+
+    @TestCase
+    public func unknownNamedAccountDoesNotFallThroughWhenAccountsConfigured(): Unit {
+        let accounts = JsonObject()
+        let work = JsonObject()
+        work.put("botToken", JsonString("999001:WORK"))
+        accounts.put("work", work)
+        let adapter = TelegramAdapter(
+            config: TelegramConfig(
+                accountId: "missing",
+                enabled: true,
+                botToken: "111001:TOP",
+                accounts: Some(accounts)
+            )
+        )
+        let account = adapter.debugTelegramAccountDiagnosticsForTest()
+        @Expect(account.get("accountId").getOrThrow().asString().getValue(), "missing")
+        @Expect(account.get("tokenSource").getOrThrow().asString().getValue(), "none")
+        @Expect(account.get("tokenConfigured").getOrThrow().asBool().getValue(), false)
+        @Expect(account.get("tokenError").getOrThrow().asString().getValue().contains("unknown accountId"), true)
+    }
+
+    @TestCase
+    public func offsetStateIsIsolatedByAccountAndBotId(): Unit {
+        let root = Path("/tmp/metis-telegram-account-offset-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
+        let workV1 = TelegramAdapter(
+            config: TelegramConfig(accountId: "work", enabled: true, botToken: "111001:WORK"),
+            pairingRoot: root.toString()
+        )
+        let ack = workV1.ingestWebhookPayload(
+            "{\"update_id\":42,\"message\":{\"message_id\":101,\"text\":\"hello\",\"chat\":{\"id\":8734062810,\"type\":\"private\"},\"from\":{\"id\":8734062810}}}"
+        )
+        @Expect(ack.contains("\"ok\":true"), true)
+        @Expect(workV1.debugLastInboundUpdateId(), "42")
+        let workSameBot = TelegramAdapter(
+            config: TelegramConfig(accountId: "work", enabled: true, botToken: "111001:WORK"),
+            pairingRoot: root.toString()
+        )
+        @Expect(workSameBot.debugLastInboundUpdateId(), "42")
+        let workRotatedBot = TelegramAdapter(
+            config: TelegramConfig(accountId: "work", enabled: true, botToken: "222001:WORK"),
+            pairingRoot: root.toString()
+        )
+        @Expect(workRotatedBot.debugLastInboundUpdateId(), "")
+        let defaultAccount = TelegramAdapter(
+            config: TelegramConfig(enabled: true, botToken: "111001:WORK"),
+            pairingRoot: root.toString()
+        )
+        @Expect(defaultAccount.debugLastInboundUpdateId(), "")
+        let snapshot = workSameBot.debugBuildHealthSnapshot()
+        let offset = snapshot.get("offset").getOrThrow().asObject()
+        @Expect(offset.get("accountId").getOrThrow().asString().getValue(), "work")
+        @Expect(offset.get("botId").getOrThrow().asString().getValue(), "111001")
+        @Expect(offset.get("statePath").getOrThrow().asString().getValue().contains("/accounts/work/offset-state.json"), true)
+    }
+
+    @TestCase
+    public func mediaStateIsIsolatedByAccount(): Unit {
+        let root = Path("/tmp/metis-telegram-account-media-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
+        let defaultAccount = TelegramAdapter(
+            config: TelegramConfig(enabled: true, botToken: "111001:DEFAULT"),
+            pairingRoot: root.toString()
+        )
+        let workAccount = TelegramAdapter(
+            config: TelegramConfig(accountId: "work", enabled: true, botToken: "222001:WORK"),
+            pairingRoot: root.toString()
+        )
+        let defaultMedia = defaultAccount.debugPersistInboundMediaForTest(
+            "photo",
+            "default-photo",
+            getFileRaw: "{\"ok\":true,\"result\":{\"file_path\":\"photos/default.jpg\"}}",
+            downloadRaw: "default-bytes"
+        )
+        let workMedia = workAccount.debugPersistInboundMediaForTest(
+            "photo",
+            "work-photo",
+            getFileRaw: "{\"ok\":true,\"result\":{\"file_path\":\"photos/work.jpg\"}}",
+            downloadRaw: "work-bytes"
+        )
+        @Expect(defaultMedia.get("accountId").getOrThrow().asString().getValue(), "default")
+        @Expect(workMedia.get("accountId").getOrThrow().asString().getValue(), "work")
+        @Expect(defaultMedia.get("statePath").getOrThrow().asString().getValue().contains("/accounts/default/media-state.json"), true)
+        @Expect(workMedia.get("statePath").getOrThrow().asString().getValue().contains("/accounts/work/media-state.json"), true)
+        @Expect(defaultAccount.debugReadMediaState().get("lastPersistedMediaId").getOrThrow().asString().getValue(), "default-photo")
+        @Expect(workAccount.debugReadMediaState().get("lastPersistedMediaId").getOrThrow().asString().getValue(), "work-photo")
     }
 
     @TestCase
@@ -458,14 +591,12 @@ public class TelegramAdapterTest {
     }
 
     @TestCase
-    public func proxyConfiguredPollingUsesCurlProxyForGetUpdates(): Unit {
+    public func proxyConfiguredPollingUsesTransportProxyForGetUpdates(): Unit {
         let seen = ArrayList<String>()
         try {
-            setTelegramCurlRunnerForTest(Some({ args: Array<String> =>
-                for (arg in args) {
-                    seen.add(arg)
-                }
-                (0, "{\"ok\":true,\"result\":[]}", "")
+            setTelegramTransportRunnerForTest(Some({ request: TelegramTransportRequest =>
+                seen.add("${request.method}|${request.context}|${request.url}|${request.proxy}")
+                TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":[]}", outcome: "ok")
             }))
             let adapter = TelegramAdapter(
                 config: TelegramConfig(
@@ -476,12 +607,15 @@ public class TelegramAdapterTest {
             )
             let raw = adapter.debugFetchTelegramUpdatesRaw()
             @Expect(raw.contains("\"ok\":true"), true)
-            @Expect(seen[0], "curl")
-            @Expect(seen.contains("--proxy"), true)
-            @Expect(seen.contains("http://127.0.0.1:7897"), true)
-            @Expect(seen[seen.size - 1].contains("/getUpdates"), true)
+            var found = false
+            for (item in seen) {
+                if (item.contains("POST|getUpdates|") && item.contains("/getUpdates") && item.contains("http://127.0.0.1:7897")) {
+                    found = true
+                }
+            }
+            @Expect(found, true)
         } finally {
-            setTelegramCurlRunnerForTest(None)
+            setTelegramTransportRunnerForTest(None)
         }
     }
 
@@ -490,12 +624,12 @@ public class TelegramAdapterTest {
         let attempts = ArrayList<Int64>()
         let root = Path("/tmp/metis-telegram-polling-recover-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
         try {
-            setTelegramCurlRunnerForTest(Some({ _args: Array<String> =>
+            setTelegramTransportRunnerForTest(Some({ _request: TelegramTransportRequest =>
                 attempts.add(1)
                 if (attempts.size == 1) {
                     throw Exception("simulated getUpdates timeout")
                 }
-                (0, "{\"ok\":true,\"result\":[{\"update_id\":123,\"message\":{\"message_id\":21,\"text\":\"recovered\",\"chat\":{\"id\":745123456,\"type\":\"private\"},\"from\":{\"id\":745123456}}}]}", "")
+                TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":[{\"update_id\":123,\"message\":{\"message_id\":21,\"text\":\"recovered\",\"chat\":{\"id\":745123456,\"type\":\"private\"},\"from\":{\"id\":745123456}}}]}", outcome: "ok")
             }))
             let adapter = TelegramAdapter(
                 config: TelegramConfig(
@@ -511,15 +645,15 @@ public class TelegramAdapterTest {
             @Expect(adapter.debugRunPollingIterationForTest(), 1)
             @Expect(adapter.debugLastInboundUpdateId(), "123")
         } finally {
-            setTelegramCurlRunnerForTest(None)
+            setTelegramTransportRunnerForTest(None)
         }
     }
 
     @TestCase
-    public func pollingCurlTimeoutRecordsPollingErrorWithoutSendError(): Unit {
+    public func pollingTransportTimeoutRecordsPollingErrorWithoutSendError(): Unit {
         try {
-            setTelegramCurlRunnerForTest(Some({ _args: Array<String> =>
-                (28, "", "Operation timed out")
+            setTelegramTransportRunnerForTest(Some({ _request: TelegramTransportRequest =>
+                TelegramTransportResponse(false, error: "Operation timed out", outcome: "timeout")
             }))
             let adapter = TelegramAdapter(
                 config: TelegramConfig(
@@ -532,12 +666,13 @@ public class TelegramAdapterTest {
             let snapshot = adapter.debugBuildPollingDiagnosticSnapshot()
             @Expect(snapshot.get("state").getOrThrow().asString().getValue(), "recovering")
             @Expect(snapshot.get("lastOutcome").getOrThrow().asString().getValue(), "timeout")
-            @Expect(snapshot.get("lastError").getOrThrow().asString().getValue().contains("getUpdates curl failed"), true)
+            @Expect(snapshot.get("lastError").getOrThrow().asString().getValue().contains("getUpdates transport failed"), true)
+            @Expect(snapshot.get("lastError").getOrThrow().asString().getValue().contains("Operation timed out"), true)
             @Expect(snapshot.get("consecutiveFailures").getOrThrow().asInt().getValue(), 1)
             @Expect(adapter.debugCurrentPollBackoffMsForTest(), 2000)
             @Expect(adapter.debugLastSendErrorForTest(), "")
         } finally {
-            setTelegramCurlRunnerForTest(None)
+            setTelegramTransportRunnerForTest(None)
         }
     }
 
@@ -545,12 +680,12 @@ public class TelegramAdapterTest {
     public func pollingSuccessResetsFailureCountAfterTimeout(): Unit {
         let attempts = ArrayList<Int64>()
         try {
-            setTelegramCurlRunnerForTest(Some({ _args: Array<String> =>
+            setTelegramTransportRunnerForTest(Some({ _request: TelegramTransportRequest =>
                 attempts.add(1)
                 if (attempts.size == 1) {
-                    return (28, "", "Operation timed out")
+                    return TelegramTransportResponse(false, error: "Operation timed out", outcome: "timeout")
                 }
-                (0, "{\"ok\":true,\"result\":[]}", "")
+                TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":[]}", outcome: "ok")
             }))
             let adapter = TelegramAdapter(
                 config: TelegramConfig(
@@ -568,15 +703,46 @@ public class TelegramAdapterTest {
             @Expect(snapshot.get("consecutiveFailures").getOrThrow().asInt().getValue(), 0)
             @Expect(adapter.debugCurrentPollBackoffMsForTest(), 0)
         } finally {
-            setTelegramCurlRunnerForTest(None)
+            setTelegramTransportRunnerForTest(None)
+        }
+    }
+
+    @TestCase
+    public func pollingWatchdogMarksStalledGetUpdatesAndRebuildsTransport(): Unit {
+        let attempts = ArrayList<Int64>()
+        try {
+            setTelegramTransportRunnerForTest(Some({ _request: TelegramTransportRequest =>
+                attempts.add(1)
+                sleep(Duration.millisecond * 120)
+                TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":[]}", outcome: "ok")
+            }))
+            let adapter = TelegramAdapter(
+                config: TelegramConfig(
+                    enabled: true,
+                    botToken: "telegram-token",
+                    proxy: "http://127.0.0.1:7897"
+                )
+            )
+            adapter.debugSetPollingWatchdogForTest(25, 5)
+            adapter.start()
+            sleep(Duration.millisecond * 80)
+            let snapshot = adapter.debugBuildPollingDiagnosticSnapshot()
+            @Expect(snapshot.get("lastOutcome").getOrThrow().asString().getValue(), "watchdog-stall")
+            @Expect(snapshot.get("watchdogRestartCount").getOrThrow().asInt().getValue() >= 1, true)
+            @Expect(snapshot.get("transportRebuildCount").getOrThrow().asInt().getValue() >= 1, true)
+            @Expect(snapshot.get("lastStallReason").getOrThrow().asString().getValue().contains("getUpdates stalled"), true)
+            @Expect(adapter.debugTelegramTransportRebuildCountForTest() >= 1, true)
+            adapter.stop()
+        } finally {
+            setTelegramTransportRunnerForTest(None)
         }
     }
 
     @TestCase
     public func pollingBackoffGrowsAndCapsAcrossConsecutiveFailures(): Unit {
         try {
-            setTelegramCurlRunnerForTest(Some({ _args: Array<String> =>
-                (28, "", "Operation timed out")
+            setTelegramTransportRunnerForTest(Some({ _request: TelegramTransportRequest =>
+                TelegramTransportResponse(false, error: "Operation timed out", outcome: "timeout")
             }))
             let adapter = TelegramAdapter(
                 config: TelegramConfig(
@@ -592,15 +758,15 @@ public class TelegramAdapterTest {
             @Expect(adapter.debugRunPollingIterationForTest(), 0)
             @Expect(adapter.debugCurrentPollBackoffMsForTest(), 8000)
         } finally {
-            setTelegramCurlRunnerForTest(None)
+            setTelegramTransportRunnerForTest(None)
         }
     }
 
     @TestCase
     public func healthSnapshotIncludesPollingDiagnostics(): Unit {
         try {
-            setTelegramCurlRunnerForTest(Some({ _args: Array<String> =>
-                (28, "", "Operation timed out")
+            setTelegramTransportRunnerForTest(Some({ _request: TelegramTransportRequest =>
+                TelegramTransportResponse(false, error: "Operation timed out", outcome: "timeout")
             }))
             let adapter = TelegramAdapter(
                 config: TelegramConfig(
@@ -616,21 +782,19 @@ public class TelegramAdapterTest {
             @Expect(summary.get("pollingState").getOrThrow().asString().getValue(), "recovering")
             @Expect(summary.get("pollingConsecutiveFailures").getOrThrow().asInt().getValue(), 1)
             @Expect(summary.get("pollingLastOutcome").getOrThrow().asString().getValue(), "timeout")
-            @Expect(polling.get("lastError").getOrThrow().asString().getValue().contains("getUpdates curl failed"), true)
+            @Expect(polling.get("lastError").getOrThrow().asString().getValue().contains("getUpdates transport failed"), true)
         } finally {
-            setTelegramCurlRunnerForTest(None)
+            setTelegramTransportRunnerForTest(None)
         }
     }
 
     @TestCase
-    public func proxyConfiguredNativeCommandsUseCurlProxy(): Unit {
+    public func proxyConfiguredNativeCommandsUseTransportProxy(): Unit {
         let seen = ArrayList<String>()
         try {
-            setTelegramCurlRunnerForTest(Some({ args: Array<String> =>
-                for (arg in args) {
-                    seen.add(arg)
-                }
-                (0, "{\"ok\":true,\"result\":true}", "")
+            setTelegramTransportRunnerForTest(Some({ request: TelegramTransportRequest =>
+                seen.add("${request.method}|${request.context}|${request.url}|${request.proxy}|${request.body}")
+                TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":true}", outcome: "ok")
             }))
             let adapter = TelegramAdapter(
                 config: TelegramConfig(
@@ -640,26 +804,31 @@ public class TelegramAdapterTest {
                 )
             )
             @Expect(adapter.debugSyncNativeCommandsForTest(), true)
-            @Expect(seen[0], "curl")
-            @Expect(seen.contains("--proxy"), true)
-            @Expect(seen.contains("http://127.0.0.1:7897"), true)
-            @Expect(seen[seen.size - 1].contains("/setMyCommands"), true)
+            var found = false
+            for (item in seen) {
+                if (item.contains("POST|setMyCommands|") && item.contains("/setMyCommands") && item.contains("|http://127.0.0.1:7897|") && item.contains("\"commands\"")) {
+                    found = true
+                }
+            }
+            @Expect(found, true)
         } finally {
-            setTelegramCurlRunnerForTest(None)
+            setTelegramTransportRunnerForTest(None)
         }
     }
 
-    /*
     @TestCase
-    public func sendWithMessageIdReturnsTelegramMessageIdForStreaming(): Unit {
+    public func sendWithMessageIdUsesNativeTransportOverride(): Unit {
+        let seen = ArrayList<String>()
         try {
-            setTelegramCurlRunnerForTest(Some({ _args: Array<String> =>
-                (0, "{\"ok\":true,\"result\":{\"message_id\":321,\"text\":\"hello\"}}", "")
+            setTelegramTransportRunnerForTest(Some({ request: TelegramTransportRequest =>
+                seen.add("${request.method}|${request.context}|${request.url}|${request.proxy}|${request.body}")
+                TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":{\"message_id\":321,\"text\":\"hello\"}}", outcome: "ok")
             }))
             let adapter = TelegramAdapter(
                 config: TelegramConfig(
                     enabled: true,
-                    botToken: "telegram-token"
+                    botToken: "telegram-token",
+                    proxy: "http://127.0.0.1:7897"
                 )
             )
             adapter.start()
@@ -667,11 +836,25 @@ public class TelegramAdapterTest {
                 OutboundMessage(ChannelType.Telegram, "user:8734062810", "hello")
             )
             @Expect(messageId, "321")
+            var found = false
+            for (item in seen) {
+                if (item.contains("POST|send:") && item.contains("/sendMessage") && item.contains("|http://127.0.0.1:7897|") && item.contains("8734062810")) {
+                    found = true
+                }
+            }
+            @Expect(found, true)
         } finally {
-            setTelegramCurlRunnerForTest(None)
+            setTelegramTransportRunnerForTest(None)
         }
     }
-    */
+
+    @TestCase
+    public func telegramTransportRedactsBotTokenInUrls(): Unit {
+        let adapter = TelegramAdapter(config: TelegramConfig(enabled: true, botToken: "123456:SECRET"))
+        let redacted = adapter.debugRedactTelegramUrlForTest("https://api.telegram.org/bot123456:SECRET/sendMessage")
+        @Expect(redacted, "https://api.telegram.org/bot<redacted>/sendMessage")
+        @Expect(redacted.contains("123456:SECRET"), false)
+    }
 
     @TestCase
     public func sendPayloadsChunkLongTextAndKeepReplyOnlyOnFirstChunkWhenReplyModeFirst(): Unit {

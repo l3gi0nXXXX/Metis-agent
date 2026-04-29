@@ -355,6 +355,7 @@ private func mergeTelegram(user: GatewayUserSettings): TelegramConfig {
         )
     }
     TelegramConfig(
+        accountId: "default",
         enabled: user.telegram.enabled || gatewayBuilderBuiltinExtraBool(extra, "enabled", false),
         botToken: botToken,
         tokenFile: user.telegram.tokenFile.trimAscii(),
