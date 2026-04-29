@@ -24,6 +24,54 @@ That gives the project a few defining characteristics:
 - Channel delivery for Feishu, QQ, Telegram, and plugin-driven IM integrations
 - Control and observability surfaces for dashboard, HTTP, and runtime inspection
 
+## High performance
+
+Without undergoing any specialized performance optimization, Metis has achieved a more than 20-fold leap in startup and shutdown efficiency, thereby completely resolving the critical issue of slow startup times associated with OpenClaw.
+
+Absent any specialized performance optimization, Metis has realized a qualitative leap in its startup and shutdown efficiency:
+
+| Comparison Item               | openclaw Average Duration | Metis Average Duration | Magnification Factor |
+| ----------------------------- | ------------------------- | ---------------------- | -------------------- |
+| onboard（Cold Start）         | 2\.591s                   | 0\.122s                | 21\.2 times          |
+| gateway restart（Cold Start） | 2\.366s                   | 0\.073s                | 32\.4 times          |
+| gateway start（Cold Start）   | 2\.174s                   | 0\.074s                | 29\.4 times          |
+| gateway stop（Cold Start）    | 1\.979s                   | 0\.073s                | 27\.1 times          |
+
+The detailed data is presented below; notably, these figures were achieved without any performance optimizations whatsoever (perhaps because Metis's feature set is not yet fully comprehensive?).
+
+| Num     | openclaw onboard | openclaw gateway restart | openclaw gateway start | openclaw gateway stop |
+| ------- | ---------------: | -----------------------: | ---------------------: | --------------------: |
+| 1       |           3.563s |                   1.989s |                 2.462s |                2.136s |
+| 2       |           2.470s |                   2.044s |                 2.397s |                1.955s |
+| 3       |           2.476s |                   2.555s |                 2.108s |                1.950s |
+| 4       |           2.473s |                   2.381s |                 2.089s |                1.962s |
+| 5       |           2.474s |                   2.391s |                 2.103s |                1.970s |
+| 6       |           2.493s |                   2.491s |                 2.118s |                1.957s |
+| 7       |           2.468s |                   2.421s |                 2.135s |                1.972s |
+| 8       |           2.505s |                   2.545s |                 2.099s |                1.966s |
+| 9       |           2.491s |                   2.432s |                 2.114s |                1.959s |
+| 10      |           2.500s |                   2.413s |                 2.117s |                1.961s |
+| average |           2.591s |                   2.366s |                 2.174s |                1.979s |
+
+| Num     | Metis onboard | Metis gateway restart | Metis gateway run | Metis gateway stop |
+| :------ | ------------: | --------------------: | ----------------: | -----------------: |
+| 1       |        0.562s |                0.072s |            0.075s |             0.071s |
+| 2       |        0.068s |                0.071s |            0.073s |             0.073s |
+| 3       |        0.076s |                0.074s |            0.077s |             0.073s |
+| 4       |        0.074s |                0.076s |            0.073s |             0.074s |
+| 5       |        0.076s |                0.073s |            0.074s |             0.073s |
+| 6       |        0.071s |                0.075s |            0.074s |             0.075s |
+| 7       |        0.071s |                0.075s |            0.073s |             0.077s |
+| 8       |        0.076s |                0.072s |            0.075s |             0.071s |
+| 9       |        0.072s |                0.074s |            0.073s |             0.073s |
+| 10      |        0.071s |                0.073s |            0.073s |             0.072s |
+| average |        0.122s |                0.073s |            0.074s |             0.073s |
+
+Test Environment:
+
+* MacBook Air 2026 M5 (10-core CPU + 10-core GPU) | 16GB RAM + 256GB SSD
+* macOS 26.4 (25E246)
+
 ## Quick Start
 
 ### Prerequisites
