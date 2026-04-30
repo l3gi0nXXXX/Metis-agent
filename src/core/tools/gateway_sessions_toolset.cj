@@ -2583,7 +2583,7 @@ public class GatewaySessionsToolset {
                 if (!t.isEmpty()) { unsupported.put("poll", JsonString(t)) }
             case None => ()
         }
-        unsupported.put("compatNote", JsonString("Supported actions are send, reply, thread, reaction, and poll."))
+        unsupported.put("compatNote", JsonString("Supported actions are send, reply, thread, reaction, poll, edit, delete, and telegram inline-keyboard payloads."))
         let out = unsupported.toJsonString()
         PrintUtils.printToolResult(out)
         return out

@@ -402,7 +402,9 @@ private func mergeTelegram(user: GatewayUserSettings): TelegramConfig {
             videoNote: user.telegram.actions.videoNote,
             sticker: user.telegram.actions.sticker,
             createForumTopic: user.telegram.actions.createForumTopic,
-            editForumTopic: user.telegram.actions.editForumTopic
+            editForumTopic: user.telegram.actions.editForumTopic,
+            inlineKeyboard: user.telegram.actions.inlineKeyboard,
+            callbackQuery: user.telegram.actions.callbackQuery
         ),
         threadBindings: TelegramThreadBindingsConfig(
             enabled: user.telegram.threadBindings.enabled,

@@ -100,6 +100,18 @@ public class GatewayMessagePayloadsTest {
     }
 
     @TestCase
+    func renderAndParseGatewayInlineKeyboardPartsRoundTrip(): Unit {
+        let rendered = renderGatewayInlineKeyboardText("Choose", ["Approve|callback:approve-1", "row", "Docs|url:https://example.test"])
+        @Expect(rendered.contains("[inline-keyboard]"), true)
+        let parsed = parseGatewayInlineKeyboardParts(rendered)
+        @Expect(parsed[0], "Choose")
+        @Expect(parsed[1].size, 3)
+        @Expect(parsed[1][0], "Approve|callback:approve-1")
+        @Expect(parsed[1][1], "row")
+        @Expect(parsed[1][2], "Docs|url:https://example.test")
+    }
+
+    @TestCase
     func renderAndParseGatewayEditTextRoundTrip(): Unit {
         let rendered = renderGatewayEditText("Updated text")
         @Expect(rendered.contains("[edit]"), true)

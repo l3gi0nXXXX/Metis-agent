@@ -556,9 +556,37 @@ private func gatewayTelegramChannelJson(user: GatewayUserSettings): JsonObject {
     actions.put("videoNote", user.telegram.actions.videoNote.toJsonValue())
     actions.put("createForumTopic", user.telegram.actions.createForumTopic.toJsonValue())
     actions.put("editForumTopic", user.telegram.actions.editForumTopic.toJsonValue())
+    actions.put("inlineKeyboard", user.telegram.actions.inlineKeyboard.toJsonValue())
+    actions.put("callbackQuery", user.telegram.actions.callbackQuery.toJsonValue())
     result.put("actions", actions)
+    result.put("actionSchemas", gatewayTelegramActionSchemasJson())
     result.put("supports", gatewayChannelSupportsJson(user, "telegram"))
     result
+}
+
+private func gatewayTelegramActionSchema(name: String, method: String, enabledBy: String, required: Array<String>): JsonObject {
+    let out = JsonObject()
+    out.put("name", JsonString(name))
+    out.put("botApiMethod", JsonString(method))
+    out.put("enabledBy", JsonString(enabledBy))
+    let requiredJson = JsonArray([])
+    for (field in required) {
+        requiredJson.add(JsonString(field))
+    }
+    out.put("required", requiredJson)
+    return out
+}
+
+private func gatewayTelegramActionSchemasJson(): JsonArray {
+    let out = JsonArray([])
+    out.add(gatewayTelegramActionSchema("sendMessage", "sendMessage", "telegram.actions.sendMessage", ["chat_id", "text"]))
+    out.add(gatewayTelegramActionSchema("poll", "sendPoll", "telegram.actions.poll", ["chat_id", "question", "options"]))
+    out.add(gatewayTelegramActionSchema("deleteMessage", "deleteMessage", "telegram.actions.deleteMessage", ["chat_id", "message_id"]))
+    out.add(gatewayTelegramActionSchema("editMessage", "editMessageText", "telegram.actions.editMessage", ["chat_id", "message_id", "text"]))
+    out.add(gatewayTelegramActionSchema("reaction", "setMessageReaction", "telegram.actions.reactions", ["chat_id", "message_id", "reaction"]))
+    out.add(gatewayTelegramActionSchema("inlineKeyboard", "sendMessage", "telegram.actions.inlineKeyboard", ["chat_id", "text", "reply_markup.inline_keyboard"]))
+    out.add(gatewayTelegramActionSchema("callbackQuery", "inbound:callback_query", "telegram.actions.callbackQuery", ["callback_query.id", "callback_query.message", "callback_query.from"]))
+    return out
 }
 
 private func gatewayTelegramRuntimeJson(user: GatewayUserSettings, liveProbe!: Bool = false): JsonObject {
@@ -581,6 +609,9 @@ private func gatewayTelegramRuntimeJson(user: GatewayUserSettings, liveProbe!: B
     }
     if (user.telegram.reactionNotifications.trimAscii().toAsciiLower() != "off") {
         allowed.add(JsonString("message_reaction"))
+    }
+    if (user.telegram.actions.callbackQuery || user.telegram.actions.inlineKeyboard) {
+        allowed.add(JsonString("callback_query"))
     }
     out.put("allowedUpdates", allowed)
     out.put("registrationPayload", adapter.debugBuildWebhookRegistrationPayload())

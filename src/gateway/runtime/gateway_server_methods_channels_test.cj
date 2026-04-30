@@ -104,9 +104,13 @@ public class GatewayServerMethodsChannelsTest {
         @Expect(channelsTestBool(telegram, "customCommands"), true)
         @Expect(channelsTestBool(telegram, "topicBindings"), true)
         @Expect(channelsTestBool(telegram, "topicActions"), true)
+        @Expect(channelsTestBool(telegram, "messageActions"), true)
+        @Expect(channelsTestBool(telegram, "actionDiscovery"), true)
         @Expect(channelsTestBool(telegram, "pollActions"), true)
         @Expect(channelsTestBool(telegram, "reactionActions"), true)
         @Expect(channelsTestBool(telegram, "reactionEvents"), true)
+        @Expect(channelsTestBool(telegram, "inlineKeyboard"), true)
+        @Expect(channelsTestBool(telegram, "callbackQuery"), true)
         @Expect(channelsTestBool(telegram, "ackReaction"), true)
         @Expect(channelsTestBool(telegram, "mediaSticker"), true)
         @Expect(channelsTestBool(telegram, "mediaPhoto"), true)
@@ -164,6 +168,8 @@ public class GatewayServerMethodsChannelsTest {
         user.telegram.webhookUrl = "https://example.test/telegram-webhook"
         user.telegram.actions.photo = true
         user.telegram.actions.document = true
+        user.telegram.actions.inlineKeyboard = true
+        user.telegram.actions.callbackQuery = true
 
         let channel = gatewayChannelGetJson(user, "telegram")
         @Expect(channelsTestString(channel, "kind"), "builtin")
@@ -174,6 +180,12 @@ public class GatewayServerMethodsChannelsTest {
         let actions = channel.get("actions").getOrThrow().asObject()
         @Expect(channelsTestBool(actions, "photo"), true)
         @Expect(channelsTestBool(actions, "document"), true)
+        @Expect(channelsTestBool(actions, "inlineKeyboard"), true)
+        @Expect(channelsTestBool(actions, "callbackQuery"), true)
+        let actionSchemas = channel.get("actionSchemas").getOrThrow().asArray()
+        @Expect(actionSchemas.size() >= 7, true)
+        @Expect(actionSchemas.toJsonString().contains("inlineKeyboard"), true)
+        @Expect(actionSchemas.toJsonString().contains("callbackQuery"), true)
         let supports = channel.get("supports").getOrThrow().asObject()
         @Expect(channelsTestBool(supports, "allowedUpdatesAuto"), true)
     }
@@ -187,6 +199,7 @@ public class GatewayServerMethodsChannelsTest {
         user.telegram.reactionNotifications = "all"
         user.telegram.reactionLevel = "ack"
         user.telegram.ackReaction = "👀"
+        user.telegram.actions.callbackQuery = true
         let params = JsonObject()
         params.put("channelId", JsonString("telegram"))
         params.put("probe", true.toJsonValue())
@@ -202,6 +215,7 @@ public class GatewayServerMethodsChannelsTest {
         let allowed = telegram.get("allowedUpdates").getOrThrow().asArray()
         @Expect(allowed.size() >= 5, true)
         @Expect(allowed[4].asString().getValue(), "message_reaction")
+        @Expect(allowed.toJsonString().contains("callback_query"), true)
         let registration = telegram.get("registrationPayload").getOrThrow().asObject()
         @Expect(registration.get("allowed_updates").isSome(), true)
         let health = telegram.get("healthSnapshot").getOrThrow().asObject()

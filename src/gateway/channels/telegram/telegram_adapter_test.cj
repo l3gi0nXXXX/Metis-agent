@@ -1646,6 +1646,39 @@ public class TelegramAdapterTest {
         @Expect(reaction.get("emoji").getOrThrow().asString().getValue(), "👍")
     }
 
+    @TestCase
+    public func sendPayloadsRenderNativeTelegramInlineKeyboardPayload(): Unit {
+        let adapter = TelegramAdapter(
+            config: TelegramConfig(
+                enabled: true,
+                botToken: "telegram-token",
+                replyToMode: "thread",
+                actions: TelegramActionConfig(inlineKeyboard: true)
+            )
+        )
+        let payloads = adapter.debugBuildSendPayloads(
+            OutboundMessage(
+                ChannelType.Telegram,
+                "group:-1001234567890:topic:42",
+                "[inline-keyboard]\ntext=Choose <one>\nbutton=Approve|callback:approve-1\nrow\nbutton=Docs|url:https://example.test",
+                replyInThread: true
+            )
+        )
+        @Expect(payloads.size(), 1)
+        let first = payloads[0].asObject()
+        @Expect(first.get("kind").getOrThrow().asString().getValue(), "inline-keyboard")
+        @Expect(first.get("text").getOrThrow().asString().getValue(), "Choose &lt;one&gt;")
+        @Expect(first.get("message_thread_id").getOrThrow().asString().getValue(), "42")
+        let markup = first.get("reply_markup").getOrThrow().asObject()
+        let rows = markup.get("inline_keyboard").getOrThrow().asArray()
+        @Expect(rows.size(), 2)
+        let firstButton = rows[0].asArray()[0].asObject()
+        @Expect(firstButton.get("text").getOrThrow().asString().getValue(), "Approve")
+        @Expect(firstButton.get("callback_data").getOrThrow().asString().getValue(), "approve-1")
+        let secondButton = rows[1].asArray()[0].asObject()
+        @Expect(secondButton.get("url").getOrThrow().asString().getValue(), "https://example.test")
+    }
+
     /*
     @TestCase
     public func sendPayloadsRenderNativeTelegramStickerPayload(): Unit {
@@ -1802,6 +1835,74 @@ public class TelegramAdapterTest {
         match (result) {
             case SendResult.Success => @Expect(false, true)
             case SendResult.Failed(reason) => @Expect(reason.contains("reaction action is disabled"), true)
+        }
+    }
+
+    @TestCase
+    public func disabledDeleteActionFailsFastBeforeNetwork(): Unit {
+        let cfg = TelegramConfig(
+            enabled: true,
+            botToken: "telegram-token",
+            actions: TelegramActionConfig(sendMessage: true, deleteMessage: false)
+        )
+        let adapter = TelegramAdapter(config: cfg)
+        adapter.start()
+        let result = adapter.send(
+            OutboundMessage(
+                ChannelType.Telegram,
+                "user:8734062810",
+                "[delete]",
+                replyToMessageId: Some("44")
+            )
+        )
+        match (result) {
+            case SendResult.Success => @Expect(false, true)
+            case SendResult.Failed(reason) => @Expect(reason.contains("deleteMessage action is disabled"), true)
+        }
+    }
+
+    @TestCase
+    public func disabledEditActionFailsFastBeforeNetwork(): Unit {
+        let cfg = TelegramConfig(
+            enabled: true,
+            botToken: "telegram-token",
+            actions: TelegramActionConfig(sendMessage: true, editMessage: false)
+        )
+        let adapter = TelegramAdapter(config: cfg)
+        adapter.start()
+        let result = adapter.send(
+            OutboundMessage(
+                ChannelType.Telegram,
+                "user:8734062810",
+                "[edit]\nUpdated",
+                replyToMessageId: Some("44")
+            )
+        )
+        match (result) {
+            case SendResult.Success => @Expect(false, true)
+            case SendResult.Failed(reason) => @Expect(reason.contains("editMessage action is disabled"), true)
+        }
+    }
+
+    @TestCase
+    public func disabledInlineKeyboardActionFailsFastBeforeNetwork(): Unit {
+        let cfg = TelegramConfig(
+            enabled: true,
+            botToken: "telegram-token",
+            actions: TelegramActionConfig(sendMessage: true, inlineKeyboard: false)
+        )
+        let adapter = TelegramAdapter(config: cfg)
+        adapter.start()
+        let result = adapter.send(
+            OutboundMessage(
+                ChannelType.Telegram,
+                "user:8734062810",
+                "[inline-keyboard]\ntext=Choose\nbutton=Approve|callback:approve-1"
+            )
+        )
+        match (result) {
+            case SendResult.Success => @Expect(false, true)
+            case SendResult.Failed(reason) => @Expect(reason.contains("inlineKeyboard action is disabled"), true)
         }
     }
 
@@ -2009,5 +2110,59 @@ public class TelegramAdapterTest {
         @Expect(inbound[0].replyTargetMessageId.getOrThrow(), "101")
         @Expect(inbound[0].text.contains("[telegram-reaction]"), true)
         @Expect(inbound[0].text.contains("emoji=👍"), true)
+    }
+
+    @TestCase
+    public func allowedUpdatesIncludeCallbackQueryOnlyWhenCallbackActionsEnabled(): Unit {
+        let disabled = TelegramAdapter(config: TelegramConfig(enabled: true, botToken: "telegram-token"))
+        let disabledAllowed = disabled.debugBuildAllowedUpdates().toJsonString()
+        @Expect(disabledAllowed.contains("callback_query"), false)
+
+        let enabled = TelegramAdapter(
+            config: TelegramConfig(
+                enabled: true,
+                botToken: "telegram-token",
+                actions: TelegramActionConfig(callbackQuery: true)
+            )
+        )
+        let enabledAllowed = enabled.debugBuildAllowedUpdates().toJsonString()
+        @Expect(enabledAllowed.contains("callback_query"), true)
+    }
+
+    @TestCase
+    public func callbackQueryWebhookQueuesInboundWhenEnabled(): Unit {
+        let cfg = TelegramConfig(
+            enabled: true,
+            botToken: "telegram-token",
+            dmPolicy: "open",
+            allowFrom: ["*"],
+            actions: TelegramActionConfig(callbackQuery: true)
+        )
+        let adapter = TelegramAdapter(config: cfg)
+        adapter.start()
+        let payload = "{\"update_id\":2,\"callback_query\":{\"id\":\"cb-1\",\"from\":{\"id\":8734062810},\"message\":{\"message_id\":101,\"chat\":{\"id\":8734062810,\"type\":\"private\"}},\"data\":\"approve-1\"}}"
+        let ack = adapter.ingestWebhookPayload(payload)
+        @Expect(ack.contains("\"ok\":true"), true)
+
+        let inbound = adapter.pullInbound()
+        @Expect(inbound.size, 1)
+        @Expect(inbound[0].messageId, "callback:cb-1")
+        @Expect(inbound[0].peerId, "user:8734062810")
+        @Expect(inbound[0].replyTargetMessageId.getOrThrow(), "101")
+        @Expect(inbound[0].text.contains("[telegram-callback]"), true)
+        @Expect(inbound[0].text.contains("data=approve-1"), true)
+    }
+
+    @TestCase
+    public func callbackQueryWebhookRecordsDisabledInboundPolicyReason(): Unit {
+        let adapter = TelegramAdapter(config: TelegramConfig(enabled: true, botToken: "telegram-token"))
+        adapter.start()
+        let payload = "{\"update_id\":3,\"callback_query\":{\"id\":\"cb-2\",\"from\":{\"id\":8734062810},\"message\":{\"message_id\":102,\"chat\":{\"id\":745123456,\"type\":\"private\"}},\"data\":\"approve-2\"}}"
+        let ack = adapter.ingestWebhookPayload(payload)
+        @Expect(ack.contains("\"ignored\":true"), true)
+        @Expect(adapter.pullInbound().size, 0)
+        let policy = adapter.debugBuildInboundPolicyDiagnostics()
+        @Expect(policy.get("lastUpdateKind").getOrThrow().asString().getValue(), "callback_query")
+        @Expect(policy.get("lastReason").getOrThrow().asString().getValue(), "callback_query_disabled")
     }
 }

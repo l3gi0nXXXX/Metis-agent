@@ -269,6 +269,51 @@ public func parseGatewayVideoNoteFileId(raw: String): String {
     ""
 }
 
+public func renderGatewayInlineKeyboardText(text: String, buttons: Array<String>): String {
+    let normalizedText = text.trimAscii()
+    if (normalizedText.isEmpty() || buttons.isEmpty()) {
+        return ""
+    }
+    let lines = ArrayList<String>()
+    lines.add("[inline-keyboard]")
+    lines.add("text=${normalizedText}")
+    for (button in buttons) {
+        let one = button.trimAscii()
+        if (one.isEmpty()) {
+            continue
+        }
+        if (one == "---" || one.toAsciiLower() == "row") {
+            lines.add("row")
+        } else {
+            lines.add("button=${one}")
+        }
+    }
+    return String.join(lines.toArray(), delimiter: "\n")
+}
+
+public func parseGatewayInlineKeyboardParts(raw: String): (String, Array<String>) {
+    let normalized = raw.replace("\r\n", "\n").replace("\r", "\n").trimAscii()
+    if (!normalized.startsWith("[inline-keyboard]")) {
+        return ("", [])
+    }
+    var text = ""
+    let buttons = ArrayList<String>()
+    for (line0 in normalized.split("\n")) {
+        let line = line0.trimAscii()
+        if (line.startsWith("text=")) {
+            text = line["text=".size..].trimAscii()
+        } else if (line.startsWith("button=")) {
+            let spec = line["button=".size..].trimAscii()
+            if (!spec.isEmpty()) {
+                buttons.add(spec)
+            }
+        } else if (line == "row" || line == "---") {
+            buttons.add("row")
+        }
+    }
+    (text, buttons.toArray())
+}
+
 public func parseGatewayStickerFileId(raw: String): String {
     let normalized = raw.replace("\r\n", "\n").replace("\r", "\n").trimAscii()
     if (!normalized.startsWith("[sticker]")) {

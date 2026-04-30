@@ -270,6 +270,8 @@ public struct TelegramActionUserSettings {
     public var sticker: Bool = false
     public var createForumTopic: Bool = false
     public var editForumTopic: Bool = false
+    public var inlineKeyboard: Bool = false
+    public var callbackQuery: Bool = false
 }
 
 @jsonable

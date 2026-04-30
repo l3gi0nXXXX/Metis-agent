@@ -514,6 +514,8 @@ public class TelegramActionConfig {
     public let sticker: Bool
     public let createForumTopic: Bool
     public let editForumTopic: Bool
+    public let inlineKeyboard: Bool
+    public let callbackQuery: Bool
 
     public init(
         reactions!: Bool = true,
@@ -529,7 +531,9 @@ public class TelegramActionConfig {
         videoNote!: Bool = false,
         sticker!: Bool = false,
         createForumTopic!: Bool = false,
-        editForumTopic!: Bool = false
+        editForumTopic!: Bool = false,
+        inlineKeyboard!: Bool = false,
+        callbackQuery!: Bool = false
     ) {
         this.reactions = reactions
         this.sendMessage = sendMessage
@@ -545,6 +549,8 @@ public class TelegramActionConfig {
         this.sticker = sticker
         this.createForumTopic = createForumTopic
         this.editForumTopic = editForumTopic
+        this.inlineKeyboard = inlineKeyboard
+        this.callbackQuery = callbackQuery
     }
 }
 

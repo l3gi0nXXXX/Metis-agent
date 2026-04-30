@@ -1,6 +1,6 @@
 package metis.gateway.channels.telegram
 
-import metis.core.{parseGatewayAudioParts, parseGatewayDocumentParts, parseGatewayEditText, parseGatewayPhotoParts, parseGatewayReactionToken, parseGatewayStickerFileId, parseGatewayTopicCreateText, parseGatewayTopicEditText, parseGatewayVideoNoteFileId, parseGatewayVideoParts, parseGatewayVoiceParts}
+import metis.core.{parseGatewayAudioParts, parseGatewayDocumentParts, parseGatewayEditText, parseGatewayInlineKeyboardParts, parseGatewayPhotoParts, parseGatewayReactionToken, parseGatewayStickerFileId, parseGatewayTopicCreateText, parseGatewayTopicEditText, parseGatewayVideoNoteFileId, parseGatewayVideoParts, parseGatewayVoiceParts}
 import metis.gateway.core.ChannelAdapter
 import metis.gateway.model.*
 import metis.io.PrintUtils
@@ -219,8 +219,24 @@ public class TelegramAdapter <: ChannelAdapter {
                 this.lastSendError = "telegram poll action is disabled"
                 return ""
             }
+            if (this.payloadIsDelete(payload) && !this.config.actions.deleteMessage) {
+                this.lastSendError = "telegram deleteMessage action is disabled"
+                return ""
+            }
+            if (this.payloadIsEdit(payload) && !this.config.actions.editMessage) {
+                this.lastSendError = "telegram editMessage action is disabled"
+                return ""
+            }
             if (this.payloadIsReaction(payload) && !this.config.actions.reactions) {
                 this.lastSendError = "telegram reaction action is disabled"
+                return ""
+            }
+            if (this.payloadIsInlineKeyboardInvalid(payload)) {
+                this.lastSendError = this.payloadValidationError(payload)
+                return ""
+            }
+            if (this.payloadIsInlineKeyboard(payload) && !this.config.actions.inlineKeyboard) {
+                this.lastSendError = "telegram inlineKeyboard action is disabled"
                 return ""
             }
             if (this.payloadIsSticker(payload) && !this.config.actions.sticker) {
@@ -516,6 +532,9 @@ public class TelegramAdapter <: ChannelAdapter {
         let notifications = this.config.reactionNotifications.trimAscii().toAsciiLower()
         if (!(notifications == "off" || notifications == "false" || notifications == "disabled")) {
             updates.add(JsonString("message_reaction"))
+        }
+        if (this.config.actions.callbackQuery || this.config.actions.inlineKeyboard) {
+            updates.add(JsonString("callback_query"))
         }
         updates
     }
@@ -845,6 +864,9 @@ public class TelegramAdapter <: ChannelAdapter {
             case Some(inbound) => return Some(inbound)
             case None => ()
         }
+        if (root.get("callback_query").isSome()) {
+            return this.mapCallbackQueryWebhookToInbound(root, raw)
+        }
         let message = this.pickPrimaryUpdateObject(root)
         if (message.isNone()) {
             this.recordInboundDecision(this.readIntStringField(root, "update_id"), this.primaryUpdateKind(root), "ignored", "unsupported_update_kind")
@@ -1141,6 +1163,67 @@ public class TelegramAdapter <: ChannelAdapter {
             this.recordInboundDecision(
                 this.readIntStringField(root, "update_id"),
                 "message_reaction",
+                "ignored",
+                rejectReason,
+                peerId: inbound.peerId,
+                senderId: inbound.senderId,
+                messageId: inbound.messageId
+            )
+            return None
+        }
+        Some(inbound)
+    }
+
+    private func mapCallbackQueryWebhookToInbound(root: JsonObject, raw: String): Option<InboundMessage> {
+        let callback = match (this.readObjectFieldOpt(root, "callback_query")) {
+            case Some(v) => v
+            case None => return None
+        }
+        if (!this.config.actions.callbackQuery) {
+            this.recordInboundDecision(this.readIntStringField(root, "update_id"), "callback_query", "ignored", "callback_query_disabled")
+            return None
+        }
+        let callbackId = this.readStringField(callback, "id").trimAscii()
+        let data = this.readStringField(callback, "data").trimAscii()
+        let sender = this.readObjectField(callback, "from")
+        let senderId = this.readIntStringField(sender, "id")
+        let msg = this.readObjectField(callback, "message")
+        let messageId = this.readIntStringField(msg, "message_id")
+        let chat = this.readObjectField(msg, "chat")
+        let chatId = this.readIntStringField(chat, "id")
+        if (callbackId.isEmpty() || senderId.isEmpty() || messageId.isEmpty() || chatId.isEmpty()) {
+            this.recordInboundDecision(this.readIntStringField(root, "update_id"), "callback_query", "ignored", "unsupported_or_empty_callback_query")
+            return None
+        }
+        let threadIdRaw = this.readIntStringField(msg, "message_thread_id")
+        let peerId = this.telegramPeerId(chat, threadId: threadIdRaw)
+        let chatType = if (this.readStringField(chat, "type") == "private") { ChatType.Direct } else { ChatType.Group }
+        let text = if (data.isEmpty()) {
+            "[telegram-callback]\nid=${callbackId}\nmessageId=${messageId}\nby=${senderId}"
+        } else {
+            "[telegram-callback]\nid=${callbackId}\nmessageId=${messageId}\ndata=${data}\nby=${senderId}"
+        }
+        let inbound = InboundMessage(
+            ChannelType.Telegram,
+            "callback:${callbackId}",
+            peerId,
+            senderId,
+            chatType,
+            text,
+            true,
+            DateTime.now(),
+            conversationId: Some(peerId),
+            threadId: if (threadIdRaw.isEmpty()) { None } else { Some(threadIdRaw) },
+            replyTargetMessageId: Some(messageId),
+            replyInThread: !threadIdRaw.isEmpty(),
+            raw: Some(raw),
+            accountId: this.effectiveAccountId()
+        )
+        let rejectReason = this.inboundRejectReason(inbound)
+        if (!rejectReason.isEmpty()) {
+            this.recordInboundDecision(
+                this.readIntStringField(root, "update_id"),
+                "callback_query",
                 "ignored",
                 rejectReason,
                 peerId: inbound.peerId,
@@ -1945,6 +2028,10 @@ public class TelegramAdapter <: ChannelAdapter {
             case Some(payload) => return [payload]
             case None => ()
         }
+        match (this.detectInlineKeyboardPayload(message)) {
+            case Some(payload) => return [payload]
+            case None => ()
+        }
         match (this.detectStickerPayload(message)) {
             case Some(payload) => return [payload]
             case None => ()
@@ -2093,6 +2180,60 @@ public class TelegramAdapter <: ChannelAdapter {
         let reactions = JsonArray([])
         reactions.add(reaction)
         body["reaction"] = reactions
+        body
+    }
+
+    private func buildInlineKeyboardPayload(message: OutboundMessage, text: String, specs: Array<String>): HashMap<String, JsonValue> {
+        let normalizedPeer = message.peerId.trimAscii()
+        let chatId = this.normalizePeerId(normalizedPeer)
+        let threadId = this.extractThreadId(normalizedPeer)
+        let replyInThread = this.effectiveReplyInThread(message.replyInThread)
+        let body = HashMap<String, JsonValue>()
+        body["kind"] = JsonString("inline-keyboard")
+        body["peer"] = JsonString(normalizedPeer)
+        body["chat_id"] = JsonString(chatId)
+        body["text"] = JsonString(this.telegramEscapeHtml(text))
+        body["plain_text"] = JsonString(text)
+        body["disable_web_page_preview"] = (!this.config.linkPreview).toJsonValue()
+        body["parse_mode"] = JsonString("HTML")
+        this.applyTelegramSilentOption(body)
+        if (!threadId.isEmpty() && replyInThread) {
+            body["message_thread_id"] = JsonString(threadId)
+        }
+        if (let Some(replyId) <- this.effectiveReplyToMessageId(message.replyToMessageId)) {
+            if (!replyId.trimAscii().isEmpty()) {
+                body["reply_to_message_id"] = JsonString(replyId.trimAscii())
+            }
+        }
+        let rows = JsonArray([])
+        var current = JsonArray([])
+        for (spec0 in specs) {
+            let spec = spec0.trimAscii()
+            if (spec.isEmpty()) {
+                continue
+            }
+            if (spec == "row" || spec == "---") {
+                if (current.size() > 0) {
+                    rows.add(current)
+                    current = JsonArray([])
+                }
+                continue
+            }
+            match (this.inlineKeyboardButtonFromSpec(spec)) {
+                case Some(button) => current.add(button)
+                case None => ()
+            }
+        }
+        if (current.size() > 0) {
+            rows.add(current)
+        }
+        if (rows.size() <= 0) {
+            body["validation_error"] = JsonString("telegram inlineKeyboard requires at least one valid button")
+            return body
+        }
+        let markup = JsonObject()
+        markup.put("inline_keyboard", rows)
+        body["reply_markup"] = markup
         body
     }
 
@@ -2389,10 +2530,42 @@ public class TelegramAdapter <: ChannelAdapter {
         }
     }
 
+    private func payloadIsDelete(payload: HashMap<String, JsonValue>): Bool {
+        match (payload.get("kind")) {
+            case Some(v) => try { v.asString().getValue().trimAscii().toAsciiLower() == "delete" } catch (_e: Exception) { false }
+            case None => false
+        }
+    }
+
+    private func payloadIsEdit(payload: HashMap<String, JsonValue>): Bool {
+        match (payload.get("kind")) {
+            case Some(v) => try { v.asString().getValue().trimAscii().toAsciiLower() == "edit" } catch (_e: Exception) { false }
+            case None => false
+        }
+    }
+
     private func payloadIsReaction(payload: HashMap<String, JsonValue>): Bool {
         match (payload.get("kind")) {
             case Some(v) => try { v.asString().getValue().trimAscii().toAsciiLower() == "reaction" } catch (_e: Exception) { false }
             case None => false
+        }
+    }
+
+    private func payloadIsInlineKeyboard(payload: HashMap<String, JsonValue>): Bool {
+        match (payload.get("kind")) {
+            case Some(v) => try { v.asString().getValue().trimAscii().toAsciiLower() == "inline-keyboard" } catch (_e: Exception) { false }
+            case None => false
+        }
+    }
+
+    private func payloadIsInlineKeyboardInvalid(payload: HashMap<String, JsonValue>): Bool {
+        this.payloadIsInlineKeyboard(payload) && payload.get("validation_error").isSome()
+    }
+
+    private func payloadValidationError(payload: HashMap<String, JsonValue>): String {
+        match (payload.get("validation_error")) {
+            case Some(v) => try { v.asString().getValue().trimAscii() } catch (_e: Exception) { "telegram payload validation failed" }
+            case None => "telegram payload validation failed"
         }
     }
 
@@ -2592,6 +2765,27 @@ public class TelegramAdapter <: ChannelAdapter {
         }
     }
 
+    private func detectInlineKeyboardPayload(message: OutboundMessage): Option<HashMap<String, JsonValue>> {
+        let parsed = parseGatewayInlineKeyboardParts(message.text)
+        let text = parsed[0].trimAscii()
+        if (text.isEmpty() && parsed[1].isEmpty()) {
+            return None
+        }
+        if (text.isEmpty()) {
+            let invalid = HashMap<String, JsonValue>()
+            invalid["kind"] = JsonString("inline-keyboard")
+            invalid["validation_error"] = JsonString("telegram inlineKeyboard requires non-empty text")
+            return Some(invalid)
+        }
+        if (!this.inlineKeyboardSpecsAreValid(parsed[1])) {
+            let invalid = HashMap<String, JsonValue>()
+            invalid["kind"] = JsonString("inline-keyboard")
+            invalid["validation_error"] = JsonString("telegram inlineKeyboard requires at least one valid button")
+            return Some(invalid)
+        }
+        Some(this.buildInlineKeyboardPayload(message, text, parsed[1]))
+    }
+
     private func detectStickerPayload(message: OutboundMessage): Option<HashMap<String, JsonValue>> {
         let fileId = parseGatewayStickerFileId(message.text)
         if (fileId.isEmpty()) {
@@ -2653,6 +2847,57 @@ public class TelegramAdapter <: ChannelAdapter {
             case Some(idx) => raw[idx + 2..].trimAscii()
             case None => raw
         }
+    }
+
+    private func inlineKeyboardButtonFromSpec(spec: String): Option<JsonObject> {
+        let normalized = spec.trimAscii()
+        match (normalized.indexOf("|")) {
+            case Some(idx) =>
+                let label = normalized[..idx].trimAscii()
+                let action = normalized[idx + 1..].trimAscii()
+                if (label.isEmpty() || action.isEmpty()) {
+                    return None
+                }
+                let button = JsonObject()
+                button.put("text", JsonString(label))
+                if (action.startsWith("callback:")) {
+                    if (action.size <= "callback:".size) {
+                        return None
+                    }
+                    let data = action["callback:".size..].trimAscii()
+                    if (data.isEmpty() || data.size > 64) {
+                        return None
+                    }
+                    button.put("callback_data", JsonString(data))
+                    return Some(button)
+                }
+                if (action.startsWith("url:")) {
+                    if (!(action.startsWith("url:https://") || action.startsWith("url:http://"))) {
+                        return None
+                    }
+                    let url = action["url:".size..].trimAscii()
+                    if (url.isEmpty()) {
+                        return None
+                    }
+                    button.put("url", JsonString(url))
+                    return Some(button)
+                }
+                None
+            case None => None
+        }
+    }
+
+    private func inlineKeyboardSpecsAreValid(specs: Array<String>): Bool {
+        for (spec0 in specs) {
+            let spec = spec0.trimAscii()
+            if (spec.isEmpty() || spec == "row" || spec == "---") {
+                continue
+            }
+            if (this.inlineKeyboardButtonFromSpec(spec).isSome()) {
+                return true
+            }
+        }
+        false
     }
 
     private func reactionInboundThreadId(peerId: String): Option<String> {
