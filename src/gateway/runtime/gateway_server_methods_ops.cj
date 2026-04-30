@@ -334,6 +334,10 @@ private func gatewayProbeActionsJson(user: GatewayUserSettings, issues: JsonArra
 
 private func gatewayDoctorActionsJson(user: GatewayUserSettings, checks: JsonArray, issues: JsonArray): JsonArray {
     let actions = gatewayProbeActionsJson(user, issues)
+    let telegramActions = gatewayTelegramDiagnosticsActionsJson(gatewayTelegramDiagnosticsJson(user))
+    for (idx in 0..telegramActions.size()) {
+        actions.add(telegramActions[idx])
+    }
     let cfg = gatewayOpsConfig(user)
     let audits = [
         gatewayNodeSchedulingAuditSummary(cfg),
@@ -578,6 +582,7 @@ private func gatewayDoctorStatusJson(user: GatewayUserSettings): JsonObject {
     let issues = gatewayProbeIssuesJson(user, checks)
     doctor.put("checks", checks)
     doctor.put("issues", issues)
+    doctor.put("telegramDiagnostics", gatewayTelegramDiagnosticsJson(user))
     doctor.put("summary", gatewayProbeSummaryJson(checks, issues))
     doctor.put("actions", gatewayDoctorActionsJson(user, checks, issues))
     return doctor

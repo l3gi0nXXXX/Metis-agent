@@ -1403,7 +1403,9 @@ private func gatewayChannelsHealthJson(user: GatewayUserSettings, liveProbe!: Bo
     let result = gatewayBuildChannelsHealthJson(user, { channelId, probe, timeoutMs =>
         gatewayChannelStatusRow(user, channelId, probe: probe, timeoutMs: timeoutMs)
     })
-    result.put("telegram", gatewayTelegramRuntimeJson(user, liveProbe: liveProbe))
+    let telegramRuntime = gatewayTelegramRuntimeJson(user, liveProbe: liveProbe)
+    result.put("telegram", telegramRuntime)
+    result.put("telegramDiagnostics", gatewayTelegramDiagnosticsJson(user, runtime: telegramRuntime))
     result
 }
 
@@ -1461,21 +1463,27 @@ private func gatewayChannelsAuditJson(user: GatewayUserSettings, channelId!: Str
     summary.put("remainingCount", remaining.size().toJsonValue())
 
     let runtime = JsonObject()
+    var telegramRuntime = JsonObject()
     if (normalized.isEmpty()) {
         runtime.put("channels", gatewayChannelsHealthJson(user))
         runtime.put("channelMeta", gatewayChannelMetaJson(user))
-        runtime.put("telegram", gatewayTelegramRuntimeJson(user, liveProbe: true))
+        telegramRuntime = gatewayTelegramRuntimeJson(user, liveProbe: true)
+        runtime.put("telegram", telegramRuntime)
     } else {
         runtime.put("channel", gatewayChannelGetJson(user, normalized))
         runtime.put("summary", gatewayChannelRuntimeSummary(normalized))
         if (normalized == "telegram") {
-            runtime.put("telegram", gatewayTelegramRuntimeJson(user, liveProbe: true))
+            telegramRuntime = gatewayTelegramRuntimeJson(user, liveProbe: true)
+            runtime.put("telegram", telegramRuntime)
         }
     }
+    let telegramDiagnostics = gatewayTelegramDiagnosticsJson(user, runtime: telegramRuntime)
+    summary.put("telegramDiagnostics", telegramDiagnostics.get("summary") ?? JsonObject())
 
     result.put("kind", JsonString("gateway-channels-audit"))
     result.put("summary", summary)
     result.put("runtime", runtime)
+    result.put("telegramDiagnostics", telegramDiagnostics)
     result.put("acceptance", acceptance)
     result.put("remaining", remaining)
     return result

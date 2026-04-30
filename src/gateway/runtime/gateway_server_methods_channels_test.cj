@@ -347,6 +347,82 @@ public class GatewayServerMethodsChannelsTest {
     }
 
     @TestCase
+    public func telegramT11DiagnosticsExposeSecurityAndRuntimeFindings(): Unit {
+        var user = GatewayUserSettings()
+        user.telegram.enabled = true
+        user.telegram.allowFrom = ["alice", "tg:8734062810"]
+        user.telegram.groupAllowFrom = ["*", "user:notnumeric"]
+        user.telegram.media.allowedMimes = []
+        user.telegram.media.mediaMaxBytes = 0
+        user.telegram.media.outboundAllowLocalPath = true
+        user.telegram.actions.deleteMessage = true
+        user.telegram.network.dangerouslyAllowPrivateNetwork = true
+
+        let runtime = JsonObject()
+        runtime.put("mode", JsonString("polling"))
+        let liveProbe = JsonObject()
+        liveProbe.put("status", JsonString("degraded"))
+        runtime.put("liveProbe", liveProbe)
+        let health = JsonObject()
+        let webhook = JsonObject()
+        webhook.put("url", JsonString("https://example.test/old-webhook"))
+        health.put("webhook", webhook)
+        let webhookLifecycle = JsonObject()
+        webhookLifecycle.put("cleanupError", JsonString("409 Conflict"))
+        health.put("webhookLifecycle", webhookLifecycle)
+        let polling = JsonObject()
+        polling.put("lastOutcome", JsonString("http-409-conflict"))
+        health.put("polling", polling)
+        runtime.put("healthSnapshot", health)
+
+        let diagnostics = gatewayTelegramDiagnosticsJson(user, runtime: runtime)
+        let summary = diagnostics.get("summary").getOrThrow().asObject()
+        @Expect(channelsTestBool(summary, "healthy"), false)
+        @Expect(channelsTestBool(summary, "curlConfigRuntimeResidual"), false)
+        @Expect(channelsTestString(summary, "transport"), "native-http")
+        let findings = diagnostics.get("findings").getOrThrow().asArray().toJsonString()
+        @Expect(findings.contains("telegram-token-missing"), true)
+        @Expect(findings.contains("telegram-getme-failed"), true)
+        @Expect(findings.contains("telegram-webhook-conflict"), true)
+        @Expect(findings.contains("telegram-polling-409"), true)
+        @Expect(findings.contains("telegram-allowfrom-nonnumeric"), true)
+        @Expect(findings.contains("telegram-groupallowfrom-nonnumeric"), true)
+        @Expect(findings.contains("telegram-groupallowfrom-wildcard"), true)
+        @Expect(findings.contains("telegram-media-allowed-mimes-missing"), true)
+        @Expect(findings.contains("telegram-media-size-limit-missing"), true)
+        @Expect(findings.contains("telegram-media-local-roots-missing"), true)
+        @Expect(findings.contains("telegram-high-risk-actions-enabled"), true)
+        @Expect(findings.contains("telegram-curl-runtime-residual"), true)
+    }
+
+    @TestCase
+    public func telegramT11DiagnosticsDetectGroupWithoutSenderAllowlist(): Unit {
+        var user = GatewayUserSettings()
+        user.telegram.enabled = true
+        user.telegram.botToken = "telegram-token"
+        user.telegram.groupPolicy = "allowlist"
+        user.telegram.allowFrom = []
+        user.telegram.groupAllowFrom = []
+
+        let diagnostics = gatewayTelegramDiagnosticsJson(user)
+        let findings = diagnostics.get("findings").getOrThrow().asArray().toJsonString()
+        @Expect(findings.contains("telegram-group-no-sender-allowlist"), true)
+    }
+
+    @TestCase
+    public func telegramChannelsHealthExposesT11Diagnostics(): Unit {
+        var user = GatewayUserSettings()
+        user.telegram.enabled = true
+
+        let result = handleGatewayChannelsFamily("channels.health", user).getOrThrow().result.asObject()
+        let channels = result.get("channels").getOrThrow().asObject()
+        let diagnostics = channels.get("telegramDiagnostics").getOrThrow().asObject()
+        let findings = diagnostics.get("findings").getOrThrow().asArray().toJsonString()
+        @Expect(findings.contains("telegram-token-missing"), true)
+        @Expect(result.get("telegram").isSome(), true)
+    }
+
+    @TestCase
     public func deliveryPolicyDegradesUnsupportedThreadReply(): Unit {
         let user = GatewayUserSettings()
         let delivery = gatewayApplyChannelDeliveryPolicy(

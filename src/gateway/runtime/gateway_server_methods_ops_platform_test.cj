@@ -52,4 +52,20 @@ public class GatewayServerMethodsOpsPlatformTest {
         @Expect(result.get("platform").isSome(), true)
         @Expect(result.get("controlUi").isSome(), true)
     }
+
+    @TestCase
+    public func doctorExposesTelegramDiagnosticsAndActions(): Unit {
+        var user = GatewayUserSettings()
+        user.telegram.enabled = true
+
+        let response = handleGatewayOpsFamily("doctor", user)
+        @Expect(response.isSome(), true)
+        let doctor = response.getOrThrow().result.asObject().get("doctor").getOrThrow().asObject()
+        let diagnostics = doctor.get("telegramDiagnostics").getOrThrow().asObject()
+        let findings = diagnostics.get("findings").getOrThrow().asArray().toJsonString()
+        @Expect(findings.contains("telegram-token-missing"), true)
+        let actions = doctor.get("actions").getOrThrow().asArray().toJsonString()
+        @Expect(actions.contains("telegram-diagnostic-followup"), true)
+        @Expect(actions.contains("telegram-token-missing"), true)
+    }
 }

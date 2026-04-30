@@ -4,11 +4,107 @@ import metis.gateway.model.*
 
 import magic.jsonable.*
 import std.collection.ArrayList
-import std.fs.{Directory, File, Path}
+import std.fs.{Directory, File, Path, remove}
 import std.sync.Mutex
 import std.time.*
 import std.unittest.testmacro.*
 import stdx.encoding.json.*
+
+private class TelegramFakeBotApi {
+    public var calls: ArrayList<String> = ArrayList<String>()
+    public var bodies: ArrayList<String> = ArrayList<String>()
+    private let lock: Mutex = Mutex()
+    private var getUpdatesCount: Int64 = 0
+    private var nextMessageId: Int64 = 500
+
+    public func handle(request: TelegramTransportRequest): TelegramTransportResponse {
+        synchronized(this.lock) {
+            this.calls.add(request.context + "|" + this.methodName(request.url))
+            if (!request.body.trimAscii().isEmpty()) {
+                this.bodies.add(request.body)
+            }
+            if (request.context == "get") {
+                if (request.url.contains("/getMe")) {
+                    return TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":{\"id\":10001,\"is_bot\":true,\"username\":\"metis_fake_bot\"}}", outcome: "ok")
+                }
+                if (request.url.contains("/getWebhookInfo")) {
+                    return TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":{\"url\":\"\",\"pending_update_count\":0}}", outcome: "ok")
+                }
+                if (request.url.contains("/getFile")) {
+                    return TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":{\"file_path\":\"photos/fake-photo.jpg\",\"file_size\":12}}", outcome: "ok")
+                }
+            }
+            if (request.context == "downloadFile") {
+                return TelegramTransportResponse(true, body: "fake-binary-photo", outcome: "ok")
+            }
+            if (request.context == "setWebhook" || request.context == "setMyCommands" || request.context.startsWith("deleteWebhook:")) {
+                return TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":true}", outcome: "ok")
+            }
+            if (request.context == "getUpdates") {
+                this.getUpdatesCount += 1
+                if (this.getUpdatesCount == 1) {
+                    return TelegramTransportResponse(
+                        true,
+                        body: "{\"ok\":true,\"result\":[{\"update_id\":7001,\"message\":{\"message_id\":11,\"text\":\"hello from fake polling\",\"chat\":{\"id\":8734062810,\"type\":\"private\"},\"from\":{\"id\":8734062810}}}]}",
+                        outcome: "ok"
+                    )
+                }
+                return TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":[]}", outcome: "ok")
+            }
+            if (request.context.startsWith("send:delete") || request.context.startsWith("send:reaction") || request.context.startsWith("send:topic-edit")) {
+                return TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":true}", outcome: "ok")
+            }
+            if (request.context.startsWith("send:topic-create")) {
+                return TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":{\"message_thread_id\":42,\"name\":\"Sprint\"}}", outcome: "ok")
+            }
+            if (request.context.startsWith("send:")) {
+                this.nextMessageId += 1
+                return TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":{\"message_id\":${this.nextMessageId}}}", outcome: "ok")
+            }
+            TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":true}", outcome: "ok")
+        }
+    }
+
+    public func saw(method: String): Bool {
+        synchronized(this.lock) {
+            for (call in this.calls) {
+                if (call.contains(method)) {
+                    return true
+                }
+            }
+            false
+        }
+    }
+
+    public func sawBodyContaining(text: String): Bool {
+        synchronized(this.lock) {
+            for (body in this.bodies) {
+                if (body.contains(text)) {
+                    return true
+                }
+            }
+            false
+        }
+    }
+
+    private func methodName(url: String): String {
+        if (url.contains("/getUpdates")) { return "getUpdates" }
+        if (url.contains("/setWebhook")) { return "setWebhook" }
+        if (url.contains("/deleteWebhook")) { return "deleteWebhook" }
+        if (url.contains("/setMyCommands")) { return "setMyCommands" }
+        if (url.contains("/getMe")) { return "getMe" }
+        if (url.contains("/getWebhookInfo")) { return "getWebhookInfo" }
+        if (url.contains("/getFile")) { return "getFile" }
+        if (url.contains("/deleteMessage")) { return "deleteMessage" }
+        if (url.contains("/setMessageReaction")) { return "setMessageReaction" }
+        if (url.contains("/createForumTopic")) { return "createForumTopic" }
+        if (url.contains("/editForumTopic")) { return "editForumTopic" }
+        if (url.contains("/sendPhoto")) { return "sendPhoto" }
+        if (url.contains("/sendMessage")) { return "sendMessage" }
+        if (url.contains("/file/bot")) { return "downloadFile" }
+        "unknown"
+    }
+}
 
 @Test
 public class TelegramAdapterTest {
@@ -249,6 +345,161 @@ public class TelegramAdapterTest {
             @Expect(seen[3], "https://example.test/telegram-webhook")
         } finally {
             setTelegramTransportRunnerForTest(None)
+        }
+    }
+
+    @TestCase
+    public func fakeBotApiEndToEndCoversTelegramRuntimeClosure(): Unit {
+        let fake = TelegramFakeBotApi()
+        let root = "/tmp/metis-telegram-fake-bot-api-e2e-${DateTime.now().toUnixTimeStamp().toMilliseconds()}"
+        try {
+            setTelegramTransportRunnerForTest(Some({ request: TelegramTransportRequest =>
+                fake.handle(request)
+            }))
+            let cfg = TelegramConfig(
+                enabled: true,
+                botToken: "123456:FAKE",
+                dmPolicy: "open",
+                allowFrom: ["*"],
+                actions: TelegramActionConfig(
+                    sendMessage: true,
+                    deleteMessage: true,
+                    photo: true,
+                    createForumTopic: true,
+                    editForumTopic: true,
+                    reactions: true,
+                    inlineKeyboard: true,
+                    callbackQuery: true
+                ),
+                media: TelegramMediaConfig(
+                    downloadEnabled: true,
+                    mediaMaxBytes: 1024,
+                    allowedMimes: ["image/*"]
+                )
+            )
+            let adapter = TelegramAdapter(config: cfg, pairingRoot: root)
+            adapter.start()
+            sleep(Duration.millisecond * 80)
+
+            let polled = adapter.pullInbound()
+            @Expect(polled.size >= 1, true)
+            @Expect(polled[0].text, "hello from fake polling")
+            @Expect(polled[0].senderId, "8734062810")
+
+            @Expect(adapter.debugSyncNativeCommandsForTest(), true)
+            let liveProbe = adapter.debugBuildLiveProbe()
+            @Expect(liveProbe.get("status").getOrThrow().asString().getValue(), "ok")
+
+            let textMessageId = adapter.sendWithMessageId(
+                OutboundMessage(ChannelType.Telegram, "user:8734062810", "hello fake bot api")
+            )
+            @Expect(textMessageId, "501")
+
+            let keyboardMessageId = adapter.sendWithMessageId(
+                OutboundMessage(
+                    ChannelType.Telegram,
+                    "user:8734062810",
+                    "[inline-keyboard]\ntext=Choose\nbutton=Approve|callback:approve-1"
+                )
+            )
+            @Expect(keyboardMessageId, "502")
+
+            let photoMessageId = adapter.sendWithMessageId(
+                OutboundMessage(ChannelType.Telegram, "user:8734062810", "[photo]\nfileId=photo-file-id\ncaption=fake")
+            )
+            @Expect(photoMessageId, "503")
+
+            let deleteResult = adapter.send(
+                OutboundMessage(
+                    ChannelType.Telegram,
+                    "user:8734062810",
+                    "[delete]",
+                    replyToMessageId: Some("503")
+                )
+            )
+            match (deleteResult) {
+                case SendResult.Success => @Expect(true, true)
+                case SendResult.Failed(reason) => @Expect(reason, "")
+            }
+
+            let topicResult = adapter.send(
+                OutboundMessage(ChannelType.Telegram, "group:-1001234567890", "[topic-create]\nSprint")
+            )
+            match (topicResult) {
+                case SendResult.Success => @Expect(true, true)
+                case SendResult.Failed(reason) => @Expect(reason, "")
+            }
+
+            let reactionResult = adapter.send(
+                OutboundMessage(
+                    ChannelType.Telegram,
+                    "user:8734062810",
+                    "[reaction]\ntoken=👍\nrender=👍",
+                    replyToMessageId: Some("503")
+                )
+            )
+            match (reactionResult) {
+                case SendResult.Success => @Expect(true, true)
+                case SendResult.Failed(reason) => @Expect(reason, "")
+            }
+
+            let mediaState = adapter.debugPersistInboundMediaForTest(
+                "photo",
+                "photo-file-id",
+                mimeType: "image/jpeg",
+                fileSize: 12
+            )
+            let lastMedia = mediaState.get("lastMedia").getOrThrow().asObject()
+            @Expect(lastMedia.get("downloaded").getOrThrow().asBool().getValue(), true)
+            @Expect(lastMedia.get("filePath").getOrThrow().asString().getValue(), "photos/fake-photo.jpg")
+
+            let callbackAck = adapter.ingestWebhookPayload(
+                "{\"update_id\":7002,\"callback_query\":{\"id\":\"cb-1\",\"data\":\"approve-1\",\"from\":{\"id\":8734062810},\"message\":{\"message_id\":22,\"chat\":{\"id\":8734062810,\"type\":\"private\"}}}}"
+            )
+            @Expect(callbackAck.contains("\"ok\":true"), true)
+            let callbackInbound = adapter.pullInbound()
+            @Expect(callbackInbound.size >= 1, true)
+            @Expect(callbackInbound[0].text.contains("approve-1"), true)
+
+            let webhookAdapter = TelegramAdapter(
+                config: TelegramConfig(
+                    enabled: true,
+                    botToken: "123456:FAKE",
+                    webhookUrl: "https://example.test/telegram-webhook",
+                    webhookSecret: "secret-token"
+                ),
+                pairingRoot: root + "-webhook"
+            )
+            @Expect(webhookAdapter.debugRegisterWebhookForTest(), true)
+
+            adapter.stop()
+            @Expect(fake.saw("deleteWebhook"), true)
+            @Expect(fake.saw("getUpdates"), true)
+            @Expect(fake.saw("setMyCommands"), true)
+            @Expect(fake.saw("getMe"), true)
+            @Expect(fake.saw("getWebhookInfo"), true)
+            @Expect(fake.saw("sendMessage"), true)
+            @Expect(fake.saw("sendPhoto"), true)
+            @Expect(fake.saw("deleteMessage"), true)
+            @Expect(fake.saw("createForumTopic"), true)
+            @Expect(fake.saw("setMessageReaction"), true)
+            @Expect(fake.saw("getFile"), true)
+            @Expect(fake.saw("downloadFile"), true)
+            @Expect(fake.saw("setWebhook"), true)
+            @Expect(fake.sawBodyContaining("inline_keyboard"), true)
+            @Expect(fake.sawBodyContaining("photo-file-id"), true)
+        } finally {
+            setTelegramTransportRunnerForTest(None)
+            try {
+                remove(Path(root), recursive: true)
+            } catch (_: Exception) {
+                ()
+            }
+            try {
+                remove(Path(root + "-webhook"), recursive: true)
+            } catch (_: Exception) {
+                ()
+            }
         }
     }
 
