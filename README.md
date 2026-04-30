@@ -235,6 +235,7 @@ Useful project documents:
 
 - `README.md` for the current project intro and command overview
 - `docs/user/runtime-execution-model.md` for how Gateway-first execution works
+- `docs/user/telegram.md` for Telegram channel configuration, media usage, and troubleshooting
 - `docs/user/subagents.md` for background subagent usage and control-ui operations
 - `docs/user/skills-guide.md` for skills discovery, commands, and installation
 - `docs/user/gateway-im-plugins.md` for IM plugin integration

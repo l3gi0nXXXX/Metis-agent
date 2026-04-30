@@ -1357,7 +1357,10 @@ public class TelegramAdapter <: ChannelAdapter {
         }
         let method = this.telegramApiMethodForPayloadKind(kind)
         let url = this.normalizeApiRoot() + "/bot${token}/${method}"
-        let responseOpt = this.telegramJsonPost(url, this.telegramApiBodyForPayload(payload, plainFallback: false), context: "send:${kind}")
+        let responseOpt = match (this.localMediaUploadForPayload(kind, payload)) {
+            case Some(upload) => this.telegramMultipartPost(url, payload, upload[0], upload[1], context: "send:${kind}:multipart")
+            case None => this.telegramJsonPost(url, this.telegramApiBodyForPayload(payload, plainFallback: false), context: "send:${kind}")
+        }
         let responseRaw = match (responseOpt) {
             case Some(resp) => resp
             case None =>
@@ -1380,7 +1383,10 @@ public class TelegramAdapter <: ChannelAdapter {
             }
             plainPayload[key] = value
         }
-        let plainResponseOpt = this.telegramJsonPost(url, this.telegramApiBodyForPayload(plainPayload, plainFallback: true), context: "send:${kind}:plain")
+        let plainResponseOpt = match (this.localMediaUploadForPayload(kind, plainPayload)) {
+            case Some(upload) => this.telegramMultipartPost(url, plainPayload, upload[0], upload[1], context: "send:${kind}:plain:multipart")
+            case None => this.telegramJsonPost(url, this.telegramApiBodyForPayload(plainPayload, plainFallback: true), context: "send:${kind}:plain")
+        }
         let plainResponseRaw = match (plainResponseOpt) {
             case Some(resp) => resp
             case None =>
@@ -1415,6 +1421,55 @@ public class TelegramAdapter <: ChannelAdapter {
             out.put(key, value)
         }
         out
+    }
+
+    private func localMediaUploadForPayload(kind: String, payload: HashMap<String, JsonValue>): Option<Array<String>> {
+        let mediaField = this.telegramMediaFieldForPayloadKind(kind)
+        if (mediaField.isEmpty()) {
+            return None
+        }
+        let ref = match (payload.get(mediaField)) {
+            case Some(v) => try { v.asString().getValue().trimAscii() } catch (_e: Exception) { "" }
+            case None => ""
+        }
+        if (ref.isEmpty() || !this.looksLikeLocalMediaPath(ref)) {
+            return None
+        }
+        Some([mediaField, this.normalizeOutboundLocalMediaPath(ref)])
+    }
+
+    private func telegramMediaFieldForPayloadKind(kind: String): String {
+        if (kind == "photo") { return "photo" }
+        if (kind == "document") { return "document" }
+        if (kind == "audio") { return "audio" }
+        if (kind == "voice") { return "voice" }
+        if (kind == "video") { return "video" }
+        if (kind == "video-note") { return "video_note" }
+        if (kind == "sticker") { return "sticker" }
+        ""
+    }
+
+    private func telegramMultipartFieldsForPayload(payload: HashMap<String, JsonValue>, fileField: String): HashMap<String, String> {
+        let out = HashMap<String, String>()
+        for ((key, value) in payload) {
+            if (key == "kind" || key == "peer" || key == "plain_text" || key == "plain_caption" || key == fileField) {
+                continue
+            }
+            out[key] = this.telegramMultipartFieldValue(value)
+        }
+        out
+    }
+
+    private func telegramMultipartFieldValue(value: JsonValue): String {
+        try {
+            return value.asString().getValue()
+        } catch (_e1: Exception) {
+            try {
+                return if (value.asBool().getValue()) { "true" } else { "false" }
+            } catch (_e2: Exception) {
+                value.toJsonString()
+            }
+        }
     }
 
     private func parseTelegramPayloadSuccess(kind: String, raw: String): Option<String> {
@@ -3148,7 +3203,7 @@ public class TelegramAdapter <: ChannelAdapter {
             if (!this.localMediaPathWithinAllowedRoots(normalized)) {
                 return "telegram outbound local media path is outside configured roots"
             }
-            return "telegram outbound local media upload requires multipart transport"
+            return ""
         }
         if (normalized.contains("://")) {
             return "telegram outbound media URL scheme is not allowed"
@@ -3182,6 +3237,14 @@ public class TelegramAdapter <: ChannelAdapter {
             }
         }
         false
+    }
+
+    private func normalizeOutboundLocalMediaPath(ref: String): String {
+        let trimmed = ref.trimAscii()
+        if (trimmed.toAsciiLower().startsWith("file://")) {
+            return trimmed[7..]
+        }
+        trimmed
     }
 
     private func parsePollOptionLine(raw: String): String {
@@ -3637,6 +3700,25 @@ public class TelegramAdapter <: ChannelAdapter {
 
     private func telegramJsonPost(url: String, body: JsonObject, context!: String): Option<String> {
         this.handleTelegramTransportResponse(this.telegramTransport().postJson(url, body, context: context), context)
+    }
+
+    private func telegramMultipartPost(
+        url: String,
+        payload: HashMap<String, JsonValue>,
+        fileField: String,
+        filePath: String,
+        context!: String
+    ): Option<String> {
+        this.handleTelegramTransportResponse(
+            this.telegramTransport().postMultipartFile(
+                url,
+                this.telegramMultipartFieldsForPayload(payload, fileField),
+                fileField,
+                filePath,
+                context: context
+            ),
+            context
+        )
     }
 
     private func handleTelegramTransportResponse(response: TelegramTransportResponse, context: String): Option<String> {

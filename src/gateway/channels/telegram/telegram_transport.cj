@@ -4,6 +4,7 @@ import magic.jsonable.*
 
 import std.collection.{ArrayList, HashMap}
 import std.convert.Parsable
+import std.fs.{File, Path}
 import std.io.StringReader
 import std.net.{SocketAddress, TcpSocket}
 import std.time.*
@@ -19,6 +20,8 @@ public class TelegramTransportRequest {
     public let context: String
     public let accept: String
     public let body: String
+    public let bodyBytes: Array<Byte>
+    public let contentType: String
     public let proxy: String
     public let timeoutSeconds: Int64
 
@@ -28,6 +31,8 @@ public class TelegramTransportRequest {
         context!: String = "",
         accept!: String = "application/json",
         body!: String = "",
+        bodyBytes!: Array<Byte> = [],
+        contentType!: String = "",
         proxy!: String = "",
         timeoutSeconds!: Int64 = 30
     ) {
@@ -36,6 +41,8 @@ public class TelegramTransportRequest {
         this.context = context
         this.accept = accept
         this.body = body
+        this.bodyBytes = bodyBytes
+        this.contentType = contentType
         this.proxy = proxy
         this.timeoutSeconds = timeoutSeconds
     }
@@ -115,6 +122,7 @@ public class TelegramTransport {
             context: context,
             accept: "application/json",
             body: body.toJsonString(),
+            contentType: "application/json; charset=utf-8",
             proxy: this.proxy,
             timeoutSeconds: this.timeoutSeconds
         )
@@ -125,6 +133,35 @@ public class TelegramTransport {
         let headers = HashMap<String, String>()
         headers["Accept"] = "application/json"
         headers["Content-Type"] = "application/json; charset=utf-8"
+        this.sendNative(request, headers)
+    }
+
+    public func postMultipartFile(
+        url: String,
+        fields: HashMap<String, String>,
+        fileField: String,
+        filePath: String,
+        context!: String = "postMultipartFile"
+    ): TelegramTransportResponse {
+        let boundary = "metis-telegram-${DateTime.now().toUnixTimeStamp().toMilliseconds()}"
+        let bodyBytes = this.buildMultipartBody(boundary, fields, fileField, filePath)
+        let request = TelegramTransportRequest(
+            "POST",
+            url,
+            context: context,
+            accept: "application/json",
+            bodyBytes: bodyBytes,
+            contentType: "multipart/form-data; boundary=${boundary}",
+            proxy: this.proxy,
+            timeoutSeconds: this.timeoutSeconds
+        )
+        match (telegramTransportRunnerOverride) {
+            case Some(runner) => return runner(request)
+            case None => ()
+        }
+        let headers = HashMap<String, String>()
+        headers["Accept"] = "application/json"
+        headers["Content-Type"] = request.contentType
         this.sendNative(request, headers)
     }
 
@@ -282,7 +319,11 @@ public class TelegramTransport {
         let builder = HttpRequestBuilder().url(request.url)
         if (request.method == "POST") {
             builder.post()
-            builder.body(request.body)
+            if (!request.bodyBytes.isEmpty()) {
+                builder.body(request.bodyBytes)
+            } else {
+                builder.body(request.body)
+            }
         } else {
             builder.get()
         }
@@ -290,6 +331,52 @@ public class TelegramTransport {
             builder.header(key, value)
         }
         builder.build()
+    }
+
+    private func buildMultipartBody(
+        boundary: String,
+        fields: HashMap<String, String>,
+        fileField: String,
+        filePath: String
+    ): Array<Byte> {
+        let out = ArrayList<Byte>()
+        for ((key, value) in fields) {
+            out.add(all: "--${boundary}\r\n".toArray())
+            out.add(all: "Content-Disposition: form-data; name=\"${this.escapeMultipartName(key)}\"\r\n\r\n".toArray())
+            out.add(all: value.toArray())
+            out.add(all: "\r\n".toArray())
+        }
+        let normalizedPath = this.normalizeLocalFilePath(filePath)
+        let filename = this.fileNameForMultipart(normalizedPath)
+        out.add(all: "--${boundary}\r\n".toArray())
+        out.add(all: "Content-Disposition: form-data; name=\"${this.escapeMultipartName(fileField)}\"; filename=\"${this.escapeMultipartName(filename)}\"\r\n".toArray())
+        out.add(all: "Content-Type: application/octet-stream\r\n\r\n".toArray())
+        out.add(all: File.readFrom(Path(normalizedPath)))
+        out.add(all: "\r\n--${boundary}--\r\n".toArray())
+        out.toArray()
+    }
+
+    private func normalizeLocalFilePath(pathText: String): String {
+        let trimmed = pathText.trimAscii()
+        if (trimmed.toAsciiLower().startsWith("file://")) {
+            return trimmed[7..]
+        }
+        trimmed
+    }
+
+    private func fileNameForMultipart(pathText: String): String {
+        let normalized = pathText.trimAscii()
+        match (normalized.lastIndexOf("/")) {
+            case Some(idx) =>
+                let name = normalized[idx + 1..].trimAscii()
+                if (name.isEmpty()) { "upload.bin" } else { name }
+            case None =>
+                if (normalized.isEmpty()) { "upload.bin" } else { normalized }
+        }
+    }
+
+    private func escapeMultipartName(raw: String): String {
+        raw.replace("\\", "\\\\").replace("\"", "\\\"").replace("\r", "").replace("\n", "")
     }
 
     private func classifyStatus(status: Int64): String {

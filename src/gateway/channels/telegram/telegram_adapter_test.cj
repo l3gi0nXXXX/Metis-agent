@@ -13,6 +13,8 @@ import stdx.encoding.json.*
 private class TelegramFakeBotApi {
     public var calls: ArrayList<String> = ArrayList<String>()
     public var bodies: ArrayList<String> = ArrayList<String>()
+    public var contentTypes: ArrayList<String> = ArrayList<String>()
+    public var bodySizes: ArrayList<Int64> = ArrayList<Int64>()
     private let lock: Mutex = Mutex()
     private var getUpdatesCount: Int64 = 0
     private var nextMessageId: Int64 = 500
@@ -22,6 +24,13 @@ private class TelegramFakeBotApi {
             this.calls.add(request.context + "|" + this.methodName(request.url))
             if (!request.body.trimAscii().isEmpty()) {
                 this.bodies.add(request.body)
+            }
+            if (!request.contentType.trimAscii().isEmpty()) {
+                this.contentTypes.add(request.contentType)
+            }
+            if (!request.bodyBytes.isEmpty()) {
+                this.bodySizes.add(Int64(request.bodyBytes.size))
+                this.bodies.add(String.fromUtf8(request.bodyBytes))
             }
             if (request.context == "get") {
                 if (request.url.contains("/getMe")) {
@@ -87,6 +96,17 @@ private class TelegramFakeBotApi {
         }
     }
 
+    public func sawContentTypeContaining(text: String): Bool {
+        synchronized(this.lock) {
+            for (contentType in this.contentTypes) {
+                if (contentType.contains(text)) {
+                    return true
+                }
+            }
+            false
+        }
+    }
+
     private func methodName(url: String): String {
         if (url.contains("/getUpdates")) { return "getUpdates" }
         if (url.contains("/setWebhook")) { return "setWebhook" }
@@ -100,6 +120,11 @@ private class TelegramFakeBotApi {
         if (url.contains("/createForumTopic")) { return "createForumTopic" }
         if (url.contains("/editForumTopic")) { return "editForumTopic" }
         if (url.contains("/sendPhoto")) { return "sendPhoto" }
+        if (url.contains("/sendDocument")) { return "sendDocument" }
+        if (url.contains("/sendAudio")) { return "sendAudio" }
+        if (url.contains("/sendVoice")) { return "sendVoice" }
+        if (url.contains("/sendVideo")) { return "sendVideo" }
+        if (url.contains("/sendVideoNote")) { return "sendVideoNote" }
         if (url.contains("/sendMessage")) { return "sendMessage" }
         if (url.contains("/file/bot")) { return "downloadFile" }
         "unknown"
@@ -2226,6 +2251,77 @@ public class TelegramAdapterTest {
         match (result) {
             case SendResult.Success => @Expect(false, true)
             case SendResult.Failed(reason) => @Expect(reason.contains("outbound local media path is disabled"), true)
+        }
+    }
+
+    @TestCase
+    public func outboundLocalPhotoUsesMultipartTransport(): Unit {
+        let root = Path("/tmp/metis-telegram-outbound-photo-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
+        Directory.create(root, recursive: true)
+        let photoPath = root.join("photo.jpg")
+        File.writeTo(photoPath, "fake-photo-bytes".toArray())
+        let fake = TelegramFakeBotApi()
+        setTelegramTransportRunnerForTest(Some({ request => fake.handle(request) }))
+        try {
+            let adapter = TelegramAdapter(
+                config: TelegramConfig(
+                    enabled: true,
+                    botToken: "telegram-token",
+                    actions: TelegramActionConfig(photo: true),
+                    media: TelegramMediaConfig(outboundAllowLocalPath: true, outboundLocalRoots: [root.toString()])
+                )
+            )
+            adapter.start()
+            let result = adapter.send(
+                OutboundMessage(ChannelType.Telegram, "user:8734062810", "[photo]\nfileId=${photoPath.toString()}\ncaption=local photo")
+            )
+            match (result) {
+                case SendResult.Success => ()
+                case SendResult.Failed(reason) => @Expect(reason, "")
+            }
+            @Expect(fake.saw("sendPhoto"), true)
+            @Expect(fake.sawContentTypeContaining("multipart/form-data"), true)
+            @Expect(fake.sawBodyContaining("name=\"photo\"; filename=\"photo.jpg\""), true)
+            @Expect(fake.sawBodyContaining("fake-photo-bytes"), true)
+            @Expect(fake.sawBodyContaining("name=\"caption\""), true)
+        } finally {
+            setTelegramTransportRunnerForTest(None)
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func outboundLocalDocumentUsesMultipartTransport(): Unit {
+        let root = Path("/tmp/metis-telegram-outbound-doc-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
+        Directory.create(root, recursive: true)
+        let docPath = root.join("report.txt")
+        File.writeTo(docPath, "fake-report".toArray())
+        let fake = TelegramFakeBotApi()
+        setTelegramTransportRunnerForTest(Some({ request => fake.handle(request) }))
+        try {
+            let adapter = TelegramAdapter(
+                config: TelegramConfig(
+                    enabled: true,
+                    botToken: "telegram-token",
+                    actions: TelegramActionConfig(document: true),
+                    media: TelegramMediaConfig(outboundAllowLocalPath: true, outboundLocalRoots: [root.toString()])
+                )
+            )
+            adapter.start()
+            let result = adapter.send(
+                OutboundMessage(ChannelType.Telegram, "user:8734062810", "[document]\nfileId=file://${docPath.toString()}\ncaption=report")
+            )
+            match (result) {
+                case SendResult.Success => ()
+                case SendResult.Failed(reason) => @Expect(reason, "")
+            }
+            @Expect(fake.saw("sendDocument"), true)
+            @Expect(fake.sawContentTypeContaining("multipart/form-data"), true)
+            @Expect(fake.sawBodyContaining("name=\"document\"; filename=\"report.txt\""), true)
+            @Expect(fake.sawBodyContaining("fake-report"), true)
+        } finally {
+            setTelegramTransportRunnerForTest(None)
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
         }
     }
 
