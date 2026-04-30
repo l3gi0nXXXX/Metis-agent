@@ -209,6 +209,11 @@ public func gatewaySubagentCreateRunRecord(
     requesterSessionKey!: String = "",
     requesterChannel!: String = "cli",
     requesterThreadId!: String = "",
+    requesterAccountId!: String = "",
+    requesterPeerId!: String = "",
+    requesterConversationId!: String = "",
+    requesterReplyToMessageId!: String = "",
+    requesterReplyInThread!: Bool = false,
     agentId!: String = "",
     agentSource!: String = "builtin",
     runtime!: String = "subagent",
@@ -237,11 +242,11 @@ public func gatewaySubagentCreateRunRecord(
     record.put("requesterChannel", JsonString(requesterChannel.trimAscii()))
     record.put("requesterThreadId", JsonString(requesterThreadId.trimAscii()))
     record.put("requesterClientId", JsonString(""))
-    record.put("requesterAccountId", JsonString(""))
-    record.put("requesterPeerId", JsonString(""))
-    record.put("requesterConversationId", JsonString(""))
-    record.put("requesterReplyToMessageId", JsonString(""))
-    record.put("requesterReplyInThread", JsonBool(false))
+    record.put("requesterAccountId", JsonString(requesterAccountId.trimAscii()))
+    record.put("requesterPeerId", JsonString(requesterPeerId.trimAscii()))
+    record.put("requesterConversationId", JsonString(requesterConversationId.trimAscii()))
+    record.put("requesterReplyToMessageId", JsonString(requesterReplyToMessageId.trimAscii()))
+    record.put("requesterReplyInThread", JsonBool(requesterReplyInThread))
     record.put("agentId", JsonString(agentId.trimAscii()))
     record.put("agentSource", JsonString(agentSource.trimAscii()))
     record.put("runtime", JsonString(runtime.trimAscii()))

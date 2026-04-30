@@ -215,6 +215,52 @@ public class GatewaySessionCoordinatorTest {
     }
 
     @TestCase
+    public func telegramTopicSessionHintInfersDeliveryTargetAndThread(): Unit {
+        let context = gatewayResolveSessionContext(
+            GatewaySessionRequest(
+                GatewayIngressSource.ControlUi,
+                channelName: "control-ui",
+                accountId: "telegram:default",
+                sessionHint: "telegram:group:group:-1001234567890:topic:42",
+                deliver: true
+            )
+        )
+        @Expect(context.sessionKey, "telegram:group:group:-1001234567890:topic:42")
+        match (context.deliveryTarget) {
+            case Some(target) =>
+                @Expect(target.channelName, "telegram")
+                @Expect(target.peerId, "group:-1001234567890:topic:42")
+                @Expect(target.accountId, "telegram:default")
+                @Expect(target.conversationId, "group:-1001234567890:topic:42")
+                @Expect(target.threadId, "42")
+                @Expect(target.replyInThread, true)
+            case None =>
+                @Expect("missing", "delivery-target")
+        }
+    }
+
+    @TestCase
+    public func telegramDirectSessionHintInfersDeliveryTarget(): Unit {
+        let context = gatewayResolveSessionContext(
+            GatewaySessionRequest(
+                GatewayIngressSource.ControlUi,
+                accountId: "telegram:default",
+                sessionHint: "telegram:direct:user:745123456",
+                deliver: true
+            )
+        )
+        match (context.deliveryTarget) {
+            case Some(target) =>
+                @Expect(target.channelName, "telegram")
+                @Expect(target.peerId, "user:745123456")
+                @Expect(target.accountId, "telegram:default")
+                @Expect(target.replyInThread, false)
+            case None =>
+                @Expect("missing", "delivery-target")
+        }
+    }
+
+    @TestCase
     public func inboundChannelRequestPrefersRouterApprovedSessionHint(): Unit {
         let context = gatewayResolveSessionContext(
             GatewaySessionRequest(

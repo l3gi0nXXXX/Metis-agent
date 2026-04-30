@@ -202,6 +202,27 @@ private func gatewayInferDeliveryTargetFromSessionKey(sessionKey: String, accoun
         let peerId = if (let Some(pos) <- idx) { rest[0..pos] } else { rest }
         return Some(GatewayDeliveryTarget("qq", peerId, accountId: accountId))
     }
+    if (sk.startsWith("telegram:direct:")) {
+        return Some(GatewayDeliveryTarget("telegram", sk["telegram:direct:".size..], accountId: accountId))
+    }
+    if (sk.startsWith("telegram:group:")) {
+        let peerId = sk["telegram:group:".size..]
+        var threadId = ""
+        match (peerId.indexOf(":topic:")) {
+            case Some(idx) => threadId = peerId[idx + ":topic:".size..].trimAscii()
+            case None => ()
+        }
+        return Some(
+            GatewayDeliveryTarget(
+                "telegram",
+                peerId,
+                accountId: accountId,
+                conversationId: peerId,
+                threadId: threadId,
+                replyInThread: !threadId.isEmpty()
+            )
+        )
+    }
     None
 }
 

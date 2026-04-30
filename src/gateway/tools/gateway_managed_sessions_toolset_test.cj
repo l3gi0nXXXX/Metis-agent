@@ -1,6 +1,6 @@
 package metis.gateway.tools
 
-import metis.core.{GatewayToolRuntimeContext, gatewaySubagentCreateRunRecord, gatewaySubagentResolveAgent, gatewaySubagentResolveRunRecord, gatewaySubagentRunRecordString, gatewaySubagentWriteRunRecord, gatewayWithToolRuntimeContext}
+import metis.core.{GatewayToolRuntimeContext, gatewayClearSubagentNoticeDeliveryHook, gatewayRegisterSubagentNoticeDeliveryHook, gatewaySubagentCreateRunRecord, gatewaySubagentMarkRunSucceeded, gatewaySubagentResolveAgent, gatewaySubagentResolveRunRecord, gatewaySubagentRunRecordString, gatewaySubagentWriteRunRecord, gatewayWithToolRuntimeContext}
 import metis.core.config.{CliConfig, CliSettingManager, MetisConfigManager}
 import metis.core.memory.memorySessionStoreForGatewayUser
 import metis.utils.ShellUtils
@@ -11,7 +11,7 @@ import std.fs.{Directory, File, Path, exists, remove}
 import std.core.Duration
 import std.time.DateTime
 import std.unittest.testmacro.*
-import stdx.encoding.json.{JsonBool, JsonObject, JsonValue}
+import stdx.encoding.json.{JsonBool, JsonObject, JsonString, JsonValue}
 
 private func withManagedSessionsToolsetTestHome<T>(home: String, block: () -> T): T {
     let actualHome = "${home}-${DateTime.now().toUnixTimeStamp().toNanoseconds()}"
@@ -109,6 +109,37 @@ private func createManagedSubagentsGitRepo(name: String): Path {
     @Expect(managedSubagentsRunGit(repo, ["add", "README.md"]), true)
     @Expect(managedSubagentsRunGit(repo, ["commit", "-m", "init"]), true)
     repo
+}
+
+private func appendManagedSubagentsBindingSnapshot(
+    sessionKey: String,
+    channelName: String,
+    peerId: String,
+    accountId: String,
+    conversationId: String,
+    threadId: String,
+    sourceMessageId: String,
+    replyToMessageId: String,
+    replyInThread: Bool
+): Unit {
+    let store = memorySessionStoreForGatewayUser(CliSettingManager.readGatewaySettings())
+    store.appendTranscriptEntry(sessionKey, "system", "binding fixture")
+    let binding = JsonObject()
+    binding.put("kind", JsonString("binding"))
+    binding.put("channel", JsonString(channelName))
+    binding.put("peer", JsonString(peerId))
+    binding.put("accountId", JsonString(accountId))
+    binding.put("conversationId", JsonString(conversationId))
+    binding.put("threadId", JsonString(threadId))
+    binding.put("sourceMessageId", JsonString(sourceMessageId))
+    binding.put("replyToMessageId", JsonString(replyToMessageId))
+    binding.put("replyTargetMessageId", JsonString(replyToMessageId))
+    binding.put("replyInThread", JsonBool(replyInThread))
+    binding.put("deliverable", JsonBool(true))
+    binding.put("mode", JsonString("delivery-target"))
+    let p = store.transcriptPath(sessionKey)
+    let existing = String.fromUtf8(File.readFrom(p))
+    File.writeTo(p, (existing + binding.toJsonString() + "\n").toArray())
 }
 
 @Test
@@ -518,6 +549,114 @@ public class GatewayManagedSessionsToolsetTest {
                 @Expect(managedSubagentsString(run, "contextMode"), "with_context")
                 @Expect(managedSubagentsString(run, "parentSessionKey"), "telegram:chat:phase10:topic:42")
                 @Expect(managedSubagentsString(run, "requesterThreadId"), "42")
+            }
+        }
+    }
+
+    @TestCase
+    public func telegramTopicSubagentSpawnPersistsRequesterBindingForCompletionNotice(): Unit {
+        withManagedSessionsToolsetTestHome("/tmp/metis-managed-subagents-telegram-topic-binding") {
+            createManagedSubagentsCustomAgentFixture("phase10-telegram", false)
+            var settings = CliSettingManager.readGatewaySettings()
+            settings.subagents.allowCustomAgents = true
+            let _ = MetisConfigManager.setGatewaySettings(settings)
+            CliSettingManager.invalidate()
+            let store = memorySessionStoreForGatewayUser(CliSettingManager.readGatewaySettings())
+            let requesterSessionKey = "telegram:group:group:-1001234567890:topic:42"
+            appendManagedSubagentsBindingSnapshot(
+                requesterSessionKey,
+                "telegram",
+                "group:-1001234567890:topic:42",
+                "telegram:default",
+                "group:-1001234567890:topic:42",
+                "42",
+                "777",
+                "777",
+                true
+            )
+            let toolset = GatewayManagedSessionsToolset()
+
+            gatewayWithToolRuntimeContext(GatewayToolRuntimeContext("telegram", channelName: "telegram", sessionKey: requesterSessionKey)) {
+                let spawned = managedSubagentsJson(toolset.sessionsSpawnForCommand(
+                    "inspect telegram topic context",
+                    Some("topic-binding"),
+                    Some("subagent"),
+                    Some("phase10-telegram"),
+                    None<String>,
+                    None<String>,
+                    None<String>,
+                    None<String>,
+                    None<Int64>,
+                    None<Int64>,
+                    Some("thread"),
+                    None<String>,
+                    None<Bool>,
+                    None<String>,
+                    None<String>,
+                    None<String>,
+                    None<String>
+                ))
+                @Expect(managedSubagentsString(spawned, "status"), "accepted")
+                let runId = managedSubagentsString(spawned, "runId")
+                let status = managedSubagentsJson(toolset.subagentsForTest(managedSubagentsSome("status"), managedSubagentsSome(runId), None<String>, None<Int64>))
+                let run = status.get("run").getOrThrow().asObject()
+                @Expect(managedSubagentsString(run, "requesterSessionKey"), requesterSessionKey)
+                @Expect(managedSubagentsString(run, "requesterChannel"), "telegram")
+                @Expect(managedSubagentsString(run, "requesterAccountId"), "telegram:default")
+                @Expect(managedSubagentsString(run, "requesterPeerId"), "group:-1001234567890:topic:42")
+                @Expect(managedSubagentsString(run, "requesterThreadId"), "42")
+                @Expect(managedSubagentsString(run, "requesterConversationId"), "group:-1001234567890:topic:42")
+                @Expect(managedSubagentsString(run, "requesterReplyToMessageId"), "777")
+                @Expect(run.get("requesterReplyInThread").getOrThrow().asBool().getValue(), true)
+                let rowJson = managedSubagentsJson(toolset.subagentsForTest(managedSubagentsSome("list"), managedSubagentsSome("current"), None<String>, None<Int64>))
+                let row = rowJson.get("sessions").getOrThrow().asArray()[0].asObject()
+                @Expect(managedSubagentsString(row, "requesterPeerId"), "group:-1001234567890:topic:42")
+                @Expect(managedSubagentsString(row, "requesterThreadId"), "42")
+            }
+        }
+    }
+
+    @TestCase
+    public func telegramTopicSubagentTerminalNoticeUsesGatewayChannelHook(): Unit {
+        withManagedSessionsToolsetTestHome("/tmp/metis-managed-subagents-telegram-topic-notice") {
+            let store = memorySessionStoreForGatewayUser(CliSettingManager.readGatewaySettings())
+            let sessionKey = "child-topic-notice"
+            let record = gatewaySubagentCreateRunRecord(
+                store.sessionsRoot(),
+                sessionKey,
+                parentSessionKey: "telegram:group:group:-1001234567890:topic:42",
+                requesterSessionKey: "telegram:group:group:-1001234567890:topic:42",
+                requesterChannel: "telegram",
+                requesterThreadId: "42",
+                requesterAccountId: "telegram:default",
+                requesterPeerId: "group:-1001234567890:topic:42",
+                requesterConversationId: "group:-1001234567890:topic:42",
+                requesterReplyToMessageId: "777",
+                requesterReplyInThread: true,
+                agentId: "reviewer",
+                runtime: "subagent",
+                status: "running",
+                transcriptPath: store.transcriptPath(sessionKey).toString()
+            )
+            let runId = gatewaySubagentRunRecordString(record, "runId")
+            @Expect(gatewaySubagentMarkRunSucceeded(store.sessionsRoot(), runId, resultSummary: "topic review done"), true)
+            let delivered = JsonObject()
+            gatewayRegisterSubagentNoticeDeliveryHook({ channelName, accountId, peerId, notice, replyToMessageId, replyInThread =>
+                delivered.put("value", JsonString("${channelName}|${accountId}|${peerId}|${replyToMessageId}|${replyInThread}|${notice.contains("topic review done")}"))
+                "notice-message-1"
+            })
+            try {
+                let toolset = GatewayManagedSessionsToolset()
+                toolset.debugDeliverTerminalNoticeForTest(sessionKey)
+                @Expect(managedSubagentsString(delivered, "value"), "telegram|telegram:default|group:-1001234567890:topic:42|777|true|true")
+                match (gatewaySubagentResolveRunRecord(store.sessionsRoot(), runId)) {
+                    case Some(found) =>
+                        @Expect(managedSubagentsString(found, "channelNoticeStatus"), "delivered")
+                        @Expect(managedSubagentsString(found, "channelNoticeMessageId"), "notice-message-1")
+                    case None => @Expect("missing", "record")
+                }
+            } finally {
+                gatewayClearSubagentNoticeDeliveryHook()
             }
         }
     }

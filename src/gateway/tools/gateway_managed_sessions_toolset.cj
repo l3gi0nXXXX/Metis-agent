@@ -427,6 +427,12 @@ public class GatewayManagedSessionsToolset {
         row.put("runtime", JsonString(gatewaySubagentRunRecordString(record, "runtime")))
         row.put("agentId", JsonString(gatewaySubagentRunRecordString(record, "agentId")))
         row.put("requesterSessionKey", JsonString(gatewaySubagentRunRecordString(record, "requesterSessionKey")))
+        row.put("requesterChannel", JsonString(gatewaySubagentRunRecordString(record, "requesterChannel")))
+        row.put("requesterAccountId", JsonString(gatewaySubagentRunRecordString(record, "requesterAccountId")))
+        row.put("requesterPeerId", JsonString(gatewaySubagentRunRecordString(record, "requesterPeerId")))
+        row.put("requesterThreadId", JsonString(gatewaySubagentRunRecordString(record, "requesterThreadId")))
+        row.put("requesterReplyToMessageId", JsonString(gatewaySubagentRunRecordString(record, "requesterReplyToMessageId")))
+        row.put("requesterReplyInThread", this.jsonBoolField(record, "requesterReplyInThread").toJsonValue())
         row.put("noticeStatus", JsonString(gatewaySubagentRunRecordString(record, "noticeStatus")))
         row.put("channelNoticeStatus", JsonString(gatewaySubagentRunRecordString(record, "channelNoticeStatus")))
         row.put("hasLiveFuture", this.managedHasLiveFuture(sessionKey).toJsonValue())
@@ -505,8 +511,16 @@ public class GatewayManagedSessionsToolset {
             return
         }
         let snapshot = this.gwStore().readLatestBindingSnapshot(requesterSessionKey)
-        let channelName = this.jsonStringField(snapshot, "channel")
-        let peerId = this.jsonStringField(snapshot, "peer")
+        let channelName = if (!gatewaySubagentRunRecordString(record, "requesterChannel").isEmpty()) {
+            gatewaySubagentRunRecordString(record, "requesterChannel")
+        } else {
+            this.jsonStringField(snapshot, "channel")
+        }
+        let peerId = if (!gatewaySubagentRunRecordString(record, "requesterPeerId").isEmpty()) {
+            gatewaySubagentRunRecordString(record, "requesterPeerId")
+        } else {
+            this.jsonStringField(snapshot, "peer")
+        }
         if (channelName.isEmpty() || peerId.isEmpty()) {
             return
         }
@@ -514,9 +528,21 @@ public class GatewayManagedSessionsToolset {
             case "telegram" | "feishu" | "qq" => ()
             case _ => return
         }
-        let accountId = this.jsonStringField(snapshot, "accountId")
-        let replyToMessageId = this.jsonStringField(snapshot, "replyToMessageId")
-        let replyInThread = this.jsonBoolField(snapshot, "replyInThread")
+        let accountId = if (!gatewaySubagentRunRecordString(record, "requesterAccountId").isEmpty()) {
+            gatewaySubagentRunRecordString(record, "requesterAccountId")
+        } else {
+            this.jsonStringField(snapshot, "accountId")
+        }
+        let replyToMessageId = if (!gatewaySubagentRunRecordString(record, "requesterReplyToMessageId").isEmpty()) {
+            gatewaySubagentRunRecordString(record, "requesterReplyToMessageId")
+        } else {
+            this.jsonStringField(snapshot, "replyToMessageId")
+        }
+        let replyInThread = if (record.get("requesterReplyInThread").isSome()) {
+            try { record.get("requesterReplyInThread").getOrThrow().asBool().getValue() } catch (_: Exception) { this.jsonBoolField(snapshot, "replyInThread") }
+        } else {
+            this.jsonBoolField(snapshot, "replyInThread")
+        }
         let runId = gatewaySubagentRunRecordString(record, "runId")
         let target = if (!runId.isEmpty()) { runId } else { gatewaySubagentRunRecordString(record, "sessionKey") }
         try {
@@ -1588,6 +1614,16 @@ public class GatewayManagedSessionsToolset {
             case None => "gateway"
         }
         let requesterThreadIdText = this.requesterThreadIdFromSessionKey(requesterSessionKey)
+        let requesterBinding = if (requesterSessionKey.trimAscii().isEmpty()) {
+            JsonObject()
+        } else {
+            st.readLatestBindingSnapshot(requesterSessionKey)
+        }
+        let requesterAccountIdText = this.jsonStringField(requesterBinding, "accountId")
+        let requesterPeerIdText = this.jsonStringField(requesterBinding, "peer")
+        let requesterConversationIdText = this.jsonStringField(requesterBinding, "conversationId")
+        let requesterReplyToMessageIdText = this.jsonStringField(requesterBinding, "replyToMessageId")
+        let requesterReplyInThreadValue = this.jsonBoolField(requesterBinding, "replyInThread")
         var currentDepth: Int64 = 0
         if (!requesterSessionKey.trimAscii().isEmpty()) {
             match (gatewaySubagentFindRunBySessionKey(st.sessionsRoot(), requesterSessionKey)) {
@@ -1807,6 +1843,11 @@ public class GatewayManagedSessionsToolset {
             requesterSessionKey: requesterSessionKey,
             requesterChannel: requesterChannelText,
             requesterThreadId: requesterThreadIdText,
+            requesterAccountId: requesterAccountIdText,
+            requesterPeerId: requesterPeerIdText,
+            requesterConversationId: requesterConversationIdText,
+            requesterReplyToMessageId: requesterReplyToMessageIdText,
+            requesterReplyInThread: requesterReplyInThreadValue,
             agentId: agentIdText,
             agentSource: agentSourceText,
             runtime: runtimeText,
@@ -2057,6 +2098,10 @@ public class GatewayManagedSessionsToolset {
 
     public func subagentsForTest(action: Option<String>, target: Option<String>, message: Option<String>, recentMinutes: Option<Int64>): String {
         this.subagentsImpl(action, target, message, recentMinutes)
+    }
+
+    public func debugDeliverTerminalNoticeForTest(sessionKey: String): Unit {
+        this.deliverManagedTerminalNotice(sessionKey)
     }
 
     public func subagentsForCommand(action: Option<String>, target: Option<String>, message: Option<String>, recentMinutes: Option<Int64>): String {
