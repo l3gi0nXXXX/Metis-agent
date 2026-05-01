@@ -30,7 +30,11 @@ private class TelegramFakeBotApi {
             }
             if (!request.bodyBytes.isEmpty()) {
                 this.bodySizes.add(Int64(request.bodyBytes.size))
-                this.bodies.add(String.fromUtf8(request.bodyBytes))
+                try {
+                    this.bodies.add(String.fromUtf8(request.bodyBytes))
+                } catch (_e: Exception) {
+                    this.bodies.add("<binary-body:${request.bodyBytes.size}>")
+                }
             }
             if (request.context == "get") {
                 if (request.url.contains("/getMe")) {
@@ -924,6 +928,101 @@ public class TelegramAdapterTest {
         @Expect(voice.get("eligibleFor").getOrThrow().asString().getValue(), "transcription")
         @Expect(media.get("lastMediaRecordId").getOrThrow().asString().getValue().contains("voice-file-id"), true)
         @Expect(media.get("lastMedia").getOrThrow().asObject().get("mediaId").isSome(), true)
+    }
+
+    @TestCase
+    public func mediaDownloadPersistsNonUtf8BinaryBytesForPhotoDocumentVoiceAndVideo(): Unit {
+        let root = Path("/tmp/metis-telegram-media-binary-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
+        let downloadCalls = ArrayList<String>()
+        let jpegBytes: Array<Byte> = [255u8, 216u8, 255u8, 0u8, 254u8]
+        let documentBytes: Array<Byte> = [37u8, 80u8, 68u8, 70u8, 45u8, 255u8]
+        let voiceBytes: Array<Byte> = [79u8, 103u8, 103u8, 83u8, 255u8, 0u8]
+        let videoBytes: Array<Byte> = [0u8, 0u8, 0u8, 24u8, 102u8, 116u8, 121u8, 112u8, 255u8]
+        try {
+            setTelegramTransportRunnerForTest(Some({ request: TelegramTransportRequest =>
+                if (request.url.contains("/getFile") && request.url.contains("photo-file-id")) {
+                    return TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":{\"file_path\":\"photos/file_1.jpg\",\"file_size\":5}}", outcome: "ok")
+                }
+                if (request.url.contains("/getFile") && request.url.contains("doc-file-id")) {
+                    return TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":{\"file_path\":\"documents/file_2.pdf\",\"file_size\":6}}", outcome: "ok")
+                }
+                if (request.url.contains("/getFile") && request.url.contains("voice-file-id")) {
+                    return TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":{\"file_path\":\"voice/file_3.ogg\",\"file_size\":6}}", outcome: "ok")
+                }
+                if (request.url.contains("/getFile") && request.url.contains("video-file-id")) {
+                    return TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":{\"file_path\":\"videos/file_4.mp4\",\"file_size\":9}}", outcome: "ok")
+                }
+                if (request.context == "downloadFile") {
+                    downloadCalls.add(request.url)
+                    if (request.url.contains("photos/file_1.jpg")) {
+                        return TelegramTransportResponse(true, bodyBytes: jpegBytes, outcome: "ok")
+                    }
+                    if (request.url.contains("documents/file_2.pdf")) {
+                        return TelegramTransportResponse(true, bodyBytes: documentBytes, outcome: "ok")
+                    }
+                    if (request.url.contains("voice/file_3.ogg")) {
+                        return TelegramTransportResponse(true, bodyBytes: voiceBytes, outcome: "ok")
+                    }
+                    if (request.url.contains("videos/file_4.mp4")) {
+                        return TelegramTransportResponse(true, bodyBytes: videoBytes, outcome: "ok")
+                    }
+                }
+                TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":true}", outcome: "ok")
+            }))
+            let adapter = TelegramAdapter(
+                config: TelegramConfig(enabled: true, botToken: "telegram-token"),
+                pairingRoot: root.toString()
+            )
+            let photo = adapter.debugPersistInboundMediaForTest(
+                "photo",
+                "photo-file-id",
+                mimeType: "image/jpeg",
+                peerId: "user:1001",
+                messageId: "201"
+            )
+            let document = adapter.debugPersistInboundMediaForTest(
+                "document",
+                "doc-file-id",
+                mimeType: "application/pdf",
+                peerId: "user:1001",
+                messageId: "202"
+            )
+            let voice = adapter.debugPersistInboundMediaForTest(
+                "voice",
+                "voice-file-id",
+                mimeType: "audio/ogg",
+                peerId: "user:1001",
+                messageId: "203"
+            )
+            let video = adapter.debugPersistInboundMediaForTest(
+                "video",
+                "video-file-id",
+                mimeType: "video/mp4",
+                peerId: "user:1001",
+                messageId: "204"
+            )
+
+            let photoRecord = photo.get("lastMedia").getOrThrow().asObject()
+            let documentRecord = document.get("lastMedia").getOrThrow().asObject()
+            let voiceRecord = voice.get("lastMedia").getOrThrow().asObject()
+            let videoRecord = video.get("lastMedia").getOrThrow().asObject()
+            @Expect(photoRecord.get("downloaded").getOrThrow().asBool().getValue(), true)
+            @Expect(documentRecord.get("downloaded").getOrThrow().asBool().getValue(), true)
+            @Expect(voiceRecord.get("downloaded").getOrThrow().asBool().getValue(), true)
+            @Expect(videoRecord.get("downloaded").getOrThrow().asBool().getValue(), true)
+            @Expect(File.readFrom(Path(photoRecord.get("localPath").getOrThrow().asString().getValue())), jpegBytes)
+            @Expect(File.readFrom(Path(documentRecord.get("localPath").getOrThrow().asString().getValue())), documentBytes)
+            @Expect(File.readFrom(Path(voiceRecord.get("localPath").getOrThrow().asString().getValue())), voiceBytes)
+            @Expect(File.readFrom(Path(videoRecord.get("localPath").getOrThrow().asString().getValue())), videoBytes)
+            @Expect(downloadCalls.size, 4)
+        } finally {
+            setTelegramTransportRunnerForTest(None)
+            try {
+                remove(root, recursive: true)
+            } catch (_: Exception) {
+                ()
+            }
+        }
     }
 
     @TestCase
@@ -2625,6 +2724,42 @@ public class TelegramAdapterTest {
             @Expect(fake.sawBodyContaining("name=\"photo\"; filename=\"photo.jpg\""), true)
             @Expect(fake.sawBodyContaining("fake-photo-bytes"), true)
             @Expect(fake.sawBodyContaining("name=\"caption\""), true)
+        } finally {
+            setTelegramTransportRunnerForTest(None)
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func outboundLocalPhotoMultipartPreservesNonUtf8BinaryBytes(): Unit {
+        let root = Path("/tmp/metis-telegram-outbound-photo-binary-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
+        Directory.create(root, recursive: true)
+        let photoPath = root.join("photo.jpg")
+        let photoBytes: Array<Byte> = [255u8, 216u8, 255u8, 0u8, 254u8]
+        File.writeTo(photoPath, photoBytes)
+        let fake = TelegramFakeBotApi()
+        setTelegramTransportRunnerForTest(Some({ request => fake.handle(request) }))
+        try {
+            let adapter = TelegramAdapter(
+                config: TelegramConfig(
+                    enabled: true,
+                    botToken: "telegram-token",
+                    actions: TelegramActionConfig(photo: true),
+                    media: TelegramMediaConfig(outboundAllowLocalPath: true, outboundLocalRoots: [root.toString()])
+                )
+            )
+            adapter.start()
+            let result = adapter.send(
+                OutboundMessage(ChannelType.Telegram, "user:8734062810", "[photo]\nfileId=${photoPath.toString()}\ncaption=binary photo")
+            )
+            match (result) {
+                case SendResult.Success => ()
+                case SendResult.Failed(reason) => @Expect(reason, "")
+            }
+            @Expect(fake.saw("sendPhoto"), true)
+            @Expect(fake.sawContentTypeContaining("multipart/form-data"), true)
+            @Expect(fake.bodySizes.size > 0, true)
+            @Expect(fake.bodySizes[fake.bodySizes.size - 1] > Int64(photoBytes.size), true)
         } finally {
             setTelegramTransportRunnerForTest(None)
             try { remove(root, recursive: true) } catch (_e: Exception) { () }

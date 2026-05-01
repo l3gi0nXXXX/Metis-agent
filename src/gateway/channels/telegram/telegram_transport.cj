@@ -5,7 +5,6 @@ import magic.jsonable.*
 import std.collection.{ArrayList, HashMap}
 import std.convert.Parsable
 import std.fs.{File, Path}
-import std.io.StringReader
 import std.net.{SocketAddress, TcpSocket}
 import std.time.*
 import stdx.encoding.base64.toBase64String
@@ -51,6 +50,7 @@ public class TelegramTransportRequest {
 public class TelegramTransportResponse {
     public let ok: Bool
     public let body: String
+    public let bodyBytes: Array<Byte>
     public let error: String
     public let outcome: String
     public let statusCode: Int64
@@ -58,12 +58,14 @@ public class TelegramTransportResponse {
     public init(
         ok: Bool,
         body!: String = "",
+        bodyBytes!: Array<Byte> = [],
         error!: String = "",
         outcome!: String = "",
         statusCode!: Int64 = 0
     ) {
         this.ok = ok
         this.body = body
+        this.bodyBytes = bodyBytes
         this.error = error
         this.outcome = outcome
         this.statusCode = statusCode
@@ -174,9 +176,23 @@ public class TelegramTransport {
             try {
                 let response = client.send(this.buildNativeHttpRequest(request, headers))
                 let status = Int64(response.status)
-                let responseBody = StringReader(response.body).readToEnd()
+                let responseBytes = ArrayList<Byte>()
+                let responseBuffer = Array<Byte>(8192, repeat: 0)
+                while (true) {
+                    let n = response.body.read(responseBuffer)
+                    if (n <= 0) {
+                        break
+                    }
+                    responseBytes.add(all: responseBuffer[..n])
+                }
+                let isBinaryResponse = request.context == "downloadFile" || request.accept == "*/*"
+                let responseBody = if (isBinaryResponse) {
+                    ""
+                } else {
+                    String.fromUtf8(responseBytes.toArray())
+                }
                 if (status >= 200 && status < 300) {
-                    return TelegramTransportResponse(true, body: responseBody, outcome: "ok", statusCode: status)
+                    return TelegramTransportResponse(true, body: responseBody, bodyBytes: responseBytes.toArray(), outcome: "ok", statusCode: status)
                 }
                 let detail = if (responseBody.trimAscii().isEmpty()) {
                     "Http status: ${status}"

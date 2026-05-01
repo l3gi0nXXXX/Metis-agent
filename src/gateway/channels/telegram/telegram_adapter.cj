@@ -2409,12 +2409,12 @@ public class TelegramAdapter <: ChannelAdapter {
                 skippedReason = "unsafe_file_path"
             } else if (!filePath.isEmpty()) {
                 let resolvedDownloadRaw = if (!downloadRaw.trimAscii().isEmpty()) {
-                    downloadRaw
+                    downloadRaw.toArray()
                 } else {
                     this.tryTelegramDownloadFile(filePath)
                 }
                 if (!resolvedDownloadRaw.isEmpty()) {
-                    if (this.mediaSizeExceedsLimit(Int64(resolvedDownloadRaw.toArray().size))) {
+                    if (this.mediaSizeExceedsLimit(Int64(resolvedDownloadRaw.size))) {
                         skippedReason = "download_size_limit_exceeded"
                     } else {
                         downloadPath = this.persistDownloadedMediaBytes(
@@ -2577,16 +2577,16 @@ public class TelegramAdapter <: ChannelAdapter {
         }
     }
 
-    private func tryTelegramDownloadFile(filePath: String): String {
+    private func tryTelegramDownloadFile(filePath: String): Array<Byte> {
         let normalized = filePath.trimAscii()
         let token = this.effectiveBotToken()
         if (normalized.isEmpty() || token.isEmpty()) {
-            return ""
+            return []
         }
         let url = this.normalizeApiRoot() + "/file/bot${token}/${normalized}"
-        match (this.telegramGet(url, accept: "*/*", context: "downloadFile")) {
+        match (this.telegramGetBytes(url, accept: "*/*", context: "downloadFile")) {
             case Some(raw) => raw
-            case None => ""
+            case None => []
         }
     }
 
@@ -2594,7 +2594,7 @@ public class TelegramAdapter <: ChannelAdapter {
         info: TelegramInboundMediaInfo,
         fileId: String,
         telegramFilePath: String,
-        raw: String,
+        raw: Array<Byte>,
         messageId!: String = ""
     ): String {
         if (raw.isEmpty()) {
@@ -2616,7 +2616,7 @@ public class TelegramAdapter <: ChannelAdapter {
             telegramFilePath
         )
         let path = messageDir.join(fileName)
-        File.writeTo(path, raw.toArray())
+        File.writeTo(path, raw)
         path.toString()
     }
 
@@ -4616,6 +4616,10 @@ public class TelegramAdapter <: ChannelAdapter {
         this.handleTelegramTransportResponse(this.telegramTransport().get(url, accept: accept, context: context), context)
     }
 
+    private func telegramGetBytes(url: String, accept!: String, context!: String): Option<Array<Byte>> {
+        this.handleTelegramTransportBytesResponse(this.telegramTransport().get(url, accept: accept, context: context), context)
+    }
+
     private func telegramJsonPost(url: String, body: JsonObject, context!: String): Option<String> {
         this.handleTelegramTransportResponse(this.telegramTransport().postJson(url, body, context: context), context)
     }
@@ -4642,6 +4646,23 @@ public class TelegramAdapter <: ChannelAdapter {
     private func handleTelegramTransportResponse(response: TelegramTransportResponse, context: String): Option<String> {
         if (response.ok) {
             return Some(response.body)
+        }
+        let outcome = if (response.outcome.trimAscii().isEmpty()) { "request-error" } else { response.outcome.trimAscii() }
+        let detail = this.redactTelegramSensitive(if (response.error.trimAscii().isEmpty()) { "transport failed" } else { response.error.trimAscii() })
+        this.recordTelegramRequestError(context, "transport failed: ${detail}", outcome: outcome)
+        LogUtils.info("Telegram ${context} failed: ${context} transport failed: ${detail}")
+        None
+    }
+
+    private func handleTelegramTransportBytesResponse(response: TelegramTransportResponse, context: String): Option<Array<Byte>> {
+        if (response.ok) {
+            if (!response.bodyBytes.isEmpty()) {
+                return Some(response.bodyBytes)
+            }
+            if (!response.body.isEmpty()) {
+                return Some(response.body.toArray())
+            }
+            return Some([])
         }
         let outcome = if (response.outcome.trimAscii().isEmpty()) { "request-error" } else { response.outcome.trimAscii() }
         let detail = this.redactTelegramSensitive(if (response.error.trimAscii().isEmpty()) { "transport failed" } else { response.error.trimAscii() })
