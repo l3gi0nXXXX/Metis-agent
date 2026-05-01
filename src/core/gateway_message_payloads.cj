@@ -74,6 +74,28 @@ public func parseGatewayReactionToken(raw: String): String {
     ""
 }
 
+public func renderGatewayChatActionText(raw: String): String {
+    let text = raw.trimAscii()
+    if (text.isEmpty()) {
+        return ""
+    }
+    return "[chat-action]\naction=${text}"
+}
+
+public func parseGatewayChatAction(raw: String): String {
+    let normalized = raw.replace("\r\n", "\n").replace("\r", "\n").trimAscii()
+    if (!normalized.startsWith("[chat-action]")) {
+        return ""
+    }
+    for (line0 in normalized.split("\n")) {
+        let line = line0.trimAscii()
+        if (line.startsWith("action=")) {
+            return line["action=".size..].trimAscii()
+        }
+    }
+    ""
+}
+
 public func renderGatewayStickerText(fileId: String): String {
     let text = fileId.trimAscii()
     if (text.isEmpty()) {

@@ -98,6 +98,14 @@ private func gatewaySessionJsonStringArray(params: JsonObject, key: String): Arr
     }
 }
 
+private func gatewaySessionJsonObject(params: JsonObject, key: String): JsonObject {
+    match (params.get(key)) {
+        case Some(v) =>
+            try { v.asObject() } catch (_e: Exception) { JsonObject() }
+        case None => JsonObject()
+    }
+}
+
 public func gatewayIngressSourceFromString(raw: String, fallback!: GatewayIngressSource = GatewayIngressSource.Unknown("")): GatewayIngressSource {
     let low = raw.trimAscii().toAsciiLower()
     if (low == "cli") {
@@ -284,7 +292,8 @@ public func gatewaySessionRequestFromInbound(message: InboundMessage, dmScope!: 
         dmScope: dmScope,
         replyToMessageId: replyToMessageId,
         replyInThread: message.replyInThread,
-        deliver: true
+        deliver: true,
+        mediaContext: message.mediaContext
     )
 }
 
@@ -313,7 +322,8 @@ public func gatewaySessionRequestFromInbound(
         dmScope: dmScope,
         replyToMessageId: replyToMessageId,
         replyInThread: message.replyInThread,
-        deliver: true
+        deliver: true,
+        mediaContext: message.mediaContext
     )
 }
 
@@ -342,7 +352,8 @@ public func gatewaySessionRequestFromRpcParams(
         replyAccountId: if (!replyAccountId.isEmpty()) { replyAccountId } else { replyAccount },
         replyToMessageId: gatewaySessionJsonString(params, "replyToMessageId"),
         replyInThread: gatewaySessionJsonBool(params, "replyInThread", false),
-        deliver: gatewaySessionJsonBool(params, "deliver", false)
+        deliver: gatewaySessionJsonBool(params, "deliver", false),
+        mediaContext: gatewaySessionJsonObject(params, "mediaContext")
     )
 }
 

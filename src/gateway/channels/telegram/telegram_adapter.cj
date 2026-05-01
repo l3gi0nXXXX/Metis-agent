@@ -1,6 +1,6 @@
 package metis.gateway.channels.telegram
 
-import metis.core.{parseGatewayAudioParts, parseGatewayDocumentParts, parseGatewayEditText, parseGatewayInlineKeyboardParts, parseGatewayPhotoParts, parseGatewayReactionToken, parseGatewayStickerFileId, parseGatewayTopicCreateText, parseGatewayTopicEditText, parseGatewayVideoNoteFileId, parseGatewayVideoParts, parseGatewayVoiceParts}
+import metis.core.{parseGatewayAudioParts, parseGatewayChatAction, parseGatewayDocumentParts, parseGatewayEditText, parseGatewayInlineKeyboardParts, parseGatewayPhotoParts, parseGatewayReactionToken, parseGatewayStickerFileId, parseGatewayTopicCreateText, parseGatewayTopicEditText, parseGatewayVideoNoteFileId, parseGatewayVideoParts, parseGatewayVoiceParts}
 import metis.gateway.core.ChannelAdapter
 import metis.gateway.model.*
 import metis.io.PrintUtils
@@ -219,10 +219,149 @@ public class TelegramAdapter <: ChannelAdapter {
             if (!this.running || this.inboundQueue.isEmpty()) {
                 return []
             }
-            let out = this.inboundQueue.toArray()
+            let out = this.mergeTelegramTextBurstInboundMessages(
+                this.mergeTelegramMediaGroupInboundMessages(this.inboundQueue.toArray())
+            )
             this.inboundQueue.clear()
             out
         }
+    }
+
+    private func mergeTelegramTextBurstInboundMessages(messages: Array<InboundMessage>): Array<InboundMessage> {
+        let out = ArrayList<InboundMessage>()
+        for (msg in messages) {
+            if (!this.telegramInboundCanTextBurstMerge(msg)) {
+                out.add(msg)
+                continue
+            }
+            if (out.size > 0 && this.telegramInboundCanTextBurstMerge(out[out.size - 1]) && this.telegramInboundBurstKey(out[out.size - 1]) == this.telegramInboundBurstKey(msg)) {
+                out[out.size - 1] = this.mergeTelegramTextBurstMessage(out[out.size - 1], msg)
+            } else {
+                out.add(msg)
+            }
+        }
+        out.toArray()
+    }
+
+    private func telegramInboundCanTextBurstMerge(msg: InboundMessage): Bool {
+        let text = msg.text.trimAscii()
+        if (text.isEmpty() || text.startsWith("/") || text.startsWith("[")) {
+            return false
+        }
+        this.mediaContextRecords(msg.mediaContext).size() == 0
+    }
+
+    private func telegramInboundBurstKey(msg: InboundMessage): String {
+        let thread = match (msg.threadId) {
+            case Some(v) => v.trimAscii()
+            case None => ""
+        }
+        "${msg.peerId}|${msg.senderId}|${thread}"
+    }
+
+    private func mergeTelegramTextBurstMessage(first: InboundMessage, next: InboundMessage): InboundMessage {
+        InboundMessage(
+            first.channel,
+            next.messageId,
+            first.peerId,
+            first.senderId,
+            first.chatType,
+            first.text + "\n" + next.text,
+            first.mentioned || next.mentioned,
+            next.timestamp,
+            conversationId: first.conversationId,
+            threadId: first.threadId,
+            replyTargetMessageId: first.replyTargetMessageId,
+            replyInThread: first.replyInThread,
+            raw: first.raw,
+            accountId: first.accountId,
+            mediaContext: first.mediaContext
+        )
+    }
+
+    private func mergeTelegramMediaGroupInboundMessages(messages: Array<InboundMessage>): Array<InboundMessage> {
+        let out = ArrayList<InboundMessage>()
+        let groupPositions = HashMap<String, Int64>()
+        for (msg in messages) {
+            let groupId = this.inboundPrimaryMediaGroupId(msg)
+            if (groupId.isEmpty()) {
+                out.add(msg)
+                continue
+            }
+            match (groupPositions.get(groupId)) {
+                case Some(pos) =>
+                    out[pos] = this.mergeTelegramMediaGroupMessage(out[pos], msg)
+                case None =>
+                    groupPositions[groupId] = out.size
+                    out.add(msg)
+            }
+        }
+        out.toArray()
+    }
+
+    private func inboundPrimaryMediaGroupId(message: InboundMessage): String {
+        match (message.mediaContext.get("records")) {
+            case Some(v) =>
+                try {
+                    let records = v.asArray()
+                    if (records.size() == 0) {
+                        return ""
+                    }
+                    this.readStringField(records[0].asObject(), "mediaGroupId").trimAscii()
+                } catch (_e: Exception) {
+                    ""
+                }
+            case None => ""
+        }
+    }
+
+    private func mediaContextRecords(context: JsonObject): JsonArray {
+        match (context.get("records")) {
+            case Some(v) => try { v.asArray() } catch (_e: Exception) { JsonArray([]) }
+            case None => JsonArray([])
+        }
+    }
+
+    private func mergeTelegramMediaGroupContext(first: JsonObject, next: JsonObject, messageId: String): JsonObject {
+        let merged = JsonObject()
+        for (key in ["channel", "accountId", "peerId"]) {
+            let value = this.readStringField(first, key)
+            if (!value.isEmpty()) {
+                merged.put(key, JsonString(value))
+            }
+        }
+        merged.put("messageId", JsonString(messageId))
+        let records = JsonArray([])
+        for (item in this.mediaContextRecords(first).getItems()) {
+            records.add(item)
+        }
+        for (item in this.mediaContextRecords(next).getItems()) {
+            records.add(item)
+        }
+        merged.put("records", records)
+        merged
+    }
+
+    private func mergeTelegramMediaGroupMessage(first: InboundMessage, next: InboundMessage): InboundMessage {
+        let mergedContext = this.mergeTelegramMediaGroupContext(first.mediaContext, next.mediaContext, next.messageId)
+        let text = if (first.text.trimAscii().isEmpty()) { next.text } else { first.text }
+        InboundMessage(
+            first.channel,
+            next.messageId,
+            first.peerId,
+            first.senderId,
+            first.chatType,
+            text,
+            first.mentioned || next.mentioned,
+            next.timestamp,
+            conversationId: first.conversationId,
+            threadId: first.threadId,
+            replyTargetMessageId: first.replyTargetMessageId,
+            replyInThread: first.replyInThread,
+            raw: first.raw,
+            accountId: first.accountId,
+            mediaContext: mergedContext
+        )
     }
 
     public func send(message: OutboundMessage): SendResult {
@@ -510,6 +649,8 @@ public class TelegramAdapter <: ChannelAdapter {
         fileSize!: Int64 = 0,
         fileName!: String = "",
         mediaGroupId!: String = "",
+        peerId!: String = "",
+        messageId!: String = "",
         getFileRaw!: String = "",
         downloadRaw!: String = ""
     ): JsonObject {
@@ -524,6 +665,8 @@ public class TelegramAdapter <: ChannelAdapter {
                 mediaGroupId: mediaGroupId,
                 caption: caption
             ),
+            peerId: peerId,
+            messageId: messageId,
             getFileRaw: getFileRaw,
             downloadRaw: downloadRaw
         )
@@ -958,17 +1101,40 @@ public class TelegramAdapter <: ChannelAdapter {
         let peerId = this.telegramPeerId(chat, threadId: threadIdRaw)
         let senderId = this.readIntStringField(from, "id")
         let chatType = if (this.readStringField(chat, "type") == "private") { ChatType.Direct } else { ChatType.Group }
+        let mediaContext = JsonObject()
+        let contextRecords = JsonArray([])
         match (mediaInfo) {
             case Some(info) =>
-                let mediaState = this.persistInboundMedia(info)
+                let mediaState = this.persistInboundMedia(info, peerId: peerId, messageId: messageId, relation: "current")
+                let record = this.readObjectField(mediaState, "lastMedia")
+                contextRecords.add(record)
                 text = this.appendTelegramMediaContextBlock(text, info, mediaState, peerId, messageId)
             case None => ()
         }
         let replyTarget: Option<String> = match (this.readObjectFieldOpt(msg, "reply_to_message")) {
             case Some(reply) =>
                 let replyId = this.readIntStringField(reply, "message_id")
+                match (this.readTelegramMediaInfo(reply)) {
+                    case Some(replyInfo) =>
+                        let replyMediaState = this.persistInboundMedia(
+                            replyInfo,
+                            peerId: peerId,
+                            messageId: replyId,
+                            relation: "replyTarget",
+                            replyToMessageId: replyId
+                        )
+                        contextRecords.add(this.readObjectField(replyMediaState, "lastMedia"))
+                    case None => ()
+                }
                 if (replyId.isEmpty()) { None<String> } else { Some(replyId) }
             case None => None<String>
+        }
+        if (contextRecords.size() > 0) {
+            mediaContext.put("channel", JsonString("telegram"))
+            mediaContext.put("accountId", JsonString(this.effectiveAccountId()))
+            mediaContext.put("peerId", JsonString(peerId))
+            mediaContext.put("messageId", JsonString(messageId))
+            mediaContext.put("records", contextRecords)
         }
         let mentioned = this.detectMention(text)
         let inbound = InboundMessage(
@@ -985,7 +1151,8 @@ public class TelegramAdapter <: ChannelAdapter {
             replyTargetMessageId: replyTarget,
             replyInThread: !threadIdRaw.isEmpty(),
             raw: Some(raw),
-            accountId: this.effectiveAccountId()
+            accountId: this.effectiveAccountId(),
+            mediaContext: mediaContext
         )
         let rejectReason = this.inboundRejectReason(inbound)
         if (!rejectReason.isEmpty()) {
@@ -1107,7 +1274,7 @@ public class TelegramAdapter <: ChannelAdapter {
     ): String {
         let text = this.readStringField(msg, "text").trimAscii()
         if (!text.isEmpty()) {
-            return text
+            return this.appendTelegramSupplementalContext(text, msg)
         }
         match (mediaInfo) {
             case Some(info) =>
@@ -1133,9 +1300,79 @@ public class TelegramAdapter <: ChannelAdapter {
                 if (!info.caption.isEmpty() && info.kind != "sticker" && info.kind != "video-note") {
                     lines.add("caption=${info.caption}")
                 }
-                return String.join(lines.toArray(), delimiter: "\n")
-            case None => ""
+                return this.appendTelegramSupplementalContext(String.join(lines.toArray(), delimiter: "\n"), msg)
+            case None =>
+                let supplemental = this.telegramSupplementalContextText(msg)
+                if (!supplemental.isEmpty()) {
+                    return supplemental
+                }
+                ""
         }
+    }
+
+    private func appendTelegramSupplementalContext(baseText: String, msg: JsonObject): String {
+        let supplemental = this.telegramSupplementalContextText(msg)
+        if (supplemental.isEmpty()) {
+            return baseText
+        }
+        baseText + "\n" + supplemental
+    }
+
+    private func telegramSupplementalContextText(msg: JsonObject): String {
+        let lines = ArrayList<String>()
+        match (this.readObjectFieldOpt(msg, "reply_to_message")) {
+            case Some(reply) =>
+                let replyText = this.readStringField(reply, "text").trimAscii()
+                let replyCaption = this.readStringField(reply, "caption").trimAscii()
+                let replyBody = if (!replyText.isEmpty()) { replyText } else { replyCaption }
+                if (!replyBody.isEmpty()) {
+                    lines.add("[reply-context]")
+                    lines.add("messageId=${this.readIntStringField(reply, "message_id")}")
+                    lines.add("body=${replyBody}")
+                }
+            case None => ()
+        }
+        match (this.readObjectFieldOpt(msg, "forward_origin")) {
+            case Some(origin) =>
+                lines.add("[forward-context]")
+                lines.add("type=${this.readStringField(origin, "type")}")
+                let senderName = this.readStringField(origin, "sender_user_name")
+                if (!senderName.isEmpty()) {
+                    lines.add("sender=${senderName}")
+                }
+                let chat = this.readObjectField(origin, "chat")
+                let title = this.readStringField(chat, "title")
+                if (!title.isEmpty()) {
+                    lines.add("chatTitle=${title}")
+                }
+            case None => ()
+        }
+        match (this.readObjectFieldOpt(msg, "location")) {
+            case Some(location) =>
+                lines.add("[location]")
+                lines.add("latitude=${this.readFloatStringField(location, "latitude")}")
+                lines.add("longitude=${this.readFloatStringField(location, "longitude")}")
+            case None => ()
+        }
+        match (this.readObjectFieldOpt(msg, "venue")) {
+            case Some(venue) =>
+                lines.add("[venue]")
+                lines.add("title=${this.readStringField(venue, "title")}")
+                lines.add("address=${this.readStringField(venue, "address")}")
+                let location = this.readObjectField(venue, "location")
+                lines.add("latitude=${this.readFloatStringField(location, "latitude")}")
+                lines.add("longitude=${this.readFloatStringField(location, "longitude")}")
+            case None => ()
+        }
+        match (this.readObjectFieldOpt(msg, "contact")) {
+            case Some(contact) =>
+                lines.add("[contact]")
+                lines.add("firstName=${this.readStringField(contact, "first_name")}")
+                lines.add("lastName=${this.readStringField(contact, "last_name")}")
+                lines.add("phoneNumber=${this.readStringField(contact, "phone_number")}")
+            case None => ()
+        }
+        String.join(lines.toArray(), delimiter: "\n")
     }
 
     private func appendTelegramMediaContextBlock(
@@ -1501,6 +1738,20 @@ public class TelegramAdapter <: ChannelAdapter {
         if (let Some(messageId) <- this.parseTelegramPayloadSuccess(kind, responseRaw)) {
             return messageId
         }
+        if (this.shouldRetryWithoutTelegramThread(payload)) {
+            let threadlessPayload = this.telegramPayloadWithoutThread(payload)
+            let retryResponseOpt = match (this.localMediaUploadForPayload(kind, threadlessPayload)) {
+                case Some(upload) => this.telegramMultipartPost(url, threadlessPayload, upload[0], upload[1], context: "send:${kind}:threadless:multipart")
+                case None => this.telegramJsonPost(url, this.telegramApiBodyForPayload(threadlessPayload, plainFallback: false), context: "send:${kind}:threadless")
+            }
+            match (retryResponseOpt) {
+                case Some(retryRaw) =>
+                    if (let Some(messageId) <- this.parseTelegramPayloadSuccess(kind, retryRaw)) {
+                        return messageId
+                    }
+                case None => this.setLastSendError("empty http response")
+            }
+        }
         if (kind == "poll" || kind == "delete" || kind == "topic-create" || kind == "reaction" || kind == "sticker") {
             return ""
         }
@@ -1525,6 +1776,28 @@ public class TelegramAdapter <: ChannelAdapter {
                 return ""
         }
         this.parseTelegramPayloadSuccess(kind, plainResponseRaw) ?? ""
+    }
+
+    private func shouldRetryWithoutTelegramThread(payload: HashMap<String, JsonValue>): Bool {
+        if (!payload.contains("message_thread_id")) {
+            return false
+        }
+        let err = this.lastSendError.trimAscii().toAsciiLower()
+        err.contains("message thread not found") ||
+            err.contains("message thread_id not found") ||
+            err.contains("thread not found") ||
+            err.contains("topic not found")
+    }
+
+    private func telegramPayloadWithoutThread(payload: HashMap<String, JsonValue>): HashMap<String, JsonValue> {
+        let out = HashMap<String, JsonValue>()
+        for ((key, value) in payload) {
+            if (key == "message_thread_id") {
+                continue
+            }
+            out[key] = value
+        }
+        out
     }
 
     private func sendDraftPayloadToTelegram(url: String, payload: HashMap<String, JsonValue>): String {
@@ -2092,6 +2365,10 @@ public class TelegramAdapter <: ChannelAdapter {
 
     private func persistInboundMedia(
         info: TelegramInboundMediaInfo,
+        peerId!: String = "",
+        messageId!: String = "",
+        relation!: String = "",
+        replyToMessageId!: String = "",
         getFileRaw!: String = "",
         downloadRaw!: String = ""
     ): JsonObject {
@@ -2140,16 +2417,44 @@ public class TelegramAdapter <: ChannelAdapter {
                     if (this.mediaSizeExceedsLimit(Int64(resolvedDownloadRaw.toArray().size))) {
                         skippedReason = "download_size_limit_exceeded"
                     } else {
-                        downloadPath = this.persistDownloadedMediaBytes(normalizedFileId, resolvedDownloadRaw)
+                        downloadPath = this.persistDownloadedMediaBytes(
+                            info,
+                            normalizedFileId,
+                            filePath,
+                            resolvedDownloadRaw,
+                            messageId: messageId
+                        )
                         downloaded = !downloadPath.isEmpty()
                     }
                 }
             }
         }
+        let accountId = this.effectiveAccountId()
+        let createdAtMs = DateTime.now().toUnixTimeStamp().toMilliseconds()
+        let mediaId = this.telegramMediaRecordId(
+            accountId,
+            peerId,
+            messageId,
+            normalizedKind,
+            normalizedFileId
+        )
+        let eligibleFor = this.telegramMediaEligibility(normalizedKind)
+        let relativePath = this.relativeTelegramMediaPath(downloadPath)
+
         let lastMedia = JsonObject()
+        lastMedia.put("mediaId", JsonString(mediaId))
+        lastMedia.put("channel", JsonString("telegram"))
+        lastMedia.put("accountId", JsonString(accountId))
+        lastMedia.put("peerId", JsonString(peerId.trimAscii()))
+        lastMedia.put("messageId", JsonString(messageId.trimAscii()))
+        lastMedia.put("relation", JsonString(if (relation.trimAscii().isEmpty()) { "current" } else { relation.trimAscii() }))
+        lastMedia.put("replyToMessageId", JsonString(replyToMessageId.trimAscii()))
+        lastMedia.put("mediaKind", JsonString(normalizedKind))
         lastMedia.put("kind", JsonString(normalizedKind))
         lastMedia.put("fileId", JsonString(normalizedFileId))
         lastMedia.put("fileUniqueId", JsonString(info.fileUniqueId))
+        lastMedia.put("telegramFilePath", JsonString(filePath))
+        lastMedia.put("originalFileName", JsonString(info.fileName))
         lastMedia.put("mimeType", JsonString(effectiveMime))
         lastMedia.put("fileSize", effectiveSize.toJsonValue())
         lastMedia.put("fileName", JsonString(info.fileName))
@@ -2157,20 +2462,76 @@ public class TelegramAdapter <: ChannelAdapter {
         lastMedia.put("albumPolicy", JsonString(this.effectiveMediaAlbumPolicy()))
         lastMedia.put("caption", JsonString(info.caption.trimAscii()))
         lastMedia.put("filePath", JsonString(filePath))
+        lastMedia.put("localPath", JsonString(downloadPath))
+        lastMedia.put("relativePath", JsonString(relativePath))
         lastMedia.put("downloaded", downloaded.toJsonValue())
         lastMedia.put("downloadPath", JsonString(downloadPath))
         lastMedia.put("skippedReason", JsonString(skippedReason))
-        lastMedia.put("persistedAtMs", DateTime.now().toUnixTimeStamp().toMilliseconds().toJsonValue())
-        let root = JsonObject()
-        root.put("accountId", JsonString(this.effectiveAccountId()))
+        lastMedia.put("eligibleFor", JsonString(eligibleFor))
+        lastMedia.put("createdAtMs", createdAtMs.toJsonValue())
+        lastMedia.put("persistedAtMs", createdAtMs.toJsonValue())
+        let root = this.readMediaState()
+        let records = this.readMediaRecords(root)
+        records.add(lastMedia)
+        root.put("accountId", JsonString(accountId))
         root.put("downloadEnabled", this.config.media.downloadEnabled.toJsonValue())
         root.put("mediaMaxBytes", this.effectiveMediaMaxBytes().toJsonValue())
         root.put("allowedMimes", this.mediaAllowedMimesJson())
         root.put("albumPolicy", JsonString(this.effectiveMediaAlbumPolicy()))
         root.put("lastPersistedMediaId", JsonString(normalizedFileId))
+        root.put("lastMediaRecordId", JsonString(mediaId))
         root.put("lastMedia", lastMedia)
+        root.put("records", records)
         File.writeTo(this.mediaStatePath(), root.toJsonString().toArray())
         root
+    }
+
+    private func readMediaRecords(root: JsonObject): JsonArray {
+        match (root.get("records")) {
+            case Some(v) =>
+                try {
+                    v.asArray()
+                } catch (_: Exception) {
+                    JsonArray([])
+                }
+            case None => JsonArray([])
+        }
+    }
+
+    private func telegramMediaRecordId(accountId: String, peerId: String, messageId: String, kind: String, fileId: String): String {
+        let account = if (accountId.trimAscii().isEmpty()) { TELEGRAM_DEFAULT_ACCOUNT_ID } else { accountId.trimAscii() }
+        let peer = if (peerId.trimAscii().isEmpty()) { "unknown-peer" } else { peerId.trimAscii() }
+        let message = if (messageId.trimAscii().isEmpty()) { "unknown-message" } else { messageId.trimAscii() }
+        "tg_${this.safeStateSegment(account)}_${this.safeStateSegment(peer)}_${this.safeStateSegment(message)}_${this.safeStateSegment(kind)}_${this.safeStateSegment(fileId)}"
+    }
+
+    private func telegramMediaEligibility(kind: String): String {
+        if (kind == "photo") {
+            return "vision"
+        }
+        if (kind == "voice" || kind == "audio") {
+            return "transcription"
+        }
+        if (kind == "document") {
+            return "file-context"
+        }
+        "metadata-only"
+    }
+
+    private func relativeTelegramMediaPath(path: String): String {
+        let normalized = path.trimAscii()
+        if (normalized.isEmpty()) {
+            return ""
+        }
+        let mediaRoot = this.mediaDownloadDir().toString()
+        if (normalized == mediaRoot) {
+            return ""
+        }
+        let prefix = mediaRoot + "/"
+        if (normalized.startsWith(prefix)) {
+            return normalized[prefix.size..]
+        }
+        ""
     }
 
     private func tryTelegramGetFile(fileId: String): String {
@@ -2229,14 +2590,143 @@ public class TelegramAdapter <: ChannelAdapter {
         }
     }
 
-    private func persistDownloadedMediaBytes(fileId: String, raw: String): String {
+    private func persistDownloadedMediaBytes(
+        info: TelegramInboundMediaInfo,
+        fileId: String,
+        telegramFilePath: String,
+        raw: String,
+        messageId!: String = ""
+    ): String {
         if (raw.isEmpty()) {
             return ""
         }
-        let safeId = fileId.trimAscii().replace("/", "_").replace(":", "_").replace("\\", "_")
-        let path = this.mediaDownloadDir().join("${safeId}.download")
+        let dayDir = this.mediaDownloadDir().join(DateTime.now().format("yyyy-MM-dd"))
+        if (!exists(dayDir)) {
+            Directory.create(dayDir, recursive: true)
+        }
+        let messageSegment = this.safeStateSegment(if (messageId.trimAscii().isEmpty()) { "unknown-message" } else { messageId.trimAscii() })
+        let messageDir = dayDir.join(messageSegment)
+        if (!exists(messageDir)) {
+            Directory.create(messageDir, recursive: true)
+        }
+        let fileName = this.uniqueTelegramMediaFileName(
+            messageDir,
+            info,
+            fileId,
+            telegramFilePath
+        )
+        let path = messageDir.join(fileName)
         File.writeTo(path, raw.toArray())
         path.toString()
+    }
+
+    private func uniqueTelegramMediaFileName(dir: Path, info: TelegramInboundMediaInfo, fileId: String, telegramFilePath: String): String {
+        let preferred = this.preferredTelegramMediaFileName(info, fileId, telegramFilePath)
+        if (!exists(dir.join(preferred))) {
+            return preferred
+        }
+        let ext = this.fileExtensionFromName(preferred)
+        let stem = if (ext.isEmpty()) { preferred } else { preferred[..preferred.size - ext.size - 1] }
+        var i: Int64 = 2
+        while (i < 10000) {
+            let candidate = if (ext.isEmpty()) { "${stem}-${i}" } else { "${stem}-${i}.${ext}" }
+            if (!exists(dir.join(candidate))) {
+                return candidate
+            }
+            i += 1
+        }
+        if (ext.isEmpty()) { "${stem}-${DateTime.now().toUnixTimeStamp().toMilliseconds()}" } else { "${stem}-${DateTime.now().toUnixTimeStamp().toMilliseconds()}.${ext}" }
+    }
+
+    private func preferredTelegramMediaFileName(info: TelegramInboundMediaInfo, fileId: String, telegramFilePath: String): String {
+        var candidate = this.safeTelegramMediaFileName(info.fileName)
+        if (candidate.isEmpty()) {
+            candidate = this.safeTelegramMediaFileName(this.fileNameFromTelegramFilePath(telegramFilePath))
+        }
+        let ext = this.telegramMediaExtension(info, telegramFilePath)
+        if (candidate.isEmpty()) {
+            let safeId = this.safeStateSegment(fileId)
+            return if (ext.isEmpty()) { safeId } else { "${safeId}.${ext}" }
+        }
+        if (!ext.isEmpty() && this.fileExtensionFromName(candidate).isEmpty()) {
+            return "${candidate}.${ext}"
+        }
+        candidate
+    }
+
+    private func safeTelegramMediaFileName(raw: String): String {
+        let trimmed = raw.trimAscii()
+        if (trimmed.isEmpty()) {
+            return ""
+        }
+        let name = this.fileNameFromTelegramFilePath(trimmed)
+        let out = StringBuilder()
+        for (r in name.runes()) {
+            if ((r >= r'a' && r <= r'z') || (r >= r'A' && r <= r'Z') || (r >= r'0' && r <= r'9') || r == r'.' || r == r'_' || r == r'-') {
+                out.append(r)
+            } else {
+                out.append(r'_')
+            }
+        }
+        let normalized = out.toString().trimAscii()
+        if (normalized.isEmpty() || normalized == "." || normalized == "..") {
+            return ""
+        }
+        normalized
+    }
+
+    private func fileNameFromTelegramFilePath(pathText: String): String {
+        let normalized = pathText.trimAscii().replace("\\", "/")
+        if (normalized.isEmpty()) {
+            return ""
+        }
+        match (normalized.lastIndexOf("/")) {
+            case Some(idx) =>
+                let name = normalized[idx + 1..].trimAscii()
+                if (name == "." || name == "..") { "" } else { name }
+            case None =>
+                if (normalized == "." || normalized == "..") { "" } else { normalized }
+        }
+    }
+
+    private func telegramMediaExtension(info: TelegramInboundMediaInfo, telegramFilePath: String): String {
+        let fromName = this.fileExtensionFromName(info.fileName)
+        if (!fromName.isEmpty()) {
+            return fromName
+        }
+        let fromPath = this.fileExtensionFromName(telegramFilePath)
+        if (!fromPath.isEmpty()) {
+            return fromPath
+        }
+        this.fileExtensionFromMime(info.mimeType)
+    }
+
+    private func fileExtensionFromName(name: String): String {
+        let fileName = this.fileNameFromTelegramFilePath(name)
+        match (fileName.lastIndexOf(".")) {
+            case Some(idx) =>
+                if (idx <= 0 || idx + 1 >= fileName.size) {
+                    return ""
+                }
+                fileName[idx + 1..].trimAscii().toAsciiLower()
+            case None => ""
+        }
+    }
+
+    private func fileExtensionFromMime(mime: String): String {
+        let normalized = mime.trimAscii().toAsciiLower()
+        if (normalized == "image/jpeg" || normalized == "image/jpg") { return "jpg" }
+        if (normalized == "image/png") { return "png" }
+        if (normalized == "image/gif") { return "gif" }
+        if (normalized == "image/webp") { return "webp" }
+        if (normalized == "application/pdf") { return "pdf" }
+        if (normalized == "text/plain") { return "txt" }
+        if (normalized == "application/json") { return "json" }
+        if (normalized == "audio/ogg") { return "ogg" }
+        if (normalized == "audio/mpeg") { return "mp3" }
+        if (normalized == "audio/mp4") { return "m4a" }
+        if (normalized == "video/mp4") { return "mp4" }
+        ""
     }
 
     private func mediaAllowedMimesJson(): JsonArray {
@@ -2497,6 +2987,10 @@ public class TelegramAdapter <: ChannelAdapter {
             case Some(payload) => return [payload]
             case None => ()
         }
+        match (this.detectChatActionPayload(message)) {
+            case Some(payload) => return [payload]
+            case None => ()
+        }
         match (this.detectInlineKeyboardPayload(message)) {
             case Some(payload) => return [payload]
             case None => ()
@@ -2657,6 +3151,22 @@ public class TelegramAdapter <: ChannelAdapter {
         let reactions = JsonArray([])
         reactions.add(reaction)
         body["reaction"] = reactions
+        body
+    }
+
+    private func buildChatActionPayload(message: OutboundMessage, action: String): HashMap<String, JsonValue> {
+        let normalizedPeer = message.peerId.trimAscii()
+        let chatId = this.normalizePeerId(normalizedPeer)
+        let threadId = this.extractThreadId(normalizedPeer)
+        let replyInThread = this.effectiveReplyInThread(message.replyInThread)
+        let body = HashMap<String, JsonValue>()
+        body["kind"] = JsonString("chat-action")
+        body["peer"] = JsonString(normalizedPeer)
+        body["chat_id"] = JsonString(chatId)
+        body["action"] = JsonString(this.normalizeTelegramChatAction(action))
+        if (!threadId.isEmpty() && replyInThread) {
+            body["message_thread_id"] = JsonString(threadId)
+        }
         body
     }
 
@@ -3089,6 +3599,13 @@ public class TelegramAdapter <: ChannelAdapter {
         }
     }
 
+    private func payloadIsChatAction(payload: HashMap<String, JsonValue>): Bool {
+        match (payload.get("kind")) {
+            case Some(v) => try { v.asString().getValue().trimAscii().toAsciiLower() == "chat-action" } catch (_e: Exception) { false }
+            case None => false
+        }
+    }
+
     private func payloadIsInlineKeyboard(payload: HashMap<String, JsonValue>): Bool {
         match (payload.get("kind")) {
             case Some(v) => try { v.asString().getValue().trimAscii().toAsciiLower() == "inline-keyboard" } catch (_e: Exception) { false }
@@ -3210,6 +3727,9 @@ public class TelegramAdapter <: ChannelAdapter {
         }
         if (kind == "reaction") {
             return "setMessageReaction"
+        }
+        if (kind == "chat-action") {
+            return "sendChatAction"
         }
         if (kind == "draft") {
             return "sendMessage"
@@ -3335,6 +3855,25 @@ public class TelegramAdapter <: ChannelAdapter {
                 if (trimmed.isEmpty()) { None } else { Some(this.buildReactionPayload(message, trimmed, token)) }
             case None => None
         }
+    }
+
+    private func detectChatActionPayload(message: OutboundMessage): Option<HashMap<String, JsonValue>> {
+        let action = parseGatewayChatAction(message.text)
+        if (action.isEmpty()) {
+            return None
+        }
+        Some(this.buildChatActionPayload(message, action))
+    }
+
+    private func normalizeTelegramChatAction(action: String): String {
+        let normalized = action.trimAscii().toAsciiLower().replace("-", "_").replace(" ", "_")
+        if (normalized == "typing" || normalized == "upload_photo" || normalized == "record_video" ||
+            normalized == "upload_video" || normalized == "record_voice" || normalized == "upload_voice" ||
+            normalized == "upload_document" || normalized == "choose_sticker" || normalized == "find_location" ||
+            normalized == "record_video_note" || normalized == "upload_video_note") {
+            return normalized
+        }
+        "typing"
     }
 
     private func detectInlineKeyboardPayload(message: OutboundMessage): Option<HashMap<String, JsonValue>> {
@@ -4183,6 +4722,18 @@ public class TelegramAdapter <: ChannelAdapter {
                 case s: JsonString => s.getValue().trimAscii()
                 case n: JsonInt => n.getValue().toString()
                 case n: JsonFloat => Int64(n.getValue()).toString()
+                case _ => ""
+            }
+            case None => ""
+        }
+    }
+
+    private func readFloatStringField(obj: JsonObject, key: String): String {
+        match (obj.get(key)) {
+            case Some(v) => match (v) {
+                case s: JsonString => s.getValue().trimAscii()
+                case n: JsonInt => n.getValue().toString()
+                case n: JsonFloat => n.getValue().toString()
                 case _ => ""
             }
             case None => ""

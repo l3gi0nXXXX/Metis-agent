@@ -4,8 +4,10 @@ import metis.core.gatewayCurrentToolRuntimeContext
 import metis.core.config.GatewayUserSettings
 import metis.gateway.session.{GatewayIngressSource, GatewaySessionRequest}
 
-import std.fs.Path
+import std.fs.{Directory, File, Path, remove}
+import std.time.DateTime
 import std.unittest.testmacro.*
+import stdx.encoding.json.{JsonArray, JsonBool, JsonObject, JsonString}
 
 @Test
 public class GatewaySessionTurnRunnerTest {
@@ -66,6 +68,75 @@ public class GatewaySessionTurnRunnerTest {
         )
         @Expect(turn.context.channelName, "control-ui")
         @Expect(gatewayCurrentToolRuntimeContext().isNone(), true)
+    }
+
+    @TestCase
+    public func mediaContextPromptExposesMediaPathsAndTypes(): Unit {
+        let media = JsonObject()
+        let records = JsonArray([])
+        let record = JsonObject()
+        record.put("mediaId", JsonString("tg-default-user-101-photo"))
+        record.put("mediaKind", JsonString("photo"))
+        record.put("mimeType", JsonString("image/jpeg"))
+        record.put("originalFileName", JsonString("file_1.jpg"))
+        record.put("localPath", JsonString("/tmp/metis-media/file_1.jpg"))
+        record.put("downloaded", JsonBool(true))
+        records.add(record)
+        media.put("records", records)
+
+        let prompt = gatewayBuildMediaContextPrompt(media)
+        @Expect(prompt.contains("MediaPath=/tmp/metis-media/file_1.jpg"), true)
+        @Expect(prompt.contains("MediaType=photo"), true)
+        @Expect(prompt.contains("MediaPaths=/tmp/metis-media/file_1.jpg"), true)
+        @Expect(prompt.contains("MediaTypes=photo"), true)
+    }
+
+    @TestCase
+    public func mediaContextPromptIncludesAudioTranscriptSidecar(): Unit {
+        let root = Path("/tmp/metis-media-audio-context-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
+        Directory.create(root, recursive: true)
+        let voice = root.join("voice.ogg")
+        File.writeTo(voice, "fake-audio".toArray())
+        File.writeTo(Path("${voice.toString()}.transcript.txt"), "hello from voice".toArray())
+        try {
+            let media = JsonObject()
+            let records = JsonArray([])
+            let record = JsonObject()
+            record.put("mediaKind", JsonString("voice"))
+            record.put("mimeType", JsonString("audio/ogg"))
+            record.put("localPath", JsonString(voice.toString()))
+            record.put("downloaded", JsonBool(true))
+            records.add(record)
+            media.put("records", records)
+            let prompt = gatewayBuildMediaContextPrompt(media)
+            @Expect(prompt.contains("AudioTranscript=hello from voice"), true)
+        } finally {
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func mediaContextPromptIncludesReadableDocumentPreview(): Unit {
+        let root = Path("/tmp/metis-media-doc-context-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
+        Directory.create(root, recursive: true)
+        let doc = root.join("report.txt")
+        File.writeTo(doc, "line one\nline two".toArray())
+        try {
+            let media = JsonObject()
+            let records = JsonArray([])
+            let record = JsonObject()
+            record.put("mediaKind", JsonString("document"))
+            record.put("mimeType", JsonString("text/plain"))
+            record.put("originalFileName", JsonString("report.txt"))
+            record.put("localPath", JsonString(doc.toString()))
+            record.put("downloaded", JsonBool(true))
+            records.add(record)
+            media.put("records", records)
+            let prompt = gatewayBuildMediaContextPrompt(media)
+            @Expect(prompt.contains("FileContentPreview=line one\nline two"), true)
+        } finally {
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
     }
 
     @TestCase

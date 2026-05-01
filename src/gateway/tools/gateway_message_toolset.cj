@@ -3,7 +3,7 @@ package metis.gateway.tools
 import magic.dsl.{tool, toolset}
 import magic.prelude.*
 
-import metis.core.{gatewayMessagePayloadPreview, parseGatewayPollParts, renderGatewayAudioText, renderGatewayDeleteText, renderGatewayDocumentText, renderGatewayEditText, renderGatewayPhotoText, renderGatewayPollText, renderGatewayReactionText, renderGatewayTopicCreateText, renderGatewayTopicEditText, renderGatewayVideoNoteText, renderGatewayVideoText, renderGatewayVoiceText}
+import metis.core.{gatewayMessagePayloadPreview, parseGatewayPollParts, renderGatewayAudioText, renderGatewayChatActionText, renderGatewayDeleteText, renderGatewayDocumentText, renderGatewayEditText, renderGatewayPhotoText, renderGatewayPollText, renderGatewayReactionText, renderGatewayTopicCreateText, renderGatewayTopicEditText, renderGatewayVideoNoteText, renderGatewayVideoText, renderGatewayVoiceText}
 import metis.core.config.MetisPaths
 import metis.io.PrintUtils
 
@@ -53,9 +53,9 @@ public class GatewayMessageToolset {
     }
 
     @tool[
-        description: "Send one Gateway-backed message through the unified channels.send RPC surface. Supports action=send, reply, thread, reaction, poll, delete, edit, topic-create, topic-edit, photo, document, audio, voice, video, and video-note.",
+        description: "Send one Gateway-backed message through the unified channels.send RPC surface. Supports action=send, reply, thread, reaction, chat-action, poll, delete, edit, topic-create, topic-edit, photo, document, audio, voice, video, and video-note.",
         parameters: {
-            action: "Message action. Supported now: send, reply, thread, reaction, poll, delete, edit, topic-create, topic-edit, photo, document, audio, voice, video, video-note.",
+            action: "Message action. Supported now: send, reply, thread, reaction, chat-action, poll, delete, edit, topic-create, topic-edit, photo, document, audio, voice, video, video-note.",
             channel: "Gateway channel id, such as feishu or qq.",
             to: "Target peer/chat id.",
             message: "Message text to send.",
@@ -78,7 +78,7 @@ public class GatewayMessageToolset {
         let act = action.trimAscii().toAsciiLower()
         PrintUtils.printTool("message", shortMessage: act)
 
-        if (!(act == "send" || act == "reply" || act == "thread" || act == "reaction" || act == "poll" || act == "delete" || act == "edit" || act == "topic-create" || act == "topic-edit" || act == "photo" || act == "document" || act == "audio" || act == "voice" || act == "video" || act == "video-note")) {
+        if (!(act == "send" || act == "reply" || act == "thread" || act == "reaction" || act == "chat-action" || act == "poll" || act == "delete" || act == "edit" || act == "topic-create" || act == "topic-edit" || act == "photo" || act == "document" || act == "audio" || act == "voice" || act == "video" || act == "video-note")) {
             let unsupported = JsonObject()
             unsupported.put("ok", JsonBool(false))
             unsupported.put("status", JsonString("unsupported"))
@@ -110,6 +110,9 @@ public class GatewayMessageToolset {
                     if (t.isEmpty()) { "" } else { renderGatewayReactionText(t) }
                 case None => ""
             }
+        } else if (act == "chat-action") {
+            payloadKind = "chat-action"
+            text = renderGatewayChatActionText(text)
         } else if (act == "poll") {
             payloadKind = "poll"
             text = renderGatewayPollText(match (poll) {
@@ -156,6 +159,8 @@ public class GatewayMessageToolset {
             err.put("action", JsonString(act))
             err.put("error", JsonString(if (act == "reaction") {
                 "reaction requires channel, to, and reaction"
+            } else if (act == "chat-action") {
+                "chat-action requires channel, to, and message"
             } else if (act == "poll") {
                 "poll requires channel, to, and poll"
             } else if (act == "delete") {

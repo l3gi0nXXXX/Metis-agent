@@ -1,6 +1,7 @@
 package metis.gateway.session
 
 import metis.gateway.model.ChatType
+import stdx.encoding.json.JsonObject
 
 public enum GatewayIngressSource {
     | Cli
@@ -67,6 +68,7 @@ public class GatewaySessionRequest {
     public let replyToMessageId: String
     public let replyInThread: Bool
     public let deliver: Bool
+    public let mediaContext: JsonObject
 
     public init(
         source: GatewayIngressSource,
@@ -91,7 +93,8 @@ public class GatewaySessionRequest {
         replyAccountId!: String = "",
         replyToMessageId!: String = "",
         replyInThread!: Bool = false,
-        deliver!: Bool = false
+        deliver!: Bool = false,
+        mediaContext!: JsonObject = JsonObject()
     ) {
         this.source = source
         this.channelName = channelName.trimAscii().toAsciiLower()
@@ -116,6 +119,7 @@ public class GatewaySessionRequest {
         this.replyToMessageId = replyToMessageId.trimAscii()
         this.replyInThread = replyInThread
         this.deliver = deliver
+        this.mediaContext = mediaContext
     }
 }
 

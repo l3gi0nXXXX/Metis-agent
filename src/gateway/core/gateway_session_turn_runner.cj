@@ -3,6 +3,139 @@ package metis.gateway.core
 import metis.core.GatewayToolRuntimeContext
 import metis.core.config.GatewayUserSettings
 import metis.gateway.session.{GatewaySessionContext, GatewaySessionRequest, gatewayResolveSessionContext}
+import std.collection.ArrayList
+import std.fs.{File, Path, exists}
+import stdx.encoding.json.{JsonArray, JsonObject}
+
+private func gatewayJsonString(obj: JsonObject, key: String): String {
+    match (obj.get(key)) {
+        case Some(v) => try { v.asString().getValue().trimAscii() } catch (_e: Exception) { "" }
+        case None => ""
+    }
+}
+
+private func gatewayJsonBool(obj: JsonObject, key: String): Bool {
+    match (obj.get(key)) {
+        case Some(v) => try { v.asBool().getValue() } catch (_e: Exception) { false }
+        case None => false
+    }
+}
+
+private func gatewayMediaRecords(mediaContext: JsonObject): JsonArray {
+    match (mediaContext.get("records")) {
+        case Some(v) => try { v.asArray() } catch (_e: Exception) { JsonArray([]) }
+        case None => JsonArray([])
+    }
+}
+
+private func gatewayMediaReadableTextMime(mime: String, fileName: String): Bool {
+    let normalizedMime = mime.trimAscii().toAsciiLower()
+    let normalizedName = fileName.trimAscii().toAsciiLower()
+    if (normalizedMime.startsWith("text/") || normalizedMime == "application/json" || normalizedMime == "application/xml") {
+        return true
+    }
+    normalizedName.endsWith(".txt") ||
+        normalizedName.endsWith(".md") ||
+        normalizedName.endsWith(".json") ||
+        normalizedName.endsWith(".xml") ||
+        normalizedName.endsWith(".csv") ||
+        normalizedName.endsWith(".cj") ||
+        normalizedName.endsWith(".ts") ||
+        normalizedName.endsWith(".js") ||
+        normalizedName.endsWith(".py")
+}
+
+private func gatewayMediaSafeTextPreview(pathText: String, maxBytes!: Int64 = 8192): String {
+    let path = Path(pathText)
+    if (pathText.trimAscii().isEmpty() || !exists(path)) {
+        return ""
+    }
+    let bytes = File.readFrom(path)
+    if (bytes.size > maxBytes) {
+        return String.fromUtf8(bytes[..maxBytes]).replace("\r\n", "\n").replace("\r", "\n") + "\n[truncated]"
+    }
+    String.fromUtf8(bytes).replace("\r\n", "\n").replace("\r", "\n")
+}
+
+private func gatewayMediaAudioTranscript(localPath: String): String {
+    let candidates = [
+        "${localPath}.transcript.txt",
+        "${localPath}.txt",
+        "${localPath}.transcript"
+    ]
+    for (candidate in candidates) {
+        if (exists(Path(candidate))) {
+            return gatewayMediaSafeTextPreview(candidate, maxBytes: 4096).trimAscii()
+        }
+    }
+    ""
+}
+
+public func gatewayBuildMediaContextPrompt(mediaContext: JsonObject): String {
+    let records = gatewayMediaRecords(mediaContext)
+    if (records.size() == 0) {
+        return ""
+    }
+    let lines = ArrayList<String>()
+    let paths = ArrayList<String>()
+    let types = ArrayList<String>()
+    lines.add("## Current Message Media")
+    lines.add("The current inbound message has structured media resources from the gateway. Use these local paths when the user asks to save, inspect, transcribe, or reason about the attached media. Do not parse media out of the visible chat text.")
+    for (item in records.getItems()) {
+        let record = try { item.asObject() } catch (_e: Exception) { JsonObject() }
+        let mediaId = gatewayJsonString(record, "mediaId")
+        let kind = gatewayJsonString(record, "mediaKind")
+        let mime = gatewayJsonString(record, "mimeType")
+        let localPath = gatewayJsonString(record, "localPath")
+        let fileName = gatewayJsonString(record, "originalFileName")
+        let relation = gatewayJsonString(record, "relation")
+        let downloaded = gatewayJsonBool(record, "downloaded")
+        let skipped = gatewayJsonString(record, "skippedReason")
+        let transcript = if ((kind == "voice" || kind == "audio") && downloaded && !localPath.isEmpty()) {
+            gatewayMediaAudioTranscript(localPath)
+        } else {
+            ""
+        }
+        let filePreview = if (kind == "document" && downloaded && gatewayMediaReadableTextMime(mime, fileName) && !localPath.isEmpty()) {
+            gatewayMediaSafeTextPreview(localPath).trimAscii()
+        } else {
+            ""
+        }
+        if (!localPath.isEmpty()) {
+            paths.add(localPath)
+        }
+        if (!kind.isEmpty()) {
+            types.add(kind)
+        }
+        let row = ArrayList<String>()
+        if (!mediaId.isEmpty()) { row.add("mediaId=${mediaId}") }
+        if (!kind.isEmpty()) { row.add("MediaType=${kind}") }
+        if (!mime.isEmpty()) { row.add("mimeType=${mime}") }
+        if (!fileName.isEmpty()) { row.add("fileName=${fileName}") }
+        if (!relation.isEmpty()) { row.add("relation=${relation}") }
+        if (!localPath.isEmpty()) { row.add("MediaPath=${localPath}") }
+        row.add("downloaded=${downloaded}")
+        if (!skipped.isEmpty()) { row.add("skippedReason=${skipped}") }
+        if (!transcript.isEmpty()) {
+            row.add("AudioTranscript=${transcript}")
+        } else if ((kind == "voice" || kind == "audio") && downloaded) {
+            row.add("ASRStatus=not_configured")
+        }
+        if (!filePreview.isEmpty()) {
+            row.add("FileContentPreview=${filePreview}")
+        } else if (kind == "document" && downloaded) {
+            row.add("FileContentStatus=metadata_only")
+        }
+        lines.add("- " + String.join(row.toArray(), delimiter: "; "))
+    }
+    if (paths.size > 0) {
+        lines.add("MediaPaths=${String.join(paths.toArray(), delimiter: ", ")}")
+    }
+    if (types.size > 0) {
+        lines.add("MediaTypes=${String.join(types.toArray(), delimiter: ", ")}")
+    }
+    String.join(lines.toArray(), delimiter: "\n")
+}
 
 public class GatewayResolvedSessionTurnResult {
     public let context: GatewaySessionContext
@@ -60,8 +193,17 @@ public func gatewayExecuteSessionRequestTurn(
         senderId: request.senderId,
         declaredUser: request.declaredUser,
         operatorScopes: request.operatorScopes,
-        prompt: prompt
+        prompt: prompt,
+        mediaContext: request.mediaContext
     )
+    let mediaPrompt = gatewayBuildMediaContextPrompt(request.mediaContext)
+    let mergedExtraSystemPrompt = if (mediaPrompt.trimAscii().isEmpty()) {
+        extraSystemPrompt
+    } else if (extraSystemPrompt.trimAscii().isEmpty()) {
+        mediaPrompt
+    } else {
+        extraSystemPrompt + "\n\n" + mediaPrompt
+    }
     match (context.deliveryTarget) {
         case Some(target) =>
             // Persist the latest real delivery/binding target so later catalog views do not need to infer
@@ -74,7 +216,7 @@ public func gatewayExecuteSessionRequestTurn(
         context,
         prompt,
         deliver: deliver,
-        extraSystemPrompt: extraSystemPrompt,
+        extraSystemPrompt: mergedExtraSystemPrompt,
         timeoutSeconds: timeoutSeconds,
         toolRuntimeContext: Some(toolRuntimeContext),
         bestEffortDeliver: bestEffortDeliver,

@@ -2,6 +2,7 @@ package metis.core
 
 import std.collection.{ArrayList, HashMap}
 import std.sync.Mutex
+import stdx.encoding.json.JsonObject
 
 public class GatewayToolRuntimeContext {
     public let sourceLabel: String
@@ -11,6 +12,7 @@ public class GatewayToolRuntimeContext {
     public let declaredUser: String
     public let operatorScopes: Array<String>
     public let prompt: String
+    public let mediaContext: JsonObject
 
     public init(
         sourceLabel: String,
@@ -19,7 +21,8 @@ public class GatewayToolRuntimeContext {
         senderId!: String = "",
         declaredUser!: String = "",
         operatorScopes!: Array<String> = [],
-        prompt!: String = ""
+        prompt!: String = "",
+        mediaContext!: JsonObject = JsonObject()
     ) {
         this.sourceLabel = sourceLabel.trimAscii().toAsciiLower()
         this.channelName = channelName.trimAscii().toAsciiLower()
@@ -35,6 +38,7 @@ public class GatewayToolRuntimeContext {
         }
         this.operatorScopes = normalizedScopes.toArray()
         this.prompt = prompt
+        this.mediaContext = mediaContext
     }
 }
 

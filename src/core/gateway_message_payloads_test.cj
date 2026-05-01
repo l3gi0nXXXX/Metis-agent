@@ -40,6 +40,14 @@ public class GatewayMessagePayloadsTest {
     }
 
     @TestCase
+    func renderGatewayChatActionTextWrapsStructuredPayload(): Unit {
+        let rendered = renderGatewayChatActionText("upload_photo")
+        @Expect(rendered.contains("[chat-action]"), true)
+        @Expect(rendered.contains("action=upload_photo"), true)
+        @Expect(parseGatewayChatAction(rendered), "upload_photo")
+    }
+
+    @TestCase
     func renderGatewayStickerTextWrapsStructuredPayload(): Unit {
         let rendered = renderGatewayStickerText("sticker-file-id")
         @Expect(rendered.contains("[sticker]"), true)

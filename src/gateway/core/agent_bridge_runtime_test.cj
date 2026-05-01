@@ -71,6 +71,13 @@ public class AgentBridgeRuntimeTest {
     }
 
     @TestCase
+    public func gatewayDefaultChatRuntimeNowIncludesTelegramMediaTools(): Unit {
+        let names = gatewayDefaultChatToolNames()
+        @Expect(names.contains("telegram_media_list"), true)
+        @Expect(names.contains("telegram_media_save"), true)
+    }
+
+    @TestCase
     public func gatewayDefaultChatRuntimeNowIncludesSessionsSpawnTool(): Unit {
         let names = gatewayDefaultChatToolNames()
         var found = false

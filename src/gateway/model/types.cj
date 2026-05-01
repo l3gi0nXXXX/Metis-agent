@@ -1,6 +1,7 @@
 package metis.gateway.model
 
 import std.time.DateTime
+import stdx.encoding.json.JsonObject
 
 /**
  * 网关层统一的渠道类型。
@@ -44,6 +45,7 @@ public class InboundMessage {
     public let replyTargetMessageId: Option<String>
     public let replyInThread: Bool
     public let raw: Option<String>
+    public let mediaContext: JsonObject
 
     public init(
         channel: ChannelType,
@@ -59,7 +61,8 @@ public class InboundMessage {
         replyTargetMessageId!: Option<String> = None,
         replyInThread!: Bool = false,
         raw!: Option<String> = None,
-        accountId!: String = ""
+        accountId!: String = "",
+        mediaContext!: JsonObject = JsonObject()
     ) {
         this.channel = channel
         this.accountId = accountId.trimAscii()
@@ -75,6 +78,7 @@ public class InboundMessage {
         this.replyTargetMessageId = replyTargetMessageId
         this.replyInThread = replyInThread
         this.raw = raw
+        this.mediaContext = mediaContext
     }
 }
 

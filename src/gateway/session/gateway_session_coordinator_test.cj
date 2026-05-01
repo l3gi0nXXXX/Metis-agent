@@ -353,6 +353,13 @@ public class GatewaySessionCoordinatorTest {
 
     @TestCase
     public func inboundRequestPreservesReplyMessageMetadata(): Unit {
+        let media = JsonObject()
+        let records = JsonArray([])
+        let record = JsonObject()
+        record.put("mediaKind", JsonString("photo"))
+        record.put("localPath", JsonString("/tmp/metis-photo.jpg"))
+        records.add(record)
+        media.put("records", records)
         let request = gatewaySessionRequestFromInbound(
             InboundMessage(
                 ChannelType.Feishu,
@@ -367,7 +374,8 @@ public class GatewaySessionCoordinatorTest {
                 threadId: Some("thread-1"),
                 replyTargetMessageId: Some("msg-root"),
                 replyInThread: true,
-                accountId: "feishu:bot-a"
+                accountId: "feishu:bot-a",
+                mediaContext: media
             )
         )
         let context = gatewayResolveSessionContext(request)
@@ -376,6 +384,7 @@ public class GatewaySessionCoordinatorTest {
         @Expect(request.sourceMessageId, "msg-current")
         @Expect(request.replyToMessageId, "msg-root")
         @Expect(request.replyInThread, true)
+        @Expect(request.mediaContext.get("records").getOrThrow().asArray().size(), 1)
         match (context.deliveryTarget) {
             case Some(target) =>
                 @Expect(target.conversationId, "chat-ou_123")
