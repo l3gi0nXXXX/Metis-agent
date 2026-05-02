@@ -394,6 +394,8 @@ private func mergeTelegram(user: GatewayUserSettings): TelegramConfig {
             poll: user.telegram.actions.poll,
             deleteMessage: user.telegram.actions.deleteMessage,
             editMessage: user.telegram.actions.editMessage,
+            pinMessage: user.telegram.actions.pinMessage,
+            unpinMessage: user.telegram.actions.unpinMessage,
             photo: user.telegram.actions.photo,
             document: user.telegram.actions.document,
             audio: user.telegram.actions.audio,

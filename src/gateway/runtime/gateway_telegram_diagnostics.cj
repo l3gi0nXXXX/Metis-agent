@@ -365,11 +365,13 @@ private func gatewayTelegramBuildDiagnosticFindings(user: GatewayUserSettings, r
         )
     }
 
-    if (user.telegram.actions.deleteMessage || user.telegram.actions.createForumTopic ||
+    if (user.telegram.actions.deleteMessage || user.telegram.actions.pinMessage || user.telegram.actions.unpinMessage || user.telegram.actions.createForumTopic ||
         user.telegram.actions.editForumTopic || user.telegram.media.outboundAllowLocalPath ||
         user.telegram.network.dangerouslyAllowPrivateNetwork) {
         let enabled = JsonArray([])
         if (user.telegram.actions.deleteMessage) { enabled.add(JsonString("deleteMessage")) }
+        if (user.telegram.actions.pinMessage) { enabled.add(JsonString("pinMessage")) }
+        if (user.telegram.actions.unpinMessage) { enabled.add(JsonString("unpinMessage")) }
         if (user.telegram.actions.createForumTopic) { enabled.add(JsonString("createForumTopic")) }
         if (user.telegram.actions.editForumTopic) { enabled.add(JsonString("editForumTopic")) }
         if (user.telegram.media.outboundAllowLocalPath) { enabled.add(JsonString("outboundAllowLocalPath")) }

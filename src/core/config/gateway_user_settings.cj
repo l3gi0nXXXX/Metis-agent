@@ -261,6 +261,8 @@ public struct TelegramActionUserSettings {
     public var poll: Bool = false
     public var deleteMessage: Bool = false
     public var editMessage: Bool = false
+    public var pinMessage: Bool = false
+    public var unpinMessage: Bool = false
     public var photo: Bool = false
     public var document: Bool = false
     public var audio: Bool = false

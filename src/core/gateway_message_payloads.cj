@@ -28,6 +28,35 @@ public func renderGatewayPollText(raw: String): String {
     return String.join(lines.toArray(), delimiter: "\n")
 }
 
+public func renderGatewayPollTextAdvanced(
+    raw: String,
+    durationSeconds!: Option<Int64> = None<Int64>,
+    allowMultiselect!: Option<Bool> = None<Bool>,
+    isAnonymous!: Option<Bool> = None<Bool>
+): String {
+    let base = renderGatewayPollText(raw)
+    if (!base.startsWith("[poll]")) {
+        return base
+    }
+    let lines = ArrayList<String>()
+    for (line in base.split("\n")) {
+        lines.add(line)
+    }
+    match (durationSeconds) {
+        case Some(v) => lines.add("durationSeconds=${v}")
+        case None => ()
+    }
+    match (allowMultiselect) {
+        case Some(v) => lines.add("allowMultiselect=${v}")
+        case None => ()
+    }
+    match (isAnonymous) {
+        case Some(v) => lines.add("isAnonymous=${v}")
+        case None => ()
+    }
+    String.join(lines.toArray(), delimiter: "\n")
+}
+
 public func parseGatewayPollParts(raw: String): (String, Array<String>) {
     let parts = ArrayList<String>()
     for (seg in raw.trimAscii().split("|")) {
@@ -57,6 +86,9 @@ public func renderGatewayReactionText(raw: String): String {
     if (text.isEmpty()) {
         return ""
     }
+    if (text.toAsciiLower() == "remove" || text.toAsciiLower() == "none" || text.toAsciiLower() == "empty") {
+        return "[reaction]\nremove=true\nrender=${text}"
+    }
     return "[reaction]\ntoken=${text}\nrender=${text}"
 }
 
@@ -72,6 +104,20 @@ public func parseGatewayReactionToken(raw: String): String {
         }
     }
     ""
+}
+
+public func parseGatewayReactionRemove(raw: String): Bool {
+    let normalized = raw.replace("\r\n", "\n").replace("\r", "\n").trimAscii()
+    if (!normalized.startsWith("[reaction]")) {
+        return false
+    }
+    for (line0 in normalized.split("\n")) {
+        let line = line0.trimAscii().toAsciiLower()
+        if (line == "remove=true" || line == "remove=1" || line == "empty=true") {
+            return true
+        }
+    }
+    false
 }
 
 public func renderGatewayChatActionText(raw: String): String {
@@ -352,6 +398,25 @@ public func parseGatewayStickerFileId(raw: String): String {
 
 public func renderGatewayDeleteText(): String {
     return "[delete]"
+}
+
+public func renderGatewayPinText(): String {
+    return "[pin]"
+}
+
+public func renderGatewayUnpinText(): String {
+    return "[unpin]"
+}
+
+public func parseGatewayPinAction(raw: String): String {
+    let normalized = raw.replace("\r\n", "\n").replace("\r", "\n").trimAscii().toAsciiLower()
+    if (normalized == "[pin]") {
+        return "pin"
+    }
+    if (normalized == "[unpin]") {
+        return "unpin"
+    }
+    ""
 }
 
 public func renderGatewayEditText(content: String): String {

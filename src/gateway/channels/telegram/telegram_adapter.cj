@@ -1,6 +1,6 @@
 package metis.gateway.channels.telegram
 
-import metis.core.{parseGatewayAudioParts, parseGatewayChatAction, parseGatewayDocumentParts, parseGatewayEditText, parseGatewayInlineKeyboardParts, parseGatewayPhotoParts, parseGatewayReactionToken, parseGatewayStickerFileId, parseGatewayTopicCreateText, parseGatewayTopicEditText, parseGatewayVideoNoteFileId, parseGatewayVideoParts, parseGatewayVoiceParts}
+import metis.core.{parseGatewayAudioParts, parseGatewayChatAction, parseGatewayDocumentParts, parseGatewayEditText, parseGatewayInlineKeyboardParts, parseGatewayPhotoParts, parseGatewayPinAction, parseGatewayReactionRemove, parseGatewayReactionToken, parseGatewayStickerFileId, parseGatewayTopicCreateText, parseGatewayTopicEditText, parseGatewayVideoNoteFileId, parseGatewayVideoParts, parseGatewayVoiceParts}
 import metis.gateway.core.ChannelAdapter
 import metis.gateway.model.*
 import metis.io.PrintUtils
@@ -398,12 +398,24 @@ public class TelegramAdapter <: ChannelAdapter {
                 this.lastSendError = "telegram poll action is disabled"
                 return ""
             }
+            if (payload.get("validation_error").isSome()) {
+                this.lastSendError = this.payloadValidationError(payload)
+                return ""
+            }
             if (this.payloadIsDelete(payload) && !this.config.actions.deleteMessage) {
                 this.lastSendError = "telegram deleteMessage action is disabled"
                 return ""
             }
             if (this.payloadIsEdit(payload) && !this.config.actions.editMessage) {
                 this.lastSendError = "telegram editMessage action is disabled"
+                return ""
+            }
+            if (this.payloadIsPin(payload) && !this.config.actions.pinMessage) {
+                this.lastSendError = "telegram pinMessage action is disabled"
+                return ""
+            }
+            if (this.payloadIsUnpin(payload) && !this.config.actions.unpinMessage) {
+                this.lastSendError = "telegram unpinMessage action is disabled"
                 return ""
             }
             if (this.payloadIsReaction(payload) && !this.config.actions.reactions) {
@@ -1766,7 +1778,7 @@ public class TelegramAdapter <: ChannelAdapter {
                 case None => this.setLastSendError("empty http response")
             }
         }
-        if (kind == "poll" || kind == "delete" || kind == "topic-create" || kind == "reaction" || kind == "sticker") {
+        if (kind == "poll" || kind == "delete" || kind == "pin" || kind == "unpin" || kind == "topic-create" || kind == "reaction" || kind == "sticker") {
             return ""
         }
         if (!this.shouldRetryWithoutParseMode()) {
@@ -1972,7 +1984,7 @@ public class TelegramAdapter <: ChannelAdapter {
     }
 
     private func parseTelegramPayloadSuccess(kind: String, raw: String): Option<String> {
-        if (kind == "delete" || kind == "reaction" || kind == "edit") {
+        if (kind == "delete" || kind == "pin" || kind == "unpin" || kind == "reaction" || kind == "edit") {
             return if (this.parseTelegramBoolSuccess(raw, missingDetail: "telegram api returned ok=false")) { Some("") } else { None<String> }
         }
         if (kind == "topic-create") {
@@ -3023,8 +3035,8 @@ public class TelegramAdapter <: ChannelAdapter {
     }
 
     private func buildSendPayloads(message: OutboundMessage): Array<HashMap<String, JsonValue>> {
-        match (this.detectPollPayload(message.text)) {
-            case Some(spec) => return [this.buildPollPayload(message, spec[0], spec[1])]
+        match (this.detectPollPayload(message)) {
+            case Some(payload) => return [payload]
             case None => ()
         }
         match (this.detectDeletePayload(message)) {
@@ -3032,6 +3044,10 @@ public class TelegramAdapter <: ChannelAdapter {
             case None => ()
         }
         match (this.detectEditPayload(message)) {
+            case Some(payload) => return [payload]
+            case None => ()
+        }
+        match (this.detectPinPayload(message)) {
             case Some(payload) => return [payload]
             case None => ()
         }
@@ -3123,7 +3139,14 @@ public class TelegramAdapter <: ChannelAdapter {
         out.toArray()
     }
 
-    private func buildPollPayload(message: OutboundMessage, question: String, options: Array<String>): HashMap<String, JsonValue> {
+    private func buildPollPayload(
+        message: OutboundMessage,
+        question: String,
+        options: Array<String>,
+        durationSeconds!: Int64 = 0,
+        allowMultiselect!: Bool = false,
+        isAnonymous!: Option<Bool> = None<Bool>
+    ): HashMap<String, JsonValue> {
         let normalizedPeer = message.peerId.trimAscii()
         let chatId = this.normalizePeerId(normalizedPeer)
         let threadId = this.extractThreadId(normalizedPeer)
@@ -3139,6 +3162,16 @@ public class TelegramAdapter <: ChannelAdapter {
             optionsJson.add(JsonString(one))
         }
         body["options"] = optionsJson
+        if (durationSeconds > 0) {
+            body["open_period"] = durationSeconds.toJsonValue()
+        }
+        if (allowMultiselect) {
+            body["allows_multiple_answers"] = true.toJsonValue()
+        }
+        match (isAnonymous) {
+            case Some(v) => body["is_anonymous"] = v.toJsonValue()
+            case None => ()
+        }
         if (!threadId.isEmpty() && replyInThread) {
             body["message_thread_id"] = JsonString(threadId)
         }
@@ -3152,6 +3185,19 @@ public class TelegramAdapter <: ChannelAdapter {
         body["peer"] = JsonString(normalizedPeer)
         body["chat_id"] = JsonString(this.normalizePeerId(normalizedPeer))
         body["message_id"] = JsonString(targetMessageId)
+        body
+    }
+
+    private func buildPinPayload(message: OutboundMessage, targetMessageId: String, unpin!: Bool = false): HashMap<String, JsonValue> {
+        let normalizedPeer = message.peerId.trimAscii()
+        let body = HashMap<String, JsonValue>()
+        body["kind"] = JsonString(if (unpin) { "unpin" } else { "pin" })
+        body["peer"] = JsonString(normalizedPeer)
+        body["chat_id"] = JsonString(this.normalizePeerId(normalizedPeer))
+        body["message_id"] = JsonString(targetMessageId)
+        if (!unpin) {
+            body["disable_notification"] = true.toJsonValue()
+        }
         body
     }
 
@@ -3197,11 +3243,13 @@ public class TelegramAdapter <: ChannelAdapter {
         body["peer"] = JsonString(normalizedPeer)
         body["chat_id"] = JsonString(this.normalizePeerId(normalizedPeer))
         body["message_id"] = JsonString(targetMessageId)
-        let reaction = JsonObject()
-        reaction.put("type", JsonString("emoji"))
-        reaction.put("emoji", JsonString(token))
         let reactions = JsonArray([])
-        reactions.add(reaction)
+        if (!parseGatewayReactionRemove(message.text)) {
+            let reaction = JsonObject()
+            reaction.put("type", JsonString("emoji"))
+            reaction.put("emoji", JsonString(token))
+            reactions.add(reaction)
+        }
         body["reaction"] = reactions
         body
     }
@@ -3654,6 +3702,20 @@ public class TelegramAdapter <: ChannelAdapter {
         }
     }
 
+    private func payloadIsPin(payload: HashMap<String, JsonValue>): Bool {
+        match (payload.get("kind")) {
+            case Some(v) => try { v.asString().getValue().trimAscii().toAsciiLower() == "pin" } catch (_e: Exception) { false }
+            case None => false
+        }
+    }
+
+    private func payloadIsUnpin(payload: HashMap<String, JsonValue>): Bool {
+        match (payload.get("kind")) {
+            case Some(v) => try { v.asString().getValue().trimAscii().toAsciiLower() == "unpin" } catch (_e: Exception) { false }
+            case None => false
+        }
+    }
+
     private func payloadIsReaction(payload: HashMap<String, JsonValue>): Bool {
         match (payload.get("kind")) {
             case Some(v) => try { v.asString().getValue().trimAscii().toAsciiLower() == "reaction" } catch (_e: Exception) { false }
@@ -3795,6 +3857,12 @@ public class TelegramAdapter <: ChannelAdapter {
         if (kind == "edit") {
             return "editMessageText"
         }
+        if (kind == "pin") {
+            return "pinChatMessage"
+        }
+        if (kind == "unpin") {
+            return "unpinChatMessage"
+        }
         if (kind == "reaction") {
             return "setMessageReaction"
         }
@@ -3840,8 +3908,8 @@ public class TelegramAdapter <: ChannelAdapter {
         "sendMessage"
     }
 
-    private func detectPollPayload(text: String): Option<(String, Array<String>)> {
-        let normalized = text.replace("\r\n", "\n").replace("\r", "\n").trimAscii()
+    private func detectPollPayload(message: OutboundMessage): Option<HashMap<String, JsonValue>> {
+        let normalized = message.text.replace("\r\n", "\n").replace("\r", "\n").trimAscii()
         if (!normalized.startsWith("[poll]")) {
             return None
         }
@@ -3851,14 +3919,25 @@ public class TelegramAdapter <: ChannelAdapter {
         }
         let title = lines[1].trimAscii()
         let options = ArrayList<String>()
+        var durationSeconds: Int64 = 0
+        var allowMultiselect = false
+        var isAnonymous: Option<Bool> = None<Bool>
         if (lines.size > 2) {
             var i = 2
             while (i < lines.size) {
                 let raw = lines[i].trimAscii()
                 if (!raw.isEmpty()) {
-                    let parsed = this.parsePollOptionLine(raw)
-                    if (!parsed.isEmpty()) {
-                        options.add(parsed)
+                    if (raw.startsWith("durationSeconds=")) {
+                        durationSeconds = try { Int64.parse(raw["durationSeconds=".size..].trimAscii()) } catch (_e: Exception) { -1 }
+                    } else if (raw.startsWith("allowMultiselect=")) {
+                        allowMultiselect = this.parseTelegramBool(raw["allowMultiselect=".size..].trimAscii())
+                    } else if (raw.startsWith("isAnonymous=")) {
+                        isAnonymous = Some(this.parseTelegramBool(raw["isAnonymous=".size..].trimAscii()))
+                    } else {
+                        let parsed = this.parsePollOptionLine(raw)
+                        if (!parsed.isEmpty()) {
+                            options.add(parsed)
+                        }
                     }
                 }
                 i += 1
@@ -3867,7 +3946,19 @@ public class TelegramAdapter <: ChannelAdapter {
         if (title.isEmpty() || options.isEmpty()) {
             return None
         }
-        Some((title, options.toArray()))
+        if (options.size > 10) {
+            let invalid = HashMap<String, JsonValue>()
+            invalid["kind"] = JsonString("poll")
+            invalid["validation_error"] = JsonString("telegram poll supports at most 10 options")
+            return Some(invalid)
+        }
+        if (durationSeconds < 0 || (durationSeconds > 0 && (durationSeconds < 5 || durationSeconds > 600))) {
+            let invalid = HashMap<String, JsonValue>()
+            invalid["kind"] = JsonString("poll")
+            invalid["validation_error"] = JsonString("telegram poll durationSeconds must be between 5 and 600")
+            return Some(invalid)
+        }
+        Some(this.buildPollPayload(message, title, options.toArray(), durationSeconds: durationSeconds, allowMultiselect: allowMultiselect, isAnonymous: isAnonymous))
     }
 
     private func detectDeletePayload(message: OutboundMessage): Option<HashMap<String, JsonValue>> {
@@ -3896,6 +3987,23 @@ public class TelegramAdapter <: ChannelAdapter {
         }
     }
 
+    private func detectPinPayload(message: OutboundMessage): Option<HashMap<String, JsonValue>> {
+        let action = parseGatewayPinAction(message.text)
+        if (action.isEmpty()) {
+            return None
+        }
+        match (message.replyToMessageId) {
+            case Some(target) =>
+                let trimmed = target.trimAscii()
+                if (trimmed.isEmpty()) {
+                    None
+                } else {
+                    Some(this.buildPinPayload(message, trimmed, unpin: action == "unpin"))
+                }
+            case None => None
+        }
+    }
+
     private func detectTopicCreatePayload(message: OutboundMessage): Option<HashMap<String, JsonValue>> {
         let title = parseGatewayTopicCreateText(message.text)
         if (title.isEmpty()) {
@@ -3919,7 +4027,8 @@ public class TelegramAdapter <: ChannelAdapter {
 
     private func detectReactionPayload(message: OutboundMessage): Option<HashMap<String, JsonValue>> {
         let token = parseGatewayReactionToken(message.text)
-        if (token.isEmpty()) {
+        let remove = parseGatewayReactionRemove(message.text)
+        if (token.isEmpty() && !remove) {
             return None
         }
         match (message.replyToMessageId) {
@@ -4199,6 +4308,11 @@ public class TelegramAdapter <: ChannelAdapter {
             case Some(idx) => raw[idx + 2..].trimAscii()
             case None => raw
         }
+    }
+
+    private func parseTelegramBool(raw: String): Bool {
+        let normalized = raw.trimAscii().toAsciiLower()
+        normalized == "true" || normalized == "1" || normalized == "yes" || normalized == "on"
     }
 
     private func inlineKeyboardButtonFromSpec(spec: String): Option<JsonObject> {

@@ -7,7 +7,7 @@ import magic.model.ModelManager
 import magic.prelude.*
 
 import metis.core.gatewayCurrentToolRuntimeContext
-import metis.core.{renderGatewayAudioText, renderGatewayDocumentText, renderGatewayPhotoText, renderGatewayVideoNoteText, renderGatewayVideoText, renderGatewayVoiceText}
+import metis.core.{renderGatewayAudioText, renderGatewayDocumentText, renderGatewayPhotoText, renderGatewayStickerText, renderGatewayVideoNoteText, renderGatewayVideoText, renderGatewayVoiceText}
 import metis.core.config.{CliConfig, CliSettingManager, MetisPaths}
 import metis.io.PrintUtils
 
@@ -434,6 +434,9 @@ private func telegramMediaToolBuildMediaText(kind: String, media: String, captio
     if (normalized == "video-note" || normalized == "video_note" || normalized == "videonote") {
         return renderGatewayVideoNoteText(media)
     }
+    if (normalized == "sticker") {
+        return renderGatewayStickerText(media)
+    }
     renderGatewayDocumentText(media, caption: caption)
 }
 
@@ -469,6 +472,18 @@ public class GatewayTelegramMediaToolset {
 
     public func debugTelegramDoctorFromEnvelopeForTest(doctorEnvelope: JsonObject): String {
         this.renderTelegramDoctorFromEnvelope(doctorEnvelope)
+    }
+
+    public func debugTelegramStickerSearchForTest(query: String, limit: Option<Int64>): String {
+        this.searchTelegramStickers(query, limit)
+    }
+
+    public func debugTelegramStickerGetForTest(mediaId: Option<String>, fileUniqueId: Option<String>, fileId: Option<String>): String {
+        this.getTelegramSticker(mediaId, fileUniqueId, fileId)
+    }
+
+    public func debugTelegramStickerCacheStatsForTest(): String {
+        this.telegramStickerCacheStats()
     }
 
     private func renderTelegramMediaList(): String {
@@ -723,6 +738,136 @@ public class GatewayTelegramMediaToolset {
         out.toJsonString()
     }
 
+    private func telegramStickerRecordMatchesQuery(record: JsonObject, query: String): Bool {
+        let q = query.trimAscii().toAsciiLower()
+        if (q.isEmpty()) {
+            return true
+        }
+        let haystack = (
+            telegramMediaToolString(record, "fileId") + " " +
+            telegramMediaToolString(record, "fileUniqueId") + " " +
+            telegramMediaToolString(record, "caption") + " " +
+            telegramMediaToolString(record, "emoji") + " " +
+            telegramMediaToolString(record, "setName") + " " +
+            telegramMediaToolString(record, "description") + " " +
+            telegramMediaToolString(record, "analysis")
+        ).toAsciiLower()
+        haystack.contains(q)
+    }
+
+    private func searchTelegramStickers(query: String, limit: Option<Int64>): String {
+        let max = match (limit) {
+            case Some(v) => if (v <= 0) { 10 } else { v }
+            case None => 10
+        }
+        let out = JsonObject()
+        out.put("ok", JsonBool(true))
+        out.put("status", JsonString("ok"))
+        out.put("action", JsonString("telegram_sticker_search"))
+        out.put("source", JsonString("current_session_media_context"))
+        let stickers = JsonArray([])
+        var count: Int64 = 0
+        let records = telegramMediaToolRecords()
+        for (item in records.getItems()) {
+            if (count >= max) {
+                break
+            }
+            let record = try { item.asObject() } catch (_e: Exception) { JsonObject() }
+            let kind = telegramMediaToolString(record, "mediaKind").toAsciiLower()
+            if (kind != "sticker") {
+                continue
+            }
+            if (!this.telegramStickerRecordMatchesQuery(record, query)) {
+                continue
+            }
+            let row = JsonObject()
+            row.put("mediaId", JsonString(telegramMediaToolString(record, "mediaId")))
+            row.put("fileId", JsonString(telegramMediaToolString(record, "fileId")))
+            row.put("fileUniqueId", JsonString(telegramMediaToolString(record, "fileUniqueId")))
+            row.put("emoji", JsonString(telegramMediaToolString(record, "emoji")))
+            row.put("setName", JsonString(telegramMediaToolString(record, "setName")))
+            row.put("description", JsonString(telegramMediaToolString(record, "description")))
+            stickers.add(row)
+            count += 1
+        }
+        out.put("count", count.toJsonValue())
+        out.put("stickers", stickers)
+        out.toJsonString()
+    }
+
+    private func getTelegramSticker(mediaId: Option<String>, fileUniqueId: Option<String>, fileId: Option<String>): String {
+        let targetMediaId = match (mediaId) {
+            case Some(v) => v.trimAscii()
+            case None => ""
+        }
+        let targetUniqueId = match (fileUniqueId) {
+            case Some(v) => v.trimAscii()
+            case None => ""
+        }
+        let targetFileId = match (fileId) {
+            case Some(v) => v.trimAscii()
+            case None => ""
+        }
+        if (targetMediaId.isEmpty() && targetUniqueId.isEmpty() && targetFileId.isEmpty()) {
+            return telegramMediaError("telegram_sticker_get", "mediaId, fileUniqueId, or fileId is required")
+        }
+        let records = telegramMediaToolRecords()
+        for (item in records.getItems()) {
+            let record = try { item.asObject() } catch (_e: Exception) { JsonObject() }
+            if (telegramMediaToolString(record, "mediaKind").toAsciiLower() != "sticker") {
+                continue
+            }
+            if (!targetMediaId.isEmpty() && telegramMediaToolString(record, "mediaId") != targetMediaId) {
+                continue
+            }
+            if (!targetUniqueId.isEmpty() && telegramMediaToolString(record, "fileUniqueId") != targetUniqueId) {
+                continue
+            }
+            if (!targetFileId.isEmpty() && telegramMediaToolString(record, "fileId") != targetFileId) {
+                continue
+            }
+            let out = JsonObject()
+            out.put("ok", JsonBool(true))
+            out.put("status", JsonString("ok"))
+            out.put("action", JsonString("telegram_sticker_get"))
+            out.put("source", JsonString("current_session_media_context"))
+            out.put("sticker", record)
+            return out.toJsonString()
+        }
+        let out = JsonObject()
+        out.put("ok", JsonBool(false))
+        out.put("status", JsonString("error"))
+        out.put("action", JsonString("telegram_sticker_get"))
+        out.put("error", JsonString("sticker not found in current session context"))
+        if (!targetMediaId.isEmpty()) { out.put("mediaId", JsonString(targetMediaId)) }
+        if (!targetUniqueId.isEmpty()) { out.put("fileUniqueId", JsonString(targetUniqueId)) }
+        if (!targetFileId.isEmpty()) { out.put("fileId", JsonString(targetFileId)) }
+        out.toJsonString()
+    }
+
+    private func telegramStickerCacheStats(): String {
+        let out = JsonObject()
+        let records = telegramMediaToolRecords()
+        var stickerCount: Int64 = 0
+        var describedCount: Int64 = 0
+        for (item in records.getItems()) {
+            let record = try { item.asObject() } catch (_e: Exception) { JsonObject() }
+            if (telegramMediaToolString(record, "mediaKind").toAsciiLower() == "sticker") {
+                stickerCount += 1
+                if (!telegramMediaToolString(record, "description").isEmpty() || !telegramMediaToolString(record, "analysis").isEmpty()) {
+                    describedCount += 1
+                }
+            }
+        }
+        out.put("ok", JsonBool(true))
+        out.put("status", JsonString("ok"))
+        out.put("action", JsonString("telegram_sticker_cache_stats"))
+        out.put("source", JsonString("current_session_media_context"))
+        out.put("stickerCount", stickerCount.toJsonValue())
+        out.put("describedCount", describedCount.toJsonValue())
+        out.toJsonString()
+    }
+
     private func sendTelegramMedia(pathOrUrl: String, caption: Option<String>, kind: Option<String>, forceDocument: Option<Bool>): String {
         let media = pathOrUrl.trimAscii()
         if (media.isEmpty()) {
@@ -905,6 +1050,46 @@ public class GatewayTelegramMediaToolset {
     public func telegram_audio_transcribe(mediaId: Option<String>, index: Option<Int64>): String {
         PrintUtils.printTool("telegram_audio_transcribe", shortMessage: "current")
         let text = this.transcribeTelegramAudio(mediaId, index)
+        PrintUtils.printToolResult(text)
+        return text
+    }
+
+    @tool[
+        description: "Search sticker media seen in the current Telegram session context by emoji, set name, file id, or cached description.",
+        parameters: {
+            query: "Sticker search query. Empty returns recent stickers from the current session context.",
+            limit: "Optional maximum number of results. Defaults to 10."
+        }
+    ]
+    public func telegram_sticker_search(query: String, limit: Option<Int64>): String {
+        PrintUtils.printTool("telegram_sticker_search", shortMessage: query)
+        let text = this.searchTelegramStickers(query, limit)
+        PrintUtils.printToolResult(text)
+        return text
+    }
+
+    @tool[
+        description: "Get one sticker seen in the current Telegram session context by mediaId, fileUniqueId, or fileId.",
+        parameters: {
+            mediaId: "Optional mediaId returned by telegram_media_list or telegram_sticker_search.",
+            fileUniqueId: "Optional Telegram sticker file_unique_id.",
+            fileId: "Optional Telegram sticker file_id."
+        }
+    ]
+    public func telegram_sticker_get(mediaId: Option<String>, fileUniqueId: Option<String>, fileId: Option<String>): String {
+        PrintUtils.printTool("telegram_sticker_get", shortMessage: "current")
+        let text = this.getTelegramSticker(mediaId, fileUniqueId, fileId)
+        PrintUtils.printToolResult(text)
+        return text
+    }
+
+    @tool[
+        description: "Return sticker cache/search stats for the current Telegram session context.",
+        parameters: {}
+    ]
+    public func telegram_sticker_cache_stats(): String {
+        PrintUtils.printTool("telegram_sticker_cache_stats", shortMessage: "current")
+        let text = this.telegramStickerCacheStats()
         PrintUtils.printToolResult(text)
         return text
     }

@@ -505,6 +505,8 @@ public class TelegramActionConfig {
     public let poll: Bool
     public let deleteMessage: Bool
     public let editMessage: Bool
+    public let pinMessage: Bool
+    public let unpinMessage: Bool
     public let photo: Bool
     public let document: Bool
     public let audio: Bool
@@ -523,6 +525,8 @@ public class TelegramActionConfig {
         poll!: Bool = false,
         deleteMessage!: Bool = false,
         editMessage!: Bool = false,
+        pinMessage!: Bool = false,
+        unpinMessage!: Bool = false,
         photo!: Bool = false,
         document!: Bool = false,
         audio!: Bool = false,
@@ -540,6 +544,8 @@ public class TelegramActionConfig {
         this.poll = poll
         this.deleteMessage = deleteMessage
         this.editMessage = editMessage
+        this.pinMessage = pinMessage
+        this.unpinMessage = unpinMessage
         this.photo = photo
         this.document = document
         this.audio = audio

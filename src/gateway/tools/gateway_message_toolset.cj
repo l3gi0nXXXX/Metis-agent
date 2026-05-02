@@ -3,7 +3,7 @@ package metis.gateway.tools
 import magic.dsl.{tool, toolset}
 import magic.prelude.*
 
-import metis.core.{gatewayMessagePayloadPreview, parseGatewayPollParts, renderGatewayAudioText, renderGatewayChatActionText, renderGatewayDeleteText, renderGatewayDocumentText, renderGatewayEditText, renderGatewayPhotoText, renderGatewayPollText, renderGatewayReactionText, renderGatewayTopicCreateText, renderGatewayTopicEditText, renderGatewayVideoNoteText, renderGatewayVideoText, renderGatewayVoiceText}
+import metis.core.{gatewayMessagePayloadPreview, parseGatewayPollParts, renderGatewayAudioText, renderGatewayChatActionText, renderGatewayDeleteText, renderGatewayDocumentText, renderGatewayEditText, renderGatewayPhotoText, renderGatewayPinText, renderGatewayPollTextAdvanced, renderGatewayReactionText, renderGatewayTopicCreateText, renderGatewayTopicEditText, renderGatewayUnpinText, renderGatewayVideoNoteText, renderGatewayVideoText, renderGatewayVoiceText}
 import metis.core.config.MetisPaths
 import metis.io.PrintUtils
 
@@ -53,16 +53,21 @@ public class GatewayMessageToolset {
     }
 
     @tool[
-        description: "Send one Gateway-backed message through the unified channels.send RPC surface. Supports action=send, reply, thread, reaction, chat-action, poll, delete, edit, topic-create, topic-edit, photo, document, audio, voice, video, and video-note.",
+        description: "Send one Gateway-backed message through the unified channels.send RPC surface. Supports action=send, reply, thread, reaction, chat-action, poll, delete, edit, pin, unpin, topic-create, topic-edit, photo, document, audio, voice, video, and video-note.",
         parameters: {
-            action: "Message action. Supported now: send, reply, thread, reaction, chat-action, poll, delete, edit, topic-create, topic-edit, photo, document, audio, voice, video, video-note.",
+            action: "Message action. Supported now: send, reply, thread, reaction, chat-action, poll, delete, edit, pin, unpin, topic-create, topic-edit, photo, document, audio, voice, video, video-note.",
             channel: "Gateway channel id, such as feishu or qq.",
             to: "Target peer/chat id.",
             message: "Message text to send.",
             replyTo: "Reply target message id for action=reply.",
             threadId: "Thread root or anchor message id for action=thread.",
             reaction: "For action=reaction, the reaction token or short text to send, such as +1, thumbs_up, or acknowledged.",
-            poll: "For action=poll, a pipe-delimited poll payload such as 'Lunch?|Rice|Noodles|Salad'. It is encoded into a structured text payload."
+            poll: "For action=poll, a pipe-delimited poll payload such as 'Lunch?|Rice|Noodles|Salad'. It is encoded into a structured text payload.",
+            caption: "Optional caption for media actions.",
+            forceDocument: "When true for Telegram media, route image/GIF media through document payload.",
+            durationSeconds: "Optional Telegram poll duration in seconds, 5-600.",
+            allowMultiselect: "Optional Telegram poll multi-select flag.",
+            isAnonymous: "Optional Telegram poll anonymous flag."
         }
     ]
     public func message(
@@ -73,12 +78,17 @@ public class GatewayMessageToolset {
         replyTo: Option<String>,
         threadId: Option<String>,
         reaction: Option<String>,
-        poll: Option<String>
+        poll: Option<String>,
+        caption: Option<String>,
+        forceDocument: Option<Bool>,
+        durationSeconds: Option<Int64>,
+        allowMultiselect: Option<Bool>,
+        isAnonymous: Option<Bool>
     ): String {
         let act = action.trimAscii().toAsciiLower()
         PrintUtils.printTool("message", shortMessage: act)
 
-        if (!(act == "send" || act == "reply" || act == "thread" || act == "reaction" || act == "chat-action" || act == "poll" || act == "delete" || act == "edit" || act == "topic-create" || act == "topic-edit" || act == "photo" || act == "document" || act == "audio" || act == "voice" || act == "video" || act == "video-note")) {
+        if (!(act == "send" || act == "reply" || act == "thread" || act == "reaction" || act == "chat-action" || act == "poll" || act == "delete" || act == "edit" || act == "pin" || act == "unpin" || act == "topic-create" || act == "topic-edit" || act == "photo" || act == "document" || act == "audio" || act == "voice" || act == "video" || act == "video-note")) {
             let unsupported = JsonObject()
             unsupported.put("ok", JsonBool(false))
             unsupported.put("status", JsonString("unsupported"))
@@ -115,13 +125,19 @@ public class GatewayMessageToolset {
             text = renderGatewayChatActionText(text)
         } else if (act == "poll") {
             payloadKind = "poll"
-            text = renderGatewayPollText(match (poll) {
+            text = renderGatewayPollTextAdvanced(match (poll) {
                 case Some(v) => v
                 case None => ""
-            })
+            }, durationSeconds: durationSeconds, allowMultiselect: allowMultiselect, isAnonymous: isAnonymous)
         } else if (act == "delete") {
             payloadKind = "delete"
             text = renderGatewayDeleteText()
+        } else if (act == "pin") {
+            payloadKind = "pin"
+            text = renderGatewayPinText()
+        } else if (act == "unpin") {
+            payloadKind = "unpin"
+            text = renderGatewayUnpinText()
         } else if (act == "edit") {
             payloadKind = "edit"
             text = renderGatewayEditText(text)
@@ -133,19 +149,23 @@ public class GatewayMessageToolset {
             text = renderGatewayTopicEditText(text)
         } else if (act == "photo") {
             payloadKind = "photo"
-            text = renderGatewayPhotoText(text)
+            text = if (match (forceDocument) { case Some(v) => v case None => false }) {
+                renderGatewayDocumentText(text, caption: match (caption) { case Some(v) => v case None => "" })
+            } else {
+                renderGatewayPhotoText(text, caption: match (caption) { case Some(v) => v case None => "" })
+            }
         } else if (act == "document") {
             payloadKind = "document"
-            text = renderGatewayDocumentText(text)
+            text = renderGatewayDocumentText(text, caption: match (caption) { case Some(v) => v case None => "" })
         } else if (act == "audio") {
             payloadKind = "audio"
-            text = renderGatewayAudioText(text)
+            text = renderGatewayAudioText(text, caption: match (caption) { case Some(v) => v case None => "" })
         } else if (act == "voice") {
             payloadKind = "voice"
-            text = renderGatewayVoiceText(text)
+            text = renderGatewayVoiceText(text, caption: match (caption) { case Some(v) => v case None => "" })
         } else if (act == "video") {
             payloadKind = "video"
-            text = renderGatewayVideoText(text)
+            text = renderGatewayVideoText(text, caption: match (caption) { case Some(v) => v case None => "" })
         } else if (act == "video-note") {
             payloadKind = "video-note"
             text = renderGatewayVideoNoteText(text)
@@ -163,8 +183,8 @@ public class GatewayMessageToolset {
                 "chat-action requires channel, to, and message"
             } else if (act == "poll") {
                 "poll requires channel, to, and poll"
-            } else if (act == "delete") {
-                "delete requires channel and to"
+            } else if (act == "delete" || act == "pin" || act == "unpin") {
+                "${act} requires channel and to"
             } else {
                 "${act} requires channel, to, and message"
             }))
@@ -173,7 +193,7 @@ public class GatewayMessageToolset {
             return out
         }
 
-        let replyAnchor = if (act == "reply" || act == "edit" || act == "delete" || act == "topic-edit") {
+        let replyAnchor = if (act == "reply" || act == "edit" || act == "delete" || act == "pin" || act == "unpin" || act == "topic-edit") {
             match (replyTo) {
                 case Some(v) => v.trimAscii()
                 case None => ""
@@ -186,7 +206,7 @@ public class GatewayMessageToolset {
         } else {
             ""
         }
-        if ((act == "reply" || act == "thread" || act == "edit" || act == "delete" || act == "topic-edit") && replyAnchor.isEmpty()) {
+        if ((act == "reply" || act == "thread" || act == "edit" || act == "delete" || act == "pin" || act == "unpin" || act == "topic-edit") && replyAnchor.isEmpty()) {
             let err = JsonObject()
             err.put("ok", JsonBool(false))
             err.put("status", JsonString("error"))
@@ -200,6 +220,8 @@ public class GatewayMessageToolset {
                     "edit requires replyTo"
                 } else if (act == "topic-edit") {
                     "topic-edit requires replyTo"
+                } else if (act == "pin" || act == "unpin") {
+                    "${act} requires replyTo"
                 } else {
                     "delete requires replyTo"
                 }

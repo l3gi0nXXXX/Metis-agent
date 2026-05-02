@@ -31,12 +31,37 @@ public class GatewayMessagePayloadsTest {
     }
 
     @TestCase
+    func renderGatewayPollTextAdvancedAddsTelegramOptions(): Unit {
+        let rendered = renderGatewayPollTextAdvanced(
+            "Lunch?|Rice|Noodles",
+            durationSeconds: Some(60),
+            allowMultiselect: Some(true),
+            isAnonymous: Some(false)
+        )
+        @Expect(rendered.contains("durationSeconds=60"), true)
+        @Expect(rendered.contains("allowMultiselect=true"), true)
+        @Expect(rendered.contains("isAnonymous=false"), true)
+    }
+
+    @TestCase
     func renderGatewayReactionTextWrapsStructuredPayload(): Unit {
         let rendered = renderGatewayReactionText("+1")
         @Expect(rendered.contains("[reaction]"), true)
         @Expect(rendered.contains("token=+1"), true)
         @Expect(rendered.contains("render=+1"), true)
         @Expect(parseGatewayReactionToken(rendered), "+1")
+    }
+
+    @TestCase
+    func renderGatewayReactionTextSupportsRemove(): Unit {
+        let rendered = renderGatewayReactionText("remove")
+        @Expect(parseGatewayReactionRemove(rendered), true)
+    }
+
+    @TestCase
+    func renderGatewayPinActionsRoundTrip(): Unit {
+        @Expect(parseGatewayPinAction(renderGatewayPinText()), "pin")
+        @Expect(parseGatewayPinAction(renderGatewayUnpinText()), "unpin")
     }
 
     @TestCase

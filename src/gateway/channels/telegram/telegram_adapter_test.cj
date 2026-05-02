@@ -64,7 +64,7 @@ private class TelegramFakeBotApi {
                 }
                 return TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":[]}", outcome: "ok")
             }
-            if (request.context.startsWith("send:delete") || request.context.startsWith("send:reaction") || request.context.startsWith("send:topic-edit") || request.context.startsWith("send:draft:final")) {
+            if (request.context.startsWith("send:delete") || request.context.startsWith("send:pin") || request.context.startsWith("send:unpin") || request.context.startsWith("send:reaction") || request.context.startsWith("send:topic-edit") || request.context.startsWith("send:draft:final")) {
                 return TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":true}", outcome: "ok")
             }
             if (request.context.startsWith("send:topic-create")) {
@@ -120,8 +120,11 @@ private class TelegramFakeBotApi {
         if (url.contains("/getWebhookInfo")) { return "getWebhookInfo" }
         if (url.contains("/getFile")) { return "getFile" }
         if (url.contains("/deleteMessage")) { return "deleteMessage" }
+        if (url.contains("/pinChatMessage")) { return "pinChatMessage" }
+        if (url.contains("/unpinChatMessage")) { return "unpinChatMessage" }
         if (url.contains("/setMessageReaction")) { return "setMessageReaction" }
         if (url.contains("/sendChatAction")) { return "sendChatAction" }
+        if (url.contains("/sendPoll")) { return "sendPoll" }
         if (url.contains("/createForumTopic")) { return "createForumTopic" }
         if (url.contains("/editForumTopic")) { return "editForumTopic" }
         if (url.contains("/editMessageText")) { return "editMessageText" }
@@ -2332,6 +2335,54 @@ public class TelegramAdapterTest {
     }
 
     @TestCase
+    public func sendPayloadsRenderTelegramPollAdvancedOptions(): Unit {
+        let adapter = TelegramAdapter(
+            config: TelegramConfig(
+                enabled: true,
+                botToken: "telegram-token",
+                actions: TelegramActionConfig(poll: true)
+            )
+        )
+        let payloads = adapter.debugBuildSendPayloads(
+            OutboundMessage(
+                ChannelType.Telegram,
+                "group:-1001234567890:topic:42",
+                "[poll]\nLunch?\n1. Rice\n2. Noodles\ndurationSeconds=60\nallowMultiselect=true\nisAnonymous=false",
+                replyInThread: true
+            )
+        )
+        @Expect(payloads.size(), 1)
+        let first = payloads[0].asObject()
+        @Expect(first.get("kind").getOrThrow().asString().getValue(), "poll")
+        @Expect(first.get("open_period").getOrThrow().asInt().getValue(), 60)
+        @Expect(first.get("allows_multiple_answers").getOrThrow().asBool().getValue(), true)
+        @Expect(first.get("is_anonymous").getOrThrow().asBool().getValue(), false)
+    }
+
+    @TestCase
+    public func invalidTelegramPollDurationFailsFastBeforeNetwork(): Unit {
+        let adapter = TelegramAdapter(
+            config: TelegramConfig(
+                enabled: true,
+                botToken: "telegram-token",
+                actions: TelegramActionConfig(poll: true)
+            )
+        )
+        adapter.start()
+        let result = adapter.send(
+            OutboundMessage(
+                ChannelType.Telegram,
+                "user:8734062810",
+                "[poll]\nLunch?\n1. Rice\n2. Noodles\ndurationSeconds=1"
+            )
+        )
+        match (result) {
+            case SendResult.Success => @Expect(false, true)
+            case SendResult.Failed(reason) => @Expect(reason.contains("durationSeconds"), true)
+        }
+    }
+
+    @TestCase
     public func sendPayloadsRenderNativeTelegramDeletePayload(): Unit {
         let adapter = TelegramAdapter(config: TelegramConfig(enabled: true, botToken: "telegram-token"))
         let payloads = adapter.debugBuildSendPayloads(
@@ -2364,6 +2415,71 @@ public class TelegramAdapterTest {
         @Expect(first.get("kind").getOrThrow().asString().getValue(), "edit")
         @Expect(first.get("message_id").getOrThrow().asString().getValue(), "77")
         @Expect(first.get("text").getOrThrow().asString().getValue(), "Hello &lt;b&gt;world&lt;/b&gt;")
+    }
+
+    @TestCase
+    public func sendPayloadsRenderNativeTelegramPinAndUnpinPayloads(): Unit {
+        let adapter = TelegramAdapter(config: TelegramConfig(enabled: true, botToken: "telegram-token"))
+        let pinPayloads = adapter.debugBuildSendPayloads(
+            OutboundMessage(
+                ChannelType.Telegram,
+                "group:-1001234567890",
+                "[pin]",
+                replyToMessageId: Some("88")
+            )
+        )
+        @Expect(pinPayloads.size(), 1)
+        let pin = pinPayloads[0].asObject()
+        @Expect(pin.get("kind").getOrThrow().asString().getValue(), "pin")
+        @Expect(pin.get("message_id").getOrThrow().asString().getValue(), "88")
+        @Expect(pin.get("disable_notification").getOrThrow().asBool().getValue(), true)
+
+        let unpinPayloads = adapter.debugBuildSendPayloads(
+            OutboundMessage(
+                ChannelType.Telegram,
+                "group:-1001234567890",
+                "[unpin]",
+                replyToMessageId: Some("88")
+            )
+        )
+        @Expect(unpinPayloads.size(), 1)
+        let unpin = unpinPayloads[0].asObject()
+        @Expect(unpin.get("kind").getOrThrow().asString().getValue(), "unpin")
+        @Expect(unpin.get("message_id").getOrThrow().asString().getValue(), "88")
+    }
+
+    @TestCase
+    public func sendPinAndUnpinUseNativeTelegramBotApi(): Unit {
+        let fake = TelegramFakeBotApi()
+        setTelegramTransportRunnerForTest(Some({ request => fake.handle(request) }))
+        try {
+            let adapter = TelegramAdapter(
+                config: TelegramConfig(
+                    enabled: true,
+                    botToken: "telegram-token",
+                    actions: TelegramActionConfig(pinMessage: true, unpinMessage: true)
+                )
+            )
+            adapter.start()
+            let pinResult = adapter.send(
+                OutboundMessage(ChannelType.Telegram, "user:8734062810", "[pin]", replyToMessageId: Some("88"))
+            )
+            let unpinResult = adapter.send(
+                OutboundMessage(ChannelType.Telegram, "user:8734062810", "[unpin]", replyToMessageId: Some("88"))
+            )
+            match (pinResult) {
+                case SendResult.Success => ()
+                case SendResult.Failed(reason) => @Expect(reason, "")
+            }
+            match (unpinResult) {
+                case SendResult.Success => ()
+                case SendResult.Failed(reason) => @Expect(reason, "")
+            }
+            @Expect(fake.saw("pinChatMessage"), true)
+            @Expect(fake.saw("unpinChatMessage"), true)
+        } finally {
+            setTelegramTransportRunnerForTest(None)
+        }
     }
 
     @TestCase

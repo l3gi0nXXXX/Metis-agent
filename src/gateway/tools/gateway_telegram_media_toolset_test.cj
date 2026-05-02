@@ -59,6 +59,13 @@ public class GatewayTelegramMediaToolsetTest {
         record.put("fileName", JsonString(fileName))
         record.put("localPath", JsonString(localPath))
         record.put("downloaded", JsonBool(true))
+        if (mediaKind == "sticker") {
+            record.put("fileId", JsonString("sticker-file-id"))
+            record.put("fileUniqueId", JsonString("sticker-unique-id"))
+            record.put("emoji", JsonString("🙂"))
+            record.put("setName", JsonString("MetisStickers"))
+            record.put("description", JsonString("friendly metis sticker"))
+        }
         records.add(record)
         media.put("records", records)
         media
@@ -251,6 +258,48 @@ public class GatewayTelegramMediaToolsetTest {
         } finally {
             try { remove(root, recursive: true) } catch (_e: Exception) { () }
         }
+    }
+
+    @TestCase
+    public func telegramStickerSearchReadsCurrentContext(): Unit {
+        let toolset = GatewayTelegramMediaToolset()
+        let context = this.mediaContext("/tmp/metis-media/sticker.webp", mediaKind: "sticker", mimeType: "image/webp", fileName: "sticker.webp")
+        let out = gatewayWithToolRuntimeContext(
+            GatewayToolRuntimeContext("telegram", channelName: "telegram", sessionKey: "telegram:chat:1", mediaContext: context),
+            { => toolset.debugTelegramStickerSearchForTest("friendly", Some(5)) }
+        )
+        let json = JsonValue.fromStr(out).asObject()
+        @Expect(json.get("count").getOrThrow().asInt().getValue(), 1)
+        let first = json.get("stickers").getOrThrow().asArray()[0].asObject()
+        @Expect(first.get("setName").getOrThrow().asString().getValue(), "MetisStickers")
+    }
+
+    @TestCase
+    public func telegramStickerGetReadsCurrentContextByFileUniqueId(): Unit {
+        let toolset = GatewayTelegramMediaToolset()
+        let context = this.mediaContext("/tmp/metis-media/sticker.webp", mediaKind: "sticker", mimeType: "image/webp", fileName: "sticker.webp")
+        let out = gatewayWithToolRuntimeContext(
+            GatewayToolRuntimeContext("telegram", channelName: "telegram", sessionKey: "telegram:chat:1", mediaContext: context),
+            { => toolset.debugTelegramStickerGetForTest(None<String>, Some("sticker-unique-id"), None<String>) }
+        )
+        let json = JsonValue.fromStr(out).asObject()
+        @Expect(json.get("status").getOrThrow().asString().getValue(), "ok")
+        let sticker = json.get("sticker").getOrThrow().asObject()
+        @Expect(sticker.get("fileId").getOrThrow().asString().getValue(), "sticker-file-id")
+        @Expect(sticker.get("description").getOrThrow().asString().getValue(), "friendly metis sticker")
+    }
+
+    @TestCase
+    public func telegramStickerCacheStatsCountsCurrentContext(): Unit {
+        let toolset = GatewayTelegramMediaToolset()
+        let context = this.mediaContext("/tmp/metis-media/sticker.webp", mediaKind: "sticker", mimeType: "image/webp", fileName: "sticker.webp")
+        let out = gatewayWithToolRuntimeContext(
+            GatewayToolRuntimeContext("telegram", channelName: "telegram", sessionKey: "telegram:chat:1", mediaContext: context),
+            { => toolset.debugTelegramStickerCacheStatsForTest() }
+        )
+        let json = JsonValue.fromStr(out).asObject()
+        @Expect(json.get("stickerCount").getOrThrow().asInt().getValue(), 1)
+        @Expect(json.get("describedCount").getOrThrow().asInt().getValue(), 1)
     }
 
     @TestCase
