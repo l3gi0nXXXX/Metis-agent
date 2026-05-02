@@ -1,11 +1,48 @@
 package metis.gateway.tools
 
 import metis.core.{GatewayToolRuntimeContext, gatewayWithToolRuntimeContext}
+import magic.core.message.Message
+import magic.core.model.{AsyncChatResponse, ChatModel, ChatRequest, ChatResponse}
+import magic.model.ModelManager
 
 import std.fs.{Directory, File, Path, exists, remove}
 import std.time.DateTime
 import std.unittest.testmacro.*
 import stdx.encoding.json.{JsonArray, JsonBool, JsonObject, JsonString, JsonValue}
+
+private class TelegramMediaToolsetVisionFakeModel <: ChatModel {
+    private var _maxTokens: Option<Int64> = None
+
+    public prop provider: String {
+        get() { "fake" }
+    }
+
+    public prop name: String {
+        get() { "telegram-vision" }
+    }
+
+    public prop contextLength: Int64 {
+        get() { 8192 }
+    }
+
+    public mut prop maxTokens: Option<Int64> {
+        get() { this._maxTokens }
+        set(v) { this._maxTokens = v }
+    }
+
+    public func create(request: ChatRequest): ChatResponse {
+        let first = request.messageList[0]
+        let prefix = match (first.image) {
+            case Some(v) => if (v.startsWith("data:image/jpeg;base64,")) { "image-ok" } else { "image-bad" }
+            case None => "image-missing"
+        }
+        ChatResponse(this.fullName, Message.assistant("${prefix}: a red square"))
+    }
+
+    public func asyncCreate(request: ChatRequest): AsyncChatResponse {
+        throw Exception("async not used in telegram media toolset tests")
+    }
+}
 
 @Test
 public class GatewayTelegramMediaToolsetTest {
@@ -162,6 +199,31 @@ public class GatewayTelegramMediaToolsetTest {
             @Expect(json.get("status").getOrThrow().asString().getValue(), "ok")
             @Expect(json.get("analysis").getOrThrow().asString().getValue(), "a red square")
         } finally {
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func telegramImageAnalyzeUsesConfiguredVisionModelWhenNoSidecarExists(): Unit {
+        let root = Path("/tmp/metis-telegram-image-model-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
+        Directory.create(root, recursive: true)
+        let source = root.join("image.jpg")
+        File.writeTo(source, "fake".toArray())
+        let modelName = "metis-test-telegram-vision-${DateTime.now().toUnixTimeStamp().toMilliseconds()}"
+        ModelManager.registerChatModel(modelName, { => TelegramMediaToolsetVisionFakeModel() })
+        setGatewayTelegramMediaVisionCandidatesForTest(Some([modelName]))
+        try {
+            let toolset = GatewayTelegramMediaToolset()
+            let out = gatewayWithToolRuntimeContext(
+                GatewayToolRuntimeContext("telegram", channelName: "telegram", sessionKey: "telegram:chat:1", mediaContext: this.mediaContext(source.toString())),
+                { => toolset.debugTelegramImageAnalyzeForTest(None<String>, None<Int64>, Some("describe this image")) }
+            )
+            let json = JsonValue.fromStr(out).asObject()
+            @Expect(json.get("status").getOrThrow().asString().getValue(), "ok")
+            @Expect(json.get("analysis").getOrThrow().asString().getValue().contains("image-ok"), true)
+            @Expect(json.get("model").getOrThrow().asString().getValue(), "fake:telegram-vision")
+        } finally {
+            setGatewayTelegramMediaVisionCandidatesForTest(None<Array<String>>)
             try { remove(root, recursive: true) } catch (_e: Exception) { () }
         }
     }

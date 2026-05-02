@@ -373,7 +373,15 @@ public class TelegramAdapter <: ChannelAdapter {
     }
 
     public func sendWithMessageId(message: OutboundMessage): String {
-        if (!this.running) {
+        this.sendWithMessageIdImpl(message, requireRunning: true)
+    }
+
+    public func sendDirectWithMessageIdForGatewayRpc(message: OutboundMessage): String {
+        this.sendWithMessageIdImpl(message, requireRunning: false)
+    }
+
+    private func sendWithMessageIdImpl(message: OutboundMessage, requireRunning!: Bool): String {
+        if (requireRunning && !this.running) {
             this.lastSendError = "telegram adapter is not running"
             return ""
         }
@@ -432,6 +440,10 @@ public class TelegramAdapter <: ChannelAdapter {
             }
             if (this.payloadIsPhoto(payload) && !this.config.actions.photo) {
                 this.lastSendError = "telegram photo action is disabled"
+                return ""
+            }
+            if (this.payloadIsAnimation(payload) && !this.config.actions.photo) {
+                this.lastSendError = "telegram animation action requires photo action"
                 return ""
             }
             if (this.payloadIsDocument(payload) && !this.config.actions.document) {
@@ -1736,6 +1748,7 @@ public class TelegramAdapter <: ChannelAdapter {
                 return ""
         }
         if (let Some(messageId) <- this.parseTelegramPayloadSuccess(kind, responseRaw)) {
+            this.sendTelegramPayloadFollowUpText(payload)
             return messageId
         }
         if (this.shouldRetryWithoutTelegramThread(payload)) {
@@ -1747,6 +1760,7 @@ public class TelegramAdapter <: ChannelAdapter {
             match (retryResponseOpt) {
                 case Some(retryRaw) =>
                     if (let Some(messageId) <- this.parseTelegramPayloadSuccess(kind, retryRaw)) {
+                        this.sendTelegramPayloadFollowUpText(threadlessPayload)
                         return messageId
                     }
                 case None => this.setLastSendError("empty http response")
@@ -1775,7 +1789,44 @@ public class TelegramAdapter <: ChannelAdapter {
                 this.setLastSendError("empty http response")
                 return ""
         }
-        this.parseTelegramPayloadSuccess(kind, plainResponseRaw) ?? ""
+        let plainMessageId = this.parseTelegramPayloadSuccess(kind, plainResponseRaw) ?? ""
+        if (!plainMessageId.isEmpty()) {
+            this.sendTelegramPayloadFollowUpText(plainPayload)
+        }
+        plainMessageId
+    }
+
+    private func sendTelegramPayloadFollowUpText(payload: HashMap<String, JsonValue>): Unit {
+        let text = match (payload.get("follow_up_text")) {
+            case Some(v) => try { v.asString().getValue().trimAscii() } catch (_e: Exception) { "" }
+            case None => ""
+        }
+        if (text.isEmpty()) {
+            return
+        }
+        let body = JsonObject()
+        body.put("chat_id", payload.get("chat_id") ?? JsonString(""))
+        body.put("text", JsonString(this.telegramEscapeHtml(text)))
+        body.put("plain_text", JsonString(text))
+        body.put("parse_mode", JsonString("HTML"))
+        body.put("disable_web_page_preview", (!this.config.linkPreview).toJsonValue())
+        match (payload.get("message_thread_id")) {
+            case Some(v) => body.put("message_thread_id", v)
+            case None => ()
+        }
+        match (payload.get("reply_to_message_id")) {
+            case Some(v) => body.put("reply_to_message_id", v)
+            case None => ()
+        }
+        let url = this.normalizeApiRoot() + "/bot${this.effectiveBotToken()}/sendMessage"
+        let previousError = this.lastSendError
+        match (this.telegramJsonPost(url, body, context: "send:follow-up")) {
+            case Some(raw) =>
+                if (this.parseTelegramPayloadSuccess("text", raw).isNone()) {
+                    this.lastSendError = previousError
+                }
+            case None => this.lastSendError = previousError
+        }
     }
 
     private func shouldRetryWithoutTelegramThread(payload: HashMap<String, JsonValue>): Bool {
@@ -1846,7 +1897,7 @@ public class TelegramAdapter <: ChannelAdapter {
     private func telegramApiBodyForPayload(payload: HashMap<String, JsonValue>, plainFallback!: Bool): JsonObject {
         let out = JsonObject()
         for ((key, value) in payload) {
-            if (key == "kind" || key == "peer" || key == "plain_text" || key == "plain_caption") {
+            if (key == "kind" || key == "peer" || key == "plain_text" || key == "plain_caption" || key == "follow_up_text") {
                 continue
             }
             if (plainFallback && key == "text") {
@@ -1893,13 +1944,14 @@ public class TelegramAdapter <: ChannelAdapter {
         if (kind == "video") { return "video" }
         if (kind == "video-note") { return "video_note" }
         if (kind == "sticker") { return "sticker" }
+        if (kind == "animation") { return "animation" }
         ""
     }
 
     private func telegramMultipartFieldsForPayload(payload: HashMap<String, JsonValue>, fileField: String): HashMap<String, String> {
         let out = HashMap<String, String>()
         for ((key, value) in payload) {
-            if (key == "kind" || key == "peer" || key == "plain_text" || key == "plain_caption" || key == fileField) {
+            if (key == "kind" || key == "peer" || key == "plain_text" || key == "plain_caption" || key == "follow_up_text" || key == fileField) {
                 continue
             }
             out[key] = this.telegramMultipartFieldValue(value)
@@ -3307,21 +3359,46 @@ public class TelegramAdapter <: ChannelAdapter {
         body
     }
 
+    private func telegramApplyMediaCaption(body: HashMap<String, JsonValue>, caption: String): Unit {
+        let plain = caption.trimAscii()
+        if (plain.isEmpty()) {
+            return
+        }
+        let escaped = this.telegramEscapeHtml(plain)
+        if (escaped.size <= 1024) {
+            body["caption"] = JsonString(escaped)
+            body["plain_caption"] = JsonString(plain)
+            body["parse_mode"] = JsonString("HTML")
+        } else {
+            body["follow_up_text"] = JsonString(plain)
+        }
+    }
+
+    private func telegramRefLooksLikeGif(ref: String): Bool {
+        let normalized = ref.trimAscii().toAsciiLower()
+        normalized.endsWith(".gif") || normalized.contains(".gif?")
+    }
+
+    private func telegramRefLooksVoiceCompatible(ref: String): Bool {
+        let normalized = ref.trimAscii().toAsciiLower()
+        if (normalized.startsWith("http://") || normalized.startsWith("https://")) {
+            return true
+        }
+        normalized.endsWith(".ogg") || normalized.endsWith(".oga") || normalized.endsWith(".opus")
+    }
+
     private func buildPhotoPayload(message: OutboundMessage, fileId: String, caption: String): HashMap<String, JsonValue> {
         let normalizedPeer = message.peerId.trimAscii()
         let chatId = this.normalizePeerId(normalizedPeer)
         let threadId = this.extractThreadId(normalizedPeer)
         let replyInThread = this.effectiveReplyInThread(message.replyInThread)
         let body = HashMap<String, JsonValue>()
-        body["kind"] = JsonString("photo")
+        let asAnimation = this.telegramRefLooksLikeGif(fileId)
+        body["kind"] = JsonString(if (asAnimation) { "animation" } else { "photo" })
         body["peer"] = JsonString(normalizedPeer)
         body["chat_id"] = JsonString(chatId)
-        body["photo"] = JsonString(fileId)
-        if (!caption.trimAscii().isEmpty()) {
-            body["caption"] = JsonString(this.telegramEscapeHtml(caption))
-            body["plain_caption"] = JsonString(caption)
-            body["parse_mode"] = JsonString("HTML")
-        }
+        body[if (asAnimation) { "animation" } else { "photo" }] = JsonString(fileId)
+        this.telegramApplyMediaCaption(body, caption)
         this.applyTelegramSilentOption(body)
         if (!threadId.isEmpty() && replyInThread) {
             body["message_thread_id"] = JsonString(threadId)
@@ -3344,11 +3421,7 @@ public class TelegramAdapter <: ChannelAdapter {
         body["peer"] = JsonString(normalizedPeer)
         body["chat_id"] = JsonString(chatId)
         body["document"] = JsonString(fileId)
-        if (!caption.trimAscii().isEmpty()) {
-            body["caption"] = JsonString(this.telegramEscapeHtml(caption))
-            body["plain_caption"] = JsonString(caption)
-            body["parse_mode"] = JsonString("HTML")
-        }
+        this.telegramApplyMediaCaption(body, caption)
         this.applyTelegramSilentOption(body)
         if (!threadId.isEmpty() && replyInThread) {
             body["message_thread_id"] = JsonString(threadId)
@@ -3371,11 +3444,7 @@ public class TelegramAdapter <: ChannelAdapter {
         body["peer"] = JsonString(normalizedPeer)
         body["chat_id"] = JsonString(chatId)
         body["audio"] = JsonString(fileId)
-        if (!caption.trimAscii().isEmpty()) {
-            body["caption"] = JsonString(this.telegramEscapeHtml(caption))
-            body["plain_caption"] = JsonString(caption)
-            body["parse_mode"] = JsonString("HTML")
-        }
+        this.telegramApplyMediaCaption(body, caption)
         this.applyTelegramSilentOption(body)
         if (!threadId.isEmpty() && replyInThread) {
             body["message_thread_id"] = JsonString(threadId)
@@ -3394,15 +3463,12 @@ public class TelegramAdapter <: ChannelAdapter {
         let threadId = this.extractThreadId(normalizedPeer)
         let replyInThread = this.effectiveReplyInThread(message.replyInThread)
         let body = HashMap<String, JsonValue>()
-        body["kind"] = JsonString("voice")
+        let asAudio = this.looksLikeLocalMediaPath(fileId) && !this.telegramRefLooksVoiceCompatible(fileId)
+        body["kind"] = JsonString(if (asAudio) { "audio" } else { "voice" })
         body["peer"] = JsonString(normalizedPeer)
         body["chat_id"] = JsonString(chatId)
-        body["voice"] = JsonString(fileId)
-        if (!caption.trimAscii().isEmpty()) {
-            body["caption"] = JsonString(this.telegramEscapeHtml(caption))
-            body["plain_caption"] = JsonString(caption)
-            body["parse_mode"] = JsonString("HTML")
-        }
+        body[if (asAudio) { "audio" } else { "voice" }] = JsonString(fileId)
+        this.telegramApplyMediaCaption(body, caption)
         this.applyTelegramSilentOption(body)
         if (!threadId.isEmpty() && replyInThread) {
             body["message_thread_id"] = JsonString(threadId)
@@ -3425,11 +3491,7 @@ public class TelegramAdapter <: ChannelAdapter {
         body["peer"] = JsonString(normalizedPeer)
         body["chat_id"] = JsonString(chatId)
         body["video"] = JsonString(fileId)
-        if (!caption.trimAscii().isEmpty()) {
-            body["caption"] = JsonString(this.telegramEscapeHtml(caption))
-            body["plain_caption"] = JsonString(caption)
-            body["parse_mode"] = JsonString("HTML")
-        }
+        this.telegramApplyMediaCaption(body, caption)
         this.applyTelegramSilentOption(body)
         if (!threadId.isEmpty() && replyInThread) {
             body["message_thread_id"] = JsonString(threadId)
@@ -3656,6 +3718,13 @@ public class TelegramAdapter <: ChannelAdapter {
         }
     }
 
+    private func payloadIsAnimation(payload: HashMap<String, JsonValue>): Bool {
+        match (payload.get("kind")) {
+            case Some(v) => try { v.asString().getValue().trimAscii().toAsciiLower() == "animation" } catch (_e: Exception) { false }
+            case None => false
+        }
+    }
+
     private func payloadIsDocument(payload: HashMap<String, JsonValue>): Bool {
         match (payload.get("kind")) {
             case Some(v) => try { v.asString().getValue().trimAscii().toAsciiLower() == "document" } catch (_e: Exception) { false }
@@ -3692,8 +3761,9 @@ public class TelegramAdapter <: ChannelAdapter {
     }
 
     private func payloadIsAnyMedia(payload: HashMap<String, JsonValue>): Bool {
-        this.payloadIsSticker(payload) ||
+            this.payloadIsSticker(payload) ||
             this.payloadIsPhoto(payload) ||
+            this.payloadIsAnimation(payload) ||
             this.payloadIsDocument(payload) ||
             this.payloadIsAudio(payload) ||
             this.payloadIsVoice(payload) ||
@@ -3742,6 +3812,9 @@ public class TelegramAdapter <: ChannelAdapter {
         }
         if (kind == "photo") {
             return "sendPhoto"
+        }
+        if (kind == "animation") {
+            return "sendAnimation"
         }
         if (kind == "document") {
             return "sendDocument"

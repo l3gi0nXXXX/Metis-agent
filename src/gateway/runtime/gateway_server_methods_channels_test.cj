@@ -3,6 +3,7 @@ package metis.gateway.runtime
 import magic.jsonable.*
 
 import metis.core.config.{CliConfig, GatewayUserSettings, TelegramCustomCommandUserSettings}
+import metis.gateway.channels.telegram.{setTelegramTransportRunnerForTest, TelegramTransportRequest, TelegramTransportResponse}
 import metis.gateway.core.{
     gatewayChannelManagerSummary,
     gatewayChannelRuntimeMarkFailure,
@@ -696,6 +697,38 @@ public class GatewayServerMethodsChannelsTest {
                 @Expect(channelsTestString(response, "channel"), "metis-fixture")
                 @Expect(channelsTestString(response, "channelId"), "metis-fixture")
             }
+        }
+    }
+
+    @TestCase
+    public func channelsSendUsesNativeTelegramAdapterForPhotoPayload(): Unit {
+        setTelegramTransportRunnerForTest(Some({ request: TelegramTransportRequest =>
+            if (request.context.startsWith("send:photo") && request.url.contains("/sendPhoto")) {
+                return TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":{\"message_id\":8801}}", outcome: "ok")
+            }
+            TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":true}", outcome: "ok")
+        }))
+        try {
+            var user = GatewayUserSettings()
+            user.telegram.enabled = true
+            user.telegram.botToken = "telegram-token"
+            user.telegram.actions.photo = true
+            let params = JsonObject()
+            params.put("channel", JsonString("telegram"))
+            params.put("to", JsonString("user:8734062810"))
+            params.put("message", JsonString("[photo]\nfileId=photo-file-id\ncaption=hello"))
+            let response = handleGatewayChannelsFamily(
+                "channels.send",
+                user,
+                request: Some(GatewayRpcRequest("channels.send", params: params, clientId: "telegram-native-send-photo"))
+            ).getOrThrow().result.asObject()
+
+            @Expect(channelsTestBool(response, "ok"), true)
+            @Expect(channelsTestString(response, "channelId"), "telegram")
+            @Expect(channelsTestString(response, "compatibilityMode"), "native-cangjie")
+            @Expect(channelsTestString(response, "messageId"), "8801")
+        } finally {
+            setTelegramTransportRunnerForTest(None)
         }
     }
 

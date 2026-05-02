@@ -126,6 +126,7 @@ private class TelegramFakeBotApi {
         if (url.contains("/editForumTopic")) { return "editForumTopic" }
         if (url.contains("/editMessageText")) { return "editMessageText" }
         if (url.contains("/sendPhoto")) { return "sendPhoto" }
+        if (url.contains("/sendAnimation")) { return "sendAnimation" }
         if (url.contains("/sendDocument")) { return "sendDocument" }
         if (url.contains("/sendAudio")) { return "sendAudio" }
         if (url.contains("/sendVoice")) { return "sendVoice" }
@@ -2529,6 +2530,88 @@ public class TelegramAdapterTest {
         @Expect(first.get("photo").getOrThrow().asString().getValue(), "photo-file-id")
         @Expect(first.get("caption").getOrThrow().asString().getValue(), "hello")
         @Expect(first.get("message_thread_id").getOrThrow().asString().getValue(), "42")
+    }
+
+    @TestCase
+    public func longTelegramMediaCaptionIsMovedToFollowUpText(): Unit {
+        var caption = ""
+        while (caption.size <= 1100) {
+            caption += "long-caption "
+        }
+        let adapter = TelegramAdapter(config: TelegramConfig(enabled: true, botToken: "telegram-token"))
+        let payloads = adapter.debugBuildSendPayloads(
+            OutboundMessage(
+                ChannelType.Telegram,
+                "user:8734062810",
+                "[photo]\nfileId=photo-file-id\ncaption=${caption}"
+            )
+        )
+        @Expect(payloads.size(), 1)
+        let first = payloads[0].asObject()
+        @Expect(first.get("caption").isNone(), true)
+        @Expect(first.get("follow_up_text").getOrThrow().asString().getValue(), caption.trimAscii())
+    }
+
+    @TestCase
+    public func localGifPhotoRoutesToTelegramAnimation(): Unit {
+        let root = Path("/tmp/metis-telegram-outbound-gif-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
+        Directory.create(root, recursive: true)
+        let gifPath = root.join("motion.gif")
+        File.writeTo(gifPath, "GIF89a".toArray())
+        let fake = TelegramFakeBotApi()
+        setTelegramTransportRunnerForTest(Some({ request => fake.handle(request) }))
+        try {
+            let adapter = TelegramAdapter(
+                config: TelegramConfig(
+                    enabled: true,
+                    botToken: "telegram-token",
+                    actions: TelegramActionConfig(photo: true),
+                    media: TelegramMediaConfig(outboundAllowLocalPath: true, outboundLocalRoots: [root.toString()])
+                )
+            )
+            adapter.start()
+            let result = adapter.send(OutboundMessage(ChannelType.Telegram, "user:8734062810", "[photo]\nfileId=${gifPath.toString()}\ncaption=gif"))
+            match (result) {
+                case SendResult.Success => ()
+                case SendResult.Failed(reason) => @Expect(reason, "")
+            }
+            @Expect(fake.saw("sendAnimation"), true)
+            @Expect(fake.sawBodyContaining("name=\"animation\"; filename=\"motion.gif\""), true)
+        } finally {
+            setTelegramTransportRunnerForTest(None)
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func localNonOggVoiceRoutesToTelegramAudio(): Unit {
+        let root = Path("/tmp/metis-telegram-outbound-voice-fallback-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
+        Directory.create(root, recursive: true)
+        let mp3Path = root.join("memo.mp3")
+        File.writeTo(mp3Path, "fake-mp3".toArray())
+        let fake = TelegramFakeBotApi()
+        setTelegramTransportRunnerForTest(Some({ request => fake.handle(request) }))
+        try {
+            let adapter = TelegramAdapter(
+                config: TelegramConfig(
+                    enabled: true,
+                    botToken: "telegram-token",
+                    actions: TelegramActionConfig(audio: true, voice: true),
+                    media: TelegramMediaConfig(outboundAllowLocalPath: true, outboundLocalRoots: [root.toString()])
+                )
+            )
+            adapter.start()
+            let result = adapter.send(OutboundMessage(ChannelType.Telegram, "user:8734062810", "[voice]\nfileId=${mp3Path.toString()}\ncaption=memo"))
+            match (result) {
+                case SendResult.Success => ()
+                case SendResult.Failed(reason) => @Expect(reason, "")
+            }
+            @Expect(fake.saw("sendAudio"), true)
+            @Expect(fake.sawBodyContaining("name=\"audio\"; filename=\"memo.mp3\""), true)
+        } finally {
+            setTelegramTransportRunnerForTest(None)
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
     }
 
     @TestCase

@@ -120,6 +120,12 @@ public func gatewayBuildMediaContextPrompt(mediaContext: JsonObject): String {
             row.add("AudioTranscript=${transcript}")
         } else if ((kind == "voice" || kind == "audio") && downloaded) {
             row.add("ASRStatus=not_configured")
+            row.add("ASRAction=use telegram_audio_transcribe")
+        }
+        if ((kind == "photo" || kind == "image" || kind == "sticker" || mime.startsWith("image/")) && downloaded) {
+            row.add("visionInputReady=true")
+            row.add("visionRuntimeAvailable=unknown")
+            row.add("visionAction=use telegram_image_analyze")
         }
         if (!filePreview.isEmpty()) {
             row.add("FileContentPreview=${filePreview}")

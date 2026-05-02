@@ -4,6 +4,7 @@ import magic.jsonable.*
 
 import metis.core.config.{CliConfig, CliSettingManager, GatewayPluginUserSettings, GatewayUserSettings}
 import metis.gateway.channels.telegram.{TelegramAdapter, telegramPairingAccountStore}
+import metis.gateway.model.{ChannelType, OutboundMessage}
 import metis.gateway.core.{
     gatewayChannelRuntimeMarkFailure,
     gatewayChannelRuntimeMarkRunning,
@@ -1024,6 +1025,12 @@ private func gatewayChannelActionByPlugin(
     action: String
 ): JsonObject {
     let channelId = gatewayRpcStringParam(request, ["id", "channel", "channelId"], "")
+    if (action == "send") {
+        match (gatewayChannelActionByNativeAdapter(user, request, channelId)) {
+            case Some(nativeResult) => return nativeResult
+            case None => ()
+        }
+    }
     let pluginId = gatewayHostCompatiblePluginForChannel(channelId)
     let result = JsonObject()
     result.put("channelId", JsonString(normalizeGatewayChannelId(channelId)))
@@ -1054,6 +1061,65 @@ private func gatewayChannelActionByPlugin(
     result.put("action", JsonString(action))
     result.put("result", actionResult)
     result
+}
+
+private func gatewayChannelActionByNativeAdapter(
+    user: GatewayUserSettings,
+    request: GatewayRpcRequest,
+    channelId: String
+): Option<JsonObject> {
+    let normalized = normalizeGatewayChannelId(channelId)
+    if (normalized != "telegram") {
+        return None<JsonObject>
+    }
+    let cfg = buildGatewayConfigFromUserSettings(user)
+    let accountId = gatewayRpcStringParam(request, ["accountId"], cfg.telegram.accountId)
+    let peerId = gatewayRpcStringParam(request, ["peerId", "to", "target"], "")
+    let text = gatewayRpcStringParam(request, ["text", "message", "body"], "")
+    let replyTo = gatewayRpcStringParam(request, ["replyToMessageId", "replyTo"], "")
+    let replyInThread = gatewayRpcBoolParam(request, ["replyInThread"], false)
+    let result = JsonObject()
+    result.put("channelId", JsonString(normalized))
+    result.put("channel", JsonString(normalized))
+    result.put("accountId", JsonString(accountId))
+    result.put("peerId", JsonString(peerId))
+    result.put("runtimeKind", JsonString("native-cangjie"))
+    result.put("compatibilityMode", JsonString("native-cangjie"))
+    if (peerId.isEmpty() || text.isEmpty()) {
+        result.put("ok", false.toJsonValue())
+        result.put("supported", true.toJsonValue())
+        result.put("reason", JsonString("missing-peer-or-message"))
+        return Some(result)
+    }
+    let adapter = TelegramAdapter(config: cfg.telegram)
+    let messageId = adapter.sendDirectWithMessageIdForGatewayRpc(
+        OutboundMessage(
+            ChannelType.Telegram,
+            peerId,
+            text,
+            replyToMessageId: if (replyTo.isEmpty()) { None<String> } else { Some(replyTo) },
+            replyInThread: replyInThread,
+            accountId: accountId
+        )
+    )
+    let lastError = adapter.debugLastSendErrorForTest()
+    let ok = !messageId.isEmpty()
+    let delivery = JsonObject()
+    delivery.put("deliverable", ok.toJsonValue())
+    delivery.put("channel", JsonString(normalized))
+    delivery.put("peerId", JsonString(peerId))
+    delivery.put("accountId", JsonString(accountId))
+    if (!messageId.isEmpty()) {
+        delivery.put("messageId", JsonString(messageId))
+        result.put("messageId", JsonString(messageId))
+    }
+    result.put("supported", true.toJsonValue())
+    result.put("ok", ok.toJsonValue())
+    result.put("delivery", delivery)
+    if (!ok) {
+        result.put("reason", JsonString(if (lastError.isEmpty()) { "native-send-failed" } else { lastError }))
+    }
+    Some(result)
 }
 
 private func gatewayBindingBool(obj: JsonObject, key: String): Bool {

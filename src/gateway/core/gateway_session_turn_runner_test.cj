@@ -89,6 +89,8 @@ public class GatewaySessionTurnRunnerTest {
         @Expect(prompt.contains("MediaType=photo"), true)
         @Expect(prompt.contains("MediaPaths=/tmp/metis-media/file_1.jpg"), true)
         @Expect(prompt.contains("MediaTypes=photo"), true)
+        @Expect(prompt.contains("visionInputReady=true"), true)
+        @Expect(prompt.contains("visionAction=use telegram_image_analyze"), true)
     }
 
     @TestCase

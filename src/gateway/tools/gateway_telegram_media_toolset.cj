@@ -1,17 +1,21 @@
 package metis.gateway.tools
 
 import magic.dsl.{tool, toolset}
+import magic.core.message.Message
+import magic.core.model.ChatRequest
+import magic.model.ModelManager
 import magic.prelude.*
 
 import metis.core.gatewayCurrentToolRuntimeContext
 import metis.core.{renderGatewayAudioText, renderGatewayDocumentText, renderGatewayPhotoText, renderGatewayVideoNoteText, renderGatewayVideoText, renderGatewayVoiceText}
-import metis.core.config.{CliConfig, MetisPaths}
+import metis.core.config.{CliConfig, CliSettingManager, MetisPaths}
 import metis.io.PrintUtils
 
 import std.collection.ArrayList
 import std.fs.{Directory, File, Path, copy, exists}
 import std.process.executeWithOutput
 import std.time.DateTime
+import stdx.encoding.base64.toBase64String
 import stdx.encoding.json.{JsonArray, JsonBool, JsonObject, JsonString, JsonValue}
 
 private func telegramMediaToolString(obj: JsonObject, key: String): String {
@@ -211,6 +215,149 @@ private func telegramMediaToolImageAnalysis(record: JsonObject): String {
         }
     }
     ""
+}
+
+private func telegramMediaToolProviderFromModelRef(modelRef: String): String {
+    let normalized = modelRef.trimAscii()
+    if (normalized.contains(":")) {
+        return normalized.split(":", 2)[0].trimAscii().toAsciiLower()
+    }
+    ""
+}
+
+private func telegramMediaToolVisionProviderSupported(modelRef: String): Bool {
+    let provider = telegramMediaToolProviderFromModelRef(modelRef)
+    if (provider.isEmpty()) {
+        // Registered test/local models do not need a provider prefix.
+        return !modelRef.trimAscii().isEmpty()
+    }
+    provider == "openai" ||
+        provider == "dashscope" ||
+        provider == "ark" ||
+        provider == "deepseek" ||
+        provider == "siliconflow" ||
+        provider == "zhipuai" ||
+        provider == "maas" ||
+        provider == "google" ||
+        provider == "moonshot" ||
+        provider == "openrouter" ||
+        provider == "ollama"
+}
+
+private func telegramMediaToolAddVisionCandidate(out: ArrayList<String>, seen: ArrayList<String>, raw: String): Unit {
+    let modelRef = raw.trimAscii()
+    if (modelRef.isEmpty() || seen.contains(modelRef)) {
+        return
+    }
+    seen.add(modelRef)
+    out.add(modelRef)
+}
+
+private var telegramMediaToolVisionCandidatesOverride: Option<Array<String>> = None<Array<String>>
+
+public func setGatewayTelegramMediaVisionCandidatesForTest(candidates: Option<Array<String>>): Unit {
+    telegramMediaToolVisionCandidatesOverride = candidates
+}
+
+private func telegramMediaToolVisionCandidates(): Array<String> {
+    match (telegramMediaToolVisionCandidatesOverride) {
+        case Some(candidates) => return candidates
+        case None => ()
+    }
+    let out = ArrayList<String>()
+    let seen = ArrayList<String>()
+    let settings = CliSettingManager.readGatewaySettings()
+    telegramMediaToolAddVisionCandidate(out, seen, settings.channelModels.get("telegram") ?? "")
+    telegramMediaToolAddVisionCandidate(out, seen, CliConfig.modelOrEmpty())
+    for (modelRef in CliConfig.fallbackModels) {
+        telegramMediaToolAddVisionCandidate(out, seen, modelRef)
+    }
+    out.toArray()
+}
+
+private func telegramMediaToolDataUrlMime(record: JsonObject): String {
+    let mime = telegramMediaToolString(record, "mimeType").trimAscii().toAsciiLower()
+    if (mime.startsWith("image/")) {
+        return mime
+    }
+    let name = telegramMediaToolString(record, "fileName").toAsciiLower()
+    if (name.endsWith(".png")) { return "image/png" }
+    if (name.endsWith(".gif")) { return "image/gif" }
+    if (name.endsWith(".webp")) { return "image/webp" }
+    "image/jpeg"
+}
+
+private func telegramMediaToolDescribeImageWithModel(record: JsonObject, userPrompt: String): JsonObject {
+    let out = JsonObject()
+    out.put("mediaId", JsonString(telegramMediaToolString(record, "mediaId")))
+    let sourcePath = telegramMediaToolString(record, "localPath")
+    if (sourcePath.isEmpty() || !exists(Path(sourcePath))) {
+        out.put("ok", JsonBool(false))
+        out.put("status", JsonString("unsupported"))
+        out.put("error", JsonString("image localPath is missing or not downloaded"))
+        return out
+    }
+    let bytes = File.readFrom(Path(sourcePath))
+    let limit = CliSettingManager.readGatewaySettings().telegram.media.mediaMaxBytes
+    if (limit > 0 && Int64(bytes.size) > limit) {
+        out.put("ok", JsonBool(false))
+        out.put("status", JsonString("unsupported"))
+        out.put("error", JsonString("image exceeds configured Telegram mediaMaxBytes"))
+        out.put("fileBytes", Int64(bytes.size).toJsonValue())
+        out.put("limitBytes", limit.toJsonValue())
+        return out
+    }
+    let candidates = telegramMediaToolVisionCandidates()
+    if (candidates.isEmpty()) {
+        out.put("ok", JsonBool(false))
+        out.put("status", JsonString("unsupported"))
+        out.put("error", JsonString("no model is configured for Telegram image understanding"))
+        return out
+    }
+    let errors = JsonArray([])
+    let prompt = if (userPrompt.trimAscii().isEmpty()) {
+        "Describe this Telegram image clearly and concisely for the current user request."
+    } else {
+        userPrompt.trimAscii()
+    }
+    let dataUrl = "data:${telegramMediaToolDataUrlMime(record)};base64,${toBase64String(bytes)}"
+    for (modelRef in candidates) {
+        if (!telegramMediaToolVisionProviderSupported(modelRef)) {
+            let skipped = JsonObject()
+            skipped.put("model", JsonString(modelRef))
+            skipped.put("status", JsonString("unsupported_provider"))
+            errors.add(skipped)
+            continue
+        }
+        try {
+            let model = ModelManager.createChatModel(modelRef)
+            let response = model.create(ChatRequest(Message.user(prompt, image: Some(dataUrl)), temperature: Some(0.0), maxTokens: Some(1024)))
+            let content = response.message.content.trimAscii()
+            if (!content.isEmpty()) {
+                out.put("ok", JsonBool(true))
+                out.put("status", JsonString("ok"))
+                out.put("analysis", JsonString(content))
+                out.put("provider", JsonString(model.provider))
+                out.put("model", JsonString(model.fullName))
+                return out
+            }
+            let empty = JsonObject()
+            empty.put("model", JsonString(modelRef))
+            empty.put("status", JsonString("empty_response"))
+            errors.add(empty)
+        } catch (e: Exception) {
+            let err = JsonObject()
+            err.put("model", JsonString(modelRef))
+            err.put("status", JsonString("provider_error"))
+            err.put("error", JsonString(e.message))
+            errors.add(err)
+        }
+    }
+    out.put("ok", JsonBool(false))
+    out.put("status", JsonString("unsupported"))
+    out.put("error", JsonString("no configured vision-capable model could analyze this Telegram image"))
+    out.put("attempts", errors)
+    out
 }
 
 private func telegramMediaToolGatewayBinaryCommand(): (String, Option<Path>) {
@@ -510,21 +657,27 @@ public class GatewayTelegramMediaToolset {
         }
         let analysis = telegramMediaToolImageAnalysis(record)
         out.put("mediaId", JsonString(telegramMediaToolString(record, "mediaId")))
-        match (prompt) {
-            case Some(v) =>
-                let p = v.trimAscii()
-                if (!p.isEmpty()) { out.put("prompt", JsonString(p)) }
-            case None => ()
+        let promptText = match (prompt) {
+            case Some(v) => v.trimAscii()
+            case None => ""
         }
-        if (analysis.isEmpty()) {
-            out.put("ok", JsonBool(false))
-            out.put("status", JsonString("unsupported"))
-            out.put("error", JsonString("vision adapter is not configured for this Telegram media resource"))
-            out.put("fallback", JsonString("Use localPath from telegram_media_get with a model/runtime that supports vision."))
-        } else {
+        if (!promptText.isEmpty()) { out.put("prompt", JsonString(promptText)) }
+        if (!analysis.isEmpty()) {
             out.put("ok", JsonBool(true))
             out.put("status", JsonString("ok"))
             out.put("analysis", JsonString(analysis))
+            out.put("source", JsonString("sidecar"))
+        } else {
+            let runtime = telegramMediaToolDescribeImageWithModel(record, promptText)
+            for (key in ["ok", "status", "analysis", "provider", "model", "error", "attempts", "fileBytes", "limitBytes"]) {
+                match (runtime.get(key)) {
+                    case Some(v) => out.put(key, v)
+                    case None => ()
+                }
+            }
+            if (!(try { runtime.get("ok").getOrThrow().asBool().getValue() } catch (_e: Exception) { false })) {
+                out.put("fallback", JsonString("Bind gateway.channelModels.telegram or the primary/fallback model to a vision-capable OpenAI-compatible or Ollama model."))
+            }
         }
         out.toJsonString()
     }
