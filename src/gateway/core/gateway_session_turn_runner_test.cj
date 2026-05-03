@@ -91,6 +91,8 @@ public class GatewaySessionTurnRunnerTest {
         @Expect(prompt.contains("MediaTypes=photo"), true)
         @Expect(prompt.contains("visionInputReady=true"), true)
         @Expect(prompt.contains("visionAction=use telegram_image_analyze"), true)
+        @Expect(prompt.contains("call telegram_image_analyze before answering"), true)
+        @Expect(prompt.contains("Do not claim that the image cannot be seen"), true)
     }
 
     @TestCase
@@ -112,6 +114,7 @@ public class GatewaySessionTurnRunnerTest {
             media.put("records", records)
             let prompt = gatewayBuildMediaContextPrompt(media)
             @Expect(prompt.contains("AudioTranscript=hello from voice"), true)
+            @Expect(prompt.contains("use AudioTranscript when present"), true)
         } finally {
             try { remove(root, recursive: true) } catch (_e: Exception) { () }
         }
@@ -139,6 +142,28 @@ public class GatewaySessionTurnRunnerTest {
         } finally {
             try { remove(root, recursive: true) } catch (_e: Exception) { () }
         }
+    }
+
+    @TestCase
+    public func mediaContextPromptIncludesStructuredTelegramContextWithoutMediaRecords(): Unit {
+        let media = JsonObject()
+        let context = JsonObject()
+        let location = JsonObject()
+        location.put("latitude", JsonString("31.23"))
+        location.put("longitude", JsonString("121.47"))
+        context.put("location", location)
+        let contact = JsonObject()
+        contact.put("firstName", JsonString("Ada"))
+        contact.put("phoneNumber", JsonString("123"))
+        context.put("contact", contact)
+        media.put("context", context)
+
+        let prompt = gatewayBuildMediaContextPrompt(media)
+        @Expect(prompt.contains("StructuredTelegramContext:"), true)
+        @Expect(prompt.contains("Location="), true)
+        @Expect(prompt.contains("31.23"), true)
+        @Expect(prompt.contains("Contact="), true)
+        @Expect(prompt.contains("Ada"), true)
     }
 
     @TestCase

@@ -353,6 +353,39 @@ private func gatewayTelegramBuildDiagnosticFindings(user: GatewayUserSettings, r
             "Set mediaMaxBytes to a bounded value."
         )
     }
+    if (user.telegram.webhookMaxBodyBytes <= 0) {
+        gatewayTelegramAddFinding(
+            findings,
+            "telegram-webhook-body-limit-missing",
+            "warning",
+            "failed",
+            "Telegram webhook body size limit is disabled.",
+            "gateway.telegram.webhookMaxBodyBytes must be positive for bounded webhook intake.",
+            "Set webhookMaxBodyBytes to a bounded value such as 1048576."
+        )
+    }
+    if (user.telegram.webhookRateLimitWindowMs <= 0 || user.telegram.webhookRateLimitMaxRequests <= 0) {
+        gatewayTelegramAddFinding(
+            findings,
+            "telegram-webhook-rate-limit-missing",
+            "warning",
+            "failed",
+            "Telegram webhook rate limit is disabled.",
+            "gateway.telegram.webhookRateLimitWindowMs and webhookRateLimitMaxRequests must both be positive.",
+            "Set webhookRateLimitWindowMs and webhookRateLimitMaxRequests to bounded values."
+        )
+    }
+    if (!user.telegram.webhookUrl.trimAscii().isEmpty() && user.telegram.webhookSecret.trimAscii().isEmpty()) {
+        gatewayTelegramAddFinding(
+            findings,
+            "telegram-webhook-secret-missing",
+            "warning",
+            "failed",
+            "Telegram webhook mode is enabled without a secret token.",
+            "gateway.telegram.webhookUrl is configured but webhookSecret is empty.",
+            "Set gateway.telegram.webhookSecret and keep it out of chat-visible outputs."
+        )
+    }
     if (user.telegram.media.outboundAllowLocalPath && user.telegram.media.outboundLocalRoots.isEmpty()) {
         gatewayTelegramAddFinding(
             findings,
@@ -432,6 +465,7 @@ public func gatewayTelegramDiagnosticsJson(user: GatewayUserSettings, runtime!: 
         "token",
         "getMe",
         "webhook",
+        "webhookGuard",
         "polling",
         "allowFrom",
         "groupAllowFrom",

@@ -336,6 +336,10 @@ public struct TelegramUserSettings {
     public var webhookPath: String = "/telegram-webhook"
     public var webhookHost: String = "127.0.0.1"
     public var webhookPort: Int64 = 8787
+    public var webhookMaxBodyBytes: Int64 = 1024 * 1024
+    public var webhookBodyTimeoutMs: Int64 = 30000
+    public var webhookRateLimitWindowMs: Int64 = 60000
+    public var webhookRateLimitMaxRequests: Int64 = 120
     public var apiRoot: String = "https://api.telegram.org"
     public var proxy: String = ""
     public var reactionNotifications: String = "off"

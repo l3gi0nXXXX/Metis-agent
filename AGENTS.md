@@ -211,3 +211,27 @@ For Telegram "no reply" reports, first check whether logs contain `Gateway.inbou
 If no inbound event exists, prioritize Telegram polling/transport/proxy/pairing diagnostics. If the
 inbound event exists but no answer is sent, then investigate gateway reply, session, model, and
 send-path behavior.
+
+## Telegram/OpenClaw gap analysis discipline
+
+For broad Telegram compatibility work against OpenClaw, do not claim that gaps are fully analyzed
+or fully closed from file names, method names, or isolated examples. First create or update a single
+source-backed capability matrix under `develop_steps`.
+
+Analysis results must be persisted. A chat response is not a substitute for the `develop_steps`
+artifact, even when the response contains a matrix. If the user asks for a gap comparison or says
+"do not change code, only analyze", write the analysis document first or update the existing
+Telegram gap document before giving the final summary.
+
+The matrix must enumerate every user-visible Telegram capability being compared and include:
+
+- OpenClaw source evidence with file paths and line references.
+- Metis source evidence with file paths and line references.
+- Status using only `aligned`, `partial`, `missing`, or `not-applicable`.
+- The exact functional gap, if any.
+- The implementation task needed to close the gap.
+- Concrete acceptance items and tests.
+
+Only after that matrix is complete should implementation begin. Do not repeatedly produce partial
+gap summaries or say "no remaining gap" unless every `partial` and `missing` row has been resolved
+or explicitly marked `not-applicable` with code-based justification.

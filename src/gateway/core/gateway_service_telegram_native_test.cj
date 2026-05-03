@@ -127,6 +127,32 @@ public class GatewayServiceTelegramNativeTest {
             @Expect(text.contains("[inline-keyboard]"), true)
             @Expect(text.contains("callback:models:set:"), true)
             @Expect(text.contains("Telegram model"), true)
+            @Expect(text.contains("Page:"), true)
+        }
+    }
+
+    @TestCase
+    public func modelsPageCallbackReturnsModelPageWithoutMutatingConfig(): Unit {
+        withGatewayTelegramNativeTestHome {
+            var user = GatewayUserSettings()
+            user.telegram.enabled = true
+            user.telegram.allowFrom = ["8734062810"]
+            user.telegram.actions.inlineKeyboard = true
+            user.telegram.actions.callbackQuery = true
+            CliSettingManager.writeGatewaySettings(user)
+
+            let adapter = GatewayTelegramNativeTestAdapter()
+            let service = gatewayTelegramNativeService(adapter)
+            service.start()
+            adapter.queue("[telegram-callback]\nid=cb-page\nmessageId=1\ndata=models:page:1\nby=8734062810")
+            service.processOnce()
+
+            let text = adapter.sentText(0)
+            @Expect(text.contains("[inline-keyboard]"), true)
+            @Expect(text.contains("callback:models:set:"), true)
+            @Expect(text.contains("Telegram model"), true)
+            let updated = CliSettingManager.readGatewaySettings()
+            @Expect(updated.channelModels.get("telegram") ?? "", "")
         }
     }
 

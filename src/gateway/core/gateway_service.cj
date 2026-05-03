@@ -5,6 +5,7 @@ import metis.gateway.model.*
 import metis.gateway.session.{GatewaySessionContext, gatewaySessionRequestFromInbound}
 import magic.log.LogUtils
 import std.collection.ArrayList
+import std.convert.Parsable
 import std.time.DateTime
 import stdx.encoding.json.JsonObject
 
@@ -186,7 +187,7 @@ public class GatewayService {
             this.sendTextToPeerDetailed(
                 "telegram",
                 message.peerId,
-                this.renderTelegramModelsEntry(user),
+                this.renderTelegramModelsEntry(user, page: this.telegramModelsPageFromCommand(text)),
                 replyToMessageId: message.replyTargetMessageId,
                 replyInThread: message.replyInThread,
                 accountId: accountId
@@ -207,36 +208,73 @@ public class GatewayService {
                 )
                 return true
             }
+            if (data.startsWith("models:page:")) {
+                let reply = this.renderTelegramModelsEntry(user, page: this.telegramModelsPageFromCallback(data))
+                this.sendTextToPeerDetailed(
+                    "telegram",
+                    message.peerId,
+                    reply,
+                    replyToMessageId: message.replyTargetMessageId,
+                    replyInThread: message.replyInThread,
+                    accountId: accountId
+                )
+                return true
+            }
         }
         false
     }
 
-    private func renderTelegramModelsEntry(user: GatewayUserSettings): String {
+    private func telegramModelsPageFromCommand(text: String): Int64 {
+        let parts = text.trimAscii().split(" ")
+        if (parts.size >= 2) {
+            try { return Int64.parse(parts[1].trimAscii()) } catch (_e: Exception) { return 0 }
+        }
+        0
+    }
+
+    private func telegramModelsPageFromCallback(data: String): Int64 {
+        try { Int64.parse(data["models:page:".size..].trimAscii()) } catch (_e: Exception) { 0 }
+    }
+
+    private func renderTelegramModelsEntry(user: GatewayUserSettings, page!: Int64 = 0): String {
         let current = user.channelModels.get("telegram") ?? ""
         let currentText = if (current.trimAscii().isEmpty()) { "global default" } else { current.trimAscii() }
+        let providers = cliSetupVisibleModelProviders()
+        let pageSize: Int64 = 8
+        let total = Int64(providers.size)
+        let totalPages = if (total <= 0) { 1 } else { (total + pageSize - 1) / pageSize }
+        var effectivePage = page
+        if (effectivePage < 0) { effectivePage = 0 }
+        if (effectivePage >= totalPages) { effectivePage = totalPages - 1 }
         if (!user.telegram.actions.inlineKeyboard || !user.telegram.actions.callbackQuery) {
             let lines = ArrayList<String>()
             lines.add("Telegram model")
             lines.add("Current: ${currentText}")
-            for (descriptor in cliSetupVisibleModelProviders()) {
-                if (descriptor.highPriority) {
-                    lines.add("- ${descriptor.displayName}: ${descriptor.defaultModelRef}")
-                }
+            lines.add("Page: ${effectivePage + 1}/${totalPages}")
+            let start = effectivePage * pageSize
+            let end = if (start + pageSize > total) { total } else { start + pageSize }
+            for (idx in start..end) {
+                let descriptor = providers[idx]
+                let mark = if (descriptor.defaultModelRef == current.trimAscii()) { " *current*" } else { "" }
+                lines.add("- ${descriptor.displayName}: ${descriptor.defaultModelRef}${mark}")
             }
             return String.join(lines.toArray(), delimiter: "\n")
         }
         let lines = ArrayList<String>()
         lines.add("[inline-keyboard]")
-        lines.add("text=Telegram model\nCurrent: ${currentText}\nSelect a model for the Telegram channel.")
-        var count = 0
-        for (descriptor in cliSetupVisibleModelProviders()) {
-            if (descriptor.highPriority || count < 8) {
-                lines.add("button=${descriptor.displayName}|callback:models:set:${descriptor.defaultModelRef}")
-                count += 1
-            }
-            if (count >= 10) {
-                break
-            }
+        lines.add("text=Telegram model\nCurrent: ${currentText}\nPage: ${effectivePage + 1}/${totalPages}\nSelect a model for the Telegram channel.")
+        let start = effectivePage * pageSize
+        let end = if (start + pageSize > total) { total } else { start + pageSize }
+        for (idx in start..end) {
+            let descriptor = providers[idx]
+            let mark = if (descriptor.defaultModelRef == current.trimAscii()) { " ✓" } else { "" }
+            lines.add("button=${descriptor.displayName}${mark}|callback:models:set:${descriptor.defaultModelRef}")
+        }
+        if (totalPages > 1) {
+            let prev = if (effectivePage <= 0) { totalPages - 1 } else { effectivePage - 1 }
+            let next = if (effectivePage + 1 >= totalPages) { 0 } else { effectivePage + 1 }
+            lines.add("button=Prev|callback:models:page:${prev}")
+            lines.add("button=Next|callback:models:page:${next}")
         }
         String.join(lines.toArray(), delimiter: "\n")
     }

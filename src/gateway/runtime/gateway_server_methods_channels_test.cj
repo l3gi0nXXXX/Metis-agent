@@ -413,6 +413,9 @@ public class GatewayServerMethodsChannelsTest {
         user.telegram.groupAllowFrom = ["*", "user:notnumeric"]
         user.telegram.media.allowedMimes = []
         user.telegram.media.mediaMaxBytes = 0
+        user.telegram.webhookUrl = "https://example.test/telegram-webhook"
+        user.telegram.webhookMaxBodyBytes = 0
+        user.telegram.webhookRateLimitWindowMs = 0
         user.telegram.media.outboundAllowLocalPath = true
         user.telegram.actions.deleteMessage = true
         user.telegram.network.dangerouslyAllowPrivateNetwork = true
@@ -449,6 +452,9 @@ public class GatewayServerMethodsChannelsTest {
         @Expect(findings.contains("telegram-groupallowfrom-wildcard"), true)
         @Expect(findings.contains("telegram-media-allowed-mimes-missing"), true)
         @Expect(findings.contains("telegram-media-size-limit-missing"), true)
+        @Expect(findings.contains("telegram-webhook-body-limit-missing"), true)
+        @Expect(findings.contains("telegram-webhook-rate-limit-missing"), true)
+        @Expect(findings.contains("telegram-webhook-secret-missing"), true)
         @Expect(findings.contains("telegram-media-local-roots-missing"), true)
         @Expect(findings.contains("telegram-high-risk-actions-enabled"), true)
         @Expect(findings.contains("telegram-curl-runtime-residual"), true)

@@ -45,6 +45,48 @@ private func gatewayMediaReadableTextMime(mime: String, fileName: String): Bool 
         normalizedName.endsWith(".py")
 }
 
+private func gatewayMediaContextStructuredSummary(mediaContext: JsonObject): String {
+    let ctx = match (mediaContext.get("context")) {
+        case Some(v) => try { v.asObject() } catch (_e: Exception) { JsonObject() }
+        case None => JsonObject()
+    }
+    if (ctx.size() == 0) {
+        return ""
+    }
+    let lines = ArrayList<String>()
+    match (ctx.get("replyTo")) {
+        case Some(v) =>
+            let obj = try { v.asObject() } catch (_e: Exception) { JsonObject() }
+            lines.add("ReplyTo=${obj.toJsonString()}")
+        case None => ()
+    }
+    match (ctx.get("forwarded")) {
+        case Some(v) =>
+            let obj = try { v.asObject() } catch (_e: Exception) { JsonObject() }
+            lines.add("Forwarded=${obj.toJsonString()}")
+        case None => ()
+    }
+    match (ctx.get("location")) {
+        case Some(v) =>
+            let obj = try { v.asObject() } catch (_e: Exception) { JsonObject() }
+            lines.add("Location=${obj.toJsonString()}")
+        case None => ()
+    }
+    match (ctx.get("venue")) {
+        case Some(v) =>
+            let obj = try { v.asObject() } catch (_e: Exception) { JsonObject() }
+            lines.add("Venue=${obj.toJsonString()}")
+        case None => ()
+    }
+    match (ctx.get("contact")) {
+        case Some(v) =>
+            let obj = try { v.asObject() } catch (_e: Exception) { JsonObject() }
+            lines.add("Contact=${obj.toJsonString()}")
+        case None => ()
+    }
+    String.join(lines.toArray(), delimiter: "\n")
+}
+
 private func gatewayMediaSafeTextPreview(pathText: String, maxBytes!: Int64 = 8192): String {
     let path = Path(pathText)
     if (pathText.trimAscii().isEmpty() || !exists(path)) {
@@ -73,7 +115,8 @@ private func gatewayMediaAudioTranscript(localPath: String): String {
 
 public func gatewayBuildMediaContextPrompt(mediaContext: JsonObject): String {
     let records = gatewayMediaRecords(mediaContext)
-    if (records.size() == 0) {
+    let structuredSummary = gatewayMediaContextStructuredSummary(mediaContext)
+    if (records.size() == 0 && structuredSummary.isEmpty()) {
         return ""
     }
     let lines = ArrayList<String>()
@@ -81,6 +124,12 @@ public func gatewayBuildMediaContextPrompt(mediaContext: JsonObject): String {
     let types = ArrayList<String>()
     lines.add("## Current Message Media")
     lines.add("The current inbound message has structured media resources from the gateway. Use these local paths when the user asks to save, inspect, transcribe, or reason about the attached media. Do not parse media out of the visible chat text.")
+    lines.add("For image/photo/sticker understanding requests, call telegram_image_analyze before answering. Do not claim that the image cannot be seen when downloaded=true and a MediaPath is present; if no vision model is configured, say that explicitly and keep the saved path available.")
+    lines.add("For voice/audio requests, use AudioTranscript when present; otherwise call telegram_audio_transcribe before answering. If ASRStatus=not_configured, say that transcription is unavailable instead of guessing.")
+    if (!structuredSummary.isEmpty()) {
+        lines.add("StructuredTelegramContext:")
+        lines.add(structuredSummary)
+    }
     for (item in records.getItems()) {
         let record = try { item.asObject() } catch (_e: Exception) { JsonObject() }
         let mediaId = gatewayJsonString(record, "mediaId")

@@ -659,6 +659,12 @@ public class TelegramConfig {
     public let webhookPath: String
     public let webhookHost: String
     public let webhookPort: UInt16
+    public let webhookMaxBodyBytes: Int64
+    public let webhookBodyTimeoutMs: Int64
+    public let webhookRateLimitWindowMs: Int64
+    public let webhookRateLimitMaxRequests: Int64
+    public let trustedProxies: Array<String>
+    public let allowRealIpFallback: Bool
     public let apiRoot: String
     public let proxy: String
     public let reactionNotifications: String
@@ -699,6 +705,12 @@ public class TelegramConfig {
         webhookPath!: String = "/telegram-webhook",
         webhookHost!: String = "127.0.0.1",
         webhookPort!: UInt16 = 8787u16,
+        webhookMaxBodyBytes!: Int64 = 1024 * 1024,
+        webhookBodyTimeoutMs!: Int64 = 30000,
+        webhookRateLimitWindowMs!: Int64 = 60000,
+        webhookRateLimitMaxRequests!: Int64 = 120,
+        trustedProxies!: Array<String> = [],
+        allowRealIpFallback!: Bool = false,
         apiRoot!: String = "https://api.telegram.org",
         proxy!: String = "",
         reactionNotifications!: String = "off",
@@ -738,6 +750,12 @@ public class TelegramConfig {
         this.webhookPath = webhookPath
         this.webhookHost = webhookHost
         this.webhookPort = webhookPort
+        this.webhookMaxBodyBytes = webhookMaxBodyBytes
+        this.webhookBodyTimeoutMs = webhookBodyTimeoutMs
+        this.webhookRateLimitWindowMs = webhookRateLimitWindowMs
+        this.webhookRateLimitMaxRequests = webhookRateLimitMaxRequests
+        this.trustedProxies = trustedProxies
+        this.allowRealIpFallback = allowRealIpFallback
         this.apiRoot = apiRoot
         this.proxy = proxy
         this.reactionNotifications = reactionNotifications

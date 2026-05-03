@@ -64,6 +64,18 @@ private class TelegramInboundMediaInfo {
     }
 }
 
+private class TelegramWebhookBodyReadResult {
+    public let ok: Bool
+    public let payload: String
+    public let error: String
+
+    public init(ok: Bool, payload!: String = "", error!: String = "") {
+        this.ok = ok
+        this.payload = payload
+        this.error = error
+    }
+}
+
 private func normalizeTelegramAccountIdForState(raw: String): String {
     let trimmed = raw.trimAscii()
     if (trimmed.isEmpty() || trimmed == "telegram:default") {
@@ -126,6 +138,9 @@ public class TelegramAdapter <: ChannelAdapter {
     private let completedUpdateIds = HashSet<String>()
     private let completedUpdateIdOrder = ArrayList<String>()
     private let consumedApprovalCallbacks = HashSet<String>()
+    private let webhookGuardMutex = Mutex()
+    private let webhookRateWindowStartedAtBySource = HashMap<String, Int64>()
+    private let webhookRateCountBySource = HashMap<String, Int64>()
     private var pollingRunner: Option<TelegramPollingRunner> = None<TelegramPollingRunner>
     private var telegramTransportRebuildCount: Int64 = 0
     private var running = false
@@ -581,6 +596,18 @@ public class TelegramAdapter <: ChannelAdapter {
         this.validateWebhookSecretHeader(secretHeader)
     }
 
+    public func debugResolveWebhookSourceForTest(xForwardedFor: String, xRealIp: String, remoteHint: String): String {
+        this.resolveWebhookSource(xForwardedFor, xRealIp, remoteHint)
+    }
+
+    public func debugWebhookRateLimitAllowsForTest(source: String, nowMs: Int64): Bool {
+        this.webhookRateLimitAllows(source, nowMs: nowMs)
+    }
+
+    public func debugBuildWebhookGuardForTest(method: String, path: String, bodyBytes: Int64, source: String, nowMs: Int64): JsonObject {
+        this.buildWebhookGuardResult(method, path, bodyBytes, source, nowMs: nowMs)
+    }
+
     public func debugBuildHealthSnapshot(
         getMeRaw!: String = "{\"ok\":true,\"result\":{\"id\":1,\"is_bot\":true,\"username\":\"bot\"}}",
         webhookInfoRaw!: String = "{\"ok\":true,\"result\":{\"url\":\"\",\"pending_update_count\":0}}"
@@ -921,6 +948,28 @@ public class TelegramAdapter <: ChannelAdapter {
             .port(this.config.webhookPort)
             .build()
         server.distributor.register(this.config.webhookPath, { ctx =>
+            let source = this.resolveWebhookSource(
+                ctx.request.headers.getFirst("X-Forwarded-For") ?? ctx.request.headers.getFirst("x-forwarded-for") ?? "",
+                ctx.request.headers.getFirst("X-Real-IP") ?? ctx.request.headers.getFirst("x-real-ip") ?? "",
+                ""
+            )
+            let guard = this.buildWebhookGuardResult(ctx.request.method, this.config.webhookPath, 0, source)
+            if (!this.readJsonBoolField(guard, "ok", false)) {
+                let httpStatus = this.readJsonIntField(guard, "httpStatus", 400)
+                if (httpStatus == 405) {
+                    ctx.responseBuilder.status(405)
+                } else if (httpStatus == 404) {
+                    ctx.responseBuilder.status(404)
+                } else if (httpStatus == 429) {
+                    ctx.responseBuilder.status(429)
+                } else if (httpStatus == 413) {
+                    ctx.responseBuilder.status(413)
+                } else {
+                    ctx.responseBuilder.status(400)
+                }
+                ctx.responseBuilder.body(guard.toJsonString())
+                return
+            }
             let secret = ctx.request.headers.getFirst("X-Telegram-Bot-Api-Secret-Token") ??
                 ctx.request.headers.getFirst("x-telegram-bot-api-secret-token") ??
                 ""
@@ -929,7 +978,17 @@ public class TelegramAdapter <: ChannelAdapter {
                 ctx.responseBuilder.body("{\"ok\":false,\"error\":\"webhook_secret_mismatch\"}")
                 return
             }
-            let payload = this.readRequestBody(ctx)
+            let body = this.readRequestBodyLimited(ctx)
+            if (!body.ok) {
+                ctx.responseBuilder.status(if (body.error == "payload-too-large") { 413 } else { 408 })
+                let err = JsonObject()
+                err.put("ok", JsonBool(false))
+                err.put("status", JsonString("error"))
+                err.put("error", JsonString(body.error))
+                ctx.responseBuilder.body(err.toJsonString())
+                return
+            }
+            let payload = body.payload
             let ack = this.ingestWebhookPayload(payload)
             ctx.responseBuilder.body(ack)
         })
@@ -1075,21 +1134,151 @@ public class TelegramAdapter <: ChannelAdapter {
         this.pollingRunnerOrThrow().diagnostics()
     }
 
-    private func readRequestBody(ctx: HttpContext): String {
+    private func readRequestBodyLimited(ctx: HttpContext): TelegramWebhookBodyReadResult {
         try {
             let output = ArrayList<Byte>()
             let buffer = Array<Byte>(8192, repeat: 0)
+            let limit = this.effectiveWebhookMaxBodyBytes()
+            let startedAt = DateTime.now().toUnixTimeStamp().toMilliseconds()
+            let timeoutMs = this.effectiveWebhookBodyTimeoutMs()
             while (true) {
+                if (timeoutMs > 0 && DateTime.now().toUnixTimeStamp().toMilliseconds() - startedAt > timeoutMs) {
+                    return TelegramWebhookBodyReadResult(false, error: "timeout")
+                }
                 let n = ctx.request.body.read(buffer)
                 if (n <= 0) {
                     break
                 }
+                if (limit > 0 && Int64(output.size) + Int64(n) > limit) {
+                    return TelegramWebhookBodyReadResult(false, error: "payload-too-large")
+                }
                 output.add(all: buffer[..n])
             }
-            String.fromUtf8(output.toArray())
+            TelegramWebhookBodyReadResult(true, payload: String.fromUtf8(output.toArray()))
         } catch (_e: Exception) {
-            ""
+            TelegramWebhookBodyReadResult(false, error: "read-failed")
         }
+    }
+
+    private func effectiveWebhookMaxBodyBytes(): Int64 {
+        if (this.config.webhookMaxBodyBytes <= 0) { 1024 * 1024 } else { this.config.webhookMaxBodyBytes }
+    }
+
+    private func effectiveWebhookBodyTimeoutMs(): Int64 {
+        if (this.config.webhookBodyTimeoutMs < 0) { 0 } else { this.config.webhookBodyTimeoutMs }
+    }
+
+    private func effectiveWebhookRateLimitWindowMs(): Int64 {
+        if (this.config.webhookRateLimitWindowMs <= 0) { 60000 } else { this.config.webhookRateLimitWindowMs }
+    }
+
+    private func effectiveWebhookRateLimitMaxRequests(): Int64 {
+        if (this.config.webhookRateLimitMaxRequests <= 0) { 120 } else { this.config.webhookRateLimitMaxRequests }
+    }
+
+    private func splitFirstCsvValue(raw: String): String {
+        let trimmed = raw.trimAscii()
+        if (trimmed.isEmpty()) {
+            return ""
+        }
+        let parts = trimmed.split(",")
+        if (parts.isEmpty()) {
+            return trimmed
+        }
+        parts[0].trimAscii()
+    }
+
+    private func trustedProxyContains(candidate: String): Bool {
+        let value = candidate.trimAscii()
+        if (value.isEmpty()) {
+            return false
+        }
+        for (proxy in this.config.trustedProxies) {
+            if (proxy.trimAscii() == value) {
+                return true
+            }
+        }
+        false
+    }
+
+    private func resolveWebhookSource(xForwardedFor: String, xRealIp: String, remoteHint: String): String {
+        let forwarded = this.splitFirstCsvValue(xForwardedFor)
+        let real = xRealIp.trimAscii()
+        let remote = remoteHint.trimAscii()
+        if (!forwarded.isEmpty() && (remote.isEmpty() || this.trustedProxyContains(remote) || this.config.trustedProxies.isEmpty())) {
+            return forwarded
+        }
+        if (!real.isEmpty() && (this.config.allowRealIpFallback || remote.isEmpty() || this.trustedProxyContains(remote))) {
+            return real
+        }
+        if (!remote.isEmpty()) {
+            return remote
+        }
+        "unknown"
+    }
+
+    private func webhookRateLimitAllows(source: String, nowMs!: Int64 = DateTime.now().toUnixTimeStamp().toMilliseconds()): Bool {
+        let key = if (source.trimAscii().isEmpty()) { "unknown" } else { source.trimAscii() }
+        let windowMs = this.effectiveWebhookRateLimitWindowMs()
+        let maxRequests = this.effectiveWebhookRateLimitMaxRequests()
+        synchronized(this.webhookGuardMutex) {
+            let startedAt = this.webhookRateWindowStartedAtBySource.get(key) ?? 0
+            let count = this.webhookRateCountBySource.get(key) ?? 0
+            if (startedAt <= 0 || nowMs - startedAt >= windowMs) {
+                this.webhookRateWindowStartedAtBySource[key] = nowMs
+                this.webhookRateCountBySource[key] = 1
+                return true
+            }
+            if (count >= maxRequests) {
+                return false
+            }
+            this.webhookRateCountBySource[key] = count + 1
+            true
+        }
+    }
+
+    private func buildWebhookGuardResult(
+        method: String,
+        path: String,
+        bodyBytes: Int64,
+        source: String,
+        nowMs!: Int64 = DateTime.now().toUnixTimeStamp().toMilliseconds()
+    ): JsonObject {
+        let out = JsonObject()
+        let normalizedMethod = method.trimAscii().toAsciiUpper()
+        if (normalizedMethod != "POST") {
+            out.put("ok", JsonBool(false))
+            out.put("status", JsonString("error"))
+            out.put("error", JsonString("method-not-allowed"))
+            out.put("httpStatus", 405.toJsonValue())
+            return out
+        }
+        if (!path.trimAscii().isEmpty() && path.trimAscii() != this.config.webhookPath.trimAscii()) {
+            out.put("ok", JsonBool(false))
+            out.put("status", JsonString("error"))
+            out.put("error", JsonString("path-not-found"))
+            out.put("httpStatus", 404.toJsonValue())
+            return out
+        }
+        if (bodyBytes > 0 && bodyBytes > this.effectiveWebhookMaxBodyBytes()) {
+            out.put("ok", JsonBool(false))
+            out.put("status", JsonString("error"))
+            out.put("error", JsonString("payload-too-large"))
+            out.put("httpStatus", 413.toJsonValue())
+            return out
+        }
+        if (!this.webhookRateLimitAllows(source, nowMs: nowMs)) {
+            out.put("ok", JsonBool(false))
+            out.put("status", JsonString("error"))
+            out.put("error", JsonString("rate-limited"))
+            out.put("httpStatus", 429.toJsonValue())
+            return out
+        }
+        out.put("ok", JsonBool(true))
+        out.put("status", JsonString("ok"))
+        out.put("source", JsonString(if (source.trimAscii().isEmpty()) { "unknown" } else { source.trimAscii() }))
+        out.put("httpStatus", 200.toJsonValue())
+        out
     }
 
     private func mapWebhookToInbound(root: JsonObject, raw: String): Option<InboundMessage> {
@@ -1159,6 +1348,14 @@ public class TelegramAdapter <: ChannelAdapter {
             mediaContext.put("peerId", JsonString(peerId))
             mediaContext.put("messageId", JsonString(messageId))
             mediaContext.put("records", contextRecords)
+        }
+        let structuredContext = this.telegramStructuredSupplementalContext(msg)
+        if (structuredContext.size() > 0) {
+            mediaContext.put("channel", JsonString("telegram"))
+            mediaContext.put("accountId", JsonString(this.effectiveAccountId()))
+            mediaContext.put("peerId", JsonString(peerId))
+            mediaContext.put("messageId", JsonString(messageId))
+            mediaContext.put("context", structuredContext)
         }
         let mentioned = this.detectMention(text)
         let inbound = InboundMessage(
@@ -1397,6 +1594,72 @@ public class TelegramAdapter <: ChannelAdapter {
             case None => ()
         }
         String.join(lines.toArray(), delimiter: "\n")
+    }
+
+    private func telegramStructuredSupplementalContext(msg: JsonObject): JsonObject {
+        let out = JsonObject()
+        match (this.readObjectFieldOpt(msg, "reply_to_message")) {
+            case Some(reply) =>
+                let obj = JsonObject()
+                obj.put("messageId", JsonString(this.readIntStringField(reply, "message_id")))
+                obj.put("text", JsonString(this.readStringField(reply, "text").trimAscii()))
+                obj.put("caption", JsonString(this.readStringField(reply, "caption").trimAscii()))
+                let from = this.readObjectField(reply, "from")
+                obj.put("senderId", JsonString(this.readIntStringField(from, "id")))
+                obj.put("senderUsername", JsonString(this.readStringField(from, "username").trimAscii()))
+                out.put("replyTo", obj)
+            case None => ()
+        }
+        match (this.readObjectFieldOpt(msg, "forward_origin")) {
+            case Some(origin) =>
+                let obj = JsonObject()
+                obj.put("type", JsonString(this.readStringField(origin, "type").trimAscii()))
+                obj.put("senderUserName", JsonString(this.readStringField(origin, "sender_user_name").trimAscii()))
+                obj.put("date", JsonString(this.readIntStringField(origin, "date")))
+                let senderUser = this.readObjectField(origin, "sender_user")
+                if (senderUser.size() > 0) {
+                    obj.put("senderId", JsonString(this.readIntStringField(senderUser, "id")))
+                    obj.put("senderUsername", JsonString(this.readStringField(senderUser, "username").trimAscii()))
+                }
+                let chat = this.readObjectField(origin, "chat")
+                if (chat.size() > 0) {
+                    obj.put("chatId", JsonString(this.readIntStringField(chat, "id")))
+                    obj.put("chatTitle", JsonString(this.readStringField(chat, "title").trimAscii()))
+                    obj.put("chatType", JsonString(this.readStringField(chat, "type").trimAscii()))
+                }
+                out.put("forwarded", obj)
+            case None => ()
+        }
+        match (this.readObjectFieldOpt(msg, "location")) {
+            case Some(location) =>
+                let obj = JsonObject()
+                obj.put("latitude", JsonString(this.readFloatStringField(location, "latitude")))
+                obj.put("longitude", JsonString(this.readFloatStringField(location, "longitude")))
+                out.put("location", obj)
+            case None => ()
+        }
+        match (this.readObjectFieldOpt(msg, "venue")) {
+            case Some(venue) =>
+                let obj = JsonObject()
+                obj.put("title", JsonString(this.readStringField(venue, "title").trimAscii()))
+                obj.put("address", JsonString(this.readStringField(venue, "address").trimAscii()))
+                let location = this.readObjectField(venue, "location")
+                obj.put("latitude", JsonString(this.readFloatStringField(location, "latitude")))
+                obj.put("longitude", JsonString(this.readFloatStringField(location, "longitude")))
+                out.put("venue", obj)
+            case None => ()
+        }
+        match (this.readObjectFieldOpt(msg, "contact")) {
+            case Some(contact) =>
+                let obj = JsonObject()
+                obj.put("firstName", JsonString(this.readStringField(contact, "first_name").trimAscii()))
+                obj.put("lastName", JsonString(this.readStringField(contact, "last_name").trimAscii()))
+                obj.put("phoneNumber", JsonString(this.readStringField(contact, "phone_number").trimAscii()))
+                obj.put("userId", JsonString(this.readIntStringField(contact, "user_id")))
+                out.put("contact", obj)
+            case None => ()
+        }
+        out
     }
 
     private func appendTelegramMediaContextBlock(
@@ -3436,6 +3699,9 @@ public class TelegramAdapter <: ChannelAdapter {
     }
 
     private func buildPhotoPayload(message: OutboundMessage, fileId: String, caption: String): HashMap<String, JsonValue> {
+        if (this.telegramPhotoShouldFallbackToDocument(fileId)) {
+            return this.buildDocumentPayload(message, fileId, caption)
+        }
         let normalizedPeer = message.peerId.trimAscii()
         let chatId = this.normalizePeerId(normalizedPeer)
         let threadId = this.extractThreadId(normalizedPeer)
@@ -3457,6 +3723,73 @@ public class TelegramAdapter <: ChannelAdapter {
             }
         }
         body
+    }
+
+    private func byteToInt64(v: Byte): Int64 {
+        Int64(v)
+    }
+
+    private func be16(bytes: Array<Byte>, idx: Int64): Int64 {
+        if (idx + 1 >= Int64(bytes.size)) { return 0 }
+        this.byteToInt64(bytes[idx]) * 256 + this.byteToInt64(bytes[idx + 1])
+    }
+
+    private func be32(bytes: Array<Byte>, idx: Int64): Int64 {
+        if (idx + 3 >= Int64(bytes.size)) { return 0 }
+        this.byteToInt64(bytes[idx]) * 16777216 +
+            this.byteToInt64(bytes[idx + 1]) * 65536 +
+            this.byteToInt64(bytes[idx + 2]) * 256 +
+            this.byteToInt64(bytes[idx + 3])
+    }
+
+    private func telegramLocalImageDimensions(pathText: String): (Int64, Int64) {
+        let path = Path(pathText)
+        if (pathText.trimAscii().isEmpty() || !exists(path)) {
+            return (0, 0)
+        }
+        let bytes = try { File.readFrom(path) } catch (_e: Exception) { return (0, 0) }
+        if (bytes.size >= 24 &&
+            bytes[0] == 137u8 && bytes[1] == 80u8 && bytes[2] == 78u8 && bytes[3] == 71u8 &&
+            bytes[12] == 73u8 && bytes[13] == 72u8 && bytes[14] == 68u8 && bytes[15] == 82u8) {
+            return (this.be32(bytes, 16), this.be32(bytes, 20))
+        }
+        if (bytes.size >= 4 && bytes[0] == 255u8 && bytes[1] == 216u8) {
+            var idx: Int64 = 2
+            while (idx + 9 < Int64(bytes.size)) {
+                if (bytes[idx] != 255u8) {
+                    idx += 1
+                    continue
+                }
+                let marker = bytes[idx + 1]
+                let segmentLength = this.be16(bytes, idx + 2)
+                if (segmentLength <= 0) {
+                    return (0, 0)
+                }
+                if ((marker >= 192u8 && marker <= 195u8) || (marker >= 197u8 && marker <= 199u8) ||
+                    (marker >= 201u8 && marker <= 203u8) || (marker >= 205u8 && marker <= 207u8)) {
+                    return (this.be16(bytes, idx + 7), this.be16(bytes, idx + 5))
+                }
+                idx += 2 + segmentLength
+            }
+        }
+        (0, 0)
+    }
+
+    private func telegramPhotoShouldFallbackToDocument(fileId: String): Bool {
+        if (!this.looksLikeLocalMediaPath(fileId)) {
+            return false
+        }
+        let localPath = this.normalizeOutboundLocalMediaPath(fileId)
+        let (width, height) = this.telegramLocalImageDimensions(localPath)
+        if (width <= 0 || height <= 0) {
+            return false
+        }
+        if (width + height > 10000) {
+            return true
+        }
+        let longer = if (width > height) { width } else { height }
+        let shorter = if (width > height) { height } else { width }
+        shorter > 0 && longer > shorter * 20
     }
 
     private func buildDocumentPayload(message: OutboundMessage, fileId: String, caption: String): HashMap<String, JsonValue> {

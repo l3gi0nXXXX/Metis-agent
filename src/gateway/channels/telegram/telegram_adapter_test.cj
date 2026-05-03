@@ -652,6 +652,41 @@ public class TelegramAdapterTest {
     }
 
     @TestCase
+    public func webhookGuardRejectsUnsafeMethodPathOversizeAndRate(): Unit {
+        let adapter = TelegramAdapter(
+            config: TelegramConfig(
+                enabled: true,
+                botToken: "telegram-token",
+                webhookPath: "/telegram-webhook",
+                webhookMaxBodyBytes: 8,
+                webhookRateLimitWindowMs: 60000,
+                webhookRateLimitMaxRequests: 2,
+                trustedProxies: ["127.0.0.1"],
+                allowRealIpFallback: true
+            )
+        )
+        @Expect(adapter.debugResolveWebhookSourceForTest("203.0.113.8, 127.0.0.1", "", "127.0.0.1"), "203.0.113.8")
+        @Expect(adapter.debugResolveWebhookSourceForTest("", "203.0.113.9", "127.0.0.1"), "203.0.113.9")
+
+        let badMethod = adapter.debugBuildWebhookGuardForTest("GET", "/telegram-webhook", 0, "203.0.113.8", 1000)
+        @Expect(badMethod.get("error").getOrThrow().asString().getValue(), "method-not-allowed")
+        @Expect(badMethod.get("httpStatus").getOrThrow().asInt().getValue(), 405)
+
+        let badPath = adapter.debugBuildWebhookGuardForTest("POST", "/wrong", 0, "203.0.113.8", 1001)
+        @Expect(badPath.get("error").getOrThrow().asString().getValue(), "path-not-found")
+        @Expect(badPath.get("httpStatus").getOrThrow().asInt().getValue(), 404)
+
+        let tooLarge = adapter.debugBuildWebhookGuardForTest("POST", "/telegram-webhook", 9, "203.0.113.8", 1002)
+        @Expect(tooLarge.get("error").getOrThrow().asString().getValue(), "payload-too-large")
+        @Expect(tooLarge.get("httpStatus").getOrThrow().asInt().getValue(), 413)
+
+        @Expect(adapter.debugWebhookRateLimitAllowsForTest("198.51.100.10", 2000), true)
+        @Expect(adapter.debugWebhookRateLimitAllowsForTest("198.51.100.10", 2001), true)
+        @Expect(adapter.debugWebhookRateLimitAllowsForTest("198.51.100.10", 2002), false)
+        @Expect(adapter.debugWebhookRateLimitAllowsForTest("198.51.100.10", 62001), true)
+    }
+
+    @TestCase
     public func healthSnapshotExposesModeBotAndWebhookState(): Unit {
         let adapter = TelegramAdapter(
             config: TelegramConfig(
@@ -1553,6 +1588,30 @@ public class TelegramAdapterTest {
         @Expect(inbound[0].text.contains("[location]"), true)
         @Expect(inbound[0].text.contains("latitude=31.2304"), true)
         @Expect(inbound[0].text.contains("longitude=121.4737"), true)
+        let context = inbound[0].mediaContext.get("context").getOrThrow().asObject()
+        @Expect(context.get("replyTo").getOrThrow().asObject().get("messageId").getOrThrow().asString().getValue(), "400")
+        @Expect(context.get("location").getOrThrow().asObject().get("latitude").getOrThrow().asString().getValue().contains("31.23"), true)
+    }
+
+    @TestCase
+    public func webhookForwardVenueAndContactBecomeStructuredContext(): Unit {
+        let adapter = TelegramAdapter(
+            config: TelegramConfig(
+                enabled: true,
+                botToken: "telegram-token",
+                dmPolicy: "open",
+                allowFrom: ["*"]
+            )
+        )
+        adapter.start()
+        let payload = "{\"update_id\":1,\"message\":{\"message_id\":402,\"text\":\"context\",\"forward_origin\":{\"type\":\"channel\",\"chat\":{\"id\":-1001,\"type\":\"channel\",\"title\":\"Announcements\"}},\"venue\":{\"title\":\"Office\",\"address\":\"Road 1\",\"location\":{\"latitude\":31.23,\"longitude\":121.47}},\"contact\":{\"first_name\":\"Ada\",\"last_name\":\"Lovelace\",\"phone_number\":\"123\",\"user_id\":888},\"chat\":{\"id\":745123456,\"type\":\"private\"},\"from\":{\"id\":745123456}}}"
+        @Expect(adapter.ingestWebhookPayload(payload).contains("\"ok\":true"), true)
+        let inbound = adapter.pullInbound()
+        @Expect(inbound.size, 1)
+        let context = inbound[0].mediaContext.get("context").getOrThrow().asObject()
+        @Expect(context.get("forwarded").getOrThrow().asObject().get("chatTitle").getOrThrow().asString().getValue(), "Announcements")
+        @Expect(context.get("venue").getOrThrow().asObject().get("title").getOrThrow().asString().getValue(), "Office")
+        @Expect(context.get("contact").getOrThrow().asObject().get("firstName").getOrThrow().asString().getValue(), "Ada")
     }
 
     @TestCase
@@ -2959,6 +3018,44 @@ public class TelegramAdapterTest {
             @Expect(fake.sawContentTypeContaining("multipart/form-data"), true)
             @Expect(fake.bodySizes.size > 0, true)
             @Expect(fake.bodySizes[fake.bodySizes.size - 1] > Int64(photoBytes.size), true)
+        } finally {
+            setTelegramTransportRunnerForTest(None)
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func outboundOversizedLocalPhotoFallsBackToDocument(): Unit {
+        let root = Path("/tmp/metis-telegram-outbound-photo-fallback-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
+        Directory.create(root, recursive: true)
+        let photoPath = root.join("wide.png")
+        let pngBytes: Array<Byte> = [
+            137u8, 80u8, 78u8, 71u8, 13u8, 10u8, 26u8, 10u8,
+            0u8, 0u8, 0u8, 13u8, 73u8, 72u8, 68u8, 82u8,
+            0u8, 0u8, 35u8, 40u8, 0u8, 0u8, 7u8, 208u8
+        ]
+        File.writeTo(photoPath, pngBytes)
+        let fake = TelegramFakeBotApi()
+        setTelegramTransportRunnerForTest(Some({ request => fake.handle(request) }))
+        try {
+            let adapter = TelegramAdapter(
+                config: TelegramConfig(
+                    enabled: true,
+                    botToken: "telegram-token",
+                    actions: TelegramActionConfig(photo: true, document: true),
+                    media: TelegramMediaConfig(outboundAllowLocalPath: true, outboundLocalRoots: [root.toString()])
+                )
+            )
+            adapter.start()
+            let result = adapter.send(
+                OutboundMessage(ChannelType.Telegram, "user:8734062810", "[photo]\nfileId=${photoPath.toString()}\ncaption=wide")
+            )
+            match (result) {
+                case SendResult.Success => ()
+                case SendResult.Failed(reason) => @Expect(reason, "")
+            }
+            @Expect(fake.saw("sendDocument"), true)
+            @Expect(fake.saw("sendPhoto"), false)
         } finally {
             setTelegramTransportRunnerForTest(None)
             try { remove(root, recursive: true) } catch (_e: Exception) { () }

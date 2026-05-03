@@ -11,7 +11,7 @@ import metis.core.{renderGatewayAudioText, renderGatewayDocumentText, renderGate
 import metis.core.config.{CliConfig, CliSettingManager, MetisPaths}
 import metis.io.PrintUtils
 
-import std.collection.ArrayList
+import std.collection.{ArrayList, HashSet}
 import std.fs.{Directory, File, Path, copy, exists}
 import std.process.executeWithOutput
 import std.time.DateTime
@@ -254,9 +254,90 @@ private func telegramMediaToolAddVisionCandidate(out: ArrayList<String>, seen: A
 }
 
 private var telegramMediaToolVisionCandidatesOverride: Option<Array<String>> = None<Array<String>>
+private var telegramStickerCacheRootOverride: Option<Path> = None<Path>
 
 public func setGatewayTelegramMediaVisionCandidatesForTest(candidates: Option<Array<String>>): Unit {
     telegramMediaToolVisionCandidatesOverride = candidates
+}
+
+public func setGatewayTelegramStickerCacheRootForTest(root: Option<Path>): Unit {
+    telegramStickerCacheRootOverride = root
+}
+
+private func telegramStickerCacheRoot(): Path {
+    match (telegramStickerCacheRootOverride) {
+        case Some(root) => root
+        case None => CliConfig.dotDir.join("gateway-telegram")
+    }
+}
+
+private func telegramStickerCachePath(): Path {
+    telegramStickerCacheRoot().join("sticker-cache.json")
+}
+
+private func telegramStickerCacheLoad(): JsonArray {
+    let path = telegramStickerCachePath()
+    if (!exists(path)) {
+        return JsonArray([])
+    }
+    try {
+        JsonValue.fromStr(String.fromUtf8(File.readFrom(path))).asArray()
+    } catch (_e: Exception) {
+        JsonArray([])
+    }
+}
+
+private func telegramStickerCacheKey(record: JsonObject): String {
+    let uniqueId = telegramMediaToolString(record, "fileUniqueId")
+    if (!uniqueId.isEmpty()) {
+        return "unique:${uniqueId}"
+    }
+    let fileId = telegramMediaToolString(record, "fileId")
+    if (!fileId.isEmpty()) {
+        return "file:${fileId}"
+    }
+    telegramMediaToolString(record, "mediaId")
+}
+
+private func telegramStickerCachePersistCurrentRecords(): JsonArray {
+    let existing = telegramStickerCacheLoad()
+    let seen = HashSet<String>()
+    let merged = JsonArray([])
+    for (item in existing.getItems()) {
+        let obj = try { item.asObject() } catch (_e: Exception) { JsonObject() }
+        let key = telegramStickerCacheKey(obj)
+        if (!key.isEmpty() && !seen.contains(key)) {
+            seen.add(key)
+            merged.add(obj)
+        }
+    }
+    for (item in telegramMediaToolRecords().getItems()) {
+        let record = try { item.asObject() } catch (_e: Exception) { JsonObject() }
+        if (telegramMediaToolString(record, "mediaKind").toAsciiLower() != "sticker") {
+            continue
+        }
+        let key = telegramStickerCacheKey(record)
+        if (key.isEmpty() || seen.contains(key)) {
+            continue
+        }
+        seen.add(key)
+        let cached = JsonObject()
+        for (field in ["mediaId", "fileId", "fileUniqueId", "emoji", "setName", "description", "analysis", "mimeType", "fileName", "localPath", "downloaded", "createdAtMs"]) {
+            match (record.get(field)) {
+                case Some(v) => cached.put(field, v)
+                case None => ()
+            }
+        }
+        cached.put("mediaKind", JsonString("sticker"))
+        cached.put("cachedAtMs", DateTime.now().toUnixTimeStamp().toMilliseconds().toJsonValue())
+        merged.add(cached)
+    }
+    let root = telegramStickerCacheRoot()
+    if (!exists(root)) {
+        Directory.create(root, recursive: true)
+    }
+    File.writeTo(telegramStickerCachePath(), merged.toJsonString().toArray())
+    merged
 }
 
 private func telegramMediaToolVisionCandidates(): Array<String> {
@@ -764,10 +845,10 @@ public class GatewayTelegramMediaToolset {
         out.put("ok", JsonBool(true))
         out.put("status", JsonString("ok"))
         out.put("action", JsonString("telegram_sticker_search"))
-        out.put("source", JsonString("current_session_media_context"))
+        out.put("source", JsonString("current_session_media_context+durable_cache"))
         let stickers = JsonArray([])
         var count: Int64 = 0
-        let records = telegramMediaToolRecords()
+        let records = telegramStickerCachePersistCurrentRecords()
         for (item in records.getItems()) {
             if (count >= max) {
                 break
@@ -811,7 +892,7 @@ public class GatewayTelegramMediaToolset {
         if (targetMediaId.isEmpty() && targetUniqueId.isEmpty() && targetFileId.isEmpty()) {
             return telegramMediaError("telegram_sticker_get", "mediaId, fileUniqueId, or fileId is required")
         }
-        let records = telegramMediaToolRecords()
+        let records = telegramStickerCachePersistCurrentRecords()
         for (item in records.getItems()) {
             let record = try { item.asObject() } catch (_e: Exception) { JsonObject() }
             if (telegramMediaToolString(record, "mediaKind").toAsciiLower() != "sticker") {
@@ -830,7 +911,7 @@ public class GatewayTelegramMediaToolset {
             out.put("ok", JsonBool(true))
             out.put("status", JsonString("ok"))
             out.put("action", JsonString("telegram_sticker_get"))
-            out.put("source", JsonString("current_session_media_context"))
+            out.put("source", JsonString("current_session_media_context+durable_cache"))
             out.put("sticker", record)
             return out.toJsonString()
         }
@@ -838,7 +919,7 @@ public class GatewayTelegramMediaToolset {
         out.put("ok", JsonBool(false))
         out.put("status", JsonString("error"))
         out.put("action", JsonString("telegram_sticker_get"))
-        out.put("error", JsonString("sticker not found in current session context"))
+        out.put("error", JsonString("sticker not found in current session context or durable cache"))
         if (!targetMediaId.isEmpty()) { out.put("mediaId", JsonString(targetMediaId)) }
         if (!targetUniqueId.isEmpty()) { out.put("fileUniqueId", JsonString(targetUniqueId)) }
         if (!targetFileId.isEmpty()) { out.put("fileId", JsonString(targetFileId)) }
@@ -847,7 +928,7 @@ public class GatewayTelegramMediaToolset {
 
     private func telegramStickerCacheStats(): String {
         let out = JsonObject()
-        let records = telegramMediaToolRecords()
+        let records = telegramStickerCachePersistCurrentRecords()
         var stickerCount: Int64 = 0
         var describedCount: Int64 = 0
         for (item in records.getItems()) {
@@ -862,9 +943,10 @@ public class GatewayTelegramMediaToolset {
         out.put("ok", JsonBool(true))
         out.put("status", JsonString("ok"))
         out.put("action", JsonString("telegram_sticker_cache_stats"))
-        out.put("source", JsonString("current_session_media_context"))
+        out.put("source", JsonString("current_session_media_context+durable_cache"))
         out.put("stickerCount", stickerCount.toJsonValue())
         out.put("describedCount", describedCount.toJsonValue())
+        out.put("cachePath", JsonString(telegramStickerCachePath().toString()))
         out.toJsonString()
     }
 
