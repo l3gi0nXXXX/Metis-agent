@@ -158,6 +158,18 @@ private class TelegramThreadFallbackFakeBotApi {
     }
 }
 
+private class TelegramChatActionUnauthorizedFakeBotApi {
+    public var calls: Int64 = 0
+
+    public func handle(request: TelegramTransportRequest): TelegramTransportResponse {
+        if (request.url.contains("/sendChatAction")) {
+            this.calls += 1
+            return TelegramTransportResponse(true, body: "{\"ok\":false,\"error_code\":401,\"description\":\"Unauthorized\"}", outcome: "ok")
+        }
+        TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":{\"message_id\":1}}", outcome: "ok")
+    }
+}
+
 @Test
 public class TelegramAdapterTest {
     public init() {
@@ -2629,6 +2641,30 @@ public class TelegramAdapterTest {
             }
             @Expect(fake.saw("sendChatAction"), true)
             @Expect(fake.sawBodyContaining("typing"), true)
+        } finally {
+            setTelegramTransportRunnerForTest(None)
+        }
+    }
+
+    @TestCase
+    public func sendChatActionUnauthorizedEntersBackoff(): Unit {
+        let fake = TelegramChatActionUnauthorizedFakeBotApi()
+        setTelegramTransportRunnerForTest(Some({ request => fake.handle(request) }))
+        try {
+            let adapter = TelegramAdapter(config: TelegramConfig(enabled: true, botToken: "telegram-token"))
+            adapter.start()
+            let first = adapter.send(OutboundMessage(ChannelType.Telegram, "user:8734062810", "[chat-action]\naction=typing"))
+            match (first) {
+                case SendResult.Success => @Expect("failed", "first-send")
+                case SendResult.Failed(reason) => @Expect(reason.contains("Unauthorized"), true)
+            }
+            @Expect(adapter.debugChatActionBackoffUntilMsForTest() > 0, true)
+            let second = adapter.send(OutboundMessage(ChannelType.Telegram, "user:8734062810", "[chat-action]\naction=typing"))
+            match (second) {
+                case SendResult.Success => @Expect("failed", "second-send")
+                case SendResult.Failed(reason) => @Expect(reason.contains("backoff"), true)
+            }
+            @Expect(fake.calls, 1)
         } finally {
             setTelegramTransportRunnerForTest(None)
         }

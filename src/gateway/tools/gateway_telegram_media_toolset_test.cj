@@ -205,6 +205,8 @@ public class GatewayTelegramMediaToolsetTest {
             let json = JsonValue.fromStr(out).asObject()
             @Expect(json.get("status").getOrThrow().asString().getValue(), "ok")
             @Expect(json.get("analysis").getOrThrow().asString().getValue(), "a red square")
+            @Expect(json.get("capability").getOrThrow().asString().getValue(), "image")
+            @Expect(json.get("source").getOrThrow().asString().getValue(), "analysis_companion_file")
         } finally {
             try { remove(root, recursive: true) } catch (_e: Exception) { () }
         }
@@ -255,7 +257,118 @@ public class GatewayTelegramMediaToolsetTest {
             )
             let json = JsonValue.fromStr(out).asObject()
             @Expect(json.get("transcript").getOrThrow().asString().getValue(), "hello voice")
+            @Expect(json.get("capability").getOrThrow().asString().getValue(), "audio")
         } finally {
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func telegramAudioTranscribeReportsUnifiedRuntimeNotConfigured(): Unit {
+        let root = Path("/tmp/metis-telegram-audio-runtime-not-configured-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
+        Directory.create(root, recursive: true)
+        let source = root.join("voice.ogg")
+        File.writeTo(source, "fake".toArray())
+        try {
+            let toolset = GatewayTelegramMediaToolset()
+            let out = gatewayWithToolRuntimeContext(
+                GatewayToolRuntimeContext(
+                    "telegram",
+                    channelName: "telegram",
+                    sessionKey: "telegram:chat:1",
+                    mediaContext: this.mediaContext(source.toString(), mediaKind: "voice", mimeType: "audio/ogg", fileName: "voice.ogg")
+                ),
+                { => toolset.debugTelegramAudioTranscribeForTest(None<String>, None<Int64>) }
+            )
+            let json = JsonValue.fromStr(out).asObject()
+            @Expect(json.get("status").getOrThrow().asString().getValue(), "unsupported")
+            @Expect(json.get("ASRStatus").getOrThrow().asString().getValue(), "not_configured")
+            @Expect(json.get("capability").getOrThrow().asString().getValue(), "audio")
+            let decision = json.get("decision").getOrThrow().asObject()
+            @Expect(decision.get("outcome").getOrThrow().asString().getValue(), "not_configured")
+        } finally {
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func telegramVideoDescribeReadsVideoCompanion(): Unit {
+        let root = Path("/tmp/metis-telegram-video-description-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
+        Directory.create(root, recursive: true)
+        let source = root.join("clip.mp4")
+        File.writeTo(source, "fake-video".toArray())
+        File.writeTo(Path(source.toString() + ".video.txt"), "short product demo clip".toArray())
+        try {
+            let toolset = GatewayTelegramMediaToolset()
+            let out = gatewayWithToolRuntimeContext(
+                GatewayToolRuntimeContext(
+                    "telegram",
+                    channelName: "telegram",
+                    sessionKey: "telegram:chat:1",
+                    mediaContext: this.mediaContext(source.toString(), mediaKind: "video", mimeType: "video/mp4", fileName: "clip.mp4")
+                ),
+                { => toolset.debugTelegramVideoDescribeForTest(None<String>, None<Int64>) }
+            )
+            let json = JsonValue.fromStr(out).asObject()
+            @Expect(json.get("status").getOrThrow().asString().getValue(), "ok")
+            @Expect(json.get("description").getOrThrow().asString().getValue(), "short product demo clip")
+        } finally {
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func telegramDocumentExtractReadsCompanionForBinaryDocument(): Unit {
+        let root = Path("/tmp/metis-telegram-document-extract-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
+        Directory.create(root, recursive: true)
+        let source = root.join("report.pdf")
+        File.writeTo(source, "fake-pdf".toArray())
+        File.writeTo(Path(source.toString() + ".extract.txt"), "pdf extracted summary".toArray())
+        try {
+            let toolset = GatewayTelegramMediaToolset()
+            let out = gatewayWithToolRuntimeContext(
+                GatewayToolRuntimeContext(
+                    "telegram",
+                    channelName: "telegram",
+                    sessionKey: "telegram:chat:1",
+                    mediaContext: this.mediaContext(source.toString(), mediaKind: "document", mimeType: "application/pdf", fileName: "report.pdf")
+                ),
+                { => toolset.debugTelegramDocumentExtractForTest(None<String>, None<Int64>, Some(100)) }
+            )
+            let json = JsonValue.fromStr(out).asObject()
+            @Expect(json.get("status").getOrThrow().asString().getValue(), "ok")
+            @Expect(json.get("readable").getOrThrow().asBool().getValue(), true)
+            @Expect(json.get("content").getOrThrow().asString().getValue(), "pdf extracted summary")
+        } finally {
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func telegramStickerAnalysisWritesDurableCacheDescription(): Unit {
+        let root = Path("/tmp/metis-telegram-sticker-analysis-cache-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
+        setGatewayTelegramStickerCacheRootForTest(Some(root))
+        Directory.create(root, recursive: true)
+        let source = root.join("sticker.webp")
+        File.writeTo(source, "fake-sticker".toArray())
+        File.writeTo(Path(source.toString() + ".analysis.txt"), "smiling sticker with blue text".toArray())
+        try {
+            let toolset = GatewayTelegramMediaToolset()
+            let context = this.mediaContext(source.toString(), mediaKind: "sticker", mimeType: "image/webp", fileName: "sticker.webp")
+            context.get("records").getOrThrow().asArray()[0].asObject().put("description", JsonString(""))
+            let analyzed = gatewayWithToolRuntimeContext(
+                GatewayToolRuntimeContext("telegram", channelName: "telegram", sessionKey: "telegram:chat:1", mediaContext: context),
+                { => toolset.debugTelegramImageAnalyzeForTest(None<String>, None<Int64>, Some("describe sticker")) }
+            )
+            @Expect(JsonValue.fromStr(analyzed).asObject().get("analysis").getOrThrow().asString().getValue(), "smiling sticker with blue text")
+            let searched = gatewayWithToolRuntimeContext(
+                GatewayToolRuntimeContext("telegram", channelName: "telegram", sessionKey: "telegram:chat:1", mediaContext: JsonObject()),
+                { => GatewayTelegramMediaToolset().debugTelegramStickerSearchForTest("blue text", Some(5)) }
+            )
+            let json = JsonValue.fromStr(searched).asObject()
+            @Expect(json.get("count").getOrThrow().asInt().getValue(), 1)
+        } finally {
+            setGatewayTelegramStickerCacheRootForTest(None<Path>)
             try { remove(root, recursive: true) } catch (_e: Exception) { () }
         }
     }

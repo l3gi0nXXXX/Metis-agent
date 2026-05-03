@@ -150,6 +150,8 @@ public class TelegramAdapter <: ChannelAdapter {
     private var nativeCommandsLastSyncError: String = ""
     private var nativeCommandsLastSyncAtMs: Int64 = 0
     private var nativeCommandsLastSyncCommandCount: Int64 = 0
+    private var chatActionBackoffUntilMs: Int64 = 0
+    private var chatActionBackoffReason: String = ""
     private var webhookRegistrationStatus: String = "not-attempted"
     private var webhookRegistrationError: String = ""
     private var webhookRegistrationAtMs: Int64 = 0
@@ -501,7 +503,14 @@ public class TelegramAdapter <: ChannelAdapter {
                 this.lastSendError = "telegram topic-edit action is disabled"
                 return ""
             }
+            if (this.payloadIsChatAction(payload) && this.chatActionBackoffActive()) {
+                this.lastSendError = "telegram chat-action backoff active: ${this.chatActionBackoffReason}"
+                return ""
+            }
             let sentMessageId = this.sendPayloadToTelegram(payload)
+            if (this.payloadIsChatAction(payload) && sentMessageId.isEmpty()) {
+                this.recordChatActionBackoffIfNeeded()
+            }
             if (sentMessageId.isEmpty()) {
                 return ""
             }
@@ -633,6 +642,10 @@ public class TelegramAdapter <: ChannelAdapter {
 
     public func debugLastSendErrorForTest(): String {
         this.lastSendError
+    }
+
+    public func debugChatActionBackoffUntilMsForTest(): Int64 {
+        this.chatActionBackoffUntilMs
     }
 
     public func debugBuildLiveProbe(): JsonObject {
@@ -2247,7 +2260,7 @@ public class TelegramAdapter <: ChannelAdapter {
     }
 
     private func parseTelegramPayloadSuccess(kind: String, raw: String): Option<String> {
-        if (kind == "delete" || kind == "pin" || kind == "unpin" || kind == "reaction" || kind == "edit") {
+        if (kind == "delete" || kind == "pin" || kind == "unpin" || kind == "reaction" || kind == "edit" || kind == "chat-action") {
             return if (this.parseTelegramBoolSuccess(raw, missingDetail: "telegram api returned ok=false")) { Some("") } else { None<String> }
         }
         if (kind == "topic-create") {
@@ -2302,6 +2315,20 @@ public class TelegramAdapter <: ChannelAdapter {
         } catch (e: Exception) {
             this.setLastSendError("telegram bool parse failed: ${e.message}")
             false
+        }
+    }
+
+    private func chatActionBackoffActive(): Bool {
+        let until = this.chatActionBackoffUntilMs
+        until > 0 && DateTime.now().toUnixTimeStamp().toMilliseconds() < until
+    }
+
+    private func recordChatActionBackoffIfNeeded(): Unit {
+        let reason = this.lastSendError.trimAscii()
+        let low = reason.toAsciiLower()
+        if (low.contains("401") || low.contains("403") || low.contains("unauthorized") || low.contains("forbidden")) {
+            this.chatActionBackoffReason = if (reason.isEmpty()) { "telegram chat-action authorization failure" } else { reason }
+            this.chatActionBackoffUntilMs = DateTime.now().toUnixTimeStamp().toMilliseconds() + 60000
         }
     }
 

@@ -8,7 +8,7 @@ import std.env.setVariable
 import std.fs.{Directory, Path, remove}
 import std.time.DateTime
 import std.unittest.testmacro.*
-import stdx.encoding.json.{JsonObject, JsonString}
+import stdx.encoding.json.{JsonObject, JsonString, JsonValue}
 
 private class GatewayTelegramNativeTestAdapter <: ChannelAdapter {
     private let inbound = ArrayList<InboundMessage>()
@@ -48,7 +48,7 @@ private class GatewayTelegramNativeTestAdapter <: ChannelAdapter {
 
     public func sendWithMessageId(message: OutboundMessage): String {
         this.sent.add(message)
-        ""
+        "test-message-${this.sent.size}"
     }
 
     public func sentText(index: Int64): String {
@@ -193,6 +193,31 @@ public class GatewayServiceTelegramNativeTest {
             @Expect(adapter.sentText(0).contains("Model switch denied"), true)
             let updated = CliSettingManager.readGatewaySettings()
             @Expect(updated.channelModels.get("telegram") ?? "", "")
+        }
+    }
+
+    @TestCase
+    public func telegramNativeCommandsBypassModelForHelpSubagentsSessionsAndApprovals(): Unit {
+        withGatewayTelegramNativeTestHome {
+            var user = GatewayUserSettings()
+            user.telegram.enabled = true
+            user.telegram.allowFrom = ["*"]
+            CliSettingManager.writeGatewaySettings(user)
+
+            let adapter = GatewayTelegramNativeTestAdapter()
+            let service = gatewayTelegramNativeService(adapter)
+            service.start()
+            adapter.queue("/help")
+            adapter.queue("/subagents help")
+            adapter.queue("/sessions list")
+            adapter.queue("/approvals")
+            service.processOnce()
+
+            @Expect(JsonValue.fromStr(adapter.sentText(0)).asObject().get("action").getOrThrow().asString().getValue(), "help")
+            @Expect(JsonValue.fromStr(adapter.sentText(1)).asObject().get("action").getOrThrow().asString().getValue(), "help")
+            @Expect(adapter.sentText(1).contains("/subagents spawn"), true)
+            @Expect(JsonValue.fromStr(adapter.sentText(2)).asObject().get("action").getOrThrow().asString().getValue(), "sessions")
+            @Expect(JsonValue.fromStr(adapter.sentText(3)).asObject().get("action").getOrThrow().asString().getValue(), "approvals")
         }
     }
 }

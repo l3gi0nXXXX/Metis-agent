@@ -1,6 +1,7 @@
 package metis.gateway.core
 
 import metis.core.gatewayCurrentToolRuntimeContext
+import metis.core.{gatewayMediaUnderstandingFirstText, gatewayMediaUnderstandingForRecord}
 import metis.core.config.GatewayUserSettings
 import metis.gateway.session.{GatewayIngressSource, GatewaySessionRequest}
 
@@ -139,6 +140,126 @@ public class GatewaySessionTurnRunnerTest {
             media.put("records", records)
             let prompt = gatewayBuildMediaContextPrompt(media)
             @Expect(prompt.contains("FileContentPreview=line one\nline two"), true)
+        } finally {
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func mediaUnderstandingRuntimeReadsImageAnalysisCompanion(): Unit {
+        let root = Path("/tmp/metis-media-understanding-image-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
+        Directory.create(root, recursive: true)
+        let image = root.join("image.jpg")
+        File.writeTo(image, "fake-image".toArray())
+        File.writeTo(Path(image.toString() + ".analysis.txt"), "a blue square".toArray())
+        try {
+            let record = JsonObject()
+            record.put("mediaId", JsonString("tg-image-1"))
+            record.put("mediaKind", JsonString("photo"))
+            record.put("mimeType", JsonString("image/jpeg"))
+            record.put("localPath", JsonString(image.toString()))
+            record.put("downloaded", JsonBool(true))
+
+            let result = gatewayMediaUnderstandingForRecord(record)
+            @Expect(result.get("status").getOrThrow().asString().getValue(), "ok")
+            @Expect(result.get("capability").getOrThrow().asString().getValue(), "image")
+            @Expect(gatewayMediaUnderstandingFirstText(result), "a blue square")
+        } finally {
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func mediaContextPromptIncludesUnifiedImageDescription(): Unit {
+        let root = Path("/tmp/metis-media-context-image-understanding-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
+        Directory.create(root, recursive: true)
+        let image = root.join("image.jpg")
+        File.writeTo(image, "fake-image".toArray())
+        File.writeTo(Path(image.toString() + ".analysis.txt"), "a green square".toArray())
+        try {
+            let media = JsonObject()
+            let records = JsonArray([])
+            let record = JsonObject()
+            record.put("mediaKind", JsonString("photo"))
+            record.put("mimeType", JsonString("image/jpeg"))
+            record.put("localPath", JsonString(image.toString()))
+            record.put("downloaded", JsonBool(true))
+            records.add(record)
+            media.put("records", records)
+
+            let prompt = gatewayBuildMediaContextPrompt(media)
+            @Expect(prompt.contains("MediaUnderstandingStatus=ok"), true)
+            @Expect(prompt.contains("MediaUnderstandingCapability=image"), true)
+            @Expect(prompt.contains("ImageDescription=a green square"), true)
+        } finally {
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func mediaUnderstandingRuntimeReportsVideoNotConfigured(): Unit {
+        let root = Path("/tmp/metis-media-understanding-video-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
+        Directory.create(root, recursive: true)
+        let video = root.join("clip.mp4")
+        File.writeTo(video, "fake-video".toArray())
+        try {
+            let record = JsonObject()
+            record.put("mediaKind", JsonString("video"))
+            record.put("mimeType", JsonString("video/mp4"))
+            record.put("localPath", JsonString(video.toString()))
+            record.put("downloaded", JsonBool(true))
+
+            let result = gatewayMediaUnderstandingForRecord(record)
+            @Expect(result.get("status").getOrThrow().asString().getValue(), "not_configured")
+            @Expect(result.get("capability").getOrThrow().asString().getValue(), "video")
+            @Expect(result.get("videoUnderstandingStatus").getOrThrow().asString().getValue(), "not_configured")
+        } finally {
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func mediaContextPromptIncludesVideoDescriptionCompanion(): Unit {
+        let root = Path("/tmp/metis-media-context-video-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
+        Directory.create(root, recursive: true)
+        let video = root.join("clip.mp4")
+        File.writeTo(video, "fake-video".toArray())
+        File.writeTo(Path(video.toString() + ".video.txt"), "demo video description".toArray())
+        try {
+            let media = JsonObject()
+            let records = JsonArray([])
+            let record = JsonObject()
+            record.put("mediaKind", JsonString("video"))
+            record.put("mimeType", JsonString("video/mp4"))
+            record.put("localPath", JsonString(video.toString()))
+            record.put("downloaded", JsonBool(true))
+            records.add(record)
+            media.put("records", records)
+            let prompt = gatewayBuildMediaContextPrompt(media)
+            @Expect(prompt.contains("VideoDescription=demo video description"), true)
+        } finally {
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func mediaUnderstandingRuntimeExtractsDocumentCompanion(): Unit {
+        let root = Path("/tmp/metis-media-document-extract-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
+        Directory.create(root, recursive: true)
+        let doc = root.join("report.pdf")
+        File.writeTo(doc, "fake-pdf".toArray())
+        File.writeTo(Path(doc.toString() + ".extract.txt"), "extracted pdf content".toArray())
+        try {
+            let record = JsonObject()
+            record.put("mediaKind", JsonString("document"))
+            record.put("mimeType", JsonString("application/pdf"))
+            record.put("originalFileName", JsonString("report.pdf"))
+            record.put("localPath", JsonString(doc.toString()))
+            record.put("downloaded", JsonBool(true))
+            let result = gatewayMediaUnderstandingForRecord(record)
+            @Expect(result.get("status").getOrThrow().asString().getValue(), "ok")
+            @Expect(result.get("documentExtractStatus").getOrThrow().asString().getValue(), "ok")
+            @Expect(gatewayMediaUnderstandingFirstText(result), "extracted pdf content")
         } finally {
             try { remove(root, recursive: true) } catch (_e: Exception) { () }
         }

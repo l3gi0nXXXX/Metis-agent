@@ -353,6 +353,51 @@ private func gatewayTelegramBuildDiagnosticFindings(user: GatewayUserSettings, r
             "Set mediaMaxBytes to a bounded value."
         )
     }
+    gatewayTelegramAddFinding(
+        findings,
+        "telegram-media-understanding-runtime",
+        "info",
+        "passed",
+        "Telegram media understanding runtime is wired through Gateway mediaContext.",
+        "Image/sticker/audio/video/document understanding uses downloaded localPath plus configured/companion runtime output; missing providers return explicit not_configured or metadata_only states.",
+        "Configure ASR/vision/video/document providers or companion extraction files when automatic understanding is required."
+    )
+    gatewayTelegramAddFinding(
+        findings,
+        "telegram-native-command-dispatch",
+        "info",
+        "passed",
+        "Telegram native commands are handled before the ReAct/model path.",
+        "/help, /status, /models, /subagents, /sessions, /approvals, /activation, and /pair have deterministic GatewayService/RPC handling.",
+        "Keep Telegram menu commands aligned with GatewayService native dispatch."
+    )
+    gatewayTelegramAddFinding(
+        findings,
+        "telegram-target-writeback-policy",
+        "info",
+        "passed",
+        "Telegram target writeback remains permission-gated.",
+        "Read-only target list/resolve/send tools are available; configuration writeback must stay behind admin/operator scopes and Gateway RPC mutation policy.",
+        "Do not allow ordinary Telegram chat turns to mutate metis.json directly."
+    )
+    gatewayTelegramAddFinding(
+        findings,
+        "telegram-thread-binding-manager",
+        "info",
+        if (user.telegram.threadBindings.enabled) { "passed" } else { "skipped" },
+        "Telegram thread binding manager state is explicit.",
+        "threadBindings.enabled=${user.telegram.threadBindings.enabled}, spawnSubagentSessions=${user.telegram.threadBindings.spawnSubagentSessions}, spawnAcpSessions=${user.telegram.threadBindings.spawnAcpSessions}.",
+        "Enable threadBindings only when Telegram forum/topic session binding is required."
+    )
+    gatewayTelegramAddFinding(
+        findings,
+        "telegram-chat-action-backoff",
+        "info",
+        "passed",
+        "Telegram chat action failures are bounded by runtime backoff.",
+        "sendChatAction 401/403 failures stop repeated chat-action attempts for the current adapter instance.",
+        "Inspect adapter lastSendError/runtime state if typing indicators stop after authorization failures."
+    )
     if (user.telegram.webhookMaxBodyBytes <= 0) {
         gatewayTelegramAddFinding(
             findings,
@@ -471,8 +516,16 @@ public func gatewayTelegramDiagnosticsJson(user: GatewayUserSettings, runtime!: 
         "groupAllowFrom",
         "media",
         "mediaUnderstanding",
+        "asr",
+        "vision",
+        "videoUnderstanding",
+        "documentExtract",
+        "nativeCommands",
         "approvalResolver",
         "streamingDraft",
+        "threadBindings",
+        "targetWriteback",
+        "chatActionBackoff",
         "directoryAggregation",
         "modelButtons",
         "actions",

@@ -9,6 +9,7 @@ import magic.prelude.*
 import metis.core.gatewayCurrentToolRuntimeContext
 import metis.core.{renderGatewayAudioText, renderGatewayDocumentText, renderGatewayPhotoText, renderGatewayStickerText, renderGatewayVideoNoteText, renderGatewayVideoText, renderGatewayVoiceText}
 import metis.core.config.{CliConfig, CliSettingManager, MetisPaths}
+import metis.core.{gatewayMediaUnderstandingFirstText, gatewayMediaUnderstandingForRecord, gatewayMediaUnderstandingOutputs}
 import metis.io.PrintUtils
 
 import std.collection.{ArrayList, HashSet}
@@ -189,34 +190,6 @@ private func telegramMediaToolResolveDestination(destination: String, record: Js
     (true, dest, "")
 }
 
-private func telegramMediaToolAudioTranscript(record: JsonObject): String {
-    let sourcePath = telegramMediaToolString(record, "localPath")
-    if (sourcePath.isEmpty()) {
-        return ""
-    }
-    for (suffix in [".transcript.txt", ".txt", ".transcript"]) {
-        let path = Path(sourcePath + suffix)
-        if (exists(path)) {
-            return try { String.fromUtf8(File.readFrom(path)).trimAscii() } catch (_e: Exception) { "" }
-        }
-    }
-    ""
-}
-
-private func telegramMediaToolImageAnalysis(record: JsonObject): String {
-    let sourcePath = telegramMediaToolString(record, "localPath")
-    if (sourcePath.isEmpty()) {
-        return ""
-    }
-    for (suffix in [".analysis.txt", ".vision.txt", ".description.txt"]) {
-        let path = Path(sourcePath + suffix)
-        if (exists(path)) {
-            return try { String.fromUtf8(File.readFrom(path)).trimAscii() } catch (_e: Exception) { "" }
-        }
-    }
-    ""
-}
-
 private func telegramMediaToolProviderFromModelRef(modelRef: String): String {
     let normalized = modelRef.trimAscii()
     if (normalized.contains(":")) {
@@ -338,6 +311,45 @@ private func telegramStickerCachePersistCurrentRecords(): JsonArray {
     }
     File.writeTo(telegramStickerCachePath(), merged.toJsonString().toArray())
     merged
+}
+
+private func telegramStickerCacheUpsertAnalysis(record: JsonObject, analysis: String): Unit {
+    let key = telegramStickerCacheKey(record)
+    if (key.isEmpty() || analysis.trimAscii().isEmpty()) {
+        return
+    }
+    let existing = telegramStickerCacheLoad()
+    let merged = JsonArray([])
+    var updated = false
+    for (item in existing.getItems()) {
+        let obj = try { item.asObject() } catch (_e: Exception) { JsonObject() }
+        if (telegramStickerCacheKey(obj) == key) {
+            obj.put("analysis", JsonString(analysis.trimAscii()))
+            obj.put("description", JsonString(analysis.trimAscii()))
+            obj.put("cachedAtMs", DateTime.now().toUnixTimeStamp().toMilliseconds().toJsonValue())
+            updated = true
+        }
+        merged.add(obj)
+    }
+    if (!updated) {
+        let cached = JsonObject()
+        for (field in ["mediaId", "fileId", "fileUniqueId", "emoji", "setName", "mimeType", "fileName", "localPath", "downloaded", "createdAtMs"]) {
+            match (record.get(field)) {
+                case Some(v) => cached.put(field, v)
+                case None => ()
+            }
+        }
+        cached.put("mediaKind", JsonString("sticker"))
+        cached.put("analysis", JsonString(analysis.trimAscii()))
+        cached.put("description", JsonString(analysis.trimAscii()))
+        cached.put("cachedAtMs", DateTime.now().toUnixTimeStamp().toMilliseconds().toJsonValue())
+        merged.add(cached)
+    }
+    let root = telegramStickerCacheRoot()
+    if (!exists(root)) {
+        Directory.create(root, recursive: true)
+    }
+    File.writeTo(telegramStickerCachePath(), merged.toJsonString().toArray())
 }
 
 private func telegramMediaToolVisionCandidates(): Array<String> {
@@ -547,6 +559,14 @@ public class GatewayTelegramMediaToolset {
         this.transcribeTelegramAudio(mediaId, index)
     }
 
+    public func debugTelegramVideoDescribeForTest(mediaId: Option<String>, index: Option<Int64>): String {
+        this.describeTelegramVideo(mediaId, index)
+    }
+
+    public func debugTelegramDocumentExtractForTest(mediaId: Option<String>, index: Option<Int64>, maxBytes: Option<Int64>): String {
+        this.extractTelegramDocument(mediaId, index, maxBytes)
+    }
+
     public func debugTelegramTargetListFromAuditForTest(auditEnvelope: JsonObject): String {
         this.renderTelegramTargetListFromAudit(auditEnvelope)
     }
@@ -751,18 +771,41 @@ public class GatewayTelegramMediaToolset {
             out.put("error", JsonString("selected media is not image-like"))
             return out.toJsonString()
         }
-        let analysis = telegramMediaToolImageAnalysis(record)
         out.put("mediaId", JsonString(telegramMediaToolString(record, "mediaId")))
         let promptText = match (prompt) {
             case Some(v) => v.trimAscii()
             case None => ""
         }
         if (!promptText.isEmpty()) { out.put("prompt", JsonString(promptText)) }
+        let capability = if (kind == "sticker") { "sticker" } else { "image" }
+        let understanding = gatewayMediaUnderstandingForRecord(record, capability: capability, prompt: promptText)
+        let analysis = gatewayMediaUnderstandingFirstText(understanding)
         if (!analysis.isEmpty()) {
             out.put("ok", JsonBool(true))
             out.put("status", JsonString("ok"))
             out.put("analysis", JsonString(analysis))
-            out.put("source", JsonString("sidecar"))
+            match (understanding.get("outputs")) {
+                case Some(v) => out.put("outputs", v)
+                case None => ()
+            }
+            match (understanding.get("decision")) {
+                case Some(v) => out.put("decision", v)
+                case None => ()
+            }
+            match (understanding.get("capability")) {
+                case Some(v) => out.put("capability", v)
+                case None => ()
+            }
+            let outputs = gatewayMediaUnderstandingOutputs(understanding)
+            let source = if (outputs.size() > 0) {
+                try { outputs[0].asObject().get("source").getOrThrow().asString().getValue() } catch (_e: Exception) { "media_understanding_runtime" }
+            } else {
+                "media_understanding_runtime"
+            }
+            out.put("source", JsonString(source))
+            if (kind == "sticker") {
+                telegramStickerCacheUpsertAnalysis(record, analysis)
+            }
         } else {
             let runtime = telegramMediaToolDescribeImageWithModel(record, promptText)
             for (key in ["ok", "status", "analysis", "provider", "model", "error", "attempts", "fileBytes", "limitBytes"]) {
@@ -773,6 +816,8 @@ public class GatewayTelegramMediaToolset {
             }
             if (!(try { runtime.get("ok").getOrThrow().asBool().getValue() } catch (_e: Exception) { false })) {
                 out.put("fallback", JsonString("Bind gateway.channelModels.telegram or the primary/fallback model to a vision-capable OpenAI-compatible or Ollama model."))
+            } else if (kind == "sticker") {
+                telegramStickerCacheUpsertAnalysis(record, telegramMediaToolString(runtime, "analysis"))
             }
         }
         out.toJsonString()
@@ -804,17 +849,135 @@ public class GatewayTelegramMediaToolset {
             out.put("error", JsonString("selected media is not audio-like"))
             return out.toJsonString()
         }
-        let transcript = telegramMediaToolAudioTranscript(record)
+        let understanding = gatewayMediaUnderstandingForRecord(record, capability: "audio")
+        let transcript = gatewayMediaUnderstandingFirstText(understanding)
         out.put("mediaId", JsonString(telegramMediaToolString(record, "mediaId")))
+        match (understanding.get("outputs")) {
+            case Some(v) => out.put("outputs", v)
+            case None => ()
+        }
+        match (understanding.get("decision")) {
+            case Some(v) => out.put("decision", v)
+            case None => ()
+        }
+        match (understanding.get("capability")) {
+            case Some(v) => out.put("capability", v)
+            case None => ()
+        }
         if (transcript.isEmpty()) {
             out.put("ok", JsonBool(false))
             out.put("status", JsonString("unsupported"))
             out.put("ASRStatus", JsonString("not_configured"))
-            out.put("error", JsonString("ASR adapter is not configured and no transcript sidecar exists"))
+            let error = telegramMediaToolString(understanding, "error")
+            out.put("error", JsonString(if (error.isEmpty()) { "native ASR runtime is not configured and no transcript companion file exists" } else { error }))
         } else {
             out.put("ok", JsonBool(true))
             out.put("status", JsonString("ok"))
             out.put("transcript", JsonString(transcript))
+        }
+        out.toJsonString()
+    }
+
+    private func describeTelegramVideo(mediaId: Option<String>, index: Option<Int64>): String {
+        let targetMediaId = match (mediaId) {
+            case Some(v) => v.trimAscii()
+            case None => ""
+        }
+        let targetIndex = match (index) {
+            case Some(v) => v
+            case None => 0
+        }
+        let out = JsonObject()
+        let record = match (telegramMediaToolRecordByTarget(targetMediaId, targetIndex)) {
+            case Some(v) => v
+            case None =>
+                out.put("ok", JsonBool(false))
+                out.put("status", JsonString("error"))
+                out.put("error", JsonString("media resource not found in current session turn"))
+                return out.toJsonString()
+        }
+        let kind = telegramMediaToolString(record, "mediaKind").toAsciiLower()
+        let mime = telegramMediaToolString(record, "mimeType").toAsciiLower()
+        if (!(kind == "video" || kind == "video-note" || kind == "video_note" || mime.startsWith("video/"))) {
+            out.put("ok", JsonBool(false))
+            out.put("status", JsonString("unsupported"))
+            out.put("error", JsonString("selected media is not video-like"))
+            return out.toJsonString()
+        }
+        let understanding = gatewayMediaUnderstandingForRecord(record, capability: "video")
+        let description = gatewayMediaUnderstandingFirstText(understanding)
+        out.put("mediaId", JsonString(telegramMediaToolString(record, "mediaId")))
+        match (understanding.get("outputs")) {
+            case Some(v) => out.put("outputs", v)
+            case None => ()
+        }
+        match (understanding.get("decision")) {
+            case Some(v) => out.put("decision", v)
+            case None => ()
+        }
+        out.put("capability", JsonString("video"))
+        if (description.isEmpty()) {
+            out.put("ok", JsonBool(false))
+            out.put("status", JsonString("unsupported"))
+            out.put("videoUnderstandingStatus", JsonString("not_configured"))
+            out.put("error", JsonString(telegramMediaToolString(understanding, "error")))
+        } else {
+            out.put("ok", JsonBool(true))
+            out.put("status", JsonString("ok"))
+            out.put("description", JsonString(description))
+        }
+        out.toJsonString()
+    }
+
+    private func extractTelegramDocument(mediaId: Option<String>, index: Option<Int64>, maxBytes: Option<Int64>): String {
+        let targetMediaId = match (mediaId) {
+            case Some(v) => v.trimAscii()
+            case None => ""
+        }
+        let targetIndex = match (index) {
+            case Some(v) => v
+            case None => 0
+        }
+        let limit = match (maxBytes) {
+            case Some(v) => if (v <= 0) { 8192 } else { v }
+            case None => 8192
+        }
+        let out = JsonObject()
+        let record = match (telegramMediaToolRecordByTarget(targetMediaId, targetIndex)) {
+            case Some(v) => v
+            case None =>
+                out.put("ok", JsonBool(false))
+                out.put("status", JsonString("error"))
+                out.put("error", JsonString("media resource not found in current session turn"))
+                return out.toJsonString()
+        }
+        let kind = telegramMediaToolString(record, "mediaKind").toAsciiLower()
+        if (kind != "document") {
+            out.put("ok", JsonBool(false))
+            out.put("status", JsonString("unsupported"))
+            out.put("error", JsonString("selected media is not a document"))
+            return out.toJsonString()
+        }
+        let understanding = gatewayMediaUnderstandingForRecord(record, capability: "document", maxBytes: limit)
+        let preview = gatewayMediaUnderstandingFirstText(understanding)
+        out.put("mediaId", JsonString(telegramMediaToolString(record, "mediaId")))
+        out.put("capability", JsonString("document"))
+        match (understanding.get("outputs")) {
+            case Some(v) => out.put("outputs", v)
+            case None => ()
+        }
+        match (understanding.get("decision")) {
+            case Some(v) => out.put("decision", v)
+            case None => ()
+        }
+        out.put("status", understanding.get("status") ?? JsonString("metadata_only"))
+        out.put("ok", understanding.get("ok") ?? JsonBool(false))
+        if (!preview.isEmpty()) {
+            out.put("content", JsonString(preview))
+            out.put("readable", JsonBool(true))
+        } else {
+            out.put("readable", JsonBool(false))
+            out.put("reason", JsonString("document extractor is not configured or media is not text-like"))
         }
         out.toJsonString()
     }
@@ -1132,6 +1295,35 @@ public class GatewayTelegramMediaToolset {
     public func telegram_audio_transcribe(mediaId: Option<String>, index: Option<Int64>): String {
         PrintUtils.printTool("telegram_audio_transcribe", shortMessage: "current")
         let text = this.transcribeTelegramAudio(mediaId, index)
+        PrintUtils.printToolResult(text)
+        return text
+    }
+
+    @tool[
+        description: "Describe a Telegram video/video-note media resource from the current turn. Reads configured companion/runtime output when present; otherwise returns videoUnderstandingStatus=not_configured.",
+        parameters: {
+            mediaId: "Optional mediaId returned by telegram_media_list.",
+            index: "Optional zero-based media index."
+        }
+    ]
+    public func telegram_video_describe(mediaId: Option<String>, index: Option<Int64>): String {
+        PrintUtils.printTool("telegram_video_describe", shortMessage: "current")
+        let text = this.describeTelegramVideo(mediaId, index)
+        PrintUtils.printToolResult(text)
+        return text
+    }
+
+    @tool[
+        description: "Extract text/preview from a Telegram document media resource. Text-like files are read directly; extracted companion files are used when available; unsupported documents return metadata_only.",
+        parameters: {
+            mediaId: "Optional mediaId returned by telegram_media_list.",
+            index: "Optional zero-based media index.",
+            maxBytes: "Optional maximum preview bytes/chars. Defaults to 8192."
+        }
+    ]
+    public func telegram_document_extract(mediaId: Option<String>, index: Option<Int64>, maxBytes: Option<Int64>): String {
+        PrintUtils.printTool("telegram_document_extract", shortMessage: "current")
+        let text = this.extractTelegramDocument(mediaId, index, maxBytes)
         PrintUtils.printToolResult(text)
         return text
     }

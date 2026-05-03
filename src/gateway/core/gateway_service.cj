@@ -3,6 +3,7 @@ package metis.gateway.core
 import metis.core.config.{CliSettingManager, GatewayUserSettings, cliSetupVisibleModelProviders}
 import metis.gateway.model.*
 import metis.gateway.session.{GatewaySessionContext, gatewaySessionRequestFromInbound}
+import metis.gateway.tools.{gatewayHandleNativeCommandLine, gatewayHandleSubagentsCommandLine}
 import magic.log.LogUtils
 import std.collection.ArrayList
 import std.convert.Parsable
@@ -183,6 +184,61 @@ public class GatewayService {
 
     private func handleTelegramNativeCommand(message: InboundMessage, accountId: String, user: GatewayUserSettings): Bool {
         let text = message.text.trimAscii()
+        if (text == "/help" || text.startsWith("/help ") ||
+            text == "/status" || text.startsWith("/status ") ||
+            text == "/activation" || text.startsWith("/activation ") ||
+            text == "/pair" || text.startsWith("/pair ")) {
+            match (gatewayHandleNativeCommandLine(text)) {
+                case Some(reply) =>
+                    this.sendTextToPeerDetailed(
+                        "telegram",
+                        message.peerId,
+                        reply,
+                        replyToMessageId: message.replyTargetMessageId,
+                        replyInThread: message.replyInThread,
+                        accountId: accountId
+                    )
+                    return true
+                case None => ()
+            }
+        }
+        if (text == "/subagents" || text.startsWith("/subagents ")) {
+            match (gatewayHandleSubagentsCommandLine(text)) {
+                case Some(reply) =>
+                    this.sendTextToPeerDetailed(
+                        "telegram",
+                        message.peerId,
+                        reply,
+                        replyToMessageId: message.replyTargetMessageId,
+                        replyInThread: message.replyInThread,
+                        accountId: accountId
+                    )
+                    return true
+                case None => ()
+            }
+        }
+        if (text == "/sessions" || text.startsWith("/sessions ")) {
+            this.sendTextToPeerDetailed(
+                "telegram",
+                message.peerId,
+                this.renderTelegramSessionsCommand(text),
+                replyToMessageId: message.replyTargetMessageId,
+                replyInThread: message.replyInThread,
+                accountId: accountId
+            )
+            return true
+        }
+        if (text == "/approvals" || text.startsWith("/approvals ")) {
+            this.sendTextToPeerDetailed(
+                "telegram",
+                message.peerId,
+                this.renderTelegramApprovalsCommand(),
+                replyToMessageId: message.replyTargetMessageId,
+                replyInThread: message.replyInThread,
+                accountId: accountId
+            )
+            return true
+        }
         if (text == "/models" || text.startsWith("/models ")) {
             this.sendTextToPeerDetailed(
                 "telegram",
@@ -222,6 +278,14 @@ public class GatewayService {
             }
         }
         false
+    }
+
+    private func renderTelegramSessionsCommand(text: String): String {
+        "{\"ok\":true,\"status\":\"ok\",\"action\":\"sessions\",\"usage\":\"/sessions list | /sessions path | /sessions preview <sessionKey>\",\"message\":\"Telegram /sessions is handled natively by GatewayService. Use CLI/control-ui Gateway sessions views for full transcript details.\"}"
+    }
+
+    private func renderTelegramApprovalsCommand(): String {
+        "{\"ok\":true,\"status\":\"ok\",\"action\":\"approvals\",\"message\":\"Telegram approvals are handled by native callback resolver. Use control-ui or Gateway approvals surface for the full pending approval list.\"}"
     }
 
     private func telegramModelsPageFromCommand(text: String): Int64 {

@@ -1,10 +1,10 @@
 package metis.gateway.core
 
-import metis.core.GatewayToolRuntimeContext
+import metis.core.{GatewayToolRuntimeContext, gatewayMediaUnderstandingFirstText, gatewayMediaUnderstandingForRecord}
 import metis.core.config.GatewayUserSettings
 import metis.gateway.session.{GatewaySessionContext, GatewaySessionRequest, gatewayResolveSessionContext}
 import std.collection.ArrayList
-import std.fs.{File, Path, exists}
+import std.fs.{Path, exists}
 import stdx.encoding.json.{JsonArray, JsonObject}
 
 private func gatewayJsonString(obj: JsonObject, key: String): String {
@@ -87,32 +87,6 @@ private func gatewayMediaContextStructuredSummary(mediaContext: JsonObject): Str
     String.join(lines.toArray(), delimiter: "\n")
 }
 
-private func gatewayMediaSafeTextPreview(pathText: String, maxBytes!: Int64 = 8192): String {
-    let path = Path(pathText)
-    if (pathText.trimAscii().isEmpty() || !exists(path)) {
-        return ""
-    }
-    let bytes = File.readFrom(path)
-    if (bytes.size > maxBytes) {
-        return String.fromUtf8(bytes[..maxBytes]).replace("\r\n", "\n").replace("\r", "\n") + "\n[truncated]"
-    }
-    String.fromUtf8(bytes).replace("\r\n", "\n").replace("\r", "\n")
-}
-
-private func gatewayMediaAudioTranscript(localPath: String): String {
-    let candidates = [
-        "${localPath}.transcript.txt",
-        "${localPath}.txt",
-        "${localPath}.transcript"
-    ]
-    for (candidate in candidates) {
-        if (exists(Path(candidate))) {
-            return gatewayMediaSafeTextPreview(candidate, maxBytes: 4096).trimAscii()
-        }
-    }
-    ""
-}
-
 public func gatewayBuildMediaContextPrompt(mediaContext: JsonObject): String {
     let records = gatewayMediaRecords(mediaContext)
     let structuredSummary = gatewayMediaContextStructuredSummary(mediaContext)
@@ -140,16 +114,19 @@ public func gatewayBuildMediaContextPrompt(mediaContext: JsonObject): String {
         let relation = gatewayJsonString(record, "relation")
         let downloaded = gatewayJsonBool(record, "downloaded")
         let skipped = gatewayJsonString(record, "skippedReason")
-        let transcript = if ((kind == "voice" || kind == "audio") && downloaded && !localPath.isEmpty()) {
-            gatewayMediaAudioTranscript(localPath)
+        let understanding = if (downloaded && !localPath.isEmpty() && exists(Path(localPath))) {
+            gatewayMediaUnderstandingForRecord(record)
         } else {
-            ""
+            JsonObject()
         }
-        let filePreview = if (kind == "document" && downloaded && gatewayMediaReadableTextMime(mime, fileName) && !localPath.isEmpty()) {
-            gatewayMediaSafeTextPreview(localPath).trimAscii()
-        } else {
-            ""
-        }
+        let understandingStatus = gatewayJsonString(understanding, "status")
+        let understandingCapability = gatewayJsonString(understanding, "capability")
+        let understandingText = gatewayMediaUnderstandingFirstText(understanding)
+        let transcript = if (understandingCapability == "audio") { understandingText } else { "" }
+        let imageDescription = if (understandingCapability == "image") { understandingText } else { "" }
+        let stickerDescription = if (understandingCapability == "sticker") { understandingText } else { "" }
+        let videoDescription = if (understandingCapability == "video") { understandingText } else { "" }
+        let filePreview = if (understandingCapability == "document") { understandingText } else { "" }
         if (!localPath.isEmpty()) {
             paths.add(localPath)
         }
@@ -165,6 +142,8 @@ public func gatewayBuildMediaContextPrompt(mediaContext: JsonObject): String {
         if (!localPath.isEmpty()) { row.add("MediaPath=${localPath}") }
         row.add("downloaded=${downloaded}")
         if (!skipped.isEmpty()) { row.add("skippedReason=${skipped}") }
+        if (!understandingStatus.isEmpty()) { row.add("MediaUnderstandingStatus=${understandingStatus}") }
+        if (!understandingCapability.isEmpty()) { row.add("MediaUnderstandingCapability=${understandingCapability}") }
         if (!transcript.isEmpty()) {
             row.add("AudioTranscript=${transcript}")
         } else if ((kind == "voice" || kind == "audio") && downloaded) {
@@ -175,11 +154,26 @@ public func gatewayBuildMediaContextPrompt(mediaContext: JsonObject): String {
             row.add("visionInputReady=true")
             row.add("visionRuntimeAvailable=unknown")
             row.add("visionAction=use telegram_image_analyze")
+            if (!imageDescription.isEmpty()) {
+                row.add("ImageDescription=${imageDescription}")
+            }
+            if (!stickerDescription.isEmpty()) {
+                row.add("StickerDescription=${stickerDescription}")
+            }
+        }
+        if ((kind == "video" || kind == "video-note" || kind == "video_note" || mime.startsWith("video/")) && downloaded) {
+            if (!videoDescription.isEmpty()) {
+                row.add("VideoDescription=${videoDescription}")
+            } else {
+                row.add("VideoUnderstandingStatus=not_configured")
+                row.add("VideoAction=use telegram_video_describe")
+            }
         }
         if (!filePreview.isEmpty()) {
             row.add("FileContentPreview=${filePreview}")
         } else if (kind == "document" && downloaded) {
-            row.add("FileContentStatus=metadata_only")
+            row.add("DocumentExtractStatus=metadata_only")
+            row.add("DocumentAction=use telegram_document_extract")
         }
         lines.add("- " + String.join(row.toArray(), delimiter: "; "))
     }

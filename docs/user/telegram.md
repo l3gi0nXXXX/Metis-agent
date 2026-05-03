@@ -310,8 +310,35 @@ modelHandling=vision-input-ready
 |---|---|---|
 | `photo` | `vision` | 图片可作为视觉上下文；模型不支持视觉时保留路径和元数据。 |
 | `voice` / `audio` | `transcription` | 语音/音频可作为转写输入；未配置 ASR 时保留元数据。 |
-| `document` | `file-context` | 文件可作为文件上下文；不可读或未下载时保留元数据。 |
-| `sticker` / 其他 | `metadata-only` | 仅作为结构化事件和元数据进入上下文。 |
+| `video` / `video_note` | `video-understanding` | 视频可作为视频理解输入；未配置视频理解时保留本地路径和元数据。 |
+| `document` | `file-context` | 文本类文件直接预览；PDF/Office 等依赖 extractor 或 companion extract；不可读时保留元数据。 |
+| `sticker` | `vision` / `metadata-only` | sticker 按 image-like 流程理解；描述会进入 sticker durable cache。 |
+
+### 入站媒体理解工具
+
+Gateway 会把当前 Telegram turn 的媒体对象注入 `mediaContext`。Agent 可以通过这些工具读取，不需要从可见聊天文本中解析 `fileId`：
+
+| 工具 | 用途 | 无 provider 时行为 |
+|---|---|---|
+| `telegram_media_list` | 列出当前 turn 的结构化媒体对象。 | 返回空列表。 |
+| `telegram_media_save` | 保存已下载媒体到用户指定路径。 | 未下载或路径受保护时返回错误，不写真实配置。 |
+| `telegram_media_read` | 读取 text-like 文件。 | 二进制文件返回 `readable=false`。 |
+| `telegram_image_analyze` | 图片/sticker 理解。 | 返回 `vision provider is not configured` 或建议配置视觉模型。 |
+| `telegram_audio_transcribe` | voice/audio 转写。 | 返回 `ASRStatus=not_configured`。 |
+| `telegram_video_describe` | video/video-note 描述。 | 返回 `videoUnderstandingStatus=not_configured`。 |
+| `telegram_document_extract` | 文档抽取或预览。 | 返回 `metadata_only`。 |
+| `telegram_sticker_search/get/cache_stats` | 查询当前上下文和 durable sticker cache。 | cache 为空时返回空结果。 |
+
+当前 native runtime 会优先读取媒体记录中的已知字段和本地 companion 文件：
+
+| 类型 | companion 文件 |
+|---|---|
+| 音频 | `<localPath>.transcript.txt`、`<localPath>.txt`、`<localPath>.transcript` |
+| 图片/sticker | `<localPath>.analysis.txt`、`<localPath>.vision.txt`、`<localPath>.description.txt` |
+| 视频 | `<localPath>.video.txt`、`<localPath>.analysis.txt`、`<localPath>.description.txt` |
+| 文档 | text-like 文件直接读取；否则读取 `<localPath>.extract.txt`、`<localPath>.text.txt`、`<localPath>.preview.txt` |
+
+这部分不引入 Node sidecar，也不绕过 Gateway/channel/session 架构。真正的 ASR、vision、video、document provider 未配置时，Metis 会明确返回 `not_configured` / `metadata_only`，不会猜测媒体内容。
 
 ### 出站图片
 
