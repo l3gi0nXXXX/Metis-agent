@@ -197,6 +197,48 @@ public class GatewayServiceTelegramNativeTest {
     }
 
     @TestCase
+    public func unknownTelegramCallbackIsHandledNativelyWithoutModelPath(): Unit {
+        withGatewayTelegramNativeTestHome {
+            var user = GatewayUserSettings()
+            user.telegram.enabled = true
+            user.telegram.allowFrom = ["*"]
+            user.telegram.actions.callbackQuery = true
+            CliSettingManager.writeGatewaySettings(user)
+
+            let adapter = GatewayTelegramNativeTestAdapter()
+            let service = gatewayTelegramNativeService(adapter)
+            service.start()
+            adapter.queue("[telegram-callback]\nid=cb-unknown\nmessageId=1\nactionType=unknown\ndata=unknown:action\nby=8734062810")
+            service.processOnce()
+
+            let text = adapter.sentText(0)
+            @Expect(text.contains("\"action\":\"telegram_callback\""), true)
+            @Expect(text.contains("\"reason\":\"unknown callback action\""), true)
+        }
+    }
+
+    @TestCase
+    public func pluginTelegramCallbackReportsNativeNotApplicable(): Unit {
+        withGatewayTelegramNativeTestHome {
+            var user = GatewayUserSettings()
+            user.telegram.enabled = true
+            user.telegram.allowFrom = ["*"]
+            user.telegram.actions.callbackQuery = true
+            CliSettingManager.writeGatewaySettings(user)
+
+            let adapter = GatewayTelegramNativeTestAdapter()
+            let service = gatewayTelegramNativeService(adapter)
+            service.start()
+            adapter.queue("[telegram-callback]\nid=cb-plugin\nmessageId=1\nactionType=plugin-not-applicable\ndata=plugin:demo:run\nby=8734062810")
+            service.processOnce()
+
+            let text = adapter.sentText(0)
+            @Expect(text.contains("\"status\":\"not_applicable\""), true)
+            @Expect(text.contains("OpenClaw plugin interactive callbacks"), true)
+        }
+    }
+
+    @TestCase
     public func telegramNativeCommandsBypassModelForHelpSubagentsSessionsAndApprovals(): Unit {
         withGatewayTelegramNativeTestHome {
             var user = GatewayUserSettings()

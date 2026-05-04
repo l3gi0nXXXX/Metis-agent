@@ -292,6 +292,7 @@ public struct TelegramMediaUserSettings {
     public var outboundAllowLocalPath: Bool = false
     public var outboundLocalRoots: Array<String> = []
     public var albumPolicy: String = "single-largest"
+    public var warnOnDownloadFailure: Bool = true
 }
 
 @jsonable

@@ -579,6 +579,7 @@ private func gatewayTelegramChannelJson(user: GatewayUserSettings): JsonObject {
     }
     media.put("outboundLocalRoots", localRoots)
     media.put("albumPolicy", JsonString(user.telegram.media.albumPolicy))
+    media.put("warnOnDownloadFailure", user.telegram.media.warnOnDownloadFailure.toJsonValue())
     result.put("media", media)
     result.put("setup", gatewayTelegramSetupJson(user))
     result.put("directory", gatewayTelegramDirectoryJson(user))

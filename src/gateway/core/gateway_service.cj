@@ -276,8 +276,62 @@ public class GatewayService {
                 )
                 return true
             }
+            if (data.startsWith("commands:help:")) {
+                let reply = gatewayHandleNativeCommandLine("/help").getOrThrow()
+                this.sendTextToPeerDetailed(
+                    "telegram",
+                    message.peerId,
+                    reply,
+                    replyToMessageId: message.replyTargetMessageId,
+                    replyInThread: message.replyInThread,
+                    accountId: accountId
+                )
+                return true
+            }
+            if (data.startsWith("sessions:")) {
+                this.sendTextToPeerDetailed(
+                    "telegram",
+                    message.peerId,
+                    this.renderTelegramSessionsCommand("/sessions list"),
+                    replyToMessageId: message.replyTargetMessageId,
+                    replyInThread: message.replyInThread,
+                    accountId: accountId
+                )
+                return true
+            }
+            if (data.startsWith("subagents:")) {
+                let reply = gatewayHandleSubagentsCommandLine("/subagents list current") ?? "{\"ok\":true,\"status\":\"ok\",\"action\":\"subagents\",\"message\":\"Telegram subagent callback was acknowledged.\"}"
+                this.sendTextToPeerDetailed(
+                    "telegram",
+                    message.peerId,
+                    reply,
+                    replyToMessageId: message.replyTargetMessageId,
+                    replyInThread: message.replyInThread,
+                    accountId: accountId
+                )
+                return true
+            }
+            let actionType = this.telegramNativeField(text, "actionType").trimAscii()
+            let reply = if (actionType == "plugin-not-applicable" || data.startsWith("plugin:")) {
+                "{\"ok\":false,\"status\":\"not_applicable\",\"action\":\"telegram_callback\",\"reason\":\"Metis native Gateway does not expose OpenClaw plugin interactive callbacks. Use Metis Gateway tools or native command callbacks instead.\"}"
+            } else {
+                "{\"ok\":false,\"status\":\"ignored\",\"action\":\"telegram_callback\",\"reason\":\"unknown callback action\",\"data\":\"${this.telegramCallbackJsonEscape(data)}\"}"
+            }
+            this.sendTextToPeerDetailed(
+                "telegram",
+                message.peerId,
+                reply,
+                replyToMessageId: message.replyTargetMessageId,
+                replyInThread: message.replyInThread,
+                accountId: accountId
+            )
+            return true
         }
         false
+    }
+
+    private func telegramCallbackJsonEscape(raw: String): String {
+        raw.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "")
     }
 
     private func renderTelegramSessionsCommand(text: String): String {

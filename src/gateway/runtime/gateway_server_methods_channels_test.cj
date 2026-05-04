@@ -461,6 +461,20 @@ public class GatewayServerMethodsChannelsTest {
     }
 
     @TestCase
+    public func telegramDiagnosticsFlagUnsafeCustomApiRoot(): Unit {
+        var user = GatewayUserSettings()
+        user.telegram.enabled = true
+        user.telegram.botToken = "telegram-token"
+        user.telegram.apiRoot = "http://127.0.0.1:8081"
+        user.telegram.network.dangerouslyAllowPrivateNetwork = false
+
+        let diagnostics = gatewayTelegramDiagnosticsJson(user)
+        let findings = diagnostics.get("findings").getOrThrow().asArray().toJsonString()
+        @Expect(findings.contains("telegram-custom-api-root-risk"), true)
+        @Expect(findings.contains("private_custom_api_root") || findings.contains("non_https_custom_api_root"), true)
+    }
+
+    @TestCase
     public func telegramT11DiagnosticsDetectGroupWithoutSenderAllowlist(): Unit {
         var user = GatewayUserSettings()
         user.telegram.enabled = true

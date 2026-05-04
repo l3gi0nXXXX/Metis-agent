@@ -166,6 +166,15 @@ private class TelegramThreadFallbackFakeBotApi {
         }
         TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":true}", outcome: "ok")
     }
+
+    public func sawBodyContaining(text: String): Bool {
+        for (body in this.bodies) {
+            if (body.contains(text)) {
+                return true
+            }
+        }
+        false
+    }
 }
 
 private class TelegramChatActionUnauthorizedFakeBotApi {
@@ -180,10 +189,40 @@ private class TelegramChatActionUnauthorizedFakeBotApi {
     }
 }
 
+private class TelegramVoiceForbiddenFakeBotApi {
+    public var voiceCalls: Int64 = 0
+    public var textCalls: Int64 = 0
+    public let bodies: ArrayList<String> = ArrayList<String>()
+
+    public func handle(request: TelegramTransportRequest): TelegramTransportResponse {
+        if (request.url.contains("/sendVoice")) {
+            this.voiceCalls += 1
+            this.bodies.add(request.body)
+            return TelegramTransportResponse(true, body: "{\"ok\":false,\"description\":\"Bad Request: VOICE_MESSAGES_FORBIDDEN\"}", outcome: "ok")
+        }
+        if (request.url.contains("/sendMessage")) {
+            this.textCalls += 1
+            this.bodies.add(request.body)
+            return TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":{\"message_id\":801}}", outcome: "ok")
+        }
+        TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":true}", outcome: "ok")
+    }
+
+    public func sawBodyContaining(text: String): Bool {
+        for (body in this.bodies) {
+            if (body.contains(text)) {
+                return true
+            }
+        }
+        false
+    }
+}
+
 @Test
 public class TelegramAdapterTest {
     public init() {
         setTelegramTransportRunnerForTest(None)
+        setTelegramAsrRunnerForTest(None)
     }
 
     @TestCase
@@ -1487,7 +1526,7 @@ public class TelegramAdapterTest {
             )
         )
         adapter.start()
-        let payload = "{\"update_id\":1,\"message\":{\"message_id\":101,\"sticker\":{\"file_id\":\"sticker-file-id\"},\"chat\":{\"id\":745123456,\"type\":\"private\"},\"from\":{\"id\":745123456}}}"
+        let payload = "{\"update_id\":1,\"message\":{\"message_id\":101,\"sticker\":{\"file_id\":\"sticker-file-id\",\"emoji\":\"🙂\",\"set_name\":\"metis_pack\",\"is_animated\":false,\"is_video\":false},\"chat\":{\"id\":745123456,\"type\":\"private\"},\"from\":{\"id\":745123456}}}"
         let ack = adapter.ingestWebhookPayload(payload)
         @Expect(ack.contains("\"ok\":true"), true)
 
@@ -1498,7 +1537,13 @@ public class TelegramAdapterTest {
         @Expect(inbound[0].text.contains("fileId=sticker-file-id"), true)
         @Expect(inbound[0].text.contains("[media-context]"), true)
         @Expect(inbound[0].text.contains("mediaKind=sticker"), true)
-        @Expect(inbound[0].text.contains("eligibleFor=metadata-only"), true)
+        @Expect(inbound[0].text.contains("stickerEmoji=🙂"), true)
+        @Expect(inbound[0].text.contains("stickerSetName=metis_pack"), true)
+        @Expect(inbound[0].text.contains("eligibleFor=vision"), true)
+        let mediaRecords = inbound[0].mediaContext.get("records").getOrThrow().asArray()
+        let first = mediaRecords[0].asObject()
+        @Expect(first.get("stickerEmoji").getOrThrow().asString().getValue(), "🙂")
+        @Expect(first.get("eligibleFor").getOrThrow().asString().getValue(), "vision")
     }
 
     @TestCase
@@ -1532,6 +1577,67 @@ public class TelegramAdapterTest {
         let mediaRecords = inbound[0].mediaContext.get("records").getOrThrow().asArray()
         @Expect(mediaRecords.size(), 1)
         @Expect(mediaRecords[0].asObject().get("mediaKind").getOrThrow().asString().getValue(), "document")
+    }
+
+    @TestCase
+    public func webhookMediaDownloadFailureSendsUserVisibleWarning(): Unit {
+        let fake = TelegramFakeBotApi()
+        setTelegramTransportRunnerForTest(Some({ request => fake.handle(request) }))
+        try {
+            let adapter = TelegramAdapter(
+                config: TelegramConfig(
+                    enabled: true,
+                    botToken: "telegram-token",
+                    dmPolicy: "open",
+                    allowFrom: ["*"],
+                    media: TelegramMediaConfig(
+                        downloadEnabled: true,
+                        allowedMimes: ["image/*"],
+                        warnOnDownloadFailure: true
+                    )
+                )
+            )
+            adapter.start()
+            let payload = "{\"update_id\":1,\"message\":{\"message_id\":303,\"document\":{\"file_id\":\"doc-file-id\",\"mime_type\":\"application/pdf\",\"file_size\":1024,\"file_name\":\"report.pdf\"},\"chat\":{\"id\":745123456,\"type\":\"private\"},\"from\":{\"id\":745123456}}}"
+            let ack = adapter.ingestWebhookPayload(payload)
+            @Expect(ack.contains("\"ok\":true"), true)
+            @Expect(fake.saw("sendMessage"), true)
+            @Expect(fake.sawBodyContaining("reason=mime_not_allowed"), true)
+        } finally {
+            setTelegramTransportRunnerForTest(None)
+        }
+    }
+
+    @TestCase
+    public func persistedTelegramVoiceCanUseNativeAsrRunner(): Unit {
+        let root = Path("/tmp/metis-telegram-asr-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
+        Directory.create(root, recursive: true)
+        setTelegramAsrRunnerForTest(Some({ _path: String, _mime: String => "transcribed voice text" }))
+        try {
+            let adapter = TelegramAdapter(
+                config: TelegramConfig(
+                    enabled: true,
+                    botToken: "telegram-token",
+                    media: TelegramMediaConfig(downloadEnabled: true, allowedMimes: ["audio/*"])
+                ),
+                pairingRoot: root.toString()
+            )
+            let state = adapter.debugPersistInboundMediaForTest(
+                "voice",
+                "voice-file-id",
+                mimeType: "audio/ogg",
+                getFileRaw: "{\"ok\":true,\"result\":{\"file_path\":\"voice/file.ogg\",\"file_size\":12}}",
+                downloadRaw: "fake-audio",
+                peerId: "user:745123456",
+                messageId: "304"
+            )
+            let last = state.get("lastMedia").getOrThrow().asObject()
+            @Expect(last.get("asrStatus").getOrThrow().asString().getValue(), "transcribed")
+            @Expect(last.get("transcript").getOrThrow().asString().getValue(), "transcribed voice text")
+        } finally {
+            setTelegramAsrRunnerForTest(None)
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
     }
 
     @TestCase
@@ -2720,6 +2826,26 @@ public class TelegramAdapterTest {
     }
 
     @TestCase
+    public func sendPayloadsRenderTelegramRichTextAsHtml(): Unit {
+        let adapter = TelegramAdapter(config: TelegramConfig(enabled: true, botToken: "telegram-token"))
+        let payloads = adapter.debugBuildSendPayloads(
+            OutboundMessage(
+                ChannelType.Telegram,
+                "user:8734062810",
+                "Hello **bold** *italic* `code` [site](https://example.test) <unsafe>\n> quoted"
+            )
+        )
+        @Expect(payloads.size(), 1)
+        let text = payloads[0].asObject().get("text").getOrThrow().asString().getValue()
+        @Expect(text.contains("<b>bold</b>"), true)
+        @Expect(text.contains("<i>italic</i>"), true)
+        @Expect(text.contains("<code>code</code>"), true)
+        @Expect(text.contains("<a href=\"https://example.test\">site</a>"), true)
+        @Expect(text.contains("&lt;unsafe&gt;"), true)
+        @Expect(text.contains("<blockquote>quoted</blockquote>"), true)
+    }
+
+    @TestCase
     public func sendPayloadsRenderNativeTelegramStickerPayload(): Unit {
         let adapter = TelegramAdapter(config: TelegramConfig(enabled: true, botToken: "telegram-token", replyToMode: "thread"))
         let payloads = adapter.debugBuildSendPayloads(
@@ -2838,6 +2964,31 @@ public class TelegramAdapterTest {
         } finally {
             setTelegramTransportRunnerForTest(None)
             try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func telegramVoiceForbiddenFallsBackToTextCaption(): Unit {
+        let fake = TelegramVoiceForbiddenFakeBotApi()
+        setTelegramTransportRunnerForTest(Some({ request => fake.handle(request) }))
+        try {
+            let adapter = TelegramAdapter(
+                config: TelegramConfig(
+                    enabled: true,
+                    botToken: "telegram-token",
+                    actions: TelegramActionConfig(voice: true, sendMessage: true)
+                )
+            )
+            adapter.start()
+            let id = adapter.sendWithMessageId(
+                OutboundMessage(ChannelType.Telegram, "user:8734062810", "[voice]\nfileId=voice-file-id\ncaption=voice fallback text")
+            )
+            @Expect(id, "801")
+            @Expect(fake.voiceCalls, 1)
+            @Expect(fake.textCalls, 1)
+            @Expect(fake.sawBodyContaining("voice fallback text"), true)
+        } finally {
+            setTelegramTransportRunnerForTest(None)
         }
     }
 

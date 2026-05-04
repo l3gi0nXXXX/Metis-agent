@@ -92,6 +92,21 @@ private func gatewayTelegramHasTokenConfigured(user: GatewayUserSettings): Bool 
     !user.telegram.botToken.trimAscii().isEmpty() || !user.telegram.tokenFile.trimAscii().isEmpty()
 }
 
+private func gatewayTelegramApiRootRisk(user: GatewayUserSettings): String {
+    let root = user.telegram.apiRoot.trimAscii().toAsciiLower()
+    if (root.isEmpty() || root == "https://api.telegram.org" || root.startsWith("https://api.telegram.org/")) {
+        return ""
+    }
+    if (!root.startsWith("https://") && !user.telegram.network.dangerouslyAllowPrivateNetwork) {
+        return "non_https_custom_api_root"
+    }
+    if ((root.contains("127.0.0.1") || root.contains("localhost") || root.contains("0.0.0.0") || root.contains("10.") || root.contains("192.168.") || root.contains("172.16.")) &&
+        !user.telegram.network.dangerouslyAllowPrivateNetwork) {
+        return "private_custom_api_root"
+    }
+    "custom_api_root"
+}
+
 private func gatewayTelegramFinding(
     id: String,
     severity: String,
@@ -440,6 +455,28 @@ private func gatewayTelegramBuildDiagnosticFindings(user: GatewayUserSettings, r
             "Telegram outbound local path upload is enabled without roots.",
             "gateway.telegram.media.outboundLocalRoots is empty.",
             "Configure explicit local roots or disable outboundAllowLocalPath."
+        )
+    }
+    let apiRootRisk = gatewayTelegramApiRootRisk(user)
+    if (apiRootRisk == "non_https_custom_api_root" || apiRootRisk == "private_custom_api_root") {
+        gatewayTelegramAddFinding(
+            findings,
+            "telegram-custom-api-root-risk",
+            "warning",
+            "failed",
+            "Telegram custom apiRoot requires an explicit network trust decision.",
+            "apiRoot=${user.telegram.apiRoot.trimAscii()}, risk=${apiRootRisk}.",
+            "Use https://api.telegram.org or set gateway.telegram.network.dangerouslyAllowPrivateNetwork only for a trusted local/self-hosted Bot API endpoint."
+        )
+    } else if (apiRootRisk == "custom_api_root") {
+        gatewayTelegramAddFinding(
+            findings,
+            "telegram-custom-api-root",
+            "info",
+            "passed",
+            "Telegram custom apiRoot is configured.",
+            "apiRoot is not the default Telegram Bot API endpoint; file downloads and Bot API calls remain routed through TelegramTransport with token redaction.",
+            "Keep custom endpoints trusted and avoid logging raw Bot API URLs."
         )
     }
 

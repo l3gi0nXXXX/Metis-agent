@@ -42,6 +42,10 @@ private class TelegramInboundMediaInfo {
     public let fileName: String
     public let mediaGroupId: String
     public let caption: String
+    public let stickerEmoji: String
+    public let stickerSetName: String
+    public let stickerIsAnimated: Bool
+    public let stickerIsVideo: Bool
 
     public init(
         kind: String,
@@ -51,7 +55,11 @@ private class TelegramInboundMediaInfo {
         fileSize!: Int64 = 0,
         fileName!: String = "",
         mediaGroupId!: String = "",
-        caption!: String = ""
+        caption!: String = "",
+        stickerEmoji!: String = "",
+        stickerSetName!: String = "",
+        stickerIsAnimated!: Bool = false,
+        stickerIsVideo!: Bool = false
     ) {
         this.kind = kind
         this.fileId = fileId
@@ -61,7 +69,17 @@ private class TelegramInboundMediaInfo {
         this.fileName = fileName
         this.mediaGroupId = mediaGroupId
         this.caption = caption
+        this.stickerEmoji = stickerEmoji
+        this.stickerSetName = stickerSetName
+        this.stickerIsAnimated = stickerIsAnimated
+        this.stickerIsVideo = stickerIsVideo
     }
+}
+
+private var telegramAsrRunnerOverride: Option<(String, String) -> String> = None<(String, String) -> String>
+
+public func setTelegramAsrRunnerForTest(runner: Option<(String, String) -> String>): Unit {
+    telegramAsrRunnerOverride = runner
 }
 
 private class TelegramWebhookBodyReadResult {
@@ -1376,11 +1394,13 @@ public class TelegramAdapter <: ChannelAdapter {
         let chatType = if (this.readStringField(chat, "type") == "private") { ChatType.Direct } else { ChatType.Group }
         let mediaContext = JsonObject()
         let contextRecords = JsonArray([])
+        let persistedMediaStates = ArrayList<JsonObject>()
         match (mediaInfo) {
             case Some(info) =>
                 let mediaState = this.persistInboundMedia(info, peerId: peerId, messageId: messageId, relation: "current")
                 let record = this.readObjectField(mediaState, "lastMedia")
                 contextRecords.add(record)
+                persistedMediaStates.add(mediaState)
                 text = this.appendTelegramMediaContextBlock(text, info, mediaState, peerId, messageId)
             case None => ()
         }
@@ -1397,6 +1417,7 @@ public class TelegramAdapter <: ChannelAdapter {
                             replyToMessageId: replyId
                         )
                         contextRecords.add(this.readObjectField(replyMediaState, "lastMedia"))
+                        persistedMediaStates.add(replyMediaState)
                     case None => ()
                 }
                 if (replyId.isEmpty()) { None<String> } else { Some(replyId) }
@@ -1447,6 +1468,9 @@ public class TelegramAdapter <: ChannelAdapter {
                 messageId: inbound.messageId
             )
             return None
+        }
+        for (mediaState in persistedMediaStates) {
+            this.maybeWarnInboundMediaDownloadFailure(peerId, messageId, mediaState)
         }
         Some(inbound)
     }
@@ -1631,6 +1655,16 @@ public class TelegramAdapter <: ChannelAdapter {
                 if (!info.caption.isEmpty() && info.kind != "sticker" && info.kind != "video-note") {
                     lines.add("caption=${info.caption}")
                 }
+                if (info.kind == "sticker") {
+                    if (!info.stickerEmoji.isEmpty()) {
+                        lines.add("stickerEmoji=${info.stickerEmoji}")
+                    }
+                    if (!info.stickerSetName.isEmpty()) {
+                        lines.add("stickerSetName=${info.stickerSetName}")
+                    }
+                    lines.add("stickerAnimated=${info.stickerIsAnimated}")
+                    lines.add("stickerVideo=${info.stickerIsVideo}")
+                }
                 return this.appendTelegramSupplementalContext(String.join(lines.toArray(), delimiter: "\n"), msg)
             case None =>
                 let supplemental = this.telegramSupplementalContextText(msg)
@@ -1792,7 +1826,7 @@ public class TelegramAdapter <: ChannelAdapter {
         } else {
             "metadata-only"
         }
-        let eligibility = if (info.kind == "photo") {
+        let eligibility = if (info.kind == "photo" || (info.kind == "sticker" && !info.stickerIsAnimated && !info.stickerIsVideo)) {
             "vision"
         } else if (info.kind == "voice" || info.kind == "audio") {
             "transcription"
@@ -1828,6 +1862,20 @@ public class TelegramAdapter <: ChannelAdapter {
         }
         if (!info.caption.trimAscii().isEmpty()) {
             lines.add("caption=${info.caption.trimAscii()}")
+        }
+        if (info.kind == "sticker") {
+            if (!info.stickerEmoji.trimAscii().isEmpty()) {
+                lines.add("stickerEmoji=${info.stickerEmoji.trimAscii()}")
+            }
+            if (!info.stickerSetName.trimAscii().isEmpty()) {
+                lines.add("stickerSetName=${info.stickerSetName.trimAscii()}")
+            }
+            lines.add("stickerAnimated=${info.stickerIsAnimated}")
+            lines.add("stickerVideo=${info.stickerIsVideo}")
+        }
+        let transcript = this.readStringField(lastMedia, "transcript").trimAscii()
+        if (!transcript.isEmpty()) {
+            lines.add("transcript=${transcript}")
         }
         lines.add("safetyStatus=${safetyStatus}")
         lines.add("eligibleFor=${eligibility}")
@@ -1888,7 +1936,11 @@ public class TelegramAdapter <: ChannelAdapter {
             fileSize: this.readJsonIntField(obj, "file_size", 0),
             fileName: this.readStringField(obj, "file_name").trimAscii(),
             mediaGroupId: mediaGroupId,
-            caption: caption
+            caption: caption,
+            stickerEmoji: this.readStringField(obj, "emoji").trimAscii(),
+            stickerSetName: this.readStringField(obj, "set_name").trimAscii(),
+            stickerIsAnimated: this.readJsonBoolField(obj, "is_animated", false),
+            stickerIsVideo: this.readJsonBoolField(obj, "is_video", false)
         )
     }
 
@@ -2032,9 +2084,9 @@ public class TelegramAdapter <: ChannelAdapter {
         let text = if (data.startsWith("approval:")) {
             this.renderApprovalCallbackInboundText(callbackId, messageId, data, senderId)
         } else if (data.isEmpty()) {
-            "[telegram-callback]\nid=${callbackId}\nmessageId=${messageId}\nby=${senderId}"
+            "[telegram-callback]\nid=${callbackId}\nmessageId=${messageId}\nactionType=unknown\nby=${senderId}"
         } else {
-            "[telegram-callback]\nid=${callbackId}\nmessageId=${messageId}\ndata=${data}\nby=${senderId}"
+            "[telegram-callback]\nid=${callbackId}\nmessageId=${messageId}\nactionType=${this.classifyTelegramCallbackAction(data)}\ndata=${data}\nby=${senderId}"
         }
         let inbound = InboundMessage(
             ChannelType.Telegram,
@@ -2069,6 +2121,17 @@ public class TelegramAdapter <: ChannelAdapter {
             this.clearTelegramCallbackButtons(chatId, messageId)
         }
         Some(inbound)
+    }
+
+    private func classifyTelegramCallbackAction(data: String): String {
+        let normalized = data.trimAscii()
+        if (normalized.startsWith("approval:")) { return "approval" }
+        if (normalized.startsWith("models:")) { return "model-ui" }
+        if (normalized.startsWith("commands:")) { return "command-ui" }
+        if (normalized.startsWith("sessions:")) { return "session-ui" }
+        if (normalized.startsWith("subagents:")) { return "subagent-ui" }
+        if (normalized.startsWith("plugin:")) { return "plugin-not-applicable" }
+        "unknown"
     }
 
     private func answerTelegramCallbackQuery(callbackId: String, text: String): Unit {
@@ -2188,6 +2251,12 @@ public class TelegramAdapter <: ChannelAdapter {
             this.sendTelegramPayloadFollowUpText(payload)
             return messageId
         }
+        if (kind == "voice") {
+            let fallbackId = this.trySendVoiceForbiddenFallback(payload)
+            if (!fallbackId.isEmpty()) {
+                return fallbackId
+            }
+        }
         if (this.shouldRetryWithoutTelegramThread(payload)) {
             let threadlessPayload = this.telegramPayloadWithoutThread(payload)
             let retryResponseOpt = match (this.localMediaUploadForPayload(kind, threadlessPayload)) {
@@ -2199,6 +2268,12 @@ public class TelegramAdapter <: ChannelAdapter {
                     if (let Some(messageId) <- this.parseTelegramPayloadSuccess(kind, retryRaw)) {
                         this.sendTelegramPayloadFollowUpText(threadlessPayload)
                         return messageId
+                    }
+                    if (kind == "voice") {
+                        let fallbackId = this.trySendVoiceForbiddenFallback(threadlessPayload)
+                        if (!fallbackId.isEmpty()) {
+                            return fallbackId
+                        }
                     }
                 case None => this.setLastSendError("empty http response")
             }
@@ -2233,6 +2308,44 @@ public class TelegramAdapter <: ChannelAdapter {
         plainMessageId
     }
 
+    private func trySendVoiceForbiddenFallback(payload: HashMap<String, JsonValue>): String {
+        let err = this.lastSendError.trimAscii().toAsciiLower()
+        if (!err.contains("voice_messages_forbidden") && !err.contains("voice messages forbidden")) {
+            return ""
+        }
+        let plainCaption = match (payload.get("plain_caption")) {
+            case Some(v) => try { v.asString().getValue().trimAscii() } catch (_e: Exception) { "" }
+            case None => ""
+        }
+        let fallbackText = if (!plainCaption.isEmpty()) {
+            plainCaption
+        } else {
+            "Telegram refused this voice message. The original audio is available as a voice attachment in Gateway media context."
+        }
+        let fallback = HashMap<String, JsonValue>()
+        fallback["kind"] = JsonString("text")
+        fallback["peer"] = payload.get("peer") ?? JsonString("")
+        fallback["chat_id"] = payload.get("chat_id") ?? JsonString("")
+        fallback["text"] = JsonString(this.telegramRenderHtml(fallbackText))
+        fallback["plain_text"] = JsonString(fallbackText)
+        fallback["parse_mode"] = JsonString("HTML")
+        fallback["disable_web_page_preview"] = true.toJsonValue()
+        match (payload.get("message_thread_id")) {
+            case Some(v) => fallback["message_thread_id"] = v
+            case None => ()
+        }
+        match (payload.get("reply_to_message_id")) {
+            case Some(v) => fallback["reply_to_message_id"] = v
+            case None => ()
+        }
+        let previousError = this.lastSendError
+        let sent = this.sendPayloadToTelegram(fallback)
+        if (!sent.isEmpty()) {
+            this.lastSendError = previousError
+        }
+        sent
+    }
+
     private func sendComplexMediaPayloadToTelegram(url: String, kind: String, payload: HashMap<String, JsonValue>): String {
         let responseOpt = match (this.telegramMultipartFilesForPayload(kind, payload)) {
             case Some(files) => this.telegramMultipartFilesPost(url, this.telegramComplexMultipartFieldsForPayload(kind, payload, files), files, context: "send:${kind}:multipart")
@@ -2260,7 +2373,7 @@ public class TelegramAdapter <: ChannelAdapter {
         }
         let body = JsonObject()
         body.put("chat_id", payload.get("chat_id") ?? JsonString(""))
-        body.put("text", JsonString(this.telegramEscapeHtml(text)))
+        body.put("text", JsonString(this.telegramRenderHtml(text)))
         body.put("plain_text", JsonString(text))
         body.put("parse_mode", JsonString("HTML"))
         body.put("disable_web_page_preview", (!this.config.linkPreview).toJsonValue())
@@ -2799,8 +2912,9 @@ public class TelegramAdapter <: ChannelAdapter {
         out.add(this.telegramUpdateTypeCapability("channel_post", "supported", "message", "channel post maps to channel-style ingress"))
         out.add(this.telegramUpdateTypeCapability("edited_channel_post", "supported", "message", "edited channel post maps to channel-style ingress"))
         out.add(this.telegramUpdateTypeCapability("message_reaction", "config-supported", "reaction", "enabled when reactionNotifications is not off"))
+        out.add(this.telegramUpdateTypeCapability("message_reaction_count", "ignored", "unsupported-diagnostic", "aggregate reaction counts do not represent a user chat turn"))
         out.add(this.telegramUpdateTypeCapability("callback_query", "config-supported", "callback", "enabled when actions.callbackQuery or inlineKeyboard is true"))
-        for (kind in ["business_connection", "business_message", "edited_business_message", "deleted_business_messages", "inline_query", "chosen_inline_result", "shipping_query", "pre_checkout_query", "purchased_paid_media", "poll", "poll_answer", "my_chat_member", "managed_bot", "chat_join_request", "chat_boost", "removed_chat_boost"]) {
+        for (kind in ["business_connection", "business_message", "edited_business_message", "deleted_business_messages", "inline_query", "chosen_inline_result", "shipping_query", "pre_checkout_query", "purchased_paid_media", "poll", "poll_answer", "my_chat_member", "chat_member", "managed_bot", "chat_join_request", "chat_boost", "removed_chat_boost"]) {
             out.add(this.telegramUpdateTypeCapability(kind, "not-applicable", "unsupported-diagnostic", "not part of the current Metis code-agent chat surface"))
         }
         out
@@ -3001,6 +3115,7 @@ public class TelegramAdapter <: ChannelAdapter {
             empty.put("mediaMaxBytes", this.effectiveMediaMaxBytes().toJsonValue())
             empty.put("allowedMimes", this.mediaAllowedMimesJson())
             empty.put("albumPolicy", JsonString(this.effectiveMediaAlbumPolicy()))
+            empty.put("warnOnDownloadFailure", this.config.media.warnOnDownloadFailure.toJsonValue())
             empty.put("accountId", JsonString(this.effectiveAccountId()))
             empty.put("lastPersistedMediaId", JsonString(""))
             empty.put("lastMedia", JsonObject())
@@ -3014,6 +3129,7 @@ public class TelegramAdapter <: ChannelAdapter {
             root.put("mediaMaxBytes", this.effectiveMediaMaxBytes().toJsonValue())
             root.put("allowedMimes", this.mediaAllowedMimesJson())
             root.put("albumPolicy", JsonString(this.effectiveMediaAlbumPolicy()))
+            root.put("warnOnDownloadFailure", this.config.media.warnOnDownloadFailure.toJsonValue())
             root.put("accountId", JsonString(this.effectiveAccountId()))
             root
         } catch (_: Exception) {
@@ -3024,6 +3140,7 @@ public class TelegramAdapter <: ChannelAdapter {
             empty.put("mediaMaxBytes", this.effectiveMediaMaxBytes().toJsonValue())
             empty.put("allowedMimes", this.mediaAllowedMimesJson())
             empty.put("albumPolicy", JsonString(this.effectiveMediaAlbumPolicy()))
+            empty.put("warnOnDownloadFailure", this.config.media.warnOnDownloadFailure.toJsonValue())
             empty.put("accountId", JsonString(this.effectiveAccountId()))
             empty.put("lastPersistedMediaId", JsonString(""))
             empty.put("lastMedia", JsonObject())
@@ -3106,7 +3223,7 @@ public class TelegramAdapter <: ChannelAdapter {
             normalizedKind,
             normalizedFileId
         )
-        let eligibleFor = this.telegramMediaEligibility(normalizedKind)
+        let eligibleFor = this.telegramMediaEligibility(info)
         let relativePath = this.relativeTelegramMediaPath(downloadPath)
 
         let lastMedia = JsonObject()
@@ -3129,6 +3246,10 @@ public class TelegramAdapter <: ChannelAdapter {
         lastMedia.put("mediaGroupId", JsonString(info.mediaGroupId))
         lastMedia.put("albumPolicy", JsonString(this.effectiveMediaAlbumPolicy()))
         lastMedia.put("caption", JsonString(info.caption.trimAscii()))
+        lastMedia.put("stickerEmoji", JsonString(info.stickerEmoji.trimAscii()))
+        lastMedia.put("stickerSetName", JsonString(info.stickerSetName.trimAscii()))
+        lastMedia.put("stickerAnimated", info.stickerIsAnimated.toJsonValue())
+        lastMedia.put("stickerVideo", info.stickerIsVideo.toJsonValue())
         lastMedia.put("filePath", JsonString(filePath))
         lastMedia.put("localPath", JsonString(downloadPath))
         lastMedia.put("relativePath", JsonString(relativePath))
@@ -3136,6 +3257,13 @@ public class TelegramAdapter <: ChannelAdapter {
         lastMedia.put("downloadPath", JsonString(downloadPath))
         lastMedia.put("skippedReason", JsonString(skippedReason))
         lastMedia.put("eligibleFor", JsonString(eligibleFor))
+        let transcript = this.tryTranscribeTelegramMedia(normalizedKind, downloadPath, effectiveMime)
+        if (!transcript.isEmpty()) {
+            lastMedia.put("transcript", JsonString(transcript))
+            lastMedia.put("asrStatus", JsonString("transcribed"))
+        } else if (normalizedKind == "voice" || normalizedKind == "audio") {
+            lastMedia.put("asrStatus", JsonString(if (downloaded) { "ready" } else { "metadata-only" }))
+        }
         lastMedia.put("createdAtMs", createdAtMs.toJsonValue())
         lastMedia.put("persistedAtMs", createdAtMs.toJsonValue())
         let root = this.readMediaState()
@@ -3146,6 +3274,7 @@ public class TelegramAdapter <: ChannelAdapter {
         root.put("mediaMaxBytes", this.effectiveMediaMaxBytes().toJsonValue())
         root.put("allowedMimes", this.mediaAllowedMimesJson())
         root.put("albumPolicy", JsonString(this.effectiveMediaAlbumPolicy()))
+        root.put("warnOnDownloadFailure", this.config.media.warnOnDownloadFailure.toJsonValue())
         root.put("lastPersistedMediaId", JsonString(normalizedFileId))
         root.put("lastMediaRecordId", JsonString(mediaId))
         root.put("lastMedia", lastMedia)
@@ -3173,8 +3302,9 @@ public class TelegramAdapter <: ChannelAdapter {
         "tg_${this.safeStateSegment(account)}_${this.safeStateSegment(peer)}_${this.safeStateSegment(message)}_${this.safeStateSegment(kind)}_${this.safeStateSegment(fileId)}"
     }
 
-    private func telegramMediaEligibility(kind: String): String {
-        if (kind == "photo") {
+    private func telegramMediaEligibility(info: TelegramInboundMediaInfo): String {
+        let kind = info.kind.trimAscii().toAsciiLower()
+        if (kind == "photo" || (kind == "sticker" && !info.stickerIsAnimated && !info.stickerIsVideo)) {
             return "vision"
         }
         if (kind == "voice" || kind == "audio") {
@@ -3184,6 +3314,47 @@ public class TelegramAdapter <: ChannelAdapter {
             return "file-context"
         }
         "metadata-only"
+    }
+
+    private func tryTranscribeTelegramMedia(kind: String, downloadPath: String, mimeType: String): String {
+        let normalizedKind = kind.trimAscii().toAsciiLower()
+        if (normalizedKind != "voice" && normalizedKind != "audio") {
+            return ""
+        }
+        let path = downloadPath.trimAscii()
+        if (path.isEmpty()) {
+            return ""
+        }
+        match (telegramAsrRunnerOverride) {
+            case Some(runner) =>
+                try { runner(path, mimeType.trimAscii().toAsciiLower()).trimAscii() } catch (_e: Exception) { "" }
+            case None => ""
+        }
+    }
+
+    private func maybeWarnInboundMediaDownloadFailure(peerId: String, messageId: String, mediaState: JsonObject): Unit {
+        if (!this.config.media.warnOnDownloadFailure) {
+            return
+        }
+        let lastMedia = this.readObjectField(mediaState, "lastMedia")
+        let downloaded = this.readBoolFieldOpt(lastMedia, "downloaded") == Some(true)
+        let reason = this.readStringField(lastMedia, "skippedReason").trimAscii()
+        if (downloaded || reason.isEmpty()) {
+            return
+        }
+        let kind = this.readStringField(lastMedia, "mediaKind").trimAscii()
+        let text = "Telegram ${kind} media was received but was not downloaded locally. reason=${reason}; messageId=${messageId}"
+        let body = HashMap<String, JsonValue>()
+        body["kind"] = JsonString("text")
+        body["peer"] = JsonString(peerId.trimAscii())
+        body["chat_id"] = JsonString(this.normalizePeerId(peerId.trimAscii()))
+        body["text"] = JsonString(this.telegramRenderHtml(text))
+        body["plain_text"] = JsonString(text)
+        body["parse_mode"] = JsonString("HTML")
+        body["disable_web_page_preview"] = true.toJsonValue()
+        let previousError = this.lastSendError
+        let _ = this.sendPayloadToTelegram(body)
+        this.lastSendError = previousError
     }
 
     private func relativeTelegramMediaPath(path: String): String {
@@ -3731,7 +3902,7 @@ public class TelegramAdapter <: ChannelAdapter {
             body["kind"] = JsonString("text")
             body["peer"] = JsonString(normalizedPeer)
             body["chat_id"] = JsonString(chatId)
-            body["text"] = JsonString(this.telegramEscapeHtml(chunks[i]))
+            body["text"] = JsonString(this.telegramRenderHtml(chunks[i]))
             body["plain_text"] = JsonString(chunks[i])
             body["disable_web_page_preview"] = (!this.config.linkPreview).toJsonValue()
             body["parse_mode"] = JsonString("HTML")
@@ -3806,7 +3977,7 @@ public class TelegramAdapter <: ChannelAdapter {
             one.put("type", JsonString(kind))
             one.put("media", JsonString(item.fileId))
             if (!item.caption.isEmpty()) {
-                let escaped = this.telegramEscapeHtml(item.caption)
+                let escaped = this.telegramRenderHtml(item.caption)
                 one.put("caption", JsonString(escaped))
                 one.put("parse_mode", JsonString("HTML"))
             }
@@ -3837,7 +4008,7 @@ public class TelegramAdapter <: ChannelAdapter {
         media.put("type", JsonString(this.normalizeMediaGroupType(kind, fileId)))
         media.put("media", JsonString(fileId))
         if (!caption.trimAscii().isEmpty()) {
-            media.put("caption", JsonString(this.telegramEscapeHtml(caption.trimAscii())))
+            media.put("caption", JsonString(this.telegramRenderHtml(caption.trimAscii())))
             media.put("parse_mode", JsonString("HTML"))
         }
         body["media"] = media
@@ -3888,7 +4059,7 @@ public class TelegramAdapter <: ChannelAdapter {
         body["peer"] = JsonString(normalizedPeer)
         body["chat_id"] = JsonString(this.normalizePeerId(normalizedPeer))
         body["message_id"] = JsonString(targetMessageId)
-        body["text"] = JsonString(this.telegramEscapeHtml(content))
+        body["text"] = JsonString(this.telegramRenderHtml(content))
         body["plain_text"] = JsonString(content)
         body["parse_mode"] = JsonString("HTML")
         body["disable_web_page_preview"] = (!this.config.linkPreview).toJsonValue()
@@ -3959,7 +4130,7 @@ public class TelegramAdapter <: ChannelAdapter {
         body["kind"] = JsonString("inline-keyboard")
         body["peer"] = JsonString(normalizedPeer)
         body["chat_id"] = JsonString(chatId)
-        body["text"] = JsonString(this.telegramEscapeHtml(text))
+        body["text"] = JsonString(this.telegramRenderHtml(text))
         body["plain_text"] = JsonString(text)
         body["disable_web_page_preview"] = (!this.config.linkPreview).toJsonValue()
         body["parse_mode"] = JsonString("HTML")
@@ -4013,9 +4184,9 @@ public class TelegramAdapter <: ChannelAdapter {
         body["kind"] = JsonString("draft")
         body["peer"] = JsonString(normalizedPeer)
         body["chat_id"] = JsonString(chatId)
-        body["text"] = JsonString(this.telegramEscapeHtml(preview))
+        body["text"] = JsonString(this.telegramRenderHtml(preview))
         body["plain_text"] = JsonString(preview)
-        body["final_text"] = JsonString(this.telegramEscapeHtml(finalText))
+        body["final_text"] = JsonString(this.telegramRenderHtml(finalText))
         body["plain_final_text"] = JsonString(finalText)
         body["disable_web_page_preview"] = (!this.config.linkPreview).toJsonValue()
         body["parse_mode"] = JsonString("HTML")
@@ -4092,7 +4263,7 @@ public class TelegramAdapter <: ChannelAdapter {
         if (plain.isEmpty()) {
             return
         }
-        let escaped = this.telegramEscapeHtml(plain)
+        let escaped = this.telegramRenderHtml(plain)
         if (escaped.size <= 1024) {
             body["caption"] = JsonString(escaped)
             body["plain_caption"] = JsonString(plain)
@@ -5257,6 +5428,153 @@ public class TelegramAdapter <: ChannelAdapter {
 
     private func telegramEscapeHtml(text: String): String {
         text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    }
+
+    private func telegramEscapeHtmlAttr(text: String): String {
+        this.telegramEscapeHtml(text).replace("\"", "&quot;")
+    }
+
+    private func startsWithAt(text: String, idx: Int64, token: String): Bool {
+        idx >= 0 && idx + token.size <= text.size && text[idx..idx + token.size] == token
+    }
+
+    private func appendEscapedHtmlSegment(sb: StringBuilder, segment: String): Unit {
+        sb.append(this.telegramEscapeHtml(segment))
+    }
+
+    private func telegramRenderHtml(text: String): String {
+        let raw = text.replace("\r\n", "\n").replace("\r", "\n")
+        if (raw.isEmpty()) {
+            return ""
+        }
+        let sb = StringBuilder()
+        var cursor: Int64 = 0
+        while (cursor < raw.size) {
+            if (raw[cursor..cursor + 1] == "\n" && cursor + 1 < raw.size && this.startsWithAt(raw, cursor + 1, "> ")) {
+                sb.append("\n")
+                cursor += 1
+                continue
+            }
+            if ((cursor == 0 || raw[cursor - 1..cursor] == "\n") && this.startsWithAt(raw, cursor, "> ")) {
+                let lineEnd = match (raw.indexOf("\n", cursor)) {
+                    case Some(idx) => idx
+                    case None => raw.size
+                }
+                sb.append("<blockquote>")
+                this.appendEscapedHtmlSegment(sb, raw[cursor + 2..lineEnd])
+                sb.append("</blockquote>")
+                if (lineEnd < raw.size) {
+                    sb.append("\n")
+                    cursor = lineEnd + 1
+                } else {
+                    cursor = lineEnd
+                }
+                continue
+            }
+            if (this.startsWithAt(raw, cursor, "```")) {
+                match (raw.indexOf("```", cursor + 3)) {
+                    case Some(endIdx) =>
+                        sb.append("<pre>")
+                        this.appendEscapedHtmlSegment(sb, raw[cursor + 3..endIdx])
+                        sb.append("</pre>")
+                        cursor = endIdx + 3
+                        continue
+                    case None => ()
+                }
+            }
+            if (this.startsWithAt(raw, cursor, "**")) {
+                match (raw.indexOf("**", cursor + 2)) {
+                    case Some(endIdx) =>
+                        sb.append("<b>")
+                        this.appendEscapedHtmlSegment(sb, raw[cursor + 2..endIdx])
+                        sb.append("</b>")
+                        cursor = endIdx + 2
+                        continue
+                    case None => ()
+                }
+            }
+            if (this.startsWithAt(raw, cursor, "*") && !this.startsWithAt(raw, cursor, "**")) {
+                match (raw.indexOf("*", cursor + 1)) {
+                    case Some(endIdx) =>
+                        sb.append("<i>")
+                        this.appendEscapedHtmlSegment(sb, raw[cursor + 1..endIdx])
+                        sb.append("</i>")
+                        cursor = endIdx + 1
+                        continue
+                    case None => ()
+                }
+            }
+            if (this.startsWithAt(raw, cursor, "__")) {
+                match (raw.indexOf("__", cursor + 2)) {
+                    case Some(endIdx) =>
+                        sb.append("<u>")
+                        this.appendEscapedHtmlSegment(sb, raw[cursor + 2..endIdx])
+                        sb.append("</u>")
+                        cursor = endIdx + 2
+                        continue
+                    case None => ()
+                }
+            }
+            if (this.startsWithAt(raw, cursor, "~~")) {
+                match (raw.indexOf("~~", cursor + 2)) {
+                    case Some(endIdx) =>
+                        sb.append("<s>")
+                        this.appendEscapedHtmlSegment(sb, raw[cursor + 2..endIdx])
+                        sb.append("</s>")
+                        cursor = endIdx + 2
+                        continue
+                    case None => ()
+                }
+            }
+            if (this.startsWithAt(raw, cursor, "`")) {
+                match (raw.indexOf("`", cursor + 1)) {
+                    case Some(endIdx) =>
+                        sb.append("<code>")
+                        this.appendEscapedHtmlSegment(sb, raw[cursor + 1..endIdx])
+                        sb.append("</code>")
+                        cursor = endIdx + 1
+                        continue
+                    case None => ()
+                }
+            }
+            if (this.startsWithAt(raw, cursor, "[")) {
+                match (raw.indexOf("](", cursor + 1)) {
+                    case Some(midIdx) =>
+                        match (raw.indexOf(")", midIdx + 2)) {
+                            case Some(endIdx) =>
+                                let label = raw[cursor + 1..midIdx]
+                                let url = raw[midIdx + 2..endIdx].trimAscii()
+                                if (url.startsWith("https://") || url.startsWith("http://")) {
+                                    sb.append("<a href=\"${this.telegramEscapeHtmlAttr(url)}\">")
+                                    this.appendEscapedHtmlSegment(sb, label)
+                                    sb.append("</a>")
+                                    cursor = endIdx + 1
+                                    continue
+                                }
+                            case None => ()
+                        }
+                    case None => ()
+                }
+            }
+            let next = this.nextTelegramMarkdownMarker(raw, cursor + 1)
+            this.appendEscapedHtmlSegment(sb, raw[cursor..next])
+            cursor = next
+        }
+        sb.toString()
+    }
+
+    private func nextTelegramMarkdownMarker(text: String, start: Int64): Int64 {
+        var next = text.size
+        for (token in ["\n> ", "```", "**", "__", "~~", "`", "*", "["]) {
+            match (text.indexOf(token, start)) {
+                case Some(idx) =>
+                    if (idx < next) {
+                        next = idx
+                    }
+                case None => ()
+            }
+        }
+        next
     }
 
     private func pickPrimaryUpdateObject(root: JsonObject): Option<JsonObject> {

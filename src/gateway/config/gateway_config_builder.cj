@@ -426,7 +426,8 @@ private func mergeTelegram(user: GatewayUserSettings): TelegramConfig {
             outboundAllowUrl: user.telegram.media.outboundAllowUrl,
             outboundAllowLocalPath: user.telegram.media.outboundAllowLocalPath,
             outboundLocalRoots: user.telegram.media.outboundLocalRoots,
-            albumPolicy: user.telegram.media.albumPolicy.trimAscii()
+            albumPolicy: user.telegram.media.albumPolicy.trimAscii(),
+            warnOnDownloadFailure: user.telegram.media.warnOnDownloadFailure
         ),
         network: TelegramNetworkConfig(
             autoSelectFamily: user.telegram.network.autoSelectFamily,

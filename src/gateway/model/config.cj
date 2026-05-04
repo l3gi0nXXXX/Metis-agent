@@ -584,6 +584,7 @@ public class TelegramMediaConfig {
     public let outboundAllowLocalPath: Bool
     public let outboundLocalRoots: Array<String>
     public let albumPolicy: String
+    public let warnOnDownloadFailure: Bool
 
     public init(
         downloadEnabled!: Bool = true,
@@ -592,7 +593,8 @@ public class TelegramMediaConfig {
         outboundAllowUrl!: Bool = false,
         outboundAllowLocalPath!: Bool = false,
         outboundLocalRoots!: Array<String> = [],
-        albumPolicy!: String = "single-largest"
+        albumPolicy!: String = "single-largest",
+        warnOnDownloadFailure!: Bool = true
     ) {
         this.downloadEnabled = downloadEnabled
         this.mediaMaxBytes = mediaMaxBytes
@@ -601,6 +603,7 @@ public class TelegramMediaConfig {
         this.outboundAllowLocalPath = outboundAllowLocalPath
         this.outboundLocalRoots = outboundLocalRoots
         this.albumPolicy = albumPolicy
+        this.warnOnDownloadFailure = warnOnDownloadFailure
     }
 }
 
