@@ -72,6 +72,20 @@ public class TelegramTransportResponse {
     }
 }
 
+public class TelegramMultipartFile {
+    public let fieldName: String
+    public let fileName: String
+    public let filePath: String
+    public let bytes: Array<Byte>
+
+    public init(fieldName: String, fileName!: String = "", filePath!: String = "", bytes!: Array<Byte> = []) {
+        this.fieldName = fieldName.trimAscii()
+        this.fileName = fileName.trimAscii()
+        this.filePath = filePath.trimAscii()
+        this.bytes = bytes
+    }
+}
+
 private class TelegramProxyEndpoint {
     public let host: String
     public let port: UInt16
@@ -145,8 +159,18 @@ public class TelegramTransport {
         filePath: String,
         context!: String = "postMultipartFile"
     ): TelegramTransportResponse {
+        let file = TelegramMultipartFile(fileField, filePath: filePath)
+        this.postMultipartFiles(url, fields, [file], context: context)
+    }
+
+    public func postMultipartFiles(
+        url: String,
+        fields: HashMap<String, String>,
+        files: Array<TelegramMultipartFile>,
+        context!: String = "postMultipartFiles"
+    ): TelegramTransportResponse {
         let boundary = "metis-telegram-${DateTime.now().toUnixTimeStamp().toMilliseconds()}"
-        let bodyBytes = this.buildMultipartBody(boundary, fields, fileField, filePath)
+        let bodyBytes = this.buildMultipartFilesBody(boundary, fields, files)
         let request = TelegramTransportRequest(
             "POST",
             url,
@@ -355,6 +379,14 @@ public class TelegramTransport {
         fileField: String,
         filePath: String
     ): Array<Byte> {
+        this.buildMultipartFilesBody(boundary, fields, [TelegramMultipartFile(fileField, filePath: filePath)])
+    }
+
+    private func buildMultipartFilesBody(
+        boundary: String,
+        fields: HashMap<String, String>,
+        files: Array<TelegramMultipartFile>
+    ): Array<Byte> {
         let out = ArrayList<Byte>()
         for ((key, value) in fields) {
             out.add(all: "--${boundary}\r\n".toArray())
@@ -362,13 +394,29 @@ public class TelegramTransport {
             out.add(all: value.toArray())
             out.add(all: "\r\n".toArray())
         }
-        let normalizedPath = this.normalizeLocalFilePath(filePath)
-        let filename = this.fileNameForMultipart(normalizedPath)
-        out.add(all: "--${boundary}\r\n".toArray())
-        out.add(all: "Content-Disposition: form-data; name=\"${this.escapeMultipartName(fileField)}\"; filename=\"${this.escapeMultipartName(filename)}\"\r\n".toArray())
-        out.add(all: "Content-Type: application/octet-stream\r\n\r\n".toArray())
-        out.add(all: File.readFrom(Path(normalizedPath)))
-        out.add(all: "\r\n--${boundary}--\r\n".toArray())
+        for (file in files) {
+            if (file.fieldName.isEmpty()) {
+                continue
+            }
+            let normalizedPath = this.normalizeLocalFilePath(file.filePath)
+            let filename = if (!file.fileName.isEmpty()) {
+                file.fileName
+            } else if (!normalizedPath.isEmpty()) {
+                this.fileNameForMultipart(normalizedPath)
+            } else {
+                "upload.bin"
+            }
+            out.add(all: "--${boundary}\r\n".toArray())
+            out.add(all: "Content-Disposition: form-data; name=\"${this.escapeMultipartName(file.fieldName)}\"; filename=\"${this.escapeMultipartName(filename)}\"\r\n".toArray())
+            out.add(all: "Content-Type: application/octet-stream\r\n\r\n".toArray())
+            if (!file.bytes.isEmpty()) {
+                out.add(all: file.bytes)
+            } else if (!normalizedPath.isEmpty()) {
+                out.add(all: File.readFrom(Path(normalizedPath)))
+            }
+            out.add(all: "\r\n".toArray())
+        }
+        out.add(all: "--${boundary}--\r\n".toArray())
         out.toArray()
     }
 
@@ -450,6 +498,10 @@ public class TelegramTransport {
 
     public func debugClassifyExceptionForTest(message: String): String {
         this.classifyException(message)
+    }
+
+    public func debugBuildMultipartFilesBodyForTest(fields: HashMap<String, String>, files: Array<TelegramMultipartFile>): String {
+        String.fromUtf8(this.buildMultipartFilesBody("metis-test-boundary", fields, files))
     }
 
     public func debugUsesNativeHttpTransportForTest(): Bool {

@@ -1,6 +1,6 @@
 package metis.gateway.channels.telegram
 
-import metis.core.{parseGatewayAudioParts, parseGatewayChatAction, parseGatewayDocumentParts, parseGatewayEditText, parseGatewayInlineKeyboardParts, parseGatewayPhotoParts, parseGatewayPinAction, parseGatewayReactionRemove, parseGatewayReactionToken, parseGatewayStickerFileId, parseGatewayTopicCreateText, parseGatewayTopicEditText, parseGatewayVideoNoteFileId, parseGatewayVideoParts, parseGatewayVoiceParts}
+import metis.core.{GatewayMediaGroupItem, parseGatewayAudioParts, parseGatewayChatAction, parseGatewayDocumentParts, parseGatewayEditMediaParts, parseGatewayEditText, parseGatewayInlineKeyboardParts, parseGatewayMediaGroupItems, parseGatewayPhotoParts, parseGatewayPinAction, parseGatewayReactionRemove, parseGatewayReactionToken, parseGatewayStickerFileId, parseGatewayTopicCreateText, parseGatewayTopicEditText, parseGatewayVideoNoteFileId, parseGatewayVideoParts, parseGatewayVoiceParts}
 import metis.gateway.core.ChannelAdapter
 import metis.gateway.model.*
 import metis.io.PrintUtils
@@ -166,6 +166,8 @@ public class TelegramAdapter <: ChannelAdapter {
     private var lastInboundPeerId: String = ""
     private var lastInboundSenderId: String = ""
     private var lastInboundMessageIdForPolicy: String = ""
+    private var lastConfirmedPollingOffset: String = ""
+    private var lastRetryAfterSeconds: Int64 = 0
 
     public init(
         config!: TelegramConfig = TelegramConfig(),
@@ -217,7 +219,11 @@ public class TelegramAdapter <: ChannelAdapter {
     }
 
     public func stop(): Unit {
+        let shouldConfirmOffset = this.running && !this.usesWebhookMode()
         this.running = false
+        if (shouldConfirmOffset) {
+            this.confirmPollingOffsetOnStop()
+        }
         this.markPollingStopped()
         if (let Some(server) <- this.webhookServer) {
             try {
@@ -427,6 +433,10 @@ public class TelegramAdapter <: ChannelAdapter {
                 this.lastSendError = "telegram editMessage action is disabled"
                 return ""
             }
+            if (this.payloadIsEditMedia(payload) && !this.config.actions.editMessage) {
+                this.lastSendError = "telegram editMessage action is disabled"
+                return ""
+            }
             if (this.payloadIsPin(payload) && !this.config.actions.pinMessage) {
                 this.lastSendError = "telegram pinMessage action is disabled"
                 return ""
@@ -585,6 +595,10 @@ public class TelegramAdapter <: ChannelAdapter {
         this.buildWebhookDeletePayload(dropPendingUpdates: false)
     }
 
+    public func debugBuildWebhookDeletePayloadWithDropPendingForTest(dropPending: Bool): JsonObject {
+        this.buildWebhookDeletePayload(dropPendingUpdates: dropPending)
+    }
+
     public func debugRegisterWebhookForTest(): Bool {
         this.registerWebhookWithTelegram()
     }
@@ -688,6 +702,22 @@ public class TelegramAdapter <: ChannelAdapter {
         this.runPollingIteration()
     }
 
+    public func debugConfirmPollingOffsetOnStopForTest(): Bool {
+        this.confirmPollingOffsetOnStop()
+    }
+
+    public func debugLastConfirmedPollingOffsetForTest(): String {
+        this.lastConfirmedPollingOffset
+    }
+
+    public func debugRetryAfterSecondsForTest(raw: String): Int64 {
+        this.telegramRetryAfterSeconds(raw)
+    }
+
+    public func debugSupportedUpdateTypesForTest(): JsonArray {
+        this.buildTelegramUpdateTypeCapabilityMatrix()
+    }
+
     public func debugSyncNativeCommandsForTest(): Bool {
         this.syncNativeCommands()
     }
@@ -753,7 +783,24 @@ public class TelegramAdapter <: ChannelAdapter {
         if (expected.isEmpty()) {
             return true
         }
-        secretHeader.trimAscii() == expected
+        this.constantTimeStringEquals(secretHeader.trimAscii(), expected)
+    }
+
+    private func constantTimeStringEquals(left: String, right: String): Bool {
+        let leftBytes = left.toArray()
+        let rightBytes = right.toArray()
+        let maxSize = if (leftBytes.size > rightBytes.size) { leftBytes.size } else { rightBytes.size }
+        var mismatch = leftBytes.size != rightBytes.size
+        var i: Int64 = 0
+        while (i < Int64(maxSize)) {
+            let a = if (i < Int64(leftBytes.size)) { Int64(leftBytes[i]) } else { 0 }
+            let b = if (i < Int64(rightBytes.size)) { Int64(rightBytes[i]) } else { 0 }
+            if (a != b) {
+                mismatch = true
+            }
+            i += 1
+        }
+        !mismatch
     }
 
     private func ingestTelegramUpdatePayload(payload: String, dedupeByOffset!: Bool = false): String {
@@ -1458,6 +1505,11 @@ public class TelegramAdapter <: ChannelAdapter {
                 }
                 let outcome = if (this.isTelegramConflictError(root, desc)) { "conflict" } else { "api-error" }
                 this.recordPollError(detail, outcome: outcome)
+                let retryAfter = this.telegramRetryAfterSeconds(trimmed)
+                if (retryAfter > 0) {
+                    this.lastRetryAfterSeconds = retryAfter
+                    this.recordPollError("${detail}; retry_after=${retryAfter}", outcome: "rate-limit")
+                }
                 if (outcome == "conflict") {
                     this.pollingWebhookCleared = false
                     this.ensurePollingWebhookCleared("conflict-recovery")
@@ -1499,6 +1551,51 @@ public class TelegramAdapter <: ChannelAdapter {
             this.recordPollError(detail, outcome: "parse-error")
             LogUtils.info("Telegram getUpdates failed: ${detail}")
             0
+        }
+    }
+
+    private func confirmPollingOffsetOnStop(): Bool {
+        let token = this.effectiveBotToken()
+        if (token.isEmpty()) {
+            return false
+        }
+        let lastInbound = this.readLastInboundUpdateId()
+        if (lastInbound.isEmpty()) {
+            return false
+        }
+        let nextOffset = try { Int64.parse(lastInbound) + 1 } catch (_: Exception) { return false }
+        let payload = JsonObject()
+        payload.put("offset", nextOffset.toJsonValue())
+        payload.put("limit", 1.toJsonValue())
+        let responseOpt = this.telegramJsonPost(
+            this.normalizeApiRoot() + "/bot${token}/getUpdates",
+            payload,
+            context: "getUpdates:stop-confirm"
+        )
+        match (responseOpt) {
+            case Some(raw) =>
+                if (this.parseTelegramBoolSuccess(raw, missingDetail: "telegram stop offset confirmation returned ok=false")) {
+                    this.lastConfirmedPollingOffset = "${nextOffset}"
+                    return true
+                }
+                false
+            case None => false
+        }
+    }
+
+    private func telegramRetryAfterSeconds(raw: String): Int64 {
+        try {
+            let root = JsonValue.fromStr(raw).asObject()
+            let params = this.readObjectField(root, "parameters")
+            match (params.get("retry_after")) {
+                case Some(v) =>
+                    try { return v.asInt().getValue() } catch (_e: Exception) {
+                        try { return Int64.parse(v.asString().getValue().trimAscii()) } catch (_e2: Exception) { return 0 }
+                    }
+                case None => return 0
+            }
+        } catch (_e: Exception) {
+            return 0
         }
     }
 
@@ -1923,6 +2020,7 @@ public class TelegramAdapter <: ChannelAdapter {
             this.recordInboundDecision(this.readIntStringField(root, "update_id"), "callback_query", "ignored", "unsupported_or_empty_callback_query")
             return None
         }
+        this.answerTelegramCallbackQuery(callbackId, "")
         let approvalValidation = this.validateApprovalCallbackData(callbackId, data)
         if (!approvalValidation.isEmpty()) {
             this.recordInboundDecision(this.readIntStringField(root, "update_id"), "callback_query", "ignored", approvalValidation)
@@ -1967,7 +2065,55 @@ public class TelegramAdapter <: ChannelAdapter {
             )
             return None
         }
+        if (data.startsWith("approval:")) {
+            this.clearTelegramCallbackButtons(chatId, messageId)
+        }
         Some(inbound)
+    }
+
+    private func answerTelegramCallbackQuery(callbackId: String, text: String): Unit {
+        let token = this.effectiveBotToken()
+        if (token.isEmpty() || callbackId.trimAscii().isEmpty()) {
+            return
+        }
+        let body = JsonObject()
+        body.put("callback_query_id", JsonString(callbackId.trimAscii()))
+        if (!text.trimAscii().isEmpty()) {
+            body.put("text", JsonString(text.trimAscii()))
+        }
+        let previous = this.lastSendError
+        match (this.telegramJsonPost(this.normalizeApiRoot() + "/bot${token}/answerCallbackQuery", body, context: "answerCallbackQuery")) {
+            case Some(raw) =>
+                if (!this.parseTelegramBoolSuccess(raw, missingDetail: "telegram answerCallbackQuery returned ok=false")) {
+                    this.lastSendError = previous
+                }
+            case None => this.lastSendError = previous
+        }
+    }
+
+    private func clearTelegramCallbackButtons(chatId: String, messageId: String): Unit {
+        let token = this.effectiveBotToken()
+        if (token.isEmpty() || chatId.trimAscii().isEmpty() || messageId.trimAscii().isEmpty()) {
+            return
+        }
+        let body = JsonObject()
+        body.put("chat_id", JsonString(chatId.trimAscii()))
+        try { body.put("message_id", Int64.parse(messageId.trimAscii()).toJsonValue()) } catch (_: Exception) { body.put("message_id", JsonString(messageId.trimAscii())) }
+        let markup = JsonObject()
+        markup.put("inline_keyboard", JsonArray([]))
+        body.put("reply_markup", markup)
+        let previous = this.lastSendError
+        match (this.telegramJsonPost(this.normalizeApiRoot() + "/bot${token}/editMessageReplyMarkup", body, context: "editMessageReplyMarkup:clear")) {
+            case Some(raw) =>
+                let ok = this.parseTelegramBoolSuccess(raw, missingDetail: "telegram editMessageReplyMarkup returned ok=false")
+                if (!ok) {
+                    let lower = this.lastSendError.toAsciiLower()
+                    if (lower.contains("message is not modified")) {
+                        this.lastSendError = previous
+                    }
+                }
+            case None => this.lastSendError = previous
+        }
     }
 
     private func validateApprovalCallbackData(callbackId: String, data: String): String {
@@ -2024,6 +2170,9 @@ public class TelegramAdapter <: ChannelAdapter {
         let url = this.normalizeApiRoot() + "/bot${token}/${method}"
         if (kind == "draft") {
             return this.sendDraftPayloadToTelegram(url, payload)
+        }
+        if (kind == "media-group" || kind == "edit-media") {
+            return this.sendComplexMediaPayloadToTelegram(url, kind, payload)
         }
         let responseOpt = match (this.localMediaUploadForPayload(kind, payload)) {
             case Some(upload) => this.telegramMultipartPost(url, payload, upload[0], upload[1], context: "send:${kind}:multipart")
@@ -2082,6 +2231,23 @@ public class TelegramAdapter <: ChannelAdapter {
             this.sendTelegramPayloadFollowUpText(plainPayload)
         }
         plainMessageId
+    }
+
+    private func sendComplexMediaPayloadToTelegram(url: String, kind: String, payload: HashMap<String, JsonValue>): String {
+        let responseOpt = match (this.telegramMultipartFilesForPayload(kind, payload)) {
+            case Some(files) => this.telegramMultipartFilesPost(url, this.telegramComplexMultipartFieldsForPayload(kind, payload, files), files, context: "send:${kind}:multipart")
+            case None => this.telegramJsonPost(url, this.telegramApiBodyForPayload(payload, plainFallback: false), context: "send:${kind}")
+        }
+        let raw = match (responseOpt) {
+            case Some(v) => v
+            case None =>
+                this.setLastSendError("empty http response")
+                return ""
+        }
+        if (kind == "media-group") {
+            return if (this.parseTelegramMediaGroupSuccess(raw)) { "media-group" } else { "" }
+        }
+        this.parseTelegramPayloadSuccess(kind, raw) ?? ""
     }
 
     private func sendTelegramPayloadFollowUpText(payload: HashMap<String, JsonValue>): Unit {
@@ -2224,6 +2390,106 @@ public class TelegramAdapter <: ChannelAdapter {
         Some([mediaField, this.normalizeOutboundLocalMediaPath(ref)])
     }
 
+    private func telegramMultipartFilesForPayload(kind: String, payload: HashMap<String, JsonValue>): Option<Array<TelegramMultipartFile>> {
+        let files = ArrayList<TelegramMultipartFile>()
+        if (kind == "media-group") {
+            match (payload.get("media")) {
+                case Some(v) =>
+                    try {
+                        var idx: Int64 = 0
+                        for (item in v.asArray().getItems()) {
+                            let obj = item.asObject()
+                            let ref = this.readStringField(obj, "media").trimAscii()
+                            if (this.looksLikeLocalMediaPath(ref)) {
+                                files.add(TelegramMultipartFile("file${idx}", filePath: this.normalizeOutboundLocalMediaPath(ref)))
+                            }
+                            idx += 1
+                        }
+                    } catch (_e: Exception) {
+                        ()
+                    }
+                case None => ()
+            }
+        } else if (kind == "edit-media") {
+            match (payload.get("media")) {
+                case Some(v) =>
+                    try {
+                        let obj = v.asObject()
+                        let ref = this.readStringField(obj, "media").trimAscii()
+                        if (this.looksLikeLocalMediaPath(ref)) {
+                            files.add(TelegramMultipartFile("file0", filePath: this.normalizeOutboundLocalMediaPath(ref)))
+                        }
+                    } catch (_e: Exception) {
+                        ()
+                    }
+                case None => ()
+            }
+        }
+        if (files.isEmpty()) {
+            return None
+        }
+        Some(files.toArray())
+    }
+
+    private func telegramComplexMultipartFieldsForPayload(kind: String, payload: HashMap<String, JsonValue>, files: Array<TelegramMultipartFile>): HashMap<String, String> {
+        let out = HashMap<String, String>()
+        for ((key, value) in payload) {
+            if (key == "kind" || key == "peer" || key == "plain_text" || key == "plain_caption" || key == "follow_up_text") {
+                continue
+            }
+            if (key == "media") {
+                out[key] = this.telegramMediaPayloadWithAttachReferences(kind, value, files)
+            } else {
+                out[key] = this.telegramMultipartFieldValue(value)
+            }
+        }
+        out
+    }
+
+    private func telegramMediaPayloadWithAttachReferences(kind: String, value: JsonValue, files: Array<TelegramMultipartFile>): String {
+        if (kind == "media-group") {
+            let arr = JsonArray([])
+            try {
+                var idx: Int64 = 0
+                for (item in value.asArray().getItems()) {
+                    let obj = item.asObject()
+                    let copy = this.copyTelegramInputMediaObject(obj, if (this.looksLikeLocalMediaPath(this.readStringField(obj, "media"))) { "attach://file${idx}" } else { "" })
+                    arr.add(copy)
+                    idx += 1
+                }
+                return arr.toJsonString()
+            } catch (_e: Exception) {
+                return value.toJsonString()
+            }
+        }
+        if (kind == "edit-media") {
+            try {
+                let obj = value.asObject()
+                let copy = this.copyTelegramInputMediaObject(obj, if (this.looksLikeLocalMediaPath(this.readStringField(obj, "media"))) { "attach://file0" } else { "" })
+                return copy.toJsonString()
+            } catch (_e: Exception) {
+                return value.toJsonString()
+            }
+        }
+        value.toJsonString()
+    }
+
+    private func copyTelegramInputMediaObject(obj: JsonObject, attachMedia: String): JsonObject {
+        let out = JsonObject()
+        for (key in ["type", "media", "caption", "parse_mode", "has_spoiler", "thumbnail", "duration", "width", "height", "supports_streaming", "performer", "title", "disable_content_type_detection"]) {
+            match (obj.get(key)) {
+                case Some(v) =>
+                    if (key == "media" && !attachMedia.trimAscii().isEmpty()) {
+                        out.put("media", JsonString(attachMedia.trimAscii()))
+                    } else {
+                        out.put(key, v)
+                    }
+                case None => ()
+            }
+        }
+        out
+    }
+
     private func telegramMediaFieldForPayloadKind(kind: String): String {
         if (kind == "photo") { return "photo" }
         if (kind == "document") { return "document" }
@@ -2260,7 +2526,7 @@ public class TelegramAdapter <: ChannelAdapter {
     }
 
     private func parseTelegramPayloadSuccess(kind: String, raw: String): Option<String> {
-        if (kind == "delete" || kind == "pin" || kind == "unpin" || kind == "reaction" || kind == "edit" || kind == "chat-action") {
+        if (kind == "delete" || kind == "pin" || kind == "unpin" || kind == "reaction" || kind == "edit" || kind == "edit-media" || kind == "chat-action") {
             return if (this.parseTelegramBoolSuccess(raw, missingDetail: "telegram api returned ok=false")) { Some("") } else { None<String> }
         }
         if (kind == "topic-create") {
@@ -2270,6 +2536,26 @@ public class TelegramAdapter <: ChannelAdapter {
             return if (this.parseTelegramBoolSuccess(raw, missingDetail: "telegram api returned ok=false")) { Some("") } else { None<String> }
         }
         return this.parseTelegramSendSuccess(raw)
+    }
+
+    private func parseTelegramMediaGroupSuccess(raw: String): Bool {
+        return try {
+            let jo = JsonValue.fromStr(raw).asObject()
+            let ok = match (jo.get("ok")) {
+                case Some(v) => try { v.asBool().getValue() } catch (_e: Exception) { false }
+                case None => false
+            }
+            if (!ok) {
+                let desc = this.readStringField(jo, "description")
+                this.setLastSendError(if (desc.isEmpty()) { "telegram media group returned ok=false" } else { desc })
+                return false
+            }
+            this.lastSendError = ""
+            true
+        } catch (e: Exception) {
+            this.setLastSendError("telegram media group parse failed: ${e.message}")
+            false
+        }
     }
 
     private func parseTelegramSendSuccess(raw: String): Option<String> {
@@ -2413,6 +2699,8 @@ public class TelegramAdapter <: ChannelAdapter {
         summary.put("pollingState", polling.get("state") ?? JsonString("idle"))
         summary.put("pollingConsecutiveFailures", polling.get("consecutiveFailures") ?? 0.toJsonValue())
         summary.put("pollingLastOutcome", polling.get("lastOutcome") ?? JsonString("idle"))
+        summary.put("pollingLastConfirmedOffset", JsonString(this.lastConfirmedPollingOffset))
+        summary.put("pollingLastRetryAfterSeconds", this.lastRetryAfterSeconds.toJsonValue())
         let inboundPolicy = this.buildInboundPolicyDiagnostics()
         summary.put("lastInboundDecision", inboundPolicy.get("lastDecision") ?? JsonString("none"))
         summary.put("lastInboundReason", inboundPolicy.get("lastReason") ?? JsonString(""))
@@ -2454,6 +2742,7 @@ public class TelegramAdapter <: ChannelAdapter {
         let offsetDiagnostics = this.buildOffsetDiagnostics()
         offset.put("pendingUpdateCount", offsetDiagnostics.get("pendingUpdateCount") ?? 0.toJsonValue())
         offset.put("dedupeCacheSize", offsetDiagnostics.get("dedupeCacheSize") ?? 0.toJsonValue())
+        offset.put("lastConfirmedOffset", JsonString(this.lastConfirmedPollingOffset))
         out.put("offset", offset)
         out.put("account", account)
         out.put("media", media)
@@ -2461,6 +2750,7 @@ public class TelegramAdapter <: ChannelAdapter {
         out.put("inboundPolicy", inboundPolicy)
         out.put("webhookLifecycle", this.buildWebhookLifecycleDiagnostics())
         out.put("nativeCommands", this.buildNativeCommandDiagnostics())
+        out.put("telegramUpdateTypes", this.buildTelegramUpdateTypeCapabilityMatrix())
         out.put("getMe", getMe)
         out.put("webhookInfo", webhookInfo)
         out
@@ -2477,6 +2767,7 @@ public class TelegramAdapter <: ChannelAdapter {
         out.put("cleanupAtMs", this.webhookCleanupAtMs.toJsonValue())
         out.put("pollingWebhookCleared", this.pollingWebhookCleared.toJsonValue())
         out.put("secretConfigured", (!this.config.webhookSecret.trimAscii().isEmpty()).toJsonValue())
+        out.put("webhookAndPollingMutuallyExclusive", true.toJsonValue())
         out
     }
 
@@ -2489,6 +2780,29 @@ public class TelegramAdapter <: ChannelAdapter {
         out.put("lastPeerId", JsonString(this.lastInboundPeerId))
         out.put("lastSenderId", JsonString(this.lastInboundSenderId))
         out.put("lastMessageId", JsonString(this.lastInboundMessageIdForPolicy))
+        out
+    }
+
+    private func telegramUpdateTypeCapability(kind: String, status: String, handler: String, reason: String): JsonObject {
+        let out = JsonObject()
+        out.put("kind", JsonString(kind))
+        out.put("status", JsonString(status))
+        out.put("handler", JsonString(handler))
+        out.put("reason", JsonString(reason))
+        out
+    }
+
+    private func buildTelegramUpdateTypeCapabilityMatrix(): JsonArray {
+        let out = JsonArray([])
+        out.add(this.telegramUpdateTypeCapability("message", "supported", "message", "standard Telegram message ingress"))
+        out.add(this.telegramUpdateTypeCapability("edited_message", "supported", "message", "edited message maps to standard ingress"))
+        out.add(this.telegramUpdateTypeCapability("channel_post", "supported", "message", "channel post maps to channel-style ingress"))
+        out.add(this.telegramUpdateTypeCapability("edited_channel_post", "supported", "message", "edited channel post maps to channel-style ingress"))
+        out.add(this.telegramUpdateTypeCapability("message_reaction", "config-supported", "reaction", "enabled when reactionNotifications is not off"))
+        out.add(this.telegramUpdateTypeCapability("callback_query", "config-supported", "callback", "enabled when actions.callbackQuery or inlineKeyboard is true"))
+        for (kind in ["business_connection", "business_message", "edited_business_message", "deleted_business_messages", "inline_query", "chosen_inline_result", "shipping_query", "pre_checkout_query", "purchased_paid_media", "poll", "poll_answer", "my_chat_member", "managed_bot", "chat_join_request", "chat_boost", "removed_chat_boost"]) {
+            out.add(this.telegramUpdateTypeCapability(kind, "not-applicable", "unsupported-diagnostic", "not part of the current Metis code-agent chat surface"))
+        }
         out
     }
 
@@ -3361,6 +3675,14 @@ public class TelegramAdapter <: ChannelAdapter {
             case Some(payload) => return [payload]
             case None => ()
         }
+        match (this.detectMediaGroupPayload(message)) {
+            case Some(payload) => return [payload]
+            case None => ()
+        }
+        match (this.detectEditMediaPayload(message)) {
+            case Some(payload) => return [payload]
+            case None => ()
+        }
         match (this.detectStickerPayload(message)) {
             case Some(payload) => return [payload]
             case None => ()
@@ -3466,6 +3788,74 @@ public class TelegramAdapter <: ChannelAdapter {
             body["message_thread_id"] = JsonString(threadId)
         }
         body
+    }
+
+    private func buildMediaGroupPayload(message: OutboundMessage, items: Array<GatewayMediaGroupItem>): HashMap<String, JsonValue> {
+        let normalizedPeer = message.peerId.trimAscii()
+        let chatId = this.normalizePeerId(normalizedPeer)
+        let threadId = this.extractThreadId(normalizedPeer)
+        let replyInThread = this.effectiveReplyInThread(message.replyInThread)
+        let body = HashMap<String, JsonValue>()
+        body["kind"] = JsonString("media-group")
+        body["peer"] = JsonString(normalizedPeer)
+        body["chat_id"] = JsonString(chatId)
+        let media = JsonArray([])
+        for (item in items) {
+            let one = JsonObject()
+            let kind = this.normalizeMediaGroupType(item.kind, item.fileId)
+            one.put("type", JsonString(kind))
+            one.put("media", JsonString(item.fileId))
+            if (!item.caption.isEmpty()) {
+                let escaped = this.telegramEscapeHtml(item.caption)
+                one.put("caption", JsonString(escaped))
+                one.put("parse_mode", JsonString("HTML"))
+            }
+            media.add(one)
+        }
+        body["media"] = media
+        this.applyTelegramSilentOption(body)
+        if (!threadId.isEmpty() && replyInThread) {
+            body["message_thread_id"] = JsonString(threadId)
+        }
+        if (let Some(replyId) <- this.effectiveReplyToMessageId(message.replyToMessageId)) {
+            if (!replyId.trimAscii().isEmpty()) {
+                body["reply_to_message_id"] = JsonString(replyId.trimAscii())
+            }
+        }
+        body
+    }
+
+    private func buildEditMediaPayload(message: OutboundMessage, targetMessageId: String, kind: String, fileId: String, caption: String): HashMap<String, JsonValue> {
+        let normalizedPeer = message.peerId.trimAscii()
+        let chatId = this.normalizePeerId(normalizedPeer)
+        let body = HashMap<String, JsonValue>()
+        body["kind"] = JsonString("edit-media")
+        body["peer"] = JsonString(normalizedPeer)
+        body["chat_id"] = JsonString(chatId)
+        body["message_id"] = JsonString(targetMessageId)
+        let media = JsonObject()
+        media.put("type", JsonString(this.normalizeMediaGroupType(kind, fileId)))
+        media.put("media", JsonString(fileId))
+        if (!caption.trimAscii().isEmpty()) {
+            media.put("caption", JsonString(this.telegramEscapeHtml(caption.trimAscii())))
+            media.put("parse_mode", JsonString("HTML"))
+        }
+        body["media"] = media
+        body
+    }
+
+    private func normalizeMediaGroupType(kind: String, fileId: String): String {
+        let normalized = kind.trimAscii().toAsciiLower()
+        if (normalized == "photo" || normalized == "video" || normalized == "audio" || normalized == "document" || normalized == "animation") {
+            if (normalized == "animation") {
+                return "video"
+            }
+            return normalized
+        }
+        if (this.telegramRefLooksLikeGif(fileId)) {
+            return "video"
+        }
+        "photo"
     }
 
     private func buildDeletePayload(message: OutboundMessage, targetMessageId: String): HashMap<String, JsonValue> {
@@ -4111,6 +4501,20 @@ public class TelegramAdapter <: ChannelAdapter {
         }
     }
 
+    private func payloadIsMediaGroup(payload: HashMap<String, JsonValue>): Bool {
+        match (payload.get("kind")) {
+            case Some(v) => try { v.asString().getValue().trimAscii().toAsciiLower() == "media-group" } catch (_e: Exception) { false }
+            case None => false
+        }
+    }
+
+    private func payloadIsEditMedia(payload: HashMap<String, JsonValue>): Bool {
+        match (payload.get("kind")) {
+            case Some(v) => try { v.asString().getValue().trimAscii().toAsciiLower() == "edit-media" } catch (_e: Exception) { false }
+            case None => false
+        }
+    }
+
     private func payloadIsInlineKeyboardInvalid(payload: HashMap<String, JsonValue>): Bool {
         this.payloadIsInlineKeyboard(payload) && payload.get("validation_error").isSome()
     }
@@ -4190,7 +4594,9 @@ public class TelegramAdapter <: ChannelAdapter {
             this.payloadIsAudio(payload) ||
             this.payloadIsVoice(payload) ||
             this.payloadIsVideo(payload) ||
-            this.payloadIsVideoNote(payload)
+            this.payloadIsVideoNote(payload) ||
+            this.payloadIsMediaGroup(payload) ||
+            this.payloadIsEditMedia(payload)
     }
 
     private func payloadIsTopicCreate(payload: HashMap<String, JsonValue>): Bool {
@@ -4216,6 +4622,12 @@ public class TelegramAdapter <: ChannelAdapter {
         }
         if (kind == "edit") {
             return "editMessageText"
+        }
+        if (kind == "edit-media") {
+            return "editMessageMedia"
+        }
+        if (kind == "media-group") {
+            return "sendMediaGroup"
         }
         if (kind == "pin") {
             return "pinChatMessage"
@@ -4504,6 +4916,57 @@ public class TelegramAdapter <: ChannelAdapter {
             return Some(invalid)
         }
         Some(this.buildApprovalPayload(message, approvalId, text, allowLabel, denyLabel, allowDecision, denyDecision, expiresAtMs))
+    }
+
+    private func detectMediaGroupPayload(message: OutboundMessage): Option<HashMap<String, JsonValue>> {
+        let items = parseGatewayMediaGroupItems(message.text)
+        if (items.isEmpty()) {
+            return None
+        }
+        if (items.size < 2 || items.size > 10) {
+            let invalid = HashMap<String, JsonValue>()
+            invalid["kind"] = JsonString("media-group")
+            invalid["validation_error"] = JsonString("telegram media group requires 2 to 10 items")
+            return Some(invalid)
+        }
+        for (item in items) {
+            let kind = this.normalizeMediaGroupType(item.kind, item.fileId)
+            let invalid = this.validateOutboundMediaReference(kind, item.fileId)
+            if (!invalid.isEmpty()) {
+                return Some(this.invalidMediaPayload("media-group", invalid))
+            }
+        }
+        Some(this.buildMediaGroupPayload(message, items))
+    }
+
+    private func detectEditMediaPayload(message: OutboundMessage): Option<HashMap<String, JsonValue>> {
+        let parsed = parseGatewayEditMediaParts(message.text)
+        let kind = parsed[0]
+        let fileId = parsed[1]
+        let caption = parsed[2]
+        if (kind.isEmpty() && fileId.isEmpty()) {
+            return None
+        }
+        if (fileId.isEmpty()) {
+            let invalid = HashMap<String, JsonValue>()
+            invalid["kind"] = JsonString("edit-media")
+            invalid["validation_error"] = JsonString("telegram edit-media requires fileId")
+            return Some(invalid)
+        }
+        match (message.replyToMessageId) {
+            case Some(target) =>
+                let targetMessageId = target.trimAscii()
+                if (targetMessageId.isEmpty()) {
+                    return None
+                }
+                let normalizedKind = this.normalizeMediaGroupType(kind, fileId)
+                let invalid = this.validateOutboundMediaReference(normalizedKind, fileId)
+                if (!invalid.isEmpty()) {
+                    return Some(this.invalidMediaPayload("edit-media", invalid))
+                }
+                Some(this.buildEditMediaPayload(message, targetMessageId, normalizedKind, fileId, caption))
+            case None => None
+        }
     }
 
     private func detectStickerPayload(message: OutboundMessage): Option<HashMap<String, JsonValue>> {
@@ -5186,6 +5649,18 @@ public class TelegramAdapter <: ChannelAdapter {
                 filePath,
                 context: context
             ),
+            context
+        )
+    }
+
+    private func telegramMultipartFilesPost(
+        url: String,
+        fields: HashMap<String, String>,
+        files: Array<TelegramMultipartFile>,
+        context!: String
+    ): Option<String> {
+        this.handleTelegramTransportResponse(
+            this.telegramTransport().postMultipartFiles(url, fields, files, context: context),
             context
         )
     }

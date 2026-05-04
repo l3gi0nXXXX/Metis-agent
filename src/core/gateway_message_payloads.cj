@@ -337,6 +337,90 @@ public func parseGatewayVideoNoteFileId(raw: String): String {
     ""
 }
 
+public class GatewayMediaGroupItem {
+    public let kind: String
+    public let fileId: String
+    public let caption: String
+
+    public init(kind: String, fileId: String, caption!: String = "") {
+        this.kind = kind.trimAscii().toAsciiLower()
+        this.fileId = fileId.trimAscii()
+        this.caption = caption.trimAscii()
+    }
+}
+
+public func parseGatewayMediaGroupItems(raw: String): Array<GatewayMediaGroupItem> {
+    let normalized = raw.replace("\r\n", "\n").replace("\r", "\n").trimAscii()
+    if (!normalized.startsWith("[media-group]")) {
+        return []
+    }
+    let out = ArrayList<GatewayMediaGroupItem>()
+    var currentKind = ""
+    var currentFileId = ""
+    var currentCaption = ""
+    for (line0 in normalized.split("\n")) {
+        let line = line0.trimAscii()
+        if (line.isEmpty() || line == "[media-group]") {
+            continue
+        }
+        if (line.startsWith("item=")) {
+            if (!currentFileId.isEmpty()) {
+                out.add(GatewayMediaGroupItem(currentKind, currentFileId, caption: currentCaption))
+                currentKind = ""
+                currentFileId = ""
+                currentCaption = ""
+            }
+            let spec = line["item=".size..].trimAscii()
+            let parts = spec.split("|")
+            if (parts.size >= 2) {
+                currentKind = parts[0].trimAscii().toAsciiLower()
+                currentFileId = parts[1].trimAscii()
+                if (parts.size >= 3) {
+                    currentCaption = parts[2].trimAscii()
+                }
+            }
+        } else if (line.startsWith("type=")) {
+            currentKind = line["type=".size..].trimAscii().toAsciiLower()
+        } else if (line.startsWith("fileId=")) {
+            currentFileId = line["fileId=".size..].trimAscii()
+        } else if (line.startsWith("caption=")) {
+            currentCaption = line["caption=".size..].trimAscii()
+        } else if (line == "---" || line == "item") {
+            if (!currentFileId.isEmpty()) {
+                out.add(GatewayMediaGroupItem(currentKind, currentFileId, caption: currentCaption))
+            }
+            currentKind = ""
+            currentFileId = ""
+            currentCaption = ""
+        }
+    }
+    if (!currentFileId.isEmpty()) {
+        out.add(GatewayMediaGroupItem(currentKind, currentFileId, caption: currentCaption))
+    }
+    out.toArray()
+}
+
+public func parseGatewayEditMediaParts(raw: String): (String, String, String) {
+    let normalized = raw.replace("\r\n", "\n").replace("\r", "\n").trimAscii()
+    if (!normalized.startsWith("[edit-media]")) {
+        return ("", "", "")
+    }
+    var kind = ""
+    var fileId = ""
+    var caption = ""
+    for (line0 in normalized.split("\n")) {
+        let line = line0.trimAscii()
+        if (line.startsWith("type=")) {
+            kind = line["type=".size..].trimAscii().toAsciiLower()
+        } else if (line.startsWith("fileId=")) {
+            fileId = line["fileId=".size..].trimAscii()
+        } else if (line.startsWith("caption=")) {
+            caption = line["caption=".size..].trimAscii()
+        }
+    }
+    (kind, fileId, caption)
+}
+
 public func renderGatewayInlineKeyboardText(text: String, buttons: Array<String>): String {
     let normalizedText = text.trimAscii()
     if (normalizedText.isEmpty() || buttons.isEmpty()) {

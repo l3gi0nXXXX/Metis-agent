@@ -147,6 +147,13 @@ Webhook 字段：
 | `webhookPort` | `8787` | 本地 webhook server 监听端口。 |
 | `webhookPath` | `/telegram-webhook` | 本地 webhook path。 |
 
+运行语义：
+
+- polling 与 webhook 互斥。配置 `webhookUrl` 时不启动 polling runner；未配置时进入 polling，并在启动前调用 `deleteWebhook` 清理远端 webhook。
+- polling stop/restart 时会按最后处理的 Telegram update id 做一次 `getUpdates(offset=last+1, limit=1)` 确认，降低重启后重复处理的概率。
+- Telegram Bot API 返回 `parameters.retry_after` 时，Metis 会记录 `pollingLastRetryAfterSeconds` 诊断，供后续 backoff 和排障使用。
+- `channels health` / runtime diagnostics 会暴露当前模式、webhook/polling 互斥状态、最后确认 offset 和支持的 update type 决策表。
+
 ## 输出与动作开关
 
 出站动作由 `actions` 控制。默认只启用普通文本和 reaction，其他高风险或媒体动作默认关闭。
@@ -190,6 +197,12 @@ Webhook 字段：
 | `editForumTopic` | `false` | `editForumTopic`。 |
 | `inlineKeyboard` | `false` | 带 `reply_markup.inline_keyboard` 的 `sendMessage`。 |
 | `callbackQuery` | `false` | 接收 `callback_query` 入站事件。 |
+
+媒体组和媒体编辑依赖对应媒体 action：
+
+- `[media-group]` 中包含图片时需要 `actions.photo=true`。
+- `[media-group]` 中包含视频、音频或文档时分别需要 `actions.video=true`、`actions.audio=true`、`actions.document=true`。
+- `[edit-media]` 需要 `actions.editMessage=true`，并需要目标消息 id。
 
 ## 文本与回复
 
@@ -422,6 +435,44 @@ fileId=<telegram-file-id>
 caption=podcast
 ```
 
+### 出站媒体组
+
+需要开启对应媒体类型的 action。媒体组会调用 Telegram Bot API `sendMediaGroup`，支持 2 到 10 个媒体项：
+
+```text
+[media-group]
+item=photo|<telegram-file-id-or-local-path>|first caption
+item=photo|<telegram-file-id-or-local-path>|second caption
+```
+
+也可以使用分块字段：
+
+```text
+[media-group]
+type=photo
+fileId=<telegram-file-id-or-local-path>
+caption=first
+---
+type=photo
+fileId=<telegram-file-id-or-local-path>
+caption=second
+```
+
+当媒体项是白名单内本地路径时，Metis 会在 Telegram transport 内生成多文件 `multipart/form-data`，并在 `media` 数组中使用 `attach://fileN` 引用，不会通过 curl 或 sidecar 上传。
+
+### 编辑媒体消息
+
+需要开启 `actions.editMessage=true` 和对应媒体 action。编辑媒体会调用 Telegram Bot API `editMessageMedia`：
+
+```text
+[edit-media]
+type=photo
+fileId=<telegram-file-id-or-local-path>
+caption=updated caption
+```
+
+目标消息 id 来自当前 `OutboundMessage.replyToMessageId`。如果没有目标消息 id，发送会在网络请求前失败并返回明确错误。
+
 ### 出站媒体引用限制
 
 默认只建议使用 Telegram `file_id`。URL 和本地路径有额外限制：
@@ -451,6 +502,7 @@ caption=podcast
 - URL 只在 `outboundAllowUrl=true` 时允许。
 - 本地路径只在 `outboundAllowLocalPath=true` 且路径位于 `outboundLocalRoots` 白名单内时允许；通过校验后会使用 Telegram Bot API multipart/form-data 上传。
 - `video-note` 不支持 URL 媒体引用。
+- 媒体组和媒体编辑中的本地文件同样遵守本地路径白名单，不允许裸露任意本机路径。
 
 ## Inline Keyboard 与 Callback
 
@@ -484,6 +536,8 @@ callback 入站会转成结构化文本，例如包含：
 [telegram-callback]
 data=approve-1
 ```
+
+Metis 会对收到的 callback 调用 Telegram Bot API `answerCallbackQuery`，避免 Telegram 客户端按钮一直处于加载状态。审批 callback 被接受后，Metis 会尝试通过 `editMessageReplyMarkup` 清理原消息上的审批按钮，避免用户重复点击。
 
 审批按钮可使用 `[approval]` 格式发送。该格式会生成两枚 inline button，callback 数据会携带审批 id、决策和过期时间。必须开启 `actions.inlineKeyboard`；接收入站审批结果时还必须开启 `actions.callbackQuery`。
 

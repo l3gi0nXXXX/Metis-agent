@@ -64,8 +64,14 @@ private class TelegramFakeBotApi {
                 }
                 return TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":[]}", outcome: "ok")
             }
-            if (request.context.startsWith("send:delete") || request.context.startsWith("send:pin") || request.context.startsWith("send:unpin") || request.context.startsWith("send:reaction") || request.context.startsWith("send:topic-edit") || request.context.startsWith("send:draft:final")) {
+            if (request.context == "answerCallbackQuery" || request.context.startsWith("editMessageReplyMarkup:")) {
                 return TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":true}", outcome: "ok")
+            }
+            if (request.context.startsWith("send:delete") || request.context.startsWith("send:pin") || request.context.startsWith("send:unpin") || request.context.startsWith("send:reaction") || request.context.startsWith("send:topic-edit") || request.context.startsWith("send:draft:final") || request.context.startsWith("send:edit-media")) {
+                return TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":true}", outcome: "ok")
+            }
+            if (request.context.startsWith("send:media-group")) {
+                return TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":[{\"message_id\":601},{\"message_id\":602}]}", outcome: "ok")
             }
             if (request.context.startsWith("send:topic-create")) {
                 return TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":{\"message_thread_id\":42,\"name\":\"Sprint\"}}", outcome: "ok")
@@ -128,6 +134,10 @@ private class TelegramFakeBotApi {
         if (url.contains("/createForumTopic")) { return "createForumTopic" }
         if (url.contains("/editForumTopic")) { return "editForumTopic" }
         if (url.contains("/editMessageText")) { return "editMessageText" }
+        if (url.contains("/editMessageMedia")) { return "editMessageMedia" }
+        if (url.contains("/editMessageReplyMarkup")) { return "editMessageReplyMarkup" }
+        if (url.contains("/answerCallbackQuery")) { return "answerCallbackQuery" }
+        if (url.contains("/sendMediaGroup")) { return "sendMediaGroup" }
         if (url.contains("/sendPhoto")) { return "sendPhoto" }
         if (url.contains("/sendAnimation")) { return "sendAnimation" }
         if (url.contains("/sendDocument")) { return "sendDocument" }
@@ -2084,9 +2094,12 @@ public class TelegramAdapterTest {
     @TestCase
     public func sendWithMessageIdUsesNativeTransportOverride(): Unit {
         let seen = ArrayList<String>()
+        let seenLock = Mutex()
         try {
             setTelegramTransportRunnerForTest(Some({ request: TelegramTransportRequest =>
-                seen.add("${request.method}|${request.context}|${request.url}|${request.proxy}|${request.body}")
+                synchronized(seenLock) {
+                    seen.add("${request.method}|${request.context}|${request.url}|${request.proxy}|${request.body}")
+                }
                 TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":{\"message_id\":321,\"text\":\"hello\"}}", outcome: "ok")
             }))
             let adapter = TelegramAdapter(
@@ -2100,11 +2113,14 @@ public class TelegramAdapterTest {
             let messageId = adapter.sendWithMessageId(
                 OutboundMessage(ChannelType.Telegram, "user:8734062810", "hello")
             )
+            adapter.stop()
             @Expect(messageId, "321")
             var found = false
-            for (item in seen) {
-                if (item.contains("POST|send:") && item.contains("/sendMessage") && item.contains("|http://127.0.0.1:7897|") && item.contains("8734062810")) {
-                    found = true
+            synchronized(seenLock) {
+                for (item in seen) {
+                    if (item.contains("POST|send:") && item.contains("/sendMessage") && item.contains("|http://127.0.0.1:7897|") && item.contains("8734062810")) {
+                        found = true
+                    }
                 }
             }
             @Expect(found, true)
@@ -3594,5 +3610,132 @@ public class TelegramAdapterTest {
         let policy = adapter.debugBuildInboundPolicyDiagnostics()
         @Expect(policy.get("lastUpdateKind").getOrThrow().asString().getValue(), "callback_query")
         @Expect(policy.get("lastReason").getOrThrow().asString().getValue(), "callback_query_disabled")
+    }
+
+    @TestCase
+    public func callbackQueryAckAndApprovalClearButtonsUseBotApi(): Unit {
+        let future = DateTime.now().toUnixTimeStamp().toMilliseconds() + 60000
+        let fake = TelegramFakeBotApi()
+        setTelegramTransportRunnerForTest(Some({ request => fake.handle(request) }))
+        try {
+            let cfg = TelegramConfig(
+                enabled: true,
+                botToken: "telegram-token",
+                dmPolicy: "open",
+                allowFrom: ["*"],
+                actions: TelegramActionConfig(callbackQuery: true)
+            )
+            let adapter = TelegramAdapter(config: cfg)
+            adapter.start()
+            let payload = "{\"update_id\":16,\"callback_query\":{\"id\":\"cb-approval-clear\",\"from\":{\"id\":8734062810},\"message\":{\"message_id\":104,\"chat\":{\"id\":8734062810,\"type\":\"private\"}},\"data\":\"approval:appr-2:allow-once:${future}\"}}"
+            let ack = adapter.ingestWebhookPayload(payload)
+            @Expect(ack.contains("\"ok\":true"), true)
+            @Expect(fake.saw("answerCallbackQuery"), true)
+            @Expect(fake.saw("editMessageReplyMarkup"), true)
+        } finally {
+            setTelegramTransportRunnerForTest(None)
+        }
+    }
+
+    @TestCase
+    public func sendMediaGroupSupportsMultipleLocalFilesWithAttachMultipart(): Unit {
+        let root = Path("/tmp/metis-telegram-media-group-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
+        Directory.create(root, recursive: true)
+        let first = root.join("a.jpg")
+        let second = root.join("b.jpg")
+        File.writeTo(first, "a-photo".toArray())
+        File.writeTo(second, "b-photo".toArray())
+        let fake = TelegramFakeBotApi()
+        setTelegramTransportRunnerForTest(Some({ request => fake.handle(request) }))
+        try {
+            let adapter = TelegramAdapter(
+                config: TelegramConfig(
+                    enabled: true,
+                    botToken: "telegram-token",
+                    actions: TelegramActionConfig(photo: true),
+                    media: TelegramMediaConfig(outboundAllowLocalPath: true, outboundLocalRoots: [root.toString()])
+                )
+            )
+            adapter.start()
+            let text = "[media-group]\nitem=photo|${first.toString()}|first\nitem=photo|${second.toString()}|second"
+            let result = adapter.send(OutboundMessage(ChannelType.Telegram, "user:8734062810", text))
+            match (result) {
+                case SendResult.Success => ()
+                case SendResult.Failed(reason) => @Expect(reason, "")
+            }
+            @Expect(fake.saw("sendMediaGroup"), true)
+            @Expect(fake.sawBodyContaining("attach://file0"), true)
+            @Expect(fake.sawBodyContaining("attach://file1"), true)
+            @Expect(fake.sawBodyContaining("name=\"file0\"; filename=\"a.jpg\""), true)
+            @Expect(fake.sawBodyContaining("name=\"file1\"; filename=\"b.jpg\""), true)
+        } finally {
+            setTelegramTransportRunnerForTest(None)
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func editMediaPayloadUsesEditMessageMedia(): Unit {
+        let fake = TelegramFakeBotApi()
+        setTelegramTransportRunnerForTest(Some({ request => fake.handle(request) }))
+        try {
+            let adapter = TelegramAdapter(
+                config: TelegramConfig(
+                    enabled: true,
+                    botToken: "telegram-token",
+                    actions: TelegramActionConfig(editMessage: true, photo: true)
+                )
+            )
+            adapter.start()
+            let result = adapter.send(
+                OutboundMessage(
+                    ChannelType.Telegram,
+                    "user:8734062810",
+                    "[edit-media]\ntype=photo\nfileId=photo-file-id\ncaption=updated",
+                    replyToMessageId: Some("55")
+                )
+            )
+            match (result) {
+                case SendResult.Success => ()
+                case SendResult.Failed(reason) => @Expect(reason, "")
+            }
+            @Expect(fake.saw("editMessageMedia"), true)
+            @Expect(fake.sawBodyContaining("photo-file-id"), true)
+        } finally {
+            setTelegramTransportRunnerForTest(None)
+        }
+    }
+
+    @TestCase
+    public func pollingStopConfirmUsesNextOffsetAndDiagnosticsExposeUpdateTypes(): Unit {
+        let root = Path("/tmp/metis-telegram-stop-confirm-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
+        Directory.create(root, recursive: true)
+        let fake = TelegramFakeBotApi()
+        setTelegramTransportRunnerForTest(Some({ request => fake.handle(request) }))
+        try {
+            let adapter = TelegramAdapter(
+                config: TelegramConfig(enabled: true, botToken: "telegram-token", dmPolicy: "open", allowFrom: ["*"]),
+                pairingRoot: root.toString()
+            )
+            adapter.start()
+            let payload = "{\"update_id\":42,\"message\":{\"message_id\":11,\"text\":\"hello\",\"chat\":{\"id\":8734062810,\"type\":\"private\"},\"from\":{\"id\":8734062810}}}"
+            let ack = adapter.ingestWebhookPayload(payload)
+            @Expect(ack.contains("\"ok\":true"), true)
+            @Expect(adapter.debugConfirmPollingOffsetOnStopForTest(), true)
+            @Expect(adapter.debugLastConfirmedPollingOffsetForTest(), "43")
+            @Expect(fake.sawBodyContaining("\"offset\""), true)
+            @Expect(fake.sawBodyContaining("43"), true)
+            @Expect(adapter.debugSupportedUpdateTypesForTest().toJsonString().contains("inline_query"), true)
+        } finally {
+            setTelegramTransportRunnerForTest(None)
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func retryAfterParserReadsTelegramParameters(): Unit {
+        let adapter = TelegramAdapter(config: TelegramConfig(enabled: true, botToken: "telegram-token"))
+        let raw = "{\"ok\":false,\"error_code\":429,\"description\":\"Too Many Requests\",\"parameters\":{\"retry_after\":30}}"
+        @Expect(adapter.debugRetryAfterSecondsForTest(raw), 30)
     }
 }
