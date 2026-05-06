@@ -210,10 +210,22 @@ public class TelegramTransport {
                     responseBytes.add(all: responseBuffer[..n])
                 }
                 let isBinaryResponse = request.context == "downloadFile" || request.accept == "*/*"
-                let responseBody = if (isBinaryResponse) {
-                    ""
-                } else {
-                    String.fromUtf8(responseBytes.toArray())
+                var responseBody = ""
+                var decodeError = ""
+                if (!isBinaryResponse) {
+                    try {
+                        responseBody = String.fromUtf8(responseBytes.toArray())
+                    } catch (e: Exception) {
+                        decodeError = e.message.trimAscii()
+                    }
+                }
+                if (!decodeError.isEmpty()) {
+                    return TelegramTransportResponse(
+                        false,
+                        error: "invalid utf8 response body: ${decodeError}",
+                        outcome: "invalid-response-body",
+                        statusCode: status
+                    )
                 }
                 if (status >= 200 && status < 300) {
                     return TelegramTransportResponse(true, body: responseBody, bodyBytes: responseBytes.toArray(), outcome: "ok", statusCode: status)

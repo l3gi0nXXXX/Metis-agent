@@ -5,6 +5,39 @@ import magic.prelude.*
 import std.fs.{File, Path, exists}
 import stdx.encoding.json.{JsonArray, JsonBool, JsonObject, JsonString}
 
+private var gatewayMediaAsrRunnerOverride: Option<(String, String) -> String> = None<(String, String) -> String>
+private var gatewayMediaDocumentExtractorOverride: Option<(String, String, String, Int64) -> String> = None<(String, String, String, Int64) -> String>
+
+public func setGatewayMediaAsrRunnerForTest(runner: Option<(String, String) -> String>): Unit {
+    gatewayMediaAsrRunnerOverride = runner
+}
+
+public func setGatewayMediaDocumentExtractorForTest(extractor: Option<(String, String, String, Int64) -> String>): Unit {
+    gatewayMediaDocumentExtractorOverride = extractor
+}
+
+public func gatewayMediaTranscribeAudioPathForRuntime(path: String, mime: String): String {
+    let normalizedPath = path.trimAscii()
+    if (normalizedPath.isEmpty() || !exists(Path(normalizedPath))) {
+        return ""
+    }
+    match (gatewayMediaAsrRunnerOverride) {
+        case Some(runner) => try { runner(normalizedPath, mime.trimAscii().toAsciiLower()).trimAscii() } catch (_e: Exception) { "" }
+        case None => ""
+    }
+}
+
+private func gatewayMediaExtractDocumentPathForRuntime(path: String, mime: String, fileName: String, maxBytes: Int64): String {
+    let normalizedPath = path.trimAscii()
+    if (normalizedPath.isEmpty() || !exists(Path(normalizedPath))) {
+        return ""
+    }
+    match (gatewayMediaDocumentExtractorOverride) {
+        case Some(extractor) => try { extractor(normalizedPath, mime.trimAscii().toAsciiLower(), fileName.trimAscii(), maxBytes).trimAscii() } catch (_e: Exception) { "" }
+        case None => ""
+    }
+}
+
 private func gatewayMediaRuntimeString(obj: JsonObject, key: String): String {
     match (obj.get(key)) {
         case Some(v) => try { v.asString().getValue().trimAscii() } catch (_e: Exception) { "" }
@@ -196,18 +229,32 @@ public func gatewayMediaUnderstandingForRecord(
         }
         let recordTranscript = gatewayMediaRuntimeString(record, "transcript")
         let recordAsrTranscript = gatewayMediaRuntimeString(record, "asrTranscript")
+        let nativeTranscript = if (recordTranscript.isEmpty() && recordAsrTranscript.isEmpty()) {
+            gatewayMediaTranscribeAudioPathForRuntime(localPath, mime)
+        } else {
+            ""
+        }
         let transcript = if (!recordTranscript.isEmpty()) {
             recordTranscript
         } else if (!recordAsrTranscript.isEmpty()) {
             recordAsrTranscript
+        } else if (!nativeTranscript.isEmpty()) {
+            nativeTranscript
         } else {
             gatewayMediaRuntimeCompanionText(localPath, [".transcript.txt", ".txt", ".transcript"], maxBytes: 4096)
         }
         if (!transcript.isEmpty()) {
-            let source = if (!recordTranscript.isEmpty() || !recordAsrTranscript.isEmpty()) { "media_record_cache" } else { "transcript_companion_file" }
+            let source = if (!recordTranscript.isEmpty() || !recordAsrTranscript.isEmpty()) {
+                "media_record_cache"
+            } else if (!nativeTranscript.isEmpty()) {
+                "native_asr_runtime"
+            } else {
+                "transcript_companion_file"
+            }
             outputs.add(gatewayMediaRuntimeOutput("audio.transcription", transcript, source))
             let out = gatewayMediaRuntimeResult(record, resolvedCapability, "ok", outputs, gatewayMediaRuntimeDecision(resolvedCapability, "applied", source))
             out.put("transcript", JsonString(transcript))
+            out.put("ASRStatus", JsonString("transcribed"))
             return out
         }
         let out = gatewayMediaRuntimeResult(
@@ -317,6 +364,15 @@ public func gatewayMediaUnderstandingForRecord(
                 out.put("documentTextPreview", JsonString(content))
                 return out
             }
+        }
+        let nativeExtracted = gatewayMediaExtractDocumentPathForRuntime(localPath, mime, fileName, maxBytes)
+        if (!nativeExtracted.isEmpty()) {
+            outputs.add(gatewayMediaRuntimeOutput("document.text", nativeExtracted, "native_document_extractor"))
+            let out = gatewayMediaRuntimeResult(record, resolvedCapability, "ok", outputs, gatewayMediaRuntimeDecision(resolvedCapability, "applied", "native document extractor"))
+            out.put("documentTextPreview", JsonString(nativeExtracted))
+            out.put("documentExtractStatus", JsonString("ok"))
+            out.put("extractor", JsonString("native"))
+            return out
         }
         let extracted = gatewayMediaRuntimeCompanionText(localPath, [".extract.txt", ".text.txt", ".preview.txt"], maxBytes: maxBytes)
         if (!extracted.isEmpty()) {

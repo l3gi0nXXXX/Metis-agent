@@ -466,6 +466,41 @@ public class TelegramAdapterTest {
     }
 
     @TestCase
+    public func sendTransportInvalidUtf8FailureDoesNotThrow(): Unit {
+        try {
+            setTelegramTransportRunnerForTest(Some({ request: TelegramTransportRequest =>
+                if (request.context.startsWith("send:")) {
+                    return TelegramTransportResponse(
+                        false,
+                        error: "invalid utf8 response body: Invalid utf8 byte sequence",
+                        outcome: "invalid-response-body",
+                        statusCode: 200
+                    )
+                }
+                if (request.context == "getUpdates") {
+                    return TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":[]}", outcome: "ok")
+                }
+                TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":true}", outcome: "ok")
+            }))
+            let adapter = TelegramAdapter(config: TelegramConfig(enabled: true, botToken: "telegram-token"))
+            try {
+                adapter.start()
+                let message = OutboundMessage(ChannelType.Telegram, "user:8734062810", "hello")
+                @Expect(adapter.sendWithMessageId(message), "")
+                match (adapter.send(message)) {
+                    case SendResult.Success => @Expect(false, true)
+                    case SendResult.Failed(reason) =>
+                        @Expect(reason.contains("invalid utf8 response body"), true)
+                }
+            } finally {
+                adapter.stop()
+            }
+        } finally {
+            setTelegramTransportRunnerForTest(None)
+        }
+    }
+
+    @TestCase
     public func fakeBotApiEndToEndCoversTelegramRuntimeClosure(): Unit {
         let fake = TelegramFakeBotApi()
         let root = "/tmp/metis-telegram-fake-bot-api-e2e-${DateTime.now().toUnixTimeStamp().toMilliseconds()}"

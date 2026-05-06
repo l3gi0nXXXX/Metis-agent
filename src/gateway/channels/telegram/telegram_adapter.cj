@@ -1,6 +1,6 @@
 package metis.gateway.channels.telegram
 
-import metis.core.{GatewayMediaGroupItem, parseGatewayAudioParts, parseGatewayChatAction, parseGatewayDocumentParts, parseGatewayEditMediaParts, parseGatewayEditText, parseGatewayInlineKeyboardParts, parseGatewayMediaGroupItems, parseGatewayPhotoParts, parseGatewayPinAction, parseGatewayReactionRemove, parseGatewayReactionToken, parseGatewayStickerFileId, parseGatewayTopicCreateText, parseGatewayTopicEditText, parseGatewayVideoNoteFileId, parseGatewayVideoParts, parseGatewayVoiceParts}
+import metis.core.{GatewayMediaGroupItem, gatewayMediaTranscribeAudioPathForRuntime, parseGatewayAudioParts, parseGatewayChatAction, parseGatewayDocumentParts, parseGatewayEditMediaParts, parseGatewayEditText, parseGatewayInlineKeyboardParts, parseGatewayMediaGroupItems, parseGatewayPhotoParts, parseGatewayPinAction, parseGatewayReactionRemove, parseGatewayReactionToken, parseGatewayStickerFileId, parseGatewayTopicCreateText, parseGatewayTopicEditText, parseGatewayVideoNoteFileId, parseGatewayVideoParts, parseGatewayVoiceParts}
 import metis.gateway.core.ChannelAdapter
 import metis.gateway.model.*
 import metis.io.PrintUtils
@@ -2244,7 +2244,9 @@ public class TelegramAdapter <: ChannelAdapter {
         let responseRaw = match (responseOpt) {
             case Some(resp) => resp
             case None =>
-                this.setLastSendError("empty http response")
+                if (this.lastSendError.trimAscii().isEmpty()) {
+                    this.setLastSendError("empty http response")
+                }
                 return ""
         }
         if (let Some(messageId) <- this.parseTelegramPayloadSuccess(kind, responseRaw)) {
@@ -2275,7 +2277,10 @@ public class TelegramAdapter <: ChannelAdapter {
                             return fallbackId
                         }
                     }
-                case None => this.setLastSendError("empty http response")
+                case None =>
+                    if (this.lastSendError.trimAscii().isEmpty()) {
+                        this.setLastSendError("empty http response")
+                    }
             }
         }
         if (kind == "poll" || kind == "delete" || kind == "pin" || kind == "unpin" || kind == "topic-create" || kind == "reaction" || kind == "sticker") {
@@ -2298,7 +2303,9 @@ public class TelegramAdapter <: ChannelAdapter {
         let plainResponseRaw = match (plainResponseOpt) {
             case Some(resp) => resp
             case None =>
-                this.setLastSendError("empty http response")
+                if (this.lastSendError.trimAscii().isEmpty()) {
+                    this.setLastSendError("empty http response")
+                }
                 return ""
         }
         let plainMessageId = this.parseTelegramPayloadSuccess(kind, plainResponseRaw) ?? ""
@@ -3328,7 +3335,7 @@ public class TelegramAdapter <: ChannelAdapter {
         match (telegramAsrRunnerOverride) {
             case Some(runner) =>
                 try { runner(path, mimeType.trimAscii().toAsciiLower()).trimAscii() } catch (_e: Exception) { "" }
-            case None => ""
+            case None => gatewayMediaTranscribeAudioPathForRuntime(path, mimeType)
         }
     }
 
@@ -5989,6 +5996,10 @@ public class TelegramAdapter <: ChannelAdapter {
         }
         let outcome = if (response.outcome.trimAscii().isEmpty()) { "request-error" } else { response.outcome.trimAscii() }
         let detail = this.redactTelegramSensitive(if (response.error.trimAscii().isEmpty()) { "transport failed" } else { response.error.trimAscii() })
+        if (context.startsWith("send:") || context == "setWebhook" || context.startsWith("deleteWebhook:") ||
+            context == "setMyCommands" || context == "answerCallbackQuery" || context.startsWith("editMessageReplyMarkup:")) {
+            this.setLastSendError(detail)
+        }
         this.recordTelegramRequestError(context, "transport failed: ${detail}", outcome: outcome)
         LogUtils.info("Telegram ${context} failed: ${context} transport failed: ${detail}")
         None

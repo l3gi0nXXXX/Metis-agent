@@ -8,7 +8,7 @@ import magic.prelude.*
 
 import metis.core.gatewayCurrentToolRuntimeContext
 import metis.core.{renderGatewayAudioText, renderGatewayDocumentText, renderGatewayPhotoText, renderGatewayStickerText, renderGatewayVideoNoteText, renderGatewayVideoText, renderGatewayVoiceText}
-import metis.core.config.{CliConfig, CliSettingManager, MetisPaths}
+import metis.core.config.{CliConfig, CliSettingManager, MetisConfigManager, MetisPaths}
 import metis.core.{gatewayMediaUnderstandingFirstText, gatewayMediaUnderstandingForRecord, gatewayMediaUnderstandingOutputs}
 import metis.io.PrintUtils
 
@@ -573,6 +573,14 @@ public class GatewayTelegramMediaToolset {
 
     public func debugTelegramDoctorFromEnvelopeForTest(doctorEnvelope: JsonObject): String {
         this.renderTelegramDoctorFromEnvelope(doctorEnvelope)
+    }
+
+    public func debugTelegramTargetWritebackDryRunForTest(target: String, resolvedChatId: Option<String>): String {
+        this.telegramTargetWritebackDryRun(target, resolvedChatId)
+    }
+
+    public func debugTelegramTargetWritebackApplyForTest(target: String, resolvedChatId: Option<String>): String {
+        this.telegramTargetWritebackApply(target, resolvedChatId)
     }
 
     public func debugTelegramStickerSearchForTest(query: String, limit: Option<Int64>): String {
@@ -1213,6 +1221,100 @@ public class GatewayTelegramMediaToolset {
         out.toJsonString()
     }
 
+    private func telegramTargetWritebackNormalize(target: String, resolvedChatId: Option<String>): (Bool, String, String) {
+        let rawTarget = target.trimAscii()
+        let rawResolved = match (resolvedChatId) {
+            case Some(v) => v.trimAscii()
+            case None => ""
+        }
+        if (rawTarget.isEmpty() && rawResolved.isEmpty()) {
+            return (false, "", "target or resolvedChatId is required")
+        }
+        let candidate = if (!rawResolved.isEmpty()) { rawResolved } else { rawTarget }
+        let normalized = candidate.trimAscii()
+        if (normalized.startsWith("user:") || normalized.startsWith("group:")) {
+            return (true, normalized, "")
+        }
+        if (normalized.startsWith("-")) {
+            return (true, "group:${normalized}", "")
+        }
+        if (normalized.startsWith("@")) {
+            return (false, "", "target writeback for @username requires resolvedChatId from Telegram getChat")
+        }
+        var numeric = true
+        for (r in normalized.runes()) {
+            if (!(r >= r'0' && r <= r'9')) {
+                numeric = false
+                break
+            }
+        }
+        if (numeric && !normalized.isEmpty()) {
+            return (true, "user:${normalized}", "")
+        }
+        (false, "", "target cannot be normalized without resolvedChatId")
+    }
+
+    private func telegramTargetWritebackHasAdminScope(): Bool {
+        match (gatewayCurrentToolRuntimeContext()) {
+            case Some(ctx) =>
+                for (scope in ctx.operatorScopes) {
+                    let normalized = scope.trimAscii().toAsciiLower()
+                    if (normalized == "operator.admin" || normalized == "gateway.admin" || normalized == "admin") {
+                        return true
+                    }
+                }
+                false
+            case None => false
+        }
+    }
+
+    private func telegramTargetWritebackEnvelope(action: String, target: String, resolvedChatId: Option<String>, apply!: Bool): JsonObject {
+        let out = JsonObject()
+        let (ok, normalized, error) = this.telegramTargetWritebackNormalize(target, resolvedChatId)
+        out.put("ok", ok.toJsonValue())
+        out.put("status", JsonString(if (ok) { if (apply) { "applied" } else { "dry_run" } } else { "error" }))
+        out.put("action", JsonString(action))
+        out.put("target", JsonString(target.trimAscii()))
+        match (resolvedChatId) {
+            case Some(v) => out.put("resolvedChatId", JsonString(v.trimAscii()))
+            case None => ()
+        }
+        if (!ok) {
+            out.put("error", JsonString(error))
+            return out
+        }
+        let proposed = JsonObject()
+        proposed.put("path", JsonString("gateway.telegram.defaultTo"))
+        proposed.put("value", JsonString(normalized))
+        proposed.put("writeMode", JsonString("metis-config-manager"))
+        out.put("proposed", proposed)
+        out.put("defaultTo", JsonString(normalized))
+        out
+    }
+
+    private func telegramTargetWritebackDryRun(target: String, resolvedChatId: Option<String>): String {
+        this.telegramTargetWritebackEnvelope("telegram_target_writeback_dry_run", target, resolvedChatId, apply: false).toJsonString()
+    }
+
+    private func telegramTargetWritebackApply(target: String, resolvedChatId: Option<String>): String {
+        if (!this.telegramTargetWritebackHasAdminScope()) {
+            let denied = this.telegramTargetWritebackEnvelope("telegram_target_writeback_apply", target, resolvedChatId, apply: true)
+            denied.put("ok", JsonBool(false))
+            denied.put("status", JsonString("denied"))
+            denied.put("error", JsonString("telegram target writeback requires operator.admin scope"))
+            return denied.toJsonString()
+        }
+        let envelope = this.telegramTargetWritebackEnvelope("telegram_target_writeback_apply", target, resolvedChatId, apply: true)
+        if (!(try { envelope.get("ok").getOrThrow().asBool().getValue() } catch (_e: Exception) { false })) {
+            return envelope.toJsonString()
+        }
+        var settings = CliSettingManager.readGatewaySettings()
+        settings.telegram.defaultTo = telegramMediaToolString(envelope, "defaultTo")
+        MetisConfigManager.setGatewaySettings(settings)
+        envelope.put("configPath", JsonString(MetisConfigManager.configPath().toString()))
+        envelope.toJsonString()
+    }
+
     @tool[
         description: "List structured Telegram media resources attached to the current Gateway session turn. Use this before saving or inspecting an image, file, voice, audio, or reply target media sent by the user.",
         parameters: {}
@@ -1410,6 +1512,34 @@ public class GatewayTelegramMediaToolset {
         params.put("channelId", JsonString("telegram"))
         let audit = telegramMediaToolInvokeGatewayCall("channels.audit", params: Some(params))
         let text = this.renderTelegramTargetResolveFromAudit(target, audit)
+        PrintUtils.printToolResult(text)
+        return text
+    }
+
+    @tool[
+        description: "Preview a controlled Telegram target writeback for gateway.telegram.defaultTo. This is read-only and never changes metis.json.",
+        parameters: {
+            target: "Raw target, numeric chat id, user:<id>, group:<id>, or @username.",
+            resolvedChatId: "Optional numeric chat id resolved by Telegram getChat for @username targets."
+        }
+    ]
+    public func telegram_target_writeback_dry_run(target: String, resolvedChatId: Option<String>): String {
+        PrintUtils.printTool("telegram_target_writeback_dry_run", shortMessage: target)
+        let text = this.telegramTargetWritebackDryRun(target, resolvedChatId)
+        PrintUtils.printToolResult(text)
+        return text
+    }
+
+    @tool[
+        description: "Apply a controlled Telegram target writeback to gateway.telegram.defaultTo through MetisConfigManager. Requires operator.admin scope.",
+        parameters: {
+            target: "Raw target, numeric chat id, user:<id>, group:<id>, or @username.",
+            resolvedChatId: "Optional numeric chat id resolved by Telegram getChat for @username targets."
+        }
+    ]
+    public func telegram_target_writeback_apply(target: String, resolvedChatId: Option<String>): String {
+        PrintUtils.printTool("telegram_target_writeback_apply", shortMessage: target)
+        let text = this.telegramTargetWritebackApply(target, resolvedChatId)
         PrintUtils.printToolResult(text)
         return text
     }

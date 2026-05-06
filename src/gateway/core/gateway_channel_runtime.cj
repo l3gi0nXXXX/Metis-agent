@@ -595,6 +595,31 @@ public func gatewayChannelRuntimeMarkFailure(
     })
 }
 
+public func gatewayChannelRuntimeMarkInboundFailure(
+    channelId: String,
+    accountId!: String = "default",
+    error!: String = ""
+): JsonObject {
+    channelRuntimeUpsertAccount(channelId, accountId, { row =>
+        let out = channelRuntimeCloneRow(row)
+        let failureCount = channelRuntimeReadInt(row, "failureCount", 0) + 1
+        let history = match (row.get("history")) { case Some(v) => try { v.asArray() } catch (_e: Exception) { JsonArray([]) } case None => JsonArray([]) }
+        let now = gatewayChannelRuntimeNowMs()
+        out.put("running", true.toJsonValue())
+        out.put("lifecycleState", JsonString("running"))
+        out.put("phase", JsonString("active"))
+        out.put("failureCount", failureCount.toJsonValue())
+        out.put("lastEventAtMs", now.toJsonValue())
+        out.put("lastError", JsonString(error.trimAscii()))
+        out.put("backoffMs", 0.toJsonValue())
+        out.put("nextRestartAtMs", 0.toJsonValue())
+        out.put("taskState", JsonString("running"))
+        out.put("abortState", JsonString("clear"))
+        out.put("history", channelRuntimeAppendHistory(history, "turn-failed", if (error.trimAscii().isEmpty()) { "inbound-turn-failed" } else { error.trimAscii() }))
+        out
+    })
+}
+
 public func gatewayChannelRuntimeMarkPull(channelId: String, accountId!: String = "default", inboundCount!: Int64 = 0): JsonObject {
     channelRuntimeUpsertAccount(channelId, accountId, { row =>
         let out = channelRuntimeCloneRow(row)

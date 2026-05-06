@@ -1,7 +1,7 @@
 package metis.gateway.core
 
 import metis.core.gatewayCurrentToolRuntimeContext
-import metis.core.{gatewayMediaUnderstandingFirstText, gatewayMediaUnderstandingForRecord}
+import metis.core.{gatewayMediaUnderstandingFirstText, gatewayMediaUnderstandingForRecord, setGatewayMediaAsrRunnerForTest, setGatewayMediaDocumentExtractorForTest}
 import metis.core.config.GatewayUserSettings
 import metis.gateway.session.{GatewayIngressSource, GatewaySessionRequest}
 
@@ -117,6 +117,33 @@ public class GatewaySessionTurnRunnerTest {
             @Expect(prompt.contains("AudioTranscript=hello from voice"), true)
             @Expect(prompt.contains("use AudioTranscript when present"), true)
         } finally {
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func mediaContextPromptIncludesNativeAsrTranscript(): Unit {
+        let root = Path("/tmp/metis-media-audio-native-asr-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
+        Directory.create(root, recursive: true)
+        let voice = root.join("voice.ogg")
+        File.writeTo(voice, "fake-audio".toArray())
+        setGatewayMediaAsrRunnerForTest(Some({ _path: String, _mime: String => "native voice transcript" }))
+        try {
+            let media = JsonObject()
+            let records = JsonArray([])
+            let record = JsonObject()
+            record.put("mediaKind", JsonString("voice"))
+            record.put("mimeType", JsonString("audio/ogg"))
+            record.put("localPath", JsonString(voice.toString()))
+            record.put("downloaded", JsonBool(true))
+            records.add(record)
+            media.put("records", records)
+            let prompt = gatewayBuildMediaContextPrompt(media)
+            @Expect(prompt.contains("AudioTranscript=native voice transcript"), true)
+            @Expect(prompt.contains("MediaUnderstandingCapability=audio"), true)
+            @Expect(prompt.contains("MediaUnderstandingStatus=ok"), true)
+        } finally {
+            setGatewayMediaAsrRunnerForTest(None<(String, String) -> String>)
             try { remove(root, recursive: true) } catch (_e: Exception) { () }
         }
     }
@@ -261,6 +288,31 @@ public class GatewaySessionTurnRunnerTest {
             @Expect(result.get("documentExtractStatus").getOrThrow().asString().getValue(), "ok")
             @Expect(gatewayMediaUnderstandingFirstText(result), "extracted pdf content")
         } finally {
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func mediaUnderstandingRuntimeUsesNativeDocumentExtractor(): Unit {
+        let root = Path("/tmp/metis-media-document-native-extract-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
+        Directory.create(root, recursive: true)
+        let doc = root.join("report.pdf")
+        File.writeTo(doc, "fake-pdf".toArray())
+        setGatewayMediaDocumentExtractorForTest(Some({ _path: String, _mime: String, _fileName: String, _maxBytes: Int64 => "native pdf text" }))
+        try {
+            let record = JsonObject()
+            record.put("mediaKind", JsonString("document"))
+            record.put("mimeType", JsonString("application/pdf"))
+            record.put("originalFileName", JsonString("report.pdf"))
+            record.put("localPath", JsonString(doc.toString()))
+            record.put("downloaded", JsonBool(true))
+            let result = gatewayMediaUnderstandingForRecord(record)
+            @Expect(result.get("status").getOrThrow().asString().getValue(), "ok")
+            @Expect(result.get("documentExtractStatus").getOrThrow().asString().getValue(), "ok")
+            @Expect(result.get("extractor").getOrThrow().asString().getValue(), "native")
+            @Expect(gatewayMediaUnderstandingFirstText(result), "native pdf text")
+        } finally {
+            setGatewayMediaDocumentExtractorForTest(None<(String, String, String, Int64) -> String>)
             try { remove(root, recursive: true) } catch (_e: Exception) { () }
         }
     }

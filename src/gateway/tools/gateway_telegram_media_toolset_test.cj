@@ -1,10 +1,12 @@
 package metis.gateway.tools
 
 import metis.core.{GatewayToolRuntimeContext, gatewayWithToolRuntimeContext}
+import metis.core.config.{CliConfig, CliSettingManager, GatewayUserSettings, MetisConfigManager}
 import magic.core.message.Message
 import magic.core.model.{AsyncChatResponse, ChatModel, ChatRequest, ChatResponse}
 import magic.model.ModelManager
 
+import std.env.{getVariable, setVariable}
 import std.fs.{Directory, File, Path, exists, remove}
 import std.time.DateTime
 import std.unittest.testmacro.*
@@ -46,6 +48,30 @@ private class TelegramMediaToolsetVisionFakeModel <: ChatModel {
 
 @Test
 public class GatewayTelegramMediaToolsetTest {
+    private func withTelegramMediaToolsetConfigHome<T>(block: () -> T): T {
+        let testHome = "/tmp/metis-telegram-media-toolset-config-${DateTime.now().toUnixTimeStamp().toMilliseconds()}"
+        try { remove(Path(testHome), recursive: true) } catch (_e: Exception) { () }
+        Directory.create(testHome, recursive: true)
+        let oldHome = getVariable("METIS_HOME")
+        setVariable("METIS_HOME", testHome)
+        CliConfig.invalidatePathCache()
+        MetisConfigManager.invalidate()
+        CliSettingManager.invalidate()
+        try {
+            MetisConfigManager.initializeIfMissing()
+            return block()
+        } finally {
+            match (oldHome) {
+                case Some(value) => setVariable("METIS_HOME", value)
+                case None => setVariable("METIS_HOME", "")
+            }
+            CliConfig.invalidatePathCache()
+            MetisConfigManager.invalidate()
+            CliSettingManager.invalidate()
+            try { remove(Path(testHome), recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
     private func mediaContext(localPath: String, mediaKind!: String = "photo", mimeType!: String = "image/jpeg", fileName!: String = "file_1.jpg", relation!: String = "current"): JsonObject {
         let media = JsonObject()
         let records = JsonArray([])
@@ -495,5 +521,48 @@ public class GatewayTelegramMediaToolsetTest {
         let out = GatewayTelegramMediaToolset().debugTelegramDoctorFromEnvelopeForTest(envelope)
         let json = JsonValue.fromStr(out).asObject()
         @Expect(json.get("summary").getOrThrow().asObject().get("state").getOrThrow().asString().getValue(), "ready")
+    }
+
+    @TestCase
+    public func telegramTargetWritebackDryRunDoesNotMutateConfig(): Unit {
+        this.withTelegramMediaToolsetConfigHome {
+            var user = GatewayUserSettings()
+            user.telegram.defaultTo = "user:old"
+            MetisConfigManager.setGatewaySettings(user)
+
+            let out = GatewayTelegramMediaToolset().debugTelegramTargetWritebackDryRunForTest("@metis_user", Some("12345"))
+            let json = JsonValue.fromStr(out).asObject()
+            @Expect(json.get("status").getOrThrow().asString().getValue(), "dry_run")
+            @Expect(json.get("defaultTo").getOrThrow().asString().getValue(), "user:12345")
+            @Expect(CliSettingManager.readGatewaySettings().telegram.defaultTo, "user:old")
+        }
+    }
+
+    @TestCase
+    public func telegramTargetWritebackApplyRequiresAdminScope(): Unit {
+        this.withTelegramMediaToolsetConfigHome {
+            let out = gatewayWithToolRuntimeContext(
+                GatewayToolRuntimeContext("telegram", channelName: "telegram", sessionKey: "telegram:chat:1", operatorScopes: []),
+                { => GatewayTelegramMediaToolset().debugTelegramTargetWritebackApplyForTest("12345", None<String>) }
+            )
+            let json = JsonValue.fromStr(out).asObject()
+            @Expect(json.get("status").getOrThrow().asString().getValue(), "denied")
+            @Expect(json.get("error").getOrThrow().asString().getValue().contains("operator.admin"), true)
+        }
+    }
+
+    @TestCase
+    public func telegramTargetWritebackApplyUsesMetisConfigManagerInTempHome(): Unit {
+        this.withTelegramMediaToolsetConfigHome {
+            let out = gatewayWithToolRuntimeContext(
+                GatewayToolRuntimeContext("telegram", channelName: "telegram", sessionKey: "telegram:chat:1", operatorScopes: ["operator.admin"]),
+                { => GatewayTelegramMediaToolset().debugTelegramTargetWritebackApplyForTest("-100123", None<String>) }
+            )
+            let json = JsonValue.fromStr(out).asObject()
+            @Expect(json.get("status").getOrThrow().asString().getValue(), "applied")
+            @Expect(json.get("defaultTo").getOrThrow().asString().getValue(), "group:-100123")
+            @Expect(CliSettingManager.readGatewaySettings().telegram.defaultTo, "group:-100123")
+            @Expect(MetisConfigManager.configPath().toString().contains("/tmp/metis-telegram-media-toolset-config-"), true)
+        }
     }
 }

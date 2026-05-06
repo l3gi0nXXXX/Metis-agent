@@ -1,9 +1,12 @@
 package metis.gateway.core
 
 import metis.core.config.CliConfig
+import metis.gateway.model.{ChannelType, ChatType, InboundMessage, OutboundMessage, SendResult}
 
+import std.collection.ArrayList
 import std.env.{getVariable, setVariable}
 import std.fs.{Directory, File, Path, exists, remove}
+import std.time.DateTime
 import std.unittest.testmacro.*
 
 private func gatewayChannelRuntimeTestReadState(): String {
@@ -40,6 +43,45 @@ private func withGatewayChannelRuntimeTestHome<T>(block: () -> T): T {
     }
 }
 
+private class GatewayChannelRuntimeFailingInboundAdapter <: ChannelAdapter {
+    private let inbound = ArrayList<InboundMessage>()
+
+    public prop name: String {
+        get() { "telegram" }
+    }
+
+    public func start(): Unit {}
+
+    public func stop(): Unit {}
+
+    public func queue(text: String): Unit {
+        this.inbound.add(InboundMessage(
+            ChannelType.Telegram,
+            "msg-${this.inbound.size}",
+            "user:42",
+            "42",
+            ChatType.Direct,
+            text,
+            false,
+            DateTime.now()
+        ))
+    }
+
+    public func pullInbound(): Array<InboundMessage> {
+        let out = this.inbound.toArray()
+        this.inbound.clear()
+        out
+    }
+
+    public func send(_message: OutboundMessage): SendResult {
+        SendResult.Success
+    }
+
+    public func sendWithMessageId(_message: OutboundMessage): String {
+        "msg-out"
+    }
+}
+
 @Test
 public class GatewayChannelRuntimeTest {
     @TestCase
@@ -58,6 +100,30 @@ public class GatewayChannelRuntimeTest {
             @Expect(primed.get("manualStop").getOrThrow().asBool().getValue(), false)
             @Expect(primed.get("abortState").getOrThrow().asString().getValue(), "clear")
             @Expect(gatewayChannelRuntimeCanStart("qq", accountId: "qq:test"), true)
+        }
+    }
+
+    @TestCase
+    public func inboundTurnFailureDoesNotMarkChannelFailed(): Unit {
+        withGatewayChannelRuntimeTestHome {
+            let manager = GatewayChannelManager()
+            let adapter = GatewayChannelRuntimeFailingInboundAdapter()
+            manager.registerAdapter(adapter, channelId: "telegram", accountId: "telegram:default")
+            manager.startChannels()
+            adapter.queue("hello")
+
+            manager.processOnce({ _message, _accountId =>
+                throw Exception("delivery failed")
+            })
+
+            let accounts = gatewayChannelRuntimeAccountsJson("telegram")
+            @Expect(accounts.size(), 1)
+            let row = accounts[0].asObject()
+            @Expect(row.get("running").getOrThrow().asBool().getValue(), true)
+            @Expect(row.get("lifecycleState").getOrThrow().asString().getValue(), "running")
+            @Expect(row.get("phase").getOrThrow().asString().getValue(), "active")
+            @Expect(row.get("taskState").getOrThrow().asString().getValue(), "running")
+            @Expect(row.get("lastError").getOrThrow().asString().getValue(), "delivery failed")
         }
     }
 }

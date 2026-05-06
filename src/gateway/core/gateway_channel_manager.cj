@@ -420,9 +420,11 @@ public class GatewayChannelManager {
                         handleInbound(message, entry.accountId)
                     } catch (e: Exception) {
                         this.updateLiveAccount(entry.channelId, entry.accountId, { state =>
+                            state.running = true
+                            state.connected = true
                             state.lastError = e.message.trimAscii()
                         })
-                        gatewayChannelRuntimeMarkFailure(entry.channelId, accountId: entry.accountId, lifecycleState: "failed", error: e.message)
+                        gatewayChannelRuntimeMarkInboundFailure(entry.channelId, accountId: entry.accountId, error: e.message)
                         LogUtils.error(
                             "Gateway.handleInbound failed: channel=${channelToString(message.channel)} peer=${message.peerId} err=${e.message}"
                         )

@@ -768,6 +768,17 @@ cjpm run --skip-build --name metis --run-args "gateway channels runtime telegram
 
 这些字段是只读投影；真实配置修改仍必须走 Gateway 配置更新路径，测试和运行态都不应直接改写真实 `~/.metis/metis.json`。
 
+### Target writeback
+
+Metis 提供受控的 Telegram target writeback 工具，用来把已确认的 Telegram 目标写入 `gateway.telegram.defaultTo`：
+
+| 工具 | 行为 | 配置写入 |
+|---|---|---|
+| `telegram_target_writeback_dry_run` | 预览 `gateway.telegram.defaultTo` 将被写成什么。 | 不写入。 |
+| `telegram_target_writeback_apply` | 通过 `MetisConfigManager` 写入 `gateway.telegram.defaultTo`。 | 需要 `operator.admin` scope。 |
+
+`@username` 目标必须先解析出 numeric chat id，再把 `resolvedChatId` 传给 writeback 工具。未授权、未解析或无法规范化的 target 会返回 `denied` / `error`，不会改写配置。测试必须使用临时 `METIS_HOME`，禁止读写真实 `~/.metis/metis.json`。
+
 ## 网络配置
 
 ```json
@@ -861,6 +872,8 @@ cjpm run --skip-build --name metis --run-args "gateway channels audit"
 - `modelButtonState`
 
 `doctor` / `channels audit` 会检查 token、webhook secret、proxy、媒体下载限制、本地媒体白名单、高风险 action、approval resolver、streaming draft、directory aggregation 等项。
+
+ASR、vision、video、document extractor 都走 Gateway media understanding runtime。没有配置 provider/extractor 时，工具和 prompt 会返回 `not_configured` 或 `metadata_only`，不会绕过 Gateway 直接调用模型，也不会猜测媒体内容。
 
 常见问题：
 

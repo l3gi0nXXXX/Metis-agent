@@ -1,11 +1,12 @@
 package metis.gateway.core
 
+import metis.core.renderGatewayTopicEditText
 import metis.core.config.{CliSettingManager, GatewayUserSettings, cliSetupVisibleModelProviders}
 import metis.gateway.model.*
 import metis.gateway.session.{GatewaySessionContext, gatewaySessionRequestFromInbound}
 import metis.gateway.tools.{gatewayHandleNativeCommandLine, gatewayHandleSubagentsCommandLine}
 import magic.log.LogUtils
-import std.collection.ArrayList
+import std.collection.{ArrayList, HashSet}
 import std.convert.Parsable
 import std.time.DateTime
 import stdx.encoding.json.JsonObject
@@ -24,6 +25,7 @@ public class GatewayService {
     private let router: GatewayRouter
     private let channelManager: GatewayChannelManager
     private let transcriptPublisher: Option<(GatewaySessionContext, Int64, String, String) -> Unit>
+    private let telegramAutoTopicLabelAttempts = HashSet<String>()
 
     public init(
         router: GatewayRouter,
@@ -177,9 +179,71 @@ public class GatewayService {
                 LogUtils.info("Gateway.send: delivery target missing after execution")
         }
         if (execution.delivered) {
+            if (channelToString(message.channel) == "telegram") {
+                this.maybeAutoLabelTelegramTopic(user, message, effectiveAccountId)
+            }
             return
         }
         LogUtils.error("Gateway.send: deliveryStatus=${execution.deliveryStatus} err=${execution.deliveryError}")
+    }
+
+    private func telegramAutoTopicLabelFromText(text: String): String {
+        let cleaned = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")[0]
+            .replace("[media-context]", "")
+            .replace("[photo]", "")
+            .replace("[document]", "")
+            .replace("[voice]", "")
+            .replace("[audio]", "")
+            .trimAscii()
+        if (cleaned.isEmpty()) {
+            return "Metis topic"
+        }
+        let words = ArrayList<String>()
+        for (part in cleaned.split(" ")) {
+            let one = part.trimAscii()
+            if (!one.isEmpty()) {
+                words.add(one)
+            }
+            if (words.size >= 4) {
+                break
+            }
+        }
+        var title = if (words.isEmpty()) { cleaned } else { String.join(words.toArray(), delimiter: " ") }
+        if (title.size > 32) {
+            title = title[..32].trimAscii()
+        }
+        if (title.isEmpty()) { "Metis topic" } else { title }
+    }
+
+    private func maybeAutoLabelTelegramTopic(user: GatewayUserSettings, message: InboundMessage, accountId: String): Unit {
+        if (!user.telegram.actions.editForumTopic) {
+            return
+        }
+        let threadId = match (message.threadId) {
+            case Some(v) => v.trimAscii()
+            case None => ""
+        }
+        if (threadId.isEmpty() || !message.peerId.contains(":topic:")) {
+            return
+        }
+        let key = "${accountId}|${message.peerId}|${threadId}"
+        if (this.telegramAutoTopicLabelAttempts.contains(key)) {
+            return
+        }
+        this.telegramAutoTopicLabelAttempts.add(key)
+        let title = this.telegramAutoTopicLabelFromText(message.text)
+        try {
+            let _ = this.sendTextToPeerDetailed(
+                "telegram",
+                message.peerId,
+                renderGatewayTopicEditText(title),
+                replyToMessageId: Some(threadId),
+                replyInThread: false,
+                accountId: accountId
+            )
+        } catch (e: Exception) {
+            LogUtils.info("Telegram auto topic label skipped: ${e.message}")
+        }
     }
 
     private func handleTelegramNativeCommand(message: InboundMessage, accountId: String, user: GatewayUserSettings): Bool {
