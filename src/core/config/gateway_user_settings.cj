@@ -291,6 +291,7 @@ public struct TelegramMediaUserSettings {
     public var outboundAllowUrl: Bool = false
     public var outboundAllowLocalPath: Bool = false
     public var outboundLocalRoots: Array<String> = []
+    public var trustedLocalFileRoots: Array<String> = []
     public var albumPolicy: String = "single-largest"
     public var warnOnDownloadFailure: Bool = true
 }
@@ -300,6 +301,9 @@ public struct TelegramNetworkUserSettings {
     public var autoSelectFamily: Bool = true
     public var dnsResultOrder: String = "ipv4first"
     public var dangerouslyAllowPrivateNetwork: Bool = false
+    public var insecureSkipTlsVerify: Bool = false
+    public var allowedUpdatesExtra: Array<String> = []
+    public var getFileRetryCount: Int64 = 3
 }
 
 @jsonable

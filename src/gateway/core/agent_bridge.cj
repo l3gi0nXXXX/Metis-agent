@@ -382,7 +382,7 @@ public class AgentBridge {
             // - if a skill configured `model` + api key, try it first
             // - if apikey invalid/auth error occurs, fall back to global model config
             var allModels = CliModelManager.getAllModels()
-            let channelBoundModelOpt = resolveChannelBoundModelName(channelName)
+            let channelBoundModelOpt = resolveChannelBoundModelName(channelName, sessionKey: conversationKey)
             allModels = applyChannelModelBinding(channelBoundModelOpt, allModels)
             let skillsEnabled = CliSettingManager.readSkillsEnabled()
             let forcedSkillName: Option<String> = parseForcedSkillFromSlash(prompt, agentId: agentId)
@@ -660,12 +660,23 @@ public class AgentBridge {
         buildGatewayModelInput(history, latestUserPrompt, availableSkillsMeta)
     }
 
-    private func resolveChannelBoundModelName(channelName: String): Option<String> {
+    private func resolveChannelBoundModelName(channelName: String, sessionKey!: String = ""): Option<String> {
         let ch = channelName.trimAscii().toAsciiLower()
         if (ch.isEmpty()) {
             return None
         }
         let g = CliSettingManager.readGatewaySettings()
+        let sk = sessionKey.trimAscii()
+        if (!sk.isEmpty()) {
+            for ((k, v) in g.channelModels) {
+                if (k.trimAscii().toAsciiLower() == "${ch}:${sk}".toAsciiLower()) {
+                    let modelName = v.trimAscii()
+                    if (!modelName.isEmpty()) {
+                        return Some(modelName)
+                    }
+                }
+            }
+        }
         for ((k, v) in g.channelModels) {
             if (k.toAsciiLower().trimAscii() == ch) {
                 let modelName = v.trimAscii()

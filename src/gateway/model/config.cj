@@ -583,6 +583,7 @@ public class TelegramMediaConfig {
     public let outboundAllowUrl: Bool
     public let outboundAllowLocalPath: Bool
     public let outboundLocalRoots: Array<String>
+    public let trustedLocalFileRoots: Array<String>
     public let albumPolicy: String
     public let warnOnDownloadFailure: Bool
 
@@ -593,6 +594,7 @@ public class TelegramMediaConfig {
         outboundAllowUrl!: Bool = false,
         outboundAllowLocalPath!: Bool = false,
         outboundLocalRoots!: Array<String> = [],
+        trustedLocalFileRoots!: Array<String> = [],
         albumPolicy!: String = "single-largest",
         warnOnDownloadFailure!: Bool = true
     ) {
@@ -602,6 +604,7 @@ public class TelegramMediaConfig {
         this.outboundAllowUrl = outboundAllowUrl
         this.outboundAllowLocalPath = outboundAllowLocalPath
         this.outboundLocalRoots = outboundLocalRoots
+        this.trustedLocalFileRoots = trustedLocalFileRoots
         this.albumPolicy = albumPolicy
         this.warnOnDownloadFailure = warnOnDownloadFailure
     }
@@ -611,15 +614,24 @@ public class TelegramNetworkConfig {
     public let autoSelectFamily: Bool
     public let dnsResultOrder: String
     public let dangerouslyAllowPrivateNetwork: Bool
+    public let insecureSkipTlsVerify: Bool
+    public let allowedUpdatesExtra: Array<String>
+    public let getFileRetryCount: Int64
 
     public init(
         autoSelectFamily!: Bool = true,
         dnsResultOrder!: String = "ipv4first",
-        dangerouslyAllowPrivateNetwork!: Bool = false
+        dangerouslyAllowPrivateNetwork!: Bool = false,
+        insecureSkipTlsVerify!: Bool = false,
+        allowedUpdatesExtra!: Array<String> = [],
+        getFileRetryCount!: Int64 = 3
     ) {
         this.autoSelectFamily = autoSelectFamily
         this.dnsResultOrder = dnsResultOrder
         this.dangerouslyAllowPrivateNetwork = dangerouslyAllowPrivateNetwork
+        this.insecureSkipTlsVerify = insecureSkipTlsVerify
+        this.allowedUpdatesExtra = allowedUpdatesExtra
+        this.getFileRetryCount = if (getFileRetryCount <= 0) { 1 } else { getFileRetryCount }
     }
 }
 

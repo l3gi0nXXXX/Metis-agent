@@ -680,6 +680,22 @@ public class TelegramAdapter <: ChannelAdapter {
         this.chatActionBackoffUntilMs
     }
 
+    public func debugTryTelegramGetChatForTest(chatId: String): JsonObject {
+        this.tryTelegramGetChat(chatId)
+    }
+
+    public func debugTrustedLocalTelegramFilePathForTest(filePath: String): String {
+        this.trustedLocalTelegramFilePath(filePath)
+    }
+
+    public func debugReadGroupMigrationStateForTest(): JsonArray {
+        let path = this.groupMigrationStatePath()
+        if (!exists(path)) {
+            return JsonArray([])
+        }
+        try { JsonValue.fromStr(String.fromUtf8(File.readFrom(path))).asArray() } catch (_e: Exception) { JsonArray([]) }
+    }
+
     public func debugBuildLiveProbe(): JsonObject {
         let out = JsonObject()
         out.put("supported", true.toJsonValue())
@@ -864,15 +880,30 @@ public class TelegramAdapter <: ChannelAdapter {
 
     private func buildAllowedUpdates(): JsonArray {
         let updates = JsonArray([])
+        let seen = HashSet<String>()
         for (kind in ["message", "edited_message", "channel_post", "edited_channel_post"]) {
             updates.add(JsonString(kind))
+            seen.add(kind)
         }
         let notifications = this.config.reactionNotifications.trimAscii().toAsciiLower()
         if (!(notifications == "off" || notifications == "false" || notifications == "disabled")) {
-            updates.add(JsonString("message_reaction"))
+            if (!seen.contains("message_reaction")) {
+                updates.add(JsonString("message_reaction"))
+                seen.add("message_reaction")
+            }
         }
         if (this.config.actions.callbackQuery || this.config.actions.inlineKeyboard) {
-            updates.add(JsonString("callback_query"))
+            if (!seen.contains("callback_query")) {
+                updates.add(JsonString("callback_query"))
+                seen.add("callback_query")
+            }
+        }
+        for (raw in this.config.network.allowedUpdatesExtra) {
+            let kind = raw.trimAscii()
+            if (!kind.isEmpty() && !seen.contains(kind)) {
+                updates.add(JsonString(kind))
+                seen.add(kind)
+            }
         }
         updates
     }
@@ -1374,6 +1405,16 @@ public class TelegramAdapter <: ChannelAdapter {
         }
         let msg = message.getOrThrow()
         let messageId = this.readIntStringField(msg, "message_id")
+        if (this.recordTelegramGroupMigrationIfNeeded(root, msg, messageId)) {
+            this.recordInboundDecision(
+                this.readIntStringField(root, "update_id"),
+                this.primaryUpdateKind(root),
+                "ignored",
+                "group_migration_recorded",
+                messageId: messageId
+            )
+            return None
+        }
         let mediaInfo = this.readTelegramMediaInfo(msg)
         var text = this.normalizeInboundTelegramCommandText(this.readInboundTelegramText(msg, mediaInfo: mediaInfo))
         if (messageId.isEmpty() || text.isEmpty()) {
@@ -1437,6 +1478,25 @@ public class TelegramAdapter <: ChannelAdapter {
             mediaContext.put("peerId", JsonString(peerId))
             mediaContext.put("messageId", JsonString(messageId))
             mediaContext.put("context", structuredContext)
+        }
+        if (this.readStringField(chat, "type") == "supergroup" && this.readBoolFieldOpt(chat, "is_forum").isNone()) {
+            let chatInfo = this.tryTelegramGetChat(this.readIntStringField(chat, "id"))
+            if (this.readJsonBoolField(chatInfo, "ok", false)) {
+                mediaContext.put("channel", JsonString("telegram"))
+                mediaContext.put("accountId", JsonString(this.effectiveAccountId()))
+                mediaContext.put("peerId", JsonString(peerId))
+                mediaContext.put("messageId", JsonString(messageId))
+                let context = match (mediaContext.get("context")) {
+                    case Some(v) => try { v.asObject() } catch (_e: Exception) { JsonObject() }
+                    case None => JsonObject()
+                }
+                let forum = JsonObject()
+                forum.put("source", JsonString("getChat"))
+                forum.put("chatId", chatInfo.get("chatId") ?? JsonString(""))
+                forum.put("isForum", chatInfo.get("isForum") ?? false.toJsonValue())
+                context.put("forum", forum)
+                mediaContext.put("context", context)
+            }
         }
         let mentioned = this.detectMention(text)
         let inbound = InboundMessage(
@@ -2232,7 +2292,7 @@ public class TelegramAdapter <: ChannelAdapter {
         let method = this.telegramApiMethodForPayloadKind(kind)
         let url = this.normalizeApiRoot() + "/bot${token}/${method}"
         if (kind == "draft") {
-            return this.sendDraftPayloadToTelegram(url, payload)
+            return this.sendDraftPayloadToTelegram(payload)
         }
         if (kind == "media-group" || kind == "edit-media") {
             return this.sendComplexMediaPayloadToTelegram(url, kind, payload)
@@ -2425,7 +2485,7 @@ public class TelegramAdapter <: ChannelAdapter {
         out
     }
 
-    private func sendDraftPayloadToTelegram(url: String, payload: HashMap<String, JsonValue>): String {
+    private func sendDraftPayloadToTelegram(payload: HashMap<String, JsonValue>): String {
         let draftPayload = HashMap<String, JsonValue>()
         for ((key, value) in payload) {
             if (key == "final_text" || key == "plain_final_text") {
@@ -2434,7 +2494,15 @@ public class TelegramAdapter <: ChannelAdapter {
             draftPayload[key] = value
         }
         draftPayload["kind"] = JsonString("text")
-        let responseOpt = this.telegramJsonPost(url, this.telegramApiBodyForPayload(draftPayload, plainFallback: false), context: "send:draft")
+        let draftUrl = this.normalizeApiRoot() + "/bot${this.effectiveBotToken()}/sendMessageDraft"
+        var responseOpt = this.telegramJsonPost(draftUrl, this.telegramApiBodyForPayload(draftPayload, plainFallback: false), context: "send:draft:native")
+        if (responseOpt.isNone()) {
+            let low = this.lastSendError.toAsciiLower()
+            if (low.contains("not found") || low.contains("method") || low.contains("404")) {
+                let fallbackUrl = this.normalizeApiRoot() + "/bot${this.effectiveBotToken()}/sendMessage"
+                responseOpt = this.telegramJsonPost(fallbackUrl, this.telegramApiBodyForPayload(draftPayload, plainFallback: false), context: "send:draft")
+            }
+        }
         let responseRaw = match (responseOpt) {
             case Some(resp) => resp
             case None =>
@@ -2443,7 +2511,19 @@ public class TelegramAdapter <: ChannelAdapter {
         }
         let messageId = match (this.parseTelegramSendSuccess(responseRaw)) {
             case Some(id) => id
-            case None => return ""
+            case None =>
+                if (!this.telegramDraftMethodLooksUnsupported(responseRaw)) {
+                    return ""
+                }
+                let fallbackUrl = this.normalizeApiRoot() + "/bot${this.effectiveBotToken()}/sendMessage"
+                let fallbackRaw = match (this.telegramJsonPost(fallbackUrl, this.telegramApiBodyForPayload(draftPayload, plainFallback: false), context: "send:draft")) {
+                    case Some(resp) => resp
+                    case None => return ""
+                }
+                match (this.parseTelegramSendSuccess(fallbackRaw)) {
+                    case Some(id2) => id2
+                    case None => return ""
+                }
         }
         let editPayload = HashMap<String, JsonValue>()
         editPayload["kind"] = JsonString("edit")
@@ -2466,6 +2546,15 @@ public class TelegramAdapter <: ChannelAdapter {
                 this.setLastSendError("empty http response")
                 ""
         }
+    }
+
+    private func telegramDraftMethodLooksUnsupported(raw: String): Bool {
+        let low = raw.trimAscii().toAsciiLower()
+        low.contains("method not found") ||
+            low.contains("not found") ||
+            low.contains("can't find method") ||
+            low.contains("\"error_code\":404") ||
+            low.contains("\"error_code\": 404")
     }
 
     private func telegramApiBodyForPayload(payload: HashMap<String, JsonValue>, plainFallback!: Bool): JsonObject {
@@ -2976,6 +3065,49 @@ public class TelegramAdapter <: ChannelAdapter {
         this.telegramAccountStateDir().join("media-state.json")
     }
 
+    private func groupMigrationStatePath(): Path {
+        this.telegramAccountStateDir().join("group-migrations.json")
+    }
+
+    private func recordTelegramGroupMigrationIfNeeded(root: JsonObject, msg: JsonObject, messageId: String): Bool {
+        let toChatId = this.readIntStringField(msg, "migrate_to_chat_id").trimAscii()
+        let fromChatId = this.readIntStringField(msg, "migrate_from_chat_id").trimAscii()
+        if (toChatId.isEmpty() && fromChatId.isEmpty()) {
+            return false
+        }
+        let chat = this.readObjectField(msg, "chat")
+        let chatId = this.readIntStringField(chat, "id").trimAscii()
+        let oldChatId = if (!fromChatId.isEmpty()) { fromChatId } else { chatId }
+        let newChatId = if (!toChatId.isEmpty()) { toChatId } else { chatId }
+        let row = JsonObject()
+        row.put("updateId", JsonString(this.readIntStringField(root, "update_id")))
+        row.put("messageId", JsonString(messageId.trimAscii()))
+        row.put("oldChatId", JsonString(oldChatId))
+        row.put("newChatId", JsonString(newChatId))
+        row.put("oldPeerId", JsonString(if (oldChatId.isEmpty()) { "" } else { "group:${oldChatId}" }))
+        row.put("newPeerId", JsonString(if (newChatId.isEmpty()) { "" } else { "group:${newChatId}" }))
+        row.put("accountId", JsonString(this.effectiveAccountId()))
+        row.put("recordedAtMs", DateTime.now().toUnixTimeStamp().toMilliseconds().toJsonValue())
+        let path = this.groupMigrationStatePath()
+        let migrations = if (exists(path)) {
+            try { JsonValue.fromStr(String.fromUtf8(File.readFrom(path))).asArray() } catch (_e: Exception) { JsonArray([]) }
+        } else {
+            JsonArray([])
+        }
+        for (item in migrations.getItems()) {
+            let existing = try { item.asObject() } catch (_e: Exception) { JsonObject() }
+            if (this.readStringField(existing, "oldChatId") == oldChatId && this.readStringField(existing, "newChatId") == newChatId) {
+                return true
+            }
+        }
+        migrations.add(row)
+        if (!exists(path.parent)) {
+            Directory.create(path.parent, recursive: true)
+        }
+        File.writeTo(path, (migrations.toJsonString() + "\n").toArray())
+        true
+    }
+
     private func mediaDownloadDir(): Path {
         let dir = this.telegramAccountStateDir().join("media")
         if (!exists(dir)) {
@@ -3197,7 +3329,7 @@ public class TelegramAdapter <: ChannelAdapter {
             }
             if (this.mediaSizeExceedsLimit(effectiveSize)) {
                 skippedReason = "size_limit_exceeded"
-            } else if (!filePath.isEmpty() && !this.isSafeTelegramFilePath(filePath)) {
+            } else if (!filePath.isEmpty() && !this.isSafeTelegramFilePath(filePath) && this.trustedLocalTelegramFilePath(filePath).isEmpty()) {
                 skippedReason = "unsafe_file_path"
             } else if (!filePath.isEmpty()) {
                 let resolvedDownloadRaw = if (!downloadRaw.trimAscii().isEmpty()) {
@@ -3386,7 +3518,74 @@ public class TelegramAdapter <: ChannelAdapter {
             return ""
         }
         let apiRoot = this.normalizeApiRoot()
-        this.tryTelegramGet("${apiRoot}/bot${token}/getFile?file_id=${fileId}")
+        let attempts = if (this.config.network.getFileRetryCount <= 0) { 1 } else { this.config.network.getFileRetryCount }
+        var last = ""
+        for (_i in 0..attempts) {
+            last = this.tryTelegramGet("${apiRoot}/bot${token}/getFile?file_id=${fileId}")
+            let parsed = this.parseTelegramProbeResult(last)
+            if (this.readJsonBoolField(parsed, "ok", false)) {
+                return last
+            }
+            let err = this.readStringField(parsed, "error").toAsciiLower()
+            if (err.contains("file is too big") || err.contains("too big") || err.contains("forbidden") || err.contains("unauthorized")) {
+                return last
+            }
+        }
+        last
+    }
+
+    private func tryTelegramGetChat(chatId: String): JsonObject {
+        let out = JsonObject()
+        out.put("ok", false.toJsonValue())
+        let token = this.effectiveBotToken()
+        let normalizedChatId = chatId.trimAscii()
+        if (token.isEmpty() || normalizedChatId.isEmpty()) {
+            out.put("error", JsonString("missing-token-or-chat-id"))
+            return out
+        }
+        let raw = this.tryTelegramGet("${this.normalizeApiRoot()}/bot${token}/getChat?chat_id=${normalizedChatId}")
+        let parsed = this.parseTelegramProbeResult(raw)
+        if (!this.readJsonBoolField(parsed, "ok", false)) {
+            out.put("error", JsonString(this.readStringField(parsed, "error")))
+            return out
+        }
+        let result = this.readObjectField(parsed, "result")
+        out.put("ok", true.toJsonValue())
+        out.put("chatId", JsonString(this.readIntStringField(result, "id")))
+        out.put("type", JsonString(this.readStringField(result, "type")))
+        out.put("username", JsonString(this.readStringField(result, "username")))
+        out.put("title", JsonString(this.readStringField(result, "title")))
+        out.put("isForum", (this.readBoolFieldOpt(result, "is_forum") == Some(true)).toJsonValue())
+        let reactions = JsonArray([])
+        match (result.get("available_reactions")) {
+            case Some(v) =>
+                try {
+                    let arr = v.asArray()
+                    for (item in arr.getItems()) {
+                        try {
+                            let obj = item.asObject()
+                            let emoji = this.readStringField(obj, "emoji").trimAscii()
+                            if (!emoji.isEmpty()) {
+                                reactions.add(JsonString(emoji))
+                            }
+                        } catch (_e: Exception) {
+                            try {
+                                let emoji = item.asString().getValue().trimAscii()
+                                if (!emoji.isEmpty()) {
+                                    reactions.add(JsonString(emoji))
+                                }
+                            } catch (_e2: Exception) {
+                                ()
+                            }
+                        }
+                    }
+                } catch (_e: Exception) {
+                    ()
+                }
+            case None => ()
+        }
+        out.put("availableReactions", reactions)
+        out
     }
 
     private func parseTelegramFilePath(raw: String): String {
@@ -3428,6 +3627,14 @@ public class TelegramAdapter <: ChannelAdapter {
         let token = this.effectiveBotToken()
         if (normalized.isEmpty() || token.isEmpty()) {
             return []
+        }
+        let localPath = this.trustedLocalTelegramFilePath(normalized)
+        if (!localPath.isEmpty()) {
+            try {
+                return File.readFrom(Path(localPath))
+            } catch (_e: Exception) {
+                return []
+            }
         }
         let url = this.normalizeApiRoot() + "/file/bot${token}/${normalized}"
         match (this.telegramGetBytes(url, accept: "*/*", context: "downloadFile")) {
@@ -3641,6 +3848,28 @@ public class TelegramAdapter <: ChannelAdapter {
             }
         }
         true
+    }
+
+    private func trustedLocalTelegramFilePath(filePath: String): String {
+        let normalized = filePath.trimAscii()
+        if (normalized.isEmpty() || !normalized.startsWith("/")) {
+            return ""
+        }
+        if (this.config.media.trustedLocalFileRoots.isEmpty()) {
+            return ""
+        }
+        let candidate = try { canonicalize(Path(normalized)).toString() } catch (_e: Exception) { return "" }
+        for (root in this.config.media.trustedLocalFileRoots) {
+            let rootText = root.trimAscii()
+            if (rootText.isEmpty()) {
+                continue
+            }
+            let rootPath = try { canonicalize(Path(rootText)).toString() } catch (_e: Exception) { continue }
+            if (candidate == rootPath || candidate.startsWith(rootPath + "/")) {
+                return candidate
+            }
+        }
+        ""
     }
 
     private func readJsonIntField(obj: JsonObject, key: String, defaultValue: Int64): Int64 {
@@ -4096,6 +4325,7 @@ public class TelegramAdapter <: ChannelAdapter {
 
     private func buildReactionPayload(message: OutboundMessage, targetMessageId: String, token: String): HashMap<String, JsonValue> {
         let normalizedPeer = message.peerId.trimAscii()
+        let effectiveToken = this.telegramReactionFallbackToken(this.normalizePeerId(normalizedPeer), token)
         let body = HashMap<String, JsonValue>()
         body["kind"] = JsonString("reaction")
         body["peer"] = JsonString(normalizedPeer)
@@ -4105,11 +4335,48 @@ public class TelegramAdapter <: ChannelAdapter {
         if (!parseGatewayReactionRemove(message.text)) {
             let reaction = JsonObject()
             reaction.put("type", JsonString("emoji"))
-            reaction.put("emoji", JsonString(token))
+            reaction.put("emoji", JsonString(effectiveToken))
             reactions.add(reaction)
         }
         body["reaction"] = reactions
         body
+    }
+
+    private func telegramReactionFallbackToken(chatId: String, requested: String): String {
+        let token = requested.trimAscii()
+        if (token.isEmpty()) {
+            return token
+        }
+        let chatInfo = this.tryTelegramGetChat(chatId)
+        if (!this.readJsonBoolField(chatInfo, "ok", false)) {
+            return token
+        }
+        match (chatInfo.get("availableReactions")) {
+            case Some(v) =>
+                try {
+                    let arr = v.asArray()
+                    if (arr.size() == 0) {
+                        return token
+                    }
+                    var first = ""
+                    for (item in arr.getItems()) {
+                        let emoji = try { item.asString().getValue().trimAscii() } catch (_e: Exception) { "" }
+                        if (first.isEmpty() && !emoji.isEmpty()) {
+                            first = emoji
+                        }
+                        if (emoji == token) {
+                            return token
+                        }
+                    }
+                    if (!first.isEmpty()) {
+                        return first
+                    }
+                } catch (_e: Exception) {
+                    ()
+                }
+            case None => ()
+        }
+        token
     }
 
     private func buildChatActionPayload(message: OutboundMessage, action: String): HashMap<String, JsonValue> {
@@ -5943,7 +6210,9 @@ public class TelegramAdapter <: ChannelAdapter {
     private func telegramTransport(): TelegramTransport {
         TelegramTransport(
             proxy: this.config.proxy,
-            timeoutSeconds: if (this.config.timeoutSeconds > 0) { this.config.timeoutSeconds } else { 30 }
+            timeoutSeconds: if (this.config.timeoutSeconds > 0) { this.config.timeoutSeconds } else { 30 },
+            insecureSkipTlsVerify: this.config.network.insecureSkipTlsVerify,
+            dangerouslyAllowPrivateNetwork: this.config.network.dangerouslyAllowPrivateNetwork
         )
     }
 

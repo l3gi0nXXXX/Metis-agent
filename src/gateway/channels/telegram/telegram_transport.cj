@@ -107,10 +107,19 @@ public func setTelegramTransportRunnerForTest(runner: Option<(TelegramTransportR
 public class TelegramTransport {
     private let proxy: String
     private let timeoutSeconds: Int64
+    private let insecureSkipTlsVerify: Bool
+    private let dangerouslyAllowPrivateNetwork: Bool
 
-    public init(proxy!: String = "", timeoutSeconds!: Int64 = 30) {
+    public init(
+        proxy!: String = "",
+        timeoutSeconds!: Int64 = 30,
+        insecureSkipTlsVerify!: Bool = false,
+        dangerouslyAllowPrivateNetwork!: Bool = false
+    ) {
         this.proxy = proxy.trimAscii()
         this.timeoutSeconds = if (timeoutSeconds > 0) { timeoutSeconds } else { 30 }
+        this.insecureSkipTlsVerify = insecureSkipTlsVerify
+        this.dangerouslyAllowPrivateNetwork = dangerouslyAllowPrivateNetwork
     }
 
     public func get(url: String, accept!: String = "application/json", context!: String = "get"): TelegramTransportResponse {
@@ -196,6 +205,10 @@ public class TelegramTransport {
         headers: HashMap<String, String>
     ): TelegramTransportResponse {
         try {
+            let urlPolicyError = this.validateTelegramRequestUrl(request.url)
+            if (!urlPolicyError.isEmpty()) {
+                return TelegramTransportResponse(false, error: urlPolicyError, outcome: "blocked-url", statusCode: 0)
+            }
             let client = this.buildNativeHttpClient(request.url)
             try {
                 let response = client.send(this.buildNativeHttpRequest(request, headers))
@@ -244,6 +257,51 @@ public class TelegramTransport {
         }
     }
 
+    private func validateTelegramRequestUrl(url: String): String {
+        let trimmed = url.trimAscii()
+        let lower = trimmed.toAsciiLower()
+        if (!(lower.startsWith("https://") || lower.startsWith("http://"))) {
+            return "telegram transport blocked non-http url"
+        }
+        let parsed = try {
+            URL.parse(trimmed)
+        } catch (_e: Exception) {
+            return "telegram transport blocked invalid url"
+        }
+        let host = parsed.hostName.trimAscii().toAsciiLower()
+        if (host.isEmpty()) {
+            return "telegram transport blocked url without host"
+        }
+        if (!this.dangerouslyAllowPrivateNetwork && this.telegramHostLooksPrivate(host)) {
+            return "telegram transport blocked private-network host: ${host}"
+        }
+        ""
+    }
+
+    private func telegramHostLooksPrivate(host: String): Bool {
+        let h = host.trimAscii().toAsciiLower()
+        if (h == "localhost" || h == "0.0.0.0" || h == "127.0.0.1" || h == "::1" || h == "[::1]") {
+            return true
+        }
+        if (h.startsWith("127.") || h.startsWith("10.") || h.startsWith("192.168.") || h.startsWith("169.254.")) {
+            return true
+        }
+        if (h.startsWith("172.")) {
+            let parts = h.split(".")
+            if (parts.size >= 2) {
+                try {
+                    let second = Int64.parse(parts[1])
+                    if (second >= 16 && second <= 31) {
+                        return true
+                    }
+                } catch (_e: Exception) {
+                    ()
+                }
+            }
+        }
+        h.startsWith("fc") || h.startsWith("fd") || h.startsWith("fe80:")
+    }
+
     private func buildNativeHttpClient(url: String): Client {
         let builder = ClientBuilder()
         builder.readTimeout(Duration.second * (this.timeoutSeconds + 5))
@@ -253,7 +311,9 @@ public class TelegramTransport {
         }
         if (url.startsWith("https")) {
             var tlsConfig = TlsClientConfig()
-            tlsConfig.verifyMode = TrustAll
+            if (this.insecureSkipTlsVerify) {
+                tlsConfig.verifyMode = TrustAll
+            }
             tlsConfig.domain = URL.parse(url).hostName
             tlsConfig.alpnProtocolsList = ["http/1.1"]
             builder.tlsConfig(tlsConfig)
@@ -502,6 +562,10 @@ public class TelegramTransport {
 
     public func debugUsesCustomConnectorForTest(): Bool {
         this.proxy.isEmpty()
+    }
+
+    public func debugValidateRequestUrlForTest(url: String): String {
+        this.validateTelegramRequestUrl(url)
     }
 
     public func debugClassifyStatusForTest(status: Int64): String {

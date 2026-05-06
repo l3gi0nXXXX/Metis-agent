@@ -426,13 +426,17 @@ private func mergeTelegram(user: GatewayUserSettings): TelegramConfig {
             outboundAllowUrl: user.telegram.media.outboundAllowUrl,
             outboundAllowLocalPath: user.telegram.media.outboundAllowLocalPath,
             outboundLocalRoots: user.telegram.media.outboundLocalRoots,
+            trustedLocalFileRoots: user.telegram.media.trustedLocalFileRoots,
             albumPolicy: user.telegram.media.albumPolicy.trimAscii(),
             warnOnDownloadFailure: user.telegram.media.warnOnDownloadFailure
         ),
         network: TelegramNetworkConfig(
             autoSelectFamily: user.telegram.network.autoSelectFamily,
             dnsResultOrder: user.telegram.network.dnsResultOrder.trimAscii(),
-            dangerouslyAllowPrivateNetwork: user.telegram.network.dangerouslyAllowPrivateNetwork
+            dangerouslyAllowPrivateNetwork: user.telegram.network.dangerouslyAllowPrivateNetwork,
+            insecureSkipTlsVerify: user.telegram.network.insecureSkipTlsVerify,
+            allowedUpdatesExtra: user.telegram.network.allowedUpdatesExtra,
+            getFileRetryCount: user.telegram.network.getFileRetryCount
         ),
         policy: policy
     )

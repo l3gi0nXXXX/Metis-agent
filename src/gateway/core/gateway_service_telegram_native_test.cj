@@ -157,7 +157,7 @@ public class GatewayServiceTelegramNativeTest {
     }
 
     @TestCase
-    public func modelCallbackPersistsTelegramChannelModelForAuthorizedSender(): Unit {
+    public func modelCallbackPersistsTelegramSessionModelForAuthorizedSender(): Unit {
         withGatewayTelegramNativeTestHome {
             var user = GatewayUserSettings()
             user.telegram.enabled = true
@@ -170,9 +170,10 @@ public class GatewayServiceTelegramNativeTest {
             adapter.queue("[telegram-callback]\nid=cb-1\nmessageId=1\ndata=models:set:qwen:qwen3.5-plus\nby=8734062810")
             service.processOnce()
 
-            @Expect(adapter.sentText(0).contains("Telegram model switched to qwen:qwen3.5-plus"), true)
+            @Expect(adapter.sentText(0).contains("Telegram session model switched to qwen:qwen3.5-plus"), true)
             let updated = CliSettingManager.readGatewaySettings()
-            @Expect(updated.channelModels.get("telegram") ?? "", "qwen:qwen3.5-plus")
+            @Expect(updated.channelModels.get("telegram") ?? "", "")
+            @Expect(updated.channelModels.get("telegram:telegram:direct:8734062810") ?? "", "qwen:qwen3.5-plus")
         }
     }
 

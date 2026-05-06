@@ -41,6 +41,42 @@ private func gatewayChannelSupportsMessageEdit(channelName: String): Bool {
     channelName.trimAscii().toAsciiLower() == "telegram"
 }
 
+private func gatewayStripTaggedReasoning(raw: String): String {
+    var text = raw
+    while (true) {
+        let startOpt = text.indexOf("<think>")
+        if (startOpt.isNone()) {
+            break
+        }
+        let start = startOpt.getOrThrow()
+        let afterStart = start + "<think>".size
+        match (text[afterStart..].indexOf("</think>")) {
+            case Some(endRel) =>
+                let end = afterStart + endRel + "</think>".size
+                text = text[..start] + text[end..]
+            case None =>
+                text = text[..start]
+                break
+        }
+    }
+    match (text.indexOf("<final>")) {
+        case Some(start) =>
+            let afterStart = start + "<final>".size
+            match (text[afterStart..].indexOf("</final>")) {
+                case Some(endRel) => return text[afterStart..afterStart + endRel].trimAscii()
+                case None => return text[afterStart..].trimAscii()
+            }
+        case None => text.trimAscii()
+    }
+}
+
+private func gatewayVisibleDeliveryText(channelName: String, raw: String): String {
+    if (channelName.trimAscii().toAsciiLower() == "telegram") {
+        return gatewayStripTaggedReasoning(raw)
+    }
+    raw
+}
+
 private func gatewayReplyWithTimeout(
     bridge: AgentBridge,
     context: GatewaySessionContext,
@@ -175,7 +211,8 @@ public func gatewayExecuteSessionTurn(
         toolRuntimeContext: toolRuntimeContext,
         streamingEnabled: streamingEnabled,
         streamChunkHook: Some({ currentText =>
-            let normalized = currentText.trimAscii()
+            let visibleText = gatewayVisibleDeliveryText(context.channelName, currentText)
+            let normalized = visibleText.trimAscii()
             if (normalized.isEmpty()) {
                 return
             }
@@ -201,7 +238,7 @@ public func gatewayExecuteSessionTurn(
                                 context.deliveryTarget.getOrThrow().channelName,
                                 context.deliveryTarget.getOrThrow().accountId,
                                 context.deliveryTarget.getOrThrow().peerId,
-                                currentText,
+                                visibleText,
                                 effectiveReplyToMessageId,
                                 effectiveReplyInThread
                             )
@@ -216,13 +253,13 @@ public func gatewayExecuteSessionTurn(
                                 context.deliveryTarget.getOrThrow().channelName,
                                 context.deliveryTarget.getOrThrow().accountId,
                                 context.deliveryTarget.getOrThrow().peerId,
-                                if (useEditMessages) { renderGatewayEditText(currentText) } else { currentText },
+                                if (useEditMessages) { renderGatewayEditText(visibleText) } else { visibleText },
                                 Some(streamingState.messageId),
                                 false
                             )
                         }
                         streamingState.lastSentAtMs = nowMs
-                        streamingState.lastText = currentText
+                        streamingState.lastText = visibleText
                     } catch (ex: Exception) {
                         streamingState.failed = true
                         LogUtils.info("Gateway streaming fallback: channel=${context.channelName}, reason=${ex.message}")
@@ -243,13 +280,14 @@ public func gatewayExecuteSessionTurn(
             match (deliverHook) {
                 case Some(send) =>
                     try {
+                        let visibleAnswer = gatewayVisibleDeliveryText(context.channelName, answer)
                         if (!streamingState.messageId.isEmpty() && !streamingState.failed) {
-                            if (answer != streamingState.lastText) {
+                            if (visibleAnswer != streamingState.lastText) {
                                 let _ = send(
                                     target.channelName,
                                     target.accountId,
                                     target.peerId,
-                                    if (useEditMessages) { renderGatewayEditText(answer) } else { answer },
+                                    if (useEditMessages) { renderGatewayEditText(visibleAnswer) } else { visibleAnswer },
                                     Some(streamingState.messageId),
                                     false
                                 )
@@ -262,7 +300,7 @@ public func gatewayExecuteSessionTurn(
                                 deliveryMessageId: streamingState.messageId
                             )
                         }
-                        let sentMessageId = send(target.channelName, target.accountId, target.peerId, answer, effectiveReplyToMessageId, effectiveReplyInThread)
+                        let sentMessageId = send(target.channelName, target.accountId, target.peerId, visibleAnswer, effectiveReplyToMessageId, effectiveReplyInThread)
                         return GatewaySessionExecutionResult(
                             answer,
                             delivered: true,

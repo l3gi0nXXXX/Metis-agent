@@ -140,7 +140,7 @@ public class GatewayService {
             )
             return
         }
-        if (channelToString(message.channel) == "telegram" && this.handleTelegramNativeCommand(message, effectiveAccountId, user)) {
+        if (channelToString(message.channel) == "telegram" && this.handleTelegramNativeCommand(message, effectiveAccountId, user, conversationKey)) {
             return
         }
         let request = gatewaySessionRequestFromInbound(message, sessionHint: conversationKey, accountId: effectiveAccountId)
@@ -246,7 +246,7 @@ public class GatewayService {
         }
     }
 
-    private func handleTelegramNativeCommand(message: InboundMessage, accountId: String, user: GatewayUserSettings): Bool {
+    private func handleTelegramNativeCommand(message: InboundMessage, accountId: String, user: GatewayUserSettings, sessionKey: String): Bool {
         let text = message.text.trimAscii()
         if (text == "/help" || text.startsWith("/help ") ||
             text == "/status" || text.startsWith("/status ") ||
@@ -307,7 +307,7 @@ public class GatewayService {
             this.sendTextToPeerDetailed(
                 "telegram",
                 message.peerId,
-                this.renderTelegramModelsEntry(user, page: this.telegramModelsPageFromCommand(text)),
+                this.renderTelegramModelsEntry(user, sessionKey, page: this.telegramModelsPageFromCommand(text)),
                 replyToMessageId: message.replyTargetMessageId,
                 replyInThread: message.replyInThread,
                 accountId: accountId
@@ -317,7 +317,7 @@ public class GatewayService {
         if (text.startsWith("[telegram-callback]")) {
             let data = this.telegramNativeField(text, "data").trimAscii()
             if (data.startsWith("models:set:")) {
-                let reply = this.resolveTelegramModelCallback(data, message.senderId, user)
+                let reply = this.resolveTelegramModelCallback(data, message.senderId, user, sessionKey)
                 this.sendTextToPeerDetailed(
                     "telegram",
                     message.peerId,
@@ -329,7 +329,7 @@ public class GatewayService {
                 return true
             }
             if (data.startsWith("models:page:")) {
-                let reply = this.renderTelegramModelsEntry(user, page: this.telegramModelsPageFromCallback(data))
+                let reply = this.renderTelegramModelsEntry(user, sessionKey, page: this.telegramModelsPageFromCallback(data))
                 this.sendTextToPeerDetailed(
                     "telegram",
                     message.peerId,
@@ -418,8 +418,21 @@ public class GatewayService {
         try { Int64.parse(data["models:page:".size..].trimAscii()) } catch (_e: Exception) { 0 }
     }
 
-    private func renderTelegramModelsEntry(user: GatewayUserSettings, page!: Int64 = 0): String {
-        let current = user.channelModels.get("telegram") ?? ""
+    private func telegramSessionModelKey(sessionKey: String): String {
+        "telegram:${sessionKey.trimAscii()}"
+    }
+
+    private func telegramCurrentModelRef(user: GatewayUserSettings, sessionKey: String): String {
+        let key = this.telegramSessionModelKey(sessionKey)
+        let sessionModel = user.channelModels.get(key) ?? ""
+        if (!sessionModel.trimAscii().isEmpty()) {
+            return sessionModel.trimAscii()
+        }
+        user.channelModels.get("telegram") ?? ""
+    }
+
+    private func renderTelegramModelsEntry(user: GatewayUserSettings, sessionKey: String, page!: Int64 = 0): String {
+        let current = this.telegramCurrentModelRef(user, sessionKey)
         let currentText = if (current.trimAscii().isEmpty()) { "global default" } else { current.trimAscii() }
         let providers = cliSetupVisibleModelProviders()
         let pageSize: Int64 = 8
@@ -444,7 +457,7 @@ public class GatewayService {
         }
         let lines = ArrayList<String>()
         lines.add("[inline-keyboard]")
-        lines.add("text=Telegram model\nCurrent: ${currentText}\nPage: ${effectivePage + 1}/${totalPages}\nSelect a model for the Telegram channel.")
+            lines.add("text=Telegram model\nCurrent: ${currentText}\nPage: ${effectivePage + 1}/${totalPages}\nSelect a model for this Telegram session.")
         let start = effectivePage * pageSize
         let end = if (start + pageSize > total) { total } else { start + pageSize }
         for (idx in start..end) {
@@ -461,7 +474,7 @@ public class GatewayService {
         String.join(lines.toArray(), delimiter: "\n")
     }
 
-    private func resolveTelegramModelCallback(data: String, senderId: String, user: GatewayUserSettings): String {
+    private func resolveTelegramModelCallback(data: String, senderId: String, user: GatewayUserSettings, sessionKey: String): String {
         if (!this.telegramSenderCanOperate(senderId, user)) {
             return "Model switch denied: sender ${senderId} is not authorized."
         }
@@ -470,9 +483,9 @@ public class GatewayService {
             return "Model switch failed: invalid model reference."
         }
         var next = user
-        next.channelModels["telegram"] = modelRef
+        next.channelModels[this.telegramSessionModelKey(sessionKey)] = modelRef
         CliSettingManager.writeGatewaySettings(next)
-        "Telegram model switched to ${modelRef}."
+        "Telegram session model switched to ${modelRef}."
     }
 
     private func telegramSenderCanOperate(senderId: String, user: GatewayUserSettings): Bool {
