@@ -457,7 +457,7 @@ public class GatewayServer {
         response
     }
 
-    public func stopAndWait(clientId!: String = "", timeoutMs!: Int64 = 1000): Bool {
+    public func stopAndWait(clientId!: String = "", timeoutMs!: Int64 = 1000, connectionId!: String = ""): Bool {
         synchronized(gatewayServerLock) {
             let normalized = clientId.trimAscii()
             if (normalized.isEmpty()) {
@@ -509,8 +509,15 @@ public class GatewayServer {
                 gatewayStreamLastDetachAtByClient.clear()
                 gatewayStreamLastWakeReasonByClient.clear()
             } else {
+                let expectedConnectionId = connectionId.trimAscii()
+                if (!expectedConnectionId.isEmpty()) {
+                    let activeConnectionId = existingStringOr(normalized, gatewayConnectionIdByClient, "")
+                    if (!activeConnectionId.isEmpty() && activeConnectionId != expectedConnectionId) {
+                        return false
+                    }
+                }
                 let _ = gatewayServerPublishSessionLifecycleForClient(normalized, "unbound", detail: "client-disconnected")
-                let connectionId = existingStringOr(normalized, gatewayConnectionIdByClient, "")
+                let activeConnectionIdForDisconnect = existingStringOr(normalized, gatewayConnectionIdByClient, "")
                 gatewayConnectedAtByClient.remove(normalized)
                 gatewayLastSeenAtByClient.remove(normalized)
                 gatewayClientNameById.remove(normalized)
@@ -522,7 +529,7 @@ public class GatewayServer {
                 gatewaySessionHintByClient.remove(normalized)
                 gatewayConnectionIdByClient.remove(normalized)
                 gatewayCapabilitiesByClient.remove(normalized)
-                gatewayServerClearChallengeLocked(connectionId, clientId: normalized)
+                gatewayServerClearChallengeLocked(activeConnectionIdForDisconnect, clientId: normalized)
                 gatewayEventQueueByClient.remove(normalized)
                 gatewaySessionEventSubscriberKindsByClient.remove(normalized)
                 gatewayServerUnsubscribeAllSessionMessageEventsLocked(normalized)

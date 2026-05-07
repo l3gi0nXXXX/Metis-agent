@@ -113,14 +113,17 @@ private func gatewayOpenClawPluginSidecarError(method: String, reason: String): 
 
 public func gatewayOpenClawPluginSidecarInvoke(user: GatewayUserSettings, method: String, payload: JsonObject): JsonObject {
     let normalizedMethod = method.trimAscii()
-    match (gatewayOpenClawPluginSidecarRunnerOverride) {
-        case Some(runner) => return runner(normalizedMethod, payload)
-        case None => ()
+    let config = gatewayOpenClawPluginSidecarConfig(user)
+    let configEnabled = gatewayOpenClawPluginSidecarBool(config, "enabled", false)
+    if (!configEnabled) {
+        match (gatewayOpenClawPluginSidecarRunnerOverride) {
+            case Some(runner) => return runner(normalizedMethod, payload)
+            case None => ()
+        }
     }
-    if (!gatewayOpenClawPluginSidecarEnabled(user)) {
+    if (!configEnabled) {
         return gatewayOpenClawPluginSidecarDisabled(normalizedMethod)
     }
-    let config = gatewayOpenClawPluginSidecarConfig(user)
     let command = gatewayOpenClawPluginSidecarString(config, "nodeCommand", "node")
     let timeoutMs = max(1000, gatewayOpenClawPluginSidecarInt(config, "timeoutMs", 10000))
     let scriptPath = gatewayOpenClawPluginSidecarScriptPath(config)

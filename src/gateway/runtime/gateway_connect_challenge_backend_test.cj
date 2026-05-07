@@ -127,4 +127,54 @@ public class GatewayConnectChallengeBackendTest {
             CliSettingManager.applyPersistedFieldsToCliConfig()
         }
     }
+
+    @TestCase
+    public func staleDisconnectDoesNotClearNewerAcknowledgedReconnect(): Unit {
+        let originalRoot = MetisConfigManager.rawConfig() ?? JsonObject()
+        MetisConfigManager.writeRoot(challengeTestConfigRoot())
+        CliSettingManager.applyPersistedFieldsToCliConfig()
+        let original = CliSettingManager.readGatewaySettings()
+        var updated = original
+        updated.auth.mode = "none"
+        updated.controlUi.dangerouslyDisableDeviceAuth = true
+        let _ = MetisConfigManager.setGatewaySettings(updated)
+        CliSettingManager.invalidate()
+
+        let _ = GatewayServer.startGatewayServer(
+            options: GatewayServerOptions(
+                remoteTransportEnabled: true,
+                enableHandshake: true
+            )
+        )
+        let server = GatewayServer.defaultServer()
+        let clientId = "control-ui-stale-close-test"
+        try {
+            let connectOne = challengeTestConnect(clientId, "conn-one")
+            let helloOne = server.request(GatewayProtocolRequest("connect", connectOne))
+            @Expect(helloOne.ok, true)
+            let ackOneParams = JsonObject()
+            ackOneParams.put("challengeToken", JsonString(challengeTestToken(helloOne.result.asObject())))
+            let ackOne = server.request(GatewayProtocolRequest("connect.ack", connectOne, params: ackOneParams))
+            @Expect(ackOne.ok, true)
+
+            let connectTwo = challengeTestConnect(clientId, "conn-two")
+            let helloTwo = server.request(GatewayProtocolRequest("connect", connectTwo))
+            @Expect(helloTwo.ok, true)
+            let ackTwoParams = JsonObject()
+            ackTwoParams.put("challengeToken", JsonString(challengeTestToken(helloTwo.result.asObject())))
+            let ackTwo = server.request(GatewayProtocolRequest("connect.ack", connectTwo, params: ackTwoParams))
+            @Expect(ackTwo.ok, true)
+
+            let staleStopped = server.stopAndWait(clientId: clientId, timeoutMs: 1000, connectionId: "conn-one")
+            @Expect(staleStopped, false)
+
+            let healthTwo = server.request(GatewayProtocolRequest("health", connectTwo))
+            @Expect(healthTwo.ok, true)
+            @Expect(healthTwo.errorCode, "")
+        } finally {
+            let _ = server.stopAndWait(timeoutMs: 1000)
+            MetisConfigManager.writeRoot(originalRoot)
+            CliSettingManager.applyPersistedFieldsToCliConfig()
+        }
+    }
 }

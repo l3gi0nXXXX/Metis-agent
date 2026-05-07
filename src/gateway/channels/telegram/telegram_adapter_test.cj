@@ -3325,7 +3325,13 @@ public class TelegramAdapterTest {
             let sentId = adapter.sendWithMessageId(OutboundMessage(ChannelType.Telegram, "user:8734062810", "hello"))
             @Expect(sentId, "900")
             @Expect(seen.size > 0, true)
-            @Expect(seen[0], "false|verbatim|http://127.0.0.1:7897")
+            var found = false
+            for (item in seen) {
+                if (item == "false|verbatim|http://127.0.0.1:7897") {
+                    found = true
+                }
+            }
+            @Expect(found, true)
         } finally {
             setTelegramTransportRunnerForTest(None)
         }

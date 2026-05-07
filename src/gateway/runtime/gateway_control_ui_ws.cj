@@ -13,7 +13,7 @@ import metis.gateway.core.GatewaySessionStore
 import metis.gateway.core.{GATEWAY_CONTROL_UI_CLIENT_NAME, GatewaySessionCatalogRow, GatewaySessionCatalogView, GatewaySessionConversationView, gatewayBuildChatEventPayload, gatewayBuildSessionCatalogOrigin, gatewayFindSessionConversationViewForUser, gatewayListSessionConversationViewsForUser, gatewaySessionStoreForSessionKey, gatewaySessionStoreForUserWithAgentId}
 import metis.gateway.model.GatewayConfig
 import metis.gateway.session.{GatewayIngressSource, gatewayBuildChatHistoryRpcParams, gatewayBuildChatSendRpcParams, gatewayBuildSessionsDeleteRpcParams}
-import metis.gateway.protocol.{GATEWAY_ERROR_INVALID_CONNECT, GATEWAY_ERROR_NOT_CONNECTED, GatewayClientInfo, GatewayConnectParams, GatewayProtocolRequest, GatewayProtocolResponse, validateGatewayConnectParams}
+import metis.gateway.protocol.{GATEWAY_ERROR_CONNECT_CHALLENGE_REQUIRED, GATEWAY_ERROR_INVALID_CONNECT, GATEWAY_ERROR_NOT_CONNECTED, GatewayClientInfo, GatewayConnectParams, GatewayProtocolRequest, GatewayProtocolResponse, validateGatewayConnectParams}
 import magic.log.LogUtils
 
 import std.collection.{ArrayList, HashMap}
@@ -366,11 +366,26 @@ private func gatewayControlUiWsMaybeAutoAckChallenge(connect: GatewayConnectPara
     let challenge = gatewayControlUiWsObject(root, "challenge")
     let token = gatewayControlUiWsString(challenge, "challengeToken").trimAscii()
     if (token.isEmpty()) {
-        return response
+        return GatewayProtocolResponse(
+            false,
+            response.method,
+            requestId: response.requestId,
+            error: "Gateway connect challenge token missing.",
+            errorCode: GATEWAY_ERROR_CONNECT_CHALLENGE_REQUIRED,
+            details: root
+        )
     }
     let ack = gatewayControlUiWsGatewayAckRequest(connect, token)
     if (!ack.ok) {
-        return response
+        LogUtils.error("Gateway.control-ui.ws: challenge auto-ack failed clientId=${connect.client.id} error=${ack.error}")
+        return GatewayProtocolResponse(
+            false,
+            response.method,
+            requestId: response.requestId,
+            error: ack.error,
+            errorCode: ack.errorCode,
+            details: ack.details
+        )
     }
     root.put("connectChallengeRequired", false.toJsonValue())
     root.put("challenge", ack.result)
@@ -3245,6 +3260,11 @@ private func gatewayControlUiWsHandleConnect(
     let response = gatewayControlUiWsGatewayConnectRequest(connect, frameId)
     if (response.ok) {
         let effectiveResponse = gatewayControlUiWsMaybeAutoAckChallenge(connect, response)
+        if (!effectiveResponse.ok) {
+            LogUtils.error("Gateway.control-ui.ws: connect failed clientId=${connect.client.id} error=${effectiveResponse.error}")
+            gatewayControlUiWsWriteJson(websocket, writeLock, gatewayControlUiWsResponseFrame(effectiveResponse, frameId))
+            return
+        }
         synchronized(stateLock) {
             state.connectParams = Some(connect)
             if (state.registryToken.isEmpty()) {
@@ -3473,7 +3493,14 @@ public func gatewayHandleControlUiWebSocket(ctx: HttpContext, cfg: GatewayConfig
 
 private func gatewayControlUiWsCloseBoundClient(bound: GatewayConnectParams, token: String): Unit {
     gatewayControlUiWsUnregisterConnection(bound.client.id, token)
-    gatewayServerUnsubscribeSessionEvents(bound.client.id)
-    LogUtils.info("Gateway.control-ui.ws: closing clientId=${bound.client.id}")
-    GatewayServer.defaultServer().stopAndWait(clientId: bound.client.id, timeoutMs: 250)
+    let stopped = GatewayServer.defaultServer().stopAndWait(
+        clientId: bound.client.id,
+        timeoutMs: 250,
+        connectionId: bound.connectionId
+    )
+    if (stopped) {
+        LogUtils.info("Gateway.control-ui.ws: closing clientId=${bound.client.id}")
+    } else {
+        LogUtils.info("Gateway.control-ui.ws: skip stale close clientId=${bound.client.id} connectionId=${bound.connectionId}")
+    }
 }

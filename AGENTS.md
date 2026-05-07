@@ -235,3 +235,25 @@ The matrix must enumerate every user-visible Telegram capability being compared 
 Only after that matrix is complete should implementation begin. Do not repeatedly produce partial
 gap summaries or say "no remaining gap" unless every `partial` and `missing` row has been resolved
 or explicitly marked `not-applicable` with code-based justification.
+
+## Control UI validation discipline
+
+Control UI changes are browser-runtime changes, not only static build changes. For any work touching
+`ui/`, `assets/control-ui/`, or Gateway Control UI static serving, validation must include a real
+browser smoke test against the built assets or a live Gateway page.
+
+At minimum, verify that:
+
+- the built JavaScript has no raw TypeScript decorator syntax that the browser would reject;
+- `customElements.get("metis-app")` is registered in the browser;
+- the page renders visible Metis UI content instead of a blank document;
+- there are no browser page errors or failed JavaScript/CSS asset requests;
+- control token bootstrap writes to the same storage backend that the runtime reads;
+- Gateway static asset filenames are stable, or the running Gateway process is restarted and checked.
+- Metis branding assets remain Metis-owned. Do not copy OpenClaw public branding assets into
+  `ui/public` or `assets/control-ui`. Verify favicon and touch-icon files do not contain
+  OpenClaw-specific graphical markers such as `lobster-gradient`, `Left Claw`, `Right Claw`, or
+  `pixel-lobster`.
+
+Do not treat `npm run build`, Cangjie unit tests, or API endpoint checks alone as sufficient proof
+that Control UI still opens correctly.

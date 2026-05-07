@@ -133,8 +133,8 @@
             normalizedDefault: normalizedDefault,
           };
         }
-        function writeTokenVariants(localStorageRef, token, normalizedActual, normalizedDefault) {
-          localStorageRef.removeItem("metis.control.token.v1");
+        function writeTokenVariants(sessionStorageRef, token, normalizedActual, normalizedDefault) {
+          sessionStorageRef.removeItem("metis.control.token.v1");
           var values = [];
           if (normalizedActual) values.push("metis.control.token.v1:" + normalizedActual);
           if (normalizedDefault && normalizedDefault !== normalizedActual) {
@@ -142,9 +142,9 @@
           }
           for (var i = 0; i < values.length; i++) {
             if (token) {
-              localStorageRef.setItem(values[i], token);
+              sessionStorageRef.setItem(values[i], token);
             } else {
-              localStorageRef.removeItem(values[i]);
+              sessionStorageRef.removeItem(values[i]);
             }
           }
         }
@@ -160,23 +160,20 @@
             language: "en",
           });
           var variants = writeSettingsVariants(localStorage, merged);
-          writeTokenVariants(localStorage, token, variants.normalizedActual, variants.normalizedDefault);
+          writeTokenVariants(sessionStorage, token, variants.normalizedActual, variants.normalizedDefault);
           window.__LEGACY_CJ_BOOTSTRAP__ = {
             gatewayUrl: wsUrl,
             token: token,
             password: password,
           };
-          if (token && window.location.hash.indexOf("token=") === -1) {
-            window.location.hash = "token=" + encodeURIComponent(token);
-          }
         } catch (_e) {}
       })();
     </script>
-    <script type="module" crossorigin src="./assets/index-DWX0XMYb.js"></script>
-    <link rel="modulepreload" crossorigin href="./assets/i18n-CV7rUnW0.js">
-    <link rel="modulepreload" crossorigin href="./assets/directive-CUxOzvVj.js">
-    <link rel="modulepreload" crossorigin href="./assets/format-EHph2kGh.js">
-    <link rel="stylesheet" crossorigin href="./assets/index-D6qddEG9.css">
+    <script type="module" crossorigin src="./assets/index.js"></script>
+    <link rel="modulepreload" crossorigin href="./assets/i18n.js">
+    <link rel="modulepreload" crossorigin href="./assets/directive.js">
+    <link rel="modulepreload" crossorigin href="./assets/format.js">
+    <link rel="stylesheet" crossorigin href="./assets/index.css">
   </head>
   <body>
     <metis-app></metis-app>

@@ -49,3 +49,5 @@ test_examples/
 # External modules
 CangjieMagic/
 cj-lsp/
+node_modules/
+ui/node_modules/

@@ -32,10 +32,6 @@ private func gatewayControlUiReplyResolvedIndexHtml(ctx: HttpContext, cfg: Gatew
             return
         }
     }
-    if (state.kind == "inline-fallback") {
-        gatewayControlUiReplyHtml(ctx, gatewayBuildControlUiContentHtml(cfg), csp)
-        return
-    }
     gatewayControlUiReplyHtml(ctx, gatewayControlUiAssetsUnavailableHtml(cfg, state), csp)
 }
 
