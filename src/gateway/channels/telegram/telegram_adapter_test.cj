@@ -1,7 +1,7 @@
 package metis.gateway.channels.telegram
 
 import metis.core.config.CliConfig
-import metis.gateway.core.gatewayBuildMediaContextPrompt
+import metis.gateway.core.{gatewayBuildMediaContextPrompt, setGatewayOpenClawPluginSidecarRunnerForTest}
 import metis.gateway.model.*
 
 import magic.jsonable.*
@@ -266,6 +266,7 @@ public class TelegramAdapterTest {
     public init() {
         setTelegramTransportRunnerForTest(None)
         setTelegramAsrRunnerForTest(None)
+        setGatewayOpenClawPluginSidecarRunnerForTest(None)
     }
 
     @TestCase
@@ -309,14 +310,16 @@ public class TelegramAdapterTest {
         let adapter = TelegramAdapter(config: TelegramConfig(enabled: true, botToken: "telegram-token"))
         let payload = adapter.debugBuildNativeCommandsPayload()
         let commands = payload.get("commands").getOrThrow().asArray()
-        @Expect(commands.size(), 8)
+        @Expect(commands.size(), 20)
         let first = commands[0].asObject()
         let second = commands[1].asObject()
-        let models = commands[2].asObject()
-        let subagents = commands[3].asObject()
+        let commandsEntry = commands[2].asObject()
+        let models = commands[5].asObject()
+        let subagents = commands[7].asObject()
         @Expect(first.get("command").getOrThrow().asString().getValue(), "help")
         @Expect(first.get("description").getOrThrow().asString().getValue(), "Show help")
         @Expect(second.get("command").getOrThrow().asString().getValue(), "status")
+        @Expect(commandsEntry.get("command").getOrThrow().asString().getValue(), "commands")
         @Expect(models.get("command").getOrThrow().asString().getValue(), "models")
         @Expect(subagents.get("command").getOrThrow().asString().getValue(), "subagents")
     }
@@ -356,10 +359,38 @@ public class TelegramAdapterTest {
         )
         let payload = adapter.debugBuildNativeCommandsPayload()
         let commands = payload.get("commands").getOrThrow().asArray()
-        @Expect(commands.size(), 9)
-        let last = commands[8].asObject()
+        @Expect(commands.size(), 21)
+        let last = commands[20].asObject()
         @Expect(last.get("command").getOrThrow().asString().getValue(), "generate")
         @Expect(last.get("description").getOrThrow().asString().getValue(), "Create image")
+    }
+
+    @TestCase
+    public func nativeCommandsPayloadIncludesOpenClawPluginCommandsWhenSidecarEnabled(): Unit {
+        setGatewayOpenClawPluginSidecarRunnerForTest(Some({ method: String, _payload: JsonObject =>
+            let out = JsonObject()
+            out.put("ok", true.toJsonValue())
+            if (method == "commands.list") {
+                let commands = JsonArray([])
+                let row = JsonObject()
+                row.put("command", JsonString("plugin_demo"))
+                row.put("description", JsonString("Plugin demo command"))
+                commands.add(row)
+                out.put("commands", commands)
+            }
+            out
+        }))
+        try {
+            let adapter = TelegramAdapter(config: TelegramConfig(enabled: true, botToken: "telegram-token"))
+            let payload = adapter.debugBuildNativeCommandsPayload()
+            let commands = payload.get("commands").getOrThrow().asArray()
+            @Expect(commands.size(), 21)
+            let pluginCommand = commands[20].asObject()
+            @Expect(pluginCommand.get("command").getOrThrow().asString().getValue(), "plugin_demo")
+            @Expect(pluginCommand.get("description").getOrThrow().asString().getValue(), "Plugin demo command")
+        } finally {
+            setGatewayOpenClawPluginSidecarRunnerForTest(None)
+        }
     }
 
     @TestCase
@@ -463,7 +494,7 @@ public class TelegramAdapterTest {
             let commands = snapshot.get("nativeCommands").getOrThrow().asObject()
             @Expect(commands.get("lastSyncStatus").getOrThrow().asString().getValue(), "error")
             @Expect(commands.get("lastSyncError").getOrThrow().asString().getValue().contains("Bad Request"), true)
-            @Expect(commands.get("lastSyncCommandCount").getOrThrow().asInt().getValue(), 8)
+            @Expect(commands.get("lastSyncCommandCount").getOrThrow().asInt().getValue(), 20)
         } finally {
             setTelegramTransportRunnerForTest(None)
         }

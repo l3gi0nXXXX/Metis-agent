@@ -1,7 +1,7 @@
 package metis.gateway.channels.telegram
 
 import metis.core.{GatewayMediaGroupItem, gatewayMediaTranscribeAudioPathForRuntime, parseGatewayAudioParts, parseGatewayChatAction, parseGatewayDocumentParts, parseGatewayEditMediaParts, parseGatewayEditText, parseGatewayInlineKeyboardParts, parseGatewayMediaGroupItems, parseGatewayPhotoParts, parseGatewayPinAction, parseGatewayReactionRemove, parseGatewayReactionToken, parseGatewayStickerFileId, parseGatewayTopicCreateText, parseGatewayTopicEditText, parseGatewayVideoNoteFileId, parseGatewayVideoParts, parseGatewayVoiceParts}
-import metis.gateway.core.ChannelAdapter
+import metis.gateway.core.{ChannelAdapter, gatewayOpenClawPluginSidecarCommandCatalogForMenu}
 import metis.gateway.model.*
 import metis.io.PrintUtils
 import metis.core.config.CliConfig
@@ -575,6 +575,10 @@ public class TelegramAdapter <: ChannelAdapter {
             }
             if (this.payloadIsDelete(payload) && !this.config.actions.deleteMessage) {
                 this.lastSendError = "telegram deleteMessage action is disabled"
+                return ""
+            }
+            if (this.payloadIsClearButtons(payload) && !this.config.actions.editMessage) {
+                this.lastSendError = "telegram clear-buttons action requires editMessage action"
                 return ""
             }
             if (this.payloadIsEdit(payload) && !this.config.actions.editMessage) {
@@ -2460,6 +2464,7 @@ public class TelegramAdapter <: ChannelAdapter {
         if (normalized.startsWith("commands:")) { return "command-ui" }
         if (normalized.startsWith("sessions:")) { return "session-ui" }
         if (normalized.startsWith("subagents:")) { return "subagent-ui" }
+        if (normalized.startsWith("plugin-approval:")) { return "plugin-approval" }
         if (normalized.startsWith("plugin:")) { return "plugin-not-applicable" }
         "unknown"
     }
@@ -3005,7 +3010,7 @@ public class TelegramAdapter <: ChannelAdapter {
     }
 
     private func parseTelegramPayloadSuccess(kind: String, raw: String): Option<String> {
-        if (kind == "delete" || kind == "pin" || kind == "unpin" || kind == "reaction" || kind == "edit" || kind == "edit-media" || kind == "chat-action") {
+        if (kind == "delete" || kind == "clear-buttons" || kind == "pin" || kind == "unpin" || kind == "reaction" || kind == "edit" || kind == "edit-media" || kind == "chat-action") {
             return if (this.parseTelegramBoolSuccess(raw, missingDetail: "telegram api returned ok=false")) { Some("") } else { None<String> }
         }
         if (kind == "topic-create") {
@@ -4342,9 +4347,21 @@ public class TelegramAdapter <: ChannelAdapter {
             for ((command, description) in [
                 ("help", "Show help"),
                 ("status", "Show status"),
+                ("commands", "Show commands"),
+                ("tools", "Show tools"),
+                ("whoami", "Show Telegram identity"),
                 ("models", "Switch model"),
+                ("model", "Show current model"),
                 ("subagents", "Manage subagents"),
                 ("sessions", "Manage sessions"),
+                ("session", "Show current session"),
+                ("new", "Start new session"),
+                ("reset", "Reset session"),
+                ("compact", "Compact session"),
+                ("think", "Set reasoning"),
+                ("reasoning", "Set reasoning"),
+                ("fast", "Fast mode"),
+                ("verbose", "Verbose mode"),
                 ("approvals", "Review approvals"),
                 ("activation", "Set activation mode"),
                 ("pair", "Manage pairing")
@@ -4352,6 +4369,18 @@ public class TelegramAdapter <: ChannelAdapter {
                 rows.add((command, description))
                 seen[command] = true
             }
+        }
+        for ((command, description) in gatewayOpenClawPluginSidecarCommandCatalogForMenu()) {
+            let normalizedCommand = this.normalizeTelegramCommandName(command)
+            let normalizedDescription = description.trimAscii()
+            if (normalizedCommand.isEmpty() || normalizedDescription.isEmpty()) {
+                continue
+            }
+            if (seen.contains(normalizedCommand)) {
+                continue
+            }
+            rows.add((normalizedCommand, normalizedDescription))
+            seen[normalizedCommand] = true
         }
         for (custom in this.config.customCommands) {
             let normalizedCommand = this.normalizeTelegramCommandName(custom.command)
@@ -4434,6 +4463,10 @@ public class TelegramAdapter <: ChannelAdapter {
             case None => ()
         }
         match (this.detectDeletePayload(message)) {
+            case Some(payload) => return [payload]
+            case None => ()
+        }
+        match (this.detectClearButtonsPayload(message)) {
             case Some(payload) => return [payload]
             case None => ()
         }
@@ -4655,6 +4688,19 @@ public class TelegramAdapter <: ChannelAdapter {
         body["peer"] = JsonString(normalizedPeer)
         body["chat_id"] = JsonString(this.normalizePeerId(normalizedPeer))
         body["message_id"] = JsonString(targetMessageId)
+        body
+    }
+
+    private func buildClearButtonsPayload(message: OutboundMessage, targetMessageId: String): HashMap<String, JsonValue> {
+        let normalizedPeer = message.peerId.trimAscii()
+        let body = HashMap<String, JsonValue>()
+        body["kind"] = JsonString("clear-buttons")
+        body["peer"] = JsonString(normalizedPeer)
+        body["chat_id"] = JsonString(this.normalizePeerId(normalizedPeer))
+        body["message_id"] = JsonString(targetMessageId)
+        let markup = JsonObject()
+        markup.put("inline_keyboard", JsonArray([]))
+        body["reply_markup"] = markup
         body
     }
 
@@ -5273,6 +5319,13 @@ public class TelegramAdapter <: ChannelAdapter {
         }
     }
 
+    private func payloadIsClearButtons(payload: HashMap<String, JsonValue>): Bool {
+        match (payload.get("kind")) {
+            case Some(v) => try { v.asString().getValue().trimAscii().toAsciiLower() == "clear-buttons" } catch (_e: Exception) { false }
+            case None => false
+        }
+    }
+
     private func payloadIsEdit(payload: HashMap<String, JsonValue>): Bool {
         match (payload.get("kind")) {
             case Some(v) => try { v.asString().getValue().trimAscii().toAsciiLower() == "edit" } catch (_e: Exception) { false }
@@ -5448,6 +5501,9 @@ public class TelegramAdapter <: ChannelAdapter {
         if (kind == "delete") {
             return "deleteMessage"
         }
+        if (kind == "clear-buttons") {
+            return "editMessageReplyMarkup"
+        }
         if (kind == "edit") {
             return "editMessageText"
         }
@@ -5570,6 +5626,19 @@ public class TelegramAdapter <: ChannelAdapter {
             case Some(target) =>
                 let trimmed = target.trimAscii()
                 if (trimmed.isEmpty()) { None } else { Some(this.buildDeletePayload(message, trimmed)) }
+            case None => None
+        }
+    }
+
+    private func detectClearButtonsPayload(message: OutboundMessage): Option<HashMap<String, JsonValue>> {
+        let normalized = message.text.replace("\r\n", "\n").replace("\r", "\n").trimAscii()
+        if (normalized != "[clear-buttons]") {
+            return None
+        }
+        match (message.replyToMessageId) {
+            case Some(target) =>
+                let trimmed = target.trimAscii()
+                if (trimmed.isEmpty()) { None } else { Some(this.buildClearButtonsPayload(message, trimmed)) }
             case None => None
         }
     }

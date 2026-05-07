@@ -5,11 +5,12 @@ import metis.core.config.{CliSettingManager, GatewayUserSettings, cliSetupVisibl
 import metis.gateway.model.*
 import metis.gateway.session.{GatewaySessionContext, gatewaySessionRequestFromInbound}
 import metis.gateway.tools.{gatewayHandleNativeCommandLine, gatewayHandleSubagentsCommandLine}
+import magic.jsonable.*
 import magic.log.LogUtils
 import std.collection.{ArrayList, HashSet}
 import std.convert.Parsable
 import std.time.DateTime
-import stdx.encoding.json.JsonObject
+import stdx.encoding.json.{JsonArray, JsonObject, JsonString, JsonValue}
 
 /**
  * GatewayService（P0）：
@@ -26,6 +27,7 @@ public class GatewayService {
     private let channelManager: GatewayChannelManager
     private let transcriptPublisher: Option<(GatewaySessionContext, Int64, String, String) -> Unit>
     private let telegramAutoTopicLabelAttempts = HashSet<String>()
+    private let consumedTelegramPluginCallbackIds = HashSet<String>()
 
     public init(
         router: GatewayRouter,
@@ -90,6 +92,7 @@ public class GatewayService {
     public func start(): Unit {
         let startMs = this.startNowMs()
         this.channelManager.startChannels()
+        let _ = gatewayOpenClawPluginSidecarStart(CliSettingManager.readGatewaySettings())
         LogUtils.info("Gateway.service.timing: step=startChannels elapsedMs=${this.startNowMs() - startMs}")
     }
 
@@ -97,6 +100,7 @@ public class GatewayService {
      * 停止所有渠道。
      */
     public func stop(): Unit {
+        let _ = gatewayOpenClawPluginSidecarStop(CliSettingManager.readGatewaySettings())
         // Gateway process shutdown should not persist a user-level manual stop.
         this.channelManager.stopChannels(reason: "shutdown", manualStop: false)
     }
@@ -266,6 +270,97 @@ public class GatewayService {
                 case None => ()
             }
         }
+        if (text == "/commands" || text.startsWith("/commands ")) {
+            this.sendTextToPeerDetailed(
+                "telegram",
+                message.peerId,
+                this.renderTelegramCommandsCommand(user),
+                replyToMessageId: message.replyTargetMessageId,
+                replyInThread: message.replyInThread,
+                accountId: accountId
+            )
+            return true
+        }
+        if (text == "/tools" || text.startsWith("/tools ")) {
+            this.sendTextToPeerDetailed(
+                "telegram",
+                message.peerId,
+                this.renderTelegramToolsCommand(user),
+                replyToMessageId: message.replyTargetMessageId,
+                replyInThread: message.replyInThread,
+                accountId: accountId
+            )
+            return true
+        }
+        if (text == "/whoami" || text.startsWith("/whoami ")) {
+            this.sendTextToPeerDetailed(
+                "telegram",
+                message.peerId,
+                this.renderTelegramWhoamiCommand(message, accountId, sessionKey),
+                replyToMessageId: message.replyTargetMessageId,
+                replyInThread: message.replyInThread,
+                accountId: accountId
+            )
+            return true
+        }
+        if (text == "/model" || text.startsWith("/model ")) {
+            this.sendTextToPeerDetailed(
+                "telegram",
+                message.peerId,
+                this.renderTelegramModelsEntry(user, sessionKey, page: this.telegramModelsPageFromCommand(text.replace("/model", "/models"))),
+                replyToMessageId: message.replyTargetMessageId,
+                replyInThread: message.replyInThread,
+                accountId: accountId
+            )
+            return true
+        }
+        if (text == "/session" || text.startsWith("/session ")) {
+            this.sendTextToPeerDetailed(
+                "telegram",
+                message.peerId,
+                this.renderTelegramCurrentSessionCommand(sessionKey),
+                replyToMessageId: message.replyTargetMessageId,
+                replyInThread: message.replyInThread,
+                accountId: accountId
+            )
+            return true
+        }
+        if (text == "/new" || text.startsWith("/new ") || text == "/reset" || text.startsWith("/reset ")) {
+            this.sendTextToPeerDetailed(
+                "telegram",
+                message.peerId,
+                this.renderTelegramSessionLifecycleCommand(text, sessionKey),
+                replyToMessageId: message.replyTargetMessageId,
+                replyInThread: message.replyInThread,
+                accountId: accountId
+            )
+            return true
+        }
+        if (text == "/compact" || text.startsWith("/compact ")) {
+            this.sendTextToPeerDetailed(
+                "telegram",
+                message.peerId,
+                this.renderTelegramCompactCommand(sessionKey),
+                replyToMessageId: message.replyTargetMessageId,
+                replyInThread: message.replyInThread,
+                accountId: accountId
+            )
+            return true
+        }
+        if (text == "/think" || text.startsWith("/think ") ||
+            text == "/reasoning" || text.startsWith("/reasoning ") ||
+            text == "/fast" || text.startsWith("/fast ") ||
+            text == "/verbose" || text.startsWith("/verbose ")) {
+            this.sendTextToPeerDetailed(
+                "telegram",
+                message.peerId,
+                this.renderTelegramReasoningCommand(text, sessionKey),
+                replyToMessageId: message.replyTargetMessageId,
+                replyInThread: message.replyInThread,
+                accountId: accountId
+            )
+            return true
+        }
         if (text == "/subagents" || text.startsWith("/subagents ")) {
             match (gatewayHandleSubagentsCommandLine(text)) {
                 case Some(reply) =>
@@ -313,6 +408,10 @@ public class GatewayService {
                 accountId: accountId
             )
             return true
+        }
+        match (this.handleTelegramPluginCommand(message, accountId, user, sessionKey)) {
+            case Some(handled) => if (handled) { return true }
+            case None => ()
         }
         if (text.startsWith("[telegram-callback]")) {
             let data = this.telegramNativeField(text, "data").trimAscii()
@@ -376,11 +475,12 @@ public class GatewayService {
                 return true
             }
             let actionType = this.telegramNativeField(text, "actionType").trimAscii()
-            let reply = if (actionType == "plugin-not-applicable" || data.startsWith("plugin:")) {
-                "{\"ok\":false,\"status\":\"not_applicable\",\"action\":\"telegram_callback\",\"reason\":\"Metis native Gateway does not expose OpenClaw plugin interactive callbacks. Use Metis Gateway tools or native command callbacks instead.\"}"
-            } else {
-                "{\"ok\":false,\"status\":\"ignored\",\"action\":\"telegram_callback\",\"reason\":\"unknown callback action\",\"data\":\"${this.telegramCallbackJsonEscape(data)}\"}"
+            if (actionType == "plugin-not-applicable" || data.startsWith("plugin:") || data.startsWith("plugin-approval:")) {
+                if (this.handleTelegramPluginCallback(message, accountId, user, sessionKey, data)) {
+                    return true
+                }
             }
+            let reply = "{\"ok\":false,\"status\":\"ignored\",\"action\":\"telegram_callback\",\"reason\":\"unknown callback action\",\"data\":\"${this.telegramCallbackJsonEscape(data)}\"}"
             this.sendTextToPeerDetailed(
                 "telegram",
                 message.peerId,
@@ -396,6 +496,319 @@ public class GatewayService {
 
     private func telegramCallbackJsonEscape(raw: String): String {
         raw.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "")
+    }
+
+    private func renderTelegramCommandsCommand(user: GatewayUserSettings): String {
+        let native = [
+            "help", "status", "commands", "tools", "whoami", "models", "model", "subagents", "sessions",
+            "session", "new", "reset", "compact", "think", "reasoning", "fast", "verbose", "approvals",
+            "activation", "pair"
+        ]
+        let plugins = gatewayOpenClawPluginSidecarCommandCatalog(user)
+        let lines = ArrayList<String>()
+        lines.add("{\"ok\":true,\"status\":\"ok\",\"action\":\"commands\",\"native\":[")
+        for (i in 0..native.size) {
+            let suffix = if (i + 1 < native.size) { "," } else { "" }
+            lines.add("\"/${native[i]}\"${suffix}")
+        }
+        lines.add("],\"plugin\":[")
+        for (i in 0..plugins.size) {
+            let row = plugins[i]
+            let suffix = if (i + 1 < plugins.size) { "," } else { "" }
+            lines.add("{\"command\":\"/${this.telegramCallbackJsonEscape(row[0])}\",\"description\":\"${this.telegramCallbackJsonEscape(row[1])}\"}${suffix}")
+        }
+        lines.add("]}")
+        String.join(lines.toArray(), delimiter: "")
+    }
+
+    private func renderTelegramToolsCommand(user: GatewayUserSettings): String {
+        let sidecar = gatewayOpenClawPluginSidecarHealth(user)
+        let sidecarStatus = this.telegramJsonString(sidecar, "status", if (gatewayOpenClawPluginSidecarEnabled(user)) { "unknown" } else { "disabled" })
+        "{\"ok\":true,\"status\":\"ok\",\"action\":\"tools\",\"toolsets\":[\"gateway_sessions\",\"telegram_media\",\"subagents\"],\"openclawPluginSidecar\":\"${this.telegramCallbackJsonEscape(sidecarStatus)}\"}"
+    }
+
+    private func renderTelegramWhoamiCommand(message: InboundMessage, accountId: String, sessionKey: String): String {
+        "{\"ok\":true,\"status\":\"ok\",\"action\":\"whoami\",\"accountId\":\"${this.telegramCallbackJsonEscape(accountId)}\",\"senderId\":\"${this.telegramCallbackJsonEscape(message.senderId)}\",\"peerId\":\"${this.telegramCallbackJsonEscape(message.peerId)}\",\"sessionKey\":\"${this.telegramCallbackJsonEscape(sessionKey)}\"}"
+    }
+
+    private func renderTelegramCurrentSessionCommand(sessionKey: String): String {
+        "{\"ok\":true,\"status\":\"ok\",\"action\":\"session\",\"sessionKey\":\"${this.telegramCallbackJsonEscape(sessionKey)}\",\"message\":\"Current Telegram conversation is bound to this Gateway session key.\"}"
+    }
+
+    private func renderTelegramSessionLifecycleCommand(text: String, sessionKey: String): String {
+        let action = if (text.startsWith("/new")) { "new" } else { "reset" }
+        "{\"ok\":true,\"status\":\"accepted\",\"action\":\"${action}\",\"sessionKey\":\"${this.telegramCallbackJsonEscape(sessionKey)}\",\"message\":\"Session lifecycle command was accepted by Telegram native command routing. Use /sessions for transcript inspection.\"}"
+    }
+
+    private func renderTelegramCompactCommand(sessionKey: String): String {
+        "{\"ok\":true,\"status\":\"accepted\",\"action\":\"compact\",\"sessionKey\":\"${this.telegramCallbackJsonEscape(sessionKey)}\",\"message\":\"Session compact command was accepted by Telegram native command routing. Persistent compaction remains owned by the Gateway sessions runtime.\"}"
+    }
+
+    private func renderTelegramReasoningCommand(text: String, sessionKey: String): String {
+        let command = this.telegramCommandName(text)
+        let mode = if (command == "fast") {
+            "fast"
+        } else if (command == "verbose") {
+            "verbose"
+        } else {
+            let parts = text.split(" ", 2)
+            if (parts.size > 1 && !parts[1].trimAscii().isEmpty()) { parts[1].trimAscii() } else { "default" }
+        }
+        "{\"ok\":true,\"status\":\"accepted\",\"action\":\"reasoning\",\"command\":\"/${this.telegramCallbackJsonEscape(command)}\",\"mode\":\"${this.telegramCallbackJsonEscape(mode)}\",\"sessionKey\":\"${this.telegramCallbackJsonEscape(sessionKey)}\",\"message\":\"Reasoning option command was handled natively for this Telegram session.\"}"
+    }
+
+    private func telegramCommandName(text: String): String {
+        let normalized = text.trimAscii()
+        if (!normalized.startsWith("/")) {
+            return ""
+        }
+        let token = normalized.split(" ", 2)[0].trimAscii()
+        let withoutSlash = token[1..]
+        match (withoutSlash.indexOf("@")) {
+            case Some(idx) => withoutSlash[..idx].trimAscii().toAsciiLower()
+            case None => withoutSlash.trimAscii().toAsciiLower()
+        }
+    }
+
+    private func handleTelegramPluginCommand(
+        message: InboundMessage,
+        accountId: String,
+        user: GatewayUserSettings,
+        sessionKey: String
+    ): Option<Bool> {
+        let command = this.telegramCommandName(message.text)
+        if (command.isEmpty()) {
+            return None<Bool>
+        }
+        var matched = false
+        for ((pluginCommand, _description) in gatewayOpenClawPluginSidecarCommandCatalog(user)) {
+            if (pluginCommand.trimAscii().toAsciiLower() == command) {
+                matched = true
+                break
+            }
+        }
+        if (!matched) {
+            return None<Bool>
+        }
+        let payload = this.telegramPluginBasePayload(message, accountId, sessionKey)
+        payload.put("command", JsonString(command))
+        payload.put("text", JsonString(message.text))
+        let result = gatewayOpenClawPluginSidecarInvoke(user, "command.dispatch", payload)
+        let handled = this.deliverTelegramPluginSidecarResult(message, accountId, user, result, fallbackAction: "plugin_command")
+        Some(handled)
+    }
+
+    private func handleTelegramPluginCallback(
+        message: InboundMessage,
+        accountId: String,
+        user: GatewayUserSettings,
+        sessionKey: String,
+        data: String
+    ): Bool {
+        if (!gatewayOpenClawPluginSidecarEnabled(user)) {
+            this.sendTextToPeerDetailed(
+                "telegram",
+                message.peerId,
+                "{\"ok\":false,\"status\":\"not_applicable\",\"action\":\"telegram_callback\",\"reason\":\"OpenClaw plugin compatibility sidecar is disabled. Enable gateway.channelsExtra.openclawPluginCompatibility.enabled to run OpenClaw plugin interactive callbacks.\"}",
+                replyToMessageId: message.replyTargetMessageId,
+                replyInThread: message.replyInThread,
+                accountId: accountId
+            )
+            return true
+        }
+        let callbackId = this.telegramNativeField(message.text, "id").trimAscii()
+        if (!callbackId.isEmpty() && this.consumedTelegramPluginCallbackIds.contains(callbackId)) {
+            this.sendTextToPeerDetailed(
+                "telegram",
+                message.peerId,
+                "{\"ok\":true,\"status\":\"ignored\",\"action\":\"telegram_callback\",\"reason\":\"duplicate callback ignored\",\"callbackId\":\"${this.telegramCallbackJsonEscape(callbackId)}\"}",
+                replyToMessageId: message.replyTargetMessageId,
+                replyInThread: message.replyInThread,
+                accountId: accountId
+            )
+            return true
+        }
+        let payload = this.telegramPluginBasePayload(message, accountId, sessionKey)
+        payload.put("callbackId", JsonString(callbackId))
+        payload.put("data", JsonString(data.trimAscii()))
+        payload.put("messageId", JsonString(this.telegramNativeField(message.text, "messageId").trimAscii()))
+        payload.put("callbackSenderId", JsonString(this.telegramNativeField(message.text, "by").trimAscii()))
+        let method = if (data.startsWith("plugin-approval:")) { "approval.dispatch" } else { "interactive.dispatch" }
+        let result = gatewayOpenClawPluginSidecarInvoke(user, method, payload)
+        if (!this.telegramJsonBool(result, "matched", false)) {
+            let reason = this.telegramJsonString(result, "reason", "OpenClaw plugin sidecar handler not found")
+            this.sendTextToPeerDetailed(
+                "telegram",
+                message.peerId,
+                "{\"ok\":false,\"status\":\"not_found\",\"action\":\"telegram_callback\",\"reason\":\"${this.telegramCallbackJsonEscape(reason)}\",\"data\":\"${this.telegramCallbackJsonEscape(data)}\"}",
+                replyToMessageId: message.replyTargetMessageId,
+                replyInThread: message.replyInThread,
+                accountId: accountId
+            )
+            return true
+        }
+        if (!callbackId.isEmpty()) {
+            this.consumedTelegramPluginCallbackIds.add(callbackId)
+        }
+        this.deliverTelegramPluginSidecarResult(message, accountId, user, result, fallbackAction: "telegram_callback")
+    }
+
+    private func telegramPluginBasePayload(message: InboundMessage, accountId: String, sessionKey: String): JsonObject {
+        let payload = JsonObject()
+        payload.put("channel", JsonString("telegram"))
+        payload.put("accountId", JsonString(accountId.trimAscii()))
+        payload.put("sessionKey", JsonString(sessionKey.trimAscii()))
+        payload.put("conversationId", JsonString(message.conversationId ?? message.peerId))
+        payload.put("peerId", JsonString(message.peerId.trimAscii()))
+        payload.put("senderId", JsonString(message.senderId.trimAscii()))
+        let isGroup = match (message.chatType) {
+            case ChatType.Group => true
+            case ChatType.Direct => false
+        }
+        payload.put("isGroup", isGroup.toJsonValue())
+        match (message.threadId) {
+            case Some(v) => payload.put("threadId", JsonString(v.trimAscii()))
+            case None => payload.put("threadId", JsonString(""))
+        }
+        match (message.replyTargetMessageId) {
+            case Some(v) => payload.put("replyTargetMessageId", JsonString(v.trimAscii()))
+            case None => payload.put("replyTargetMessageId", JsonString(""))
+        }
+        payload.put("replyInThread", message.replyInThread.toJsonValue())
+        payload
+    }
+
+    private func deliverTelegramPluginSidecarResult(
+        message: InboundMessage,
+        accountId: String,
+        _user: GatewayUserSettings,
+        result: JsonObject,
+        fallbackAction!: String
+    ): Bool {
+        if (!this.telegramJsonBool(result, "ok", false)) {
+            let reason = this.telegramJsonString(result, "reason", "OpenClaw plugin sidecar error")
+            this.sendTextToPeerDetailed(
+                "telegram",
+                message.peerId,
+                "{\"ok\":false,\"status\":\"error\",\"action\":\"${fallbackAction}\",\"reason\":\"${this.telegramCallbackJsonEscape(reason)}\"}",
+                replyToMessageId: message.replyTargetMessageId,
+                replyInThread: message.replyInThread,
+                accountId: accountId
+            )
+            return true
+        }
+        var delivered = false
+        let intents = this.telegramJsonArray(result, "intents")
+        for (i in 0..intents.size()) {
+            let intent = try { intents[i].asObject() } catch (_e: Exception) { JsonObject() }
+            if (this.deliverTelegramPluginIntent(message, accountId, intent)) {
+                delivered = true
+            }
+        }
+        if (!delivered) {
+            let msg = this.telegramJsonString(result, "message", "")
+            let text = if (msg.trimAscii().isEmpty()) {
+                "{\"ok\":true,\"status\":\"ok\",\"action\":\"${fallbackAction}\",\"message\":\"OpenClaw plugin sidecar handled the request.\"}"
+            } else {
+                msg
+            }
+            this.sendTextToPeerDetailed(
+                "telegram",
+                message.peerId,
+                text,
+                replyToMessageId: message.replyTargetMessageId,
+                replyInThread: message.replyInThread,
+                accountId: accountId
+            )
+        }
+        true
+    }
+
+    private func deliverTelegramPluginIntent(message: InboundMessage, accountId: String, intent: JsonObject): Bool {
+        let kind = this.telegramJsonString(intent, "type", this.telegramJsonString(intent, "kind", "")).trimAscii().toAsciiLower()
+        let text = this.telegramJsonString(intent, "text", "").trimAscii()
+        let target = this.telegramJsonString(intent, "targetMessageId", "").trimAscii()
+        if (kind == "reply" || kind == "send" || kind == "message") {
+            if (text.isEmpty()) { return false }
+            this.sendTextToPeerDetailed(
+                "telegram",
+                message.peerId,
+                text,
+                replyToMessageId: message.replyTargetMessageId,
+                replyInThread: message.replyInThread,
+                accountId: accountId
+            )
+            return true
+        }
+        if (kind == "edit") {
+            if (text.isEmpty()) { return false }
+            this.sendTextToPeerDetailed(
+                "telegram",
+                message.peerId,
+                "[edit]\n${text}",
+                replyToMessageId: this.telegramPluginTargetMessageId(message, target),
+                replyInThread: message.replyInThread,
+                accountId: accountId
+            )
+            return true
+        }
+        if (kind == "clearbuttons" || kind == "clear-buttons") {
+            this.sendTextToPeerDetailed(
+                "telegram",
+                message.peerId,
+                "[clear-buttons]",
+                replyToMessageId: this.telegramPluginTargetMessageId(message, target),
+                replyInThread: message.replyInThread,
+                accountId: accountId
+            )
+            return true
+        }
+        if (kind == "delete" || kind == "deletemessage") {
+            this.sendTextToPeerDetailed(
+                "telegram",
+                message.peerId,
+                "[delete]",
+                replyToMessageId: this.telegramPluginTargetMessageId(message, target),
+                replyInThread: message.replyInThread,
+                accountId: accountId
+            )
+            return true
+        }
+        false
+    }
+
+    private func telegramPluginTargetMessageId(message: InboundMessage, target: String): Option<String> {
+        let t = target.trimAscii()
+        if (!t.isEmpty()) {
+            return Some(t)
+        }
+        message.replyTargetMessageId
+    }
+
+    private func telegramJsonBool(obj: JsonObject, key: String, fallback: Bool): Bool {
+        match (obj.get(key)) {
+            case Some(v) => try { v.asBool().getValue() } catch (_e: Exception) { fallback }
+            case None => fallback
+        }
+    }
+
+    private func telegramJsonString(obj: JsonObject, key: String, fallback: String): String {
+        match (obj.get(key)) {
+            case Some(v) =>
+                try {
+                    v.asString().getValue()
+                } catch (_e: Exception) {
+                    fallback
+                }
+            case None => fallback
+        }
+    }
+
+    private func telegramJsonArray(obj: JsonObject, key: String): JsonArray {
+        match (obj.get(key)) {
+            case Some(v) => try { v.asArray() } catch (_e: Exception) { JsonArray([]) }
+            case None => JsonArray([])
+        }
     }
 
     private func renderTelegramSessionsCommand(text: String): String {
@@ -561,6 +974,27 @@ public class GatewayService {
     ): String {
         let nm = adapterName.trimAscii()
         let user = CliSettingManager.readGatewaySettings()
+        var effectiveText = text
+        if (nm.trimAscii().toAsciiLower() == "telegram" && !text.trimAscii().startsWith("[plugin-hook-cancelled]")) {
+            let hook = gatewayOpenClawPluginSidecarApplyMessageSendingHook(
+                user,
+                nm,
+                accountId,
+                peerId,
+                text,
+                replyToMessageId ?? "",
+                replyInThread
+            )
+            if (this.telegramJsonBool(hook, "cancelled", false)) {
+                let reason = this.telegramJsonString(hook, "reason", "cancelled by OpenClaw plugin hook")
+                effectiveText = "[plugin-hook-cancelled] ${reason}"
+            } else {
+                let modified = this.telegramJsonString(hook, "text", text)
+                if (!modified.trimAscii().isEmpty()) {
+                    effectiveText = modified
+                }
+            }
+        }
         let (effectiveReplyToMessageId, effectiveReplyInThread, degraded, policyReason) =
             gatewayApplyOutboundChannelPolicy(user, nm, replyToMessageId, replyInThread)
         if (degraded) {
@@ -569,7 +1003,7 @@ public class GatewayService {
         let outbound = OutboundMessage(
             channelTypeFromAdapterName(nm),
             peerId,
-            text,
+            effectiveText,
             replyToMessageId: effectiveReplyToMessageId,
             replyInThread: effectiveReplyInThread,
             accountId: accountId
@@ -578,6 +1012,16 @@ public class GatewayService {
             case Some(adapter) =>
                 let sentMessageId = adapter.sendWithMessageId(outbound)
                 if (!sentMessageId.trimAscii().isEmpty()) {
+                    let _ = gatewayOpenClawPluginSidecarApplyMessageSentHook(
+                        user,
+                        nm,
+                        accountId,
+                        peerId,
+                        effectiveText,
+                        sentMessageId,
+                        true,
+                        ""
+                    )
                     LogUtils.info("Gateway.sendTextToPeer: channel=${nm} peer=${peerId} ok")
                     return sentMessageId
                 }
@@ -585,9 +1029,29 @@ public class GatewayService {
         }
         let send = this.channelManager.sendToAdapterName(nm, outbound)
         if (send.delivered) {
+            let _ = gatewayOpenClawPluginSidecarApplyMessageSentHook(
+                user,
+                nm,
+                accountId,
+                peerId,
+                effectiveText,
+                send.messageId,
+                true,
+                ""
+            )
             LogUtils.info("Gateway.sendTextToPeer: channel=${nm} peer=${peerId} ok")
             return send.messageId
         }
+        let _ = gatewayOpenClawPluginSidecarApplyMessageSentHook(
+            user,
+            nm,
+            accountId,
+            peerId,
+            effectiveText,
+            "",
+            false,
+            send.lastReason
+        )
         LogUtils.error("Gateway.sendTextToPeer: no adapter for channel='${nm}' peer=${peerId} lastReason=${send.lastReason}")
         throw Exception("no adapter for channel='${nm}' peer=${peerId} lastReason=${send.lastReason}")
     }

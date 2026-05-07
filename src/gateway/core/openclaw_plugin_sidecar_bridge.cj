@@ -1,0 +1,269 @@
+package metis.gateway.core
+
+import metis.core.config.{CliConfig, CliSettingManager, GatewayUserSettings}
+import metis.utils.ShellUtils
+
+import magic.jsonable.*
+
+import std.collection.ArrayList
+import std.env.getVariable
+import std.fs.Path
+import std.time.*
+import std.convert.Parsable
+import stdx.encoding.json.{JsonArray, JsonObject, JsonString, JsonValue}
+
+private let OPENCLAW_PLUGIN_COMPAT_KEY = "openclawPluginCompatibility"
+private let OPENCLAW_PLUGIN_COMPAT_ALT_KEY = "openclawPluginSidecar"
+
+private var gatewayOpenClawPluginSidecarRunnerOverride: Option<(String, JsonObject) -> JsonObject> =
+    None<(String, JsonObject) -> JsonObject>
+
+public func setGatewayOpenClawPluginSidecarRunnerForTest(runner: Option<(String, JsonObject) -> JsonObject>): Unit {
+    gatewayOpenClawPluginSidecarRunnerOverride = runner
+}
+
+private func gatewayOpenClawPluginSidecarBool(obj: JsonObject, key: String, fallback: Bool): Bool {
+    match (obj.get(key)) {
+        case Some(v) => try { v.asBool().getValue() } catch (_e: Exception) { fallback }
+        case None => fallback
+    }
+}
+
+private func gatewayOpenClawPluginSidecarString(obj: JsonObject, key: String, fallback: String): String {
+    match (obj.get(key)) {
+        case Some(v) =>
+            try {
+                let value = v.asString().getValue().trimAscii()
+                if (value.isEmpty()) { fallback } else { value }
+            } catch (_e: Exception) {
+                fallback
+            }
+        case None => fallback
+    }
+}
+
+private func gatewayOpenClawPluginSidecarInt(obj: JsonObject, key: String, fallback: Int64): Int64 {
+    match (obj.get(key)) {
+        case Some(v) =>
+            try {
+                Int64.parse(v.toJsonString())
+            } catch (_e: Exception) {
+                fallback
+            }
+        case None => fallback
+    }
+}
+
+public func gatewayOpenClawPluginSidecarConfig(user: GatewayUserSettings): JsonObject {
+    match (user.channelsExtra) {
+        case Some(extra) =>
+            match (extra.get(OPENCLAW_PLUGIN_COMPAT_KEY)) {
+                case Some(v) => try { return v.asObject() } catch (_e: Exception) { () }
+                case None => ()
+            }
+            match (extra.get(OPENCLAW_PLUGIN_COMPAT_ALT_KEY)) {
+                case Some(v) => try { return v.asObject() } catch (_e: Exception) { () }
+                case None => ()
+            }
+        case None => ()
+    }
+    JsonObject()
+}
+
+public func gatewayOpenClawPluginSidecarEnabled(user: GatewayUserSettings): Bool {
+    if (gatewayOpenClawPluginSidecarRunnerOverride.isSome()) {
+        return true
+    }
+    gatewayOpenClawPluginSidecarBool(gatewayOpenClawPluginSidecarConfig(user), "enabled", false)
+}
+
+private func gatewayOpenClawPluginSidecarScriptPath(config: JsonObject): String {
+    let configured = gatewayOpenClawPluginSidecarString(config, "scriptPath", "")
+    if (!configured.isEmpty()) {
+        return configured
+    }
+    let root = match (getVariable("METIS_CJPM_ROOT")) {
+        case Some(v) =>
+            let trimmed = v.trimAscii()
+            if (trimmed.isEmpty()) { CliConfig.cwd.toString() } else { trimmed }
+        case None => CliConfig.cwd.toString()
+    }
+    Path(root).join("scripts").join("openclaw-plugin-sidecar.mjs").toString()
+}
+
+private func gatewayOpenClawPluginSidecarDisabled(method: String): JsonObject {
+    let out = JsonObject()
+    out.put("ok", false.toJsonValue())
+    out.put("status", JsonString("disabled"))
+    out.put("method", JsonString(method))
+    out.put("matched", false.toJsonValue())
+    out.put("reason", JsonString("openclaw plugin compatibility sidecar is disabled"))
+    return out
+}
+
+private func gatewayOpenClawPluginSidecarError(method: String, reason: String): JsonObject {
+    let out = JsonObject()
+    out.put("ok", false.toJsonValue())
+    out.put("status", JsonString("error"))
+    out.put("method", JsonString(method))
+    out.put("matched", false.toJsonValue())
+    out.put("reason", JsonString(reason.trimAscii()))
+    return out
+}
+
+public func gatewayOpenClawPluginSidecarInvoke(user: GatewayUserSettings, method: String, payload: JsonObject): JsonObject {
+    let normalizedMethod = method.trimAscii()
+    match (gatewayOpenClawPluginSidecarRunnerOverride) {
+        case Some(runner) => return runner(normalizedMethod, payload)
+        case None => ()
+    }
+    if (!gatewayOpenClawPluginSidecarEnabled(user)) {
+        return gatewayOpenClawPluginSidecarDisabled(normalizedMethod)
+    }
+    let config = gatewayOpenClawPluginSidecarConfig(user)
+    let command = gatewayOpenClawPluginSidecarString(config, "nodeCommand", "node")
+    let timeoutMs = max(1000, gatewayOpenClawPluginSidecarInt(config, "timeoutMs", 10000))
+    let scriptPath = gatewayOpenClawPluginSidecarScriptPath(config)
+    let request = JsonObject()
+    request.put("method", JsonString(normalizedMethod))
+    request.put("payload", payload)
+    request.put("config", config)
+    let args = [
+        command,
+        scriptPath,
+        normalizedMethod,
+        "--config-json",
+        config.toJsonString(),
+        "--request-json",
+        request.toJsonString()
+    ]
+    let (code, stdout, stderr) = try {
+        ShellUtils.execute(args, timeout: Some(Duration.millisecond * timeoutMs), withWrap: false, workDir: CliConfig.cwd)
+    } catch (e: Exception) {
+        return gatewayOpenClawPluginSidecarError(normalizedMethod, "sidecar launch failed: ${e.message}")
+    }
+    let raw = stdout.trimAscii()
+    if (raw.isEmpty()) {
+        return gatewayOpenClawPluginSidecarError(normalizedMethod, "sidecar returned empty response: ${stderr.trimAscii()}")
+    }
+    let parsed = try {
+        JsonValue.fromStr(raw).asObject()
+    } catch (e: Exception) {
+        return gatewayOpenClawPluginSidecarError(normalizedMethod, "sidecar returned invalid json: ${e.message}")
+    }
+    parsed.put("method", JsonString(normalizedMethod))
+    parsed.put("exitCode", code.toJsonValue())
+    if (!stderr.trimAscii().isEmpty()) {
+        parsed.put("stderr", JsonString(stderr.trimAscii()))
+    }
+    parsed
+}
+
+public func gatewayOpenClawPluginSidecarStart(user: GatewayUserSettings): JsonObject {
+    gatewayOpenClawPluginSidecarInvoke(user, "lifecycle.start", JsonObject())
+}
+
+public func gatewayOpenClawPluginSidecarStop(user: GatewayUserSettings): JsonObject {
+    gatewayOpenClawPluginSidecarInvoke(user, "lifecycle.stop", JsonObject())
+}
+
+public func gatewayOpenClawPluginSidecarHealth(user: GatewayUserSettings): JsonObject {
+    gatewayOpenClawPluginSidecarInvoke(user, "lifecycle.health", JsonObject())
+}
+
+private func gatewayOpenClawPluginSidecarReadString(obj: JsonObject, key: String): String {
+    gatewayOpenClawPluginSidecarString(obj, key, "")
+}
+
+private func gatewayOpenClawPluginSidecarCommandsFrom(result: JsonObject): Array<(String, String)> {
+    let rows = ArrayList<(String, String)>()
+    let commands = match (result.get("commands")) {
+        case Some(v) => try { v.asArray() } catch (_e: Exception) { JsonArray([]) }
+        case None => JsonArray([])
+    }
+    for (i in 0..commands.size()) {
+        let row = try { commands[i].asObject() } catch (_e: Exception) { JsonObject() }
+        let command = gatewayOpenClawPluginSidecarReadString(row, "command")
+            .trimAscii()
+            .toAsciiLower()
+            .replace("/", "")
+        let description = gatewayOpenClawPluginSidecarReadString(row, "description").trimAscii()
+        if (!command.isEmpty() && !description.isEmpty()) {
+            rows.add((command, description))
+        }
+    }
+    rows.toArray()
+}
+
+public func gatewayOpenClawPluginSidecarCommandCatalogForMenu(): Array<(String, String)> {
+    let user = CliSettingManager.readGatewaySettings()
+    if (!gatewayOpenClawPluginSidecarEnabled(user)) {
+        return []
+    }
+    gatewayOpenClawPluginSidecarCommandsFrom(
+        gatewayOpenClawPluginSidecarInvoke(user, "commands.list", JsonObject())
+    )
+}
+
+public func gatewayOpenClawPluginSidecarCommandCatalog(user: GatewayUserSettings): Array<(String, String)> {
+    if (!gatewayOpenClawPluginSidecarEnabled(user)) {
+        return []
+    }
+    gatewayOpenClawPluginSidecarCommandsFrom(
+        gatewayOpenClawPluginSidecarInvoke(user, "commands.list", JsonObject())
+    )
+}
+
+public func gatewayOpenClawPluginSidecarApplyMessageSendingHook(
+    user: GatewayUserSettings,
+    channelName: String,
+    accountId: String,
+    peerId: String,
+    text: String,
+    replyToMessageId: String,
+    replyInThread: Bool
+): JsonObject {
+    if (!gatewayOpenClawPluginSidecarEnabled(user) || channelName.trimAscii().toAsciiLower() != "telegram") {
+        let out = JsonObject()
+        out.put("ok", true.toJsonValue())
+        out.put("status", JsonString("skipped"))
+        out.put("cancelled", false.toJsonValue())
+        out.put("text", JsonString(text))
+        return out
+    }
+    let payload = JsonObject()
+    payload.put("channel", JsonString(channelName.trimAscii().toAsciiLower()))
+    payload.put("accountId", JsonString(accountId.trimAscii()))
+    payload.put("peerId", JsonString(peerId.trimAscii()))
+    payload.put("text", JsonString(text))
+    payload.put("replyToMessageId", JsonString(replyToMessageId.trimAscii()))
+    payload.put("replyInThread", replyInThread.toJsonValue())
+    gatewayOpenClawPluginSidecarInvoke(user, "hook.message_sending", payload)
+}
+
+public func gatewayOpenClawPluginSidecarApplyMessageSentHook(
+    user: GatewayUserSettings,
+    channelName: String,
+    accountId: String,
+    peerId: String,
+    text: String,
+    sentMessageId: String,
+    delivered: Bool,
+    reason: String
+): JsonObject {
+    if (!gatewayOpenClawPluginSidecarEnabled(user) || channelName.trimAscii().toAsciiLower() != "telegram") {
+        let out = JsonObject()
+        out.put("ok", true.toJsonValue())
+        out.put("status", JsonString("skipped"))
+        return out
+    }
+    let payload = JsonObject()
+    payload.put("channel", JsonString(channelName.trimAscii().toAsciiLower()))
+    payload.put("accountId", JsonString(accountId.trimAscii()))
+    payload.put("peerId", JsonString(peerId.trimAscii()))
+    payload.put("text", JsonString(text))
+    payload.put("sentMessageId", JsonString(sentMessageId.trimAscii()))
+    payload.put("delivered", delivered.toJsonValue())
+    payload.put("reason", JsonString(reason.trimAscii()))
+    gatewayOpenClawPluginSidecarInvoke(user, "hook.message_sent", payload)
+}
