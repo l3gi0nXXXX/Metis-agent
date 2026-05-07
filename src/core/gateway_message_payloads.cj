@@ -106,6 +106,20 @@ public func parseGatewayReactionToken(raw: String): String {
     ""
 }
 
+public func parseGatewayReactionStatus(raw: String): String {
+    let normalized = raw.replace("\r\n", "\n").replace("\r", "\n").trimAscii()
+    if (!normalized.startsWith("[reaction]")) {
+        return ""
+    }
+    for (line0 in normalized.split("\n")) {
+        let line = line0.trimAscii()
+        if (line.startsWith("status=")) {
+            return line["status=".size..].trimAscii().toAsciiLower()
+        }
+    }
+    ""
+}
+
 public func parseGatewayReactionRemove(raw: String): Bool {
     let normalized = raw.replace("\r\n", "\n").replace("\r", "\n").trimAscii()
     if (!normalized.startsWith("[reaction]")) {

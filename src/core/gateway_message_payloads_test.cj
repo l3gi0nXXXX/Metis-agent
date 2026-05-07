@@ -59,6 +59,13 @@ public class GatewayMessagePayloadsTest {
     }
 
     @TestCase
+    func t46ParseGatewayReactionStatusPayload(): Unit {
+        @Expect(parseGatewayReactionStatus("[reaction]\nstatus=thinking"), "thinking")
+        @Expect(parseGatewayReactionStatus("[reaction]\nstatus=tool"), "tool")
+        @Expect(parseGatewayReactionStatus("plain"), "")
+    }
+
+    @TestCase
     func renderGatewayPinActionsRoundTrip(): Unit {
         @Expect(parseGatewayPinAction(renderGatewayPinText()), "pin")
         @Expect(parseGatewayPinAction(renderGatewayUnpinText()), "unpin")

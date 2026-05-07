@@ -302,6 +302,7 @@ public struct TelegramNetworkUserSettings {
     public var dnsResultOrder: String = "ipv4first"
     public var dangerouslyAllowPrivateNetwork: Bool = false
     public var insecureSkipTlsVerify: Bool = false
+    public var envProxyEnabled: Bool = false
     public var allowedUpdatesExtra: Array<String> = []
     public var getFileRetryCount: Int64 = 3
 }
@@ -329,6 +330,8 @@ public struct TelegramUserSettings {
     public var commandsNative: String = "auto"
     public var customCommands: Array<TelegramCustomCommandUserSettings> = []
     public var replyToMode: String = "off"
+    public var groupHistoryEnabled: Bool = true
+    public var groupHistoryLimit: Int64 = 20
     public var textChunkLimit: Int64 = 4000
     public var chunkMode: String = "length"
     public var streaming: String = "partial"

@@ -260,7 +260,7 @@ public class GatewaySessionsToolset {
             case "qq" | "gateway.qq" =>
                 "gateway.qq: object. Common keys: enabled, mode, appId, appSecret, officialIntents, officialTokenUrl, officialGatewayUrl, officialWebsocketUrl."
             case "telegram" | "gateway.telegram" =>
-                "gateway.telegram: object. Common keys: enabled, botToken, tokenFile, dmPolicy, allowFrom, groupPolicy, groupAllowFrom, groups, replyToMode, textChunkLimit, streaming, webhookUrl, webhookSecret, webhookPath, webhookHost, webhookPort, apiRoot, actions, threadBindings."
+                "gateway.telegram: object. Common keys: enabled, botToken, tokenFile, dmPolicy, allowFrom, groupPolicy, groupAllowFrom, groups, groupHistoryEnabled, groupHistoryLimit, replyToMode, textChunkLimit, streaming, webhookUrl, webhookSecret, webhookPath, webhookHost, webhookPort, apiRoot, proxy, actions, media, network, threadBindings."
             case "channelmodels" | "gateway.channelmodels" =>
                 "gateway.channelModels: map<string,string>. Per-channel primary model binding, e.g. feishu -> provider:model."
             case "tools" | "gateway.tools" =>

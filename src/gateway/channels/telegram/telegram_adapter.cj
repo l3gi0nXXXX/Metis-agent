@@ -1,6 +1,6 @@
 package metis.gateway.channels.telegram
 
-import metis.core.{GatewayMediaGroupItem, gatewayMediaTranscribeAudioPathForRuntime, parseGatewayAudioParts, parseGatewayChatAction, parseGatewayDocumentParts, parseGatewayEditButtonsParts, parseGatewayEditMediaParts, parseGatewayEditText, parseGatewayInlineKeyboardParts, parseGatewayMediaGroupItems, parseGatewayPhotoParts, parseGatewayPinAction, parseGatewayReactionRemove, parseGatewayReactionToken, parseGatewayStickerFileId, parseGatewayTopicCreateText, parseGatewayTopicEditText, parseGatewayVideoNoteFileId, parseGatewayVideoParts, parseGatewayVoiceParts}
+import metis.core.{GatewayMediaGroupItem, gatewayMediaTranscribeAudioPathForRuntime, parseGatewayAudioParts, parseGatewayChatAction, parseGatewayDocumentParts, parseGatewayEditButtonsParts, parseGatewayEditMediaParts, parseGatewayEditText, parseGatewayInlineKeyboardParts, parseGatewayMediaGroupItems, parseGatewayPhotoParts, parseGatewayPinAction, parseGatewayReactionRemove, parseGatewayReactionStatus, parseGatewayReactionToken, parseGatewayStickerFileId, parseGatewayTopicCreateText, parseGatewayTopicEditText, parseGatewayVideoNoteFileId, parseGatewayVideoParts, parseGatewayVoiceParts}
 import metis.gateway.core.{ChannelAdapter, gatewayOpenClawPluginSidecarCommandCatalogForMenu}
 import metis.gateway.model.*
 import metis.io.PrintUtils
@@ -171,6 +171,7 @@ public class TelegramAdapter <: ChannelAdapter {
     private let completedUpdateIdOrder = ArrayList<String>()
     private let consumedApprovalCallbacks = HashSet<String>()
     private let pendingMediaGroups = HashMap<String, TelegramPendingMediaGroup>()
+    private let groupHistoryByPeer = HashMap<String, ArrayList<JsonObject>>()
     private let webhookGuardMutex = Mutex()
     private let webhookRateWindowStartedAtBySource = HashMap<String, Int64>()
     private let webhookRateCountBySource = HashMap<String, Int64>()
@@ -185,6 +186,10 @@ public class TelegramAdapter <: ChannelAdapter {
     private var nativeCommandsLastSyncError: String = ""
     private var nativeCommandsLastSyncAtMs: Int64 = 0
     private var nativeCommandsLastSyncCommandCount: Int64 = 0
+    private var nativeCommandsLastSyncHash: String = ""
+    private var nativeCommandsLastSyncSkipped: Bool = false
+    private var nativeCommandsLastSyncRetryCount: Int64 = 0
+    private var nativeCommandsLastSyncTrimmedCount: Int64 = 0
     private var chatActionBackoffUntilMs: Int64 = 0
     private var chatActionBackoffReason: String = ""
     private var webhookRegistrationStatus: String = "not-attempted"
@@ -1701,6 +1706,13 @@ public class TelegramAdapter <: ChannelAdapter {
             }
         }
         let mentioned = this.detectMentionInMessage(msg, text)
+        match (chatType) {
+            case ChatType.Group =>
+                if (mentioned) {
+                    this.attachTelegramGroupHistoryContext(mediaContext, peerId, messageId)
+                }
+            case ChatType.Direct => ()
+        }
         let inbound = InboundMessage(
             ChannelType.Telegram,
             messageId,
@@ -1720,6 +1732,7 @@ public class TelegramAdapter <: ChannelAdapter {
         )
         let rejectReason = this.inboundRejectReason(inbound)
         if (!rejectReason.isEmpty()) {
+            this.maybeRecordTelegramGroupHistory(inbound, rejectReason)
             this.recordInboundDecision(
                 this.readIntStringField(root, "update_id"),
                 this.primaryUpdateKind(root),
@@ -4315,33 +4328,106 @@ public class TelegramAdapter <: ChannelAdapter {
 
     private func syncNativeCommands(): Bool {
         this.nativeCommandsLastSyncAtMs = DateTime.now().toUnixTimeStamp().toMilliseconds()
-        this.nativeCommandsLastSyncCommandCount = this.resolvedTelegramCommandMenuForTelegramApi().size
+        let rows = this.resolvedTelegramCommandMenuForTelegramApi()
+        this.nativeCommandsLastSyncCommandCount = rows.size
+        this.nativeCommandsLastSyncSkipped = false
+        this.nativeCommandsLastSyncRetryCount = 0
+        this.nativeCommandsLastSyncTrimmedCount = 0
         let token = this.effectiveBotToken()
         if (token.isEmpty()) {
             this.setNativeCommandsSyncError("bot token is empty")
             return false
         }
+        var payload = this.buildNativeCommandsPayloadForRows(rows)
+        let payloadHash = payload.toJsonString()
+        if (
+            !payloadHash.isEmpty() &&
+            payloadHash == this.nativeCommandsLastSyncHash &&
+            (this.nativeCommandsLastSyncStatus == "ok" || this.nativeCommandsLastSyncStatus == "skipped")
+        ) {
+            this.nativeCommandsLastSyncStatus = "skipped"
+            this.nativeCommandsLastSyncError = ""
+            this.nativeCommandsLastSyncSkipped = true
+            return true
+        }
+        let deleteResponse = this.telegramJsonPost(
+            this.normalizeApiRoot() + "/bot${token}/deleteMyCommands",
+            JsonObject(),
+            context: "deleteMyCommands"
+        )
+        match (deleteResponse) {
+            case Some(raw) =>
+                if (!this.parseTelegramBoolSuccess(raw, missingDetail: "telegram deleteMyCommands returned ok=false")) {
+                    this.setNativeCommandsSyncError(this.lastSendError)
+                    LogUtils.info("Telegram deleteMyCommands failed: ${this.lastSendError}")
+                    return false
+                }
+            case None =>
+                this.setNativeCommandsSyncError("empty http response")
+                LogUtils.info("Telegram deleteMyCommands failed: ${this.lastSendError}")
+                return false
+        }
         let responseOpt = this.telegramJsonPost(
             this.normalizeApiRoot() + "/bot${token}/setMyCommands",
-            this.buildNativeCommandsPayload(),
+            payload,
             context: "setMyCommands"
         )
-        let responseRaw = match (responseOpt) {
+        var responseRaw = match (responseOpt) {
             case Some(resp) => resp
             case None =>
                 this.setNativeCommandsSyncError("empty http response")
                 LogUtils.info("Telegram setMyCommands failed: ${this.lastSendError}")
                 return false
         }
-        let ok = this.parseTelegramBoolSuccess(responseRaw, missingDetail: "telegram setMyCommands returned ok=false")
+        var ok = this.parseTelegramBoolSuccess(responseRaw, missingDetail: "telegram setMyCommands returned ok=false")
+        if (!ok && this.shouldRetryNativeCommandMenuWithTrim()) {
+            this.nativeCommandsLastSyncRetryCount += 1
+            let trimmedRows = this.trimTelegramCommandRowsForRetry(rows)
+            this.nativeCommandsLastSyncTrimmedCount = rows.size - trimmedRows.size
+            this.nativeCommandsLastSyncCommandCount = trimmedRows.size
+            payload = this.buildNativeCommandsPayloadForRows(trimmedRows)
+            match (this.telegramJsonPost(
+                this.normalizeApiRoot() + "/bot${token}/setMyCommands",
+                payload,
+                context: "setMyCommands:retry"
+            )) {
+                case Some(retryRaw) =>
+                    responseRaw = retryRaw
+                    ok = this.parseTelegramBoolSuccess(responseRaw, missingDetail: "telegram setMyCommands retry returned ok=false")
+                case None =>
+                    this.setNativeCommandsSyncError("empty http response")
+                    LogUtils.info("Telegram setMyCommands retry failed: ${this.lastSendError}")
+                    return false
+            }
+        }
         if (!ok) {
             this.setNativeCommandsSyncError(this.lastSendError)
             LogUtils.info("Telegram setMyCommands failed: ${this.lastSendError}")
         } else {
             this.nativeCommandsLastSyncStatus = "ok"
             this.nativeCommandsLastSyncError = ""
+            this.nativeCommandsLastSyncHash = payloadHash
         }
         ok
+    }
+
+    private func shouldRetryNativeCommandMenuWithTrim(): Bool {
+        let reason = this.lastSendError.toAsciiLower()
+        reason.contains("bot_commands_too_much") ||
+            reason.contains("commands_too_much") ||
+            reason.contains("commands too much") ||
+            reason.contains("too many commands")
+    }
+
+    private func trimTelegramCommandRowsForRetry(rows: Array<(String, String)>): Array<(String, String)> {
+        let out = ArrayList<(String, String)>()
+        let limit = if (rows.size > 80) { 80 } else { rows.size }
+        var i: Int64 = 0
+        while (i < limit) {
+            out.add(rows[i])
+            i += 1
+        }
+        out.toArray()
     }
 
     private func setNativeCommandsSyncError(message: String): Unit {
@@ -4364,12 +4450,19 @@ public class TelegramAdapter <: ChannelAdapter {
         out.put("lastSyncError", JsonString(this.nativeCommandsLastSyncError))
         out.put("lastSyncAtMs", this.nativeCommandsLastSyncAtMs.toJsonValue())
         out.put("lastSyncCommandCount", this.nativeCommandsLastSyncCommandCount.toJsonValue())
+        out.put("lastSyncSkipped", this.nativeCommandsLastSyncSkipped.toJsonValue())
+        out.put("lastSyncRetryCount", this.nativeCommandsLastSyncRetryCount.toJsonValue())
+        out.put("lastSyncTrimmedCount", this.nativeCommandsLastSyncTrimmedCount.toJsonValue())
         out
     }
 
     private func buildNativeCommandsPayload(): JsonObject {
+        this.buildNativeCommandsPayloadForRows(this.resolvedTelegramCommandMenuForTelegramApi())
+    }
+
+    private func buildNativeCommandsPayloadForRows(rows: Array<(String, String)>): JsonObject {
         let commands = JsonArray([])
-        for ((command, description) in this.resolvedTelegramCommandMenuForTelegramApi()) {
+        for ((command, description) in rows) {
             let item = JsonObject()
             item.put("command", JsonString(command))
             item.put("description", JsonString(this.telegramCommandDescription(description)))
@@ -5653,6 +5746,7 @@ public class TelegramAdapter <: ChannelAdapter {
         let title = lines[1].trimAscii()
         let options = ArrayList<String>()
         var durationSeconds: Int64 = 0
+        var durationHoursSeen = false
         var allowMultiselect = false
         var isAnonymous: Option<Bool> = None<Bool>
         if (lines.size > 2) {
@@ -5662,10 +5756,16 @@ public class TelegramAdapter <: ChannelAdapter {
                 if (!raw.isEmpty()) {
                     if (raw.startsWith("durationSeconds=")) {
                         durationSeconds = try { Int64.parse(raw["durationSeconds=".size..].trimAscii()) } catch (_e: Exception) { -1 }
+                    } else if (raw.startsWith("durationHours=")) {
+                        durationHoursSeen = true
                     } else if (raw.startsWith("allowMultiselect=")) {
                         allowMultiselect = this.parseTelegramBool(raw["allowMultiselect=".size..].trimAscii())
                     } else if (raw.startsWith("isAnonymous=")) {
                         isAnonymous = Some(this.parseTelegramBool(raw["isAnonymous=".size..].trimAscii()))
+                    } else if (raw.startsWith("pollAnonymous=")) {
+                        isAnonymous = Some(this.parseTelegramBool(raw["pollAnonymous=".size..].trimAscii()))
+                    } else if (raw.startsWith("pollPublic=")) {
+                        isAnonymous = Some(!this.parseTelegramBool(raw["pollPublic=".size..].trimAscii()))
                     } else {
                         let parsed = this.parsePollOptionLine(raw)
                         if (!parsed.isEmpty()) {
@@ -5679,10 +5779,30 @@ public class TelegramAdapter <: ChannelAdapter {
         if (title.isEmpty() || options.isEmpty()) {
             return None
         }
+        if (title.size > 300) {
+            let invalid = HashMap<String, JsonValue>()
+            invalid["kind"] = JsonString("poll")
+            invalid["validation_error"] = JsonString("telegram poll question supports at most 300 characters")
+            return Some(invalid)
+        }
+        for (option in options) {
+            if (option.size > 100) {
+                let invalid = HashMap<String, JsonValue>()
+                invalid["kind"] = JsonString("poll")
+                invalid["validation_error"] = JsonString("telegram poll option supports at most 100 characters")
+                return Some(invalid)
+            }
+        }
         if (options.size > 10) {
             let invalid = HashMap<String, JsonValue>()
             invalid["kind"] = JsonString("poll")
             invalid["validation_error"] = JsonString("telegram poll supports at most 10 options")
+            return Some(invalid)
+        }
+        if (durationHoursSeen) {
+            let invalid = HashMap<String, JsonValue>()
+            invalid["kind"] = JsonString("poll")
+            invalid["validation_error"] = JsonString("telegram poll durationHours is not supported; use durationSeconds (5..600)")
             return Some(invalid)
         }
         if (durationSeconds < 0 || (durationSeconds > 0 && (durationSeconds < 5 || durationSeconds > 600))) {
@@ -5785,7 +5905,11 @@ public class TelegramAdapter <: ChannelAdapter {
     }
 
     private func detectReactionPayload(message: OutboundMessage): Option<HashMap<String, JsonValue>> {
-        let token = parseGatewayReactionToken(message.text)
+        var token = parseGatewayReactionToken(message.text)
+        let status = parseGatewayReactionStatus(message.text)
+        if (token.isEmpty() && !status.isEmpty()) {
+            token = this.telegramStatusReactionToken(status)
+        }
         let remove = parseGatewayReactionRemove(message.text)
         if (token.isEmpty() && !remove) {
             return None
@@ -5795,6 +5919,22 @@ public class TelegramAdapter <: ChannelAdapter {
                 let trimmed = target.trimAscii()
                 if (trimmed.isEmpty()) { None } else { Some(this.buildReactionPayload(message, trimmed, token)) }
             case None => None
+        }
+    }
+
+    private func telegramStatusReactionToken(status: String): String {
+        match (status.trimAscii().toAsciiLower()) {
+            case "queued" => "👀"
+            case "thinking" => "🤔"
+            case "tool" => "🔥"
+            case "coding" => "👨‍💻"
+            case "web" => "⚡"
+            case "done" => "👍"
+            case "error" => "😱"
+            case "stallsoft" | "stall_soft" | "stall-soft" => "🥱"
+            case "stallhard" | "stall_hard" | "stall-hard" => "😨"
+            case "compacting" => "✍"
+            case _ => ""
         }
     }
 
@@ -6344,6 +6484,17 @@ public class TelegramAdapter <: ChannelAdapter {
                     case None => ()
                 }
             }
+            if (this.startsWithAt(raw, cursor, "||")) {
+                match (raw.indexOf("||", cursor + 2)) {
+                    case Some(endIdx) =>
+                        sb.append("<tg-spoiler>")
+                        this.appendEscapedHtmlSegment(sb, raw[cursor + 2..endIdx])
+                        sb.append("</tg-spoiler>")
+                        cursor = endIdx + 2
+                        continue
+                    case None => ()
+                }
+            }
             if (this.startsWithAt(raw, cursor, "**")) {
                 match (raw.indexOf("**", cursor + 2)) {
                     case Some(endIdx) =>
@@ -6437,7 +6588,7 @@ public class TelegramAdapter <: ChannelAdapter {
 
     private func nextTelegramMarkdownMarker(text: String, start: Int64): Int64 {
         var next = text.size
-        for (token in ["\n> ", "```", "**", "__", "~~", "`", "*", "["]) {
+        for (token in ["\n> ", "```", "||", "**", "__", "~~", "`", "*", "["]) {
             match (text.indexOf(token, start)) {
                 case Some(idx) =>
                     if (idx < next) {
@@ -6582,6 +6733,79 @@ public class TelegramAdapter <: ChannelAdapter {
             case ChatType.Direct => return this.directInboundRejectReason(message)
             case ChatType.Group => return this.groupInboundRejectReason(message)
         }
+    }
+
+    private func maybeRecordTelegramGroupHistory(message: InboundMessage, rejectReason: String): Unit {
+        if (!this.config.groupHistoryEnabled || rejectReason != "group_mention_required") {
+            return
+        }
+        match (message.chatType) {
+            case ChatType.Group => ()
+            case ChatType.Direct => return
+        }
+        let peer = message.peerId.trimAscii()
+        if (peer.isEmpty()) {
+            return
+        }
+        let entry = JsonObject()
+        entry.put("messageId", JsonString(message.messageId.trimAscii()))
+        entry.put("senderId", JsonString(message.senderId.trimAscii()))
+        entry.put("text", JsonString(message.text.trimAscii()))
+        entry.put("reason", JsonString(rejectReason))
+        entry.put("recordedAtMs", DateTime.now().toUnixTimeStamp().toMilliseconds().toJsonValue())
+        synchronized(this.queueMutex) {
+            let history = match (this.groupHistoryByPeer.get(peer)) {
+                case Some(existing) => existing
+                case None =>
+                    let created = ArrayList<JsonObject>()
+                    this.groupHistoryByPeer[peer] = created
+                    created
+            }
+            history.add(entry)
+            let limit = if (this.config.groupHistoryLimit <= 0) { 20 } else { this.config.groupHistoryLimit }
+            while (history.size > limit) {
+                history.remove(at: 0)
+            }
+        }
+    }
+
+    private func attachTelegramGroupHistoryContext(mediaContext: JsonObject, peerId: String, messageId: String): Unit {
+        if (!this.config.groupHistoryEnabled) {
+            return
+        }
+        let peer = peerId.trimAscii()
+        if (peer.isEmpty()) {
+            return
+        }
+        let records = JsonArray([])
+        synchronized(this.queueMutex) {
+            match (this.groupHistoryByPeer.get(peer)) {
+                case Some(history) =>
+                    for (item in history.toArray()) {
+                        records.add(item)
+                    }
+                    history.clear()
+                case None => ()
+            }
+        }
+        if (records.size() == 0) {
+            return
+        }
+        let context = match (mediaContext.get("context")) {
+            case Some(v) => try { v.asObject() } catch (_e: Exception) { JsonObject() }
+            case None => JsonObject()
+        }
+        let groupHistory = JsonObject()
+        groupHistory.put("source", JsonString("telegram-silent-ingest"))
+        groupHistory.put("peerId", JsonString(peer))
+        groupHistory.put("triggerMessageId", JsonString(messageId.trimAscii()))
+        groupHistory.put("records", records)
+        context.put("groupHistory", groupHistory)
+        mediaContext.put("channel", JsonString("telegram"))
+        mediaContext.put("accountId", JsonString(this.effectiveAccountId()))
+        mediaContext.put("peerId", JsonString(peer))
+        mediaContext.put("messageId", JsonString(messageId.trimAscii()))
+        mediaContext.put("context", context)
     }
 
     private func directInboundRejectReason(message: InboundMessage): String {
@@ -6903,6 +7127,7 @@ public class TelegramAdapter <: ChannelAdapter {
     private func telegramTransport(): TelegramTransport {
         TelegramTransport(
             proxy: this.config.proxy,
+            envProxyEnabled: this.config.network.envProxyEnabled,
             timeoutSeconds: if (this.config.timeoutSeconds > 0) { this.config.timeoutSeconds } else { 30 },
             insecureSkipTlsVerify: this.config.network.insecureSkipTlsVerify,
             dangerouslyAllowPrivateNetwork: this.config.network.dangerouslyAllowPrivateNetwork,

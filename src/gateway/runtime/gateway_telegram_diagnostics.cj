@@ -513,6 +513,24 @@ private func gatewayTelegramBuildDiagnosticFindings(user: GatewayUserSettings, r
             "Use ipv4first when local networks prefer IPv4 proxy paths; keep this setting documented in gateway doctor output."
         )
     }
+    gatewayTelegramAddFinding(
+        findings,
+        "telegram-network-env-proxy",
+        "info",
+        if (user.telegram.network.envProxyEnabled) { "passed" } else { "skipped" },
+        "Telegram env proxy fallback is explicit.",
+        "gateway.telegram.network.envProxyEnabled=${user.telegram.network.envProxyEnabled}; explicit gateway.telegram.proxy still has priority when configured.",
+        "Enable envProxyEnabled only when this host intentionally routes Telegram Bot API traffic through HTTPS_PROXY/HTTP_PROXY."
+    )
+    gatewayTelegramAddFinding(
+        findings,
+        "telegram-group-history-silent-ingest",
+        "info",
+        if (user.telegram.groupHistoryEnabled) { "passed" } else { "skipped" },
+        "Telegram group silent ingest history is explicit.",
+        "groupHistoryEnabled=${user.telegram.groupHistoryEnabled}, groupHistoryLimit=${user.telegram.groupHistoryLimit}. Non-mentioned group messages may be recorded as bounded context without triggering an agent turn.",
+        "Keep groupHistoryLimit bounded; disable groupHistoryEnabled if silent group context should not be retained."
+    )
 
     if (user.telegram.actions.deleteMessage || user.telegram.actions.pinMessage || user.telegram.actions.unpinMessage || user.telegram.actions.createForumTopic ||
         user.telegram.actions.editForumTopic || user.telegram.media.outboundAllowLocalPath ||
@@ -595,12 +613,14 @@ public func gatewayTelegramDiagnosticsJson(user: GatewayUserSettings, runtime!: 
         "approvalResolver",
         "streamingDraft",
         "threadBindings",
+        "groupHistory",
         "targetWriteback",
         "chatActionBackoff",
         "directoryAggregation",
         "modelButtons",
         "configWrites",
         "webhookCertPath",
+        "envProxy",
         "actions",
         "transport"
     ]))

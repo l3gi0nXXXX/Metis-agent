@@ -4,6 +4,7 @@ import magic.jsonable.*
 
 import std.collection.{ArrayList, HashMap}
 import std.convert.Parsable
+import std.env.getVariable
 import std.fs.{File, Path}
 import std.net.{SocketAddress, TcpSocket}
 import std.time.*
@@ -22,6 +23,7 @@ public class TelegramTransportRequest {
     public let bodyBytes: Array<Byte>
     public let contentType: String
     public let proxy: String
+    public let proxySource: String
     public let timeoutSeconds: Int64
     public let autoSelectFamily: Bool
     public let dnsResultOrder: String
@@ -35,6 +37,7 @@ public class TelegramTransportRequest {
         bodyBytes!: Array<Byte> = [],
         contentType!: String = "",
         proxy!: String = "",
+        proxySource!: String = "none",
         timeoutSeconds!: Int64 = 30,
         autoSelectFamily!: Bool = true,
         dnsResultOrder!: String = "ipv4first"
@@ -47,6 +50,7 @@ public class TelegramTransportRequest {
         this.bodyBytes = bodyBytes
         this.contentType = contentType
         this.proxy = proxy
+        this.proxySource = proxySource
         this.timeoutSeconds = timeoutSeconds
         this.autoSelectFamily = autoSelectFamily
         this.dnsResultOrder = dnsResultOrder
@@ -112,6 +116,7 @@ public func setTelegramTransportRunnerForTest(runner: Option<(TelegramTransportR
 
 public class TelegramTransport {
     private let proxy: String
+    private let envProxyEnabled: Bool
     private let timeoutSeconds: Int64
     private let insecureSkipTlsVerify: Bool
     private let dangerouslyAllowPrivateNetwork: Bool
@@ -120,6 +125,7 @@ public class TelegramTransport {
 
     public init(
         proxy!: String = "",
+        envProxyEnabled!: Bool = false,
         timeoutSeconds!: Int64 = 30,
         insecureSkipTlsVerify!: Bool = false,
         dangerouslyAllowPrivateNetwork!: Bool = false,
@@ -127,6 +133,7 @@ public class TelegramTransport {
         dnsResultOrder!: String = "ipv4first"
     ) {
         this.proxy = proxy.trimAscii()
+        this.envProxyEnabled = envProxyEnabled
         this.timeoutSeconds = if (timeoutSeconds > 0) { timeoutSeconds } else { 30 }
         this.insecureSkipTlsVerify = insecureSkipTlsVerify
         this.dangerouslyAllowPrivateNetwork = dangerouslyAllowPrivateNetwork
@@ -135,12 +142,14 @@ public class TelegramTransport {
     }
 
     public func get(url: String, accept!: String = "application/json", context!: String = "get"): TelegramTransportResponse {
+        let effectiveProxy = this.effectiveProxyForUrl(url)
         let request = TelegramTransportRequest(
             "GET",
             url,
             context: context,
             accept: accept,
-            proxy: this.proxy,
+            proxy: effectiveProxy,
+            proxySource: this.proxySourceForUrl(url, effectiveProxy),
             timeoutSeconds: this.timeoutSeconds,
             autoSelectFamily: this.autoSelectFamily,
             dnsResultOrder: this.dnsResultOrder
@@ -155,6 +164,7 @@ public class TelegramTransport {
     }
 
     public func postJson(url: String, body: JsonObject, context!: String = "postJson"): TelegramTransportResponse {
+        let effectiveProxy = this.effectiveProxyForUrl(url)
         let request = TelegramTransportRequest(
             "POST",
             url,
@@ -162,7 +172,8 @@ public class TelegramTransport {
             accept: "application/json",
             body: body.toJsonString(),
             contentType: "application/json; charset=utf-8",
-            proxy: this.proxy,
+            proxy: effectiveProxy,
+            proxySource: this.proxySourceForUrl(url, effectiveProxy),
             timeoutSeconds: this.timeoutSeconds,
             autoSelectFamily: this.autoSelectFamily,
             dnsResultOrder: this.dnsResultOrder
@@ -196,6 +207,7 @@ public class TelegramTransport {
     ): TelegramTransportResponse {
         let boundary = "metis-telegram-${DateTime.now().toUnixTimeStamp().toMilliseconds()}"
         let bodyBytes = this.buildMultipartFilesBody(boundary, fields, files)
+        let effectiveProxy = this.effectiveProxyForUrl(url)
         let request = TelegramTransportRequest(
             "POST",
             url,
@@ -203,7 +215,8 @@ public class TelegramTransport {
             accept: "application/json",
             bodyBytes: bodyBytes,
             contentType: "multipart/form-data; boundary=${boundary}",
-            proxy: this.proxy,
+            proxy: effectiveProxy,
+            proxySource: this.proxySourceForUrl(url, effectiveProxy),
             timeoutSeconds: this.timeoutSeconds,
             autoSelectFamily: this.autoSelectFamily,
             dnsResultOrder: this.dnsResultOrder
@@ -323,9 +336,10 @@ public class TelegramTransport {
     private func buildNativeHttpClient(url: String): Client {
         let builder = ClientBuilder()
         builder.readTimeout(Duration.second * (this.timeoutSeconds + 5))
-        let useConnectTunnel = !this.proxy.isEmpty() && url.startsWith("https")
-        if (!this.proxy.isEmpty() && !useConnectTunnel) {
-            builder.httpProxy(this.proxy)
+        let proxy = this.effectiveProxyForUrl(url)
+        let useConnectTunnel = !proxy.isEmpty() && url.startsWith("https")
+        if (!proxy.isEmpty() && !useConnectTunnel) {
+            builder.httpProxy(proxy)
         }
         if (url.startsWith("https")) {
             var tlsConfig = TlsClientConfig()
@@ -337,7 +351,7 @@ public class TelegramTransport {
             builder.tlsConfig(tlsConfig)
         }
         if (useConnectTunnel) {
-            let proxyEndpoint = this.parseHttpProxyEndpoint(this.proxy)
+            let proxyEndpoint = this.parseHttpProxyEndpoint(proxy)
             let targetHost = URL.parse(url).hostName
             let connectTimeoutSeconds = if (this.timeoutSeconds > 0) { this.timeoutSeconds } else { 30 }
             let socketConnector = { _sa: SocketAddress =>
@@ -349,7 +363,7 @@ public class TelegramTransport {
                 return socket
             }
             builder.connector(socketConnector)
-        } else if (this.proxy.isEmpty()) {
+        } else if (proxy.isEmpty()) {
             let connectTimeoutSeconds = if (this.timeoutSeconds > 0) { this.timeoutSeconds } else { 30 }
             let socketConnector = { sa: SocketAddress =>
                 let socket = TcpSocket(sa)
@@ -361,6 +375,90 @@ public class TelegramTransport {
             builder.connector(socketConnector)
         }
         builder.build()
+    }
+
+    private func effectiveProxyForUrl(url: String): String {
+        if (!this.proxy.isEmpty()) {
+            return this.proxy
+        }
+        if (!this.envProxyEnabled) {
+            return ""
+        }
+        if (this.noProxyMatches(url)) {
+            return ""
+        }
+        let httpsProxy = this.envProxyValue("HTTPS_PROXY")
+        if (url.trimAscii().toAsciiLower().startsWith("https") && !httpsProxy.isEmpty()) {
+            return httpsProxy
+        }
+        let httpProxy = this.envProxyValue("HTTP_PROXY")
+        if (!httpProxy.isEmpty()) {
+            return httpProxy
+        }
+        ""
+    }
+
+    private func proxySourceForUrl(url: String, effectiveProxy: String): String {
+        if (effectiveProxy.isEmpty()) {
+            return "none"
+        }
+        if (!this.proxy.isEmpty()) {
+            return "explicit"
+        }
+        if (this.envProxyEnabled && !this.noProxyMatches(url)) {
+            return "env"
+        }
+        "none"
+    }
+
+    private func envProxyValue(key: String): String {
+        match (getVariable(key)) {
+            case Some(v) =>
+                let trimmed = v.trimAscii()
+                if (!trimmed.isEmpty()) {
+                    return trimmed
+                }
+            case None => ()
+        }
+        match (getVariable(key.toAsciiLower())) {
+            case Some(v) => v.trimAscii()
+            case None => ""
+        }
+    }
+
+    private func noProxyMatches(url: String): Bool {
+        let raw = match (getVariable("NO_PROXY")) {
+            case Some(v) => v.trimAscii()
+            case None =>
+                match (getVariable("no_proxy")) {
+                    case Some(v2) => v2.trimAscii()
+                    case None => ""
+                }
+        }
+        if (raw.isEmpty()) {
+            return false
+        }
+        let host = try { URL.parse(url.trimAscii()).hostName.trimAscii().toAsciiLower() } catch (_e: Exception) { "" }
+        if (host.isEmpty()) {
+            return false
+        }
+        for (part0 in raw.split(",")) {
+            let part = part0.trimAscii().toAsciiLower()
+            if (part.isEmpty()) {
+                continue
+            }
+            if (part == "*" || part == host) {
+                return true
+            }
+            if (part.startsWith(".")) {
+                if (host.endsWith(part)) {
+                    return true
+                }
+            } else if (host.endsWith("." + part)) {
+                return true
+            }
+        }
+        false
     }
 
     private func parseHttpProxyEndpoint(proxy: String): TelegramProxyEndpoint {
@@ -550,12 +648,14 @@ public class TelegramTransport {
     }
 
     public func debugBuildRequestForTest(method: String, url: String, body!: String = ""): TelegramTransportRequest {
+        let effectiveProxy = this.effectiveProxyForUrl(url)
         TelegramTransportRequest(
             method,
             url,
             context: "debug",
             body: body,
-            proxy: this.proxy,
+            proxy: effectiveProxy,
+            proxySource: this.proxySourceForUrl(url, effectiveProxy),
             timeoutSeconds: this.timeoutSeconds
         )
     }
@@ -564,12 +664,22 @@ public class TelegramTransport {
         this.proxy
     }
 
+    public func debugEffectiveProxyForUrlForTest(url: String): String {
+        this.effectiveProxyForUrl(url)
+    }
+
+    public func debugProxySourceForUrlForTest(url: String): String {
+        let proxy = this.effectiveProxyForUrl(url)
+        this.proxySourceForUrl(url, proxy)
+    }
+
     public func debugEffectiveTimeoutSecondsForTest(): Int64 {
         this.timeoutSeconds
     }
 
     public func debugProxyRouteForTest(url: String): String {
-        if (this.proxy.isEmpty()) {
+        let proxy = this.effectiveProxyForUrl(url)
+        if (proxy.isEmpty()) {
             return "none"
         }
         if (url.startsWith("https")) {
@@ -579,7 +689,7 @@ public class TelegramTransport {
     }
 
     public func debugUsesCustomConnectorForTest(): Bool {
-        this.proxy.isEmpty()
+        this.effectiveProxyForUrl("https://api.telegram.org/botTOKEN/getUpdates").isEmpty()
     }
 
     public func debugValidateRequestUrlForTest(url: String): String {

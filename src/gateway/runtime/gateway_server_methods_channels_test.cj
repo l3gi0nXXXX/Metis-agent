@@ -174,6 +174,9 @@ public class GatewayServerMethodsChannelsTest {
         user.telegram.reactionNotifications = "all"
         user.telegram.reactionLevel = "ack"
         user.telegram.webhookUrl = "https://example.test/telegram-webhook"
+        user.telegram.groupHistoryEnabled = false
+        user.telegram.groupHistoryLimit = 7
+        user.telegram.network.envProxyEnabled = true
         user.telegram.actions.photo = true
         user.telegram.actions.document = true
         user.telegram.actions.inlineKeyboard = true
@@ -192,6 +195,12 @@ public class GatewayServerMethodsChannelsTest {
         @Expect(channelsTestBool(channel, "configured"), true)
         @Expect(channelsTestString(channel, "commandsNative"), "auto")
         @Expect(channelsTestInt(channel, "customCommandCount"), 1)
+        @Expect(channelsTestBool(channel, "groupHistoryEnabled"), false)
+        @Expect(channelsTestInt(channel, "groupHistoryLimit"), 7)
+        let network = channel.get("network").getOrThrow().asObject()
+        @Expect(channelsTestBool(network, "envProxyEnabled"), true)
+        @Expect(channelsTestString(network, "apiRoot"), "https://api.telegram.org")
+        @Expect(channelsTestBool(network, "autoSelectFamily"), true)
         let actions = channel.get("actions").getOrThrow().asObject()
         @Expect(channelsTestBool(actions, "photo"), true)
         @Expect(channelsTestBool(actions, "document"), true)
@@ -270,6 +279,8 @@ public class GatewayServerMethodsChannelsTest {
         user.telegram.reactionNotifications = "all"
         user.telegram.reactionLevel = "ack"
         user.telegram.ackReaction = "👀"
+        user.telegram.groupHistoryLimit = 9
+        user.telegram.network.envProxyEnabled = true
         user.telegram.actions.callbackQuery = true
         user.telegram.actions.inlineKeyboard = true
         let params = JsonObject()
@@ -284,6 +295,10 @@ public class GatewayServerMethodsChannelsTest {
         @Expect(channelsTestString(telegram, "mode"), "webhook")
         @Expect(channelsTestBool(telegram, "webhookConfigured"), true)
         @Expect(channelsTestBool(telegram, "allowedUpdatesAuto"), true)
+        @Expect(channelsTestBool(telegram, "groupHistoryEnabled"), true)
+        @Expect(channelsTestInt(telegram, "groupHistoryLimit"), 9)
+        let runtimeNetwork = telegram.get("network").getOrThrow().asObject()
+        @Expect(channelsTestBool(runtimeNetwork, "envProxyEnabled"), true)
         let allowed = telegram.get("allowedUpdates").getOrThrow().asArray()
         @Expect(allowed.size() >= 5, true)
         @Expect(allowed[4].asString().getValue(), "message_reaction")
@@ -457,6 +472,8 @@ public class GatewayServerMethodsChannelsTest {
         @Expect(findings.contains("telegram-webhook-secret-missing"), true)
         @Expect(findings.contains("telegram-media-local-roots-missing"), true)
         @Expect(findings.contains("telegram-high-risk-actions-enabled"), true)
+        @Expect(findings.contains("telegram-network-env-proxy"), true)
+        @Expect(findings.contains("telegram-group-history-silent-ingest"), true)
         @Expect(findings.contains("telegram-curl-runtime-residual"), true)
     }
 

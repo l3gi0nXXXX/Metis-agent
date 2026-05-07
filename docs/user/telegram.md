@@ -30,6 +30,7 @@ Telegram 配置写在 `~/.metis/metis.json` 的 `gateway.telegram` 下。最小 
 | `tokenFile` | `""` | bot token 文件路径。 |
 | `apiRoot` | `https://api.telegram.org` | Telegram Bot API 根地址。 |
 | `proxy` | `""` | HTTP/HTTPS 代理，例如 `http://127.0.0.1:7897` 或 `https://127.0.0.1:7897`。 |
+| `network.envProxyEnabled` | `false` | 是否允许 Telegram transport 读取 `HTTPS_PROXY` / `HTTP_PROXY`。显式 `proxy` 优先，`NO_PROXY` / `no_proxy` 可排除目标 host。 |
 | `timeoutSeconds` | `30` | Bot API 请求超时秒数。 |
 | `defaultTo` | `""` | 默认发送目标，通常由 Gateway session 自动推断。 |
 | `configWrites` | `true` | 是否允许 Telegram 原生命令/callback 修改 Gateway 配置。设为 `false` 时，`/models` 选择只返回拒绝提示，不写 `metis.json`。 |
@@ -104,6 +105,13 @@ cjpm run --skip-build --name metis --run-args "doctor"
 ```
 
 `allowFrom` 支持纯数字 id，也兼容 `tg:<id>` 形式。群聊默认要求提及 bot；可用 `groups.<chatId>.requireMention=false` 关闭。
+
+群聊 silent ingest 配置：
+
+| 字段 | 默认值 | 说明 |
+|---|---:|---|
+| `groupHistoryEnabled` | `true` | 未提及 bot 而被 `group_mention_required` 拒绝的群消息，会作为有界上下文暂存，不触发 agent turn。下一条提及 bot 的消息会带上 `mediaContext.context.groupHistory`。 |
+| `groupHistoryLimit` | `20` | 每个群/话题最多保留的 silent history 条数。 |
 
 ## Polling 与 Webhook
 
@@ -206,6 +214,20 @@ Webhook 字段：
 - `[media-group]` 中包含视频、音频或文档时分别需要 `actions.video=true`、`actions.audio=true`、`actions.document=true`。
 - `[edit-media]` 需要 `actions.editMessage=true`，并需要目标消息 id。
 
+Poll 格式：
+
+```text
+[poll]
+Lunch?
+1. Rice
+2. Noodles
+durationSeconds=60
+allowMultiselect=true
+pollPublic=true
+```
+
+`durationSeconds` 支持 `5..600` 秒；`pollPublic=true` 等价于非匿名投票，`pollAnonymous=true` 等价于匿名投票。`durationHours` 与 OpenClaw 保持一致，不做自动换算，使用时会在网络请求前返回明确错误。
+
 ## 文本与回复
 
 文本出站由 Gateway 自动调用，不需要用户手写特殊格式。
@@ -219,6 +241,8 @@ Webhook 字段：
 | `replyToMode` | `off` | 回复目标使用方式。常用值：`off`、`first`、`all`、`thread`。 |
 | `linkPreview` | `true` | 是否允许链接预览。 |
 | `silent` | `false` | 是否静默发送。 |
+
+Telegram HTML 渲染支持常用轻量标记：`**bold**`、`*italic*`、`` `code` ``、`[label](https://...)`、引用行和 `||spoiler||`。Metis 会转义普通 HTML，避免未授权标签直接进入 Bot API。
 
 ## 图片、文件、语音与其他媒体
 
@@ -621,6 +645,15 @@ remove=true
 render=remove
 ```
 
+状态 reaction 可使用 OpenClaw 同名生命周期字段，Metis 会映射为 Telegram 支持的 emoji 并保留 `available_reactions` fallback：
+
+```text
+[reaction]
+status=thinking
+```
+
+支持的状态名：`queued`、`thinking`、`tool`、`coding`、`web`、`done`、`error`、`stallSoft`、`stallHard`、`compacting`。
+
 ## Native Commands
 
 `commandsNative` 控制 Telegram bot command menu：
@@ -650,7 +683,7 @@ render=remove
 
 Telegram 中 `/subagents` 等命令仍走 Gateway 统一命令路径，不在 Telegram adapter 内单独执行 agent 逻辑。
 
-Telegram Bot API 对 command menu 有数量和描述长度限制。Metis 同步菜单前会把命令裁剪到 100 条，并把 description 裁剪到 256 字符；被裁剪的配置不会绕过 Gateway 执行，也不会让启动流程因为 `setMyCommands` payload 过大而中断。
+Telegram Bot API 对 command menu 有数量和描述长度限制。Metis 同步菜单前会把命令裁剪到 100 条，并把 description 裁剪到 256 字符；同步时会先 `deleteMyCommands` 再 `setMyCommands`，未变化的菜单会按 payload hash 跳过重复同步。如果 Telegram 返回命令过多错误，Metis 会降级裁剪到 80 条后重试一次。被裁剪的配置不会绕过 Gateway 执行，也不会让启动流程因为 `setMyCommands` payload 过大而中断。
 
 内置 command menu 当前包含：
 

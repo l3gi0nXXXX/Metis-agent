@@ -615,6 +615,7 @@ public class TelegramNetworkConfig {
     public let dnsResultOrder: String
     public let dangerouslyAllowPrivateNetwork: Bool
     public let insecureSkipTlsVerify: Bool
+    public let envProxyEnabled: Bool
     public let allowedUpdatesExtra: Array<String>
     public let getFileRetryCount: Int64
 
@@ -623,6 +624,7 @@ public class TelegramNetworkConfig {
         dnsResultOrder!: String = "ipv4first",
         dangerouslyAllowPrivateNetwork!: Bool = false,
         insecureSkipTlsVerify!: Bool = false,
+        envProxyEnabled!: Bool = false,
         allowedUpdatesExtra!: Array<String> = [],
         getFileRetryCount!: Int64 = 3
     ) {
@@ -630,6 +632,7 @@ public class TelegramNetworkConfig {
         this.dnsResultOrder = dnsResultOrder
         this.dangerouslyAllowPrivateNetwork = dangerouslyAllowPrivateNetwork
         this.insecureSkipTlsVerify = insecureSkipTlsVerify
+        this.envProxyEnabled = envProxyEnabled
         this.allowedUpdatesExtra = allowedUpdatesExtra
         this.getFileRetryCount = if (getFileRetryCount <= 0) { 1 } else { getFileRetryCount }
     }
@@ -662,6 +665,8 @@ public class TelegramConfig {
     public let commandsNative: String
     public let customCommands: Array<TelegramCustomCommandConfig>
     public let replyToMode: String
+    public let groupHistoryEnabled: Bool
+    public let groupHistoryLimit: Int64
     public let textChunkLimit: Int64
     public let chunkMode: String
     public let streaming: String
@@ -711,6 +716,8 @@ public class TelegramConfig {
         commandsNative!: String = "auto",
         customCommands!: Array<TelegramCustomCommandConfig> = [],
         replyToMode!: String = "off",
+        groupHistoryEnabled!: Bool = true,
+        groupHistoryLimit!: Int64 = 20,
         textChunkLimit!: Int64 = 4000,
         chunkMode!: String = "length",
         streaming!: String = "partial",
@@ -759,6 +766,8 @@ public class TelegramConfig {
         this.commandsNative = commandsNative
         this.customCommands = customCommands
         this.replyToMode = replyToMode
+        this.groupHistoryEnabled = groupHistoryEnabled
+        this.groupHistoryLimit = if (groupHistoryLimit <= 0) { 20 } else { groupHistoryLimit }
         this.textChunkLimit = textChunkLimit
         this.chunkMode = chunkMode
         this.streaming = streaming

@@ -371,6 +371,8 @@ private func mergeTelegram(user: GatewayUserSettings): TelegramConfig {
         commandsNative: user.telegram.commandsNative.trimAscii(),
         customCommands: customCommands.toArray(),
         replyToMode: user.telegram.replyToMode.trimAscii(),
+        groupHistoryEnabled: user.telegram.groupHistoryEnabled,
+        groupHistoryLimit: user.telegram.groupHistoryLimit,
         textChunkLimit: user.telegram.textChunkLimit,
         chunkMode: user.telegram.chunkMode.trimAscii(),
         streaming: user.telegram.streaming.trimAscii(),
@@ -438,6 +440,7 @@ private func mergeTelegram(user: GatewayUserSettings): TelegramConfig {
             dnsResultOrder: user.telegram.network.dnsResultOrder.trimAscii(),
             dangerouslyAllowPrivateNetwork: user.telegram.network.dangerouslyAllowPrivateNetwork,
             insecureSkipTlsVerify: user.telegram.network.insecureSkipTlsVerify,
+            envProxyEnabled: user.telegram.network.envProxyEnabled,
             allowedUpdatesExtra: user.telegram.network.allowedUpdatesExtra,
             getFileRetryCount: user.telegram.network.getFileRetryCount
         ),

@@ -6,7 +6,7 @@ import metis.gateway.model.*
 
 import magic.jsonable.*
 import std.collection.ArrayList
-import std.env.setVariable
+import std.env.{getVariable, setVariable}
 import std.fs.{Directory, File, Path, remove}
 import std.sync.Mutex
 import std.time.*
@@ -19,6 +19,7 @@ private class TelegramFakeBotApi {
     public var contentTypes: ArrayList<String> = ArrayList<String>()
     public var bodySizes: ArrayList<Int64> = ArrayList<Int64>()
     public var pollingUpdatesEnabled: Bool = true
+    public var setMyCommandsFailuresBeforeSuccess: Int64 = 0
     private let lock: Mutex = Mutex()
     private var getUpdatesCount: Int64 = 0
     private var nextMessageId: Int64 = 500
@@ -57,7 +58,11 @@ private class TelegramFakeBotApi {
             if (request.context == "downloadFile") {
                 return TelegramTransportResponse(true, body: "fake-binary-photo", outcome: "ok")
             }
-            if (request.context == "setWebhook" || request.context == "setMyCommands" || request.context.startsWith("deleteWebhook:")) {
+            if (request.context == "setMyCommands" && this.setMyCommandsFailuresBeforeSuccess > 0) {
+                this.setMyCommandsFailuresBeforeSuccess -= 1
+                return TelegramTransportResponse(true, body: "{\"ok\":false,\"description\":\"Bad Request: BOT_COMMANDS_TOO_MUCH\"}", outcome: "api-error")
+            }
+            if (request.context == "setWebhook" || request.context == "setMyCommands" || request.context == "setMyCommands:retry" || request.context == "deleteMyCommands" || request.context.startsWith("deleteWebhook:")) {
                 return TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":true}", outcome: "ok")
             }
             if (request.context == "getUpdates") {
@@ -109,6 +114,18 @@ private class TelegramFakeBotApi {
         }
     }
 
+    public func count(method: String): Int64 {
+        var total: Int64 = 0
+        synchronized(this.lock) {
+            for (call in this.calls) {
+                if (call.contains(method)) {
+                    total += 1
+                }
+            }
+        }
+        total
+    }
+
     public func sawBodyContaining(text: String): Bool {
         synchronized(this.lock) {
             for (body in this.bodies) {
@@ -135,6 +152,7 @@ private class TelegramFakeBotApi {
         if (url.contains("/getUpdates")) { return "getUpdates" }
         if (url.contains("/setWebhook")) { return "setWebhook" }
         if (url.contains("/deleteWebhook")) { return "deleteWebhook" }
+        if (url.contains("/deleteMyCommands")) { return "deleteMyCommands" }
         if (url.contains("/setMyCommands")) { return "setMyCommands" }
         if (url.contains("/getMe")) { return "getMe" }
         if (url.contains("/getWebhookInfo")) { return "getWebhookInfo" }
@@ -495,6 +513,55 @@ public class TelegramAdapterTest {
             @Expect(commands.get("lastSyncStatus").getOrThrow().asString().getValue(), "error")
             @Expect(commands.get("lastSyncError").getOrThrow().asString().getValue().contains("Bad Request"), true)
             @Expect(commands.get("lastSyncCommandCount").getOrThrow().asInt().getValue(), 20)
+        } finally {
+            setTelegramTransportRunnerForTest(None)
+        }
+    }
+
+    @TestCase
+    public func t46NativeCommandSyncDeletesBeforeSetAndSkipsUnchangedHash(): Unit {
+        let fake = TelegramFakeBotApi()
+        setTelegramTransportRunnerForTest(Some({ request => fake.handle(request) }))
+        try {
+            let adapter = TelegramAdapter(config: TelegramConfig(enabled: true, botToken: "telegram-token"))
+            @Expect(adapter.debugSyncNativeCommandsForTest(), true)
+            @Expect(adapter.debugSyncNativeCommandsForTest(), true)
+            let snapshot = adapter.debugBuildHealthSnapshot()
+            let commands = snapshot.get("nativeCommands").getOrThrow().asObject()
+            @Expect(fake.count("deleteMyCommands"), 1)
+            @Expect(fake.count("setMyCommands"), 1)
+            @Expect(commands.get("lastSyncStatus").getOrThrow().asString().getValue(), "skipped")
+            @Expect(commands.get("lastSyncSkipped").getOrThrow().asBool().getValue(), true)
+        } finally {
+            setTelegramTransportRunnerForTest(None)
+        }
+    }
+
+    @TestCase
+    public func t46NativeCommandSyncRetriesWithTrimmedMenuWhenTelegramRejectsTooManyCommands(): Unit {
+        let custom = ArrayList<TelegramCustomCommandConfig>()
+        for (i in 0..120) {
+            custom.add(TelegramCustomCommandConfig(command: "cmd${i}", description: "Command ${i}"))
+        }
+        let fake = TelegramFakeBotApi()
+        fake.setMyCommandsFailuresBeforeSuccess = 1
+        setTelegramTransportRunnerForTest(Some({ request => fake.handle(request) }))
+        try {
+            let adapter = TelegramAdapter(
+                config: TelegramConfig(
+                    enabled: true,
+                    botToken: "telegram-token",
+                    customCommands: custom.toArray()
+                )
+            )
+            @Expect(adapter.debugSyncNativeCommandsForTest(), true)
+            let snapshot = adapter.debugBuildHealthSnapshot()
+            let commands = snapshot.get("nativeCommands").getOrThrow().asObject()
+            @Expect(fake.count("deleteMyCommands"), 1)
+            @Expect(fake.count("setMyCommands"), 2)
+            @Expect(commands.get("lastSyncRetryCount").getOrThrow().asInt().getValue(), 1)
+            @Expect(commands.get("lastSyncTrimmedCount").getOrThrow().asInt().getValue(), 20)
+            @Expect(commands.get("lastSyncCommandCount").getOrThrow().asInt().getValue(), 80)
         } finally {
             setTelegramTransportRunnerForTest(None)
         }
@@ -1679,6 +1746,33 @@ public class TelegramAdapterTest {
     }
 
     @TestCase
+    public func t46GroupSilentIngestHistoryIsAttachedToNextMentionedTurn(): Unit {
+        let cfg = TelegramConfig(
+            enabled: true,
+            botToken: "telegram-token",
+            groupPolicy: "open",
+            groupHistoryEnabled: true,
+            groupHistoryLimit: 2
+        )
+        let adapter = TelegramAdapter(config: cfg)
+        adapter.start()
+        let silent = "{\"update_id\":41,\"message\":{\"message_id\":201,\"text\":\"background context\",\"chat\":{\"id\":-1001234567890,\"type\":\"supergroup\"},\"from\":{\"id\":8734062810}}}"
+        @Expect(adapter.ingestWebhookPayload(silent).contains("\"ignored\":true"), true)
+        @Expect(adapter.pullInbound().isEmpty(), true)
+
+        let mentioned = "{\"update_id\":42,\"message\":{\"message_id\":202,\"text\":\"/status\",\"chat\":{\"id\":-1001234567890,\"type\":\"supergroup\"},\"from\":{\"id\":8734062810}}}"
+        @Expect(adapter.ingestWebhookPayload(mentioned).contains("\"ok\":true"), true)
+        let inbound = adapter.pullInbound()
+        @Expect(inbound.size, 1)
+        let context = inbound[0].mediaContext.get("context").getOrThrow().asObject()
+        let groupHistory = context.get("groupHistory").getOrThrow().asObject()
+        @Expect(groupHistory.get("source").getOrThrow().asString().getValue(), "telegram-silent-ingest")
+        let records = groupHistory.get("records").getOrThrow().asArray()
+        @Expect(records.size(), 1)
+        @Expect(records[0].asObject().get("text").getOrThrow().asString().getValue(), "background context")
+    }
+
+    @TestCase
     public func editedAndChannelPostPolicyDiagnosticsPreserveTelegramUpdateKind(): Unit {
         let adapter = TelegramAdapter(config: TelegramConfig(enabled: true, botToken: "telegram-token", groupPolicy: "disabled"))
         adapter.start()
@@ -2739,6 +2833,39 @@ public class TelegramAdapterTest {
     }
 
     @TestCase
+    public func t46TelegramTransportUsesEnvProxyOnlyWhenEnabledAndHonorsNoProxy(): Unit {
+        let oldHttps = getVariable("HTTPS_PROXY") ?? ""
+        let oldHttp = getVariable("HTTP_PROXY") ?? ""
+        let oldNoProxy = getVariable("NO_PROXY") ?? ""
+        try {
+            setVariable("HTTPS_PROXY", "http://127.0.0.1:7897")
+            setVariable("HTTP_PROXY", "")
+            setVariable("NO_PROXY", "")
+            let disabled = TelegramTransport(envProxyEnabled: false)
+            @Expect(disabled.debugEffectiveProxyForUrlForTest("https://api.telegram.org/botTOKEN/getUpdates"), "")
+
+            let enabled = TelegramTransport(envProxyEnabled: true, timeoutSeconds: 9)
+            let request = enabled.debugBuildRequestForTest("POST", "https://api.telegram.org/botTOKEN/getUpdates")
+            @Expect(request.proxy, "http://127.0.0.1:7897")
+            @Expect(request.proxySource, "env")
+            @Expect(enabled.debugProxyRouteForTest("https://api.telegram.org/botTOKEN/getUpdates"), "httpConnectTunnel")
+            @Expect(enabled.debugUsesCustomConnectorForTest(), false)
+
+            setVariable("NO_PROXY", "api.telegram.org")
+            @Expect(enabled.debugEffectiveProxyForUrlForTest("https://api.telegram.org/botTOKEN/getUpdates"), "")
+            @Expect(enabled.debugProxySourceForUrlForTest("https://api.telegram.org/botTOKEN/getUpdates"), "none")
+
+            let explicit = TelegramTransport(proxy: "http://127.0.0.1:1111", envProxyEnabled: true)
+            @Expect(explicit.debugEffectiveProxyForUrlForTest("https://api.telegram.org/botTOKEN/getUpdates"), "http://127.0.0.1:1111")
+            @Expect(explicit.debugProxySourceForUrlForTest("https://api.telegram.org/botTOKEN/getUpdates"), "explicit")
+        } finally {
+            setVariable("HTTPS_PROXY", oldHttps)
+            setVariable("HTTP_PROXY", oldHttp)
+            setVariable("NO_PROXY", oldNoProxy)
+        }
+    }
+
+    @TestCase
     public func telegramTransportBlocksPrivateTargetHostsUnlessExplicitlyAllowed(): Unit {
         let transport = TelegramTransport()
         @Expect(transport.debugValidateRequestUrlForTest("https://api.telegram.org/botTOKEN/getUpdates"), "")
@@ -3036,6 +3163,48 @@ public class TelegramAdapterTest {
     }
 
     @TestCase
+    public func t46TelegramPollAcceptsOpenClawVisibilityAliasesAndRejectsDurationHours(): Unit {
+        let adapter = TelegramAdapter(
+            config: TelegramConfig(
+                enabled: true,
+                botToken: "telegram-token",
+                actions: TelegramActionConfig(poll: true)
+            )
+        )
+        let publicPayloads = adapter.debugBuildSendPayloads(
+            OutboundMessage(
+                ChannelType.Telegram,
+                "user:8734062810",
+                "[poll]\nLunch?\n1. Rice\n2. Noodles\npollPublic=true"
+            )
+        )
+        @Expect(publicPayloads.size(), 1)
+        @Expect(publicPayloads[0].asObject().get("is_anonymous").getOrThrow().asBool().getValue(), false)
+
+        let anonymousPayloads = adapter.debugBuildSendPayloads(
+            OutboundMessage(
+                ChannelType.Telegram,
+                "user:8734062810",
+                "[poll]\nLunch?\n1. Rice\n2. Noodles\npollAnonymous=true"
+            )
+        )
+        @Expect(anonymousPayloads[0].asObject().get("is_anonymous").getOrThrow().asBool().getValue(), true)
+
+        adapter.start()
+        let invalid = adapter.send(
+            OutboundMessage(
+                ChannelType.Telegram,
+                "user:8734062810",
+                "[poll]\nLunch?\n1. Rice\n2. Noodles\ndurationHours=1"
+            )
+        )
+        match (invalid) {
+            case SendResult.Success => @Expect(false, true)
+            case SendResult.Failed(reason) => @Expect(reason.contains("durationHours is not supported"), true)
+        }
+    }
+
+    @TestCase
     public func invalidTelegramPollDurationFailsFastBeforeNetwork(): Unit {
         let adapter = TelegramAdapter(
             config: TelegramConfig(
@@ -3210,6 +3379,28 @@ public class TelegramAdapterTest {
         let reaction = first.get("reaction").getOrThrow().asArray()[0].asObject()
         @Expect(reaction.get("type").getOrThrow().asString().getValue(), "emoji")
         @Expect(reaction.get("emoji").getOrThrow().asString().getValue(), "👍")
+    }
+
+    @TestCase
+    public func t46ReactionPayloadAcceptsOpenClawStatusLifecycleNames(): Unit {
+        let fake = TelegramFakeBotApi()
+        setTelegramTransportRunnerForTest(Some({ request => fake.handle(request) }))
+        try {
+            let adapter = TelegramAdapter(config: TelegramConfig(enabled: true, botToken: "telegram-token"))
+            let payloads = adapter.debugBuildSendPayloads(
+                OutboundMessage(
+                    ChannelType.Telegram,
+                    "group:-1001234567890",
+                    "[reaction]\nstatus=done",
+                    replyToMessageId: Some("55")
+                )
+            )
+            @Expect(payloads.size(), 1)
+            let reaction = payloads[0].asObject().get("reaction").getOrThrow().asArray()[0].asObject()
+            @Expect(reaction.get("emoji").getOrThrow().asString().getValue(), "👍")
+        } finally {
+            setTelegramTransportRunnerForTest(None)
+        }
     }
 
     @TestCase
@@ -3486,6 +3677,12 @@ public class TelegramAdapterTest {
         @Expect(text.contains("<a href=\"https://example.test\">site</a>"), true)
         @Expect(text.contains("&lt;unsafe&gt;"), true)
         @Expect(text.contains("<blockquote>quoted</blockquote>"), true)
+    }
+
+    @TestCase
+    public func t46TelegramRichTextRendersSpoilerAsTelegramHtml(): Unit {
+        let adapter = TelegramAdapter(config: TelegramConfig(enabled: true, botToken: "telegram-token"))
+        @Expect(adapter.debugTelegramRenderHtmlForTest("hide ||secret <tag>||"), "hide <tg-spoiler>secret &lt;tag&gt;</tg-spoiler>")
     }
 
     @TestCase
