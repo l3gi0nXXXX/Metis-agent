@@ -77,6 +77,66 @@ function linkPath(nodeModules, name) {
   return path.join(nodeModules, name);
 }
 
+function detectPackageManager(root, workspaceRoot = "") {
+  const roots = [root, workspaceRoot].filter(Boolean);
+  for (const base of roots) {
+    if (fs.existsSync(path.join(base, "pnpm-lock.yaml"))) {
+      return { name: "pnpm", reason: "pnpm-lock.yaml" };
+    }
+    if (fs.existsSync(path.join(base, "yarn.lock"))) {
+      return { name: "yarn", reason: "yarn.lock" };
+    }
+    if (fs.existsSync(path.join(base, "package-lock.json")) || fs.existsSync(path.join(base, "npm-shrinkwrap.json"))) {
+      return { name: "npm", reason: "npm-lockfile" };
+    }
+  }
+
+  const pkg = packageJson(root);
+  if (typeof pkg.packageManager === "string") {
+    const [name] = pkg.packageManager.split("@");
+    if (["npm", "pnpm", "yarn"].includes(name)) {
+      return { name, reason: "packageManager" };
+    }
+  }
+  return { name: "npm", reason: "default" };
+}
+
+function installCommandFor(packageManager) {
+  if (packageManager.name === "pnpm") {
+    return ["pnpm", "install", "--frozen-lockfile", "--ignore-scripts"];
+  }
+  if (packageManager.name === "yarn") {
+    return ["yarn", "install", "--immutable", "--ignore-scripts"];
+  }
+  return packageManager.reason === "npm-lockfile" ? ["npm", "ci", "--ignore-scripts"] : ["npm", "install", "--ignore-scripts"];
+}
+
+function hasUnlinkedDependencies(pkg, workspaceLinks) {
+  const linked = new Set(workspaceLinks.map((link) => link.name));
+  for (const name of Object.keys(dependencyEntries(pkg))) {
+    if (!linked.has(name)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function copyPluginPackage(root, target) {
+  fs.rmSync(target, { recursive: true, force: true });
+  fs.cpSync(root, target, {
+    recursive: true,
+    dereference: false,
+    filter(source) {
+      const rel = path.relative(root, source);
+      if (!rel) {
+        return true;
+      }
+      const parts = rel.split(path.sep);
+      return !["node_modules", ".git", ".metis-openclaw-stage"].includes(parts[0]);
+    },
+  });
+}
+
 export function createInstallPlan(pluginRoot, options = {}) {
   const root = path.resolve(pluginRoot);
   const pkg = packageJson(root);
@@ -102,12 +162,19 @@ export function createInstallPlan(pluginRoot, options = {}) {
     workspaceLinks.push({ name: "openclaw", target: path.resolve(options.openclawPackageRoot), reason: "openclaw_sdk" });
   }
 
+  const stageRoot = path.resolve(options.stageRoot ?? path.join(root, ".metis-openclaw-stage"));
+  const packageManager = detectPackageManager(root, workspaceRoot);
+  const installCommand = installCommandFor(packageManager);
+
   return {
     ok: true,
     pluginRoot: root,
     packageName: typeof pkg.name === "string" ? pkg.name : path.basename(root),
-    stageRoot: path.resolve(options.stageRoot ?? path.join(root, ".metis-openclaw-stage")),
-    requiresInstall: false,
+    stageRoot,
+    stagedPluginRoot: path.join(stageRoot, "package"),
+    requiresInstall: hasUnlinkedDependencies(pkg, workspaceLinks),
+    packageManager,
+    installCommand,
     workspaceRoot,
     workspaceLinks,
   };
@@ -118,6 +185,7 @@ export function preparePluginStage(pluginRoot, options = {}) {
   const stageRoot = plan.stageRoot;
   const nodeModules = path.join(stageRoot, "node_modules");
   fs.mkdirSync(nodeModules, { recursive: true });
+  copyPluginPackage(plan.pluginRoot, plan.stagedPluginRoot);
   for (const link of plan.workspaceLinks) {
     const target = linkPath(nodeModules, link.name);
     fs.mkdirSync(path.dirname(target), { recursive: true });
