@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -8,9 +10,30 @@ import { validateOpenClawCompatGate } from "./openclaw-compat-ci-gate.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const fixtureRoot = path.join(__dirname, "fixtures", "openclaw-compat-ci");
+const artifactRoot = path.join("scripts", "fixtures", "openclaw-compat-ci", "artifacts");
 
 function readFixture(name) {
   return JSON.parse(fs.readFileSync(path.join(fixtureRoot, name), "utf8"));
+}
+
+function alignedRecord(id, overrides = {}) {
+  return {
+    id,
+    pluginId: id,
+    source_repo: "openclaw",
+    sourceRef: `OpenClaw/plugins/${id}/src/index.ts:1`,
+    entry: "dist/index.mjs",
+    registerApis: ["registerCommand"],
+    sdkSubpaths: ["@openclaw/plugin-sdk"],
+    status: "aligned",
+    real_plugin_smoke_status: "passed",
+    real_plugin_smoke_artifact: path.join(artifactRoot, "chat-smoke.json"),
+    behavior_test_status: "passed",
+    behavior_test_artifact: path.join(artifactRoot, "chat-behavior.json"),
+    runtime_facets_required: ["command"],
+    release_blockers: [],
+    ...overrides,
+  };
 }
 
 test("passes release gate when inventory and matrix records are complete and release-ready", () => {
@@ -36,7 +59,9 @@ test("accepts object-map matrix records from generated inventory artifacts", () 
         sdkSubpaths: ["@openclaw/plugin-sdk"],
         status: "aligned",
         real_plugin_smoke_status: "passed",
+        real_plugin_smoke_artifact: path.join(artifactRoot, "chat-smoke.json"),
         behavior_test_status: "passed",
+        behavior_test_artifact: path.join(artifactRoot, "chat-behavior.json"),
         runtime_facets_required: ["command"],
         release_blockers: [],
       },
@@ -59,7 +84,9 @@ test("accepts generated Phase 0 snake_case inventory records", () => {
           sdk_subpaths: [],
           metis_status: "missing",
           real_plugin_smoke_status: "passed",
+          real_plugin_smoke_artifact: path.join(artifactRoot, "chat-smoke.json"),
           behavior_test_status: "passed",
+          behavior_test_artifact: path.join(artifactRoot, "chat-behavior.json"),
           runtime_facets_required: ["channel"],
           release_blockers: [],
           requires_metis_manifest: false,
@@ -90,7 +117,9 @@ test("fails generated inventory records that require source patching or wrappers
           sdk_subpaths: [],
           metis_status: "aligned",
           real_plugin_smoke_status: "passed",
+          real_plugin_smoke_artifact: path.join(artifactRoot, "chat-smoke.json"),
           behavior_test_status: "passed",
+          behavior_test_artifact: path.join(artifactRoot, "chat-behavior.json"),
           runtime_facets_required: [],
           release_blockers: [],
           requires_metis_manifest: true,
@@ -173,7 +202,9 @@ test("treats string compatibility escape-hatch markers as failing markers", () =
           sdkSubpaths: ["@openclaw/plugin-sdk"],
           status: "aligned",
           real_plugin_smoke_status: "passed",
+          real_plugin_smoke_artifact: path.join(artifactRoot, "chat-smoke.json"),
           behavior_test_status: "passed",
+          behavior_test_artifact: path.join(artifactRoot, "chat-behavior.json"),
           runtime_facets_required: ["command"],
           release_blockers: [],
           requiresWrapper: "true",
@@ -211,6 +242,113 @@ test("fails release gate when smoke or behavior evidence is missing or not ready
   assert.equal(result.ok, false);
   assert.ok(result.errors.some((error) => error.code === "real_plugin_smoke_not_ready" && error.recordId === "not-smoked"));
   assert.ok(result.errors.some((error) => error.code === "behavior_test_not_ready" && error.recordId === "not-smoked"));
+});
+
+test("fails release gate when passed smoke or behavior evidence lacks artifact paths", () => {
+  const result = validateOpenClawCompatGate({
+    inventory: { plugins: [] },
+    matrix: {
+      matrix: [
+        alignedRecord("no-artifacts", {
+          real_plugin_smoke_artifact: undefined,
+          behavior_test_artifact: undefined,
+        }),
+      ],
+    },
+  });
+
+  assert.equal(result.ok, false);
+  assert.ok(result.errors.some((error) => error.code === "missing_real_plugin_smoke_artifact" && error.recordId === "no-artifacts"));
+  assert.ok(result.errors.some((error) => error.code === "missing_behavior_test_artifact" && error.recordId === "no-artifacts"));
+});
+
+test("fails release gate when referenced smoke or behavior artifacts do not exist", () => {
+  const result = validateOpenClawCompatGate({
+    inventory: { plugins: [] },
+    matrix: {
+      matrix: [
+        alignedRecord("missing-artifacts", {
+          real_plugin_smoke_artifact: path.join(artifactRoot, "missing-smoke.json"),
+          behavior_test_artifact: path.join(artifactRoot, "missing-behavior.json"),
+        }),
+      ],
+    },
+  });
+
+  assert.equal(result.ok, false);
+  assert.ok(result.errors.some((error) => error.code === "real_plugin_smoke_artifact_missing" && error.recordId === "missing-artifacts"));
+  assert.ok(result.errors.some((error) => error.code === "behavior_test_artifact_missing" && error.recordId === "missing-artifacts"));
+});
+
+test("fails source boundary metadata for dirty openclaw source and omitted qmd source", () => {
+  const result = validateOpenClawCompatGate({
+    inventory: {
+      sources: [
+        { name: "openclaw", exists: true, ref: "3e72c0352d", dirty: true, dirty_paths: ["pnpm-lock.yaml"] },
+        { name: "openclaw-china", exists: true, ref: "a36d023" },
+        { name: "openclaw-weixin", exists: true, ref: "archive-sha256:abc" },
+        { name: "clawmate", exists: true, ref: "580e011" },
+      ],
+      plugins: [alignedRecord("dirty-source")],
+    },
+    matrix: { plugins: [] },
+  });
+
+  assert.equal(result.ok, false);
+  assert.ok(result.errors.some((error) => error.code === "source_dirty" && error.recordId === "openclaw"));
+  assert.ok(result.errors.some((error) => error.code === "source_missing" && error.recordId === "qmd"));
+});
+
+test("fails source boundary when a pinned git source root is dirty", () => {
+  const sourceRoot = fs.mkdtempSync(path.join(os.tmpdir(), "metis-openclaw-source-"));
+  execFileSync("git", ["-C", sourceRoot, "init"], { stdio: "ignore" });
+  execFileSync("git", ["-C", sourceRoot, "config", "user.email", "metis-test@example.invalid"], { stdio: "ignore" });
+  execFileSync("git", ["-C", sourceRoot, "config", "user.name", "Metis Test"], { stdio: "ignore" });
+  fs.writeFileSync(path.join(sourceRoot, "pnpm-lock.yaml"), "lockfileVersion: 9\n");
+  execFileSync("git", ["-C", sourceRoot, "add", "pnpm-lock.yaml"], { stdio: "ignore" });
+  execFileSync("git", ["-C", sourceRoot, "commit", "-m", "seed"], { stdio: "ignore" });
+  fs.appendFileSync(path.join(sourceRoot, "pnpm-lock.yaml"), "dirty: true\n");
+
+  const result = validateOpenClawCompatGate({
+    inventory: {
+      sources: [
+        { name: "openclaw", root: sourceRoot, exists: true, ref: "3e72c0352d" },
+        { name: "openclaw-china", exists: true, ref: "a36d023" },
+        { name: "openclaw-weixin", exists: true, ref: "archive-sha256:abc" },
+        { name: "clawmate", exists: true, ref: "580e011" },
+        { name: "qmd", exists: true, ref: "9a8b7c6" },
+      ],
+      plugins: [alignedRecord("dirty-source")],
+    },
+    matrix: { plugins: [] },
+  });
+
+  assert.equal(result.ok, false);
+  assert.ok(result.errors.some((error) => error.code === "source_dirty" && error.recordId === "openclaw"));
+});
+
+test("fails release gate when representative plugin evidence is absent", () => {
+  const result = validateOpenClawCompatGate({
+    inventory: {
+      sources: [
+        { name: "openclaw", exists: true, ref: "3e72c0352d" },
+        { name: "openclaw-china", exists: true, ref: "a36d023" },
+        { name: "openclaw-weixin", exists: true, ref: "archive-sha256:abc" },
+        { name: "clawmate", exists: true, ref: "580e011" },
+        { name: "qmd", exists: true, ref: "9a8b7c6" },
+      ],
+      plugins: [
+        alignedRecord("china-channel", { source_repo: "openclaw-china" }),
+        alignedRecord("plain-openclaw"),
+      ],
+    },
+    matrix: { plugins: [] },
+  });
+
+  assert.equal(result.ok, false);
+  assert.ok(result.errors.some((error) => error.code === "missing_representative_plugin_evidence" && error.recordId === "openclaw-weixin"));
+  assert.ok(result.errors.some((error) => error.code === "missing_representative_plugin_evidence" && error.recordId === "clawmate"));
+  assert.ok(!result.errors.some((error) => error.code === "missing_representative_plugin_evidence" && error.recordId === "openclaw-china"));
 });
 
 test("fails release gate when release blockers are present", () => {

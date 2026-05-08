@@ -1,11 +1,15 @@
 #!/usr/bin/env node
 
 import fs from "node:fs";
+import path from "node:path";
+import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const RELEASE_READY_STATUSES = new Set(["aligned", "not-applicable"]);
 const RELEASE_READY_EVIDENCE_STATUSES = new Set(["passed", "not-applicable"]);
 const VALID_STATUSES = new Set(["aligned", "not-applicable", "partial", "missing"]);
+const REQUIRED_SOURCE_NAMES = ["openclaw", "openclaw-china", "openclaw-weixin", "clawmate", "qmd"];
+const REPRESENTATIVE_EVIDENCE_SOURCES = ["openclaw-china", "openclaw-weixin", "clawmate"];
 const RECORD_COLLECTION_KEYS = new Set(["plugins", "matrix", "items", "records", "capabilities"]);
 const METADATA_KEYS = new Set([
   "sources",
@@ -17,8 +21,9 @@ const METADATA_KEYS = new Set([
   "releaseBlockers",
 ]);
 
-export function validateOpenClawCompatGate({ inventory = {}, matrix = {} } = {}) {
+export function validateOpenClawCompatGate({ inventory = {}, matrix = {}, artifactRoot = process.cwd() } = {}) {
   const errors = [];
+  const context = { artifactRoot };
 
   validateDocumentMetadata(inventory, "inventory", errors);
   validateDocumentMetadata(matrix, "matrix", errors);
@@ -33,8 +38,9 @@ export function validateOpenClawCompatGate({ inventory = {}, matrix = {} } = {})
   }
 
   for (const record of records) {
-    validateRecord(record, errors);
+    validateRecord(record, errors, context);
   }
+  validateRepresentativeEvidence(records, inventory, matrix, errors);
 
   return {
     ok: errors.length === 0,
@@ -44,7 +50,7 @@ export function validateOpenClawCompatGate({ inventory = {}, matrix = {} } = {})
   };
 }
 
-function validateRecord(record, errors) {
+function validateRecord(record, errors, context) {
   const { value, recordId, source } = record;
   requireField(value, "sourceRef", "missing_source_ref", record, errors, isPresent);
   requireField(value, "entry", "missing_entry", record, errors, isPresent);
@@ -64,6 +70,8 @@ function validateRecord(record, errors) {
 
   validateEvidenceStatus(value.realPluginSmokeStatus, "real plugin smoke", "real_plugin_smoke_not_ready", record, errors);
   validateEvidenceStatus(value.behaviorTestStatus, "behavior test", "behavior_test_not_ready", record, errors);
+  validateEvidenceArtifact(value.realPluginSmokeStatus, value.realPluginSmokeArtifact, "real plugin smoke", "real_plugin_smoke", record, errors, context);
+  validateEvidenceArtifact(value.behaviorTestStatus, value.behaviorTestArtifact, "behavior test", "behavior_test", record, errors, context);
   validateReleaseBlockers(value.releaseBlockers, record, errors);
 
   if (isMarked(value.requiresMetisManifest)) {
@@ -87,18 +95,31 @@ function validateDocumentMetadata(document, source, errors) {
 
 function validateSources(sources, documentSource, errors) {
   if (!Array.isArray(sources)) return;
+  const seenSources = new Set();
   for (let index = 0; index < sources.length; index += 1) {
     const sourceRecord = sources[index];
     if (!isObject(sourceRecord)) continue;
     const recordId = firstNonEmpty(sourceRecord.name, sourceRecord.source, `sources[${index}]`);
+    seenSources.add(recordId);
     const source = `${documentSource}.sources`;
     const record = { source, recordId };
     if (sourceRecord.exists === false) {
       errors.push(error("source_missing", `${source}:${recordId} source root is missing`, record));
       continue;
     }
+    if (isDirtySource(sourceRecord)) {
+      errors.push(error("source_dirty", `${source}:${recordId} has uncommitted source changes`, record));
+    }
     if (!isPresent(sourceRecord.ref ?? sourceRecord.source_ref ?? sourceRecord.sourceRef)) {
       errors.push(error("missing_source_ref", `${source}:${recordId} is missing pinned source ref`, record));
+    }
+  }
+  for (const sourceName of REQUIRED_SOURCE_NAMES) {
+    if (!seenSources.has(sourceName)) {
+      errors.push(error("source_missing", `${documentSource}.sources:${sourceName} is missing from release boundary metadata`, {
+        source: `${documentSource}.sources`,
+        recordId: sourceName,
+      }));
     }
   }
 }
@@ -111,7 +132,7 @@ function validateDiagnostics(diagnostics, documentSource, errors) {
     const recordId = firstNonEmpty(diagnostic.source, diagnostic.name, `diagnostics[${index}]`);
     const diagnosticCode = firstNonEmpty(diagnostic.code, "diagnostic_blocker");
     const source = `${documentSource}.diagnostics`;
-    const code = diagnosticCode === "source_missing" ? "source_missing" : "diagnostic_blocker";
+    const code = diagnosticCode === "source_missing" || diagnosticCode === "source_dirty" ? diagnosticCode : "diagnostic_blocker";
     errors.push(error(code, `${source}:${recordId} reports ${diagnosticCode}`, { source, recordId }));
   }
 }
@@ -136,9 +157,9 @@ function validateDocumentReleaseBlockers(releaseBlockers, documentSource, errors
     return;
   }
   for (const blocker of releaseBlockers) {
-    errors.push(error("release_blocker", `${documentSource}:release_blockers contains ${formatBlocker(blocker)}`, {
+    errors.push(error(documentReleaseBlockerCode(blocker), `${documentSource}:release_blockers contains ${formatBlocker(blocker)}`, {
       source: documentSource,
-      recordId: "release_blockers",
+      recordId: blockerRecordId(blocker, "release_blockers"),
     }));
   }
 }
@@ -151,6 +172,40 @@ function validateEvidenceStatus(value, label, code, record, errors) {
   }
 }
 
+function validateEvidenceArtifact(status, artifactValue, label, codePrefix, record, errors, context) {
+  if (!isPassedEvidence(status)) return;
+  const artifactPaths = artifactPathList(artifactValue);
+  if (artifactPaths.length === 0) {
+    errors.push(error(`missing_${codePrefix}_artifact`, `${record.source}:${record.recordId} ${label} evidence is missing an artifact path`, record));
+    return;
+  }
+  for (const artifactPath of artifactPaths) {
+    const resolved = path.isAbsolute(artifactPath) ? artifactPath : path.resolve(context.artifactRoot, artifactPath);
+    if (!fs.existsSync(resolved) || !fs.statSync(resolved).isFile()) {
+      errors.push(error(`${codePrefix}_artifact_missing`, `${record.source}:${record.recordId} ${label} artifact is missing: ${artifactPath}`, record));
+    }
+  }
+}
+
+function validateRepresentativeEvidence(records, inventory, matrix, errors) {
+  const sourceNames = new Set([
+    ...sourceNamesFromDocument(inventory),
+    ...sourceNamesFromDocument(matrix),
+  ]);
+  if (sourceNames.size === 0) return;
+
+  for (const sourceName of REPRESENTATIVE_EVIDENCE_SOURCES) {
+    if (!sourceNames.has(sourceName)) continue;
+    const hasEvidence = records.some((record) => isRepresentativeEvidenceForSource(record, sourceName));
+    if (!hasEvidence) {
+      errors.push(error("missing_representative_plugin_evidence", `representative ${sourceName} plugin evidence is missing`, {
+        source: "representative_evidence",
+        recordId: sourceName,
+      }));
+    }
+  }
+}
+
 function validateReleaseBlockers(releaseBlockers, record, errors) {
   if (releaseBlockers == null) return;
   if (!Array.isArray(releaseBlockers)) {
@@ -160,6 +215,16 @@ function validateReleaseBlockers(releaseBlockers, record, errors) {
   for (const blocker of releaseBlockers) {
     errors.push(error("release_blocker", `${record.source}:${record.recordId} has release blocker ${formatBlocker(blocker)}`, record));
   }
+}
+
+function isRepresentativeEvidenceForSource(record, sourceName) {
+  const { value } = record;
+  return value.sourceRepo === sourceName
+    && RELEASE_READY_STATUSES.has(value.status)
+    && isPassedEvidence(value.realPluginSmokeStatus)
+    && isPassedEvidence(value.behaviorTestStatus)
+    && artifactPathList(value.realPluginSmokeArtifact).length > 0
+    && artifactPathList(value.behaviorTestArtifact).length > 0;
 }
 
 function requireField(value, field, code, record, errors, predicate) {
@@ -242,19 +307,90 @@ function normalizeRecordFields(value) {
   return {
     ...value,
     pluginId: value.pluginId ?? value.plugin_id,
+    sourceRepo: value.sourceRepo ?? value.source_repo ?? value.source_name ?? value.source,
     sourceRef: value.sourceRef ?? value.source_ref,
     entry: value.entry ?? value.entry_path,
     registerApis: value.registerApis ?? value.register_apis,
     sdkSubpaths: value.sdkSubpaths ?? value.sdk_subpaths,
     status: value.status ?? value.metis_status,
     realPluginSmokeStatus: value.realPluginSmokeStatus ?? value.real_plugin_smoke_status,
+    realPluginSmokeArtifact: value.realPluginSmokeArtifact
+      ?? value.realPluginSmokeArtifactPath
+      ?? value.real_plugin_smoke_artifact
+      ?? value.real_plugin_smoke_artifact_path
+      ?? value.realPluginSmokeArtifacts
+      ?? value.real_plugin_smoke_artifacts,
     behaviorTestStatus: value.behaviorTestStatus ?? value.behavior_test_status,
+    behaviorTestArtifact: value.behaviorTestArtifact
+      ?? value.behaviorTestArtifactPath
+      ?? value.behavior_test_artifact
+      ?? value.behavior_test_artifact_path
+      ?? value.behaviorTestArtifacts
+      ?? value.behavior_test_artifacts,
     runtimeFacetsRequired: value.runtimeFacetsRequired ?? value.runtime_facets_required,
     releaseBlockers: value.releaseBlockers ?? value.release_blockers,
     requiresMetisManifest: value.requiresMetisManifest ?? value.requires_metis_manifest,
     requiresWrapper: value.requiresWrapper ?? value.requires_wrapper,
     sourcePatched: value.sourcePatched ?? value.source_patched,
   };
+}
+
+function sourceNamesFromDocument(document) {
+  if (!isObject(document) || !Array.isArray(document.sources)) return [];
+  return document.sources
+    .filter(isObject)
+    .map((source) => firstNonEmpty(source.name, source.source))
+    .filter(Boolean);
+}
+
+function isDirtySource(sourceRecord) {
+  if (isMarked(sourceRecord.dirty) || isMarked(sourceRecord.source_dirty) || isMarked(sourceRecord.sourceDirty)) return true;
+  if (isFalseMarker(sourceRecord.clean)) return true;
+  const status = firstNonEmpty(sourceRecord.status, sourceRecord.state, sourceRecord.git_status, sourceRecord.gitStatus).toLowerCase();
+  if (status === "dirty" || status === "source_dirty" || status.includes("dirty")) return true;
+  return hasDirtyGitWorktree(sourceRecord.root);
+}
+
+function isPassedEvidence(value) {
+  return String(value ?? "").trim().toLowerCase() === "passed";
+}
+
+function artifactPathList(value) {
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    return trimmed ? [trimmed] : [];
+  }
+  if (Array.isArray(value)) {
+    return value.flatMap((item) => artifactPathList(item));
+  }
+  if (isObject(value)) {
+    return artifactPathList(value.path ?? value.file ?? value.artifact);
+  }
+  return [];
+}
+
+function hasDirtyGitWorktree(root) {
+  if (!isPresent(root) || !fs.existsSync(root)) return false;
+  try {
+    return execFileSync("git", ["-C", String(root), "status", "--porcelain"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim().length > 0;
+  } catch {
+    return false;
+  }
+}
+
+function documentReleaseBlockerCode(blocker) {
+  if (!isObject(blocker)) return "release_blocker";
+  const code = firstNonEmpty(blocker.code);
+  if (code === "source_missing" || code === "source_dirty") return code;
+  return "release_blocker";
+}
+
+function blockerRecordId(blocker, fallback) {
+  if (!isObject(blocker)) return fallback;
+  return firstNonEmpty(blocker.plugin_id, blocker.pluginId, blocker.source, blocker.name, fallback);
 }
 
 function isPresent(value) {

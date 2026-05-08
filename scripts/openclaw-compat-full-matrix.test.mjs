@@ -1,7 +1,15 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import { validateOpenClawCompatGate } from "./openclaw-compat-ci-gate.mjs";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const repoRoot = path.resolve(__dirname, "..");
+const artifactRoot = path.join("scripts", "fixtures", "openclaw-compat-ci", "artifacts");
+const currentMatrixPath = path.join(repoRoot, "develop_steps", "openclaw-plugin-compatibility-matrix-2026-05-08.json");
 
 function alignedRecord(id, overrides = {}) {
   return {
@@ -13,7 +21,9 @@ function alignedRecord(id, overrides = {}) {
     sdk_subpaths: ["@openclaw/plugin-sdk"],
     metis_status: "aligned",
     real_plugin_smoke_status: "passed",
+    real_plugin_smoke_artifact: path.join(artifactRoot, "chat-smoke.json"),
     behavior_test_status: "passed",
+    behavior_test_artifact: path.join(artifactRoot, "chat-behavior.json"),
     runtime_facets_required: ["command"],
     release_blockers: [],
     requires_metis_manifest: false,
@@ -21,6 +31,10 @@ function alignedRecord(id, overrides = {}) {
     source_patched: false,
     ...overrides,
   };
+}
+
+function readJson(file) {
+  return JSON.parse(fs.readFileSync(file, "utf8"));
 }
 
 function syntheticFullMatrix(records) {
@@ -96,6 +110,9 @@ test("fails the current all-plugin matrix shape with 104 missing plugins, qmd mi
 test("passes a synthetic full matrix only when every plugin is aligned or not-applicable with release evidence", () => {
   const matrix = syntheticFullMatrix([
     alignedRecord("chat-commands"),
+    alignedRecord("china-channel", { source_repo: "openclaw-china" }),
+    alignedRecord("weixin-channel", { source_repo: "openclaw-weixin" }),
+    alignedRecord("clawmate-companion", { source_repo: "clawmate" }),
     alignedRecord("setup-only", {
       metis_status: "not-applicable",
       real_plugin_smoke_status: "not-applicable",
@@ -112,4 +129,23 @@ test("passes a synthetic full matrix only when every plugin is aligned or not-ap
   assert.equal(result.ok, true);
   assert.equal(result.releaseReady, true);
   assert.deepEqual(result.errors, []);
+});
+
+test("fails the checked-in real matrix until all current blockers are resolved with real evidence", () => {
+  const matrix = readJson(currentMatrixPath);
+  const result = validateOpenClawCompatGate({
+    inventory: { plugins: [] },
+    matrix,
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(matrix.summary.plugin_count, 104);
+  assert.equal(matrix.summary.by_status.missing, 104);
+  assert.equal(
+    result.errors.filter((error) => error.code === "release_status_not_ready").length,
+    104,
+  );
+  assert.ok(result.errors.some((error) => error.code === "source_missing" && error.recordId === "qmd"));
+  assert.ok(result.errors.some((error) => error.code === "real_plugin_smoke_not_ready"));
+  assert.ok(result.errors.some((error) => error.code === "behavior_test_not_ready"));
 });
