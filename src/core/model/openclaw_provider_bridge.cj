@@ -184,6 +184,7 @@ public class OpenClawProviderBridgeCall {
     public let name: String
     public let argumentsJson: String
     public let error: String
+    public let evidenceJson: String
 
     public init(
         ok: Bool,
@@ -196,7 +197,8 @@ public class OpenClawProviderBridgeCall {
         authConfigPath!: String = "",
         name!: String = "",
         argumentsJson!: String = "",
-        error!: String = ""
+        error!: String = "",
+        evidenceJson!: String = "{}"
     ) {
         this.ok = ok
         this.status = status
@@ -209,6 +211,7 @@ public class OpenClawProviderBridgeCall {
         this.name = name
         this.argumentsJson = argumentsJson
         this.error = error
+        this.evidenceJson = evidenceJson
     }
 }
 
@@ -251,12 +254,13 @@ public class OpenClawProviderBridgeRegistry {
                 if (!binding.supportsStreaming) {
                     return OpenClawProviderBridgeCall(
                         false,
-                        "unsupported",
+                        "not_supported",
                         "openclaw.provider.stream",
                         binding.providerId,
                         binding.runtimeProviderId,
                         openClawProviderNormalizeModelRef(binding.providerId, model),
-                        error: "provider does not advertise streaming"
+                        error: "not_supported",
+                        evidenceJson: "{\"kind\":\"provider\",\"provider\":\"${binding.providerId}\",\"capability\":\"stream\",\"status\":\"not_supported\",\"reason\":\"provider does not advertise streaming\"}"
                     )
                 }
                 OpenClawProviderBridgeCall(
@@ -270,7 +274,16 @@ public class OpenClawProviderBridgeRegistry {
                     authConfigPath: binding.apiKeyConfigPath
                 )
             case None =>
-                OpenClawProviderBridgeCall(false, "not_found", "openclaw.provider.stream", "", "", "", error: "provider not registered")
+                OpenClawProviderBridgeCall(
+                    false,
+                    "not_configured",
+                    "openclaw.provider.stream",
+                    "",
+                    "",
+                    openClawProviderNormalizeModelRef(providerId, model),
+                    error: "not_configured",
+                    evidenceJson: "{\"kind\":\"provider\",\"provider\":\"${providerId.trimAscii()}\",\"capability\":\"stream\",\"status\":\"not_configured\",\"reason\":\"provider not registered\"}"
+                )
         }
     }
 
@@ -280,12 +293,13 @@ public class OpenClawProviderBridgeRegistry {
                 if (!binding.supportsToolCalls) {
                     return OpenClawProviderBridgeCall(
                         false,
-                        "unsupported",
+                        "not_supported",
                         "openclaw.provider.toolCall",
                         binding.providerId,
                         binding.runtimeProviderId,
                         "",
-                        error: "provider does not advertise tool calls"
+                        error: "not_supported",
+                        evidenceJson: "{\"kind\":\"provider\",\"provider\":\"${binding.providerId}\",\"capability\":\"toolCall\",\"status\":\"not_supported\",\"reason\":\"provider does not advertise tool calls\"}"
                     )
                 }
                 OpenClawProviderBridgeCall(
@@ -300,7 +314,16 @@ public class OpenClawProviderBridgeRegistry {
                     argumentsJson: argumentsJson
                 )
             case None =>
-                OpenClawProviderBridgeCall(false, "not_found", "openclaw.provider.toolCall", "", "", "", error: "provider not registered")
+                OpenClawProviderBridgeCall(
+                    false,
+                    "not_configured",
+                    "openclaw.provider.toolCall",
+                    "",
+                    "",
+                    "",
+                    error: "not_configured",
+                    evidenceJson: "{\"kind\":\"provider\",\"provider\":\"${providerId.trimAscii()}\",\"capability\":\"toolCall\",\"status\":\"not_configured\",\"reason\":\"provider not registered\"}"
+                )
         }
     }
 }

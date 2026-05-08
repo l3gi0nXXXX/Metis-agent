@@ -70,6 +70,20 @@
         "acceptanceTests": ["CLI approvals status contract remains registered"]
       }
     ],
+    "gatewayMethods": [
+      {
+        "method": "gateway.plugins.reload",
+        "metisStatus": "aligned",
+        "acceptanceTests": ["gateway.plugins.reload maps to explicit compatibility evidence"]
+      }
+    ],
+    "services": [
+      {
+        "id": "compat-host",
+        "metisStatus": "aligned",
+        "acceptanceTests": ["compat host service health appears in Gateway runtime evidence"]
+      }
+    ],
     "approvals": [
       {
         "id": "tool-execution",

@@ -77,32 +77,127 @@ public class OpenClawRoutedProjection {
     }
 }
 
+public class OpenClawCommandDispatchRequest {
+    public let name: String
+    public let inputJson: String
+    public let scope: OpenClawCapabilityScope
+
+    public init(name: String, inputJson!: String = "{}", scope!: OpenClawCapabilityScope = OpenClawCapabilityScope("", "", "", "")) {
+        this.name = name.trimAscii()
+        this.inputJson = inputJson
+        this.scope = scope
+    }
+}
+
+public class OpenClawCommandDispatchResult {
+    public let ok: Bool
+    public let status: String
+    public let payloadJson: String
+    public let evidenceJson: String
+
+    public init(ok: Bool, status!: String = "ok", payloadJson!: String = "{}", evidenceJson!: String = "{}") {
+        this.ok = ok
+        this.status = status.trimAscii()
+        this.payloadJson = payloadJson
+        this.evidenceJson = evidenceJson
+    }
+}
+
+public class OpenClawCommandCatalogEntry {
+    public let projection: OpenClawCommandProjection
+    private let dispatcher: (OpenClawCommandDispatchRequest) -> OpenClawCommandDispatchResult
+
+    public init(projection: OpenClawCommandProjection, dispatcher: (OpenClawCommandDispatchRequest) -> OpenClawCommandDispatchResult) {
+        this.projection = projection
+        this.dispatcher = dispatcher
+    }
+
+    public func matches(raw: String): Bool {
+        let normalized = raw.trimAscii()
+        if (this.projection.name == normalized) {
+            return true
+        }
+        for (alias in this.projection.aliases) {
+            if (alias.trimAscii() == normalized) {
+                return true
+            }
+        }
+        false
+    }
+
+    public func dispatch(request: OpenClawCommandDispatchRequest): OpenClawCommandDispatchResult {
+        this.dispatcher(request)
+    }
+}
+
 public class OpenClawCommandCatalog {
-    private let entries = ArrayList<OpenClawCommandProjection>()
+    private let entries = ArrayList<OpenClawCommandCatalogEntry>()
+    private let cliEntries = ArrayList<OpenClawCommandCatalogEntry>()
 
     public init() {}
 
     public func register(command: OpenClawCommandProjection): Unit {
-        this.entries.add(command)
+        this.register(command, { request: OpenClawCommandDispatchRequest =>
+            OpenClawCommandDispatchResult(
+                false,
+                status: "not_supported",
+                evidenceJson: "{\"kind\":\"command\",\"command\":\"${request.name}\",\"status\":\"not_supported\",\"reason\":\"dispatcher_not_configured\"}"
+            )
+        })
+    }
+
+    public func register(command: OpenClawCommandProjection, dispatcher: (OpenClawCommandDispatchRequest) -> OpenClawCommandDispatchResult): Unit {
+        this.entries.add(OpenClawCommandCatalogEntry(command, dispatcher))
+    }
+
+    public func registerCli(command: OpenClawCommandProjection, dispatcher: (OpenClawCommandDispatchRequest) -> OpenClawCommandDispatchResult): Unit {
+        this.cliEntries.add(OpenClawCommandCatalogEntry(command, dispatcher))
     }
 
     public func list(): Array<OpenClawCommandProjection> {
-        this.entries.toArray()
+        let out = ArrayList<OpenClawCommandProjection>()
+        for (entry in this.entries) {
+            out.add(entry.projection)
+        }
+        out.toArray()
+    }
+
+    public func listCli(): Array<OpenClawCommandProjection> {
+        let out = ArrayList<OpenClawCommandProjection>()
+        for (entry in this.cliEntries) {
+            out.add(entry.projection)
+        }
+        out.toArray()
     }
 
     public func contains(raw: String): Bool {
-        let normalized = raw.trimAscii()
         for (entry in this.entries) {
-            if (entry.name == normalized) {
+            if (entry.matches(raw)) {
                 return true
-            }
-            for (alias in entry.aliases) {
-                if (alias.trimAscii() == normalized) {
-                    return true
-                }
             }
         }
         false
+    }
+
+    public func dispatch(request: OpenClawCommandDispatchRequest): OpenClawCommandDispatchResult {
+        this.dispatchFrom(this.entries, request, "command")
+    }
+
+    public func dispatchCli(request: OpenClawCommandDispatchRequest): OpenClawCommandDispatchResult {
+        this.dispatchFrom(this.cliEntries, request, "cli")
+    }
+
+    private func dispatchFrom(entries: ArrayList<OpenClawCommandCatalogEntry>, request: OpenClawCommandDispatchRequest, kind: String): OpenClawCommandDispatchResult {
+        for (entry in entries) {
+            if (entry.matches(request.name)) {
+                return entry.dispatch(request)
+            }
+        }
+        OpenClawCommandDispatchResult(
+            false,
+            status: "not_supported",
+            evidenceJson: "{\"kind\":\"${kind}\",\"command\":\"${request.name}\",\"status\":\"not_supported\",\"reason\":\"command_not_registered\"}"
+        )
     }
 }
 
@@ -120,11 +215,15 @@ public class OpenClawLifecycleHookEvent {
 
 public class OpenClawLifecycleHookResult {
     public let ok: Bool
+    public let status: String
     public let payloadJson: String
+    public let evidenceJson: String
 
-    public init(ok: Bool, payloadJson!: String = "{}") {
+    public init(ok: Bool, status!: String = "ok", payloadJson!: String = "{}", evidenceJson!: String = "{}") {
         this.ok = ok
+        this.status = status.trimAscii()
         this.payloadJson = payloadJson
+        this.evidenceJson = evidenceJson
     }
 }
 
@@ -159,6 +258,19 @@ public class OpenClawLifecycleHookRegistry {
             }
         }
         out.toArray()
+    }
+
+    public func dispatchOne(event: OpenClawLifecycleHookEvent): OpenClawLifecycleHookResult {
+        for (entry in this.entries) {
+            if (entry.projection.canDispatch(event.stage, event.scope)) {
+                return entry.dispatch(event)
+            }
+        }
+        OpenClawLifecycleHookResult(
+            false,
+            status: "not_supported",
+            evidenceJson: "{\"kind\":\"hook\",\"stage\":\"${event.stage}\",\"status\":\"not_supported\",\"reason\":\"hook_not_registered\"}"
+        )
     }
 }
 

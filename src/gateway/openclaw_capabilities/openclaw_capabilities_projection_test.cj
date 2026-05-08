@@ -77,9 +77,34 @@ public class OpenClawCapabilitiesProjectionTest {
     }
 
     @TestCase
+    public func toolRegistryReturnsStructuredNotSupportedEvidenceForDeniedOrMissingTools(): Unit {
+        let restrictedTool = OpenClawToolRegistration(
+            "firecrawl_search",
+            "{\"type\":\"object\",\"required\":[\"query\"]}",
+            requiredPermissions: ["network:https://api.firecrawl.dev"],
+            timeoutMs: 8000
+        )
+        let registry = OpenClawMetisToolRegistry()
+
+        registry.register(OpenClawToolBridge.project(restrictedTool, OpenClawSandboxGrantSet([])), { _: OpenClawToolDispatchRequest =>
+            OpenClawToolDispatchResult(true, content: "should not run")
+        })
+
+        let denied = registry.dispatch(OpenClawToolDispatchRequest("firecrawl_search", inputJson: "{\"query\":\"metis\"}"))
+        let missing = registry.dispatch(OpenClawToolDispatchRequest("missing_tool"))
+
+        @Expect(denied.ok, false)
+        @Expect(denied.status, "not_supported")
+        @Expect(denied.evidenceJson.contains("network:https://api.firecrawl.dev"), true)
+        @Expect(missing.status, "not_supported")
+        @Expect(missing.evidenceJson.contains("\"tool\":\"missing_tool\""), true)
+    }
+
+    @TestCase
     public func commandHookApprovalAndInteractiveProjectionAreChannelNeutralAndScoped(): Unit {
         let scope = OpenClawCapabilityScope("generic", "acct-1", "room-7", "thread-3")
         let command = OpenClawCommandProjection("doctor", summary: "Inspect runtime health", aliases: ["health"], requiredPermissions: ["gateway:read"])
+        let cli = OpenClawCommandProjection("metis approvals status", summary: "Show approval queue", aliases: ["approvals"], requiredPermissions: ["gateway:read"])
         let hook = OpenClawHookProjection("message_media_lifecycle", ["message", "media", "sent-result", "reasoning", "tool-progress"], channelSpecific: false)
         let approval = OpenClawRoutedProjection("tool-execution", scope)
         let interactive = OpenClawRoutedProjection("confirm-button", scope)
@@ -87,7 +112,12 @@ public class OpenClawCapabilitiesProjectionTest {
         let hookRegistry = OpenClawLifecycleHookRegistry()
         let scopedRegistry = OpenClawScopedDispatchRegistry()
 
-        catalog.register(command)
+        catalog.register(command, { request: OpenClawCommandDispatchRequest =>
+            OpenClawCommandDispatchResult(true, status: "dispatched", payloadJson: "{\"command\":\"${request.name}\",\"input\":${request.inputJson}}")
+        })
+        catalog.registerCli(cli, { request: OpenClawCommandDispatchRequest =>
+            OpenClawCommandDispatchResult(true, status: "dispatched", payloadJson: "{\"cli\":\"${request.name}\"}")
+        })
         hookRegistry.register(hook, { event: OpenClawLifecycleHookEvent =>
             OpenClawLifecycleHookResult(true, payloadJson: "{\"stage\":\"${event.stage}\",\"payload\":${event.payloadJson}}")
         })
@@ -99,6 +129,10 @@ public class OpenClawCapabilitiesProjectionTest {
         })
 
         let hookResults = hookRegistry.dispatch(OpenClawLifecycleHookEvent("tool-progress", "{\"percent\":50}", scope))
+        let missingHookResult = hookRegistry.dispatchOne(OpenClawLifecycleHookEvent("unregistered-stage", "{}", scope))
+        let commandResult = catalog.dispatch(OpenClawCommandDispatchRequest("health", inputJson: "{\"verbose\":true}", scope: scope))
+        let cliResult = catalog.dispatchCli(OpenClawCommandDispatchRequest("approvals", scope: scope))
+        let missingCommandResult = catalog.dispatch(OpenClawCommandDispatchRequest("missing", scope: scope))
         let approvalResult = scopedRegistry.dispatchApproval(OpenClawScopedDispatchRequest("tool-execution", scope, payloadJson: "{\"decision\":\"allow\"}"))
         let interactiveResult = scopedRegistry.dispatchInteractive(OpenClawScopedDispatchRequest("confirm-button", scope, payloadJson: "{\"data\":\"ok\"}"))
 
@@ -107,10 +141,17 @@ public class OpenClawCapabilitiesProjectionTest {
         @Expect(command.requiredPermissions[0], "gateway:read")
         @Expect(catalog.contains("health"), true)
         @Expect(catalog.list()[0].summary, "Inspect runtime health")
+        @Expect(catalog.listCli()[0].name, "metis approvals status")
+        @Expect(commandResult.status, "dispatched")
+        @Expect(cliResult.payloadJson.contains("approvals"), true)
+        @Expect(missingCommandResult.status, "not_supported")
+        @Expect(missingCommandResult.evidenceJson.contains("\"kind\":\"command\""), true)
         @Expect(hook.canDispatch("media", scope), true)
         @Expect(hook.channelSpecific, false)
         @Expect(hookResults.size, 1)
         @Expect(hookResults[0].payloadJson.contains("tool-progress"), true)
+        @Expect(missingHookResult.status, "not_supported")
+        @Expect(missingHookResult.evidenceJson.contains("unregistered-stage"), true)
         @Expect(approval.routeKey(), "generic/acct-1/room-7/thread-3/tool-execution")
         @Expect(interactive.routeKey(), "generic/acct-1/room-7/thread-3/confirm-button")
         @Expect(approvalResult.status, "approved")

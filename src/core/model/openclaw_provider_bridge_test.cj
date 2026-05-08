@@ -68,4 +68,30 @@ public class OpenClawProviderBridgeTest {
         @Expect(toolCall.method, "openclaw.provider.toolCall")
         @Expect(toolCall.name, "search")
     }
+
+    @TestCase
+    public func providerBridgeReturnsStructuredNotSupportedAndNotConfiguredEvidence(): Unit {
+        let registry = OpenClawProviderBridgeRegistry()
+        registry.registerProvider(OpenClawProviderRegistration(
+            "local-embed",
+            authKind: "none",
+            configKeys: [],
+            models: ["embed-small"],
+            supportsStreaming: false,
+            supportsToolCalls: false,
+            supportsModelList: true
+        ))
+
+        let unsupportedStream = registry.stream("local-embed", "embed-small", "hello")
+        let unsupportedToolCall = registry.toolCall("local-embed", "search", "{\"query\":\"metis\"}")
+        let missingProvider = registry.stream("missing-provider", "model", "hello")
+
+        @Expect(unsupportedStream.ok, false)
+        @Expect(unsupportedStream.status, "not_supported")
+        @Expect(unsupportedStream.evidenceJson.contains("\"capability\":\"stream\""), true)
+        @Expect(unsupportedToolCall.status, "not_supported")
+        @Expect(unsupportedToolCall.evidenceJson.contains("\"capability\":\"toolCall\""), true)
+        @Expect(missingProvider.status, "not_configured")
+        @Expect(missingProvider.evidenceJson.contains("missing-provider"), true)
+    }
 }

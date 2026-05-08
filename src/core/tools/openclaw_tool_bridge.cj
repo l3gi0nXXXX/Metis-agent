@@ -98,15 +98,19 @@ public class OpenClawToolDispatchRequest {
 
 public class OpenClawToolDispatchResult {
     public let ok: Bool
+    public let status: String
     public let content: String
     public let error: String
     public let rawJson: String
+    public let evidenceJson: String
 
-    public init(ok: Bool, content!: String = "", error!: String = "", rawJson!: String = "") {
+    public init(ok: Bool, status!: String = "ok", content!: String = "", error!: String = "", rawJson!: String = "", evidenceJson!: String = "{}") {
         this.ok = ok
+        this.status = status.trimAscii()
         this.content = content
         this.error = error
         this.rawJson = rawJson
+        this.evidenceJson = evidenceJson
     }
 }
 
@@ -145,11 +149,19 @@ public class OpenClawMetisToolRegistry {
         for (entry in this.entries) {
             if (entry.projection.name == request.name.trimAscii()) {
                 if (!entry.projection.allowed) {
-                    return OpenClawToolDispatchResult(false, error: "permission_denied", rawJson: "{\"ok\":false,\"error\":\"permission_denied\"}")
+                    let missing = String.join(entry.projection.missingPermissions, delimiter: "\",\"")
+                    let evidence = "{\"kind\":\"tool\",\"tool\":\"${request.name}\",\"status\":\"not_supported\",\"missingPermissions\":[\"${missing}\"]}"
+                    return OpenClawToolDispatchResult(false, status: "not_supported", error: "not_supported", rawJson: "{\"ok\":false,\"status\":\"not_supported\"}", evidenceJson: evidence)
                 }
                 return entry.dispatch(request)
             }
         }
-        OpenClawToolDispatchResult(false, error: "tool_not_found", rawJson: "{\"ok\":false,\"error\":\"tool_not_found\"}")
+        OpenClawToolDispatchResult(
+            false,
+            status: "not_supported",
+            error: "not_supported",
+            rawJson: "{\"ok\":false,\"status\":\"not_supported\"}",
+            evidenceJson: "{\"kind\":\"tool\",\"tool\":\"${request.name}\",\"status\":\"not_supported\",\"reason\":\"tool_not_registered\"}"
+        )
     }
 }

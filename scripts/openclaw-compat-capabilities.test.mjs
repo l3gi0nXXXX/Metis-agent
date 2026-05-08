@@ -28,6 +28,8 @@ test("normalizes every OpenClaw capability group into Metis capability records",
     "hook",
     "command",
     "cli",
+    "gatewayMethod",
+    "service",
     "approval",
     "interactive",
     "memory",
@@ -170,4 +172,38 @@ test("normalizes host-captured approval and interactive handler collections", ()
   assert.equal(report.groups.interactive.status, "aligned");
   assert.equal(report.groups.interactive.records[0].id, "interactive-generic");
   assert.equal(report.releaseGate.zeroCostCompatible, true);
+});
+
+test("normalizes gateway method and service capabilities with explicit support evidence", () => {
+  const report = normalizeCapabilityRegistry({
+    source: "openclaw-host-capture",
+    capabilities: {
+      gatewayMethods: [
+        {
+          method: "gateway.plugins.reload",
+          metisStatus: "not-applicable",
+          reason: "Metis owns gateway reload outside plugin compatibility runtime",
+          acceptanceTests: ["gateway.plugins.reload emits not-applicable compatibility evidence"],
+        },
+      ],
+      services: [
+        {
+          id: "background-indexer",
+          metisStatus: "missing",
+          gap: "No Metis service runtime projection exists for this OpenClaw service.",
+          implementationTask: "Map to a Gateway-managed service or emit not_supported with evidence.",
+          acceptanceTests: ["service capability fixture is not silently dropped"],
+        },
+      ],
+    },
+  });
+
+  assert.equal(report.groups.gatewayMethod.status, "not-applicable");
+  assert.equal(report.groups.gatewayMethod.records[0].id, "gateway.plugins.reload");
+  assert.equal(report.groups.service.status, "missing");
+  assert.equal(report.releaseGate.zeroCostCompatible, false);
+  assert.deepEqual(
+    report.releaseGate.blockingRecords.map((record) => `${record.group}:${record.id}:${record.status}`),
+    ["service:background-indexer:missing"],
+  );
 });
