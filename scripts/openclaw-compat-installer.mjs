@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
 
 import { enforceOpenClawInstallSource } from "./openclaw-compat-security-policy.mjs";
 
@@ -165,6 +166,65 @@ function hasUnlinkedDependencies(pkg, workspaceLinks) {
   return false;
 }
 
+function lifecycleScripts(pkg) {
+  const scripts = isObject(pkg.scripts) ? pkg.scripts : {};
+  return Object.keys(scripts).filter((name) =>
+    ["preinstall", "install", "postinstall", "prepack", "prepare", "build"].includes(name),
+  );
+}
+
+function truncateText(value, maxLength = 12000) {
+  const text = String(value ?? "");
+  return text.length > maxLength ? `${text.slice(0, maxLength)}...[truncated]` : text;
+}
+
+function executeInstall(plan, options = {}) {
+  if (!plan.requiresInstall) {
+    return {
+      status: "skipped",
+      reason: "no_unlinked_dependencies",
+      command: plan.installCommand,
+      cwd: plan.stagedPluginRoot,
+      lifecycleScriptsAllowed: false,
+      lifecycleScripts: plan.lifecycleScripts,
+    };
+  }
+  if (options.skipInstall === true || options.install === false) {
+    return {
+      status: "blocked",
+      reason: "install_disabled",
+      command: plan.installCommand,
+      cwd: plan.stagedPluginRoot,
+      lifecycleScriptsAllowed: false,
+      lifecycleScripts: plan.lifecycleScripts,
+    };
+  }
+
+  const [command, ...args] = plan.installCommand;
+  const child = spawnSync(command, args, {
+    cwd: plan.stagedPluginRoot,
+    encoding: "utf8",
+    timeout: Number(options.installTimeoutMs ?? 120000),
+    env: {
+      ...process.env,
+      npm_config_audit: "false",
+      npm_config_fund: "false",
+    },
+  });
+  return {
+    status: child.status === 0 ? "passed" : "failed",
+    command: plan.installCommand,
+    cwd: plan.stagedPluginRoot,
+    exitCode: child.status,
+    signal: child.signal,
+    error: child.error?.message ?? "",
+    stdout: truncateText(child.stdout),
+    stderr: truncateText(child.stderr),
+    lifecycleScriptsAllowed: false,
+    lifecycleScripts: plan.lifecycleScripts,
+  };
+}
+
 function copyPluginPackage(root, target) {
   fs.rmSync(target, { recursive: true, force: true });
   fs.cpSync(root, target, {
@@ -221,6 +281,7 @@ export function createInstallPlan(pluginRoot, options = {}) {
     requiresInstall: hasUnlinkedDependencies(pkg, workspaceLinks),
     packageManager,
     installCommand,
+    lifecycleScripts: lifecycleScripts(pkg),
     workspaceRoot,
     workspaceLinks,
     security,
@@ -236,15 +297,17 @@ export function preparePluginStage(pluginRoot, options = {}) {
   }
   const stageRoot = plan.stageRoot;
   const nodeModules = path.join(stageRoot, "node_modules");
-  fs.mkdirSync(nodeModules, { recursive: true });
+  fs.rmSync(stageRoot, { recursive: true, force: true });
   copyPluginPackage(plan.pluginRoot, plan.stagedPluginRoot);
+  fs.mkdirSync(nodeModules, { recursive: true });
+  const install = executeInstall(plan, options);
   for (const link of plan.workspaceLinks) {
     const target = linkPath(nodeModules, link.name);
     fs.mkdirSync(path.dirname(target), { recursive: true });
     fs.rmSync(target, { recursive: true, force: true });
     fs.symlinkSync(link.target, target, "dir");
   }
-  return { ...plan, stageRoot };
+  return { ...plan, stageRoot, install };
 }
 
 export default { createInstallPlan, preparePluginStage };

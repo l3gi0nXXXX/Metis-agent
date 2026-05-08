@@ -1,0 +1,13 @@
+{
+  "name": "installable-plugin",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "postinstall": "node scripts/lifecycle-marker.mjs",
+    "build": "node scripts/lifecycle-marker.mjs"
+  },
+  "dependencies": {
+    "fixture-local-dep": "file:./deps/fixture-local-dep"
+  }
+}

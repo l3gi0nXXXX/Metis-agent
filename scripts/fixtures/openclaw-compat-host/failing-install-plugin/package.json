@@ -1,0 +1,9 @@
+{
+  "name": "failing-install-plugin",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "dependencies": {
+    "missing-fixture-dep": "file:./missing-fixture-dep.tgz"
+  }
+}

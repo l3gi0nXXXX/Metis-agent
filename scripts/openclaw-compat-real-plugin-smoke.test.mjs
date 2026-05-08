@@ -13,6 +13,8 @@ const hostScript = path.join(__dirname, "openclaw-compat-host.mjs");
 const smokeScript = path.join(__dirname, "openclaw-compat-real-plugin-smoke.mjs");
 const fixtureRoot = path.join(__dirname, "fixtures", "openclaw-compat-host");
 const realPluginRoot = path.join(fixtureRoot, "real-plugin-smoke");
+const installablePluginRoot = path.join(fixtureRoot, "installable-plugin");
+const failingInstallPluginRoot = path.join(fixtureRoot, "failing-install-plugin");
 const workspacePluginRoot = path.join(fixtureRoot, "workspace-root", "packages", "plugin");
 const tsEntryOnlyRoot = path.join(fixtureRoot, "ts-entry-only");
 const sdkRequiredRoot = path.join(fixtureRoot, "sdk-required");
@@ -171,6 +173,99 @@ test("real smoke runner stages raw package, loads register(api), and maps matrix
     const mapped = JSON.parse(fs.readFileSync(matrixOut, "utf8"));
     assert.equal(mapped.plugins[0].real_plugin_smoke_status, "passed");
     assert.equal(mapped.plugins[0].real_plugin_smoke_diagnostic.pluginId, "real-fixture");
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("real smoke runner performs isolated install, ignores lifecycle scripts, and writes smoke artifact", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "metis-openclaw-smoke-"));
+  try {
+    const matrixIn = path.join(tmp, "matrix-in.json");
+    const matrixOut = path.join(tmp, "matrix-out.json");
+    const artifactRoot = path.join(tmp, "artifacts");
+    fs.writeFileSync(
+      matrixIn,
+      JSON.stringify({
+        plugins: [
+          {
+            plugin_id: "installable-fixture",
+            source_root: installablePluginRoot,
+            real_plugin_smoke_status: "not-run",
+          },
+        ],
+      }),
+      "utf8",
+    );
+
+    const result = runSmoke([
+      "--plugin",
+      `installable-fixture:${installablePluginRoot}`,
+      "--stage-root",
+      tmp,
+      "--artifact-root",
+      artifactRoot,
+      "--matrix-in",
+      matrixIn,
+      "--matrix-out",
+      matrixOut,
+    ]);
+
+    const smoke = result.results[0];
+    assert.equal(result.status, "DONE");
+    assert.equal(smoke.real_plugin_smoke_status, "passed");
+    assert.equal(smoke.loader, "dist");
+    assert.equal(smoke.install.status, "passed");
+    assert.deepEqual(smoke.install.command.slice(0, 2), ["npm", "install"]);
+    assert.equal(smoke.install.command.includes("--ignore-scripts"), true);
+    assert.equal(fs.existsSync(path.join(smoke.stagedPluginRoot, "node_modules", "fixture-local-dep")), true);
+    assert.equal(fs.existsSync(path.join(installablePluginRoot, "node_modules")), false);
+    assert.equal(fs.existsSync(path.join(installablePluginRoot, "lifecycle-ran.txt")), false);
+    assert.equal(fs.existsSync(path.join(smoke.stagedPluginRoot, "lifecycle-ran.txt")), false);
+    assert.equal(fs.existsSync(smoke.artifact), true);
+
+    const artifact = JSON.parse(fs.readFileSync(smoke.artifact, "utf8"));
+    assert.equal(artifact.pluginId, "installable-fixture");
+    assert.equal(artifact.sourceRoot, installablePluginRoot);
+    assert.equal(artifact.real_plugin_smoke_status, "passed");
+    assert.equal(artifact.install.status, "passed");
+    assert.equal(artifact.sourceWriteCheck.sourceNodeModulesCreated, false);
+    assert.equal(artifact.sourceWriteCheck.sourceLifecycleMarkerCreated, false);
+
+    const mapped = JSON.parse(fs.readFileSync(matrixOut, "utf8"));
+    assert.equal(mapped.plugins[0].real_plugin_smoke_status, "passed");
+    assert.equal(mapped.plugins[0].real_plugin_smoke_artifact, smoke.artifact);
+    assert.equal(mapped.plugins[0].real_plugin_smoke_diagnostic.install.status, "passed");
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("real smoke runner records failed install artifact without reporting fake pass", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "metis-openclaw-smoke-"));
+  try {
+    const artifactRoot = path.join(tmp, "artifacts");
+    const result = runSmoke([
+      "--plugin",
+      `failing-install:${failingInstallPluginRoot}`,
+      "--stage-root",
+      tmp,
+      "--artifact-root",
+      artifactRoot,
+    ]);
+
+    const smoke = result.results[0];
+    assert.equal(result.status, "BLOCKED");
+    assert.equal(smoke.real_plugin_smoke_status, "failed");
+    assert.equal(smoke.install.status, "failed");
+    assert.equal(smoke.loadedPluginCount, 0);
+    assert.equal(smoke.blockers.some((blocker) => blocker.code === "install_failed"), true);
+    assert.equal(fs.existsSync(smoke.artifact), true);
+
+    const artifact = JSON.parse(fs.readFileSync(smoke.artifact, "utf8"));
+    assert.equal(artifact.real_plugin_smoke_status, "failed");
+    assert.equal(artifact.install.status, "failed");
+    assert.equal(artifact.blockers.some((blocker) => blocker.code === "install_failed"), true);
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
