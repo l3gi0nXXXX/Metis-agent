@@ -44,4 +44,3 @@ public func openClawChannelAdapterForAccount(
 ): OpenClawChannelAdapterBridge {
     OpenClawChannelAdapterBridge(capability.channelId, accountId, capability.runner)
 }
-

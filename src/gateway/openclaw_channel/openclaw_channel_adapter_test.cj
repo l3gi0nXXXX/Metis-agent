@@ -121,4 +121,3 @@ public class OpenClawChannelAdapterTest {
         @Expect(runner.payloads[0].get("configPath").isNone(), true)
     }
 }
-

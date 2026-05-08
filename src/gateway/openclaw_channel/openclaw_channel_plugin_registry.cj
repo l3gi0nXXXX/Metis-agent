@@ -37,4 +37,3 @@ private class OpenClawGatewayChannelPlugin <: GatewayChannelPlugin {
 public func registerOpenClawChannelPlugin(capability: OpenClawChannelCapability): Unit {
     GatewayChannelPluginRegistry.register(OpenClawGatewayChannelPlugin(capability))
 }
-

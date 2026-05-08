@@ -119,4 +119,3 @@ public class OpenClawHttpDispatcherTest {
         @Expect(handler.diagnosticKind, "handler_error")
     }
 }
-
