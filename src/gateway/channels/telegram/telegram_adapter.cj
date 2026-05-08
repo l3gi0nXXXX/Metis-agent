@@ -1,6 +1,6 @@
 package metis.gateway.channels.telegram
 
-import metis.core.{GatewayMediaGroupItem, gatewayMediaTranscribeAudioPathForRuntime, parseGatewayAudioParts, parseGatewayChatAction, parseGatewayDocumentParts, parseGatewayEditButtonsParts, parseGatewayEditMediaParts, parseGatewayEditText, parseGatewayInlineKeyboardParts, parseGatewayMediaGroupItems, parseGatewayPhotoParts, parseGatewayPinAction, parseGatewayReactionRemove, parseGatewayReactionStatus, parseGatewayReactionToken, parseGatewayStickerFileId, parseGatewayTopicCreateText, parseGatewayTopicEditText, parseGatewayVideoNoteFileId, parseGatewayVideoParts, parseGatewayVoiceParts}
+import metis.core.{GatewayMediaGroupItem, gatewayMediaTranscribeAudioPathForRuntime, gatewayMediaUnderstandingFirstText, gatewayMediaUnderstandingForRecord, parseGatewayAudioParts, parseGatewayChatAction, parseGatewayDocumentParts, parseGatewayEditButtonsParts, parseGatewayEditMediaParts, parseGatewayEditText, parseGatewayInlineKeyboardParts, parseGatewayMediaGroupItems, parseGatewayPhotoParts, parseGatewayPinAction, parseGatewayReactionRemove, parseGatewayReactionStatus, parseGatewayReactionToken, parseGatewayStickerFileId, parseGatewayTopicCreateText, parseGatewayTopicEditText, parseGatewayVideoNoteFileId, parseGatewayVideoParts, parseGatewayVoiceParts}
 import metis.gateway.core.{ChannelAdapter, gatewayOpenClawPluginSidecarApplyCurrentMessageReceivedHook, gatewayOpenClawPluginSidecarCommandCatalogForMenu, gatewayTelegramNativeCommandMenuRows}
 import metis.gateway.model.*
 import metis.io.PrintUtils
@@ -2407,6 +2407,18 @@ public class TelegramAdapter <: ChannelAdapter {
         if (!transcript.isEmpty()) {
             lines.add("transcript=${transcript}")
         }
+        let analysis = this.readStringField(lastMedia, "analysis").trimAscii()
+        if (!analysis.isEmpty()) {
+            lines.add("analysis=${analysis}")
+        }
+        let preview = this.readStringField(lastMedia, "documentTextPreview").trimAscii()
+        if (!preview.isEmpty()) {
+            lines.add("preview=${preview}")
+        }
+        let understandingStatus = this.readStringField(lastMedia, "understandingStatus").trimAscii()
+        if (!understandingStatus.isEmpty()) {
+            lines.add("understandingStatus=${understandingStatus}")
+        }
         lines.add("safetyStatus=${safetyStatus}")
         lines.add("eligibleFor=${eligibility}")
         lines.add("modelHandling=${this.telegramMediaModelHandling(eligibility, downloaded)}")
@@ -3888,9 +3900,8 @@ public class TelegramAdapter <: ChannelAdapter {
         if (!transcript.isEmpty()) {
             lastMedia.put("transcript", JsonString(transcript))
             lastMedia.put("asrStatus", JsonString("transcribed"))
-        } else if (normalizedKind == "voice" || normalizedKind == "audio") {
-            lastMedia.put("asrStatus", JsonString(if (downloaded) { "ready" } else { "metadata-only" }))
         }
+        this.applyTelegramMediaUnderstandingPreflight(lastMedia, normalizedKind)
         lastMedia.put("createdAtMs", createdAtMs.toJsonValue())
         lastMedia.put("persistedAtMs", createdAtMs.toJsonValue())
         let root = this.readMediaState()
@@ -3908,6 +3919,154 @@ public class TelegramAdapter <: ChannelAdapter {
         root.put("records", records)
         File.writeTo(this.mediaStatePath(), root.toJsonString().toArray())
         root
+    }
+
+    private func applyTelegramMediaUnderstandingPreflight(record: JsonObject, kind: String): Unit {
+        let normalizedKind = kind.trimAscii().toAsciiLower()
+        let capability = if (normalizedKind == "voice" || normalizedKind == "audio") {
+            "audio"
+        } else if (normalizedKind == "photo") {
+            "image"
+        } else if (normalizedKind == "sticker") {
+            "sticker"
+        } else if (normalizedKind == "document") {
+            "document"
+        } else {
+            ""
+        }
+        if (capability.isEmpty()) {
+            return
+        }
+        let downloaded = this.readBoolFieldOpt(record, "downloaded") == Some(true)
+        let understanding = gatewayMediaUnderstandingForRecord(record, capability: capability, maxBytes: this.effectiveMediaMaxBytes())
+        let status = this.readStringField(understanding, "status").trimAscii()
+        if (!status.isEmpty()) {
+            record.put("understandingStatus", JsonString(status))
+        }
+        record.put("understandingCapability", JsonString(capability))
+        match (understanding.get("outputs")) {
+            case Some(v) => record.put("understandingOutputs", v)
+            case None => ()
+        }
+        match (understanding.get("decision")) {
+            case Some(v) => record.put("understandingDecision", v)
+            case None => ()
+        }
+        let text = gatewayMediaUnderstandingFirstText(understanding).trimAscii()
+        if (capability == "audio") {
+            if (!text.isEmpty()) {
+                record.put("transcript", JsonString(text))
+                record.put("asrStatus", JsonString("transcribed"))
+            } else if (status == "not_configured") {
+                record.put("asrStatus", JsonString("not_configured"))
+            } else if (!downloaded) {
+                record.put("asrStatus", JsonString("metadata-only"))
+            } else if (!status.isEmpty()) {
+                record.put("asrStatus", JsonString(status))
+            }
+            return
+        }
+        if (capability == "image" || capability == "sticker") {
+            if (!text.isEmpty()) {
+                record.put("analysis", JsonString(text))
+                record.put("description", JsonString(text))
+                record.put("visionStatus", JsonString("analyzed"))
+                if (capability == "sticker") {
+                    this.upsertTelegramStickerDescriptionCache(record, text)
+                }
+            } else if (status == "not_configured") {
+                record.put("visionStatus", JsonString("not_configured"))
+            } else if (!downloaded) {
+                record.put("visionStatus", JsonString("metadata-only"))
+            } else if (!status.isEmpty()) {
+                record.put("visionStatus", JsonString(status))
+            }
+            return
+        }
+        if (capability == "document") {
+            if (!text.isEmpty()) {
+                record.put("preview", JsonString(text))
+                record.put("documentPreview", JsonString(text))
+                record.put("documentTextPreview", JsonString(text))
+                record.put("documentExtractStatus", JsonString("ok"))
+            } else if (!status.isEmpty()) {
+                record.put("documentExtractStatus", JsonString(status))
+            } else {
+                record.put("documentExtractStatus", JsonString("metadata_only"))
+            }
+        }
+    }
+
+    private func telegramStickerDescriptionCachePath(): Path {
+        this.stateRoot.join("gateway-telegram").join("sticker-cache.json")
+    }
+
+    private func telegramStickerDescriptionCacheLoad(): JsonArray {
+        let path = this.telegramStickerDescriptionCachePath()
+        if (!exists(path)) {
+            return JsonArray([])
+        }
+        try {
+            JsonValue.fromStr(String.fromUtf8(File.readFrom(path))).asArray()
+        } catch (_e: Exception) {
+            JsonArray([])
+        }
+    }
+
+    private func telegramStickerDescriptionCacheKey(record: JsonObject): String {
+        let uniqueId = this.readStringField(record, "fileUniqueId").trimAscii()
+        if (!uniqueId.isEmpty()) {
+            return "unique:${uniqueId}"
+        }
+        let fileId = this.readStringField(record, "fileId").trimAscii()
+        if (!fileId.isEmpty()) {
+            return "file:${fileId}"
+        }
+        this.readStringField(record, "mediaId").trimAscii()
+    }
+
+    private func upsertTelegramStickerDescriptionCache(record: JsonObject, description: String): Unit {
+        let text = description.trimAscii()
+        let key = this.telegramStickerDescriptionCacheKey(record)
+        if (key.isEmpty() || text.isEmpty()) {
+            return
+        }
+        let existing = this.telegramStickerDescriptionCacheLoad()
+        let merged = JsonArray([])
+        var updated = false
+        for (item in existing.getItems()) {
+            let obj = try { item.asObject() } catch (_e: Exception) { JsonObject() }
+            if (this.telegramStickerDescriptionCacheKey(obj) == key) {
+                obj.put("analysis", JsonString(text))
+                obj.put("description", JsonString(text))
+                obj.put("cachedAtMs", DateTime.now().toUnixTimeStamp().toMilliseconds().toJsonValue())
+                updated = true
+            }
+            merged.add(obj)
+        }
+        if (!updated) {
+            let cached = JsonObject()
+            for (field in ["mediaId", "fileId", "fileUniqueId", "mediaKind", "mimeType", "fileName", "localPath", "downloaded", "createdAtMs"]) {
+                match (record.get(field)) {
+                    case Some(v) => cached.put(field, v)
+                    case None => ()
+                }
+            }
+            cached.put("mediaKind", JsonString("sticker"))
+            cached.put("emoji", JsonString(this.readStringField(record, "stickerEmoji").trimAscii()))
+            cached.put("setName", JsonString(this.readStringField(record, "stickerSetName").trimAscii()))
+            cached.put("stickerEmoji", JsonString(this.readStringField(record, "stickerEmoji").trimAscii()))
+            cached.put("stickerSetName", JsonString(this.readStringField(record, "stickerSetName").trimAscii()))
+            cached.put("analysis", JsonString(text))
+            cached.put("description", JsonString(text))
+            cached.put("cachedAtMs", DateTime.now().toUnixTimeStamp().toMilliseconds().toJsonValue())
+            merged.add(cached)
+        }
+        let root = this.stateRoot.join("gateway-telegram")
+        if (!exists(root)) {
+            Directory.create(root, recursive: true)
+        }
+        File.writeTo(this.telegramStickerDescriptionCachePath(), merged.toJsonString().toArray())
     }
 
     private func readMediaRecords(root: JsonObject): JsonArray {

@@ -469,6 +469,14 @@ private func telegramStickerCachePersistCurrentRecords(): JsonArray {
                 case None => ()
             }
         }
+        if (telegramMediaToolString(cached, "emoji").isEmpty()) {
+            let emoji = telegramMediaToolString(record, "stickerEmoji")
+            if (!emoji.isEmpty()) { cached.put("emoji", JsonString(emoji)) }
+        }
+        if (telegramMediaToolString(cached, "setName").isEmpty()) {
+            let setName = telegramMediaToolString(record, "stickerSetName")
+            if (!setName.isEmpty()) { cached.put("setName", JsonString(setName)) }
+        }
         cached.put("mediaKind", JsonString("sticker"))
         cached.put("cachedAtMs", DateTime.now().toUnixTimeStamp().toMilliseconds().toJsonValue())
         merged.add(cached)
@@ -506,6 +514,14 @@ private func telegramStickerCacheUpsertAnalysis(record: JsonObject, analysis: St
                 case Some(v) => cached.put(field, v)
                 case None => ()
             }
+        }
+        if (telegramMediaToolString(cached, "emoji").isEmpty()) {
+            let emoji = telegramMediaToolString(record, "stickerEmoji")
+            if (!emoji.isEmpty()) { cached.put("emoji", JsonString(emoji)) }
+        }
+        if (telegramMediaToolString(cached, "setName").isEmpty()) {
+            let setName = telegramMediaToolString(record, "stickerSetName")
+            if (!setName.isEmpty()) { cached.put("setName", JsonString(setName)) }
         }
         cached.put("mediaKind", JsonString("sticker"))
         cached.put("analysis", JsonString(analysis.trimAscii()))
@@ -1182,7 +1198,9 @@ public class GatewayTelegramMediaToolset {
             telegramMediaToolString(record, "fileUniqueId") + " " +
             telegramMediaToolString(record, "caption") + " " +
             telegramMediaToolString(record, "emoji") + " " +
+            telegramMediaToolString(record, "stickerEmoji") + " " +
             telegramMediaToolString(record, "setName") + " " +
+            telegramMediaToolString(record, "stickerSetName") + " " +
             telegramMediaToolString(record, "description") + " " +
             telegramMediaToolString(record, "analysis")
         ).toAsciiLower()
