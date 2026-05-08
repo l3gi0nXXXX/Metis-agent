@@ -7,7 +7,11 @@
       "entry": "dist/index.mjs",
       "registerApis": ["registerCommand"],
       "sdkSubpaths": ["@openclaw/plugin-sdk"],
-      "status": "partial"
+      "status": "partial",
+      "real_plugin_smoke_status": "passed",
+      "behavior_test_status": "passed",
+      "runtime_facets_required": ["command"],
+      "release_blockers": []
     },
     {
       "id": "wrapper-only",
@@ -17,6 +21,10 @@
       "registerApis": ["registerCommand"],
       "sdkSubpaths": ["@openclaw/plugin-sdk"],
       "status": "aligned",
+      "real_plugin_smoke_status": "passed",
+      "behavior_test_status": "passed",
+      "runtime_facets_required": ["command"],
+      "release_blockers": [],
       "requiresMetisManifest": true,
       "requiresWrapper": true,
       "sourcePatched": true
@@ -28,7 +36,11 @@
       "entry": "",
       "registerApis": [],
       "sdkSubpaths": [],
-      "status": "aligned"
+      "status": "aligned",
+      "real_plugin_smoke_status": "missing",
+      "behavior_test_status": "missing",
+      "runtime_facets_required": [],
+      "release_blockers": ["missing source evidence"]
     }
   ]
 }

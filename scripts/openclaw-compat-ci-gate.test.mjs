@@ -35,6 +35,10 @@ test("accepts object-map matrix records from generated inventory artifacts", () 
         registerApis: ["registerCommand"],
         sdkSubpaths: ["@openclaw/plugin-sdk"],
         status: "aligned",
+        real_plugin_smoke_status: "passed",
+        behavior_test_status: "passed",
+        runtime_facets_required: ["command"],
+        release_blockers: [],
       },
     },
   });
@@ -54,6 +58,10 @@ test("accepts generated Phase 0 snake_case inventory records", () => {
           register_apis: ["registerChannel"],
           sdk_subpaths: [],
           metis_status: "missing",
+          real_plugin_smoke_status: "passed",
+          behavior_test_status: "passed",
+          runtime_facets_required: ["channel"],
+          release_blockers: [],
           requires_metis_manifest: false,
           requires_wrapper: false,
           source_patched: false,
@@ -81,6 +89,10 @@ test("fails generated inventory records that require source patching or wrappers
           register_apis: [],
           sdk_subpaths: [],
           metis_status: "aligned",
+          real_plugin_smoke_status: "passed",
+          behavior_test_status: "passed",
+          runtime_facets_required: [],
+          release_blockers: [],
           requires_metis_manifest: true,
           requires_wrapper: "true",
           source_patched: true,
@@ -137,10 +149,14 @@ test("reports missing sourceRef, entry, registerApis, sdkSubpaths, and status fi
     [
       "missing_entry",
       "missing_register_apis",
+      "missing_behavior_test_status",
+      "missing_real_plugin_smoke_status",
+      "missing_release_blockers",
       "missing_sdk_subpaths",
       "missing_source_ref",
       "missing_status",
-    ],
+      "missing_runtime_facets_required",
+    ].sort(),
   );
 });
 
@@ -156,6 +172,10 @@ test("treats string compatibility escape-hatch markers as failing markers", () =
           registerApis: ["registerCommand"],
           sdkSubpaths: ["@openclaw/plugin-sdk"],
           status: "aligned",
+          real_plugin_smoke_status: "passed",
+          behavior_test_status: "passed",
+          runtime_facets_required: ["command"],
+          release_blockers: [],
           requiresWrapper: "true",
         },
       ],
@@ -164,4 +184,57 @@ test("treats string compatibility escape-hatch markers as failing markers", () =
 
   assert.equal(result.ok, false);
   assert.ok(result.errors.some((error) => error.code === "requires_wrapper" && error.recordId === "string-flags"));
+});
+
+test("fails release gate when smoke or behavior evidence is missing or not ready", () => {
+  const result = validateOpenClawCompatGate({
+    inventory: { plugins: [] },
+    matrix: {
+      matrix: [
+        {
+          id: "not-smoked",
+          pluginId: "not-smoked",
+          sourceRef: "OpenClaw/plugins/not-smoked/src/index.ts:1",
+          entry: "index.mjs",
+          registerApis: ["registerCommand"],
+          sdkSubpaths: ["@openclaw/plugin-sdk"],
+          status: "aligned",
+          real_plugin_smoke_status: "pending",
+          behavior_test_status: "missing",
+          runtime_facets_required: ["command"],
+          release_blockers: [],
+        },
+      ],
+    },
+  });
+
+  assert.equal(result.ok, false);
+  assert.ok(result.errors.some((error) => error.code === "real_plugin_smoke_not_ready" && error.recordId === "not-smoked"));
+  assert.ok(result.errors.some((error) => error.code === "behavior_test_not_ready" && error.recordId === "not-smoked"));
+});
+
+test("fails release gate when release blockers are present", () => {
+  const result = validateOpenClawCompatGate({
+    inventory: { plugins: [] },
+    matrix: {
+      matrix: [
+        {
+          id: "blocked",
+          pluginId: "blocked",
+          sourceRef: "OpenClaw/plugins/blocked/src/index.ts:1",
+          entry: "index.mjs",
+          registerApis: ["registerCommand"],
+          sdkSubpaths: ["@openclaw/plugin-sdk"],
+          status: "aligned",
+          real_plugin_smoke_status: "passed",
+          behavior_test_status: "passed",
+          runtime_facets_required: ["command"],
+          release_blockers: ["requires channel runtime"],
+        },
+      ],
+    },
+  });
+
+  assert.equal(result.ok, false);
+  assert.ok(result.errors.some((error) => error.code === "release_blocker" && error.recordId === "blocked"));
 });
