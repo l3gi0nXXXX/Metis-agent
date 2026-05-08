@@ -10,6 +10,37 @@ const TEXT_EXTENSIONS = new Set([".js", ".mjs", ".cjs", ".ts", ".tsx", ".json"])
 const SKIP_DIRS = new Set([".git", "node_modules", "coverage", ".turbo", ".next", ".cache"]);
 const STATUS_VALUES = new Set(["aligned", "partial", "missing", "not-applicable"]);
 
+const MISSING_TO_ALIGNED_CONDITIONS = [
+  {
+    id: "zero_cost_source",
+    condition: "Use original OpenClaw package source, package metadata, entry path, and directory layout without metis.plugin.json conversion, per-plugin wrapper, fork, or source patch.",
+  },
+  {
+    id: "pinned_clean_source",
+    condition: "Every source boundary entry has a reproducible source_ref; git sources are clean and archive refs verify against the local snapshot hash.",
+  },
+  {
+    id: "inventory_classification",
+    condition: "entry_path, register_apis, sdk_subpaths, plugin_kinds, runtime_facets_required, source evidence, implementation task, and acceptance tests are populated from source evidence.",
+  },
+  {
+    id: "real_plugin_smoke",
+    condition: "real_plugin_smoke_status is passed or code-proven not-applicable, with artifact paths for passed evidence.",
+  },
+  {
+    id: "behavior_evidence",
+    condition: "behavior_test_status is passed or code-proven not-applicable, with user-visible capability artifacts for passed evidence.",
+  },
+  {
+    id: "runtime_facets",
+    condition: "Every runtime facet has a Metis runtime mapping or plugin-specific not-applicable evidence; high-risk facets are not bulk waived.",
+  },
+  {
+    id: "no_release_blockers",
+    condition: "release_blockers is empty and the CI gate reports no release_status_not_ready, smoke, behavior, source, wrapper, manifest, or patch blockers.",
+  },
+];
+
 const REGISTER_API_PATTERNS = new Map([
   ["registerChannel", /\bregisterChannel\b/g],
   ["registerHttpRoute", /\bregisterHttpRoute\b/g],
@@ -71,6 +102,7 @@ Examples:
 function parseArgs(argv) {
   const sources = [];
   const sourceRefs = new Map();
+  const sourceUrls = new Map();
   let outJson = "";
   let outMd = "";
   let pretty = true;
@@ -94,6 +126,17 @@ function parseArgs(argv) {
         throw new Error("--source-ref must be name:git-or-archive-ref");
       }
       sourceRefs.set(name.trim(), ref);
+    } else if (arg === "--source-url") {
+      const value = argv[++i];
+      if (!value || !value.includes(":")) {
+        throw new Error("--source-url must be name:url-or-package-spec");
+      }
+      const [name, ...rest] = value.split(":");
+      const url = rest.join(":").trim();
+      if (!name.trim() || !url) {
+        throw new Error("--source-url must be name:url-or-package-spec");
+      }
+      sourceUrls.set(name.trim(), url);
     } else if (arg === "--out-json") {
       outJson = argv[++i] ?? "";
     } else if (arg === "--out-md") {
@@ -118,9 +161,17 @@ function parseArgs(argv) {
       throw new Error(`--source-ref was provided for unknown source: ${name}`);
     }
   }
+  for (const name of sourceUrls.keys()) {
+    if (!sources.some((source) => source.name === name)) {
+      throw new Error(`--source-url was provided for unknown source: ${name}`);
+    }
+  }
   for (const source of sources) {
     if (sourceRefs.has(source.name)) {
       source.ref = sourceRefs.get(source.name);
+    }
+    if (sourceUrls.has(source.name)) {
+      source.source_url = sourceUrls.get(source.name);
     }
   }
   return { sources, outJson, outMd, pretty };
@@ -495,11 +546,15 @@ function inventoryPlugin(source, pluginRoot, discoveredBy) {
     });
   }
   const runtimeFacetsRequired = runtimeFacetsFor(kinds);
+  const realPluginSmokeStatus = "not-run";
+  const behaviorTestStatus = "not-run";
   const releaseBlockers = releaseBlockersForPlugin({
     pluginId,
     source,
     entry: resolvedEntry.entry,
     status,
+    realPluginSmokeStatus,
+    behaviorTestStatus,
     diagnostics,
     requiresMetisManifest: false,
     requiresWrapper: false,
@@ -532,8 +587,8 @@ function inventoryPlugin(source, pluginRoot, discoveredBy) {
     secret_fields: scan.secretFields,
     openclaw_evidence: scan.evidenceFiles,
     runtime_facets_required: runtimeFacetsRequired,
-    real_plugin_smoke_status: "not-run",
-    behavior_test_status: "not-run",
+    real_plugin_smoke_status: realPluginSmokeStatus,
+    behavior_test_status: behaviorTestStatus,
     metis_status: status,
     gap: gapFor(status, kinds),
     implementation_task: implementationTaskFor(kinds),
@@ -643,6 +698,8 @@ function releaseBlockersForPlugin({
   source,
   entry,
   status,
+  realPluginSmokeStatus,
+  behaviorTestStatus,
   diagnostics,
   requiresMetisManifest,
   requiresWrapper,
@@ -658,6 +715,12 @@ function releaseBlockersForPlugin({
   }
   if (!["aligned", "not-applicable"].includes(status)) {
     blockers.push({ ...record, code: "release_status_not_ready", message: `Compatibility status ${status} is not release-ready.` });
+  }
+  if (!["passed", "not-applicable"].includes(String(realPluginSmokeStatus ?? "").trim().toLowerCase())) {
+    blockers.push({ ...record, code: "real_plugin_smoke_not_ready", message: `Real plugin smoke status ${realPluginSmokeStatus} is not release-ready.` });
+  }
+  if (!["passed", "not-applicable"].includes(String(behaviorTestStatus ?? "").trim().toLowerCase())) {
+    blockers.push({ ...record, code: "behavior_test_not_ready", message: `Behavior test status ${behaviorTestStatus} is not release-ready.` });
   }
   if (requiresMetisManifest) {
     blockers.push({ ...record, code: "requires_metis_manifest", message: "Zero-cost policy forbids requiring metis.plugin.json conversion." });
@@ -676,12 +739,14 @@ function releaseBlockersForPlugin({
   return blockers;
 }
 
-function summarize(plugins, diagnostics) {
+function summarize(plugins, diagnostics, sources = []) {
   const byStatus = {};
   const byKind = {};
+  const bySource = {};
   const releaseBlockers = [];
   for (const plugin of plugins) {
     byStatus[plugin.metis_status] = (byStatus[plugin.metis_status] ?? 0) + 1;
+    bySource[plugin.source_repo] = (bySource[plugin.source_repo] ?? 0) + 1;
     for (const kind of plugin.plugin_kinds) {
       byKind[kind] = (byKind[kind] ?? 0) + 1;
     }
@@ -696,11 +761,22 @@ function summarize(plugins, diagnostics) {
       });
     }
   }
+  const sourceCounts = {};
+  for (const source of sources) {
+    sourceCounts[source.name] = source.plugin_count ?? 0;
+  }
+  const totalFromSources = Object.values(sourceCounts).reduce((sum, count) => sum + count, 0);
   return {
     plugin_count: plugins.length,
     diagnostics_count: diagnostics.length,
     by_status: Object.fromEntries(Object.entries(byStatus).sort()),
     by_kind: Object.fromEntries(Object.entries(byKind).sort()),
+    by_source: Object.fromEntries(Object.entries(bySource).sort()),
+    source_boundary: {
+      sources: Object.fromEntries(Object.entries(sourceCounts).sort()),
+      total_from_sources: totalFromSources,
+      plugin_count_matches_sources: totalFromSources === plugins.length,
+    },
     release_blockers: releaseBlockers,
     release_ready: plugins.length > 0 && releaseBlockers.length === 0,
   };
@@ -715,6 +791,7 @@ export function buildInventory(options) {
     const sourceRecord = sourceRecordFor(source, root);
     sources.push(sourceRecord);
     if (!sourceRecord.exists) {
+      sourceRecord.plugin_count = 0;
       diagnostics.push({ source: source.name, code: "source_missing", message: `Source root not found: ${root}` });
       continue;
     }
@@ -737,6 +814,7 @@ export function buildInventory(options) {
     }
     const roots = discoverPluginRoots(root);
     if (roots.length === 0) {
+      sourceRecord.plugin_count = 0;
       diagnostics.push({ source: source.name, code: "no_plugins_discovered", message: `No plugin roots discovered under ${root}` });
       continue;
     }
@@ -752,6 +830,7 @@ export function buildInventory(options) {
         });
       }
     }
+    sourceRecord.plugin_count = plugins.filter((plugin) => plugin.source_repo === sourceRecord.name).length;
   }
   plugins.sort((a, b) => `${a.source_repo}:${a.plugin_id}`.localeCompare(`${b.source_repo}:${b.plugin_id}`));
   return {
@@ -763,8 +842,9 @@ export function buildInventory(options) {
       allows_per_plugin_wrapper: false,
       allows_source_patch: false,
     },
+    missing_to_aligned_conditions: MISSING_TO_ALIGNED_CONDITIONS,
     sources,
-    summary: summarize(plugins, diagnostics),
+    summary: summarize(plugins, diagnostics, sources),
     plugins,
     diagnostics,
   };
@@ -788,9 +868,31 @@ function sourceRecordFor(source, root) {
     record.ref_verification = {
       status: ref === computedRef ? "verified" : "mismatch",
       computed_ref: computedRef,
+      reproduce_command: archiveRefReproduceCommand(source.name, root, ref),
     };
   }
   return record;
+}
+
+function archiveRefReproduceCommand(sourceName, root, ref) {
+  return [
+    "node",
+    "scripts/openclaw-plugin-inventory.mjs",
+    "--source",
+    `${sourceName}:${root}`,
+    "--source-ref",
+    `${sourceName}:${ref}`,
+    "--out-json",
+    "develop_steps/openclaw-plugin-compatibility-matrix-2026-05-08.json",
+  ].map(shellQuote).join(" ");
+}
+
+function shellQuote(value) {
+  const text = String(value);
+  if (/^[A-Za-z0-9_./:@%+=,-]+$/.test(text)) {
+    return text;
+  }
+  return `'${text.replaceAll("'", "'\\''")}'`;
 }
 
 function gitInfoFor(root) {
@@ -894,6 +996,32 @@ export function renderMarkdown(inventory) {
   lines.push("");
   for (const [kind, count] of Object.entries(inventory.summary.by_kind)) {
     lines.push(`- \`${kind}\`: ${count}`);
+  }
+  lines.push("");
+  lines.push("### By Source");
+  lines.push("");
+  for (const [source, count] of Object.entries(inventory.summary.by_source ?? {})) {
+    lines.push(`- \`${source}\`: ${count}`);
+  }
+  lines.push("");
+  lines.push("## Source Boundary");
+  lines.push("");
+  lines.push(`- Source plugin total: ${inventory.summary.source_boundary?.total_from_sources ?? 0}`);
+  lines.push(`- Plugin count matches sources: ${inventory.summary.source_boundary?.plugin_count_matches_sources ? "yes" : "no"}`);
+  for (const source of inventory.sources ?? []) {
+    const sourceUrl = firstNonEmpty(source.source_url, source.sourceUrl, source.url);
+    lines.push(
+      `- \`${escapeMd(source.name)}\`: exists=${source.exists ? "yes" : "no"}, ref=${escapeMd(source.ref)}, git=${escapeMd(source.git_status)}, plugins=${source.plugin_count ?? 0}${sourceUrl ? `, source=${escapeMd(sourceUrl)}` : ""}`
+    );
+    if (source.ref_verification?.reproduce_command) {
+      lines.push(`  - Archive verification: \`${escapeMd(source.ref_verification.reproduce_command)}\``);
+    }
+  }
+  lines.push("");
+  lines.push("## Missing to Aligned Conditions");
+  lines.push("");
+  for (const item of inventory.missing_to_aligned_conditions ?? []) {
+    lines.push(`- \`${escapeMd(item.id)}\`: ${escapeMd(item.condition)}`);
   }
   lines.push("");
   lines.push("## Plugins");

@@ -28,9 +28,11 @@ export function validateOpenClawCompatGate({ inventory = {}, matrix = {}, artifa
   validateDocumentMetadata(inventory, "inventory", errors);
   validateDocumentMetadata(matrix, "matrix", errors);
 
+  const inventoryRecords = extractRecords(inventory, "inventory");
+  const matrixRecords = extractRecords(matrix, "matrix");
   const records = [
-    ...extractRecords(inventory, "inventory"),
-    ...extractRecords(matrix, "matrix"),
+    ...inventoryRecords,
+    ...matrixRecords,
   ];
 
   if (records.length === 0) {
@@ -40,6 +42,8 @@ export function validateOpenClawCompatGate({ inventory = {}, matrix = {}, artifa
   for (const record of records) {
     validateRecord(record, errors, context);
   }
+  validateSourceBoundaryCounts(inventory, "inventory", inventoryRecords, errors);
+  validateSourceBoundaryCounts(matrix, "matrix", matrixRecords, errors);
   validateRepresentativeEvidence(records, inventory, matrix, errors);
 
   return {
@@ -143,6 +147,80 @@ function validateSummary(summary, documentSource, errors) {
     errors.push(error("summary_release_not_ready", `${documentSource}:summary release_ready is false`, {
       source: `${documentSource}.summary`,
       recordId: "release_ready",
+    }));
+  }
+}
+
+function validateSourceBoundaryCounts(document, documentSource, records, errors) {
+  if (!isObject(document)) return;
+  const actualBySource = records.reduce((counts, record) => {
+    const sourceName = firstNonEmpty(record.value.sourceRepo);
+    if (sourceName) {
+      counts[sourceName] = (counts[sourceName] ?? 0) + 1;
+    }
+    return counts;
+  }, {});
+  validateSummaryPluginCount(document.summary, documentSource, records.length, errors);
+  validateSummaryBySource(document.summary?.by_source ?? document.summary?.bySource, documentSource, actualBySource, errors);
+  validateSourcePluginCounts(document.sources, documentSource, actualBySource, errors);
+  validateSourceBoundarySummary(document.summary?.source_boundary ?? document.summary?.sourceBoundary, documentSource, records.length, errors);
+}
+
+function validateSummaryPluginCount(summary, documentSource, actualCount, errors) {
+  if (!isObject(summary) || summary.plugin_count == null && summary.pluginCount == null) return;
+  const expected = Number(summary.plugin_count ?? summary.pluginCount);
+  if (Number.isFinite(expected) && expected !== actualCount) {
+    errors.push(error("summary_plugin_count_mismatch", `${documentSource}:summary plugin_count ${expected} does not match ${actualCount} records`, {
+      source: `${documentSource}.summary`,
+      recordId: "plugin_count",
+    }));
+  }
+}
+
+function validateSummaryBySource(bySource, documentSource, actualBySource, errors) {
+  if (!isObject(bySource)) return;
+  const sourceNames = new Set([...Object.keys(bySource), ...Object.keys(actualBySource)]);
+  for (const sourceName of sourceNames) {
+    const expected = Number(bySource[sourceName] ?? 0);
+    const actual = actualBySource[sourceName] ?? 0;
+    if (Number.isFinite(expected) && expected !== actual) {
+      errors.push(error("source_plugin_count_mismatch", `${documentSource}:summary by_source ${sourceName}=${expected} does not match ${actual} records`, {
+        source: `${documentSource}.summary.by_source`,
+        recordId: sourceName,
+      }));
+    }
+  }
+}
+
+function validateSourcePluginCounts(sources, documentSource, actualBySource, errors) {
+  if (!Array.isArray(sources)) return;
+  for (const sourceRecord of sources) {
+    if (!isObject(sourceRecord) || sourceRecord.plugin_count == null && sourceRecord.pluginCount == null) continue;
+    const sourceName = firstNonEmpty(sourceRecord.name, sourceRecord.source);
+    const expected = Number(sourceRecord.plugin_count ?? sourceRecord.pluginCount);
+    const actual = actualBySource[sourceName] ?? 0;
+    if (Number.isFinite(expected) && expected !== actual) {
+      errors.push(error("source_plugin_count_mismatch", `${documentSource}.sources:${sourceName} plugin_count ${expected} does not match ${actual} records`, {
+        source: `${documentSource}.sources`,
+        recordId: sourceName,
+      }));
+    }
+  }
+}
+
+function validateSourceBoundarySummary(sourceBoundary, documentSource, actualCount, errors) {
+  if (!isObject(sourceBoundary)) return;
+  const total = sourceBoundary.total_from_sources ?? sourceBoundary.totalFromSources;
+  if (total != null && Number(total) !== actualCount) {
+    errors.push(error("summary_plugin_count_mismatch", `${documentSource}:source_boundary total_from_sources ${total} does not match ${actualCount} records`, {
+      source: `${documentSource}.summary.source_boundary`,
+      recordId: "plugin_count",
+    }));
+  }
+  if (isFalseMarker(sourceBoundary.plugin_count_matches_sources ?? sourceBoundary.pluginCountMatchesSources)) {
+    errors.push(error("summary_plugin_count_mismatch", `${documentSource}:source_boundary reports plugin_count_matches_sources=false`, {
+      source: `${documentSource}.summary.source_boundary`,
+      recordId: "plugin_count",
     }));
   }
 }

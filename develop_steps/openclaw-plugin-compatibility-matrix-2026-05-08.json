@@ -1,12 +1,42 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-05-08T10:50:34.145Z",
+  "generated_at": "2026-05-08T12:57:37.392Z",
   "zero_cost_policy": {
     "requires_original_source": true,
     "allows_metis_manifest_conversion": false,
     "allows_per_plugin_wrapper": false,
     "allows_source_patch": false
   },
+  "missing_to_aligned_conditions": [
+    {
+      "id": "zero_cost_source",
+      "condition": "Use original OpenClaw package source, package metadata, entry path, and directory layout without metis.plugin.json conversion, per-plugin wrapper, fork, or source patch."
+    },
+    {
+      "id": "pinned_clean_source",
+      "condition": "Every source boundary entry has a reproducible source_ref; git sources are clean and archive refs verify against the local snapshot hash."
+    },
+    {
+      "id": "inventory_classification",
+      "condition": "entry_path, register_apis, sdk_subpaths, plugin_kinds, runtime_facets_required, source evidence, implementation task, and acceptance tests are populated from source evidence."
+    },
+    {
+      "id": "real_plugin_smoke",
+      "condition": "real_plugin_smoke_status is passed or code-proven not-applicable, with artifact paths for passed evidence."
+    },
+    {
+      "id": "behavior_evidence",
+      "condition": "behavior_test_status is passed or code-proven not-applicable, with user-visible capability artifacts for passed evidence."
+    },
+    {
+      "id": "runtime_facets",
+      "condition": "Every runtime facet has a Metis runtime mapping or plugin-specific not-applicable evidence; high-risk facets are not bulk waived."
+    },
+    {
+      "id": "no_release_blockers",
+      "condition": "release_blockers is empty and the CI gate reports no release_status_not_ready, smoke, behavior, source, wrapper, manifest, or patch blockers."
+    }
+  ],
   "sources": [
     {
       "name": "openclaw",
@@ -16,7 +46,8 @@
       "git_status": "dirty",
       "dirty_paths": [
         "pnpm-lock.yaml"
-      ]
+      ],
+      "plugin_count": 94
     },
     {
       "name": "openclaw-china",
@@ -24,19 +55,23 @@
       "exists": true,
       "ref": "a36d023",
       "git_status": "clean",
-      "dirty_paths": []
+      "dirty_paths": [],
+      "plugin_count": 8
     },
     {
       "name": "openclaw-weixin",
       "root": "/tmp/openclaw-weixin",
       "ref": "archive-sha256:a7244892b3eca2abf1ca76879b4fc71e7f3090a68cbac888baa41b9e6e25e912",
+      "source_url": "npm:@tencent-weixin/openclaw-weixin",
       "exists": true,
       "git_status": "non-git",
       "dirty_paths": [],
       "ref_verification": {
         "status": "verified",
-        "computed_ref": "archive-sha256:a7244892b3eca2abf1ca76879b4fc71e7f3090a68cbac888baa41b9e6e25e912"
-      }
+        "computed_ref": "archive-sha256:a7244892b3eca2abf1ca76879b4fc71e7f3090a68cbac888baa41b9e6e25e912",
+        "reproduce_command": "node scripts/openclaw-plugin-inventory.mjs --source openclaw-weixin:/tmp/openclaw-weixin --source-ref openclaw-weixin:archive-sha256:a7244892b3eca2abf1ca76879b4fc71e7f3090a68cbac888baa41b9e6e25e912 --out-json develop_steps/openclaw-plugin-compatibility-matrix-2026-05-08.json"
+      },
+      "plugin_count": 1
     },
     {
       "name": "clawmate",
@@ -44,7 +79,8 @@
       "exists": true,
       "ref": "580e011",
       "git_status": "clean",
-      "dirty_paths": []
+      "dirty_paths": [],
+      "plugin_count": 1
     },
     {
       "name": "qmd",
@@ -52,7 +88,8 @@
       "exists": false,
       "ref": "",
       "git_status": "missing",
-      "dirty_paths": []
+      "dirty_paths": [],
+      "plugin_count": 0
     }
   ],
   "summary": {
@@ -78,6 +115,23 @@
       "setup": 23,
       "tool": 15
     },
+    "by_source": {
+      "clawmate": 1,
+      "openclaw": 94,
+      "openclaw-china": 8,
+      "openclaw-weixin": 1
+    },
+    "source_boundary": {
+      "sources": {
+        "clawmate": 1,
+        "openclaw": 94,
+        "openclaw-china": 8,
+        "openclaw-weixin": 1,
+        "qmd": 0
+      },
+      "total_from_sources": 104,
+      "plugin_count_matches_sources": true
+    },
     "release_blockers": [
       {
         "plugin_id": "clawmate-companion",
@@ -86,10 +140,34 @@
         "message": "Compatibility status missing is not release-ready."
       },
       {
+        "plugin_id": "clawmate-companion",
+        "source": "clawmate",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "clawmate-companion",
+        "source": "clawmate",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
+      },
+      {
         "plugin_id": "channels",
         "source": "openclaw-china",
         "code": "release_status_not_ready",
         "message": "Compatibility status missing is not release-ready."
+      },
+      {
+        "plugin_id": "channels",
+        "source": "openclaw-china",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "channels",
+        "source": "openclaw-china",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
       },
       {
         "plugin_id": "dingtalk",
@@ -98,7 +176,37 @@
         "message": "Compatibility status missing is not release-ready."
       },
       {
+        "plugin_id": "dingtalk",
+        "source": "openclaw-china",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "dingtalk",
+        "source": "openclaw-china",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
+      },
+      {
         "plugin_id": "feishu-china",
+        "source": "openclaw-china",
+        "code": "release_status_not_ready",
+        "message": "Compatibility status missing is not release-ready."
+      },
+      {
+        "plugin_id": "feishu-china",
+        "source": "openclaw-china",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "feishu-china",
+        "source": "openclaw-china",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "qqbot",
         "source": "openclaw-china",
         "code": "release_status_not_ready",
         "message": "Compatibility status missing is not release-ready."
@@ -106,8 +214,14 @@
       {
         "plugin_id": "qqbot",
         "source": "openclaw-china",
-        "code": "release_status_not_ready",
-        "message": "Compatibility status missing is not release-ready."
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "qqbot",
+        "source": "openclaw-china",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
       },
       {
         "plugin_id": "wechat-mp",
@@ -116,10 +230,34 @@
         "message": "Compatibility status missing is not release-ready."
       },
       {
+        "plugin_id": "wechat-mp",
+        "source": "openclaw-china",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "wechat-mp",
+        "source": "openclaw-china",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
+      },
+      {
         "plugin_id": "wecom",
         "source": "openclaw-china",
         "code": "release_status_not_ready",
         "message": "Compatibility status missing is not release-ready."
+      },
+      {
+        "plugin_id": "wecom",
+        "source": "openclaw-china",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "wecom",
+        "source": "openclaw-china",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
       },
       {
         "plugin_id": "wecom-app",
@@ -128,10 +266,34 @@
         "message": "Compatibility status missing is not release-ready."
       },
       {
+        "plugin_id": "wecom-app",
+        "source": "openclaw-china",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "wecom-app",
+        "source": "openclaw-china",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
+      },
+      {
         "plugin_id": "wecom-kf",
         "source": "openclaw-china",
         "code": "release_status_not_ready",
         "message": "Compatibility status missing is not release-ready."
+      },
+      {
+        "plugin_id": "wecom-kf",
+        "source": "openclaw-china",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "wecom-kf",
+        "source": "openclaw-china",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
       },
       {
         "plugin_id": "openclaw-weixin",
@@ -140,10 +302,34 @@
         "message": "Compatibility status missing is not release-ready."
       },
       {
+        "plugin_id": "openclaw-weixin",
+        "source": "openclaw-weixin",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "openclaw-weixin",
+        "source": "openclaw-weixin",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
+      },
+      {
         "plugin_id": "acpx",
         "source": "openclaw",
         "code": "release_status_not_ready",
         "message": "Compatibility status missing is not release-ready."
+      },
+      {
+        "plugin_id": "acpx",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "acpx",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
       },
       {
         "plugin_id": "alibaba",
@@ -152,10 +338,34 @@
         "message": "Compatibility status missing is not release-ready."
       },
       {
+        "plugin_id": "alibaba",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "alibaba",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
+      },
+      {
         "plugin_id": "amazon-bedrock",
         "source": "openclaw",
         "code": "release_status_not_ready",
         "message": "Compatibility status missing is not release-ready."
+      },
+      {
+        "plugin_id": "amazon-bedrock",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "amazon-bedrock",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
       },
       {
         "plugin_id": "amazon-bedrock-mantle",
@@ -164,10 +374,34 @@
         "message": "Compatibility status missing is not release-ready."
       },
       {
+        "plugin_id": "amazon-bedrock-mantle",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "amazon-bedrock-mantle",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
+      },
+      {
         "plugin_id": "anthropic",
         "source": "openclaw",
         "code": "release_status_not_ready",
         "message": "Compatibility status missing is not release-ready."
+      },
+      {
+        "plugin_id": "anthropic",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "anthropic",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
       },
       {
         "plugin_id": "anthropic-vertex",
@@ -176,10 +410,34 @@
         "message": "Compatibility status missing is not release-ready."
       },
       {
+        "plugin_id": "anthropic-vertex",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "anthropic-vertex",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
+      },
+      {
         "plugin_id": "bluebubbles",
         "source": "openclaw",
         "code": "release_status_not_ready",
         "message": "Compatibility status missing is not release-ready."
+      },
+      {
+        "plugin_id": "bluebubbles",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "bluebubbles",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
       },
       {
         "plugin_id": "brave",
@@ -188,10 +446,34 @@
         "message": "Compatibility status missing is not release-ready."
       },
       {
+        "plugin_id": "brave",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "brave",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
+      },
+      {
         "plugin_id": "browser",
         "source": "openclaw",
         "code": "release_status_not_ready",
         "message": "Compatibility status missing is not release-ready."
+      },
+      {
+        "plugin_id": "browser",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "browser",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
       },
       {
         "plugin_id": "byteplus",
@@ -200,10 +482,34 @@
         "message": "Compatibility status missing is not release-ready."
       },
       {
+        "plugin_id": "byteplus",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "byteplus",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
+      },
+      {
         "plugin_id": "chutes",
         "source": "openclaw",
         "code": "release_status_not_ready",
         "message": "Compatibility status missing is not release-ready."
+      },
+      {
+        "plugin_id": "chutes",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "chutes",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
       },
       {
         "plugin_id": "cloudflare-ai-gateway",
@@ -212,10 +518,34 @@
         "message": "Compatibility status missing is not release-ready."
       },
       {
+        "plugin_id": "cloudflare-ai-gateway",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "cloudflare-ai-gateway",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
+      },
+      {
         "plugin_id": "comfy",
         "source": "openclaw",
         "code": "release_status_not_ready",
         "message": "Compatibility status missing is not release-ready."
+      },
+      {
+        "plugin_id": "comfy",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "comfy",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
       },
       {
         "plugin_id": "copilot-proxy",
@@ -224,10 +554,34 @@
         "message": "Compatibility status missing is not release-ready."
       },
       {
+        "plugin_id": "copilot-proxy",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "copilot-proxy",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
+      },
+      {
         "plugin_id": "deepgram",
         "source": "openclaw",
         "code": "release_status_not_ready",
         "message": "Compatibility status missing is not release-ready."
+      },
+      {
+        "plugin_id": "deepgram",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "deepgram",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
       },
       {
         "plugin_id": "deepseek",
@@ -236,10 +590,34 @@
         "message": "Compatibility status missing is not release-ready."
       },
       {
+        "plugin_id": "deepseek",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "deepseek",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
+      },
+      {
         "plugin_id": "device-pair",
         "source": "openclaw",
         "code": "release_status_not_ready",
         "message": "Compatibility status missing is not release-ready."
+      },
+      {
+        "plugin_id": "device-pair",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "device-pair",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
       },
       {
         "plugin_id": "diagnostics-otel",
@@ -248,10 +626,34 @@
         "message": "Compatibility status missing is not release-ready."
       },
       {
+        "plugin_id": "diagnostics-otel",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "diagnostics-otel",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
+      },
+      {
         "plugin_id": "diffs",
         "source": "openclaw",
         "code": "release_status_not_ready",
         "message": "Compatibility status missing is not release-ready."
+      },
+      {
+        "plugin_id": "diffs",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "diffs",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
       },
       {
         "plugin_id": "discord",
@@ -260,10 +662,34 @@
         "message": "Compatibility status missing is not release-ready."
       },
       {
+        "plugin_id": "discord",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "discord",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
+      },
+      {
         "plugin_id": "duckduckgo",
         "source": "openclaw",
         "code": "release_status_not_ready",
         "message": "Compatibility status missing is not release-ready."
+      },
+      {
+        "plugin_id": "duckduckgo",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "duckduckgo",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
       },
       {
         "plugin_id": "elevenlabs",
@@ -272,10 +698,34 @@
         "message": "Compatibility status missing is not release-ready."
       },
       {
+        "plugin_id": "elevenlabs",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "elevenlabs",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
+      },
+      {
         "plugin_id": "exa",
         "source": "openclaw",
         "code": "release_status_not_ready",
         "message": "Compatibility status missing is not release-ready."
+      },
+      {
+        "plugin_id": "exa",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "exa",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
       },
       {
         "plugin_id": "fal",
@@ -284,10 +734,34 @@
         "message": "Compatibility status missing is not release-ready."
       },
       {
+        "plugin_id": "fal",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "fal",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
+      },
+      {
         "plugin_id": "feishu",
         "source": "openclaw",
         "code": "release_status_not_ready",
         "message": "Compatibility status missing is not release-ready."
+      },
+      {
+        "plugin_id": "feishu",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "feishu",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
       },
       {
         "plugin_id": "firecrawl",
@@ -296,10 +770,34 @@
         "message": "Compatibility status missing is not release-ready."
       },
       {
+        "plugin_id": "firecrawl",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "firecrawl",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
+      },
+      {
         "plugin_id": "fireworks",
         "source": "openclaw",
         "code": "release_status_not_ready",
         "message": "Compatibility status missing is not release-ready."
+      },
+      {
+        "plugin_id": "fireworks",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "fireworks",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
       },
       {
         "plugin_id": "github-copilot",
@@ -308,10 +806,34 @@
         "message": "Compatibility status missing is not release-ready."
       },
       {
+        "plugin_id": "github-copilot",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "github-copilot",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
+      },
+      {
         "plugin_id": "google",
         "source": "openclaw",
         "code": "release_status_not_ready",
         "message": "Compatibility status missing is not release-ready."
+      },
+      {
+        "plugin_id": "google",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "google",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
       },
       {
         "plugin_id": "googlechat",
@@ -320,10 +842,34 @@
         "message": "Compatibility status missing is not release-ready."
       },
       {
+        "plugin_id": "googlechat",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "googlechat",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
+      },
+      {
         "plugin_id": "groq",
         "source": "openclaw",
         "code": "release_status_not_ready",
         "message": "Compatibility status missing is not release-ready."
+      },
+      {
+        "plugin_id": "groq",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "groq",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
       },
       {
         "plugin_id": "huggingface",
@@ -332,10 +878,34 @@
         "message": "Compatibility status missing is not release-ready."
       },
       {
+        "plugin_id": "huggingface",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "huggingface",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
+      },
+      {
         "plugin_id": "imessage",
         "source": "openclaw",
         "code": "release_status_not_ready",
         "message": "Compatibility status missing is not release-ready."
+      },
+      {
+        "plugin_id": "imessage",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "imessage",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
       },
       {
         "plugin_id": "irc",
@@ -344,10 +914,34 @@
         "message": "Compatibility status missing is not release-ready."
       },
       {
+        "plugin_id": "irc",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "irc",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
+      },
+      {
         "plugin_id": "kilocode",
         "source": "openclaw",
         "code": "release_status_not_ready",
         "message": "Compatibility status missing is not release-ready."
+      },
+      {
+        "plugin_id": "kilocode",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "kilocode",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
       },
       {
         "plugin_id": "kimi",
@@ -356,10 +950,34 @@
         "message": "Compatibility status missing is not release-ready."
       },
       {
+        "plugin_id": "kimi",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "kimi",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
+      },
+      {
         "plugin_id": "line",
         "source": "openclaw",
         "code": "release_status_not_ready",
         "message": "Compatibility status missing is not release-ready."
+      },
+      {
+        "plugin_id": "line",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "line",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
       },
       {
         "plugin_id": "litellm",
@@ -368,10 +986,34 @@
         "message": "Compatibility status missing is not release-ready."
       },
       {
+        "plugin_id": "litellm",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "litellm",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
+      },
+      {
         "plugin_id": "llm-task",
         "source": "openclaw",
         "code": "release_status_not_ready",
         "message": "Compatibility status missing is not release-ready."
+      },
+      {
+        "plugin_id": "llm-task",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "llm-task",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
       },
       {
         "plugin_id": "lobster",
@@ -380,10 +1022,34 @@
         "message": "Compatibility status missing is not release-ready."
       },
       {
+        "plugin_id": "lobster",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "lobster",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
+      },
+      {
         "plugin_id": "matrix",
         "source": "openclaw",
         "code": "release_status_not_ready",
         "message": "Compatibility status missing is not release-ready."
+      },
+      {
+        "plugin_id": "matrix",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "matrix",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
       },
       {
         "plugin_id": "mattermost",
@@ -392,10 +1058,34 @@
         "message": "Compatibility status missing is not release-ready."
       },
       {
+        "plugin_id": "mattermost",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "mattermost",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
+      },
+      {
         "plugin_id": "memory-core",
         "source": "openclaw",
         "code": "release_status_not_ready",
         "message": "Compatibility status missing is not release-ready."
+      },
+      {
+        "plugin_id": "memory-core",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "memory-core",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
       },
       {
         "plugin_id": "memory-lancedb",
@@ -404,10 +1094,34 @@
         "message": "Compatibility status missing is not release-ready."
       },
       {
+        "plugin_id": "memory-lancedb",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "memory-lancedb",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
+      },
+      {
         "plugin_id": "microsoft",
         "source": "openclaw",
         "code": "release_status_not_ready",
         "message": "Compatibility status missing is not release-ready."
+      },
+      {
+        "plugin_id": "microsoft",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "microsoft",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
       },
       {
         "plugin_id": "microsoft-foundry",
@@ -416,10 +1130,34 @@
         "message": "Compatibility status missing is not release-ready."
       },
       {
+        "plugin_id": "microsoft-foundry",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "microsoft-foundry",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
+      },
+      {
         "plugin_id": "minimax",
         "source": "openclaw",
         "code": "release_status_not_ready",
         "message": "Compatibility status missing is not release-ready."
+      },
+      {
+        "plugin_id": "minimax",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "minimax",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
       },
       {
         "plugin_id": "mistral",
@@ -428,10 +1166,34 @@
         "message": "Compatibility status missing is not release-ready."
       },
       {
+        "plugin_id": "mistral",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "mistral",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
+      },
+      {
         "plugin_id": "moonshot",
         "source": "openclaw",
         "code": "release_status_not_ready",
         "message": "Compatibility status missing is not release-ready."
+      },
+      {
+        "plugin_id": "moonshot",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "moonshot",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
       },
       {
         "plugin_id": "msteams",
@@ -440,10 +1202,34 @@
         "message": "Compatibility status missing is not release-ready."
       },
       {
+        "plugin_id": "msteams",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "msteams",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
+      },
+      {
         "plugin_id": "nextcloud-talk",
         "source": "openclaw",
         "code": "release_status_not_ready",
         "message": "Compatibility status missing is not release-ready."
+      },
+      {
+        "plugin_id": "nextcloud-talk",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "nextcloud-talk",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
       },
       {
         "plugin_id": "nostr",
@@ -452,10 +1238,34 @@
         "message": "Compatibility status missing is not release-ready."
       },
       {
+        "plugin_id": "nostr",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "nostr",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
+      },
+      {
         "plugin_id": "nvidia",
         "source": "openclaw",
         "code": "release_status_not_ready",
         "message": "Compatibility status missing is not release-ready."
+      },
+      {
+        "plugin_id": "nvidia",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "nvidia",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
       },
       {
         "plugin_id": "ollama",
@@ -464,10 +1274,34 @@
         "message": "Compatibility status missing is not release-ready."
       },
       {
+        "plugin_id": "ollama",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "ollama",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
+      },
+      {
         "plugin_id": "open-prose",
         "source": "openclaw",
         "code": "release_status_not_ready",
         "message": "Compatibility status missing is not release-ready."
+      },
+      {
+        "plugin_id": "open-prose",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "open-prose",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
       },
       {
         "plugin_id": "openai",
@@ -476,10 +1310,34 @@
         "message": "Compatibility status missing is not release-ready."
       },
       {
+        "plugin_id": "openai",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "openai",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
+      },
+      {
         "plugin_id": "opencode",
         "source": "openclaw",
         "code": "release_status_not_ready",
         "message": "Compatibility status missing is not release-ready."
+      },
+      {
+        "plugin_id": "opencode",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "opencode",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
       },
       {
         "plugin_id": "opencode-go",
@@ -488,10 +1346,34 @@
         "message": "Compatibility status missing is not release-ready."
       },
       {
+        "plugin_id": "opencode-go",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "opencode-go",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
+      },
+      {
         "plugin_id": "openrouter",
         "source": "openclaw",
         "code": "release_status_not_ready",
         "message": "Compatibility status missing is not release-ready."
+      },
+      {
+        "plugin_id": "openrouter",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "openrouter",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
       },
       {
         "plugin_id": "openshell",
@@ -500,10 +1382,34 @@
         "message": "Compatibility status missing is not release-ready."
       },
       {
+        "plugin_id": "openshell",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "openshell",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
+      },
+      {
         "plugin_id": "perplexity",
         "source": "openclaw",
         "code": "release_status_not_ready",
         "message": "Compatibility status missing is not release-ready."
+      },
+      {
+        "plugin_id": "perplexity",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "perplexity",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
       },
       {
         "plugin_id": "phone-control",
@@ -512,10 +1418,34 @@
         "message": "Compatibility status missing is not release-ready."
       },
       {
+        "plugin_id": "phone-control",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "phone-control",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
+      },
+      {
         "plugin_id": "qa-channel",
         "source": "openclaw",
         "code": "release_status_not_ready",
         "message": "Compatibility status missing is not release-ready."
+      },
+      {
+        "plugin_id": "qa-channel",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "qa-channel",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
       },
       {
         "plugin_id": "qa-lab",
@@ -524,10 +1454,34 @@
         "message": "Compatibility status missing is not release-ready."
       },
       {
+        "plugin_id": "qa-lab",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "qa-lab",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
+      },
+      {
         "plugin_id": "qianfan",
         "source": "openclaw",
         "code": "release_status_not_ready",
         "message": "Compatibility status missing is not release-ready."
+      },
+      {
+        "plugin_id": "qianfan",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "qianfan",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
       },
       {
         "plugin_id": "qqbot",
@@ -536,10 +1490,34 @@
         "message": "Compatibility status missing is not release-ready."
       },
       {
+        "plugin_id": "qqbot",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "qqbot",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
+      },
+      {
         "plugin_id": "qwen",
         "source": "openclaw",
         "code": "release_status_not_ready",
         "message": "Compatibility status missing is not release-ready."
+      },
+      {
+        "plugin_id": "qwen",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "qwen",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
       },
       {
         "plugin_id": "runway",
@@ -548,10 +1526,34 @@
         "message": "Compatibility status missing is not release-ready."
       },
       {
+        "plugin_id": "runway",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "runway",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
+      },
+      {
         "plugin_id": "searxng",
         "source": "openclaw",
         "code": "release_status_not_ready",
         "message": "Compatibility status missing is not release-ready."
+      },
+      {
+        "plugin_id": "searxng",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "searxng",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
       },
       {
         "plugin_id": "sglang",
@@ -560,10 +1562,34 @@
         "message": "Compatibility status missing is not release-ready."
       },
       {
+        "plugin_id": "sglang",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "sglang",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
+      },
+      {
         "plugin_id": "signal",
         "source": "openclaw",
         "code": "release_status_not_ready",
         "message": "Compatibility status missing is not release-ready."
+      },
+      {
+        "plugin_id": "signal",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "signal",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
       },
       {
         "plugin_id": "slack",
@@ -572,10 +1598,34 @@
         "message": "Compatibility status missing is not release-ready."
       },
       {
+        "plugin_id": "slack",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "slack",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
+      },
+      {
         "plugin_id": "stepfun",
         "source": "openclaw",
         "code": "release_status_not_ready",
         "message": "Compatibility status missing is not release-ready."
+      },
+      {
+        "plugin_id": "stepfun",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "stepfun",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
       },
       {
         "plugin_id": "synology-chat",
@@ -584,10 +1634,34 @@
         "message": "Compatibility status missing is not release-ready."
       },
       {
+        "plugin_id": "synology-chat",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "synology-chat",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
+      },
+      {
         "plugin_id": "synthetic",
         "source": "openclaw",
         "code": "release_status_not_ready",
         "message": "Compatibility status missing is not release-ready."
+      },
+      {
+        "plugin_id": "synthetic",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "synthetic",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
       },
       {
         "plugin_id": "talk-voice",
@@ -596,10 +1670,34 @@
         "message": "Compatibility status missing is not release-ready."
       },
       {
+        "plugin_id": "talk-voice",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "talk-voice",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
+      },
+      {
         "plugin_id": "tavily",
         "source": "openclaw",
         "code": "release_status_not_ready",
         "message": "Compatibility status missing is not release-ready."
+      },
+      {
+        "plugin_id": "tavily",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "tavily",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
       },
       {
         "plugin_id": "telegram",
@@ -608,10 +1706,34 @@
         "message": "Compatibility status missing is not release-ready."
       },
       {
+        "plugin_id": "telegram",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "telegram",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
+      },
+      {
         "plugin_id": "thread-ownership",
         "source": "openclaw",
         "code": "release_status_not_ready",
         "message": "Compatibility status missing is not release-ready."
+      },
+      {
+        "plugin_id": "thread-ownership",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "thread-ownership",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
       },
       {
         "plugin_id": "tlon",
@@ -620,10 +1742,34 @@
         "message": "Compatibility status missing is not release-ready."
       },
       {
+        "plugin_id": "tlon",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "tlon",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
+      },
+      {
         "plugin_id": "together",
         "source": "openclaw",
         "code": "release_status_not_ready",
         "message": "Compatibility status missing is not release-ready."
+      },
+      {
+        "plugin_id": "together",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "together",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
       },
       {
         "plugin_id": "twitch",
@@ -632,10 +1778,34 @@
         "message": "Compatibility status missing is not release-ready."
       },
       {
+        "plugin_id": "twitch",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "twitch",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
+      },
+      {
         "plugin_id": "venice",
         "source": "openclaw",
         "code": "release_status_not_ready",
         "message": "Compatibility status missing is not release-ready."
+      },
+      {
+        "plugin_id": "venice",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "venice",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
       },
       {
         "plugin_id": "vercel-ai-gateway",
@@ -644,10 +1814,34 @@
         "message": "Compatibility status missing is not release-ready."
       },
       {
+        "plugin_id": "vercel-ai-gateway",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "vercel-ai-gateway",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
+      },
+      {
         "plugin_id": "vllm",
         "source": "openclaw",
         "code": "release_status_not_ready",
         "message": "Compatibility status missing is not release-ready."
+      },
+      {
+        "plugin_id": "vllm",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "vllm",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
       },
       {
         "plugin_id": "voice-call",
@@ -656,10 +1850,34 @@
         "message": "Compatibility status missing is not release-ready."
       },
       {
+        "plugin_id": "voice-call",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "voice-call",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
+      },
+      {
         "plugin_id": "volcengine",
         "source": "openclaw",
         "code": "release_status_not_ready",
         "message": "Compatibility status missing is not release-ready."
+      },
+      {
+        "plugin_id": "volcengine",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "volcengine",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
       },
       {
         "plugin_id": "vydra",
@@ -668,10 +1886,34 @@
         "message": "Compatibility status missing is not release-ready."
       },
       {
+        "plugin_id": "vydra",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "vydra",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
+      },
+      {
         "plugin_id": "whatsapp",
         "source": "openclaw",
         "code": "release_status_not_ready",
         "message": "Compatibility status missing is not release-ready."
+      },
+      {
+        "plugin_id": "whatsapp",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "whatsapp",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
       },
       {
         "plugin_id": "xai",
@@ -680,10 +1922,34 @@
         "message": "Compatibility status missing is not release-ready."
       },
       {
+        "plugin_id": "xai",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "xai",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
+      },
+      {
         "plugin_id": "xiaomi",
         "source": "openclaw",
         "code": "release_status_not_ready",
         "message": "Compatibility status missing is not release-ready."
+      },
+      {
+        "plugin_id": "xiaomi",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "xiaomi",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
       },
       {
         "plugin_id": "zai",
@@ -692,7 +1958,37 @@
         "message": "Compatibility status missing is not release-ready."
       },
       {
+        "plugin_id": "zai",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "zai",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
+      },
+      {
         "plugin_id": "zalo",
+        "source": "openclaw",
+        "code": "release_status_not_ready",
+        "message": "Compatibility status missing is not release-ready."
+      },
+      {
+        "plugin_id": "zalo",
+        "source": "openclaw",
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "zalo",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "zalouser",
         "source": "openclaw",
         "code": "release_status_not_ready",
         "message": "Compatibility status missing is not release-ready."
@@ -700,8 +1996,14 @@
       {
         "plugin_id": "zalouser",
         "source": "openclaw",
-        "code": "release_status_not_ready",
-        "message": "Compatibility status missing is not release-ready."
+        "code": "real_plugin_smoke_not_ready",
+        "message": "Real plugin smoke status not-run is not release-ready."
+      },
+      {
+        "plugin_id": "zalouser",
+        "source": "openclaw",
+        "code": "behavior_test_not_ready",
+        "message": "Behavior test status not-run is not release-ready."
       },
       {
         "code": "source_dirty",
@@ -825,6 +2127,18 @@
           "source": "clawmate",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "clawmate-companion",
+          "source": "clawmate",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "clawmate-companion",
+          "source": "clawmate",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -908,6 +2222,18 @@
           "source": "openclaw-china",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "channels",
+          "source": "openclaw-china",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "channels",
+          "source": "openclaw-china",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": [
@@ -1055,6 +2381,18 @@
           "source": "openclaw-china",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "dingtalk",
+          "source": "openclaw-china",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "dingtalk",
+          "source": "openclaw-china",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": [
@@ -1156,6 +2494,18 @@
           "source": "openclaw-china",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "feishu-china",
+          "source": "openclaw-china",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "feishu-china",
+          "source": "openclaw-china",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": [
@@ -1319,6 +2669,18 @@
           "source": "openclaw-china",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "qqbot",
+          "source": "openclaw-china",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "qqbot",
+          "source": "openclaw-china",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": [
@@ -1463,6 +2825,18 @@
           "source": "openclaw-china",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "wechat-mp",
+          "source": "openclaw-china",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "wechat-mp",
+          "source": "openclaw-china",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": [
@@ -1597,6 +2971,18 @@
           "source": "openclaw-china",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "wecom",
+          "source": "openclaw-china",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "wecom",
+          "source": "openclaw-china",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": [
@@ -1732,6 +3118,18 @@
           "source": "openclaw-china",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "wecom-app",
+          "source": "openclaw-china",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "wecom-app",
+          "source": "openclaw-china",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": [
@@ -1865,6 +3263,18 @@
           "source": "openclaw-china",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "wecom-kf",
+          "source": "openclaw-china",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "wecom-kf",
+          "source": "openclaw-china",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": [
@@ -2051,6 +3461,18 @@
           "source": "openclaw-weixin",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "openclaw-weixin",
+          "source": "openclaw-weixin",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "openclaw-weixin",
+          "source": "openclaw-weixin",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -2181,6 +3603,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "acpx",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "acpx",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -2264,6 +3698,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "alibaba",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "alibaba",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -2370,6 +3816,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "amazon-bedrock",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "amazon-bedrock",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -2479,6 +3937,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "amazon-bedrock-mantle",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "amazon-bedrock-mantle",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -2595,6 +4065,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "anthropic",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "anthropic",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -2678,6 +4160,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "anthropic-vertex",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "anthropic-vertex",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -2926,6 +4420,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "bluebubbles",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "bluebubbles",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -3007,6 +4513,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "brave",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "brave",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -3380,6 +4898,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "browser",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "browser",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -3473,6 +5003,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "byteplus",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "byteplus",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -3571,6 +5113,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "chutes",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "chutes",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -3667,6 +5221,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "cloudflare-ai-gateway",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "cloudflare-ai-gateway",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -3762,6 +5328,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "comfy",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "comfy",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -3835,6 +5413,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "copilot-proxy",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "copilot-proxy",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -3920,6 +5510,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "deepgram",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "deepgram",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -3997,6 +5599,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "deepseek",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "deepseek",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -4096,6 +5710,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "device-pair",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "device-pair",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": [
@@ -4192,6 +5818,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "diagnostics-otel",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "diagnostics-otel",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -4310,6 +5948,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "diffs",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "diffs",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -4772,6 +6422,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "discord",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "discord",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -4845,6 +6507,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "duckduckgo",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "duckduckgo",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -4941,6 +6615,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "elevenlabs",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "elevenlabs",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -5021,6 +6707,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "exa",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "exa",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -5115,6 +6813,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "fal",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "fal",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -5513,6 +7223,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "feishu",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "feishu",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -5615,6 +7337,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "firecrawl",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "firecrawl",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -5693,6 +7427,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "fireworks",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "fireworks",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -5821,6 +7567,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "github-copilot",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "github-copilot",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -6011,6 +7769,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "google",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "google",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -6198,6 +7968,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "googlechat",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "googlechat",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -6271,6 +8053,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "groq",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "groq",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -6360,6 +8154,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "huggingface",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "huggingface",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -6530,6 +8336,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "imessage",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "imessage",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -6696,6 +8514,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "irc",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "irc",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -6784,6 +8614,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "kilocode",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "kilocode",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -6867,6 +8709,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "kimi",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "kimi",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -7110,6 +8964,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "line",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "line",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -7185,6 +9051,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "litellm",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "litellm",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -7265,6 +9143,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "llm-task",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "llm-task",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -7359,6 +9249,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "lobster",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "lobster",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -7846,6 +9748,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "matrix",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "matrix",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -8142,6 +10056,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "mattermost",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "mattermost",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -8380,6 +10306,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "memory-core",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "memory-core",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -8486,6 +10424,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "memory-lancedb",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "memory-lancedb",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -8571,6 +10521,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "microsoft",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "microsoft",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -8707,6 +10669,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "microsoft-foundry",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "microsoft-foundry",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -8869,6 +10843,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "minimax",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "minimax",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -8969,6 +10955,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "mistral",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "mistral",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -9068,6 +11066,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "moonshot",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "moonshot",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -9350,6 +11360,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "msteams",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "msteams",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -9544,6 +11566,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "nextcloud-talk",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "nextcloud-talk",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -9689,6 +11723,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "nostr",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "nostr",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -9758,6 +11804,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "nvidia",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "nvidia",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -9898,6 +11956,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "ollama",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "ollama",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -9961,6 +12031,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "open-prose",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "open-prose",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -10147,6 +12229,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "openai",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "openai",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -10223,6 +12317,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "opencode",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "opencode",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -10299,6 +12405,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "opencode-go",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "opencode-go",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -10393,6 +12511,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "openrouter",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "openrouter",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -10479,6 +12609,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "openshell",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "openshell",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -10569,6 +12711,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "perplexity",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "perplexity",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -10643,6 +12797,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "phone-control",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "phone-control",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": [
@@ -10744,6 +12910,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "qa-channel",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "qa-channel",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -10861,6 +13039,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "qa-lab",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "qa-lab",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -10934,6 +13124,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "qianfan",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "qianfan",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -11144,6 +13346,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "qqbot",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "qqbot",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -11242,6 +13456,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "qwen",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "qwen",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -11326,6 +13552,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "runway",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "runway",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -11413,6 +13651,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "searxng",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "searxng",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -11485,6 +13735,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "sglang",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "sglang",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -11656,6 +13918,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "signal",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "signal",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -12059,6 +14333,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "slack",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "slack",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -12138,6 +14424,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "stepfun",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "stepfun",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -12302,6 +14600,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "synology-chat",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "synology-chat",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -12377,6 +14687,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "synthetic",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "synthetic",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -12459,6 +14781,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "talk-voice",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "talk-voice",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": [
@@ -12563,6 +14897,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "tavily",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "tavily",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -13050,6 +15396,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "telegram",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "telegram",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -13120,6 +15478,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "thread-ownership",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "thread-ownership",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": [
@@ -13293,6 +15663,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "tlon",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "tlon",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -13382,6 +15764,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "together",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "together",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -13541,6 +15935,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "twitch",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "twitch",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -13623,6 +16029,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "venice",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "venice",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -13700,6 +16118,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "vercel-ai-gateway",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "vercel-ai-gateway",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -13772,6 +16202,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "vllm",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "vllm",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -13986,6 +16428,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "voice-call",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "voice-call",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -14064,6 +16518,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "volcengine",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "volcengine",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -14166,6 +16632,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "vydra",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "vydra",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -14442,6 +16920,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "whatsapp",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "whatsapp",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -14592,6 +17082,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "xai",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "xai",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -14674,6 +17176,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "xiaomi",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "xiaomi",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -14784,6 +17298,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "zai",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "zai",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -15028,6 +17554,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "zalo",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "zalo",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []
@@ -15181,6 +17719,18 @@
           "source": "openclaw",
           "code": "release_status_not_ready",
           "message": "Compatibility status missing is not release-ready."
+        },
+        {
+          "plugin_id": "zalouser",
+          "source": "openclaw",
+          "code": "real_plugin_smoke_not_ready",
+          "message": "Real plugin smoke status not-run is not release-ready."
+        },
+        {
+          "plugin_id": "zalouser",
+          "source": "openclaw",
+          "code": "behavior_test_not_ready",
+          "message": "Behavior test status not-run is not release-ready."
         }
       ],
       "diagnostics": []

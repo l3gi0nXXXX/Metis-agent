@@ -394,6 +394,91 @@ test("adds CI-compatible release and runtime status fields to plugin records", (
   assert.ok(inventory.summary.release_blockers.some((item) => item.code === "release_status_not_ready"));
 });
 
+test("records source boundary counts and evidence blockers without marking missing plugins aligned", () => {
+  const root = tempRoot();
+  const pluginRoot = path.join(root, "extensions", "tooling");
+  writeJson(path.join(pluginRoot, "package.json"), {
+    name: "@vendor/tooling",
+    version: "1.0.0",
+    type: "module",
+    openclaw: { extensions: ["./index.js"] },
+  });
+  writeText(
+    path.join(pluginRoot, "index.js"),
+    `
+      export default {
+        register(api) {
+          api.registerTool({ name: "fixture" });
+        }
+      };
+    `
+  );
+
+  const inventory = buildInventory({
+    sources: [
+      { name: "openclaw", root, ref: "git:fixture" },
+      { name: "qmd", root: path.join(tempRoot(), "qmd") },
+    ],
+  });
+  const plugin = inventory.plugins[0];
+
+  assert.equal(inventory.summary.plugin_count, 1);
+  assert.deepEqual(inventory.summary.by_source, { openclaw: 1 });
+  assert.equal(inventory.sources.find((source) => source.name === "openclaw").plugin_count, 1);
+  assert.equal(inventory.sources.find((source) => source.name === "qmd").plugin_count, 0);
+  assert.equal(inventory.summary.source_boundary.plugin_count_matches_sources, true);
+  assert.equal(inventory.summary.source_boundary.total_from_sources, 1);
+  assert.deepEqual(plugin.real_plugin_smoke_status, "not-run");
+  assert.deepEqual(plugin.behavior_test_status, "not-run");
+  assert.equal(plugin.metis_status, "missing");
+  assert.ok(plugin.release_blockers.some((item) => item.code === "release_status_not_ready"));
+  assert.ok(plugin.release_blockers.some((item) => item.code === "real_plugin_smoke_not_ready"));
+  assert.ok(plugin.release_blockers.some((item) => item.code === "behavior_test_not_ready"));
+  assert.ok(inventory.summary.release_blockers.some((item) => item.code === "source_missing" && item.source === "qmd"));
+});
+
+test("documents machine-readable conditions required before missing records become aligned", () => {
+  const root = tempRoot();
+  writeJson(path.join(root, "package.json"), {
+    name: "@vendor/tooling",
+    version: "1.0.0",
+    type: "module",
+    openclaw: { extensions: ["./index.js"] },
+  });
+  writeText(path.join(root, "index.js"), "export default { register(api) { api.registerTool({ name: 'fixture' }); } };\n");
+
+  const inventory = buildInventory({ sources: [{ name: "openclaw", root, ref: "git:fixture" }] });
+
+  assert.ok(inventory.missing_to_aligned_conditions.some((item) => item.id === "zero_cost_source"));
+  assert.ok(inventory.missing_to_aligned_conditions.some((item) => item.id === "real_plugin_smoke"));
+  assert.ok(inventory.missing_to_aligned_conditions.some((item) => item.id === "behavior_evidence"));
+  assert.ok(inventory.missing_to_aligned_conditions.some((item) => item.id === "no_release_blockers"));
+  assert.match(renderMarkdown(inventory), /Missing to Aligned Conditions/);
+});
+
+test("records reproducible archive source verification commands", () => {
+  const root = tempRoot();
+  writeJson(path.join(root, "package.json"), {
+    name: "@vendor/openclaw-archive",
+    version: "0.1.0",
+    type: "module",
+    openclaw: { extensions: ["./index.js"] },
+  });
+  writeText(path.join(root, "index.js"), "export default { register(api) { api.registerTool({ name: 'fixture' }); } };\n");
+  const computed = buildInventory({ sources: [{ name: "openclaw-weixin", root }] }).sources[0].ref;
+
+  const inventory = buildInventory({ sources: [{ name: "openclaw-weixin", root, ref: computed, source_url: "npm:@vendor/openclaw-archive" }] });
+  const source = inventory.sources[0];
+
+  assert.equal(source.source_url, "npm:@vendor/openclaw-archive");
+  assert.equal(source.ref_verification.status, "verified");
+  assert.match(source.ref_verification.reproduce_command, /openclaw-plugin-inventory\.mjs/);
+  assert.match(source.ref_verification.reproduce_command, /--source openclaw-weixin:/);
+  assert.match(source.ref_verification.reproduce_command, /--source-ref openclaw-weixin:archive-sha256:/);
+  assert.match(renderMarkdown(inventory), /Archive verification/);
+  assert.match(renderMarkdown(inventory), /npm:@vendor\/openclaw-archive/);
+});
+
 test("classifies OpenClaw web search providers as provider capabilities", () => {
   const root = tempRoot();
   const pluginRoot = path.join(root, "extensions", "duckduckgo");

@@ -351,6 +351,36 @@ test("fails release gate when representative plugin evidence is absent", () => {
   assert.ok(!result.errors.some((error) => error.code === "missing_representative_plugin_evidence" && error.recordId === "openclaw-china"));
 });
 
+test("fails release gate when source boundary plugin counts do not match records", () => {
+  const matrix = {
+    sources: [
+      { name: "openclaw", exists: true, ref: "3e72c0352d", plugin_count: 2 },
+      { name: "openclaw-china", exists: true, ref: "a36d023", plugin_count: 0 },
+      { name: "openclaw-weixin", exists: true, ref: "archive-sha256:abc", plugin_count: 0 },
+      { name: "clawmate", exists: true, ref: "580e011", plugin_count: 0 },
+      { name: "qmd", exists: true, ref: "9a8b7c6", plugin_count: 0 },
+    ],
+    summary: {
+      plugin_count: 1,
+      by_source: { openclaw: 2 },
+      source_boundary: {
+        total_from_sources: 2,
+        plugin_count_matches_sources: false,
+      },
+    },
+    plugins: [alignedRecord("one-openclaw")],
+  };
+
+  const result = validateOpenClawCompatGate({
+    inventory: { plugins: [] },
+    matrix,
+  });
+
+  assert.equal(result.ok, false);
+  assert.ok(result.errors.some((error) => error.code === "source_plugin_count_mismatch" && error.recordId === "openclaw"));
+  assert.ok(result.errors.some((error) => error.code === "summary_plugin_count_mismatch" && error.recordId === "plugin_count"));
+});
+
 test("fails release gate when release blockers are present", () => {
   const result = validateOpenClawCompatGate({
     inventory: { plugins: [] },
