@@ -10,12 +10,12 @@ import std.time.DateTime
 import stdx.encoding.json.{JsonArray, JsonBool, JsonFloat, JsonInt, JsonObject, JsonString, JsonValue}
 
 public const OPENCLAW_CHANNEL_HTTP_SCHEMA: String = "openclaw.channel_http.v1"
-public const OPENCLAW_CHANNEL_START_METHOD: String = "openclaw.channel.start"
-public const OPENCLAW_CHANNEL_STOP_METHOD: String = "openclaw.channel.stop"
-public const OPENCLAW_CHANNEL_PULL_INBOUND_METHOD: String = "openclaw.channel.pullInbound"
-public const OPENCLAW_CHANNEL_SEND_METHOD: String = "openclaw.channel.send"
-public const OPENCLAW_CHANNEL_HEALTH_METHOD: String = "openclaw.channel.health"
-public const OPENCLAW_HTTP_DISPATCH_METHOD: String = "openclaw.http.dispatch"
+public const OPENCLAW_CHANNEL_START_METHOD: String = "channel.start"
+public const OPENCLAW_CHANNEL_STOP_METHOD: String = "channel.stop"
+public const OPENCLAW_CHANNEL_PULL_INBOUND_METHOD: String = "channel.pullInbound"
+public const OPENCLAW_CHANNEL_SEND_METHOD: String = "channel.send"
+public const OPENCLAW_CHANNEL_HEALTH_METHOD: String = "channel.health"
+public const OPENCLAW_HTTP_DISPATCH_METHOD: String = "http.dispatch"
 
 public interface OpenClawBridgeRunner {
     func invoke(method: String, payload: JsonObject): JsonObject
@@ -176,6 +176,7 @@ private func ocBasePayload(kind: String): JsonObject {
 private func ocChannelBasePayload(kind: String, channelId: String, accountId: String): JsonObject {
     let out = ocBasePayload(kind)
     out.put("channelId", JsonString(channelId.trimAscii()))
+    out.put("id", JsonString(channelId.trimAscii()))
     out.put("accountId", JsonString(accountId.trimAscii()))
     return out
 }
@@ -216,6 +217,17 @@ public func openClawChannelSendPayload(
     out.put("mediaRefs", mediaRefs)
     out.put("chatType", JsonString(chatType.trimAscii().toAsciiLower()))
     out.put("rawMetadata", rawMetadata)
+    let message = JsonObject()
+    message.put("channelId", JsonString(channelId.trimAscii()))
+    message.put("id", JsonString(channelId.trimAscii()))
+    message.put("accountId", JsonString(accountId.trimAscii()))
+    message.put("peerId", JsonString(peerId.trimAscii()))
+    message.put("text", JsonString(text))
+    message.put("replyToMessageId", JsonString(replyToMessageId.trimAscii()))
+    message.put("mediaRefs", mediaRefs)
+    message.put("chatType", JsonString(chatType.trimAscii().toAsciiLower()))
+    message.put("rawMetadata", rawMetadata)
+    out.put("message", message)
     ocPutOptionalString(out, "threadId", threadId)
     return out
 }

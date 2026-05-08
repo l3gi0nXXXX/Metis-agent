@@ -3,7 +3,8 @@ package metis.gateway.openclaw_http
 import metis.gateway.openclaw_channel_http.OpenClawBridgeRunner
 
 import std.collection.ArrayList
-import stdx.encoding.json.{JsonObject, JsonString}
+import std.convert.Parsable
+import stdx.encoding.json.{JsonArray, JsonFloat, JsonInt, JsonObject, JsonString}
 
 public class OpenClawHttpRouteRegistration {
     public let pluginId: String
@@ -110,4 +111,107 @@ public class OpenClawHttpRouteRegistry {
 
 public func openClawHttpSidecarPublicListenerEnabled(): Bool {
     false
+}
+
+private func openClawHttpCaptureObject(obj: JsonObject, key: String): JsonObject {
+    match (obj.get(key)) {
+        case Some(v) => try { v.asObject() } catch (_e: Exception) { JsonObject() }
+        case None => JsonObject()
+    }
+}
+
+private func openClawHttpCaptureArray(obj: JsonObject, key: String): JsonArray {
+    match (obj.get(key)) {
+        case Some(v) => try { v.asArray() } catch (_e: Exception) { JsonArray([]) }
+        case None => JsonArray([])
+    }
+}
+
+private func openClawHttpCaptureString(obj: JsonObject, key: String): String {
+    match (obj.get(key)) {
+        case Some(v) => try { v.asString().getValue().trimAscii() } catch (_e: Exception) { "" }
+        case None => ""
+    }
+}
+
+private func openClawHttpCaptureString(obj: JsonObject, keys: Array<String>): String {
+    for (key in keys) {
+        let value = openClawHttpCaptureString(obj, key)
+        if (!value.isEmpty()) {
+            return value
+        }
+    }
+    ""
+}
+
+private func openClawHttpCaptureInt(obj: JsonObject, key: String, fallback: Int64): Int64 {
+    match (obj.get(key)) {
+        case Some(v) =>
+            match (v) {
+                case i: JsonInt => i.getValue()
+                case f: JsonFloat => Int64(f.getValue())
+                case _ => try { Int64.parse(v.asString().getValue().trimAscii()) } catch (_e: Exception) { fallback }
+            }
+        case None => fallback
+    }
+}
+
+private func openClawHttpCapturedCapabilityArray(capture: JsonObject, key: String): JsonArray {
+    let direct = openClawHttpCaptureArray(capture, key)
+    if (direct.size() > 0) {
+        return direct
+    }
+    openClawHttpCaptureArray(openClawHttpCaptureObject(capture, "capabilities"), key)
+}
+
+private func registerOpenClawCapturedHttpRouteRecord(record: JsonObject, runner: OpenClawBridgeRunner): Bool {
+    let spec = openClawHttpCaptureObject(record, "spec")
+    let pluginMeta = openClawHttpCaptureObject(spec, "plugin")
+    var pluginId = openClawHttpCaptureString(record, "pluginId")
+    if (pluginId.isEmpty()) {
+        pluginId = openClawHttpCaptureString(pluginMeta, ["id", "name"])
+    }
+    var path = openClawHttpCaptureString(record, "path")
+    if (path.isEmpty()) {
+        path = openClawHttpCaptureString(spec, "path")
+    }
+    if (path.isEmpty()) {
+        return false
+    }
+    if (pluginId.isEmpty()) {
+        pluginId = path
+    }
+    var method = openClawHttpCaptureString(record, "method")
+    if (method.isEmpty()) {
+        method = openClawHttpCaptureString(spec, "method")
+    }
+    if (method.isEmpty()) {
+        method = "POST"
+    }
+    let maxBodyBytes = openClawHttpCaptureInt(spec, "maxBodyBytes", openClawHttpCaptureInt(record, "maxBodyBytes", 1048576))
+    let timeoutMs = openClawHttpCaptureInt(spec, "timeoutMs", openClawHttpCaptureInt(record, "timeoutMs", 3000))
+    OpenClawHttpRouteRegistry.register(
+        OpenClawHttpRouteRegistration(
+            pluginId,
+            method,
+            path,
+            runner,
+            maxBodyBytes: maxBodyBytes,
+            timeoutMs: timeoutMs
+        )
+    ).ok
+}
+
+public func registerOpenClawCapturedHttpRoutes(capture: JsonObject, runner: OpenClawBridgeRunner): Int64 {
+    var count: Int64 = 0
+    for (group in ["httpRoutes", "httpHandlers"]) {
+        let routes = openClawHttpCapturedCapabilityArray(capture, group)
+        for (i in 0..routes.size()) {
+            let record = try { routes[i].asObject() } catch (_e: Exception) { JsonObject() }
+            if (registerOpenClawCapturedHttpRouteRecord(record, runner)) {
+                count += 1
+            }
+        }
+    }
+    count
 }

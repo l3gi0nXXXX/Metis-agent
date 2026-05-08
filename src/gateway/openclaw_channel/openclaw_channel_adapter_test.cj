@@ -120,4 +120,86 @@ public class OpenClawChannelAdapterTest {
         @Expect(runner.payloads[0].get("token").isNone(), true)
         @Expect(runner.payloads[0].get("configPath").isNone(), true)
     }
+
+    @TestCase
+    public func hostCapturedRepresentativeChannelsAutoRegisterAndBridgeGatewayLoop(): Unit {
+        let runner = FakeOpenClawChannelRunner()
+        let channels = JsonArray([])
+        for (channelId in ["openclaw-weixin", "dingtalk", "feishu", "qqbot"]) {
+            let spec = JsonObject()
+            spec.put("id", JsonString(channelId))
+            let accounts = JsonArray([])
+            accounts.add(JsonString("${channelId}:acct-a"))
+            accounts.add(JsonString("${channelId}:acct-b"))
+            spec.put("accountIds", accounts)
+            let row = JsonObject()
+            row.put("pluginId", JsonString(channelId))
+            row.put("id", JsonString(channelId))
+            row.put("spec", spec)
+            channels.add(row)
+        }
+        let capabilities = JsonObject()
+        capabilities.put("channels", channels)
+        let capture = JsonObject()
+        capture.put("capabilities", capabilities)
+
+        let registered = registerOpenClawCapturedChannelPlugins(capture, runner)
+
+        @Expect(registered, 4)
+        for (channelId in ["openclaw-weixin", "dingtalk", "feishu", "qqbot"]) {
+            let plugin = GatewayChannelPluginRegistry.getById(channelId).getOrThrow()
+            let adapters = plugin.createAdapters(JsonObject())
+            @Expect(adapters.size, 2)
+
+            runner.enqueue(okChannel("started"))
+            adapters[0].start()
+
+            let raw = JsonObject()
+            raw.put("platform", JsonString(channelId))
+            raw.put("rawEventId", JsonString("raw-${channelId}"))
+            let media = JsonArray([])
+            let mediaRef = JsonObject()
+            mediaRef.put("kind", JsonString("image"))
+            mediaRef.put("mediaId", JsonString("media-${channelId}"))
+            media.add(mediaRef)
+            let inbound = JsonObject()
+            inbound.put("accountId", JsonString("${channelId}:acct-a"))
+            inbound.put("messageId", JsonString("msg-${channelId}"))
+            inbound.put("peerId", JsonString("room-${channelId}"))
+            inbound.put("senderId", JsonString("user-${channelId}"))
+            inbound.put("text", JsonString("hello ${channelId}"))
+            inbound.put("chatType", JsonString("group"))
+            inbound.put("threadId", JsonString("thread-${channelId}"))
+            inbound.put("replyToMessageId", JsonString("reply-${channelId}"))
+            inbound.put("mediaRefs", media)
+            inbound.put("rawMetadata", raw)
+            let messages = JsonArray([])
+            messages.add(inbound)
+            let pull = okChannel("ok")
+            pull.put("messages", messages)
+            runner.enqueue(pull)
+            let pulled = adapters[0].pullInbound()
+            @Expect(pulled.size, 1)
+            @Expect(pulled[0].accountId, "${channelId}:acct-a")
+            @Expect(pulled[0].threadId.getOrThrow(), "thread-${channelId}")
+            @Expect(pulled[0].replyTargetMessageId.getOrThrow(), "reply-${channelId}")
+            @Expect(pulled[0].mediaContext.toJsonString().contains("media-${channelId}"), true)
+            @Expect(pulled[0].raw.getOrThrow().contains("raw-${channelId}"), true)
+
+            let send = okChannel("sent")
+            send.put("messageId", JsonString("out-${channelId}"))
+            runner.enqueue(send)
+            let sent = adapters[0].sendWithMessageId(
+                OutboundMessage(
+                    ChannelType.Extension(channelId),
+                    "room-${channelId}",
+                    "reply ${channelId}",
+                    replyToMessageId: Some("msg-${channelId}"),
+                    replyInThread: true,
+                    accountId: "${channelId}:acct-a"
+                )
+            )
+            @Expect(sent, "out-${channelId}")
+        }
+    }
 }

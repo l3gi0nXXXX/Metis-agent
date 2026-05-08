@@ -5,7 +5,7 @@ import metis.gateway.openclaw_channel_http.{OPENCLAW_HTTP_DISPATCH_METHOD, OpenC
 
 import std.collection.ArrayList
 import std.unittest.testmacro.*
-import stdx.encoding.json.{JsonObject, JsonString}
+import stdx.encoding.json.{JsonArray, JsonObject, JsonString}
 
 private class FakeOpenClawHttpRunner <: OpenClawBridgeRunner {
     public let methods = ArrayList<String>()
@@ -117,5 +117,58 @@ public class OpenClawHttpDispatcherTest {
         @Expect(handler.ok, false)
         @Expect(handler.statusCode, 500)
         @Expect(handler.diagnosticKind, "handler_error")
+    }
+
+    @TestCase
+    public func hostCapturedWechatAndWecomWebhookRoutesAutoRegisterAndPreserveRequestShape(): Unit {
+        OpenClawHttpRouteRegistry.clearForTest()
+        let runner = FakeOpenClawHttpRunner()
+        let routes = JsonArray([])
+        for (pluginId in ["wechat-mp", "wecom", "wecom-app", "wecom-kf"]) {
+            let spec = JsonObject()
+            spec.put("method", JsonString("POST"))
+            spec.put("path", JsonString("/webhook/${pluginId}"))
+            spec.put("timeoutMs", 1800.toJsonValue())
+            spec.put("maxBodyBytes", 2048.toJsonValue())
+            let row = JsonObject()
+            row.put("pluginId", JsonString(pluginId))
+            row.put("method", JsonString("POST"))
+            row.put("path", JsonString("/webhook/${pluginId}"))
+            row.put("spec", spec)
+            routes.add(row)
+        }
+        let capabilities = JsonObject()
+        capabilities.put("httpRoutes", routes)
+        let capture = JsonObject()
+        capture.put("capabilities", capabilities)
+
+        let registered = registerOpenClawCapturedHttpRoutes(capture, runner)
+
+        @Expect(registered, 4)
+        for (pluginId in ["wechat-mp", "wecom", "wecom-app", "wecom-kf"]) {
+            runner.enqueue(okHttp(200, "{\"plugin\":\"${pluginId}\"}"))
+            let query = JsonObject()
+            query.put("timestamp", JsonString("123"))
+            query.put("nonce", JsonString("abc"))
+            let headers = JsonObject()
+            headers.put("x-wechat-signature", JsonString("mock-signature"))
+            headers.put("content-type", JsonString("application/json"))
+            let result = OpenClawHttpDispatcher.dispatch(
+                "POST",
+                "/webhook/${pluginId}",
+                query: query,
+                headers: headers,
+                body: "{\"plugin\":\"${pluginId}\",\"message\":\"mock\"}"
+            )
+            @Expect(result.ok, true)
+            @Expect(result.body, "{\"plugin\":\"${pluginId}\"}")
+            let payload = runner.payloads[runner.payloads.size - 1]
+            @Expect(jstr(payload, "method"), "POST")
+            @Expect(jstr(payload, "path"), "/webhook/${pluginId}")
+            @Expect(jstr(payload.get("query").getOrThrow().asObject(), "timestamp"), "123")
+            @Expect(jstr(payload.get("headers").getOrThrow().asObject(), "x-wechat-signature"), "mock-signature")
+            @Expect(jstr(payload, "body"), "{\"plugin\":\"${pluginId}\",\"message\":\"mock\"}")
+        }
+        @Expect(openClawHttpSidecarPublicListenerEnabled(), false)
     }
 }
