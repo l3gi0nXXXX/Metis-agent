@@ -143,3 +143,31 @@ test("redacts secret and token fields without destroying normalized capability s
   assert.equal(report.groups.provider.records[0].raw.apiKey, "[REDACTED]");
   assert.equal(report.groups.channel.records[0].raw.botToken, "[REDACTED]");
 });
+
+test("normalizes host-captured approval and interactive handler collections", () => {
+  const report = normalizeCapabilityRegistry({
+    source: "openclaw-host-capture",
+    capabilities: {
+      approvalHandlers: [
+        {
+          id: "approval-generic",
+          metisStatus: "aligned",
+          acceptanceTests: ["approval.dispatch routes by channel/account/peer/thread scope"],
+        },
+      ],
+      interactiveHandlers: [
+        {
+          id: "interactive-generic",
+          metisStatus: "aligned",
+          acceptanceTests: ["interactive.dispatch routes by channel/account/peer/thread scope"],
+        },
+      ],
+    },
+  });
+
+  assert.equal(report.groups.approval.status, "aligned");
+  assert.equal(report.groups.approval.records[0].id, "approval-generic");
+  assert.equal(report.groups.interactive.status, "aligned");
+  assert.equal(report.groups.interactive.records[0].id, "interactive-generic");
+  assert.equal(report.releaseGate.zeroCostCompatible, true);
+});

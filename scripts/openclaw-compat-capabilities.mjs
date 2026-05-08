@@ -18,8 +18,8 @@ const GROUPS = [
   { name: "hook", aliases: ["hook", "hooks"], keys: ["hooks"] },
   { name: "command", aliases: ["command", "commands"], keys: ["commands"] },
   { name: "cli", aliases: ["cli", "clis", "cliCommand", "cli-command"], keys: ["cli", "cliCommands"] },
-  { name: "approval", aliases: ["approval", "approvals"], keys: ["approvals"] },
-  { name: "interactive", aliases: ["interactive", "interactives"], keys: ["interactive", "interactives"] },
+  { name: "approval", aliases: ["approval", "approvals"], keys: ["approvals", "approvalHandlers"] },
+  { name: "interactive", aliases: ["interactive", "interactives"], keys: ["interactive", "interactives", "interactiveHandlers"] },
   { name: "memory", aliases: ["memory", "memories"], keys: ["memory", "memories"] },
   { name: "media", aliases: ["media", "medias", "attachment", "attachments"], keys: ["media", "attachments"] },
   { name: "process", aliases: ["process", "processes"], keys: ["processes", "process"] },
@@ -105,7 +105,7 @@ function normalizeAcceptanceTests(value) {
 
 function capabilityEntries(capture) {
   const out = [];
-  const containers = [capture, isObject(capture.registry) ? capture.registry : null].filter(Boolean);
+  const containers = [capture, isObject(capture.registry) ? capture.registry : null, isObject(capture.capabilities) ? capture.capabilities : null].filter(Boolean);
 
   for (const item of asArray(capture.capabilities)) {
     if (isObject(item)) out.push(item);

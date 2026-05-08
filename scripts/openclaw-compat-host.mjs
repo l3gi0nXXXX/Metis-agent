@@ -745,6 +745,30 @@ async function dispatchHook(state, params) {
   return callHandler(entry.handler, [params.payload ?? {}, params.context ?? {}], ["dispatch", "handle"]);
 }
 
+async function dispatchCommand(state, params) {
+  const entry = findHandlerEntry(state, "commands", params, ["name", "id", "command"]);
+  if (!entry) {
+    return handlerNotFound("commands", params);
+  }
+  return callHandler(entry.handler, [params.args ?? [], params.context ?? {}], ["execute", "run", "handle"]);
+}
+
+async function dispatchInteractive(state, params) {
+  const entry = findHandlerEntry(state, "interactiveHandlers", params, ["id", "name", "namespace"]);
+  if (!entry) {
+    return handlerNotFound("interactiveHandlers", params);
+  }
+  return callHandler(entry.handler, [params.payload ?? {}, params.scope ?? {}, params.context ?? {}], ["dispatch", "handle"]);
+}
+
+async function dispatchApproval(state, params) {
+  const entry = findHandlerEntry(state, "approvalHandlers", params, ["id", "name", "namespace"]);
+  if (!entry) {
+    return handlerNotFound("approvalHandlers", params);
+  }
+  return callHandler(entry.handler, [params.payload ?? {}, params.scope ?? {}, params.context ?? {}], ["dispatch", "handle"]);
+}
+
 async function handleRequest(state, request) {
   const id = request?.id ?? null;
   try {
@@ -799,6 +823,15 @@ async function handleRequest(state, request) {
     }
     if (method === "hook.dispatch") {
       return response(id, await dispatchHook(state, params));
+    }
+    if (method === "command.execute") {
+      return response(id, await dispatchCommand(state, params));
+    }
+    if (method === "interactive.dispatch") {
+      return response(id, await dispatchInteractive(state, params));
+    }
+    if (method === "approval.dispatch") {
+      return response(id, await dispatchApproval(state, params));
     }
     return response(id, null, { code: -32601, message: `unknown method: ${method}` });
   } catch (error) {

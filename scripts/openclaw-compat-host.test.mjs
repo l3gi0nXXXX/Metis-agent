@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
 import { spawn, spawnSync } from "node:child_process";
 import path from "node:path";
 import test from "node:test";
@@ -98,6 +100,35 @@ function startHost(t) {
 
 function byName(items, name) {
   return items.find((item) => item.name === name || item.id === name || item.path === name || item.command === name);
+}
+
+function makeToolFixture(t) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "metis-openclaw-gap08-tools-"));
+  fs.writeFileSync(
+    path.join(root, "package.json"),
+    JSON.stringify({ name: "gap08-tool-fixture", type: "module", main: "index.mjs" }),
+  );
+  fs.writeFileSync(
+    path.join(root, "index.mjs"),
+    `
+export default async function register(api) {
+  for (const name of ["firecrawl.search", "tavily.search", "exa.search", "clawmate.plan"]) {
+    api.registerTool(
+      {
+        name,
+        inputSchema: { type: "object", required: ["query"], properties: { query: { type: "string" } } },
+        timeoutMs: 9000,
+        permissions: ["network:https://api.example.invalid"],
+        resultShape: { ok: "ok", content: "content", error: "error" },
+      },
+      async (input, context) => ({ ok: true, content: name + ":" + input.query, context })
+    );
+  }
+}
+`,
+  );
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  return root;
 }
 
 test("persistent host loads raw register(api) plugin and captures OpenClaw capabilities", async (t) => {
@@ -233,8 +264,51 @@ test("persistent host dispatches registered channel, HTTP, tool, provider, and h
   const hook = await host.request("hook.dispatch", { name: "message.received", payload: { text: "hook me" } });
   assert.deepEqual(hook.result, { ok: true, hook: "message.received", text: "hook me" });
 
+  const command = await host.request("command.execute", { name: "fixture-command", args: ["doctor"], context: { channel: "generic" } });
+  assert.deepEqual(command.result, { ok: true });
+
+  const interactive = await host.request("interactive.dispatch", {
+    id: "fixture-interactive",
+    payload: { data: "clicked" },
+    scope: { channelId: "generic", accountId: "acct-1", peerId: "peer-1", threadId: "thread-1" },
+  });
+  assert.deepEqual(interactive.result, { ok: true });
+
+  const approval = await host.request("approval.dispatch", {
+    id: "fixture-approval",
+    payload: { decision: "allow-once" },
+    scope: { channelId: "generic", accountId: "acct-1", peerId: "peer-1", threadId: "thread-1" },
+  });
+  assert.deepEqual(approval.result, { ok: true });
+
   const stopChannel = await host.request("channel.stop", { id: "fixture-channel" });
   assert.deepEqual(stopChannel.result, { ok: true, status: "stopped", channelId: "fixture-channel" });
+});
+
+test("persistent host dispatches OpenClaw search tool fixtures through tool bridge shape", async (t) => {
+  const host = startHost(t);
+  const root = makeToolFixture(t);
+  const load = await host.request("plugin.load", {
+    roots: [root],
+    runtime: { version: "test-runtime" },
+    permissions: { fetch: true },
+  });
+
+  assert.equal(load.result.ok, true);
+  assert.equal(load.result.loadedPluginCount, 1);
+
+  for (const name of ["firecrawl.search", "tavily.search", "exa.search", "clawmate.plan"]) {
+    const dispatched = await host.request("tool.execute", {
+      name,
+      input: { query: "metis" },
+      context: { channelId: "generic", accountId: "acct-1", peerId: "peer-1", threadId: "thread-1" },
+    });
+    assert.deepEqual(dispatched.result, {
+      ok: true,
+      content: `${name}:metis`,
+      context: { channelId: "generic", accountId: "acct-1", peerId: "peer-1", threadId: "thread-1" },
+    });
+  }
 });
 
 test("--once plugin.discover reports missing entry diagnostics without executing plugins", () => {

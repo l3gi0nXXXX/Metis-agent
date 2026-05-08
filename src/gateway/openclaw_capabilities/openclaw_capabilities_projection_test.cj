@@ -1,7 +1,7 @@
 package metis.gateway.openclaw_capabilities
 
 import metis.core.model.{OpenClawProviderBridge, OpenClawProviderRegistration}
-import metis.core.tools.{OpenClawToolBridge, OpenClawToolRegistration}
+import metis.core.tools.{OpenClawMetisToolRegistry, OpenClawToolBridge, OpenClawToolDispatchRequest, OpenClawToolDispatchResult, OpenClawToolRegistration}
 import metis.gateway.openclaw_sandbox.OpenClawSandboxGrantSet
 
 import std.unittest.testmacro.*
@@ -35,20 +35,86 @@ public class OpenClawCapabilitiesProjectionTest {
     }
 
     @TestCase
+    public func toolRegistryDispatchesThroughMetisBridgeAndKeepsResultShape(): Unit {
+        let tool = OpenClawToolRegistration(
+            "tavily.search",
+            "{\"type\":\"object\",\"required\":[\"query\"]}",
+            requiredPermissions: ["network:https://api.tavily.com"],
+            timeoutMs: 9000,
+            contextScopes: ["channel", "account", "peer", "thread"],
+            resultOkKey: "ok",
+            resultContentKey: "content",
+            resultErrorKey: "error"
+        )
+        let projection = OpenClawToolBridge.project(tool, OpenClawSandboxGrantSet(["network:https://api.tavily.com"]))
+        let registry = OpenClawMetisToolRegistry()
+
+        registry.register(projection, { request: OpenClawToolDispatchRequest =>
+            OpenClawToolDispatchResult(
+                true,
+                content: "tool=${request.name};thread=${request.threadId};input=${request.inputJson}",
+                rawJson: "{\"ok\":true,\"content\":\"fixture\"}"
+            )
+        })
+
+        let listed = registry.list()
+        let result = registry.dispatch(OpenClawToolDispatchRequest(
+            "tavily.search",
+            inputJson: "{\"query\":\"metis\"}",
+            channelId: "generic",
+            accountId: "acct-1",
+            peerId: "peer-1",
+            threadId: "thread-1"
+        ))
+
+        @Expect(listed.size, 1)
+        @Expect(listed[0].inputSchema.contains("\"query\""), true)
+        @Expect(listed[0].timeoutMs, 9000)
+        @Expect(listed[0].resultShape.contentKey, "content")
+        @Expect(result.ok, true)
+        @Expect(result.content.contains("thread=thread-1"), true)
+        @Expect(result.rawJson.contains("\"ok\":true"), true)
+    }
+
+    @TestCase
     public func commandHookApprovalAndInteractiveProjectionAreChannelNeutralAndScoped(): Unit {
         let scope = OpenClawCapabilityScope("generic", "acct-1", "room-7", "thread-3")
         let command = OpenClawCommandProjection("doctor", summary: "Inspect runtime health", aliases: ["health"], requiredPermissions: ["gateway:read"])
         let hook = OpenClawHookProjection("message_media_lifecycle", ["message", "media", "sent-result", "reasoning", "tool-progress"], channelSpecific: false)
         let approval = OpenClawRoutedProjection("tool-execution", scope)
         let interactive = OpenClawRoutedProjection("confirm-button", scope)
+        let catalog = OpenClawCommandCatalog()
+        let hookRegistry = OpenClawLifecycleHookRegistry()
+        let scopedRegistry = OpenClawScopedDispatchRegistry()
+
+        catalog.register(command)
+        hookRegistry.register(hook, { event: OpenClawLifecycleHookEvent =>
+            OpenClawLifecycleHookResult(true, payloadJson: "{\"stage\":\"${event.stage}\",\"payload\":${event.payloadJson}}")
+        })
+        scopedRegistry.registerApproval(approval, { request: OpenClawScopedDispatchRequest =>
+            OpenClawScopedDispatchResult(true, status: "approved", payloadJson: request.payloadJson)
+        })
+        scopedRegistry.registerInteractive(interactive, { request: OpenClawScopedDispatchRequest =>
+            OpenClawScopedDispatchResult(true, status: "handled", payloadJson: request.payloadJson)
+        })
+
+        let hookResults = hookRegistry.dispatch(OpenClawLifecycleHookEvent("tool-progress", "{\"percent\":50}", scope))
+        let approvalResult = scopedRegistry.dispatchApproval(OpenClawScopedDispatchRequest("tool-execution", scope, payloadJson: "{\"decision\":\"allow\"}"))
+        let interactiveResult = scopedRegistry.dispatchInteractive(OpenClawScopedDispatchRequest("confirm-button", scope, payloadJson: "{\"data\":\"ok\"}"))
 
         @Expect(command.catalogKey(), "doctor")
         @Expect(command.aliases[0], "health")
         @Expect(command.requiredPermissions[0], "gateway:read")
+        @Expect(catalog.contains("health"), true)
+        @Expect(catalog.list()[0].summary, "Inspect runtime health")
         @Expect(hook.canDispatch("media", scope), true)
         @Expect(hook.channelSpecific, false)
+        @Expect(hookResults.size, 1)
+        @Expect(hookResults[0].payloadJson.contains("tool-progress"), true)
         @Expect(approval.routeKey(), "generic/acct-1/room-7/thread-3/tool-execution")
         @Expect(interactive.routeKey(), "generic/acct-1/room-7/thread-3/confirm-button")
+        @Expect(approvalResult.status, "approved")
+        @Expect(interactiveResult.status, "handled")
     }
 
     @TestCase
