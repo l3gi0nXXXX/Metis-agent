@@ -543,15 +543,21 @@ function enforceStartGate(state, plugin, capabilityRecords, phase) {
 }
 
 async function dispatchThroughSecurity(state, entry, stage, handler) {
-  if (!state.security.enabled) {
-    return handler();
-  }
   const plugin = state.plugins.find((candidate) => candidate.id === entry.record.pluginId) ?? {
     id: entry.record.pluginId,
     root: "",
     manifestPath: "",
     packagePath: "",
   };
+  if (!state.security.enabled) {
+    const decision = await createSecurityEnforcer(state, plugin, []).runGuardedHandler(stage, handler, {
+      timeoutMs: state.security.handlerTimeoutMs,
+    });
+    if (!decision.allowed) {
+      return decision;
+    }
+    return decision.diagnostics?.result ?? { ok: true };
+  }
   const permissionRequests = derivePermissionRequirements({ capabilityRecords: [entry.record.spec ?? entry.record] });
   const decision = await createSecurityEnforcer(state, plugin, []).dispatchHandler(stage, permissionRequests, handler, {
     timeoutMs: state.security.handlerTimeoutMs,
@@ -575,10 +581,17 @@ function buildApi(state, plugin) {
     logger: runtime.logger,
     registerTool: (spec, handler) => registerCapabilityWithHandler(state, "tools", pluginId, spec, handler),
     registerProvider: (spec, handler) => registerCapabilityWithHandler(state, "providers", pluginId, spec, handler),
+    registerWebSearchProvider: (spec, handler) => registerCapabilityWithHandler(state, "providers", pluginId, spec, handler, {
+      kind: "web-search",
+    }),
     registerChannel: (spec, handler) => registerCapabilityWithHandler(state, "channels", pluginId, spec, handler),
     registerHook: (kindOrSpec, handler) => {
       const spec = typeof kindOrSpec === "string" ? { name: kindOrSpec } : kindOrSpec;
       registerCapabilityWithHandler(state, "hooks", pluginId, spec, handler);
+    },
+    registerMessageHook: (kindOrSpec, handler) => {
+      const spec = typeof kindOrSpec === "string" ? { name: kindOrSpec } : kindOrSpec;
+      registerCapabilityWithHandler(state, "hooks", pluginId, spec, handler, { kind: "message" });
     },
     registerCommand: (spec, handler) => registerCapabilityWithHandler(state, "commands", pluginId, spec, handler),
     registerCli: (spec, handler) => registerCapabilityWithHandler(state, "clis", pluginId, spec, handler),
@@ -604,6 +617,7 @@ function buildApi(state, plugin) {
             code: "unknown_capability",
             pluginId,
             capability: property,
+            releaseBlocker: true,
             args,
           });
         };
@@ -904,6 +918,26 @@ async function dispatchCommand(state, params) {
   );
 }
 
+async function dispatchCli(state, params) {
+  const entry = findHandlerEntry(state, "clis", params, ["name", "id", "command"]);
+  if (!entry) {
+    return handlerNotFound("clis", params);
+  }
+  return dispatchThroughSecurity(state, entry, "cli.execute", () =>
+    callHandler(entry.handler, [params.args ?? [], params.context ?? {}], ["execute", "run", "handle"]),
+  );
+}
+
+async function dispatchGatewayMethod(state, params) {
+  const entry = findHandlerEntry(state, "gatewayMethods", params, ["name", "id", "method"]);
+  if (!entry) {
+    return handlerNotFound("gatewayMethods", params);
+  }
+  return dispatchThroughSecurity(state, entry, "gateway.invoke", () =>
+    callHandler(entry.handler, [params.request ?? params.payload ?? {}, params.context ?? {}], ["invoke", "execute", "handle"]),
+  );
+}
+
 async function dispatchInteractive(state, params) {
   const entry = findHandlerEntry(state, "interactiveHandlers", params, ["id", "name", "namespace"]);
   if (!entry) {
@@ -981,6 +1015,12 @@ async function handleRequest(state, request) {
     }
     if (method === "command.execute") {
       return response(id, await dispatchCommand(state, params));
+    }
+    if (method === "cli.execute") {
+      return response(id, await dispatchCli(state, params));
+    }
+    if (method === "gateway.invoke") {
+      return response(id, await dispatchGatewayMethod(state, params));
     }
     if (method === "interactive.dispatch") {
       return response(id, await dispatchInteractive(state, params));

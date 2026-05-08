@@ -131,6 +131,39 @@ export default async function register(api) {
   return root;
 }
 
+function makeGap03Fixture(t) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "metis-openclaw-gap03-host-"));
+  fs.writeFileSync(
+    path.join(root, "package.json"),
+    JSON.stringify({ name: "gap03-host-fixture", type: "module", main: "index.mjs" }),
+    "utf8",
+  );
+  fs.writeFileSync(
+    path.join(root, "index.mjs"),
+    `
+export default async function register(api) {
+  api.registerWebSearchProvider({ id: "fixture-web-search", kind: "web-search" }, {
+    invoke: async (request) => ({ ok: true, provider: "fixture-web-search", query: request.query })
+  });
+  api.registerMessageHook("message.created", async (payload) => ({ ok: true, hook: "message.created", text: payload.text }));
+  api.registerCli({ name: "fixture-cli-dispatch" }, async (args) => ({ ok: true, args }));
+  api.registerGatewayMethod({ name: "fixture.gateway.dispatch" }, async (request) => ({ ok: true, request }));
+  api.registerTool({ name: "fixture.crash" }, async () => {
+    throw new Error("boom GAP03_SECRET_TOKEN");
+  });
+  api.registerTool({ name: "fixture.timeout" }, async () => {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    return { ok: true };
+  });
+  api.registerMystery({ id: "fixture-mystery", token: "GAP03_SECRET_TOKEN" });
+}
+`,
+    "utf8",
+  );
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  return root;
+}
+
 test("persistent host loads raw register(api) plugin and captures OpenClaw capabilities", async (t) => {
   const host = startHost(t);
   const load = await host.request("plugin.load", {
@@ -172,7 +205,12 @@ test("persistent host loads raw register(api) plugin and captures OpenClaw capab
   assert.equal(byName(registries.httpRoutes, "/fixture").dispatch.method, "http.dispatch");
 
   assert.ok(
-    registered.result.diagnostics.some((diagnostic) => diagnostic.code === "unknown_capability" && diagnostic.capability === "registerWidget"),
+    registered.result.diagnostics.some(
+      (diagnostic) =>
+        diagnostic.code === "unknown_capability" &&
+        diagnostic.capability === "registerWidget" &&
+        diagnostic.releaseBlocker === true,
+    ),
   );
   assert.equal(registered.result.diagnostics.some((diagnostic) => diagnostic.code === "runtime_placeholder"), false);
 
@@ -182,6 +220,34 @@ test("persistent host loads raw register(api) plugin and captures OpenClaw capab
 
   const stop = await host.request("runtime.stop");
   assert.equal(stop.result.ok, true);
+});
+
+test("persistent host captures OpenClaw SDK register aliases without converting plugin manifests", async (t) => {
+  const host = startHost(t);
+  const root = makeGap03Fixture(t);
+  const load = await host.request("plugin.load", {
+    roots: [root],
+    runtime: { version: "test-runtime" },
+    secrets: { GAP03_SECRET_TOKEN: "GAP03_SECRET_TOKEN" },
+  });
+
+  assert.equal(load.result.ok, true);
+  assert.equal(load.result.loadedPluginCount, 1);
+
+  const registered = await host.request("plugin.registeredCapabilities");
+  assert.ok(byName(registered.result.capabilities.providers, "fixture-web-search"));
+  assert.ok(byName(registered.result.capabilities.hooks, "message.created"));
+  assert.equal(
+    registered.result.diagnostics.some((diagnostic) => diagnostic.capability === "registerWebSearchProvider"),
+    false,
+  );
+  assert.equal(
+    registered.result.diagnostics.some((diagnostic) => diagnostic.capability === "registerMessageHook"),
+    false,
+  );
+
+  const serialized = JSON.stringify(registered);
+  assert.equal(serialized.includes("GAP03_SECRET_TOKEN"), false);
 });
 
 test("discovers OpenClaw package entries from extensions, exports, dist, and TS source fallbacks", () => {
@@ -267,6 +333,12 @@ test("persistent host dispatches registered channel, HTTP, tool, provider, and h
   const command = await host.request("command.execute", { name: "fixture-command", args: ["doctor"], context: { channel: "generic" } });
   assert.deepEqual(command.result, { ok: true });
 
+  const cli = await host.request("cli.execute", { name: "fixture-cli", args: ["doctor"], context: { channel: "generic" } });
+  assert.deepEqual(cli.result, 0);
+
+  const gateway = await host.request("gateway.invoke", { name: "fixture.gateway", request: { value: 7 } });
+  assert.deepEqual(gateway.result, { ok: true });
+
   const interactive = await host.request("interactive.dispatch", {
     id: "fixture-interactive",
     payload: { data: "clicked" },
@@ -283,6 +355,48 @@ test("persistent host dispatches registered channel, HTTP, tool, provider, and h
 
   const stopChannel = await host.request("channel.stop", { id: "fixture-channel" });
   assert.deepEqual(stopChannel.result, { ok: true, status: "stopped", channelId: "fixture-channel" });
+});
+
+test("persistent host dispatches alias handlers and preserves OpenClaw result shapes", async (t) => {
+  const host = startHost(t);
+  const root = makeGap03Fixture(t);
+  const load = await host.request("plugin.load", { roots: [root], runtime: { version: "test-runtime" } });
+  assert.equal(load.result.loadedPluginCount, 1);
+
+  const provider = await host.request("provider.invoke", { id: "fixture-web-search", request: { query: "metis" } });
+  assert.deepEqual(provider.result, { ok: true, provider: "fixture-web-search", query: "metis" });
+
+  const hook = await host.request("hook.dispatch", { name: "message.created", payload: { text: "hello" } });
+  assert.deepEqual(hook.result, { ok: true, hook: "message.created", text: "hello" });
+
+  const cli = await host.request("cli.execute", { name: "fixture-cli-dispatch", args: ["doctor"] });
+  assert.deepEqual(cli.result, { ok: true, args: ["doctor"] });
+
+  const gateway = await host.request("gateway.invoke", { name: "fixture.gateway.dispatch", request: { value: 11 } });
+  assert.deepEqual(gateway.result, { ok: true, request: { value: 11 } });
+});
+
+test("persistent host returns redacted JS error evidence for crashed and timed-out handlers", async (t) => {
+  const host = startHost(t);
+  const root = makeGap03Fixture(t);
+  const load = await host.request("plugin.load", {
+    roots: [root],
+    runtime: { version: "test-runtime" },
+    secrets: { GAP03_SECRET_TOKEN: "GAP03_SECRET_TOKEN" },
+    handlerTimeoutMs: 10,
+  });
+  assert.equal(load.result.loadedPluginCount, 1);
+
+  const crashed = await host.request("tool.execute", { name: "fixture.crash" });
+  assert.equal(crashed.result.allowed, false);
+  assert.equal(crashed.result.code, "handler_crash");
+  assert.equal(JSON.stringify(crashed).includes("GAP03_SECRET_TOKEN"), false);
+  assert.equal(JSON.stringify(crashed).includes("[REDACTED]"), true);
+
+  const timedOut = await host.request("tool.execute", { name: "fixture.timeout" });
+  assert.equal(timedOut.result.allowed, false);
+  assert.equal(timedOut.result.code, "handler_timeout");
+  assert.equal(timedOut.result.diagnostics.timeoutMs, 10);
 });
 
 test("persistent host dispatches OpenClaw search tool fixtures through tool bridge shape", async (t) => {
