@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import { buildInventory, renderMarkdown } from "./openclaw-plugin-inventory.mjs";
+
+const scriptPath = path.join(path.dirname(fileURLToPath(import.meta.url)), "openclaw-plugin-inventory.mjs");
 
 function tempRoot() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "metis-openclaw-inventory-"));
@@ -167,4 +171,197 @@ test("discovers package workspace plugins such as ClawMate companion packages", 
   assert.equal(inventory.plugins[0].plugin_id, "clawmate-companion");
   assert.equal(inventory.plugins[0].discovered_by, "packages");
   assert.equal(inventory.plugins[0].metis_status, "partial");
+});
+
+test("accepts explicit source refs through the CLI for non-git source snapshots", () => {
+  const root = tempRoot();
+  const outJson = path.join(tempRoot(), "inventory.json");
+  writeJson(path.join(root, "package.json"), {
+    name: "@tencent/openclaw-weixin",
+    version: "0.0.1",
+    type: "module",
+    openclaw: { extensions: ["./index.ts"], channel: { id: "openclaw-weixin" } },
+  });
+  writeText(
+    path.join(root, "index.ts"),
+    `
+      export default {
+        register(api) {
+          api.registerChannel({ plugin: { id: "openclaw-weixin" } });
+        }
+      };
+    `
+  );
+
+  execFileSync(process.execPath, [
+    scriptPath,
+    "--source",
+    `openclaw-weixin:${root}`,
+    "--source-ref",
+    "openclaw-weixin:archive-sha256:fixturehash",
+    "--out-json",
+    outJson,
+  ]);
+
+  const inventory = JSON.parse(fs.readFileSync(outJson, "utf8"));
+  assert.equal(inventory.sources[0].ref, "archive-sha256:fixturehash");
+  assert.equal(inventory.plugins[0].source_ref, "archive-sha256:fixturehash");
+  assert.ok(!inventory.summary.release_blockers.some((item) => item.code === "missing_source_ref"));
+});
+
+test("preserves source_missing diagnostics as release blockers", () => {
+  const inventory = buildInventory({ sources: [{ name: "qmd", root: path.join(tempRoot(), "qmd") }] });
+
+  assert.equal(inventory.summary.plugin_count, 0);
+  assert.equal(inventory.summary.release_ready, false);
+  assert.equal(inventory.diagnostics[0].code, "source_missing");
+  assert.ok(
+    inventory.summary.release_blockers.some(
+      (item) => item.code === "source_missing" && item.source === "qmd"
+    )
+  );
+});
+
+test("falls back to source entry for unbuilt workspace packages while recording package entry", () => {
+  const root = tempRoot();
+  const pluginRoot = path.join(root, "packages", "channels");
+  writeJson(path.join(pluginRoot, "package.json"), {
+    name: "@openclaw/channels",
+    version: "0.1.0",
+    type: "module",
+    main: "./dist/index.js",
+    openclaw: {
+      extensions: ["./dist/index.js"],
+      channel: { id: "channels" },
+    },
+  });
+  writeText(
+    path.join(pluginRoot, "src", "index.ts"),
+    `
+      export default {
+        register(api) {
+          api.registerChannel({ plugin: { id: "channels" } });
+        }
+      };
+    `
+  );
+
+  const inventory = buildInventory({ sources: [{ name: "openclaw-china", root, ref: "git:fixture" }] });
+  const plugin = inventory.plugins[0];
+
+  assert.ok(plugin.entry_path.endsWith("src/index.ts"));
+  assert.ok(plugin.published_entry_path.endsWith("dist/index.js"));
+  assert.ok(plugin.diagnostics.some((item) => item.code === "entry_uses_source_fallback"));
+  assert.ok(!plugin.release_blockers.some((item) => item.code === "missing_entry"));
+});
+
+test("classifies setup-only package helpers instead of emitting unexplained unknown kinds", () => {
+  const root = tempRoot();
+  const pluginRoot = path.join(root, "packages", "setup-helper");
+  writeJson(path.join(pluginRoot, "package.json"), {
+    name: "@openclaw/setup-helper",
+    version: "0.1.0",
+    type: "module",
+    openclaw: {
+      install: { npmSpec: "@openclaw/setup-helper" },
+      setupEntry: "./setup.js",
+    },
+  });
+  writeText(path.join(pluginRoot, "setup.js"), "export function setup() { return true; }\n");
+
+  const inventory = buildInventory({ sources: [{ name: "openclaw", root, ref: "git:fixture" }] });
+  const plugin = inventory.plugins[0];
+
+  assert.deepEqual(plugin.plugin_kinds, ["setup"]);
+  assert.ok(!inventory.summary.by_kind.unknown);
+  assert.ok(plugin.runtime_facets_required.includes("setup"));
+  assert.equal(plugin.real_plugin_smoke_status, "not-run");
+  assert.equal(plugin.behavior_test_status, "not-run");
+  assert.ok(plugin.release_blockers.some((item) => item.code === "release_status_not_ready"));
+});
+
+test("adds CI-compatible release and runtime status fields to plugin records", () => {
+  const root = tempRoot();
+  const pluginRoot = path.join(root, "extensions", "tooling");
+  writeJson(path.join(pluginRoot, "package.json"), {
+    name: "@vendor/tooling",
+    version: "1.0.0",
+    type: "module",
+    openclaw: { extensions: ["./index.js"] },
+  });
+  writeText(
+    path.join(pluginRoot, "index.js"),
+    `
+      export default {
+        register(api) {
+          api.registerTool({ name: "fixture" });
+        }
+      };
+    `
+  );
+
+  const inventory = buildInventory({ sources: [{ name: "fixture-openclaw", root, ref: "git:fixture" }] });
+  const plugin = inventory.plugins[0];
+
+  assert.deepEqual(plugin.runtime_facets_required, ["tool"]);
+  assert.equal(plugin.real_plugin_smoke_status, "not-run");
+  assert.equal(plugin.behavior_test_status, "not-run");
+  assert.ok(Array.isArray(plugin.release_blockers));
+  assert.ok(inventory.summary.release_blockers.some((item) => item.code === "release_status_not_ready"));
+});
+
+test("classifies OpenClaw web search providers as provider capabilities", () => {
+  const root = tempRoot();
+  const pluginRoot = path.join(root, "extensions", "duckduckgo");
+  writeJson(path.join(pluginRoot, "package.json"), {
+    name: "@openclaw/duckduckgo",
+    version: "1.0.0",
+    type: "module",
+    openclaw: { extensions: ["./index.ts"] },
+  });
+  writeText(
+    path.join(pluginRoot, "index.ts"),
+    `
+      export default {
+        register(api) {
+          api.registerWebSearchProvider(createProvider());
+        }
+      };
+    `
+  );
+
+  const inventory = buildInventory({ sources: [{ name: "openclaw", root, ref: "git:fixture" }] });
+  const plugin = inventory.plugins[0];
+
+  assert.deepEqual(plugin.plugin_kinds, ["provider"]);
+  assert.deepEqual(plugin.register_apis, ["registerWebSearchProvider"]);
+  assert.ok(!inventory.summary.by_kind.unknown);
+});
+
+test("classifies plugin-shipped skill bundles as setup facets instead of unknown", () => {
+  const root = tempRoot();
+  const pluginRoot = path.join(root, "extensions", "open-prose");
+  writeJson(path.join(pluginRoot, "package.json"), {
+    name: "@openclaw/open-prose",
+    version: "1.0.0",
+    type: "module",
+    description: "OpenProse VM skill pack plugin.",
+    openclaw: { extensions: ["./index.ts"] },
+  });
+  writeText(
+    path.join(pluginRoot, "index.ts"),
+    `
+      export default definePluginEntry({
+        register(_api) {
+        }
+      });
+    `
+  );
+
+  const inventory = buildInventory({ sources: [{ name: "openclaw", root, ref: "git:fixture" }] });
+  const plugin = inventory.plugins[0];
+
+  assert.deepEqual(plugin.plugin_kinds, ["setup"]);
+  assert.deepEqual(plugin.runtime_facets_required, ["setup"]);
+  assert.ok(!inventory.summary.by_kind.unknown);
 });
