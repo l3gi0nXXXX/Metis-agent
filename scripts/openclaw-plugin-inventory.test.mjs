@@ -24,6 +24,16 @@ function writeText(file, value) {
   fs.writeFileSync(file, value);
 }
 
+function commitAll(root, message = "initial") {
+  execFileSync("git", ["init"], { cwd: root, stdio: "ignore" });
+  execFileSync("git", ["add", "."], { cwd: root, stdio: "ignore" });
+  execFileSync(
+    "git",
+    ["-c", "user.name=Metis Test", "-c", "user.email=metis@example.invalid", "commit", "-m", message],
+    { cwd: root, stdio: "ignore" }
+  );
+}
+
 test("discovers original OpenClaw extension packages without requiring metis.plugin.json", () => {
   const root = tempRoot();
   const pluginRoot = path.join(root, "extensions", "weixin");
@@ -209,6 +219,78 @@ test("accepts explicit source refs through the CLI for non-git source snapshots"
   assert.ok(!inventory.summary.release_blockers.some((item) => item.code === "missing_source_ref"));
 });
 
+test("records dirty git source diagnostics and release blockers", () => {
+  const root = tempRoot();
+  writeJson(path.join(root, "package.json"), {
+    name: "@vendor/openclaw-root",
+    version: "0.1.0",
+    type: "module",
+    openclaw: { extensions: ["./index.js"] },
+  });
+  writeText(
+    path.join(root, "index.js"),
+    `
+      export default {
+        register(api) {
+          api.registerTool({ name: "fixture" });
+        }
+      };
+    `
+  );
+  writeText(path.join(root, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n");
+  commitAll(root);
+  writeText(path.join(root, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\npackages: {}\n");
+
+  const inventory = buildInventory({ sources: [{ name: "openclaw", root }] });
+
+  assert.equal(inventory.sources[0].git_status, "dirty");
+  assert.deepEqual(inventory.sources[0].dirty_paths, ["pnpm-lock.yaml"]);
+  assert.ok(
+    inventory.diagnostics.some(
+      (item) => item.code === "source_dirty" && item.source === "openclaw" && item.dirty_paths.includes("pnpm-lock.yaml")
+    )
+  );
+  assert.ok(
+    inventory.summary.release_blockers.some(
+      (item) => item.code === "source_dirty" && item.source === "openclaw"
+    )
+  );
+});
+
+test("verifies explicit archive source refs against the source snapshot hash", () => {
+  const root = tempRoot();
+  writeJson(path.join(root, "package.json"), {
+    name: "@vendor/openclaw-archive",
+    version: "0.1.0",
+    type: "module",
+    openclaw: { extensions: ["./index.js"] },
+  });
+  writeText(
+    path.join(root, "index.js"),
+    `
+      export default {
+        register(api) {
+          api.registerTool({ name: "fixture" });
+        }
+      };
+    `
+  );
+  const computed = buildInventory({ sources: [{ name: "openclaw-weixin", root }] }).sources[0].ref;
+
+  const verified = buildInventory({ sources: [{ name: "openclaw-weixin", root, ref: computed }] });
+  assert.equal(verified.sources[0].ref_verification.status, "verified");
+  assert.equal(verified.sources[0].ref_verification.computed_ref, computed);
+  assert.ok(!verified.diagnostics.some((item) => item.code === "source_ref_mismatch"));
+
+  const mismatched = buildInventory({
+    sources: [{ name: "openclaw-weixin", root, ref: "archive-sha256:0000000000000000000000000000000000000000000000000000000000000000" }],
+  });
+  assert.equal(mismatched.sources[0].ref_verification.status, "mismatch");
+  assert.equal(mismatched.sources[0].ref_verification.computed_ref, computed);
+  assert.ok(mismatched.diagnostics.some((item) => item.code === "source_ref_mismatch"));
+  assert.ok(mismatched.summary.release_blockers.some((item) => item.code === "source_ref_mismatch"));
+});
+
 test("preserves source_missing diagnostics as release blockers", () => {
   const inventory = buildInventory({ sources: [{ name: "qmd", root: path.join(tempRoot(), "qmd") }] });
 
@@ -220,6 +302,8 @@ test("preserves source_missing diagnostics as release blockers", () => {
       (item) => item.code === "source_missing" && item.source === "qmd"
     )
   );
+  assert.ok(!inventory.summary.release_blockers.some((item) => item.code === "missing_source_ref"));
+  assert.ok(!inventory.summary.release_blockers.some((item) => item.code === "missing_entry"));
 });
 
 test("falls back to source entry for unbuilt workspace packages while recording package entry", () => {

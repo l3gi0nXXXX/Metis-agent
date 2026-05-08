@@ -688,9 +688,9 @@ function summarize(plugins, diagnostics) {
     releaseBlockers.push(...(plugin.release_blockers ?? []));
   }
   for (const diagnostic of diagnostics) {
-    if (diagnostic.code === "source_missing") {
+    if (["source_missing", "source_dirty", "source_ref_mismatch"].includes(diagnostic.code)) {
       releaseBlockers.push({
-        code: "source_missing",
+        code: diagnostic.code,
         source: diagnostic.source,
         message: diagnostic.message,
       });
@@ -712,11 +712,28 @@ export function buildInventory(options) {
   const sources = [];
   for (const source of options.sources) {
     const root = path.resolve(source.root);
-    const sourceRecord = { ...source, root, exists: fs.existsSync(root), ref: source.ref ?? gitRefFor(root) };
+    const sourceRecord = sourceRecordFor(source, root);
     sources.push(sourceRecord);
     if (!sourceRecord.exists) {
       diagnostics.push({ source: source.name, code: "source_missing", message: `Source root not found: ${root}` });
       continue;
+    }
+    if (sourceRecord.git_status === "dirty") {
+      diagnostics.push({
+        source: source.name,
+        code: "source_dirty",
+        message: `Source root has uncommitted changes: ${sourceRecord.dirty_paths.join(", ")}`,
+        dirty_paths: sourceRecord.dirty_paths,
+      });
+    }
+    if (sourceRecord.ref_verification?.status === "mismatch") {
+      diagnostics.push({
+        source: source.name,
+        code: "source_ref_mismatch",
+        message: `Source ref ${sourceRecord.ref} does not match computed ${sourceRecord.ref_verification.computed_ref}`,
+        expected_ref: sourceRecord.ref,
+        computed_ref: sourceRecord.ref_verification.computed_ref,
+      });
     }
     const roots = discoverPluginRoots(root);
     if (roots.length === 0) {
@@ -751,6 +768,57 @@ export function buildInventory(options) {
     plugins,
     diagnostics,
   };
+}
+
+function sourceRecordFor(source, root) {
+  const exists = fs.existsSync(root);
+  const gitInfo = exists ? gitInfoFor(root) : { git_status: "missing", dirty_paths: [] };
+  const fallbackRef = exists ? (gitInfo.ref || sourceSnapshotRefFor(root)) : "";
+  const ref = source.ref ?? fallbackRef;
+  const record = {
+    ...source,
+    root,
+    exists,
+    ref,
+    git_status: gitInfo.git_status,
+    dirty_paths: gitInfo.dirty_paths,
+  };
+  if (exists && String(ref).startsWith("archive-sha256:")) {
+    const computedRef = sourceSnapshotRefFor(root);
+    record.ref_verification = {
+      status: ref === computedRef ? "verified" : "mismatch",
+      computed_ref: computedRef,
+    };
+  }
+  return record;
+}
+
+function gitInfoFor(root) {
+  try {
+    const ref = execFileSync("git", ["-C", root, "rev-parse", "--short", "HEAD"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 2000,
+    }).trim();
+    const status = execFileSync("git", ["-C", root, "status", "--porcelain=v1"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 2000,
+    }).trim();
+    const dirtyPaths = status
+      ? status
+          .split("\n")
+          .map((line) => line.replace(/^..\s*/, "").trim())
+          .filter(Boolean)
+      : [];
+    return {
+      ref,
+      git_status: dirtyPaths.length > 0 ? "dirty" : "clean",
+      dirty_paths: dirtyPaths,
+    };
+  } catch {
+    return { ref: "", git_status: "non-git", dirty_paths: [] };
+  }
 }
 
 function gitRefFor(root) {

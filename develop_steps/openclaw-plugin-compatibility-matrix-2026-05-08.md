@@ -1,12 +1,12 @@
 # OpenClaw Plugin Compatibility Matrix
 
-Generated: 2026-05-08T08:23:58.309Z
+Generated: 2026-05-08T10:50:34.145Z
 
 ## Summary
 
 - Plugins: 104
-- Diagnostics: 1
-- Release blockers: 105
+- Diagnostics: 2
+- Release blockers: 106
 - Release ready: no
 
 ### By Status
@@ -246,8 +246,10 @@ Generated: 2026-05-08T08:23:58.309Z
 - `release_status_not_ready` zai: Compatibility status missing is not release-ready.
 - `release_status_not_ready` zalo: Compatibility status missing is not release-ready.
 - `release_status_not_ready` zalouser: Compatibility status missing is not release-ready.
+- `source_dirty` openclaw: Source root has uncommitted changes: pnpm-lock.yaml
 - `source_missing` qmd: Source root not found: /Users/l3gi0n/work/workspace_cangjie/qmd
 
 ## Diagnostics
 
+- `source_dirty` openclaw: Source root has uncommitted changes: pnpm-lock.yaml
 - `source_missing` qmd: Source root not found: /Users/l3gi0n/work/workspace_cangjie/qmd
