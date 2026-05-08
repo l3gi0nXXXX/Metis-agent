@@ -51,6 +51,10 @@ private class TelegramFakeBotApi {
                 if (request.url.contains("/getFile")) {
                     return TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":{\"file_path\":\"photos/fake-photo.jpg\",\"file_size\":12}}", outcome: "ok")
                 }
+                if (request.url.contains("/getChatMember")) {
+                    let status = if (request.url.contains("chat_id=-1000000000002")) { "left" } else { "administrator" }
+                    return TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":{\"status\":\"${status}\",\"user\":{\"id\":10001,\"is_bot\":true}}}", outcome: "ok")
+                }
                 if (request.url.contains("/getChat")) {
                     return TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":{\"id\":-1001234567890,\"type\":\"supergroup\",\"title\":\"Metis Test\",\"username\":\"metis_test\",\"is_forum\":true,\"available_reactions\":[{\"type\":\"emoji\",\"emoji\":\"👍\"}]}}", outcome: "ok")
                 }
@@ -157,6 +161,7 @@ private class TelegramFakeBotApi {
         if (url.contains("/getMe")) { return "getMe" }
         if (url.contains("/getWebhookInfo")) { return "getWebhookInfo" }
         if (url.contains("/getFile")) { return "getFile" }
+        if (url.contains("/getChatMember")) { return "getChatMember" }
         if (url.contains("/getChat")) { return "getChat" }
         if (url.contains("/deleteMessage")) { return "deleteMessage" }
         if (url.contains("/pinChatMessage")) { return "pinChatMessage" }
@@ -2414,6 +2419,78 @@ public class TelegramAdapterTest {
     }
 
     @TestCase
+    public func longTextFragmentsDebounceAcrossWebhookPulls(): Unit {
+        let fake = TelegramFakeBotApi()
+        fake.pollingUpdatesEnabled = false
+        setTelegramTransportRunnerForTest(Some({ request => fake.handle(request) }))
+        try {
+            let adapter = TelegramAdapter(
+                config: TelegramConfig(
+                    enabled: true,
+                    botToken: "telegram-token",
+                    dmPolicy: "open",
+                    allowFrom: ["*"]
+                )
+            )
+            adapter.start()
+            let sb1 = StringBuilder()
+            let sb2 = StringBuilder()
+            for (_ in 0..3600) {
+                sb1.append("a")
+                sb2.append("b")
+            }
+            let firstText = sb1.toString()
+            let secondText = sb2.toString()
+            let first = "{\"update_id\":1,\"message\":{\"message_id\":601,\"text\":\"${firstText}\",\"chat\":{\"id\":745123456,\"type\":\"private\"},\"from\":{\"id\":745123456}}}"
+            let second = "{\"update_id\":2,\"message\":{\"message_id\":602,\"text\":\"${secondText}\",\"chat\":{\"id\":745123456,\"type\":\"private\"},\"from\":{\"id\":745123456}}}"
+            @Expect(adapter.ingestWebhookPayload(first).contains("\"ok\":true"), true)
+            @Expect(adapter.pullInbound().size, 0)
+            @Expect(adapter.ingestWebhookPayload(second).contains("\"ok\":true"), true)
+            let inbound = adapter.pullInbound()
+            @Expect(inbound.size, 1)
+            @Expect(inbound[0].messageId, "602")
+            @Expect(inbound[0].text, firstText + "\n" + secondText)
+        } finally {
+            setTelegramTransportRunnerForTest(None)
+        }
+    }
+
+    @TestCase
+    public func forwardBurstDebounceDoesNotMixWithSlashCommand(): Unit {
+        let fake = TelegramFakeBotApi()
+        fake.pollingUpdatesEnabled = false
+        setTelegramTransportRunnerForTest(Some({ request => fake.handle(request) }))
+        try {
+            let adapter = TelegramAdapter(
+                config: TelegramConfig(
+                    enabled: true,
+                    botToken: "telegram-token",
+                    dmPolicy: "open",
+                    allowFrom: ["*"]
+                )
+            )
+            adapter.start()
+            let first = "{\"update_id\":1,\"message\":{\"message_id\":701,\"text\":\"forward one\",\"forward_origin\":{\"type\":\"channel\",\"chat\":{\"id\":-1001,\"type\":\"channel\",\"title\":\"Announcements\"}},\"chat\":{\"id\":745123456,\"type\":\"private\"},\"from\":{\"id\":745123456}}}"
+            let second = "{\"update_id\":2,\"message\":{\"message_id\":702,\"text\":\"forward two\",\"forward_origin\":{\"type\":\"channel\",\"chat\":{\"id\":-1001,\"type\":\"channel\",\"title\":\"Announcements\"}},\"chat\":{\"id\":745123456,\"type\":\"private\"},\"from\":{\"id\":745123456}}}"
+            @Expect(adapter.ingestWebhookPayload(first).contains("\"ok\":true"), true)
+            @Expect(adapter.pullInbound().size, 0)
+            @Expect(adapter.ingestWebhookPayload(second).contains("\"ok\":true"), true)
+            let merged = adapter.pullInbound()
+            @Expect(merged.size, 1)
+            @Expect(merged[0].text.contains("forward one"), true)
+            @Expect(merged[0].text.contains("forward two"), true)
+
+            let slash = "{\"update_id\":3,\"message\":{\"message_id\":703,\"text\":\"/status\",\"chat\":{\"id\":745123456,\"type\":\"private\"},\"from\":{\"id\":745123456}}}"
+            @Expect(adapter.ingestWebhookPayload(slash).contains("\"ok\":true"), true)
+            let immediate = adapter.pullInbound()
+            @Expect(immediate.size, 1)
+            @Expect(immediate[0].text, "/status")
+        } finally {
+            setTelegramTransportRunnerForTest(None)
+        }
+    }
+
+    @TestCase
     public func dmOpenRequiresWildcardAllowFrom(): Unit {
         let noWildcard = TelegramAdapter(
             config: TelegramConfig(
@@ -4638,8 +4715,58 @@ public class TelegramAdapterTest {
         let inbound = adapter.pullInbound()
         @Expect(inbound.size, 1)
         @Expect(inbound[0].replyTargetMessageId.getOrThrow(), "101")
+        @Expect(inbound[0].systemEvent, true)
+        @Expect(inbound[0].systemEventKind, "telegram.message_reaction")
         @Expect(inbound[0].text.contains("[telegram-reaction]"), true)
         @Expect(inbound[0].text.contains("emoji=👍"), true)
+    }
+
+    @TestCase
+    public func getChatMemberProbeUsesMockedTelegramTransport(): Unit {
+        let fake = TelegramFakeBotApi()
+        setTelegramTransportRunnerForTest(Some({ request => fake.handle(request) }))
+        try {
+            let groups = JsonObject()
+            groups.put("-1001234567890", JsonObject())
+            let adapter = TelegramAdapter(
+                config: TelegramConfig(
+                    enabled: true,
+                    botToken: "10001:telegram-token",
+                    groups: Some(groups)
+                )
+            )
+            let probe = adapter.debugTryTelegramGetChatMemberForTest("-1001234567890", "10001")
+            @Expect(probe.get("ok").getOrThrow().asBool().getValue(), true)
+            @Expect(probe.get("status").getOrThrow().asString().getValue(), "administrator")
+            @Expect(fake.saw("getChatMember"), true)
+        } finally {
+            setTelegramTransportRunnerForTest(None)
+        }
+    }
+
+    @TestCase
+    public func membershipAuditReportsLeftOrKickedAsWarning(): Unit {
+        let fake = TelegramFakeBotApi()
+        setTelegramTransportRunnerForTest(Some({ request => fake.handle(request) }))
+        try {
+            let groups = JsonObject()
+            groups.put("-1000000000002", JsonObject())
+            let adapter = TelegramAdapter(
+                config: TelegramConfig(
+                    enabled: true,
+                    botToken: "10001:telegram-token",
+                    groups: Some(groups)
+                )
+            )
+            let audit = adapter.debugBuildMembershipAuditForTest(getMeRaw: "{\"ok\":true,\"result\":{\"id\":10001,\"is_bot\":true,\"username\":\"metis_fake_bot\"}}")
+            let probes = audit.get("probes").getOrThrow().asArray()
+            @Expect(probes.size(), 1)
+            let probe = probes[0].asObject()
+            @Expect(probe.get("status").getOrThrow().asString().getValue(), "left")
+            @Expect(probe.get("warning").getOrThrow().asBool().getValue(), true)
+        } finally {
+            setTelegramTransportRunnerForTest(None)
+        }
     }
 
     @TestCase

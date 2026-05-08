@@ -13,6 +13,18 @@ import stdx.encoding.json.{JsonArray, JsonBool, JsonObject, JsonString}
 @Test
 public class GatewaySessionTurnRunnerTest {
     @TestCase
+    public func telegramStreamingSplitsAnswerAndReasoningLanes(): Unit {
+        let raw = "<think>check facts</think><final>visible answer</final>"
+        let hidden = gatewayDebugTelegramStreamingLanesForTest(raw)
+        @Expect(hidden.get("answer").getOrThrow().asString().getValue(), "visible answer")
+        @Expect(hidden.get("reasoning").getOrThrow().asString().getValue(), "")
+
+        let visible = gatewayDebugTelegramStreamingLanesForTest(raw, reasoningEnabled: true)
+        @Expect(visible.get("answer").getOrThrow().asString().getValue(), "visible answer")
+        @Expect(visible.get("reasoning").getOrThrow().asString().getValue(), "check facts")
+    }
+
+    @TestCase
     public func executeSessionRequestTurnResolvesContextBeforeReply(): Unit {
         let store = GatewaySessionStore(Path("."), enabled: false, agentId: "general")
         let bridge = AgentBridge(sessionStore: store)

@@ -39,6 +39,21 @@ private class GatewayTelegramNativeTestAdapter <: ChannelAdapter {
         ))
     }
 
+    public func queueSystemEvent(text: String, kind!: String = "telegram.message_reaction"): Unit {
+        this.inbound.add(InboundMessage(
+            ChannelType.Telegram,
+            "system-${this.inbound.size}",
+            "8734062810",
+            "8734062810",
+            ChatType.Direct,
+            text,
+            false,
+            DateTime.now(),
+            systemEvent: true,
+            systemEventKind: kind
+        ))
+    }
+
     public func pullInbound(): Array<InboundMessage> {
         let out = this.inbound.toArray()
         this.inbound.clear()
@@ -152,6 +167,28 @@ private func gatewayTelegramNativeService(adapter: GatewayTelegramNativeTestAdap
 
 @Test
 public class GatewayServiceTelegramNativeTest {
+    @TestCase
+    public func telegramReactionSystemEventBypassesModelAndWritesTranscript(): Unit {
+        withGatewayTelegramNativeTestHome {
+            var user = GatewayUserSettings()
+            user.telegram.enabled = true
+            user.telegram.allowFrom = ["8734062810"]
+            CliSettingManager.writeGatewaySettings(user)
+
+            let adapter = GatewayTelegramNativeTestAdapter()
+            let service = gatewayTelegramNativeService(adapter)
+            service.start()
+            adapter.queueSystemEvent("[telegram-reaction]\nmessageId=101\nemoji=👍\nby=8734062810")
+            service.processOnce()
+
+            @Expect(adapter.sentCount(), 0)
+            let store = gatewaySessionStoreForUser(user)
+            let transcript = store.formatHistoryAsText("telegram:direct:8734062810", 10)
+            @Expect(transcript.contains("[system] [telegram-reaction]"), true)
+            @Expect(transcript.contains("emoji=👍"), true)
+        }
+    }
+
     @TestCase
     public func modelsCommandReturnsTelegramInlineButtonsThroughGatewayService(): Unit {
         withGatewayTelegramNativeTestHome {

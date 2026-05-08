@@ -90,6 +90,22 @@ private class TelegramPendingMediaGroup {
     }
 }
 
+private class TelegramPendingTextBurst {
+    public let key: String
+    public let lane: String
+    public var firstSeenAtMs: Int64
+    public var lastSeenAtMs: Int64
+    public var message: InboundMessage
+
+    public init(key: String, lane: String, firstSeenAtMs: Int64, message: InboundMessage) {
+        this.key = key
+        this.lane = lane
+        this.firstSeenAtMs = firstSeenAtMs
+        this.lastSeenAtMs = firstSeenAtMs
+        this.message = message
+    }
+}
+
 private var telegramAsrRunnerOverride: Option<(String, String) -> String> = None<(String, String) -> String>
 
 public func setTelegramAsrRunnerForTest(runner: Option<(String, String) -> String>): Unit {
@@ -171,6 +187,7 @@ public class TelegramAdapter <: ChannelAdapter {
     private let completedUpdateIdOrder = ArrayList<String>()
     private let consumedApprovalCallbacks = HashSet<String>()
     private let pendingMediaGroups = HashMap<String, TelegramPendingMediaGroup>()
+    private let pendingTextBursts = HashMap<String, TelegramPendingTextBurst>()
     private let groupHistoryByPeer = HashMap<String, ArrayList<JsonObject>>()
     private let webhookGuardMutex = Mutex()
     private let webhookRateWindowStartedAtBySource = HashMap<String, Int64>()
@@ -285,10 +302,93 @@ public class TelegramAdapter <: ChannelAdapter {
             let drained = this.inboundQueue.toArray()
             this.inboundQueue.clear()
             let out = this.mergeTelegramTextBurstInboundMessages(
-                this.collectTelegramMediaGroupsForPull(drained)
+                this.collectTelegramTextBurstsForPull(
+                    this.collectTelegramMediaGroupsForPull(drained)
+                )
             )
             out
         }
+    }
+
+    private func collectTelegramTextBurstsForPull(messages: Array<InboundMessage>): Array<InboundMessage> {
+        let out = ArrayList<InboundMessage>()
+        let nowMs = DateTime.now().toUnixTimeStamp().toMilliseconds()
+        this.flushTelegramPendingTextBursts(out, nowMs, force: false)
+        for (msg in messages) {
+            let lane = this.telegramInboundTextDebounceLane(msg)
+            if (lane.isEmpty()) {
+                this.flushTelegramPendingTextBursts(out, nowMs, force: true)
+                out.add(msg)
+                continue
+            }
+            let key = this.telegramInboundBurstKey(msg) + "|lane:" + lane
+            var shouldFlushMerged = false
+            match (this.pendingTextBursts.get(key)) {
+                case Some(existing) =>
+                    if (this.telegramInboundShouldTextBurstMerge(existing.message, msg)) {
+                        existing.message = this.mergeTelegramTextBurstMessage(existing.message, msg)
+                        existing.lastSeenAtMs = nowMs
+                        shouldFlushMerged = true
+                    } else {
+                        out.add(existing.message)
+                        existing.firstSeenAtMs = nowMs
+                        existing.lastSeenAtMs = nowMs
+                        existing.message = msg
+                    }
+                case None =>
+                    if (this.pendingTextBursts.size > 0) {
+                        this.flushTelegramPendingTextBursts(out, nowMs, force: true)
+                    }
+                    this.pendingTextBursts[key] = TelegramPendingTextBurst(key, lane, nowMs, msg)
+            }
+            if (shouldFlushMerged) {
+                match (this.pendingTextBursts.get(key)) {
+                    case Some(done) =>
+                        out.add(done.message)
+                        this.pendingTextBursts.remove(key)
+                    case None => ()
+                }
+            }
+        }
+        this.flushTelegramPendingTextBursts(out, nowMs, force: false)
+        out.toArray()
+    }
+
+    private func flushTelegramPendingTextBursts(out: ArrayList<InboundMessage>, nowMs: Int64, force!: Bool): Unit {
+        let flushKeys = ArrayList<String>()
+        for ((key, pending) in this.pendingTextBursts) {
+            if (force || nowMs - pending.firstSeenAtMs >= 700) {
+                out.add(pending.message)
+                flushKeys.add(key)
+            }
+        }
+        for (key in flushKeys) {
+            this.pendingTextBursts.remove(key)
+        }
+    }
+
+    private func telegramInboundTextDebounceLane(msg: InboundMessage): String {
+        if (!this.telegramInboundCanTextBurstMerge(msg)) {
+            return ""
+        }
+        if (!this.inboundPrimaryMediaGroupId(msg).trimAscii().isEmpty()) {
+            return ""
+        }
+        if (this.telegramInboundHasForwardContext(msg)) {
+            return "forward"
+        }
+        if (msg.text.size >= 3500) {
+            return "long-text"
+        }
+        ""
+    }
+
+    private func telegramInboundHasForwardContext(msg: InboundMessage): Bool {
+        let context = match (msg.mediaContext.get("context")) {
+            case Some(v) => try { v.asObject() } catch (_e: Exception) { JsonObject() }
+            case None => JsonObject()
+        }
+        context.get("forwarded").isSome()
     }
 
     private func mergeTelegramTextBurstInboundMessages(messages: Array<InboundMessage>): Array<InboundMessage> {
@@ -316,7 +416,9 @@ public class TelegramAdapter <: ChannelAdapter {
             case None => ()
         }
         match (mediaContext.get("context")) {
-            case Some(_) => return false
+            case Some(v) =>
+                let context = try { v.asObject() } catch (_e: Exception) { JsonObject() }
+                return context.size() == 1 && context.get("forwarded").isSome()
             case None => ()
         }
         true
@@ -327,7 +429,7 @@ public class TelegramAdapter <: ChannelAdapter {
         if (text.isEmpty() || text.startsWith("/") || text.startsWith("[")) {
             return false
         }
-        if (text.contains("\n[")) {
+        if (text.contains("\n[") && !this.telegramInboundHasForwardContext(msg)) {
             return false
         }
         this.telegramMediaContextAllowsTextBurstMerge(msg.mediaContext)
@@ -836,6 +938,14 @@ public class TelegramAdapter <: ChannelAdapter {
         this.tryTelegramGetChat(chatId)
     }
 
+    public func debugTryTelegramGetChatMemberForTest(chatId: String, userId: String): JsonObject {
+        this.tryTelegramGetChatMember(chatId, userId)
+    }
+
+    public func debugBuildMembershipAuditForTest(getMeRaw!: String = "{\"ok\":true,\"result\":{\"id\":1,\"is_bot\":true,\"username\":\"bot\"}}"): JsonObject {
+        this.buildTelegramMembershipAudit(this.parseTelegramProbeResult(getMeRaw))
+    }
+
     public func resolveTelegramChatForGatewayRpc(chatId: String): JsonObject {
         this.tryTelegramGetChat(chatId)
     }
@@ -869,10 +979,13 @@ public class TelegramAdapter <: ChannelAdapter {
         let webhookInfo = snapshot.get("webhookInfo").getOrThrow().asObject()
         let getMeOk = this.readJsonBoolField(getMe, "ok", false)
         let webhookInfoOk = this.readJsonBoolField(webhookInfo, "ok", false)
+        let membership = this.buildTelegramMembershipAudit(getMe)
+        snapshot.put("membership", membership)
         out.put("executed", true.toJsonValue())
         out.put("status", JsonString(if (getMeOk && webhookInfoOk) { "ok" } else { "degraded" }))
         out.put("healthy", (getMeOk && webhookInfoOk).toJsonValue())
         out.put("snapshot", snapshot)
+        out.put("membership", membership)
         out
     }
 
@@ -2436,6 +2549,14 @@ public class TelegramAdapter <: ChannelAdapter {
         } else {
             "[telegram-reaction]\nmessageId=${messageId}\nemoji=${token}\nby=${senderId}"
         }
+        let mediaContext = JsonObject()
+        mediaContext.put("channel", JsonString("telegram"))
+        mediaContext.put("accountId", JsonString(this.effectiveAccountId()))
+        mediaContext.put("peerId", JsonString(peerId))
+        mediaContext.put("messageId", JsonString(messageId))
+        mediaContext.put("systemEventKind", JsonString("telegram.message_reaction"))
+        mediaContext.put("reactionEmoji", JsonString(token))
+        mediaContext.put("reactionSenderId", JsonString(senderId))
         let inbound = InboundMessage(
             ChannelType.Telegram,
             "reaction:${chatId}:${messageId}:${senderId}",
@@ -2450,7 +2571,10 @@ public class TelegramAdapter <: ChannelAdapter {
             replyTargetMessageId: Some(messageId),
             replyInThread: peerId.contains(":topic:"),
             raw: Some(raw),
-            accountId: this.effectiveAccountId()
+            accountId: this.effectiveAccountId(),
+            mediaContext: mediaContext,
+            systemEvent: true,
+            systemEventKind: "telegram.message_reaction"
         )
         let rejectReason = this.inboundRejectReason(inbound)
         if (!rejectReason.isEmpty()) {
@@ -4035,6 +4159,107 @@ public class TelegramAdapter <: ChannelAdapter {
         }
         out.put("availableReactions", reactions)
         out
+    }
+
+    private func tryTelegramGetChatMember(chatId: String, userId: String): JsonObject {
+        let out = JsonObject()
+        out.put("ok", false.toJsonValue())
+        let token = this.effectiveBotToken()
+        let normalizedChatId = chatId.trimAscii()
+        let normalizedUserId = userId.trimAscii()
+        out.put("chatId", JsonString(normalizedChatId))
+        out.put("userId", JsonString(normalizedUserId))
+        if (token.isEmpty() || normalizedChatId.isEmpty() || normalizedUserId.isEmpty()) {
+            out.put("status", JsonString("error"))
+            out.put("error", JsonString("missing-token-chat-or-user-id"))
+            return out
+        }
+        let raw = this.tryTelegramGet("${this.normalizeApiRoot()}/bot${token}/getChatMember?chat_id=${normalizedChatId}&user_id=${normalizedUserId}")
+        let parsed = this.parseTelegramProbeResult(raw)
+        if (!this.readJsonBoolField(parsed, "ok", false)) {
+            out.put("status", JsonString("error"))
+            out.put("error", JsonString(this.redactTelegramSensitive(this.readStringField(parsed, "error"))))
+            return out
+        }
+        let result = this.readObjectField(parsed, "result")
+        let status = this.readStringField(result, "status").trimAscii()
+        out.put("ok", true.toJsonValue())
+        out.put("status", JsonString(if (status.isEmpty()) { "unknown" } else { status }))
+        out.put("healthy", (status == "member" || status == "administrator" || status == "creator").toJsonValue())
+        out.put("warning", (status == "left" || status == "kicked" || status == "restricted").toJsonValue())
+        out
+    }
+
+    private func buildTelegramMembershipAudit(getMe: JsonObject): JsonObject {
+        let out = JsonObject()
+        out.put("enabled", true.toJsonValue())
+        let botId = match (getMe.get("result")) {
+            case Some(v) =>
+                try { this.readIntStringField(v.asObject(), "id") } catch (_e: Exception) { "" }
+            case None => ""
+        }
+        out.put("botId", JsonString(botId))
+        let probes = JsonArray([])
+        if (botId.isEmpty()) {
+            out.put("status", JsonString("skipped"))
+            out.put("reason", JsonString("missing-bot-id"))
+            out.put("probes", probes)
+            return out
+        }
+        let chatIds = this.telegramMembershipAuditChatIds()
+        for (chatId in chatIds) {
+            probes.add(this.tryTelegramGetChatMember(chatId, botId))
+        }
+        out.put("status", JsonString(if (probes.size() == 0) { "skipped" } else { "checked" }))
+        out.put("probes", probes)
+        out
+    }
+
+    private func telegramMembershipAuditChatIds(): Array<String> {
+        let out = ArrayList<String>()
+        let seen = HashSet<String>()
+        match (this.config.groups) {
+            case Some(groups) =>
+                for (key in groups.getFields().keys()) {
+                    let id = this.telegramMembershipAuditChatIdFromTarget(key)
+                    if (!id.isEmpty() && !seen.contains(id)) {
+                        seen.add(id)
+                        out.add(id)
+                    }
+                }
+            case None => ()
+        }
+        let defaultId = this.telegramMembershipAuditChatIdFromTarget(this.config.defaultTo)
+        if (!defaultId.isEmpty() && !seen.contains(defaultId)) {
+            seen.add(defaultId)
+            out.add(defaultId)
+        }
+        out.toArray()
+    }
+
+    private func telegramMembershipAuditChatIdFromTarget(raw: String): String {
+        let trimmed = raw.trimAscii()
+        if (trimmed.isEmpty()) {
+            return ""
+        }
+        if (trimmed.startsWith("group:")) {
+            let rest = trimmed["group:".size..].trimAscii()
+            match (rest.indexOf(":topic:")) {
+                case Some(idx) => return rest[..idx].trimAscii()
+                case None => return rest
+            }
+        }
+        if (trimmed.startsWith("telegram:group:")) {
+            let rest = trimmed["telegram:group:".size..].trimAscii()
+            match (rest.indexOf(":topic:")) {
+                case Some(idx) => return rest[..idx].trimAscii()
+                case None => return rest
+            }
+        }
+        if (trimmed.startsWith("-")) {
+            return trimmed
+        }
+        ""
     }
 
     private func parseTelegramFilePath(raw: String): String {
