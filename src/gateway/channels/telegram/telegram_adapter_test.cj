@@ -1,13 +1,15 @@
 package metis.gateway.channels.telegram
 
+import metis.core.{GatewayToolRuntimeContext, gatewayWithToolRuntimeContext, setGatewayMediaAsrRunnerForTest, setGatewayMediaVisionRunnerForTest}
 import metis.core.config.CliConfig
 import metis.gateway.core.{gatewayBuildMediaContextPrompt, setGatewayOpenClawPluginSidecarRunnerForTest}
 import metis.gateway.model.*
+import metis.gateway.tools.{GatewayTelegramMediaToolset, setGatewayTelegramStickerCacheRootForTest}
 
 import magic.jsonable.*
 import std.collection.ArrayList
 import std.env.{getVariable, setVariable}
-import std.fs.{Directory, File, Path, remove}
+import std.fs.{Directory, File, Path, exists, remove}
 import std.sync.Mutex
 import std.time.*
 import std.unittest.testmacro.*
@@ -2213,6 +2215,179 @@ public class TelegramAdapterTest {
             @Expect(last.get("transcript").getOrThrow().asString().getValue(), "transcribed voice text")
         } finally {
             setTelegramAsrRunnerForTest(None)
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func inboundVoicePreflightAddsTranscriptFromUnifiedAsrMock(): Unit {
+        let root = Path("/tmp/metis-telegram-preflight-asr-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
+        Directory.create(root, recursive: true)
+        setGatewayMediaAsrRunnerForTest(Some({ _path: String, _mime: String => "unified asr transcript" }))
+        try {
+            let adapter = TelegramAdapter(
+                config: TelegramConfig(
+                    enabled: true,
+                    botToken: "telegram-token",
+                    media: TelegramMediaConfig(downloadEnabled: true, allowedMimes: ["audio/*"])
+                ),
+                pairingRoot: root.toString()
+            )
+            let state = adapter.debugPersistInboundMediaForTest(
+                "voice",
+                "voice-file-id",
+                mimeType: "audio/ogg",
+                getFileRaw: "{\"ok\":true,\"result\":{\"file_path\":\"voice/file.ogg\",\"file_size\":10}}",
+                downloadRaw: "fake-audio",
+                peerId: "user:745123456",
+                messageId: "305"
+            )
+            let last = state.get("lastMedia").getOrThrow().asObject()
+            @Expect(last.get("downloaded").getOrThrow().asBool().getValue(), true)
+            @Expect(last.get("transcript").getOrThrow().asString().getValue(), "unified asr transcript")
+            @Expect(last.get("asrStatus").getOrThrow().asString().getValue(), "transcribed")
+            @Expect(last.get("understandingStatus").getOrThrow().asString().getValue(), "ok")
+        } finally {
+            setGatewayMediaAsrRunnerForTest(None<(String, String) -> String>)
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func inboundPhotoAndStickerPreflightAddsVisionAnalysisAndDurableStickerCache(): Unit {
+        let root = Path("/tmp/metis-telegram-preflight-vision-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
+        Directory.create(root, recursive: true)
+        setGatewayMediaVisionRunnerForTest(Some({ _path: String, _mime: String, kind: String, _prompt: String, _maxBytes: Int64 =>
+            if (kind == "sticker") { "mock sticker description" } else { "mock photo analysis" }
+        }))
+        setGatewayTelegramStickerCacheRootForTest(Some(root.join("gateway-telegram")))
+        try {
+            let adapter = TelegramAdapter(
+                config: TelegramConfig(enabled: true, botToken: "telegram-token"),
+                pairingRoot: root.toString()
+            )
+            let photoState = adapter.debugPersistInboundMediaForTest(
+                "photo",
+                "photo-file-id",
+                mimeType: "image/jpeg",
+                getFileRaw: "{\"ok\":true,\"result\":{\"file_path\":\"photos/file.jpg\",\"file_size\":10}}",
+                downloadRaw: "fake-photo",
+                peerId: "user:745123456",
+                messageId: "306"
+            )
+            let photo = photoState.get("lastMedia").getOrThrow().asObject()
+            @Expect(photo.get("analysis").getOrThrow().asString().getValue(), "mock photo analysis")
+            @Expect(photo.get("visionStatus").getOrThrow().asString().getValue(), "analyzed")
+
+            let stickerState = adapter.debugPersistInboundMediaForTest(
+                "sticker",
+                "sticker-file-id",
+                fileUniqueId: "sticker-unique-id",
+                mimeType: "image/webp",
+                getFileRaw: "{\"ok\":true,\"result\":{\"file_path\":\"stickers/file.webp\",\"file_size\":10}}",
+                downloadRaw: "fake-sticker",
+                peerId: "user:745123456",
+                messageId: "307"
+            )
+            let sticker = stickerState.get("lastMedia").getOrThrow().asObject()
+            @Expect(sticker.get("description").getOrThrow().asString().getValue(), "mock sticker description")
+            @Expect(exists(root.join("gateway-telegram").join("sticker-cache.json")), true)
+            let searched = gatewayWithToolRuntimeContext(
+                GatewayToolRuntimeContext("telegram", channelName: "telegram", sessionKey: "telegram:chat:1", mediaContext: JsonObject()),
+                { => GatewayTelegramMediaToolset().debugTelegramStickerSearchForTest("mock sticker", Some(5)) }
+            )
+            let searchJson = JsonValue.fromStr(searched).asObject()
+            @Expect(searchJson.get("count").getOrThrow().asInt().getValue(), 1)
+            let got = gatewayWithToolRuntimeContext(
+                GatewayToolRuntimeContext("telegram", channelName: "telegram", sessionKey: "telegram:chat:1", mediaContext: JsonObject()),
+                { => GatewayTelegramMediaToolset().debugTelegramStickerGetForTest(None<String>, Some("sticker-unique-id"), None<String>) }
+            )
+            @Expect(JsonValue.fromStr(got).asObject().get("status").getOrThrow().asString().getValue(), "ok")
+        } finally {
+            setGatewayMediaVisionRunnerForTest(None<(String, String, String, String, Int64) -> String>)
+            setGatewayTelegramStickerCacheRootForTest(None<Path>)
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func inboundTextDocumentPreflightAddsPreviewAndToolCanReadIt(): Unit {
+        let root = Path("/tmp/metis-telegram-preflight-document-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
+        Directory.create(root, recursive: true)
+        try {
+            let adapter = TelegramAdapter(
+                config: TelegramConfig(enabled: true, botToken: "telegram-token"),
+                pairingRoot: root.toString()
+            )
+            let state = adapter.debugPersistInboundMediaForTest(
+                "document",
+                "doc-file-id",
+                mimeType: "text/plain",
+                fileName: "note.txt",
+                getFileRaw: "{\"ok\":true,\"result\":{\"file_path\":\"documents/note.txt\",\"file_size\":17}}",
+                downloadRaw: "hello text document",
+                peerId: "user:745123456",
+                messageId: "308"
+            )
+            let record = state.get("lastMedia").getOrThrow().asObject()
+            @Expect(record.get("documentExtractStatus").getOrThrow().asString().getValue(), "ok")
+            @Expect(record.get("documentTextPreview").getOrThrow().asString().getValue(), "hello text document")
+            let mediaContext = JsonObject()
+            let records = JsonArray([])
+            records.add(record)
+            mediaContext.put("records", records)
+            let extracted = gatewayWithToolRuntimeContext(
+                GatewayToolRuntimeContext("telegram", channelName: "telegram", sessionKey: "telegram:chat:1", mediaContext: mediaContext),
+                { => GatewayTelegramMediaToolset().debugTelegramDocumentExtractForTest(None<String>, None<Int64>, Some(100)) }
+            )
+            let json = JsonValue.fromStr(extracted).asObject()
+            @Expect(json.get("status").getOrThrow().asString().getValue(), "ok")
+            @Expect(json.get("content").getOrThrow().asString().getValue(), "hello text document")
+        } finally {
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func inboundUnconfiguredUnderstandingDoesNotBlockMediaSave(): Unit {
+        let root = Path("/tmp/metis-telegram-preflight-not-configured-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
+        Directory.create(root, recursive: true)
+        try {
+            let adapter = TelegramAdapter(
+                config: TelegramConfig(
+                    enabled: true,
+                    botToken: "telegram-token",
+                    media: TelegramMediaConfig(downloadEnabled: true, allowedMimes: ["audio/*", "image/*"])
+                ),
+                pairingRoot: root.toString()
+            )
+            let voiceState = adapter.debugPersistInboundMediaForTest(
+                "voice",
+                "voice-file-id",
+                mimeType: "audio/ogg",
+                getFileRaw: "{\"ok\":true,\"result\":{\"file_path\":\"voice/file.ogg\",\"file_size\":10}}",
+                downloadRaw: "fake-audio",
+                peerId: "user:745123456",
+                messageId: "309"
+            )
+            let voice = voiceState.get("lastMedia").getOrThrow().asObject()
+            @Expect(voice.get("downloaded").getOrThrow().asBool().getValue(), true)
+            @Expect(voice.get("skippedReason").getOrThrow().asString().getValue(), "")
+            @Expect(voice.get("asrStatus").getOrThrow().asString().getValue(), "not_configured")
+            let photoState = adapter.debugPersistInboundMediaForTest(
+                "photo",
+                "photo-file-id",
+                mimeType: "image/jpeg",
+                getFileRaw: "{\"ok\":true,\"result\":{\"file_path\":\"photos/file.jpg\",\"file_size\":10}}",
+                downloadRaw: "fake-photo",
+                peerId: "user:745123456",
+                messageId: "310"
+            )
+            let photo = photoState.get("lastMedia").getOrThrow().asObject()
+            @Expect(photo.get("downloaded").getOrThrow().asBool().getValue(), true)
+            @Expect(photo.get("skippedReason").getOrThrow().asString().getValue(), "")
+            @Expect(photo.get("visionStatus").getOrThrow().asString().getValue(), "not_configured")
+        } finally {
             try { remove(root, recursive: true) } catch (_e: Exception) { () }
         }
     }
