@@ -46,6 +46,8 @@ public class InboundMessage {
     public let replyInThread: Bool
     public let raw: Option<String>
     public let mediaContext: JsonObject
+    public let systemEvent: Bool
+    public let systemEventKind: String
 
     public init(
         channel: ChannelType,
@@ -62,7 +64,9 @@ public class InboundMessage {
         replyInThread!: Bool = false,
         raw!: Option<String> = None,
         accountId!: String = "",
-        mediaContext!: JsonObject = JsonObject()
+        mediaContext!: JsonObject = JsonObject(),
+        systemEvent!: Bool = false,
+        systemEventKind!: String = ""
     ) {
         this.channel = channel
         this.accountId = accountId.trimAscii()
@@ -79,6 +83,8 @@ public class InboundMessage {
         this.replyInThread = replyInThread
         this.raw = raw
         this.mediaContext = mediaContext
+        this.systemEvent = systemEvent
+        this.systemEventKind = systemEventKind.trimAscii()
     }
 }
 

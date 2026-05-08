@@ -7,6 +7,7 @@ import metis.gateway.session.GatewaySessionContext
 import magic.log.LogUtils
 import std.core.Duration
 import std.time.DateTime
+import stdx.encoding.json.{JsonObject, JsonString}
 
 public class GatewaySessionExecutionResult {
     public let answer: String
@@ -75,6 +76,38 @@ private func gatewayVisibleDeliveryText(channelName: String, raw: String): Strin
         return gatewayStripTaggedReasoning(raw)
     }
     raw
+}
+
+private func gatewayExtractTaggedReasoning(raw: String): String {
+    match (raw.indexOf("<think>")) {
+        case Some(start) =>
+            let afterStart = start + "<think>".size
+            match (raw[afterStart..].indexOf("</think>")) {
+                case Some(endRel) => raw[afterStart..afterStart + endRel].trimAscii()
+                case None => raw[afterStart..].trimAscii()
+            }
+        case None => ""
+    }
+}
+
+private func gatewayReasoningLaneEnabled(bridge: AgentBridge, context: GatewaySessionContext): Bool {
+    if (context.channelName.trimAscii().toAsciiLower() != "telegram") {
+        return false
+    }
+    let indexRoot = bridge.getSessionStore().readSessionsIndexRoot()
+    let entry = match (indexRoot.get(context.sessionKey)) {
+        case Some(v) => try { v.asObject() } catch (_e: Exception) { JsonObject() }
+        case None => JsonObject()
+    }
+    let mode = GatewaySessionStore.sessionIndexString(entry, "reasoningVisibility").toAsciiLower()
+    mode == "on" || mode == "stream" || mode == "true" || mode == "visible"
+}
+
+public func gatewayDebugTelegramStreamingLanesForTest(raw: String, reasoningEnabled!: Bool = false): JsonObject {
+    let out = JsonObject()
+    out.put("answer", JsonString(gatewayVisibleDeliveryText("telegram", raw)))
+    out.put("reasoning", JsonString(if (reasoningEnabled) { gatewayExtractTaggedReasoning(raw) } else { "" }))
+    out
 }
 
 private func gatewayReplyWithTimeout(
@@ -202,6 +235,8 @@ public func gatewayExecuteSessionTurn(
         deliverHook.isSome()
     let useEditMessages = gatewayChannelSupportsMessageEdit(context.channelName)
     let streamingState = GatewayStreamingDeliveryState()
+    let reasoningStreamingState = GatewayStreamingDeliveryState()
+    let reasoningLaneEnabled = gatewayReasoningLaneEnabled(bridge, context)
     let answer = gatewayReplyWithTimeout(
         bridge,
         context,
@@ -213,12 +248,54 @@ public func gatewayExecuteSessionTurn(
         streamChunkHook: Some({ currentText =>
             let visibleText = gatewayVisibleDeliveryText(context.channelName, currentText)
             let normalized = visibleText.trimAscii()
-            if (normalized.isEmpty()) {
-                return
-            }
             match (streamHook) {
                 case Some(notify) => notify(context, currentText)
                 case None => ()
+            }
+            let reasoningText = if (reasoningLaneEnabled) { gatewayExtractTaggedReasoning(currentText) } else { "" }
+            if (!reasoningText.trimAscii().isEmpty() && canStreamToPeer && !reasoningStreamingState.failed && reasoningText.trimAscii() != reasoningStreamingState.lastText.trimAscii()) {
+                let nowMs = DateTime.now().toUnixTimeStamp().toMilliseconds()
+                let shouldSendReasoningNow = reasoningStreamingState.messageId.isEmpty() ||
+                    nowMs - reasoningStreamingState.lastSentAtMs >= 500 ||
+                    reasoningText.size - reasoningStreamingState.lastText.size >= 96
+                if (shouldSendReasoningNow) {
+                    match (deliverHook) {
+                        case Some(send) =>
+                            try {
+                                let laneText = "Reasoning\n${reasoningText}"
+                                if (reasoningStreamingState.messageId.isEmpty()) {
+                                    reasoningStreamingState.messageId = send(
+                                        context.deliveryTarget.getOrThrow().channelName,
+                                        context.deliveryTarget.getOrThrow().accountId,
+                                        context.deliveryTarget.getOrThrow().peerId,
+                                        laneText,
+                                        effectiveReplyToMessageId,
+                                        effectiveReplyInThread
+                                    )
+                                    if (reasoningStreamingState.messageId.trimAscii().isEmpty()) {
+                                        reasoningStreamingState.failed = true
+                                    }
+                                } else {
+                                    let _ = send(
+                                        context.deliveryTarget.getOrThrow().channelName,
+                                        context.deliveryTarget.getOrThrow().accountId,
+                                        context.deliveryTarget.getOrThrow().peerId,
+                                        if (useEditMessages) { renderGatewayEditText(laneText) } else { laneText },
+                                        Some(reasoningStreamingState.messageId),
+                                        false
+                                    )
+                                }
+                                reasoningStreamingState.lastSentAtMs = nowMs
+                                reasoningStreamingState.lastText = reasoningText
+                            } catch (_ex: Exception) {
+                                reasoningStreamingState.failed = true
+                            }
+                        case None => ()
+                    }
+                }
+            }
+            if (normalized.isEmpty()) {
+                return
             }
             if (!canStreamToPeer || streamingState.failed || normalized == streamingState.lastText.trimAscii()) {
                 return

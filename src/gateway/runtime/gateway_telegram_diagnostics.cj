@@ -177,6 +177,43 @@ private func gatewayTelegramRuntimeContainsPolling409(runtime: JsonObject): Bool
     outcome.contains("409") || outcome.contains("conflict") || error.contains("409") || error.contains("conflict")
 }
 
+private func gatewayTelegramRuntimeMembershipSummary(runtime: JsonObject): (String, String) {
+    let liveProbe = gatewayTelegramDiagObject(runtime, "liveProbe")
+    let snapshot = gatewayTelegramDiagObject(liveProbe, "snapshot")
+    let membership = gatewayTelegramDiagObject(snapshot, "membership")
+    let status = gatewayTelegramDiagString(membership, "status", "")
+    if (status.isEmpty()) {
+        return ("skipped", "membership probe has not run")
+    }
+    let probes = match (membership.get("probes")) {
+        case Some(v) => try { v.asArray() } catch (_e: Exception) { JsonArray([]) }
+        case None => JsonArray([])
+    }
+    if (probes.size() == 0) {
+        return (status, gatewayTelegramDiagString(membership, "reason", "no configured group targets"))
+    }
+    var warnings: Int64 = 0
+    var errors: Int64 = 0
+    var healthy: Int64 = 0
+    for (idx in 0..probes.size()) {
+        let probe = try { probes[idx].asObject() } catch (_e: Exception) { JsonObject() }
+        if (gatewayTelegramDiagBool(probe, "healthy", false)) {
+            healthy += 1
+        } else if (gatewayTelegramDiagBool(probe, "warning", false)) {
+            warnings += 1
+        } else {
+            errors += 1
+        }
+    }
+    if (errors > 0) {
+        return ("failed", "membership probes healthy=${healthy}, warnings=${warnings}, errors=${errors}")
+    }
+    if (warnings > 0) {
+        return ("warning", "membership probes healthy=${healthy}, warnings=${warnings}, errors=${errors}")
+    }
+    ("passed", "membership probes healthy=${healthy}, warnings=0, errors=0")
+}
+
 private func gatewayTelegramBuildDiagnosticFindings(user: GatewayUserSettings, runtime: JsonObject): JsonArray {
     let findings = JsonArray([])
     if (!user.telegram.enabled) {
@@ -239,6 +276,17 @@ private func gatewayTelegramBuildDiagnosticFindings(user: GatewayUserSettings, r
             "Stop competing consumers and let the polling supervisor back off and recover."
         )
     }
+
+    let membership = gatewayTelegramRuntimeMembershipSummary(runtime)
+    gatewayTelegramAddFinding(
+        findings,
+        "telegram-membership-probe",
+        if (membership[0] == "failed") { "warning" } else { "info" },
+        membership[0],
+        "Telegram live membership probe is reported by doctor.",
+        membership[1],
+        "Run live channel diagnostics with a mocked or trusted Bot API path; verify getChatMember status for configured groups."
+    )
 
     let invalidDm = gatewayTelegramInvalidSenderTokens(user.telegram.allowFrom)
     if (invalidDm.size() > 0) {
@@ -612,6 +660,7 @@ public func gatewayTelegramDiagnosticsJson(user: GatewayUserSettings, runtime!: 
         "nativeCommands",
         "approvalResolver",
         "streamingDraft",
+        "membership",
         "threadBindings",
         "groupHistory",
         "targetWriteback",

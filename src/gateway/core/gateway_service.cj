@@ -3,7 +3,7 @@ package metis.gateway.core
 import metis.core.renderGatewayTopicEditText
 import metis.core.config.{CliConfig, CliSettingManager, GatewayUserSettings, MetisConfigManager, cliFindModelAuthChoicesForProvider, cliSetupVisibleModelProviders}
 import metis.gateway.model.*
-import metis.gateway.session.{GatewaySessionContext, gatewaySessionRequestFromInbound}
+import metis.gateway.session.{GatewaySessionContext, gatewayResolveSessionContext, gatewaySessionRequestFromInbound}
 import metis.gateway.tools.{gatewayHandleNativeCommandLine, gatewayHandleSubagentsCommandLine}
 import magic.jsonable.*
 import magic.log.LogUtils
@@ -153,6 +153,10 @@ public class GatewayService {
             )
             return
         }
+        if (message.systemEvent) {
+            this.handleInboundSystemEvent(message, effectiveAccountId, user, conversationKey)
+            return
+        }
         if (channelToString(message.channel) == "telegram" && this.handleTelegramNativeCommand(message, effectiveAccountId, user, conversationKey)) {
             return
         }
@@ -212,6 +216,28 @@ public class GatewayService {
             return
         }
         LogUtils.error("Gateway.send: deliveryStatus=${execution.deliveryStatus} err=${execution.deliveryError}")
+    }
+
+    private func handleInboundSystemEvent(message: InboundMessage, accountId: String, user: GatewayUserSettings, conversationKey: String): Unit {
+        let request = gatewaySessionRequestFromInbound(message, sessionHint: conversationKey, accountId: accountId)
+        let context = gatewayResolveSessionContext(request)
+        let store = gatewaySessionStoreForResolvedRequest(user, request)
+        let kind = if (message.systemEventKind.trimAscii().isEmpty()) { "system" } else { message.systemEventKind.trimAscii() }
+        let text = if (message.text.trimAscii().isEmpty()) {
+            "Gateway system event: ${kind}"
+        } else {
+            message.text.trimAscii()
+        }
+        match (context.deliveryTarget) {
+            case Some(target) => store.appendBindingSnapshot(context.sessionKey, target, mode: "system-event")
+            case None => ()
+        }
+        store.appendTranscriptEntry(context.sessionKey, "system", text)
+        match (this.transcriptPublisher) {
+            case Some(notify) => notify(context, 1, kind, "system")
+            case None => ()
+        }
+        LogUtils.info("Gateway.systemEvent: channel=${channelToString(message.channel)} session=${context.sessionKey} kind=${kind}")
     }
 
     private func maybeAutoLabelTelegramTopic(user: GatewayUserSettings, message: InboundMessage, accountId: String): Unit {
