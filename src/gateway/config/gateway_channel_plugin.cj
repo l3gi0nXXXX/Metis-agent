@@ -60,6 +60,17 @@ public class GatewayChannelPluginRegistry {
         None
     }
 
+    public static func removeForTest(id: String): Unit {
+        let t = id.trimAscii()
+        let next = ArrayList<GatewayChannelPlugin>()
+        for (existing in plugins) {
+            if (existing.pluginId() != t) {
+                next.add(existing)
+            }
+        }
+        plugins = next
+    }
+
     public static func allPluginIds(): Array<String> {
         let out = ArrayList<String>()
         for (p in plugins) {

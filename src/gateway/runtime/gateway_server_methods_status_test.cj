@@ -12,10 +12,12 @@ public class GatewayServerMethodsStatusTest {
         let healthResult = health.result.toJsonString()
         @Expect(healthResult.contains("surfaces"), true)
         @Expect(healthResult.contains("platform"), true)
+        @Expect(healthResult.contains("openclawCompatHost"), true)
 
         let readiness = handleGatewayStatusFamily("readiness", GatewayUserSettings()).getOrThrow()
         let readinessResult = readiness.result.toJsonString()
         @Expect(readinessResult.contains("surfaces"), true)
         @Expect(readinessResult.contains("platform"), true)
+        @Expect(readinessResult.contains("openclawCompatHost"), true)
     }
 }

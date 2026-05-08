@@ -177,6 +177,7 @@ public func buildGatewayRpcStatusJson(user: GatewayUserSettings): JsonObject {
 
     result.put("surfaces", buildGatewayExternalSurfaceJson(user))
     result.put("platform", gatewayStatusPlatform(cfg))
+    result.put("openclawCompatHost", gatewayOpenClawCompatHostSnapshot(user))
     result
 }
 
@@ -197,6 +198,7 @@ public func handleGatewayStatusFamily(method: String, user: GatewayUserSettings)
         result.put("hasAnyEnabledChannel", full.get("hasAnyEnabledChannel") ?? false.toJsonValue())
         result.put("surfaces", full.get("surfaces") ?? JsonObject())
         result.put("platform", full.get("platform") ?? JsonObject())
+        result.put("openclawCompatHost", full.get("openclawCompatHost") ?? JsonObject())
         return Some(GatewayRpcResponse(true, method, result: result))
     }
     if (method == "readiness") {
@@ -209,6 +211,7 @@ public func handleGatewayStatusFamily(method: String, user: GatewayUserSettings)
         result.put("transport", gatewayStatusTransportSnapshot(fullRpc))
         result.put("surfaces", full.get("surfaces") ?? JsonObject())
         result.put("platform", full.get("platform") ?? JsonObject())
+        result.put("openclawCompatHost", full.get("openclawCompatHost") ?? JsonObject())
         return Some(GatewayRpcResponse(true, method, result: result))
     }
     None

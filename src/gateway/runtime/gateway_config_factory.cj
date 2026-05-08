@@ -101,6 +101,7 @@ public func gatewayHasAnyEnabledChannel(user: GatewayUserSettings): Bool {
  */
 public func buildGatewayServiceFromUserSettings(user: GatewayUserSettings): (GatewayService, FeishuAdapter) {
     let startMs = gatewayConfigFactoryNowMs()
+    gatewayInstallOpenClawCompatHostLifecycleHooks()
     ensureInstalledGatewayPluginsRegistered()
     gatewayConfigFactoryTimingLog("plugins-registered", startMs)
     gatewayPrimeConfiguredChannelBindings(user)

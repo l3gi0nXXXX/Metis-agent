@@ -39,6 +39,7 @@ public class GatewayServerMethodsOpsPlatformTest {
         @Expect(result.get("http").isSome(), true)
         @Expect(result.get("platform").isSome(), true)
         @Expect(result.get("controlUi").isSome(), true)
+        @Expect(result.get("openclawCompatHost").isSome(), true)
     }
 
     @TestCase
@@ -50,6 +51,7 @@ public class GatewayServerMethodsOpsPlatformTest {
         @Expect(result.get("transport").isSome(), true)
         @Expect(result.get("http").isSome(), true)
         @Expect(result.get("platform").isSome(), true)
+        @Expect(result.get("openclawCompatHost").isSome(), true)
         @Expect(result.get("controlUi").isSome(), true)
     }
 

@@ -312,6 +312,38 @@ public class OpenClawCompatGatewayRegistryBridge {
     public func hookCount(): Int64 { this.hooks.size() }
 }
 
+public class OpenClawCompatRegistrySyncSummary {
+    public let channels: Int64
+    public let httpRoutes: Int64
+    public let tools: Int64
+    public let providers: Int64
+    public let hooks: Int64
+
+    public init(
+        channels!: Int64 = 0,
+        httpRoutes!: Int64 = 0,
+        tools!: Int64 = 0,
+        providers!: Int64 = 0,
+        hooks!: Int64 = 0
+    ) {
+        this.channels = channels
+        this.httpRoutes = httpRoutes
+        this.tools = tools
+        this.providers = providers
+        this.hooks = hooks
+    }
+
+    public func toJson(): JsonObject {
+        let out = JsonObject()
+        out.put("channels", this.channels.toJsonValue())
+        out.put("httpRoutes", this.httpRoutes.toJsonValue())
+        out.put("tools", this.tools.toJsonValue())
+        out.put("providers", this.providers.toJsonValue())
+        out.put("hooks", this.hooks.toJsonValue())
+        return out
+    }
+}
+
 public class OpenClawCompatHostManager {
     private let config: OpenClawCompatHostConfig
     private let runner: OpenClawCompatHostProcessRunner
@@ -319,7 +351,9 @@ public class OpenClawCompatHostManager {
     private var state: String = "stopped"
     private var restartBackoffActive: Bool = false
     private var lastDiagnostic: JsonObject = JsonObject()
+    private var lastRaw: JsonObject = JsonObject()
     private var registryBridge: OpenClawCompatGatewayRegistryBridge = OpenClawCompatGatewayRegistryBridge()
+    private var registrySync: OpenClawCompatRegistrySyncSummary = OpenClawCompatRegistrySyncSummary()
 
     public init(
         config: OpenClawCompatHostConfig,
@@ -352,6 +386,13 @@ public class OpenClawCompatHostManager {
         let registered = client.request("plugin.registeredCapabilities")
         if (registered.ok) {
             this.registryBridge = OpenClawCompatGatewayRegistryBridge(raw: ocManagerObject(registered.result, "gatewayRegistries"))
+            this.registrySync = OpenClawCompatRegistrySyncSummary(
+                channels: this.registryBridge.channelCount(),
+                httpRoutes: this.registryBridge.httpRouteCount(),
+                tools: this.registryBridge.toolCount(),
+                providers: this.registryBridge.providerCount(),
+                hooks: this.registryBridge.hookCount()
+            )
         }
         registered
     }
@@ -359,6 +400,7 @@ public class OpenClawCompatHostManager {
     private func status(ok: Bool, state: String, diagnostic!: JsonObject = JsonObject(), raw!: JsonObject = JsonObject()): OpenClawCompatHostManagerStatus {
         this.state = state
         this.lastDiagnostic = diagnostic
+        this.lastRaw = raw
         OpenClawCompatHostManagerStatus(ok, state, diagnostic: diagnostic, raw: raw)
     }
 
@@ -390,10 +432,14 @@ public class OpenClawCompatHostManager {
                 if (loaded.ok) {
                     let registered = this.syncRegisteredCapabilities(client)
                     if (!registered.ok) {
+                        let _ = client.stop()
+                        this.client = None<OpenClawCompatHostClient>
                         return this.status(false, registered.status, diagnostic: registered.diagnostic, raw: registered.raw)
                     }
                     return this.status(true, "running", raw: loaded.raw)
                 }
+                let _ = client.stop()
+                this.client = None<OpenClawCompatHostClient>
                 return this.status(false, loaded.status, diagnostic: loaded.diagnostic, raw: loaded.raw)
             case Failed(reason) =>
                 this.client = None<OpenClawCompatHostClient>
@@ -407,9 +453,13 @@ public class OpenClawCompatHostManager {
                 let stopped = existing.stop()
                 this.client = None<OpenClawCompatHostClient>
                 this.restartBackoffActive = false
+                this.registryBridge = OpenClawCompatGatewayRegistryBridge()
+                this.registrySync = OpenClawCompatRegistrySyncSummary()
                 return this.status(stopped.ok, "stopped", diagnostic: stopped.diagnostic, raw: stopped.raw)
             case None =>
                 this.restartBackoffActive = false
+                this.registryBridge = OpenClawCompatGatewayRegistryBridge()
+                this.registrySync = OpenClawCompatRegistrySyncSummary()
                 return this.status(true, "stopped")
         }
     }
@@ -455,5 +505,60 @@ public class OpenClawCompatHostManager {
 
     public func gatewayRegistryBridge(): OpenClawCompatGatewayRegistryBridge {
         this.registryBridge
+    }
+
+    public func registrySyncSummary(): OpenClawCompatRegistrySyncSummary {
+        this.registrySync
+    }
+
+    public func setRegistrySyncSummary(summary: OpenClawCompatRegistrySyncSummary): Unit {
+        this.registrySync = summary
+    }
+
+    public func invoke(method: String, payload: JsonObject): JsonObject {
+        match (this.client) {
+            case Some(existing) =>
+                if (!existing.isAlive()) {
+                    let out = JsonObject()
+                    out.put("ok", false.toJsonValue())
+                    out.put("status", JsonString("crashed"))
+                    out.put("diagnostic", ocManagerDiagnostic("host_crashed"))
+                    return out
+                }
+                let result = existing.request(method.trimAscii(), params: payload)
+                if (result.ok) {
+                    return result.result
+                }
+                let out = JsonObject()
+                out.put("ok", false.toJsonValue())
+                out.put("status", JsonString(result.status))
+                out.put("diagnostic", result.diagnostic)
+                out.put("raw", result.raw)
+                return out
+            case None =>
+                let out = JsonObject()
+                out.put("ok", false.toJsonValue())
+                out.put("status", JsonString("stopped"))
+                out.put("diagnostic", ocManagerDiagnostic("host_not_started"))
+                return out
+        }
+    }
+
+    public func snapshotJson(): JsonObject {
+        let out = JsonObject()
+        out.put("enabled", this.config.enabled.toJsonValue())
+        out.put("ok", (this.state == "running" || this.state == "disabled" || this.state == "stopped").toJsonValue())
+        out.put("state", JsonString(this.state))
+        out.put("diagnostic", this.lastDiagnostic)
+        out.put("raw", this.lastRaw)
+        let capture = JsonObject()
+        capture.put("channels", this.registryBridge.channelCount().toJsonValue())
+        capture.put("httpRoutes", this.registryBridge.httpRouteCount().toJsonValue())
+        capture.put("tools", this.registryBridge.toolCount().toJsonValue())
+        capture.put("providers", this.registryBridge.providerCount().toJsonValue())
+        capture.put("hooks", this.registryBridge.hookCount().toJsonValue())
+        out.put("capturedCapabilities", capture)
+        out.put("registrySync", this.registrySync.toJson())
+        return out
     }
 }

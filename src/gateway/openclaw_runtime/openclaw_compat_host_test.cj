@@ -81,7 +81,13 @@ private func registeredCapabilitiesResult(): JsonObject {
     channel.put("id", JsonString("fixture-channel"))
     channels.add(channel)
     registries.put("channels", channels)
-    registries.put("httpRoutes", JsonArray([]))
+    let httpRoutes = JsonArray([])
+    let route = JsonObject()
+    route.put("pluginId", JsonString("fixture-plugin"))
+    route.put("method", JsonString("POST"))
+    route.put("path", JsonString("/openclaw/fixture"))
+    httpRoutes.add(route)
+    registries.put("httpRoutes", httpRoutes)
     registries.put("tools", JsonArray([]))
     registries.put("providers", JsonArray([]))
     registries.put("hooks", JsonArray([]))
@@ -248,6 +254,35 @@ public class OpenClawCompatHostTest {
         @Expect(jarr(jobj(runner.transport.frames[0], "params"), "roots").size(), 2)
         @Expect(jstr(runner.transport.frames[1], "method"), "plugin.registeredCapabilities")
         @Expect(manager.gatewayRegistryBridge().channelCount(), 1)
+        @Expect(manager.gatewayRegistryBridge().httpRouteCount(), 1)
+    }
+
+    @TestCase
+    public func managerStartFailurePreservesRealLoadEvidenceInSnapshot(): Unit {
+        let runner = FakeOpenClawCompatHostProcessRunner()
+        let error = JsonObject()
+        error.put("code", JsonString("OPENCLAW_PLUGIN_LOAD_FAILED"))
+        error.put("message", JsonString("fixture load failed"))
+        let raw = JsonObject()
+        raw.put("jsonrpc", JsonString("2.0"))
+        raw.put("id", 1.toJsonValue())
+        raw.put("error", error)
+        runner.transport.enqueue(raw)
+        let manager = OpenClawCompatHostManager(
+            openClawCompatHostConfigFromGatewaySettings(runtimeSettings()),
+            runner: runner
+        )
+
+        let status = manager.start()
+        let snapshot = manager.snapshotJson()
+        let diagnostic = snapshot.get("diagnostic").getOrThrow().asObject()
+
+        @Expect(status.ok, false)
+        @Expect(status.state, "error")
+        @Expect(jstr(diagnostic, "kind"), "rpc_error")
+        @Expect(jstr(diagnostic, "message"), "fixture load failed")
+        @Expect(snapshot.toJsonString().contains("OPENCLAW_PLUGIN_LOAD_FAILED"), true)
+        @Expect(snapshot.toJsonString().contains("fixture load failed"), true)
     }
 
     @TestCase

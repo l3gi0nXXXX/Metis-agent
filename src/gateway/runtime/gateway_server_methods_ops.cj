@@ -577,6 +577,7 @@ private func gatewayDoctorStatusJson(user: GatewayUserSettings): JsonObject {
     doctor.put("transport", rpc.get("transport") ?? JsonObject())
     doctor.put("http", gatewayOpsHttp(cfg))
     doctor.put("platform", gatewayOpsPlatform(cfg))
+    doctor.put("openclawCompatHost", gatewayOpenClawCompatHostSnapshot(user))
     doctor.put("controlUi", buildGatewayExternalSurfaceJson(user).get("controlUi") ?? JsonObject())
     let checks = gatewayProbeChecksJson(user)
     let issues = gatewayProbeIssuesJson(user, checks)
@@ -617,6 +618,7 @@ private func gatewayOpsActionContextJson(user: GatewayUserSettings, includeRunti
     out.put("transport", rpc.get("transport") ?? JsonObject())
     out.put("http", gatewayOpsHttp(cfg))
     out.put("platform", gatewayPlatformRuntimeSummary(cfg))
+    out.put("openclawCompatHost", gatewayOpenClawCompatHostSnapshot(user))
     out.put("controlUi", buildGatewayExternalSurfaceJson(user).get("controlUi") ?? JsonObject())
     out
 }
@@ -1830,6 +1832,7 @@ public func handleGatewayOpsFamily(method: String, user: GatewayUserSettings, re
         result.put("transport", context.get("transport") ?? JsonObject())
         result.put("http", context.get("http") ?? JsonObject())
         result.put("platform", context.get("platform") ?? JsonObject())
+        result.put("openclawCompatHost", context.get("openclawCompatHost") ?? JsonObject())
         result.put("controlUi", context.get("controlUi") ?? JsonObject())
         return Some(GatewayRpcResponse(true, method, result: result))
     }
@@ -1847,6 +1850,7 @@ public func handleGatewayOpsFamily(method: String, user: GatewayUserSettings, re
         result.put("transport", context.get("transport") ?? JsonObject())
         result.put("http", context.get("http") ?? JsonObject())
         result.put("platform", context.get("platform") ?? JsonObject())
+        result.put("openclawCompatHost", context.get("openclawCompatHost") ?? JsonObject())
         result.put("controlUi", context.get("controlUi") ?? JsonObject())
         return Some(GatewayRpcResponse(true, method, result: result))
     }
@@ -1872,6 +1876,7 @@ public func handleGatewayOpsFamily(method: String, user: GatewayUserSettings, re
         result.put("transport", context.get("transport") ?? JsonObject())
         result.put("http", context.get("http") ?? JsonObject())
         result.put("platform", context.get("platform") ?? JsonObject())
+        result.put("openclawCompatHost", context.get("openclawCompatHost") ?? JsonObject())
         result.put("controlUi", context.get("controlUi") ?? JsonObject())
         return Some(GatewayRpcResponse(true, method, result: result))
     }
@@ -1890,6 +1895,7 @@ public func handleGatewayOpsFamily(method: String, user: GatewayUserSettings, re
         result.put("transport", context.get("transport") ?? JsonObject())
         result.put("http", context.get("http") ?? JsonObject())
         result.put("platform", context.get("platform") ?? JsonObject())
+        result.put("openclawCompatHost", context.get("openclawCompatHost") ?? JsonObject())
         result.put("controlUi", context.get("controlUi") ?? JsonObject())
         return Some(GatewayRpcResponse(true, method, result: result))
     }

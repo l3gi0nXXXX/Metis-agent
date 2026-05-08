@@ -96,7 +96,9 @@ public class GatewayService {
     public func start(): Unit {
         let startMs = this.startNowMs()
         this.channelManager.startChannels()
-        let _ = gatewayOpenClawPluginSidecarStart(CliSettingManager.readGatewaySettings())
+        let user = CliSettingManager.readGatewaySettings()
+        let _ = gatewayOpenClawCompatHostStart(user)
+        let _ = gatewayOpenClawPluginSidecarStart(user)
         LogUtils.info("Gateway.service.timing: step=startChannels elapsedMs=${this.startNowMs() - startMs}")
     }
 
@@ -104,7 +106,9 @@ public class GatewayService {
      * 停止所有渠道。
      */
     public func stop(): Unit {
-        let _ = gatewayOpenClawPluginSidecarStop(CliSettingManager.readGatewaySettings())
+        let user = CliSettingManager.readGatewaySettings()
+        let _ = gatewayOpenClawCompatHostStop(user)
+        let _ = gatewayOpenClawPluginSidecarStop(user)
         // Gateway process shutdown should not persist a user-level manual stop.
         this.channelManager.stopChannels(reason: "shutdown", manualStop: false)
     }

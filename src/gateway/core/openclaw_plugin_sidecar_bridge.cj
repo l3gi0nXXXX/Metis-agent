@@ -17,9 +17,44 @@ private let OPENCLAW_PLUGIN_COMPAT_ALT_KEY = "openclawPluginSidecar"
 
 private var gatewayOpenClawPluginSidecarRunnerOverride: Option<(String, JsonObject) -> JsonObject> =
     None<(String, JsonObject) -> JsonObject>
+private var gatewayOpenClawCompatHostStartHook: Option<(GatewayUserSettings) -> JsonObject> =
+    None<(GatewayUserSettings) -> JsonObject>
+private var gatewayOpenClawCompatHostStopHook: Option<(GatewayUserSettings) -> JsonObject> =
+    None<(GatewayUserSettings) -> JsonObject>
 
 public func setGatewayOpenClawPluginSidecarRunnerForTest(runner: Option<(String, JsonObject) -> JsonObject>): Unit {
     gatewayOpenClawPluginSidecarRunnerOverride = runner
+}
+
+public func setGatewayOpenClawCompatHostLifecycleHooks(
+    startHook: Option<(GatewayUserSettings) -> JsonObject>,
+    stopHook: Option<(GatewayUserSettings) -> JsonObject>
+): Unit {
+    gatewayOpenClawCompatHostStartHook = startHook
+    gatewayOpenClawCompatHostStopHook = stopHook
+}
+
+private func gatewayOpenClawCompatHostLifecycleFallback(action: String): JsonObject {
+    let out = JsonObject()
+    out.put("enabled", false.toJsonValue())
+    out.put("ok", true.toJsonValue())
+    out.put("state", JsonString("disabled"))
+    out.put("action", JsonString(action))
+    return out
+}
+
+public func gatewayOpenClawCompatHostStart(user: GatewayUserSettings): JsonObject {
+    match (gatewayOpenClawCompatHostStartHook) {
+        case Some(hook) => hook(user)
+        case None => gatewayOpenClawCompatHostLifecycleFallback("start")
+    }
+}
+
+public func gatewayOpenClawCompatHostStop(user: GatewayUserSettings): JsonObject {
+    match (gatewayOpenClawCompatHostStopHook) {
+        case Some(hook) => hook(user)
+        case None => gatewayOpenClawCompatHostLifecycleFallback("stop")
+    }
 }
 
 private func gatewayOpenClawPluginSidecarBool(obj: JsonObject, key: String, fallback: Bool): Bool {
