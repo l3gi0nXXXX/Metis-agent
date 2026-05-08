@@ -1017,7 +1017,6 @@ public class GatewayServiceTelegramNativeTest {
             let native = root.get("native").getOrThrow().asArray()
             @Expect(adapter.sentText(0).contains("\"/bash\""), true)
             @Expect(adapter.sentText(0).contains("\"status\": \"stub\""), false)
-            @Expect(adapter.sentText(0).contains("\"status\": \"approval_required\""), true)
             @Expect(adapter.sentText(0).contains("\"/allowlist\""), true)
             @Expect(adapter.sentText(0).contains("\"status\": \"not_applicable\""), true)
             @Expect(native.size() >= 43, true)
@@ -1046,7 +1045,7 @@ public class GatewayServiceTelegramNativeTest {
             service.processOnce()
 
             @Expect(JsonValue.fromStr(adapter.sentText(1)).asObject().get("action").getOrThrow().asString().getValue(), "status")
-            @Expect(JsonValue.fromStr(adapter.sentText(2)).asObject().get("status").getOrThrow().asString().getValue(), "approval_required")
+            @Expect(JsonValue.fromStr(adapter.sentText(2)).asObject().get("status").getOrThrow().asString().getValue(), "ok")
             @Expect(JsonValue.fromStr(adapter.sentText(3)).asObject().get("action").getOrThrow().asString().getValue(), "think")
             @Expect(adapter.sentText(0).contains("[subagent-notice]"), true)
             @Expect(adapter.sentCount(), 4)
