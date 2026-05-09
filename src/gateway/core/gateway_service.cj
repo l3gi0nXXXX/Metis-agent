@@ -1,6 +1,6 @@
 package metis.gateway.core
 
-import metis.core.renderGatewayTopicEditText
+import metis.core.{gatewaySpeechResolveDeliveryPrefs, gatewaySpeechResolveTtsConfig, gatewaySpeechTtsSynthesize, renderGatewayTopicEditText}
 import metis.core.config.{CliConfig, CliSettingManager, GatewayUserSettings, MetisConfigManager, cliFindModelAuthChoicesForProvider, cliSetupVisibleModelProviders}
 import metis.core.skills.SkillsPrompt
 import metis.gateway.model.*
@@ -139,6 +139,9 @@ public class GatewayService {
 
         let user = CliSettingManager.readGatewaySettings()
         var conversationKey = decision.conversationKey.getOrThrow()
+        let telegramAutoVoiceReply = channelToString(message.channel) == "telegram" &&
+            this.telegramShouldUseVoiceReply(user, message)
+        let sessionUser = this.telegramSessionUserForAutoVoiceReply(user, telegramAutoVoiceReply)
         if (channelToString(message.channel) == "telegram") {
             let bindingSession = gatewayTelegramThreadBindingSessionHintForMessage(user, message, effectiveAccountId)
             if (!bindingSession.trimAscii().isEmpty()) {
@@ -172,7 +175,7 @@ public class GatewayService {
         }
         let turn = try {
             gatewayExecuteSessionRequestTurnForUser(
-                user,
+                sessionUser,
                 request,
                 message.text,
                 deliver: true,
@@ -184,10 +187,21 @@ public class GatewayService {
                     if (degraded) {
                         LogUtils.info("Gateway.send policy: channel=${channelName} peer=${peerId} degraded=true reason=${policyReason}")
                     }
+                    let autoVoiceText = if (telegramAutoVoiceReply && this.telegramIsSilentReplyText(text)) {
+                        let fallback = this.telegramVoiceFallbackText(message)
+                        LogUtils.info("Telegram auto TTS reply fallback: silent_reply")
+                        fallback
+                    } else {
+                        text
+                    }
                     this.sendTextToPeerDetailed(
                         channelName,
                         peerId,
-                        text,
+                        if (telegramAutoVoiceReply) {
+                            this.telegramMaybeSynthesizeAutoVoiceReply(user, channelName, autoVoiceText)
+                        } else {
+                            autoVoiceText
+                        },
                         replyToMessageId: effectiveReplyToMessageId,
                         replyInThread: effectiveReplyInThread,
                         accountId: if (!deliveryAccountId.trimAscii().isEmpty()) { deliveryAccountId } else { effectiveAccountId }
@@ -226,6 +240,140 @@ public class GatewayService {
             return
         }
         LogUtils.error("Gateway.send: deliveryStatus=${execution.deliveryStatus} err=${execution.deliveryError}")
+    }
+
+    private func telegramShouldAutoReplyVoice(user: GatewayUserSettings, message: InboundMessage): Bool {
+        if (channelToString(message.channel) != "telegram") {
+            return false
+        }
+        let text = message.text.trimAscii()
+        if (!(text.startsWith("[voice]") || text.contains("\nmediaKind=voice") || text.contains("\nmediaKind=audio") || text.contains("\nmimeType=audio/"))) {
+            return false
+        }
+        let prefs = gatewaySpeechResolveDeliveryPrefs(user, channel: "telegram")
+        match (prefs.get("autoReplyToVoice")) {
+            case Some(v) => try { v.asBool().getValue() } catch (_: Exception) { false }
+            case None => false
+        }
+    }
+
+    private func telegramShouldUseVoiceReply(user: GatewayUserSettings, message: InboundMessage): Bool {
+        this.telegramShouldAutoReplyVoice(user, message)
+    }
+
+    private func telegramSessionUserForAutoVoiceReply(user: GatewayUserSettings, enabled: Bool): GatewayUserSettings {
+        if (!enabled) {
+            return user
+        }
+        var out = user
+        out.telegram.streaming = "off"
+        out
+    }
+
+    private func telegramTtsDir(): Path {
+        let dir = CliConfig.dotDir.join("gateway-telegram").join("tts")
+        if (!exists(dir)) {
+            Directory.create(dir, recursive: true)
+        }
+        dir
+    }
+
+    private func telegramReadTtsState(): JsonObject {
+        let path = this.telegramTtsDir().join("state.json")
+        if (!exists(path)) {
+            let out = JsonObject()
+            out.put("enabled", true.toJsonValue())
+            out.put("provider", JsonString(""))
+            out.put("limit", 4000.toJsonValue())
+            return out
+        }
+        try {
+            JsonValue.fromStr(String.fromUtf8(File.readFrom(path))).asObject()
+        } catch (_: Exception) {
+            JsonObject()
+        }
+    }
+
+    private func telegramTtsSpeakableText(text: String): String {
+        var out = text.trimAscii()
+        if (out.startsWith("[[")) {
+            var end: Int64 = -1
+            for (i in 0..(out.size - 1)) {
+                if (out[i] == 93u8 && out[i + 1] == 93u8) {
+                    end = i + 2
+                    break
+                }
+            }
+            if (end > 0 && end <= out.size) {
+                out = out[end..].trimAscii()
+            }
+        }
+        out
+    }
+
+    private func telegramIsSilentReplyText(text: String): Bool {
+        let normalized = text.trimAscii().toAsciiLower()
+        normalized == "<silent_reply>" || normalized == "silent_reply"
+    }
+
+    private func telegramSilentVoiceFallbackText(message: InboundMessage): String {
+        let transcript = this.telegramTranscriptFromInboundText(message.text)
+        if (!transcript.isEmpty()) {
+            return "我已收到你的语音：${transcript}"
+        }
+        "我已收到你的语音。"
+    }
+
+    private func telegramVoiceFallbackText(message: InboundMessage): String {
+        this.telegramSilentVoiceFallbackText(message)
+    }
+
+    private func telegramTranscriptFromInboundText(text: String): String {
+        for (line in text.split("\n")) {
+            let trimmed = line.trimAscii()
+            if (trimmed.startsWith("transcript=")) {
+                return trimmed["transcript=".size..].trimAscii()
+            }
+            if (trimmed.startsWith("AudioTranscript=")) {
+                return trimmed["AudioTranscript=".size..].trimAscii()
+            }
+        }
+        ""
+    }
+
+    private func telegramMaybeSynthesizeAutoVoiceReply(user: GatewayUserSettings, channelName: String, text: String): String {
+        if (channelName.trimAscii().toAsciiLower() != "telegram") {
+            return text
+        }
+        if (text.trimAscii().startsWith("[voice]") || text.trimAscii().startsWith("[audio]")) {
+            return text
+        }
+        let speakable = this.telegramTtsSpeakableText(text)
+        if (speakable.isEmpty()) {
+            return text
+        }
+        let result = gatewaySpeechTtsSynthesize(
+            gatewaySpeechResolveTtsConfig(user, channel: "telegram"),
+            gatewaySpeechResolveDeliveryPrefs(user, channel: "telegram"),
+            this.telegramReadTtsState(),
+            speakable,
+            outputRoot: this.telegramTtsDir()
+        )
+        match (result.get("payload")) {
+            case Some(v) =>
+                try {
+                    let payload = v.asString().getValue().trimAscii()
+                    if (!payload.isEmpty()) {
+                        LogUtils.info("Telegram auto TTS reply synthesized: payloadKind=${this.telegramJsonString(result, "payloadKind", "")}")
+                        return payload
+                    }
+                } catch (_: Exception) {
+                    ()
+                }
+            case None => ()
+        }
+        LogUtils.info("Telegram auto TTS reply fallback to text: status=${this.telegramJsonString(result, "status", "")}")
+        text
     }
 
     private func handleInboundSystemEvent(message: InboundMessage, accountId: String, user: GatewayUserSettings, conversationKey: String): Unit {
@@ -1038,7 +1186,7 @@ public class GatewayService {
 
     private func renderTelegramTtsText(root: JsonObject): String {
         let lines = ArrayList<String>()
-        lines.add("Telegram TTS")
+        lines.add("Gateway TTS")
         this.appendTelegramJsonTextField(lines, root, "Status", "status")
         this.appendTelegramJsonTextField(lines, root, "Provider", "provider")
         this.appendTelegramJsonTextField(lines, root, "Provider kind", "providerKind")
@@ -1046,6 +1194,7 @@ public class GatewayService {
         let limit = this.telegramJsonInt(root, "limit", -1)
         if (limit >= 0) { lines.add("Limit: ${limit}") }
         lines.add("Audio as voice: ${this.telegramJsonBool(root, "audioAsVoice", false)}")
+        this.appendTelegramJsonTextField(lines, root, "Migration", "migrationHint")
         this.appendTelegramJsonTextField(lines, root, "Usage", "usage")
         this.appendTelegramJsonTextField(lines, root, "Message", "message")
         String.join(lines.toArray(), delimiter: "\n")
@@ -1856,7 +2005,7 @@ public class GatewayService {
         let action = this.telegramCommandArgText(text).split(" ")[0].trimAscii().toAsciiLower()
         let out = this.telegramCommandJson("tts", "not_configured", ok: false)
         out.put("requested", JsonString(if (action.isEmpty()) { "status" } else { action }))
-        out.put("message", JsonString("No Metis TTS provider is configured for Telegram native voice output."))
+        out.put("message", JsonString("No Metis Gateway TTS provider is configured."))
         out.toJsonString()
     }
 

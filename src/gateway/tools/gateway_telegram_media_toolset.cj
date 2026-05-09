@@ -1087,10 +1087,16 @@ public class GatewayTelegramMediaToolset {
             case Some(v) => out.put("capability", v)
             case None => ()
         }
+        match (understanding.get("ASRStatus")) {
+            case Some(v) => out.put("ASRStatus", v)
+            case None => ()
+        }
         if (transcript.isEmpty()) {
             out.put("ok", JsonBool(false))
             out.put("status", JsonString("unsupported"))
-            out.put("ASRStatus", JsonString("not_configured"))
+            if (out.get("ASRStatus").isNone()) {
+                out.put("ASRStatus", JsonString("not_configured"))
+            }
             let error = telegramMediaToolString(understanding, "error")
             out.put("error", JsonString(if (error.isEmpty()) { "native ASR runtime is not configured and no transcript companion file exists" } else { error }))
         } else {

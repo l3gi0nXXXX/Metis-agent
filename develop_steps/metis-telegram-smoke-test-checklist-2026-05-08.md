@@ -123,7 +123,7 @@ cjpm run --skip-build --name metis --run-args "gateway discover"
 |---|---|---|---|
 | TG-SMOKE-20 | 向 bot 发送 Telegram 语音消息 | Gateway 下载 voice 文件；如 ASR 配置支持，应转写；不支持时应明确说明能力限制 | 待填写 |
 | TG-SMOKE-21 | 要求保存语音 | Bot 返回保存成功和本地路径 | 待填写 |
-| TG-SMOKE-22 | 要求 bot 发送一段语音/音频 | Telegram 收到 voice/audio，或明确说明当前 TTS/voice provider 未配置 | 待填写 |
+| TG-SMOKE-22 | 发送文本“发一条语音信息给我，随便说点什么。” | 配置 TTS provider 时模型调用 `tts` 工具，Telegram 收到且只收到一条 voice/audio；未配置时返回明确 TTS 不可用说明，不误报成功 | 待手动复测 |
 | TG-SMOKE-23 | 向 bot 发送短视频 | Gateway 下载视频并保存到 media 根目录 | 待填写 |
 | TG-SMOKE-24 | 要求 bot 把视频发回 Telegram | Telegram 收到视频，失败时返回明确错误 | 待填写 |
 
@@ -135,13 +135,15 @@ cjpm run --skip-build --name metis --run-args "gateway discover"
 
 | 编号 | 操作 | 预期结果 | 测试结果 |
 |---|---|---|---|
-| TG-SMOKE-25 | 在配置了 TTS provider 的情况下，让 bot 朗读一段中文 | Provider 被调用，Telegram 收到音频/语音 | 待填写 |
-| TG-SMOKE-26 | 在未配置 TTS provider 的情况下让 bot 朗读 | Bot 明确说明未配置，不误报成功 | 待填写 |
+| TG-SMOKE-25 | 在配置了 TTS provider 的情况下执行 `/tts audio 你好，这是 Metis 的语音回复测试` | Provider 被调用，Telegram 收到音频/语音 | 用户已测 OK |
+| TG-SMOKE-26 | 在未配置 TTS provider 的情况下让 bot 朗读 | Bot 明确说明未配置，不误报成功 | 待手动复测 |
 
 失败时记录：
 
 - TTS provider 配置项。
-- 日志中 `telegramTts`、`/tts`、`sendVoice`、`sendAudio` 相关行。
+- 日志中 `telegramTts`、`tts` tool、`/tts`、`sendVoice`、`sendAudio` 相关行。
+- 文本请求语音时不应出现普通文本和 silent fallback 语音双回复。
+- voice/audio 输入且 `autoReplyToVoice=true`、`audioAsVoice=true` 时，本轮所有可见回复应直接用 voice/audio 投递。
 
 ## 10. Subagent 通知链路
 

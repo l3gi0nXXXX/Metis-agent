@@ -86,6 +86,20 @@ public struct GatewayTalkUserSettings {
 }
 
 @jsonable
+public struct GatewaySpeechUserSettings {
+    public var tts: JsonObject = JsonObject()
+    public var asr: JsonObject = JsonObject()
+}
+
+@jsonable
+public struct GatewayChannelSpeechUserSettings {
+    public var tts: JsonObject = JsonObject()
+    public var asr: JsonObject = JsonObject()
+    public var audioAsVoice: Option<Bool> = None<Bool>
+    public var autoReplyToVoice: Option<Bool> = None<Bool>
+}
+
+@jsonable
 public struct GatewayControlUiUserSettings {
     public var enabled: Bool = true
     public var basePath: String = ""
@@ -406,6 +420,7 @@ public struct TelegramUserSettings {
     public var threadBindings: TelegramThreadBindingsUserSettings = TelegramThreadBindingsUserSettings()
     public var media: TelegramMediaUserSettings = TelegramMediaUserSettings()
     public var network: TelegramNetworkUserSettings = TelegramNetworkUserSettings()
+    public var speech: GatewayChannelSpeechUserSettings = GatewayChannelSpeechUserSettings()
 }
 
 /**
@@ -432,6 +447,7 @@ public struct FeishuUserSettings {
     public var replyInThread: String = "disabled"
     public var requireSignatureHeaders: Bool = true
     public var requestMaxSkewSeconds: Int64 = 300
+    public var speech: GatewayChannelSpeechUserSettings = GatewayChannelSpeechUserSettings()
 }
 
 /**
@@ -465,6 +481,7 @@ public struct QQUserSettings {
     public var officialAuthScheme: String = ""
     public var officialSendPrivateUrlTemplate: String = ""
     public var officialSendGroupUrlTemplate: String = ""
+    public var speech: GatewayChannelSpeechUserSettings = GatewayChannelSpeechUserSettings()
 }
 
 /**
@@ -532,6 +549,7 @@ public struct GatewayUserSettings {
     public var session: GatewaySessionUserSettings = GatewaySessionUserSettings()
     public var canvas: GatewayCanvasHostUserSettings = GatewayCanvasHostUserSettings()
     public var talk: GatewayTalkUserSettings = GatewayTalkUserSettings()
+    public var speech: GatewaySpeechUserSettings = GatewaySpeechUserSettings()
     public var feishu: FeishuUserSettings = FeishuUserSettings()
     public var qq: QQUserSettings = QQUserSettings()
     public var telegram: TelegramUserSettings = TelegramUserSettings()

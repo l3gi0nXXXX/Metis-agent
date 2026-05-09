@@ -1,18 +1,78 @@
 package metis.gateway.core
 
-import metis.core.{GatewayToolRuntimeContext, gatewayCurrentToolRuntimeContext, gatewayNotifyCurrentToolRuntimeStatus}
+import metis.core.{GatewayToolRuntimeContext, gatewayCurrentToolRuntimeContext, gatewayMarkCurrentToolRuntimeVisibleReplyDelivered, gatewayNotifyCurrentToolRuntimeStatus}
 import metis.core.{gatewayMediaUnderstandingFirstText, gatewayMediaUnderstandingForRecord, setGatewayMediaAsrRunnerForTest, setGatewayMediaDocumentExtractorForTest, setGatewayMediaVideoRunnerForTest, setGatewayMediaVisionRunnerForTest}
-import metis.core.config.GatewayUserSettings
+import metis.core.config.{CliConfig, GatewayUserSettings, CliSettingManager, MetisConfigManager}
+import metis.gateway.tools.{GatewayTtsToolset, debugSetGatewayTtsToolCallRunnerForTest}
 import metis.gateway.session.{GatewayDeliveryTarget, GatewayIngressSource, GatewaySessionContext, GatewaySessionRequest}
 
 import std.collection.ArrayList
+import std.env.{getVariable, setVariable}
 import std.fs.{Directory, File, Path, remove}
 import std.time.DateTime
 import std.unittest.testmacro.*
 import stdx.encoding.json.{JsonArray, JsonBool, JsonObject, JsonString}
 
+private func gatewaySessionTurnTtsTestHome(label: String): String {
+    "/tmp/metis-gateway-session-turn-tts-${label}-${DateTime.now().toUnixTimeStamp().toMilliseconds()}"
+}
+
+private func gatewaySessionTurnInstallTtsConfig(home: String): Unit {
+    let root = JsonObject()
+    let gateway = JsonObject()
+    let speech = JsonObject()
+    let tts = JsonObject()
+    tts.put("provider", JsonString("fake-command"))
+    let providers = JsonObject()
+    let provider = JsonObject()
+    provider.put("kind", JsonString("command"))
+    provider.put("outputExtension", JsonString("ogg"))
+    provider.put("command", JsonArray([
+        JsonString("sh"),
+        JsonString("-c"),
+        JsonString("printf 'session-turn-tts' > \"$2\""),
+        JsonString("metis-tts"),
+        JsonString("{text}"),
+        JsonString("{output}")
+    ]))
+    providers.put("fake-command", provider)
+    tts.put("providers", providers)
+    speech.put("tts", tts)
+    gateway.put("speech", speech)
+    let telegram = JsonObject()
+    let telegramSpeech = JsonObject()
+    telegramSpeech.put("audioAsVoice", JsonBool(true))
+    telegramSpeech.put("autoReplyToVoice", JsonBool(true))
+    telegram.put("speech", telegramSpeech)
+    gateway.put("telegram", telegram)
+    root.put("gateway", gateway)
+    MetisConfigManager.writeRoot(root)
+    CliSettingManager.invalidate()
+    Directory.create(Path(home).join("gateway-tts"), recursive: true)
+}
+
+private func gatewaySessionTurnResetEnv(oldHome: Option<String>, home: String): Unit {
+    match (oldHome) {
+        case Some(value) => setVariable("METIS_HOME", value)
+        case None => setVariable("METIS_HOME", "")
+    }
+    MetisConfigManager.invalidate()
+    CliSettingManager.invalidate()
+    CliConfig.invalidatePathCache()
+    try { remove(Path(home), recursive: true) } catch (_e: Exception) { () }
+}
+
 @Test
 public class GatewaySessionTurnRunnerTest {
+    @TestCase
+    public func telegramSystemPromptTellsModelToUseTtsToolForVoiceReply(): Unit {
+        let prompt = gatewayPolicyFilteredSystemPrompt(channelName: "telegram", modelName: "test-model")
+        @Expect(prompt.contains("do not use `shellExecute`"), true)
+        @Expect(prompt.contains("Call the `tts` tool"), true)
+        @Expect(prompt.contains("<silent_reply>"), true)
+        @Expect(prompt.contains("Write the exact text that should be spoken as the final answer; the Telegram Gateway will synthesize and deliver"), false)
+    }
+
     @TestCase
     public func telegramLifecycleHookReportsThinkingToolDone(): Unit {
         let statuses = ArrayList<String>()
@@ -63,6 +123,257 @@ public class GatewaySessionTurnRunnerTest {
             @Expect(statuses[0], "thinking")
             @Expect(statuses[1], "tool")
             @Expect(statuses[2], "done")
+        } finally {
+            setGatewayAgentBridgeReplyRunnerForTest(None<(String, String, String, String, Bool, Option<(String) -> Unit>) -> String>)
+        }
+    }
+
+    @TestCase
+    public func telegramSilentReplyAfterToolDeliveryDoesNotSendDuplicateFinalMessage(): Unit {
+        let sentTexts = ArrayList<String>()
+        let statuses = ArrayList<String>()
+        setGatewayAgentBridgeReplyRunnerForTest(Some({
+            _conversationKey: String,
+            _prompt: String,
+            _channelName: String,
+            _agentId: String,
+            _streamingEnabled: Bool,
+            _streamChunkHook: Option<(String) -> Unit> =>
+                gatewayMarkCurrentToolRuntimeVisibleReplyDelivered()
+                "<SILENT_REPLY>"
+        }))
+        try {
+            let store = GatewaySessionStore(Path("."), enabled: false, agentId: "general")
+            let bridge = AgentBridge(sessionStore: store)
+            let context = GatewaySessionContext(
+                GatewayIngressSource.Channel("telegram"),
+                "telegram",
+                "telegram",
+                "telegram:chat:1",
+                "general",
+                deliveryTarget: Some(GatewayDeliveryTarget("telegram", "user:1", accountId: "default", replyToMessageId: "7"))
+            )
+            let runtimeContext = GatewayToolRuntimeContext(
+                "telegram",
+                channelName: "telegram",
+                sessionKey: "telegram:chat:1",
+                lifecycleHook: Some({ status: String => statuses.add(status) })
+            )
+            let result = gatewayExecuteSessionTurn(
+                bridge,
+                context,
+                "run fake message tool",
+                deliver: true,
+                toolRuntimeContext: Some(runtimeContext),
+                deliverHook: Some({
+                    _channelName: String,
+                    _accountId: String,
+                    _peerId: String,
+                    text: String,
+                    _replyToMessageId: Option<String>,
+                    _replyInThread: Bool =>
+                        sentTexts.add(text)
+                        "501"
+                }),
+                lifecycleHook: Some({ status: String => statuses.add(status) })
+            )
+            @Expect(result.delivered, true)
+            @Expect(result.deliveryStatus, "delivered-by-tool")
+            @Expect(sentTexts.size, 0)
+            @Expect(statuses[statuses.size - 1], "done")
+        } finally {
+            setGatewayAgentBridgeReplyRunnerForTest(None<(String, String, String, String, Bool, Option<(String) -> Unit>) -> String>)
+        }
+    }
+
+    @TestCase
+    public func telegramTtsToolDeliveryDuringSessionTurnSuppressesDuplicateFinalText(): Unit {
+        let home = gatewaySessionTurnTtsTestHome("tool-delivery")
+        let oldHome = getVariable("METIS_HOME")
+        try { remove(Path(home), recursive: true) } catch (_e: Exception) { () }
+        Directory.create(home, recursive: true)
+        setVariable("METIS_HOME", home)
+        MetisConfigManager.invalidate()
+        CliSettingManager.invalidate()
+        CliConfig.invalidatePathCache()
+        gatewaySessionTurnInstallTtsConfig(home)
+
+        let sentToolPayloads = ArrayList<String>()
+        let sentFinalTexts = ArrayList<String>()
+        debugSetGatewayTtsToolCallRunnerForTest(Some({ method: String, payload: JsonObject =>
+            @Expect(method, "channels.send")
+            sentToolPayloads.add(payload.get("text").getOrThrow().asString().getValue())
+            let out = JsonObject()
+            out.put("ok", JsonBool(true))
+            out
+        }))
+        setGatewayAgentBridgeReplyRunnerForTest(Some({
+            _conversationKey: String,
+            _prompt: String,
+            _channelName: String,
+            _agentId: String,
+            _streamingEnabled: Bool,
+            _streamChunkHook: Option<(String) -> Unit> =>
+                let _ = GatewayTtsToolset().debugTtsForTest("你好，这是模型调用语音工具的回复", "telegram", true)
+                "<SILENT_REPLY>"
+        }))
+        try {
+            let store = GatewaySessionStore(Path("."), enabled: false, agentId: "general")
+            let bridge = AgentBridge(sessionStore: store)
+            let context = GatewaySessionContext(
+                GatewayIngressSource.Channel("telegram"),
+                "telegram",
+                "telegram",
+                "telegram:direct:user:1",
+                "general",
+                deliveryTarget: Some(GatewayDeliveryTarget("telegram", "user:1", accountId: "default", replyToMessageId: "7"))
+            )
+            let runtimeContext = GatewayToolRuntimeContext(
+                "telegram",
+                channelName: "telegram",
+                sessionKey: "telegram:direct:user:1"
+            )
+            let result = gatewayExecuteSessionTurn(
+                bridge,
+                context,
+                "发一条语音信息给我，随便说点什么。",
+                deliver: true,
+                toolRuntimeContext: Some(runtimeContext),
+                deliverHook: Some({
+                    _channelName: String,
+                    _accountId: String,
+                    _peerId: String,
+                    text: String,
+                    _replyToMessageId: Option<String>,
+                    _replyInThread: Bool =>
+                        sentFinalTexts.add(text)
+                        "final-${sentFinalTexts.size}"
+                })
+            )
+            @Expect(result.delivered, true)
+            @Expect(result.deliveryStatus, "delivered-by-tool")
+            @Expect(sentToolPayloads.size, 1)
+            @Expect(sentToolPayloads[0].startsWith("[voice]"), true)
+            @Expect(sentFinalTexts.size, 0)
+        } finally {
+            setGatewayAgentBridgeReplyRunnerForTest(None<(String, String, String, String, Bool, Option<(String) -> Unit>) -> String>)
+            debugSetGatewayTtsToolCallRunnerForTest(None<(String, JsonObject) -> JsonObject>)
+            gatewaySessionTurnResetEnv(oldHome, home)
+        }
+    }
+
+    @TestCase
+    public func telegramVoiceInputFinalTextAutoSynthesizesVoiceAndDoesNotSendPlainText(): Unit {
+        let home = gatewaySessionTurnTtsTestHome("final-auto-voice")
+        let oldHome = getVariable("METIS_HOME")
+        try { remove(Path(home), recursive: true) } catch (_e: Exception) { () }
+        Directory.create(home, recursive: true)
+        setVariable("METIS_HOME", home)
+        MetisConfigManager.invalidate()
+        CliSettingManager.invalidate()
+        CliConfig.invalidatePathCache()
+        gatewaySessionTurnInstallTtsConfig(home)
+
+        let sentTexts = ArrayList<String>()
+        setGatewayAgentBridgeReplyRunnerForTest(Some({
+            _conversationKey: String,
+            _prompt: String,
+            _channelName: String,
+            _agentId: String,
+            _streamingEnabled: Bool,
+            _streamChunkHook: Option<(String) -> Unit> =>
+                "这是模型普通文本回复"
+        }))
+        try {
+            let store = GatewaySessionStore(Path("."), enabled: false, agentId: "general")
+            let bridge = AgentBridge(sessionStore: store)
+            let context = GatewaySessionContext(
+                GatewayIngressSource.Channel("telegram"),
+                "telegram",
+                "telegram",
+                "telegram:direct:user:1",
+                "general",
+                deliveryTarget: Some(GatewayDeliveryTarget("telegram", "user:1", accountId: "default", replyToMessageId: "7"))
+            )
+            let runtimeContext = GatewayToolRuntimeContext(
+                "telegram",
+                channelName: "telegram",
+                sessionKey: "telegram:direct:user:1",
+                prompt: "[voice]\nmediaKind=voice\ntranscript=语音测试"
+            )
+            let result = gatewayExecuteSessionTurn(
+                bridge,
+                context,
+                "语音测试",
+                deliver: true,
+                toolRuntimeContext: Some(runtimeContext),
+                deliverHook: Some({
+                    _channelName: String,
+                    _accountId: String,
+                    _peerId: String,
+                    text: String,
+                    _replyToMessageId: Option<String>,
+                    _replyInThread: Bool =>
+                        sentTexts.add(text)
+                        "final-${sentTexts.size}"
+                })
+            )
+            @Expect(result.delivered, true)
+            @Expect(sentTexts.size, 1)
+            @Expect(sentTexts[0].startsWith("[voice]"), true)
+            @Expect(sentTexts[0].contains("caption=TTS (fake-command)"), true)
+            @Expect(sentTexts[0].contains("这是模型普通文本回复"), false)
+        } finally {
+            setGatewayAgentBridgeReplyRunnerForTest(None<(String, String, String, String, Bool, Option<(String) -> Unit>) -> String>)
+            gatewaySessionTurnResetEnv(oldHome, home)
+        }
+    }
+
+    @TestCase
+    public func telegramFinalDeliveryStripsInternalDirectivesButKeepsReplyTarget(): Unit {
+        let sentTexts = ArrayList<String>()
+        let replyTargets = ArrayList<String>()
+        setGatewayAgentBridgeReplyRunnerForTest(Some({
+            _conversationKey: String,
+            _prompt: String,
+            _channelName: String,
+            _agentId: String,
+            _streamingEnabled: Bool,
+            _streamChunkHook: Option<(String) -> Unit> =>
+                "[[reply_to_current]] [[tts:text]]可以，这是一条回复。[[audio_as_voice]]"
+        }))
+        try {
+            let store = GatewaySessionStore(Path("."), enabled: false, agentId: "general")
+            let bridge = AgentBridge(sessionStore: store)
+            let context = GatewaySessionContext(
+                GatewayIngressSource.Channel("telegram"),
+                "telegram",
+                "telegram",
+                "telegram:chat:1",
+                "general",
+                deliveryTarget: Some(GatewayDeliveryTarget("telegram", "user:1", accountId: "default", replyToMessageId: "7"))
+            )
+            let result = gatewayExecuteSessionTurn(
+                bridge,
+                context,
+                "reply",
+                deliver: true,
+                deliverHook: Some({
+                    _channelName: String,
+                    _accountId: String,
+                    _peerId: String,
+                    text: String,
+                    replyToMessageId: Option<String>,
+                    _replyInThread: Bool =>
+                        sentTexts.add(text)
+                        replyTargets.add(match (replyToMessageId) { case Some(v) => v case None => "" })
+                        "501"
+                })
+            )
+            @Expect(result.delivered, true)
+            @Expect(sentTexts.size, 1)
+            @Expect(sentTexts[0], "可以，这是一条回复。")
+            @Expect(replyTargets[0], "7")
         } finally {
             setGatewayAgentBridgeReplyRunnerForTest(None<(String, String, String, String, Bool, Option<(String) -> Unit>) -> String>)
         }

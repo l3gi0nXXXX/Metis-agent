@@ -777,23 +777,133 @@ Telegram 入站先经过 `dmPolicy`、`groupPolicy`、`allowFrom`、`groupAllowF
 
 TTS 生成文件只能写入临时目录、测试 fixture 目录或用户显式配置的安全目录；不得默认写入真实用户媒体归档。无 provider 时应返回可操作诊断，而不是静默失败。
 
-命令型 provider 使用 `gateway.channelsExtra.telegramTts` 配置，不改变 Telegram adapter 的发送链路。`command` 必须是数组，避免 shell 拼接；可使用 `{text}` 和 `{output}` 占位符。provider 命令应将音频写入 `{output}`，Gateway 再按 `audioAsVoice` 选择 `[voice]` 或 `[audio]` payload。
+TTS/ASR 的 canonical 配置入口是 Gateway speech 配置：
+
+- `gateway.speech.tts` / `gateway.speech.asr`：所有 IM channel 共享的默认 provider 配置。
+- `gateway.telegram.speech.tts` / `gateway.telegram.speech.asr`：Telegram channel override，优先级高于共享配置；QQ、Feishu、WeCom 等 IM channel 也按同一规则使用自己的 `gateway.<channel>.speech.tts/asr` 覆盖共享配置。
+- `gateway.telegram.speech.audioAsVoice` / `autoReplyToVoice`：Telegram 投递和会话行为偏好；不覆盖 provider、voice 或 api key。
+- `gateway.channelsExtra.telegramTts`：legacy TTS 兼容入口，仅在共享和 Telegram override 都未配置时 fallback，并应迁移到 `gateway.telegram.speech.tts` 或 `gateway.speech.tts`。
+
+依据：OpenClaw TTS 文档把 provider-owned settings 放在 `messages.tts.providers.<id>`，并允许 provider fallback；OpenClaw-China QQBot 文档把腾讯 Flash ASR 配置在通道 ASR 下；Hermes 示例把 messaging voice transcription 作为独立 STT provider 配置。Metis 采用 Gateway 共享默认配置加通道覆盖配置：先读取 `gateway.speech.tts/asr`，再深合并 `gateway.telegram.speech.tts/asr`，因此 Telegram 自己的 speech 配置优先于共享配置。
+
+正常对话中，用户明确要求 Metis 用语音/音频回复时，模型应调用 Gateway 暴露的 `tts` 工具，由工具生成 `[voice]` 或 `[audio]` payload 并通过当前 Telegram 会话发送；发送成功后模型应返回 silent reply，避免再追加一条普通文本。`/tts audio <text>` 仍是 native command 测试入口，用于直接验证 provider、音频生成和 Telegram 发送链路。
+
+Telegram 收到 voice/audio 输入时，`autoReplyToVoice=true` 且 `audioAsVoice=true` 表示 Gateway 会把本轮可见回复直接转成语音投递；这条路径只由入站媒体类型和配置决定。普通文本里的“发语音/朗读/voice/audio”等自然语言关键词不会再由 Gateway 硬编码改写成语音，是否发语音由模型调用 `tts` 工具决定。
+
+命令型 provider 不改变 Telegram adapter 的发送链路。`command` 必须是数组，避免 shell 拼接；TTS 可使用 `{text}` 和 `{output}` 占位符；ASR 可使用 `{input}`、`{mime}`、`{output}` 和 `{outputDir}` 占位符。provider 命令应将音频写入 `{output}`，Gateway 再按 `audioAsVoice` 选择 `[voice]` 或 `[audio]` payload。Telegram adapter 只负责 `[voice]` / `[audio]` 投递，不执行 provider。
+
+#### 推荐配置：共享默认 + Telegram 覆盖
+
+下面示例同时展示 DashScope `qwen3-tts-flash`、OpenAI-compatible ASR、Tencent Flash ASR 和 command fallback。示例里的 `${ENV_NAME}` 是环境变量占位符，不要把真实 key、secret 或 token 写进聊天、日志或版本库。
 
 ```json
 {
   "gateway": {
-    "channelsExtra": {
-      "telegramTts": {
-        "provider": "command",
-        "command": ["edge-tts", "--text", "{text}", "--write-media", "{output}"],
-        "outputExtension": "mp3",
+    "speech": {
+      "tts": {
+        "enabled": true,
+        "provider": "dashscope",
+        "fallbackProviders": ["edge"],
+        "maxChars": 4000,
+        "degradeMessage": "语音暂时发送失败，我先打字陪你。",
+        "providers": {
+          "dashscope": {
+            "kind": "openai-compatible",
+            "baseUrl": "https://dashscope.aliyuncs.com/api/v1",
+            "apiKey": "${DASHSCOPE_API_KEY}",
+            "model": "qwen3-tts-flash",
+            "voice": "Chelsie",
+            "responseFormat": "opus",
+            "timeoutMs": 60000
+          },
+          "edge": {
+            "kind": "command",
+            "command": ["edge-tts", "--text", "{text}", "--write-media", "{output}"],
+            "outputExtension": "mp3",
+            "timeoutMs": 10000
+          }
+        }
+      },
+      "asr": {
+        "enabled": true,
+        "provider": "openai-whisper",
+        "fallbackProviders": ["tencent-flash", "local-command"],
+        "maxBytes": 26214400,
+        "providers": {
+          "openai-whisper": {
+            "kind": "openai-compatible",
+            "baseUrl": "https://api.openai.com/v1",
+            "apiKey": "${OPENAI_ASR_API_KEY}",
+            "model": "whisper-1",
+            "timeoutMs": 60000
+          },
+          "tencent-flash": {
+            "kind": "tencent-flash",
+            "appId": "${TENCENT_ASR_APP_ID}",
+            "secretId": "${TENCENT_ASR_SECRET_ID}",
+            "secretKey": "${TENCENT_ASR_SECRET_KEY}",
+            "engineType": "16k_zh",
+            "timeoutMs": 60000,
+            "maxBytes": 26214400
+          },
+          "local-command": {
+            "kind": "command",
+            "command": ["python3", "/path/to/transcribe.py", "{input}"],
+            "timeoutMs": 60000
+          }
+        }
+      }
+    },
+    "telegram": {
+      "speech": {
+        "tts": {
+          "provider": "dashscope",
+          "providers": {
+            "telegram-edge": {
+              "kind": "command",
+              "command": ["edge-tts", "--voice", "zh-CN-XiaoxiaoNeural", "--text", "{text}", "--write-media", "{output}"],
+              "outputExtension": "ogg",
+              "timeoutMs": 10000
+            }
+          }
+        },
+        "asr": {
+          "provider": "tencent-flash"
+        },
         "audioAsVoice": true,
-        "timeoutMs": 10000
+        "autoReplyToVoice": true
       }
     }
   }
 }
 ```
+
+配置要点：
+
+- `gateway.speech.tts.providers.dashscope.kind=openai-compatible` 使用 OpenAI-compatible TTS 形态，Metis 向 `${baseUrl}/audio/speech` 发送请求；DashScope 示例使用 `qwen3-tts-flash` 和 `${DASHSCOPE_API_KEY}`。
+- `gateway.speech.asr.providers.openai-whisper.kind=openai-compatible` 用于 Whisper-compatible `/audio/transcriptions` 类接口；示例用 `${OPENAI_ASR_API_KEY}`，也可以替换为兼容服务的 base URL 和模型。
+- `gateway.speech.asr.providers.tencent-flash.kind=tencent-flash` 对齐 OpenClaw-China QQBot 的腾讯录音文件识别极速版配置，需要 `${TENCENT_ASR_APP_ID}`、`${TENCENT_ASR_SECRET_ID}`、`${TENCENT_ASR_SECRET_KEY}`。
+- `command` provider 是本地 fallback，不需要云 key；只把文件路径和文本作为数组参数传给命令，不通过 shell 拼接。
+- `gateway.telegram.speech.tts/asr` 可以只覆盖 `provider`，继续复用共享 `providers`；如果 Telegram 需要不同 voice、输出格式、ASR engine 或 fallback，再在 Telegram 覆盖块内补充同名 provider 字段。
+- 显式配置本地/免费 ASR provider 后，Metis 不应静默回退到付费云 provider。不同 IM 通道自己的 `speech` 配置优先于 `gateway.speech`，共享配置只是默认值。
+
+#### 迁移建议
+
+- 旧的 `gateway.channelsExtra.telegramTts` 仅作为兼容 fallback；迁移时把 provider、command、limit、outputExtension、timeoutMs 移到 `gateway.telegram.speech.tts` 或 `gateway.speech.tts`。
+- 如果原先只有 Telegram 使用 TTS，优先迁移到 `gateway.telegram.speech.tts`；如果多个 IM 都要复用同一 provider，放到 `gateway.speech.tts`，再用各通道 `gateway.<channel>.speech` 覆盖投递偏好。
+- 如果原先由脚本做 ASR/TTS，先保留为 `kind=command` fallback，再逐步增加 `openai-compatible` 或 `tencent-flash` provider。
+
+#### 排障状态
+
+| 状态 | 常见原因 | 处理方式 |
+|---|---|---|
+| `not_configured` | 没有设置 provider，或 OpenAI-compatible provider 缺少 `${ENV_NAME}` 对应环境变量。 | 运行 `/tts status`，检查 `gateway.speech.tts/asr` 与 `gateway.telegram.speech.tts/asr`，确认环境变量已在 Gateway 进程环境中设置。 |
+| `auth_error` | API key、secretId、secretKey 无效，或 provider 返回 401/403。 | 轮换密钥，确认没有把真实 key 写进配置仓库；检查 provider 控制台权限和额度。 |
+| `timeout` | provider 网络慢、本地 command 卡住、代理或 DNS 问题。 | 增大 `timeoutMs`，先用 command fallback 或 fake server 验证 Metis 链路，再排查外部网络。 |
+| `provider_error` | provider 返回 4xx/5xx、command 非零退出、输出文件缺失、格式不被目标通道接受。 | 查看脱敏后的 provider status、HTTP status、exitCode 和 attempts；不要把 authorization header 或 secret 打进日志。 |
+| `too_large` | TTS 文本超过 `maxChars`，或 ASR 文件超过 `maxBytes`。 | 降低输入长度、开启 summary、压缩媒体，或按预算调整 `maxChars`/`maxBytes`。 |
+| `empty_result` | ASR 成功返回但 transcript 为空，或 TTS provider 返回空音频。 | 先换一段清晰短音频/短文本；如果 command provider 使用 `{output}`，确认它确实写入输出文件。 |
+| `degraded` | 主 provider 和 fallback 都失败，但配置了 `degradeMessage` 或通道能力降级为文本/普通消息。 | 确认用户收到了文本降级回复；随后根据 attempts 中的 provider 顺序逐一修复。 |
 
 ## OpenClaw Plugin Compatibility
 

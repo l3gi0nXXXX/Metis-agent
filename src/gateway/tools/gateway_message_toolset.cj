@@ -3,14 +3,57 @@ package metis.gateway.tools
 import magic.dsl.{tool, toolset}
 import magic.prelude.*
 
-import metis.core.{gatewayMessagePayloadPreview, parseGatewayPollParts, renderGatewayAudioText, renderGatewayChatActionText, renderGatewayDeleteText, renderGatewayDocumentText, renderGatewayEditText, renderGatewayPhotoText, renderGatewayPinText, renderGatewayPollTextAdvanced, renderGatewayReactionText, renderGatewayTopicCreateText, renderGatewayTopicEditText, renderGatewayUnpinText, renderGatewayVideoNoteText, renderGatewayVideoText, renderGatewayVoiceText}
-import metis.core.config.MetisPaths
+import metis.core.{gatewayCurrentToolRuntimeContext, gatewayMarkCurrentToolRuntimeVisibleReplyDelivered, gatewayMessagePayloadPreview, gatewaySpeechResolveDeliveryPrefs, gatewaySpeechResolveTtsConfig, gatewaySpeechTtsSynthesize, parseGatewayPollParts, renderGatewayAudioText, renderGatewayChatActionText, renderGatewayDeleteText, renderGatewayDocumentText, renderGatewayEditText, renderGatewayPhotoText, renderGatewayPinText, renderGatewayPollTextAdvanced, renderGatewayReactionText, renderGatewayTopicCreateText, renderGatewayTopicEditText, renderGatewayUnpinText, renderGatewayVideoNoteText, renderGatewayVideoText, renderGatewayVoiceText}
+import metis.core.config.{CliConfig, CliSettingManager, MetisPaths}
 import metis.io.PrintUtils
 
-import std.fs.{Path, exists}
+import std.fs.{Directory, File, Path, exists}
 import std.process.executeWithOutput
 
-import stdx.encoding.json.{JsonBool, JsonObject, JsonString, JsonValue}
+import stdx.encoding.json.{JsonBool, JsonInt, JsonObject, JsonString, JsonValue}
+
+private var gatewayMessageToolCallRunnerForTest: Option<(String, JsonObject) -> JsonObject> = None<(String, JsonObject) -> JsonObject>
+
+public func debugSetGatewayMessageToolCallRunnerForTest(runner: Option<(String, JsonObject) -> JsonObject>): Unit {
+    gatewayMessageToolCallRunnerForTest = runner
+}
+
+private func gatewayMessageToolIsInternalDirective(tag: String): Bool {
+    let normalized = tag.trimAscii().toAsciiLower().replace(" ", "")
+    normalized == "reply_to_current" ||
+        normalized.startsWith("reply_to:") ||
+        normalized == "tts" ||
+        normalized == "tts:text" ||
+        normalized == "/tts" ||
+        normalized == "/tts:text" ||
+        normalized == "audio_as_voice"
+}
+
+private func gatewayMessageToolStripInternalDirectives(raw: String): String {
+    var cursor: Int64 = 0
+    let out = StringBuilder()
+    while (cursor < raw.size) {
+        match (raw.indexOf("[[", cursor)) {
+            case Some(start) =>
+                out.append(raw[cursor..start])
+                match (raw.indexOf("]]", start + 2)) {
+                    case Some(end) =>
+                        let tag = raw[start + 2..end]
+                        if (!gatewayMessageToolIsInternalDirective(tag)) {
+                            out.append(raw[start..end + 2])
+                        }
+                        cursor = end + 2
+                    case None =>
+                        out.append(raw[start..])
+                        cursor = raw.size
+                }
+            case None =>
+                out.append(raw[cursor..])
+                cursor = raw.size
+        }
+    }
+    out.toString().trimAscii()
+}
 
 @toolset
 public class GatewayMessageToolset {
@@ -27,6 +70,10 @@ public class GatewayMessageToolset {
     }
 
     private func invokeGatewaySend(payload: JsonObject): JsonObject {
+        match (gatewayMessageToolCallRunnerForTest) {
+            case Some(runner) => return runner("channels.send", payload)
+            case None => ()
+        }
         let (command, workDir) = this.gatewayMessageBinaryCommand()
         let args = ["gateway", "call", "channels.send", payload.toJsonString()]
         let (exitCode, stdoutBytes, stderrBytes) = executeWithOutput(command, args, workingDirectory: workDir)
@@ -50,6 +97,149 @@ public class GatewayMessageToolset {
         out.put("stdout", JsonString(stdout))
         out.put("stderr", JsonString(stderr))
         return out
+    }
+
+    private func jsonBool(obj: JsonObject, key: String, fallback: Bool): Bool {
+        match (obj.get(key)) {
+            case Some(v) => try { v.asBool().getValue() } catch (_: Exception) { fallback }
+            case None => fallback
+        }
+    }
+
+    private func telegramTtsDir(): Path {
+        let dir = CliConfig.dotDir.join("gateway-telegram").join("tts")
+        if (!exists(dir)) {
+            Directory.create(dir, recursive: true)
+        }
+        dir
+    }
+
+    private func telegramReadTtsState(): JsonObject {
+        let path = this.telegramTtsDir().join("state.json")
+        if (!exists(path)) {
+            let out = JsonObject()
+            out.put("enabled", JsonBool(true))
+            out.put("provider", JsonString(""))
+            out.put("limit", JsonInt(4000))
+            return out
+        }
+        try {
+            JsonValue.fromStr(String.fromUtf8(File.readFrom(path))).asObject()
+        } catch (_: Exception) {
+            JsonObject()
+        }
+    }
+
+    private func telegramSpeakableText(text: String): String {
+        var out = text.trimAscii()
+        if (out.startsWith("[[")) {
+            var end: Int64 = -1
+            for (i in 0..(out.size - 1)) {
+                if (out[i] == 93u8 && out[i + 1] == 93u8) {
+                    end = i + 2
+                    break
+                }
+            }
+            if (end > 0 && end <= out.size) {
+                out = out[end..].trimAscii()
+            }
+        }
+        out
+    }
+
+    private func telegramVoiceInputContext(): Bool {
+        match (gatewayCurrentToolRuntimeContext()) {
+            case Some(context) =>
+                if (context.channelName != "telegram") {
+                    return false
+                }
+                let prompt = context.prompt
+                prompt.startsWith("[voice]") ||
+                    prompt.startsWith("[audio]") ||
+                    prompt.contains("\nmediaKind=voice") ||
+                    prompt.contains("\nmediaKind=audio") ||
+                    prompt.contains("\nmimeType=audio/")
+            case None => false
+        }
+    }
+
+    private func maybeSynthesizeTelegramAutoVoiceText(channel: String, payloadKind: String, text: String): String {
+        if (channel.trimAscii().toAsciiLower() != "telegram") {
+            return text
+        }
+        if (!(payloadKind == "text" || payloadKind == "threaded-text")) {
+            return text
+        }
+        if (text.trimAscii().startsWith("[voice]") || text.trimAscii().startsWith("[audio]")) {
+            return text
+        }
+        let voiceInput = this.telegramVoiceInputContext()
+        if (!voiceInput) {
+            return text
+        }
+        let user = CliSettingManager.readGatewaySettings()
+        let prefs = gatewaySpeechResolveDeliveryPrefs(user, channel: "telegram")
+        if (!this.jsonBool(prefs, "audioAsVoice", false)) {
+            return text
+        }
+        if (!this.jsonBool(prefs, "autoReplyToVoice", false)) {
+            return text
+        }
+        let speakable = this.telegramSpeakableText(text)
+        if (speakable.isEmpty()) {
+            return text
+        }
+        let result = gatewaySpeechTtsSynthesize(
+            gatewaySpeechResolveTtsConfig(user, channel: "telegram"),
+            prefs,
+            this.telegramReadTtsState(),
+            speakable,
+            outputRoot: this.telegramTtsDir()
+        )
+        match (result.get("payload")) {
+            case Some(v) =>
+                try {
+                    let payload = v.asString().getValue().trimAscii()
+                    if (!payload.isEmpty()) {
+                        return payload
+                    }
+                } catch (_: Exception) {
+                    ()
+                }
+            case None => ()
+        }
+        text
+    }
+
+    private func messageToolActionDeliveredVisibleReply(action: String): Bool {
+        action == "send" ||
+            action == "reply" ||
+            action == "thread" ||
+            action == "poll" ||
+            action == "photo" ||
+            action == "document" ||
+            action == "audio" ||
+            action == "voice" ||
+            action == "video" ||
+            action == "video-note"
+    }
+
+    public func debugMessageForTest(action: String, channel: String, to: String, message: String): String {
+        this.__tool_impl_of_message(
+            action,
+            Some(channel),
+            Some(to),
+            Some(message),
+            None<String>,
+            None<String>,
+            None<String>,
+            None<String>,
+            None<String>,
+            None<Bool>,
+            None<Int64>,
+            None<Bool>,
+            None<Bool>
+        )
     }
 
     @tool[
@@ -172,6 +362,14 @@ public class GatewayMessageToolset {
         } else if (act == "reply" || act == "thread") {
             payloadKind = "threaded-text"
         }
+        text = gatewayMessageToolStripInternalDirectives(text)
+        let synthesizedText = this.maybeSynthesizeTelegramAutoVoiceText(ch, payloadKind, text)
+        if (synthesizedText.trimAscii().startsWith("[voice]")) {
+            payloadKind = "voice"
+        } else if (synthesizedText.trimAscii().startsWith("[audio]")) {
+            payloadKind = "audio"
+        }
+        text = synthesizedText
         if (ch.isEmpty() || target.isEmpty() || text.isEmpty()) {
             let err = JsonObject()
             err.put("ok", JsonBool(false))
@@ -251,6 +449,9 @@ public class GatewayMessageToolset {
             case Some(v) =>
                 try { v.asBool().getValue() } catch (_: Exception) { false }
             case None => false
+        }
+        if (ok && this.messageToolActionDeliveredVisibleReply(act)) {
+            gatewayMarkCurrentToolRuntimeVisibleReplyDelivered()
         }
         let result = JsonObject()
         result.put("ok", JsonBool(ok))

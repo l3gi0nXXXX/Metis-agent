@@ -152,6 +152,35 @@ private class GatewayTelegramNativeFakeModel <: ChatModel {
     }
 }
 
+private class GatewayTelegramNativeSilentReplyFakeModel <: ChatModel {
+    private var _maxTokens: Option<Int64> = None
+
+    public prop provider: String {
+        get() { "fake" }
+    }
+
+    public prop name: String {
+        get() { "telegram-native-silent" }
+    }
+
+    public prop contextLength: Int64 {
+        get() { 8192 }
+    }
+
+    public mut prop maxTokens: Option<Int64> {
+        get() { this._maxTokens }
+        set(v) { this._maxTokens = v }
+    }
+
+    public func create(_request: ChatRequest): ChatResponse {
+        ChatResponse(this.fullName, Message.assistant("<SILENT_REPLY>"))
+    }
+
+    public func asyncCreate(_request: ChatRequest): AsyncChatResponse {
+        throw Exception("async not used in telegram native tests")
+    }
+}
+
 private let gatewayTelegramNativeTestLock: Mutex = Mutex()
 
 private func gatewayTelegramNativeTestConfigRoot(): JsonObject {
@@ -1690,7 +1719,7 @@ public class GatewayServiceTelegramNativeTest {
             adapter.queue("/tts audio hello")
             service.processOnce()
 
-            @Expect(adapter.sentText(0).contains("Telegram TTS"), true)
+            @Expect(adapter.sentText(0).contains("Gateway TTS"), true)
             @Expect(adapter.sentText(0).contains("Status: not_configured"), true)
             @Expect(adapter.sentText(1).contains("Provider: fake"), true)
             @Expect(adapter.sentText(2).startsWith("[voice]"), true)
@@ -1701,7 +1730,7 @@ public class GatewayServiceTelegramNativeTest {
     }
 
     @TestCase
-    public func t53TtsCommandProviderEmitsConfiguredAudioPayloadWithoutRealConfig(): Unit {
+    public func t53TtsLegacyCommandProviderEmitsConfiguredAudioPayloadWithMigrationHint(): Unit {
         withGatewayTelegramNativeTestHome {
             var user = GatewayUserSettings()
             user.telegram.enabled = true
@@ -1729,9 +1758,249 @@ public class GatewayServiceTelegramNativeTest {
             @Expect(adapter.sentText(0).contains("Provider: command"), true)
             @Expect(adapter.sentText(0).contains("Provider kind: command"), true)
             @Expect(adapter.sentText(0).contains("Audio as voice: false"), true)
+            @Expect(adapter.sentText(0).contains("gateway.channelsExtra.telegramTts"), true)
             @Expect(adapter.sentText(1).startsWith("[audio]"), true)
             @Expect(adapter.sentText(1).contains("/tmp/metis-gateway-telegram-native-test-home"), true)
             @Expect(adapter.sentText(1).contains("caption=TTS (command)"), true)
+        }
+    }
+
+    @TestCase
+    public func t53TtsUsesTelegramSpeechOverrideBeforeSharedSpeechProvider(): Unit {
+        withGatewayTelegramNativeTestHome {
+            var user = GatewayUserSettings()
+            user.telegram.enabled = true
+            user.telegram.allowFrom = ["*"]
+            user.telegram.actions.audio = true
+            let sharedProvider = JsonObject()
+            sharedProvider.put("kind", JsonString("command"))
+            sharedProvider.put("command", JsonArray([JsonString("sh"), JsonString("-c"), JsonString("printf 'shared' > \"$2\""), JsonString("metis-tts"), JsonString("{text}"), JsonString("{output}")]))
+            sharedProvider.put("outputExtension", JsonString("ogg"))
+            let sharedProviders = JsonObject()
+            sharedProviders.put("shared", sharedProvider)
+            user.speech.tts.put("enabled", true.toJsonValue())
+            user.speech.tts.put("provider", JsonString("shared"))
+            user.speech.tts.put("providers", sharedProviders)
+
+            let telegramProvider = JsonObject()
+            telegramProvider.put("kind", JsonString("command"))
+            telegramProvider.put("command", JsonArray([JsonString("sh"), JsonString("-c"), JsonString("printf 'telegram' > \"$2\""), JsonString("metis-tts"), JsonString("{text}"), JsonString("{output}")]))
+            telegramProvider.put("outputExtension", JsonString("ogg"))
+            let telegramProviders = JsonObject()
+            telegramProviders.put("telegram", telegramProvider)
+            user.telegram.speech.tts.put("provider", JsonString("telegram"))
+            user.telegram.speech.tts.put("providers", telegramProviders)
+            user.telegram.speech.audioAsVoice = Some<Bool>(false)
+            CliSettingManager.writeGatewaySettings(user)
+
+            let adapter = GatewayTelegramNativeTestAdapter()
+            let service = gatewayTelegramNativeService(adapter)
+            service.start()
+            adapter.queue("/tts status")
+            adapter.queue("/tts audio hello-shared-override")
+            service.processOnce()
+
+            @Expect(adapter.sentText(0).contains("Gateway TTS"), true)
+            @Expect(adapter.sentText(0).contains("Provider: telegram"), true)
+            @Expect(adapter.sentText(0).contains("Audio as voice: false"), true)
+            @Expect(adapter.sentText(1).startsWith("[audio]"), true)
+            @Expect(adapter.sentText(1).contains("caption=TTS (telegram)"), true)
+        }
+    }
+
+    @TestCase
+    public func t53TtsFallsBackToSharedSpeechProviderWhenTelegramOverrideMissing(): Unit {
+        withGatewayTelegramNativeTestHome {
+            var user = GatewayUserSettings()
+            user.telegram.enabled = true
+            user.telegram.allowFrom = ["*"]
+            user.telegram.actions.audio = true
+            let sharedProvider = JsonObject()
+            sharedProvider.put("kind", JsonString("command"))
+            sharedProvider.put("command", JsonArray([JsonString("sh"), JsonString("-c"), JsonString("printf 'shared' > \"$2\""), JsonString("metis-tts"), JsonString("{text}"), JsonString("{output}")]))
+            sharedProvider.put("outputExtension", JsonString("ogg"))
+            let sharedProviders = JsonObject()
+            sharedProviders.put("shared", sharedProvider)
+            user.speech.tts.put("enabled", true.toJsonValue())
+            user.speech.tts.put("provider", JsonString("shared"))
+            user.speech.tts.put("providers", sharedProviders)
+            user.telegram.speech.audioAsVoice = Some<Bool>(false)
+            CliSettingManager.writeGatewaySettings(user)
+
+            let adapter = GatewayTelegramNativeTestAdapter()
+            let service = gatewayTelegramNativeService(adapter)
+            service.start()
+            adapter.queue("/tts status")
+            adapter.queue("/tts audio hello-shared")
+            service.processOnce()
+
+            @Expect(adapter.sentText(0).contains("Provider: shared"), true)
+            @Expect(adapter.sentText(1).startsWith("[audio]"), true)
+            @Expect(adapter.sentText(1).contains("caption=TTS (shared)"), true)
+        }
+    }
+
+    @TestCase
+    public func t53VoiceInboundAutoReplyUsesTtsPayloadWhenEnabled(): Unit {
+        withGatewayTelegramNativeTestHome {
+            let modelName = "metis-test-telegram-auto-tts-${DateTime.now().toUnixTimeStamp().toMilliseconds()}"
+            ModelManager.registerChatModel(modelName, { => GatewayTelegramNativeFakeModel() })
+            let oldModel = CliConfig.model
+            CliConfig.model = modelName
+            try {
+                var user = GatewayUserSettings()
+                user.telegram.enabled = true
+                user.telegram.allowFrom = ["*"]
+                user.channelModels["telegram"] = modelName
+                user.telegram.speech.autoReplyToVoice = Some<Bool>(true)
+                user.telegram.speech.audioAsVoice = Some<Bool>(true)
+                user.speech.tts.put("enabled", true.toJsonValue())
+                user.speech.tts.put("provider", JsonString("fake"))
+                CliSettingManager.writeGatewaySettings(user)
+
+                let adapter = GatewayTelegramNativeTestAdapter()
+                let service = gatewayTelegramNativeService(adapter)
+                service.start()
+                adapter.queue("[voice]\nfileId=file-1\nmimeType=audio/ogg\n[media-context]\nchannel=telegram\naccountId=default\npeerId=user:8734062810\nmessageId=900\nmediaKind=voice\ntranscript=语音测试\nunderstandingStatus=ok")
+                service.processOnce()
+
+                var foundVoice = false
+                var foundPlainAnswer = false
+                for (i in 0..adapter.sentCount()) {
+                    let sent = adapter.sentText(i)
+                    if (sent.startsWith("[voice]") && sent.contains("caption=TTS (fake)")) {
+                        foundVoice = true
+                    }
+                    if (sent == "fake telegram native session answer") {
+                        foundPlainAnswer = true
+                    }
+                }
+                @Expect(foundVoice, true)
+                @Expect(foundPlainAnswer, false)
+            } finally {
+                CliConfig.model = oldModel
+            }
+        }
+    }
+
+    @TestCase
+    public func t53VoiceInboundAutoReplyFallsBackToVoiceWhenModelReturnsSilentReplyToken(): Unit {
+        withGatewayTelegramNativeTestHome {
+            let modelName = "metis-test-telegram-auto-tts-silent-${DateTime.now().toUnixTimeStamp().toMilliseconds()}"
+            ModelManager.registerChatModel(modelName, { => GatewayTelegramNativeSilentReplyFakeModel() })
+            let oldModel = CliConfig.model
+            CliConfig.model = modelName
+            try {
+                var user = GatewayUserSettings()
+                user.telegram.enabled = true
+                user.telegram.allowFrom = ["*"]
+                user.channelModels["telegram"] = modelName
+                user.telegram.speech.autoReplyToVoice = Some<Bool>(true)
+                user.telegram.speech.audioAsVoice = Some<Bool>(true)
+                user.speech.tts.put("enabled", true.toJsonValue())
+                user.speech.tts.put("provider", JsonString("fake"))
+                CliSettingManager.writeGatewaySettings(user)
+
+                let adapter = GatewayTelegramNativeTestAdapter()
+                let service = gatewayTelegramNativeService(adapter)
+                service.start()
+                adapter.queue("[voice]\nfileId=file-1\nmimeType=audio/ogg\n[media-context]\nchannel=telegram\naccountId=default\npeerId=user:8734062810\nmessageId=902\nmediaKind=voice\ntranscript=语音测试\nunderstandingStatus=ok")
+                service.processOnce()
+
+                var foundVoice = false
+                var foundSilentText = false
+                for (i in 0..adapter.sentCount()) {
+                    let sent = adapter.sentText(i)
+                    if (sent.startsWith("[voice]") && sent.contains("caption=TTS (fake)")) {
+                        foundVoice = true
+                    }
+                    if (sent.trimAscii().toAsciiLower() == "<silent_reply>" || sent.trimAscii().toAsciiLower() == "silent_reply") {
+                        foundSilentText = true
+                    }
+                }
+                @Expect(foundVoice, true)
+                @Expect(foundSilentText, false)
+            } finally {
+                CliConfig.model = oldModel
+            }
+        }
+    }
+
+    @TestCase
+    public func t53TextExplicitVoiceRequestDoesNotUseKeywordDrivenTtsVoicePayload(): Unit {
+        withGatewayTelegramNativeTestHome {
+            let modelName = "metis-test-telegram-text-tts-${DateTime.now().toUnixTimeStamp().toMilliseconds()}"
+            ModelManager.registerChatModel(modelName, { => GatewayTelegramNativeFakeModel() })
+            let oldModel = CliConfig.model
+            CliConfig.model = modelName
+            try {
+                var user = GatewayUserSettings()
+                user.telegram.enabled = true
+                user.telegram.allowFrom = ["*"]
+                user.channelModels["telegram"] = modelName
+                user.telegram.speech.audioAsVoice = Some<Bool>(true)
+                user.speech.tts.put("enabled", true.toJsonValue())
+                user.speech.tts.put("provider", JsonString("fake"))
+                CliSettingManager.writeGatewaySettings(user)
+
+                let adapter = GatewayTelegramNativeTestAdapter()
+                let service = gatewayTelegramNativeService(adapter)
+                service.start()
+                adapter.queue("发一条语音信息给我，随便说点什么。")
+                service.processOnce()
+
+                var foundVoice = false
+                var foundPlainAnswer = false
+                for (i in 0..adapter.sentCount()) {
+                    let sent = adapter.sentText(i)
+                    if (sent.startsWith("[voice]") && sent.contains("caption=TTS (fake)")) {
+                        foundVoice = true
+                    }
+                    if (sent == "fake telegram native session answer") {
+                        foundPlainAnswer = true
+                    }
+                }
+                @Expect(foundVoice, false)
+                @Expect(foundPlainAnswer, true)
+            } finally {
+                CliConfig.model = oldModel
+            }
+        }
+    }
+
+    @TestCase
+    public func t53VoiceInboundAutoReplyFallsBackToTextWhenDisabled(): Unit {
+        withGatewayTelegramNativeTestHome {
+            let modelName = "metis-test-telegram-auto-tts-off-${DateTime.now().toUnixTimeStamp().toMilliseconds()}"
+            ModelManager.registerChatModel(modelName, { => GatewayTelegramNativeFakeModel() })
+            let oldModel = CliConfig.model
+            CliConfig.model = modelName
+            try {
+                var user = GatewayUserSettings()
+                user.telegram.enabled = true
+                user.telegram.allowFrom = ["*"]
+                user.telegram.speech.autoReplyToVoice = Some<Bool>(false)
+                user.telegram.speech.audioAsVoice = Some<Bool>(true)
+                user.speech.tts.put("enabled", true.toJsonValue())
+                user.speech.tts.put("provider", JsonString("fake"))
+                CliSettingManager.writeGatewaySettings(user)
+
+                let adapter = GatewayTelegramNativeTestAdapter()
+                let service = gatewayTelegramNativeService(adapter)
+                service.start()
+                adapter.queue("[voice]\nfileId=file-1\nmimeType=audio/ogg\n[media-context]\nchannel=telegram\naccountId=default\npeerId=user:8734062810\nmessageId=901\nmediaKind=voice\ntranscript=语音测试\nunderstandingStatus=ok")
+                service.processOnce()
+
+                var foundPlainAnswer = false
+                for (i in 0..adapter.sentCount()) {
+                    if (adapter.sentText(i) == "fake telegram native session answer") {
+                        foundPlainAnswer = true
+                    }
+                }
+                @Expect(foundPlainAnswer, true)
+            } finally {
+                CliConfig.model = oldModel
+            }
         }
     }
 }

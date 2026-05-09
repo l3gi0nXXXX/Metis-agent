@@ -87,6 +87,8 @@ public class GatewayTelegramMediaToolsetTest {
         record.put("fileName", JsonString(fileName))
         record.put("localPath", JsonString(localPath))
         record.put("downloaded", JsonBool(true))
+        record.put("channel", JsonString("telegram"))
+        record.put("accountId", JsonString("default"))
         if (mediaKind == "sticker") {
             record.put("fileId", JsonString("sticker-file-id"))
             record.put("fileUniqueId", JsonString("sticker-unique-id"))
@@ -508,29 +510,68 @@ public class GatewayTelegramMediaToolsetTest {
 
     @TestCase
     public func telegramAudioTranscribeReportsUnifiedRuntimeNotConfigured(): Unit {
-        let root = Path("/tmp/metis-telegram-audio-runtime-not-configured-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
-        Directory.create(root, recursive: true)
-        let source = root.join("voice.ogg")
-        File.writeTo(source, "fake".toArray())
-        try {
-            let toolset = GatewayTelegramMediaToolset()
-            let out = gatewayWithToolRuntimeContext(
-                GatewayToolRuntimeContext(
-                    "telegram",
-                    channelName: "telegram",
-                    sessionKey: "telegram:chat:1",
-                    mediaContext: this.mediaContext(source.toString(), mediaKind: "voice", mimeType: "audio/ogg", fileName: "voice.ogg")
-                ),
-                { => toolset.debugTelegramAudioTranscribeForTest(None<String>, None<Int64>) }
-            )
-            let json = JsonValue.fromStr(out).asObject()
-            @Expect(json.get("status").getOrThrow().asString().getValue(), "unsupported")
-            @Expect(json.get("ASRStatus").getOrThrow().asString().getValue(), "not_configured")
-            @Expect(json.get("capability").getOrThrow().asString().getValue(), "audio")
-            let decision = json.get("decision").getOrThrow().asObject()
-            @Expect(decision.get("outcome").getOrThrow().asString().getValue(), "not_configured")
-        } finally {
-            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        this.withTelegramMediaToolsetConfigHome {
+            let root = Path("/tmp/metis-telegram-audio-runtime-not-configured-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
+            Directory.create(root, recursive: true)
+            let source = root.join("voice.ogg")
+            File.writeTo(source, "fake".toArray())
+            try {
+                let toolset = GatewayTelegramMediaToolset()
+                let out = gatewayWithToolRuntimeContext(
+                    GatewayToolRuntimeContext(
+                        "telegram",
+                        channelName: "telegram",
+                        sessionKey: "telegram:chat:1",
+                        mediaContext: this.mediaContext(source.toString(), mediaKind: "voice", mimeType: "audio/ogg", fileName: "voice.ogg")
+                    ),
+                    { => toolset.debugTelegramAudioTranscribeForTest(None<String>, None<Int64>) }
+                )
+                let json = JsonValue.fromStr(out).asObject()
+                @Expect(json.get("status").getOrThrow().asString().getValue(), "unsupported")
+                @Expect(json.get("ASRStatus").getOrThrow().asString().getValue(), "not_configured")
+                @Expect(json.get("capability").getOrThrow().asString().getValue(), "audio")
+                let decision = json.get("decision").getOrThrow().asObject()
+                @Expect(decision.get("outcome").getOrThrow().asString().getValue(), "not_configured")
+            } finally {
+                try { remove(root, recursive: true) } catch (_e: Exception) { () }
+            }
+        }
+    }
+
+    @TestCase
+    public func telegramAudioTranscribeUsesSharedGatewayAsrProvider(): Unit {
+        this.withTelegramMediaToolsetConfigHome {
+            let root = Path("/tmp/metis-telegram-audio-shared-asr-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
+            Directory.create(root, recursive: true)
+            let source = root.join("voice.ogg")
+            File.writeTo(source, "fake".toArray())
+            var user = GatewayUserSettings()
+            let provider = JsonObject()
+            provider.put("kind", JsonString("command"))
+            provider.put("command", JsonArray([JsonString("sh"), JsonString("-c"), JsonString("printf 'shared tool transcript'")]))
+            let providers = JsonObject()
+            providers.put("shared", provider)
+            user.speech.asr.put("enabled", true.toJsonValue())
+            user.speech.asr.put("provider", JsonString("shared"))
+            user.speech.asr.put("providers", providers)
+            CliSettingManager.writeGatewaySettings(user)
+            try {
+                let toolset = GatewayTelegramMediaToolset()
+                let out = gatewayWithToolRuntimeContext(
+                    GatewayToolRuntimeContext(
+                        "telegram",
+                        channelName: "telegram",
+                        sessionKey: "telegram:chat:1",
+                        mediaContext: this.mediaContext(source.toString(), mediaKind: "voice", mimeType: "audio/ogg", fileName: "voice.ogg")
+                    ),
+                    { => toolset.debugTelegramAudioTranscribeForTest(None<String>, None<Int64>) }
+                )
+                let json = JsonValue.fromStr(out).asObject()
+                @Expect(json.get("ASRStatus").getOrThrow().asString().getValue(), "transcribed")
+                @Expect(json.get("transcript").getOrThrow().asString().getValue(), "shared tool transcript")
+            } finally {
+                try { remove(root, recursive: true) } catch (_e: Exception) { () }
+            }
         }
     }
 

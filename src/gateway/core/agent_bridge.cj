@@ -15,7 +15,7 @@ import metis.core.prompting.{MetisBootstrapBudgetResult, MetisSystemPromptParams
 import metis.core.skills.SkillsPrompt
 import metis.core.skills.tryHandleSkillsCommand
 import metis.cron.{executeGatewayCronCommand, parseSlashCronLine}
-import metis.gateway.tools.{GatewayCronToolset, GatewayFSToolset, GatewayGatewayToolset, GatewayManagedSessionsToolset, GatewayMemoryToolset, GatewayMessageToolset, GatewayPlanToolset, GatewaySessionTranscriptToolset, GatewayShellToolset, GatewayTelegramMediaToolset, GatewayWeatherToolset, gatewayHandleNativeCommandLine, gatewayHandleSubagentsCommandLine}
+import metis.gateway.tools.{GatewayCronToolset, GatewayFSToolset, GatewayGatewayToolset, GatewayManagedSessionsToolset, GatewayMemoryToolset, GatewayMessageToolset, GatewayPlanToolset, GatewaySessionTranscriptToolset, GatewayShellToolset, GatewayTelegramMediaToolset, GatewayTtsToolset, GatewayWeatherToolset, gatewayHandleNativeCommandLine, gatewayHandleSubagentsCommandLine}
 import metis.io.{PrintUtils, AnsiColor, WithColor}
 
 import std.collection.{HashMap, ArrayList, enumerate}
@@ -37,6 +37,7 @@ import magic.core.model.ChatModel
         GatewayCronToolset(),
         GatewayGatewayToolset(),
         GatewayMessageToolset(),
+        GatewayTtsToolset(),
         GatewayTelegramMediaToolset(),
         GatewayManagedSessionsToolset(),
         GatewaySessionTranscriptToolset()
@@ -245,6 +246,9 @@ private func buildGatewaySystemPrompt(
     params.runtimeInfo.model = modelName.trimAscii()
     params.runtimeInfo.channel = channelName.trimAscii().toAsciiLower()
     params.runtimeInfo.capabilities = gatewayCorePromptRuntimeCapabilities(gatewayUser, channelName)
+    if (channelName.trimAscii().toAsciiLower() == "telegram") {
+        params.ttsHint = "- If the user explicitly asks for a voice/audio reply, do not use `shellExecute`, host TTS commands, or ad-hoc files to generate audio. Call the `tts` tool with the exact text that should be spoken.\n- When the `tts` tool reports a successful visible delivery, finish with `<silent_reply>` so Telegram users do not receive duplicate text.\n- For normal Telegram text replies, use plain final text or the `message` tool. Gateway only auto-converts replies to voice for voice/audio input when the configured Telegram speech policy requires it."
+    }
     var nativeApprovalUiAvailable = false
     for (capability in params.runtimeInfo.capabilities) {
         if (capability.trimAscii().toAsciiLower() == "native-approval-ui") {

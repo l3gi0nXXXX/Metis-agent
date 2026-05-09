@@ -1,13 +1,15 @@
 package metis.gateway.core
 
-import metis.core.{GatewayToolRuntimeContext, gatewayWithToolRuntimeContext}
+import metis.core.{GatewayToolRuntimeContext, gatewaySpeechResolveDeliveryPrefs, gatewaySpeechResolveTtsConfig, gatewaySpeechTtsSynthesize, gatewayWithToolRuntimeContext}
 import metis.core.renderGatewayEditText
+import metis.core.config.{CliConfig, CliSettingManager}
 import metis.gateway.session.GatewaySessionContext
 
 import magic.log.LogUtils
 import std.core.Duration
+import std.fs.{Directory, File, Path, exists}
 import std.time.DateTime
-import stdx.encoding.json.{JsonObject, JsonString}
+import stdx.encoding.json.{JsonBool, JsonInt, JsonObject, JsonString, JsonValue}
 
 public class GatewaySessionExecutionResult {
     public let answer: String
@@ -72,10 +74,152 @@ private func gatewayStripTaggedReasoning(raw: String): String {
 }
 
 private func gatewayVisibleDeliveryText(channelName: String, raw: String): String {
-    if (channelName.trimAscii().toAsciiLower() == "telegram") {
-        return gatewayStripTaggedReasoning(raw)
+    let visible = if (channelName.trimAscii().toAsciiLower() == "telegram") {
+        gatewayStripTaggedReasoning(raw)
+    } else {
+        raw
     }
-    raw
+    gatewayStripInternalDeliveryDirectives(visible)
+}
+
+private func gatewayIsSilentReplyText(text: String): Bool {
+    let normalized = text.trimAscii().toAsciiLower()
+    normalized == "<silent_reply>" || normalized == "silent_reply"
+}
+
+private func gatewayIsInternalDeliveryDirective(tag: String): Bool {
+    let normalized = tag.trimAscii().toAsciiLower().replace(" ", "")
+    normalized == "reply_to_current" ||
+        normalized.startsWith("reply_to:") ||
+        normalized == "tts" ||
+        normalized == "tts:text" ||
+        normalized == "/tts" ||
+        normalized == "/tts:text" ||
+        normalized == "audio_as_voice"
+}
+
+private func gatewayStripInternalDeliveryDirectives(raw: String): String {
+    var cursor: Int64 = 0
+    let out = StringBuilder()
+    while (cursor < raw.size) {
+        match (raw.indexOf("[[", cursor)) {
+            case Some(start) =>
+                out.append(raw[cursor..start])
+                match (raw.indexOf("]]", start + 2)) {
+                    case Some(end) =>
+                        let tag = raw[start + 2..end]
+                        if (!gatewayIsInternalDeliveryDirective(tag)) {
+                            out.append(raw[start..end + 2])
+                        }
+                        cursor = end + 2
+                    case None =>
+                        out.append(raw[start..])
+                        cursor = raw.size
+                }
+            case None =>
+                out.append(raw[cursor..])
+                cursor = raw.size
+        }
+    }
+    out.toString().trimAscii()
+}
+
+private func gatewaySessionJsonBool(obj: JsonObject, key: String, fallback: Bool): Bool {
+    match (obj.get(key)) {
+        case Some(v) => try { v.asBool().getValue() } catch (_: Exception) { fallback }
+        case None => fallback
+    }
+}
+
+private func gatewayTelegramTtsDir(): Path {
+    let dir = CliConfig.dotDir.join("gateway-telegram").join("tts")
+    if (!exists(dir)) {
+        Directory.create(dir, recursive: true)
+    }
+    dir
+}
+
+private func gatewayTelegramReadTtsState(): JsonObject {
+    let path = gatewayTelegramTtsDir().join("state.json")
+    if (!exists(path)) {
+        let out = JsonObject()
+        out.put("enabled", JsonBool(true))
+        out.put("provider", JsonString(""))
+        out.put("limit", JsonInt(4000))
+        return out
+    }
+    try {
+        JsonValue.fromStr(String.fromUtf8(File.readFrom(path))).asObject()
+    } catch (_: Exception) {
+        JsonObject()
+    }
+}
+
+private func gatewayLooksLikeVoiceOrAudioInput(text: String): Bool {
+    let normalized = text.trimAscii()
+    normalized.startsWith("[voice]") ||
+        normalized.startsWith("[audio]") ||
+        normalized.contains("\nmediaKind=voice") ||
+        normalized.contains("\nmediaKind=audio") ||
+        normalized.contains("\nmimeType=audio/")
+}
+
+private func gatewayShouldAutoSynthesizeTelegramReply(
+    channelName: String,
+    prompt: String,
+    toolRuntimeContext: Option<GatewayToolRuntimeContext>
+): Bool {
+    if (channelName.trimAscii().toAsciiLower() != "telegram") {
+        return false
+    }
+    let runtimePrompt = match (toolRuntimeContext) {
+        case Some(ctx) => ctx.prompt
+        case None => ""
+    }
+    if (!(gatewayLooksLikeVoiceOrAudioInput(runtimePrompt) || gatewayLooksLikeVoiceOrAudioInput(prompt))) {
+        return false
+    }
+    let user = CliSettingManager.readGatewaySettings()
+    let prefs = gatewaySpeechResolveDeliveryPrefs(user, channel: "telegram")
+    gatewaySessionJsonBool(prefs, "autoReplyToVoice", false) &&
+        gatewaySessionJsonBool(prefs, "audioAsVoice", false)
+}
+
+private func gatewayMaybeSynthesizeTelegramFinalReply(
+    channelName: String,
+    prompt: String,
+    text: String,
+    toolRuntimeContext: Option<GatewayToolRuntimeContext>
+): String {
+    let speakable = text.trimAscii()
+    if (speakable.isEmpty() ||
+        speakable.startsWith("[voice]") ||
+        speakable.startsWith("[audio]") ||
+        gatewayIsSilentReplyText(speakable) ||
+        !gatewayShouldAutoSynthesizeTelegramReply(channelName, prompt, toolRuntimeContext)) {
+        return text
+    }
+    let user = CliSettingManager.readGatewaySettings()
+    let result = gatewaySpeechTtsSynthesize(
+        gatewaySpeechResolveTtsConfig(user, channel: "telegram"),
+        gatewaySpeechResolveDeliveryPrefs(user, channel: "telegram"),
+        gatewayTelegramReadTtsState(),
+        speakable,
+        outputRoot: gatewayTelegramTtsDir()
+    )
+    match (result.get("payload")) {
+        case Some(v) =>
+            try {
+                let payload = v.asString().getValue().trimAscii()
+                if (!payload.isEmpty()) {
+                    return payload
+                }
+            } catch (_: Exception) {
+                ()
+            }
+        case None => ()
+    }
+    text
 }
 
 private func gatewayExtractTaggedReasoning(raw: String): String {
@@ -384,7 +528,24 @@ public func gatewayExecuteSessionTurn(
             match (deliverHook) {
                 case Some(send) =>
                     try {
-                        let visibleAnswer = gatewayVisibleDeliveryText(context.channelName, answer)
+                        let visibleAnswer = gatewayMaybeSynthesizeTelegramFinalReply(
+                            context.channelName,
+                            prompt,
+                            gatewayVisibleDeliveryText(context.channelName, answer),
+                            toolRuntimeContext
+                        )
+                        match (toolRuntimeContext) {
+                            case Some(runtimeContext) =>
+                                if (runtimeContext.hasVisibleReplyDelivered() && gatewayIsSilentReplyText(visibleAnswer)) {
+                                    gatewayNotifySessionLifecycle(lifecycleHook, "done")
+                                    return GatewaySessionExecutionResult(
+                                        answer,
+                                        delivered: true,
+                                        deliveryStatus: "delivered-by-tool"
+                                    )
+                                }
+                            case None => ()
+                        }
                         if (!streamingState.messageId.isEmpty() && !streamingState.failed) {
                             if (visibleAnswer != streamingState.lastText) {
                                 let finalEditMessageId = send(

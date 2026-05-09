@@ -14,6 +14,7 @@ public class GatewayToolRuntimeContext {
     public let prompt: String
     public let mediaContext: JsonObject
     public let lifecycleHook: Option<(String) -> Unit>
+    private var visibleReplyDelivered: Bool = false
 
     public init(
         sourceLabel: String,
@@ -58,6 +59,14 @@ public class GatewayToolRuntimeContext {
                 }
             case None => ()
         }
+    }
+
+    public func markVisibleReplyDelivered(): Unit {
+        this.visibleReplyDelivered = true
+    }
+
+    public func hasVisibleReplyDelivered(): Bool {
+        this.visibleReplyDelivered
     }
 }
 
@@ -117,6 +126,13 @@ public func gatewayCurrentToolRuntimeContext(): Option<GatewayToolRuntimeContext
 public func gatewayNotifyCurrentToolRuntimeStatus(status: String): Unit {
     match (gatewayCurrentToolRuntimeContext()) {
         case Some(context) => context.notifyLifecycleStatus(status)
+        case None => ()
+    }
+}
+
+public func gatewayMarkCurrentToolRuntimeVisibleReplyDelivered(): Unit {
+    match (gatewayCurrentToolRuntimeContext()) {
+        case Some(context) => context.markVisibleReplyDelivered()
         case None => ()
     }
 }

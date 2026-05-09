@@ -1,7 +1,10 @@
 package metis.core
 
+import metis.core.config.{CliSettingManager, GatewayUserSettings}
+
 import magic.prelude.*
 
+import std.convert.*
 import std.fs.{File, Path, exists}
 import stdx.encoding.json.{JsonArray, JsonBool, JsonObject, JsonString}
 
@@ -35,6 +38,24 @@ public func gatewayMediaTranscribeAudioPathForRuntime(path: String, mime: String
         case Some(runner) => try { runner(normalizedPath, mime.trimAscii().toAsciiLower()).trimAscii() } catch (_e: Exception) { "" }
         case None => ""
     }
+}
+
+private func gatewayMediaConfiguredTranscribeAudioPathForRuntime(record: JsonObject, user: GatewayUserSettings, path: String, mime: String, maxBytes: Int64): JsonObject {
+    let normalizedPath = path.trimAscii()
+    if (normalizedPath.isEmpty() || !exists(Path(normalizedPath))) {
+        let out = JsonObject()
+        out.put("status", JsonString("unsupported"))
+        out.put("message", JsonString("audio input path is missing"))
+        return out
+    }
+    let channel = gatewayMediaRuntimeString(record, "channel").toAsciiLower()
+    let config = gatewaySpeechResolveAsrConfig(user, channel: channel)
+    let configuredMaxBytes = gatewayMediaRuntimeAsrMaxBytes(record, user, -1)
+    if (configuredMaxBytes >= 0) {
+        config.put("maxBytes", configuredMaxBytes.toJsonValue())
+    }
+    let outputRoot = Path(normalizedPath).parent.join(".metis-asr")
+    gatewaySpeechAsrTranscribeAudioPath(config, normalizedPath, mime, outputRoot: outputRoot, maxBytes: 0)
 }
 
 private func gatewayMediaExtractDocumentPathForRuntime(path: String, mime: String, fileName: String, maxBytes: Int64): String {
@@ -82,6 +103,33 @@ private func gatewayMediaRuntimeBool(obj: JsonObject, key: String): Bool {
         case Some(v) => try { v.asBool().getValue() } catch (_e: Exception) { false }
         case None => false
     }
+}
+
+private func gatewayMediaRuntimeInt(obj: JsonObject, key: String, fallback: Int64): Int64 {
+    match (obj.get(key)) {
+        case Some(v) =>
+            try {
+                v.asInt().getValue()
+            } catch (_: Exception) {
+                try { Int64.parse(v.asString().getValue().trimAscii()) } catch (_inner: Exception) { fallback }
+            }
+        case None => fallback
+    }
+}
+
+private func gatewayMediaRuntimeAsrMaxBytes(record: JsonObject, user: GatewayUserSettings, fallback: Int64): Int64 {
+    let channel = gatewayMediaRuntimeString(record, "channel").toAsciiLower()
+    let channelConfig = match (channel) {
+        case "telegram" => user.telegram.speech.asr
+        case "feishu" => user.feishu.speech.asr
+        case "qq" => user.qq.speech.asr
+        case _ => JsonObject()
+    }
+    let channelLimit = gatewayMediaRuntimeInt(channelConfig, "maxBytes", -1)
+    if (channelLimit >= 0) {
+        return channelLimit
+    }
+    gatewayMediaRuntimeInt(user.speech.asr, "maxBytes", fallback)
 }
 
 private func gatewayMediaRuntimeSafePreview(pathText: String, maxBytes!: Int64 = 8192): String {
@@ -207,6 +255,16 @@ public func gatewayMediaUnderstandingForRecord(
     prompt!: String = "",
     maxBytes!: Int64 = 8192
 ): JsonObject {
+    gatewayMediaUnderstandingForRecordWithSettings(record, CliSettingManager.readGatewaySettings(), capability: capability, prompt: prompt, maxBytes: maxBytes)
+}
+
+public func gatewayMediaUnderstandingForRecordWithSettings(
+    record: JsonObject,
+    user: GatewayUserSettings,
+    capability!: String = "auto",
+    prompt!: String = "",
+    maxBytes!: Int64 = 8192
+): JsonObject {
     let kind = gatewayMediaRuntimeString(record, "mediaKind").toAsciiLower()
     let mime = gatewayMediaRuntimeString(record, "mimeType").toAsciiLower()
     let fileName = if (!gatewayMediaRuntimeString(record, "fileName").isEmpty()) {
@@ -234,7 +292,7 @@ public func gatewayMediaUnderstandingForRecord(
         )
     }
     let bytes = File.readFrom(Path(localPath))
-    if (maxBytes > 0 && Int64(bytes.size) > maxBytes) {
+    if (resolvedCapability != "audio" && maxBytes > 0 && Int64(bytes.size) > maxBytes) {
         let out = gatewayMediaRuntimeResult(
             record,
             resolvedCapability,
@@ -266,12 +324,21 @@ public func gatewayMediaUnderstandingForRecord(
         } else {
             ""
         }
+        let configuredAsr = if (recordTranscript.isEmpty() && recordAsrTranscript.isEmpty() && nativeTranscript.isEmpty()) {
+            gatewayMediaConfiguredTranscribeAudioPathForRuntime(record, user, localPath, mime, maxBytes)
+        } else {
+            JsonObject()
+        }
+        let configuredStatus = gatewayMediaRuntimeString(configuredAsr, "status")
+        let configuredTranscript = gatewayMediaRuntimeString(configuredAsr, "transcript")
         let transcript = if (!recordTranscript.isEmpty()) {
             recordTranscript
         } else if (!recordAsrTranscript.isEmpty()) {
             recordAsrTranscript
         } else if (!nativeTranscript.isEmpty()) {
             nativeTranscript
+        } else if (!configuredTranscript.isEmpty()) {
+            configuredTranscript
         } else {
             gatewayMediaRuntimeCompanionText(localPath, [".transcript.txt", ".txt", ".transcript"], maxBytes: 4096)
         }
@@ -280,6 +347,8 @@ public func gatewayMediaUnderstandingForRecord(
                 "media_record_cache"
             } else if (!nativeTranscript.isEmpty()) {
                 "native_asr_runtime"
+            } else if (!configuredTranscript.isEmpty()) {
+                "gateway_asr_runtime"
             } else {
                 "transcript_companion_file"
             }
@@ -287,6 +356,19 @@ public func gatewayMediaUnderstandingForRecord(
             let out = gatewayMediaRuntimeResult(record, resolvedCapability, "ok", outputs, gatewayMediaRuntimeDecision(resolvedCapability, "applied", source))
             out.put("transcript", JsonString(transcript))
             out.put("ASRStatus", JsonString("transcribed"))
+            return out
+        }
+        if (configuredStatus == "provider_error" || configuredStatus == "timeout" || configuredStatus == "too_large" || configuredStatus == "disabled" || configuredStatus == "not_found") {
+            let message = gatewayMediaRuntimeString(configuredAsr, "message")
+            let out = gatewayMediaRuntimeResult(
+                record,
+                resolvedCapability,
+                configuredStatus,
+                outputs,
+                gatewayMediaRuntimeDecision(resolvedCapability, configuredStatus, message),
+                error: message
+            )
+            out.put("ASRStatus", JsonString(configuredStatus))
             return out
         }
         let out = gatewayMediaRuntimeResult(
