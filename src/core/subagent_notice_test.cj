@@ -15,6 +15,14 @@ public class SubagentNoticeTest {
         root.join("agents").join("main").join("sessions")
     }
 
+    private func longRuneText(r: Rune, count: Int64): String {
+        let sb = StringBuilder()
+        for (_ in 0..count) {
+            sb.append(r)
+        }
+        sb.toString()
+    }
+
     @TestCase
     public func noticeTargetPrefersRequesterSession(): Unit {
         let sessionsRoot = this.tempSessionsRoot("target")
@@ -59,6 +67,30 @@ public class SubagentNoticeTest {
     }
 
     @TestCase
+    public func renderSucceededNoticeTruncatesUnicodeSummaryWithoutInvalidUtf8(): Unit {
+        let sessionsRoot = this.tempSessionsRoot("render-unicode")
+        Directory.create(sessionsRoot, recursive: true)
+        let record = gatewaySubagentCreateRunRecord(
+            sessionsRoot,
+            "child-render-unicode",
+            agentId: "explorer",
+            transcriptPath: "/tmp/child-render-unicode.jsonl"
+        )
+        let runId = gatewaySubagentRunRecordString(record, "runId")
+        let longSummary = this.longRuneText(r'词', 1300)
+        @Expect(gatewaySubagentMarkRunSucceeded(sessionsRoot, runId, resultSummary: longSummary), true)
+
+        match (gatewaySubagentResolveRunRecord(sessionsRoot, runId)) {
+            case Some(found) =>
+                let notice = gatewaySubagentRenderNotice(found)
+                @Expect(notice.contains("[Subagent succeeded] explorer ${runId}"), true)
+                @Expect(notice.contains("... (truncated)"), true)
+                @Expect(notice.contains("Logs: /subagents logs ${runId}"), true)
+            case None => @Expect("missing", "record")
+        }
+    }
+
+    @TestCase
     public func noticeStatusUpdatesAttemptsAndBlocksDuplicateDelivery(): Unit {
         let sessionsRoot = this.tempSessionsRoot("status")
         Directory.create(sessionsRoot, recursive: true)
@@ -83,6 +115,30 @@ public class SubagentNoticeTest {
                 @Expect(gatewaySubagentRunRecordInt(found, "noticeAttempts"), 2)
                 @Expect(gatewaySubagentNoticeShouldDeliver(found), false)
             case None => @Expect("missing", "delivered")
+        }
+    }
+
+    @TestCase
+    public func laterSucceededStateCanDeliverAfterEarlierCancelledNotice(): Unit {
+        let sessionsRoot = this.tempSessionsRoot("terminal-transition")
+        Directory.create(sessionsRoot, recursive: true)
+        let record = gatewaySubagentCreateRunRecord(sessionsRoot, "child-terminal-transition", agentId: "explorer")
+        let runId = gatewaySubagentRunRecordString(record, "runId")
+
+        @Expect(gatewaySubagentMarkRunCancelled(sessionsRoot, runId, reason: "cancel requested"), true)
+        @Expect(gatewaySubagentUpdateNoticeStatus(sessionsRoot, runId, "delivered"), true)
+        @Expect(gatewaySubagentUpdateChannelNoticeStatus(sessionsRoot, runId, "failed", error: "subagent notice delivery hook is unavailable"), true)
+        @Expect(gatewaySubagentMarkRunSucceeded(sessionsRoot, runId, resultSummary: "finished after child process completed"), true)
+
+        match (gatewaySubagentResolveRunRecord(sessionsRoot, runId)) {
+            case Some(found) =>
+                @Expect(gatewaySubagentRunRecordString(found, "status"), "succeeded")
+                @Expect(gatewaySubagentRunRecordString(found, "error"), "")
+                @Expect(gatewaySubagentRunRecordString(found, "noticeStatus"), "none")
+                @Expect(gatewaySubagentRunRecordString(found, "channelNoticeStatus"), "none")
+                @Expect(gatewaySubagentRunRecordString(found, "lastChannelNoticeError"), "")
+                @Expect(gatewaySubagentNoticeShouldDeliver(found), true)
+            case None => @Expect("missing", "record")
         }
     }
 

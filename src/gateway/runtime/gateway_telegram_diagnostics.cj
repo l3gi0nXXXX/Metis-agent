@@ -2,6 +2,7 @@ package metis.gateway.runtime
 
 import magic.jsonable.*
 
+import metis.core.{gatewayImageGenerationOutputRoot, gatewayImageGenerationResolveConfig, gatewayVideoGenerationOutputRoot, gatewayVideoGenerationResolveConfig}
 import metis.core.config.GatewayUserSettings
 
 import std.convert.Parsable
@@ -29,6 +30,100 @@ private func gatewayTelegramDiagObject(obj: JsonObject, key: String): JsonObject
             try { v.asObject() } catch (_e: Exception) { JsonObject() }
         case None => JsonObject()
     }
+}
+
+private func gatewayTelegramDiagProviderConfig(config: JsonObject, provider: String): JsonObject {
+    if (provider.isEmpty()) {
+        return JsonObject()
+    }
+    let providers = gatewayTelegramDiagObject(config, "providers")
+    match (providers.get(provider)) {
+        case Some(v) => try { v.asObject() } catch (_e: Exception) { JsonObject() }
+        case None => JsonObject()
+    }
+}
+
+private func gatewayTelegramDiagStringFromPair(primary: JsonObject, secondary: JsonObject, key: String): String {
+    let primaryValue = gatewayTelegramDiagString(primary, key, "")
+    if (!primaryValue.isEmpty()) {
+        return primaryValue
+    }
+    gatewayTelegramDiagString(secondary, key, "")
+}
+
+private func gatewayTelegramDiagBoolFromPair(primary: JsonObject, secondary: JsonObject, key: String, defaultValue: Bool): Bool {
+    if (primary.get(key).isSome()) {
+        return gatewayTelegramDiagBool(primary, key, defaultValue)
+    }
+    gatewayTelegramDiagBool(secondary, key, defaultValue)
+}
+
+private func gatewayTelegramVideoUnderstandingDiagnostics(user: GatewayUserSettings): JsonObject {
+    let shared = user.media.video
+    let telegram = user.telegram.video
+    let provider = gatewayTelegramDiagStringFromPair(telegram, shared, "provider")
+    let providerConfig = if (provider.isEmpty()) {
+        JsonObject()
+    } else {
+        let telegramProvider = gatewayTelegramDiagProviderConfig(telegram, provider)
+        if (telegramProvider.size() > 0) {
+            telegramProvider
+        } else {
+            gatewayTelegramDiagProviderConfig(shared, provider)
+        }
+    }
+    let model = gatewayTelegramDiagStringFromPair(
+        providerConfig,
+        telegram,
+        "model"
+    )
+    let configured = !provider.isEmpty() && (providerConfig.size() > 0 || !model.isEmpty())
+    let enabled = gatewayTelegramDiagBoolFromPair(telegram, shared, "enabled", true)
+    let out = JsonObject()
+    out.put("enabled", enabled.toJsonValue())
+    out.put("configured", configured.toJsonValue())
+    out.put("status", JsonString(if (!enabled) { "disabled" } else if (configured) { "configured" } else { "not_configured" }))
+    out.put("provider", JsonString(provider))
+    out.put("providerKind", JsonString(gatewayTelegramDiagString(providerConfig, "kind", "")))
+    out.put("model", JsonString(if (model.isEmpty()) { gatewayTelegramDiagString(shared, "model", "") } else { model }))
+    return out
+}
+
+private func gatewayTelegramVideoGenerationDiagnostics(user: GatewayUserSettings): JsonObject {
+    let config = gatewayVideoGenerationResolveConfig(user, channel: "telegram")
+    let provider = gatewayTelegramDiagString(config, "provider", "")
+    let providerConfig = gatewayTelegramDiagProviderConfig(config, provider)
+    let model = gatewayTelegramDiagString(providerConfig, "model", gatewayTelegramDiagString(config, "model", ""))
+    let configured = !provider.isEmpty() && providerConfig.size() > 0
+    let enabled = gatewayTelegramDiagBool(config, "enabled", true)
+    let out = JsonObject()
+    out.put("enabled", enabled.toJsonValue())
+    out.put("configured", configured.toJsonValue())
+    out.put("status", JsonString(if (!enabled) { "disabled" } else if (configured) { "configured" } else { "not_configured" }))
+    out.put("provider", JsonString(provider))
+    out.put("providerKind", JsonString(gatewayTelegramDiagString(providerConfig, "kind", "")))
+    out.put("model", JsonString(model))
+    out.put("outputRoot", JsonString(gatewayVideoGenerationOutputRoot(config)))
+    return out
+}
+
+private func gatewayTelegramImageGenerationDiagnostics(user: GatewayUserSettings): JsonObject {
+    let config = gatewayImageGenerationResolveConfig(user, channel: "telegram")
+    let provider = gatewayTelegramDiagString(config, "provider", "")
+    let providerConfig = gatewayTelegramDiagProviderConfig(config, provider)
+    let model = gatewayTelegramDiagString(providerConfig, "model", gatewayTelegramDiagString(config, "model", ""))
+    let configured = !provider.isEmpty() && providerConfig.size() > 0
+    let enabled = gatewayTelegramDiagBool(config, "enabled", true)
+    let out = JsonObject()
+    out.put("enabled", enabled.toJsonValue())
+    out.put("configured", configured.toJsonValue())
+    out.put("status", JsonString(if (!enabled) { "disabled" } else if (configured) { "configured" } else { "not_configured" }))
+    out.put("provider", JsonString(provider))
+    out.put("providerKind", JsonString(gatewayTelegramDiagString(providerConfig, "kind", "")))
+    out.put("model", JsonString(model))
+    out.put("outputRoot", JsonString(gatewayImageGenerationOutputRoot(config)))
+    out.put("photoActionEnabled", user.telegram.actions.photo.toJsonValue())
+    return out
 }
 
 private func gatewayTelegramDiagArray(values: Array<String>): JsonArray {
@@ -425,6 +520,36 @@ private func gatewayTelegramBuildDiagnosticFindings(user: GatewayUserSettings, r
         "Image/sticker/audio/video/document understanding uses downloaded localPath plus configured/companion runtime output; missing providers return explicit not_configured or metadata_only states.",
         "Configure ASR/vision/video/document providers or companion extraction files when automatic understanding is required."
     )
+    let videoUnderstanding = gatewayTelegramVideoUnderstandingDiagnostics(user)
+    gatewayTelegramAddFinding(
+        findings,
+        "telegram-video-understanding-config",
+        "info",
+        gatewayTelegramDiagString(videoUnderstanding, "status", "not_configured"),
+        "Telegram video understanding provider status is explicit.",
+        "videoUnderstanding=${gatewayTelegramDiagString(videoUnderstanding, "status", "not_configured")}, enabled=${gatewayTelegramDiagBool(videoUnderstanding, "enabled", true)}, configured=${gatewayTelegramDiagBool(videoUnderstanding, "configured", false)}, provider=${gatewayTelegramDiagString(videoUnderstanding, "provider", "")}, kind=${gatewayTelegramDiagString(videoUnderstanding, "providerKind", "")}, model=${gatewayTelegramDiagString(videoUnderstanding, "model", "")}.",
+        "Configure gateway.media.video or gateway.telegram.video when native video understanding should call a provider; companion files still work without provider configuration."
+    )
+    let videoGeneration = gatewayTelegramVideoGenerationDiagnostics(user)
+    gatewayTelegramAddFinding(
+        findings,
+        "telegram-video-generation-config",
+        "info",
+        gatewayTelegramDiagString(videoGeneration, "status", "not_configured"),
+        "Telegram video generation provider status is explicit.",
+        "enabled=${gatewayTelegramDiagBool(videoGeneration, "enabled", true)}, configured=${gatewayTelegramDiagBool(videoGeneration, "configured", false)}, provider=${gatewayTelegramDiagString(videoGeneration, "provider", "")}, model=${gatewayTelegramDiagString(videoGeneration, "model", "")}, outputRoot=${gatewayTelegramDiagString(videoGeneration, "outputRoot", "")}.",
+        "Configure gateway.media.videoGeneration or gateway.telegram.videoGeneration before using gateway_video_generate in Telegram turns."
+    )
+    let imageGeneration = gatewayTelegramImageGenerationDiagnostics(user)
+    gatewayTelegramAddFinding(
+        findings,
+        "telegram-image-generation-config",
+        "info",
+        gatewayTelegramDiagString(imageGeneration, "status", "not_configured"),
+        "Telegram image generation provider status is explicit.",
+        "enabled=${gatewayTelegramDiagBool(imageGeneration, "enabled", true)}, configured=${gatewayTelegramDiagBool(imageGeneration, "configured", false)}, provider=${gatewayTelegramDiagString(imageGeneration, "provider", "")}, model=${gatewayTelegramDiagString(imageGeneration, "model", "")}, outputRoot=${gatewayTelegramDiagString(imageGeneration, "outputRoot", "")}, photoActionEnabled=${gatewayTelegramDiagBool(imageGeneration, "photoActionEnabled", false)}.",
+        "Configure gateway.media.imageGeneration or gateway.telegram.imageGeneration before using gateway_image_generate in Telegram turns; enable gateway.telegram.actions.photo for automatic photo delivery."
+    )
     gatewayTelegramAddFinding(
         findings,
         "telegram-native-command-dispatch",
@@ -643,6 +768,9 @@ public func gatewayTelegramDiagnosticsJson(user: GatewayUserSettings, runtime!: 
     let out = JsonObject()
     out.put("summary", gatewayTelegramDiagnosticsSummary(findings))
     out.put("findings", findings)
+    out.put("videoUnderstanding", gatewayTelegramVideoUnderstandingDiagnostics(user))
+    out.put("videoGeneration", gatewayTelegramVideoGenerationDiagnostics(user))
+    out.put("imageGeneration", gatewayTelegramImageGenerationDiagnostics(user))
     out.put("checkedInputs", gatewayTelegramDiagArray([
         "token",
         "getMe",
@@ -656,6 +784,8 @@ public func gatewayTelegramDiagnosticsJson(user: GatewayUserSettings, runtime!: 
         "asr",
         "vision",
         "videoUnderstanding",
+        "videoGeneration",
+        "imageGeneration",
         "documentExtract",
         "nativeCommands",
         "approvalResolver",

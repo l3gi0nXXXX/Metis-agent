@@ -365,6 +365,14 @@ public class GatewayManagedSessionsToolset {
         }
     }
 
+    private func jsonObjectField(obj: JsonObject, key: String): JsonObject {
+        match (obj.get(key)) {
+            case Some(v) => try { return v.asObject() } catch (_: Exception) { () }
+            case None => ()
+        }
+        JsonObject()
+    }
+
     private func jsonIntStringField(obj: JsonObject, key: String): String {
         match (obj.get(key)) {
             case Some(v) =>
@@ -743,7 +751,30 @@ public class GatewayManagedSessionsToolset {
         let runId = gatewaySubagentRunRecordString(record, "runId")
         let target = if (!runId.isEmpty()) { runId } else { gatewaySubagentRunRecordString(record, "sessionKey") }
         try {
-            let messageId = gatewaySubagentDeliverNoticeToChannel(
+            let messageId = this.deliverManagedChannelNotice(
+                channelName,
+                accountId,
+                peerId,
+                notice,
+                replyToMessageId,
+                replyInThread
+            )
+            let _ = gatewaySubagentUpdateChannelNoticeStatus(this.gwStore().sessionsRoot(), target, "delivered", messageId: messageId)
+        } catch (e: Exception) {
+            let _ = gatewaySubagentUpdateChannelNoticeStatus(this.gwStore().sessionsRoot(), target, "failed", error: e.message)
+        }
+    }
+
+    private func deliverManagedChannelNotice(
+        channelName: String,
+        accountId: String,
+        peerId: String,
+        notice: String,
+        replyToMessageId: String,
+        replyInThread: Bool
+    ): String {
+        try {
+            return gatewaySubagentDeliverNoticeToChannel(
                 channelName,
                 accountId,
                 peerId,
@@ -751,10 +782,72 @@ public class GatewayManagedSessionsToolset {
                 replyToMessageId: replyToMessageId,
                 replyInThread: replyInThread
             )
-            let _ = gatewaySubagentUpdateChannelNoticeStatus(this.gwStore().sessionsRoot(), target, "delivered", messageId: messageId)
-        } catch (e: Exception) {
-            let _ = gatewaySubagentUpdateChannelNoticeStatus(this.gwStore().sessionsRoot(), target, "failed", error: e.message)
+        } catch (hookError: Exception) {
+            return this.deliverManagedChannelNoticeViaGatewayRpc(
+                channelName,
+                accountId,
+                peerId,
+                notice,
+                replyToMessageId,
+                replyInThread,
+                hookError.message
+            )
         }
+    }
+
+    private func deliverManagedChannelNoticeViaGatewayRpc(
+        channelName: String,
+        accountId: String,
+        peerId: String,
+        notice: String,
+        replyToMessageId: String,
+        replyInThread: Bool,
+        hookError: String
+    ): String {
+        let params = JsonObject()
+        params.put("channel", JsonString(channelName))
+        params.put("accountId", JsonString(accountId))
+        params.put("peerId", JsonString(peerId))
+        params.put("to", JsonString(peerId))
+        params.put("text", JsonString(notice))
+        params.put("message", JsonString(notice))
+        params.put("replyInThread", JsonBool(replyInThread))
+        if (!replyToMessageId.trimAscii().isEmpty()) {
+            params.put("replyToMessageId", JsonString(replyToMessageId.trimAscii()))
+            params.put("replyTo", JsonString(replyToMessageId.trimAscii()))
+        }
+
+        let sent = this.invokeGatewayCall("channels.send", params)
+        let result = this.jsonObjectField(sent, "result")
+        var messageId = this.jsonStringField(sent, "messageId")
+        if (messageId.isEmpty()) {
+            messageId = this.jsonStringField(result, "messageId")
+        }
+        if (messageId.isEmpty()) {
+            let delivery = this.jsonObjectField(result, "delivery")
+            messageId = this.jsonStringField(delivery, "messageId")
+        }
+        if (!messageId.isEmpty()) {
+            return messageId
+        }
+        if (this.jsonBoolField(sent, "ok") || this.jsonBoolField(result, "ok")) {
+            return "gateway-rpc"
+        }
+
+        var detail = this.jsonStringField(sent, "error")
+        if (detail.isEmpty()) {
+            detail = this.jsonStringField(result, "error")
+        }
+        if (detail.isEmpty()) {
+            detail = this.jsonStringField(sent, "stderr")
+        }
+        if (detail.isEmpty()) {
+            detail = this.jsonStringField(sent, "stdout")
+        }
+        if (detail.isEmpty()) {
+            detail = hookError.trimAscii()
+        }
+        throw Exception("subagent notice gateway fallback failed: ${detail}")
     }
 
     private func deliverManagedTerminalNotice(sessionKey: String): Unit {
@@ -766,10 +859,10 @@ public class GatewayManagedSessionsToolset {
         if (!gatewaySubagentNoticeShouldDeliver(record)) {
             return
         }
-        let notice = gatewaySubagentRenderNotice(record)
-        let target = gatewaySubagentNoticeTargetSession(record)
-        let effectiveTarget = if (target.trimAscii().isEmpty()) { sessionKey } else { target.trimAscii() }
         try {
+            let notice = gatewaySubagentRenderNotice(record)
+            let target = gatewaySubagentNoticeTargetSession(record)
+            let effectiveTarget = if (target.trimAscii().isEmpty()) { sessionKey } else { target.trimAscii() }
             st.appendTranscriptEntry(effectiveTarget, "system", notice)
             let _ = gatewaySubagentUpdateNoticeStatus(st.sessionsRoot(), sessionKey, "delivered")
             let runId = gatewaySubagentRunRecordString(record, "runId")
@@ -1818,7 +1911,12 @@ public class GatewayManagedSessionsToolset {
         }
         let requesterAccountIdText = this.jsonStringField(requesterBinding, "accountId")
         let requesterPeerIdText = this.jsonStringField(requesterBinding, "peer")
-        let requesterConversationIdText = this.jsonStringField(requesterBinding, "conversationId")
+        let requesterConversationIdTextRaw = this.jsonStringField(requesterBinding, "conversationId")
+        let requesterConversationIdText = if (requesterConversationIdTextRaw.isEmpty()) {
+            requesterPeerIdText
+        } else {
+            requesterConversationIdTextRaw
+        }
         let requesterReplyToMessageIdText = this.jsonStringField(requesterBinding, "replyToMessageId")
         let requesterReplyInThreadValue = this.jsonBoolField(requesterBinding, "replyInThread")
         var currentDepth: Int64 = 0

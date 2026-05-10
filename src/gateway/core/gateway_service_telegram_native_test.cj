@@ -1,8 +1,9 @@
 package metis.gateway.core
 
 import metis.core.config.{CliConfig, CliSettingManager, GatewayUserSettings, MetisConfigManager, TelegramCustomCommandUserSettings}
-import metis.core.{GatewaySpeechTtsDashScopeQwenHttpResult, gatewaySubagentCreateRunRecord, setGatewaySpeechTtsDashScopeQwenRunnerForTest}
+import metis.core.{GatewaySpeechTtsDashScopeQwenHttpResult, gatewaySubagentCreateRunRecord, gatewaySubagentListRunRecords, gatewaySubagentRunRecordString, setGatewaySpeechTtsDashScopeQwenRunnerForTest}
 import metis.gateway.model.{ChannelPolicyConfig, ChannelType, ChatType, InboundMessage, OutboundMessage, SendResult}
+import metis.core.memory.memorySessionStoreForGatewayUser
 
 import magic.core.message.Message
 import magic.core.model.{AsyncChatResponse, ChatModel, ChatRequest, ChatResponse}
@@ -251,6 +252,28 @@ private func gatewayTelegramNativeDashScopeQwenTtsProviders(): JsonObject {
     provider.put("timeoutMs", JsonInt(1000))
     providers.put("dashscope", provider)
     providers
+}
+
+private func gatewayTelegramNativeCreateCustomSubagentFixture(id: String, background: Bool): Unit {
+    let agentDir = CliConfig.dotDir.join("agents").join(id)
+    Directory.create(agentDir, recursive: true)
+    File.writeTo(
+        agentDir.join("AGENT.md"),
+        (
+            "id: ${id}\n" +
+            "name: ${id}\n" +
+            "description: Telegram native custom subagent fixture\n" +
+            "model: openai/gpt-test\n" +
+            "tools: fileRead,grepSearch\n" +
+            "background: ${background}\n" +
+            "isolation: shared\n" +
+            "maxTurns: 7\n" +
+            "---\n" +
+            "# Fixture Instructions\n" +
+            "Always answer as the telegram native fixture.\n"
+        ).toArray()
+    )
+    CliConfig.invalidatePathCache()
 }
 
 @Test
@@ -1121,6 +1144,93 @@ public class GatewayServiceTelegramNativeTest {
             @Expect(adapter.sentText(2).contains("Gateway sessions"), true)
             @Expect(adapter.sentText(3).contains("Pending approvals"), true)
             @Expect(adapter.sentText(3).startsWith("{"), false)
+        }
+    }
+
+    @TestCase
+    public func telegramNativeSubagentsListRendersHumanText(): Unit {
+        withGatewayTelegramNativeTestHome {
+            var user = GatewayUserSettings()
+            user.telegram.enabled = true
+            user.telegram.allowFrom = ["*"]
+            CliSettingManager.writeGatewaySettings(user)
+
+            let adapter = GatewayTelegramNativeTestAdapter()
+            let service = gatewayTelegramNativeService(adapter)
+            service.start()
+            adapter.queue("/subagents list active")
+            service.processOnce()
+
+            let text = adapter.sentText(0)
+            @Expect(text.startsWith("{"), false)
+            @Expect(text.contains("Subagents: list"), true)
+        }
+    }
+
+    @TestCase
+    public func telegramNativeSubagentsSpawnAcceptedJsonRendersHumanText(): Unit {
+        withGatewayTelegramNativeTestHome {
+            let adapter = GatewayTelegramNativeTestAdapter()
+            let service = gatewayTelegramNativeService(adapter)
+            let text = service.renderTelegramNativeHumanReplyForTest("{\"ok\":true,\"status\":\"accepted\",\"runId\":\"subrun_1778383455269_gateway_spawn_subagent-explorer_\",\"sessionKey\":\"gateway:spawn:subagent-explorer:1778383455269\",\"runtime\":\"subagent\",\"agentId\":\"explorer\",\"task\":\"“以沁园春为词牌，写一首词”\",\"liveRunStarted\":true}")
+            @Expect(text.startsWith("{"), false)
+            @Expect(text.contains("Subagents: spawn (accepted)"), true)
+            @Expect(text.contains("runId="), true)
+            @Expect(text.contains("agent=explorer"), true)
+            @Expect(text.contains("task=“以沁园春为词牌，写一首词”"), true)
+        }
+    }
+
+    @TestCase
+    public func telegramNativeSubagentsSpawnPersistsTelegramRequesterForCompletionNotice(): Unit {
+        withGatewayTelegramNativeTestHome {
+            var user = GatewayUserSettings()
+            user.telegram.enabled = true
+            user.telegram.allowFrom = ["*"]
+            user.subagents.allowCustomAgents = true
+            CliSettingManager.writeGatewaySettings(user)
+            gatewayTelegramNativeCreateCustomSubagentFixture("phase-native-telegram", false)
+
+            let adapter = GatewayTelegramNativeTestAdapter()
+            let service = gatewayTelegramNativeService(adapter)
+            service.start()
+            adapter.queue("/subagents spawn phase-native-telegram \"inspect unicode 任务\"")
+            service.processOnce()
+
+            let text = adapter.sentText(0)
+            @Expect(text.startsWith("{"), false)
+            @Expect(text.contains("Subagents: spawn (accepted)"), true)
+            let store = memorySessionStoreForGatewayUser(CliSettingManager.readGatewaySettings())
+            let records = gatewaySubagentListRunRecords(store.sessionsRoot())
+            @Expect(records.size, 1)
+            let record = records[0]
+            @Expect(gatewaySubagentRunRecordString(record, "requesterSessionKey"), "telegram:direct:8734062810")
+            @Expect(gatewaySubagentRunRecordString(record, "requesterChannel"), "telegram")
+            @Expect(gatewaySubagentRunRecordString(record, "requesterAccountId"), "default")
+            @Expect(gatewaySubagentRunRecordString(record, "requesterPeerId"), "8734062810")
+            @Expect(gatewaySubagentRunRecordString(record, "requesterConversationId"), "8734062810")
+        }
+    }
+
+    @TestCase
+    public func telegramNativeSubagentsInvalidActionRendersSubagentsText(): Unit {
+        withGatewayTelegramNativeTestHome {
+            var user = GatewayUserSettings()
+            user.telegram.enabled = true
+            user.telegram.allowFrom = ["*"]
+            CliSettingManager.writeGatewaySettings(user)
+
+            let adapter = GatewayTelegramNativeTestAdapter()
+            let service = gatewayTelegramNativeService(adapter)
+            service.start()
+            adapter.queue("/subagents 以沁园春为词牌写一首词，主题是关于vibe coding。")
+            service.processOnce()
+
+            let text = adapter.sentText(0)
+            @Expect(text.startsWith("{"), false)
+            @Expect(text.contains("Telegram command:"), false)
+            @Expect(text.contains("Subagents:"), true)
+            @Expect(text.contains("unknown subagents action"), true)
         }
     }
 

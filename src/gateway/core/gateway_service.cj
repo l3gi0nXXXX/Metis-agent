@@ -1,6 +1,6 @@
 package metis.gateway.core
 
-import metis.core.{gatewaySpeechResolveDeliveryPrefs, gatewaySpeechResolveTtsConfig, gatewaySpeechTtsSynthesize, renderGatewayTopicEditText}
+import metis.core.{GatewayToolRuntimeContext, gatewaySpeechResolveDeliveryPrefs, gatewaySpeechResolveTtsConfig, gatewaySpeechTtsSynthesize, gatewayWithToolRuntimeContext, renderGatewayTopicEditText}
 import metis.core.config.{CliConfig, CliSettingManager, GatewayUserSettings, MetisConfigManager, cliFindModelAuthChoicesForProvider, cliSetupVisibleModelProviders}
 import metis.core.skills.SkillsPrompt
 import metis.gateway.model.*
@@ -660,12 +660,12 @@ public class GatewayService {
             return true
         }
         if (text == "/subagents" || text.startsWith("/subagents ")) {
-            match (gatewayHandleSubagentsCommandLine(text)) {
+            match (this.handleTelegramSubagentsCommandLine(text, message, accountId, user, sessionKey)) {
                 case Some(reply) =>
                     this.sendTextToPeerDetailed(
                         "telegram",
                         message.peerId,
-                        reply,
+                        this.renderTelegramNativeHumanReply(reply),
                         replyToMessageId: message.replyTargetMessageId,
                         replyInThread: message.replyInThread,
                         accountId: accountId
@@ -788,7 +788,7 @@ public class GatewayService {
                 return true
             }
             if (data.startsWith("subagents:")) {
-                let reply = this.renderTelegramNativeHumanReply(gatewayHandleSubagentsCommandLine("/subagents list current") ?? "{\"ok\":true,\"status\":\"ok\",\"action\":\"subagents\",\"message\":\"Telegram subagent callback was acknowledged.\"}")
+                let reply = this.renderTelegramNativeHumanReply(this.handleTelegramSubagentsCommandLine("/subagents list current", message, accountId, user, sessionKey) ?? "{\"ok\":true,\"status\":\"ok\",\"action\":\"subagents\",\"message\":\"Telegram subagent callback was acknowledged.\"}")
                 this.sendTextToPeerDetailed(
                     "telegram",
                     message.peerId,
@@ -860,6 +860,18 @@ public class GatewayService {
         let action = this.telegramJsonString(root, "action", "command")
         let status = this.telegramJsonString(root, "status", "ok")
         let message = this.telegramJsonString(root, "message", "")
+        let usage = this.telegramJsonString(root, "usage", "")
+        if (usage.startsWith("Usage: /subagents")) {
+            return this.renderTelegramSubagentsText(root)
+        }
+        let runtime = this.telegramJsonString(root, "runtime", "")
+        let runId = this.telegramJsonString(root, "runId", "")
+        if (status == "accepted" && !runId.isEmpty() && (runtime == "subagent" || runtime == "acp")) {
+            if (action == "command") {
+                root.put("action", JsonString("spawn"))
+            }
+            return this.renderTelegramSubagentsText(root)
+        }
         if (status == "not_applicable") {
             return "Not applicable: /${action}\n${if (message.isEmpty()) { "This command is not available in this Metis Telegram runtime." } else { message }}"
         }
@@ -904,6 +916,45 @@ public class GatewayService {
             return this.renderTelegramGenericCommandText(root)
         }
         raw
+    }
+
+    public func renderTelegramNativeHumanReplyForTest(raw: String): String {
+        this.renderTelegramNativeHumanReply(raw)
+    }
+
+    private func rememberTelegramNativeCommandBinding(
+        message: InboundMessage,
+        accountId: String,
+        user: GatewayUserSettings,
+        sessionKey: String
+    ): Unit {
+        let request = gatewaySessionRequestFromInbound(message, sessionHint: sessionKey, accountId: accountId)
+        let context = gatewayResolveSessionContext(request)
+        let store = gatewaySessionStoreForResolvedRequest(user, request)
+        match (context.deliveryTarget) {
+            case Some(target) => store.appendBindingSnapshot(context.sessionKey, target, mode: "native-command")
+            case None => ()
+        }
+    }
+
+    private func handleTelegramSubagentsCommandLine(
+        text: String,
+        message: InboundMessage,
+        accountId: String,
+        user: GatewayUserSettings,
+        sessionKey: String
+    ): Option<String> {
+        this.rememberTelegramNativeCommandBinding(message, accountId, user, sessionKey)
+        let runtimeContext = GatewayToolRuntimeContext(
+            "telegram",
+            channelName: "telegram",
+            sessionKey: sessionKey,
+            senderId: message.senderId,
+            prompt: text
+        )
+        gatewayWithToolRuntimeContext(runtimeContext, { =>
+            gatewayHandleSubagentsCommandLine(text)
+        })
     }
 
     private func renderTelegramNativeHelpText(root: JsonObject, message: String): String {
@@ -1294,6 +1345,13 @@ public class GatewayService {
             if (!msg.isEmpty()) { lines.add(msg) }
             let runId = this.telegramJsonString(root, "runId", "")
             if (!runId.isEmpty()) { lines.add("runId=${runId}") }
+            let agentId = this.telegramJsonString(root, "agentId", "")
+            if (!agentId.isEmpty()) { lines.add("agent=${agentId}") }
+            let task = this.telegramJsonString(root, "task", "")
+            if (!task.isEmpty()) { lines.add("task=${task}") }
+            if (root.get("liveRunStarted").isSome()) {
+                lines.add("liveRunStarted=${this.telegramJsonBool(root, "liveRunStarted", false)}")
+            }
         }
         String.join(lines.toArray(), delimiter: "\n")
     }
@@ -1364,7 +1422,7 @@ public class GatewayService {
             case "sessions" => gatewayTelegramRenderSessionsCommand(text, user)
             case "approvals" => gatewayTelegramRenderApprovalsCommand()
             case "focus" | "unfocus" | "agents" => this.renderTelegramThreadBindingCommand(text, message, accountId, user, sessionKey)
-            case "subagents" => gatewayHandleSubagentsCommandLine(text) ?? this.renderTelegramSubagentsFallback(text)
+            case "subagents" => this.handleTelegramSubagentsCommandLine(text, message, accountId, user, sessionKey) ?? this.renderTelegramSubagentsFallback(text)
             case "new" | "reset" => this.renderTelegramSessionLifecycleCommand(text, user, sessionKey)
             case "compact" => this.renderTelegramCompactCommand(text, user, sessionKey)
             case "think" | "reasoning" | "fast" | "verbose" | "send" | "usage" | "queue" | "elevated" | "exec" => this.renderTelegramSessionOptionCommand(spec.command, text, user, sessionKey)
@@ -1376,8 +1434,8 @@ public class GatewayService {
             case "debug" => this.renderTelegramDebugCommand(text, user, message.senderId)
             case "export-session" => this.renderTelegramExportSessionCommand(text, user, sessionKey)
             case "stop" => gatewayTelegramRenderStopCommand(user, sessionKey)
-            case "kill" => gatewayHandleSubagentsCommandLine("/subagents kill ${this.telegramCommandArgText(text)}") ?? this.renderTelegramSubagentsFallback(text)
-            case "steer" => gatewayHandleSubagentsCommandLine("/subagents steer ${this.telegramCommandArgText(text)}") ?? this.renderTelegramSubagentsFallback(text)
+            case "kill" => this.handleTelegramSubagentsCommandLine("/subagents kill ${this.telegramCommandArgText(text)}", message, accountId, user, sessionKey) ?? this.renderTelegramSubagentsFallback(text)
+            case "steer" => this.handleTelegramSubagentsCommandLine("/subagents steer ${this.telegramCommandArgText(text)}", message, accountId, user, sessionKey) ?? this.renderTelegramSubagentsFallback(text)
             case "approve" => this.renderTelegramApproveCommand(text, user, message.senderId)
             case "restart" => gatewayTelegramRenderRestartCommand(text, message.senderId)
             case "bash" => gatewayTelegramRenderBashCommand(text, message.senderId)

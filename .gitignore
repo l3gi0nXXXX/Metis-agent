@@ -10,6 +10,7 @@ memory/
 .qwen/
 .env.example
 control-ui-cjbackup/
+.worktrees/
 
 .magic-cli/
 **/*.bak

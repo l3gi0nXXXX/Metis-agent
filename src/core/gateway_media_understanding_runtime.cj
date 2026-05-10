@@ -91,6 +91,20 @@ private func gatewayMediaDescribeVideoPathForRuntime(path: String, mime: String,
     }
 }
 
+private func gatewayMediaConfiguredDescribeVideoPathForRuntime(record: JsonObject, user: GatewayUserSettings, path: String, mime: String, prompt: String, maxBytes: Int64): JsonObject {
+    let normalizedPath = path.trimAscii()
+    if (normalizedPath.isEmpty() || !exists(Path(normalizedPath))) {
+        let out = JsonObject()
+        out.put("status", JsonString("unsupported"))
+        out.put("message", JsonString("video input path is missing"))
+        return out
+    }
+    let channel = gatewayMediaRuntimeString(record, "channel").toAsciiLower()
+    let config = gatewayMediaResolveVideoConfig(user, channel: channel)
+    let outputRoot = Path(normalizedPath).parent.join(".metis-video-understanding")
+    gatewayMediaVideoDescribePath(config, normalizedPath, mime, prompt, outputRoot: outputRoot, maxBytes: maxBytes)
+}
+
 private func gatewayMediaRuntimeString(obj: JsonObject, key: String): String {
     match (obj.get(key)) {
         case Some(v) => try { v.asString().getValue().trimAscii() } catch (_e: Exception) { "" }
@@ -292,7 +306,7 @@ public func gatewayMediaUnderstandingForRecordWithSettings(
         )
     }
     let bytes = File.readFrom(Path(localPath))
-    if (resolvedCapability != "audio" && maxBytes > 0 && Int64(bytes.size) > maxBytes) {
+    if (resolvedCapability != "audio" && resolvedCapability != "video" && maxBytes > 0 && Int64(bytes.size) > maxBytes) {
         let out = gatewayMediaRuntimeResult(
             record,
             resolvedCapability,
@@ -464,7 +478,14 @@ public func gatewayMediaUnderstandingForRecordWithSettings(
         } else {
             ""
         }
-        let companionVideo = if (nativeVideo.isEmpty()) {
+        let configuredVideo = if (recordAnalysis.isEmpty() && recordDescription.isEmpty() && nativeVideo.isEmpty()) {
+            gatewayMediaConfiguredDescribeVideoPathForRuntime(record, user, localPath, mime, prompt, maxBytes)
+        } else {
+            JsonObject()
+        }
+        let configuredStatus = gatewayMediaRuntimeString(configuredVideo, "status")
+        let configuredDescription = gatewayMediaRuntimeString(configuredVideo, "description")
+        let companionVideo = if (nativeVideo.isEmpty() && configuredDescription.isEmpty()) {
             gatewayMediaRuntimeCompanionText(localPath, [".video.txt", ".analysis.txt", ".description.txt"], maxBytes: 4096)
         } else {
             ""
@@ -475,6 +496,8 @@ public func gatewayMediaUnderstandingForRecordWithSettings(
             recordDescription
         } else if (!nativeVideo.isEmpty()) {
             nativeVideo
+        } else if (!configuredDescription.isEmpty()) {
+            configuredDescription
         } else {
             companionVideo
         }
@@ -483,12 +506,38 @@ public func gatewayMediaUnderstandingForRecordWithSettings(
                 "media_record_cache"
             } else if (!nativeVideo.isEmpty()) {
                 "native_video_runtime"
+            } else if (!configuredDescription.isEmpty()) {
+                "gateway_video_runtime"
             } else {
                 "video_companion_file"
             }
             outputs.add(gatewayMediaRuntimeOutput("video.description", videoText, source))
             let out = gatewayMediaRuntimeResult(record, resolvedCapability, "ok", outputs, gatewayMediaRuntimeDecision(resolvedCapability, "applied", source))
             out.put("videoDescription", JsonString(videoText))
+            if (!configuredDescription.isEmpty()) {
+                match (configuredVideo.get("provider")) { case Some(v) => out.put("provider", v) case None => () }
+                match (configuredVideo.get("providerKind")) { case Some(v) => out.put("providerKind", v) case None => () }
+                match (configuredVideo.get("model")) { case Some(v) => out.put("model", v) case None => () }
+            }
+            return out
+        }
+        if (configuredStatus == "provider_error" || configuredStatus == "timeout" || configuredStatus == "too_large" || configuredStatus == "disabled" || configuredStatus == "not_found") {
+            let message = gatewayMediaRuntimeString(configuredVideo, "message")
+            let out = gatewayMediaRuntimeResult(
+                record,
+                resolvedCapability,
+                configuredStatus,
+                outputs,
+                gatewayMediaRuntimeDecision(resolvedCapability, configuredStatus, message),
+                error: message
+            )
+            out.put("videoUnderstandingStatus", JsonString(configuredStatus))
+            match (configuredVideo.get("provider")) { case Some(v) => out.put("provider", v) case None => () }
+            match (configuredVideo.get("providerKind")) { case Some(v) => out.put("providerKind", v) case None => () }
+            match (configuredVideo.get("fileBytes")) { case Some(v) => out.put("fileBytes", v) case None => () }
+            match (configuredVideo.get("base64Bytes")) { case Some(v) => out.put("base64Bytes", v) case None => () }
+            match (configuredVideo.get("limitBytes")) { case Some(v) => out.put("limitBytes", v) case None => () }
+            match (configuredVideo.get("timeoutMs")) { case Some(v) => out.put("timeoutMs", v) case None => () }
             return out
         }
         let out = gatewayMediaRuntimeResult(

@@ -107,10 +107,11 @@ private func gatewaySubagentNormalizeNoticeStatus(noticeStatus: String): String 
 
 private func subagentNoticePreview(text: String): String {
     let trimmed = text.trimAscii()
-    if (trimmed.size <= 1200) {
+    let runes = trimmed.toRuneArray()
+    if (runes.size <= 1200) {
         return trimmed
     }
-    "${trimmed[0..1200]}\n... (truncated)"
+    "${String(runes[0..1200])}\n... (truncated)"
 }
 
 private func subagentNoticeLogsHint(record: JsonObject): String {

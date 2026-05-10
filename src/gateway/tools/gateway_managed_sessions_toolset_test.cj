@@ -802,6 +802,70 @@ public class GatewayManagedSessionsToolsetTest {
     }
 
     @TestCase
+    public func telegramSubagentTerminalNoticeFallsBackToGatewayRpcWhenHookUnavailable(): Unit {
+        withManagedSessionsToolsetTestHome("/tmp/metis-managed-subagents-telegram-notice-fallback") {
+            let store = memorySessionStoreForGatewayUser(CliSettingManager.readGatewaySettings())
+            let sessionKey = "child-topic-notice-fallback"
+            let record = gatewaySubagentCreateRunRecord(
+                store.sessionsRoot(),
+                sessionKey,
+                parentSessionKey: "telegram:direct:user:1059872384",
+                requesterSessionKey: "telegram:direct:user:1059872384",
+                requesterChannel: "telegram",
+                requesterAccountId: "telegram:default",
+                requesterPeerId: "user:1059872384",
+                requesterConversationId: "user:1059872384",
+                requesterReplyToMessageId: "888",
+                requesterReplyInThread: false,
+                agentId: "explorer",
+                runtime: "subagent",
+                status: "running",
+                transcriptPath: store.transcriptPath(sessionKey).toString()
+            )
+            let runId = gatewaySubagentRunRecordString(record, "runId")
+            @Expect(gatewaySubagentMarkRunSucceeded(store.sessionsRoot(), runId, resultSummary: "fallback notice done"), true)
+            gatewayClearSubagentNoticeDeliveryHook()
+
+            let captured = JsonObject()
+            let toolset = GatewayManagedSessionsToolset()
+            toolset.debugSetGatewayCallRunnerForTest(Some<(String, JsonObject) -> JsonObject>({ method, params =>
+                captured.put("method", JsonString(method))
+                captured.put("channel", params.get("channel").getOrThrow())
+                captured.put("accountId", params.get("accountId").getOrThrow())
+                captured.put("peerId", params.get("peerId").getOrThrow())
+                captured.put("text", params.get("text").getOrThrow())
+                captured.put("replyToMessageId", params.get("replyToMessageId").getOrThrow())
+                captured.put("replyInThread", params.get("replyInThread").getOrThrow())
+                let out = JsonObject()
+                out.put("ok", JsonBool(true))
+                let result = JsonObject()
+                result.put("ok", JsonBool(true))
+                result.put("messageId", JsonString("gateway-rpc-message-1"))
+                out.put("result", result)
+                out
+            }))
+            try {
+                toolset.debugDeliverTerminalNoticeForTest(sessionKey)
+                @Expect(managedSubagentsString(captured, "method"), "channels.send")
+                @Expect(managedSubagentsString(captured, "channel"), "telegram")
+                @Expect(managedSubagentsString(captured, "accountId"), "telegram:default")
+                @Expect(managedSubagentsString(captured, "peerId"), "user:1059872384")
+                @Expect(managedSubagentsString(captured, "replyToMessageId"), "888")
+                @Expect(captured.get("replyInThread").getOrThrow().asBool().getValue(), false)
+                @Expect(managedSubagentsString(captured, "text").contains("fallback notice done"), true)
+                match (gatewaySubagentResolveRunRecord(store.sessionsRoot(), runId)) {
+                    case Some(found) =>
+                        @Expect(managedSubagentsString(found, "channelNoticeStatus"), "delivered")
+                        @Expect(managedSubagentsString(found, "channelNoticeMessageId"), "gateway-rpc-message-1")
+                    case None => @Expect("missing", "record")
+                }
+            } finally {
+                toolset.debugSetGatewayCallRunnerForTest(None<(String, JsonObject) -> JsonObject>)
+            }
+        }
+    }
+
+    @TestCase
     public func sessionsSpawnCwdIsolationRecordsSpecifiedWorkspace(): Unit {
         withManagedSessionsToolsetTestHome("/tmp/metis-managed-subagents-cwd-isolation") {
             createManagedSubagentsCustomAgentFixture("phase11-cwd", false)

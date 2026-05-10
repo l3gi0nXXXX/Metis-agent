@@ -2395,6 +2395,8 @@ public class TelegramAdapter <: ChannelAdapter {
             "vision"
         } else if (info.kind == "voice" || info.kind == "audio") {
             "transcription"
+        } else if (info.kind == "video" || info.kind == "video-note" || info.kind == "video_note") {
+            "video-understanding"
         } else if (info.kind == "document") {
             "file-context"
         } else {
@@ -2465,6 +2467,8 @@ public class TelegramAdapter <: ChannelAdapter {
             if (downloaded) { "vision-input-ready" } else { "vision-metadata-only" }
         } else if (eligibility == "transcription") {
             if (downloaded) { "asr-input-ready" } else { "asr-metadata-only" }
+        } else if (eligibility == "video-understanding") {
+            if (downloaded) { "video-understanding-ready" } else { "video-metadata-only" }
         } else if (eligibility == "file-context") {
             if (downloaded) { "file-context-ready" } else { "file-metadata-only" }
         } else {
@@ -4570,6 +4574,9 @@ public class TelegramAdapter <: ChannelAdapter {
         }
         if (kind == "voice" || kind == "audio") {
             return "transcription"
+        }
+        if (kind == "video" || kind == "video-note" || kind == "video_note") {
+            return "video-understanding"
         }
         if (kind == "document") {
             return "file-context"

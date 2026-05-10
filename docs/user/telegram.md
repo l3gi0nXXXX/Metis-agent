@@ -364,11 +364,40 @@ Gateway 会把当前 Telegram turn 的媒体对象注入 `mediaContext`。Agent 
 | `telegram_media_read` | 读取 text-like 文件。 | 二进制文件返回 `readable=false`。 |
 | `telegram_image_analyze` | 图片/sticker 理解。 | 返回 `vision provider is not configured` 或建议配置视觉模型。 |
 | `telegram_audio_transcribe` | voice/audio 转写。 | 返回 `ASRStatus=not_configured`。 |
-| `telegram_video_describe` | video/video-note 描述。 | 返回 `videoUnderstandingStatus=not_configured`。 |
+| `telegram_video_describe` | video/video-note 描述。 | 返回 `videoUnderstandingStatus=not_configured`、`too_large`、`timeout` 或 `provider_error`。 |
 | `telegram_document_extract` | 文档抽取或预览。 | 返回 `metadata_only`。 |
 | `telegram_sticker_search/get/cache_stats` | 查询当前上下文和 durable sticker cache。 | cache 为空时返回空结果。 |
 
-当前 native runtime 会优先读取媒体记录中的已知字段和本地 companion 文件：
+视频理解可以使用共享配置 `gateway.media.video`，也可以用 `gateway.telegram.video` 覆盖 Telegram 通道。Telegram override 会深合并共享 provider 配置；缺少 provider、超限、超时或 provider 错误时，工具返回可读错误文本，不把 token、Authorization header 或本地文件路径暴露给用户。
+
+Gemini inline video provider 示例：
+
+```json
+{
+  "gateway": {
+    "media": {
+      "video": {
+        "enabled": true,
+        "provider": "gemini",
+        "maxBytes": 20971520,
+        "maxBase64Bytes": 73400320,
+        "timeoutMs": 120000,
+        "providers": {
+          "gemini": {
+            "kind": "gemini-inline-video",
+            "apiKey": "${GEMINI_API_KEY}",
+            "model": "gemini-3-flash-preview"
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+Metis 会把已下载视频作为 Gemini `inline_data` 发送给 provider；测试和 CI 不需要真实 Telegram、真实网络或真实 `~/.metis`。如果只想给 Telegram 设置不同 provider，可把同样的 `video` 块放在 `gateway.telegram.video` 下。
+
+当前 native runtime 会优先读取媒体记录中的已知字段、已配置视频 provider 和本地 companion 文件：
 
 | 类型 | companion 文件 |
 |---|---|
@@ -378,6 +407,77 @@ Gateway 会把当前 Telegram turn 的媒体对象注入 `mediaContext`。Agent 
 | 文档 | text-like 文件直接读取；否则读取 `<localPath>.extract.txt`、`<localPath>.text.txt`、`<localPath>.preview.txt` |
 
 这部分不引入 Node sidecar，也不绕过 Gateway/channel/session 架构。真正的 ASR、vision、video、document provider 未配置时，Metis 会明确返回 `not_configured` / `metadata_only`，不会猜测媒体内容。
+
+### 视频理解、视频生成与图片生成配置
+
+视频理解、视频生成和图片生成是三套 provider：
+
+- 视频理解处理用户发来的 Telegram 视频，入口是 `telegram_video_describe` 和 mediaContext。
+- 视频生成处理用户要求 Metis 生成视频，入口是 `gateway_video_generate`，成功后通过现有 `channels.send` 媒体发送链路投递为 Telegram video。
+- 图片生成处理用户要求 Metis 生成图片，入口是 `gateway_image_generate`，成功后通过现有 `channels.send` 媒体发送链路投递为 Telegram photo。
+
+三者不能混用。视频理解 provider 不会生成新视频；视频生成 provider 不会替代入站视频描述；图片生成 provider 不会替代 `telegram_image_analyze`。
+
+Qwen 视频理解 + Qwen/DashScope 视频生成 + DashScope Qwen 图片生成配置示例：
+
+```json
+{
+  "gateway": {
+    "media": {
+      "video": {
+        "enabled": true,
+        "provider": "qwen-video-understanding",
+        "maxBytes": 20971520,
+        "maxBase64Bytes": 73400320,
+        "timeoutMs": 120000,
+        "providers": {
+          "qwen-video-understanding": {
+            "kind": "qwen-vl-video",
+            "baseUrl": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            "model": "qwen3-vl-plus",
+            "apiKey": "${DASHSCOPE_API_KEY}"
+          }
+        }
+      },
+      "videoGeneration": {
+        "enabled": true,
+        "provider": "qwen-video-generation",
+        "outputRoot": "~/.metis/gateway-video-generation",
+        "allowedOutputRoots": ["~/.metis/gateway-video-generation"],
+        "providers": {
+          "qwen-video-generation": {
+            "kind": "dashscope-qwen-video-generation",
+            "model": "wanx2.1-t2v-turbo",
+            "apiKey": "${DASHSCOPE_API_KEY}"
+          }
+        }
+      },
+      "imageGeneration": {
+        "enabled": true,
+        "provider": "dashscope-qwen-image",
+        "outputRoot": "~/.metis/gateway-image-generation",
+        "allowedOutputRoots": ["~/.metis/gateway-image-generation"],
+        "providers": {
+          "dashscope-qwen-image": {
+            "kind": "dashscope-qwen-image-generation",
+            "baseUrl": "https://dashscope.aliyuncs.com/api/v1",
+            "model": "qwen-image-2.0-pro",
+            "apiKey": "${DASHSCOPE_API_KEY}"
+          }
+        }
+      }
+    },
+    "telegram": {
+      "actions": {
+        "video": true,
+        "photo": true
+      }
+    }
+  }
+}
+```
+
+当前 native 视频理解 provider 支持 `qwen-vl-video` 和 `gemini-inline-video`。`qwen-vl-video` 使用 DashScope compatible mode 的 `/chat/completions`，把视频作为 `video_url` data URL 发送，默认模型为 `qwen3-vl-plus`。图片生成当前支持 OpenAI-compatible `/images/generations` 和 DashScope Qwen Image 原生 `/services/aigc/multimodal-generation/generation`，可解析 provider 返回的 base64 图片或 URL 图片并落盘。DashScope `qwen-image-2.0-pro` 必须使用 `kind: "dashscope-qwen-image-generation"`；不要把 `https://dashscope.aliyuncs.com/api/v1` 配成 `openai-images`，否则会请求不存在的 `/images/generations` 路径并得到 404。`gateway.telegram.video`、`gateway.telegram.videoGeneration` 和 `gateway.telegram.imageGeneration` 可覆盖共享 `gateway.media.*` 配置；其它 IM channel 使用对应 channel override。`doctor` 会输出 `videoUnderstanding`、`videoGeneration` 和 `imageGeneration` 的 `enabled`、`configured`、`provider`、`model` 状态，生成类能力还会输出 `outputRoot`。doctor 不展开 provider secret 字段。
 
 ### 出站图片
 
@@ -1189,6 +1289,8 @@ cjpm run --skip-build --name metis --run-args "gateway discover"
 `gateway discover` 会暴露 Telegram 能力状态，例如：
 
 - `mediaUnderstandingState`
+- `videoUnderstandingState`
+- `videoGenerationState`
 - `approvalResolverState`
 - `lastDraftState`
 - `directoryAggregationState`
@@ -1207,7 +1309,7 @@ Telegram audit 还应覆盖 live membership/security 项：
 
 真实 Telegram doctor 需要用户显式配置 bot token 和目标 chat。CI 和回归测试必须使用 mock `getMe` / `getChatMember`，不得访问真实 Telegram 网络。
 
-ASR、vision、video、document extractor 都走 Gateway media understanding runtime。没有配置 provider/extractor 时，工具和 prompt 会返回 `not_configured` 或 `metadata_only`，不会绕过 Gateway 直接调用模型，也不会猜测媒体内容。
+ASR、vision、video、document extractor 都走 Gateway media understanding runtime。没有配置 provider/extractor 时，工具和 prompt 会返回 `not_configured` 或 `metadata_only`，不会绕过 Gateway 直接调用模型，也不会猜测媒体内容。视频生成走独立 Gateway video generation runtime，生成结果只通过受控媒体发送路径交付。
 
 常见问题：
 

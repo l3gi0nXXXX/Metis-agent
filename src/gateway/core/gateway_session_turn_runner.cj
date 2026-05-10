@@ -1,7 +1,7 @@
 package metis.gateway.core
 
-import metis.core.{GatewayToolRuntimeContext, gatewayMediaUnderstandingFirstText, gatewayMediaUnderstandingForRecord}
-import metis.core.config.GatewayUserSettings
+import metis.core.{GatewayToolRuntimeContext, gatewayMediaUnderstandingFirstText, gatewayMediaUnderstandingForRecordWithSettings}
+import metis.core.config.{CliSettingManager, GatewayUserSettings}
 import metis.gateway.session.{GatewaySessionContext, GatewaySessionRequest, gatewayResolveSessionContext}
 import std.collection.ArrayList
 import std.fs.{Path, exists}
@@ -94,6 +94,10 @@ private func gatewayMediaContextStructuredSummary(mediaContext: JsonObject): Str
 }
 
 public func gatewayBuildMediaContextPrompt(mediaContext: JsonObject): String {
+    gatewayBuildMediaContextPromptForUser(mediaContext, CliSettingManager.readGatewaySettings())
+}
+
+public func gatewayBuildMediaContextPromptForUser(mediaContext: JsonObject, user: GatewayUserSettings): String {
     let records = gatewayMediaRecords(mediaContext)
     let structuredSummary = gatewayMediaContextStructuredSummary(mediaContext)
     if (records.size() == 0 && structuredSummary.isEmpty()) {
@@ -106,6 +110,7 @@ public func gatewayBuildMediaContextPrompt(mediaContext: JsonObject): String {
     lines.add("The current inbound message has structured media resources from the gateway. Use these local paths when the user asks to save, inspect, transcribe, or reason about the attached media. Do not parse media out of the visible chat text.")
     lines.add("For image/photo/sticker understanding requests, call telegram_image_analyze before answering. Do not claim that the image cannot be seen when downloaded=true and a MediaPath is present; if no vision model is configured, say that explicitly and keep the saved path available.")
     lines.add("For voice/audio requests, use AudioTranscript when present; otherwise call telegram_audio_transcribe before answering. If ASRStatus=not_configured, say that transcription is unavailable instead of guessing.")
+    lines.add("For video/video-note understanding requests, use VideoDescription when present; otherwise call telegram_video_describe before answering. Do not claim that video understanding is unconfigured unless VideoUnderstandingStatus is not_configured.")
     if (!structuredSummary.isEmpty()) {
         lines.add("StructuredTelegramContext:")
         lines.add(structuredSummary)
@@ -121,7 +126,7 @@ public func gatewayBuildMediaContextPrompt(mediaContext: JsonObject): String {
         let downloaded = gatewayJsonBool(record, "downloaded")
         let skipped = gatewayJsonString(record, "skippedReason")
         let understanding = if (downloaded && !localPath.isEmpty() && exists(Path(localPath))) {
-            gatewayMediaUnderstandingForRecord(record)
+            gatewayMediaUnderstandingForRecordWithSettings(record, user)
         } else {
             JsonObject()
         }
@@ -171,8 +176,11 @@ public func gatewayBuildMediaContextPrompt(mediaContext: JsonObject): String {
             if (!videoDescription.isEmpty()) {
                 row.add("VideoDescription=${videoDescription}")
             } else {
-                row.add("VideoUnderstandingStatus=not_configured")
-                row.add("VideoAction=use telegram_video_describe")
+                let videoStatus = if (understandingStatus.isEmpty()) { "not_configured" } else { understandingStatus }
+                row.add("VideoUnderstandingStatus=${videoStatus}")
+                if (videoStatus == "not_configured") {
+                    row.add("VideoAction=use telegram_video_describe")
+                }
             }
         }
         if (!filePreview.isEmpty()) {

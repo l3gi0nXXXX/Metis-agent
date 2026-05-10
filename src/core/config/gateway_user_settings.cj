@@ -92,6 +92,13 @@ public struct GatewaySpeechUserSettings {
 }
 
 @jsonable
+public struct GatewayMediaUserSettings {
+    public var video: JsonObject = JsonObject()
+    public var videoGeneration: JsonObject = JsonObject()
+    public var imageGeneration: JsonObject = JsonObject()
+}
+
+@jsonable
 public struct GatewayChannelSpeechUserSettings {
     public var tts: JsonObject = JsonObject()
     public var asr: JsonObject = JsonObject()
@@ -419,6 +426,9 @@ public struct TelegramUserSettings {
     public var autoTopicLabel: TelegramAutoTopicLabelUserSettings = TelegramAutoTopicLabelUserSettings()
     public var threadBindings: TelegramThreadBindingsUserSettings = TelegramThreadBindingsUserSettings()
     public var media: TelegramMediaUserSettings = TelegramMediaUserSettings()
+    public var video: JsonObject = JsonObject()
+    public var videoGeneration: JsonObject = JsonObject()
+    public var imageGeneration: JsonObject = JsonObject()
     public var network: TelegramNetworkUserSettings = TelegramNetworkUserSettings()
     public var speech: GatewayChannelSpeechUserSettings = GatewayChannelSpeechUserSettings()
 }
@@ -448,6 +458,9 @@ public struct FeishuUserSettings {
     public var requireSignatureHeaders: Bool = true
     public var requestMaxSkewSeconds: Int64 = 300
     public var speech: GatewayChannelSpeechUserSettings = GatewayChannelSpeechUserSettings()
+    public var video: JsonObject = JsonObject()
+    public var videoGeneration: JsonObject = JsonObject()
+    public var imageGeneration: JsonObject = JsonObject()
 }
 
 /**
@@ -482,6 +495,9 @@ public struct QQUserSettings {
     public var officialSendPrivateUrlTemplate: String = ""
     public var officialSendGroupUrlTemplate: String = ""
     public var speech: GatewayChannelSpeechUserSettings = GatewayChannelSpeechUserSettings()
+    public var video: JsonObject = JsonObject()
+    public var videoGeneration: JsonObject = JsonObject()
+    public var imageGeneration: JsonObject = JsonObject()
 }
 
 /**
@@ -550,6 +566,7 @@ public struct GatewayUserSettings {
     public var canvas: GatewayCanvasHostUserSettings = GatewayCanvasHostUserSettings()
     public var talk: GatewayTalkUserSettings = GatewayTalkUserSettings()
     public var speech: GatewaySpeechUserSettings = GatewaySpeechUserSettings()
+    public var media: GatewayMediaUserSettings = GatewayMediaUserSettings()
     public var feishu: FeishuUserSettings = FeishuUserSettings()
     public var qq: QQUserSettings = QQUserSettings()
     public var telegram: TelegramUserSettings = TelegramUserSettings()

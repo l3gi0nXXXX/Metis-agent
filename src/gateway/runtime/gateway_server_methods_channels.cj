@@ -2,6 +2,7 @@ package metis.gateway.runtime
 
 import magic.jsonable.*
 
+import metis.core.gatewayVideoGenerationResolveConfig
 import metis.core.config.{CliConfig, CliSettingManager, GatewayPluginUserSettings, GatewayUserSettings}
 import metis.gateway.channels.telegram.{TelegramAdapter, telegramPairingAccountStore}
 import metis.gateway.model.{ChannelType, OutboundMessage}
@@ -104,6 +105,71 @@ private func gatewayRpcBoolParam(request: GatewayRpcRequest, keys: Array<String>
         }
     }
     defaultValue
+}
+
+private func gatewayRpcJsonString(obj: JsonObject, key: String): String {
+    match (obj.get(key)) {
+        case Some(v) => try { v.asString().getValue().trimAscii() } catch (_e: Exception) { "" }
+        case None => ""
+    }
+}
+
+private func gatewayRpcJsonBool(obj: JsonObject, key: String, defaultValue: Bool): Bool {
+    match (obj.get(key)) {
+        case Some(v) => try { v.asBool().getValue() } catch (_e: Exception) { defaultValue }
+        case None => defaultValue
+    }
+}
+
+private func gatewayRpcJsonObject(obj: JsonObject, key: String): JsonObject {
+    match (obj.get(key)) {
+        case Some(v) => try { v.asObject() } catch (_e: Exception) { JsonObject() }
+        case None => JsonObject()
+    }
+}
+
+private func gatewayRpcVideoConfigState(config: JsonObject): String {
+    if (!gatewayRpcJsonBool(config, "enabled", true)) {
+        return "disabled"
+    }
+    let provider = gatewayRpcJsonString(config, "provider")
+    if (provider.isEmpty()) {
+        return "not_configured"
+    }
+    let providers = gatewayRpcJsonObject(config, "providers")
+    match (providers.get(provider)) {
+        case Some(v) =>
+            let providerConfig = try { v.asObject() } catch (_e: Exception) { JsonObject() }
+            if (providerConfig.size() > 0) { "configured" } else { "not_configured" }
+        case None => "not_configured"
+    }
+}
+
+private func gatewayRpcTelegramVideoUnderstandingState(user: GatewayUserSettings): String {
+    let telegram = user.telegram.video
+    let shared = user.media.video
+    let enabled = if (telegram.get("enabled").isSome()) {
+        gatewayRpcJsonBool(telegram, "enabled", true)
+    } else {
+        gatewayRpcJsonBool(shared, "enabled", true)
+    }
+    if (!enabled) {
+        return "disabled"
+    }
+    let provider = if (!gatewayRpcJsonString(telegram, "provider").isEmpty()) {
+        gatewayRpcJsonString(telegram, "provider")
+    } else {
+        gatewayRpcJsonString(shared, "provider")
+    }
+    if (provider.isEmpty()) {
+        return "not_configured"
+    }
+    let telegramProvider = gatewayRpcJsonObject(gatewayRpcJsonObject(telegram, "providers"), provider)
+    let sharedProvider = gatewayRpcJsonObject(gatewayRpcJsonObject(shared, "providers"), provider)
+    if (telegramProvider.size() > 0 || sharedProvider.size() > 0) {
+        return "configured"
+    }
+    "not_configured"
 }
 
 private func gatewayRpcIntParam(request: GatewayRpcRequest, keys: Array<String>, defaultValue: Int64): Int64 {
@@ -939,6 +1005,8 @@ private func gatewayTelegramRuntimeJson(user: GatewayUserSettings, liveProbe!: B
     out.put("accountInspect", gatewayTelegramAccountInspectJson(user))
     let capabilityState = JsonObject()
     capabilityState.put("mediaUnderstandingState", JsonString(if (user.telegram.media.downloadEnabled) { "context-ready" } else { "metadata-only" }))
+    capabilityState.put("videoUnderstandingState", JsonString(gatewayRpcTelegramVideoUnderstandingState(user)))
+    capabilityState.put("videoGenerationState", JsonString(gatewayRpcVideoConfigState(gatewayVideoGenerationResolveConfig(user, channel: "telegram"))))
     capabilityState.put("approvalResolverState", JsonString(if (user.telegram.actions.callbackQuery && user.telegram.actions.inlineKeyboard) { "button-resolver-ready" } else { "callback-or-button-disabled" }))
     capabilityState.put("lastDraftState", JsonString(if (user.telegram.actions.editMessage && user.telegram.streaming.trimAscii().toAsciiLower() != "off") { "streaming-draft-ready" } else { "send-only" }))
     capabilityState.put("directoryAggregationState", JsonString("config-session-history-ready"))

@@ -23,6 +23,16 @@ private func mediaAsrTestRecord(path: String, channel!: String = "telegram"): Js
     return record
 }
 
+private func mediaVideoTestRecord(path: String, channel!: String = "telegram"): JsonObject {
+    let record = JsonObject()
+    record.put("mediaKind", JsonString("video"))
+    record.put("mimeType", JsonString("video/mp4"))
+    record.put("localPath", JsonString(path))
+    record.put("downloaded", JsonBool(true))
+    record.put("channel", JsonString(channel))
+    record
+}
+
 private func mediaAsrTestProvider(text: String): JsonObject {
     let provider = JsonObject()
     provider.put("kind", JsonString("command"))
@@ -122,5 +132,59 @@ public class GatewayMediaUnderstandingRuntimeTest {
         @Expect(mediaAsrString(result, "status"), "ok")
         @Expect(mediaAsrString(result, "ASRStatus"), "transcribed")
         @Expect(mediaAsrString(result, "transcript"), "configured transcript")
+    }
+
+    @TestCase
+    public func configuredGeminiVideoProviderProducesVideoDescriptionOutput(): Unit {
+        let root = mediaAsrTestTempRoot("video-gemini")
+        let clip = root.join("clip.mp4")
+        File.writeTo(clip, "fake-video".toArray())
+        var user = GatewayUserSettings()
+        let provider = JsonObject()
+        provider.put("kind", JsonString("gemini-inline-video"))
+        provider.put("apiKey", JsonString("test-video-key"))
+        provider.put("baseUrl", JsonString("https://gemini.example/v1beta"))
+        provider.put("model", JsonString("gemini-3-flash-preview"))
+        let providers = JsonObject()
+        providers.put("gemini", provider)
+        user.media.video.put("enabled", JsonBool(true))
+        user.media.video.put("provider", JsonString("gemini"))
+        user.media.video.put("providers", providers)
+        setGatewayMediaVideoHttpRunnerForTest(Some({ _request: JsonObject =>
+            GatewayMediaVideoHttpResult(200, bodyBytes: "{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"a short clip\"}]}}]}".toArray())
+        }))
+        try {
+            let result = gatewayMediaUnderstandingForRecordWithSettings(mediaVideoTestRecord(clip.toString()), user, capability: "video")
+            @Expect(mediaAsrString(result, "status"), "ok")
+            @Expect(mediaAsrString(result, "videoDescription"), "a short clip")
+            @Expect(mediaAsrString(result, "provider"), "gemini")
+            let outputs = result.get("outputs").getOrThrow().asArray()
+            @Expect(outputs[0].asObject().get("kind").getOrThrow().asString().getValue(), "video.description")
+            @Expect(outputs[0].asObject().get("source").getOrThrow().asString().getValue(), "gateway_video_runtime")
+        } finally {
+            setGatewayMediaVideoHttpRunnerForTest(None<(JsonObject) -> GatewayMediaVideoHttpResult>)
+        }
+    }
+
+    @TestCase
+    public func configuredVideoProviderTooLargeStatusIsPropagated(): Unit {
+        let root = mediaAsrTestTempRoot("video-large")
+        let clip = root.join("clip.mp4")
+        File.writeTo(clip, Array<Byte>(16, repeat: 65))
+        var user = GatewayUserSettings()
+        user.media.video.put("enabled", JsonBool(true))
+        user.media.video.put("provider", JsonString("gemini"))
+        let provider = JsonObject()
+        provider.put("kind", JsonString("gemini-inline-video"))
+        provider.put("apiKey", JsonString("test-video-key"))
+        let providers = JsonObject()
+        providers.put("gemini", provider)
+        user.media.video.put("providers", providers)
+        user.media.video.put("maxBytes", JsonString("4"))
+
+        let result = gatewayMediaUnderstandingForRecordWithSettings(mediaVideoTestRecord(clip.toString()), user, capability: "video")
+        @Expect(mediaAsrString(result, "status"), "too_large")
+        @Expect(mediaAsrString(result, "videoUnderstandingStatus"), "too_large")
+        @Expect(result.get("fileBytes").isSome(), true)
     }
 }

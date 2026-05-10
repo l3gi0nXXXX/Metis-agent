@@ -347,6 +347,8 @@ public class GatewayServerMethodsChannelsTest {
         @Expect(channelsTestString(capabilityState, "approvalResolverState"), "button-resolver-ready")
         @Expect(channelsTestString(capabilityState, "directoryAggregationState"), "config-session-history-ready")
         @Expect(channelsTestString(capabilityState, "modelButtonState"), "available")
+        @Expect(channelsTestString(capabilityState, "videoUnderstandingState"), "not_configured")
+        @Expect(channelsTestString(capabilityState, "videoGenerationState"), "not_configured")
         let summary = health.get("summary").getOrThrow().asObject()
         @Expect(channelsTestBool(summary, "offsetPersistenceEnabled"), true)
         @Expect(summary.get("lastInboundUpdateId").isSome(), true)
@@ -527,6 +529,87 @@ public class GatewayServerMethodsChannelsTest {
     }
 
     @TestCase
+    public func telegramDiagnosticsExposeVideoUnderstandingAndGenerationConfig(): Unit {
+        var user = GatewayUserSettings()
+        user.telegram.enabled = true
+        user.telegram.botToken = "telegram-token"
+
+        let videoProvider = JsonObject()
+        videoProvider.put("kind", JsonString("qwen-vl-video"))
+        videoProvider.put("model", JsonString("qwen-vl-max-latest"))
+        let videoProviders = JsonObject()
+        videoProviders.put("qwen-video-understanding", videoProvider)
+        let video = JsonObject()
+        video.put("enabled", true.toJsonValue())
+        video.put("provider", JsonString("qwen-video-understanding"))
+        video.put("providers", videoProviders)
+        user.telegram.video = video
+
+        let generationProvider = JsonObject()
+        generationProvider.put("kind", JsonString("dashscope-qwen-video-generation"))
+        generationProvider.put("model", JsonString("wanx2.1-t2v-turbo"))
+        let generationProviders = JsonObject()
+        generationProviders.put("qwen-video-generation", generationProvider)
+        let generation = JsonObject()
+        generation.put("enabled", true.toJsonValue())
+        generation.put("provider", JsonString("qwen-video-generation"))
+        generation.put("outputRoot", JsonString("/tmp/metis-video-generation-test"))
+        generation.put("providers", generationProviders)
+        user.media.videoGeneration = generation
+
+        let diagnostics = gatewayTelegramDiagnosticsJson(user)
+        let checkedInputs = diagnostics.get("checkedInputs").getOrThrow().asArray().toJsonString()
+        @Expect(checkedInputs.contains("videoGeneration"), true)
+        let videoUnderstanding = diagnostics.get("videoUnderstanding").getOrThrow().asObject()
+        @Expect(channelsTestBool(videoUnderstanding, "configured"), true)
+        @Expect(channelsTestString(videoUnderstanding, "provider"), "qwen-video-understanding")
+        @Expect(channelsTestString(videoUnderstanding, "model"), "qwen-vl-max-latest")
+        let videoGeneration = diagnostics.get("videoGeneration").getOrThrow().asObject()
+        @Expect(channelsTestBool(videoGeneration, "configured"), true)
+        @Expect(channelsTestString(videoGeneration, "provider"), "qwen-video-generation")
+        @Expect(channelsTestString(videoGeneration, "model"), "wanx2.1-t2v-turbo")
+        @Expect(channelsTestString(videoGeneration, "outputRoot"), "/tmp/metis-video-generation-test")
+        let findings = diagnostics.get("findings").getOrThrow().asArray().toJsonString()
+        @Expect(findings.contains("telegram-video-understanding-config"), true)
+        @Expect(findings.contains("telegram-video-generation-config"), true)
+        @Expect(findings.contains("telegram-token"), false)
+    }
+
+    @TestCase
+    public func telegramDiagnosticsExposeImageGenerationConfigAndPhotoAction(): Unit {
+        var user = GatewayUserSettings()
+        user.telegram.enabled = true
+        user.telegram.botToken = "telegram-token"
+        user.telegram.actions.photo = true
+
+        let provider = JsonObject()
+        provider.put("kind", JsonString("openai-images"))
+        provider.put("model", JsonString("gpt-image-1"))
+        provider.put("apiKey", JsonString("secret-image-key"))
+        let providers = JsonObject()
+        providers.put("openai-image", provider)
+        let generation = JsonObject()
+        generation.put("enabled", true.toJsonValue())
+        generation.put("provider", JsonString("openai-image"))
+        generation.put("outputRoot", JsonString("/tmp/metis-image-generation-test"))
+        generation.put("providers", providers)
+        user.media.imageGeneration = generation
+
+        let diagnostics = gatewayTelegramDiagnosticsJson(user)
+        let checkedInputs = diagnostics.get("checkedInputs").getOrThrow().asArray().toJsonString()
+        @Expect(checkedInputs.contains("imageGeneration"), true)
+        let imageGeneration = diagnostics.get("imageGeneration").getOrThrow().asObject()
+        @Expect(channelsTestBool(imageGeneration, "configured"), true)
+        @Expect(channelsTestBool(imageGeneration, "photoActionEnabled"), true)
+        @Expect(channelsTestString(imageGeneration, "provider"), "openai-image")
+        @Expect(channelsTestString(imageGeneration, "model"), "gpt-image-1")
+        @Expect(channelsTestString(imageGeneration, "outputRoot"), "/tmp/metis-image-generation-test")
+        let findings = diagnostics.get("findings").getOrThrow().asArray().toJsonString()
+        @Expect(findings.contains("telegram-image-generation-config"), true)
+        @Expect(findings.contains("secret-image-key"), false)
+    }
+
+    @TestCase
     public func telegramT11DiagnosticsDetectGroupWithoutSenderAllowlist(): Unit {
         var user = GatewayUserSettings()
         user.telegram.enabled = true
@@ -538,6 +621,27 @@ public class GatewayServerMethodsChannelsTest {
         let diagnostics = gatewayTelegramDiagnosticsJson(user)
         let findings = diagnostics.get("findings").getOrThrow().asArray().toJsonString()
         @Expect(findings.contains("telegram-group-no-sender-allowlist"), true)
+    }
+
+    @TestCase
+    public func telegramDiagnosticsReportsConfiguredVideoUnderstandingWithoutSecrets(): Unit {
+        var user = GatewayUserSettings()
+        user.telegram.enabled = true
+        user.telegram.botToken = "telegram-token"
+        user.telegram.video.put("provider", JsonString("gemini"))
+        let provider = JsonObject()
+        provider.put("kind", JsonString("gemini-inline-video"))
+        provider.put("apiKey", JsonString("secret-video-key"))
+        let providers = JsonObject()
+        providers.put("gemini", provider)
+        user.telegram.video.put("providers", providers)
+
+        let diagnostics = gatewayTelegramDiagnosticsJson(user)
+        let findings = diagnostics.get("findings").getOrThrow().asArray().toJsonString()
+        @Expect(findings.contains("telegram-video-understanding-config"), true)
+        @Expect(findings.contains("videoUnderstanding=configured"), true)
+        @Expect(findings.contains("gemini-inline-video"), true)
+        @Expect(findings.contains("secret-video-key"), false)
     }
 
     @TestCase

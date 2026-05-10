@@ -373,9 +373,20 @@ public func gatewaySubagentUpdateRunStatus(
             }
     }
     let now = subagentNowMs()
+    let previousStatus = gatewaySubagentRunRecordString(resolved, "status")
     let normalized = normalizeSubagentStatus(status)
+    let terminalStatusChanged = gatewaySubagentRunStatusIsTerminal(previousStatus) && gatewaySubagentRunStatusIsTerminal(normalized) && previousStatus != normalized
     resolved.put("status", JsonString(normalized))
     resolved.put("lastUpdatedAtMs", now.toJsonValue())
+    if (terminalStatusChanged) {
+        resolved.put("noticeStatus", JsonString("none"))
+        resolved.put("lastNoticeError", JsonString(""))
+        resolved.put("channelNoticeStatus", JsonString("none"))
+        resolved.put("lastChannelNoticeError", JsonString(""))
+        resolved.put("channelNoticeMessageId", JsonString(""))
+        resolved.put("realtimeNoticeStatus", JsonString("none"))
+        resolved.put("lastRealtimeNoticeError", JsonString(""))
+    }
     if (normalized == "running" && subagentJsonInt(resolved, "startedAtMs") == 0) {
         resolved.put("startedAtMs", now.toJsonValue())
     }
@@ -385,7 +396,9 @@ public func gatewaySubagentUpdateRunStatus(
     if (!resultSummary.trimAscii().isEmpty()) {
         resolved.put("resultSummary", JsonString(resultSummary.trimAscii()))
     }
-    if (!error.trimAscii().isEmpty()) {
+    if (normalized == "succeeded") {
+        resolved.put("error", JsonString(""))
+    } else if (!error.trimAscii().isEmpty()) {
         resolved.put("error", JsonString(error.trimAscii()))
     }
     if (!outputPath.trimAscii().isEmpty()) {

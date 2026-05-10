@@ -1434,6 +1434,37 @@ public class TelegramAdapterTest {
     }
 
     @TestCase
+    public func mediaDownloadMarksVideoNoteEligibleForVideoUnderstanding(): Unit {
+        let root = Path("/tmp/metis-telegram-media-video-note-eligible-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
+        try {
+            let adapter = TelegramAdapter(
+                config: TelegramConfig(
+                    enabled: true,
+                    botToken: "telegram-token",
+                    dmPolicy: "open",
+                    allowFrom: ["*"]
+                ),
+                pairingRoot: root.toString()
+            )
+            let media = adapter.debugPersistInboundMediaForTest(
+                "video-note",
+                "video-note-file-id",
+                mimeType: "video/mp4",
+                fileSize: 64,
+                peerId: "user:1001",
+                messageId: "104",
+                getFileRaw: "{\"ok\":true,\"result\":{\"file_path\":\"video_notes/file_4.mp4\",\"file_size\":64}}",
+                downloadRaw: "video-bytes"
+            )
+            let record = media.get("lastMedia").getOrThrow().asObject()
+            @Expect(record.get("mediaKind").getOrThrow().asString().getValue(), "video-note")
+            @Expect(record.get("eligibleFor").getOrThrow().asString().getValue(), "video-understanding")
+        } finally {
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
     public func mediaDownloadPersistsNonUtf8BinaryBytesForPhotoDocumentVoiceAndVideo(): Unit {
         let root = Path("/tmp/metis-telegram-media-binary-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
         let downloadCalls = ArrayList<String>()

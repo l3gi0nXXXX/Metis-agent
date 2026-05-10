@@ -1147,13 +1147,56 @@ public class GatewayTelegramMediaToolset {
         out.put("capability", JsonString("video"))
         if (description.isEmpty()) {
             out.put("ok", JsonBool(false))
-            out.put("status", JsonString("unsupported"))
-            out.put("videoUnderstandingStatus", JsonString("not_configured"))
-            out.put("error", JsonString(telegramMediaToolString(understanding, "error")))
+            let status = telegramMediaToolString(understanding, "status")
+            let normalizedStatus = if (status.isEmpty()) { "not_configured" } else { status }
+            out.put("status", JsonString(normalizedStatus))
+            out.put("videoUnderstandingStatus", JsonString(normalizedStatus))
+            match (understanding.get("provider")) {
+                case Some(v) => out.put("provider", v)
+                case None => ()
+            }
+            match (understanding.get("providerKind")) {
+                case Some(v) => out.put("providerKind", v)
+                case None => ()
+            }
+            match (understanding.get("model")) {
+                case Some(v) => out.put("model", v)
+                case None => ()
+            }
+            match (understanding.get("fileBytes")) {
+                case Some(v) => out.put("fileBytes", v)
+                case None => ()
+            }
+            match (understanding.get("limitBytes")) {
+                case Some(v) => out.put("limitBytes", v)
+                case None => ()
+            }
+            match (understanding.get("timeoutMs")) {
+                case Some(v) => out.put("timeoutMs", v)
+                case None => ()
+            }
+            let error = telegramMediaToolString(understanding, "error")
+            let readable = match (normalizedStatus) {
+                case "not_configured" => "Video understanding is not configured. Configure gateway.media.video or gateway.telegram.video with a provider before asking Metis to describe videos."
+                case "disabled" => "Video understanding is disabled in Gateway configuration."
+                case "too_large" => "The selected video is too large for the configured video understanding limit."
+                case "timeout" => "The configured video understanding provider timed out before returning a description."
+                case "provider_error" => if (error.isEmpty()) { "The configured video understanding provider failed." } else { error }
+                case _ => if (error.isEmpty()) { "Video understanding did not return a description." } else { error }
+            }
+            out.put("error", JsonString(readable))
         } else {
             out.put("ok", JsonBool(true))
             out.put("status", JsonString("ok"))
             out.put("description", JsonString(description))
+            match (understanding.get("provider")) {
+                case Some(v) => out.put("provider", v)
+                case None => ()
+            }
+            match (understanding.get("model")) {
+                case Some(v) => out.put("model", v)
+                case None => ()
+            }
         }
         out.toJsonString()
     }

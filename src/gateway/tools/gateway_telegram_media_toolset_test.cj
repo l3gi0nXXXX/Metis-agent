@@ -1,6 +1,6 @@
 package metis.gateway.tools
 
-import metis.core.{GatewayToolRuntimeContext, gatewayWithToolRuntimeContext}
+import metis.core.{GatewayMediaVideoHttpResult, GatewayToolRuntimeContext, gatewayWithToolRuntimeContext, setGatewayMediaVideoHttpRunnerForTest}
 import metis.core.config.{CliConfig, CliSettingManager, GatewayUserSettings, MetisConfigManager}
 import magic.core.message.Message
 import magic.core.model.{AsyncChatResponse, ChatModel, ChatRequest, ChatResponse}
@@ -598,6 +598,53 @@ public class GatewayTelegramMediaToolsetTest {
             @Expect(json.get("description").getOrThrow().asString().getValue(), "short product demo clip")
         } finally {
             try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func telegramVideoDescribeReportsProviderErrorAsReadableStatus(): Unit {
+        this.withTelegramMediaToolsetConfigHome {
+            let root = Path("/tmp/metis-telegram-video-provider-error-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
+            Directory.create(root, recursive: true)
+            let source = root.join("clip.mp4")
+            File.writeTo(source, "fake-video".toArray())
+            var user = GatewayUserSettings()
+            let provider = JsonObject()
+            provider.put("kind", JsonString("gemini-inline-video"))
+            provider.put("apiKey", JsonString("secret-video-key"))
+            provider.put("baseUrl", JsonString("https://gemini.example/v1beta"))
+            provider.put("model", JsonString("gemini-3-flash-preview"))
+            let providers = JsonObject()
+            providers.put("gemini", provider)
+            user.media.video.put("enabled", JsonBool(true))
+            user.media.video.put("provider", JsonString("gemini"))
+            user.media.video.put("providers", providers)
+            CliSettingManager.writeGatewaySettings(user)
+            setGatewayMediaVideoHttpRunnerForTest(Some({ _request: JsonObject =>
+                GatewayMediaVideoHttpResult(500, bodyBytes: "{\"error\":\"secret-video-key provider exploded\"}".toArray())
+            }))
+            try {
+                let toolset = GatewayTelegramMediaToolset()
+                let out = gatewayWithToolRuntimeContext(
+                    GatewayToolRuntimeContext(
+                        "telegram",
+                        channelName: "telegram",
+                        sessionKey: "telegram:chat:1",
+                        mediaContext: this.mediaContext(source.toString(), mediaKind: "video", mimeType: "video/mp4", fileName: "clip.mp4")
+                    ),
+                    { => toolset.debugTelegramVideoDescribeForTest(None<String>, None<Int64>) }
+                )
+                let json = JsonValue.fromStr(out).asObject()
+                @Expect(json.get("ok").getOrThrow().asBool().getValue(), false)
+                @Expect(json.get("status").getOrThrow().asString().getValue(), "provider_error")
+                @Expect(json.get("videoUnderstandingStatus").getOrThrow().asString().getValue(), "provider_error")
+                @Expect(json.get("error").getOrThrow().asString().getValue().contains("video understanding provider failed"), true)
+                @Expect(out.contains("secret-video-key"), false)
+                @Expect(out.startsWith("{"), true)
+            } finally {
+                setGatewayMediaVideoHttpRunnerForTest(None<(JsonObject) -> GatewayMediaVideoHttpResult>)
+                try { remove(root, recursive: true) } catch (_e: Exception) { () }
+            }
         }
     }
 

@@ -1,7 +1,7 @@
 package metis.gateway.core
 
 import metis.core.{GatewayToolRuntimeContext, gatewayCurrentToolRuntimeContext, gatewayMarkCurrentToolRuntimeVisibleReplyDelivered, gatewayNotifyCurrentToolRuntimeStatus}
-import metis.core.{gatewayMediaUnderstandingFirstText, gatewayMediaUnderstandingForRecord, setGatewayMediaAsrRunnerForTest, setGatewayMediaDocumentExtractorForTest, setGatewayMediaVideoRunnerForTest, setGatewayMediaVisionRunnerForTest}
+import metis.core.{gatewayMediaUnderstandingFirstText, gatewayMediaUnderstandingForRecord, gatewayMediaUnderstandingForRecordWithSettings, setGatewayMediaAsrRunnerForTest, setGatewayMediaDocumentExtractorForTest, setGatewayMediaVideoRunnerForTest, setGatewayMediaVisionRunnerForTest}
 import metis.core.config.{CliConfig, GatewayUserSettings, CliSettingManager, MetisConfigManager}
 import metis.gateway.tools.{GatewayTtsToolset, debugSetGatewayTtsToolCallRunnerForTest}
 import metis.gateway.session.{GatewayDeliveryTarget, GatewayIngressSource, GatewaySessionContext, GatewaySessionRequest}
@@ -744,7 +744,7 @@ public class GatewaySessionTurnRunnerTest {
             record.put("localPath", JsonString(video.toString()))
             record.put("downloaded", JsonBool(true))
 
-            let result = gatewayMediaUnderstandingForRecord(record)
+            let result = gatewayMediaUnderstandingForRecordWithSettings(record, GatewayUserSettings())
             @Expect(result.get("status").getOrThrow().asString().getValue(), "not_configured")
             @Expect(result.get("capability").getOrThrow().asString().getValue(), "video")
             @Expect(result.get("videoUnderstandingStatus").getOrThrow().asString().getValue(), "not_configured")
@@ -799,6 +799,43 @@ public class GatewaySessionTurnRunnerTest {
             media.put("records", records)
             let prompt = gatewayBuildMediaContextPrompt(media)
             @Expect(prompt.contains("VideoDescription=demo video description"), true)
+        } finally {
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func mediaContextPromptPropagatesConfiguredVideoStatusInsteadOfNotConfigured(): Unit {
+        let root = Path("/tmp/metis-media-context-video-status-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
+        Directory.create(root, recursive: true)
+        let video = root.join("clip.mp4")
+        File.writeTo(video, Array<Byte>(16, repeat: 65))
+        try {
+            var user = GatewayUserSettings()
+            user.media.video.put("enabled", JsonBool(true))
+            user.media.video.put("provider", JsonString("qwen"))
+            user.media.video.put("maxBytes", JsonString("4"))
+            let provider = JsonObject()
+            provider.put("kind", JsonString("qwen-vl-video"))
+            provider.put("apiKey", JsonString("test-video-key"))
+            let providers = JsonObject()
+            providers.put("qwen", provider)
+            user.media.video.put("providers", providers)
+
+            let media = JsonObject()
+            let records = JsonArray([])
+            let record = JsonObject()
+            record.put("mediaKind", JsonString("video-note"))
+            record.put("mimeType", JsonString("video/mp4"))
+            record.put("localPath", JsonString(video.toString()))
+            record.put("downloaded", JsonBool(true))
+            records.add(record)
+            media.put("records", records)
+
+            let prompt = gatewayBuildMediaContextPromptForUser(media, user)
+            @Expect(prompt.contains("MediaUnderstandingStatus=too_large"), true)
+            @Expect(prompt.contains("VideoUnderstandingStatus=too_large"), true)
+            @Expect(prompt.contains("VideoUnderstandingStatus=not_configured"), false)
         } finally {
             try { remove(root, recursive: true) } catch (_e: Exception) { () }
         }

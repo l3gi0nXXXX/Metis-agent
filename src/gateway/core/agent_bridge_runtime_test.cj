@@ -71,6 +71,18 @@ public class AgentBridgeRuntimeTest {
     }
 
     @TestCase
+    public func gatewayDefaultChatRuntimeNowIncludesVideoGenerationTool(): Unit {
+        let names = gatewayDefaultChatToolNames()
+        @Expect(names.contains("gateway_video_generate"), true)
+    }
+
+    @TestCase
+    public func gatewayDefaultChatRuntimeNowIncludesImageGenerationTool(): Unit {
+        let names = gatewayDefaultChatToolNames()
+        @Expect(names.contains("gateway_image_generate"), true)
+    }
+
+    @TestCase
     public func gatewayDefaultChatRuntimeNowIncludesTelegramMediaTools(): Unit {
         let names = gatewayDefaultChatToolNames()
         @Expect(names.contains("telegram_media_list"), true)
