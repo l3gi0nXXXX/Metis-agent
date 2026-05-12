@@ -11,7 +11,7 @@ import std.fs.{Directory, File, Path, exists, remove}
 import std.core.Duration
 import std.time.DateTime
 import std.unittest.testmacro.*
-import stdx.encoding.json.{JsonBool, JsonObject, JsonString, JsonValue}
+import stdx.encoding.json.{JsonArray, JsonBool, JsonObject, JsonString, JsonValue}
 
 private func withManagedSessionsToolsetTestHome<T>(home: String, block: () -> T): T {
     let actualHome = "${home}-${DateTime.now().toUnixTimeStamp().toNanoseconds()}"
@@ -87,6 +87,32 @@ private func createManagedSubagentsCustomAgentFixture(id: String, background: Bo
     )
     CliConfig.invalidatePathCache()
     agentDir
+}
+
+private func writeManagedSubagentsAgentToolPolicy(agentId: String, deny: Array<String>): Unit {
+    let root = JsonObject()
+    let agents = JsonObject()
+    agents.put("defaults", JsonObject())
+    let entries = JsonArray([])
+    let entry = JsonObject()
+    entry.put("id", JsonString(agentId))
+    let tools = JsonObject()
+    let denied = JsonArray([])
+    for (name in deny) {
+        denied.add(JsonString(name))
+    }
+    tools.put("deny", denied)
+    entry.put("tools", tools)
+    entries.add(entry)
+    agents.put("list", entries)
+    root.put("agents", agents)
+    let configDir = MetisConfigManager.configPath().parent
+    if (!exists(configDir)) {
+        Directory.create(configDir, recursive: true)
+    }
+    File.writeTo(MetisConfigManager.configPath(), root.toJsonString().toArray())
+    MetisConfigManager.invalidate()
+    CliSettingManager.invalidate()
 }
 
 private func managedSubagentsRunGit(repo: Path, args: Array<String>): Bool {
@@ -688,6 +714,48 @@ public class GatewayManagedSessionsToolsetTest {
             } finally {
                 toolset.debugSetGatewayCallRunnerForTest(None<(String, JsonObject) -> JsonObject>)
             }
+        }
+    }
+
+    @TestCase
+    public func sessionsSpawnRejectsChildToolsBeyondParentAgentPolicy(): Unit {
+        withManagedSessionsToolsetTestHome("/tmp/metis-managed-subagents-phase6-parent-boundary") {
+            createManagedSubagentsCustomAgentFixture("phase6-child", false)
+            writeManagedSubagentsAgentToolPolicy("agent-a", ["exec"])
+            var settings = CliSettingManager.readGatewaySettings()
+            settings.subagents.allowCustomAgents = true
+            settings.subagents.requireAgentId = true
+            settings.subagents.allowAgents = ["phase6-child"]
+            settings.subagents.childAllowedTools = ["shellExecute"]
+            let _ = MetisConfigManager.setGatewaySettings(settings)
+            CliSettingManager.invalidate()
+
+            let toolset = GatewayManagedSessionsToolset()
+            let out = gatewayWithToolRuntimeContext(
+                GatewayToolRuntimeContext("cli", channelName: "cli", sessionKey: "agent:agent-a:main", agentId: "agent-a"),
+                { => managedSubagentsJson(toolset.sessionsSpawnForCommand(
+                    "attempt denied child shell",
+                    Some("phase6-parent-boundary"),
+                    Some("subagent"),
+                    Some("phase6-child"),
+                    None<String>,
+                    None<String>,
+                    None<String>,
+                    None<String>,
+                    None<Int64>,
+                    None<Int64>,
+                    Some("fresh"),
+                    None<String>,
+                    None<Bool>,
+                    None<String>,
+                    None<String>,
+                    None<String>,
+                    None<String>
+                )) }
+            )
+
+            @Expect(managedSubagentsString(out, "status"), "rejected")
+            @Expect(managedSubagentsString(out, "reason").contains("parent tool policy denied"), true)
         }
     }
 

@@ -1484,6 +1484,7 @@ private func gatewayAgentGetJson(agentId: String): JsonObject {
             row.put("capabilities", gatewayBuiltinAgentCapabilities(id))
             row.put("configured", true.toJsonValue())
             row.put("skills", gatewayAgentSkillsJson(id))
+            row.put("tools", gatewayAgentToolsJson(id, gatewayDefaultChatToolNames()))
             row.put("memory", gatewayAgentMemoryJson(id))
             return row
         }
@@ -1508,6 +1509,7 @@ private func gatewayAgentGetJson(agentId: String): JsonObject {
             row.put("path", obj.get("path") ?? JsonString(""))
             row.put("configured", true.toJsonValue())
             row.put("skills", gatewayAgentSkillsJson(id))
+            row.put("tools", gatewayAgentToolsJson(id, gatewayDefaultChatToolNames()))
             row.put("memory", gatewayAgentMemoryJson(id))
             return row
         }
@@ -1515,6 +1517,7 @@ private func gatewayAgentGetJson(agentId: String): JsonObject {
     let row = JsonObject()
     row.put("id", JsonString(normalized))
     row.put("configured", false.toJsonValue())
+    row.put("tools", gatewayAgentToolsJson(normalized, gatewayDefaultChatToolNames()))
     row
 }
 

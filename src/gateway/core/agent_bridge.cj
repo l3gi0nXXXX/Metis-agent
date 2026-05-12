@@ -8,7 +8,7 @@ import magic.jsonable.TypeSchema
 import magic.prelude.*
 import magic.log.LogUtils
 
-import metis.core.{gatewayMainRuntimeRequiredToolNames, gatewayNotifyCurrentToolRuntimeStatus, resolveRuntimeToolPolicyFromRoot, runtimeToolInvocationAllowedFromRoot, runtimeToolNamesContain, runtimeToolNamesContainAll}
+import metis.core.{RuntimeToolInvocationPolicyContext, gatewayMainRuntimeRequiredToolNames, gatewayNotifyCurrentToolRuntimeStatus, resolveRuntimeToolPolicyFromRoot, runtimePopToolInvocationPolicyContext, runtimePushToolInvocationPolicyContext, runtimeToolInvocationAllowedFromRoot, runtimeToolNamesContain, runtimeToolNamesContainAll}
 import metis.core.model.CliModelManager
 import metis.core.model.ModelTokenLimits
 import metis.core.config.{CliConfig, CliSettingManager, GatewayUserSettings, MetisConfigManager}
@@ -680,6 +680,8 @@ public class AgentBridge {
                     }
                     try {
                     let agent = GatewayP1ChatAgent()
+                    let invocationPolicyRoot = gatewayRuntimePolicyRoot(gatewayUser)
+                    let invocationPolicyInventory = MetisSystemPromptBuilder.collectToolNames(agent.toolManager.tools)
                     let restrictedTools = gatewayApplyToolPolicy(agent, gatewayUser, agentId: agentId, provider: currModel.fullName)
                     agent.model = currModel
                     let promptBuild = buildGatewaySystemPrompt(
@@ -712,37 +714,47 @@ public class AgentBridge {
                     )
                     var firstTokenMs: Int64 = -1
                     gatewayBeginUsageCapture(agent.name)
-                    if (streamingEnabled) {
-                        let response = agent.asyncChat(modelInput)
-                        var lastChunkContent = ""
-                        try {
-                            for (_chunk in response) {
-                                let currentContent = response.content
-                                if (currentContent == lastChunkContent) {
-                                    continue
+                    runtimePushToolInvocationPolicyContext(RuntimeToolInvocationPolicyContext(
+                        invocationPolicyRoot,
+                        invocationPolicyInventory,
+                        agentId: agentId,
+                        provider: currModel.fullName
+                    ))
+                    try {
+                            if (streamingEnabled) {
+                                let response = agent.asyncChat(modelInput)
+                                var lastChunkContent = ""
+                                try {
+                                    for (_chunk in response) {
+                                        let currentContent = response.content
+                                        if (currentContent == lastChunkContent) {
+                                            continue
+                                        }
+                                        if (firstTokenMs < 0) {
+                                            firstTokenMs = DateTime.now().toUnixTimeStamp().toMilliseconds() - modelCallStartedAtMs
+                                        }
+                                        lastChunkContent = currentContent
+                                        match (streamChunkHook) {
+                                            case Some(notify) => notify(currentContent)
+                                            case None => ()
+                                        }
+                                    }
+                                } catch (_streamEx: Exception) {
+                                    ()
                                 }
-                                if (firstTokenMs < 0) {
-                                    firstTokenMs = DateTime.now().toUnixTimeStamp().toMilliseconds() - modelCallStartedAtMs
+                                answer = response.content
+                                match (response.status) {
+                                    case AgentResponseStatus.Success => ()
+                                    case AgentResponseStatus.Cancelled =>
+                                        throw Exception(if (answer.trimAscii().isEmpty()) { "gateway async response cancelled" } else { answer })
+                                    case AgentResponseStatus.Failed =>
+                                        throw Exception(if (answer.trimAscii().isEmpty()) { "gateway async response failed" } else { answer })
                                 }
-                                lastChunkContent = currentContent
-                                match (streamChunkHook) {
-                                    case Some(notify) => notify(currentContent)
-                                    case None => ()
-                                }
+                            } else {
+                                answer = agent.chat(modelInput)
                             }
-                        } catch (_streamEx: Exception) {
-                            ()
-                        }
-                        answer = response.content
-                        match (response.status) {
-                            case AgentResponseStatus.Success => ()
-                            case AgentResponseStatus.Cancelled =>
-                                throw Exception(if (answer.trimAscii().isEmpty()) { "gateway async response cancelled" } else { answer })
-                            case AgentResponseStatus.Failed =>
-                                throw Exception(if (answer.trimAscii().isEmpty()) { "gateway async response failed" } else { answer })
-                        }
-                    } else {
-                        answer = agent.chat(modelInput)
+                    } finally {
+                        runtimePopToolInvocationPolicyContext()
                     }
                     let usagePair = gatewayFinishUsageCapture()
                     successfulPromptTokens = usagePair[0]

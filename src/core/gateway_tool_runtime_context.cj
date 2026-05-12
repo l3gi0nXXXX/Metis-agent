@@ -10,6 +10,7 @@ public class GatewayToolRuntimeContext {
     public let sessionKey: String
     public let senderId: String
     public let declaredUser: String
+    public let agentId: String
     public let operatorScopes: Array<String>
     public let prompt: String
     public let mediaContext: JsonObject
@@ -22,6 +23,7 @@ public class GatewayToolRuntimeContext {
         sessionKey!: String = "",
         senderId!: String = "",
         declaredUser!: String = "",
+        agentId!: String = "",
         operatorScopes!: Array<String> = [],
         prompt!: String = "",
         mediaContext!: JsonObject = JsonObject(),
@@ -32,6 +34,7 @@ public class GatewayToolRuntimeContext {
         this.sessionKey = sessionKey.trimAscii()
         this.senderId = senderId.trimAscii()
         this.declaredUser = declaredUser.trimAscii()
+        this.agentId = agentId.trimAscii()
         let normalizedScopes = ArrayList<String>()
         for (scope in operatorScopes) {
             let normalized = scope.trimAscii().toAsciiLower()

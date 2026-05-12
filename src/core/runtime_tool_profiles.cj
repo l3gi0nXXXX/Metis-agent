@@ -1,6 +1,7 @@
 package metis.core
 
 import std.collection.{ArrayList, HashMap}
+import std.sync.Mutex
 import stdx.encoding.json.{JsonArray, JsonObject, JsonString}
 
 public class RuntimeToolPolicyReport {
@@ -28,6 +29,20 @@ public class RuntimeSubagentBoundaryDecision {
     public var reason: String = "allowed"
     public var blockedTool: String = ""
     public init() {}
+}
+
+public class RuntimeToolInvocationPolicyContext {
+    public let root: JsonObject
+    public let inventory: Array<String>
+    public let agentId: String
+    public let provider: String
+
+    public init(root: JsonObject, inventory: Array<String>, agentId!: String = "", provider!: String = "") {
+        this.root = root
+        this.inventory = inventory
+        this.agentId = agentId.trimAscii()
+        this.provider = provider.trimAscii()
+    }
 }
 
 private class RuntimeToolPolicyScope {
@@ -99,6 +114,17 @@ private func runtimeToolNormalizeName(raw: String): String {
     raw.trimAscii().toAsciiLower()
 }
 
+private func runtimeToolCanonicalNames(raw: String): Array<String> {
+    let normalized = runtimeToolNormalizeName(raw)
+    match (normalized) {
+        case "exec" | "shell" | "shell-execute" | "shell_execute" => ["shellexecute"]
+        case "fs" | "file" | "files" | "filesystem" => ["fileread", "listdirectory", "globsearch", "grepsearch"]
+        case "memory" => ["memory_search", "memory_get"]
+        case "sessions" | "subagent" => ["sessions_spawn", "sessions_batch_delegate", "subagents"]
+        case _ => [normalized]
+    }
+}
+
 private func runtimeToolJsonStringArray(obj: JsonObject, key: String): Array<String> {
     let out = ArrayList<String>()
     match (obj.get(key)) {
@@ -154,6 +180,17 @@ private func runtimeToolAddScope(scopes: ArrayList<RuntimeToolPolicyScope>, objO
         case Some(obj) =>
             scopes.add(runtimeToolPolicyScopeFromObject(obj, source))
         case None => ()
+    }
+}
+
+private func runtimeToolSandboxTools(objOpt: Option<JsonObject>): Option<JsonObject> {
+    match (objOpt) {
+        case Some(obj) =>
+            match (runtimeToolJsonObject(obj, "sandbox")) {
+                case Some(sandbox) => runtimeToolJsonObject(sandbox, "tools")
+                case None => None<JsonObject>
+            }
+        case None => None<JsonObject>
     }
 }
 
@@ -228,6 +265,9 @@ private func runtimeToolPolicyScopes(root: JsonObject, agentId: String, provider
     let rootTools = runtimeToolJsonObject(root, "tools")
     runtimeToolAddScope(scopes, rootTools, "tools")
     runtimeToolAddProviderScopes(scopes, rootTools, provider, "tools")
+    let rootSandboxTools = runtimeToolSandboxTools(rootTools)
+    runtimeToolAddScope(scopes, rootSandboxTools, "tools.sandbox.tools")
+    runtimeToolAddProviderScopes(scopes, rootSandboxTools, provider, "tools.sandbox.tools")
 
     let gatewayTools = match (runtimeToolJsonObject(root, "gateway")) {
         case Some(gateway) => runtimeToolJsonObject(gateway, "tools")
@@ -235,6 +275,9 @@ private func runtimeToolPolicyScopes(root: JsonObject, agentId: String, provider
     }
     runtimeToolAddScope(scopes, gatewayTools, "gateway.tools")
     runtimeToolAddProviderScopes(scopes, gatewayTools, provider, "gateway.tools")
+    let gatewaySandboxTools = runtimeToolSandboxTools(gatewayTools)
+    runtimeToolAddScope(scopes, gatewaySandboxTools, "gateway.tools.sandbox.tools")
+    runtimeToolAddProviderScopes(scopes, gatewaySandboxTools, provider, "gateway.tools.sandbox.tools")
 
     match (runtimeToolJsonObject(root, "agents")) {
         case Some(agents) =>
@@ -244,6 +287,9 @@ private func runtimeToolPolicyScopes(root: JsonObject, agentId: String, provider
             }
             runtimeToolAddScope(scopes, defaultsTools, "agents.defaults.tools")
             runtimeToolAddProviderScopes(scopes, defaultsTools, provider, "agents.defaults.tools")
+            let defaultsSandboxTools = runtimeToolSandboxTools(defaultsTools)
+            runtimeToolAddScope(scopes, defaultsSandboxTools, "agents.defaults.tools.sandbox.tools")
+            runtimeToolAddProviderScopes(scopes, defaultsSandboxTools, provider, "agents.defaults.tools.sandbox.tools")
         case None => ()
     }
 
@@ -252,6 +298,9 @@ private func runtimeToolPolicyScopes(root: JsonObject, agentId: String, provider
             let agentTools = runtimeToolJsonObject(entry, "tools")
             runtimeToolAddScope(scopes, agentTools, "agents.list[${runtimeToolNormalizeName(agentId)}].tools")
             runtimeToolAddProviderScopes(scopes, agentTools, provider, "agents.list[${runtimeToolNormalizeName(agentId)}].tools")
+            let agentSandboxTools = runtimeToolSandboxTools(agentTools)
+            runtimeToolAddScope(scopes, agentSandboxTools, "agents.list[${runtimeToolNormalizeName(agentId)}].tools.sandbox.tools")
+            runtimeToolAddProviderScopes(scopes, agentSandboxTools, provider, "agents.list[${runtimeToolNormalizeName(agentId)}].tools.sandbox.tools")
         case None => ()
     }
     scopes
@@ -263,6 +312,22 @@ private func runtimeToolInventorySet(inventory: Array<String>): HashMap<String, 
         let normalized = runtimeToolNormalizeName(tool)
         if (!normalized.isEmpty()) {
             out[normalized] = true
+        }
+    }
+    out
+}
+
+private func runtimeToolCanonicalSet(values: Array<String>, inventory: Array<String>): HashMap<String, Bool> {
+    let out = HashMap<String, Bool>()
+    let inventorySet = runtimeToolInventorySet(inventory)
+    for (value in values) {
+        for (canonical in runtimeToolCanonicalNames(value)) {
+            if (canonical.isEmpty()) {
+                continue
+            }
+            if (canonical == "*" || inventorySet.contains(canonical)) {
+                out[canonical] = true
+            }
         }
     }
     out
@@ -297,23 +362,23 @@ private func runtimeToolIntersectAllowed(current: HashMap<String, Bool>, allowed
     out
 }
 
-private func runtimeToolArrayToSet(values: Array<String>): HashMap<String, Bool> {
-    let out = HashMap<String, Bool>()
-    for (value in values) {
-        let normalized = runtimeToolNormalizeName(value)
-        if (!normalized.isEmpty()) {
-            out[normalized] = true
-        }
-    }
-    out
+private func runtimeToolArrayToSet(values: Array<String>, inventory: Array<String>): HashMap<String, Bool> {
+    runtimeToolCanonicalSet(values, inventory)
 }
 
-private func runtimeToolSetContains(values: Array<String>, target: String): Bool {
-    let needle = runtimeToolNormalizeName(target)
+private func runtimeToolSetContains(values: Array<String>, target: String, inventory!: Array<String> = []): Bool {
+    let needles = runtimeToolCanonicalNames(target)
     for (value in values) {
         let normalized = runtimeToolNormalizeName(value)
-        if (normalized == "*" || normalized == needle) {
+        if (normalized == "*") {
             return true
+        }
+        for (candidate in runtimeToolCanonicalNames(value)) {
+            for (needle in needles) {
+                if (candidate == needle) {
+                    return true
+                }
+            }
         }
     }
     false
@@ -369,34 +434,36 @@ public func resolveRuntimeToolPolicyFromRoot(
             current = runtimeToolIntersectAllowed(current, runtimeToolProfileSet(scope.profile, inventory))
         }
         if (scope.allow.size > 0) {
-            current = runtimeToolIntersectAllowed(current, runtimeToolArrayToSet(scope.allow))
+            current = runtimeToolIntersectAllowed(current, runtimeToolArrayToSet(scope.allow, inventory))
         }
         if (scope.alsoAllow.size > 0 && !scope.profile.isEmpty() && scope.allow.size == 0) {
             for (name in scope.alsoAllow) {
-                let normalized = runtimeToolNormalizeName(name)
-                if (!normalized.isEmpty() && !denied.contains(normalized) && !denyAll) {
-                    current[normalized] = true
+                for (normalized in runtimeToolCanonicalNames(name)) {
+                    if (!normalized.isEmpty() && !denied.contains(normalized) && !denyAll) {
+                        current[normalized] = true
+                    }
                 }
             }
         }
         for (name in scope.deny) {
-            let normalized = runtimeToolNormalizeName(name)
-            if (normalized.isEmpty()) {
-                continue
+            for (normalized in runtimeToolCanonicalNames(name)) {
+                if (normalized.isEmpty()) {
+                    continue
+                }
+                if (normalized == "*") {
+                    denyAll = true
+                    current.clear()
+                    runtimeToolAppendDiagnostic(diagnostics, "${scope.source}: deny wins over allow/profile for all tools")
+                    continue
+                }
+                if (runtimeToolSetContains(scope.allow, normalized, inventory: inventory) ||
+                    runtimeToolSetContains(scope.alsoAllow, normalized, inventory: inventory) ||
+                    (!scope.profile.isEmpty() && runtimeToolProfileSet(scope.profile, inventory).contains(normalized))) {
+                    runtimeToolAppendDiagnostic(diagnostics, "${scope.source}: deny wins over allow/profile for ${name.trimAscii()}")
+                }
+                denied[normalized] = true
+                current.remove(normalized)
             }
-            if (normalized == "*") {
-                denyAll = true
-                current.clear()
-                runtimeToolAppendDiagnostic(diagnostics, "${scope.source}: deny wins over allow/profile for all tools")
-                continue
-            }
-            if (runtimeToolSetContains(scope.allow, normalized) ||
-                runtimeToolSetContains(scope.alsoAllow, normalized) ||
-                (!scope.profile.isEmpty() && runtimeToolProfileSet(scope.profile, inventory).contains(normalized))) {
-                runtimeToolAppendDiagnostic(diagnostics, "${scope.source}: deny wins over allow/profile for ${name.trimAscii()}")
-            }
-            denied[normalized] = true
-            current.remove(normalized)
         }
     }
 
@@ -415,6 +482,74 @@ public func resolveRuntimeToolPolicyFromRoot(
     report.diagnostics = diagnostics.toArray()
     report.policySource = if (sources.size == 0) { "unrestricted" } else { String.join(sources.toArray(), delimiter: " + ") }
     report
+}
+
+private let runtimeToolInvocationPolicyContextLock = Mutex()
+private let runtimeToolInvocationPolicyContextByThread = HashMap<String, ArrayList<RuntimeToolInvocationPolicyContext>>()
+
+private func runtimeToolInvocationPolicyThreadKey(): String {
+    Thread.currentThread.name.trimAscii()
+}
+
+private func runtimeToolInvocationPolicyStack(threadKey: String): ArrayList<RuntimeToolInvocationPolicyContext> {
+    match (runtimeToolInvocationPolicyContextByThread.get(threadKey)) {
+        case Some(existing) => existing
+        case None =>
+            let created = ArrayList<RuntimeToolInvocationPolicyContext>()
+            runtimeToolInvocationPolicyContextByThread[threadKey] = created
+            created
+    }
+}
+
+public func runtimeCurrentToolInvocationPolicyContext(): Option<RuntimeToolInvocationPolicyContext> {
+    synchronized(runtimeToolInvocationPolicyContextLock) {
+        match (runtimeToolInvocationPolicyContextByThread.get(runtimeToolInvocationPolicyThreadKey())) {
+            case Some(stack) =>
+                if (stack.size > 0) {
+                    Some(stack[stack.size - 1])
+                } else {
+                    None<RuntimeToolInvocationPolicyContext>
+                }
+            case None => None<RuntimeToolInvocationPolicyContext>
+        }
+    }
+}
+
+public func runtimePushToolInvocationPolicyContext(context: RuntimeToolInvocationPolicyContext): Unit {
+    synchronized(runtimeToolInvocationPolicyContextLock) {
+        runtimeToolInvocationPolicyStack(runtimeToolInvocationPolicyThreadKey()).add(context)
+    }
+}
+
+public func runtimePopToolInvocationPolicyContext(): Unit {
+    synchronized(runtimeToolInvocationPolicyContextLock) {
+        let threadKey = runtimeToolInvocationPolicyThreadKey()
+        match (runtimeToolInvocationPolicyContextByThread.get(threadKey)) {
+            case Some(stack) =>
+                if (stack.size > 0) {
+                    stack.remove(at: stack.size - 1)
+                }
+                if (stack.size == 0) {
+                    runtimeToolInvocationPolicyContextByThread.remove(threadKey)
+                }
+            case None => ()
+        }
+    }
+}
+
+public func runtimeWithToolInvocationPolicyContext<T>(
+    root: JsonObject,
+    inventory: Array<String>,
+    block: () -> T,
+    agentId!: String = "",
+    provider!: String = ""
+): T {
+    runtimePushToolInvocationPolicyContext(RuntimeToolInvocationPolicyContext(root, inventory, agentId: agentId, provider: provider))
+    try {
+        block()
+    } finally {
+        runtimePopToolInvocationPolicyContext()
+    }
 }
 
 public func runtimeToolDiagnosticsContain(report: RuntimeToolPolicyReport, needle: String): Bool {
@@ -458,13 +593,23 @@ public func runtimeToolInvocationAllowedFromRoot(
     decision.toolName = toolName.trimAscii()
     let report = resolveRuntimeToolPolicyFromRoot(root, inventory, agentId: agentId, provider: provider)
     decision.policySource = report.policySource
-    if (!runtimeToolNamesContain(inventory, toolName)) {
+    var knownTool = false
+    var visibleTool = false
+    for (canonical in runtimeToolCanonicalNames(toolName)) {
+        if (runtimeToolNamesContain(inventory, canonical)) {
+            knownTool = true
+        }
+        if (runtimeToolNamesContain(report.visibleTools, canonical)) {
+            visibleTool = true
+        }
+    }
+    if (!knownTool) {
         decision.allowed = false
         decision.status = "rejected"
         decision.reason = "unknown tool: ${toolName.trimAscii()}"
         return decision
     }
-    if (!runtimeToolNamesContain(report.visibleTools, toolName)) {
+    if (!visibleTool) {
         decision.allowed = false
         decision.status = "rejected"
         decision.reason = "tool denied by policy: ${toolName.trimAscii()}"

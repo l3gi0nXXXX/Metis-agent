@@ -79,6 +79,38 @@ public class RuntimeToolProfilesTest {
     }
 
     @TestCase
+    public func execAliasDenyHidesShellExecuteAndRejectsInvocation(): Unit {
+        let agents = JsonArray([])
+        agents.add(this.agentEntry("agent-a", tools: this.toolPolicy(deny: ["exec"])))
+        let root = this.configWithAgents(agentEntries: agents)
+        let inventory = ["fileRead", "shellExecute", "message"]
+
+        let report = resolveRuntimeToolPolicyFromRoot(root, inventory, agentId: "agent-a")
+        @Expect(runtimeToolNamesContain(report.visibleTools, "shellExecute"), false)
+        @Expect(runtimeToolNamesContain(report.deniedTools, "shellExecute"), true)
+
+        let decision = runtimeToolInvocationAllowedFromRoot(root, "shellExecute", inventory, agentId: "agent-a")
+        @Expect(decision.allowed, false)
+        @Expect(decision.reason.contains("shellExecute"), true)
+    }
+
+    @TestCase
+    public func sandboxToolPolicyNarrowsParentScopeAndReportsSource(): Unit {
+        let root = JsonObject()
+        let tools = this.toolPolicy(allow: ["fileRead", "shellExecute"])
+        let sandbox = JsonObject()
+        sandbox.put("tools", this.toolPolicy(deny: ["exec"]))
+        tools.put("sandbox", sandbox)
+        root.put("tools", tools)
+
+        let report = resolveRuntimeToolPolicyFromRoot(root, ["fileRead", "shellExecute"])
+
+        @Expect(runtimeToolNamesContain(report.visibleTools, "fileRead"), true)
+        @Expect(runtimeToolNamesContain(report.visibleTools, "shellExecute"), false)
+        @Expect(report.policySource.contains("tools.sandbox.tools"), true)
+    }
+
+    @TestCase
     public func allowDenyAlsoAllowAndProviderConflictsAreDiagnosed(): Unit {
         let root = JsonObject()
         root.put("tools", this.toolPolicy(allow: ["fileRead"], alsoAllow: ["message"], deny: ["fileRead"]))
