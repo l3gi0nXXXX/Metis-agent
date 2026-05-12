@@ -3,8 +3,9 @@ package metis.gateway.runtime
 import metis.core.config.CliSettingManager
 
 import std.collection.ArrayList
+import std.fs.Path
 import std.unittest.testmacro.*
-import stdx.encoding.json.{JsonObject, JsonString}
+import stdx.encoding.json.{JsonArray, JsonBool, JsonObject, JsonString}
 
 private func agentsTestString(obj: JsonObject, key: String): String {
     match (obj.get(key)) {
@@ -12,6 +13,14 @@ private func agentsTestString(obj: JsonObject, key: String): String {
             try { v.asString().getValue() } catch (_: Exception) { "" }
         case None => ""
     }
+}
+
+private func agentsTestStringArray(values: Array<String>): JsonArray {
+    let out = JsonArray([])
+    for (value in values) {
+        out.add(JsonString(value))
+    }
+    out
 }
 
 @Test
@@ -121,6 +130,48 @@ public class GatewayServerMethodsAgentsTest {
         let first = rows[0].asObject()
         @Expect(agentsTestString(first, "id"), "general")
         @Expect(first.get("skills").isSome(), true)
+    }
+
+    @TestCase
+    public func agentsScopeHelpersExposeReadOnlyResolvedAgentScope(): Unit {
+        let home = Path("/tmp").join("metis-agent-scope-gateway-test")
+        let root = JsonObject()
+        let agents = JsonObject()
+        let defaults = JsonObject()
+        defaults.put("workspace", JsonString(home.join("team").toString()))
+        defaults.put("skills", agentsTestStringArray(["safe-default"]))
+        let tools = JsonObject()
+        tools.put("allow", agentsTestStringArray(["fileRead"]))
+        defaults.put("tools", tools)
+        agents.put("defaults", defaults)
+        let list = JsonArray([])
+        let pm = JsonObject()
+        pm.put("id", JsonString("pm"))
+        pm.put("default", JsonBool(true))
+        list.add(pm)
+        let writer = JsonObject()
+        writer.put("id", JsonString("writer"))
+        writer.put("skills", agentsTestStringArray(["writer-skill"]))
+        list.add(writer)
+        agents.put("list", list)
+        root.put("agents", agents)
+
+        let summary = gatewayResolveAgentsScopeSummaryFromRoot(root, homeRoot: home, defaultWorkspace: home.join("workspaces"))
+        @Expect(agentsTestString(summary, "defaultAgentId"), "pm")
+        @Expect(summary.get("agents").getOrThrow().asArray().size(), 2)
+
+        let scope = gatewayResolveAgentScopeFromRoot(root, agentId: "writer", homeRoot: home, defaultWorkspace: home.join("workspaces"))
+        @Expect(agentsTestString(scope, "agentId"), "writer")
+        @Expect(agentsTestString(scope, "workspaceDir"), home.join("team").join("writer").toString())
+        @Expect(agentsTestString(scope, "agentDir"), home.join("agents").join("writer").join("agent").toString())
+        @Expect(agentsTestString(scope, "modelsJsonPath"), home.join("agents").join("writer").join("agent").join("models.json").toString())
+        @Expect(agentsTestString(scope, "authProfilesPath"), home.join("agents").join("writer").join("agent").join("auth-profiles.json").toString())
+        @Expect(agentsTestString(scope, "sessionsDir"), home.join("agents").join("writer").join("sessions").toString())
+        @Expect(scope.get("skillsPolicy").getOrThrow().asObject().toJsonString().contains("writer-skill"), true)
+        @Expect(scope.get("toolsPolicy").getOrThrow().asObject().toJsonString().contains("fileRead"), true)
+
+        let defaultScope = gatewayResolveDefaultAgentScopeFromRoot(root, homeRoot: home, defaultWorkspace: home.join("workspaces"))
+        @Expect(agentsTestString(defaultScope, "agentId"), "pm")
     }
 
     @TestCase

@@ -3,7 +3,7 @@ package metis.gateway.runtime
 import magic.jsonable.*
 
 import metis.core.{gatewayMainRuntimeExtendedToolNames, gatewayMainRuntimeRequiredToolNames, missingRuntimeToolNames}
-import metis.core.config.{CliConfig, CliSettingManager, MetisConfigManager, MetisPaths, GatewayUserSettings}
+import metis.core.config.{CliConfig, CliSettingManager, MetisAgentScope, MetisConfigManager, MetisPaths, GatewayUserSettings}
 import metis.core.memory.MemoryRuntimeRegistry
 import metis.core.skills.resolveAgentSkillVisibility
 import metis.gateway.config.buildGatewayConfigFromUserSettings
@@ -1442,6 +1442,47 @@ private func gatewayAgentsSummaryJson(): JsonObject {
     summary
 }
 
+public func gatewayResolveAgentScopeFromRoot(
+    root: JsonObject,
+    agentId!: String = "",
+    homeRoot!: Path = MetisPaths.homeRoot(),
+    defaultWorkspace!: Path = MetisPaths.workspaceRoot()
+): JsonObject {
+    MetisAgentScope.resolve(root, agentId: agentId, homeRoot: homeRoot, defaultWorkspace: defaultWorkspace)
+}
+
+public func gatewayResolveAgentsScopeSummaryFromRoot(
+    root: JsonObject,
+    homeRoot!: Path = MetisPaths.homeRoot(),
+    defaultWorkspace!: Path = MetisPaths.workspaceRoot()
+): JsonObject {
+    MetisAgentScope.summary(root, homeRoot: homeRoot, defaultWorkspace: defaultWorkspace)
+}
+
+public func gatewayResolveDefaultAgentScopeFromRoot(
+    root: JsonObject,
+    homeRoot!: Path = MetisPaths.homeRoot(),
+    defaultWorkspace!: Path = MetisPaths.workspaceRoot()
+): JsonObject {
+    let summary = gatewayResolveAgentsScopeSummaryFromRoot(root, homeRoot: homeRoot, defaultWorkspace: defaultWorkspace)
+    let defaultId = gatewayAgentJsonString(summary, "defaultAgentId", "main")
+    gatewayResolveAgentScopeFromRoot(root, agentId: defaultId, homeRoot: homeRoot, defaultWorkspace: defaultWorkspace)
+}
+
+private func gatewayAgentScopeJson(request: GatewayRpcRequest): JsonObject {
+    let root = gatewayAgentConfigRootClone()
+    let agentId = gatewayAgentRpcStringParam(request, ["id", "agent", "agentId"], "")
+    gatewayResolveAgentScopeFromRoot(root, agentId: agentId)
+}
+
+private func gatewayAgentsScopeSummaryJson(): JsonObject {
+    gatewayResolveAgentsScopeSummaryFromRoot(gatewayAgentConfigRootClone())
+}
+
+private func gatewayAgentsDefaultScopeJson(): JsonObject {
+    gatewayResolveDefaultAgentScopeFromRoot(gatewayAgentConfigRootClone())
+}
+
 public func handleGatewayAgentsFamily(method: String, request!: Option<GatewayRpcRequest> = None): Option<GatewayRpcResponse> {
     if (method == "agents.list" || method == "agents.status") {
         let result = JsonObject()
@@ -1464,6 +1505,16 @@ public func handleGatewayAgentsFamily(method: String, request!: Option<GatewayRp
     if (method == "agents.summary") {
         let result = JsonObject()
         result.put("agents", gatewayAgentsSummaryJson())
+        return Some(GatewayRpcResponse(true, method, result: result))
+    }
+    if (method == "agents.scope") {
+        let result = JsonObject()
+        result.put("scope", gatewayAgentsScopeSummaryJson())
+        return Some(GatewayRpcResponse(true, method, result: result))
+    }
+    if (method == "agents.default") {
+        let result = JsonObject()
+        result.put("scope", gatewayAgentsDefaultScopeJson())
         return Some(GatewayRpcResponse(true, method, result: result))
     }
     if (method == "agents.capabilities") {
@@ -1543,6 +1594,15 @@ public func handleGatewayAgentsFamily(method: String, request!: Option<GatewayRp
         let agentId = gatewayAgentRpcStringParam(requestValue, ["id", "agent", "agentId"], "general")
         let result = JsonObject()
         result.put("agent", gatewayAgentGetJson(agentId))
+        return Some(GatewayRpcResponse(true, method, result: result))
+    }
+    if (method == "agent.scope") {
+        let requestValue = match (request) {
+            case Some(v) => v
+            case None => GatewayRpcRequest(method)
+        }
+        let result = JsonObject()
+        result.put("scope", gatewayAgentScopeJson(requestValue))
         return Some(GatewayRpcResponse(true, method, result: result))
     }
     if (method == "agent.preview") {
