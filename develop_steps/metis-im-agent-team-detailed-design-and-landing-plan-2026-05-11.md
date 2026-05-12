@@ -1941,6 +1941,8 @@ GatewayAgentRoute:
    - 同 agent 的 channel-only binding 可以被显式 account binding 升级，而不是生成重复规则。
    - 不同 agent 声明相同 match 时必须进入 conflicts。
    - wildcard account 和 default account 不可被模糊合并。
+   - apply/copy 必须保留 route binding 元数据，至少保留 `comment` 和 `enabled`；disabled route 不能在 round-trip 后被重新启用。
+   - scope upgrade 不能把已有 `enabled=false` 的 default/account binding 当作可覆盖对象重新启用；如果需要新增显式 account binding，应保留旧 disabled binding 或合并 metadata 后仍保持 disabled。
 5. 集成 Phase 1 的 Agent Scope：
    - resolver 不直接相信 `agentId` 字符串。
    - 绑定未知 agent 时 fallback 到 default，并输出诊断。
@@ -1957,8 +1959,9 @@ GatewayAgentRoute:
    - `session.dmScope=main` 且 allowFrom 能推断唯一 owner 时，非 owner DM 只能记录 inbound metadata，不能覆盖 main session `lastRoute`。
 8. 输出 preferredAccountId：
    - 有显式 route binding account 时优先使用绑定 account。
-   - 否则使用 channel default account。
+   - 否则使用 resolved channel default account，不能使用当前 inbound account 替代。
    - channel default account 规则为 plugin/default 配置优先，其次第一个 account，最后 `default`。
+   - `accountId` 归一化必须集中实现：空值和 `default` 归到 resolved default account；大小写归一；非法字符按 OpenClaw `account-id.ts` 规则折叠或拒绝并给 diagnostics。
 9. 输出 matchedBy：
    - `binding.peer.exact`。
    - `binding.peer.parent`。
@@ -1978,9 +1981,13 @@ GatewayAgentRoute:
 - 覆盖 Feishu direct/group/thread/account。
 - 覆盖 legacy `channel[:accountId]`。
 - 覆盖 `accountId` 缺省、显式账号、`"*"` channel-wide fallback。
+- 覆盖显式 `accountId="default"` 与缺省 account 等价。
+- 覆盖大小写和非法字符 accountId 归一化。
 - 覆盖 `type=route`、缺省 type、`type=acp` 不被普通 resolver 命中。
 - 覆盖 preferredAccountId。
 - 覆盖 binding apply 的 added/updated/skipped/conflicts。
+- 覆盖 binding apply/copy 对 `comment` 和 `enabled` 的 round-trip 保留，disabled binding 不参与 route。
+- 覆盖 disabled default binding 遇到显式 account binding apply 时不会被 scope upgrade 覆盖、不会丢失 `comment`、不会从 `enabled=false` 变成 enabled。
 - 覆盖 lastRoutePolicy 和 main DM owner pin mismatch。
 - 覆盖冲突、禁用规则、未知 agent、空配置。
 
@@ -2411,6 +2418,7 @@ GatewayAgentRoute:
 5. invocation 二次校验：
    - 即使模型直接构造被禁 tool call，运行时也拒绝。
    - MCP/HTTP tool invoke 不能绕过。
+   - Gateway HTTP `tools/call` / MCP-over-HTTP surface 必须和 core/MCP wrapper 使用同一套 agent effective tool policy gate，不能只在 Gateway RPC 或 managed session 工具链上校验。
 6. 可观测性：
    - status 返回 effective skills/tools。
    - 对 deny 原因给出结构化解释。
@@ -2424,6 +2432,10 @@ GatewayAgentRoute:
    - `subagents.allowAgents` 限制该 agent 可委派的目标 agent。
    - `subagents.model`、`requireAgentId`、spawn depth/concurrency 必须作为 AgentTeam 边界的一部分。
    - 未授权 agent 不能通过 subagent 工具绕过 tool/sandbox 限制。
+   - managed session toolset 与 core `GatewaySessionsToolset` 的真实 `sessions_spawn` 路径都必须接入同一个 boundary decision；不能只覆盖 Gateway managed path。
+10. policy 合并必须保持最严格语义：
+   - `allow/profile` 一旦在上游 scope 收窄，后续 scope 的 `alsoAllow` 只能在当前可见集合内追加说明或解除同层误配，不能重新放宽父级 allow/profile 已排除的工具。
+   - `tools.sandbox.tools` 与 `agents.list[].tools.sandbox.tools` 只可进一步收窄或保持，不可扩大父级 effective tool set。
 
 测试要求：
 
@@ -2431,8 +2443,11 @@ GatewayAgentRoute:
 - agent A deny exec，agent B allow exec。
 - agent A skill allowlist 为空，agent B 使用默认。
 - 模型 tool list 和 invocation 分别测试。
+- Gateway HTTP `tools/call` / MCP-over-HTTP invocation 测试必须证明被禁工具无法绕过 policy gate。
 - sandbox policy 和 tool policy 组合测试。
 - subagent allowAgents/requireAgentId 测试。
+- managed session 与 core `GatewaySessionsToolset` 的 `sessions_spawn` 都要测试 boundary decision。
+- `alsoAllow` 与 `tools.sandbox.tools` 合并测试必须证明后续 scope 不能放宽父级 allow/profile。
 - elevated sender-based 与 agent policy 组合测试。
 - 不调用真实外部 MCP 或真实 IM。
 

@@ -3,7 +3,7 @@ package metis.gateway.runtime
 import magic.jsonable.*
 
 import metis.core.gatewaySubagentResolveAgent
-import metis.core.config.{CliConfig, CliModelRuntimeStateManager, CliSettingManager, MetisConfigManager}
+import metis.core.config.{CliConfig, CliModelRuntimeStateManager, CliSettingManager, MetisConfigManager, MetisProcessEnvironmentLock}
 
 import std.collection.ArrayList
 import std.env.{getVariable, setVariable}
@@ -54,32 +54,34 @@ private func agentsTestClean(path: Path): Unit {
 }
 
 private func withAgentsTempHome<T>(label: String, block: (Path) -> T): T {
-    let home = Path("/tmp/${label}")
-    try {
-        remove(home, recursive: true)
-    } catch (_: Exception) {
-        ()
-    }
-    Directory.create(home, recursive: true)
-    let oldHome = getVariable("METIS_HOME")
-    setVariable("METIS_HOME", home.toString())
-    CliConfig.invalidatePathCache()
-    MetisConfigManager.invalidate()
-    CliSettingManager.invalidate()
-    try {
-        return block(home)
-    } finally {
-        match (oldHome) {
-            case Some(value) => setVariable("METIS_HOME", value)
-            case None => setVariable("METIS_HOME", "")
-        }
-        CliConfig.invalidatePathCache()
-        MetisConfigManager.invalidate()
-        CliSettingManager.invalidate()
+    synchronized(MetisProcessEnvironmentLock) {
+        let home = Path("/tmp/${label}")
         try {
             remove(home, recursive: true)
         } catch (_: Exception) {
             ()
+        }
+        Directory.create(home, recursive: true)
+        let oldHome = getVariable("METIS_HOME")
+        setVariable("METIS_HOME", home.toString())
+        CliConfig.invalidatePathCache()
+        MetisConfigManager.invalidate()
+        CliSettingManager.invalidate()
+        try {
+            return block(home)
+        } finally {
+            match (oldHome) {
+                case Some(value) => setVariable("METIS_HOME", value)
+                case None => setVariable("METIS_HOME", "")
+            }
+            CliConfig.invalidatePathCache()
+            MetisConfigManager.invalidate()
+            CliSettingManager.invalidate()
+            try {
+                remove(home, recursive: true)
+            } catch (_: Exception) {
+                ()
+            }
         }
     }
 }
