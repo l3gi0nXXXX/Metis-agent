@@ -106,6 +106,24 @@ public class GatewayHttpSurfaceTest {
     }
 
     @TestCase
+    public func mcpToolsCallRejectsDeniedGatewayToolBeforeDispatch(): Unit {
+        withGatewayHttpSurfaceTestSettings<Unit>({ =>
+            var user = gatewayHttpSurfaceTestUser()
+            user.tools.deny = ["gateway.http.start"]
+
+            let response = gatewayHandleMcpRequest(
+                user,
+                "{\"jsonrpc\":\"2.0\",\"id\":17,\"method\":\"tools/call\",\"params\":{\"name\":\"gateway.http.start\",\"arguments\":{}}}"
+            )
+
+            @Expect(response.contains("\"error\""), true)
+            @Expect(response.contains("tool denied by policy"), true)
+            @Expect(response.contains("gateway.http.start"), true)
+            @Expect(response.contains("\"started\""), false)
+        })
+    }
+
+    @TestCase
     public func mcpHttpStartAndStatusForwardExistingPlatformMethods(): Unit {
         withGatewayHttpSurfaceTestSettings<Unit>({ =>
             let readinessResponse = gatewayHandleMcpRequest(

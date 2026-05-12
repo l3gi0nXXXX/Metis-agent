@@ -430,20 +430,25 @@ public func resolveRuntimeToolPolicyFromRoot(
         if (scope.allow.size > 0 && scope.alsoAllow.size > 0) {
             runtimeToolAppendDiagnostic(diagnostics, "${scope.source}: allow and alsoAllow cannot both be set in the same policy scope")
         }
+        var scopeConstrainsTools = false
+        var scopeAllowed = runtimeToolInventorySet(inventory)
         if (!scope.profile.isEmpty()) {
-            current = runtimeToolIntersectAllowed(current, runtimeToolProfileSet(scope.profile, inventory))
+            scopeAllowed = runtimeToolProfileSet(scope.profile, inventory)
+            scopeConstrainsTools = true
         }
         if (scope.allow.size > 0) {
-            current = runtimeToolIntersectAllowed(current, runtimeToolArrayToSet(scope.allow, inventory))
+            scopeAllowed = runtimeToolArrayToSet(scope.allow, inventory)
+            scopeConstrainsTools = true
         }
         if (scope.alsoAllow.size > 0 && !scope.profile.isEmpty() && scope.allow.size == 0) {
-            for (name in scope.alsoAllow) {
-                for (normalized in runtimeToolCanonicalNames(name)) {
-                    if (!normalized.isEmpty() && !denied.contains(normalized) && !denyAll) {
-                        current[normalized] = true
-                    }
+            for ((name, _) in runtimeToolArrayToSet(scope.alsoAllow, inventory)) {
+                if (!name.isEmpty() && name != "*") {
+                    scopeAllowed[name] = true
                 }
             }
+        }
+        if (scopeConstrainsTools) {
+            current = runtimeToolIntersectAllowed(current, scopeAllowed)
         }
         for (name in scope.deny) {
             for (normalized in runtimeToolCanonicalNames(name)) {

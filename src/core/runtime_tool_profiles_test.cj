@@ -111,6 +111,40 @@ public class RuntimeToolProfilesTest {
     }
 
     @TestCase
+    public func alsoAllowDoesNotWidenEarlierAllowScope(): Unit {
+        let root = JsonObject()
+        root.put("tools", this.toolPolicy(allow: ["fileRead"]))
+        let gateway = JsonObject()
+        gateway.put("tools", this.toolPolicy(alsoAllow: ["shellExecute"], profile: "coding"))
+        root.put("gateway", gateway)
+
+        let report = resolveRuntimeToolPolicyFromRoot(root, ["fileRead", "shellExecute", "message"])
+
+        @Expect(runtimeToolNamesContain(report.visibleTools, "fileRead"), true)
+        @Expect(runtimeToolNamesContain(report.visibleTools, "shellExecute"), false)
+        @Expect(runtimeToolNamesContain(report.visibleTools, "message"), false)
+        @Expect(report.policySource.contains("tools"), true)
+        @Expect(report.policySource.contains("gateway.tools"), true)
+    }
+
+    @TestCase
+    public func agentSandboxToolsCannotWidenAgentToolPolicyWithAlsoAllow(): Unit {
+        let agents = JsonArray([])
+        let agentTools = this.toolPolicy(allow: ["fileRead"])
+        let sandbox = JsonObject()
+        sandbox.put("tools", this.toolPolicy(alsoAllow: ["shellExecute"], profile: "coding"))
+        agentTools.put("sandbox", sandbox)
+        agents.add(this.agentEntry("agent-a", tools: agentTools))
+        let root = this.configWithAgents(agentEntries: agents)
+
+        let report = resolveRuntimeToolPolicyFromRoot(root, ["fileRead", "shellExecute"], agentId: "agent-a")
+
+        @Expect(runtimeToolNamesContain(report.visibleTools, "fileRead"), true)
+        @Expect(runtimeToolNamesContain(report.visibleTools, "shellExecute"), false)
+        @Expect(report.policySource.contains("agents.list[agent-a].tools.sandbox.tools"), true)
+    }
+
+    @TestCase
     public func allowDenyAlsoAllowAndProviderConflictsAreDiagnosed(): Unit {
         let root = JsonObject()
         root.put("tools", this.toolPolicy(allow: ["fileRead"], alsoAllow: ["message"], deny: ["fileRead"]))
