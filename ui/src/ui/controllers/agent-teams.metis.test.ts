@@ -1,11 +1,18 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   applyAgentTeamBinding,
+  buildAgentTeamBindingPreview,
+  changeAgentTeamMember,
   createAgentTeam,
   createEmptyAgentTeamBindingDraft,
   createEmptyAgentTeamDraft,
   createEmptyAgentTeamModelDraft,
+  createEmptyAgentTeamWorkspaceDraft,
+  loadAgentTeamWorkspaceFile,
+  loadAgentTeamWorkspaceFiles,
   loadAgentTeamModel,
+  previewAgentTeamBinding,
+  saveAgentTeamWorkspaceFile,
   loadAgentTeams,
   saveAgentTeamModel,
   updateAgentTeam,
@@ -31,6 +38,10 @@ function createState(): { state: AgentTeamsState; request: ReturnType<typeof vi.
     agentTeamModelError: null,
     agentTeamModelResult: null,
     agentTeamModelDraft: createEmptyAgentTeamModelDraft(),
+    agentTeamWorkspaceLoading: false,
+    agentTeamWorkspaceSaving: false,
+    agentTeamWorkspaceError: null,
+    agentTeamWorkspace: createEmptyAgentTeamWorkspaceDraft(),
   };
   return { state, request };
 }
@@ -63,6 +74,22 @@ describe("loadAgentTeams", () => {
 });
 
 describe("team mutations", () => {
+  it("edits team members without requiring raw JSON textarea changes", () => {
+    const draft = {
+      ...createEmptyAgentTeamDraft(),
+      membersJson: '[{"agentId":"content-writer","role":"writer","name":"Writer"}]',
+    };
+
+    const changed = changeAgentTeamMember(draft, 0, {
+      role: "reviewer",
+      name: "Reviewer",
+    });
+
+    expect(JSON.parse(changed.membersJson)).toEqual([
+      { agentId: "content-writer", role: "reviewer", name: "Reviewer" },
+    ]);
+  });
+
   it("creates a template-backed team when members are empty", async () => {
     const { state, request } = createState();
     state.agentTeamDraft = {
@@ -86,6 +113,32 @@ describe("team mutations", () => {
       bindings: [],
     });
     expect(state.agentTeamsSuccess).toBe("Team created.");
+  });
+
+  it("ignores incomplete member rows when creating a custom team", async () => {
+    const { state, request } = createState();
+    state.agentTeamDraft = {
+      ...createEmptyAgentTeamDraft(),
+      id: "content",
+      displayName: "Content Team",
+      template: "",
+      membersJson:
+        '[{"agentId":"","role":"writer","name":"Draft"},{"agentId":"content-reviewer","role":"reviewer"}]',
+    };
+    request
+      .mockResolvedValueOnce({ team: { id: "content", displayName: "Content Team" } })
+      .mockResolvedValueOnce({ teams: [{ id: "content", displayName: "Content Team" }], count: 1 })
+      .mockResolvedValueOnce({ team: { id: "content", displayName: "Content Team" } });
+
+    await createAgentTeam(state);
+
+    expect(request).toHaveBeenNthCalledWith(1, "agents.teams.create", {
+      id: "content",
+      displayName: "Content Team",
+      members: [{ agentId: "content-reviewer", role: "reviewer" }],
+      aliases: [],
+      bindings: [],
+    });
   });
 
   it("updates team members, aliases, and bindings through agents.teams.update", async () => {
@@ -118,6 +171,44 @@ describe("team mutations", () => {
 });
 
 describe("team binding and models", () => {
+  it("builds a structured binding preview before applying", () => {
+    const draft = {
+      ...createEmptyAgentTeamBindingDraft(),
+      agentId: "content-writer",
+      useStructuredBinding: true,
+      channel: "feishu",
+      accountId: "tenant-a",
+      peer: "chat:oc_123",
+      thread: "thread:om_456",
+      group: "chat:oc_123",
+      team: "content",
+      roles: "writer, reviewer",
+      comment: "content team route",
+    };
+
+    const preview = buildAgentTeamBindingPreview(draft);
+
+    expect(preview.simpleBinding).toBe("feishu:tenant-a");
+    expect(preview.routeBinding).toEqual({
+      type: "route",
+      agentId: "content-writer",
+      match: {
+        channel: "feishu",
+        accountId: "tenant-a",
+        peer: { kind: "thread", id: "thread:om_456" },
+        guildId: "chat:oc_123",
+        teamId: "content",
+        roles: ["writer", "reviewer"],
+      },
+      comment: "content team route",
+    });
+    expect(preview.applyPayload).toEqual({
+      agentId: "content-writer",
+      bindings: [preview.routeBinding],
+    });
+    expect(preview.lines.join("\n")).toContain("read-only preview");
+  });
+
   it("applies a team member binding through agents.bind", async () => {
     const { state, request } = createState();
     state.agentTeamBinding = {
@@ -134,6 +225,45 @@ describe("team binding and models", () => {
       bind: "telegram:bot-a",
     });
     expect(state.agentTeamsSuccess).toBe("Binding applied.");
+  });
+
+  it("applies a structured binding through agents.bind after preview", async () => {
+    const { state, request } = createState();
+    state.agentTeamBinding = {
+      ...createEmptyAgentTeamBindingDraft(),
+      agentId: "content-writer",
+      channel: "feishu",
+      accountId: "tenant-a",
+      peer: "chat:oc_123",
+      useStructuredBinding: true,
+    };
+    request.mockResolvedValue({ agentId: "content-writer", added: ["feishu accountId=tenant-a"] });
+
+    previewAgentTeamBinding(state);
+    await applyAgentTeamBinding(state);
+
+    expect(state.agentTeamBindingPreview?.routeBinding).toMatchObject({
+      agentId: "content-writer",
+      match: {
+        channel: "feishu",
+        accountId: "tenant-a",
+        peer: { kind: "group", id: "chat:oc_123" },
+      },
+    });
+    expect(request).toHaveBeenCalledWith("agents.bind", {
+      agentId: "content-writer",
+      bindings: [
+        {
+          type: "route",
+          agentId: "content-writer",
+          match: {
+            channel: "feishu",
+            accountId: "tenant-a",
+            peer: { kind: "group", id: "chat:oc_123" },
+          },
+        },
+      ],
+    });
   });
 
   it("loads and saves per-agent model state through agents.models.get/set", async () => {
@@ -181,5 +311,68 @@ describe("team binding and models", () => {
         runtimePrimaryModelRef: "openai:gpt-5.1",
       },
     });
+  });
+});
+
+describe("team workspace profiles", () => {
+  it("lists, loads, and saves supported workspace profile files through agents.files RPC", async () => {
+    const { state, request } = createState();
+    request
+      .mockResolvedValueOnce({
+        agentId: "content-writer",
+        workspace: "/tmp/metis/content-writer",
+        files: [
+          { name: "SOUL.md", path: "/tmp/metis/content-writer/SOUL.md", missing: false },
+          { name: "scratch.txt", path: "/tmp/metis/content-writer/scratch.txt", missing: false },
+        ],
+      })
+      .mockResolvedValueOnce({
+        agentId: "content-writer",
+        workspace: "/tmp/metis/content-writer",
+        file: {
+          name: "SOUL.md",
+          path: "/tmp/metis/content-writer/SOUL.md",
+          missing: false,
+          content: "Be concise.",
+        },
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        agentId: "content-writer",
+        workspace: "/tmp/metis/content-writer",
+        file: {
+          name: "SOUL.md",
+          path: "/tmp/metis/content-writer/SOUL.md",
+          missing: false,
+          content: "Be direct.",
+        },
+      });
+
+    await loadAgentTeamWorkspaceFiles(state, "content-writer");
+    await loadAgentTeamWorkspaceFile(state, "SOUL.md");
+    state.agentTeamWorkspace.draft = "Be direct.";
+    await saveAgentTeamWorkspaceFile(state);
+
+    expect(request).toHaveBeenNthCalledWith(1, "agents.files.list", {
+      agentId: "content-writer",
+    });
+    expect(request).toHaveBeenNthCalledWith(2, "agents.files.get", {
+      agentId: "content-writer",
+      name: "SOUL.md",
+    });
+    expect(request).toHaveBeenNthCalledWith(3, "agents.files.set", {
+      agentId: "content-writer",
+      name: "SOUL.md",
+      content: "Be direct.",
+    });
+    expect(state.agentTeamWorkspace.files.map((file) => file.name)).toEqual([
+      "SOUL.md",
+      "AGENTS.md",
+      "IDENTITY.md",
+      "USER.md",
+      "TOOLS.md",
+      "MEMORY.md",
+    ]);
+    expect(state.agentTeamWorkspace.content).toBe("Be direct.");
   });
 });

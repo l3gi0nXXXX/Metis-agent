@@ -190,11 +190,16 @@ export type AppViewState = {
   agentTeamsDetail: import("./types.js").AgentTeam | null;
   agentTeamDraft: import("./controllers/agent-teams.js").AgentTeamEditorDraft;
   agentTeamBinding: import("./controllers/agent-teams.js").AgentTeamBindingDraft;
+  agentTeamBindingPreview: import("./controllers/agent-teams.js").AgentTeamBindingPreview | null;
   agentTeamBindingResult: import("./types.js").AgentBindingsResult | null;
   agentTeamModelLoading: boolean;
   agentTeamModelError: string | null;
   agentTeamModelResult: import("./types.js").AgentModelsResult | null;
   agentTeamModelDraft: import("./controllers/agent-teams.js").AgentTeamModelDraft;
+  agentTeamWorkspaceLoading: boolean;
+  agentTeamWorkspaceSaving: boolean;
+  agentTeamWorkspaceError: string | null;
+  agentTeamWorkspace: import("./controllers/agent-teams.js").AgentTeamWorkspaceDraft;
   agentFilesLoading: boolean;
   agentFilesError: string | null;
   agentFilesList: AgentsFilesListResult | null;

@@ -208,11 +208,15 @@ Hard requirements:
 ### 6. `agents.bind` / `agents.unbind`
 
 Used by:
-- Agents page `Teams` panel binding action
+- Agents page `Teams` panel binding builder
 
 Control UI calls:
 - `agents.bind` with `{ "agentId": "<memberAgentId>", "bind": "channel[:accountId]" }`
 - `agents.unbind` with `{ "agentId": "<memberAgentId>", "bind": "channel[:accountId]" }`
+- For structured routes, `agents.bind` / `agents.unbind` may use
+  `{ "agentId": "<memberAgentId>", "bindings": [{ "type": "route", "agentId": "<memberAgentId>", "match": { ... } }] }`.
+  The UI builds a read-only preview locally before submit because no dedicated
+  binding preview RPC is currently part of this contract.
 
 Minimum response:
 
@@ -280,6 +284,7 @@ Hard requirements:
 
 Used by:
 - upstream UI agent file controller sources
+- Agents page `Teams` panel workspace profile editor
 
 Minimum response:
 
@@ -301,6 +306,8 @@ Minimum response:
 Hard requirements:
 - `files` must be an array.
 - UI checks `list.files.some(...)`.
+- Teams workspace profile editor filters the returned files to `SOUL.md`,
+  `AGENTS.md`, `IDENTITY.md`, `USER.md`, `TOOLS.md`, and `MEMORY.md`.
 
 ### 9. `agents.files.get`
 

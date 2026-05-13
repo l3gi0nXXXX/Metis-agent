@@ -6,11 +6,20 @@ import type {
   AgentTeam,
   AgentTeamMember,
   AgentTeamsListResult,
+  ChannelAccountSnapshot,
+  ChannelsStatusSnapshot,
 } from "../types.ts";
-import type {
-  AgentTeamBindingDraft,
-  AgentTeamEditorDraft,
-  AgentTeamModelDraft,
+import {
+  addAgentTeamMember,
+  AGENT_TEAM_PROFILE_FILES,
+  buildAgentTeamBindingPreview,
+  changeAgentTeamMember,
+  removeAgentTeamMember,
+  type AgentTeamBindingDraft,
+  type AgentTeamBindingPreview,
+  type AgentTeamEditorDraft,
+  type AgentTeamModelDraft,
+  type AgentTeamWorkspaceDraft,
 } from "../controllers/agent-teams.ts";
 
 export type AgentTeamsPanelState = {
@@ -23,11 +32,18 @@ export type AgentTeamsPanelState = {
   detail: AgentTeam | null;
   draft: AgentTeamEditorDraft;
   binding: AgentTeamBindingDraft;
+  bindingPreview: AgentTeamBindingPreview | null;
   bindingResult: AgentBindingsResult | null;
   modelLoading: boolean;
   modelError: string | null;
   modelResult: AgentModelsResult | null;
   modelDraft: AgentTeamModelDraft;
+  workspaceLoading: boolean;
+  workspaceSaving: boolean;
+  workspaceError: string | null;
+  workspace: AgentTeamWorkspaceDraft;
+  channelsSnapshot: ChannelsStatusSnapshot | null;
+  configForm: Record<string, unknown> | null;
 };
 
 export type AgentTeamsPanelProps = AgentTeamsPanelState & {
@@ -39,15 +55,21 @@ export type AgentTeamsPanelProps = AgentTeamsPanelState & {
   onUpdateTeam: () => void;
   onDeleteTeam: () => void;
   onBindingChange: (patch: Partial<AgentTeamBindingDraft>) => void;
+  onPreviewBinding: () => void;
   onApplyBinding: () => void;
   onModelDraftChange: (patch: Partial<AgentTeamModelDraft>) => void;
   onLoadModel: () => void;
   onSaveModel: () => void;
+  onWorkspaceChange: (patch: Partial<AgentTeamWorkspaceDraft>) => void;
+  onLoadWorkspaceFiles: () => void;
+  onLoadWorkspaceFile: (name: string) => void;
+  onSaveWorkspaceFile: () => void;
 };
 
 export function renderAgentTeamsPanel(props: AgentTeamsPanelProps) {
   const teams = props.list?.teams ?? [];
-  const members = props.detail?.members ?? [];
+  const draftMembers = safeMembersFromJson(props.draft.membersJson);
+  const activeMembers = draftMembers.length > 0 ? draftMembers : (props.detail?.members ?? []);
   const selectedTeamLabel = props.detail
     ? teamDisplayName(props.detail)
     : props.selectedId
@@ -55,176 +77,252 @@ export function renderAgentTeamsPanel(props: AgentTeamsPanelProps) {
       : "New team";
   return html`
     <section class="grid grid-cols-2">
-      <section class="card">
-        <div class="row" style="justify-content: space-between; align-items: flex-start;">
-          <div>
-            <div class="card-title">Agent Teams</div>
-            <div class="card-sub">Manage team definitions through Gateway AgentTeam RPC.</div>
-          </div>
-          <div class="row" style="gap: 8px;">
-            <button type="button" class="btn btn--sm" ?disabled=${props.loading} @click=${props.onRefresh}>
-              ${props.loading ? t("common.refreshing") : t("common.refresh")}
-            </button>
-            <button type="button" class="btn btn--sm btn--ghost" @click=${props.onNewTeam}>
-              New
-            </button>
-          </div>
-        </div>
-        ${props.error
-          ? html`<div class="callout danger" style="margin-top: 12px;">${props.error}</div>`
-          : nothing}
-        ${props.success
-          ? html`<div class="callout success" style="margin-top: 12px;">${props.success}</div>`
-          : nothing}
-        ${teams.length === 0
-          ? html`
-              <div class="callout info" style="margin-top: 12px;">
-                No teams are configured yet.
-              </div>
-            `
-          : html`
-              <div class="list" style="margin-top: 16px;">
-                ${teams.map(
-                  (team) => html`
-                    <button
-                      type="button"
-                      class="list-item"
-                      style="width: 100%; text-align: left;"
-                      @click=${() => props.onSelectTeam(team.id)}
-                      aria-pressed=${team.id === props.selectedId ? "true" : "false"}
-                    >
-                      <div class="list-main">
-                        <div class="list-title">${teamDisplayName(team)}</div>
-                        <div class="list-sub">
-                          ${team.members?.length ?? 0} members · default
-                          ${memberDisplayName(team.defaultAgentId, team.members ?? [])}
-                        </div>
-                      </div>
-                      <div class="list-meta">
-                        <span class="badge">${team.bindings?.length ?? 0} bindings</span>
-                      </div>
-                    </button>
-                  `,
-                )}
-              </div>
-            `}
-      </section>
+      ${renderTeamsList(props, teams)}
+      ${renderTeamEditor(props, selectedTeamLabel, draftMembers, activeMembers)}
+    </section>
 
-      <section class="card">
-        <div class="card-title">${selectedTeamLabel}</div>
-        <div class="card-sub">Create or update team metadata, members, aliases, and draft bindings.</div>
-        <div class="grid grid-cols-2" style="margin-top: 14px;">
-          <label class="field">
-            <span>Team key</span>
-            <input
-              .value=${props.draft.id}
-              ?disabled=${Boolean(props.detail)}
-              placeholder="content"
-              @input=${(e: Event) =>
-                props.onDraftChange({ id: (e.target as HTMLInputElement).value })}
-            />
-          </label>
-          <label class="field">
-            <span>Display name</span>
-            <input
-              .value=${props.draft.displayName}
-              placeholder="Content Team"
-              @input=${(e: Event) =>
-                props.onDraftChange({ displayName: (e.target as HTMLInputElement).value })}
-            />
-          </label>
-          <label class="field">
-            <span>Template for new team</span>
-            <select
-              .value=${props.draft.template}
-              ?disabled=${Boolean(props.detail)}
-              @change=${(e: Event) =>
-                props.onDraftChange({ template: (e.target as HTMLSelectElement).value })}
-            >
-              <option value="pm-writer-reviewer">PM / Writer / Reviewer</option>
-              <option value="">Custom members JSON</option>
-            </select>
-          </label>
-          <label class="field">
-            <span>Default member</span>
-            <select
-              .value=${props.draft.defaultAgentId}
-              @change=${(e: Event) =>
-                props.onDraftChange({ defaultAgentId: (e.target as HTMLSelectElement).value })}
-            >
-              <option value="">First member</option>
-              ${members.map(
-                (member) => html`
-                  <option value=${member.agentId}>${memberDisplayName(member.agentId, members)}</option>
+    <section class="grid grid-cols-2" style="margin-top: 16px;">
+      ${renderBindingCard(props, activeMembers)}
+      ${renderWorkspaceProfileCard(props, activeMembers)}
+    </section>
+
+    <section class="grid grid-cols-2" style="margin-top: 16px;">
+      ${renderModelCard(props, activeMembers)}
+      ${renderFeishuSettingsCard(props)}
+    </section>
+
+    <section style="margin-top: 16px;">
+      ${renderDoctorPanel(props, teams, activeMembers)}
+    </section>
+  `;
+}
+
+function renderTeamsList(props: AgentTeamsPanelProps, teams: AgentTeam[]) {
+  return html`
+    <section class="card">
+      <div class="row" style="justify-content: space-between; align-items: flex-start;">
+        <div>
+          <div class="card-title">Agent Teams</div>
+          <div class="card-sub">Manage team definitions through Gateway AgentTeam RPC.</div>
+        </div>
+        <div class="row" style="gap: 8px;">
+          <button type="button" class="btn btn--sm" ?disabled=${props.loading} @click=${props.onRefresh}>
+            ${props.loading ? t("common.refreshing") : t("common.refresh")}
+          </button>
+          <button type="button" class="btn btn--sm btn--ghost" @click=${props.onNewTeam}>
+            New
+          </button>
+        </div>
+      </div>
+      ${props.error ? html`<div class="callout danger" style="margin-top: 12px;">${props.error}</div>` : nothing}
+      ${props.success ? html`<div class="callout success" style="margin-top: 12px;">${props.success}</div>` : nothing}
+      ${teams.length === 0
+        ? html`<div class="callout info" style="margin-top: 12px;">No teams are configured yet.</div>`
+        : html`
+            <div class="list" style="margin-top: 16px;">
+              ${teams.map(
+                (team) => html`
+                  <button
+                    type="button"
+                    class="list-item"
+                    style="width: 100%; text-align: left;"
+                    @click=${() => props.onSelectTeam(team.id)}
+                    aria-pressed=${team.id === props.selectedId ? "true" : "false"}
+                  >
+                    <div class="list-main">
+                      <div class="list-title">${teamDisplayName(team)}</div>
+                      <div class="list-sub">
+                        ${team.members?.length ?? 0} members · default
+                        ${memberDisplayName(team.defaultAgentId, team.members ?? [])}
+                      </div>
+                    </div>
+                    <div class="list-meta">
+                      <span class="badge">${team.bindings?.length ?? 0} bindings</span>
+                    </div>
+                  </button>
                 `,
               )}
-            </select>
-          </label>
+            </div>
+          `}
+    </section>
+  `;
+}
+
+function renderTeamEditor(
+  props: AgentTeamsPanelProps,
+  selectedTeamLabel: string,
+  draftMembers: AgentTeamMember[],
+  activeMembers: AgentTeamMember[],
+) {
+  return html`
+    <section class="card">
+      <div class="card-title">${selectedTeamLabel}</div>
+      <div class="card-sub">Create teams, edit members, and keep JSON metadata available for compatibility.</div>
+      <div class="grid grid-cols-2" style="margin-top: 14px;">
+        <label class="field">
+          <span>Team key</span>
+          <input
+            .value=${props.draft.id}
+            ?disabled=${Boolean(props.detail)}
+            placeholder="content"
+            @input=${(e: Event) => props.onDraftChange({ id: inputValue(e) })}
+          />
+        </label>
+        <label class="field">
+          <span>Display name</span>
+          <input
+            .value=${props.draft.displayName}
+            placeholder="Content Team"
+            @input=${(e: Event) => props.onDraftChange({ displayName: inputValue(e) })}
+          />
+        </label>
+        <label class="field">
+          <span>Template</span>
+          <select
+            .value=${props.draft.template}
+            ?disabled=${Boolean(props.detail) || draftMembers.length > 0}
+            @change=${(e: Event) => props.onDraftChange({ template: selectValue(e) })}
+          >
+            <option value="pm-writer-reviewer">PM / Writer / Reviewer</option>
+            <option value="">Custom members</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>Default member</span>
+          <select
+            .value=${props.draft.defaultAgentId}
+            @change=${(e: Event) => props.onDraftChange({ defaultAgentId: selectValue(e) })}
+          >
+            <option value="">First member</option>
+            ${activeMembers.map(
+              (member) => html`
+                <option value=${member.agentId}>${memberDisplayName(member.agentId, activeMembers)}</option>
+              `,
+            )}
+          </select>
+        </label>
+      </div>
+
+      <div class="row" style="justify-content: space-between; margin-top: 16px;">
+        <div>
+          <div class="list-title">Members</div>
+          <div class="muted">Each member becomes an agent-scoped workspace and model profile.</div>
         </div>
-        ${renderJsonField("Members JSON", props.draft.membersJson, (membersJson) =>
-          props.onDraftChange({ membersJson }),
-        )}
+        <button
+          type="button"
+          class="btn btn--sm"
+          @click=${() => props.onDraftChange(addAgentTeamMember(props.draft))}
+        >
+          Add Member
+        </button>
+      </div>
+      ${draftMembers.length === 0
+        ? html`<div class="callout info" style="margin-top: 12px;">Use a template, or add members for a custom team.</div>`
+        : html`
+            <div class="list" style="margin-top: 12px;">
+              ${draftMembers.map((member, index) => renderMemberRow(props, member, index))}
+            </div>
+          `}
+
+      <details style="margin-top: 14px;">
+        <summary class="muted">Advanced metadata JSON</summary>
         ${renderJsonField("Aliases JSON", props.draft.aliasesJson, (aliasesJson) =>
           props.onDraftChange({ aliasesJson }),
         )}
         ${renderJsonField("Team bindings JSON", props.draft.bindingsJson, (bindingsJson) =>
           props.onDraftChange({ bindingsJson }),
         )}
-        <div class="agent-model-actions">
-          <button
-            type="button"
-            class="btn btn--sm primary"
-            ?disabled=${props.saving || Boolean(props.detail)}
-            @click=${props.onCreateTeam}
-          >
-            ${props.saving && !props.detail ? "Creating..." : "Create Team"}
-          </button>
-          <button
-            type="button"
-            class="btn btn--sm"
-            ?disabled=${props.saving || !props.detail}
-            @click=${props.onUpdateTeam}
-          >
-            ${props.saving && props.detail ? "Saving..." : "Save Team"}
-          </button>
-          <button
-            type="button"
-            class="btn btn--sm btn--ghost"
-            ?disabled=${props.saving || !props.detail}
-            @click=${props.onDeleteTeam}
-          >
-            Delete
-          </button>
-        </div>
-      </section>
-    </section>
+      </details>
 
-    <section class="grid grid-cols-2" style="margin-top: 16px;">
-      ${renderBindingCard(props, members)}
-      ${renderModelCard(props, members)}
+      <div class="agent-model-actions">
+        <button
+          type="button"
+          class="btn btn--sm primary"
+          ?disabled=${props.saving || Boolean(props.detail)}
+          @click=${props.onCreateTeam}
+        >
+          ${props.saving && !props.detail ? "Creating..." : "Create Team"}
+        </button>
+        <button
+          type="button"
+          class="btn btn--sm"
+          ?disabled=${props.saving || !props.detail}
+          @click=${props.onUpdateTeam}
+        >
+          ${props.saving && props.detail ? "Saving..." : "Save Team"}
+        </button>
+        <button
+          type="button"
+          class="btn btn--sm btn--ghost"
+          ?disabled=${props.saving || !props.detail}
+          @click=${props.onDeleteTeam}
+        >
+          Delete
+        </button>
+      </div>
     </section>
   `;
 }
 
+function renderMemberRow(props: AgentTeamsPanelProps, member: AgentTeamMember, index: number) {
+  return html`
+    <div class="list-item">
+      <div class="list-main">
+        <div class="grid grid-cols-3">
+          <label class="field">
+            <span>Agent id</span>
+            <input
+              .value=${member.agentId ?? ""}
+              placeholder="content-writer"
+              @input=${(e: Event) =>
+                props.onDraftChange(changeAgentTeamMember(props.draft, index, { agentId: inputValue(e) }))}
+            />
+          </label>
+          <label class="field">
+            <span>Role</span>
+            <input
+              .value=${member.role ?? ""}
+              placeholder="writer"
+              @input=${(e: Event) =>
+                props.onDraftChange(changeAgentTeamMember(props.draft, index, { role: inputValue(e) }))}
+            />
+          </label>
+          <label class="field">
+            <span>Name</span>
+            <input
+              .value=${member.name ?? ""}
+              placeholder="Writer"
+              @input=${(e: Event) =>
+                props.onDraftChange(changeAgentTeamMember(props.draft, index, { name: inputValue(e) }))}
+            />
+          </label>
+        </div>
+      </div>
+      <div class="list-meta">
+        <button
+          type="button"
+          class="btn btn--sm btn--ghost"
+          @click=${() => props.onDraftChange(removeAgentTeamMember(props.draft, index))}
+        >
+          Remove
+        </button>
+      </div>
+    </div>
+  `;
+}
+
 function renderBindingCard(props: AgentTeamsPanelProps, members: AgentTeamMember[]) {
+  const preview = props.bindingPreview ?? buildAgentTeamBindingPreview(props.binding);
   return html`
     <section class="card">
-      <div class="card-title">Member Binding</div>
-      <div class="card-sub">Apply or remove a channel/account route through Gateway binding RPC.</div>
+      <div class="card-title">Binding Builder</div>
+      <div class="card-sub">Build channel/account/peer/thread/group/team/role routes before applying them.</div>
       <div class="grid grid-cols-2" style="margin-top: 14px;">
         <label class="field">
           <span>Member</span>
-          <select
-            .value=${props.binding.agentId}
-            @change=${(e: Event) =>
-              props.onBindingChange({ agentId: (e.target as HTMLSelectElement).value })}
-          >
+          <select .value=${props.binding.agentId} @change=${(e: Event) => props.onBindingChange({ agentId: selectValue(e) })}>
             <option value="">Choose member</option>
-            ${members.map(
-              (member) => html`
-                <option value=${member.agentId}>${memberDisplayName(member.agentId, members)}</option>
-              `,
-            )}
+            ${members.map((member) => html`<option value=${member.agentId}>${memberDisplayName(member.agentId, members)}</option>`)}
           </select>
         </label>
         <label class="field">
@@ -232,41 +330,171 @@ function renderBindingCard(props: AgentTeamsPanelProps, members: AgentTeamMember
           <select
             .value=${props.binding.mode}
             @change=${(e: Event) =>
-              props.onBindingChange({
-                mode: (e.target as HTMLSelectElement).value === "unbind" ? "unbind" : "bind",
-              })}
+              props.onBindingChange({ mode: selectValue(e) === "unbind" ? "unbind" : "bind" })}
           >
             <option value="bind">Apply</option>
             <option value="unbind">Remove</option>
           </select>
         </label>
+        <label class="field">
+          <span>Payload type</span>
+          <select
+            .value=${props.binding.useStructuredBinding ? "structured" : "simple"}
+            @change=${(e: Event) =>
+              props.onBindingChange({ useStructuredBinding: selectValue(e) === "structured" })}
+          >
+            <option value="simple">Simple binding</option>
+            <option value="structured">JSON route binding</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>Simple binding</span>
+          <input
+            .value=${props.binding.spec}
+            placeholder="feishu:tenant-a"
+            @input=${(e: Event) => props.onBindingChange({ spec: inputValue(e) })}
+          />
+        </label>
+        ${renderBindingTextInput(props, "Channel", "channel", "feishu")}
+        ${renderBindingTextInput(props, "Account", "accountId", "tenant-a")}
+        ${renderBindingTextInput(props, "Peer kind", "peerKind", "group")}
+        ${renderBindingTextInput(props, "Peer id", "peer", "chat:oc_123")}
+        ${renderBindingTextInput(props, "Thread", "thread", "thread:om_456")}
+        ${renderBindingTextInput(props, "Group", "group", "chat:oc_123")}
+        ${renderBindingTextInput(props, "Team", "team", "content")}
+        ${renderBindingTextInput(props, "Roles", "roles", "writer,reviewer")}
       </div>
       <label class="field" style="margin-top: 12px;">
-        <span>Channel binding</span>
+        <span>Comment</span>
         <input
-          .value=${props.binding.spec}
-          placeholder="telegram:bot-a"
-          @input=${(e: Event) =>
-            props.onBindingChange({ spec: (e.target as HTMLInputElement).value })}
+          .value=${props.binding.comment}
+          placeholder="content team route"
+          @input=${(e: Event) => props.onBindingChange({ comment: inputValue(e) })}
         />
       </label>
       <div class="agent-model-actions">
+        <button type="button" class="btn btn--sm" @click=${props.onPreviewBinding}>Preview</button>
         <button
           type="button"
           class="btn btn--sm primary"
-          ?disabled=${props.saving || !props.binding.agentId || !props.binding.spec.trim()}
+          ?disabled=${props.saving || !props.binding.agentId || !preview.applyPayload}
           @click=${props.onApplyBinding}
         >
           ${props.binding.mode === "unbind" ? "Remove Binding" : "Apply Binding"}
         </button>
       </div>
+      <div class="callout info" style="margin-top: 12px;">
+        <pre style="white-space: pre-wrap; margin: 0;">${preview.lines.join("\n")}</pre>
+      </div>
       ${props.bindingResult
+        ? html`<div class="callout success" style="margin-top: 12px;">${bindingSummary(props.bindingResult)}</div>`
+        : nothing}
+    </section>
+  `;
+}
+
+function renderBindingTextInput(
+  props: AgentTeamsPanelProps,
+  label: string,
+  key: keyof AgentTeamBindingDraft,
+  placeholder: string,
+) {
+  return html`
+    <label class="field">
+      <span>${label}</span>
+      <input
+        .value=${String(props.binding[key] ?? "")}
+        placeholder=${placeholder}
+        @input=${(e: Event) => props.onBindingChange({ [key]: inputValue(e) } as Partial<AgentTeamBindingDraft>)}
+      />
+    </label>
+  `;
+}
+
+function renderWorkspaceProfileCard(props: AgentTeamsPanelProps, members: AgentTeamMember[]) {
+  return html`
+    <section class="card">
+      <div class="card-title">Workspace Profiles</div>
+      <div class="card-sub">Edit SOUL, AGENTS, IDENTITY, USER, TOOLS, and MEMORY via agents.files RPC.</div>
+      ${props.workspaceError
+        ? html`<div class="callout danger" style="margin-top: 12px;">${props.workspaceError}</div>`
+        : nothing}
+      <div class="grid grid-cols-2" style="margin-top: 14px;">
+        <label class="field">
+          <span>Member</span>
+          <select
+            .value=${props.workspace.agentId}
+            @change=${(e: Event) => props.onWorkspaceChange({ agentId: selectValue(e) })}
+          >
+            <option value="">Choose member</option>
+            ${members.map((member) => html`<option value=${member.agentId}>${memberDisplayName(member.agentId, members)}</option>`)}
+          </select>
+        </label>
+        <label class="field">
+          <span>Profile file</span>
+          <select
+            .value=${props.workspace.fileName}
+            @change=${(e: Event) => {
+              const name = selectValue(e);
+              props.onWorkspaceChange({ fileName: name });
+              props.onLoadWorkspaceFile(name);
+            }}
+          >
+            ${AGENT_TEAM_PROFILE_FILES.map((name) => html`<option value=${name}>${name}</option>`)}
+          </select>
+        </label>
+      </div>
+      ${props.workspace.workspace
         ? html`
-            <div class="callout info" style="margin-top: 12px;">
-              ${bindingSummary(props.bindingResult)}
+            <div class="agent-kv" style="margin-top: 12px;">
+              <div class="label">Workspace</div>
+              <div class="mono">${props.workspace.workspace}</div>
             </div>
           `
         : nothing}
+      ${props.workspace.path
+        ? html`
+            <div class="agent-kv" style="margin-top: 12px;">
+              <div class="label">File path</div>
+              <div class="mono">${props.workspace.path}</div>
+            </div>
+          `
+        : nothing}
+      <label class="field agent-file-field" style="margin-top: 12px;">
+        <span>${props.workspace.fileName}</span>
+        <textarea
+          class="agent-file-textarea"
+          rows="12"
+          .value=${props.workspace.draft}
+          @input=${(e: Event) => props.onWorkspaceChange({ draft: textareaValue(e) })}
+        ></textarea>
+      </label>
+      <div class="agent-model-actions">
+        <button
+          type="button"
+          class="btn btn--sm"
+          ?disabled=${props.workspaceLoading || !props.workspace.agentId}
+          @click=${props.onLoadWorkspaceFiles}
+        >
+          ${props.workspaceLoading ? "Loading..." : "List Files"}
+        </button>
+        <button
+          type="button"
+          class="btn btn--sm"
+          ?disabled=${props.workspaceLoading || !props.workspace.agentId || !props.workspace.fileName}
+          @click=${() => props.onLoadWorkspaceFile(props.workspace.fileName)}
+        >
+          Load
+        </button>
+        <button
+          type="button"
+          class="btn btn--sm primary"
+          ?disabled=${props.workspaceSaving || !props.workspace.agentId || !props.workspace.fileName}
+          @click=${props.onSaveWorkspaceFile}
+        >
+          ${props.workspaceSaving ? "Saving..." : "Save"}
+        </button>
+      </div>
     </section>
   `;
 }
@@ -275,25 +503,18 @@ function renderModelCard(props: AgentTeamsPanelProps, members: AgentTeamMember[]
   const model = props.modelResult?.models ?? null;
   return html`
     <section class="card">
-      <div class="card-title">Member Model</div>
+      <div class="card-title">Model Editor</div>
       <div class="card-sub">Read and write per-agent models.json through Gateway.</div>
-      ${props.modelError
-        ? html`<div class="callout danger" style="margin-top: 12px;">${props.modelError}</div>`
-        : nothing}
+      ${props.modelError ? html`<div class="callout danger" style="margin-top: 12px;">${props.modelError}</div>` : nothing}
       <div class="grid grid-cols-2" style="margin-top: 14px;">
         <label class="field">
           <span>Member</span>
           <select
             .value=${props.modelDraft.agentId}
-            @change=${(e: Event) =>
-              props.onModelDraftChange({ agentId: (e.target as HTMLSelectElement).value })}
+            @change=${(e: Event) => props.onModelDraftChange({ agentId: selectValue(e) })}
           >
             <option value="">Choose member</option>
-            ${members.map(
-              (member) => html`
-                <option value=${member.agentId}>${memberDisplayName(member.agentId, members)}</option>
-              `,
-            )}
+            ${members.map((member) => html`<option value=${member.agentId}>${memberDisplayName(member.agentId, members)}</option>`)}
           </select>
         </label>
         <div class="field">
@@ -312,10 +533,7 @@ function renderModelCard(props: AgentTeamsPanelProps, members: AgentTeamMember[]
           <input
             .value=${props.modelDraft.primaryModelRef}
             placeholder="openai:gpt-5-mini"
-            @input=${(e: Event) =>
-              props.onModelDraftChange({
-                primaryModelRef: (e.target as HTMLInputElement).value,
-              })}
+            @input=${(e: Event) => props.onModelDraftChange({ primaryModelRef: inputValue(e) })}
           />
         </label>
         <label class="field">
@@ -323,10 +541,7 @@ function renderModelCard(props: AgentTeamsPanelProps, members: AgentTeamMember[]
           <input
             .value=${props.modelDraft.runtimePrimaryModelRef}
             placeholder="openai:gpt-5-mini"
-            @input=${(e: Event) =>
-              props.onModelDraftChange({
-                runtimePrimaryModelRef: (e.target as HTMLInputElement).value,
-              })}
+            @input=${(e: Event) => props.onModelDraftChange({ runtimePrimaryModelRef: inputValue(e) })}
           />
         </label>
       </div>
@@ -363,6 +578,88 @@ function renderModelCard(props: AgentTeamsPanelProps, members: AgentTeamMember[]
   `;
 }
 
+function renderFeishuSettingsCard(props: AgentTeamsPanelProps) {
+  const feishu = resolveFeishuSettings(props);
+  return html`
+    <section class="card">
+      <div class="card-title">Feishu Settings</div>
+      <div class="card-sub">Non-secret channel settings and account runtime snapshot.</div>
+      <div class="agents-overview-grid" style="margin-top: 14px;">
+        <div class="agent-kv">
+          <div class="label">Default Account</div>
+          <div class="mono">${feishu.defaultAccount || "not configured"}</div>
+        </div>
+        <div class="agent-kv">
+          <div class="label">Thread Session</div>
+          <div>${feishu.threadSession}</div>
+        </div>
+        <div class="agent-kv">
+          <div class="label">Groups</div>
+          <div>${feishu.groupCount}</div>
+        </div>
+        <div class="agent-kv">
+          <div class="label">Accounts</div>
+          <div>${feishu.accounts.length}</div>
+        </div>
+      </div>
+      ${feishu.accounts.length === 0
+        ? html`<div class="callout info" style="margin-top: 12px;">No Feishu accounts are visible in channels.status yet.</div>`
+        : html`
+            <div class="list" style="margin-top: 12px;">
+              ${feishu.accounts.map(
+                (account) => html`
+                  <div class="list-item">
+                    <div class="list-main">
+                      <div class="list-title">${account.name || account.accountId}</div>
+                      <div class="list-sub mono">${account.accountId}</div>
+                    </div>
+                    <div class="list-meta">
+                      <div>${account.configured ? "configured" : "not configured"}</div>
+                      <div>${account.running || account.connected ? "active" : "stopped"}</div>
+                    </div>
+                  </div>
+                `,
+              )}
+            </div>
+          `}
+    </section>
+  `;
+}
+
+function renderDoctorPanel(
+  props: AgentTeamsPanelProps,
+  teams: AgentTeam[],
+  members: AgentTeamMember[],
+) {
+  const items = buildDoctorItems(props, teams, members);
+  return html`
+    <section class="card">
+      <div class="row" style="justify-content: space-between;">
+        <div>
+          <div class="card-title">Doctor</div>
+          <div class="card-sub">Local UI checks for team, binding, model, profile, and Feishu readiness.</div>
+        </div>
+        <button type="button" class="btn btn--sm" ?disabled=${props.loading} @click=${props.onRefresh}>
+          ${props.loading ? t("common.refreshing") : t("common.refresh")}
+        </button>
+      </div>
+      <div class="list" style="margin-top: 14px;">
+        ${items.map(
+          (item) => html`
+            <div class="list-item">
+              <div class="list-main">
+                <div class="list-title">${item.title}</div>
+                <div class="list-sub">${item.message}</div>
+              </div>
+              <div class="list-meta"><span class="badge">${item.status}</span></div>
+            </div>
+          `,
+        )}
+      </div>
+    </section>
+  `;
+}
+
 function renderJsonField(label: string, value: string, onChange: (value: string) => void) {
   return html`
     <label class="field agent-file-field" style="margin-top: 12px;">
@@ -371,7 +668,7 @@ function renderJsonField(label: string, value: string, onChange: (value: string)
         class="agent-file-textarea"
         rows="6"
         .value=${value}
-        @input=${(e: Event) => onChange((e.target as HTMLTextAreaElement).value)}
+        @input=${(e: Event) => onChange(textareaValue(e))}
       ></textarea>
     </label>
   `;
@@ -402,4 +699,109 @@ function bindingSummary(result: AgentBindingsResult) {
     result.conflicts?.length ? `${result.conflicts.length} conflicts` : "",
   ].filter(Boolean);
   return parts.length ? parts.join(", ") : "Gateway accepted the binding request.";
+}
+
+function safeMembersFromJson(text: string): AgentTeamMember[] {
+  try {
+    const parsed = JSON.parse(text || "[]") as unknown;
+    return Array.isArray(parsed) ? (parsed as AgentTeamMember[]) : [];
+  } catch (_err) {
+    return [];
+  }
+}
+
+function resolveFeishuSettings(props: AgentTeamsPanelProps): {
+  defaultAccount: string;
+  threadSession: string;
+  groupCount: number;
+  accounts: ChannelAccountSnapshot[];
+} {
+  const gateway = objectValue(props.configForm?.gateway);
+  const feishu = objectValue(gateway?.feishu ?? props.configForm?.feishu);
+  const accountsObject = objectValue(feishu?.accounts);
+  const groupsObject = objectValue(feishu?.groups);
+  const runtimeAccounts = props.channelsSnapshot?.channelAccounts?.feishu ?? [];
+  const configuredAccounts = accountsObject ? Object.keys(accountsObject) : [];
+  const defaultAccount =
+    stringOrEmpty(feishu?.defaultAccount) ||
+    props.channelsSnapshot?.channelDefaultAccountId?.feishu ||
+    runtimeAccounts[0]?.accountId ||
+    configuredAccounts[0] ||
+    "";
+  const accounts =
+    runtimeAccounts.length > 0
+      ? runtimeAccounts
+      : configuredAccounts.map((accountId) => ({ accountId, configured: true }));
+  return {
+    defaultAccount,
+    threadSession: stringOrEmpty(feishu?.threadSession) || stringOrEmpty(feishu?.groupSessionScope) || "not configured",
+    groupCount: groupsObject ? Object.keys(groupsObject).length : 0,
+    accounts,
+  };
+}
+
+function buildDoctorItems(
+  props: AgentTeamsPanelProps,
+  teams: AgentTeam[],
+  members: AgentTeamMember[],
+): Array<{ title: string; message: string; status: string }> {
+  return [
+    {
+      title: "Teams list",
+      message: teams.length > 0 ? `${teams.length} team definitions loaded.` : "No team definitions loaded.",
+      status: teams.length > 0 ? "ok" : "info",
+    },
+    {
+      title: "Members",
+      message: members.length > 0 ? `${members.length} members available for edit.` : "No members selected.",
+      status: members.length > 0 ? "ok" : "warn",
+    },
+    {
+      title: "Binding preview",
+      message: props.bindingPreview?.applyPayload ? "Apply payload is ready." : "Preview a binding before applying.",
+      status: props.bindingPreview?.applyPayload ? "ok" : "info",
+    },
+    {
+      title: "Workspace profiles",
+      message: props.workspace.workspace
+        ? `Workspace loaded: ${props.workspace.workspace}`
+        : "Choose a member and list files.",
+      status: props.workspace.workspace ? "ok" : "info",
+    },
+    {
+      title: "Model profile",
+      message: props.modelResult?.models?.path ? `models.json: ${props.modelResult.models.path}` : "Load a member model.",
+      status: props.modelResult?.models?.path ? "ok" : "info",
+    },
+    {
+      title: "Feishu accounts",
+      message:
+        (props.channelsSnapshot?.channelAccounts?.feishu ?? []).length > 0
+          ? "Feishu account status is visible."
+          : "No Feishu account status in channels.status.",
+      status: (props.channelsSnapshot?.channelAccounts?.feishu ?? []).length > 0 ? "ok" : "info",
+    },
+  ];
+}
+
+function objectValue(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function stringOrEmpty(value: unknown): string {
+  return typeof value === "string" ? value : "";
+}
+
+function inputValue(event: Event): string {
+  return (event.target as HTMLInputElement).value;
+}
+
+function selectValue(event: Event): string {
+  return (event.target as HTMLSelectElement).value;
+}
+
+function textareaValue(event: Event): string {
+  return (event.target as HTMLTextAreaElement).value;
 }
