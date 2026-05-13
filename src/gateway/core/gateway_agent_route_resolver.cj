@@ -19,6 +19,9 @@ public class GatewayAgentRouteInput {
     public let roles: Array<String>
     public let dmScope: String
     public let mainDmOwnerId: String
+    public let explicitAgentId: String
+    public let explicitMatchedBy: String
+    public let diagnostics: Array<String>
 
     public init(
         root: JsonObject,
@@ -34,7 +37,10 @@ public class GatewayAgentRouteInput {
         teamId!: String = "",
         roles!: Array<String> = [],
         dmScope!: String = "main",
-        mainDmOwnerId!: String = ""
+        mainDmOwnerId!: String = "",
+        explicitAgentId!: String = "",
+        explicitMatchedBy!: String = "",
+        diagnostics!: Array<String> = []
     ) {
         this.root = root
         this.channel = gatewayRouteToken(channel)
@@ -50,6 +56,9 @@ public class GatewayAgentRouteInput {
         this.roles = gatewayRouteNormalizeArray(roles)
         this.dmScope = gatewayRouteToken(dmScope)
         this.mainDmOwnerId = mainDmOwnerId.trimAscii()
+        this.explicitAgentId = explicitAgentId.trimAscii()
+        this.explicitMatchedBy = explicitMatchedBy.trimAscii()
+        this.diagnostics = diagnostics
     }
 }
 
@@ -559,18 +568,28 @@ public func gatewayResolveAgentRoute(input: GatewayAgentRouteInput): GatewayAgen
     }
     let fallbackAgentId = gatewayRouteDefaultAgentId(input.root)
     let diagnostics = ArrayList<String>()
+    for (diagnostic in input.diagnostics) {
+        if (!diagnostic.trimAscii().isEmpty()) {
+            diagnostics.add(diagnostic.trimAscii())
+        }
+    }
 
     var agentId = fallbackAgentId
     var matchedBy = "default"
     var preferredAccountId = defaultAccountId
-    match (gatewayRoutePickCandidate(input, accountId, defaultAccountId)) {
-        case Some(candidate) =>
-            agentId = candidate.agentId
-            matchedBy = candidate.matchedBy
-            if (candidate.accountExplicit && candidate.accountPattern != "*") {
-                preferredAccountId = candidate.accountPattern
-            }
-        case None => ()
+    if (!input.explicitAgentId.isEmpty()) {
+        agentId = gatewayRouteSanitizeAgentId(input.explicitAgentId)
+        matchedBy = if (!input.explicitMatchedBy.isEmpty()) { input.explicitMatchedBy } else { "explicit.agentId" }
+    } else {
+        match (gatewayRoutePickCandidate(input, accountId, defaultAccountId)) {
+            case Some(candidate) =>
+                agentId = candidate.agentId
+                matchedBy = candidate.matchedBy
+                if (candidate.accountExplicit && candidate.accountPattern != "*") {
+                    preferredAccountId = candidate.accountPattern
+                }
+            case None => ()
+        }
     }
 
     if (!gatewayRouteAgentExists(input.root, agentId)) {
