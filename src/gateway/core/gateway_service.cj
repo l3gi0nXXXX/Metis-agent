@@ -1,7 +1,7 @@
 package metis.gateway.core
 
 import metis.core.{GatewayToolRuntimeContext, gatewaySpeechResolveDeliveryPrefs, gatewaySpeechResolveTtsConfig, gatewaySpeechTtsSynthesize, gatewayWithToolRuntimeContext, renderGatewayTopicEditText}
-import metis.core.config.{CliConfig, CliSettingManager, GatewayUserSettings, MetisConfigManager, cliFindModelAuthChoicesForProvider, cliSetupVisibleModelProviders}
+import metis.core.config.{CliConfig, CliSettingManager, GatewayUserSettings, MetisConfigManager, MetisPaths, cliFindModelAuthChoicesForProvider, cliSetupVisibleModelProviders}
 import metis.core.skills.SkillsPrompt
 import metis.gateway.model.*
 import metis.gateway.session.{GatewaySessionContext, gatewayResolveSessionContext, gatewaySessionRequestFromInbound}
@@ -130,6 +130,10 @@ public class GatewayService {
         LogUtils.info(
             "Gateway.inbound: channel=${channelToString(message.channel)}, account=${effectiveAccountId}, chatType=${chatTypeToString(message.chatType)}, sender=${message.senderId}, peer=${message.peerId}, text='${message.text}'"
         )
+        let user = CliSettingManager.readGatewaySettings()
+        if (channelToString(message.channel) == "feishu" && this.handleFeishuNativeCommand(message, effectiveAccountId, user)) {
+            return
+        }
         let decision = this.router.route(message)
         LogUtils.info("Gateway.route: accepted=${decision.accepted}, reason=${decision.reason}")
         if (!decision.accepted) {
@@ -137,7 +141,6 @@ public class GatewayService {
             return
         }
 
-        let user = CliSettingManager.readGatewaySettings()
         var conversationKey = decision.conversationKey.getOrThrow()
         let telegramAutoVoiceReply = channelToString(message.channel) == "telegram" &&
             this.telegramShouldUseVoiceReply(user, message)
@@ -410,6 +413,227 @@ public class GatewayService {
             case None => ()
         }
         LogUtils.info("Gateway.systemEvent: channel=${channelToString(message.channel)} session=${context.sessionKey} kind=${kind}")
+    }
+
+    private func handleFeishuNativeCommand(message: InboundMessage, accountId: String, user: GatewayUserSettings): Bool {
+        let command = this.feishuNativeCommandNameFromText(message.text)
+        if (command.isEmpty()) {
+            return false
+        }
+        let reply = match (command) {
+            case "start" => this.renderFeishuStartCommand(message, accountId, user)
+            case "doctor" => this.renderFeishuDoctorCommand(message, accountId, user)
+            case "auth" => this.renderFeishuAuthCommand(accountId, user)
+            case "info" => this.renderFeishuInfoCommand(accountId, user)
+            case _ => this.renderFeishuHelpCommand()
+        }
+        this.sendTextToPeerDetailed(
+            "feishu",
+            message.peerId,
+            reply,
+            replyToMessageId: message.replyTargetMessageId,
+            replyInThread: message.replyInThread,
+            accountId: accountId
+        )
+        LogUtils.info("Gateway.feishu.nativeCommand: command=${command} account=${accountId} peer=${message.peerId}")
+        return true
+    }
+
+    private func feishuNativeCommandNameFromText(text: String): String {
+        let raw = text.trimAscii()
+        let normalized = raw.toAsciiLower()
+        if (normalized == "/feishu" || normalized == "/feishu help" || normalized == "/feishu_help") {
+            return "help"
+        }
+        if (normalized == "/feishu start" || normalized == "/feishu_start") {
+            return "start"
+        }
+        if (normalized == "/feishu doctor" || normalized == "/feishu_doctor") {
+            return "doctor"
+        }
+        if (normalized == "/feishu auth" || normalized == "/feishu_auth" ||
+            normalized == "/feishu onboarding" || normalized == "/feishu_onboarding") {
+            return "auth"
+        }
+        if (normalized == "/feishu info" || normalized == "/feishu info --all" ||
+            normalized == "/feishu_info" || normalized == "/feishu_info --all" ||
+            normalized == "info --all") {
+            return "info"
+        }
+        ""
+    }
+
+    private func renderFeishuHelpCommand(): String {
+        "Metis Feishu commands\n" +
+            "- /feishu start: validate Feishu gateway and AgentTeam routing basics\n" +
+            "- /feishu doctor: run read-only diagnostics\n" +
+            "- /feishu auth: show authorization status and next steps\n" +
+            "- /feishu info --all: show redacted runtime information"
+    }
+
+    private func renderFeishuStartCommand(message: InboundMessage, accountId: String, user: GatewayUserSettings): String {
+        let lines = ArrayList<String>()
+        lines.add("Metis Feishu start")
+        lines.add("version: ${CliConfig.version}")
+        lines.add("accountId: ${this.feishuNativeAccountId(accountId, user)}")
+        lines.add("receiveMode: ${user.feishu.receiveMode}")
+        lines.add("peer: ${message.peerId}")
+        lines.add("threadSession: ${if (user.feishu.threadSession) { "enabled" } else { "disabled" }}")
+        lines.add("route: AgentTeam bindings=${this.feishuNativeBindingsCount()} agents=${this.feishuNativeAgentsCount()}")
+        if (!this.feishuNativeHasCredentials(accountId, user)) {
+            lines.add("warning: appId/appSecret is missing for this account.")
+        }
+        String.join(lines.toArray(), delimiter: "\n")
+    }
+
+    private func renderFeishuDoctorCommand(_message: InboundMessage, accountId: String, user: GatewayUserSettings): String {
+        let lines = ArrayList<String>()
+        lines.add("Metis Feishu doctor")
+        lines.add("version: ${CliConfig.version}")
+        lines.add("accountId: ${this.feishuNativeAccountId(accountId, user)}")
+        lines.add("receiveMode: ${user.feishu.receiveMode}")
+        lines.add("enabled: ${if (user.feishu.enabled) { "true" } else { "false" }}")
+        lines.add("credentials: ${if (this.feishuNativeHasCredentials(accountId, user)) { "configured" } else { "missing appId/appSecret" }}")
+        lines.add("threadSession: ${if (user.feishu.threadSession) { "enabled" } else { "disabled" }}")
+        lines.add("groupPolicy: ${user.feishu.groupPolicy}")
+        lines.add("requireMention: ${if (user.feishu.requireMention) { "true" } else { "false" }}")
+        if (this.feishuNativeBindingsCount() == 0) {
+            lines.add("bindings: missing")
+        } else {
+            lines.add("bindings: ${this.feishuNativeBindingsCount()}")
+        }
+        let rawRoot = match (MetisConfigManager.rawConfig()) {
+            case Some(root) => root
+            case None => JsonObject()
+        }
+        let scan = gatewayAgentTeamDoctorScan(
+            rawRoot,
+            homeRoot: MetisPaths.homeRootReadOnly(),
+            defaultWorkspace: MetisPaths.workspaceRootReadOnly()
+        )
+        let findings = this.feishuNativeJsonArray(scan, "findings")
+        lines.add("agentTeamFindings: ${findings.size()}")
+        for (i in 0..findings.size()) {
+            if (i >= 5) {
+                lines.add("... ${findings.size() - 5} more finding(s)")
+                break
+            }
+            let finding = try { findings[i].asObject() } catch (_e: Exception) { JsonObject() }
+            let severity = this.feishuNativeJsonString(finding, "severity")
+            let code = this.feishuNativeJsonString(finding, "code")
+            let reason = this.feishuNativeJsonString(finding, "reason")
+            lines.add("- ${severity} ${code}: ${reason}")
+        }
+        lines.add("redaction: secrets are not displayed")
+        String.join(lines.toArray(), delimiter: "\n")
+    }
+
+    private func renderFeishuAuthCommand(accountId: String, user: GatewayUserSettings): String {
+        let lines = ArrayList<String>()
+        lines.add("Metis Feishu auth")
+        lines.add("accountId: ${this.feishuNativeAccountId(accountId, user)}")
+        lines.add("app credentials: ${if (this.feishuNativeHasCredentials(accountId, user)) { "configured" } else { "missing appId/appSecret" }}")
+        lines.add("OAuth/user authorization: not completed by Metis native command.")
+        lines.add("Next step: configure Feishu app permissions in the Feishu developer console, then use Control UI or metis.json to bind accounts and agents.")
+        String.join(lines.toArray(), delimiter: "\n")
+    }
+
+    private func renderFeishuInfoCommand(accountId: String, user: GatewayUserSettings): String {
+        let lines = ArrayList<String>()
+        lines.add("Metis Feishu info --all")
+        lines.add("version: ${CliConfig.version}")
+        lines.add("accountId: ${this.feishuNativeAccountId(accountId, user)}")
+        lines.add("defaultAccount: ${user.feishu.defaultAccount}")
+        lines.add("domain: ${user.feishu.domain}")
+        lines.add("receiveMode: ${user.feishu.receiveMode}")
+        lines.add("webhookPath: ${user.feishu.webhookPath}")
+        lines.add("appId: ${this.feishuNativeRedactedValue(user.feishu.appId)}")
+        lines.add("appSecret: ${if (user.feishu.appSecret.trimAscii().isEmpty()) { "" } else { "[redacted]" }}")
+        lines.add("accounts: ${this.feishuNativeAccountsCount(user)}")
+        lines.add("bindings: ${this.feishuNativeBindingsCount()}")
+        lines.add("agents: ${this.feishuNativeAgentsCount()}")
+        lines.add("media.downloadEnabled: ${if (user.feishu.media.downloadEnabled) { "true" } else { "false" }}")
+        lines.add("media.downloadRoot: ${user.feishu.media.downloadRoot}")
+        String.join(lines.toArray(), delimiter: "\n")
+    }
+
+    private func feishuNativeAccountId(accountId: String, user: GatewayUserSettings): String {
+        let normalized = accountId.trimAscii()
+        if (!normalized.isEmpty()) {
+            return normalized
+        }
+        if (!user.feishu.defaultAccount.trimAscii().isEmpty()) {
+            return user.feishu.defaultAccount.trimAscii()
+        }
+        "default"
+    }
+
+    private func feishuNativeHasCredentials(accountId: String, user: GatewayUserSettings): Bool {
+        if (!user.feishu.appId.trimAscii().isEmpty() && !user.feishu.appSecret.trimAscii().isEmpty()) {
+            return true
+        }
+        let accountConfig = this.feishuNativeAccountConfig(accountId, user)
+        !this.feishuNativeJsonString(accountConfig, "appId").isEmpty() && !this.feishuNativeJsonString(accountConfig, "appSecret").isEmpty()
+    }
+
+    private func feishuNativeAccountConfig(accountId: String, user: GatewayUserSettings): JsonObject {
+        let normalized = this.feishuNativeAccountId(accountId, user)
+        match (user.feishu.accounts) {
+            case Some(accounts) =>
+                match (accounts.get(normalized)) {
+                    case Some(v) => try { v.asObject() } catch (_e: Exception) { JsonObject() }
+                    case None => JsonObject()
+                }
+            case None => JsonObject()
+        }
+    }
+
+    private func feishuNativeAccountsCount(user: GatewayUserSettings): Int64 {
+        match (user.feishu.accounts) {
+            case Some(accounts) => accounts.size()
+            case None => if (user.feishu.appId.trimAscii().isEmpty()) { 0 } else { 1 }
+        }
+    }
+
+    private func feishuNativeBindingsCount(): Int64 {
+        let root = match (MetisConfigManager.rawConfig()) {
+            case Some(value) => value
+            case None => JsonObject()
+        }
+        this.feishuNativeJsonArray(root, "bindings").size()
+    }
+
+    private func feishuNativeAgentsCount(): Int64 {
+        let root = match (MetisConfigManager.rawConfig()) {
+            case Some(value) => value
+            case None => JsonObject()
+        }
+        this.feishuNativeJsonArray(root, "agents").size()
+    }
+
+    private func feishuNativeRedactedValue(value: String): String {
+        let trimmed = value.trimAscii()
+        if (trimmed.isEmpty()) {
+            return ""
+        }
+        if (trimmed.size <= 6) {
+            return "[redacted]"
+        }
+        trimmed[0..3] + "***" + trimmed[trimmed.size - 3..]
+    }
+
+    private func feishuNativeJsonString(obj: JsonObject, key: String): String {
+        match (obj.get(key)) {
+            case Some(v) => try { v.asString().getValue().trimAscii() } catch (_e: Exception) { "" }
+            case None => ""
+        }
+    }
+
+    private func feishuNativeJsonArray(obj: JsonObject, key: String): JsonArray {
+        match (obj.get(key)) {
+            case Some(v) => try { v.asArray() } catch (_e: Exception) { JsonArray([]) }
+            case None => JsonArray([])
+        }
     }
 
     private func maybeAutoLabelTelegramTopic(user: GatewayUserSettings, message: InboundMessage, accountId: String): Unit {
