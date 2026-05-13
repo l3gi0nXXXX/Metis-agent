@@ -128,6 +128,25 @@ public class GatewayAgentBindingApplyResult {
     }
 }
 
+public class GatewayAgentBindingRemoveResult {
+    public let config: JsonObject
+    public let removed: Array<JsonObject>
+    public let missing: Array<JsonObject>
+    public let conflicts: Array<GatewayAgentBindingConflict>
+
+    public init(
+        config: JsonObject,
+        removed: Array<JsonObject>,
+        missing: Array<JsonObject>,
+        conflicts: Array<GatewayAgentBindingConflict>
+    ) {
+        this.config = config
+        this.removed = removed
+        this.missing = missing
+        this.conflicts = conflicts
+    }
+}
+
 private class GatewayAgentRouteCandidate {
     let binding: JsonObject
     let agentId: String
@@ -608,7 +627,7 @@ public func gatewayBuildLegacyAgentRouteBinding(agentId: String, spec: String): 
         ""
     }
     let accountId = if (parts.size > 1) {
-        gatewayRouteNormalizeAccountPattern(parts[1])
+        gatewayRouteNormalizeAccountPattern(String.join(parts[1..parts.size], delimiter: ":"))
     } else {
         ""
     }
@@ -824,4 +843,79 @@ public func gatewayApplyAgentRouteBindings(root: JsonObject, bindings: JsonArray
     }
     root.put("bindings", outBindings)
     GatewayAgentBindingApplyResult(root, added.toArray(), updated.toArray(), skipped.toArray(), conflicts.toArray())
+}
+
+public func gatewayRemoveAgentRouteBindings(root: JsonObject, bindings: JsonArray): GatewayAgentBindingRemoveResult {
+    let preservedBindings = ArrayList<JsonObject>()
+    let existingBindings = ArrayList<JsonObject>()
+    let source = gatewayRouteJsonArray(root, "bindings")
+    for (i in 0..source.size()) {
+        let row = try {
+            source[i].asObject()
+        } catch (_e: Exception) {
+            JsonObject()
+        }
+        if (gatewayRouteBindingType(row) == "route") {
+            existingBindings.add(gatewayRouteCopyBinding(row))
+        } else {
+            preservedBindings.add(row)
+        }
+    }
+
+    let removedIndexes = ArrayList<Int64>()
+    let removed = ArrayList<JsonObject>()
+    let missing = ArrayList<JsonObject>()
+    let conflicts = ArrayList<GatewayAgentBindingConflict>()
+
+    for (i in 0..bindings.size()) {
+        let incomingRaw = try {
+            bindings[i].asObject()
+        } catch (_e: Exception) {
+            JsonObject()
+        }
+        if (gatewayRouteBindingType(incomingRaw) != "route") {
+            missing.add(incomingRaw)
+            continue
+        }
+        let incoming = gatewayRouteCopyBinding(incomingRaw)
+        let desiredAgent = gatewayRouteSanitizeAgentId(gatewayRouteJsonString(incoming, "agentId"))
+        let key = gatewayRouteApplyKey(incoming)
+        var matchedIndex: Int64 = -1
+        var conflictingAgent = ""
+        for (j in 0..existingBindings.size) {
+            if (removedIndexes.contains(j)) {
+                continue
+            }
+            let current = existingBindings[j]
+            if (gatewayRouteApplyKey(current) != key) {
+                continue
+            }
+            let currentAgent = gatewayRouteSanitizeAgentId(gatewayRouteJsonString(current, "agentId"))
+            if (currentAgent == desiredAgent) {
+                matchedIndex = j
+                break
+            }
+            conflictingAgent = currentAgent
+        }
+        if (matchedIndex >= 0) {
+            removedIndexes.add(matchedIndex)
+            removed.add(existingBindings[matchedIndex])
+        } else if (!conflictingAgent.isEmpty()) {
+            conflicts.add(GatewayAgentBindingConflict(incoming, conflictingAgent))
+        } else {
+            missing.add(incoming)
+        }
+    }
+
+    let outBindings = JsonArray([])
+    for (binding in preservedBindings) {
+        outBindings.add(binding)
+    }
+    for (i in 0..existingBindings.size) {
+        if (!removedIndexes.contains(i)) {
+            outBindings.add(existingBindings[i])
+        }
+    }
+    root.put("bindings", outBindings)
+    GatewayAgentBindingRemoveResult(root, removed.toArray(), missing.toArray(), conflicts.toArray())
 }
