@@ -59,9 +59,12 @@ import {
   createEmptyAgentTeamBindingDraft,
   createEmptyAgentTeamDraft,
   createEmptyAgentTeamModelDraft,
+  createEmptyAgentTeamWorkspaceDraft,
   type AgentTeamBindingDraft,
+  type AgentTeamBindingPreview,
   type AgentTeamEditorDraft,
   type AgentTeamModelDraft,
+  type AgentTeamWorkspaceDraft,
 } from "./controllers/agent-teams.ts";
 import {
   loadToolsEffective as loadToolsEffectiveInternal,
@@ -306,11 +309,16 @@ export class MetisApp extends LitElement {
   @state() agentTeamsDetail: AgentTeam | null = null;
   @state() agentTeamDraft: AgentTeamEditorDraft = createEmptyAgentTeamDraft();
   @state() agentTeamBinding: AgentTeamBindingDraft = createEmptyAgentTeamBindingDraft();
+  @state() agentTeamBindingPreview: AgentTeamBindingPreview | null = null;
   @state() agentTeamBindingResult: AgentBindingsResult | null = null;
   @state() agentTeamModelLoading = false;
   @state() agentTeamModelError: string | null = null;
   @state() agentTeamModelResult: AgentModelsResult | null = null;
   @state() agentTeamModelDraft: AgentTeamModelDraft = createEmptyAgentTeamModelDraft();
+  @state() agentTeamWorkspaceLoading = false;
+  @state() agentTeamWorkspaceSaving = false;
+  @state() agentTeamWorkspaceError: string | null = null;
+  @state() agentTeamWorkspace: AgentTeamWorkspaceDraft = createEmptyAgentTeamWorkspaceDraft();
   @state() agentFilesLoading = false;
   @state() agentFilesError: string | null = null;
   @state() agentFilesList: AgentsFilesListResult | null = null;

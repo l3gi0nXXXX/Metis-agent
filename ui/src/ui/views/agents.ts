@@ -121,10 +121,15 @@ export type AgentsProps = {
   onUpdateTeam: () => void;
   onDeleteTeam: () => void;
   onTeamBindingChange: (patch: Partial<AgentTeamsPanelState["binding"]>) => void;
+  onPreviewTeamBinding: () => void;
   onApplyTeamBinding: () => void;
   onTeamModelDraftChange: (patch: Partial<AgentTeamsPanelState["modelDraft"]>) => void;
   onLoadTeamModel: () => void;
   onSaveTeamModel: () => void;
+  onWorkspaceChange: (patch: Partial<AgentTeamsPanelState["workspace"]>) => void;
+  onLoadWorkspaceFiles: () => void;
+  onLoadWorkspaceFile: (name: string) => void;
+  onSaveWorkspaceFile: () => void;
   onSkillsFilterChange: (next: string) => void;
   onSkillsRefresh: () => void;
   onAgentSkillToggle: (agentId: string, skillName: string, enabled: boolean) => void;
@@ -362,10 +367,15 @@ export function renderAgents(props: AgentsProps) {
                     onUpdateTeam: props.onUpdateTeam,
                     onDeleteTeam: props.onDeleteTeam,
                     onBindingChange: props.onTeamBindingChange,
+                    onPreviewBinding: props.onPreviewTeamBinding,
                     onApplyBinding: props.onApplyTeamBinding,
                     onModelDraftChange: props.onTeamModelDraftChange,
                     onLoadModel: props.onLoadTeamModel,
                     onSaveModel: props.onSaveTeamModel,
+                    onWorkspaceChange: props.onWorkspaceChange,
+                    onLoadWorkspaceFiles: props.onLoadWorkspaceFiles,
+                    onLoadWorkspaceFile: props.onLoadWorkspaceFile,
+                    onSaveWorkspaceFile: props.onSaveWorkspaceFile,
                   })
                 : nothing}
             `}

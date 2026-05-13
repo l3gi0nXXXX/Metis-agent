@@ -22,11 +22,16 @@ import {
   createEmptyAgentTeamBindingDraft,
   createEmptyAgentTeamDraft,
   createEmptyAgentTeamModelDraft,
+  createEmptyAgentTeamWorkspaceDraft,
   deleteAgentTeam,
   loadAgentTeamDetail,
   loadAgentTeamModel,
+  loadAgentTeamWorkspaceFile,
+  loadAgentTeamWorkspaceFiles,
   loadAgentTeams,
+  previewAgentTeamBinding,
   saveAgentTeamModel,
+  saveAgentTeamWorkspaceFile,
   updateAgentTeam,
 } from "./controllers/agent-teams.ts";
 import {
@@ -1085,11 +1090,18 @@ export function renderApp(state: AppViewState) {
                   detail: state.agentTeamsDetail,
                   draft: state.agentTeamDraft,
                   binding: state.agentTeamBinding,
+                  bindingPreview: state.agentTeamBindingPreview,
                   bindingResult: state.agentTeamBindingResult,
                   modelLoading: state.agentTeamModelLoading,
                   modelError: state.agentTeamModelError,
                   modelResult: state.agentTeamModelResult,
                   modelDraft: state.agentTeamModelDraft,
+                  workspaceLoading: state.agentTeamWorkspaceLoading,
+                  workspaceSaving: state.agentTeamWorkspaceSaving,
+                  workspaceError: state.agentTeamWorkspaceError,
+                  workspace: state.agentTeamWorkspace,
+                  channelsSnapshot: state.channelsSnapshot,
+                  configForm: state.configForm,
                 },
                 runtimeSessionKey: state.sessionKey,
                 runtimeSessionMatchesSelectedAgent: toolsPanelUsesActiveSession,
@@ -1302,10 +1314,13 @@ export function renderApp(state: AppViewState) {
                   state.agentTeamsDetail = null;
                   state.agentTeamDraft = createEmptyAgentTeamDraft();
                   state.agentTeamBinding = createEmptyAgentTeamBindingDraft();
+                  state.agentTeamBindingPreview = null;
                   state.agentTeamBindingResult = null;
                   state.agentTeamModelDraft = createEmptyAgentTeamModelDraft();
                   state.agentTeamModelResult = null;
                   state.agentTeamModelError = null;
+                  state.agentTeamWorkspace = createEmptyAgentTeamWorkspaceDraft();
+                  state.agentTeamWorkspaceError = null;
                   state.agentTeamsError = null;
                   state.agentTeamsSuccess = null;
                 },
@@ -1317,7 +1332,9 @@ export function renderApp(state: AppViewState) {
                 onDeleteTeam: () => deleteAgentTeam(state),
                 onTeamBindingChange: (patch) => {
                   state.agentTeamBinding = { ...state.agentTeamBinding, ...patch };
+                  state.agentTeamBindingPreview = null;
                 },
+                onPreviewTeamBinding: () => previewAgentTeamBinding(state),
                 onApplyTeamBinding: () => applyAgentTeamBinding(state),
                 onTeamModelDraftChange: (patch) => {
                   state.agentTeamModelDraft = { ...state.agentTeamModelDraft, ...patch };
@@ -1328,6 +1345,12 @@ export function renderApp(state: AppViewState) {
                 },
                 onLoadTeamModel: () => loadAgentTeamModel(state),
                 onSaveTeamModel: () => saveAgentTeamModel(state),
+                onWorkspaceChange: (patch) => {
+                  state.agentTeamWorkspace = { ...state.agentTeamWorkspace, ...patch };
+                },
+                onLoadWorkspaceFiles: () => loadAgentTeamWorkspaceFiles(state),
+                onLoadWorkspaceFile: (name) => loadAgentTeamWorkspaceFile(state, name),
+                onSaveWorkspaceFile: () => saveAgentTeamWorkspaceFile(state),
                 onSkillsFilterChange: (next) => (state.skillsFilter = next),
                 onSkillsRefresh: () => {
                   if (resolvedAgentId) {

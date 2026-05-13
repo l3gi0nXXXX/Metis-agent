@@ -1,12 +1,16 @@
 import type { GatewayBrowserClient } from "../gateway.ts";
 import type {
   AgentBindingsResult,
+  AgentFileEntry,
   AgentModelsResult,
   AgentTeam,
   AgentTeamGetResult,
   AgentTeamMember,
   AgentTeamMutationResult,
   AgentTeamsListResult,
+  AgentsFilesGetResult,
+  AgentsFilesListResult,
+  AgentsFilesSetResult,
 } from "../types.ts";
 import {
   formatMissingOperatorReadScopeMessage,
@@ -27,6 +31,23 @@ export type AgentTeamBindingDraft = {
   agentId: string;
   spec: string;
   mode: "bind" | "unbind";
+  useStructuredBinding: boolean;
+  channel: string;
+  accountId: string;
+  peerKind: string;
+  peer: string;
+  thread: string;
+  group: string;
+  team: string;
+  roles: string;
+  comment: string;
+};
+
+export type AgentTeamBindingPreview = {
+  simpleBinding: string;
+  routeBinding: Record<string, unknown> | null;
+  applyPayload: Record<string, unknown> | null;
+  lines: string[];
 };
 
 export type AgentTeamModelDraft = {
@@ -34,6 +55,16 @@ export type AgentTeamModelDraft = {
   primaryModelRef: string;
   runtimePrimaryModelRef: string;
   stateJson: string;
+};
+
+export type AgentTeamWorkspaceDraft = {
+  agentId: string;
+  workspace: string;
+  files: AgentFileEntry[];
+  fileName: string;
+  path: string;
+  content: string;
+  draft: string;
 };
 
 export type AgentTeamsState = {
@@ -48,12 +79,26 @@ export type AgentTeamsState = {
   agentTeamsDetail: AgentTeam | null;
   agentTeamDraft: AgentTeamEditorDraft;
   agentTeamBinding: AgentTeamBindingDraft;
+  agentTeamBindingPreview?: AgentTeamBindingPreview | null;
   agentTeamBindingResult: AgentBindingsResult | null;
   agentTeamModelLoading: boolean;
   agentTeamModelError: string | null;
   agentTeamModelResult: AgentModelsResult | null;
   agentTeamModelDraft: AgentTeamModelDraft;
+  agentTeamWorkspaceLoading: boolean;
+  agentTeamWorkspaceSaving: boolean;
+  agentTeamWorkspaceError: string | null;
+  agentTeamWorkspace: AgentTeamWorkspaceDraft;
 };
+
+export const AGENT_TEAM_PROFILE_FILES = [
+  "SOUL.md",
+  "AGENTS.md",
+  "IDENTITY.md",
+  "USER.md",
+  "TOOLS.md",
+  "MEMORY.md",
+] as const;
 
 export function createEmptyAgentTeamDraft(): AgentTeamEditorDraft {
   return {
@@ -72,6 +117,16 @@ export function createEmptyAgentTeamBindingDraft(): AgentTeamBindingDraft {
     agentId: "",
     spec: "",
     mode: "bind",
+    useStructuredBinding: false,
+    channel: "feishu",
+    accountId: "",
+    peerKind: "group",
+    peer: "",
+    thread: "",
+    group: "",
+    team: "",
+    roles: "",
+    comment: "",
   };
 }
 
@@ -81,6 +136,18 @@ export function createEmptyAgentTeamModelDraft(): AgentTeamModelDraft {
     primaryModelRef: "",
     runtimePrimaryModelRef: "",
     stateJson: "{\n  \"providers\": []\n}",
+  };
+}
+
+export function createEmptyAgentTeamWorkspaceDraft(): AgentTeamWorkspaceDraft {
+  return {
+    agentId: "",
+    workspace: "",
+    files: [],
+    fileName: "SOUL.md",
+    path: "",
+    content: "",
+    draft: "",
   };
 }
 
@@ -97,6 +164,53 @@ export function draftFromTeam(team: AgentTeam | null): AgentTeamEditorDraft {
     aliasesJson: stringifyPretty(team.aliases ?? []),
     bindingsJson: stringifyPretty(team.bindings ?? []),
   };
+}
+
+export function membersFromDraft(draft: AgentTeamEditorDraft): AgentTeamMember[] {
+  return parseJsonArray<AgentTeamMember>(draft.membersJson, "members");
+}
+
+export function changeAgentTeamMember(
+  draft: AgentTeamEditorDraft,
+  index: number,
+  patch: Partial<AgentTeamMember>,
+): AgentTeamEditorDraft {
+  const members = membersFromDraft(draft);
+  if (index < 0 || index >= members.length) {
+    return draft;
+  }
+  const current = members[index] ?? { agentId: "" };
+  const next = {
+    ...current,
+    ...patch,
+  };
+  const compact: AgentTeamMember = { agentId: next.agentId?.trim() ?? "" };
+  if (next.role?.trim()) {
+    compact.role = next.role.trim();
+  }
+  if (next.name?.trim()) {
+    compact.name = next.name.trim();
+  }
+  members[index] = compact;
+  return { ...draft, membersJson: stringifyPretty(members) };
+}
+
+export function addAgentTeamMember(draft: AgentTeamEditorDraft): AgentTeamEditorDraft {
+  const members = membersFromDraft(draft);
+  members.push({ agentId: "", role: "", name: "" });
+  return { ...draft, membersJson: stringifyPretty(members) };
+}
+
+export function removeAgentTeamMember(
+  draft: AgentTeamEditorDraft,
+  index: number,
+): AgentTeamEditorDraft {
+  const members = membersFromDraft(draft);
+  if (index < 0 || index >= members.length) {
+    return draft;
+  }
+  members.splice(index, 1);
+  return { ...draft, membersJson: stringifyPretty(members) };
 }
 
 export async function loadAgentTeams(state: AgentTeamsState) {
@@ -153,6 +267,10 @@ export async function loadAgentTeamDetail(state: AgentTeamsState, teamId: string
       ...state.agentTeamModelDraft,
       agentId: state.agentTeamModelDraft.agentId || defaultAgentId,
     };
+    state.agentTeamWorkspace = {
+      ...state.agentTeamWorkspace,
+      agentId: state.agentTeamWorkspace.agentId || defaultAgentId,
+    };
   } catch (err) {
     state.agentTeamsError = String(err);
   }
@@ -193,20 +311,18 @@ export async function applyAgentTeamBinding(
     return;
   }
   const agentId = draft.agentId.trim();
-  const spec = draft.spec.trim();
-  if (!agentId || !spec) {
+  const preview = buildAgentTeamBindingPreview(draft);
+  if (!agentId || !preview.applyPayload) {
     state.agentTeamsError = "Choose a team member and enter a channel binding.";
     return;
   }
   state.agentTeamsSaving = true;
   state.agentTeamsError = null;
   state.agentTeamsSuccess = null;
+  state.agentTeamBindingPreview = preview;
   try {
     const method = draft.mode === "unbind" ? "agents.unbind" : "agents.bind";
-    const res = await state.client.request<AgentBindingsResult>(method, {
-      agentId,
-      bind: spec,
-    });
+    const res = await state.client.request<AgentBindingsResult>(method, preview.applyPayload);
     state.agentTeamBindingResult = res ?? null;
     state.agentTeamsSuccess = draft.mode === "unbind" ? "Binding removed." : "Binding applied.";
   } catch (err) {
@@ -214,6 +330,107 @@ export async function applyAgentTeamBinding(
   } finally {
     state.agentTeamsSaving = false;
   }
+}
+
+export function previewAgentTeamBinding(
+  state: AgentTeamsState,
+  draft = state.agentTeamBinding,
+): AgentTeamBindingPreview {
+  const preview = buildAgentTeamBindingPreview(draft);
+  state.agentTeamBindingPreview = preview;
+  return preview;
+}
+
+export function buildAgentTeamBindingPreview(
+  draft: AgentTeamBindingDraft,
+): AgentTeamBindingPreview {
+  const agentId = stringValue(draft.agentId).trim();
+  const channel = stringValue(draft.channel).trim();
+  const accountId = stringValue(draft.accountId).trim();
+  const explicitSpec = stringValue(draft.spec).trim();
+  const simpleBinding = explicitSpec || (channel ? `${channel}${accountId ? `:${accountId}` : ""}` : "");
+  const match: Record<string, unknown> = {};
+  if (channel) {
+    match.channel = channel;
+  }
+  if (accountId) {
+    match.accountId = accountId;
+  }
+  const threadId = stringValue(draft.thread).trim();
+  const peerId = threadId || stringValue(draft.peer).trim();
+  if (peerId) {
+    match.peer = {
+      kind: threadId ? "thread" : stringValue(draft.peerKind).trim() || "group",
+      id: peerId,
+    };
+  }
+  if (stringValue(draft.group).trim()) {
+    match.guildId = stringValue(draft.group).trim();
+  }
+  if (stringValue(draft.team).trim()) {
+    match.teamId = stringValue(draft.team).trim();
+  }
+  const roles = splitCsv(stringValue(draft.roles));
+  if (roles.length > 0) {
+    match.roles = roles;
+  }
+  const routeBinding =
+    agentId && Object.keys(match).length > 0
+      ? ({
+          type: "route",
+          agentId,
+          match,
+        } as Record<string, unknown>)
+      : null;
+  if (routeBinding && stringValue(draft.comment).trim()) {
+    routeBinding.comment = stringValue(draft.comment).trim();
+  }
+  const applyPayload = buildBindingApplyPayload(draft, agentId, simpleBinding, routeBinding);
+  const lines = [
+    "Gateway has no dedicated binding preview RPC in the current contract; this is a read-only preview of the apply payload.",
+  ];
+  if (simpleBinding) {
+    lines.push(`Simple binding: ${simpleBinding}`);
+  }
+  if (routeBinding) {
+    lines.push(`JSON binding: ${stringifyPretty(routeBinding)}`);
+  }
+  if (applyPayload) {
+    lines.push(`Apply call: ${draft.mode === "unbind" ? "agents.unbind" : "agents.bind"} ${stringifyPretty(applyPayload)}`);
+  }
+  return {
+    simpleBinding,
+    routeBinding,
+    applyPayload,
+    lines,
+  };
+}
+
+function buildBindingApplyPayload(
+  draft: AgentTeamBindingDraft,
+  agentId: string,
+  simpleBinding: string,
+  routeBinding: Record<string, unknown> | null,
+): Record<string, unknown> | null {
+  if (!agentId) {
+    return null;
+  }
+  if (draft.useStructuredBinding) {
+    if (!routeBinding) {
+      return null;
+    }
+    return {
+      agentId,
+      bindings: [routeBinding],
+    };
+  }
+  if (!simpleBinding) {
+    return null;
+  }
+  return {
+    agentId,
+    bind: simpleBinding,
+  };
 }
 
 export async function loadAgentTeamModel(
@@ -277,6 +494,108 @@ export async function saveAgentTeamModel(
   }
 }
 
+export async function loadAgentTeamWorkspaceFiles(
+  state: AgentTeamsState,
+  agentId = state.agentTeamWorkspace.agentId,
+) {
+  const id = agentId.trim();
+  if (!state.client || !state.connected || !id || state.agentTeamWorkspaceLoading) {
+    return;
+  }
+  state.agentTeamWorkspaceLoading = true;
+  state.agentTeamWorkspaceError = null;
+  try {
+    const res = await state.client.request<AgentsFilesListResult | null>("agents.files.list", {
+      agentId: id,
+    });
+    if (res) {
+      const files = filterProfileFiles(res.files ?? []);
+      const current = state.agentTeamWorkspace.fileName;
+      const fileName = files.some((file) => file.name === current) ? current : (files[0]?.name ?? "SOUL.md");
+      state.agentTeamWorkspace = {
+        ...state.agentTeamWorkspace,
+        agentId: id,
+        workspace: res.workspace ?? "",
+        files,
+        fileName,
+      };
+    }
+  } catch (err) {
+    state.agentTeamWorkspaceError = String(err);
+  } finally {
+    state.agentTeamWorkspaceLoading = false;
+  }
+}
+
+export async function loadAgentTeamWorkspaceFile(
+  state: AgentTeamsState,
+  fileName = state.agentTeamWorkspace.fileName,
+) {
+  const agentId = state.agentTeamWorkspace.agentId.trim();
+  const name = normalizeProfileFileName(fileName);
+  if (!state.client || !state.connected || !agentId || !name || state.agentTeamWorkspaceLoading) {
+    return;
+  }
+  state.agentTeamWorkspaceLoading = true;
+  state.agentTeamWorkspaceError = null;
+  try {
+    const res = await state.client.request<AgentsFilesGetResult | null>("agents.files.get", {
+      agentId,
+      name,
+    });
+    if (res?.file) {
+      const content = res.file.content ?? "";
+      state.agentTeamWorkspace = {
+        ...state.agentTeamWorkspace,
+        workspace: res.workspace ?? state.agentTeamWorkspace.workspace,
+        fileName: res.file.name,
+        path: res.file.path,
+        content,
+        draft: content,
+        files: mergeProfileFile(state.agentTeamWorkspace.files, res.file),
+      };
+    }
+  } catch (err) {
+    state.agentTeamWorkspaceError = String(err);
+  } finally {
+    state.agentTeamWorkspaceLoading = false;
+  }
+}
+
+export async function saveAgentTeamWorkspaceFile(state: AgentTeamsState) {
+  const agentId = state.agentTeamWorkspace.agentId.trim();
+  const name = normalizeProfileFileName(state.agentTeamWorkspace.fileName);
+  if (!state.client || !state.connected || !agentId || !name || state.agentTeamWorkspaceSaving) {
+    return;
+  }
+  state.agentTeamWorkspaceSaving = true;
+  state.agentTeamWorkspaceError = null;
+  try {
+    const content = state.agentTeamWorkspace.draft;
+    const res = await state.client.request<AgentsFilesSetResult | null>("agents.files.set", {
+      agentId,
+      name,
+      content,
+    });
+    if (res?.file) {
+      state.agentTeamWorkspace = {
+        ...state.agentTeamWorkspace,
+        workspace: res.workspace ?? state.agentTeamWorkspace.workspace,
+        fileName: res.file.name,
+        path: res.file.path,
+        content,
+        draft: content,
+        files: mergeProfileFile(state.agentTeamWorkspace.files, res.file),
+      };
+      state.agentTeamsSuccess = `${res.file.name} saved.`;
+    }
+  } catch (err) {
+    state.agentTeamWorkspaceError = String(err);
+  } finally {
+    state.agentTeamWorkspaceSaving = false;
+  }
+}
+
 function teamPayloadFromDraft(
   draft: AgentTeamEditorDraft,
   options: { create: boolean },
@@ -289,7 +608,9 @@ function teamPayloadFromDraft(
     id,
     displayName: draft.displayName.trim() || id,
   };
-  const members = parseJsonArray<AgentTeamMember>(draft.membersJson, "members");
+  const members = parseJsonArray<AgentTeamMember>(draft.membersJson, "members").filter((member) =>
+    Boolean(member.agentId?.trim()),
+  );
   if (members.length > 0) {
     payload.members = members;
   } else if (options.create && draft.template.trim()) {
@@ -343,6 +664,40 @@ function parseJsonArray<T = unknown>(text: string, label: string): T[] {
     throw new Error(`${label} must be a JSON array.`);
   }
   return parsed as T[];
+}
+
+function splitCsv(text: string): string[] {
+  return text
+    .split(",")
+    .map((part) => part.trim())
+    .filter(Boolean);
+}
+
+function stringValue(value: string | undefined): string {
+  return value ?? "";
+}
+
+function normalizeProfileFileName(name: string): string {
+  const normalized = name.trim();
+  return AGENT_TEAM_PROFILE_FILES.includes(normalized as (typeof AGENT_TEAM_PROFILE_FILES)[number])
+    ? normalized
+    : "";
+}
+
+function filterProfileFiles(files: AgentFileEntry[]): AgentFileEntry[] {
+  const byName = new Map(files.map((file) => [file.name, file]));
+  return AGENT_TEAM_PROFILE_FILES.map(
+    (name) => byName.get(name) ?? { name, path: "", missing: true },
+  );
+}
+
+function mergeProfileFile(files: AgentFileEntry[], entry: AgentFileEntry): AgentFileEntry[] {
+  const next = filterProfileFiles(files);
+  const index = next.findIndex((file) => file.name === entry.name);
+  if (index >= 0) {
+    next[index] = entry;
+  }
+  return next;
 }
 
 function parseJsonObject(text: string, label: string): Record<string, unknown> {
