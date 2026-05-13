@@ -307,7 +307,8 @@ private func mergeFeishu(fs: FeishuUserSettings): FeishuConfig {
         media: FeishuMediaConfig(
             downloadEnabled: fs.media.downloadEnabled,
             mediaMaxBytes: fs.media.mediaMaxBytes,
-            allowedMimes: fs.media.allowedMimes
+            allowedMimes: fs.media.allowedMimes,
+            downloadRoot: fs.media.downloadRoot
         ),
         policy: ChannelPolicyConfig(
             allowFrom: [],

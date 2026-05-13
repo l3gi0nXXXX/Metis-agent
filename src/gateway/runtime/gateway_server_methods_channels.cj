@@ -585,6 +585,7 @@ private func gatewayFeishuMediaJson(user: GatewayUserSettings): JsonObject {
         allowedMimes.add(JsonString(mime))
     }
     media.put("allowedMimes", allowedMimes)
+    media.put("downloadRoot", JsonString(user.feishu.media.downloadRoot))
     return media
 }
 

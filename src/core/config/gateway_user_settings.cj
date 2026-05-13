@@ -442,6 +442,7 @@ public struct FeishuMediaUserSettings {
     public var downloadEnabled: Bool = false
     public var mediaMaxBytes: Int64 = 20 * 1024 * 1024
     public var allowedMimes: Array<String> = []
+    public var downloadRoot: String = "/tmp/metis-feishu-media"
 }
 
 @jsonable

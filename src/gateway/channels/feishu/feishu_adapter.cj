@@ -11,13 +11,15 @@ import magic.utils.http.HttpUtils
 import std.collection.{ArrayList, HashMap}
 import std.convert.Parsable
 import std.env.getVariable
-import std.fs.{Path, canonicalize, exists}
+import std.fs.{Directory, File, Path, canonicalize, exists}
 import std.io.*
 import std.process.*
 import std.time.DateTime
 import std.sync.Mutex
+import stdx.encoding.url.*
 import stdx.encoding.json.*
 import stdx.net.http.*
+import stdx.net.tls.*
 
 /**
  * Feishu 渠道适配器（P0 基础实现）。
@@ -29,6 +31,32 @@ import stdx.net.http.*
  */
 public interface FeishuApiClient {
     func isThreadCapableGroup(chatId: String): Bool
+    func fetchMessageResource(accountId: String, messageId: String, fileKey: String, resourceType: String): FeishuResourceDownloadResult
+}
+
+public class FeishuResourceDownloadResult {
+    public let ok: Bool
+    public let status: String
+    public let bytes: Array<Byte>
+    public let contentType: String
+    public let fileName: String
+    public let error: String
+
+    public init(
+        ok!: Bool = false,
+        status!: String = "not_configured",
+        bytes!: Array<Byte> = [],
+        contentType!: String = "",
+        fileName!: String = "",
+        error!: String = ""
+    ) {
+        this.ok = ok
+        this.status = if (status.trimAscii().isEmpty()) { if (ok) { "ok" } else { "error" } } else { status.trimAscii() }
+        this.bytes = bytes
+        this.contentType = contentType.trimAscii()
+        this.fileName = fileName.trimAscii()
+        this.error = error.trimAscii()
+    }
 }
 
 public class FeishuNoopApiClient <: FeishuApiClient {
@@ -37,10 +65,20 @@ public class FeishuNoopApiClient <: FeishuApiClient {
     public func isThreadCapableGroup(_chatId: String): Bool {
         false
     }
+
+    public func fetchMessageResource(
+        _accountId: String,
+        _messageId: String,
+        _fileKey: String,
+        _resourceType: String
+    ): FeishuResourceDownloadResult {
+        FeishuResourceDownloadResult(status: "not_configured", error: "feishu api client is not configured")
+    }
 }
 
 public class FeishuFakeApiClient <: FeishuApiClient {
     private let threadCapable = HashMap<String, Bool>()
+    private let resources = HashMap<String, FeishuResourceDownloadResult>()
 
     public init() {}
 
@@ -50,6 +88,56 @@ public class FeishuFakeApiClient <: FeishuApiClient {
 
     public func isThreadCapableGroup(chatId: String): Bool {
         this.threadCapable.get(chatId.trimAscii()) ?? false
+    }
+
+    public func setResource(
+        accountId: String,
+        messageId: String,
+        fileKey: String,
+        resourceType: String,
+        bytes: Array<Byte>,
+        contentType!: String = "",
+        fileName!: String = ""
+    ): Unit {
+        this.resources[this.resourceKey(accountId, messageId, fileKey, resourceType)] =
+            FeishuResourceDownloadResult(
+                ok: true,
+                status: "ok",
+                bytes: bytes,
+                contentType: contentType,
+                fileName: fileName
+            )
+    }
+
+    public func setResourceError(
+        accountId: String,
+        messageId: String,
+        fileKey: String,
+        resourceType: String,
+        status: String,
+        error!: String = ""
+    ): Unit {
+        this.resources[this.resourceKey(accountId, messageId, fileKey, resourceType)] =
+            FeishuResourceDownloadResult(status: status, error: error)
+    }
+
+    public func fetchMessageResource(
+        accountId: String,
+        messageId: String,
+        fileKey: String,
+        resourceType: String
+    ): FeishuResourceDownloadResult {
+        this.resources.get(this.resourceKey(accountId, messageId, fileKey, resourceType)) ??
+            FeishuResourceDownloadResult(status: "not_found", error: "fake resource not registered")
+    }
+
+    private func resourceKey(accountId: String, messageId: String, fileKey: String, resourceType: String): String {
+        "${this.normalize(accountId)}|${messageId.trimAscii()}|${fileKey.trimAscii()}|${resourceType.trimAscii().toAsciiLower()}"
+    }
+
+    private func normalize(raw: String): String {
+        let trimmed = raw.trimAscii()
+        if (trimmed.isEmpty()) { "default" } else { trimmed }
     }
 }
 
@@ -476,6 +564,14 @@ public class FeishuAdapter <: ChannelAdapter {
         }
         route.put("senderId", JsonString(senderId.trimAscii()))
         route.put("messageId", JsonString(messageId.trimAscii()))
+        match (chatType) {
+            case ChatType.Group =>
+                let groupPolicy = this.feishuGroupPolicyContext(chatId)
+                if (groupPolicy.size() > 0) {
+                    route.put("groupPolicy", groupPolicy)
+                }
+            case ChatType.Direct => ()
+        }
         context.put("imRoute", route)
         mediaContext.put("channel", JsonString("feishu"))
         mediaContext.put("accountId", JsonString(normalizedAccountId))
@@ -499,20 +595,31 @@ public class FeishuAdapter <: ChannelAdapter {
         match (chatType) {
             case ChatType.Direct => ()
             case ChatType.Group =>
-                if (!this.feishuGroupAllowed(chatId)) {
+                let groupConfig = this.feishuGroupConfig(chatId)
+                let groupEnabled = this.feishuGroupBool(groupConfig, "enabled", true)
+                let groupAllowBots = this.feishuGroupBool(groupConfig, "allowBots", this.config.allowBots)
+                let groupRequireMention = this.feishuGroupBool(groupConfig, "requireMention", this.config.policy.requireMentionInGroup)
+                let groupAllowFrom = this.feishuGroupStringArray(groupConfig, "allowFrom")
+                if (!groupEnabled) {
+                    accepted = false
+                    reason = "group_disabled"
+                } else if (!this.feishuGroupAllowed(chatId)) {
                     accepted = false
                     reason = "group_not_allowed"
-                } else if (!this.config.allowBots && this.feishuSenderLooksBot(senderId)) {
+                } else if (!this.feishuSenderAllowedByGroup(groupAllowFrom, senderId)) {
+                    accepted = false
+                    reason = "sender_not_allowed"
+                } else if (!groupAllowBots && this.feishuSenderLooksBot(senderId)) {
                     accepted = false
                     reason = "bot_sender_not_allowed"
-                } else if (this.config.policy.requireMentionInGroup && !mentioned) {
+                } else if (groupRequireMention && !mentioned) {
                     accepted = false
                     reason = "group_mention_required"
                 }
         }
         gate.put("triggerAgent", JsonBool(accepted))
         gate.put("mentioned", JsonBool(mentioned))
-        gate.put("requireMentionInGroup", JsonBool(this.config.policy.requireMentionInGroup))
+        gate.put("requireMentionInGroup", JsonBool(this.feishuGroupBool(this.feishuGroupConfig(chatId), "requireMention", this.config.policy.requireMentionInGroup)))
         gate.put("groupPolicy", JsonString(this.config.groupPolicy))
         gate.put("allowBots", JsonBool(this.config.allowBots))
         gate.put("reason", JsonString(reason))
@@ -540,6 +647,86 @@ public class FeishuAdapter <: ChannelAdapter {
                 groups.getFields().contains(normalized) || groups.getFields().contains("*")
             case None => false
         }
+    }
+
+    private func feishuGroupConfig(chatId: String): JsonObject {
+        let normalized = chatId.trimAscii()
+        match (this.config.groups) {
+            case Some(groups) =>
+                match (groups.get(normalized)) {
+                    case Some(v) =>
+                        try { return v.asObject() } catch (_e: Exception) { () }
+                    case None => ()
+                }
+                match (groups.get("*")) {
+                    case Some(v) =>
+                        try { return v.asObject() } catch (_e: Exception) { () }
+                    case None => ()
+                }
+                JsonObject()
+            case None => JsonObject()
+        }
+    }
+
+    private func feishuGroupPolicyContext(chatId: String): JsonObject {
+        let cfg = this.feishuGroupConfig(chatId)
+        let out = JsonObject()
+        out.put("groupId", JsonString(chatId.trimAscii()))
+        out.put("policy", JsonString(this.config.groupPolicy.trimAscii().toAsciiLower()))
+        out.put("requireMention", JsonBool(this.feishuGroupBool(cfg, "requireMention", this.config.policy.requireMentionInGroup)))
+        out.put("allowBots", JsonBool(this.feishuGroupBool(cfg, "allowBots", this.config.allowBots)))
+        for (key in ["tools", "skills", "systemPrompt", "runtimePolicy", "policy"]) {
+            match (cfg.get(key)) {
+                case Some(v) => out.put(key, v)
+                case None => ()
+            }
+        }
+        out
+    }
+
+    private func feishuGroupBool(cfg: JsonObject, key: String, fallback: Bool): Bool {
+        match (cfg.get(key)) {
+            case Some(v) => try { v.asBool().getValue() } catch (_e: Exception) { fallback }
+            case None => fallback
+        }
+    }
+
+    private func feishuGroupStringArray(cfg: JsonObject, key: String): Array<String> {
+        let out = ArrayList<String>()
+        match (cfg.get(key)) {
+            case Some(v) =>
+                try {
+                    let arr = v.asArray()
+                    for (i in 0..arr.size()) {
+                        try {
+                            let value = arr[i].asString().getValue().trimAscii()
+                            if (!value.isEmpty()) {
+                                out.add(value)
+                            }
+                        } catch (_e: Exception) {
+                            ()
+                        }
+                    }
+                } catch (_e: Exception) {
+                    ()
+                }
+            case None => ()
+        }
+        out.toArray()
+    }
+
+    private func feishuSenderAllowedByGroup(allowFrom: Array<String>, senderId: String): Bool {
+        if (allowFrom.isEmpty()) {
+            return true
+        }
+        let normalized = senderId.trimAscii()
+        for (candidateRaw in allowFrom) {
+            let candidate = candidateRaw.trimAscii()
+            if (candidate == "*" || candidate == normalized) {
+                return true
+            }
+        }
+        false
     }
 
     private func feishuSenderLooksBot(senderId: String): Bool {
@@ -612,6 +799,10 @@ public class FeishuAdapter <: ChannelAdapter {
         if (fileId.isEmpty()) {
             return
         }
+        let originalFileName = this.feishuAttachmentFileName(content)
+        let originalMimeType = this.feishuAttachmentMimeType(normalizedType, content)
+        let declaredSize = this.feishuAttachmentFileSize(content)
+        let resourceType = this.feishuResourceTypeForApi(normalizedType)
         let record = JsonObject()
         record.put("mediaId", JsonString("${this.normalizeAccountId(accountId)}:${chatId.trimAscii()}:${messageId.trimAscii()}:${normalizedType}:${fileId}"))
         record.put("channel", JsonString("feishu"))
@@ -623,19 +814,303 @@ public class FeishuAdapter <: ChannelAdapter {
         record.put("kind", JsonString(normalizedType))
         record.put("fileId", JsonString(fileId))
         record.put("fileKey", JsonString(fileId))
-        record.put("originalFileName", JsonString(this.feishuAttachmentFileName(content)))
-        record.put("fileName", JsonString(this.feishuAttachmentFileName(content)))
-        record.put("mimeType", JsonString(this.feishuAttachmentMimeType(normalizedType, content)))
-        record.put("fileSize", JsonInt(this.feishuAttachmentFileSize(content)))
-        record.put("downloaded", JsonBool(false))
-        record.put("skippedReason", JsonString("metadata_only"))
+        record.put("resourceType", JsonString(resourceType))
+        record.put("originalFileName", JsonString(originalFileName))
+        record.put("fileName", JsonString(originalFileName))
+        record.put("mimeType", JsonString(originalMimeType))
+        record.put("fileSize", JsonInt(declaredSize))
         record.put("eligibleFor", JsonString(this.feishuAttachmentEligibility(normalizedType)))
-        record.put("localPath", JsonString(""))
-        record.put("downloadPath", JsonString(""))
         record.put("createdAtMs", JsonInt(DateTime.now().toUnixTimeStamp().toMilliseconds()))
+        var downloaded = false
+        var skippedReason = "metadata_only"
+        var localPath = ""
+        var effectiveMimeType = originalMimeType
+        var effectiveFileName = originalFileName
+        var effectiveFileSize = declaredSize
+        if (this.config.media.downloadEnabled) {
+            if (!this.feishuMediaMimeAllowed(originalMimeType)) {
+                skippedReason = "mime_not_allowed"
+            } else if (declaredSize > 0 && this.feishuMediaSizeExceedsLimit(declaredSize)) {
+                skippedReason = "size_limit_exceeded"
+            } else {
+                let result = this.fetchFeishuMessageResource(
+                    this.normalizeAccountId(accountId),
+                    messageId,
+                    fileId,
+                    resourceType
+                )
+                if (result.ok) {
+                    effectiveMimeType = if (!result.contentType.isEmpty()) { result.contentType } else { originalMimeType }
+                    effectiveFileName = if (!result.fileName.isEmpty()) { result.fileName } else { originalFileName }
+                    effectiveFileSize = Int64(result.bytes.size)
+                    if (this.feishuMediaSizeExceedsLimit(effectiveFileSize)) {
+                        skippedReason = "download_size_limit_exceeded"
+                    } else if (!this.feishuMediaMimeAllowed(effectiveMimeType)) {
+                        skippedReason = "mime_not_allowed"
+                    } else {
+                        let persisted = this.feishuPersistDownloadedResourceBytes(
+                            result.bytes,
+                            accountId: accountId,
+                            chatId: chatId,
+                            messageId: messageId,
+                            fileKey: fileId,
+                            mediaKind: normalizedType,
+                            fileName: effectiveFileName,
+                            mimeType: effectiveMimeType
+                        )
+                        if (!persisted.trimAscii().isEmpty()) {
+                            downloaded = true
+                            skippedReason = ""
+                            localPath = persisted
+                        } else {
+                            skippedReason = "download_failed"
+                        }
+                    }
+                } else {
+                    skippedReason = this.feishuDownloadSkippedReason(result.status)
+                }
+            }
+        }
+        record.put("fileName", JsonString(effectiveFileName))
+        record.put("mimeType", JsonString(effectiveMimeType))
+        record.put("fileSize", JsonInt(effectiveFileSize))
+        record.put("downloaded", JsonBool(downloaded))
+        record.put("skippedReason", JsonString(skippedReason))
+        record.put("localPath", JsonString(localPath))
+        record.put("downloadPath", JsonString(localPath))
         let records = JsonArray([])
         records.add(record)
         mediaContext.put("records", records)
+    }
+
+    private func feishuResourceTypeForApi(kind: String): String {
+        if (kind.trimAscii().toAsciiLower() == "image") { "image" } else { "file" }
+    }
+
+    private func fetchFeishuMessageResource(
+        accountId: String,
+        messageId: String,
+        fileKey: String,
+        resourceType: String
+    ): FeishuResourceDownloadResult {
+        let injected = this.apiClient.fetchMessageResource(accountId, messageId, fileKey, resourceType)
+        if (injected.ok || injected.status != "not_configured") {
+            return injected
+        }
+        this.fetchFeishuMessageResourceViaHttp(messageId, fileKey, resourceType)
+    }
+
+    private func fetchFeishuMessageResourceViaHttp(
+        messageId: String,
+        fileKey: String,
+        resourceType: String
+    ): FeishuResourceDownloadResult {
+        let token = this.getTenantAccessToken()
+        if (token.trimAscii().isEmpty()) {
+            return FeishuResourceDownloadResult(status: "not_configured", error: "tenant_access_token is empty")
+        }
+        let base = this.normalizeFeishuDomain()
+        let url = "${base}/open-apis/im/v1/messages/${messageId.trimAscii()}/resources/${fileKey.trimAscii()}?type=${resourceType.trimAscii()}"
+        let builder = ClientBuilder()
+        builder.readTimeout(Duration.second * 30)
+        if (url.startsWith("https")) {
+            var tlsConfig = TlsClientConfig()
+            tlsConfig.domain = URL.parse(url).hostName
+            tlsConfig.alpnProtocolsList = ["http/1.1"]
+            builder.tlsConfig(tlsConfig)
+        }
+        let client = builder.build()
+        try {
+            let reqBuilder = HttpRequestBuilder().url(url).get()
+            reqBuilder.header("Authorization", "Bearer ${token}")
+            reqBuilder.header("Accept", "*/*")
+            let response = client.send(reqBuilder.build())
+            let status = Int64(response.status)
+            let bytes = this.feishuReadAllBytes(response)
+            let contentType = response.headers.getFirst("content-type") ?? response.headers.getFirst("Content-Type") ?? ""
+            let fileName = this.feishuFileNameFromContentDisposition(
+                response.headers.getFirst("content-disposition") ?? response.headers.getFirst("Content-Disposition") ?? ""
+            )
+            if (status >= 200 && status < 300) {
+                return FeishuResourceDownloadResult(ok: true, status: "ok", bytes: bytes, contentType: contentType, fileName: fileName)
+            }
+            return FeishuResourceDownloadResult(status: this.feishuHttpStatusLabel(status), error: "feishu resource download failed: status=${status}")
+        } catch (e: Exception) {
+            return FeishuResourceDownloadResult(status: "network_error", error: e.message)
+        } finally {
+            client.close()
+        }
+    }
+
+    private func feishuReadAllBytes(response: HttpResponse): Array<Byte> {
+        let out = ArrayList<Byte>()
+        let buffer = Array<Byte>(8192, repeat: 0)
+        while (true) {
+            let n = response.body.read(buffer)
+            if (n <= 0) {
+                break
+            }
+            out.add(all: buffer[..n])
+        }
+        out.toArray()
+    }
+
+    private func feishuHttpStatusLabel(status: Int64): String {
+        if (status == 401 || status == 403) { return "forbidden" }
+        if (status == 404) { return "not_found" }
+        if (status == 429) { return "rate_limited" }
+        "http_${status}"
+    }
+
+    private func feishuDownloadSkippedReason(status: String): String {
+        let normalized = status.trimAscii().toAsciiLower()
+        if (normalized == "403" || normalized == "401" || normalized == "forbidden" || normalized == "unauthorized") {
+            return "forbidden"
+        }
+        if (normalized == "404" || normalized == "not_found") {
+            return "not_found"
+        }
+        if (normalized == "429" || normalized == "rate_limited" || normalized == "too_many_requests") {
+            return "rate_limited"
+        }
+        if (normalized.isEmpty()) {
+            return "download_failed"
+        }
+        normalized
+    }
+
+    private func feishuMediaMimeAllowed(mimeType: String): Bool {
+        let mime = mimeType.trimAscii().toAsciiLower()
+        if (this.config.media.allowedMimes.isEmpty()) {
+            return true
+        }
+        for (raw in this.config.media.allowedMimes) {
+            let allowed = raw.trimAscii().toAsciiLower()
+            if (allowed == "*" || allowed == mime) {
+                return true
+            }
+            if (allowed.endsWith("/*")) {
+                let prefix = allowed[0..allowed.size - 1]
+                if (mime.startsWith(prefix)) {
+                    return true
+                }
+            }
+        }
+        false
+    }
+
+    private func feishuMediaSizeExceedsLimit(sizeBytes: Int64): Bool {
+        let limit = this.config.media.mediaMaxBytes
+        limit > 0 && sizeBytes > limit
+    }
+
+    private func feishuPersistDownloadedResourceBytes(
+        bytes: Array<Byte>,
+        accountId!: String,
+        chatId!: String,
+        messageId!: String,
+        fileKey!: String,
+        mediaKind!: String,
+        fileName!: String,
+        mimeType!: String
+    ): String {
+        let root = Path(if (this.config.media.downloadRoot.trimAscii().isEmpty()) {
+            "/tmp/metis-feishu-media"
+        } else {
+            this.config.media.downloadRoot.trimAscii()
+        })
+        let dir = root
+            .join(this.feishuSafeMediaSegment(this.normalizeAccountId(accountId)))
+            .join(this.feishuSafeMediaSegment(chatId))
+            .join(this.feishuSafeMediaSegment(messageId))
+        let safeName = this.feishuSafeMediaFileName(fileKey, mediaKind: mediaKind, fileName: fileName, mimeType: mimeType)
+        try {
+            if (!exists(dir)) {
+                Directory.create(dir, recursive: true)
+            }
+            let target = dir.join(safeName)
+            File.writeTo(target, bytes)
+            target.toString()
+        } catch (_e: Exception) {
+            ""
+        }
+    }
+
+    private func feishuSafeMediaSegment(raw: String): String {
+        let trimmed = raw.trimAscii()
+        if (trimmed.isEmpty()) {
+            return "default"
+        }
+        let out = StringBuilder()
+        for (r in trimmed.runes()) {
+            if ((r >= r'a' && r <= r'z') || (r >= r'A' && r <= r'Z') || (r >= r'0' && r <= r'9') || r == r'.' || r == r'_' || r == r'-') {
+                out.append(r)
+            } else {
+                out.append(r'_')
+            }
+        }
+        let value = out.toString().trimAscii()
+        if (value.isEmpty()) { "default" } else { value }
+    }
+
+    private func feishuSafeMediaFileName(fileKey: String, mediaKind!: String, fileName!: String, mimeType!: String): String {
+        let candidate = if (!fileName.trimAscii().isEmpty()) {
+            fileName.trimAscii()
+        } else if (!fileKey.trimAscii().isEmpty()) {
+            fileKey.trimAscii()
+        } else {
+            mediaKind.trimAscii()
+        }
+        var safe = this.feishuSafeMediaSegment(candidate)
+        if (this.feishuFileExtensionFromName(safe).isEmpty()) {
+            safe += this.feishuFileExtensionFromMime(mimeType)
+        }
+        safe
+    }
+
+    private func feishuFileExtensionFromName(name: String): String {
+        let trimmed = name.trimAscii()
+        var dot: Int64 = -1
+        for (i in 0..trimmed.size) {
+            if (trimmed[i] == UInt8(46)) {
+                dot = i
+            }
+        }
+        if (dot >= 0 && dot < trimmed.size - 1) {
+            return trimmed[dot..]
+        }
+        ""
+    }
+
+    private func feishuFileExtensionFromMime(mimeType: String): String {
+        let mime = mimeType.trimAscii().toAsciiLower()
+        if (mime == "image/jpeg" || mime == "image/jpg") { return ".jpg" }
+        if (mime == "image/png") { return ".png" }
+        if (mime == "image/gif") { return ".gif" }
+        if (mime == "image/webp") { return ".webp" }
+        if (mime == "audio/ogg") { return ".ogg" }
+        if (mime == "audio/mpeg") { return ".mp3" }
+        if (mime == "audio/mp4") { return ".m4a" }
+        if (mime == "video/mp4") { return ".mp4" }
+        if (mime == "application/pdf") { return ".pdf" }
+        if (mime == "application/json") { return ".json" }
+        if (mime.startsWith("text/")) { return ".txt" }
+        ""
+    }
+
+    private func feishuFileNameFromContentDisposition(raw: String): String {
+        let marker = "filename="
+        let value = raw.trimAscii()
+        let lowered = value.toAsciiLower()
+        let pos = match (lowered.indexOf(marker)) {
+            case Some(v) => v
+            case None => return ""
+        }
+        var out = value[pos + marker.size..].trimAscii()
+        if (out.startsWith("\"") && out.endsWith("\"") && out.size >= 2) {
+            out = out[1..out.size - 1]
+        }
+        out
     }
 
     private func resolveFeishuAccountId(root: JsonObject): String {

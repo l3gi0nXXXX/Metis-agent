@@ -1,9 +1,12 @@
 package metis.gateway.channels.feishu
 
-import metis.gateway.model.{ChannelPolicyConfig, FeishuConfig}
+import metis.gateway.model.{ChannelPolicyConfig, FeishuConfig, FeishuMediaConfig}
 import std.core.Duration
+import std.fs.{File, Path, exists, remove}
 import std.sync.Mutex
+import std.time.DateTime
 import std.unittest.testmacro.*
+import stdx.encoding.json.{JsonArray, JsonObject, JsonString}
 
 class FeishuQueueProbe {
     private let lock = Mutex()
@@ -289,6 +292,140 @@ public class FeishuAdapterTest {
         @Expect(file.get("fileSize").getOrThrow().asInt().getValue(), 64)
         @Expect(media.get("mediaKind").getOrThrow().asString().getValue(), "media")
         @Expect(audio.get("mediaKind").getOrThrow().asString().getValue(), "audio")
+    }
+
+    @TestCase
+    public func imageResourceDownloadPersistsToConfiguredSafeTempPath(): Unit {
+        let root = "/tmp/metis-feishu-media-download-${DateTime.now().toUnixTimeStamp().toMilliseconds()}"
+        try { remove(Path(root), recursive: true) } catch (_e: Exception) { () }
+        let client = FeishuFakeApiClient()
+        client.setResource(
+            "work",
+            "om_image_dl",
+            "img_v2_dl",
+            "image",
+            "fake-image".toArray(),
+            contentType: "image/png",
+            fileName: "diagram.png"
+        )
+        let adapter = FeishuAdapter(
+            config: FeishuConfig(
+                enabled: true,
+                media: FeishuMediaConfig(downloadEnabled: true, allowedMimes: ["image/*"], downloadRoot: root)
+            ),
+            accountId: "work",
+            apiClient: client
+        )
+        adapter.start()
+        try {
+            @Expect(adapter.ingestWebhookPayload(
+                this.webhookPayload(
+                    "om_image_dl",
+                    "oc_group",
+                    "ou_1",
+                    "{\\\"image_key\\\":\\\"img_v2_dl\\\",\\\"file_name\\\":\\\"diagram.png\\\",\\\"mime_type\\\":\\\"image/png\\\"}",
+                    messageType: "image"
+                )
+            ).contains("\"ok\":true"), true)
+
+            let inbound = adapter.pullInbound()
+            @Expect(inbound.size, 1)
+            let record = inbound[0].mediaContext.get("records").getOrThrow().asArray()[0].asObject()
+            @Expect(record.get("downloaded").getOrThrow().asBool().getValue(), true)
+            @Expect(record.get("skippedReason").getOrThrow().asString().getValue(), "")
+            let localPath = record.get("localPath").getOrThrow().asString().getValue()
+            @Expect(localPath.startsWith(root), true)
+            @Expect(localPath.contains(".."), false)
+            @Expect(exists(Path(localPath)), true)
+            @Expect(String.fromUtf8(File.readFrom(Path(localPath))), "fake-image")
+        } finally {
+            try { remove(Path(root), recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func resourceDownloadReportsPermissionAndRateLimitFailures(): Unit {
+        let root = "/tmp/metis-feishu-media-errors-${DateTime.now().toUnixTimeStamp().toMilliseconds()}"
+        try { remove(Path(root), recursive: true) } catch (_e: Exception) { () }
+        let client = FeishuFakeApiClient()
+        client.setResourceError("default", "om_forbidden", "img_forbidden", "image", "forbidden")
+        client.setResourceError("default", "om_rate", "file_rate", "file", "rate_limited")
+        let adapter = FeishuAdapter(
+            config: FeishuConfig(
+                enabled: true,
+                media: FeishuMediaConfig(downloadEnabled: true, downloadRoot: root)
+            ),
+            apiClient: client
+        )
+        adapter.start()
+        try {
+            @Expect(adapter.ingestWebhookPayload(
+                this.webhookPayload(
+                    "om_forbidden",
+                    "oc_group",
+                    "ou_1",
+                    "{\\\"image_key\\\":\\\"img_forbidden\\\",\\\"mime_type\\\":\\\"image/png\\\"}",
+                    messageType: "image"
+                )
+            ).contains("\"ok\":true"), true)
+            @Expect(adapter.ingestWebhookPayload(
+                this.webhookPayload(
+                    "om_rate",
+                    "oc_group",
+                    "ou_1",
+                    "{\\\"file_key\\\":\\\"file_rate\\\",\\\"file_name\\\":\\\"rate.pdf\\\",\\\"mime_type\\\":\\\"application/pdf\\\"}",
+                    messageType: "file"
+                )
+            ).contains("\"ok\":true"), true)
+
+            let inbound = adapter.pullInbound()
+            @Expect(inbound.size, 2)
+            let forbidden = inbound[0].mediaContext.get("records").getOrThrow().asArray()[0].asObject()
+            let rate = inbound[1].mediaContext.get("records").getOrThrow().asArray()[0].asObject()
+            @Expect(forbidden.get("downloaded").getOrThrow().asBool().getValue(), false)
+            @Expect(forbidden.get("skippedReason").getOrThrow().asString().getValue(), "forbidden")
+            @Expect(rate.get("downloaded").getOrThrow().asBool().getValue(), false)
+            @Expect(rate.get("skippedReason").getOrThrow().asString().getValue(), "rate_limited")
+        } finally {
+            try { remove(Path(root), recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func groupConfigProjectsToolPolicyAndSenderGate(): Unit {
+        let groups = JsonObject()
+        let group = JsonObject()
+        group.put("allowFrom", JsonArray([JsonString("ou_allowed")]))
+        let tools = JsonObject()
+        tools.put("allow", JsonArray([JsonString("feishu_im_user_fetch_resource")]))
+        group.put("tools", tools)
+        groups.put("oc_team", group)
+        let adapter = FeishuAdapter(
+            config: FeishuConfig(
+                enabled: true,
+                groupPolicy: "allowlist",
+                groups: Some(groups)
+            )
+        )
+        adapter.start()
+        @Expect(adapter.ingestWebhookPayload(
+            this.webhookPayload("om_allowed", "oc_team", "ou_allowed", "{\\\"text\\\":\\\"@bot hello\\\"}")
+        ).contains("\"ok\":true"), true)
+        @Expect(adapter.ingestWebhookPayload(
+            this.webhookPayload("om_denied", "oc_team", "ou_other", "{\\\"text\\\":\\\"@bot hello\\\"}")
+        ).contains("\"ok\":true"), true)
+
+        let inbound = adapter.pullInbound()
+        @Expect(inbound.size, 2)
+        let route = inbound[0].mediaContext.get("context").getOrThrow().asObject()
+            .get("imRoute").getOrThrow().asObject()
+        let groupPolicy = route.get("groupPolicy").getOrThrow().asObject()
+        let routeTools = groupPolicy.get("tools").getOrThrow().asObject()
+        @Expect(routeTools.get("allow").getOrThrow().asArray()[0].asString().getValue(), "feishu_im_user_fetch_resource")
+        let deniedGate = inbound[1].mediaContext.get("context").getOrThrow().asObject()
+            .get("feishuGate").getOrThrow().asObject()
+        @Expect(deniedGate.get("triggerAgent").getOrThrow().asBool().getValue(), false)
+        @Expect(deniedGate.get("reason").getOrThrow().asString().getValue(), "sender_not_allowed")
     }
 
     @TestCase

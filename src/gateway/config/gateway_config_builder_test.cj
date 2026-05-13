@@ -95,6 +95,7 @@ public class GatewayConfigBuilderTest {
         user.feishu.allowBots = false
         user.feishu.media.downloadEnabled = true
         user.feishu.media.mediaMaxBytes = 1024
+        user.feishu.media.downloadRoot = "/tmp/metis-feishu-test-media"
         let groups = JsonObject()
         let groupRule = JsonObject()
         groupRule.put("requireMention", true.toJsonValue())
@@ -122,6 +123,7 @@ public class GatewayConfigBuilderTest {
         @Expect(feishu.accounts.isSome(), true)
         @Expect(feishu.media.downloadEnabled, true)
         @Expect(feishu.media.mediaMaxBytes, 1024)
+        @Expect(feishu.media.downloadRoot, "/tmp/metis-feishu-test-media")
     }
 
     @TestCase

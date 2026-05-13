@@ -317,6 +317,7 @@ public class GatewayServerMethodsChannelsTest {
         user.feishu.threadSession = true
         user.feishu.requireMention = true
         user.feishu.media.downloadEnabled = true
+        user.feishu.media.downloadRoot = "/tmp/metis-feishu-runtime-media"
         let accounts = JsonObject()
         let tenantAccount = JsonObject()
         tenantAccount.put("appId", JsonString("tenant-app"))
@@ -341,6 +342,8 @@ public class GatewayServerMethodsChannelsTest {
         @Expect(inspect.get("tokenRedacted").getOrThrow().asBool().getValue(), true)
         @Expect(inspect.get("accounts").getOrThrow().asArray().toJsonString().contains("tenant-b"), true)
         @Expect(inspect.toJsonString().contains("tenant-secret"), false)
+        let media = channel.get("media").getOrThrow().asObject()
+        @Expect(channelsTestString(media, "downloadRoot"), "/tmp/metis-feishu-runtime-media")
         let accountOps = channel.get("accountOps").getOrThrow().asObject()
         @Expect(channelsTestBool(accountOps, "list"), true)
         @Expect(channelsTestBool(accountOps, "describe"), true)
