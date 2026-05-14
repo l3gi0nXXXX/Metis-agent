@@ -87,7 +87,7 @@ public func gatewayFeishuResolveAccount(config: FeishuConfig, accountId: String)
         encryptKey: gatewayFeishuString(overrideObj, ["encryptKey", "encrypt_key"], config.encryptKey),
         groupSessionScope: gatewayFeishuGroupSessionScope(gatewayFeishuString(overrideObj, ["groupSessionScope", "group_session_scope"], config.groupSessionScope)),
         threadSession: gatewayFeishuBool(overrideObj, "threadSession", config.threadSession),
-        groups: gatewayFeishuObjectOption(overrideObj, "groups", config.groups),
+        groups: gatewayFeishuMergedObjectOption(overrideObj, "groups", config.groups),
         groupPolicy: gatewayFeishuGroupPolicy(gatewayFeishuString(overrideObj, ["groupPolicy", "group_policy"], config.groupPolicy)),
         groupAllowFrom: gatewayFeishuStringArray(overrideObj, "groupAllowFrom", config.groupAllowFrom),
         requireMention: gatewayFeishuBool(overrideObj, "requireMention", config.requireMention),
@@ -221,6 +221,61 @@ private func gatewayFeishuUInt16(obj: JsonObject, keys: Array<String>, fallback:
 private func gatewayFeishuObjectOption(obj: JsonObject, key: String, fallback: Option<JsonObject>): Option<JsonObject> {
     match (obj.get(key)) {
         case Some(v) => try { Some(v.asObject()) } catch (_: Exception) { fallback }
+        case None => fallback
+    }
+}
+
+private func gatewayFeishuCloneValue(value: JsonValue): JsonValue {
+    try {
+        JsonValue.fromStr(value.toJsonString())
+    } catch (_: Exception) {
+        value
+    }
+}
+
+private func gatewayFeishuCloneObject(obj: JsonObject): JsonObject {
+    try {
+        JsonValue.fromStr(obj.toJsonString()).asObject()
+    } catch (_: Exception) {
+        JsonObject()
+    }
+}
+
+private func gatewayFeishuDeepMergeObject(base: JsonObject, overrideObj: JsonObject): JsonObject {
+    let out = gatewayFeishuCloneObject(base)
+    for (key in overrideObj.getFields().keys()) {
+        match (overrideObj.get(key)) {
+            case Some(overrideValue) =>
+                let mergedValue = match (out.get(key)) {
+                    case Some(baseValue) =>
+                        try {
+                            let baseObj = baseValue.asObject()
+                            let overrideChild = overrideValue.asObject()
+                            gatewayFeishuDeepMergeObject(baseObj, overrideChild)
+                        } catch (_: Exception) {
+                            gatewayFeishuCloneValue(overrideValue)
+                        }
+                    case None => gatewayFeishuCloneValue(overrideValue)
+                }
+                out.put(key, mergedValue)
+            case None => ()
+        }
+    }
+    out
+}
+
+private func gatewayFeishuMergedObjectOption(obj: JsonObject, key: String, fallback: Option<JsonObject>): Option<JsonObject> {
+    match (obj.get(key)) {
+        case Some(v) =>
+            try {
+                let overrideObj = v.asObject()
+                match (fallback) {
+                    case Some(base) => Some(gatewayFeishuDeepMergeObject(base, overrideObj))
+                    case None => Some(gatewayFeishuCloneObject(overrideObj))
+                }
+            } catch (_: Exception) {
+                fallback
+            }
         case None => fallback
     }
 }

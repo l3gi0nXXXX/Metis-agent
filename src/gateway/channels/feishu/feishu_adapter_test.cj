@@ -149,6 +149,53 @@ public class FeishuAdapterTest {
     }
 
     @TestCase
+    public func accountResolverDeepMergesSupportedNestedGroupOverrides(): Unit {
+        let baseTeam = JsonObject()
+        baseTeam.put("requireMention", JsonBool(true))
+        let baseTools = JsonObject()
+        baseTools.put("deny", JsonArray([JsonString("feishu_drive_file")]))
+        baseTeam.put("tools", baseTools)
+        let baseWildcard = JsonObject()
+        baseWildcard.put("allowBots", JsonBool(false))
+        let baseGroups = JsonObject()
+        baseGroups.put("oc_team", baseTeam)
+        baseGroups.put("*", baseWildcard)
+
+        let accountTeam = JsonObject()
+        accountTeam.put("systemPrompt", JsonString("tenant-a group prompt"))
+        let accountTools = JsonObject()
+        accountTools.put("allow", JsonArray([JsonString("feishu_fetch_doc")]))
+        accountTeam.put("tools", accountTools)
+        let accountOnly = JsonObject()
+        accountOnly.put("requireMention", JsonBool(false))
+        let accountGroups = JsonObject()
+        accountGroups.put("oc_team", accountTeam)
+        accountGroups.put("oc_account_only", accountOnly)
+        let tenant = JsonObject()
+        tenant.put("groups", accountGroups)
+        let accounts = JsonObject()
+        accounts.put("tenant-a", tenant)
+
+        let config = FeishuConfig(
+            enabled: true,
+            defaultAccount: "tenant-a",
+            accounts: Some(accounts),
+            groups: Some(baseGroups)
+        )
+
+        let resolvedGroups = gatewayFeishuResolveAccount(config, "tenant-a").config.groups.getOrThrow()
+        @Expect(resolvedGroups.getFields().contains("oc_team"), true)
+        @Expect(resolvedGroups.getFields().contains("oc_account_only"), true)
+        @Expect(resolvedGroups.getFields().contains("*"), true)
+        let mergedTeam = resolvedGroups.get("oc_team").getOrThrow().asObject()
+        @Expect(mergedTeam.get("requireMention").getOrThrow().asBool().getValue(), true)
+        @Expect(mergedTeam.get("systemPrompt").getOrThrow().asString().getValue(), "tenant-a group prompt")
+        let mergedTools = mergedTeam.get("tools").getOrThrow().asObject()
+        @Expect(mergedTools.get("allow").getOrThrow().asArray().size(), 1)
+        @Expect(mergedTools.get("deny").getOrThrow().asArray().size(), 1)
+    }
+
+    @TestCase
     public func disabledAccountOverrideDoesNotRunAdapterTransport(): Unit {
         let accounts = JsonObject()
         let disabled = JsonObject()
@@ -663,6 +710,34 @@ public class FeishuAdapterTest {
         let route = inbound[0].mediaContext.get("context").getOrThrow().asObject()
             .get("imRoute").getOrThrow().asObject()
         @Expect(route.get("threadSessionKey").getOrThrow().asString().getValue(), "oc_threads:topic:omt_1")
+    }
+
+    @TestCase
+    public func threadSessionCachesThreadCapabilityAndReportsSkippedReason(): Unit {
+        let client = FeishuFakeApiClient()
+        client.setThreadCapable("oc_plain", false)
+        let adapter = FeishuAdapter(
+            config: FeishuConfig(enabled: true, threadSession: true),
+            apiClient: client
+        )
+        adapter.start()
+        @Expect(adapter.ingestWebhookPayload(
+            this.webhookPayload("om_thread_no_1", "oc_plain", "ou_1", "{\\\"text\\\":\\\"topic\\\"}", threadId: "omt_1")
+        ).contains("\"ok\":true"), true)
+        @Expect(adapter.ingestWebhookPayload(
+            this.webhookPayload("om_thread_no_2", "oc_plain", "ou_1", "{\\\"text\\\":\\\"topic\\\"}", threadId: "omt_2")
+        ).contains("\"ok\":true"), true)
+
+        let inbound = adapter.pullInbound()
+        @Expect(inbound.size, 2)
+        @Expect(inbound[0].conversationId.getOrThrow(), "oc_plain")
+        @Expect(client.threadCapabilityChecks("oc_plain"), 1)
+        let route = inbound[0].mediaContext.get("context").getOrThrow().asObject()
+            .get("imRoute").getOrThrow().asObject()
+        @Expect(route.get("threadSessionKey").isNone(), true)
+        let diagnostic = route.get("threadSessionDiagnostic").getOrThrow().asObject()
+        @Expect(diagnostic.get("status").getOrThrow().asString().getValue(), "skipped")
+        @Expect(diagnostic.get("reason").getOrThrow().asString().getValue(), "thread_not_capable")
     }
 
 }

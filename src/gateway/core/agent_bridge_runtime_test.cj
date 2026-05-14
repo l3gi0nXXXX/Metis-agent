@@ -8,7 +8,7 @@ import std.env.{getVariable, setVariable}
 import std.fs.{Directory, File, Path, exists, remove}
 import std.time.DateTime
 import std.unittest.testmacro.*
-import stdx.encoding.json.{JsonArray, JsonObject, JsonString}
+import stdx.encoding.json.{JsonArray, JsonObject, JsonString, JsonValue}
 
 private func withAgentBridgeTempHome<T>(label: String, block: (Path) -> T): T {
     synchronized(MetisProcessEnvironmentLock) {
@@ -61,6 +61,21 @@ private func writeAgentBridgeAgentConfig(home: Path): Unit {
     CliConfig.invalidatePathCache()
     MetisConfigManager.invalidate()
     CliSettingManager.invalidate()
+}
+
+private func writeAgentBridgeAuthProfile(path: Path, provider: String, secret: String): Unit {
+    Directory.create(path.parent, recursive: true)
+    let root = JsonObject()
+    let providers = JsonObject()
+    let row = JsonObject()
+    row.put("apiKey", JsonString(secret))
+    providers.put(provider, row)
+    root.put("providers", providers)
+    File.writeTo(path, root.toJsonString().toArray())
+}
+
+private func readAgentBridgeJson(path: Path): JsonObject {
+    JsonValue.fromStr(String.fromUtf8(File.readFrom(path))).asObject()
 }
 
 @Test
@@ -397,6 +412,80 @@ public class AgentBridgeRuntimeTest {
             @Expect(exists(home.join("agents").join("ops").join("agent").join("models.json")), true)
             @Expect(exists(home.join("models.json")), false)
         })
+    }
+
+    @TestCase
+    public func gatewayRuntimeStateUsesSelectedAgentAuthProfileWithoutLeakingPeerSecrets(): Unit {
+        withAgentBridgeTempHome("metis-s07-agent-bridge-auth-source", { home: Path =>
+            writeAgentBridgeAgentConfig(home)
+            let writerAuth = home.join("agents").join("writer").join("agent").join("auth-profiles.json")
+            let opsAuth = home.join("agents").join("ops").join("agent").join("auth-profiles.json")
+            writeAgentBridgeAuthProfile(writerAuth, "openai", "writer-secret-never-log")
+            writeAgentBridgeAuthProfile(opsAuth, "dashscope", "ops-secret-never-log")
+
+            let writerContext = gatewayResolveSessionContext(
+                GatewaySessionRequest(
+                    GatewayIngressSource.DashboardRpc,
+                    sessionHint: "main",
+                    agentId: "writer"
+                )
+            )
+            let opsContext = gatewayResolveSessionContext(
+                GatewaySessionRequest(
+                    GatewayIngressSource.DashboardRpc,
+                    sessionHint: "main",
+                    agentId: "ops"
+                )
+            )
+
+            @Expect(gatewayDebugModelOrderForTurnContext(writerContext.turnContext)[0], "openai:gpt-4o-mini")
+            @Expect(gatewayDebugModelOrderForTurnContext(opsContext.turnContext)[0], "dashscope:qwen-plus")
+
+            let writerModelsPath = home.join("agents").join("writer").join("agent").join("models.json")
+            let opsModelsPath = home.join("agents").join("ops").join("agent").join("models.json")
+            let writerRuntime = readAgentBridgeJson(writerModelsPath).toJsonString()
+            let opsRuntime = readAgentBridgeJson(opsModelsPath).toJsonString()
+
+            @Expect(writerRuntime.contains("agent.auth-profiles.openai"), true)
+            @Expect(writerRuntime.contains("agent.auth-profiles.dashscope"), false)
+            @Expect(opsRuntime.contains("agent.auth-profiles.dashscope"), true)
+            @Expect(opsRuntime.contains("agent.auth-profiles.openai"), false)
+            @Expect(writerRuntime.contains("writer-secret-never-log"), false)
+            @Expect(writerRuntime.contains("ops-secret-never-log"), false)
+            @Expect(opsRuntime.contains("writer-secret-never-log"), false)
+            @Expect(opsRuntime.contains("ops-secret-never-log"), false)
+        })
+    }
+
+    @TestCase
+    public func gatewayTurnGroupPolicySystemPromptIsAddedToRuntimePromptAndToolsAreNarrowed(): Unit {
+        let route = JsonObject()
+        let groupPolicy = JsonObject()
+        groupPolicy.put("systemPrompt", JsonString("group-a-only-system-prompt"))
+        groupPolicy.put("skills", JsonArray([JsonString("feishu-docs")]))
+        let tools = JsonObject()
+        tools.put("allow", JsonArray([JsonString("feishu_fetch_doc")]))
+        groupPolicy.put("tools", tools)
+        route.put("groupPolicy", groupPolicy)
+        let context = GatewayTurnContext(
+            "writer",
+            sessionKey: "agent:writer:feishu:group:oc_a",
+            channelName: "feishu",
+            accountId: "tenant-a",
+            peerId: "oc_a",
+            route: route
+        )
+
+        let names = gatewayPolicyFilteredChatToolNamesForTurnContext(context)
+        let prompt = gatewayPolicyFilteredSystemPromptForTurnContext(
+            context,
+            channelName: "feishu",
+            modelName: "openai:gpt-4o-mini"
+        )
+
+        @Expect(names.contains("feishu_fetch_doc"), true)
+        @Expect(names.contains("feishu_drive_file"), false)
+        @Expect(prompt.contains("group-a-only-system-prompt"), true)
     }
 
     // @TestCase

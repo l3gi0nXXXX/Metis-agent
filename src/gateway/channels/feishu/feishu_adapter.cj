@@ -109,6 +109,7 @@ public class FeishuNoopApiClient <: FeishuApiClient {
 
 public class FeishuFakeApiClient <: FeishuApiClient {
     private let threadCapable = HashMap<String, Bool>()
+    private let threadCapabilityCheckCounts = HashMap<String, Int64>()
     private let resources = HashMap<String, FeishuResourceDownloadResult>()
     private let textMessages = ArrayList<String>()
     private let sentCards = ArrayList<FeishuInteractiveCard>()
@@ -121,7 +122,13 @@ public class FeishuFakeApiClient <: FeishuApiClient {
     }
 
     public func isThreadCapableGroup(chatId: String): Bool {
-        this.threadCapable.get(chatId.trimAscii()) ?? false
+        let normalized = chatId.trimAscii()
+        this.threadCapabilityCheckCounts[normalized] = (this.threadCapabilityCheckCounts.get(normalized) ?? 0) + 1
+        this.threadCapable.get(normalized) ?? false
+    }
+
+    public func threadCapabilityChecks(chatId: String): Int64 {
+        this.threadCapabilityCheckCounts.get(chatId.trimAscii()) ?? 0
     }
 
     public func setResource(
@@ -235,6 +242,7 @@ public class FeishuAdapter <: ChannelAdapter {
     private let tenantAccessTokens = HashMap<String, String>()
     private let tenantAccessTokenExpiries = HashMap<String, Int64>()
     private var lastSendError: String = ""
+    private let threadCapabilityCache = HashMap<String, Bool>()
     private let feishuMonitorLock = Mutex()
     private var feishuMonitorProcess: Option<SubProcess> = None
     private var feishuMonitorStdIn: Option<StringWriter<OutputStream>> = None
@@ -818,8 +826,14 @@ public class FeishuAdapter <: ChannelAdapter {
                     route.put("parentPeerKind", JsonString("group"))
                     route.put("parentPeerId", JsonString(chatId.trimAscii()))
                     route.put("threadId", JsonString(topicId))
-                    if (this.feishuThreadSessionEnabled(cfg, chatId, topicId)) {
+                    let threadSessionStatus = this.feishuThreadSessionStatus(cfg, chatId, topicId)
+                    if (threadSessionStatus[0]) {
                         route.put("threadSessionKey", JsonString(this.buildTopicConversationId(chatId.trimAscii(), topicId)))
+                    } else if (cfg.threadSession) {
+                        let diagnostic = JsonObject()
+                        diagnostic.put("status", JsonString("skipped"))
+                        diagnostic.put("reason", JsonString(threadSessionStatus[1]))
+                        route.put("threadSessionDiagnostic", diagnostic)
                     }
                 } else {
                     route.put("peerKind", JsonString("group"))
@@ -1787,11 +1801,39 @@ public class FeishuAdapter <: ChannelAdapter {
         }
     }
 
+    private func feishuThreadCapabilityCacheKey(accountId: String, chatId: String): String {
+        "${this.normalizeAccountId(accountId)}:${chatId.trimAscii()}"
+    }
+
+    private func feishuThreadCapableGroup(accountId: String, chatId: String): Bool {
+        let key = this.feishuThreadCapabilityCacheKey(accountId, chatId)
+        match (this.threadCapabilityCache.get(key)) {
+            case Some(cached) => return cached
+            case None => ()
+        }
+        let capable = this.apiClient.isThreadCapableGroup(chatId.trimAscii())
+        this.threadCapabilityCache[key] = capable
+        capable
+    }
+
+    private func feishuThreadSessionStatus(cfg: FeishuConfig, chatId: String, topicId: String): (Bool, String) {
+        if (!cfg.threadSession) {
+            return (false, "thread_session_disabled")
+        }
+        if (chatId.trimAscii().isEmpty()) {
+            return (false, "missing_chat_id")
+        }
+        if (topicId.trimAscii().isEmpty()) {
+            return (false, "missing_thread_id")
+        }
+        if (!this.feishuThreadCapableGroup(cfg.accountId, chatId)) {
+            return (false, "thread_not_capable")
+        }
+        (true, "enabled")
+    }
+
     private func feishuThreadSessionEnabled(cfg: FeishuConfig, chatId: String, topicId: String): Bool {
-        cfg.threadSession &&
-            !chatId.trimAscii().isEmpty() &&
-            !topicId.trimAscii().isEmpty() &&
-            this.apiClient.isThreadCapableGroup(chatId.trimAscii())
+        this.feishuThreadSessionStatus(cfg, chatId, topicId)[0]
     }
 
     private func resolveReplyTargetMessageId(messageId: String, rootId: String, threadId: String): Option<String> {

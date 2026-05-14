@@ -207,6 +207,56 @@ private func gatewayRouteRuntimeSkillNames(turnContext: Option<GatewayTurnContex
     []
 }
 
+private func gatewayRouteSystemPrompt(turnContext: Option<GatewayTurnContext>): String {
+    match (turnContext) {
+        case Some(ctx) =>
+            match (ctx.route.get("systemPrompt")) {
+                case Some(value) =>
+                    try {
+                        let text = value.asString().getValue().trimAscii()
+                        if (!text.isEmpty()) {
+                            return text
+                        }
+                    } catch (_: Exception) {
+                        ()
+                    }
+                case None => ()
+            }
+            for (container in ["groupPolicy", "policy", "runtimePolicy"]) {
+                match (gatewayRouteObject(ctx.route, container)) {
+                    case Some(obj) =>
+                        match (obj.get("systemPrompt")) {
+                            case Some(value) =>
+                                try {
+                                    let text = value.asString().getValue().trimAscii()
+                                    if (!text.isEmpty()) {
+                                        return text
+                                    }
+                                } catch (_: Exception) {
+                                    ()
+                                }
+                            case None => ()
+                        }
+                    case None => ()
+                }
+            }
+        case None => ()
+    }
+    ""
+}
+
+private func gatewayMergeExtraSystemPrompt(extraPrompt: String, turnContext: Option<GatewayTurnContext>): String {
+    let routePrompt = gatewayRouteSystemPrompt(turnContext)
+    let explicit = extraPrompt.trimAscii()
+    if (routePrompt.isEmpty()) {
+        return explicit
+    }
+    if (explicit.isEmpty()) {
+        return routePrompt
+    }
+    explicit + "\n\n" + routePrompt
+}
+
 private func gatewayRuntimePolicyRootForTurn(user: GatewayUserSettings, turnContext: Option<GatewayTurnContext>): JsonObject {
     let root = gatewayRuntimePolicyRoot(user)
     match (turnContext) {
@@ -556,7 +606,10 @@ private func buildGatewaySystemPrompt(
     )
     params.contextFiles = bootstrap.files
     params.promptContribution = MetisSystemPromptBuilder.buildPromptContributionForModel(modelName)
-    params.extraSystemPrompt = buildGatewayExtraSystemPrompt(channelName, extraPrompt: extraPrompt)
+    params.extraSystemPrompt = buildGatewayExtraSystemPrompt(
+        channelName,
+        extraPrompt: gatewayMergeExtraSystemPrompt(extraPrompt, turnContext)
+    )
     (MetisSystemPromptBuilder.build(params, cangjieMode: false), bootstrap)
 }
 
