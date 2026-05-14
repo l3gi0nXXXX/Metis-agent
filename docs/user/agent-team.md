@@ -4,6 +4,12 @@ AgentTeam lets one Gateway runtime manage multiple named agents, route IM accoun
 
 Telegram and Feishu are the first-priority IM targets for AgentTeam. Other IM adapters should extend through the same `ChannelAdapter` inbound model, route binding, account, peer, and thread semantics instead of adding agent routing inside each adapter.
 
+## Collaboration Modes
+
+The default product semantics are deterministic Gateway routing plus optional deterministic fan-out. A normal route resolves one inbound CLI, Telegram, or Feishu turn to one agent and one agent-scoped session. When team `broadcast.enabled` is `true`, Gateway fans the same inbound turn out to the configured `broadcast.members` list, keeps each member's workspace/model/session isolated, and builds an aggregate response with per-agent status.
+
+Manager delegation can coexist with this model, but it is not a separate productized runtime yet. Today, configure a manager as a normal team member or `defaultAgentId`, give it profile instructions in `AGENTS.md`/`SOUL.md`, and bind IM routes to that manager when you want manager-style triage. Any handoff still runs through normal Gateway route/session boundaries; Metis does not yet provide autonomous manager task decomposition, cross-agent handoff policy, or a separate manager-delegation execution engine.
+
 ## Supported Capability Matrix
 
 | Area | Supported now | Remaining gap |
@@ -38,6 +44,16 @@ In another shell, check that Gateway is reachable:
 metis gateway status
 metis gateway health
 ```
+
+## Use AgentTeam From Each Surface
+
+CLI: use `metis agents team create/list/get/update/delete` for the common team lifecycle, `metis agents bind/unbind` for simple channel/account routes, and `metis gateway call agents.teams.update ...` for richer structured bindings or broadcast settings.
+
+Telegram: configure the built-in Telegram channel, then bind `telegram:<accountId>` or a structured route with group/topic peer data to a member agent. Native Telegram commands such as `/focus`, `/unfocus`, `/agents`, and `/subagents` continue to enter the same Gateway route/session path.
+
+Feishu: configure Feishu accounts and use native `/feishu start`, `/feishu doctor`, `/feishu auth`, and `/feishu info --all` from Feishu conversations when available. Bind `feishu:<accountId>` or structured group/thread routes to member agents. OAuth/OAPI and card behavior remain Gateway-backed and are not handled by browser-local files.
+
+Control UI: open Agents -> Teams to create teams, edit members and aliases, preview bindings, apply Gateway RPC changes, edit allowed profile files, inspect per-agent model state, and review Feishu readiness/doctor guidance. The browser is a Gateway RPC client only.
 
 ## Create One Agent
 
@@ -319,6 +335,7 @@ After editing `~/.metis/metis.json`, restart Gateway so the running process load
 
 - `metis agents bind` intentionally exposes the simple `channel[:account]` form. Use Gateway RPC JSON payloads for peer/thread/team/role binding matches.
 - Migration dry-run is read-only. It previews diagnostics and route-binding application but does not rewrite `session.dmScope`, model state, auth profiles, or workspace files automatically.
+- Manager delegation is currently a configuration/profile pattern using a normal manager agent. Deterministic fan-out is the implemented team collaboration mode when `broadcast.enabled=true`; full manager-delegation product policy remains planned work.
 - Feishu AgentTeam routing is not the same as the full OpenClaw Lark plugin surface. Message routing, native command replies, redacted status, and dry-run diagnostics exist; real OAPI tools, historical resource downloads, streaming card parity, and complete OAuth/UAT runtime remain partial unless a later release note says otherwise.
 - The Control UI capability panel is not a plugin marketplace. It lists Metis-owned built-in tools, skills, profile files, channel capabilities, and RPC surfaces only.
 - Feishu auth controls in Control UI are status and guidance only until a stable Gateway auth-start/status RPC is present. Browser code must not create, edit, or delete Feishu token files.

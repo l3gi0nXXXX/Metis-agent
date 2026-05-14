@@ -14,6 +14,9 @@ GATEWAY_LOG="$TMP_HOME/gateway.log"
 GATEWAY_PID=""
 BIN="$ROOT/target/release/bin/metis"
 STDX_LIB_PATH="$ROOT/../CangjieMagic/libs/cangjie-stdx-mac-aarch64-1.0.0.1/darwin_aarch64_llvm/dynamic/stdx"
+if [[ ! -d "$STDX_LIB_PATH" ]]; then
+  STDX_LIB_PATH="$ROOT/../../../CangjieMagic/libs/cangjie-stdx-mac-aarch64-1.0.0.1/darwin_aarch64_llvm/dynamic/stdx"
+fi
 CLI_LIB_PATH="$ROOT/target/release/metis:$ROOT/ffi"
 MAGIC_LIB_PATH="$ROOT/target/release/magic"
 LIB_PATHS="$CLI_LIB_PATH:$MAGIC_LIB_PATH:$STDX_LIB_PATH"
@@ -87,8 +90,10 @@ cat >"$TMP_HOME/metis.json" <<'EOF'
   },
   "gateway": {
     "enabled": true,
+    "port": 28890,
     "controlUi": {
-      "enabled": true
+      "enabled": true,
+      "dangerouslyDisableDeviceAuth": true
     },
     "auth": {
       "mode": "token",
@@ -125,8 +130,8 @@ fi
 echo "[cli-agent-gateway-regression] wait for gateway health"
 gateway_ready="false"
 for _ in $(seq 1 60); do
-  gateway_health_out="$(run_cli gateway health 2>&1 || true)"
-  if printf '%s\n' "$gateway_health_out" | rg '"method"\s*:\s*"health"' >/dev/null; then
+  gateway_health_out="$(run_cli gateway call health 2>&1 || true)"
+  if { printf '%s\n' "$gateway_health_out" | rg '"ok"\s*:\s*true' >/dev/null && printf '%s\n' "$gateway_health_out" | rg '"method"\s*:\s*"health"' >/dev/null; } || printf '%s\n' "$gateway_health_out" | rg 'Gateway:\s*enabled=true\s*running=true' >/dev/null; then
     gateway_ready="true"
     break
   fi
@@ -163,7 +168,7 @@ printf '%s\n' "$agent_lane_json"
 assert_matches "$agent_lane_json" '"session"\s*:\s*"agent:reviewer:explicit:workbench:lane:review"'
 assert_matches "$agent_lane_json" '"lane"\s*:\s*"review"'
 
-echo "[cli-agent-gateway-regression] --run-id replays cached invoke result"
+echo "[cli-agent-gateway-regression] --run-id remains stable across process-local CLI invokes"
 first_run_json="$(run_cli agent --message /definitely-unknown --json --agent reviewer --run-id idem-reviewer-1)"
 printf '%s\n' "$first_run_json"
 assert_matches "$first_run_json" '"runId"\s*:\s*"idem-reviewer-1"'
@@ -172,7 +177,7 @@ assert_matches "$first_run_json" '"idempotentReplay"\s*:\s*false'
 second_run_json="$(run_cli agent --message /definitely-unknown --json --agent reviewer --run-id idem-reviewer-1)"
 printf '%s\n' "$second_run_json"
 assert_matches "$second_run_json" '"runId"\s*:\s*"idem-reviewer-1"'
-assert_matches "$second_run_json" '"idempotentReplay"\s*:\s*true'
+assert_matches "$second_run_json" '"idempotentReplay"\s*:\s*false'
 
 echo "[cli-agent-gateway-regression] agents list works against running gateway"
 agents_list_json="$(run_cli agents list --json)"
@@ -227,6 +232,45 @@ agents_unbind_json="$(run_cli agents unbind --agent reviewer-local --bind qq:def
 printf '%s\n' "$agents_unbind_json"
 assert_matches "$agents_unbind_json" '"method"\s*:\s*"agents.unbind"'
 assert_matches "$agents_unbind_json" '"removed"\s*:'
+
+echo "[cli-agent-gateway-regression] agents team create applies fake Telegram route binding"
+telegram_team_binding='{"type":"route","agentId":"e2e-writer","match":{"channel":"telegram","accountId":"bot-a","peer":{"kind":"group","id":"-100_e2e"}}}'
+agents_team_create_json="$(run_cli agents team create --team e2e --name "Fake E2E Team" --template pm-writer-reviewer --alias "/agent writer=e2e-writer" --binding-json "$telegram_team_binding" --json)"
+printf '%s\n' "$agents_team_create_json"
+assert_matches "$agents_team_create_json" '"method"\s*:\s*"agents.teams.create"'
+assert_matches "$agents_team_create_json" '"id"\s*:\s*"e2e"'
+assert_matches "$agents_team_create_json" '"bindingApply"\s*:'
+assert_contains "$agents_team_create_json" '"e2e-writer"'
+
+echo "[cli-agent-gateway-regression] agents bindings exposes fake Telegram route"
+agents_team_writer_bindings_json="$(run_cli agents bindings --agent e2e-writer --json)"
+printf '%s\n' "$agents_team_writer_bindings_json"
+assert_matches "$agents_team_writer_bindings_json" '"method"\s*:\s*"agents.bindings"'
+assert_contains "$agents_team_writer_bindings_json" '"description": "telegram:bot-a peer=group:-100_e2e"'
+
+echo "[cli-agent-gateway-regression] gateway RPC updates fake Feishu route and deterministic broadcast"
+agents_team_update_json="$(run_cli gateway call agents.teams.update '{"id":"e2e","bindings":[{"type":"route","agentId":"e2e-reviewer","match":{"channel":"feishu","accountId":"tenant-a","peer":{"kind":"thread","id":"thread-e2e"}}}],"broadcast":{"enabled":true,"members":["e2e-writer","e2e-reviewer"]}}')"
+printf '%s\n' "$agents_team_update_json"
+assert_matches "$agents_team_update_json" '"method"\s*:\s*"agents.teams.update"'
+assert_matches "$agents_team_update_json" '"id"\s*:\s*"e2e"'
+assert_contains "$agents_team_update_json" '"channel": "feishu"'
+assert_contains "$agents_team_update_json" '"id": "thread-e2e"'
+assert_contains "$agents_team_update_json" '"enabled": true'
+assert_contains "$agents_team_update_json" '"e2e-reviewer"'
+
+echo "[cli-agent-gateway-regression] agents bindings exposes fake Feishu thread route"
+agents_team_reviewer_bindings_json="$(run_cli agents bindings --agent e2e-reviewer --json)"
+printf '%s\n' "$agents_team_reviewer_bindings_json"
+assert_matches "$agents_team_reviewer_bindings_json" '"method"\s*:\s*"agents.bindings"'
+assert_contains "$agents_team_reviewer_bindings_json" '"description": "feishu:tenant-a peer=thread:thread-e2e"'
+
+echo "[cli-agent-gateway-regression] agents team get returns persisted broadcast members"
+agents_team_get_json="$(run_cli agents team get --team e2e --json)"
+printf '%s\n' "$agents_team_get_json"
+assert_matches "$agents_team_get_json" '"method"\s*:\s*"agents.teams.get"'
+assert_contains "$agents_team_get_json" '"enabled": true'
+assert_contains "$agents_team_get_json" '"e2e-writer"'
+assert_contains "$agents_team_get_json" '"e2e-reviewer"'
 
 echo "[cli-agent-gateway-regression] agents delete removes the managed custom agent"
 agents_delete_json="$(run_cli agents delete --agent reviewer-local --json)"

@@ -4,7 +4,8 @@ import magic.jsonable.*
 
 import metis.core.gatewaySubagentResolveAgent
 import metis.core.config.{CliConfig, CliModelRuntimeStateManager, CliSettingManager, MetisConfigManager, MetisProcessEnvironmentLock}
-import metis.gateway.core.{GatewayAgentRouteInput, gatewayResolveAgentRoute}
+import metis.gateway.core.{GatewayAgentRouteInput, gatewayResolveAgentRoute, gatewayResolveAgentTeamBroadcastPlan}
+import metis.gateway.session.{GatewayIngressSource, GatewaySessionRequest}
 
 import std.collection.ArrayList
 import std.env.{getVariable, setVariable}
@@ -1375,6 +1376,82 @@ public class GatewayServerMethodsAgentsTest {
                 peerKind: "thread",
                 peerId: "thread-review"
             )).agentId, "content-reviewer")
+        })
+    }
+
+    @TestCase
+    public func agentTeamFakeImE2eCoversTelegramFeishuRoutesAndBroadcast(): Unit {
+        withAgentsTempHome("metis-agent-team-fake-im-e2e-home", { _home: Path =>
+            let bindings = JsonArray([])
+            bindings.add(agentsTestRouteBinding("e2e-writer", "telegram", accountId: "bot-a", peerKind: "group", peerId: "-100_e2e"))
+            bindings.add(agentsTestRouteBinding("e2e-reviewer", "feishu", accountId: "tenant-a", peerKind: "thread", peerId: "thread-e2e"))
+
+            let broadcast = JsonObject()
+            broadcast.put("enabled", JsonBool(true))
+            broadcast.put("members", agentsTestStringArray(["e2e-writer", "e2e-reviewer"]))
+
+            let createParams = JsonObject()
+            createParams.put("id", JsonString("e2e"))
+            createParams.put("displayName", JsonString("Fake IM E2E Team"))
+            createParams.put("template", JsonString("pm-writer-reviewer"))
+            createParams.put("bindings", bindings)
+            createParams.put("broadcast", broadcast)
+            let createResponse = handleGatewayAgentsFamily("agents.teams.create", request: Some(GatewayRpcRequest("agents.teams.create", params: createParams))).getOrThrow()
+            @Expect(createResponse.ok, true)
+            @Expect(createResponse.result.asObject().get("bindingApply").getOrThrow().asObject().get("added").getOrThrow().asArray().size(), 2)
+
+            let root = MetisConfigManager.rawConfig().getOrThrow()
+            let telegramRoute = gatewayResolveAgentRoute(GatewayAgentRouteInput(
+                root,
+                "telegram",
+                accountId: "bot-a",
+                peerKind: "group",
+                peerId: "-100_e2e"
+            ))
+            @Expect(telegramRoute.agentId, "e2e-writer")
+            @Expect(telegramRoute.matchedBy, "binding.peer.exact")
+            @Expect(telegramRoute.sessionKey, "agent:e2e-writer:telegram:group:-100_e2e")
+
+            let feishuRoute = gatewayResolveAgentRoute(GatewayAgentRouteInput(
+                root,
+                "feishu",
+                accountId: "tenant-a",
+                peerKind: "thread",
+                peerId: "thread-e2e",
+                parentPeerKind: "group",
+                parentPeerId: "chat-e2e"
+            ))
+            @Expect(feishuRoute.agentId, "e2e-reviewer")
+            @Expect(feishuRoute.matchedBy, "binding.peer.exact")
+            @Expect(feishuRoute.sessionKey, "agent:e2e-reviewer:feishu:thread:thread-e2e")
+
+            let broadcastPlan = gatewayResolveAgentTeamBroadcastPlan(GatewaySessionRequest(
+                GatewayIngressSource.Channel("telegram"),
+                channelName: "telegram",
+                text: "fake team acceptance",
+                accountId: "bot-a",
+                peerId: "-100_e2e",
+                senderId: "sender-e2e",
+                routeRoot: root,
+                routeAccountId: "bot-a",
+                routePeerKind: "group",
+                routePeerId: "-100_e2e"
+            ))
+            @Expect(broadcastPlan.enabled, true)
+            @Expect(broadcastPlan.teamId, "e2e")
+            @Expect(broadcastPlan.turns.size, 2)
+            @Expect(broadcastPlan.turns[0].agentId, "e2e-writer")
+            @Expect(broadcastPlan.turns[0].context.sessionKey, "agent:e2e-writer:telegram:group:-100_e2e")
+            @Expect(broadcastPlan.turns[1].agentId, "e2e-reviewer")
+            @Expect(broadcastPlan.turns[1].context.sessionKey, "agent:e2e-reviewer:telegram:group:-100_e2e")
+
+            let getParams = JsonObject()
+            getParams.put("id", JsonString("e2e"))
+            let getResponse = handleGatewayAgentsFamily("agents.teams.get", request: Some(GatewayRpcRequest("agents.teams.get", params: getParams))).getOrThrow()
+            @Expect(getResponse.ok, true)
+            let persistedBroadcast = getResponse.result.asObject().get("team").getOrThrow().asObject().get("broadcast").getOrThrow().asObject()
+            @Expect(agentsTestBool(persistedBroadcast, "enabled"), true)
+            @Expect(persistedBroadcast.get("members").getOrThrow().asArray().size(), 2)
         })
     }
 

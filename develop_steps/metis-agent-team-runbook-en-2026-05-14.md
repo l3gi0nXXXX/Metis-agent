@@ -35,7 +35,20 @@ Agent Team management stays behind Gateway RPC and Metis configuration managemen
 
 Feishu app id, app secret, token store files, and model credentials must remain in Gateway-side config or auth storage. The UI may display only redacted summaries.
 
-## 4. Team Creation
+## 4. Default Collaboration Semantics And Entry Points
+
+The current default product semantics are deterministic Gateway routing plus optional deterministic fan-out. A normal CLI, Telegram, or Feishu inbound request resolves to one agent and one agent-scoped session. Gateway fans the same turn out only when the team has `broadcast.enabled=true` and a non-empty `broadcast.members` list; each selected member keeps separate workspace, model, sessions, and per-agent delivery status.
+
+Manager delegation can coexist with this model, but it is not a separate productized runtime yet. For manager-style behavior today, configure a manager as a normal member or `defaultAgentId`, put decomposition and handoff instructions in `AGENTS.md`, `SOUL.md`, or another allowed profile file, and bind CLI/IM routes to that manager. Execution still stays inside the existing Gateway route/session/session-runner boundary. Metis does not yet provide autonomous manager task decomposition, cross-agent handoff policy, or a separate manager-delegation engine.
+
+Entry points:
+
+- CLI: use `metis agents team create/list/get/update/delete` for the common team lifecycle; use `metis agents bind/unbind` for simple `channel[:account]` bindings; use `metis gateway call agents.teams.update ...` for structured peer/thread/team/role bindings or broadcast settings.
+- Telegram: configure the built-in Telegram channel, then bind `telegram:<accountId>` or a structured group/topic route to a member agent. Native commands such as `/focus`, `/unfocus`, `/agents`, and `/subagents` still enter the unified Gateway route path.
+- Feishu: configure Feishu account/app settings, then use `/feishu start`, `/feishu doctor`, `/feishu auth`, and `/feishu info --all` for conversation-side checks when available. Bind `feishu:<accountId>` or structured group/thread routes to member agents. OAuth/OAPI/card behavior must stay behind Gateway backend code or native commands, not browser-local files.
+- Control UI: open Agents -> Teams to create teams, edit members and aliases, preview and apply bindings, edit allowed profile files, inspect model state, and review Feishu readiness/doctor guidance. The browser is only a Gateway RPC client.
+
+## 5. Team Creation
 
 1. Open Control UI -> Agents -> Teams.
 2. Enter a Team key and Display name.
@@ -51,7 +64,7 @@ Acceptance:
 - The UI does not edit local JSON files directly.
 - Reloading the team shows the expected members, aliases, defaultAgentId, and broadcast state.
 
-## 5. Channel Binding
+## 6. Channel Binding
 
 The Binding Builder supports:
 
@@ -73,7 +86,7 @@ Acceptance:
 - Apply/remove goes through Gateway RPC.
 - No code path creates a separate AgentTeam runtime outside Gateway route/session handling.
 
-## 6. Profile Files
+## 7. Profile Files
 
 Control UI can edit these workspace profile files:
 
@@ -95,7 +108,7 @@ Safety boundary:
 - Gateway validates path boundaries.
 - The UI does not accept arbitrary paths or read files outside the workspace.
 
-## 7. Model Configuration
+## 8. Model Configuration
 
 The Model Editor reads and writes each agent's `models.json` through `agents.models.get/set`.
 
@@ -112,7 +125,7 @@ Notes:
 - If a Gateway response accidentally includes a secret-bearing field, the UI redacts it before display.
 - Credential material should stay in backend auth profiles or environment configuration.
 
-## 8. Feishu OAuth and OAPI
+## 9. Feishu OAuth and OAPI
 
 The Feishu readiness panel should show:
 
@@ -137,7 +150,7 @@ OAPI use:
 - Missing scopes return `scope_missing` or later app/user-scope diagnostics.
 - Output and logs must not expose access tokens, refresh tokens, app secrets, or Authorization headers.
 
-## 9. Common Failure Diagnosis
+## 10. Common Failure Diagnosis
 
 ### Teams Panel Is Empty
 
@@ -175,7 +188,18 @@ OAPI use:
 - Confirm built JavaScript contains no raw TypeScript decorator syntax.
 - In a browser, verify `customElements.get("metis-app")`, visible UI content, and no failed JS/CSS/static asset requests.
 
-## 10. Verification
+## 11. Verification
+
+AgentTeam fake E2E/regression baseline:
+
+```bash
+source /Users/l3gi0n/cangjie100/envsetup.sh
+export DYLD_LIBRARY_PATH="/opt/homebrew/opt/openssl@3/lib:$DYLD_LIBRARY_PATH"
+cjpm test src/gateway/runtime --filter GatewayServerMethodsAgentsTest.agentTeamFakeImE2eCoversTelegramFeishuRoutesAndBroadcast
+scripts/cli-agent-gateway-regression.sh
+```
+
+These commands use temporary `METIS_HOME` or fake route/broadcast payloads. They do not use real Telegram/Feishu network and do not read the real `~/.metis`.
 
 For UI changes, run:
 
