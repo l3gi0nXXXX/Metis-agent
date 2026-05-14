@@ -208,6 +208,31 @@ public class FeishuOapiHttpResponse {
     }
 }
 
+public class FeishuOapiResourceResult {
+    public let ok: Bool
+    public let status: String
+    public let bytes: Array<Byte>
+    public let contentType: String
+    public let fileName: String
+    public let error: String
+
+    public init(
+        ok!: Bool = false,
+        status!: String = "not_configured",
+        bytes!: Array<Byte> = [],
+        contentType!: String = "",
+        fileName!: String = "",
+        error!: String = ""
+    ) {
+        this.ok = ok
+        this.status = if (status.trimAscii().isEmpty()) { if (ok) { "ok" } else { "error" } } else { status.trimAscii() }
+        this.bytes = bytes
+        this.contentType = contentType.trimAscii()
+        this.fileName = fileName.trimAscii()
+        this.error = error.trimAscii()
+    }
+}
+
 public interface FeishuOapiTokenProvider {
     func userAccessToken(accountId: String, requiredScopes: Array<String>): FeishuOapiTokenLookup
 }
@@ -220,8 +245,16 @@ public interface FeishuOapiHttpClient {
     func request(request: FeishuOapiRequest, accessToken: String): FeishuOapiHttpResponse
 }
 
+public interface FeishuOapiResourceHttpClient {
+    func fetchMessageResource(request: FeishuOapiRequest, accessToken: String): FeishuOapiResourceResult
+}
+
 public interface FeishuOapiClient {
     func invoke(request: FeishuOapiRequest): JsonObject
+}
+
+public interface FeishuOapiResourceClient {
+    func fetchMessageResource(accountId: String, messageId: String, fileKey: String, resourceType: String): FeishuOapiResourceResult
 }
 
 public class FeishuOapiRawHttpRequest {
@@ -509,6 +542,60 @@ public class MetisFeishuOapiClient <: FeishuOapiClient {
     }
 }
 
+public class MetisFeishuOapiResourceClient <: FeishuOapiResourceClient {
+    private let tokenProvider: Option<FeishuOapiTokenProvider>
+    private let httpClient: Option<FeishuOapiResourceHttpClient>
+
+    public init(
+        tokenProvider!: Option<FeishuOapiTokenProvider> = None<FeishuOapiTokenProvider>,
+        httpClient!: Option<FeishuOapiResourceHttpClient> = None<FeishuOapiResourceHttpClient>
+    ) {
+        this.tokenProvider = tokenProvider
+        this.httpClient = httpClient
+    }
+
+    public func fetchMessageResource(
+        accountId: String,
+        messageId: String,
+        fileKey: String,
+        resourceType: String
+    ): FeishuOapiResourceResult {
+        let params = JsonObject()
+        params.put("message_id", JsonString(messageId.trimAscii()))
+        params.put("file_key", JsonString(fileKey.trimAscii()))
+        params.put("type", JsonString(resourceType.trimAscii()))
+        let request = feishuOapiBuildRequest("feishu_im_user_fetch_resource", "fetch", accountId, params)
+        let token = match (this.tokenProvider) {
+            case Some(provider) => provider.userAccessToken(request.accountId, request.requiredScopes)
+            case None =>
+                return FeishuOapiResourceResult(
+                    status: "auth_required",
+                    error: "Feishu OAPI user authorization is not configured for historical resource fetch."
+                )
+        }
+        if (token.status == "scope_missing") {
+            return FeishuOapiResourceResult(
+                status: "scope_missing",
+                error: if (token.error.isEmpty()) { "Feishu OAPI required resource scope is missing." } else { token.error }
+            )
+        }
+        if (token.status == "auth_required" || token.accessToken.isEmpty()) {
+            return FeishuOapiResourceResult(
+                status: "auth_required",
+                error: if (token.error.isEmpty()) { "Feishu OAPI user authorization is required for historical resource fetch." } else { token.error }
+            )
+        }
+        match (this.httpClient) {
+            case Some(http) => http.fetchMessageResource(request, token.accessToken)
+            case None =>
+                FeishuOapiResourceResult(
+                    status: "not_configured",
+                    error: "Feishu OAPI resource HTTP client is not configured for this runtime."
+                )
+        }
+    }
+}
+
 public func feishuOapiBuildRequest(toolName: String, action: String, accountId: String, params: JsonObject): FeishuOapiRequest {
     let cleanTool = toolName.trimAscii()
     let cleanAction = if (action.trimAscii().isEmpty()) { "default" } else { action.trimAscii() }
@@ -621,6 +708,9 @@ public func feishuOapiRequiredScopesForTool(toolName: String, category: String, 
             }
             if (name == "feishu_im_user_message") {
                 return ["im:message"]
+            }
+            if (name == "feishu_im_user_fetch_resource") {
+                return ["im:message.group_msg:get_as_user", "im:message.p2p_msg:get_as_user", "im:message:readonly"]
             }
             ["im:message:readonly"]
         case "oauth" => ["offline_access"]

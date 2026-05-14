@@ -1399,7 +1399,13 @@ public class FeishuAdapter <: ChannelAdapter {
                 out.append(r'_')
             }
         }
-        let value = out.toString().trimAscii()
+        var value = out.toString().trimAscii()
+        while (value.contains("..")) {
+            value = value.replace("..", "_")
+        }
+        while (value.startsWith(".")) {
+            value = value[1..]
+        }
         if (value.isEmpty()) { "default" } else { value }
     }
 

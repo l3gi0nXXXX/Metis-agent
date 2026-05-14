@@ -703,6 +703,51 @@ public class FeishuAdapterTest {
     }
 
     @TestCase
+    public func imageResourceDownloadStripsTraversalFromDownloadedFileName(): Unit {
+        let root = "/tmp/metis-feishu-media-safe-name-${DateTime.now().toUnixTimeStamp().toMilliseconds()}"
+        try { remove(Path(root), recursive: true) } catch (_e: Exception) { () }
+        let client = FeishuFakeApiClient()
+        client.setResource(
+            "work",
+            "om_image_safe",
+            "img_safe",
+            "image",
+            "fake-image".toArray(),
+            contentType: "image/png",
+            fileName: "../../diagram.png"
+        )
+        let adapter = FeishuAdapter(
+            config: FeishuConfig(
+                enabled: true,
+                media: FeishuMediaConfig(downloadEnabled: true, allowedMimes: ["image/*"], downloadRoot: root)
+            ),
+            accountId: "work",
+            apiClient: client
+        )
+        adapter.start()
+        try {
+            @Expect(adapter.ingestWebhookPayload(
+                this.webhookPayload(
+                    "om_image_safe",
+                    "oc_group",
+                    "ou_1",
+                    "{\\\"image_key\\\":\\\"img_safe\\\",\\\"file_name\\\":\\\"../../diagram.png\\\",\\\"mime_type\\\":\\\"image/png\\\"}",
+                    messageType: "image"
+                )
+            ).contains("\"ok\":true"), true)
+
+            let inbound = adapter.pullInbound()
+            let record = inbound[0].mediaContext.get("records").getOrThrow().asArray()[0].asObject()
+            let localPath = record.get("localPath").getOrThrow().asString().getValue()
+            @Expect(localPath.startsWith(root), true)
+            @Expect(localPath.contains(".."), false)
+            @Expect(exists(Path(localPath)), true)
+        } finally {
+            try { remove(Path(root), recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
     public func resourceDownloadReportsPermissionAndRateLimitFailures(): Unit {
         let root = "/tmp/metis-feishu-media-errors-${DateTime.now().toUnixTimeStamp().toMilliseconds()}"
         try { remove(Path(root), recursive: true) } catch (_e: Exception) { () }

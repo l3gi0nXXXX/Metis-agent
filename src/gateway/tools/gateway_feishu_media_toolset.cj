@@ -7,7 +7,7 @@ import metis.core.{GatewayToolRuntimeContext, gatewayCurrentToolRuntimeContext}
 import metis.io.PrintUtils
 
 import std.collection.ArrayList
-import std.fs.{Directory, File, Path, exists}
+import std.fs.{Directory, File, Path, exists, remove}
 import stdx.encoding.json.{JsonArray, JsonBool, JsonInt, JsonObject, JsonString, JsonValue}
 
 public class GatewayFeishuHistoricalResourceResult {
@@ -17,6 +17,7 @@ public class GatewayFeishuHistoricalResourceResult {
     public let contentType: String
     public let fileName: String
     public let error: String
+    public let source: String
 
     public init(
         ok!: Bool = false,
@@ -24,7 +25,8 @@ public class GatewayFeishuHistoricalResourceResult {
         bytes!: Array<Byte> = [],
         contentType!: String = "",
         fileName!: String = "",
-        error!: String = ""
+        error!: String = "",
+        source!: String = ""
     ) {
         this.ok = ok
         this.status = if (status.trimAscii().isEmpty()) { if (ok) { "ok" } else { "error" } } else { status.trimAscii() }
@@ -32,14 +34,21 @@ public class GatewayFeishuHistoricalResourceResult {
         this.contentType = contentType.trimAscii()
         this.fileName = fileName.trimAscii()
         this.error = error.trimAscii()
+        this.source = source.trimAscii()
     }
 }
 
 private var gatewayFeishuHistoricalResourceRunnerForTest: Option<(JsonObject) -> GatewayFeishuHistoricalResourceResult> =
     None<(JsonObject) -> GatewayFeishuHistoricalResourceResult>
+private var gatewayFeishuHistoricalResourceClientForTest: Option<FeishuOapiResourceClient> =
+    None<FeishuOapiResourceClient>
 
 public func setGatewayFeishuHistoricalResourceRunnerForTest(runner: Option<(JsonObject) -> GatewayFeishuHistoricalResourceResult>): Unit {
     gatewayFeishuHistoricalResourceRunnerForTest = runner
+}
+
+public func setGatewayFeishuHistoricalResourceClientForTest(client: Option<FeishuOapiResourceClient>): Unit {
+    gatewayFeishuHistoricalResourceClientForTest = client
 }
 
 private func feishuMediaToolString(obj: JsonObject, key: String): String {
@@ -122,13 +131,23 @@ private func feishuMediaToolFindRecord(messageId: String, fileKey: String, resou
     None<JsonObject>
 }
 
-private func feishuMediaToolError(status: String, messageId: String, fileKey: String, resourceType: String, reason!: String = ""): String {
+private func feishuMediaToolError(
+    status: String,
+    messageId: String,
+    fileKey: String,
+    resourceType: String,
+    reason!: String = "",
+    identity!: String = ""
+): String {
     let out = JsonObject()
     out.put("ok", JsonBool(false))
     out.put("status", JsonString(status))
     out.put("message_id", JsonString(messageId.trimAscii()))
     out.put("file_key", JsonString(fileKey.trimAscii()))
     out.put("type", JsonString(resourceType.trimAscii()))
+    if (!identity.trimAscii().isEmpty()) {
+        out.put("identity", JsonString(identity.trimAscii()))
+    }
     if (!reason.trimAscii().isEmpty()) {
         out.put("reason", JsonString(reason.trimAscii()))
     }
@@ -167,14 +186,51 @@ private func feishuMediaToolFetchResource(messageId: String, fileKey: String, re
     }
 }
 
+private func feishuMediaToolFetchBotImage(messageId: String, fileKey: String, resourceType: String): String {
+    if (messageId.trimAscii().isEmpty() || fileKey.trimAscii().isEmpty()) {
+        return feishuMediaToolError("invalid_request", messageId, fileKey, resourceType, reason: "message_id and file_key are required", identity: "bot")
+    }
+    match (feishuMediaToolFindRecord(messageId, fileKey, resourceType)) {
+        case Some(record) =>
+            let skippedReason = feishuMediaToolString(record, "skippedReason")
+            if (!feishuMediaToolBool(record, "downloaded")) {
+                return feishuMediaToolError(
+                    if (skippedReason.isEmpty()) { "not_downloaded" } else { skippedReason },
+                    messageId,
+                    fileKey,
+                    resourceType,
+                    reason: skippedReason,
+                    identity: "bot"
+                )
+            }
+            let out = JsonObject()
+            out.put("ok", JsonBool(true))
+            out.put("status", JsonString("ok"))
+            out.put("identity", JsonString("bot"))
+            out.put("message_id", JsonString(messageId.trimAscii()))
+            out.put("file_key", JsonString(fileKey.trimAscii()))
+            out.put("type", JsonString(resourceType.trimAscii()))
+            out.put("saved_path", JsonString(feishuMediaToolString(record, "localPath")))
+            out.put("content_type", JsonString(feishuMediaToolString(record, "mimeType")))
+            out.put("size_bytes", JsonInt(feishuMediaToolInt(record, "fileSize")))
+            out.put("file_name", JsonString(feishuMediaToolString(record, "fileName")))
+            out.toJsonString()
+        case None =>
+            feishuMediaToolError(
+                "not_configured",
+                messageId,
+                fileKey,
+                resourceType,
+                reason: "historical Feishu bot image fetch is not configured in this runtime",
+                identity: "bot"
+            )
+    }
+}
+
 private func feishuMediaToolFetchHistoricalResource(messageId: String, fileKey: String, resourceType: String): String {
     let ctx = match (feishuMediaToolCurrentContext()) {
         case Some(value) => value
         case None => return feishuMediaToolError("not_found", messageId, fileKey, resourceType, reason: "resource is not present in current Feishu media context")
-    }
-    let runner = match (gatewayFeishuHistoricalResourceRunnerForTest) {
-        case Some(value) => value
-        case None => return feishuMediaToolError("not_found", messageId, fileKey, resourceType, reason: "historical Feishu resource fetch is not configured")
     }
     let request = JsonObject()
     request.put("accountId", JsonString(feishuMediaToolAccountId(ctx)))
@@ -182,11 +238,37 @@ private func feishuMediaToolFetchHistoricalResource(messageId: String, fileKey: 
     request.put("fileKey", JsonString(fileKey.trimAscii()))
     request.put("type", JsonString(resourceType.trimAscii()))
     request.put("relation", JsonString("historical"))
-    let result = runner(request)
+    var source = "oapi"
+    var result = GatewayFeishuHistoricalResourceResult()
+    match (gatewayFeishuHistoricalResourceRunnerForTest) {
+        case Some(runner) =>
+            source = "test_runner"
+            result = runner(request)
+        case None =>
+            let oapiResult = match (gatewayFeishuHistoricalResourceClientForTest) {
+                case Some(client) => client.fetchMessageResource(
+                    feishuMediaToolAccountId(ctx),
+                    messageId.trimAscii(),
+                    fileKey.trimAscii(),
+                    resourceType.trimAscii()
+                )
+                case None => MetisFeishuOapiResourceClient().fetchMessageResource(
+                    feishuMediaToolAccountId(ctx),
+                    messageId.trimAscii(),
+                    fileKey.trimAscii(),
+                    resourceType.trimAscii()
+                )
+            }
+            result = feishuMediaToolHistoricalResultFromOapi(oapiResult)
+    }
     if (!result.ok) {
         return feishuMediaToolError(result.status, messageId, fileKey, resourceType, reason: result.error)
     }
     let policy = feishuMediaToolHistoricalPolicy(ctx.mediaContext)
+    let cacheRoot = feishuMediaToolCacheRootString(policy)
+    if (!feishuMediaToolSafeCacheRoot(cacheRoot)) {
+        return feishuMediaToolError("unsafe_cache_root", messageId, fileKey, resourceType, reason: "historical resource cache root must be an isolated Metis temp directory")
+    }
     let sizeBytes = Int64(result.bytes.size)
     let maxBytes = feishuMediaToolPolicyMaxBytes(policy)
     if (maxBytes > 0 && sizeBytes > maxBytes) {
@@ -203,6 +285,7 @@ private func feishuMediaToolFetchHistoricalResource(messageId: String, fileKey: 
     out.put("ok", JsonBool(true))
     out.put("status", JsonString("ok"))
     out.put("relation", JsonString("historical"))
+    out.put("source", JsonString(if (!result.source.isEmpty()) { result.source } else { source }))
     out.put("message_id", JsonString(messageId.trimAscii()))
     out.put("file_key", JsonString(fileKey.trimAscii()))
     out.put("type", JsonString(resourceType.trimAscii()))
@@ -211,6 +294,18 @@ private func feishuMediaToolFetchHistoricalResource(messageId: String, fileKey: 
     out.put("size_bytes", JsonInt(sizeBytes))
     out.put("file_name", JsonString(result.fileName.trimAscii()))
     out.toJsonString()
+}
+
+private func feishuMediaToolHistoricalResultFromOapi(result: FeishuOapiResourceResult): GatewayFeishuHistoricalResourceResult {
+    GatewayFeishuHistoricalResourceResult(
+        ok: result.ok,
+        status: result.status,
+        bytes: result.bytes,
+        contentType: result.contentType,
+        fileName: result.fileName,
+        error: result.error,
+        source: "oapi"
+    )
 }
 
 private func feishuMediaToolAccountId(ctx: GatewayToolRuntimeContext): String {
@@ -235,6 +330,29 @@ private func feishuMediaToolHistoricalPolicy(mediaContext: JsonObject): JsonObje
         case None => ()
     }
     JsonObject()
+}
+
+private func feishuMediaToolCacheRootString(policy: JsonObject): String {
+    let cacheRoot = feishuMediaToolString(policy, "cacheRoot")
+    if (!cacheRoot.isEmpty()) {
+        return cacheRoot
+    }
+    let downloadRoot = feishuMediaToolString(policy, "downloadRoot")
+    if (!downloadRoot.isEmpty()) {
+        return downloadRoot
+    }
+    "/tmp/metis-feishu-media/historical"
+}
+
+private func feishuMediaToolSafeCacheRoot(root: String): Bool {
+    let clean = root.trimAscii()
+    if (clean.isEmpty()) {
+        return false
+    }
+    clean.startsWith("/tmp/metis-") ||
+        clean.startsWith("/tmp/metis_") ||
+        clean.startsWith("/private/tmp/metis-") ||
+        clean.startsWith("/private/tmp/metis_")
 }
 
 private func feishuMediaToolPolicyMaxBytes(policy: JsonObject): Int64 {
@@ -288,13 +406,7 @@ private func feishuMediaToolPersistHistoricalResource(
     fileKey: String,
     resourceType: String
 ): String {
-    let root = Path(if (!feishuMediaToolString(policy, "cacheRoot").isEmpty()) {
-        feishuMediaToolString(policy, "cacheRoot")
-    } else if (!feishuMediaToolString(policy, "downloadRoot").isEmpty()) {
-        feishuMediaToolString(policy, "downloadRoot")
-    } else {
-        "/tmp/metis-feishu-media/historical"
-    })
+    let root = Path(feishuMediaToolCacheRootString(policy))
     let dir = root
         .join(feishuMediaToolSafeSegment(feishuMediaToolAccountId(ctx)))
         .join(feishuMediaToolSafeSegment(messageId))
@@ -363,6 +475,60 @@ private func feishuMediaToolExtensionFromMime(mimeType: String): String {
     ""
 }
 
+private func feishuMediaToolJsonStringArray(values: Array<String>): JsonArray {
+    let arr = JsonArray([])
+    for (value in values) {
+        if (!value.trimAscii().isEmpty()) {
+            arr.add(JsonString(value.trimAscii()))
+        }
+    }
+    arr
+}
+
+private func feishuMediaToolStatus(policy: JsonObject, accountId: String): String {
+    let cacheRoot = feishuMediaToolCacheRootString(policy)
+    let out = JsonObject()
+    out.put("ok", JsonBool(true))
+    out.put("status", JsonString("ok"))
+    out.put("account_id", JsonString(if (accountId.trimAscii().isEmpty()) { "default" } else { accountId.trimAscii() }))
+    out.put("cache_root", JsonString(cacheRoot))
+    out.put("safe_cache_root", JsonBool(feishuMediaToolSafeCacheRoot(cacheRoot)))
+    out.put("media_max_bytes", JsonInt(feishuMediaToolPolicyMaxBytes(policy)))
+    out.put("allowed_mimes", feishuMediaToolJsonStringArray(feishuMediaToolAllowedMimes(policy)))
+    out.put("cleanup_supported", JsonBool(true))
+    out.toJsonString()
+}
+
+private func feishuMediaToolCleanup(policy: JsonObject, accountId: String): String {
+    let cacheRoot = feishuMediaToolCacheRootString(policy)
+    let out = JsonObject()
+    out.put("account_id", JsonString(if (accountId.trimAscii().isEmpty()) { "default" } else { accountId.trimAscii() }))
+    out.put("cache_root", JsonString(cacheRoot))
+    if (!feishuMediaToolSafeCacheRoot(cacheRoot)) {
+        out.put("ok", JsonBool(false))
+        out.put("status", JsonString("unsafe_cache_root"))
+        out.put("reason", JsonString("historical resource cache root must be an isolated Metis temp directory"))
+        return out.toJsonString()
+    }
+    let accountDir = Path(cacheRoot).join(feishuMediaToolSafeSegment(accountId))
+    var removed = false
+    try {
+        if (exists(accountDir)) {
+            remove(accountDir, recursive: true)
+            removed = true
+        }
+        out.put("ok", JsonBool(true))
+        out.put("status", JsonString("ok"))
+        out.put("removed", JsonBool(removed))
+    } catch (e: Exception) {
+        out.put("ok", JsonBool(false))
+        out.put("status", JsonString("cleanup_failed"))
+        out.put("reason", JsonString(e.message))
+        out.put("removed", JsonBool(removed))
+    }
+    out.toJsonString()
+}
+
 @toolset
 public class GatewayFeishuMediaToolset {
     public init() {}
@@ -378,6 +544,18 @@ public class GatewayFeishuMediaToolset {
 
     public func debugFeishuFetchResourceForTest(messageId: String, fileKey: String, resourceType: Option<String>): String {
         feishuMediaToolFetchResource(messageId, fileKey, resourceType ?? "file")
+    }
+
+    public func debugFeishuBotImageForTest(messageId: String, fileKey: String, resourceType: Option<String>): String {
+        feishuMediaToolFetchBotImage(messageId, fileKey, resourceType ?? "image")
+    }
+
+    public func debugFeishuMediaStatusForTest(policy: JsonObject, accountId: String): String {
+        feishuMediaToolStatus(policy, accountId)
+    }
+
+    public func debugFeishuMediaCleanupForTest(policy: JsonObject, accountId: String): String {
+        feishuMediaToolCleanup(policy, accountId)
     }
 
     @tool[
@@ -399,5 +577,13 @@ public class GatewayFeishuMediaToolset {
     public func feishu_im_user_fetch_resource(message_id: String, file_key: String, `type`: Option<String>): String {
         PrintUtils.printTool("feishu_im_user_fetch_resource", shortMessage: "current")
         feishuMediaToolFetchResource(message_id, file_key, `type` ?? "file")
+    }
+
+    @tool[
+        description: "Fetch a Feishu IM bot image resource from the current turn context. Current-turn staged media returns a local path. Historical bot-identity resource fetch returns a structured not_configured diagnostic until tenant-token OAPI wiring is attached."
+    ]
+    public func feishu_im_bot_image(message_id: String, file_key: String, `type`: Option<String>): String {
+        PrintUtils.printTool("feishu_im_bot_image", shortMessage: "current")
+        feishuMediaToolFetchBotImage(message_id, file_key, `type` ?? "image")
     }
 }

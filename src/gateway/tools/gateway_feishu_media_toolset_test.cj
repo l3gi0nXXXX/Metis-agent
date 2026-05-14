@@ -2,10 +2,45 @@ package metis.gateway.tools
 
 import metis.core.{GatewayToolRuntimeContext, gatewayWithToolRuntimeContext}
 
-import std.fs.{File, Path, exists, remove}
+import std.collection.ArrayList
+import std.fs.{Directory, File, Path, exists, remove}
 import std.time.DateTime
 import std.unittest.testmacro.*
 import stdx.encoding.json.{JsonArray, JsonBool, JsonInt, JsonObject, JsonString, JsonValue}
+
+private class FeishuMediaToolsetFakeResourceClient <: FeishuOapiResourceClient {
+    public let captured = ArrayList<String>()
+
+    public init() {}
+
+    public func fetchMessageResource(
+        accountId: String,
+        messageId: String,
+        fileKey: String,
+        resourceType: String
+    ): FeishuOapiResourceResult {
+        this.captured.add(accountId)
+        this.captured.add(messageId)
+        this.captured.add(fileKey)
+        this.captured.add(resourceType)
+        if (fileKey == "missing") {
+            return FeishuOapiResourceResult(status: "not_found", error: "not found")
+        }
+        if (fileKey == "forbidden") {
+            return FeishuOapiResourceResult(status: "forbidden", error: "forbidden")
+        }
+        if (fileKey == "rate") {
+            return FeishuOapiResourceResult(status: "rate_limited", error: "rate limited")
+        }
+        FeishuOapiResourceResult(
+            ok: true,
+            status: "ok",
+            bytes: "oapi-history".toArray(),
+            contentType: "image/png",
+            fileName: "../../history.png"
+        )
+    }
+}
 
 @Test
 public class GatewayFeishuMediaToolsetTest {
@@ -163,6 +198,153 @@ public class GatewayFeishuMediaToolsetTest {
         } finally {
             setGatewayFeishuHistoricalResourceRunnerForTest(None<(JsonObject) -> GatewayFeishuHistoricalResourceResult>)
             try { remove(Path(root), recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func feishuHistoricalFetchDefaultsToOapiAuthRequiredWhenNoTestRunnerIsConfigured(): Unit {
+        let media = JsonObject()
+        media.put("channel", JsonString("feishu"))
+        media.put("accountId", JsonString("tenant-a"))
+        let context = JsonObject()
+        context.put("feishuHistoricalResource", JsonObject())
+        media.put("context", context)
+
+        let out = gatewayWithToolRuntimeContext(
+            GatewayToolRuntimeContext("feishu", channelName: "feishu", sessionKey: "feishu:chat:1", mediaContext: media),
+            { => GatewayFeishuMediaToolset().debugFeishuFetchResourceForTest("om_history", "img_history", Some("image")) }
+        )
+        let json = JsonValue.fromStr(out).asObject()
+        @Expect(json.get("ok").getOrThrow().asBool().getValue(), false)
+        @Expect(json.get("status").getOrThrow().asString().getValue(), "auth_required")
+        @Expect(json.get("reason").getOrThrow().asString().getValue().contains("authorization"), true)
+    }
+
+    @TestCase
+    public func feishuHistoricalFetchCanUseOapiResourceClientAndPreservesSafeTempCache(): Unit {
+        let root = "/tmp/metis-feishu-oapi-history-${DateTime.now().toUnixTimeStamp().toMilliseconds()}"
+        try { remove(Path(root), recursive: true) } catch (_e: Exception) { () }
+        let media = JsonObject()
+        media.put("channel", JsonString("feishu"))
+        media.put("accountId", JsonString("tenant-a"))
+        let policy = JsonObject()
+        policy.put("cacheRoot", JsonString(root))
+        policy.put("mediaMaxBytes", JsonInt(64))
+        policy.put("allowedMimes", JsonArray([JsonString("image/png")]))
+        let context = JsonObject()
+        context.put("feishuHistoricalResource", policy)
+        media.put("context", context)
+        let client = FeishuMediaToolsetFakeResourceClient()
+        setGatewayFeishuHistoricalResourceClientForTest(Some<FeishuOapiResourceClient>(client))
+        try {
+            let out = gatewayWithToolRuntimeContext(
+                GatewayToolRuntimeContext("feishu", channelName: "feishu", sessionKey: "feishu:chat:1", mediaContext: media),
+                { => GatewayFeishuMediaToolset().debugFeishuFetchResourceForTest("om_history", "img_history", Some("image")) }
+            )
+            let json = JsonValue.fromStr(out).asObject()
+            @Expect(json.get("ok").getOrThrow().asBool().getValue(), true)
+            @Expect(json.get("status").getOrThrow().asString().getValue(), "ok")
+            @Expect(json.get("relation").getOrThrow().asString().getValue(), "historical")
+            @Expect(json.get("source").getOrThrow().asString().getValue(), "oapi")
+            let savedPath = json.get("saved_path").getOrThrow().asString().getValue()
+            @Expect(savedPath.startsWith(root), true)
+            @Expect(savedPath.contains(".."), false)
+            @Expect(exists(Path(savedPath)), true)
+            @Expect(String.fromUtf8(File.readFrom(Path(savedPath))), "oapi-history")
+            @Expect(client.captured[0], "tenant-a")
+            @Expect(client.captured[1], "om_history")
+            @Expect(client.captured[2], "img_history")
+            @Expect(client.captured[3], "image")
+        } finally {
+            setGatewayFeishuHistoricalResourceClientForTest(None<FeishuOapiResourceClient>)
+            try { remove(Path(root), recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func feishuHistoricalFetchPropagatesOapiNotFoundForbiddenAndRateLimit(): Unit {
+        let root = "/tmp/metis-feishu-oapi-errors-${DateTime.now().toUnixTimeStamp().toMilliseconds()}"
+        try { remove(Path(root), recursive: true) } catch (_e: Exception) { () }
+        let media = JsonObject()
+        media.put("channel", JsonString("feishu"))
+        media.put("accountId", JsonString("tenant-a"))
+        let policy = JsonObject()
+        policy.put("cacheRoot", JsonString(root))
+        let context = JsonObject()
+        context.put("feishuHistoricalResource", policy)
+        media.put("context", context)
+        let client = FeishuMediaToolsetFakeResourceClient()
+        setGatewayFeishuHistoricalResourceClientForTest(Some<FeishuOapiResourceClient>(client))
+        try {
+            let toolset = GatewayFeishuMediaToolset()
+            let missing = gatewayWithToolRuntimeContext(
+                GatewayToolRuntimeContext("feishu", channelName: "feishu", sessionKey: "feishu:chat:1", mediaContext: media),
+                { => toolset.debugFeishuFetchResourceForTest("om_history", "missing", Some("image")) }
+            )
+            @Expect(JsonValue.fromStr(missing).asObject().get("status").getOrThrow().asString().getValue(), "not_found")
+            let forbidden = gatewayWithToolRuntimeContext(
+                GatewayToolRuntimeContext("feishu", channelName: "feishu", sessionKey: "feishu:chat:1", mediaContext: media),
+                { => toolset.debugFeishuFetchResourceForTest("om_history", "forbidden", Some("image")) }
+            )
+            @Expect(JsonValue.fromStr(forbidden).asObject().get("status").getOrThrow().asString().getValue(), "forbidden")
+            let rate = gatewayWithToolRuntimeContext(
+                GatewayToolRuntimeContext("feishu", channelName: "feishu", sessionKey: "feishu:chat:1", mediaContext: media),
+                { => toolset.debugFeishuFetchResourceForTest("om_history", "rate", Some("image")) }
+            )
+            @Expect(JsonValue.fromStr(rate).asObject().get("status").getOrThrow().asString().getValue(), "rate_limited")
+        } finally {
+            setGatewayFeishuHistoricalResourceClientForTest(None<FeishuOapiResourceClient>)
+            try { remove(Path(root), recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func feishuBotImageMapsCurrentTurnAndReportsNotConfiguredForHistoricalBotFetch(): Unit {
+        let toolset = GatewayFeishuMediaToolset()
+        let current = gatewayWithToolRuntimeContext(
+            GatewayToolRuntimeContext("feishu", channelName: "feishu", sessionKey: "feishu:chat:1", mediaContext: this.mediaContext()),
+            { => toolset.debugFeishuBotImageForTest("om_1", "img_1", Some("image")) }
+        )
+        let currentJson = JsonValue.fromStr(current).asObject()
+        @Expect(currentJson.get("ok").getOrThrow().asBool().getValue(), true)
+        @Expect(currentJson.get("status").getOrThrow().asString().getValue(), "ok")
+        @Expect(currentJson.get("identity").getOrThrow().asString().getValue(), "bot")
+
+        let media = JsonObject()
+        media.put("channel", JsonString("feishu"))
+        media.put("accountId", JsonString("tenant-a"))
+        let missing = gatewayWithToolRuntimeContext(
+            GatewayToolRuntimeContext("feishu", channelName: "feishu", sessionKey: "feishu:chat:1", mediaContext: media),
+            { => toolset.debugFeishuBotImageForTest("om_history", "img_history", Some("image")) }
+        )
+        let missingJson = JsonValue.fromStr(missing).asObject()
+        @Expect(missingJson.get("ok").getOrThrow().asBool().getValue(), false)
+        @Expect(missingJson.get("status").getOrThrow().asString().getValue(), "not_configured")
+        @Expect(missingJson.get("identity").getOrThrow().asString().getValue(), "bot")
+    }
+
+    @TestCase
+    public func feishuMediaStatusAndCleanupRejectUnsafeRootsAndCleanSafeAccountCache(): Unit {
+        let safeRoot = "/tmp/metis-feishu-cleanup-${DateTime.now().toUnixTimeStamp().toMilliseconds()}"
+        let unsafeRoot = "/Users/l3gi0n/Downloads/metis-feishu-media"
+        try { remove(Path(safeRoot), recursive: true) } catch (_e: Exception) { () }
+        try {
+            let unsafePolicy = JsonObject()
+            unsafePolicy.put("cacheRoot", JsonString(unsafeRoot))
+            let unsafeStatus = JsonValue.fromStr(GatewayFeishuMediaToolset().debugFeishuMediaStatusForTest(unsafePolicy, "tenant-a")).asObject()
+            @Expect(unsafeStatus.get("safe_cache_root").getOrThrow().asBool().getValue(), false)
+
+            let safePolicy = JsonObject()
+            safePolicy.put("cacheRoot", JsonString(safeRoot))
+            let accountDir = Path(safeRoot).join("tenant-a").join("om_1")
+            Directory.create(accountDir, recursive: true)
+            File.writeTo(accountDir.join("image.png"), "cache".toArray())
+            let cleanup = JsonValue.fromStr(GatewayFeishuMediaToolset().debugFeishuMediaCleanupForTest(safePolicy, "tenant-a")).asObject()
+            @Expect(cleanup.get("ok").getOrThrow().asBool().getValue(), true)
+            @Expect(cleanup.get("status").getOrThrow().asString().getValue(), "ok")
+            @Expect(exists(accountDir), false)
+        } finally {
+            try { remove(Path(safeRoot), recursive: true) } catch (_e: Exception) { () }
         }
     }
 }
