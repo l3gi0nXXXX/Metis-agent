@@ -388,6 +388,7 @@ export type AgentModelsResult = {
     primaryModelRef?: string;
     runtimePrimaryModelRef?: string;
     providerCount?: number;
+    credentialSource?: Record<string, unknown>;
     diagnostics?: string[];
     state?: Record<string, unknown>;
   };

@@ -59,7 +59,39 @@ function createProps(overrides: Partial<AgentTeamsPanelProps> = {}): AgentTeamsP
     bindingResult: null,
     modelLoading: false,
     modelError: null,
-    modelResult: null,
+    modelResult: {
+      models: {
+        agentId: "content-writer",
+        path: "/tmp/metis/agents/content-writer/agent/models.json",
+        present: true,
+        primaryModelRef: "openai:gpt-5-mini",
+        runtimePrimaryModelRef: "openai:gpt-5-mini",
+        providerCount: 2,
+        credentialSource: {
+          status: "configured",
+          source: "agent auth-profiles.json",
+          authorization: "Authorization: Bearer model-secret-token",
+        },
+        state: {
+          providers: [
+            {
+              provider: "openai",
+              displayName: "OpenAI",
+              runtimeProvider: "openai",
+              defaultModelRef: "openai:gpt-5-mini",
+              configured: true,
+            },
+            {
+              provider: "qwen",
+              displayName: "Qwen",
+              runtimeProvider: "modelstudio",
+              defaultModelRef: "qwen:qwen-plus",
+              configured: false,
+            },
+          ],
+        },
+      },
+    },
     modelDraft: createEmptyAgentTeamModelDraft(),
     workspaceLoading: false,
     workspaceSaving: false,
@@ -73,7 +105,25 @@ function createProps(overrides: Partial<AgentTeamsPanelProps> = {}): AgentTeamsP
       ts: 1,
       channelOrder: ["feishu"],
       channelLabels: { feishu: "Feishu" },
-      channels: { feishu: { configured: true, running: true } },
+      channels: {
+        feishu: {
+          configured: true,
+          running: true,
+          capabilities: ["oauth:device-flow", "oapi:docs", "doctor"],
+          auth: {
+            accountId: "tenant-a",
+            status: "authorized",
+            tokenStatus: "authorized",
+            scopeSummary: "docs:read im:message",
+            accessToken: "secret-feishu-access-token",
+          },
+          doctor: {
+            status: "ok",
+            findings: 0,
+            lastProbeAt: 123,
+          },
+        },
+      },
       channelAccounts: {
         feishu: [
           {
@@ -131,16 +181,54 @@ describe("renderAgentTeamsPanel", () => {
     expect(text).toContain("Select all members");
     expect(text).toContain("Clear selected");
     expect(text).toContain("Capability gaps");
-    expect(text).toContain("OAuth missing");
+    expect(text).toContain("OAuth available");
     expect(text).toContain("/feishu doctor");
     expect(text).toContain("Team-agent parity is partial");
+    expect(text).toContain("Model provider chips");
+    expect(text).toContain("OpenAI");
+    expect(text).toContain("Qwen");
+    expect(text).toContain("openai:gpt-5-mini");
+    expect(text).toContain("agent auth-profiles.json");
+    expect(text).toContain("Metis capabilities");
+    expect(text).toContain("feishu_im_user_fetch_resource");
+    expect(text).toContain("Workspace profile files");
+    expect(text).toContain("Feishu Auth & Doctor");
+    expect(text).toContain("authorized");
+    expect(text).toContain("docs:read im:message");
     expect(text).toContain("[redacted]");
     expect(text).not.toContain("secret-access-token");
+    expect(text).not.toContain("model-secret-token");
+    expect(text).not.toContain("secret-feishu-access-token");
 
     const options = Array.from(container.querySelectorAll("option")).map(
       (option) => option.textContent ?? "",
     );
     expect(options).toContain("HEARTBEAT.md");
     expect(options).toContain("BOOTSTRAP.md");
+  });
+
+  it("shows explicit fallback rows when Feishu auth status RPC fields are absent", () => {
+    const container = document.createElement("div");
+    render(
+      renderAgentTeamsPanel(
+        createProps({
+          channelsSnapshot: {
+            ts: 1,
+            channelOrder: ["feishu"],
+            channelLabels: { feishu: "Feishu" },
+            channels: { feishu: { configured: true, running: true } },
+            channelAccounts: { feishu: [] },
+            channelDefaultAccountId: { feishu: "tenant-a" },
+          },
+        }),
+      ),
+      container,
+    );
+
+    const text = container.textContent ?? "";
+    expect(text).toContain("Feishu Auth & Doctor");
+    expect(text).toContain("Auth status RPC missing");
+    expect(text).toContain("Doctor status RPC missing");
+    expect(text).toContain("UI will not write token files");
   });
 });

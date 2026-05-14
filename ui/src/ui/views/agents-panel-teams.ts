@@ -110,6 +110,11 @@ export function renderAgentTeamsPanel(props: AgentTeamsPanelProps) {
       ${renderFeishuSettingsCard(props)}
     </section>
 
+    <section class="grid grid-cols-2" style="margin-top: 16px;">
+      ${renderMetisCapabilitiesPanel()}
+      ${renderFeishuAuthDoctorPanel(props)}
+    </section>
+
     <section style="margin-top: 16px;">
       ${renderDoctorPanel(props, teams, activeMembers)}
     </section>
@@ -809,6 +814,7 @@ function renderModelCard(props: AgentTeamsPanelProps, members: AgentTeamMember[]
             </div>
           `
         : nothing}
+      ${renderModelProviderChips(model)}
       ${renderJsonField("models.json state", props.modelDraft.stateJson, (stateJson) =>
         props.onModelDraftChange({ stateJson }),
       )}
@@ -831,6 +837,48 @@ function renderModelCard(props: AgentTeamsPanelProps, members: AgentTeamMember[]
         </button>
       </div>
     </section>
+  `;
+}
+
+function renderModelProviderChips(model: AgentModelsResult["models"] | null) {
+  if (!model) {
+    return nothing;
+  }
+  const chips = modelProviderChips(model);
+  return html`
+    <div style="margin-top: 14px;">
+      <div class="list-title">Model provider chips</div>
+      <div class="card-sub">Derived from agents.models.get/set and redacted before display.</div>
+      <div class="list" style="margin-top: 8px;">
+        ${chips.length === 0
+          ? html`<div class="callout info">No provider entries are visible in this models.json response.</div>`
+          : chips.map(
+              (chip) => html`
+                <div class="list-item">
+                  <div class="list-main">
+                    <div class="list-title">${chip.label}</div>
+                    <div class="list-sub mono">
+                      ${chip.modelRef || "no default model"}${chip.runtimeProvider
+                        ? ` · runtime ${chip.runtimeProvider}`
+                        : ""}
+                    </div>
+                  </div>
+                  <div class="list-meta">
+                    <span class="badge">${chip.status}</span>
+                  </div>
+                </div>
+              `,
+            )}
+      </div>
+      ${model.credentialSource
+        ? html`
+            <div class="agent-kv" style="margin-top: 12px;">
+              <div class="label">Credential source</div>
+              <pre class="mono" style="white-space: pre-wrap; margin: 0;">${redactedJsonText(model.credentialSource)}</pre>
+            </div>
+          `
+        : nothing}
+    </div>
   `;
 }
 
@@ -953,6 +1001,144 @@ function renderFeishuCapabilityGaps(props: AgentTeamsPanelProps) {
         )}
       </div>
     </div>
+  `;
+}
+
+const METIS_CAPABILITY_GROUPS = [
+  {
+    title: "AgentTeam Gateway RPC",
+    badge: "Gateway",
+    items: [
+      "agents.teams.* team CRUD",
+      "agents.bind route bindings",
+      "agents.migration.dryRun read-only doctor preview",
+    ],
+  },
+  {
+    title: "Workspace profile files",
+    badge: "profiles",
+    items: [...AGENT_TEAM_PROFILE_FILES],
+  },
+  {
+    title: "Model and provider state",
+    badge: "models",
+    items: ["agents.models.get", "agents.models.set", "per-agent models.json", "redacted credential source"],
+  },
+  {
+    title: "Channel capabilities",
+    badge: "channels",
+    items: [
+      "Telegram route/account/topic baseline",
+      "Feishu route/account/group/thread status",
+      "Feishu native commands: /feishu auth, /feishu doctor, /feishu info",
+    ],
+  },
+  {
+    title: "Built-in tools",
+    badge: "tools",
+    items: ["feishu_media_list", "feishu_im_user_fetch_resource", "gateway control tools", "memory tools"],
+  },
+  {
+    title: "Built-in skills",
+    badge: "skills",
+    items: ["workspace skills", "bundled Metis skills", "per-agent skill allowlist"],
+  },
+];
+
+function renderMetisCapabilitiesPanel() {
+  return html`
+    <section class="card">
+      <div class="card-title">Metis capabilities</div>
+      <div class="card-sub">Metis-owned built-in tools, skills, channel capabilities, and Gateway RPC surfaces.</div>
+      <div class="callout info" style="margin-top: 12px;">
+        This is a read-only capability inventory. It does not expose third-party plugin install toggles or copy public branding assets.
+      </div>
+      <div class="list" style="margin-top: 12px;">
+        ${METIS_CAPABILITY_GROUPS.map(
+          (group) => html`
+            <div class="list-item">
+              <div class="list-main">
+                <div class="list-title">${group.title}</div>
+                <div class="list-sub">${group.items.join(" · ")}</div>
+              </div>
+              <div class="list-meta"><span class="badge">${group.badge}</span></div>
+            </div>
+          `,
+        )}
+      </div>
+    </section>
+  `;
+}
+
+function renderFeishuAuthDoctorPanel(props: AgentTeamsPanelProps) {
+  const status = objectValue(props.channelsSnapshot?.channels?.feishu);
+  const capabilities = stringArrayFromUnknown(status?.capabilities);
+  const auth = objectValue(status?.auth) ?? objectValue(status?.oauth);
+  const doctor = objectValue(status?.doctor) ?? objectValue(status?.diagnostics);
+  const oapiAvailable = capabilities.some((item) => {
+    const normalized = item.toLowerCase();
+    return normalized.includes("oapi") || normalized.includes("openapi");
+  });
+  const defaultAccount =
+    resolveFeishuSettings(props).defaultAccount ||
+    props.channelsSnapshot?.channelDefaultAccountId?.feishu ||
+    "default";
+  return html`
+    <section class="card">
+      <div class="card-title">Feishu Auth & Doctor</div>
+      <div class="card-sub">Read-only Feishu status, auth, doctor, and OAPI signals from Gateway RPC.</div>
+      <div class="callout info" style="margin-top: 12px;">
+        UI will not write token files, app credentials, or local Feishu config. Auth start and token refresh must stay behind Gateway RPC or native Feishu commands.
+      </div>
+      <div class="agents-overview-grid" style="margin-top: 14px;">
+        <div class="agent-kv">
+          <div class="label">Account</div>
+          <div class="mono">${defaultAccount}</div>
+        </div>
+        <div class="agent-kv">
+          <div class="label">OAuth status</div>
+          <div>${auth ? statusText(auth, ["status", "tokenStatus"], "status unknown") : "Auth status RPC missing"}</div>
+        </div>
+        <div class="agent-kv">
+          <div class="label">Doctor</div>
+          <div>${doctor ? statusText(doctor, ["status", "state"], "available") : "Doctor status RPC missing"}</div>
+        </div>
+        <div class="agent-kv">
+          <div class="label">OAPI</div>
+          <div>${oapiAvailable ? "OAPI capability advertised" : "OAPI status RPC missing"}</div>
+        </div>
+      </div>
+      ${auth
+        ? html`
+            <div class="agent-kv" style="margin-top: 12px;">
+              <div class="label">Auth summary</div>
+              <div>
+                ${statusText(auth, ["accountId"], defaultAccount)} ·
+                ${statusText(auth, ["scopeSummary", "scopes"], "scope status missing")}
+                ${stringOrEmpty(auth.error)
+                  ? html`<div class="list-sub">Error: ${redactSecretText(stringOrEmpty(auth.error))}</div>`
+                  : nothing}
+              </div>
+            </div>
+          `
+        : html`
+            <div class="callout warning" style="margin-top: 12px;">
+              Auth status RPC missing. Needed backend field: channels.status.channels.feishu.auth or oauth with redacted accountId, status, tokenStatus, and scopeSummary.
+            </div>
+          `}
+      ${doctor
+        ? html`
+            <div class="agent-kv" style="margin-top: 12px;">
+              <div class="label">Doctor summary</div>
+              <div>${redactedJsonText(compactStatusObject(doctor, ["status", "state", "findings", "lastProbeAt", "message"]))}</div>
+            </div>
+          `
+        : html`
+            <div class="callout warning" style="margin-top: 12px;">
+              Doctor status RPC missing. Use /feishu doctor until Gateway exposes a redacted Feishu doctor object to channels.status.
+            </div>
+          `}
+    </section>
   `;
 }
 
@@ -1188,6 +1374,128 @@ function objectValue(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
+type ModelProviderChip = {
+  label: string;
+  provider: string;
+  runtimeProvider: string;
+  modelRef: string;
+  status: string;
+};
+
+function modelProviderChips(model: AgentModelsResult["models"]): ModelProviderChip[] {
+  const state = objectValue(model.state);
+  const providers = state?.providers;
+  const chips: ModelProviderChip[] = [];
+  if (Array.isArray(providers)) {
+    providers.forEach((provider) => {
+      const chip = modelProviderChipFromObject(objectValue(provider));
+      if (chip) {
+        chips.push(chip);
+      }
+    });
+  } else {
+    const providerObject = objectValue(providers);
+    if (providerObject) {
+      Object.entries(providerObject).forEach(([providerId, value]) => {
+        const item = objectValue(value) ?? { provider: providerId };
+        const chip = modelProviderChipFromObject({ ...item, provider: item.provider ?? providerId });
+        if (chip) {
+          chips.push(chip);
+        }
+      });
+    }
+  }
+  if (chips.length === 0 && model.primaryModelRef) {
+    const provider = model.primaryModelRef.includes(":") ? model.primaryModelRef.split(":")[0] : "";
+    chips.push({
+      label: provider || "Primary model",
+      provider,
+      runtimeProvider: provider,
+      modelRef: model.primaryModelRef,
+      status: "primary",
+    });
+  }
+  return chips;
+}
+
+function modelProviderChipFromObject(item: Record<string, unknown> | null): ModelProviderChip | null {
+  if (!item) {
+    return null;
+  }
+  const provider = stringOrEmpty(item.provider) || stringOrEmpty(item.id);
+  const runtimeProvider = stringOrEmpty(item.runtimeProvider) || stringOrEmpty(item.runtime_provider);
+  const modelRef =
+    stringOrEmpty(item.defaultModelRef) ||
+    stringOrEmpty(item.modelRef) ||
+    stringOrEmpty(item.model) ||
+    stringOrEmpty(item.runtimeModelRef);
+  const label = stringOrEmpty(item.displayName) || stringOrEmpty(item.name) || provider || runtimeProvider || modelRef;
+  if (!label) {
+    return null;
+  }
+  return {
+    label,
+    provider,
+    runtimeProvider,
+    modelRef,
+    status: providerConfiguredStatus(item.configured),
+  };
+}
+
+function providerConfiguredStatus(value: unknown): string {
+  if (value === true) {
+    return "configured";
+  }
+  if (value === false) {
+    return "needs credentials";
+  }
+  return "status unknown";
+}
+
+function statusText(
+  obj: Record<string, unknown>,
+  keys: string[],
+  fallback: string,
+): string {
+  for (const key of keys) {
+    const value = obj[key];
+    if (typeof value === "string" && value.trim()) {
+      return redactSecretText(value.trim());
+    }
+    if (typeof value === "number" || typeof value === "boolean") {
+      return String(value);
+    }
+    if (Array.isArray(value)) {
+      const joined = value.map((item) => String(item).trim()).filter(Boolean).join(", ");
+      if (joined) {
+        return redactSecretText(joined);
+      }
+    }
+  }
+  return fallback;
+}
+
+function compactStatusObject(
+  obj: Record<string, unknown>,
+  keys: string[],
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  keys.forEach((key) => {
+    if (obj[key] !== undefined) {
+      out[key] = obj[key];
+    }
+  });
+  return out;
+}
+
+function redactedJsonText(value: unknown): string {
+  try {
+    return redactSecretText(JSON.stringify(value ?? {}, null, 2));
+  } catch (_err) {
+    return redactSecretText(String(value ?? ""));
+  }
+}
+
 function stringOrEmpty(value: unknown): string {
   return typeof value === "string" ? value : "";
 }
@@ -1196,6 +1504,7 @@ function redactSecretText(value: string): string {
   return value
     .replace(/authorization:\s*bearer\s+[^\s,;]+/gi, "Authorization: Bearer [redacted]")
     .replace(/\b(access|refresh|bot|app)[_-]?token\s*[:=]\s*[^\s,;]+/gi, "$1_token=[redacted]")
+    .replace(/(["']?(?:access|refresh|bot|app)[_-]?token["']?\s*[:=]\s*)["']?[^"',;\s]+["']?/gi, "$1[redacted]")
     .replace(/\b(app[_-]?secret|authorization)\s*[:=]\s*[^\s,;]+/gi, "$1=[redacted]");
 }
 
