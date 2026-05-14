@@ -9,7 +9,7 @@ import std.fs.{File, Path, exists, remove}
 import std.sync.Mutex
 import std.time.DateTime
 import std.unittest.testmacro.*
-import stdx.encoding.json.{JsonArray, JsonBool, JsonObject, JsonString}
+import stdx.encoding.json.{JsonArray, JsonBool, JsonObject, JsonString, JsonValue}
 
 class FeishuQueueProbe {
     private let lock = Mutex()
@@ -99,6 +99,36 @@ public class FeishuAdapterTest {
             "\"operator\":{\"open_id\":\"ou_operator\"}," +
             "\"context\":{\"open_message_id\":\"om_card\",\"open_chat_id\":\"oc_card\"}," +
             "\"action\":{\"value\":{\"action\":\"${action}\",\"nonce\":\"n-1\"}}" +
+            "}" +
+            "}"
+    }
+
+    private func reactionPayload(accountId!: String = "tenant-a"): String {
+        "{" +
+            "\"header\":{\"event_type\":\"im.message.reaction.created_v1\",\"account_id\":\"${accountId}\"}," +
+            "\"event\":{" +
+            "\"message_id\":\"om_reacted\"," +
+            "\"chat_id\":\"oc_react\"," +
+            "\"chat_type\":\"group\"," +
+            "\"thread_id\":\"omt_react\"," +
+            "\"reaction_type\":{\"emoji_type\":\"THUMBSUP\"}," +
+            "\"user_id\":{\"open_id\":\"ou_reactor\"}," +
+            "\"action_time\":\"1710000000000\"" +
+            "}" +
+            "}"
+    }
+
+    private func driveCommentPayload(accountId!: String = "tenant-a"): String {
+        "{" +
+            "\"header\":{\"event_type\":\"drive.file.comment.created_v1\",\"account_id\":\"${accountId}\"}," +
+            "\"event\":{" +
+            "\"comment_id\":\"comment_1\"," +
+            "\"reply_id\":\"reply_1\"," +
+            "\"file_token\":\"doccn_1\"," +
+            "\"file_type\":\"docx\"," +
+            "\"is_mention\":true," +
+            "\"user_id\":{\"open_id\":\"ou_commenter\"}," +
+            "\"content\":\"please review\"" +
             "}" +
             "}"
     }
@@ -414,6 +444,84 @@ public class FeishuAdapterTest {
     }
 
     @TestCase
+    public func replyModeTextStaticAndFallbackAreExplicit(): Unit {
+        let textClient = FeishuFakeApiClient()
+        let textAdapter = FeishuAdapter(config: FeishuConfig(enabled: true, streaming: "text"), apiClient: textClient)
+        textAdapter.start()
+        let textId = textAdapter.sendWithMessageId(OutboundMessage(ChannelType.Feishu, "oc_text", "plain answer"))
+        @Expect(textId, "fake-feishu-text-1")
+        @Expect(textClient.textSendCount(), 1)
+        @Expect(textClient.cardSendCount(), 0)
+
+        let cardClient = FeishuFakeApiClient()
+        let cardAdapter = FeishuAdapter(config: FeishuConfig(enabled: true, streaming: "card"), apiClient: cardClient)
+        cardAdapter.start()
+        let cardId = cardAdapter.sendWithMessageId(OutboundMessage(ChannelType.Feishu, "oc_card", "card answer"))
+        @Expect(cardId, "fake-feishu-card-1")
+        @Expect(cardClient.cardSendCount(), 1)
+        @Expect(cardClient.cardPatchCount(), 0)
+
+        let fallbackClient = FeishuFakeApiClient()
+        fallbackClient.failNextCardSend("rate_limited", error: "card rate limited")
+        let fallbackAdapter = FeishuAdapter(config: FeishuConfig(enabled: true, streaming: "card"), apiClient: fallbackClient)
+        fallbackAdapter.start()
+        let fallbackId = fallbackAdapter.sendWithMessageId(OutboundMessage(ChannelType.Feishu, "oc_fallback", "fallback answer"))
+        @Expect(fallbackId, "fake-feishu-text-1")
+        @Expect(fallbackClient.cardSendCount(), 1)
+        @Expect(fallbackClient.textSendCount(), 1)
+    }
+
+    @TestCase
+    public func streamingControllerLifecycleIncludesToolFooterAbortAndFallback(): Unit {
+        let client = FeishuFakeApiClient()
+        let metrics = FeishuReplyFooterMetrics(inputTokens: 12, cacheRead: 3, model: "metis-test")
+        let controller = FeishuStreamingCardController(
+            client,
+            accountId: "tenant-a",
+            rawPeerId: "oc_stream",
+            receiveId: "oc_stream",
+            receiveIdType: "chat_id",
+            replyToMessageId: Some("om_source"),
+            replyInThread: true,
+            showToolUse: true
+        )
+
+        @Expect(controller.create("first chunk"), "fake-feishu-card-1")
+        @Expect(controller.patchChunk("second chunk"), true)
+        @Expect(controller.updateToolPayload("feishu_fetch_doc", "{\"doc\":\"1\"}"), true)
+        @Expect(controller.finalize("final answer", footerMetrics: Some(metrics)), true)
+        @Expect(client.cardSendCount(), 1)
+        @Expect(client.cardPatchCount(), 3)
+        @Expect(client.patchedCard(2).fallbackText().contains("Tokens in: 12"), true)
+        @Expect(client.patchedCard(2).fallbackText().contains("Cache read: 3"), true)
+        @Expect(client.patchedCard(2).fallbackText().contains("Model: metis-test"), true)
+        @Expect(client.patchedCard(2).fallbackText().contains("Tokens out: 0"), false)
+
+        let abortController = FeishuStreamingCardController(
+            client,
+            accountId: "tenant-a",
+            rawPeerId: "oc_stream",
+            receiveId: "oc_stream",
+            receiveIdType: "chat_id"
+        )
+        @Expect(abortController.create("will abort"), "fake-feishu-card-2")
+        @Expect(abortController.abort("cancelled"), true)
+        @Expect(abortController.patchChunk("ignored after abort"), false)
+
+        let fallbackClient = FeishuFakeApiClient()
+        fallbackClient.failNextCardSend("rate_limited", error: "card create failed")
+        let fallback = FeishuStreamingCardController(
+            fallbackClient,
+            accountId: "tenant-a",
+            rawPeerId: "oc_stream",
+            receiveId: "oc_stream",
+            receiveIdType: "chat_id"
+        )
+        @Expect(fallback.create("fallback text"), "fake-feishu-text-1")
+        @Expect(fallbackClient.textSendCount(), 1)
+    }
+
+    @TestCase
     public func toolUseDisplayIsIncludedOnlyWhenEnabled(): Unit {
         let hidden = FeishuReplyCardDraft(title: "Metis", showToolUse: false)
         hidden.appendText("answer")
@@ -446,6 +554,76 @@ public class FeishuAdapterTest {
             .get("feishuCardAction").getOrThrow().asObject()
         @Expect(action.get("action").getOrThrow().asString().getValue(), "feishu.auth.confirm")
         @Expect(action.get("operatorId").getOrThrow().asString().getValue(), "ou_operator")
+    }
+
+    @TestCase
+    public func reactionAndDriveCommentEventsBecomeSafeSystemEvents(): Unit {
+        let adapter = FeishuAdapter(config: FeishuConfig(enabled: true), accountId: "tenant-a")
+        adapter.start()
+        @Expect(adapter.ingestWebhookPayload(this.reactionPayload()).contains("\"ok\":true"), true)
+        @Expect(adapter.ingestWebhookPayload(this.driveCommentPayload()).contains("\"ok\":true"), true)
+
+        let inbound = adapter.pullInbound()
+        @Expect(inbound.size, 2)
+        @Expect(inbound[0].systemEvent, true)
+        @Expect(inbound[0].systemEventKind, "feishu.reaction")
+        @Expect(inbound[0].peerId, "oc_react")
+        @Expect(inbound[0].threadId.getOrThrow(), "omt_react")
+        @Expect(inbound[0].text.contains("THUMBSUP"), true)
+        let reaction = inbound[0].mediaContext.get("context").getOrThrow().asObject()
+            .get("feishuReaction").getOrThrow().asObject()
+        @Expect(reaction.get("messageId").getOrThrow().asString().getValue(), "om_reacted")
+        @Expect(reaction.get("operatorId").getOrThrow().asString().getValue(), "ou_reactor")
+
+        @Expect(inbound[1].systemEvent, true)
+        @Expect(inbound[1].systemEventKind, "feishu.drive_comment")
+        @Expect(inbound[1].mentioned, true)
+        @Expect(inbound[1].text.contains("comment_1"), true)
+        let comment = inbound[1].mediaContext.get("context").getOrThrow().asObject()
+            .get("feishuDriveComment").getOrThrow().asObject()
+        @Expect(comment.get("fileToken").getOrThrow().asString().getValue(), "doccn_1")
+        @Expect(comment.get("replyId").getOrThrow().asString().getValue(), "reply_1")
+    }
+
+    @TestCase
+    public func unsupportedAndMalformedEventsReturnExplicitIgnoredDiagnostics(): Unit {
+        let adapter = FeishuAdapter(config: FeishuConfig(enabled: true))
+        adapter.start()
+
+        let unsupportedEvent =
+            "{" +
+            "\"header\":{\"event_type\":\"im.message.deleted_v1\"}," +
+            "\"event\":{\"message_id\":\"om_deleted\"}" +
+            "}"
+        let unsupported = adapter.ingestWebhookPayload(unsupportedEvent)
+        let unsupportedJson = JsonValue.fromStr(unsupported).asObject()
+        @Expect(unsupportedJson.get("ignored").getOrThrow().asBool().getValue(), true)
+        @Expect(unsupportedJson.get("reason").getOrThrow().asString().getValue(), "unsupported_event")
+        @Expect(unsupportedJson.get("eventType").getOrThrow().asString().getValue(), "im.message.deleted_v1")
+
+        let unsupportedMessage = adapter.ingestWebhookPayload(
+            this.webhookPayload(
+                "om_location",
+                "oc_group",
+                "ou_1",
+                "{\\\"name\\\":\\\"office\\\"}",
+                messageType: "location"
+            )
+        )
+        let unsupportedMessageJson = JsonValue.fromStr(unsupportedMessage).asObject()
+        @Expect(unsupportedMessageJson.get("ignored").getOrThrow().asBool().getValue(), true)
+        @Expect(unsupportedMessageJson.get("reason").getOrThrow().asString().getValue(), "unsupported_message_type")
+        @Expect(unsupportedMessageJson.get("messageType").getOrThrow().asString().getValue(), "location")
+
+        let malformedMessage =
+            "{" +
+            "\"header\":{\"event_type\":\"im.message.receive_v1\"}," +
+            "\"event\":{\"message\":{\"message_type\":\"text\",\"content\":\"{\\\"text\\\":\\\"missing sender\\\"}\"}}" +
+            "}"
+        let malformed = adapter.ingestWebhookPayload(malformedMessage)
+        let malformedJson = JsonValue.fromStr(malformed).asObject()
+        @Expect(malformedJson.get("ignored").getOrThrow().asBool().getValue(), true)
+        @Expect(malformedJson.get("reason").getOrThrow().asString().getValue(), "malformed_event")
     }
 
     @TestCase
@@ -651,6 +829,52 @@ public class FeishuAdapterTest {
         @Expect(file.get("fileSize").getOrThrow().asInt().getValue(), 64)
         @Expect(media.get("mediaKind").getOrThrow().asString().getValue(), "media")
         @Expect(audio.get("mediaKind").getOrThrow().asString().getValue(), "audio")
+    }
+
+    @TestCase
+    public func videoInteractiveAndMergeForwardConvertersPreserveSafeContext(): Unit {
+        let adapter = FeishuAdapter(config: FeishuConfig(enabled: true), accountId: "work")
+        adapter.start()
+        @Expect(adapter.ingestWebhookPayload(
+            this.webhookPayload(
+                "om_video",
+                "oc_group",
+                "ou_1",
+                "{\\\"file_key\\\":\\\"video_v2_1\\\",\\\"file_name\\\":\\\"demo.mp4\\\",\\\"mime_type\\\":\\\"video/mp4\\\"}",
+                messageType: "video"
+            )
+        ).contains("\"ok\":true"), true)
+        @Expect(adapter.ingestWebhookPayload(
+            this.webhookPayload(
+                "om_interactive",
+                "oc_group",
+                "ou_1",
+                "{\\\"elements\\\":[{\\\"tag\\\":\\\"div\\\",\\\"text\\\":{\\\"tag\\\":\\\"lark_md\\\",\\\"content\\\":\\\"Choose option\\\"}}]}",
+                messageType: "interactive"
+            )
+        ).contains("\"ok\":true"), true)
+        @Expect(adapter.ingestWebhookPayload(
+            this.webhookPayload(
+                "om_merge",
+                "oc_group",
+                "ou_1",
+                "{\\\"title\\\":\\\"forwarded thread\\\"}",
+                messageType: "merge_forward"
+            )
+        ).contains("\"ok\":true"), true)
+
+        let inbound = adapter.pullInbound()
+        @Expect(inbound.size, 3)
+        @Expect(inbound[0].text, "[video]")
+        let video = inbound[0].mediaContext.get("records").getOrThrow().asArray()[0].asObject()
+        @Expect(video.get("mediaKind").getOrThrow().asString().getValue(), "video")
+        @Expect(video.get("eligibleFor").getOrThrow().asString().getValue(), "video")
+        @Expect(inbound[1].text.contains("Choose option"), true)
+        @Expect(inbound[2].text.contains("forwarded thread"), true)
+        let mergeContext = inbound[2].mediaContext.get("context").getOrThrow().asObject()
+            .get("feishuMergeForward").getOrThrow().asObject()
+        @Expect(mergeContext.get("title").getOrThrow().asString().getValue(), "forwarded thread")
+        @Expect(mergeContext.get("status").getOrThrow().asString().getValue(), "metadata_only")
     }
 
     @TestCase

@@ -7,23 +7,29 @@ public class FeishuInteractiveCard {
     public let title: String
     public let text: String
     public let toolUseText: String
+    public let footerText: String
     public let actionId: String
 
-    public init(title!: String = "", text!: String = "", toolUseText!: String = "", actionId!: String = "") {
+    public init(title!: String = "", text!: String = "", toolUseText!: String = "", footerText!: String = "", actionId!: String = "") {
         this.title = title.trimAscii()
         this.text = text.trimAscii()
         this.toolUseText = toolUseText.trimAscii()
+        this.footerText = footerText.trimAscii()
         this.actionId = actionId.trimAscii()
     }
 
     public func fallbackText(): String {
-        let body = if (this.toolUseText.isEmpty()) {
-            this.text
-        } else if (this.text.isEmpty()) {
-            this.toolUseText
-        } else {
-            "${this.text}\n\n${this.toolUseText}"
+        let parts = ArrayList<String>()
+        if (!this.text.isEmpty()) {
+            parts.add(this.text)
         }
+        if (!this.toolUseText.isEmpty()) {
+            parts.add(this.toolUseText)
+        }
+        if (!this.footerText.isEmpty()) {
+            parts.add(this.footerText)
+        }
+        let body = String.join(parts.toArray(), delimiter: "\n\n")
         if (this.title.isEmpty()) {
             return body
         }
@@ -58,6 +64,15 @@ public class FeishuInteractiveCard {
             toolNode.put("text", toolText)
             elements.add(toolNode)
         }
+        if (!this.footerText.isEmpty()) {
+            let footerNode = JsonObject()
+            footerNode.put("tag", JsonString("div"))
+            let footer = JsonObject()
+            footer.put("tag", JsonString("lark_md"))
+            footer.put("content", JsonString(this.footerText))
+            footerNode.put("text", footer)
+            elements.add(footerNode)
+        }
         if (!this.actionId.isEmpty()) {
             let actionNode = JsonObject()
             actionNode.put("tag", JsonString("action"))
@@ -77,6 +92,57 @@ public class FeishuInteractiveCard {
         }
         root.put("elements", elements)
         root
+    }
+}
+
+public class FeishuReplyFooterMetrics {
+    public let inputTokens: Int64
+    public let outputTokens: Int64
+    public let cacheRead: Int64
+    public let cacheWrite: Int64
+    public let contextTokens: Int64
+    public let model: String
+
+    public init(
+        inputTokens!: Int64 = 0,
+        outputTokens!: Int64 = 0,
+        cacheRead!: Int64 = 0,
+        cacheWrite!: Int64 = 0,
+        contextTokens!: Int64 = 0,
+        model!: String = ""
+    ) {
+        this.inputTokens = inputTokens
+        this.outputTokens = outputTokens
+        this.cacheRead = cacheRead
+        this.cacheWrite = cacheWrite
+        this.contextTokens = contextTokens
+        this.model = model.trimAscii()
+    }
+
+    public func toFooterText(): String {
+        let parts = ArrayList<String>()
+        if (this.inputTokens > 0) {
+            parts.add("Tokens in: ${this.inputTokens}")
+        }
+        if (this.outputTokens > 0) {
+            parts.add("Tokens out: ${this.outputTokens}")
+        }
+        if (this.cacheRead > 0) {
+            parts.add("Cache read: ${this.cacheRead}")
+        }
+        if (this.cacheWrite > 0) {
+            parts.add("Cache write: ${this.cacheWrite}")
+        }
+        if (this.contextTokens > 0) {
+            parts.add("Context: ${this.contextTokens}")
+        }
+        if (!this.model.isEmpty()) {
+            parts.add("Model: ${this.model}")
+        }
+        if (parts.isEmpty()) {
+            return ""
+        }
+        "Metrics\n${String.join(parts.toArray(), delimiter: " | ")}"
     }
 }
 
@@ -122,6 +188,135 @@ public class FeishuReplyCardDraft {
             "Tool use\n${String.join(this.toolUseParts.toArray(), delimiter: "\n")}"
         }
         FeishuInteractiveCard(title: this.title, text: text, toolUseText: toolText)
+    }
+}
+
+public class FeishuStreamingCardController {
+    private let client: FeishuApiClient
+    private let accountId: String
+    private let rawPeerId: String
+    private let receiveId: String
+    private let receiveIdType: String
+    private let replyToMessageId: Option<String>
+    private let replyInThread: Bool
+    private let showToolUse: Bool
+    private var cardMessageId: String = ""
+    private var currentText: String = ""
+    private var toolUseText: String = ""
+    private var aborted: Bool = false
+
+    public init(
+        client: FeishuApiClient,
+        accountId!: String,
+        rawPeerId!: String,
+        receiveId!: String,
+        receiveIdType!: String,
+        replyToMessageId!: Option<String> = None<String>,
+        replyInThread!: Bool = false,
+        showToolUse!: Bool = false
+    ) {
+        this.client = client
+        this.accountId = accountId.trimAscii()
+        this.rawPeerId = rawPeerId.trimAscii()
+        this.receiveId = receiveId.trimAscii()
+        this.receiveIdType = receiveIdType.trimAscii()
+        this.replyToMessageId = replyToMessageId
+        this.replyInThread = replyInThread
+        this.showToolUse = showToolUse
+    }
+
+    public func create(text: String): String {
+        if (this.aborted) {
+            return ""
+        }
+        this.currentText = text.trimAscii()
+        let result = this.client.sendInteractiveCard(
+            this.accountId,
+            this.rawPeerId,
+            this.receiveId,
+            this.receiveIdType,
+            this.buildCard(None<FeishuReplyFooterMetrics>),
+            this.replyToMessageId,
+            this.replyInThread
+        )
+        if (result.ok && !result.messageId.isEmpty()) {
+            this.cardMessageId = result.messageId
+            return result.messageId
+        }
+        let fallback = this.client.sendTextMessage(
+            this.accountId,
+            this.rawPeerId,
+            this.receiveId,
+            this.receiveIdType,
+            this.buildCard(None<FeishuReplyFooterMetrics>).fallbackText(),
+            this.replyToMessageId,
+            this.replyInThread
+        )
+        if (fallback.ok) {
+            return fallback.messageId
+        }
+        ""
+    }
+
+    public func patchChunk(text: String): Bool {
+        if (this.aborted || this.cardMessageId.isEmpty()) {
+            return false
+        }
+        this.currentText = text.trimAscii()
+        this.patchCurrent(None<FeishuReplyFooterMetrics>)
+    }
+
+    public func updateToolPayload(name: String, payload: String): Bool {
+        if (this.aborted || this.cardMessageId.isEmpty() || !this.showToolUse) {
+            return false
+        }
+        let toolName = name.trimAscii()
+        if (toolName.isEmpty()) {
+            return false
+        }
+        let preview = payload.trimAscii()
+        this.toolUseText = if (preview.isEmpty()) {
+            "Tool use\n- ${toolName}"
+        } else {
+            "Tool use\n- ${toolName}: ${preview}"
+        }
+        this.patchCurrent(None<FeishuReplyFooterMetrics>)
+    }
+
+    public func finalize(text: String, footerMetrics!: Option<FeishuReplyFooterMetrics> = None<FeishuReplyFooterMetrics>): Bool {
+        if (this.aborted || this.cardMessageId.isEmpty()) {
+            return false
+        }
+        this.currentText = text.trimAscii()
+        this.patchCurrent(footerMetrics)
+    }
+
+    public func abort(reason: String): Bool {
+        if (this.cardMessageId.isEmpty()) {
+            this.aborted = true
+            return false
+        }
+        this.aborted = true
+        let message = if (reason.trimAscii().isEmpty()) { "aborted" } else { reason.trimAscii() }
+        let result = this.client.patchInteractiveCard(
+            this.accountId,
+            this.cardMessageId,
+            FeishuInteractiveCard(title: "Metis", text: "Aborted: ${message}")
+        )
+        result.ok
+    }
+
+    private func patchCurrent(footerMetrics: Option<FeishuReplyFooterMetrics>): Bool {
+        let result = this.client.patchInteractiveCard(this.accountId, this.cardMessageId, this.buildCard(footerMetrics))
+        result.ok
+    }
+
+    private func buildCard(footerMetrics: Option<FeishuReplyFooterMetrics>): FeishuInteractiveCard {
+        let footer = match (footerMetrics) {
+            case Some(metrics) => metrics.toFooterText()
+            case None => ""
+        }
+        FeishuInteractiveCard(title: "Metis", text: this.currentText, toolUseText: this.toolUseText, footerText: footer)
     }
 }
 

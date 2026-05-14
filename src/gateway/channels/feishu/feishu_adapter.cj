@@ -115,6 +115,8 @@ public class FeishuFakeApiClient <: FeishuApiClient {
     private let textMessages = ArrayList<String>()
     private let sentCards = ArrayList<FeishuInteractiveCard>()
     private let patchedCards = ArrayList<FeishuInteractiveCard>()
+    private var nextCardSendFailureStatus: String = ""
+    private var nextCardSendFailureError: String = ""
 
     public init() {}
 
@@ -196,6 +198,13 @@ public class FeishuFakeApiClient <: FeishuApiClient {
         _replyInThread: Bool
     ): FeishuApiSendResult {
         this.sentCards.add(card)
+        if (!this.nextCardSendFailureStatus.trimAscii().isEmpty()) {
+            let status = this.nextCardSendFailureStatus.trimAscii()
+            let error = this.nextCardSendFailureError.trimAscii()
+            this.nextCardSendFailureStatus = ""
+            this.nextCardSendFailureError = ""
+            return FeishuApiSendResult(status: status, error: error)
+        }
         FeishuApiSendResult(ok: true, status: "ok", messageId: "fake-feishu-card-${this.sentCards.size}")
     }
 
@@ -208,8 +217,17 @@ public class FeishuFakeApiClient <: FeishuApiClient {
         this.sentCards.size
     }
 
+    public func textSendCount(): Int64 {
+        this.textMessages.size
+    }
+
     public func cardPatchCount(): Int64 {
         this.patchedCards.size
+    }
+
+    public func failNextCardSend(status: String, error!: String = ""): Unit {
+        this.nextCardSendFailureStatus = if (status.trimAscii().isEmpty()) { "error" } else { status.trimAscii() }
+        this.nextCardSendFailureError = error.trimAscii()
     }
 
     public func sentCard(index: Int64): FeishuInteractiveCard {
@@ -555,11 +573,33 @@ public class FeishuAdapter <: ChannelAdapter {
                 }
                 return "{\"ok\":true}"
             }
-            return "{\"ok\":true,\"ignored\":true}"
+            return this.feishuIgnoredResponse("malformed_event", eventType: headerEventType)
+        }
+        if (headerEventType == "im.message.reaction.created_v1" || headerEventType == "im.message.reaction.deleted_v1") {
+            if (let Some(inbound) <- this.mapReactionEventToInbound(root)) {
+                this.chatQueue.runExclusive(inbound.accountId, inbound.peerId, inbound.threadId ?? "", { =>
+                    synchronized(this.queueMutex) {
+                        this.inboundQueue.add(inbound)
+                    }
+                })
+                return "{\"ok\":true}"
+            }
+            return this.feishuIgnoredResponse("malformed_event", eventType: headerEventType)
+        }
+        if (headerEventType == "drive.file.comment.created_v1" ||
+            headerEventType == "drive.file.comment.updated_v1" ||
+            headerEventType == "drive.file.comment.deleted_v1") {
+            if (let Some(inbound) <- this.mapDriveCommentEventToInbound(root)) {
+                synchronized(this.queueMutex) {
+                    this.inboundQueue.add(inbound)
+                }
+                return "{\"ok\":true}"
+            }
+            return this.feishuIgnoredResponse("malformed_event", eventType: headerEventType)
         }
         if (!headerEventType.isEmpty() && headerEventType != "im.message.receive_v1") {
             PrintUtils.printLine("Feishu ingest: ignore event_type=${headerEventType}")
-            return "{\"ok\":true,\"ignored\":true}"
+            return this.feishuIgnoredResponse("unsupported_event", eventType: headerEventType)
         }
 
         if (let Some(inbound) <- this.mapWebhookToInbound(root)) {
@@ -574,7 +614,70 @@ public class FeishuAdapter <: ChannelAdapter {
             return "{\"ok\":true}"
         }
         PrintUtils.printLine("Feishu ingest: no text message mapped (non-text or missing fields), event_type=${headerEventType}")
-        return "{\"ok\":true,\"ignored\":true}"
+        let diagnostic = this.feishuMessageIgnoredDiagnostic(root, headerEventType)
+        return this.feishuIgnoredResponse(diagnostic[0], eventType: headerEventType, messageType: diagnostic[1])
+    }
+
+    private func feishuIgnoredResponse(reason: String, eventType!: String = "", messageType!: String = ""): String {
+        let root = JsonObject()
+        root.put("ok", JsonBool(true))
+        root.put("ignored", JsonBool(true))
+        root.put("reason", JsonString(if (reason.trimAscii().isEmpty()) { "ignored" } else { reason.trimAscii() }))
+        if (!eventType.trimAscii().isEmpty()) {
+            root.put("eventType", JsonString(eventType.trimAscii()))
+        }
+        if (!messageType.trimAscii().isEmpty()) {
+            root.put("messageType", JsonString(messageType.trimAscii()))
+        }
+        root.toJsonString()
+    }
+
+    private func feishuMessageIgnoredDiagnostic(root: JsonObject, eventType: String): (String, String) {
+        if (!eventType.trimAscii().isEmpty() && eventType != "im.message.receive_v1") {
+            return ("unsupported_event", "")
+        }
+        let event = match (root.get("event")) {
+            case Some(v) => try { v.asObject() } catch (_e: Exception) { return ("malformed_event", "") }
+            case None => return ("malformed_event", "")
+        }
+        let messageObj = match (event.get("message")) {
+            case Some(v) => try { v.asObject() } catch (_e: Exception) { return ("malformed_event", "") }
+            case None => return ("malformed_event", "")
+        }
+        match (event.get("sender")) {
+            case Some(v) =>
+                let sender = try { v.asObject() } catch (_e: Exception) { return ("malformed_event", "") }
+                match (sender.get("sender_id")) {
+                    case Some(idv) =>
+                        let senderIdObj = try { idv.asObject() } catch (_e: Exception) { return ("malformed_event", "") }
+                        if (this.extractSenderId(senderIdObj).trimAscii().isEmpty()) {
+                            return ("malformed_event", "")
+                        }
+                    case None => return ("malformed_event", "")
+                }
+            case None => return ("malformed_event", "")
+        }
+        let messageType = this.readStringField(messageObj, "message_type").trimAscii().toAsciiLower()
+        if (!this.feishuMessageTypeSupported(messageType)) {
+            return ("unsupported_message_type", messageType)
+        }
+        ("malformed_event", messageType)
+    }
+
+    private func feishuMessageTypeSupported(messageType: String): Bool {
+        let normalized = messageType.trimAscii().toAsciiLower()
+        normalized == "text" ||
+            normalized == "post" ||
+            normalized == "image" ||
+            normalized == "file" ||
+            normalized == "audio" ||
+            normalized == "video" ||
+            normalized == "media" ||
+            normalized == "interactive" ||
+            normalized == "merge_forward" ||
+            normalized == "sticker" ||
+            normalized == "share_chat" ||
+            normalized == "share_user"
     }
 
     private func mapCardActionToInbound(root: JsonObject): Option<InboundMessage> {
@@ -660,6 +763,141 @@ public class FeishuAdapter <: ChannelAdapter {
             mediaContext: mediaContext,
             systemEvent: true,
             systemEventKind: "feishu.card_action"
+        ))
+    }
+
+    private func mapReactionEventToInbound(root: JsonObject): Option<InboundMessage> {
+        let event = match (root.get("event")) {
+            case Some(v) => try { v.asObject() } catch (_e: Exception) { return None<InboundMessage> }
+            case None => return None<InboundMessage>
+        }
+        let reactionTypeObj = match (event.get("reaction_type")) {
+            case Some(v) => try { v.asObject() } catch (_e: Exception) { JsonObject() }
+            case None => JsonObject()
+        }
+        let userIdObj = match (event.get("user_id")) {
+            case Some(v) => try { v.asObject() } catch (_e: Exception) { JsonObject() }
+            case None => JsonObject()
+        }
+        let accountId = this.resolveFeishuAccountId(root)
+        let messageId = this.readStringField(event, "message_id")
+        let chatId = this.readStringField(event, "chat_id")
+        let threadId = this.readStringField(event, "thread_id")
+        let chatTypeRaw = this.readStringField(event, "chat_type")
+        let operatorId = this.firstNonEmpty([
+            this.readStringField(userIdObj, "open_id"),
+            this.readStringField(userIdObj, "user_id"),
+            this.readStringField(userIdObj, "union_id")
+        ])
+        let emojiType = this.firstNonEmpty([
+            this.readStringField(reactionTypeObj, "emoji_type"),
+            this.readStringField(reactionTypeObj, "emojiType"),
+            this.readStringField(event, "reaction_type")
+        ])
+        if (messageId.trimAscii().isEmpty() || chatId.trimAscii().isEmpty() || operatorId.trimAscii().isEmpty()) {
+            return None<InboundMessage>
+        }
+        let chatType = if (chatTypeRaw == "p2p") { ChatType.Direct } else { ChatType.Group }
+        let cfg = this.feishuConfigForAccount(accountId)
+        let mediaContext = JsonObject()
+        this.attachFeishuImRouteContext(mediaContext, cfg, accountId, chatId, chatType, operatorId, messageId, "", threadId)
+        let context = match (mediaContext.get("context")) {
+            case Some(v) => try { v.asObject() } catch (_e: Exception) { JsonObject() }
+            case None => JsonObject()
+        }
+        let reaction = JsonObject()
+        reaction.put("messageId", JsonString(messageId.trimAscii()))
+        reaction.put("operatorId", JsonString(operatorId.trimAscii()))
+        reaction.put("emojiType", JsonString(emojiType.trimAscii()))
+        reaction.put("chatId", JsonString(chatId.trimAscii()))
+        reaction.put("threadId", JsonString(threadId.trimAscii()))
+        reaction.put("eventType", JsonString(this.readHeaderEventType(root)))
+        context.put("feishuReaction", reaction)
+        mediaContext.put("context", context)
+        let inboundId = "reaction:${messageId.trimAscii()}:${operatorId.trimAscii()}:${emojiType.trimAscii()}"
+        Some(InboundMessage(
+            ChannelType.Feishu,
+            inboundId,
+            chatId.trimAscii(),
+            operatorId.trimAscii(),
+            chatType,
+            "[feishu-reaction]\nmessageId=${messageId.trimAscii()}\nreaction=${emojiType.trimAscii()}\nby=${operatorId.trimAscii()}",
+            true,
+            DateTime.now(),
+            conversationId: this.resolveConversationId(cfg, chatId, chatType, operatorId, messageId, "", threadId),
+            threadId: if (threadId.trimAscii().isEmpty()) { None<String> } else { Some(threadId.trimAscii()) },
+            replyTargetMessageId: Some(messageId.trimAscii()),
+            raw: Some(root.toJsonString()),
+            accountId: accountId,
+            mediaContext: mediaContext,
+            systemEvent: true,
+            systemEventKind: "feishu.reaction"
+        ))
+    }
+
+    private func mapDriveCommentEventToInbound(root: JsonObject): Option<InboundMessage> {
+        let event = match (root.get("event")) {
+            case Some(v) => try { v.asObject() } catch (_e: Exception) { return None<InboundMessage> }
+            case None => return None<InboundMessage>
+        }
+        let userIdObj = match (event.get("user_id")) {
+            case Some(v) => try { v.asObject() } catch (_e: Exception) { JsonObject() }
+            case None => JsonObject()
+        }
+        let accountId = this.resolveFeishuAccountId(root)
+        let commentId = this.readStringField(event, "comment_id")
+        let replyId = this.readStringField(event, "reply_id")
+        let fileToken = this.firstNonEmpty([
+            this.readStringField(event, "file_token"),
+            this.readStringField(event, "token")
+        ])
+        let fileType = this.readStringField(event, "file_type")
+        let operatorId = this.firstNonEmpty([
+            this.readStringField(userIdObj, "open_id"),
+            this.readStringField(userIdObj, "user_id"),
+            this.readStringField(userIdObj, "union_id")
+        ])
+        if (commentId.trimAscii().isEmpty() || fileToken.trimAscii().isEmpty()) {
+            return None<InboundMessage>
+        }
+        let peerId = "drive:${fileToken.trimAscii()}"
+        let mediaContext = JsonObject()
+        mediaContext.put("channel", JsonString("feishu"))
+        mediaContext.put("accountId", JsonString(accountId))
+        mediaContext.put("peerId", JsonString(peerId))
+        mediaContext.put("messageId", JsonString(commentId.trimAscii()))
+        let context = JsonObject()
+        let comment = JsonObject()
+        comment.put("commentId", JsonString(commentId.trimAscii()))
+        comment.put("replyId", JsonString(replyId.trimAscii()))
+        comment.put("fileToken", JsonString(fileToken.trimAscii()))
+        comment.put("fileType", JsonString(fileType.trimAscii()))
+        comment.put("operatorId", JsonString(operatorId.trimAscii()))
+        comment.put("mentioned", JsonBool(this.readBoolField(event, "is_mention", false)))
+        comment.put("content", JsonString(this.readStringField(event, "content")))
+        comment.put("eventType", JsonString(this.readHeaderEventType(root)))
+        context.put("feishuDriveComment", comment)
+        mediaContext.put("context", context)
+        let inboundId = if (replyId.trimAscii().isEmpty()) {
+            "comment:${commentId.trimAscii()}"
+        } else {
+            "comment:${commentId.trimAscii()}:reply:${replyId.trimAscii()}"
+        }
+        Some(InboundMessage(
+            ChannelType.Feishu,
+            inboundId,
+            peerId,
+            operatorId.trimAscii(),
+            ChatType.Direct,
+            "[feishu-drive-comment]\nfileToken=${fileToken.trimAscii()}\ncommentId=${commentId.trimAscii()}\nreplyId=${replyId.trimAscii()}\ncontent=${this.readStringField(event, "content")}",
+            this.readBoolField(event, "is_mention", false),
+            DateTime.now(),
+            conversationId: Some(peerId),
+            raw: Some(root.toJsonString()),
+            accountId: accountId,
+            mediaContext: mediaContext,
+            systemEvent: true,
+            systemEventKind: "feishu.drive_comment"
         ))
     }
 
@@ -836,6 +1074,7 @@ public class FeishuAdapter <: ChannelAdapter {
         this.attachFeishuGateContext(mediaContext, accountConfig, chatType, mentioned, chatId, senderId)
         this.attachFeishuAliasCandidates(mediaContext, accountConfig, messageObj)
         this.attachFeishuAttachmentContext(mediaContext, accountConfig, accountId, chatId, messageId, messageType, contentJsonString)
+        this.attachFeishuRichMessageContext(mediaContext, messageType, contentJsonString)
 
         return InboundMessage(
             ChannelType.Feishu,
@@ -1133,7 +1372,7 @@ public class FeishuAdapter <: ChannelAdapter {
         contentJsonString: String
     ): Unit {
         let normalizedType = messageType.trimAscii().toAsciiLower()
-        if (!(normalizedType == "image" || normalizedType == "file" || normalizedType == "media" || normalizedType == "audio")) {
+        if (!(normalizedType == "image" || normalizedType == "file" || normalizedType == "media" || normalizedType == "audio" || normalizedType == "video")) {
             return
         }
         let content = try {
@@ -1228,6 +1467,31 @@ public class FeishuAdapter <: ChannelAdapter {
         let records = JsonArray([])
         records.add(record)
         mediaContext.put("records", records)
+    }
+
+    private func attachFeishuRichMessageContext(
+        mediaContext: JsonObject,
+        messageType: String,
+        contentJsonString: String
+    ): Unit {
+        let normalizedType = messageType.trimAscii().toAsciiLower()
+        if (normalizedType != "merge_forward") {
+            return
+        }
+        let content = try {
+            JsonValue.fromStr(contentJsonString).asObject()
+        } catch (_e: Exception) {
+            JsonObject()
+        }
+        let context = match (mediaContext.get("context")) {
+            case Some(v) => try { v.asObject() } catch (_e: Exception) { JsonObject() }
+            case None => JsonObject()
+        }
+        let forward = JsonObject()
+        forward.put("title", JsonString(this.readStringField(content, "title").trimAscii()))
+        forward.put("status", JsonString("metadata_only"))
+        context.put("feishuMergeForward", forward)
+        mediaContext.put("context", context)
     }
 
     private func feishuResourceTypeForApi(kind: String): String {
@@ -1529,7 +1793,7 @@ public class FeishuAdapter <: ChannelAdapter {
         }
         if (kind == "image") { return "image/*" }
         if (kind == "audio") { return "audio/*" }
-        if (kind == "media") { return "video/*" }
+        if (kind == "media" || kind == "video") { return "video/*" }
         ""
     }
 
@@ -1546,13 +1810,13 @@ public class FeishuAdapter <: ChannelAdapter {
     private func feishuAttachmentEligibility(kind: String): String {
         if (kind == "image") { return "image" }
         if (kind == "audio") { return "audio" }
-        if (kind == "media") { return "video" }
+        if (kind == "media" || kind == "video") { return "video" }
         "document"
     }
 
     private func readHeaderEventType(root: JsonObject): String {
         match (root.get("header")) {
-            case Some(hv) => this.readStringField(hv.asObject(), "event_type")
+            case Some(hv) => try { this.readStringField(hv.asObject(), "event_type") } catch (_e: Exception) { "" }
             case None => ""
         }
     }
@@ -1646,6 +1910,25 @@ public class FeishuAdapter <: ChannelAdapter {
         }
     }
 
+    private func readBoolField(obj: JsonObject, key: String, fallback: Bool): Bool {
+        match (obj.get(key)) {
+            case Some(v) =>
+                try {
+                    return v.asBool().getValue()
+                } catch (_e: Exception) {
+                    let raw = this.readStringField(obj, key).trimAscii().toAsciiLower()
+                    if (raw == "true" || raw == "1" || raw == "yes") {
+                        return true
+                    }
+                    if (raw == "false" || raw == "0" || raw == "no") {
+                        return false
+                    }
+                    return fallback
+                }
+            case None => fallback
+        }
+    }
+
     /**
      * 飞书文本 content 通常是 JSON 字符串，例如 {"text":"hello"}。
      */
@@ -1684,6 +1967,12 @@ public class FeishuAdapter <: ChannelAdapter {
         if (normalized == "audio") {
             return "[audio]"
         }
+        if (normalized == "video") {
+            return "[video]"
+        }
+        if (normalized == "merge_forward") {
+            return this.extractMergeForwardText(contentJsonString)
+        }
         if (normalized == "sticker") {
             return "[sticker]"
         }
@@ -1694,6 +1983,20 @@ public class FeishuAdapter <: ChannelAdapter {
             return "[shared user card]"
         }
         ""
+    }
+
+    private func extractMergeForwardText(contentJsonString: String): String {
+        let title = try {
+            let root = JsonValue.fromStr(contentJsonString).asObject()
+            this.readStringField(root, "title").trimAscii()
+        } catch (_e: Exception) {
+            ""
+        }
+        if (title.isEmpty()) {
+            "[merge forward]"
+        } else {
+            "[merge forward]\n${title}"
+        }
     }
 
     private func extractPostText(contentJsonString: String): String {
@@ -2025,11 +2328,7 @@ public class FeishuAdapter <: ChannelAdapter {
             if (kind == "event") {
                 match (root.get("payload")) {
                     case Some(v) =>
-                        if (let Some(inbound) <- this.mapWebhookToInbound(v.asObject())) {
-                            synchronized(this.queueMutex) {
-                                this.inboundQueue.add(inbound)
-                            }
-                        }
+                        let _ = this.feishuDispatchEventRoot(v.asObject())
                     case None => ()
                 }
                 return
