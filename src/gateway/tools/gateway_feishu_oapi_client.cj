@@ -4,6 +4,7 @@ import metis.core.config.MetisPaths
 
 import std.collection.{ArrayList, HashMap, HashSet}
 import std.convert.Parsable
+import std.env.getVariable
 import std.fs.{Directory, File, Path, exists}
 import std.time.DateTime
 import stdx.encoding.json.{JsonArray, JsonBool, JsonInt, JsonObject, JsonString, JsonValue}
@@ -80,6 +81,7 @@ public class FeishuOapiResult {
     private let error: String
     private let missingScopes: Array<String>
     private let authState: String
+    private let scopeDiagnostic: Option<JsonObject>
 
     public init(
         request: FeishuOapiRequest,
@@ -88,7 +90,8 @@ public class FeishuOapiResult {
         data!: Option<JsonValue> = None<JsonValue>,
         error!: String = "",
         missingScopes!: Array<String> = [],
-        authState!: String = ""
+        authState!: String = "",
+        scopeDiagnostic!: Option<JsonObject> = None<JsonObject>
     ) {
         this.request = request
         this.ok = ok
@@ -97,13 +100,19 @@ public class FeishuOapiResult {
         this.error = error.trimAscii()
         this.missingScopes = missingScopes
         this.authState = authState.trimAscii()
+        this.scopeDiagnostic = scopeDiagnostic
     }
 
-    public static func success(request: FeishuOapiRequest, data: JsonValue): FeishuOapiResult {
-        FeishuOapiResult(request, true, "success", data: Some(data))
+    public static func success(request: FeishuOapiRequest, data: JsonValue, scopeDiagnostic!: Option<JsonObject> = None<JsonObject>): FeishuOapiResult {
+        FeishuOapiResult(request, true, "success", data: Some(data), scopeDiagnostic: scopeDiagnostic)
     }
 
-    public static func authRequired(request: FeishuOapiRequest, authState!: String = "absent", error!: String = ""): FeishuOapiResult {
+    public static func authRequired(
+        request: FeishuOapiRequest,
+        authState!: String = "absent",
+        error!: String = "",
+        scopeDiagnostic!: Option<JsonObject> = None<JsonObject>
+    ): FeishuOapiResult {
         FeishuOapiResult(
             request,
             false,
@@ -113,27 +122,40 @@ public class FeishuOapiResult {
             } else {
                 error.trimAscii()
             },
-            authState: if (authState.trimAscii().isEmpty()) { "absent" } else { authState.trimAscii() }
+            authState: if (authState.trimAscii().isEmpty()) { "absent" } else { authState.trimAscii() },
+            scopeDiagnostic: scopeDiagnostic
         )
     }
 
-    public static func scopeMissing(request: FeishuOapiRequest, missingScopes: Array<String>, error!: String = ""): FeishuOapiResult {
+    public static func scopeMissing(
+        request: FeishuOapiRequest,
+        missingScopes: Array<String>,
+        error!: String = "",
+        scopeDiagnostic!: Option<JsonObject> = None<JsonObject>
+    ): FeishuOapiResult {
         FeishuOapiResult(
             request,
             false,
             "scope_missing",
             error: if (error.trimAscii().isEmpty()) { "Feishu OAPI required scope is missing." } else { error.trimAscii() },
-            missingScopes: missingScopes
+            missingScopes: missingScopes,
+            scopeDiagnostic: scopeDiagnostic
         )
     }
 
-    public static func appScopeMissing(request: FeishuOapiRequest, missingScopes: Array<String>, error!: String = ""): FeishuOapiResult {
+    public static func appScopeMissing(
+        request: FeishuOapiRequest,
+        missingScopes: Array<String>,
+        error!: String = "",
+        scopeDiagnostic!: Option<JsonObject> = None<JsonObject>
+    ): FeishuOapiResult {
         FeishuOapiResult(
             request,
             false,
             "app_scope_missing",
             error: if (error.trimAscii().isEmpty()) { "Feishu app is missing required OAPI scope(s)." } else { error.trimAscii() },
-            missingScopes: missingScopes
+            missingScopes: missingScopes,
+            scopeDiagnostic: scopeDiagnostic
         )
     }
 
@@ -146,8 +168,13 @@ public class FeishuOapiResult {
         )
     }
 
-    public static func apiError(request: FeishuOapiRequest, error: String, data!: Option<JsonValue> = None<JsonValue>): FeishuOapiResult {
-        FeishuOapiResult(request, false, "api_error", data: data, error: error)
+    public static func apiError(
+        request: FeishuOapiRequest,
+        error: String,
+        data!: Option<JsonValue> = None<JsonValue>,
+        scopeDiagnostic!: Option<JsonObject> = None<JsonObject>
+    ): FeishuOapiResult {
+        FeishuOapiResult(request, false, "api_error", data: data, error: error, scopeDiagnostic: scopeDiagnostic)
     }
 
     public static func invalidRequest(request: FeishuOapiRequest, error: String): FeishuOapiResult {
@@ -167,6 +194,10 @@ public class FeishuOapiResult {
         }
         if (this.missingScopes.size > 0) {
             out.put("missing_scopes", feishuOapiJsonStringArray(this.missingScopes))
+        }
+        match (this.scopeDiagnostic) {
+            case Some(v) => out.put("scope_diagnostic", v)
+            case None => ()
         }
         match (this.data) {
             case Some(v) => out.put("data", v)
@@ -188,10 +219,39 @@ public class FeishuOapiTokenLookup {
     public let accessToken: String
     public let missingScopes: Array<String>
     public let error: String
+    public let grantedScopes: Array<String>
+    public let hasOfflineAccess: Bool
+    public let offlineAccessKnown: Bool
 
-    public init(status: String, accessToken!: String = "", missingScopes!: Array<String> = [], error!: String = "") {
+    public init(
+        status: String,
+        accessToken!: String = "",
+        missingScopes!: Array<String> = [],
+        error!: String = "",
+        grantedScopes!: Array<String> = [],
+        hasOfflineAccess!: Bool = false,
+        offlineAccessKnown!: Bool = false
+    ) {
         this.status = status.trimAscii()
         this.accessToken = accessToken.trimAscii()
+        this.missingScopes = missingScopes
+        this.error = error.trimAscii()
+        this.grantedScopes = grantedScopes
+        this.hasOfflineAccess = hasOfflineAccess || feishuOapiHasScope(grantedScopes, "offline_access")
+        this.offlineAccessKnown = offlineAccessKnown || grantedScopes.size > 0 || this.status == "authorized" || this.status == "scope_missing"
+    }
+}
+
+public class FeishuOapiAppScopeCheck {
+    public let status: String
+    public let grantedScopes: Array<String>
+    public let missingScopes: Array<String>
+    public let error: String
+
+    public init(status: String, grantedScopes!: Array<String> = [], missingScopes!: Array<String> = [], error!: String = "") {
+        let normalized = status.trimAscii()
+        this.status = if (normalized.isEmpty()) { "ok" } else { normalized }
+        this.grantedScopes = grantedScopes
         this.missingScopes = missingScopes
         this.error = error.trimAscii()
     }
@@ -336,6 +396,10 @@ public interface FeishuOapiTokenProvider {
     func userAccessToken(accountId: String, requiredScopes: Array<String>): FeishuOapiTokenLookup
 }
 
+public interface FeishuOapiAppScopeChecker {
+    func check(accountId: String, tokenMode: String, requiredScopes: Array<String>): FeishuOapiAppScopeCheck
+}
+
 public interface FeishuOapiRefreshClient {
     func refresh(accountId: String, refreshToken: String): FeishuOapiRefreshResult
 }
@@ -431,35 +495,69 @@ public class MetisFeishuOapiTokenProvider <: FeishuOapiTokenProvider {
         }
         let missing = feishuOapiMissingScopes(token.scopes, requiredScopes)
         if (missing.size > 0) {
-            return FeishuOapiTokenLookup("scope_missing", missingScopes: missing, error: "Feishu user authorization is missing required scope(s).")
+            return FeishuOapiTokenLookup(
+                "scope_missing",
+                missingScopes: missing,
+                error: "Feishu user authorization is missing required scope(s).",
+                grantedScopes: token.scopes,
+                hasOfflineAccess: feishuOapiHasScope(token.scopes, "offline_access")
+            )
         }
         if (token.expiresAtMs <= this.nowMsValue) {
             return this.refreshOrExpired(normalized, token, requiredScopes)
         }
         if (token.accessToken.isEmpty()) {
-            return FeishuOapiTokenLookup("auth_required", error: "Stored Feishu user authorization does not contain an access token.")
+            return FeishuOapiTokenLookup(
+                "auth_required",
+                error: "Stored Feishu user authorization does not contain an access token.",
+                grantedScopes: token.scopes,
+                hasOfflineAccess: feishuOapiHasScope(token.scopes, "offline_access")
+            )
         }
-        FeishuOapiTokenLookup("authorized", accessToken: token.accessToken)
+        FeishuOapiTokenLookup(
+            "authorized",
+            accessToken: token.accessToken,
+            grantedScopes: token.scopes,
+            hasOfflineAccess: feishuOapiHasScope(token.scopes, "offline_access")
+        )
     }
 
     private func refreshOrExpired(accountId: String, token: FeishuOapiStoredToken, requiredScopes: Array<String>): FeishuOapiTokenLookup {
         if (token.refreshToken.isEmpty()) {
-            return FeishuOapiTokenLookup("expired", error: "Stored Feishu user authorization is expired and has no refresh token.")
+            return FeishuOapiTokenLookup(
+                "expired",
+                error: "Stored Feishu user authorization is expired and has no refresh token.",
+                grantedScopes: token.scopes,
+                hasOfflineAccess: feishuOapiHasScope(token.scopes, "offline_access")
+            )
         }
         let refreshed = match (this.refreshClient) {
             case Some(client) => client.refresh(accountId, token.refreshToken)
-            case None => return FeishuOapiTokenLookup("expired", error: "Stored Feishu user authorization is expired.")
+            case None => return FeishuOapiTokenLookup(
+                "expired",
+                error: "Stored Feishu user authorization is expired.",
+                grantedScopes: token.scopes,
+                hasOfflineAccess: feishuOapiHasScope(token.scopes, "offline_access")
+            )
         }
         if (refreshed.status != "authorized" || refreshed.accessToken.isEmpty()) {
             return FeishuOapiTokenLookup(
                 if (refreshed.status.isEmpty()) { "expired" } else { refreshed.status },
-                error: if (refreshed.error.isEmpty()) { "Feishu user authorization refresh did not return an access token." } else { refreshed.error }
+                error: if (refreshed.error.isEmpty()) { "Feishu user authorization refresh did not return an access token." } else { refreshed.error },
+                grantedScopes: token.scopes,
+                hasOfflineAccess: feishuOapiHasScope(token.scopes, "offline_access")
             )
         }
         let scopes = if (refreshed.scopes.size > 0) { refreshed.scopes } else { token.scopes }
         let missing = feishuOapiMissingScopes(scopes, requiredScopes)
         if (missing.size > 0) {
-            return FeishuOapiTokenLookup("scope_missing", missingScopes: missing, error: "Refreshed Feishu user authorization is missing required scope(s).")
+            return FeishuOapiTokenLookup(
+                "scope_missing",
+                missingScopes: missing,
+                error: "Refreshed Feishu user authorization is missing required scope(s).",
+                grantedScopes: scopes,
+                hasOfflineAccess: feishuOapiHasScope(scopes, "offline_access")
+            )
         }
         this.save(accountId, FeishuOapiStoredToken(
             accessToken: refreshed.accessToken,
@@ -467,7 +565,12 @@ public class MetisFeishuOapiTokenProvider <: FeishuOapiTokenProvider {
             expiresAtMs: this.nowMsValue + refreshed.expiresInSeconds * 1000,
             scopes: scopes
         ))
-        FeishuOapiTokenLookup("authorized", accessToken: refreshed.accessToken)
+        FeishuOapiTokenLookup(
+            "authorized",
+            accessToken: refreshed.accessToken,
+            grantedScopes: scopes,
+            hasOfflineAccess: feishuOapiHasScope(scopes, "offline_access")
+        )
     }
 
     private func load(accountId: String): Option<FeishuOapiStoredToken> {
@@ -541,11 +644,20 @@ public class FeishuNativeOapiHttpClient <: FeishuOapiHttpClient {
             case None => FeishuNativeOapiRawHttpTransport(timeoutSeconds: this.timeoutSeconds).send(raw)
         }
         if (response.statusCode < 200 || response.statusCode >= 300) {
-            return FeishuOapiHttpResponse(false, statusCode: response.statusCode, body: feishuOapiParseBody(response.body), error: response.error)
+            let (parsed, body) = feishuOapiParseBodyWithStatus(response.body)
+            return FeishuOapiHttpResponse(
+                false,
+                statusCode: response.statusCode,
+                body: body,
+                error: if (!response.error.isEmpty()) { response.error } else if (!parsed) { "Feishu OAPI response body is not valid JSON." } else { "" }
+            )
         }
-        let body = feishuOapiParseBody(response.body)
-        let apiCode = try { body.asObject().get("code").getOrThrow().asInt().getValue() } catch (_e: Exception) { 0 }
-        if (apiCode != 0) {
+        let (parsed, body) = feishuOapiParseBodyWithStatus(response.body)
+        if (!parsed) {
+            return FeishuOapiHttpResponse(false, statusCode: response.statusCode, body: body, error: "Feishu OAPI response body is not valid JSON.")
+        }
+        let apiCode = feishuOapiResponseCode(body)
+        if (!apiCode.isEmpty() && apiCode != "0") {
             return FeishuOapiHttpResponse(false, statusCode: response.statusCode, body: body, error: "Feishu OAPI returned code ${apiCode}.")
         }
         FeishuOapiHttpResponse(true, statusCode: response.statusCode, body: body)
@@ -601,55 +713,82 @@ public class FeishuNativeOapiRawHttpTransport <: FeishuOapiRawHttpTransport {
 public class MetisFeishuOapiClient <: FeishuOapiClient {
     private let tokenProvider: Option<FeishuOapiTokenProvider>
     private let httpClient: Option<FeishuOapiHttpClient>
+    private let appScopeChecker: Option<FeishuOapiAppScopeChecker>
 
     public init(
         tokenProvider!: Option<FeishuOapiTokenProvider> = None<FeishuOapiTokenProvider>,
-        httpClient!: Option<FeishuOapiHttpClient> = None<FeishuOapiHttpClient>
+        httpClient!: Option<FeishuOapiHttpClient> = None<FeishuOapiHttpClient>,
+        appScopeChecker!: Option<FeishuOapiAppScopeChecker> = None<FeishuOapiAppScopeChecker>
     ) {
         this.tokenProvider = tokenProvider
         this.httpClient = httpClient
+        this.appScopeChecker = appScopeChecker
     }
 
     public func invoke(request: FeishuOapiRequest): JsonObject {
         if (!request.supported) {
             return FeishuOapiResult.unsupportedAction(request).toJson()
         }
+        let appScope = match (this.appScopeChecker) {
+            case Some(checker) => Some(checker.check(request.accountId, request.tokenMode, request.requiredScopes))
+            case None => None<FeishuOapiAppScopeCheck>
+        }
+        match (appScope) {
+            case Some(check) =>
+                if (check.status == "app_scope_missing") {
+                    return FeishuOapiResult.appScopeMissing(
+                        request,
+                        check.missingScopes,
+                        error: check.error,
+                        scopeDiagnostic: Some(feishuOapiScopeDiagnostic(request, appScope, None<FeishuOapiTokenLookup>))
+                    ).toJson()
+                }
+                if (check.status == "token_mode_unsupported") {
+                    return FeishuOapiResult.invalidRequest(request, if (check.error.isEmpty()) { "Unsupported Feishu OAPI token mode: ${request.tokenMode}." } else { check.error }).toJson()
+                }
+            case None => ()
+        }
         let token = match (this.tokenProvider) {
             case Some(provider) => provider.userAccessToken(request.accountId, request.requiredScopes)
-            case None => return FeishuOapiResult.authRequired(request).toJson()
+            case None => return FeishuOapiResult.authRequired(
+                request,
+                scopeDiagnostic: Some(feishuOapiScopeDiagnostic(request, appScope, None<FeishuOapiTokenLookup>))
+            ).toJson()
         }
+        let scopeDiagnostic = Some(feishuOapiScopeDiagnostic(request, appScope, Some(token)))
         if (token.status == "app_scope_missing") {
-            return FeishuOapiResult.appScopeMissing(request, token.missingScopes, error: token.error).toJson()
+            return FeishuOapiResult.appScopeMissing(request, token.missingScopes, error: token.error, scopeDiagnostic: scopeDiagnostic).toJson()
         }
         if (token.status == "scope_missing") {
-            return FeishuOapiResult.scopeMissing(request, token.missingScopes, error: token.error).toJson()
+            return FeishuOapiResult.scopeMissing(request, token.missingScopes, error: token.error, scopeDiagnostic: scopeDiagnostic).toJson()
         }
         if (token.status == "expired") {
-            return FeishuOapiResult.authRequired(request, authState: "expired", error: token.error).toJson()
+            return FeishuOapiResult.authRequired(request, authState: "expired", error: token.error, scopeDiagnostic: scopeDiagnostic).toJson()
         }
         if (token.status == "auth_required" || token.accessToken.isEmpty()) {
-            return FeishuOapiResult.authRequired(request, authState: token.status, error: token.error).toJson()
+            return FeishuOapiResult.authRequired(request, authState: token.status, error: token.error, scopeDiagnostic: scopeDiagnostic).toJson()
         }
         match (this.httpClient) {
             case Some(http) =>
                 let response = http.request(request, token.accessToken)
                 if (response.ok) {
-                    return FeishuOapiResult.success(request, response.body).toJson()
+                    return FeishuOapiResult.success(request, response.body, scopeDiagnostic: scopeDiagnostic).toJson()
                 }
                 let code = feishuOapiResponseCode(response.body)
                 if (code == "99991672") {
-                    return FeishuOapiResult.appScopeMissing(request, request.requiredScopes, error: response.error).toJson()
+                    return FeishuOapiResult.appScopeMissing(request, request.requiredScopes, error: response.error, scopeDiagnostic: scopeDiagnostic).toJson()
                 }
                 if (code == "99991679") {
-                    return FeishuOapiResult.scopeMissing(request, request.requiredScopes, error: response.error).toJson()
+                    return FeishuOapiResult.scopeMissing(request, request.requiredScopes, error: response.error, scopeDiagnostic: scopeDiagnostic).toJson()
                 }
                 return FeishuOapiResult.apiError(
                     request,
                     if (response.error.isEmpty()) { "Feishu OAPI request failed with HTTP ${response.statusCode}." } else { response.error },
-                    data: Some(response.body)
+                    data: Some(response.body),
+                    scopeDiagnostic: scopeDiagnostic
                 ).toJson()
             case None =>
-                FeishuOapiResult.apiError(request, "Feishu OAPI HTTP client is not configured for this runtime.").toJson()
+                FeishuOapiResult.apiError(request, "Feishu OAPI HTTP client is not configured for this runtime.", scopeDiagnostic: scopeDiagnostic).toJson()
         }
     }
 }
@@ -888,6 +1027,11 @@ private func feishuOapiTokenModeForActionKey(_actionKey: String): String {
 
 private func feishuOapiMethodForActionKey(actionKey: String): String {
     match (actionKey) {
+        case "feishu_oauth.default" => "POST"
+        case "feishu_oauth_batch_auth.default" => "POST"
+        case "feishu_ask_user_question.default" => "POST"
+        case "feishu_create_doc.default" => "POST"
+        case "feishu_update_doc.default" => "PATCH"
         case "feishu_chat.search" => "GET"
         case "feishu_search_user.default" => "GET"
         case "feishu_im_user_message.send" => "POST"
@@ -896,6 +1040,8 @@ private func feishuOapiMethodForActionKey(actionKey: String): String {
         case "feishu_sheet.write" => "PUT"
         case "feishu_sheet.append" => "POST"
         case "feishu_sheet.create" => "POST"
+        case "feishu_sheet.export" => "POST"
+        case "feishu_drive_file.get_meta" => "POST"
         case "feishu_drive_file.copy" => "POST"
         case "feishu_drive_file.move" => "POST"
         case "feishu_drive_file.delete" => "DELETE"
@@ -908,9 +1054,13 @@ private func feishuOapiMethodForActionKey(actionKey: String): String {
         case "feishu_wiki_space_node.create" => "POST"
         case "feishu_wiki_space_node.move" => "POST"
         case "feishu_wiki_space_node.copy" => "POST"
+        case "feishu_calendar_event.reply" => "POST"
+        case "feishu_calendar_freebusy.list" => "POST"
+        case "feishu_task_attachment.upload" => "POST"
         case _ =>
             let action = actionKey.split(".")[1].trimAscii()
-            if (action == "create" || action == "batch_create" || action == "register" || action == "add_members" || action == "append_steps") {
+            if (action == "create" || action == "batch_create" || action == "register" || action == "add_members" || action == "append_steps" ||
+                action == "copy" || action == "reply" || action == "upload" || action == "export") {
                 "POST"
             } else if (action == "patch" || action == "update" || action == "update_profile" || action == "batch_update") {
                 "PATCH"
@@ -1132,6 +1282,165 @@ public func feishuOapiDefaultTokenStoreRoot(): Path {
     MetisPaths.homeRoot().join("feishu").join("user-tokens")
 }
 
+private class FeishuOapiStaticTokenProvider <: FeishuOapiTokenProvider {
+    private let accessToken: String
+    private let grantedScopes: Array<String>
+
+    init(accessToken: String, grantedScopes: Array<String>) {
+        this.accessToken = accessToken.trimAscii()
+        this.grantedScopes = grantedScopes
+    }
+
+    public func userAccessToken(_accountId: String, requiredScopes: Array<String>): FeishuOapiTokenLookup {
+        let missing = feishuOapiMissingScopes(this.grantedScopes, requiredScopes)
+        if (missing.size > 0) {
+            return FeishuOapiTokenLookup(
+                "scope_missing",
+                missingScopes: missing,
+                error: "METIS_FEISHU_OAPI_LIVE_USER_SCOPES is missing required scope(s).",
+                grantedScopes: this.grantedScopes,
+                hasOfflineAccess: feishuOapiHasScope(this.grantedScopes, "offline_access")
+            )
+        }
+        FeishuOapiTokenLookup(
+            "authorized",
+            accessToken: this.accessToken,
+            grantedScopes: this.grantedScopes,
+            hasOfflineAccess: feishuOapiHasScope(this.grantedScopes, "offline_access")
+        )
+    }
+}
+
+private class FeishuOapiStaticAppScopeChecker <: FeishuOapiAppScopeChecker {
+    private let grantedScopes: Array<String>
+
+    init(grantedScopes: Array<String>) {
+        this.grantedScopes = grantedScopes
+    }
+
+    public func check(_accountId: String, _tokenMode: String, requiredScopes: Array<String>): FeishuOapiAppScopeCheck {
+        let missing = feishuOapiMissingScopes(this.grantedScopes, requiredScopes)
+        if (missing.size > 0) {
+            return FeishuOapiAppScopeCheck(
+                "app_scope_missing",
+                grantedScopes: this.grantedScopes,
+                missingScopes: missing,
+                error: "METIS_FEISHU_OAPI_LIVE_APP_SCOPES is missing required app scope(s)."
+            )
+        }
+        FeishuOapiAppScopeCheck("ok", grantedScopes: this.grantedScopes)
+    }
+}
+
+public func feishuOapiLiveSmokeHarnessFromEnv(): JsonObject {
+    let required = JsonArray([
+        JsonString("METIS_FEISHU_OAPI_LIVE_SMOKE"),
+        JsonString("METIS_FEISHU_OAPI_LIVE_ACCESS_TOKEN"),
+        JsonString("METIS_FEISHU_OAPI_LIVE_USER_SCOPES"),
+        JsonString("METIS_FEISHU_OAPI_LIVE_APP_SCOPES"),
+        JsonString("METIS_FEISHU_OAPI_LIVE_CASES_JSON")
+    ])
+    if (!feishuOapiEnvEnabled(feishuOapiEnvValue("METIS_FEISHU_OAPI_LIVE_SMOKE"))) {
+        let out = JsonObject()
+        out.put("status", JsonString("skipped"))
+        out.put("reason", JsonString("env_gate_disabled"))
+        out.put("live", JsonBool(false))
+        out.put("redacted", JsonBool(true))
+        out.put("requiresEnv", required)
+        return out
+    }
+
+    let accessToken = feishuOapiEnvValue("METIS_FEISHU_OAPI_LIVE_ACCESS_TOKEN")
+    let userScopes = feishuOapiSplitScopes(feishuOapiEnvValue("METIS_FEISHU_OAPI_LIVE_USER_SCOPES"))
+    let appScopes = feishuOapiSplitScopes(feishuOapiEnvValue("METIS_FEISHU_OAPI_LIVE_APP_SCOPES"))
+    let casesRaw = feishuOapiEnvValue("METIS_FEISHU_OAPI_LIVE_CASES_JSON")
+    let missingEnv = JsonArray([])
+    if (accessToken.isEmpty()) {
+        missingEnv.add(JsonString("METIS_FEISHU_OAPI_LIVE_ACCESS_TOKEN"))
+    }
+    if (userScopes.size == 0) {
+        missingEnv.add(JsonString("METIS_FEISHU_OAPI_LIVE_USER_SCOPES"))
+    }
+    if (appScopes.size == 0) {
+        missingEnv.add(JsonString("METIS_FEISHU_OAPI_LIVE_APP_SCOPES"))
+    }
+    if (casesRaw.isEmpty()) {
+        missingEnv.add(JsonString("METIS_FEISHU_OAPI_LIVE_CASES_JSON"))
+    }
+    if (missingEnv.size() > 0) {
+        let out = JsonObject()
+        out.put("status", JsonString("configuration_error"))
+        out.put("reason", JsonString("missing_live_smoke_env"))
+        out.put("missingEnv", missingEnv)
+        out.put("live", JsonBool(false))
+        out.put("redacted", JsonBool(true))
+        out.put("requiresEnv", required)
+        return out
+    }
+
+    let cases = try {
+        JsonValue.fromStr(casesRaw).asArray()
+    } catch (e: Exception) {
+        let out = JsonObject()
+        out.put("status", JsonString("invalid_request"))
+        out.put("reason", JsonString("METIS_FEISHU_OAPI_LIVE_CASES_JSON must be a JSON array: ${e.message}"))
+        out.put("live", JsonBool(false))
+        out.put("redacted", JsonBool(true))
+        out.put("requiresEnv", required)
+        return out
+    }
+
+    let domain = feishuOapiEnvValue("METIS_FEISHU_OAPI_LIVE_DOMAIN")
+    let defaultAccount = feishuOapiEnvValue("METIS_FEISHU_OAPI_LIVE_ACCOUNT_ID")
+    let client = MetisFeishuOapiClient(
+        tokenProvider: Some<FeishuOapiTokenProvider>(FeishuOapiStaticTokenProvider(accessToken, userScopes)),
+        appScopeChecker: Some<FeishuOapiAppScopeChecker>(FeishuOapiStaticAppScopeChecker(appScopes)),
+        httpClient: Some<FeishuOapiHttpClient>(FeishuNativeOapiHttpClient(
+            domain: if (domain.isEmpty()) { "https://open.feishu.cn" } else { domain }
+        ))
+    )
+    let results = JsonArray([])
+    var failures: Int64 = 0
+    for (i in 0..cases.size()) {
+        let item = try { cases[i].asObject() } catch (_e: Exception) { JsonObject() }
+        let tool = feishuOapiJsonString(item, "tool")
+        let action = if (feishuOapiJsonString(item, "action").isEmpty()) { "default" } else { feishuOapiJsonString(item, "action") }
+        let accountId = if (feishuOapiJsonString(item, "accountId").isEmpty()) { defaultAccount } else { feishuOapiJsonString(item, "accountId") }
+        let params = match (feishuOapiObjectField(item, "params")) {
+            case Some(v) => v
+            case None => JsonObject()
+        }
+        let request = feishuOapiBuildRequest(tool, action, if (accountId.isEmpty()) { "default" } else { accountId }, params)
+        let invoked = client.invoke(request)
+        let ok = try { invoked.get("ok").getOrThrow().asBool().getValue() } catch (_e: Exception) { false }
+        if (!ok) {
+            failures++
+        }
+        let row = JsonObject()
+        row.put("tool", JsonString(request.toolName))
+        row.put("action", JsonString(request.action))
+        row.put("accountId", JsonString(request.accountId))
+        row.put("path", JsonString(request.path))
+        row.put("method", JsonString(request.method))
+        row.put("tokenMode", JsonString(request.tokenMode))
+        row.put("ok", JsonBool(ok))
+        row.put("status", invoked.get("status") ?? JsonString("unknown"))
+        row.put("missing_scopes", invoked.get("missing_scopes") ?? JsonArray([]))
+        row.put("hasData", JsonBool(invoked.get("data").isSome()))
+        row.put("redacted", JsonBool(true))
+        results.add(row)
+    }
+    let out = JsonObject()
+    out.put("status", JsonString(if (failures == 0) { "ok" } else { "completed_with_failures" }))
+    out.put("live", JsonBool(true))
+    out.put("redacted", JsonBool(true))
+    out.put("caseCount", JsonInt(cases.size()))
+    out.put("failureCount", JsonInt(failures))
+    out.put("results", results)
+    out.put("requiresEnv", required)
+    out
+}
+
 public func feishuOapiBuildRawHttpRequest(domain: String, request: FeishuOapiRequest, accessToken: String): FeishuOapiRawHttpRequest {
     let headers = feishuOapiHeadersFromParams(request.params)
     headers["Authorization"] = "Bearer ${accessToken}"
@@ -1190,6 +1499,78 @@ private func feishuOapiMissingScopes(granted: Array<String>, required: Array<Str
         }
     }
     missing.toArray()
+}
+
+private func feishuOapiHasScope(scopes: Array<String>, expected: String): Bool {
+    let cleanExpected = expected.trimAscii()
+    if (cleanExpected.isEmpty()) {
+        return false
+    }
+    for (scope in scopes) {
+        if (scope.trimAscii() == cleanExpected) {
+            return true
+        }
+    }
+    false
+}
+
+private func feishuOapiScopeDiagnosticStatus(
+    status: String,
+    grantedScopes: Array<String>,
+    missingScopes: Array<String>,
+    error: String
+): JsonObject {
+    let out = JsonObject()
+    out.put("status", JsonString(if (status.trimAscii().isEmpty()) { "unknown" } else { status.trimAscii() }))
+    out.put("granted_scopes", feishuOapiJsonStringArray(grantedScopes))
+    out.put("missing_scopes", feishuOapiJsonStringArray(missingScopes))
+    if (!error.trimAscii().isEmpty()) {
+        out.put("error", JsonString(error.trimAscii()))
+    }
+    return out
+}
+
+private func feishuOapiScopeDiagnostic(
+    request: FeishuOapiRequest,
+    appScope: Option<FeishuOapiAppScopeCheck>,
+    userToken: Option<FeishuOapiTokenLookup>
+): JsonObject {
+    let out = JsonObject()
+    out.put("tokenMode", JsonString(request.tokenMode))
+    out.put("token_mode", JsonString(request.tokenMode))
+    out.put("required_scopes", feishuOapiJsonStringArray(request.requiredScopes))
+    match (appScope) {
+        case Some(check) =>
+            out.put("app", feishuOapiScopeDiagnosticStatus(check.status, check.grantedScopes, check.missingScopes, check.error))
+        case None =>
+            out.put("app", feishuOapiScopeDiagnosticStatus("not_checked", [], [], ""))
+    }
+    match (userToken) {
+        case Some(token) =>
+            out.put("user", feishuOapiScopeDiagnosticStatus(token.status, token.grantedScopes, token.missingScopes, token.error))
+            let offline = JsonObject()
+            let required = request.tokenMode == "user_access_token"
+            offline.put("required", JsonBool(required))
+            offline.put("granted", JsonBool(token.hasOfflineAccess))
+            offline.put("status", JsonString(if (!required) {
+                "not_required"
+            } else if (!token.offlineAccessKnown) {
+                "unknown"
+            } else if (token.hasOfflineAccess) {
+                "present"
+            } else {
+                "missing"
+            }))
+            out.put("offline_access", offline)
+        case None =>
+            out.put("user", feishuOapiScopeDiagnosticStatus("not_checked", [], [], ""))
+            let offline = JsonObject()
+            offline.put("required", JsonBool(request.tokenMode == "user_access_token"))
+            offline.put("granted", JsonBool(false))
+            offline.put("status", JsonString("not_checked"))
+            out.put("offline_access", offline)
+    }
+    out
 }
 
 private func feishuOapiJsonString(obj: JsonObject, key: String): String {
@@ -1331,15 +1712,44 @@ private func feishuOapiUrlEncode(raw: String): String {
     out.toString()
 }
 
-private func feishuOapiParseBody(body: String): JsonValue {
+private func feishuOapiParseBodyWithStatus(body: String): (Bool, JsonValue) {
     if (body.trimAscii().isEmpty()) {
-        return JsonObject()
+        return (true, JsonObject())
     }
-    try { JsonValue.fromStr(body) } catch (_e: Exception) {
+    try { (true, JsonValue.fromStr(body)) } catch (_e: Exception) {
         let out = JsonObject()
         out.put("raw", JsonString(body))
-        out
+        (false, out)
     }
+}
+
+private func feishuOapiParseBody(body: String): JsonValue {
+    let (_, parsed) = feishuOapiParseBodyWithStatus(body)
+    parsed
+}
+
+private func feishuOapiEnvValue(name: String): String {
+    match (getVariable(name)) {
+        case Some(v) => v.trimAscii()
+        case None => ""
+    }
+}
+
+private func feishuOapiEnvEnabled(raw: String): Bool {
+    let value = raw.trimAscii().toAsciiLower()
+    value == "1" || value == "true" || value == "yes" || value == "on"
+}
+
+private func feishuOapiSplitScopes(raw: String): Array<String> {
+    let normalized = raw.replace(",", " ").replace("\n", " ").replace("\t", " ")
+    let out = ArrayList<String>()
+    for (part in normalized.split(" ")) {
+        let clean = part.trimAscii()
+        if (!clean.isEmpty() && !out.contains(clean)) {
+            out.add(clean)
+        }
+    }
+    out.toArray()
 }
 
 private func feishuOapiResponseCode(body: JsonValue): String {

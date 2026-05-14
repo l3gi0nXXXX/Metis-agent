@@ -47,7 +47,36 @@ private class FeishuOapiToolsetOkTokenProvider <: FeishuOapiTokenProvider {
     public init() {}
 
     public func userAccessToken(_accountId: String, _requiredScopes: Array<String>): FeishuOapiTokenLookup {
-        FeishuOapiTokenLookup("authorized", accessToken: "fake-access-token")
+        FeishuOapiTokenLookup(
+            "authorized",
+            accessToken: "fake-access-token",
+            grantedScopes: ["im:message", "im:message.send_as_user", "im:chat:read"],
+            hasOfflineAccess: false
+        )
+    }
+}
+
+private class FeishuOapiToolsetMissingAppScopeChecker <: FeishuOapiAppScopeChecker {
+    public init() {}
+
+    public func check(accountId: String, tokenMode: String, requiredScopes: Array<String>): FeishuOapiAppScopeCheck {
+        @Expect(accountId, "tenant-a")
+        @Expect(tokenMode, "user_access_token")
+        @Expect(requiredScopes[0], "im:message")
+        FeishuOapiAppScopeCheck(
+            "app_scope_missing",
+            grantedScopes: ["im:message"],
+            missingScopes: ["im:message.send_as_user"],
+            error: "missing app grant"
+        )
+    }
+}
+
+private class FeishuOapiToolsetOkAppScopeChecker <: FeishuOapiAppScopeChecker {
+    public init() {}
+
+    public func check(_accountId: String, _tokenMode: String, requiredScopes: Array<String>): FeishuOapiAppScopeCheck {
+        FeishuOapiAppScopeCheck("ok", grantedScopes: requiredScopes)
     }
 }
 
@@ -117,6 +146,40 @@ private class FeishuOapiToolsetFakeRawTransport <: FeishuOapiRawHttpTransport {
     public func send(request: FeishuOapiRawHttpRequest): FeishuOapiRawHttpResponse {
         this.last = Some(request)
         FeishuOapiRawHttpResponse(200, body: "{\"code\":0,\"data\":{\"ok\":true}}")
+    }
+}
+
+private class FeishuOapiToolsetStaticRawTransport <: FeishuOapiRawHttpTransport {
+    public let statusCode: Int64
+    public let body: String
+    public let error: String
+    public var last: Option<FeishuOapiRawHttpRequest> = None<FeishuOapiRawHttpRequest>
+
+    public init(statusCode: Int64, body!: String = "", error!: String = "") {
+        this.statusCode = statusCode
+        this.body = body
+        this.error = error
+    }
+
+    public func send(request: FeishuOapiRawHttpRequest): FeishuOapiRawHttpResponse {
+        this.last = Some(request)
+        FeishuOapiRawHttpResponse(this.statusCode, body: this.body, error: this.error)
+    }
+}
+
+private class FeishuOapiMatrixCase {
+    let tool: String
+    let action: String
+    let path: String
+    let method: String
+    let firstScope: String
+
+    init(tool: String, action: String, path: String, method: String, firstScope: String) {
+        this.tool = tool
+        this.action = action
+        this.path = path
+        this.method = method
+        this.firstScope = firstScope
     }
 }
 
@@ -309,6 +372,51 @@ public class GatewayFeishuOapiToolsetTest {
     }
 
     @TestCase
+    public func appScopeCheckerSeamRunsBeforeUserTokenAndReportsScopeDiagnostic(): Unit {
+        let request = feishuOapiBuildRequest("feishu_im_user_message", "send", "tenant-a", JsonObject())
+        let json = MetisFeishuOapiClient(
+            tokenProvider: Some<FeishuOapiTokenProvider>(FeishuOapiToolsetOkTokenProvider()),
+            appScopeChecker: Some<FeishuOapiAppScopeChecker>(FeishuOapiToolsetMissingAppScopeChecker())
+        ).invoke(request)
+
+        @Expect(json.get("ok").getOrThrow().asBool().getValue(), false)
+        @Expect(json.get("status").getOrThrow().asString().getValue(), "app_scope_missing")
+        @Expect(json.get("missing_scopes").getOrThrow().asArray()[0].asString().getValue(), "im:message.send_as_user")
+        let diagnostic = json.get("scope_diagnostic").getOrThrow().asObject()
+        @Expect(diagnostic.get("tokenMode").getOrThrow().asString().getValue(), "user_access_token")
+        @Expect(diagnostic.get("token_mode").getOrThrow().asString().getValue(), "user_access_token")
+        let app = diagnostic.get("app").getOrThrow().asObject()
+        @Expect(app.get("status").getOrThrow().asString().getValue(), "app_scope_missing")
+        @Expect(app.get("missing_scopes").getOrThrow().asArray()[0].asString().getValue(), "im:message.send_as_user")
+        @Expect(json.toJsonString().contains("fake-access-token"), false)
+    }
+
+    @TestCase
+    public func successfulUserTokenResultIncludesOfflineAccessAndUserScopeDiagnostic(): Unit {
+        let request = feishuOapiBuildRequest("feishu_im_user_message", "send", "tenant-a", JsonObject())
+        let json = MetisFeishuOapiClient(
+            tokenProvider: Some<FeishuOapiTokenProvider>(FeishuOapiToolsetOkTokenProvider()),
+            appScopeChecker: Some<FeishuOapiAppScopeChecker>(FeishuOapiToolsetOkAppScopeChecker()),
+            httpClient: Some<FeishuOapiHttpClient>(FeishuNativeOapiHttpClient(
+                transport: Some<FeishuOapiRawHttpTransport>(FeishuOapiToolsetStaticRawTransport(200, body: "{\"code\":0,\"data\":{\"message_id\":\"om_live_fake\"}}"))
+            ))
+        ).invoke(request)
+
+        @Expect(json.get("status").getOrThrow().asString().getValue(), "success")
+        let diagnostic = json.get("scope_diagnostic").getOrThrow().asObject()
+        let app = diagnostic.get("app").getOrThrow().asObject()
+        let user = diagnostic.get("user").getOrThrow().asObject()
+        let offline = diagnostic.get("offline_access").getOrThrow().asObject()
+        @Expect(app.get("status").getOrThrow().asString().getValue(), "ok")
+        @Expect(user.get("status").getOrThrow().asString().getValue(), "authorized")
+        @Expect(user.get("granted_scopes").getOrThrow().asArray()[0].asString().getValue(), "im:message")
+        @Expect(offline.get("required").getOrThrow().asBool().getValue(), true)
+        @Expect(offline.get("granted").getOrThrow().asBool().getValue(), false)
+        @Expect(offline.get("status").getOrThrow().asString().getValue(), "missing")
+        @Expect(json.toJsonString().contains("fake-access-token"), false)
+    }
+
+    @TestCase
     public func metisTokenProviderReadsTempStoreAndMapsAuthScopeExpiredAndRefresh(): Unit {
         let root = feishuOapiToolsetTempRoot("token-provider")
         try { remove(root, recursive: true) } catch (_e: Exception) { () }
@@ -428,6 +536,47 @@ public class GatewayFeishuOapiToolsetTest {
         @Expect(sent.headers.get("Authorization").getOrThrow(), "Bearer boundary-secret-token")
         @Expect(sent.toRedactedJson().toJsonString().contains("boundary-secret-token"), false)
         @Expect(sent.toRedactedJson().toJsonString().contains("must-not-win"), false)
+    }
+
+    @TestCase
+    public func nativeClientNormalizesSuccessFeishuCodeHttpFailureAndInvalidJson(): Unit {
+        let request = feishuOapiBuildRequest("feishu_chat", "get", "tenant-a", JsonObject())
+        let tokenProvider = FeishuOapiToolsetOkTokenProvider()
+
+        let success = MetisFeishuOapiClient(
+            tokenProvider: Some<FeishuOapiTokenProvider>(tokenProvider),
+            httpClient: Some<FeishuOapiHttpClient>(FeishuNativeOapiHttpClient(
+                transport: Some<FeishuOapiRawHttpTransport>(FeishuOapiToolsetStaticRawTransport(200, body: "{\"code\":0,\"data\":{\"chat_id\":\"oc_1\"}}"))
+            ))
+        ).invoke(request)
+        @Expect(success.get("status").getOrThrow().asString().getValue(), "success")
+
+        let feishuCode = MetisFeishuOapiClient(
+            tokenProvider: Some<FeishuOapiTokenProvider>(tokenProvider),
+            httpClient: Some<FeishuOapiHttpClient>(FeishuNativeOapiHttpClient(
+                transport: Some<FeishuOapiRawHttpTransport>(FeishuOapiToolsetStaticRawTransport(200, body: "{\"code\":\"99991679\",\"msg\":\"user scope denied\"}"))
+            ))
+        ).invoke(request)
+        @Expect(feishuCode.get("status").getOrThrow().asString().getValue(), "scope_missing")
+        @Expect(feishuCode.get("missing_scopes").getOrThrow().asArray()[0].asString().getValue(), "im:chat:read")
+
+        let httpFailure = MetisFeishuOapiClient(
+            tokenProvider: Some<FeishuOapiTokenProvider>(tokenProvider),
+            httpClient: Some<FeishuOapiHttpClient>(FeishuNativeOapiHttpClient(
+                transport: Some<FeishuOapiRawHttpTransport>(FeishuOapiToolsetStaticRawTransport(503, body: "{\"code\":1255001,\"msg\":\"busy\"}", error: "upstream busy"))
+            ))
+        ).invoke(request)
+        @Expect(httpFailure.get("status").getOrThrow().asString().getValue(), "api_error")
+        @Expect(httpFailure.get("error").getOrThrow().asString().getValue(), "upstream busy")
+
+        let invalidJson = MetisFeishuOapiClient(
+            tokenProvider: Some<FeishuOapiTokenProvider>(tokenProvider),
+            httpClient: Some<FeishuOapiHttpClient>(FeishuNativeOapiHttpClient(
+                transport: Some<FeishuOapiRawHttpTransport>(FeishuOapiToolsetStaticRawTransport(200, body: "{not-json"))
+            ))
+        ).invoke(request)
+        @Expect(invalidJson.get("status").getOrThrow().asString().getValue(), "api_error")
+        @Expect(invalidJson.get("error").getOrThrow().asString().getValue().contains("valid JSON"), true)
     }
 
     @TestCase
@@ -563,6 +712,58 @@ public class GatewayFeishuOapiToolsetTest {
     }
 
     @TestCase
+    public func oapiActionMatrixCoversEveryExposedToolFamilyPathMethodAndScope(): Unit {
+        let cases = ArrayList<FeishuOapiMatrixCase>()
+        cases.add(FeishuOapiMatrixCase("feishu_fetch_doc", "default", "/open-apis/docx/v1/documents/:document_id/raw_content", "GET", "docx:document:readonly"))
+        cases.add(FeishuOapiMatrixCase("feishu_create_doc", "default", "/open-apis/docx/v1/documents", "POST", "board:whiteboard:node:create"))
+        cases.add(FeishuOapiMatrixCase("feishu_update_doc", "default", "/open-apis/docx/v1/documents/:document_id", "PATCH", "board:whiteboard:node:create"))
+        cases.add(FeishuOapiMatrixCase("feishu_doc_comments", "create", "/open-apis/docx/v1/documents/:document_id/comments", "POST", "wiki:node:read"))
+        cases.add(FeishuOapiMatrixCase("feishu_doc_media", "insert", "/open-apis/docx/v1/documents/:document_id/media", "POST", "docx:document:write_only"))
+        cases.add(FeishuOapiMatrixCase("feishu_wiki_space", "list", "/open-apis/wiki/v2/spaces", "GET", "wiki:space:retrieve"))
+        cases.add(FeishuOapiMatrixCase("feishu_wiki_space_node", "move", "/open-apis/wiki/v2/spaces/:space_id/nodes/:node_token/move", "POST", "wiki:node:move"))
+        cases.add(FeishuOapiMatrixCase("feishu_drive_file", "delete", "/open-apis/drive/v1/files/:file_token", "DELETE", "space:document:delete"))
+        cases.add(FeishuOapiMatrixCase("feishu_search_doc_wiki", "search", "/open-apis/search/v2/data_sources/:data_source_id/search", "POST", "search:docs:read"))
+        cases.add(FeishuOapiMatrixCase("feishu_bitable_app", "patch", "/open-apis/bitable/v1/apps/:app_token", "PATCH", "base:app:update"))
+        cases.add(FeishuOapiMatrixCase("feishu_bitable_app_table", "batch_create", "/open-apis/bitable/v1/apps/:app_token/tables/batch_create", "POST", "base:app:create"))
+        cases.add(FeishuOapiMatrixCase("feishu_bitable_app_table_record", "batch_delete", "/open-apis/bitable/v1/apps/:app_token/tables/:table_id/records/batch_delete", "DELETE", "base:record:delete"))
+        cases.add(FeishuOapiMatrixCase("feishu_bitable_app_table_field", "update", "/open-apis/bitable/v1/apps/:app_token/tables/:table_id/fields/:field_id", "PATCH", "base:field:read"))
+        cases.add(FeishuOapiMatrixCase("feishu_bitable_app_table_view", "get", "/open-apis/bitable/v1/apps/:app_token/tables/:table_id/views/:view_id", "GET", "base:app:read"))
+        cases.add(FeishuOapiMatrixCase("feishu_calendar_calendar", "primary", "/open-apis/calendar/v4/calendars/primary", "GET", "calendar:calendar:read"))
+        cases.add(FeishuOapiMatrixCase("feishu_calendar_event", "reply", "/open-apis/calendar/v4/calendars/:calendar_id/events/:event_id/reply", "POST", "calendar:calendar.event:reply"))
+        cases.add(FeishuOapiMatrixCase("feishu_calendar_event_attendee", "create", "/open-apis/calendar/v4/calendars/:calendar_id/events/:event_id/attendees", "POST", "calendar:calendar:read"))
+        cases.add(FeishuOapiMatrixCase("feishu_calendar_freebusy", "list", "/open-apis/calendar/v4/freebusy/list", "POST", "calendar:calendar.free_busy:read"))
+        cases.add(FeishuOapiMatrixCase("feishu_task_task", "append_steps", "/open-apis/task/v2/tasks/:task_guid/append_steps", "POST", "task:task:write"))
+        cases.add(FeishuOapiMatrixCase("feishu_task_tasklist", "add_members", "/open-apis/task/v2/tasklists/:tasklist_guid/add_members", "POST", "task:task:write"))
+        cases.add(FeishuOapiMatrixCase("feishu_task_attachment", "upload", "/open-apis/task/v2/tasks/:task_guid/attachments", "POST", "task:task:read"))
+        cases.add(FeishuOapiMatrixCase("feishu_task_section", "tasks", "/open-apis/task/v2/tasklists/:tasklist_guid/sections/:section_guid/tasks", "GET", "task:task:read"))
+        cases.add(FeishuOapiMatrixCase("feishu_task_comment", "create", "/open-apis/task/v2/tasks/:task_guid/comments", "POST", "task:task:write"))
+        cases.add(FeishuOapiMatrixCase("feishu_task_subtask", "list", "/open-apis/task/v2/tasks/:task_guid/subtasks", "GET", "task:task:read"))
+        cases.add(FeishuOapiMatrixCase("feishu_task_agent", "update_profile", "/open-apis/task/v2/tasks/:task_guid/collaborators/:user_id", "PATCH", "task:task:write"))
+        cases.add(FeishuOapiMatrixCase("feishu_sheet", "append", "/open-apis/sheets/v2/spreadsheets/:spreadsheet_token/values_append", "POST", "sheets:spreadsheet.meta:read"))
+        cases.add(FeishuOapiMatrixCase("feishu_chat", "search", "/open-apis/im/v1/chats/search", "GET", "im:chat:read"))
+        cases.add(FeishuOapiMatrixCase("feishu_chat_members", "default", "/open-apis/im/v1/chats/:chat_id/members", "GET", "im:chat.members:read"))
+        cases.add(FeishuOapiMatrixCase("feishu_get_user", "default", "/open-apis/contact/v3/users/:user_id", "GET", "contact:contact.base:readonly"))
+        cases.add(FeishuOapiMatrixCase("feishu_search_user", "default", "/open-apis/search/v1/user", "GET", "contact:user:search"))
+        cases.add(FeishuOapiMatrixCase("feishu_im_user_message", "reply", "/open-apis/im/v1/messages/:message_id/reply", "POST", "im:message"))
+        cases.add(FeishuOapiMatrixCase("feishu_im_user_get_messages", "default", "/open-apis/im/v1/messages", "GET", "im:chat:read"))
+        cases.add(FeishuOapiMatrixCase("feishu_im_user_get_thread_messages", "default", "/open-apis/im/v1/messages", "GET", "im:chat:read"))
+        cases.add(FeishuOapiMatrixCase("feishu_im_user_search_messages", "default", "/open-apis/search/v2/data_sources/im_message/search", "GET", "im:chat:read"))
+        cases.add(FeishuOapiMatrixCase("feishu_im_user_fetch_resource", "default", "/open-apis/im/v1/messages/:message_id/resources/:file_key", "GET", "im:message.group_msg:get_as_user"))
+        cases.add(FeishuOapiMatrixCase("feishu_im_bot_image", "default", "/open-apis/im/v1/messages/:message_id/resources/:file_key", "GET", "im:message.group_msg:get_as_user"))
+        cases.add(FeishuOapiMatrixCase("feishu_oauth", "default", "/open-apis/authen/v1/oidc/device_authorize", "POST", "offline_access"))
+        cases.add(FeishuOapiMatrixCase("feishu_oauth_batch_auth", "default", "/open-apis/authen/v1/oidc/device_authorize", "POST", "offline_access"))
+        cases.add(FeishuOapiMatrixCase("feishu_ask_user_question", "default", "/open-apis/cardkit/v1/cards", "POST", "cardkit:card"))
+
+        for (row in cases) {
+            let request = feishuOapiBuildRequest(row.tool, row.action, "tenant-a", JsonObject())
+            @Expect(request.path, row.path)
+            @Expect(request.method, row.method)
+            @Expect(request.tokenMode, "user_access_token")
+            @Expect(request.requiredScopes[0], row.firstScope)
+        }
+    }
+
+    @TestCase
     public func unknownOapiActionReturnsStructuredUnsupportedActionDiagnostic(): Unit {
         let out = GatewayFeishuOapiToolset().debugFeishuOapiInvokeForTest(
             "feishu_chat",
@@ -576,6 +777,16 @@ public class GatewayFeishuOapiToolsetTest {
         @Expect(json.get("action_key").getOrThrow().asString().getValue(), "feishu_chat.explode")
         @Expect(json.get("supported_actions").getOrThrow().asArray()[0].asString().getValue(), "get")
         @Expect(json.toJsonString().contains("Bearer"), false)
+    }
+
+    @TestCase
+    public func liveSmokeHarnessDefaultsToSkippedUnlessExplicitEnvGateIsEnabled(): Unit {
+        let result = feishuOapiLiveSmokeHarnessFromEnv()
+        @Expect(result.get("status").getOrThrow().asString().getValue(), "skipped")
+        @Expect(result.get("reason").getOrThrow().asString().getValue(), "env_gate_disabled")
+        @Expect(result.get("live").getOrThrow().asBool().getValue(), false)
+        @Expect(result.get("redacted").getOrThrow().asBool().getValue(), true)
+        @Expect(result.get("requiresEnv").getOrThrow().asArray()[0].asString().getValue(), "METIS_FEISHU_OAPI_LIVE_SMOKE")
     }
 
     @TestCase
