@@ -219,6 +219,115 @@ describe("renderAgentTeamsPanel", () => {
     expect(options).not.toContain("BOOTSTRAP.md");
   });
 
+  it("renders Team Wizard templates and wires channel route presets", () => {
+    const onBindingChange = vi.fn();
+    const onDraftChange = vi.fn();
+    const container = document.createElement("div");
+    render(renderAgentTeamsPanel(createProps({ onBindingChange, onDraftChange })), container);
+
+    const text = container.textContent ?? "";
+    expect(text).toContain("Team Wizard");
+    expect(text).toContain("Feishu content handoff");
+    expect(text).toContain("Telegram support triage");
+    expect(text).toContain("Export template JSON");
+    expect(text).toContain("Import template JSON");
+
+    const feishuButton = Array.from(container.querySelectorAll("button")).find((entry) =>
+      (entry.textContent ?? "").includes("Seed Feishu route"),
+    );
+    expect(feishuButton).toBeTruthy();
+    feishuButton?.click();
+    expect(onBindingChange).toHaveBeenCalledWith({
+      channel: "feishu",
+      accountId: "tenant-a",
+      peerKind: "group",
+      useStructuredBinding: true,
+      team: "content",
+    });
+
+    const telegramButton = Array.from(container.querySelectorAll("button")).find((entry) =>
+      (entry.textContent ?? "").includes("Seed Telegram route"),
+    );
+    expect(telegramButton).toBeTruthy();
+    telegramButton?.click();
+    expect(onBindingChange).toHaveBeenCalledWith({
+      channel: "telegram",
+      accountId: "default",
+      peerKind: "group",
+      useStructuredBinding: true,
+      team: "content",
+    });
+  });
+
+  it("renders explicit Doctor repair rows for Feishu and team readiness gaps", () => {
+    const onStartFeishuOAuth = vi.fn();
+    const container = document.createElement("div");
+    render(
+      renderAgentTeamsPanel(
+        createProps({
+          onStartFeishuOAuth,
+          draft: {
+            ...createEmptyAgentTeamDraft(),
+            id: "content",
+            displayName: "Content Team",
+            membersJson: '[{"agentId":"content-writer","role":"writer"}]',
+            bindingsJson: "[]",
+          },
+          channelsSnapshot: {
+            ts: 1,
+            channelOrder: ["feishu"],
+            channelLabels: { feishu: "Feishu" },
+            channels: {
+              feishu: {
+                configured: true,
+                running: true,
+                auth: {
+                  accountId: "tenant-a",
+                  status: "missing_oauth",
+                  missingAppScopes: ["im:message"],
+                  missingUserScopes: ["offline_access"],
+                },
+                doctor: {
+                  status: "warning",
+                  findings: [
+                    { code: "disabled_group_policy", message: "group policy disabled" },
+                  ],
+                },
+              },
+            },
+            channelAccounts: { feishu: [] },
+            channelDefaultAccountId: { feishu: "tenant-a" },
+          },
+          configForm: {
+            gateway: {
+              feishu: {
+                defaultAccountId: "tenant-a",
+                groups: {},
+              },
+            },
+          },
+        }),
+      ),
+      container,
+    );
+
+    const text = container.textContent ?? "";
+    expect(text).toContain("Missing OAuth");
+    expect(text).toContain("Missing app scope");
+    expect(text).toContain("Missing user scope");
+    expect(text).toContain("Missing channel account");
+    expect(text).toContain("Disabled group policy");
+    expect(text).toContain("Missing binding");
+    expect(text).toContain("Repair actions never write token, secret, or auth files from the browser.");
+
+    const startOAuth = Array.from(container.querySelectorAll("button")).find((entry) =>
+      (entry.textContent ?? "").includes("Start OAuth"),
+    );
+    expect(startOAuth).toBeTruthy();
+    startOAuth?.click();
+    expect(onStartFeishuOAuth).toHaveBeenCalledWith("tenant-a");
+  });
+
   it("wires Feishu OAuth start to a Gateway RPC callback", () => {
     const onStartFeishuOAuth = vi.fn();
     const container = document.createElement("div");

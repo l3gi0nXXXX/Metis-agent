@@ -2,8 +2,10 @@ import { describe, expect, it, vi } from "vitest";
 import {
   addAgentTeamAlias,
   AGENT_TEAM_PROFILE_FILES,
+  applyAgentTeamTemplate,
   applyAgentTeamBinding,
   buildAgentTeamBindingPreview,
+  exportAgentTeamTemplate,
   changeAgentTeamMember,
   changeAgentTeamAlias,
   createAgentTeam,
@@ -11,6 +13,7 @@ import {
   createEmptyAgentTeamDraft,
   createEmptyAgentTeamModelDraft,
   createEmptyAgentTeamWorkspaceDraft,
+  importAgentTeamTemplate,
   loadAgentTeamWorkspaceFile,
   loadAgentTeamWorkspaceFiles,
   loadAgentTeamModel,
@@ -85,6 +88,51 @@ describe("loadAgentTeams", () => {
 });
 
 describe("team mutations", () => {
+  it("applies a Metis-owned Feishu team template without raw JSON editing", () => {
+    const draft = applyAgentTeamTemplate(createEmptyAgentTeamDraft(), "feishu-content-handoff");
+
+    expect(draft.template).toBe("feishu-content-handoff");
+    expect(draft.displayName).toBe("Feishu Content Team");
+    expect(draft.defaultAgentId).toBe("feishu-manager");
+    expect(JSON.parse(draft.membersJson)).toEqual([
+      { agentId: "feishu-manager", role: "manager", name: "Manager" },
+      { agentId: "feishu-writer", role: "writer", name: "Writer" },
+      { agentId: "feishu-reviewer", role: "reviewer", name: "Reviewer" },
+    ]);
+    expect(JSON.parse(draft.aliasesJson)).toEqual([
+      { alias: "@manager", agentId: "feishu-manager" },
+      { alias: "@writer", agentId: "feishu-writer" },
+      { alias: "@reviewer", agentId: "feishu-reviewer" },
+    ]);
+    expect(JSON.parse(draft.broadcastJson)).toEqual({
+      enabled: true,
+      members: ["feishu-manager", "feishu-writer", "feishu-reviewer"],
+      mode: "manager-delegation",
+    });
+  });
+
+  it("exports and imports a Metis-owned team template schema", () => {
+    const draft = {
+      ...applyAgentTeamTemplate(createEmptyAgentTeamDraft(), "telegram-support-triage"),
+      id: "support",
+      displayName: "Support Team",
+      defaultAgentId: "telegram-triage",
+    };
+
+    const exported = JSON.parse(exportAgentTeamTemplate(draft));
+    const imported = importAgentTeamTemplate(JSON.stringify(exported));
+
+    expect(exported.schema).toBe("metis.agentTeamTemplate.v1");
+    expect(exported.team.id).toBe("support");
+    expect(exported.team.template).toBe("telegram-support-triage");
+    expect(imported.id).toBe("support");
+    expect(imported.displayName).toBe("Support Team");
+    expect(imported.defaultAgentId).toBe("telegram-triage");
+    expect(JSON.parse(imported.membersJson)).toEqual(JSON.parse(draft.membersJson));
+    expect(JSON.parse(imported.aliasesJson)).toEqual(JSON.parse(draft.aliasesJson));
+    expect(JSON.parse(imported.bindingsJson)).toEqual([]);
+  });
+
   it("edits team members without requiring raw JSON textarea changes", () => {
     const draft = {
       ...createEmptyAgentTeamDraft(),

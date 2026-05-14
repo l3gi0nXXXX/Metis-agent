@@ -13,9 +13,13 @@ import {
   addAgentTeamAlias,
   addAgentTeamMember,
   AGENT_TEAM_PROFILE_FILES,
+  AGENT_TEAM_TEMPLATES,
+  applyAgentTeamTemplate,
   buildAgentTeamBindingPreview,
   changeAgentTeamAlias,
   changeAgentTeamMember,
+  exportAgentTeamTemplate,
+  importAgentTeamTemplate,
   removeAgentTeamAlias,
   removeAgentTeamMember,
   setAgentTeamBroadcastEnabled,
@@ -92,6 +96,7 @@ export function renderAgentTeamsPanel(props: AgentTeamsPanelProps) {
       : "New team";
   return html`
     ${renderWorkflowStrip(props, activeMembers, activeBroadcast)}
+    ${renderTeamWizardCard(props, activeMembers)}
 
     <section class="grid grid-cols-2">
       ${renderTeamsList(props, teams)}
@@ -175,6 +180,127 @@ function renderWorkflowStrip(
             </div>
           `,
         )}
+      </div>
+    </section>
+  `;
+}
+
+function renderTeamWizardCard(props: AgentTeamsPanelProps, members: AgentTeamMember[]) {
+  const feishu = resolveFeishuSettings(props);
+  const teamId = props.draft.id.trim() || props.selectedId || "";
+  const canExport = Boolean(props.draft.id.trim() || members.length > 0);
+  return html`
+    <section class="card" style="margin-bottom: 16px;">
+      <div class="row" style="justify-content: space-between; align-items: flex-start;">
+        <div>
+          <div class="card-title">Team Wizard</div>
+          <div class="card-sub">Template, members, default member, model, profile, binding, and Feishu readiness in one guided path.</div>
+        </div>
+        <span class="badge">Metis template schema</span>
+      </div>
+      <div class="grid grid-cols-3" style="margin-top: 14px;">
+        ${AGENT_TEAM_TEMPLATES.map(
+          (template) => html`
+            <div class="agent-kv">
+              <div class="row" style="justify-content: space-between; align-items: center; gap: 8px;">
+                <div class="label">${template.transport}</div>
+                <span class="badge">${props.draft.template === template.id ? "selected" : "template"}</span>
+              </div>
+              <div class="list-title" style="margin-top: 6px;">${template.label}</div>
+              <div class="list-sub">${template.description}</div>
+              <button
+                type="button"
+                class="btn btn--sm"
+                style="margin-top: 10px;"
+                @click=${() => props.onDraftChange(applyAgentTeamTemplate(props.draft, template.id))}
+              >
+                Use template
+              </button>
+            </div>
+          `,
+        )}
+      </div>
+      <div class="agents-overview-grid" style="margin-top: 14px;">
+        <div class="agent-kv">
+          <div class="label">Members</div>
+          <div>${formatCount(members.length, "member")}</div>
+        </div>
+        <div class="agent-kv">
+          <div class="label">Default member</div>
+          <div>${memberDisplayName(props.draft.defaultAgentId, members)}</div>
+        </div>
+        <div class="agent-kv">
+          <div class="label">Model</div>
+          <div>${props.modelResult?.models?.path ? "loaded" : "choose member below"}</div>
+        </div>
+        <div class="agent-kv">
+          <div class="label">Profile</div>
+          <div>${props.workspace.workspace ? "workspace loaded" : "choose profile below"}</div>
+        </div>
+      </div>
+      <div class="row" style="justify-content: space-between; align-items: flex-end; margin-top: 14px;">
+        <div>
+          <div class="list-title">Channel route presets</div>
+          <div class="muted">Seed the Binding Builder with non-secret Telegram or Feishu route fields, then preview/apply through Gateway RPC.</div>
+        </div>
+        <div class="row" style="gap: 8px;">
+          <button
+            type="button"
+            class="btn btn--sm"
+            @click=${() =>
+              props.onBindingChange({
+                channel: "telegram",
+                accountId: "default",
+                peerKind: "group",
+                useStructuredBinding: true,
+                team: teamId,
+              })}
+          >
+            Seed Telegram route
+          </button>
+          <button
+            type="button"
+            class="btn btn--sm"
+            @click=${() =>
+              props.onBindingChange({
+                channel: "feishu",
+                accountId: feishu.defaultAccount || "default",
+                peerKind: "group",
+                useStructuredBinding: true,
+                team: teamId,
+              })}
+          >
+            Seed Feishu route
+          </button>
+        </div>
+      </div>
+      <div class="row" style="justify-content: space-between; align-items: flex-end; margin-top: 14px;">
+        <div>
+          <div class="list-title">Template import/export</div>
+          <div class="muted">Uses metis.agentTeamTemplate.v1. Tokens, secrets, and auth files are not included.</div>
+        </div>
+        <div class="row" style="gap: 8px;">
+          <button
+            type="button"
+            class="btn btn--sm"
+            ?disabled=${!canExport}
+            @click=${() => downloadAgentTeamTemplate(props.draft)}
+          >
+            Export template JSON
+          </button>
+          <label class="btn btn--sm btn--ghost">
+            Import template JSON
+            <input
+              type="file"
+              accept="application/json,.json"
+              style="display: none;"
+              @change=${(event: Event) => importTemplateFile(event, props)}
+            />
+          </label>
+        </div>
+      </div>
+      <div class="callout info" style="margin-top: 12px;">
+        Feishu readiness is checked below from Gateway status. Browser-side repair never writes local token, secret, or auth files.
       </div>
     </section>
   `;
@@ -1238,6 +1364,9 @@ function renderDoctorPanel(
           ${props.loading ? t("common.refreshing") : t("common.refresh")}
         </button>
       </div>
+      <div class="callout info" style="margin-top: 12px;">
+        Repair actions never write token, secret, or auth files from the browser. Secret and auth repair stays behind Gateway RPC or operator-managed backend configuration.
+      </div>
       <div class="list" style="margin-top: 14px;">
         ${items.map(
           (item) => html`
@@ -1246,7 +1375,10 @@ function renderDoctorPanel(
                 <div class="list-title">${item.title}</div>
                 <div class="list-sub">${item.message}</div>
               </div>
-              <div class="list-meta"><span class="badge">${item.status}</span></div>
+              <div class="list-meta">
+                <span class="badge">${item.status}</span>
+                ${renderDoctorAction(props, item)}
+              </div>
             </div>
           `,
         )}
@@ -1267,6 +1399,39 @@ function renderJsonField(label: string, value: string, onChange: (value: string)
       ></textarea>
     </label>
   `;
+}
+
+function downloadAgentTeamTemplate(draft: AgentTeamEditorDraft) {
+  const text = exportAgentTeamTemplate(draft);
+  if (typeof document === "undefined" || typeof URL === "undefined" || !URL.createObjectURL) {
+    return;
+  }
+  const blob = new Blob([text], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `${draft.id.trim() || "metis-agent-team-template"}.json`;
+  link.click();
+  URL.revokeObjectURL(url);
+}
+
+function importTemplateFile(event: Event, props: AgentTeamsPanelProps) {
+  const input = event.target as HTMLInputElement;
+  const file = input.files?.[0];
+  if (!file) {
+    return;
+  }
+  const reader = new FileReader();
+  reader.onload = () => {
+    try {
+      props.onDraftChange(importAgentTeamTemplate(String(reader.result ?? "")));
+    } catch (_err) {
+      // Invalid template files are ignored here; Gateway mutations still validate drafts before saving.
+    } finally {
+      input.value = "";
+    }
+  };
+  reader.readAsText(file);
 }
 
 function teamDisplayName(team: AgentTeam) {
@@ -1403,11 +1568,20 @@ function resolveFeishuSettings(props: AgentTeamsPanelProps): {
   };
 }
 
+type DoctorAction = "start-feishu-oauth" | "refresh" | "preview-binding" | "apply-binding";
+
+type DoctorItem = {
+  title: string;
+  message: string;
+  status: string;
+  action?: DoctorAction;
+};
+
 function buildDoctorItems(
   props: AgentTeamsPanelProps,
   teams: AgentTeam[],
   members: AgentTeamMember[],
-): Array<{ title: string; message: string; status: string }> {
+): DoctorItem[] {
   return [
     {
       title: "Teams list",
@@ -1436,15 +1610,174 @@ function buildDoctorItems(
       message: props.modelResult?.models?.path ? `models.json: ${props.modelResult.models.path}` : "Load a member model.",
       status: props.modelResult?.models?.path ? "ok" : "info",
     },
+    ...buildFeishuReadinessItems(props),
+  ];
+}
+
+function buildFeishuReadinessItems(props: AgentTeamsPanelProps): DoctorItem[] {
+  const feishu = resolveFeishuSettings(props);
+  const status = objectValue(props.channelsSnapshot?.channels?.feishu);
+  const capabilities = stringArrayFromUnknown(status?.capabilities).map((item) => item.toLowerCase());
+  const auth = objectValue(status?.auth) ?? objectValue(status?.oauth);
+  const doctor = objectValue(status?.doctor) ?? objectValue(status?.diagnostics);
+  const oapiAvailable = capabilities.some((item) => item.includes("oapi") || item.includes("openapi"));
+  const appScopeGaps = missingScopes(auth, ["missingAppScopes", "missing_app_scopes", "appScopeMissing"]);
+  const userScopeGaps = missingScopes(auth, ["missingUserScopes", "missing_user_scopes", "userScopeMissing"]);
+  const authOk = isFeishuAuthAuthorized(auth);
+  const userScopesOk = authOk && userScopeGaps.length === 0 && authHasOfflineAccess(auth);
+  const groupPolicyDisabled = feishu.groupCount === 0 || doctorHasFinding(doctor, "disabled_group_policy");
+  const hasBinding = safeJsonArrayLength(props.draft.bindingsJson) > 0 || Boolean(props.bindingPreview?.applyPayload);
+  const hasAccount = feishu.accounts.length > 0;
+  const appScopesOk = appScopeGaps.length === 0 && oapiAvailable;
+  return [
     {
-      title: "Feishu accounts",
-      message:
-        (props.channelsSnapshot?.channelAccounts?.feishu ?? []).length > 0
-          ? "Feishu account status is visible."
-          : "No Feishu account status in channels.status.",
-      status: (props.channelsSnapshot?.channelAccounts?.feishu ?? []).length > 0 ? "ok" : "info",
+      title: authOk ? "OAuth authorized" : "Missing OAuth",
+      message: authOk
+        ? `Feishu account ${feishu.defaultAccount || "default"} has an authorized OAuth status.`
+        : "Start OAuth through Gateway RPC; the browser will not write token files.",
+      status: authOk ? "ok" : "repair",
+      action: authOk ? undefined : "start-feishu-oauth",
+    },
+    {
+      title: appScopesOk ? "App scope ready" : "Missing app scope",
+      message: appScopesOk
+        ? "Feishu OAPI/app scope capability is advertised by Gateway status."
+        : `Missing app scopes: ${appScopeGaps.length ? appScopeGaps.join(", ") : "OAPI capability not advertised"}. Update the Feishu app in backend/admin config, then refresh.`,
+      status: appScopesOk ? "ok" : "manual",
+      action: appScopesOk ? undefined : "refresh",
+    },
+    {
+      title: userScopesOk ? "User scope ready" : "Missing user scope",
+      message: userScopesOk
+        ? "User OAuth scopes include offline access."
+        : `Missing user scopes: ${userScopeGaps.length ? userScopeGaps.join(", ") : "offline_access"}. Re-run Gateway OAuth after app scopes are granted.`,
+      status: userScopesOk ? "ok" : "repair",
+      action: userScopesOk ? undefined : "start-feishu-oauth",
+    },
+    {
+      title: hasAccount ? "Channel account ready" : "Missing channel account",
+      message: hasAccount
+        ? "channels.status exposes a redacted Feishu channel account."
+        : "No redacted Feishu channel account is visible. Configure the account behind Gateway, then refresh.",
+      status: hasAccount ? "ok" : "manual",
+      action: hasAccount ? undefined : "refresh",
+    },
+    {
+      title: groupPolicyDisabled ? "Disabled group policy" : "Group policy ready",
+      message: groupPolicyDisabled
+        ? "No Feishu group policy is visible or doctor reports disabled_group_policy. Repair belongs in non-secret Gateway configuration."
+        : "Feishu group policy is visible in Control UI status/config.",
+      status: groupPolicyDisabled ? "manual" : "ok",
+      action: groupPolicyDisabled ? "refresh" : undefined,
+    },
+    {
+      title: hasBinding ? "Binding ready" : "Missing binding",
+      message: hasBinding
+        ? "Team binding metadata or a Binding Builder preview is ready."
+        : "Seed a Telegram or Feishu route, preview it, then apply it through agents.bind.",
+      status: hasBinding ? "ok" : "repair",
+      action: hasBinding ? (props.bindingPreview?.applyPayload ? "apply-binding" : undefined) : "preview-binding",
     },
   ];
+}
+
+function renderDoctorAction(props: AgentTeamsPanelProps, item: DoctorItem) {
+  if (!item.action) {
+    return nothing;
+  }
+  if (item.action === "start-feishu-oauth") {
+    const accountId = resolveFeishuSettings(props).defaultAccount || props.channelsSnapshot?.channelDefaultAccountId?.feishu || "default";
+    return html`
+      <button
+        type="button"
+        class="btn btn--sm"
+        ?disabled=${props.feishuAuthLoading}
+        @click=${() => props.onStartFeishuOAuth(accountId)}
+      >
+        Start OAuth
+      </button>
+    `;
+  }
+  if (item.action === "refresh") {
+    return html`<button type="button" class="btn btn--sm" ?disabled=${props.loading} @click=${props.onRefresh}>Refresh status</button>`;
+  }
+  if (item.action === "apply-binding") {
+    return html`
+      <button
+        type="button"
+        class="btn btn--sm"
+        ?disabled=${props.saving || !props.bindingPreview?.applyPayload}
+        @click=${props.onApplyBinding}
+      >
+        Apply binding
+      </button>
+    `;
+  }
+  return html`<button type="button" class="btn btn--sm" @click=${props.onPreviewBinding}>Preview binding</button>`;
+}
+
+function isFeishuAuthAuthorized(auth: Record<string, unknown> | null): boolean {
+  if (!auth) {
+    return false;
+  }
+  const values = ["status", "tokenStatus", "state"]
+    .map((key) => stringOrEmpty(auth[key]).toLowerCase())
+    .filter(Boolean);
+  if (values.some((value) => value.includes("missing") || value.includes("expired"))) {
+    return false;
+  }
+  return values.some((value) => ["authorized", "ok", "active", "valid"].includes(value));
+}
+
+function authHasOfflineAccess(auth: Record<string, unknown> | null): boolean {
+  if (!auth) {
+    return false;
+  }
+  const scopes = [
+    ...missingScopes(auth, ["scopeSummary", "scopes", "userScopes", "grantedUserScopes"]),
+  ].map((scope) => scope.toLowerCase());
+  return scopes.some((scope) => scope === "offline_access" || scope.includes("offline_access"));
+}
+
+function missingScopes(obj: Record<string, unknown> | null, keys: string[]): string[] {
+  if (!obj) {
+    return [];
+  }
+  for (const key of keys) {
+    const value = obj[key];
+    if (Array.isArray(value)) {
+      return stringArrayFromUnknown(value);
+    }
+    if (typeof value === "string" && value.trim()) {
+      return value
+        .split(/[\s,]+/)
+        .map((part) => part.trim())
+        .filter(Boolean);
+    }
+  }
+  return [];
+}
+
+function doctorHasFinding(doctor: Record<string, unknown> | null, code: string): boolean {
+  if (!doctor) {
+    return false;
+  }
+  const normalizedCode = code.toLowerCase();
+  return Object.values(doctor).some((value) => hasFindingValue(value, normalizedCode));
+}
+
+function hasFindingValue(value: unknown, normalizedCode: string): boolean {
+  if (typeof value === "string") {
+    return value.toLowerCase().includes(normalizedCode);
+  }
+  if (Array.isArray(value)) {
+    return value.some((entry) => hasFindingValue(entry, normalizedCode));
+  }
+  const obj = objectValue(value);
+  if (!obj) {
+    return false;
+  }
+  return Object.values(obj).some((entry) => hasFindingValue(entry, normalizedCode));
 }
 
 function objectValue(value: unknown): Record<string, unknown> | null {

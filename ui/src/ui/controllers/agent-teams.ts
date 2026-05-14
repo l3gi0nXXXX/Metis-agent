@@ -28,6 +28,23 @@ export type AgentTeamEditorDraft = {
   broadcastJson: string;
 };
 
+export type AgentTeamTemplateId =
+  | "pm-writer-reviewer"
+  | "feishu-content-handoff"
+  | "telegram-support-triage";
+
+export type AgentTeamTemplate = {
+  id: AgentTeamTemplateId;
+  label: string;
+  description: string;
+  transport: "feishu" | "telegram" | "generic";
+  displayName: string;
+  defaultAgentId: string;
+  members: AgentTeamMember[];
+  aliases: AgentTeamAliasDraft[];
+  broadcast: Record<string, unknown>;
+};
+
 export type AgentTeamAliasDraft = {
   alias: string;
   agentId: string;
@@ -109,6 +126,78 @@ export const AGENT_TEAM_PROFILE_FILES = [
   "USER.md",
 ] as const;
 
+export const AGENT_TEAM_TEMPLATES: AgentTeamTemplate[] = [
+  {
+    id: "pm-writer-reviewer",
+    label: "PM / Writer / Reviewer",
+    description: "Generic content team with deterministic fan-out.",
+    transport: "generic",
+    displayName: "Content Team",
+    defaultAgentId: "content-pm",
+    members: [
+      { agentId: "content-pm", role: "pm", name: "PM" },
+      { agentId: "content-writer", role: "writer", name: "Writer" },
+      { agentId: "content-reviewer", role: "reviewer", name: "Reviewer" },
+    ],
+    aliases: [
+      { alias: "@pm", agentId: "content-pm" },
+      { alias: "@writer", agentId: "content-writer" },
+      { alias: "@reviewer", agentId: "content-reviewer" },
+    ],
+    broadcast: {
+      enabled: true,
+      members: ["content-pm", "content-writer", "content-reviewer"],
+      mode: "fan-out",
+    },
+  },
+  {
+    id: "feishu-content-handoff",
+    label: "Feishu content handoff",
+    description: "Manager delegation pattern for Feishu group workflows.",
+    transport: "feishu",
+    displayName: "Feishu Content Team",
+    defaultAgentId: "feishu-manager",
+    members: [
+      { agentId: "feishu-manager", role: "manager", name: "Manager" },
+      { agentId: "feishu-writer", role: "writer", name: "Writer" },
+      { agentId: "feishu-reviewer", role: "reviewer", name: "Reviewer" },
+    ],
+    aliases: [
+      { alias: "@manager", agentId: "feishu-manager" },
+      { alias: "@writer", agentId: "feishu-writer" },
+      { alias: "@reviewer", agentId: "feishu-reviewer" },
+    ],
+    broadcast: {
+      enabled: true,
+      members: ["feishu-manager", "feishu-writer", "feishu-reviewer"],
+      mode: "manager-delegation",
+    },
+  },
+  {
+    id: "telegram-support-triage",
+    label: "Telegram support triage",
+    description: "Triage, answer, and escalation team for Telegram chats.",
+    transport: "telegram",
+    displayName: "Telegram Support Team",
+    defaultAgentId: "telegram-triage",
+    members: [
+      { agentId: "telegram-triage", role: "triage", name: "Triage" },
+      { agentId: "telegram-answer", role: "answer", name: "Answer" },
+      { agentId: "telegram-escalation", role: "escalation", name: "Escalation" },
+    ],
+    aliases: [
+      { alias: "@triage", agentId: "telegram-triage" },
+      { alias: "@answer", agentId: "telegram-answer" },
+      { alias: "@escalate", agentId: "telegram-escalation" },
+    ],
+    broadcast: {
+      enabled: true,
+      members: ["telegram-triage", "telegram-answer", "telegram-escalation"],
+      mode: "fan-out",
+    },
+  },
+];
+
 export function createEmptyAgentTeamDraft(): AgentTeamEditorDraft {
   return {
     id: "",
@@ -158,6 +247,63 @@ export function createEmptyAgentTeamWorkspaceDraft(): AgentTeamWorkspaceDraft {
     path: "",
     content: "",
     draft: "",
+  };
+}
+
+export function applyAgentTeamTemplate(
+  draft: AgentTeamEditorDraft,
+  templateId: string,
+): AgentTeamEditorDraft {
+  const template = AGENT_TEAM_TEMPLATES.find((entry) => entry.id === templateId);
+  if (!template) {
+    return { ...draft, template: templateId };
+  }
+  return {
+    ...draft,
+    displayName: draft.displayName.trim() ? draft.displayName : template.displayName,
+    template: template.id,
+    defaultAgentId: template.defaultAgentId,
+    membersJson: stringifyPretty(template.members),
+    aliasesJson: stringifyPretty(template.aliases),
+    broadcastJson: stringifyPretty(template.broadcast),
+  };
+}
+
+export function exportAgentTeamTemplate(draft: AgentTeamEditorDraft): string {
+  const members = compactTeamMembers(parseJsonArray<AgentTeamMember>(draft.membersJson, "members"));
+  return stringifyPretty({
+    schema: "metis.agentTeamTemplate.v1",
+    team: {
+      id: draft.id.trim(),
+      displayName: draft.displayName.trim(),
+      template: draft.template.trim(),
+      defaultAgentId: normalizeDefaultAgentId(draft.defaultAgentId, members),
+      members,
+      aliases: compactTeamAliases(parseJsonArray<AgentTeamAliasDraft>(draft.aliasesJson, "aliases")),
+      bindings: parseJsonArray(draft.bindingsJson, "bindings"),
+      broadcast: compactBroadcast(parseJsonObject(draft.broadcastJson, "broadcast"), members),
+    },
+  });
+}
+
+export function importAgentTeamTemplate(text: string): AgentTeamEditorDraft {
+  const root = parseJsonObject(text, "team template");
+  if (root.schema !== "metis.agentTeamTemplate.v1") {
+    throw new Error("team template schema must be metis.agentTeamTemplate.v1.");
+  }
+  const team = objectValue(root.team);
+  if (!team) {
+    throw new Error("team template must include a team object.");
+  }
+  return {
+    id: stringValue(team.id),
+    displayName: stringValue(team.displayName),
+    template: stringValue(team.template),
+    defaultAgentId: stringValue(team.defaultAgentId),
+    membersJson: stringifyPretty(Array.isArray(team.members) ? team.members : []),
+    aliasesJson: stringifyPretty(Array.isArray(team.aliases) ? team.aliases : []),
+    bindingsJson: stringifyPretty(Array.isArray(team.bindings) ? team.bindings : []),
+    broadcastJson: stringifyPretty(objectValue(team.broadcast) ?? { enabled: false }),
   };
 }
 
@@ -821,8 +967,14 @@ function uniqueStrings(values: string[]): string[] {
   return result;
 }
 
-function stringValue(value: string | undefined): string {
-  return value ?? "";
+function stringValue(value: unknown): string {
+  return typeof value === "string" ? value : "";
+}
+
+function objectValue(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
 }
 
 function normalizeProfileFileName(name: string): string {
