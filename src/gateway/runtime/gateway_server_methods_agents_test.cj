@@ -75,6 +75,27 @@ private func agentsTestFindObjectById(rows: JsonArray, id: String): JsonObject {
     JsonObject()
 }
 
+private func agentsTestConfiguredAgent(root: JsonObject, id: String): JsonObject {
+    let agents = agentsTestObject(root, "agents")
+    let list = match (agents.get("list")) {
+        case Some(v) => try { v.asArray() } catch (_: Exception) { JsonArray([]) }
+        case None => JsonArray([])
+    }
+    agentsTestFindObjectById(list, id)
+}
+
+private func agentsTestTeamMember(agentId: String, role!: String = "", name!: String = ""): JsonObject {
+    let member = JsonObject()
+    member.put("agentId", JsonString(agentId))
+    if (!role.trimAscii().isEmpty()) {
+        member.put("role", JsonString(role))
+    }
+    if (!name.trimAscii().isEmpty()) {
+        member.put("name", JsonString(name))
+    }
+    member
+}
+
 private func agentsTestRouteBinding(
     agentId: String,
     channel: String,
@@ -676,6 +697,30 @@ public class GatewayServerMethodsAgentsTest {
     }
 
     @TestCase
+    public func agentsAddRejectsDuplicateAgentDirWithoutPartialConfig(): Unit {
+        withAgentsTempHome("metis-agents-add-duplicate-agentdir-home", { home: Path =>
+            let firstParams = JsonObject()
+            firstParams.put("id", JsonString("writer"))
+            let first = handleGatewayAgentsFamily("agents.add", request: Some(GatewayRpcRequest("agents.add", params: firstParams))).getOrThrow()
+            @Expect(first.ok, true)
+            let sharedAgentDir = home.join("agents").join("writer").join("agent").toString()
+            let before = MetisConfigManager.rawConfig().getOrThrow().toJsonString()
+
+            let duplicateParams = JsonObject()
+            duplicateParams.put("id", JsonString("qa"))
+            duplicateParams.put("agentDir", JsonString(sharedAgentDir))
+            let duplicate = handleGatewayAgentsFamily("agents.add", request: Some(GatewayRpcRequest("agents.add", params: duplicateParams))).getOrThrow()
+
+            @Expect(duplicate.ok, false)
+            @Expect(duplicate.error.contains("Duplicate agentDir"), true)
+            @Expect(MetisConfigManager.rawConfig().getOrThrow().toJsonString(), before)
+            @Expect(agentsTestConfiguredAgent(MetisConfigManager.rawConfig().getOrThrow(), "qa").size(), 0)
+            @Expect(exists(home.join("workspaces").join("qa")), false)
+            @Expect(exists(home.join("agents").join("qa")), false)
+        })
+    }
+
+    @TestCase
     public func agentsBindAppliesFullRouteBindingsAndPreservesNonRouteRows(): Unit {
         withAgentsTempHome("metis-agents-bind-route-apply-home", { _home: Path =>
             @Expect(agentsTestAddAgent("assistant-a").ok, true)
@@ -966,6 +1011,30 @@ public class GatewayServerMethodsAgentsTest {
     }
 
     @TestCase
+    public func agentsUpdateRejectsDuplicateAgentDirWithoutPartialConfig(): Unit {
+        withAgentsTempHome("metis-agents-update-duplicate-agentdir-home", { home: Path =>
+            @Expect(agentsTestAddAgent("writer").ok, true)
+            @Expect(agentsTestAddAgent("qa").ok, true)
+            let writerAgentDir = home.join("agents").join("writer").join("agent").toString()
+            let qaAgentDir = home.join("agents").join("qa").join("agent").toString()
+            let before = MetisConfigManager.rawConfig().getOrThrow().toJsonString()
+
+            let updateParams = JsonObject()
+            updateParams.put("id", JsonString("qa"))
+            updateParams.put("agentDir", JsonString(writerAgentDir))
+            updateParams.put("workspace", JsonString(home.join("workspaces").join("qa-updated").toString()))
+            let update = handleGatewayAgentsFamily("agents.update", request: Some(GatewayRpcRequest("agents.update", params: updateParams))).getOrThrow()
+
+            @Expect(update.ok, false)
+            @Expect(update.error.contains("Duplicate agentDir"), true)
+            @Expect(MetisConfigManager.rawConfig().getOrThrow().toJsonString(), before)
+            let qa = agentsTestConfiguredAgent(MetisConfigManager.rawConfig().getOrThrow(), "qa")
+            @Expect(agentsTestString(qa, "agentDir"), qaAgentDir)
+            @Expect(exists(home.join("workspaces").join("qa-updated")), false)
+        })
+    }
+
+    @TestCase
     public func agentFilesRpcUsesWorkspaceSafeBootstrapFiles(): Unit {
         withAgentsTempHome("metis-agents-files-phase7-home", { home: Path =>
             let addParams = JsonObject()
@@ -1118,6 +1187,66 @@ public class GatewayServerMethodsAgentsTest {
             @Expect(agentsTestBool(copiedSource, "apiKeyConfigured"), true)
             @Expect(copiedRendered.contains("pm-auth-secret"), false)
             @Expect(copiedRendered.contains("main-auth-secret"), false)
+        })
+    }
+
+    @TestCase
+    public func agentRuntimeScopeKeepsPerAgentModelAuthWorkspaceAndSessionPathsSeparate(): Unit {
+        withAgentsTempHome("metis-agents-runtime-path-isolation-home", { home: Path =>
+            let writerParams = JsonObject()
+            writerParams.put("id", JsonString("writer"))
+            writerParams.put("model", JsonString("openai:gpt-4o-mini"))
+            let writerAdd = handleGatewayAgentsFamily("agents.add", request: Some(GatewayRpcRequest("agents.add", params: writerParams))).getOrThrow()
+            @Expect(writerAdd.ok, true)
+
+            let opsParams = JsonObject()
+            opsParams.put("id", JsonString("ops"))
+            opsParams.put("model", JsonString("dashscope:qwen-plus"))
+            let opsAdd = handleGatewayAgentsFamily("agents.add", request: Some(GatewayRpcRequest("agents.add", params: opsParams))).getOrThrow()
+            @Expect(opsAdd.ok, true)
+
+            File.writeTo(
+                home.join("agents").join("writer").join("agent").join("auth-profiles.json"),
+                "{\"profiles\":[{\"id\":\"writer-openai\",\"provider\":\"openai\",\"apiKey\":\"writer-secret-never-log\"}]}\n".toArray()
+            )
+            File.writeTo(
+                home.join("agents").join("ops").join("agent").join("auth-profiles.json"),
+                "{\"profiles\":[{\"id\":\"ops-dashscope\",\"provider\":\"dashscope\",\"apiKey\":\"ops-secret-never-log\"}]}\n".toArray()
+            )
+
+            let writerScopeParams = JsonObject()
+            writerScopeParams.put("agentId", JsonString("writer"))
+            let writerScopeResponse = handleGatewayAgentsFamily("agent.scope", request: Some(GatewayRpcRequest("agent.scope", params: writerScopeParams))).getOrThrow()
+            let writerScope = writerScopeResponse.result.asObject().get("scope").getOrThrow().asObject()
+            let opsScopeParams = JsonObject()
+            opsScopeParams.put("agentId", JsonString("ops"))
+            let opsScopeResponse = handleGatewayAgentsFamily("agent.scope", request: Some(GatewayRpcRequest("agent.scope", params: opsScopeParams))).getOrThrow()
+            let opsScope = opsScopeResponse.result.asObject().get("scope").getOrThrow().asObject()
+
+            @Expect(agentsTestString(writerScope, "workspaceDir"), home.join("workspaces").join("writer").toString())
+            @Expect(agentsTestString(opsScope, "workspaceDir"), home.join("workspaces").join("ops").toString())
+            @Expect(agentsTestString(writerScope, "agentDir"), home.join("agents").join("writer").join("agent").toString())
+            @Expect(agentsTestString(opsScope, "agentDir"), home.join("agents").join("ops").join("agent").toString())
+            @Expect(agentsTestString(writerScope, "modelsJsonPath") != agentsTestString(opsScope, "modelsJsonPath"), true)
+            @Expect(agentsTestString(writerScope, "authProfilesPath") != agentsTestString(opsScope, "authProfilesPath"), true)
+            @Expect(agentsTestString(writerScope, "sessionsDir") != agentsTestString(opsScope, "sessionsDir"), true)
+            @Expect(agentsTestString(writerScope, "modelRef"), "openai:gpt-4o-mini")
+            @Expect(agentsTestString(opsScope, "modelRef"), "dashscope:qwen-plus")
+
+            let writerModelsResponse = handleGatewayAgentsFamily("agents.models.get", request: Some(GatewayRpcRequest("agents.models.get", params: writerScopeParams))).getOrThrow()
+            let writerModels = writerModelsResponse.result.asObject().get("models").getOrThrow().asObject()
+            let opsModelsResponse = handleGatewayAgentsFamily("agents.models.get", request: Some(GatewayRpcRequest("agents.models.get", params: opsScopeParams))).getOrThrow()
+            let opsModels = opsModelsResponse.result.asObject().get("models").getOrThrow().asObject()
+            let writerSource = agentsTestObject(writerModels, "credentialSource")
+            let opsSource = agentsTestObject(opsModels, "credentialSource")
+
+            @Expect(agentsTestString(writerSource, "source"), "agent.auth-profiles.openai")
+            @Expect(agentsTestString(opsSource, "source"), "agent.auth-profiles.dashscope")
+            let rendered = writerModels.toJsonString() + opsModels.toJsonString()
+            @Expect(rendered.contains("writer-secret-never-log"), false)
+            @Expect(rendered.contains("ops-secret-never-log"), false)
+            @Expect(rendered.contains("agent.auth-profiles.openai"), true)
+            @Expect(rendered.contains("agent.auth-profiles.dashscope"), true)
         })
     }
 
@@ -1353,6 +1482,90 @@ public class GatewayServerMethodsAgentsTest {
             let team = getResponse.result.asObject().get("team").getOrThrow().asObject()
             @Expect(team.get("bindings").getOrThrow().asArray().size(), 0)
             @Expect(agentsTestRawBindings().toJsonString().contains("\"agentId\":\"content-writer\""), false)
+        })
+    }
+
+    @TestCase
+    public func agentTeamsCreateRejectsDuplicateAgentDirWithoutPartialConfig(): Unit {
+        withAgentsTempHome("metis-agent-teams-create-duplicate-agentdir-home", { home: Path =>
+            @Expect(agentsTestAddAgent("ops").ok, true)
+            let root = MetisConfigManager.rawConfig().getOrThrow()
+            let agents = agentsTestObject(root, "agents")
+            let list = match (agents.get("list")) {
+                case Some(v) => try { v.asArray() } catch (_: Exception) { JsonArray([]) }
+                case None => JsonArray([])
+            }
+            let legacy = JsonObject()
+            legacy.put("id", JsonString("legacy"))
+            legacy.put("workspace", JsonString(home.join("workspaces").join("legacy").toString()))
+            legacy.put("agentDir", JsonString(home.join("agents").join("content-pm").join("agent").toString()))
+            legacy.put("sessionsDir", JsonString(home.join("agents").join("legacy").join("sessions").toString()))
+            list.add(legacy)
+            agents.put("list", list)
+            root.put("agents", agents)
+            MetisConfigManager.writeRoot(root)
+            let before = MetisConfigManager.rawConfig().getOrThrow().toJsonString()
+
+            let createParams = JsonObject()
+            createParams.put("id", JsonString("content"))
+            createParams.put("template", JsonString("pm-writer-reviewer"))
+            let create = handleGatewayAgentsFamily("agents.teams.create", request: Some(GatewayRpcRequest("agents.teams.create", params: createParams))).getOrThrow()
+
+            @Expect(create.ok, false)
+            @Expect(create.error.contains("Duplicate agentDir"), true)
+            @Expect(MetisConfigManager.rawConfig().getOrThrow().toJsonString(), before)
+            let listResponse = handleGatewayAgentsFamily("agents.teams.list").getOrThrow()
+            @Expect(listResponse.result.asObject().get("teams").getOrThrow().asArray().size(), 0)
+            @Expect(exists(home.join("agents").join("content-pm").join("agent").join("AGENT.md")), false)
+            @Expect(exists(home.join("workspaces").join("content-writer")), false)
+        })
+    }
+
+    @TestCase
+    public func agentTeamsUpdateRejectsDuplicateAgentDirWithoutPartialConfig(): Unit {
+        withAgentsTempHome("metis-agent-teams-update-duplicate-agentdir-home", { home: Path =>
+            let members = JsonArray([])
+            members.add(agentsTestTeamMember("content-pm", role: "pm", name: "Content PM"))
+            let createParams = JsonObject()
+            createParams.put("id", JsonString("content"))
+            createParams.put("members", members)
+            let create = handleGatewayAgentsFamily("agents.teams.create", request: Some(GatewayRpcRequest("agents.teams.create", params: createParams))).getOrThrow()
+            @Expect(create.ok, true)
+
+            let root = MetisConfigManager.rawConfig().getOrThrow()
+            let agents = agentsTestObject(root, "agents")
+            let list = match (agents.get("list")) {
+                case Some(v) => try { v.asArray() } catch (_: Exception) { JsonArray([]) }
+                case None => JsonArray([])
+            }
+            let legacy = JsonObject()
+            legacy.put("id", JsonString("legacy"))
+            legacy.put("workspace", JsonString(home.join("workspaces").join("legacy").toString()))
+            legacy.put("agentDir", JsonString(home.join("agents").join("content-reviewer").join("agent").toString()))
+            legacy.put("sessionsDir", JsonString(home.join("agents").join("legacy").join("sessions").toString()))
+            list.add(legacy)
+            agents.put("list", list)
+            root.put("agents", agents)
+            MetisConfigManager.writeRoot(root)
+            let before = MetisConfigManager.rawConfig().getOrThrow().toJsonString()
+
+            let nextMembers = JsonArray([])
+            nextMembers.add(agentsTestTeamMember("content-pm", role: "pm", name: "Content PM"))
+            nextMembers.add(agentsTestTeamMember("content-reviewer", role: "reviewer", name: "Content Reviewer"))
+            let updateParams = JsonObject()
+            updateParams.put("id", JsonString("content"))
+            updateParams.put("members", nextMembers)
+            let update = handleGatewayAgentsFamily("agents.teams.update", request: Some(GatewayRpcRequest("agents.teams.update", params: updateParams))).getOrThrow()
+
+            @Expect(update.ok, false)
+            @Expect(update.error.contains("Duplicate agentDir"), true)
+            @Expect(MetisConfigManager.rawConfig().getOrThrow().toJsonString(), before)
+            let getParams = JsonObject()
+            getParams.put("id", JsonString("content"))
+            let get = handleGatewayAgentsFamily("agents.teams.get", request: Some(GatewayRpcRequest("agents.teams.get", params: getParams))).getOrThrow()
+            let persistedMembers = get.result.asObject().get("team").getOrThrow().asObject().get("members").getOrThrow().asArray()
+            @Expect(persistedMembers.size(), 1)
+            @Expect(exists(home.join("agents").join("content-reviewer").join("agent").join("AGENT.md")), false)
         })
     }
 

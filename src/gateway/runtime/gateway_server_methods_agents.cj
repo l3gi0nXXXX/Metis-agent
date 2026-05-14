@@ -10,6 +10,7 @@ import metis.core.skills.resolveAgentSkillVisibility
 import metis.gateway.config.buildGatewayConfigFromUserSettings
 import metis.gateway.core.{GatewayAgentBindingApplyResult, GatewayAgentBindingConflict, GatewayAgentBindingRemoveResult, gatewayAgentTeamMigrationDryRun, gatewayApplyAgentRouteBindings, gatewayAuthorizedChatToolNames, gatewayBuildLegacyAgentRouteBinding, gatewayCorePromptRuntimeCapabilities, gatewayDefaultChatRuntimeHasUnifiedCoreTools, gatewayDefaultChatToolNames, gatewayMainRuntimePromptTemplateId, gatewayMainRuntimePromptVarianceFields, gatewayRemoveAgentRouteBindings, gatewaySanitizeAgentId}
 import metis.gateway.session.{GatewayIngressSource, GatewaySessionRequest, gatewayBuildSessionRpcParams, gatewayIngressSourceFromString, gatewayResolveSessionContext, gatewaySessionRequestFromRpcParams}
+import metis.utils.InfoUtils
 
 import std.collection.{ArrayList, HashMap}
 import std.convert.Parsable
@@ -162,6 +163,53 @@ private func gatewayAgentScopePathParam(request: GatewayRpcRequest, key: String,
         return fallback
     }
     try { Path(raw.trimAscii()).normalize() } catch (_e: Exception) { Path(raw.trimAscii()) }
+}
+
+private func gatewayAgentCanonicalAgentDir(pathText: String): String {
+    let trimmed = pathText.trimAscii()
+    if (trimmed.isEmpty()) {
+        return ""
+    }
+    let normalized = try { Path(trimmed).normalize().toString() } catch (_e: Exception) { trimmed }
+    if (InfoUtils.os == "macos" || InfoUtils.os == "windows") {
+        return normalized.toAsciiLower()
+    }
+    normalized
+}
+
+private func gatewayAgentDuplicateAgentDirPreflightError(root: JsonObject): String {
+    let summary = MetisAgentScope.summary(
+        root,
+        homeRoot: MetisPaths.homeRootReadOnly(),
+        defaultWorkspace: MetisPaths.workspaceRootReadOnly()
+    )
+    let agents = gatewayAgentJsonArray(summary, "agents")
+    for (i in 0..agents.size()) {
+        let left = try { agents[i].asObject() } catch (_e: Exception) { JsonObject() }
+        let leftPath = gatewayAgentCanonicalAgentDir(gatewayAgentJsonString(left, "agentDir", ""))
+        if (leftPath.isEmpty()) {
+            continue
+        }
+        for (j in i + 1..agents.size()) {
+            let right = try { agents[j].asObject() } catch (_e: Exception) { JsonObject() }
+            let rightPath = gatewayAgentCanonicalAgentDir(gatewayAgentJsonString(right, "agentDir", ""))
+            if (leftPath == rightPath) {
+                let displayPath = gatewayAgentJsonString(left, "agentDir", leftPath)
+                let leftId = gatewayAgentJsonString(left, "agentId", "")
+                let rightId = gatewayAgentJsonString(right, "agentId", "")
+                return "Duplicate agentDir detected: \"${leftId}\" and \"${rightId}\" both resolve to ${displayPath}. Each agent must have a unique agentDir; sharing it causes auth/session state collisions. Copy auth-profiles.json instead of sharing the entire agentDir when credentials should be shared."
+            }
+        }
+    }
+    ""
+}
+
+private func gatewayAgentDuplicateAgentDirResponse(method: String, root: JsonObject): Option<GatewayRpcResponse> {
+    let error = gatewayAgentDuplicateAgentDirPreflightError(root)
+    if (error.isEmpty()) {
+        return None<GatewayRpcResponse>
+    }
+    Some(GatewayRpcResponse(false, method, error: error))
 }
 
 private func gatewayAgentConfigEntries(root: JsonObject): JsonArray {
@@ -1246,6 +1294,25 @@ private func gatewayAgentAddJson(request: GatewayRpcRequest): GatewayRpcResponse
     if (!authCopy.ok) {
         return GatewayRpcResponse(false, "agents.add", error: authCopy.error)
     }
+    let preflightEntry = JsonObject()
+    preflightEntry.put("id", JsonString(agentId))
+    preflightEntry.put("name", JsonString(name))
+    preflightEntry.put("workspace", JsonString(workspace))
+    preflightEntry.put("agentDir", JsonString(agentDir))
+    preflightEntry.put("sessionsDir", JsonString(sessionsDir))
+    if (!model.trimAscii().isEmpty()) {
+        preflightEntry.put("model", JsonString(model.trimAscii()))
+    }
+    let preflightEntries = JsonArray([])
+    for (i in 0..entries.size()) {
+        preflightEntries.add(entries[i])
+    }
+    preflightEntries.add(preflightEntry)
+    gatewayAgentConfigWriteEntries(root, preflightEntries)
+    match (gatewayAgentDuplicateAgentDirResponse("agents.add", root)) {
+        case Some(response) => return response
+        case None => ()
+    }
     if (!exists(agentDirPath)) {
         Directory.create(agentDirPath, recursive: true)
     }
@@ -1416,6 +1483,19 @@ private func gatewayAgentUpdateJson(request: GatewayRpcRequest): GatewayRpcRespo
     let identityError = gatewayAgentPutIdentityFromRequest(updated, request, workspace)
     if (!identityError.isEmpty()) {
         return GatewayRpcResponse(false, "agents.update", error: identityError)
+    }
+    let preflightEntries = JsonArray([])
+    for (i in 0..entries.size()) {
+        if (i == index) {
+            preflightEntries.add(updated)
+        } else {
+            preflightEntries.add(entries[i])
+        }
+    }
+    gatewayAgentConfigWriteEntries(root, preflightEntries)
+    match (gatewayAgentDuplicateAgentDirResponse("agents.update", root)) {
+        case Some(response) => return response
+        case None => ()
     }
     let workspacePath = Path(workspace)
     let bootstrap = ensureMetisAgentWorkspace(workspacePath)
@@ -2061,6 +2141,10 @@ private func gatewayAgentTeamCreateJson(request: GatewayRpcRequest): GatewayRpcR
         }
         bindingApply = gatewayAgentBindingApplyJson(applyResult)
     }
+    match (gatewayAgentDuplicateAgentDirResponse(request.method, preflightRoot)) {
+        case Some(response) => return response
+        case None => ()
+    }
     team.put("broadcast", gatewayAgentTeamBroadcastFromRequest(request))
     let memberAgents = gatewayAgentEnsureTeamMemberAgents(preflightRoot, members)
     let nextTeams = JsonArray([])
@@ -2142,6 +2226,10 @@ private func gatewayAgentTeamUpdateJson(request: GatewayRpcRequest): GatewayRpcR
             try { team.put("broadcast", gatewayAgentCloneObject(v.asObject())) } catch (_e: Exception) {
                 return GatewayRpcResponse(false, request.method, error: "broadcast must be an object.")
             }
+        case None => ()
+    }
+    match (gatewayAgentDuplicateAgentDirResponse(request.method, preflightRoot)) {
+        case Some(response) => return response
         case None => ()
     }
     let nextTeams = JsonArray([])
