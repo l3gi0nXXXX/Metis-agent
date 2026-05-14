@@ -4,6 +4,7 @@ import magic.jsonable.*
 
 import metis.core.gatewayVideoGenerationResolveConfig
 import metis.core.config.{CliConfig, CliSettingManager, GatewayPluginUserSettings, GatewayUserSettings}
+import metis.gateway.channels.feishu.gatewayFeishuDescribeAccounts
 import metis.gateway.channels.telegram.{TelegramAdapter, telegramPairingAccountStore}
 import metis.gateway.model.{ChannelType, OutboundMessage}
 import metis.gateway.core.{
@@ -589,6 +590,59 @@ private func gatewayFeishuMediaJson(user: GatewayUserSettings): JsonObject {
     return media
 }
 
+private func gatewayFeishuReceiveModeDiagnosticsJson(user: GatewayUserSettings): JsonObject {
+    let out = JsonObject()
+    out.put("mode", JsonString(user.feishu.receiveMode))
+    out.put("supportedModes", JsonArray([JsonString("long_connect"), JsonString("webhook")]))
+    out.put("state", JsonString(if (user.feishu.receiveMode == "webhook" || user.feishu.receiveMode == "long_connect") { "supported" } else { "normalized_by_runtime" }))
+    return out
+}
+
+private func gatewayFeishuGroupPolicyDiagnosticsJson(user: GatewayUserSettings): JsonObject {
+    let out = JsonObject()
+    out.put("mode", JsonString(user.feishu.groupPolicy))
+    out.put("allowFromCount", user.feishu.groupAllowFrom.size.toJsonValue())
+    out.put("configuredGroupCount", gatewayFeishuGroupsJson(user).size().toJsonValue())
+    out.put("requireMention", user.feishu.requireMention.toJsonValue())
+    out.put("allowBots", user.feishu.allowBots.toJsonValue())
+    out.put("state", JsonString("evaluated_per_account_and_group"))
+    return out
+}
+
+private func gatewayFeishuThreadSessionDiagnosticsJson(user: GatewayUserSettings): JsonObject {
+    let out = JsonObject()
+    out.put("enabled", user.feishu.threadSession.toJsonValue())
+    out.put("cache", JsonString("account_scoped_chat_thread_capability"))
+    out.put("skippedReasons", JsonArray([
+        JsonString("thread_session_disabled"),
+        JsonString("thread_not_capable")
+    ]))
+    out.put("state", JsonString(if (user.feishu.threadSession) { "requires_thread_capable_group" } else { "disabled" }))
+    return out
+}
+
+private func gatewayFeishuChannelDiagnosticsJson(user: GatewayUserSettings): JsonObject {
+    let out = JsonObject()
+    let account = gatewayFeishuDescribeAccounts(buildGatewayConfigFromUserSettings(user).feishu)
+    out.put("channel", JsonString("feishu"))
+    out.put("redacted", true.toJsonValue())
+    out.put("checkedInputs", JsonArray([
+        JsonString("account"),
+        JsonString("receiveMode"),
+        JsonString("groupPolicy"),
+        JsonString("threadSession"),
+        JsonString("media")
+    ]))
+    out.put("account", account)
+    out.put("receiveMode", gatewayFeishuReceiveModeDiagnosticsJson(user))
+    out.put("groupPolicy", gatewayFeishuGroupPolicyDiagnosticsJson(user))
+    out.put("threadSession", gatewayFeishuThreadSessionDiagnosticsJson(user))
+    out.put("media", gatewayFeishuMediaJson(user))
+    out.put("unsupportedFields", account.get("unsupportedFields") ?? JsonArray([]))
+    out.put("ignoredFields", account.get("ignoredFields") ?? JsonArray([]))
+    return out
+}
+
 public func gatewayChannelGetJson(user: GatewayUserSettings, channelId: String): JsonObject {
     let normalized = normalizeGatewayChannelId(channelId)
     let result = JsonObject()
@@ -612,6 +666,7 @@ public func gatewayChannelGetJson(user: GatewayUserSettings, channelId: String):
         result.put("replyInThread", JsonString(user.feishu.replyInThread))
         result.put("configured", (!user.feishu.appId.trimAscii().isEmpty()).toJsonValue())
         result.put("media", gatewayFeishuMediaJson(user))
+        result.put("diagnostics", gatewayFeishuChannelDiagnosticsJson(user))
         result.put("directory", gatewayFeishuDirectoryJson(user))
         result.put("accountInspect", gatewayFeishuAccountInspectJson(user))
         result.put("accountOps", gatewayFeishuAccountOpsJson())

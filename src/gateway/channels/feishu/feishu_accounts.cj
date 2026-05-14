@@ -109,9 +109,14 @@ public func gatewayFeishuResolveAccount(config: FeishuConfig, accountId: String)
 public func gatewayFeishuDescribeAccounts(config: FeishuConfig): JsonObject {
     let out = JsonObject()
     let defaultAccount = gatewayFeishuDefaultAccountId(config)
+    let diagnostics = gatewayFeishuUnsupportedFieldDiagnostics(config)
     out.put("channel", JsonString("feishu"))
     out.put("defaultAccountId", JsonString(defaultAccount))
     out.put("redacted", JsonBool(true))
+    out.put("unsupportedFields", diagnostics.get("unsupportedFields") ?? JsonArray([]))
+    out.put("ignoredFields", diagnostics.get("ignoredFields") ?? JsonArray([]))
+    out.put("unsupportedFieldCount", diagnostics.get("unsupportedFieldCount") ?? JsonInt(0))
+    out.put("ignoredFieldCount", diagnostics.get("ignoredFieldCount") ?? JsonInt(0))
     let rows = JsonArray([])
     for (accountId in gatewayFeishuListAccountIds(config)) {
         let resolved = gatewayFeishuResolveAccount(config, accountId)
@@ -139,6 +144,50 @@ public func gatewayFeishuDescribeAccounts(config: FeishuConfig): JsonObject {
     out
 }
 
+public func gatewayFeishuUnsupportedFieldDiagnostics(config: FeishuConfig): JsonObject {
+    let unsupported = JsonArray([])
+    let ignored = JsonArray([])
+    match (config.accounts) {
+        case Some(accounts) =>
+            for (rawAccountId in accounts.getFields().keys()) {
+                let accountId = gatewayFeishuNormalizeAccountId(rawAccountId)
+                let accountObj = try { accounts.getFields()[rawAccountId].asObject() } catch (_: Exception) { JsonObject() }
+                for (key in accountObj.getFields().keys()) {
+                    if (key == "groups") {
+                        gatewayFeishuCollectUnsupportedGroupFields(
+                            accountObj,
+                            "accounts.${accountId}.groups",
+                            unsupported,
+                            ignored
+                        )
+                    } else if (!gatewayFeishuSupportedAccountOverrideField(key)) {
+                        gatewayFeishuAddUnsupportedIgnoredField(
+                            unsupported,
+                            ignored,
+                            "accounts.${accountId}.${key}",
+                            "account",
+                            "unsupported Feishu account override field is ignored by the native runtime"
+                        )
+                    }
+                }
+            }
+        case None => ()
+    }
+    match (config.groups) {
+        case Some(groups) =>
+            let wrapper = JsonObject()
+            wrapper.put("groups", groups)
+            gatewayFeishuCollectUnsupportedGroupFields(wrapper, "groups", unsupported, ignored)
+        case None => ()
+    }
+    let out = JsonObject()
+    out.put("unsupportedFields", unsupported)
+    out.put("ignoredFields", ignored)
+    out.put("unsupportedFieldCount", JsonInt(unsupported.size()))
+    out.put("ignoredFieldCount", JsonInt(ignored.size()))
+    out
+}
+
 public func gatewayFeishuRedactedValue(value: String): String {
     let trimmed = value.trimAscii()
     if (trimmed.isEmpty()) {
@@ -158,6 +207,121 @@ private func gatewayFeishuAccountOverride(config: FeishuConfig, accountId: Strin
                 case None => None<JsonObject>
             }
         case None => None<JsonObject>
+    }
+}
+
+private func gatewayFeishuStringInList(value: String, allowed: Array<String>): Bool {
+    for (candidate in allowed) {
+        if (value == candidate) {
+            return true
+        }
+    }
+    false
+}
+
+private func gatewayFeishuSupportedAccountOverrideField(raw: String): Bool {
+    gatewayFeishuStringInList(raw.trimAscii(), [
+        "enabled",
+        "streaming",
+        "blockStreaming",
+        "appId",
+        "app_id",
+        "appSecret",
+        "app_secret",
+        "receiveMode",
+        "receive_mode",
+        "domain",
+        "botOpenId",
+        "bot_open_id",
+        "webhookHost",
+        "webhook_host",
+        "webhookPort",
+        "webhook_port",
+        "webhookPath",
+        "webhook_path",
+        "verificationToken",
+        "verification_token",
+        "encryptKey",
+        "encrypt_key",
+        "groupSessionScope",
+        "group_session_scope",
+        "threadSession",
+        "groups",
+        "groupPolicy",
+        "group_policy",
+        "groupAllowFrom",
+        "requireMention",
+        "allowBots",
+        "replyInThread",
+        "reply_in_thread",
+        "requireSignatureHeaders",
+        "requestMaxSkewSeconds",
+        "request_max_skew_seconds",
+        "media"
+    ])
+}
+
+private func gatewayFeishuSupportedGroupOverrideField(raw: String): Bool {
+    gatewayFeishuStringInList(raw.trimAscii(), [
+        "enabled",
+        "allowBots",
+        "requireMention",
+        "allowFrom",
+        "tools",
+        "skills",
+        "systemPrompt",
+        "runtimePolicy",
+        "policy"
+    ])
+}
+
+private func gatewayFeishuAddUnsupportedIgnoredField(
+    unsupported: JsonArray,
+    ignored: JsonArray,
+    path: String,
+    scope: String,
+    reason: String
+): Unit {
+    let unsupportedRow = JsonObject()
+    unsupportedRow.put("path", JsonString(path))
+    unsupportedRow.put("scope", JsonString(scope))
+    unsupportedRow.put("status", JsonString("unsupported"))
+    unsupportedRow.put("effect", JsonString("ignored"))
+    unsupportedRow.put("reason", JsonString(reason))
+    unsupported.add(unsupportedRow)
+
+    let ignoredRow = JsonObject()
+    ignoredRow.put("path", JsonString(path))
+    ignoredRow.put("scope", JsonString(scope))
+    ignoredRow.put("status", JsonString("ignored"))
+    ignoredRow.put("unsupported", JsonBool(true))
+    ignoredRow.put("reason", JsonString(reason))
+    ignored.add(ignoredRow)
+}
+
+private func gatewayFeishuCollectUnsupportedGroupFields(
+    container: JsonObject,
+    pathPrefix: String,
+    unsupported: JsonArray,
+    ignored: JsonArray
+): Unit {
+    let groups = match (container.get("groups")) {
+        case Some(v) => try { v.asObject() } catch (_: Exception) { JsonObject() }
+        case None => JsonObject()
+    }
+    for (groupId in groups.getFields().keys()) {
+        let groupObj = try { groups.getFields()[groupId].asObject() } catch (_: Exception) { JsonObject() }
+        for (key in groupObj.getFields().keys()) {
+            if (!gatewayFeishuSupportedGroupOverrideField(key)) {
+                gatewayFeishuAddUnsupportedIgnoredField(
+                    unsupported,
+                    ignored,
+                    "${pathPrefix}.${groupId}.${key}",
+                    "groupPolicy",
+                    "unsupported Feishu group policy field is ignored by the native runtime"
+                )
+            }
+        }
     }
 }
 

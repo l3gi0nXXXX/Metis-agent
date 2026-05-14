@@ -1,7 +1,9 @@
 package metis.gateway.channels.feishu
 
 import metis.core.renderGatewayEditText
+import metis.gateway.core.{gatewayPolicyFilteredChatToolNamesForTurnContext, gatewayPolicyFilteredSystemPromptForTurnContext, gatewayResolveSessionContextWithAgentRoute}
 import metis.gateway.model.{ChannelPolicyConfig, ChannelType, FeishuConfig, FeishuMediaConfig, OutboundMessage}
+import metis.gateway.session.gatewaySessionRequestFromInbound
 import std.core.Duration
 import std.fs.{File, Path, exists, remove}
 import std.sync.Mutex
@@ -197,6 +199,45 @@ public class FeishuAdapterTest {
     }
 
     @TestCase
+    public func accountResolverReportsUnsupportedAccountFieldsAsIgnoredDiagnostics(): Unit {
+        let tenant = JsonObject()
+        tenant.put("footer", JsonObject())
+        tenant.put("uat", JsonObject())
+        tenant.put("dedup", JsonObject())
+        let group = JsonObject()
+        group.put("respondToMentionAll", JsonBool(true))
+        let accountGroups = JsonObject()
+        accountGroups.put("oc_team", group)
+        tenant.put("groups", accountGroups)
+        let accounts = JsonObject()
+        accounts.put("tenant-a", tenant)
+
+        let config = FeishuConfig(
+            enabled: true,
+            defaultAccount: "tenant-a",
+            appId: "base-app",
+            appSecret: "base-secret-never-visible",
+            accounts: Some(accounts)
+        )
+
+        let descriptions = gatewayFeishuDescribeAccounts(config)
+        let raw = descriptions.toJsonString()
+        @Expect(raw.contains("base-secret-never-visible"), false)
+        @Expect(raw.contains("unsupportedFields"), true)
+        @Expect(raw.contains("ignoredFields"), true)
+        @Expect(raw.contains("accounts.tenant-a.footer"), true)
+        @Expect(raw.contains("accounts.tenant-a.uat"), true)
+        @Expect(raw.contains("accounts.tenant-a.dedup"), true)
+        @Expect(raw.contains("accounts.tenant-a.groups.oc_team.respondToMentionAll"), true)
+        let unsupportedRows = descriptions.get("unsupportedFields").getOrThrow().asArray().toJsonString()
+        let ignoredRows = descriptions.get("ignoredFields").getOrThrow().asArray().toJsonString()
+        @Expect(unsupportedRows.contains("status"), true)
+        @Expect(unsupportedRows.contains("unsupported"), true)
+        @Expect(ignoredRows.contains("status"), true)
+        @Expect(ignoredRows.contains("ignored"), true)
+    }
+
+    @TestCase
     public func disabledAccountOverrideDoesNotRunAdapterTransport(): Unit {
         let accounts = JsonObject()
         let disabled = JsonObject()
@@ -244,6 +285,80 @@ public class FeishuAdapterTest {
             .get("feishuGate").getOrThrow().asObject()
         @Expect(gate.get("triggerAgent").getOrThrow().asBool().getValue(), true)
         @Expect(gate.get("reason").getOrThrow().asString().getValue(), "accepted")
+    }
+
+    @TestCase
+    public func sameChatIdUsesIsolatedAccountScopedGroupPolicies(): Unit {
+        let tenantAGroup = JsonObject()
+        tenantAGroup.put("requireMention", JsonBool(false))
+        let tenantATools = JsonObject()
+        tenantATools.put("allow", JsonArray([JsonString("feishu_fetch_doc")]))
+        tenantAGroup.put("tools", tenantATools)
+        let tenantAGroups = JsonObject()
+        tenantAGroups.put("oc_shared", tenantAGroup)
+        let tenantA = JsonObject()
+        tenantA.put("groups", tenantAGroups)
+
+        let tenantBGroup = JsonObject()
+        tenantBGroup.put("enabled", JsonBool(false))
+        tenantBGroup.put("systemPrompt", JsonString("tenant-b-disabled-prompt"))
+        let tenantBGroups = JsonObject()
+        tenantBGroups.put("oc_shared", tenantBGroup)
+        let tenantB = JsonObject()
+        tenantB.put("groups", tenantBGroups)
+
+        let accounts = JsonObject()
+        accounts.put("tenant-a", tenantA)
+        accounts.put("tenant-b", tenantB)
+
+        let adapter = FeishuAdapter(
+            config: FeishuConfig(
+                enabled: true,
+                accounts: Some(accounts),
+                groupPolicy: "allowlist",
+                requireMention: true
+            )
+        )
+        adapter.start()
+        @Expect(adapter.ingestWebhookPayload(
+            this.webhookPayload(
+                "om_tenant_a",
+                "oc_shared",
+                "ou_1",
+                "{\\\"text\\\":\\\"plain group message\\\"}",
+                headerAccountId: "tenant-a"
+            )
+        ).contains("\"ok\":true"), true)
+        @Expect(adapter.ingestWebhookPayload(
+            this.webhookPayload(
+                "om_tenant_b",
+                "oc_shared",
+                "ou_2",
+                "{\\\"text\\\":\\\"plain group message\\\"}",
+                headerAccountId: "tenant-b"
+            )
+        ).contains("\"ok\":true"), true)
+
+        let inbound = adapter.pullInbound()
+        @Expect(inbound.size, 2)
+        let tenantAGate = inbound[0].mediaContext.get("context").getOrThrow().asObject()
+            .get("feishuGate").getOrThrow().asObject()
+        let tenantBGate = inbound[1].mediaContext.get("context").getOrThrow().asObject()
+            .get("feishuGate").getOrThrow().asObject()
+        @Expect(inbound[0].accountId, "tenant-a")
+        @Expect(inbound[1].accountId, "tenant-b")
+        @Expect(tenantAGate.get("triggerAgent").getOrThrow().asBool().getValue(), true)
+        @Expect(tenantAGate.get("reason").getOrThrow().asString().getValue(), "accepted")
+        @Expect(tenantBGate.get("triggerAgent").getOrThrow().asBool().getValue(), false)
+        @Expect(tenantBGate.get("reason").getOrThrow().asString().getValue(), "group_disabled")
+        let tenantARoute = inbound[0].mediaContext.get("context").getOrThrow().asObject()
+            .get("imRoute").getOrThrow().asObject()
+        let tenantBRoute = inbound[1].mediaContext.get("context").getOrThrow().asObject()
+            .get("imRoute").getOrThrow().asObject()
+        @Expect(tenantARoute.get("accountId").getOrThrow().asString().getValue(), "tenant-a")
+        @Expect(tenantBRoute.get("accountId").getOrThrow().asString().getValue(), "tenant-b")
+        @Expect(tenantARoute.get("groupPolicy").getOrThrow().asObject().toJsonString().contains("feishu_fetch_doc"), true)
+        @Expect(tenantBRoute.get("groupPolicy").getOrThrow().asObject().toJsonString().contains("tenant-b-disabled-prompt"), true)
     }
 
     @TestCase
@@ -670,6 +785,92 @@ public class FeishuAdapterTest {
             .get("feishuGate").getOrThrow().asObject()
         @Expect(deniedGate.get("triggerAgent").getOrThrow().asBool().getValue(), false)
         @Expect(deniedGate.get("reason").getOrThrow().asString().getValue(), "sender_not_allowed")
+    }
+
+    @TestCase
+    public func fakeFeishuGroupPolicyReachesSessionRouteAndAgentBridgeRuntime(): Unit {
+        let group = JsonObject()
+        group.put("requireMention", JsonBool(false))
+        group.put("systemPrompt", JsonString("group-a-only-system-prompt"))
+        group.put("skills", JsonArray([JsonString("feishu-docs")]))
+        let runtimePolicy = JsonObject()
+        runtimePolicy.put("systemPrompt", JsonString("runtime-policy-visible"))
+        group.put("runtimePolicy", runtimePolicy)
+        let tools = JsonObject()
+        tools.put("allow", JsonArray([JsonString("feishu_fetch_doc")]))
+        group.put("tools", tools)
+        let groups = JsonObject()
+        groups.put("oc_bridge", group)
+
+        let routeRoot = JsonObject()
+        let agents = JsonObject()
+        let list = JsonArray([])
+        let mainAgent = JsonObject()
+        mainAgent.put("id", JsonString("main"))
+        mainAgent.put("default", JsonBool(true))
+        list.add(mainAgent)
+        let writer = JsonObject()
+        writer.put("id", JsonString("writer"))
+        list.add(writer)
+        agents.put("list", list)
+        routeRoot.put("agents", agents)
+        let bindings = JsonArray([])
+        let binding = JsonObject()
+        binding.put("type", JsonString("route"))
+        binding.put("agentId", JsonString("writer"))
+        let matchObj = JsonObject()
+        matchObj.put("channel", JsonString("feishu"))
+        matchObj.put("accountId", JsonString("tenant-a"))
+        let peer = JsonObject()
+        peer.put("kind", JsonString("group"))
+        peer.put("id", JsonString("oc_bridge"))
+        matchObj.put("peer", peer)
+        binding.put("match", matchObj)
+        bindings.add(binding)
+        routeRoot.put("bindings", bindings)
+
+        let accounts = JsonObject()
+        let tenant = JsonObject()
+        tenant.put("groups", groups)
+        accounts.put("tenant-a", tenant)
+        let adapter = FeishuAdapter(
+            config: FeishuConfig(
+                enabled: true,
+                accounts: Some(accounts),
+                groupPolicy: "allowlist",
+                requireMention: true
+            )
+        )
+        adapter.start()
+        @Expect(adapter.ingestWebhookPayload(
+            this.webhookPayload(
+                "om_bridge",
+                "oc_bridge",
+                "ou_1",
+                "{\\\"text\\\":\\\"plain group message\\\"}",
+                headerAccountId: "tenant-a"
+            )
+        ).contains("\"ok\":true"), true)
+
+        let inbound = adapter.pullInbound()
+        @Expect(inbound.size, 1)
+        let request = gatewaySessionRequestFromInbound(
+            inbound[0],
+            sessionHint: "feishu:group:oc_bridge",
+            accountId: "tenant-a",
+            routeRoot: routeRoot
+        )
+        let resolved = gatewayResolveSessionContextWithAgentRoute(request)
+        let turn = resolved.turnContext
+        let names = gatewayPolicyFilteredChatToolNamesForTurnContext(turn)
+        let prompt = gatewayPolicyFilteredSystemPromptForTurnContext(turn, channelName: "feishu", modelName: "openai:gpt-4o-mini")
+
+        @Expect(resolved.agentId, "writer")
+        @Expect(turn.route.get("groupPolicy").isSome(), true)
+        @Expect(names.contains("feishu_fetch_doc"), true)
+        @Expect(names.contains("feishu_drive_file"), false)
+        @Expect(prompt.contains("group-a-only-system-prompt"), true)
+        @Expect(prompt.contains("runtime-policy-visible"), false)
     }
 
     @TestCase

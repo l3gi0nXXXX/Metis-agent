@@ -353,6 +353,70 @@ public class GatewayServerMethodsChannelsTest {
     }
 
     @TestCase
+    public func feishuChannelGetExposesExecutableDiagnosticsForAccountsThreadGroupMediaAndIgnoredFields(): Unit {
+        var user = GatewayUserSettings()
+        user.feishu.enabled = true
+        user.feishu.defaultAccount = "tenant-a"
+        user.feishu.receiveMode = "webhook"
+        user.feishu.appId = "legacy-app"
+        user.feishu.appSecret = "legacy-secret-never-visible"
+        user.feishu.groupPolicy = "allowlist"
+        user.feishu.groupAllowFrom = ["oc_team"]
+        user.feishu.threadSession = true
+        user.feishu.requireMention = false
+        user.feishu.allowBots = true
+        user.feishu.media.downloadEnabled = true
+        user.feishu.media.mediaMaxBytes = 8192
+        user.feishu.media.allowedMimes = ["image/*", "application/pdf"]
+        user.feishu.media.downloadRoot = "/tmp/metis-feishu-status-media"
+
+        let accountGroup = JsonObject()
+        accountGroup.put("respondToMentionAll", true.toJsonValue())
+        let accountGroups = JsonObject()
+        accountGroups.put("oc_team", accountGroup)
+        let tenant = JsonObject()
+        tenant.put("appSecret", JsonString("tenant-secret-never-visible"))
+        tenant.put("footer", JsonObject())
+        tenant.put("uat", JsonObject())
+        tenant.put("dedup", JsonObject())
+        tenant.put("groups", accountGroups)
+        let accounts = JsonObject()
+        accounts.put("tenant-a", tenant)
+        user.feishu.accounts = Some(accounts)
+
+        let channel = gatewayChannelGetJson(user, "feishu")
+        let diagnostics = channel.get("diagnostics").getOrThrow().asObject()
+        @Expect(channelsTestString(diagnostics, "channel"), "feishu")
+        @Expect(channelsTestBool(diagnostics, "redacted"), true)
+        @Expect(diagnostics.get("checkedInputs").getOrThrow().asArray().toJsonString().contains("threadSession"), true)
+        @Expect(diagnostics.get("checkedInputs").getOrThrow().asArray().toJsonString().contains("media"), true)
+        let account = diagnostics.get("account").getOrThrow().asObject()
+        @Expect(channelsTestString(account, "defaultAccountId"), "tenant-a")
+        @Expect(account.toJsonString().contains("tenant-secret-never-visible"), false)
+        let receiveMode = diagnostics.get("receiveMode").getOrThrow().asObject()
+        @Expect(channelsTestString(receiveMode, "mode"), "webhook")
+        let groupPolicy = diagnostics.get("groupPolicy").getOrThrow().asObject()
+        @Expect(channelsTestString(groupPolicy, "mode"), "allowlist")
+        @Expect(channelsTestBool(groupPolicy, "requireMention"), false)
+        @Expect(channelsTestBool(groupPolicy, "allowBots"), true)
+        let threadSession = diagnostics.get("threadSession").getOrThrow().asObject()
+        @Expect(channelsTestBool(threadSession, "enabled"), true)
+        @Expect(threadSession.get("skippedReasons").getOrThrow().asArray().toJsonString().contains("thread_not_capable"), true)
+        let media = diagnostics.get("media").getOrThrow().asObject()
+        @Expect(channelsTestBool(media, "downloadEnabled"), true)
+        @Expect(channelsTestInt(media, "mediaMaxBytes"), 8192)
+        let raw = diagnostics.toJsonString()
+        @Expect(raw.contains("unsupportedFields"), true)
+        @Expect(raw.contains("ignoredFields"), true)
+        @Expect(raw.contains("accounts.tenant-a.footer"), true)
+        @Expect(raw.contains("accounts.tenant-a.uat"), true)
+        @Expect(raw.contains("accounts.tenant-a.dedup"), true)
+        @Expect(raw.contains("accounts.tenant-a.groups.oc_team.respondToMentionAll"), true)
+        @Expect(raw.contains("legacy-secret-never-visible"), false)
+        @Expect(raw.contains("tenant-secret-never-visible"), false)
+    }
+
+    @TestCase
     public func telegramChannelsRuntimeExposesNativeRuntimeView(): Unit {
         var user = GatewayUserSettings()
         user.telegram.enabled = true
