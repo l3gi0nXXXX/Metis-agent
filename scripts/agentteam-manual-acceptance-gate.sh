@@ -59,6 +59,8 @@ write_evidence_pack() {
   cat >"$report_json" <<JSON
 {
   "kind": "metis-agentteam-manual-acceptance-evidence",
+  "series": "17",
+  "phases": "0-1",
   "createdAt": "$created_at",
   "gitHead": "$head",
   "metisHome": "$METIS_HOME_CANONICAL",
@@ -121,11 +123,11 @@ JSON
 | Feishu tenant/user/group/thread | TODO skipped/pass/fail | redacted id only |
 | Provider key for per-agent model smoke | TODO skipped/pass/fail | source summary only |
 
-## Phase 2 Core AgentTeam Regression
+## Phase 1 Core AgentTeam CLI/RPC Acceptance
 
 | Check | Result | Evidence |
 | --- | --- | --- |
-| CLI template team create/list/get/delete | TODO pass/fail | TODO |
+| CLI team create/list/get/update/delete | TODO pass/fail | TODO |
 | CLI custom members and aliases | TODO pass/fail | TODO |
 | RPC agents.teams create/list/get/update/delete | TODO pass/fail | TODO |
 | Profile files list/get/set including BOOTSTRAP.md creation | TODO pass/fail | TODO |
@@ -170,15 +172,15 @@ METIS_HOME_VALUE="${METIS_HOME:-}"
 
 REAL_HOME="$(cd "$HOME" && pwd -P)/.metis"
 METIS_HOME_CANONICAL="$(mkdir -p "$METIS_HOME_VALUE" && cd "$METIS_HOME_VALUE" && pwd -P)"
-if [[ "$METIS_HOME_CANONICAL" == "$REAL_HOME" && "${METIS_AGENTTEAM_ALLOW_REAL_HOME:-0}" != "1" ]]; then
-  fail "METIS_HOME points at the real home ($REAL_HOME). Use a test home or set METIS_AGENTTEAM_ALLOW_REAL_HOME=1 deliberately."
+if [[ "$METIS_HOME_CANONICAL" == "$REAL_HOME" ]]; then
+  fail "METIS_HOME points at the real home ($REAL_HOME). Use an isolated test home."
 fi
 info "METIS_HOME=$METIS_HOME_CANONICAL"
 
 REPORT_DIR_VALUE="${METIS_AGENTTEAM_REPORT_DIR:-$METIS_HOME_CANONICAL/agentteam-manual-acceptance-report}"
 mkdir -p "$REPORT_DIR_VALUE"
 REPORT_DIR_CANONICAL="$(cd "$REPORT_DIR_VALUE" && pwd -P)"
-if [[ "$REPORT_DIR_CANONICAL" == "$REAL_HOME"* && "${METIS_AGENTTEAM_ALLOW_REAL_HOME:-0}" != "1" ]]; then
+if [[ "$REPORT_DIR_CANONICAL" == "$REAL_HOME"* ]]; then
   fail "report dir points inside the real home ($REAL_HOME). Use METIS_AGENTTEAM_REPORT_DIR outside the real home."
 fi
 write_evidence_pack "$REPORT_DIR_CANONICAL"

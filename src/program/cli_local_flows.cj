@@ -542,10 +542,11 @@ private func printGatewayAgentTeamResult(action: String, result: JsonObject): In
     CLI_EXIT_OK
 }
 
-private func cliAgentsTeamHasAnyUpdateField(params: JsonObject): Bool {
+func cliAgentsTeamHasAnyUpdateField(params: JsonObject): Bool {
     match (params.get("displayName")) { case Some(_) => return true case None => () }
     match (params.get("members")) { case Some(_) => return true case None => () }
     match (params.get("aliases")) { case Some(_) => return true case None => () }
+    match (params.get("bindings")) { case Some(_) => return true case None => () }
     false
 }
 

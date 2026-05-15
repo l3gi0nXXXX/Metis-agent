@@ -65,6 +65,23 @@ public class CliLocalFlowsAgentTeamTest {
     }
 
     @TestCase
+    public func updateTeamAcceptsBindingOnlyAsMutationField(): Unit {
+        let spec = cliBuildAgentsTeamRpcSpec([
+            "team",
+            "update",
+            "--team",
+            "content",
+            "--binding-json",
+            "{\"type\":\"route\",\"agentId\":\"content-writer\",\"match\":{\"channel\":\"telegram\",\"accountId\":\"bot-a\"}}"
+        ]).getOrThrow()
+
+        @Expect(spec.method, "agents.teams.update")
+        @Expect(spec.params.get("id").getOrThrow().asString().getValue(), "content")
+        @Expect(spec.params.get("bindings").getOrThrow().asArray().size(), 1)
+        @Expect(cliAgentsTeamHasAnyUpdateField(spec.params), true)
+    }
+
+    @TestCase
     public func buildsTeamBindingRpcParamsFromInlineJsonAndLegacyBindFlags(): Unit {
         let spec = cliBuildAgentsTeamRpcSpec([
             "team",
