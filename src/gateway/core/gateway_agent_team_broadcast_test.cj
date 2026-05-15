@@ -147,10 +147,12 @@ private func broadcastRequest(root: JsonObject, channelName!: String = "fake", a
         peerId: peerId,
         senderId: "user-1",
         conversationId: peerId,
+        threadId: if (peerKind == "topic") { peerId } else { "" },
         sourceMessageId: "msg-1",
         chatType: Some(ChatType.Group),
         dmScope: "per-chat",
         replyToMessageId: "msg-1",
+        replyInThread: peerKind == "topic",
         deliver: true,
         mediaContext: broadcastMediaContext(channelName: channelName, accountId: accountId, peerKind: peerKind,
             peerId: peerId, parentPeerKind: parentPeerKind, parentPeerId: parentPeerId),
@@ -254,6 +256,80 @@ public class GatewayAgentTeamBroadcastTest {
             @Expect(executableWriterContext.sessionKey, "agent:writer:fake:group:room-1")
             @Expect(broadcastRouteString(executableWriterContext.turnContext.route, "matchedBy"), "broadcast.team")
             @Expect(broadcastRouteString(executableWriterContext.turnContext.route, "broadcastTeamId"), "content")
+        })
+    }
+
+    @TestCase
+    public func broadcastSkipsInvalidSelectedMembersButKeepsValidFanout(): Unit {
+        withBroadcastTempHome("invalid-selected", { home: Path =>
+            let team = broadcastTeam(Some(JsonBool(true)), selectedMembers: ["writer", "ghost", "outsider"])
+            let members = team.get("members").getOrThrow().asArray()
+            members.add(broadcastMember("ghost"))
+            let root = broadcastRoot(home, team)
+            writeBroadcastRoot(root)
+            let plan = gatewayResolveAgentTeamBroadcastPlan(broadcastRequest(root))
+
+            @Expect(plan.enabled, true)
+            @Expect(plan.selectedAgentIds.size, 1)
+            @Expect(plan.selectedAgentIds[0], "writer")
+            @Expect(plan.turns.size, 1)
+            @Expect(plan.turns[0].context.agentId, "writer")
+            @Expect(plan.diagnostics.contains("broadcast-member-unknown-agent:content:ghost"), true)
+            @Expect(plan.diagnostics.contains("broadcast-member-not-in-team:content:outsider"), true)
+        })
+    }
+
+    @TestCase
+    public func broadcastPreservesIngressAccountThreadAndMediaRouteForTelegramFanout(): Unit {
+        withBroadcastTempHome("telegram-route-preserve", { home: Path =>
+            let root = broadcastRoot(
+                home,
+                broadcastTeam(
+                    Some(JsonBool(true)),
+                    selectedMembers: ["writer"],
+                    channelName: "telegram",
+                    peerKind: "topic",
+                    peerId: "42",
+                    accountId: "*"
+                ),
+                channelName: "telegram",
+                accountId: "bot-a"
+            )
+            writeBroadcastRoot(root)
+            let plan = gatewayResolveAgentTeamBroadcastPlan(
+                broadcastRequest(
+                    root,
+                    channelName: "telegram",
+                    accountId: "bot-b",
+                    peerKind: "topic",
+                    peerId: "42",
+                    parentPeerKind: "group",
+                    parentPeerId: "-100_acceptance"
+                )
+            )
+
+            @Expect(plan.enabled, true)
+            @Expect(plan.turns.size, 1)
+            let turn = plan.turns[0]
+            @Expect(turn.request.accountId, "bot-b")
+            @Expect(turn.request.replyAccountId, "bot-b")
+            @Expect(turn.request.threadId, "42")
+            @Expect(turn.request.replyInThread, true)
+            match (turn.context.deliveryTarget) {
+                case Some(target) =>
+                    @Expect(target.accountId, "bot-b")
+                    @Expect(target.peerId, "42")
+                    @Expect(target.threadId, "42")
+                    @Expect(target.replyInThread, true)
+                case None => @Expect("missing", "delivery-target")
+            }
+            let imRoute = turn.request.mediaContext.get("context").getOrThrow().asObject()
+                .get("imRoute").getOrThrow().asObject()
+            @Expect(broadcastRouteString(imRoute, "accountId"), "bot-b")
+            @Expect(broadcastRouteString(imRoute, "peerKind"), "topic")
+            @Expect(broadcastRouteString(imRoute, "peerId"), "42")
+            @Expect(broadcastRouteString(imRoute, "parentPeerKind"), "group")
+            @Expect(broadcastRouteString(imRoute, "parentPeerId"), "-100_acceptance")
         })
     }
 

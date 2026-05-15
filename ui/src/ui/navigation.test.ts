@@ -59,6 +59,7 @@ describe("titleForTab", () => {
     expect(titleForTab("chat")).toBe("Chat");
     expect(titleForTab("overview")).toBe("Overview");
     expect(titleForTab("cron")).toBe("Cron Jobs");
+    expect(titleForTab("agentTeams")).toBe("Agent Teams");
   });
 });
 
@@ -117,6 +118,7 @@ describe("pathForTab", () => {
   it("returns correct path without base", () => {
     expect(pathForTab("chat")).toBe("/chat");
     expect(pathForTab("overview")).toBe("/overview");
+    expect(pathForTab("agentTeams")).toBe("/agent-teams");
   });
 
   it("prepends base path", () => {
@@ -130,6 +132,7 @@ describe("tabFromPath", () => {
     expect(tabFromPath("/chat")).toBe("chat");
     expect(tabFromPath("/overview")).toBe("overview");
     expect(tabFromPath("/sessions")).toBe("sessions");
+    expect(tabFromPath("/agent-teams")).toBe("agentTeams");
     expect(tabFromPath("/dreaming")).toBe("dreams");
     expect(tabFromPath("/dreams")).toBe("dreams");
   });
@@ -161,6 +164,7 @@ describe("inferBasePathFromPathname", () => {
   it("returns empty string for direct tab path", () => {
     expect(inferBasePathFromPathname("/chat")).toBe("");
     expect(inferBasePathFromPathname("/overview")).toBe("");
+    expect(inferBasePathFromPathname("/agent-teams")).toBe("");
     expect(inferBasePathFromPathname("/dreaming")).toBe("");
     expect(inferBasePathFromPathname("/dreams")).toBe("");
   });
@@ -183,6 +187,7 @@ describe("TAB_GROUPS", () => {
     expect(labels).toContain("control");
     expect(labels).toContain("agent");
     expect(labels).toContain("settings");
+    expect(TAB_GROUPS.find((g) => g.label === "agent")?.tabs).toContain("agentTeams");
   });
 
   it("all tabs are unique", () => {

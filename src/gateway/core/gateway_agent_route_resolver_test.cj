@@ -321,6 +321,59 @@ public class GatewayAgentRouteResolverTest {
     }
 
     @TestCase
+    public func accountSpecificPeerBindingWinsOverEarlierWildcardPeerBinding(): Unit {
+        let root = routeTestConfig()
+        putBindings(
+            root,
+            [
+                peerBinding("assistant-b", "telegram", "group", "-100_acceptance", accountId: "*"),
+                peerBinding("ops", "telegram", "group", "-100_acceptance", accountId: "bot-a")
+            ]
+        )
+
+        let botA = gatewayResolveAgentRoute(
+            GatewayAgentRouteInput(root, "telegram", accountId: "bot-a", peerKind: "group", peerId: "-100_acceptance")
+        )
+        @Expect(botA.agentId, "ops")
+        @Expect(botA.matchedBy, "binding.peer.exact")
+        @Expect(botA.accountId, "bot-a")
+        @Expect(botA.preferredAccountId, "bot-a")
+
+        let botB = gatewayResolveAgentRoute(
+            GatewayAgentRouteInput(root, "telegram", accountId: "bot-b", peerKind: "group", peerId: "-100_acceptance")
+        )
+        @Expect(botB.agentId, "assistant-b")
+        @Expect(botB.matchedBy, "binding.peer.exact")
+        @Expect(botB.accountId, "bot-b")
+    }
+
+    @TestCase
+    public func explicitAgentIdBypassesBindingsButStillUsesAgentScopedSessions(): Unit {
+        let root = routeTestConfig()
+        putBindings(root, [peerBinding("ops", "telegram", "group", "-100_acceptance", accountId: "*")])
+
+        let route = gatewayResolveAgentRoute(
+            GatewayAgentRouteInput(
+                root,
+                "telegram",
+                accountId: "bot-b",
+                peerKind: "topic",
+                peerId: "42",
+                parentPeerKind: "group",
+                parentPeerId: "-100_acceptance",
+                explicitAgentId: "reviewer",
+                explicitMatchedBy: "broadcast.team"
+            )
+        )
+
+        @Expect(route.agentId, "reviewer")
+        @Expect(route.matchedBy, "broadcast.team")
+        @Expect(route.accountId, "bot-b")
+        @Expect(route.sessionKey, "agent:reviewer:telegram:topic:42")
+        @Expect(route.mainSessionKey, "agent:reviewer:main")
+    }
+
+    @TestCase
     public func telegramAndFeishuTopicThreadRoutesBuildAgentScopedSessionKeys(): Unit {
         let root = routeTestConfig()
         putBindings(

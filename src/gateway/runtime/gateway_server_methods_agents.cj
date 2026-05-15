@@ -2080,12 +2080,20 @@ private func gatewayAgentBindingConflictError(conflicts: Array<GatewayAgentBindi
 
 private func gatewayAgentTeamProductSemanticsJson(): JsonObject {
     let out = JsonObject()
+    let crudMethods = JsonArray([])
+    for (method in ["list", "get", "create", "update", "delete"]) {
+        crudMethods.add(JsonString(method))
+    }
     out.put("singleRoute", JsonString("deterministic-single-agent"))
     out.put("broadcast", JsonString("explicit-fan-out"))
     out.put("manager", JsonString("member-or-default-agent-only"))
     out.put("autonomousManagerRuntime", JsonBool(false))
     out.put("crudSurface", JsonString("cli-ui-gateway-rpc"))
+    out.put("crudMethods", crudMethods)
     out.put("imSurface", JsonString("runtime-route-alias-native-command"))
+    out.put("nativeCommandSurface", JsonString("runtime-route-native-command-only"))
+    out.put("deletePreservesMemberAgents", JsonBool(true))
+    out.put("deletePreservesUserWorkspaces", JsonBool(true))
     return out
 }
 

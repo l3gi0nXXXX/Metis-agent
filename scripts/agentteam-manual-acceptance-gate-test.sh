@@ -50,10 +50,19 @@ run_gate "$fake_home" "$metis_home" "$report_dir" "$TMP_ROOT/success.log"
 
 [[ -f "$report_dir/report.json" ]] || fail "report.json was not written"
 [[ -f "$report_dir/manual-acceptance-template.md" ]] || fail "manual-acceptance-template.md was not written"
-assert_file_contains "$report_dir/report.json" '"series": "17"'
-assert_file_contains "$report_dir/report.json" '"phases": "0-1"'
+assert_file_contains "$report_dir/report.json" '"series": "19"'
+assert_file_contains "$report_dir/report.json" '"phases": "0-9"'
+assert_file_contains "$report_dir/report.json" '"acceptance"'
+assert_file_contains "$report_dir/report.json" '"id": "phase2"'
+assert_file_contains "$report_dir/report.json" '"id": "G02"'
+assert_file_contains "$report_dir/report.json" '"id": "G11"'
+assert_file_contains "$report_dir/report.json" '"status": "local-pass"'
+assert_file_contains "$report_dir/report.json" '"status": "external-resource-required"'
 assert_file_contains "$report_dir/report.json" '"storesRealMetisHome": false'
 assert_file_contains "$report_dir/manual-acceptance-template.md" '## Phase 0 Evidence Freeze'
+assert_file_contains "$report_dir/manual-acceptance-template.md" '## Phase 2 Agent Isolation Acceptance'
+assert_file_contains "$report_dir/manual-acceptance-template.md" '\| G02 \|'
+assert_file_contains "$report_dir/manual-acceptance-template.md" '\| G11 \| external-resource-required \|'
 assert_file_contains "$report_dir/manual-acceptance-template.md" '## Phase 1 Core AgentTeam CLI/RPC Acceptance'
 assert_file_contains "$report_dir/manual-acceptance-template.md" 'CLI team create/list/get/update/delete'
 assert_file_contains "$report_dir/manual-acceptance-template.md" 'RPC agents.teams create/list/get/update/delete'

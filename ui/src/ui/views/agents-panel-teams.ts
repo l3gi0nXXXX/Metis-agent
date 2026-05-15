@@ -97,6 +97,7 @@ export function renderAgentTeamsPanel(props: AgentTeamsPanelProps) {
       ? props.selectedId
       : "New team";
   return html`
+    ${renderAgentTeamManagementSummary(props, teams, activeMembers, activeAliases, activeBroadcast)}
     ${renderWorkflowStrip(props, activeMembers, activeBroadcast)}
     ${renderTeamWizardCard(props, activeMembers)}
     ${renderFeishuSetupRepairWizard(props)}
@@ -134,6 +135,74 @@ export function renderAgentTeamsPanel(props: AgentTeamsPanelProps) {
 
     <section style="margin-top: 16px;">
       ${renderDoctorPanel(props, teams, activeMembers)}
+    </section>
+  `;
+}
+
+function renderAgentTeamManagementSummary(
+  props: AgentTeamsPanelProps,
+  teams: AgentTeam[],
+  members: AgentTeamMember[],
+  aliases: AgentTeamAliasDraft[],
+  broadcast: Record<string, unknown>,
+) {
+  const selectedName = props.detail ? teamDisplayName(props.detail) : "Start with a template";
+  const bindingCount = safeJsonArrayLength(props.draft.bindingsJson);
+  const nextAction = resolveAgentTeamNextAction(props, teams, members, bindingCount);
+  return html`
+    <section class="card" style="margin-bottom: 16px;">
+      <div class="row" style="justify-content: space-between; align-items: flex-start;">
+        <div>
+          <div class="card-title">Agent Team Management</div>
+          <div class="card-sub">
+            Create teams, review member state, repair channel setup, and then bind Feishu or Telegram routes from one place.
+          </div>
+        </div>
+        <span class="badge">${props.saving ? "saving" : props.loading ? "loading" : "ready"}</span>
+      </div>
+      <div class="agents-overview-grid" style="margin-top: 14px;">
+        <div class="agent-kv">
+          <div class="label">Teams</div>
+          <div>${formatCount(teams.length, "team")}</div>
+        </div>
+        <div class="agent-kv">
+          <div class="label">Selected path</div>
+          <div>${selectedName}</div>
+        </div>
+        <div class="agent-kv">
+          <div class="label">Members and aliases</div>
+          <div>${formatCount(members.length, "member")} · ${formatCount(aliases.length, "alias")}</div>
+        </div>
+        <div class="agent-kv">
+          <div class="label">Bindings and broadcast</div>
+          <div>${formatCount(bindingCount, "binding")} · ${broadcastEnabled(broadcast) ? "broadcast on" : "broadcast off"}</div>
+        </div>
+        <div class="agent-kv">
+          <div class="label">Telegram</div>
+          <div>${channelReadinessLabel(props, "telegram")}</div>
+        </div>
+        <div class="agent-kv">
+          <div class="label">Feishu</div>
+          <div>${channelReadinessLabel(props, "feishu")}</div>
+        </div>
+        <div class="agent-kv">
+          <div class="label">Next action</div>
+          <div>${nextAction}</div>
+        </div>
+      </div>
+      ${props.error
+        ? html`
+            <div class="callout danger" style="margin-top: 12px;">
+              <div class="list-title">Repair first</div>
+              <div class="list-sub">
+                ${redactSecretText(props.error)}. Refresh Gateway status or check the current Control UI token and agent-team RPC permission before editing.
+              </div>
+            </div>
+          `
+        : nothing}
+      <div class="callout info" style="margin-top: 12px;">
+        Control UI cannot automatically create a Feishu app or bot; it supports guided setup and linking an existing bot through Gateway status, OAuth, and repair steps. Create or install the bot in Feishu developer console first, then associate it here.
+      </div>
     </section>
   `;
 }
@@ -274,7 +343,7 @@ function renderFeishuExistingAppBotFlow(props: AgentTeamsPanelProps, defaultAcco
     <div class="callout info" style="margin-top: 12px;">
       <div class="list-title">Link existing Feishu app/bot</div>
       <div class="list-sub">
-        Associate existing app/bot by confirming developer-console credentials, event URL, scopes, bot installation, and a test message through Gateway status. Control UI never stores app secrets or token files.
+        Associate existing app/bot by confirming developer-console credentials, event URL, scopes, bot installation, and a test message through Gateway status. Control UI cannot automatically create a Feishu app or bot; it only provides guided setup and linking an existing bot. Control UI never stores app secrets or token files.
       </div>
       <div class="row" style="gap: 8px; margin-top: 10px;">
         <button
@@ -688,10 +757,21 @@ function renderTeamsList(props: AgentTeamsPanelProps, teams: AgentTeam[]) {
           </button>
         </div>
       </div>
-      ${props.error ? html`<div class="callout danger" style="margin-top: 12px;">${props.error}</div>` : nothing}
+      ${props.error
+        ? html`
+            <div class="callout danger" style="margin-top: 12px;">
+              <div class="list-title">Repair first</div>
+              <div class="list-sub">${redactSecretText(props.error)}</div>
+            </div>
+          `
+        : nothing}
       ${props.success ? html`<div class="callout success" style="margin-top: 12px;">${props.success}</div>` : nothing}
       ${teams.length === 0
-        ? html`<div class="callout info" style="margin-top: 12px;">No teams are configured yet.</div>`
+        ? html`
+            <div class="callout info" style="margin-top: 12px;">
+              No teams are configured yet. Create from a template or import a Metis team template, then add members, bindings, profiles, models, and channel setup.
+            </div>
+          `
         : html`
             <div class="list" style="margin-top: 16px;">
               ${teams.map(
@@ -2149,7 +2229,56 @@ function duplicateStrings(values: string[]): string[] {
 }
 
 function formatCount(count: number, label: string): string {
-  return `${count} ${label}${count === 1 ? "" : "s"}`;
+  if (count === 1) {
+    return `${count} ${label}`;
+  }
+  const plural = label === "alias" ? "aliases" : `${label}s`;
+  return `${count} ${plural}`;
+}
+
+function resolveAgentTeamNextAction(
+  props: AgentTeamsPanelProps,
+  teams: AgentTeam[],
+  members: AgentTeamMember[],
+  bindingCount: number,
+): string {
+  if (props.error) {
+    return "Repair Gateway RPC access";
+  }
+  if (teams.length === 0 && members.length === 0) {
+    return "Start with a template";
+  }
+  if (members.length === 0) {
+    return "Add team members";
+  }
+  if (bindingCount === 0 && !props.bindingPreview?.applyPayload) {
+    return "Preview a channel binding";
+  }
+  if (!props.workspace.workspace) {
+    return "Load member profile files";
+  }
+  if (!props.modelResult?.models) {
+    return "Load member model state";
+  }
+  if (channelIsReady(props, "feishu") || channelIsReady(props, "telegram")) {
+    return "Review and save team changes";
+  }
+  return "Repair channel setup";
+}
+
+function channelReadinessLabel(props: AgentTeamsPanelProps, channel: "feishu" | "telegram"): string {
+  const label = channel === "feishu" ? "Feishu" : "Telegram";
+  return `${label} ${channelIsReady(props, channel) ? "ready" : "needs setup"}`;
+}
+
+function channelIsReady(props: AgentTeamsPanelProps, channel: "feishu" | "telegram"): boolean {
+  const status = objectValue(props.channelsSnapshot?.channels?.[channel]);
+  const accounts = props.channelsSnapshot?.channelAccounts?.[channel] ?? [];
+  return (
+    status?.configured === true ||
+    status?.running === true ||
+    accounts.some((account) => account.configured === true || account.running === true || account.connected === true)
+  );
 }
 
 function stringArrayFromUnknown(value: unknown): string[] {

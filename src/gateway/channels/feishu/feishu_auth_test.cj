@@ -464,6 +464,98 @@ public class FeishuAuthFoundationTest {
     }
 
     @TestCase
+    public func nativeAuthPollRejectsAuthorizedTokenMissingOfflineAccessWithoutPersistingSecret(): Unit {
+        let root = Path("/tmp/metis-feishu-native-auth-missing-offline-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
+        try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        try {
+            var user = GatewayUserSettings()
+            user.feishu.defaultAccount = "tenant-a"
+            user.feishu.appId = "app-id"
+            user.feishu.appSecret = "app-secret-never-visible"
+            let tokenStore = FeishuFileTokenStore(root.join("tokens"))
+            let sessionStore = FeishuFileAuthSessionStore(root.join("sessions"))
+            sessionStore.save("tenant-a", FeishuPendingUserAuth(
+                deviceCode: "device-1",
+                userCode: "ABCD-EFGH",
+                verificationUri: "https://verify.example/activate",
+                expiresAtMs: 600000,
+                intervalSeconds: 5
+            ))
+
+            let result = feishuGatewayNativeAuthPollWithClient(
+                "tenant-a",
+                user,
+                FeishuAuthFakeHttpClient(tokenBody: "{\"access_token\":\"uat-secret\",\"refresh_token\":\"refresh-secret\",\"expires_in\":7200,\"scope\":\"im:message\"}"),
+                tokenStore,
+                sessionStore,
+                nowMs: 2000
+            )
+            let diagnostic = result.get("scopeDiagnostic").getOrThrow().asObject()
+            let raw = result.toJsonString()
+
+            @Expect(feishuAuthTestString(result, "status"), "scope_missing")
+            @Expect(feishuAuthTestString(result, "tokenStatus"), "missing")
+            @Expect(diagnostic.get("status").getOrThrow().asString().getValue(), "missing_user_scope")
+            @Expect(diagnostic.get("missingUserScopes").getOrThrow().asArray()[0].asString().getValue(), "offline_access")
+            @Expect(tokenStore.load("tenant-a").isNone(), true)
+            @Expect(sessionStore.load("tenant-a").isNone(), true)
+            @Expect(raw.contains("uat-secret"), false)
+            @Expect(raw.contains("refresh-secret"), false)
+            @Expect(raw.contains("app-secret-never-visible"), false)
+            @Expect(raw.contains("device-1"), false)
+        } finally {
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func nativeAuthRefreshRejectsMissingOfflineAccessAndKeepsStoredSecretsRedacted(): Unit {
+        let root = Path("/tmp/metis-feishu-native-auth-refresh-offline-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
+        try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        try {
+            var user = GatewayUserSettings()
+            user.feishu.defaultAccount = "tenant-a"
+            user.feishu.appId = "app-id"
+            user.feishu.appSecret = "app-secret-never-visible"
+            let tokenStore = FeishuFileTokenStore(root.join("tokens"))
+            let sessionStore = FeishuFileAuthSessionStore(root.join("sessions"))
+            let nowMs = DateTime.now().toUnixTimeStamp().toMilliseconds()
+            tokenStore.save("tenant-a", FeishuUserToken(
+                accessToken: "expired-access-secret",
+                refreshToken: "refresh-secret",
+                expiresAtMs: nowMs - 1000,
+                scopes: ["offline_access", "im:message"]
+            ))
+
+            let result = feishuGatewayNativeAuthStatusWithStores(
+                "tenant-a",
+                user,
+                tokenStore,
+                sessionStore,
+                nowMs: nowMs,
+                http: Some<FeishuAuthHttpClient>(FeishuAuthFakeHttpClient(
+                    tokenBody: "{\"access_token\":\"refreshed-access-secret\",\"refresh_token\":\"refreshed-refresh-secret\",\"expires_in\":7200,\"scope\":\"im:message\"}"
+                ))
+            )
+            let diagnostic = result.get("scopeDiagnostic").getOrThrow().asObject()
+            let raw = result.toJsonString()
+
+            @Expect(feishuAuthTestString(result, "status"), "scope_missing")
+            @Expect(feishuAuthTestString(result, "refreshStatus"), "scope_missing")
+            @Expect(diagnostic.get("status").getOrThrow().asString().getValue(), "missing_user_scope")
+            @Expect(diagnostic.get("missingUserScopes").getOrThrow().asArray()[0].asString().getValue(), "offline_access")
+            @Expect(tokenStore.load("tenant-a").getOrThrow().accessToken, "expired-access-secret")
+            @Expect(raw.contains("expired-access-secret"), false)
+            @Expect(raw.contains("refresh-secret"), false)
+            @Expect(raw.contains("refreshed-access-secret"), false)
+            @Expect(raw.contains("refreshed-refresh-secret"), false)
+            @Expect(raw.contains("app-secret-never-visible"), false)
+        } finally {
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
     public func liveAuthSmokeWithoutOptInWritesSkippedFixtureAndDoesNotCallNetwork(): Unit {
         let root = Path("/tmp/metis-feishu-live-auth-skip-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
         try { remove(root, recursive: true) } catch (_e: Exception) { () }

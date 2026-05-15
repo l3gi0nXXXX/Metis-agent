@@ -551,7 +551,7 @@ func cliAgentsTeamHasAnyUpdateField(params: JsonObject): Bool {
 }
 
 public func cliAgentsTeamProductSemanticsHelpText(): String {
-    "Team CRUD is handled by CLI/UI/Gateway RPC. Telegram/Feishu IM are runtime entry points for route bindings, aliases, and native commands; they do not create/update/delete teams. Team route means one deterministic agent, broadcast means explicit fan-out, and manager is a normal member/defaultAgent, not an autonomous manager runtime."
+    "Team CRUD is handled by CLI/UI/Gateway RPC. CRUD methods: list|get|create|update|delete. JSON responses include semantics.crudSurface=cli-ui-gateway-rpc and semantics.imSurface=runtime-route-alias-native-command. Telegram/Feishu IM are runtime entry points for route bindings, aliases, and native commands (runtime route/native command only); they do not create/update/delete teams. Team route means one deterministic agent, broadcast means explicit fan-out, delete preserves member agents/workspaces, and manager is a normal member/defaultAgent, not an autonomous manager runtime."
 }
 
 private func cliRunAgentsTeamFlow(args: Array<String>): Int64 {
@@ -559,7 +559,7 @@ private func cliRunAgentsTeamFlow(args: Array<String>): Int64 {
     if (action.isEmpty() || action == "help") {
         return printLocalFlowUsage(
             "agents team",
-            "Manage AgentTeam definitions through CLI/UI/Gateway RPC. Telegram/Feishu IM only trigger runtime routes, aliases, and native commands; they do not perform team CRUD. Manager is a normal member/defaultAgent, not an autonomous manager runtime.",
+            "Manage AgentTeam definitions through CLI/UI/Gateway RPC. CRUD methods: list|get|create|update|delete. JSON output includes team semantics. Telegram/Feishu IM only trigger runtime routes, aliases, and native commands; they do not perform team CRUD. Manager is a normal member/defaultAgent, not an autonomous manager runtime.",
             [
                 "metis agents team list",
                 "metis agents team get --team content",

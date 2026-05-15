@@ -263,7 +263,10 @@ public class FeishuAdapterTest {
         @Expect(raw.contains("base-secret-never-visible"), false)
         @Expect(raw.contains("tenant-app"), false)
         let firstDescription = descriptions.get("accounts").getOrThrow().asArray().getItems()[0].asObject()
-        @Expect(firstDescription.get("credentialSource").getOrThrow().asString().getValue(), "account")
+        @Expect(firstDescription.get("credentialSource").getOrThrow().asString().getValue(), "mixed")
+        let credentialSources = firstDescription.get("credentialSources").getOrThrow().asObject()
+        @Expect(credentialSources.get("appId").getOrThrow().asString().getValue(), "account")
+        @Expect(credentialSources.get("appSecret").getOrThrow().asString().getValue(), "top-level")
     }
 
     @TestCase
@@ -542,6 +545,81 @@ public class FeishuAdapterTest {
         @Expect(tenantBRoute.get("accountId").getOrThrow().asString().getValue(), "tenant-b")
         @Expect(tenantARoute.get("groupPolicy").getOrThrow().asObject().toJsonString().contains("feishu_fetch_doc"), true)
         @Expect(tenantBRoute.get("groupPolicy").getOrThrow().asObject().toJsonString().contains("tenant-b-disabled-prompt"), true)
+    }
+
+    @TestCase
+    public func multiAccountSnakeCasePolicyAllowlistAndThreadSessionAreAccountScoped(): Unit {
+        let tenantA = JsonObject()
+        tenantA.put("group_policy", JsonString("allowlist"))
+        tenantA.put("group_allow_from", JsonArray([JsonString("oc_shared")]))
+        tenantA.put("require_mention", JsonBool(false))
+        tenantA.put("thread_session", JsonBool(true))
+
+        let tenantB = JsonObject()
+        tenantB.put("group_policy", JsonString("allowlist"))
+        tenantB.put("group_allow_from", JsonArray([]))
+        tenantB.put("require_mention", JsonBool(false))
+        tenantB.put("thread_session", JsonBool(false))
+
+        let accounts = JsonObject()
+        accounts.put("tenant-a", tenantA)
+        accounts.put("tenant-b", tenantB)
+
+        let client = FeishuFakeApiClient()
+        client.setThreadCapable("oc_shared", true)
+        let adapter = FeishuAdapter(
+            config: FeishuConfig(
+                enabled: true,
+                accounts: Some(accounts),
+                groupPolicy: "allowlist",
+                requireMention: true,
+                threadSession: false
+            ),
+            apiClient: client
+        )
+        adapter.start()
+        @Expect(adapter.ingestWebhookPayload(
+            this.webhookPayload(
+                "om_tenant_a_policy",
+                "oc_shared",
+                "ou_1",
+                "{\\\"text\\\":\\\"plain topic message\\\"}",
+                threadId: "omt_a",
+                headerAccountId: "tenant-a"
+            )
+        ).contains("\"ok\":true"), true)
+        @Expect(adapter.ingestWebhookPayload(
+            this.webhookPayload(
+                "om_tenant_b_policy",
+                "oc_shared",
+                "ou_2",
+                "{\\\"text\\\":\\\"plain topic message\\\"}",
+                threadId: "omt_b",
+                headerAccountId: "tenant-b"
+            )
+        ).contains("\"ok\":true"), true)
+
+        let inbound = adapter.pullInbound()
+        @Expect(inbound.size, 2)
+        let tenantARoute = inbound[0].mediaContext.get("context").getOrThrow().asObject()
+            .get("imRoute").getOrThrow().asObject()
+        let tenantAGate = inbound[0].mediaContext.get("context").getOrThrow().asObject()
+            .get("feishuGate").getOrThrow().asObject()
+        let tenantBRoute = inbound[1].mediaContext.get("context").getOrThrow().asObject()
+            .get("imRoute").getOrThrow().asObject()
+        let tenantBGate = inbound[1].mediaContext.get("context").getOrThrow().asObject()
+            .get("feishuGate").getOrThrow().asObject()
+
+        @Expect(inbound[0].accountId, "tenant-a")
+        @Expect(inbound[1].accountId, "tenant-b")
+        @Expect(tenantAGate.get("triggerAgent").getOrThrow().asBool().getValue(), true)
+        @Expect(tenantAGate.get("reason").getOrThrow().asString().getValue(), "accepted")
+        @Expect(tenantARoute.get("threadSessionKey").getOrThrow().asString().getValue(), "oc_shared:topic:omt_a")
+        @Expect(inbound[0].conversationId.getOrThrow(), "oc_shared:topic:omt_a")
+        @Expect(tenantBGate.get("triggerAgent").getOrThrow().asBool().getValue(), false)
+        @Expect(tenantBGate.get("reason").getOrThrow().asString().getValue(), "group_not_allowed")
+        @Expect(tenantBRoute.get("threadSessionKey").isNone(), true)
+        @Expect(client.threadCapabilityChecks("oc_shared"), 1)
     }
 
     @TestCase

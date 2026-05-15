@@ -3,6 +3,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { shouldMetisAppRenderForChangedKeys } from "./app-render-boundary.ts";
+import { TAB_GROUPS, pathForTab, tabFromPath, titleForTab } from "./navigation.ts";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const uiRoot = path.resolve(here, "../..");
@@ -110,5 +111,12 @@ describe("Metis control-ui contracts", () => {
     expect(index).toContain("metis.control.token.v1");
     expect(index).toContain("writeTokenVariants(sessionStorage");
     expect(index).not.toContain("writeTokenVariants(localStorage");
+  });
+
+  it("exposes Agent Teams as a first-class Control UI route", () => {
+    expect(TAB_GROUPS.find((group) => group.label === "agent")?.tabs).toContain("agentTeams");
+    expect(titleForTab("agentTeams")).toBe("Agent Teams");
+    expect(pathForTab("agentTeams")).toBe("/agent-teams");
+    expect(tabFromPath("/agent-teams")).toBe("agentTeams");
   });
 });

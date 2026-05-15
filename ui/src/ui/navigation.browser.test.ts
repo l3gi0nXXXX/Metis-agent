@@ -92,6 +92,22 @@ describe("control UI routing", () => {
     expect(dreamsLink).not.toBeNull();
   });
 
+  it("exposes Agent Teams as a direct sidebar destination", async () => {
+    const app = mountApp("/chat");
+    await app.updateComplete;
+
+    const link = app.querySelector<HTMLAnchorElement>('a.nav-item[href="/agent-teams"]');
+    expect(link).not.toBeNull();
+    expect(link?.textContent).toContain("Agent Teams");
+
+    link?.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, button: 0 }));
+
+    await app.updateComplete;
+    expect(app.tab).toBe("agentTeams");
+    expect(app.agentsPanel).toBe("teams");
+    expect(window.location.pathname).toBe("/agent-teams");
+  });
+
   it("renders the refreshed top navigation shell", async () => {
     const app = mountApp("/chat");
     await app.updateComplete;

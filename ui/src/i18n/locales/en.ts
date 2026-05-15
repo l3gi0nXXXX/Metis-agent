@@ -155,6 +155,7 @@ export const en: TranslationMap = {
   },
   tabs: {
     agents: "Agents",
+    agentTeams: "Agent Teams",
     overview: "Overview",
     channels: "Channels",
     instances: "Instances",
@@ -176,6 +177,7 @@ export const en: TranslationMap = {
   },
   subtitles: {
     agents: "Workspaces, tools, identities.",
+    agentTeams: "Team creation, routing, profiles, models, and channel setup.",
     overview: "Status, entry points, health.",
     channels: "Channels and settings.",
     instances: "Connected clients and nodes.",

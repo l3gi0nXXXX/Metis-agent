@@ -1025,7 +1025,7 @@ export function renderApp(state: AppViewState) {
               }),
             )
           : nothing}
-        ${state.tab === "agents"
+        ${state.tab === "agents" || state.tab === "agentTeams"
           ? lazyRender(lazyAgents, (m) =>
               m.renderAgents({
                 basePath: state.basePath ?? "",
@@ -1033,7 +1033,7 @@ export function renderApp(state: AppViewState) {
                 error: state.agentsError,
                 agentsList: state.agentsList,
                 selectedAgentId: resolvedAgentId,
-                activePanel: state.agentsPanel,
+                activePanel: state.tab === "agentTeams" ? "teams" : state.agentsPanel,
                 config: {
                   form: configValue,
                   loading: state.configLoading,
@@ -1187,6 +1187,13 @@ export function renderApp(state: AppViewState) {
                 },
                 onSelectPanel: (panel) => {
                   state.agentsPanel = panel;
+                  if (panel === "teams" && state.tab !== "agentTeams") {
+                    state.setTab("agentTeams" as import("./navigation.ts").Tab);
+                    return;
+                  }
+                  if (panel !== "teams" && state.tab === "agentTeams") {
+                    state.setTab("agents" as import("./navigation.ts").Tab);
+                  }
                   if (panel === "files" && resolvedAgentId) {
                     if (state.agentFilesList?.agentId !== resolvedAgentId) {
                       state.agentFilesList = null;

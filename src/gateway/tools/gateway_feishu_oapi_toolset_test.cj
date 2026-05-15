@@ -54,6 +54,30 @@ private class FeishuOapiToolsetAuthRequiredTokenProvider <: FeishuOapiTokenProvi
     }
 }
 
+private class FeishuOapiToolsetSecretErrorTokenProvider <: FeishuOapiTokenProvider {
+    private let statusValue: String
+
+    public init(status: String) {
+        this.statusValue = status.trimAscii()
+    }
+
+    public func userAccessToken(_accountId: String, requiredScopes: Array<String>): FeishuOapiTokenLookup {
+        this.lookup(requiredScopes)
+    }
+
+    public func tokenLookup(_accountId: String, _tokenMode: String, requiredScopes: Array<String>): FeishuOapiTokenLookup {
+        this.lookup(requiredScopes)
+    }
+
+    private func lookup(requiredScopes: Array<String>): FeishuOapiTokenLookup {
+        FeishuOapiTokenLookup(
+            this.statusValue,
+            missingScopes: requiredScopes,
+            error: "Authorization: Bearer secret-token-value refresh_token=secret-token-value app_secret=secret-token-value"
+        )
+    }
+}
+
 private class FeishuOapiToolsetAppScopeMissingTokenProvider <: FeishuOapiTokenProvider {
     public init() {}
 
@@ -1146,6 +1170,26 @@ public class GatewayFeishuOapiToolsetTest {
         @Expect(json.get("action_key").getOrThrow().asString().getValue(), "feishu_chat.explode")
         @Expect(json.get("supported_actions").getOrThrow().asArray()[0].asString().getValue(), "get")
         @Expect(json.toJsonString().contains("Bearer"), false)
+    }
+
+    @TestCase
+    public func oapiStatusDiagnosticsRedactSecretBearingErrorText(): Unit {
+        let request = feishuOapiBuildRequest("feishu_chat", "get", "tenant-a", JsonObject())
+        let statuses = ["auth_required", "scope_missing", "app_scope_missing", "missing_credential", "api_error"]
+        for (status in statuses) {
+            let json = MetisFeishuOapiClient(
+                tokenProvider: Some<FeishuOapiTokenProvider>(FeishuOapiToolsetSecretErrorTokenProvider(status)),
+                httpClient: Some<FeishuOapiHttpClient>(FeishuOapiToolsetCountingHttpClient())
+            ).invoke(request)
+            @Expect(json.get("status").getOrThrow().asString().getValue(), status)
+            let raw = json.toJsonString()
+            @Expect(raw.contains("[redacted]"), true)
+            @Expect(raw.contains("secret-token-value"), false)
+            @Expect(raw.contains("Bearer"), false)
+            @Expect(raw.contains("Authorization"), false)
+            @Expect(raw.contains("refresh_token"), false)
+            @Expect(raw.contains("app_secret"), false)
+        }
     }
 
     @TestCase

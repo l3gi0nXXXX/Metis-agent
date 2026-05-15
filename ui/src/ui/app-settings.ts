@@ -248,7 +248,10 @@ export async function refreshActiveTab(host: SettingsHost) {
   if (host.tab === "skills") {
     await loadSkills(host as unknown as MetisApp);
   }
-  if (host.tab === "agents") {
+  if (host.tab === "agents" || host.tab === "agentTeams") {
+    if (host.tab === "agentTeams") {
+      host.agentsPanel = "teams";
+    }
     await loadAgents(host as unknown as MetisApp);
     await loadConfig(host as unknown as MetisApp);
     const agentIds = host.agentsList?.agents?.map((entry) => entry.id) ?? [];
@@ -453,6 +456,9 @@ function applyTabSelection(
   const prev = host.tab;
   if (host.tab !== next) {
     host.tab = next;
+  }
+  if (next === "agentTeams") {
+    host.agentsPanel = "teams";
   }
 
   // Cleanup chat module state when navigating away from chat

@@ -11,12 +11,23 @@ public class FeishuResolvedAccount {
     public let config: FeishuConfig
     public let explicitAccount: Bool
     public let credentialSource: String
+    public let appIdCredentialSource: String
+    public let appSecretCredentialSource: String
 
-    public init(accountId: String, config: FeishuConfig, explicitAccount!: Bool = false, credentialSource!: String = "top-level") {
+    public init(
+        accountId: String,
+        config: FeishuConfig,
+        explicitAccount!: Bool = false,
+        credentialSource!: String = "top-level",
+        appIdCredentialSource!: String = "top-level",
+        appSecretCredentialSource!: String = "top-level"
+    ) {
         this.accountId = gatewayFeishuNormalizeAccountId(accountId)
         this.config = config
         this.explicitAccount = explicitAccount
         this.credentialSource = credentialSource.trimAscii()
+        this.appIdCredentialSource = appIdCredentialSource.trimAscii()
+        this.appSecretCredentialSource = appSecretCredentialSource.trimAscii()
     }
 }
 
@@ -58,22 +69,26 @@ public func gatewayFeishuResolveAccount(config: FeishuConfig, accountId: String)
     let accountConfig = gatewayFeishuAccountOverride(config, normalized)
     let explicitAccount = accountConfig.isSome()
     let overrideObj = accountConfig ?? JsonObject()
-    let credentialSource = if (
-        gatewayFeishuHasString(overrideObj, ["appId", "app_id"]) ||
-        gatewayFeishuHasString(overrideObj, ["appSecret", "app_secret"])
-    ) {
-        "account"
-    } else if (!config.appId.trimAscii().isEmpty() || !config.appSecret.trimAscii().isEmpty()) {
-        "top-level"
-    } else {
-        "missing"
-    }
+    let appIdSource = gatewayFeishuCredentialFieldSource(
+        gatewayFeishuHasString(overrideObj, ["appId", "app_id"]),
+        !config.appId.trimAscii().isEmpty()
+    )
+    let appSecretSource = gatewayFeishuCredentialFieldSource(
+        gatewayFeishuHasString(overrideObj, ["appSecret", "app_secret"]),
+        !config.appSecret.trimAscii().isEmpty()
+    )
+    let credentialSource = gatewayFeishuCredentialSourceSummary(appIdSource, appSecretSource)
+    let threadSession = gatewayFeishuBoolKeys(overrideObj, ["threadSession", "thread_session"], config.threadSession)
+    let groupPolicy = gatewayFeishuGroupPolicy(gatewayFeishuString(overrideObj, ["groupPolicy", "group_policy"], config.groupPolicy))
+    let groupAllowFrom = gatewayFeishuStringArray(overrideObj, ["groupAllowFrom", "group_allow_from"], config.groupAllowFrom)
+    let requireMention = gatewayFeishuBoolKeys(overrideObj, ["requireMention", "require_mention"], config.requireMention)
+    let allowBots = gatewayFeishuBoolKeys(overrideObj, ["allowBots", "allow_bots"], config.allowBots)
     let merged = FeishuConfig(
         accountId: normalized,
         defaultAccount: gatewayFeishuDefaultAccountId(config),
-        enabled: gatewayFeishuBool(overrideObj, "enabled", config.enabled),
+        enabled: gatewayFeishuBoolKeys(overrideObj, ["enabled"], config.enabled),
         streaming: gatewayFeishuString(overrideObj, ["streaming"], config.streaming),
-        blockStreaming: gatewayFeishuBool(overrideObj, "blockStreaming", config.blockStreaming),
+        blockStreaming: gatewayFeishuBoolKeys(overrideObj, ["blockStreaming", "block_streaming"], config.blockStreaming),
         appId: gatewayFeishuString(overrideObj, ["appId", "app_id"], config.appId),
         appSecret: gatewayFeishuString(overrideObj, ["appSecret", "app_secret"], config.appSecret),
         accounts: config.accounts,
@@ -86,24 +101,31 @@ public func gatewayFeishuResolveAccount(config: FeishuConfig, accountId: String)
         verificationToken: gatewayFeishuString(overrideObj, ["verificationToken", "verification_token"], config.verificationToken),
         encryptKey: gatewayFeishuString(overrideObj, ["encryptKey", "encrypt_key"], config.encryptKey),
         groupSessionScope: gatewayFeishuGroupSessionScope(gatewayFeishuString(overrideObj, ["groupSessionScope", "group_session_scope"], config.groupSessionScope)),
-        threadSession: gatewayFeishuBool(overrideObj, "threadSession", config.threadSession),
+        threadSession: threadSession,
         groups: gatewayFeishuMergedObjectOption(overrideObj, "groups", config.groups),
-        groupPolicy: gatewayFeishuGroupPolicy(gatewayFeishuString(overrideObj, ["groupPolicy", "group_policy"], config.groupPolicy)),
-        groupAllowFrom: gatewayFeishuStringArray(overrideObj, "groupAllowFrom", config.groupAllowFrom),
-        requireMention: gatewayFeishuBool(overrideObj, "requireMention", config.requireMention),
-        allowBots: gatewayFeishuBool(overrideObj, "allowBots", config.allowBots),
+        groupPolicy: groupPolicy,
+        groupAllowFrom: groupAllowFrom,
+        requireMention: requireMention,
+        allowBots: allowBots,
         replyInThread: gatewayFeishuReplyInThread(gatewayFeishuString(overrideObj, ["replyInThread", "reply_in_thread"], config.replyInThread)),
-        requireSignatureHeaders: gatewayFeishuBool(overrideObj, "requireSignatureHeaders", config.requireSignatureHeaders),
+        requireSignatureHeaders: gatewayFeishuBoolKeys(overrideObj, ["requireSignatureHeaders", "require_signature_headers"], config.requireSignatureHeaders),
         requestMaxSkewSeconds: gatewayFeishuInt(overrideObj, ["requestMaxSkewSeconds", "request_max_skew_seconds"], config.requestMaxSkewSeconds),
         media: gatewayFeishuMedia(overrideObj, config.media),
         policy: ChannelPolicyConfig(
             allowFrom: [],
-            requireMentionInGroup: gatewayFeishuBool(overrideObj, "requireMention", config.requireMention),
+            requireMentionInGroup: requireMention,
             enableDirect: true,
-            enableGroup: gatewayFeishuGroupPolicy(gatewayFeishuString(overrideObj, ["groupPolicy", "group_policy"], config.groupPolicy)) != "disabled"
+            enableGroup: groupPolicy != "disabled"
         )
     )
-    FeishuResolvedAccount(normalized, merged, explicitAccount: explicitAccount, credentialSource: credentialSource)
+    FeishuResolvedAccount(
+        normalized,
+        merged,
+        explicitAccount: explicitAccount,
+        credentialSource: credentialSource,
+        appIdCredentialSource: appIdSource,
+        appSecretCredentialSource: appSecretSource
+    )
 }
 
 public func gatewayFeishuDescribeAccounts(config: FeishuConfig, runtime!: JsonObject = JsonObject()): JsonObject {
@@ -129,6 +151,12 @@ public func gatewayFeishuDescribeAccounts(config: FeishuConfig, runtime!: JsonOb
         row.put("running", JsonBool(gatewayFeishuRuntimeBool(runtimeRow, "running", false)))
         row.put("lastError", JsonString(gatewayFeishuRedactSecretText(gatewayFeishuRuntimeString(runtimeRow, "lastError", ""))))
         row.put("credentialSource", JsonString(resolved.credentialSource))
+        let credentialSources = JsonObject()
+        credentialSources.put("summary", JsonString(resolved.credentialSource))
+        credentialSources.put("appId", JsonString(resolved.appIdCredentialSource))
+        credentialSources.put("appSecret", JsonString(resolved.appSecretCredentialSource))
+        credentialSources.put("redacted", JsonBool(true))
+        row.put("credentialSources", credentialSources)
         row.put("explicitAccount", JsonBool(resolved.explicitAccount))
         row.put("receiveMode", JsonString(resolved.config.receiveMode))
         row.put("domain", JsonString(resolved.config.domain))
@@ -378,6 +406,29 @@ private func gatewayFeishuHasString(obj: JsonObject, keys: Array<String>): Bool 
     !gatewayFeishuString(obj, keys, "").isEmpty()
 }
 
+private func gatewayFeishuCredentialFieldSource(accountHasValue: Bool, topLevelHasValue: Bool): String {
+    if (accountHasValue) {
+        return "account"
+    }
+    if (topLevelHasValue) {
+        return "top-level"
+    }
+    "missing"
+}
+
+private func gatewayFeishuCredentialSourceSummary(appIdSource: String, appSecretSource: String): String {
+    if (appIdSource == "missing" && appSecretSource == "missing") {
+        return "missing"
+    }
+    if (appIdSource == appSecretSource) {
+        return appIdSource
+    }
+    if (appIdSource == "missing" || appSecretSource == "missing") {
+        return "partial"
+    }
+    "mixed"
+}
+
 private func gatewayFeishuString(obj: JsonObject, keys: Array<String>, fallback: String): String {
     for (key in keys) {
         match (obj.get(key)) {
@@ -398,16 +449,25 @@ private func gatewayFeishuString(obj: JsonObject, keys: Array<String>, fallback:
 }
 
 private func gatewayFeishuBool(obj: JsonObject, key: String, fallback: Bool): Bool {
-    match (obj.get(key)) {
-        case Some(v) =>
-            try { v.asBool().getValue() } catch (_: Exception) {
-                try {
-                    let raw = v.asString().getValue().trimAscii().toAsciiLower()
-                    raw == "true" || raw == "1" || raw == "yes" || raw == "on"
-                } catch (_inner: Exception) { fallback }
-            }
-        case None => fallback
+    gatewayFeishuBoolKeys(obj, [key], fallback)
+}
+
+private func gatewayFeishuBoolKeys(obj: JsonObject, keys: Array<String>, fallback: Bool): Bool {
+    for (key in keys) {
+        match (obj.get(key)) {
+            case Some(v) =>
+                try { return v.asBool().getValue() } catch (_: Exception) {
+                    try {
+                        let raw = v.asString().getValue().trimAscii().toAsciiLower()
+                        return raw == "true" || raw == "1" || raw == "yes" || raw == "on"
+                    } catch (_inner: Exception) {
+                        return fallback
+                    }
+                }
+            case None => ()
+        }
     }
+    fallback
 }
 
 private func gatewayFeishuInt(obj: JsonObject, keys: Array<String>, fallback: Int64): Int64 {
@@ -493,28 +553,31 @@ private func gatewayFeishuMergedObjectOption(obj: JsonObject, key: String, fallb
     }
 }
 
-private func gatewayFeishuStringArray(obj: JsonObject, key: String, fallback: Array<String>): Array<String> {
-    match (obj.get(key)) {
-        case Some(v) =>
-            try {
-                let arr = v.asArray()
-                let out = ArrayList<String>()
-                for (i in 0..arr.size()) {
-                    try {
-                        let item = arr[i].asString().getValue().trimAscii()
-                        if (!item.isEmpty()) {
-                            out.add(item)
+private func gatewayFeishuStringArray(obj: JsonObject, keys: Array<String>, fallback: Array<String>): Array<String> {
+    for (key in keys) {
+        match (obj.get(key)) {
+            case Some(v) =>
+                try {
+                    let arr = v.asArray()
+                    let out = ArrayList<String>()
+                    for (i in 0..arr.size()) {
+                        try {
+                            let item = arr[i].asString().getValue().trimAscii()
+                            if (!item.isEmpty()) {
+                                out.add(item)
+                            }
+                        } catch (_: Exception) {
+                            ()
                         }
-                    } catch (_: Exception) {
-                        ()
                     }
+                    return out.toArray()
+                } catch (_: Exception) {
+                    return fallback
                 }
-                return out.toArray()
-            } catch (_: Exception) {
-                return fallback
-            }
-        case None => fallback
+            case None => ()
+        }
     }
+    fallback
 }
 
 private func gatewayFeishuMedia(obj: JsonObject, fallback: FeishuMediaConfig): FeishuMediaConfig {
@@ -523,9 +586,9 @@ private func gatewayFeishuMedia(obj: JsonObject, fallback: FeishuMediaConfig): F
         case None => JsonObject()
     }
     FeishuMediaConfig(
-        downloadEnabled: gatewayFeishuBool(media, "downloadEnabled", fallback.downloadEnabled),
+        downloadEnabled: gatewayFeishuBoolKeys(media, ["downloadEnabled", "download_enabled"], fallback.downloadEnabled),
         mediaMaxBytes: gatewayFeishuInt(media, ["mediaMaxBytes", "media_max_bytes"], fallback.mediaMaxBytes),
-        allowedMimes: gatewayFeishuStringArray(media, "allowedMimes", fallback.allowedMimes),
+        allowedMimes: gatewayFeishuStringArray(media, ["allowedMimes", "allowed_mimes"], fallback.allowedMimes),
         downloadRoot: gatewayFeishuString(media, ["downloadRoot", "download_root"], fallback.downloadRoot)
     )
 }

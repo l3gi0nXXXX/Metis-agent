@@ -538,6 +538,45 @@ describe("renderAgentTeamsPanel", () => {
     expect(text).not.toContain("Authorization: Bearer secret");
   });
 
+  it("renders a management-console empty state with honest Feishu setup boundaries", () => {
+    const container = document.createElement("div");
+    render(
+      renderAgentTeamsPanel(
+        createProps({
+          error: "Gateway RPC failed",
+          list: { count: 0, teams: [] },
+          selectedId: null,
+          detail: null,
+          draft: createEmptyAgentTeamDraft(),
+          channelsSnapshot: {
+            ts: 1,
+            channelOrder: ["feishu", "telegram"],
+            channelLabels: { feishu: "Feishu", telegram: "Telegram" },
+            channels: {
+              feishu: { configured: false, running: false },
+              telegram: { configured: true, running: true },
+            },
+            channelAccounts: { feishu: [], telegram: [{ accountId: "bot-a", running: true }] },
+            channelDefaultAccountId: { telegram: "bot-a" },
+          },
+        }),
+      ),
+      container,
+    );
+
+    const text = container.textContent ?? "";
+    expect(text).toContain("Agent Team Management");
+    expect(text).toContain("Start with a template");
+    expect(text).toContain("No teams are configured yet");
+    expect(text).toContain("Create from a template or import a Metis team template");
+    expect(text).toContain("Gateway RPC failed");
+    expect(text).toContain("Repair first");
+    expect(text).toContain("Control UI cannot automatically create a Feishu app or bot");
+    expect(text).toContain("guided setup and linking an existing bot");
+    expect(text).toContain("Telegram ready");
+    expect(text).toContain("Feishu needs setup");
+  });
+
   it("copies redacted Feishu repair steps without mutating configuration", async () => {
     const writeText = vi.fn().mockResolvedValue(undefined);
     Object.defineProperty(navigator, "clipboard", {

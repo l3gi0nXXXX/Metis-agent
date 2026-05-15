@@ -582,6 +582,38 @@ private func gatewayFeishuAccountOpsJson(): JsonObject {
     return out
 }
 
+private func gatewayFeishuNativeCommandsJson(): JsonObject {
+    let out = JsonObject()
+    out.put("supported", true.toJsonValue())
+    out.put("surface", JsonString("feishu-im-native-command"))
+    out.put("architecture", JsonString("GatewayService handles Feishu native IM commands; Gateway RPC and Control UI expose the same auth and diagnostic actions."))
+    out.put("commands", JsonArray([
+        JsonString("/feishu start"),
+        JsonString("/feishu doctor"),
+        JsonString("/feishu auth"),
+        JsonString("/feishu info --all")
+    ]))
+    out.put("gatewayRpcActions", JsonArray([
+        JsonString("channels.feishu.auth.start"),
+        JsonString("channels.feishu.auth.status"),
+        JsonString("channels.feishu.auth.poll"),
+        JsonString("channels.feishu.auth.complete"),
+        JsonString("channels.feishu.auth.revoke"),
+        JsonString("channels.feishu.auth.liveSmoke"),
+        JsonString("channels.status"),
+        JsonString("channels.get")
+    ]))
+    out.put("diagnostics", JsonArray([
+        JsonString("account redaction"),
+        JsonString("threadSession"),
+        JsonString("groupPolicy"),
+        JsonString("media"),
+        JsonString("unsupportedFields")
+    ]))
+    out.put("redacted", true.toJsonValue())
+    return out
+}
+
 private func gatewayFeishuMediaJson(user: GatewayUserSettings): JsonObject {
     let media = JsonObject()
     media.put("downloadEnabled", user.feishu.media.downloadEnabled.toJsonValue())
@@ -636,13 +668,15 @@ private func gatewayFeishuChannelDiagnosticsJson(user: GatewayUserSettings): Jso
         JsonString("receiveMode"),
         JsonString("groupPolicy"),
         JsonString("threadSession"),
-        JsonString("media")
+        JsonString("media"),
+        JsonString("nativeCommands")
     ]))
     out.put("account", account)
     out.put("receiveMode", gatewayFeishuReceiveModeDiagnosticsJson(user))
     out.put("groupPolicy", gatewayFeishuGroupPolicyDiagnosticsJson(user))
     out.put("threadSession", gatewayFeishuThreadSessionDiagnosticsJson(user))
     out.put("media", gatewayFeishuMediaJson(user))
+    out.put("nativeCommands", gatewayFeishuNativeCommandsJson())
     out.put("unsupportedFields", account.get("unsupportedFields") ?? JsonArray([]))
     out.put("ignoredFields", account.get("ignoredFields") ?? JsonArray([]))
     return out
@@ -672,6 +706,7 @@ public func gatewayChannelGetJson(user: GatewayUserSettings, channelId: String):
         result.put("configured", (!user.feishu.appId.trimAscii().isEmpty()).toJsonValue())
         result.put("media", gatewayFeishuMediaJson(user))
         result.put("diagnostics", gatewayFeishuChannelDiagnosticsJson(user))
+        result.put("nativeCommands", gatewayFeishuNativeCommandsJson())
         result.put("directory", gatewayFeishuDirectoryJson(user))
         result.put("accountInspect", gatewayFeishuAccountInspectJson(user))
         result.put("accountOps", gatewayFeishuAccountOpsJson())

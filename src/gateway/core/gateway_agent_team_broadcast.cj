@@ -290,6 +290,18 @@ private func gatewayBroadcastTurnRoute(route: GatewayAgentRoute, rawRoute: JsonO
     out.put("preferredAccountId", JsonString(route.preferredAccountId))
     out.put("peerKind", JsonString(route.peerKind))
     out.put("peerId", JsonString(route.peerId))
+    let parentPeerKind = gatewayBroadcastJsonString(rawRoute, "parentPeerKind")
+    let parentPeerId = gatewayBroadcastJsonString(rawRoute, "parentPeerId")
+    let threadId = gatewayBroadcastJsonString(rawRoute, "threadId")
+    if (!parentPeerKind.isEmpty()) {
+        out.put("parentPeerKind", JsonString(parentPeerKind))
+    }
+    if (!parentPeerId.isEmpty()) {
+        out.put("parentPeerId", JsonString(parentPeerId))
+    }
+    if (!threadId.isEmpty()) {
+        out.put("threadId", JsonString(threadId))
+    }
     out.put("sessionKey", JsonString(route.sessionKey))
     out.put("mainSessionKey", JsonString(route.mainSessionKey))
     out.put("matchedBy", JsonString(route.matchedBy))

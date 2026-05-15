@@ -12,6 +12,29 @@ import stdx.encoding.url.URL
 import stdx.net.http.*
 import stdx.net.tls.*
 
+private func feishuOapiRedactSensitiveText(raw: String): String {
+    let text = raw.trimAscii()
+    if (text.isEmpty()) {
+        return ""
+    }
+    let lower = text.toAsciiLower()
+    if (
+        lower.contains("authorization") ||
+        lower.contains("bearer ") ||
+        lower.contains("access_token") ||
+        lower.contains("refresh_token") ||
+        lower.contains("client_secret") ||
+        lower.contains("appsecret") ||
+        lower.contains("app_secret") ||
+        lower.contains("secret") ||
+        lower.contains("token=") ||
+        lower.contains("password")
+    ) {
+        return "[redacted]"
+    }
+    text
+}
+
 public class FeishuOapiRequest {
     public let toolName: String
     public let actionKey: String
@@ -97,7 +120,7 @@ public class FeishuOapiResult {
         this.ok = ok
         this.status = status.trimAscii()
         this.data = data
-        this.error = error.trimAscii()
+        this.error = feishuOapiRedactSensitiveText(error)
         this.missingScopes = missingScopes
         this.authState = authState.trimAscii()
         this.scopeDiagnostic = scopeDiagnostic
@@ -246,7 +269,7 @@ public class FeishuOapiResult {
             let credential = JsonObject()
             credential.put("required", JsonBool(true))
             credential.put("mode", JsonString(this.request.tokenMode))
-            credential.put("missing_fields", feishuOapiJsonStringArray(["app_id", "app_secret"]))
+            credential.put("missing_fields", feishuOapiJsonStringArray(["app_id", "appSecret"]))
             credential.put("redacted", JsonBool(true))
             out.put("credential", credential)
         }
@@ -1890,8 +1913,9 @@ private func feishuOapiScopeDiagnosticStatus(
     out.put("status", JsonString(if (status.trimAscii().isEmpty()) { "unknown" } else { status.trimAscii() }))
     out.put("granted_scopes", feishuOapiJsonStringArray(grantedScopes))
     out.put("missing_scopes", feishuOapiJsonStringArray(missingScopes))
-    if (!error.trimAscii().isEmpty()) {
-        out.put("error", JsonString(error.trimAscii()))
+    let safeError = feishuOapiRedactSensitiveText(error)
+    if (!safeError.isEmpty()) {
+        out.put("error", JsonString(safeError))
     }
     return out
 }

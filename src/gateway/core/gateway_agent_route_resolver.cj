@@ -172,6 +172,30 @@ private class GatewayAgentRouteCandidate {
     }
 }
 
+private func gatewayRouteCandidateAccountRank(candidate: GatewayAgentRouteCandidate): Int64 {
+    if (candidate.accountExplicit && candidate.accountPattern != "*") {
+        return 0
+    }
+    if (!candidate.accountExplicit) {
+        return 1
+    }
+    2
+}
+
+private func gatewayRoutePreferAccountSpecificCandidate(
+    current: Option<GatewayAgentRouteCandidate>,
+    candidate: GatewayAgentRouteCandidate
+): Option<GatewayAgentRouteCandidate> {
+    match (current) {
+        case Some(existing) =>
+            if (gatewayRouteCandidateAccountRank(candidate) < gatewayRouteCandidateAccountRank(existing)) {
+                return Some(candidate)
+            }
+            current
+        case None => Some(candidate)
+    }
+}
+
 private func gatewayRouteToken(raw: String): String {
     raw.trimAscii().toAsciiLower()
 }
@@ -453,6 +477,7 @@ private func gatewayRouteFindCandidate(
     tier: String
 ): Option<GatewayAgentRouteCandidate> {
     let bindings = gatewayRouteJsonArray(input.root, "bindings")
+    var best = None<GatewayAgentRouteCandidate>
     for (i in 0..bindings.size()) {
         let binding = try {
             bindings[i].asObject()
@@ -472,7 +497,7 @@ private func gatewayRouteFindCandidate(
         match (tier) {
             case "peer.exact" =>
                 if (peerKind == input.peerKind && !peerId.isEmpty() && peerId != "*" && peerId == input.peerId) {
-                    return Some(
+                    best = gatewayRoutePreferAccountSpecificCandidate(best,
                         GatewayAgentRouteCandidate(binding,
                             gatewayRouteSanitizeAgentId(gatewayRouteJsonString(binding, "agentId")),
                             "binding.peer.exact", accountInfo[0], accountInfo[1]))
@@ -480,14 +505,14 @@ private func gatewayRouteFindCandidate(
             case "peer.parent" =>
                 if (peerKind == input.parentPeerKind && !peerId.isEmpty() && peerId != "*" && peerId == input
                     .parentPeerId) {
-                    return Some(
+                    best = gatewayRoutePreferAccountSpecificCandidate(best,
                         GatewayAgentRouteCandidate(binding,
                             gatewayRouteSanitizeAgentId(gatewayRouteJsonString(binding, "agentId")),
                             "binding.peer.parent", accountInfo[0], accountInfo[1]))
                 }
             case "peer.wildcard" =>
                 if (peerKind == input.peerKind && peerId == "*") {
-                    return Some(
+                    best = gatewayRoutePreferAccountSpecificCandidate(best,
                         GatewayAgentRouteCandidate(binding,
                             gatewayRouteSanitizeAgentId(gatewayRouteJsonString(binding, "agentId")),
                             "binding.peer.wildcard", accountInfo[0], accountInfo[1]))
@@ -495,35 +520,35 @@ private func gatewayRouteFindCandidate(
             case "guild+roles" =>
                 if (!guildId.isEmpty() && guildId == input.guildId && roles.size > 0 && gatewayRouteRolesOverlap(roles,
                     input.roles)) {
-                    return Some(
+                    best = gatewayRoutePreferAccountSpecificCandidate(best,
                         GatewayAgentRouteCandidate(binding,
                             gatewayRouteSanitizeAgentId(gatewayRouteJsonString(binding, "agentId")),
                             "binding.guild+roles", accountInfo[0], accountInfo[1]))
                 }
             case "guild" =>
                 if (!guildId.isEmpty() && guildId == input.guildId && roles.size == 0) {
-                    return Some(
+                    best = gatewayRoutePreferAccountSpecificCandidate(best,
                         GatewayAgentRouteCandidate(binding,
                             gatewayRouteSanitizeAgentId(gatewayRouteJsonString(binding, "agentId")), "binding.guild",
                             accountInfo[0], accountInfo[1]))
                 }
             case "team" =>
                 if (!teamId.isEmpty() && teamId == input.teamId && guildId.isEmpty() && !gatewayRouteHasPeer(routeMatch)) {
-                    return Some(
+                    best = gatewayRoutePreferAccountSpecificCandidate(best,
                         GatewayAgentRouteCandidate(binding,
                             gatewayRouteSanitizeAgentId(gatewayRouteJsonString(binding, "agentId")), "binding.team",
                             accountInfo[0], accountInfo[1]))
                 }
             case "account" =>
                 if (!gatewayRouteHasPeer(routeMatch) && guildId.isEmpty() && teamId.isEmpty() && accountInfo[0] != "*") {
-                    return Some(
+                    best = gatewayRoutePreferAccountSpecificCandidate(best,
                         GatewayAgentRouteCandidate(binding,
                             gatewayRouteSanitizeAgentId(gatewayRouteJsonString(binding, "agentId")), "binding.account",
                             accountInfo[0], accountInfo[1]))
                 }
             case "channel" =>
                 if (!gatewayRouteHasPeer(routeMatch) && guildId.isEmpty() && teamId.isEmpty() && accountInfo[0] == "*") {
-                    return Some(
+                    best = gatewayRoutePreferAccountSpecificCandidate(best,
                         GatewayAgentRouteCandidate(binding,
                             gatewayRouteSanitizeAgentId(gatewayRouteJsonString(binding, "agentId")), "binding.channel",
                             accountInfo[0], accountInfo[1]))
@@ -531,7 +556,7 @@ private func gatewayRouteFindCandidate(
             case _ => ()
         }
     }
-    None<GatewayAgentRouteCandidate>
+    best
 }
 
 private func gatewayRoutePickCandidate(input: GatewayAgentRouteInput, accountId: String, defaultAccountId: String): Option<GatewayAgentRouteCandidate> {

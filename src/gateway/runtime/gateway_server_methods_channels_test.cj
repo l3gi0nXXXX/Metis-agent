@@ -783,6 +783,38 @@ public class GatewayServerMethodsChannelsTest {
     }
 
     @TestCase
+    public func feishuChannelGetExposesNativeCommandAndGatewayRpcDiagnostics(): Unit {
+        var user = GatewayUserSettings()
+        user.feishu.enabled = true
+        user.feishu.defaultAccount = "tenant-a"
+        user.feishu.appId = "legacy-app"
+        user.feishu.appSecret = "legacy-secret-never-visible"
+        let accounts = JsonObject()
+        let tenant = JsonObject()
+        tenant.put("appId", JsonString("tenant-app"))
+        accounts.put("tenant-a", tenant)
+        user.feishu.accounts = Some(accounts)
+
+        let channel = gatewayChannelGetJson(user, "feishu")
+        let nativeCommands = channel.get("nativeCommands").getOrThrow().asObject()
+        let diagnostics = channel.get("diagnostics").getOrThrow().asObject()
+        let commands = nativeCommands.get("commands").getOrThrow().asArray().toJsonString()
+        let rpcActions = nativeCommands.get("gatewayRpcActions").getOrThrow().asArray().toJsonString()
+        let raw = channel.toJsonString()
+
+        @Expect(channelsTestBool(nativeCommands, "supported"), true)
+        @Expect(channelsTestString(nativeCommands, "surface"), "feishu-im-native-command")
+        @Expect(commands.contains("/feishu start"), true)
+        @Expect(commands.contains("/feishu doctor"), true)
+        @Expect(commands.contains("/feishu auth"), true)
+        @Expect(rpcActions.contains("channels.feishu.auth.start"), true)
+        @Expect(rpcActions.contains("channels.feishu.auth.status"), true)
+        @Expect(diagnostics.get("nativeCommands").isSome(), true)
+        @Expect(raw.contains("tenant-app"), false)
+        @Expect(raw.contains("legacy-secret-never-visible"), false)
+    }
+
+    @TestCase
     public func telegramChannelsRuntimeExposesNativeRuntimeView(): Unit {
         var user = GatewayUserSettings()
         user.telegram.enabled = true

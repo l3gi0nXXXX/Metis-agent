@@ -40,6 +40,183 @@ resource_status() {
   fi
 }
 
+json_escape() {
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+agentteam_acceptance_json() {
+  cat <<'JSON'
+{
+  "source": "develop_steps/metis-agent-team-series-19-feishu-openclaw-source-recheck-gap-quantification-manual-acceptance-2026-05-16.md",
+  "scope": "phase0-9-gap-index",
+  "statuses": {
+    "localPass": "local-pass",
+    "externalResourceRequired": "external-resource-required",
+    "operatorRecordRequired": "operator-record-required"
+  },
+  "phases": [
+    {
+      "id": "phase0",
+      "title": "Freeze source-backed GAP matrix",
+      "status": "local-pass",
+      "gaps": ["G01", "G02", "G03", "G04", "G05", "G06", "G07", "G08", "G09", "G10", "G24", "G25"],
+      "checklist": [
+        {"id": "M01", "status": "local-pass", "evidence": "isolated METIS_HOME and redacted report directory were enforced"},
+        {"id": "M28", "status": "local-pass", "evidence": "report.json and manual-acceptance-template.md were generated"}
+      ],
+      "evidence": [
+        {"id": "series14-source-doc", "status": "local-pass", "path": "develop_steps/metis-agent-team-series-14-current-source-recheck-gap-quantification-manual-acceptance-2026-05-15.md"},
+        {"id": "oapi-parity-report", "status": "local-pass", "path": "develop_steps/metis-agent-team-series-14-oapi-action-parity-report-2026-05-15.md"}
+      ]
+    },
+    {
+      "id": "phase1",
+      "title": "Management entry points and operation paths",
+      "status": "local-pass",
+      "gaps": ["G08", "G09", "G23", "G24"],
+      "checklist": [
+        {"id": "M03", "status": "local-pass", "evidence": "CLI team create is mapped to agents.teams.create"},
+        {"id": "M04", "status": "local-pass", "evidence": "CLI team list/get support --json Gateway RPC output"},
+        {"id": "M05", "status": "local-pass", "evidence": "CLI team update/delete are mapped to Gateway RPC"},
+        {"id": "M06", "status": "local-pass", "evidence": "team create returns generated member agents in Gateway RPC"}
+      ],
+      "evidence": [
+        {"id": "cli-help-boundary", "status": "local-pass", "path": "src/program/cli_local_flows.cj"},
+        {"id": "team-rpc-methods", "status": "local-pass", "path": "src/gateway/runtime/gateway_server_methods_agents.cj"}
+      ]
+    },
+    {
+      "id": "phase2",
+      "title": "Agent isolation acceptance",
+      "status": "local-pass",
+      "gaps": ["G02", "G03", "G04", "G05", "G09", "G25"],
+      "checklist": [
+        {"id": "M06", "status": "local-pass", "evidence": "team create auto-creates member agent workspace/agentDir/sessionsDir"},
+        {"id": "M07", "status": "local-pass", "evidence": "profile file reads and writes are scoped to the selected agent workspace"},
+        {"id": "M08", "status": "local-pass", "evidence": "per-agent models.json paths and model refs remain separate"},
+        {"id": "M09", "status": "local-pass", "evidence": "agent auth-profiles are not copied or read across agents unless explicitly requested"},
+        {"id": "M27", "status": "local-pass", "evidence": "local evidence is redaction-scanned before the gate exits"}
+      ],
+      "evidence": [
+        {"id": "profile-isolation-test", "status": "local-pass", "path": "src/gateway/runtime/gateway_server_methods_agents_test.cj"},
+        {"id": "model-auth-isolation-test", "status": "local-pass", "path": "src/gateway/runtime/gateway_server_methods_agents_test.cj"}
+      ]
+    },
+    {
+      "id": "phase3",
+      "title": "binding/accountId/teamId route acceptance",
+      "status": "local-pass",
+      "gaps": ["G07", "G10", "G12", "G22"],
+      "checklist": [
+        {"id": "M10", "status": "local-pass", "evidence": "local conflict tests reject duplicate routes without partial team writes"},
+        {"id": "M14", "status": "external-resource-required", "evidence": "real multi-account Feishu bot validation needs operator resources"}
+      ],
+      "evidence": [
+        {"id": "route-resolver-tests", "status": "local-pass", "path": "src/gateway/runtime/gateway_server_methods_agents_test.cj"}
+      ]
+    },
+    {
+      "id": "phase4",
+      "title": "Telegram live route acceptance",
+      "status": "external-resource-required",
+      "gaps": ["G11"],
+      "checklist": [
+        {"id": "M11", "status": "external-resource-required", "evidence": "requires real test bot and private chat"},
+        {"id": "M12", "status": "external-resource-required", "evidence": "requires real test group/topic"},
+        {"id": "M13", "status": "external-resource-required", "evidence": "requires real message delivery and aggregate reply evidence"}
+      ],
+      "evidence": []
+    },
+    {
+      "id": "phase5",
+      "title": "Feishu account/routing/threadSession live acceptance",
+      "status": "external-resource-required",
+      "gaps": ["G12", "G13", "G22"],
+      "checklist": [
+        {"id": "M14", "status": "external-resource-required", "evidence": "requires two test Feishu accounts/bots"},
+        {"id": "M15", "status": "external-resource-required", "evidence": "requires real Feishu group mention and allowlist checks"},
+        {"id": "M16", "status": "external-resource-required", "evidence": "requires real Feishu thread/topic checks"}
+      ],
+      "evidence": []
+    },
+    {
+      "id": "phase6",
+      "title": "Feishu OAuth/UAT/TAT live acceptance",
+      "status": "external-resource-required",
+      "gaps": ["G14", "G15", "G17"],
+      "checklist": [
+        {"id": "M17", "status": "external-resource-required", "evidence": "requires test app credentials, offline_access, and user authorization"}
+      ],
+      "evidence": []
+    },
+    {
+      "id": "phase7",
+      "title": "Feishu OAPI parity live acceptance",
+      "status": "external-resource-required",
+      "gaps": ["G16", "G17"],
+      "checklist": [
+        {"id": "M18", "status": "external-resource-required", "evidence": "requires low-risk test doc/wiki/calendar/task/bitable/sheet/im resources"},
+        {"id": "M19", "status": "external-resource-required", "evidence": "requires writeable test-only Feishu resources"}
+      ],
+      "evidence": []
+    },
+    {
+      "id": "phase8",
+      "title": "Feishu CardKit and rich events live acceptance",
+      "status": "external-resource-required",
+      "gaps": ["G18", "G19", "G20"],
+      "checklist": [
+        {"id": "M20", "status": "external-resource-required", "evidence": "requires real CardKit-capable test chat"},
+        {"id": "M21", "status": "external-resource-required", "evidence": "requires test media/file resources"},
+        {"id": "M22", "status": "external-resource-required", "evidence": "requires reaction, quote, and merged-forward test events"}
+      ],
+      "evidence": []
+    },
+    {
+      "id": "phase9",
+      "title": "Control UI product acceptance",
+      "status": "operator-record-required",
+      "gaps": ["G23", "G24"],
+      "checklist": [
+        {"id": "M23", "status": "operator-record-required", "evidence": "set METIS_AGENTTEAM_CONTROL_UI_URL to run browser smoke"},
+        {"id": "M24", "status": "operator-record-required", "evidence": "requires local Gateway/Control UI runtime"},
+        {"id": "M25", "status": "operator-record-required", "evidence": "requires local Gateway/Control UI runtime"},
+        {"id": "M26", "status": "operator-record-required", "evidence": "requires local Gateway/Control UI runtime"}
+      ],
+      "evidence": []
+    }
+  ],
+  "gaps": [
+    {"id": "G01", "status": "local-pass", "phase": "phase0", "title": "multi-agent config/default agent"},
+    {"id": "G02", "status": "local-pass", "phase": "phase2", "title": "per-agent workspace and agentDir isolation"},
+    {"id": "G03", "status": "local-pass", "phase": "phase2", "title": "profile files"},
+    {"id": "G04", "status": "local-pass", "phase": "phase2", "title": "per-agent model"},
+    {"id": "G05", "status": "local-pass", "phase": "phase2", "title": "per-agent auth profile and credential source"},
+    {"id": "G06", "status": "local-pass", "phase": "phase0", "title": "skill/tool filtering"},
+    {"id": "G07", "status": "local-pass", "phase": "phase3", "title": "binding match dimensions"},
+    {"id": "G08", "status": "local-pass", "phase": "phase1", "title": "CLI/UI/Gateway RPC management surface"},
+    {"id": "G09", "status": "local-pass", "phase": "phase1", "title": "team CRUD auto-creates member agents"},
+    {"id": "G10", "status": "local-pass", "phase": "phase3", "title": "team broadcast/fan-out local plan"},
+    {"id": "G11", "status": "external-resource-required", "phase": "phase4", "title": "Telegram live route and broadcast"},
+    {"id": "G12", "status": "external-resource-required", "phase": "phase5", "title": "Feishu multi-account live route"},
+    {"id": "G13", "status": "external-resource-required", "phase": "phase5", "title": "Feishu inbound group/thread policy live route"},
+    {"id": "G14", "status": "external-resource-required", "phase": "phase6", "title": "Feishu OAuth/UAT live authorization"},
+    {"id": "G15", "status": "external-resource-required", "phase": "phase6", "title": "Feishu TAT/app-token live validation"},
+    {"id": "G16", "status": "external-resource-required", "phase": "phase7", "title": "Feishu OAPI live tool matrix"},
+    {"id": "G17", "status": "external-resource-required", "phase": "phase7", "title": "Feishu scope diagnostics and repair live validation"},
+    {"id": "G18", "status": "external-resource-required", "phase": "phase8", "title": "Feishu CardKit streaming live validation"},
+    {"id": "G19", "status": "external-resource-required", "phase": "phase8", "title": "Feishu rich event/resource live validation"},
+    {"id": "G20", "status": "external-resource-required", "phase": "phase8", "title": "Feishu native start/doctor/auth command parity"},
+    {"id": "G21", "status": "external-resource-required", "phase": "phase8", "title": "automatic Feishu bot/app creation platform boundary"},
+    {"id": "G22", "status": "external-resource-required", "phase": "phase5", "title": "multi-bot mapping to agent/team live validation"},
+    {"id": "G23", "status": "operator-record-required", "phase": "phase9", "title": "Miaoda-like Control UI product experience"},
+    {"id": "G24", "status": "local-pass", "phase": "phase0", "title": "manual acceptance and evidence pack"},
+    {"id": "G25", "status": "local-pass", "phase": "phase2", "title": "security and redaction"}
+  ]
+}
+JSON
+}
+
 write_evidence_pack() {
   local report_dir="$1"
   local report_json="$report_dir/report.json"
@@ -84,15 +261,21 @@ write_evidence_pack() {
     control_ui_status="enabled"
   fi
 
-  cat >"$report_json" <<JSON
+  {
+    cat <<JSON
 {
   "kind": "metis-agentteam-manual-acceptance-evidence",
-  "series": "17",
-  "phases": "0-1",
+  "series": "19",
+  "phases": "0-9",
   "createdAt": "$created_at",
   "gitHead": "$head",
-  "metisHome": "$METIS_HOME_CANONICAL",
-  "reportDir": "$report_dir",
+  "metisHome": "$(json_escape "$METIS_HOME_CANONICAL")",
+  "reportDir": "$(json_escape "$report_dir")",
+  "acceptance":
+JSON
+    agentteam_acceptance_json
+    cat <<JSON
+  ,
   "controlUi": {
     "status": "$control_ui_status",
     "url": "$(redacted_flag "${METIS_AGENTTEAM_CONTROL_UI_URL:-}")"
@@ -154,6 +337,7 @@ write_evidence_pack() {
   }
 }
 JSON
+  } >"$report_json"
 
   cat >"$template_md" <<MD
 # Metis AgentTeam Manual Acceptance Evidence
@@ -170,9 +354,54 @@ JSON
 
 | Check | Result | Evidence |
 | --- | --- | --- |
-| Series 15 source-backed conclusion is current | TODO pass/fail | TODO |
+| Series 19 source-backed GAP matrix is current | local-pass | See report.json acceptance.source |
 | Series 14 OAPI parity is 108 aligned / 0 partial / 0 missing / 0 not-applicable | TODO pass/fail | TODO |
 | Live Telegram/Feishu gates are opt-in only | TODO pass/fail | See report.json liveGates |
+
+## Phase 0-9 Structured Acceptance Index
+
+| Phase | Gate status | GAPs | Evidence |
+| --- | --- | --- | --- |
+| phase0 | local-pass | G01 G02 G03 G04 G05 G06 G07 G08 G09 G10 G24 G25 | Source-backed docs and redacted evidence pack checks |
+| phase1 | local-pass | G08 G09 G23 G24 | CLI/UI/Gateway RPC management boundary |
+| phase2 | local-pass | G02 G03 G04 G05 G09 G25 | Local agent isolation tests and redaction checks |
+| phase3 | local-pass | G07 G10 G12 G22 | Local binding/account route checks; live multi-account remains external |
+| phase4 | external-resource-required | G11 | Real Telegram bot/group/topic required |
+| phase5 | external-resource-required | G12 G13 G22 | Real Feishu accounts/bots/groups/topics required |
+| phase6 | external-resource-required | G14 G15 G17 | Real Feishu app credentials and OAuth user required |
+| phase7 | external-resource-required | G16 G17 | Real Feishu OAPI test resources required |
+| phase8 | external-resource-required | G18 G19 G20 G21 | Real CardKit/rich event resources and platform permission confirmation required |
+| phase9 | operator-record-required | G23 G24 | Local Control UI/Gateway runtime smoke record required |
+
+## GAP Acceptance State Index
+
+| GAP | Gate status | Evidence |
+| --- | --- | --- |
+| G01 | local-pass | Multi-agent/default source-backed matrix row |
+| G02 | local-pass | Workspace/agentDir/sessionsDir isolation tests |
+| G03 | local-pass | Profile file scoped read/write tests |
+| G04 | local-pass | Per-agent models.json tests |
+| G05 | local-pass | Per-agent auth profile source tests |
+| G06 | local-pass | Skill/tool filter source-backed row |
+| G07 | local-pass | Binding route resolver tests |
+| G08 | local-pass | CLI/UI/Gateway RPC management boundary |
+| G09 | local-pass | Team create auto-creates member agents |
+| G10 | local-pass | Local broadcast plan/aggregate tests |
+| G11 | external-resource-required | Telegram live route/broadcast requires test bot/group/topic |
+| G12 | external-resource-required | Feishu multi-account route requires real accounts |
+| G13 | external-resource-required | Feishu group/thread policy requires real group/thread |
+| G14 | external-resource-required | Feishu OAuth/UAT requires real app/user authorization |
+| G15 | external-resource-required | Feishu TAT/app token requires real app credentials |
+| G16 | external-resource-required | Feishu OAPI parity requires real test resources |
+| G17 | external-resource-required | Feishu scope diagnostic requires real missing-scope scenario |
+| G18 | external-resource-required | Feishu CardKit streaming requires real CardKit chat |
+| G19 | external-resource-required | Feishu rich events/resources require real media/events |
+| G20 | external-resource-required | Feishu native command parity requires real IM command smoke |
+| G21 | external-resource-required | Automatic Feishu bot/app creation needs platform permission confirmation |
+| G22 | external-resource-required | Multi-bot team mapping needs real accounts |
+| G23 | operator-record-required | Control UI product acceptance needs local browser smoke record |
+| G24 | local-pass | This gate emits redacted evidence pack and checklist |
+| G25 | local-pass | Secret-pattern scan and redaction flags |
 
 ## Phase 1 Redacted Live Resource Pack
 
@@ -196,6 +425,17 @@ JSON
 | Per-agent models and credential source redaction | TODO pass/fail | TODO |
 | Binding conflict rejects same route/different agent without partial write | TODO pass/fail | TODO |
 | Broadcast aggregate includes per-agent status/detail/answer/sessionKey | TODO pass/fail | TODO |
+
+## Phase 2 Agent Isolation Acceptance
+
+| GAP | Gate status | Acceptance item | Evidence |
+| --- | --- | --- | --- |
+| G02 | local-pass | member workspace/agentDir/sessionsDir are distinct | GatewayServerMethodsAgentsTest.agentRuntimeScopeKeepsPerAgentModelAuthWorkspaceAndSessionPathsSeparate |
+| G03 | local-pass | profile file reads/writes are scoped to the selected agent | GatewayServerMethodsAgentsTest.agentFilesRpcUsesWorkspaceSafeBootstrapFiles |
+| G04 | local-pass | agent A/B model state does not cross-write | GatewayServerMethodsAgentsTest.agentAAgentBModelsRpcKeepsModelsJsonPathAndModelRefSeparate |
+| G05 | local-pass | auth profile source does not cross-read main or sibling credentials | GatewayServerMethodsAgentsTest.agentBWithoutExplicitAuthCopyDoesNotReadAgentAOrMainCredentialsAndRedactsOutput |
+| G09 | local-pass | team create auto-creates member agents and delete preserves agent dirs | GatewayServerMethodsAgentsTest.agentTeamsCreateUpdateListAndDeleteRoundTripConfig |
+| G25 | local-pass | evidence pack is redaction-scanned | scripts/agentteam-manual-acceptance-gate.sh |
 
 ## Phase 3 Telegram Live Route Gate
 

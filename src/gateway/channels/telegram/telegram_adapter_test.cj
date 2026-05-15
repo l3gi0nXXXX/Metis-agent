@@ -2,7 +2,7 @@ package metis.gateway.channels.telegram
 
 import metis.core.{GatewayToolRuntimeContext, gatewayWithToolRuntimeContext, setGatewayMediaAsrRunnerForTest, setGatewayMediaVisionRunnerForTest}
 import metis.core.config.{CliConfig, CliSettingManager, GatewayUserSettings, MetisConfigManager}
-import metis.gateway.core.{gatewayBuildMediaContextPrompt, gatewayResolveSessionContextWithAgentRoute, setGatewayOpenClawPluginSidecarRunnerForTest}
+import metis.gateway.core.{gatewayBuildMediaContextPrompt, gatewayResolveAgentTeamBroadcastPlan, gatewayResolveSessionContextWithAgentRoute, setGatewayOpenClawPluginSidecarRunnerForTest}
 import metis.gateway.model.*
 import metis.gateway.session.gatewaySessionRequestFromInbound
 import metis.gateway.tools.{GatewayTelegramMediaToolset, setGatewayTelegramStickerCacheRootForTest}
@@ -256,6 +256,68 @@ private func telegramAliasRouteRoot(): JsonObject {
     return root
 }
 
+private func telegramAgentTeamRouteRoot(): JsonObject {
+    let root = JsonObject()
+    let agents = JsonObject()
+    let list = JsonArray([])
+    list.add(telegramAliasRouteAgent("main", isDefault: true))
+    list.add(telegramAliasRouteAgent("private-agent"))
+    list.add(telegramAliasRouteAgent("group-agent"))
+    list.add(telegramAliasRouteAgent("topic-agent"))
+    list.add(telegramAliasRouteAgent("writer", mentionPatterns: ["@writer", "/agent writer"]))
+    list.add(telegramAliasRouteAgent("reviewer"))
+    agents.put("list", list)
+    root.put("agents", agents)
+
+    let channels = JsonObject()
+    let telegram = JsonObject()
+    telegram.put("defaultAccountId", JsonString("default"))
+    telegram.put("accountIds", JsonArray([JsonString("default")]))
+    channels.put("telegram", telegram)
+    root.put("channels", channels)
+
+    let bindings = JsonArray([])
+    bindings.add(telegramRouteBinding("private-agent", "direct", "8734062810"))
+    bindings.add(telegramRouteBinding("group-agent", "group", "-1001234567890"))
+    bindings.add(telegramRouteBinding("topic-agent", "topic", "42"))
+    root.put("bindings", bindings)
+
+    let team = JsonObject()
+    team.put("id", JsonString("content"))
+    team.put("defaultAgentId", JsonString("group-agent"))
+    team.put("members", JsonArray([telegramTeamMember("writer"), telegramTeamMember("reviewer")]))
+    team.put("bindings", JsonArray([telegramRouteBinding("group-agent", "group", "-1001234567890")]))
+    let broadcast = JsonObject()
+    broadcast.put("enabled", JsonBool(true))
+    broadcast.put("members", JsonArray([JsonString("writer"), JsonString("reviewer")]))
+    team.put("broadcast", broadcast)
+    let agentTeams = JsonObject()
+    agentTeams.put("list", JsonArray([team]))
+    root.put("agentTeams", agentTeams)
+    return root
+}
+
+private func telegramRouteBinding(agentId: String, peerKind: String, peerId: String): JsonObject {
+    let binding = JsonObject()
+    binding.put("type", JsonString("route"))
+    binding.put("agentId", JsonString(agentId))
+    let matchObj = JsonObject()
+    matchObj.put("channel", JsonString("telegram"))
+    matchObj.put("accountId", JsonString("*"))
+    let peer = JsonObject()
+    peer.put("kind", JsonString(peerKind))
+    peer.put("id", JsonString(peerId))
+    matchObj.put("peer", peer)
+    binding.put("match", matchObj)
+    binding
+}
+
+private func telegramTeamMember(agentId: String): JsonObject {
+    let member = JsonObject()
+    member.put("agentId", JsonString(agentId))
+    member
+}
+
 private func telegramBytesContain(body: Array<Byte>, needle: Array<Byte>): Bool {
     if (needle.isEmpty()) {
         return true
@@ -473,6 +535,49 @@ public class TelegramAdapterTest {
 
         @Expect(context.agentId, "main")
         @Expect(context.matchedBy, "default")
+    }
+
+    @TestCase
+    public func fakeInboundTelegramAgentTeamRoutesPrivateGroupTopicMentionAndBroadcast(): Unit {
+        let root = telegramAgentTeamRouteRoot()
+        let adapter = TelegramAdapter(config: TelegramConfig(enabled: true, botToken: "telegram-token"))
+        adapter.start()
+        adapter.simulateIncomingText("msg-private", "user:8734062810", "8734062810", "private route", chatType: ChatType.Direct)
+        adapter.simulateIncomingText("msg-group", "group:-1001234567890", "8734062810", "group route", chatType: ChatType.Group, mentioned: true)
+        adapter.simulateIncomingText("msg-topic", "group:-1001234567890:topic:42", "8734062810", "topic route", chatType: ChatType.Group, mentioned: true, threadId: Some("42"))
+        adapter.simulateIncomingText("msg-mention", "group:-1001234567890", "8734062810", "@writer draft", chatType: ChatType.Group, mentioned: true)
+
+        let inbound = adapter.pullInbound()
+        @Expect(inbound.size, 4)
+
+        let privateContext = gatewayResolveSessionContextWithAgentRoute(gatewaySessionRequestFromInbound(inbound[0], routeRoot: root))
+        @Expect(privateContext.agentId, "private-agent")
+        @Expect(privateContext.matchedBy, "binding.peer.exact")
+        @Expect(privateContext.sessionKey, "agent:private-agent:direct:8734062810")
+
+        let groupRequest = gatewaySessionRequestFromInbound(inbound[1], routeRoot: root)
+        let groupContext = gatewayResolveSessionContextWithAgentRoute(groupRequest)
+        @Expect(groupContext.agentId, "group-agent")
+        @Expect(groupContext.matchedBy, "binding.peer.exact")
+        @Expect(groupContext.sessionKey, "agent:group-agent:telegram:group:-1001234567890")
+
+        let topicContext = gatewayResolveSessionContextWithAgentRoute(gatewaySessionRequestFromInbound(inbound[2], routeRoot: root))
+        @Expect(topicContext.agentId, "topic-agent")
+        @Expect(topicContext.matchedBy, "binding.peer.exact")
+        @Expect(topicContext.sessionKey, "agent:topic-agent:telegram:topic:42")
+
+        let mentionContext = gatewayResolveSessionContextWithAgentRoute(gatewaySessionRequestFromInbound(inbound[3], routeRoot: root))
+        @Expect(mentionContext.agentId, "writer")
+        @Expect(mentionContext.matchedBy, "alias.mention")
+
+        let broadcast = gatewayResolveAgentTeamBroadcastPlan(groupRequest)
+        @Expect(broadcast.enabled, true)
+        @Expect(broadcast.teamId, "content")
+        @Expect(broadcast.turns.size, 2)
+        @Expect(broadcast.turns[0].context.agentId, "writer")
+        @Expect(broadcast.turns[1].context.agentId, "reviewer")
+        @Expect(broadcast.turns[0].context.sessionKey, "agent:writer:telegram:group:-1001234567890")
+        @Expect(broadcast.turns[1].context.sessionKey, "agent:reviewer:telegram:group:-1001234567890")
     }
 
     @TestCase

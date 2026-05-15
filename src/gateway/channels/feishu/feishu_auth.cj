@@ -749,6 +749,21 @@ public func feishuGatewayNativeAuthPollWithClient(
     let domain = feishuAuthJsonStringFallback(account, ["domain"], user.feishu.domain)
     let result = FeishuDeviceFlowClient(http, domain: domain, appId: appId, appSecret: appSecret).poll(pending.deviceCode)
     if (result.status == "authorized") {
+        let scopeDiagnostic = feishuAuthScopeDiagnostic(result.scopes)
+        if (feishuAuthString(scopeDiagnostic, "status") != "ok") {
+            sessionStore.delete(normalized)
+            let out = result.toRedactedJson()
+            out.put("status", JsonString("scope_missing"))
+            out.put("authorized", JsonBool(false))
+            out.put("accountId", JsonString(normalized))
+            out.put("tokenStatus", JsonString(tokenStatus))
+            out.put("pending", JsonBool(false))
+            out.put("scopeDiagnostic", scopeDiagnostic)
+            out.put("scopeSummary", JsonString(feishuAuthScopeSummaryFromArray(result.scopes)))
+            out.put("message", JsonString("Feishu user authorization is missing required user scope(s). Re-run authorization after granting offline_access."))
+            out.put("redacted", JsonBool(true))
+            return out
+        }
         let saved = feishuSaveAuthorizedUserToken(store, normalized, result, nowMs: nowMs)
         sessionStore.delete(normalized)
         return feishuAuthLifecycleTokenStatus(normalized, saved, "Feishu user authorization completed.")
@@ -1084,12 +1099,24 @@ private func feishuAuthRefreshExpiredTokenStatus(
         base.put("message", JsonString("Stored Feishu user authorization refresh did not return an access token."))
         return Some(base)
     }
+    let scopes = if (refreshed.scopes.size > 0) { refreshed.scopes } else { token.scopes }
+    let scopeDiagnostic = feishuAuthScopeDiagnostic(scopes)
+    if (feishuAuthString(scopeDiagnostic, "status") != "ok") {
+        base.put("status", JsonString("scope_missing"))
+        base.put("tokenStatus", JsonString("scope_missing"))
+        base.put("authorized", JsonBool(false))
+        base.put("refreshStatus", JsonString("scope_missing"))
+        base.put("scopeDiagnostic", scopeDiagnostic)
+        base.put("scopeSummary", JsonString(feishuAuthScopeSummaryFromArray(scopes)))
+        base.put("message", JsonString("Stored Feishu user authorization refresh is missing required user scope(s). Re-run authorization after granting offline_access."))
+        return Some(base)
+    }
     let saved = feishuSaveAuthorizedUserToken(store, accountId, FeishuDeviceTokenResult(
         status: "authorized",
         accessToken: refreshed.accessToken,
         refreshToken: if (refreshed.refreshToken.isEmpty()) { token.refreshToken } else { refreshed.refreshToken },
         expiresInSeconds: refreshed.expiresInSeconds,
-        scopes: if (refreshed.scopes.size > 0) { refreshed.scopes } else { token.scopes }
+        scopes: scopes
     ), nowMs: nowMs)
     let out = feishuAuthLifecycleTokenStatus(accountId, saved, "Stored Feishu user authorization was refreshed.")
     out.put("refreshStatus", JsonString("refreshed"))
@@ -1247,6 +1274,7 @@ private func feishuAuthLiveStepFailed(result: JsonObject): Bool {
         case "network_error" => true
         case "parse_error" => true
         case "missing_app_credentials" => true
+        case "scope_missing" => true
         case _ => false
     }
 }

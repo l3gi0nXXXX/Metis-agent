@@ -54,3 +54,48 @@ test("Telegram live opt-in without external resources is a structured skip, not 
     ],
   );
 });
+
+test("writes a phase0-9 and GAP-numbered acceptance checklist with local/external evidence states", () => {
+  const result = runGate();
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const report = readReport(result.reportDir);
+  assert.equal(report.series, "19");
+  assert.equal(report.phases, "0-9");
+  assert.equal(report.acceptance.statuses.localPass, "local-pass");
+  assert.equal(report.acceptance.statuses.externalResourceRequired, "external-resource-required");
+
+  const phases = report.acceptance.phases.map((phase) => phase.id);
+  assert.deepEqual(phases, [
+    "phase0",
+    "phase1",
+    "phase2",
+    "phase3",
+    "phase4",
+    "phase5",
+    "phase6",
+    "phase7",
+    "phase8",
+    "phase9",
+  ]);
+
+  const phase2 = report.acceptance.phases.find((phase) => phase.id === "phase2");
+  assert.equal(phase2.status, "local-pass");
+  assert(phase2.gaps.includes("G02"));
+  assert(phase2.gaps.includes("G05"));
+  assert(phase2.checklist.some((item) => item.id === "M07" && item.status === "local-pass"));
+  assert(phase2.checklist.some((item) => item.id === "M09" && item.status === "local-pass"));
+
+  const gapById = new Map(report.acceptance.gaps.map((gap) => [gap.id, gap]));
+  assert.equal(gapById.get("G01").status, "local-pass");
+  assert.equal(gapById.get("G11").status, "external-resource-required");
+  assert.equal(gapById.get("G18").status, "external-resource-required");
+  assert.equal(gapById.get("G24").status, "local-pass");
+  assert.equal(gapById.get("G25").status, "local-pass");
+
+  const template = fs.readFileSync(path.join(result.reportDir, "manual-acceptance-template.md"), "utf8");
+  assert.match(template, /## Phase 2 Agent Isolation Acceptance/);
+  assert.match(template, /\| G02 \|/);
+  assert.match(template, /\| G11 \| external-resource-required \|/);
+  assert.match(template, /\| G25 \| local-pass \|/);
+});

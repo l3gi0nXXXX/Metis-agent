@@ -130,7 +130,10 @@ public class CliLocalFlowsAgentTeamTest {
     public func teamHelpClarifiesCliGatewayCrudAndImRuntimeBoundary(): Unit {
         let help = cliAgentsTeamProductSemanticsHelpText()
         @Expect(help.contains("Team CRUD is handled by CLI/UI/Gateway RPC"), true)
+        @Expect(help.contains("CRUD methods: list|get|create|update|delete"), true)
+        @Expect(help.contains("JSON responses include semantics.crudSurface=cli-ui-gateway-rpc"), true)
         @Expect(help.contains("Telegram/Feishu IM are runtime entry points"), true)
+        @Expect(help.contains("runtime route/native command only"), true)
         @Expect(help.contains("do not create/update/delete teams"), true)
         @Expect(help.contains("manager is a normal member/defaultAgent"), true)
         @Expect(help.contains("autonomous manager runtime"), true)

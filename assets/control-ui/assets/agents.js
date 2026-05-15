@@ -1,4 +1,4 @@
-import{f as e,o as t,r as n,u as r}from"./i18n.js";import{l as i}from"./format.js";import{A as a,B as o,C as s,D as c,F as l,G as u,H as d,I as f,J as p,K as m,L as h,N as g,O as _,P as v,R as y,S as b,T as x,U as S,V as C,W as w,_ as ee,a as te,b as T,d as E,f as ne,g as re,h as D,k as O,m as ie,n as ae,p as oe,q as se,r as ce,t as le,u as ue,v as de,w as fe,x as k,y as A,z as pe}from"./index.js";import{r as me}from"./channel-config-extras.js";import{i as he,n as ge,r as _e,t as ve}from"./skills-shared.js";function ye(t){let{agent:i,configForm:a,agentFilesList:o,configLoading:s,configSaving:c,configDirty:l,onConfigReload:u,onConfigSave:d,onModelChange:f,onModelFallbacksChange:p,onSelectPanel:m}=t,h=de(a,i.id),g=i.model,_=(o&&o.agentId===i.id?o.workspace:null)||h.entry?.workspace||h.defaults?.workspace||i.workspace||`default`,v=h.entry?.model?T(h.entry?.model):h.defaults?.model?T(h.defaults?.model):T(g),y=T(h.defaults?.model??g),b=k(h.entry?.model),x=k(h.defaults?.model)||(y===`-`?null:re(y))||(a?null:k(g)),S=b??x??null,C=A(h.entry?.model)??A(h.defaults?.model)??(a?null:A(g))??[],w=Array.isArray(h.entry?.skills)?h.entry?.skills:null,te=w?.length??null,E=!!(t.defaultId&&i.id===t.defaultId),D=!a||s||c,O=e=>{let t=C.filter((t,n)=>n!==e);p(i.id,t)};return e`
+import{f as e,o as t,r as n,u as r}from"./i18n.js";import{l as i}from"./format.js";import{A as a,B as o,C as s,D as c,F as l,G as u,H as d,I as f,J as p,K as m,L as h,N as g,O as _,P as v,R as y,S as ee,T as b,U as x,V as S,W as C,_ as te,a as ne,b as w,d as T,f as re,g as ie,h as E,k as D,m as ae,n as oe,p as se,q as ce,r as le,t as ue,u as de,v as O,w as fe,x as k,y as A,z as pe}from"./index.js";import{r as me}from"./channel-config-extras.js";import{i as he,n as ge,r as _e,t as ve}from"./skills-shared.js";function ye(t){let{agent:i,configForm:a,agentFilesList:o,configLoading:s,configSaving:c,configDirty:l,onConfigReload:u,onConfigSave:d,onModelChange:f,onModelFallbacksChange:p,onSelectPanel:m}=t,h=O(a,i.id),g=i.model,_=(o&&o.agentId===i.id?o.workspace:null)||h.entry?.workspace||h.defaults?.workspace||i.workspace||`default`,v=h.entry?.model?w(h.entry?.model):h.defaults?.model?w(h.defaults?.model):w(g),y=w(h.defaults?.model??g),ee=k(h.entry?.model),b=k(h.defaults?.model)||(y===`-`?null:ie(y))||(a?null:k(g)),x=ee??b??null,S=A(h.entry?.model)??A(h.defaults?.model)??(a?null:A(g))??[],C=Array.isArray(h.entry?.skills)?h.entry?.skills:null,ne=C?.length??null,T=!!(t.defaultId&&i.id===t.defaultId),E=!a||s||c,D=e=>{let t=S.filter((t,n)=>n!==e);p(i.id,t)};return e`
     <section class="card">
       <div class="card-title">Overview</div>
       <div class="card-sub">Workspace paths and identity metadata.</div>
@@ -23,7 +23,7 @@ import{f as e,o as t,r as n,u as r}from"./i18n.js";import{l as i}from"./format.j
         </div>
         <div class="agent-kv">
           <div class="label">Skills Filter</div>
-          <div>${w?`${te} selected`:`all skills`}</div>
+          <div>${C?`${ne} selected`:`all skills`}</div>
         </div>
       </div>
 
@@ -37,18 +37,18 @@ import{f as e,o as t,r as n,u as r}from"./i18n.js";import{l as i}from"./format.j
         <div class="label">Model Selection</div>
         <div class="agent-model-fields">
           <label class="field">
-            <span>Primary model${E?` (default)`:``}</span>
+            <span>Primary model${T?` (default)`:``}</span>
             <select
-              .value=${E?S??``:b??``}
-              ?disabled=${D}
+              .value=${T?x??``:ee??``}
+              ?disabled=${E}
               @change=${e=>f(i.id,e.target.value||null)}
             >
-              ${E?e` <option value="">Not set</option> `:e`
+              ${T?e` <option value="">Not set</option> `:e`
                     <option value="">
-                      ${x?`Inherit default (${x})`:`Inherit default`}
+                      ${b?`Inherit default (${b})`:`Inherit default`}
                     </option>
                   `}
-              ${ne(a,S??void 0,t.modelCatalog)}
+              ${re(a,x??void 0,t.modelCatalog)}
             </select>
           </label>
           <div class="field">
@@ -57,24 +57,24 @@ import{f as e,o as t,r as n,u as r}from"./i18n.js";import{l as i}from"./format.j
               class="agent-chip-input"
               @click=${e=>{let t=e.currentTarget.querySelector(`input`);t&&t.focus()}}
             >
-              ${C.map((t,n)=>e`
+              ${S.map((t,n)=>e`
                   <span class="chip">
                     ${t}
                     <button
                       type="button"
                       class="chip-remove"
-                      ?disabled=${D}
-                      @click=${()=>O(n)}
+                      ?disabled=${E}
+                      @click=${()=>D(n)}
                     >
                       &times;
                     </button>
                   </span>
                 `)}
               <input
-                ?disabled=${D}
-                placeholder=${C.length===0?`provider/model`:``}
-                @keydown=${e=>{let t=e.target;if(e.key===`Enter`||e.key===`,`){e.preventDefault();let n=ee(t.value);n.length>0&&(p(i.id,[...C,...n]),t.value=``)}}}
-                @blur=${e=>{let t=e.target,n=ee(t.value);n.length>0&&(p(i.id,[...C,...n]),t.value=``)}}
+                ?disabled=${E}
+                placeholder=${S.length===0?`provider/model`:``}
+                @keydown=${e=>{let t=e.target;if(e.key===`Enter`||e.key===`,`){e.preventDefault();let n=te(t.value);n.length>0&&(p(i.id,[...S,...n]),t.value=``)}}}
+                @blur=${e=>{let t=e.target,n=te(t.value);n.length>0&&(p(i.id,[...S,...n]),t.value=``)}}
               />
             </div>
           </div>
@@ -258,7 +258,7 @@ ${e}
           </div>
           <div class="stat">
             <div class="stat-label">Next wake</div>
-            <div class="stat-value">${te(t.status?.nextWakeAtMs??null)}</div>
+            <div class="stat-value">${ne(t.status?.nextWakeAtMs??null)}</div>
           </div>
         </div>
         ${t.error?e`<div class="callout danger" style="margin-top: 12px;">${t.error}</div>`:r}
@@ -275,7 +275,7 @@ ${e}
                       <div class="list-title">${n.name}</div>
                       ${n.description?e`<div class="list-sub">${n.description}</div>`:r}
                       <div class="chip-row" style="margin-top: 6px;">
-                        <span class="chip">${ae(n)}</span>
+                        <span class="chip">${oe(n)}</span>
                         <span class="chip ${n.enabled?`chip-ok`:`chip-warn`}">
                           ${n.enabled?`enabled`:`disabled`}
                         </span>
@@ -283,8 +283,8 @@ ${e}
                       </div>
                     </div>
                     <div class="list-meta">
-                      <div class="mono">${ce(n)}</div>
-                      <div class="muted">${le(n)}</div>
+                      <div class="mono">${le(n)}</div>
+                      <div class="muted">${ue(n)}</div>
                       <button
                         class="btn btn--sm"
                         style="margin-top: 6px;"
@@ -342,7 +342,7 @@ ${e}
                           title="Preview rendered markdown"
                           @click=${e=>{let t=e.currentTarget.closest(`.card`)?.querySelector(`dialog`);t&&t.showModal()}}
                         >
-                          ${O.eye} Preview
+                          ${D.eye} Preview
                         </button>
                         <button
                           class="btn btn--sm"
@@ -387,21 +387,21 @@ ${e}
                               title="Toggle fullscreen"
                               @click=${e=>{let t=e.currentTarget,n=t.closest(`.md-preview-dialog__panel`);if(!n)return;let r=n.classList.toggle(`fullscreen`);t.classList.toggle(`is-fullscreen`,r)}}
                             >
-                              <span class="when-normal">${O.maximize} Expand</span
-                              ><span class="when-fullscreen">${O.minimize} Collapse</span>
+                              <span class="when-normal">${D.maximize} Expand</span
+                              ><span class="when-fullscreen">${D.minimize} Collapse</span>
                             </button>
                             <button
                               class="btn btn--sm"
                               title="Edit file"
                               @click=${e=>{e.currentTarget.closest(`dialog`)?.close(),document.querySelector(`.agent-file-textarea`)?.focus()}}
                             >
-                              ${O.edit} Editor
+                              ${D.edit} Editor
                             </button>
                             <button
                               class="btn btn--sm"
                               @click=${e=>{e.currentTarget.closest(`dialog`)?.close()}}
                             >
-                              ${O.x} Close
+                              ${D.x} Close
                             </button>
                           </div>
                         </div>
@@ -421,21 +421,21 @@ ${e}
     <div style="display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px;">
       ${o.map(t=>e`<span class="agent-pill">${t}</span>`)}
     </div>
-  `}function Ze(e){return e.source===`plugin`?e.pluginId?n(`agentTools.connectedSource`,{id:e.pluginId}):n(`agentTools.connected`):e.source===`channel`?e.channelId?n(`agentTools.channelSource`,{id:e.channelId}):n(`agentTools.channel`):n(`agentTools.builtIn`)}function Qe(t){let i=de(t.configForm,t.agentId),a=i.entry?.tools??{},o=i.globalTools??{},c=a.profile??o.profile??`full`,l=s(t.toolsCatalogResult),u=fe(t.toolsCatalogResult),d=a.profile?`agent override`:o.profile?`global default`:`default`,f=Array.isArray(a.allow)&&a.allow.length>0,p=Array.isArray(o.allow)&&o.allow.length>0,m=!!t.configForm&&!t.configLoading&&!t.configSaving&&!f&&!(t.toolsCatalogLoading&&!t.toolsCatalogResult&&!t.toolsCatalogError),h=f?[]:Array.isArray(a.alsoAllow)?a.alsoAllow:[],g=f?[]:Array.isArray(a.deny)?a.deny:[],_=f?{allow:a.allow??[],deny:a.deny??[]}:b(c)??void 0,v=u.flatMap(e=>e.tools.map(e=>e.id)),y=e=>{let t=oe(e,_),n=ie(e,h),r=ie(e,g);return{allowed:(t||n)&&!r,baseAllowed:t,denied:r}},S=v.filter(e=>y(e).allowed).length,C=(e,n)=>{let r=new Set(h.map(e=>x(e)).filter(e=>e.length>0)),i=new Set(g.map(e=>x(e)).filter(e=>e.length>0)),a=y(e).baseAllowed,o=x(e);n?(i.delete(o),a||r.add(o)):(r.delete(o),i.add(o)),t.onOverridesChange(t.agentId,[...r],[...i])},w=e=>{let n=new Set(h.map(e=>x(e)).filter(e=>e.length>0)),r=new Set(g.map(e=>x(e)).filter(e=>e.length>0));for(let t of v){let i=y(t).baseAllowed,a=x(t);e?(r.delete(a),i||n.add(a)):(n.delete(a),r.add(a))}t.onOverridesChange(t.agentId,[...n],[...r])};return e`
+  `}function Ze(e){return e.source===`plugin`?e.pluginId?n(`agentTools.connectedSource`,{id:e.pluginId}):n(`agentTools.connected`):e.source===`channel`?e.channelId?n(`agentTools.channelSource`,{id:e.channelId}):n(`agentTools.channel`):n(`agentTools.builtIn`)}function Qe(t){let i=O(t.configForm,t.agentId),a=i.entry?.tools??{},o=i.globalTools??{},c=a.profile??o.profile??`full`,l=s(t.toolsCatalogResult),u=fe(t.toolsCatalogResult),d=a.profile?`agent override`:o.profile?`global default`:`default`,f=Array.isArray(a.allow)&&a.allow.length>0,p=Array.isArray(o.allow)&&o.allow.length>0,m=!!t.configForm&&!t.configLoading&&!t.configSaving&&!f&&!(t.toolsCatalogLoading&&!t.toolsCatalogResult&&!t.toolsCatalogError),h=f?[]:Array.isArray(a.alsoAllow)?a.alsoAllow:[],g=f?[]:Array.isArray(a.deny)?a.deny:[],_=f?{allow:a.allow??[],deny:a.deny??[]}:ee(c)??void 0,v=u.flatMap(e=>e.tools.map(e=>e.id)),y=e=>{let t=se(e,_),n=ae(e,h),r=ae(e,g);return{allowed:(t||n)&&!r,baseAllowed:t,denied:r}},x=v.filter(e=>y(e).allowed).length,S=(e,n)=>{let r=new Set(h.map(e=>b(e)).filter(e=>e.length>0)),i=new Set(g.map(e=>b(e)).filter(e=>e.length>0)),a=y(e).baseAllowed,o=b(e);n?(i.delete(o),a||r.add(o)):(r.delete(o),i.add(o)),t.onOverridesChange(t.agentId,[...r],[...i])},C=e=>{let n=new Set(h.map(e=>b(e)).filter(e=>e.length>0)),r=new Set(g.map(e=>b(e)).filter(e=>e.length>0));for(let t of v){let i=y(t).baseAllowed,a=b(t);e?(r.delete(a),i||n.add(a)):(n.delete(a),r.add(a))}t.onOverridesChange(t.agentId,[...n],[...r])};return e`
     <section class="card">
       <div class="row" style="justify-content: space-between; flex-wrap: wrap;">
         <div style="min-width: 0;">
           <div class="card-title">Tool Access</div>
           <div class="card-sub">
             Profile + per-tool overrides for this agent.
-            <span class="mono">${S}/${v.length}</span> enabled.
+            <span class="mono">${x}/${v.length}</span> enabled.
           </div>
         </div>
         <div class="row" style="gap: 8px; flex-wrap: wrap;">
-          <button class="btn btn--sm" ?disabled=${!m} @click=${()=>w(!0)}>
+          <button class="btn btn--sm" ?disabled=${!m} @click=${()=>C(!0)}>
             Enable All
           </button>
-          <button class="btn btn--sm" ?disabled=${!m} @click=${()=>w(!1)}>
+          <button class="btn btn--sm" ?disabled=${!m} @click=${()=>C(!1)}>
             Disable All
           </button>
           <button
@@ -590,7 +590,7 @@ ${e}
                           type="checkbox"
                           .checked=${r}
                           ?disabled=${!m}
-                          @change=${e=>C(n.id,e.target.checked)}
+                          @change=${e=>S(n.id,e.target.checked)}
                         />
                         <span class="cfg-toggle__track"></span>
                       </label>
@@ -601,7 +601,7 @@ ${e}
           `)}
       </div>
     </section>
-  `}function $e(t){let i=!!t.configForm&&!t.configLoading&&!t.configSaving,a=de(t.configForm,t.agentId),o=Array.isArray(a.entry?.skills)?a.entry?.skills:void 0,s=new Set((o??[]).map(e=>e.trim()).filter(Boolean)),c=o!==void 0,l=!!(t.report&&t.activeAgentId===t.agentId),u=l?t.report?.skills??[]:[],d=t.filter.trim().toLowerCase(),f=d?u.filter(e=>[e.name,e.description,e.source].join(` `).toLowerCase().includes(d)):u,p=he(f),m=c?u.filter(e=>s.has(e.name)).length:u.length,h=u.length;return e`
+  `}function $e(t){let i=!!t.configForm&&!t.configLoading&&!t.configSaving,a=O(t.configForm,t.agentId),o=Array.isArray(a.entry?.skills)?a.entry?.skills:void 0,s=new Set((o??[]).map(e=>e.trim()).filter(Boolean)),c=o!==void 0,l=!!(t.report&&t.activeAgentId===t.agentId),u=l?t.report?.skills??[]:[],d=t.filter.trim().toLowerCase(),f=d?u.filter(e=>[e.name,e.description,e.source].join(` `).toLowerCase().includes(d)):u,p=he(f),m=c?u.filter(e=>s.has(e.name)).length:u.length,h=u.length;return e`
     <section class="card">
       <div class="row" style="justify-content: space-between; flex-wrap: wrap;">
         <div style="min-width: 0;">
@@ -731,39 +731,93 @@ ${e}
         </label>
       </div>
     </div>
-  `}function nt(t){let n=t.list?.teams??[],r=zt(t.draft.membersJson),i=r.length>0?r:t.detail?.members??[],a=Bt(t.draft.aliasesJson),o=a.length>0?a:Vt(t.detail),s=Ht(t.draft.broadcastJson,t.detail?.broadcast),c=t.detail?Lt(t.detail):t.selectedId?t.selectedId:`New team`;return e`
-    ${rt(t,i,s)}
-    ${ft(t,i)}
-    ${it(t)}
+  `}function nt(t){let n=t.list?.teams??[],r=Bt(t.draft.membersJson),i=r.length>0?r:t.detail?.members??[],a=Vt(t.draft.aliasesJson),o=a.length>0?a:Ht(t.detail),s=Ut(t.draft.broadcastJson,t.detail?.broadcast),c=t.detail?R(t.detail):t.selectedId?t.selectedId:`New team`;return e`
+    ${rt(t,n,i,o,s)}
+    ${it(t,i,s)}
+    ${mt(t,i)}
+    ${at(t)}
 
     <section class="grid grid-cols-2">
-      ${pt(t,n)}
-      ${mt(t,c,r,i,o,s)}
-    </section>
-
-    <section class="grid grid-cols-2" style="margin-top: 16px;">
-      ${St(t,i)}
-      ${Ct(t,i)}
+      ${ht(t,n)}
+      ${gt(t,c,r,i,o,s)}
     </section>
 
     <section class="grid grid-cols-2" style="margin-top: 16px;">
       ${wt(t,i)}
-      ${Et(t)}
+      ${Tt(t,i)}
     </section>
 
     <section class="grid grid-cols-2" style="margin-top: 16px;">
-      ${kt()}
-      ${At(t)}
+      ${Et(t,i)}
+      ${Ot(t)}
     </section>
 
-    <section style="margin-top: 16px;">
+    <section class="grid grid-cols-2" style="margin-top: 16px;">
+      ${jt()}
       ${Mt(t)}
     </section>
 
     <section style="margin-top: 16px;">
-      ${Pt(t,n,i)}
+      ${Pt(t)}
     </section>
-  `}function rt(t,n,r){return e`
+
+    <section style="margin-top: 16px;">
+      ${It(t,n,i)}
+    </section>
+  `}function rt(t,n,i,a,o){let s=t.detail?R(t.detail):`Start with a template`,c=V(t.draft.bindingsJson),l=qt(t,n,i,c);return e`
+    <section class="card" style="margin-bottom: 16px;">
+      <div class="row" style="justify-content: space-between; align-items: flex-start;">
+        <div>
+          <div class="card-title">Agent Team Management</div>
+          <div class="card-sub">
+            Create teams, review member state, repair channel setup, and then bind Feishu or Telegram routes from one place.
+          </div>
+        </div>
+        <span class="badge">${t.saving?`saving`:t.loading?`loading`:`ready`}</span>
+      </div>
+      <div class="agents-overview-grid" style="margin-top: 14px;">
+        <div class="agent-kv">
+          <div class="label">Teams</div>
+          <div>${H(n.length,`team`)}</div>
+        </div>
+        <div class="agent-kv">
+          <div class="label">Selected path</div>
+          <div>${s}</div>
+        </div>
+        <div class="agent-kv">
+          <div class="label">Members and aliases</div>
+          <div>${H(i.length,`member`)} · ${H(a.length,`alias`)}</div>
+        </div>
+        <div class="agent-kv">
+          <div class="label">Bindings and broadcast</div>
+          <div>${H(c,`binding`)} · ${B(o)?`broadcast on`:`broadcast off`}</div>
+        </div>
+        <div class="agent-kv">
+          <div class="label">Telegram</div>
+          <div>${Jt(t,`telegram`)}</div>
+        </div>
+        <div class="agent-kv">
+          <div class="label">Feishu</div>
+          <div>${Jt(t,`feishu`)}</div>
+        </div>
+        <div class="agent-kv">
+          <div class="label">Next action</div>
+          <div>${l}</div>
+        </div>
+      </div>
+      ${t.error?e`
+            <div class="callout danger" style="margin-top: 12px;">
+              <div class="list-title">Repair first</div>
+              <div class="list-sub">
+                ${Z(t.error)}. Refresh Gateway status or check the current Control UI token and agent-team RPC permission before editing.
+              </div>
+            </div>
+          `:r}
+      <div class="callout info" style="margin-top: 12px;">
+        Control UI cannot automatically create a Feishu app or bot; it supports guided setup and linking an existing bot through Gateway status, OAuth, and repair steps. Create or install the bot in Feishu developer console first, then associate it here.
+      </div>
+    </section>
+  `}function it(t,n,r){return e`
     <section class="card" style="margin-bottom: 16px;">
       <div class="row" style="justify-content: space-between; align-items: flex-start;">
         <div>
@@ -773,7 +827,7 @@ ${e}
         <span class="badge">Gateway RPC only</span>
       </div>
       <div class="agents-overview-grid" style="margin-top: 14px;">
-        ${[{label:t.detail?`Edit team`:`Create team`,status:t.draft.id?`ready`:`needs key`},{label:`Members`,status:H(n.length,`member`)},{label:`Default`,status:z(t.draft.defaultAgentId,n)},{label:`Bindings`,status:H(V(t.draft.bindingsJson),`binding`)},{label:`Profiles`,status:t.workspace.workspace?`workspace loaded`:`choose member`},{label:`Models`,status:t.modelResult?.models?.path?`models.json loaded`:`load model`},{label:`Feishu`,status:(t.channelsSnapshot?.channelAccounts?.feishu??[]).length?`status visible`:`status missing`},{label:`Broadcast`,status:B(r)?`${U(r.members).length} selected`:`disabled`}].map(t=>e`
+        ${[{label:t.detail?`Edit team`:`Create team`,status:t.draft.id?`ready`:`needs key`},{label:`Members`,status:H(n.length,`member`)},{label:`Default`,status:z(t.draft.defaultAgentId,n)},{label:`Bindings`,status:H(V(t.draft.bindingsJson),`binding`)},{label:`Profiles`,status:t.workspace.workspace?`workspace loaded`:`choose member`},{label:`Models`,status:t.modelResult?.models?.path?`models.json loaded`:`load model`},{label:`Feishu`,status:(t.channelsSnapshot?.channelAccounts?.feishu??[]).length?`status visible`:`status missing`},{label:`Broadcast`,status:B(r)?`${W(r.members).length} selected`:`disabled`}].map(t=>e`
             <div class="agent-kv">
               <div class="label">${t.label}</div>
               <div>${t.status}</div>
@@ -781,7 +835,7 @@ ${e}
           `)}
       </div>
     </section>
-  `}function it(t){let n=ot(t),r=n.filter(e=>e.status===`ready`).length,i=W(t).defaultAccount||t.channelsSnapshot?.channelDefaultAccountId?.feishu||`default`;return e`
+  `}function at(t){let n=st(t),r=n.filter(e=>e.status===`ready`).length,i=G(t).defaultAccount||t.channelsSnapshot?.channelDefaultAccountId?.feishu||`default`;return e`
     <section class="card" style="margin-bottom: 16px;">
       <div class="row" style="justify-content: space-between; align-items: flex-start;">
         <div>
@@ -795,7 +849,7 @@ ${e}
       <div class="callout info" style="margin-top: 12px;">
         Browser repair is limited to Gateway RPC actions and copyable repair steps. Token files, app credential files, and local Feishu config stay behind Gateway RPC or operator-managed backend configuration.
       </div>
-      ${at(t,i)}
+      ${ot(t,i)}
       <div class="agents-overview-grid" style="margin-top: 14px;">
         <div class="agent-kv">
           <div class="label">Account</div>
@@ -828,7 +882,7 @@ ${e}
                   type="button"
                   class="btn btn--sm"
                   title="Copy repair steps"
-                  @click=${()=>st(t.copyText)}
+                  @click=${()=>ct(t.copyText)}
                 >
                   ${t.copyLabel}
                 </button>
@@ -837,11 +891,11 @@ ${e}
           `)}
       </div>
     </section>
-  `}function at(t,n){return e`
+  `}function ot(t,n){return e`
     <div class="callout info" style="margin-top: 12px;">
       <div class="list-title">Link existing Feishu app/bot</div>
       <div class="list-sub">
-        Associate existing app/bot by confirming developer-console credentials, event URL, scopes, bot installation, and a test message through Gateway status. Control UI never stores app secrets or token files.
+        Associate existing app/bot by confirming developer-console credentials, event URL, scopes, bot installation, and a test message through Gateway status. Control UI cannot automatically create a Feishu app or bot; it only provides guided setup and linking an existing bot. Control UI never stores app secrets or token files.
       </div>
       <div class="row" style="gap: 8px; margin-top: 10px;">
         <button
@@ -857,9 +911,9 @@ ${e}
         </button>
       </div>
     </div>
-  `}function ot(e){let t=q(e.channelsSnapshot?.channels?.feishu),n=U(t?.capabilities).map(e=>e.toLowerCase()),r=q(t?.auth)??q(t?.oauth),i=q(t?.doctor)??q(t?.diagnostics),a=W(e),o=ct(e),s=lt(o),c=a.accounts.some(e=>e.configured===!0),l=t?.configured===!0||c||ut(o)||s.some(e=>ut(e)),u=t?.running===!0||n.some(e=>e.includes(`event`)||e.includes(`webhook`)||e.includes(`long`))||dt(o)||s.some(e=>dt(e)),d=K(r,[`missingAppScopes`,`missing_app_scopes`,`appScopeMissing`]),f=K(r,[`missingUserScopes`,`missing_user_scopes`,`userScopeMissing`]),p=G(r),m=r?J(r,[`scopeSummary`,`scopes`,`userScopes`,`grantedUserScopes`],``):``,h=!!(r&&d.length===0&&f.length===0&&(m||p)),g=a.groupCount>0,_=a.threadSession!==`not configured`,v=n.some(e=>e.includes(`oapi`)||e.includes(`openapi`))&&d.length===0,y=n.some(e=>e.includes(`card`)||e.includes(`interactive`)||e.includes(`blockstreaming`)||e.includes(`streaming-card`))&&!Xt(i,`card_unavailable`);return[{title:`App credentials`,status:l?`ready`:`needed`,message:l?`Feishu app credential presence is visible through redacted Gateway status.`:`Missing Feishu app credential signal. Configure app id, app secret, and domain behind Gateway.`,details:[`Open Feishu developer console`,`confirm app id/app secret/domain`,`refresh channels.status`],copyLabel:`Copy credential steps`,copyText:P(`Feishu app credential repair`,[`Open Feishu developer console for the test app.`,`Confirm app id, app secret, and tenant domain in operator-managed Gateway configuration.`,"Restart or refresh Gateway and verify `channels.status` reports the Feishu account as configured.",`Do not paste app secret values into the browser, team metadata, profile files, or comments.`])},{title:`Event subscription`,status:u?`ready`:`needed`,message:u?`Gateway status/config shows Feishu event delivery or runtime activity.`:`Missing event subscription signal. Configure webhook or long-connection receive mode in Feishu and Gateway.`,details:[`subscribe message events`,`include card/reaction/drive/bot events as needed`,`verify Gateway inbound logs`],copyLabel:`Copy event steps`,copyText:P(`Feishu event subscription repair`,[`Open Feishu developer console > Events and callbacks.`,`Configure the request URL or long-connection receive mode used by Gateway.`,`Subscribe to message receive, reaction, card action, drive comment, and bot membership events required by the team.`,"Refresh Control UI and verify `channels.status` plus Gateway logs show Feishu event readiness."])},{title:`Scope repair`,status:h?`ready`:r?`repair`:`needed`,message:h?`Scopes visible: ${m||`authorized`}`:`Missing app scopes: ${I(d,`none reported`)}; missing user scopes: ${I(f,`offline_access or OAPI scopes`)}.`,details:[`grant app scopes in Feishu console`,`grant user scopes through OAuth`,`rerun Gateway OAuth`],copyLabel:`Copy scope repair steps`,copyText:P(`Feishu scope repair`,[`Grant missing app scopes in Feishu developer console: ${I(d,`check OAPI capability requirements`)}.`,`Grant missing user scopes through OAuth: ${I(f,`offline_access and action-specific user scopes`)}.`,"Run `channels.feishu.auth.start` from Gateway RPC or click Start OAuth via Gateway in Control UI.","Poll or complete the OAuth flow through Gateway RPC, then refresh `channels.status`."],r?`Current redacted auth diagnostic:\n${Y(r)}`:`Current auth diagnostic: not visible in channels.status.`)},{title:`Group/thread routing`,status:g&&_?`ready`:`manual`,message:g&&_?`Group policy and thread session settings are visible.`:`Group allowlist or thread session policy is not fully visible. Repair belongs in non-secret Gateway configuration.`,details:[`${g?`group policy visible`:`group policy missing`}`,`${_?`thread policy visible`:`thread policy missing`}`,`use Binding Builder for peer/thread routes`],copyLabel:`Copy routing steps`,copyText:P(`Feishu group/thread routing repair`,[`Confirm the Feishu account id matches the account used by the incoming group.`,`Configure allowed groups and thread session policy in Gateway backend configuration.`,`Use the Teams Binding Builder to preview a structured route with channel, account, peer, thread, team, and roles.`,"Apply the route through `agents.bind` or `agents.teams.update`; do not edit route files from the browser."])},{title:`OAuth device flow`,status:p||e.feishuAuthResult?`ready`:`repair`,message:p||e.feishuAuthResult?`OAuth status or lifecycle result is visible through Gateway RPC.`:`Start OAuth through Gateway RPC after app credentials and scopes are configured.`,details:[`Start OAuth via Gateway`,`Status`,`Poll`,`Complete`,`Revoke local auth`],copyLabel:`Copy OAuth steps`,copyText:P(`Feishu OAuth device-flow repair`,["Click Start OAuth via Gateway or call `channels.feishu.auth.start` with the account id.",`Open the verification URL and enter the user code returned by Gateway.`,`Use Status, Poll, or Complete through Gateway RPC until tokenStatus is authorized.`,`Use Revoke local auth only when intentionally clearing local Gateway auth state.`])},{title:`OAPI readiness`,status:v?`ready`:`manual`,message:v?`OAPI capability is advertised and no app scope gap is visible.`:`OAPI capability or app-scope readiness is incomplete; tools should return structured auth_required or scope_missing diagnostics.`,details:[`docs/wiki/drive/search/calendar/task/sheets/bitable`,`Gateway tool calls only`,`redacted diagnostics`],copyLabel:`Copy OAPI steps`,copyText:P(`Feishu OAPI readiness repair`,[`Grant the action-specific app and user scopes required by the Feishu OAPI tool.`,`Complete OAuth through Gateway so user access token scopes are refreshed.`,"Run the OAPI tool through Gateway or the agent runtime and inspect structured `auth_required`, `scope_missing`, or `app_scope_missing` diagnostics.",`Do not call Feishu OAPI directly from Control UI browser code.`])},{title:`Card readiness`,status:y?`ready`:`manual`,message:y?`Interactive or streaming card capability is visible in Gateway status.`:`Card readiness is not fully visible. Verify card events and live smoke through opt-in Gateway diagnostics.`,details:[`interactive card events`,`streaming card fallback`,`live smoke opt-in`],copyLabel:`Copy card steps`,copyText:P(`Feishu card readiness repair`,[`Enable interactive card callbacks or card action events in the Feishu developer console.`,`Verify Gateway receives card action events and can map them to route/session context.`,`Run card live smoke only with explicit opt-in test credentials.`,`If card patch fails or a message is unavailable, expect Gateway fallback text or a clear diagnostic.`])}]}function st(e){let t=Z(e);typeof navigator>`u`||!navigator.clipboard?.writeText||navigator.clipboard.writeText(t)}function P(e,t,n=``){return[e,``,t.map((e,t)=>`${t+1}. ${e}`).join(`
+  `}function st(e){let t=q(e.channelsSnapshot?.channels?.feishu),n=W(t?.capabilities).map(e=>e.toLowerCase()),r=q(t?.auth)??q(t?.oauth),i=q(t?.doctor)??q(t?.diagnostics),a=G(e),o=lt(e),s=ut(o),c=a.accounts.some(e=>e.configured===!0),l=t?.configured===!0||c||dt(o)||s.some(e=>dt(e)),u=t?.running===!0||n.some(e=>e.includes(`event`)||e.includes(`webhook`)||e.includes(`long`))||ft(o)||s.some(e=>ft(e)),d=K(r,[`missingAppScopes`,`missing_app_scopes`,`appScopeMissing`]),f=K(r,[`missingUserScopes`,`missing_user_scopes`,`userScopeMissing`]),p=Qt(r),m=r?J(r,[`scopeSummary`,`scopes`,`userScopes`,`grantedUserScopes`],``):``,h=!!(r&&d.length===0&&f.length===0&&(m||p)),g=a.groupCount>0,_=a.threadSession!==`not configured`,v=n.some(e=>e.includes(`oapi`)||e.includes(`openapi`))&&d.length===0,y=n.some(e=>e.includes(`card`)||e.includes(`interactive`)||e.includes(`blockstreaming`)||e.includes(`streaming-card`))&&!en(i,`card_unavailable`);return[{title:`App credentials`,status:l?`ready`:`needed`,message:l?`Feishu app credential presence is visible through redacted Gateway status.`:`Missing Feishu app credential signal. Configure app id, app secret, and domain behind Gateway.`,details:[`Open Feishu developer console`,`confirm app id/app secret/domain`,`refresh channels.status`],copyLabel:`Copy credential steps`,copyText:P(`Feishu app credential repair`,[`Open Feishu developer console for the test app.`,`Confirm app id, app secret, and tenant domain in operator-managed Gateway configuration.`,"Restart or refresh Gateway and verify `channels.status` reports the Feishu account as configured.",`Do not paste app secret values into the browser, team metadata, profile files, or comments.`])},{title:`Event subscription`,status:u?`ready`:`needed`,message:u?`Gateway status/config shows Feishu event delivery or runtime activity.`:`Missing event subscription signal. Configure webhook or long-connection receive mode in Feishu and Gateway.`,details:[`subscribe message events`,`include card/reaction/drive/bot events as needed`,`verify Gateway inbound logs`],copyLabel:`Copy event steps`,copyText:P(`Feishu event subscription repair`,[`Open Feishu developer console > Events and callbacks.`,`Configure the request URL or long-connection receive mode used by Gateway.`,`Subscribe to message receive, reaction, card action, drive comment, and bot membership events required by the team.`,"Refresh Control UI and verify `channels.status` plus Gateway logs show Feishu event readiness."])},{title:`Scope repair`,status:h?`ready`:r?`repair`:`needed`,message:h?`Scopes visible: ${m||`authorized`}`:`Missing app scopes: ${F(d,`none reported`)}; missing user scopes: ${F(f,`offline_access or OAPI scopes`)}.`,details:[`grant app scopes in Feishu console`,`grant user scopes through OAuth`,`rerun Gateway OAuth`],copyLabel:`Copy scope repair steps`,copyText:P(`Feishu scope repair`,[`Grant missing app scopes in Feishu developer console: ${F(d,`check OAPI capability requirements`)}.`,`Grant missing user scopes through OAuth: ${F(f,`offline_access and action-specific user scopes`)}.`,"Run `channels.feishu.auth.start` from Gateway RPC or click Start OAuth via Gateway in Control UI.","Poll or complete the OAuth flow through Gateway RPC, then refresh `channels.status`."],r?`Current redacted auth diagnostic:\n${Y(r)}`:`Current auth diagnostic: not visible in channels.status.`)},{title:`Group/thread routing`,status:g&&_?`ready`:`manual`,message:g&&_?`Group policy and thread session settings are visible.`:`Group allowlist or thread session policy is not fully visible. Repair belongs in non-secret Gateway configuration.`,details:[`${g?`group policy visible`:`group policy missing`}`,`${_?`thread policy visible`:`thread policy missing`}`,`use Binding Builder for peer/thread routes`],copyLabel:`Copy routing steps`,copyText:P(`Feishu group/thread routing repair`,[`Confirm the Feishu account id matches the account used by the incoming group.`,`Configure allowed groups and thread session policy in Gateway backend configuration.`,`Use the Teams Binding Builder to preview a structured route with channel, account, peer, thread, team, and roles.`,"Apply the route through `agents.bind` or `agents.teams.update`; do not edit route files from the browser."])},{title:`OAuth device flow`,status:p||e.feishuAuthResult?`ready`:`repair`,message:p||e.feishuAuthResult?`OAuth status or lifecycle result is visible through Gateway RPC.`:`Start OAuth through Gateway RPC after app credentials and scopes are configured.`,details:[`Start OAuth via Gateway`,`Status`,`Poll`,`Complete`,`Revoke local auth`],copyLabel:`Copy OAuth steps`,copyText:P(`Feishu OAuth device-flow repair`,["Click Start OAuth via Gateway or call `channels.feishu.auth.start` with the account id.",`Open the verification URL and enter the user code returned by Gateway.`,`Use Status, Poll, or Complete through Gateway RPC until tokenStatus is authorized.`,`Use Revoke local auth only when intentionally clearing local Gateway auth state.`])},{title:`OAPI readiness`,status:v?`ready`:`manual`,message:v?`OAPI capability is advertised and no app scope gap is visible.`:`OAPI capability or app-scope readiness is incomplete; tools should return structured auth_required or scope_missing diagnostics.`,details:[`docs/wiki/drive/search/calendar/task/sheets/bitable`,`Gateway tool calls only`,`redacted diagnostics`],copyLabel:`Copy OAPI steps`,copyText:P(`Feishu OAPI readiness repair`,[`Grant the action-specific app and user scopes required by the Feishu OAPI tool.`,`Complete OAuth through Gateway so user access token scopes are refreshed.`,"Run the OAPI tool through Gateway or the agent runtime and inspect structured `auth_required`, `scope_missing`, or `app_scope_missing` diagnostics.",`Do not call Feishu OAPI directly from Control UI browser code.`])},{title:`Card readiness`,status:y?`ready`:`manual`,message:y?`Interactive or streaming card capability is visible in Gateway status.`:`Card readiness is not fully visible. Verify card events and live smoke through opt-in Gateway diagnostics.`,details:[`interactive card events`,`streaming card fallback`,`live smoke opt-in`],copyLabel:`Copy card steps`,copyText:P(`Feishu card readiness repair`,[`Enable interactive card callbacks or card action events in the Feishu developer console.`,`Verify Gateway receives card action events and can map them to route/session context.`,`Run card live smoke only with explicit opt-in test credentials.`,`If card patch fails or a message is unavailable, expect Gateway fallback text or a clear diagnostic.`])}]}function ct(e){let t=Z(e);typeof navigator>`u`||!navigator.clipboard?.writeText||navigator.clipboard.writeText(t)}function P(e,t,n=``){return[e,``,t.map((e,t)=>`${t+1}. ${e}`).join(`
 `),``,`Safety: Control UI does not write token files, app credential files, or local Feishu config. Use Gateway RPC or operator-managed backend configuration for real changes.`,n?`\n${n}`:``].filter(Boolean).join(`
-`)}function ct(e){return q(q(e.configForm?.gateway)?.feishu??e.configForm?.feishu)}function lt(e){let t=q(e?.accounts);return t?Object.values(t).map(e=>q(e)).filter(e=>!!e):[]}function ut(e){return e?F(e,[`appId`,`app_id`,`clientId`,`client_id`,`domain`])&&F(e,[`appSecret`,`app_secret`,`clientSecret`,`client_secret`]):!1}function dt(e){return e?F(e,[`webhook`,`webhookUrl`,`eventUrl`,`requestUrl`,`connectionMode`,`receiveMode`])||Array.isArray(e.events)||Array.isArray(e.eventSubscriptions):!1}function F(e,t){return t.some(t=>!!X(e[t]).trim())}function I(e,t){return e.length>0?e.join(`, `):t}function ft(t,n){let r=W(t),i=t.draft.id.trim()||t.selectedId||``,a=!!(t.draft.id.trim()||n.length>0);return e`
+`)}function lt(e){return q(q(e.configForm?.gateway)?.feishu??e.configForm?.feishu)}function ut(e){let t=q(e?.accounts);return t?Object.values(t).map(e=>q(e)).filter(e=>!!e):[]}function dt(e){return e?pt(e,[`appId`,`app_id`,`clientId`,`client_id`,`domain`])&&pt(e,[`appSecret`,`app_secret`,`clientSecret`,`client_secret`]):!1}function ft(e){return e?pt(e,[`webhook`,`webhookUrl`,`eventUrl`,`requestUrl`,`connectionMode`,`receiveMode`])||Array.isArray(e.events)||Array.isArray(e.eventSubscriptions):!1}function pt(e,t){return t.some(t=>!!X(e[t]).trim())}function F(e,t){return e.length>0?e.join(`, `):t}function mt(t,n){let r=G(t),i=t.draft.id.trim()||t.selectedId||``,a=!!(t.draft.id.trim()||n.length>0);return e`
     <section class="card" style="margin-bottom: 16px;">
       <div class="row" style="justify-content: space-between; align-items: flex-start;">
         <div>
@@ -960,7 +1014,7 @@ ${e}
             type="button"
             class="btn btn--sm"
             ?disabled=${!a}
-            @click=${()=>Ft(t.draft)}
+            @click=${()=>Lt(t.draft)}
           >
             Export template JSON
           </button>
@@ -970,7 +1024,7 @@ ${e}
               type="file"
               accept="application/json,.json"
               style="display: none;"
-              @change=${e=>It(e,t)}
+              @change=${e=>Rt(e,t)}
             />
           </label>
         </div>
@@ -979,7 +1033,7 @@ ${e}
         Feishu readiness is checked below from Gateway status. Browser-side repair never writes local token, secret, or auth files.
       </div>
     </section>
-  `}function pt(t,i){return e`
+  `}function ht(t,i){return e`
     <section class="card">
       <div class="row" style="justify-content: space-between; align-items: flex-start;">
         <div>
@@ -995,9 +1049,18 @@ ${e}
           </button>
         </div>
       </div>
-      ${t.error?e`<div class="callout danger" style="margin-top: 12px;">${t.error}</div>`:r}
+      ${t.error?e`
+            <div class="callout danger" style="margin-top: 12px;">
+              <div class="list-title">Repair first</div>
+              <div class="list-sub">${Z(t.error)}</div>
+            </div>
+          `:r}
       ${t.success?e`<div class="callout success" style="margin-top: 12px;">${t.success}</div>`:r}
-      ${i.length===0?e`<div class="callout info" style="margin-top: 12px;">No teams are configured yet.</div>`:e`
+      ${i.length===0?e`
+            <div class="callout info" style="margin-top: 12px;">
+              No teams are configured yet. Create from a template or import a Metis team template, then add members, bindings, profiles, models, and channel setup.
+            </div>
+          `:e`
             <div class="list" style="margin-top: 16px;">
               ${i.map(n=>e`
                   <button
@@ -1008,7 +1071,7 @@ ${e}
                     aria-pressed=${n.id===t.selectedId?`true`:`false`}
                   >
                     <div class="list-main">
-                      <div class="list-title">${Lt(n)}</div>
+                      <div class="list-title">${R(n)}</div>
                       <div class="list-sub">
                         ${H(n.members?.length??0,`member`)} ·
                         ${H(n.aliases?.length??0,`alias`)} · default
@@ -1024,12 +1087,12 @@ ${e}
             </div>
           `}
     </section>
-  `}function mt(t,n,r,i,a,o){return e`
+  `}function gt(t,n,r,i,a,o){return e`
     <section class="card">
       <div class="card-title">${n}</div>
       <div class="card-sub">Create teams, edit members, and keep JSON metadata available for compatibility.</div>
-      ${gt(i,a,t.draft.bindingsJson,o)}
-      ${_t(t,i,a,o)}
+      ${vt(i,a,t.draft.bindingsJson,o)}
+      ${yt(t,i,a,o)}
       <div class="grid grid-cols-2" style="margin-top: 14px;">
         <label class="field">
           <span>Team key</span>
@@ -1088,19 +1151,19 @@ ${e}
       </div>
       ${r.length===0?e`<div class="callout info" style="margin-top: 12px;">Use a template, or add members for a custom team.</div>`:e`
             <div class="list" style="margin-top: 12px;">
-              ${r.map((e,n)=>ht(t,e,n))}
+              ${r.map((e,n)=>_t(t,e,n))}
             </div>
           `}
 
-      ${yt(t,i)}
-      ${vt(i,a,o,t.draft.defaultAgentId)}
-      ${xt(t,i,o)}
+      ${xt(t,i)}
+      ${bt(i,a,o,t.draft.defaultAgentId)}
+      ${Ct(t,i,o)}
 
       <details style="margin-top: 14px;">
         <summary class="muted">Advanced metadata JSON</summary>
-        ${R(`Aliases JSON`,t.draft.aliasesJson,e=>t.onDraftChange({aliasesJson:e}))}
-        ${R(`Team bindings JSON`,t.draft.bindingsJson,e=>t.onDraftChange({bindingsJson:e}))}
-        ${R(`Broadcast JSON`,t.draft.broadcastJson,e=>t.onDraftChange({broadcastJson:e}))}
+        ${L(`Aliases JSON`,t.draft.aliasesJson,e=>t.onDraftChange({aliasesJson:e}))}
+        ${L(`Team bindings JSON`,t.draft.bindingsJson,e=>t.onDraftChange({bindingsJson:e}))}
+        ${L(`Broadcast JSON`,t.draft.broadcastJson,e=>t.onDraftChange({broadcastJson:e}))}
       </details>
 
       <div class="agent-model-actions">
@@ -1130,7 +1193,7 @@ ${e}
         </button>
       </div>
     </section>
-  `}function ht(t,n,r){return e`
+  `}function _t(t,n,r){return e`
     <div class="list-item">
       <div class="list-main">
         <div class="grid grid-cols-3">
@@ -1139,7 +1202,7 @@ ${e}
             <input
               .value=${n.agentId??``}
               placeholder="content-writer"
-              @input=${e=>t.onDraftChange(C(t.draft,r,{agentId:Q(e)}))}
+              @input=${e=>t.onDraftChange(S(t.draft,r,{agentId:Q(e)}))}
             />
           </label>
           <label class="field">
@@ -1147,7 +1210,7 @@ ${e}
             <input
               .value=${n.role??``}
               placeholder="writer"
-              @input=${e=>t.onDraftChange(C(t.draft,r,{role:Q(e)}))}
+              @input=${e=>t.onDraftChange(S(t.draft,r,{role:Q(e)}))}
             />
           </label>
           <label class="field">
@@ -1155,7 +1218,7 @@ ${e}
             <input
               .value=${n.name??``}
               placeholder="Writer"
-              @input=${e=>t.onDraftChange(C(t.draft,r,{name:Q(e)}))}
+              @input=${e=>t.onDraftChange(S(t.draft,r,{name:Q(e)}))}
             />
           </label>
         </div>
@@ -1170,7 +1233,7 @@ ${e}
         </button>
       </div>
     </div>
-  `}function gt(t,n,r,i){return e`
+  `}function vt(t,n,r,i){return e`
     <div class="agents-overview-grid" style="margin-top: 14px;">
       <div class="agent-kv">
         <div class="label">Members</div>
@@ -1189,11 +1252,11 @@ ${e}
         <div>${B(i)?`Broadcast enabled`:`Broadcast disabled`}</div>
       </div>
     </div>
-  `}function _t(t,n,r,i){return e`
+  `}function yt(t,n,r,i){return e`
     <div style="margin-top: 14px;">
       <div class="list-title">Team health summary</div>
       <div class="agents-overview-grid" style="margin-top: 8px;">
-        ${Wt(t,n,r,i).map(t=>e`
+        ${Gt(t,n,r,i).map(t=>e`
             <div class="agent-kv">
               <div class="label">${t.label}</div>
               <div>${t.value}</div>
@@ -1201,7 +1264,7 @@ ${e}
           `)}
       </div>
     </div>
-  `}function vt(t,n,r,i){let a=U(r.members);return e`
+  `}function bt(t,n,r,i){let a=W(r.members);return e`
     <div style="margin-top: 16px;">
       <div class="list-title">Member details</div>
       <div class="list" style="margin-top: 8px;">
@@ -1217,7 +1280,7 @@ ${e}
               `})}
       </div>
     </div>
-  `}function yt(t,n){let r=Bt(t.draft.aliasesJson);return e`
+  `}function xt(t,n){let r=Vt(t.draft.aliasesJson);return e`
     <div class="row" style="justify-content: space-between; margin-top: 16px;">
       <div>
         <div class="list-title">Aliases</div>
@@ -1233,10 +1296,10 @@ ${e}
     </div>
     ${r.length===0?e`<div class="callout info" style="margin-top: 12px;">No aliases are configured.</div>`:e`
           <div class="list" style="margin-top: 12px;">
-            ${r.map((e,r)=>bt(t,n,e,r))}
+            ${r.map((e,r)=>St(t,n,e,r))}
           </div>
         `}
-  `}function bt(t,n,r,i){return e`
+  `}function St(t,n,r,i){return e`
     <div class="list-item">
       <div class="list-main">
         <div class="grid grid-cols-2">
@@ -1264,13 +1327,13 @@ ${e}
         <button
           type="button"
           class="btn btn--sm btn--ghost"
-          @click=${()=>t.onDraftChange(w(t.draft,i))}
+          @click=${()=>t.onDraftChange(C(t.draft,i))}
         >
           Remove
         </button>
       </div>
     </div>
-  `}function xt(t,n,r){let i=B(r),a=U(r.members);return e`
+  `}function Ct(t,n,r){let i=B(r),a=W(r.members);return e`
     <div style="margin-top: 16px;">
       <div class="row" style="justify-content: space-between; align-items: flex-start;">
         <div>
@@ -1298,7 +1361,7 @@ ${e}
             <input
               type="checkbox"
               ?checked=${i}
-              @change=${e=>t.onDraftChange(m(t.draft,rn(e)))}
+              @change=${e=>t.onDraftChange(m(t.draft,cn(e)))}
             />
             <span>${i?`Broadcast enabled`:`Broadcast disabled`}</span>
           </label>
@@ -1316,14 +1379,14 @@ ${e}
                   type="checkbox"
                   ?checked=${o}
                   ?disabled=${!i}
-                  @change=${e=>t.onDraftChange(se(t.draft,r.agentId,rn(e)))}
+                  @change=${e=>t.onDraftChange(ce(t.draft,r.agentId,cn(e)))}
                 />
               </div>
             </label>
           `})}
       </div>
     </div>
-  `}function St(t,n){let i=t.bindingPreview??y(t.binding);return e`
+  `}function wt(t,n){let i=t.bindingPreview??y(t.binding);return e`
     <section class="card">
       <div class="card-title">Binding Builder</div>
       <div class="card-sub">Build channel/account/peer/thread/group/team/role routes before applying them.</div>
@@ -1363,14 +1426,14 @@ ${e}
             @input=${e=>t.onBindingChange({spec:Q(e)})}
           />
         </label>
-        ${L(t,`Channel`,`channel`,`feishu`)}
-        ${L(t,`Account`,`accountId`,`tenant-a`)}
-        ${L(t,`Peer kind`,`peerKind`,`group`)}
-        ${L(t,`Peer id`,`peer`,`chat:oc_123`)}
-        ${L(t,`Thread`,`thread`,`thread:om_456`)}
-        ${L(t,`Group`,`group`,`chat:oc_123`)}
-        ${L(t,`Team`,`team`,`content`)}
-        ${L(t,`Roles`,`roles`,`writer,reviewer`)}
+        ${I(t,`Channel`,`channel`,`feishu`)}
+        ${I(t,`Account`,`accountId`,`tenant-a`)}
+        ${I(t,`Peer kind`,`peerKind`,`group`)}
+        ${I(t,`Peer id`,`peer`,`chat:oc_123`)}
+        ${I(t,`Thread`,`thread`,`thread:om_456`)}
+        ${I(t,`Group`,`group`,`chat:oc_123`)}
+        ${I(t,`Team`,`team`,`content`)}
+        ${I(t,`Roles`,`roles`,`writer,reviewer`)}
       </div>
       <label class="field" style="margin-top: 12px;">
         <span>Comment</span>
@@ -1395,9 +1458,9 @@ ${e}
         <pre style="white-space: pre-wrap; margin: 0;">${i.lines.join(`
 `)}</pre>
       </div>
-      ${t.bindingResult?e`<div class="callout success" style="margin-top: 12px;">${Rt(t.bindingResult)}</div>`:r}
+      ${t.bindingResult?e`<div class="callout success" style="margin-top: 12px;">${zt(t.bindingResult)}</div>`:r}
     </section>
-  `}function L(t,n,r,i){return e`
+  `}function I(t,n,r,i){return e`
     <label class="field">
       <span>${n}</span>
       <input
@@ -1406,7 +1469,7 @@ ${e}
         @input=${e=>t.onBindingChange({[r]:Q(e)})}
       />
     </label>
-  `}function Ct(t,n){return e`
+  `}function Tt(t,n){return e`
     <section class="card">
       <div class="card-title">Workspace Profiles</div>
       <div class="card-sub">Edit Gateway-supported workspace files via agents.files RPC.</div>
@@ -1450,7 +1513,7 @@ ${e}
           class="agent-file-textarea"
           rows="12"
           .value=${t.workspace.draft}
-          @input=${e=>t.onWorkspaceChange({draft:nn(e)})}
+          @input=${e=>t.onWorkspaceChange({draft:sn(e)})}
         ></textarea>
       </label>
       <div class="agent-model-actions">
@@ -1480,7 +1543,7 @@ ${e}
         </button>
       </div>
     </section>
-  `}function wt(t,n){let i=t.modelResult?.models??null;return e`
+  `}function Et(t,n){let i=t.modelResult?.models??null;return e`
     <section class="card">
       <div class="card-title">Model Editor</div>
       <div class="card-sub">Read and write per-agent models.json through Gateway.</div>
@@ -1528,8 +1591,8 @@ ${e}
               <div class="mono">${i.path}</div>
             </div>
           `:r}
-      ${Tt(i)}
-      ${R(`models.json state`,t.modelDraft.stateJson,e=>t.onModelDraftChange({stateJson:e}))}
+      ${Dt(i)}
+      ${L(`models.json state`,t.modelDraft.stateJson,e=>t.onModelDraftChange({stateJson:e}))}
       <div class="agent-model-actions">
         <button
           type="button"
@@ -1549,7 +1612,7 @@ ${e}
         </button>
       </div>
     </section>
-  `}function Tt(t){if(!t)return r;let n=Qt(t);return e`
+  `}function Dt(t){if(!t)return r;let n=nn(t);return e`
     <div style="margin-top: 14px;">
       <div class="list-title">Model provider chips</div>
       <div class="card-sub">Derived from agents.models.get/set and redacted before display.</div>
@@ -1575,7 +1638,7 @@ ${e}
             </div>
           `:r}
     </div>
-  `}function Et(t){let n=W(t);return e`
+  `}function Ot(t){let n=G(t);return e`
     <section class="card">
       <div class="card-title">Feishu Settings</div>
       <div class="card-sub">Non-secret channel settings and account runtime snapshot.</div>
@@ -1626,9 +1689,9 @@ ${e}
         Feishu commands: /feishu start, /feishu doctor, /feishu auth, /feishu info --all.
         Status shown here is read-only and redacted; secrets stay behind Gateway configuration and auth storage.
       </div>
-      ${Dt(t)}
+      ${kt(t)}
     </section>
-  `}function Dt(t){let n=q(t.channelsSnapshot?.channels?.feishu),r=U(n?.capabilities),i=q(n?.auth)??q(n?.oauth),a=q(n?.doctor)??q(n?.diagnostics),o=!!i||r.some(e=>e.includes(`oauth`)),s=r.some(e=>e.includes(`oapi`)||e.includes(`openapi`)),c=!!a||r.some(e=>e.includes(`doctor`));return e`
+  `}function kt(t){let n=q(t.channelsSnapshot?.channels?.feishu),r=W(n?.capabilities),i=q(n?.auth)??q(n?.oauth),a=q(n?.doctor)??q(n?.diagnostics),o=!!i||r.some(e=>e.includes(`oauth`)),s=r.some(e=>e.includes(`oapi`)||e.includes(`openapi`)),c=!!a||r.some(e=>e.includes(`doctor`));return e`
     <div style="margin-top: 14px;">
       <div class="list-title">Capability gaps</div>
       <div class="list" style="margin-top: 8px;">
@@ -1643,7 +1706,7 @@ ${e}
           `)}
       </div>
     </div>
-  `}var Ot=[{title:`AgentTeam Gateway RPC`,badge:`Gateway`,items:[`agents.teams.* team CRUD`,`agents.bind route bindings`,`agents.migration.dryRun read-only doctor preview`]},{title:`Workspace profile files`,badge:`profiles`,items:[...g]},{title:`Model and provider state`,badge:`models`,items:[`agents.models.get`,`agents.models.set`,`per-agent models.json`,`redacted credential source`]},{title:`Channel capabilities`,badge:`channels`,items:[`Telegram route/account/topic baseline`,`Feishu route/account/group/thread status`,`Feishu native commands: /feishu auth, /feishu doctor, /feishu info`]},{title:`Built-in tools`,badge:`tools`,items:[`feishu_media_list`,`feishu_im_user_fetch_resource`,`gateway control tools`,`memory tools`]},{title:`Built-in skills`,badge:`skills`,items:[`workspace skills`,`bundled Metis skills`,`per-agent skill allowlist`]}];function kt(){return e`
+  `}var At=[{title:`AgentTeam Gateway RPC`,badge:`Gateway`,items:[`agents.teams.* team CRUD`,`agents.bind route bindings`,`agents.migration.dryRun read-only doctor preview`]},{title:`Workspace profile files`,badge:`profiles`,items:[...g]},{title:`Model and provider state`,badge:`models`,items:[`agents.models.get`,`agents.models.set`,`per-agent models.json`,`redacted credential source`]},{title:`Channel capabilities`,badge:`channels`,items:[`Telegram route/account/topic baseline`,`Feishu route/account/group/thread status`,`Feishu native commands: /feishu auth, /feishu doctor, /feishu info`]},{title:`Built-in tools`,badge:`tools`,items:[`feishu_media_list`,`feishu_im_user_fetch_resource`,`gateway control tools`,`memory tools`]},{title:`Built-in skills`,badge:`skills`,items:[`workspace skills`,`bundled Metis skills`,`per-agent skill allowlist`]}];function jt(){return e`
     <section class="card">
       <div class="card-title">Metis capabilities</div>
       <div class="card-sub">Metis-owned built-in tools, skills, channel capabilities, and Gateway RPC surfaces.</div>
@@ -1651,7 +1714,7 @@ ${e}
         This is a read-only capability inventory. It does not expose third-party plugin install toggles or copy public branding assets.
       </div>
       <div class="list" style="margin-top: 12px;">
-        ${Ot.map(t=>e`
+        ${At.map(t=>e`
             <div class="list-item">
               <div class="list-main">
                 <div class="list-title">${t.title}</div>
@@ -1662,7 +1725,7 @@ ${e}
           `)}
       </div>
     </section>
-  `}function At(t){let n=q(t.channelsSnapshot?.channels?.feishu),i=U(n?.capabilities),a=q(n?.auth)??q(n?.oauth),o=q(n?.doctor)??q(n?.diagnostics),s=i.some(e=>{let t=e.toLowerCase();return t.includes(`oapi`)||t.includes(`openapi`)}),c=W(t).defaultAccount||t.channelsSnapshot?.channelDefaultAccountId?.feishu||`default`;return e`
+  `}function Mt(t){let n=q(t.channelsSnapshot?.channels?.feishu),i=W(n?.capabilities),a=q(n?.auth)??q(n?.oauth),o=q(n?.doctor)??q(n?.diagnostics),s=i.some(e=>{let t=e.toLowerCase();return t.includes(`oapi`)||t.includes(`openapi`)}),c=G(t).defaultAccount||t.channelsSnapshot?.channelDefaultAccountId?.feishu||`default`;return e`
     <section class="card">
       <div class="card-title">Feishu Auth & Doctor</div>
       <div class="card-sub">Read-only Feishu status, auth, doctor, and OAPI signals from Gateway RPC.</div>
@@ -1705,7 +1768,7 @@ ${e}
       ${o?e`
             <div class="agent-kv" style="margin-top: 12px;">
               <div class="label">Doctor summary</div>
-              <div>${Y(tn(o,[`status`,`state`,`findings`,`lastProbeAt`,`message`]))}</div>
+              <div>${Y(on(o,[`status`,`state`,`findings`,`lastProbeAt`,`message`]))}</div>
             </div>
           `:e`
             <div class="callout warning" style="margin-top: 12px;">
@@ -1760,13 +1823,13 @@ ${e}
               <pre class="mono" style="white-space: pre-wrap; margin: 0;">${Y(t.feishuAuthResult)}</pre>
             </div>
           `:r}
-      ${jt(t,a,o,s)}
+      ${Nt(t,a,o,s)}
     </section>
-  `}function jt(t,n,r,i){return e`
+  `}function Nt(t,n,r,i){return e`
     <div style="margin-top: 14px;">
       <div class="list-title">Missing setup steps</div>
       <div class="list" style="margin-top: 8px;">
-        ${[{label:`Confirm Feishu app credentials`,done:W(t).accounts.some(e=>e.configured===!0)},{label:`Start OAuth through Gateway RPC`,done:!!n||!!t.feishuAuthResult},{label:`Grant offline_access and OAPI scopes`,done:!!(n&&J(n,[`scopeSummary`,`scopes`],``).trim())},{label:`Run Feishu doctor`,done:!!r},{label:`Bind channel/account/peer/thread/team route`,done:!!(t.bindingPreview?.applyPayload||V(t.draft.bindingsJson)>0)},{label:`Expose OAPI capability status`,done:i}].map(t=>e`
+        ${[{label:`Confirm Feishu app credentials`,done:G(t).accounts.some(e=>e.configured===!0)},{label:`Start OAuth through Gateway RPC`,done:!!n||!!t.feishuAuthResult},{label:`Grant offline_access and OAPI scopes`,done:!!(n&&J(n,[`scopeSummary`,`scopes`],``).trim())},{label:`Run Feishu doctor`,done:!!r},{label:`Bind channel/account/peer/thread/team route`,done:!!(t.bindingPreview?.applyPayload||V(t.draft.bindingsJson)>0)},{label:`Expose OAPI capability status`,done:i}].map(t=>e`
             <div class="list-item">
               <div class="list-main">
                 <div class="list-title">${t.label}</div>
@@ -1776,7 +1839,7 @@ ${e}
           `)}
       </div>
     </div>
-  `}function Mt(t){let n=pe({workspace:t.workspace,channelsSnapshot:t.channelsSnapshot}),i=[n.memory,n.heartbeat];return e`
+  `}function Pt(t){let n=pe({workspace:t.workspace,channelsSnapshot:t.channelsSnapshot}),i=[n.memory,n.heartbeat];return e`
     <section class="card">
       <div class="row" style="justify-content: space-between; align-items: flex-start;">
         <div>
@@ -1806,8 +1869,8 @@ ${e}
         </div>
       </div>
       <div class="grid grid-cols-2" style="margin-top: 14px;">
-        ${Nt(`Memory preview`,n.memory.preview)}
-        ${Nt(`Heartbeat preview`,n.heartbeat.preview)}
+        ${Ft(`Memory preview`,n.memory.preview)}
+        ${Ft(`Heartbeat preview`,n.heartbeat.preview)}
       </div>
       <div style="margin-top: 14px;">
         <div class="list-title">Recent doctor findings</div>
@@ -1826,12 +1889,12 @@ ${e}
         Use the Workspace Profiles editor for MEMORY.md and HEARTBEAT.md changes. This panel does not write secrets, tokens, or local files.
       </div>
     </section>
-  `}function Nt(t,n){return e`
+  `}function Ft(t,n){return e`
     <div class="agent-kv">
       <div class="label">${t}</div>
       <div>${n||`Load the file to show a redacted preview.`}</div>
     </div>
-  `}function Pt(t,r,i){let a=Kt(t,r,i);return e`
+  `}function It(t,r,i){let a=Yt(t,r,i);return e`
     <section class="card">
       <div class="row" style="justify-content: space-between;">
         <div>
@@ -1854,23 +1917,23 @@ ${e}
               </div>
               <div class="list-meta">
                 <span class="badge">${n.status}</span>
-                ${Jt(t,n)}
+                ${Zt(t,n)}
               </div>
             </div>
           `)}
       </div>
     </section>
-  `}function R(t,n,r){return e`
+  `}function L(t,n,r){return e`
     <label class="field agent-file-field" style="margin-top: 12px;">
       <span>${t}</span>
       <textarea
         class="agent-file-textarea"
         rows="6"
         .value=${n}
-        @input=${e=>r(nn(e))}
+        @input=${e=>r(sn(e))}
       ></textarea>
     </label>
-  `}function Ft(e){let t=d(e);if(typeof document>`u`||typeof URL>`u`||!URL.createObjectURL)return;let n=new Blob([t],{type:`application/json`}),r=URL.createObjectURL(n),i=document.createElement(`a`);i.href=r,i.download=`${e.id.trim()||`metis-agent-team-template`}.json`,i.click(),URL.revokeObjectURL(r)}function It(e,t){let n=e.target,r=n.files?.[0];if(!r)return;let i=new FileReader;i.onload=()=>{try{t.onDraftChange(S(String(i.result??``)))}catch{}finally{n.value=``}},i.readAsText(r)}function Lt(e){return e.displayName?.trim()||e.id}function z(e,t){if(!e)return`first configured member`;let n=t.find(t=>t.agentId===e);return n?`${n.name?.trim()||n.role?.trim()||n.agentId} (${n.agentId})`:e}function Rt(e){let t=[e.added?.length?`${e.added.length} added`:``,e.removed?.length?`${e.removed.length} removed`:``,e.skipped?.length?`${e.skipped.length} skipped`:``,e.missing?.length?`${e.missing.length} missing`:``,e.conflicts?.length?`${e.conflicts.length} conflicts`:``].filter(Boolean);return t.length?t.join(`, `):`Gateway accepted the binding request.`}function zt(e){try{let t=JSON.parse(e||`[]`);return Array.isArray(t)?t:[]}catch{return[]}}function Bt(e){try{let t=JSON.parse(e||`[]`);return Array.isArray(t)?t.map(e=>q(e)).filter(e=>!!e).map(e=>({alias:X(e.alias),agentId:X(e.agentId)})).filter(e=>e.alias||e.agentId):[]}catch{return[]}}function Vt(e){return Array.isArray(e?.aliases)?e.aliases.map(e=>q(e)).filter(e=>!!e).map(e=>({alias:X(e.alias),agentId:X(e.agentId)})).filter(e=>e.alias||e.agentId):[]}function Ht(e,t){try{return q(JSON.parse(e||`{}`))??t??{enabled:!1}}catch{return t??{enabled:!1}}}function B(e){return q(e)?.enabled===!0}function V(e){try{let t=JSON.parse(e||`[]`);return Array.isArray(t)?t.length:0}catch{return 0}}function Ut(e){try{let t=JSON.parse(e||`[]`);return Array.isArray(t)?t:[]}catch{return[]}}function Wt(e,t,n,r){let i=new Set(t.map(e=>e.agentId).filter(Boolean)),a=Ut(e.draft.bindingsJson).map(e=>q(e)).filter(Boolean).map(e=>X(e?.agentId)).filter(Boolean).filter(e=>!i.has(e)),o=Gt(n.map(e=>e.alias.toLowerCase()).filter(Boolean)),s=t.filter(t=>t.agentId&&e.workspace.agentId!==t.agentId).map(e=>e.agentId),c=e.modelResult?.models?.agentId||e.modelDraft.agentId,l=t.filter(e=>e.agentId&&c!==e.agentId).map(e=>e.agentId),u=q(e.channelsSnapshot?.channels?.feishu),d=G(q(u?.auth)??q(u?.oauth))?[]:[`Feishu OAuth`],f=u?.configured===!0&&u?.running===!0&&(e.channelsSnapshot?.channelAccounts?.feishu??[]).length>0&&d.length===0;return[{label:`Routing conflicts`,value:[...a,...o].join(`, `)||`none`},{label:`Missing profiles`,value:s.join(`, `)||`none`},{label:`Missing model`,value:l.join(`, `)||`none`},{label:`Missing auth`,value:d.join(`, `)||`none`},{label:`Feishu readiness`,value:f?`ready`:`needs repair`},{label:`Broadcast members`,value:B(r)?H(U(r.members).length,`member`):`disabled`}]}function Gt(e){let t=new Set,n=new Set;return e.forEach(e=>{t.has(e)?n.add(e):t.add(e)}),Array.from(n)}function H(e,t){return`${e} ${t}${e===1?``:`s`}`}function U(e){return Array.isArray(e)?e.filter(e=>typeof e==`string`).map(e=>e.trim()).filter(Boolean):[]}function W(e){let t=q(q(e.configForm?.gateway)?.feishu??e.configForm?.feishu),n=q(t?.accounts),r=q(t?.groups),i=e.channelsSnapshot?.channelAccounts?.feishu??[],a=n?Object.keys(n):[],o=X(t?.defaultAccount)||e.channelsSnapshot?.channelDefaultAccountId?.feishu||i[0]?.accountId||a[0]||``,s=i.length>0?i:a.map(e=>({accountId:e,configured:!0}));return{defaultAccount:o,threadSession:X(t?.threadSession)||X(t?.groupSessionScope)||`not configured`,groupCount:r?Object.keys(r).length:0,accounts:s}}function Kt(e,t,n){return[{title:`Teams list`,message:t.length>0?`${t.length} team definitions loaded.`:`No team definitions loaded.`,status:t.length>0?`ok`:`info`},{title:`Members`,message:n.length>0?`${n.length} members available for edit.`:`No members selected.`,status:n.length>0?`ok`:`warn`},{title:`Binding preview`,message:e.bindingPreview?.applyPayload?`Apply payload is ready.`:`Preview a binding before applying.`,status:e.bindingPreview?.applyPayload?`ok`:`info`},{title:`Workspace profiles`,message:e.workspace.workspace?`Workspace loaded: ${e.workspace.workspace}`:`Choose a member and list files.`,status:e.workspace.workspace?`ok`:`info`},{title:`Model profile`,message:e.modelResult?.models?.path?`models.json: ${e.modelResult.models.path}`:`Load a member model.`,status:e.modelResult?.models?.path?`ok`:`info`},...qt(e)]}function qt(e){let t=W(e),n=q(e.channelsSnapshot?.channels?.feishu),r=U(n?.capabilities).map(e=>e.toLowerCase()),i=q(n?.auth)??q(n?.oauth),a=q(n?.doctor)??q(n?.diagnostics),o=r.some(e=>e.includes(`oapi`)||e.includes(`openapi`)),s=K(i,[`missingAppScopes`,`missing_app_scopes`,`appScopeMissing`]),c=K(i,[`missingUserScopes`,`missing_user_scopes`,`userScopeMissing`]),l=G(i),u=l&&c.length===0&&Yt(i),d=t.groupCount===0||Xt(a,`disabled_group_policy`),f=V(e.draft.bindingsJson)>0||!!e.bindingPreview?.applyPayload,p=t.accounts.length>0,m=s.length===0&&o;return[{title:l?`OAuth authorized`:`Missing OAuth`,message:l?`Feishu account ${t.defaultAccount||`default`} has an authorized OAuth status.`:`Start OAuth through Gateway RPC; the browser will not write token files.`,status:l?`ok`:`repair`,action:l?void 0:`start-feishu-oauth`},{title:m?`App scope ready`:`Missing app scope`,message:m?`Feishu OAPI/app scope capability is advertised by Gateway status.`:`Missing app scopes: ${s.length?s.join(`, `):`OAPI capability not advertised`}. Update the Feishu app in backend/admin config, then refresh.`,status:m?`ok`:`manual`,action:m?void 0:`refresh`},{title:u?`User scope ready`:`Missing user scope`,message:u?`User OAuth scopes include offline access.`:`Missing user scopes: ${c.length?c.join(`, `):`offline_access`}. Re-run Gateway OAuth after app scopes are granted.`,status:u?`ok`:`repair`,action:u?void 0:`start-feishu-oauth`},{title:p?`Channel account ready`:`Missing channel account`,message:p?`channels.status exposes a redacted Feishu channel account.`:`No redacted Feishu channel account is visible. Configure the account behind Gateway, then refresh.`,status:p?`ok`:`manual`,action:p?void 0:`refresh`},{title:d?`Disabled group policy`:`Group policy ready`,message:d?`No Feishu group policy is visible or doctor reports disabled_group_policy. Repair belongs in non-secret Gateway configuration.`:`Feishu group policy is visible in Control UI status/config.`,status:d?`manual`:`ok`,action:d?`refresh`:void 0},{title:f?`Binding ready`:`Missing binding`,message:f?`Team binding metadata or a Binding Builder preview is ready.`:`Seed a Telegram or Feishu route, preview it, then apply it through agents.bind.`,status:f?`ok`:`repair`,action:f?e.bindingPreview?.applyPayload?`apply-binding`:void 0:`preview-binding`}]}function Jt(t,n){if(!n.action)return r;if(n.action===`start-feishu-oauth`){let n=W(t).defaultAccount||t.channelsSnapshot?.channelDefaultAccountId?.feishu||`default`;return e`
+  `}function Lt(e){let t=d(e);if(typeof document>`u`||typeof URL>`u`||!URL.createObjectURL)return;let n=new Blob([t],{type:`application/json`}),r=URL.createObjectURL(n),i=document.createElement(`a`);i.href=r,i.download=`${e.id.trim()||`metis-agent-team-template`}.json`,i.click(),URL.revokeObjectURL(r)}function Rt(e,t){let n=e.target,r=n.files?.[0];if(!r)return;let i=new FileReader;i.onload=()=>{try{t.onDraftChange(x(String(i.result??``)))}catch{}finally{n.value=``}},i.readAsText(r)}function R(e){return e.displayName?.trim()||e.id}function z(e,t){if(!e)return`first configured member`;let n=t.find(t=>t.agentId===e);return n?`${n.name?.trim()||n.role?.trim()||n.agentId} (${n.agentId})`:e}function zt(e){let t=[e.added?.length?`${e.added.length} added`:``,e.removed?.length?`${e.removed.length} removed`:``,e.skipped?.length?`${e.skipped.length} skipped`:``,e.missing?.length?`${e.missing.length} missing`:``,e.conflicts?.length?`${e.conflicts.length} conflicts`:``].filter(Boolean);return t.length?t.join(`, `):`Gateway accepted the binding request.`}function Bt(e){try{let t=JSON.parse(e||`[]`);return Array.isArray(t)?t:[]}catch{return[]}}function Vt(e){try{let t=JSON.parse(e||`[]`);return Array.isArray(t)?t.map(e=>q(e)).filter(e=>!!e).map(e=>({alias:X(e.alias),agentId:X(e.agentId)})).filter(e=>e.alias||e.agentId):[]}catch{return[]}}function Ht(e){return Array.isArray(e?.aliases)?e.aliases.map(e=>q(e)).filter(e=>!!e).map(e=>({alias:X(e.alias),agentId:X(e.agentId)})).filter(e=>e.alias||e.agentId):[]}function Ut(e,t){try{return q(JSON.parse(e||`{}`))??t??{enabled:!1}}catch{return t??{enabled:!1}}}function B(e){return q(e)?.enabled===!0}function V(e){try{let t=JSON.parse(e||`[]`);return Array.isArray(t)?t.length:0}catch{return 0}}function Wt(e){try{let t=JSON.parse(e||`[]`);return Array.isArray(t)?t:[]}catch{return[]}}function Gt(e,t,n,r){let i=new Set(t.map(e=>e.agentId).filter(Boolean)),a=Wt(e.draft.bindingsJson).map(e=>q(e)).filter(Boolean).map(e=>X(e?.agentId)).filter(Boolean).filter(e=>!i.has(e)),o=Kt(n.map(e=>e.alias.toLowerCase()).filter(Boolean)),s=t.filter(t=>t.agentId&&e.workspace.agentId!==t.agentId).map(e=>e.agentId),c=e.modelResult?.models?.agentId||e.modelDraft.agentId,l=t.filter(e=>e.agentId&&c!==e.agentId).map(e=>e.agentId),u=q(e.channelsSnapshot?.channels?.feishu),d=Qt(q(u?.auth)??q(u?.oauth))?[]:[`Feishu OAuth`],f=u?.configured===!0&&u?.running===!0&&(e.channelsSnapshot?.channelAccounts?.feishu??[]).length>0&&d.length===0;return[{label:`Routing conflicts`,value:[...a,...o].join(`, `)||`none`},{label:`Missing profiles`,value:s.join(`, `)||`none`},{label:`Missing model`,value:l.join(`, `)||`none`},{label:`Missing auth`,value:d.join(`, `)||`none`},{label:`Feishu readiness`,value:f?`ready`:`needs repair`},{label:`Broadcast members`,value:B(r)?H(W(r.members).length,`member`):`disabled`}]}function Kt(e){let t=new Set,n=new Set;return e.forEach(e=>{t.has(e)?n.add(e):t.add(e)}),Array.from(n)}function H(e,t){return e===1?`${e} ${t}`:`${e} ${t===`alias`?`aliases`:`${t}s`}`}function qt(e,t,n,r){return e.error?`Repair Gateway RPC access`:t.length===0&&n.length===0?`Start with a template`:n.length===0?`Add team members`:r===0&&!e.bindingPreview?.applyPayload?`Preview a channel binding`:e.workspace.workspace?e.modelResult?.models?U(e,`feishu`)||U(e,`telegram`)?`Review and save team changes`:`Repair channel setup`:`Load member model state`:`Load member profile files`}function Jt(e,t){return`${t===`feishu`?`Feishu`:`Telegram`} ${U(e,t)?`ready`:`needs setup`}`}function U(e,t){let n=q(e.channelsSnapshot?.channels?.[t]),r=e.channelsSnapshot?.channelAccounts?.[t]??[];return n?.configured===!0||n?.running===!0||r.some(e=>e.configured===!0||e.running===!0||e.connected===!0)}function W(e){return Array.isArray(e)?e.filter(e=>typeof e==`string`).map(e=>e.trim()).filter(Boolean):[]}function G(e){let t=q(q(e.configForm?.gateway)?.feishu??e.configForm?.feishu),n=q(t?.accounts),r=q(t?.groups),i=e.channelsSnapshot?.channelAccounts?.feishu??[],a=n?Object.keys(n):[],o=X(t?.defaultAccount)||e.channelsSnapshot?.channelDefaultAccountId?.feishu||i[0]?.accountId||a[0]||``,s=i.length>0?i:a.map(e=>({accountId:e,configured:!0}));return{defaultAccount:o,threadSession:X(t?.threadSession)||X(t?.groupSessionScope)||`not configured`,groupCount:r?Object.keys(r).length:0,accounts:s}}function Yt(e,t,n){return[{title:`Teams list`,message:t.length>0?`${t.length} team definitions loaded.`:`No team definitions loaded.`,status:t.length>0?`ok`:`info`},{title:`Members`,message:n.length>0?`${n.length} members available for edit.`:`No members selected.`,status:n.length>0?`ok`:`warn`},{title:`Binding preview`,message:e.bindingPreview?.applyPayload?`Apply payload is ready.`:`Preview a binding before applying.`,status:e.bindingPreview?.applyPayload?`ok`:`info`},{title:`Workspace profiles`,message:e.workspace.workspace?`Workspace loaded: ${e.workspace.workspace}`:`Choose a member and list files.`,status:e.workspace.workspace?`ok`:`info`},{title:`Model profile`,message:e.modelResult?.models?.path?`models.json: ${e.modelResult.models.path}`:`Load a member model.`,status:e.modelResult?.models?.path?`ok`:`info`},...Xt(e)]}function Xt(e){let t=G(e),n=q(e.channelsSnapshot?.channels?.feishu),r=W(n?.capabilities).map(e=>e.toLowerCase()),i=q(n?.auth)??q(n?.oauth),a=q(n?.doctor)??q(n?.diagnostics),o=r.some(e=>e.includes(`oapi`)||e.includes(`openapi`)),s=K(i,[`missingAppScopes`,`missing_app_scopes`,`appScopeMissing`]),c=K(i,[`missingUserScopes`,`missing_user_scopes`,`userScopeMissing`]),l=Qt(i),u=l&&c.length===0&&$t(i),d=t.groupCount===0||en(a,`disabled_group_policy`),f=V(e.draft.bindingsJson)>0||!!e.bindingPreview?.applyPayload,p=t.accounts.length>0,m=s.length===0&&o;return[{title:l?`OAuth authorized`:`Missing OAuth`,message:l?`Feishu account ${t.defaultAccount||`default`} has an authorized OAuth status.`:`Start OAuth through Gateway RPC; the browser will not write token files.`,status:l?`ok`:`repair`,action:l?void 0:`start-feishu-oauth`},{title:m?`App scope ready`:`Missing app scope`,message:m?`Feishu OAPI/app scope capability is advertised by Gateway status.`:`Missing app scopes: ${s.length?s.join(`, `):`OAPI capability not advertised`}. Update the Feishu app in backend/admin config, then refresh.`,status:m?`ok`:`manual`,action:m?void 0:`refresh`},{title:u?`User scope ready`:`Missing user scope`,message:u?`User OAuth scopes include offline access.`:`Missing user scopes: ${c.length?c.join(`, `):`offline_access`}. Re-run Gateway OAuth after app scopes are granted.`,status:u?`ok`:`repair`,action:u?void 0:`start-feishu-oauth`},{title:p?`Channel account ready`:`Missing channel account`,message:p?`channels.status exposes a redacted Feishu channel account.`:`No redacted Feishu channel account is visible. Configure the account behind Gateway, then refresh.`,status:p?`ok`:`manual`,action:p?void 0:`refresh`},{title:d?`Disabled group policy`:`Group policy ready`,message:d?`No Feishu group policy is visible or doctor reports disabled_group_policy. Repair belongs in non-secret Gateway configuration.`:`Feishu group policy is visible in Control UI status/config.`,status:d?`manual`:`ok`,action:d?`refresh`:void 0},{title:f?`Binding ready`:`Missing binding`,message:f?`Team binding metadata or a Binding Builder preview is ready.`:`Seed a Telegram or Feishu route, preview it, then apply it through agents.bind.`,status:f?`ok`:`repair`,action:f?e.bindingPreview?.applyPayload?`apply-binding`:void 0:`preview-binding`}]}function Zt(t,n){if(!n.action)return r;if(n.action===`start-feishu-oauth`){let n=G(t).defaultAccount||t.channelsSnapshot?.channelDefaultAccountId?.feishu||`default`;return e`
       <button
         type="button"
         class="btn btn--sm"
@@ -1888,7 +1951,7 @@ ${e}
       >
         Apply binding
       </button>
-    `:e`<button type="button" class="btn btn--sm" @click=${t.onPreviewBinding}>Preview binding</button>`}function G(e){if(!e)return!1;let t=[`status`,`tokenStatus`,`state`].map(t=>X(e[t]).toLowerCase()).filter(Boolean);return t.some(e=>e.includes(`missing`)||e.includes(`expired`))?!1:t.some(e=>[`authorized`,`ok`,`active`,`valid`].includes(e))}function Yt(e){return e?[...K(e,[`scopeSummary`,`scopes`,`userScopes`,`grantedUserScopes`])].map(e=>e.toLowerCase()).some(e=>e===`offline_access`||e.includes(`offline_access`)):!1}function K(e,t){if(!e)return[];for(let n of t){let t=e[n];if(Array.isArray(t))return U(t);if(typeof t==`string`&&t.trim())return t.split(/[\s,]+/).map(e=>e.trim()).filter(Boolean)}return[]}function Xt(e,t){if(!e)return!1;let n=t.toLowerCase();return Object.values(e).some(e=>Zt(e,n))}function Zt(e,t){if(typeof e==`string`)return e.toLowerCase().includes(t);if(Array.isArray(e))return e.some(e=>Zt(e,t));let n=q(e);return n?Object.values(n).some(e=>Zt(e,t)):!1}function q(e){return e&&typeof e==`object`&&!Array.isArray(e)?e:null}function Qt(e){let t=q(e.state)?.providers,n=[];if(Array.isArray(t))t.forEach(e=>{let t=$t(q(e));t&&n.push(t)});else{let e=q(t);e&&Object.entries(e).forEach(([e,t])=>{let r=q(t)??{provider:e},i=$t({...r,provider:r.provider??e});i&&n.push(i)})}if(n.length===0&&e.primaryModelRef){let t=e.primaryModelRef.includes(`:`)?e.primaryModelRef.split(`:`)[0]:``;n.push({label:t||`Primary model`,provider:t,runtimeProvider:t,modelRef:e.primaryModelRef,status:`primary`})}return n}function $t(e){if(!e)return null;let t=X(e.provider)||X(e.id),n=X(e.runtimeProvider)||X(e.runtime_provider),r=X(e.defaultModelRef)||X(e.modelRef)||X(e.model)||X(e.runtimeModelRef),i=X(e.displayName)||X(e.name)||t||n||r;return i?{label:i,provider:t,runtimeProvider:n,modelRef:r,status:en(e.configured)}:null}function en(e){return e===!0?`configured`:e===!1?`needs credentials`:`status unknown`}function J(e,t,n){for(let n of t){let t=e[n];if(typeof t==`string`&&t.trim())return Z(t.trim());if(typeof t==`number`||typeof t==`boolean`)return String(t);if(Array.isArray(t)){let e=t.map(e=>String(e).trim()).filter(Boolean).join(`, `);if(e)return Z(e)}}return n}function tn(e,t){let n={};return t.forEach(t=>{e[t]!==void 0&&(n[t]=e[t])}),n}function Y(e){try{return Z(JSON.stringify(e??{},null,2))}catch{return Z(String(e??``))}}function X(e){return typeof e==`string`?e:``}function Z(e){return e.replace(/\bBearer\s+[^\s"',;]+/gi,`Bearer [redacted]`).replace(/authorization:\s*bearer\s+[^\s,;]+/gi,`Authorization: Bearer [redacted]`).replace(/\b(access|refresh|bot|app)[_-]?token\s*[:=]\s*[^\s,;]+/gi,`$1_token=[redacted]`).replace(/(["']?(?:access|refresh|bot|app)[_-]?token["']?\s*[:=]\s*)["']?[^"',;\s]+["']?/gi,`$1[redacted]`).replace(/\b(app[_-]?secret|authorization)\s*[:=]\s*[^\s,;]+/gi,`$1=[redacted]`)}function Q(e){return e.target.value}function $(e){return e.target.value}function nn(e){return e.target.value}function rn(e){return e.target.checked}function an(t){let i=t.agentsList?.agents??[],a=t.agentsList?.defaultId??null,o=t.selectedAgentId??a??i[0]?.id??null,s=o?i.find(e=>e.id===o)??null:null,c=o&&t.agentSkills.agentId===o?t.agentSkills.report?.skills?.length??null:null,l=t.channels.snapshot?Object.keys(t.channels.snapshot.channelAccounts??{}).length:null,u=o?t.cron.jobs.filter(e=>e.agentId===o).length:null,d={files:t.agentFiles.list?.files?.length??null,skills:c,channels:l,cron:u||null,teams:t.agentTeams.list?.count??null};return e`
+    `:e`<button type="button" class="btn btn--sm" @click=${t.onPreviewBinding}>Preview binding</button>`}function Qt(e){if(!e)return!1;let t=[`status`,`tokenStatus`,`state`].map(t=>X(e[t]).toLowerCase()).filter(Boolean);return t.some(e=>e.includes(`missing`)||e.includes(`expired`))?!1:t.some(e=>[`authorized`,`ok`,`active`,`valid`].includes(e))}function $t(e){return e?[...K(e,[`scopeSummary`,`scopes`,`userScopes`,`grantedUserScopes`])].map(e=>e.toLowerCase()).some(e=>e===`offline_access`||e.includes(`offline_access`)):!1}function K(e,t){if(!e)return[];for(let n of t){let t=e[n];if(Array.isArray(t))return W(t);if(typeof t==`string`&&t.trim())return t.split(/[\s,]+/).map(e=>e.trim()).filter(Boolean)}return[]}function en(e,t){if(!e)return!1;let n=t.toLowerCase();return Object.values(e).some(e=>tn(e,n))}function tn(e,t){if(typeof e==`string`)return e.toLowerCase().includes(t);if(Array.isArray(e))return e.some(e=>tn(e,t));let n=q(e);return n?Object.values(n).some(e=>tn(e,t)):!1}function q(e){return e&&typeof e==`object`&&!Array.isArray(e)?e:null}function nn(e){let t=q(e.state)?.providers,n=[];if(Array.isArray(t))t.forEach(e=>{let t=rn(q(e));t&&n.push(t)});else{let e=q(t);e&&Object.entries(e).forEach(([e,t])=>{let r=q(t)??{provider:e},i=rn({...r,provider:r.provider??e});i&&n.push(i)})}if(n.length===0&&e.primaryModelRef){let t=e.primaryModelRef.includes(`:`)?e.primaryModelRef.split(`:`)[0]:``;n.push({label:t||`Primary model`,provider:t,runtimeProvider:t,modelRef:e.primaryModelRef,status:`primary`})}return n}function rn(e){if(!e)return null;let t=X(e.provider)||X(e.id),n=X(e.runtimeProvider)||X(e.runtime_provider),r=X(e.defaultModelRef)||X(e.modelRef)||X(e.model)||X(e.runtimeModelRef),i=X(e.displayName)||X(e.name)||t||n||r;return i?{label:i,provider:t,runtimeProvider:n,modelRef:r,status:an(e.configured)}:null}function an(e){return e===!0?`configured`:e===!1?`needs credentials`:`status unknown`}function J(e,t,n){for(let n of t){let t=e[n];if(typeof t==`string`&&t.trim())return Z(t.trim());if(typeof t==`number`||typeof t==`boolean`)return String(t);if(Array.isArray(t)){let e=t.map(e=>String(e).trim()).filter(Boolean).join(`, `);if(e)return Z(e)}}return n}function on(e,t){let n={};return t.forEach(t=>{e[t]!==void 0&&(n[t]=e[t])}),n}function Y(e){try{return Z(JSON.stringify(e??{},null,2))}catch{return Z(String(e??``))}}function X(e){return typeof e==`string`?e:``}function Z(e){return e.replace(/\bBearer\s+[^\s"',;]+/gi,`Bearer [redacted]`).replace(/authorization:\s*bearer\s+[^\s,;]+/gi,`Authorization: Bearer [redacted]`).replace(/\b(access|refresh|bot|app)[_-]?token\s*[:=]\s*[^\s,;]+/gi,`$1_token=[redacted]`).replace(/(["']?(?:access|refresh|bot|app)[_-]?token["']?\s*[:=]\s*)["']?[^"',;\s]+["']?/gi,`$1[redacted]`).replace(/\b(app[_-]?secret|authorization)\s*[:=]\s*[^\s,;]+/gi,`$1=[redacted]`)}function Q(e){return e.target.value}function $(e){return e.target.value}function sn(e){return e.target.value}function cn(e){return e.target.checked}function ln(t){let i=t.agentsList?.agents??[],a=t.agentsList?.defaultId??null,o=t.selectedAgentId??a??i[0]?.id??null,s=o?i.find(e=>e.id===o)??null:null,c=o&&t.agentSkills.agentId===o?t.agentSkills.report?.skills?.length??null:null,l=t.channels.snapshot?Object.keys(t.channels.snapshot.channelAccounts??{}).length:null,u=o?t.cron.jobs.filter(e=>e.agentId===o).length:null,d={files:t.agentFiles.list?.files?.length??null,skills:c,channels:l,cron:u||null,teams:t.agentTeams.list?.count??null};return e`
     <div class="agents-layout">
       <section class="agents-toolbar">
         <div class="agents-toolbar-row">
@@ -1901,7 +1964,7 @@ ${e}
             >
               ${i.length===0?e` <option value="">No agents</option> `:i.map(t=>e`
                       <option value=${t.id} ?selected=${t.id===o}>
-                        ${D(t)}${ue(t.id,a)?` (${ue(t.id,a)})`:``}
+                        ${E(t)}${de(t.id,a)?` (${de(t.id,a)})`:``}
                       </option>
                     `)}
             </select>
@@ -1938,7 +2001,7 @@ ${e}
         ${t.error?e`<div class="callout danger" style="margin-top: 8px;">${t.error}</div>`:r}
       </section>
       <section class="agents-main">
-        ${on(t.activePanel,e=>t.onSelectPanel(e),d)}
+        ${un(t.activePanel,e=>t.onSelectPanel(e),d)}
         ${!s&&t.activePanel!==`teams`?e`
               <div class="card">
                 <div class="card-title">Select an agent</div>
@@ -1949,13 +2012,13 @@ ${e}
               ${t.activePanel===`files`?Ye({agentId:s.id,agentFilesList:t.agentFiles.list,agentFilesLoading:t.agentFiles.loading,agentFilesError:t.agentFiles.error,agentFileActive:t.agentFiles.active,agentFileContents:t.agentFiles.contents,agentFileDrafts:t.agentFiles.drafts,agentFileSaving:t.agentFiles.saving,onLoadFiles:t.onLoadFiles,onSelectFile:t.onSelectFile,onFileDraftChange:t.onFileDraftChange,onFileReset:t.onFileReset,onFileSave:t.onFileSave}):r}
               ${t.activePanel===`tools`?Qe({agentId:s.id,configForm:t.config.form,configLoading:t.config.loading,configSaving:t.config.saving,configDirty:t.config.dirty,toolsCatalogLoading:t.toolsCatalog.loading,toolsCatalogError:t.toolsCatalog.error,toolsCatalogResult:t.toolsCatalog.result,toolsEffectiveLoading:t.toolsEffective.loading,toolsEffectiveError:t.toolsEffective.error,toolsEffectiveResult:t.toolsEffective.result,runtimeSessionKey:t.runtimeSessionKey,runtimeSessionMatchesSelectedAgent:t.runtimeSessionMatchesSelectedAgent,onProfileChange:t.onToolsProfileChange,onOverridesChange:t.onToolsOverridesChange,onConfigReload:t.onConfigReload,onConfigSave:t.onConfigSave}):r}
               ${t.activePanel===`skills`?$e({agentId:s.id,report:t.agentSkills.report,loading:t.agentSkills.loading,error:t.agentSkills.error,activeAgentId:t.agentSkills.agentId,configForm:t.config.form,configLoading:t.config.loading,configSaving:t.config.saving,configDirty:t.config.dirty,filter:t.agentSkills.filter,onFilterChange:t.onSkillsFilterChange,onRefresh:t.onSkillsRefresh,onToggle:t.onAgentSkillToggle,onClear:t.onAgentSkillsClear,onDisableAll:t.onAgentSkillsDisableAll,onConfigReload:t.onConfigReload,onConfigSave:t.onConfigSave}):r}
-              ${t.activePanel===`channels`?qe({context:E(s,t.config.form,t.agentFiles.list,a,t.agentIdentityById[s.id]??null),configForm:t.config.form,snapshot:t.channels.snapshot,loading:t.channels.loading,error:t.channels.error,lastSuccess:t.channels.lastSuccess,onRefresh:t.onChannelsRefresh,onSelectPanel:t.onSelectPanel}):r}
-              ${t.activePanel===`cron`?Je({context:E(s,t.config.form,t.agentFiles.list,a,t.agentIdentityById[s.id]??null),agentId:s.id,jobs:t.cron.jobs,status:t.cron.status,loading:t.cron.loading,error:t.cron.error,onRefresh:t.onCronRefresh,onRunNow:t.onCronRunNow,onSelectPanel:t.onSelectPanel}):r}
+              ${t.activePanel===`channels`?qe({context:T(s,t.config.form,t.agentFiles.list,a,t.agentIdentityById[s.id]??null),configForm:t.config.form,snapshot:t.channels.snapshot,loading:t.channels.loading,error:t.channels.error,lastSuccess:t.channels.lastSuccess,onRefresh:t.onChannelsRefresh,onSelectPanel:t.onSelectPanel}):r}
+              ${t.activePanel===`cron`?Je({context:T(s,t.config.form,t.agentFiles.list,a,t.agentIdentityById[s.id]??null),agentId:s.id,jobs:t.cron.jobs,status:t.cron.status,loading:t.cron.loading,error:t.cron.error,onRefresh:t.onCronRefresh,onRunNow:t.onCronRunNow,onSelectPanel:t.onSelectPanel}):r}
               ${t.activePanel===`teams`?nt({...t.agentTeams,onRefresh:t.onTeamsRefresh,onSelectTeam:t.onSelectTeam,onNewTeam:t.onNewTeam,onDraftChange:t.onTeamDraftChange,onCreateTeam:t.onCreateTeam,onUpdateTeam:t.onUpdateTeam,onDeleteTeam:t.onDeleteTeam,onBindingChange:t.onTeamBindingChange,onPreviewBinding:t.onPreviewTeamBinding,onApplyBinding:t.onApplyTeamBinding,onModelDraftChange:t.onTeamModelDraftChange,onLoadModel:t.onLoadTeamModel,onSaveModel:t.onSaveTeamModel,onWorkspaceChange:t.onWorkspaceChange,onLoadWorkspaceFiles:t.onLoadWorkspaceFiles,onLoadWorkspaceFile:t.onLoadWorkspaceFile,onSaveWorkspaceFile:t.onSaveWorkspaceFile,onStartFeishuOAuth:t.onStartFeishuOAuth}):r}
             `}
       </section>
     </div>
-  `}function on(t,n,i){return e`
+  `}function un(t,n,i){return e`
     <div class="agent-tabs">
       ${[{id:`overview`,label:`Overview`},{id:`files`,label:`Files`},{id:`tools`,label:`Tools`},{id:`skills`,label:`Skills`},{id:`channels`,label:`Channels`},{id:`cron`,label:`Cron Jobs`},{id:`teams`,label:`Teams`}].map(a=>e`
           <button
@@ -1967,5 +2030,5 @@ ${e}
           </button>
         `)}
     </div>
-  `}export{an as renderAgents};
+  `}export{ln as renderAgents};
 //# sourceMappingURL=agents.js.map
