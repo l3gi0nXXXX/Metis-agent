@@ -1732,10 +1732,13 @@ public func feishuOapiLiveSmokeHarnessFromEnv(): JsonObject {
     }
     if (missingEnv.size() > 0) {
         let out = JsonObject()
-        out.put("status", JsonString("configuration_error"))
-        out.put("reason", JsonString("missing_live_smoke_env"))
+        out.put("status", JsonString("skipped"))
+        out.put("reason", JsonString("external-resource-required"))
+        out.put("blocker", JsonString("missing_live_smoke_env"))
+        out.put("externalResourceRequired", JsonBool(true))
         out.put("missingEnv", missingEnv)
         out.put("live", JsonBool(false))
+        out.put("networkAttempted", JsonBool(false))
         out.put("redacted", JsonBool(true))
         out.put("requiresEnv", required)
         return feishuOapiWriteLiveSmokeReportIfRequested(out)

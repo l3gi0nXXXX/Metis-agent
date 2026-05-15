@@ -534,7 +534,7 @@ public class FeishuAuthFoundationTest {
     }
 
     @TestCase
-    public func liveAuthSmokeWithOptInButMissingCredentialsWritesChecklistWithoutNetwork(): Unit {
+    public func liveAuthSmokeWithOptInButMissingCredentialsReportsExternalResourceRequiredWithoutNetwork(): Unit {
         let root = Path("/tmp/metis-feishu-live-auth-missing-creds-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
         try { remove(root, recursive: true) } catch (_e: Exception) { () }
         try {
@@ -552,8 +552,10 @@ public class FeishuAuthFoundationTest {
             )
             let raw = String.fromUtf8(File.readFrom(Path(feishuAuthTestString(result, "reportPath"))))
 
-            @Expect(feishuAuthTestString(result, "status"), "configuration_error")
-            @Expect(feishuAuthTestString(result, "reason"), "missing_app_credentials")
+            @Expect(feishuAuthTestString(result, "status"), "skipped")
+            @Expect(feishuAuthTestString(result, "reason"), "external-resource-required")
+            @Expect(feishuAuthTestString(result, "blocker"), "missing_app_credentials")
+            @Expect(result.get("externalResourceRequired").getOrThrow().asBool().getValue(), true)
             @Expect(raw.contains("METIS_FEISHU_LIVE_AUTH_SMOKE"), true)
             @Expect(raw.contains("appSecret"), false)
             @Expect(raw.contains("accessToken"), false)

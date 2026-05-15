@@ -42,6 +42,18 @@ private class FeishuOapiToolsetScopeMissingTokenProvider <: FeishuOapiTokenProvi
     }
 }
 
+private class FeishuOapiToolsetAuthRequiredTokenProvider <: FeishuOapiTokenProvider {
+    public init() {}
+
+    public func userAccessToken(_accountId: String, _requiredScopes: Array<String>): FeishuOapiTokenLookup {
+        FeishuOapiTokenLookup("auth_required", error: "fake user auth missing")
+    }
+
+    public func tokenLookup(_accountId: String, _tokenMode: String, _requiredScopes: Array<String>): FeishuOapiTokenLookup {
+        FeishuOapiTokenLookup("auth_required", error: "fake token missing")
+    }
+}
+
 private class FeishuOapiToolsetAppScopeMissingTokenProvider <: FeishuOapiTokenProvider {
     public init() {}
 
@@ -51,6 +63,44 @@ private class FeishuOapiToolsetAppScopeMissingTokenProvider <: FeishuOapiTokenPr
 
     public func tokenLookup(_accountId: String, _tokenMode: String, requiredScopes: Array<String>): FeishuOapiTokenLookup {
         FeishuOapiTokenLookup("app_scope_missing", missingScopes: requiredScopes, error: "missing app scope")
+    }
+}
+
+private class FeishuOapiToolsetReadOkTokenProvider <: FeishuOapiTokenProvider {
+    public init() {}
+
+    public func userAccessToken(_accountId: String, requiredScopes: Array<String>): FeishuOapiTokenLookup {
+        FeishuOapiTokenLookup(
+            "authorized",
+            accessToken: "fake-read-user-token",
+            grantedScopes: requiredScopes,
+            hasOfflineAccess: false
+        )
+    }
+
+    public func tokenLookup(accountId: String, tokenMode: String, requiredScopes: Array<String>): FeishuOapiTokenLookup {
+        if (tokenMode == "user_access_token") {
+            return this.userAccessToken(accountId, requiredScopes)
+        }
+        FeishuOapiTokenLookup(
+            "authorized",
+            accessToken: "fake-read-${tokenMode}",
+            grantedScopes: requiredScopes,
+            hasOfflineAccess: false
+        )
+    }
+}
+
+private class FeishuOapiToolsetReadMissingAppScopeChecker <: FeishuOapiAppScopeChecker {
+    public init() {}
+
+    public func check(_accountId: String, _tokenMode: String, requiredScopes: Array<String>): FeishuOapiAppScopeCheck {
+        FeishuOapiAppScopeCheck(
+            "app_scope_missing",
+            grantedScopes: [],
+            missingScopes: requiredScopes,
+            error: "fake missing app scope"
+        )
     }
 }
 
@@ -920,6 +970,70 @@ public class GatewayFeishuOapiToolsetTest {
     }
 
     @TestCase
+    public func lowRiskReadActionsHaveFakeSuccessAuthAndScopeDiagnosticsWithoutNetwork(): Unit {
+        let cases = ArrayList<FeishuOapiMatrixCase>()
+        cases.add(FeishuOapiMatrixCase("feishu_fetch_doc", "default", "/open-apis/docx/v1/documents/:document_id/raw_content", "GET", "docx:document:readonly"))
+        cases.add(FeishuOapiMatrixCase("feishu_wiki_space_node", "get", "/open-apis/wiki/v2/spaces/:space_id/nodes/:node_token", "GET", "wiki:node:read"))
+        cases.add(FeishuOapiMatrixCase("feishu_drive_file", "list", "/open-apis/drive/v1/files", "GET", "space:document:retrieve"))
+        cases.add(FeishuOapiMatrixCase("feishu_calendar_event", "list", "/open-apis/calendar/v4/calendars/:calendar_id/events", "GET", "calendar:calendar.event:read"))
+        cases.add(FeishuOapiMatrixCase("feishu_task_tasklist", "list", "/open-apis/task/v2/tasklists", "GET", "task:tasklist:read"))
+
+        for (row in cases) {
+            let request = feishuOapiBuildRequest(row.tool, row.action, "tenant-a", JsonObject())
+            @Expect(request.path, row.path)
+            @Expect(request.method, row.method)
+            @Expect(request.requiredScopes[0], row.firstScope)
+
+            let raw = FeishuOapiToolsetStaticRawTransport(200, body: "{\"code\":0,\"data\":{\"ok\":true}}")
+            let success = MetisFeishuOapiClient(
+                tokenProvider: Some<FeishuOapiTokenProvider>(FeishuOapiToolsetReadOkTokenProvider()),
+                appScopeChecker: Some<FeishuOapiAppScopeChecker>(FeishuOapiToolsetOkAppScopeChecker()),
+                httpClient: Some<FeishuOapiHttpClient>(FeishuNativeOapiHttpClient(
+                    transport: Some<FeishuOapiRawHttpTransport>(raw)
+                ))
+            ).invoke(request)
+            @Expect(success.get("ok").getOrThrow().asBool().getValue(), true)
+            @Expect(success.get("status").getOrThrow().asString().getValue(), "success")
+            @Expect(success.get("tool").getOrThrow().asString().getValue(), row.tool)
+            @Expect(success.get("path").getOrThrow().asString().getValue(), row.path)
+            @Expect(success.toJsonString().contains("fake-read"), false)
+            @Expect(raw.last.isSome(), true)
+
+            let authHttp = FeishuOapiToolsetCountingHttpClient()
+            let auth = MetisFeishuOapiClient(
+                tokenProvider: Some<FeishuOapiTokenProvider>(FeishuOapiToolsetAuthRequiredTokenProvider()),
+                httpClient: Some<FeishuOapiHttpClient>(authHttp)
+            ).invoke(request)
+            @Expect(auth.get("ok").getOrThrow().asBool().getValue(), false)
+            @Expect(auth.get("status").getOrThrow().asString().getValue(), "auth_required")
+            @Expect(auth.get("auth").getOrThrow().asObject().get("required").getOrThrow().asBool().getValue(), true)
+            @Expect(authHttp.calls, 0)
+
+            let scopeHttp = FeishuOapiToolsetCountingHttpClient()
+            let scope = MetisFeishuOapiClient(
+                tokenProvider: Some<FeishuOapiTokenProvider>(FeishuOapiToolsetScopeMissingTokenProvider()),
+                httpClient: Some<FeishuOapiHttpClient>(scopeHttp)
+            ).invoke(request)
+            @Expect(scope.get("ok").getOrThrow().asBool().getValue(), false)
+            @Expect(scope.get("status").getOrThrow().asString().getValue(), "scope_missing")
+            @Expect(scope.get("missing_scopes").getOrThrow().asArray()[0].asString().getValue(), row.firstScope)
+            @Expect(scope.get("scope_diagnostic").getOrThrow().asObject().get("token_mode").getOrThrow().asString().getValue(), request.tokenMode)
+            @Expect(scopeHttp.calls, 0)
+
+            let appScopeHttp = FeishuOapiToolsetCountingHttpClient()
+            let appScope = MetisFeishuOapiClient(
+                tokenProvider: Some<FeishuOapiTokenProvider>(FeishuOapiToolsetReadOkTokenProvider()),
+                appScopeChecker: Some<FeishuOapiAppScopeChecker>(FeishuOapiToolsetReadMissingAppScopeChecker()),
+                httpClient: Some<FeishuOapiHttpClient>(appScopeHttp)
+            ).invoke(request)
+            @Expect(appScope.get("ok").getOrThrow().asBool().getValue(), false)
+            @Expect(appScope.get("status").getOrThrow().asString().getValue(), "app_scope_missing")
+            @Expect(appScope.get("missing_scopes").getOrThrow().asArray()[0].asString().getValue(), row.firstScope)
+            @Expect(appScopeHttp.calls, 0)
+        }
+    }
+
+    @TestCase
     public func tatMissingAppCredentialsReturnsDiagnosticWithoutTokenOrOapiNetwork(): Unit {
         let request = feishuOapiBuildRequest("feishu_task_task", "append_steps", "tenant-a", JsonObject())
         @Expect(request.tokenMode, "tenant_access_token")
@@ -1066,6 +1180,66 @@ public class GatewayFeishuOapiToolsetTest {
                 match (oldReport) {
                     case Some(value) => setVariable("METIS_FEISHU_OAPI_LIVE_REPORT_DIR", value)
                     case None => setVariable("METIS_FEISHU_OAPI_LIVE_REPORT_DIR", "")
+                }
+            }
+        }
+    }
+
+    @TestCase
+    public func liveSmokeHarnessWithOptInButMissingExternalResourcesSkipsWithoutNetwork(): Unit {
+        synchronized(MetisProcessEnvironmentLock) {
+            let root = feishuOapiToolsetTempRoot("live-oapi-missing-resource")
+            let oldSmoke = getVariable("METIS_FEISHU_OAPI_LIVE_SMOKE")
+            let oldReport = getVariable("METIS_FEISHU_OAPI_LIVE_REPORT_DIR")
+            let oldAccessToken = getVariable("METIS_FEISHU_OAPI_LIVE_ACCESS_TOKEN")
+            let oldUserScopes = getVariable("METIS_FEISHU_OAPI_LIVE_USER_SCOPES")
+            let oldAppScopes = getVariable("METIS_FEISHU_OAPI_LIVE_APP_SCOPES")
+            let oldCases = getVariable("METIS_FEISHU_OAPI_LIVE_CASES_JSON")
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+            try {
+                setVariable("METIS_FEISHU_OAPI_LIVE_SMOKE", "1")
+                setVariable("METIS_FEISHU_OAPI_LIVE_REPORT_DIR", root.toString())
+                setVariable("METIS_FEISHU_OAPI_LIVE_ACCESS_TOKEN", "")
+                setVariable("METIS_FEISHU_OAPI_LIVE_USER_SCOPES", "")
+                setVariable("METIS_FEISHU_OAPI_LIVE_APP_SCOPES", "")
+                setVariable("METIS_FEISHU_OAPI_LIVE_CASES_JSON", "")
+
+                let result = feishuOapiLiveSmokeHarnessFromEnv()
+                @Expect(result.get("status").getOrThrow().asString().getValue(), "skipped")
+                @Expect(result.get("reason").getOrThrow().asString().getValue(), "external-resource-required")
+                @Expect(result.get("externalResourceRequired").getOrThrow().asBool().getValue(), true)
+                @Expect(result.get("missingEnv").getOrThrow().asArray()[0].asString().getValue(), "METIS_FEISHU_OAPI_LIVE_ACCESS_TOKEN")
+                @Expect(result.get("networkAttempted").getOrThrow().asBool().getValue(), false)
+                let reportPath = result.get("reportPath").getOrThrow().asString().getValue()
+                let report = JsonValue.fromStr(String.fromUtf8(File.readFrom(Path(reportPath)))).asObject()
+                @Expect(report.get("status").getOrThrow().asString().getValue(), "skipped")
+                @Expect(report.toJsonString().contains("accessToken"), false)
+                @Expect(report.toJsonString().contains("Authorization"), false)
+            } finally {
+                try { remove(root, recursive: true) } catch (_e: Exception) { () }
+                match (oldSmoke) {
+                    case Some(value) => setVariable("METIS_FEISHU_OAPI_LIVE_SMOKE", value)
+                    case None => setVariable("METIS_FEISHU_OAPI_LIVE_SMOKE", "")
+                }
+                match (oldReport) {
+                    case Some(value) => setVariable("METIS_FEISHU_OAPI_LIVE_REPORT_DIR", value)
+                    case None => setVariable("METIS_FEISHU_OAPI_LIVE_REPORT_DIR", "")
+                }
+                match (oldAccessToken) {
+                    case Some(value) => setVariable("METIS_FEISHU_OAPI_LIVE_ACCESS_TOKEN", value)
+                    case None => setVariable("METIS_FEISHU_OAPI_LIVE_ACCESS_TOKEN", "")
+                }
+                match (oldUserScopes) {
+                    case Some(value) => setVariable("METIS_FEISHU_OAPI_LIVE_USER_SCOPES", value)
+                    case None => setVariable("METIS_FEISHU_OAPI_LIVE_USER_SCOPES", "")
+                }
+                match (oldAppScopes) {
+                    case Some(value) => setVariable("METIS_FEISHU_OAPI_LIVE_APP_SCOPES", value)
+                    case None => setVariable("METIS_FEISHU_OAPI_LIVE_APP_SCOPES", "")
+                }
+                match (oldCases) {
+                    case Some(value) => setVariable("METIS_FEISHU_OAPI_LIVE_CASES_JSON", value)
+                    case None => setVariable("METIS_FEISHU_OAPI_LIVE_CASES_JSON", "")
                 }
             }
         }

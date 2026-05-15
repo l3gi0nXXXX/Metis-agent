@@ -926,8 +926,10 @@ public func feishuGatewayNativeAuthLiveSmokeWithClient(
         if (appSecret.isEmpty()) {
             missing.add(JsonString("app_secret"))
         }
-        report.put("status", JsonString("configuration_error"))
-        report.put("reason", JsonString("missing_app_credentials"))
+        report.put("status", JsonString("skipped"))
+        report.put("reason", JsonString("external-resource-required"))
+        report.put("blocker", JsonString("missing_app_credentials"))
+        report.put("externalResourceRequired", JsonBool(true))
         report.put("missingConfig", missing)
         report.put("networkAttempted", JsonBool(false))
         report.put("steps", feishuAuthLiveSkippedSteps(root, "blocked"))
