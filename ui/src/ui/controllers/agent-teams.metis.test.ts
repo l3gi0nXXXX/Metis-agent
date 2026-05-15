@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   addAgentTeamAlias,
+  AGENT_TEAM_TEMPLATE_GROUPS,
   AGENT_TEAM_PROFILE_FILES,
   applyAgentTeamTemplate,
   applyAgentTeamBinding,
@@ -88,6 +89,20 @@ describe("loadAgentTeams", () => {
 });
 
 describe("team mutations", () => {
+  it("exposes Miaoda-like template groups for content, engineering, support, data, and ops", () => {
+    const groupLabels = AGENT_TEAM_TEMPLATE_GROUPS.map((group) => group.label);
+    const groupedTemplateIds = AGENT_TEAM_TEMPLATE_GROUPS.flatMap((group) =>
+      group.templates.map((template) => template.id),
+    );
+
+    expect(groupLabels).toEqual(["内容", "研发", "客服", "数据", "运营"]);
+    expect(groupedTemplateIds).toContain("pm-writer-reviewer");
+    expect(groupedTemplateIds).toContain("engineering-sprint");
+    expect(groupedTemplateIds).toContain("telegram-support-triage");
+    expect(groupedTemplateIds).toContain("data-insight-report");
+    expect(groupedTemplateIds).toContain("ops-campaign-launch");
+  });
+
   it("applies a Metis-owned Feishu team template without raw JSON editing", () => {
     const draft = applyAgentTeamTemplate(createEmptyAgentTeamDraft(), "feishu-content-handoff");
 

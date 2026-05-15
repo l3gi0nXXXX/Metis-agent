@@ -26,6 +26,9 @@ require_command() {
 require_command git
 require_command rg
 
+PARITY_REPORT="develop_steps/metis-agent-team-series-14-oapi-action-parity-report-2026-05-15.md"
+SERIES14_DOC="develop_steps/metis-agent-team-series-14-current-source-recheck-gap-quantification-manual-acceptance-2026-05-15.md"
+
 METIS_HOME_VALUE="${METIS_HOME:-}"
 [[ -n "$METIS_HOME_VALUE" ]] || fail "set METIS_HOME to an isolated test directory, for example /tmp/metis-agentteam-manual-acceptance"
 
@@ -41,6 +44,8 @@ stale_patterns=(
   "只 start"
   "4 个文件"
   "自动创建 Feishu"
+  "TAT/app-token provider parity"
+  "series13 is the current source-recheck"
 )
 for pattern in "${stale_patterns[@]}"; do
   if rg -n "$pattern" docs/user/agent-team.md >/tmp/metis-agentteam-gate-rg.txt; then
@@ -50,6 +55,28 @@ for pattern in "${stale_patterns[@]}"; do
 done
 rm -f /tmp/metis-agentteam-gate-rg.txt
 info "docs stale-wording check passed"
+
+[[ -f "$SERIES14_DOC" ]] || fail "missing series14 evidence document: $SERIES14_DOC"
+rg -n "tenant_access_token.*bot_access_token.*app_access_token|user/TAT/bot/app token provider" "$SERIES14_DOC" >/dev/null \
+  || fail "series14 evidence document must record current Feishu token provider support"
+info "series14 evidence document check passed"
+
+[[ -f "$PARITY_REPORT" ]] || fail "missing OAPI parity report: $PARITY_REPORT"
+rg -n "OpenClaw-Lark source currently enumerates 108" "$PARITY_REPORT" >/dev/null \
+  || fail "OAPI parity report must identify the 108 action source baseline"
+rg -n "^-? ?aligned: 108$" "$PARITY_REPORT" >/dev/null \
+  || fail "OAPI parity report aligned count changed; regenerate and review the report"
+rg -n "^-? ?partial: 0$" "$PARITY_REPORT" >/dev/null \
+  || fail "OAPI parity report partial count changed; regenerate and review the report"
+rg -n "^-? ?missing: 0$" "$PARITY_REPORT" >/dev/null \
+  || fail "OAPI parity report missing count is not the reviewed baseline"
+rg -n "^-? ?not-applicable: 0$" "$PARITY_REPORT" >/dev/null \
+  || fail "OAPI parity report not-applicable count changed; regenerate and review the report"
+INVALID_STATUS="$(awk -F'|' '/^\| feishu_/ { gsub(/^[ \t]+|[ \t]+$/, "", $3); if ($3 != "aligned" && $3 != "partial" && $3 != "missing" && $3 != "not-applicable") print $0 }' "$PARITY_REPORT")"
+[[ -z "$INVALID_STATUS" ]] || fail "OAPI parity report contains an invalid status: $INVALID_STATUS"
+ACTION_ROWS="$(awk '/^\| feishu_/ { count += 1 } END { print count + 0 }' "$PARITY_REPORT")"
+[[ "$ACTION_ROWS" == "108" ]] || fail "OAPI parity report must contain 108 action rows, found $ACTION_ROWS"
+info "OAPI parity report check passed"
 
 git diff --check
 info "git diff --check passed"

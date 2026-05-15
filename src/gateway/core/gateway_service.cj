@@ -1210,6 +1210,9 @@ public class GatewayService {
         if (status == "approval_required" || status == "rejected" || status == "handler_missing" || status == "not_supported" || status == "usage" || status == "disabled" || status == "no_active_run" || status == "error") {
             return this.renderTelegramGenericCommandText(root)
         }
+        if (this.telegramJsonString(root, "surface", "") == "thread_binding") {
+            return this.renderTelegramThreadBindingText(root)
+        }
         match (action) {
             case "help" =>
                 match (root.get("examples")) {
@@ -1547,6 +1550,8 @@ public class GatewayService {
         this.appendTelegramJsonTextField(lines, root, "Conversation", "conversationId")
         this.appendTelegramJsonTextField(lines, root, "Session", "sessionKey")
         this.appendTelegramJsonTextField(lines, root, "Error", "error")
+        this.appendTelegramJsonTextField(lines, root, "Alias", "alias")
+        this.appendTelegramJsonTextField(lines, root, "Message", "message")
         match (root.get("bindings")) {
             case Some(v) => lines.add("Bindings: ${v.toJsonString()}")
             case None => ()
@@ -2018,6 +2023,29 @@ public class GatewayService {
         if (command == "unfocus") {
             let result = gatewayTelegramThreadBindingUnbind("telegram", accountId, conversationId)
             return "{\"ok\":${this.telegramJsonBool(result, "ok", false)},\"status\":\"${this.telegramCallbackJsonEscape(this.telegramJsonString(result, "status", "not_found"))}\",\"action\":\"unfocus\",\"conversationId\":\"${this.telegramCallbackJsonEscape(conversationId)}\"}"
+        }
+        if (command == "agents") {
+            let args = this.telegramCommandArgText(text)
+            let parts = args.split(" ", 2)
+            let subcommand = if (parts.size > 0) { parts[0].trimAscii().toAsciiLower() } else { "" }
+            if (subcommand == "team") {
+                return "{\"ok\":true,\"status\":\"ok\",\"action\":\"team\",\"surface\":\"thread_binding\",\"conversationId\":\"${this.telegramCallbackJsonEscape(conversationId)}\",\"message\":\"Team commands: /agents status, /agents switch <alias>. Configure aliases and team routes from Control UI or Gateway RPC; Telegram does not write team config.\"}"
+            }
+            if (subcommand == "status") {
+                let rows = gatewayTelegramThreadBindingList()
+                return "{\"ok\":true,\"status\":\"ok\",\"action\":\"status\",\"surface\":\"thread_binding\",\"conversationId\":\"${this.telegramCallbackJsonEscape(conversationId)}\",\"message\":\"Team routing status is read-only from Telegram. Alias matches are resolved by persisted AgentTeam bindings.\",\"bindings\":${rows.toJsonString()}}"
+            }
+            if (subcommand == "switch") {
+                let alias = if (parts.size > 1) { parts[1].trimAscii() } else { "" }
+                let ok = !alias.isEmpty()
+                let statusLabel = if (ok) { "ok" } else { "usage" }
+                let messageText = if (ok) {
+                    "Alias switching is routed through AgentTeam alias bindings; send the alias in chat or configure it in Control UI."
+                } else {
+                    "usage: /agents switch <alias>"
+                }
+                return "{\"ok\":${ok},\"status\":\"${statusLabel}\",\"action\":\"switch\",\"surface\":\"thread_binding\",\"conversationId\":\"${this.telegramCallbackJsonEscape(conversationId)}\",\"alias\":\"${this.telegramCallbackJsonEscape(alias)}\",\"message\":\"${messageText}\"}"
+            }
         }
         let rows = gatewayTelegramThreadBindingList()
         return "{\"ok\":true,\"status\":\"ok\",\"action\":\"agents\",\"conversationId\":\"${this.telegramCallbackJsonEscape(conversationId)}\",\"bindings\":${rows.toJsonString()}}"

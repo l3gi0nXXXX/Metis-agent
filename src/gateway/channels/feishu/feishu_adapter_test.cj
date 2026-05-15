@@ -874,8 +874,12 @@ public class FeishuAdapterTest {
         @Expect(checklist.get("optInRequired").getOrThrow().asBool().getValue(), true)
         @Expect(checklist.get("defaultNetwork").getOrThrow().asString().getValue(), "disabled")
         let phases = checklist.get("phases").getOrThrow().asArray()
-        @Expect(phases.size(), 5)
+        @Expect(phases.size(), 7)
         @Expect(checklist.toJsonString().contains("create"), true)
+        @Expect(checklist.toJsonString().contains("stream_patch"), true)
+        @Expect(checklist.toJsonString().contains("final_update"), true)
+        @Expect(checklist.toJsonString().contains("message_unavailable"), true)
+        @Expect(checklist.toJsonString().contains("image_resolver"), true)
         @Expect(checklist.toJsonString().contains("fallback"), true)
         @Expect(FeishuCardLiveSmokeChecklist.isOptInValueEnabled(""), false)
         @Expect(FeishuCardLiveSmokeChecklist.isOptInValueEnabled("0"), false)
@@ -891,7 +895,12 @@ public class FeishuAdapterTest {
         @Expect(checklist.get("defaultNetwork").getOrThrow().asString().getValue(), "disabled")
         @Expect(checklist.toJsonString().contains("redacted"), true)
         let matrix = checklist.get("matrix").getOrThrow().asArray()
-        @Expect(matrix.size(), 8)
+        @Expect(matrix.size(), 12)
+        @Expect(checklist.toJsonString().contains("post"), true)
+        @Expect(checklist.toJsonString().contains("interactive"), true)
+        @Expect(checklist.toJsonString().contains("file"), true)
+        @Expect(checklist.toJsonString().contains("audio"), true)
+        @Expect(checklist.toJsonString().contains("video"), true)
         @Expect(FeishuEventReplayLiveSmokeChecklist.isOptInValueEnabled(""), false)
         @Expect(FeishuEventReplayLiveSmokeChecklist.isOptInValueEnabled("yes"), true)
     }
@@ -934,6 +943,37 @@ public class FeishuAdapterTest {
 
         let noData = FeishuReplyFooterMetrics().toFooterText(config: FeishuReplyFooterConfig(status: true, elapsed: true, tokens: true, cache: true, context: true, model: true))
         @Expect(noData, "")
+    }
+
+    @TestCase
+    public func streamingControllerObservableStateIncludesFooterMetricsSnapshot(): Unit {
+        let client = FeishuFakeApiClient()
+        let controller = FeishuStreamingCardController(
+            client,
+            accountId: "tenant-a",
+            rawPeerId: "oc_stream",
+            receiveId: "oc_stream",
+            receiveIdType: "chat_id"
+        )
+        @Expect(controller.create("first"), "fake-feishu-card-1")
+        @Expect(controller.finalize("final", footerMetrics: Some(FeishuReplyFooterMetrics(
+            status: "completed",
+            elapsedMs: 2000,
+            inputTokens: 11,
+            outputTokens: 22,
+            cacheRead: 3,
+            cacheWrite: 4,
+            contextTokens: 8192,
+            model: "metis-observable"
+        ))), true)
+        let metrics = controller.observableState().get("footerMetrics").getOrThrow().asObject()
+        @Expect(metrics.get("status").getOrThrow().asString().getValue(), "completed")
+        @Expect(metrics.get("inputTokens").getOrThrow().asInt().getValue(), 11)
+        @Expect(metrics.get("outputTokens").getOrThrow().asInt().getValue(), 22)
+        @Expect(metrics.get("cacheRead").getOrThrow().asInt().getValue(), 3)
+        @Expect(metrics.get("cacheWrite").getOrThrow().asInt().getValue(), 4)
+        @Expect(metrics.get("contextTokens").getOrThrow().asInt().getValue(), 8192)
+        @Expect(metrics.get("model").getOrThrow().asString().getValue(), "metis-observable")
     }
 
     @TestCase
@@ -1182,15 +1222,17 @@ public class FeishuAdapterTest {
         }
 
         let inbound = adapter.pullInbound()
-        @Expect(samples.size(), 11)
+        @Expect(samples.size(), 16)
         @Expect(ignoredCount, 3)
         @Expect(inbound.size, expectedInbound.size)
-        @Expect(inbound.size, 8)
+        @Expect(inbound.size, 13)
         for (i in 0..inbound.size) {
             this.expectFixtureInbound(inbound[i], expectedInbound[i])
         }
         @Expect(inbound[0].text.contains("fixture hello"), true)
-        @Expect(inbound[7].mediaContext.get("records").getOrThrow().asArray()[0].asObject()
+        @Expect(inbound[1].text.contains("fixture post"), true)
+        @Expect(inbound[5].text.contains("fixture card text"), true)
+        @Expect(inbound[12].mediaContext.get("records").getOrThrow().asArray()[0].asObject()
             .get("skippedReason").getOrThrow().asString().getValue(), "metadata_only")
     }
 

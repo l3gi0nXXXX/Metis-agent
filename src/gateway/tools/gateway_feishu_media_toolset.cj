@@ -154,6 +154,35 @@ private func feishuMediaToolError(
     out.toJsonString()
 }
 
+private func feishuMediaToolHistoricalError(
+    result: GatewayFeishuHistoricalResourceResult,
+    messageId: String,
+    fileKey: String,
+    resourceType: String,
+    source: String
+): String {
+    let out = JsonObject()
+    let status = result.status.trimAscii()
+    out.put("ok", JsonBool(false))
+    out.put("status", JsonString(status))
+    out.put("relation", JsonString("historical"))
+    out.put("source", JsonString(if (!result.source.isEmpty()) { result.source } else { source.trimAscii() }))
+    out.put("message_id", JsonString(messageId.trimAscii()))
+    out.put("file_key", JsonString(fileKey.trimAscii()))
+    out.put("type", JsonString(resourceType.trimAscii()))
+    if (!result.error.trimAscii().isEmpty()) {
+        out.put("reason", JsonString(result.error.trimAscii()))
+    }
+    if (status == "auth_required" || status == "user_auth_required") {
+        out.put("auth_required", JsonBool(true))
+    }
+    if (status == "scope_missing" || status == "user_scope_missing" || status == "app_scope_missing") {
+        out.put("scope_missing", JsonBool(true))
+        out.put("required_scopes", feishuMediaToolRequiredScopesFromError(result.error))
+    }
+    out.toJsonString()
+}
+
 private func feishuMediaToolFetchResource(messageId: String, fileKey: String, resourceType: String): String {
     if (messageId.trimAscii().isEmpty() || fileKey.trimAscii().isEmpty()) {
         return feishuMediaToolError("invalid_request", messageId, fileKey, resourceType, reason: "message_id and file_key are required")
@@ -262,7 +291,7 @@ private func feishuMediaToolFetchHistoricalResource(messageId: String, fileKey: 
             result = feishuMediaToolHistoricalResultFromOapi(oapiResult)
     }
     if (!result.ok) {
-        return feishuMediaToolError(result.status, messageId, fileKey, resourceType, reason: result.error)
+        return feishuMediaToolHistoricalError(result, messageId, fileKey, resourceType, source)
     }
     let policy = feishuMediaToolHistoricalPolicy(ctx.mediaContext)
     let cacheRoot = feishuMediaToolCacheRootString(policy)
@@ -483,6 +512,18 @@ private func feishuMediaToolJsonStringArray(values: Array<String>): JsonArray {
         }
     }
     arr
+}
+
+private func feishuMediaToolRequiredScopesFromError(error: String): JsonArray {
+    let scopes = ArrayList<String>()
+    let normalized = error.trimAscii()
+    if (normalized.contains("im:message.resource:read")) {
+        scopes.add("im:message.resource:read")
+    }
+    if (scopes.isEmpty()) {
+        scopes.add("im:message.resource:read")
+    }
+    feishuMediaToolJsonStringArray(scopes.toArray())
 }
 
 private func feishuMediaToolStatus(policy: JsonObject, accountId: String): String {

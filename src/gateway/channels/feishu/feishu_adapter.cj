@@ -287,13 +287,17 @@ public class FeishuEventReplayLiveSmokeChecklist {
         root.put("redaction", JsonString("live event fixtures must be redacted before persistence: remove tokens, authorization headers, secrets, tenant credentials, and private user content"))
         root.put("matrix", JsonArray([
             JsonString("message"),
+            JsonString("post"),
+            JsonString("image"),
+            JsonString("file"),
+            JsonString("audio"),
+            JsonString("video"),
+            JsonString("interactive"),
             JsonString("reaction"),
-            JsonString("card"),
             JsonString("drive"),
             JsonString("bot"),
             JsonString("vc"),
-            JsonString("bitable"),
-            JsonString("media")
+            JsonString("bitable")
         ]))
         root
     }

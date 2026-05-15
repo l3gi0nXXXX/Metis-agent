@@ -21,7 +21,7 @@ Manager delegation can coexist with this model, but it is not a separate product
 | Workspace profiles | Control UI and RPC can list, read, and write `AGENTS.md`, `SOUL.md`, `TOOLS.md`, `IDENTITY.md`, `USER.md`, `HEARTBEAT.md`, `BOOTSTRAP.md`, and `MEMORY.md` through Gateway only. | `BOOTSTRAP.md` is supported but not auto-created. |
 | Model state | Control UI and RPC can read/write per-agent `models.json` state, render provider/model chips from `agents.models.*`, and display redacted credential-source summaries. | Operators still need to configure real provider credentials explicitly per agent or allowed fallback source. |
 | Telegram | Existing Telegram adapter has broad fake-tested group/topic/media/native-command coverage and AgentTeam alias routing baseline. | Telegram remains the first full IM validation path for future ChannelAdapter route extensions. |
-| Feishu | Built-in Feishu support includes unified route context, account id, group/thread context, rich-event baselines, native `/feishu ...` command replies, OAuth lifecycle RPC/buttons, native OAPI client/toolset baseline, 108 action parity reporting, streaming-card controller, and redacted status/doctor surfaces. | Real tenant UAT/TAT/app-scope repair, scope-exact OAPI parity closure, historical resource fetch, complete CardKit parity, and live event matrix validation remain release gates. |
+| Feishu | Built-in Feishu support includes unified route context, account id, group/thread context, rich-event baselines, native `/feishu ...` command replies, OAuth lifecycle RPC/buttons, native OAPI client/toolset baseline, user/TAT/bot/app token provider support, 108 action parity reporting, streaming-card controller, and redacted status/doctor surfaces. | Real tenant UAT/TAT/app-token behavior, app-scope repair, scope-exact OAPI parity closure, historical resource fetch, complete CardKit parity, and live event matrix validation remain release gates. |
 | Migration | `agents.migration.dryRun` is read-only, previews doctor findings, binding apply, redacted config preview, and Feishu single-account migration suggestions. | Future migration may add apply-mode helpers after dry-run acceptance, but it must not rewrite user config silently. |
 
 ## Start Gateway
@@ -438,7 +438,7 @@ Run the helper before recording manual acceptance:
 scripts/agentteam-manual-acceptance-gate.sh
 ```
 
-The helper rejects the default real home, checks this doc for stale Feishu/AgentTeam claims, runs `git diff --check`, and runs the browser smoke only when `METIS_AGENTTEAM_CONTROL_UI_URL` is set. For example, after building the UI and starting Gateway or a static preview:
+The helper rejects the default real home, checks this doc for stale Feishu/AgentTeam claims, verifies the series14 evidence document and OAPI parity report baseline, runs `git diff --check`, and runs the browser smoke only when `METIS_AGENTTEAM_CONTROL_UI_URL` is set. For example, after building the UI and starting Gateway or a static preview:
 
 ```bash
 export METIS_AGENTTEAM_CONTROL_UI_URL="http://127.0.0.1:3000/"
@@ -466,15 +466,15 @@ npm --prefix ui run build
 scripts/agentteam-manual-acceptance-gate.sh
 ```
 
-Source-backed series13 acceptance details and result template live in `develop_steps/metis-agent-team-series-13-team-docs-runbook-2026-05-15.md`.
+Source-backed series14 acceptance details live in `develop_steps/metis-agent-team-series-14-current-source-recheck-gap-quantification-manual-acceptance-2026-05-15.md`. Record redacted live evidence in `develop_steps/metis-agent-team-series-14-manual-acceptance-runbook-2026-05-15.md`.
 
 ## Current Limits
 
 - `metis agents bind` intentionally exposes the simple `channel[:account]` form. Use Gateway RPC JSON payloads for peer/thread/team/role binding matches.
 - Migration dry-run is read-only. It previews diagnostics and route-binding application but does not rewrite `session.dmScope`, model state, auth profiles, or workspace files automatically.
 - Manager delegation is currently a configuration/profile pattern using a normal manager agent. Deterministic fan-out is the implemented team collaboration mode when `broadcast.enabled=true`; full manager-delegation product policy remains planned work.
-- Feishu AgentTeam routing is not the same as the full OpenClaw Lark plugin surface. Message routing, native command replies, OAuth lifecycle RPC/buttons, native OAPI client/toolset baseline, streaming-card controller, redacted status, and dry-run diagnostics exist; TAT/app-token provider parity, auto scope repair, historical resource downloads, complete CardKit parity, and live tenant event/OAPI validation remain release gates unless a later release note says otherwise.
+- Feishu AgentTeam routing is not the same as the full OpenClaw Lark plugin surface. Message routing, native command replies, OAuth lifecycle RPC/buttons, native OAPI client/toolset baseline, user/TAT/bot/app token provider support, streaming-card controller, redacted status, and dry-run diagnostics exist. Real tenant token behavior, automatic scope repair, historical resource downloads, complete CardKit parity, and live tenant event/OAPI validation remain release gates unless a later release note says otherwise.
 - The Control UI capability panel is not a plugin marketplace. It lists Metis-owned built-in tools, skills, profile files, channel capabilities, and RPC surfaces only.
 - Feishu auth controls in Control UI call Gateway-backed auth lifecycle RPCs when available. Browser code must not create, edit, or delete Feishu token files.
-- Source-backed AgentTeam parity tracking lives under `develop_steps/`; series13 is the current source-recheck, manual-acceptance, and runbook baseline for this guide.
+- Source-backed AgentTeam parity tracking lives under `develop_steps/`; series14 is the current source-recheck and manual-acceptance baseline for this guide.
 - Live Telegram and Feishu operation still depends on the normal channel credentials and account setup. This guide does not require real Telegram or Feishu network access.

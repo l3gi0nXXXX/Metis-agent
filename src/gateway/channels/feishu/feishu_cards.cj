@@ -163,9 +163,11 @@ public class FeishuCardLiveSmokeChecklist {
         root.put("redaction", JsonString("capture fixtures only after removing tokens, authorization headers, user content, and tenant secrets"))
         root.put("phases", JsonArray([
             JsonString("create"),
-            JsonString("patch"),
-            JsonString("finalize"),
+            JsonString("stream_patch"),
+            JsonString("final_update"),
             JsonString("abort"),
+            JsonString("message_unavailable"),
+            JsonString("image_resolver"),
             JsonString("fallback")
         ]))
         root
@@ -232,6 +234,19 @@ public class FeishuReplyFooterMetrics {
             return ""
         }
         "Metrics\n${String.join(parts.toArray(), delimiter: " | ")}"
+    }
+
+    public func toJson(): JsonObject {
+        let root = JsonObject()
+        root.put("status", JsonString(this.status))
+        root.put("elapsedMs", JsonInt(this.elapsedMs))
+        root.put("inputTokens", JsonInt(this.inputTokens))
+        root.put("outputTokens", JsonInt(this.outputTokens))
+        root.put("cacheRead", JsonInt(this.cacheRead))
+        root.put("cacheWrite", JsonInt(this.cacheWrite))
+        root.put("contextTokens", JsonInt(this.contextTokens))
+        root.put("model", JsonString(this.model))
+        root
     }
 
     private func formatElapsed(ms: Int64): String {
@@ -461,6 +476,7 @@ public class FeishuStreamingCardController {
     private var unavailableSource: String = ""
     private var unavailableStatus: String = ""
     private var unavailableDetail: String = ""
+    private var lastFooterMetrics: Option<FeishuReplyFooterMetrics> = None<FeishuReplyFooterMetrics>
     private let imageResolver = FeishuCardImageResolver()
 
     public init(
@@ -700,6 +716,10 @@ public class FeishuStreamingCardController {
         unavailable.put("detail", JsonString(this.unavailableDetail))
         root.put("unavailable", unavailable)
 
+        root.put("footerMetrics", match (this.lastFooterMetrics) {
+            case Some(metrics) => metrics.toJson()
+            case None => JsonObject()
+        })
         root.put("imageResolver", this.imageResolver.toJson())
         root
     }
@@ -714,6 +734,7 @@ public class FeishuStreamingCardController {
         if (result.ok) {
             this.cardKitSequence += 1
             this.lastFlushedText = this.currentText
+            this.lastFooterMetrics = footerMetrics
             this.clearUnavailableState()
             return true
         }

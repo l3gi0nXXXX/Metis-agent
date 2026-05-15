@@ -55,7 +55,7 @@ private func feishuOapiNormalizeRunnerResult(
     feishuOapiPutIfMissing(result, "method", JsonString(request.method))
     feishuOapiPutIfMissing(result, "token_mode", JsonString(request.tokenMode))
     feishuOapiPutIfMissing(result, "required_scopes", feishuOapiJsonStringArray(request.requiredScopes))
-    result
+    gatewayFeishuOapiAttachRepairActionForToolResult(result, request)
 }
 
 private func feishuOapiInvoke(
@@ -86,11 +86,11 @@ private func feishuOapiInvoke(
             feishuOapiNormalizeRunnerResult(result, request).toJsonString()
         case None =>
             match (gatewayFeishuOapiClientForTest) {
-                case Some(client) => client.invoke(request).toJsonString()
-                case None => MetisFeishuOapiClient(
+                case Some(client) => gatewayFeishuOapiAttachRepairActionForToolResult(client.invoke(request), request).toJsonString()
+                case None => gatewayFeishuOapiAttachRepairActionForToolResult(MetisFeishuOapiClient(
                     tokenProvider: Some<FeishuOapiTokenProvider>(MetisFeishuOapiTokenProvider()),
                     httpClient: Some<FeishuOapiHttpClient>(FeishuNativeOapiHttpClient())
-                ).invoke(request).toJsonString()
+                ).invoke(request), request).toJsonString()
             }
     }
 }

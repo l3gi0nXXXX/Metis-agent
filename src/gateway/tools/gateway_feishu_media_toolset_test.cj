@@ -32,6 +32,12 @@ private class FeishuMediaToolsetFakeResourceClient <: FeishuOapiResourceClient {
         if (fileKey == "rate") {
             return FeishuOapiResourceResult(status: "rate_limited", error: "rate limited")
         }
+        if (fileKey == "auth_required") {
+            return FeishuOapiResourceResult(status: "auth_required", error: "authorization required")
+        }
+        if (fileKey == "scope_missing") {
+            return FeishuOapiResourceResult(status: "scope_missing", error: "missing im:message.resource:read")
+        }
         FeishuOapiResourceResult(
             ok: true,
             status: "ok",
@@ -295,6 +301,43 @@ public class GatewayFeishuMediaToolsetTest {
         } finally {
             setGatewayFeishuHistoricalResourceClientForTest(None<FeishuOapiResourceClient>)
             try { remove(Path(root), recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func feishuHistoricalFetchOapiAuthAndScopeDiagnosticsAreStructured(): Unit {
+        let media = JsonObject()
+        media.put("channel", JsonString("feishu"))
+        media.put("accountId", JsonString("tenant-a"))
+        let context = JsonObject()
+        context.put("feishuHistoricalResource", JsonObject())
+        media.put("context", context)
+        let client = FeishuMediaToolsetFakeResourceClient()
+        setGatewayFeishuHistoricalResourceClientForTest(Some<FeishuOapiResourceClient>(client))
+        try {
+            let toolset = GatewayFeishuMediaToolset()
+            let authRequired = JsonValue.fromStr(gatewayWithToolRuntimeContext(
+                GatewayToolRuntimeContext("feishu", channelName: "feishu", sessionKey: "feishu:chat:1", mediaContext: media),
+                { => toolset.debugFeishuFetchResourceForTest("om_history", "auth_required", Some("image")) }
+            )).asObject()
+            @Expect(authRequired.get("ok").getOrThrow().asBool().getValue(), false)
+            @Expect(authRequired.get("status").getOrThrow().asString().getValue(), "auth_required")
+            @Expect(authRequired.get("relation").getOrThrow().asString().getValue(), "historical")
+            @Expect(authRequired.get("source").getOrThrow().asString().getValue(), "oapi")
+            @Expect(authRequired.get("auth_required").getOrThrow().asBool().getValue(), true)
+
+            let scopeMissing = JsonValue.fromStr(gatewayWithToolRuntimeContext(
+                GatewayToolRuntimeContext("feishu", channelName: "feishu", sessionKey: "feishu:chat:1", mediaContext: media),
+                { => toolset.debugFeishuFetchResourceForTest("om_history", "scope_missing", Some("image")) }
+            )).asObject()
+            @Expect(scopeMissing.get("ok").getOrThrow().asBool().getValue(), false)
+            @Expect(scopeMissing.get("status").getOrThrow().asString().getValue(), "scope_missing")
+            @Expect(scopeMissing.get("relation").getOrThrow().asString().getValue(), "historical")
+            @Expect(scopeMissing.get("source").getOrThrow().asString().getValue(), "oapi")
+            @Expect(scopeMissing.get("scope_missing").getOrThrow().asBool().getValue(), true)
+            @Expect(scopeMissing.get("required_scopes").getOrThrow().asArray()[0].asString().getValue(), "im:message.resource:read")
+        } finally {
+            setGatewayFeishuHistoricalResourceClientForTest(None<FeishuOapiResourceClient>)
         }
     }
 

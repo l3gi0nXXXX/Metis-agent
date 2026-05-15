@@ -13,7 +13,7 @@ import {
   addAgentTeamAlias,
   addAgentTeamMember,
   AGENT_TEAM_PROFILE_FILES,
-  AGENT_TEAM_TEMPLATES,
+  AGENT_TEAM_TEMPLATE_GROUPS,
   applyAgentTeamTemplate,
   buildAgentTeamBindingPreview,
   changeAgentTeamAlias,
@@ -217,6 +217,7 @@ function renderFeishuSetupRepairWizard(props: AgentTeamsPanelProps) {
       <div class="callout info" style="margin-top: 12px;">
         Browser repair is limited to Gateway RPC actions and copyable repair steps. Token files, app credential files, and local Feishu config stay behind Gateway RPC or operator-managed backend configuration.
       </div>
+      ${renderFeishuExistingAppBotFlow(props, defaultAccount)}
       <div class="agents-overview-grid" style="margin-top: 14px;">
         <div class="agent-kv">
           <div class="label">Account</div>
@@ -260,6 +261,30 @@ function renderFeishuSetupRepairWizard(props: AgentTeamsPanelProps) {
         )}
       </div>
     </section>
+  `;
+}
+
+function renderFeishuExistingAppBotFlow(props: AgentTeamsPanelProps, defaultAccount: string) {
+  return html`
+    <div class="callout info" style="margin-top: 12px;">
+      <div class="list-title">Link existing Feishu app/bot</div>
+      <div class="list-sub">
+        Associate existing app/bot by confirming developer-console credentials, event URL, scopes, bot installation, and a test message through Gateway status. Control UI never stores app secrets or token files.
+      </div>
+      <div class="row" style="gap: 8px; margin-top: 10px;">
+        <button
+          type="button"
+          class="btn btn--sm"
+          ?disabled=${props.feishuAuthLoading}
+          @click=${() => props.onStartFeishuOAuth(defaultAccount, "status")}
+        >
+          Associate existing app/bot
+        </button>
+        <button type="button" class="btn btn--sm btn--ghost" ?disabled=${props.loading} @click=${props.onRefresh}>
+          Refresh status
+        </button>
+      </div>
+    </div>
   `;
 }
 
@@ -509,27 +534,45 @@ function renderTeamWizardCard(props: AgentTeamsPanelProps, members: AgentTeamMem
         </div>
         <span class="badge">Metis template schema</span>
       </div>
-      <div class="grid grid-cols-3" style="margin-top: 14px;">
-        ${AGENT_TEAM_TEMPLATES.map(
-          (template) => html`
-            <div class="agent-kv">
-              <div class="row" style="justify-content: space-between; align-items: center; gap: 8px;">
-                <div class="label">${template.transport}</div>
-                <span class="badge">${props.draft.template === template.id ? "selected" : "template"}</span>
+      <div style="margin-top: 14px;">
+        <div class="list-title">Template library</div>
+        <div class="card-sub">Grouped templates for content, engineering, support, data, and operations teams.</div>
+        <div class="list" style="margin-top: 10px;">
+          ${AGENT_TEAM_TEMPLATE_GROUPS.map(
+            (group) => html`
+              <div class="list-item">
+                <div class="list-main">
+                  <div class="row" style="justify-content: space-between; align-items: center; gap: 8px;">
+                    <div class="list-title">${group.label}</div>
+                    <span class="badge">${formatCount(group.templates.length, "template")}</span>
+                  </div>
+                  <div class="grid grid-cols-3" style="margin-top: 10px;">
+                    ${group.templates.map(
+                      (template) => html`
+                        <div class="agent-kv">
+                          <div class="row" style="justify-content: space-between; align-items: center; gap: 8px;">
+                            <div class="label">${template.transport}</div>
+                            <span class="badge">${props.draft.template === template.id ? "selected" : "template"}</span>
+                          </div>
+                          <div class="list-title" style="margin-top: 6px;">${template.label}</div>
+                          <div class="list-sub">${template.description}</div>
+                          <button
+                            type="button"
+                            class="btn btn--sm"
+                            style="margin-top: 10px;"
+                            @click=${() => props.onDraftChange(applyAgentTeamTemplate(props.draft, template.id))}
+                          >
+                            Use template
+                          </button>
+                        </div>
+                      `,
+                    )}
+                  </div>
+                </div>
               </div>
-              <div class="list-title" style="margin-top: 6px;">${template.label}</div>
-              <div class="list-sub">${template.description}</div>
-              <button
-                type="button"
-                class="btn btn--sm"
-                style="margin-top: 10px;"
-                @click=${() => props.onDraftChange(applyAgentTeamTemplate(props.draft, template.id))}
-              >
-                Use template
-              </button>
-            </div>
-          `,
-        )}
+            `,
+          )}
+        </div>
       </div>
       <div class="agents-overview-grid" style="margin-top: 14px;">
         <div class="agent-kv">
@@ -547,6 +590,12 @@ function renderTeamWizardCard(props: AgentTeamsPanelProps, members: AgentTeamMem
         <div class="agent-kv">
           <div class="label">Profile</div>
           <div>${props.workspace.workspace ? "workspace loaded" : "choose profile below"}</div>
+        </div>
+      </div>
+      <div class="callout info" style="margin-top: 12px;">
+        <div class="list-title">IM team commands</div>
+        <div class="list-sub">
+          /agents team · /agents status · /agents switch @writer. Alias routing such as @writer or /agent writer remains handled by persisted team aliases and channel bindings.
         </div>
       </div>
       <div class="row" style="justify-content: space-between; align-items: flex-end; margin-top: 14px;">
@@ -683,6 +732,7 @@ function renderTeamEditor(
       <div class="card-title">${selectedTeamLabel}</div>
       <div class="card-sub">Create teams, edit members, and keep JSON metadata available for compatibility.</div>
       ${renderTeamSummary(activeMembers, activeAliases, props.draft.bindingsJson, activeBroadcast)}
+      ${renderTeamHealthSummary(props, activeMembers, activeAliases, activeBroadcast)}
       <div class="grid grid-cols-2" style="margin-top: 14px;">
         <label class="field">
           <span>Team key</span>
@@ -708,7 +758,11 @@ function renderTeamEditor(
             ?disabled=${Boolean(props.detail) || draftMembers.length > 0}
             @change=${(e: Event) => props.onDraftChange({ template: selectValue(e) })}
           >
-            <option value="pm-writer-reviewer">PM / Writer / Reviewer</option>
+            ${AGENT_TEAM_TEMPLATE_GROUPS.flatMap((group) =>
+              group.templates.map(
+                (template) => html`<option value=${template.id}>${group.label} · ${template.label}</option>`,
+              ),
+            )}
             <option value="">Custom members</option>
           </select>
         </label>
@@ -750,6 +804,7 @@ function renderTeamEditor(
           `}
 
       ${renderAliasEditor(props, activeMembers)}
+      ${renderMemberDetails(activeMembers, activeAliases, activeBroadcast, props.draft.defaultAgentId)}
       ${renderBroadcastEditor(props, activeMembers, activeBroadcast)}
 
       <details style="margin-top: 14px;">
@@ -865,6 +920,68 @@ function renderTeamSummary(
       <div class="agent-kv">
         <div class="label">Broadcast</div>
         <div>${broadcastEnabled(broadcast) ? "Broadcast enabled" : "Broadcast disabled"}</div>
+      </div>
+    </div>
+  `;
+}
+
+function renderTeamHealthSummary(
+  props: AgentTeamsPanelProps,
+  members: AgentTeamMember[],
+  aliases: AgentTeamAliasDraft[],
+  broadcast: Record<string, unknown>,
+) {
+  const health = buildTeamHealthSummary(props, members, aliases, broadcast);
+  return html`
+    <div style="margin-top: 14px;">
+      <div class="list-title">Team health summary</div>
+      <div class="agents-overview-grid" style="margin-top: 8px;">
+        ${health.map(
+          (item) => html`
+            <div class="agent-kv">
+              <div class="label">${item.label}</div>
+              <div>${item.value}</div>
+            </div>
+          `,
+        )}
+      </div>
+    </div>
+  `;
+}
+
+function renderMemberDetails(
+  members: AgentTeamMember[],
+  aliases: AgentTeamAliasDraft[],
+  broadcast: Record<string, unknown>,
+  defaultAgentId: string,
+) {
+  const selectedMembers = stringArrayFromUnknown(broadcast.members);
+  return html`
+    <div style="margin-top: 16px;">
+      <div class="list-title">Member details</div>
+      <div class="list" style="margin-top: 8px;">
+        ${members.length === 0
+          ? html`<div class="callout info">No member details are available yet.</div>`
+          : members.map((member) => {
+              const memberAliases = aliases
+                .filter((alias) => alias.agentId === member.agentId)
+                .map((alias) => alias.alias);
+              const tags = [
+                member.agentId === defaultAgentId ? "default" : "",
+                selectedMembers.includes(member.agentId) ? "broadcast" : "",
+                memberAliases.length ? memberAliases.join(", ") : "no aliases",
+              ].filter(Boolean);
+              return html`
+                <div class="list-item">
+                  <div class="list-main">
+                    <div class="list-title">${memberDisplayName(member.agentId, members)}</div>
+                    <div class="list-sub">
+                      ${member.role || "role missing"} · ${member.name || "name missing"} · ${tags.join(" · ")}
+                    </div>
+                  </div>
+                </div>
+              `;
+            })}
       </div>
     </div>
   `;
@@ -1869,6 +1986,85 @@ function safeJsonArrayLength(text: string): number {
   } catch (_err) {
     return 0;
   }
+}
+
+function safeJsonArray(text: string): unknown[] {
+  try {
+    const parsed = JSON.parse(text || "[]") as unknown;
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (_err) {
+    return [];
+  }
+}
+
+function buildTeamHealthSummary(
+  props: AgentTeamsPanelProps,
+  members: AgentTeamMember[],
+  aliases: AgentTeamAliasDraft[],
+  broadcast: Record<string, unknown>,
+): { label: string; value: string }[] {
+  const memberIds = new Set(members.map((member) => member.agentId).filter(Boolean));
+  const bindings = safeJsonArray(props.draft.bindingsJson).map((entry) => objectValue(entry)).filter(Boolean);
+  const bindingAgentIds = bindings.map((binding) => stringOrEmpty(binding?.agentId)).filter(Boolean);
+  const missingRouteAgents = bindingAgentIds.filter((agentId) => !memberIds.has(agentId));
+  const duplicateAliases = duplicateStrings(aliases.map((alias) => alias.alias.toLowerCase()).filter(Boolean));
+  const missingProfileAgents = members
+    .filter((member) => member.agentId && props.workspace.agentId !== member.agentId)
+    .map((member) => member.agentId);
+  const modelAgentId = props.modelResult?.models?.agentId || props.modelDraft.agentId;
+  const missingModelAgents = members
+    .filter((member) => member.agentId && modelAgentId !== member.agentId)
+    .map((member) => member.agentId);
+  const feishuStatus = objectValue(props.channelsSnapshot?.channels?.feishu);
+  const feishuAuth = objectValue(feishuStatus?.auth) ?? objectValue(feishuStatus?.oauth);
+  const missingAuth = isFeishuAuthAuthorized(feishuAuth) ? [] : ["Feishu OAuth"];
+  const feishuReady = Boolean(
+    feishuStatus?.configured === true &&
+      feishuStatus?.running === true &&
+      (props.channelsSnapshot?.channelAccounts?.feishu ?? []).length > 0 &&
+      missingAuth.length === 0,
+  );
+  return [
+    {
+      label: "Routing conflicts",
+      value: [...missingRouteAgents, ...duplicateAliases].join(", ") || "none",
+    },
+    {
+      label: "Missing profiles",
+      value: missingProfileAgents.join(", ") || "none",
+    },
+    {
+      label: "Missing model",
+      value: missingModelAgents.join(", ") || "none",
+    },
+    {
+      label: "Missing auth",
+      value: missingAuth.join(", ") || "none",
+    },
+    {
+      label: "Feishu readiness",
+      value: feishuReady ? "ready" : "needs repair",
+    },
+    {
+      label: "Broadcast members",
+      value: broadcastEnabled(broadcast)
+        ? formatCount(stringArrayFromUnknown(broadcast.members).length, "member")
+        : "disabled",
+    },
+  ];
+}
+
+function duplicateStrings(values: string[]): string[] {
+  const seen = new Set<string>();
+  const duplicates = new Set<string>();
+  values.forEach((value) => {
+    if (seen.has(value)) {
+      duplicates.add(value);
+    } else {
+      seen.add(value);
+    }
+  });
+  return Array.from(duplicates);
 }
 
 function formatCount(count: number, label: string): string {

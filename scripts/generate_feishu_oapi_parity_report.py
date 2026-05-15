@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the Feishu OAPI action parity matrix for AgentTeam series13.
+"""Generate the Feishu OAPI action parity matrix for AgentTeam series14.
 
 The report is intentionally source-backed: it reads OpenClaw-Lark's
 ToolActionKey/TOOL_SCOPES and Metis' OAPI action registry instead of using a
@@ -16,7 +16,7 @@ from pathlib import Path
 
 DEFAULT_OPENCLAW_ROOT = Path("/Users/l3gi0n/work/workspace_cangjie/openclaw-lark")
 DEFAULT_OUTPUT = Path(
-    "develop_steps/metis-agent-team-series-13-oapi-action-parity-report-2026-05-15.md"
+    "develop_steps/metis-agent-team-series-14-oapi-action-parity-report-2026-05-15.md"
 )
 
 
@@ -253,7 +253,7 @@ def generate(args: argparse.Namespace) -> str:
 
     now = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     lines = [
-        "# Metis AgentTeam Series13 Feishu OAPI Action Parity Report",
+        "# Metis AgentTeam Series14 Feishu OAPI Action Parity Report",
         "",
         f"Generated: {now}",
         "",

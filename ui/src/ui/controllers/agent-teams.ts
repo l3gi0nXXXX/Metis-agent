@@ -31,12 +31,16 @@ export type AgentTeamEditorDraft = {
 export type AgentTeamTemplateId =
   | "pm-writer-reviewer"
   | "feishu-content-handoff"
-  | "telegram-support-triage";
+  | "engineering-sprint"
+  | "telegram-support-triage"
+  | "data-insight-report"
+  | "ops-campaign-launch";
 
 export type AgentTeamTemplate = {
   id: AgentTeamTemplateId;
   label: string;
   description: string;
+  category: "content" | "engineering" | "support" | "data" | "ops";
   transport: "feishu" | "telegram" | "generic";
   displayName: string;
   defaultAgentId: string;
@@ -48,6 +52,12 @@ export type AgentTeamTemplate = {
 export type AgentTeamAliasDraft = {
   alias: string;
   agentId: string;
+};
+
+export type AgentTeamTemplateGroup = {
+  id: AgentTeamTemplate["category"];
+  label: string;
+  templates: AgentTeamTemplate[];
 };
 
 export type AgentTeamBindingDraft = {
@@ -136,6 +146,7 @@ export const AGENT_TEAM_TEMPLATES: AgentTeamTemplate[] = [
     id: "pm-writer-reviewer",
     label: "PM / Writer / Reviewer",
     description: "Generic content team with deterministic fan-out.",
+    category: "content",
     transport: "generic",
     displayName: "Content Team",
     defaultAgentId: "content-pm",
@@ -159,6 +170,7 @@ export const AGENT_TEAM_TEMPLATES: AgentTeamTemplate[] = [
     id: "feishu-content-handoff",
     label: "Feishu content handoff",
     description: "Manager delegation pattern for Feishu group workflows.",
+    category: "content",
     transport: "feishu",
     displayName: "Feishu Content Team",
     defaultAgentId: "feishu-manager",
@@ -179,9 +191,36 @@ export const AGENT_TEAM_TEMPLATES: AgentTeamTemplate[] = [
     },
   },
   {
+    id: "engineering-sprint",
+    label: "Engineering sprint",
+    description: "Planner, implementer, reviewer, and release notes roles for development loops.",
+    category: "engineering",
+    transport: "generic",
+    displayName: "Engineering Sprint Team",
+    defaultAgentId: "eng-planner",
+    members: [
+      { agentId: "eng-planner", role: "planner", name: "Planner" },
+      { agentId: "eng-implementer", role: "implementer", name: "Implementer" },
+      { agentId: "eng-reviewer", role: "reviewer", name: "Reviewer" },
+      { agentId: "eng-release", role: "release", name: "Release" },
+    ],
+    aliases: [
+      { alias: "@planner", agentId: "eng-planner" },
+      { alias: "@dev", agentId: "eng-implementer" },
+      { alias: "@review", agentId: "eng-reviewer" },
+      { alias: "/agent release", agentId: "eng-release" },
+    ],
+    broadcast: {
+      enabled: true,
+      members: ["eng-planner", "eng-implementer", "eng-reviewer"],
+      mode: "review-loop",
+    },
+  },
+  {
     id: "telegram-support-triage",
     label: "Telegram support triage",
     description: "Triage, answer, and escalation team for Telegram chats.",
+    category: "support",
     transport: "telegram",
     displayName: "Telegram Support Team",
     defaultAgentId: "telegram-triage",
@@ -201,6 +240,64 @@ export const AGENT_TEAM_TEMPLATES: AgentTeamTemplate[] = [
       mode: "fan-out",
     },
   },
+  {
+    id: "data-insight-report",
+    label: "Data insight report",
+    description: "Analyst, charting, and narrative roles for structured reporting.",
+    category: "data",
+    transport: "generic",
+    displayName: "Data Insight Team",
+    defaultAgentId: "data-analyst",
+    members: [
+      { agentId: "data-analyst", role: "analyst", name: "Analyst" },
+      { agentId: "data-viz", role: "visualization", name: "Visualization" },
+      { agentId: "data-narrator", role: "narrative", name: "Narrator" },
+    ],
+    aliases: [
+      { alias: "@analyst", agentId: "data-analyst" },
+      { alias: "@chart", agentId: "data-viz" },
+      { alias: "@report", agentId: "data-narrator" },
+    ],
+    broadcast: {
+      enabled: true,
+      members: ["data-analyst", "data-viz", "data-narrator"],
+      mode: "report-chain",
+    },
+  },
+  {
+    id: "ops-campaign-launch",
+    label: "Ops campaign launch",
+    description: "Operations owner, copy, QA, and customer response roles for campaign launches.",
+    category: "ops",
+    transport: "feishu",
+    displayName: "Ops Campaign Team",
+    defaultAgentId: "ops-owner",
+    members: [
+      { agentId: "ops-owner", role: "owner", name: "Owner" },
+      { agentId: "ops-copy", role: "copy", name: "Copy" },
+      { agentId: "ops-qa", role: "qa", name: "QA" },
+      { agentId: "ops-support", role: "support", name: "Support" },
+    ],
+    aliases: [
+      { alias: "@owner", agentId: "ops-owner" },
+      { alias: "@copy", agentId: "ops-copy" },
+      { alias: "@qa", agentId: "ops-qa" },
+      { alias: "@support", agentId: "ops-support" },
+    ],
+    broadcast: {
+      enabled: true,
+      members: ["ops-owner", "ops-copy", "ops-qa", "ops-support"],
+      mode: "launch-readiness",
+    },
+  },
+];
+
+export const AGENT_TEAM_TEMPLATE_GROUPS: AgentTeamTemplateGroup[] = [
+  { id: "content", label: "内容", templates: AGENT_TEAM_TEMPLATES.filter((template) => template.category === "content") },
+  { id: "engineering", label: "研发", templates: AGENT_TEAM_TEMPLATES.filter((template) => template.category === "engineering") },
+  { id: "support", label: "客服", templates: AGENT_TEAM_TEMPLATES.filter((template) => template.category === "support") },
+  { id: "data", label: "数据", templates: AGENT_TEAM_TEMPLATES.filter((template) => template.category === "data") },
+  { id: "ops", label: "运营", templates: AGENT_TEAM_TEMPLATES.filter((template) => template.category === "ops") },
 ];
 
 export function createEmptyAgentTeamDraft(): AgentTeamEditorDraft {

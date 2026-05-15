@@ -1410,6 +1410,35 @@ public class GatewayServiceTelegramNativeTest {
     }
 
     @TestCase
+    public func telegramAgentsTeamStatusAndSwitchCommandsReturnSafeGuidance(): Unit {
+        withGatewayTelegramNativeTestHome {
+            var user = GatewayUserSettings()
+            user.telegram.enabled = true
+            user.telegram.allowFrom = ["*"]
+            user.telegram.threadBindings.enabled = true
+            CliSettingManager.writeGatewaySettings(user)
+
+            let adapter = GatewayTelegramNativeTestAdapter()
+            let service = gatewayTelegramNativeService(adapter)
+            service.start()
+            adapter.queue("/agents team")
+            service.processOnce()
+            adapter.queue("/agents status")
+            service.processOnce()
+            adapter.queue("/agents switch @writer")
+            service.processOnce()
+
+            @Expect(adapter.sentText(0).contains("Telegram thread binding: team"), true)
+            @Expect(adapter.sentText(0).contains("/agents switch <alias>"), true)
+            @Expect(adapter.sentText(1).contains("Telegram thread binding: status"), true)
+            @Expect(adapter.sentText(1).contains("Bindings:"), true)
+            @Expect(adapter.sentText(2).contains("Telegram thread binding: switch"), true)
+            @Expect(adapter.sentText(2).contains("@writer"), true)
+            @Expect(adapter.sentText(2).contains("Alias switching is routed through AgentTeam alias bindings"), true)
+        }
+    }
+
+    @TestCase
     public func t51CatalogCoversOpenClawNativeCommandNames(): Unit {
         let expected = [
             "help", "commands", "tools", "skill", "status", "tasks", "allowlist", "approve",

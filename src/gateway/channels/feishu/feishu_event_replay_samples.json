@@ -37,6 +37,191 @@
     }
   },
   {
+    "name": "post",
+    "payload": {
+      "header": {
+        "event_type": "im.message.receive_v1",
+        "account_id": "tenant-a",
+        "app_id": "cli_app_a"
+      },
+      "event": {
+        "sender": {
+          "sender_id": {
+            "open_id": "ou_fixture_sender"
+          }
+        },
+        "message": {
+          "message_id": "om_fixture_post",
+          "chat_id": "oc_fixture_group",
+          "chat_type": "group",
+          "message_type": "post",
+          "content": "{\"zh_cn\":{\"content\":[[{\"tag\":\"text\",\"text\":\"fixture post\"}]]}}",
+          "root_id": "",
+          "thread_id": "omt_fixture_post"
+        }
+      }
+    },
+    "expected": {
+      "ignored": false,
+      "dedup": true,
+      "accountId": "tenant-a",
+      "peerId": "oc_fixture_group",
+      "messageId": "om_fixture_post",
+      "mediaMessageId": "",
+      "threadId": "omt_fixture_post",
+      "systemEventKind": "",
+      "mediaKind": ""
+    }
+  },
+  {
+    "name": "media_file",
+    "payload": {
+      "header": {
+        "event_type": "im.message.receive_v1",
+        "account_id": "tenant-a",
+        "app_id": "cli_app_a"
+      },
+      "event": {
+        "sender": {
+          "sender_id": {
+            "open_id": "ou_fixture_sender"
+          }
+        },
+        "message": {
+          "message_id": "om_fixture_file",
+          "chat_id": "oc_fixture_group",
+          "chat_type": "group",
+          "message_type": "file",
+          "content": "{\"file_key\":\"file_fixture_1\",\"file_name\":\"fixture.pdf\",\"mime_type\":\"application/pdf\",\"size\":\"256\"}",
+          "root_id": "",
+          "thread_id": "omt_fixture_file"
+        }
+      }
+    },
+    "expected": {
+      "ignored": false,
+      "dedup": true,
+      "accountId": "tenant-a",
+      "peerId": "oc_fixture_group",
+      "messageId": "om_fixture_file",
+      "mediaMessageId": "",
+      "threadId": "omt_fixture_file",
+      "systemEventKind": "",
+      "mediaKind": "file"
+    }
+  },
+  {
+    "name": "media_audio",
+    "payload": {
+      "header": {
+        "event_type": "im.message.receive_v1",
+        "account_id": "tenant-a",
+        "app_id": "cli_app_a"
+      },
+      "event": {
+        "sender": {
+          "sender_id": {
+            "open_id": "ou_fixture_sender"
+          }
+        },
+        "message": {
+          "message_id": "om_fixture_audio",
+          "chat_id": "oc_fixture_group",
+          "chat_type": "group",
+          "message_type": "audio",
+          "content": "{\"audio_key\":\"audio_fixture_1\",\"file_name\":\"fixture.ogg\",\"mime_type\":\"audio/ogg\",\"size\":\"512\"}",
+          "root_id": "",
+          "thread_id": "omt_fixture_audio"
+        }
+      }
+    },
+    "expected": {
+      "ignored": false,
+      "dedup": true,
+      "accountId": "tenant-a",
+      "peerId": "oc_fixture_group",
+      "messageId": "om_fixture_audio",
+      "mediaMessageId": "",
+      "threadId": "omt_fixture_audio",
+      "systemEventKind": "",
+      "mediaKind": "audio"
+    }
+  },
+  {
+    "name": "media_video",
+    "payload": {
+      "header": {
+        "event_type": "im.message.receive_v1",
+        "account_id": "tenant-a",
+        "app_id": "cli_app_a"
+      },
+      "event": {
+        "sender": {
+          "sender_id": {
+            "open_id": "ou_fixture_sender"
+          }
+        },
+        "message": {
+          "message_id": "om_fixture_video",
+          "chat_id": "oc_fixture_group",
+          "chat_type": "group",
+          "message_type": "video",
+          "content": "{\"file_key\":\"video_fixture_1\",\"file_name\":\"fixture.mp4\",\"mime_type\":\"video/mp4\",\"size\":\"1024\"}",
+          "root_id": "",
+          "thread_id": "omt_fixture_video"
+        }
+      }
+    },
+    "expected": {
+      "ignored": false,
+      "dedup": true,
+      "accountId": "tenant-a",
+      "peerId": "oc_fixture_group",
+      "messageId": "om_fixture_video",
+      "mediaMessageId": "",
+      "threadId": "omt_fixture_video",
+      "systemEventKind": "",
+      "mediaKind": "video"
+    }
+  },
+  {
+    "name": "interactive_message",
+    "payload": {
+      "header": {
+        "event_type": "im.message.receive_v1",
+        "account_id": "tenant-a",
+        "app_id": "cli_app_a"
+      },
+      "event": {
+        "sender": {
+          "sender_id": {
+            "open_id": "ou_fixture_sender"
+          }
+        },
+        "message": {
+          "message_id": "om_fixture_interactive",
+          "chat_id": "oc_fixture_group",
+          "chat_type": "group",
+          "message_type": "interactive",
+          "content": "{\"elements\":[{\"tag\":\"div\",\"text\":{\"tag\":\"lark_md\",\"content\":\"fixture card text\"}}]}",
+          "root_id": "",
+          "thread_id": "omt_fixture_interactive"
+        }
+      }
+    },
+    "expected": {
+      "ignored": false,
+      "dedup": true,
+      "accountId": "tenant-a",
+      "peerId": "oc_fixture_group",
+      "messageId": "om_fixture_interactive",
+      "mediaMessageId": "",
+      "threadId": "omt_fixture_interactive",
+      "systemEventKind": "",
+      "mediaKind": ""
+    }
+  },
+  {
     "name": "reaction",
     "payload": {
       "header": {

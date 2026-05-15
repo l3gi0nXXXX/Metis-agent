@@ -229,8 +229,21 @@ describe("renderAgentTeamsPanel", () => {
 
     const text = container.textContent ?? "";
     expect(text).toContain("Team Wizard");
+    expect(text).toContain("Template library");
+    expect(text).toContain("内容");
+    expect(text).toContain("研发");
+    expect(text).toContain("客服");
+    expect(text).toContain("数据");
+    expect(text).toContain("运营");
     expect(text).toContain("Feishu content handoff");
+    expect(text).toContain("Engineering sprint");
+    expect(text).toContain("Data insight report");
+    expect(text).toContain("Ops campaign launch");
     expect(text).toContain("Telegram support triage");
+    expect(text).toContain("IM team commands");
+    expect(text).toContain("/agents team");
+    expect(text).toContain("/agents status");
+    expect(text).toContain("/agents switch @writer");
     expect(text).toContain("Export template JSON");
     expect(text).toContain("Import template JSON");
 
@@ -259,6 +272,45 @@ describe("renderAgentTeamsPanel", () => {
       useStructuredBinding: true,
       team: "content",
     });
+  });
+
+  it("renders member detail and health summary without leaking secrets", () => {
+    const container = document.createElement("div");
+    render(
+      renderAgentTeamsPanel(
+        createProps({
+          draft: {
+            ...createEmptyAgentTeamDraft(),
+            id: "content",
+            displayName: "Content Team",
+            defaultAgentId: "content-writer",
+            membersJson:
+              '[{"agentId":"content-writer","role":"writer","name":"Writer"},{"agentId":"content-reviewer","role":"reviewer","name":"Reviewer"},{"agentId":"missing-model","role":"analyst","name":"Analyst"}]',
+            aliasesJson: '[{"alias":"@writer","agentId":"content-writer"},{"alias":"/agent review","agentId":"content-reviewer"}]',
+            bindingsJson:
+              '[{"agentId":"content-writer","match":{"channel":"feishu"}},{"agentId":"missing-route","match":{"channel":"telegram"}}]',
+            broadcastJson: '{"enabled":true,"members":["content-writer"]}',
+          },
+        }),
+      ),
+      container,
+    );
+
+    const text = container.textContent ?? "";
+    expect(text).toContain("Team health summary");
+    expect(text).toContain("Routing conflicts");
+    expect(text).toContain("missing-route");
+    expect(text).toContain("Missing profiles");
+    expect(text).toContain("missing-model");
+    expect(text).toContain("Missing model");
+    expect(text).toContain("Missing auth");
+    expect(text).toContain("Feishu readiness");
+    expect(text).toContain("Member details");
+    expect(text).toContain("@writer");
+    expect(text).toContain("/agent review");
+    expect(text).toContain("default");
+    expect(text).toContain("broadcast");
+    expect(text).not.toContain("secret-feishu-access-token");
   });
 
   it("renders explicit Doctor repair rows for Feishu and team readiness gaps", () => {
@@ -409,6 +461,8 @@ describe("renderAgentTeamsPanel", () => {
 
     const text = container.textContent ?? "";
     expect(text).toContain("Feishu setup/repair wizard");
+    expect(text).toContain("Link existing Feishu app/bot");
+    expect(text).toContain("Associate existing app/bot");
     expect(text).toContain("App credentials");
     expect(text).toContain("Event subscription");
     expect(text).toContain("Scope repair");
