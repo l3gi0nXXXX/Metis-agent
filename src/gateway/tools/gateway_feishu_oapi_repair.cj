@@ -129,7 +129,7 @@ private func feishuOapiRepairContextFromRuntimeContext(ctx: GatewayToolRuntimeCo
 
 private func feishuOapiRepairStatusSupportsAction(status: String): Bool {
     let clean = status.trimAscii()
-    clean == "auth_required" || clean == "scope_missing" || clean == "app_scope_missing"
+    clean == "auth_required" || clean == "scope_missing" || clean == "app_scope_missing" || clean == "missing_credential"
 }
 
 public func gatewayFeishuOapiAttachRepairActionForToolResult(result: JsonObject, request: FeishuOapiRequest): JsonObject {
@@ -149,6 +149,17 @@ public func gatewayFeishuOapiAttachRepairActionForToolResult(result: JsonObject,
     repair.put("action", JsonString(request.action))
     repair.put("scopes", feishuOapiJsonStringArray(scopes))
     repair.put("redacted", JsonBool(true))
+
+    if (status == "missing_credential") {
+        repair.put("kind", JsonString("feishu_oapi_credential_repair"))
+        repair.put("status", JsonString("operator_required"))
+        repair.put("can_start", JsonBool(false))
+        repair.put("repair_method", JsonString("configure_feishu_app_credentials"))
+        repair.put("missing_fields", feishuOapiJsonStringArray(["app_id", "app_secret"]))
+        repair.put("network", JsonString("not_started"))
+        result.put("repair_action", repair)
+        return result
+    }
 
     if (!ctx.complete) {
         repair.put("status", JsonString("diagnostic_only"))

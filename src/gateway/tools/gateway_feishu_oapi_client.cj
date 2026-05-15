@@ -1675,6 +1675,26 @@ private class FeishuOapiStaticAppScopeChecker <: FeishuOapiAppScopeChecker {
     }
 }
 
+private func feishuOapiWriteLiveSmokeReportIfRequested(out: JsonObject): JsonObject {
+    let rawDir = feishuOapiEnvValue("METIS_FEISHU_OAPI_LIVE_REPORT_DIR").trimAscii()
+    if (rawDir.isEmpty()) {
+        return out
+    }
+    try {
+        let root = Path(rawDir)
+        if (!exists(root)) {
+            Directory.create(root, recursive: true)
+        }
+        let reportPath = root.join("report.json")
+        out.put("reportPath", JsonString(reportPath.toString()))
+        File.writeTo(reportPath, out.toJsonString().toArray())
+    } catch (e: Exception) {
+        out.put("reportStatus", JsonString("write_failed"))
+        out.put("reportError", JsonString(e.message))
+    }
+    out
+}
+
 public func feishuOapiLiveSmokeHarnessFromEnv(): JsonObject {
     let required = JsonArray([
         JsonString("METIS_FEISHU_OAPI_LIVE_SMOKE"),
@@ -1690,7 +1710,7 @@ public func feishuOapiLiveSmokeHarnessFromEnv(): JsonObject {
         out.put("live", JsonBool(false))
         out.put("redacted", JsonBool(true))
         out.put("requiresEnv", required)
-        return out
+        return feishuOapiWriteLiveSmokeReportIfRequested(out)
     }
 
     let accessToken = feishuOapiEnvValue("METIS_FEISHU_OAPI_LIVE_ACCESS_TOKEN")
@@ -1718,7 +1738,7 @@ public func feishuOapiLiveSmokeHarnessFromEnv(): JsonObject {
         out.put("live", JsonBool(false))
         out.put("redacted", JsonBool(true))
         out.put("requiresEnv", required)
-        return out
+        return feishuOapiWriteLiveSmokeReportIfRequested(out)
     }
 
     let cases = try {
@@ -1730,7 +1750,7 @@ public func feishuOapiLiveSmokeHarnessFromEnv(): JsonObject {
         out.put("live", JsonBool(false))
         out.put("redacted", JsonBool(true))
         out.put("requiresEnv", required)
-        return out
+        return feishuOapiWriteLiveSmokeReportIfRequested(out)
     }
 
     let domain = feishuOapiEnvValue("METIS_FEISHU_OAPI_LIVE_DOMAIN")
@@ -1781,7 +1801,7 @@ public func feishuOapiLiveSmokeHarnessFromEnv(): JsonObject {
     out.put("failureCount", JsonInt(failures))
     out.put("results", results)
     out.put("requiresEnv", required)
-    out
+    feishuOapiWriteLiveSmokeReportIfRequested(out)
 }
 
 public func feishuOapiBuildRawHttpRequest(domain: String, request: FeishuOapiRequest, accessToken: String): FeishuOapiRawHttpRequest {

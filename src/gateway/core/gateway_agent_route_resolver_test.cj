@@ -358,6 +358,46 @@ public class GatewayAgentRouteResolverTest {
     }
 
     @TestCase
+    public func telegramAccountGroupAndTopicsResolveToIsolatedAgentSessions(): Unit {
+        let root = routeTestConfig()
+        putBindings(
+            root,
+            [
+                routeBinding("assistant-a", "telegram", accountId: "bot-a"),
+                peerBinding("ops", "telegram", "group", "-100_acceptance", accountId: "bot-b"),
+                peerBinding("writer", "telegram", "topic", "41", accountId: "bot-b"),
+                peerBinding("reviewer", "telegram", "topic", "42", accountId: "bot-b")
+            ]
+        )
+
+        let accountRoute = gatewayResolveAgentRoute(
+            GatewayAgentRouteInput(root, "telegram", accountId: "bot-a", peerKind: "group", peerId: "-100_account"))
+        @Expect(accountRoute.agentId, "assistant-a")
+        @Expect(accountRoute.accountId, "bot-a")
+        @Expect(accountRoute.sessionKey, "agent:assistant-a:telegram:group:-100_account")
+        @Expect(accountRoute.matchedBy, "binding.account")
+
+        let groupRoute = gatewayResolveAgentRoute(
+            GatewayAgentRouteInput(root, "telegram", accountId: "bot-b", peerKind: "group", peerId: "-100_acceptance"))
+        @Expect(groupRoute.agentId, "ops")
+        @Expect(groupRoute.accountId, "bot-b")
+        @Expect(groupRoute.sessionKey, "agent:ops:telegram:group:-100_acceptance")
+        @Expect(groupRoute.matchedBy, "binding.peer.exact")
+
+        let topic41 = gatewayResolveAgentRoute(
+            GatewayAgentRouteInput(root, "telegram", accountId: "bot-b", peerKind: "topic", peerId: "41",
+                parentPeerKind: "group", parentPeerId: "-100_acceptance"))
+        let topic42 = gatewayResolveAgentRoute(
+            GatewayAgentRouteInput(root, "telegram", accountId: "bot-b", peerKind: "topic", peerId: "42",
+                parentPeerKind: "group", parentPeerId: "-100_acceptance"))
+        @Expect(topic41.agentId, "writer")
+        @Expect(topic41.sessionKey, "agent:writer:telegram:topic:41")
+        @Expect(topic42.agentId, "reviewer")
+        @Expect(topic42.sessionKey, "agent:reviewer:telegram:topic:42")
+        @Expect(topic41.sessionKey == topic42.sessionKey, false)
+    }
+
+    @TestCase
     public func directDmScopesIncludeMainPeerChannelPeerAndPerAccountKeys(): Unit {
         let root = routeTestConfig()
         putBindings(root, [peerBinding("assistant-a", "telegram", "direct", "u_1", accountId: "*")])

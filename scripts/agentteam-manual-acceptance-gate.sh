@@ -23,6 +23,142 @@ require_command() {
   command -v "$1" >/dev/null 2>&1 || fail "required command not found: $1"
 }
 
+redacted_flag() {
+  if [[ -n "${1:-}" ]]; then
+    printf "provided-redacted"
+  else
+    printf "not-provided"
+  fi
+}
+
+write_evidence_pack() {
+  local report_dir="$1"
+  local report_json="$report_dir/report.json"
+  local template_md="$report_dir/manual-acceptance-template.md"
+  local created_at
+  local head
+  local telegram_status
+  local feishu_status
+  local control_ui_status
+
+  created_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+  head="$(git rev-parse HEAD)"
+  telegram_status="skipped"
+  feishu_status="skipped"
+  control_ui_status="skipped"
+  if [[ "${METIS_AGENTTEAM_LIVE_TELEGRAM:-0}" == "1" ]]; then
+    telegram_status="manual-opt-in-record-required"
+  fi
+  if [[ "${METIS_AGENTTEAM_LIVE_FEISHU:-0}" == "1" ]]; then
+    feishu_status="manual-opt-in-record-required"
+  fi
+  if [[ -n "${METIS_AGENTTEAM_CONTROL_UI_URL:-}" ]]; then
+    control_ui_status="enabled"
+  fi
+
+  cat >"$report_json" <<JSON
+{
+  "kind": "metis-agentteam-manual-acceptance-evidence",
+  "createdAt": "$created_at",
+  "gitHead": "$head",
+  "metisHome": "$METIS_HOME_CANONICAL",
+  "reportDir": "$report_dir",
+  "controlUi": {
+    "status": "$control_ui_status",
+    "url": "$(redacted_flag "${METIS_AGENTTEAM_CONTROL_UI_URL:-}")"
+  },
+  "liveGates": {
+    "telegram": {
+      "status": "$telegram_status",
+      "accountId": "$(redacted_flag "${METIS_AGENTTEAM_TELEGRAM_ACCOUNT_ID:-}")",
+      "chatOrTopic": "$(redacted_flag "${METIS_AGENTTEAM_TELEGRAM_TEST_CHAT_ID:-}")"
+    },
+    "feishu": {
+      "status": "$feishu_status",
+      "accountId": "$(redacted_flag "${METIS_AGENTTEAM_FEISHU_ACCOUNT_ID:-}")",
+      "tenant": "$(redacted_flag "${METIS_AGENTTEAM_FEISHU_TENANT_ID:-}")",
+      "chatOrThread": "$(redacted_flag "${METIS_AGENTTEAM_FEISHU_CHAT_ID:-}")"
+    }
+  },
+  "redaction": {
+    "storesRealMetisHome": false,
+    "containsTelegramBotToken": false,
+    "containsFeishuAppSecret": false,
+    "containsAccessToken": false,
+    "containsRefreshToken": false,
+    "containsAuthorizationHeader": false
+  }
+}
+JSON
+
+  cat >"$template_md" <<MD
+# Metis AgentTeam Manual Acceptance Evidence
+
+- Date: $created_at
+- Git head: $head
+- METIS_HOME: $METIS_HOME_CANONICAL
+- Report dir: $report_dir
+- Operator: TODO
+- Gateway URL: TODO redacted or local-only
+- Control UI URL: ${control_ui_status}
+
+## Phase 0 Evidence Freeze
+
+| Check | Result | Evidence |
+| --- | --- | --- |
+| Series 15 source-backed conclusion is current | TODO pass/fail | TODO |
+| Series 14 OAPI parity is 108 aligned / 0 partial / 0 missing / 0 not-applicable | TODO pass/fail | TODO |
+| Live Telegram/Feishu gates are opt-in only | TODO pass/fail | See report.json liveGates |
+
+## Phase 1 Redacted Live Resource Pack
+
+| Resource | Result | Redacted Evidence |
+| --- | --- | --- |
+| Isolated METIS_HOME | TODO pass/fail | $METIS_HOME_CANONICAL |
+| Telegram test bot/account | TODO skipped/pass/fail | redacted id only |
+| Telegram test group/topic | TODO skipped/pass/fail | redacted id only |
+| Feishu test app/account | TODO skipped/pass/fail | redacted id only |
+| Feishu tenant/user/group/thread | TODO skipped/pass/fail | redacted id only |
+| Provider key for per-agent model smoke | TODO skipped/pass/fail | source summary only |
+
+## Phase 2 Core AgentTeam Regression
+
+| Check | Result | Evidence |
+| --- | --- | --- |
+| CLI template team create/list/get/delete | TODO pass/fail | TODO |
+| CLI custom members and aliases | TODO pass/fail | TODO |
+| RPC agents.teams create/list/get/update/delete | TODO pass/fail | TODO |
+| Profile files list/get/set including BOOTSTRAP.md creation | TODO pass/fail | TODO |
+| Per-agent models and credential source redaction | TODO pass/fail | TODO |
+| Binding conflict rejects same route/different agent without partial write | TODO pass/fail | TODO |
+| Broadcast aggregate includes per-agent status/detail/answer/sessionKey | TODO pass/fail | TODO |
+
+## Redaction Checklist
+
+- No real ~/.metis path was used.
+- No Telegram bot token was recorded.
+- No Feishu app secret was recorded.
+- No access or refresh token was recorded.
+- No auth header was recorded.
+- No proxy credentials or provider keys were recorded.
+MD
+
+  if rg -n -i 'bot[ _-]?token[=:][^ ]+|app[ _-]?secret[=:][^ ]+|access[ _-]?token[=:][^ ]+|refresh[ _-]?token[=:][^ ]+|authorization:[[:space:]]*bearer[[:space:]]+[^ ]+|sk-[A-Za-z0-9_-]{16,}' "$report_dir" >/tmp/metis-agentteam-gate-redaction.txt; then
+    cat /tmp/metis-agentteam-gate-redaction.txt >&2
+    rm -f /tmp/metis-agentteam-gate-redaction.txt
+    fail "redaction scan found secret-like evidence in $report_dir"
+  fi
+  rm -f /tmp/metis-agentteam-gate-redaction.txt
+}
+
+require_env_for_gate() {
+  local gate="$1"
+  local name="$2"
+  if [[ "$gate" == "1" && -z "${!name:-}" ]]; then
+    fail "set $name for the opt-in Telegram live gate, or unset METIS_AGENTTEAM_LIVE_TELEGRAM to keep it skipped"
+  fi
+}
+
 require_command git
 require_command rg
 
@@ -38,6 +174,15 @@ if [[ "$METIS_HOME_CANONICAL" == "$REAL_HOME" && "${METIS_AGENTTEAM_ALLOW_REAL_H
   fail "METIS_HOME points at the real home ($REAL_HOME). Use a test home or set METIS_AGENTTEAM_ALLOW_REAL_HOME=1 deliberately."
 fi
 info "METIS_HOME=$METIS_HOME_CANONICAL"
+
+REPORT_DIR_VALUE="${METIS_AGENTTEAM_REPORT_DIR:-$METIS_HOME_CANONICAL/agentteam-manual-acceptance-report}"
+mkdir -p "$REPORT_DIR_VALUE"
+REPORT_DIR_CANONICAL="$(cd "$REPORT_DIR_VALUE" && pwd -P)"
+if [[ "$REPORT_DIR_CANONICAL" == "$REAL_HOME"* && "${METIS_AGENTTEAM_ALLOW_REAL_HOME:-0}" != "1" ]]; then
+  fail "report dir points inside the real home ($REAL_HOME). Use METIS_AGENTTEAM_REPORT_DIR outside the real home."
+fi
+write_evidence_pack "$REPORT_DIR_CANONICAL"
+info "redacted evidence pack written to $REPORT_DIR_CANONICAL"
 
 stale_patterns=(
   "Auth status RPC missing"
@@ -160,9 +305,12 @@ NODE
 fi
 
 if [[ "${METIS_AGENTTEAM_LIVE_TELEGRAM:-0}" == "1" ]]; then
-  info "live Telegram gate is opt-in; record test bot/account, group/topic, pass/fail, and log redaction result in the runbook"
+  require_env_for_gate "${METIS_AGENTTEAM_LIVE_TELEGRAM:-0}" METIS_AGENTTEAM_TELEGRAM_ACCOUNT_ID
+  require_env_for_gate "${METIS_AGENTTEAM_LIVE_TELEGRAM:-0}" METIS_AGENTTEAM_TELEGRAM_TEST_CHAT_ID
+  info "live Telegram gate opted in for account=${METIS_AGENTTEAM_TELEGRAM_ACCOUNT_ID}; test chat/topic ids are operator-provided and must be redacted in reports"
+  info "live Telegram route checks remain manual: account route, group/topic session isolation, alias routing, and team broadcast aggregate"
 else
-  info "live Telegram gate skipped"
+  info "live Telegram gate skipped; set METIS_AGENTTEAM_LIVE_TELEGRAM=1 with METIS_AGENTTEAM_TELEGRAM_ACCOUNT_ID and METIS_AGENTTEAM_TELEGRAM_TEST_CHAT_ID to enable manual smoke"
 fi
 
 if [[ "${METIS_AGENTTEAM_LIVE_FEISHU:-0}" == "1" ]]; then

@@ -1,6 +1,9 @@
 package metis.gateway.tools
 
+import metis.core.config.MetisProcessEnvironmentLock
+
 import std.collection.{ArrayList, HashMap}
+import std.env.{getVariable, setVariable}
 import std.fs.{Directory, File, Path, exists, remove}
 import std.time.DateTime
 import std.unittest.testmacro.*
@@ -944,7 +947,7 @@ public class GatewayFeishuOapiToolsetTest {
     }
 
     @TestCase
-    public func appTokenProviderFetchesCachesTenantAndAppTokensWithFakeClient(): Unit {
+    public func appTokenProviderFetchesCachesTenantBotAndAppTokensWithFakeClient(): Unit {
         let appTokenClient = FeishuOapiToolsetFakeAppTokenClient()
         let http = FeishuOapiToolsetCountingHttpClient()
         let provider = MetisFeishuOapiTokenProvider(
@@ -971,16 +974,27 @@ public class GatewayFeishuOapiToolsetTest {
         @Expect(appTokenClient.modes.size, 1)
         @Expect(http.accessTokens[1], "issued-tenant_access_token")
 
+        let botRequest = feishuOapiBuildRequest("feishu_im_bot_image", "default", "tenant-a", JsonObject())
+        let botJson = MetisFeishuOapiClient(
+            tokenProvider: Some<FeishuOapiTokenProvider>(provider),
+            httpClient: Some<FeishuOapiHttpClient>(http)
+        ).invoke(botRequest)
+        @Expect(botJson.get("status").getOrThrow().asString().getValue(), "success")
+        @Expect(appTokenClient.modes[1], "bot_access_token")
+        @Expect(http.accessTokens[2], "issued-bot_access_token")
+        @Expect(botJson.toJsonString().contains("token_mode_unsupported"), false)
+
         let appRequest = feishuOapiBuildRequest("feishu_ask_user_question", "default", "tenant-a", JsonObject())
         let appJson = MetisFeishuOapiClient(
             tokenProvider: Some<FeishuOapiTokenProvider>(provider),
             httpClient: Some<FeishuOapiHttpClient>(http)
         ).invoke(appRequest)
         @Expect(appJson.get("status").getOrThrow().asString().getValue(), "success")
-        @Expect(appTokenClient.modes[1], "app_access_token")
-        @Expect(http.accessTokens[2], "issued-app_access_token")
+        @Expect(appTokenClient.modes[2], "app_access_token")
+        @Expect(http.accessTokens[3], "issued-app_access_token")
         @Expect(appJson.toJsonString().contains("app-secret-never-visible"), false)
         @Expect(appJson.toJsonString().contains("issued-app_access_token"), false)
+        @Expect(appJson.toJsonString().contains("token_mode_unsupported"), false)
     }
 
     @TestCase
@@ -1022,12 +1036,39 @@ public class GatewayFeishuOapiToolsetTest {
 
     @TestCase
     public func liveSmokeHarnessDefaultsToSkippedUnlessExplicitEnvGateIsEnabled(): Unit {
-        let result = feishuOapiLiveSmokeHarnessFromEnv()
-        @Expect(result.get("status").getOrThrow().asString().getValue(), "skipped")
-        @Expect(result.get("reason").getOrThrow().asString().getValue(), "env_gate_disabled")
-        @Expect(result.get("live").getOrThrow().asBool().getValue(), false)
-        @Expect(result.get("redacted").getOrThrow().asBool().getValue(), true)
-        @Expect(result.get("requiresEnv").getOrThrow().asArray()[0].asString().getValue(), "METIS_FEISHU_OAPI_LIVE_SMOKE")
+        synchronized(MetisProcessEnvironmentLock) {
+            let root = feishuOapiToolsetTempRoot("live-oapi-skip")
+            let oldSmoke = getVariable("METIS_FEISHU_OAPI_LIVE_SMOKE")
+            let oldReport = getVariable("METIS_FEISHU_OAPI_LIVE_REPORT_DIR")
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+            try {
+                setVariable("METIS_FEISHU_OAPI_LIVE_SMOKE", "")
+                setVariable("METIS_FEISHU_OAPI_LIVE_REPORT_DIR", root.toString())
+                let result = feishuOapiLiveSmokeHarnessFromEnv()
+                @Expect(result.get("status").getOrThrow().asString().getValue(), "skipped")
+                @Expect(result.get("reason").getOrThrow().asString().getValue(), "env_gate_disabled")
+                @Expect(result.get("live").getOrThrow().asBool().getValue(), false)
+                @Expect(result.get("redacted").getOrThrow().asBool().getValue(), true)
+                @Expect(result.get("requiresEnv").getOrThrow().asArray()[0].asString().getValue(), "METIS_FEISHU_OAPI_LIVE_SMOKE")
+                let reportPath = result.get("reportPath").getOrThrow().asString().getValue()
+                @Expect(reportPath.contains(root.toString()), true)
+                let report = JsonValue.fromStr(String.fromUtf8(File.readFrom(Path(reportPath)))).asObject()
+                @Expect(report.get("status").getOrThrow().asString().getValue(), "skipped")
+                @Expect(report.get("redacted").getOrThrow().asBool().getValue(), true)
+                @Expect(report.toJsonString().contains("accessToken"), false)
+                @Expect(report.toJsonString().contains("Authorization"), false)
+            } finally {
+                try { remove(root, recursive: true) } catch (_e: Exception) { () }
+                match (oldSmoke) {
+                    case Some(value) => setVariable("METIS_FEISHU_OAPI_LIVE_SMOKE", value)
+                    case None => setVariable("METIS_FEISHU_OAPI_LIVE_SMOKE", "")
+                }
+                match (oldReport) {
+                    case Some(value) => setVariable("METIS_FEISHU_OAPI_LIVE_REPORT_DIR", value)
+                    case None => setVariable("METIS_FEISHU_OAPI_LIVE_REPORT_DIR", "")
+                }
+            }
+        }
     }
 
     @TestCase

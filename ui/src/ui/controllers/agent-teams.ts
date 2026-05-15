@@ -11,6 +11,7 @@ import type {
   AgentsFilesGetResult,
   AgentsFilesListResult,
   AgentsFilesSetResult,
+  ChannelsStatusSnapshot,
 } from "../types.ts";
 import {
   formatMissingOperatorReadScopeMessage,
@@ -98,6 +99,29 @@ export type AgentTeamWorkspaceDraft = {
   path: string;
   content: string;
   draft: string;
+};
+
+export type AgentTeamCultivationFileSnapshot = {
+  name: "MEMORY.md" | "HEARTBEAT.md";
+  status: "loaded" | "present" | "missing";
+  updatedAtMs?: number;
+  preview: string;
+};
+
+export type AgentTeamDoctorFindingSnapshot = {
+  code: string;
+  message: string;
+};
+
+export type AgentTeamCultivationSnapshot = {
+  agentId: string;
+  memory: AgentTeamCultivationFileSnapshot;
+  heartbeat: AgentTeamCultivationFileSnapshot;
+  doctor: {
+    status: string;
+    lastProbeAt?: number;
+    findings: AgentTeamDoctorFindingSnapshot[];
+  };
 };
 
 export type AgentTeamFeishuAuthResult = Record<string, unknown>;
@@ -349,6 +373,23 @@ export function createEmptyAgentTeamWorkspaceDraft(): AgentTeamWorkspaceDraft {
     path: "",
     content: "",
     draft: "",
+  };
+}
+
+export function buildAgentTeamCultivationSnapshot(params: {
+  workspace: AgentTeamWorkspaceDraft;
+  channelsSnapshot: ChannelsStatusSnapshot | null;
+}): AgentTeamCultivationSnapshot {
+  const doctor = resolveFeishuDoctor(params.channelsSnapshot);
+  return {
+    agentId: params.workspace.agentId.trim(),
+    memory: buildCultivationFileSnapshot(params.workspace, "MEMORY.md"),
+    heartbeat: buildCultivationFileSnapshot(params.workspace, "HEARTBEAT.md"),
+    doctor: {
+      status: stringValue(doctor?.status) || stringValue(doctor?.state) || (doctor ? "available" : "missing"),
+      lastProbeAt: numberValue(doctor?.lastProbeAt),
+      findings: extractDoctorFindings(doctor),
+    },
   };
 }
 
@@ -1092,10 +1133,78 @@ function stringValue(value: unknown): string {
   return typeof value === "string" ? value : "";
 }
 
+function numberValue(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
 function objectValue(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : null;
+}
+
+function buildCultivationFileSnapshot(
+  workspace: AgentTeamWorkspaceDraft,
+  name: "MEMORY.md" | "HEARTBEAT.md",
+): AgentTeamCultivationFileSnapshot {
+  const file = workspace.files.find((entry) => entry.name === name);
+  const loaded = workspace.fileName === name;
+  return {
+    name,
+    status: loaded ? "loaded" : file && !file.missing ? "present" : "missing",
+    updatedAtMs: file?.updatedAtMs,
+    preview: loaded ? summarizeProfileText(workspace.draft) : "",
+  };
+}
+
+function summarizeProfileText(text: string): string {
+  const redacted = String(deepRedact(text) ?? "").trim();
+  if (!redacted) {
+    return "";
+  }
+  return redacted.length > 220 ? `${redacted.slice(0, 220)}...` : redacted;
+}
+
+function resolveFeishuDoctor(snapshot: ChannelsStatusSnapshot | null): Record<string, unknown> | null {
+  const feishu = objectValue(snapshot?.channels?.feishu);
+  return objectValue(feishu?.doctor) ?? objectValue(feishu?.diagnostics);
+}
+
+function extractDoctorFindings(doctor: Record<string, unknown> | null): AgentTeamDoctorFindingSnapshot[] {
+  if (!doctor) {
+    return [];
+  }
+  const findings = doctor.findings;
+  if (Array.isArray(findings)) {
+    return findings
+      .map((entry) => doctorFindingFromUnknown(entry))
+      .filter((entry): entry is AgentTeamDoctorFindingSnapshot => Boolean(entry));
+  }
+  const message = stringValue(doctor.message) || stringValue(doctor.error);
+  if (!message) {
+    return [];
+  }
+  return [{ code: stringValue(doctor.code) || "doctor_message", message: redactDiagnosticText(message) }];
+}
+
+function doctorFindingFromUnknown(value: unknown): AgentTeamDoctorFindingSnapshot | null {
+  if (typeof value === "string") {
+    return { code: "finding", message: redactDiagnosticText(value) };
+  }
+  const obj = objectValue(value);
+  if (!obj) {
+    return null;
+  }
+  const code = stringValue(obj.code) || stringValue(obj.id) || stringValue(obj.kind) || "finding";
+  const message = stringValue(obj.message) || stringValue(obj.detail) || stringValue(obj.reason) || code;
+  return {
+    code: redactDiagnosticText(code),
+    message: redactDiagnosticText(message),
+  };
+}
+
+function redactDiagnosticText(text: string): string {
+  return String(deepRedact(text) ?? "");
 }
 
 function normalizeProfileFileName(name: string): string {

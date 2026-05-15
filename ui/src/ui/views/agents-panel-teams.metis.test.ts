@@ -382,6 +382,65 @@ describe("renderAgentTeamsPanel", () => {
     expect(onStartFeishuOAuth).toHaveBeenCalledWith("tenant-a");
   });
 
+  it("renders cultivation memory, heartbeat, and recent doctor findings baseline", () => {
+    const container = document.createElement("div");
+    render(
+      renderAgentTeamsPanel(
+        createProps({
+          workspace: {
+            ...createEmptyAgentTeamWorkspaceDraft(),
+            agentId: "content-writer",
+            workspace: "/tmp/metis/content-writer",
+            fileName: "MEMORY.md",
+            draft: "Remember launch positioning. Authorization: Bearer secret-memory-token",
+            files: [
+              { name: "MEMORY.md", path: "/tmp/metis/content-writer/MEMORY.md", missing: false },
+              { name: "HEARTBEAT.md", path: "/tmp/metis/content-writer/HEARTBEAT.md", missing: false },
+            ],
+          },
+          channelsSnapshot: {
+            ts: 1,
+            channelOrder: ["feishu"],
+            channelLabels: { feishu: "Feishu" },
+            channels: {
+              feishu: {
+                configured: true,
+                running: true,
+                doctor: {
+                  status: "warning",
+                  lastProbeAt: 1710000100000,
+                  findings: [
+                    {
+                      code: "app_scope_missing",
+                      message: "Authorization: Bearer secret-doctor-token missing im:message",
+                    },
+                  ],
+                },
+              },
+            },
+            channelAccounts: {
+              feishu: [{ accountId: "tenant-a", configured: true, running: true }],
+            },
+            channelDefaultAccountId: { feishu: "tenant-a" },
+          },
+        }),
+      ),
+      container,
+    );
+
+    const text = container.textContent ?? "";
+    expect(text).toContain("Cultivation, Memory & Heartbeat");
+    expect(text).toContain("MEMORY.md loaded");
+    expect(text).toContain("HEARTBEAT.md present");
+    expect(text).toContain("Memory preview");
+    expect(text).toContain("Remember launch positioning");
+    expect(text).toContain("Recent doctor findings");
+    expect(text).toContain("app_scope_missing");
+    expect(text).toContain("Bearer [redacted]");
+    expect(text).not.toContain("secret-memory-token");
+    expect(text).not.toContain("secret-doctor-token");
+  });
+
   it("wires Feishu OAuth start to a Gateway RPC callback", () => {
     const onStartFeishuOAuth = vi.fn();
     const container = document.createElement("div");

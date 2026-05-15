@@ -869,6 +869,42 @@ public class FeishuAdapterTest {
     }
 
     @TestCase
+    public func streamingControllerPreservesLongTextMarkdownTableImagesAndRateLimitFallback(): Unit {
+        let client = FeishuFakeApiClient()
+        let controller = FeishuStreamingCardController(
+            client,
+            accountId: "tenant-a",
+            rawPeerId: "oc_stream",
+            receiveId: "oc_stream",
+            receiveIdType: "chat_id"
+        )
+        controller.registerResolvedImage("https://assets.example.test/table.png", "img_table")
+        let longText = StringBuilder()
+        for (i in 0..80) {
+            longText.append("line ${i}: Feishu CardKit streaming parity keeps long text observable.\n")
+        }
+
+        @Expect(controller.create(longText.toString()), "fake-feishu-card-1")
+        @Expect(client.sentCard(0).fallbackText().contains("line 79"), true)
+
+        let markdownTable =
+            "| Item | Status |\n" +
+            "| --- | --- |\n" +
+            "| create | ok |\n" +
+            "| patch | rate-limited fallback |\n" +
+            "![table](https://assets.example.test/table.png)"
+        client.failNextCardPatch("rate_limited", error: "429 too many card updates")
+        @Expect(controller.patchChunk(markdownTable), true)
+        @Expect(controller.currentPhase(), "terminated")
+        @Expect(controller.lastFallbackCategory(), "rate_limit")
+        @Expect(client.cardPatchCount(), 1)
+        @Expect(client.textSendCount(), 1)
+        @Expect(client.lastTextMessage().contains("| patch | rate-limited fallback |"), true)
+        @Expect(client.lastTextMessage().contains("![table](img_table)"), true)
+        @Expect(client.lastTextMessage().contains("assets.example.test"), false)
+    }
+
+    @TestCase
     public func cardLiveSmokeChecklistIsExplicitOptInOnly(): Unit {
         let checklist = FeishuCardLiveSmokeChecklist.toJson()
         @Expect(checklist.get("optInRequired").getOrThrow().asBool().getValue(), true)

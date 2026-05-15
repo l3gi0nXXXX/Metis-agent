@@ -137,6 +137,32 @@ public class GatewayFeishuOapiRepairTest {
     }
 
     @TestCase
+    public func missingCredentialResultIncludesOperatorRepairActionWithoutStartingNetwork(): Unit {
+        debugResetGatewayFeishuOapiRepairForTest()
+        debugSetGatewayFeishuOapiToolCallRunnerForTest(Some(feishuOapiRepairTestRunner("missing_credential", ["task:task:write"])))
+        try {
+            let media = feishuOapiRepairTestMediaContext("tenant-a", "oc_chat", "ou_admin", "om_turn")
+            let out = gatewayWithToolRuntimeContext(
+                GatewayToolRuntimeContext("feishu", channelName: "feishu", sessionKey: "turn-credential", senderId: "ou_admin", mediaContext: media),
+                { =>
+                    GatewayFeishuOapiToolset().debugFeishuOapiInvokeForTest("feishu_task_task", "append_steps", Some("tenant-a"), Some("{}"))
+                }
+            )
+            let repair = JsonValue.fromStr(out).asObject().get("repair_action").getOrThrow().asObject()
+            @Expect(repair.get("kind").getOrThrow().asString().getValue(), "feishu_oapi_credential_repair")
+            @Expect(repair.get("status").getOrThrow().asString().getValue(), "operator_required")
+            @Expect(repair.get("can_start").getOrThrow().asBool().getValue(), false)
+            @Expect(repair.get("repair_method").getOrThrow().asString().getValue(), "configure_feishu_app_credentials")
+            @Expect(repair.get("network").getOrThrow().asString().getValue(), "not_started")
+            @Expect(repair.get("redacted").getOrThrow().asBool().getValue(), true)
+            @Expect(repair.get("missing_fields").getOrThrow().asArray()[0].asString().getValue(), "app_id")
+        } finally {
+            debugSetGatewayFeishuOapiToolCallRunnerForTest(None<(String, JsonObject) -> JsonObject>)
+            debugResetGatewayFeishuOapiRepairForTest()
+        }
+    }
+
+    @TestCase
     public func missingTicketChatOrUserContextReturnsDiagnosticOnlyRepairAction(): Unit {
         debugResetGatewayFeishuOapiRepairForTest()
         debugSetGatewayFeishuOapiToolCallRunnerForTest(Some(feishuOapiRepairTestRunner("scope_missing", ["docx:document:readonly"])))

@@ -5,6 +5,7 @@ import {
   AGENT_TEAM_PROFILE_FILES,
   applyAgentTeamTemplate,
   applyAgentTeamBinding,
+  buildAgentTeamCultivationSnapshot,
   buildAgentTeamBindingPreview,
   exportAgentTeamTemplate,
   changeAgentTeamMember,
@@ -618,5 +619,56 @@ describe("team workspace profiles", () => {
       "MEMORY.md",
     ]);
     expect(state.agentTeamWorkspace.content).toBe("Be direct.");
+  });
+
+  it("builds a redacted cultivation snapshot from memory, heartbeat, and doctor status", () => {
+    const snapshot = buildAgentTeamCultivationSnapshot({
+      workspace: {
+        ...createEmptyAgentTeamWorkspaceDraft(),
+        agentId: "content-writer",
+        fileName: "MEMORY.md",
+        draft: "Remember launch positioning. Authorization: Bearer secret-memory-token",
+        files: [
+          { name: "MEMORY.md", path: "/tmp/metis/MEMORY.md", missing: false, updatedAtMs: 1710000000000 },
+          { name: "HEARTBEAT.md", path: "/tmp/metis/HEARTBEAT.md", missing: true },
+        ],
+      },
+      channelsSnapshot: {
+        ts: 1,
+        channelOrder: ["feishu"],
+        channelLabels: { feishu: "Feishu" },
+        channels: {
+          feishu: {
+            doctor: {
+              status: "warning",
+              lastProbeAt: 1710000100000,
+              findings: [
+                {
+                  code: "app_scope_missing",
+                  message: "Authorization: Bearer secret-doctor-token missing im:message",
+                },
+              ],
+            },
+          },
+        },
+        channelAccounts: {},
+        channelDefaultAccountId: {},
+      },
+    });
+
+    expect(snapshot.agentId).toBe("content-writer");
+    expect(snapshot.memory.status).toBe("loaded");
+    expect(snapshot.heartbeat.status).toBe("missing");
+    expect(snapshot.memory.preview).toContain("Remember launch positioning");
+    expect(snapshot.memory.preview).toContain("Bearer [redacted]");
+    expect(snapshot.doctor.status).toBe("warning");
+    expect(snapshot.doctor.findings).toEqual([
+      {
+        code: "app_scope_missing",
+        message: "Authorization: Bearer [redacted] missing im:message",
+      },
+    ]);
+    expect(JSON.stringify(snapshot)).not.toContain("secret-doctor-token");
+    expect(JSON.stringify(snapshot)).not.toContain("secret-memory-token");
   });
 });

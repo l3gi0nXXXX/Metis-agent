@@ -15,6 +15,7 @@ import {
   AGENT_TEAM_PROFILE_FILES,
   AGENT_TEAM_TEMPLATE_GROUPS,
   applyAgentTeamTemplate,
+  buildAgentTeamCultivationSnapshot,
   buildAgentTeamBindingPreview,
   changeAgentTeamAlias,
   changeAgentTeamMember,
@@ -125,6 +126,10 @@ export function renderAgentTeamsPanel(props: AgentTeamsPanelProps) {
     <section class="grid grid-cols-2" style="margin-top: 16px;">
       ${renderMetisCapabilitiesPanel()}
       ${renderFeishuAuthDoctorPanel(props)}
+    </section>
+
+    <section style="margin-top: 16px;">
+      ${renderCultivationPanel(props)}
     </section>
 
     <section style="margin-top: 16px;">
@@ -1803,6 +1808,82 @@ function renderFeishuMissingSetupSteps(
           `,
         )}
       </div>
+    </div>
+  `;
+}
+
+function renderCultivationPanel(props: AgentTeamsPanelProps) {
+  const snapshot = buildAgentTeamCultivationSnapshot({
+    workspace: props.workspace,
+    channelsSnapshot: props.channelsSnapshot,
+  });
+  const files = [snapshot.memory, snapshot.heartbeat];
+  return html`
+    <section class="card">
+      <div class="row" style="justify-content: space-between; align-items: flex-start;">
+        <div>
+          <div class="card-title">Cultivation, Memory & Heartbeat</div>
+          <div class="card-sub">
+            Baseline view of member training files and recent Gateway doctor findings. Values come from agents.files and channels.status only.
+          </div>
+        </div>
+        <span class="badge">${snapshot.agentId || "choose member"}</span>
+      </div>
+      <div class="agents-overview-grid" style="margin-top: 14px;">
+        ${files.map(
+          (file) => html`
+            <div class="agent-kv">
+              <div class="label">${file.name}</div>
+              <div>${file.name} ${file.status}</div>
+              ${file.updatedAtMs ? html`<div class="agent-kv-sub">${file.updatedAtMs}</div>` : nothing}
+            </div>
+          `,
+        )}
+        <div class="agent-kv">
+          <div class="label">Doctor status</div>
+          <div>${snapshot.doctor.status}</div>
+          ${snapshot.doctor.lastProbeAt
+            ? html`<div class="agent-kv-sub">${snapshot.doctor.lastProbeAt}</div>`
+            : nothing}
+        </div>
+        <div class="agent-kv">
+          <div class="label">Findings</div>
+          <div>${formatCount(snapshot.doctor.findings.length, "finding")}</div>
+        </div>
+      </div>
+      <div class="grid grid-cols-2" style="margin-top: 14px;">
+        ${renderCultivationPreview("Memory preview", snapshot.memory.preview)}
+        ${renderCultivationPreview("Heartbeat preview", snapshot.heartbeat.preview)}
+      </div>
+      <div style="margin-top: 14px;">
+        <div class="list-title">Recent doctor findings</div>
+        <div class="list" style="margin-top: 8px;">
+          ${snapshot.doctor.findings.length === 0
+            ? html`<div class="callout success">No doctor findings are visible in the current Gateway status.</div>`
+            : snapshot.doctor.findings.map(
+                (finding) => html`
+                  <div class="list-item">
+                    <div class="list-main">
+                      <div class="list-title">${finding.code}</div>
+                      <div class="list-sub">${finding.message}</div>
+                    </div>
+                  </div>
+                `,
+              )}
+        </div>
+      </div>
+      <div class="callout info" style="margin-top: 12px;">
+        Use the Workspace Profiles editor for MEMORY.md and HEARTBEAT.md changes. This panel does not write secrets, tokens, or local files.
+      </div>
+    </section>
+  `;
+}
+
+function renderCultivationPreview(title: string, preview: string) {
+  return html`
+    <div class="agent-kv">
+      <div class="label">${title}</div>
+      <div>${preview || "Load the file to show a redacted preview."}</div>
     </div>
   `;
 }

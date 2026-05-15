@@ -35,13 +35,14 @@ private func broadcastAgentEntry(home: Path, id: String, modelRef: String, toolN
     return entry
 }
 
-private func broadcastBinding(agentId: String, channel: String, peerKind: String, peerId: String): JsonObject {
+private func broadcastBinding(agentId: String, channel: String, peerKind: String, peerId: String,
+    accountId!: String = "*"): JsonObject {
     let binding = JsonObject()
     binding.put("type", JsonString("route"))
     binding.put("agentId", JsonString(agentId))
     let matchObj = JsonObject()
     matchObj.put("channel", JsonString(channel))
-    matchObj.put("accountId", JsonString("*"))
+    matchObj.put("accountId", JsonString(accountId))
     let peer = JsonObject()
     peer.put("kind", JsonString(peerKind))
     peer.put("id", JsonString(peerId))
@@ -56,7 +57,9 @@ private func broadcastMember(agentId: String): JsonObject {
     return member
 }
 
-private func broadcastTeam(enabledValue: Option<JsonBool>, selectedMembers!: Array<String> = []): JsonObject {
+private func broadcastTeam(enabledValue: Option<JsonBool>, selectedMembers!: Array<String> = [],
+    channelName!: String = "fake", peerKind!: String = "group", peerId!: String = "room-1",
+    accountId!: String = "*"): JsonObject {
     let team = JsonObject()
     team.put("id", JsonString("content"))
     team.put("displayName", JsonString("Content Team"))
@@ -67,7 +70,7 @@ private func broadcastTeam(enabledValue: Option<JsonBool>, selectedMembers!: Arr
     members.add(broadcastMember("reviewer"))
     team.put("members", members)
     let bindings = JsonArray([])
-    bindings.add(broadcastBinding("ops", "fake", "group", "room-1"))
+    bindings.add(broadcastBinding("ops", channelName, peerKind, peerId, accountId: accountId))
     team.put("bindings", bindings)
     let broadcast = JsonObject()
     match (enabledValue) {
@@ -81,7 +84,8 @@ private func broadcastTeam(enabledValue: Option<JsonBool>, selectedMembers!: Arr
     return team
 }
 
-private func broadcastRoot(home: Path, team: JsonObject): JsonObject {
+private func broadcastRoot(home: Path, team: JsonObject, channelName!: String = "fake",
+    accountId!: String = "bot-a"): JsonObject {
     let root = JsonObject()
     let agents = JsonObject()
     let list = JsonArray([])
@@ -94,13 +98,13 @@ private func broadcastRoot(home: Path, team: JsonObject): JsonObject {
 
     let channels = JsonObject()
     let fake = JsonObject()
-    fake.put("defaultAccountId", JsonString("bot-a"))
-    fake.put("accountIds", broadcastStringArray(["bot-a"]))
-    channels.put("fake", fake)
+    fake.put("defaultAccountId", JsonString(accountId))
+    fake.put("accountIds", broadcastStringArray([accountId]))
+    channels.put(channelName, fake)
     root.put("channels", channels)
 
     let bindings = JsonArray([])
-    bindings.add(broadcastBinding("ops", "fake", "group", "room-1"))
+    bindings.add(broadcastBinding("ops", channelName, "group", "room-1"))
     root.put("bindings", bindings)
 
     let agentTeams = JsonObject()
@@ -109,40 +113,54 @@ private func broadcastRoot(home: Path, team: JsonObject): JsonObject {
     return root
 }
 
-private func broadcastMediaContext(): JsonObject {
+private func broadcastMediaContext(channelName!: String = "fake", accountId!: String = "bot-a",
+    peerKind!: String = "group", peerId!: String = "room-1", parentPeerKind!: String = "",
+    parentPeerId!: String = ""): JsonObject {
     let media = JsonObject()
     let context = JsonObject()
     let route = JsonObject()
-    route.put("accountId", JsonString("bot-a"))
-    route.put("defaultAccountId", JsonString("bot-a"))
-    route.put("peerKind", JsonString("group"))
-    route.put("peerId", JsonString("room-1"))
+    route.put("channel", JsonString(channelName))
+    route.put("accountId", JsonString(accountId))
+    route.put("defaultAccountId", JsonString(accountId))
+    route.put("peerKind", JsonString(peerKind))
+    route.put("peerId", JsonString(peerId))
+    if (!parentPeerKind.isEmpty()) {
+        route.put("parentPeerKind", JsonString(parentPeerKind))
+    }
+    if (!parentPeerId.isEmpty()) {
+        route.put("parentPeerId", JsonString(parentPeerId))
+    }
     context.put("imRoute", route)
     media.put("context", context)
     return media
 }
 
-private func broadcastRequest(root: JsonObject): GatewaySessionRequest {
+private func broadcastRequest(root: JsonObject, channelName!: String = "fake", accountId!: String = "bot-a",
+    peerKind!: String = "group", peerId!: String = "room-1", parentPeerKind!: String = "",
+    parentPeerId!: String = ""): GatewaySessionRequest {
     GatewaySessionRequest(
-        GatewayIngressSource.Channel("fake"),
-        channelName: "fake",
-        sessionHint: "fake:group:room-1",
+        GatewayIngressSource.Channel(channelName),
+        channelName: channelName,
+        sessionHint: "${channelName}:${peerKind}:${peerId}",
         text: "hello team",
-        accountId: "bot-a",
-        peerId: "room-1",
+        accountId: accountId,
+        peerId: peerId,
         senderId: "user-1",
-        conversationId: "room-1",
+        conversationId: peerId,
         sourceMessageId: "msg-1",
         chatType: Some(ChatType.Group),
         dmScope: "per-chat",
         replyToMessageId: "msg-1",
         deliver: true,
-        mediaContext: broadcastMediaContext(),
+        mediaContext: broadcastMediaContext(channelName: channelName, accountId: accountId, peerKind: peerKind,
+            peerId: peerId, parentPeerKind: parentPeerKind, parentPeerId: parentPeerId),
         routeRoot: root,
-        routeAccountId: "bot-a",
-        routeDefaultAccountId: "bot-a",
-        routePeerKind: "group",
-        routePeerId: "room-1"
+        routeAccountId: accountId,
+        routeDefaultAccountId: accountId,
+        routePeerKind: peerKind,
+        routePeerId: peerId,
+        routeParentPeerKind: parentPeerKind,
+        routeParentPeerId: parentPeerId
     )
 }
 
@@ -289,6 +307,61 @@ public class GatewayAgentTeamBroadcastTest {
             @Expect(agents[1].asObject().get("status").getOrThrow().asString().getValue(), "not-delivered")
             @Expect(agents[1].asObject().get("detail").getOrThrow().asString().getValue(), "not-requested")
             @Expect(aggregate.get("answer").getOrThrow().asString().getValue(), "[writer] writer answer\n[reviewer] reviewer answer")
+        })
+    }
+
+    @TestCase
+    public func telegramBroadcastAggregateCarriesPerMemberRouteAndSessionEvidence(): Unit {
+        withBroadcastTempHome("telegram-aggregate", { home: Path =>
+            let root = broadcastRoot(
+                home,
+                broadcastTeam(
+                    Some(JsonBool(true)),
+                    selectedMembers: ["writer", "reviewer"],
+                    channelName: "telegram",
+                    peerKind: "group",
+                    peerId: "-100_acceptance",
+                    accountId: "bot-a"
+                ),
+                channelName: "telegram",
+                accountId: "bot-a"
+            )
+            writeBroadcastRoot(root)
+            let plan = gatewayResolveAgentTeamBroadcastPlan(
+                broadcastRequest(root, channelName: "telegram", accountId: "bot-a",
+                    peerKind: "group", peerId: "-100_acceptance")
+            )
+
+            @Expect(plan.enabled, true)
+            @Expect(plan.turns.size, 2)
+            @Expect(plan.turns[0].context.agentId, "writer")
+            @Expect(plan.turns[1].context.agentId, "reviewer")
+            @Expect(plan.turns[0].context.channelName, "telegram")
+            @Expect(plan.turns[0].context.accountId, "bot-a")
+            @Expect(plan.turns[0].context.sessionKey, "agent:writer:telegram:group:-100_acceptance")
+            @Expect(plan.turns[1].context.sessionKey, "agent:reviewer:telegram:group:-100_acceptance")
+            @Expect(plan.turns[0].request.sessionHint, "agent:writer:telegram:group:-100_acceptance")
+            @Expect(plan.turns[1].request.sessionHint, "agent:reviewer:telegram:group:-100_acceptance")
+
+            let writer = GatewayResolvedSessionTurnResult(
+                plan.turns[0].context,
+                GatewaySessionExecutionResult("writer telegram answer", delivered: true,
+                    deliveryStatus: "delivered", deliveryMessageId: "tg-writer")
+            )
+            let reviewer = GatewayResolvedSessionTurnResult(
+                plan.turns[1].context,
+                GatewaySessionExecutionResult("reviewer telegram answer", delivered: true,
+                    deliveryStatus: "delivered", deliveryMessageId: "tg-reviewer")
+            )
+            let aggregate = gatewayAgentTeamBroadcastAggregateJson(plan, [reviewer, writer])
+            let agents = aggregate.get("agents").getOrThrow().asArray()
+            @Expect(aggregate.get("status").getOrThrow().asString().getValue(), "ok")
+            @Expect(agents[0].asObject().get("sessionKey").getOrThrow().asString().getValue(),
+                "agent:writer:telegram:group:-100_acceptance")
+            @Expect(agents[1].asObject().get("sessionKey").getOrThrow().asString().getValue(),
+                "agent:reviewer:telegram:group:-100_acceptance")
+            @Expect(aggregate.get("answer").getOrThrow().asString().getValue(),
+                "[writer] writer telegram answer\n[reviewer] reviewer telegram answer")
         })
     }
 }
