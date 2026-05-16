@@ -3,6 +3,37 @@ package metis.gateway.channels.feishu
 import std.collection.{ArrayList, HashMap}
 import stdx.encoding.json.{JsonArray, JsonBool, JsonInt, JsonObject, JsonString}
 
+private func feishuCardRedactSensitiveText(raw: String): String {
+    let text = raw.trimAscii()
+    if (text.isEmpty()) {
+        return ""
+    }
+    let lower = text.toAsciiLower()
+    if (lower.contains("authorization:") ||
+        lower.contains("bearer ") ||
+        lower.contains("access_token") ||
+        lower.contains("refresh_token") ||
+        lower.contains("tenant_secret") ||
+        lower.contains("tenant secret") ||
+        lower.contains("appsecret") ||
+        lower.contains("app_secret") ||
+        lower.contains("client_secret") ||
+        lower.contains("secret") ||
+        lower.contains("token=") ||
+        lower.contains("password")) {
+        return "[redacted]"
+    }
+    text
+}
+
+private func feishuCardJsonStringArray(values: Array<String>): JsonArray {
+    let arr = JsonArray([])
+    for (value in values) {
+        arr.add(JsonString(value.trimAscii()))
+    }
+    arr
+}
+
 public class FeishuInteractiveCard {
     public let title: String
     public let text: String
@@ -105,7 +136,7 @@ public class FeishuCardFallbackDecision {
         this.shouldFallback = shouldFallback
         this.category = if (category.trimAscii().isEmpty()) { "unrecoverable" } else { category.trimAscii() }
         this.status = status.trimAscii()
-        this.detail = detail.trimAscii()
+        this.detail = feishuCardRedactSensitiveText(detail)
     }
 }
 
@@ -179,12 +210,257 @@ public class FeishuCardLiveSmokeChecklist {
         root.put("reason", JsonString("external-resource-required"))
         root.put("networkAttempted", JsonBool(false))
         root.put("redacted", JsonBool(true))
+        root.put("requestPlan", FeishuCardKitStreamingPlan.build(
+            accountId: "test-account",
+            receiveId: "test-chat-id",
+            receiveIdType: "chat_id",
+            card: FeishuInteractiveCard(title: "Metis", text: "live smoke create placeholder"),
+            cardId: "card_id_from_live_create",
+            messageId: "message_id_from_live_send",
+            elementId: "metis_stream_body",
+            patchContent: "live smoke stream patch placeholder",
+            finalCard: FeishuInteractiveCard(title: "Metis", text: "live smoke final update placeholder"),
+            abortReason: "live smoke abort placeholder"
+        ).toJson())
         root.put("requiredExternalResources", JsonArray([
             JsonString("test_feishu_group"),
             JsonString("card_create_patch_finalize_abort"),
             JsonString("cardkit_permissions"),
             JsonString("test_thread"),
             JsonString("image_key_or_upload_fixture")
+        ]))
+        root
+    }
+}
+
+public class FeishuCardKitRequestPlan {
+    private let stage: String
+    private let api: String
+    private let method: String
+    private let path: String
+    private let tokenMode: String
+    private let sequence: Int64
+    private let body: JsonObject
+    private let requiredScopes: Array<String>
+    private let networkAttempted: Bool
+
+    public init(
+        stage: String,
+        api: String,
+        method: String,
+        path: String,
+        tokenMode!: String = "sdk_default",
+        sequence!: Int64 = 0,
+        body!: JsonObject = JsonObject(),
+        requiredScopes!: Array<String> = [],
+        networkAttempted!: Bool = false
+    ) {
+        this.stage = stage.trimAscii()
+        this.api = api.trimAscii()
+        this.method = method.trimAscii().toAsciiUpper()
+        this.path = path.trimAscii()
+        this.tokenMode = tokenMode.trimAscii()
+        this.sequence = sequence
+        this.body = body
+        this.requiredScopes = requiredScopes
+        this.networkAttempted = networkAttempted
+    }
+
+    public func toJson(): JsonObject {
+        let out = JsonObject()
+        out.put("stage", JsonString(this.stage))
+        out.put("api", JsonString(this.api))
+        out.put("method", JsonString(this.method))
+        out.put("path", JsonString(this.path))
+        out.put("tokenMode", JsonString(this.tokenMode))
+        out.put("sequence", JsonInt(this.sequence))
+        out.put("body", this.body)
+        out.put("requiredScopes", feishuCardJsonStringArray(this.requiredScopes))
+        out.put("networkAttempted", JsonBool(this.networkAttempted))
+        out.put("redacted", JsonBool(true))
+        out
+    }
+}
+
+public class FeishuCardKitStreamingPlan {
+    private let accountId: String
+    private let receiveId: String
+    private let receiveIdType: String
+    private let cardId: String
+    private let messageId: String
+    private let elementId: String
+    private let requests: Array<FeishuCardKitRequestPlan>
+
+    public init(
+        accountId: String,
+        receiveId: String,
+        receiveIdType: String,
+        cardId: String,
+        messageId: String,
+        elementId: String,
+        requests: Array<FeishuCardKitRequestPlan>
+    ) {
+        this.accountId = if (accountId.trimAscii().isEmpty()) { "default" } else { accountId.trimAscii() }
+        this.receiveId = receiveId.trimAscii()
+        this.receiveIdType = receiveIdType.trimAscii()
+        this.cardId = cardId.trimAscii()
+        this.messageId = messageId.trimAscii()
+        this.elementId = elementId.trimAscii()
+        this.requests = requests
+    }
+
+    public static func build(
+        accountId!: String,
+        receiveId!: String,
+        receiveIdType!: String,
+        card!: FeishuInteractiveCard,
+        cardId!: String,
+        messageId!: String,
+        elementId!: String,
+        patchContent!: String,
+        finalCard!: FeishuInteractiveCard,
+        abortReason!: String
+    ): FeishuCardKitStreamingPlan {
+        let requests = ArrayList<FeishuCardKitRequestPlan>()
+        let cleanCardId = cardId.trimAscii()
+        let cleanMessageId = messageId.trimAscii()
+        let cleanElementId = if (elementId.trimAscii().isEmpty()) { "metis_stream_body" } else { elementId.trimAscii() }
+
+        let createBody = JsonObject()
+        createBody.put("type", JsonString("card_json"))
+        createBody.put("data", card.toJson())
+        requests.add(FeishuCardKitRequestPlan(
+            "create_entity",
+            "cardkit.v1.card.create",
+            "POST",
+            "sdk://cardkit.v1.card.create",
+            body: createBody,
+            requiredScopes: ["cardkit:card:create"]
+        ))
+
+        let sendBody = JsonObject()
+        sendBody.put("receive_id", JsonString(receiveId.trimAscii()))
+        sendBody.put("receive_id_type", JsonString(receiveIdType.trimAscii()))
+        sendBody.put("msg_type", JsonString("interactive"))
+        let content = JsonObject()
+        content.put("type", JsonString("card"))
+        let data = JsonObject()
+        data.put("card_id", JsonString(cleanCardId))
+        content.put("data", data)
+        sendBody.put("content", content)
+        requests.add(FeishuCardKitRequestPlan(
+            "send_card_message",
+            "im.message.create(interactive.cardkit)",
+            "POST",
+            "/open-apis/im/v1/messages",
+            body: sendBody,
+            requiredScopes: ["im:message:send_as_bot"]
+        ))
+
+        let patchBody = JsonObject()
+        patchBody.put("content", JsonString(patchContent.trimAscii()))
+        patchBody.put("sequence", JsonInt(2))
+        requests.add(FeishuCardKitRequestPlan(
+            "stream_patch",
+            "cardkit.v1.cardElement.content",
+            "PATCH",
+            "sdk://cardkit.v1.cardElement.content/${cleanCardId}/${cleanElementId}",
+            sequence: 2,
+            body: patchBody,
+            requiredScopes: ["cardkit:card:update"]
+        ))
+
+        let finalBody = JsonObject()
+        finalBody.put("card", finalCard.toJson())
+        finalBody.put("sequence", JsonInt(3))
+        requests.add(FeishuCardKitRequestPlan(
+            "final_update",
+            "cardkit.v1.card.update",
+            "PATCH",
+            "sdk://cardkit.v1.card.update/${cleanCardId}",
+            sequence: 3,
+            body: finalBody,
+            requiredScopes: ["cardkit:card:update"]
+        ))
+
+        let settingsBody = JsonObject()
+        settingsBody.put("streaming_mode", JsonBool(false))
+        settingsBody.put("sequence", JsonInt(4))
+        requests.add(FeishuCardKitRequestPlan(
+            "settings_close",
+            "cardkit.v1.card.settings",
+            "PATCH",
+            "sdk://cardkit.v1.card.settings/${cleanCardId}",
+            sequence: 4,
+            body: settingsBody,
+            requiredScopes: ["cardkit:card:update"]
+        ))
+
+        let abortBody = JsonObject()
+        abortBody.put("card", FeishuInteractiveCard(
+            title: "Metis",
+            text: "Aborted: ${if (abortReason.trimAscii().isEmpty()) { "aborted" } else { abortReason.trimAscii() }}"
+        ).toJson())
+        abortBody.put("sequence", JsonInt(5))
+        requests.add(FeishuCardKitRequestPlan(
+            "abort_update",
+            "cardkit.v1.card.update",
+            "PATCH",
+            "sdk://cardkit.v1.card.update/${cleanCardId}",
+            sequence: 5,
+            body: abortBody,
+            requiredScopes: ["cardkit:card:update"]
+        ))
+
+        let fallbackBody = JsonObject()
+        fallbackBody.put("message_id", JsonString(cleanMessageId))
+        fallbackBody.put("fallback_text", JsonString(finalCard.fallbackText()))
+        fallbackBody.put("reason", JsonString("cardkit_unavailable_or_live_gate_missing"))
+        requests.add(FeishuCardKitRequestPlan(
+            "fallback_text",
+            "im.message.create(text.fallback)",
+            "POST",
+            "/open-apis/im/v1/messages",
+            body: fallbackBody,
+            requiredScopes: ["im:message:send_as_bot"]
+        ))
+
+        FeishuCardKitStreamingPlan(
+            accountId,
+            receiveId.trimAscii(),
+            receiveIdType.trimAscii(),
+            cleanCardId,
+            cleanMessageId,
+            cleanElementId,
+            requests.toArray()
+        )
+    }
+
+    public func toJson(): JsonObject {
+        let root = JsonObject()
+        root.put("status", JsonString("planned"))
+        root.put("networkAttempted", JsonBool(false))
+        root.put("defaultNetwork", JsonString("disabled"))
+        root.put("accountId", JsonString(this.accountId))
+        root.put("receiveId", JsonString(this.receiveId))
+        root.put("receiveIdType", JsonString(this.receiveIdType))
+        root.put("cardId", JsonString(this.cardId))
+        root.put("messageId", JsonString(this.messageId))
+        root.put("elementId", JsonString(this.elementId))
+        root.put("transport", JsonString("metis-native-cardkit-request-plan"))
+        root.put("redacted", JsonBool(true))
+        let rows = JsonArray([])
+        for (request in this.requests) {
+            rows.add(request.toJson())
+        }
+        root.put("requests", rows)
+        root.put("liveGate", JsonString("external-resource-required"))
+        root.put("requiredExternalResources", JsonArray([
+            JsonString("test_feishu_group"),
+            JsonString("cardkit_permissions"),
+            JsonString("live_card_id"),
+            JsonString("live_message_id"),
+            JsonString("redacted_cardkit_response_fixture")
         ]))
         root
     }

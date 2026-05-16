@@ -1016,6 +1016,53 @@ public class FeishuAdapterTest {
     }
 
     @TestCase
+    public func cardKitStreamingPlanDescribesOpenClawLifecycleWithoutNetwork(): Unit {
+        let plan = FeishuCardKitStreamingPlan.build(
+            accountId: "tenant-a",
+            receiveId: "oc_stream",
+            receiveIdType: "chat_id",
+            card: FeishuInteractiveCard(title: "Metis", text: "initial answer"),
+            cardId: "card_live_1",
+            messageId: "om_live_1",
+            elementId: "metis_stream_body",
+            patchContent: "partial answer",
+            finalCard: FeishuInteractiveCard(title: "Metis", text: "final answer"),
+            abortReason: "operator stopped"
+        )
+        let root = plan.toJson()
+        let raw = root.toJsonString()
+        @Expect(root.get("status").getOrThrow().asString().getValue(), "planned")
+        @Expect(root.get("networkAttempted").getOrThrow().asBool().getValue(), false)
+        @Expect(root.get("accountId").getOrThrow().asString().getValue(), "tenant-a")
+        let requests = root.get("requests").getOrThrow().asArray()
+        @Expect(requests.size(), 7)
+        @Expect(raw.contains("cardkit.v1.card.create"), true)
+        @Expect(raw.contains("im.message.create(interactive.cardkit)"), true)
+        @Expect(raw.contains("cardkit.v1.cardElement.content"), true)
+        @Expect(raw.contains("cardkit.v1.card.update"), true)
+        @Expect(raw.contains("cardkit.v1.card.settings"), true)
+        @Expect(raw.contains("abort_update"), true)
+        @Expect(raw.contains("fallback_text"), true)
+        @Expect(raw.contains("metis_stream_body"), true)
+        @Expect(raw.contains("Authorization"), false)
+        @Expect(raw.contains("tenant-secret"), false)
+    }
+
+    @TestCase
+    public func cardFallbackClassificationRedactsSensitiveDetails(): Unit {
+        let decision = classifyFeishuCardFallback(
+            "rate_limited",
+            error: "Authorization: Bearer live-token tenant_secret=abc appSecret=def"
+        )
+        @Expect(decision.shouldFallback, true)
+        @Expect(decision.category, "rate_limit")
+        @Expect(decision.detail, "[redacted]")
+        @Expect(decision.detail.contains("live-token"), false)
+        @Expect(decision.detail.contains("tenant_secret"), false)
+        @Expect(decision.detail.contains("appSecret"), false)
+    }
+
+    @TestCase
     public func eventReplayLiveSmokeChecklistIsExplicitOptInOnly(): Unit {
         let checklist = FeishuEventReplayLiveSmokeChecklist.toJson()
         @Expect(checklist.get("optInRequired").getOrThrow().asBool().getValue(), true)
@@ -1043,6 +1090,9 @@ public class FeishuAdapterTest {
         @Expect(report.get("redacted").getOrThrow().asBool().getValue(), true)
         @Expect(raw.contains("test_event_subscription"), true)
         @Expect(raw.contains("message/post/image/file/audio/video/card/reaction/drive/membership/vc/bitable"), true)
+        @Expect(raw.contains("quote"), true)
+        @Expect(raw.contains("merged_forward"), true)
+        @Expect(raw.contains("resource_fetch_diagnostics"), true)
         @Expect(raw.contains("tenant_access_token"), false)
         @Expect(raw.contains("Authorization"), false)
     }
@@ -1573,14 +1623,22 @@ public class FeishuAdapterTest {
         @Expect(image.get("mimeType").getOrThrow().asString().getValue(), "image/png")
         @Expect(image.get("downloaded").getOrThrow().asBool().getValue(), false)
         @Expect(image.get("skippedReason").getOrThrow().asString().getValue(), "metadata_only")
+        let imageFetch = image.get("resourceFetch").getOrThrow().asObject()
+        @Expect(imageFetch.get("status").getOrThrow().asString().getValue(), "metadata_only")
+        @Expect(imageFetch.get("networkAttempted").getOrThrow().asBool().getValue(), false)
+        @Expect(imageFetch.get("tool").getOrThrow().asString().getValue(), "feishu_im_user_fetch_resource")
+        @Expect(imageFetch.get("requiredScopes").getOrThrow().asArray()[0].asString().getValue(), "im:message.resource:read")
 
         let file = inbound[1].mediaContext.get("records").getOrThrow().asArray()[0].asObject()
         let media = inbound[2].mediaContext.get("records").getOrThrow().asArray()[0].asObject()
         let audio = inbound[3].mediaContext.get("records").getOrThrow().asArray()[0].asObject()
         @Expect(file.get("mediaKind").getOrThrow().asString().getValue(), "file")
         @Expect(file.get("fileSize").getOrThrow().asInt().getValue(), 64)
+        @Expect(file.get("resourceFetch").getOrThrow().asObject().get("resourceType").getOrThrow().asString().getValue(), "file")
         @Expect(media.get("mediaKind").getOrThrow().asString().getValue(), "media")
+        @Expect(media.get("resourceFetch").getOrThrow().asObject().get("eligibleFor").getOrThrow().asString().getValue(), "video")
         @Expect(audio.get("mediaKind").getOrThrow().asString().getValue(), "audio")
+        @Expect(audio.get("resourceFetch").getOrThrow().asObject().get("eligibleFor").getOrThrow().asString().getValue(), "audio")
     }
 
     @TestCase
@@ -1622,7 +1680,9 @@ public class FeishuAdapterTest {
         @Expect(inbound[4].mediaContext.get("records").getOrThrow().asArray()[0].asObject().get("mediaKind").getOrThrow().asString().getValue(), "audio")
         @Expect(inbound[5].mediaContext.get("records").getOrThrow().asArray()[0].asObject().get("mediaKind").getOrThrow().asString().getValue(), "video")
         @Expect(inbound[6].mediaContext.get("records").getOrThrow().asArray()[0].asObject().get("mediaKind").getOrThrow().asString().getValue(), "media")
-        @Expect(inbound[8].mediaContext.get("context").getOrThrow().asObject().get("feishuMergeForward").getOrThrow().asObject().get("status").getOrThrow().asString().getValue(), "metadata_only")
+        let merge = inbound[8].mediaContext.get("context").getOrThrow().asObject().get("feishuMergeForward").getOrThrow().asObject()
+        @Expect(merge.get("status").getOrThrow().asString().getValue(), "metadata_only")
+        @Expect(merge.get("resourceFetch").getOrThrow().asObject().get("status").getOrThrow().asString().getValue(), "external_resource_required")
     }
 
     @TestCase
@@ -1704,6 +1764,55 @@ public class FeishuAdapterTest {
             .get("feishuMergeForward").getOrThrow().asObject()
         @Expect(mergeContext.get("title").getOrThrow().asString().getValue(), "forwarded thread")
         @Expect(mergeContext.get("status").getOrThrow().asString().getValue(), "metadata_only")
+        @Expect(mergeContext.get("resourceFetch").getOrThrow().asObject().get("tool").getOrThrow().asString().getValue(), "feishu_im_message.list_forward_messages")
+    }
+
+    @TestCase
+    public func quoteReactionAndMergeForwardExposeDiagnosticContext(): Unit {
+        let adapter = FeishuAdapter(config: FeishuConfig(enabled: true), accountId: "work")
+        adapter.start()
+        @Expect(adapter.ingestWebhookPayload(
+            this.webhookPayload(
+                "om_quote",
+                "oc_group",
+                "ou_reply",
+                "{\\\"text\\\":\\\"quoted reply\\\"}",
+                rootId: "om_root",
+                threadId: "omt_thread"
+            )
+        ).contains("\"ok\":true"), true)
+        @Expect(adapter.ingestWebhookPayload(this.reactionPayload(accountId: "work")).contains("\"ok\":true"), true)
+        @Expect(adapter.ingestWebhookPayload(
+            this.webhookPayload(
+                "om_merge_diag",
+                "oc_group",
+                "ou_forwarder",
+                "{\\\"title\\\":\\\"forwarded thread\\\",\\\"message_count\\\":2}",
+                messageType: "merge_forward"
+            )
+        ).contains("\"ok\":true"), true)
+
+        let inbound = adapter.pullInbound()
+        @Expect(inbound.size, 3)
+        let quoteCtx = inbound[0].mediaContext.get("context").getOrThrow().asObject()
+            .get("feishuQuote").getOrThrow().asObject()
+        @Expect(quoteCtx.get("messageId").getOrThrow().asString().getValue(), "om_quote")
+        @Expect(quoteCtx.get("rootId").getOrThrow().asString().getValue(), "om_root")
+        @Expect(quoteCtx.get("threadId").getOrThrow().asString().getValue(), "omt_thread")
+        @Expect(quoteCtx.get("replyTargetMessageId").getOrThrow().asString().getValue(), "om_root")
+        @Expect(quoteCtx.get("status").getOrThrow().asString().getValue(), "metadata_only")
+
+        let reaction = inbound[1].mediaContext.get("context").getOrThrow().asObject()
+            .get("feishuReaction").getOrThrow().asObject()
+        @Expect(inbound[1].systemEventKind, "feishu.reaction")
+        @Expect(reaction.get("status").getOrThrow().asString().getValue(), "accepted")
+        @Expect(reaction.get("resourceFetch").getOrThrow().asObject().get("status").getOrThrow().asString().getValue(), "not_required")
+
+        let merge = inbound[2].mediaContext.get("context").getOrThrow().asObject()
+            .get("feishuMergeForward").getOrThrow().asObject()
+        @Expect(merge.get("title").getOrThrow().asString().getValue(), "forwarded thread")
+        @Expect(merge.get("declaredMessageCount").getOrThrow().asInt().getValue(), 2)
+        @Expect(merge.get("resourceFetch").getOrThrow().asObject().get("status").getOrThrow().asString().getValue(), "external_resource_required")
     }
 
     @TestCase

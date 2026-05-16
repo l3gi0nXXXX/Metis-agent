@@ -19,7 +19,7 @@ private func feishuOapiRedactSensitiveText(raw: String): String {
     }
     let lower = text.toAsciiLower()
     if (
-        lower.contains("authorization") ||
+        lower.contains("authorization:") ||
         lower.contains("bearer ") ||
         lower.contains("access_token") ||
         lower.contains("refresh_token") ||
@@ -477,7 +477,7 @@ public class FeishuOapiResourceResult {
         this.bytes = bytes
         this.contentType = contentType.trimAscii()
         this.fileName = fileName.trimAscii()
-        this.error = error.trimAscii()
+        this.error = feishuOapiRedactSensitiveText(error)
     }
 }
 

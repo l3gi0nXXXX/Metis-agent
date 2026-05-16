@@ -38,6 +38,12 @@ private class FeishuMediaToolsetFakeResourceClient <: FeishuOapiResourceClient {
         if (fileKey == "scope_missing") {
             return FeishuOapiResourceResult(status: "scope_missing", error: "missing im:message.resource:read")
         }
+        if (fileKey == "secret_error") {
+            return FeishuOapiResourceResult(
+                status: "auth_required",
+                error: "Authorization: Bearer live-token tenant_secret=abc appSecret=def"
+            )
+        }
         FeishuOapiResourceResult(
             ok: true,
             status: "ok",
@@ -351,6 +357,34 @@ public class GatewayFeishuMediaToolsetTest {
             @Expect(scopeMissing.get("source").getOrThrow().asString().getValue(), "oapi")
             @Expect(scopeMissing.get("scope_missing").getOrThrow().asBool().getValue(), true)
             @Expect(scopeMissing.get("required_scopes").getOrThrow().asArray()[0].asString().getValue(), "im:message.resource:read")
+        } finally {
+            setGatewayFeishuHistoricalResourceClientForTest(None<FeishuOapiResourceClient>)
+        }
+    }
+
+    @TestCase
+    public func feishuHistoricalFetchRedactsSensitiveOapiErrors(): Unit {
+        let media = JsonObject()
+        media.put("channel", JsonString("feishu"))
+        media.put("accountId", JsonString("tenant-a"))
+        let context = JsonObject()
+        context.put("feishuHistoricalResource", JsonObject())
+        media.put("context", context)
+        let client = FeishuMediaToolsetFakeResourceClient()
+        setGatewayFeishuHistoricalResourceClientForTest(Some<FeishuOapiResourceClient>(client))
+        try {
+            let raw = gatewayWithToolRuntimeContext(
+                GatewayToolRuntimeContext("feishu", channelName: "feishu", sessionKey: "feishu:chat:1", mediaContext: media),
+                { => GatewayFeishuMediaToolset().debugFeishuFetchResourceForTest("om_history", "secret_error", Some("image")) }
+            )
+            let json = JsonValue.fromStr(raw).asObject()
+            @Expect(json.get("ok").getOrThrow().asBool().getValue(), false)
+            @Expect(json.get("status").getOrThrow().asString().getValue(), "auth_required")
+            @Expect(json.get("reason").getOrThrow().asString().getValue(), "[redacted]")
+            @Expect(raw.contains("live-token"), false)
+            @Expect(raw.contains("tenant_secret"), false)
+            @Expect(raw.contains("appSecret"), false)
+            @Expect(raw.contains("Authorization"), false)
         } finally {
             setGatewayFeishuHistoricalResourceClientForTest(None<FeishuOapiResourceClient>)
         }

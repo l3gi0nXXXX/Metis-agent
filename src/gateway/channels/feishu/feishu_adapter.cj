@@ -311,6 +311,9 @@ public class FeishuEventReplayLiveSmokeChecklist {
         root.put("requiredExternalResources", JsonArray([
             JsonString("test_event_subscription"),
             JsonString("message/post/image/file/audio/video/card/reaction/drive/membership/vc/bitable"),
+            JsonString("quote"),
+            JsonString("merged_forward"),
+            JsonString("resource_fetch_diagnostics"),
             JsonString("redacted_live_event_replay_fixture"),
             JsonString("isolated_test_tenant")
         ]))
@@ -1079,6 +1082,8 @@ public class FeishuAdapter <: ChannelAdapter {
         reaction.put("chatId", JsonString(chatId.trimAscii()))
         reaction.put("threadId", JsonString(threadId.trimAscii()))
         reaction.put("eventType", JsonString(this.readHeaderEventType(root)))
+        reaction.put("status", JsonString("accepted"))
+        reaction.put("resourceFetch", this.feishuNoResourceFetchDiagnostic("not_required", reason: "reaction events do not carry downloadable message resources"))
         context.put("feishuReaction", reaction)
         mediaContext.put("context", context)
         let inboundId = "reaction:${messageId.trimAscii()}:${operatorId.trimAscii()}:${emojiType.trimAscii()}"
@@ -1525,6 +1530,7 @@ public class FeishuAdapter <: ChannelAdapter {
         let mediaContext = JsonObject()
         this.attachFeishuImRouteContext(mediaContext, accountConfig, accountId, chatId, chatType, senderId, messageId, rootId, threadId)
         this.attachFeishuGateContext(mediaContext, accountConfig, chatType, mentioned, chatId, senderId)
+        this.attachFeishuQuoteContext(mediaContext, messageId, rootId, threadId, chatType)
         this.attachFeishuAliasCandidates(mediaContext, accountConfig, messageObj)
         this.attachFeishuAttachmentContext(mediaContext, accountConfig, accountId, chatId, messageId, messageType, contentJsonString)
         this.attachFeishuRichMessageContext(mediaContext, messageType, contentJsonString)
@@ -1871,12 +1877,14 @@ public class FeishuAdapter <: ChannelAdapter {
         var effectiveMimeType = originalMimeType
         var effectiveFileName = originalFileName
         var effectiveFileSize = declaredSize
+        var resourceNetworkAttempted = false
         if (cfg.media.downloadEnabled) {
             if (!this.feishuMediaMimeAllowed(cfg, originalMimeType)) {
                 skippedReason = "mime_not_allowed"
             } else if (declaredSize > 0 && this.feishuMediaSizeExceedsLimit(cfg, declaredSize)) {
                 skippedReason = "size_limit_exceeded"
             } else {
+                resourceNetworkAttempted = true
                 let result = this.fetchFeishuMessageResource(
                     this.normalizeAccountId(accountId),
                     messageId,
@@ -1923,9 +1931,54 @@ public class FeishuAdapter <: ChannelAdapter {
         record.put("skippedReason", JsonString(skippedReason))
         record.put("localPath", JsonString(localPath))
         record.put("downloadPath", JsonString(localPath))
+        record.put("resourceFetch", this.feishuResourceFetchDiagnostic(
+            accountId,
+            messageId,
+            fileId,
+            resourceType,
+            normalizedType,
+            if (downloaded) { "downloaded" } else { skippedReason },
+            resourceNetworkAttempted,
+            this.feishuAttachmentEligibility(normalizedType)
+        ))
         let records = JsonArray([])
         records.add(record)
         mediaContext.put("records", records)
+    }
+
+    private func attachFeishuQuoteContext(
+        mediaContext: JsonObject,
+        messageId: String,
+        rootId: String,
+        threadId: String,
+        chatType: ChatType
+    ): Unit {
+        let cleanRoot = rootId.trimAscii()
+        let cleanThread = threadId.trimAscii()
+        if (cleanRoot.isEmpty() && cleanThread.isEmpty()) {
+            return
+        }
+        let context = match (mediaContext.get("context")) {
+            case Some(v) => try { v.asObject() } catch (_e: Exception) { JsonObject() }
+            case None => JsonObject()
+        }
+        let quoteContext = JsonObject()
+        quoteContext.put("messageId", JsonString(messageId.trimAscii()))
+        quoteContext.put("rootId", JsonString(cleanRoot))
+        quoteContext.put("threadId", JsonString(cleanThread))
+        quoteContext.put("status", JsonString("metadata_only"))
+        quoteContext.put("reason", JsonString("quoted Feishu message content requires historical resource/message authorization"))
+        quoteContext.put("replyInThread", JsonBool(this.shouldReplyInThread(chatType, cleanRoot, cleanThread)))
+        match (this.resolveReplyTargetMessageId(messageId, cleanRoot, cleanThread)) {
+            case Some(target) => quoteContext.put("replyTargetMessageId", JsonString(target))
+            case None => quoteContext.put("replyTargetMessageId", JsonString(""))
+        }
+        quoteContext.put("resourceFetch", this.feishuNoResourceFetchDiagnostic(
+            "auth_required",
+            reason: "quote expansion requires Feishu historical message/resource scopes"
+        ))
+        context.put("feishuQuote", quoteContext)
+        mediaContext.put("context", context)
     }
 
     private func attachFeishuRichMessageContext(
@@ -1949,8 +2002,55 @@ public class FeishuAdapter <: ChannelAdapter {
         let forward = JsonObject()
         forward.put("title", JsonString(this.readStringField(content, "title").trimAscii()))
         forward.put("status", JsonString("metadata_only"))
+        forward.put("declaredMessageCount", JsonInt(this.readIntField(content, "message_count")))
+        let fetch = JsonObject()
+        fetch.put("status", JsonString("external_resource_required"))
+        fetch.put("networkAttempted", JsonBool(false))
+        fetch.put("tool", JsonString("feishu_im_message.list_forward_messages"))
+        fetch.put("reason", JsonString("merge_forward expansion requires a live Feishu message history/resource API fixture"))
+        fetch.put("redacted", JsonBool(true))
+        fetch.put("requiredScopes", JsonArray([
+            JsonString("im:message")
+        ]))
+        forward.put("resourceFetch", fetch)
         context.put("feishuMergeForward", forward)
         mediaContext.put("context", context)
+    }
+
+    private func feishuResourceFetchDiagnostic(
+        accountId: String,
+        messageId: String,
+        fileKey: String,
+        resourceType: String,
+        mediaKind: String,
+        status: String,
+        networkAttempted: Bool,
+        eligibleFor: String
+    ): JsonObject {
+        let out = JsonObject()
+        out.put("status", JsonString(if (status.trimAscii().isEmpty()) { "metadata_only" } else { status.trimAscii() }))
+        out.put("networkAttempted", JsonBool(networkAttempted))
+        out.put("tool", JsonString("feishu_im_user_fetch_resource"))
+        out.put("accountId", JsonString(this.normalizeAccountId(accountId)))
+        out.put("messageId", JsonString(messageId.trimAscii()))
+        out.put("fileKey", JsonString(fileKey.trimAscii()))
+        out.put("resourceType", JsonString(resourceType.trimAscii()))
+        out.put("mediaKind", JsonString(mediaKind.trimAscii()))
+        out.put("eligibleFor", JsonString(eligibleFor.trimAscii()))
+        out.put("requiredScopes", JsonArray([
+            JsonString("im:message.resource:read")
+        ]))
+        out.put("redacted", JsonBool(true))
+        out
+    }
+
+    private func feishuNoResourceFetchDiagnostic(status: String, reason!: String = ""): JsonObject {
+        let out = JsonObject()
+        out.put("status", JsonString(if (status.trimAscii().isEmpty()) { "not_required" } else { status.trimAscii() }))
+        out.put("networkAttempted", JsonBool(false))
+        out.put("reason", JsonString(reason.trimAscii()))
+        out.put("redacted", JsonBool(true))
+        out
     }
 
     private func attachFeishuResourceBoundaryContext(

@@ -10,6 +10,29 @@ import std.collection.ArrayList
 import std.fs.{Directory, File, Path, exists, remove}
 import stdx.encoding.json.{JsonArray, JsonBool, JsonInt, JsonObject, JsonString, JsonValue}
 
+private func feishuMediaToolRedactSensitiveText(raw: String): String {
+    let text = raw.trimAscii()
+    if (text.isEmpty()) {
+        return ""
+    }
+    let lower = text.toAsciiLower()
+    if (lower.contains("authorization:") ||
+        lower.contains("bearer ") ||
+        lower.contains("access_token") ||
+        lower.contains("refresh_token") ||
+        lower.contains("tenant_secret") ||
+        lower.contains("tenant secret") ||
+        lower.contains("appsecret") ||
+        lower.contains("app_secret") ||
+        lower.contains("client_secret") ||
+        lower.contains("secret") ||
+        lower.contains("token=") ||
+        lower.contains("password")) {
+        return "[redacted]"
+    }
+    text
+}
+
 public class GatewayFeishuHistoricalResourceResult {
     public let ok: Bool
     public let status: String
@@ -33,7 +56,7 @@ public class GatewayFeishuHistoricalResourceResult {
         this.bytes = bytes
         this.contentType = contentType.trimAscii()
         this.fileName = fileName.trimAscii()
-        this.error = error.trimAscii()
+        this.error = feishuMediaToolRedactSensitiveText(error)
         this.source = source.trimAscii()
     }
 }
@@ -193,7 +216,7 @@ private func feishuMediaToolError(
         out.put("identity", JsonString(identity.trimAscii()))
     }
     if (!reason.trimAscii().isEmpty()) {
-        out.put("reason", JsonString(reason.trimAscii()))
+        out.put("reason", JsonString(feishuMediaToolRedactSensitiveText(reason)))
     }
     out.toJsonString()
 }
@@ -215,7 +238,7 @@ private func feishuMediaToolHistoricalError(
     out.put("file_key", JsonString(fileKey.trimAscii()))
     out.put("type", JsonString(resourceType.trimAscii()))
     if (!result.error.trimAscii().isEmpty()) {
-        out.put("reason", JsonString(result.error.trimAscii()))
+        out.put("reason", JsonString(feishuMediaToolRedactSensitiveText(result.error)))
     }
     if (status == "auth_required" || status == "user_auth_required") {
         out.put("auth_required", JsonBool(true))
