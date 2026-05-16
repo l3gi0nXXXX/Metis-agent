@@ -522,28 +522,45 @@ public class GatewayService {
     }
 
     private func renderFeishuStartCommand(message: InboundMessage, accountId: String, user: GatewayUserSettings): String {
+        let normalized = this.feishuNativeAccountId(accountId, user)
+        let hasCredentials = this.feishuNativeHasCredentials(accountId, user)
+        let auth = gatewayFeishuNativeAuthStatus(normalized, user)
+        let oauthStatus = this.feishuNativeOAuthDisplayStatus(auth)
         let lines = ArrayList<String>()
         lines.add("Metis Feishu start")
         lines.add("version: ${CliConfig.version}")
-        lines.add("accountId: ${this.feishuNativeAccountId(accountId, user)}")
+        lines.add("accountId: ${normalized}")
+        lines.add("connection: ${this.feishuNativeConnectionStatus(user, hasCredentials)}")
+        lines.add("configuration: enabled=${if (user.feishu.enabled) { "true" } else { "false" }} receiveMode=${user.feishu.receiveMode} threadSession=${if (user.feishu.threadSession) { "enabled" } else { "disabled" }}")
+        lines.add("accountStatus: credentials=${if (hasCredentials) { "configured" } else { "missing" }} oauth=${oauthStatus}")
         lines.add("receiveMode: ${user.feishu.receiveMode}")
         lines.add("peer: ${message.peerId}")
         lines.add("threadSession: ${if (user.feishu.threadSession) { "enabled" } else { "disabled" }}")
         lines.add("route: AgentTeam bindings=${this.feishuNativeBindingsCount()} agents=${this.feishuNativeAgentsCount()}")
-        if (!this.feishuNativeHasCredentials(accountId, user)) {
+        lines.add("OAPI: ${this.feishuNativeOapiDisplayStatus(hasCredentials, oauthStatus)}")
+        if (!hasCredentials) {
             lines.add("warning: appId/appSecret is missing for this account.")
         }
         String.join(lines.toArray(), delimiter: "\n")
     }
 
     private func renderFeishuDoctorCommand(_message: InboundMessage, accountId: String, user: GatewayUserSettings): String {
+        let normalized = this.feishuNativeAccountId(accountId, user)
+        let hasCredentials = this.feishuNativeHasCredentials(accountId, user)
+        let auth = gatewayFeishuNativeAuthStatus(normalized, user)
+        let oauthStatus = this.feishuNativeOAuthDisplayStatus(auth)
         let lines = ArrayList<String>()
         lines.add("Metis Feishu doctor")
         lines.add("version: ${CliConfig.version}")
-        lines.add("accountId: ${this.feishuNativeAccountId(accountId, user)}")
+        lines.add("accountId: ${normalized}")
         lines.add("receiveMode: ${user.feishu.receiveMode}")
         lines.add("enabled: ${if (user.feishu.enabled) { "true" } else { "false" }}")
-        lines.add("credentials: ${if (this.feishuNativeHasCredentials(accountId, user)) { "configured" } else { "missing appId/appSecret" }}")
+        lines.add("credentials: ${if (hasCredentials) { "configured" } else { "missing appId/appSecret" }}")
+        lines.add("OAuth/user authorization: ${oauthStatus}")
+        lines.add("OAPI: ${this.feishuNativeOapiDisplayStatus(hasCredentials, oauthStatus)}")
+        lines.add("CardKit/live cards: external-resource-required")
+        lines.add("live resource smoke: external-resource-required")
+        lines.add("liveNetwork: not_started")
         lines.add("threadSession: ${if (user.feishu.threadSession) { "enabled" } else { "disabled" }}")
         lines.add("groupPolicy: ${user.feishu.groupPolicy}")
         lines.add("requireMention: ${if (user.feishu.requireMention) { "true" } else { "false" }}")
@@ -584,6 +601,7 @@ public class GatewayService {
         let verificationUri = this.feishuNativeJsonString(auth, "verificationUri")
         let userCode = this.feishuNativeJsonString(auth, "userCode")
         let expiresInSeconds = this.feishuNativeJsonString(auth, "expiresInSeconds")
+        let intervalSeconds = this.feishuNativeJsonString(auth, "intervalSeconds")
         let message = this.feishuNativeJsonString(auth, "message")
         let tokenStatus = this.feishuNativeJsonString(auth, "tokenStatus")
         let scopeSummary = this.feishuNativeJsonString(auth, "scopeSummary")
@@ -610,6 +628,9 @@ public class GatewayService {
         }
         if (!expiresInSeconds.isEmpty()) {
             lines.add("expiresInSeconds: ${expiresInSeconds}")
+        }
+        if (!intervalSeconds.isEmpty()) {
+            lines.add("intervalSeconds: ${intervalSeconds}")
         }
         if (!scopeSummary.isEmpty()) {
             lines.add("scopes: ${scopeSummary}")
@@ -656,6 +677,71 @@ public class GatewayService {
         let appId = this.feishuNativeJsonStringFallback(accountConfig, ["appId", "app_id"], user.feishu.appId)
         let appSecret = this.feishuNativeJsonStringFallback(accountConfig, ["appSecret", "app_secret"], user.feishu.appSecret)
         !appId.isEmpty() && !appSecret.isEmpty()
+    }
+
+    private func feishuNativeConnectionStatus(user: GatewayUserSettings, hasCredentials: Bool): String {
+        if (!user.feishu.enabled) {
+            return "disabled"
+        }
+        if (!hasCredentials) {
+            return "missing_credentials"
+        }
+        "configured"
+    }
+
+    private func feishuNativeOAuthDisplayStatus(auth: JsonObject): String {
+        let status = this.feishuNativeJsonString(auth, "status")
+        let tokenStatus = this.feishuNativeJsonString(auth, "tokenStatus")
+        if (
+            status == "authorized" ||
+            tokenStatus == "authorized" ||
+            this.feishuNativeJsonBool(auth, "authorized", false)
+        ) {
+            return "authorized"
+        }
+        if (
+            status == "pending" ||
+            status == "authorization_pending" ||
+            status == "slow_down" ||
+            this.feishuNativeJsonBool(auth, "pending", false)
+        ) {
+            return "pending"
+        }
+        if (status == "missing_app_credentials") {
+            return "missing_credentials"
+        }
+        if (status == "scope_missing" || tokenStatus == "scope_missing") {
+            return "scope_missing"
+        }
+        if (status == "expired" || tokenStatus == "expired") {
+            return "expired"
+        }
+        if (status == "missing_device_flow" || status == "not_configured" || tokenStatus == "missing" || tokenStatus.isEmpty()) {
+            return "missing"
+        }
+        if (status.isEmpty()) {
+            return "missing"
+        }
+        status
+    }
+
+    private func feishuNativeOapiDisplayStatus(hasCredentials: Bool, oauthStatus: String): String {
+        if (!hasCredentials) {
+            return "missing_credentials"
+        }
+        if (oauthStatus == "pending") {
+            return "oauth_pending"
+        }
+        if (oauthStatus == "missing" || oauthStatus == "missing_credentials") {
+            return "oauth_required"
+        }
+        if (oauthStatus == "scope_missing") {
+            return "oauth_scope_missing"
+        }
+        if (oauthStatus == "expired") {
+            return "oauth_expired"
+        }
+        "external-resource-required"
     }
 
     private func feishuNativeAccountConfig(accountId: String, user: GatewayUserSettings): JsonObject {
@@ -710,6 +796,13 @@ public class GatewayService {
                 try { v.asInt().getValue().toString() } catch (_inner: Exception) { "" }
             }
             case None => ""
+        }
+    }
+
+    private func feishuNativeJsonBool(obj: JsonObject, key: String, fallback: Bool): Bool {
+        match (obj.get(key)) {
+            case Some(v) => try { v.asBool().getValue() } catch (_e: Exception) { fallback }
+            case None => fallback
         }
     }
 

@@ -255,6 +255,39 @@ public class GatewayServiceFeishuNativeTest {
     }
 
     @TestCase
+    public func feishuStartShowsConnectionConfigurationAndAccountStatus(): Unit {
+        withGatewayFeishuNativeTestHome("start-status", gatewayFeishuNativeTestRoot(appSecret: "start-secret"), { =>
+            setGatewayFeishuNativeAuthStatusRunnerForTest(Some({ accountId: String, _user: GatewayUserSettings =>
+                let out = JsonObject()
+                out.put("status", JsonString("authorized"))
+                out.put("accountId", JsonString(accountId))
+                out.put("tokenStatus", JsonString("authorized"))
+                out.put("scopeSummary", JsonString("offline_access im:message"))
+                out.put("refreshToken", JsonString("must-not-render"))
+                out
+            }))
+            let adapter = GatewayFeishuNativeTestAdapter()
+            let service = gatewayFeishuNativeService(adapter, enableGroup: false)
+            service.start()
+            try {
+                adapter.queueGroup("/feishu start")
+                service.processOnce()
+                let reply = adapter.sentText(0)
+                @Expect(adapter.sentCount(), 1)
+                @Expect(reply.contains("connection: configured"), true)
+                @Expect(reply.contains("configuration: enabled=true"), true)
+                @Expect(reply.contains("accountStatus: credentials=configured oauth=authorized"), true)
+                @Expect(reply.contains("OAPI: external-resource-required"), true)
+                @Expect(reply.contains("start-secret"), false)
+                @Expect(reply.contains("must-not-render"), false)
+            } finally {
+                service.stop()
+                setGatewayFeishuNativeAuthStatusRunnerForTest(None<(String, GatewayUserSettings) -> JsonObject>)
+            }
+        })
+    }
+
+    @TestCase
     public func feishuDoctorReportsMissingBindingsAndRedactsSecret(): Unit {
         withGatewayFeishuNativeTestHome("doctor", gatewayFeishuNativeTestRoot(appSecret: "top-secret"), { =>
             let adapter = GatewayFeishuNativeTestAdapter()
@@ -276,6 +309,43 @@ public class GatewayServiceFeishuNativeTest {
     }
 
     @TestCase
+    public func feishuDoctorDistinguishesOAuthOapiCardAndLiveResourceStates(): Unit {
+        withGatewayFeishuNativeTestHome("doctor-oauth-oapi", gatewayFeishuNativeTestRoot(appSecret: "doctor-secret"), { =>
+            setGatewayFeishuNativeAuthStatusRunnerForTest(Some({ accountId: String, _user: GatewayUserSettings =>
+                let out = JsonObject()
+                out.put("status", JsonString("pending"))
+                out.put("accountId", JsonString(accountId))
+                out.put("tokenStatus", JsonString("missing"))
+                out.put("verificationUri", JsonString("https://verify.example/activate"))
+                out.put("userCode", JsonString("ABCD-EFGH"))
+                out.put("deviceCode", JsonString("device-secret"))
+                out.put("diagnostic", JsonString("Authorization: Bearer access-secret"))
+                out
+            }))
+            let adapter = GatewayFeishuNativeTestAdapter()
+            let service = gatewayFeishuNativeService(adapter)
+            service.start()
+            try {
+                adapter.queueDirect("/feishu doctor")
+                service.processOnce()
+                let reply = adapter.sentText(0)
+                @Expect(adapter.sentCount(), 1)
+                @Expect(reply.contains("credentials: configured"), true)
+                @Expect(reply.contains("OAuth/user authorization: pending"), true)
+                @Expect(reply.contains("OAPI: oauth_pending"), true)
+                @Expect(reply.contains("CardKit/live cards: external-resource-required"), true)
+                @Expect(reply.contains("live resource smoke: external-resource-required"), true)
+                @Expect(reply.contains("device-secret"), false)
+                @Expect(reply.contains("access-secret"), false)
+                @Expect(reply.contains("doctor-secret"), false)
+            } finally {
+                service.stop()
+                setGatewayFeishuNativeAuthStatusRunnerForTest(None<(String, GatewayUserSettings) -> JsonObject>)
+            }
+        })
+    }
+
+    @TestCase
     public func feishuAuthCommandReturnsExplicitAuthorizationGuidance(): Unit {
         withGatewayFeishuNativeTestHome("auth", gatewayFeishuNativeTestRoot(), { =>
             let adapter = GatewayFeishuNativeTestAdapter()
@@ -290,6 +360,52 @@ public class GatewayServiceFeishuNativeTest {
                 @Expect(reply.contains("OAuth/user authorization: not completed"), true)
             } finally {
                 service.stop()
+            }
+        })
+    }
+
+    @TestCase
+    public func feishuAuthCommandRendersOnlySafeOAuthFields(): Unit {
+        withGatewayFeishuNativeTestHome("auth-safe-fields", gatewayFeishuNativeTestRoot(appSecret: "auth-secret"), { =>
+            setGatewayFeishuNativeAuthRunnerForTest(Some({ accountId: String, _user: GatewayUserSettings =>
+                let out = JsonObject()
+                out.put("status", JsonString("pending"))
+                out.put("accountId", JsonString(accountId))
+                out.put("verificationUri", JsonString("https://verify.example/activate"))
+                out.put("userCode", JsonString("SAFE-CODE"))
+                out.put("expiresInSeconds", JsonString("600"))
+                out.put("intervalSeconds", JsonString("5"))
+                out.put("tokenStatus", JsonString("missing"))
+                out.put("scopeSummary", JsonString("offline_access im:message"))
+                out.put("message", JsonString("Open the verification URL and enter the user code."))
+                out.put("deviceCode", JsonString("device-secret"))
+                out.put("accessToken", JsonString("access-secret"))
+                out.put("refreshToken", JsonString("refresh-secret"))
+                out.put("Authorization", JsonString("Bearer bearer-secret"))
+                out
+            }))
+            let adapter = GatewayFeishuNativeTestAdapter()
+            let service = gatewayFeishuNativeService(adapter)
+            service.start()
+            try {
+                adapter.queueDirect("/feishu auth")
+                service.processOnce()
+                let reply = adapter.sentText(0)
+                @Expect(adapter.sentCount(), 1)
+                @Expect(reply.contains("OAuth/user authorization: pending"), true)
+                @Expect(reply.contains("verificationUrl: https://verify.example/activate"), true)
+                @Expect(reply.contains("userCode: SAFE-CODE"), true)
+                @Expect(reply.contains("expiresInSeconds: 600"), true)
+                @Expect(reply.contains("intervalSeconds: 5"), true)
+                @Expect(reply.contains("scopes: offline_access im:message"), true)
+                @Expect(reply.contains("device-secret"), false)
+                @Expect(reply.contains("access-secret"), false)
+                @Expect(reply.contains("refresh-secret"), false)
+                @Expect(reply.contains("bearer-secret"), false)
+                @Expect(reply.contains("auth-secret"), false)
+            } finally {
+                service.stop()
+                setGatewayFeishuNativeAuthRunnerForTest(None<(String, GatewayUserSettings) -> JsonObject>)
             }
         })
     }
