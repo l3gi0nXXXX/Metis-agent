@@ -402,6 +402,33 @@ $(manual_json_line M30 operator-record-required phase9 "Control UI profile model
 $(manual_json_line M31 operator-record-required phase9 "Control UI Feishu wizard" "$PHASE9_REASON" "Record setup/repair wizard states and next-step text without credential values." ",")
 $(manual_json_line M32 local-pass phase9 "evidence pack" "report and template generated with redaction scan" "review report.json and complete manual-acceptance-template.md with redacted operator evidence" "")
   ],
+  "telegramLiveReadiness": {
+    "phase": "phase1",
+    "gap": "G11",
+    "manualItems": ["M12", "M13", "M14"],
+    "status": "$PHASE3_STATUS",
+    "reason": "$PHASE3_REASON",
+    "redacted": true,
+    "routePreflight": {
+      "requiredPeerKinds": ["private", "group", "topic"],
+      "evidenceFields": ["privateBindingCount", "groupBindingCount", "topicBindingCount", "missingRequirements"],
+      "operatorRecordRequired": true
+    },
+    "broadcastEvidenceFields": [
+      "teamId",
+      "selectedAgentIds",
+      "agents[].agentId",
+      "agents[].sessionKey",
+      "agents[].deliveryStatus",
+      "agents[].deliveryMessageId",
+      "answer"
+    ],
+    "logEvidence": {
+      "requiredMarkers": ["Gateway.inbound: channel=telegram", "outbound success"],
+      "forbiddenMarkerRefs": ["auth-header", "bearer-secret", "proxy-credential", "telegram-credential"],
+      "operatorRecordRequired": true
+    }
+  },
   "externalResources": [
 $(resource_json_line telegram METIS_AGENTTEAM_TELEGRAM_ACCOUNT_ID "Telegram account id" phase1 ",")
 $(resource_json_line telegram METIS_AGENTTEAM_TELEGRAM_TEST_CHAT_ID "Telegram private chat or topic id" phase1 ",")
@@ -475,6 +502,9 @@ Do not record secret values, bearer headers, provider keys, proxy auth values, c
 | M12 Telegram private route | $PHASE1_STATUS | TODO | redacted account and chat ids only |
 | M13 Telegram group/topic route | $PHASE1_STATUS | TODO | redacted group/topic ids only |
 | M14 Telegram team broadcast | $PHASE1_STATUS | TODO | aggregate rows with agentId/status/sessionKey |
+| Route preflight | $PHASE1_STATUS | TODO | privateBindingCount, groupBindingCount, topicBindingCount, missingRequirements |
+| Broadcast selected members | $PHASE1_STATUS | TODO | teamId, selectedAgentIds, agents[].agentId, agents[].sessionKey, agents[].deliveryStatus, agents[].deliveryMessageId |
+| Log redaction scan | operator-record-required | TODO | required marker Gateway.inbound: channel=telegram; forbidden refs auth-header, bearer-secret, proxy-credential, telegram-credential |
 
 Required env state is in report.json externalResources. The gate does not call Telegram by default.
 
