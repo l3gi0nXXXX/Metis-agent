@@ -385,6 +385,18 @@ public class CliAgentsAddRpcSpec {
     }
 }
 
+private class CliAgentsUpdateParseResult {
+    public let spec: Option<CliAgentsAddRpcSpec>
+    public let missing: String
+    public let invalid: String
+
+    public init(spec: Option<CliAgentsAddRpcSpec>, missing: String, invalid: String) {
+        this.spec = spec
+        this.missing = missing
+        this.invalid = invalid
+    }
+}
+
 private class CliAgentsAddParseResult {
     public let spec: Option<CliAgentsAddRpcSpec>
     public let missing: String
@@ -611,6 +623,68 @@ private func cliParseAgentsAddRpcSpec(args: Array<String>): CliAgentsAddParseRes
 
 public func cliBuildAgentsAddRpcSpec(args: Array<String>): Option<CliAgentsAddRpcSpec> {
     cliParseAgentsAddRpcSpec(args).spec
+}
+
+private func cliParseAgentsUpdateRpcSpec(args: Array<String>): CliAgentsUpdateParseResult {
+    if (args.size < 1 || args[0].trimAscii().toAsciiLower() != "update") {
+        return CliAgentsUpdateParseResult(None<CliAgentsAddRpcSpec>, "", "update")
+    }
+    var json = false
+    var agentId = ""
+    var name = ""
+    var workspace = ""
+    var model = ""
+    var i: Int64 = 1
+    while (i < args.size) {
+        let token = args[i].trimAscii()
+        let low = token.toAsciiLower()
+        if (low == "--json") {
+            json = true
+            i += 1
+            continue
+        }
+        if (low == "--agent") {
+            if (i + 1 >= args.size) { return CliAgentsUpdateParseResult(None<CliAgentsAddRpcSpec>, "--agent <id>", "") }
+            agentId = args[i + 1].trimAscii()
+            i += 2
+            continue
+        }
+        if (low == "--name") {
+            if (i + 1 >= args.size) { return CliAgentsUpdateParseResult(None<CliAgentsAddRpcSpec>, "--name <text>", "") }
+            name = args[i + 1].trimAscii()
+            i += 2
+            continue
+        }
+        if (low == "--workspace") {
+            if (i + 1 >= args.size) { return CliAgentsUpdateParseResult(None<CliAgentsAddRpcSpec>, "--workspace <path>", "") }
+            workspace = args[i + 1].trimAscii()
+            i += 2
+            continue
+        }
+        if (low == "--model") {
+            if (i + 1 >= args.size) { return CliAgentsUpdateParseResult(None<CliAgentsAddRpcSpec>, "--model <ref>", "") }
+            model = args[i + 1].trimAscii()
+            i += 2
+            continue
+        }
+        return CliAgentsUpdateParseResult(None<CliAgentsAddRpcSpec>, "", token)
+    }
+    if (agentId.isEmpty()) {
+        return CliAgentsUpdateParseResult(None<CliAgentsAddRpcSpec>, "--agent <id>", "")
+    }
+    if (name.isEmpty() && workspace.isEmpty() && model.isEmpty()) {
+        return CliAgentsUpdateParseResult(None<CliAgentsAddRpcSpec>, "--model/--name/--workspace", "")
+    }
+    let params = JsonObject()
+    params.put("agentId", JsonString(agentId))
+    if (!name.isEmpty()) { params.put("name", JsonString(name)) }
+    if (!workspace.isEmpty()) { params.put("workspace", JsonString(workspace)) }
+    if (!model.isEmpty()) { params.put("model", JsonString(model)) }
+    CliAgentsUpdateParseResult(Some(CliAgentsAddRpcSpec("agents.update", params, json)), "", "")
+}
+
+public func cliBuildAgentsUpdateRpcSpec(args: Array<String>): Option<CliAgentsAddRpcSpec> {
+    cliParseAgentsUpdateRpcSpec(args).spec
 }
 
 private func cliAgentsJsonObjectFromText(raw: String): Option<JsonObject> {
@@ -986,6 +1060,36 @@ public func cliRenderGatewayAgentAddResult(result: JsonObject, fallbackAgentId: 
     String.join(lines.toArray(), delimiter: "\n")
 }
 
+public func cliRenderGatewayAgentUpdateResult(result: JsonObject, fallbackAgentId: String): String {
+    let safe = cliRedactJsonObjectForOutput(result)
+    let lines = ArrayList<String>()
+    lines.add("Updated agent: ${gatewayAgentsJsonString(safe, "agentId", fallbackAgentId)}")
+    let agent = match (safe.get("agent")) {
+        case Some(v) =>
+            try { v.asObject() } catch (_e: Exception) { JsonObject() }
+        case None => JsonObject()
+    }
+    let name = gatewayAgentsJsonString(agent, "name", "")
+    if (!name.isEmpty()) { lines.add("  name: ${name}") }
+    let model = gatewayAgentsJsonString(agent, "model", "")
+    if (!model.isEmpty()) { lines.add("  model: ${model}") }
+    let workspace = gatewayAgentsJsonString(agent, "workspace", "")
+    if (!workspace.isEmpty()) { lines.add("  workspace: ${workspace}") }
+    let refresh = match (safe.get("modelsRefresh")) {
+        case Some(v) =>
+            try { v.asObject() } catch (_e: Exception) { JsonObject() }
+        case None => JsonObject()
+    }
+    if (refresh.size() > 0) {
+        let ok = match (refresh.get("ok")) {
+            case Some(v) => try { v.asBool().getValue() } catch (_e: Exception) { true }
+            case None => true
+        }
+        lines.add("  modelsRefresh: ${if (ok) { "ok" } else { "failed" }}")
+    }
+    String.join(lines.toArray(), delimiter: "\n")
+}
+
 private func cliRunAgentsAddFlow(args: Array<String>): Int64 {
     let parsed = cliParseAgentsAddRpcSpec(args)
     match (parsed.spec) {
@@ -1009,6 +1113,32 @@ private func cliRunAgentsAddFlow(args: Array<String>): Int64 {
                 return cliReturnMissingArgument("agents", "add", parsed.missing)
             }
             cliReturnInvalidArgument("agents", "add", parsed.invalid, "--json | --agent <id> | --name <text> | --workspace <path> | --model <ref> | --bind <channel[:account]> | --feishu <appId:appSecret> | --feishu-account <id> | --qqbot <appId:appSecret> | --qqbot-account <id> | --telegram-bot-token <token> | --telegram-account <id> | --channel-overwrite")
+    }
+}
+
+private func cliRunAgentsUpdateFlow(args: Array<String>): Int64 {
+    let parsed = cliParseAgentsUpdateRpcSpec(args)
+    match (parsed.spec) {
+        case Some(spec) =>
+            let res = gatewayCliClient().call(spec.method, params: spec.params)
+            if (!res.ok) {
+                return printGatewayRpcFailure("agents", "metis agents update", res.error)
+            }
+            if (spec.json) {
+                return printJsonObject(cliRedactJsonObjectForOutput(res.toJson()))
+            }
+            let result = try {
+                res.result.asObject()
+            } catch (_e: Exception) {
+                JsonObject()
+            }
+            PrintUtils.printLine(cliRenderGatewayAgentUpdateResult(result, gatewayAgentsJsonString(spec.params, "agentId", "")))
+            CLI_EXIT_OK
+        case None =>
+            if (!parsed.missing.isEmpty()) {
+                return cliReturnMissingArgument("agents", "update", parsed.missing)
+            }
+            cliReturnInvalidArgument("agents", "update", parsed.invalid, "--json | --agent <id> | --model <ref> | --name <text> | --workspace <path>")
     }
 }
 
@@ -2227,15 +2357,19 @@ public func cliRunAgentsFlow(args: Array<String>): Int64 {
                 "metis agents migrate --dry-run --json",
                 "metis agents add --agent custom-reviewer --name Reviewer",
                 "metis agents add --agent demo --name Demo --model dashscope:qwen-plus --feishu cli_test:secret_test --qqbot 1020:test_secret --telegram-bot-token test-token",
+                "metis agents update --agent custom-reviewer --model dashscope:qwen-plus",
                 "metis agents set-identity --agent custom-reviewer --name Reviewer --emoji 🔎",
                 "metis agents delete --agent custom-reviewer",
                 "metis agents list --json"
             ],
-            "list [--json] | summary [--json] | health [--json] | capabilities [--json] | bindings [--agent <id>] [--json] | bind --agent <id> --bind <channel[:account]> [--bind ...] [--json] | unbind --agent <id> (--bind <channel[:account]> [--bind ...] | --all) [--json] | team list|get|create|update|delete [--team <id>] [--json] | migrate --dry-run [--json] | add --agent <id> [--name <text>] [--workspace <path>] [--model <ref>] [--bind <channel[:account]> ...] [--feishu <appId:appSecret>] [--feishu-account <id>] [--qqbot <appId:appSecret>] [--qqbot-account <id>] [--telegram-bot-token <token>] [--telegram-account <id>] [--channel-overwrite] [--json] | set-identity --agent <id> [--name <text>] [--emoji <text>] [--theme <text>] [--avatar <path>] [--json] | delete --agent <id> [--json] | help\n${cliAgentsTeamProductSemanticsHelpText()}"
+            "list [--json] | summary [--json] | health [--json] | capabilities [--json] | bindings [--agent <id>] [--json] | bind --agent <id> --bind <channel[:account]> [--bind ...] [--json] | unbind --agent <id> (--bind <channel[:account]> [--bind ...] | --all) [--json] | team list|get|create|update|delete [--team <id>] [--json] | migrate --dry-run [--json] | add --agent <id> [--name <text>] [--workspace <path>] [--model <ref>] [--bind <channel[:account]> ...] [--feishu <appId:appSecret>] [--feishu-account <id>] [--qqbot <appId:appSecret>] [--qqbot-account <id>] [--telegram-bot-token <token>] [--telegram-account <id>] [--channel-overwrite] [--json] | update --agent <id> [--model <ref>] [--name <text>] [--workspace <path>] [--json] | set-identity --agent <id> [--name <text>] [--emoji <text>] [--theme <text>] [--avatar <path>] [--json] | delete --agent <id> [--json] | help\n${cliAgentsTeamProductSemanticsHelpText()}"
         )
     }
     if (sub == "add") {
         return cliRunAgentsAddFlow(args)
+    }
+    if (sub == "update") {
+        return cliRunAgentsUpdateFlow(args)
     }
     if (sub == "team") {
         return cliRunAgentsTeamFlow(args)
@@ -2659,7 +2793,7 @@ public func cliRunAgentsFlow(args: Array<String>): Int64 {
         PrintUtils.printLine("Deleted agent: ${gatewayAgentsJsonString(result, "agentId", agentId)}")
         return CLI_EXIT_OK
     }
-    printUnknownLocalSubcommand("agents", sub, "list [--json] | summary [--json] | health [--json] | capabilities [--json] | bindings [--agent <id>] [--json] | bind --agent <id> --bind <channel[:account]> [--bind ...] [--json] | unbind --agent <id> (--bind <channel[:account]> [--bind ...] | --all) [--json] | team list|get|create|update|delete [--team <id>] [--json] | migrate --dry-run [--json] | add --agent <id> [--name <text>] [--workspace <path>] [--model <ref>] [--bind <channel[:account]> ...] [--feishu <appId:appSecret>] [--qqbot <appId:appSecret>] [--telegram-bot-token <token>] [--channel-overwrite] [--json] | set-identity --agent <id> [--name <text>] [--emoji <text>] [--theme <text>] [--avatar <path>] [--json] | delete --agent <id> [--json] | help")
+    printUnknownLocalSubcommand("agents", sub, "list [--json] | summary [--json] | health [--json] | capabilities [--json] | bindings [--agent <id>] [--json] | bind --agent <id> --bind <channel[:account]> [--bind ...] [--json] | unbind --agent <id> (--bind <channel[:account]> [--bind ...] | --all) [--json] | team list|get|create|update|delete [--team <id>] [--json] | migrate --dry-run [--json] | add --agent <id> [--name <text>] [--workspace <path>] [--model <ref>] [--bind <channel[:account]> ...] [--feishu <appId:appSecret>] [--qqbot <appId:appSecret>] [--telegram-bot-token <token>] [--channel-overwrite] [--json] | update --agent <id> [--model <ref>] [--name <text>] [--workspace <path>] [--json] | set-identity --agent <id> [--name <text>] [--emoji <text>] [--theme <text>] [--avatar <path>] [--json] | delete --agent <id> [--json] | help")
 }
 
 public func cliRunTasksFlow(args: Array<String>): Int64 {
