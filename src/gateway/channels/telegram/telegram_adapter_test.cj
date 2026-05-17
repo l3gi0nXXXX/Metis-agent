@@ -454,6 +454,13 @@ private class TelegramGetFileRetryFakeBotApi {
     }
 }
 
+private func telegramTestSource(sources: JsonObject, key: String): String {
+    match (sources.get(key)) {
+        case Some(v) => try { v.asString().getValue() } catch (_e: Exception) { "" }
+        case None => ""
+    }
+}
+
 @Test
 public class TelegramAdapterTest {
     @BeforeAll
@@ -469,6 +476,117 @@ public class TelegramAdapterTest {
         setTelegramTransportRunnerForTest(None)
         setTelegramAsrRunnerForTest(None)
         setGatewayOpenClawPluginSidecarRunnerForTest(None)
+    }
+
+    @TestCase
+    public func telegramResolverDoesNotInheritDefaultSecurityForNamedAccount(): Unit {
+        let defaultAccount = JsonObject()
+        defaultAccount.put("botToken", JsonString("123:default"))
+        defaultAccount.put("allowFrom", JsonArray([JsonString("default-user")]))
+        defaultAccount.put("groupAllowFrom", JsonArray([JsonString("default-group-user")]))
+        let writer = JsonObject()
+        writer.put("botToken", JsonString("123:writer"))
+        writer.put("allowFrom", JsonArray([]))
+        writer.put("groupAllowFrom", JsonArray([]))
+        let accounts = JsonObject()
+        accounts.put("default", defaultAccount)
+        accounts.put("tgWriter", writer)
+
+        let resolved = gatewayTelegramResolveAccount(
+            TelegramConfig(
+                enabled: true,
+                allowFrom: ["old-user"],
+                groupAllowFrom: ["old-group-user"],
+                accounts: Some(accounts)
+            ),
+            "tgWriter"
+        )
+
+        @Expect(resolved.config.allowFrom.size, 0)
+        @Expect(resolved.config.groupAllowFrom.size, 0)
+        @Expect(telegramTestSource(resolved.securitySources, "allowFrom"), "explicit-empty")
+        @Expect(telegramTestSource(resolved.securitySources, "groupAllowFrom"), "explicit-empty")
+        @Expect(resolved.credentialSource, "account-local")
+    }
+
+    @TestCase
+    public func telegramResolverMarksLegacyTopLevelSecurityInheritance(): Unit {
+        let writer = JsonObject()
+        writer.put("botToken", JsonString("123:writer"))
+        let accounts = JsonObject()
+        accounts.put("tgWriter", writer)
+
+        let resolved = gatewayTelegramResolveAccount(
+            TelegramConfig(
+                enabled: true,
+                allowFrom: ["old-user"],
+                groupAllowFrom: ["old-group-user"],
+                accounts: Some(accounts)
+            ),
+            "tgWriter"
+        )
+
+        @Expect(resolved.config.allowFrom, ["old-user"])
+        @Expect(resolved.config.groupAllowFrom, ["old-group-user"])
+        @Expect(telegramTestSource(resolved.securitySources, "allowFrom"), "top-level-inherited")
+        @Expect(telegramTestSource(resolved.securitySources, "groupAllowFrom"), "top-level-inherited")
+        @Expect(resolved.inheritanceDiagnostics.size(), 4)
+    }
+
+    @TestCase
+    public func directGateUsesCurrentAccountEffectiveAllowlist(): Unit {
+        let writer = JsonObject()
+        writer.put("botToken", JsonString("123:writer"))
+        writer.put("dmPolicy", JsonString("allowlist"))
+        writer.put("allowFrom", JsonArray([]))
+        let accounts = JsonObject()
+        accounts.put("tgWriter", writer)
+        let cfg = TelegramConfig(
+            accountId: "tgWriter",
+            enabled: true,
+            botToken: "123:top",
+            dmPolicy: "allowlist",
+            allowFrom: ["old-user"],
+            accounts: Some(accounts)
+        )
+        let adapter = TelegramAdapter(config: cfg)
+        adapter.start()
+        let payload = "{\"update_id\":251,\"message\":{\"message_id\":11,\"text\":\"hello\",\"chat\":{\"id\":745123456,\"type\":\"private\"},\"from\":{\"id\":\"old-user\"}}}"
+
+        let ack = adapter.ingestWebhookPayload(payload)
+
+        @Expect(ack.contains("\"ignored\":true"), true)
+        let diag = adapter.debugBuildInboundPolicyDiagnostics()
+        @Expect(diag.get("lastReason").getOrThrow().asString().getValue(), "dm_sender_not_allowed")
+        @Expect(adapter.pullInbound().isEmpty(), true)
+    }
+
+    @TestCase
+    public func groupGateUsesCurrentAccountEffectivePolicy(): Unit {
+        let writer = JsonObject()
+        writer.put("botToken", JsonString("123:writer"))
+        writer.put("groupPolicy", JsonString("disabled"))
+        writer.put("groupAllowFrom", JsonArray([]))
+        let accounts = JsonObject()
+        accounts.put("tgWriter", writer)
+        let cfg = TelegramConfig(
+            accountId: "tgWriter",
+            enabled: true,
+            botToken: "123:top",
+            groupPolicy: "open",
+            groupAllowFrom: ["old-user"],
+            accounts: Some(accounts)
+        )
+        let adapter = TelegramAdapter(config: cfg)
+        adapter.start()
+        let payload = "{\"update_id\":252,\"message\":{\"message_id\":101,\"text\":\"/status\",\"chat\":{\"id\":-1001234567890,\"type\":\"supergroup\"},\"from\":{\"id\":\"old-user\"}}}"
+
+        let ack = adapter.ingestWebhookPayload(payload)
+
+        @Expect(ack.contains("\"ignored\":true"), true)
+        let diag = adapter.debugBuildInboundPolicyDiagnostics()
+        @Expect(diag.get("lastReason").getOrThrow().asString().getValue(), "group_not_allowed")
+        @Expect(adapter.pullInbound().isEmpty(), true)
     }
 
     @TestCase

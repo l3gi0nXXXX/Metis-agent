@@ -1278,6 +1278,19 @@ private func gatewayAgentCredentialSame(existing: JsonObject, desired: JsonObjec
     true
 }
 
+private func gatewayAgentPutTelegramSecurityDefault(account: JsonObject, key: String, value: JsonValue): Unit {
+    if (account.get(key).isNone()) {
+        account.put(key, value)
+    }
+}
+
+private func gatewayAgentApplyTelegramSecurityDefaults(account: JsonObject): Unit {
+    gatewayAgentPutTelegramSecurityDefault(account, "dmPolicy", JsonString("pairing"))
+    gatewayAgentPutTelegramSecurityDefault(account, "allowFrom", JsonArray([]))
+    gatewayAgentPutTelegramSecurityDefault(account, "groupPolicy", JsonString("disabled"))
+    gatewayAgentPutTelegramSecurityDefault(account, "groupAllowFrom", JsonArray([]))
+}
+
 private func gatewayAgentApplyTelegramCredential(root: JsonObject, agentId: String, obj: JsonObject, overwrite: Bool, summaries: JsonArray, autoBindings: JsonArray): String {
     let accountId = gatewayAgentCredentialNormalizeAccountId(agentId, gatewayAgentCredentialString(obj, ["accountId", "account"], ""))
     let botToken = gatewayAgentCredentialString(obj, ["botToken", "token"], "")
@@ -1317,6 +1330,7 @@ private func gatewayAgentApplyTelegramCredential(root: JsonObject, agentId: Stri
             case Some(v) => next.put("tokenFile", v)
             case None => ()
         }
+        gatewayAgentApplyTelegramSecurityDefaults(next)
         accounts.put(accountId, next)
     }
     summaries.add(gatewayAgentCredentialSummary("telegram", accountId, action, tokenKey: "token"))

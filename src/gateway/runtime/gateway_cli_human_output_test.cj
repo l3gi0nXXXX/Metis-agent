@@ -16,7 +16,10 @@ private func gatewayHumanTelegramAccountInspectJson(): String {
                 "\"hasBotToken\":true," +
                 "\"hasTokenFile\":false," +
                 "\"allowFromCount\":1," +
+                "\"allowFromEffectiveCount\":1," +
                 "\"groupAllowFromCount\":2," +
+                "\"groupAllowFromEffectiveCount\":2," +
+                "\"securitySources\":{\"allowFrom\":\"account-local\",\"groupAllowFrom\":\"account-local\",\"dmPolicy\":\"account-local\",\"groupPolicy\":\"account-local\"}," +
                 "\"approvedSenderCount\":3," +
                 "\"hasMediaOverride\":true," +
                 "\"hasNetworkOverride\":false," +
@@ -33,7 +36,10 @@ private func gatewayHumanTelegramAccountInspectJson(): String {
                 "\"hasBotToken\":true," +
                 "\"hasTokenFile\":false," +
                 "\"allowFromCount\":0," +
+                "\"allowFromEffectiveCount\":0," +
                 "\"groupAllowFromCount\":0," +
+                "\"groupAllowFromEffectiveCount\":0," +
+                "\"securitySources\":{\"allowFrom\":\"explicit-empty\",\"groupAllowFrom\":\"explicit-empty\",\"dmPolicy\":\"account-local\",\"groupPolicy\":\"account-local\"}," +
                 "\"approvedSenderCount\":0," +
                 "\"hasMediaOverride\":false," +
                 "\"hasNetworkOverride\":true," +
@@ -163,6 +169,10 @@ public class GatewayCliHumanOutputTest {
         @Expect(out.contains("telegram/writer [default]"), true)
         @Expect(out.contains("telegram/reviewer"), true)
         @Expect(out.contains("token=account-botToken"), true)
+        @Expect(out.contains("allowEffective=0"), true)
+        @Expect(out.contains("groupAllowEffective=0"), true)
+        @Expect(out.contains("allowSource=explicit-empty"), true)
+        @Expect(out.contains("groupAllowSource=explicit-empty"), true)
         @Expect(out.contains("binding=telegram:writer"), true)
         @Expect(out.contains("binding=telegram:reviewer"), true)
         @Expect(out.contains("111111111:fake-writer-token"), false)
