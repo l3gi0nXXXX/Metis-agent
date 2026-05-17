@@ -110,6 +110,16 @@ private func agentsTestFindChannelAccountSummary(rows: JsonArray, channel: Strin
     JsonObject()
 }
 
+private func agentsTestFindRouteBinding(rows: JsonArray, channel: String, accountId: String): JsonObject {
+    for (i in 0..rows.size()) {
+        let row = try { rows[i].asObject() } catch (_: Exception) { JsonObject() }
+        if (agentsTestString(row, "channel") == channel && agentsTestString(row, "accountId") == accountId) {
+            return row
+        }
+    }
+    JsonObject()
+}
+
 private func agentsTestTeamMember(agentId: String, role!: String = "", name!: String = ""): JsonObject {
     let member = JsonObject()
     member.put("agentId", JsonString(agentId))
@@ -863,6 +873,53 @@ public class GatewayServerMethodsAgentsTest {
             @Expect(agentEntry.get("feishu").isSome(), false)
             @Expect(agentEntry.get("qq").isSome(), false)
             @Expect(root.toJsonString().contains("agentAccounts"), false)
+        })
+    }
+
+    @TestCase
+    public func agentsListShowsChannelAccountBindingDiagnostics(): Unit {
+        withAgentsTempHome("metis-agents-list-channel-binding-diagnostics-home", { _home: Path =>
+            let params = JsonObject()
+            params.put("id", JsonString("writer"))
+            let credentials = JsonObject()
+            let telegram = JsonObject()
+            telegram.put("accountId", JsonString("tg-writer"))
+            telegram.put("botToken", JsonString("123456:test-telegram-token-never-visible"))
+            credentials.put("telegram", telegram)
+            let feishu = JsonObject()
+            feishu.put("accountId", JsonString("feishu-writer"))
+            feishu.put("appId", JsonString("cli_test_app"))
+            feishu.put("appSecret", JsonString("test-feishu-secret-never-visible"))
+            credentials.put("feishu", feishu)
+            let qq = JsonObject()
+            qq.put("accountId", JsonString("qq-writer"))
+            qq.put("appId", JsonString("102012345"))
+            qq.put("appSecret", JsonString("test-qq-secret-never-visible"))
+            credentials.put("qq", qq)
+            params.put("channelCredentials", credentials)
+
+            let addResponse = handleGatewayAgentsFamily("agents.add", request: Some(GatewayRpcRequest("agents.add", params: params))).getOrThrow()
+            @Expect(addResponse.ok, true)
+
+            let listResponse = handleGatewayAgentsFamily("agents.list").getOrThrow()
+            let rows = listResponse.result.asObject().get("agents").getOrThrow().asArray()
+            let writer = agentsTestFindObjectById(rows, "writer")
+            let routeBindings = agentsTestArray(writer, "routeBindings")
+            let tgRoute = agentsTestFindRouteBinding(routeBindings, "telegram", "tg-writer")
+            let fsRoute = agentsTestFindRouteBinding(routeBindings, "feishu", "feishu-writer")
+            let qqRoute = agentsTestFindRouteBinding(routeBindings, "qq", "qq-writer")
+            @Expect(tgRoute.size() > 0, true)
+            @Expect(fsRoute.size() > 0, true)
+            @Expect(qqRoute.size() > 0, true)
+            @Expect(agentsTestString(agentsTestObject(tgRoute, "diagnostic"), "status"), "binding-account-not-registered")
+            @Expect(agentsTestString(agentsTestObject(fsRoute, "diagnostic"), "status"), "binding-account-not-registered")
+            @Expect(agentsTestString(agentsTestObject(qqRoute, "diagnostic"), "status"), "binding-account-not-registered")
+            @Expect(agentsTestBool(agentsTestObject(tgRoute, "diagnostic"), "configured"), true)
+            @Expect(agentsTestBool(agentsTestObject(fsRoute, "diagnostic"), "configured"), true)
+            @Expect(agentsTestBool(agentsTestObject(qqRoute, "diagnostic"), "configured"), true)
+            @Expect(listResponse.result.toJsonString().contains("test-telegram-token-never-visible"), false)
+            @Expect(listResponse.result.toJsonString().contains("test-feishu-secret-never-visible"), false)
+            @Expect(listResponse.result.toJsonString().contains("test-qq-secret-never-visible"), false)
         })
     }
 
