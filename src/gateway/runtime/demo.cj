@@ -1,7 +1,7 @@
 package metis.gateway.runtime
 
 import metis.core.{gatewayClearSubagentNoticeDeliveryHook, gatewayClearSubagentNoticeEventHook, gatewayRegisterSubagentNoticeDeliveryHook}
-import metis.core.config.{CliSettingManager, MetisConfigManager, MetisConfigWriteNotification}
+import metis.core.config.{CliSettingManager, MetisConfigManager, MetisConfigWriteNotificationListener}
 import metis.gateway.config.buildGatewayConfigFromUserSettings
 import metis.gateway.gatewayPrepareStartupAuth
 import metis.gateway.core.gatewayLogProcessMemory
@@ -235,7 +235,7 @@ public func runGatewayService(): Unit {
             sleep(Duration.millisecond * 200)
         }
     } finally {
-        MetisConfigManager.setWriteRootNotificationHook(None<(MetisConfigWriteNotification) -> Unit>)
+        MetisConfigManager.setWriteRootNotificationHook(None<MetisConfigWriteNotificationListener>)
         try {
             gateway.stop()
         } catch (_: Exception) {

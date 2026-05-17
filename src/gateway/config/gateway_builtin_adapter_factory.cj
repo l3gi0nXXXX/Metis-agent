@@ -146,6 +146,9 @@ public func gatewayPreparedBuiltinAdapterRegistrations(
 ): Array<GatewayPreparedAdapterRegistration> {
     let rows = ArrayList<GatewayPreparedAdapterRegistration>()
     for (profile in gatewayBuiltinAdapterRegistrationProfiles(user, healthMonitorEnabled)) {
+        if (!profile.enabled || !profile.configured) {
+            continue
+        }
         rows.add(GatewayPreparedAdapterRegistration(
             gatewayAdapterForProfile(user, profile),
             profile

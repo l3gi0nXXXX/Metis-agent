@@ -24,13 +24,18 @@ public class MetisConfigWriteNotification {
     }
 }
 
+public interface MetisConfigWriteNotificationListener {
+    func onConfigWritten(event: MetisConfigWriteNotification): Unit
+}
+
+private var metisConfigWriteRootNotificationHook: Option<MetisConfigWriteNotificationListener> =
+    None<MetisConfigWriteNotificationListener>
+
 private func metisConfigStableHash(text: String): String {
     var hash: Int64 = 5381
+    let modulus: Int64 = 1000000007
     for (b in text.toArray()) {
-        hash = ((hash << 5) + hash) + Int64(b)
-    }
-    if (hash < 0) {
-        hash = -hash
+        hash = ((hash * 33) % modulus + (Int64(b) % modulus)) % modulus
     }
     hash.toString()
 }
@@ -690,15 +695,13 @@ public class MetisConfigManager {
     private static var _rawLoadAttempted: Bool = false
     private static var _rawExists: Bool = false
     private static var _rawParseError: String = ""
-    private static var _writeRootNotificationHook: Option<(MetisConfigWriteNotification) -> Unit> =
-        None<(MetisConfigWriteNotification) -> Unit>
 
     public static func configPath(): Path {
         MetisPaths.configPath()
     }
 
-    public static func setWriteRootNotificationHook(listener: Option<(MetisConfigWriteNotification) -> Unit>): Unit {
-        _writeRootNotificationHook = listener
+    public static func setWriteRootNotificationHook(listener: Option<MetisConfigWriteNotificationListener>): Unit {
+        metisConfigWriteRootNotificationHook = listener
     }
 
     public static func rawConfig(): Option<JsonObject> {
@@ -2049,10 +2052,10 @@ public class MetisConfigManager {
         _raw = root
         CliSettingManager.invalidate()
         CliModelRuntimeStateManager.writeMaterializedRuntimeState()
-        match (_writeRootNotificationHook) {
+        match (metisConfigWriteRootNotificationHook) {
             case Some(listener) =>
                 try {
-                    listener(MetisConfigWriteNotification(
+                    listener.onConfigWritten(MetisConfigWriteNotification(
                         path.toString(),
                         root,
                         metisConfigStableHash(persisted),

@@ -1,17 +1,21 @@
 package metis.core.config
 
 import std.env.{getVariable, setVariable}
-import std.fs.{Directory, Path, remove}
+import std.fs.{Directory, File, Path, exists, remove}
 import std.time.DateTime
 import std.unittest.testmacro.*
 import stdx.encoding.json.{JsonObject, JsonString}
 
-private class ConfigWriteNotificationCapture {
-    public var seen: Bool = false
-    public var path: String = ""
-    public var hash: String = ""
+private class ConfigWriteNotificationCapture <: MetisConfigWriteNotificationListener {
+    private let capturePath: Path
 
-    public init() {}
+    public init(capturePath: Path) {
+        this.capturePath = capturePath
+    }
+
+    public func onConfigWritten(event: MetisConfigWriteNotification): Unit {
+        File.writeTo(this.capturePath, "${event.configPath}\n${event.persistedHash}".toArray())
+    }
 }
 
 @Test
@@ -27,13 +31,9 @@ public class MetisConfigWriteNotificationTest {
         MetisConfigManager.invalidate()
         CliSettingManager.invalidate()
 
-        let capture = ConfigWriteNotificationCapture()
-        MetisConfigManager.setWriteRootNotificationHook(Some<(MetisConfigWriteNotification) -> Unit>(
-            { event: MetisConfigWriteNotification =>
-                capture.seen = true
-                capture.path = event.configPath
-                capture.hash = event.persistedHash
-            }
+        let capturePath = Path(testHome).join("notification.txt")
+        MetisConfigManager.setWriteRootNotificationHook(Some<MetisConfigWriteNotificationListener>(
+            ConfigWriteNotificationCapture(capturePath)
         ))
 
         let root = JsonObject()
@@ -42,11 +42,17 @@ public class MetisConfigWriteNotificationTest {
         root.put("gateway", gateway)
         MetisConfigManager.writeRoot(root)
 
-        @Expect(capture.seen, true)
-        @Expect(capture.path, MetisConfigManager.configPath().toString())
-        @Expect(capture.hash.isEmpty(), false)
+        @Expect(exists(capturePath), true)
+        let captured = if (exists(capturePath)) {
+            String.fromUtf8(File.readFrom(capturePath)).split("\n")
+        } else {
+            Array<String>()
+        }
+        @Expect(captured.size >= 2, true)
+        @Expect(if (captured.size >= 1) { captured[0] } else { "" }, MetisConfigManager.configPath().toString())
+        @Expect(if (captured.size >= 2) { captured[1].isEmpty() } else { true }, false)
 
-        MetisConfigManager.setWriteRootNotificationHook(None<(MetisConfigWriteNotification) -> Unit>)
+        MetisConfigManager.setWriteRootNotificationHook(None<MetisConfigWriteNotificationListener>)
         match (oldHome) {
             case Some(value) => setVariable("METIS_HOME", value)
             case None => setVariable("METIS_HOME", "")

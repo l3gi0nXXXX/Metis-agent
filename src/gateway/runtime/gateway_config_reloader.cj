@@ -1,6 +1,6 @@
 package metis.gateway.runtime
 
-import metis.core.config.{GatewayUserSettings, MetisConfigManager, MetisConfigWriteNotification}
+import metis.core.config.{GatewayUserSettings, MetisConfigManager, MetisConfigWriteNotification, MetisConfigWriteNotificationListener}
 
 import magic.log.LogUtils
 
@@ -37,11 +37,9 @@ private func gatewayConfigReloadNowMs(): Int64 {
 
 public func gatewayConfigStableHash(text: String): String {
     var hash: Int64 = 5381
+    let modulus: Int64 = 1000000007
     for (b in text.toArray()) {
-        hash = ((hash << 5) + hash) + Int64(b)
-    }
-    if (hash < 0) {
-        hash = -hash
+        hash = ((hash * 33) % modulus + (Int64(b) % modulus)) % modulus
     }
     hash.toString()
 }
@@ -143,7 +141,7 @@ public interface GatewayConfigReloadCallbacks {
     func onRestartRequired(plan: GatewayReloadPlan, nextUser: GatewayUserSettings): Unit
 }
 
-public class GatewayConfigReloader {
+public class GatewayConfigReloader <: MetisConfigWriteNotificationListener {
     private var currentRoot: JsonObject
     private var currentHash: String
     private var pendingRoot: Option<JsonObject> = None<JsonObject>
@@ -156,18 +154,18 @@ public class GatewayConfigReloader {
         this.currentRoot = initialRoot
         this.currentHash = gatewayConfigStableHash(initialRoot.toJsonString())
         this.callbacks = callbacks
-        MetisConfigManager.setWriteRootNotificationHook(Some<(MetisConfigWriteNotification) -> Unit>(
-            { event: MetisConfigWriteNotification =>
-                if (event.configPath == MetisConfigManager.configPath().toString()) {
-                    this.queueSnapshot(event.runtimeRoot, event.persistedHash)
-                }
-            }
-        ))
+        MetisConfigManager.setWriteRootNotificationHook(Some<MetisConfigWriteNotificationListener>(this))
     }
 
     public func stop(): Unit {
         this.stopped = true
-        MetisConfigManager.setWriteRootNotificationHook(None<(MetisConfigWriteNotification) -> Unit>)
+        MetisConfigManager.setWriteRootNotificationHook(None<MetisConfigWriteNotificationListener>)
+    }
+
+    public func onConfigWritten(event: MetisConfigWriteNotification): Unit {
+        if (event.configPath == MetisConfigManager.configPath().toString()) {
+            this.queueSnapshot(event.runtimeRoot, event.persistedHash)
+        }
     }
 
     public func queueSnapshot(root: JsonObject, hash: String): Unit {
