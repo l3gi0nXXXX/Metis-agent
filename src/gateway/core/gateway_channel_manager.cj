@@ -381,6 +381,32 @@ public class GatewayChannelManager {
         this.adapterByName.get(name)
     }
 
+    private func rebuildAdapterByName(): Unit {
+        this.adapterByName.clear()
+        for (entry in this.adapters) {
+            this.adapterByName[entry.adapter.name] = entry.adapter
+        }
+    }
+
+    public func clearChannelRegistrations(channelId: String): Unit {
+        let normalized = channelId.trimAscii().toAsciiLower()
+        if (normalized.isEmpty()) {
+            return
+        }
+        var idx: Int64 = this.adapters.size - 1
+        while (idx >= 0) {
+            if (this.adapters[idx].channelId == normalized) {
+                let key = this.liveKey(this.adapters[idx].channelId, this.adapters[idx].accountId)
+                synchronized(this.liveStateLock) {
+                    this.liveAccounts.remove(key)
+                }
+                this.adapters.remove(at: idx)
+            }
+            idx -= 1
+        }
+        this.rebuildAdapterByName()
+    }
+
     private func registeredAccountSummary(adapterName: String): String {
         let normalized = adapterName.trimAscii()
         let accounts = ArrayList<String>()
@@ -423,49 +449,98 @@ public class GatewayChannelManager {
         )
     }
 
+    private func startEntry(entry: GatewayRegisteredAdapter): Unit {
+        let entryStartMs = this.timingNowMs()
+        if (!gatewayChannelRuntimeCanStart(entry.channelId, accountId: entry.accountId)) {
+            this.timingLog("skip-cannot-start", entryStartMs, channelId: entry.channelId, accountId: entry.accountId)
+            return
+        }
+        this.timingLog("can-start-checked", entryStartMs, channelId: entry.channelId, accountId: entry.accountId)
+        gatewayChannelRuntimeMarkStarting(entry.channelId, accountId: entry.accountId)
+        this.timingLog("marked-starting", entryStartMs, channelId: entry.channelId, accountId: entry.accountId)
+        let adapterStartMs = this.timingNowMs()
+        try {
+            entry.adapter.start()
+            this.timingLog("adapter-started", adapterStartMs, channelId: entry.channelId, accountId: entry.accountId)
+            this.updateLiveAccount(entry.channelId, entry.accountId, { state =>
+                state.configured = entry.configured
+                state.running = true
+                state.connected = true
+                state.lastError = ""
+            })
+            this.timingLog("live-updated-running", entryStartMs, channelId: entry.channelId, accountId: entry.accountId)
+            gatewayChannelRuntimeMarkRunning(entry.channelId, accountId: entry.accountId)
+            this.timingLog("start", adapterStartMs, channelId: entry.channelId, accountId: entry.accountId)
+            this.timingLog("entry-total", entryStartMs, channelId: entry.channelId, accountId: entry.accountId)
+        } catch (e: Exception) {
+            this.updateLiveAccount(entry.channelId, entry.accountId, { state =>
+                state.configured = entry.configured
+                state.running = false
+                state.connected = false
+                state.lastError = e.message.trimAscii()
+            })
+            gatewayChannelRuntimeMarkFailure(entry.channelId, accountId: entry.accountId, lifecycleState: "failed", error: e.message)
+            LogUtils.error("Gateway.channel.start failed: channel=${entry.channelId} account=${entry.accountId} err=${e.message}")
+            this.timingLog("start-failed", adapterStartMs, channelId: entry.channelId, accountId: entry.accountId)
+            this.timingLog("entry-total-failed", entryStartMs, channelId: entry.channelId, accountId: entry.accountId)
+        }
+    }
+
+    public func startChannel(channelId: String): Unit {
+        let normalized = channelId.trimAscii().toAsciiLower()
+        if (normalized.isEmpty()) {
+            return
+        }
+        let startMs = this.timingNowMs()
+        for (entry in this.adapters) {
+            if (entry.channelId != normalized) {
+                continue
+            }
+            this.startEntry(entry)
+        }
+        this.started = true
+        this.timingLog("startChannel-total", startMs, channelId: normalized)
+    }
+
     public func startChannels(): Unit {
         if (this.started) {
             return
         }
         let startMs = this.timingNowMs()
         for (entry in this.adapters) {
-            let entryStartMs = this.timingNowMs()
-            if (!gatewayChannelRuntimeCanStart(entry.channelId, accountId: entry.accountId)) {
-                this.timingLog("skip-cannot-start", entryStartMs, channelId: entry.channelId, accountId: entry.accountId)
+            this.startEntry(entry)
+        }
+        this.started = true
+        this.timingLog("startChannels-total", startMs)
+    }
+
+    public func stopChannel(channelId: String, reason!: String = "manual-stop", manualStop!: Bool = true): Unit {
+        let normalized = channelId.trimAscii().toAsciiLower()
+        if (normalized.isEmpty()) {
+            return
+        }
+        for (entry in this.adapters) {
+            if (entry.channelId != normalized) {
                 continue
             }
-            this.timingLog("can-start-checked", entryStartMs, channelId: entry.channelId, accountId: entry.accountId)
-            gatewayChannelRuntimeMarkStarting(entry.channelId, accountId: entry.accountId)
-            this.timingLog("marked-starting", entryStartMs, channelId: entry.channelId, accountId: entry.accountId)
-            let adapterStartMs = this.timingNowMs()
             try {
-                entry.adapter.start()
-                this.timingLog("adapter-started", adapterStartMs, channelId: entry.channelId, accountId: entry.accountId)
+                entry.adapter.stop()
                 this.updateLiveAccount(entry.channelId, entry.accountId, { state =>
-                    state.configured = entry.configured
-                    state.running = true
-                    state.connected = true
-                    state.lastError = ""
+                    state.running = false
+                    state.connected = false
+                    state.lastError = if (manualStop) { "" } else { reason.trimAscii() }
                 })
-                this.timingLog("live-updated-running", entryStartMs, channelId: entry.channelId, accountId: entry.accountId)
-                gatewayChannelRuntimeMarkRunning(entry.channelId, accountId: entry.accountId)
-                this.timingLog("start", adapterStartMs, channelId: entry.channelId, accountId: entry.accountId)
-                this.timingLog("entry-total", entryStartMs, channelId: entry.channelId, accountId: entry.accountId)
+                gatewayChannelRuntimeMarkStopped(entry.channelId, accountId: entry.accountId, reason: reason, manualStop: manualStop)
             } catch (e: Exception) {
                 this.updateLiveAccount(entry.channelId, entry.accountId, { state =>
-                    state.configured = entry.configured
                     state.running = false
                     state.connected = false
                     state.lastError = e.message.trimAscii()
                 })
                 gatewayChannelRuntimeMarkFailure(entry.channelId, accountId: entry.accountId, lifecycleState: "failed", error: e.message)
-                LogUtils.error("Gateway.channel.start failed: channel=${entry.channelId} account=${entry.accountId} err=${e.message}")
-                this.timingLog("start-failed", adapterStartMs, channelId: entry.channelId, accountId: entry.accountId)
-                this.timingLog("entry-total-failed", entryStartMs, channelId: entry.channelId, accountId: entry.accountId)
+                LogUtils.error("Gateway.channel.stop failed: channel=${entry.channelId} account=${entry.accountId} err=${e.message}")
             }
         }
-        this.started = true
-        this.timingLog("startChannels-total", startMs)
     }
 
     public func stopChannels(reason!: String = "manual-stop", manualStop!: Bool = true): Unit {

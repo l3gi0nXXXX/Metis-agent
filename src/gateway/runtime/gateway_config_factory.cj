@@ -21,11 +21,8 @@ import metis.core.config.{
     GatewayWebchatUserSettings
 }
 import metis.gateway.channels.feishu.FeishuAdapter
-import metis.gateway.channels.qq.QQAdapter
-import metis.gateway.channels.telegram.TelegramAdapter
-import metis.gateway.channels.builtin.GenericBuiltinChannelAdapter
 import metis.gateway.{gatewayRuntimeEffectiveAuthPasswordString, gatewayRuntimeEffectiveAuthTokenString}
-import metis.gateway.config.{buildGatewayConfigFromUserSettings, ensureInstalledGatewayPluginsRegistered, gatewayBuiltinAdapterRegistrationProfiles, gatewayBuiltinExtraBool, gatewayBuiltinExtraConfig, gatewayBuiltinExtraConfigured, gatewayPreparedPluginAdapterRegistrations, GatewayChannelPluginRegistry, mergeGatewayUserSettings}
+import metis.gateway.config.{buildGatewayConfigFromUserSettings, ensureInstalledGatewayPluginsRegistered, gatewayBuiltinExtraBool, gatewayBuiltinExtraConfig, gatewayBuiltinExtraConfigured, gatewayPreparedBuiltinAdapterRegistrations, gatewayPreparedPluginAdapterRegistrations, GatewayChannelPluginRegistry, mergeGatewayUserSettings}
 import metis.cron.registerGatewayCronRunUnified
 import metis.gateway.core.{
     GatewayRouter,
@@ -133,73 +130,21 @@ public func buildGatewayServiceFromUserSettings(user: GatewayUserSettings): (Gat
     gatewayConfigFactoryTimingLog("gateway-service-created", startMs)
 
     let feishu = FeishuAdapter(config: cfg.feishu)
-    let qq = QQAdapter(config: cfg.qq)
-    for (profile in gatewayBuiltinAdapterRegistrationProfiles(user, cfg.channelHealthCheckMinutes > 0)) {
-        if (profile.channelId == "feishu") {
-            gateway.registerAdapter(
-                feishu,
-                channelId: profile.channelId,
-                accountId: profile.accountId,
-                pluginId: profile.pluginId,
-                origin: profile.origin,
-                runtimeKind: profile.runtimeKind,
-                compatibilityMode: profile.compatibilityMode,
-                label: profile.label,
-                detailLabel: profile.detailLabel,
-                enabled: profile.enabled,
-                configured: profile.configured,
-                healthMonitorEnabled: profile.healthMonitorEnabled
-            )
-        } else if (profile.channelId == "qq") {
-            gateway.registerAdapter(
-                qq,
-                channelId: profile.channelId,
-                accountId: profile.accountId,
-                pluginId: profile.pluginId,
-                origin: profile.origin,
-                runtimeKind: profile.runtimeKind,
-                compatibilityMode: profile.compatibilityMode,
-                label: profile.label,
-                detailLabel: profile.detailLabel,
-                enabled: profile.enabled,
-                configured: profile.configured,
-                healthMonitorEnabled: profile.healthMonitorEnabled
-            )
-        } else if (profile.channelId == "telegram") {
-            gateway.registerAdapter(
-                TelegramAdapter(config: cfg.telegram, registerNativeCommandsOnStart: true),
-                channelId: profile.channelId,
-                accountId: profile.accountId,
-                pluginId: profile.pluginId,
-                origin: profile.origin,
-                runtimeKind: profile.runtimeKind,
-                compatibilityMode: profile.compatibilityMode,
-                label: profile.label,
-                detailLabel: profile.detailLabel,
-                enabled: profile.enabled,
-                configured: profile.configured,
-                healthMonitorEnabled: profile.healthMonitorEnabled
-            )
-        } else {
-            gateway.registerAdapter(
-                GenericBuiltinChannelAdapter(
-                    profile.channelId,
-                    label: profile.label,
-                    configured: profile.configured
-                ),
-                channelId: profile.channelId,
-                accountId: profile.accountId,
-                pluginId: profile.pluginId,
-                origin: profile.origin,
-                runtimeKind: profile.runtimeKind,
-                compatibilityMode: profile.compatibilityMode,
-                label: profile.label,
-                detailLabel: profile.detailLabel,
-                enabled: profile.enabled,
-                configured: profile.configured,
-                healthMonitorEnabled: profile.healthMonitorEnabled
-            )
-        }
+    for (prepared in gatewayPreparedBuiltinAdapterRegistrations(user, cfg.channelHealthCheckMinutes > 0)) {
+        gateway.registerAdapter(
+            prepared.adapter,
+            channelId: prepared.profile.channelId,
+            accountId: prepared.profile.accountId,
+            pluginId: prepared.profile.pluginId,
+            origin: prepared.profile.origin,
+            runtimeKind: prepared.profile.runtimeKind,
+            compatibilityMode: prepared.profile.compatibilityMode,
+            label: prepared.profile.label,
+            detailLabel: prepared.profile.detailLabel,
+            enabled: prepared.profile.enabled,
+            configured: prepared.profile.configured,
+            healthMonitorEnabled: prepared.profile.healthMonitorEnabled
+        )
     }
     gatewayConfigFactoryTimingLog("builtin-adapters-registered", startMs)
 

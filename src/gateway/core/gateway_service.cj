@@ -90,6 +90,18 @@ public class GatewayService {
         this.channelManager.liveSnapshotJson()
     }
 
+    public func clearChannelRegistrations(channelId: String): Unit {
+        this.channelManager.clearChannelRegistrations(channelId)
+    }
+
+    public func startChannel(channelId: String): Unit {
+        this.channelManager.startChannel(channelId)
+    }
+
+    public func stopChannel(channelId: String, reason!: String = "manual-stop", manualStop!: Bool = true): Unit {
+        this.channelManager.stopChannel(channelId, reason: reason, manualStop: manualStop)
+    }
+
     /**
      * 启动所有已注册渠道。
      */
