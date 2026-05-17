@@ -3,24 +3,42 @@ package metis.gateway.channels.telegram
 import metis.gateway.model.TelegramConfig
 
 import std.collection.{ArrayList, HashSet}
-import stdx.encoding.json.JsonObject
+import stdx.encoding.json.{JsonArray, JsonObject, JsonString}
 
 public class TelegramResolvedAccount {
     public let accountId: String
     public let config: TelegramConfig
     public let explicitAccount: Bool
+    public let missingAccount: Bool
     public let configured: Bool
+    public let credentialSource: String
+    public let botTokenSource: String
+    public let tokenFileSource: String
+    public let securitySources: JsonObject
+    public let inheritanceDiagnostics: JsonArray
 
     public init(
         accountId: String,
         config: TelegramConfig,
         explicitAccount!: Bool = false,
-        configured!: Bool = false
+        missingAccount!: Bool = false,
+        configured!: Bool = false,
+        credentialSource!: String = "missing",
+        botTokenSource!: String = "missing",
+        tokenFileSource!: String = "missing",
+        securitySources!: JsonObject = JsonObject(),
+        inheritanceDiagnostics!: JsonArray = JsonArray([])
     ) {
         this.accountId = gatewayTelegramNormalizeAccountId(accountId)
         this.config = config
         this.explicitAccount = explicitAccount
+        this.missingAccount = missingAccount
         this.configured = configured
+        this.credentialSource = credentialSource.trimAscii()
+        this.botTokenSource = botTokenSource.trimAscii()
+        this.tokenFileSource = tokenFileSource.trimAscii()
+        this.securitySources = securitySources
+        this.inheritanceDiagnostics = inheritanceDiagnostics
     }
 }
 
@@ -69,15 +87,38 @@ public func gatewayTelegramResolveAccount(config: TelegramConfig, accountId: Str
     } else {
         gatewayTelegramNormalizeAccountId(accountId)
     }
+    let defaultAccount = gatewayTelegramDefaultAccountId(config)
     let accountConfig = gatewayTelegramAccountOverride(config, normalized)
     let explicitAccount = accountConfig.isSome()
+    let missingAccount = !explicitAccount && normalized != defaultAccount && config.accounts.isSome()
     let overrideObj = accountConfig ?? JsonObject()
-    let merged = gatewayTelegramMergedConfig(config, normalized, overrideObj)
+    let merged = gatewayTelegramMergedConfig(config, normalized, overrideObj, missingAccount)
+    let tokenFileSource = gatewayTelegramCredentialFieldSource(
+        normalized,
+        gatewayTelegramHasString(overrideObj, ["tokenFile", "token_file"]),
+        !config.tokenFile.trimAscii().isEmpty(),
+        missingAccount
+    )
+    let botTokenSource = gatewayTelegramCredentialFieldSource(
+        normalized,
+        gatewayTelegramHasString(overrideObj, ["botToken", "bot_token"]),
+        !config.botToken.trimAscii().isEmpty(),
+        missingAccount
+    )
+    let credentialSource = gatewayTelegramCredentialSourceSummary(botTokenSource, tokenFileSource)
+    let securitySources = gatewayTelegramSecuritySources(config, normalized, overrideObj, missingAccount)
+    let diagnostics = gatewayTelegramInheritanceDiagnostics(securitySources)
     TelegramResolvedAccount(
         normalized,
         merged,
         explicitAccount: explicitAccount,
-        configured: !merged.botToken.trimAscii().isEmpty() || !merged.tokenFile.trimAscii().isEmpty()
+        missingAccount: missingAccount,
+        configured: !merged.botToken.trimAscii().isEmpty() || !merged.tokenFile.trimAscii().isEmpty(),
+        credentialSource: credentialSource,
+        botTokenSource: botTokenSource,
+        tokenFileSource: tokenFileSource,
+        securitySources: securitySources,
+        inheritanceDiagnostics: diagnostics
     )
 }
 
@@ -130,6 +171,189 @@ private func gatewayTelegramString(obj: JsonObject, keys: Array<String>, fallbac
     fallback
 }
 
+private func gatewayTelegramHasString(obj: JsonObject, keys: Array<String>): Bool {
+    !gatewayTelegramString(obj, keys, "").isEmpty()
+}
+
+private func gatewayTelegramHasAnyKey(obj: JsonObject, keys: Array<String>): Bool {
+    for (key in keys) {
+        if (obj.get(key).isSome()) {
+            return true
+        }
+    }
+    false
+}
+
+private func gatewayTelegramAccountLocalSource(accountId: String): String {
+    if (gatewayTelegramNormalizeAccountId(accountId) == "default") {
+        "default-account"
+    } else {
+        "account-local"
+    }
+}
+
+private func gatewayTelegramCredentialFieldSource(
+    accountId: String,
+    accountHasValue: Bool,
+    topLevelHasValue: Bool,
+    missingAccount: Bool
+): String {
+    if (missingAccount) {
+        return "missing-account"
+    }
+    if (accountHasValue) {
+        return gatewayTelegramAccountLocalSource(accountId)
+    }
+    if (topLevelHasValue) {
+        return "top-level-inherited"
+    }
+    "missing"
+}
+
+private func gatewayTelegramCredentialSourceSummary(botTokenSource: String, tokenFileSource: String): String {
+    if (tokenFileSource != "missing" && tokenFileSource != "missing-account") {
+        return tokenFileSource
+    }
+    if (botTokenSource != "missing" && botTokenSource != "missing-account") {
+        return botTokenSource
+    }
+    if (botTokenSource == "missing-account" || tokenFileSource == "missing-account") {
+        return "missing-account"
+    }
+    "missing"
+}
+
+private func gatewayTelegramStringArray(obj: JsonObject, keys: Array<String>, fallback: Array<String>): Array<String> {
+    for (key in keys) {
+        match (obj.get(key)) {
+            case Some(value) =>
+                try {
+                    let arr = value.asArray()
+                    let out = ArrayList<String>()
+                    for (i in 0..arr.size()) {
+                        try {
+                            let item = arr[i].asString().getValue().trimAscii()
+                            if (!item.isEmpty()) {
+                                out.add(item)
+                            }
+                        } catch (_: Exception) {
+                            ()
+                        }
+                    }
+                    return out.toArray()
+                } catch (_: Exception) {
+                    return fallback
+                }
+            case None => ()
+        }
+    }
+    fallback
+}
+
+private func gatewayTelegramArraySource(
+    accountId: String,
+    overrideObj: JsonObject,
+    keys: Array<String>,
+    topLevel: Array<String>,
+    missingAccount: Bool
+): String {
+    if (missingAccount) {
+        return "missing-account"
+    }
+    if (gatewayTelegramHasAnyKey(overrideObj, keys)) {
+        let values = gatewayTelegramStringArray(overrideObj, keys, [])
+        if (values.isEmpty()) {
+            return "explicit-empty"
+        }
+        return gatewayTelegramAccountLocalSource(accountId)
+    }
+    if (!topLevel.isEmpty()) {
+        return "top-level-inherited"
+    }
+    "missing"
+}
+
+private func gatewayTelegramObjectSource(
+    accountId: String,
+    overrideObj: JsonObject,
+    key: String,
+    topLevel: Option<JsonObject>,
+    missingAccount: Bool
+): String {
+    if (missingAccount) {
+        return "missing-account"
+    }
+    match (overrideObj.get(key)) {
+        case Some(value) =>
+            try {
+                let obj = value.asObject()
+                if (obj.size() == 0) {
+                    return "explicit-empty"
+                }
+                return gatewayTelegramAccountLocalSource(accountId)
+            } catch (_: Exception) {
+                return "missing"
+            }
+        case None => ()
+    }
+    match (topLevel) {
+        case Some(obj) =>
+            if (obj.size() > 0) {
+                return "top-level-inherited"
+            }
+        case None => ()
+    }
+    "missing"
+}
+
+private func gatewayTelegramStringSource(
+    accountId: String,
+    overrideObj: JsonObject,
+    keys: Array<String>,
+    topLevel: String,
+    missingAccount: Bool
+): String {
+    if (missingAccount) {
+        return "missing-account"
+    }
+    if (gatewayTelegramHasAnyKey(overrideObj, keys)) {
+        return gatewayTelegramAccountLocalSource(accountId)
+    }
+    if (!topLevel.trimAscii().isEmpty()) {
+        return "top-level-inherited"
+    }
+    "missing"
+}
+
+private func gatewayTelegramSecuritySources(
+    config: TelegramConfig,
+    accountId: String,
+    overrideObj: JsonObject,
+    missingAccount: Bool
+): JsonObject {
+    let out = JsonObject()
+    out.put("dmPolicy", JsonString(gatewayTelegramStringSource(accountId, overrideObj, ["dmPolicy", "dm_policy"], config.dmPolicy, missingAccount)))
+    out.put("allowFrom", JsonString(gatewayTelegramArraySource(accountId, overrideObj, ["allowFrom", "allow_from"], config.allowFrom, missingAccount)))
+    out.put("groupPolicy", JsonString(gatewayTelegramStringSource(accountId, overrideObj, ["groupPolicy", "group_policy"], config.groupPolicy, missingAccount)))
+    out.put("groupAllowFrom", JsonString(gatewayTelegramArraySource(accountId, overrideObj, ["groupAllowFrom", "group_allow_from"], config.groupAllowFrom, missingAccount)))
+    out.put("groups", JsonString(gatewayTelegramObjectSource(accountId, overrideObj, "groups", config.groups, missingAccount)))
+    out
+}
+
+private func gatewayTelegramInheritanceDiagnostics(sources: JsonObject): JsonArray {
+    let out = JsonArray([])
+    for (key in sources.getFields().keys()) {
+        let source = try { sources.getFields()[key].asString().getValue() } catch (_: Exception) { "" }
+        if (source == "top-level-inherited" || source == "explicit-empty") {
+            let row = JsonObject()
+            row.put("field", JsonString(key))
+            row.put("source", JsonString(source))
+            out.add(row)
+        }
+    }
+    out
+}
+
 private func gatewayTelegramBool(obj: JsonObject, key: String, fallback: Bool): Bool {
     match (obj.get(key)) {
         case Some(value) =>
@@ -145,19 +369,19 @@ private func gatewayTelegramObject(obj: JsonObject, key: String, fallback: Optio
     }
 }
 
-private func gatewayTelegramMergedConfig(base: TelegramConfig, accountId: String, overrideObj: JsonObject): TelegramConfig {
+private func gatewayTelegramMergedConfig(base: TelegramConfig, accountId: String, overrideObj: JsonObject, missingAccount: Bool): TelegramConfig {
     TelegramConfig(
         accountId: accountId,
         defaultAccount: gatewayTelegramDefaultAccountId(base),
         enabled: gatewayTelegramBool(overrideObj, "enabled", base.enabled),
-        botToken: gatewayTelegramString(overrideObj, ["botToken", "bot_token"], base.botToken),
-        tokenFile: gatewayTelegramString(overrideObj, ["tokenFile", "token_file"], base.tokenFile),
+        botToken: if (missingAccount) { "" } else { gatewayTelegramString(overrideObj, ["botToken", "bot_token"], base.botToken) },
+        tokenFile: if (missingAccount) { "" } else { gatewayTelegramString(overrideObj, ["tokenFile", "token_file"], base.tokenFile) },
         dmPolicy: gatewayTelegramString(overrideObj, ["dmPolicy", "dm_policy"], base.dmPolicy),
-        allowFrom: base.allowFrom,
+        allowFrom: gatewayTelegramStringArray(overrideObj, ["allowFrom", "allow_from"], if (missingAccount) { [] } else { base.allowFrom }),
         defaultTo: gatewayTelegramString(overrideObj, ["defaultTo", "default_to"], base.defaultTo),
         groupPolicy: gatewayTelegramString(overrideObj, ["groupPolicy", "group_policy"], base.groupPolicy),
-        groupAllowFrom: base.groupAllowFrom,
-        groups: gatewayTelegramObject(overrideObj, "groups", base.groups),
+        groupAllowFrom: gatewayTelegramStringArray(overrideObj, ["groupAllowFrom", "group_allow_from"], if (missingAccount) { [] } else { base.groupAllowFrom }),
+        groups: if (missingAccount) { None<JsonObject> } else { gatewayTelegramObject(overrideObj, "groups", base.groups) },
         direct: gatewayTelegramObject(overrideObj, "direct", base.direct),
         dms: gatewayTelegramObject(overrideObj, "dms", base.dms),
         accounts: base.accounts,

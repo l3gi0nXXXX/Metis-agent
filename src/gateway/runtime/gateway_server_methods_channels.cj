@@ -6,7 +6,7 @@ import metis.core.gatewayVideoGenerationResolveConfig
 import metis.core.config.{CliConfig, CliSettingManager, GatewayPluginUserSettings, GatewayUserSettings}
 import metis.gateway.channels.feishu.{gatewayFeishuDescribeAccounts, feishuGatewayNativeAuthLiveSmoke}
 import metis.gateway.channels.qq.{gatewayQqDefaultAccountId, gatewayQqDescribeAccounts}
-import metis.gateway.channels.telegram.{TelegramAdapter, telegramPairingAccountStore}
+import metis.gateway.channels.telegram.{TelegramAdapter, gatewayTelegramResolveAccount, telegramPairingAccountStore}
 import metis.gateway.model.{ChannelType, OutboundMessage}
 import metis.gateway.core.{
     gatewayChannelRuntimeMarkFailure,
@@ -1091,6 +1091,7 @@ private func gatewayTelegramConfigArraySize(obj: JsonObject, key: String): Int64
 
 private func gatewayTelegramAccountInspectRow(user: GatewayUserSettings, accountId: String, accountConfig: JsonObject, defaultAccountId: String): JsonObject {
     let row = JsonObject()
+    let resolved = gatewayTelegramResolveAccount(buildGatewayConfigFromUserSettings(user).telegram, accountId)
     let accountToken = gatewayBindingStringParam(accountConfig, ["botToken"], "")
     let accountTokenFile = gatewayBindingStringParam(accountConfig, ["tokenFile"], "")
     let globalTokenConfigured = !user.telegram.botToken.trimAscii().isEmpty() || !user.telegram.tokenFile.trimAscii().isEmpty()
@@ -1105,12 +1106,19 @@ private func gatewayTelegramAccountInspectRow(user: GatewayUserSettings, account
     }
     row.put("accountId", JsonString(accountId))
     row.put("defaultAccount", (accountId == defaultAccountId).toJsonValue())
-    row.put("configured", (tokenSource != "missing").toJsonValue())
+    row.put("configured", resolved.configured.toJsonValue())
     row.put("tokenSource", JsonString(tokenSource))
+    row.put("credentialSource", JsonString(resolved.credentialSource))
+    row.put("securitySources", resolved.securitySources)
+    row.put("inheritanceDiagnostics", resolved.inheritanceDiagnostics)
     row.put("hasBotToken", (!accountToken.isEmpty()).toJsonValue())
     row.put("hasTokenFile", (!accountTokenFile.isEmpty()).toJsonValue())
     row.put("allowFromCount", gatewayTelegramConfigArraySize(accountConfig, "allowFrom").toJsonValue())
+    row.put("allowFromEffectiveCount", resolved.config.allowFrom.size.toJsonValue())
     row.put("groupAllowFromCount", gatewayTelegramConfigArraySize(accountConfig, "groupAllowFrom").toJsonValue())
+    row.put("groupAllowFromEffectiveCount", resolved.config.groupAllowFrom.size.toJsonValue())
+    row.put("dmPolicy", JsonString(resolved.config.dmPolicy))
+    row.put("groupPolicy", JsonString(resolved.config.groupPolicy))
     row.put("hasGroupsOverride", gatewayTelegramConfigHasObject(accountConfig, "groups").toJsonValue())
     row.put("hasDirectOverride", gatewayTelegramConfigHasObject(accountConfig, "direct").toJsonValue())
     row.put("hasDmsOverride", gatewayTelegramConfigHasObject(accountConfig, "dms").toJsonValue())

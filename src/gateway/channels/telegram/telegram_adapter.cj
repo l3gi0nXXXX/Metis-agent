@@ -255,13 +255,14 @@ public class TelegramAdapter <: ChannelAdapter {
         pairingRoot!: String = "",
         registerNativeCommandsOnStart!: Bool = false
     ) {
+        let scopedConfig = gatewayTelegramConfigForAccount(config, config.accountId)
         let resolvedStateRoot = if (pairingRoot.trimAscii().isEmpty()) { CliConfig.dotDir } else { Path(pairingRoot.trimAscii()) }
-        this.config = config
+        this.config = scopedConfig
         this.registerNativeCommandsOnStart = registerNativeCommandsOnStart
         this.stateRoot = resolvedStateRoot
         this.pairingStore = telegramPairingAccountStore(
             rootDir: resolvedStateRoot,
-            accountId: config.accountId
+            accountId: scopedConfig.accountId
         )
         this.pollingRunner = Some(TelegramPollingRunner(
             { => this.fetchTelegramUpdates() },

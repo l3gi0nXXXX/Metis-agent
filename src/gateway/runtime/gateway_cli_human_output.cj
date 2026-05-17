@@ -329,9 +329,20 @@ private func cliRenderChannelAccountRow(channelId: String, row: JsonObject, defa
     if (cliJsonHasField(row, "allowFromCount")) {
         bits.add("allow=${cliJsonInt(row, "allowFromCount")}")
     }
+    if (cliJsonHasField(row, "allowFromEffectiveCount")) {
+        bits.add("allowEffective=${cliJsonInt(row, "allowFromEffectiveCount")}")
+    }
     if (cliJsonHasField(row, "groupAllowFromCount")) {
         bits.add("groupAllow=${cliJsonInt(row, "groupAllowFromCount")}")
     }
+    if (cliJsonHasField(row, "groupAllowFromEffectiveCount")) {
+        bits.add("groupAllowEffective=${cliJsonInt(row, "groupAllowFromEffectiveCount")}")
+    }
+    let securitySources = cliJsonObject(row, "securitySources")
+    cliAddAccountSourceBit(bits, "allowSource", securitySources, "allowFrom")
+    cliAddAccountSourceBit(bits, "groupAllowSource", securitySources, "groupAllowFrom")
+    cliAddAccountSourceBit(bits, "dmPolicySource", securitySources, "dmPolicy")
+    cliAddAccountSourceBit(bits, "groupPolicySource", securitySources, "groupPolicy")
     if (cliJsonHasField(row, "approvedSenderCount")) {
         bits.add("approvedSenders=${cliJsonInt(row, "approvedSenderCount")}")
     }

@@ -3,7 +3,7 @@ package metis.gateway.config
 import metis.gateway.channels.builtin.GenericBuiltinChannelAdapter
 import metis.gateway.channels.feishu.FeishuAdapter
 import metis.gateway.channels.qq.QQAdapter
-import metis.gateway.channels.telegram.TelegramAdapter
+import metis.gateway.channels.telegram.{TelegramAdapter, gatewayTelegramConfigForAccount}
 import metis.gateway.core.{ChannelAdapter, gatewayCanonicalChannelAccountId}
 import metis.gateway.model.{QQConfig, TelegramConfig}
 import metis.core.config.GatewayUserSettings
@@ -25,62 +25,7 @@ private func gatewayProfileRuntimeAccountId(profile: GatewayAdapterRegistrationP
 }
 
 private func telegramConfigForAccount(config: TelegramConfig, accountId: String): TelegramConfig {
-    TelegramConfig(
-        accountId: accountId,
-        defaultAccount: config.defaultAccount,
-        enabled: config.enabled,
-        botToken: config.botToken,
-        tokenFile: config.tokenFile,
-        dmPolicy: config.dmPolicy,
-        allowFrom: config.allowFrom,
-        defaultTo: config.defaultTo,
-        groupPolicy: config.groupPolicy,
-        groupAllowFrom: config.groupAllowFrom,
-        groups: config.groups,
-        direct: config.direct,
-        dms: config.dms,
-        accounts: config.accounts,
-        commandsNative: config.commandsNative,
-        customCommands: config.customCommands,
-        replyToMode: config.replyToMode,
-        groupHistoryEnabled: config.groupHistoryEnabled,
-        groupHistoryLimit: config.groupHistoryLimit,
-        textChunkLimit: config.textChunkLimit,
-        chunkMode: config.chunkMode,
-        streaming: config.streaming,
-        blockStreaming: config.blockStreaming,
-        timeoutSeconds: config.timeoutSeconds,
-        linkPreview: config.linkPreview,
-        silent: config.silent,
-        webhookUrl: config.webhookUrl,
-        webhookSecret: config.webhookSecret,
-        webhookCertPath: config.webhookCertPath,
-        webhookPath: config.webhookPath,
-        webhookHost: config.webhookHost,
-        webhookPort: config.webhookPort,
-        webhookMaxBodyBytes: config.webhookMaxBodyBytes,
-        webhookBodyTimeoutMs: config.webhookBodyTimeoutMs,
-        webhookRateLimitWindowMs: config.webhookRateLimitWindowMs,
-        webhookRateLimitMaxRequests: config.webhookRateLimitMaxRequests,
-        trustedProxies: config.trustedProxies,
-        allowRealIpFallback: config.allowRealIpFallback,
-        apiRoot: config.apiRoot,
-        proxy: config.proxy,
-        reactionNotifications: config.reactionNotifications,
-        reactionLevel: config.reactionLevel,
-        ackReaction: config.ackReaction,
-        removeAckAfterReply: config.removeAckAfterReply,
-        configWrites: config.configWrites,
-        actions: config.actions,
-        inlineButtons: config.inlineButtons,
-        execApprovals: config.execApprovals,
-        errorPolicy: config.errorPolicy,
-        autoTopicLabel: config.autoTopicLabel,
-        threadBindings: config.threadBindings,
-        media: config.media,
-        network: config.network,
-        policy: config.policy
-    )
+    gatewayTelegramConfigForAccount(config, accountId)
 }
 
 private func qqConfigForAccount(config: QQConfig, accountId: String): QQConfig {

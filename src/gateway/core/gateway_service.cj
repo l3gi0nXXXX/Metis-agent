@@ -1081,7 +1081,7 @@ public class GatewayService {
             let reply = if (modelArg.isEmpty()) {
                 this.renderTelegramModelsEntry(user, sessionKey, commandText: "/models")
             } else {
-                this.applyTelegramModelSelection(modelArg, message.senderId, user, sessionKey)
+                this.applyTelegramModelSelection(modelArg, message.senderId, accountId, user, sessionKey)
             }
             this.sendTextToPeerDetailed(
                 "telegram",
@@ -1224,7 +1224,7 @@ public class GatewayService {
                 }
             }
             if (data.startsWith("models:set:") || data.startsWith("models:setidx:")) {
-                let reply = this.resolveTelegramModelCallback(data, message.senderId, user, sessionKey)
+                let reply = this.resolveTelegramModelCallback(data, message.senderId, accountId, user, sessionKey)
                 this.sendTextToPeerDetailed(
                     "telegram",
                     message.peerId,
@@ -1982,7 +1982,7 @@ public class GatewayService {
                 if (modelArg.isEmpty()) {
                     this.renderTelegramModelsEntry(user, sessionKey, commandText: "/models")
                 } else {
-                    this.applyTelegramModelSelection(modelArg, message.senderId, user, sessionKey)
+                    this.applyTelegramModelSelection(modelArg, message.senderId, accountId, user, sessionKey)
                 }
             case "models" => this.renderTelegramModelsEntry(user, sessionKey, commandText: text)
             case "allowlist" => gatewayTelegramRenderAllowlistCommand(text, user, accountId, message.senderId)
@@ -3420,7 +3420,7 @@ public class GatewayService {
         String.join(lines.toArray(), delimiter: "\n")
     }
 
-    private func resolveTelegramModelCallback(data: String, senderId: String, user: GatewayUserSettings, sessionKey: String): String {
+    private func resolveTelegramModelCallback(data: String, senderId: String, accountId: String, user: GatewayUserSettings, sessionKey: String): String {
         var modelRef = ""
         if (data.startsWith("models:setidx:")) {
             let parts = data.split(":")
@@ -3437,11 +3437,11 @@ public class GatewayService {
         } else if (data.startsWith("models:set:")) {
             modelRef = data["models:set:".size..].trimAscii()
         }
-        return this.applyTelegramModelSelection(modelRef, senderId, user, sessionKey)
+        return this.applyTelegramModelSelection(modelRef, senderId, accountId, user, sessionKey)
     }
 
-    private func applyTelegramModelSelection(rawModelRef: String, senderId: String, user: GatewayUserSettings, sessionKey: String): String {
-        if (!this.telegramSenderCanOperate(senderId, user)) {
+    private func applyTelegramModelSelection(rawModelRef: String, senderId: String, accountId: String, user: GatewayUserSettings, sessionKey: String): String {
+        if (!this.telegramSenderCanOperate(senderId, user, accountId)) {
             return "Model switch denied: sender ${senderId} is not authorized."
         }
         if (!user.telegram.configWrites) {
@@ -3459,7 +3459,7 @@ public class GatewayService {
 
     private func telegramMessageCanOperate(message: InboundMessage, user: GatewayUserSettings, accountId: String): Bool {
         if (!user.telegram.commands.useAccessGroups) {
-            return this.telegramSenderCanOperate(message.senderId, user) ||
+            return this.telegramSenderCanOperate(message.senderId, user, accountId) ||
                 this.telegramPairingSenderAllowed(accountId, message.senderId)
         }
         var anyConfigured = false
@@ -3469,9 +3469,10 @@ public class GatewayService {
                 return true
             }
         }
-        if (!user.telegram.allowFrom.isEmpty()) {
+        let effectiveTelegram = this.telegramEffectiveAccountConfig(user, accountId)
+        if (!effectiveTelegram.allowFrom.isEmpty()) {
             anyConfigured = true
-            if (this.telegramAllowListMatches(user.telegram.allowFrom, message.senderId)) {
+            if (this.telegramAllowListMatches(effectiveTelegram.allowFrom, message.senderId)) {
                 return true
             }
         }
@@ -3482,7 +3483,7 @@ public class GatewayService {
             }
         }
         if (chatTypeToString(message.chatType) == "group") {
-            let groupAllow = this.telegramEffectiveGroupAllowFrom(user, message)
+            let groupAllow = this.telegramEffectiveGroupAllowFrom(user, message, accountId)
             if (!groupAllow.isEmpty()) {
                 anyConfigured = true
                 if (this.telegramAllowListMatches(groupAllow, message.senderId)) {
@@ -3496,9 +3497,23 @@ public class GatewayService {
         false
     }
 
-    private func telegramSenderCanOperate(senderId: String, user: GatewayUserSettings): Bool {
-        this.telegramAllowListMatches(user.telegram.allowFrom, senderId) ||
-            this.telegramAllowListMatches(user.telegram.groupAllowFrom, senderId)
+    private func telegramSenderCanOperate(senderId: String, user: GatewayUserSettings, accountId: String): Bool {
+        let effectiveTelegram = this.telegramEffectiveAccountConfig(user, accountId)
+        this.telegramAllowListMatches(effectiveTelegram.allowFrom, senderId) ||
+            this.telegramAllowListMatches(effectiveTelegram.groupAllowFrom, senderId)
+    }
+
+    private func telegramEffectiveAccountConfig(user: GatewayUserSettings, accountId: String): TelegramConfig {
+        let account = this.telegramAccountOverride(user, accountId) ?? JsonObject()
+        TelegramConfig(
+            enabled: user.telegram.enabled,
+            defaultAccount: user.telegram.defaultAccount,
+            dmPolicy: this.telegramStringField(account, ["dmPolicy", "dm_policy"], user.telegram.dmPolicy),
+            allowFrom: this.telegramStringArrayFieldWithFallback(account, ["allowFrom", "allow_from"], user.telegram.allowFrom),
+            groupPolicy: this.telegramStringField(account, ["groupPolicy", "group_policy"], user.telegram.groupPolicy),
+            groupAllowFrom: this.telegramStringArrayFieldWithFallback(account, ["groupAllowFrom", "group_allow_from"], user.telegram.groupAllowFrom),
+            groups: this.telegramObjectFieldWithFallback(account, "groups", user.telegram.groups)
+        )
     }
 
     private func telegramAllowListMatches(allowFrom: Array<String>, senderId: String): Bool {
@@ -3603,6 +3618,51 @@ public class GatewayService {
         }
     }
 
+    private func telegramAccountIdForConfig(raw: String): String {
+        let trimmed = raw.trimAscii()
+        if (trimmed.isEmpty()) {
+            return "default"
+        }
+        let lower = trimmed.toAsciiLower()
+        for (prefix in ["telegram:", "tg:"]) {
+            if (lower.startsWith(prefix)) {
+                let suffix = trimmed[prefix.size..].trimAscii()
+                return if (suffix.isEmpty()) { "default" } else { suffix }
+            }
+        }
+        trimmed
+    }
+
+    private func telegramAccountOverride(user: GatewayUserSettings, rawAccountId: String): Option<JsonObject> {
+        let accountId = this.telegramAccountIdForConfig(rawAccountId)
+        match (user.telegram.accounts) {
+            case Some(accounts) =>
+                let raw = match (accounts.get(accountId)) {
+                    case Some(v) => Some(v)
+                    case None =>
+                        match (accounts.get("telegram:${accountId}")) {
+                            case Some(v) => Some(v)
+                            case None => accounts.get("tg:${accountId}")
+                        }
+                }
+                match (raw) {
+                    case Some(v) => try { Some(v.asObject()) } catch (_: Exception) { None<JsonObject> }
+                    case None => None<JsonObject>
+                }
+            case None => None<JsonObject>
+        }
+    }
+
+    private func telegramStringField(obj: JsonObject, keys: Array<String>, fallback: String): String {
+        for (key in keys) {
+            match (obj.get(key)) {
+                case Some(v) => try { return v.asString().getValue().trimAscii() } catch (_: Exception) { () }
+                case None => ()
+            }
+        }
+        fallback
+    }
+
     private func telegramStringArrayField(obj: JsonObject, key: String): Array<String> {
         let out = ArrayList<String>()
         match (obj.get(key)) {
@@ -3627,9 +3687,37 @@ public class GatewayService {
         out.toArray()
     }
 
+    private func telegramStringArrayFieldWithFallback(obj: JsonObject, keys: Array<String>, fallback: Array<String>): Array<String> {
+        for (key in keys) {
+            if (obj.get(key).isSome()) {
+                return this.telegramStringArrayField(obj, key)
+            }
+        }
+        fallback
+    }
+
+    private func telegramObjectFieldWithFallback(obj: JsonObject, key: String, fallback: Option<JsonObject>): Option<JsonObject> {
+        match (obj.get(key)) {
+            case Some(v) => try { Some(v.asObject()) } catch (_: Exception) { fallback }
+            case None => fallback
+        }
+    }
+
     private func telegramGroupEntry(user: GatewayUserSettings, peerId: String): Option<JsonObject> {
         let normalizedGroupId = this.telegramNormalizeGroupId(peerId)
         match (user.telegram.groups) {
+            case Some(groups) =>
+                match (this.telegramObjectFieldOpt(groups, normalizedGroupId)) {
+                    case Some(v) => Some(v)
+                    case None => this.telegramObjectFieldOpt(groups, "*")
+                }
+            case None => None<JsonObject>
+        }
+    }
+
+    private func telegramConfigGroupEntry(config: TelegramConfig, peerId: String): Option<JsonObject> {
+        let normalizedGroupId = this.telegramNormalizeGroupId(peerId)
+        match (config.groups) {
             case Some(groups) =>
                 match (this.telegramObjectFieldOpt(groups, normalizedGroupId)) {
                     case Some(v) => Some(v)
@@ -3658,8 +3746,9 @@ public class GatewayService {
         }
     }
 
-    private func telegramEffectiveGroupAllowFrom(user: GatewayUserSettings, message: InboundMessage): Array<String> {
-        let groupEntry = this.telegramGroupEntry(user, message.peerId)
+    private func telegramEffectiveGroupAllowFrom(user: GatewayUserSettings, message: InboundMessage, accountId: String): Array<String> {
+        let effectiveTelegram = this.telegramEffectiveAccountConfig(user, accountId)
+        let groupEntry = this.telegramConfigGroupEntry(effectiveTelegram, message.peerId)
         let topicEntry = this.telegramTopicEntry(message.peerId, groupEntry)
         match (topicEntry) {
             case Some(topicCfg) =>
@@ -3677,10 +3766,10 @@ public class GatewayService {
                 }
             case None => ()
         }
-        if (!user.telegram.groupAllowFrom.isEmpty()) {
-            return user.telegram.groupAllowFrom
+        if (!effectiveTelegram.groupAllowFrom.isEmpty()) {
+            return effectiveTelegram.groupAllowFrom
         }
-        user.telegram.allowFrom
+        effectiveTelegram.allowFrom
     }
 
     private func telegramNativeField(text: String, key: String): String {
