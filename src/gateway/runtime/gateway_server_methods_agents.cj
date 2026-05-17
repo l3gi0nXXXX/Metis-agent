@@ -7,8 +7,11 @@ import metis.core.config.{CliConfig, CliModelRuntimeStateManager, CliModelRuntim
 import metis.core.memory.MemoryRuntimeRegistry
 import metis.core.prompting.{MetisAgentWorkspaceBootstrapResult, ensureMetisAgentWorkspace, metisWorkspaceBootstrapFilenames, metisWorkspaceSupportedProfileFilenames, metisWorkspaceSafeRead, metisWorkspaceSafeWrite, validateMetisIdentityAvatar}
 import metis.core.skills.resolveAgentSkillVisibility
+import metis.gateway.channels.feishu.{gatewayFeishuListAccountIds, gatewayFeishuResolveAccount}
+import metis.gateway.channels.qq.{gatewayQqListAccountIds, gatewayQqResolveAccount}
+import metis.gateway.channels.telegram.{gatewayTelegramListAccountIds, gatewayTelegramResolveAccount}
 import metis.gateway.config.buildGatewayConfigFromUserSettings
-import metis.gateway.core.{GatewayAgentBindingApplyResult, GatewayAgentBindingConflict, GatewayAgentBindingRemoveResult, gatewayAgentTeamMigrationDryRun, gatewayApplyAgentRouteBindings, gatewayAuthorizedChatToolNames, gatewayBuildLegacyAgentRouteBinding, gatewayCorePromptRuntimeCapabilities, gatewayDefaultChatRuntimeHasUnifiedCoreTools, gatewayDefaultChatToolNames, gatewayMainRuntimePromptTemplateId, gatewayMainRuntimePromptVarianceFields, gatewayRemoveAgentRouteBindings, gatewaySanitizeAgentId}
+import metis.gateway.core.{GatewayAgentBindingApplyResult, GatewayAgentBindingConflict, GatewayAgentBindingRemoveResult, gatewayAgentTeamMigrationDryRun, gatewayApplyAgentRouteBindings, gatewayAuthorizedChatToolNames, gatewayBuildLegacyAgentRouteBinding, gatewayChannelRuntimeSummary, gatewayCorePromptRuntimeCapabilities, gatewayDefaultChatRuntimeHasUnifiedCoreTools, gatewayDefaultChatToolNames, gatewayMainRuntimePromptTemplateId, gatewayMainRuntimePromptVarianceFields, gatewayRemoveAgentRouteBindings, gatewaySanitizeAgentId}
 import metis.gateway.session.{GatewayIngressSource, GatewaySessionRequest, gatewayBuildSessionRpcParams, gatewayIngressSourceFromString, gatewayResolveSessionContext, gatewaySessionRequestFromRpcParams}
 import metis.utils.InfoUtils
 
@@ -740,6 +743,165 @@ private func gatewayMainRuntimeAuthorizationProfileJson(
     out
 }
 
+private func gatewayAgentArrayContainsString(values: Array<String>, expected: String): Bool {
+    for (value in values) {
+        if (value == expected) {
+            return true
+        }
+    }
+    false
+}
+
+private func gatewayAgentBindingNormalizedChannel(raw: String): String {
+    let value = raw.trimAscii().toAsciiLower()
+    if (value == "tg") {
+        return "telegram"
+    }
+    if (value == "lark") {
+        return "feishu"
+    }
+    value
+}
+
+private func gatewayAgentBindingNormalizedAccountId(channelId: String, raw: String): String {
+    let trimmed = raw.trimAscii()
+    if (trimmed.isEmpty()) {
+        return "default"
+    }
+    let lower = trimmed.toAsciiLower()
+    let channelPrefix = "${channelId}:"
+    if (lower.startsWith(channelPrefix)) {
+        let suffix = trimmed[channelPrefix.size..].trimAscii()
+        return if (suffix.isEmpty()) { "default" } else { suffix }
+    }
+    if (channelId == "telegram" && lower.startsWith("tg:")) {
+        let suffix = trimmed["tg:".size..].trimAscii()
+        return if (suffix.isEmpty()) { "default" } else { suffix }
+    }
+    trimmed
+}
+
+private func gatewayAgentRuntimeAccountRow(channelId: String, accountId: String): JsonObject {
+    let summary = gatewayChannelRuntimeSummary(channelId)
+    let rows = match (summary.get("accounts")) {
+        case Some(v) => try { v.asArray() } catch (_e: Exception) { JsonArray([]) }
+        case None => JsonArray([])
+    }
+    let canonical = "${channelId}:${accountId}"
+    for (i in 0..rows.size()) {
+        let row = try { rows[i].asObject() } catch (_e: Exception) { JsonObject() }
+        let rowAccount = gatewayAgentJsonString(row, "accountId", "")
+        if (rowAccount == accountId || rowAccount == canonical) {
+            return row
+        }
+    }
+    JsonObject()
+}
+
+private func gatewayAgentRuntimeRowIsRunning(row: JsonObject): Bool {
+    gatewayAgentJsonBool(row, "running", false)
+}
+
+private func gatewayAgentRuntimeState(row: JsonObject): String {
+    if (row.size() == 0) {
+        return "not-registered"
+    }
+    if (gatewayAgentRuntimeRowIsRunning(row)) {
+        return "running"
+    }
+    let phase = gatewayAgentJsonString(row, "phase", gatewayAgentJsonString(row, "lifecycleState", "stopped"))
+    if (phase.isEmpty()) {
+        return "not-running"
+    }
+    phase
+}
+
+private func gatewayAgentChannelAccountDiagnostic(channelId: String, accountId: String): JsonObject {
+    let out = JsonObject()
+    out.put("channel", JsonString(channelId))
+    out.put("accountId", JsonString(accountId))
+    var existsInConfig = false
+    var configured = false
+    var credentialSource = ""
+    let user = CliSettingManager.readGatewaySettings()
+    let cfg = buildGatewayConfigFromUserSettings(user)
+    if (channelId == "telegram") {
+        let resolved = gatewayTelegramResolveAccount(cfg.telegram, accountId)
+        existsInConfig = gatewayAgentArrayContainsString(gatewayTelegramListAccountIds(cfg.telegram), resolved.accountId)
+        configured = resolved.configured
+        credentialSource = if (resolved.configured) { "account-or-inherited-token" } else { "missing" }
+        out.put("resolvedAccountId", JsonString(resolved.accountId))
+    } else if (channelId == "feishu") {
+        let resolved = gatewayFeishuResolveAccount(cfg.feishu, accountId)
+        existsInConfig = gatewayAgentArrayContainsString(gatewayFeishuListAccountIds(cfg.feishu), resolved.accountId)
+        configured = !resolved.config.appId.trimAscii().isEmpty() && !resolved.config.appSecret.trimAscii().isEmpty()
+        credentialSource = resolved.credentialSource
+        out.put("resolvedAccountId", JsonString(resolved.accountId))
+    } else if (channelId == "qq") {
+        let resolved = gatewayQqResolveAccount(cfg.qq, accountId)
+        existsInConfig = gatewayAgentArrayContainsString(gatewayQqListAccountIds(cfg.qq), resolved.accountId)
+        configured = !resolved.config.appId.trimAscii().isEmpty() && !resolved.config.appSecret.trimAscii().isEmpty()
+        credentialSource = resolved.credentialSource
+        out.put("resolvedAccountId", JsonString(resolved.accountId))
+    } else {
+        out.put("status", JsonString("binding-channel-unsupported"))
+        out.put("configured", false.toJsonValue())
+        out.put("registered", false.toJsonValue())
+        out.put("running", false.toJsonValue())
+        return out
+    }
+
+    let runtimeRow = gatewayAgentRuntimeAccountRow(channelId, accountId)
+    let registered = runtimeRow.size() > 0
+    let running = gatewayAgentRuntimeRowIsRunning(runtimeRow)
+    var status = "binding-ready"
+    if (!existsInConfig) {
+        status = "binding-account-missing"
+    } else if (!configured) {
+        status = "binding-account-unconfigured"
+    } else if (!registered) {
+        status = "binding-account-not-registered"
+    } else if (!running) {
+        status = "binding-account-not-running"
+    }
+    out.put("status", JsonString(status))
+    out.put("existsInConfig", existsInConfig.toJsonValue())
+    out.put("configured", configured.toJsonValue())
+    out.put("registered", registered.toJsonValue())
+    out.put("running", running.toJsonValue())
+    out.put("runtimeState", JsonString(gatewayAgentRuntimeState(runtimeRow)))
+    if (!credentialSource.isEmpty()) {
+        out.put("credentialSource", JsonString(credentialSource))
+    }
+    out
+}
+
+private func gatewayAgentRouteBindingRows(root: JsonObject, agentId: String): JsonArray {
+    let out = JsonArray([])
+    let normalizedAgent = gatewaySanitizeAgentId(agentId)
+    let bindings = gatewayAgentConfigBindings(root)
+    for (i in 0..bindings.size()) {
+        let binding = try { bindings[i].asObject() } catch (_e: Exception) { JsonObject() }
+        if (gatewaySanitizeAgentId(gatewayAgentJsonString(binding, "agentId", "")) != normalizedAgent) {
+            continue
+        }
+        let matchObj = gatewayAgentJsonObject(binding, "match")
+        let channelId = gatewayAgentBindingNormalizedChannel(gatewayAgentJsonString(matchObj, "channel", ""))
+        let accountId = gatewayAgentBindingNormalizedAccountId(channelId, gatewayAgentJsonString(matchObj, "accountId", ""))
+        let row = JsonObject()
+        row.put("description", JsonString(gatewayAgentBindingDescribe(binding)))
+        row.put("channel", JsonString(channelId))
+        row.put("accountId", JsonString(accountId))
+        row.put("tenantId", JsonString(gatewayAgentJsonString(matchObj, "tenantId", gatewayAgentJsonString(matchObj, "teamId", ""))))
+        row.put("match", gatewayAgentCloneObject(matchObj))
+        if (!channelId.isEmpty()) {
+            row.put("diagnostic", gatewayAgentChannelAccountDiagnostic(channelId, accountId))
+        }
+        out.add(row)
+    }
+    out
+}
+
 private func gatewayAgentSummaryRow(agentId: String, kind: String, entry!: JsonObject = JsonObject(), root!: JsonObject = JsonObject()): JsonObject {
     let row = JsonObject()
     let normalized = gatewaySanitizeAgentId(agentId)
@@ -774,6 +936,12 @@ private func gatewayAgentSummaryRow(agentId: String, kind: String, entry!: JsonO
     let teamIds = gatewayAgentTeamIdsForAgent(root, normalized)
     if (teamIds.size() > 0) {
         row.put("teamIds", teamIds)
+    }
+    if (root.size() > 0) {
+        let routeBindings = gatewayAgentRouteBindingRows(root, normalized)
+        if (routeBindings.size() > 0) {
+            row.put("routeBindings", routeBindings)
+        }
     }
     row.put("skills", gatewayAgentSkillsJson(normalized))
     row.put("tools", gatewayAgentToolsJson(normalized, gatewayDefaultChatToolNames()))
