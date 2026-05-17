@@ -1,7 +1,7 @@
 package metis.program
 
 import std.unittest.testmacro.*
-import stdx.encoding.json.{JsonArray, JsonObject, JsonString}
+import stdx.encoding.json.{JsonArray, JsonBool, JsonObject, JsonString}
 
 @Test
 public class CliLocalFlowsAgentTeamTest {
@@ -141,6 +141,45 @@ public class CliLocalFlowsAgentTeamTest {
         @Expect(text.contains("{\""), false)
         @Expect(text.contains("RAW_TOKEN"), false)
         @Expect(text.contains("RAW_FEISHU_SECRET"), false)
+    }
+
+    @TestCase
+    public func buildsAgentUpdateRpcParamsForModelWithoutDirectConfigWrite(): Unit {
+        let spec = cliBuildAgentsUpdateRpcSpec([
+            "update",
+            "--agent",
+            "reviewer",
+            "--model",
+            "dashscope:qwen-plus",
+            "--json"
+        ]).getOrThrow()
+
+        @Expect(spec.method, "agents.update")
+        @Expect(spec.json, true)
+        @Expect(spec.params.get("agentId").getOrThrow().asString().getValue(), "reviewer")
+        @Expect(spec.params.get("model").getOrThrow().asString().getValue(), "dashscope:qwen-plus")
+        @Expect(spec.params.get("channelCredentials").isNone(), true)
+    }
+
+    @TestCase
+    public func rendersAgentUpdateOutputWithoutRawJson(): Unit {
+        let result = JsonObject()
+        result.put("agentId", JsonString("reviewer"))
+        let agent = JsonObject()
+        agent.put("id", JsonString("reviewer"))
+        agent.put("name", JsonString("Reviewer"))
+        agent.put("model", JsonString("dashscope:qwen-plus"))
+        agent.put("workspace", JsonString("/tmp/reviewer"))
+        result.put("agent", agent)
+        let refresh = JsonObject()
+        refresh.put("ok", JsonBool(true))
+        result.put("modelsRefresh", refresh)
+
+        let text = cliRenderGatewayAgentUpdateResult(result, "reviewer")
+        @Expect(text.contains("Updated agent: reviewer"), true)
+        @Expect(text.contains("model: dashscope:qwen-plus"), true)
+        @Expect(text.contains("modelsRefresh: ok"), true)
+        @Expect(text.contains("{\""), false)
     }
 
     @TestCase
