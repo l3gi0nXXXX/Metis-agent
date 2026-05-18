@@ -110,6 +110,81 @@ public class GatewayHttpSurfaceTest {
     }
 
     @TestCase
+    public func mcpToolCatalogCarriesGitCodeToolsWithSchemas(): Unit {
+        withGatewayHttpSurfaceTestSettings<Unit>({ =>
+            let response = gatewayHandleMcpRequest(
+                gatewayHttpSurfaceTestUser(),
+                "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}"
+            )
+            for (name in [
+                "gitcode_issue_summarize",
+                "gitcode_pr_summarize",
+                "gitcode_issue_draft_reply",
+                "gitcode_pr_draft_reply",
+                "gitcode_reply_safety_review"
+            ]) {
+                @Expect(response.contains(name), true)
+            }
+            @Expect(response.contains("\"inputSchema\""), true)
+            @Expect(response.contains("\"resultSchema\""), true)
+            @Expect(response.contains("\"ensure_recent\""), true)
+            @Expect(response.contains("\"ensure_ref\""), true)
+            @Expect(response.contains("\"force_candidate\""), true)
+        })
+    }
+
+    @TestCase
+    public func mcpGitCodeToolCallReturnsStructuredContentAndStaysReadOnly(): Unit {
+        withGatewayHttpSurfaceTestSettings<Unit>({ =>
+            let response = gatewayHandleMcpRequest(
+                gatewayHttpSurfaceTestUser(),
+                "{\"jsonrpc\":\"2.0\",\"id\":21,\"method\":\"tools/call\",\"params\":{\"name\":\"gitcode_issue_summarize\",\"arguments\":{\"requestId\":\"req-runtime\",\"caller\":\"monitor\",\"repository\":\"owner/repo\",\"issueId\":\"42\"}}}"
+            )
+            let root = JsonValue.fromStr(response).asObject()
+            let result = root.get("result").getOrThrow().asObject()
+            let structured = result.get("structuredContent").getOrThrow().asObject()
+            @Expect(structured.get("requestId").getOrThrow().asString().getValue(), "req-runtime")
+            @Expect(structured.get("status").getOrThrow().asString().getValue(), "needs_human_review")
+            @Expect(structured.get("needsHumanReview").getOrThrow().asBool().getValue(), true)
+            @Expect(structured.get("readOnly").getOrThrow().asBool().getValue(), true)
+            let audit = structured.get("audit").getOrThrow().asObject()
+            @Expect(audit.get("writebackAttempted").getOrThrow().asBool().getValue(), false)
+            @Expect(audit.get("modelProviderCalled").getOrThrow().asBool().getValue(), false)
+            @Expect(audit.get("ckbLocalPathRead").getOrThrow().asBool().getValue(), false)
+        })
+    }
+
+    @TestCase
+    public func mcpGitCodeSecretInputIsRejectedWithoutLeakingSecret(): Unit {
+        withGatewayHttpSurfaceTestSettings<Unit>({ =>
+            let response = gatewayHandleMcpRequest(
+                gatewayHttpSurfaceTestUser(),
+                "{\"jsonrpc\":\"2.0\",\"id\":22,\"method\":\"tools/call\",\"params\":{\"name\":\"gitcode_issue_summarize\",\"arguments\":{\"requestId\":\"req-secret\",\"caller\":\"monitor\",\"repository\":\"owner/repo\",\"issueId\":\"42\",\"token\":\"ghp_runtime_secret\"}}}"
+            )
+            @Expect(response.contains("ghp_runtime_secret"), false)
+            let root = JsonValue.fromStr(response).asObject()
+            let structured = root.get("result").getOrThrow().asObject().get("structuredContent").getOrThrow().asObject()
+            @Expect(structured.get("status").getOrThrow().asString().getValue(), "rejected")
+            @Expect(structured.toJsonString().contains("[REDACTED]"), true)
+        })
+    }
+
+    @TestCase
+    public func mcpUnknownGitCodeToolReturnsStructuredError(): Unit {
+        withGatewayHttpSurfaceTestSettings<Unit>({ =>
+            let response = gatewayHandleMcpRequest(
+                gatewayHttpSurfaceTestUser(),
+                "{\"jsonrpc\":\"2.0\",\"id\":23,\"method\":\"tools/call\",\"params\":{\"name\":\"gitcode_unknown\",\"arguments\":{\"requestId\":\"req-unknown\"}}}"
+            )
+            let root = JsonValue.fromStr(response).asObject()
+            let structured = root.get("result").getOrThrow().asObject().get("structuredContent").getOrThrow().asObject()
+            @Expect(structured.get("status").getOrThrow().asString().getValue(), "error")
+            let error = structured.get("error").getOrThrow().asObject()
+            @Expect(error.get("code").getOrThrow().asString().getValue(), "UNKNOWN_GITCODE_TOOL")
+        })
+    }
+
+    @TestCase
     public func mcpToolsCallRejectsDeniedGatewayToolBeforeDispatch(): Unit {
         withGatewayHttpSurfaceTestSettings<Unit>({ =>
             var user = gatewayHttpSurfaceTestUser()

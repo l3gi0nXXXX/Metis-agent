@@ -6,6 +6,7 @@ import metis.core.runtimeToolInvocationAllowedFromRoot
 import metis.core.config.{CliConfig, CliSettingManager, GatewayUserSettings, MetisConfigManager}
 import metis.core.model.CliModelManager
 import metis.gateway.config.buildGatewayConfigFromUserSettings
+import metis.gateway.{gatewayMcpAppendGitCodeTools, gatewayMcpGitCodeToolResultJson, gatewayMcpIsGitCodeTool}
 import metis.gateway.model.GatewayConfig
 import metis.gateway.openclaw_http.gatewayRegisterOpenClawHttpRoutes
 import metis.gateway.protocol.{GATEWAY_ERROR_AUTH_FAILED, GATEWAY_ERROR_INVALID_CONNECT, GatewayClientInfo, GatewayConnectParams, GatewayProtocolRequest, GatewayProtocolResponse, validateGatewayConnectParams}
@@ -488,6 +489,7 @@ private func gatewayHandleMcpRequestWithPolicy(cfg: GatewayConfig, raw: String, 
             row.put("description", JsonString(description))
             tools.add(row)
         }
+        gatewayMcpAppendGitCodeTools(tools)
         if (mcpConfigured()) {
             let row = JsonObject()
             row.put("name", JsonString("mcp.configured"))
@@ -988,6 +990,7 @@ private func gatewayMcpNormalizedPayload(value: JsonValue): JsonValue {
 private func gatewayMcpCompatEnvelope(payload: JsonValue, raw: JsonValue): JsonObject {
     let result = JsonObject()
     result.put("content", payload)
+    result.put("structuredContent", payload)
     result.put("payload", payload)
     result.put("raw", raw)
     try {
@@ -1237,6 +1240,9 @@ private func gatewayMcpToolCall(user: GatewayUserSettings, name: String, args: J
         return GatewayRpcResponse(false, "tools.call", error: "tool policy rejected `${name.trimAscii()}`: ${decision.reason}; source=${decision.policySource}")
     }
     let normalized = name.trimAscii().toAsciiLower()
+    if (gatewayMcpIsGitCodeTool(normalized) || normalized.startsWith("gitcode_")) {
+        return GatewayRpcResponse(true, "tools.call", result: gatewayMcpGitCodeToolResultJson(normalized, args))
+    }
     let client = gatewayBuildClient("gateway-http-mcp", "http-mcp")
     if (normalized == "gateway.status") {
         return client.request("status")
