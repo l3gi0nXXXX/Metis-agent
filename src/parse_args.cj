@@ -8,6 +8,7 @@ import magic.model.ModelManager
 import metis.core.config.{CliConfig, CliSettingManager, MetisConfigManager, MetisPaths}
 import metis.core.memory.MemoryRuntimeRegistry
 import metis.core.skills.SkillsPrompt
+import metis.gateway.logging.gatewayLoggingCurrentLogFile
 import metis.io.PrintUtils
 import metis.program.printRootHelp
 import metis.core.model.ModelTokenLimits
@@ -125,7 +126,7 @@ func parseArgsAndSetConfig(args: Array<String>): ParseArgsResult {
         Config.logLevel = "INFO"
     }
     // Log file must be set together with the log level
-    Config.logFile = CliConfig.logFile.toString()
+    Config.logFile = gatewayLoggingCurrentLogFile()
 
     // Clean up old log files based on retention policy
     CliConfig.cleanupLogs()

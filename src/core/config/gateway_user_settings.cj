@@ -259,6 +259,17 @@ public struct GatewayPushUserSettings {
 }
 
 @jsonable
+public struct GatewayLoggingUserSettings {
+    public var level: String = "info"
+    public var file: String = ""
+    public var consoleLevel: String = "info"
+    public var consoleStyle: String = "compact"
+    public var maxFileBytes: Int64 = 500 * 1024 * 1024
+    public var redactSensitive: Bool = true
+    public var redactPatterns: Array<String> = []
+}
+
+@jsonable
 public struct GatewayNodesBrowserUserSettings {
     public var mode: String = "auto"
     public var node: String = ""
@@ -584,6 +595,7 @@ public struct GatewayUserSettings {
     public var reload: GatewayReloadUserSettings = GatewayReloadUserSettings()
     public var http: GatewayHttpUserSettings = GatewayHttpUserSettings()
     public var push: GatewayPushUserSettings = GatewayPushUserSettings()
+    public var logging: GatewayLoggingUserSettings = GatewayLoggingUserSettings()
     public var nodes: GatewayNodesUserSettings = GatewayNodesUserSettings()
     public var trustedProxies: Array<String> = []
     public var allowRealIpFallback: Bool = false

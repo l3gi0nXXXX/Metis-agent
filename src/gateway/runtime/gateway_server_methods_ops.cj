@@ -5,12 +5,13 @@ import magic.jsonable.*
 import metis.core.config.{CliConfig, GatewayUserSettings, MetisConfigManager, MetisPaths}
 import metis.gateway.config.buildGatewayConfigFromUserSettings
 import metis.gateway.core.gatewayAgentTeamDoctorScan
+import metis.gateway.logging.{gatewayLoggingCurrentLogFile, gatewayLoggingResolveSettings}
 import metis.gateway.model.GatewayConfig
 import metis.core.model.CliModelManager
 
 import std.collection.ArrayList
 import std.convert.Parsable
-import std.fs.{Directory, File, exists}
+import std.fs.{Directory, File, Path, exists}
 import stdx.encoding.json.{JsonArray, JsonObject, JsonString, JsonValue}
 
 private func gatewayOpsStringParam(request: GatewayRpcRequest, keys: Array<String>, defaultValue: String): String {
@@ -487,9 +488,14 @@ private func gatewayModelGetJson(modelId: String): JsonObject {
 }
 
 private func gatewayLogsStatusJson(): JsonObject {
+    let logging = gatewayLoggingResolveSettings()
+    let current = gatewayLoggingCurrentLogFile()
     let result = JsonObject()
     result.put("logsDir", JsonString(CliConfig.logsDir.toString()))
-    result.put("currentLogFile", JsonString(CliConfig.logFile.toString()))
+    result.put("currentLogFile", JsonString(current))
+    result.put("currentLogFileExists", exists(Path(current)).toJsonValue())
+    result.put("level", JsonString(logging.level))
+    result.put("consoleLevel", JsonString(logging.consoleLevel))
     result.put("recentFiles", gatewayRecentLogFiles(10))
     result
 }
@@ -524,7 +530,7 @@ private func gatewayLogGetJson(fileName: String): JsonObject {
 }
 
 private func gatewayCurrentLogFileName(): String {
-    let full = CliConfig.logFile.toString()
+    let full = gatewayLoggingCurrentLogFile()
     let parts = full.split("/")
     if (parts.isEmpty()) {
         return full
@@ -535,8 +541,9 @@ private func gatewayCurrentLogFileName(): String {
 private func gatewayLogTailJson(maxLines: Int64): JsonObject {
     let result = gatewayLogsStatusJson()
     let lines = JsonArray([])
-    if (exists(CliConfig.logFile)) {
-        let all = String.fromUtf8(File.readFrom(CliConfig.logFile)).split("\n")
+    let current = Path(gatewayLoggingCurrentLogFile())
+    if (exists(current)) {
+        let all = String.fromUtf8(File.readFrom(current)).split("\n")
         let total = all.size
         let limit = if (maxLines <= 0) { 80 } else { maxLines }
         var count: Int64 = 0
