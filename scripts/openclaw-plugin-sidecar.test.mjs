@@ -22,9 +22,15 @@ function writePlugin(source) {
 }
 
 function invoke(method, payload, pluginRoot) {
+  const result = invokeRaw(method, payload, pluginRoot);
+  assert.equal(result.status, 0, result.stderr);
+  return JSON.parse(result.stdout);
+}
+
+function invokeRaw(method, payload, pluginRoot) {
   const config = { enabled: true, plugins: [pluginRoot] };
   const request = { method, payload, config };
-  const result = spawnSync(
+  return spawnSync(
     process.execPath,
     [
       sidecarPath,
@@ -43,8 +49,6 @@ function invoke(method, payload, pluginRoot) {
       },
     },
   );
-  assert.equal(result.status, 0, result.stderr);
-  return JSON.parse(result.stdout);
 }
 
 test("OpenClaw-style command and two-argument hooks are normalized", () => {
@@ -128,6 +132,40 @@ test("interactive respond contract and unsupported capabilities are structured",
     const unsupported = invoke("sdk.missing", {}, pluginRoot);
     assert.equal(unsupported.status, "unsupported");
     assert.equal(unsupported.unsupportedCapability.capability, "sdk.missing");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("plugin console output is routed to stderr and redacted away from protocol stdout", () => {
+  const { root, pluginRoot } = writePlugin(`
+    export default function(api) {
+      console.log("plugin console fake-sidecar-secret");
+      api.logger.info("plugin logger fake-sidecar-secret", { token: "fake-sidecar-secret" });
+      api.registerCommand({
+        name: "demo",
+        handler: async () => ({ text: "ok fake-sidecar-secret" }),
+      });
+    }
+  `);
+  try {
+    const result = invokeRaw(
+      "command.dispatch",
+      {
+        command: "demo",
+        token: "fake-sidecar-secret",
+      },
+      pluginRoot,
+    );
+    assert.equal(result.status, 0, result.stderr);
+    const lines = result.stdout.trim().split(/\n+/).filter(Boolean);
+    assert.equal(lines.length, 1, result.stdout);
+    const frame = JSON.parse(lines[0]);
+    assert.equal(frame.matched, true);
+    assert.equal(frame.intents[0].text.includes("fake-sidecar-secret"), false);
+    assert.equal(`${result.stdout}${result.stderr}`.includes("fake-sidecar-secret"), false);
+    assert.match(result.stderr, /\[openclaw-plugin-sidecar\] info: plugin console \[REDACTED\]/);
+    assert.match(result.stderr, /\[openclaw-plugin-sidecar\] info: plugin logger \[REDACTED\]/);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
