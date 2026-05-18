@@ -11,7 +11,7 @@ import metis.gateway.security.{gatewayNormalizePairingAccountId, gatewayPairingA
 import metis.mcp.{MetisMcpServeOptions, serveMetisChannelMcp}
 import metis.gateway.runtime.{gatewayCliClient, gatewayCliShouldPrintRuntimeRequiredHint, gatewayInvokeCliAgent, gatewayInvokeCliAgentResult}
 import metis.io.PrintUtils
-import metis.program_support.programSupportRenderLocalCommandSummary
+import metis.program_support.{programSupportBuildPdfStatusSnapshot, programSupportRenderLocalCommandSummary, programSupportRenderPdfStatus}
 
 import std.collection.ArrayList
 import std.convert.*
@@ -2857,8 +2857,8 @@ public func cliRunModelsFlow(args: Array<String>): Int64 {
             ["metis models", "metis models list", "metis models current", "metis models providers",
                 "metis models auth", "metis models resolve <model>", "metis models set <model>",
                 "metis models set-image <model>", "metis models image-fallbacks add <model>",
-                "metis models status", "metis models search <term>"],
-            "list | current | providers | auth | resolve <model> | set <model> | set-image <model> | image-fallbacks add|remove|clear <model> | status | search <term> | help"
+                "metis models status", "metis models pdf-status", "metis models search <term>"],
+            "list | current | providers | auth | resolve <model> | set <model> | set-image <model> | image-fallbacks add|remove|clear <model> | status | pdf-status | search <term> | help"
         )
     }
     if (sub == "list") {
@@ -2996,6 +2996,15 @@ public func cliRunModelsFlow(args: Array<String>): Int64 {
         putNextSteps(obj, ["metis models current", "metis models providers"])
         return localPrintCommandResult(args, obj)
     }
+    if (sub == "pdf-status") {
+        if (localArgsWantJson(args)) {
+            return printJsonObject(programSupportBuildPdfStatusSnapshot())
+        }
+        for (line in programSupportRenderPdfStatus().split("\n")) {
+            PrintUtils.printLine(line)
+        }
+        return CLI_EXIT_OK
+    }
     if (sub == "search") {
         let query = joinArgs(args, start: 1)
         if (query.isEmpty()) {
@@ -3010,7 +3019,7 @@ public func cliRunModelsFlow(args: Array<String>): Int64 {
         putNextSteps(obj, ["metis models resolve ${query}", "metis models providers"])
         return localPrintCommandResult(args, obj)
     }
-    printUnknownLocalSubcommand("models", sub, "list | current | providers | auth | resolve <model> | set <model> | set-image <model> | image-fallbacks add|remove|clear <model> | status | search <term> | help")
+    printUnknownLocalSubcommand("models", sub, "list | current | providers | auth | resolve <model> | set <model> | set-image <model> | image-fallbacks add|remove|clear <model> | status | pdf-status | search <term> | help")
 }
 
 public func cliRunLogsFlow(args: Array<String>): Int64 {

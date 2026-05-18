@@ -1,6 +1,7 @@
 package metis.program_support
 
 import metis.core.config.{CliConfig, MetisConfigManager, cliFindModelAuthChoicesForProvider, cliSetupVisibleModelProviders}
+import metis.core.{gatewayPdfDiagnosticSnapshot, gatewayPdfDiagnosticStatusText}
 
 import std.collection.{ArrayList, filter, map, collectArray}
 import std.convert.Parsable
@@ -122,15 +123,24 @@ public func programSupportIsModelsCommandLine(raw: String): Bool {
 }
 
 public func programSupportRenderModelsHelp(): String {
-    "Usage: /models [status|help|set-image|image-fallbacks|<provider>|<page>]\n" +
+    "Usage: /models [status|pdf-status|help|set-image|image-fallbacks|<provider>|<page>]\n" +
     "  /models              Open the interactive provider/model configuration flow and may write metis.json.\n" +
     "  /models status       Print read-only CLI chat model status.\n" +
+    "  /models pdf-status   Print read-only PDF tool model/runtime/fallback dependency status.\n" +
     "  /models set-image <provider/model>  Set the dedicated image-understanding model.\n" +
     "  /models image-fallbacks add|remove|clear <provider/model>  Manage image-understanding fallbacks.\n" +
     "  /models help         Show this help.\n" +
     "  /models <provider>   Show read-only model candidates for a provider.\n" +
     "  /models <page>       Show a provider page.\n" +
     "  metis models set <provider/model>  Switch the persisted CLI model outside chat.\n"
+}
+
+public func programSupportBuildPdfStatusSnapshot(): JsonObject {
+    gatewayPdfDiagnosticSnapshot()
+}
+
+public func programSupportRenderPdfStatus(): String {
+    gatewayPdfDiagnosticStatusText(programSupportBuildPdfStatusSnapshot())
 }
 
 public func programSupportRenderModelsStatus(): String {

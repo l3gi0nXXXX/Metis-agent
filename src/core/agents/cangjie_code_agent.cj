@@ -49,6 +49,7 @@ For any unclear aspects, use the **${CangjieToolset._cangjieRetrieveDocuments}**
         WeatherToolset(),
         ShellTool(),
         BasicMediaToolset(),
+        PdfToolset(),
         CangjieToolset(),
         MemoryToolset(),
         GatewaySessionsToolset(),

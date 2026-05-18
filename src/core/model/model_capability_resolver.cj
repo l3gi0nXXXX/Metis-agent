@@ -139,6 +139,7 @@ private func capabilityKnownDecision(modelRef: String): ModelCapabilityDecision 
 
     if (
         provider == "fake" ||
+        provider == "anthropic" && lowerModel.startsWith("claude") ||
         (provider == "dashscope" || provider == "qwen") && (lowerModel.contains("vl") || lowerModel.contains("qvq") || lowerModel.contains("omni")) ||
         provider == "openai" && (lowerModel.startsWith("gpt-4o") || lowerModel.startsWith("gpt-4.1") || lowerModel.startsWith("gpt-5")) ||
         provider == "google" && lowerModel.startsWith("gemini") ||

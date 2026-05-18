@@ -55,7 +55,7 @@ public class CliappCommandSupportTest {
     @TestCase
     public func modelsHelpAndStatusAreExplicitAboutScope(): Unit {
         let help = programSupportRenderModelsHelp()
-        @Expect(help.contains("Usage: /models [status|help|set-image|image-fallbacks|<provider>|<page>]"), true)
+        @Expect(help.contains("Usage: /models [status|pdf-status|help|set-image|image-fallbacks|<provider>|<page>]"), true)
         @Expect(help.contains("/models status"), true)
         @Expect(help.contains("/models set-image"), true)
         @Expect(help.contains("/models <provider>"), true)

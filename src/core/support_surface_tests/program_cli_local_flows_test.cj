@@ -6,7 +6,7 @@ import metis.program_support.*
 import std.env.setVariable
 import std.unittest.testmacro.*
 import std.collection.ArrayList
-import stdx.encoding.json.{JsonArray, JsonObject, JsonString, JsonValue}
+import stdx.encoding.json.{JsonArray, JsonInt, JsonObject, JsonString, JsonValue}
 
 @Test
 public class CliLocalFlowsTest {
@@ -79,5 +79,33 @@ public class CliLocalFlowsTest {
         @Expect(rendered.contains("Image primary: qwen:qwen-vl-max"), true)
         @Expect(rendered.contains("Image fallbacks: openai:gpt-4o"), true)
         @Expect(rendered.contains("independent from the main chat model"), true)
+    }
+
+    @TestCase
+    public func pdfStatusRendersHumanTextWithoutRawJson(): Unit {
+        let root = JsonObject()
+        let agents = JsonObject()
+        let defaults = JsonObject()
+        let pdfModel = JsonObject()
+        pdfModel.put("primary", JsonString("anthropic/claude-sonnet-4-5"))
+        defaults.put("pdfModel", pdfModel)
+        defaults.put("pdfMaxPages", JsonInt(12))
+        agents.put("defaults", defaults)
+        root.put("agents", agents)
+        MetisConfigManager.writeRoot(root)
+        CliSettingManager.applyPersistedFieldsToCliConfig()
+
+        let rendered = programSupportRenderPdfStatus()
+
+        @Expect(rendered.contains("PDF tool status"), true)
+        @Expect(rendered.contains("Model candidates: 1 (configured)"), true)
+        @Expect(rendered.contains("anthropic:claude-sonnet-4-5"), true)
+        @Expect(rendered.contains("native PDF: yes"), true)
+        @Expect(rendered.contains("maxPages=12"), true)
+        @Expect(rendered.contains("pdfjs-dist"), true)
+        @Expect(rendered.contains("{"), false)
+        @Expect(rendered.contains("\"ok\""), false)
+        @Expect(rendered.contains("\"result\""), false)
+        @Expect(rendered.contains("\"sessions\""), false)
     }
 }

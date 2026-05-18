@@ -118,6 +118,7 @@ public func programSupportRootCommandExamples(command: String): Array<CliRootCom
     if (cmd == "models") {
         return [
             ("metis models status", "Inspect current model and provider state."),
+            ("metis models pdf-status", "Inspect PDF tool model/runtime/fallback dependency state."),
             ("metis models search kimi", "Search matching models.")
         ]
     }

@@ -113,6 +113,39 @@ private func cfgGetStringArray(root: JsonObject, key: String): Option<Array<Stri
     }
 }
 
+private func cfgGetFloat64(root: JsonObject, key: String): Option<Float64> {
+    match (root.get(key)) {
+        case Some(value) =>
+            try {
+                return Some(Float64.parse(value.toJsonString()))
+            } catch (_: Exception) {
+                ()
+            }
+            try {
+                Some(Float64.parse(value.asString().getValue().trimAscii()))
+            } catch (_: Exception) {
+                None<Float64>
+            }
+        case None => None<Float64>
+    }
+}
+
+private func cfgGetInt64(root: JsonObject, key: String): Option<Int64> {
+    match (root.get(key)) {
+        case Some(value) =>
+            try {
+                return Some(value.asInt().getValue())
+            } catch (_: Exception) {
+                ()
+            }
+            match (cfgGetFloat64(root, key)) {
+                case Some(v) => Some(Int64(v))
+                case None => None<Int64>
+            }
+        case None => None<Int64>
+    }
+}
+
 private func cfgCopyScalar(root: JsonObject, key: String, projected: JsonObject): Unit {
     match (root.get(key)) {
         case Some(value) =>
@@ -972,6 +1005,111 @@ public class MetisConfigManager {
         }
     }
 
+    public static func readPdfModel(): Option<String> {
+        match (rawConfig()) {
+            case Some(root) =>
+                match (cfgGetObject(root, "agents")) {
+                    case Some(agents) =>
+                        match (cfgGetObject(agents, "defaults")) {
+                            case Some(defaults) =>
+                                match (cfgGetObject(defaults, "pdfModel")) {
+                                    case Some(model) =>
+                                        match (cfgGetString(model, "primary")) {
+                                            case Some(value) =>
+                                                let normalized = normalizeLegacyModelRef(value).trimAscii()
+                                                if (normalized.isEmpty()) { None } else { Some(normalized) }
+                                            case None => None
+                                        }
+                                    case None => None
+                                }
+                            case None => None
+                        }
+                    case None => None
+                }
+            case None => None
+        }
+    }
+
+    public static func readPdfFallbackModels(): Array<String> {
+        match (rawConfig()) {
+            case Some(root) =>
+                match (cfgGetObject(root, "agents")) {
+                    case Some(agents) =>
+                        match (cfgGetObject(agents, "defaults")) {
+                            case Some(defaults) =>
+                                match (cfgGetObject(defaults, "pdfModel")) {
+                                    case Some(model) =>
+                                        match (model.get("fallbacks")) {
+                                            case Some(value) =>
+                                                try {
+                                                    let arr = value.asArray()
+                                                    let out = ArrayList<String>()
+                                                    let seen = ArrayList<String>()
+                                                    for (item in arr.getItems()) {
+                                                        try {
+                                                            let text = normalizeLegacyModelRef(item.asString().getValue()).trimAscii()
+                                                            if (!text.isEmpty() && !seen.contains(text)) {
+                                                                seen.add(text)
+                                                                out.add(text)
+                                                            }
+                                                        } catch (_: Exception) {
+                                                            ()
+                                                        }
+                                                    }
+                                                    out.toArray()
+                                                } catch (_: Exception) {
+                                                    Array<String>()
+                                                }
+                                            case None => Array<String>()
+                                        }
+                                    case None => Array<String>()
+                                }
+                            case None => Array<String>()
+                        }
+                    case None => Array<String>()
+                }
+            case None => Array<String>()
+        }
+    }
+
+    public static func readPdfMaxBytesMb(): Option<Float64> {
+        match (rawConfig()) {
+            case Some(root) =>
+                match (cfgGetObject(root, "agents")) {
+                    case Some(agents) =>
+                        match (cfgGetObject(agents, "defaults")) {
+                            case Some(defaults) =>
+                                match (cfgGetFloat64(defaults, "pdfMaxBytesMb")) {
+                                    case Some(value) => if (value > 0.0) { Some(value) } else { None<Float64> }
+                                    case None => None<Float64>
+                                }
+                            case None => None<Float64>
+                        }
+                    case None => None<Float64>
+                }
+            case None => None<Float64>
+        }
+    }
+
+    public static func readPdfMaxPages(): Option<Int64> {
+        match (rawConfig()) {
+            case Some(root) =>
+                match (cfgGetObject(root, "agents")) {
+                    case Some(agents) =>
+                        match (cfgGetObject(agents, "defaults")) {
+                            case Some(defaults) =>
+                                match (cfgGetInt64(defaults, "pdfMaxPages")) {
+                                    case Some(value) => if (value > 0) { Some(value) } else { None<Int64> }
+                                    case None => None<Int64>
+                                }
+                            case None => None<Int64>
+                        }
+                    case None => None<Int64>
+                }
+            case None => None<Int64>
+        }
+    }
+
     public static func readWorkspace(): Option<String> {
         match (rawConfig()) {
             case Some(root) =>
@@ -1677,6 +1815,23 @@ public class MetisConfigManager {
             case None => ()
         }
         CliConfig.imageFallbackModels = readImageFallbackModels()
+        match (readPdfModel()) {
+            case Some(model) =>
+                let trimmed = normalizeLegacyModelRef(model).trimAscii()
+                if (!trimmed.isEmpty()) {
+                    CliConfig.pdfModel = trimmed
+                }
+            case None => CliConfig.clearPdfModelForTest()
+        }
+        CliConfig.pdfFallbackModels = readPdfFallbackModels()
+        match (readPdfMaxBytesMb()) {
+            case Some(value) => CliConfig.pdfMaxBytesMb = value
+            case None => CliConfig.pdfMaxBytesMb = 10.0
+        }
+        match (readPdfMaxPages()) {
+            case Some(value) => CliConfig.pdfMaxPages = value
+            case None => CliConfig.pdfMaxPages = 20
+        }
         match (readFastModel()) {
             case Some(model) =>
                 let trimmed = model.trimAscii()

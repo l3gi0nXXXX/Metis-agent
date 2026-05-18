@@ -48,6 +48,18 @@ private func mediaImageTestRecord(path: String, channel!: String = "telegram", k
     record
 }
 
+private func mediaDocumentTestRecord(path: String, mime!: String = "application/pdf", fileName!: String = "report.pdf", channel!: String = "telegram"): JsonObject {
+    let record = JsonObject()
+    record.put("mediaKind", JsonString("document"))
+    record.put("mimeType", JsonString(mime))
+    record.put("fileName", JsonString(fileName))
+    record.put("originalFileName", JsonString(fileName))
+    record.put("localPath", JsonString(path))
+    record.put("downloaded", JsonBool(true))
+    record.put("channel", JsonString(channel))
+    record
+}
+
 private class GatewayImageRuntimeFakeModel <: ChatModel {
     private var _maxTokens: Option<Int64> = None
 
@@ -291,6 +303,196 @@ public class GatewayMediaUnderstandingRuntimeTest {
         @Expect(mediaAsrString(result, "status"), "too_large")
         @Expect(mediaAsrString(result, "videoUnderstandingStatus"), "too_large")
         @Expect(result.get("fileBytes").isSome(), true)
+    }
+
+    @TestCase
+    public func pdfDocumentRecordUsesSharedPdfRuntimeHook(): Unit {
+        let root = mediaAsrTestTempRoot("pdf-runtime-ok")
+        let doc = root.join("report.pdf")
+        File.writeTo(doc, "%PDF-1.7\nfake".toArray())
+        setGatewayMediaPdfRuntimeForTest(Some({ path: String, mime: String, fileName: String, prompt: String, maxBytes: Int64 =>
+            @Expect(path, doc.toString())
+            @Expect(mime, "application/pdf")
+            @Expect(fileName, "report.pdf")
+            @Expect(prompt, "summarize")
+            @Expect(maxBytes, 4096)
+            let out = JsonObject()
+            out.put("status", JsonString("ok"))
+            out.put("text", JsonString("pdf summary"))
+            out.put("provider", JsonString("fake"))
+            out.put("model", JsonString("fake:pdf-runtime"))
+            out
+        }))
+        try {
+            let result = gatewayMediaUnderstandingForRecordWithSettings(
+                mediaDocumentTestRecord(doc.toString()),
+                GatewayUserSettings(),
+                capability: "document",
+                prompt: "summarize",
+                maxBytes: 4096
+            )
+            @Expect(mediaAsrString(result, "status"), "ok")
+            @Expect(mediaAsrString(result, "documentExtractStatus"), "ok")
+            @Expect(mediaAsrString(result, "extractor"), "pdf_runtime")
+            @Expect(mediaAsrString(result, "provider"), "fake")
+            @Expect(gatewayMediaUnderstandingFirstText(result), "pdf summary")
+            let outputs = result.get("outputs").getOrThrow().asArray()
+            @Expect(outputs[0].asObject().get("source").getOrThrow().asString().getValue(), "gateway_pdf_runtime")
+        } finally {
+            setGatewayMediaPdfRuntimeForTest(None<(String, String, String, String, Int64) -> JsonObject>)
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func pdfProviderErrorIsPropagatedWithoutMetadataFallbackAndRedactsSecrets(): Unit {
+        let root = mediaAsrTestTempRoot("pdf-provider-error")
+        let doc = root.join("report.dat")
+        File.writeTo(doc, "not-a-real-pdf".toArray())
+        setGatewayMediaPdfRuntimeForTest(Some({ _path: String, _mime: String, _fileName: String, _prompt: String, _maxBytes: Int64 =>
+            let out = JsonObject()
+            out.put("status", JsonString("provider_error"))
+            out.put("error", JsonString("Http status: 401 Authorization: Bearer sk-pdf-secret https://provider.example/pdf?api_key=query-secret&token=query-token"))
+            out
+        }))
+        try {
+            let result = gatewayMediaUnderstandingForRecordWithSettings(
+                mediaDocumentTestRecord(doc.toString(), mime: "application/octet-stream", fileName: "report.pdf"),
+                GatewayUserSettings(),
+                capability: "document"
+            )
+            @Expect(mediaAsrString(result, "status"), "provider_error")
+            @Expect(mediaAsrString(result, "documentExtractStatus"), "provider_error")
+            @Expect(mediaAsrString(result, "extractor"), "pdf_runtime")
+            @Expect(mediaAsrString(result, "error").contains("401"), true)
+            @Expect(mediaAsrString(result, "status") == "metadata_only", false)
+            @Expect(result.toJsonString().contains("sk-pdf-secret"), false)
+            @Expect(result.toJsonString().contains("query-secret"), false)
+            @Expect(result.toJsonString().contains("query-token"), false)
+        } finally {
+            setGatewayMediaPdfRuntimeForTest(None<(String, String, String, String, Int64) -> JsonObject>)
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func pdfMagicBytesWithoutConfiguredRuntimeReturnsNotConfigured(): Unit {
+        let root = mediaAsrTestTempRoot("pdf-not-configured")
+        let doc = root.join("report.bin")
+        File.writeTo(doc, "%PDF-1.7\nfake".toArray())
+        let oldModel = CliConfig.modelOrEmpty()
+        let oldFallbacks = CliConfig.fallbackModels
+        let oldImageModel = CliConfig.imageModelOrEmpty()
+        let oldImageFallbacks = CliConfig.imageFallbackModels
+        let oldPdfModel = CliConfig.pdfModelOrEmpty()
+        let oldPdfFallbacks = CliConfig.pdfFallbackModels
+        try {
+            CliConfig.clearPrimaryModelForTest()
+            CliConfig.fallbackModels = []
+            CliConfig.clearImageModelForTest()
+            CliConfig.imageFallbackModels = []
+            CliConfig.clearPdfModelForTest()
+            CliConfig.pdfFallbackModels = []
+
+            let result = gatewayMediaUnderstandingForRecordWithSettings(
+                mediaDocumentTestRecord(doc.toString(), mime: "application/octet-stream", fileName: "report.bin"),
+                GatewayUserSettings(),
+                capability: "document"
+            )
+            @Expect(mediaAsrString(result, "status"), "not_configured")
+            @Expect(mediaAsrString(result, "documentExtractStatus"), "not_configured")
+            @Expect(mediaAsrString(result, "extractor"), "pdf_runtime")
+            @Expect(mediaAsrString(result, "error").contains("agents.defaults.pdfModel"), true)
+            @Expect(result.get("ok").getOrThrow().asBool().getValue(), false)
+        } finally {
+            if (oldModel.isEmpty()) {
+                CliConfig.clearPrimaryModelForTest()
+            } else {
+                CliConfig.model = oldModel
+            }
+            CliConfig.fallbackModels = oldFallbacks
+            if (oldImageModel.isEmpty()) {
+                CliConfig.clearImageModelForTest()
+            } else {
+                CliConfig.imageModel = oldImageModel
+            }
+            CliConfig.imageFallbackModels = oldImageFallbacks
+            if (oldPdfModel.isEmpty()) {
+                CliConfig.clearPdfModelForTest()
+            } else {
+                CliConfig.pdfModel = oldPdfModel
+            }
+            CliConfig.pdfFallbackModels = oldPdfFallbacks
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func pdfDocumentRecordUsesConfiguredPdfRuntimeWithoutHook(): Unit {
+        let root = mediaAsrTestTempRoot("pdf-configured-runtime")
+        let doc = root.join("report.pdf")
+        File.writeTo(doc, "%PDF-1.7\nfake".toArray())
+        let modelRef = "fake:image-runtime"
+        ModelManager.registerChatModel(modelRef, { => GatewayImageRuntimeFakeModel() })
+        let oldModel = CliConfig.modelOrEmpty()
+        let oldFallbacks = CliConfig.fallbackModels
+        let oldImageModel = CliConfig.imageModelOrEmpty()
+        let oldImageFallbacks = CliConfig.imageFallbackModels
+        let oldPdfModel = CliConfig.pdfModelOrEmpty()
+        let oldPdfFallbacks = CliConfig.pdfFallbackModels
+        setPdfExtractorBridgeRunnerForTest(Some({ request: PdfExtractorBridgeRequest =>
+            @Expect(request.inputPath, doc.toString())
+            PdfExtractorProcessResult(
+                0,
+                stdout: "{\"ok\":true,\"status\":\"ok\",\"text\":\"extracted media pdf text\",\"pageCount\":1,\"selectedPages\":[1]}",
+                stderr: ""
+            )
+        }))
+        try {
+            CliConfig.clearPrimaryModelForTest()
+            CliConfig.fallbackModels = []
+            CliConfig.clearImageModelForTest()
+            CliConfig.imageFallbackModels = []
+            CliConfig.pdfModel = modelRef
+            CliConfig.pdfFallbackModels = []
+
+            let result = gatewayMediaUnderstandingForRecordWithSettings(
+                mediaDocumentTestRecord(doc.toString()),
+                GatewayUserSettings(),
+                capability: "document",
+                prompt: "summarize"
+            )
+
+            @Expect(mediaAsrString(result, "status"), "ok")
+            @Expect(mediaAsrString(result, "documentExtractStatus"), "ok")
+            @Expect(mediaAsrString(result, "extractor"), "pdf_runtime")
+            @Expect(mediaAsrString(result, "provider"), "fake")
+            @Expect(mediaAsrString(result, "model"), "fake:image-runtime")
+            @Expect(gatewayMediaUnderstandingFirstText(result).contains("configured runtime image"), true)
+            let outputs = result.get("outputs").getOrThrow().asArray()
+            @Expect(outputs[0].asObject().get("source").getOrThrow().asString().getValue(), "gateway_pdf_runtime")
+        } finally {
+            setPdfExtractorBridgeRunnerForTest(None<(PdfExtractorBridgeRequest) -> PdfExtractorProcessResult>)
+            if (oldModel.isEmpty()) {
+                CliConfig.clearPrimaryModelForTest()
+            } else {
+                CliConfig.model = oldModel
+            }
+            CliConfig.fallbackModels = oldFallbacks
+            if (oldImageModel.isEmpty()) {
+                CliConfig.clearImageModelForTest()
+            } else {
+                CliConfig.imageModel = oldImageModel
+            }
+            CliConfig.imageFallbackModels = oldImageFallbacks
+            if (oldPdfModel.isEmpty()) {
+                CliConfig.clearPdfModelForTest()
+            } else {
+                CliConfig.pdfModel = oldPdfModel
+            }
+            CliConfig.pdfFallbackModels = oldPdfFallbacks
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
     }
 
     @TestCase

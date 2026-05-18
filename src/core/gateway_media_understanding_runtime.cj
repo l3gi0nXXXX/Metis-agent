@@ -12,12 +12,13 @@ import std.convert.*
 import std.fs.{File, Path, exists}
 import std.regex.{Regex, RegexFlag}
 import stdx.encoding.base64.toBase64String
-import stdx.encoding.json.{JsonArray, JsonBool, JsonObject, JsonString}
+import stdx.encoding.json.{JsonArray, JsonBool, JsonFloat, JsonObject, JsonString}
 
 private var gatewayMediaAsrRunnerOverride: Option<(String, String) -> String> = None<(String, String) -> String>
 private var gatewayMediaVisionRunnerOverride: Option<(String, String, String, String, Int64) -> String> = None<(String, String, String, String, Int64) -> String>
 private var gatewayMediaVideoRunnerOverride: Option<(String, String, String, Int64) -> String> = None<(String, String, String, Int64) -> String>
 private var gatewayMediaDocumentExtractorOverride: Option<(String, String, String, Int64) -> String> = None<(String, String, String, Int64) -> String>
+private var gatewayMediaPdfRuntimeOverride: Option<(String, String, String, String, Int64) -> JsonObject> = None<(String, String, String, String, Int64) -> JsonObject>
 
 public func setGatewayMediaAsrRunnerForTest(runner: Option<(String, String) -> String>): Unit {
     gatewayMediaAsrRunnerOverride = runner
@@ -33,6 +34,10 @@ public func setGatewayMediaVideoRunnerForTest(runner: Option<(String, String, St
 
 public func setGatewayMediaDocumentExtractorForTest(extractor: Option<(String, String, String, Int64) -> String>): Unit {
     gatewayMediaDocumentExtractorOverride = extractor
+}
+
+public func setGatewayMediaPdfRuntimeForTest(runner: Option<(String, String, String, String, Int64) -> JsonObject>): Unit {
+    gatewayMediaPdfRuntimeOverride = runner
 }
 
 public func gatewayMediaTranscribeAudioPathForRuntime(path: String, mime: String): String {
@@ -72,6 +77,46 @@ private func gatewayMediaExtractDocumentPathForRuntime(path: String, mime: Strin
     match (gatewayMediaDocumentExtractorOverride) {
         case Some(extractor) => try { extractor(normalizedPath, mime.trimAscii().toAsciiLower(), fileName.trimAscii(), maxBytes).trimAscii() } catch (_e: Exception) { "" }
         case None => ""
+    }
+}
+
+private func gatewayMediaAnalyzePdfPathForRuntime(path: String, mime: String, fileName: String, prompt: String, maxBytes: Int64, channel: String): JsonObject {
+    let out = JsonObject()
+    let normalizedPath = path.trimAscii()
+    if (normalizedPath.isEmpty() || !exists(Path(normalizedPath))) {
+        out.put("status", JsonString("unsupported"))
+        out.put("error", JsonString("PDF input path is missing"))
+        return out
+    }
+    match (gatewayMediaPdfRuntimeOverride) {
+        case Some(runner) =>
+            try {
+                runner(normalizedPath, mime.trimAscii().toAsciiLower(), fileName.trimAscii(), prompt, maxBytes)
+            } catch (e: Exception) {
+                out.put("status", JsonString("provider_error"))
+                out.put("error", JsonString(gatewayMediaRuntimeRedactProviderError(e.message)))
+                out
+            }
+        case None =>
+            let request = JsonObject()
+            request.put("tool", JsonString("pdf"))
+            request.put("pdf", JsonString(normalizedPath))
+            request.put("pdfs", JsonArray([JsonString(normalizedPath)]))
+            request.put("prompt", JsonString(if (prompt.trimAscii().isEmpty()) { PDF_TOOL_DEFAULT_PROMPT } else { prompt.trimAscii() }))
+            if (maxBytes > 0) {
+                request.put("maxBytesMb", JsonFloat(Float64(maxBytes) / 1024.0 / 1024.0))
+            }
+            let normalizedChannel = channel.trimAscii().toAsciiLower()
+            if (!normalizedChannel.isEmpty()) {
+                request.put("channel", JsonString(normalizedChannel))
+            }
+            let result = gatewayPdfAnalyze(request)
+            if (!gatewayMediaRuntimeString(result, "error").isEmpty()) {
+                let safe = gatewayMediaRuntimeRedactProviderError(gatewayMediaRuntimeString(result, "error"))
+                result.put("error", JsonString(safe))
+                result.put("message", JsonString(safe))
+            }
+            result
     }
 }
 
@@ -319,6 +364,22 @@ private func gatewayMediaRuntimeReadableTextMime(mime: String, fileName: String)
         normalizedName.endsWith(".log")
 }
 
+private func gatewayMediaRuntimeIsPdf(mime: String, fileName: String, bytes: Array<Byte>): Bool {
+    let normalizedMime = mime.trimAscii().toAsciiLower()
+    let normalizedName = fileName.trimAscii().toAsciiLower()
+    normalizedMime == "application/pdf" ||
+        normalizedMime.contains("pdf") ||
+        normalizedName.endsWith(".pdf") ||
+        (
+            bytes.size >= 5 &&
+            UInt8(bytes[0]) == 37u8 &&
+            UInt8(bytes[1]) == 80u8 &&
+            UInt8(bytes[2]) == 68u8 &&
+            UInt8(bytes[3]) == 70u8 &&
+            UInt8(bytes[4]) == 45u8
+        )
+}
+
 private func gatewayMediaRuntimeCompanionText(localPath: String, suffixes: Array<String>, maxBytes!: Int64 = 4096): String {
     if (localPath.trimAscii().isEmpty()) {
         return ""
@@ -404,6 +465,25 @@ private func gatewayMediaRuntimeResult(
         out.put("error", JsonString(error.trimAscii()))
     }
     out
+}
+
+private func gatewayMediaRuntimePdfText(pdfResult: JsonObject): String {
+    for (key in ["text", "analysis", "content", "documentText", "documentTextPreview"]) {
+        let value = gatewayMediaRuntimeString(pdfResult, key)
+        if (!value.isEmpty()) {
+            return value
+        }
+    }
+    ""
+}
+
+private func gatewayMediaRuntimeCopyFields(source: JsonObject, target: JsonObject, keys: Array<String>): Unit {
+    for (key in keys) {
+        match (source.get(key)) {
+            case Some(v) => target.put(key, v)
+            case None => ()
+        }
+    }
 }
 
 public func gatewayMediaUnderstandingForRecord(
@@ -734,12 +814,69 @@ public func gatewayMediaUnderstandingForRecordWithSettings(
     }
 
     if (resolvedCapability == "document") {
-        if (gatewayMediaRuntimeReadableTextMime(mime, fileName)) {
+        let isPdf = gatewayMediaRuntimeIsPdf(mime, fileName, bytes)
+        if (!isPdf && gatewayMediaRuntimeReadableTextMime(mime, fileName)) {
             let content = gatewayMediaRuntimeSafePreview(localPath, maxBytes: maxBytes).trimAscii()
             if (!content.isEmpty()) {
                 outputs.add(gatewayMediaRuntimeOutput("document.text", content, "text_file_preview"))
                 let out = gatewayMediaRuntimeResult(record, resolvedCapability, "ok", outputs, gatewayMediaRuntimeDecision(resolvedCapability, "applied", "text-like document preview"))
                 out.put("documentTextPreview", JsonString(content))
+                return out
+            }
+        }
+        let pdfRuntime = if (isPdf) {
+            gatewayMediaAnalyzePdfPathForRuntime(localPath, mime, fileName, prompt, maxBytes, gatewayMediaRuntimeString(record, "channel"))
+        } else {
+            JsonObject()
+        }
+        if (isPdf) {
+            let pdfText = gatewayMediaRuntimePdfText(pdfRuntime).trimAscii()
+            if (!pdfText.isEmpty()) {
+                outputs.add(gatewayMediaRuntimeOutput("document.text", pdfText, "gateway_pdf_runtime"))
+                let out = gatewayMediaRuntimeResult(record, resolvedCapability, "ok", outputs, gatewayMediaRuntimeDecision(resolvedCapability, "applied", "gateway PDF runtime"))
+                out.put("documentTextPreview", JsonString(pdfText))
+                out.put("documentExtractStatus", JsonString("ok"))
+                out.put("extractor", JsonString("pdf_runtime"))
+                gatewayMediaRuntimeCopyFields(pdfRuntime, out, ["provider", "providerKind", "model", "source", "attempts"])
+                return out
+            }
+            let pdfStatus = gatewayMediaRuntimeString(pdfRuntime, "status")
+            if (
+                pdfStatus == "provider_error" ||
+                pdfStatus == "timeout" ||
+                pdfStatus == "too_large" ||
+                pdfStatus == "unsupported" ||
+                pdfStatus == "not_configured" ||
+                pdfStatus == "runtime_unavailable" ||
+                pdfStatus == "extractor_error" ||
+                pdfStatus == "extractor_failed" ||
+                pdfStatus == "extractor_timeout" ||
+                pdfStatus == "extractor_invalid_output" ||
+                pdfStatus == "extractor_output_too_large" ||
+                pdfStatus == "unsupported_pages" ||
+                pdfStatus == "unsupported_images" ||
+                pdfStatus == "invalid_pages" ||
+                pdfStatus == "missing_pdf" ||
+                pdfStatus == "too_many_pdfs" ||
+                pdfStatus == "unsupported_pdf_reference" ||
+                pdfStatus == "not_found" ||
+                pdfStatus == "read_error" ||
+                pdfStatus == "http_error" ||
+                pdfStatus == "outside_allowed_roots" ||
+                pdfStatus == "sandbox_remote_disallowed"
+            ) {
+                let safeError = gatewayMediaRuntimeRedactProviderError(gatewayMediaRuntimeString(pdfRuntime, "error"))
+                let out = gatewayMediaRuntimeResult(
+                    record,
+                    resolvedCapability,
+                    pdfStatus,
+                    outputs,
+                    gatewayMediaRuntimeDecision(resolvedCapability, pdfStatus, safeError),
+                    error: safeError
+                )
+                out.put("documentExtractStatus", JsonString(pdfStatus))
+                out.put("extractor", JsonString("pdf_runtime"))
+                gatewayMediaRuntimeCopyFields(pdfRuntime, out, ["provider", "providerKind", "model", "source", "attempts", "fileBytes", "limitBytes"])
                 return out
             }
         }
@@ -758,6 +895,25 @@ public func gatewayMediaUnderstandingForRecordWithSettings(
             let out = gatewayMediaRuntimeResult(record, resolvedCapability, "ok", outputs, gatewayMediaRuntimeDecision(resolvedCapability, "applied", "extract companion file"))
             out.put("documentTextPreview", JsonString(extracted))
             out.put("documentExtractStatus", JsonString("ok"))
+            return out
+        }
+        if (isPdf) {
+            let configuredReason = gatewayMediaRuntimeString(pdfRuntime, "error")
+            let reason = if (configuredReason.isEmpty()) {
+                "PDF runtime is not configured. Configure agents.defaults.pdfModel or agents.defaults.imageModel/gateway.media.image.models before asking Metis to analyze PDF documents."
+            } else {
+                configuredReason
+            }
+            let out = gatewayMediaRuntimeResult(
+                record,
+                resolvedCapability,
+                "not_configured",
+                outputs,
+                gatewayMediaRuntimeDecision(resolvedCapability, "not_configured", reason),
+                error: reason
+            )
+            out.put("documentExtractStatus", JsonString("not_configured"))
+            out.put("extractor", JsonString("pdf_runtime"))
             return out
         }
         let out = gatewayMediaRuntimeResult(

@@ -12,7 +12,8 @@ import metis.program_support.{
     programSupportRenderModelsHelp,
     programSupportRenderModelsProviderIndex,
     programSupportRenderModelsProviderModels,
-    programSupportRenderModelsStatus
+    programSupportRenderModelsStatus,
+    programSupportRenderPdfStatus
 }
 
 import std.collection.{ArrayList, filter, map, collectArray}
@@ -162,6 +163,10 @@ protected func handleModelsCommandLine(app: CliApp, raw: String): Unit {
         PrintUtils.printLine(renderModelsStatus())
         return
     }
+    if (sub == "pdf-status") {
+        PrintUtils.printLine(renderPdfStatus())
+        return
+    }
     if (sub == "set-image") {
         if (tokens.size < 3) {
             PrintUtils.printLine("Usage: /models set-image <provider/model>")
@@ -230,6 +235,10 @@ protected func renderModelsHelp(): String {
 
 protected func renderModelsStatus(): String {
     programSupportRenderModelsStatus()
+}
+
+protected func renderPdfStatus(): String {
+    programSupportRenderPdfStatus()
 }
 
 protected func renderModelsProviderIndex(page: Int64): String {

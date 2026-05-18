@@ -34,6 +34,7 @@ IMPORTANT: For weather / forecast questions, use the **weather** tool (wttr.in v
         WeatherToolset(),
         ShellTool(),
         BasicMediaToolset(),
+        PdfToolset(),
         MemoryToolset(),
         GatewaySessionsToolset(),
         PlanToolset(),

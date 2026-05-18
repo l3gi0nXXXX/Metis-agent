@@ -215,6 +215,49 @@ protected class CliConfig {
     }
 
     /**
+     * Dedicated PDF-understanding model. This is resolved before image/default
+     * model fallbacks, but does not imply that PDF loading or extraction is enabled.
+     */
+    public static var _pdfModel: Option<String> = None
+    public static mut prop pdfModel: String {
+        get() {
+            return _pdfModel.getOrThrow()
+        }
+        set(v) {
+            _pdfModel = Some(v)
+        }
+    }
+
+    public static func pdfModelOrEmpty(): String {
+        match (_pdfModel) {
+            case Some(v) => v
+            case None => ""
+        }
+    }
+
+    public static func clearPdfModelForTest(): Unit {
+        _pdfModel = None
+    }
+
+    private static var _pdfFallbackModels: Array<String> = []
+
+    public static mut prop pdfFallbackModels: Array<String> {
+        get() {
+            if (_pdfFallbackModels.isEmpty()) {
+                _pdfFallbackModels = CliSettingManager.setting.pdfFallbackModels
+            }
+            return _pdfFallbackModels
+        }
+
+        set(v) {
+            _pdfFallbackModels = v
+        }
+    }
+
+    public static var pdfMaxBytesMb: Float64 = 10.0
+    public static var pdfMaxPages: Int64 = 20
+
+    /**
      * Fast model for auxiliary tasks in hybrid mode
      */
     public static var _fastModel: Option<String> = None

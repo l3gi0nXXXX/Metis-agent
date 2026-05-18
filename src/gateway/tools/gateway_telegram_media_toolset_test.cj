@@ -1,6 +1,6 @@
 package metis.gateway.tools
 
-import metis.core.{GatewayMediaVideoHttpResult, GatewayToolRuntimeContext, gatewayWithToolRuntimeContext, setGatewayMediaVideoHttpRunnerForTest}
+import metis.core.{GatewayMediaVideoHttpResult, GatewayToolRuntimeContext, gatewayWithToolRuntimeContext, setGatewayMediaPdfRuntimeForTest, setGatewayMediaVideoHttpRunnerForTest}
 import metis.core.config.{CliConfig, CliSettingManager, GatewayUserSettings, MetisConfigManager}
 import magic.core.message.Message
 import magic.core.model.{AsyncChatResponse, ChatModel, ChatRequest, ChatResponse}
@@ -932,6 +932,105 @@ public class GatewayTelegramMediaToolsetTest {
             @Expect(json.get("content").getOrThrow().asString().getValue(), "pdf extracted summary")
         } finally {
             try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func telegramDocumentExtractReadsPdfRuntimeResult(): Unit {
+        let root = Path("/tmp/metis-telegram-document-pdf-runtime-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
+        Directory.create(root, recursive: true)
+        let source = root.join("report.pdf")
+        File.writeTo(source, "%PDF-1.7\nfake".toArray())
+        setGatewayMediaPdfRuntimeForTest(Some({ _path: String, mime: String, fileName: String, _prompt: String, _maxBytes: Int64 =>
+            @Expect(mime, "application/pdf")
+            @Expect(fileName, "report.pdf")
+            let out = JsonObject()
+            out.put("status", JsonString("ok"))
+            out.put("text", JsonString("telegram pdf summary"))
+            out.put("provider", JsonString("fake"))
+            out.put("model", JsonString("fake:pdf-runtime"))
+            out
+        }))
+        try {
+            let toolset = GatewayTelegramMediaToolset()
+            let out = gatewayWithToolRuntimeContext(
+                GatewayToolRuntimeContext(
+                    "telegram",
+                    channelName: "telegram",
+                    sessionKey: "telegram:chat:1",
+                    mediaContext: this.mediaContext(source.toString(), mediaKind: "document", mimeType: "application/pdf", fileName: "report.pdf")
+                ),
+                { => toolset.debugTelegramDocumentExtractForTest(None<String>, None<Int64>, Some(4096)) }
+            )
+            let json = JsonValue.fromStr(out).asObject()
+            @Expect(json.get("status").getOrThrow().asString().getValue(), "ok")
+            @Expect(json.get("documentExtractStatus").getOrThrow().asString().getValue(), "ok")
+            @Expect(json.get("readable").getOrThrow().asBool().getValue(), true)
+            @Expect(json.get("content").getOrThrow().asString().getValue(), "telegram pdf summary")
+            @Expect(out.contains("gateway_pdf_runtime"), true)
+        } finally {
+            setGatewayMediaPdfRuntimeForTest(None<(String, String, String, String, Int64) -> JsonObject>)
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func telegramDocumentExtractReportsPdfRuntimeNotConfigured(): Unit {
+        this.withTelegramMediaToolsetConfigHome {
+            let root = Path("/tmp/metis-telegram-document-pdf-not-configured-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
+            Directory.create(root, recursive: true)
+            let source = root.join("report.pdf")
+            File.writeTo(source, "%PDF-1.7\nfake".toArray())
+            let oldModel = CliConfig.modelOrEmpty()
+            let oldFallbacks = CliConfig.fallbackModels
+            let oldImageModel = CliConfig.imageModelOrEmpty()
+            let oldImageFallbacks = CliConfig.imageFallbackModels
+            let oldPdfModel = CliConfig.pdfModelOrEmpty()
+            let oldPdfFallbacks = CliConfig.pdfFallbackModels
+            try {
+                CliConfig.clearPrimaryModelForTest()
+                CliConfig.fallbackModels = []
+                CliConfig.clearImageModelForTest()
+                CliConfig.imageFallbackModels = []
+                CliConfig.clearPdfModelForTest()
+                CliConfig.pdfFallbackModels = []
+
+                let toolset = GatewayTelegramMediaToolset()
+                let out = gatewayWithToolRuntimeContext(
+                    GatewayToolRuntimeContext(
+                        "telegram",
+                        channelName: "telegram",
+                        sessionKey: "telegram:chat:1",
+                        mediaContext: this.mediaContext(source.toString(), mediaKind: "document", mimeType: "application/pdf", fileName: "report.pdf")
+                    ),
+                    { => toolset.debugTelegramDocumentExtractForTest(None<String>, None<Int64>, Some(4096)) }
+                )
+                let json = JsonValue.fromStr(out).asObject()
+                @Expect(json.get("status").getOrThrow().asString().getValue(), "not_configured")
+                @Expect(json.get("documentExtractStatus").getOrThrow().asString().getValue(), "not_configured")
+                @Expect(json.get("readable").getOrThrow().asBool().getValue(), false)
+                @Expect(json.get("reason").getOrThrow().asString().getValue().contains("agents.defaults.pdfModel"), true)
+            } finally {
+                if (oldModel.isEmpty()) {
+                    CliConfig.clearPrimaryModelForTest()
+                } else {
+                    CliConfig.model = oldModel
+                }
+                CliConfig.fallbackModels = oldFallbacks
+                if (oldImageModel.isEmpty()) {
+                    CliConfig.clearImageModelForTest()
+                } else {
+                    CliConfig.imageModel = oldImageModel
+                }
+                CliConfig.imageFallbackModels = oldImageFallbacks
+                if (oldPdfModel.isEmpty()) {
+                    CliConfig.clearPdfModelForTest()
+                } else {
+                    CliConfig.pdfModel = oldPdfModel
+                }
+                CliConfig.pdfFallbackModels = oldPdfFallbacks
+                try { remove(root, recursive: true) } catch (_e: Exception) { () }
+            }
         }
     }
 

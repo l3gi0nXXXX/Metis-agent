@@ -135,6 +135,14 @@ protected class CliSetting {
     protected var imageFallbackModels: Array<String> = []
 
     /**
+     * Dedicated PDF-understanding model and fallback models.
+     */
+    protected var pdfModel: String = ""
+    protected var pdfFallbackModels: Array<String> = []
+    protected var pdfMaxBytesMb: Float64 = 10.0
+    protected var pdfMaxPages: Int64 = 20
+
+    /**
      * Temperature agents will use
      */
     protected var temperature: Float64 = 1.0
@@ -309,6 +317,31 @@ protected class CliSettingManager {
         out.toArray()
     }
 
+    private static func jsonNumberAsFloat(value: JsonValue): Option<Float64> {
+        try {
+            return Some(Float64.parse(value.toJsonString()))
+        } catch (_: Exception) {
+            ()
+        }
+        try {
+            return Some(Float64.parse(value.asString().getValue().trimAscii()))
+        } catch (_: Exception) {
+            None<Float64>
+        }
+    }
+
+    private static func jsonNumberAsInt(value: JsonValue): Option<Int64> {
+        try {
+            return Some(value.asInt().getValue())
+        } catch (_: Exception) {
+            ()
+        }
+        match (jsonNumberAsFloat(value)) {
+            case Some(v) => Some(Int64(v))
+            case None => None<Int64>
+        }
+    }
+
     private static func normalizeGatewayTelegramCompat(gateway: JsonObject): JsonObject {
         let normalized = cloneJsonObjectShallow(gateway)
         match (rootGetObject(gateway, "telegram")) {
@@ -461,6 +494,51 @@ protected class CliSettingManager {
                                 match (modelObj.get("fallbacks")) {
                                     case Some(fallbacksValue) =>
                                         merged.imageFallbackModels = normalizedModelArray(fallbacksValue)
+                                    case None => ()
+                                }
+                            case None => ()
+                        }
+                        match (rootGetObject(defaults, "pdfModel")) {
+                            case Some(modelObj) =>
+                                match (modelObj.get("primary")) {
+                                    case Some(primaryValue) =>
+                                        try {
+                                            let primary = MetisConfigManager.normalizeModelRef(
+                                                primaryValue.asString().getValue()
+                                            ).trimAscii()
+                                            if (!primary.isEmpty()) {
+                                                merged.pdfModel = primary
+                                            }
+                                        } catch (_: Exception) {
+                                            ()
+                                        }
+                                    case None => ()
+                                }
+                                match (modelObj.get("fallbacks")) {
+                                    case Some(fallbacksValue) =>
+                                        merged.pdfFallbackModels = normalizedModelArray(fallbacksValue)
+                                    case None => ()
+                                }
+                            case None => ()
+                        }
+                        match (defaults.get("pdfMaxBytesMb")) {
+                            case Some(value) =>
+                                match (jsonNumberAsFloat(value)) {
+                                    case Some(v) =>
+                                        if (v > 0.0) {
+                                            merged.pdfMaxBytesMb = v
+                                        }
+                                    case None => ()
+                                }
+                            case None => ()
+                        }
+                        match (defaults.get("pdfMaxPages")) {
+                            case Some(value) =>
+                                match (jsonNumberAsInt(value)) {
+                                    case Some(v) =>
+                                        if (v > 0) {
+                                            merged.pdfMaxPages = v
+                                        }
                                     case None => ()
                                 }
                             case None => ()
@@ -707,11 +785,15 @@ protected class CliSettingManager {
         let rawRoot = MetisConfigManager.rawConfig()
         CliConfig.model = MetisConfigManager.normalizeModelRef(s.model)
         CliConfig.imageModel = MetisConfigManager.normalizeModelRef(s.imageModel)
+        CliConfig.pdfModel = MetisConfigManager.normalizeModelRef(s.pdfModel)
         CliConfig.temperature = s.temperature
         CliConfig.defaultModelInputLimit = s.defaultModelInputLimit
         CliConfig.defaultModelOutputLimit = s.defaultModelOutputLimit
         CliConfig.fallbackModels = s.fallbackModels
         CliConfig.imageFallbackModels = s.imageFallbackModels
+        CliConfig.pdfFallbackModels = s.pdfFallbackModels
+        CliConfig.pdfMaxBytesMb = if (s.pdfMaxBytesMb > 0.0) { s.pdfMaxBytesMb } else { 10.0 }
+        CliConfig.pdfMaxPages = if (s.pdfMaxPages > 0) { s.pdfMaxPages } else { 20 }
         CliConfig.collectData = s.collectData
         CliConfig.language = s.language
         CliConfig.memoryProvider = CliSettingManager.resolvedMemoryProvider(s, root: rawRoot)

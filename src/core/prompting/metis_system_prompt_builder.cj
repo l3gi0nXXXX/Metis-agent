@@ -772,6 +772,7 @@ public class MetisSystemPromptBuilder {
         let hasUpdatePlanTool = containsTool(toolNames, "update_plan")
         let hasSessionsSpawn = containsTool(toolNames, "sessions_spawn")
         let hasSubagentsTool = containsTool(toolNames, "subagents")
+        let hasPdfTool = containsTool(toolNames, "pdf")
         let acpHarnessSpawnAllowed = hasSessionsSpawn && params.acpEnabled && !params.sandboxInfo.enabled
         let readToolName = if (containsTool(toolNames, "read")) { "read" } else { "fileRead" }
         let execToolName = if (containsTool(toolNames, "exec")) { "exec" } else if (containsTool(toolNames, "shellExecute")) { "shellExecute" } else { "" }
@@ -816,6 +817,10 @@ public class MetisSystemPromptBuilder {
 
         if (!toolNames.isEmpty()) {
             appendLines(lines, buildToolSummaryLines(toolNames))
+        }
+
+        if (hasPdfTool) {
+            lines.add("For PDF content analysis, when the user asks to read, summarize, compare, extract, or analyze PDFs, prefer the `pdf` tool. Do not treat `basicMediaInspect` approximate page counts as PDF content reading; use shell/Python parsing only if `pdf` is unavailable or the user explicitly asks.")
         }
 
         if (hasExecTool && hasCronTool) {
@@ -1140,6 +1145,7 @@ public class MetisSystemPromptBuilder {
             "fileCreate",
             "weather",
             "basicMediaInspect",
+            "pdf",
             "sessionsList",
             "sessionsHistory",
             "sessionsSend",

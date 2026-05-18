@@ -1367,6 +1367,10 @@ public class GatewayTelegramMediaToolset {
             case Some(v) => out.put("decision", v)
             case None => ()
         }
+        match (understanding.get("documentExtractStatus")) {
+            case Some(v) => out.put("documentExtractStatus", v)
+            case None => ()
+        }
         out.put("status", understanding.get("status") ?? JsonString("metadata_only"))
         out.put("ok", understanding.get("ok") ?? JsonBool(false))
         if (!preview.isEmpty()) {
@@ -1374,7 +1378,8 @@ public class GatewayTelegramMediaToolset {
             out.put("readable", JsonBool(true))
         } else {
             out.put("readable", JsonBool(false))
-            out.put("reason", JsonString("document extractor is not configured or media is not text-like"))
+            let reason = telegramMediaToolString(understanding, "error")
+            out.put("reason", JsonString(if (reason.isEmpty()) { "document extractor is not configured or media is not text-like" } else { reason }))
         }
         out.toJsonString()
     }
@@ -2196,7 +2201,7 @@ public class GatewayTelegramMediaToolset {
     }
 
     @tool[
-        description: "Extract text/preview from a Telegram document media resource from the current turn or recent same-peer Telegram media. Text-like files are read directly; extracted companion files are used when available; unsupported documents return metadata_only.",
+        description: "Extract text/preview from a Telegram document media resource from the current turn or recent same-peer Telegram media. Text-like files are read directly; PDF documents reuse the shared gateway PDF runtime when configured; extracted companion files are used when available; unsupported documents return metadata_only.",
         parameters: {
             mediaId: "Optional mediaId returned by telegram_media_list, or a Telegram fileId/fileUniqueId.",
             index: "Optional zero-based media index.",

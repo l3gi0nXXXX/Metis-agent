@@ -128,6 +128,37 @@ public class MetisSystemPromptBuilderTest {
     }
 
     @TestCase
+    public func pdfGuidanceAppearsForPdfToolWithoutProviderInternals(): Unit {
+        let params = MetisSystemPromptParams()
+        params.promptMode = PromptMode.FullMode
+        params.toolNames = ["pdf", "basicMediaInspect", "shellExecute"]
+        let generalPrompt = MetisSystemPromptBuilder.build(params, cangjieMode: false)
+        let cangjiePrompt = MetisSystemPromptBuilder.build(params, cangjieMode: true)
+
+        for (prompt in [generalPrompt, cangjiePrompt]) {
+            @Expect(prompt.contains("For PDF content analysis"), true)
+            @Expect(prompt.contains("prefer the `pdf` tool"), true)
+            @Expect(prompt.contains("basicMediaInspect` approximate page counts"), true)
+            @Expect(prompt.contains("only if `pdf` is unavailable"), true)
+            @Expect(prompt.contains("pdfjs-dist"), false)
+            @Expect(prompt.contains("@napi-rs/canvas"), false)
+            @Expect(prompt.contains("anthropic-beta"), false)
+            @Expect(prompt.contains("Authorization"), false)
+        }
+    }
+
+    @TestCase
+    public func pdfGuidanceIsOmittedWhenPdfToolIsAbsent(): Unit {
+        let params = MetisSystemPromptParams()
+        params.promptMode = PromptMode.FullMode
+        params.toolNames = ["basicMediaInspect", "shellExecute"]
+        let prompt = MetisSystemPromptBuilder.build(params, cangjieMode: false)
+
+        @Expect(prompt.contains("For PDF content analysis"), false)
+        @Expect(prompt.contains("prefer the `pdf` tool"), false)
+    }
+
+    @TestCase
     public func selfUpdateActionsDescribeRuntimeEffects(): Unit {
         let params = MetisSystemPromptParams()
         params.promptMode = PromptMode.FullMode
