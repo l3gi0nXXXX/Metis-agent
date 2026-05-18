@@ -6,7 +6,12 @@ import readline from "node:readline";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 
-let protocolRedactionValues = [];
+import {
+  configureKnownSecrets,
+  installConsoleStderrPatch,
+  writeDiagnostic,
+  writeProtocol,
+} from "./lib/metis-sidecar-logger.mjs";
 
 export function parseArgs(argv) {
   const out = { _: [] };
@@ -30,50 +35,6 @@ export function parseArgs(argv) {
 
 export function readTrimmed(value) {
   return typeof value === "string" ? value.trim() : "";
-}
-
-function configureProtocolRedaction(values) {
-  const seen = new Set();
-  for (const value of values) {
-    const trimmed = readTrimmed(value);
-    if (trimmed) {
-      seen.add(trimmed);
-    }
-  }
-  protocolRedactionValues = [...seen].sort((a, b) => b.length - a.length);
-}
-
-function redactKnownSecrets(text) {
-  let out = String(text);
-  for (const secret of protocolRedactionValues) {
-    out = out.split(secret).join("[redacted]");
-  }
-  return out;
-}
-
-function redactProtocolValue(value) {
-  if (typeof value === "string") {
-    return redactKnownSecrets(value);
-  }
-  if (Array.isArray(value)) {
-    return value.map((item) => redactProtocolValue(item));
-  }
-  if (value != null && typeof value === "object") {
-    const out = {};
-    for (const [key, item] of Object.entries(value)) {
-      out[key] = redactProtocolValue(item);
-    }
-    return out;
-  }
-  return value;
-}
-
-function writeProtocol(frame) {
-  process.stdout.write(`${JSON.stringify(redactProtocolValue(frame))}\n`);
-}
-
-function writeStderr(text) {
-  process.stderr.write(`[feishu-monitor] ${redactKnownSecrets(text)}\n`);
 }
 
 export function resolveDomain(Lark, raw) {
@@ -102,20 +63,6 @@ export function buildEventFrame(eventType, data, accountId) {
   };
 }
 
-const originalConsole = {
-  log: console.log.bind(console),
-  info: console.info.bind(console),
-  warn: console.warn.bind(console),
-  error: console.error.bind(console),
-};
-
-function installConsoleRedirect() {
-  console.log = (...items) => writeStderr(items.map(String).join(" "));
-  console.info = (...items) => writeStderr(items.map(String).join(" "));
-  console.warn = (...items) => writeStderr(items.map(String).join(" "));
-  console.error = (...items) => writeStderr(items.map(String).join(" "));
-}
-
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   const sdkRoot = path.resolve(
@@ -127,8 +74,8 @@ async function main() {
   const verificationToken = readTrimmed(args["verification-token"]);
   const encryptKey = readTrimmed(args["encrypt-key"]);
   const accountId = readTrimmed(args["account-id"]);
-  configureProtocolRedaction([appSecret, verificationToken, encryptKey, args["token"]]);
-  installConsoleRedirect();
+  configureKnownSecrets([appSecret, verificationToken, encryptKey, args["token"]]);
+  installConsoleStderrPatch({ prefix: "feishu-monitor" });
   if (!appId || !appSecret) {
     throw new Error("missing --app-id / --app-secret");
   }
@@ -206,9 +153,7 @@ async function main() {
     },
   });
 
-  originalConsole.error(
-    `[feishu-monitor] starting sdkRoot=${sdkRoot} accountId=${accountId} pid=${process.pid}`,
-  );
+  writeDiagnostic("info", "starting", { sdkRoot, accountId, pid: process.pid }, { prefix: "feishu-monitor" });
   wsClient.start({ eventDispatcher });
   writeProtocol({ type: "ready" });
   await new Promise(() => {});

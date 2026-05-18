@@ -4,6 +4,16 @@ import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
+import {
+  addKnownSecrets,
+  installConsoleStderrPatch,
+  writeDiagnostic,
+  writeProtocol,
+} from "./lib/metis-sidecar-logger.mjs";
+
+const SENSITIVE_KEY =
+  /(?:secret|token|password|passwd|authorization|api[_-]?key|credential|private[_-]?key|client[_-]?secret|refresh[_-]?token|access[_-]?token)/i;
+
 function parseArgs(argv) {
   const out = { _: [] };
   for (let i = 0; i < argv.length; i += 1) {
@@ -34,6 +44,36 @@ function readJson(raw, fallback = {}) {
 
 function isObject(value) {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function collectSecretStrings(...values) {
+  const out = [];
+  function collect(value, key = "") {
+    if (value == null) {
+      return;
+    }
+    if (typeof value === "string") {
+      if ((SENSITIVE_KEY.test(key) || key === "") && value.trim()) {
+        out.push(value);
+      }
+      return;
+    }
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        collect(item, key);
+      }
+      return;
+    }
+    if (isObject(value)) {
+      for (const [childKey, childValue] of Object.entries(value)) {
+        collect(childValue, childKey);
+      }
+    }
+  }
+  for (const value of values) {
+    collect(value);
+  }
+  return out;
 }
 
 function resolvePluginRoots(config) {
@@ -201,10 +241,18 @@ function buildApi(pluginId, pluginRoot, registry) {
       return unsupportedCapability(capability, { pluginId, ...details });
     },
     logger: {
-      debug() {},
-      info() {},
-      warn() {},
-      error() {},
+      debug(message, meta = {}) {
+        writeDiagnostic("debug", String(message ?? ""), { pluginId, meta }, { prefix: "openclaw-plugin-sidecar" });
+      },
+      info(message, meta = {}) {
+        writeDiagnostic("info", String(message ?? ""), { pluginId, meta }, { prefix: "openclaw-plugin-sidecar" });
+      },
+      warn(message, meta = {}) {
+        writeDiagnostic("warn", String(message ?? ""), { pluginId, meta }, { prefix: "openclaw-plugin-sidecar" });
+      },
+      error(message, meta = {}) {
+        writeDiagnostic("error", String(message ?? ""), { pluginId, meta }, { prefix: "openclaw-plugin-sidecar" });
+      },
     },
     runtime: {
       kind: "metis-openclaw-plugin-compat-sidecar",
@@ -719,59 +767,55 @@ async function runSidecarHook(hook, payload, event, ctx) {
 }
 
 async function main() {
+  installConsoleStderrPatch({ prefix: "openclaw-plugin-sidecar" });
   const args = parseArgs(process.argv.slice(2));
   const method = String(args._[0] ?? "").trim();
   const config = readJson(String(args["config-json"] ?? ""), {});
   const request = readJson(String(args["request-json"] ?? ""), {});
   const payload = isObject(request.payload) ? request.payload : {};
+  addKnownSecrets(collectSecretStrings(config, request));
   const registry = await buildRegistry(config);
 
   if (method === "lifecycle.start" || method === "lifecycle.stop" || method === "lifecycle.health") {
-    process.stdout.write(
-      JSON.stringify({
-        ok: true,
-        status: "ok",
-        method,
-        runtime: "node-sidecar",
-        pluginCount: registry.plugins.length,
-        diagnostics: registry.diagnostics,
-      }),
-    );
+    writeProtocol({
+      ok: true,
+      status: "ok",
+      method,
+      runtime: "node-sidecar",
+      pluginCount: registry.plugins.length,
+      diagnostics: registry.diagnostics,
+    });
     return;
   }
 
   if (method === "handlers.list") {
-    process.stdout.write(
-      JSON.stringify({
-        ok: true,
-        handlers: registry.interactive.map((h) => ({
-          pluginId: h.pluginId,
-          channel: h.channel,
-          namespace: h.namespace,
-        })),
-        approvals: registry.approvals.map((h) => ({
-          pluginId: h.pluginId,
-          channel: h.channel,
-          namespace: h.namespace,
-        })),
-        diagnostics: registry.diagnostics,
-      }),
-    );
+    writeProtocol({
+      ok: true,
+      handlers: registry.interactive.map((h) => ({
+        pluginId: h.pluginId,
+        channel: h.channel,
+        namespace: h.namespace,
+      })),
+      approvals: registry.approvals.map((h) => ({
+        pluginId: h.pluginId,
+        channel: h.channel,
+        namespace: h.namespace,
+      })),
+      diagnostics: registry.diagnostics,
+    });
     return;
   }
 
   if (method === "commands.list") {
-    process.stdout.write(
-      JSON.stringify({
-        ok: true,
-        commands: registry.commands.map((c) => ({
-          pluginId: c.pluginId,
-          command: c.command,
-          description: c.description,
-        })),
-        diagnostics: registry.diagnostics,
-      }),
-    );
+    writeProtocol({
+      ok: true,
+      commands: registry.commands.map((c) => ({
+        pluginId: c.pluginId,
+        command: c.command,
+        description: c.description,
+      })),
+      diagnostics: registry.diagnostics,
+    });
     return;
   }
 
@@ -780,23 +824,21 @@ async function main() {
     const telegramHandlers = registry.interactive.filter((h) => h.channel === "telegram");
     const handler = telegramHandlers.find((h) => h.namespace === namespace) ?? (telegramHandlers.length === 1 ? telegramHandlers[0] : null);
     if (!handler) {
-      process.stdout.write(
-        JSON.stringify({
-          ok: true,
-          matched: false,
-          reason: "handler_not_found",
-          namespace,
-          handlers: telegramHandlers.map((h) => ({ pluginId: h.pluginId, namespace: h.namespace })),
-          diagnostics: registry.diagnostics,
-        }),
-      );
+      writeProtocol({
+        ok: true,
+        matched: false,
+        reason: "handler_not_found",
+        namespace,
+        handlers: telegramHandlers.map((h) => ({ pluginId: h.pluginId, namespace: h.namespace })),
+        diagnostics: registry.diagnostics,
+      });
       return;
     }
     const intents = [];
     const bindingIntents = [];
     const ctx = buildInteractiveContext(payload, namespace, intents, bindingIntents);
     const result = normalizeHandlerResult(await handler.handler(ctx), intents, bindingIntents);
-    process.stdout.write(JSON.stringify({ ...result, pluginId: handler.pluginId, namespace, diagnostics: registry.diagnostics }));
+    writeProtocol({ ...result, pluginId: handler.pluginId, namespace, diagnostics: registry.diagnostics });
     return;
   }
 
@@ -804,13 +846,13 @@ async function main() {
     const command = normalizeCommand(payload.command);
     const handler = registry.commands.find((c) => c.command === command);
     if (!handler) {
-      process.stdout.write(JSON.stringify({ ok: true, matched: false, reason: "command_not_found", diagnostics: registry.diagnostics }));
+      writeProtocol({ ok: true, matched: false, reason: "command_not_found", diagnostics: registry.diagnostics });
       return;
     }
     const intents = [];
     const bindingIntents = [];
     const result = normalizeHandlerResult(await handler.handler(buildCommandContext(payload, intents, bindingIntents)), intents, bindingIntents);
-    process.stdout.write(JSON.stringify({ ...result, pluginId: handler.pluginId, command, diagnostics: registry.diagnostics }));
+    writeProtocol({ ...result, pluginId: handler.pluginId, command, diagnostics: registry.diagnostics });
     return;
   }
 
@@ -819,22 +861,20 @@ async function main() {
     const telegramHandlers = registry.approvals.filter((h) => h.channel === "telegram");
     const handler = telegramHandlers.find((h) => h.namespace === namespace) ?? (telegramHandlers.length === 1 ? telegramHandlers[0] : null);
     if (!handler) {
-      process.stdout.write(
-        JSON.stringify({
-          ok: true,
-          matched: false,
-          reason: "approval_handler_not_found",
-          namespace,
-          handlers: telegramHandlers.map((h) => ({ pluginId: h.pluginId, namespace: h.namespace })),
-          diagnostics: registry.diagnostics,
-        }),
-      );
+      writeProtocol({
+        ok: true,
+        matched: false,
+        reason: "approval_handler_not_found",
+        namespace,
+        handlers: telegramHandlers.map((h) => ({ pluginId: h.pluginId, namespace: h.namespace })),
+        diagnostics: registry.diagnostics,
+      });
       return;
     }
     const intents = [];
     const bindingIntents = [];
     const result = normalizeHandlerResult(await handler.handler(buildApprovalContext(payload, namespace, intents, bindingIntents)), intents, bindingIntents);
-    process.stdout.write(JSON.stringify({ ...result, pluginId: handler.pluginId, namespace, diagnostics: registry.diagnostics }));
+    writeProtocol({ ...result, pluginId: handler.pluginId, namespace, diagnostics: registry.diagnostics });
     return;
   }
 
@@ -848,15 +888,13 @@ async function main() {
       });
       if (isObject(result)) {
         if (result.cancelled === true || result.cancel === true) {
-          process.stdout.write(
-            JSON.stringify({
-              ok: true,
-              status: "cancelled",
-              cancelled: true,
-              reason: String(result.reason ?? "cancelled by plugin hook"),
-              pluginId: hook.pluginId,
-            }),
-          );
+          writeProtocol({
+            ok: true,
+            status: "cancelled",
+            cancelled: true,
+            reason: String(result.reason ?? "cancelled by plugin hook"),
+            pluginId: hook.pluginId,
+          });
           return;
         }
         if (typeof result.text === "string") {
@@ -868,7 +906,7 @@ async function main() {
         }
       }
     }
-    process.stdout.write(JSON.stringify({ ok: true, status: "ok", cancelled: false, text: current.text, diagnostics: [...registry.diagnostics, ...hookErrors] }));
+    writeProtocol({ ok: true, status: "ok", cancelled: false, text: current.text, diagnostics: [...registry.diagnostics, ...hookErrors] });
     return;
   }
 
@@ -881,7 +919,7 @@ async function main() {
         hookErrors.push({ pluginId: hook.pluginId, kind: hook.kind, reason: String(error) });
       }
     }
-    process.stdout.write(JSON.stringify({ ok: true, status: "ok", diagnostics: [...registry.diagnostics, ...hookErrors] }));
+    writeProtocol({ ok: true, status: "ok", diagnostics: [...registry.diagnostics, ...hookErrors] });
     return;
   }
 
@@ -894,11 +932,11 @@ async function main() {
         hookErrors.push({ pluginId: hook.pluginId, kind: hook.kind, reason: String(error) });
       }
     }
-    process.stdout.write(JSON.stringify({ ok: true, status: "ok", diagnostics: [...registry.diagnostics, ...hookErrors] }));
+    writeProtocol({ ok: true, status: "ok", diagnostics: [...registry.diagnostics, ...hookErrors] });
     return;
   }
 
-  process.stdout.write(JSON.stringify(unsupportedCapability(method, { reason: `unknown sidecar method: ${method}` })));
+  writeProtocol(unsupportedCapability(method, { reason: `unknown sidecar method: ${method}` }));
 }
 
 await main();

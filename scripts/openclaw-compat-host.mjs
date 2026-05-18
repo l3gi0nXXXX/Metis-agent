@@ -8,6 +8,12 @@ import path from "node:path";
 import readline from "node:readline";
 import { pathToFileURL } from "node:url";
 
+import {
+  addKnownSecrets,
+  installConsoleStderrPatch,
+  writeDiagnostic,
+  writeProtocol,
+} from "./lib/metis-sidecar-logger.mjs";
 import { createRuntimeFacets, createRuntimeState } from "./openclaw-compat-runtime-facets.mjs";
 import { OpenClawSecurityEnforcer, derivePermissionRequirements } from "./openclaw-compat-security-policy.mjs";
 
@@ -191,6 +197,7 @@ function resetStateForLoad(state, params) {
   state.configSnapshot = isObject(params.config) ? params.config : {};
   state.secrets = isObject(params.secrets) ? params.secrets : {};
   state.redactor = createRedactor(state.configSnapshot, state.secrets);
+  addKnownSecrets(collectSecretStrings(state.configSnapshot, state.secrets));
   state.runtimeVersion = String(params.runtime?.version ?? params.version ?? HOST_VERSION);
   state.security = securityOptionsFromParams(params);
   state.runtimeState = createRuntimeState({
@@ -203,6 +210,36 @@ function resetStateForLoad(state, params) {
     diagnostics: state.diagnostics,
     redactor: state.redactor,
   });
+}
+
+function collectSecretStrings(...values) {
+  const out = [];
+  function collect(value, key = "") {
+    if (value == null) {
+      return;
+    }
+    if (typeof value === "string") {
+      if ((SENSITIVE_KEY.test(key) || key === "") && value.trim()) {
+        out.push(value);
+      }
+      return;
+    }
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        collect(item, key);
+      }
+      return;
+    }
+    if (isObject(value)) {
+      for (const [childKey, childValue] of Object.entries(value)) {
+        collect(childValue, childKey);
+      }
+    }
+  }
+  for (const value of values) {
+    collect(value);
+  }
+  return out;
 }
 
 function securityOptionsFromParams(params) {
@@ -463,6 +500,7 @@ function buildLogger(state, pluginId) {
   const logger = {};
   for (const level of ["debug", "info", "warn", "error"]) {
     logger[level] = (message, meta = {}) => {
+      writeDiagnostic(level, String(message ?? ""), { pluginId, meta: state.redactor.sanitize(meta) }, { prefix: "openclaw-compat-host" });
       addDiagnostic(state, {
         code: "plugin_log",
         pluginId,
@@ -1248,7 +1286,7 @@ async function runOnce(payload) {
   const out = request.parseError
     ? response(null, null, { code: -32700, message: request.parseError })
     : await handleRequest(state, request);
-  process.stdout.write(`${JSON.stringify(state.redactor.sanitize(out))}\n`);
+  writeProtocol(state.redactor.sanitize(out));
 }
 
 async function runPersistent() {
@@ -1262,7 +1300,7 @@ async function runPersistent() {
     const out = request.parseError
       ? response(null, null, { code: -32700, message: request.parseError })
       : await handleRequest(state, request);
-    process.stdout.write(`${JSON.stringify(state.redactor.sanitize(out))}\n`);
+    writeProtocol(state.redactor.sanitize(out));
     if (!request.parseError && request.method === "runtime.stop") {
       input.close();
       break;
@@ -1271,6 +1309,7 @@ async function runPersistent() {
 }
 
 const args = parseArgs(process.argv.slice(2));
+installConsoleStderrPatch({ prefix: "openclaw-compat-host" });
 if (args.once) {
   await runOnce(args.oncePayload);
 } else {
