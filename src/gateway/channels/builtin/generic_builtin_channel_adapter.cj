@@ -1,11 +1,12 @@
 package metis.gateway.channels.builtin
 
 import metis.gateway.core.ChannelAdapter
+import metis.gateway.logging.{MetisLogEvent, metisCreateSubsystemLogger}
 import metis.gateway.model.*
-import metis.io.PrintUtils
 
 import std.collection.ArrayList
 import std.sync.Mutex
+import stdx.encoding.json.{JsonObject, JsonString}
 
 /**
  * 轻量内置渠道适配器。
@@ -29,6 +30,18 @@ public class GenericBuiltinChannelAdapter <: ChannelAdapter {
         this.configured = configured
     }
 
+    private func logStarted(status: String, message: String): Unit {
+        let meta = JsonObject()
+        meta.put("channel", JsonString(this.channelId))
+        meta.put("status", JsonString(status))
+        meta.put("configured", JsonString(if (this.configured) { "true" } else { "false" }))
+        metisCreateSubsystemLogger("gateway/channel/${this.channelId}").info(
+            MetisLogEvent.channelStarted,
+            message,
+            meta: meta
+        )
+    }
+
     public prop name: String {
         get() { this.channelId }
     }
@@ -39,10 +52,10 @@ public class GenericBuiltinChannelAdapter <: ChannelAdapter {
         }
         this.running = true
         if (!this.configured) {
-            PrintUtils.printLine("${this.label} adapter: started in stub mode (configuration incomplete).")
+            this.logStarted("stub", "${this.label} adapter started in stub mode")
             return
         }
-        PrintUtils.printLine("${this.label} adapter: started.")
+        this.logStarted("started", "${this.label} adapter started")
     }
 
     public func stop(): Unit {

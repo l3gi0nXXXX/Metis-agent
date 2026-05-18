@@ -1,12 +1,11 @@
 package metis.gateway.channels.telegram
 
 import metis.core.{GatewayMediaGroupItem, gatewayMediaTranscribeAudioPathForRuntime, gatewayMediaUnderstandingFirstText, gatewayMediaUnderstandingForRecord, parseGatewayAudioParts, parseGatewayChatAction, parseGatewayDocumentParts, parseGatewayEditButtonsParts, parseGatewayEditMediaParts, parseGatewayEditText, parseGatewayInlineKeyboardParts, parseGatewayMediaGroupItems, parseGatewayPhotoParts, parseGatewayPinAction, parseGatewayReactionRemove, parseGatewayReactionStatus, parseGatewayReactionToken, parseGatewayStickerFileId, parseGatewayTopicCreateText, parseGatewayTopicEditText, parseGatewayVideoNoteFileId, parseGatewayVideoParts, parseGatewayVoiceParts}
-import metis.gateway.core.{ChannelAdapter, gatewayOpenClawPluginSidecarApplyCurrentMessageReceivedHook, gatewayOpenClawPluginSidecarCommandCatalogForMenu, gatewayTelegramClassifySendError, gatewayTelegramNativeCommandMenuRows}
+import metis.gateway.core.{ChannelAdapter, gatewayLogIdentityHash, gatewayOpenClawPluginSidecarApplyCurrentMessageReceivedHook, gatewayOpenClawPluginSidecarCommandCatalogForMenu, gatewayTelegramClassifySendError, gatewayTelegramNativeCommandMenuRows}
+import metis.gateway.logging.{MetisLogEvent, metisCreateSubsystemLogger}
 import metis.gateway.model.*
-import metis.io.PrintUtils
 import metis.core.config.{CliConfig, CliSettingManager, MetisConfigManager}
 
-import magic.log.LogUtils
 import magic.jsonable.*
 
 import std.collection.{ArrayList, HashMap, HashSet}
@@ -276,28 +275,119 @@ public class TelegramAdapter <: ChannelAdapter {
         get() { "telegram" }
     }
 
+    private func channelLogMeta(
+        phase: String,
+        status: String,
+        errorKind!: String = "none",
+        error!: String = "",
+        extra!: JsonObject = JsonObject()
+    ): JsonObject {
+        let meta = JsonObject()
+        meta.put("channel", JsonString("telegram"))
+        meta.put("accountId", JsonString(this.effectiveAccountId()))
+        meta.put("phase", JsonString(phase.trimAscii()))
+        meta.put("status", JsonString(status.trimAscii()))
+        meta.put("errorKind", JsonString(if (errorKind.trimAscii().isEmpty()) { "none" } else { errorKind.trimAscii() }))
+        if (!error.trimAscii().isEmpty()) {
+            meta.put("error", JsonString(error.trimAscii()))
+        }
+        for (key in extra.getFields().keys()) {
+            match (extra.get(key)) {
+                case Some(value) => meta.put(key, value)
+                case None => ()
+            }
+        }
+        meta
+    }
+
+    private func logChannel(
+        level: String,
+        event: String,
+        phase: String,
+        status: String,
+        message: String,
+        errorKind!: String = "none",
+        error!: String = "",
+        extra!: JsonObject = JsonObject()
+    ): Unit {
+        let meta = this.channelLogMeta(phase, status, errorKind: errorKind, error: error, extra: extra)
+        let logger = metisCreateSubsystemLogger("gateway/channel/telegram")
+        match (level.trimAscii().toAsciiLower()) {
+            case "debug" => logger.debug(event, message, meta: meta)
+            case "warn" => logger.warn(event, message, meta: meta)
+            case "error" => logger.error(event, message, meta: meta)
+            case _ => logger.info(event, message, meta: meta)
+        }
+    }
+
+    private func telegramErrorKind(detail: String): String {
+        let lowered = detail.trimAscii().toAsciiLower()
+        if (lowered.isEmpty()) { return "unknown" }
+        if (lowered.contains("token") || lowered.contains("credential") || lowered.contains("unauthorized")) {
+            return "credential"
+        }
+        if (lowered.contains("not running")) { return "not-running" }
+        if (lowered.contains("disabled") || lowered.contains("scope blocks")) { return "disabled" }
+        if (lowered.contains("validation") || lowered.contains("invalid") || lowered.contains("bad request")) {
+            return "validation"
+        }
+        if (lowered.contains("timeout") || lowered.contains("transport") || lowered.contains("http") || lowered.contains("response")) {
+            return "transport"
+        }
+        if (lowered.contains("parse")) { return "parse" }
+        if (lowered.contains("rate") || lowered.contains("retry_after") || lowered.contains("too many")) { return "rate-limit" }
+        "unknown"
+    }
+
+    private func logSendFailure(message: OutboundMessage, detail: String): Unit {
+        let extra = JsonObject()
+        extra.put("peerHash", JsonString(gatewayLogIdentityHash(message.peerId)))
+        extra.put("textLen", message.text.size.toJsonValue())
+        extra.put("replyToPresent", message.replyToMessageId.isSome().toJsonValue())
+        this.logChannel(
+            "warn",
+            MetisLogEvent.messageSendFailed,
+            "send",
+            "failed",
+            "Telegram send failed",
+            errorKind: this.telegramErrorKind(detail),
+            error: detail,
+            extra: extra
+        )
+    }
+
     public func start(): Unit {
         if (this.running || !this.config.enabled) {
             return
         }
         if (this.effectiveBotToken().isEmpty()) {
             this.lastSendError = "Telegram adapter requires botToken or tokenFile"
-            LogUtils.error("Telegram adapter start failed: ${this.lastSendError}")
+            this.logChannel(
+                "error",
+                MetisLogEvent.channelFailed,
+                "start",
+                "failed",
+                "Telegram adapter start failed",
+                errorKind: "credential",
+                error: this.lastSendError
+            )
             return
         }
         this.running = true
         this.markPollingIdle()
+        let startMeta = JsonObject()
+        startMeta.put("mode", JsonString(if (this.usesWebhookMode()) { "webhook" } else { "polling" }))
         if (this.usesWebhookMode()) {
             this.registerWebhookWithTelegram()
             this.startWebhookServer()
             this.startNativeCommandSyncIfNeeded()
-            PrintUtils.printLine("Telegram adapter started in webhook mode")
+            this.logChannel("info", MetisLogEvent.channelStarted, "start", "started", "Telegram adapter started", extra: startMeta)
             return
         }
         this.ensurePollingWebhookCleared("polling-start")
         this.startPollingLoop()
         this.startNativeCommandSyncIfNeeded()
-        PrintUtils.printLine("Telegram adapter started in polling mode")
+        this.logChannel("info", MetisLogEvent.channelStarted, "start", "started", "Telegram adapter started", extra: startMeta)
     }
 
     public func stop(): Unit {
@@ -722,11 +812,21 @@ public class TelegramAdapter <: ChannelAdapter {
     }
 
     public func sendWithMessageId(message: OutboundMessage): String {
-        this.sendWithMessageIdImpl(message, requireRunning: true)
+        let sentMessageId = this.sendWithMessageIdImpl(message, requireRunning: true)
+        let detail = this.lastSendError.trimAscii()
+        if (sentMessageId.trimAscii().isEmpty() && !detail.isEmpty() && !detail.startsWith("telegram send error class=")) {
+            this.logSendFailure(message, detail)
+        }
+        sentMessageId
     }
 
     public func sendDirectWithMessageIdForGatewayRpc(message: OutboundMessage): String {
-        this.sendWithMessageIdImpl(message, requireRunning: false)
+        let sentMessageId = this.sendWithMessageIdImpl(message, requireRunning: false)
+        let detail = this.lastSendError.trimAscii()
+        if (sentMessageId.trimAscii().isEmpty() && !detail.isEmpty() && !detail.startsWith("telegram send error class=")) {
+            this.logSendFailure(message, detail)
+        }
+        sentMessageId
     }
 
     private func sendWithMessageIdImpl(message: OutboundMessage, requireRunning!: Bool): String {
@@ -1499,7 +1599,15 @@ public class TelegramAdapter <: ChannelAdapter {
             case None =>
                 this.webhookRegistrationStatus = "error"
                 this.webhookRegistrationError = this.lastSendError
-                LogUtils.info("Telegram setWebhook failed: ${this.webhookRegistrationError}")
+                this.logChannel(
+                    "warn",
+                    MetisLogEvent.channelFailed,
+                    "webhook",
+                    "failed",
+                    "Telegram setWebhook failed",
+                    errorKind: this.telegramErrorKind(this.webhookRegistrationError),
+                    error: this.webhookRegistrationError
+                )
                 return false
         }
         if (this.parseTelegramBoolSuccess(raw, missingDetail: "telegram setWebhook returned ok=false")) {
@@ -1509,7 +1617,15 @@ public class TelegramAdapter <: ChannelAdapter {
         }
         this.webhookRegistrationStatus = "error"
         this.webhookRegistrationError = this.lastSendError
-        LogUtils.info("Telegram setWebhook failed: ${this.webhookRegistrationError}")
+        this.logChannel(
+            "warn",
+            MetisLogEvent.channelFailed,
+            "webhook",
+            "failed",
+            "Telegram setWebhook failed",
+            errorKind: this.telegramErrorKind(this.webhookRegistrationError),
+            error: this.webhookRegistrationError
+        )
         false
     }
 
@@ -1564,7 +1680,15 @@ public class TelegramAdapter <: ChannelAdapter {
             case None =>
                 this.webhookCleanupStatus = "error"
                 this.webhookCleanupError = this.lastSendError
-                LogUtils.info("Telegram deleteWebhook failed: ${this.webhookCleanupError}")
+                this.logChannel(
+                    "warn",
+                    MetisLogEvent.channelFailed,
+                    "webhook",
+                    "failed",
+                    "Telegram deleteWebhook failed",
+                    errorKind: this.telegramErrorKind(this.webhookCleanupError),
+                    error: this.webhookCleanupError
+                )
                 return false
         }
         if (this.parseTelegramBoolSuccess(raw, missingDetail: "telegram deleteWebhook returned ok=false")) {
@@ -1575,7 +1699,15 @@ public class TelegramAdapter <: ChannelAdapter {
         }
         this.webhookCleanupStatus = "error"
         this.webhookCleanupError = this.lastSendError
-        LogUtils.info("Telegram deleteWebhook failed: ${this.webhookCleanupError}")
+        this.logChannel(
+            "warn",
+            MetisLogEvent.channelFailed,
+            "webhook",
+            "failed",
+            "Telegram deleteWebhook failed",
+            errorKind: this.telegramErrorKind(this.webhookCleanupError),
+            error: this.webhookCleanupError
+        )
         false
     }
 
@@ -1605,7 +1737,16 @@ public class TelegramAdapter <: ChannelAdapter {
 
     private func markTelegramTransportDirtyForPollingWatchdog(): Unit {
         this.telegramTransportRebuildCount += 1
-        LogUtils.info("Telegram polling watchdog marked transport dirty; future requests will use a fresh native transport")
+        let extra = JsonObject()
+        extra.put("rebuildCount", this.telegramTransportRebuildCount.toJsonValue())
+        this.logChannel(
+            "debug",
+            MetisLogEvent.channelPull,
+            "poll",
+            "transport_rebuild",
+            "Telegram polling watchdog marked transport dirty",
+            extra: extra
+        )
     }
 
     private func markPollingIdle(): Unit {
@@ -1987,13 +2128,29 @@ public class TelegramAdapter <: ChannelAdapter {
             case Some(raw) =>
                 if (raw.trimAscii().isEmpty()) {
                     this.recordPollError("getUpdates returned empty response", outcome: "empty-response")
-                    LogUtils.info("Telegram getUpdates failed: getUpdates returned empty response")
+                    this.logChannel(
+                        "warn",
+                        MetisLogEvent.channelPull,
+                        "poll",
+                        "failed",
+                        "Telegram getUpdates returned empty response",
+                        errorKind: "transport",
+                        error: "getUpdates returned empty response"
+                    )
                 }
                 raw
             case None =>
                 if (!this.pollErrorRecordedForCurrentIteration()) {
                     this.recordPollError("getUpdates returned no response", outcome: "no-response")
-                    LogUtils.info("Telegram getUpdates failed: getUpdates returned no response")
+                    this.logChannel(
+                        "warn",
+                        MetisLogEvent.channelPull,
+                        "poll",
+                        "failed",
+                        "Telegram getUpdates returned no response",
+                        errorKind: "transport",
+                        error: "getUpdates returned no response"
+                    )
                 }
                 ""
         }
@@ -2024,7 +2181,15 @@ public class TelegramAdapter <: ChannelAdapter {
                     this.pollingWebhookCleared = false
                     this.ensurePollingWebhookCleared("conflict-recovery")
                 }
-                LogUtils.info("Telegram getUpdates failed: ${detail}")
+                this.logChannel(
+                    "warn",
+                    MetisLogEvent.channelPull,
+                    "poll",
+                    "failed",
+                    "Telegram getUpdates failed",
+                    errorKind: this.telegramErrorKind(detail),
+                    error: detail
+                )
                 return 0
             }
             match (root.get("result")) {
@@ -2044,7 +2209,16 @@ public class TelegramAdapter <: ChannelAdapter {
                             }
                         }
                         if (accepted > 0) {
-                            LogUtils.info("Telegram getUpdates accepted ${accepted} inbound update(s)")
+                            let extra = JsonObject()
+                            extra.put("acceptedCount", accepted.toJsonValue())
+                            this.logChannel(
+                                "info",
+                                MetisLogEvent.messageInbound,
+                                "ingest",
+                                "accepted",
+                                "Telegram getUpdates accepted inbound updates",
+                                extra: extra
+                            )
                         }
                         this.markPollSuccess(outcome: if (accepted > 0) { "success" } else { "empty-result" })
                         accepted
@@ -2059,7 +2233,15 @@ public class TelegramAdapter <: ChannelAdapter {
         } catch (e: Exception) {
             let detail = "getUpdates parse failed: ${e.message}"
             this.recordPollError(detail, outcome: "parse-error")
-            LogUtils.info("Telegram getUpdates failed: ${detail}")
+            this.logChannel(
+                "warn",
+                MetisLogEvent.channelPull,
+                "poll",
+                "failed",
+                "Telegram getUpdates parse failed",
+                errorKind: "parse",
+                error: detail
+            )
             0
         }
     }
@@ -5229,12 +5411,28 @@ public class TelegramAdapter <: ChannelAdapter {
             case Some(raw) =>
                 if (!this.parseTelegramBoolSuccess(raw, missingDetail: "telegram deleteMyCommands returned ok=false")) {
                     this.setNativeCommandsSyncError(this.lastSendError)
-                    LogUtils.info("Telegram deleteMyCommands failed: ${this.lastSendError}")
+                    this.logChannel(
+                        "warn",
+                        MetisLogEvent.channelFailed,
+                        "native_command",
+                        "failed",
+                        "Telegram deleteMyCommands failed",
+                        errorKind: this.telegramErrorKind(this.lastSendError),
+                        error: this.lastSendError
+                    )
                     return false
                 }
             case None =>
                 this.setNativeCommandsSyncError("empty http response")
-                LogUtils.info("Telegram deleteMyCommands failed: ${this.lastSendError}")
+                this.logChannel(
+                    "warn",
+                    MetisLogEvent.channelFailed,
+                    "native_command",
+                    "failed",
+                    "Telegram deleteMyCommands returned no response",
+                    errorKind: "transport",
+                    error: this.lastSendError
+                )
                 return false
         }
         let responseOpt = this.telegramJsonPost(
@@ -5246,7 +5444,15 @@ public class TelegramAdapter <: ChannelAdapter {
             case Some(resp) => resp
             case None =>
                 this.setNativeCommandsSyncError("empty http response")
-                LogUtils.info("Telegram setMyCommands failed: ${this.lastSendError}")
+                this.logChannel(
+                    "warn",
+                    MetisLogEvent.channelFailed,
+                    "native_command",
+                    "failed",
+                    "Telegram setMyCommands returned no response",
+                    errorKind: "transport",
+                    error: this.lastSendError
+                )
                 return false
         }
         var ok = this.parseTelegramBoolSuccess(responseRaw, missingDetail: "telegram setMyCommands returned ok=false")
@@ -5266,13 +5472,29 @@ public class TelegramAdapter <: ChannelAdapter {
                     ok = this.parseTelegramBoolSuccess(responseRaw, missingDetail: "telegram setMyCommands retry returned ok=false")
                 case None =>
                     this.setNativeCommandsSyncError("empty http response")
-                    LogUtils.info("Telegram setMyCommands retry failed: ${this.lastSendError}")
+                    this.logChannel(
+                        "warn",
+                        MetisLogEvent.channelFailed,
+                        "native_command",
+                        "failed",
+                        "Telegram setMyCommands retry returned no response",
+                        errorKind: "transport",
+                        error: this.lastSendError
+                    )
                     return false
             }
         }
         if (!ok) {
             this.setNativeCommandsSyncError(this.lastSendError)
-            LogUtils.info("Telegram setMyCommands failed: ${this.lastSendError}")
+            this.logChannel(
+                "warn",
+                MetisLogEvent.channelFailed,
+                "native_command",
+                "failed",
+                "Telegram setMyCommands failed",
+                errorKind: this.telegramErrorKind(this.lastSendError),
+                error: this.lastSendError
+            )
         } else {
             this.nativeCommandsLastSyncStatus = "ok"
             this.nativeCommandsLastSyncError = ""
@@ -7421,7 +7643,15 @@ public class TelegramAdapter <: ChannelAdapter {
         try {
             this.telegramRenderHtmlUnsafe(text)
         } catch (e: Exception) {
-            LogUtils.info("Telegram HTML render failed; using escaped plain text: ${e.message}")
+            this.logChannel(
+                "debug",
+                MetisLogEvent.channelSend,
+                "send",
+                "fallback",
+                "Telegram HTML render failed; using escaped plain text",
+                errorKind: "format",
+                error: e.message
+            )
             this.telegramEscapeHtml(text.replace("\r\n", "\n").replace("\r", "\n"))
         }
     }
@@ -7941,7 +8171,18 @@ public class TelegramAdapter <: ChannelAdapter {
         body["disable_web_page_preview"] = true.toJsonValue()
         let sentMessageId = this.sendPayloadToTelegram(body)
         if (sentMessageId.isEmpty() && !this.lastSendError.trimAscii().isEmpty()) {
-            LogUtils.info("Telegram pairing prompt failed sender=${normalizedSender}: ${this.lastSendError}")
+            let extra = JsonObject()
+            extra.put("senderHash", JsonString(gatewayLogIdentityHash(normalizedSender)))
+            this.logChannel(
+                "warn",
+                MetisLogEvent.messageSendFailed,
+                "pairing",
+                "failed",
+                "Telegram pairing prompt failed",
+                errorKind: this.telegramErrorKind(this.lastSendError),
+                error: this.lastSendError,
+                extra: extra
+            )
         }
     }
 
@@ -8468,8 +8709,30 @@ public class TelegramAdapter <: ChannelAdapter {
             }
         }
         this.recordTelegramRequestError(context, "transport failed: ${detail}", outcome: outcome)
-        LogUtils.info("Telegram ${context} failed: ${context} transport failed: ${detail}")
+        let extra = JsonObject()
+        extra.put("context", JsonString(context))
+        extra.put("outcome", JsonString(outcome))
+        extra.put("statusCode", response.statusCode.toJsonValue())
+        this.logChannel(
+            "warn",
+            if (context.startsWith("send:")) { MetisLogEvent.messageSendFailed } else { MetisLogEvent.channelFailed },
+            this.telegramLogPhaseForContext(context),
+            "failed",
+            "Telegram transport request failed",
+            errorKind: this.telegramErrorKind(detail),
+            error: detail,
+            extra: extra
+        )
         None
+    }
+
+    private func telegramLogPhaseForContext(context: String): String {
+        let normalized = context.trimAscii()
+        if (normalized.startsWith("send:")) { return "send" }
+        if (normalized == "setWebhook" || normalized.startsWith("deleteWebhook:")) { return "webhook" }
+        if (normalized.startsWith("setMyCommands") || normalized == "deleteMyCommands") { return "native_command" }
+        if (normalized == "getUpdates") { return "poll" }
+        "transport"
     }
 
     private func telegramSendKindFromContext(context: String): String {
@@ -8497,7 +8760,20 @@ public class TelegramAdapter <: ChannelAdapter {
         let outcome = if (response.outcome.trimAscii().isEmpty()) { "request-error" } else { response.outcome.trimAscii() }
         let detail = this.redactTelegramSensitive(if (response.error.trimAscii().isEmpty()) { "transport failed" } else { response.error.trimAscii() })
         this.recordTelegramRequestError(context, "transport failed: ${detail}", outcome: outcome)
-        LogUtils.info("Telegram ${context} failed: ${context} transport failed: ${detail}")
+        let extra = JsonObject()
+        extra.put("context", JsonString(context))
+        extra.put("outcome", JsonString(outcome))
+        extra.put("statusCode", response.statusCode.toJsonValue())
+        this.logChannel(
+            "warn",
+            if (context.startsWith("send:")) { MetisLogEvent.messageSendFailed } else { MetisLogEvent.channelFailed },
+            this.telegramLogPhaseForContext(context),
+            "failed",
+            "Telegram transport bytes request failed",
+            errorKind: this.telegramErrorKind(detail),
+            error: detail,
+            extra: extra
+        )
         None
     }
 

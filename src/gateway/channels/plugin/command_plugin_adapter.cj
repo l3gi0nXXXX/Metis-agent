@@ -1,16 +1,15 @@
 package metis.gateway.channels.plugin
 
 import metis.gateway.core.ChannelAdapter
+import metis.gateway.logging.{MetisLogEvent, metisCreateSubsystemLogger}
 import metis.gateway.model.{InboundMessage, OutboundMessage, SendResult, ChatType, ChannelType}
 import metis.utils.ShellUtils
-
-import magic.log.LogUtils
 
 import std.collection.ArrayList
 import std.fs.Path
 import std.time.DateTime
 
-import stdx.encoding.json.{JsonObject, JsonValue}
+import stdx.encoding.json.{JsonObject, JsonString, JsonValue}
 
 /**
  * 外部命令插件适配器：
@@ -49,11 +48,25 @@ public class CommandPluginAdapter <: ChannelAdapter {
         this.configJson = configJson
     }
 
+    private func logPluginFailure(phase: String, detail: String): Unit {
+        let meta = JsonObject()
+        meta.put("channel", JsonString(this.channelId))
+        meta.put("pluginId", JsonString(this.pluginId))
+        meta.put("phase", JsonString(phase))
+        meta.put("status", JsonString("failed"))
+        meta.put("error", JsonString(detail.trimAscii()))
+        metisCreateSubsystemLogger("gateway/channel/plugin").error(
+            MetisLogEvent.channelFailed,
+            "Gateway plugin ${phase} failed",
+            meta: meta
+        )
+    }
+
     public func start(): Unit {
         let args = this.baseArgs("start")
         let (ec, _out, err) = ShellUtils.execute(args, withWrap: false, workDir: this.pluginRoot)
         if (ec != 0) {
-            LogUtils.error("Gateway plugin '${this.pluginId}' start failed: ${err}")
+            this.logPluginFailure("start", err)
         }
     }
 
@@ -66,7 +79,7 @@ public class CommandPluginAdapter <: ChannelAdapter {
         let args = this.baseArgs("pull")
         let (ec, out, err) = ShellUtils.execute(args, withWrap: false, workDir: this.pluginRoot)
         if (ec != 0) {
-            LogUtils.error("Gateway plugin '${this.pluginId}' pull failed: ${err}")
+            this.logPluginFailure("pull", err)
             return []
         }
         return this.parseInboundLines(out)

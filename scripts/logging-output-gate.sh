@@ -170,6 +170,7 @@ check_file_allowlist \
   "src/gateway/runtime/gateway_settings_actions.cj" \
   "src/gateway/runtime/gateway_sessions_cli.cj" \
   "src/gateway/runtime/gateway_external_console.cj" \
+  "src/gateway/runtime/demo.cj" \
   "src/gateway/runtime/gateway_cron_cli.cj" \
   "src/gateway/runtime/gateway_cli_human_output.cj"
 

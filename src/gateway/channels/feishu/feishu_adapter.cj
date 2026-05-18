@@ -2,13 +2,13 @@ package metis.gateway.channels.feishu
 
 import metis.core.parseGatewayEditText
 import metis.core.config.CliConfig
-import metis.gateway.core.ChannelAdapter
+import metis.gateway.core.{ChannelAdapter, gatewayLogIdentityHash}
+import metis.gateway.logging.{MetisLogEvent, metisCreateSubsystemLogger}
 import metis.gateway.model.*
 import metis.gateway.model.FeishuConfig
 import metis.gateway.security.gatewayPairingAccountStore
-import metis.io.PrintUtils
 import metis.utils.ShellUtils
-import magic.log.LogUtils
+import magic.jsonable.*
 import magic.utils.http.HttpUtils
 
 import std.collection.{ArrayList, HashMap}
@@ -422,32 +422,143 @@ public class FeishuAdapter <: ChannelAdapter {
             .approve(code)
     }
 
+    private func channelLogMeta(
+        phase: String,
+        status: String,
+        errorKind!: String = "none",
+        error!: String = "",
+        accountId!: String = "",
+        extra!: JsonObject = JsonObject()
+    ): JsonObject {
+        let meta = JsonObject()
+        meta.put("channel", JsonString("feishu"))
+        meta.put("accountId", JsonString(this.normalizeAccountId(if (accountId.trimAscii().isEmpty()) { this.effectiveAccountId() } else { accountId })))
+        meta.put("phase", JsonString(phase.trimAscii()))
+        meta.put("status", JsonString(status.trimAscii()))
+        meta.put("errorKind", JsonString(if (errorKind.trimAscii().isEmpty()) { "none" } else { errorKind.trimAscii() }))
+        if (!error.trimAscii().isEmpty()) {
+            meta.put("error", JsonString(error.trimAscii()))
+        }
+        for (key in extra.getFields().keys()) {
+            match (extra.get(key)) {
+                case Some(value) => meta.put(key, value)
+                case None => ()
+            }
+        }
+        meta
+    }
+
+    private func logChannel(
+        level: String,
+        event: String,
+        phase: String,
+        status: String,
+        message: String,
+        errorKind!: String = "none",
+        error!: String = "",
+        accountId!: String = "",
+        extra!: JsonObject = JsonObject()
+    ): Unit {
+        let meta = this.channelLogMeta(phase, status, errorKind: errorKind, error: error, accountId: accountId, extra: extra)
+        let logger = metisCreateSubsystemLogger("gateway/channel/feishu")
+        match (level.trimAscii().toAsciiLower()) {
+            case "debug" => logger.debug(event, message, meta: meta)
+            case "warn" => logger.warn(event, message, meta: meta)
+            case "error" => logger.error(event, message, meta: meta)
+            case _ => logger.info(event, message, meta: meta)
+        }
+    }
+
+    private func feishuErrorKind(detail: String): String {
+        let lowered = detail.trimAscii().toAsciiLower()
+        if (lowered.isEmpty()) { return "unknown" }
+        if (lowered.contains("token") || lowered.contains("secret") || lowered.contains("credential") || lowered.contains("authorization")) {
+            return "credential"
+        }
+        if (lowered.contains("not running")) { return "not-running" }
+        if (lowered.contains("invalid") || lowered.contains("malformed") || lowered.contains("signature")) {
+            return "validation"
+        }
+        if (lowered.contains("timeout") || lowered.contains("http") || lowered.contains("response") || lowered.contains("network")) {
+            return "transport"
+        }
+        if (lowered.contains("parse") || lowered.contains("json")) { return "parse" }
+        if (lowered.contains("sdk") || lowered.contains("sidecar") || lowered.contains("monitor-host")) { return "sidecar" }
+        if (lowered.contains("rate")) { return "rate-limit" }
+        "unknown"
+    }
+
+    private func logSendFailure(message: OutboundMessage, accountId: String, detail: String): Unit {
+        let extra = JsonObject()
+        extra.put("peerHash", JsonString(gatewayLogIdentityHash(message.peerId)))
+        extra.put("textLen", message.text.size.toJsonValue())
+        extra.put("replyToPresent", message.replyToMessageId.isSome().toJsonValue())
+        this.logChannel(
+            "warn",
+            MetisLogEvent.messageSendFailed,
+            "send",
+            "failed",
+            "Feishu send failed",
+            errorKind: this.feishuErrorKind(detail),
+            error: detail,
+            accountId: accountId,
+            extra: extra
+        )
+    }
+
     public func start(): Unit {
         if (this.running) {
             return
         }
         if (!this.config.enabled) {
-            PrintUtils.printLine("Feishu adapter: disabled (account=${this.accountId}).")
+            this.logChannel("info", MetisLogEvent.channelStopped, "start", "disabled", "Feishu adapter disabled", accountId: this.accountId)
             return
         }
         this.running = true
+        let startMeta = JsonObject()
+        startMeta.put("mode", JsonString(this.config.receiveMode))
+        this.logChannel("info", MetisLogEvent.channelStarted, "start", "started", "Feishu adapter started", accountId: this.accountId, extra: startMeta)
         if (this.config.receiveMode == "webhook") {
             this.startWebhookServer()
             return
         }
         if (this.config.appId.isEmpty() || this.config.appSecret.isEmpty()) {
-            PrintUtils.printLine("Feishu long_connect: gateway.feishu.appId / gateway.feishu.appSecret is required.")
+            this.logChannel(
+                "warn",
+                MetisLogEvent.channelFailed,
+                "sidecar",
+                "failed",
+                "Feishu long connection credentials are required",
+                errorKind: "credential",
+                error: "gateway.feishu.appId / gateway.feishu.appSecret is required",
+                accountId: this.accountId
+            )
             return
         }
         if (!this.feishuOfficialSdkMonitorHostEnabled()) {
-            PrintUtils.printLine(
-                "Feishu long_connect: official SDK monitor host is required. Check scripts/feishu-ws-sidecar.mjs and tools/feishu-official-sdk."
+            this.logChannel(
+                "warn",
+                MetisLogEvent.channelFailed,
+                "sidecar",
+                "failed",
+                "Feishu official SDK monitor host is required",
+                errorKind: "sidecar",
+                error: "official SDK monitor host is not enabled",
+                accountId: this.accountId
             )
             return
         }
         if (!this.startFeishuOfficialSdkMonitorHost()) {
-            PrintUtils.printLine(
-                "Feishu inbound unavailable: official SDK monitor host failed to start: ${this.feishuOfficialSdkMonitorError()}"
+            let detail = this.feishuOfficialSdkMonitorError()
+            this.logChannel(
+                "warn",
+                MetisLogEvent.channelFailed,
+                "sidecar",
+                "failed",
+                "Feishu official SDK monitor host failed to start",
+                errorKind: this.feishuErrorKind(detail),
+                error: detail,
+                accountId: this.accountId
             )
         }
     }
@@ -463,12 +574,16 @@ public class FeishuAdapter <: ChannelAdapter {
 
     /** 常驻服务启动后的入口说明（长连接模式无本地 webhook 地址）。 */
     public func printFeishuIngressHints(): Unit {
+        let extra = JsonObject()
         if (this.config.receiveMode == "webhook") {
-            PrintUtils.printLine("Feishu webhook: ${this.webhookListenUrlForLog()}")
-            PrintUtils.printLine("Health: ${this.healthzUrlForLog()}")
+            extra.put("host", JsonString(this.config.webhookHost))
+            extra.put("port", JsonInt(Int64(this.config.webhookPort)))
+            extra.put("path", JsonString(this.config.webhookPath))
+            extra.put("healthPath", JsonString("/healthz"))
         } else {
-            PrintUtils.printLine(feishuMonitorHostIngressHintText())
+            extra.put("mode", JsonString("long_connect"))
         }
+        this.logChannel("debug", MetisLogEvent.channelStarted, "start", "hint", "Feishu ingress hint", accountId: this.accountId, extra: extra)
     }
 
     public func stop(): Unit {
@@ -507,6 +622,7 @@ public class FeishuAdapter <: ChannelAdapter {
      */
     public func send(message: OutboundMessage): SendResult {
         if (!this.running) {
+            this.logSendFailure(message, this.outboundAccountId(message), "feishu adapter is not running")
             return SendResult.Failed("feishu adapter is not running")
         }
         let sentMessageId = this.sendWithMessageId(message)
@@ -518,6 +634,7 @@ public class FeishuAdapter <: ChannelAdapter {
 
     public func sendWithMessageId(message: OutboundMessage): String {
         if (!this.running) {
+            this.logSendFailure(message, this.outboundAccountId(message), "feishu adapter is not running")
             return ""
         }
         let accountId = this.outboundAccountId(message)
@@ -536,6 +653,9 @@ public class FeishuAdapter <: ChannelAdapter {
         }
         synchronized(this.queueMutex) {
             this.outboundLog.add(message)
+        }
+        if (sentMessageId.trimAscii().isEmpty() && !this.lastSendError.trimAscii().isEmpty()) {
+            this.logSendFailure(message, accountId, this.lastSendError)
         }
         sentMessageId
     }
@@ -672,19 +792,32 @@ public class FeishuAdapter <: ChannelAdapter {
         let root = try {
             JsonValue.fromStr(payload).asObject()
         } catch (e: Exception) {
-            PrintUtils.printLine("Feishu ingest: invalid json")
+            let extra = JsonObject()
+            extra.put("payloadBytes", payload.size.toJsonValue())
+            this.logChannel(
+                "warn",
+                MetisLogEvent.messageInbound,
+                "ingest",
+                "failed",
+                "Feishu ingest invalid JSON",
+                errorKind: "parse",
+                error: e.message,
+                extra: extra
+            )
             return "{\"ok\":false,\"error\":\"invalid_json\"}"
         }
 
         // 飞书 URL 校验事件
-        if (let Some(typeVal) <- root.get("type")) {
-            if (typeVal.asString().getValue() == "url_verification") {
-                let challenge = match (root.get("challenge")) {
-                    case Some(v) => v.asString().getValue()
-                    case None => ""
+        match (root.get("type")) {
+            case Some(typeVal) =>
+                if (typeVal.asString().getValue() == "url_verification") {
+                    let challenge = match (root.get("challenge")) {
+                        case Some(v) => v.asString().getValue()
+                        case None => ""
+                    }
+                    return "{\"challenge\":\"${challenge}\"}"
                 }
-                return "{\"challenge\":\"${challenge}\"}"
-            }
+            case None => ()
         }
 
         return this.feishuDispatchEventRoot(root)
@@ -779,7 +912,17 @@ public class FeishuAdapter <: ChannelAdapter {
             return this.feishuIgnoredResponse("malformed_event", eventType: headerEventType)
         }
         if (!headerEventType.isEmpty() && headerEventType != "im.message.receive_v1") {
-            PrintUtils.printLine("Feishu ingest: ignore event_type=${headerEventType}")
+            let extra = JsonObject()
+            extra.put("eventType", JsonString(headerEventType))
+            this.logChannel(
+                "debug",
+                MetisLogEvent.messageInbound,
+                "ingest",
+                "ignored",
+                "Feishu ingest ignored unsupported event",
+                errorKind: "none",
+                extra: extra
+            )
             return this.feishuIgnoredResponse("unsupported_event", eventType: headerEventType)
         }
 
@@ -787,8 +930,21 @@ public class FeishuAdapter <: ChannelAdapter {
             if (!this.tryRecordFeishuEvent(inbound.accountId, inbound.messageId)) {
                 return this.feishuIgnoredResponse("duplicate_event", eventType: headerEventType)
             }
-            PrintUtils.printLine(
-                "Feishu ingest: mapped messageId=${inbound.messageId}, chat=${inbound.peerId}, sender=${inbound.senderId}, mentioned=${inbound.mentioned}"
+            let extra = JsonObject()
+            extra.put("messageId", JsonString(inbound.messageId))
+            extra.put("peerHash", JsonString(gatewayLogIdentityHash(inbound.peerId)))
+            extra.put("senderHash", JsonString(gatewayLogIdentityHash(inbound.senderId)))
+            extra.put("mentioned", inbound.mentioned.toJsonValue())
+            extra.put("textLen", inbound.text.size.toJsonValue())
+            extra.put("eventType", JsonString(headerEventType))
+            this.logChannel(
+                "info",
+                MetisLogEvent.messageInbound,
+                "ingest",
+                "queued",
+                "Feishu ingest queued message",
+                accountId: inbound.accountId,
+                extra: extra
             )
             this.chatQueue.runExclusive(inbound.accountId, inbound.peerId, inbound.threadId ?? "", { =>
                 synchronized(this.queueMutex) {
@@ -797,8 +953,20 @@ public class FeishuAdapter <: ChannelAdapter {
             })
             return "{\"ok\":true}"
         }
-        PrintUtils.printLine("Feishu ingest: no text message mapped (non-text or missing fields), event_type=${headerEventType}")
         let diagnostic = this.feishuMessageIgnoredDiagnostic(root, headerEventType)
+        let extra = JsonObject()
+        extra.put("eventType", JsonString(headerEventType))
+        extra.put("reason", JsonString(diagnostic[0]))
+        extra.put("messageType", JsonString(diagnostic[1]))
+        this.logChannel(
+            "debug",
+            MetisLogEvent.messageInbound,
+            "ingest",
+            "ignored",
+            "Feishu ingest ignored message",
+            errorKind: if (diagnostic[0] == "malformed_event") { "validation" } else { "none" },
+            extra: extra
+        )
         return this.feishuIgnoredResponse(diagnostic[0], eventType: headerEventType, messageType: diagnostic[1])
     }
 
@@ -868,8 +1036,17 @@ public class FeishuAdapter <: ChannelAdapter {
         let resolution = this.resolveFeishuEventAccount(root)
         if (!resolution.reason.isEmpty()) {
             let eventAppId = this.readFeishuEventAppId(root)
-            PrintUtils.printLine(
-                "Feishu ingest: ${resolution.reason} for event app_id=${this.feishuMaskDiagnosticValue(eventAppId)}"
+            let extra = JsonObject()
+            extra.put("reason", JsonString(resolution.reason))
+            extra.put("eventAppIdMasked", JsonString(this.feishuMaskDiagnosticValue(eventAppId)))
+            this.logChannel(
+                "warn",
+                MetisLogEvent.messageInbound,
+                "ingest",
+                "ignored",
+                "Feishu event ownership check failed",
+                errorKind: "validation",
+                extra: extra
             )
             return Some(resolution.reason)
         }
@@ -881,12 +1058,29 @@ public class FeishuAdapter <: ChannelAdapter {
         }
         let eventAppId = this.readFeishuEventAppId(root)
         if (eventAppId.isEmpty()) {
-            PrintUtils.printLine("Feishu ingest: missing event app_id for account=${accountId}, ownership check skipped")
+            this.logChannel(
+                "debug",
+                MetisLogEvent.messageInbound,
+                "ingest",
+                "ownership_skipped",
+                "Feishu event app_id missing; ownership check skipped",
+                accountId: accountId
+            )
             return None<String>
         }
         if (eventAppId != expectedAppId) {
-            PrintUtils.printLine(
-                "Feishu ingest: wrong app for account=${accountId}, expected_app_id=${this.feishuMaskDiagnosticValue(expectedAppId)}, event_app_id=${this.feishuMaskDiagnosticValue(eventAppId)}"
+            let extra = JsonObject()
+            extra.put("expectedAppIdMasked", JsonString(this.feishuMaskDiagnosticValue(expectedAppId)))
+            extra.put("eventAppIdMasked", JsonString(this.feishuMaskDiagnosticValue(eventAppId)))
+            this.logChannel(
+                "warn",
+                MetisLogEvent.messageInbound,
+                "ingest",
+                "ignored",
+                "Feishu event app_id does not match account",
+                errorKind: "validation",
+                accountId: accountId,
+                extra: extra
             )
             return Some("wrong_app")
         }
@@ -1590,8 +1784,20 @@ public class FeishuAdapter <: ChannelAdapter {
         this.webhookServer = Some(server)
         spawn {
             try {
-                PrintUtils.printLine("Feishu webhook gateway started at ${this.webhookListenUrlForLog()}")
-                PrintUtils.printLine("Health endpoint: ${this.healthzUrlForLog()}")
+                let extra = JsonObject()
+                extra.put("host", JsonString(this.config.webhookHost))
+                extra.put("port", JsonInt(Int64(this.config.webhookPort)))
+                extra.put("path", JsonString(this.config.webhookPath))
+                extra.put("healthPath", JsonString("/healthz"))
+                this.logChannel(
+                    "info",
+                    MetisLogEvent.channelStarted,
+                    "webhook",
+                    "started",
+                    "Feishu webhook server started",
+                    accountId: this.accountId,
+                    extra: extra
+                )
                 server.serve()
             } catch (_e: Exception) {
                 // P1.5 最小版：服务异常退出暂不抛出到主流程。
@@ -1850,8 +2056,18 @@ public class FeishuAdapter <: ChannelAdapter {
         if (!sent[0]) {
             let error = this.feishuRedactedPairingPromptError(this.lastSendError)
             gate.put("pairingPromptError", JsonString(error))
-            LogUtils.info(
-                "Feishu pairing prompt failed account=${normalizedAccountId} sender=${this.feishuMaskDiagnosticValue(normalizedSenderId)}: ${error}"
+            let extra = JsonObject()
+            extra.put("senderHash", JsonString(gatewayLogIdentityHash(normalizedSenderId)))
+            this.logChannel(
+                "warn",
+                MetisLogEvent.messageSendFailed,
+                "pairing",
+                "failed",
+                "Feishu pairing prompt failed",
+                errorKind: this.feishuErrorKind(error),
+                error: error,
+                accountId: normalizedAccountId,
+                extra: extra
             )
         }
     }
@@ -3338,7 +3554,14 @@ public class FeishuAdapter <: ChannelAdapter {
                     this.feishuMonitorReady = true
                     this.feishuMonitorLastError = ""
                 }
-                PrintUtils.printLine("Feishu official SDK monitor host active")
+                this.logChannel(
+                    "info",
+                    MetisLogEvent.channelStarted,
+                    "sidecar",
+                    "started",
+                    "Feishu official SDK monitor host active",
+                    accountId: this.accountId
+                )
                 return
             }
             if (kind == "event") {
@@ -3354,7 +3577,16 @@ public class FeishuAdapter <: ChannelAdapter {
                 synchronized(this.feishuMonitorLock) {
                     this.feishuMonitorLastError = message
                 }
-                PrintUtils.printLine("Feishu official SDK monitor host error: ${message}")
+                this.logChannel(
+                    "warn",
+                    MetisLogEvent.channelFailed,
+                    "sidecar",
+                    "failed",
+                    "Feishu official SDK monitor host error",
+                    errorKind: this.feishuErrorKind(message),
+                    error: message,
+                    accountId: this.accountId
+                )
                 return
             }
             if (kind == "closed") {
@@ -3363,18 +3595,46 @@ public class FeishuAdapter <: ChannelAdapter {
                     this.feishuMonitorReady = false
                     this.feishuMonitorLastError = reason
                 }
-                PrintUtils.printLine("Feishu official SDK monitor host closed: ${reason}")
+                this.logChannel(
+                    "info",
+                    MetisLogEvent.channelStopped,
+                    "sidecar",
+                    "closed",
+                    "Feishu official SDK monitor host closed",
+                    errorKind: if (reason.trimAscii().isEmpty()) { "none" } else { this.feishuErrorKind(reason) },
+                    error: reason,
+                    accountId: this.accountId
+                )
                 return
             }
         } catch (e: Exception) {
-            PrintUtils.printLine("Feishu official SDK monitor host emitted invalid line: ${e.message}")
+            this.logChannel(
+                "warn",
+                MetisLogEvent.channelFailed,
+                "sidecar",
+                "failed",
+                "Feishu official SDK monitor host emitted invalid line",
+                errorKind: "parse",
+                error: e.message,
+                accountId: this.accountId
+            )
         }
     }
 
     private func startFeishuOfficialSdkMonitorHost(): Bool {
         if (!this.feishuOfficialSdkAvailable()) {
-            PrintUtils.printLine(
-                "Feishu official SDK monitor host unavailable script=${this.feishuOfficialSdkMonitorHostScript().toString()} deps=${this.feishuOfficialSdkDepsRoot().toString()}"
+            let extra = JsonObject()
+            extra.put("scriptPath", JsonString(this.feishuOfficialSdkMonitorHostScript().toString()))
+            extra.put("depsRoot", JsonString(this.feishuOfficialSdkDepsRoot().toString()))
+            this.logChannel(
+                "warn",
+                MetisLogEvent.channelFailed,
+                "sidecar",
+                "failed",
+                "Feishu official SDK monitor host unavailable",
+                errorKind: "sidecar",
+                accountId: this.accountId,
+                extra: extra
             )
             return false
         }
@@ -3412,7 +3672,16 @@ public class FeishuAdapter <: ChannelAdapter {
                                     case Some(line) =>
                                         let text = line.trimAscii()
                                         if (!text.isEmpty()) {
-                                            PrintUtils.printLine("Feishu official SDK monitor host stderr: ${text}")
+                                            this.logChannel(
+                                                "debug",
+                                                MetisLogEvent.channelFailed,
+                                                "sidecar",
+                                                "stderr",
+                                                "Feishu official SDK monitor host stderr",
+                                                errorKind: this.feishuErrorKind(text),
+                                                error: text,
+                                                accountId: this.accountId
+                                            )
                                         }
                                     case None => break
                                 }
@@ -3513,7 +3782,18 @@ public class FeishuAdapter <: ChannelAdapter {
         let killed = feishuKillMonitorHostPids(stalePids)
         if (killed.size > 0) {
             let killedText = String.join(killed.map({ pid => pid.toString() }), delimiter: ",")
-            PrintUtils.printLine("Feishu official SDK monitor host cleanup: killed stale sidecars ${killedText}")
+            let extra = JsonObject()
+            extra.put("pidCount", killed.size.toJsonValue())
+            extra.put("pids", JsonString(killedText))
+            this.logChannel(
+                "info",
+                MetisLogEvent.channelStopped,
+                "sidecar",
+                "cleanup",
+                "Feishu official SDK monitor host cleanup killed stale sidecars",
+                accountId: this.accountId,
+                extra: extra
+            )
         }
     }
 

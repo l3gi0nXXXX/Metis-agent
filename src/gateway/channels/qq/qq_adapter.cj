@@ -1,11 +1,10 @@
 package metis.gateway.channels.qq
 
-import metis.gateway.core.ChannelAdapter
+import metis.gateway.core.{ChannelAdapter, gatewayLogIdentityHash}
+import metis.gateway.logging.{MetisLogEvent, metisCreateSubsystemLogger}
 import metis.gateway.model.*
 import metis.gateway.model.QQConfig
-import metis.io.PrintUtils
 
-import magic.log.LogUtils
 import magic.jsonable.*
 import magic.utils.http.*
 
@@ -57,14 +56,96 @@ public class QQAdapter <: ChannelAdapter {
         this.lastSendError
     }
 
-    private func logInfo(message: String): Unit {
-        PrintUtils.printLine(message)
-        LogUtils.info(message)
+    private func channelLogMeta(
+        phase: String,
+        status: String,
+        errorKind!: String = "none",
+        error!: String = "",
+        extra!: JsonObject = JsonObject()
+    ): JsonObject {
+        let meta = JsonObject()
+        meta.put("channel", JsonString("qq"))
+        meta.put("accountId", JsonString(this.config.accountId))
+        meta.put("phase", JsonString(phase.trimAscii()))
+        meta.put("status", JsonString(status.trimAscii()))
+        meta.put("errorKind", JsonString(if (errorKind.trimAscii().isEmpty()) { "none" } else { errorKind.trimAscii() }))
+        if (!error.trimAscii().isEmpty()) {
+            meta.put("error", JsonString(error.trimAscii()))
+        }
+        for (key in extra.getFields().keys()) {
+            match (extra.get(key)) {
+                case Some(value) => meta.put(key, value)
+                case None => ()
+            }
+        }
+        meta
+    }
+
+    private func logChannel(
+        level: String,
+        event: String,
+        phase: String,
+        status: String,
+        message: String,
+        errorKind!: String = "none",
+        error!: String = "",
+        extra!: JsonObject = JsonObject()
+    ): Unit {
+        let meta = this.channelLogMeta(phase, status, errorKind: errorKind, error: error, extra: extra)
+        let logger = metisCreateSubsystemLogger("gateway/channel/qq")
+        match (level.trimAscii().toAsciiLower()) {
+            case "debug" => logger.debug(event, message, meta: meta)
+            case "warn" => logger.warn(event, message, meta: meta)
+            case "error" => logger.error(event, message, meta: meta)
+            case _ => logger.info(event, message, meta: meta)
+        }
     }
 
     private func logError(message: String): Unit {
-        PrintUtils.printLine(message)
-        LogUtils.error(message)
+        this.logChannel(
+            "warn",
+            MetisLogEvent.channelFailed,
+            "runtime",
+            "failed",
+            message,
+            errorKind: this.qqErrorKind(message),
+            error: message
+        )
+    }
+
+    private func qqErrorKind(detail: String): String {
+        let lowered = detail.trimAscii().toAsciiLower()
+        if (lowered.isEmpty()) { return "unknown" }
+        if (lowered.contains("token") || lowered.contains("secret") || lowered.contains("credential") || lowered.contains("authorization")) {
+            return "credential"
+        }
+        if (lowered.contains("not running")) { return "not-running" }
+        if (lowered.contains("invalid") || lowered.contains("missing") || lowered.contains("unsupported")) {
+            return "validation"
+        }
+        if (lowered.contains("http") || lowered.contains("response") || lowered.contains("websocket") || lowered.contains("gateway")) {
+            return "transport"
+        }
+        if (lowered.contains("parse") || lowered.contains("json")) { return "parse" }
+        if (lowered.contains("heartbeat")) { return "heartbeat" }
+        "unknown"
+    }
+
+    private func logSendFailure(message: OutboundMessage, detail: String): Unit {
+        let extra = JsonObject()
+        extra.put("peerHash", JsonString(gatewayLogIdentityHash(message.peerId)))
+        extra.put("textLen", message.text.size.toJsonValue())
+        extra.put("replyToPresent", message.replyToMessageId.isSome().toJsonValue())
+        this.logChannel(
+            "warn",
+            MetisLogEvent.messageSendFailed,
+            "send",
+            "failed",
+            "QQ send failed",
+            errorKind: this.qqErrorKind(detail),
+            error: detail,
+            extra: extra
+        )
     }
 
     public prop name: String {
@@ -77,26 +158,28 @@ public class QQAdapter <: ChannelAdapter {
         }
         if (!this.isOfficialWsMode()) {
             this.lastSendError = "QQ adapter only supports official_ws mode"
-            this.logError("QQ adapter start failed: ${this.lastSendError}")
+            this.logChannel("error", MetisLogEvent.channelFailed, "start", "failed", "QQ adapter start failed", errorKind: "configuration", error: this.lastSendError)
             return
         }
         if (this.resolvedAccount.missingAccount) {
             this.lastSendError = this.resolvedAccount.missingDiagnostic
-            this.logError("QQ adapter start failed: ${this.lastSendError}")
+            this.logChannel("error", MetisLogEvent.channelFailed, "start", "failed", "QQ adapter start failed", errorKind: "configuration", error: this.lastSendError)
             return
         }
         if (this.resolvedAccount.missingCredential) {
             this.lastSendError = this.resolvedAccount.missingDiagnostic
-            this.logError("QQ adapter start failed: ${this.lastSendError}")
+            this.logChannel("error", MetisLogEvent.channelFailed, "start", "failed", "QQ adapter start failed", errorKind: "credential", error: this.lastSendError)
             return
         }
         if (this.config.appId.isEmpty() || this.config.appSecret.isEmpty()) {
             this.lastSendError = "QQ official mode requires appId and appSecret for account ${this.config.accountId}"
-            this.logError("QQ adapter start failed: ${this.lastSendError}")
+            this.logChannel("error", MetisLogEvent.channelFailed, "start", "failed", "QQ adapter start failed", errorKind: "credential", error: this.lastSendError)
             return
         }
         this.running = true
-        this.logInfo("QQ adapter started in official_ws mode")
+        let extra = JsonObject()
+        extra.put("mode", JsonString("official_ws"))
+        this.logChannel("info", MetisLogEvent.channelStarted, "start", "started", "QQ adapter started", extra: extra)
         this.startOfficialGatewayLoop()
     }
 
@@ -127,28 +210,36 @@ public class QQAdapter <: ChannelAdapter {
 
     public func send(message: OutboundMessage): SendResult {
         if (!this.running) {
+            this.logSendFailure(message, "qq adapter is not running")
             return SendResult.Failed("qq adapter is not running")
         }
-        LogUtils.info("QQ send: peer=${message.peerId}, textLen=${message.text.size}")
+        let sendMeta = JsonObject()
+        sendMeta.put("peerHash", JsonString(gatewayLogIdentityHash(message.peerId)))
+        sendMeta.put("textLen", message.text.size.toJsonValue())
+        this.logChannel("debug", MetisLogEvent.channelSend, "send", "started", "QQ send started", extra: sendMeta)
         let sentMessageId = this.sendTextToQQWithMessageId(message.peerId, message.text, message.replyToMessageId)
         synchronized(this.queueMutex) {
             this.outboundLog.add(message)
         }
         if (!sentMessageId.trimAscii().isEmpty()) {
-            LogUtils.info("QQ send: success peer=${message.peerId}")
+            this.logChannel("info", MetisLogEvent.messageSent, "send", "sent", "QQ send succeeded", extra: sendMeta)
             return SendResult.Success
         }
-        this.logError("QQ send: failed, reason=${this.lastSendError}")
+        this.logSendFailure(message, this.lastSendError)
         return SendResult.Failed("failed to send qq message: ${this.lastSendError}")
     }
 
     public func sendWithMessageId(message: OutboundMessage): String {
         if (!this.running) {
+            this.logSendFailure(message, "qq adapter is not running")
             return ""
         }
         let sentMessageId = this.sendTextToQQWithMessageId(message.peerId, message.text, message.replyToMessageId)
         synchronized(this.queueMutex) {
             this.outboundLog.add(message)
+        }
+        if (sentMessageId.trimAscii().isEmpty() && !this.lastSendError.trimAscii().isEmpty()) {
+            this.logSendFailure(message, this.lastSendError)
         }
         sentMessageId
     }
@@ -194,15 +285,27 @@ public class QQAdapter <: ChannelAdapter {
 
         server.distributor.register(this.config.webhookPath, { ctx =>
             let payload = this.readRequestBody(ctx)
-            let preview = if (payload.size > 200) { payload[..200] + "..." } else { payload }
-            PrintUtils.printLine("QQ webhook: received payload len=${payload.size}, preview=${preview}")
+            let receiveMeta = JsonObject()
+            receiveMeta.put("payloadBytes", payload.size.toJsonValue())
+            this.logChannel("debug", MetisLogEvent.messageInbound, "webhook", "received", "QQ webhook received payload", extra: receiveMeta)
             if (!this.validateWebhookHeaders(ctx.request.headers)) {
-                PrintUtils.printLine("QQ webhook: header validation failed")
+                this.logChannel(
+                    "warn",
+                    MetisLogEvent.messageInbound,
+                    "webhook",
+                    "failed",
+                    "QQ webhook header validation failed",
+                    errorKind: "credential",
+                    error: "invalid authorization header"
+                )
                 ctx.responseBuilder.body("{\"ok\":false,\"error\":\"unauthorized\"}")
                 return
             }
             let ack = this.ingestWebhookPayload(payload)
-            PrintUtils.printLine("QQ webhook: ack=${ack}")
+            let ackMeta = JsonObject()
+            ackMeta.put("ackBytes", ack.size.toJsonValue())
+            ackMeta.put("ackOk", ack.contains("\"ok\":true").toJsonValue())
+            this.logChannel("debug", MetisLogEvent.messageInbound, "webhook", "ack", "QQ webhook ack generated", extra: ackMeta)
             ctx.responseBuilder.body(ack)
         })
         server.distributor.register("/healthz", { ctx =>
@@ -242,7 +345,9 @@ public class QQAdapter <: ChannelAdapter {
         let root = try {
             JsonValue.fromStr(payload).asObject()
         } catch (_e: Exception) {
-            PrintUtils.printLine("QQ ingest: invalid json")
+            let extra = JsonObject()
+            extra.put("payloadBytes", payload.size.toJsonValue())
+            this.logChannel("warn", MetisLogEvent.messageInbound, "ingest", "failed", "QQ ingest invalid JSON", errorKind: "parse", error: "invalid_json", extra: extra)
             return "{\"ok\":false,\"error\":\"invalid_json\"}"
         }
 
@@ -257,8 +362,18 @@ public class QQAdapter <: ChannelAdapter {
             }
             let plainToken = this.readStringField(d, "plain_token")
             let eventTs = this.readStringField(d, "event_ts")
-            PrintUtils.printLine("QQ ingest: received callback verification op=13, plain_token present=${!plainToken.isEmpty()}, event_ts=${eventTs}")
-            PrintUtils.printLine("QQ ingest warning: Ed25519 signature for op=13 is not implemented yet, webhook verification may fail on platform side.")
+            let extra = JsonObject()
+            extra.put("plainTokenPresent", (!plainToken.isEmpty()).toJsonValue())
+            extra.put("eventTsPresent", (!eventTs.trimAscii().isEmpty()).toJsonValue())
+            this.logChannel(
+                "warn",
+                MetisLogEvent.messageInbound,
+                "webhook",
+                "verification",
+                "QQ callback verification received without Ed25519 signature support",
+                errorKind: "not-implemented",
+                extra: extra
+            )
             return "{\"plain_token\":\"${plainToken}\",\"signature\":\"\"}"
         }
 
@@ -266,35 +381,55 @@ public class QQAdapter <: ChannelAdapter {
         if (op == 0) {
             let eventType = this.readStringField(root, "t")
             if (this.isIgnoredOfficialControlEvent(eventType)) {
-                PrintUtils.printLine("QQ ingest: ignore control event ${eventType}")
+                let extra = JsonObject()
+                extra.put("eventType", JsonString(eventType))
+                this.logChannel("debug", MetisLogEvent.messageInbound, "ingest", "ignored", "QQ ingest ignored control event", extra: extra)
                 return "{\"ok\":true,\"ignored\":true,\"event\":\"${eventType}\"}"
             }
         }
 
         if (let Some(inbound) <- this.mapWebhookToInbound(root)) {
             let dedupKey = this.buildDedupKey(root, inbound)
-            LogUtils.info("QQ ingest: mapped messageId=${inbound.messageId}, peer=${inbound.peerId}, sender=${inbound.senderId}, mentioned=${inbound.mentioned}")
+            let mappedMeta = JsonObject()
+            mappedMeta.put("messageId", JsonString(inbound.messageId))
+            mappedMeta.put("peerHash", JsonString(gatewayLogIdentityHash(inbound.peerId)))
+            mappedMeta.put("senderHash", JsonString(gatewayLogIdentityHash(inbound.senderId)))
+            mappedMeta.put("mentioned", inbound.mentioned.toJsonValue())
+            mappedMeta.put("textLen", inbound.text.size.toJsonValue())
+            this.logChannel("debug", MetisLogEvent.messageInbound, "ingest", "mapped", "QQ ingest mapped inbound message", extra: mappedMeta)
             synchronized(this.queueMutex) {
                 if (this.isDuplicateMessage(dedupKey)) {
-                    LogUtils.info("QQ ingest: dedup hit for key=${dedupKey}")
+                    let dedupMeta = JsonObject()
+                    dedupMeta.put("dedupHash", JsonString(gatewayLogIdentityHash(dedupKey)))
+                    this.logChannel("debug", MetisLogEvent.messageInbound, "ingest", "dedup", "QQ ingest duplicate message skipped", extra: dedupMeta)
                     return "{\"ok\":true,\"dedup\":true}"
                 }
                 this.inboundQueue.add(inbound)
                 this.markMessageProcessed(dedupKey)
-                LogUtils.info("QQ ingest: queued messageId=${inbound.messageId}, queueSize=${this.inboundQueue.size}")
+                let queuedMeta = JsonObject()
+                queuedMeta.put("messageId", JsonString(inbound.messageId))
+                queuedMeta.put("queueSize", this.inboundQueue.size.toJsonValue())
+                this.logChannel("info", MetisLogEvent.messageInbound, "ingest", "queued", "QQ ingest queued message", extra: queuedMeta)
             }
             return "{\"ok\":true}"
         }
         let eventType = this.readStringField(root, "t")
         if (op == 0 && !eventType.isEmpty()) {
             if (this.isSupportedOfficialInboundEvent(eventType)) {
-                this.logError("QQ ingest: supported event payload missing required fields, t=${eventType}")
+                let extra = JsonObject()
+                extra.put("eventType", JsonString(eventType))
+                this.logChannel("warn", MetisLogEvent.messageInbound, "ingest", "failed", "QQ supported event payload missing required fields", errorKind: "validation", extra: extra)
                 return "{\"ok\":false,\"error\":\"invalid_event_payload\",\"event\":\"${eventType}\"}"
             }
-            LogUtils.info("QQ ingest: ignored unsupported official event ${eventType}")
+            let extra = JsonObject()
+            extra.put("eventType", JsonString(eventType))
+            this.logChannel("debug", MetisLogEvent.messageInbound, "ingest", "ignored", "QQ ingest ignored unsupported official event", extra: extra)
             return "{\"ok\":true,\"ignored\":true,\"reason\":\"unsupported_event\",\"event\":\"${eventType}\"}"
         }
-        PrintUtils.printLine("QQ ingest: unsupported event, op=${op}, t=${eventType}")
+        let extra = JsonObject()
+        extra.put("op", op.toJsonValue())
+        extra.put("eventType", JsonString(eventType))
+        this.logChannel("debug", MetisLogEvent.messageInbound, "ingest", "ignored", "QQ ingest ignored unsupported op", extra: extra)
         return "{\"ok\":true,\"ignored\":true,\"reason\":\"unsupported_op\",\"event\":\"${eventType}\"}"
     }
 
@@ -305,7 +440,9 @@ public class QQAdapter <: ChannelAdapter {
     private func mapOnebotWebhookToInbound(root: JsonObject): Option<InboundMessage> {
         let postType = this.readStringField(root, "post_type")
         if (postType != "message") {
-            PrintUtils.printLine("QQ map(onebot): skip post_type=${postType}")
+            let extra = JsonObject()
+            extra.put("postType", JsonString(postType))
+            this.logChannel("debug", MetisLogEvent.messageInbound, "ingest", "ignored", "QQ onebot post type ignored", extra: extra)
             return None
         }
         let messageType = this.readStringField(root, "message_type")
@@ -326,7 +463,9 @@ public class QQAdapter <: ChannelAdapter {
             peerId = "group:${groupId}"
             mentioned = this.detectMention(text)
         } else {
-            PrintUtils.printLine("QQ map(onebot): skip message_type=${messageType}")
+            let extra = JsonObject()
+            extra.put("messageType", JsonString(messageType))
+            this.logChannel("debug", MetisLogEvent.messageInbound, "ingest", "ignored", "QQ onebot message type ignored", extra: extra)
             return None
         }
         return InboundMessage(
@@ -353,7 +492,9 @@ public class QQAdapter <: ChannelAdapter {
      */
     private func mapOfficialWebhookToInbound(root: JsonObject): Option<InboundMessage> {
         let eventType = this.readStringField(root, "t")
-        PrintUtils.printLine("QQ map(official): eventType=${eventType}")
+        let eventMeta = JsonObject()
+        eventMeta.put("eventType", JsonString(eventType))
+        this.logChannel("debug", MetisLogEvent.messageInbound, "ingest", "mapping", "QQ official event mapping", extra: eventMeta)
         if (this.isIgnoredOfficialControlEvent(eventType)) {
             // 连接建立/恢复事件，不是业务消息，静默忽略。
             return None
@@ -560,7 +701,12 @@ public class QQAdapter <: ChannelAdapter {
         let (isGroup, pureId) = this.parsePeerId(peerId)
         let apiPath = this.resolveSendApiPath(isGroup)
         let url = this.config.onebotApiBaseUrl + apiPath
-        PrintUtils.printLine("QQ send(onebot): url=${url}, apiPath=${apiPath}")
+        let requestMeta = JsonObject()
+        requestMeta.put("apiPath", JsonString(apiPath))
+        requestMeta.put("isGroup", isGroup.toJsonValue())
+        requestMeta.put("peerHash", JsonString(gatewayLogIdentityHash(peerId)))
+        requestMeta.put("textLen", text.size.toJsonValue())
+        this.logChannel("debug", MetisLogEvent.channelSend, "send", "request", "QQ onebot send request", extra: requestMeta)
 
         let header = HashMap<String, String>()
         header["Content-Type"] = "application/json; charset=utf-8"
@@ -591,11 +737,13 @@ public class QQAdapter <: ChannelAdapter {
             case Some(resp) => resp
             case None =>
                 this.lastSendError = "empty http response"
-                PrintUtils.printLine("QQ send(onebot): empty http response")
+                this.logChannel("warn", MetisLogEvent.messageSendFailed, "send", "failed", "QQ onebot send returned empty response", errorKind: "transport", error: this.lastSendError, extra: requestMeta)
                 return false
         }
-        let preview = if (responseRaw.size > 300) { responseRaw[..300] + "..." } else { responseRaw }
-        PrintUtils.printLine("QQ send(onebot): response=${preview}")
+        let responseMeta = JsonObject()
+        responseMeta.put("responseBytes", responseRaw.size.toJsonValue())
+        responseMeta.put("apiPath", JsonString(apiPath))
+        this.logChannel("debug", MetisLogEvent.channelSend, "send", "response", "QQ onebot send response received", extra: responseMeta)
         return this.parseOnebotApiSuccess(responseRaw)
     }
 
@@ -623,7 +771,12 @@ public class QQAdapter <: ChannelAdapter {
             case Some(v) => v
             case None => ""
         }
-        LogUtils.info("QQ send(official): url=${url}, isGroup=${isGroup}, replyTo=${replyTarget}")
+        let requestMeta = JsonObject()
+        requestMeta.put("isGroup", isGroup.toJsonValue())
+        requestMeta.put("peerHash", JsonString(gatewayLogIdentityHash(peerId)))
+        requestMeta.put("textLen", text.size.toJsonValue())
+        requestMeta.put("replyToPresent", (!replyTarget.trimAscii().isEmpty()).toJsonValue())
+        this.logChannel("debug", MetisLogEvent.channelSend, "send", "request", "QQ official send request", extra: requestMeta)
 
         let header = HashMap<String, String>()
         header["Content-Type"] = "application/json; charset=utf-8"
@@ -646,22 +799,24 @@ public class QQAdapter <: ChannelAdapter {
             HttpUtils.post(url, header, JsonObject(body))
         } catch (e: HttpException) {
             this.lastSendError = "official send http error: ${e.message}"
-            this.logError("QQ send(official): ${this.lastSendError}")
+            this.logChannel("warn", MetisLogEvent.messageSendFailed, "send", "failed", "QQ official send HTTP error", errorKind: "transport", error: this.lastSendError, extra: requestMeta)
             return ""
         } catch (e: Exception) {
             this.lastSendError = "official send exception: ${e.message}"
-            this.logError("QQ send(official): ${this.lastSendError}")
+            this.logChannel("warn", MetisLogEvent.messageSendFailed, "send", "failed", "QQ official send exception", errorKind: this.qqErrorKind(this.lastSendError), error: this.lastSendError, extra: requestMeta)
             return ""
         }
         let responseRaw = match (responseOpt) {
             case Some(resp) => resp
             case None =>
                 this.lastSendError = "empty http response"
-                this.logError("QQ send(official): empty http response")
+                this.logChannel("warn", MetisLogEvent.messageSendFailed, "send", "failed", "QQ official send returned empty response", errorKind: "transport", error: this.lastSendError, extra: requestMeta)
                 return ""
         }
-        let preview = if (responseRaw.size > 300) { responseRaw[..300] + "..." } else { responseRaw }
-        LogUtils.info("QQ send(official): response=${preview}")
+        let responseMeta = JsonObject()
+        responseMeta.put("responseBytes", responseRaw.size.toJsonValue())
+        responseMeta.put("isGroup", isGroup.toJsonValue())
+        this.logChannel("debug", MetisLogEvent.channelSend, "send", "response", "QQ official send response received", extra: responseMeta)
         this.parseOfficialSendMessageId(responseRaw)
     }
 
@@ -716,7 +871,7 @@ public class QQAdapter <: ChannelAdapter {
             case Some(resp) => resp
             case None =>
                 this.lastSendError = "official token api no response"
-                this.logError("QQ official_ws: ${this.lastSendError}")
+                this.logChannel("warn", MetisLogEvent.channelFailed, "official_ws", "failed", "QQ official token API returned no response", errorKind: "transport", error: this.lastSendError)
                 return ""
         }
         return try {
@@ -725,18 +880,20 @@ public class QQAdapter <: ChannelAdapter {
             let expiresIn = this.readIntField(jo, "expires_in")
             if (token.isEmpty()) {
                 this.lastSendError = "official token api missing access_token"
-                this.logError("QQ official_ws: ${this.lastSendError}")
+                this.logChannel("warn", MetisLogEvent.channelFailed, "official_ws", "failed", "QQ official token API missing access_token", errorKind: "credential", error: this.lastSendError)
                 return ""
             }
             this.officialAccessToken = token
             let ttl = if (expiresIn > 0) { expiresIn } else { 7200 }
             this.officialTokenExpireAtNano = nowNano + ttl * 1000000000
             this.lastSendError = ""
-            LogUtils.info("QQ official_ws: token acquired, ttl=${ttl}s")
+            let extra = JsonObject()
+            extra.put("ttlSeconds", ttl.toJsonValue())
+            this.logChannel("info", MetisLogEvent.channelStarted, "official_ws", "token_acquired", "QQ official token acquired", extra: extra)
             token
         } catch (e: Exception) {
             this.lastSendError = "official token parse failed: ${e.message}"
-            this.logError("QQ official_ws: ${this.lastSendError}")
+            this.logChannel("warn", MetisLogEvent.channelFailed, "official_ws", "failed", "QQ official token parse failed", errorKind: "parse", error: this.lastSendError)
             ""
         }
     }
@@ -861,13 +1018,13 @@ public class QQAdapter <: ChannelAdapter {
         spawn {
             while (this.running) {
                 try {
-                    this.logInfo("QQ official_ws: connecting gateway...")
+                    this.logChannel("debug", MetisLogEvent.channelPull, "official_ws", "connecting", "QQ official websocket connecting")
                     this.connectOfficialGatewayAndServe()
                 } catch (e: Exception) {
                     this.lastSendError = "official ws loop error: ${e.message}"
-                    this.logError("QQ official_ws loop error: ${e.message}")
+                    this.logChannel("warn", MetisLogEvent.channelFailed, "official_ws", "failed", "QQ official websocket loop error", errorKind: this.qqErrorKind(e.message), error: e.message)
                 }
-                this.logInfo("QQ official_ws: reconnect in 3s")
+                this.logChannel("debug", MetisLogEvent.channelPull, "official_ws", "reconnect_scheduled", "QQ official websocket reconnect scheduled")
                 sleep(Duration.second * 3)
             }
         }
@@ -880,7 +1037,9 @@ public class QQAdapter <: ChannelAdapter {
         if (gatewayUrl.isEmpty()) {
             throw Exception("official gateway url is empty")
         }
-        this.logInfo("QQ official_ws: using gateway url ${gatewayUrl}")
+        let gatewayMeta = JsonObject()
+        gatewayMeta.put("urlConfigured", true.toJsonValue())
+        this.logChannel("debug", MetisLogEvent.channelPull, "official_ws", "gateway_url_resolved", "QQ official websocket gateway URL resolved", extra: gatewayMeta)
 
         // wss 连接必须显式配置 TLS，否则会报
         // "TLS must be configured when HTTPS requests are sent."
@@ -893,7 +1052,7 @@ public class QQAdapter <: ChannelAdapter {
         let _respHeaders: HttpHeaders
         (websocket, _respHeaders) = WebSocket.upgradeFromClient(client, u)
         client.close()
-        this.logInfo("QQ official_ws: websocket connected")
+        this.logChannel("info", MetisLogEvent.channelStarted, "official_ws", "connected", "QQ official websocket connected")
 
         var heartbeatIntervalMs: Int64 = 30000
         var heartbeatStarted = false
@@ -903,7 +1062,9 @@ public class QQAdapter <: ChannelAdapter {
             let frame = websocket.read()
             if (frame.frameType == CloseWebFrame) {
                 let closePayload = frame.payload.toString()
-                this.logInfo("QQ official_ws: received CLOSE frame, payload=${closePayload}")
+                let extra = JsonObject()
+                extra.put("payloadBytes", closePayload.size.toJsonValue())
+                this.logChannel("info", MetisLogEvent.channelStopped, "official_ws", "closed", "QQ official websocket close frame received", extra: extra)
                 shouldReconnect = true
                 break
             }
@@ -934,7 +1095,9 @@ public class QQAdapter <: ChannelAdapter {
                 if (interval > 0) {
                     heartbeatIntervalMs = interval
                 }
-                this.logInfo("QQ official_ws: received HELLO, heartbeat_interval=${heartbeatIntervalMs}ms")
+                let extra = JsonObject()
+                extra.put("heartbeatIntervalMs", heartbeatIntervalMs.toJsonValue())
+                this.logChannel("info", MetisLogEvent.channelPull, "heartbeat", "hello", "QQ official websocket hello received", extra: extra)
                 this.sendOfficialIdentifyOrResume(websocket)
                 if (!heartbeatStarted) {
                     heartbeatStarted = true
@@ -945,7 +1108,9 @@ public class QQAdapter <: ChannelAdapter {
             if (op == 0) { // Dispatch
                 // 直接复用官方事件解析路径（t+d）。
                 let eventType = this.readStringField(jo, "t")
-                LogUtils.info("QQ official_ws: dispatch event ${eventType}")
+                let dispatchMeta = JsonObject()
+                dispatchMeta.put("eventType", JsonString(eventType))
+                this.logChannel("debug", MetisLogEvent.messageInbound, "official_ws", "dispatch", "QQ official websocket dispatch event", extra: dispatchMeta)
                 if (eventType == "READY") {
                     let data = match (jo.get("d")) {
                         case Some(v) =>
@@ -955,32 +1120,38 @@ public class QQAdapter <: ChannelAdapter {
                     let sessionId = this.readStringField(data, "session_id")
                     if (!sessionId.isEmpty()) {
                         this.officialSessionId = sessionId
-                        LogUtils.info("QQ official_ws: saved session_id=${sessionId}")
+                        let sessionMeta = JsonObject()
+                        sessionMeta.put("sessionHash", JsonString(gatewayLogIdentityHash(sessionId)))
+                        this.logChannel("debug", MetisLogEvent.channelPull, "official_ws", "session_saved", "QQ official websocket session saved", extra: sessionMeta)
                     }
                 }
                 let ack = this.ingestWebhookPayload(payload)
                 if (ack.contains("\"ok\":false")) {
-                    LogUtils.info("QQ official_ws: dispatch ignored ${ack}")
+                    let ackMeta = JsonObject()
+                    ackMeta.put("ackBytes", ack.size.toJsonValue())
+                    this.logChannel("debug", MetisLogEvent.messageInbound, "official_ws", "dispatch_ignored", "QQ official websocket dispatch ignored", extra: ackMeta)
                 }
                 continue
             }
             if (op == 11) { // Heartbeat ACK
-                LogUtils.debug("QQ official_ws: heartbeat ack")
+                this.logChannel("debug", MetisLogEvent.channelPull, "heartbeat", "ack", "QQ official websocket heartbeat ack")
                 continue
             }
             if (op == 9) { // Invalid Session
-                this.logError("QQ official_ws: invalid session (op=9)")
+                this.logChannel("warn", MetisLogEvent.channelFailed, "official_ws", "failed", "QQ official websocket invalid session", errorKind: "session", error: "op=9")
                 this.officialSessionId = ""
                 this.officialSeq = 0
                 shouldReconnect = true
                 break
             }
             if (op == 7) { // Reconnect
-                this.logInfo("QQ official_ws: server requested reconnect (op=7)")
+                this.logChannel("info", MetisLogEvent.channelPull, "official_ws", "reconnect_requested", "QQ official websocket server requested reconnect")
                 shouldReconnect = true
                 break
             }
-            LogUtils.info("QQ official_ws: received op=${op}")
+            let opMeta = JsonObject()
+            opMeta.put("op", op.toJsonValue())
+            this.logChannel("debug", MetisLogEvent.channelPull, "official_ws", "received", "QQ official websocket op received", extra: opMeta)
         }
         try {
             websocket.closeConn()
@@ -1058,7 +1229,17 @@ public class QQAdapter <: ChannelAdapter {
 
         root["d"] = JsonObject(d)
         let payload = JsonObject(root).toJsonString()
-        LogUtils.info("QQ official_ws: sending IDENTIFY, token_source=app_access_token, scheme=${this.config.officialAuthScheme}, intents=${this.config.officialIntents}")
+        let identifyMeta = JsonObject()
+        identifyMeta.put("scheme", JsonString(this.config.officialAuthScheme))
+        identifyMeta.put("intents", JsonInt(this.config.officialIntents))
+        this.logChannel(
+            "debug",
+            MetisLogEvent.channelSend,
+            "official_ws",
+            "identify",
+            "QQ official websocket sending IDENTIFY",
+            extra: identifyMeta
+        )
         websocket.write(TextWebFrame, payload.toArray())
     }
 
@@ -1082,7 +1263,17 @@ public class QQAdapter <: ChannelAdapter {
         root["d"] = JsonObject(d)
 
         let payload = JsonObject(root).toJsonString()
-        LogUtils.info("QQ official_ws: sending RESUME, session_id=${this.officialSessionId}, seq=${this.officialSeq}")
+        let resumeMeta = JsonObject()
+        resumeMeta.put("sessionHash", JsonString(gatewayLogIdentityHash(this.officialSessionId)))
+        resumeMeta.put("seq", JsonInt(this.officialSeq))
+        this.logChannel(
+            "debug",
+            MetisLogEvent.channelSend,
+            "official_ws",
+            "resume",
+            "QQ official websocket sending RESUME",
+            extra: resumeMeta
+        )
         websocket.write(TextWebFrame, payload.toArray())
     }
 

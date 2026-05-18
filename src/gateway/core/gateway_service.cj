@@ -1223,7 +1223,7 @@ public class GatewayService {
                 "telegram lifecycle chat-action skipped",
                 meta: gatewayLogMeta()
                     .string("channel", "telegram")
-                    .string("accountId", accountId)
+                    .string("accountId", "default")
                     .identityHash("peerHash", message.peerId)
                     .string("status", "skipped")
                     .string("errorKind", "chat_action_failed")
@@ -2774,7 +2774,7 @@ public class GatewayService {
                 "telegram native command failed to persist session option",
                 meta: gatewayLogMeta()
                     .string("channel", "telegram")
-                    .string("accountId", accountId)
+                    .string("accountId", "default")
                     .string("sessionKey", sessionKey)
                     .string("field", field)
                     .string("errorKind", "session_option_persist_failed")

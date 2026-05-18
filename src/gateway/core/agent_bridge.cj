@@ -18,8 +18,6 @@ import metis.core.skills.tryHandleSkillsCommand
 import metis.cron.{executeGatewayCronCommand, parseSlashCronLine}
 import metis.gateway.session.GatewayTurnContext
 import metis.gateway.tools.{GatewayCronToolset, GatewayFeishuMediaToolset, GatewayFeishuOapiToolset, GatewayFSToolset, GatewayGatewayToolset, GatewayImageGenerationToolset, GatewayManagedSessionsToolset, GatewayMemoryToolset, GatewayMessageToolset, GatewayPlanToolset, GatewaySessionTranscriptToolset, GatewayShellToolset, GatewayTelegramMediaToolset, GatewayTtsToolset, GatewayVideoGenerationToolset, GatewayWeatherToolset, gatewayHandleNativeCommandLine, gatewayHandleSubagentsCommandLine}
-import metis.io.{PrintUtils, AnsiColor, WithColor}
-
 import std.collection.{HashMap, ArrayList, enumerate}
 import std.fs.Path
 import std.sync.Mutex
@@ -899,7 +897,16 @@ public class AgentBridge {
             )
             let skillNotice = gatewaySkillSelectionUserNotice(skillsEnabled, selectedSkillNameOpt)
             if (!skillNotice.isEmpty()) {
-                PrintUtils.printLine(skillNotice.withColor(AnsiColor.WHITE))
+                gatewayLogEventDebug(
+                    "gateway/skills",
+                    "skill.matched",
+                    "gateway skill user notice prepared",
+                    meta: gatewayLogMeta()
+                        .string("channel", channelName.trimAscii().toAsciiLower())
+                        .string("agentId", effectiveAgentId)
+                        .int("noticeChars", Int64(skillNotice.size))
+                        .object()
+                )
             }
             match (selectedSkillNameOpt) {
                 case Some(skillName) =>
