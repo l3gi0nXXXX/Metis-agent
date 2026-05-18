@@ -120,11 +120,17 @@
 
 ### 4.2 文件日志事件字段标准
 
-所有 Gateway 文件日志后续统一为 JSONL，一行一个对象。字段必须稳定：
+所有 Gateway 文件日志后续统一为 JSONL，一行一个对象。字段必须稳定。本节字段按三类标注，避免把 OpenClaw 的实现细节和 Metis 必须适配的业务字段混为一谈：
+
+| 分类 | 含义 | 本方案处理 |
+| --- | --- | --- |
+| OpenClaw 原样采用 | OpenClaw 文件日志已经稳定使用，Metis 没有必要改名 | `time`、`level`、`subsystem`、`event`、`message` |
+| OpenClaw 原则对齐但 Metis 适配 | 结构化、可筛选、脱敏、摘要化原则对齐 OpenClaw，但字段来自 Metis Gateway/IM 运行时 | `channel`、`accountId`、`agentId`、`sessionKey`、`peerId`、`messageId`、`direction`、`status`、`durationMs`、`textLen`、`mediaCount`、`errorKind`、`error` |
+| Metis 扩展 | Metis 为 Control UI、会话、渠道兼容性增加的字段；新增前必须写入事件字典和验收项 | 后续新增字段 |
 
 | 字段 | 必填 | 说明 |
 | --- | --- | --- |
-| `time` | 是 | ISO 时间戳，与 OpenClaw JSONL 文件日志字段对齐 |
+| `time` | 是 | ISO 时间戳；对齐 OpenClaw 文件日志字段名，不使用 `ts` |
 | `level` | 是 | `trace/debug/info/warn/error/fatal` |
 | `subsystem` | 是 | 例如 `gateway`, `gateway/channel/telegram`, `gateway/model`, `gateway/control-ui` |
 | `event` | 是 | 稳定事件名，例如 `message.inbound`, `message.outbound`, `channel.started` |
@@ -133,7 +139,7 @@
 | `accountId` | 视事件 | channel account |
 | `agentId` | 视事件 | agent id |
 | `sessionKey` | 视事件 | 会话 key，可截断或 hash |
-| `peerId` | 视事件 | IM peer id，默认脱敏或 hash；debug 可显示红acted摘要 |
+| `peerId` | 视事件 | IM peer id，默认脱敏或 hash；debug 可显示 redacted 摘要 |
 | `messageId` | 视事件 | IM message id |
 | `direction` | 视事件 | `inbound/outbound` |
 | `status` | 视事件 | `started/ok/failed/skipped/degraded` |
@@ -212,6 +218,59 @@
    ```
 
 2. 输出点清单必须覆盖上述命令返回的每一类文件；如果暂不迁移，必须写明理由和所属 allowlist。
+
+#### Phase 0.3 Metis 当前输出点审计清单（2026-05-18）
+
+审计命令均在 `/Users/l3gi0n/work/workspace_cangjie/Metis/.worktrees/logging-docs-20260518` 执行，使用 `rg`，未调用 pager，未修改配置。
+
+| 扫描面 | 命令 | 当前结论 |
+| --- | --- | --- |
+| Gateway `LogUtils` | `rg -c "LogUtils\\.(trace|debug|info|error)" src/gateway -g'*.cj'` | 25 个 Gateway 文件仍有直接 `LogUtils` 调用，需要 Phase 2-6 逐步迁移到 Gateway logger facade。 |
+| Gateway/Program/IO 用户输出 | `rg -c "PrintUtils\\.printLine|println\\(|print\\(|eprintln\\(" src/gateway src/program src/io -g'*.cj'` | `PrintUtils.printLine` 是现有 CLI human 输出入口；Gateway adapter 中仍有 QQ/Feishu/Telegram 启动、诊断、命令输出混用，需要迁移到 shell reporter 或 logger。 |
+| JS stdout/stderr | `rg -c "process\\.(stdout|stderr)\\.write|console\\.(log|error|warn|info|debug)" scripts -g'*.mjs'` | 9 个 JS 脚本有 stdout/stderr/console 输出；协议 sidecar 和兼容工具需要显式 allowlist，新增 sidecar 应改走 helper。 |
+| 用户文档日志描述 | `rg -n "Gateway\\.inbound|Gateway\\.reply|Gateway\\.send|logs|log" docs/user README.md -g'*.md'` | `docs/user/gateway-im-plugins.md` 已有日志位置和 inbound/outbound 排查，但没有统一 `metis logs` 命令说明。 |
+
+Gateway `LogUtils` 当前文件矩阵：
+
+| 文件 | 命中数 | 分类 | Phase 处理 |
+| --- | ---: | --- | --- |
+| `src/gateway/core/gateway_service.cj` | 29 | Gateway 生命周期、route、inbound、reply、send | Phase 4 优先迁移；`Gateway.inbound` 正文输出必须改为 `textLen`/摘要。 |
+| `src/gateway/channels/telegram/telegram_adapter.cj` | 20 | Telegram polling/webhook/命令/配对/发送诊断 | Phase 5 迁移到 channel/account logger，错误统一 redaction。 |
+| `src/gateway/channels/qq/qq_adapter.cj` | 18 | QQ ingest/send/official ws/heartbeat | Phase 5 迁移；heartbeat ack 降到 debug。 |
+| `src/gateway/runtime/demo.cj` | 16 | Gateway serve 生命周期 | Phase 3/4 迁移到 startup reporter + `gateway.*` 事件。 |
+| `src/gateway/runtime/gateway_control_ui_ws.cj` | 16 | Control UI WS 连接/帧诊断 | Phase 7 迁移到 `gateway/rpc` 与 `gateway/control-ui`。 |
+| `src/gateway/core/agent_bridge.cj` | 15 | 模型、技能、prompt、reply | Phase 4 迁移到 `gateway/model` 和 `message.reply.generated`，避免 prompt/response 泄露。 |
+| `src/gateway/runtime/cron_runner.cj` | 12 | cron runtime | Phase 4 后补 `gateway/cron` 子系统。 |
+| `src/gateway/core/gateway_channel_manager.cj` | 7 | channel start/stop/pull | Phase 5 优先迁移；普通模式只保留 account 摘要。 |
+| `src/gateway/core/gateway_session_executor.cj` | 5 | streaming send fallback | Phase 4 迁移到 message outbound/send event。 |
+| `src/gateway/config/gateway_channel_plugin.cj` | 5 | plugin discover | Phase 6 迁移到 plugin/channel logger。 |
+| `src/gateway/runtime/gateway_config_reload_handler.cj` | 4 | config reload | Phase 4/7 迁移到 `gateway/config`。 |
+| `src/gateway/core/gateway_session_store.cj` | 3 | session store error | Phase 4 后补 `gateway/session`。 |
+| `src/gateway/runtime/gateway_config_reloader.cj` | 3 | config reload | Phase 4/7 迁移到 `gateway/config`。 |
+| `src/gateway/runtime/gateway_platform_state.cj` | 3 | platform state | Phase 7 Control UI/RPC 迁移。 |
+| `src/gateway/runtime/gateway_cli.cj` | 2 | CLI timing/bootstrap | Phase 3 迁移到 shell reporter。 |
+| `src/gateway/runtime/gateway_config_factory.cj` | 2 | config factory timing | Phase 3/4 降级 debug 或 structured event。 |
+| `src/gateway/runtime/gateway_external_console.cj` | 2 | external console launch | Phase 3 迁移到 shell reporter。 |
+| `src/gateway/channels/plugin/command_plugin_adapter.cj` | 2 | plugin adapter pull/start failure | Phase 6 迁移到 plugin logger。 |
+| `src/gateway/channels/plugin/legacy_node_plugin_adapter.cj` | 2 | legacy plugin adapter failure | Phase 6 迁移到 plugin logger。 |
+| `src/gateway/startup_auth.cj` | 1 | startup auth | Phase 3 迁移到 startup reporter/logger。 |
+| `src/gateway/runtime/gateway_chat_turn_runtime.cj` | 1 | chat turn runtime | Phase 4 迁移。 |
+| `src/gateway/runtime/gateway_configured_channel_binding_registry.cj` | 1 | binding registry | Phase 5/7 迁移。 |
+| `src/gateway/channels/feishu/feishu_adapter.cj` | 1 | Feishu adapter | Phase 5 迁移。 |
+| `src/gateway/core/gateway_cron_session_reaper.cj` | 1 | cron session reaper | Phase 4 后补 `gateway/session`。 |
+| `src/gateway/core/gateway_process_memory.cj` | 1 | process memory | Phase 4 后补 `gateway/runtime`。 |
+
+JS stdout/stderr 当前 allowlist：
+
+| 文件 | 当前用途 | 允许条件 | 后续任务 |
+| --- | --- | --- | --- |
+| `scripts/feishu-ws-sidecar.mjs` | stdout 写协议 JSON frame；stderr 写 `[feishu-monitor]` 诊断；console patched 到 stderr | 暂时允许；不得新增裸 stdout human 文本 | Phase 6 抽 `writeProtocol`/`writeDiagnostic` helper。 |
+| `scripts/openclaw-compat-host.mjs` | 兼容 host 机器输出 | 暂时允许；stdout 只能是一行 JSON frame | Phase 6 迁移 helper。 |
+| `scripts/openclaw-plugin-sidecar.mjs` | plugin sidecar RPC JSON 输出 | 暂时允许；stdout 只能是 JSON response | Phase 6 迁移 helper。 |
+| `scripts/legacy-channel-host.mjs` | legacy host 透传子进程 stdout | 暂时允许；需要协议边界复核 | Phase 6 迁移或收窄。 |
+| `scripts/openclaw-compat-*.mjs`、`scripts/openclaw-plugin-inventory.mjs` | CLI/测试报告 JSON 输出 | 仅作为显式命令输出允许 | 不属于 Gateway runtime sidecar；保留 CLI human/JSON 契约测试。 |
+
+本审计清单落在 `develop_steps`，该目录被 `.gitignore` 忽略；本次提交需要用 `git add -f` 强制纳入。
 
 ### Phase 1：日志配置模型与当前日志文件语义
 
@@ -646,10 +705,12 @@
 1. 执行：
 
    ```bash
-   rg -n "LogUtils\\.(trace|debug|info|error)" src/gateway -g'*.cj'
+   scripts/logging-output-gate.sh
    ```
 
-2. 除 allowlist 外不得有结果；allowlist 必须在测试或文档中列明。
+2. 门禁脚本必须报告 `gateway/channel LogUtils: allowed=N disallowed=0`。
+3. 新增 `LogUtils` 调用只能出现在 `scripts/logging-output-gate.sh` 中明确 allowlist 的 legacy 文件；新增文件不得默认加入 allowlist。
+4. 当 Phase 4/5/6 迁移完成一个文件后，必须从脚本 allowlist 移除该文件。
 
 #### Phase 8.2 禁止直接 stdout/stderr 污染机器输出
 
@@ -669,11 +730,15 @@
 1. 执行：
 
    ```bash
-   rg -n "println\\(|print\\(|eprintln\\(|process\\.stdout\\.write|process\\.stderr\\.write" src scripts -g'*.cj' -g'*.mjs'
+   scripts/logging-output-gate.sh
    ```
 
-2. 所有结果必须属于 `PrintUtils`、shell reporter、sidecar helper、测试、或明确 allowlist。
-3. 随机抽取 5 个 `--json` CLI 命令，stdout 必须可直接 `jq` 解析。
+2. 门禁脚本必须报告：
+   - `gateway/channel direct print: allowed=N disallowed=0`
+   - `JS sidecar stdout: allowed=N disallowed=0`
+   - `JS sidecar stderr: allowed=N disallowed=0`
+3. `scripts/logging-output-gate.sh` 不得调用 `less`、`more`、`clear`、`exit` 用户 shell、修改配置文件或写入项目文件；只允许创建并清理临时目录。
+4. 随机抽取 5 个 `--json` CLI 命令，stdout 必须可直接 `jq` 解析。
 
 #### Phase 8.3 安全扫描门禁
 
@@ -692,6 +757,30 @@
 
 1. fake secret 出现在输入配置、fake inbound、fake error 中，但不得出现在任何输出文件。
 2. CI 测试失败时必须打印哪个文件泄露了哪个 fake secret 的 redacted key 名称，不打印 secret 原值。
+
+#### Phase 8.4 本轮新增门禁脚本
+
+| 文件 | 作用 | 当前 allowlist 边界 |
+| --- | --- | --- |
+| `scripts/logging-output-gate.sh` | Phase 8 静态门禁；扫描 Gateway/Channel `LogUtils`、Gateway/Channel 直接 print/eprintln、JS sidecar stdout/stderr | 只允许 Phase 0.3 列出的 legacy 文件；新增文件命中即失败。 |
+| `scripts/logging-output-gate-test.sh` | Bash 自测；构造临时 fixture 验证 allowlist 通过、非法 Gateway `LogUtils` 失败、非法 sidecar stdout 失败 | 不依赖 Node，不调用网络，不读写 `~/.metis`。 |
+
+脚本输出示例：
+
+```text
+gateway/channel LogUtils: allowed=166 disallowed=0
+gateway/channel direct print: allowed=0 disallowed=0
+JS sidecar stdout: allowed=23 disallowed=0
+JS sidecar stderr: allowed=1 disallowed=0
+logging-output-gate: passed
+```
+
+脚本设计约束：
+
+1. 只使用 `bash`、`rg`、`mktemp`、`wc`、`sed`、`rm` 等本地工具。
+2. 不清屏、不进入 pager、不修改 Metis 配置、不启动 Gateway、不访问真实 IM 网络。
+3. 可用 `--root <dir>` 指向临时 fixture，方便 shell 自测。
+4. 失败时只打印前 120 行 disallowed 命中，避免刷屏。
 
 ### Phase 9：文档、手工验收与总体验证
 
