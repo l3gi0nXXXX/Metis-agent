@@ -30,6 +30,7 @@ private var managedSubagentAgentIds = HashMap<String, String>()
 private var managedSubagentStates = HashMap<String, String>()
 private var managedSubagentFutures = HashMap<String, Future<Unit>>()
 private var managedSubagentProcesses = HashMap<String, SubProcess>()
+private var sessionsSendRuntimeRunnerForTest: Option<(String, String) -> String> = None<(String, String) -> String>
 
 /**
  * 对齐参考实现的 Agent 侧网关会话工具：操作本地 `~/.metis/agents/<agentId>/sessions` 转录。
@@ -185,6 +186,334 @@ public class GatewaySessionsToolset {
             return sessionKey
         }
         return ""
+    }
+
+    private func configObjectField(obj: JsonObject, key: String): Option<JsonObject> {
+        match (obj.get(key)) {
+            case Some(value) =>
+                try { Some(value.asObject()) } catch (_: Exception) { None<JsonObject> }
+            case None => None<JsonObject>
+        }
+    }
+
+    private func configStringField(obj: JsonObject, key: String): String {
+        match (obj.get(key)) {
+            case Some(value) =>
+                try { value.asString().getValue().trimAscii() } catch (_: Exception) { "" }
+            case None => ""
+        }
+    }
+
+    private func configBoolField(obj: JsonObject, key: String, defaultValue: Bool): Bool {
+        match (obj.get(key)) {
+            case Some(value) =>
+                try { value.asBool().getValue() } catch (_: Exception) {
+                    let raw = try { value.asString().getValue().trimAscii().toAsciiLower() } catch (_inner: Exception) { "" }
+                    if (raw == "true" || raw == "1" || raw == "yes" || raw == "on") {
+                        true
+                    } else if (raw == "false" || raw == "0" || raw == "no" || raw == "off") {
+                        false
+                    } else {
+                        defaultValue
+                    }
+                }
+            case None => defaultValue
+        }
+    }
+
+    private func configStringArrayField(obj: JsonObject, key: String): Array<String> {
+        let out = ArrayList<String>()
+        match (obj.get(key)) {
+            case Some(value) =>
+                try {
+                    let arr = value.asArray()
+                    var i: Int64 = 0
+                    while (i < arr.size()) {
+                        let item = arr[i]
+                        let text = try { item.asString().getValue().trimAscii() } catch (_: Exception) { "" }
+                        if (!text.isEmpty()) {
+                            out.add(text)
+                        }
+                        i += 1
+                    }
+                } catch (_: Exception) {
+                    ()
+                }
+            case None => ()
+        }
+        out.toArray()
+    }
+
+    private func rawConfigRoot(): JsonObject {
+        match (MetisConfigManager.rawConfig()) {
+            case Some(raw) =>
+                try { JsonValue.fromStr(raw.toJsonString()).asObject() } catch (_: Exception) { JsonObject() }
+            case None => JsonObject()
+        }
+    }
+
+    private func agentToAgentPolicyObject(): JsonObject {
+        let root = this.rawConfigRoot()
+        match (this.configObjectField(root, "tools")) {
+            case Some(tools) =>
+                match (this.configObjectField(tools, "agentToAgent")) {
+                    case Some(policy) => return policy
+                    case None => ()
+                }
+            case None => ()
+        }
+        match (this.configObjectField(root, "gateway")) {
+            case Some(gateway) =>
+                match (this.configObjectField(gateway, "agentToAgent")) {
+                    case Some(policy) => return policy
+                    case None => ()
+                }
+            case None => ()
+        }
+        JsonObject()
+    }
+
+    private func sessionToolsVisibility(policy: JsonObject): String {
+        let direct = this.configStringField(policy, "visibility").toAsciiLower()
+        if (direct == "self" || direct == "tree" || direct == "agent" || direct == "all") {
+            return direct
+        }
+        let root = this.rawConfigRoot()
+        match (this.configObjectField(root, "tools")) {
+            case Some(tools) =>
+                match (this.configObjectField(tools, "sessions")) {
+                    case Some(sessions) =>
+                        let value = this.configStringField(sessions, "visibility").toAsciiLower()
+                        if (value == "self" || value == "tree" || value == "agent" || value == "all") {
+                            return value
+                        }
+                    case None => ()
+                }
+            case None => ()
+        }
+        return "tree"
+    }
+
+    private func normalizeA2AAgentId(agentId: String): String {
+        agentId.trimAscii().toAsciiLower()
+    }
+
+    private func agentIdFromSessionKey(sessionKey: String): String {
+        let trimmed = sessionKey.trimAscii()
+        if (!trimmed.startsWith("agent:")) {
+            return ""
+        }
+        let rest = trimmed["agent:".size..]
+        match (rest.indexOf(":")) {
+            case Some(idx) => this.normalizeA2AAgentId(rest[0..idx])
+            case None => this.normalizeA2AAgentId(rest)
+        }
+    }
+
+    private func requesterAgentIdFromContext(): String {
+        match (gatewayCurrentToolRuntimeContext()) {
+            case Some(ctx) =>
+                let explicit = this.normalizeA2AAgentId(ctx.agentId)
+                if (!explicit.isEmpty()) {
+                    return explicit
+                }
+                this.agentIdFromSessionKey(ctx.sessionKey)
+            case None => ""
+        }
+    }
+
+    private func targetAgentIdForSession(sessionKey: String): String {
+        let fromKey = this.agentIdFromSessionKey(sessionKey)
+        if (!fromKey.isEmpty()) {
+            return fromKey
+        }
+        this.normalizeA2AAgentId(this.managedSubagentAgentId(sessionKey))
+    }
+
+    private func a2aPatternMatches(pattern: String, agentId: String): Bool {
+        let raw = pattern.trimAscii().toAsciiLower()
+        let target = agentId.trimAscii().toAsciiLower()
+        if (raw.isEmpty() || target.isEmpty()) {
+            return false
+        }
+        if (raw == "*") {
+            return true
+        }
+        if (!raw.contains("*")) {
+            return raw == target
+        }
+        let parts = raw.split("*")
+        var position: Int64 = 0
+        var index: Int64 = 0
+        while (index < parts.size) {
+            let part = parts[index]
+            if (part.isEmpty()) {
+                index += 1
+                continue
+            }
+            match (target[position..].indexOf(part)) {
+                case Some(found) =>
+                    if (index == 0 && !raw.startsWith("*") && found != 0) {
+                        return false
+                    }
+                    position += found + part.size
+                case None => return false
+            }
+            index += 1
+        }
+        if (!raw.endsWith("*") && parts.size > 0) {
+            let last = parts[parts.size - 1]
+            if (!last.isEmpty() && !target.endsWith(last)) {
+                return false
+            }
+        }
+        true
+    }
+
+    private func a2aAgentAllowed(agentId: String, allow: Array<String>): Bool {
+        if (allow.isEmpty()) {
+            return true
+        }
+        for (pattern in allow) {
+            if (this.a2aPatternMatches(pattern, agentId)) {
+                return true
+            }
+        }
+        false
+    }
+
+    private func a2aForbiddenJson(error: String, sessionKey: String): JsonObject {
+        let err = JsonObject()
+        err.put("ok", false.toJsonValue())
+        err.put("status", JsonString("forbidden"))
+        err.put("action", JsonString("sessions_send"))
+        err.put("sessionKey", JsonString(sessionKey))
+        err.put("error", JsonString(error))
+        err
+    }
+
+    private func a2aRuntimeErrorJson(error: String, sessionKey: String): JsonObject {
+        let err = JsonObject()
+        err.put("ok", false.toJsonValue())
+        err.put("status", JsonString("error"))
+        err.put("action", JsonString("sessions_send"))
+        err.put("sessionKey", JsonString(sessionKey))
+        err.put("error", JsonString(error))
+        err
+    }
+
+    private func checkAgentToAgentSendPolicy(requesterAgentId: String, targetAgentId: String, sessionKey: String): Option<JsonObject> {
+        if (requesterAgentId.isEmpty() || targetAgentId.isEmpty() || requesterAgentId == targetAgentId) {
+            return None<JsonObject>
+        }
+        let policy = this.agentToAgentPolicyObject()
+        if (!this.configBoolField(policy, "enabled", false)) {
+            return Some(this.a2aForbiddenJson(
+                "Agent-to-agent messaging is disabled. Set tools.agentToAgent.enabled=true to allow cross-agent sends.",
+                sessionKey
+            ))
+        }
+        if (this.sessionToolsVisibility(policy) != "all") {
+            return Some(this.a2aForbiddenJson(
+                "Session send visibility is restricted. Set tools.agentToAgent.visibility=all or tools.sessions.visibility=all to allow cross-agent access.",
+                sessionKey
+            ))
+        }
+        let allow = this.configStringArrayField(policy, "allow")
+        if (!this.a2aAgentAllowed(requesterAgentId, allow) || !this.a2aAgentAllowed(targetAgentId, allow)) {
+            return Some(this.a2aForbiddenJson("Agent-to-agent messaging denied by tools.agentToAgent.allow.", sessionKey))
+        }
+        None<JsonObject>
+    }
+
+    private func targetSessionSupportsRuntimeSend(sessionKey: String): Bool {
+        let runtime = this.managedSubagentRuntime(sessionKey)
+        if (runtime == "acp") {
+            return !this.managedSubagentAgentId(sessionKey).trimAscii().isEmpty()
+        }
+        this.supportsRealManagedSubagent(this.managedSubagentAgentId(sessionKey))
+    }
+
+    private func launchSessionsSendRuntimeForTest(sessionKey: String, task: String): Option<Bool> {
+        let runner = synchronized(managedSubagentLock) {
+            sessionsSendRuntimeRunnerForTest
+        }
+        match (runner) {
+            case Some(run) =>
+                this.setManagedSubagentState(sessionKey, "running")
+                let reply = try { run(sessionKey, task).trimAscii() } catch (e: Exception) {
+                    this.gwStore().appendTranscriptEntry(sessionKey, "system", "sessions_send test runtime failed: ${e.message}")
+                    this.setManagedSubagentState(sessionKey, "failed", error: e.message, exitCode: 1)
+                    return Some(false)
+                }
+                if (!reply.isEmpty()) {
+                    this.gwStore().appendTranscriptEntry(sessionKey, "assistant", reply)
+                }
+                this.setManagedSubagentState(sessionKey, "succeeded", resultSummary: reply, exitCode: 0)
+                Some(true)
+            case None => None<Bool>
+        }
+    }
+
+    private func launchSessionsSendRuntimeTurn(sessionKey: String, task: String): Bool {
+        match (this.launchSessionsSendRuntimeForTest(sessionKey, task)) {
+            case Some(value) => value
+            case None => this.launchManagedSessionTurn(sessionKey, task)
+        }
+    }
+
+    private func latestAssistantSnapshot(sessionKey: String): (Int64, String) {
+        var count: Int64 = 0
+        var latest = ""
+        let store = this.gwStore()
+        match (store.readTranscriptRaw(sessionKey)) {
+            case Some(raw) =>
+                for (line in raw.split("\n")) {
+                    let trimmed = line.trimAscii()
+                    if (trimmed.isEmpty() || !trimmed.startsWith("{")) {
+                        continue
+                    }
+                    try {
+                        let obj = JsonValue.fromStr(trimmed).asObject()
+                        let role = this.configStringField(obj, "role")
+                        if (role == "assistant") {
+                            count += 1
+                            latest = this.configStringField(obj, "text")
+                        }
+                    } catch (_: Exception) {
+                        ()
+                    }
+                }
+            case None => ()
+        }
+        if (count == 0) {
+            let formatted = store.formatHistoryAsText(sessionKey, 200)
+            for (block in formatted.split("\n\n")) {
+                let trimmed = block.trimAscii()
+                if (trimmed.startsWith("[assistant] ")) {
+                    count += 1
+                    latest = trimmed["[assistant] ".size..].trimAscii()
+                }
+            }
+        }
+        (count, latest)
+    }
+
+    private func waitForAssistantReply(sessionKey: String, baseline: (Int64, String), timeoutSeconds: Int64): Option<String> {
+        let timeoutMs = max(0, timeoutSeconds) * 1000
+        let deadline = DateTime.now().toUnixTimeStamp().toNanoseconds() / 1000000 + timeoutMs
+        while (DateTime.now().toUnixTimeStamp().toNanoseconds() / 1000000 <= deadline) {
+            let current = this.latestAssistantSnapshot(sessionKey)
+            if ((current[0] > baseline[0] || current[1] != baseline[1]) && !current[1].trimAscii().isEmpty()) {
+                return Some(current[1])
+            }
+            sleep(Duration.millisecond * 50)
+        }
+        let finalSnapshot = this.latestAssistantSnapshot(sessionKey)
+        if ((finalSnapshot[0] > baseline[0] || finalSnapshot[1] != baseline[1]) && !finalSnapshot[1].trimAscii().isEmpty()) {
+            return Some(finalSnapshot[1])
+        }
+        None<String>
     }
 
     private func buildSpawnLabel(label: String, runtime: String, agentId: String): String {
@@ -1324,6 +1653,14 @@ public class GatewaySessionsToolset {
         }
     ]
     public func sessionsSend(sessionKey: String, message: String, role: Option<String>): String {
+        this.sessionsSendRawAppendImpl(sessionKey, message, role)
+    }
+
+    public func sessionsSendForTest(sessionKey: String, message: String, role: Option<String>): String {
+        this.sessionsSendRawAppendImpl(sessionKey, message, role)
+    }
+
+    private func sessionsSendRawAppendImpl(sessionKey: String, message: String, role: Option<String>): String {
         let sk = sessionKey.trimAscii()
         let msg = message.trimAscii()
         PrintUtils.printTool("sessionsSend", shortMessage: sk)
@@ -1353,16 +1690,53 @@ public class GatewaySessionsToolset {
     }
 
     @tool[
-        description: "Metis-compatible cross-session send tool. Accepts either sessionKey or label plus message, appends the message to the local gateway session transcript, and returns a structured JSON result. timeoutSeconds is accepted for compatibility but does not block on a remote run.",
+        description: "Internal compatibility tool for raw gateway transcript append. Appends one user message to the target session without starting a runtime turn.",
+        parameters: {
+            sessionKey: "Target session key.",
+            message: "Text to append."
+        }
+    ]
+    public func sessions_append(sessionKey: String, message: String): String {
+        this.sessionsSendRawAppendImpl(sessionKey, message, Some<String>("user"))
+    }
+
+    @tool[
+        description: "Metis-compatible cross-session send tool. Accepts either sessionKey or label plus message. Same-agent or unscoped calls keep raw append compatibility; cross-agent sends require tools.agentToAgent policy and start a nested target session run.",
         parameters: {
             sessionKey: "Optional target session key. Provide either sessionKey or label.",
             label: "Optional spawned-session label. Provide either label or sessionKey.",
             agentId: "Optional agent id hint used during label lookup.",
             message: "Message text to append to the target session.",
-            timeoutSeconds: "Optional compatibility timeout hint. Current implementation acknowledges it but does not wait for a remote reply."
+            timeoutSeconds: "0 returns accepted after dispatch; positive values wait for a target assistant reply or return a timeout diagnostic."
         }
     ]
     public func sessions_send(
+        sessionKey: Option<String>,
+        label: Option<String>,
+        agentId: Option<String>,
+        message: String,
+        timeoutSeconds: Option<Int64>
+    ): String {
+        this.sessionsSendA2AImpl(sessionKey, label, agentId, message, timeoutSeconds)
+    }
+
+    public func sessionsSendA2AForTest(
+        sessionKey: Option<String>,
+        label: Option<String>,
+        agentId: Option<String>,
+        message: String,
+        timeoutSeconds: Option<Int64>
+    ): String {
+        this.sessionsSendA2AImpl(sessionKey, label, agentId, message, timeoutSeconds)
+    }
+
+    public func debugSetSessionsSendRuntimeRunnerForTest(runner: Option<(String, String) -> String>): Unit {
+        synchronized(managedSubagentLock) {
+            sessionsSendRuntimeRunnerForTest = runner
+        }
+    }
+
+    private func sessionsSendA2AImpl(
         sessionKey: Option<String>,
         label: Option<String>,
         agentId: Option<String>,
@@ -1440,18 +1814,99 @@ public class GatewaySessionsToolset {
             return out
         }
 
+        let requesterAgentId = this.requesterAgentIdFromContext()
+        let targetAgentId = this.targetAgentIdForSession(resolvedSessionKey)
+        match (this.checkAgentToAgentSendPolicy(requesterAgentId, targetAgentId, resolvedSessionKey)) {
+            case Some(err) =>
+                let out = err.toJsonString()
+                PrintUtils.printToolResult(out)
+                return out
+            case None => ()
+        }
+
+        let isCrossAgentRuntimeSend = !requesterAgentId.isEmpty() && !targetAgentId.isEmpty() && requesterAgentId != targetAgentId
+        if (!isCrossAgentRuntimeSend) {
+            st.appendTranscriptEntry(resolvedSessionKey, "user", msg)
+            let now = DateTime.now().toUnixTimeStamp().toNanoseconds() / 1000000
+            let result = JsonObject()
+            result.put("ok", true.toJsonValue())
+            result.put("action", JsonString("sessions_send"))
+            result.put("runId", JsonString("local-${now}"))
+            result.put("status", JsonString("completed"))
+            result.put("sessionKey", JsonString(resolvedSessionKey))
+            result.put("message", JsonString(msg))
+            result.put("compatMode", JsonString("raw-append"))
+            if (let Some(v) <- timeoutSeconds) {
+                if (v >= 0) {
+                    result.put("compatNote", JsonString("timeoutSeconds=${v} was accepted, but this non-cross-agent call used raw transcript append compatibility and did not wait for a remote reply."))
+                }
+            }
+            let out = result.toJsonString()
+            PrintUtils.printToolResult(out)
+            return out
+        }
+
+        if (!this.targetSessionSupportsRuntimeSend(resolvedSessionKey)) {
+            let err = this.a2aRuntimeErrorJson(
+                "Target session is not runtime-send capable. Use sessions_spawn runtime=subagent or runtime=acp for agent-to-agent sessions_send.",
+                resolvedSessionKey
+            )
+            let out = err.toJsonString()
+            PrintUtils.printToolResult(out)
+            return out
+        }
+
+        let waitSeconds = match (timeoutSeconds) {
+            case Some(v) => max(0, v)
+            case None => 30
+        }
+        let baseline = this.latestAssistantSnapshot(resolvedSessionKey)
         st.appendTranscriptEntry(resolvedSessionKey, "user", msg)
         let now = DateTime.now().toUnixTimeStamp().toNanoseconds() / 1000000
+        let launched = this.launchSessionsSendRuntimeTurn(resolvedSessionKey, msg)
+        if (!launched) {
+            let err = JsonObject()
+            err.put("ok", false.toJsonValue())
+            err.put("action", JsonString("sessions_send"))
+            err.put("runId", JsonString("local-${now}"))
+            err.put("status", JsonString("busy"))
+            err.put("sessionKey", JsonString(resolvedSessionKey))
+            err.put("message", JsonString(msg))
+            err.put("error", JsonString("Target session already has a queued or running runtime turn."))
+            let out = err.toJsonString()
+            PrintUtils.printToolResult(out)
+            return out
+        }
+
         let result = JsonObject()
         result.put("ok", true.toJsonValue())
         result.put("action", JsonString("sessions_send"))
         result.put("runId", JsonString("local-${now}"))
-        result.put("status", JsonString("completed"))
         result.put("sessionKey", JsonString(resolvedSessionKey))
         result.put("message", JsonString(msg))
-        if (let Some(v) <- timeoutSeconds) {
-            if (v >= 0) {
-                result.put("compatNote", JsonString("timeoutSeconds=${v} was accepted, but sessions_send only appends to the target transcript and does not wait for a remote reply."))
+        result.put("requesterAgentId", JsonString(requesterAgentId))
+        result.put("targetAgentId", JsonString(targetAgentId))
+        result.put("runtime", JsonString(this.managedSubagentRuntime(resolvedSessionKey)))
+        result.put("liveRunStarted", true.toJsonValue())
+        if (waitSeconds == 0) {
+            result.put("status", JsonString("accepted"))
+            let delivery = JsonObject()
+            delivery.put("status", JsonString("pending"))
+            delivery.put("mode", JsonString("announce"))
+            result.put("delivery", delivery)
+        } else {
+            match (this.waitForAssistantReply(resolvedSessionKey, baseline, waitSeconds)) {
+                case Some(reply) =>
+                    result.put("status", JsonString("ok"))
+                    result.put("reply", JsonString(reply))
+                    let delivery = JsonObject()
+                    delivery.put("status", JsonString("pending"))
+                    delivery.put("mode", JsonString("announce"))
+                    result.put("delivery", delivery)
+                case None =>
+                    result.put("ok", false.toJsonValue())
+                    result.put("status", JsonString("timeout"))
+                    result.put("error", JsonString("Timed out waiting for target assistant reply after ${waitSeconds}s."))
             }
         }
         let out = result.toJsonString()
