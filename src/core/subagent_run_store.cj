@@ -229,7 +229,8 @@ public func gatewaySubagentCreateRunRecord(
     worktreePath!: String = "",
     sandbox!: String = "inherit",
     cleanupMode!: String = "keep",
-    transcriptPath!: String = ""
+    transcriptPath!: String = "",
+    archiveAfterMinutes!: Int64 = -1
 ): JsonObject {
     let now = subagentNowMs()
     let runId = gatewaySubagentNewRunId(sessionsRoot, sessionKey)
@@ -272,6 +273,11 @@ public func gatewaySubagentCreateRunRecord(
     record.put("resultSummary", JsonString(""))
     record.put("outputPath", JsonString(""))
     record.put("transcriptPath", JsonString(transcriptPath.trimAscii()))
+    record.put("archiveAfterMinutes", archiveAfterMinutes.toJsonValue())
+    record.put("archiveDueAtMs", (if (archiveAfterMinutes >= 0) { now + archiveAfterMinutes * 60000 } else { 0 }).toJsonValue())
+    record.put("archiveStatus", JsonString(if (archiveAfterMinutes >= 0) { "scheduled" } else { "disabled" }))
+    record.put("archivedAtMs", 0.toJsonValue())
+    record.put("archivedTranscriptPath", JsonString(""))
     record.put("error", JsonString(""))
     record.put("exitCode", 0.toJsonValue())
     record.put("cancelRequested", JsonBool(false))

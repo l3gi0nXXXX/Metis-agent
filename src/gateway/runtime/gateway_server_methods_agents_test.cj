@@ -176,6 +176,23 @@ private func agentsTestRouteBinding(
     binding
 }
 
+private func agentsTestAcpBinding(
+    agentId: String,
+    channel: String,
+    accountId: String,
+    peerKind: String,
+    peerId: String,
+    mode!: String = "persistent"
+): JsonObject {
+    let binding = agentsTestRouteBinding(agentId, channel, accountId: accountId, peerKind: peerKind, peerId: peerId)
+    binding.put("type", JsonString("acp"))
+    let acp = JsonObject()
+    acp.put("mode", JsonString(mode))
+    acp.put("ready", JsonBool(true))
+    binding.put("acp", acp)
+    binding
+}
+
 private func agentsTestAddAgent(agentId: String): GatewayRpcResponse {
     let params = JsonObject()
     params.put("id", JsonString(agentId))
@@ -1144,6 +1161,44 @@ public class GatewayServerMethodsAgentsTest {
     }
 
     @TestCase
+    public func agentsBindingsListGroupsRouteAndAcpRows(): Unit {
+        withAgentsTempHome("metis-agents-bindings-acp-groups-home", { home: Path =>
+            Directory.create(home.join("agents"), recursive: true)
+            @Expect(agentsTestAddAgent("writer").ok, true)
+
+            let root = MetisConfigManager.rawConfig().getOrThrow()
+            let bindings = JsonArray([])
+            bindings.add(agentsTestRouteBinding("writer", "telegram", accountId: "bot-a", peerKind: "group", peerId: "-100_a"))
+            bindings.add(agentsTestAcpBinding("harness-a", "telegram", "bot-a", "group", "-100_a"))
+            root.put("bindings", bindings)
+            MetisConfigManager.writeRoot(root)
+            @Expect(agentsTestRawBindings().size(), 2)
+
+            let response = handleGatewayAgentsFamily("agents.bindings").getOrThrow()
+            @Expect(response.ok, true)
+            let result = response.result.asObject()
+            @Expect(result.get("count").getOrThrow().asInt().getValue(), 2)
+            @Expect(result.get("routeCount").getOrThrow().asInt().getValue(), 1)
+            @Expect(result.get("acpCount").getOrThrow().asInt().getValue(), 1)
+
+            let routeRows = agentsTestArray(result, "routeBindings")
+            let acpRows = agentsTestArray(result, "acpBindings")
+            @Expect(routeRows.size(), 1)
+            @Expect(acpRows.size(), 1)
+            let route = routeRows[0].asObject()
+            let acp = acpRows[0].asObject()
+            @Expect(agentsTestString(route, "type"), "route")
+            @Expect(agentsTestString(acp, "type"), "acp")
+            @Expect(agentsTestString(acp, "agentId"), "harness-a")
+            @Expect(agentsTestString(acp, "sessionKey"), "acp:harness-a:telegram:bot-a:group:-100_a")
+            @Expect(agentsTestString(acp, "lifecycle"), "ready")
+
+            let compatRows = agentsTestArray(result, "bindings")
+            @Expect(compatRows.size(), 2)
+        })
+    }
+
+    @TestCase
     public func agentsBindAndUnbindSupportThreadPeerMatch(): Unit {
         withAgentsTempHome("metis-agents-thread-binding-home", { _home: Path =>
             @Expect(agentsTestAddAgent("writer").ok, true)
@@ -1950,6 +2005,52 @@ public class GatewayServerMethodsAgentsTest {
             let persistedBroadcast = getResponse.result.asObject().get("team").getOrThrow().asObject().get("broadcast").getOrThrow().asObject()
             @Expect(agentsTestBool(persistedBroadcast, "enabled"), true)
             @Expect(persistedBroadcast.get("members").getOrThrow().asArray().size(), 2)
+        })
+    }
+
+    @TestCase
+    public func agentTeamBroadcastRpcPersistsStrategyAndResolverUsesIt(): Unit {
+        withAgentsTempHome("metis-agent-team-broadcast-strategy-rpc-home", { _home: Path =>
+            let bindings = JsonArray([])
+            bindings.add(agentsTestRouteBinding("content-pm", "telegram", accountId: "bot-a", peerKind: "group", peerId: "-100_strategy"))
+
+            let broadcast = JsonObject()
+            broadcast.put("enabled", JsonBool(true))
+            broadcast.put("members", agentsTestStringArray(["content-pm", "content-writer"]))
+            broadcast.put("strategy", JsonString("parallel"))
+
+            let createParams = JsonObject()
+            createParams.put("id", JsonString("content"))
+            createParams.put("template", JsonString("pm-writer-reviewer"))
+            createParams.put("bindings", bindings)
+            createParams.put("broadcast", broadcast)
+            @Expect(handleGatewayAgentsFamily("agents.teams.create", request: Some(GatewayRpcRequest("agents.teams.create", params: createParams))).getOrThrow().ok, true)
+
+            let getParams = JsonObject()
+            getParams.put("id", JsonString("content"))
+            let getResponse = handleGatewayAgentsFamily("agents.teams.get", request: Some(GatewayRpcRequest("agents.teams.get", params: getParams))).getOrThrow()
+            @Expect(getResponse.ok, true)
+            let persistedBroadcast = getResponse.result.asObject().get("team").getOrThrow().asObject()
+                .get("broadcast").getOrThrow().asObject()
+            @Expect(agentsTestBool(persistedBroadcast, "enabled"), true)
+            @Expect(agentsTestString(persistedBroadcast, "strategy"), "parallel")
+
+            let root = MetisConfigManager.rawConfig().getOrThrow()
+            let plan = gatewayResolveAgentTeamBroadcastPlan(GatewaySessionRequest(
+                GatewayIngressSource.Channel("telegram"),
+                channelName: "telegram",
+                text: "strategy rpc acceptance",
+                accountId: "bot-a",
+                peerId: "-100_strategy",
+                senderId: "sender-strategy",
+                routeRoot: root,
+                routeAccountId: "bot-a",
+                routePeerKind: "group",
+                routePeerId: "-100_strategy"
+            ))
+            @Expect(plan.enabled, true)
+            @Expect(plan.strategy, "parallel")
+            @Expect(plan.turns.size, 2)
         })
     }
 

@@ -416,13 +416,6 @@ private func teamScanAgentFilesAndPolicies(findings: JsonArray, summary: JsonObj
                 "Add explicit per-agent memory collections or mark the sharing decision in config.",
                 agentId: agentId)
         }
-        if (teamObject(raw, "memorySearch").size() > 0) {
-            teamAddFinding(findings, "agent-team-runtime-memorysearch-not-enforced", "warning", "agents.list[].memorySearch",
-                "memorySearch is parsed into agent scope but is not fully enforced by Gateway turn memory tools.",
-                "Users may assume per-agent memory search boundaries are active when the runtime still depends on tool implementation details.",
-                "Treat memorySearch as diagnostic-only until the memory tool runtime consumes this policy.",
-                agentId: agentId)
-        }
         if (teamSubagentsWide(raw)) {
             teamAddFinding(findings, "agent-team-subagent-wide", "warning", "agents.list[].subagents",
                 "subagents is configured without allowAgents.",

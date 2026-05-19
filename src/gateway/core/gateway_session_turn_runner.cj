@@ -22,6 +22,36 @@ private func gatewayJsonBool(obj: JsonObject, key: String): Bool {
     }
 }
 
+private func gatewayMemorySearchPolicyFromScope(scope: JsonObject): JsonObject {
+    match (scope.get("memorySearchPolicy")) {
+        case Some(policyValue) =>
+            try {
+                let policy = policyValue.asObject()
+                match (policy.get("raw")) {
+                    case Some(rawValue) => return rawValue.asObject()
+                    case None => ()
+                }
+            } catch (_: Exception) {
+                ()
+            }
+        case None => ()
+    }
+    match (scope.get("raw")) {
+        case Some(rawValue) =>
+            try {
+                let raw = rawValue.asObject()
+                match (raw.get("memorySearch")) {
+                    case Some(memorySearchValue) => return memorySearchValue.asObject()
+                    case None => ()
+                }
+            } catch (_: Exception) {
+                ()
+            }
+        case None => ()
+    }
+    JsonObject()
+}
+
 private func gatewayJsonInt(obj: JsonObject, key: String, fallback: Int64): Int64 {
     match (obj.get(key)) {
         case Some(v) =>
@@ -480,6 +510,7 @@ public func gatewayExecuteSessionRequestTurn(
         operatorScopes: request.operatorScopes,
         prompt: prompt,
         mediaContext: request.mediaContext,
+        memorySearchPolicy: gatewayMemorySearchPolicyFromScope(context.turnContext.agentScope),
         lifecycleHook: lifecycleHook
     )
     let mediaPrompt = gatewayBuildMediaContextPrompt(request.mediaContext)

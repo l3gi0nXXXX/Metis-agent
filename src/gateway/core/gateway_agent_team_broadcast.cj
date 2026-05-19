@@ -22,6 +22,7 @@ public class GatewayAgentTeamBroadcastTurn {
 public class GatewayAgentTeamBroadcastPlan {
     public let enabled: Bool
     public let teamId: String
+    public let strategy: String
     public let selectedAgentIds: Array<String>
     public let turns: Array<GatewayAgentTeamBroadcastTurn>
     public let diagnostics: Array<String>
@@ -29,12 +30,14 @@ public class GatewayAgentTeamBroadcastPlan {
     public init(
         enabled: Bool,
         teamId: String,
+        strategy: String,
         selectedAgentIds: Array<String>,
         turns: Array<GatewayAgentTeamBroadcastTurn>,
         diagnostics: Array<String>
     ) {
         this.enabled = enabled
         this.teamId = teamId.trimAscii()
+        this.strategy = strategy.trimAscii().toAsciiLower()
         this.selectedAgentIds = selectedAgentIds
         this.turns = turns
         this.diagnostics = diagnostics
@@ -69,6 +72,19 @@ private func gatewayBroadcastJsonArray(obj: JsonObject, key: String): JsonArray 
         case Some(v) => try { v.asArray() } catch (_: Exception) { JsonArray([]) }
         case None => JsonArray([])
     }
+}
+
+private func gatewayBroadcastNormalizeStrategy(raw: String, owner: String, defaultStrategy: String,
+    diagnostics: ArrayList<String>): String {
+    let normalized = raw.trimAscii().toAsciiLower()
+    if (normalized.isEmpty()) {
+        return defaultStrategy
+    }
+    if (normalized == "parallel" || normalized == "sequential") {
+        return normalized
+    }
+    diagnostics.add("broadcast-strategy-invalid:${owner}:${normalized}")
+    defaultStrategy
 }
 
 private func gatewayBroadcastCloneObject(obj: JsonObject): JsonObject {
@@ -169,6 +185,17 @@ private func gatewayBroadcastSelectedAgentIds(broadcast: JsonObject): Array<Stri
         return out.toArray()
     }
     []
+}
+
+private func gatewayBroadcastSelectedAgentIdsFromArray(arr: JsonArray): Array<String> {
+    let out = ArrayList<String>()
+    for (i in 0..arr.size()) {
+        let agentId = gatewayBroadcastAgentIdFromValue(arr[i])
+        if (!agentId.isEmpty() && !out.contains(agentId)) {
+            out.add(agentId)
+        }
+    }
+    out.toArray()
 }
 
 private func gatewayBroadcastTeamMemberIds(team: JsonObject): ArrayList<String> {
@@ -282,7 +309,7 @@ private func gatewayBroadcastMergePolicyFields(target: JsonObject, raw: JsonObje
 }
 
 private func gatewayBroadcastTurnRoute(route: GatewayAgentRoute, rawRoute: JsonObject, teamId: String,
-    selectedAgentIds: Array<String>): JsonObject {
+    selectedAgentIds: Array<String>, strategy: String, role: String, deliver: Bool, observerReason: String): JsonObject {
     let out = JsonObject()
     out.put("agentId", JsonString(route.agentId))
     out.put("channel", JsonString(route.channel))
@@ -307,6 +334,12 @@ private func gatewayBroadcastTurnRoute(route: GatewayAgentRoute, rawRoute: JsonO
     out.put("matchedBy", JsonString(route.matchedBy))
     out.put("broadcastTeamId", JsonString(teamId))
     out.put("broadcastEnabled", JsonBool(true))
+    out.put("broadcastStrategy", JsonString(strategy))
+    out.put("broadcastRole", JsonString(role))
+    out.put("broadcastDeliver", JsonBool(deliver))
+    if (!observerReason.isEmpty()) {
+        out.put("broadcastObserverReason", JsonString(observerReason))
+    }
     let selected = JsonArray([])
     for (agentId in selectedAgentIds) {
         selected.add(JsonString(agentId))
@@ -371,19 +404,37 @@ private func gatewayBroadcastContextForRoute(request: GatewaySessionRequest, rou
     )
 }
 
-private func gatewayBroadcastMediaContextForRoute(mediaContext: JsonObject, turnRoute: JsonObject): JsonObject {
+private func gatewayBroadcastInboundSnapshot(request: GatewaySessionRequest): JsonObject {
+    let snapshot = JsonObject()
+    snapshot.put("channel", JsonString(gatewayBroadcastChannelName(request)))
+    snapshot.put("accountId", JsonString(gatewayBroadcastRouteAccountId(request)))
+    snapshot.put("peerKind", JsonString(request.routePeerKind))
+    snapshot.put("peerId", JsonString(request.routePeerId))
+    snapshot.put("parentPeerKind", JsonString(request.routeParentPeerKind))
+    snapshot.put("parentPeerId", JsonString(request.routeParentPeerId))
+    snapshot.put("senderId", JsonString(request.senderId))
+    snapshot.put("conversationId", JsonString(request.conversationId))
+    snapshot.put("threadId", JsonString(request.threadId))
+    snapshot.put("sourceMessageId", JsonString(request.sourceMessageId))
+    snapshot.put("text", JsonString(request.text))
+    return snapshot
+}
+
+private func gatewayBroadcastMediaContextForRoute(mediaContext: JsonObject, turnRoute: JsonObject,
+    inboundSnapshot: JsonObject): JsonObject {
     let media = gatewayBroadcastCloneObject(mediaContext)
     let context = match (media.get("context")) {
         case Some(v) => try { v.asObject() } catch (_: Exception) { JsonObject() }
         case None => JsonObject()
     }
     context.put("imRoute", gatewayBroadcastCloneObject(turnRoute))
+    context.put("broadcastInboundSnapshot", gatewayBroadcastCloneObject(inboundSnapshot))
     media.put("context", context)
     media
 }
 
 private func gatewayBroadcastExecutableRequest(request: GatewaySessionRequest, route: GatewayAgentRoute,
-    turnRoute: JsonObject): GatewaySessionRequest {
+    turnRoute: JsonObject, inboundSnapshot: JsonObject, deliver: Bool): GatewaySessionRequest {
     GatewaySessionRequest(
         request.source,
         channelName: request.channelName,
@@ -407,8 +458,8 @@ private func gatewayBroadcastExecutableRequest(request: GatewaySessionRequest, r
         replyAccountId: if (!request.replyAccountId.isEmpty()) { request.replyAccountId } else if (!route.preferredAccountId.isEmpty()) { route.preferredAccountId } else { route.accountId },
         replyToMessageId: request.replyToMessageId,
         replyInThread: request.replyInThread,
-        deliver: request.deliver,
-        mediaContext: gatewayBroadcastMediaContextForRoute(request.mediaContext, turnRoute)
+        deliver: request.deliver && deliver,
+        mediaContext: gatewayBroadcastMediaContextForRoute(request.mediaContext, turnRoute, inboundSnapshot)
     )
 }
 
@@ -436,7 +487,7 @@ private func gatewayBroadcastRouteForAgent(request: GatewaySessionRequest, agent
 private func gatewayBroadcastSinglePlan(request: GatewaySessionRequest, diagnostics: Array<String>): GatewayAgentTeamBroadcastPlan {
     let context = gatewayResolveSessionContextWithAgentRoute(request)
     let turn = GatewayAgentTeamBroadcastTurn("", context.agentId, request, context)
-    GatewayAgentTeamBroadcastPlan(false, "", [], [turn], diagnostics)
+    GatewayAgentTeamBroadcastPlan(false, "", "sequential", [], [turn], diagnostics)
 }
 
 private func gatewayBroadcastValidatedSelectedIds(root: JsonObject, team: JsonObject, selected: Array<String>,
@@ -460,10 +511,84 @@ private func gatewayBroadcastValidatedSelectedIds(root: JsonObject, team: JsonOb
     out.toArray()
 }
 
+private func gatewayBroadcastValidatedTopLevelSelectedIds(root: JsonObject, peerKey: String, selected: Array<String>,
+    diagnostics: ArrayList<String>): Array<String> {
+    let out = ArrayList<String>()
+    for (agentId in selected) {
+        if (!gatewayBroadcastAgentExists(root, agentId)) {
+            diagnostics.add("broadcast-member-unknown-agent:top-level:${peerKey}:${agentId}")
+            continue
+        }
+        if (!out.contains(agentId)) {
+            out.add(agentId)
+        }
+    }
+    out.toArray()
+}
+
+private func gatewayBroadcastUsesSingleActiveFeishuReply(request: GatewaySessionRequest): Bool {
+    if (gatewayBroadcastChannelName(request) != "feishu") {
+        return false
+    }
+    let peerKind = request.routePeerKind.trimAscii().toAsciiLower()
+    peerKind == "group" || peerKind == "thread" || peerKind == "topic"
+}
+
+private func gatewayBroadcastActiveAgentId(request: GatewaySessionRequest, selected: Array<String>): String {
+    if (selected.size == 0) {
+        return ""
+    }
+    let direct = try {
+        gatewayResolveSessionContextWithAgentRoute(request).agentId
+    } catch (_: Exception) {
+        ""
+    }
+    if (!direct.isEmpty() && selected.contains(direct)) {
+        return direct
+    }
+    selected[0]
+}
+
+private func gatewayBroadcastBuildTurns(
+    request: GatewaySessionRequest,
+    teamId: String,
+    selected: Array<String>,
+    strategy: String,
+    diagnostics: ArrayList<String>
+): Array<GatewayAgentTeamBroadcastTurn> {
+    let rawRoute = gatewayRuntimeRouteContextFromMediaContext(request.mediaContext)
+    let inboundSnapshot = gatewayBroadcastInboundSnapshot(request)
+    let turns = ArrayList<GatewayAgentTeamBroadcastTurn>()
+    let singleActiveFeishuReply = gatewayBroadcastUsesSingleActiveFeishuReply(request)
+    let activeAgentId = if (singleActiveFeishuReply) {
+        gatewayBroadcastActiveAgentId(request, selected)
+    } else {
+        ""
+    }
+    for (agentId in selected) {
+        let route = gatewayBroadcastRouteForAgent(request, agentId, diagnostics.toArray())
+        if (route.agentId != agentId) {
+            diagnostics.add("broadcast-route-agent-fallback:${teamId}:${agentId}:${route.agentId}")
+            continue
+        }
+        let deliver = !singleActiveFeishuReply || agentId == activeAgentId
+        let role = if (deliver) { "active" } else { "observer" }
+        let observerReason = if (deliver) { "" } else { "feishu-group-single-active-reply" }
+        let turnRoute = gatewayBroadcastTurnRoute(route, rawRoute, teamId, selected, strategy, role, deliver,
+            observerReason)
+        let executableRequest = gatewayBroadcastExecutableRequest(request, route, turnRoute, inboundSnapshot, deliver)
+        let context = gatewayBroadcastContextForRoute(request, route, turnRoute)
+        turns.add(GatewayAgentTeamBroadcastTurn(teamId, agentId, executableRequest, context))
+    }
+    turns.toArray()
+}
+
 private func gatewayBroadcastBuildPlanForTeam(request: GatewaySessionRequest, team: JsonObject,
     diagnostics: ArrayList<String>): GatewayAgentTeamBroadcastPlan {
     let teamId = gatewayBroadcastTeamId(team)
     let broadcast = gatewayBroadcastJsonObject(team, "broadcast")
+    let strategy = gatewayBroadcastNormalizeStrategy(gatewayBroadcastJsonString(broadcast, "strategy"), teamId,
+        "sequential", diagnostics)
     let selectedRaw = gatewayBroadcastSelectedAgentIds(broadcast)
     if (selectedRaw.size == 0) {
         diagnostics.add("broadcast-members-empty:${teamId}")
@@ -475,24 +600,73 @@ private func gatewayBroadcastBuildPlanForTeam(request: GatewaySessionRequest, te
         return gatewayBroadcastSinglePlan(request, diagnostics.toArray())
     }
 
-    let rawRoute = gatewayRuntimeRouteContextFromMediaContext(request.mediaContext)
-    let turns = ArrayList<GatewayAgentTeamBroadcastTurn>()
-    for (agentId in selected) {
-        let route = gatewayBroadcastRouteForAgent(request, agentId, diagnostics.toArray())
-        if (route.agentId != agentId) {
-            diagnostics.add("broadcast-route-agent-fallback:${teamId}:${agentId}:${route.agentId}")
-            continue
-        }
-        let turnRoute = gatewayBroadcastTurnRoute(route, rawRoute, teamId, selected)
-        let executableRequest = gatewayBroadcastExecutableRequest(request, route, turnRoute)
-        let context = gatewayBroadcastContextForRoute(request, route, turnRoute)
-        turns.add(GatewayAgentTeamBroadcastTurn(teamId, agentId, executableRequest, context))
-    }
+    let turns = gatewayBroadcastBuildTurns(request, teamId, selected, strategy, diagnostics)
     if (turns.size == 0) {
         diagnostics.add("broadcast-turns-empty:${teamId}")
         return gatewayBroadcastSinglePlan(request, diagnostics.toArray())
     }
-    GatewayAgentTeamBroadcastPlan(true, teamId, selected, turns.toArray(), diagnostics.toArray())
+    GatewayAgentTeamBroadcastPlan(true, teamId, strategy, selected, turns, diagnostics.toArray())
+}
+
+private func gatewayBroadcastRequestPeerKeys(request: GatewaySessionRequest): Array<String> {
+    let out = ArrayList<String>()
+    for (value in [request.routePeerId, request.peerId, request.conversationId]) {
+        let normalized = value.trimAscii()
+        if (!normalized.isEmpty() && !out.contains(normalized)) {
+            out.add(normalized)
+        }
+    }
+    out.toArray()
+}
+
+private func gatewayBroadcastTopLevelPeerKey(request: GatewaySessionRequest, broadcast: JsonObject): String {
+    for (peerKey in gatewayBroadcastRequestPeerKeys(request)) {
+        match (broadcast.get(peerKey)) {
+            case Some(value) =>
+                try {
+                    let arr = value.asArray()
+                    if (arr.size() > 0) {
+                        return peerKey
+                    }
+                } catch (_: Exception) {
+                    ()
+                }
+            case None => ()
+        }
+    }
+    ""
+}
+
+private func gatewayBroadcastBuildPlanForTopLevelPeerMap(request: GatewaySessionRequest,
+    diagnostics: ArrayList<String>): GatewayAgentTeamBroadcastPlan {
+    let broadcast = gatewayBroadcastJsonObject(request.routeRoot, "broadcast")
+    if (broadcast.size() == 0) {
+        return gatewayBroadcastSinglePlan(request, diagnostics.toArray())
+    }
+    let peerKey = gatewayBroadcastTopLevelPeerKey(request, broadcast)
+    if (peerKey.isEmpty()) {
+        return gatewayBroadcastSinglePlan(request, diagnostics.toArray())
+    }
+    diagnostics.add("broadcast-compat-top-level-peer-map:${peerKey}")
+    let teamId = "top-level:${peerKey}"
+    let strategy = gatewayBroadcastNormalizeStrategy(gatewayBroadcastJsonString(broadcast, "strategy"), teamId,
+        "parallel", diagnostics)
+    let selectedRaw = gatewayBroadcastSelectedAgentIdsFromArray(gatewayBroadcastJsonArray(broadcast, peerKey))
+    if (selectedRaw.size == 0) {
+        diagnostics.add("broadcast-members-empty:${teamId}")
+        return gatewayBroadcastSinglePlan(request, diagnostics.toArray())
+    }
+    let selected = gatewayBroadcastValidatedTopLevelSelectedIds(request.routeRoot, peerKey, selectedRaw, diagnostics)
+    if (selected.size == 0) {
+        diagnostics.add("broadcast-members-valid-empty:${teamId}")
+        return gatewayBroadcastSinglePlan(request, diagnostics.toArray())
+    }
+    let turns = gatewayBroadcastBuildTurns(request, teamId, selected, strategy, diagnostics)
+    if (turns.size == 0) {
+        diagnostics.add("broadcast-turns-empty:${teamId}")
+        return gatewayBroadcastSinglePlan(request, diagnostics.toArray())
+    }
+    GatewayAgentTeamBroadcastPlan(true, teamId, strategy, selected, turns, diagnostics.toArray())
 }
 
 public func gatewayResolveAgentTeamBroadcastPlan(request: GatewaySessionRequest): GatewayAgentTeamBroadcastPlan {
@@ -510,7 +684,53 @@ public func gatewayResolveAgentTeamBroadcastPlan(request: GatewaySessionRequest)
         }
         return gatewayBroadcastBuildPlanForTeam(request, team, diagnostics)
     }
-    gatewayBroadcastSinglePlan(request, diagnostics.toArray())
+    gatewayBroadcastBuildPlanForTopLevelPeerMap(request, diagnostics)
+}
+
+private func gatewayBroadcastFailureResult(turn: GatewayAgentTeamBroadcastTurn, error: String): GatewayResolvedSessionTurnResult {
+    GatewayResolvedSessionTurnResult(
+        turn.context,
+        GatewaySessionExecutionResult("", delivered: false, deliveryStatus: "exception", deliveryError: error)
+    )
+}
+
+private func gatewayBroadcastExecuteOne(
+    turn: GatewayAgentTeamBroadcastTurn,
+    execute: (GatewayAgentTeamBroadcastTurn) -> GatewayResolvedSessionTurnResult
+): GatewayResolvedSessionTurnResult {
+    try {
+        execute(turn)
+    } catch (e: Exception) {
+        gatewayBroadcastFailureResult(turn, e.message)
+    }
+}
+
+public func gatewayRunAgentTeamBroadcastPlan(
+    plan: GatewayAgentTeamBroadcastPlan,
+    execute: (GatewayAgentTeamBroadcastTurn) -> GatewayResolvedSessionTurnResult
+): Array<GatewayResolvedSessionTurnResult> {
+    let out = ArrayList<GatewayResolvedSessionTurnResult>()
+    if (plan.strategy == "parallel") {
+        let futures = ArrayList<Future<GatewayResolvedSessionTurnResult>>()
+        for (turn in plan.turns) {
+            let captured = turn
+            futures.add(spawn {
+                gatewayBroadcastExecuteOne(captured, execute)
+            })
+        }
+        for (i in 0..futures.size) {
+            try {
+                out.add(futures[i].get())
+            } catch (e: Exception) {
+                out.add(gatewayBroadcastFailureResult(plan.turns[i], e.message))
+            }
+        }
+        return out.toArray()
+    }
+    for (turn in plan.turns) {
+        out.add(gatewayBroadcastExecuteOne(turn, execute))
+    }
+    out.toArray()
 }
 
 private func gatewayBroadcastFindTurnResult(
@@ -606,6 +826,7 @@ public func gatewayAgentTeamBroadcastAggregateJson(
     out.put("kind", JsonString("agent-team-broadcast-aggregate"))
     out.put("enabled", JsonBool(plan.enabled))
     out.put("teamId", JsonString(plan.teamId))
+    out.put("strategy", JsonString(plan.strategy))
     out.put("status", JsonString(status))
     out.put("delivered", JsonBool(deliveredCount > 0))
     out.put("total", JsonInt(plan.turns.size))

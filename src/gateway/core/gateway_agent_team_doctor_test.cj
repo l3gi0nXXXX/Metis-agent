@@ -204,7 +204,7 @@ public class GatewayAgentTeamDoctorTest {
         @Expect(doctorHasCode(findings, "agent-team-team-unknown-agent"), true)
         @Expect(doctorHasCode(findings, "agent-team-memory-cross-agent"), true)
         @Expect(doctorHasCode(findings, "agent-team-subagent-wide"), true)
-        @Expect(doctorHasCode(findings, "agent-team-runtime-memorysearch-not-enforced"), true)
+        @Expect(doctorHasCode(findings, "agent-team-runtime-memorysearch-not-enforced"), false)
         @Expect(doctorHasCode(findings, "agent-team-runtime-subagents-partial"), true)
         @Expect(doctorHasCode(findings, "agent-team-runtime-sandbox-not-enforced"), true)
         @Expect(doctorHasCode(findings, "agent-team-runtime-heartbeat-not-enforced"), true)

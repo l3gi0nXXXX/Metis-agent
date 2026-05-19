@@ -11,7 +11,7 @@ import metis.io.PrintUtils
 import std.collection.{ArrayList, HashMap}
 import std.convert.Parsable
 import std.core.Duration
-import std.fs.{Directory, File, OpenMode, Path, exists, remove}
+import std.fs.{Directory, File, OpenMode, Path, exists, remove, rename}
 import std.io.StringReader
 import std.process.*
 import std.sync.Mutex
@@ -421,6 +421,107 @@ public class GatewayManagedSessionsToolset {
         JsonObject()
     }
 
+    private func nowMs(): Int64 {
+        DateTime.now().toUnixTimeStamp().toNanoseconds() / 1000000
+    }
+
+    private func jsonIntField(obj: JsonObject, key: String): Int64 {
+        match (obj.get(key)) {
+            case Some(v) =>
+                try { return v.asInt().getValue() } catch (_: Exception) {
+                    try { return Int64.parse(v.toJsonString()) } catch (_inner: Exception) { return 0 }
+                }
+            case None => 0
+        }
+    }
+
+    private func managedRecordTranscriptPath(record: JsonObject, sessionKey: String): String {
+        let recorded = gatewaySubagentRunRecordString(record, "transcriptPath")
+        if (!recorded.isEmpty()) {
+            return recorded
+        }
+        this.gwStore().transcriptPath(sessionKey).toString()
+    }
+
+    private func managedRecordLogs(record: JsonObject, sessionKey: String, limit: Int64): String {
+        let pathText = this.managedRecordTranscriptPath(record, sessionKey)
+        if (!pathText.trimAscii().isEmpty() && exists(Path(pathText))) {
+            try {
+                let raw = String.fromUtf8(File.readFrom(Path(pathText)))
+                let lines = raw.split("\n")
+                let start = if (limit > 0 && lines.size > limit) { lines.size - limit } else { 0 }
+                return String.join(lines[start..], delimiter: "\n")
+            } catch (_: Exception) {
+                ()
+            }
+        }
+        this.gwStore().formatHistoryAsText(sessionKey, limit)
+    }
+
+    private func markManagedRunArchiveStatus(record: JsonObject, status: String, error!: String = ""): Bool {
+        record.put("archiveStatus", JsonString(status.trimAscii()))
+        record.put("lastArchiveError", JsonString(error.trimAscii()))
+        gatewaySubagentWriteRunRecord(this.gwStore().sessionsRoot(), record)
+    }
+
+    private func archiveManagedRunTranscript(runIdOrSessionKey: String, reason: String): Bool {
+        let record = match (gatewaySubagentResolveRunRecord(this.gwStore().sessionsRoot(), runIdOrSessionKey)) {
+            case Some(v) => v
+            case None => return false
+        }
+        if (gatewaySubagentRunRecordString(record, "archiveStatus") == "archived") {
+            return true
+        }
+        let sessionKey = gatewaySubagentRunRecordString(record, "sessionKey")
+        let originalText = this.managedRecordTranscriptPath(record, sessionKey)
+        if (originalText.trimAscii().isEmpty()) {
+            return this.markManagedRunArchiveStatus(record, "failed", error: "transcript path unavailable")
+        }
+        let original = Path(originalText)
+        if (!exists(original)) {
+            record.put("archivedAtMs", this.nowMs().toJsonValue())
+            record.put("archivedTranscriptPath", JsonString(originalText))
+            record.put("archiveReason", JsonString(reason.trimAscii()))
+            record.put("archiveStatus", JsonString("archived"))
+            return gatewaySubagentWriteRunRecord(this.gwStore().sessionsRoot(), record)
+        }
+        var archived = Path("${originalText}.deleted.${this.nowMs()}")
+        var n: Int64 = 0
+        while (exists(archived)) {
+            n += 1
+            archived = Path("${originalText}.deleted.${this.nowMs()}_${n}")
+        }
+        try {
+            rename(original.toString(), to: archived.toString(), overwrite: false)
+            record.put("archiveStatus", JsonString("archived"))
+            record.put("archivedAtMs", this.nowMs().toJsonValue())
+            record.put("archivedTranscriptPath", JsonString(archived.toString()))
+            record.put("transcriptPath", JsonString(archived.toString()))
+            record.put("archiveReason", JsonString(reason.trimAscii()))
+            record.put("lastArchiveError", JsonString(""))
+            gatewaySubagentWriteRunRecord(this.gwStore().sessionsRoot(), record)
+        } catch (e: Exception) {
+            this.markManagedRunArchiveStatus(record, "failed", error: e.message)
+        }
+    }
+
+    private func archiveDueManagedRuns(): Unit {
+        let now = this.nowMs()
+        for (record in gatewaySubagentListRunRecords(this.gwStore().sessionsRoot())) {
+            if (!gatewaySubagentRunStatusIsTerminal(gatewaySubagentRunRecordString(record, "status"))) {
+                continue
+            }
+            if (gatewaySubagentRunRecordString(record, "archiveStatus") == "archived") {
+                continue
+            }
+            let dueAt = this.jsonIntField(record, "archiveDueAtMs")
+            if (dueAt > 0 && dueAt <= now) {
+                let target = gatewaySubagentRunRecordString(record, "runId")
+                let _ = this.archiveManagedRunTranscript(target, "auto-archive due")
+            }
+        }
+    }
+
     private func jsonIntStringField(obj: JsonObject, key: String): String {
         match (obj.get(key)) {
             case Some(v) =>
@@ -688,9 +789,14 @@ public class GatewayManagedSessionsToolset {
         row.put("requesterReplyInThread", this.jsonBoolField(record, "requesterReplyInThread").toJsonValue())
         row.put("noticeStatus", JsonString(gatewaySubagentRunRecordString(record, "noticeStatus")))
         row.put("channelNoticeStatus", JsonString(gatewaySubagentRunRecordString(record, "channelNoticeStatus")))
+        row.put("archiveStatus", JsonString(gatewaySubagentRunRecordString(record, "archiveStatus")))
+        row.put("archiveAfterMinutes", gatewaySubagentRunRecordInt(record, "archiveAfterMinutes").toJsonValue())
+        row.put("archiveDueAtMs", gatewaySubagentRunRecordInt(record, "archiveDueAtMs").toJsonValue())
+        row.put("archivedAtMs", gatewaySubagentRunRecordInt(record, "archivedAtMs").toJsonValue())
+        row.put("archivedTranscriptPath", JsonString(gatewaySubagentRunRecordString(record, "archivedTranscriptPath")))
         row.put("hasLiveFuture", this.managedHasLiveFuture(sessionKey).toJsonValue())
         row.put("hasLiveProcess", this.managedHasLiveProcess(sessionKey).toJsonValue())
-        row.put("transcriptPath", JsonString(this.gwStore().transcriptPath(sessionKey).toString()))
+        row.put("transcriptPath", JsonString(this.managedRecordTranscriptPath(record, sessionKey)))
         gatewaySubagentPutEffectiveState(row, this.managedEffectiveState(record))
         row
     }
@@ -809,7 +915,9 @@ public class GatewayManagedSessionsToolset {
             )
             let _ = gatewaySubagentUpdateChannelNoticeStatus(this.gwStore().sessionsRoot(), target, "delivered", messageId: messageId)
         } catch (e: Exception) {
-            let _ = gatewaySubagentUpdateChannelNoticeStatus(this.gwStore().sessionsRoot(), target, "failed", error: e.message)
+            let existingAttempts = gatewaySubagentRunRecordInt(record, "channelNoticeAttempts")
+            let nextStatus = if (existingAttempts + 1 >= 3) { "failed" } else { "pending" }
+            let _ = gatewaySubagentUpdateChannelNoticeStatus(this.gwStore().sessionsRoot(), target, nextStatus, error: e.message)
         }
     }
 
@@ -895,6 +1003,9 @@ public class GatewayManagedSessionsToolset {
         if (detail.isEmpty()) {
             detail = hookError.trimAscii()
         }
+        if (!hookError.trimAscii().isEmpty() && !detail.contains(hookError.trimAscii())) {
+            detail = "${detail}; direct hook failed: ${hookError.trimAscii()}"
+        }
         throw Exception("subagent notice gateway fallback failed: ${detail}")
     }
 
@@ -917,8 +1028,30 @@ public class GatewayManagedSessionsToolset {
             let status = gatewaySubagentRunRecordString(record, "status")
             let _ = gatewaySubagentPublishNoticeEvent(effectiveTarget, runId, status, notice)
             this.deliverManagedChannelTerminalNotice(record, notice)
+            match (gatewaySubagentResolveRunRecord(st.sessionsRoot(), sessionKey)) {
+                case Some(updated) =>
+                    if (gatewaySubagentRunRecordString(updated, "cleanupMode") == "delete") {
+                        let archiveTarget = if (!runId.isEmpty()) { runId } else { sessionKey }
+                        let _ = this.archiveManagedRunTranscript(archiveTarget, "cleanup=delete")
+                    }
+                case None => ()
+            }
         } catch (e: Exception) {
             let _ = gatewaySubagentUpdateNoticeStatus(st.sessionsRoot(), sessionKey, "failed", error: e.message)
+        }
+    }
+
+    private func retryPendingTerminalNotices(): Unit {
+        for (record in gatewaySubagentListRunRecords(this.gwStore().sessionsRoot())) {
+            if (!gatewaySubagentRunStatusIsTerminal(gatewaySubagentRunRecordString(record, "status"))) {
+                continue
+            }
+            let status = gatewaySubagentRunRecordString(record, "channelNoticeStatus")
+            if (status != "pending") {
+                continue
+            }
+            let notice = gatewaySubagentRenderNotice(record)
+            this.deliverManagedChannelTerminalNotice(record, notice)
         }
     }
 
@@ -1232,6 +1365,65 @@ public class GatewayManagedSessionsToolset {
             }
             cancelled
         }
+    }
+
+    private func stringListContains(values: ArrayList<String>, target: String): Bool {
+        for (value in values) {
+            if (value == target) {
+                return true
+            }
+        }
+        false
+    }
+
+    private func cascadeCancelChildRuns(parentSessionKey: String, parentRunId: String, target: String): JsonArray {
+        let rows = JsonArray([])
+        if (parentSessionKey.trimAscii().isEmpty()) {
+            return rows
+        }
+        let frontier = ArrayList<String>()
+        let seen = ArrayList<String>()
+        frontier.add(parentSessionKey.trimAscii())
+        seen.add(parentSessionKey.trimAscii())
+        var idx: Int64 = 0
+        while (idx < frontier.size) {
+            let currentParent = frontier[idx]
+            idx += 1
+            for (record in gatewaySubagentListRunRecords(this.gwStore().sessionsRoot())) {
+                if (gatewaySubagentRunRecordString(record, "parentSessionKey") != currentParent) {
+                    continue
+                }
+                if (!this.controllerCanAccessRun(record)) {
+                    continue
+                }
+                let childSessionKey = gatewaySubagentRunRecordString(record, "sessionKey")
+                if (childSessionKey.isEmpty() || this.stringListContains(seen, childSessionKey)) {
+                    continue
+                }
+                seen.add(childSessionKey)
+                frontier.add(childSessionKey)
+                let childRunId = gatewaySubagentRunRecordString(record, "runId")
+                let effective = this.managedEffectiveState(record)
+                if (effective.isTerminal) {
+                    continue
+                }
+                let snapshot = this.managedKillSnapshot(childSessionKey)
+                this.markManagedSessionKillRequested(childSessionKey, target)
+                let cancelRequested = this.cancelManagedSession(childSessionKey)
+                let reason = "cascade cancelled by parent ${parentRunId}"
+                let _ = gatewaySubagentMarkRunCancelled(this.gwStore().sessionsRoot(), childRunId, reason: reason)
+                let row = JsonObject()
+                row.put("runId", JsonString(childRunId))
+                row.put("sessionKey", JsonString(childSessionKey))
+                row.put("parentSessionKey", JsonString(currentParent))
+                row.put("cancelRequested", cancelRequested.toJsonValue())
+                row.put("hadLiveFuture", (snapshot[1]).toJsonValue())
+                row.put("hadLiveProcess", (snapshot[2]).toJsonValue())
+                gatewaySubagentPutEffectiveState(row, effective)
+                rows.add(row)
+            }
+        }
+        rows
     }
 
     private func markManagedSessionKillRequested(sessionKey: String, target: String): Unit {
@@ -2194,6 +2386,8 @@ public class GatewayManagedSessionsToolset {
         result.put("cwd", JsonString(workspaceSpec.cwd))
         result.put("isolationMode", JsonString(workspaceSpec.isolationMode))
         result.put("cleanupMode", JsonString(workspaceSpec.cleanupMode))
+        result.put("archiveAfterMinutes", subagentSettings.archiveAfterMinutes.toJsonValue())
+        result.put("archiveStatus", JsonString(if (subagentSettings.archiveAfterMinutes >= 0) { "scheduled" } else { "disabled" }))
         result.put("sandbox", JsonString(workspaceSpec.sandbox))
         if (!workspaceSpec.worktreePath.trimAscii().isEmpty()) {
             result.put("worktreePath", JsonString(workspaceSpec.worktreePath))
@@ -2237,7 +2431,8 @@ public class GatewayManagedSessionsToolset {
             worktreePath: workspaceSpec.worktreePath,
             sandbox: workspaceSpec.sandbox,
             cleanupMode: workspaceSpec.cleanupMode,
-            transcriptPath: st.transcriptPath(sessionKey).toString()
+            transcriptPath: st.transcriptPath(sessionKey).toString(),
+            archiveAfterMinutes: subagentSettings.archiveAfterMinutes
         )
         let runMetadata = JsonObject()
         runMetadata.put("policy", gatewaySubagentPolicyDecisionToJson(policyDecision))
@@ -2500,11 +2695,17 @@ public class GatewayManagedSessionsToolset {
         this.deliverManagedTerminalNotice(sessionKey)
     }
 
+    public func debugRetryPendingNoticesForTest(): Unit {
+        this.retryPendingTerminalNotices()
+    }
+
     public func subagentsForCommand(action: Option<String>, target: Option<String>, message: Option<String>, recentMinutes: Option<Int64>): String {
         this.subagentsImpl(action, target, message, recentMinutes)
     }
 
     private func subagentsImpl(action: Option<String>, target: Option<String>, message: Option<String>, recentMinutes: Option<Int64>): String {
+        this.archiveDueManagedRuns()
+        this.retryPendingTerminalNotices()
         let act = match (action) {
             case Some(v) =>
                 let t = v.trimAscii().toAsciiLower()
@@ -2641,9 +2842,9 @@ public class GatewayManagedSessionsToolset {
                 result.put("run", record)
                 result.put("runId", JsonString(gatewaySubagentRunRecordString(record, "runId")))
                 result.put("sessionKey", JsonString(resolved))
-                result.put("transcriptPath", JsonString(this.gwStore().transcriptPath(resolved).toString()))
+                result.put("transcriptPath", JsonString(this.managedRecordTranscriptPath(record, resolved)))
                 result.put("outputPath", JsonString(gatewaySubagentRunRecordString(record, "outputPath")))
-                result.put("logs", JsonString(this.gwStore().formatHistoryAsText(resolved, 40)))
+                result.put("logs", JsonString(this.managedRecordLogs(record, resolved, 40)))
                 gatewaySubagentPutEffectiveState(result, effective)
                 return result.toJsonString()
             }
@@ -2660,7 +2861,7 @@ public class GatewayManagedSessionsToolset {
             result.put("state", JsonString(this.managedState(resolved)))
             result.put("hasLiveFuture", JsonBool(this.managedHasLiveFuture(resolved)))
             result.put("hasLiveProcess", JsonBool(this.managedHasLiveProcess(resolved)))
-            result.put("transcriptPath", JsonString(this.gwStore().transcriptPath(resolved).toString()))
+            result.put("transcriptPath", JsonString(this.managedRecordTranscriptPath(record, resolved)))
             gatewaySubagentPutEffectiveState(result, effective)
             return result.toJsonString()
         }
@@ -2860,6 +3061,7 @@ public class GatewayManagedSessionsToolset {
                     if (!cancelRequested && !hadFuture && !hadProcess) {
                         this.setManagedState(sessionKey, "cancelled", error: "cancel requested")
                     }
+                    let cascaded = this.cascadeCancelChildRuns(sessionKey, gatewaySubagentRunRecordString(record, "runId"), "all")
                     let row = JsonObject()
                     row.put("runId", JsonString(gatewaySubagentRunRecordString(record, "runId")))
                     row.put("sessionKey", JsonString(sessionKey))
@@ -2867,6 +3069,7 @@ public class GatewayManagedSessionsToolset {
                     row.put("hadLiveFuture", hadFuture.toJsonValue())
                     row.put("hadLiveProcess", hadProcess.toJsonValue())
                     row.put("cancelRequested", cancelRequested.toJsonValue())
+                    row.put("cascadeCancelled", cascaded)
                     gatewaySubagentPutEffectiveState(row, effective)
                     killed.add(row)
                     count += 1
@@ -2929,6 +3132,11 @@ public class GatewayManagedSessionsToolset {
                 }
                 resultStatus = "cancelled"
             }
+            let cascadeCancelled = if (!effective.isTerminal) {
+                this.cascadeCancelChildRuns(resolved, gatewaySubagentRunRecordString(record, "runId"), tgt)
+            } else {
+                JsonArray([])
+            }
             let result = JsonObject()
             result.put("ok", JsonBool(true))
             result.put("status", JsonString(resultStatus))
@@ -2941,6 +3149,7 @@ public class GatewayManagedSessionsToolset {
             result.put("hadLiveFuture", hadFuture.toJsonValue())
             result.put("hadLiveProcess", hadProcess.toJsonValue())
             result.put("cancelRequested", cancelRequested.toJsonValue())
+            result.put("cascadeCancelled", cascadeCancelled)
             result.put("deleted", JsonBool(false))
             gatewaySubagentPutEffectiveState(result, effective)
             return result.toJsonString()
