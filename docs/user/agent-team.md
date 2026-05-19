@@ -6,7 +6,22 @@ Telegram and Feishu are the first-priority IM targets for AgentTeam. Other IM ad
 
 ## Collaboration Modes
 
-The default product semantics are deterministic Gateway routing plus optional deterministic fan-out. A normal route resolves one inbound CLI, Telegram, or Feishu turn to one agent and one agent-scoped session. When team `broadcast.enabled` is `true`, Gateway fans the same inbound turn out to the configured `broadcast.members` list, keeps each member's workspace/model/session isolated, and builds an aggregate response with per-agent status.
+The default product semantics are deterministic Gateway routing plus optional deterministic fan-out. A normal route resolves one inbound CLI, Telegram, or Feishu turn to one agent and one agent-scoped session. When team `broadcast.enabled` is `true`, Gateway fans the same inbound turn out to the configured `broadcast.members` list, keeps each member's workspace/model/session isolated, and builds an aggregate response with per-agent status. Team-scoped broadcast defaults to `strategy="sequential"` for compatibility with earlier Metis releases; set `strategy` to `parallel` when members may run concurrently. Invalid strategy values are ignored with a diagnostic and fall back to the compatible sequential mode.
+
+Metis also accepts a read-only top-level `broadcast` peer map as a compatibility input for imported configs:
+
+```json
+{
+  "broadcast": {
+    "strategy": "parallel",
+    "-1001234567890": ["writer", "reviewer"]
+  }
+}
+```
+
+This layer is only used when no matching `agentTeams.list` team broadcast applies. It maps the current inbound peer id to a temporary broadcast plan and does not create, replace, or mutate AgentTeam records. Top-level broadcast defaults to `parallel` to match the imported config shape; prefer `agentTeams.list[].broadcast` for native Metis configuration.
+
+For Feishu group/thread broadcast, Metis uses a single active reply plus observer turns. The active member is the normally routed agent when it is in the selected list, otherwise the first selected member. Observer members still get isolated session turns and the same inbound snapshot, but their `deliver` flag is disabled so a group broadcast does not post multiple real Feishu replies. Telegram broadcast preserves the existing per-member delivery route and topic/account metadata.
 
 Manager delegation can coexist with this model, but it is not a separate productized runtime yet. Today, configure a manager as a normal team member or `defaultAgentId`, give it profile instructions in `AGENTS.md`/`SOUL.md`, and bind IM routes to that manager when you want manager-style triage. Any handoff still runs through normal Gateway route/session boundaries; Metis does not yet provide autonomous manager task decomposition, cross-agent handoff policy, or a separate manager-delegation execution engine.
 
@@ -17,7 +32,7 @@ Manager delegation can coexist with this model, but it is not a separate product
 | Agent isolation | Managed agents have separate workspace, `agentDir`, `models.json`, auth profile path, and sessions path. | Some runtime fallback diagnostics still need broader end-to-end coverage. |
 | Team management | `agents.teams.*` and Control UI can create, list, update, delete, edit members, set default member, edit aliases, edit bindings JSON, and reject binding conflicts without partial writes. | Template library and assisted onboarding remain intentionally small. |
 | Route bindings | Telegram and Feishu can use shared route semantics for channel, account, peer, thread, team, and role matches through Gateway RPC. The Control UI binding builder previews simple and structured payloads before apply. | Feishu real-account thread capability cache and deeper group-policy diagnostics are still being expanded. |
-| Broadcast | Team broadcast settings persist selected member fanout, Gateway runs selected members as isolated turns, and aggregate rows expose per-agent status, error, detail, elapsed placeholder, delivery id, and answer. | Channel-specific live UX diagnostics still need Telegram/Feishu opt-in validation. |
+| Broadcast | Team broadcast settings persist selected member fanout, `strategy=sequential|parallel`, shared inbound snapshots, selected-member isolation, stable aggregate rows, top-level peer-map compatibility, Telegram route preservation, and Feishu active/observer delivery behavior. | Live Telegram/Feishu tenant UAT remains opt-in; top-level peer-map compatibility is read-only and does not replace native AgentTeam configuration. |
 | Workspace profiles | Control UI and RPC can list, read, and write `AGENTS.md`, `SOUL.md`, `TOOLS.md`, `IDENTITY.md`, `USER.md`, `HEARTBEAT.md`, `BOOTSTRAP.md`, and `MEMORY.md` through Gateway only. | `BOOTSTRAP.md` is supported but not auto-created. |
 | Model state | Control UI and RPC can read/write per-agent `models.json` state, render provider/model chips from `agents.models.*`, and display redacted credential-source summaries. | Operators still need to configure real provider credentials explicitly per agent or allowed fallback source. |
 | Telegram | Existing Telegram adapter has broad fake-tested group/topic/media/native-command coverage and AgentTeam alias routing baseline. | Telegram remains the first full IM validation path for future ChannelAdapter route extensions. |
