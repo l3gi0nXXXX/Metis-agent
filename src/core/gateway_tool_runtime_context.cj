@@ -2,7 +2,15 @@ package metis.core
 
 import std.collection.{ArrayList, HashMap}
 import std.sync.Mutex
-import stdx.encoding.json.JsonObject
+import stdx.encoding.json.{JsonObject, JsonValue}
+
+private func gatewayToolRuntimeCloneObject(value: JsonObject): JsonObject {
+    try {
+        JsonValue.fromStr(value.toJsonString()).asObject()
+    } catch (_: Exception) {
+        JsonObject()
+    }
+}
 
 public class GatewayToolRuntimeContext {
     public let sourceLabel: String
@@ -18,6 +26,7 @@ public class GatewayToolRuntimeContext {
     public let operatorScopes: Array<String>
     public let prompt: String
     public let mediaContext: JsonObject
+    public let memorySearchPolicy: JsonObject
     public let lifecycleHook: Option<(String) -> Unit>
     private var visibleReplyDelivered: Bool = false
 
@@ -35,6 +44,7 @@ public class GatewayToolRuntimeContext {
         operatorScopes!: Array<String> = [],
         prompt!: String = "",
         mediaContext!: JsonObject = JsonObject(),
+        memorySearchPolicy!: JsonObject = JsonObject(),
         lifecycleHook!: Option<(String) -> Unit> = None<(String) -> Unit>
     ) {
         this.sourceLabel = sourceLabel.trimAscii().toAsciiLower()
@@ -57,6 +67,7 @@ public class GatewayToolRuntimeContext {
         this.operatorScopes = normalizedScopes.toArray()
         this.prompt = prompt
         this.mediaContext = mediaContext
+        this.memorySearchPolicy = gatewayToolRuntimeCloneObject(memorySearchPolicy)
         this.lifecycleHook = lifecycleHook
     }
 

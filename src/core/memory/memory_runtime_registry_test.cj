@@ -37,6 +37,15 @@ private func memoryRuntimeTestIssueContains(issues: JsonValue, expected: String)
     false
 }
 
+private func memoryRuntimeTestArrayContains(values: Array<String>, expected: String): Bool {
+    for (value in values) {
+        if (value == expected) {
+            return true
+        }
+    }
+    false
+}
+
 private func memoryRuntimeTestReadConfigText(): Option<String> {
     let path = MetisConfigManager.configPath()
     if (!exists(path)) {
@@ -283,6 +292,23 @@ public class MemoryRuntimeRegistryTest {
         } finally {
             memoryRuntimeTestRestoreConfigText(previousConfig)
         }
+    }
+
+    @TestCase
+    public func qmdMemorySearchCollectionsDefaultToCurrentAgentWorkspaceAndExplicitExtras(): Unit {
+        let defaultCollections = resolveQmdMemorySearchCollections(
+            workspaceDir: "/tmp/metis-memory/agent-a",
+            extraCollections: []
+        )
+        @Expect(memoryRuntimeTestArrayContains(defaultCollections, "memory-root-agent-a"), true)
+        @Expect(memoryRuntimeTestArrayContains(defaultCollections, "memory-root-agent-b"), false)
+
+        let sharedCollections = resolveQmdMemorySearchCollections(
+            workspaceDir: "/tmp/metis-memory/agent-a",
+            extraCollections: ["memory-root-agent-b"]
+        )
+        @Expect(memoryRuntimeTestArrayContains(sharedCollections, "memory-root-agent-a"), true)
+        @Expect(memoryRuntimeTestArrayContains(sharedCollections, "memory-root-agent-b"), true)
     }
 
     @TestCase

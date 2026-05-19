@@ -115,10 +115,19 @@ public class MemoryRuntime {
         limit: Int64,
         sessionKey!: Option<String>,
         agentId!: String = "",
-        purpose!: String = "search"
+        purpose!: String = "search",
+        qmdWorkspaceDir!: String = "",
+        qmdExtraCollections!: Array<String> = []
     ): Array<LocalMemorySearchRow> {
         match (getMemorySearchManager(agentId: agentId, purpose: purpose).manager) {
-            case Some(manager) => manager.searchRows(query, limit, sessionKey: sessionKey)
+            case Some(manager) =>
+                manager.searchRows(
+                    query,
+                    limit,
+                    sessionKey: sessionKey,
+                    qmdWorkspaceDir: qmdWorkspaceDir,
+                    qmdExtraCollections: qmdExtraCollections
+                )
             case None => Array<LocalMemorySearchRow>()
         }
     }

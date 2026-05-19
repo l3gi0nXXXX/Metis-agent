@@ -615,6 +615,22 @@ public class MemorySearchManager {
         provider.searchRows(query, limit, sessionKey: sessionKey)
     }
 
+    public func searchRows(
+        query: String,
+        limit: Int64,
+        sessionKey!: Option<String>,
+        qmdWorkspaceDir!: String = "",
+        qmdExtraCollections!: Array<String> = []
+    ): Array<LocalMemorySearchRow> {
+        provider.searchRows(
+            query,
+            limit,
+            sessionKey: sessionKey,
+            qmdWorkspaceDir: qmdWorkspaceDir,
+            qmdExtraCollections: qmdExtraCollections
+        )
+    }
+
     public func recordShortTermRecall(query: String, rows: Array<LocalMemoryRecallResult>): Unit {
         provider.recordShortTermRecall(query, rows)
     }
@@ -772,14 +788,35 @@ private func qmdCollectionName(raw: String): String {
     normalized
 }
 
-private func qmdDefaultCollectionName(): String {
-    let workspaceName = CliConfig.cwd.fileName.trimAscii()
+private func qmdWorkspaceRoot(workspaceDir: String): Path {
+    let trimmed = workspaceDir.trimAscii()
+    if (trimmed.isEmpty()) {
+        return CliConfig.cwd
+    }
+    let path = Path(trimmed)
+    if (path.isAbsolute()) {
+        path
+    } else {
+        CliConfig.cwd.join(trimmed)
+    }
+}
+
+private func qmdDefaultCollectionNameForWorkspace(workspace: Path): String {
+    let workspaceName = workspace.fileName.trimAscii()
     qmdCollectionName("memory-root-" + workspaceName)
 }
 
-private func qmdSessionCollectionName(): String {
-    let workspaceName = CliConfig.cwd.fileName.trimAscii()
+private func qmdDefaultCollectionName(): String {
+    qmdDefaultCollectionNameForWorkspace(CliConfig.cwd)
+}
+
+private func qmdSessionCollectionNameForWorkspace(workspace: Path): String {
+    let workspaceName = workspace.fileName.trimAscii()
     qmdCollectionName("sessions-" + workspaceName)
+}
+
+private func qmdSessionCollectionName(): String {
+    qmdSessionCollectionNameForWorkspace(CliConfig.cwd)
 }
 
 private func qmdAddCollectionArgs(root: Path, name: String, mask!: String = ""): Array<String> {
@@ -858,23 +895,58 @@ private func qmdSessionsAllowedByScope(): Bool {
     isQmdScopeAllowed(Some("gateway:dm:main"))
 }
 
-private func qmdManagedCollectionNames(includeSessions!: Bool = false): Array<String> {
+private func qmdAddUniqueCollection(out: ArrayList<String>, collection: String): Unit {
+    let normalized = qmdCollectionName(collection)
+    if (normalized.isEmpty()) {
+        return
+    }
+    if (!out.contains(normalized)) {
+        out.add(normalized)
+    }
+}
+
+public func resolveQmdMemorySearchCollections(
+    workspaceDir!: String = "",
+    extraCollections!: Array<String> = [],
+    includeSessions!: Bool = false
+): Array<String> {
+    let workspace = qmdWorkspaceRoot(workspaceDir)
     let out = ArrayList<String>()
-    out.add(qmdDefaultCollectionName())
-    out.add(qmdNotesCollectionName())
+    qmdAddUniqueCollection(out, qmdDefaultCollectionNameForWorkspace(workspace))
+    qmdAddUniqueCollection(out, qmdNotesCollectionNameForWorkspace(workspace))
     for (rawPath in CliConfig.qmdPaths) {
         let trimmed = rawPath.trimAscii()
         if (trimmed.isEmpty()) {
             continue
         }
         let path = Path(trimmed)
-        let absolute = if (path.isAbsolute()) { path } else { CliConfig.cwd.join(trimmed) }
-        out.add(qmdCollectionName("custom-" + absolute.fileName))
+        let absolute = if (path.isAbsolute()) { path } else { workspace.join(trimmed) }
+        qmdAddUniqueCollection(out, "custom-" + absolute.fileName)
     }
     if (includeSessions && CliConfig.qmdSessionsEnabled && qmdSessionsAllowedByScope()) {
-        out.add(qmdSessionCollectionName())
+        qmdAddUniqueCollection(out, qmdSessionCollectionNameForWorkspace(workspace))
+    }
+    for (collection in extraCollections) {
+        qmdAddUniqueCollection(out, collection)
     }
     out.toArray()
+}
+
+private func qmdManagedCollectionNames(
+    includeSessions!: Bool = false,
+    workspaceDir!: String = "",
+    extraCollections!: Array<String> = []
+): Array<String> {
+    resolveQmdMemorySearchCollections(
+        workspaceDir: workspaceDir,
+        extraCollections: extraCollections,
+        includeSessions: includeSessions
+    )
+}
+
+private func qmdNotesCollectionNameForWorkspace(workspace: Path): String {
+    let workspaceName = workspace.fileName.trimAscii()
+    qmdCollectionName("memory-notes-" + workspaceName)
 }
 
 private func qmdGatewayStore(): MemorySessionTranscriptStore {
@@ -964,12 +1036,17 @@ private func qmdExportSessions(): Int64 {
     exported
 }
 
-private func qmdEnsureManagedCollections(): String {
+private func qmdEnsureManagedCollectionsForWorkspace(workspaceDir!: String = ""): String {
+    let workspace = qmdWorkspaceRoot(workspaceDir)
     MemoryPaths.ensureWorkspaceMemoryDir()
     let _ = qmdExportSessions()
     if (CliConfig.qmdIncludeDefaultMemory) {
-        qmdEnsureCollection(CliConfig.cwd, qmdDefaultCollectionName(), mask: qmdDefaultCollectionMask())
-        qmdEnsureCollection(qmdManagedMemoryDir(), qmdNotesCollectionName(), mask: qmdNotesCollectionMask())
+        let workspaceMemoryDir = workspace.join("memory")
+        if (!exists(workspaceMemoryDir)) {
+            Directory.create(workspaceMemoryDir, recursive: true)
+        }
+        qmdEnsureCollection(workspace, qmdDefaultCollectionNameForWorkspace(workspace), mask: qmdDefaultCollectionMask())
+        qmdEnsureCollection(workspaceMemoryDir, qmdNotesCollectionNameForWorkspace(workspace), mask: qmdNotesCollectionMask())
     }
     for (i in 0..CliConfig.qmdPaths.size) {
         let rawPath = CliConfig.qmdPaths[i]
@@ -978,16 +1055,20 @@ private func qmdEnsureManagedCollections(): String {
             continue
         }
         let path = Path(trimmed)
-        let absolute = if (path.isAbsolute()) { path } else { CliConfig.cwd.join(trimmed) }
+        let absolute = if (path.isAbsolute()) { path } else { workspace.join(trimmed) }
         let explicitName = if (i < CliConfig.qmdPathNames.size) { CliConfig.qmdPathNames[i].trimAscii() } else { "" }
         let pattern = if (i < CliConfig.qmdPathPatterns.size) { CliConfig.qmdPathPatterns[i].trimAscii() } else { "" }
         let collectionName = if (!explicitName.isEmpty()) { qmdCollectionName(explicitName) } else { qmdCollectionName("custom-" + absolute.fileName) }
         qmdEnsureCollection(absolute, collectionName, mask: pattern)
     }
     if (CliConfig.qmdSessionsEnabled) {
-        qmdEnsureCollection(qmdSessionExportDir(), qmdSessionCollectionName(), mask: qmdSessionsCollectionMask())
+        qmdEnsureCollection(qmdSessionExportDir(), qmdSessionCollectionNameForWorkspace(workspace), mask: qmdSessionsCollectionMask())
     }
     qmdStateRoot().toString()
+}
+
+private func qmdEnsureManagedCollections(): String {
+    qmdEnsureManagedCollectionsForWorkspace()
 }
 
 private func qmdRunUpdate(): (Int64, String, String) {
@@ -1065,7 +1146,13 @@ private func qmdParseSearchRows(stdout: String): Array<LocalMemorySearchRow> {
     rows.toArray()
 }
 
-private func qmdSearchCommand(mode: String, query: String, limit: Int64): Array<String> {
+private func qmdSearchCommand(
+    mode: String,
+    query: String,
+    limit: Int64,
+    workspaceDir!: String = "",
+    extraCollections!: Array<String> = []
+): Array<String> {
     let args = ArrayList<String>()
     let explicitTool = CliConfig.qmdSearchTool.trimAscii().toAsciiLower()
     let normalized = if (!explicitTool.isEmpty()) { explicitTool } else { mode.trimAscii().toAsciiLower() }
@@ -1081,7 +1168,11 @@ private func qmdSearchCommand(mode: String, query: String, limit: Int64): Array<
     args.add("--json")
     args.add("--limit")
     args.add("${limit}")
-    for (collection in qmdManagedCollectionNames(includeSessions: qmdSessionsAllowedByScope())) {
+    for (collection in qmdManagedCollectionNames(
+        includeSessions: qmdSessionsAllowedByScope(),
+        workspaceDir: workspaceDir,
+        extraCollections: extraCollections
+    )) {
         args.add("--collection")
         args.add(collection)
     }
@@ -1288,6 +1379,13 @@ public interface MemoryProvider {
     func resolveMemoryFiles(): Array<Path>
     func searchRows(query: String, limit: Int64): Array<LocalMemorySearchRow>
     func searchRows(query: String, limit: Int64, sessionKey!: Option<String>): Array<LocalMemorySearchRow>
+    func searchRows(
+        query: String,
+        limit: Int64,
+        sessionKey!: Option<String>,
+        qmdWorkspaceDir!: String,
+        qmdExtraCollections!: Array<String>
+    ): Array<LocalMemorySearchRow>
     func recordShortTermRecall(query: String, rows: Array<LocalMemoryRecallResult>): Unit
 
     func statusJson(deep!: Bool): String
@@ -1410,6 +1508,18 @@ private class LocalMemoryProvider <: MemoryProvider {
         LocalMemoryIndexManager.searchSqlite(query, limit)
     }
 
+    public func searchRows(
+        query: String,
+        limit: Int64,
+        sessionKey!: Option<String>,
+        qmdWorkspaceDir!: String,
+        qmdExtraCollections!: Array<String>
+    ): Array<LocalMemorySearchRow> {
+        let _ = qmdWorkspaceDir
+        let _ = qmdExtraCollections
+        this.searchRows(query, limit, sessionKey: sessionKey)
+    }
+
     public func recordShortTermRecall(query: String, rows: Array<LocalMemoryRecallResult>): Unit {
         LocalMemoryIndexManager.recordShortTermRecall(query, rows)
     }
@@ -1510,6 +1620,18 @@ private class LocalCompatMemoryProvider <: MemoryProvider {
         ordered[0..limit]
     }
 
+    public func searchRows(
+        query: String,
+        limit: Int64,
+        sessionKey!: Option<String>,
+        qmdWorkspaceDir!: String,
+        qmdExtraCollections!: Array<String>
+    ): Array<LocalMemorySearchRow> {
+        let _ = qmdWorkspaceDir
+        let _ = qmdExtraCollections
+        this.searchRows(query, limit, sessionKey: sessionKey)
+    }
+
     public func recordShortTermRecall(query: String, rows: Array<LocalMemoryRecallResult>): Unit {
         LocalMemoryIndexManager.recordShortTermRecall(query, rows)
     }
@@ -1605,6 +1727,18 @@ private class ExternalCommandMemoryProvider <: MemoryProvider {
         }
     }
 
+    public func searchRows(
+        query: String,
+        limit: Int64,
+        sessionKey!: Option<String>,
+        qmdWorkspaceDir!: String,
+        qmdExtraCollections!: Array<String>
+    ): Array<LocalMemorySearchRow> {
+        let _ = qmdWorkspaceDir
+        let _ = qmdExtraCollections
+        this.searchRows(query, limit, sessionKey: sessionKey)
+    }
+
     public func recordShortTermRecall(query: String, rows: Array<LocalMemoryRecallResult>): Unit {
         LocalMemoryIndexManager.recordShortTermRecall(query, rows)
     }
@@ -1667,6 +1801,22 @@ private class QmdMemoryProvider <: MemoryProvider {
 
     public func searchRows(query: String, limit: Int64, sessionKey!: Option<String>): Array<LocalMemorySearchRow> {
         QmdBackendRuntime.searchRows(query, limit, sessionKey: sessionKey)
+    }
+
+    public func searchRows(
+        query: String,
+        limit: Int64,
+        sessionKey!: Option<String>,
+        qmdWorkspaceDir!: String,
+        qmdExtraCollections!: Array<String>
+    ): Array<LocalMemorySearchRow> {
+        QmdBackendRuntime.searchRows(
+            query,
+            limit,
+            sessionKey: sessionKey,
+            workspaceDir: qmdWorkspaceDir,
+            extraCollections: qmdExtraCollections
+        )
     }
 
     public func recordShortTermRecall(query: String, rows: Array<LocalMemoryRecallResult>): Unit {
@@ -1797,12 +1947,18 @@ private class MemoryBackendAdapterRegistry {
 }
 
 private class QmdBackendRuntime {
-    public static func searchRows(query: String, limit: Int64, sessionKey!: Option<String>): Array<LocalMemorySearchRow> {
+    public static func searchRows(
+        query: String,
+        limit: Int64,
+        sessionKey!: Option<String>,
+        workspaceDir!: String = "",
+        extraCollections!: Array<String> = []
+    ): Array<LocalMemorySearchRow> {
         if (!qmdConfigured()) {
             return Array<LocalMemorySearchRow>()
         }
         try {
-            let _ = qmdEnsureManagedCollections()
+            let _ = qmdEnsureManagedCollectionsForWorkspace(workspaceDir: workspaceDir)
             if (!isQmdScopeAllowed(sessionKey)) {
                 let info = deriveQmdScopeInfo(sessionKey)
                 LogUtils.info("qmd search denied by scope (channel=${info.channel ?? "-"}, chatType=${info.chatType ?? "-"}, session=${sessionKey ?? ""})")
@@ -1810,7 +1966,13 @@ private class QmdBackendRuntime {
             }
             let effectiveLimit = min(max(1, limit), max(1, CliConfig.qmdLimitsMaxResults))
             let (ec, stdout, _stderr) = qmdRun(
-                qmdSearchCommand(CliConfig.qmdSearchMode, query, effectiveLimit),
+                qmdSearchCommand(
+                    CliConfig.qmdSearchMode,
+                    query,
+                    effectiveLimit,
+                    workspaceDir: workspaceDir,
+                    extraCollections: extraCollections
+                ),
                 CliConfig.qmdLimitsTimeoutMs
             )
             if (ec == 0) {
@@ -1822,7 +1984,13 @@ private class QmdBackendRuntime {
             let (updateEc, _updateOut, _updateErr) = qmdRunUpdate()
             if (updateEc == 0) {
                 let (retryEc, retryOut, _retryErr) = qmdRun(
-                    qmdSearchCommand(CliConfig.qmdSearchMode, query, effectiveLimit),
+                    qmdSearchCommand(
+                        CliConfig.qmdSearchMode,
+                        query,
+                        effectiveLimit,
+                        workspaceDir: workspaceDir,
+                        extraCollections: extraCollections
+                    ),
                     CliConfig.qmdLimitsTimeoutMs
                 )
                 if (retryEc == 0) {
@@ -1834,7 +2002,13 @@ private class QmdBackendRuntime {
             }
             if (CliConfig.qmdSearchMode.trimAscii().toAsciiLower() != "query") {
                 let (fallbackEc, fallbackOut, _fallbackErr) = qmdRun(
-                    qmdSearchCommand("query", query, effectiveLimit),
+                    qmdSearchCommand(
+                        "query",
+                        query,
+                        effectiveLimit,
+                        workspaceDir: workspaceDir,
+                        extraCollections: extraCollections
+                    ),
                     CliConfig.qmdLimitsTimeoutMs
                 )
                 if (fallbackEc == 0) {
