@@ -446,6 +446,13 @@ private func gatewayRoutePeerId(routeMatch: JsonObject): String {
     gatewayRouteJsonString(gatewayRouteJsonObject(routeMatch, "peer"), "id")
 }
 
+private func gatewayRoutePeerKindMatches(bindingKind: String, scopeKind: String): Bool {
+    if (bindingKind == scopeKind) {
+        return true
+    }
+    (bindingKind == "group" && scopeKind == "channel") || (bindingKind == "channel" && scopeKind == "group")
+}
+
 private func gatewayRouteRolesOverlap(bindingRoles: Array<String>, inputRoles: Array<String>): Bool {
     for (role in bindingRoles) {
         for (inputRole in inputRoles) {
@@ -455,6 +462,44 @@ private func gatewayRouteRolesOverlap(bindingRoles: Array<String>, inputRoles: A
         }
     }
     false
+}
+
+private func gatewayRouteMatchScopeSatisfied(
+    input: GatewayAgentRouteInput,
+    routeMatch: JsonObject,
+    scopePeerKind: String,
+    scopePeerId: String
+): Bool {
+    if (gatewayRouteHasPeer(routeMatch)) {
+        let peerKind = gatewayRoutePeerKind(routeMatch)
+        let peerId = gatewayRoutePeerId(routeMatch)
+        if (peerKind.isEmpty() || peerId.isEmpty()) {
+            return false
+        }
+        if (!gatewayRoutePeerKindMatches(peerKind, scopePeerKind)) {
+            return false
+        }
+        if (peerId != "*" && peerId != scopePeerId) {
+            return false
+        }
+    }
+
+    let guildId = gatewayRouteJsonString(routeMatch, "guildId")
+    if (!guildId.isEmpty() && guildId != input.guildId) {
+        return false
+    }
+
+    let teamId = gatewayRouteJsonString(routeMatch, "teamId")
+    if (!teamId.isEmpty() && teamId != input.teamId) {
+        return false
+    }
+
+    let roles = gatewayRouteJsonStringArray(routeMatch, "roles")
+    if (roles.size > 0 && !gatewayRouteRolesOverlap(roles, input.roles)) {
+        return false
+    }
+
+    true
 }
 
 private func gatewayRouteBasicBindingMatches(input: GatewayAgentRouteInput, binding: JsonObject, accountId: String,
@@ -494,24 +539,28 @@ private func gatewayRouteFindCandidate(
         let guildId = gatewayRouteJsonString(routeMatch, "guildId")
         let teamId = gatewayRouteJsonString(routeMatch, "teamId")
         let roles = gatewayRouteJsonStringArray(routeMatch, "roles")
+        let inputScopeMatches = gatewayRouteMatchScopeSatisfied(input, routeMatch, input.peerKind, input.peerId)
+        let parentScopeMatches = gatewayRouteMatchScopeSatisfied(input, routeMatch, input.parentPeerKind,
+            input.parentPeerId)
         match (tier) {
             case "peer.exact" =>
-                if (peerKind == input.peerKind && !peerId.isEmpty() && peerId != "*" && peerId == input.peerId) {
+                if (gatewayRoutePeerKindMatches(peerKind, input.peerKind) && !peerId.isEmpty() && peerId != "*" &&
+                    peerId == input.peerId && inputScopeMatches) {
                     best = gatewayRoutePreferAccountSpecificCandidate(best,
                         GatewayAgentRouteCandidate(binding,
                             gatewayRouteSanitizeAgentId(gatewayRouteJsonString(binding, "agentId")),
                             "binding.peer.exact", accountInfo[0], accountInfo[1]))
                 }
             case "peer.parent" =>
-                if (peerKind == input.parentPeerKind && !peerId.isEmpty() && peerId != "*" && peerId == input
-                    .parentPeerId) {
+                if (gatewayRoutePeerKindMatches(peerKind, input.parentPeerKind) && !peerId.isEmpty() && peerId != "*" &&
+                    peerId == input.parentPeerId && parentScopeMatches) {
                     best = gatewayRoutePreferAccountSpecificCandidate(best,
                         GatewayAgentRouteCandidate(binding,
                             gatewayRouteSanitizeAgentId(gatewayRouteJsonString(binding, "agentId")),
                             "binding.peer.parent", accountInfo[0], accountInfo[1]))
                 }
             case "peer.wildcard" =>
-                if (peerKind == input.peerKind && peerId == "*") {
+                if (gatewayRoutePeerKindMatches(peerKind, input.peerKind) && peerId == "*" && inputScopeMatches) {
                     best = gatewayRoutePreferAccountSpecificCandidate(best,
                         GatewayAgentRouteCandidate(binding,
                             gatewayRouteSanitizeAgentId(gatewayRouteJsonString(binding, "agentId")),
@@ -519,35 +568,38 @@ private func gatewayRouteFindCandidate(
                 }
             case "guild+roles" =>
                 if (!guildId.isEmpty() && guildId == input.guildId && roles.size > 0 && gatewayRouteRolesOverlap(roles,
-                    input.roles)) {
+                    input.roles) && inputScopeMatches) {
                     best = gatewayRoutePreferAccountSpecificCandidate(best,
                         GatewayAgentRouteCandidate(binding,
                             gatewayRouteSanitizeAgentId(gatewayRouteJsonString(binding, "agentId")),
                             "binding.guild+roles", accountInfo[0], accountInfo[1]))
                 }
             case "guild" =>
-                if (!guildId.isEmpty() && guildId == input.guildId && roles.size == 0) {
+                if (!guildId.isEmpty() && guildId == input.guildId && roles.size == 0 && inputScopeMatches) {
                     best = gatewayRoutePreferAccountSpecificCandidate(best,
                         GatewayAgentRouteCandidate(binding,
                             gatewayRouteSanitizeAgentId(gatewayRouteJsonString(binding, "agentId")), "binding.guild",
                             accountInfo[0], accountInfo[1]))
                 }
             case "team" =>
-                if (!teamId.isEmpty() && teamId == input.teamId && guildId.isEmpty() && !gatewayRouteHasPeer(routeMatch)) {
+                if (!teamId.isEmpty() && teamId == input.teamId && guildId.isEmpty() && !gatewayRouteHasPeer(routeMatch) &&
+                    inputScopeMatches) {
                     best = gatewayRoutePreferAccountSpecificCandidate(best,
                         GatewayAgentRouteCandidate(binding,
                             gatewayRouteSanitizeAgentId(gatewayRouteJsonString(binding, "agentId")), "binding.team",
                             accountInfo[0], accountInfo[1]))
                 }
             case "account" =>
-                if (!gatewayRouteHasPeer(routeMatch) && guildId.isEmpty() && teamId.isEmpty() && accountInfo[0] != "*") {
+                if (!gatewayRouteHasPeer(routeMatch) && guildId.isEmpty() && teamId.isEmpty() && accountInfo[0] != "*" &&
+                    inputScopeMatches) {
                     best = gatewayRoutePreferAccountSpecificCandidate(best,
                         GatewayAgentRouteCandidate(binding,
                             gatewayRouteSanitizeAgentId(gatewayRouteJsonString(binding, "agentId")), "binding.account",
                             accountInfo[0], accountInfo[1]))
                 }
             case "channel" =>
-                if (!gatewayRouteHasPeer(routeMatch) && guildId.isEmpty() && teamId.isEmpty() && accountInfo[0] == "*") {
+                if (!gatewayRouteHasPeer(routeMatch) && guildId.isEmpty() && teamId.isEmpty() && accountInfo[0] == "*" &&
+                    inputScopeMatches) {
                     best = gatewayRoutePreferAccountSpecificCandidate(best,
                         GatewayAgentRouteCandidate(binding,
                             gatewayRouteSanitizeAgentId(gatewayRouteJsonString(binding, "agentId")), "binding.channel",
