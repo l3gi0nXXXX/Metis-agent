@@ -1954,6 +1954,52 @@ public class GatewayServerMethodsAgentsTest {
     }
 
     @TestCase
+    public func agentTeamBroadcastRpcPersistsStrategyAndResolverUsesIt(): Unit {
+        withAgentsTempHome("metis-agent-team-broadcast-strategy-rpc-home", { _home: Path =>
+            let bindings = JsonArray([])
+            bindings.add(agentsTestRouteBinding("content-pm", "telegram", accountId: "bot-a", peerKind: "group", peerId: "-100_strategy"))
+
+            let broadcast = JsonObject()
+            broadcast.put("enabled", JsonBool(true))
+            broadcast.put("members", agentsTestStringArray(["content-pm", "content-writer"]))
+            broadcast.put("strategy", JsonString("parallel"))
+
+            let createParams = JsonObject()
+            createParams.put("id", JsonString("content"))
+            createParams.put("template", JsonString("pm-writer-reviewer"))
+            createParams.put("bindings", bindings)
+            createParams.put("broadcast", broadcast)
+            @Expect(handleGatewayAgentsFamily("agents.teams.create", request: Some(GatewayRpcRequest("agents.teams.create", params: createParams))).getOrThrow().ok, true)
+
+            let getParams = JsonObject()
+            getParams.put("id", JsonString("content"))
+            let getResponse = handleGatewayAgentsFamily("agents.teams.get", request: Some(GatewayRpcRequest("agents.teams.get", params: getParams))).getOrThrow()
+            @Expect(getResponse.ok, true)
+            let persistedBroadcast = getResponse.result.asObject().get("team").getOrThrow().asObject()
+                .get("broadcast").getOrThrow().asObject()
+            @Expect(agentsTestBool(persistedBroadcast, "enabled"), true)
+            @Expect(agentsTestString(persistedBroadcast, "strategy"), "parallel")
+
+            let root = MetisConfigManager.rawConfig().getOrThrow()
+            let plan = gatewayResolveAgentTeamBroadcastPlan(GatewaySessionRequest(
+                GatewayIngressSource.Channel("telegram"),
+                channelName: "telegram",
+                text: "strategy rpc acceptance",
+                accountId: "bot-a",
+                peerId: "-100_strategy",
+                senderId: "sender-strategy",
+                routeRoot: root,
+                routeAccountId: "bot-a",
+                routePeerKind: "group",
+                routePeerId: "-100_strategy"
+            ))
+            @Expect(plan.enabled, true)
+            @Expect(plan.strategy, "parallel")
+            @Expect(plan.turns.size, 2)
+        })
+    }
+
+    @TestCase
     public func agentTeamRpcResponsesExposeProductSemanticsWithoutManagerRuntimePromise(): Unit {
         withAgentsTempHome("metis-agent-team-product-semantics-home", { _home: Path =>
             let createParams = JsonObject()

@@ -59,7 +59,7 @@ private func broadcastMember(agentId: String): JsonObject {
 
 private func broadcastTeam(enabledValue: Option<JsonBool>, selectedMembers!: Array<String> = [],
     channelName!: String = "fake", peerKind!: String = "group", peerId!: String = "room-1",
-    accountId!: String = "*"): JsonObject {
+    accountId!: String = "*", strategy!: String = ""): JsonObject {
     let team = JsonObject()
     team.put("id", JsonString("content"))
     team.put("displayName", JsonString("Content Team"))
@@ -79,6 +79,9 @@ private func broadcastTeam(enabledValue: Option<JsonBool>, selectedMembers!: Arr
     }
     if (selectedMembers.size > 0) {
         broadcast.put("members", broadcastStringArray(selectedMembers))
+    }
+    if (!strategy.isEmpty()) {
+        broadcast.put("strategy", JsonString(strategy))
     }
     team.put("broadcast", broadcast)
     return team
@@ -205,6 +208,13 @@ private func broadcastRouteString(obj: JsonObject, key: String): String {
     }
 }
 
+private func broadcastNestedObject(obj: JsonObject, key: String): JsonObject {
+    match (obj.get(key)) {
+        case Some(v) => try { v.asObject() } catch (_: Exception) { JsonObject() }
+        case None => JsonObject()
+    }
+}
+
 @Test
 public class GatewayAgentTeamBroadcastTest {
     @TestCase
@@ -256,6 +266,63 @@ public class GatewayAgentTeamBroadcastTest {
             @Expect(executableWriterContext.sessionKey, "agent:writer:fake:group:room-1")
             @Expect(broadcastRouteString(executableWriterContext.turnContext.route, "matchedBy"), "broadcast.team")
             @Expect(broadcastRouteString(executableWriterContext.turnContext.route, "broadcastTeamId"), "content")
+        })
+    }
+
+    @TestCase
+    public func teamBroadcastStrategyDefaultsSequentialAndDiagnosesInvalidValues(): Unit {
+        withBroadcastTempHome("strategy-parse", { home: Path =>
+            let defaultRoot = broadcastRoot(home, broadcastTeam(Some(JsonBool(true)), selectedMembers: ["writer", "reviewer"]))
+            writeBroadcastRoot(defaultRoot)
+            let defaultPlan = gatewayResolveAgentTeamBroadcastPlan(broadcastRequest(defaultRoot))
+            @Expect(defaultPlan.enabled, true)
+            @Expect(defaultPlan.strategy, "sequential")
+
+            let parallelRoot = broadcastRoot(home,
+                broadcastTeam(Some(JsonBool(true)), selectedMembers: ["writer", "reviewer"], strategy: "parallel"))
+            writeBroadcastRoot(parallelRoot)
+            let parallelPlan = gatewayResolveAgentTeamBroadcastPlan(broadcastRequest(parallelRoot))
+            @Expect(parallelPlan.enabled, true)
+            @Expect(parallelPlan.strategy, "parallel")
+
+            let invalidRoot = broadcastRoot(home,
+                broadcastTeam(Some(JsonBool(true)), selectedMembers: ["writer"], strategy: "fastest"))
+            writeBroadcastRoot(invalidRoot)
+            let invalidPlan = gatewayResolveAgentTeamBroadcastPlan(broadcastRequest(invalidRoot))
+            @Expect(invalidPlan.enabled, true)
+            @Expect(invalidPlan.strategy, "sequential")
+            @Expect(invalidPlan.diagnostics.contains("broadcast-strategy-invalid:content:fastest"), true)
+        })
+    }
+
+    @TestCase
+    public func topLevelBroadcastPeerMapIsReadOnlyCompatibilityLayerAndDoesNotOverrideTeams(): Unit {
+        withBroadcastTempHome("top-level-map", { home: Path =>
+            let root = broadcastRoot(home, broadcastTeam(Some(JsonBool(false)), selectedMembers: ["writer"]))
+            let topBroadcast = JsonObject()
+            topBroadcast.put("strategy", JsonString("parallel"))
+            topBroadcast.put("room-1", broadcastStringArray(["writer", "reviewer"]))
+            root.put("broadcast", topBroadcast)
+            writeBroadcastRoot(root)
+            let plan = gatewayResolveAgentTeamBroadcastPlan(broadcastRequest(root))
+            @Expect(plan.enabled, true)
+            @Expect(plan.teamId, "top-level:room-1")
+            @Expect(plan.strategy, "parallel")
+            @Expect(plan.selectedAgentIds.size, 2)
+            @Expect(plan.turns[0].agentId, "writer")
+            @Expect(plan.turns[1].agentId, "reviewer")
+            @Expect(plan.diagnostics.contains("broadcast-compat-top-level-peer-map:room-1"), true)
+
+            let teamRoot = broadcastRoot(home, broadcastTeam(Some(JsonBool(true)), selectedMembers: ["writer"]))
+            let ignoredTop = JsonObject()
+            ignoredTop.put("room-1", broadcastStringArray(["reviewer"]))
+            teamRoot.put("broadcast", ignoredTop)
+            writeBroadcastRoot(teamRoot)
+            let teamPlan = gatewayResolveAgentTeamBroadcastPlan(broadcastRequest(teamRoot))
+            @Expect(teamPlan.enabled, true)
+            @Expect(teamPlan.teamId, "content")
+            @Expect(teamPlan.selectedAgentIds.size, 1)
+            @Expect(teamPlan.selectedAgentIds[0], "writer")
         })
     }
 
@@ -334,6 +401,61 @@ public class GatewayAgentTeamBroadcastTest {
     }
 
     @TestCase
+    public func feishuGroupBroadcastMarksOnlyActiveAgentForDeliveryAndObserversNoReply(): Unit {
+        withBroadcastTempHome("feishu-observer", { home: Path =>
+            let root = broadcastRoot(
+                home,
+                broadcastTeam(
+                    Some(JsonBool(true)),
+                    selectedMembers: ["ops", "writer"],
+                    channelName: "feishu",
+                    peerKind: "group",
+                    peerId: "chat-1",
+                    accountId: "tenant-a",
+                    strategy: "parallel"
+                ),
+                channelName: "feishu",
+                accountId: "tenant-a"
+            )
+            writeBroadcastRoot(root)
+            let plan = gatewayResolveAgentTeamBroadcastPlan(
+                broadcastRequest(root, channelName: "feishu", accountId: "tenant-a", peerKind: "group", peerId: "chat-1")
+            )
+
+            @Expect(plan.enabled, true)
+            @Expect(plan.turns.size, 2)
+            @Expect(plan.turns[0].agentId, "ops")
+            @Expect(plan.turns[0].request.deliver, true)
+            @Expect(broadcastRouteString(plan.turns[0].context.turnContext.route, "broadcastRole"), "active")
+            @Expect(plan.turns[1].agentId, "writer")
+            @Expect(plan.turns[1].request.deliver, false)
+            @Expect(broadcastRouteString(plan.turns[1].context.turnContext.route, "broadcastRole"), "observer")
+            @Expect(broadcastRouteString(plan.turns[1].context.turnContext.route, "broadcastObserverReason"), "feishu-group-single-active-reply")
+        })
+    }
+
+    @TestCase
+    public func broadcastTurnsShareSameInboundSnapshotBeforeAnyMemberReply(): Unit {
+        withBroadcastTempHome("shared-snapshot", { home: Path =>
+            let root = broadcastRoot(home, broadcastTeam(Some(JsonBool(true)), selectedMembers: ["writer", "reviewer"]))
+            writeBroadcastRoot(root)
+            let plan = gatewayResolveAgentTeamBroadcastPlan(broadcastRequest(root))
+            @Expect(plan.enabled, true)
+            @Expect(plan.turns.size, 2)
+
+            let leftContext = broadcastNestedObject(plan.turns[0].request.mediaContext, "context")
+            let rightContext = broadcastNestedObject(plan.turns[1].request.mediaContext, "context")
+            let leftSnapshot = broadcastNestedObject(leftContext, "broadcastInboundSnapshot")
+            let rightSnapshot = broadcastNestedObject(rightContext, "broadcastInboundSnapshot")
+            @Expect(leftSnapshot.toJsonString(), rightSnapshot.toJsonString())
+            @Expect(broadcastRouteString(leftSnapshot, "text"), "hello team")
+            @Expect(broadcastRouteString(leftSnapshot, "sourceMessageId"), "msg-1")
+            @Expect(leftSnapshot.toJsonString().contains("writer answer"), false)
+            @Expect(leftSnapshot.toJsonString().contains("reviewer answer"), false)
+        })
+    }
+
+    @TestCase
     public func broadcastRequiresBooleanEnabledTrueAndASelectedMemberList(): Unit {
         withBroadcastTempHome("explicit-enabled", { home: Path =>
             let stringEnabledTeam = broadcastTeam(None, selectedMembers: ["writer", "reviewer"])
@@ -383,6 +505,39 @@ public class GatewayAgentTeamBroadcastTest {
             @Expect(agents[1].asObject().get("status").getOrThrow().asString().getValue(), "not-delivered")
             @Expect(agents[1].asObject().get("detail").getOrThrow().asString().getValue(), "not-requested")
             @Expect(aggregate.get("answer").getOrThrow().asString().getValue(), "[writer] writer answer\n[reviewer] reviewer answer")
+        })
+    }
+
+    @TestCase
+    public func broadcastStrategyRunnerKeepsPlanOrderAndConvertsMemberFailureToResult(): Unit {
+        withBroadcastTempHome("strategy-runner", { home: Path =>
+            let root = broadcastRoot(home,
+                broadcastTeam(Some(JsonBool(true)), selectedMembers: ["writer", "reviewer"], strategy: "parallel"))
+            writeBroadcastRoot(root)
+            let plan = gatewayResolveAgentTeamBroadcastPlan(broadcastRequest(root))
+            let results = gatewayRunAgentTeamBroadcastPlan(plan, { turn: GatewayAgentTeamBroadcastTurn =>
+                if (turn.agentId == "writer") {
+                    throw Exception("synthetic member failure")
+                }
+                GatewayResolvedSessionTurnResult(
+                    turn.context,
+                    GatewaySessionExecutionResult("${turn.agentId} answer", delivered: true, deliveryStatus: "delivered")
+                )
+            })
+
+            @Expect(plan.strategy, "parallel")
+            @Expect(results.size, 2)
+            @Expect(results[0].context.agentId, "writer")
+            @Expect(results[0].execution.delivered, false)
+            @Expect(results[0].execution.deliveryStatus, "exception")
+            @Expect(results[0].execution.deliveryError, "synthetic member failure")
+            @Expect(results[1].context.agentId, "reviewer")
+            @Expect(results[1].execution.delivered, true)
+            let aggregate = gatewayAgentTeamBroadcastAggregateJson(plan, results)
+            let agents = aggregate.get("agents").getOrThrow().asArray()
+            @Expect(agents[0].asObject().get("agentId").getOrThrow().asString().getValue(), "writer")
+            @Expect(agents[1].asObject().get("agentId").getOrThrow().asString().getValue(), "reviewer")
+            @Expect(aggregate.get("status").getOrThrow().asString().getValue(), "partial")
         })
     }
 

@@ -162,13 +162,15 @@ public class GatewayService {
         request: GatewaySessionRequest,
         message: InboundMessage,
         effectiveAccountId: String,
-        telegramAutoVoiceReply: Bool
+        telegramAutoVoiceReply: Bool,
+        bestEffortDeliver!: Bool = false
     ): GatewayResolvedSessionTurnResult {
         gatewayExecuteSessionRequestTurnForUser(
             sessionUser,
             request,
             message.text,
-            deliver: true,
+            deliver: request.deliver,
+            bestEffortDeliver: bestEffortDeliver,
             replyToMessageId: this.telegramReplyTargetOrMessageId(message),
             replyInThread: message.replyInThread,
             deliverHook: Some({ channelName, deliveryAccountId, peerId, text, replyToMessageId, replyInThread =>
@@ -425,32 +427,47 @@ public class GatewayService {
                     .string("accountId", effectiveAccountId)
                     .identityHash("peerHash", message.peerId)
                     .string("teamId", broadcastPlan.teamId)
+                    .string("strategy", broadcastPlan.strategy)
                     .int("turns", Int64(broadcastPlan.turns.size))
                     .int("selectedAgentCount", Int64(broadcastPlan.selectedAgentIds.size))
                     .object()
             )
-            var delivered = false
-            for (broadcastTurn in broadcastPlan.turns) {
-                let turn = try {
+            let broadcastConversationKey = conversationKey
+            let results = gatewayRunAgentTeamBroadcastPlan(broadcastPlan, { broadcastTurn: GatewayAgentTeamBroadcastTurn =>
+                let turn =
                     this.executeInboundSessionTurn(
                         user,
                         sessionUser,
                         broadcastTurn.request,
                         message,
                         effectiveAccountId,
-                        telegramAutoVoiceReply
+                        telegramAutoVoiceReply,
+                        bestEffortDeliver: true
                     )
-                } catch (e: Exception) {
-                    if (channelToString(message.channel) == "telegram") {
-                        this.handleTelegramInboundExecutionError(user, message, effectiveAccountId, e)
-                        return
-                    }
-                    throw e
-                }
-                this.logInboundTurnOutcome(conversationKey, message, turn)
-                if (turn.execution.delivered) {
-                    delivered = true
-                }
+                this.logInboundTurnOutcome(broadcastConversationKey, message, turn)
+                turn
+            })
+            let aggregate = gatewayAgentTeamBroadcastAggregateJson(broadcastPlan, results)
+            gatewayLogEventInfo(
+                "gateway/message",
+                "message.routed",
+                "agent team broadcast completed",
+                meta: gatewayLogMeta()
+                    .string("channel", channelToString(message.channel))
+                    .string("accountId", effectiveAccountId)
+                    .identityHash("peerHash", message.peerId)
+                    .string("teamId", broadcastPlan.teamId)
+                    .string("strategy", broadcastPlan.strategy)
+                    .string("status", aggregate.get("status").getOrThrow().asString().getValue())
+                    .int("deliveredCount", aggregate.get("deliveredCount").getOrThrow().asInt().getValue())
+                    .int("total", aggregate.get("total").getOrThrow().asInt().getValue())
+                    .object()
+            )
+            let delivered = aggregate.get("delivered").getOrThrow().asBool().getValue()
+            if (!delivered && channelToString(message.channel) == "telegram") {
+                this.handleTelegramInboundExecutionError(user, message, effectiveAccountId,
+                    Exception("agent team broadcast failed for all selected members"))
+                return
             }
             if (delivered && channelToString(message.channel) == "telegram") {
                 this.maybeAutoLabelTelegramTopic(user, message, effectiveAccountId)
