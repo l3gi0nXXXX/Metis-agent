@@ -36,6 +36,7 @@ public struct GatewaySubagentPolicyUserSettings {
     public var maxSpawnDepth: Int64 = 1
     public var defaultTimeoutSeconds: Int64 = 600
     public var maxTimeoutSeconds: Int64 = 1800
+    public var archiveAfterMinutes: Int64 = 60
     public var childAllowedTools: Array<String> = []
     public var childDeniedTools: Array<String> = []
     public var allowCustomAgents: Bool = false

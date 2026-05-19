@@ -11,7 +11,7 @@ import std.fs.{Directory, File, Path, exists, remove}
 import std.core.Duration
 import std.time.DateTime
 import std.unittest.testmacro.*
-import stdx.encoding.json.{JsonArray, JsonBool, JsonObject, JsonString, JsonValue}
+import stdx.encoding.json.{JsonArray, JsonBool, JsonInt, JsonObject, JsonString, JsonValue}
 
 private func withManagedSessionsToolsetTestHome<T>(home: String, block: () -> T): T {
     synchronized(MetisProcessEnvironmentLock) {
@@ -404,6 +404,85 @@ public class GatewayManagedSessionsToolsetTest {
     }
 
     @TestCase
+    public func subagentsKillParentCascadesToChildRuns(): Unit {
+        withManagedSessionsToolsetTestHome("/tmp/metis-managed-subagents-toolset-kill-cascade") {
+            let store = memorySessionStoreForGatewayUser(CliSettingManager.readGatewaySettings())
+            let parentSessionKey = "parent-orchestrator"
+            let childSessionKey = "child-worker"
+            store.appendTranscriptEntry(parentSessionKey, "assistant", "parent work")
+            store.appendTranscriptEntry(childSessionKey, "assistant", "child work")
+            let parent = gatewaySubagentCreateRunRecord(
+                store.sessionsRoot(),
+                parentSessionKey,
+                requesterSessionKey: "cli:main",
+                agentId: "planner",
+                status: "running",
+                transcriptPath: store.transcriptPath(parentSessionKey).toString()
+            )
+            let child = gatewaySubagentCreateRunRecord(
+                store.sessionsRoot(),
+                childSessionKey,
+                parentSessionKey: parentSessionKey,
+                requesterSessionKey: parentSessionKey,
+                agentId: "reviewer",
+                status: "running",
+                transcriptPath: store.transcriptPath(childSessionKey).toString()
+            )
+            let parentRunId = gatewaySubagentRunRecordString(parent, "runId")
+            let childRunId = gatewaySubagentRunRecordString(child, "runId")
+            let toolset = GatewayManagedSessionsToolset()
+
+            gatewayWithToolRuntimeContext(GatewayToolRuntimeContext("cli", sessionKey: "cli:main")) {
+                let killed = managedSubagentsJson(toolset.subagentsForTest(managedSubagentsSome("kill"), managedSubagentsSome(parentRunId), None<String>, None<Int64>))
+                @Expect(managedSubagentsString(killed, "status"), "cancelled")
+                @Expect(killed.get("cascadeCancelled").getOrThrow().asArray().size(), 1)
+                match (gatewaySubagentResolveRunRecord(store.sessionsRoot(), childRunId)) {
+                    case Some(found) =>
+                        @Expect(gatewaySubagentRunRecordString(found, "status"), "cancelled")
+                        @Expect(gatewaySubagentRunRecordString(found, "error").contains(parentRunId), true)
+                    case None => @Expect("missing", "child")
+                }
+            }
+        }
+    }
+
+    @TestCase
+    public func cleanupDeleteArchivesTranscriptByRename(): Unit {
+        withManagedSessionsToolsetTestHome("/tmp/metis-managed-subagents-toolset-cleanup-delete-archive") {
+            let store = memorySessionStoreForGatewayUser(CliSettingManager.readGatewaySettings())
+            let sessionKey = "child-cleanup-delete"
+            store.appendTranscriptEntry(sessionKey, "assistant", "archive me")
+            let originalTranscript = store.transcriptPath(sessionKey).toString()
+            let record = gatewaySubagentCreateRunRecord(
+                store.sessionsRoot(),
+                sessionKey,
+                requesterSessionKey: "cli:main",
+                agentId: "reviewer",
+                status: "running",
+                cleanupMode: "delete",
+                transcriptPath: originalTranscript
+            )
+            let runId = gatewaySubagentRunRecordString(record, "runId")
+            @Expect(gatewaySubagentMarkRunSucceeded(store.sessionsRoot(), runId, resultSummary: "done"), true)
+            let toolset = GatewayManagedSessionsToolset()
+
+            gatewayWithToolRuntimeContext(GatewayToolRuntimeContext("cli", sessionKey: "cli:main")) {
+                toolset.debugDeliverTerminalNoticeForTest(sessionKey)
+                match (gatewaySubagentResolveRunRecord(store.sessionsRoot(), runId)) {
+                    case Some(found) =>
+                        let archivedPath = gatewaySubagentRunRecordString(found, "archivedTranscriptPath")
+                        @Expect(gatewaySubagentRunRecordString(found, "archiveStatus"), "archived")
+                        @Expect(archivedPath.contains(".deleted."), true)
+                        @Expect(exists(Path(originalTranscript)), false)
+                        @Expect(exists(Path(archivedPath)), true)
+                        @Expect(gatewaySubagentRunRecordString(found, "transcriptPath"), archivedPath)
+                    case None => @Expect("missing", "record")
+                }
+            }
+        }
+    }
+
+    @TestCase
     public func subagentsStatusDeniesDifferentRequesterSessionOnChannelSurface(): Unit {
         withManagedSessionsToolsetTestHome("/tmp/metis-managed-subagents-toolset-scope-deny") {
             let store = memorySessionStoreForGatewayUser(CliSettingManager.readGatewaySettings())
@@ -492,6 +571,7 @@ public class GatewayManagedSessionsToolsetTest {
             createManagedSubagentsCustomAgentFixture("phase9-custom", false)
             var settings = CliSettingManager.readGatewaySettings()
             settings.subagents.allowCustomAgents = true
+            settings.subagents.archiveAfterMinutes = 15
             let _ = MetisConfigManager.setGatewaySettings(settings)
             CliSettingManager.invalidate()
             let toolset = GatewayManagedSessionsToolset()
@@ -528,6 +608,8 @@ public class GatewayManagedSessionsToolsetTest {
                 @Expect(managedSubagentsString(run, "status"), "queued")
                 @Expect(managedSubagentsString(run, "requesterSessionKey"), "telegram:chat:phase9")
                 @Expect(managedSubagentsString(run, "requesterChannel"), "telegram")
+                @Expect(managedSubagentsInt(run, "archiveAfterMinutes"), 15)
+                @Expect(managedSubagentsString(run, "archiveStatus"), "scheduled")
                 @Expect(managedSubagentsString(run, "agentSource"), "custom")
                 let metadata = run.get("metadata").getOrThrow().asObject()
                 let agent = metadata.get("agent").getOrThrow().asObject()
@@ -930,6 +1012,71 @@ public class GatewayManagedSessionsToolsetTest {
                     case None => @Expect("missing", "record")
                 }
             } finally {
+                toolset.debugSetGatewayCallRunnerForTest(None<(String, JsonObject) -> JsonObject>)
+            }
+        }
+    }
+
+    @TestCase
+    public func telegramSubagentNoticeFailureStaysPendingAndRetriesToDelivered(): Unit {
+        withManagedSessionsToolsetTestHome("/tmp/metis-managed-subagents-telegram-notice-retry") {
+            let store = memorySessionStoreForGatewayUser(CliSettingManager.readGatewaySettings())
+            let sessionKey = "child-topic-notice-retry"
+            let record = gatewaySubagentCreateRunRecord(
+                store.sessionsRoot(),
+                sessionKey,
+                parentSessionKey: "telegram:direct:user:1059872384",
+                requesterSessionKey: "telegram:direct:user:1059872384",
+                requesterChannel: "telegram",
+                requesterAccountId: "telegram:default",
+                requesterPeerId: "user:1059872384",
+                requesterConversationId: "user:1059872384",
+                requesterReplyToMessageId: "999",
+                requesterReplyInThread: false,
+                agentId: "explorer",
+                runtime: "subagent",
+                status: "running",
+                transcriptPath: store.transcriptPath(sessionKey).toString()
+            )
+            let runId = gatewaySubagentRunRecordString(record, "runId")
+            @Expect(gatewaySubagentMarkRunSucceeded(store.sessionsRoot(), runId, resultSummary: "retry notice done"), true)
+
+            let attempts = JsonObject()
+            attempts.put("count", JsonInt(0))
+            gatewayRegisterSubagentNoticeDeliveryHook({ _channelName, _accountId, _peerId, _notice, _replyToMessageId, _replyInThread =>
+                let count = managedSubagentsInt(attempts, "count") + 1
+                attempts.put("count", JsonInt(count))
+                if (count == 1) {
+                    throw Exception("temporary delivery outage")
+                }
+                "notice-retry-message-1"
+            })
+            let toolset = GatewayManagedSessionsToolset()
+            toolset.debugSetGatewayCallRunnerForTest(Some<(String, JsonObject) -> JsonObject>({ _method, _params =>
+                let out = JsonObject()
+                out.put("ok", JsonBool(false))
+                out.put("error", JsonString("gateway queue unavailable"))
+                out
+            }))
+            try {
+                toolset.debugDeliverTerminalNoticeForTest(sessionKey)
+                match (gatewaySubagentResolveRunRecord(store.sessionsRoot(), runId)) {
+                    case Some(pending) =>
+                        @Expect(gatewaySubagentRunRecordString(pending, "channelNoticeStatus"), "pending")
+                        @Expect(gatewaySubagentRunRecordString(pending, "lastChannelNoticeError").contains("temporary delivery outage"), true)
+                    case None => @Expect("missing", "pending")
+                }
+
+                toolset.debugRetryPendingNoticesForTest()
+                match (gatewaySubagentResolveRunRecord(store.sessionsRoot(), runId)) {
+                    case Some(delivered) =>
+                        @Expect(gatewaySubagentRunRecordString(delivered, "channelNoticeStatus"), "delivered")
+                        @Expect(gatewaySubagentRunRecordString(delivered, "channelNoticeMessageId"), "notice-retry-message-1")
+                        @Expect(gatewaySubagentRunRecordString(delivered, "noticeStatus"), "delivered")
+                    case None => @Expect("missing", "delivered")
+                }
+            } finally {
+                gatewayClearSubagentNoticeDeliveryHook()
                 toolset.debugSetGatewayCallRunnerForTest(None<(String, JsonObject) -> JsonObject>)
             }
         }
