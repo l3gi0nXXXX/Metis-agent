@@ -7,6 +7,9 @@ import metis.gateway.{
     GATEWAY_MCP_PROTOCOL_VERSION,
     GATEWAY_MCP_SERVER_NAME,
     gatewayMcpGitCodeToolResultJson,
+    gatewayMcpGitCodeParseStructuredOutputJson,
+    gatewayMcpGitCodeRuntimeStatusJson,
+    gatewayMcpGitCodeToolMetadataRegistryJson,
     gatewayMcpInitializeResultJson,
     gatewayMcpPingResultJson,
     gatewayMcpToolListResultJson
@@ -177,6 +180,34 @@ public class GatewayMcpHttpSharedTest {
     }
 
     @TestCase
+    public func gitCodeUnauthorizedCallerIsRejected(): Unit {
+        let args = JsonObject()
+        args.put("requestId", JsonString("req-unauthorized"))
+        args.put("caller", JsonString("random-writer"))
+        args.put("repository", JsonString("owner/repo"))
+        args.put("issueId", JsonString("42"))
+        let result = gatewayMcpGitCodeToolResultJson("gitcode_issue_summarize", args)
+        @Expect(testJsonString(result, "status"), "rejected")
+        let error = testJsonObject(result, "error")
+        @Expect(testJsonString(error, "code"), "CALLER_NOT_ALLOWED")
+    }
+
+    @TestCase
+    public func gitCodeEvidenceSchemaValidationRejectsNonArray(): Unit {
+        let args = JsonObject()
+        args.put("requestId", JsonString("req-schema"))
+        args.put("caller", JsonString("monitor"))
+        args.put("repository", JsonString("owner/repo"))
+        args.put("issueId", JsonString("42"))
+        args.put("evidence", JsonString("not-array"))
+        let result = gatewayMcpGitCodeToolResultJson("gitcode_issue_summarize", args)
+        @Expect(testJsonString(result, "status"), "error")
+        let error = testJsonObject(result, "error")
+        @Expect(testJsonString(error, "code"), "INVALID_ARGUMENT_SCHEMA")
+        @Expect(testJsonString(error, "field"), "evidence")
+    }
+
+    @TestCase
     public func gitCodeEvidenceAbsentKeepsCkbUnavailableAndNeedsHumanReview(): Unit {
         let args = JsonObject()
         args.put("requestId", JsonString("req-no-evidence"))
@@ -193,6 +224,26 @@ public class GatewayMcpHttpSharedTest {
         @Expect(testJsonString(knowledge, "knowledgeVersion"), "unavailable")
         @Expect(testJsonInt(knowledge, "hitCount"), 0)
         @Expect(testJsonBool(knowledge, "truncated"), false)
+    }
+
+    @TestCase
+    public func gitCodeCkbTimeoutNeedsHumanReviewAndAuditsKnowledge(): Unit {
+        let args = JsonObject()
+        args.put("requestId", JsonString("req-ckb-timeout"))
+        args.put("caller", JsonString("monitor"))
+        args.put("repository", JsonString("owner/repo"))
+        args.put("prId", JsonString("7"))
+        args.put("knowledgeVersion", JsonString("ckb-v2"))
+        args.put("ckbStatus", JsonString("timeout"))
+        let result = gatewayMcpGitCodeToolResultJson("gitcode_pr_summarize", args)
+        @Expect(testJsonString(result, "status"), "needs_human_review")
+        let knowledge = testJsonObject(result, "knowledge")
+        @Expect(testJsonBool(knowledge, "timeout"), true)
+        @Expect(testJsonBool(knowledge, "localPathRead"), false)
+        let audit = testJsonObject(result, "audit")
+        @Expect(testJsonString(audit, "knowledgeVersion"), "unavailable")
+        @Expect(testJsonInt(audit, "hitCount"), 0)
+        @Expect(testJsonBool(audit, "truncated"), false)
     }
 
     @TestCase
@@ -216,6 +267,39 @@ public class GatewayMcpHttpSharedTest {
         @Expect(testJsonString(knowledge, "knowledgeVersion"), "ckb-v1")
         @Expect(testJsonInt(knowledge, "hitCount"), 1)
         @Expect(testJsonBool(knowledge, "truncated"), false)
+    }
+
+    @TestCase
+    public func gitCodeStructuredOutputParserRejectsBadJsonAndSecrets(): Unit {
+        let bad = gatewayMcpGitCodeParseStructuredOutputJson("{not-json")
+        @Expect(testJsonString(bad, "status"), "rejected")
+        @Expect(testJsonString(bad, "code"), "BAD_JSON_OUTPUT")
+
+        let secret = gatewayMcpGitCodeParseStructuredOutputJson("{\"text\":\"Bearer should-not-pass\"}")
+        @Expect(testJsonString(secret, "status"), "rejected")
+        @Expect(testJsonString(secret, "code"), "SECRET_OUTPUT_REJECTED")
+
+        let ok = gatewayMcpGitCodeParseStructuredOutputJson("{\"text\":\"review needed\"}")
+        @Expect(testJsonString(ok, "status"), "ok")
+    }
+
+    @TestCase
+    public func gitCodeRegistryAndRuntimeStatusExposePolicyAuditAndAuth(): Unit {
+        let registry = gatewayMcpGitCodeToolMetadataRegistryJson()
+        @Expect(testJsonInt(registry, "toolCount"), 5)
+        @Expect(testJsonInt(registry, "maxInputBytes") > 0, true)
+
+        let status = gatewayMcpGitCodeRuntimeStatusJson(authMode: "token")
+        @Expect(testJsonString(status, "server"), GATEWAY_MCP_SERVER_NAME)
+        let auth = testJsonObject(status, "auth")
+        @Expect(testJsonString(auth, "mode"), "token")
+        @Expect(testJsonBool(auth, "callerAllowlistEnforced"), true)
+        let ckb = testJsonObject(status, "ckbEvidence")
+        @Expect(testJsonBool(ckb, "localPathRead"), false)
+        @Expect(testJsonBool(ckb, "timeoutNeedsHumanReview"), true)
+        let audit = testJsonObject(status, "audit")
+        @Expect(audit.get("recent").isSome(), true)
+        @Expect(audit.get("recentErrors").isSome(), true)
     }
 
     @TestCase

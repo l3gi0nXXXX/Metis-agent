@@ -170,6 +170,22 @@ public class GatewayHttpSurfaceTest {
     }
 
     @TestCase
+    public func mcpStatusExposesGitCodeRuntimeRegistryAuthAndAudit(): Unit {
+        withGatewayHttpSurfaceTestSettings<Unit>({ =>
+            let response = gatewayHandleMcpRequest(
+                gatewayHttpSurfaceTestUser(),
+                "{\"jsonrpc\":\"2.0\",\"id\":24,\"method\":\"mcp/status\"}"
+            )
+            let root = JsonValue.fromStr(response).asObject()
+            let result = root.get("result").getOrThrow().asObject()
+            @Expect(result.get("registeredTools").isSome(), true)
+            @Expect(result.get("auth").getOrThrow().asObject().get("mode").getOrThrow().asString().getValue(), "none")
+            @Expect(result.get("audit").getOrThrow().asObject().get("recentErrors").isSome(), true)
+            @Expect(result.get("ckbEvidence").getOrThrow().asObject().get("localPathRead").getOrThrow().asBool().getValue(), false)
+        })
+    }
+
+    @TestCase
     public func mcpUnknownGitCodeToolReturnsStructuredError(): Unit {
         withGatewayHttpSurfaceTestSettings<Unit>({ =>
             let response = gatewayHandleMcpRequest(

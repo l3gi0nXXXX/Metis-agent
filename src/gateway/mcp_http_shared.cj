@@ -4,13 +4,44 @@ import magic.jsonable.*
 
 import metis.core.config.CliSettingManager
 
+import std.collection.{ArrayList, HashMap}
 import std.convert.Parsable
+import std.sync.Mutex
 import stdx.encoding.json.{JsonArray, JsonObject, JsonString, JsonValue}
 
 public let GATEWAY_MCP_PATH = "/mcp"
 public let GATEWAY_MCP_PROTOCOL_VERSION = "2025-03-26"
 public let GATEWAY_MCP_SERVER_NAME = "metis-gateway"
 public let GATEWAY_MCP_DEFAULT_RESPONSE_ID = "mcp-local"
+
+private let GATEWAY_MCP_GITCODE_ALLOWED_CALLERS = [
+    "agent-bridge",
+    "gateway-agent-bridge",
+    "gateway",
+    "gitcode-monitor",
+    "monitor",
+    "mcp-client",
+    "test"
+]
+private let GATEWAY_MCP_GITCODE_MAX_INPUT_BYTES: Int64 = 65536
+private let GATEWAY_MCP_GITCODE_MAX_EVIDENCE_ITEMS: Int64 = 20
+private let GATEWAY_MCP_GITCODE_TIMEOUT_MS: Int64 = 8000
+private let GATEWAY_MCP_GITCODE_RATE_LIMIT_PER_CALLER_TOOL: Int64 = 64
+
+private let gatewayMcpGitCodeRuntimeMutex = Mutex()
+private let gatewayMcpGitCodeRateCounters = HashMap<String, Int64>()
+private let gatewayMcpGitCodeRecentAudits = ArrayList<JsonObject>()
+private let gatewayMcpGitCodeRecentErrors = ArrayList<JsonObject>()
+
+public func gatewayMcpGitCodeRegisteredToolNames(): Array<String> {
+    [
+        "gitcode_issue_summarize",
+        "gitcode_pr_summarize",
+        "gitcode_issue_draft_reply",
+        "gitcode_pr_draft_reply",
+        "gitcode_reply_safety_review"
+    ]
+}
 
 private func gatewayMcpAppendTool(tools: JsonArray, name: String, description: String): Unit {
     let row = JsonObject()
@@ -76,6 +107,14 @@ private func gatewayMcpSchemaEvidenceArray(): JsonObject {
     arr
 }
 
+private func gatewayMcpGitCodeQueryPlanSchema(): JsonObject {
+    let schema = JsonObject()
+    schema.put("type", JsonString("object"))
+    schema.put("description", JsonString("Optional external CKB query plan. Metis treats it as input contract data only."))
+    schema.put("additionalProperties", true.toJsonValue())
+    schema
+}
+
 private func gatewayMcpGitCodeFreshnessPolicySchema(): JsonObject {
     let schema = JsonObject()
     schema.put("type", JsonString("object"))
@@ -103,6 +142,10 @@ private func gatewayMcpGitCodeBaseInputSchema(requiredId: String): JsonObject {
     props.put("title", gatewayMcpSchemaString(description: "Caller-provided title."))
     props.put("body", gatewayMcpSchemaString(description: "Caller-provided body text."))
     props.put("evidence", gatewayMcpSchemaEvidenceArray())
+    props.put("queryPlan", gatewayMcpGitCodeQueryPlanSchema())
+    props.put("ckbStatus", gatewayMcpSchemaStringEnum(["ok", "empty", "timeout", "unavailable"]))
+    props.put("ckbTimeout", gatewayMcpSchemaBool(description: "Set when the external CKB evidence lookup timed out."))
+    props.put("evidenceTruncated", gatewayMcpSchemaBool(description: "Set when upstream evidence was truncated before calling Metis."))
     props.put("knowledgeVersion", gatewayMcpSchemaString(description: "Caller-provided knowledge index version."))
     props.put("conflictingEvidence", gatewayMcpSchemaBool(description: "Set when upstream evidence conflicts."))
     props.put("freshnessPolicy", gatewayMcpGitCodeFreshnessPolicySchema())
@@ -132,6 +175,10 @@ private func gatewayMcpGitCodeSafetyReviewInputSchema(): JsonObject {
     props.put("targetId", gatewayMcpSchemaString(description: "GitCode issue or pull request identifier."))
     props.put("replyText", gatewayMcpSchemaString(description: "Reply text to review."))
     props.put("evidence", gatewayMcpSchemaEvidenceArray())
+    props.put("queryPlan", gatewayMcpGitCodeQueryPlanSchema())
+    props.put("ckbStatus", gatewayMcpSchemaStringEnum(["ok", "empty", "timeout", "unavailable"]))
+    props.put("ckbTimeout", gatewayMcpSchemaBool(description: "Set when the external CKB evidence lookup timed out."))
+    props.put("evidenceTruncated", gatewayMcpSchemaBool(description: "Set when upstream evidence was truncated before calling Metis."))
     props.put("knowledgeVersion", gatewayMcpSchemaString(description: "Caller-provided knowledge index version."))
     props.put("conflictingEvidence", gatewayMcpSchemaBool(description: "Set when upstream evidence conflicts."))
     props.put("freshnessPolicy", gatewayMcpGitCodeFreshnessPolicySchema())
@@ -178,6 +225,11 @@ private func gatewayMcpAppendGitCodeTool(
     meta.put("genericContentToolDefaultDeny", true.toJsonValue())
     meta.put("genericReplyToolDefaultDeny", true.toJsonValue())
     meta.put("knowledgeClient", JsonString("contract-stub"))
+    meta.put("callerAllowlist", gatewayMcpStringArray(GATEWAY_MCP_GITCODE_ALLOWED_CALLERS))
+    meta.put("maxInputBytes", GATEWAY_MCP_GITCODE_MAX_INPUT_BYTES.toJsonValue())
+    meta.put("timeoutMs", GATEWAY_MCP_GITCODE_TIMEOUT_MS.toJsonValue())
+    meta.put("rateLimitPerCallerTool", GATEWAY_MCP_GITCODE_RATE_LIMIT_PER_CALLER_TOOL.toJsonValue())
+    meta.put("structuredJsonOnly", true.toJsonValue())
     row.put("_meta", meta)
     tools.add(row)
 }
@@ -216,14 +268,36 @@ public func gatewayMcpAppendGitCodeTools(tools: JsonArray): Unit {
 }
 
 public func gatewayMcpIsGitCodeTool(name: String): Bool {
-    match (name.trimAscii().toAsciiLower()) {
-        case "gitcode_issue_summarize" => true
-        case "gitcode_pr_summarize" => true
-        case "gitcode_issue_draft_reply" => true
-        case "gitcode_pr_draft_reply" => true
-        case "gitcode_reply_safety_review" => true
-        case _ => false
+    let normalized = name.trimAscii().toAsciiLower()
+    for (tool in gatewayMcpGitCodeRegisteredToolNames()) {
+        if (normalized == tool) {
+            return true
+        }
     }
+    false
+}
+
+public func gatewayMcpGitCodeToolMetadataRegistryJson(): JsonObject {
+    let out = JsonObject()
+    let tools = JsonArray([])
+    for (name in gatewayMcpGitCodeRegisteredToolNames()) {
+        let row = JsonObject()
+        row.put("name", JsonString(name))
+        row.put("readOnly", true.toJsonValue())
+        row.put("writebackImplemented", false.toJsonValue())
+        row.put("directModelProviderCalls", false.toJsonValue())
+        row.put("ckbLocalPathRead", false.toJsonValue())
+        row.put("structuredJsonOnly", true.toJsonValue())
+        row.put("timeoutMs", GATEWAY_MCP_GITCODE_TIMEOUT_MS.toJsonValue())
+        tools.add(row)
+    }
+    out.put("tools", tools)
+    out.put("toolCount", Int64(tools.size()).toJsonValue())
+    out.put("callerAllowlist", gatewayMcpStringArray(GATEWAY_MCP_GITCODE_ALLOWED_CALLERS))
+    out.put("maxInputBytes", GATEWAY_MCP_GITCODE_MAX_INPUT_BYTES.toJsonValue())
+    out.put("maxEvidenceItems", GATEWAY_MCP_GITCODE_MAX_EVIDENCE_ITEMS.toJsonValue())
+    out.put("rateLimitPerCallerTool", GATEWAY_MCP_GITCODE_RATE_LIMIT_PER_CALLER_TOOL.toJsonValue())
+    out
 }
 
 public func gatewayMcpConfigured(): Bool {
@@ -423,6 +497,34 @@ private func gatewayMcpGitCodeEvidenceCount(args: JsonObject): Int64 {
     }
 }
 
+private func gatewayMcpGitCodeEvidenceSchemaValid(args: JsonObject): Bool {
+    match (args.get("evidence")) {
+        case Some(v) =>
+            try {
+                let _ = v.asArray()
+                true
+            } catch (_e: Exception) {
+                false
+            }
+        case None => true
+    }
+}
+
+private func gatewayMcpGitCodeEvidenceTruncated(args: JsonObject): Bool {
+    gatewayMcpGitCodeJsonBool(args, "evidenceTruncated", false) ||
+        gatewayMcpGitCodeEvidenceCount(args) > GATEWAY_MCP_GITCODE_MAX_EVIDENCE_ITEMS
+}
+
+private func gatewayMcpGitCodeCkbTimedOut(args: JsonObject): Bool {
+    gatewayMcpGitCodeJsonBool(args, "ckbTimeout", false) ||
+        gatewayMcpGitCodeJsonString(args, "ckbStatus").trimAscii().toAsciiLower() == "timeout"
+}
+
+private func gatewayMcpGitCodeCkbEmpty(args: JsonObject): Bool {
+    gatewayMcpGitCodeEvidenceCount(args) == 0 ||
+        gatewayMcpGitCodeJsonString(args, "ckbStatus").trimAscii().toAsciiLower() == "empty"
+}
+
 private func gatewayMcpGitCodeSecretKey(key: String): Bool {
     let normalized = key.trimAscii().toAsciiLower().replace("_", "").replace("-", "")
     normalized.contains("token") || normalized.contains("secret") ||
@@ -475,6 +577,19 @@ private func gatewayMcpGitCodeHasSecretValue(key: String, value: JsonValue): Boo
 private func gatewayMcpGitCodeHasSecrets(args: JsonObject): Bool {
     for ((key, value) in args.getFields()) {
         if (gatewayMcpGitCodeHasSecretValue(key, value)) {
+            return true
+        }
+    }
+    false
+}
+
+private func gatewayMcpGitCodeCallerAllowed(caller: String): Bool {
+    let normalized = caller.trimAscii().toAsciiLower()
+    if (normalized.isEmpty() || normalized == "unknown") {
+        return true
+    }
+    for (allowed in GATEWAY_MCP_GITCODE_ALLOWED_CALLERS) {
+        if (normalized == allowed) {
             return true
         }
     }
@@ -553,11 +668,15 @@ private func gatewayMcpGitCodeFreshnessPolicy(args: JsonObject): JsonObject {
 
 private func gatewayMcpGitCodeKnowledge(args: JsonObject): JsonObject {
     let hitCount = gatewayMcpGitCodeEvidenceCount(args)
+    let timedOut = gatewayMcpGitCodeCkbTimedOut(args)
+    let empty = gatewayMcpGitCodeCkbEmpty(args)
+    let truncated = gatewayMcpGitCodeEvidenceTruncated(args)
     let out = JsonObject()
-    out.put("client", JsonString("contract-stub"))
-    out.put("available", (hitCount > 0).toJsonValue())
+    out.put("client", JsonString("external-contract"))
+    out.put("contract", JsonString("context-query-plan-to-evidence-pack"))
+    out.put("available", (hitCount > 0 && !timedOut).toJsonValue())
     out.put("localPathRead", false.toJsonValue())
-    out.put("source", JsonString(if (hitCount > 0) { "caller-provided-evidence" } else { "unavailable" }))
+    out.put("source", JsonString(if (timedOut) { "timeout" } else if (hitCount > 0) { "caller-provided-evidence" } else { "unavailable" }))
     out.put("knowledgeVersion", JsonString(if (hitCount > 0) {
         let supplied = gatewayMcpGitCodeJsonString(args, "knowledgeVersion").trimAscii()
         if (supplied.isEmpty()) { "caller-provided" } else { supplied }
@@ -565,8 +684,32 @@ private func gatewayMcpGitCodeKnowledge(args: JsonObject): JsonObject {
         "unavailable"
     }))
     out.put("hitCount", hitCount.toJsonValue())
-    out.put("truncated", false.toJsonValue())
+    out.put("truncated", truncated.toJsonValue())
+    out.put("timeout", timedOut.toJsonValue())
+    out.put("empty", empty.toJsonValue())
+    let pack = JsonObject()
+    pack.put("needsHumanReviewOnTimeoutOrEmpty", true.toJsonValue())
+    pack.put("queryPlanAccepted", args.get("queryPlan").isSome().toJsonValue())
+    pack.put("maxEvidenceItems", GATEWAY_MCP_GITCODE_MAX_EVIDENCE_ITEMS.toJsonValue())
+    out.put("evidencePack", pack)
     out
+}
+
+private func gatewayMcpGitCodeRemember(audit: JsonObject, error: Option<JsonObject>): Unit {
+    synchronized(gatewayMcpGitCodeRuntimeMutex) {
+        gatewayMcpGitCodeRecentAudits.add(audit)
+        while (gatewayMcpGitCodeRecentAudits.size > 8) {
+            gatewayMcpGitCodeRecentAudits.remove(at: 0)
+        }
+        match (error) {
+            case Some(err) =>
+                gatewayMcpGitCodeRecentErrors.add(err)
+                while (gatewayMcpGitCodeRecentErrors.size > 8) {
+                    gatewayMcpGitCodeRecentErrors.remove(at: 0)
+                }
+            case None => ()
+        }
+    }
 }
 
 private func gatewayMcpGitCodeAudit(
@@ -587,6 +730,12 @@ private func gatewayMcpGitCodeAudit(
     audit.put("ckbLocalPathRead", false.toJsonValue())
     audit.put("redacted", redacted.toJsonValue())
     audit.put("reason", JsonString(reason))
+    let knowledge = gatewayMcpGitCodeKnowledge(args)
+    audit.put("knowledgeVersion", JsonString(gatewayMcpGitCodeJsonString(knowledge, "knowledgeVersion")))
+    audit.put("hitCount", gatewayMcpGitCodeJsonInt(knowledge, "hitCount", 0).toJsonValue())
+    audit.put("truncated", gatewayMcpGitCodeJsonBool(knowledge, "truncated", false).toJsonValue())
+    audit.put("timeoutMs", GATEWAY_MCP_GITCODE_TIMEOUT_MS.toJsonValue())
+    audit.put("maxInputBytes", GATEWAY_MCP_GITCODE_MAX_INPUT_BYTES.toJsonValue())
     audit.put("sanitizedInput", gatewayMcpGitCodeSanitizedArgs(args))
     audit
 }
@@ -612,15 +761,82 @@ private func gatewayMcpGitCodeBaseResult(
     out.put("status", JsonString(status))
     out.put("needsHumanReview", needsHumanReview.toJsonValue())
     out.put("readOnly", true.toJsonValue())
-    out.put("audit", gatewayMcpGitCodeAudit(caller, tool, requestId, args, redacted, reason))
+    let audit = gatewayMcpGitCodeAudit(caller, tool, requestId, args, redacted, reason)
+    out.put("audit", audit)
     out.put("knowledge", gatewayMcpGitCodeKnowledge(args))
     out.put("freshnessPolicy", gatewayMcpGitCodeFreshnessPolicy(args))
+    let outputPolicy = JsonObject()
+    outputPolicy.put("structuredJsonOnly", true.toJsonValue())
+    outputPolicy.put("badJsonRejected", true.toJsonValue())
+    outputPolicy.put("secretOutputRejected", true.toJsonValue())
+    outputPolicy.put("autoPostAllowed", false.toJsonValue())
+    out.put("outputPolicy", outputPolicy)
     let permissions = JsonObject()
     permissions.put("contentPlaceholderDefaultDeny", true.toJsonValue())
     permissions.put("replyPlaceholderDefaultDeny", true.toJsonValue())
     permissions.put("realGitCodeWriteback", false.toJsonValue())
     out.put("permissions", permissions)
+    if (status == "error" || status == "rejected") {
+        let err = JsonObject()
+        err.put("requestId", JsonString(requestId))
+        err.put("tool", JsonString(tool))
+        err.put("status", JsonString(status))
+        err.put("reason", JsonString(reason))
+        gatewayMcpGitCodeRemember(audit, Some(err))
+    } else {
+        gatewayMcpGitCodeRemember(audit, None<JsonObject>)
+    }
     out
+}
+
+private func gatewayMcpGitCodeSchemaErrorResult(tool: String, args: JsonObject, field: String, expected: String): JsonObject {
+    let out = gatewayMcpGitCodeBaseResult(tool, args, "error", true, false, "invalid schema for `${field}`")
+    let error = JsonObject()
+    error.put("code", JsonString("INVALID_ARGUMENT_SCHEMA"))
+    error.put("field", JsonString(field))
+    error.put("expected", JsonString(expected))
+    out.put("error", error)
+    out
+}
+
+private func gatewayMcpGitCodeUnauthorizedResult(tool: String, args: JsonObject): JsonObject {
+    let out = gatewayMcpGitCodeBaseResult(tool, args, "rejected", true, false, "caller not allowlisted")
+    let error = JsonObject()
+    error.put("code", JsonString("CALLER_NOT_ALLOWED"))
+    error.put("message", JsonString("GitCode MCP caller is not allowlisted."))
+    out.put("error", error)
+    out
+}
+
+private func gatewayMcpGitCodeTooLargeResult(tool: String, args: JsonObject): JsonObject {
+    let out = gatewayMcpGitCodeBaseResult(tool, args, "rejected", true, false, "input too large")
+    let error = JsonObject()
+    error.put("code", JsonString("INPUT_TOO_LARGE"))
+    error.put("maxInputBytes", GATEWAY_MCP_GITCODE_MAX_INPUT_BYTES.toJsonValue())
+    out.put("error", error)
+    out
+}
+
+private func gatewayMcpGitCodeRateLimitResult(tool: String, args: JsonObject): JsonObject {
+    let out = gatewayMcpGitCodeBaseResult(tool, args, "rejected", true, false, "rate limit exceeded")
+    let error = JsonObject()
+    error.put("code", JsonString("RATE_LIMITED"))
+    error.put("limit", GATEWAY_MCP_GITCODE_RATE_LIMIT_PER_CALLER_TOOL.toJsonValue())
+    out.put("error", error)
+    out
+}
+
+private func gatewayMcpGitCodeRateAllowed(tool: String, caller: String): Bool {
+    let normalizedCaller = if (caller.trimAscii().isEmpty()) { "unknown" } else { caller.trimAscii().toAsciiLower() }
+    let key = "${normalizedCaller}:${tool.trimAscii().toAsciiLower()}"
+    synchronized(gatewayMcpGitCodeRuntimeMutex) {
+        let next = match (gatewayMcpGitCodeRateCounters.get(key)) {
+            case Some(current) => current + 1
+            case None => 1
+        }
+        gatewayMcpGitCodeRateCounters[key] = next
+        next <= GATEWAY_MCP_GITCODE_RATE_LIMIT_PER_CALLER_TOOL
+    }
 }
 
 private func gatewayMcpGitCodeMissingResult(tool: String, args: JsonObject, field: String): JsonObject {
@@ -652,10 +868,16 @@ private func gatewayMcpGitCodeUnknownResult(tool: String, args: JsonObject): Jso
 }
 
 private func gatewayMcpGitCodeNeedsReview(args: JsonObject): Bool {
-    gatewayMcpGitCodeEvidenceCount(args) == 0 || gatewayMcpGitCodeJsonBool(args, "conflictingEvidence", false)
+    gatewayMcpGitCodeCkbEmpty(args) ||
+        gatewayMcpGitCodeCkbTimedOut(args) ||
+        gatewayMcpGitCodeJsonBool(args, "conflictingEvidence", false) ||
+        gatewayMcpGitCodeEvidenceTruncated(args)
 }
 
 private func gatewayMcpGitCodeValidateBase(tool: String, args: JsonObject, idField: String): Option<JsonObject> {
+    if (Int64(args.toJsonString().toArray().size) > GATEWAY_MCP_GITCODE_MAX_INPUT_BYTES) {
+        return Some(gatewayMcpGitCodeTooLargeResult(tool, args))
+    }
     if (gatewayMcpGitCodeJsonString(args, "repository").trimAscii().isEmpty()) {
         return Some(gatewayMcpGitCodeMissingResult(tool, args, "repository"))
     }
@@ -664,6 +886,16 @@ private func gatewayMcpGitCodeValidateBase(tool: String, args: JsonObject, idFie
     }
     if (gatewayMcpGitCodeHasSecrets(args)) {
         return Some(gatewayMcpGitCodeRejectedResult(tool, args))
+    }
+    if (!gatewayMcpGitCodeEvidenceSchemaValid(args)) {
+        return Some(gatewayMcpGitCodeSchemaErrorResult(tool, args, "evidence", "array"))
+    }
+    let caller = gatewayMcpGitCodeJsonString(args, "caller")
+    if (!gatewayMcpGitCodeCallerAllowed(caller)) {
+        return Some(gatewayMcpGitCodeUnauthorizedResult(tool, args))
+    }
+    if (!gatewayMcpGitCodeRateAllowed(tool, caller)) {
+        return Some(gatewayMcpGitCodeRateLimitResult(tool, args))
     }
     None<JsonObject>
 }
@@ -707,6 +939,15 @@ private func gatewayMcpGitCodeDraftReplyResult(tool: String, args: JsonObject, i
     if (gatewayMcpGitCodeJsonString(args, "intent").trimAscii().isEmpty()) {
         return gatewayMcpGitCodeMissingResult(tool, args, "intent")
     }
+    let proposedJson = gatewayMcpGitCodeJsonString(args, "proposedStructuredOutput").trimAscii()
+    if (!proposedJson.isEmpty()) {
+        let parsed = gatewayMcpGitCodeParseStructuredOutputJson(proposedJson)
+        if (gatewayMcpGitCodeJsonString(parsed, "status") != "ok") {
+            let out = gatewayMcpGitCodeBaseResult(tool, args, "rejected", true, false, "bad structured output rejected")
+            out.put("outputParse", parsed)
+            return out
+        }
+    }
     let needsReview = true
     let out = gatewayMcpGitCodeBaseResult(tool, args, "needs_human_review", needsReview, false, "reply draft placeholder is default-deny")
     let draft = JsonObject()
@@ -722,11 +963,24 @@ private func gatewayMcpGitCodeDraftReplyResult(tool: String, args: JsonObject, i
 }
 
 private func gatewayMcpGitCodeSafetyReviewResult(tool: String, args: JsonObject): JsonObject {
+    if (Int64(args.toJsonString().toArray().size) > GATEWAY_MCP_GITCODE_MAX_INPUT_BYTES) {
+        return gatewayMcpGitCodeTooLargeResult(tool, args)
+    }
     if (gatewayMcpGitCodeJsonString(args, "replyText").trimAscii().isEmpty()) {
         return gatewayMcpGitCodeMissingResult(tool, args, "replyText")
     }
     if (gatewayMcpGitCodeHasSecrets(args)) {
         return gatewayMcpGitCodeRejectedResult(tool, args)
+    }
+    if (!gatewayMcpGitCodeEvidenceSchemaValid(args)) {
+        return gatewayMcpGitCodeSchemaErrorResult(tool, args, "evidence", "array")
+    }
+    let caller = gatewayMcpGitCodeJsonString(args, "caller")
+    if (!gatewayMcpGitCodeCallerAllowed(caller)) {
+        return gatewayMcpGitCodeUnauthorizedResult(tool, args)
+    }
+    if (!gatewayMcpGitCodeRateAllowed(tool, caller)) {
+        return gatewayMcpGitCodeRateLimitResult(tool, args)
     }
     let needsReview = gatewayMcpGitCodeNeedsReview(args)
     let out = gatewayMcpGitCodeBaseResult(
@@ -747,6 +1001,71 @@ private func gatewayMcpGitCodeSafetyReviewResult(tool: String, args: JsonObject)
         "Baseline safety contract does not approve outbound replies automatically."
     }))
     out.put("review", review)
+    out
+}
+
+public func gatewayMcpGitCodeParseStructuredOutputJson(raw: String): JsonObject {
+    let out = JsonObject()
+    let text = raw.trimAscii()
+    out.put("structuredJsonOnly", true.toJsonValue())
+    if (text.isEmpty()) {
+        out.put("status", JsonString("rejected"))
+        out.put("code", JsonString("EMPTY_OUTPUT"))
+        return out
+    }
+    try {
+        let value = JsonValue.fromStr(text)
+        let obj = value.asObject()
+        if (gatewayMcpGitCodeHasSecrets(obj)) {
+            out.put("status", JsonString("rejected"))
+            out.put("code", JsonString("SECRET_OUTPUT_REJECTED"))
+            return out
+        }
+        out.put("status", JsonString("ok"))
+        out.put("output", obj)
+        return out
+    } catch (_e: Exception) {
+        out.put("status", JsonString("rejected"))
+        out.put("code", JsonString("BAD_JSON_OUTPUT"))
+        return out
+    }
+}
+
+public func gatewayMcpGitCodeRuntimeStatusJson(authMode!: String = "gateway-http"): JsonObject {
+    let out = JsonObject()
+    out.put("server", JsonString(GATEWAY_MCP_SERVER_NAME))
+    out.put("protocolVersion", JsonString(GATEWAY_MCP_PROTOCOL_VERSION))
+    out.put("registeredTools", gatewayMcpGitCodeToolMetadataRegistryJson())
+    let auth = JsonObject()
+    auth.put("mode", JsonString(authMode.trimAscii()))
+    auth.put("httpSurfaceAuthorizesBeforeDispatch", true.toJsonValue())
+    auth.put("callerAllowlistEnforced", true.toJsonValue())
+    out.put("auth", auth)
+    let audit = JsonObject()
+    audit.put("redacted", true.toJsonValue())
+    audit.put("recent", JsonArray([]))
+    audit.put("recentErrors", JsonArray([]))
+    synchronized(gatewayMcpGitCodeRuntimeMutex) {
+        let recent = JsonArray([])
+        for (row in gatewayMcpGitCodeRecentAudits) {
+            recent.add(row)
+        }
+        let errors = JsonArray([])
+        for (row in gatewayMcpGitCodeRecentErrors) {
+            errors.add(row)
+        }
+        audit.put("recent", recent)
+        audit.put("recentErrors", errors)
+        audit.put("rateLimitKeys", Int64(gatewayMcpGitCodeRateCounters.size).toJsonValue())
+    }
+    out.put("audit", audit)
+    let ckb = JsonObject()
+    ckb.put("client", JsonString("external-contract"))
+    ckb.put("localMirrorBuiltIn", false.toJsonValue())
+    ckb.put("localPathRead", false.toJsonValue())
+    ckb.put("timeoutNeedsHumanReview", true.toJsonValue())
+    ckb.put("emptyNeedsHumanReview", true.toJsonValue())
+    out.put("ckbEvidence", ckb)
     out
 }
 

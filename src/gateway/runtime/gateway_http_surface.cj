@@ -6,7 +6,7 @@ import metis.core.runtimeToolInvocationAllowedFromRoot
 import metis.core.config.{CliConfig, CliSettingManager, GatewayUserSettings, MetisConfigManager}
 import metis.core.model.CliModelManager
 import metis.gateway.config.buildGatewayConfigFromUserSettings
-import metis.gateway.{gatewayMcpAppendGitCodeTools, gatewayMcpGitCodeToolResultJson, gatewayMcpIsGitCodeTool}
+import metis.gateway.{gatewayMcpAppendGitCodeTools, gatewayMcpGitCodeRuntimeStatusJson, gatewayMcpGitCodeToolResultJson, gatewayMcpIsGitCodeTool}
 import metis.gateway.model.GatewayConfig
 import metis.gateway.openclaw_http.gatewayRegisterOpenClawHttpRoutes
 import metis.gateway.protocol.{GATEWAY_ERROR_AUTH_FAILED, GATEWAY_ERROR_INVALID_CONNECT, GatewayClientInfo, GatewayConnectParams, GatewayProtocolRequest, GatewayProtocolResponse, validateGatewayConnectParams}
@@ -351,6 +351,10 @@ private func gatewayHandleMcpRequestWithPolicy(cfg: GatewayConfig, raw: String, 
         result.put("ok", true.toJsonValue())
         result.put("serverTime", nowSeconds().toJsonValue())
         response.put("result", result)
+        return response.toJsonString()
+    }
+    if (method == "mcp/status" || method == "mcp/doctor") {
+        response.put("result", gatewayMcpGitCodeRuntimeStatusJson(authMode: cfg.auth.mode))
         return response.toJsonString()
     }
     if (method == "tools/list") {

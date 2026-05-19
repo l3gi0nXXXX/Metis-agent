@@ -78,6 +78,24 @@ private func readAgentBridgeJson(path: Path): JsonObject {
     JsonValue.fromStr(String.fromUtf8(File.readFrom(path))).asObject()
 }
 
+private class MockGitCodeMcpRuntimeAdapter <: GatewayGitCodeMcpRuntimeAdapter {
+    public var called: Bool = false
+    public var toolName: String = ""
+
+    public init() {}
+
+    public func invoke(toolName: String, args: JsonObject): JsonObject {
+        this.called = true
+        this.toolName = toolName
+        let out = JsonObject()
+        out.put("status", JsonString("ok"))
+        out.put("tool", JsonString(toolName))
+        out.put("readOnly", JsonValue.fromStr("true"))
+        out.put("providerClientConstructed", JsonValue.fromStr("false"))
+        out
+    }
+}
+
 @Test
 public class AgentBridgeRuntimeTest {
     @TestCase
@@ -102,6 +120,21 @@ public class AgentBridgeRuntimeTest {
             }
         }
         @Expect(found, true)
+    }
+
+    @TestCase
+    public func gitCodeMcpAgentBridgeAdapterUsesRuntimeSeamWithoutProviderClient(): Unit {
+        let adapter = MockGitCodeMcpRuntimeAdapter()
+        let args = JsonObject()
+        args.put("caller", JsonString("agent-bridge"))
+        args.put("repository", JsonString("owner/repo"))
+        args.put("issueId", JsonString("42"))
+        let result = gatewayAgentBridgeInvokeGitCodeMcpRuntime(adapter, "gitcode_issue_summarize", args)
+        @Expect(adapter.called, true)
+        @Expect(adapter.toolName, "gitcode_issue_summarize")
+        @Expect(result.get("status").getOrThrow().asString().getValue(), "ok")
+        @Expect(result.get("readOnly").getOrThrow().asBool().getValue(), true)
+        @Expect(result.get("providerClientConstructed").getOrThrow().asBool().getValue(), false)
     }
 
     @TestCase

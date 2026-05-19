@@ -15,6 +15,7 @@ import metis.core.prompting.{MetisBootstrapBudgetResult, MetisSystemPromptParams
 import metis.core.skills.SkillsPrompt
 import metis.core.skills.tryHandleSkillsCommand
 import metis.cron.{executeGatewayCronCommand, parseSlashCronLine}
+import metis.gateway.{gatewayMcpGitCodeToolResultJson, gatewayMcpIsGitCodeTool}
 import metis.gateway.session.GatewayTurnContext
 import metis.gateway.tools.{GatewayCronToolset, GatewayFeishuMediaToolset, GatewayFeishuOapiToolset, GatewayFSToolset, GatewayGatewayToolset, GatewayImageGenerationToolset, GatewayManagedSessionsToolset, GatewayMemoryToolset, GatewayMessageToolset, GatewayPlanToolset, GatewaySessionTranscriptToolset, GatewayShellToolset, GatewayTelegramMediaToolset, GatewayTtsToolset, GatewayVideoGenerationToolset, GatewayWeatherToolset, gatewayHandleNativeCommandLine, gatewayHandleSubagentsCommandLine}
 import std.collection.{HashMap, ArrayList, enumerate}
@@ -311,6 +312,29 @@ private func gatewayToolAuthorized(
 
 private var gatewayAgentBridgeReplyRunnerForTest: Option<(String, String, String, String, Bool, Option<(String) -> Unit>) -> String> =
     None<(String, String, String, String, Bool, Option<(String) -> Unit>) -> String>
+
+public interface GatewayGitCodeMcpRuntimeAdapter {
+    func invoke(toolName: String, args: JsonObject): JsonObject
+}
+
+public class GatewayAgentBridgeGitCodeMcpAdapter <: GatewayGitCodeMcpRuntimeAdapter {
+    public init() {}
+
+    public func invoke(toolName: String, args: JsonObject): JsonObject {
+        gatewayMcpGitCodeToolResultJson(toolName, args)
+    }
+}
+
+public func gatewayAgentBridgeInvokeGitCodeMcpRuntime(
+    adapter: GatewayGitCodeMcpRuntimeAdapter,
+    toolName: String,
+    args: JsonObject
+): JsonObject {
+    if (!gatewayMcpIsGitCodeTool(toolName) && !toolName.trimAscii().toAsciiLower().startsWith("gitcode_")) {
+        return gatewayMcpGitCodeToolResultJson(toolName, args)
+    }
+    adapter.invoke(toolName.trimAscii().toAsciiLower(), args)
+}
 
 private let gatewayUsageCaptureMutex = Mutex()
 private var gatewayUsageCaptureRegistered = false
