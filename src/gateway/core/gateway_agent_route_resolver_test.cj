@@ -80,6 +80,25 @@ private func peerBinding(
     binding
 }
 
+private func acpBinding(
+    agentId: String,
+    channel: String,
+    peerKind: String,
+    peerId: String,
+    accountId!: String = "",
+    mode!: String = "persistent",
+    ready!: Bool = true,
+    reset!: Bool = false
+): JsonObject {
+    let binding = peerBinding(agentId, channel, peerKind, peerId, accountId: accountId, typeName: "acp")
+    let acp = JsonObject()
+    acp.put("mode", JsonString(mode))
+    acp.put("ready", JsonBool(ready))
+    acp.put("reset", JsonBool(reset))
+    binding.put("acp", acp)
+    binding
+}
+
 private func roleBinding(agentId: String, channel: String, guildId: String, roles: Array<String>): JsonObject {
     let binding = routeBinding(agentId, channel, accountId: "*")
     let matchObj = binding.get("match").getOrThrow().asObject()
@@ -122,6 +141,72 @@ private func applyBindings(root: JsonObject, bindings: Array<JsonObject>): Gatew
 
 @Test
 public class GatewayAgentRouteResolverTest {
+    @TestCase
+    public func acpConversationBindingResolvesPersistentSessionKey(): Unit {
+        let root = routeTestConfig()
+        putBindings(
+            root,
+            [
+                acpBinding("harness-a", "telegram", "group", "-100_a", accountId: "bot-a")
+            ]
+        )
+
+        let binding = gatewayResolveAcpConversationBinding(
+            GatewayAgentRouteInput(root, "telegram", accountId: "bot-a", peerKind: "group", peerId: "-100_a"))
+        @Expect(binding.found, true)
+        @Expect(binding.agentId, "harness-a")
+        @Expect(binding.channel, "telegram")
+        @Expect(binding.accountId, "bot-a")
+        @Expect(binding.peerKind, "group")
+        @Expect(binding.peerId, "-100_a")
+        @Expect(binding.mode, "persistent")
+        @Expect(binding.ready, true)
+        @Expect(binding.reset, false)
+        @Expect(binding.sessionKey, "acp:harness-a:telegram:bot-a:group:-100_a")
+        @Expect(binding.matchedBy, "acp.binding.peer.exact")
+    }
+
+    @TestCase
+    public func acpReadyResetLifecycleDoesNotAffectOrdinaryRoute(): Unit {
+        let root = routeTestConfig()
+        putBindings(
+            root,
+            [
+                peerBinding("ops", "telegram", "group", "-100_a", accountId: "bot-a"),
+                acpBinding("harness-a", "telegram", "group", "-100_a", accountId: "bot-a", ready: false, reset: true)
+            ]
+        )
+
+        let acp = gatewayResolveAcpConversationBinding(
+            GatewayAgentRouteInput(root, "telegram", accountId: "bot-a", peerKind: "group", peerId: "-100_a"))
+        @Expect(acp.found, true)
+        @Expect(acp.ready, false)
+        @Expect(acp.reset, true)
+        @Expect(acp.lifecycle, "reset")
+
+        let route = gatewayResolveAgentRoute(
+            GatewayAgentRouteInput(root, "telegram", accountId: "bot-a", peerKind: "group", peerId: "-100_a"))
+        @Expect(route.agentId, "ops")
+        @Expect(route.matchedBy, "binding.peer.exact")
+    }
+
+    @TestCase
+    public func acpConversationBindingRequiresConcreteConversationMatch(): Unit {
+        let root = routeTestConfig()
+        putBindings(
+            root,
+            [
+                acpBinding("harness-a", "telegram", "group", "-100_a", accountId: "bot-a"),
+                acpBinding("harness-b", "telegram", "group", "*", accountId: "bot-a")
+            ]
+        )
+
+        let missing = gatewayResolveAcpConversationBinding(
+            GatewayAgentRouteInput(root, "telegram", accountId: "bot-a", peerKind: "group", peerId: "-100_b"))
+        @Expect(missing.found, false)
+        @Expect(missing.sessionKey, "")
+    }
+
     @TestCase
     public func defaultTypeMatchesRouteAndAcpDoesNot(): Unit {
         let root = routeTestConfig()

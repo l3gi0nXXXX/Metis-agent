@@ -176,6 +176,23 @@ private func agentsTestRouteBinding(
     binding
 }
 
+private func agentsTestAcpBinding(
+    agentId: String,
+    channel: String,
+    accountId: String,
+    peerKind: String,
+    peerId: String,
+    mode!: String = "persistent"
+): JsonObject {
+    let binding = agentsTestRouteBinding(agentId, channel, accountId: accountId, peerKind: peerKind, peerId: peerId)
+    binding.put("type", JsonString("acp"))
+    let acp = JsonObject()
+    acp.put("mode", JsonString(mode))
+    acp.put("ready", JsonBool(true))
+    binding.put("acp", acp)
+    binding
+}
+
 private func agentsTestAddAgent(agentId: String): GatewayRpcResponse {
     let params = JsonObject()
     params.put("id", JsonString(agentId))
@@ -1140,6 +1157,44 @@ public class GatewayServerMethodsAgentsTest {
             @Expect(persisted.size(), 2)
             @Expect(persisted[0].asObject().get("type").getOrThrow().asString().getValue(), "token")
             @Expect(persisted.toJsonString().contains("\"agentId\":\"critic\""), false)
+        })
+    }
+
+    @TestCase
+    public func agentsBindingsListGroupsRouteAndAcpRows(): Unit {
+        withAgentsTempHome("metis-agents-bindings-acp-groups-home", { home: Path =>
+            Directory.create(home.join("agents"), recursive: true)
+            @Expect(agentsTestAddAgent("writer").ok, true)
+
+            let root = MetisConfigManager.rawConfig().getOrThrow()
+            let bindings = JsonArray([])
+            bindings.add(agentsTestRouteBinding("writer", "telegram", accountId: "bot-a", peerKind: "group", peerId: "-100_a"))
+            bindings.add(agentsTestAcpBinding("harness-a", "telegram", "bot-a", "group", "-100_a"))
+            root.put("bindings", bindings)
+            MetisConfigManager.writeRoot(root)
+            @Expect(agentsTestRawBindings().size(), 2)
+
+            let response = handleGatewayAgentsFamily("agents.bindings").getOrThrow()
+            @Expect(response.ok, true)
+            let result = response.result.asObject()
+            @Expect(result.get("count").getOrThrow().asInt().getValue(), 2)
+            @Expect(result.get("routeCount").getOrThrow().asInt().getValue(), 1)
+            @Expect(result.get("acpCount").getOrThrow().asInt().getValue(), 1)
+
+            let routeRows = agentsTestArray(result, "routeBindings")
+            let acpRows = agentsTestArray(result, "acpBindings")
+            @Expect(routeRows.size(), 1)
+            @Expect(acpRows.size(), 1)
+            let route = routeRows[0].asObject()
+            let acp = acpRows[0].asObject()
+            @Expect(agentsTestString(route, "type"), "route")
+            @Expect(agentsTestString(acp, "type"), "acp")
+            @Expect(agentsTestString(acp, "agentId"), "harness-a")
+            @Expect(agentsTestString(acp, "sessionKey"), "acp:harness-a:telegram:bot-a:group:-100_a")
+            @Expect(agentsTestString(acp, "lifecycle"), "ready")
+
+            let compatRows = agentsTestArray(result, "bindings")
+            @Expect(compatRows.size(), 2)
         })
     }
 
