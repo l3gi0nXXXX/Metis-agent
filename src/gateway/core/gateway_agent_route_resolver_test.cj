@@ -104,6 +104,25 @@ private func teamBinding(agentId: String, channel: String, teamId: String): Json
     binding
 }
 
+private func withGuildId(binding: JsonObject, guildId: String): JsonObject {
+    binding.get("match").getOrThrow().asObject().put("guildId", JsonString(guildId))
+    binding
+}
+
+private func withTeamId(binding: JsonObject, teamId: String): JsonObject {
+    binding.get("match").getOrThrow().asObject().put("teamId", JsonString(teamId))
+    binding
+}
+
+private func withRoles(binding: JsonObject, roles: Array<String>): JsonObject {
+    let arr = JsonArray([])
+    for (role in roles) {
+        arr.add(JsonString(role))
+    }
+    binding.get("match").getOrThrow().asObject().put("roles", arr)
+    binding
+}
+
 private func putBindings(root: JsonObject, bindings: Array<JsonObject>): Unit {
     let arr = JsonArray([])
     for (binding in bindings) {
@@ -318,6 +337,123 @@ public class GatewayAgentRouteResolverTest {
         @Expect(gatewayResolveAgentRoute(
             GatewayAgentRouteInput(root, "telegram", accountId: "bot-b", peerKind: "group", peerId: "g1")
         ).matchedBy, "binding.channel")
+    }
+
+    @TestCase
+    public func peerBindingsRequireAllDeclaredGuildTeamAndRoleConstraints(): Unit {
+        let root = routeTestConfig()
+        putBindings(
+            root,
+            [
+                withGuildId(peerBinding("ops", "telegram", "group", "-100_scoped_guild", accountId: "*"), "guild-1"),
+                withTeamId(peerBinding("reviewer", "telegram", "group", "-100_scoped_team", accountId: "*"), "team-1"),
+                withRoles(peerBinding("roles-agent", "telegram", "group", "-100_scoped_roles", accountId: "*"), ["mod"])
+            ]
+        )
+
+        let guildMatch = gatewayResolveAgentRoute(
+            GatewayAgentRouteInput(root, "telegram", accountId: "bot-a", peerKind: "group",
+                peerId: "-100_scoped_guild", guildId: "guild-1"))
+        @Expect(guildMatch.agentId, "ops")
+        @Expect(guildMatch.matchedBy, "binding.peer.exact")
+
+        let guildMismatch = gatewayResolveAgentRoute(
+            GatewayAgentRouteInput(root, "telegram", accountId: "bot-a", peerKind: "group",
+                peerId: "-100_scoped_guild", guildId: "guild-2"))
+        @Expect(guildMismatch.agentId, "main")
+        @Expect(guildMismatch.matchedBy, "default")
+
+        let teamMatch = gatewayResolveAgentRoute(
+            GatewayAgentRouteInput(root, "telegram", accountId: "bot-a", peerKind: "group",
+                peerId: "-100_scoped_team", teamId: "team-1"))
+        @Expect(teamMatch.agentId, "reviewer")
+        @Expect(teamMatch.matchedBy, "binding.peer.exact")
+
+        let teamMismatch = gatewayResolveAgentRoute(
+            GatewayAgentRouteInput(root, "telegram", accountId: "bot-a", peerKind: "group",
+                peerId: "-100_scoped_team", teamId: "team-2"))
+        @Expect(teamMismatch.agentId, "main")
+        @Expect(teamMismatch.matchedBy, "default")
+
+        let roleMatch = gatewayResolveAgentRoute(
+            GatewayAgentRouteInput(root, "telegram", accountId: "bot-a", peerKind: "group",
+                peerId: "-100_scoped_roles", roles: ["mod"]))
+        @Expect(roleMatch.agentId, "roles-agent")
+        @Expect(roleMatch.matchedBy, "binding.peer.exact")
+
+        let roleMismatch = gatewayResolveAgentRoute(
+            GatewayAgentRouteInput(root, "telegram", accountId: "bot-a", peerKind: "group",
+                peerId: "-100_scoped_roles", roles: ["member"]))
+        @Expect(roleMismatch.agentId, "main")
+        @Expect(roleMismatch.matchedBy, "default")
+    }
+
+    @TestCase
+    public func accountBindingsWithGuildConstraintDoNotMatchOtherGuilds(): Unit {
+        let root = routeTestConfig()
+        putBindings(
+            root,
+            [
+                withGuildId(routeBinding("assistant-a", "telegram", accountId: "bot-a"), "guild-1"),
+                routeBinding("assistant-b", "telegram", accountId: "*")
+            ]
+        )
+
+        let sameGuild = gatewayResolveAgentRoute(
+            GatewayAgentRouteInput(root, "telegram", accountId: "bot-a", peerKind: "group",
+                peerId: "-100_account_guild", guildId: "guild-1"))
+        @Expect(sameGuild.agentId, "assistant-a")
+        @Expect(sameGuild.matchedBy, "binding.guild")
+
+        let otherGuild = gatewayResolveAgentRoute(
+            GatewayAgentRouteInput(root, "telegram", accountId: "bot-a", peerKind: "group",
+                peerId: "-100_account_guild", guildId: "guild-2"))
+        @Expect(otherGuild.agentId, "assistant-b")
+        @Expect(otherGuild.matchedBy, "binding.channel")
+    }
+
+    @TestCase
+    public func groupAndChannelPeerKindsMatchEachOtherButOtherKindsStayStrict(): Unit {
+        let root = routeTestConfig()
+        putBindings(
+            root,
+            [
+                peerBinding("ops", "telegram", "group", "-100_group_channel", accountId: "*"),
+                peerBinding("reviewer", "telegram", "channel", "-100_channel_group", accountId: "*"),
+                peerBinding("pm", "telegram", "direct", "shared-peer", accountId: "*"),
+                peerBinding("writer", "telegram", "thread", "shared-peer", accountId: "*"),
+                peerBinding("roles-agent", "telegram", "topic", "shared-peer", accountId: "*")
+            ]
+        )
+
+        let groupBindingChannelInput = gatewayResolveAgentRoute(
+            GatewayAgentRouteInput(root, "telegram", accountId: "bot-a", peerKind: "channel",
+                peerId: "-100_group_channel"))
+        @Expect(groupBindingChannelInput.agentId, "ops")
+        @Expect(groupBindingChannelInput.matchedBy, "binding.peer.exact")
+
+        let channelBindingGroupInput = gatewayResolveAgentRoute(
+            GatewayAgentRouteInput(root, "telegram", accountId: "bot-a", peerKind: "group",
+                peerId: "-100_channel_group"))
+        @Expect(channelBindingGroupInput.agentId, "reviewer")
+        @Expect(channelBindingGroupInput.matchedBy, "binding.peer.exact")
+
+        @Expect(gatewayResolveAgentRoute(
+            GatewayAgentRouteInput(root, "telegram", accountId: "bot-a", peerKind: "group",
+                peerId: "shared-peer")
+        ).matchedBy, "default")
+        @Expect(gatewayResolveAgentRoute(
+            GatewayAgentRouteInput(root, "telegram", accountId: "bot-a", peerKind: "direct",
+                peerId: "-100_group_channel")
+        ).matchedBy, "default")
+        @Expect(gatewayResolveAgentRoute(
+            GatewayAgentRouteInput(root, "telegram", accountId: "bot-a", peerKind: "topic",
+                peerId: "shared-peer")
+        ).agentId, "roles-agent")
+        @Expect(gatewayResolveAgentRoute(
+            GatewayAgentRouteInput(root, "telegram", accountId: "bot-a", peerKind: "thread",
+                peerId: "shared-peer")
+        ).agentId, "writer")
     }
 
     @TestCase
