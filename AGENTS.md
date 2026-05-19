@@ -1,5 +1,9 @@
 This project implements the Metis code agent application, which is written in the Cangjie programming language.
 
+The default working language for this project is Cangjie. New runtime code, tests, examples, and project-local automation should use Cangjie unless the user explicitly asks for another language or an existing non-Cangjie subsystem requires matching its language.
+
+Project directories must keep a clear boundary: production source code belongs under `src/`, documentation belongs under `docs/`, and automated tests, fixtures, and fake services belong under `test/` or the repository's established test directory. Do not mix production code, documentation, and test fixtures in the repository root.
+
 Use context7 query Cangjie Syntax by /websites/cangjie-lang_cn_1_0_0 /dyingchinese/cangjie-stdx libraryId.
 
 ## Introduction of Cangjie
