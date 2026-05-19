@@ -11,7 +11,7 @@ import metis.gateway.channels.feishu.{gatewayFeishuListAccountIds, gatewayFeishu
 import metis.gateway.channels.qq.{gatewayQqListAccountIds, gatewayQqResolveAccount}
 import metis.gateway.channels.telegram.{gatewayTelegramListAccountIds, gatewayTelegramResolveAccount}
 import metis.gateway.config.buildGatewayConfigFromUserSettings
-import metis.gateway.core.{GatewayAgentBindingApplyResult, GatewayAgentBindingConflict, GatewayAgentBindingRemoveResult, gatewayAgentTeamMigrationDryRun, gatewayApplyAgentRouteBindings, gatewayAuthorizedChatToolNames, gatewayBuildLegacyAgentRouteBinding, gatewayChannelRuntimeSummary, gatewayCorePromptRuntimeCapabilities, gatewayDefaultChatRuntimeHasUnifiedCoreTools, gatewayDefaultChatToolNames, gatewayMainRuntimePromptTemplateId, gatewayMainRuntimePromptVarianceFields, gatewayRemoveAgentRouteBindings, gatewaySanitizeAgentId}
+import metis.gateway.core.{GatewayAgentBindingApplyResult, GatewayAgentBindingConflict, GatewayAgentBindingRemoveResult, gatewayAcpBindingRowJson, gatewayAgentTeamMigrationDryRun, gatewayApplyAgentRouteBindings, gatewayAuthorizedChatToolNames, gatewayBuildLegacyAgentRouteBinding, gatewayChannelRuntimeSummary, gatewayCorePromptRuntimeCapabilities, gatewayDefaultChatRuntimeHasUnifiedCoreTools, gatewayDefaultChatToolNames, gatewayMainRuntimePromptTemplateId, gatewayMainRuntimePromptVarianceFields, gatewayRemoveAgentRouteBindings, gatewaySanitizeAgentId}
 import metis.gateway.session.{GatewayIngressSource, GatewaySessionRequest, gatewayBuildSessionRpcParams, gatewayIngressSourceFromString, gatewayResolveSessionContext, gatewaySessionRequestFromRpcParams}
 import metis.utils.InfoUtils
 
@@ -934,6 +934,9 @@ private func gatewayAgentRouteBindingRows(root: JsonObject, agentId: String): Js
     let bindings = gatewayAgentConfigBindings(root)
     for (i in 0..bindings.size()) {
         let binding = try { bindings[i].asObject() } catch (_e: Exception) { JsonObject() }
+        if (gatewayAgentConfiguredBindingType(binding) != "route") {
+            continue
+        }
         if (gatewaySanitizeAgentId(gatewayAgentJsonString(binding, "agentId", "")) != normalizedAgent) {
             continue
         }
@@ -941,6 +944,7 @@ private func gatewayAgentRouteBindingRows(root: JsonObject, agentId: String): Js
         let channelId = gatewayAgentBindingNormalizedChannel(gatewayAgentJsonString(matchObj, "channel", ""))
         let accountId = gatewayAgentBindingNormalizedAccountId(channelId, gatewayAgentJsonString(matchObj, "accountId", ""))
         let row = JsonObject()
+        row.put("type", JsonString("route"))
         row.put("description", JsonString(gatewayAgentBindingDescribe(binding)))
         row.put("channel", JsonString(channelId))
         row.put("accountId", JsonString(accountId))
@@ -1217,6 +1221,17 @@ private func gatewayAgentBindingDescribe(binding: JsonObject): String {
         out += " team=${teamId}"
     }
     out
+}
+
+private func gatewayAgentConfiguredBindingType(binding: JsonObject): String {
+    let typeName = gatewayAgentJsonString(binding, "type", "").trimAscii().toAsciiLower()
+    if (typeName == "acp") {
+        return "acp"
+    }
+    if (typeName.isEmpty() || typeName == "route") {
+        return "route"
+    }
+    typeName
 }
 
 private func gatewayAgentRouteBindingHasChannel(binding: JsonObject): Bool {
@@ -1763,8 +1778,11 @@ private func gatewayAgentBindingRemoveJson(result: GatewayAgentBindingRemoveResu
 
 private func gatewayAgentBindingsListJson(request: GatewayRpcRequest): JsonObject {
     let root = gatewayAgentConfigRootClone()
-    let filterAgentId = gatewaySanitizeAgentId(gatewayAgentRpcStringParam(request, ["agent", "agentId"], ""))
+    let rawFilterAgentId = gatewayAgentRpcStringParam(request, ["agent", "agentId"], "")
+    let filterAgentId = if (rawFilterAgentId.trimAscii().isEmpty()) { "" } else { gatewaySanitizeAgentId(rawFilterAgentId) }
     let out = JsonArray([])
+    let routeOut = JsonArray([])
+    let acpOut = JsonArray([])
     let bindings = gatewayAgentConfigBindings(root)
     for (i in 0..bindings.size()) {
         let binding = try {
@@ -1772,19 +1790,35 @@ private func gatewayAgentBindingsListJson(request: GatewayRpcRequest): JsonObjec
         } catch (_e: Exception) {
             JsonObject()
         }
+        let bindingType = gatewayAgentConfiguredBindingType(binding)
         let bindingAgentId = gatewaySanitizeAgentId(gatewayAgentJsonString(binding, "agentId", ""))
         if (!filterAgentId.isEmpty() && bindingAgentId != filterAgentId) {
             continue
         }
         let row = JsonObject()
+        if (bindingType == "acp") {
+            let acpRow = gatewayAcpBindingRowJson(root, binding)
+            acpRow.put("description", JsonString(gatewayAgentBindingDescribe(binding)))
+            out.add(acpRow)
+            acpOut.add(acpRow)
+            continue
+        }
+        row.put("type", JsonString(bindingType))
         row.put("agentId", JsonString(bindingAgentId))
         row.put("match", binding.get("match") ?? JsonObject())
         row.put("description", JsonString(gatewayAgentBindingDescribe(binding)))
         out.add(row)
+        if (bindingType == "route") {
+            routeOut.add(row)
+        }
     }
     let result = JsonObject()
     result.put("bindings", out)
+    result.put("routeBindings", routeOut)
+    result.put("acpBindings", acpOut)
     result.put("count", out.size().toJsonValue())
+    result.put("routeCount", routeOut.size().toJsonValue())
+    result.put("acpCount", acpOut.size().toJsonValue())
     result
 }
 
