@@ -101,11 +101,20 @@ Subagents are governed by `gateway.subagents` in `metis.json`. The policy contro
 - maximum children per session
 - maximum spawn depth
 - default and maximum timeout
+- auto-archive delay in minutes
 - allowed context modes
 - allowed isolation modes
 - whether write-capable agents require worktree isolation
 
 Write-capable subagents should use `worktree` isolation unless a user explicitly accepts shared-workspace risk.
+
+## Lifecycle Cleanup
+
+Terminal subagent runs keep their run record for audit. `gateway.subagents.archiveAfterMinutes` schedules best-effort transcript archival; `cleanup=delete` archives immediately after the completion notice path. Archival renames the transcript in place as `*.deleted.<timestamp>` and updates the run record `transcriptPath`, `archivedTranscriptPath`, `archiveStatus`, and `archivedAtMs` fields so status and logs remain traceable.
+
+Killing a parent subagent run cancels non-terminal child runs whose `parentSessionKey` points at that parent session. Child records are marked `cancelled` with a cascade reason that includes the parent run id.
+
+Completion notices first update the requester transcript and then attempt channel delivery. Channel delivery failures are recorded as `pending` for retry; repeated retry failures eventually mark the channel notice `failed`, while successful retry marks it `delivered`.
 
 ## Control UI
 
