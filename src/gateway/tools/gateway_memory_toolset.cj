@@ -3,6 +3,7 @@ package metis.gateway.tools
 import magic.dsl.{tool, toolset}
 import magic.prelude.*
 
+import metis.core.{gatewayCurrentToolRuntimeContext}
 import metis.core.config.CliConfig
 import metis.core.memory.{MemoryRuntime, ResolvedMemoryBackendConfig, LocalMemorySearchRow, LocalMemoryRecallResult, isQmdScopeAllowed, parseAgentSessionKey}
 import metis.core.tools.fs_utils.catRange
@@ -220,12 +221,44 @@ private func searchHitsFromFilesImpl(query: String, agentId!: String = "", purpo
     ordered
 }
 
+private func gatewayMemorySearchQmdExtraCollections(policy: JsonObject): Array<String> {
+    match (policy.get("qmd")) {
+        case Some(value) =>
+            try {
+                let qmd = value.asObject()
+                match (qmd.get("extraCollections")) {
+                    case Some(collectionsValue) =>
+                        let collections = collectionsValue.asArray()
+                        let out = ArrayList<String>()
+                        for (item in collections.getItems()) {
+                            try {
+                                let collection = item.asString().getValue().trimAscii()
+                                if (!collection.isEmpty() && !out.contains(collection)) {
+                                    out.add(collection)
+                                }
+                            } catch (_: Exception) {
+                                ()
+                            }
+                        }
+                        return out.toArray()
+                    case None => ()
+                }
+            } catch (_: Exception) {
+                ()
+            }
+        case None => ()
+    }
+    Array<String>()
+}
+
 private func runMemorySearchImpl(
     query: String,
     maxResults: Option<Int64>,
     minScore: Option<Float64>,
     sessionKey!: Option<String> = None,
-    agentId!: Option<String> = None
+    agentId!: Option<String> = None,
+    qmdWorkspaceDir!: String = "",
+    qmdExtraCollections!: Array<String> = []
 ): String {
     let trimmed = query.trimAscii()
     if (trimmed.isEmpty()) {
@@ -266,7 +299,9 @@ private func runMemorySearchImpl(
         limit * 4,
         sessionKey: sessionKey,
         agentId: resolvedAgentId,
-        purpose: "tool-search"
+        purpose: "tool-search",
+        qmdWorkspaceDir: qmdWorkspaceDir,
+        qmdExtraCollections: qmdExtraCollections
     )
     let usingManagerRows = !searchRows.isEmpty()
     let qmdScopeDenied = backendConfig.providerId == "qmd" && !isQmdScopeAllowed(sessionKey)
@@ -358,7 +393,35 @@ public class GatewayMemoryToolset {
         }
     ]
     public func memory_search(query: String, maxResults: Option<Int64>, minScore: Option<Float64>, sessionKey: Option<String>): String {
-        runMemorySearchImpl(query, maxResults, minScore, sessionKey: sessionKey)
+        match (gatewayCurrentToolRuntimeContext()) {
+            case Some(context) =>
+                runMemorySearchImpl(
+                    query,
+                    maxResults,
+                    minScore,
+                    sessionKey: sessionKey,
+                    agentId: Some(context.agentId),
+                    qmdWorkspaceDir: context.workspaceDir,
+                    qmdExtraCollections: gatewayMemorySearchQmdExtraCollections(context.memorySearchPolicy)
+                )
+            case None => runMemorySearchImpl(query, maxResults, minScore, sessionKey: sessionKey)
+        }
+    }
+
+    public func debugMemorySearchForTest(query: String, maxResults: Option<Int64>, minScore: Option<Float64>, sessionKey: Option<String>): String {
+        match (gatewayCurrentToolRuntimeContext()) {
+            case Some(context) =>
+                runMemorySearchImpl(
+                    query,
+                    maxResults,
+                    minScore,
+                    sessionKey: sessionKey,
+                    agentId: Some(context.agentId),
+                    qmdWorkspaceDir: context.workspaceDir,
+                    qmdExtraCollections: gatewayMemorySearchQmdExtraCollections(context.memorySearchPolicy)
+                )
+            case None => runMemorySearchImpl(query, maxResults, minScore, sessionKey: sessionKey)
+        }
     }
 
     private func resolveMemoryFilePath(relPath: String): Path {

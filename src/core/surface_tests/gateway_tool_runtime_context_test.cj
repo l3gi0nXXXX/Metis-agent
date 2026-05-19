@@ -3,6 +3,7 @@ package metis.core.surface_tests
 import metis.core.*
 
 import std.unittest.testmacro.*
+import stdx.encoding.json.{JsonBool, JsonObject}
 
 @Test
 public class GatewayToolRuntimeContextTest {
@@ -41,5 +42,15 @@ public class GatewayToolRuntimeContextTest {
             @Expect(gatewayCurrentToolRuntimeContext().getOrThrow().sourceLabel, "cli")
         })
         @Expect(gatewayCurrentToolRuntimeContext().isNone(), true)
+    }
+
+    @TestCase
+    public func runtimeContextCarriesMemorySearchPolicy(): Unit {
+        let policy = JsonObject()
+        policy.put("enabled", JsonBool(true))
+        let context = GatewayToolRuntimeContext("telegram", agentId: "agent-a", memorySearchPolicy: policy)
+
+        @Expect(context.agentId, "agent-a")
+        @Expect(context.memorySearchPolicy.get("enabled").isSome(), true)
     }
 }

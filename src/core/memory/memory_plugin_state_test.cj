@@ -20,6 +20,17 @@ private class TestMemoryProvider <: MemoryProvider {
         let _ = sessionKey
         searchRows(query, limit)
     }
+    public func searchRows(
+        query: String,
+        limit: Int64,
+        sessionKey!: Option<String>,
+        qmdWorkspaceDir!: String,
+        qmdExtraCollections!: Array<String>
+    ): Array<LocalMemorySearchRow> {
+        let _ = qmdWorkspaceDir
+        let _ = qmdExtraCollections
+        searchRows(query, limit, sessionKey: sessionKey)
+    }
     public func recordShortTermRecall(query: String, rows: Array<LocalMemoryRecallResult>): Unit {
         let _ = query
         let _ = rows
