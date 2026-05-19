@@ -12,7 +12,7 @@ public class CliImageModelConfigTest {
         let model = JsonObject()
         model.put("primary", JsonString("deepseek/deepseek-v4-pro"))
         let imageModel = JsonObject()
-        imageModel.put("primary", JsonString("qwen/qwen-vl-max"))
+        imageModel.put("primary", JsonString("qwen/qwen3.6-plus"))
         imageModel.put("fallbacks", JsonArray([JsonString("openai/gpt-4o")]))
         defaults.put("model", model)
         defaults.put("imageModel", imageModel)
@@ -35,7 +35,7 @@ public class CliImageModelConfigTest {
                 CliSettingManager.applyPersistedFieldsToCliConfig()
 
                 @Expect(CliConfig.modelOrEmpty(), "deepseek:deepseek-v4-pro")
-                @Expect(CliConfig.imageModelOrEmpty(), "dashscope:qwen-vl-max")
+                @Expect(CliConfig.imageModelOrEmpty(), "dashscope:qwen3.6-plus")
                 @Expect(CliConfig.imageFallbackModels.size, 1)
                 @Expect(CliConfig.imageFallbackModels[0], "openai:gpt-4o")
             } finally {
@@ -63,7 +63,7 @@ public class CliImageModelConfigTest {
         let oldImageFallbacks = CliConfig.imageFallbackModels
         withMetisConfigTestHome("missing-image-model-clears") { _home =>
             try {
-                CliConfig.imageModel = "dashscope:qwen-vl-max"
+                CliConfig.imageModel = "dashscope:qwen3.6-plus"
                 CliConfig.imageFallbackModels = ["openai:gpt-4o"]
 
                 let root = JsonObject()

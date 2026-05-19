@@ -618,6 +618,7 @@ public class GatewayServiceTelegramNativeTest {
 
             let text = adapter.sentText(0)
             @Expect(text.contains("Models (qwen)"), true)
+            @Expect(text.contains("qwen3.6-plus [text,image]"), true)
             @Expect(text.contains("available"), true)
             @Expect(text.contains("callback:models:setidx:qwen:1:"), true)
             @Expect(text.contains("callback:models:providers"), true)

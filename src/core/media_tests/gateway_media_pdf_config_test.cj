@@ -33,7 +33,7 @@ private func pdfConfigRoot(): JsonObject {
     model.put("primary", JsonString("deepseek/deepseek-chat"))
     let pdfModel = JsonObject()
     pdfModel.put("primary", JsonString("anthropic/claude-sonnet-4-6"))
-    pdfModel.put("fallbacks", JsonArray([JsonString("qwen/qwen-vl-max"), JsonString("openai/gpt-4o")]))
+    pdfModel.put("fallbacks", JsonArray([JsonString("qwen/qwen3.6-plus"), JsonString("openai/gpt-4o")]))
     defaults.put("model", model)
     defaults.put("pdfModel", pdfModel)
     defaults.put("pdfMaxBytesMb", JsonFloat(12.5))
@@ -126,7 +126,7 @@ public class GatewayMediaPdfConfigTest {
 
             @Expect(CliConfig.pdfModelOrEmpty(), "anthropic:claude-sonnet-4-6")
             @Expect(CliConfig.pdfFallbackModels.size, 2)
-            @Expect(CliConfig.pdfFallbackModels[0], "dashscope:qwen-vl-max")
+            @Expect(CliConfig.pdfFallbackModels[0], "dashscope:qwen3.6-plus")
             @Expect(CliConfig.pdfFallbackModels[1], "openai:gpt-4o")
             @Expect(CliConfig.pdfMaxBytesMb, 12.5)
             @Expect(CliConfig.pdfMaxPages, 7)
@@ -141,7 +141,7 @@ public class GatewayMediaPdfConfigTest {
             var user = GatewayUserSettings()
             CliConfig.pdfModel = "anthropic:claude-sonnet-4-6"
             CliConfig.pdfFallbackModels = ["google/gemini-3.1-pro-preview"]
-            CliConfig.imageModel = "dashscope:qwen-vl-max"
+            CliConfig.imageModel = "dashscope:qwen3.6-plus"
             CliConfig.model = "deepseek:deepseek-chat"
 
             let candidates = gatewayPdfBuildCandidates(user, channel: "telegram")
@@ -161,13 +161,13 @@ public class GatewayMediaPdfConfigTest {
     public func imageModelFallbackIsUsedWhenPdfModelMissingAndSlashRefsNormalize(): Unit {
         withCleanPdfCandidateState("pdf-image-model-fallback") {
             var user = GatewayUserSettings()
-            CliConfig.imageModel = "qwen/qwen-vl-max"
+            CliConfig.imageModel = "qwen/qwen3.6-plus"
             CliConfig.model = "deepseek:deepseek-chat"
 
             let candidates = gatewayPdfBuildCandidates(user, channel: "telegram")
 
             @Expect(candidates.size, 2)
-            @Expect(candidates[0].modelRef, "dashscope:qwen-vl-max")
+            @Expect(candidates[0].modelRef, "dashscope:qwen3.6-plus")
             @Expect(candidates[0].source, "agents.defaults.imageModel.primary")
             @Expect(candidates[0].imageSupported, true)
             @Expect(candidates[0].nativePdfSupported, false)
@@ -182,7 +182,7 @@ public class GatewayMediaPdfConfigTest {
         withCleanPdfCandidateState("pdf-gateway-image-models") {
             var user = GatewayUserSettings()
             user.media.image = pdfTestImageConfig("custom", "vision-x")
-            CliConfig.imageModel = "qwen/qwen-vl-max"
+            CliConfig.imageModel = "qwen/qwen3.6-plus"
 
             let candidates = gatewayPdfBuildCandidates(user, channel: "feishu")
 
@@ -190,7 +190,7 @@ public class GatewayMediaPdfConfigTest {
             @Expect(candidates[0].modelRef, "custom:vision-x")
             @Expect(candidates[0].source, "gateway.media.image.models")
             @Expect(candidates[0].imageSupported, true)
-            @Expect(candidates[1].modelRef, "dashscope:qwen-vl-max")
+            @Expect(candidates[1].modelRef, "dashscope:qwen3.6-plus")
             @Expect(candidates[1].source, "agents.defaults.imageModel.primary")
         }
     }

@@ -378,6 +378,50 @@ Gateway 会把当前 Telegram turn 的媒体对象注入 `mediaContext`。Agent 
 | `telegram_document_extract` | 文档抽取或预览。 | 返回 `metadata_only`。 |
 | `telegram_sticker_search/get/cache_stats` | 查询当前上下文和 durable sticker cache。 | cache 为空时返回空结果。 |
 
+图片理解模型由统一模型能力元数据过滤。`telegram_image_analyze` 只会把图片发给 `input` 明确包含 `image` 的候选模型；不会因为模型名里包含 `vl`、`qvq`、`omni` 等字样就推断它能看图。Qwen/DashScope 的推荐图片理解配置可以直接使用内置 catalog 中声明为 `text,image` 的 `qwen/qwen3.6-plus`：
+
+```json
+{
+  "agents": {
+    "defaults": {
+      "imageModel": {
+        "primary": "qwen/qwen3.6-plus",
+        "fallbacks": []
+      }
+    }
+  },
+  "models": {
+    "providers": {
+      "qwen": {
+        "apiKey": "${DASHSCOPE_API_KEY}",
+        "baseUrl": "https://dashscope.aliyuncs.com/compatible-mode/v1"
+      }
+    }
+  }
+}
+```
+
+如果使用 Metis 尚未内置的自定义视觉模型，必须显式声明能力。可以在 `gateway.media.image.models[]` 中声明 `capabilities` / `input`，也可以在 provider 模型元数据中声明 `input`：
+
+```json
+{
+  "models": {
+    "providers": {
+      "custom": {
+        "apiKey": "${CUSTOM_API_KEY}",
+        "baseUrl": "https://provider.example/v1",
+        "models": [
+          { "id": "vision-x", "input": ["text", "image"] },
+          { "id": "text-x", "input": ["text"] }
+        ]
+      }
+    }
+  }
+}
+```
+
+`doctor` 和 `/models qwen` 会展示模型能力来源与 `input`。例如 `qwen3.6-plus [text,image]` 可作为图片理解候选，`qwen3-coder-plus [text]` 会进入 rejected/unsupported，不会被执行。unknown 模型会返回 `unknown_capability`，需要补充上述元数据后才会接收图片。
+
 视频理解可以使用共享配置 `gateway.media.video`，也可以用 `gateway.telegram.video` 覆盖 Telegram 通道。Telegram override 会深合并共享 provider 配置；缺少 provider、超限、超时或 provider 错误时，工具返回可读错误文本，不把 token、Authorization header 或本地文件路径暴露给用户。
 
 Gemini inline video provider 示例：

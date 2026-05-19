@@ -539,7 +539,7 @@ public class GatewayTelegramMediaToolsetTest {
         Directory.create(root, recursive: true)
         let source = root.join("image.jpg")
         File.writeTo(source, "fake".toArray())
-        let modelName = "metis-test-telegram-vision-${DateTime.now().toUnixTimeStamp().toMilliseconds()}"
+        let modelName = "fake:telegram-vision-${DateTime.now().toUnixTimeStamp().toMilliseconds()}"
         ModelManager.registerChatModel(modelName, { => TelegramMediaToolsetVisionFakeModel() })
         setGatewayTelegramMediaVisionCandidatesForTest(Some([modelName]))
         try {
@@ -697,8 +697,72 @@ public class GatewayTelegramMediaToolsetTest {
                 @Expect(json.get("ok").getOrThrow().asBool().getValue(), false)
                 @Expect(out.contains("image-ok"), false)
                 @Expect(out.contains("provider_error"), false)
-                @Expect(out.contains("unsupported_model"), true)
+                @Expect(json.get("status").getOrThrow().asString().getValue(), "not_configured")
                 @Expect(out.contains("agents.defaults.imageModel.primary"), true)
+            } finally {
+                if (oldModel.isEmpty()) {
+                    CliConfig.clearPrimaryModelForTest()
+                } else {
+                    CliConfig.model = oldModel
+                }
+                try { remove(root, recursive: true) } catch (_e: Exception) { () }
+            }
+        }
+    }
+
+    @TestCase
+    public func telegramImageAnalyzeUsesQwenCatalogImageModelWithoutNameHeuristic(): Unit {
+        this.withTelegramMediaToolsetConfigHome {
+            let root = Path("/tmp/metis-telegram-image-qwen36-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
+            Directory.create(root, recursive: true)
+            let source = root.join("image.jpg")
+            File.writeTo(source, "fake".toArray())
+            let oldModel = CliConfig.modelOrEmpty()
+            this.writeAgentsImageModelConfig("deepseek/deepseek-v4-pro", imagePrimary: "qwen/qwen3.6-plus")
+            ModelManager.registerChatModel("dashscope:qwen3.6-plus", { => TelegramMediaToolsetVisionFakeModel() })
+            ModelManager.registerChatModel("deepseek:deepseek-v4-pro", { => TelegramMediaToolsetVisionFakeModel() })
+            try {
+                let toolset = GatewayTelegramMediaToolset()
+                let out = gatewayWithToolRuntimeContext(
+                    GatewayToolRuntimeContext("telegram", channelName: "telegram", sessionKey: "telegram:chat:1", mediaContext: this.mediaContext(source.toString())),
+                    { => toolset.debugTelegramImageAnalyzeForTest(None<String>, None<Int64>, Some("describe this image")) }
+                )
+                let json = JsonValue.fromStr(out).asObject()
+                @Expect(json.get("status").getOrThrow().asString().getValue(), "ok")
+                @Expect(json.get("analysis").getOrThrow().asString().getValue().contains("image-ok"), true)
+                @Expect(json.get("model").getOrThrow().asString().getValue(), "fake:telegram-vision")
+            } finally {
+                if (oldModel.isEmpty()) {
+                    CliConfig.clearPrimaryModelForTest()
+                } else {
+                    CliConfig.model = oldModel
+                }
+                try { remove(root, recursive: true) } catch (_e: Exception) { () }
+            }
+        }
+    }
+
+    @TestCase
+    public func telegramImageAnalyzeDoesNotExecuteUnknownQwenVlLookingImageModel(): Unit {
+        this.withTelegramMediaToolsetConfigHome {
+            let root = Path("/tmp/metis-telegram-image-unknown-qwen-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
+            Directory.create(root, recursive: true)
+            let source = root.join("image.jpg")
+            File.writeTo(source, "fake".toArray())
+            let oldModel = CliConfig.modelOrEmpty()
+            this.writeAgentsImageModelConfig("deepseek/deepseek-v4-pro", imagePrimary: "qwen/custom-vl-looking-name")
+            ModelManager.registerChatModel("dashscope:custom-vl-looking-name", { => TelegramMediaToolsetVisionFakeModel() })
+            try {
+                let toolset = GatewayTelegramMediaToolset()
+                let out = gatewayWithToolRuntimeContext(
+                    GatewayToolRuntimeContext("telegram", channelName: "telegram", sessionKey: "telegram:chat:1", mediaContext: this.mediaContext(source.toString())),
+                    { => toolset.debugTelegramImageAnalyzeForTest(None<String>, None<Int64>, Some("describe this image")) }
+                )
+                let json = JsonValue.fromStr(out).asObject()
+                @Expect(json.get("ok").getOrThrow().asBool().getValue(), false)
+                @Expect(json.get("status").getOrThrow().asString().getValue(), "not_configured")
+                @Expect(out.contains("image-ok"), false)
+                @Expect(out.contains("provider_error"), false)
             } finally {
                 if (oldModel.isEmpty()) {
                     CliConfig.clearPrimaryModelForTest()

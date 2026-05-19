@@ -7,6 +7,7 @@ import metis.core.config.{
     cliProviderApiKeyConfigPath,
     cliProviderBaseUrlConfigPath
 }
+import metis.core.model.{modelCapabilityCatalogEntriesForProvider, modelCapabilityCatalogEntryToJson}
 
 import std.collection.ArrayList
 import stdx.encoding.json.{JsonArray, JsonBool, JsonObject, JsonString, JsonValue}
@@ -41,6 +42,11 @@ public func programSupportBuildProviderCatalog(): JsonArray {
             authChoices.add(authRow)
         }
         row.put("authChoices", JsonArray(authChoices))
+        let models = ArrayList<JsonValue>()
+        for (entry in modelCapabilityCatalogEntriesForProvider(preset.providerId)) {
+            models.add(modelCapabilityCatalogEntryToJson(entry))
+        }
+        row.put("models", JsonArray(models))
         row.put("docsUrl", JsonString(preset.docsUrl))
         rows.add(row)
     }

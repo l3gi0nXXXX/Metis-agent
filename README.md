@@ -156,6 +156,8 @@ At minimum, configure one chat model provider, for example `qwen`, `deepseek`, `
 }
 ```
 
+For Telegram image understanding, configure a dedicated image model whose model catalog `input` includes `image`. Qwen `qwen/qwen3.6-plus` is built in as `text,image`; unknown custom models must declare `input` metadata under `models.providers.<provider>.models[]` or `gateway.media.image.models[]`.
+
 IM channels need their own credentials only when that channel is enabled:
 
 - Telegram: bot token from BotFather, configured under `gateway.telegram` or a Telegram account entry.

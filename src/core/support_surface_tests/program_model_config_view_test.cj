@@ -25,6 +25,19 @@ public class ModelConfigViewTest {
                 )
                 @Expect(row.get("apiKeyEnv").isSome(), false)
                 @Expect(row.get("baseUrlEnv").isSome(), false)
+                let models = row.get("models").getOrThrow().asArray()
+                var sawQwen36 = false
+                for (modelItem in models.getItems()) {
+                    let model = modelItem.asObject()
+                    if (model.get("model").getOrThrow().asString().getValue() == "qwen3.6-plus") {
+                        sawQwen36 = true
+                        let input = model.get("input").getOrThrow().asArray()
+                        @Expect(input.size(), 2)
+                        @Expect(input[0].asString().getValue(), "text")
+                        @Expect(input[1].asString().getValue(), "image")
+                    }
+                }
+                @Expect(sawQwen36, true)
             }
         }
         @Expect(matched, true)

@@ -449,13 +449,13 @@ public class MetisConfigManagerTest {
         root.put("gateway", gateway)
         MetisConfigManager.writeRoot(root)
 
-        let nextModel = MetisConfigManager.setImageModelRef("qwen/qwen-vl-max")
+        let nextModel = MetisConfigManager.setImageModelRef("qwen/qwen3.6-plus")
         let nextFallbacks = MetisConfigManager.setImageFallbackModelRefs(["openai/gpt-4o", "openai:gpt-4o"])
 
-        @Expect(nextModel, "qwen:qwen-vl-max")
+        @Expect(nextModel, "qwen:qwen3.6-plus")
         @Expect(nextFallbacks.size, 1)
         @Expect(nextFallbacks[0], "openai:gpt-4o")
-        @Expect(MetisConfigManager.readImageModel().getOrThrow(), "dashscope:qwen-vl-max")
+        @Expect(MetisConfigManager.readImageModel().getOrThrow(), "dashscope:qwen3.6-plus")
         @Expect(MetisConfigManager.readImageFallbackModels()[0], "openai:gpt-4o")
 
         let persisted = MetisConfigManager.rawConfig().getOrThrow()

@@ -101,7 +101,7 @@ public class CliLocalFlowsTest {
         model.put("primary", JsonString("deepseek/deepseek-v4-pro"))
         defaults.put("model", model)
         let imageModel = JsonObject()
-        imageModel.put("primary", JsonString("qwen/qwen-vl-max"))
+        imageModel.put("primary", JsonString("qwen/qwen3.6-plus"))
         imageModel.put("fallbacks", JsonArray([JsonString("openai/gpt-4o")]))
         defaults.put("imageModel", imageModel)
         agents.put("defaults", defaults)
@@ -112,7 +112,7 @@ public class CliLocalFlowsTest {
 
         let rendered = programSupportRenderModelsStatus()
 
-        @Expect(rendered.contains("Image primary: qwen:qwen-vl-max"), true)
+        @Expect(rendered.contains("Image primary: qwen:qwen3.6-plus"), true)
         @Expect(rendered.contains("Image fallbacks: openai:gpt-4o"), true)
         @Expect(rendered.contains("independent from the main chat model"), true)
     }

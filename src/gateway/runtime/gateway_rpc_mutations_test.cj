@@ -122,13 +122,13 @@ public class GatewayRpcMutationsTest {
         MetisConfigManager.writeRoot(gatewayRpcMutationsTestConfigRoot())
         CliSettingManager.applyPersistedFieldsToCliConfig()
         try {
-            let imageModelResult = applyGatewayConfigPatch("agents.defaults.imageModel.primary", "qwen/qwen-vl-max")
+            let imageModelResult = applyGatewayConfigPatch("agents.defaults.imageModel.primary", "qwen/qwen3.6-plus")
             @Expect(imageModelResult[0], true)
             @Expect(imageModelResult[1].contains("agents.defaults.imageModel.primary updated"), true)
 
             let mediaImageResult = applyGatewayConfigPatch(
                 "gateway.media.image",
-                "{\"enabled\":true,\"models\":[{\"provider\":\"shared-qwen\",\"model\":\"qwen-vl-max\",\"capabilities\":[\"image\"]}]}"
+                "{\"enabled\":true,\"models\":[{\"provider\":\"shared-qwen\",\"model\":\"qwen3.6-plus\",\"capabilities\":[\"image\"]}]}"
             )
             @Expect(mediaImageResult[0], true)
             @Expect(mediaImageResult[1].contains("gateway.media.image updated"), true)
@@ -136,7 +136,7 @@ public class GatewayRpcMutationsTest {
             let updatedRoot = MetisConfigManager.rawConfig().getOrThrow()
             let defaults = updatedRoot.get("agents").getOrThrow().asObject().get("defaults").getOrThrow().asObject()
             let imageModel = defaults.get("imageModel").getOrThrow().asObject()
-            @Expect(imageModel.get("primary").getOrThrow().asString().getValue(), "qwen/qwen-vl-max")
+            @Expect(imageModel.get("primary").getOrThrow().asString().getValue(), "qwen/qwen3.6-plus")
 
             let gateway = updatedRoot.get("gateway").getOrThrow().asObject()
             let media = gateway.get("media").getOrThrow().asObject()
@@ -161,7 +161,7 @@ public class GatewayRpcMutationsTest {
             let defaults = agents.get("defaults").getOrThrow().asObject()
             let imageModel = JsonObject()
             imageModel.put("primary", JsonString("openai/gpt-4o"))
-            imageModel.put("fallbacks", JsonArray([JsonString("qwen/qwen-vl-max")]))
+            imageModel.put("fallbacks", JsonArray([JsonString("qwen/qwen3.6-plus")]))
             defaults.put("imageModel", imageModel)
 
             let result = applyGatewayConfigPatch("", replacement.toJsonString())

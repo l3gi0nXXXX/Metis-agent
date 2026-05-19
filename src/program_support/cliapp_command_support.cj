@@ -2,6 +2,7 @@ package metis.program_support
 
 import metis.core.config.{CliConfig, MetisConfigManager, cliFindModelAuthChoicesForProvider, cliSetupVisibleModelProviders}
 import metis.core.{gatewayPdfDiagnosticSnapshot, gatewayPdfDiagnosticStatusText}
+import metis.core.model.{findModelCapabilityCatalogEntry, modelCapabilityCatalogEntriesForProvider}
 
 import std.collection.{ArrayList, filter, map, collectArray}
 import std.convert.Parsable
@@ -233,7 +234,7 @@ public func programSupportRenderModelsProviderModels(provider: String, page: Int
         let model = models[idx]
         let ref = "${normalizedProvider}:${model}"
         let mark = if (ref == CliConfig.modelOrEmpty().trimAscii()) { " *current*" } else { "" }
-        sb.append("- ${normalizedProvider}/${model}${mark}\n")
+        sb.append("- ${normalizedProvider}/${model}${programSupportModelInputLabel(normalizedProvider, model)}${mark}\n")
     }
     sb.append("Back: /models\n")
     sb.append("Switch: metis models set <provider/model>\n")
@@ -259,8 +260,25 @@ private func programSupportModelsCandidatesForProvider(provider: String): Array<
     for (choice in cliFindModelAuthChoicesForProvider(normalizedProvider)) {
         programSupportAddModelsCandidate(out, normalizedProvider, choice.defaultModelRef)
     }
+    for (entry in modelCapabilityCatalogEntriesForProvider(normalizedProvider)) {
+        programSupportAddModelIdCandidate(out, entry.model)
+    }
     programSupportAddModelsCandidate(out, normalizedProvider, CliConfig.modelOrEmpty())
     out.toArray()
+}
+
+private func programSupportAddModelIdCandidate(out: ArrayList<String>, modelId: String): Unit {
+    let normalized = modelId.trimAscii()
+    if (!normalized.isEmpty() && !out.contains(normalized)) {
+        out.add(normalized)
+    }
+}
+
+private func programSupportModelInputLabel(provider: String, model: String): String {
+    match (findModelCapabilityCatalogEntry(provider, model)) {
+        case Some(entry) => " [${String.join(entry.input, delimiter: ",")}]"
+        case None => ""
+    }
 }
 
 private func programSupportAddModelsCandidate(out: ArrayList<String>, provider: String, modelRef: String): Unit {

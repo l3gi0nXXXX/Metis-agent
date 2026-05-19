@@ -10,7 +10,7 @@ import metis.core.gatewayCurrentToolRuntimeContext
 import metis.core.{renderGatewayAudioText, renderGatewayDeleteText, renderGatewayDocumentText, renderGatewayEditText, renderGatewayPhotoText, renderGatewayPollText, renderGatewayReactionText, renderGatewayStickerText, renderGatewayTopicCreateText, renderGatewayTopicEditText, renderGatewayVideoNoteText, renderGatewayVideoText, renderGatewayVoiceText}
 import metis.core.config.{CliConfig, CliSettingManager, MetisConfigManager, MetisPaths}
 import metis.core.{gatewayImageUnderstandingCandidateSummary, gatewayMediaUnderstandingFirstText, gatewayMediaUnderstandingForRecord, gatewayMediaUnderstandingOutputs}
-import metis.core.model.gatewayImageCapabilityDecisionJson
+import metis.core.model.{gatewayImageCapabilityDecisionJson, gatewayModelSupportsImageInput}
 import metis.io.PrintUtils
 
 import std.collection.{ArrayList, HashSet}
@@ -360,32 +360,8 @@ private func telegramMediaToolResolveDestination(destination: String, record: Js
     (true, dest, "", true)
 }
 
-private func telegramMediaToolProviderFromModelRef(modelRef: String): String {
-    let normalized = modelRef.trimAscii()
-    if (normalized.contains(":")) {
-        return normalized.split(":", 2)[0].trimAscii().toAsciiLower()
-    }
-    if (normalized.contains("/")) {
-        return normalized.split("/", 2)[0].trimAscii().toAsciiLower()
-    }
-    ""
-}
-
 private func telegramMediaToolVisionProviderSupported(modelRef: String): Bool {
-    let provider = telegramMediaToolProviderFromModelRef(modelRef)
-    if (provider.isEmpty()) {
-        // Registered test/local models do not need a provider prefix.
-        return !modelRef.trimAscii().isEmpty()
-    }
-    try {
-        return gatewayImageCapabilityDecisionJson(modelRef)
-            .get("supported")
-            .getOrThrow()
-            .asBool()
-            .getValue()
-    } catch (_: Exception) {
-        false
-    }
+    gatewayModelSupportsImageInput(modelRef)
 }
 
 private func telegramMediaToolAddVisionCandidate(out: ArrayList<String>, seen: ArrayList<String>, raw: String): Unit {
@@ -558,11 +534,6 @@ private func telegramMediaToolVisionCandidates(): Array<String> {
         } catch (_: Exception) {
             ()
         }
-    }
-    telegramMediaToolAddVisionCandidate(out, seen, settings.channelModels.get("telegram") ?? "")
-    telegramMediaToolAddVisionCandidate(out, seen, CliConfig.modelOrEmpty())
-    for (modelRef in CliConfig.fallbackModels) {
-        telegramMediaToolAddVisionCandidate(out, seen, modelRef)
     }
     out.toArray()
 }
@@ -737,6 +708,7 @@ private func telegramMediaToolDescribeImageWithModel(record: JsonObject, userPro
             let empty = JsonObject()
             empty.put("model", JsonString(modelRef))
             empty.put("status", JsonString("empty_response"))
+            empty.put("capability", gatewayImageCapabilityDecisionJson(modelRef).toJsonValue())
             errors.add(empty)
         } catch (e: Exception) {
             let err = JsonObject()
@@ -745,6 +717,7 @@ private func telegramMediaToolDescribeImageWithModel(record: JsonObject, userPro
             let attemptStatus = if (safeError.toAsciiLower().contains("timeout") || safeError.toAsciiLower().contains("timed out")) { "timeout" } else { "provider_error" }
             err.put("status", JsonString(attemptStatus))
             err.put("error", JsonString(safeError))
+            err.put("capability", gatewayImageCapabilityDecisionJson(modelRef).toJsonValue())
             errors.add(err)
         }
     }

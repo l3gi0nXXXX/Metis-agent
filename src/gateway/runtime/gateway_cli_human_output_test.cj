@@ -415,11 +415,11 @@ public class GatewayCliHumanOutputTest {
 
     @TestCase
     public func formatsImageUnderstandingStatusWithoutRawJson(): Unit {
-        let raw = "{\"configChannel\":\"telegram\",\"channel\":\"telegram\",\"configured\":true,\"enabled\":true,\"imageModel\":\"dashscope:qwen-vl-max\",\"imageFallbackModels\":[\"openai:gpt-4o\"],\"candidateCount\":1,\"candidates\":[{\"modelRef\":\"dashscope:qwen-vl-max\",\"source\":\"agents.defaults.imageModel.primary\",\"capability\":{\"modelRef\":\"dashscope:qwen-vl-max\",\"status\":\"supported\"}}],\"rejected\":[{\"modelRef\":\"deepseek:deepseek-v4-pro\",\"source\":\"agents.defaults.model.primary\",\"capability\":{\"modelRef\":\"deepseek:deepseek-v4-pro\",\"status\":\"unsupported\",\"reason\":\"built-in deny\"}}]}"
+        let raw = "{\"configChannel\":\"telegram\",\"channel\":\"telegram\",\"configured\":true,\"enabled\":true,\"imageModel\":\"dashscope:qwen3.6-plus\",\"imageFallbackModels\":[\"openai:gpt-4o\"],\"candidateCount\":1,\"candidates\":[{\"modelRef\":\"dashscope:qwen3.6-plus\",\"source\":\"agents.defaults.imageModel.primary\",\"capability\":{\"modelRef\":\"dashscope:qwen3.6-plus\",\"status\":\"supported\"}}],\"rejected\":[{\"modelRef\":\"deepseek:deepseek-v4-pro\",\"source\":\"agents.defaults.model.primary\",\"capability\":{\"modelRef\":\"deepseek:deepseek-v4-pro\",\"status\":\"unsupported\",\"reason\":\"built-in deny\"}}]}"
         let out = gatewayFormatCommandOutput(raw)
         @Expect(out.contains("Image understanding"), true)
         @Expect(out.contains("telegram"), true)
-        @Expect(out.contains("dashscope:qwen-vl-max"), true)
+        @Expect(out.contains("dashscope:qwen3.6-plus"), true)
         @Expect(out.contains("openai:gpt-4o"), true)
         @Expect(out.contains("Skipped"), true)
         @Expect(out.contains("deepseek:deepseek-v4-pro"), true)
@@ -429,11 +429,11 @@ public class GatewayCliHumanOutputTest {
 
     @TestCase
     public func formatsImageConfigMutationWithoutRawJson(): Unit {
-        let raw = "{\"ok\":true,\"channel\":\"telegram\",\"action\":\"set\",\"image\":{\"enabled\":true,\"provider\":\"dashscope\",\"models\":[{\"provider\":\"dashscope\",\"model\":\"qwen-vl-max\"}]}}"
+        let raw = "{\"ok\":true,\"channel\":\"telegram\",\"action\":\"set\",\"image\":{\"enabled\":true,\"provider\":\"dashscope\",\"models\":[{\"provider\":\"dashscope\",\"model\":\"qwen3.6-plus\"}]}}"
         let out = gatewayFormatCommandOutput(raw)
         @Expect(out.contains("Image understanding configuration updated"), true)
         @Expect(out.contains("Channel: telegram"), true)
-        @Expect(out.contains("dashscope:qwen-vl-max"), true)
+        @Expect(out.contains("dashscope:qwen3.6-plus"), true)
         @Expect(out.contains("\"image\""), false)
         @Expect(out.contains("{"), false)
     }

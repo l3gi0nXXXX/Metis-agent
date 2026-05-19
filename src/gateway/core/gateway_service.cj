@@ -2,6 +2,7 @@ package metis.gateway.core
 
 import metis.core.{GatewayToolRuntimeContext, gatewaySpeechResolveDeliveryPrefs, gatewaySpeechResolveTtsConfig, gatewaySpeechTtsSynthesize, gatewayWithToolRuntimeContext, renderGatewayTopicEditText}
 import metis.core.config.{CliConfig, CliSettingManager, GatewayUserSettings, MetisConfigManager, MetisPaths, cliFindModelAuthChoicesForProvider, cliSetupVisibleModelProviders}
+import metis.core.model.{findModelCapabilityCatalogEntry, modelCapabilityCatalogEntriesForProvider}
 import metis.core.skills.SkillsPrompt
 import metis.gateway.model.*
 import metis.gateway.security.gatewayPairingAccountStore
@@ -3575,6 +3576,20 @@ public class GatewayService {
         }
     }
 
+    private func telegramAddModelIdCandidate(out: ArrayList<String>, modelId: String): Unit {
+        let normalized = modelId.trimAscii()
+        if (!normalized.isEmpty() && !out.contains(normalized)) {
+            out.add(normalized)
+        }
+    }
+
+    private func telegramModelInputLabel(provider: String, model: String): String {
+        match (findModelCapabilityCatalogEntry(provider, model)) {
+            case Some(entry) => " [${String.join(entry.input, delimiter: ",")}]"
+            case None => ""
+        }
+    }
+
     private func telegramModelCandidatesForProvider(provider: String, current: String): Array<String> {
         let normalizedProvider = provider.trimAscii().toAsciiLower()
         let out = ArrayList<String>()
@@ -3585,6 +3600,9 @@ public class GatewayService {
         }
         for (choice in cliFindModelAuthChoicesForProvider(normalizedProvider)) {
             this.telegramAddModelCandidate(out, normalizedProvider, choice.defaultModelRef)
+        }
+        for (entry in modelCapabilityCatalogEntriesForProvider(normalizedProvider)) {
+            this.telegramAddModelIdCandidate(out, entry.model)
         }
         this.telegramAddModelCandidate(out, normalizedProvider, current)
         out.toArray()
@@ -3718,7 +3736,7 @@ public class GatewayService {
                 let model = models[idx]
                 let ref = "${normalizedProvider}:${model}"
                 let mark = if (ref == current.trimAscii()) { " *current*" } else { "" }
-                lines.add("- ${normalizedProvider}/${model}${mark}")
+                lines.add("- ${normalizedProvider}/${model}${this.telegramModelInputLabel(normalizedProvider, model)}${mark}")
             }
             lines.add("Back: /models")
             lines.add("Switch: /model <provider/model>")
@@ -3735,7 +3753,7 @@ public class GatewayService {
             let mark = if (ref == current.trimAscii()) { " ✓" } else { "" }
             let data = "models:setidx:${normalizedProvider}:${effectivePage}:${idx - start}"
             if (this.telegramModelCallbackFits(data)) {
-                lines.add("button=${model}${mark}|callback:${data}")
+                lines.add("button=${model}${this.telegramModelInputLabel(normalizedProvider, model)}${mark}|callback:${data}")
             }
         }
         if (totalPages > 1) {

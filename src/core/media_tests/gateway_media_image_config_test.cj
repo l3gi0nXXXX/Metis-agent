@@ -60,20 +60,20 @@ public class GatewayMediaImageConfigTest {
     @TestCase
     public func sharedImageConfigIsUsedForChannelsAndDefaultsAreFilled(): Unit {
         var user = GatewayUserSettings()
-        user.media.image = imageUnderstandingConfig("qwen", "qwen-vl-max", providerId: "shared-qwen")
+        user.media.image = imageUnderstandingConfig("qwen", "qwen3.6-plus", providerId: "shared-qwen")
 
         let resolved = gatewayMediaResolveImageConfig(user, channel: "feishu")
 
         @Expect(imageUnderstandingTestString(resolved, "provider"), "shared-qwen")
         @Expect(imageUnderstandingTestBool(resolved, "enabled"), true)
-        @Expect(imageUnderstandingTestString(imageUnderstandingTestObject(imageUnderstandingTestObject(resolved, "providers"), "shared-qwen"), "model"), "qwen-vl-max")
+        @Expect(imageUnderstandingTestString(imageUnderstandingTestObject(imageUnderstandingTestObject(resolved, "providers"), "shared-qwen"), "model"), "qwen3.6-plus")
         @Expect(resolved.get("models").getOrThrow().asArray().size(), 1)
     }
 
     @TestCase
     public func telegramImageOverrideDeepMergesSharedProvidersAndTransportContext(): Unit {
         var user = GatewayUserSettings()
-        user.media.image = imageUnderstandingConfig("qwen", "qwen-vl-max", providerId: "shared-qwen")
+        user.media.image = imageUnderstandingConfig("qwen", "qwen3.6-plus", providerId: "shared-qwen")
         user.telegram.image = imageUnderstandingConfig("openai", "gpt-4o", providerId: "telegram-openai")
         user.telegram.proxy = "http://user:secret@127.0.0.1:7897"
         user.telegram.network.envProxyEnabled = true
@@ -84,7 +84,7 @@ public class GatewayMediaImageConfigTest {
         let telegramProvider = imageUnderstandingTestObject(providers, "telegram-openai")
 
         @Expect(imageUnderstandingTestString(resolved, "provider"), "telegram-openai")
-        @Expect(imageUnderstandingTestString(imageUnderstandingTestObject(providers, "shared-qwen"), "model"), "qwen-vl-max")
+        @Expect(imageUnderstandingTestString(imageUnderstandingTestObject(providers, "shared-qwen"), "model"), "qwen3.6-plus")
         @Expect(imageUnderstandingTestString(telegramProvider, "model"), "gpt-4o")
         @Expect(imageUnderstandingTestString(telegramProvider, "proxy"), "http://user:secret@127.0.0.1:7897")
         @Expect(imageUnderstandingTestBool(telegramProvider, "envProxyEnabled"), true)
@@ -104,7 +104,7 @@ public class GatewayMediaImageConfigTest {
         try {
             CliConfig.model = "deepseek:deepseek-v4-pro"
             CliConfig.fallbackModels = ["openai:gpt-4o"]
-            CliConfig.imageModel = "dashscope:qwen-vl-max"
+            CliConfig.imageModel = "qwen/qwen3.6-plus"
             CliConfig.imageFallbackModels = ["openai:gpt-4.1"]
 
             let candidates = gatewayImageUnderstandingBuildCandidates(user, channel: "telegram")
@@ -112,13 +112,88 @@ public class GatewayMediaImageConfigTest {
             @Expect(candidates.size, 4)
             @Expect(candidates[0].modelRef, "custom:vision-x")
             @Expect(candidates[0].source, "gateway.media.image.models")
-            @Expect(candidates[1].modelRef, "dashscope:qwen-vl-max")
+            @Expect(candidates[1].modelRef, "dashscope:qwen3.6-plus")
             @Expect(candidates[1].source, "agents.defaults.imageModel.primary")
             @Expect(candidates[2].modelRef, "openai:gpt-4.1")
             @Expect(candidates[2].source, "agents.defaults.imageModel.fallbacks")
             @Expect(candidates[3].modelRef, "openai:gpt-4o")
             @Expect(candidates[3].source, "agents.defaults.model.fallbacks")
             @Expect(modelVisionSupportToString(candidates[3].decision.vision), "supported")
+        } finally {
+            if (oldModel.isEmpty()) {
+                CliConfig.clearPrimaryModelForTest()
+            } else {
+                CliConfig.model = oldModel
+            }
+            CliConfig.fallbackModels = oldFallbacks
+            if (oldImageModel.isEmpty()) {
+                CliConfig.clearImageModelForTest()
+            } else {
+                CliConfig.imageModel = oldImageModel
+            }
+            CliConfig.imageFallbackModels = oldImageFallbacks
+        }
+    }
+
+    @TestCase
+    public func qwenPrimaryModelIsImageCandidateWhenCatalogDeclaresImageInput(): Unit {
+        var user = GatewayUserSettings()
+
+        let oldModel = CliConfig.modelOrEmpty()
+        let oldFallbacks = CliConfig.fallbackModels
+        let oldImageModel = CliConfig.imageModelOrEmpty()
+        let oldImageFallbacks = CliConfig.imageFallbackModels
+        try {
+            CliConfig.model = "qwen/qwen3.6-plus"
+            CliConfig.fallbackModels = []
+            CliConfig.clearImageModelForTest()
+            CliConfig.imageFallbackModels = []
+
+            let candidates = gatewayImageUnderstandingBuildCandidates(user, channel: "telegram")
+
+            @Expect(candidates.size, 1)
+            @Expect(candidates[0].modelRef, "dashscope:qwen3.6-plus")
+            @Expect(candidates[0].source, "agents.defaults.model.primary")
+            @Expect(modelVisionSupportToString(candidates[0].decision.vision), "supported")
+        } finally {
+            if (oldModel.isEmpty()) {
+                CliConfig.clearPrimaryModelForTest()
+            } else {
+                CliConfig.model = oldModel
+            }
+            CliConfig.fallbackModels = oldFallbacks
+            if (oldImageModel.isEmpty()) {
+                CliConfig.clearImageModelForTest()
+            } else {
+                CliConfig.imageModel = oldImageModel
+            }
+            CliConfig.imageFallbackModels = oldImageFallbacks
+        }
+    }
+
+    @TestCase
+    public func unknownQwenImageModelIsRejectedNotExecutedByNameSubstring(): Unit {
+        var user = GatewayUserSettings()
+        let rejected = JsonArray([])
+
+        let oldModel = CliConfig.modelOrEmpty()
+        let oldFallbacks = CliConfig.fallbackModels
+        let oldImageModel = CliConfig.imageModelOrEmpty()
+        let oldImageFallbacks = CliConfig.imageFallbackModels
+        try {
+            CliConfig.clearPrimaryModelForTest()
+            CliConfig.fallbackModels = []
+            CliConfig.imageModel = "qwen/custom-vl-looking-name"
+            CliConfig.imageFallbackModels = []
+
+            let candidates = gatewayImageUnderstandingBuildCandidates(user, channel: "telegram", rejected: Some(rejected))
+
+            @Expect(candidates.size, 0)
+            @Expect(rejected.size(), 1)
+            let row = rejected[0].asObject()
+            @Expect(imageUnderstandingTestString(row, "modelRef"), "dashscope:custom-vl-looking-name")
+            @Expect(imageUnderstandingTestString(row, "status"), "unknown")
+            @Expect(imageUnderstandingTestString(imageUnderstandingTestObject(row, "capability"), "source"), "unknown")
         } finally {
             if (oldModel.isEmpty()) {
                 CliConfig.clearPrimaryModelForTest()

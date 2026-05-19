@@ -78,7 +78,7 @@ public class CliSettingManagerTest {
             model.put("primary", JsonString("deepseek/deepseek-v4-pro"))
             defaults.put("model", model)
             let imageModel = JsonObject()
-            imageModel.put("primary", JsonString("qwen/qwen-vl-max"))
+            imageModel.put("primary", JsonString("qwen/qwen3.6-plus"))
             imageModel.put("fallbacks", JsonArray([JsonString("openai/gpt-4o")]))
             defaults.put("imageModel", imageModel)
             agents.put("defaults", defaults)
@@ -88,7 +88,7 @@ public class CliSettingManagerTest {
             MetisConfigManager.applyPersistedFieldsToCliConfig()
 
             @Expect(CliConfig.modelOrEmpty(), "deepseek:deepseek-v4-pro")
-            @Expect(CliConfig.imageModelOrEmpty(), "dashscope:qwen-vl-max")
+            @Expect(CliConfig.imageModelOrEmpty(), "dashscope:qwen3.6-plus")
             @Expect(CliConfig.imageFallbackModels[0], "openai:gpt-4o")
             CliConfig.model = oldModel
             CliConfig.imageModel = oldImageModel

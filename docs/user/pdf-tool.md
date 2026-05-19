@@ -14,7 +14,7 @@ Add a dedicated PDF model when you want PDF analysis to use a model separate fro
     "defaults": {
       "pdfModel": {
         "primary": "anthropic/claude-sonnet-4-5",
-        "fallbacks": ["qwen/qwen-vl-max"]
+        "fallbacks": ["qwen/qwen3.6-plus"]
       },
       "pdfMaxBytesMb": 10,
       "pdfMaxPages": 20

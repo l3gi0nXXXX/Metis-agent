@@ -82,6 +82,10 @@ public class CliappCommandSupportTest {
         @Expect(provider.contains("openai/"), true)
         @Expect(provider.contains("Back: /models"), true)
         @Expect(provider.contains("Switch: metis models set <provider/model>"), true)
+
+        let qwen = programSupportRenderModelsProviderModels("qwen", 1)
+        @Expect(qwen.contains("qwen/qwen3.6-plus [text,image]"), true)
+        @Expect(qwen.contains("qwen/qwen3-coder-plus [text]"), true)
     }
 
     @TestCase
