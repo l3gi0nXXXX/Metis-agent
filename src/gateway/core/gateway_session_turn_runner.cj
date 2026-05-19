@@ -4,6 +4,7 @@ import metis.core.{GatewayToolRuntimeContext, gatewayMediaUnderstandingFirstText
 import metis.core.config.{CliSettingManager, GatewayUserSettings}
 import metis.gateway.session.{GatewaySessionContext, GatewaySessionRequest}
 import std.collection.ArrayList
+import std.convert.Parsable
 import std.fs.{Path, exists}
 import stdx.encoding.json.{JsonArray, JsonObject, JsonString}
 
@@ -18,6 +19,18 @@ private func gatewayJsonBool(obj: JsonObject, key: String): Bool {
     match (obj.get(key)) {
         case Some(v) => try { v.asBool().getValue() } catch (_e: Exception) { false }
         case None => false
+    }
+}
+
+private func gatewayJsonInt(obj: JsonObject, key: String, fallback: Int64): Int64 {
+    match (obj.get(key)) {
+        case Some(v) =>
+            try {
+                v.asInt().getValue()
+            } catch (_: Exception) {
+                try { Int64.parse(v.asString().getValue().trimAscii()) } catch (_inner: Exception) { fallback }
+            }
+        case None => fallback
     }
 }
 
@@ -42,7 +55,191 @@ private func gatewayMediaReadableTextMime(mime: String, fileName: String): Bool 
         normalizedName.endsWith(".cj") ||
         normalizedName.endsWith(".ts") ||
         normalizedName.endsWith(".js") ||
-        normalizedName.endsWith(".py")
+    normalizedName.endsWith(".py")
+}
+
+private func gatewayMediaPromptFirstString(record: JsonObject, keys: Array<String>): String {
+    for (key in keys) {
+        let value = gatewayJsonString(record, key)
+        if (!value.isEmpty()) {
+            return value
+        }
+    }
+    ""
+}
+
+private func gatewayMediaPromptCapabilityForRecord(kind: String, mime: String): String {
+    let normalizedKind = kind.trimAscii().toAsciiLower()
+    let normalizedMime = mime.trimAscii().toAsciiLower()
+    if (normalizedKind == "voice" || normalizedKind == "audio" || normalizedMime.startsWith("audio/")) {
+        return "audio"
+    }
+    if (normalizedKind == "video" || normalizedKind == "video-note" || normalizedKind == "video_note" || normalizedMime.startsWith("video/")) {
+        return "video"
+    }
+    if (normalizedKind == "photo" || normalizedKind == "image" || normalizedMime.startsWith("image/")) {
+        return "image"
+    }
+    if (normalizedKind == "sticker") {
+        return "sticker"
+    }
+    if (normalizedKind == "document" || !normalizedMime.isEmpty()) {
+        return "document"
+    }
+    "unknown"
+}
+
+private func gatewayMediaPromptNormalizeStatus(raw: String): String {
+    let normalized = raw.trimAscii().toAsciiLower()
+    match (normalized) {
+        case "analyzed" | "transcribed" => "ok"
+        case "metadata-only" => "metadata_only"
+        case _ => normalized
+    }
+}
+
+private func gatewayMediaPromptTerminalStatus(status: String): Bool {
+    let normalized = gatewayMediaPromptNormalizeStatus(status)
+    normalized == "ok" ||
+        normalized == "provider_error" ||
+        normalized == "not_configured" ||
+        normalized == "unsupported" ||
+        normalized == "too_large" ||
+        normalized == "timeout" ||
+        normalized == "disabled" ||
+        normalized == "not_found" ||
+        normalized == "metadata_only" ||
+        normalized == "runtime_unavailable" ||
+        normalized == "extractor_error" ||
+        normalized == "extractor_failed" ||
+        normalized == "extractor_timeout" ||
+        normalized == "extractor_invalid_output" ||
+        normalized == "extractor_output_too_large" ||
+        normalized == "unsupported_images"
+}
+
+private func gatewayMediaPromptRecordStatus(record: JsonObject, capability: String): String {
+    let direct = gatewayMediaPromptNormalizeStatus(gatewayMediaPromptFirstString(record, ["mediaUnderstandingStatus", "understandingStatus"]))
+    if (!direct.isEmpty() && direct != "downloaded") {
+        return direct
+    }
+    match (capability) {
+        case "audio" => return gatewayMediaPromptNormalizeStatus(gatewayMediaPromptFirstString(record, ["asrStatus", "ASRStatus"]))
+        case "image" | "sticker" => return gatewayMediaPromptNormalizeStatus(gatewayMediaPromptFirstString(record, ["visionStatus"]))
+        case "video" => return gatewayMediaPromptNormalizeStatus(gatewayMediaPromptFirstString(record, ["videoUnderstandingStatus"]))
+        case "document" => return gatewayMediaPromptNormalizeStatus(gatewayMediaPromptFirstString(record, ["documentExtractStatus"]))
+        case _ => ()
+    }
+    if (direct == "downloaded") {
+        return ""
+    }
+    direct
+}
+
+private func gatewayMediaPromptCachedText(record: JsonObject, capability: String): String {
+    match (capability) {
+        case "audio" => return gatewayMediaPromptFirstString(record, ["transcript", "asrTranscript", "audioTranscript"])
+        case "image" => return gatewayMediaPromptFirstString(record, ["analysis", "description", "imageDescription"])
+        case "sticker" => return gatewayMediaPromptFirstString(record, ["stickerDescription", "analysis", "description"])
+        case "video" => return gatewayMediaPromptFirstString(record, ["videoDescription", "description", "analysis"])
+        case "document" => return gatewayMediaPromptFirstString(record, ["documentTextPreview", "documentPreview", "preview", "filePreview"])
+        case _ => return gatewayMediaPromptFirstString(record, ["analysis", "description", "transcript", "documentTextPreview", "preview"])
+    }
+}
+
+private func gatewayMediaPromptCachedOutputKind(capability: String): String {
+    match (capability) {
+        case "audio" => "audio.transcription"
+        case "sticker" => "sticker.description"
+        case "image" => "image.description"
+        case "video" => "video.description"
+        case "document" => "document.text"
+        case _ => "media.description"
+    }
+}
+
+private func gatewayMediaPromptCopyFields(source: JsonObject, target: JsonObject, keys: Array<String>): Unit {
+    for (key in keys) {
+        match (source.get(key)) {
+            case Some(v) => target.put(key, v)
+            case None => ()
+        }
+    }
+}
+
+private func gatewayMediaPromptCachedUnderstanding(record: JsonObject, kind: String, mime: String): JsonObject {
+    let capability = gatewayMediaPromptFirstString(record, ["mediaUnderstandingCapability", "understandingCapability"])
+    let resolvedCapability = if (capability.isEmpty()) { gatewayMediaPromptCapabilityForRecord(kind, mime) } else { capability.toAsciiLower() }
+    let status = gatewayMediaPromptRecordStatus(record, resolvedCapability)
+    let text = gatewayMediaPromptCachedText(record, resolvedCapability)
+    if (status.isEmpty() && text.isEmpty()) {
+        return JsonObject()
+    }
+    if (!status.isEmpty() && !gatewayMediaPromptTerminalStatus(status) && text.isEmpty()) {
+        return JsonObject()
+    }
+    let out = JsonObject()
+    let effectiveStatus = if (!text.isEmpty() && (status.isEmpty() || status == "analyzed" || status == "transcribed")) { "ok" } else { status }
+    out.put("status", JsonString(if (effectiveStatus.isEmpty()) { "ok" } else { effectiveStatus }))
+    out.put("capability", JsonString(resolvedCapability))
+    if (!text.isEmpty()) {
+        let item = JsonObject()
+        item.put("kind", JsonString(gatewayMediaPromptCachedOutputKind(resolvedCapability)))
+        item.put("text", JsonString(text))
+        item.put("source", JsonString("media_record_cache"))
+        out.put("outputs", JsonArray([item]))
+        match (resolvedCapability) {
+            case "audio" => out.put("transcript", JsonString(text))
+            case "sticker" => out.put("stickerDescription", JsonString(text))
+            case "image" => out.put("imageDescription", JsonString(text))
+            case "video" => out.put("videoDescription", JsonString(text))
+            case "document" => out.put("documentTextPreview", JsonString(text))
+            case _ => out.put("analysis", JsonString(text))
+        }
+    }
+    let error = gatewayMediaPromptFirstString(record, ["mediaUnderstandingError", "understandingError", "error"])
+    if (!error.isEmpty()) {
+        out.put("error", JsonString(error))
+    }
+    gatewayMediaPromptCopyFields(record, out, [
+        "fileBytes",
+        "limitBytes",
+        "mediaFileBytes",
+        "mediaLimitBytes",
+        "mediaLimitSource",
+        "mediaUnderstandingStage",
+        "mediaUnderstandingFileBytes",
+        "mediaUnderstandingLimitBytes",
+        "provider",
+        "model",
+        "attempts"
+    ])
+    out
+}
+
+private func gatewayMediaPromptEffectiveMaxBytes(record: JsonObject): Int64 {
+    for (key in ["mediaUnderstandingLimitBytes", "mediaLimitBytes", "mediaMaxBytes", "limitBytes", "maxBytes"]) {
+        let value = gatewayJsonInt(record, key, -1)
+        if (value > 0) {
+            return value
+        }
+    }
+    -1
+}
+
+private func gatewayMediaPromptUnderstandingForRecord(record: JsonObject, user: GatewayUserSettings, kind: String, mime: String, downloaded: Bool, localPath: String): JsonObject {
+    let cached = gatewayMediaPromptCachedUnderstanding(record, kind, mime)
+    if (cached.size() > 0) {
+        return cached
+    }
+    if (!(downloaded && !localPath.isEmpty() && exists(Path(localPath)))) {
+        return JsonObject()
+    }
+    let maxBytes = gatewayMediaPromptEffectiveMaxBytes(record)
+    if (maxBytes > 0) {
+        return gatewayMediaUnderstandingForRecordWithSettings(record, user, maxBytes: maxBytes)
+    }
+    gatewayMediaUnderstandingForRecordWithSettings(record, user)
 }
 
 private func gatewayMediaContextStructuredSummary(mediaContext: JsonObject): String {
@@ -125,11 +322,7 @@ public func gatewayBuildMediaContextPromptForUser(mediaContext: JsonObject, user
         let relation = gatewayJsonString(record, "relation")
         let downloaded = gatewayJsonBool(record, "downloaded")
         let skipped = gatewayJsonString(record, "skippedReason")
-        let understanding = if (downloaded && !localPath.isEmpty() && exists(Path(localPath))) {
-            gatewayMediaUnderstandingForRecordWithSettings(record, user)
-        } else {
-            JsonObject()
-        }
+        let understanding = gatewayMediaPromptUnderstandingForRecord(record, user, kind, mime, downloaded, localPath)
         let understandingStatus = gatewayJsonString(understanding, "status")
         let understandingCapability = gatewayJsonString(understanding, "capability")
         if (!understandingStatus.isEmpty()) {
@@ -142,6 +335,19 @@ public func gatewayBuildMediaContextPromptForUser(mediaContext: JsonObject, user
         if (!understandingError.isEmpty()) {
             record.put("mediaUnderstandingError", JsonString(understandingError))
         }
+        gatewayMediaPromptCopyFields(understanding, record, [
+            "fileBytes",
+            "limitBytes",
+            "mediaFileBytes",
+            "mediaLimitBytes",
+            "mediaLimitSource",
+            "mediaUnderstandingStage",
+            "mediaUnderstandingFileBytes",
+            "mediaUnderstandingLimitBytes",
+            "provider",
+            "model",
+            "attempts"
+        ])
         let understandingText = gatewayMediaUnderstandingFirstText(understanding)
         let transcript = if (understandingCapability == "audio") { understandingText } else { "" }
         let imageDescription = if (understandingCapability == "image") { understandingText } else { "" }

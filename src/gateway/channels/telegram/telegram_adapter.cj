@@ -4420,6 +4420,8 @@ public class TelegramAdapter <: ChannelAdapter {
         var skippedReason = ""
         var effectiveMime = info.mimeType.trimAscii().toAsciiLower()
         var effectiveSize = info.fileSize
+        var observedFileBytes = effectiveSize
+        let mediaMaxBytes = this.effectiveMediaMaxBytes()
         if (!this.config.media.downloadEnabled) {
             skippedReason = "download_disabled"
         } else if (!this.mediaMimeAllowed(effectiveMime)) {
@@ -4438,6 +4440,7 @@ public class TelegramAdapter <: ChannelAdapter {
                 let getFileSize = this.parseTelegramFileSize(resolvedGetFileRaw)
                 if (getFileSize > 0) {
                     effectiveSize = getFileSize
+                    observedFileBytes = getFileSize
                 }
             }
             if (this.mediaSizeExceedsLimit(effectiveSize)) {
@@ -4451,6 +4454,7 @@ public class TelegramAdapter <: ChannelAdapter {
                     this.tryTelegramDownloadFile(filePath)
                 }
                 if (!resolvedDownloadRaw.isEmpty()) {
+                    observedFileBytes = Int64(resolvedDownloadRaw.size)
                     if (this.mediaSizeExceedsLimit(Int64(resolvedDownloadRaw.size))) {
                         skippedReason = "download_size_limit_exceeded"
                     } else {
@@ -4477,6 +4481,7 @@ public class TelegramAdapter <: ChannelAdapter {
         )
         let eligibleFor = this.telegramMediaEligibility(info)
         let relativePath = this.relativeTelegramMediaPath(downloadPath)
+        let downloadStatus = this.telegramMediaDownloadStatus(downloaded, skippedReason, filePath)
 
         let lastMedia = JsonObject()
         lastMedia.put("mediaId", JsonString(mediaId))
@@ -4494,6 +4499,7 @@ public class TelegramAdapter <: ChannelAdapter {
         lastMedia.put("originalFileName", JsonString(info.fileName))
         lastMedia.put("mimeType", JsonString(effectiveMime))
         lastMedia.put("fileSize", effectiveSize.toJsonValue())
+        lastMedia.put("fileBytes", observedFileBytes.toJsonValue())
         lastMedia.put("fileName", JsonString(info.fileName))
         lastMedia.put("mediaGroupId", JsonString(info.mediaGroupId))
         lastMedia.put("albumPolicy", JsonString(this.effectiveMediaAlbumPolicy()))
@@ -4508,15 +4514,41 @@ public class TelegramAdapter <: ChannelAdapter {
         lastMedia.put("downloaded", downloaded.toJsonValue())
         lastMedia.put("downloadPath", JsonString(downloadPath))
         lastMedia.put("skippedReason", JsonString(skippedReason))
+        lastMedia.put("mediaMaxBytes", mediaMaxBytes.toJsonValue())
+        lastMedia.put("limitBytes", mediaMaxBytes.toJsonValue())
+        lastMedia.put("mediaFileBytes", observedFileBytes.toJsonValue())
+        lastMedia.put("mediaLimitBytes", mediaMaxBytes.toJsonValue())
+        lastMedia.put("mediaLimitSource", JsonString("telegram-download"))
+        lastMedia.put("downloadStage", JsonString("telegram-download"))
+        lastMedia.put("downloadStatus", JsonString(downloadStatus))
+        lastMedia.put("downloadReason", JsonString(skippedReason))
+        lastMedia.put("mediaUnderstandingStage", JsonString("telegram-download"))
+        lastMedia.put("mediaUnderstandingStatus", JsonString(downloadStatus))
+        lastMedia.put("mediaUnderstandingLimitBytes", mediaMaxBytes.toJsonValue())
+        lastMedia.put("mediaUnderstandingFileBytes", observedFileBytes.toJsonValue())
+        this.putTelegramMediaStage(
+            lastMedia,
+            "download",
+            this.telegramMediaStageState(
+                "telegram-download",
+                downloadStatus,
+                reason: skippedReason,
+                fileBytes: observedFileBytes,
+                limitBytes: mediaMaxBytes
+            )
+        )
         lastMedia.put("eligibleFor", JsonString(eligibleFor))
         let transcript = this.tryTranscribeTelegramMedia(normalizedKind, downloadPath, effectiveMime)
         if (!transcript.isEmpty()) {
             lastMedia.put("transcript", JsonString(transcript))
             lastMedia.put("asrStatus", JsonString("transcribed"))
         }
-        this.applyTelegramMediaUnderstandingPreflight(lastMedia, normalizedKind)
+        if (downloaded) {
+            this.applyTelegramMediaUnderstandingPreflight(lastMedia, normalizedKind)
+        }
         lastMedia.put("createdAtMs", createdAtMs.toJsonValue())
         lastMedia.put("persistedAtMs", createdAtMs.toJsonValue())
+        this.logTelegramMediaStage(lastMedia, "download")
         let root = this.readMediaState()
         let records = this.readMediaRecords(root)
         records.add(lastMedia)
@@ -4532,6 +4564,89 @@ public class TelegramAdapter <: ChannelAdapter {
         root.put("records", records)
         File.writeTo(this.mediaStatePath(), root.toJsonString().toArray())
         root
+    }
+
+    private func telegramMediaDownloadStatus(downloaded: Bool, skippedReason: String, filePath: String): String {
+        if (downloaded) {
+            return "downloaded"
+        }
+        if (!skippedReason.trimAscii().isEmpty()) {
+            return "skipped"
+        }
+        if (!filePath.trimAscii().isEmpty()) {
+            return "not_downloaded"
+        }
+        "metadata_only"
+    }
+
+    private func telegramMediaStageState(
+        stage: String,
+        status: String,
+        reason!: String = "",
+        fileBytes!: Int64 = 0,
+        limitBytes!: Int64 = 0,
+        capability!: String = "",
+        provider!: String = "",
+        model!: String = ""
+    ): JsonObject {
+        let out = JsonObject()
+        out.put("stage", JsonString(stage.trimAscii()))
+        out.put("status", JsonString(status.trimAscii()))
+        if (!reason.trimAscii().isEmpty()) {
+            out.put("reason", JsonString(reason.trimAscii()))
+        }
+        out.put("fileBytes", fileBytes.toJsonValue())
+        out.put("limitBytes", limitBytes.toJsonValue())
+        if (!capability.trimAscii().isEmpty()) {
+            out.put("capability", JsonString(capability.trimAscii()))
+        }
+        if (!provider.trimAscii().isEmpty()) {
+            out.put("provider", JsonString(this.redactTelegramSensitive(provider.trimAscii())))
+        }
+        if (!model.trimAscii().isEmpty()) {
+            out.put("model", JsonString(this.redactTelegramSensitive(model.trimAscii())))
+        }
+        out
+    }
+
+    private func telegramMediaStages(record: JsonObject): JsonObject {
+        match (record.get("mediaStages")) {
+            case Some(v) => try { v.asObject() } catch (_e: Exception) { JsonObject() }
+            case None => JsonObject()
+        }
+    }
+
+    private func putTelegramMediaStage(record: JsonObject, key: String, stage: JsonObject): Unit {
+        let stages = this.telegramMediaStages(record)
+        stages.put(key.trimAscii(), stage)
+        record.put("mediaStages", stages)
+    }
+
+    private func logTelegramMediaStage(record: JsonObject, stageKey: String): Unit {
+        let normalizedStage = stageKey.trimAscii()
+        let stage = match (this.telegramMediaStages(record).get(normalizedStage)) {
+            case Some(v) => try { v.asObject() } catch (_e: Exception) { JsonObject() }
+            case None => JsonObject()
+        }
+        let status = this.readStringField(stage, "status").trimAscii()
+        let extra = JsonObject()
+        extra.put("mediaId", record.get("mediaId") ?? JsonString(""))
+        extra.put("mediaKind", record.get("mediaKind") ?? JsonString(""))
+        extra.put("stage", stage.get("stage") ?? JsonString(normalizedStage))
+        extra.put("status", JsonString(if (status.isEmpty()) { "unknown" } else { status }))
+        extra.put("fileBytes", stage.get("fileBytes") ?? 0.toJsonValue())
+        extra.put("limitBytes", stage.get("limitBytes") ?? 0.toJsonValue())
+        extra.put("capability", stage.get("capability") ?? JsonString(""))
+        extra.put("provider", stage.get("provider") ?? JsonString(""))
+        extra.put("model", stage.get("model") ?? JsonString(""))
+        this.logChannel(
+            "debug",
+            MetisLogEvent.messageInbound,
+            "media-${normalizedStage}",
+            if (status.isEmpty()) { "unknown" } else { status },
+            "Telegram media stage state",
+            extra: extra
+        )
     }
 
     private func applyTelegramMediaUnderstandingPreflight(record: JsonObject, kind: String): Unit {
@@ -4553,10 +4668,38 @@ public class TelegramAdapter <: ChannelAdapter {
         let downloaded = this.readBoolFieldOpt(record, "downloaded") == Some(true)
         let understanding = gatewayMediaUnderstandingForRecord(record, capability: capability, maxBytes: this.effectiveMediaMaxBytes())
         let status = this.readStringField(understanding, "status").trimAscii()
+        let error = this.readStringField(understanding, "error").trimAscii()
+        let fileBytes = this.readJsonIntField(understanding, "fileBytes", this.readJsonIntField(record, "mediaFileBytes", 0))
+        let limitBytes = this.readJsonIntField(understanding, "limitBytes", this.effectiveMediaMaxBytes())
+        let provider = this.readStringField(understanding, "provider").trimAscii()
+        let model = this.readStringField(understanding, "model").trimAscii()
         if (!status.isEmpty()) {
             record.put("understandingStatus", JsonString(status))
+            record.put("mediaUnderstandingStatus", JsonString(status))
         }
+        record.put("mediaUnderstandingStage", JsonString("telegram-preflight"))
         record.put("understandingCapability", JsonString(capability))
+        record.put("mediaUnderstandingCapability", JsonString(capability))
+        record.put("mediaUnderstandingLimitBytes", limitBytes.toJsonValue())
+        record.put("mediaUnderstandingFileBytes", fileBytes.toJsonValue())
+        if (!error.isEmpty()) {
+            record.put("mediaUnderstandingError", JsonString(this.redactTelegramSensitive(error)))
+        }
+        this.putTelegramMediaStage(
+            record,
+            "understanding",
+            this.telegramMediaStageState(
+                "telegram-preflight",
+                if (status.isEmpty()) { "unknown" } else { status },
+                reason: error,
+                fileBytes: fileBytes,
+                limitBytes: limitBytes,
+                capability: capability,
+                provider: provider,
+                model: model
+            )
+        )
+        this.logTelegramMediaStage(record, "understanding")
         match (understanding.get("outputs")) {
             case Some(v) => record.put("understandingOutputs", v)
             case None => ()

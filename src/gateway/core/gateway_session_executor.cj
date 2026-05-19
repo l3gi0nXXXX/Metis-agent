@@ -6,6 +6,7 @@ import metis.core.config.{CliConfig, CliSettingManager}
 import metis.gateway.session.GatewaySessionContext
 
 import std.core.Duration
+import std.convert.Parsable
 import std.fs.{Directory, File, Path, exists}
 import std.time.DateTime
 import stdx.encoding.json.{JsonArray, JsonBool, JsonInt, JsonObject, JsonString, JsonValue}
@@ -138,6 +139,18 @@ private func gatewaySessionJsonString(obj: JsonObject, key: String): String {
     }
 }
 
+private func gatewaySessionJsonInt(obj: JsonObject, key: String, fallback: Int64): Int64 {
+    match (obj.get(key)) {
+        case Some(v) =>
+            try {
+                v.asInt().getValue()
+            } catch (_: Exception) {
+                try { Int64.parse(v.asString().getValue().trimAscii()) } catch (_inner: Exception) { fallback }
+            }
+        case None => fallback
+    }
+}
+
 private func gatewaySessionMediaRecords(mediaContext: JsonObject): JsonArray {
     match (mediaContext.get("records")) {
         case Some(v) => try { v.asArray() } catch (_: Exception) { JsonArray([]) }
@@ -164,6 +177,49 @@ private func gatewayMediaFallbackStatusMessage(status: String): String {
         case "timeout" => "图片解析服务超时。"
         case _ => ""
     }
+}
+
+private func gatewayMediaFallbackLimitLabel(bytes: Int64): String {
+    if (bytes <= 0) {
+        return ""
+    }
+    if (bytes < 1024) {
+        return "${bytes} bytes"
+    }
+    if (bytes < 1024 * 1024) {
+        return "${(bytes + 1023) / 1024}KB"
+    }
+    "${(bytes + 1024 * 1024 - 1) / (1024 * 1024)}MB"
+}
+
+private func gatewayMediaFallbackTooLargeStatusMessage(record: JsonObject): String {
+    let source = gatewaySessionJsonString(record, "mediaLimitSource").toAsciiLower()
+    let stage = gatewaySessionJsonString(record, "mediaUnderstandingStage").toAsciiLower()
+    let reason = gatewaySessionJsonString(record, "skippedReason").toAsciiLower()
+    let limit = if (gatewaySessionJsonInt(record, "mediaLimitBytes", -1) > 0) {
+        gatewaySessionJsonInt(record, "mediaLimitBytes", -1)
+    } else if (gatewaySessionJsonInt(record, "limitBytes", -1) > 0) {
+        gatewaySessionJsonInt(record, "limitBytes", -1)
+    } else {
+        gatewaySessionJsonInt(record, "mediaUnderstandingLimitBytes", -1)
+    }
+    let label = gatewayMediaFallbackLimitLabel(limit)
+    let suffix = if (label.isEmpty()) { "" } else { "最大支持 ${label}。" }
+    if (
+        source == "telegram-download" ||
+        stage == "telegram-download" ||
+        reason == "size_limit_exceeded" ||
+        reason == "download_size_limit_exceeded"
+    ) {
+        return if (suffix.isEmpty()) { "文件过大，无法下载。" } else { "文件过大，${suffix}" }
+    }
+    if (source == "native-vision" || stage == "native-vision-load") {
+        return if (suffix.isEmpty()) { "图片超过当前模型图片输入上限。" } else { "图片超过当前模型图片输入上限，${suffix}" }
+    }
+    if (source == "media-understanding" || stage == "telegram-preflight" || stage == "session-context") {
+        return if (suffix.isEmpty()) { "图片超过图片理解模型输入上限。" } else { "图片超过图片理解模型输入上限，${suffix}" }
+    }
+    "图片过大，无法解析。"
 }
 
 private func gatewayMediaFallbackRedactAfterMarker(raw: String, marker: String): String {
@@ -209,14 +265,15 @@ private func gatewayMediaFailureFallbackText(toolRuntimeContext: Option<GatewayT
             continue
         }
         let base = gatewayMediaFallbackStatusMessage(status)
-        if (base.isEmpty()) {
+        let message = if (status == "too_large") { gatewayMediaFallbackTooLargeStatusMessage(record) } else { base }
+        if (message.isEmpty()) {
             continue
         }
         let detail = gatewayMediaFallbackRedactDetail(gatewaySessionJsonString(record, "mediaUnderstandingError"))
         if (status == "provider_error" && !detail.isEmpty()) {
-            return "${base}诊断：${detail}"
+            return "${message}诊断：${detail}"
         }
-        return base
+        return message
     }
     ""
 }

@@ -174,6 +174,13 @@ private func mediaAsrString(obj: JsonObject, key: String): String {
     }
 }
 
+private func mediaAsrInt(obj: JsonObject, key: String): Int64 {
+    match (obj.get(key)) {
+        case Some(v) => try { v.asInt().getValue() } catch (_: Exception) { -1 }
+        case None => -1
+    }
+}
+
 @Test
 public class GatewayMediaUnderstandingRuntimeTest {
     @TestCase
@@ -566,6 +573,49 @@ public class GatewayMediaUnderstandingRuntimeTest {
                 CliConfig.imageModel = oldImageModel
             }
             CliConfig.imageFallbackModels = oldImageFallbacks
+            try { remove(root, recursive: true) } catch (_: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func downloadedTelegramImageUsesRecordMediaMaxBytesInsteadOfDefault8192(): Unit {
+        let root = mediaAsrTestTempRoot("image-record-limit")
+        let image = root.join("image.jpg")
+        File.writeTo(image, Array<Byte>(9000, repeat: 65))
+        let record = mediaImageTestRecord(image.toString())
+        record.put("mediaMaxBytes", JsonString("20971520"))
+        setGatewayMediaVisionRunnerForTest(Some({ _path: String, _mime: String, _kind: String, _prompt: String, maxBytes: Int64 =>
+            @Expect(maxBytes, 20971520)
+            "record limit image description"
+        }))
+        try {
+            let result = gatewayMediaUnderstandingForRecordWithSettings(record, GatewayUserSettings(), capability: "image")
+
+            @Expect(mediaAsrString(result, "status"), "ok")
+            @Expect(mediaAsrString(result, "imageDescription"), "record limit image description")
+            @Expect(mediaAsrString(result, "status") == "too_large", false)
+        } finally {
+            setGatewayMediaVisionRunnerForTest(None<(String, String, String, String, Int64) -> String>)
+            try { remove(root, recursive: true) } catch (_: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func imageTooLargeResultIncludesDiagnosticLimitSourceFields(): Unit {
+        let root = mediaAsrTestTempRoot("image-too-large-diagnostics")
+        let image = root.join("image.jpg")
+        File.writeTo(image, Array<Byte>(9000, repeat: 65))
+        try {
+            let result = gatewayMediaUnderstandingForRecordWithSettings(mediaImageTestRecord(image.toString()), GatewayUserSettings(), capability: "image")
+
+            @Expect(mediaAsrString(result, "status"), "too_large")
+            @Expect(mediaAsrInt(result, "mediaFileBytes"), 9000)
+            @Expect(mediaAsrInt(result, "mediaLimitBytes"), 8192)
+            @Expect(mediaAsrString(result, "mediaLimitSource"), "media-understanding")
+            @Expect(mediaAsrString(result, "mediaUnderstandingStage"), "session-context")
+            @Expect(mediaAsrInt(result, "fileBytes"), 9000)
+            @Expect(mediaAsrInt(result, "limitBytes"), 8192)
+        } finally {
             try { remove(root, recursive: true) } catch (_: Exception) { () }
         }
     }

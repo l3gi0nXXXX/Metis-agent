@@ -11,7 +11,7 @@ import std.env.{getVariable, setVariable}
 import std.fs.{Directory, File, Path, remove}
 import std.time.DateTime
 import std.unittest.testmacro.*
-import stdx.encoding.json.{JsonArray, JsonBool, JsonObject, JsonString}
+import stdx.encoding.json.{JsonArray, JsonBool, JsonInt, JsonObject, JsonString}
 
 private func gatewaySessionTurnTtsTestHome(label: String): String {
     "/tmp/metis-gateway-session-turn-tts-${label}-${DateTime.now().toUnixTimeStamp().toMilliseconds()}"
@@ -415,6 +415,134 @@ public class GatewaySessionTurnRunnerTest {
         } finally {
             setGatewayAgentBridgeReplyRunnerForTest(None<(String, String, String, String, Bool, Option<(String) -> Unit>) -> String>)
             try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func telegramImageDownloadTooLargeFallbackKeepsDownloadLimitSeparate(): Unit {
+        let sentTexts = ArrayList<String>()
+        let mediaContext = gatewaySessionTurnImageMediaContext(
+            "",
+            status: "too_large"
+        )
+        let record = mediaContext.get("records").getOrThrow().asArray()[0].asObject()
+        record.put("downloaded", JsonBool(false))
+        record.put("skippedReason", JsonString("size_limit_exceeded"))
+        record.put("mediaLimitSource", JsonString("telegram-download"))
+        record.put("mediaUnderstandingStage", JsonString("telegram-download"))
+        record.put("mediaFileBytes", JsonInt(17))
+        record.put("mediaLimitBytes", JsonInt(16))
+        setGatewayAgentBridgeReplyRunnerForTest(Some({
+            _conversationKey: String,
+            _prompt: String,
+            _channelName: String,
+            _agentId: String,
+            _streamingEnabled: Bool,
+            _streamChunkHook: Option<(String) -> Unit> => ""
+        }))
+        try {
+            let store = GatewaySessionStore(Path("."), enabled: false, agentId: "general")
+            let bridge = AgentBridge(sessionStore: store)
+            let context = GatewaySessionContext(
+                GatewayIngressSource.Channel("telegram"),
+                "telegram",
+                "telegram",
+                "telegram:chat:1",
+                "general",
+                deliveryTarget: Some(GatewayDeliveryTarget("telegram", "user:1", accountId: "default", replyToMessageId: "7"))
+            )
+            let result = gatewayExecuteSessionTurn(
+                bridge,
+                context,
+                "describe image",
+                deliver: true,
+                toolRuntimeContext: Some(GatewayToolRuntimeContext(
+                    "telegram",
+                    channelName: "telegram",
+                    sessionKey: "telegram:chat:1",
+                    mediaContext: mediaContext
+                )),
+                deliverHook: Some({
+                    _channelName: String,
+                    _accountId: String,
+                    _peerId: String,
+                    text: String,
+                    _replyToMessageId: Option<String>,
+                    _replyInThread: Bool =>
+                        sentTexts.add(text)
+                        "download-too-large"
+                })
+            )
+            @Expect(result.delivered, true)
+            @Expect(sentTexts.size, 1)
+            @Expect(sentTexts[0].contains("文件过大"), true)
+            @Expect(sentTexts[0].contains("16 bytes"), true)
+            @Expect(sentTexts[0].contains("图片过大，无法解析"), false)
+        } finally {
+            setGatewayAgentBridgeReplyRunnerForTest(None<(String, String, String, String, Bool, Option<(String) -> Unit>) -> String>)
+        }
+    }
+
+    @TestCase
+    public func telegramImageUnderstandingTooLargeFallbackNamesUnderstandingLimit(): Unit {
+        let sentTexts = ArrayList<String>()
+        let mediaContext = gatewaySessionTurnImageMediaContext(
+            "/tmp/metis-no-real-too-large-image.jpg",
+            status: "too_large"
+        )
+        let record = mediaContext.get("records").getOrThrow().asArray()[0].asObject()
+        record.put("mediaLimitSource", JsonString("media-understanding"))
+        record.put("mediaUnderstandingStage", JsonString("session-context"))
+        record.put("mediaFileBytes", JsonInt(9000))
+        record.put("mediaLimitBytes", JsonInt(8192))
+        setGatewayAgentBridgeReplyRunnerForTest(Some({
+            _conversationKey: String,
+            _prompt: String,
+            _channelName: String,
+            _agentId: String,
+            _streamingEnabled: Bool,
+            _streamChunkHook: Option<(String) -> Unit> => "<SILENT_REPLY>"
+        }))
+        try {
+            let store = GatewaySessionStore(Path("."), enabled: false, agentId: "general")
+            let bridge = AgentBridge(sessionStore: store)
+            let context = GatewaySessionContext(
+                GatewayIngressSource.Channel("telegram"),
+                "telegram",
+                "telegram",
+                "telegram:chat:1",
+                "general",
+                deliveryTarget: Some(GatewayDeliveryTarget("telegram", "user:1", accountId: "default", replyToMessageId: "7"))
+            )
+            let result = gatewayExecuteSessionTurn(
+                bridge,
+                context,
+                "describe image",
+                deliver: true,
+                toolRuntimeContext: Some(GatewayToolRuntimeContext(
+                    "telegram",
+                    channelName: "telegram",
+                    sessionKey: "telegram:chat:1",
+                    mediaContext: mediaContext
+                )),
+                deliverHook: Some({
+                    _channelName: String,
+                    _accountId: String,
+                    _peerId: String,
+                    text: String,
+                    _replyToMessageId: Option<String>,
+                    _replyInThread: Bool =>
+                        sentTexts.add(text)
+                        "understanding-too-large"
+                })
+            )
+            @Expect(result.delivered, true)
+            @Expect(sentTexts.size, 1)
+            @Expect(sentTexts[0].contains("图片超过图片理解模型输入上限"), true)
+            @Expect(sentTexts[0].contains("8KB"), true)
+            @Expect(sentTexts[0].contains("图片过大，无法解析"), false)
+        } finally {
+            setGatewayAgentBridgeReplyRunnerForTest(None<(String, String, String, String, Bool, Option<(String) -> Unit>) -> String>)
         }
     }
 
@@ -1075,6 +1203,74 @@ public class GatewaySessionTurnRunnerTest {
             @Expect(prompt.contains("MediaUnderstandingCapability=image"), true)
             @Expect(prompt.contains("ImageDescription=a green square"), true)
         } finally {
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func mediaContextPromptPreservesPreflightProviderErrorForLargeImage(): Unit {
+        let root = Path("/tmp/metis-media-context-provider-error-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
+        Directory.create(root, recursive: true)
+        let image = root.join("image.jpg")
+        File.writeTo(image, Array<Byte>(9000, repeat: 65))
+        setGatewayMediaVisionRunnerForTest(Some({ _path: String, _mime: String, _kind: String, _prompt: String, _maxBytes: Int64 =>
+            "should-not-rerun"
+        }))
+        try {
+            let media = JsonObject()
+            let records = JsonArray([])
+            let record = JsonObject()
+            record.put("mediaKind", JsonString("photo"))
+            record.put("mimeType", JsonString("image/jpeg"))
+            record.put("localPath", JsonString(image.toString()))
+            record.put("downloaded", JsonBool(true))
+            record.put("mediaMaxBytes", JsonInt(20971520))
+            record.put("mediaUnderstandingStatus", JsonString("provider_error"))
+            record.put("mediaUnderstandingCapability", JsonString("image"))
+            record.put("mediaUnderstandingError", JsonString("Http status: 401 invalid_api_key"))
+            records.add(record)
+            media.put("records", records)
+
+            let prompt = gatewayBuildMediaContextPromptForUser(media, GatewayUserSettings())
+            @Expect(prompt.contains("MediaUnderstandingStatus=provider_error"), true)
+            @Expect(prompt.contains("too_large"), false)
+            @Expect(prompt.contains("should-not-rerun"), false)
+            @Expect(record.get("mediaUnderstandingStatus").getOrThrow().asString().getValue(), "provider_error")
+        } finally {
+            setGatewayMediaVisionRunnerForTest(None<(String, String, String, String, Int64) -> String>)
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func mediaContextPromptRerunUsesTelegramRecordLimitAboveDefault8192(): Unit {
+        let root = Path("/tmp/metis-media-context-record-limit-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
+        Directory.create(root, recursive: true)
+        let image = root.join("image.jpg")
+        File.writeTo(image, Array<Byte>(9000, repeat: 65))
+        setGatewayMediaVisionRunnerForTest(Some({ _path: String, _mime: String, _kind: String, _prompt: String, maxBytes: Int64 =>
+            @Expect(maxBytes, 20971520)
+            "record limit prompt image"
+        }))
+        try {
+            let media = JsonObject()
+            let records = JsonArray([])
+            let record = JsonObject()
+            record.put("mediaKind", JsonString("photo"))
+            record.put("mimeType", JsonString("image/jpeg"))
+            record.put("localPath", JsonString(image.toString()))
+            record.put("downloaded", JsonBool(true))
+            record.put("channel", JsonString("telegram"))
+            record.put("mediaMaxBytes", JsonInt(20971520))
+            records.add(record)
+            media.put("records", records)
+
+            let prompt = gatewayBuildMediaContextPromptForUser(media, GatewayUserSettings())
+            @Expect(prompt.contains("MediaUnderstandingStatus=ok"), true)
+            @Expect(prompt.contains("ImageDescription=record limit prompt image"), true)
+            @Expect(prompt.contains("too_large"), false)
+        } finally {
+            setGatewayMediaVisionRunnerForTest(None<(String, String, String, String, Int64) -> String>)
             try { remove(root, recursive: true) } catch (_e: Exception) { () }
         }
     }

@@ -200,8 +200,13 @@ private func gatewayMediaConfiguredDescribeImagePathForRuntime(record: JsonObjec
         }
         if (limit > 0 && Int64(bytes.size) > limit) {
             out.put("status", JsonString("too_large"))
-            out.put("fileBytes", Int64(bytes.size).toJsonValue())
-            out.put("limitBytes", limit.toJsonValue())
+            gatewayMediaRuntimePutLimitDiagnostics(
+                out,
+                Int64(bytes.size),
+                limit,
+                "media-understanding",
+                gatewayMediaRuntimeUnderstandingStage(record)
+            )
             out.put("error", JsonString("image exceeds configured maxBytes"))
             return out
         }
@@ -332,6 +337,73 @@ private func gatewayMediaRuntimeAsrMaxBytes(record: JsonObject, user: GatewayUse
         return channelLimit
     }
     gatewayMediaRuntimeInt(user.speech.asr, "maxBytes", fallback)
+}
+
+private func gatewayMediaRuntimeRecordLimitKey(record: JsonObject): String {
+    for (key in ["mediaMaxBytes", "mediaLimitBytes", "limitBytes", "maxBytes"]) {
+        if (gatewayMediaRuntimeInt(record, key, -1) > 0) {
+            return key
+        }
+    }
+    ""
+}
+
+private func gatewayMediaRuntimeRecordLimitBytes(record: JsonObject): Int64 {
+    let key = gatewayMediaRuntimeRecordLimitKey(record)
+    if (key.isEmpty()) {
+        return -1
+    }
+    gatewayMediaRuntimeInt(record, key, -1)
+}
+
+private func gatewayMediaRuntimeEffectiveMaxBytes(record: JsonObject, requestedMaxBytes: Int64): Int64 {
+    if (requestedMaxBytes > 0) {
+        return requestedMaxBytes
+    }
+    let recordLimit = gatewayMediaRuntimeRecordLimitBytes(record)
+    if (recordLimit > 0) {
+        return recordLimit
+    }
+    8192
+}
+
+private func gatewayMediaRuntimeLimitSource(record: JsonObject, requestedMaxBytes: Int64): String {
+    let existing = gatewayMediaRuntimeString(record, "mediaLimitSource").trimAscii()
+    if (!existing.isEmpty() && requestedMaxBytes <= 0) {
+        return existing
+    }
+    let key = gatewayMediaRuntimeRecordLimitKey(record)
+    if (requestedMaxBytes <= 0 && key == "mediaMaxBytes") {
+        return "telegram-download"
+    }
+    "media-understanding"
+}
+
+private func gatewayMediaRuntimeUnderstandingStage(record: JsonObject): String {
+    let existing = gatewayMediaRuntimeString(record, "mediaUnderstandingStage").trimAscii()
+    if (!existing.isEmpty()) {
+        return existing
+    }
+    "session-context"
+}
+
+private func gatewayMediaRuntimePutLimitDiagnostics(out: JsonObject, fileBytes: Int64, limitBytes: Int64, source: String, stage: String): Unit {
+    if (fileBytes >= 0) {
+        out.put("fileBytes", fileBytes.toJsonValue())
+        out.put("mediaFileBytes", fileBytes.toJsonValue())
+    }
+    if (limitBytes > 0) {
+        out.put("limitBytes", limitBytes.toJsonValue())
+        out.put("mediaLimitBytes", limitBytes.toJsonValue())
+    }
+    out.put("mediaLimitSource", JsonString(if (source.trimAscii().isEmpty()) { "media-understanding" } else { source.trimAscii() }))
+    out.put("mediaUnderstandingStage", JsonString(if (stage.trimAscii().isEmpty()) { "session-context" } else { stage.trimAscii() }))
+}
+
+private func gatewayMediaRuntimeEnsureLimitDiagnostics(out: JsonObject, fileBytes: Int64, limitBytes: Int64, source: String, stage: String): Unit {
+    let existingFileBytes = gatewayMediaRuntimeInt(out, "fileBytes", fileBytes)
+    let existingLimitBytes = gatewayMediaRuntimeInt(out, "limitBytes", limitBytes)
+    gatewayMediaRuntimePutLimitDiagnostics(out, existingFileBytes, existingLimitBytes, source, stage)
 }
 
 private func gatewayMediaRuntimeSafePreview(pathText: String, maxBytes!: Int64 = 8192): String {
@@ -490,7 +562,7 @@ public func gatewayMediaUnderstandingForRecord(
     record: JsonObject,
     capability!: String = "auto",
     prompt!: String = "",
-    maxBytes!: Int64 = 8192
+    maxBytes!: Int64 = -1
 ): JsonObject {
     gatewayMediaUnderstandingForRecordWithSettings(record, CliSettingManager.readGatewaySettings(), capability: capability, prompt: prompt, maxBytes: maxBytes)
 }
@@ -500,7 +572,7 @@ public func gatewayMediaUnderstandingForRecordWithSettings(
     user: GatewayUserSettings,
     capability!: String = "auto",
     prompt!: String = "",
-    maxBytes!: Int64 = 8192
+    maxBytes!: Int64 = -1
 ): JsonObject {
     let kind = gatewayMediaRuntimeString(record, "mediaKind").toAsciiLower()
     let mime = gatewayMediaRuntimeString(record, "mimeType").toAsciiLower()
@@ -516,6 +588,9 @@ public func gatewayMediaUnderstandingForRecordWithSettings(
     } else {
         capability.trimAscii().toAsciiLower()
     }
+    let effectiveMaxBytes = gatewayMediaRuntimeEffectiveMaxBytes(record, maxBytes)
+    let limitSource = gatewayMediaRuntimeLimitSource(record, maxBytes)
+    let understandingStage = gatewayMediaRuntimeUnderstandingStage(record)
     let outputs = JsonArray([])
 
     if (!downloaded || localPath.isEmpty() || !exists(Path(localPath))) {
@@ -529,7 +604,7 @@ public func gatewayMediaUnderstandingForRecordWithSettings(
         )
     }
     let bytes = File.readFrom(Path(localPath))
-    if (resolvedCapability != "audio" && resolvedCapability != "video" && maxBytes > 0 && Int64(bytes.size) > maxBytes) {
+    if (resolvedCapability != "audio" && resolvedCapability != "video" && effectiveMaxBytes > 0 && Int64(bytes.size) > effectiveMaxBytes) {
         let out = gatewayMediaRuntimeResult(
             record,
             resolvedCapability,
@@ -538,8 +613,7 @@ public func gatewayMediaUnderstandingForRecordWithSettings(
             gatewayMediaRuntimeDecision(resolvedCapability, "rejected", "media exceeds configured maxBytes"),
             error: "media exceeds configured maxBytes"
         )
-        out.put("fileBytes", Int64(bytes.size).toJsonValue())
-        out.put("limitBytes", maxBytes.toJsonValue())
+        gatewayMediaRuntimePutLimitDiagnostics(out, Int64(bytes.size), effectiveMaxBytes, limitSource, understandingStage)
         return out
     }
 
@@ -562,7 +636,7 @@ public func gatewayMediaUnderstandingForRecordWithSettings(
             ""
         }
         let configuredAsr = if (recordTranscript.isEmpty() && recordAsrTranscript.isEmpty() && nativeTranscript.isEmpty()) {
-            gatewayMediaConfiguredTranscribeAudioPathForRuntime(record, user, localPath, mime, maxBytes)
+            gatewayMediaConfiguredTranscribeAudioPathForRuntime(record, user, localPath, mime, effectiveMaxBytes)
         } else {
             JsonObject()
         }
@@ -606,6 +680,10 @@ public func gatewayMediaUnderstandingForRecordWithSettings(
                 error: message
             )
             out.put("ASRStatus", JsonString(configuredStatus))
+            if (configuredStatus == "too_large") {
+                gatewayMediaRuntimeCopyFields(configuredAsr, out, ["fileBytes", "limitBytes", "mediaFileBytes", "mediaLimitBytes", "mediaLimitSource", "mediaUnderstandingStage"])
+                gatewayMediaRuntimeEnsureLimitDiagnostics(out, Int64(bytes.size), effectiveMaxBytes, limitSource, understandingStage)
+            }
             return out
         }
         let out = gatewayMediaRuntimeResult(
@@ -634,7 +712,7 @@ public func gatewayMediaUnderstandingForRecordWithSettings(
         let recordDescription = gatewayMediaRuntimeString(record, "description")
         let recordAnalysis = gatewayMediaRuntimeString(record, "analysis")
         let nativeAnalysis = if (recordAnalysis.isEmpty() && recordDescription.isEmpty()) {
-            gatewayMediaDescribeImagePathForRuntime(localPath, mime, kind, prompt, maxBytes)
+            gatewayMediaDescribeImagePathForRuntime(localPath, mime, kind, prompt, effectiveMaxBytes)
         } else {
             ""
         }
@@ -644,7 +722,7 @@ public func gatewayMediaUnderstandingForRecordWithSettings(
             ""
         }
         let configuredAnalysis = if (recordAnalysis.isEmpty() && recordDescription.isEmpty() && nativeAnalysis.isEmpty() && companionAnalysis.isEmpty()) {
-            gatewayMediaConfiguredDescribeImagePathForRuntime(record, user, localPath, mime, kind, prompt, maxBytes)
+            gatewayMediaConfiguredDescribeImagePathForRuntime(record, user, localPath, mime, kind, prompt, effectiveMaxBytes)
         } else {
             JsonObject()
         }
@@ -707,6 +785,10 @@ public func gatewayMediaUnderstandingForRecordWithSettings(
                 case None => ()
             }
             out.put("visionStatus", JsonString(configuredStatus))
+            if (configuredStatus == "too_large") {
+                gatewayMediaRuntimeCopyFields(configuredAnalysis, out, ["fileBytes", "limitBytes", "mediaFileBytes", "mediaLimitBytes", "mediaLimitSource", "mediaUnderstandingStage"])
+                gatewayMediaRuntimeEnsureLimitDiagnostics(out, Int64(bytes.size), effectiveMaxBytes, limitSource, understandingStage)
+            }
             return out
         }
         let out = gatewayMediaRuntimeResult(
@@ -735,12 +817,12 @@ public func gatewayMediaUnderstandingForRecordWithSettings(
         let recordDescription = gatewayMediaRuntimeString(record, "description")
         let recordAnalysis = gatewayMediaRuntimeString(record, "analysis")
         let nativeVideo = if (recordAnalysis.isEmpty() && recordDescription.isEmpty()) {
-            gatewayMediaDescribeVideoPathForRuntime(localPath, mime, prompt, maxBytes)
+            gatewayMediaDescribeVideoPathForRuntime(localPath, mime, prompt, effectiveMaxBytes)
         } else {
             ""
         }
         let configuredVideo = if (recordAnalysis.isEmpty() && recordDescription.isEmpty() && nativeVideo.isEmpty()) {
-            gatewayMediaConfiguredDescribeVideoPathForRuntime(record, user, localPath, mime, prompt, maxBytes)
+            gatewayMediaConfiguredDescribeVideoPathForRuntime(record, user, localPath, mime, prompt, effectiveMaxBytes)
         } else {
             JsonObject()
         }
@@ -799,6 +881,10 @@ public func gatewayMediaUnderstandingForRecordWithSettings(
             match (configuredVideo.get("base64Bytes")) { case Some(v) => out.put("base64Bytes", v) case None => () }
             match (configuredVideo.get("limitBytes")) { case Some(v) => out.put("limitBytes", v) case None => () }
             match (configuredVideo.get("timeoutMs")) { case Some(v) => out.put("timeoutMs", v) case None => () }
+            if (configuredStatus == "too_large") {
+                gatewayMediaRuntimeCopyFields(configuredVideo, out, ["mediaFileBytes", "mediaLimitBytes", "mediaLimitSource", "mediaUnderstandingStage"])
+                gatewayMediaRuntimeEnsureLimitDiagnostics(out, Int64(bytes.size), effectiveMaxBytes, "media-understanding", understandingStage)
+            }
             return out
         }
         let out = gatewayMediaRuntimeResult(
@@ -816,7 +902,7 @@ public func gatewayMediaUnderstandingForRecordWithSettings(
     if (resolvedCapability == "document") {
         let isPdf = gatewayMediaRuntimeIsPdf(mime, fileName, bytes)
         if (!isPdf && gatewayMediaRuntimeReadableTextMime(mime, fileName)) {
-            let content = gatewayMediaRuntimeSafePreview(localPath, maxBytes: maxBytes).trimAscii()
+            let content = gatewayMediaRuntimeSafePreview(localPath, maxBytes: effectiveMaxBytes).trimAscii()
             if (!content.isEmpty()) {
                 outputs.add(gatewayMediaRuntimeOutput("document.text", content, "text_file_preview"))
                 let out = gatewayMediaRuntimeResult(record, resolvedCapability, "ok", outputs, gatewayMediaRuntimeDecision(resolvedCapability, "applied", "text-like document preview"))
@@ -825,7 +911,7 @@ public func gatewayMediaUnderstandingForRecordWithSettings(
             }
         }
         let pdfRuntime = if (isPdf) {
-            gatewayMediaAnalyzePdfPathForRuntime(localPath, mime, fileName, prompt, maxBytes, gatewayMediaRuntimeString(record, "channel"))
+            gatewayMediaAnalyzePdfPathForRuntime(localPath, mime, fileName, prompt, effectiveMaxBytes, gatewayMediaRuntimeString(record, "channel"))
         } else {
             JsonObject()
         }
@@ -876,11 +962,14 @@ public func gatewayMediaUnderstandingForRecordWithSettings(
                 )
                 out.put("documentExtractStatus", JsonString(pdfStatus))
                 out.put("extractor", JsonString("pdf_runtime"))
-                gatewayMediaRuntimeCopyFields(pdfRuntime, out, ["provider", "providerKind", "model", "source", "attempts", "fileBytes", "limitBytes"])
+                gatewayMediaRuntimeCopyFields(pdfRuntime, out, ["provider", "providerKind", "model", "source", "attempts", "fileBytes", "limitBytes", "mediaFileBytes", "mediaLimitBytes", "mediaLimitSource", "mediaUnderstandingStage"])
+                if (pdfStatus == "too_large" || pdfStatus == "extractor_output_too_large") {
+                    gatewayMediaRuntimeEnsureLimitDiagnostics(out, Int64(bytes.size), effectiveMaxBytes, "media-understanding", understandingStage)
+                }
                 return out
             }
         }
-        let nativeExtracted = gatewayMediaExtractDocumentPathForRuntime(localPath, mime, fileName, maxBytes)
+        let nativeExtracted = gatewayMediaExtractDocumentPathForRuntime(localPath, mime, fileName, effectiveMaxBytes)
         if (!nativeExtracted.isEmpty()) {
             outputs.add(gatewayMediaRuntimeOutput("document.text", nativeExtracted, "native_document_extractor"))
             let out = gatewayMediaRuntimeResult(record, resolvedCapability, "ok", outputs, gatewayMediaRuntimeDecision(resolvedCapability, "applied", "native document extractor"))
@@ -889,7 +978,7 @@ public func gatewayMediaUnderstandingForRecordWithSettings(
             out.put("extractor", JsonString("native"))
             return out
         }
-        let extracted = gatewayMediaRuntimeCompanionText(localPath, [".extract.txt", ".text.txt", ".preview.txt"], maxBytes: maxBytes)
+        let extracted = gatewayMediaRuntimeCompanionText(localPath, [".extract.txt", ".text.txt", ".preview.txt"], maxBytes: effectiveMaxBytes)
         if (!extracted.isEmpty()) {
             outputs.add(gatewayMediaRuntimeOutput("document.text", extracted, "extract_companion_file"))
             let out = gatewayMediaRuntimeResult(record, resolvedCapability, "ok", outputs, gatewayMediaRuntimeDecision(resolvedCapability, "applied", "extract companion file"))

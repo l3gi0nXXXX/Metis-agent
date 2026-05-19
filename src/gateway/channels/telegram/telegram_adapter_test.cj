@@ -369,6 +369,14 @@ private func telegramTestPngBytes(width: Int64, height: Int64): Array<Byte> {
     ]
 }
 
+private func telegramRepeatedText(size: Int64, chunk!: String = "x"): String {
+    let sb = StringBuilder()
+    for (_ in 0..size) {
+        sb.append(chunk)
+    }
+    sb.toString()
+}
+
 private class TelegramThreadFallbackFakeBotApi {
     public let bodies: ArrayList<String> = ArrayList<String>()
     public var sends: Int64 = 0
@@ -1745,6 +1753,76 @@ public class TelegramAdapterTest {
     }
 
     @TestCase
+    public func mediaDownloadLimitStateCarriesDownloadStageBytesAndLimit(): Unit {
+        let root = Path("/tmp/metis-telegram-media-limit-state-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
+        let adapter = TelegramAdapter(
+            config: TelegramConfig(
+                enabled: true,
+                botToken: "telegram-token",
+                media: TelegramMediaConfig(downloadEnabled: true, mediaMaxBytes: 10, allowedMimes: ["image/*"])
+            ),
+            pairingRoot: root.toString()
+        )
+        let media = adapter.debugPersistInboundMediaForTest(
+            "photo",
+            "oversize-photo",
+            mimeType: "image/jpeg",
+            fileSize: 11,
+            peerId: "user:1001",
+            messageId: "104"
+        )
+        let lastMedia = media.get("lastMedia").getOrThrow().asObject()
+        @Expect(lastMedia.get("downloaded").getOrThrow().asBool().getValue(), false)
+        @Expect(lastMedia.get("skippedReason").getOrThrow().asString().getValue(), "size_limit_exceeded")
+        @Expect(lastMedia.get("downloadStage").getOrThrow().asString().getValue(), "telegram-download")
+        @Expect(lastMedia.get("downloadStatus").getOrThrow().asString().getValue(), "skipped")
+        @Expect(lastMedia.get("downloadReason").getOrThrow().asString().getValue(), "size_limit_exceeded")
+        @Expect(lastMedia.get("fileBytes").getOrThrow().asInt().getValue(), 11)
+        @Expect(lastMedia.get("limitBytes").getOrThrow().asInt().getValue(), 10)
+        @Expect(lastMedia.get("mediaFileBytes").getOrThrow().asInt().getValue(), 11)
+        @Expect(lastMedia.get("mediaLimitBytes").getOrThrow().asInt().getValue(), 10)
+        @Expect(lastMedia.get("mediaLimitSource").getOrThrow().asString().getValue(), "telegram-download")
+        let stages = lastMedia.get("mediaStages").getOrThrow().asObject()
+        let download = stages.get("download").getOrThrow().asObject()
+        @Expect(download.get("stage").getOrThrow().asString().getValue(), "telegram-download")
+        @Expect(download.get("status").getOrThrow().asString().getValue(), "skipped")
+        @Expect(download.get("reason").getOrThrow().asString().getValue(), "size_limit_exceeded")
+        @Expect(download.get("fileBytes").getOrThrow().asInt().getValue(), 11)
+        @Expect(download.get("limitBytes").getOrThrow().asInt().getValue(), 10)
+    }
+
+    @TestCase
+    public func mediaDownloadUnderTelegramLimitKeepsLocalPathAboveRuntimeDefault(): Unit {
+        let root = Path("/tmp/metis-telegram-media-under-limit-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
+        let adapter = TelegramAdapter(
+            config: TelegramConfig(
+                enabled: true,
+                botToken: "telegram-token",
+                media: TelegramMediaConfig(downloadEnabled: true, mediaMaxBytes: 20000, allowedMimes: ["image/*"])
+            ),
+            pairingRoot: root.toString()
+        )
+        let media = adapter.debugPersistInboundMediaForTest(
+            "photo",
+            "large-but-allowed-photo",
+            mimeType: "image/jpeg",
+            getFileRaw: "{\"ok\":true,\"result\":{\"file_path\":\"photos/allowed.jpg\",\"file_size\":9000}}",
+            downloadRaw: telegramRepeatedText(9000),
+            peerId: "user:1001",
+            messageId: "105"
+        )
+        let lastMedia = media.get("lastMedia").getOrThrow().asObject()
+        @Expect(lastMedia.get("downloaded").getOrThrow().asBool().getValue(), true)
+        @Expect(lastMedia.get("localPath").getOrThrow().asString().getValue().endsWith("/105/allowed.jpg"), true)
+        @Expect(lastMedia.get("skippedReason").getOrThrow().asString().getValue(), "")
+        @Expect(lastMedia.get("downloadStatus").getOrThrow().asString().getValue(), "downloaded")
+        @Expect(lastMedia.get("fileBytes").getOrThrow().asInt().getValue(), 9000)
+        @Expect(lastMedia.get("limitBytes").getOrThrow().asInt().getValue(), 20000)
+        @Expect(lastMedia.get("mediaLimitSource").getOrThrow().asString().getValue(), "telegram-download")
+        @Expect(lastMedia.get("mediaUnderstandingLimitBytes").getOrThrow().asInt().getValue(), 20000)
+    }
+
+    @TestCase
     public func mediaPersistenceStoresStructuredMediaRecords(): Unit {
         let root = Path("/tmp/metis-telegram-media-records-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
         let adapter = TelegramAdapter(
@@ -2937,6 +3015,65 @@ public class TelegramAdapterTest {
         @Expect(records[1].asObject().get("fileId").getOrThrow().asString().getValue(), "p2-large")
         @Expect(records[0].asObject().get("mediaGroupId").getOrThrow().asString().getValue(), "album-1")
         @Expect(records[1].asObject().get("mediaGroupId").getOrThrow().asString().getValue(), "album-1")
+    }
+
+    @TestCase
+    public func webhookMediaGroupKeepsAllowedMediaWhenSiblingExceedsDownloadLimit(): Unit {
+        let root = Path("/tmp/metis-telegram-media-group-partial-limit-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
+        Directory.create(root, recursive: true)
+        setTelegramTransportRunnerForTest(Some({ request: TelegramTransportRequest =>
+            if (request.context == "get" && request.url.contains("/getFile")) {
+                if (request.url.contains("file_id=too-large")) {
+                    return TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":{\"file_path\":\"photos/too-large.jpg\",\"file_size\":40}}", outcome: "ok")
+                }
+                if (request.url.contains("file_id=allowed")) {
+                    return TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":{\"file_path\":\"photos/allowed.jpg\",\"file_size\":12}}", outcome: "ok")
+                }
+            }
+            if (request.context == "downloadFile") {
+                return TelegramTransportResponse(true, body: "allowed-bytes", outcome: "ok")
+            }
+            TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":true}", outcome: "ok")
+        }))
+        try {
+            let adapter = TelegramAdapter(
+                config: TelegramConfig(
+                    enabled: true,
+                    botToken: "telegram-token",
+                    dmPolicy: "open",
+                    allowFrom: ["*"],
+                    media: TelegramMediaConfig(downloadEnabled: true, mediaMaxBytes: 16, allowedMimes: ["image/*"])
+                ),
+                pairingRoot: root.toString()
+            )
+            adapter.start()
+            let first = "{\"update_id\":1,\"message\":{\"message_id\":401,\"caption\":\"album caption\",\"media_group_id\":\"album-limit\",\"photo\":[{\"file_id\":\"too-large\",\"file_size\":40}],\"chat\":{\"id\":745123456,\"type\":\"private\"},\"from\":{\"id\":745123456}}}"
+            let second = "{\"update_id\":2,\"message\":{\"message_id\":402,\"media_group_id\":\"album-limit\",\"photo\":[{\"file_id\":\"allowed\",\"file_size\":12}],\"chat\":{\"id\":745123456,\"type\":\"private\"},\"from\":{\"id\":745123456}}}"
+            @Expect(adapter.ingestWebhookPayload(first).contains("\"ok\":true"), true)
+            @Expect(adapter.ingestWebhookPayload(second).contains("\"ok\":true"), true)
+
+            let inbound = adapter.pullInbound()
+            @Expect(inbound.size, 1)
+            let records = inbound[0].mediaContext.get("records").getOrThrow().asArray()
+            @Expect(records.size(), 2)
+            let firstRecord = records[0].asObject()
+            let secondRecord = records[1].asObject()
+            @Expect(firstRecord.get("fileId").getOrThrow().asString().getValue(), "too-large")
+            @Expect(firstRecord.get("downloaded").getOrThrow().asBool().getValue(), false)
+            @Expect(firstRecord.get("skippedReason").getOrThrow().asString().getValue(), "size_limit_exceeded")
+            @Expect(firstRecord.get("downloadReason").getOrThrow().asString().getValue(), "size_limit_exceeded")
+            @Expect(firstRecord.get("fileBytes").getOrThrow().asInt().getValue(), 40)
+            @Expect(firstRecord.get("limitBytes").getOrThrow().asInt().getValue(), 16)
+            @Expect(secondRecord.get("fileId").getOrThrow().asString().getValue(), "allowed")
+            @Expect(secondRecord.get("downloaded").getOrThrow().asBool().getValue(), true)
+            @Expect(secondRecord.get("localPath").getOrThrow().asString().getValue().endsWith("/402/allowed.jpg"), true)
+            @Expect(secondRecord.get("skippedReason").getOrThrow().asString().getValue(), "")
+            @Expect(secondRecord.get("fileBytes").getOrThrow().asInt().getValue(), 13)
+            @Expect(secondRecord.get("limitBytes").getOrThrow().asInt().getValue(), 16)
+        } finally {
+            setTelegramTransportRunnerForTest(None)
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
     }
 
     @TestCase
