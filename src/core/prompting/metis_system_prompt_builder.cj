@@ -154,7 +154,7 @@ private let TOOL_SUMMARIES = HashMap<String, String>([
     ("memory_search", "Search MEMORY.md and memory/*.md for relevant recalled snippets"),
     ("memory_get", "Read a specific snippet from MEMORY.md or memory/*.md"),
     ("session_status", "Inspect local runtime and managed session state"),
-    ("sessions_send", "Append a message to a target session by sessionKey or label"),
+    ("sessions_send", "Send to a target session by sessionKey or label; cross-agent sends require agent-to-agent policy and start the target runtime"),
     ("sessions_spawn", "Create a managed session and optionally launch subagent or ACP work"),
     ("sessions_list", "List persisted local sessions with optional transcript excerpts"),
     ("subagents", "List, steer, and kill managed spawned sessions"),
