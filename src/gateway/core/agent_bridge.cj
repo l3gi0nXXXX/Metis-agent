@@ -15,7 +15,7 @@ import metis.core.prompting.{MetisBootstrapBudgetResult, MetisSystemPromptParams
 import metis.core.skills.SkillsPrompt
 import metis.core.skills.tryHandleSkillsCommand
 import metis.cron.{executeGatewayCronCommand, parseSlashCronLine}
-import metis.gateway.{gatewayMcpGitCodeToolResultJson, gatewayMcpIsGitCodeTool}
+import metis.gateway.{gatewayMcpGitCodeToolResultJson, gatewayMcpGitCodeToolResultJsonWithRuntime, gatewayMcpIsGitCodeTool}
 import metis.gateway.session.GatewayTurnContext
 import metis.gateway.tools.{GatewayCronToolset, GatewayFeishuMediaToolset, GatewayFeishuOapiToolset, GatewayFSToolset, GatewayGatewayToolset, GatewayImageGenerationToolset, GatewayManagedSessionsToolset, GatewayMemoryToolset, GatewayMessageToolset, GatewayPlanToolset, GatewaySessionTranscriptToolset, GatewayShellToolset, GatewayTelegramMediaToolset, GatewayTtsToolset, GatewayVideoGenerationToolset, GatewayWeatherToolset, gatewayHandleNativeCommandLine, gatewayHandleSubagentsCommandLine}
 import std.collection.{HashMap, ArrayList, enumerate}
@@ -321,8 +321,45 @@ public class GatewayAgentBridgeGitCodeMcpAdapter <: GatewayGitCodeMcpRuntimeAdap
     public init() {}
 
     public func invoke(toolName: String, args: JsonObject): JsonObject {
-        gatewayMcpGitCodeToolResultJson(toolName, args)
+        gatewayMcpGitCodeToolResultJsonWithRuntime(
+            toolName,
+            args,
+            modelRunner: Some({ tool: String, runtimeArgs: JsonObject =>
+                gatewayAgentBridgeGitCodeModelJson(tool, runtimeArgs)
+            })
+        )
     }
+}
+
+private func gatewayAgentBridgeGitCodeModelJson(toolName: String, args: JsonObject): String {
+    let requestId = match (args.get("requestId")) {
+        case Some(value) => try { value.asString().getValue() } catch (_e: Exception) { "unknown" }
+        case None => "unknown"
+    }
+    let prompt = """
+You are the Metis GitCode MCP runtime. Produce one JSON object and no prose.
+
+Tool: `${toolName}`
+Input JSON:
+${args.toJsonString()}
+
+Required JSON shapes:
+- summarize tools: {"text":"concise evidence-backed summary"}
+- draft reply tools: {"body":"human-editable reply draft","readyToPost":true}
+- safety review: {"safeToSend":true,"reason":"short safety reason"}
+
+Use only the supplied CKB evidence and GitCode input. If evidence is insufficient, return a conservative JSON object with readyToPost or safeToSend false.
+"""
+    let store = GatewaySessionStore(Path("."), enabled: false, agentId: "gitcode-mcp")
+    let bridge = AgentBridge(sessionStore: store)
+    bridge.reply(
+        "gitcode-mcp:${requestId}",
+        prompt,
+        channelName: "gitcode-mcp",
+        agentId: "general",
+        extraSystemPrompt: "Return strict JSON only for the GitCode MCP runtime. Do not call external GitCode writeback.",
+        streamingEnabled: false
+    )
 }
 
 public func gatewayAgentBridgeInvokeGitCodeMcpRuntime(

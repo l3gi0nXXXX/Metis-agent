@@ -6,7 +6,8 @@ import metis.core.runtimeToolInvocationAllowedFromRoot
 import metis.core.config.{CliConfig, CliSettingManager, GatewayUserSettings, MetisConfigManager}
 import metis.core.model.CliModelManager
 import metis.gateway.config.buildGatewayConfigFromUserSettings
-import metis.gateway.{gatewayMcpAppendGitCodeTools, gatewayMcpGitCodeRuntimeStatusJson, gatewayMcpGitCodeToolResultJson, gatewayMcpIsGitCodeTool}
+import metis.gateway.{gatewayMcpAppendGitCodeTools, gatewayMcpGitCodeRuntimeStatusJson, gatewayMcpIsGitCodeTool}
+import metis.gateway.core.{GatewayAgentBridgeGitCodeMcpAdapter, gatewayAgentBridgeInvokeGitCodeMcpRuntime}
 import metis.gateway.model.GatewayConfig
 import metis.gateway.openclaw_http.gatewayRegisterOpenClawHttpRoutes
 import metis.gateway.protocol.{GATEWAY_ERROR_AUTH_FAILED, GATEWAY_ERROR_INVALID_CONNECT, GatewayClientInfo, GatewayConnectParams, GatewayProtocolRequest, GatewayProtocolResponse, validateGatewayConnectParams}
@@ -1245,7 +1246,7 @@ private func gatewayMcpToolCall(user: GatewayUserSettings, name: String, args: J
     }
     let normalized = name.trimAscii().toAsciiLower()
     if (gatewayMcpIsGitCodeTool(normalized) || normalized.startsWith("gitcode_")) {
-        return GatewayRpcResponse(true, "tools.call", result: gatewayMcpGitCodeToolResultJson(normalized, args))
+        return GatewayRpcResponse(true, "tools.call", result: gatewayAgentBridgeInvokeGitCodeMcpRuntime(GatewayAgentBridgeGitCodeMcpAdapter(), normalized, args))
     }
     let client = gatewayBuildClient("gateway-http-mcp", "http-mcp")
     if (normalized == "gateway.status") {

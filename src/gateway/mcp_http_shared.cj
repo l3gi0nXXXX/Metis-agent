@@ -33,6 +33,9 @@ private let gatewayMcpGitCodeRateCounters = HashMap<String, Int64>()
 private let gatewayMcpGitCodeRecentAudits = ArrayList<JsonObject>()
 private let gatewayMcpGitCodeRecentErrors = ArrayList<JsonObject>()
 
+public type GatewayMcpGitCodeModelRunner = (String, JsonObject) -> String
+public type GatewayMcpGitCodeKnowledgeRunner = (String, JsonObject) -> JsonObject
+
 public func gatewayMcpGitCodeRegisteredToolNames(): Array<String> {
     [
         "gitcode_issue_summarize",
@@ -222,9 +225,9 @@ private func gatewayMcpAppendGitCodeTool(
     meta.put("readOnly", true.toJsonValue())
     meta.put("writebackImplemented", false.toJsonValue())
     meta.put("directModelProviderCalls", false.toJsonValue())
-    meta.put("genericContentToolDefaultDeny", true.toJsonValue())
-    meta.put("genericReplyToolDefaultDeny", true.toJsonValue())
-    meta.put("knowledgeClient", JsonString("contract-stub"))
+    meta.put("genericContentToolDefaultDeny", false.toJsonValue())
+    meta.put("genericReplyToolDefaultDeny", false.toJsonValue())
+    meta.put("knowledgeClient", JsonString("cangjie-knowledge-client"))
     meta.put("callerAllowlist", gatewayMcpStringArray(GATEWAY_MCP_GITCODE_ALLOWED_CALLERS))
     meta.put("maxInputBytes", GATEWAY_MCP_GITCODE_MAX_INPUT_BYTES.toJsonValue())
     meta.put("timeoutMs", GATEWAY_MCP_GITCODE_TIMEOUT_MS.toJsonValue())
@@ -238,25 +241,25 @@ public func gatewayMcpAppendGitCodeTools(tools: JsonArray): Unit {
     gatewayMcpAppendGitCodeTool(
         tools,
         "gitcode_issue_summarize",
-        "Read-only GitCode issue summarization contract backed only by caller-provided evidence in this baseline.",
+        "Read-only GitCode issue summarization through AgentBridge and CKB evidence.",
         gatewayMcpGitCodeBaseInputSchema("issueId")
     )
     gatewayMcpAppendGitCodeTool(
         tools,
         "gitcode_pr_summarize",
-        "Read-only GitCode pull request summarization contract backed only by caller-provided evidence in this baseline.",
+        "Read-only GitCode pull request summarization through AgentBridge and CKB evidence.",
         gatewayMcpGitCodeBaseInputSchema("prId")
     )
     gatewayMcpAppendGitCodeTool(
         tools,
         "gitcode_issue_draft_reply",
-        "Read-only GitCode issue reply draft placeholder. It never posts a reply.",
+        "Read-only GitCode issue reply draft through AgentBridge and CKB evidence. It never posts a reply.",
         gatewayMcpGitCodeDraftReplyInputSchema("issueId")
     )
     gatewayMcpAppendGitCodeTool(
         tools,
         "gitcode_pr_draft_reply",
-        "Read-only GitCode pull request reply draft placeholder. It never posts a reply.",
+        "Read-only GitCode pull request reply draft through AgentBridge and CKB evidence. It never posts a reply.",
         gatewayMcpGitCodeDraftReplyInputSchema("prId")
     )
     gatewayMcpAppendGitCodeTool(
@@ -671,15 +674,17 @@ private func gatewayMcpGitCodeKnowledge(args: JsonObject): JsonObject {
     let timedOut = gatewayMcpGitCodeCkbTimedOut(args)
     let empty = gatewayMcpGitCodeCkbEmpty(args)
     let truncated = gatewayMcpGitCodeEvidenceTruncated(args)
+    let suppliedVersion = gatewayMcpGitCodeJsonString(args, "knowledgeVersion").trimAscii()
     let out = JsonObject()
-    out.put("client", JsonString("external-contract"))
-    out.put("contract", JsonString("context-query-plan-to-evidence-pack"))
+    out.put("client", JsonString("cangjie-knowledge-client"))
+    out.put("contract", JsonString("mcp-http-like-evidence-pack"))
     out.put("available", (hitCount > 0 && !timedOut).toJsonValue())
     out.put("localPathRead", false.toJsonValue())
-    out.put("source", JsonString(if (timedOut) { "timeout" } else if (hitCount > 0) { "caller-provided-evidence" } else { "unavailable" }))
-    out.put("knowledgeVersion", JsonString(if (hitCount > 0) {
-        let supplied = gatewayMcpGitCodeJsonString(args, "knowledgeVersion").trimAscii()
-        if (supplied.isEmpty()) { "caller-provided" } else { supplied }
+    out.put("source", JsonString(if (timedOut) { "timeout" } else if (hitCount > 0) { "ckb-evidence-pack" } else { "unavailable" }))
+    out.put("knowledgeVersion", JsonString(if (!suppliedVersion.isEmpty()) {
+        suppliedVersion
+    } else if (hitCount > 0) {
+        "ckb-evidence-pack"
     } else {
         "unavailable"
     }))
@@ -693,6 +698,64 @@ private func gatewayMcpGitCodeKnowledge(args: JsonObject): JsonObject {
     pack.put("maxEvidenceItems", GATEWAY_MCP_GITCODE_MAX_EVIDENCE_ITEMS.toJsonValue())
     out.put("evidencePack", pack)
     out
+}
+
+private func gatewayMcpGitCodeCloneArgs(args: JsonObject): JsonObject {
+    try {
+        JsonValue.fromStr(args.toJsonString()).asObject()
+    } catch (_e: Exception) {
+        JsonObject()
+    }
+}
+
+private func gatewayMcpGitCodeApplyKnowledgePack(args: JsonObject, pack: JsonObject): JsonObject {
+    let out = gatewayMcpGitCodeCloneArgs(args)
+    let status = gatewayMcpGitCodeJsonString(pack, "status").trimAscii().toAsciiLower()
+    if (!status.isEmpty()) {
+        out.put("ckbStatus", JsonString(status))
+    }
+    let version = gatewayMcpGitCodeJsonString(pack, "knowledgeVersion").trimAscii()
+    if (!version.isEmpty()) {
+        out.put("knowledgeVersion", JsonString(version))
+    }
+    if (gatewayMcpGitCodeJsonBool(pack, "truncated", false)) {
+        out.put("evidenceTruncated", true.toJsonValue())
+    }
+    if (gatewayMcpGitCodeJsonBool(pack, "conflicting", false) || status == "conflicting") {
+        out.put("conflictingEvidence", true.toJsonValue())
+    }
+    match (pack.get("evidence")) {
+        case Some(value) =>
+            try {
+                out.put("evidence", value.asArray())
+            } catch (_e: Exception) {
+                ()
+            }
+        case None => ()
+    }
+    if (status == "timeout") {
+        out.put("ckbTimeout", true.toJsonValue())
+    }
+    out
+}
+
+private func gatewayMcpGitCodeResolveKnowledge(
+    tool: String,
+    args: JsonObject,
+    knowledgeRunner: Option<GatewayMcpGitCodeKnowledgeRunner>
+): JsonObject {
+    match (knowledgeRunner) {
+        case Some(runner) =>
+            try {
+                return gatewayMcpGitCodeApplyKnowledgePack(args, runner(tool, gatewayMcpGitCodeCloneArgs(args)))
+            } catch (_e: Exception) {
+                let out = gatewayMcpGitCodeCloneArgs(args)
+                out.put("ckbStatus", JsonString("timeout"))
+                out.put("ckbTimeout", true.toJsonValue())
+                return out
+            }
+        case None => args
+    }
 }
 
 private func gatewayMcpGitCodeRemember(audit: JsonObject, error: Option<JsonObject>): Unit {
@@ -724,9 +787,13 @@ private func gatewayMcpGitCodeAudit(
     audit.put("requestId", JsonString(requestId))
     audit.put("caller", JsonString(caller))
     audit.put("tool", JsonString(tool))
-    audit.put("operation", JsonString("read_only_contract_stub"))
+    audit.put("operation", JsonString("read_only_agent_bridge_runtime"))
     audit.put("writebackAttempted", false.toJsonValue())
-    audit.put("modelProviderCalled", false.toJsonValue())
+    audit.put("modelProviderCalled", (
+        reason.startsWith("agent bridge generated") ||
+        reason == "agent bridge safety review completed" ||
+        reason == "model output rejected"
+    ).toJsonValue())
     audit.put("ckbLocalPathRead", false.toJsonValue())
     audit.put("redacted", redacted.toJsonValue())
     audit.put("reason", JsonString(reason))
@@ -772,8 +839,8 @@ private func gatewayMcpGitCodeBaseResult(
     outputPolicy.put("autoPostAllowed", false.toJsonValue())
     out.put("outputPolicy", outputPolicy)
     let permissions = JsonObject()
-    permissions.put("contentPlaceholderDefaultDeny", true.toJsonValue())
-    permissions.put("replyPlaceholderDefaultDeny", true.toJsonValue())
+    permissions.put("contentPlaceholderDefaultDeny", false.toJsonValue())
+    permissions.put("replyPlaceholderDefaultDeny", false.toJsonValue())
     permissions.put("realGitCodeWriteback", false.toJsonValue())
     out.put("permissions", permissions)
     if (status == "error" || status == "rejected") {
@@ -900,105 +967,190 @@ private func gatewayMcpGitCodeValidateBase(tool: String, args: JsonObject, idFie
     None<JsonObject>
 }
 
-private func gatewayMcpGitCodeSummaryResult(tool: String, args: JsonObject, idField: String): JsonObject {
-    match (gatewayMcpGitCodeValidateBase(tool, args, idField)) {
+private func gatewayMcpGitCodeRuntimeUnavailableResult(tool: String, args: JsonObject): JsonObject {
+    let out = gatewayMcpGitCodeBaseResult(tool, args, "needs_human_review", true, false, "agent bridge runtime unavailable")
+    let error = JsonObject()
+    error.put("code", JsonString("AGENT_BRIDGE_RUNTIME_UNAVAILABLE"))
+    error.put("message", JsonString("GitCode MCP tool requires AgentBridge runtime or a deterministic test runner."))
+    out.put("error", error)
+    return out
+}
+
+private func gatewayMcpGitCodeOutputObject(parsed: JsonObject): JsonObject {
+    match (parsed.get("output")) {
+        case Some(value) =>
+            try { value.asObject() } catch (_e: Exception) { JsonObject() }
+        case None => JsonObject()
+    }
+}
+
+private func gatewayMcpGitCodeModelOutput(
+    tool: String,
+    args: JsonObject,
+    modelRunner: Option<GatewayMcpGitCodeModelRunner>
+): JsonObject {
+    match (modelRunner) {
+        case Some(runner) => gatewayMcpGitCodeParseStructuredOutputJson(runner(tool, gatewayMcpGitCodeCloneArgs(args)))
+        case None => gatewayMcpGitCodeParseStructuredOutputJson("")
+    }
+}
+
+private func gatewayMcpGitCodeSummaryResult(
+    tool: String,
+    args: JsonObject,
+    idField: String,
+    modelRunner: Option<GatewayMcpGitCodeModelRunner>,
+    knowledgeRunner: Option<GatewayMcpGitCodeKnowledgeRunner>
+): JsonObject {
+    let runtimeArgs = gatewayMcpGitCodeResolveKnowledge(tool, args, knowledgeRunner)
+    match (gatewayMcpGitCodeValidateBase(tool, runtimeArgs, idField)) {
         case Some(result) => return result
         case None => ()
     }
-    let needsReview = gatewayMcpGitCodeNeedsReview(args)
-    let status = if (needsReview) { "needs_human_review" } else { "ok" }
-    let reason = if (gatewayMcpGitCodeEvidenceCount(args) == 0) {
-        "no evidence available from CKB contract stub"
-    } else if (gatewayMcpGitCodeJsonBool(args, "conflictingEvidence", false)) {
-        "conflicting evidence"
-    } else {
-        "caller evidence available"
+    let needsReview = gatewayMcpGitCodeNeedsReview(runtimeArgs)
+    if (modelRunner.isNone() && !needsReview) {
+        return gatewayMcpGitCodeRuntimeUnavailableResult(tool, runtimeArgs)
     }
-    let out = gatewayMcpGitCodeBaseResult(tool, args, status, needsReview, false, reason)
+    let parsed = if (needsReview) { JsonObject() } else { gatewayMcpGitCodeModelOutput(tool, runtimeArgs, modelRunner) }
+    let modelOk = !needsReview && gatewayMcpGitCodeJsonString(parsed, "status") == "ok"
+    let modelOut = gatewayMcpGitCodeOutputObject(parsed)
+    let text = gatewayMcpGitCodeJsonString(modelOut, "text").trimAscii()
+    let status = if (needsReview) { "needs_human_review" } else { "ok" }
+    let reason = if (gatewayMcpGitCodeEvidenceCount(runtimeArgs) == 0) {
+        "no evidence available from CKB"
+    } else if (gatewayMcpGitCodeJsonBool(runtimeArgs, "conflictingEvidence", false)) {
+        "conflicting evidence"
+    } else if (!modelOk || text.isEmpty()) {
+        "model output rejected"
+    } else {
+        "agent bridge generated from CKB evidence"
+    }
+    let out = gatewayMcpGitCodeBaseResult(tool, runtimeArgs, if (modelOk) { status } else { "needs_human_review" }, needsReview || !modelOk, false, reason)
     let summary = JsonObject()
-    summary.put("repository", JsonString(gatewayMcpGitCodeJsonString(args, "repository")))
-    summary.put("targetId", JsonString(gatewayMcpGitCodeJsonString(args, idField)))
-    summary.put("title", JsonString(gatewayMcpGitCodeJsonString(args, "title")))
-    summary.put("bodyPreview", JsonString(gatewayMcpGitCodeJsonString(args, "body")))
+    summary.put("repository", JsonString(gatewayMcpGitCodeJsonString(runtimeArgs, "repository")))
+    summary.put("targetId", JsonString(gatewayMcpGitCodeJsonString(runtimeArgs, idField)))
+    summary.put("title", JsonString(gatewayMcpGitCodeJsonString(runtimeArgs, "title")))
+    summary.put("bodyPreview", JsonString(gatewayMcpGitCodeJsonString(runtimeArgs, "body")))
     summary.put("evidenceBased", (!needsReview).toJsonValue())
-    summary.put("generatedByModel", false.toJsonValue())
-    summary.put("text", JsonString(if (needsReview) {
+    summary.put("generatedByModel", modelOk.toJsonValue())
+    summary.put("text", JsonString(if (modelOk) {
+        text
+    } else if (needsReview) {
         "Insufficient non-conflicting evidence to summarize without human review."
     } else {
-        "Caller-provided evidence is present; real summarization is intentionally not implemented in this baseline."
+        "Model output was rejected; human review is required."
     }))
     out.put("summary", summary)
     out
 }
 
-private func gatewayMcpGitCodeDraftReplyResult(tool: String, args: JsonObject, idField: String): JsonObject {
-    match (gatewayMcpGitCodeValidateBase(tool, args, idField)) {
+private func gatewayMcpGitCodeDraftReplyResult(
+    tool: String,
+    args: JsonObject,
+    idField: String,
+    modelRunner: Option<GatewayMcpGitCodeModelRunner>,
+    knowledgeRunner: Option<GatewayMcpGitCodeKnowledgeRunner>
+): JsonObject {
+    let runtimeArgs = gatewayMcpGitCodeResolveKnowledge(tool, args, knowledgeRunner)
+    match (gatewayMcpGitCodeValidateBase(tool, runtimeArgs, idField)) {
         case Some(result) => return result
         case None => ()
     }
-    if (gatewayMcpGitCodeJsonString(args, "intent").trimAscii().isEmpty()) {
-        return gatewayMcpGitCodeMissingResult(tool, args, "intent")
+    if (gatewayMcpGitCodeJsonString(runtimeArgs, "intent").trimAscii().isEmpty()) {
+        return gatewayMcpGitCodeMissingResult(tool, runtimeArgs, "intent")
     }
-    let proposedJson = gatewayMcpGitCodeJsonString(args, "proposedStructuredOutput").trimAscii()
+    let proposedJson = gatewayMcpGitCodeJsonString(runtimeArgs, "proposedStructuredOutput").trimAscii()
     if (!proposedJson.isEmpty()) {
         let parsed = gatewayMcpGitCodeParseStructuredOutputJson(proposedJson)
         if (gatewayMcpGitCodeJsonString(parsed, "status") != "ok") {
-            let out = gatewayMcpGitCodeBaseResult(tool, args, "rejected", true, false, "bad structured output rejected")
+            let out = gatewayMcpGitCodeBaseResult(tool, runtimeArgs, "rejected", true, false, "bad structured output rejected")
             out.put("outputParse", parsed)
             return out
         }
     }
-    let needsReview = true
-    let out = gatewayMcpGitCodeBaseResult(tool, args, "needs_human_review", needsReview, false, "reply draft placeholder is default-deny")
+    let needsReview = gatewayMcpGitCodeNeedsReview(runtimeArgs)
+    if (modelRunner.isNone() && !needsReview) {
+        return gatewayMcpGitCodeRuntimeUnavailableResult(tool, runtimeArgs)
+    }
+    let parsed = if (needsReview) { JsonObject() } else { gatewayMcpGitCodeModelOutput(tool, runtimeArgs, modelRunner) }
+    let modelOk = !needsReview && gatewayMcpGitCodeJsonString(parsed, "status") == "ok"
+    let modelOut = gatewayMcpGitCodeOutputObject(parsed)
+    let body = gatewayMcpGitCodeJsonString(modelOut, "body").trimAscii()
+    let ready = modelOk && !body.isEmpty() && gatewayMcpGitCodeJsonBool(modelOut, "readyToPost", true)
+    let out = gatewayMcpGitCodeBaseResult(
+        tool,
+        runtimeArgs,
+        if (ready) { "ok" } else { "needs_human_review" },
+        !ready,
+        false,
+        if (needsReview) { "CKB evidence requires human review" } else if (!modelOk || body.isEmpty()) { "model output rejected" } else { "agent bridge generated draft from CKB evidence" }
+    )
     let draft = JsonObject()
-    draft.put("repository", JsonString(gatewayMcpGitCodeJsonString(args, "repository")))
-    draft.put("targetId", JsonString(gatewayMcpGitCodeJsonString(args, idField)))
-    draft.put("body", JsonString(""))
-    draft.put("readyToPost", false.toJsonValue())
-    draft.put("placeholder", true.toJsonValue())
+    draft.put("repository", JsonString(gatewayMcpGitCodeJsonString(runtimeArgs, "repository")))
+    draft.put("targetId", JsonString(gatewayMcpGitCodeJsonString(runtimeArgs, idField)))
+    draft.put("body", JsonString(if (ready) { body } else { "" }))
+    draft.put("readyToPost", ready.toJsonValue())
+    draft.put("placeholder", false.toJsonValue())
     draft.put("humanEditable", true.toJsonValue())
     draft.put("writebackImplemented", false.toJsonValue())
+    draft.put("generatedByModel", modelOk.toJsonValue())
     out.put("draft", draft)
     out
 }
 
-private func gatewayMcpGitCodeSafetyReviewResult(tool: String, args: JsonObject): JsonObject {
-    if (Int64(args.toJsonString().toArray().size) > GATEWAY_MCP_GITCODE_MAX_INPUT_BYTES) {
-        return gatewayMcpGitCodeTooLargeResult(tool, args)
+private func gatewayMcpGitCodeSafetyReviewResult(
+    tool: String,
+    args: JsonObject,
+    modelRunner: Option<GatewayMcpGitCodeModelRunner>,
+    knowledgeRunner: Option<GatewayMcpGitCodeKnowledgeRunner>
+): JsonObject {
+    let runtimeArgs = gatewayMcpGitCodeResolveKnowledge(tool, args, knowledgeRunner)
+    if (Int64(runtimeArgs.toJsonString().toArray().size) > GATEWAY_MCP_GITCODE_MAX_INPUT_BYTES) {
+        return gatewayMcpGitCodeTooLargeResult(tool, runtimeArgs)
     }
-    if (gatewayMcpGitCodeJsonString(args, "replyText").trimAscii().isEmpty()) {
-        return gatewayMcpGitCodeMissingResult(tool, args, "replyText")
+    if (gatewayMcpGitCodeJsonString(runtimeArgs, "replyText").trimAscii().isEmpty()) {
+        return gatewayMcpGitCodeMissingResult(tool, runtimeArgs, "replyText")
     }
-    if (gatewayMcpGitCodeHasSecrets(args)) {
-        return gatewayMcpGitCodeRejectedResult(tool, args)
+    if (gatewayMcpGitCodeHasSecrets(runtimeArgs)) {
+        return gatewayMcpGitCodeRejectedResult(tool, runtimeArgs)
     }
-    if (!gatewayMcpGitCodeEvidenceSchemaValid(args)) {
-        return gatewayMcpGitCodeSchemaErrorResult(tool, args, "evidence", "array")
+    if (!gatewayMcpGitCodeEvidenceSchemaValid(runtimeArgs)) {
+        return gatewayMcpGitCodeSchemaErrorResult(tool, runtimeArgs, "evidence", "array")
     }
-    let caller = gatewayMcpGitCodeJsonString(args, "caller")
+    let caller = gatewayMcpGitCodeJsonString(runtimeArgs, "caller")
     if (!gatewayMcpGitCodeCallerAllowed(caller)) {
-        return gatewayMcpGitCodeUnauthorizedResult(tool, args)
+        return gatewayMcpGitCodeUnauthorizedResult(tool, runtimeArgs)
     }
     if (!gatewayMcpGitCodeRateAllowed(tool, caller)) {
-        return gatewayMcpGitCodeRateLimitResult(tool, args)
+        return gatewayMcpGitCodeRateLimitResult(tool, runtimeArgs)
     }
-    let needsReview = gatewayMcpGitCodeNeedsReview(args)
+    let needsReview = gatewayMcpGitCodeNeedsReview(runtimeArgs)
+    if (modelRunner.isNone() && !needsReview) {
+        return gatewayMcpGitCodeRuntimeUnavailableResult(tool, runtimeArgs)
+    }
+    let parsed = if (needsReview) { JsonObject() } else { gatewayMcpGitCodeModelOutput(tool, runtimeArgs, modelRunner) }
+    let modelOk = !needsReview && gatewayMcpGitCodeJsonString(parsed, "status") == "ok"
+    let modelOut = gatewayMcpGitCodeOutputObject(parsed)
+    let safe = modelOk && gatewayMcpGitCodeJsonBool(modelOut, "safeToSend", false)
     let out = gatewayMcpGitCodeBaseResult(
         tool,
-        args,
-        if (needsReview) { "needs_human_review" } else { "ok" },
-        needsReview,
+        runtimeArgs,
+        if (safe) { "ok" } else { "needs_human_review" },
+        !safe,
         false,
-        if (needsReview) { "no non-conflicting evidence for safety review" } else { "caller evidence available" }
+        if (needsReview) { "CKB evidence requires human review" } else if (!modelOk) { "model output rejected" } else { "agent bridge safety review completed" }
     )
     let review = JsonObject()
-    review.put("safeToSend", false.toJsonValue())
-    review.put("readyToPost", false.toJsonValue())
+    review.put("safeToSend", safe.toJsonValue())
+    review.put("readyToPost", safe.toJsonValue())
     review.put("writebackAllowed", false.toJsonValue())
-    review.put("reason", JsonString(if (needsReview) {
+    review.put("generatedByModel", modelOk.toJsonValue())
+    review.put("reason", JsonString(if (modelOk) {
+        gatewayMcpGitCodeJsonString(modelOut, "reason")
+    } else if (needsReview) {
         "Needs human review before sending."
     } else {
-        "Baseline safety contract does not approve outbound replies automatically."
+        "Model output was rejected; human review is required."
     }))
     out.put("review", review)
     out
@@ -1060,7 +1212,8 @@ public func gatewayMcpGitCodeRuntimeStatusJson(authMode!: String = "gateway-http
     }
     out.put("audit", audit)
     let ckb = JsonObject()
-    ckb.put("client", JsonString("external-contract"))
+    ckb.put("client", JsonString("cangjie-knowledge-client"))
+    ckb.put("contract", JsonString("mcp-http-like-evidence-pack"))
     ckb.put("localMirrorBuiltIn", false.toJsonValue())
     ckb.put("localPathRead", false.toJsonValue())
     ckb.put("timeoutNeedsHumanReview", true.toJsonValue())
@@ -1069,22 +1222,31 @@ public func gatewayMcpGitCodeRuntimeStatusJson(authMode!: String = "gateway-http
     out
 }
 
-public func gatewayMcpGitCodeToolResultJson(name: String, args: JsonObject): JsonObject {
+public func gatewayMcpGitCodeToolResultJsonWithRuntime(
+    name: String,
+    args: JsonObject,
+    modelRunner!: Option<GatewayMcpGitCodeModelRunner> = None<GatewayMcpGitCodeModelRunner>,
+    knowledgeRunner!: Option<GatewayMcpGitCodeKnowledgeRunner> = None<GatewayMcpGitCodeKnowledgeRunner>
+): JsonObject {
     let normalized = name.trimAscii().toAsciiLower()
     if (normalized == "gitcode_issue_summarize") {
-        return gatewayMcpGitCodeSummaryResult(normalized, args, "issueId")
+        return gatewayMcpGitCodeSummaryResult(normalized, args, "issueId", modelRunner, knowledgeRunner)
     }
     if (normalized == "gitcode_pr_summarize") {
-        return gatewayMcpGitCodeSummaryResult(normalized, args, "prId")
+        return gatewayMcpGitCodeSummaryResult(normalized, args, "prId", modelRunner, knowledgeRunner)
     }
     if (normalized == "gitcode_issue_draft_reply") {
-        return gatewayMcpGitCodeDraftReplyResult(normalized, args, "issueId")
+        return gatewayMcpGitCodeDraftReplyResult(normalized, args, "issueId", modelRunner, knowledgeRunner)
     }
     if (normalized == "gitcode_pr_draft_reply") {
-        return gatewayMcpGitCodeDraftReplyResult(normalized, args, "prId")
+        return gatewayMcpGitCodeDraftReplyResult(normalized, args, "prId", modelRunner, knowledgeRunner)
     }
     if (normalized == "gitcode_reply_safety_review") {
-        return gatewayMcpGitCodeSafetyReviewResult(normalized, args)
+        return gatewayMcpGitCodeSafetyReviewResult(normalized, args, modelRunner, knowledgeRunner)
     }
     gatewayMcpGitCodeUnknownResult(normalized, args)
+}
+
+public func gatewayMcpGitCodeToolResultJson(name: String, args: JsonObject): JsonObject {
+    gatewayMcpGitCodeToolResultJsonWithRuntime(name, args)
 }

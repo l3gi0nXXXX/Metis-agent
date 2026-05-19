@@ -7,6 +7,7 @@ import metis.gateway.{
     GATEWAY_MCP_PROTOCOL_VERSION,
     GATEWAY_MCP_SERVER_NAME,
     gatewayMcpGitCodeToolResultJson,
+    gatewayMcpGitCodeToolResultJsonWithRuntime,
     gatewayMcpGitCodeParseStructuredOutputJson,
     gatewayMcpGitCodeRuntimeStatusJson,
     gatewayMcpGitCodeToolMetadataRegistryJson,
@@ -135,8 +136,9 @@ public class GatewayMcpHttpSharedTest {
             let meta = testJsonObject(found, "_meta")
             @Expect(testJsonBool(meta, "readOnly"), true)
             @Expect(testJsonBool(meta, "writebackImplemented"), false)
-            @Expect(testJsonBool(meta, "genericContentToolDefaultDeny"), true)
-            @Expect(testJsonBool(meta, "genericReplyToolDefaultDeny"), true)
+            @Expect(testJsonBool(meta, "genericContentToolDefaultDeny"), false)
+            @Expect(testJsonBool(meta, "genericReplyToolDefaultDeny"), false)
+            @Expect(testJsonString(meta, "knowledgeClient"), "cangjie-knowledge-client")
         }
     }
 
@@ -241,7 +243,7 @@ public class GatewayMcpHttpSharedTest {
         @Expect(testJsonBool(knowledge, "timeout"), true)
         @Expect(testJsonBool(knowledge, "localPathRead"), false)
         let audit = testJsonObject(result, "audit")
-        @Expect(testJsonString(audit, "knowledgeVersion"), "unavailable")
+        @Expect(testJsonString(audit, "knowledgeVersion"), "ckb-v2")
         @Expect(testJsonInt(audit, "hitCount"), 0)
         @Expect(testJsonBool(audit, "truncated"), false)
     }
@@ -260,13 +262,101 @@ public class GatewayMcpHttpSharedTest {
         row.put("text", JsonString("The tests failed on the lint step."))
         evidence.add(row)
         args.put("evidence", evidence)
-        let result = gatewayMcpGitCodeToolResultJson("gitcode_pr_summarize", args)
+        let result = gatewayMcpGitCodeToolResultJsonWithRuntime(
+            "gitcode_pr_summarize",
+            args,
+            modelRunner: Some({ _: String, _: JsonObject => "{\"text\":\"Lint failed on the PR.\"}" })
+        )
         @Expect(testJsonString(result, "status"), "ok")
         @Expect(testJsonBool(result, "readOnly"), true)
         let knowledge = testJsonObject(result, "knowledge")
         @Expect(testJsonString(knowledge, "knowledgeVersion"), "ckb-v1")
         @Expect(testJsonInt(knowledge, "hitCount"), 1)
         @Expect(testJsonBool(knowledge, "truncated"), false)
+        let summary = testJsonObject(result, "summary")
+        @Expect(testJsonBool(summary, "generatedByModel"), true)
+        @Expect(testJsonString(summary, "text"), "Lint failed on the PR.")
+    }
+
+    @TestCase
+    public func gitCodeKnowledgeRunnerFeedsEvidencePackIntoAgentDraft(): Unit {
+        let args = JsonObject()
+        args.put("requestId", JsonString("req-knowledge-runner"))
+        args.put("caller", JsonString("monitor"))
+        args.put("repository", JsonString("owner/repo"))
+        args.put("issueId", JsonString("42"))
+        args.put("intent", JsonString("answer question"))
+        let result = gatewayMcpGitCodeToolResultJsonWithRuntime(
+            "gitcode_issue_draft_reply",
+            args,
+            modelRunner: Some({ _: String, _: JsonObject =>
+                "{\"body\":\"The API requires import std.collection.*.\",\"readyToPost\":true}"
+            }),
+            knowledgeRunner: Some({ _: String, _: JsonObject =>
+                let pack = JsonObject()
+                pack.put("status", JsonString("ok"))
+                pack.put("knowledgeVersion", JsonString("ckb-live-v1"))
+                let evidence = JsonArray([])
+                let row = JsonObject()
+                row.put("source", JsonString("ckb"))
+                row.put("text", JsonString("ArrayList requires std.collection import."))
+                evidence.add(row)
+                pack.put("evidence", evidence)
+                pack.put("truncated", false.toJsonValue())
+                pack
+            })
+        )
+        @Expect(testJsonString(result, "status"), "ok")
+        @Expect(testJsonBool(result, "needsHumanReview"), false)
+        let knowledge = testJsonObject(result, "knowledge")
+        @Expect(testJsonString(knowledge, "client"), "cangjie-knowledge-client")
+        @Expect(testJsonString(knowledge, "knowledgeVersion"), "ckb-live-v1")
+        @Expect(testJsonInt(knowledge, "hitCount"), 1)
+        let audit = testJsonObject(result, "audit")
+        @Expect(testJsonString(audit, "knowledgeVersion"), "ckb-live-v1")
+        @Expect(testJsonInt(audit, "hitCount"), 1)
+        let draft = testJsonObject(result, "draft")
+        @Expect(testJsonBool(draft, "readyToPost"), true)
+        @Expect(testJsonString(draft, "body"), "The API requires import std.collection.*.")
+        @Expect(testJsonBool(draft, "generatedByModel"), true)
+    }
+
+    @TestCase
+    public func gitCodeKnowledgeRunnerTruncatedKeepsDraftHumanReview(): Unit {
+        let args = JsonObject()
+        args.put("requestId", JsonString("req-knowledge-truncated"))
+        args.put("caller", JsonString("monitor"))
+        args.put("repository", JsonString("owner/repo"))
+        args.put("issueId", JsonString("42"))
+        args.put("intent", JsonString("answer question"))
+        let result = gatewayMcpGitCodeToolResultJsonWithRuntime(
+            "gitcode_issue_draft_reply",
+            args,
+            modelRunner: Some({ _: String, _: JsonObject =>
+                "{\"body\":\"Do not auto-post this.\",\"readyToPost\":true}"
+            }),
+            knowledgeRunner: Some({ _: String, _: JsonObject =>
+                let pack = JsonObject()
+                pack.put("status", JsonString("ok"))
+                pack.put("knowledgeVersion", JsonString("ckb-live-v2"))
+                let evidence = JsonArray([])
+                let row = JsonObject()
+                row.put("source", JsonString("ckb"))
+                row.put("text", JsonString("Partial evidence."))
+                evidence.add(row)
+                pack.put("evidence", evidence)
+                pack.put("truncated", true.toJsonValue())
+                pack
+            })
+        )
+        @Expect(testJsonString(result, "status"), "needs_human_review")
+        @Expect(testJsonBool(result, "needsHumanReview"), true)
+        let knowledge = testJsonObject(result, "knowledge")
+        @Expect(testJsonString(knowledge, "knowledgeVersion"), "ckb-live-v2")
+        @Expect(testJsonBool(knowledge, "truncated"), true)
+        let draft = testJsonObject(result, "draft")
+        @Expect(testJsonBool(draft, "readyToPost"), false)
+        @Expect(testJsonString(draft, "body"), "")
     }
 
     @TestCase
