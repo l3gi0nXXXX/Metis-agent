@@ -3305,21 +3305,16 @@ public class FeishuAdapter <: ChannelAdapter {
         row.put("messageId", JsonString(item.messageId))
         row.put("messageType", JsonString(itemType))
         row.put("text", JsonString(itemText))
-        if (itemType == "merge_forward" && depth >= 1) {
-            row.put("status", JsonString("depth_limit_exceeded"))
-            row.put("reason", JsonString("nested merge_forward expansion depth limit reached"))
-            messagesJson.add(row)
-            if (!itemText.trimAscii().isEmpty()) {
-                textPieces.add(itemText)
-            }
-            return
-        }
-        row.put("status", JsonString("expanded"))
-        messagesJson.add(row)
-        if (!itemText.trimAscii().isEmpty()) {
-            textPieces.add(itemText)
-        }
         if (itemType == "merge_forward") {
+            if (depth >= 1) {
+                row.put("status", JsonString("depth_limit_exceeded"))
+                row.put("reason", JsonString("nested merge_forward expansion depth limit reached"))
+                messagesJson.add(row)
+                if (!itemText.trimAscii().isEmpty()) {
+                    textPieces.add(itemText)
+                }
+                return
+            }
             let nested = this.apiClient.listMergeForwardMessages(this.normalizeAccountId(accountId), item.messageId)
             if (nested.ok) {
                 for (nestedItem in nested.messages) {
@@ -3336,6 +3331,11 @@ public class FeishuAdapter <: ChannelAdapter {
                 }
             }
             return
+        }
+        row.put("status", JsonString("expanded"))
+        messagesJson.add(row)
+        if (!itemText.trimAscii().isEmpty()) {
+            textPieces.add(itemText)
         }
         let itemRecords = this.feishuHistoricalRecordsFromMessage(
             accountId,
