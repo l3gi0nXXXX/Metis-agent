@@ -1,6 +1,6 @@
 package metis.gateway.channels.feishu
 
-import metis.core.parseGatewayEditText
+import metis.core.{parseGatewayAudioParts, parseGatewayDocumentParts, parseGatewayEditText, parseGatewayPhotoParts, parseGatewayReactionRemove, parseGatewayReactionStatus, parseGatewayReactionToken, parseGatewayVideoParts}
 import metis.core.config.CliConfig
 import metis.gateway.core.{ChannelAdapter, gatewayLogIdentityHash}
 import metis.gateway.logging.{MetisLogEvent, metisCreateSubsystemLogger}
@@ -40,6 +40,12 @@ public interface FeishuApiClient {
     func sendTextMessage(accountId: String, rawPeerId: String, receiveId: String, receiveIdType: String, text: String, replyToMessageId: Option<String>, replyInThread: Bool): FeishuApiSendResult
     func sendInteractiveCard(accountId: String, rawPeerId: String, receiveId: String, receiveIdType: String, card: FeishuInteractiveCard, replyToMessageId: Option<String>, replyInThread: Bool): FeishuApiSendResult
     func patchInteractiveCard(accountId: String, messageId: String, card: FeishuInteractiveCard): FeishuApiSendResult
+    func uploadMedia(accountId: String, mediaType: String, localPath: String, bytes: Array<Byte>, mimeType: String, fileName: String): FeishuApiSendResult
+    func sendMediaMessage(accountId: String, rawPeerId: String, receiveId: String, receiveIdType: String, messageType: String, mediaKey: String, caption: String, replyToMessageId: Option<String>, replyInThread: Bool): FeishuApiSendResult
+    func addMessageReaction(accountId: String, messageId: String, reactionType: String): FeishuApiSendResult
+    func removeMessageReaction(accountId: String, messageId: String, reactionType: String): FeishuApiSendResult
+    func listMessageReactions(accountId: String, messageId: String): Array<String>
+    func deleteMessage(accountId: String, messageId: String): FeishuApiSendResult
 }
 
 public class FeishuMessageFetchResult {
@@ -175,6 +181,47 @@ public class FeishuNoopApiClient <: FeishuApiClient {
     public func patchInteractiveCard(_accountId: String, _messageId: String, _card: FeishuInteractiveCard): FeishuApiSendResult {
         FeishuApiSendResult(status: "not_configured", error: "feishu api client is not configured")
     }
+
+    public func uploadMedia(
+        _accountId: String,
+        _mediaType: String,
+        _localPath: String,
+        _bytes: Array<Byte>,
+        _mimeType: String,
+        _fileName: String
+    ): FeishuApiSendResult {
+        FeishuApiSendResult(status: "not_configured", error: "feishu api client is not configured")
+    }
+
+    public func sendMediaMessage(
+        _accountId: String,
+        _rawPeerId: String,
+        _receiveId: String,
+        _receiveIdType: String,
+        _messageType: String,
+        _mediaKey: String,
+        _caption: String,
+        _replyToMessageId: Option<String>,
+        _replyInThread: Bool
+    ): FeishuApiSendResult {
+        FeishuApiSendResult(status: "not_configured", error: "feishu api client is not configured")
+    }
+
+    public func addMessageReaction(_accountId: String, _messageId: String, _reactionType: String): FeishuApiSendResult {
+        FeishuApiSendResult(status: "not_configured", error: "feishu api client is not configured")
+    }
+
+    public func removeMessageReaction(_accountId: String, _messageId: String, _reactionType: String): FeishuApiSendResult {
+        FeishuApiSendResult(status: "not_configured", error: "feishu api client is not configured")
+    }
+
+    public func listMessageReactions(_accountId: String, _messageId: String): Array<String> {
+        []
+    }
+
+    public func deleteMessage(_accountId: String, _messageId: String): FeishuApiSendResult {
+        FeishuApiSendResult(status: "not_configured", error: "feishu api client is not configured")
+    }
 }
 
 public class FeishuFakeApiClient <: FeishuApiClient {
@@ -186,6 +233,10 @@ public class FeishuFakeApiClient <: FeishuApiClient {
     private let textMessages = ArrayList<String>()
     private let sentCards = ArrayList<FeishuInteractiveCard>()
     private let patchedCards = ArrayList<FeishuInteractiveCard>()
+    private let uploadedMedia = ArrayList<String>()
+    private let sentMediaMessages = ArrayList<String>()
+    private let messageReactions = HashMap<String, ArrayList<String>>()
+    private let deletedMessages = ArrayList<String>()
     private var nextTextSendFailureStatus: String = ""
     private var nextTextSendFailureError: String = ""
     private var nextCardSendFailureStatus: String = ""
@@ -347,12 +398,87 @@ public class FeishuFakeApiClient <: FeishuApiClient {
         FeishuApiSendResult(ok: true, status: "ok", messageId: _messageId.trimAscii())
     }
 
+    public func uploadMedia(
+        accountId: String,
+        mediaType: String,
+        localPath: String,
+        bytes: Array<Byte>,
+        mimeType: String,
+        fileName: String
+    ): FeishuApiSendResult {
+        let kind = mediaType.trimAscii().toAsciiLower()
+        this.uploadedMedia.add("${this.normalize(accountId)}|${kind}|${localPath.trimAscii()}|${mimeType.trimAscii()}|${fileName.trimAscii()}|${bytes.size}")
+        FeishuApiSendResult(ok: true, status: "ok", messageId: "fake-feishu-${kind}-key-${this.uploadedMedia.size}")
+    }
+
+    public func sendMediaMessage(
+        accountId: String,
+        rawPeerId: String,
+        receiveId: String,
+        receiveIdType: String,
+        messageType: String,
+        mediaKey: String,
+        caption: String,
+        _replyToMessageId: Option<String>,
+        _replyInThread: Bool
+    ): FeishuApiSendResult {
+        let kind = messageType.trimAscii().toAsciiLower()
+        this.sentMediaMessages.add("${this.normalize(accountId)}|${rawPeerId.trimAscii()}|${receiveId.trimAscii()}|${receiveIdType.trimAscii()}|${kind}|${mediaKey.trimAscii()}|${caption.trimAscii()}")
+        FeishuApiSendResult(ok: true, status: "ok", messageId: "fake-feishu-${kind}-${this.sentMediaMessages.size}")
+    }
+
+    public func addMessageReaction(accountId: String, messageId: String, reactionType: String): FeishuApiSendResult {
+        let key = this.actionKey(accountId, messageId)
+        let token = reactionType.trimAscii()
+        let current = this.messageReactions.get(key) ?? ArrayList<String>()
+        if (!token.isEmpty() && !current.contains(token)) {
+            current.add(token)
+        }
+        this.messageReactions[key] = current
+        FeishuApiSendResult(ok: true, status: "ok", messageId: messageId.trimAscii())
+    }
+
+    public func removeMessageReaction(accountId: String, messageId: String, reactionType: String): FeishuApiSendResult {
+        let key = this.actionKey(accountId, messageId)
+        let token = reactionType.trimAscii()
+        let current = this.messageReactions.get(key) ?? ArrayList<String>()
+        let next = ArrayList<String>()
+        for (item in current) {
+            if (!token.isEmpty() && item != token) {
+                next.add(item)
+            }
+        }
+        this.messageReactions[key] = next
+        FeishuApiSendResult(ok: true, status: "ok", messageId: messageId.trimAscii())
+    }
+
+    public func listMessageReactions(accountId: String, messageId: String): Array<String> {
+        (this.messageReactions.get(this.actionKey(accountId, messageId)) ?? ArrayList<String>()).toArray()
+    }
+
+    public func deleteMessage(accountId: String, messageId: String): FeishuApiSendResult {
+        this.deletedMessages.add("${this.normalize(accountId)}|${messageId.trimAscii()}")
+        FeishuApiSendResult(ok: true, status: "ok", messageId: messageId.trimAscii())
+    }
+
     public func cardSendCount(): Int64 {
         this.sentCards.size
     }
 
     public func textSendCount(): Int64 {
         this.textMessages.size
+    }
+
+    public func uploadedMediaCount(): Int64 {
+        this.uploadedMedia.size
+    }
+
+    public func mediaSendCount(): Int64 {
+        this.sentMediaMessages.size
+    }
+
+    public func deletedMessageCount(): Int64 {
+        this.deletedMessages.size
     }
 
     public func lastTextMessage(): String {
@@ -394,6 +520,10 @@ public class FeishuFakeApiClient <: FeishuApiClient {
     }
 
     private func messageKey(accountId: String, messageId: String): String {
+        "${this.normalize(accountId)}|${messageId.trimAscii()}"
+    }
+
+    private func actionKey(accountId: String, messageId: String): String {
         "${this.normalize(accountId)}|${messageId.trimAscii()}"
     }
 
@@ -812,6 +942,8 @@ public class FeishuAdapter <: ChannelAdapter {
         let accountId = this.outboundAccountId(message)
         let sentMessageId = if (this.feishuShouldPatchInteractiveCard(message)) {
             this.patchInteractiveCardForOutbound(accountId, message)
+        } else if (let Some(structuredId) <- this.sendStructuredPayloadToFeishu(accountId, message)) {
+            structuredId
         } else if (this.feishuShouldUseInteractiveCardForOutbound(accountId, message)) {
             this.sendInteractiveCardForOutbound(accountId, message)
         } else {
@@ -865,6 +997,322 @@ public class FeishuAdapter <: ChannelAdapter {
             this.lastSendError = if (result.error.isEmpty()) { result.status } else { result.error }
         }
         ""
+    }
+
+    private func sendStructuredPayloadToFeishu(accountId: String, message: OutboundMessage): Option<String> {
+        let normalized = message.text.replace("\r\n", "\n").replace("\r", "\n").trimAscii()
+        if (normalized == "[delete]") {
+            return Some(this.deleteFeishuMessageForOutbound(accountId, message))
+        }
+        if (normalized.startsWith("[reaction]")) {
+            return Some(this.sendFeishuReactionForOutbound(accountId, message))
+        }
+        match (this.feishuOutboundMediaParts(message.text)) {
+            case Some(parts) =>
+                return Some(this.sendFeishuMediaForOutbound(accountId, message, parts[0], parts[1], parts[2], parts[3]))
+            case None => ()
+        }
+        None<String>
+    }
+
+    private func feishuOutboundMediaParts(raw: String): Option<(String, String, String, String)> {
+        let normalized = raw.replace("\r\n", "\n").replace("\r", "\n").trimAscii()
+        if (normalized.startsWith("[photo]")) {
+            let parsed = parseGatewayPhotoParts(raw)
+            return Some(("image", "image", parsed[0], parsed[1]))
+        }
+        if (normalized.startsWith("[document]")) {
+            let parsed = parseGatewayDocumentParts(raw)
+            return Some(("file", "file", parsed[0], parsed[1]))
+        }
+        if (normalized.startsWith("[audio]")) {
+            let parsed = parseGatewayAudioParts(raw)
+            return Some(("audio", "audio", parsed[0], parsed[1]))
+        }
+        if (normalized.startsWith("[video]")) {
+            let parsed = parseGatewayVideoParts(raw)
+            return Some(("media", "media", parsed[0], parsed[1]))
+        }
+        None<(String, String, String, String)>
+    }
+
+    private func sendFeishuMediaForOutbound(
+        accountId: String,
+        message: OutboundMessage,
+        messageType: String,
+        mediaType: String,
+        mediaRef: String,
+        caption: String
+    ): String {
+        let receiveId = this.normalizeSendTarget(message.peerId)
+        if (receiveId.isEmpty()) {
+            this.lastSendError = "peerId is empty"
+            return ""
+        }
+        let mediaKey = this.resolveFeishuOutboundMediaKey(accountId, messageType, mediaType, mediaRef)
+        if (mediaKey.isEmpty()) {
+            return ""
+        }
+        let receiveIdType = this.resolveReceiveIdType(message.peerId)
+        let result = this.apiClient.sendMediaMessage(
+            gatewayFeishuNormalizeAccountId(accountId),
+            message.peerId,
+            receiveId,
+            receiveIdType,
+            messageType,
+            mediaKey,
+            caption,
+            message.replyToMessageId,
+            message.replyInThread
+        )
+        if (result.ok && !result.messageId.isEmpty()) {
+            this.lastSendError = ""
+            return result.messageId
+        }
+        if (result.status != "not_configured") {
+            this.lastSendError = if (result.error.isEmpty()) { result.status } else { result.error }
+            return ""
+        }
+        this.sendFeishuMediaMessageViaHttp(
+            accountId,
+            message.peerId,
+            receiveId,
+            messageType,
+            mediaKey,
+            message.replyToMessageId,
+            message.replyInThread
+        )
+    }
+
+    private func resolveFeishuOutboundMediaKey(
+        accountId: String,
+        messageType: String,
+        mediaType: String,
+        mediaRef: String
+    ): String {
+        let ref = mediaRef.trimAscii()
+        if (ref.isEmpty()) {
+            this.lastSendError = "feishu outbound ${messageType} media reference is empty"
+            return ""
+        }
+        let lowered = ref.toAsciiLower()
+        if (lowered.startsWith("http://") || lowered.startsWith("https://") || ref.contains("://") && !lowered.startsWith("file://")) {
+            this.lastSendError = "feishu remote media URL is not supported without a trusted fetcher"
+            return ""
+        }
+        if (!this.feishuLooksLikeLocalOutboundMediaPath(ref)) {
+            return ref
+        }
+        let localPath = this.normalizeFeishuOutboundLocalPath(ref)
+        if (!localPath.startsWith("/")) {
+            this.lastSendError = "feishu outbound local media path must be absolute"
+            return ""
+        }
+        let canonicalPath = try {
+            canonicalize(Path(localPath)).toString()
+        } catch (_e: Exception) {
+            this.lastSendError = "feishu outbound local media path does not exist"
+            return ""
+        }
+        if (!exists(Path(canonicalPath))) {
+            this.lastSendError = "feishu outbound local media path does not exist"
+            return ""
+        }
+        let bytes = try {
+            File.readFrom(Path(canonicalPath))
+        } catch (e: Exception) {
+            this.lastSendError = "feishu outbound local media read failed: ${e.message}"
+            return ""
+        }
+        let sizeBytes = Int64(bytes.size)
+        let cfg = this.feishuConfigForAccount(accountId)
+        if (this.feishuMediaSizeExceedsLimit(cfg, sizeBytes)) {
+            this.lastSendError = "size_limit_exceeded: feishu outbound media size ${sizeBytes} exceeds limit ${cfg.media.mediaMaxBytes}"
+            return ""
+        }
+        let mimeType = this.feishuOutboundMimeTypeForPath(canonicalPath, messageType)
+        if (!this.feishuMediaMimeAllowed(cfg, mimeType)) {
+            this.lastSendError = "mime_not_allowed: feishu outbound media MIME ${mimeType} is not allowed"
+            return ""
+        }
+        let fileName = Path(canonicalPath).fileName
+        let upload = this.apiClient.uploadMedia(
+            gatewayFeishuNormalizeAccountId(accountId),
+            mediaType,
+            canonicalPath,
+            bytes,
+            mimeType,
+            fileName
+        )
+        if (upload.ok && !upload.messageId.isEmpty()) {
+            return upload.messageId
+        }
+        if (upload.status != "not_configured") {
+            this.lastSendError = if (upload.error.isEmpty()) { upload.status } else { upload.error }
+            return ""
+        }
+        this.lastSendError = "feishu native media upload is not configured"
+        ""
+    }
+
+    private func deleteFeishuMessageForOutbound(accountId: String, message: OutboundMessage): String {
+        let targetMessageId = match (message.replyToMessageId) {
+            case Some(v) => v.trimAscii()
+            case None => ""
+        }
+        if (targetMessageId.isEmpty()) {
+            this.lastSendError = "feishu delete requires replyToMessageId"
+            return ""
+        }
+        let result = this.apiClient.deleteMessage(gatewayFeishuNormalizeAccountId(accountId), targetMessageId)
+        if (result.ok) {
+            this.lastSendError = ""
+            return if (!result.messageId.isEmpty()) { result.messageId } else { targetMessageId }
+        }
+        if (result.status != "not_configured") {
+            this.lastSendError = if (result.error.isEmpty()) { result.status } else { result.error }
+        } else {
+            this.lastSendError = "feishu delete message api client is not configured"
+        }
+        ""
+    }
+
+    private func sendFeishuReactionForOutbound(accountId: String, message: OutboundMessage): String {
+        let targetMessageId = match (message.replyToMessageId) {
+            case Some(v) => v.trimAscii()
+            case None => ""
+        }
+        if (targetMessageId.isEmpty()) {
+            this.lastSendError = "feishu reaction requires replyToMessageId"
+            return ""
+        }
+        let remove = parseGatewayReactionRemove(message.text)
+        var reactionType = parseGatewayReactionToken(message.text)
+        if (reactionType.isEmpty()) {
+            reactionType = this.feishuReactionTypeForStatus(parseGatewayReactionStatus(message.text))
+        }
+        reactionType = this.normalizeFeishuReactionType(reactionType)
+        if (reactionType.isEmpty() && !remove) {
+            this.lastSendError = "feishu reaction token is empty"
+            return ""
+        }
+        let result = if (remove) {
+            this.apiClient.removeMessageReaction(gatewayFeishuNormalizeAccountId(accountId), targetMessageId, reactionType)
+        } else {
+            this.apiClient.addMessageReaction(gatewayFeishuNormalizeAccountId(accountId), targetMessageId, reactionType)
+        }
+        if (result.ok) {
+            this.lastSendError = ""
+            return if (!result.messageId.isEmpty()) { result.messageId } else { targetMessageId }
+        }
+        if (result.status != "not_configured") {
+            this.lastSendError = if (result.error.isEmpty()) { result.status } else { result.error }
+        } else {
+            this.lastSendError = "feishu reaction api client is not configured"
+        }
+        ""
+    }
+
+    private func feishuReactionTypeForStatus(status: String): String {
+        match (status.trimAscii().toAsciiLower()) {
+            case "queued" => "EYES"
+            case "thinking" => "THINKING"
+            case "tool" | "coding" => "FIRE"
+            case "done" => "THUMBSUP"
+            case "error" => "ERROR"
+            case _ => ""
+        }
+    }
+
+    private func normalizeFeishuReactionType(raw: String): String {
+        let token = raw.trimAscii()
+        let lower = token.toAsciiLower().replace("-", "_")
+        if (lower == "+1" || lower == "thumbsup" || lower == "thumbs_up" || lower == "like") {
+            return "THUMBSUP"
+        }
+        if (lower == "ok" || lower == "done") {
+            return "OK"
+        }
+        token
+    }
+
+    private func feishuLooksLikeLocalOutboundMediaPath(ref: String): Bool {
+        let trimmed = ref.trimAscii()
+        let lower = trimmed.toAsciiLower()
+        lower.startsWith("file://") || trimmed.startsWith("/") || trimmed.startsWith("./") || trimmed.startsWith("../") || trimmed.startsWith("~")
+    }
+
+    private func normalizeFeishuOutboundLocalPath(ref: String): String {
+        let trimmed = ref.trimAscii()
+        if (trimmed.toAsciiLower().startsWith("file://")) {
+            return trimmed[7..]
+        }
+        trimmed
+    }
+
+    private func feishuOutboundMimeTypeForPath(path: String, messageType: String): String {
+        let lower = path.trimAscii().toAsciiLower()
+        if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) { return "image/jpeg" }
+        if (lower.endsWith(".png")) { return "image/png" }
+        if (lower.endsWith(".gif")) { return "image/gif" }
+        if (lower.endsWith(".webp")) { return "image/webp" }
+        if (lower.endsWith(".pdf")) { return "application/pdf" }
+        if (lower.endsWith(".txt") || lower.endsWith(".md")) { return "text/plain" }
+        if (lower.endsWith(".json")) { return "application/json" }
+        if (lower.endsWith(".ogg")) { return "audio/ogg" }
+        if (lower.endsWith(".mp3")) { return "audio/mpeg" }
+        if (lower.endsWith(".m4a")) { return "audio/mp4" }
+        if (lower.endsWith(".mp4")) { return if (messageType == "audio") { "audio/mp4" } else { "video/mp4" } }
+        "application/octet-stream"
+    }
+
+    private func sendFeishuMediaMessageViaHttp(
+        accountId: String,
+        chatId: String,
+        receiveId: String,
+        messageType: String,
+        mediaKey: String,
+        replyToMessageId: Option<String>,
+        replyInThread: Bool
+    ): String {
+        let cfg = this.feishuConfigForAccount(accountId)
+        let token = this.getTenantAccessTokenForConfig(accountId, cfg)
+        if (token.isEmpty()) {
+            this.lastSendError = "tenant_access_token is empty"
+            return ""
+        }
+        let header = HashMap<String, String>([
+            ("Content-Type", "application/json; charset=utf-8"),
+            ("Authorization", "Bearer ${token}")
+        ])
+        let contentJson = this.feishuMediaMessageContentJson(messageType, mediaKey)
+        let responseOpt = if (let Some(replyId) <- replyToMessageId) {
+            let normalizedReplyId = replyId.trimAscii()
+            if (normalizedReplyId.isEmpty()) {
+                this.sendCreateMessageRequest(cfg, chatId, receiveId, contentJson, header, msgType: messageType)
+            } else {
+                this.sendReplyMessageRequest(cfg, normalizedReplyId, contentJson, header, replyInThread: replyInThread, msgType: messageType)
+            }
+        } else {
+            this.sendCreateMessageRequest(cfg, chatId, receiveId, contentJson, header, msgType: messageType)
+        }
+        let responseRaw = match (responseOpt) {
+            case Some(resp) => resp
+            case None =>
+                this.lastSendError = "empty http response"
+                return ""
+        }
+        this.parseFeishuApiMessageId(responseRaw)
+    }
+
+    private func feishuMediaMessageContentJson(messageType: String, mediaKey: String): String {
+        let content = JsonObject()
+        if (messageType == "image") {
+            content.put("image_key", JsonString(mediaKey.trimAscii()))
+        } else {
+            content.put("file_key", JsonString(mediaKey.trimAscii()))
+        }
+        content.toJsonString()
     }
 
     private func sendInteractiveCardForOutbound(accountId: String, message: OutboundMessage): String {
@@ -4798,14 +5246,15 @@ public class FeishuAdapter <: ChannelAdapter {
         rawPeerId: String,
         receiveId: String,
         contentJson: String,
-        header: HashMap<String, String>
+        header: HashMap<String, String>,
+        msgType!: String = "text"
     ): Option<String> {
         let base = this.normalizeFeishuDomain(cfg)
         let receiveIdType = this.resolveReceiveIdType(rawPeerId)
         let url = "${base}/open-apis/im/v1/messages?receive_id_type=${receiveIdType}"
         let body = HashMap<String, JsonValue>()
         body["receive_id"] = JsonString(receiveId)
-        body["msg_type"] = JsonString("text")
+        body["msg_type"] = JsonString(if (msgType.trimAscii().isEmpty()) { "text" } else { msgType.trimAscii() })
         body["content"] = JsonString(contentJson)
         HttpUtils.post(url, header, JsonObject(body))
     }
@@ -4815,13 +5264,14 @@ public class FeishuAdapter <: ChannelAdapter {
         replyToMessageId: String,
         contentJson: String,
         header: HashMap<String, String>,
-        replyInThread!: Bool = false
+        replyInThread!: Bool = false,
+        msgType!: String = "text"
     ): Option<String> {
         let base = this.normalizeFeishuDomain(cfg)
         let url = "${base}/open-apis/im/v1/messages/${replyToMessageId}/reply"
         let body = HashMap<String, JsonValue>()
         body["content"] = JsonString(contentJson)
-        body["msg_type"] = JsonString("text")
+        body["msg_type"] = JsonString(if (msgType.trimAscii().isEmpty()) { "text" } else { msgType.trimAscii() })
         if (replyInThread) {
             body["reply_in_thread"] = JsonBool(true)
         }
