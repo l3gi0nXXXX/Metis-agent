@@ -1709,6 +1709,50 @@ public class FeishuAdapterTest {
     }
 
     @TestCase
+    public func dmPairingApprovalOnboardingSendsConfirmationAndAuthStatus(): Unit {
+        let root = this.pairingTestRoot("prompt-approve-onboarding")
+        try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        let client = FeishuFakeApiClient()
+        let adapter = FeishuAdapter(
+            config: FeishuConfig(enabled: true, dmPolicy: "pairing"),
+            accountId: "tenant-a",
+            apiClient: client,
+            pairingRoot: root
+        )
+        adapter.start()
+        try {
+            @Expect(adapter.ingestWebhookPayload(this.webhookPayload(
+                "om_pair_onboard",
+                "oc_dm_a",
+                "ou_pair_sender",
+                "{\\\"text\\\":\\\"hello\\\"}",
+                chatType: "p2p",
+                headerAccountId: "tenant-a"
+            )).contains("\"ok\":true"), true)
+            @Expect(adapter.pullInbound().size, 1)
+            let code = adapter.debugFeishuPairingPendingCodeForTest("ou_pair_sender", accountId: "tenant-a")
+
+            let result = adapter.debugFeishuPairingApproveOnboardingForTest(code, accountId: "tenant-a", chatId: "oc_dm_a")
+
+            @Expect(result.get("approved").getOrThrow().asBool().getValue(), true)
+            @Expect(result.get("accountId").getOrThrow().asString().getValue(), "tenant-a")
+            @Expect(result.get("senderId").getOrThrow().asString().getValue(), "ou_pair_sender")
+            @Expect(result.get("confirmationSent").getOrThrow().asBool().getValue(), true)
+            let auth = result.get("authStatus").getOrThrow().asObject()
+            @Expect(auth.get("status").getOrThrow().asString().getValue(), "missing_app_credentials")
+            @Expect(auth.get("action").getOrThrow().asString().getValue(), "feishu_auth_status")
+            @Expect(client.textSendCount(), 2)
+            let confirmation = client.lastTextMessage()
+            @Expect(confirmation.contains("Pairing approved."), true)
+            @Expect(confirmation.contains("Feishu auth status: missing_app_credentials"), true)
+            @Expect(confirmation.contains("appSecret"), false)
+            @Expect(confirmation.contains("Authorization"), false)
+        } finally {
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
     public func dmPairingApprovalIsAccountScoped(): Unit {
         let root = this.pairingTestRoot("account-scope")
         try { remove(root, recursive: true) } catch (_e: Exception) { () }

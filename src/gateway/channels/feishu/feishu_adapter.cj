@@ -6,7 +6,7 @@ import metis.gateway.core.{ChannelAdapter, gatewayLogIdentityHash}
 import metis.gateway.logging.{MetisLogEvent, metisCreateSubsystemLogger}
 import metis.gateway.model.*
 import metis.gateway.model.FeishuConfig
-import metis.gateway.security.gatewayPairingAccountStore
+import metis.gateway.security.{GatewayPairingStore, gatewayPairingAccountStore}
 import metis.utils.ShellUtils
 import magic.jsonable.*
 import magic.utils.http.HttpUtils
@@ -691,6 +691,66 @@ public class FeishuAdapter <: ChannelAdapter {
             rootDir: this.pairingRoot
         )
             .approve(code)
+    }
+
+    public func debugFeishuPairingApproveOnboardingForTest(code: String, accountId!: String = "", chatId!: String = ""): JsonObject {
+        let normalizedAccountId = this.normalizeAccountId(if (accountId.trimAscii().isEmpty()) { this.effectiveAccountId() } else { accountId })
+        let store = gatewayPairingAccountStore(
+            channel: "feishu",
+            accountId: normalizedAccountId,
+            rootDir: this.pairingRoot
+        )
+        let senderId = this.feishuPairingSenderForCode(store, code)
+        let approved = store.approve(code)
+        let authStatus = this.feishuPairingOnboardingAuthStatus(normalizedAccountId)
+        var confirmationSent = false
+        var confirmationStatus = "not_sent"
+        if (approved && !chatId.trimAscii().isEmpty()) {
+            let authStatusText = this.readStringField(authStatus, "status")
+            let sendResult = this.sendTextToFeishuDetailedForAccount(
+                normalizedAccountId,
+                chatId.trimAscii(),
+                "Pairing approved.\nFeishu auth status: ${authStatusText}"
+            )
+            confirmationSent = sendResult[0]
+            confirmationStatus = if (sendResult[0]) { "ok" } else { sendResult[1] }
+        }
+        let out = JsonObject()
+        out.put("channel", JsonString("feishu"))
+        out.put("accountId", JsonString(normalizedAccountId))
+        out.put("senderId", JsonString(senderId))
+        out.put("approved", JsonBool(approved))
+        out.put("confirmationSent", JsonBool(confirmationSent))
+        out.put("confirmationStatus", JsonString(confirmationStatus))
+        out.put("authStatus", authStatus)
+        out.put("redacted", JsonBool(true))
+        out
+    }
+
+    private func feishuPairingSenderForCode(store: GatewayPairingStore, code: String): String {
+        let normalizedCode = code.trimAscii().toAsciiUpper()
+        if (normalizedCode.isEmpty()) {
+            return ""
+        }
+        for (row in store.pendingRows()) {
+            if (this.readStringField(row, "code").trimAscii().toAsciiUpper() == normalizedCode) {
+                return this.readStringField(row, "senderId")
+            }
+        }
+        ""
+    }
+
+    private func feishuPairingOnboardingAuthStatus(accountId: String): JsonObject {
+        let resolved = gatewayFeishuResolveAccount(this.config, accountId)
+        let out = JsonObject()
+        let configured = !resolved.config.appId.trimAscii().isEmpty() && !resolved.config.appSecret.trimAscii().isEmpty()
+        out.put("action", JsonString("feishu_auth_status"))
+        out.put("accountId", JsonString(resolved.accountId))
+        out.put("status", JsonString(if (configured) { "auth_required" } else { "missing_app_credentials" }))
+        out.put("configured", JsonBool(configured))
+        out.put("repairMethod", JsonString("channels.feishu.auth.start"))
+        out.put("redacted", JsonBool(true))
+        out
     }
 
     private func channelLogMeta(

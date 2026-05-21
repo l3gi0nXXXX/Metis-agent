@@ -1,6 +1,6 @@
 package metis.gateway.tools
 
-import metis.core.config.MetisProcessEnvironmentLock
+import metis.core.config.{GatewayUserSettings, MetisProcessEnvironmentLock}
 
 import std.collection.{ArrayList, HashMap}
 import std.env.{getVariable, setVariable}
@@ -217,6 +217,9 @@ private class FeishuOapiToolsetCountingHttpClient <: FeishuOapiHttpClient {
 private class FeishuOapiToolsetFakeAppTokenClient <: FeishuOapiAppTokenClient {
     public let accountIds = ArrayList<String>()
     public let modes = ArrayList<String>()
+    public let credentialAppIds = ArrayList<String>()
+    public let credentialAppSecrets = ArrayList<String>()
+    public let credentialDomains = ArrayList<String>()
     private let statusValue: String
     private let errorValue: String
 
@@ -228,6 +231,9 @@ private class FeishuOapiToolsetFakeAppTokenClient <: FeishuOapiAppTokenClient {
     public func fetch(accountId: String, tokenMode: String, credentials: FeishuOapiAppCredentials): FeishuOapiAppTokenResult {
         this.accountIds.add(accountId)
         this.modes.add(tokenMode)
+        this.credentialAppIds.add(credentials.appId)
+        this.credentialAppSecrets.add(credentials.appSecret)
+        this.credentialDomains.add(credentials.domain)
         if (this.statusValue != "authorized") {
             return FeishuOapiAppTokenResult(this.statusValue, error: this.errorValue)
         }
@@ -499,7 +505,13 @@ public class GatewayFeishuOapiToolsetTest {
         let request = feishuOapiBuildRequest("feishu_im_user_message", "send", "tenant-a", JsonObject())
         let authJson = MetisFeishuOapiClient().invoke(request)
         @Expect(authJson.get("status").getOrThrow().asString().getValue(), "auth_required")
-        @Expect(authJson.get("auth").getOrThrow().asObject().get("mode").getOrThrow().asString().getValue(), "user_access_token")
+        let auth = authJson.get("auth").getOrThrow().asObject()
+        @Expect(auth.get("mode").getOrThrow().asString().getValue(), "user_access_token")
+        let card = auth.get("card").getOrThrow().asObject()
+        @Expect(card.get("kind").getOrThrow().asString().getValue(), "feishu_auth_required")
+        @Expect(card.get("accountId").getOrThrow().asString().getValue(), "tenant-a")
+        @Expect(card.get("repairMethod").getOrThrow().asString().getValue(), "channels.feishu.auth.start")
+        @Expect(card.get("message").getOrThrow().asString().getValue().contains("{"), false)
 
         let userScopeJson = MetisFeishuOapiClient(
             tokenProvider: Some<FeishuOapiTokenProvider>(FeishuOapiToolsetScopeMissingTokenProvider())
@@ -599,6 +611,66 @@ public class GatewayFeishuOapiToolsetTest {
     }
 
     @TestCase
+    public func metisTokenProviderPrefersGatewayFeishuAccountConfigRootAndRefreshClient(): Unit {
+        let configuredRoot = feishuOapiToolsetTempRoot("account-root")
+        let ignoredRoot = feishuOapiToolsetTempRoot("ignored-root")
+        try { remove(configuredRoot, recursive: true) } catch (_e: Exception) { () }
+        try { remove(ignoredRoot, recursive: true) } catch (_e: Exception) { () }
+        try {
+            feishuOapiWriteStoredToken(configuredRoot, "tenant-a", "expired-access-token", "stored-refresh-token", 900, ["im:message:readonly"])
+
+            var user = GatewayUserSettings()
+            user.feishu.defaultAccount = "tenant-a"
+            user.feishu.appId = "top-app"
+            user.feishu.appSecret = "top-secret-never-visible"
+            user.feishu.domain = "https://open.feishu.cn"
+            let account = JsonObject()
+            account.put("appId", JsonString("tenant-app"))
+            account.put("appSecret", JsonString("tenant-secret-never-visible"))
+            account.put("domain", JsonString("https://open.larksuite.com/"))
+            account.put("userTokenRoot", JsonString(configuredRoot.toString()))
+            let accounts = JsonObject()
+            accounts.put("tenant-a", account)
+            user.feishu.accounts = Some(accounts)
+
+            let refresher = FeishuOapiToolsetFakeRefreshClient()
+            let provider = MetisFeishuOapiTokenProvider(
+                root: ignoredRoot,
+                userSettings: Some<GatewayUserSettings>(user),
+                refreshClient: Some<FeishuOapiRefreshClient>(refresher),
+                appId: "env-app",
+                appSecret: "env-secret-never-visible",
+                appDomain: "https://env.example",
+                nowMs: 1000
+            )
+            let refreshed = provider.userAccessToken("tenant-a", ["im:message:readonly"])
+            @Expect(refreshed.status, "authorized")
+            @Expect(refreshed.accessToken, "refreshed-access-token")
+            @Expect(refresher.calls[0], "tenant-a")
+            @Expect(refresher.calls[1], "stored-refresh-token")
+
+            let appTokenClient = FeishuOapiToolsetFakeAppTokenClient()
+            let appProvider = MetisFeishuOapiTokenProvider(
+                userSettings: Some<GatewayUserSettings>(user),
+                appTokenClient: Some<FeishuOapiAppTokenClient>(appTokenClient),
+                appId: "env-app",
+                appSecret: "env-secret-never-visible",
+                appDomain: "https://env.example",
+                nowMs: 1000
+            )
+            let appLookup = appProvider.tokenLookup("tenant-a", "tenant_access_token", ["task:task:write"])
+            @Expect(appLookup.status, "authorized")
+            @Expect(appTokenClient.accountIds[0], "tenant-a")
+            @Expect(appTokenClient.credentialAppIds[0], "tenant-app")
+            @Expect(appTokenClient.credentialAppSecrets[0], "tenant-secret-never-visible")
+            @Expect(appTokenClient.credentialDomains[0], "https://open.larksuite.com")
+        } finally {
+            try { remove(configuredRoot, recursive: true) } catch (_e: Exception) { () }
+            try { remove(ignoredRoot, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
     public func metisTokenProviderRefreshMapsDeniedPendingSlowDownParseErrorAndRetainsRefreshToken(): Unit {
         let root = feishuOapiToolsetTempRoot("refresh-states")
         try { remove(root, recursive: true) } catch (_e: Exception) { () }
@@ -640,8 +712,13 @@ public class GatewayFeishuOapiToolsetTest {
             ).userAccessToken("tenant-a", ["im:message:readonly"])
             @Expect(refreshed.status, "authorized")
             let persisted = JsonValue.fromStr(String.fromUtf8(File.readFrom(root.join("tenant-a.json")))).asObject().toJsonString()
-            @Expect(persisted.contains("new-access-token"), true)
-            @Expect(persisted.contains("keep-refresh-token"), true)
+            @Expect(persisted.contains("new-access-token"), false)
+            @Expect(persisted.contains("keep-refresh-token"), false)
+            @Expect(persisted.contains("obfuscated"), true)
+            let reloaded = MetisFeishuOapiTokenProvider(root: root, nowMs: 1000)
+                .userAccessToken("tenant-a", ["im:message:readonly"])
+            @Expect(reloaded.status, "authorized")
+            @Expect(reloaded.accessToken, "new-access-token")
         } finally {
             try { remove(root, recursive: true) } catch (_e: Exception) { () }
         }
@@ -1154,6 +1231,31 @@ public class GatewayFeishuOapiToolsetTest {
         @Expect(appTokenClient.modes[0], "tenant_access_token")
         @Expect(http.calls, 0)
         @Expect(json.toJsonString().contains("app-secret-never-visible"), false)
+    }
+
+    @TestCase
+    public func directoryPeersAndGroupsWrapAccountIdAndAuthDiagnosticWithoutNetwork(): Unit {
+        let toolset = GatewayFeishuOapiToolset()
+        let peers = JsonValue.fromStr(toolset.debugFeishuDirectoryForTest(
+            "peers",
+            Some("tenant-a"),
+            Some("{\"query\":{\"query\":\"Alice\"}}")
+        )).asObject()
+        @Expect(peers.get("status").getOrThrow().asString().getValue(), "auth_required")
+        @Expect(peers.get("directoryKind").getOrThrow().asString().getValue(), "peers")
+        @Expect(peers.get("accountId").getOrThrow().asString().getValue(), "tenant-a")
+        @Expect(peers.get("auth").getOrThrow().asObject().get("required").getOrThrow().asBool().getValue(), true)
+
+        let groups = JsonValue.fromStr(toolset.debugFeishuDirectoryForTest(
+            "groups",
+            Some("tenant-a"),
+            Some("{\"query\":{\"query\":\"ops\"}}")
+        )).asObject()
+        @Expect(groups.get("status").getOrThrow().asString().getValue(), "auth_required")
+        @Expect(groups.get("directoryKind").getOrThrow().asString().getValue(), "groups")
+        @Expect(groups.get("accountId").getOrThrow().asString().getValue(), "tenant-a")
+        @Expect(groups.get("auth").getOrThrow().asObject().get("card").getOrThrow().asObject()
+            .get("repairMethod").getOrThrow().asString().getValue(), "channels.feishu.auth.start")
     }
 
     @TestCase
