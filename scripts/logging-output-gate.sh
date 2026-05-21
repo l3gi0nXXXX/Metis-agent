@@ -168,7 +168,6 @@ check_file_allowlist \
   "JS stdout protocol/report" \
   "$sidecar_stdout_scan" \
   "$TMP_DIR/sidecar-stdout.allowed" \
-  "scripts/feishu-ws-sidecar.mjs" \
   "scripts/legacy-channel-host.mjs" \
   "scripts/openclaw-compat-capabilities.mjs" \
   "scripts/openclaw-compat-ci-gate.mjs" \
@@ -182,7 +181,6 @@ check_file_allowlist \
   "JS stderr diagnostics" \
   "$sidecar_stderr_scan" \
   "$TMP_DIR/sidecar-stderr.allowed" \
-  "scripts/feishu-ws-sidecar.mjs" \
   "scripts/lib/metis-sidecar-logger.mjs"
 
 check_file_allowlist \

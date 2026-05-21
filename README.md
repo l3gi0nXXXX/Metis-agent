@@ -161,7 +161,7 @@ For Telegram image understanding, configure a dedicated image model whose model 
 IM channels need their own credentials only when that channel is enabled:
 
 - Telegram: bot token from BotFather, configured under `gateway.telegram` or a Telegram account entry.
-- Feishu: app id/app secret. The built-in long-connect path is native and does not require the Node official SDK sidecar.
+- Feishu: app id/app secret. The built-in long-connect path is native and does not require Node/npm or the legacy Feishu Node bridge.
 - QQ: app id/app secret or the official gateway credentials required by the selected QQ mode.
 - Plugin IM adapters: plugin runtime files plus the Python dependencies and credentials for that adapter.
 
@@ -205,7 +205,7 @@ Use `gateway run --verbose` for temporary runtime detail while diagnosing channe
 |---|---|---|---|
 | Control UI source rebuild and UI tests | Node.js + npm from the official Node.js download page: https://nodejs.org/en/download | `npm --prefix ui install` | Required when changing `ui/` source or running `npm --prefix ui run build` / UI tests. The committed `assets/control-ui` bundle is enough for normal Gateway startup. |
 | PDF fallback extraction | Node.js + npm from the official Node.js download page: https://nodejs.org/en/download; `tools/pdf_extract` packages `pdfjs-dist` and `@napi-rs/canvas` | `npm --prefix tools/pdf_extract install` | Required when PDF analysis uses non-native PDF models and Metis must extract text or render page images locally. Check with `metis models pdf-status`. |
-| Feishu long-connect native adapter | None beyond the Cangjie runtime and Feishu app credentials. | Not required. | `gateway.feishu.receiveMode = "long_connect"` uses the native transport path and no longer requires Node/npm, `@larksuiteoapi/node-sdk`, or `scripts/feishu-ws-sidecar.mjs` for startup. |
+| Feishu long-connect native adapter | None beyond the Cangjie runtime and Feishu app credentials. | Not required. | `gateway.feishu.receiveMode = "long_connect"` uses the native transport path and no longer requires Node/npm or `@larksuiteoapi/node-sdk` for startup. |
 | Gateway plugin IM adapters | Python 3 + pip; per-channel requirements under `tools/gateway_plugin_tool/requirements/` | `python tools/gateway_plugin_tool/install.py deps all` or `python tools/gateway_plugin_tool/install.py deps dingtalk` | Required only for plugin-style adapters such as DingTalk, WeChat, WeCom, plugin Feishu, or plugin QQ. Built-in Telegram/QQ/Feishu Cangjie adapters do not need these Python packages. |
 | Docker image build | Docker + Docker Compose; `CANGJIE_HOME` pointing to SDK | `scripts/build-docker-image.sh` | Required only when building the container image. |
 | Faster source search | ripgrep | `brew install ripgrep` | Optional. Metis/Magic workflows can fall back to slower search tools, but `rg` is recommended for development. |

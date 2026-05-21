@@ -853,10 +853,10 @@ private func gatewayFeishuAccountEventDiagnostic(
         status = "missing_app_id"
         reason = "account_app_id_missing_or_event_app_id_unavailable"
         gatewayFeishuAddUniqueText(advice, "Confirm gateway.feishu.accounts.${accountId}.appId is set for the bot receiving messages.")
-        gatewayFeishuAddUniqueText(advice, "If the event lacks app_id, verify the Feishu sidecar SDK event envelope before routing.")
+        gatewayFeishuAddUniqueText(advice, "If the event lacks app_id, verify the Feishu native long-connect event envelope before routing.")
     } else if (running && inboundCount == 0 && pullCount == 0 && lastEventAtMs == 0) {
         status = "no_event"
-        reason = "runtime_running_but_no_sidecar_event_seen"
+        reason = "runtime_running_but_no_native_event_seen"
         for (item in gatewayFeishuConsoleAdvice(accountId)) {
             gatewayFeishuAddUniqueText(advice, item)
         }

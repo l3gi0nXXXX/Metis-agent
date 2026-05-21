@@ -139,7 +139,6 @@ public class FeishuLongConnectTest {
 
         adapter.start()
         @Expect(adapter.debugIsRunningForTest(), true)
-        @Expect(adapter.debugFeishuMonitorProcessPresentForTest(), false)
         @Expect(adapter.debugFeishuNativeLongConnectLastErrorForTest(), "")
         @Expect(transport.startCount, 1)
         @Expect(transport.lastSpec.accountId, "tenant-a")

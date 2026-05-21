@@ -26,9 +26,8 @@ func fixtureStructured() {
 }
 FIXTURE
 
-cat > "$TMP_ROOT/scripts/feishu-ws-sidecar.mjs" <<'FIXTURE'
+cat > "$TMP_ROOT/scripts/openclaw-plugin-sidecar.mjs" <<'FIXTURE'
 process.stdout.write(`${JSON.stringify({ ok: true })}\n`);
-process.stderr.write("[feishu-monitor] ok\n");
 FIXTURE
 
 cat > "$TMP_ROOT/src/gateway/runtime/gateway_cli.cj" <<'FIXTURE'
