@@ -42,20 +42,50 @@ private func feishuOapiPutIfMissing(obj: JsonObject, key: String, value: JsonVal
     }
 }
 
+private func feishuOapiRunnerFieldAllowed(key: String): Bool {
+    let normalized = key.trimAscii()
+    let lowered = normalized.toAsciiLower()
+    if (normalized == "result") {
+        return false
+    }
+    !(lowered.contains("authorization") ||
+        lowered.contains("token") ||
+        lowered.contains("secret") ||
+        lowered.contains("password") ||
+        lowered.contains("app_secret") ||
+        lowered.contains("appsecret"))
+}
+
 private func feishuOapiNormalizeRunnerResult(
     result: JsonObject,
     request: FeishuOapiRequest
 ): JsonObject {
-    feishuOapiPutIfMissing(result, "tool", JsonString(request.toolName))
-    feishuOapiPutIfMissing(result, "category", JsonString(request.category))
-    feishuOapiPutIfMissing(result, "domain", JsonString(request.domain))
-    feishuOapiPutIfMissing(result, "action", JsonString(request.action))
-    feishuOapiPutIfMissing(result, "account_id", JsonString(request.accountId))
-    feishuOapiPutIfMissing(result, "path", JsonString(request.path))
-    feishuOapiPutIfMissing(result, "method", JsonString(request.method))
-    feishuOapiPutIfMissing(result, "token_mode", JsonString(request.tokenMode))
-    feishuOapiPutIfMissing(result, "required_scopes", feishuOapiJsonStringArray(request.requiredScopes))
-    gatewayFeishuOapiAttachRepairActionForToolResult(result, request)
+    let out = JsonObject()
+    for (key in result.getFields().keys()) {
+        if (!feishuOapiRunnerFieldAllowed(key)) {
+            continue
+        }
+        match (result.get(key)) {
+            case Some(value) => out.put(key, value)
+            case None => ()
+        }
+    }
+    if (out.get("data").isNone()) {
+        match (result.get("result")) {
+            case Some(value) => out.put("data", value)
+            case None => ()
+        }
+    }
+    feishuOapiPutIfMissing(out, "tool", JsonString(request.toolName))
+    feishuOapiPutIfMissing(out, "category", JsonString(request.category))
+    feishuOapiPutIfMissing(out, "domain", JsonString(request.domain))
+    feishuOapiPutIfMissing(out, "action", JsonString(request.action))
+    feishuOapiPutIfMissing(out, "account_id", JsonString(request.accountId))
+    feishuOapiPutIfMissing(out, "path", JsonString(request.path))
+    feishuOapiPutIfMissing(out, "method", JsonString(request.method))
+    feishuOapiPutIfMissing(out, "token_mode", JsonString(request.tokenMode))
+    feishuOapiPutIfMissing(out, "required_scopes", feishuOapiJsonStringArray(request.requiredScopes))
+    gatewayFeishuOapiAttachRepairActionForToolResult(out, request)
 }
 
 private func feishuOapiInvoke(

@@ -1241,6 +1241,44 @@ public class GatewayServerMethodsChannelsTest {
     }
 
     @TestCase
+    public func feishuConnectedWithoutInboundShowsDiagnosticAgeAndLastInboundAt(): Unit {
+        withGatewayChannelsTestHome {
+            var user = GatewayUserSettings()
+            user.feishu.enabled = true
+            user.feishu.defaultAccount = "tenant-a"
+            let tenant = JsonObject()
+            tenant.put("appId", JsonString("cli_sidecar_app"))
+            tenant.put("appSecret", JsonString("sidecar-secret-never-visible"))
+            let accounts = JsonObject()
+            accounts.put("tenant-a", tenant)
+            user.feishu.accounts = Some(accounts)
+
+            gatewayChannelRuntimeRegisterAccount("feishu", accountId: "tenant-a")
+            gatewayChannelRuntimeMarkRunning("feishu", accountId: "tenant-a")
+            gatewayChannelRuntimeMarkMonitorTick("feishu", accountId: "tenant-a")
+
+            let params = JsonObject()
+            params.put("channelId", JsonString("feishu"))
+            let result = handleGatewayChannelsFamily(
+                "channels.audit",
+                user,
+                request: Some(GatewayRpcRequest("channels.audit", params: params))
+            ).getOrThrow().result.asObject()
+            let ownership = result.get("audit").getOrThrow().asObject()
+                .get("feishuDiagnostics").getOrThrow().asObject()
+                .get("eventOwnership").getOrThrow().asObject()
+            let row = channelsRowByStringField(ownership.get("accounts").getOrThrow().asArray(), "accountId", "tenant-a")
+
+            @Expect(channelsTestString(row, "status"), "no_event")
+            @Expect(row.get("lastDiagnosticAge").isSome(), true)
+            @Expect(row.get("lastDiagnosticAgeMs").isSome(), true)
+            @Expect(row.get("lastInboundAt").isSome(), true)
+            @Expect(channelsTestString(row, "lastInboundAt"), "never")
+            @Expect(row.toJsonString().contains("sidecar-secret-never-visible"), false)
+        }
+    }
+
+    @TestCase
     public func qqChannelGetAndStatusExposeAccountsWithRedactedSecrets(): Unit {
         var user = GatewayUserSettings()
         user.qq.enabled = true

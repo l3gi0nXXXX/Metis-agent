@@ -461,6 +461,44 @@ public class GatewayFeishuOapiToolsetTest {
     }
 
     @TestCase
+    public func feishuSidecarOapiToolKeepsMetisToolOutputContract(): Unit {
+        debugSetGatewayFeishuOapiToolCallRunnerForTest(Some({ _method: String, _payload: JsonObject =>
+            let sidecarResult = JsonObject()
+            sidecarResult.put("image", JsonString("openclaw-image-key"))
+            sidecarResult.put("schedule", JsonString("openclaw-schedule"))
+            sidecarResult.put("sessions", JsonArray([JsonString("openclaw-session")]))
+            let out = JsonObject()
+            out.put("ok", JsonBool(true))
+            out.put("status", JsonString("success"))
+            out.put("result", sidecarResult)
+            out.put("Authorization", JsonString("Bearer sidecar-token-never-visible"))
+            out.put("appSecret", JsonString("sidecar-secret-never-visible"))
+            out
+        }))
+        try {
+            let out = GatewayFeishuOapiToolset().debugFeishuOapiInvokeForTest(
+                "feishu_drive_file",
+                "list",
+                Some("tenant-a"),
+                Some("{}")
+            )
+            let json = JsonValue.fromStr(out).asObject()
+            @Expect(json.get("ok").getOrThrow().asBool().getValue(), true)
+            @Expect(json.get("status").getOrThrow().asString().getValue(), "success")
+            @Expect(json.get("tool").getOrThrow().asString().getValue(), "feishu_drive_file")
+            @Expect(json.get("data").isSome(), true)
+            @Expect(json.get("result").isNone(), true)
+            @Expect(json.get("Authorization").isNone(), true)
+            @Expect(json.get("appSecret").isNone(), true)
+            let raw = json.toJsonString()
+            @Expect(raw.contains("sidecar-token-never-visible"), false)
+            @Expect(raw.contains("sidecar-secret-never-visible"), false)
+        } finally {
+            debugSetGatewayFeishuOapiToolCallRunnerForTest(None<(String, JsonObject) -> JsonObject>)
+        }
+    }
+
+    @TestCase
     public func invalidParamsJsonReturnsStructuredInvalidRequest(): Unit {
         let out = GatewayFeishuOapiToolset().debugFeishuOapiInvokeForTest(
             "feishu_bitable_app",
