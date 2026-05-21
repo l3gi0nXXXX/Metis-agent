@@ -365,7 +365,8 @@ public class FeishuFileTokenStore <: FeishuTokenStore {
         if (!exists(this.root)) {
             Directory.create(this.root, recursive: true)
         }
-        File.writeTo(this.pathFor(accountId), token.toJson().toJsonString().toArray())
+        let normalized = gatewayFeishuNormalizeAccountId(accountId)
+        File.writeTo(this.pathFor(normalized), feishuAuthStoredTokenEnvelope(normalized, token.toJson()).toJsonString().toArray())
     }
 
     public func load(accountId: String): Option<FeishuUserToken> {
@@ -374,7 +375,7 @@ public class FeishuFileTokenStore <: FeishuTokenStore {
             return None<FeishuUserToken>
         }
         return try {
-            let root = JsonValue.fromStr(String.fromUtf8(File.readFrom(path))).asObject()
+            let root = feishuAuthStoredTokenPayloadObject(gatewayFeishuNormalizeAccountId(accountId), String.fromUtf8(File.readFrom(path)))
             Some(FeishuUserToken(
                 accessToken: feishuAuthString(root, "accessToken"),
                 refreshToken: feishuAuthString(root, "refreshToken"),
@@ -388,7 +389,10 @@ public class FeishuFileTokenStore <: FeishuTokenStore {
 
     public func status(accountId: String): JsonObject {
         match (this.load(accountId)) {
-            case Some(token) => token.redactedStatus(accountId)
+            case Some(token) =>
+                let out = token.redactedStatus(accountId)
+                out.put("storageDiagnostic", feishuAuthTokenStorageDiagnostic(this.pathFor(accountId)))
+                out
             case None =>
                 let out = JsonObject()
                 out.put("accountId", JsonString(gatewayFeishuNormalizeAccountId(accountId)))
@@ -397,6 +401,7 @@ public class FeishuFileTokenStore <: FeishuTokenStore {
                 out.put("authorized", JsonBool(false))
                 out.put("scopeSummary", JsonString(""))
                 out.put("scopeDiagnostic", feishuAuthScopeDiagnostic([]))
+                out.put("storageDiagnostic", feishuAuthTokenStorageDiagnostic(this.pathFor(accountId)))
                 out.put("redacted", JsonBool(true))
                 out
         }
@@ -409,6 +414,137 @@ public class FeishuFileTokenStore <: FeishuTokenStore {
     private func pathFor(accountId: String): Path {
         this.root.join("${feishuAuthSafeSegment(accountId)}.json")
     }
+}
+
+private let FEISHU_AUTH_TOKEN_STORE_FORMAT = "metis-feishu-token-v2"
+private let FEISHU_AUTH_TOKEN_STORE_ENCODING = "obfuscated-hex-v1"
+
+private func feishuAuthStoredTokenEnvelope(accountId: String, payload: JsonObject): JsonObject {
+    let out = JsonObject()
+    out.put("format", JsonString(FEISHU_AUTH_TOKEN_STORE_FORMAT))
+    out.put("encoding", JsonString(FEISHU_AUTH_TOKEN_STORE_ENCODING))
+    out.put("payload", JsonString(feishuAuthObfuscatePayload(accountId, payload.toJsonString())))
+    out.put("redacted", JsonBool(true))
+    out
+}
+
+private func feishuAuthStoredTokenPayloadObject(accountId: String, raw: String): JsonObject {
+    let parsed = JsonValue.fromStr(raw).asObject()
+    let format = feishuAuthString(parsed, "format")
+    let encoding = feishuAuthString(parsed, "encoding")
+    if (format == FEISHU_AUTH_TOKEN_STORE_FORMAT && encoding == FEISHU_AUTH_TOKEN_STORE_ENCODING) {
+        let decoded = feishuAuthDeobfuscatePayload(accountId, feishuAuthString(parsed, "payload"))
+        return JsonValue.fromStr(decoded).asObject()
+    }
+    parsed
+}
+
+private func feishuAuthTokenStorageDiagnostic(path: Path): JsonObject {
+    let out = JsonObject()
+    out.put("redacted", JsonBool(true))
+    if (!exists(path)) {
+        out.put("status", JsonString("missing"))
+        out.put("migrationRecommended", JsonBool(false))
+        return out
+    }
+    try {
+        let root = JsonValue.fromStr(String.fromUtf8(File.readFrom(path))).asObject()
+        if (feishuAuthString(root, "format") == FEISHU_AUTH_TOKEN_STORE_FORMAT &&
+            feishuAuthString(root, "encoding") == FEISHU_AUTH_TOKEN_STORE_ENCODING) {
+            out.put("status", JsonString("obfuscated"))
+            out.put("migrationRecommended", JsonBool(false))
+            return out
+        }
+        if (root.get("accessToken").isSome() || root.get("refreshToken").isSome()) {
+            out.put("status", JsonString("legacy_plaintext"))
+            out.put("migrationRecommended", JsonBool(true))
+            out.put("message", JsonString("Legacy Feishu token file can be migrated by saving the token through the native auth store."))
+            return out
+        }
+    } catch (_: Exception) {
+        out.put("status", JsonString("unreadable"))
+        out.put("migrationRecommended", JsonBool(false))
+        return out
+    }
+    out.put("status", JsonString("unknown"))
+    out.put("migrationRecommended", JsonBool(true))
+    out
+}
+
+private func feishuAuthObfuscationKey(accountId: String): Array<Byte> {
+    ("metis-feishu-token-store-v1:" + gatewayFeishuNormalizeAccountId(accountId)).toArray()
+}
+
+private func feishuAuthObfuscatePayload(accountId: String, raw: String): String {
+    let key = feishuAuthObfuscationKey(accountId)
+    if (key.isEmpty()) {
+        return feishuAuthHexEncode(raw.toArray())
+    }
+    let input = raw.toArray()
+    let out = ArrayList<Byte>()
+    for (i in 0..input.size) {
+        let encoded = (Int64(input[i]) + Int64(key[i % key.size]) + 17) % 256
+        out.add(UInt8(encoded))
+    }
+    feishuAuthHexEncode(out.toArray())
+}
+
+private func feishuAuthDeobfuscatePayload(accountId: String, raw: String): String {
+    let key = feishuAuthObfuscationKey(accountId)
+    let encoded = feishuAuthHexDecode(raw)
+    if (key.isEmpty()) {
+        return String.fromUtf8(encoded)
+    }
+    let out = ArrayList<Byte>()
+    for (i in 0..encoded.size) {
+        var value = Int64(encoded[i]) - Int64(key[i % key.size]) - 17
+        while (value < 0) {
+            value += 256
+        }
+        out.add(UInt8(value % 256))
+    }
+    String.fromUtf8(out.toArray())
+}
+
+private func feishuAuthHexEncode(bytes: Array<Byte>): String {
+    let hex = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "a", "b", "c", "d", "e", "f"]
+    let out = StringBuilder()
+    for (b in bytes) {
+        let v = Int64(b)
+        out.append(hex[(v >> 4) & 0x0F])
+        out.append(hex[v & 0x0F])
+    }
+    out.toString()
+}
+
+private func feishuAuthHexDecode(raw: String): Array<Byte> {
+    let bytes = raw.trimAscii().toArray()
+    let out = ArrayList<Byte>()
+    var i: Int64 = 0
+    while (i + 1 < bytes.size) {
+        let high = feishuAuthHexValue(bytes[i])
+        let low = feishuAuthHexValue(bytes[i + 1])
+        if (high < 0 || low < 0) {
+            throw Exception("invalid hex token payload")
+        }
+        out.add(UInt8((high << 4) + low))
+        i += 2
+    }
+    out.toArray()
+}
+
+private func feishuAuthHexValue(b: Byte): Int64 {
+    let v = Int64(b)
+    if (v >= 48 && v <= 57) {
+        return v - 48
+    }
+    if (v >= 65 && v <= 70) {
+        return v - 65 + 10
+    }
+    if (v >= 97 && v <= 102) {
+        return v - 97 + 10
+    }
+    -1
 }
 
 public class FeishuPendingUserAuth {
@@ -1508,7 +1644,7 @@ private func feishuAuthScopeString(scopes: Array<String>): String {
     out.add("offline_access")
     for (scope in scopes) {
         let s = scope.trimAscii()
-        if (!s.isEmpty() && s != "offline_access") {
+        if (!s.isEmpty() && s != "offline_access" && !out.contains(s)) {
             out.add(s)
         }
     }

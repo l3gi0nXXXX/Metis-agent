@@ -234,7 +234,7 @@ public class GatewayServerMethodsStatusTest {
             user.feishu.appId = "feishu-app"
             user.feishu.appSecret = "feishu-secret"
             let _ = gatewayChannelRuntimeRegisterAccount("feishu", accountId: "default")
-            let _ = gatewayChannelRuntimeMarkFailure("feishu", accountId: "default", error: "monitor-host-timeout appSecret=hidden-secret", errorKind: "start_timeout")
+            let _ = gatewayChannelRuntimeMarkFailure("feishu", accountId: "default", error: "transport-timeout appSecret=hidden-secret", errorKind: "start_timeout")
 
             let status = buildGatewayRpcStatusJson(user)
             let rendered = status.toJsonString()
@@ -243,8 +243,8 @@ public class GatewayServerMethodsStatusTest {
             let accounts = statusTestArray(readiness, "accounts")
             @Expect(accounts.size(), 1)
             let row = accounts[0].asObject()
-            @Expect(statusTestString(row, "reason"), "sidecar-start-timeout")
-            @Expect(statusTestString(row, "suggestedAction"), "check-sidecar-deps")
+            @Expect(statusTestString(row, "reason"), "transport-start-timeout")
+            @Expect(statusTestString(row, "suggestedAction"), "check-channel-transport")
             @Expect(statusTestString(row, "lastError").contains("redacted"), true)
         })
     }

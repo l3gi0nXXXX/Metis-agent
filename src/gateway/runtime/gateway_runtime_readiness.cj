@@ -79,8 +79,8 @@ private func gatewayRuntimeActionForReason(channelId: String, reason: String): S
     if (reason == "stale-runtime-account") {
         return "reload-channel:${channelId}"
     }
-    if (reason == "sidecar-start-timeout") {
-        return "check-sidecar-deps"
+    if (reason == "transport-start-timeout") {
+        return "check-channel-transport"
     }
     if (reason == "credential") {
         return "check-credentials"
@@ -117,8 +117,8 @@ private func gatewayRuntimeReasonToErrorKind(reason: String, row: JsonObject): S
         return existing
     }
     let err = gatewayRuntimeString(row, "lastError").toAsciiLower()
-    if (err.contains("monitor-host-timeout") || err.contains("sidecar")) {
-        return "sidecar"
+    if (err.contains("monitor-host-timeout") || err.contains("transport-timeout")) {
+        return "transport"
     }
     if (err.contains("credential") || err.contains("appsecret") || err.contains("app secret")) {
         return "credential"
@@ -184,8 +184,8 @@ private func gatewayRuntimeAccountProblemReason(row: JsonObject, configured: Boo
     let state = gatewayRuntimeString(row, "lifecycleState").trimAscii()
     if (state == "failed") {
         let err = gatewayRuntimeString(row, "lastError").toAsciiLower()
-        if (err.contains("monitor-host-timeout") || err.contains("sidecar")) {
-            return "sidecar-start-timeout"
+        if (err.contains("monitor-host-timeout") || err.contains("transport-timeout")) {
+            return "transport-start-timeout"
         }
         if (err.contains("credential") || err.contains("appsecret") || err.contains("app secret")) {
             return "credential"

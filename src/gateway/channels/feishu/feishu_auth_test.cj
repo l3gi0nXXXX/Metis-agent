@@ -5,7 +5,7 @@ import metis.gateway.tools.MetisFeishuOapiTokenProvider
 
 import std.collection.{ArrayList, HashMap}
 import std.env.{getVariable, setVariable}
-import std.fs.{File, Path, exists, remove}
+import std.fs.{Directory, File, Path, exists, remove}
 import std.time.DateTime
 import std.unittest.testmacro.*
 import stdx.encoding.json.{JsonObject, JsonString}
@@ -87,6 +87,23 @@ public class FeishuAuthFoundationTest {
     }
 
     @TestCase
+    public func deviceFlowStartMergesOfflineAccessAndDeduplicatesScopes(): Unit {
+        let http = FeishuAuthFakeHttpClient()
+        let client = FeishuDeviceFlowClient(
+            http,
+            domain: "https://open.feishu.cn",
+            appId: "app-id",
+            appSecret: "app-secret-never-visible"
+        )
+
+        let started = client.start(scopes: ["im:message", "offline_access", "im:message", "contact:user:search"])
+
+        @Expect(started.status, "pending")
+        @Expect(http.capturedFields[2], "offline_access im:message contact:user:search")
+        @Expect(started.toRedactedJson().toJsonString().contains("app-secret-never-visible"), false)
+    }
+
+    @TestCase
     public func deviceFlowMapsPendingSlowDownDeniedExpiredParseAndNetworkStatuses(): Unit {
         let pending = FeishuDeviceFlowClient(FeishuAuthFakeHttpClient(tokenBody: "{\"error\":\"authorization_pending\"}"))
         @Expect(pending.start().status, "pending")
@@ -127,12 +144,48 @@ public class FeishuAuthFoundationTest {
             ))
             let loaded = store.load("tenant-a").getOrThrow()
             @Expect(loaded.accessToken, "access-secret")
+            let rawFile = String.fromUtf8(File.readFrom(root.join("tenant-a.json")))
+            @Expect(rawFile.contains("access-secret"), false)
+            @Expect(rawFile.contains("refresh-secret"), false)
+            @Expect(rawFile.contains("obfuscated"), true)
             let status = store.status("tenant-a")
             let raw = status.toJsonString()
             @Expect(raw.contains("authorized"), true)
             @Expect(raw.contains("im:message"), true)
             @Expect(raw.contains("access-secret"), false)
             @Expect(raw.contains("refresh-secret"), false)
+            let diagnostic = status.get("storageDiagnostic").getOrThrow().asObject()
+            @Expect(diagnostic.get("status").getOrThrow().asString().getValue(), "obfuscated")
+        } finally {
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func tokenStoreLoadsLegacyPlaintextWithMigrationDiagnosticButNeverLeaksStatus(): Unit {
+        let root = Path("/tmp/metis-feishu-token-store-legacy-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
+        try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        try {
+            Directory.create(root, recursive: true)
+            let legacy = JsonObject()
+            legacy.put("accessToken", JsonString("legacy-access-secret"))
+            legacy.put("refreshToken", JsonString("legacy-refresh-secret"))
+            legacy.put("expiresAtMs", JsonString("4102444800000"))
+            legacy.put("scopes", JsonString("offline_access im:message"))
+            File.writeTo(root.join("tenant-a.json"), legacy.toJsonString().toArray())
+
+            let store = FeishuFileTokenStore(root)
+            let loaded = store.load("tenant-a").getOrThrow()
+            @Expect(loaded.accessToken, "legacy-access-secret")
+            @Expect(loaded.refreshToken, "legacy-refresh-secret")
+
+            let status = store.status("tenant-a")
+            let raw = status.toJsonString()
+            let diagnostic = status.get("storageDiagnostic").getOrThrow().asObject()
+            @Expect(diagnostic.get("status").getOrThrow().asString().getValue(), "legacy_plaintext")
+            @Expect(diagnostic.get("migrationRecommended").getOrThrow().asBool().getValue(), true)
+            @Expect(raw.contains("legacy-access-secret"), false)
+            @Expect(raw.contains("legacy-refresh-secret"), false)
         } finally {
             try { remove(root, recursive: true) } catch (_e: Exception) { () }
         }

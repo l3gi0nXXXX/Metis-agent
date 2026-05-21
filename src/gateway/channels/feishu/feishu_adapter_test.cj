@@ -1709,6 +1709,50 @@ public class FeishuAdapterTest {
     }
 
     @TestCase
+    public func dmPairingApprovalOnboardingSendsConfirmationAndAuthStatus(): Unit {
+        let root = this.pairingTestRoot("prompt-approve-onboarding")
+        try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        let client = FeishuFakeApiClient()
+        let adapter = FeishuAdapter(
+            config: FeishuConfig(enabled: true, dmPolicy: "pairing"),
+            accountId: "tenant-a",
+            apiClient: client,
+            pairingRoot: root
+        )
+        adapter.start()
+        try {
+            @Expect(adapter.ingestWebhookPayload(this.webhookPayload(
+                "om_pair_onboard",
+                "oc_dm_a",
+                "ou_pair_sender",
+                "{\\\"text\\\":\\\"hello\\\"}",
+                chatType: "p2p",
+                headerAccountId: "tenant-a"
+            )).contains("\"ok\":true"), true)
+            @Expect(adapter.pullInbound().size, 1)
+            let code = adapter.debugFeishuPairingPendingCodeForTest("ou_pair_sender", accountId: "tenant-a")
+
+            let result = adapter.debugFeishuPairingApproveOnboardingForTest(code, accountId: "tenant-a", chatId: "oc_dm_a")
+
+            @Expect(result.get("approved").getOrThrow().asBool().getValue(), true)
+            @Expect(result.get("accountId").getOrThrow().asString().getValue(), "tenant-a")
+            @Expect(result.get("senderId").getOrThrow().asString().getValue(), "ou_pair_sender")
+            @Expect(result.get("confirmationSent").getOrThrow().asBool().getValue(), true)
+            let auth = result.get("authStatus").getOrThrow().asObject()
+            @Expect(auth.get("status").getOrThrow().asString().getValue(), "missing_app_credentials")
+            @Expect(auth.get("action").getOrThrow().asString().getValue(), "feishu_auth_status")
+            @Expect(client.textSendCount(), 2)
+            let confirmation = client.lastTextMessage()
+            @Expect(confirmation.contains("Pairing approved."), true)
+            @Expect(confirmation.contains("Feishu auth status: missing_app_credentials"), true)
+            @Expect(confirmation.contains("appSecret"), false)
+            @Expect(confirmation.contains("Authorization"), false)
+        } finally {
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
     public func dmPairingApprovalIsAccountScoped(): Unit {
         let root = this.pairingTestRoot("account-scope")
         try { remove(root, recursive: true) } catch (_e: Exception) { () }
@@ -1937,20 +1981,6 @@ public class FeishuAdapterTest {
         @Expect(unsupportedJson.get("ignored").getOrThrow().asBool().getValue(), true)
         @Expect(unsupportedJson.get("reason").getOrThrow().asString().getValue(), "unsupported_event")
         @Expect(unsupportedJson.get("eventType").getOrThrow().asString().getValue(), "im.message.deleted_v1")
-
-        let unsupportedMessage = adapter.ingestWebhookPayload(
-            this.webhookPayload(
-                "om_location",
-                "oc_group",
-                "ou_1",
-                "{\\\"name\\\":\\\"office\\\"}",
-                messageType: "location"
-            )
-        )
-        let unsupportedMessageJson = JsonValue.fromStr(unsupportedMessage).asObject()
-        @Expect(unsupportedMessageJson.get("ignored").getOrThrow().asBool().getValue(), true)
-        @Expect(unsupportedMessageJson.get("reason").getOrThrow().asString().getValue(), "unsupported_message_type")
-        @Expect(unsupportedMessageJson.get("messageType").getOrThrow().asString().getValue(), "location")
 
         let malformedMessage =
             "{" +
@@ -2270,6 +2300,159 @@ public class FeishuAdapterTest {
         let merge = inbound[8].mediaContext.get("context").getOrThrow().asObject().get("feishuMergeForward").getOrThrow().asObject()
         @Expect(merge.get("status").getOrThrow().asString().getValue(), "metadata_only")
         @Expect(merge.get("resourceFetch").getOrThrow().asObject().get("status").getOrThrow().asString().getValue(), "external_resource_required")
+    }
+
+    @TestCase
+    public func openClawBaselineMessageTypesProduceStableTextAndConversionMetadata(): Unit {
+        let adapter = FeishuAdapter(config: FeishuConfig(enabled: true), accountId: "work")
+        adapter.start()
+        @Expect(adapter.ingestWebhookPayload(this.webhookPayload("om_location", "oc_group", "ou_1", "{\\\"name\\\":\\\"HQ\\\",\\\"address\\\":\\\"Road 1\\\",\\\"latitude\\\":31.2304,\\\"longitude\\\":121.4737}", messageType: "location")).contains("\"ok\":true"), true)
+        @Expect(adapter.ingestWebhookPayload(this.webhookPayload("om_folder", "oc_group", "ou_1", "{\\\"file_key\\\":\\\"fld_1\\\",\\\"file_name\\\":\\\"Project Folder\\\"}", messageType: "folder")).contains("\"ok\":true"), true)
+        @Expect(adapter.ingestWebhookPayload(this.webhookPayload("om_system", "oc_group", "ou_1", "{\\\"template\\\":\\\"member joined\\\",\\\"text\\\":\\\"member joined group\\\"}", messageType: "system")).contains("\"ok\":true"), true)
+        @Expect(adapter.ingestWebhookPayload(this.webhookPayload("om_calendar", "oc_group", "ou_1", "{\\\"summary\\\":\\\"Planning\\\",\\\"start_time\\\":\\\"2026-05-21 10:00\\\"}", messageType: "calendar")).contains("\"ok\":true"), true)
+        @Expect(adapter.ingestWebhookPayload(this.webhookPayload("om_general_calendar", "oc_group", "ou_1", "{\\\"summary\\\":\\\"General Planning\\\",\\\"start_time\\\":\\\"2026-05-21 11:00\\\"}", messageType: "general_calendar")).contains("\"ok\":true"), true)
+        @Expect(adapter.ingestWebhookPayload(this.webhookPayload("om_video_chat", "oc_group", "ou_1", "{\\\"topic\\\":\\\"Daily Standup\\\",\\\"meeting_id\\\":\\\"vc_1\\\"}", messageType: "video_chat")).contains("\"ok\":true"), true)
+        @Expect(adapter.ingestWebhookPayload(this.webhookPayload("om_todo", "oc_group", "ou_1", "{\\\"summary\\\":\\\"Ship Phase 3\\\",\\\"task_id\\\":\\\"todo_1\\\"}", messageType: "todo")).contains("\"ok\":true"), true)
+        @Expect(adapter.ingestWebhookPayload(this.webhookPayload("om_vote", "oc_group", "ou_1", "{\\\"topic\\\":\\\"Choose option\\\",\\\"options\\\":[\\\"A\\\",\\\"B\\\"]}", messageType: "vote")).contains("\"ok\":true"), true)
+        @Expect(adapter.ingestWebhookPayload(this.webhookPayload("om_unknown", "oc_group", "ou_1", "{\\\"text\\\":\\\"new payload\\\",\\\"image_key\\\":\\\"img_unknown\\\"}", messageType: "new_openclaw_type")).contains("\"ok\":true"), true)
+
+        let inbound = adapter.pullInbound()
+        @Expect(inbound.size, 9)
+        @Expect(inbound[0].text.contains("[location]"), true)
+        @Expect(inbound[0].text.contains("HQ"), true)
+        @Expect(inbound[0].text.contains("31.2304"), true)
+        @Expect(inbound[1].text.contains("Project Folder"), true)
+        @Expect(inbound[2].text.contains("member joined group"), true)
+        @Expect(inbound[3].text.contains("Planning"), true)
+        @Expect(inbound[4].text.contains("General Planning"), true)
+        @Expect(inbound[5].text.contains("Daily Standup"), true)
+        @Expect(inbound[6].text.contains("Ship Phase 3"), true)
+        @Expect(inbound[7].text.contains("Choose option"), true)
+        @Expect(inbound[8].text.contains("new_openclaw_type"), true)
+        for (i in 0..inbound.size) {
+            let conversion = inbound[i].mediaContext.get("context").getOrThrow().asObject()
+                .get("feishuMessageConversion").getOrThrow().asObject()
+            @Expect(conversion.get("messageType").getOrThrow().asString().getValue().isEmpty(), false)
+            @Expect(conversion.get("text").getOrThrow().asString().getValue().trimAscii().isEmpty(), false)
+            @Expect(conversion.get("redacted").getOrThrow().asBool().getValue(), true)
+        }
+        let unknown = inbound[8].mediaContext.get("context").getOrThrow().asObject()
+            .get("feishuMessageConversion").getOrThrow().asObject()
+        @Expect(unknown.get("status").getOrThrow().asString().getValue(), "unknown_type")
+        @Expect(unknown.get("diagnostic").getOrThrow().asString().getValue(), "unknown_message_type")
+        @Expect(unknown.get("rawSummary").getOrThrow().asString().getValue().contains("img_unknown"), true)
+    }
+
+    @TestCase
+    public func currentMediaRecordsPreserveDurationCoverAndMediaPathHints(): Unit {
+        let adapter = FeishuAdapter(config: FeishuConfig(enabled: true), accountId: "work")
+        adapter.start()
+        @Expect(adapter.ingestWebhookPayload(
+            this.webhookPayload(
+                "om_video_metadata",
+                "oc_group",
+                "ou_1",
+                "{\\\"file_key\\\":\\\"video_meta\\\",\\\"file_name\\\":\\\"demo.mp4\\\",\\\"mime_type\\\":\\\"video/mp4\\\",\\\"duration\\\":42,\\\"cover_image_key\\\":\\\"cover_1\\\"}",
+                messageType: "video"
+            )
+        ).contains("\"ok\":true"), true)
+        @Expect(adapter.ingestWebhookPayload(
+            this.webhookPayload(
+                "om_audio_metadata",
+                "oc_group",
+                "ou_1",
+                "{\\\"file_key\\\":\\\"audio_meta\\\",\\\"file_name\\\":\\\"voice.ogg\\\",\\\"mime_type\\\":\\\"audio/ogg\\\",\\\"duration_ms\\\":3100}",
+                messageType: "audio"
+            )
+        ).contains("\"ok\":true"), true)
+
+        let inbound = adapter.pullInbound()
+        @Expect(inbound.size, 2)
+        let video = inbound[0].mediaContext.get("records").getOrThrow().asArray()[0].asObject()
+        @Expect(video.get("mediaType").getOrThrow().asString().getValue(), "video")
+        @Expect(video.get("mediaPath").getOrThrow().asString().getValue(), "")
+        @Expect(video.get("durationMs").getOrThrow().asInt().getValue(), 42000)
+        @Expect(video.get("coverImageKey").getOrThrow().asString().getValue(), "cover_1")
+        @Expect(video.get("resourceFetch").getOrThrow().asObject().get("status").getOrThrow().asString().getValue(), "metadata_only")
+
+        let audio = inbound[1].mediaContext.get("records").getOrThrow().asArray()[0].asObject()
+        @Expect(audio.get("mediaType").getOrThrow().asString().getValue(), "audio")
+        @Expect(audio.get("mediaPath").getOrThrow().asString().getValue(), "")
+        @Expect(audio.get("durationMs").getOrThrow().asInt().getValue(), 3100)
+    }
+
+    @TestCase
+    public func quotedAndMergeForwardMessagesExpandThroughInjectedClientWithoutNetwork(): Unit {
+        let client = FeishuFakeApiClient()
+        client.setMessage(
+            "work",
+            "om_root_image",
+            "image",
+            "{\"image_key\":\"img_quote\",\"file_name\":\"quote.png\",\"mime_type\":\"image/png\"}"
+        )
+        client.setMergeForwardMessages(
+            "work",
+            "om_merge_expand",
+            [
+                FeishuMessageFetchResult(
+                    ok: true,
+                    status: "ok",
+                    messageId: "om_forward_text",
+                    messageType: "text",
+                    content: "{\"text\":\"forwarded hello\"}"
+                ),
+                FeishuMessageFetchResult(
+                    ok: true,
+                    status: "ok",
+                    messageId: "om_forward_image",
+                    messageType: "image",
+                    content: "{\"image_key\":\"img_forward\",\"file_name\":\"forward.png\",\"mime_type\":\"image/png\"}"
+                )
+            ]
+        )
+        let adapter = FeishuAdapter(config: FeishuConfig(enabled: true), accountId: "work", apiClient: client)
+        adapter.start()
+        @Expect(adapter.ingestWebhookPayload(
+            this.webhookPayload(
+                "om_quote_expand",
+                "oc_group",
+                "ou_reply",
+                "{\\\"text\\\":\\\"reply to image\\\"}",
+                rootId: "om_root_image",
+                threadId: "omt_quote"
+            )
+        ).contains("\"ok\":true"), true)
+        @Expect(adapter.ingestWebhookPayload(
+            this.webhookPayload(
+                "om_merge_expand",
+                "oc_group",
+                "ou_forwarder",
+                "{\\\"title\\\":\\\"forwarded thread\\\",\\\"message_count\\\":2}",
+                messageType: "merge_forward"
+            )
+        ).contains("\"ok\":true"), true)
+
+        let inbound = adapter.pullInbound()
+        @Expect(inbound.size, 2)
+        let quoteCtx = inbound[0].mediaContext.get("context").getOrThrow().asObject()
+            .get("feishuQuote").getOrThrow().asObject()
+        @Expect(quoteCtx.get("status").getOrThrow().asString().getValue(), "expanded")
+        @Expect(quoteCtx.get("text").getOrThrow().asString().getValue(), "[image]")
+        @Expect(quoteCtx.get("historicalFetch").getOrThrow().asObject().get("status").getOrThrow().asString().getValue(), "ok")
+        let quoteRecords = inbound[0].mediaContext.get("records").getOrThrow().asArray()
+        @Expect(quoteRecords[0].asObject().get("relation").getOrThrow().asString().getValue(), "historical")
+        @Expect(quoteRecords[0].asObject().get("fileKey").getOrThrow().asString().getValue(), "img_quote")
+
+        @Expect(inbound[1].text.contains("forwarded hello"), true)
+        @Expect(inbound[1].text.contains("[image]"), true)
+        let merge = inbound[1].mediaContext.get("context").getOrThrow().asObject()
+            .get("feishuMergeForward").getOrThrow().asObject()
+        @Expect(merge.get("status").getOrThrow().asString().getValue(), "expanded")
+        @Expect(merge.get("messages").getOrThrow().asArray().size(), 2)
+        @Expect(merge.get("historicalFetch").getOrThrow().asObject().get("status").getOrThrow().asString().getValue(), "ok")
+        let mergeRecords = inbound[1].mediaContext.get("records").getOrThrow().asArray()
+        @Expect(mergeRecords[0].asObject().get("relation").getOrThrow().asString().getValue(), "historical")
+        @Expect(mergeRecords[0].asObject().get("fileKey").getOrThrow().asString().getValue(), "img_forward")
     }
 
     @TestCase
