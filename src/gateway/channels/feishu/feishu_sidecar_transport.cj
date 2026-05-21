@@ -586,3 +586,13 @@ public class FeishuSidecarTransport <: FeishuLongConnectTransport {
         }
     }
 }
+
+public class FeishuWebhookLongConnectTransport <: FeishuLongConnectTransport {
+    public init() {}
+
+    public func start(_spec: FeishuLongConnectStartSpec, _eventHandler: (JsonObject) -> Unit): FeishuLongConnectStartResult {
+        FeishuLongConnectStartResult(status: "webhook_receive_mode", error: "Feishu receiveMode=webhook does not start long-connect transport")
+    }
+
+    public func stop(): Unit {}
+}

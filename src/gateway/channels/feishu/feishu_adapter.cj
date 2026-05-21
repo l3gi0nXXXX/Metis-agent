@@ -653,6 +653,30 @@ public class FeishuAdapter <: ChannelAdapter {
         this.feishuNativeLongConnectLastError
     }
 
+    public func debugFeishuTransportModeForTest(): String {
+        this.config.transportMode
+    }
+
+    public func debugFeishuLongConnectTransportKindForTest(): String {
+        if (this.config.receiveMode == "webhook" || this.longConnectTransport is FeishuWebhookLongConnectTransport) {
+            return "webhook"
+        }
+        if (this.longConnectTransport is FeishuSidecarTransport) {
+            return "openclaw-sidecar"
+        }
+        if (this.longConnectTransport is FeishuNativeLongConnectTransport) {
+            return "native-legacy"
+        }
+        "custom"
+    }
+
+    public func debugFeishuApiClientKindForTest(): String {
+        if (this.apiClient is FeishuSidecarApiClient) {
+            return "openclaw-sidecar"
+        }
+        "native-legacy"
+    }
+
     public func debugFeishuPairingPendingCodeForTest(senderId: String, accountId!: String = ""): String {
         gatewayPairingAccountStore(
             channel: "feishu",
@@ -827,6 +851,8 @@ public class FeishuAdapter <: ChannelAdapter {
             this.running = true
             let startMeta = JsonObject()
             startMeta.put("mode", JsonString(this.config.receiveMode))
+            startMeta.put("transport", JsonString("webhook"))
+            startMeta.put("transportMode", JsonString(this.config.transportMode))
             this.logChannel("info", MetisLogEvent.channelStarted, "start", "started", "Feishu adapter started", accountId: this.accountId, extra: startMeta)
             this.startWebhookServer()
             return
@@ -864,7 +890,7 @@ public class FeishuAdapter <: ChannelAdapter {
                 MetisLogEvent.channelFailed,
                 "long_connect",
                 "failed",
-                "Feishu native long-connect transport failed to start",
+                "Feishu long-connect transport failed to start",
                 errorKind: this.feishuErrorKind(detail),
                 error: detail,
                 accountId: this.accountId
@@ -875,7 +901,8 @@ public class FeishuAdapter <: ChannelAdapter {
         this.running = true
         let startMeta = JsonObject()
         startMeta.put("mode", JsonString(this.config.receiveMode))
-        startMeta.put("transport", JsonString("native_long_connect"))
+        startMeta.put("transport", JsonString(this.config.transportMode))
+        startMeta.put("transportMode", JsonString(this.config.transportMode))
         this.logChannel("info", MetisLogEvent.channelStarted, "start", "started", "Feishu adapter started", accountId: this.accountId, extra: startMeta)
     }
 
@@ -898,6 +925,7 @@ public class FeishuAdapter <: ChannelAdapter {
             extra.put("healthPath", JsonString("/healthz"))
         } else {
             extra.put("mode", JsonString("long_connect"))
+            extra.put("transportMode", JsonString(this.config.transportMode))
         }
         this.logChannel("debug", MetisLogEvent.channelStarted, "start", "hint", "Feishu ingress hint", accountId: this.accountId, extra: extra)
     }

@@ -113,6 +113,7 @@ public func gatewayFeishuResolveAccount(config: FeishuConfig, accountId: String)
         appSecret: gatewayFeishuString(overrideObj, ["appSecret", "app_secret"], config.appSecret),
         accounts: config.accounts,
         receiveMode: gatewayFeishuReceiveMode(gatewayFeishuString(overrideObj, ["receiveMode", "receive_mode"], config.receiveMode)),
+        transportMode: gatewayFeishuTransportMode(gatewayFeishuString(overrideObj, ["transportMode", "transport_mode"], config.transportMode)),
         domain: gatewayFeishuString(overrideObj, ["domain"], config.domain),
         botOpenId: gatewayFeishuString(overrideObj, ["botOpenId", "bot_open_id"], config.botOpenId),
         webhookHost: gatewayFeishuString(overrideObj, ["webhookHost", "webhook_host"], config.webhookHost),
@@ -192,6 +193,7 @@ public func gatewayFeishuDescribeAccounts(config: FeishuConfig, runtime!: JsonOb
         row.put("credentialSources", credentialSources)
         row.put("explicitAccount", JsonBool(resolved.explicitAccount))
         row.put("receiveMode", JsonString(resolved.config.receiveMode))
+        row.put("transportMode", JsonString(resolved.config.transportMode))
         row.put("domain", JsonString(resolved.config.domain))
         row.put("appId", JsonString(gatewayFeishuRedactedValue(resolved.config.appId)))
         row.put("appSecret", JsonString(if (resolved.config.appSecret.trimAscii().isEmpty()) { "" } else { "[redacted]" }))
@@ -443,6 +445,8 @@ private func gatewayFeishuSupportedAccountOverrideField(raw: String): Bool {
         "app_secret",
         "receiveMode",
         "receive_mode",
+        "transportMode",
+        "transport_mode",
         "domain",
         "botOpenId",
         "bot_open_id",
@@ -831,6 +835,10 @@ private func gatewayFeishuMedia(obj: JsonObject, fallback: FeishuMediaConfig): F
 
 private func gatewayFeishuReceiveMode(raw: String): String {
     if (raw.trimAscii().toAsciiLower() == "webhook") { "webhook" } else { "long_connect" }
+}
+
+private func gatewayFeishuTransportMode(raw: String): String {
+    if (raw.trimAscii().toAsciiLower() == "native-legacy") { "native-legacy" } else { "openclaw-sidecar" }
 }
 
 private func gatewayFeishuGroupSessionScope(raw: String): String {

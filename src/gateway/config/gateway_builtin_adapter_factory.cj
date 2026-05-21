@@ -1,11 +1,21 @@
 package metis.gateway.config
 
 import metis.gateway.channels.builtin.GenericBuiltinChannelAdapter
-import metis.gateway.channels.feishu.FeishuAdapter
+import metis.gateway.channels.feishu.{
+    FeishuAdapter,
+    FeishuApiClient,
+    FeishuLongConnectTransport,
+    FeishuNativeLongConnectTransport,
+    FeishuNoopApiClient,
+    FeishuSidecarApiClient,
+    FeishuSidecarTransport,
+    FeishuWebhookLongConnectTransport,
+    gatewayFeishuResolveAccount
+}
 import metis.gateway.channels.qq.QQAdapter
 import metis.gateway.channels.telegram.{TelegramAdapter, gatewayTelegramConfigForAccount}
 import metis.gateway.core.{ChannelAdapter, gatewayCanonicalChannelAccountId}
-import metis.gateway.model.{QQConfig, TelegramConfig}
+import metis.gateway.model.{FeishuConfig, QQConfig, TelegramConfig}
 import metis.core.config.GatewayUserSettings
 
 import std.collection.ArrayList
@@ -60,6 +70,33 @@ private func qqConfigForAccount(config: QQConfig, accountId: String): QQConfig {
     )
 }
 
+private func gatewayFeishuLongConnectTransportForConfig(config: FeishuConfig): FeishuLongConnectTransport {
+    if (config.receiveMode == "webhook") {
+        return FeishuWebhookLongConnectTransport()
+    }
+    if (config.transportMode == "openclaw-sidecar") {
+        return FeishuSidecarTransport()
+    }
+    FeishuNativeLongConnectTransport()
+}
+
+private func gatewayFeishuApiClientForConfig(config: FeishuConfig): FeishuApiClient {
+    if (config.receiveMode == "long_connect" && config.transportMode == "openclaw-sidecar") {
+        return FeishuSidecarApiClient()
+    }
+    FeishuNoopApiClient()
+}
+
+public func gatewayFeishuAdapterForConfig(config: FeishuConfig, accountId: String): FeishuAdapter {
+    let resolved = gatewayFeishuResolveAccount(config, accountId)
+    FeishuAdapter(
+        config: config,
+        accountId: resolved.accountId,
+        apiClient: gatewayFeishuApiClientForConfig(resolved.config),
+        longConnectTransport: gatewayFeishuLongConnectTransportForConfig(resolved.config)
+    )
+}
+
 private func gatewayAdapterForProfile(
     user: GatewayUserSettings,
     profile: GatewayAdapterRegistrationProfile
@@ -67,7 +104,7 @@ private func gatewayAdapterForProfile(
     let cfg = buildGatewayConfigFromUserSettings(user)
     let accountId = gatewayProfileRuntimeAccountId(profile)
     if (profile.channelId == "feishu") {
-        return FeishuAdapter(config: cfg.feishu, accountId: accountId)
+        return gatewayFeishuAdapterForConfig(cfg.feishu, accountId)
     }
     if (profile.channelId == "qq") {
         return QQAdapter(config: qqConfigForAccount(cfg.qq, accountId))
