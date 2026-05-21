@@ -34,6 +34,64 @@ private class FeishuSidecarApiClientFakeRunner <: FeishuSidecarRequestRunner {
     }
 }
 
+private class FeishuSidecarApiProcessFakeProcess <: FeishuSidecarProtocolProcess {
+    public let stdoutLines = ArrayList<String>()
+    public let stdinLines = ArrayList<String>()
+    public var alive: Bool = true
+    public var terminated: Bool = false
+
+    public init(stdout!: Array<String> = []) {
+        for (line in stdout) {
+            this.stdoutLines.add(line)
+        }
+    }
+
+    public func pid(): Int64 {
+        1777
+    }
+
+    public func writeLine(line: String): Unit {
+        this.stdinLines.add(line)
+    }
+
+    public func readLine(_timeoutMs: Int64): Option<String> {
+        if (this.stdoutLines.isEmpty()) {
+            return None<String>
+        }
+        let line = this.stdoutLines[0]
+        this.stdoutLines.remove(at: 0)
+        Some(line)
+    }
+
+    public func isAlive(): Bool {
+        this.alive
+    }
+
+    public func wait(_timeoutMs: Int64): Option<Int64> {
+        this.alive = false
+        Some(0)
+    }
+
+    public func terminate(_force: Bool): Unit {
+        this.terminated = true
+        this.alive = false
+    }
+}
+
+private class FeishuSidecarApiProcessFakeRunner <: FeishuSidecarProtocolRunner {
+    public let process: FeishuSidecarApiProcessFakeProcess
+    public var launch: FeishuSidecarLaunchSpec = FeishuSidecarLaunchSpec(command: "", args: [])
+
+    public init(process: FeishuSidecarApiProcessFakeProcess) {
+        this.process = process
+    }
+
+    public func start(spec: FeishuSidecarLaunchSpec): FeishuSidecarProtocolStartResult {
+        this.launch = spec
+        FeishuSidecarProtocolStartResult.Started(this.process)
+    }
+}
+
 private func feishuSidecarTestResult(
     ok: Bool,
     status!: String = "",
@@ -101,6 +159,56 @@ private func sidecarTestBool(obj: JsonObject, key: String): Bool {
 
 @Test
 public class FeishuSidecarApiClientTest {
+    @TestCase
+    public func processRunnerInitializesSidecarAndMapsApiFramesWithoutSecretsInArgv(): Unit {
+        let process = FeishuSidecarApiProcessFakeProcess(stdout: [
+            "{\"type\":\"ready\",\"accountId\":\"tenant-a\",\"transport\":\"websocket\"}",
+            "{\"type\":\"sendResult\",\"requestId\":\"metis-sidecar-api\",\"ok\":true,\"mediaKey\":\"img_uploaded\",\"contentBase64\":\"cmVzb3VyY2U=\",\"contentType\":\"image/png\"}"
+        ])
+        let protocol = FeishuSidecarApiProcessFakeRunner(process)
+        let runner = FeishuSidecarProcessRequestRunner(
+            account: FeishuSidecarRequestAccount(
+                accountId: "tenant-a",
+                appId: "cli_app",
+                appSecret: "secret-app",
+                domain: "https://open.feishu.cn",
+                verificationToken: "secret-verification",
+                encryptKey: "secret-encrypt"
+            ),
+            runner: protocol,
+            options: FeishuSidecarRequestRunnerOptions(
+                command: "node",
+                args: ["scripts/feishu-openclaw-sidecar.mjs"],
+                readyTimeoutMs: 1,
+                requestTimeoutMs: 1,
+                readTimeoutMs: 1,
+                stopTimeoutMs: 1
+            )
+        )
+        let params = JsonObject()
+        params.put("mediaType", JsonString("image"))
+        params.put("bytesBase64", JsonString("ZmFrZQ=="))
+        params.put("fileName", JsonString("a.png"))
+        let request = JsonObject()
+        request.put("operation", JsonString("media.upload"))
+        request.put("accountId", JsonString("tenant-a"))
+        request.put("params", params)
+
+        let result = runner.run(request)
+
+        @Expect(sidecarTestBool(result, "ok"), true)
+        @Expect(sidecarTestString(result, "mediaKey"), "img_uploaded")
+        @Expect(sidecarTestString(result, "bytesBase64"), "cmVzb3VyY2U=")
+        @Expect(protocol.launch.command, "node")
+        @Expect(String.join(protocol.launch.args, delimiter: " ").contains("secret-app"), false)
+        @Expect(process.stdinLines[0].contains("\"type\":\"init\""), true)
+        @Expect(process.stdinLines[0].contains("secret-app"), true)
+        @Expect(process.stdinLines[1].contains("\"type\":\"request\""), true)
+        @Expect(process.stdinLines[1].contains("\"action\":\"uploadMedia\""), true)
+        @Expect(process.stdinLines[1].contains("\"contentBase64\":\"ZmFrZQ==\""), true)
+        @Expect(process.stdinLines[2].contains("\"type\":\"close\""), true)
+    }
+
     @TestCase
     public func textCreateReplyAndFallbackUseExpectedSidecarOperations(): Unit {
         let runner = FeishuSidecarApiClientFakeRunner()

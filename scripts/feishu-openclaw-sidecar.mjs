@@ -581,6 +581,9 @@ async function dispatchSend(frame) {
     case "sendMedia":
     case "media":
       return sendMedia(frame);
+    case "uploadMedia":
+    case "media.upload":
+      return uploadMediaOnly(frame);
     case "sendCard":
     case "card":
       return sendCard(frame);
@@ -596,9 +599,20 @@ async function dispatchSend(frame) {
     case "removeReaction":
     case "reaction.remove":
       return removeReaction(frame);
+    case "listReactions":
+    case "reaction.list":
+      return listReactions(frame);
     case "deleteMessage":
     case "delete":
       return deleteMessage(frame);
+    case "fetchMessage":
+    case "message.fetch":
+      return fetchMessage(frame);
+    case "listMergeForward":
+    case "message.list_merge_forward":
+      return listMergeForwardMessages(frame);
+    case "chat.thread_capable":
+      return chatThreadCapable(frame);
     case "downloadImage":
       return downloadImage(frame);
     case "downloadResource":
@@ -606,6 +620,17 @@ async function dispatchSend(frame) {
     default:
       throw new Error(`Unsupported Feishu sidecar send action: ${action || "missing"}`);
   }
+}
+
+async function uploadMediaOnly(frame) {
+  const mediaType = String(frame.mediaType ?? "").trim().toLowerCase();
+  if (mediaType === "image" || frame.imageKey) {
+    const imageKey = await uploadImage(frame);
+    return { imageKey, mediaKey: imageKey };
+  }
+  const fileType = String(frame.fileType ?? detectFileType(frame.fileName, mediaType));
+  const fileKey = await uploadFile(frame, fileType);
+  return { fileKey, mediaKey: fileKey, fileType };
 }
 
 async function sendText(frame) {
@@ -780,14 +805,49 @@ async function addReaction(frame) {
 }
 
 async function removeReaction(frame) {
+  let reactionId = String(frame.reactionId ?? "").trim();
+  if (!reactionId && frame.emojiType) {
+    const matches = await listReactions({
+      ...frame,
+      reactionType: frame.emojiType,
+    });
+    reactionId = matches.reactions.find((entry) => entry.emojiType === frame.emojiType)?.reactionId ?? "";
+  }
+  if (!reactionId) {
+    throw new Error("Feishu remove reaction requires reactionId");
+  }
   const response = await state.client.im.messageReaction.delete({
     path: {
       message_id: frame.messageId,
-      reaction_id: frame.reactionId,
+      reaction_id: reactionId,
     },
   });
   assertApiSuccess(response, "Feishu remove reaction failed");
-  return { messageId: frame.messageId, reactionId: frame.reactionId };
+  return { messageId: frame.messageId, reactionId };
+}
+
+async function listReactions(frame) {
+  const reactionType = String(frame.reactionType ?? frame.emojiType ?? "").trim();
+  const response = await state.client.im.messageReaction.list({
+    path: { message_id: frame.messageId },
+    ...(reactionType ? { params: { reaction_type: reactionType } } : {}),
+  });
+  assertApiSuccess(response, "Feishu list reactions failed");
+  const items = response?.data?.items ?? response?.items ?? [];
+  return {
+    messageId: frame.messageId,
+    reactions: items.map((item) => ({
+      reactionId: item.reaction_id ?? item.reactionId ?? "",
+      emojiType: item.reaction_type?.emoji_type ?? item.emojiType ?? "",
+      operatorType: item.operator_type ?? item.operatorType ?? "",
+      operatorId:
+        item.operator_id?.open_id ??
+        item.operator_id?.user_id ??
+        item.operator_id?.union_id ??
+        item.operatorId ??
+        "",
+    })),
+  };
 }
 
 async function deleteMessage(frame) {
@@ -800,6 +860,64 @@ async function deleteMessage(frame) {
   });
   assertApiSuccess(response, "Feishu delete failed");
   return { messageId };
+}
+
+function normalizeMessageItem(item, fallbackMessageId = "") {
+  const body = item?.body && typeof item.body === "object" ? item.body : {};
+  const content = item?.content ?? body.content ?? "";
+  const normalizedContent = typeof content === "string" ? content : JSON.stringify(content ?? {});
+  return {
+    messageId: item?.message_id ?? item?.messageId ?? fallbackMessageId,
+    messageType: item?.message_type ?? item?.msg_type ?? item?.messageType ?? "",
+    content: normalizedContent,
+    raw: JSON.stringify(item ?? {}),
+  };
+}
+
+async function fetchMessage(frame) {
+  const messageId = String(frame.messageId ?? "").trim();
+  if (!messageId) {
+    throw new Error("Feishu message fetch requires messageId");
+  }
+  const response = await state.client.im.message.get({
+    path: { message_id: messageId },
+  });
+  assertApiSuccess(response, "Feishu message fetch failed");
+  const data = response?.data ?? response ?? {};
+  const item = Array.isArray(data.items) ? data.items[0] : data.message ?? data;
+  return normalizeMessageItem(item ?? {}, messageId);
+}
+
+async function listMergeForwardMessages(frame) {
+  const messageId = String(frame.messageId ?? "").trim();
+  if (!messageId) {
+    throw new Error("Feishu merge_forward fetch requires messageId");
+  }
+  const response = await state.client.im.message.get({
+    path: { message_id: messageId },
+  });
+  assertApiSuccess(response, "Feishu merge_forward fetch failed");
+  const items = response?.data?.items ?? response?.items ?? [];
+  return {
+    messageId,
+    messages: items.map((item) => normalizeMessageItem(item, item?.message_id ?? "")),
+  };
+}
+
+async function chatThreadCapable(frame) {
+  const chatId = String(frame.chatId ?? frame.receiveId ?? frame.to ?? "").trim();
+  if (!chatId || !state.client.im.chat?.get) {
+    return { chatId, capable: Boolean(chatId) };
+  }
+  const response = await state.client.im.chat.get({
+    path: { chat_id: chatId },
+  });
+  assertApiSuccess(response, "Feishu chat fetch failed");
+  const data = response?.data ?? {};
+  return {
+    chatId,
+    capable: data.chat_mode === "thread" || data.thread_mode === true || data.chat_type === "group",
+  };
 }
 
 function responseBuffer(response) {
@@ -827,6 +945,7 @@ async function downloadImage(frame) {
   const buffer = responseBuffer(response);
   return {
     contentBase64: buffer.toString("base64"),
+    bytesBase64: buffer.toString("base64"),
     contentType: contentTypeOf(response),
     size: buffer.length,
   };
@@ -835,12 +954,13 @@ async function downloadImage(frame) {
 async function downloadResource(frame) {
   const response = await state.client.im.messageResource.get({
     path: { message_id: frame.messageId, file_key: frame.fileKey },
-    params: { type: frame.resourceType ?? "file" },
+    params: { type: frame.resourceType === "image" ? "image" : "file" },
   });
   assertApiSuccess(response, "Feishu message resource download failed");
   const buffer = responseBuffer(response);
   return {
     contentBase64: buffer.toString("base64"),
+    bytesBase64: buffer.toString("base64"),
     contentType: contentTypeOf(response),
     fileName: response?.file_name ?? response?.fileName ?? response?.data?.file_name,
     size: buffer.length,

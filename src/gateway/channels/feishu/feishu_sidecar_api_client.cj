@@ -1,8 +1,9 @@
 package metis.gateway.channels.feishu
 
 import std.collection.ArrayList
+import std.time.*
 import stdx.encoding.base64.toBase64String
-import stdx.encoding.json.{JsonArray, JsonBool, JsonInt, JsonObject, JsonString}
+import stdx.encoding.json.{JsonArray, JsonBool, JsonInt, JsonObject, JsonString, JsonValue}
 
 public const FEISHU_SIDECAR_API_SCHEMA: String = "metis.feishu.sidecar.api.v1"
 
@@ -20,6 +21,291 @@ public class FeishuSidecarNoopRequestRunner <: FeishuSidecarRequestRunner {
         out.put("error", JsonString("Feishu sidecar API runner is not configured."))
         out.put("operation", request.get("operation") ?? JsonString(""))
         out
+    }
+}
+
+public class FeishuSidecarRequestAccount {
+    public let accountId: String
+    public let appId: String
+    public let appSecret: String
+    public let domain: String
+    public let verificationToken: String
+    public let encryptKey: String
+
+    public init(
+        accountId!: String = "default",
+        appId!: String = "",
+        appSecret!: String = "",
+        domain!: String = "https://open.feishu.cn",
+        verificationToken!: String = "",
+        encryptKey!: String = ""
+    ) {
+        this.accountId = gatewayFeishuNormalizeAccountId(accountId)
+        this.appId = appId.trimAscii()
+        this.appSecret = appSecret.trimAscii()
+        this.domain = if (domain.trimAscii().isEmpty()) { "https://open.feishu.cn" } else { domain.trimAscii() }
+        this.verificationToken = verificationToken.trimAscii()
+        this.encryptKey = encryptKey.trimAscii()
+    }
+}
+
+public class FeishuSidecarRequestRunnerOptions {
+    public let command: String
+    public let args: Array<String>
+    public let readyTimeoutMs: Int64
+    public let requestTimeoutMs: Int64
+    public let readTimeoutMs: Int64
+    public let stopTimeoutMs: Int64
+
+    public init(
+        command!: String = "node",
+        args!: Array<String> = ["scripts/feishu-openclaw-sidecar.mjs"],
+        readyTimeoutMs!: Int64 = 10000,
+        requestTimeoutMs!: Int64 = 30000,
+        readTimeoutMs!: Int64 = 250,
+        stopTimeoutMs!: Int64 = 500
+    ) {
+        this.command = if (command.trimAscii().isEmpty()) { "node" } else { command.trimAscii() }
+        this.args = args
+        this.readyTimeoutMs = if (readyTimeoutMs > 0) { readyTimeoutMs } else { 10000 }
+        this.requestTimeoutMs = if (requestTimeoutMs > 0) { requestTimeoutMs } else { 30000 }
+        this.readTimeoutMs = if (readTimeoutMs > 0) { readTimeoutMs } else { 250 }
+        this.stopTimeoutMs = if (stopTimeoutMs > 0) { stopTimeoutMs } else { 500 }
+    }
+}
+
+public class FeishuSidecarProcessRequestRunner <: FeishuSidecarRequestRunner {
+    private let account: FeishuSidecarRequestAccount
+    private let runner: FeishuSidecarProtocolRunner
+    private let options: FeishuSidecarRequestRunnerOptions
+
+    public init(
+        account!: FeishuSidecarRequestAccount,
+        runner!: FeishuSidecarProtocolRunner = FeishuSidecarStdioRunner(),
+        options!: FeishuSidecarRequestRunnerOptions = FeishuSidecarRequestRunnerOptions()
+    ) {
+        this.account = account
+        this.runner = runner
+        this.options = options
+    }
+
+    public func run(request: JsonObject): JsonObject {
+        if (this.account.appId.isEmpty() || this.account.appSecret.isEmpty()) {
+            return feishuSidecarProcessFailure("not_configured", "Feishu sidecar API requires appId and appSecret.")
+        }
+        let spec = FeishuSidecarLaunchSpec(command: this.options.command, args: this.options.args)
+        match (this.runner.start(spec)) {
+            case FeishuSidecarProtocolStartResult.Failed(reason) =>
+                return feishuSidecarProcessFailure(if (reason.contains("not_configured")) { "not_configured" } else { "launch_failed" }, reason)
+            case FeishuSidecarProtocolStartResult.Started(proc) =>
+                try {
+                    proc.writeLine(feishuSidecarCompactJsonLine(this.initFrame().toJsonString()))
+                    let ready = this.waitForReady(proc)
+                    if (!feishuSidecarJsonBool(ready, "ok", fallback: false)) {
+                        return ready
+                    }
+                    let requestId = "metis-sidecar-api"
+                    proc.writeLine(feishuSidecarCompactJsonLine(this.requestFrame(request, requestId).toJsonString()))
+                    return this.waitForResponse(proc, requestId)
+                } catch (e: Exception) {
+                    return feishuSidecarProcessFailure("api_error", e.message)
+                } finally {
+                    this.stopProcess(proc)
+                }
+        }
+    }
+
+    private func initFrame(): JsonObject {
+        let out = JsonObject()
+        out.put("type", JsonString("init"))
+        out.put("accountId", JsonString(this.account.accountId))
+        out.put("appId", JsonString(this.account.appId))
+        out.put("appSecret", JsonString(this.account.appSecret))
+        out.put("domain", JsonString(this.account.domain))
+        out.put("verificationToken", JsonString(this.account.verificationToken))
+        out.put("encryptKey", JsonString(this.account.encryptKey))
+        out.put("mode", JsonString("websocket"))
+        out.put("readyTimeoutMs", JsonInt(this.options.readyTimeoutMs))
+        out
+    }
+
+    private func requestFrame(request: JsonObject, requestId: String): JsonObject {
+        let operation = feishuSidecarJsonString(request, "operation")
+        let params = match (request.get("params")) {
+            case Some(v) => try { v.asObject() } catch (_e: Exception) { JsonObject() }
+            case None => JsonObject()
+        }
+        let out = JsonObject()
+        out.put("type", JsonString("request"))
+        out.put("requestId", JsonString(requestId))
+        out.put("accountId", JsonString(feishuSidecarJsonString(request, "accountId", fallback: this.account.accountId)))
+        out.put("action", JsonString(this.sidecarAction(operation, params)))
+        this.copyFields(params, out)
+        this.applyOperationMapping(operation, params, out)
+        out
+    }
+
+    private func sidecarAction(operation: String, params: JsonObject): String {
+        match (operation.trimAscii()) {
+            case "message.create" | "message.reply" => "sendText"
+            case "card.create" | "card.reply" => "sendCard"
+            case "card.patch" => "patchCard"
+            case "media.upload" => "uploadMedia"
+            case "message.send_media" | "message.reply_media" => "sendMedia"
+            case "reaction.add" => "addReaction"
+            case "reaction.remove" => "removeReaction"
+            case "reaction.list" => "reaction.list"
+            case "message.delete" => "deleteMessage"
+            case "message.fetch" => "message.fetch"
+            case "message.list_merge_forward" => "message.list_merge_forward"
+            case "resource.download" =>
+                if (feishuSidecarJsonString(params, "resourceType").toAsciiLower() == "image") { "downloadImage" } else { "downloadResource" }
+            case "chat.thread_capable" => "chat.thread_capable"
+            case _ => operation.trimAscii()
+        }
+    }
+
+    private func applyOperationMapping(operation: String, params: JsonObject, out: JsonObject): Unit {
+        let receiveId = feishuSidecarJsonString(params, "receiveId")
+        if (!receiveId.isEmpty()) {
+            out.put("to", JsonString(receiveId))
+        }
+        let messageId = feishuSidecarJsonString(params, "messageId")
+        if (!messageId.isEmpty()) {
+            out.put("messageId", JsonString(messageId))
+        }
+        if (operation == "media.upload") {
+            out.put("contentBase64", JsonString(feishuSidecarJsonString(params, "bytesBase64")))
+        }
+        if (operation == "message.send_media" || operation == "message.reply_media") {
+            let messageType = feishuSidecarJsonString(params, "messageType").toAsciiLower()
+            let mediaKey = feishuSidecarJsonString(params, "mediaKey")
+            if (messageType == "image") {
+                out.put("mediaType", JsonString("image"))
+                out.put("imageKey", JsonString(mediaKey))
+            } else {
+                out.put("mediaType", JsonString(if (messageType == "audio") { "audio" } else if (messageType == "media") { "video" } else { messageType }))
+                out.put("fileKey", JsonString(mediaKey))
+            }
+        }
+        if (operation == "reaction.add" || operation == "reaction.remove") {
+            let reactionType = feishuSidecarJsonString(params, "reactionType")
+            if (!reactionType.isEmpty()) {
+                out.put("emojiType", JsonString(reactionType))
+                if (operation == "reaction.remove") {
+                    out.put("reactionId", JsonString(reactionType))
+                }
+            }
+        }
+        if (operation == "resource.download") {
+            let resourceType = feishuSidecarJsonString(params, "resourceType").toAsciiLower()
+            let fileKey = feishuSidecarJsonString(params, "fileKey")
+            if (resourceType == "image") {
+                out.put("imageKey", JsonString(fileKey))
+            } else {
+                out.put("fileKey", JsonString(fileKey))
+            }
+        }
+    }
+
+    private func waitForReady(proc: FeishuSidecarProtocolProcess): JsonObject {
+        let deadline = this.nowMs() + this.options.readyTimeoutMs
+        while (this.nowMs() <= deadline) {
+            match (proc.readLine(this.options.readTimeoutMs)) {
+                case Some(line) =>
+                    let frame = this.parseFrame(line)
+                    let frameType = feishuSidecarJsonString(frame, "type")
+                    if (frameType == "ready") {
+                        let out = JsonObject()
+                        out.put("ok", JsonBool(true))
+                        out.put("status", JsonString("ready"))
+                        return out
+                    }
+                    if (frameType == "error") {
+                        return this.errorResult(frame)
+                    }
+                case None =>
+                    if (!proc.isAlive()) {
+                        return feishuSidecarProcessFailure("unexpected_exit", "Feishu sidecar exited before ready.")
+                    }
+            }
+        }
+        feishuSidecarProcessFailure("ready_timeout", "Feishu sidecar ready timeout.")
+    }
+
+    private func waitForResponse(proc: FeishuSidecarProtocolProcess, requestId: String): JsonObject {
+        let deadline = this.nowMs() + this.options.requestTimeoutMs
+        while (this.nowMs() <= deadline) {
+            match (proc.readLine(this.options.readTimeoutMs)) {
+                case Some(line) =>
+                    let frame = this.parseFrame(line)
+                    let frameType = feishuSidecarJsonString(frame, "type")
+                    if (frameType == "sendResult" && feishuSidecarJsonString(frame, "requestId") == requestId) {
+                        return this.successResult(frame)
+                    }
+                    if (frameType == "error" && feishuSidecarJsonString(frame, "requestId") == requestId) {
+                        return this.errorResult(frame)
+                    }
+                    if (frameType == "closed") {
+                        return feishuSidecarProcessFailure("closed", "Feishu sidecar closed before API response.")
+                    }
+                case None =>
+                    if (!proc.isAlive()) {
+                        return feishuSidecarProcessFailure("unexpected_exit", "Feishu sidecar exited before API response.")
+                    }
+            }
+        }
+        feishuSidecarProcessFailure("request_timeout", "Feishu sidecar API request timeout.")
+    }
+
+    private func parseFrame(line: String): JsonObject {
+        try {
+            JsonValue.fromStr(line.trimAscii()).asObject()
+        } catch (e: Exception) {
+            feishuSidecarProcessFailure("protocol_error", "Feishu sidecar protocol parse failed: ${e.message}")
+        }
+    }
+
+    private func successResult(frame: JsonObject): JsonObject {
+        let out = JsonObject()
+        out.put("ok", JsonBool(true))
+        out.put("status", JsonString("ok"))
+        this.copyFields(frame, out, skipProtocol: true)
+        let contentBase64 = feishuSidecarJsonString(frame, "contentBase64")
+        if (!contentBase64.isEmpty() && out.get("bytesBase64").isNone()) {
+            out.put("bytesBase64", JsonString(contentBase64))
+        }
+        out
+    }
+
+    private func errorResult(frame: JsonObject): JsonObject {
+        let status = feishuSidecarJsonString(frame, "status", fallback: "api_error")
+        let message = feishuSidecarFirstString(frame, ["message", "error", "detail"], fallback: status)
+        feishuSidecarProcessFailure(status, feishuSidecarRedactSensitiveText(message))
+    }
+
+    private func copyFields(source: JsonObject, target: JsonObject, skipProtocol!: Bool = false): Unit {
+        for (key in source.getFields().keys()) {
+            if (skipProtocol && (key == "type" || key == "requestId" || key == "action" || key == "accountId")) {
+                continue
+            }
+            match (source.get(key)) {
+                case Some(v) => target.put(key, v)
+                case None => ()
+            }
+        }
+    }
+
+    private func stopProcess(proc: FeishuSidecarProtocolProcess): Unit {
+        try { proc.writeLine("{\"type\":\"close\",\"reason\":\"api_request_done\"}") } catch (_e: Exception) { () }
+        match (proc.wait(this.options.stopTimeoutMs)) {
+            case Some(_) => ()
+            case None => proc.terminate(true)
+        }
+    }
+
+    private func nowMs(): Int64 {
+        DateTime.now().toUnixTimeStamp().toMilliseconds()
     }
 }
 
@@ -436,6 +722,42 @@ private func feishuSidecarShouldFallbackReply(status: String, error: String): Bo
         probe.contains("deleted") ||
         probe.contains("recalled") ||
         probe.contains("withdrawn")
+}
+
+private func feishuSidecarProcessFailure(status: String, error: String): JsonObject {
+    let out = JsonObject()
+    out.put("ok", JsonBool(false))
+    out.put("status", JsonString(if (status.trimAscii().isEmpty()) { "api_error" } else { status.trimAscii() }))
+    out.put("error", JsonString(feishuSidecarRedactSensitiveText(error)))
+    out
+}
+
+private func feishuSidecarCompactJsonLine(raw: String): String {
+    let out = StringBuilder()
+    var inString = false
+    var escaped = false
+    for (ch in raw.toRuneArray()) {
+        if (escaped) {
+            out.append(ch)
+            escaped = false
+            continue
+        }
+        if (inString && ch == r'\\') {
+            out.append(ch)
+            escaped = true
+            continue
+        }
+        if (ch == r'"') {
+            out.append(ch)
+            inString = !inString
+            continue
+        }
+        if (!inString && (ch == r' ' || ch == r'\n' || ch == r'\r' || ch == r'\t')) {
+            continue
+        }
+        out.append(ch)
+    }
+    out.toString()
 }
 
 private func feishuSidecarBase64Value(ch: Byte): Int64 {

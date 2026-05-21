@@ -135,6 +135,21 @@ function writeFakeSdk(root, options = {}) {
                 record("im.message.delete", request);
                 return nextResponse({ code: 0, data: { message_id: request.path.message_id } });
               },
+              get: async (request) => {
+                record("im.message.get", request);
+                return nextResponse({
+                  code: 0,
+                  data: {
+                    items: [
+                      {
+                        message_id: request.path.message_id,
+                        msg_type: "text",
+                        body: { content: JSON.stringify({ text: "fetched" }) },
+                      },
+                    ],
+                  },
+                });
+              },
             },
             image: {
               create: async (request) => {
@@ -166,6 +181,28 @@ function writeFakeSdk(root, options = {}) {
               delete: async (request) => {
                 record("im.messageReaction.delete", request);
                 return nextResponse({ code: 0 });
+              },
+              list: async (request) => {
+                record("im.messageReaction.list", request);
+                return nextResponse({
+                  code: 0,
+                  data: {
+                    items: [
+                      {
+                        reaction_id: "reaction_created",
+                        reaction_type: { emoji_type: request.params?.reaction_type ?? "THUMBSUP" },
+                        operator_type: "app",
+                        operator_id: { open_id: "ou_bot" },
+                      },
+                    ],
+                  },
+                });
+              },
+            },
+            chat: {
+              get: async (request) => {
+                record("im.chat.get", request);
+                return nextResponse({ code: 0, data: { chat_id: request.path.chat_id, chat_type: "group" } });
               },
             },
           };
@@ -436,6 +473,7 @@ test("send text, media, card, reaction, delete, and download requests route to S
     const requests = [
       { type: "send", action: "sendText", requestId: "text-create", to: "oc_chat", text: "hello" },
       { type: "send", action: "sendText", requestId: "text-reply", to: "oc_chat", text: "reply", replyToMessageId: "om_parent", replyInThread: true },
+      { type: "send", action: "uploadMedia", requestId: "upload-image", mediaType: "image", fileName: "upload.png", contentBase64: Buffer.from("png").toString("base64") },
       { type: "send", action: "sendMedia", requestId: "image", to: "oc_chat", mediaType: "image", fileName: "a.png", contentBase64: Buffer.from("png").toString("base64") },
       { type: "send", action: "sendMedia", requestId: "audio", to: "oc_chat", mediaType: "audio", fileName: "a.ogg", contentBase64: Buffer.from("ogg").toString("base64"), duration: 123 },
       { type: "send", action: "sendMedia", requestId: "video", to: "oc_chat", mediaType: "video", fileName: "a.mp4", contentBase64: Buffer.from("mp4").toString("base64") },
@@ -443,7 +481,11 @@ test("send text, media, card, reaction, delete, and download requests route to S
       { type: "send", action: "patchCard", requestId: "patch-card", messageId: "om_card", card: { elements: [] } },
       { type: "send", action: "addReaction", requestId: "react-add", messageId: "om_1", emojiType: "THUMBSUP" },
       { type: "send", action: "removeReaction", requestId: "react-remove", messageId: "om_1", reactionId: "reaction_created" },
+      { type: "send", action: "reaction.list", requestId: "react-list", messageId: "om_1", emojiType: "THUMBSUP" },
       { type: "send", action: "deleteMessage", requestId: "delete", messageId: "om_1" },
+      { type: "send", action: "message.fetch", requestId: "fetch", messageId: "om_1" },
+      { type: "send", action: "message.list_merge_forward", requestId: "merge", messageId: "om_merge" },
+      { type: "send", action: "chat.thread_capable", requestId: "thread", chatId: "oc_chat" },
       { type: "send", action: "downloadImage", requestId: "download-image", imageKey: "img_1" },
       { type: "send", action: "downloadResource", requestId: "download-resource", messageId: "om_1", fileKey: "file_1", resourceType: "file" },
     ];
@@ -456,12 +498,15 @@ test("send text, media, card, reaction, delete, and download requests route to S
 
     assert.equal(callsOf(callsPath, "im.message.create").length, 5);
     assert.equal(callsOf(callsPath, "im.message.reply").length, 1);
-    assert.equal(callsOf(callsPath, "im.image.create").length, 1);
+    assert.equal(callsOf(callsPath, "im.image.create").length, 2);
     assert.equal(callsOf(callsPath, "im.file.create").length, 2);
     assert.equal(callsOf(callsPath, "im.message.patch").length, 1);
     assert.equal(callsOf(callsPath, "im.messageReaction.create")[0].data.reaction_type.emoji_type, "THUMBSUP");
     assert.equal(callsOf(callsPath, "im.messageReaction.delete")[0].path.reaction_id, "reaction_created");
+    assert.equal(callsOf(callsPath, "im.messageReaction.list")[0].params.reaction_type, "THUMBSUP");
     assert.equal(callsOf(callsPath, "im.message.delete")[0].path.message_id, "om_1");
+    assert.equal(callsOf(callsPath, "im.message.get").length, 2);
+    assert.equal(callsOf(callsPath, "im.chat.get")[0].path.chat_id, "oc_chat");
     assert.equal(callsOf(callsPath, "im.image.get")[0].path.image_key, "img_1");
     assert.deepEqual(callsOf(callsPath, "im.messageResource.get")[0], {
       path: { message_id: "om_1", file_key: "file_1" },

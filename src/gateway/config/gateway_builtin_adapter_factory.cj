@@ -8,7 +8,11 @@ import metis.gateway.channels.feishu.{
     FeishuNativeLongConnectTransport,
     FeishuNoopApiClient,
     FeishuSidecarApiClient,
+    FeishuSidecarProcessRequestRunner,
+    FeishuSidecarRequestAccount,
+    FeishuSidecarStdioRunner,
     FeishuSidecarTransport,
+    FeishuSidecarTransportOptions,
     FeishuWebhookLongConnectTransport,
     gatewayFeishuResolveAccount
 }
@@ -75,14 +79,28 @@ private func gatewayFeishuLongConnectTransportForConfig(config: FeishuConfig): F
         return FeishuWebhookLongConnectTransport()
     }
     if (config.transportMode == "openclaw-sidecar") {
-        return FeishuSidecarTransport()
+        return FeishuSidecarTransport(
+            runner: FeishuSidecarStdioRunner(),
+            options: FeishuSidecarTransportOptions(startBackgroundReader: true)
+        )
     }
     FeishuNativeLongConnectTransport()
 }
 
 private func gatewayFeishuApiClientForConfig(config: FeishuConfig): FeishuApiClient {
     if (config.receiveMode == "long_connect" && config.transportMode == "openclaw-sidecar") {
-        return FeishuSidecarApiClient()
+        return FeishuSidecarApiClient(
+            runner: FeishuSidecarProcessRequestRunner(
+                account: FeishuSidecarRequestAccount(
+                    accountId: config.accountId,
+                    appId: config.appId,
+                    appSecret: config.appSecret,
+                    domain: config.domain,
+                    verificationToken: config.verificationToken,
+                    encryptKey: config.encryptKey
+                )
+            )
+        )
     }
     FeishuNoopApiClient()
 }
