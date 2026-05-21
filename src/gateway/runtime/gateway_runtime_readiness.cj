@@ -117,7 +117,7 @@ private func gatewayRuntimeReasonToErrorKind(reason: String, row: JsonObject): S
         return existing
     }
     let err = gatewayRuntimeString(row, "lastError").toAsciiLower()
-    if (err.contains("monitor-host-timeout") || err.contains("transport-timeout")) {
+    if (err.contains("long-connect-timeout") || err.contains("transport-timeout")) {
         return "transport"
     }
     if (err.contains("credential") || err.contains("appsecret") || err.contains("app secret")) {
@@ -184,7 +184,7 @@ private func gatewayRuntimeAccountProblemReason(row: JsonObject, configured: Boo
     let state = gatewayRuntimeString(row, "lifecycleState").trimAscii()
     if (state == "failed") {
         let err = gatewayRuntimeString(row, "lastError").toAsciiLower()
-        if (err.contains("monitor-host-timeout") || err.contains("transport-timeout")) {
+        if (err.contains("long-connect-timeout") || err.contains("transport-timeout")) {
             return "transport-start-timeout"
         }
         if (err.contains("credential") || err.contains("appsecret") || err.contains("app secret")) {

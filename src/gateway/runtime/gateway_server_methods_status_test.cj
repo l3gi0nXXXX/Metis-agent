@@ -96,7 +96,7 @@ public class GatewayServerMethodsStatusTest {
             let cfg = buildGatewayConfigFromUserSettings(user)
             let _ = gatewayChannelRuntimeRegisterAccount("telegram", accountId: "default")
             let _ = gatewayChannelRuntimeMarkStarting("telegram", accountId: "default")
-            let _ = gatewayChannelRuntimeMarkFailure("telegram", accountId: "default", error: "monitor-host-timeout", errorKind: "start_timeout")
+            let _ = gatewayChannelRuntimeMarkFailure("telegram", accountId: "default", error: "transport-timeout", errorKind: "start_timeout")
 
             let readyz = JsonValue.fromStr(gatewayHttpReadyProbeJson(cfg)).asObject()
             let readyzReadiness = statusTestObject(readyz, "readiness")
@@ -119,7 +119,7 @@ public class GatewayServerMethodsStatusTest {
                 @Expect(statusTestString(row, "channelId"), "telegram")
                 @Expect(statusTestString(row, "accountId"), "default")
                 @Expect(statusTestString(row, "lifecycleState"), "failed")
-                @Expect(statusTestString(row, "lastError"), "monitor-host-timeout")
+                @Expect(statusTestString(row, "lastError"), "transport-timeout")
                 @Expect(statusTestString(row, "errorKind"), "start_timeout")
             }
         })

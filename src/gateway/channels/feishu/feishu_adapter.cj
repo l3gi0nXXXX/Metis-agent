@@ -778,29 +778,6 @@ public class FeishuAdapter <: ChannelAdapter {
         }
     }
 
-    private func logFeishuSidecarLifecycle(
-        level: String,
-        event: String,
-        phase: String,
-        status: String,
-        message: String,
-        errorKind!: String = "none",
-        error!: String = "",
-        extra!: JsonObject = JsonObject()
-    ): Unit {
-        this.logChannel(
-            level,
-            event,
-            phase,
-            status,
-            message,
-            errorKind: errorKind,
-            error: error,
-            accountId: this.accountId,
-            extra: extra
-        )
-    }
-
     private func feishuErrorKind(detail: String): String {
         let lowered = detail.trimAscii().toAsciiLower()
         if (lowered.isEmpty()) { return "unknown" }
@@ -815,7 +792,7 @@ public class FeishuAdapter <: ChannelAdapter {
             return "transport"
         }
         if (lowered.contains("parse") || lowered.contains("json")) { return "parse" }
-        if (lowered.contains("sdk") || lowered.contains("monitor-host")) { return "transport" }
+        if (lowered.contains("long-connect") || lowered.contains("websocket") || lowered.contains("pbbp2")) { return "transport" }
         if (lowered.contains("rate")) { return "rate-limit" }
         "unknown"
     }

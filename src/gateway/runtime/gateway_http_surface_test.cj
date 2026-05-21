@@ -92,7 +92,7 @@ public class GatewayHttpSurfaceTest {
             let cfg = buildGatewayConfigFromUserSettings(user)
             let _ = gatewayChannelRuntimeRegisterAccount("feishu", accountId: "work")
             let _ = gatewayChannelRuntimeMarkStarting("feishu", accountId: "work")
-            let _ = gatewayChannelRuntimeMarkFailure("feishu", accountId: "work", error: "monitor-host-timeout")
+            let _ = gatewayChannelRuntimeMarkFailure("feishu", accountId: "work", error: "transport-timeout")
 
             let healthz = JsonValue.fromStr(gatewayHttpHealthProbeJson(cfg)).asObject()
             @Expect(healthz.get("ok").getOrThrow().asBool().getValue(), true)
@@ -115,7 +115,7 @@ public class GatewayHttpSurfaceTest {
             let cfg = buildGatewayConfigFromUserSettings(user)
             let _ = gatewayChannelRuntimeRegisterAccount("feishu", accountId: "work")
             let _ = gatewayChannelRuntimeMarkStarting("feishu", accountId: "work")
-            let _ = gatewayChannelRuntimeMarkFailure("feishu", accountId: "work", error: "monitor-host-timeout")
+            let _ = gatewayChannelRuntimeMarkFailure("feishu", accountId: "work", error: "transport-timeout")
 
             let readyz = JsonValue.fromStr(gatewayHttpReadyProbeJson(cfg)).asObject()
             @Expect(readyz.get("ok").getOrThrow().asBool().getValue(), false)
@@ -130,7 +130,7 @@ public class GatewayHttpSurfaceTest {
             @Expect(row.get("channelId").getOrThrow().asString().getValue(), "feishu")
             @Expect(row.get("accountId").getOrThrow().asString().getValue(), "work")
             @Expect(row.get("lifecycleState").getOrThrow().asString().getValue(), "failed")
-            @Expect(row.get("lastError").getOrThrow().asString().getValue(), "monitor-host-timeout")
+            @Expect(row.get("lastError").getOrThrow().asString().getValue(), "transport-timeout")
         })
     }
 

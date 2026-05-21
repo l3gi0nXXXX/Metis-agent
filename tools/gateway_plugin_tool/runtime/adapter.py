@@ -209,15 +209,6 @@ def main() -> int:
 
         return cmd_stream(sargs.plugin_root, sargs.plugin_id)
 
-    if argv and argv[0] == "feishu_long_connect":
-        sp = argparse.ArgumentParser(prog="adapter feishu_long_connect")
-        sp.add_argument("--plugin-root", required=True)
-        sp.add_argument("--plugin-id", required=True)
-        sargs = sp.parse_args(argv[1:])
-        from channels.feishu import cmd_long_connect_feishu
-
-        return cmd_long_connect_feishu(sargs.plugin_root, sargs.plugin_id)
-
     if argv and argv[0] == "qq_official_ws":
         sp = argparse.ArgumentParser(prog="adapter qq_official_ws")
         sp.add_argument("--plugin-root", required=True)
