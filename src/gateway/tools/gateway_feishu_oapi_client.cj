@@ -1,6 +1,6 @@
 package metis.gateway.tools
 
-import metis.core.config.MetisPaths
+import metis.core.config.{GatewayUserSettings, MetisPaths}
 
 import std.collection.{ArrayList, HashMap, HashSet}
 import std.convert.Parsable
@@ -263,6 +263,7 @@ public class FeishuOapiResult {
             auth.put("required", JsonBool(true))
             auth.put("state", JsonString(if (this.authState.isEmpty()) { "absent" } else { this.authState }))
             auth.put("mode", JsonString(this.request.tokenMode))
+            auth.put("card", feishuOapiAuthRequiredCard(this.request, if (this.authState.isEmpty()) { "absent" } else { this.authState }))
             out.put("auth", auth)
         }
         if (this.status == "missing_credential") {
@@ -275,6 +276,20 @@ public class FeishuOapiResult {
         }
         out
     }
+}
+
+private func feishuOapiAuthRequiredCard(request: FeishuOapiRequest, authState: String): JsonObject {
+    let out = JsonObject()
+    out.put("kind", JsonString("feishu_auth_required"))
+    out.put("accountId", JsonString(feishuOapiNormalizeAccountId(request.accountId)))
+    out.put("account_id", JsonString(feishuOapiNormalizeAccountId(request.accountId)))
+    out.put("tokenMode", JsonString(request.tokenMode))
+    out.put("authState", JsonString(if (authState.trimAscii().isEmpty()) { "absent" } else { authState.trimAscii() }))
+    out.put("repairMethod", JsonString("channels.feishu.auth.start"))
+    out.put("requiredScopes", feishuOapiJsonStringArray(request.requiredScopes))
+    out.put("message", JsonString("Feishu user authorization is required. Start Feishu auth for account ${feishuOapiNormalizeAccountId(request.accountId)} and retry after it completes."))
+    out.put("redacted", JsonBool(true))
+    out
 }
 
 public class FeishuOapiTokenLookup {
@@ -578,6 +593,7 @@ private class FeishuOapiCachedAppToken {
 
 public class MetisFeishuOapiTokenProvider <: FeishuOapiTokenProvider {
     private let root: Path
+    private let userSettings: Option<GatewayUserSettings>
     private let refreshClient: Option<FeishuOapiRefreshClient>
     private let appId: String
     private let appSecret: String
@@ -588,6 +604,7 @@ public class MetisFeishuOapiTokenProvider <: FeishuOapiTokenProvider {
 
     public init(
         root!: Path = feishuOapiDefaultTokenStoreRoot(),
+        userSettings!: Option<GatewayUserSettings> = None<GatewayUserSettings>,
         refreshClient!: Option<FeishuOapiRefreshClient> = None<FeishuOapiRefreshClient>,
         appId!: String = feishuOapiEnvValue("METIS_FEISHU_OAPI_APP_ID"),
         appSecret!: String = feishuOapiEnvValue("METIS_FEISHU_OAPI_APP_SECRET"),
@@ -596,6 +613,7 @@ public class MetisFeishuOapiTokenProvider <: FeishuOapiTokenProvider {
         nowMs!: Int64 = DateTime.now().toUnixTimeStamp().toMilliseconds()
     ) {
         this.root = root
+        this.userSettings = userSettings
         this.refreshClient = refreshClient
         this.appId = appId.trimAscii()
         this.appSecret = appSecret.trimAscii()
@@ -656,7 +674,8 @@ public class MetisFeishuOapiTokenProvider <: FeishuOapiTokenProvider {
     private func appToken(accountId: String, tokenMode: String, requiredScopes: Array<String>): FeishuOapiTokenLookup {
         let normalized = feishuOapiNormalizeAccountId(accountId)
         let cleanMode = tokenMode.trimAscii()
-        if (this.appId.isEmpty() || this.appSecret.isEmpty()) {
+        let credentials = this.credentialsForAccount(normalized)
+        if (credentials.appId.isEmpty() || credentials.appSecret.isEmpty()) {
             return FeishuOapiTokenLookup(
                 "missing_credential",
                 error: "Feishu appId/appSecret is required before issuing ${cleanMode}."
@@ -675,10 +694,9 @@ public class MetisFeishuOapiTokenProvider <: FeishuOapiTokenProvider {
                 }
             case None => ()
         }
-        let credentials = FeishuOapiAppCredentials(this.appId, this.appSecret, domain: this.appDomain)
         let result = match (this.appTokenClient) {
             case Some(client) => client.fetch(normalized, cleanMode, credentials)
-            case None => FeishuNativeOapiAppTokenClient(domain: this.appDomain).fetch(normalized, cleanMode, credentials)
+            case None => FeishuNativeOapiAppTokenClient(domain: credentials.domain).fetch(normalized, cleanMode, credentials)
         }
         if (result.status != "authorized" || result.accessToken.isEmpty()) {
             return FeishuOapiTokenLookup(
@@ -756,7 +774,7 @@ public class MetisFeishuOapiTokenProvider <: FeishuOapiTokenProvider {
             return None<FeishuOapiStoredToken>
         }
         try {
-            let root = JsonValue.fromStr(String.fromUtf8(File.readFrom(path))).asObject()
+            let root = feishuOapiStoredTokenPayloadObject(feishuOapiNormalizeAccountId(accountId), String.fromUtf8(File.readFrom(path)))
             return Some(FeishuOapiStoredToken(
                 accessToken: feishuOapiJsonString(root, "accessToken"),
                 refreshToken: feishuOapiJsonString(root, "refreshToken"),
@@ -769,19 +787,101 @@ public class MetisFeishuOapiTokenProvider <: FeishuOapiTokenProvider {
     }
 
     private func save(accountId: String, token: FeishuOapiStoredToken): Unit {
-        if (!exists(this.root)) {
-            Directory.create(this.root, recursive: true)
+        let normalized = feishuOapiNormalizeAccountId(accountId)
+        let root = this.rootForAccount(normalized)
+        if (!exists(root)) {
+            Directory.create(root, recursive: true)
         }
         let obj = JsonObject()
         obj.put("accessToken", JsonString(token.accessToken))
         obj.put("refreshToken", JsonString(token.refreshToken))
         obj.put("expiresAtMs", JsonInt(token.expiresAtMs))
         obj.put("scopes", feishuOapiJsonStringArray(token.scopes))
-        File.writeTo(this.pathFor(accountId), obj.toJsonString().toArray())
+        File.writeTo(root.join("${feishuOapiSafeAccountSegment(normalized)}.json"), feishuOapiStoredTokenEnvelope(normalized, obj).toJsonString().toArray())
     }
 
     private func pathFor(accountId: String): Path {
-        this.root.join("${feishuOapiSafeAccountSegment(accountId)}.json")
+        let normalized = feishuOapiNormalizeAccountId(accountId)
+        this.rootForAccount(normalized).join("${feishuOapiSafeAccountSegment(normalized)}.json")
+    }
+
+    private func rootForAccount(accountId: String): Path {
+        match (this.accountOverride(accountId)) {
+            case Some(account) =>
+                let configured = feishuOapiJsonStringFallback(account, ["userTokenRoot", "user_token_root", "tokenRoot", "token_root"], "")
+                if (!configured.isEmpty()) {
+                    return Path(configured)
+                }
+            case None => ()
+        }
+        this.root
+    }
+
+    private func credentialsForAccount(accountId: String): FeishuOapiAppCredentials {
+        match (this.accountOverride(accountId)) {
+            case Some(account) =>
+                FeishuOapiAppCredentials(
+                    feishuOapiJsonStringFallback(account, ["appId", "app_id"], this.userTopLevelAppId()),
+                    feishuOapiJsonStringFallback(account, ["appSecret", "app_secret"], this.userTopLevelAppSecret()),
+                    domain: feishuOapiJsonStringFallback(account, ["domain"], this.userTopLevelDomain())
+                )
+            case None =>
+                FeishuOapiAppCredentials(this.userTopLevelAppId(), this.userTopLevelAppSecret(), domain: this.userTopLevelDomain())
+        }
+    }
+
+    private func userTopLevelAppId(): String {
+        match (this.userSettings) {
+            case Some(user) =>
+                if (!user.feishu.appId.trimAscii().isEmpty()) {
+                    return user.feishu.appId.trimAscii()
+                }
+            case None => ()
+        }
+        this.appId
+    }
+
+    private func userTopLevelAppSecret(): String {
+        match (this.userSettings) {
+            case Some(user) =>
+                if (!user.feishu.appSecret.trimAscii().isEmpty()) {
+                    return user.feishu.appSecret.trimAscii()
+                }
+            case None => ()
+        }
+        this.appSecret
+    }
+
+    private func userTopLevelDomain(): String {
+        match (this.userSettings) {
+            case Some(user) =>
+                if (!user.feishu.domain.trimAscii().isEmpty()) {
+                    return user.feishu.domain.trimAscii()
+                }
+            case None => ()
+        }
+        this.appDomain
+    }
+
+    private func accountOverride(accountId: String): Option<JsonObject> {
+        let normalized = feishuOapiNormalizeAccountId(accountId)
+        match (this.userSettings) {
+            case Some(user) =>
+                match (user.feishu.accounts) {
+                    case Some(accounts) =>
+                        match (accounts.get(normalized)) {
+                            case Some(v) => return try { Some(v.asObject()) } catch (_: Exception) { None<JsonObject> }
+                            case None =>
+                                match (accounts.get("feishu:${normalized}")) {
+                                    case Some(v) => return try { Some(v.asObject()) } catch (_: Exception) { None<JsonObject> }
+                                    case None => ()
+                                }
+                        }
+                    case None => ()
+                }
+            case None => ()
+        }
+        None<JsonObject>
     }
 }
 
@@ -797,6 +897,97 @@ private class FeishuOapiStoredToken {
         this.expiresAtMs = expiresAtMs
         this.scopes = scopes
     }
+}
+
+private let FEISHU_OAPI_TOKEN_STORE_FORMAT = "metis-feishu-token-v2"
+private let FEISHU_OAPI_TOKEN_STORE_ENCODING = "obfuscated-hex-v1"
+
+private func feishuOapiStoredTokenEnvelope(accountId: String, payload: JsonObject): JsonObject {
+    let out = JsonObject()
+    out.put("format", JsonString(FEISHU_OAPI_TOKEN_STORE_FORMAT))
+    out.put("encoding", JsonString(FEISHU_OAPI_TOKEN_STORE_ENCODING))
+    out.put("payload", JsonString(feishuOapiObfuscatePayload(accountId, payload.toJsonString())))
+    out.put("redacted", JsonBool(true))
+    out
+}
+
+private func feishuOapiStoredTokenPayloadObject(accountId: String, raw: String): JsonObject {
+    let parsed = JsonValue.fromStr(raw).asObject()
+    if (feishuOapiJsonString(parsed, "format") == FEISHU_OAPI_TOKEN_STORE_FORMAT &&
+        feishuOapiJsonString(parsed, "encoding") == FEISHU_OAPI_TOKEN_STORE_ENCODING) {
+        return JsonValue.fromStr(feishuOapiDeobfuscatePayload(accountId, feishuOapiJsonString(parsed, "payload"))).asObject()
+    }
+    parsed
+}
+
+private func feishuOapiObfuscationKey(accountId: String): Array<Byte> {
+    ("metis-feishu-token-store-v1:" + feishuOapiNormalizeAccountId(accountId)).toArray()
+}
+
+private func feishuOapiObfuscatePayload(accountId: String, raw: String): String {
+    let key = feishuOapiObfuscationKey(accountId)
+    let input = raw.toArray()
+    let out = ArrayList<Byte>()
+    for (i in 0..input.size) {
+        let encoded = (Int64(input[i]) + Int64(key[i % key.size]) + 17) % 256
+        out.add(UInt8(encoded))
+    }
+    feishuOapiHexEncode(out.toArray())
+}
+
+private func feishuOapiDeobfuscatePayload(accountId: String, raw: String): String {
+    let key = feishuOapiObfuscationKey(accountId)
+    let encoded = feishuOapiHexDecode(raw)
+    let out = ArrayList<Byte>()
+    for (i in 0..encoded.size) {
+        var value = Int64(encoded[i]) - Int64(key[i % key.size]) - 17
+        while (value < 0) {
+            value += 256
+        }
+        out.add(UInt8(value % 256))
+    }
+    String.fromUtf8(out.toArray())
+}
+
+private func feishuOapiHexEncode(bytes: Array<Byte>): String {
+    let hex = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "a", "b", "c", "d", "e", "f"]
+    let out = StringBuilder()
+    for (b in bytes) {
+        let v = Int64(b)
+        out.append(hex[(v >> 4) & 0x0F])
+        out.append(hex[v & 0x0F])
+    }
+    out.toString()
+}
+
+private func feishuOapiHexDecode(raw: String): Array<Byte> {
+    let bytes = raw.trimAscii().toArray()
+    let out = ArrayList<Byte>()
+    var i: Int64 = 0
+    while (i + 1 < bytes.size) {
+        let high = feishuOapiHexValue(bytes[i])
+        let low = feishuOapiHexValue(bytes[i + 1])
+        if (high < 0 || low < 0) {
+            throw Exception("invalid hex token payload")
+        }
+        out.add(UInt8((high << 4) + low))
+        i += 2
+    }
+    out.toArray()
+}
+
+private func feishuOapiHexValue(b: Byte): Int64 {
+    let v = Int64(b)
+    if (v >= 48 && v <= 57) {
+        return v - 48
+    }
+    if (v >= 65 && v <= 70) {
+        return v - 65 + 10
+    }
+    if (v >= 97 && v <= 102) {
+        return v - 97 + 10
+    }
+    -1
 }
 
 public class FeishuNativeOapiAppTokenClient <: FeishuOapiAppTokenClient {
@@ -1928,7 +2119,14 @@ private func feishuOapiNormalizeDomain(raw: String): String {
 
 private func feishuOapiNormalizeAccountId(raw: String): String {
     let out = raw.trimAscii()
-    if (out.isEmpty()) { "default" } else { out }
+    if (out.isEmpty()) {
+        return "default"
+    }
+    if (out.toAsciiLower().startsWith("feishu:")) {
+        let suffix = out["feishu:".size..].trimAscii()
+        return if (suffix.isEmpty()) { "default" } else { suffix }
+    }
+    out
 }
 
 private func feishuOapiSafeAccountSegment(raw: String): String {
@@ -2087,6 +2285,16 @@ private func feishuOapiJsonString(obj: JsonObject, key: String): String {
         case Some(v) => try { v.asString().getValue().trimAscii() } catch (_e: Exception) { "" }
         case None => ""
     }
+}
+
+private func feishuOapiJsonStringFallback(obj: JsonObject, keys: Array<String>, fallback: String): String {
+    for (key in keys) {
+        let value = feishuOapiJsonString(obj, key)
+        if (!value.isEmpty()) {
+            return value
+        }
+    }
+    fallback.trimAscii()
 }
 
 private func feishuOapiJsonInt(obj: JsonObject, key: String, fallback: Int64): Int64 {

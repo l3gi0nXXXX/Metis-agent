@@ -99,12 +99,38 @@ private func feishuOapiInvokeByTool(toolName: String, action: String, paramsJson
     feishuOapiInvoke(toolName, feishuOapiCategoryForTool(toolName), action, accountId, paramsJson)
 }
 
+private func feishuOapiDirectoryInvoke(kind: String, accountId: Option<String>, paramsJson: Option<String>): String {
+    let normalizedKind = kind.trimAscii().toAsciiLower()
+    let cleanAccount = match (accountId) {
+        case Some(value) => if (value.trimAscii().isEmpty()) { "default" } else { value.trimAscii() }
+        case None => "default"
+    }
+    let (toolName, action) = match (normalizedKind) {
+        case "groups" | "group" => ("feishu_chat", "search")
+        case _ => ("feishu_search_user", "default")
+    }
+    let raw = feishuOapiInvokeByTool(toolName, action, paramsJson, Some(cleanAccount))
+    try {
+        let out = JsonValue.fromStr(raw).asObject()
+        out.put("accountId", JsonString(cleanAccount))
+        out.put("directoryKind", JsonString(if (toolName == "feishu_chat") { "groups" } else { "peers" }))
+        out.put("sourceTool", JsonString(toolName))
+        return out.toJsonString()
+    } catch (_: Exception) {
+        raw
+    }
+}
+
 @toolset
 public class GatewayFeishuOapiToolset {
     public init() {}
 
     public func debugFeishuOapiInvokeForTest(toolName: String, action: String, accountId: Option<String>, paramsJson: Option<String>): String {
         feishuOapiInvokeByTool(toolName, action, paramsJson, accountId)
+    }
+
+    public func debugFeishuDirectoryForTest(kind: String, accountId: Option<String>, paramsJson: Option<String>): String {
+        feishuOapiDirectoryInvoke(kind, accountId, paramsJson)
     }
 
     public func debugFeishuOapiSmokeDryRunPlanForTest(casesJson: String, defaultAccountId: String, domain: String): String {
@@ -293,6 +319,18 @@ public class GatewayFeishuOapiToolset {
     public func feishu_chat_members(action: String, params_json: Option<String>, account_id: Option<String>): String {
         PrintUtils.printTool("feishu_chat_members", shortMessage: action)
         feishuOapiInvokeByTool("feishu_chat_members", action, params_json, account_id)
+    }
+
+    @tool[description: "List Feishu peer/user directory candidates through the native OAPI boundary. Results always include accountId and return auth diagnostics when user authorization is missing."]
+    public func feishu_directory_peers(params_json: Option<String>, account_id: Option<String>): String {
+        PrintUtils.printTool("feishu_directory_peers", shortMessage: "list")
+        feishuOapiDirectoryInvoke("peers", account_id, params_json)
+    }
+
+    @tool[description: "List Feishu group/chat directory candidates through the native OAPI boundary. Results always include accountId and return auth diagnostics when user authorization is missing."]
+    public func feishu_directory_groups(params_json: Option<String>, account_id: Option<String>): String {
+        PrintUtils.printTool("feishu_directory_groups", shortMessage: "list")
+        feishuOapiDirectoryInvoke("groups", account_id, params_json)
     }
 
     @tool[description: "Get Feishu user information through the Metis-native Feishu OAPI client boundary."]
