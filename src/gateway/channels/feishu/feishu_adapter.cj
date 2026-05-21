@@ -240,6 +240,8 @@ public class FeishuFakeApiClient <: FeishuApiClient {
     private var nextCardSendFailureError: String = ""
     private var nextCardPatchFailureStatus: String = ""
     private var nextCardPatchFailureError: String = ""
+    private var nextMediaUploadFailureStatus: String = ""
+    private var nextMediaUploadFailureError: String = ""
 
     public init() {}
 
@@ -405,6 +407,13 @@ public class FeishuFakeApiClient <: FeishuApiClient {
     ): FeishuApiSendResult {
         let kind = mediaType.trimAscii().toAsciiLower()
         this.uploadedMedia.add("${this.normalize(accountId)}|${kind}|${localPath.trimAscii()}|${mimeType.trimAscii()}|${fileName.trimAscii()}|${bytes.size}")
+        if (!this.nextMediaUploadFailureStatus.trimAscii().isEmpty()) {
+            let status = this.nextMediaUploadFailureStatus.trimAscii()
+            let error = this.nextMediaUploadFailureError.trimAscii()
+            this.nextMediaUploadFailureStatus = ""
+            this.nextMediaUploadFailureError = ""
+            return FeishuApiSendResult(status: status, error: error)
+        }
         FeishuApiSendResult(ok: true, status: "ok", messageId: "fake-feishu-${kind}-key-${this.uploadedMedia.size}")
     }
 
@@ -502,6 +511,11 @@ public class FeishuFakeApiClient <: FeishuApiClient {
     public func failNextCardPatch(status: String, error!: String = ""): Unit {
         this.nextCardPatchFailureStatus = if (status.trimAscii().isEmpty()) { "error" } else { status.trimAscii() }
         this.nextCardPatchFailureError = error.trimAscii()
+    }
+
+    public func failNextMediaUpload(status: String, error!: String = ""): Unit {
+        this.nextMediaUploadFailureStatus = if (status.trimAscii().isEmpty()) { "error" } else { status.trimAscii() }
+        this.nextMediaUploadFailureError = error.trimAscii()
     }
 
     public func sentCard(index: Int64): FeishuInteractiveCard {
@@ -1171,7 +1185,7 @@ public class FeishuAdapter <: ChannelAdapter {
             return upload.messageId
         }
         if (upload.status != "not_configured") {
-            this.lastSendError = if (upload.error.isEmpty()) { upload.status } else { upload.error }
+            this.lastSendError = this.feishuHumanReadableApiError(upload.status, upload.error)
             return ""
         }
         this.lastSendError = "feishu native media upload is not configured"
@@ -1193,7 +1207,7 @@ public class FeishuAdapter <: ChannelAdapter {
             return if (!result.messageId.isEmpty()) { result.messageId } else { targetMessageId }
         }
         if (result.status != "not_configured") {
-            this.lastSendError = if (result.error.isEmpty()) { result.status } else { result.error }
+            this.lastSendError = this.feishuHumanReadableApiError(result.status, result.error)
         } else {
             this.lastSendError = "feishu delete message api client is not configured"
         }
@@ -1229,7 +1243,7 @@ public class FeishuAdapter <: ChannelAdapter {
             return if (!result.messageId.isEmpty()) { result.messageId } else { targetMessageId }
         }
         if (result.status != "not_configured") {
-            this.lastSendError = if (result.error.isEmpty()) { result.status } else { result.error }
+            this.lastSendError = this.feishuHumanReadableApiError(result.status, result.error)
         } else {
             this.lastSendError = "feishu reaction api client is not configured"
         }
@@ -1718,6 +1732,8 @@ public class FeishuAdapter <: ChannelAdapter {
             normalized == "general_calendar" ||
             normalized == "video_chat" ||
             normalized == "todo" ||
+            normalized == "hongbao" ||
+            normalized == "share_calendar_event" ||
             normalized == "vote" ||
             normalized == "unknown"
     }
@@ -3229,29 +3245,16 @@ public class FeishuAdapter <: ChannelAdapter {
             let textPieces = ArrayList<String>()
             let records = JsonArray([])
             for (item in expanded.messages) {
-                let itemType = if (item.messageType.isEmpty()) { "unknown" } else { item.messageType }
-                let itemText = this.extractInboundText(itemType, item.content)
-                let row = JsonObject()
-                row.put("messageId", JsonString(item.messageId))
-                row.put("messageType", JsonString(itemType))
-                row.put("text", JsonString(itemText))
-                row.put("status", JsonString("expanded"))
-                messagesJson.add(row)
-                if (!itemText.trimAscii().isEmpty()) {
-                    textPieces.add(itemText)
-                }
-                let itemRecords = this.feishuHistoricalRecordsFromMessage(
+                this.appendFeishuMergeForwardExpansion(
                     accountId,
                     chatId,
                     senderId,
-                    item.messageId,
-                    itemType,
-                    item.content,
-                    "merge_forward"
+                    item,
+                    messagesJson,
+                    textPieces,
+                    records,
+                    0
                 )
-                for (record in itemRecords.getItems()) {
-                    records.add(record)
-                }
             }
             forward.put("status", JsonString("expanded"))
             forward.put("messages", messagesJson)
@@ -3284,6 +3287,68 @@ public class FeishuAdapter <: ChannelAdapter {
         context.put("feishuMergeForward", forward)
         mediaContext.put("context", context)
         expandedText
+    }
+
+    private func appendFeishuMergeForwardExpansion(
+        accountId: String,
+        chatId: String,
+        senderId: String,
+        item: FeishuMessageFetchResult,
+        messagesJson: JsonArray,
+        textPieces: ArrayList<String>,
+        records: JsonArray,
+        depth: Int64
+    ): Unit {
+        let itemType = if (item.messageType.isEmpty()) { "unknown" } else { item.messageType }
+        let itemText = this.extractInboundText(itemType, item.content)
+        let row = JsonObject()
+        row.put("messageId", JsonString(item.messageId))
+        row.put("messageType", JsonString(itemType))
+        row.put("text", JsonString(itemText))
+        if (itemType == "merge_forward" && depth >= 1) {
+            row.put("status", JsonString("depth_limit_exceeded"))
+            row.put("reason", JsonString("nested merge_forward expansion depth limit reached"))
+            messagesJson.add(row)
+            if (!itemText.trimAscii().isEmpty()) {
+                textPieces.add(itemText)
+            }
+            return
+        }
+        row.put("status", JsonString("expanded"))
+        messagesJson.add(row)
+        if (!itemText.trimAscii().isEmpty()) {
+            textPieces.add(itemText)
+        }
+        if (itemType == "merge_forward") {
+            let nested = this.apiClient.listMergeForwardMessages(this.normalizeAccountId(accountId), item.messageId)
+            if (nested.ok) {
+                for (nestedItem in nested.messages) {
+                    this.appendFeishuMergeForwardExpansion(
+                        accountId,
+                        chatId,
+                        senderId,
+                        nestedItem,
+                        messagesJson,
+                        textPieces,
+                        records,
+                        depth + 1
+                    )
+                }
+            }
+            return
+        }
+        let itemRecords = this.feishuHistoricalRecordsFromMessage(
+            accountId,
+            chatId,
+            senderId,
+            item.messageId,
+            itemType,
+            item.content,
+            "merge_forward"
+        )
+        for (record in itemRecords.getItems()) {
+            records.add(record)
+        }
     }
 
     private func attachFeishuMessageConversionContext(
@@ -3378,6 +3443,60 @@ public class FeishuAdapter <: ChannelAdapter {
         let originalMimeType = this.feishuAttachmentMimeType(normalizedType, content)
         let declaredSize = this.feishuAttachmentFileSize(content)
         let eligibleFor = this.feishuAttachmentEligibility(normalizedType)
+        let cfg = this.feishuConfigForAccount(accountId)
+        var downloaded = false
+        var skippedReason = "metadata_only"
+        var localPath = ""
+        var effectiveMimeType = originalMimeType
+        var effectiveFileName = originalFileName
+        var effectiveFileSize = declaredSize
+        var resourceNetworkAttempted = false
+        if (cfg.media.downloadEnabled) {
+            if (!this.feishuMediaMimeAllowed(cfg, originalMimeType)) {
+                skippedReason = "mime_not_allowed"
+            } else if (declaredSize > 0 && this.feishuMediaSizeExceedsLimit(cfg, declaredSize)) {
+                skippedReason = "size_limit_exceeded"
+            } else {
+                resourceNetworkAttempted = true
+                let result = this.fetchFeishuMessageResource(
+                    this.normalizeAccountId(accountId),
+                    messageId,
+                    fileId,
+                    resourceType
+                )
+                if (result.ok) {
+                    effectiveMimeType = if (!result.contentType.isEmpty()) { result.contentType } else { originalMimeType }
+                    effectiveFileName = if (!result.fileName.isEmpty()) { result.fileName } else { originalFileName }
+                    effectiveFileSize = Int64(result.bytes.size)
+                    if (this.feishuMediaSizeExceedsLimit(cfg, effectiveFileSize)) {
+                        skippedReason = "download_size_limit_exceeded"
+                    } else if (!this.feishuMediaMimeAllowed(cfg, effectiveMimeType)) {
+                        skippedReason = "mime_not_allowed"
+                    } else {
+                        let persisted = this.feishuPersistDownloadedResourceBytes(
+                            cfg,
+                            result.bytes,
+                            accountId: accountId,
+                            chatId: chatId,
+                            messageId: messageId,
+                            fileKey: fileId,
+                            mediaKind: normalizedType,
+                            fileName: effectiveFileName,
+                            mimeType: effectiveMimeType
+                        )
+                        if (!persisted.trimAscii().isEmpty()) {
+                            downloaded = true
+                            skippedReason = ""
+                            localPath = persisted
+                        } else {
+                            skippedReason = "download_failed"
+                        }
+                    }
+                } else {
+                    skippedReason = this.feishuDownloadSkippedReason(result.status)
+                }
+            }
+        }
         let record = JsonObject()
         record.put("mediaId", JsonString("${this.normalizeAccountId(accountId)}:${chatId.trimAscii()}:${messageId.trimAscii()}:historical:${normalizedType}:${fileId.trimAscii()}"))
         record.put("channel", JsonString("feishu"))
@@ -3393,26 +3512,26 @@ public class FeishuAdapter <: ChannelAdapter {
         record.put("fileKey", JsonString(fileId.trimAscii()))
         record.put("resourceType", JsonString(resourceType))
         record.put("originalFileName", JsonString(originalFileName))
-        record.put("fileName", JsonString(originalFileName))
-        record.put("mimeType", JsonString(originalMimeType))
-        record.put("fileSize", JsonInt(declaredSize))
+        record.put("fileName", JsonString(effectiveFileName))
+        record.put("mimeType", JsonString(effectiveMimeType))
+        record.put("fileSize", JsonInt(effectiveFileSize))
         record.put("durationMs", JsonInt(this.feishuAttachmentDurationMs(content)))
         record.put("coverImageKey", JsonString(this.feishuAttachmentCoverImageKey(content)))
         record.put("mediaType", JsonString(eligibleFor))
         record.put("eligibleFor", JsonString(eligibleFor))
-        record.put("downloaded", JsonBool(false))
-        record.put("skippedReason", JsonString("metadata_only"))
-        record.put("localPath", JsonString(""))
-        record.put("downloadPath", JsonString(""))
-        record.put("mediaPath", JsonString(""))
+        record.put("downloaded", JsonBool(downloaded))
+        record.put("skippedReason", JsonString(skippedReason))
+        record.put("localPath", JsonString(localPath))
+        record.put("downloadPath", JsonString(localPath))
+        record.put("mediaPath", JsonString(localPath))
         record.put("resourceFetch", this.feishuResourceFetchDiagnostic(
             accountId,
             messageId,
             fileId,
             resourceType,
             normalizedType,
-            "metadata_only",
-            false,
+            if (downloaded) { "downloaded" } else { skippedReason },
+            resourceNetworkAttempted,
             eligibleFor
         ))
         record
@@ -4178,6 +4297,12 @@ public class FeishuAdapter <: ChannelAdapter {
         if (normalized == "todo") {
             return this.extractTodoText(contentJsonString)
         }
+        if (normalized == "hongbao") {
+            return this.extractHongbaoText(contentJsonString)
+        }
+        if (normalized == "share_calendar_event") {
+            return this.extractShareCalendarEventText(contentJsonString)
+        }
         if (normalized == "vote") {
             return this.extractVoteText(contentJsonString)
         }
@@ -4295,6 +4420,58 @@ public class FeishuAdapter <: ChannelAdapter {
         String.join(lines.toArray(), delimiter: "\n")
     }
 
+    private func extractHongbaoText(contentJsonString: String): String {
+        let content = this.parseFeishuContentObject(contentJsonString)
+        let lines = ArrayList<String>()
+        lines.add("[hongbao]")
+        this.addFeishuFieldLine(lines, "title", this.firstNonEmpty([
+            this.readStringField(content, "title"),
+            this.readStringField(content, "name"),
+            this.readStringField(content, "summary")
+        ]))
+        this.addFeishuFieldLine(lines, "blessing", this.firstNonEmpty([
+            this.readStringField(content, "blessing"),
+            this.readStringField(content, "greeting"),
+            this.readStringField(content, "text")
+        ]))
+        this.addFeishuFieldLine(lines, "sender", this.firstNonEmpty([
+            this.readStringField(content, "sender_name"),
+            this.readStringField(content, "senderName"),
+            this.readStringField(content, "from")
+        ]))
+        String.join(lines.toArray(), delimiter: "\n")
+    }
+
+    private func extractShareCalendarEventText(contentJsonString: String): String {
+        let content = this.parseFeishuContentObject(contentJsonString)
+        let lines = ArrayList<String>()
+        lines.add("[share_calendar_event]")
+        this.addFeishuFieldLine(lines, "summary", this.firstNonEmpty([
+            this.readStringField(content, "summary"),
+            this.readStringField(content, "title"),
+            this.readStringField(content, "name")
+        ]))
+        this.addFeishuFieldLine(lines, "start", this.firstNonEmpty([
+            this.readStringField(content, "start_time"),
+            this.readStringField(content, "startTime"),
+            this.readStringField(content, "start")
+        ]))
+        this.addFeishuFieldLine(lines, "end", this.firstNonEmpty([
+            this.readStringField(content, "end_time"),
+            this.readStringField(content, "endTime"),
+            this.readStringField(content, "end")
+        ]))
+        this.addFeishuFieldLine(lines, "calendarId", this.firstNonEmpty([
+            this.readStringField(content, "calendar_id"),
+            this.readStringField(content, "calendarId")
+        ]))
+        this.addFeishuFieldLine(lines, "eventId", this.firstNonEmpty([
+            this.readStringField(content, "event_id"),
+            this.readStringField(content, "eventId")
+        ]))
+        String.join(lines.toArray(), delimiter: "\n")
+    }
+
     private func extractVoteText(contentJsonString: String): String {
         let content = this.parseFeishuContentObject(contentJsonString)
         let lines = ArrayList<String>()
@@ -4377,6 +4554,19 @@ public class FeishuAdapter <: ChannelAdapter {
             summary = "${summary[0..320]}..."
         }
         summary
+    }
+
+    private func feishuHumanReadableApiError(status: String, error: String): String {
+        let cleanStatus = if (status.trimAscii().isEmpty()) { "api_error" } else { status.trimAscii() }
+        let cleanError = error.trimAscii()
+        if (cleanError.isEmpty()) {
+            return cleanStatus
+        }
+        let redacted = this.feishuRedactDiagnosticText(cleanError).trimAscii()
+        if (redacted == "[redacted]") {
+            return "${cleanStatus}: [redacted]"
+        }
+        "${cleanStatus}: ${redacted}"
     }
 
     private func feishuRedactDiagnosticText(raw: String): String {

@@ -163,6 +163,46 @@ public class FeishuOutboundActionsTest {
     }
 
     @TestCase
+    public func mediaUploadFailureReturnsHumanReadableRedactedFailure(): Unit {
+        let root = this.tempRoot("redacted-failure")
+        try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        let imagePath = root.join("diagram.png")
+        Directory.create(root, recursive: true)
+        File.writeTo(imagePath, "fake-image".toArray())
+        try {
+            let client = FeishuFakeApiClient()
+            client.failNextMediaUpload("api_error", error: "{\"ok\":false,\"Authorization\":\"Bearer live-token\",\"tenant_secret\":\"secret\"}")
+            let adapter = FeishuAdapter(
+                config: FeishuConfig(
+                    enabled: true,
+                    streaming: "text",
+                    media: FeishuMediaConfig(mediaMaxBytes: 1024, allowedMimes: ["image/*"])
+                ),
+                apiClient: client
+            )
+            adapter.start()
+
+            match (adapter.send(OutboundMessage(
+                ChannelType.Feishu,
+                "oc_media",
+                renderGatewayPhotoText(imagePath.toString(), caption: "diagram"),
+                accountId: "tenant-a"
+            ))) {
+                case SendResult.Success => @Expect(false, true)
+                case SendResult.Failed(reason) =>
+                    @Expect(reason.contains("api_error"), true)
+                    @Expect(reason.contains("Bearer"), false)
+                    @Expect(reason.contains("live-token"), false)
+                    @Expect(reason.contains("\"ok\""), false)
+                    @Expect(reason.contains("tenant_secret"), false)
+            }
+            @Expect(client.textSendCount(), 0)
+        } finally {
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
     public func localPhotoPayloadReportsSizeLimitBeforeTextFallback(): Unit {
         let root = this.tempRoot("size")
         try { remove(root, recursive: true) } catch (_e: Exception) { () }

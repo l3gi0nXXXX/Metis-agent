@@ -2314,10 +2314,12 @@ public class FeishuAdapterTest {
         @Expect(adapter.ingestWebhookPayload(this.webhookPayload("om_video_chat", "oc_group", "ou_1", "{\\\"topic\\\":\\\"Daily Standup\\\",\\\"meeting_id\\\":\\\"vc_1\\\"}", messageType: "video_chat")).contains("\"ok\":true"), true)
         @Expect(adapter.ingestWebhookPayload(this.webhookPayload("om_todo", "oc_group", "ou_1", "{\\\"summary\\\":\\\"Ship Phase 3\\\",\\\"task_id\\\":\\\"todo_1\\\"}", messageType: "todo")).contains("\"ok\":true"), true)
         @Expect(adapter.ingestWebhookPayload(this.webhookPayload("om_vote", "oc_group", "ou_1", "{\\\"topic\\\":\\\"Choose option\\\",\\\"options\\\":[\\\"A\\\",\\\"B\\\"]}", messageType: "vote")).contains("\"ok\":true"), true)
+        @Expect(adapter.ingestWebhookPayload(this.webhookPayload("om_hongbao", "oc_group", "ou_1", "{\\\"title\\\":\\\"Spring bonus\\\",\\\"blessing\\\":\\\"good luck\\\"}", messageType: "hongbao")).contains("\"ok\":true"), true)
+        @Expect(adapter.ingestWebhookPayload(this.webhookPayload("om_share_calendar_event", "oc_group", "ou_1", "{\\\"summary\\\":\\\"Release review\\\",\\\"start_time\\\":\\\"2026-05-21 15:00\\\",\\\"calendar_id\\\":\\\"cal_1\\\",\\\"event_id\\\":\\\"evt_1\\\"}", messageType: "share_calendar_event")).contains("\"ok\":true"), true)
         @Expect(adapter.ingestWebhookPayload(this.webhookPayload("om_unknown", "oc_group", "ou_1", "{\\\"text\\\":\\\"new payload\\\",\\\"image_key\\\":\\\"img_unknown\\\"}", messageType: "new_openclaw_type")).contains("\"ok\":true"), true)
 
         let inbound = adapter.pullInbound()
-        @Expect(inbound.size, 9)
+        @Expect(inbound.size, 11)
         @Expect(inbound[0].text.contains("[location]"), true)
         @Expect(inbound[0].text.contains("HQ"), true)
         @Expect(inbound[0].text.contains("31.2304"), true)
@@ -2328,7 +2330,9 @@ public class FeishuAdapterTest {
         @Expect(inbound[5].text.contains("Daily Standup"), true)
         @Expect(inbound[6].text.contains("Ship Phase 3"), true)
         @Expect(inbound[7].text.contains("Choose option"), true)
-        @Expect(inbound[8].text.contains("new_openclaw_type"), true)
+        @Expect(inbound[8].text.contains("Spring bonus"), true)
+        @Expect(inbound[9].text.contains("Release review"), true)
+        @Expect(inbound[10].text.contains("new_openclaw_type"), true)
         for (i in 0..inbound.size) {
             let conversion = inbound[i].mediaContext.get("context").getOrThrow().asObject()
                 .get("feishuMessageConversion").getOrThrow().asObject()
@@ -2336,7 +2340,15 @@ public class FeishuAdapterTest {
             @Expect(conversion.get("text").getOrThrow().asString().getValue().trimAscii().isEmpty(), false)
             @Expect(conversion.get("redacted").getOrThrow().asBool().getValue(), true)
         }
-        let unknown = inbound[8].mediaContext.get("context").getOrThrow().asObject()
+        let hongbao = inbound[8].mediaContext.get("context").getOrThrow().asObject()
+            .get("feishuMessageConversion").getOrThrow().asObject()
+        @Expect(hongbao.get("status").getOrThrow().asString().getValue(), "converted")
+        @Expect(hongbao.get("diagnostic").getOrThrow().asString().getValue(), "")
+        let sharedCalendar = inbound[9].mediaContext.get("context").getOrThrow().asObject()
+            .get("feishuMessageConversion").getOrThrow().asObject()
+        @Expect(sharedCalendar.get("status").getOrThrow().asString().getValue(), "converted")
+        @Expect(sharedCalendar.get("diagnostic").getOrThrow().asString().getValue(), "")
+        let unknown = inbound[10].mediaContext.get("context").getOrThrow().asObject()
             .get("feishuMessageConversion").getOrThrow().asObject()
         @Expect(unknown.get("status").getOrThrow().asString().getValue(), "unknown_type")
         @Expect(unknown.get("diagnostic").getOrThrow().asString().getValue(), "unknown_message_type")
@@ -2453,6 +2465,211 @@ public class FeishuAdapterTest {
         let mergeRecords = inbound[1].mediaContext.get("records").getOrThrow().asArray()
         @Expect(mergeRecords[0].asObject().get("relation").getOrThrow().asString().getValue(), "historical")
         @Expect(mergeRecords[0].asObject().get("fileKey").getOrThrow().asString().getValue(), "img_forward")
+    }
+
+    @TestCase
+    public func historicalQuoteAndMergeForwardMediaDownloadThroughFakeClientWithSafetyLimits(): Unit {
+        let root = "/tmp/metis-feishu-historical-media-${DateTime.now().toUnixTimeStamp().toMilliseconds()}"
+        try { remove(Path(root), recursive: true) } catch (_e: Exception) { () }
+        let client = FeishuFakeApiClient()
+        client.setMessage(
+            "work",
+            "om_root_image_download",
+            "image",
+            "{\"image_key\":\"img_hist_quote\",\"file_name\":\"quote.png\",\"mime_type\":\"image/png\",\"size\":8}"
+        )
+        client.setResource(
+            "work",
+            "om_root_image_download",
+            "img_hist_quote",
+            "image",
+            "q-image".toArray(),
+            contentType: "image/png",
+            fileName: "quote.png"
+        )
+        client.setMergeForwardMessages(
+            "work",
+            "om_merge_hist_download",
+            [
+                FeishuMessageFetchResult(
+                    ok: true,
+                    status: "ok",
+                    messageId: "om_forward_text_hist",
+                    messageType: "text",
+                    content: "{\"text\":\"forwarded text\"}"
+                ),
+                FeishuMessageFetchResult(
+                    ok: true,
+                    status: "ok",
+                    messageId: "om_forward_image_hist",
+                    messageType: "image",
+                    content: "{\"image_key\":\"img_hist_forward\",\"file_name\":\"forward.png\",\"mime_type\":\"image/png\",\"size\":9}"
+                )
+            ]
+        )
+        client.setResource(
+            "work",
+            "om_forward_image_hist",
+            "img_hist_forward",
+            "image",
+            "f-image".toArray(),
+            contentType: "image/png",
+            fileName: "forward.png"
+        )
+        let adapter = FeishuAdapter(
+            config: FeishuConfig(
+                enabled: true,
+                media: FeishuMediaConfig(downloadEnabled: true, mediaMaxBytes: 32, allowedMimes: ["image/png"], downloadRoot: root)
+            ),
+            accountId: "work",
+            apiClient: client
+        )
+        adapter.start()
+        try {
+            @Expect(adapter.ingestWebhookPayload(
+                this.webhookPayload(
+                    "om_quote_hist_download",
+                    "oc_group",
+                    "ou_reply",
+                    "{\\\"text\\\":\\\"reply\\\"}",
+                    rootId: "om_root_image_download"
+                )
+            ).contains("\"ok\":true"), true)
+            @Expect(adapter.ingestWebhookPayload(
+                this.webhookPayload(
+                    "om_merge_hist_download",
+                    "oc_group",
+                    "ou_forwarder",
+                    "{\\\"title\\\":\\\"forwarded media\\\",\\\"message_count\\\":2}",
+                    messageType: "merge_forward"
+                )
+            ).contains("\"ok\":true"), true)
+
+            let inbound = adapter.pullInbound()
+            @Expect(inbound.size, 2)
+            let quoteRecord = inbound[0].mediaContext.get("records").getOrThrow().asArray()[0].asObject()
+            @Expect(quoteRecord.get("relation").getOrThrow().asString().getValue(), "historical")
+            @Expect(quoteRecord.get("downloaded").getOrThrow().asBool().getValue(), true)
+            @Expect(quoteRecord.get("skippedReason").getOrThrow().asString().getValue(), "")
+            @Expect(quoteRecord.get("resourceFetch").getOrThrow().asObject().get("status").getOrThrow().asString().getValue(), "downloaded")
+            @Expect(exists(Path(quoteRecord.get("localPath").getOrThrow().asString().getValue())), true)
+
+            let mergeRecord = inbound[1].mediaContext.get("records").getOrThrow().asArray()[0].asObject()
+            @Expect(mergeRecord.get("relation").getOrThrow().asString().getValue(), "historical")
+            @Expect(mergeRecord.get("downloaded").getOrThrow().asBool().getValue(), true)
+            @Expect(mergeRecord.get("resourceFetch").getOrThrow().asObject().get("networkAttempted").getOrThrow().asBool().getValue(), true)
+            @Expect(exists(Path(mergeRecord.get("localPath").getOrThrow().asString().getValue())), true)
+        } finally {
+            try { remove(Path(root), recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func historicalMediaExpansionHonorsDeclaredSizeMimeAndNestedMergeDepthLimits(): Unit {
+        let client = FeishuFakeApiClient()
+        client.setMessage(
+            "work",
+            "om_root_gif",
+            "image",
+            "{\"image_key\":\"img_gif\",\"file_name\":\"blocked.gif\",\"mime_type\":\"image/gif\",\"size\":3}"
+        )
+        client.setMergeForwardMessages(
+            "work",
+            "om_merge_limit",
+            [
+                FeishuMessageFetchResult(
+                    ok: true,
+                    status: "ok",
+                    messageId: "om_forward_big",
+                    messageType: "image",
+                    content: "{\"image_key\":\"img_big\",\"file_name\":\"big.png\",\"mime_type\":\"image/png\",\"size\":99}"
+                ),
+                FeishuMessageFetchResult(
+                    ok: true,
+                    status: "ok",
+                    messageId: "om_forward_nested",
+                    messageType: "merge_forward",
+                    content: "{\"title\":\"nested level 1\"}"
+                )
+            ]
+        )
+        client.setMergeForwardMessages(
+            "work",
+            "om_forward_nested",
+            [
+                FeishuMessageFetchResult(
+                    ok: true,
+                    status: "ok",
+                    messageId: "om_forward_nested_text",
+                    messageType: "text",
+                    content: "{\"text\":\"nested allowed\"}"
+                ),
+                FeishuMessageFetchResult(
+                    ok: true,
+                    status: "ok",
+                    messageId: "om_forward_too_deep",
+                    messageType: "merge_forward",
+                    content: "{\"title\":\"nested too deep\"}"
+                )
+            ]
+        )
+        client.setMergeForwardMessages(
+            "work",
+            "om_forward_too_deep",
+            [
+                FeishuMessageFetchResult(
+                    ok: true,
+                    status: "ok",
+                    messageId: "om_forward_depth_text",
+                    messageType: "text",
+                    content: "{\"text\":\"should not appear\"}"
+                )
+            ]
+        )
+        let adapter = FeishuAdapter(
+            config: FeishuConfig(
+                enabled: true,
+                media: FeishuMediaConfig(downloadEnabled: true, mediaMaxBytes: 10, allowedMimes: ["image/png"])
+            ),
+            accountId: "work",
+            apiClient: client
+        )
+        adapter.start()
+        @Expect(adapter.ingestWebhookPayload(
+            this.webhookPayload(
+                "om_quote_mime_limit",
+                "oc_group",
+                "ou_reply",
+                "{\\\"text\\\":\\\"reply\\\"}",
+                rootId: "om_root_gif"
+            )
+        ).contains("\"ok\":true"), true)
+        @Expect(adapter.ingestWebhookPayload(
+            this.webhookPayload(
+                "om_merge_limit",
+                "oc_group",
+                "ou_forwarder",
+                "{\\\"title\\\":\\\"limited merge\\\",\\\"message_count\\\":2}",
+                messageType: "merge_forward"
+            )
+        ).contains("\"ok\":true"), true)
+
+        let inbound = adapter.pullInbound()
+        @Expect(inbound.size, 2)
+        let quoteRecord = inbound[0].mediaContext.get("records").getOrThrow().asArray()[0].asObject()
+        @Expect(quoteRecord.get("downloaded").getOrThrow().asBool().getValue(), false)
+        @Expect(quoteRecord.get("skippedReason").getOrThrow().asString().getValue(), "mime_not_allowed")
+        @Expect(quoteRecord.get("resourceFetch").getOrThrow().asObject().get("networkAttempted").getOrThrow().asBool().getValue(), false)
+
+        @Expect(inbound[1].text.contains("nested allowed"), true)
+        @Expect(inbound[1].text.contains("should not appear"), false)
+        let mergeRecord = inbound[1].mediaContext.get("records").getOrThrow().asArray()[0].asObject()
+        @Expect(mergeRecord.get("downloaded").getOrThrow().asBool().getValue(), false)
+        @Expect(mergeRecord.get("skippedReason").getOrThrow().asString().getValue(), "size_limit_exceeded")
+        let merge = inbound[1].mediaContext.get("context").getOrThrow().asObject()
+            .get("feishuMergeForward").getOrThrow().asObject()
+        let messages = merge.get("messages").getOrThrow().asArray()
+        @Expect(messages[2].asObject().get("status").getOrThrow().asString().getValue(), "depth_limit_exceeded")
     }
 
     @TestCase
