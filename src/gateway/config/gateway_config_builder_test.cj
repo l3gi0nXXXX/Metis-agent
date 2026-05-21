@@ -127,6 +127,28 @@ public class GatewayConfigBuilderTest {
     }
 
     @TestCase
+    public func feishuTransportModeDefaultsToSidecarAndNormalizesExplicitNativeLegacy(): Unit {
+        var user = GatewayUserSettings()
+
+        let (defaultFeishu, _, _) = mergeGatewayUserSettings(user)
+        @Expect(defaultFeishu.receiveMode, "long_connect")
+        @Expect(defaultFeishu.transportMode, "openclaw-sidecar")
+
+        user.feishu.transportMode = "native-legacy"
+        let (nativeFeishu, _, _) = mergeGatewayUserSettings(user)
+        @Expect(nativeFeishu.transportMode, "native-legacy")
+
+        user.feishu.transportMode = "native"
+        let (normalizedFeishu, _, _) = mergeGatewayUserSettings(user)
+        @Expect(normalizedFeishu.transportMode, "openclaw-sidecar")
+
+        user.feishu.receiveMode = "webhook"
+        let (webhookFeishu, _, _) = mergeGatewayUserSettings(user)
+        @Expect(webhookFeishu.receiveMode, "webhook")
+        @Expect(webhookFeishu.transportMode, "openclaw-sidecar")
+    }
+
+    @TestCase
     public func qqPerAccountConfigMapsIntoRuntimeConfigWithoutDroppingTopLevelCompatibility(): Unit {
         var user = GatewayUserSettings()
         user.qq.enabled = true

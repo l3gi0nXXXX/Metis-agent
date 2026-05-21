@@ -470,6 +470,8 @@ public struct FeishuUserSettings {
     public var appSecret: String = ""
     public var accounts: Option<JsonObject> = None
     public var receiveMode: String = "long_connect"
+    /** 长连接实现选择：默认 OpenClaw-backed sidecar；旧 native 路径只允许显式 opt-in。 */
+    public var transportMode: String = "openclaw-sidecar"
     public var domain: String = "https://open.feishu.cn"
     public var botOpenId: String = ""
     public var webhookHost: String = "127.0.0.1"
