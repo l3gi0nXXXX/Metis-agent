@@ -359,6 +359,13 @@ private func gatewayBroadcastScopeString(scope: JsonObject, key: String): String
     }
 }
 
+private func gatewayBroadcastReplyAccountId(request: GatewaySessionRequest, route: GatewayAgentRoute): String {
+    if (!request.replyAccountId.isEmpty()) {
+        return request.replyAccountId
+    }
+    route.accountId
+}
+
 private func gatewayBroadcastContextForRoute(request: GatewaySessionRequest, route: GatewayAgentRoute,
     turnRoute: JsonObject): GatewaySessionContext {
     let scope = MetisAgentScope.resolve(
@@ -399,7 +406,8 @@ private func gatewayBroadcastContextForRoute(request: GatewaySessionRequest, rou
         lastRoutePolicy: route.lastRoutePolicy,
         routeDiagnostics: route.diagnostics,
         lane: request.lane,
-        deliveryTarget: gatewayResolveDeliveryTarget(request, route.sessionKey, preferredAccountId: route.preferredAccountId),
+        deliveryTarget: gatewayResolveDeliveryTarget(request, route.sessionKey,
+            preferredAccountId: gatewayBroadcastReplyAccountId(request, route)),
         turnContext: Some(turnContext)
     )
 }
@@ -455,7 +463,7 @@ private func gatewayBroadcastExecutableRequest(request: GatewaySessionRequest, r
         lane: request.lane,
         replyChannel: request.replyChannel,
         replyTo: request.replyTo,
-        replyAccountId: if (!request.replyAccountId.isEmpty()) { request.replyAccountId } else if (!route.preferredAccountId.isEmpty()) { route.preferredAccountId } else { route.accountId },
+        replyAccountId: gatewayBroadcastReplyAccountId(request, route),
         replyToMessageId: request.replyToMessageId,
         replyInThread: request.replyInThread,
         deliver: request.deliver && deliver,

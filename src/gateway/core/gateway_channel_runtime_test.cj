@@ -9,6 +9,7 @@ import std.collection.ArrayList
 import std.env.{getVariable, setVariable}
 import std.fs.{Directory, File, Path, exists, remove}
 import std.time.DateTime
+import std.core.Duration
 import std.unittest.testmacro.*
 import stdx.encoding.json.JsonObject
 
@@ -140,13 +141,23 @@ private class GatewayChannelLifecycleFakeAdapter <: ChannelAdapter {
     private let adapterName: String
     private let accountId: String
     private let events: ArrayList<String>
+    private let failMessage: String
+    private let startDelayMs: Int64
     public var startCount: Int64 = 0
     public var stopCount: Int64 = 0
 
-    public init(adapterName: String, accountId: String, events!: ArrayList<String> = ArrayList<String>()) {
+    public init(
+        adapterName: String,
+        accountId: String,
+        events!: ArrayList<String> = ArrayList<String>(),
+        failMessage!: String = "",
+        startDelayMs!: Int64 = 0
+    ) {
         this.adapterName = adapterName
         this.accountId = accountId
         this.events = events
+        this.failMessage = failMessage
+        this.startDelayMs = startDelayMs
     }
 
     public prop name: String {
@@ -156,6 +167,12 @@ private class GatewayChannelLifecycleFakeAdapter <: ChannelAdapter {
     public func start(): Unit {
         this.startCount += 1
         this.events.add("start:${this.accountId}")
+        if (this.startDelayMs > 0) {
+            sleep(Duration.millisecond * this.startDelayMs)
+        }
+        if (!this.failMessage.isEmpty()) {
+            throw Exception(this.failMessage)
+        }
     }
 
     public func stop(): Unit {
@@ -187,6 +204,13 @@ private func gatewayRuntimeTestBool(obj: JsonObject, key: String): Bool {
     match (obj.get(key)) {
         case Some(v) => try { v.asBool().getValue() } catch (_e: Exception) { false }
         case None => false
+    }
+}
+
+private func gatewayRuntimeTestInt(obj: JsonObject, key: String): Int64 {
+    match (obj.get(key)) {
+        case Some(v) => try { v.asInt().getValue() } catch (_e: Exception) { -1 }
+        case None => -1
     }
 }
 
@@ -227,6 +251,66 @@ public class GatewayChannelRuntimeTest {
                 @Expect(log.contains("\"event\":\"channel.timing\"") || log.contains("event=channel.timing"), true)
                 @Expect(log.contains("can-start-checked"), true)
             })
+        }
+    }
+
+    @TestCase
+    public func startChannelsMarksFailedAccountAndContinuesLaterAccounts(): Unit {
+        withGatewayChannelRuntimeTestHome {
+            let manager = GatewayChannelManager(startupAccountTimeoutMs: 1000)
+            let failed = GatewayChannelLifecycleFakeAdapter("telegram", "bad", failMessage: "boom")
+            let later = GatewayChannelLifecycleFakeAdapter("telegram", "later")
+            manager.registerAdapter(failed, channelId: "telegram", accountId: "bad")
+            manager.registerAdapter(later, channelId: "telegram", accountId: "later")
+
+            let summary = manager.startChannels()
+
+            @Expect(gatewayRuntimeTestString(summary, "status"), "degraded")
+            @Expect(gatewayRuntimeTestBool(summary, "degraded"), true)
+            @Expect(gatewayRuntimeTestInt(summary, "accountCount"), 2)
+            @Expect(gatewayRuntimeTestInt(summary, "okCount"), 1)
+            @Expect(gatewayRuntimeTestInt(summary, "failedCount"), 1)
+            @Expect(gatewayRuntimeTestInt(summary, "timedOutCount"), 0)
+            @Expect(gatewayRuntimeTestInt(summary, "skippedCount"), 0)
+            @Expect(failed.startCount, 1)
+            @Expect(failed.stopCount, 1)
+            @Expect(later.startCount, 1)
+
+            let accounts = summary.get("accounts").getOrThrow().asArray()
+            @Expect(accounts.size(), 2)
+            @Expect(gatewayRuntimeTestString(accounts[0].asObject(), "status"), "failed")
+            @Expect(gatewayRuntimeTestString(accounts[0].asObject(), "errorKind"), "start_failed")
+            @Expect(gatewayRuntimeTestString(accounts[1].asObject(), "status"), "ok")
+        }
+    }
+
+    @TestCase
+    public func startChannelsMarksTimedOutAccountAndContinuesLaterAccounts(): Unit {
+        withGatewayChannelRuntimeTestHome {
+            let manager = GatewayChannelManager(startupAccountTimeoutMs: 30)
+            let slow = GatewayChannelLifecycleFakeAdapter("telegram", "slow", startDelayMs: 120)
+            let later = GatewayChannelLifecycleFakeAdapter("telegram", "later")
+            manager.registerAdapter(slow, channelId: "telegram", accountId: "slow")
+            manager.registerAdapter(later, channelId: "telegram", accountId: "later")
+
+            let summary = manager.startChannels()
+
+            @Expect(gatewayRuntimeTestString(summary, "status"), "degraded")
+            @Expect(gatewayRuntimeTestBool(summary, "degraded"), true)
+            @Expect(gatewayRuntimeTestInt(summary, "accountCount"), 2)
+            @Expect(gatewayRuntimeTestInt(summary, "okCount"), 1)
+            @Expect(gatewayRuntimeTestInt(summary, "failedCount"), 0)
+            @Expect(gatewayRuntimeTestInt(summary, "timedOutCount"), 1)
+            @Expect(gatewayRuntimeTestInt(summary, "skippedCount"), 0)
+            @Expect(slow.startCount, 1)
+            @Expect(slow.stopCount, 1)
+            @Expect(later.startCount, 1)
+
+            let accounts = summary.get("accounts").getOrThrow().asArray()
+            @Expect(accounts.size(), 2)
+            @Expect(gatewayRuntimeTestString(accounts[0].asObject(), "status"), "timed_out")
+            @Expect(gatewayRuntimeTestString(accounts[0].asObject(), "errorKind"), "start_timeout")
+            @Expect(gatewayRuntimeTestString(accounts[1].asObject(), "status"), "ok")
         }
     }
 

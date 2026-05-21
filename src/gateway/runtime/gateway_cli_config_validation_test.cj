@@ -43,7 +43,7 @@ public class GatewayCliConfigValidationTest {
     }
 
     @TestCase
-    public func cliGatewayClientUsesLocalTransportUnlessRemoteGatewayIsEnabled(): Unit {
+    public func cliGatewayClientDefaultsToGatewayServeUnlessLocalModeIsExplicit(): Unit {
         let testHome = "/tmp/metis-phase4-gateway-cli-transport-selection"
         try {
             remove(Path(testHome), recursive: true)
@@ -52,7 +52,9 @@ public class GatewayCliConfigValidationTest {
         }
         Directory.create(testHome, recursive: true)
         let oldHome = getVariable("METIS_HOME")
+        let oldCliMode = getVariable("METIS_GATEWAY_CLI_MODE")
         setVariable("METIS_HOME", testHome)
+        setVariable("METIS_GATEWAY_CLI_MODE", "")
         MetisConfigManager.invalidate()
         CliSettingManager.invalidate()
 
@@ -63,9 +65,15 @@ public class GatewayCliConfigValidationTest {
             let _ = MetisConfigManager.setGatewaySettings(localOnly)
             CliSettingManager.invalidate()
 
-            let localClient = gatewayCliClient()
-            @Expect(localClient.transport, "local")
-            @Expect(localClient.gatewayUrl, "local://gateway")
+            let gatewayServeClient = gatewayCliClient()
+            @Expect(gatewayServeClient.transport, "remote")
+            @Expect(gatewayServeClient.gatewayUrl, "http://127.0.0.1:18788")
+
+            setVariable("METIS_GATEWAY_CLI_MODE", "local")
+            let embeddedClient = gatewayCliClient()
+            @Expect(embeddedClient.transport, "local")
+            @Expect(embeddedClient.gatewayUrl, "local://gateway")
+            setVariable("METIS_GATEWAY_CLI_MODE", "")
 
             var remote = original
             remote.remote.enabled = true
@@ -81,6 +89,10 @@ public class GatewayCliConfigValidationTest {
             match (oldHome) {
                 case Some(value) => setVariable("METIS_HOME", value)
                 case None => setVariable("METIS_HOME", "")
+            }
+            match (oldCliMode) {
+                case Some(value) => setVariable("METIS_GATEWAY_CLI_MODE", value)
+                case None => setVariable("METIS_GATEWAY_CLI_MODE", "")
             }
             MetisConfigManager.invalidate()
             CliSettingManager.invalidate()

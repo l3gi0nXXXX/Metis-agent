@@ -6,8 +6,9 @@ import magic.jsonable.*
 
 import std.collection.{ArrayList, HashMap}
 import std.convert.Parsable
-import std.sync.Mutex
+import std.sync.{Condition, Mutex}
 import std.time.DateTime
+import std.core.Duration
 import stdx.encoding.json.{JsonArray, JsonBool, JsonInt, JsonObject, JsonString, JsonValue}
 
 public func gatewayCanonicalChannelAccountId(channelId: String, rawAccountId: String): String {
@@ -385,6 +386,69 @@ public class GatewayChannelSendResult {
     }
 }
 
+private class GatewayChannelAdapterStartProbe {
+    private let lock = Mutex()
+    private var condition: Condition
+    private var completed = false
+    private var failed = false
+    private var error = ""
+
+    public init() {
+        synchronized(this.lock) {
+            this.condition = this.lock.condition()
+        }
+    }
+
+    private func nowMs(): Int64 {
+        DateTime.now().toUnixTimeStamp().toNanoseconds() / 1000000
+    }
+
+    public func start(adapter: ChannelAdapter): Unit {
+        spawn {
+            var failed = false
+            var error = ""
+            try {
+                adapter.start()
+            } catch (e: Exception) {
+                failed = true
+                error = e.message
+            }
+            synchronized(this.lock) {
+                this.completed = true
+                this.failed = failed
+                this.error = error
+                this.condition.notifyAll()
+            }
+        }
+    }
+
+    public func waitUntilDone(timeoutMs: Int64): Bool {
+        let deadline = this.nowMs() + timeoutMs
+        synchronized(this.lock) {
+            while (!this.completed) {
+                let remaining = deadline - this.nowMs()
+                if (remaining <= 0) {
+                    return false
+                }
+                let _ = this.condition.wait(timeout: Duration.millisecond * remaining)
+            }
+            true
+        }
+    }
+
+    public func failedResult(): Bool {
+        synchronized(this.lock) {
+            this.failed
+        }
+    }
+
+    public func errorResult(): String {
+        synchronized(this.lock) {
+            this.error
+        }
+    }
+}
+
 /**
  * 独立的 channel runtime manager，统一承接 adapter 的生命周期与 runtime 状态推进。
  * GatewayService 自身只保留路由和 Agent 桥接职责。
@@ -394,9 +458,12 @@ public class GatewayChannelManager {
     private let adapterByName = HashMap<String, ChannelAdapter>()
     private let liveStateLock = Mutex()
     private let liveAccounts = HashMap<String, GatewayChannelLiveAccountState>()
+    private let startupAccountTimeoutMs: Int64
     private var started = false
 
-    public init() {}
+    public init(startupAccountTimeoutMs!: Int64 = 3000) {
+        this.startupAccountTimeoutMs = if (startupAccountTimeoutMs > 0) { startupAccountTimeoutMs } else { 3000 }
+    }
 
     private func timingNowMs(): Int64 {
         DateTime.now().toUnixTimeStamp().toNanoseconds() / 1000000
@@ -952,7 +1019,58 @@ public class GatewayChannelManager {
         )
     }
 
-    private func startEntry(entry: GatewayRegisteredAdapter): Unit {
+    private func startupOutcome(
+        entry: GatewayRegisteredAdapter,
+        status: String,
+        errorKind!: String = "",
+        error!: String = "",
+        startMs!: Int64 = 0
+    ): JsonObject {
+        let row = JsonObject()
+        row.put("channelId", JsonString(entry.channelId))
+        row.put("channel", JsonString(entry.channelId))
+        row.put("accountId", JsonString(entry.accountId))
+        row.put("status", JsonString(status.trimAscii()))
+        row.put("errorKind", JsonString(errorKind.trimAscii()))
+        row.put("error", JsonString(error.trimAscii()))
+        row.put("durationMs", (this.timingNowMs() - startMs).toJsonValue())
+        row
+    }
+
+    private func bestEffortStopAfterStartFailure(entry: GatewayRegisteredAdapter, reason: String): Unit {
+        try {
+            entry.adapter.stop()
+        } catch (e: Exception) {
+            gatewayLogEventError(
+                "gateway/channel/${entry.channelId}",
+                "channel.stop_cleanup_failed",
+                "channel account cleanup after start failure failed",
+                meta: gatewayLogMeta()
+                    .string("channel", entry.channelId)
+                    .string("accountId", entry.accountId)
+                    .string("phase", "start")
+                    .string("status", "failed")
+                    .string("reason", reason)
+                    .string("errorKind", "cleanup_failed")
+                    .rawString("error", gatewaySanitizeChannelDiagnostic(e.message))
+                    .object()
+            )
+        }
+    }
+
+    private func runAdapterStartWithDeadline(entry: GatewayRegisteredAdapter): (String, String) {
+        let probe = GatewayChannelAdapterStartProbe()
+        probe.start(entry.adapter)
+        if (!probe.waitUntilDone(this.startupAccountTimeoutMs)) {
+            return ("timed_out", "adapter start timed out after ${this.startupAccountTimeoutMs}ms")
+        }
+        if (probe.failedResult()) {
+            return ("failed", probe.errorResult())
+        }
+        ("ok", "")
+    }
+
+    private func startEntry(entry: GatewayRegisteredAdapter): JsonObject {
         let entryStartMs = this.timingNowMs()
         if (!gatewayChannelRuntimeCanStart(entry.channelId, accountId: entry.accountId)) {
             gatewayLogEventInfo(
@@ -968,7 +1086,7 @@ public class GatewayChannelManager {
                     .object()
             )
             this.timingLog("skip-cannot-start", entryStartMs, channelId: entry.channelId, accountId: entry.accountId)
-            return
+            return this.startupOutcome(entry, "skipped", errorKind: "runtime_start_suppressed", error: "runtime-start-suppressed", startMs: entryStartMs)
         }
         gatewayLogEventInfo(
             "gateway/channel/${entry.channelId}",
@@ -985,8 +1103,8 @@ public class GatewayChannelManager {
         gatewayChannelRuntimeMarkStarting(entry.channelId, accountId: entry.accountId)
         this.timingLog("marked-starting", entryStartMs, channelId: entry.channelId, accountId: entry.accountId)
         let adapterStartMs = this.timingNowMs()
-        try {
-            entry.adapter.start()
+        let (startStatus, startError) = this.runAdapterStartWithDeadline(entry)
+        if (startStatus == "ok") {
             this.timingLog("adapter-started", adapterStartMs, channelId: entry.channelId, accountId: entry.accountId)
             this.updateLiveAccount(entry.channelId, entry.accountId, { state =>
                 state.configured = entry.configured
@@ -1010,53 +1128,111 @@ public class GatewayChannelManager {
                     .int("durationMs", this.timingNowMs() - entryStartMs)
                     .object()
             )
-        } catch (e: Exception) {
+            return this.startupOutcome(entry, "ok", startMs: entryStartMs)
+        } else {
+            let timedOut = startStatus == "timed_out"
+            let safeError = gatewaySanitizeChannelDiagnostic(startError)
+            this.bestEffortStopAfterStartFailure(entry, if (timedOut) { "start-timeout" } else { "start-failed" })
             this.updateLiveAccount(entry.channelId, entry.accountId, { state =>
                 state.configured = entry.configured
                 state.running = false
                 state.connected = false
-                state.lastError = e.message.trimAscii()
+                state.lastError = safeError
             })
-            gatewayChannelRuntimeMarkFailure(entry.channelId, accountId: entry.accountId, lifecycleState: "failed", error: e.message)
+            gatewayChannelRuntimeMarkFailure(entry.channelId, accountId: entry.accountId, lifecycleState: "failed", error: safeError)
             gatewayLogEventError(
                 "gateway/channel/${entry.channelId}",
                 "channel.failed",
-                "channel account start failed",
+                if (timedOut) { "channel account start timed out" } else { "channel account start failed" },
                 meta: gatewayLogMeta()
                     .string("channel", entry.channelId)
                     .string("accountId", entry.accountId)
                     .string("phase", "start")
-                    .string("status", "failed")
-                    .string("errorKind", "start_failed")
-                    .rawString("error", e.message)
+                    .string("status", startStatus)
+                    .string("errorKind", if (timedOut) { "start_timeout" } else { "start_failed" })
+                    .rawString("error", safeError)
+                    .int("durationMs", this.timingNowMs() - entryStartMs)
                     .object()
             )
-            this.timingLog("start-failed", adapterStartMs, channelId: entry.channelId, accountId: entry.accountId)
+            this.timingLog(if (timedOut) { "start-timed-out" } else { "start-failed" }, adapterStartMs, channelId: entry.channelId, accountId: entry.accountId)
             this.timingLog("entry-total-failed", entryStartMs, channelId: entry.channelId, accountId: entry.accountId)
+            return this.startupOutcome(
+                entry,
+                startStatus,
+                errorKind: if (timedOut) { "start_timeout" } else { "start_failed" },
+                error: safeError,
+                startMs: entryStartMs
+            )
         }
     }
 
-    public func startChannels(): Unit {
+    public func startChannels(): JsonObject {
         if (this.started) {
-            return
+            let summary = JsonObject()
+            summary.put("phase", JsonString("start"))
+            summary.put("status", JsonString("ok"))
+            summary.put("degraded", false.toJsonValue())
+            summary.put("accountCount", Int64(this.adapters.size).toJsonValue())
+            summary.put("okCount", 0.toJsonValue())
+            summary.put("skippedCount", 0.toJsonValue())
+            summary.put("failedCount", 0.toJsonValue())
+            summary.put("timedOutCount", 0.toJsonValue())
+            summary.put("durationMs", 0.toJsonValue())
+            summary.put("accounts", JsonArray([]))
+            return summary
         }
         let startMs = this.timingNowMs()
+        let accounts = JsonArray([])
+        var okCount: Int64 = 0
+        var skippedCount: Int64 = 0
+        var failedCount: Int64 = 0
+        var timedOutCount: Int64 = 0
         for (entry in this.adapters) {
-            this.startEntry(entry)
+            let outcome = this.startEntry(entry)
+            accounts.add(outcome)
+            let status = try { outcome.get("status").getOrThrow().asString().getValue() } catch (_e: Exception) { "" }
+            if (status == "ok") {
+                okCount += 1
+            } else if (status == "skipped") {
+                skippedCount += 1
+            } else if (status == "timed_out") {
+                timedOutCount += 1
+            } else if (status == "failed") {
+                failedCount += 1
+            }
         }
         this.started = true
         this.timingLog("startChannels-total", startMs)
+        let degraded = failedCount > 0 || timedOutCount > 0
+        let durationMs = this.timingNowMs() - startMs
+        let summary = JsonObject()
+        summary.put("phase", JsonString("start"))
+        summary.put("status", JsonString(if (degraded) { "degraded" } else { "ok" }))
+        summary.put("degraded", degraded.toJsonValue())
+        summary.put("accountCount", Int64(this.adapters.size).toJsonValue())
+        summary.put("okCount", okCount.toJsonValue())
+        summary.put("skippedCount", skippedCount.toJsonValue())
+        summary.put("failedCount", failedCount.toJsonValue())
+        summary.put("timedOutCount", timedOutCount.toJsonValue())
+        summary.put("durationMs", durationMs.toJsonValue())
+        summary.put("accounts", accounts)
         gatewayLogEventInfo(
             "gateway/channel",
             "channel.startup_summary",
-            "channel startup completed",
+            if (degraded) { "channel startup degraded" } else { "channel startup completed" },
             meta: gatewayLogMeta()
                 .string("phase", "start")
-                .string("status", "ok")
+                .string("status", if (degraded) { "degraded" } else { "ok" })
+                .bool("degraded", degraded)
                 .int("accountCount", Int64(this.adapters.size))
-                .int("durationMs", this.timingNowMs() - startMs)
+                .int("okCount", okCount)
+                .int("skippedCount", skippedCount)
+                .int("failedCount", failedCount)
+                .int("timedOutCount", timedOutCount)
+                .int("durationMs", durationMs)
                 .object()
         )
+        summary
     }
 
     public func startChannel(channelId: String, accountId!: String = ""): JsonObject {

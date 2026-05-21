@@ -120,18 +120,30 @@ public class GatewayService {
      */
     public func start(): Unit {
         let startMs = this.startNowMs()
-        this.channelManager.startChannels()
+        let startupSummary = this.channelManager.startChannels()
         let user = CliSettingManager.readGatewaySettings()
         let _ = gatewayOpenClawCompatHostStart(user)
         let _ = gatewayOpenClawPluginSidecarStart(user)
+        let startupStatus = try {
+            startupSummary.get("status").getOrThrow().asString().getValue()
+        } catch (_e: Exception) {
+            "ok"
+        }
+        let startupDegraded = try {
+            startupSummary.get("degraded").getOrThrow().asBool().getValue()
+        } catch (_e: Exception) {
+            false
+        }
         gatewayLogEventInfo(
             "gateway/service",
             "gateway.ready",
-            "gateway service start completed",
+            if (startupDegraded) { "gateway service start completed with degraded channels" } else { "gateway service start completed" },
             meta: gatewayLogMeta()
                 .string("phase", "start")
                 .string("step", "startChannels")
-                .string("status", "ok")
+                .string("status", if (startupDegraded) { "degraded" } else { startupStatus })
+                .bool("degraded", startupDegraded)
+                .value("channelStartup", startupSummary)
                 .int("durationMs", this.startNowMs() - startMs)
                 .object()
         )

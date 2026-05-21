@@ -176,14 +176,36 @@ public func gatewayRestartConfigValidationMessage(): Option<String> {
 }
 
 private func gatewayCliGatewayClient(user: GatewayUserSettings): GatewayClient {
-    if (user.remote.enabled) {
-        return gatewayBuildClient("cli", "local-cli")
+    let cliMode = match (getVariable("METIS_GATEWAY_CLI_MODE")) {
+        case Some(value) => value.trimAscii().toAsciiLower()
+        case None => ""
+    }
+    if (cliMode == "local" || cliMode == "embedded") {
+        return GatewayClient(
+            clientName: "cli",
+            mode: "local-cli",
+            transport: "local",
+            gatewayUrl: "local://gateway"
+        )
+    }
+    let explicitRemoteUrl = user.remote.enabled && !user.remote.url.trimAscii().isEmpty()
+    let gatewayUrl = if (explicitRemoteUrl) {
+        user.remote.url.trimAscii()
+    } else {
+        "http://127.0.0.1:${if (user.port > 0) { user.port } else { 18788 }}"
+    }
+    let transport = if (user.remote.enabled && !user.remote.transport.trimAscii().isEmpty()) {
+        user.remote.transport.trimAscii().toAsciiLower()
+    } else {
+        "remote"
     }
     return GatewayClient(
         clientName: "cli",
         mode: "local-cli",
-        transport: "local",
-        gatewayUrl: "local://gateway"
+        transport: transport,
+        gatewayUrl: gatewayUrl,
+        authToken: gatewayPreferredAuthTokenFromSettings(user),
+        authPassword: gatewayPreferredAuthPasswordFromSettings(user)
     )
 }
 

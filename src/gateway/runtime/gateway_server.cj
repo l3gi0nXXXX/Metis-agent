@@ -1041,7 +1041,7 @@ public func gatewayServerOptionsFromConfig(cfg: GatewayConfig): GatewayServerOpt
         // HTTP /rpc is a valid remote transport surface even when explicit remote mode is disabled.
         remoteTransportEnabled: cfg.remote.enabled || gatewayHttpAnyEndpointEnabled(cfg),
         requestTimeoutMs: 3000,
-        defaultGatewayUrl: if (cfg.remote.enabled && !cfg.remote.url.trimAscii().isEmpty()) { cfg.remote.url } else { "local://gateway" },
+        defaultGatewayUrl: if (cfg.remote.enabled && !cfg.remote.url.trimAscii().isEmpty()) { cfg.remote.url } else { "http://${gatewayHttpListenHost(cfg)}:${cfg.port}" },
         enableHandshake: true
     )
 }

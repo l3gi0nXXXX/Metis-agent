@@ -365,10 +365,11 @@ public class FeishuAdapter <: ChannelAdapter {
     private var feishuMonitorProcess: Option<SubProcess> = None
     private var feishuMonitorStdIn: Option<StringWriter<OutputStream>> = None
     private var feishuMonitorStdoutFuture: Option<Future<Unit>> = None
-    private var feishuMonitorStderrFuture: Option<Future<Unit>> = None
-    private var feishuMonitorWaitFuture: Option<Future<Unit>> = None
     private var feishuMonitorReady: Bool = false
     private var feishuMonitorLastError: String = ""
+    private let monitorHostScriptForTest: String
+    private let monitorHostDepsRootForTest: String
+    private let monitorHostStartupTimeoutMsForTest: Int64
     private let accountId: String
     private let chatQueue = FeishuChatQueue()
     private let apiClient: FeishuApiClient
@@ -379,7 +380,10 @@ public class FeishuAdapter <: ChannelAdapter {
         config!: FeishuConfig = FeishuConfig(),
         accountId!: String = "default",
         apiClient!: FeishuApiClient = FeishuNoopApiClient(),
-        pairingRoot!: Path = CliConfig.dotDir
+        pairingRoot!: Path = CliConfig.dotDir,
+        monitorHostScriptForTest!: String = "",
+        monitorHostDepsRootForTest!: String = "",
+        monitorHostStartupTimeoutMsForTest!: Int64 = 0
     ) {
         let trimmedAccountId = accountId.trimAscii()
         let requestedAccountId = if (trimmedAccountId.isEmpty()) { config.accountId } else { trimmedAccountId }
@@ -389,6 +393,9 @@ public class FeishuAdapter <: ChannelAdapter {
         this.accountId = resolved.accountId
         this.apiClient = apiClient
         this.pairingRoot = pairingRoot
+        this.monitorHostScriptForTest = monitorHostScriptForTest.trimAscii()
+        this.monitorHostDepsRootForTest = monitorHostDepsRootForTest.trimAscii()
+        this.monitorHostStartupTimeoutMsForTest = monitorHostStartupTimeoutMsForTest
         feishuInstallGatewayNativeAuthRunner()
     }
 
@@ -402,6 +409,24 @@ public class FeishuAdapter <: ChannelAdapter {
 
     public func debugOfficialSdkMonitorHostArgsForTest(): Array<String> {
         this.feishuOfficialSdkMonitorHostArgs(redactSecrets: true)
+    }
+
+    public func debugOfficialSdkMonitorHostInitFrameForTest(): String {
+        this.feishuOfficialSdkMonitorHostInitFrame()
+    }
+
+    public func debugIsRunningForTest(): Bool {
+        this.running
+    }
+
+    public func debugFeishuMonitorLastErrorForTest(): String {
+        this.feishuOfficialSdkMonitorError()
+    }
+
+    public func debugFeishuMonitorProcessPresentForTest(): Bool {
+        synchronized(this.feishuMonitorLock) {
+            this.feishuMonitorProcess.isSome()
+        }
     }
 
     public func debugFeishuPairingPendingCodeForTest(senderId: String, accountId!: String = ""): String {
@@ -514,11 +539,11 @@ public class FeishuAdapter <: ChannelAdapter {
             this.logChannel("info", MetisLogEvent.channelStopped, "start", "disabled", "Feishu adapter disabled", accountId: this.accountId)
             return
         }
-        this.running = true
-        let startMeta = JsonObject()
-        startMeta.put("mode", JsonString(this.config.receiveMode))
-        this.logChannel("info", MetisLogEvent.channelStarted, "start", "started", "Feishu adapter started", accountId: this.accountId, extra: startMeta)
         if (this.config.receiveMode == "webhook") {
+            this.running = true
+            let startMeta = JsonObject()
+            startMeta.put("mode", JsonString(this.config.receiveMode))
+            this.logChannel("info", MetisLogEvent.channelStarted, "start", "started", "Feishu adapter started", accountId: this.accountId, extra: startMeta)
             this.startWebhookServer()
             return
         }
@@ -533,6 +558,7 @@ public class FeishuAdapter <: ChannelAdapter {
                 error: "gateway.feishu.appId / gateway.feishu.appSecret is required",
                 accountId: this.accountId
             )
+            this.running = true
             return
         }
         if (!this.feishuOfficialSdkMonitorHostEnabled()) {
@@ -560,7 +586,12 @@ public class FeishuAdapter <: ChannelAdapter {
                 error: detail,
                 accountId: this.accountId
             )
+            return
         }
+        this.running = true
+        let startMeta = JsonObject()
+        startMeta.put("mode", JsonString(this.config.receiveMode))
+        this.logChannel("info", MetisLogEvent.channelStarted, "start", "started", "Feishu adapter started", accountId: this.accountId, extra: startMeta)
     }
 
     /** 便于 demo / 日志打印完整回调地址。 */
@@ -3490,10 +3521,16 @@ public class FeishuAdapter <: ChannelAdapter {
     }
 
     private func feishuOfficialSdkMonitorHostScript(): Path {
+        if (!this.monitorHostScriptForTest.isEmpty()) {
+            return Path(this.monitorHostScriptForTest)
+        }
         this.feishuProjectRootForMonitorHost().join("scripts").join("feishu-ws-sidecar.mjs")
     }
 
     private func feishuOfficialSdkDepsRoot(): Path {
+        if (!this.monitorHostDepsRootForTest.isEmpty()) {
+            return Path(this.monitorHostDepsRootForTest)
+        }
         this.feishuProjectRootForMonitorHost().join("tools").join("feishu-official-sdk")
     }
 
@@ -3519,9 +3556,6 @@ public class FeishuAdapter <: ChannelAdapter {
     }
 
     private func feishuOfficialSdkMonitorHostArgs(redactSecrets!: Bool = false): Array<String> {
-        let appSecret = if (redactSecrets && !this.config.appSecret.trimAscii().isEmpty()) { "[redacted]" } else { this.config.appSecret }
-        let verificationToken = if (redactSecrets && !this.config.verificationToken.trimAscii().isEmpty()) { "[redacted]" } else { this.config.verificationToken }
-        let encryptKey = if (redactSecrets && !this.config.encryptKey.trimAscii().isEmpty()) { "[redacted]" } else { this.config.encryptKey }
         [
             this.feishuOfficialSdkMonitorHostScript().toString(),
             "--sdk-root",
@@ -3530,15 +3564,25 @@ public class FeishuAdapter <: ChannelAdapter {
             this.accountId,
             "--app-id",
             this.config.appId,
-            "--app-secret",
-            appSecret,
             "--domain",
-            this.config.domain,
-            "--verification-token",
-            verificationToken,
-            "--encrypt-key",
-            encryptKey
+            this.config.domain
         ]
+    }
+
+    private func feishuOfficialSdkMonitorHostInitFrame(): String {
+        "{" +
+            "\"type\":\"init\"," +
+            "\"appSecret\":\"${feishuMonitorHostJsonEscape(this.config.appSecret)}\"," +
+            "\"verificationToken\":\"${feishuMonitorHostJsonEscape(this.config.verificationToken)}\"," +
+            "\"encryptKey\":\"${feishuMonitorHostJsonEscape(this.config.encryptKey)}\"" +
+            "}\n"
+    }
+
+    private func feishuOfficialSdkMonitorStartupTimeoutMs(): Int64 {
+        if (this.monitorHostStartupTimeoutMsForTest > 0) {
+            return this.monitorHostStartupTimeoutMsForTest
+        }
+        2000
     }
 
     private func handleFeishuOfficialSdkMonitorHostLine(line: String): Unit {
@@ -3639,6 +3683,8 @@ public class FeishuAdapter <: ChannelAdapter {
             return false
         }
         this.cleanupStaleFeishuOfficialSdkMonitorHosts()
+        var launchedProcessOpt = None<SubProcess>
+        var launchedWriterOpt = None<StringWriter<OutputStream>>
         try {
             let alreadyRunning = synchronized(this.feishuMonitorLock) {
                 match (this.feishuMonitorProcess) {
@@ -3651,58 +3697,48 @@ public class FeishuAdapter <: ChannelAdapter {
                             this.feishuOfficialSdkMonitorHostArgs(),
                             stdIn: ProcessRedirect.Pipe,
                             stdOut: ProcessRedirect.Pipe,
-                            stdErr: ProcessRedirect.Pipe,
                             workingDirectory: Some(this.feishuProjectRootForMonitorHost())
                         )
                         this.feishuMonitorProcess = Some(process)
-                        this.feishuMonitorStdIn = Some(StringWriter(process.stdInPipe))
-                        this.feishuMonitorStdoutFuture = Some(spawn {
-                            let reader = StringReader(process.stdOutPipe)
-                            while (true) {
-                                match (reader.readln()) {
-                                    case Some(line) => this.handleFeishuOfficialSdkMonitorHostLine(line)
-                                    case None => break
-                                }
-                            }
-                        })
-                        this.feishuMonitorStderrFuture = Some(spawn {
-                            let reader = StringReader(process.stdErrPipe)
-                            while (true) {
-                                match (reader.readln()) {
-                                    case Some(line) =>
-                                        let text = line.trimAscii()
-                                        if (!text.isEmpty()) {
-                                            this.logChannel(
-                                                "debug",
-                                                MetisLogEvent.channelFailed,
-                                                "sidecar",
-                                                "stderr",
-                                                "Feishu official SDK monitor host stderr",
-                                                errorKind: this.feishuErrorKind(text),
-                                                error: text,
-                                                accountId: this.accountId
-                                            )
-                                        }
-                                    case None => break
-                                }
-                            }
-                        })
-                        this.feishuMonitorWaitFuture = Some(spawn {
-                            let exitCode = process.wait()
-                            synchronized(this.feishuMonitorLock) {
-                                this.feishuMonitorProcess = None
-                                this.feishuMonitorStdIn = None
-                                this.feishuMonitorReady = false
-                                if (exitCode != 0 && this.feishuMonitorLastError.isEmpty()) {
-                                    this.feishuMonitorLastError = "monitor-host-exit-${exitCode}"
-                                }
-                            }
-                        })
+                        let writer = StringWriter(process.stdInPipe)
+                        this.feishuMonitorStdIn = Some(writer)
+                        launchedProcessOpt = Some(process)
+                        launchedWriterOpt = Some(writer)
                         false
                 }
             }
             if (alreadyRunning) {
                 return true
+            }
+            match (launchedProcessOpt) {
+                case Some(process) =>
+                    let stdoutFuture = spawn {
+                        let reader = StringReader(process.stdOutPipe)
+                        while (true) {
+                            match (reader.readln()) {
+                                case Some(line) => this.handleFeishuOfficialSdkMonitorHostLine(line)
+                                case None => break
+                            }
+                        }
+                        synchronized(this.feishuMonitorLock) {
+                            this.feishuMonitorProcess = None
+                            this.feishuMonitorStdIn = None
+                            this.feishuMonitorReady = false
+                            if (this.feishuMonitorLastError.isEmpty()) {
+                                this.feishuMonitorLastError = "monitor-host-stdout-closed"
+                            }
+                        }
+                    }
+                    synchronized(this.feishuMonitorLock) {
+                        this.feishuMonitorStdoutFuture = Some(stdoutFuture)
+                    }
+                case None => ()
+            }
+            match (launchedWriterOpt) {
+                case Some(writer) =>
+                    writer.write(this.feishuOfficialSdkMonitorHostInitFrame())
+                    writer.flush()
+                case None => ()
             }
         } catch (e: Exception) {
             synchronized(this.feishuMonitorLock) {
@@ -3710,17 +3746,28 @@ public class FeishuAdapter <: ChannelAdapter {
             }
             return false
         }
-        for (_i in 0..40) {
+        var waitedMs: Int64 = 0
+        let timeoutMs = this.feishuOfficialSdkMonitorStartupTimeoutMs()
+        while (waitedMs < timeoutMs) {
+            var failedBeforeReady = false
             synchronized(this.feishuMonitorLock) {
                 if (this.feishuMonitorReady) {
                     return true
+                }
+                if (!this.feishuMonitorLastError.isEmpty()) {
+                    failedBeforeReady = true
                 }
                 match (this.feishuMonitorProcess) {
                     case Some(_) => ()
                     case None => return false
                 }
             }
+            if (failedBeforeReady) {
+                this.stopFeishuOfficialSdkMonitorHost()
+                return false
+            }
             sleep(Duration.millisecond * 50)
+            waitedMs += 50
         }
         synchronized(this.feishuMonitorLock) {
             if (this.feishuMonitorLastError.isEmpty()) {
@@ -3765,8 +3812,6 @@ public class FeishuAdapter <: ChannelAdapter {
             this.feishuMonitorProcess = None
             this.feishuMonitorStdIn = None
             this.feishuMonitorStdoutFuture = None
-            this.feishuMonitorStderrFuture = None
-            this.feishuMonitorWaitFuture = None
             this.feishuMonitorReady = false
         }
     }
@@ -4246,6 +4291,15 @@ public func feishuMonitorHostForcedStopWaitMs(): Int64 {
 
 public func feishuMonitorHostShellSingleQuote(raw: String): String {
     "'" + raw.replace("'", "'\"'\"'") + "'"
+}
+
+public func feishuMonitorHostJsonEscape(raw: String): String {
+    raw
+        .replace("\\", "\\\\")
+        .replace("\"", "\\\"")
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+        .replace("\t", "\\t")
 }
 
 public func feishuMonitorHostPsLookupCommand(scriptPath: String, appId: String): String {

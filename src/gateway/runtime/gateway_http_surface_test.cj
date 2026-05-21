@@ -1,6 +1,7 @@
 package metis.gateway.runtime
 
 import metis.core.config.{CliConfig, CliSettingManager, GatewayUserSettings, MetisConfigManager, MetisProcessEnvironmentLock}
+import metis.gateway.core.{gatewayChannelRuntimeMarkFailure, gatewayChannelRuntimeMarkStarting, gatewayChannelRuntimeRegisterAccount}
 import metis.gateway.config.buildGatewayConfigFromUserSettings
 
 import std.env.{getVariable, setVariable}
@@ -62,24 +63,69 @@ public class GatewayHttpSurfaceTest {
 
     @TestCase
     public func probeBodiesExposeGatewayStatusFields(): Unit {
-        let cfg = buildGatewayConfigFromUserSettings(GatewayUserSettings())
-        let snapshot = GatewayHttpSurface.snapshot(cfg)
-        @Expect(snapshot.get("health").isSome(), true)
-        @Expect(snapshot.get("healthz").isSome(), true)
-        @Expect(snapshot.get("ready").isSome(), true)
-        @Expect(snapshot.get("readyz").isSome(), true)
-        @Expect(snapshot.get("probePaths").isSome(), true)
+        withGatewayHttpSurfaceTestSettings<Unit>({ =>
+            let cfg = buildGatewayConfigFromUserSettings(GatewayUserSettings())
+            let snapshot = GatewayHttpSurface.snapshot(cfg)
+            @Expect(snapshot.get("health").isSome(), true)
+            @Expect(snapshot.get("healthz").isSome(), true)
+            @Expect(snapshot.get("ready").isSome(), true)
+            @Expect(snapshot.get("readyz").isSome(), true)
+            @Expect(snapshot.get("probePaths").isSome(), true)
 
-        let healthz = JsonValue.fromStr(gatewayHttpHealthProbeJson(cfg)).asObject()
-        @Expect(healthz.get("ok").getOrThrow().asBool().getValue(), true)
-        @Expect(healthz.get("status").getOrThrow().asString().getValue(), "live")
-        @Expect(healthz.get("gateway").isSome(), true)
+            let healthz = JsonValue.fromStr(gatewayHttpHealthProbeJson(cfg)).asObject()
+            @Expect(healthz.get("ok").getOrThrow().asBool().getValue(), true)
+            @Expect(healthz.get("status").getOrThrow().asString().getValue(), "live")
+            @Expect(healthz.get("gateway").isSome(), true)
 
-        let readyz = JsonValue.fromStr(gatewayHttpReadyProbeJson(cfg)).asObject()
-        @Expect(readyz.get("ready").isSome(), true)
-        @Expect(readyz.get("ok").isSome(), true)
-        @Expect(readyz.get("status").getOrThrow().asString().getValue(), "ready")
-        @Expect(readyz.get("gateway").isSome(), true)
+            let readyz = JsonValue.fromStr(gatewayHttpReadyProbeJson(cfg)).asObject()
+            @Expect(readyz.get("ready").isSome(), true)
+            @Expect(readyz.get("ok").isSome(), true)
+            @Expect(readyz.get("status").getOrThrow().asString().getValue(), "ready")
+            @Expect(readyz.get("gateway").isSome(), true)
+        })
+    }
+
+    @TestCase
+    public func healthzStaysLiveWithFailedChannelRuntimeSnapshot(): Unit {
+        withGatewayHttpSurfaceTestSettings<Unit>({ =>
+            let user = gatewayHttpSurfaceTestUser()
+            let cfg = buildGatewayConfigFromUserSettings(user)
+            let _ = gatewayChannelRuntimeRegisterAccount("feishu", accountId: "work")
+            let _ = gatewayChannelRuntimeMarkStarting("feishu", accountId: "work")
+            let _ = gatewayChannelRuntimeMarkFailure("feishu", accountId: "work", error: "monitor-host-timeout")
+
+            let healthz = JsonValue.fromStr(gatewayHttpHealthProbeJson(cfg)).asObject()
+            @Expect(healthz.get("ok").getOrThrow().asBool().getValue(), true)
+            @Expect(healthz.get("status").getOrThrow().asString().getValue(), "live")
+            @Expect(healthz.get("readiness").isNone(), true)
+            @Expect(healthz.get("channels").isNone(), true)
+        })
+    }
+
+    @TestCase
+    public func readyzReportsDegradedFailedChannelRuntimeSnapshot(): Unit {
+        withGatewayHttpSurfaceTestSettings<Unit>({ =>
+            let user = gatewayHttpSurfaceTestUser()
+            let cfg = buildGatewayConfigFromUserSettings(user)
+            let _ = gatewayChannelRuntimeRegisterAccount("feishu", accountId: "work")
+            let _ = gatewayChannelRuntimeMarkStarting("feishu", accountId: "work")
+            let _ = gatewayChannelRuntimeMarkFailure("feishu", accountId: "work", error: "monitor-host-timeout")
+
+            let readyz = JsonValue.fromStr(gatewayHttpReadyProbeJson(cfg)).asObject()
+            @Expect(readyz.get("ok").getOrThrow().asBool().getValue(), false)
+            @Expect(readyz.get("ready").getOrThrow().asBool().getValue(), false)
+            @Expect(readyz.get("status").getOrThrow().asString().getValue(), "degraded")
+            let readiness = readyz.get("readiness").getOrThrow().asObject()
+            @Expect(readiness.get("degraded").getOrThrow().asBool().getValue(), true)
+            @Expect(readiness.get("failedCount").getOrThrow().toJsonString(), "1")
+            let accounts = readiness.get("accounts").getOrThrow().asArray()
+            @Expect(accounts.size(), 1)
+            let row = accounts[0].asObject()
+            @Expect(row.get("channelId").getOrThrow().asString().getValue(), "feishu")
+            @Expect(row.get("accountId").getOrThrow().asString().getValue(), "work")
+            @Expect(row.get("lifecycleState").getOrThrow().asString().getValue(), "failed")
+            @Expect(row.get("lastError").getOrThrow().asString().getValue(), "monitor-host-timeout")
+        })
     }
 
     @TestCase

@@ -7,7 +7,7 @@ import std.unittest.testmacro.*
 @Test
 public class GatewayFeishuSidecarRuntimeTest {
     @TestCase
-    public func monitorHostArgsCarryAccountIdAndRedactSecretsForDiagnostics(): Unit {
+    public func monitorHostArgsCarryAccountIdWithoutSecretArgv(): Unit {
         let adapter = FeishuAdapter(
             config: FeishuConfig(
                 enabled: true,
@@ -24,9 +24,14 @@ public class GatewayFeishuSidecarRuntimeTest {
 
         @Expect(joined.contains("--account-id feishu-writer"), true)
         @Expect(joined.contains("--app-id cli_writer_app"), true)
+        @Expect(joined.contains("--app-secret"), false)
+        @Expect(joined.contains("--verification-token"), false)
+        @Expect(joined.contains("--encrypt-key"), false)
         @Expect(joined.contains("sidecar-secret-never-output"), false)
         @Expect(joined.contains("verify-token-never-output"), false)
         @Expect(joined.contains("encrypt-key-never-output"), false)
-        @Expect(joined.contains("[redacted]"), true)
+        @Expect(adapter.debugOfficialSdkMonitorHostInitFrameForTest().contains("sidecar-secret-never-output"), true)
+        @Expect(adapter.debugOfficialSdkMonitorHostInitFrameForTest().contains("verify-token-never-output"), true)
+        @Expect(adapter.debugOfficialSdkMonitorHostInitFrameForTest().contains("encrypt-key-never-output"), true)
     }
 }

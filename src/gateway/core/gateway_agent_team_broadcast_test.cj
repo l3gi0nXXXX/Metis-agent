@@ -117,14 +117,14 @@ private func broadcastRoot(home: Path, team: JsonObject, channelName!: String = 
 }
 
 private func broadcastMediaContext(channelName!: String = "fake", accountId!: String = "bot-a",
-    peerKind!: String = "group", peerId!: String = "room-1", parentPeerKind!: String = "",
-    parentPeerId!: String = ""): JsonObject {
+    defaultAccountId!: String = "", peerKind!: String = "group", peerId!: String = "room-1",
+    parentPeerKind!: String = "", parentPeerId!: String = ""): JsonObject {
     let media = JsonObject()
     let context = JsonObject()
     let route = JsonObject()
     route.put("channel", JsonString(channelName))
     route.put("accountId", JsonString(accountId))
-    route.put("defaultAccountId", JsonString(accountId))
+    route.put("defaultAccountId", JsonString(if (!defaultAccountId.isEmpty()) { defaultAccountId } else { accountId }))
     route.put("peerKind", JsonString(peerKind))
     route.put("peerId", JsonString(peerId))
     if (!parentPeerKind.isEmpty()) {
@@ -139,8 +139,9 @@ private func broadcastMediaContext(channelName!: String = "fake", accountId!: St
 }
 
 private func broadcastRequest(root: JsonObject, channelName!: String = "fake", accountId!: String = "bot-a",
-    peerKind!: String = "group", peerId!: String = "room-1", parentPeerKind!: String = "",
-    parentPeerId!: String = ""): GatewaySessionRequest {
+    defaultAccountId!: String = "", peerKind!: String = "group", peerId!: String = "room-1",
+    parentPeerKind!: String = "", parentPeerId!: String = ""): GatewaySessionRequest {
+    let effectiveDefaultAccountId = if (!defaultAccountId.isEmpty()) { defaultAccountId } else { accountId }
     GatewaySessionRequest(
         GatewayIngressSource.Channel(channelName),
         channelName: channelName,
@@ -157,11 +158,12 @@ private func broadcastRequest(root: JsonObject, channelName!: String = "fake", a
         replyToMessageId: "msg-1",
         replyInThread: peerKind == "topic",
         deliver: true,
-        mediaContext: broadcastMediaContext(channelName: channelName, accountId: accountId, peerKind: peerKind,
-            peerId: peerId, parentPeerKind: parentPeerKind, parentPeerId: parentPeerId),
+        mediaContext: broadcastMediaContext(channelName: channelName, accountId: accountId,
+            defaultAccountId: effectiveDefaultAccountId, peerKind: peerKind, peerId: peerId,
+            parentPeerKind: parentPeerKind, parentPeerId: parentPeerId),
         routeRoot: root,
         routeAccountId: accountId,
-        routeDefaultAccountId: accountId,
+        routeDefaultAccountId: effectiveDefaultAccountId,
         routePeerKind: peerKind,
         routePeerId: peerId,
         routeParentPeerKind: parentPeerKind,
@@ -368,6 +370,7 @@ public class GatewayAgentTeamBroadcastTest {
                     root,
                     channelName: "telegram",
                     accountId: "bot-b",
+                    defaultAccountId: "bot-a",
                     peerKind: "topic",
                     peerId: "42",
                     parentPeerKind: "group",
