@@ -830,6 +830,9 @@ private func gatewayFeishuAccountEventDiagnostic(
     let inboundCount = gatewayFeishuDiagInt(runtimeRow, "inboundCount", defaultValue: gatewayFeishuDiagInt(accountRow, "inboundCount"))
     let pullCount = gatewayFeishuDiagInt(runtimeRow, "pullCount", defaultValue: gatewayFeishuDiagInt(accountRow, "pullCount"))
     let lastEventAtMs = gatewayFeishuDiagInt(runtimeRow, "lastEventAtMs", defaultValue: gatewayFeishuDiagInt(accountRow, "lastEventAtMs"))
+    let lastMonitorAtMs = gatewayFeishuDiagInt(runtimeRow, "lastMonitorAtMs", defaultValue: gatewayFeishuDiagInt(accountRow, "lastMonitorAtMs"))
+    let nowMs = DateTime.now().toUnixTimeStamp().toMilliseconds()
+    let lastDiagnosticAgeMs = if (lastMonitorAtMs > 0 && nowMs >= lastMonitorAtMs) { nowMs - lastMonitorAtMs } else { 0 }
     let rawLastError = gatewayFeishuDiagString(runtimeRow, "lastError", defaultValue: gatewayFeishuDiagString(accountRow, "lastError"))
     let safeLastError = gatewayFeishuDiagnosticRedact(rawLastError)
     let lastError = rawLastError.toAsciiLower()
@@ -884,6 +887,11 @@ private func gatewayFeishuAccountEventDiagnostic(
     row.put("inboundCount", inboundCount.toJsonValue())
     row.put("pullCount", pullCount.toJsonValue())
     row.put("lastEventAtMs", lastEventAtMs.toJsonValue())
+    row.put("lastInboundAtMs", lastEventAtMs.toJsonValue())
+    row.put("lastInboundAt", JsonString(if (lastEventAtMs > 0) { lastEventAtMs.toString() } else { "never" }))
+    row.put("lastDiagnosticAtMs", lastMonitorAtMs.toJsonValue())
+    row.put("lastDiagnosticAgeMs", lastDiagnosticAgeMs.toJsonValue())
+    row.put("lastDiagnosticAge", JsonString(if (lastMonitorAtMs > 0) { "${lastDiagnosticAgeMs}ms" } else { "never" }))
     if (!safeLastError.isEmpty()) {
         row.put("lastError", JsonString(safeLastError))
     }
