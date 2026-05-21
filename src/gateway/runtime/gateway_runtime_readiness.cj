@@ -235,12 +235,13 @@ public func gatewayRuntimeConfigDriftSnapshot(user: GatewayUserSettings, channel
             runningAccounts.add(gatewayRuntimeAccountDiagnostic(row, "runtime-account-active"))
         }
         let configured = configuredIndex.get(key).isSome()
-        if (!configured && gatewayRuntimeAccountIsActive(row)) {
+        let staleActive = !configured && gatewayRuntimeAccountIsActive(row)
+        if (staleActive) {
             let diag = gatewayRuntimeAccountDiagnostic(row, "stale-runtime-account")
             staleRunningAccounts.add(diag)
             problemAccounts.add(diag)
         }
-        let problemReason = gatewayRuntimeAccountProblemReason(row, configured)
+        let problemReason = if (staleActive) { "" } else { gatewayRuntimeAccountProblemReason(row, configured) }
         if (!problemReason.isEmpty()) {
             let diag = gatewayRuntimeAccountDiagnostic(row, problemReason)
             if (configured && gatewayRuntimeString(row, "lifecycleState") == "failed") {
@@ -276,11 +277,14 @@ public func gatewayRuntimeConfigDriftSnapshot(user: GatewayUserSettings, channel
     drift
 }
 
-private func gatewayRuntimeReadinessStatus(endpointReady: Bool, user: GatewayUserSettings, failedCount: Int64, startingCount: Int64, backoffCount: Int64, notStartedCount: Int64, staleCount: Int64): String {
+private func gatewayRuntimeReadinessStatus(endpointReady: Bool, user: GatewayUserSettings, hasEnabledChannel: Bool, failedCount: Int64, startingCount: Int64, backoffCount: Int64, notStartedCount: Int64, staleCount: Int64): String {
     if (!endpointReady) {
         return "not-ready"
     }
     if (!user.enabled) {
+        return "not-ready"
+    }
+    if (!hasEnabledChannel) {
         return "not-ready"
     }
     if (failedCount > 0 || backoffCount > 0 || notStartedCount > 0 || staleCount > 0) {
@@ -336,7 +340,7 @@ public func gatewayBuildRuntimeReadinessSnapshot(
     }
     let notStartedCount = gatewayRuntimeInt(drift, "notStartedConfiguredCount")
     let staleCount = gatewayRuntimeInt(drift, "staleRunningCount")
-    let status = gatewayRuntimeReadinessStatus(endpointReady, user, failedCount, startingCount, backoffCount, notStartedCount, staleCount)
+    let status = gatewayRuntimeReadinessStatus(endpointReady, user, hasEnabledChannel, failedCount, startingCount, backoffCount, notStartedCount, staleCount)
     let ready = status == "ready"
     let out = JsonObject()
     out.put("ready", ready.toJsonValue())

@@ -22,7 +22,7 @@ import metis.core.config.{
 }
 import metis.gateway.channels.feishu.FeishuAdapter
 import metis.gateway.{gatewayRuntimeEffectiveAuthPasswordString, gatewayRuntimeEffectiveAuthTokenString}
-import metis.gateway.config.{buildGatewayConfigFromUserSettings, ensureInstalledGatewayPluginsRegistered, gatewayBuiltinExtraBool, gatewayBuiltinExtraConfig, gatewayBuiltinExtraConfigured, gatewayPreparedBuiltinAdapterRegistrations, gatewayPreparedPluginAdapterRegistrations, GatewayChannelPluginRegistry, mergeGatewayUserSettings}
+import metis.gateway.config.{buildGatewayConfigFromUserSettings, ensureInstalledGatewayPluginsRegistered, gatewayBuiltinAdapterRegistrationProfiles, gatewayPreparedBuiltinAdapterRegistrations, gatewayPreparedPluginAdapterRegistrations, GatewayChannelPluginRegistry}
 import metis.cron.registerGatewayCronRunUnified
 import metis.gateway.core.{
     GatewayRouter,
@@ -72,16 +72,11 @@ private func mergeGatewaySession(ss: GatewaySessionUserSettings): (String, Bool)
 }
 
 /**
- * 是否至少有一条可运行的渠道：内置飞书/QQ 或已启用的扩展插件项。
+ * 是否至少有一条可运行的渠道：内置渠道必须同时 enabled 且 configured。
  */
 public func gatewayHasAnyEnabledChannel(user: GatewayUserSettings): Bool {
-    let (fCfg, qCfg, tCfg) = mergeGatewayUserSettings(user)
-    if (fCfg.enabled || qCfg.enabled || tCfg.enabled) {
-        return true
-    }
-    for (builtinId in ["slack", "discord"]) {
-        let builtinCfg = gatewayBuiltinExtraConfig(user, builtinId)
-        if (gatewayBuiltinExtraBool(builtinCfg, "enabled", false)) {
+    for (profile in gatewayBuiltinAdapterRegistrationProfiles(user, user.channelHealthCheckMinutes > 0)) {
+        if (profile.enabled && profile.configured) {
             return true
         }
     }

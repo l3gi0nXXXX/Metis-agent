@@ -105,7 +105,13 @@ public class GatewayHttpSurfaceTest {
     @TestCase
     public func readyzReportsDegradedFailedChannelRuntimeSnapshot(): Unit {
         withGatewayHttpSurfaceTestSettings<Unit>({ =>
-            let user = gatewayHttpSurfaceTestUser()
+            var user = gatewayHttpSurfaceTestUser()
+            user.feishu.enabled = true
+            user.feishu.defaultAccount = "work"
+            user.feishu.appId = "feishu-work-app"
+            user.feishu.appSecret = "feishu-work-secret"
+            let _ = MetisConfigManager.setGatewaySettings(user)
+            CliSettingManager.invalidate()
             let cfg = buildGatewayConfigFromUserSettings(user)
             let _ = gatewayChannelRuntimeRegisterAccount("feishu", accountId: "work")
             let _ = gatewayChannelRuntimeMarkStarting("feishu", accountId: "work")

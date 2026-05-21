@@ -66,6 +66,11 @@ private func statusTestString(obj: JsonObject, key: String): String {
     }
 }
 
+private func gatewayStatusPersistUser(user: GatewayUserSettings): Unit {
+    let _ = MetisConfigManager.setGatewaySettings(user)
+    CliSettingManager.invalidate()
+}
+
 @Test
 public class GatewayServerMethodsStatusTest {
     @TestCase
@@ -87,6 +92,7 @@ public class GatewayServerMethodsStatusTest {
     public func failedChannelRuntimeAccountMatchesReadyzStatusHealthAndReadiness(): Unit {
         withGatewayStatusTestSettings<Unit>("failed-runtime", { =>
             let user = gatewayStatusTestUser()
+            gatewayStatusPersistUser(user)
             let cfg = buildGatewayConfigFromUserSettings(user)
             let _ = gatewayChannelRuntimeRegisterAccount("telegram", accountId: "default")
             let _ = gatewayChannelRuntimeMarkStarting("telegram", accountId: "default")
@@ -123,6 +129,7 @@ public class GatewayServerMethodsStatusTest {
     public func startingChannelRuntimeAccountIsNotReportedOk(): Unit {
         withGatewayStatusTestSettings<Unit>("starting-runtime", { =>
             let user = gatewayStatusTestUser()
+            gatewayStatusPersistUser(user)
             let cfg = buildGatewayConfigFromUserSettings(user)
             let _ = gatewayChannelRuntimeRegisterAccount("telegram", accountId: "default")
             let _ = gatewayChannelRuntimeMarkStarting("telegram", accountId: "default")
@@ -144,6 +151,7 @@ public class GatewayServerMethodsStatusTest {
     public func disabledAndUnconfiguredRuntimeAccountsDoNotFailReadiness(): Unit {
         withGatewayStatusTestSettings<Unit>("disabled-runtime", { =>
             let user = gatewayStatusTestUser()
+            gatewayStatusPersistUser(user)
             let cfg = buildGatewayConfigFromUserSettings(user)
             let _ = gatewayChannelRuntimeRegisterAccount("telegram", accountId: "default")
             let _ = gatewayChannelRuntimeMarkRunning("telegram", accountId: "default")

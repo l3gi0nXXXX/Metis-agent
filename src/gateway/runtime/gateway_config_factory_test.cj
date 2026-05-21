@@ -161,10 +161,20 @@ public class GatewayConfigFactoryTest {
             telegramAccounts.put("tg-empty", unconfigured)
             user.telegram.accounts = Some(telegramAccounts)
 
+            user.feishu.enabled = true
+            user.feishu.receiveMode = "long_connect"
+            let feishuAccounts = JsonObject()
+            let missingCredentials = JsonObject()
+            missingCredentials.put("appId", JsonString(""))
+            missingCredentials.put("appSecret", JsonString(""))
+            feishuAccounts.put("feishu-empty", missingCredentials)
+            user.feishu.accounts = Some(feishuAccounts)
+
             let (gateway, _feishu) = buildGatewayServiceFromUserSettings(user)
             let snapshot = gateway.liveChannelSnapshot()
             @Expect(factorySnapshotHasAccount(snapshot, "telegram", "tg-disabled"), false)
             @Expect(factorySnapshotHasAccount(snapshot, "telegram", "tg-empty"), false)
+            @Expect(factorySnapshotHasAccount(snapshot, "feishu", "feishu-empty"), false)
         }
     }
 }
