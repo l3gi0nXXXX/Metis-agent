@@ -174,10 +174,21 @@ public func gatewayFeishuOapiAttachRepairActionForToolResult(result: JsonObject,
     repair.put("user_id", JsonString(ctx.userId))
     repair.put("ticket_id", JsonString(ctx.ticketId))
     repair.put("turn_key", JsonString(ctx.turnKey))
-    repair.put(
-        "merge",
-        gatewayFeishuOapiRepairMergerForToolset.merge(ctx.turnKey, ctx.accountId, ctx.userId, scopes, status)
-    )
+    let merge = gatewayFeishuOapiRepairMergerForToolset.merge(ctx.turnKey, ctx.accountId, ctx.userId, scopes, status)
+    repair.put("merge", merge)
+    let resume = JsonObject()
+    resume.put("mode", JsonString("manual_after_auth"))
+    resume.put("command", JsonString("/feishu auth resume ${ctx.ticketId}"))
+    resume.put("blocked_tool", JsonString("${request.toolName}.${request.action}"))
+    resume.put("ticket_id", JsonString(ctx.ticketId))
+    resume.put("turn_key", JsonString(ctx.turnKey))
+    resume.put("request_count", match (merge.get("request_count")) {
+        case Some(v) => v
+        case None => JsonString("0")
+    })
+    resume.put("network", JsonString("not_started"))
+    resume.put("redacted", JsonBool(true))
+    repair.put("resume", resume)
     if (status == "app_scope_missing") {
         repair.put("status", JsonString("operator_required"))
         repair.put("can_start", JsonBool(false))

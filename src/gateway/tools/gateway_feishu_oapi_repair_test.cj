@@ -71,6 +71,11 @@ public class GatewayFeishuOapiRepairTest {
             @Expect(repair.get("user_id").getOrThrow().asString().getValue(), "ou_user")
             @Expect(repair.get("redacted").getOrThrow().asBool().getValue(), true)
             @Expect(repair.get("can_start").getOrThrow().asBool().getValue(), true)
+            let resume = repair.get("resume").getOrThrow().asObject()
+            @Expect(resume.get("mode").getOrThrow().asString().getValue(), "manual_after_auth")
+            @Expect(resume.get("command").getOrThrow().asString().getValue(), "/feishu auth resume om_turn")
+            @Expect(resume.get("blocked_tool").getOrThrow().asString().getValue(), "feishu_im_user_message.send")
+            @Expect(resume.get("network").getOrThrow().asString().getValue(), "not_started")
         } finally {
             debugSetGatewayFeishuOapiToolCallRunnerForTest(None<(String, JsonObject) -> JsonObject>)
             debugResetGatewayFeishuOapiRepairForTest()
@@ -106,6 +111,9 @@ public class GatewayFeishuOapiRepairTest {
             let mergedScopes = merge.get("merged_scopes").getOrThrow().asArray().toJsonString()
             @Expect(mergedScopes.contains("im:message"), true)
             @Expect(mergedScopes.contains("contact:user:search"), true)
+            let resume = repair.get("resume").getOrThrow().asObject()
+            @Expect(resume.get("command").getOrThrow().asString().getValue(), "/feishu auth resume om_turn")
+            @Expect(resume.get("request_count").getOrThrow().asInt().getValue(), 2)
         } finally {
             debugSetGatewayFeishuOapiToolCallRunnerForTest(None<(String, JsonObject) -> JsonObject>)
             debugResetGatewayFeishuOapiRepairForTest()

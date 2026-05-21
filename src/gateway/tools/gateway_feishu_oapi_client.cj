@@ -1546,6 +1546,31 @@ public func feishuOapiOpenClawActionKeys(): Array<String> {
     ]
 }
 
+public func feishuOapiOpenClawParityMatrix(): JsonObject {
+    let out = JsonObject()
+    out.put("status", JsonString("source_backed"))
+    out.put("openclaw_source", JsonString("/Users/l3gi0n/work/workspace_cangjie/openclaw-lark/src/tools/oapi/index.ts:46-95"))
+    out.put("metis_source", JsonString("src/gateway/tools/gateway_feishu_oapi_client.cj:1393-1788"))
+    let mapped = JsonArray([])
+    let notApplicable = JsonArray([])
+    for (key in feishuOapiOpenClawActionKeys()) {
+        let row = JsonObject()
+        row.put("action_key", JsonString(key))
+        row.put("status", JsonString(if (feishuOapiIsSupportedActionKey(key)) { "mapped" } else { "missing" }))
+        row.put("path", JsonString(feishuOapiPathForActionKey(key)))
+        row.put("method", JsonString(feishuOapiMethodForActionKey(key)))
+        row.put("token_mode", JsonString(feishuOapiTokenModeForActionKey(key)))
+        row.put("required_scopes", feishuOapiJsonStringArray(feishuOapiRequiredScopesForActionKey(key)))
+        row.put("openclaw_source", JsonString("/Users/l3gi0n/work/workspace_cangjie/openclaw-lark/src/tools/oapi/index.ts:46-95"))
+        row.put("metis_source", JsonString("src/gateway/tools/gateway_feishu_oapi_client.cj"))
+        mapped.add(row)
+    }
+    out.put("mapped", mapped)
+    out.put("not_applicable", notApplicable)
+    out.put("redacted", JsonBool(true))
+    out
+}
+
 public func feishuOapiPathForActionKeyForTest(actionKey: String): String {
     feishuOapiPathForActionKey(actionKey)
 }

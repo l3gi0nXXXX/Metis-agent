@@ -320,6 +320,42 @@ public class FeishuCardKitRequestPlan {
         out.put("redacted", JsonBool(true))
         out
     }
+
+    public func stageName(): String {
+        this.stage
+    }
+
+    public func apiName(): String {
+        this.api
+    }
+
+    public func httpMethod(): String {
+        this.method
+    }
+
+    public func requestPath(): String {
+        this.path
+    }
+
+    public func tokenModeName(): String {
+        this.tokenMode
+    }
+
+    public func sequenceNumber(): Int64 {
+        this.sequence
+    }
+
+    public func paramsValue(): JsonObject {
+        this.params
+    }
+
+    public func bodyValue(): JsonObject {
+        this.body
+    }
+
+    public func requiredScopeValues(): Array<String> {
+        this.requiredScopes
+    }
 }
 
 public class FeishuCardKitStreamingPlan {
@@ -507,6 +543,313 @@ public class FeishuCardKitStreamingPlan {
             JsonString("redacted_cardkit_response_fixture")
         ]))
         root
+    }
+
+    public func accountIdValue(): String {
+        this.accountId
+    }
+
+    public func receiveIdValue(): String {
+        this.receiveId
+    }
+
+    public func receiveIdTypeValue(): String {
+        this.receiveIdType
+    }
+
+    public func cardIdValue(): String {
+        this.cardId
+    }
+
+    public func messageIdValue(): String {
+        this.messageId
+    }
+
+    public func elementIdValue(): String {
+        this.elementId
+    }
+
+    public func requestPlans(): Array<FeishuCardKitRequestPlan> {
+        this.requests
+    }
+}
+
+public class FeishuCardKitOapiResult {
+    public let ok: Bool
+    public let status: String
+    public let cardId: String
+    public let messageId: String
+    public let error: String
+
+    public init(ok!: Bool = false, status!: String = "api_error", cardId!: String = "", messageId!: String = "", error!: String = "") {
+        this.ok = ok
+        this.status = if (status.trimAscii().isEmpty()) { if (ok) { "ok" } else { "api_error" } } else { status.trimAscii() }
+        this.cardId = cardId.trimAscii()
+        this.messageId = messageId.trimAscii()
+        this.error = feishuCardRedactSensitiveText(error)
+    }
+
+    public func toJson(): JsonObject {
+        let out = JsonObject()
+        out.put("ok", JsonBool(this.ok))
+        out.put("status", JsonString(this.status))
+        if (!this.cardId.isEmpty()) {
+            out.put("cardId", JsonString(this.cardId))
+        }
+        if (!this.messageId.isEmpty()) {
+            out.put("messageId", JsonString(this.messageId))
+        }
+        if (!this.error.isEmpty()) {
+            out.put("error", JsonString(this.error))
+        }
+        out.put("redacted", JsonBool(true))
+        out
+    }
+}
+
+public class FeishuCardKitExecutableRequest {
+    public let accountId: String
+    public let stage: String
+    public let api: String
+    public let method: String
+    public let path: String
+    public let tokenMode: String
+    public let sequence: Int64
+    public let params: JsonObject
+    public let body: JsonObject
+    public let requiredScopes: Array<String>
+    public let cardId: String
+    public let messageId: String
+
+    public init(
+        accountId: String,
+        stage: String,
+        api: String,
+        method: String,
+        path: String,
+        tokenMode: String,
+        sequence: Int64,
+        params: JsonObject,
+        body: JsonObject,
+        requiredScopes: Array<String>,
+        cardId!: String = "",
+        messageId!: String = ""
+    ) {
+        this.accountId = if (accountId.trimAscii().isEmpty()) { "default" } else { accountId.trimAscii() }
+        this.stage = stage.trimAscii()
+        this.api = api.trimAscii()
+        this.method = method.trimAscii().toAsciiUpper()
+        this.path = path.trimAscii()
+        this.tokenMode = tokenMode.trimAscii()
+        this.sequence = sequence
+        this.params = params
+        this.body = body
+        this.requiredScopes = requiredScopes
+        this.cardId = cardId.trimAscii()
+        this.messageId = messageId.trimAscii()
+    }
+
+    public func toJson(): JsonObject {
+        let out = JsonObject()
+        out.put("accountId", JsonString(this.accountId))
+        out.put("stage", JsonString(this.stage))
+        out.put("api", JsonString(this.api))
+        out.put("method", JsonString(this.method))
+        out.put("path", JsonString(this.path))
+        out.put("tokenMode", JsonString(this.tokenMode))
+        out.put("sequence", JsonInt(this.sequence))
+        out.put("params", this.params)
+        out.put("body", this.body)
+        out.put("requiredScopes", feishuCardJsonStringArray(this.requiredScopes))
+        out.put("cardId", JsonString(this.cardId))
+        out.put("messageId", JsonString(this.messageId))
+        out.put("networkAttempted", JsonBool(true))
+        out.put("redacted", JsonBool(true))
+        out
+    }
+}
+
+public interface FeishuCardKitOapiClient {
+    func execute(request: FeishuCardKitExecutableRequest): FeishuCardKitOapiResult
+}
+
+public class FeishuCardKitExecutionResult {
+    public let ok: Bool
+    public let status: String
+    public let cardId: String
+    public let messageId: String
+    public let fallbackSent: Bool
+    public let networkAttempted: Bool
+    public let error: String
+    private let requests: Array<JsonObject>
+
+    public init(
+        ok!: Bool = false,
+        status!: String = "not_started",
+        cardId!: String = "",
+        messageId!: String = "",
+        fallbackSent!: Bool = false,
+        networkAttempted!: Bool = false,
+        error!: String = "",
+        requests!: Array<JsonObject> = []
+    ) {
+        this.ok = ok
+        this.status = status.trimAscii()
+        this.cardId = cardId.trimAscii()
+        this.messageId = messageId.trimAscii()
+        this.fallbackSent = fallbackSent
+        this.networkAttempted = networkAttempted
+        this.error = feishuCardRedactSensitiveText(error)
+        this.requests = requests
+    }
+
+    public func toJson(): JsonObject {
+        let out = JsonObject()
+        out.put("ok", JsonBool(this.ok))
+        out.put("status", JsonString(this.status))
+        out.put("cardId", JsonString(this.cardId))
+        out.put("messageId", JsonString(this.messageId))
+        out.put("fallbackSent", JsonBool(this.fallbackSent))
+        out.put("networkAttempted", JsonBool(this.networkAttempted))
+        out.put("redacted", JsonBool(true))
+        if (!this.error.isEmpty()) {
+            out.put("error", JsonString(this.error))
+        }
+        let rows = JsonArray([])
+        for (request in this.requests) {
+            rows.add(request)
+        }
+        out.put("requests", rows)
+        out
+    }
+}
+
+public class FeishuCardKitExecutor {
+    private let client: FeishuCardKitOapiClient
+
+    public init(client: FeishuCardKitOapiClient) {
+        this.client = client
+    }
+
+    public func execute(plan: FeishuCardKitStreamingPlan): FeishuCardKitExecutionResult {
+        var currentCardId = plan.cardIdValue()
+        var currentMessageId = plan.messageIdValue()
+        var networkAttempted = false
+        let executed = ArrayList<JsonObject>()
+        let requests = plan.requestPlans()
+
+        for (request in requests) {
+            if (request.stageName() == "fallback_text") {
+                continue
+            }
+            let executable = this.executableRequest(plan, request, currentCardId, currentMessageId)
+            let response = this.client.execute(executable)
+            networkAttempted = true
+            let row = executable.toJson()
+            row.put("response", response.toJson())
+            executed.add(row)
+            if (!response.ok) {
+                let decision = classifyFeishuCardFallback(response.status, error: response.error)
+                if (decision.shouldFallback) {
+                    return this.executeFallback(plan, requests, currentCardId, currentMessageId, networkAttempted, executed, response)
+                }
+                return FeishuCardKitExecutionResult(
+                    status: response.status,
+                    cardId: currentCardId,
+                    messageId: currentMessageId,
+                    networkAttempted: networkAttempted,
+                    error: response.error,
+                    requests: executed.toArray()
+                )
+            }
+            if (!response.cardId.isEmpty()) {
+                currentCardId = response.cardId
+            }
+            if (!response.messageId.isEmpty()) {
+                currentMessageId = response.messageId
+            }
+        }
+
+        FeishuCardKitExecutionResult(
+            ok: true,
+            status: "success",
+            cardId: currentCardId,
+            messageId: currentMessageId,
+            networkAttempted: networkAttempted,
+            requests: executed.toArray()
+        )
+    }
+
+    private func executeFallback(
+        plan: FeishuCardKitStreamingPlan,
+        requests: Array<FeishuCardKitRequestPlan>,
+        currentCardId: String,
+        currentMessageId: String,
+        networkAttempted: Bool,
+        executed: ArrayList<JsonObject>,
+        failedResponse: FeishuCardKitOapiResult
+    ): FeishuCardKitExecutionResult {
+        for (request in requests) {
+            if (request.stageName() == "fallback_text") {
+                let executable = this.executableRequest(plan, request, currentCardId, currentMessageId)
+                let response = this.client.execute(executable)
+                let row = executable.toJson()
+                row.put("response", response.toJson())
+                executed.add(row)
+                return FeishuCardKitExecutionResult(
+                    ok: response.ok,
+                    status: if (response.ok) { "fallback_sent" } else { "fallback_failed" },
+                    cardId: currentCardId,
+                    messageId: currentMessageId,
+                    fallbackSent: response.ok,
+                    networkAttempted: true,
+                    error: if (response.ok) { failedResponse.error } else { response.error },
+                    requests: executed.toArray()
+                )
+            }
+        }
+        FeishuCardKitExecutionResult(
+            status: failedResponse.status,
+            cardId: currentCardId,
+            messageId: currentMessageId,
+            networkAttempted: networkAttempted,
+            error: failedResponse.error,
+            requests: executed.toArray()
+        )
+    }
+
+    private func executableRequest(
+        plan: FeishuCardKitStreamingPlan,
+        request: FeishuCardKitRequestPlan,
+        currentCardId: String,
+        currentMessageId: String
+    ): FeishuCardKitExecutableRequest {
+        let body = request.bodyValue()
+        let stage = request.stageName()
+        if (stage == "send_card_message") {
+            let content = JsonObject()
+            content.put("type", JsonString("card"))
+            let data = JsonObject()
+            data.put("card_id", JsonString(currentCardId))
+            content.put("data", data)
+            body.put("content", JsonString(feishuCardJsonString(content)))
+        } else if (stage == "fallback_text") {
+            body.put("message_id", JsonString(currentMessageId))
+        }
+        FeishuCardKitExecutableRequest(
+            plan.accountIdValue(),
+            stage,
+            request.apiName(),
+            request.httpMethod(),
+            request.requestPath(),
+            request.tokenModeName(),
+            request.sequenceNumber(),
+            request.paramsValue(),
+            body,
+            request.requiredScopeValues(),
+            cardId: currentCardId,
+            messageId: currentMessageId
+        )
     }
 }
 

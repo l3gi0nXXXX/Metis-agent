@@ -1002,6 +1002,28 @@ public class GatewayFeishuOapiToolsetTest {
     }
 
     @TestCase
+    public func openClawActionParityMatrixMapsEveryActionKeyWithSourceEvidence(): Unit {
+        let matrix = feishuOapiOpenClawParityMatrix()
+        @Expect(matrix.get("status").getOrThrow().asString().getValue(), "source_backed")
+        @Expect(matrix.get("openclaw_source").getOrThrow().asString().getValue().contains("src/tools/oapi/index.ts"), true)
+        let mapped = matrix.get("mapped").getOrThrow().asArray()
+        let notApplicable = matrix.get("not_applicable").getOrThrow().asArray()
+        @Expect(notApplicable.size(), 0)
+        @Expect(mapped.size(), feishuOapiOpenClawActionKeys().size)
+        for (i in 0..mapped.size()) {
+            let row = mapped[i].asObject()
+            let key = row.get("action_key").getOrThrow().asString().getValue()
+            @Expect(feishuOapiOpenClawActionKeys().contains(key), true)
+            @Expect(row.get("status").getOrThrow().asString().getValue(), "mapped")
+            @Expect(row.get("path").getOrThrow().asString().getValue().startsWith("/open-apis/"), true)
+            @Expect(row.get("method").getOrThrow().asString().getValue().isEmpty(), false)
+            @Expect(row.get("token_mode").getOrThrow().asString().getValue().isEmpty(), false)
+            @Expect(row.get("required_scopes").getOrThrow().asArray().size() > 0, true)
+            @Expect(row.get("metis_source").getOrThrow().asString().getValue().contains("gateway_feishu_oapi_client.cj"), true)
+        }
+    }
+
+    @TestCase
     public func getUserBasicBatchHasPathScopeTokenModeAndToolsetEntry(): Unit {
         let request = feishuOapiBuildRequest("feishu_get_user", "basic_batch", "tenant-a", JsonObject())
         @Expect(request.actionKey, "feishu_get_user.basic_batch")
