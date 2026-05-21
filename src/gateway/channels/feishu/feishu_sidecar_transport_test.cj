@@ -1,0 +1,259 @@
+package metis.gateway.channels.feishu
+
+import std.collection.ArrayList
+import std.sync.Mutex
+import std.unittest.testmacro.*
+import stdx.encoding.json.{JsonObject, JsonString}
+
+private class FeishuSidecarFakeProcess <: FeishuSidecarProtocolProcess {
+    private let lock = Mutex()
+    private let stdoutLines = ArrayList<String>()
+    public let stdinLines = ArrayList<String>()
+    public var alive: Bool = true
+    public var waitResult: Option<Int64> = Some(0)
+    public var waitCalls: Int64 = 0
+    public var terminateCalls: Int64 = 0
+    private let processPid: Int64
+
+    public init(pid!: Int64 = 9010, stdout!: Array<String> = []) {
+        this.processPid = pid
+        for (line in stdout) {
+            this.stdoutLines.add(line)
+        }
+    }
+
+    public func pid(): Int64 {
+        this.processPid
+    }
+
+    public func writeLine(line: String): Unit {
+        synchronized(this.lock) {
+            this.stdinLines.add(line)
+        }
+    }
+
+    public func readLine(_timeoutMs: Int64): Option<String> {
+        synchronized(this.lock) {
+            if (this.stdoutLines.isEmpty()) {
+                return None<String>
+            }
+            let line = this.stdoutLines[0]
+            this.stdoutLines.remove(at: 0)
+            Some(line)
+        }
+    }
+
+    public func isAlive(): Bool {
+        synchronized(this.lock) {
+            this.alive
+        }
+    }
+
+    public func wait(_timeoutMs: Int64): Option<Int64> {
+        synchronized(this.lock) {
+            this.waitCalls += 1
+            this.waitResult
+        }
+    }
+
+    public func terminate(_force: Bool): Unit {
+        synchronized(this.lock) {
+            this.terminateCalls += 1
+            this.alive = false
+        }
+    }
+
+    public func push(line: String): Unit {
+        synchronized(this.lock) {
+            this.stdoutLines.add(line)
+        }
+    }
+
+    public func exitNow(): Unit {
+        synchronized(this.lock) {
+            this.alive = false
+        }
+    }
+}
+
+private class FeishuSidecarFakeRunner <: FeishuSidecarProtocolRunner {
+    public let process: FeishuSidecarFakeProcess
+    public var lastLaunch: FeishuSidecarLaunchSpec = FeishuSidecarLaunchSpec(command: "", args: [])
+    public var startCount: Int64 = 0
+    public var failWith: String = ""
+
+    public init(process: FeishuSidecarFakeProcess) {
+        this.process = process
+    }
+
+    public func start(spec: FeishuSidecarLaunchSpec): FeishuSidecarProtocolStartResult {
+        this.startCount += 1
+        this.lastLaunch = spec
+        if (!this.failWith.trimAscii().isEmpty()) {
+            return FeishuSidecarProtocolStartResult.Failed(this.failWith)
+        }
+        FeishuSidecarProtocolStartResult.Started(this.process)
+    }
+}
+
+@Test
+public class FeishuSidecarTransportTest {
+    private func spec(): FeishuLongConnectStartSpec {
+        FeishuLongConnectStartSpec(
+            accountId: "tenant-a",
+            appId: "cli_app",
+            appSecret: "secret-app",
+            domain: "https://open.feishu.cn",
+            verificationToken: "secret-verification",
+            encryptKey: "secret-encrypt"
+        )
+    }
+
+    private func options(): FeishuSidecarTransportOptions {
+        FeishuSidecarTransportOptions(
+            command: "node",
+            args: ["scripts/feishu-openclaw-sidecar.mjs"],
+            readyTimeoutMs: 1,
+            readTimeoutMs: 1,
+            stopTimeoutMs: 1,
+            startBackgroundReader: false
+        )
+    }
+
+    private func jsonEvent(messageId: String): String {
+        "{\"message\":{\"message_id\":\"${messageId}\"}}"
+    }
+
+    @TestCase
+    public func readyWritesInitFrameThroughStdinAndMarksHealth(): Unit {
+        let process = FeishuSidecarFakeProcess(stdout: [
+            "{\"type\":\"ready\",\"accountId\":\"tenant-a\",\"transport\":\"websocket\"}"
+        ])
+        let runner = FeishuSidecarFakeRunner(process)
+        let transport = FeishuSidecarTransport(runner: runner, options: this.options())
+
+        let result = transport.start(this.spec(), { _root => () })
+
+        @Expect(result.ok, true)
+        @Expect(result.status, "ready")
+        @Expect(process.stdinLines.size, 1)
+        @Expect(process.stdinLines[0].contains("\"type\":\"init\""), true)
+        @Expect(process.stdinLines[0].contains("secret-app"), true)
+        @Expect(String.join(runner.lastLaunch.args, delimiter: " ").contains("secret-app"), false)
+        @Expect(transport.healthSnapshot().ready, true)
+        @Expect(transport.healthSnapshot().connected, true)
+        @Expect(transport.healthSnapshot().pid, 9010)
+    }
+
+    @TestCase
+    public func inboundFrameDispatchesOnlyJsonEventRoot(): Unit {
+        let process = FeishuSidecarFakeProcess(stdout: [
+            "{\"type\":\"ready\",\"accountId\":\"tenant-a\",\"transport\":\"websocket\"}",
+            "{\"type\":\"inbound\",\"accountId\":\"tenant-a\",\"eventType\":\"im.message.receive_v1\",\"event\":${this.jsonEvent("om_sidecar")}}"
+        ])
+        let runner = FeishuSidecarFakeRunner(process)
+        let transport = FeishuSidecarTransport(runner: runner, options: this.options())
+        let events = ArrayList<JsonObject>()
+
+        let result = transport.start(this.spec(), { root => events.add(root) })
+        transport.debugDrainAvailableForTest()
+
+        @Expect(result.ok, true)
+        @Expect(events.size, 1)
+        let header = events[0].get("header").getOrThrow().asObject()
+        @Expect(header.get("event_type").getOrThrow().asString().getValue(), "im.message.receive_v1")
+        @Expect(header.get("account_id").getOrThrow().asString().getValue(), "tenant-a")
+        let event = events[0].get("event").getOrThrow().asObject()
+        let message = event.get("message").getOrThrow().asObject()
+        @Expect(message.get("message_id").getOrThrow().asString().getValue(), "om_sidecar")
+        @Expect(transport.healthSnapshot().lastInboundAt > 0, true)
+    }
+
+    @TestCase
+    public func failureFramesAndMalformedLinesUpdateLastError(): Unit {
+        let timeoutProcess = FeishuSidecarFakeProcess(stdout: [])
+        let timeoutTransport = FeishuSidecarTransport(runner: FeishuSidecarFakeRunner(timeoutProcess), options: this.options())
+        let timeoutResult = timeoutTransport.start(this.spec(), { _root => () })
+        @Expect(timeoutResult.ok, false)
+        @Expect(timeoutResult.status, "ready_timeout")
+        @Expect(timeoutTransport.healthSnapshot().lastError.contains("ready timeout"), true)
+
+        let badProcess = FeishuSidecarFakeProcess(stdout: ["not json"])
+        let badTransport = FeishuSidecarTransport(runner: FeishuSidecarFakeRunner(badProcess), options: this.options())
+        let badResult = badTransport.start(this.spec(), { _root => () })
+        @Expect(badResult.ok, false)
+        @Expect(badResult.status, "protocol_error")
+        @Expect(badTransport.healthSnapshot().lastError.contains("non-json"), true)
+
+        let errorProcess = FeishuSidecarFakeProcess(stdout: [
+            "{\"type\":\"error\",\"phase\":\"start\",\"status\":\"sdk_error\",\"message\":\"sdk failed\"}"
+        ])
+        let errorTransport = FeishuSidecarTransport(runner: FeishuSidecarFakeRunner(errorProcess), options: this.options())
+        let errorResult = errorTransport.start(this.spec(), { _root => () })
+        @Expect(errorResult.ok, false)
+        @Expect(errorResult.status, "sdk_error")
+        @Expect(errorTransport.healthSnapshot().lastError.contains("sdk failed"), true)
+    }
+
+    @TestCase
+    public func diagnosticClosedAndUnexpectedExitAreReflectedInSnapshots(): Unit {
+        let process = FeishuSidecarFakeProcess(stdout: [
+            "{\"type\":\"ready\",\"accountId\":\"tenant-a\",\"transport\":\"websocket\"}"
+        ])
+        let runner = FeishuSidecarFakeRunner(process)
+        let transport = FeishuSidecarTransport(runner: runner, options: this.options())
+        let result = transport.start(this.spec(), { _root => () })
+        @Expect(result.ok, true)
+
+        process.push("{\"type\":\"diagnostic\",\"level\":\"warn\",\"phase\":\"websocket.open\",\"status\":\"retry\",\"message\":\"retrying\"}")
+        transport.debugDrainAvailableForTest()
+        @Expect(transport.diagnosticsSnapshot().size, 2)
+        @Expect(transport.diagnosticsSnapshot()[1].phase, "websocket.open")
+
+        process.push("{\"type\":\"closed\",\"accountId\":\"tenant-a\",\"reason\":\"websocket.close\"}")
+        transport.debugDrainAvailableForTest()
+        @Expect(transport.healthSnapshot().connected, false)
+        @Expect(transport.healthSnapshot().lastError.contains("websocket.close"), true)
+
+        process.exitNow()
+        transport.debugDrainAvailableForTest()
+        @Expect(transport.healthSnapshot().lastError.contains("unexpected exit"), true)
+    }
+
+    @TestCase
+    public func diagnosticRingKeepsLast64EntriesAndStopTerminatesHungProcess(): Unit {
+        let process = FeishuSidecarFakeProcess(stdout: [
+            "{\"type\":\"ready\",\"accountId\":\"tenant-a\",\"transport\":\"websocket\"}"
+        ])
+        process.waitResult = None<Int64>
+        let runner = FeishuSidecarFakeRunner(process)
+        let transport = FeishuSidecarTransport(runner: runner, options: this.options())
+        let result = transport.start(this.spec(), { _root => () })
+        @Expect(result.ok, true)
+
+        for (i in 0..70) {
+            process.push("{\"type\":\"diagnostic\",\"level\":\"info\",\"phase\":\"phase-${i}\",\"status\":\"ok\"}")
+        }
+        transport.debugDrainAvailableForTest()
+        let diagnostics = transport.diagnosticsSnapshot()
+        @Expect(diagnostics.size, 64)
+        @Expect(diagnostics[0].phase, "phase-6")
+        @Expect(transport.healthSnapshot().diagnosticRingSize, 64)
+
+        transport.stop()
+        @Expect(process.waitCalls, 1)
+        @Expect(process.terminateCalls, 1)
+        @Expect(transport.healthSnapshot().connected, false)
+    }
+
+    @TestCase
+    public func defaultRunnerFailsClosedInsteadOfReportingConnected(): Unit {
+        let transport = FeishuSidecarTransport(options: this.options())
+        let result = transport.start(this.spec(), { _root => () })
+
+        @Expect(result.ok, false)
+        @Expect(result.status, "not_configured")
+        @Expect(transport.healthSnapshot().ready, false)
+        @Expect(transport.healthSnapshot().connected, false)
+    }
+}
