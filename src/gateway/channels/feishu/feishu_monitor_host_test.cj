@@ -8,6 +8,7 @@ import std.env.{getVariable, setVariable}
 import std.fs.{Directory, File, Path, exists, remove}
 import std.time.DateTime
 import std.unittest.testmacro.*
+import stdx.encoding.json.JsonObject
 
 private func feishuMonitorHostTestRoot(label: String): Path {
     let root = Path("/tmp/metis-feishu-monitor-host-${label}-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
@@ -160,12 +161,20 @@ private func feishuMonitorHostProcessAlive(pidFile: Path): Bool {
     stdOut.trimAscii() == "alive"
 }
 
+private class FeishuMonitorHostFailingNativeTransport <: FeishuLongConnectTransport {
+    public func start(spec: FeishuLongConnectStartSpec, eventHandler: (JsonObject) -> Unit): FeishuLongConnectStartResult {
+        FeishuLongConnectStartResult(ok: false, status: "failed", error: "synthetic-native-start-error")
+    }
+
+    public func stop(): Unit {}
+}
+
 @Test
 public class FeishuMonitorHostTest {
     @TestCase
-    public func ingressHintUsesMonitorHostWording(): Unit {
+    public func ingressHintUsesNativeLongConnectWording(): Unit {
         let text = feishuMonitorHostIngressHintText()
-        @Expect(text.contains("official SDK monitor host"), true)
+        @Expect(text.contains("native long-connect transport"), true)
         @Expect(text.contains("official WebSocket"), false)
     }
 
@@ -216,9 +225,9 @@ public class FeishuMonitorHostTest {
     }
 
     @TestCase
-    public func longConnectMarksRunningOnlyAfterMonitorHostReady(): Unit {
-        withFeishuMonitorHostLogCapture("ready", { logPath =>
-            let (script, depsRoot) = createFeishuMonitorHostFixture("ready")
+    public func longConnectStartUsesNativeTransportEvenWhenMonitorHostFixtureExists(): Unit {
+        let (script, depsRoot) = createFeishuMonitorHostFixture("ready")
+        try {
             let adapter = FeishuAdapter(
                 config: feishuMonitorHostTestConfig("metis-sidecar-ready"),
                 monitorHostScriptForTest: script.toString(),
@@ -227,19 +236,13 @@ public class FeishuMonitorHostTest {
             )
             adapter.start()
             @Expect(adapter.debugIsRunningForTest(), true)
+            @Expect(adapter.debugFeishuMonitorProcessPresentForTest(), false)
             @Expect(adapter.debugFeishuMonitorLastErrorForTest(), "")
+            @Expect(adapter.debugFeishuNativeLongConnectLastErrorForTest(), "")
             adapter.stop()
-            let raw = readFeishuMonitorHostLog(logPath)
-            expectFeishuMonitorHostLogHas(raw, "sidecar.cleanup", "begin")
-            expectFeishuMonitorHostLogHas(raw, "sidecar.cleanup", "done")
-            expectFeishuMonitorHostLogHas(raw, "sidecar.launch", "begin")
-            expectFeishuMonitorHostLogHas(raw, "sidecar.launch", "started")
-            expectFeishuMonitorHostLogHas(raw, "sidecar.stdout.reader", "started")
-            expectFeishuMonitorHostLogHas(raw, "sidecar.ready", "waiting")
-            expectFeishuMonitorHostLogHas(raw, "sidecar.stop", "begin")
-            expectFeishuMonitorHostLogHas(raw, "sidecar.stop", "done")
-            expectFeishuMonitorHostLogSecretsRedacted(raw)
-        })
+        } finally {
+            try { remove(script.parent.parent, recursive: true) } catch (_e: Exception) { () }
+        }
     }
 
     @TestCase
@@ -254,55 +257,38 @@ public class FeishuMonitorHostTest {
     }
 
     @TestCase
-    public func longConnectStartErrorLeavesAdapterNotRunning(): Unit {
-        withFeishuMonitorHostLogCapture("error", { logPath =>
-            let (script, depsRoot) = createFeishuMonitorHostFixture("error")
-            let adapter = FeishuAdapter(
-                config: feishuMonitorHostTestConfig("metis-sidecar-error"),
-                monitorHostScriptForTest: script.toString(),
-                monitorHostDepsRootForTest: depsRoot.toString(),
-                monitorHostStartupTimeoutMsForTest: 800
-            )
-            adapter.start()
-            @Expect(adapter.debugIsRunningForTest(), false)
-            @Expect(adapter.debugFeishuMonitorLastErrorForTest().contains("synthetic-start-error"), true)
-            let raw = readFeishuMonitorHostLog(logPath)
-            expectFeishuMonitorHostLogHas(raw, "sidecar.launch", "begin")
-            expectFeishuMonitorHostLogHas(raw, "sidecar.launch", "started")
-            expectFeishuMonitorHostLogHas(raw, "sidecar.stdout.reader", "started")
-            expectFeishuMonitorHostLogHas(raw, "sidecar.stop", "begin")
-            expectFeishuMonitorHostLogHas(raw, "sidecar.stop", "done")
-            expectFeishuMonitorHostLogSecretsRedacted(raw)
-        })
+    public func longConnectNativeStartErrorLeavesAdapterNotRunning(): Unit {
+        let adapter = FeishuAdapter(
+            config: feishuMonitorHostTestConfig("metis-native-error"),
+            longConnectTransport: FeishuMonitorHostFailingNativeTransport()
+        )
+        adapter.start()
+        @Expect(adapter.debugIsRunningForTest(), false)
+        @Expect(adapter.debugFeishuMonitorProcessPresentForTest(), false)
+        @Expect(adapter.debugFeishuNativeLongConnectLastErrorForTest().contains("synthetic-native-start-error"), true)
     }
 
     @TestCase
-    public func longConnectHangTimesOutAndCleansSidecarProcess(): Unit {
-        withFeishuMonitorHostLogCapture("hang", { logPath =>
-            let (script, depsRoot) = createFeishuMonitorHostFixture("hang")
-            let pidFile = script.parent.parent.join("hang.pid")
-            let oldPidFile = getVariable("METIS_FEISHU_TEST_PID_FILE")
-            setVariable("METIS_FEISHU_TEST_PID_FILE", pidFile.toString())
-            try {
-                let adapter = FeishuAdapter(
-                    config: feishuMonitorHostTestConfig("metis-sidecar-hang"),
-                    monitorHostScriptForTest: script.toString(),
-                    monitorHostDepsRootForTest: depsRoot.toString(),
-                    monitorHostStartupTimeoutMsForTest: 150
-                )
-                adapter.start()
-                @Expect(adapter.debugIsRunningForTest(), false)
-                @Expect(adapter.debugFeishuMonitorLastErrorForTest(), "monitor-host-timeout")
-                @Expect(adapter.debugFeishuMonitorProcessPresentForTest(), false)
-                @Expect(feishuMonitorHostProcessAlive(pidFile), false)
-                let raw = readFeishuMonitorHostLog(logPath)
-                expectFeishuMonitorHostLogHas(raw, "sidecar.ready", "timeout")
-                expectFeishuMonitorHostLogHas(raw, "sidecar.stop", "begin")
-                expectFeishuMonitorHostLogHas(raw, "sidecar.stop", "done")
-                expectFeishuMonitorHostLogSecretsRedacted(raw)
-            } finally {
-                restoreFeishuMonitorHostEnv("METIS_FEISHU_TEST_PID_FILE", oldPidFile)
-            }
-        })
+    public func longConnectDoesNotStartLegacySidecarWhenFixtureWouldHang(): Unit {
+        let (script, depsRoot) = createFeishuMonitorHostFixture("hang")
+        let pidFile = script.parent.parent.join("hang.pid")
+        let oldPidFile = getVariable("METIS_FEISHU_TEST_PID_FILE")
+        setVariable("METIS_FEISHU_TEST_PID_FILE", pidFile.toString())
+        try {
+            let adapter = FeishuAdapter(
+                config: feishuMonitorHostTestConfig("metis-sidecar-hang"),
+                monitorHostScriptForTest: script.toString(),
+                monitorHostDepsRootForTest: depsRoot.toString(),
+                monitorHostStartupTimeoutMsForTest: 150
+            )
+            adapter.start()
+            @Expect(adapter.debugIsRunningForTest(), true)
+            @Expect(adapter.debugFeishuMonitorProcessPresentForTest(), false)
+            @Expect(feishuMonitorHostProcessAlive(pidFile), false)
+            adapter.stop()
+        } finally {
+            restoreFeishuMonitorHostEnv("METIS_FEISHU_TEST_PID_FILE", oldPidFile)
+            try { remove(script.parent.parent, recursive: true) } catch (_e: Exception) { () }
+        }
     }
 }
