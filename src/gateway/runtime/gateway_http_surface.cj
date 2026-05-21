@@ -7,7 +7,7 @@ import metis.core.config.{CliConfig, CliSettingManager, GatewayUserSettings, Met
 import metis.core.model.CliModelManager
 import metis.gateway.config.buildGatewayConfigFromUserSettings
 import metis.gateway.{gatewayMcpAppendGitCodeTools, gatewayMcpGitCodeRuntimeStatusJson, gatewayMcpIsGitCodeTool}
-import metis.gateway.core.{GatewayAgentBridgeGitCodeMcpAdapter, gatewayAgentBridgeInvokeGitCodeMcpRuntime, gatewayChannelRuntimeSnapshot}
+import metis.gateway.core.{GatewayAgentBridgeGitCodeMcpAdapter, gatewayAgentBridgeInvokeGitCodeMcpRuntime}
 import metis.gateway.model.GatewayConfig
 import metis.gateway.openclaw_http.gatewayRegisterOpenClawHttpRoutes
 import metis.gateway.protocol.{GATEWAY_ERROR_AUTH_FAILED, GATEWAY_ERROR_INVALID_CONNECT, GatewayClientInfo, GatewayConnectParams, GatewayProtocolRequest, GatewayProtocolResponse, validateGatewayConnectParams}
@@ -216,7 +216,7 @@ public func gatewayHttpReadyProbeJson(cfg: GatewayConfig): String {
 
 private func gatewayHttpReadinessSnapshot(cfg: GatewayConfig): JsonObject {
     try {
-        return gatewayHttpBuildReadinessSnapshot(cfg)
+        return gatewayBuildRuntimeReadinessSnapshot(cfg, CliSettingManager.readGatewaySettings())
     } catch (e: Exception) {
         let out = JsonObject()
         out.put("ready", false.toJsonValue())
@@ -228,28 +228,6 @@ private func gatewayHttpReadinessSnapshot(cfg: GatewayConfig): JsonObject {
         out.put("accounts", JsonArray([]))
         return out
     }
-}
-
-private func gatewayHttpBuildReadinessSnapshot(cfg: GatewayConfig): JsonObject {
-    let endpointReady = gatewayHttpAnyEndpointEnabled(cfg)
-    let channelRuntime = gatewayChannelRuntimeSnapshot()
-    let accounts = gatewayHttpProblemChannelAccounts(channelRuntime)
-    let failedCount = gatewayHttpChannelStateCount(accounts, "failed")
-    let startingCount = gatewayHttpChannelStateCount(accounts, "starting")
-    let backoffCount = gatewayHttpChannelStateCount(accounts, "backoff")
-    let degraded = accounts.size() > 0
-    let ready = endpointReady && !degraded
-    let out = JsonObject()
-    out.put("ready", ready.toJsonValue())
-    out.put("ok", ready.toJsonValue())
-    out.put("status", JsonString(if (!endpointReady) { "not-ready" } else if (degraded) { "degraded" } else { "ready" }))
-    out.put("degraded", degraded.toJsonValue())
-    out.put("reason", JsonString(if (!endpointReady) { "http-disabled" } else if (degraded) { "channel-runtime-degraded" } else { "ok" }))
-    out.put("failedCount", failedCount.toJsonValue())
-    out.put("startingCount", startingCount.toJsonValue())
-    out.put("backoffCount", backoffCount.toJsonValue())
-    out.put("accounts", accounts)
-    return out
 }
 
 private func gatewayHttpReadyBool(readiness: JsonObject): Bool {
@@ -264,33 +242,6 @@ private func gatewayHttpReadinessStatus(readiness: JsonObject): String {
         case Some(v) => try { v.asString().getValue() } catch (_e: Exception) { "not-ready" }
         case None => "not-ready"
     }
-}
-
-private func gatewayHttpProblemChannelAccounts(channelRuntime: JsonObject): JsonArray {
-    let out = JsonArray([])
-    let accounts = match (channelRuntime.get("accounts")) {
-        case Some(v) => try { v.asArray() } catch (_e: Exception) { JsonArray([]) }
-        case None => JsonArray([])
-    }
-    for (i in 0..accounts.size()) {
-        let row = try { accounts[i].asObject() } catch (_e: Exception) { JsonObject() }
-        let lifecycleState = jsonStringAt(row, "lifecycleState").trimAscii()
-        if (lifecycleState == "failed" || lifecycleState == "starting" || lifecycleState == "backoff") {
-            out.add(row)
-        }
-    }
-    return out
-}
-
-private func gatewayHttpChannelStateCount(accounts: JsonArray, state: String): Int64 {
-    var count: Int64 = 0
-    for (i in 0..accounts.size()) {
-        let row = try { accounts[i].asObject() } catch (_e: Exception) { JsonObject() }
-        if (jsonStringAt(row, "lifecycleState").trimAscii() == state) {
-            count += 1
-        }
-    }
-    count
 }
 
 public func gatewayHttpProbeMethodAllowed(method: String): Bool {

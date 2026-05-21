@@ -600,7 +600,7 @@ public class GatewayChannelManager {
                 state.connected = false
                 state.lastError = "account-not-configured"
             })
-            let runtime = gatewayChannelRuntimeMarkFailure(entry.channelId, accountId: entry.accountId, lifecycleState: "failed", error: "account-not-configured")
+            let runtime = gatewayChannelRuntimeMarkFailure(entry.channelId, accountId: entry.accountId, lifecycleState: "failed", error: "account-not-configured", errorKind: "account_not_configured")
             return this.lifecycleAccountRow(entry, false, "not-started", "account-not-configured", runtime)
         }
         if (this.liveAccountRunning(entry.channelId, entry.accountId)) {
@@ -666,7 +666,7 @@ public class GatewayChannelManager {
                 state.connected = false
                 state.lastError = reason
             })
-            let runtime = gatewayChannelRuntimeMarkFailure(entry.channelId, accountId: entry.accountId, lifecycleState: "failed", error: reason)
+            let runtime = gatewayChannelRuntimeMarkFailure(entry.channelId, accountId: entry.accountId, lifecycleState: "failed", error: reason, errorKind: "start_failed")
             gatewayLogEventError(
                 "gateway/channel/${entry.channelId}",
                 "channel.failed",
@@ -717,7 +717,7 @@ public class GatewayChannelManager {
                 state.connected = false
                 state.lastError = safeReason
             })
-            let runtime = gatewayChannelRuntimeMarkFailure(entry.channelId, accountId: entry.accountId, lifecycleState: "failed", error: safeReason)
+            let runtime = gatewayChannelRuntimeMarkFailure(entry.channelId, accountId: entry.accountId, lifecycleState: "failed", error: safeReason, errorKind: "stop_failed")
             gatewayLogEventError(
                 "gateway/channel/${entry.channelId}",
                 "channel.failed",
@@ -1139,7 +1139,7 @@ public class GatewayChannelManager {
                 state.connected = false
                 state.lastError = safeError
             })
-            gatewayChannelRuntimeMarkFailure(entry.channelId, accountId: entry.accountId, lifecycleState: "failed", error: safeError)
+            gatewayChannelRuntimeMarkFailure(entry.channelId, accountId: entry.accountId, lifecycleState: "failed", error: safeError, errorKind: if (timedOut) { "start_timeout" } else { "start_failed" })
             gatewayLogEventError(
                 "gateway/channel/${entry.channelId}",
                 "channel.failed",
@@ -1293,7 +1293,7 @@ public class GatewayChannelManager {
                     state.connected = false
                     state.lastError = e.message.trimAscii()
                 })
-                gatewayChannelRuntimeMarkFailure(entry.channelId, accountId: entry.accountId, lifecycleState: "failed", error: e.message)
+                gatewayChannelRuntimeMarkFailure(entry.channelId, accountId: entry.accountId, lifecycleState: "failed", error: e.message, errorKind: "stop_failed")
                 gatewayLogEventError(
                     "gateway/channel/${entry.channelId}",
                     "channel.failed",
@@ -1424,7 +1424,7 @@ public class GatewayChannelManager {
                     state.connected = false
                     state.lastError = e.message.trimAscii()
                 })
-                gatewayChannelRuntimeMarkFailure(entry.channelId, accountId: entry.accountId, lifecycleState: "backoff", error: e.message, backoffMs: 1000)
+                gatewayChannelRuntimeMarkFailure(entry.channelId, accountId: entry.accountId, lifecycleState: "backoff", error: e.message, errorKind: "pull_failed", backoffMs: 1000)
                 gatewayLogEventError(
                     "gateway/channel/${entry.channelId}",
                     "channel.failed",

@@ -80,7 +80,7 @@ public class GatewayHttpSurfaceTest {
             let readyz = JsonValue.fromStr(gatewayHttpReadyProbeJson(cfg)).asObject()
             @Expect(readyz.get("ready").isSome(), true)
             @Expect(readyz.get("ok").isSome(), true)
-            @Expect(readyz.get("status").getOrThrow().asString().getValue(), "ready")
+            @Expect(readyz.get("status").getOrThrow().asString().getValue(), "not-ready")
             @Expect(readyz.get("gateway").isSome(), true)
         })
     }

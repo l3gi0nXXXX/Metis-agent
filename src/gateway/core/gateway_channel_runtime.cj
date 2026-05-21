@@ -190,6 +190,7 @@ private func channelRuntimeCloneRow(row: JsonObject): JsonObject {
     out.put("configured", channelRuntimeReadBool(row, "configured", true).toJsonValue())
     out.put("healthMonitorEnabled", channelRuntimeReadBool(row, "healthMonitorEnabled", true).toJsonValue())
     out.put("running", channelRuntimeReadBool(row, "running", false).toJsonValue())
+    out.put("connected", channelRuntimeReadBool(row, "connected", false).toJsonValue())
     out.put("lifecycleState", JsonString(channelRuntimeReadString(row, "lifecycleState", "registered")))
     out.put("phase", JsonString(channelRuntimeReadString(row, "phase", "registered")))
     out.put("manualStop", channelRuntimeReadBool(row, "manualStop", false).toJsonValue())
@@ -208,6 +209,7 @@ private func channelRuntimeCloneRow(row: JsonObject): JsonObject {
     out.put("lastEventAtMs", channelRuntimeReadInt(row, "lastEventAtMs", 0).toJsonValue())
     out.put("lastSendAtMs", channelRuntimeReadInt(row, "lastSendAtMs", 0).toJsonValue())
     out.put("lastError", JsonString(channelRuntimeRedactSecretText(channelRuntimeReadString(row, "lastError", ""))))
+    out.put("errorKind", JsonString(channelRuntimeReadString(row, "errorKind", "")))
     out.put("backoffMs", channelRuntimeReadInt(row, "backoffMs", 0).toJsonValue())
     out.put("nextRestartAtMs", channelRuntimeReadInt(row, "nextRestartAtMs", 0).toJsonValue())
     out.put("configuredBinding", channelRuntimeReadBool(row, "configuredBinding", false).toJsonValue())
@@ -298,6 +300,7 @@ public func gatewayChannelRuntimeRegisterAccount(
         out.put("configured", configured.toJsonValue())
         out.put("healthMonitorEnabled", healthMonitorEnabled.toJsonValue())
         out.put("running", row.get("running") ?? false.toJsonValue())
+        out.put("connected", row.get("connected") ?? false.toJsonValue())
         out.put("lifecycleState", row.get("lifecycleState") ?? JsonString("registered"))
         out.put("phase", row.get("phase") ?? JsonString("registered"))
         out.put("manualStop", row.get("manualStop") ?? false.toJsonValue())
@@ -316,6 +319,7 @@ public func gatewayChannelRuntimeRegisterAccount(
         out.put("lastEventAtMs", row.get("lastEventAtMs") ?? 0.toJsonValue())
         out.put("lastSendAtMs", row.get("lastSendAtMs") ?? 0.toJsonValue())
         out.put("lastError", row.get("lastError") ?? JsonString(""))
+        out.put("errorKind", row.get("errorKind") ?? JsonString(""))
         out.put("backoffMs", row.get("backoffMs") ?? 0.toJsonValue())
         out.put("nextRestartAtMs", row.get("nextRestartAtMs") ?? 0.toJsonValue())
         out.put("configuredBinding", row.get("configuredBinding") ?? false.toJsonValue())
@@ -409,6 +413,7 @@ private func gatewayChannelRuntimeNewBaseAccountRow(
     base.put("configured", true.toJsonValue())
     base.put("healthMonitorEnabled", true.toJsonValue())
     base.put("running", false.toJsonValue())
+    base.put("connected", false.toJsonValue())
     base.put("lifecycleState", JsonString("registered"))
     base.put("phase", JsonString("registered"))
     base.put("manualStop", false.toJsonValue())
@@ -427,6 +432,7 @@ private func gatewayChannelRuntimeNewBaseAccountRow(
     base.put("lastEventAtMs", 0.toJsonValue())
     base.put("lastSendAtMs", 0.toJsonValue())
     base.put("lastError", JsonString(""))
+    base.put("errorKind", JsonString(""))
     base.put("backoffMs", 0.toJsonValue())
     base.put("nextRestartAtMs", 0.toJsonValue())
     base.put("configuredBinding", false.toJsonValue())
@@ -515,6 +521,7 @@ public func gatewayChannelRuntimeMarkStarting(channelId: String, accountId!: Str
         let history = match (row.get("history")) { case Some(v) => try { v.asArray() } catch (_e: Exception) { JsonArray([]) } case None => JsonArray([]) }
         let now = gatewayChannelRuntimeNowMs()
         out.put("running", false.toJsonValue())
+        out.put("connected", false.toJsonValue())
         out.put("lifecycleState", JsonString("starting"))
         out.put("phase", JsonString("starting"))
         out.put("manualStop", false.toJsonValue())
@@ -533,9 +540,11 @@ public func gatewayChannelRuntimeMarkRunning(channelId: String, accountId!: Stri
         let out = channelRuntimeCloneRow(row)
         let history = match (row.get("history")) { case Some(v) => try { v.asArray() } catch (_e: Exception) { JsonArray([]) } case None => JsonArray([]) }
         out.put("running", true.toJsonValue())
+        out.put("connected", true.toJsonValue())
         out.put("lifecycleState", JsonString("running"))
         out.put("phase", JsonString("active"))
         out.put("manualStop", false.toJsonValue())
+        out.put("errorKind", JsonString(""))
         out.put("backoffMs", 0.toJsonValue())
         out.put("nextRestartAtMs", 0.toJsonValue())
         out.put("taskState", JsonString("running"))
@@ -552,6 +561,7 @@ public func gatewayChannelRuntimeMarkStopped(channelId: String, accountId!: Stri
         let history = match (row.get("history")) { case Some(v) => try { v.asArray() } catch (_e: Exception) { JsonArray([]) } case None => JsonArray([]) }
         let now = gatewayChannelRuntimeNowMs()
         out.put("running", false.toJsonValue())
+        out.put("connected", false.toJsonValue())
         out.put("lifecycleState", JsonString("stopped"))
         out.put("phase", JsonString("idle"))
         out.put("manualStop", manualStop.toJsonValue())
@@ -562,6 +572,7 @@ public func gatewayChannelRuntimeMarkStopped(channelId: String, accountId!: Stri
         if (!reason.trimAscii().isEmpty()) {
             out.put("lastError", JsonString(reason.trimAscii()))
         }
+        out.put("errorKind", JsonString(if (manualStop) { "" } else if (reason.trimAscii().isEmpty()) { "" } else { "stopped" }))
         out.put("history", channelRuntimeAppendHistory(history, "stopped", if (reason.trimAscii().isEmpty()) { "adapter-stopped" } else { reason.trimAscii() }))
         out
     })
@@ -572,6 +583,7 @@ public func gatewayChannelRuntimeMarkFailure(
     accountId!: String = "default",
     lifecycleState!: String = "failed",
     error!: String = "",
+    errorKind!: String = "",
     backoffMs!: Int64 = 0
 ): JsonObject {
     channelRuntimeUpsertAccount(channelId, accountId, { row =>
@@ -582,12 +594,14 @@ public func gatewayChannelRuntimeMarkFailure(
         let now = gatewayChannelRuntimeNowMs()
         let state = lifecycleState.trimAscii()
         out.put("running", false.toJsonValue())
+        out.put("connected", false.toJsonValue())
         out.put("lifecycleState", JsonString(state))
         out.put("phase", JsonString(channelRuntimePhase(state, false)))
         out.put("failureCount", failureCount.toJsonValue())
         out.put("restartCount", restartCount.toJsonValue())
         out.put("lastStopAtMs", now.toJsonValue())
         out.put("lastError", JsonString(error.trimAscii()))
+        out.put("errorKind", JsonString(errorKind.trimAscii()))
         out.put("backoffMs", backoffMs.toJsonValue())
         out.put("nextRestartAtMs", if (backoffMs > 0) { (now + backoffMs).toJsonValue() } else { 0.toJsonValue() })
         out.put("taskState", JsonString(if (state == "backoff") { "recovering" } else { "failed" }))
