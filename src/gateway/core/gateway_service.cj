@@ -36,10 +36,11 @@ public class GatewayService {
 
     public init(
         router: GatewayRouter,
-        transcriptPublisher!: Option<(GatewaySessionContext, Int64, String, String) -> Unit> = None<(GatewaySessionContext, Int64, String, String) -> Unit>
+        transcriptPublisher!: Option<(GatewaySessionContext, Int64, String, String) -> Unit> = None<(GatewaySessionContext, Int64, String, String) -> Unit>,
+        channelStartupAccountTimeoutMs!: Int64 = 3000
     ) {
         this.router = router
-        this.channelManager = GatewayChannelManager()
+        this.channelManager = GatewayChannelManager(startupAccountTimeoutMs: channelStartupAccountTimeoutMs)
         this.transcriptPublisher = transcriptPublisher
     }
 
