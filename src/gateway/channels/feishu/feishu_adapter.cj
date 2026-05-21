@@ -367,9 +367,11 @@ public class FeishuAdapter <: ChannelAdapter {
     private var feishuMonitorStdoutFuture: Option<Future<Unit>> = None
     private var feishuMonitorReady: Bool = false
     private var feishuMonitorLastError: String = ""
+    private var feishuNativeLongConnectLastError: String = ""
     private let monitorHostScriptForTest: String
     private let monitorHostDepsRootForTest: String
     private let monitorHostStartupTimeoutMsForTest: Int64
+    private let longConnectTransport: FeishuLongConnectTransport
     private let accountId: String
     private let chatQueue = FeishuChatQueue()
     private let apiClient: FeishuApiClient
@@ -383,7 +385,8 @@ public class FeishuAdapter <: ChannelAdapter {
         pairingRoot!: Path = CliConfig.dotDir,
         monitorHostScriptForTest!: String = "",
         monitorHostDepsRootForTest!: String = "",
-        monitorHostStartupTimeoutMsForTest!: Int64 = 0
+        monitorHostStartupTimeoutMsForTest!: Int64 = 0,
+        longConnectTransport!: FeishuLongConnectTransport = FeishuNativeLongConnectTransport()
     ) {
         let trimmedAccountId = accountId.trimAscii()
         let requestedAccountId = if (trimmedAccountId.isEmpty()) { config.accountId } else { trimmedAccountId }
@@ -396,6 +399,7 @@ public class FeishuAdapter <: ChannelAdapter {
         this.monitorHostScriptForTest = monitorHostScriptForTest.trimAscii()
         this.monitorHostDepsRootForTest = monitorHostDepsRootForTest.trimAscii()
         this.monitorHostStartupTimeoutMsForTest = monitorHostStartupTimeoutMsForTest
+        this.longConnectTransport = longConnectTransport
         feishuInstallGatewayNativeAuthRunner()
     }
 
@@ -421,6 +425,10 @@ public class FeishuAdapter <: ChannelAdapter {
 
     public func debugFeishuMonitorLastErrorForTest(): String {
         this.feishuOfficialSdkMonitorError()
+    }
+
+    public func debugFeishuNativeLongConnectLastErrorForTest(): String {
+        this.feishuNativeLongConnectLastError
     }
 
     public func debugFeishuMonitorProcessPresentForTest(): Bool {
@@ -574,7 +582,7 @@ public class FeishuAdapter <: ChannelAdapter {
             this.logChannel(
                 "warn",
                 MetisLogEvent.channelFailed,
-                "sidecar",
+                "long_connect",
                 "failed",
                 "Feishu long connection credentials are required",
                 errorKind: "credential",
@@ -584,36 +592,37 @@ public class FeishuAdapter <: ChannelAdapter {
             this.running = true
             return
         }
-        if (!this.feishuOfficialSdkMonitorHostEnabled()) {
+        let startResult = this.longConnectTransport.start(
+            FeishuLongConnectStartSpec(
+                accountId: this.accountId,
+                appId: this.config.appId,
+                appSecret: this.config.appSecret,
+                domain: this.config.domain,
+                verificationToken: this.config.verificationToken,
+                encryptKey: this.config.encryptKey
+            ),
+            { root => this.handleFeishuNativeLongConnectEventRoot(root) }
+        )
+        if (!startResult.ok) {
+            let detail = if (startResult.error.trimAscii().isEmpty()) { startResult.status } else { startResult.error }
+            this.feishuNativeLongConnectLastError = detail
             this.logChannel(
                 "warn",
                 MetisLogEvent.channelFailed,
-                "sidecar",
+                "long_connect",
                 "failed",
-                "Feishu official SDK monitor host is required",
-                errorKind: "sidecar",
-                error: "official SDK monitor host is not enabled",
-                accountId: this.accountId
-            )
-            return
-        }
-        if (!this.startFeishuOfficialSdkMonitorHost()) {
-            let detail = this.feishuOfficialSdkMonitorError()
-            this.logChannel(
-                "warn",
-                MetisLogEvent.channelFailed,
-                "sidecar",
-                "failed",
-                "Feishu official SDK monitor host failed to start",
+                "Feishu native long-connect transport failed to start",
                 errorKind: this.feishuErrorKind(detail),
                 error: detail,
                 accountId: this.accountId
             )
             return
         }
+        this.feishuNativeLongConnectLastError = ""
         this.running = true
         let startMeta = JsonObject()
         startMeta.put("mode", JsonString(this.config.receiveMode))
+        startMeta.put("transport", JsonString("native_long_connect"))
         this.logChannel("info", MetisLogEvent.channelStarted, "start", "started", "Feishu adapter started", accountId: this.accountId, extra: startMeta)
     }
 
@@ -642,6 +651,7 @@ public class FeishuAdapter <: ChannelAdapter {
 
     public func stop(): Unit {
         this.running = false
+        this.longConnectTransport.stop()
         this.stopFeishuOfficialSdkMonitorHost()
         if (let Some(server) <- this.webhookServer) {
             try {
@@ -877,6 +887,26 @@ public class FeishuAdapter <: ChannelAdapter {
         return this.feishuDispatchEventRoot(root)
     }
 
+    private func handleFeishuNativeLongConnectEventRoot(root: JsonObject): Unit {
+        let encrypted = this.readStringField(root, "encrypt").trimAscii()
+        if (!encrypted.isEmpty()) {
+            let decrypt = feishuDecryptEncryptedEventPayload(encryptKey: this.config.encryptKey, encryptedPayload: encrypted)
+            this.feishuNativeLongConnectLastError = decrypt.error
+            this.logChannel(
+                "warn",
+                MetisLogEvent.channelFailed,
+                "long_connect",
+                "failed",
+                "Feishu native long-connect encrypted event is unsupported",
+                errorKind: "validation",
+                error: decrypt.error,
+                accountId: this.accountId
+            )
+            return
+        }
+        let _ = this.feishuDispatchEventRoot(root)
+    }
+
     /**
      * 处理飞书事件 JSON（Webhook 与长连接共用）：入队 im.message.receive_v1 文本消息。
      */
@@ -917,7 +947,8 @@ public class FeishuAdapter <: ChannelAdapter {
         }
         if (headerEventType == "drive.file.comment.created_v1" ||
             headerEventType == "drive.file.comment.updated_v1" ||
-            headerEventType == "drive.file.comment.deleted_v1") {
+            headerEventType == "drive.file.comment.deleted_v1" ||
+            headerEventType == "drive.notice.comment_add_v1") {
             if (let Some(inbound) <- this.mapDriveCommentEventToInbound(root)) {
                 if (!this.tryRecordFeishuEvent(inbound.accountId, inbound.messageId)) {
                     return this.feishuIgnoredResponse("duplicate_event", eventType: headerEventType)
@@ -941,7 +972,9 @@ public class FeishuAdapter <: ChannelAdapter {
             }
             return this.feishuIgnoredResponse("malformed_event", eventType: headerEventType)
         }
-        if (headerEventType == "vc.meeting.invited_v1" || headerEventType == "vc.meeting.meeting_invited_v1") {
+        if (headerEventType == "vc.meeting.invited_v1" ||
+            headerEventType == "vc.meeting.meeting_invited_v1" ||
+            headerEventType == "vc.bot.meeting_invited_v1") {
             if (let Some(inbound) <- this.mapVcInvitedEventToInbound(root)) {
                 if (!this.tryRecordFeishuEvent(inbound.accountId, inbound.messageId)) {
                     return this.feishuIgnoredResponse("duplicate_event", eventType: headerEventType)
@@ -4270,59 +4303,28 @@ public class FeishuAdapter <: ChannelAdapter {
         }
     }
 
-    /**
-     * 签名/时效校验（P1.5）。
-     *
-     * 已实现：
-     * - 时间戳头存在并在允许窗口内；
-     * - 可选要求签名头存在；
-     * - 可选要求 payload.token 与配置 token 一致。
-     */
+    /** Feishu webhook timestamp/token/signature validation. */
     private func validateWebhookPayload(headers: HttpHeaders, payload: String): Bool {
         let timestamp = headers.getFirst("X-Lark-Request-Timestamp") ??
             headers.getFirst("x-lark-request-timestamp") ??
             ""
-        if (timestamp.isEmpty()) {
-            return false
-        }
-        let ts = try {
-            Int64.parse(timestamp)
-        } catch (_e: Exception) {
-            return false
-        }
-
-        let nowSec = DateTime.now().toUnixTimeStamp().toSeconds()
-        let diff = if (nowSec >= ts) { nowSec - ts } else { ts - nowSec }
-        if (diff > this.config.requestMaxSkewSeconds) {
-            return false
-        }
-
-        if (this.config.requireSignatureHeaders) {
-            let signature = headers.getFirst("X-Lark-Signature") ??
-                headers.getFirst("x-lark-signature") ??
-                ""
-            if (signature.isEmpty()) {
-                return false
-            }
-        }
-
-        if (this.config.verificationToken.isEmpty()) {
-            return true
-        }
-        return this.verifyTokenFromPayload(payload)
-    }
-
-    private func verifyTokenFromPayload(payload: String): Bool {
-        if (payload.isEmpty()) {
-            return false
-        }
-        return try {
-            let jo = JsonValue.fromStr(payload).asObject()
-            let token = this.readStringField(jo, "token")
-            token == this.config.verificationToken
-        } catch (_e: Exception) {
-            false
-        }
+        let nonce = headers.getFirst("X-Lark-Request-Nonce") ??
+            headers.getFirst("x-lark-request-nonce") ??
+            ""
+        let signature = headers.getFirst("X-Lark-Signature") ??
+            headers.getFirst("x-lark-signature") ??
+            ""
+        let result = feishuValidateEventSecurity(
+            timestamp: timestamp,
+            nonce: nonce,
+            signature: signature,
+            payload: payload,
+            verificationToken: this.config.verificationToken,
+            encryptKey: this.config.encryptKey,
+            requireSignature: this.config.requireSignatureHeaders,
+            maxSkewSeconds: this.config.requestMaxSkewSeconds
+        )
+        result.ok
     }
 
     private func normalizeFeishuDomain(): String {
@@ -4390,7 +4392,7 @@ public class FeishuAdapter <: ChannelAdapter {
 }
 
 public func feishuMonitorHostIngressHintText(): String {
-    "Feishu long_connect: using official SDK monitor host. Ensure app subscribes im.message.receive_v1 and console uses 长连接."
+    "Feishu long_connect: using native long-connect transport. Ensure app subscribes im.message.receive_v1 and console uses 长连接."
 }
 
 public func feishuMonitorHostStopFrame(): String {
