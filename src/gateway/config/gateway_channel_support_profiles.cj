@@ -20,6 +20,8 @@ private func gatewayBuiltinChannelSupportsJson(user: GatewayUserSettings, channe
     out.put("conversationBinding", JsonBool(true))
     out.put("messageReply", JsonBool(true))
     if (normalized == "feishu") {
+        let cfg = buildGatewayConfigFromUserSettings(user).feishu
+        let activeTransport = if (cfg.receiveMode == "webhook") { "webhook" } else { cfg.transportMode }
         let threadReplyEnabled = user.feishu.replyInThread.trimAscii().toAsciiLower() == "enabled"
         out.put("threadReply", JsonBool(true))
         out.put("quoteReply", JsonBool(true))
@@ -27,12 +29,15 @@ private func gatewayBuiltinChannelSupportsJson(user: GatewayUserSettings, channe
         out.put("multiAccount", JsonBool(false))
         out.put("webhookIngress", JsonBool(true))
         out.put("streamIngress", JsonBool(true))
-        out.put("nativeLongConnect", JsonBool(true))
+        out.put("sidecarLongConnect", JsonBool(cfg.receiveMode == "long_connect" && cfg.transportMode == "openclaw-sidecar"))
+        out.put("nativeLongConnect", JsonBool(cfg.receiveMode == "long_connect" && cfg.transportMode == "native-legacy"))
         out.put("officialGateway", JsonBool(false))
         out.put("mentionRouting", JsonBool(true))
-        out.put("activeMode", JsonString(user.feishu.receiveMode))
+        out.put("activeMode", JsonString(cfg.receiveMode))
+        out.put("transportMode", JsonString(cfg.transportMode))
         out.put("replyInThreadDefault", JsonBool(threadReplyEnabled))
-        out.put("transport", JsonString(if (user.feishu.receiveMode == "long_connect") { "native-long-connect" } else { "webhook" }))
+        out.put("transport", JsonString(activeTransport))
+        out.put("nativeLegacyFullCapabilityRoute", JsonBool(false))
         return out
     }
     if (normalized == "qq") {

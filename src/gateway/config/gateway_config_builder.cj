@@ -257,8 +257,10 @@ private func buildGatewayWebchatConfig(user: GatewayWebchatUserSettings): Gatewa
 }
 
 private func mergeFeishu(fs: FeishuUserSettings): FeishuConfig {
-    let receiveModeRaw = fs.receiveMode.toAsciiLower()
+    let receiveModeRaw = fs.receiveMode.trimAscii().toAsciiLower()
     let receiveMode = if (receiveModeRaw == "webhook") { "webhook" } else { "long_connect" }
+    let transportModeRaw = fs.transportMode.trimAscii().toAsciiLower()
+    let transportMode = if (transportModeRaw == "native-legacy") { "native-legacy" } else { "openclaw-sidecar" }
     let groupSessionScopeRaw = fs.groupSessionScope.toAsciiLower()
     let groupSessionScope = if (
         groupSessionScopeRaw == "group_sender" ||
@@ -293,6 +295,7 @@ private func mergeFeishu(fs: FeishuUserSettings): FeishuConfig {
         appSecret: fs.appSecret,
         accounts: fs.accounts,
         receiveMode: receiveMode,
+        transportMode: transportMode,
         domain: fs.domain,
         botOpenId: fs.botOpenId,
         webhookHost: fs.webhookHost,

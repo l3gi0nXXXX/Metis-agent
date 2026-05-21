@@ -296,8 +296,10 @@ public class GatewayServerMethodsChannelsTest {
         @Expect(channelsTestBool(feishu, "messageReply"), true)
         @Expect(channelsTestBool(feishu, "threadReply"), true)
         @Expect(channelsTestBool(feishu, "replyInThreadDefault"), true)
-        @Expect(channelsTestBool(feishu, "nativeLongConnect"), true)
-        @Expect(channelsTestString(feishu, "transport"), "native-long-connect")
+        @Expect(channelsTestBool(feishu, "sidecarLongConnect"), true)
+        @Expect(channelsTestBool(feishu, "nativeLongConnect"), false)
+        @Expect(channelsTestString(feishu, "transportMode"), "openclaw-sidecar")
+        @Expect(channelsTestString(feishu, "transport"), "openclaw-sidecar")
 
         @Expect(channelsTestBool(qq, "messageReply"), true)
         @Expect(channelsTestBool(qq, "threadReply"), false)
@@ -364,8 +366,10 @@ public class GatewayServerMethodsChannelsTest {
         let feishuMeta = meta.get("feishu").getOrThrow().asObject()
         let metaSupports = feishuMeta.get("supports").getOrThrow().asObject()
         @Expect(channelsTestBool(metaSupports, "threadReply"), true)
-        @Expect(channelsTestBool(metaSupports, "nativeLongConnect"), true)
-        @Expect(channelsTestString(metaSupports, "transport"), "native-long-connect")
+        @Expect(channelsTestBool(metaSupports, "sidecarLongConnect"), true)
+        @Expect(channelsTestBool(metaSupports, "nativeLongConnect"), false)
+        @Expect(channelsTestString(metaSupports, "transportMode"), "openclaw-sidecar")
+        @Expect(channelsTestString(metaSupports, "transport"), "openclaw-sidecar")
         let telegramMeta = meta.get("telegram").getOrThrow().asObject()
         let telegramSupports = telegramMeta.get("supports").getOrThrow().asObject()
         @Expect(channelsTestBool(telegramSupports, "reactionEvents"), true)
@@ -1037,6 +1041,10 @@ public class GatewayServerMethodsChannelsTest {
         @Expect(account.toJsonString().contains("tenant-secret-never-visible"), false)
         let receiveMode = diagnostics.get("receiveMode").getOrThrow().asObject()
         @Expect(channelsTestString(receiveMode, "mode"), "webhook")
+        let transportMode = diagnostics.get("transportMode").getOrThrow().asObject()
+        @Expect(channelsTestString(transportMode, "mode"), "openclaw-sidecar")
+        @Expect(channelsTestString(transportMode, "effectiveRuntime"), "webhook")
+        @Expect(channelsTestString(transportMode, "nativeLegacyStatus"), "explicit_opt_in_only")
         let groupPolicy = diagnostics.get("groupPolicy").getOrThrow().asObject()
         @Expect(channelsTestString(groupPolicy, "mode"), "allowlist")
         @Expect(channelsTestBool(groupPolicy, "requireMention"), false)
@@ -1056,6 +1064,62 @@ public class GatewayServerMethodsChannelsTest {
         @Expect(raw.contains("accounts.tenant-a.groups.oc_team.respondToMentionAll"), true)
         @Expect(raw.contains("legacy-secret-never-visible"), false)
         @Expect(raw.contains("tenant-secret-never-visible"), false)
+    }
+
+    @TestCase
+    public func feishuTransportDiagnosticsExposeSidecarDefaultAndNativeLegacyFreeze(): Unit {
+        var user = GatewayUserSettings()
+        user.feishu.enabled = true
+        user.feishu.appId = "app"
+        user.feishu.appSecret = "secret-never-visible"
+
+        let defaultChannel = gatewayChannelGetJson(user, "feishu")
+        let defaultTransport = defaultChannel.get("diagnostics").getOrThrow().asObject()
+            .get("transportMode").getOrThrow().asObject()
+        @Expect(channelsTestString(defaultTransport, "mode"), "openclaw-sidecar")
+        @Expect(channelsTestString(defaultTransport, "effectiveRuntime"), "openclaw-sidecar")
+        @Expect(channelsTestString(defaultTransport, "capabilityRoute"), "sidecar_primary")
+
+        user.feishu.transportMode = "native-legacy"
+        let nativeChannel = gatewayChannelGetJson(user, "feishu")
+        let nativeTransport = nativeChannel.get("diagnostics").getOrThrow().asObject()
+            .get("transportMode").getOrThrow().asObject()
+        @Expect(channelsTestString(nativeTransport, "mode"), "native-legacy")
+        @Expect(channelsTestString(nativeTransport, "effectiveRuntime"), "native-legacy")
+        @Expect(channelsTestString(nativeTransport, "capabilityRoute"), "legacy_frozen_not_full_capability")
+
+        let supports = nativeChannel.get("supports").getOrThrow().asObject()
+        @Expect(channelsTestBool(supports, "nativeLongConnect"), true)
+        @Expect(channelsTestBool(supports, "sidecarLongConnect"), false)
+        @Expect(channelsTestString(supports, "transport"), "native-legacy")
+    }
+
+    @TestCase
+    public func feishuTransportModeDoesNotChangeRouteOrSessionOwnershipDiagnostics(): Unit {
+        var user = GatewayUserSettings()
+        user.feishu.enabled = true
+        user.feishu.appId = "app"
+        user.feishu.appSecret = "secret-never-visible"
+        user.feishu.threadSession = true
+
+        let sidecarRoute = gatewayChannelGetJson(user, "feishu")
+            .get("diagnostics").getOrThrow().asObject()
+            .get("account").getOrThrow().asObject()
+            .get("accounts").getOrThrow().asArray()[0].asObject()
+            .get("routeDiagnostic").getOrThrow().asObject()
+
+        user.feishu.transportMode = "native-legacy"
+        let nativeRoute = gatewayChannelGetJson(user, "feishu")
+            .get("diagnostics").getOrThrow().asObject()
+            .get("account").getOrThrow().asObject()
+            .get("accounts").getOrThrow().asArray()[0].asObject()
+            .get("routeDiagnostic").getOrThrow().asObject()
+
+        @Expect(channelsTestString(sidecarRoute, "channel"), "feishu")
+        @Expect(channelsTestString(nativeRoute, "channel"), "feishu")
+        @Expect(channelsTestString(sidecarRoute, "bindingMatchAccountId"), channelsTestString(nativeRoute, "bindingMatchAccountId"))
+        @Expect(channelsTestString(sidecarRoute, "sessionKeyBoundary"), "account_peer_thread")
+        @Expect(channelsTestString(nativeRoute, "sessionKeyBoundary"), "account_peer_thread")
     }
 
     @TestCase
@@ -1237,6 +1301,44 @@ public class GatewayServerMethodsChannelsTest {
             @Expect(raw.contains("missing-secret-never-visible"), false)
             @Expect(raw.contains("duplicate-secret-never-visible"), false)
             @Expect(raw.contains("cli_writer_app"), false)
+        }
+    }
+
+    @TestCase
+    public func feishuConnectedWithoutInboundShowsDiagnosticAgeAndLastInboundAt(): Unit {
+        withGatewayChannelsTestHome {
+            var user = GatewayUserSettings()
+            user.feishu.enabled = true
+            user.feishu.defaultAccount = "tenant-a"
+            let tenant = JsonObject()
+            tenant.put("appId", JsonString("cli_sidecar_app"))
+            tenant.put("appSecret", JsonString("sidecar-secret-never-visible"))
+            let accounts = JsonObject()
+            accounts.put("tenant-a", tenant)
+            user.feishu.accounts = Some(accounts)
+
+            gatewayChannelRuntimeRegisterAccount("feishu", accountId: "tenant-a")
+            gatewayChannelRuntimeMarkRunning("feishu", accountId: "tenant-a")
+            gatewayChannelRuntimeMarkMonitorTick("feishu", accountId: "tenant-a")
+
+            let params = JsonObject()
+            params.put("channelId", JsonString("feishu"))
+            let result = handleGatewayChannelsFamily(
+                "channels.audit",
+                user,
+                request: Some(GatewayRpcRequest("channels.audit", params: params))
+            ).getOrThrow().result.asObject()
+            let ownership = result.get("audit").getOrThrow().asObject()
+                .get("feishuDiagnostics").getOrThrow().asObject()
+                .get("eventOwnership").getOrThrow().asObject()
+            let row = channelsRowByStringField(ownership.get("accounts").getOrThrow().asArray(), "accountId", "tenant-a")
+
+            @Expect(channelsTestString(row, "status"), "no_event")
+            @Expect(row.get("lastDiagnosticAge").isSome(), true)
+            @Expect(row.get("lastDiagnosticAgeMs").isSome(), true)
+            @Expect(row.get("lastInboundAt").isSome(), true)
+            @Expect(channelsTestString(row, "lastInboundAt"), "never")
+            @Expect(row.toJsonString().contains("sidecar-secret-never-visible"), false)
         }
     }
 

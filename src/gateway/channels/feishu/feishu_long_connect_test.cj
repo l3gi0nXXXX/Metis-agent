@@ -2,6 +2,8 @@ package metis.gateway.channels.feishu
 
 import metis.gateway.model.FeishuConfig
 import std.collection.ArrayList
+import std.fs.{Directory, Path, exists, remove}
+import std.time.DateTime
 import std.unittest.testmacro.*
 import stdx.encoding.json.{JsonBool, JsonObject, JsonString}
 
@@ -127,18 +129,59 @@ public class FeishuLongConnectTest {
     }
 
     private func messageReceiveRoot(): JsonObject {
+        this.sidecarMessageRoot("om_native", "text", "{\"text\":\"@bot native hello\"}", chatId: "oc_native")
+    }
+
+    private func sidecarMessageRoot(
+        messageId: String,
+        messageType: String,
+        content: String,
+        accountId!: String = "tenant-a",
+        chatId!: String = "oc_sidecar"
+    ): JsonObject {
         let sender = JsonObject()
         sender.put("sender_id", this.idObject("ou_sender"))
         let message = JsonObject()
-        message.put("message_id", JsonString("om_native"))
-        message.put("chat_id", JsonString("oc_native"))
+        message.put("message_id", JsonString(messageId))
+        message.put("chat_id", JsonString(chatId))
         message.put("chat_type", JsonString("group"))
-        message.put("message_type", JsonString("text"))
-        message.put("content", JsonString("{\"text\":\"@bot native hello\"}"))
+        message.put("message_type", JsonString(messageType))
+        message.put("content", JsonString(content))
         let event = JsonObject()
         event.put("sender", sender)
         event.put("message", message)
-        this.eventRoot("im.message.receive_v1", event)
+        this.eventRoot("im.message.receive_v1", event, accountId: accountId)
+    }
+
+    private func botMenuRoot(): JsonObject {
+        let event = JsonObject()
+        event.put("event_key", JsonString("metis.status"))
+        event.put("chat_id", JsonString("oc_menu_native"))
+        event.put("operator_id", this.idObject("ou_menu_operator"))
+        this.eventRoot("application.bot.menu_v6", event)
+    }
+
+    private func bitableFieldChangedRoot(): JsonObject {
+        let event = JsonObject()
+        event.put("app_token", JsonString("bascn_native"))
+        event.put("table_id", JsonString("tbl_native"))
+        event.put("field_id", JsonString("fld_native"))
+        event.put("operator_id", this.idObject("ou_bitable_editor"))
+        this.eventRoot("bitable.field.changed_v1", event)
+    }
+
+    private func sidecarDiagnosticRoot(error: String): JsonObject {
+        let diagnostic = JsonObject()
+        diagnostic.put("status", JsonString("failed"))
+        diagnostic.put("phase", JsonString("background"))
+        diagnostic.put("error", JsonString(error))
+        let root = this.eventRoot("metis.feishu.sidecar.diagnostic", JsonObject())
+        root.put("sidecar", diagnostic)
+        root
+    }
+
+    private func tempRoot(label: String): Path {
+        Path("/tmp/metis-feishu-sidecar-${label}-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
     }
 
     private func cardActionRoot(): JsonObject {
@@ -262,5 +305,170 @@ public class FeishuLongConnectTest {
         @Expect(inbound[6].text.contains("987654"), true)
         @Expect(inbound[7].systemEventKind, "feishu.drive_comment")
         @Expect(inbound[7].text.contains("comment_native"), true)
+    }
+
+    @TestCase
+    public func sidecarInboundMessageTypesEnterFeishuAdapterWithoutRouteBypass(): Unit {
+        let transport = FeishuFakeLongConnectTransport(events: [
+            this.sidecarMessageRoot("om_sidecar_text", "text", "{\"text\":\"sidecar text\"}"),
+            this.sidecarMessageRoot("om_sidecar_post", "post", "{\"zh_cn\":{\"content\":[[{\"tag\":\"text\",\"text\":\"sidecar post\"}]]}}"),
+            this.sidecarMessageRoot("om_sidecar_image", "image", "{\"image_key\":\"img_sidecar\",\"file_name\":\"diagram.png\",\"mime_type\":\"image/png\"}"),
+            this.sidecarMessageRoot("om_sidecar_file", "file", "{\"file_key\":\"file_sidecar\",\"file_name\":\"report.pdf\",\"mime_type\":\"application/pdf\"}"),
+            this.sidecarMessageRoot("om_sidecar_audio", "audio", "{\"file_key\":\"audio_sidecar\",\"file_name\":\"voice.ogg\",\"mime_type\":\"audio/ogg\"}"),
+            this.sidecarMessageRoot("om_sidecar_video", "video", "{\"file_key\":\"video_sidecar\",\"file_name\":\"demo.mp4\",\"mime_type\":\"video/mp4\"}"),
+            this.sidecarMessageRoot("om_sidecar_sticker", "sticker", "{\"sticker_key\":\"stk_sidecar\"}")
+        ])
+        let adapter = FeishuAdapter(
+            config: FeishuConfig(enabled: true, appId: "cli_sidecar_app", appSecret: "sidecar-secret-never-output", receiveMode: "long_connect"),
+            accountId: "tenant-a",
+            longConnectTransport: transport
+        )
+
+        adapter.start()
+        let inbound = adapter.pullInbound()
+
+        @Expect(inbound.size, 7)
+        for (i in 0..inbound.size) {
+            @Expect(inbound[i].accountId, "tenant-a")
+            @Expect(inbound[i].conversationId.getOrThrow(), "oc_sidecar")
+            @Expect(inbound[i].systemEvent, false)
+            let context = inbound[i].mediaContext.get("context").getOrThrow().asObject()
+            @Expect(context.get("imRoute").isSome(), true)
+            @Expect(context.get("feishuGate").isSome(), true)
+            @Expect(context.toJsonString().contains("sessionStore"), false)
+            @Expect(context.toJsonString().contains("agentDispatch"), false)
+        }
+        @Expect(inbound[2].mediaContext.get("records").getOrThrow().asArray()[0].asObject().get("mediaKind").getOrThrow().asString().getValue(), "image")
+        @Expect(inbound[3].mediaContext.get("records").getOrThrow().asArray()[0].asObject().get("mediaKind").getOrThrow().asString().getValue(), "file")
+        @Expect(inbound[4].mediaContext.get("records").getOrThrow().asArray()[0].asObject().get("mediaKind").getOrThrow().asString().getValue(), "audio")
+        @Expect(inbound[5].mediaContext.get("records").getOrThrow().asArray()[0].asObject().get("mediaKind").getOrThrow().asString().getValue(), "video")
+    }
+
+    @TestCase
+    public func sidecarDuplicateEventsDoNotDispatchTwice(): Unit {
+        let duplicated = this.sidecarMessageRoot("om_sidecar_dup", "text", "{\"text\":\"sidecar duplicate\"}")
+        let transport = FeishuFakeLongConnectTransport(events: [duplicated, duplicated])
+        let adapter = FeishuAdapter(
+            config: FeishuConfig(enabled: true, appId: "cli_sidecar_app", appSecret: "sidecar-secret-never-output", receiveMode: "long_connect"),
+            accountId: "tenant-a",
+            longConnectTransport: transport
+        )
+
+        adapter.start()
+        let inbound = adapter.pullInbound()
+
+        @Expect(inbound.size, 1)
+        @Expect(inbound[0].messageId, "om_sidecar_dup")
+    }
+
+    @TestCase
+    public func sidecarMetadataEventsAreNormalizedByFeishuAdapter(): Unit {
+        let transport = FeishuFakeLongConnectTransport(events: [
+            this.botMenuRoot(),
+            this.cardActionRoot(),
+            this.reactionRoot("im.message.reaction.created_v1", "om_sidecar_reaction"),
+            this.botMembershipRoot("im.chat.member.bot.added_v1"),
+            this.botMembershipRoot("im.chat.member.bot.deleted_v1"),
+            this.driveNoticeCommentAddRoot(),
+            this.vcBotInvitedRoot(),
+            this.bitableFieldChangedRoot()
+        ])
+        let adapter = FeishuAdapter(
+            config: FeishuConfig(enabled: true, appId: "cli_sidecar_app", appSecret: "sidecar-secret-never-output", receiveMode: "long_connect"),
+            accountId: "tenant-a",
+            longConnectTransport: transport
+        )
+
+        adapter.start()
+        let inbound = adapter.pullInbound()
+
+        @Expect(inbound.size, 8)
+        @Expect(inbound[0].systemEventKind, "feishu.bot_menu")
+        @Expect(inbound[1].systemEventKind, "feishu.card_action")
+        @Expect(inbound[2].systemEventKind, "feishu.reaction")
+        @Expect(inbound[3].systemEventKind, "feishu.bot_membership")
+        @Expect(inbound[4].systemEventKind, "feishu.bot_membership")
+        @Expect(inbound[5].systemEventKind, "feishu.drive_comment")
+        @Expect(inbound[6].systemEventKind, "feishu.vc_invited")
+        @Expect(inbound[7].systemEventKind, "feishu.bitable_field_changed")
+    }
+
+    @TestCase
+    public func sidecarBackgroundFailureUpdatesAdapterLastErrorAndRedactsDiagnostic(): Unit {
+        let transport = FeishuFakeLongConnectTransport(events: [
+            this.sidecarDiagnosticRoot("Authorization: Bearer sidecar-token appSecret=sidecar-secret-never-output")
+        ])
+        let adapter = FeishuAdapter(
+            config: FeishuConfig(enabled: true, appId: "cli_sidecar_app", appSecret: "sidecar-secret-never-output", receiveMode: "long_connect"),
+            accountId: "tenant-a",
+            longConnectTransport: transport
+        )
+
+        adapter.start()
+
+        @Expect(adapter.debugFeishuNativeLongConnectLastErrorForTest().contains("[redacted]"), true)
+        @Expect(adapter.debugFeishuNativeLongConnectLastErrorForTest().contains("sidecar-token"), false)
+        @Expect(adapter.debugFeishuNativeLongConnectLastErrorForTest().contains("sidecar-secret-never-output"), false)
+    }
+
+    @TestCase
+    public func feishuSidecarDoesNotWriteSessionDirectly(): Unit {
+        let root = this.tempRoot("session-boundary")
+        try {
+            Directory.create(root, recursive: true)
+            let transport = FeishuFakeLongConnectTransport(events: [
+                this.sidecarMessageRoot("om_sidecar_session_boundary", "text", "{\"text\":\"sidecar boundary\"}")
+            ])
+            let adapter = FeishuAdapter(
+                config: FeishuConfig(enabled: true, appId: "cli_sidecar_app", appSecret: "sidecar-secret-never-output", receiveMode: "long_connect"),
+                accountId: "tenant-a",
+                pairingRoot: root,
+                longConnectTransport: transport
+            )
+
+            adapter.start()
+            @Expect(adapter.pullInbound().size, 1)
+            @Expect(exists(root.join("agents")), false)
+            @Expect(exists(root.join("sessions")), false)
+        } finally {
+            try { remove(root, recursive: true) } catch (_: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func feishuSidecarDoesNotReadOpenClawConfigStore(): Unit {
+        let transport = FeishuFakeLongConnectTransport()
+        let adapter = FeishuAdapter(
+            config: FeishuConfig(enabled: true, appId: "metis_app_id", appSecret: "metis-secret-never-output", receiveMode: "long_connect"),
+            accountId: "tenant-a",
+            longConnectTransport: transport
+        )
+
+        adapter.start()
+
+        @Expect(transport.lastSpec.appId, "metis_app_id")
+        @Expect(transport.lastSpec.appSecret, "metis-secret-never-output")
+        @Expect(transport.lastSpec.appId.contains("openclaw"), false)
+    }
+
+    @TestCase
+    public func feishuSidecarEventsEnterOnlyThroughFeishuAdapter(): Unit {
+        let transport = FeishuFakeLongConnectTransport(events: [
+            this.sidecarMessageRoot("om_sidecar_adapter_only", "text", "{\"text\":\"adapter only\"}")
+        ])
+        let adapter = FeishuAdapter(
+            config: FeishuConfig(enabled: true, appId: "cli_sidecar_app", appSecret: "sidecar-secret-never-output", receiveMode: "long_connect"),
+            accountId: "tenant-a",
+            longConnectTransport: transport
+        )
+
+        adapter.start()
+        let inbound = adapter.pullInbound()
+
+        @Expect(transport.startCount, 1)
+        @Expect(inbound.size, 1)
+        @Expect(inbound[0].mediaContext.get("context").getOrThrow().asObject().get("imRoute").isSome(), true)
+        @Expect(inbound[0].mediaContext.toJsonString().contains("openclawSession"), false)
+        @Expect(inbound[0].mediaContext.toJsonString().contains("directAgent"), false)
     }
 }

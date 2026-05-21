@@ -22,7 +22,7 @@ import metis.core.config.{
 }
 import metis.gateway.channels.feishu.FeishuAdapter
 import metis.gateway.{gatewayRuntimeEffectiveAuthPasswordString, gatewayRuntimeEffectiveAuthTokenString}
-import metis.gateway.config.{buildGatewayConfigFromUserSettings, ensureInstalledGatewayPluginsRegistered, gatewayBuiltinAdapterRegistrationProfiles, gatewayPreparedBuiltinAdapterRegistrations, gatewayPreparedPluginAdapterRegistrations, GatewayChannelPluginRegistry}
+import metis.gateway.config.{buildGatewayConfigFromUserSettings, ensureInstalledGatewayPluginsRegistered, gatewayBuiltinAdapterRegistrationProfiles, gatewayFeishuAdapterForConfig, gatewayPreparedBuiltinAdapterRegistrations, gatewayPreparedPluginAdapterRegistrations, GatewayChannelPluginRegistry}
 import metis.cron.registerGatewayCronRunUnified
 import metis.gateway.core.{
     GatewayRouter,
@@ -125,7 +125,7 @@ public func buildGatewayServiceFromUserSettings(user: GatewayUserSettings): (Gat
     )
     gatewayConfigFactoryTimingLog("gateway-service-created", startMs)
 
-    let feishu = FeishuAdapter(config: cfg.feishu, accountId: cfg.feishu.accountId)
+    let feishu = gatewayFeishuAdapterForConfig(cfg.feishu, cfg.feishu.accountId)
     for (prepared in gatewayPreparedBuiltinAdapterRegistrations(user, cfg.channelHealthCheckMinutes > 0)) {
         gateway.registerAdapter(
             prepared.adapter,

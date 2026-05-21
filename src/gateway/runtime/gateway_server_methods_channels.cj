@@ -830,6 +830,9 @@ private func gatewayFeishuAccountEventDiagnostic(
     let inboundCount = gatewayFeishuDiagInt(runtimeRow, "inboundCount", defaultValue: gatewayFeishuDiagInt(accountRow, "inboundCount"))
     let pullCount = gatewayFeishuDiagInt(runtimeRow, "pullCount", defaultValue: gatewayFeishuDiagInt(accountRow, "pullCount"))
     let lastEventAtMs = gatewayFeishuDiagInt(runtimeRow, "lastEventAtMs", defaultValue: gatewayFeishuDiagInt(accountRow, "lastEventAtMs"))
+    let lastMonitorAtMs = gatewayFeishuDiagInt(runtimeRow, "lastMonitorAtMs", defaultValue: gatewayFeishuDiagInt(accountRow, "lastMonitorAtMs"))
+    let nowMs = DateTime.now().toUnixTimeStamp().toMilliseconds()
+    let lastDiagnosticAgeMs = if (lastMonitorAtMs > 0 && nowMs >= lastMonitorAtMs) { nowMs - lastMonitorAtMs } else { 0 }
     let rawLastError = gatewayFeishuDiagString(runtimeRow, "lastError", defaultValue: gatewayFeishuDiagString(accountRow, "lastError"))
     let safeLastError = gatewayFeishuDiagnosticRedact(rawLastError)
     let lastError = rawLastError.toAsciiLower()
@@ -884,6 +887,11 @@ private func gatewayFeishuAccountEventDiagnostic(
     row.put("inboundCount", inboundCount.toJsonValue())
     row.put("pullCount", pullCount.toJsonValue())
     row.put("lastEventAtMs", lastEventAtMs.toJsonValue())
+    row.put("lastInboundAtMs", lastEventAtMs.toJsonValue())
+    row.put("lastInboundAt", JsonString(if (lastEventAtMs > 0) { lastEventAtMs.toString() } else { "never" }))
+    row.put("lastDiagnosticAtMs", lastMonitorAtMs.toJsonValue())
+    row.put("lastDiagnosticAgeMs", lastDiagnosticAgeMs.toJsonValue())
+    row.put("lastDiagnosticAge", JsonString(if (lastMonitorAtMs > 0) { "${lastDiagnosticAgeMs}ms" } else { "never" }))
     if (!safeLastError.isEmpty()) {
         row.put("lastError", JsonString(safeLastError))
     }
@@ -941,8 +949,10 @@ private func gatewayFeishuEventOwnershipDiagnosticsJson(user: GatewayUserSetting
 
 private func gatewayFeishuRuntimeViewJson(user: GatewayUserSettings, runtime: JsonObject): JsonObject {
     let out = JsonObject()
+    let cfg = buildGatewayConfigFromUserSettings(user).feishu
     let accountInspect = gatewayFeishuAccountInspectJson(user)
-    out.put("mode", JsonString(user.feishu.receiveMode))
+    out.put("mode", JsonString(cfg.receiveMode))
+    out.put("transportMode", JsonString(cfg.transportMode))
     out.put("accountInspect", accountInspect)
     out.put("pairing", gatewayFeishuPairingCollectionJson(user))
     out.put("eventOwnership", gatewayFeishuEventOwnershipDiagnosticsJson(user, runtime: runtime))
@@ -1143,10 +1153,43 @@ private func gatewayFeishuMediaJson(user: GatewayUserSettings): JsonObject {
 }
 
 private func gatewayFeishuReceiveModeDiagnosticsJson(user: GatewayUserSettings): JsonObject {
+    let cfg = buildGatewayConfigFromUserSettings(user).feishu
     let out = JsonObject()
-    out.put("mode", JsonString(user.feishu.receiveMode))
+    out.put("mode", JsonString(cfg.receiveMode))
     out.put("supportedModes", JsonArray([JsonString("long_connect"), JsonString("webhook")]))
-    out.put("state", JsonString(if (user.feishu.receiveMode == "webhook" || user.feishu.receiveMode == "long_connect") { "supported" } else { "normalized_by_runtime" }))
+    out.put("state", JsonString("supported"))
+    return out
+}
+
+private func gatewayFeishuTransportModeDiagnosticsJson(user: GatewayUserSettings): JsonObject {
+    let cfg = buildGatewayConfigFromUserSettings(user).feishu
+    let effectiveRuntime = if (cfg.receiveMode == "webhook") { "webhook" } else { cfg.transportMode }
+    let out = JsonObject()
+    out.put("mode", JsonString(cfg.transportMode))
+    out.put("effectiveRuntime", JsonString(effectiveRuntime))
+    out.put("supportedModes", JsonArray([JsonString("openclaw-sidecar"), JsonString("native-legacy")]))
+    out.put("receiveMode", JsonString(cfg.receiveMode))
+    out.put("defaultLongConnectRuntime", JsonString("openclaw-sidecar"))
+    out.put("nativeLegacyStatus", JsonString("explicit_opt_in_only"))
+    out.put("nativeLegacyFullCapabilityRoute", false.toJsonValue())
+    out.put("state", JsonString(
+        if (cfg.receiveMode == "webhook") {
+            "webhook_receive_mode"
+        } else if (cfg.transportMode == "native-legacy") {
+            "native_legacy_explicit"
+        } else {
+            "sidecar_default"
+        }
+    ))
+    out.put("capabilityRoute", JsonString(
+        if (cfg.receiveMode == "webhook") {
+            "webhook_gateway_http_boundary"
+        } else if (cfg.transportMode == "native-legacy") {
+            "legacy_frozen_not_full_capability"
+        } else {
+            "sidecar_primary"
+        }
+    ))
     return out
 }
 
@@ -1181,6 +1224,7 @@ private func gatewayFeishuChannelDiagnosticsJson(user: GatewayUserSettings, runt
     out.put("checkedInputs", JsonArray([
         JsonString("account"),
         JsonString("receiveMode"),
+        JsonString("transportMode"),
         JsonString("groupPolicy"),
         JsonString("threadSession"),
         JsonString("media"),
@@ -1190,6 +1234,7 @@ private func gatewayFeishuChannelDiagnosticsJson(user: GatewayUserSettings, runt
     ]))
     out.put("account", account)
     out.put("receiveMode", gatewayFeishuReceiveModeDiagnosticsJson(user))
+    out.put("transportMode", gatewayFeishuTransportModeDiagnosticsJson(user))
     out.put("groupPolicy", gatewayFeishuGroupPolicyDiagnosticsJson(user))
     out.put("threadSession", gatewayFeishuThreadSessionDiagnosticsJson(user))
     out.put("media", gatewayFeishuMediaJson(user))
@@ -1266,9 +1311,11 @@ public func gatewayChannelGetJson(user: GatewayUserSettings, channelId: String):
         case None => ()
     }
     if (normalized == "feishu") {
+        let cfg = buildGatewayConfigFromUserSettings(user).feishu
         result.put("kind", JsonString("builtin"))
         result.put("enabled", user.feishu.enabled.toJsonValue())
-        result.put("mode", JsonString(user.feishu.receiveMode))
+        result.put("mode", JsonString(cfg.receiveMode))
+        result.put("transportMode", JsonString(cfg.transportMode))
         result.put("webhookPath", JsonString(user.feishu.webhookPath))
         result.put("defaultAccountId", JsonString(gatewayFeishuDefaultAccountId(user)))
         result.put("groupSessionScope", JsonString(user.feishu.groupSessionScope))

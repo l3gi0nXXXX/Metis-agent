@@ -611,6 +611,7 @@ public class FeishuAdapter <: ChannelAdapter {
     private var lastSendError: String = ""
     private let threadCapabilityCache = HashMap<String, Bool>()
     private var feishuNativeLongConnectLastError: String = ""
+    private var feishuLongConnectBackgroundFailurePending = false
     private let longConnectTransport: FeishuLongConnectTransport
     private let accountId: String
     private let chatQueue = FeishuChatQueue()
@@ -651,6 +652,30 @@ public class FeishuAdapter <: ChannelAdapter {
 
     public func debugFeishuNativeLongConnectLastErrorForTest(): String {
         this.feishuNativeLongConnectLastError
+    }
+
+    public func debugFeishuTransportModeForTest(): String {
+        this.config.transportMode
+    }
+
+    public func debugFeishuLongConnectTransportKindForTest(): String {
+        if (this.config.receiveMode == "webhook" || this.longConnectTransport is FeishuWebhookLongConnectTransport) {
+            return "webhook"
+        }
+        if (this.longConnectTransport is FeishuSidecarTransport) {
+            return "openclaw-sidecar"
+        }
+        if (this.longConnectTransport is FeishuNativeLongConnectTransport) {
+            return "native-legacy"
+        }
+        "custom"
+    }
+
+    public func debugFeishuApiClientKindForTest(): String {
+        if (this.apiClient is FeishuSidecarApiClient) {
+            return "openclaw-sidecar"
+        }
+        "native-legacy"
     }
 
     public func debugFeishuPairingPendingCodeForTest(senderId: String, accountId!: String = ""): String {
@@ -827,6 +852,8 @@ public class FeishuAdapter <: ChannelAdapter {
             this.running = true
             let startMeta = JsonObject()
             startMeta.put("mode", JsonString(this.config.receiveMode))
+            startMeta.put("transport", JsonString("webhook"))
+            startMeta.put("transportMode", JsonString(this.config.transportMode))
             this.logChannel("info", MetisLogEvent.channelStarted, "start", "started", "Feishu adapter started", accountId: this.accountId, extra: startMeta)
             this.startWebhookServer()
             return
@@ -864,18 +891,21 @@ public class FeishuAdapter <: ChannelAdapter {
                 MetisLogEvent.channelFailed,
                 "long_connect",
                 "failed",
-                "Feishu native long-connect transport failed to start",
+                "Feishu long-connect transport failed to start",
                 errorKind: this.feishuErrorKind(detail),
                 error: detail,
                 accountId: this.accountId
             )
             return
         }
-        this.feishuNativeLongConnectLastError = ""
+        if (!this.feishuLongConnectBackgroundFailurePending) {
+            this.feishuNativeLongConnectLastError = ""
+        }
         this.running = true
         let startMeta = JsonObject()
         startMeta.put("mode", JsonString(this.config.receiveMode))
-        startMeta.put("transport", JsonString("native_long_connect"))
+        startMeta.put("transport", JsonString(this.config.transportMode))
+        startMeta.put("transportMode", JsonString(this.config.transportMode))
         this.logChannel("info", MetisLogEvent.channelStarted, "start", "started", "Feishu adapter started", accountId: this.accountId, extra: startMeta)
     }
 
@@ -898,6 +928,7 @@ public class FeishuAdapter <: ChannelAdapter {
             extra.put("healthPath", JsonString("/healthz"))
         } else {
             extra.put("mode", JsonString("long_connect"))
+            extra.put("transportMode", JsonString(this.config.transportMode))
         }
         this.logChannel("debug", MetisLogEvent.channelStarted, "start", "hint", "Feishu ingress hint", accountId: this.accountId, extra: extra)
     }
@@ -922,6 +953,13 @@ public class FeishuAdapter <: ChannelAdapter {
     public func pullInbound(): Array<InboundMessage> {
         if (!this.running) {
             return []
+        }
+        if (this.feishuLongConnectBackgroundFailurePending) {
+            this.feishuLongConnectBackgroundFailurePending = false
+            let detail = this.feishuNativeLongConnectLastError.trimAscii()
+            if (!detail.isEmpty()) {
+                throw Exception(detail)
+            }
         }
         let result = ArrayList<InboundMessage>()
         synchronized(this.queueMutex) {
@@ -1499,6 +1537,21 @@ public class FeishuAdapter <: ChannelAdapter {
         if (this.feishuEventIsStale(root)) {
             return this.feishuIgnoredResponse("stale_event", eventType: headerEventType)
         }
+        if (headerEventType == "metis.feishu.sidecar.diagnostic") {
+            return this.handleFeishuSidecarDiagnosticEvent(root)
+        }
+        if (headerEventType == "application.bot.menu_v6") {
+            if (let Some(inbound) <- this.mapBotMenuEventToInbound(root)) {
+                if (!this.tryRecordFeishuEvent(inbound.accountId, inbound.messageId)) {
+                    return this.feishuIgnoredResponse("duplicate_event", eventType: headerEventType)
+                }
+                synchronized(this.queueMutex) {
+                    this.inboundQueue.add(inbound)
+                }
+                return "{\"ok\":true}"
+            }
+            return this.feishuIgnoredResponse("malformed_event", eventType: headerEventType)
+        }
         if (headerEventType == "card.action.trigger") {
             if (let Some(inbound) <- this.mapCardActionToInbound(root)) {
                 if (!this.tryRecordFeishuEvent(inbound.accountId, inbound.messageId)) {
@@ -1938,6 +1991,126 @@ public class FeishuAdapter <: ChannelAdapter {
             }
         }
         recorded
+    }
+
+    private func handleFeishuSidecarDiagnosticEvent(root: JsonObject): String {
+        let diagnostic = match (root.get("sidecar")) {
+            case Some(v) => try { v.asObject() } catch (_e: Exception) { JsonObject() }
+            case None => match (root.get("event")) {
+                case Some(v) => try { v.asObject() } catch (_e: Exception) { JsonObject() }
+                case None => JsonObject()
+            }
+        }
+        let status = this.firstNonEmpty([
+            this.readStringField(diagnostic, "status"),
+            this.readStringField(diagnostic, "state")
+        ])
+        let phase = this.firstNonEmpty([
+            this.readStringField(diagnostic, "phase"),
+            "background"
+        ])
+        let detail = this.firstNonEmpty([
+            this.readStringField(diagnostic, "error"),
+            this.readStringField(diagnostic, "message"),
+            this.readStringField(diagnostic, "reason"),
+            status
+        ])
+        let loweredStatus = status.trimAscii().toAsciiLower()
+        let failed = loweredStatus.contains("fail") || loweredStatus.contains("error") || !this.readStringField(diagnostic, "error").trimAscii().isEmpty()
+        if (failed) {
+            let redacted = this.feishuRedactDiagnosticText(detail).trimAscii()
+            let safeDetail = if (redacted == "[redacted]") {
+                "feishu sidecar ${phase.trimAscii()} failure: [redacted]"
+            } else if (redacted.isEmpty()) {
+                "feishu sidecar ${phase.trimAscii()} failure"
+            } else {
+                "feishu sidecar ${phase.trimAscii()} failure: ${redacted}"
+            }
+            this.feishuNativeLongConnectLastError = safeDetail
+            this.feishuLongConnectBackgroundFailurePending = true
+            this.logChannel(
+                "warn",
+                MetisLogEvent.channelFailed,
+                "sidecar",
+                "failed",
+                "Feishu sidecar background failure",
+                errorKind: this.feishuErrorKind(safeDetail),
+                error: safeDetail,
+                accountId: this.resolveFeishuAccountId(root)
+            )
+        }
+        "{\"ok\":true}"
+    }
+
+    private func mapBotMenuEventToInbound(root: JsonObject): Option<InboundMessage> {
+        let event = match (root.get("event")) {
+            case Some(v) => try { v.asObject() } catch (_e: Exception) { return None<InboundMessage> }
+            case None => return None<InboundMessage>
+        }
+        let operatorObj = match (event.get("operator_id")) {
+            case Some(v) => try { v.asObject() } catch (_e: Exception) { JsonObject() }
+            case None => match (event.get("operator")) {
+                case Some(v) => try { v.asObject() } catch (_e: Exception) { JsonObject() }
+                case None => JsonObject()
+            }
+        }
+        let accountId = this.resolveFeishuAccountId(root)
+        let eventKey = this.firstNonEmpty([
+            this.readStringField(event, "event_key"),
+            this.readStringField(event, "eventKey"),
+            this.readStringField(event, "menu_key"),
+            this.readStringField(event, "menuKey"),
+            this.readStringField(event, "key")
+        ])
+        let chatId = this.firstNonEmpty([
+            this.readStringField(event, "chat_id"),
+            this.readStringField(event, "open_chat_id"),
+            this.readStringField(event, "chatId"),
+            this.readStringField(event, "openChatId")
+        ])
+        let operatorId = this.firstNonEmpty([
+            this.readStringField(operatorObj, "open_id"),
+            this.readStringField(operatorObj, "openId"),
+            this.readStringField(operatorObj, "user_id"),
+            this.readStringField(operatorObj, "userId"),
+            this.readStringField(operatorObj, "union_id"),
+            this.readStringField(event, "operator_id")
+        ])
+        let peerId = if (chatId.trimAscii().isEmpty()) { operatorId.trimAscii() } else { chatId.trimAscii() }
+        if (eventKey.trimAscii().isEmpty() || peerId.isEmpty()) {
+            return None<InboundMessage>
+        }
+        let mediaContext = JsonObject()
+        mediaContext.put("channel", JsonString("feishu"))
+        mediaContext.put("accountId", JsonString(accountId))
+        mediaContext.put("peerId", JsonString(peerId))
+        mediaContext.put("messageId", JsonString("bot-menu:${eventKey.trimAscii()}:${peerId}"))
+        let context = JsonObject()
+        let menu = JsonObject()
+        menu.put("eventKey", JsonString(eventKey.trimAscii()))
+        menu.put("chatId", JsonString(chatId.trimAscii()))
+        menu.put("operatorId", JsonString(operatorId.trimAscii()))
+        menu.put("eventType", JsonString(this.readHeaderEventType(root)))
+        menu.put("status", JsonString("accepted"))
+        context.put("feishuBotMenu", menu)
+        mediaContext.put("context", context)
+        let inboundId = "bot-menu:${eventKey.trimAscii()}:${peerId}:${operatorId.trimAscii()}"
+        Some(InboundMessage(
+            ChannelType.Feishu,
+            inboundId,
+            peerId,
+            operatorId.trimAscii(),
+            if (peerId.startsWith("oc_")) { ChatType.Group } else { ChatType.Direct },
+            "[feishu-bot-menu]\neventKey=${eventKey.trimAscii()}\nchatId=${chatId.trimAscii()}\nby=${operatorId.trimAscii()}",
+            true,
+            DateTime.now(),
+            conversationId: Some(peerId),
+            raw: Some(root.toJsonString()),
+            accountId: accountId,
+            mediaContext: mediaContext,
+            systemEvent: true,
+            systemEventKind: "feishu.bot_menu"
+        ))
     }
 
     private func mapCardActionToInbound(root: JsonObject): Option<InboundMessage> {

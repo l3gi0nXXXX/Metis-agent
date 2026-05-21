@@ -137,6 +137,34 @@ private class GatewayChannelRuntimeFailingInboundAdapter <: ChannelAdapter {
     }
 }
 
+private class GatewayChannelRuntimeSidecarFailureAdapter <: ChannelAdapter {
+    private var failed = false
+
+    public prop name: String {
+        get() { "feishu" }
+    }
+
+    public func start(): Unit {}
+
+    public func stop(): Unit {}
+
+    public func pullInbound(): Array<InboundMessage> {
+        if (!this.failed) {
+            this.failed = true
+            throw Exception("feishu sidecar background failure: Authorization: Bearer sidecar-token appSecret=sidecar-secret-never-visible")
+        }
+        []
+    }
+
+    public func send(_message: OutboundMessage): SendResult {
+        SendResult.Success
+    }
+
+    public func sendWithMessageId(_message: OutboundMessage): String {
+        "fake-message"
+    }
+}
+
 private class GatewayChannelLifecycleFakeAdapter <: ChannelAdapter {
     private let adapterName: String
     private let accountId: String
@@ -378,6 +406,30 @@ public class GatewayChannelRuntimeTest {
             @Expect(rendered.contains("app-secret"), false)
             @Expect(rendered.contains("refresh-secret"), false)
             @Expect(rendered.contains("[redacted]"), true)
+        }
+    }
+
+    @TestCase
+    public func feishuSidecarBackgroundFailureUpdatesGatewayRuntimeLastError(): Unit {
+        withGatewayChannelRuntimeTestHome {
+            let manager = GatewayChannelManager()
+            manager.registerAdapter(GatewayChannelRuntimeSidecarFailureAdapter(), channelId: "feishu", accountId: "tenant-a")
+            manager.startChannels()
+
+            manager.processOnce({ _message, _accountId => () })
+
+            let accounts = gatewayChannelRuntimeAccountsJson("feishu")
+            @Expect(accounts.size(), 1)
+            let row = accounts[0].asObject()
+            @Expect(gatewayRuntimeTestString(row, "lifecycleState"), "backoff")
+            @Expect(gatewayRuntimeTestString(row, "errorKind"), "pull_failed")
+            @Expect(gatewayRuntimeTestString(row, "lastError"), "[redacted]")
+            let summary = gatewayChannelManagerSummary("feishu")
+            @Expect(gatewayRuntimeTestString(summary, "lastError"), "[redacted]")
+            let raw = summary.toJsonString()
+            @Expect(raw.contains("sidecar-token"), false)
+            @Expect(raw.contains("sidecar-secret-never-visible"), false)
+            @Expect(raw.contains("Authorization"), false)
         }
     }
 

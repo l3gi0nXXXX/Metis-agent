@@ -57,13 +57,14 @@ public func gatewayBuiltinAdapterRegistrationProfiles(
     let feishuCatalog = getGatewayChannelCatalogEntry("feishu")
     for (accountId in gatewayFeishuListAccountIds(feishuConfig)) {
         let resolved = gatewayFeishuResolveAccount(feishuConfig, accountId)
+        let feishuCompatibilityMode = if (resolved.config.receiveMode == "webhook") { "webhook" } else { resolved.config.transportMode }
         rows.add(GatewayAdapterRegistrationProfile(
             "feishu",
             resolved.accountId,
             "feishu",
             "builtin",
             "builtin-adapter",
-            "native-cangjie",
+            feishuCompatibilityMode,
             match (feishuCatalog) { case Some(v) => v.label case None => "Feishu" },
             match (feishuCatalog) { case Some(v) => v.detailLabel case None => "Built-in Feishu adapter" },
             resolved.config.enabled,
