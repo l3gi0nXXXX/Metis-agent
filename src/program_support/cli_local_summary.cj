@@ -87,6 +87,7 @@ private func localFieldLabel(key: String): String {
     if (key == "pendingCount") { return "Pending" }
     if (key == "approvedCount") { return "Approved senders" }
     if (key == "approved") { return "Approved" }
+    if (key == "deny") { return "Deny" }
     if (key == "dispatchMode") { return "Dispatch mode" }
     if (key == "primaryPath") { return "Primary path" }
     return key

@@ -3,10 +3,10 @@ package metis.program
 import metis.gateway.channels.telegram.telegramPairingAccountStore
 import metis.gateway.security.gatewayPairingAccountStore
 
-import std.fs.Path
+import std.fs.{Directory, File, Path}
 import std.time.DateTime
 import std.unittest.testmacro.*
-import stdx.encoding.json.JsonObject
+import stdx.encoding.json.{JsonArray, JsonInt, JsonObject, JsonString}
 
 @Test
 public class CliLocalFlowsPairingTest {
@@ -62,6 +62,57 @@ public class CliLocalFlowsPairingTest {
         @Expect(rendered.startsWith("{"), false)
         @Expect(rendered.contains("Approved: true"), true)
         @Expect(rendered.contains("Account: tenant-a"), true)
+        @Expect(rendered.contains("\"ok\""), false)
+    }
+
+    @TestCase
+    public func feishuPairingApproveRepeatIsSafeAndExpiredCodesStayHumanReadable(): Unit {
+        let root = this.tempRoot("metis-cli-feishu-pairing-expiry")
+        let store = gatewayPairingAccountStore(channel: "feishu", accountId: "tenant-a", rootDir: root)
+        let code = store.ensurePending("ou_a")
+
+        let first = cliBuildPairingApproveResult("feishu", code, accountId: "tenant-a", rootDir: root).getOrThrow()
+        let second = cliBuildPairingApproveResult("feishu", code, accountId: "tenant-a", rootDir: root).getOrThrow()
+        @Expect(this.jsonBool(first, "approved"), true)
+        @Expect(this.jsonBool(second, "approved"), false)
+        @Expect(store.approvedSenders().size, 1)
+
+        let expiredStore = gatewayPairingAccountStore(channel: "feishu", accountId: "tenant-expired", rootDir: root)
+        let credentials = expiredStore.rootPath().join("credentials")
+        Directory.create(credentials, recursive: true)
+        let row = JsonObject()
+        row.put("senderId", JsonString("ou_expired"))
+        row.put("code", JsonString("OLD-CODE"))
+        row.put("createdAtMs", JsonInt(1))
+        row.put("expiresAtMs", JsonInt(1))
+        File.writeTo(credentials.join("feishu-pairing.json"), JsonArray([row]).toJsonString().toArray())
+
+        let expired = cliBuildPairingApproveResult("feishu", "OLD-CODE", accountId: "tenant-expired", rootDir: root).getOrThrow()
+        @Expect(this.jsonBool(expired, "approved"), false)
+        let rendered = cliRenderLocalCommandSummary(expired)
+        @Expect(rendered.startsWith("{"), false)
+        @Expect(rendered.contains("Approved: false"), true)
+        @Expect(rendered.contains("Pending: 0"), true)
+        @Expect(rendered.contains("OLD-CODE"), false)
+        @Expect(rendered.contains("\"result\""), false)
+    }
+
+    @TestCase
+    public func feishuPairingDenyReturnsUnsupportedHumanDiagnostic(): Unit {
+        let root = this.tempRoot("metis-cli-feishu-pairing-deny")
+        let store = gatewayPairingAccountStore(channel: "feishu", accountId: "tenant-a", rootDir: root)
+        let code = store.ensurePending("ou_a")
+
+        let denied = cliBuildPairingDenyResult("feishu", code, accountId: "tenant-a", rootDir: root).getOrThrow()
+        @Expect(this.jsonBool(denied, "supported"), false)
+        @Expect(this.jsonString(denied, "status"), "unsupported")
+        @Expect(store.pendingRows().size, 1)
+
+        let rendered = cliRenderLocalCommandSummary(denied)
+        @Expect(rendered.startsWith("{"), false)
+        @Expect(rendered.contains("Deny: unsupported"), true)
+        @Expect(rendered.contains("deny is not supported"), true)
+        @Expect(rendered.contains(code), false)
         @Expect(rendered.contains("\"ok\""), false)
     }
 

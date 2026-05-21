@@ -150,6 +150,7 @@ private func localFieldLabel(key: String): String {
     if (key == "pendingCount") { return "Pending" }
     if (key == "approvedCount") { return "Approved senders" }
     if (key == "approved") { return "Approved" }
+    if (key == "deny") { return "Deny" }
     if (key == "dispatchMode") { return "Dispatch mode" }
     if (key == "primaryPath") { return "Primary path" }
     return key
@@ -4022,6 +4023,53 @@ public func cliBuildPairingApproveResult(
     None<JsonObject>
 }
 
+public func cliBuildPairingDenyResult(
+    channel: String,
+    code: String,
+    accountId!: String = "",
+    rootDir!: Path = CliConfig.dotDir
+): Option<JsonObject> {
+    let normalizedChannel = channel.trimAscii().toAsciiLower()
+    let _normalizedCode = code.trimAscii().toAsciiUpper()
+    if (normalizedChannel == "feishu") {
+        let resolvedAccountId = cliPairingResolveAccountId(normalizedChannel, accountId)
+        let store = gatewayPairingAccountStore(channel: "feishu", accountId: resolvedAccountId, rootDir: rootDir)
+        let obj = cliBuildPairingStateObject(
+            "feishu",
+            resolvedAccountId,
+            store.rootPath().toString(),
+            store.pendingRows(),
+            store.approvedSenders(),
+            "metis pairing list feishu --account ${resolvedAccountId}",
+            ["metis pairing approve feishu <CODE> --account ${resolvedAccountId}", "let untrusted pending Feishu codes expire"]
+        )
+        obj.put("supported", false.toJsonValue())
+        obj.put("status", JsonString("unsupported"))
+        obj.put("deny", JsonString("unsupported"))
+        obj.put("message", JsonString("Feishu pairing deny is not supported; pending codes expire automatically."))
+        return Some(obj)
+    }
+    if (normalizedChannel == "telegram") {
+        let resolvedAccountId = cliPairingResolveAccountId(normalizedChannel, accountId)
+        let store = telegramPairingAccountStore(rootDir: rootDir, accountId: resolvedAccountId)
+        let obj = cliBuildPairingStateObject(
+            "telegram",
+            resolvedAccountId,
+            store.rootPath().toString(),
+            store.pendingRows(),
+            store.approvedSenders(),
+            "metis pairing list telegram",
+            ["metis pairing approve telegram <CODE>", "retry with a pending Telegram pairing code"]
+        )
+        obj.put("supported", false.toJsonValue())
+        obj.put("status", JsonString("unsupported"))
+        obj.put("deny", JsonString("unsupported"))
+        obj.put("message", JsonString("Telegram pairing deny is not supported; pending codes expire automatically."))
+        return Some(obj)
+    }
+    None<JsonObject>
+}
+
 public func cliRunPairingFlow(args: Array<String>): Int64 {
     let sub = firstArg(args)
     if (sub.isEmpty() || sub == "help") {
@@ -4031,9 +4079,9 @@ public func cliRunPairingFlow(args: Array<String>): Int64 {
             ["metis pairing", "metis pairing status", "metis pairing list",
                 "metis pairing list feishu --account <id>",
                 "metis pairing approve telegram <CODE>",
-                "metis pairing approve feishu <CODE> --account <id>", "metis pairing current", "metis pairing open",
+                "metis pairing approve feishu <CODE> --account <id>", "metis pairing deny feishu <CODE> --account <id>", "metis pairing current", "metis pairing open",
                 "metis pairing code", "metis pairing sessions"],
-            "status | list | approve | current | open | code | sessions | help"
+            "status | list | approve | deny | current | open | code | sessions | help"
         )
     }
     if (sub == "status" || sub == "list") {
@@ -4076,6 +4124,27 @@ public func cliRunPairingFlow(args: Array<String>): Int64 {
         PrintUtils.printLine("Supported approval targets: telegram, feishu")
         return CLI_EXIT_USAGE_ERROR
     }
+    if (sub == "deny") {
+        let channel = argAt(args, 1).trimAscii().toAsciiLower()
+        if (channel != "telegram" && channel != "feishu") {
+            PrintUtils.printLine("Unsupported pairing deny target: ${channel}")
+            PrintUtils.printLine("Supported deny targets: telegram, feishu")
+            return CLI_EXIT_USAGE_ERROR
+        }
+        let code = argAt(args, 2).trimAscii().toAsciiUpper()
+        if (code.isEmpty()) {
+            PrintUtils.printLine("Usage: metis pairing deny feishu <CODE> --account <id>")
+            return CLI_EXIT_USAGE_ERROR
+        }
+        let accountId = cliPairingFlagValue(args, "--account", start: 3)
+        match (cliBuildPairingDenyResult(channel, code, accountId: accountId)) {
+            case Some(obj) => return localPrintCommandResult(args, obj)
+            case None => ()
+        }
+        PrintUtils.printLine("Unsupported pairing deny target: ${channel}")
+        PrintUtils.printLine("Supported deny targets: telegram, feishu")
+        return CLI_EXIT_USAGE_ERROR
+    }
     if (sub == "current" || sub == "open") {
         let obj = buildCommandEnvelope("pairing", sub)
         obj.put("surface", JsonString("local"))
@@ -4091,7 +4160,7 @@ public func cliRunPairingFlow(args: Array<String>): Int64 {
         putNextSteps(obj, ["metis pairing current", "metis qr open"])
         return localPrintCommandResult(args, obj)
     }
-    printUnknownLocalSubcommand("pairing", sub, "status | list | approve | current | open | code | sessions | help")
+    printUnknownLocalSubcommand("pairing", sub, "status | list | approve | deny | current | open | code | sessions | help")
 }
 
 public func cliRunDaemonFlow(args: Array<String>): Int64 {

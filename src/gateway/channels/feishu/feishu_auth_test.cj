@@ -8,7 +8,7 @@ import std.env.{getVariable, setVariable}
 import std.fs.{Directory, File, Path, exists, remove}
 import std.time.DateTime
 import std.unittest.testmacro.*
-import stdx.encoding.json.{JsonObject, JsonString}
+import stdx.encoding.json.{JsonObject, JsonString, JsonValue}
 
 private class FeishuAuthFakeHttpClient <: FeishuAuthHttpClient {
     public let calls = ArrayList<String>()
@@ -147,7 +147,7 @@ public class FeishuAuthFoundationTest {
             let rawFile = String.fromUtf8(File.readFrom(root.join("tenant-a.json")))
             @Expect(rawFile.contains("access-secret"), false)
             @Expect(rawFile.contains("refresh-secret"), false)
-            @Expect(rawFile.contains("obfuscated"), true)
+            @Expect(rawFile.contains("authenticated"), true)
             let status = store.status("tenant-a")
             let raw = status.toJsonString()
             @Expect(raw.contains("authorized"), true)
@@ -155,7 +155,88 @@ public class FeishuAuthFoundationTest {
             @Expect(raw.contains("access-secret"), false)
             @Expect(raw.contains("refresh-secret"), false)
             let diagnostic = status.get("storageDiagnostic").getOrThrow().asObject()
-            @Expect(diagnostic.get("status").getOrThrow().asString().getValue(), "obfuscated")
+            @Expect(diagnostic.get("status").getOrThrow().asString().getValue(), "authenticated")
+        } finally {
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func tokenStoreRejectsTamperedAuthenticatedEnvelopeWithoutLeakingStatus(): Unit {
+        let root = Path("/tmp/metis-feishu-token-store-tamper-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
+        try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        try {
+            let store = FeishuFileTokenStore(root)
+            store.save("tenant-a", FeishuUserToken(
+                accessToken: "tamper-access-secret",
+                refreshToken: "tamper-refresh-secret",
+                expiresAtMs: 4102444800000,
+                scopes: ["offline_access", "im:message"]
+            ))
+            let path = root.join("tenant-a.json")
+            let rootJson = JsonValue.fromStr(String.fromUtf8(File.readFrom(path))).asObject()
+            let payload = rootJson.get("payload").getOrThrow().asString().getValue()
+            rootJson.put("payload", JsonString(if (payload.endsWith("0")) { payload[0..payload.size - 1] + "1" } else { payload[0..payload.size - 1] + "0" }))
+            File.writeTo(path, rootJson.toJsonString().toArray())
+
+            @Expect(store.load("tenant-a").isNone(), true)
+            let status = store.status("tenant-a")
+            let raw = status.toJsonString()
+            let diagnostic = status.get("storageDiagnostic").getOrThrow().asObject()
+            @Expect(diagnostic.get("status").getOrThrow().asString().getValue(), "invalid_authentication")
+            @Expect(raw.contains("tamper-access-secret"), false)
+            @Expect(raw.contains("tamper-refresh-secret"), false)
+        } finally {
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func tokenStoreLoadsLegacyObfuscatedWithMigrationDiagnostic(): Unit {
+        let root = Path("/tmp/metis-feishu-token-store-legacy-obf-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
+        try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        try {
+            Directory.create(root, recursive: true)
+            let legacyAccess = "legacy-" + "obfuscated-" + "access"
+            let legacyRefresh = "legacy-" + "obfuscated-" + "refresh"
+            let payload = JsonObject()
+            payload.put("accessToken", JsonString(legacyAccess))
+            payload.put("refreshToken", JsonString(legacyRefresh))
+            payload.put("expiresAtMs", JsonString("4102444800000"))
+            payload.put("scopes", JsonString("offline_access im:message"))
+            let legacy = JsonObject()
+            legacy.put("format", JsonString("metis-feishu-token-v2"))
+            legacy.put("encoding", JsonString("obfuscated-hex-v1"))
+            legacy.put("payload", JsonString(feishuAuthTestLegacyObfuscatePayload("tenant-a", payload.toJsonString())))
+            legacy.put("redacted", JsonString("true"))
+            File.writeTo(root.join("tenant-a.json"), legacy.toJsonString().toArray())
+
+            let store = FeishuFileTokenStore(root)
+            let loaded = store.load("tenant-a").getOrThrow()
+            @Expect(loaded.accessToken, legacyAccess)
+            @Expect(loaded.refreshToken, legacyRefresh)
+            let diagnostic = store.status("tenant-a").get("storageDiagnostic").getOrThrow().asObject()
+            @Expect(diagnostic.get("status").getOrThrow().asString().getValue(), "legacy_obfuscated")
+            @Expect(diagnostic.get("migrationRecommended").getOrThrow().asBool().getValue(), true)
+        } finally {
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func tokenStoreReportsDamagedStoreAsUnreadableWithoutSecrets(): Unit {
+        let root = Path("/tmp/metis-feishu-token-store-damaged-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
+        try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        try {
+            Directory.create(root, recursive: true)
+            File.writeTo(root.join("tenant-a.json"), "{not-json".toArray())
+
+            let store = FeishuFileTokenStore(root)
+            @Expect(store.load("tenant-a").isNone(), true)
+            let raw = store.status("tenant-a").toJsonString()
+            @Expect(raw.contains("accessToken"), false)
+            @Expect(raw.contains("refreshToken"), false)
+            @Expect(raw.contains("unreadable"), true)
         } finally {
             try { remove(root, recursive: true) } catch (_e: Exception) { () }
         }
@@ -763,4 +844,26 @@ private func feishuAuthTestString(obj: JsonObject, key: String): String {
         }
         case None => ""
     }
+}
+
+private func feishuAuthTestLegacyObfuscatePayload(accountId: String, raw: String): String {
+    let key = ("metis-feishu-token-store-v1:" + accountId.trimAscii()).toArray()
+    let input = raw.toArray()
+    let out = ArrayList<Byte>()
+    for (i in 0..input.size) {
+        let encoded = (Int64(input[i]) + Int64(key[i % key.size]) + 17) % 256
+        out.add(UInt8(encoded))
+    }
+    feishuAuthTestHexEncode(out.toArray())
+}
+
+private func feishuAuthTestHexEncode(bytes: Array<Byte>): String {
+    let hex = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "a", "b", "c", "d", "e", "f"]
+    let out = StringBuilder()
+    for (b in bytes) {
+        let v = Int64(b)
+        out.append(hex[(v >> 4) & 0x0F])
+        out.append(hex[v & 0x0F])
+    }
+    out.toString()
 }

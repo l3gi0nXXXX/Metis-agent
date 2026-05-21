@@ -951,13 +951,118 @@ private func gatewayFeishuRuntimeViewJson(user: GatewayUserSettings, runtime: Js
     out
 }
 
+private func gatewayFeishuDirectoryRow(kind: String, id: String, displayName: String, accountId: String, source: String, status: String): JsonObject {
+    let row = JsonObject()
+    row.put("kind", JsonString(kind))
+    row.put("id", JsonString(id))
+    row.put("displayName", JsonString(displayName))
+    row.put("accountId", JsonString(accountId))
+    row.put("source", JsonString(source))
+    row.put("status", JsonString(status))
+    row
+}
+
+private func gatewayFeishuDirectoryAddRow(rows: JsonArray, seen: HashMap<String, Bool>, row: JsonObject): Unit {
+    let key = gatewayBindingStringParam(row, ["kind"], "") + ":" +
+        gatewayBindingStringParam(row, ["accountId"], "") + ":" +
+        gatewayBindingStringParam(row, ["source"], "") + ":" +
+        gatewayBindingStringParam(row, ["id"], "")
+    if (seen.contains(key)) {
+        return
+    }
+    seen[key] = true
+    rows.add(row)
+}
+
+private func gatewayFeishuDirectoryConfigRows(user: GatewayUserSettings): JsonArray {
+    let rows = JsonArray([])
+    let seen = HashMap<String, Bool>()
+    let inspect = gatewayFeishuAccountInspectJson(user)
+    let accounts = gatewayFeishuDiagArray(inspect, "accounts")
+    for (i in 0..accounts.size()) {
+        let account = try { accounts[i].asObject() } catch (_e: Exception) { JsonObject() }
+        let accountId = gatewayFeishuDiagString(account, "accountId", defaultValue: gatewayFeishuDefaultAccountId(user))
+        if (accountId.trimAscii().isEmpty()) {
+            continue
+        }
+        gatewayFeishuDirectoryAddRow(
+            rows,
+            seen,
+            gatewayFeishuDirectoryRow(
+                "user",
+                "account:${accountId}",
+                accountId,
+                accountId,
+                "config",
+                if (gatewayFeishuDiagBool(account, "configured")) { "configured" } else { "not_configured" }
+            )
+        )
+        let resolved = gatewayFeishuResolveAccount(buildGatewayConfigFromUserSettings(user).feishu, accountId)
+        match (resolved.config.groups) {
+            case Some(groups) =>
+                for (groupId in groups.getFields().keys()) {
+                    if (groupId.trimAscii().isEmpty() || groupId == "*") {
+                        continue
+                    }
+                    gatewayFeishuDirectoryAddRow(
+                        rows,
+                        seen,
+                        gatewayFeishuDirectoryRow("group", groupId, groupId, accountId, "config", "configured")
+                    )
+                }
+            case None => ()
+        }
+    }
+    rows
+}
+
+private func gatewayFeishuDirectoryDiagnosticRow(accountId: String, kind: String, sourceTool: String): JsonObject {
+    let id = "oapi:${accountId}:${kind}"
+    let row = gatewayFeishuDirectoryRow(kind, id, "${kind} directory", accountId, "oapi_diagnostic", "auth_required")
+    let diagnostic = JsonObject()
+    diagnostic.put("code", JsonString("auth_required"))
+    diagnostic.put("message", JsonString("Feishu ${kind} live directory requires user authorization; use channels.feishu.auth.start before live OAPI aggregation."))
+    diagnostic.put("sourceTool", JsonString(sourceTool))
+    diagnostic.put("repairMethod", JsonString("channels.feishu.auth.start"))
+    diagnostic.put("networkAttempted", false.toJsonValue())
+    diagnostic.put("tokenStoreRead", false.toJsonValue())
+    row.put("diagnostic", diagnostic)
+    row
+}
+
+private func gatewayFeishuDirectoryRowsJson(user: GatewayUserSettings): JsonArray {
+    let rows = gatewayFeishuDirectoryConfigRows(user)
+    let seen = HashMap<String, Bool>()
+    for (i in 0..rows.size()) {
+        let row = try { rows[i].asObject() } catch (_e: Exception) { JsonObject() }
+        seen[gatewayBindingStringParam(row, ["kind"], "") + ":" +
+            gatewayBindingStringParam(row, ["accountId"], "") + ":" +
+            gatewayBindingStringParam(row, ["source"], "") + ":" +
+            gatewayBindingStringParam(row, ["id"], "")] = true
+    }
+    let inspect = gatewayFeishuAccountInspectJson(user)
+    let accounts = gatewayFeishuDiagArray(inspect, "accounts")
+    for (i in 0..accounts.size()) {
+        let account = try { accounts[i].asObject() } catch (_e: Exception) { JsonObject() }
+        let accountId = gatewayFeishuDiagString(account, "accountId", defaultValue: gatewayFeishuDefaultAccountId(user))
+        if (accountId.trimAscii().isEmpty()) {
+            continue
+        }
+        gatewayFeishuDirectoryAddRow(rows, seen, gatewayFeishuDirectoryDiagnosticRow(accountId, "user", "feishu_search_user"))
+        gatewayFeishuDirectoryAddRow(rows, seen, gatewayFeishuDirectoryDiagnosticRow(accountId, "group", "feishu_chat"))
+    }
+    rows
+}
+
 private func gatewayFeishuDirectoryJson(user: GatewayUserSettings): JsonObject {
+    let rows = gatewayFeishuDirectoryRowsJson(user)
     let out = JsonObject()
     out.put("groups", gatewayFeishuGroupsJson(user))
     out.put("accounts", gatewayTelegramObjectKeysJson(user.feishu.accounts))
     out.put("targets", gatewayFeishuGroupsJson(user))
-    out.put("rows", JsonArray([]))
-    out.put("aggregationSources", JsonArray([JsonString("config")]))
+    out.put("rows", rows)
+    out.put("rowCount", rows.size().toJsonValue())
+    out.put("aggregationSources", JsonArray([JsonString("config"), JsonString("oapi_diagnostic")]))
     return out
 }
 
@@ -972,6 +1077,21 @@ private func gatewayFeishuAccountOpsJson(): JsonObject {
     return out
 }
 
+private func gatewayFeishuHelperActionsJson(): JsonObject {
+    let helperActions = JsonObject()
+    let typing = JsonObject()
+    typing.put("state", JsonString("not-advertised"))
+    helperActions.put("typing", typing)
+    let forward = JsonObject()
+    forward.put("state", JsonString("not-advertised"))
+    helperActions.put("forward", forward)
+    let chatManage = JsonObject()
+    chatManage.put("state", JsonString("tool-level-only"))
+    chatManage.put("tools", JsonArray([JsonString("feishu_chat"), JsonString("feishu_chat_members")]))
+    helperActions.put("chatManage", chatManage)
+    helperActions
+}
+
 private func gatewayFeishuNativeCommandsJson(): JsonObject {
     let out = JsonObject()
     out.put("supported", true.toJsonValue())
@@ -980,9 +1100,14 @@ private func gatewayFeishuNativeCommandsJson(): JsonObject {
     out.put("commands", JsonArray([
         JsonString("/feishu start"),
         JsonString("/feishu doctor"),
+        JsonString("/feishu_diagnose"),
         JsonString("/feishu auth"),
         JsonString("/feishu info --all")
     ]))
+    out.put("aliases", JsonArray([
+        JsonString("/feishu_diagnose -> /feishu doctor")
+    ]))
+    out.put("helperActions", gatewayFeishuHelperActionsJson())
     out.put("gatewayRpcActions", JsonArray([
         JsonString("channels.feishu.auth.start"),
         JsonString("channels.feishu.auth.status"),
@@ -1070,6 +1195,7 @@ private func gatewayFeishuChannelDiagnosticsJson(user: GatewayUserSettings, runt
     out.put("media", gatewayFeishuMediaJson(user))
     out.put("pairing", gatewayFeishuPairingCollectionJson(user))
     out.put("nativeCommands", gatewayFeishuNativeCommandsJson())
+    out.put("helperActions", gatewayFeishuHelperActionsJson())
     out.put("eventOwnership", gatewayFeishuEventOwnershipDiagnosticsJson(user, runtime: runtime))
     out.put("unsupportedFields", account.get("unsupportedFields") ?? JsonArray([]))
     out.put("ignoredFields", account.get("ignoredFields") ?? JsonArray([]))

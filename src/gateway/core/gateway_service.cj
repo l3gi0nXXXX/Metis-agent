@@ -734,7 +734,8 @@ public class GatewayService {
         if (normalized == "/feishu start" || normalized == "/feishu_start") {
             return "start"
         }
-        if (normalized == "/feishu doctor" || normalized == "/feishu_doctor") {
+        if (normalized == "/feishu doctor" || normalized == "/feishu_doctor" ||
+            normalized == "/feishu diagnose" || normalized == "/feishu_diagnose") {
             return "doctor"
         }
         if (normalized == "/feishu auth" || normalized == "/feishu_auth" ||
@@ -753,6 +754,7 @@ public class GatewayService {
         "Metis Feishu commands\n" +
             "- /feishu start: validate Feishu gateway and AgentTeam routing basics\n" +
             "- /feishu doctor: run read-only diagnostics\n" +
+            "- /feishu_diagnose: alias of /feishu doctor\n" +
             "- /feishu auth: show authorization status and next steps\n" +
             "- /feishu info --all: show redacted runtime information"
     }
@@ -799,6 +801,9 @@ public class GatewayService {
         lines.add("OAPI: ${this.feishuNativeOapiDisplayStatus(hasCredentials, oauthStatus)}")
         lines.add("CardKit/live cards: external-resource-required")
         lines.add("live resource smoke: external-resource-required")
+        lines.add("helper typing: not-advertised")
+        lines.add("helper forward: not-advertised")
+        lines.add("helper chat-manage: tool-level-only feishu_chat/feishu_chat_members")
         lines.add("liveNetwork: not_started")
         lines.add(this.feishuNativeRouteReadinessLine(_message, normalized))
         this.appendFeishuNativeReadinessLines(lines, hasCredentials, oauthStatus)

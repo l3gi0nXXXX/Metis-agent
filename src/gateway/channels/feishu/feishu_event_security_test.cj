@@ -83,26 +83,38 @@ public class FeishuEventSecurityTest {
     }
 
     @TestCase
-    public func encryptedPayloadReturnsTypedDiagnosticUntilAesDecryptIsAvailable(): Unit {
+    public func encryptedPayloadDecryptsAndThenValidatesToken(): Unit {
+        let encrypted = "ABEiM0RVZneImaq7zN3u/5f76ryZoPwujsln9/QfGNKjLdREzbpt+QVZ04RRTkCx3TlSJK/0t+v1HtinlXGZecGZFiWFmXI/UT04C6LJNEvMbJw27wiSzYf9k2vjRxK+"
         let result = feishuValidateEventSecurity(
             timestamp: "1700000000",
             nonce: "nonce-1",
             signature: "",
-            payload: "{\"encrypt\":\"ciphertext\"}",
-            verificationToken: "",
+            payload: "{\"encrypt\":\"${encrypted}\"}",
+            verificationToken: "verify-token",
             encryptKey: "encrypt-key",
             requireSignature: false,
             maxSkewSeconds: 10,
             nowSeconds: 1700000001
         )
 
-        @Expect(result.ok, false)
-        @Expect(result.reason, "encrypted_payload_unsupported")
-        @Expect(result.error.contains("AES"), true)
+        @Expect(result.ok, true)
+        @Expect(result.reason, "ok")
+        @Expect(result.payload.contains("\"challenge\":\"hello\""), true)
 
-        let decrypt = feishuDecryptEncryptedEventPayload(encryptKey: "encrypt-key", encryptedPayload: "ciphertext")
+        let decrypt = feishuDecryptEncryptedEventPayload(encryptKey: "encrypt-key", encryptedPayload: encrypted)
+        @Expect(decrypt.ok, true)
+        @Expect(decrypt.status, "decrypted")
+        @Expect(decrypt.payload.contains("\"token\":\"verify-token\""), true)
+    }
+
+    @TestCase
+    public func encryptedPayloadRejectsWrongKeyWithoutLeakingPayload(): Unit {
+        let decrypt = feishuDecryptEncryptedEventPayload(
+            encryptKey: "wrong-key",
+            encryptedPayload: "ABEiM0RVZneImaq7zN3u/5f76ryZoPwujsln9/QfGNKjLdREzbpt+QVZ04RRTkCx3TlSJK/0t+v1HtinlXGZecGZFiWFmXI/UT04C6LJNEvMbJw27wiSzYf9k2vjRxK+"
+        )
         @Expect(decrypt.ok, false)
-        @Expect(decrypt.status, "unsupported")
-        @Expect(decrypt.error.contains("AES"), true)
+        @Expect(decrypt.status, "decrypt_failed")
+        @Expect(decrypt.error.contains("verify-token"), false)
     }
 }

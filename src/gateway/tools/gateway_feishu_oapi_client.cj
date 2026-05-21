@@ -7,6 +7,7 @@ import std.convert.Parsable
 import std.env.getVariable
 import std.fs.{Directory, File, Path, exists}
 import std.time.DateTime
+import stdx.crypto.digest.{HMAC, HashType}
 import stdx.encoding.json.{JsonArray, JsonBool, JsonInt, JsonObject, JsonString, JsonValue}
 import stdx.encoding.url.URL
 import stdx.net.http.*
@@ -900,13 +901,16 @@ private class FeishuOapiStoredToken {
 }
 
 private let FEISHU_OAPI_TOKEN_STORE_FORMAT = "metis-feishu-token-v2"
-private let FEISHU_OAPI_TOKEN_STORE_ENCODING = "obfuscated-hex-v1"
+private let FEISHU_OAPI_TOKEN_STORE_ENCODING = "authenticated-obfuscated-hex-hmac-sha256-v1"
+private let FEISHU_OAPI_TOKEN_STORE_LEGACY_ENCODING = "obfuscated-hex-v1"
 
 private func feishuOapiStoredTokenEnvelope(accountId: String, payload: JsonObject): JsonObject {
+    let encoded = feishuOapiObfuscatePayload(accountId, payload.toJsonString())
     let out = JsonObject()
     out.put("format", JsonString(FEISHU_OAPI_TOKEN_STORE_FORMAT))
     out.put("encoding", JsonString(FEISHU_OAPI_TOKEN_STORE_ENCODING))
-    out.put("payload", JsonString(feishuOapiObfuscatePayload(accountId, payload.toJsonString())))
+    out.put("payload", JsonString(encoded))
+    out.put("mac", JsonString(feishuOapiPayloadMac(accountId, encoded)))
     out.put("redacted", JsonBool(true))
     out
 }
@@ -915,6 +919,14 @@ private func feishuOapiStoredTokenPayloadObject(accountId: String, raw: String):
     let parsed = JsonValue.fromStr(raw).asObject()
     if (feishuOapiJsonString(parsed, "format") == FEISHU_OAPI_TOKEN_STORE_FORMAT &&
         feishuOapiJsonString(parsed, "encoding") == FEISHU_OAPI_TOKEN_STORE_ENCODING) {
+        let payload = feishuOapiJsonString(parsed, "payload")
+        if (!feishuOapiVerifyPayloadMac(accountId, payload, feishuOapiJsonString(parsed, "mac"))) {
+            throw Exception("invalid Feishu token store authentication")
+        }
+        return JsonValue.fromStr(feishuOapiDeobfuscatePayload(accountId, payload)).asObject()
+    }
+    if (feishuOapiJsonString(parsed, "format") == FEISHU_OAPI_TOKEN_STORE_FORMAT &&
+        feishuOapiJsonString(parsed, "encoding") == FEISHU_OAPI_TOKEN_STORE_LEGACY_ENCODING) {
         return JsonValue.fromStr(feishuOapiDeobfuscatePayload(accountId, feishuOapiJsonString(parsed, "payload"))).asObject()
     }
     parsed
@@ -922,6 +934,31 @@ private func feishuOapiStoredTokenPayloadObject(accountId: String, raw: String):
 
 private func feishuOapiObfuscationKey(accountId: String): Array<Byte> {
     ("metis-feishu-token-store-v1:" + feishuOapiNormalizeAccountId(accountId)).toArray()
+}
+
+private func feishuOapiAuthenticationKey(accountId: String): Array<Byte> {
+    ("metis-feishu-token-store-auth-v1:" + feishuOapiNormalizeAccountId(accountId)).toArray()
+}
+
+private func feishuOapiPayloadMac(accountId: String, payload: String): String {
+    let mac = HMAC(feishuOapiAuthenticationKey(accountId), HashType.SHA256)
+    mac.write((feishuOapiNormalizeAccountId(accountId) + "\n" + payload).toArray())
+    feishuOapiHexEncode(mac.finish())
+}
+
+private func feishuOapiVerifyPayloadMac(accountId: String, payload: String, expected: String): Bool {
+    let cleanExpected = expected.trimAscii().toAsciiLower()
+    let actual = feishuOapiPayloadMac(accountId, payload)
+    if (cleanExpected.size != actual.size || cleanExpected.isEmpty()) {
+        return false
+    }
+    var diff: Int64 = 0
+    let left = cleanExpected.toArray()
+    let right = actual.toArray()
+    for (i in 0..left.size) {
+        diff = diff | (Int64(left[i]) ^ Int64(right[i]))
+    }
+    diff == 0
 }
 
 private func feishuOapiObfuscatePayload(accountId: String, raw: String): String {

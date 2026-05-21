@@ -45,6 +45,81 @@ public class FeishuLongConnectTest {
         root
     }
 
+    @TestCase
+    public func pbbp2FrameCodecRoundTripsEventFrameAndBuildsAck(): Unit {
+        let payload = "{\"header\":{\"event_type\":\"im.message.receive_v1\"},\"event\":{\"message\":{\"message_id\":\"om_codec\"}}}"
+        let frame = FeishuLongConnectFrame(
+            seqId: 7,
+            logId: 9,
+            service: 100,
+            method: 1,
+            headers: [
+                FeishuLongConnectFrameHeader("type", "event"),
+                FeishuLongConnectFrameHeader("message_id", "msg-1"),
+                FeishuLongConnectFrameHeader("sum", "1"),
+                FeishuLongConnectFrameHeader("seq", "0"),
+                FeishuLongConnectFrameHeader("trace_id", "trace-1")
+            ],
+            payloadEncoding: "none",
+            payloadType: "json",
+            payload: payload.toArray(),
+            logIdNew: "log-new"
+        )
+
+        let encoded = feishuLongConnectEncodeFrame(frame)
+        let decoded = feishuLongConnectDecodeFrame(encoded)
+        @Expect(decoded.seqId, 7)
+        @Expect(decoded.logId, 9)
+        @Expect(decoded.service, 100)
+        @Expect(decoded.method, 1)
+        @Expect(decoded.headerValue("type"), "event")
+        @Expect(decoded.headerValue("trace_id"), "trace-1")
+        @Expect(decoded.payloadType, "json")
+        @Expect(String.fromUtf8(decoded.payload), payload)
+
+        let session = FeishuLongConnectFrameSession()
+        let result = session.handleBytes(encoded)
+        @Expect(result.status, "event")
+        @Expect(result.eventRoots.size, 1)
+        @Expect(result.responseFrames.size, 1)
+        @Expect(result.responseFrames[0].payload.size > 0, true)
+        @Expect(String.fromUtf8(result.responseFrames[0].payload).contains("\"code\":200"), true)
+    }
+
+    @TestCase
+    public func pbbp2FrameSessionMergesFragmentedEventPayload(): Unit {
+        let left = "{\"header\":{\"event_type\":\"im.message.receive_v1\"},"
+        let right = "\"event\":{\"message\":{\"message_id\":\"om_fragment\"}}}"
+        let session = FeishuLongConnectFrameSession()
+        let first = session.handleFrame(FeishuLongConnectFrame(
+            method: 1,
+            headers: [
+                FeishuLongConnectFrameHeader("type", "event"),
+                FeishuLongConnectFrameHeader("message_id", "frag-1"),
+                FeishuLongConnectFrameHeader("sum", "2"),
+                FeishuLongConnectFrameHeader("seq", "0")
+            ],
+            payload: left.toArray()
+        ))
+        @Expect(first.status, "fragment_pending")
+        @Expect(first.eventRoots.size, 0)
+
+        let second = session.handleFrame(FeishuLongConnectFrame(
+            method: 1,
+            headers: [
+                FeishuLongConnectFrameHeader("type", "event"),
+                FeishuLongConnectFrameHeader("message_id", "frag-1"),
+                FeishuLongConnectFrameHeader("sum", "2"),
+                FeishuLongConnectFrameHeader("seq", "1")
+            ],
+            payload: right.toArray()
+        ))
+        @Expect(second.status, "event")
+        @Expect(second.eventRoots.size, 1)
+        @Expect(second.eventRoots[0].get("event").isSome(), true)
+        @Expect(second.responseFrames.size, 1)
+    }
+
     private func idObject(openId: String): JsonObject {
         let out = JsonObject()
         out.put("open_id", JsonString(openId))

@@ -1470,17 +1470,27 @@ public class FeishuAdapter <: ChannelAdapter {
         let encrypted = this.readStringField(root, "encrypt").trimAscii()
         if (!encrypted.isEmpty()) {
             let decrypt = feishuDecryptEncryptedEventPayload(encryptKey: this.config.encryptKey, encryptedPayload: encrypted)
-            this.feishuNativeLongConnectLastError = decrypt.error
-            this.logChannel(
-                "warn",
-                MetisLogEvent.channelFailed,
-                "long_connect",
-                "failed",
-                "Feishu native long-connect encrypted event is unsupported",
-                errorKind: "validation",
-                error: decrypt.error,
-                accountId: this.accountId
-            )
+            if (!decrypt.ok) {
+                this.feishuNativeLongConnectLastError = decrypt.error
+                this.logChannel(
+                    "warn",
+                    MetisLogEvent.channelFailed,
+                    "long_connect",
+                    "failed",
+                    "Feishu native long-connect encrypted event decrypt failed",
+                    errorKind: "validation",
+                    error: decrypt.error,
+                    accountId: this.accountId
+                )
+                return
+            }
+            let decryptedRoot = try {
+                JsonValue.fromStr(decrypt.payload).asObject()
+            } catch (_e: Exception) {
+                this.feishuNativeLongConnectLastError = "Feishu encrypted event decrypted to invalid JSON"
+                return
+            }
+            let _ = this.feishuDispatchEventRoot(decryptedRoot)
             return
         }
         let _ = this.feishuDispatchEventRoot(root)

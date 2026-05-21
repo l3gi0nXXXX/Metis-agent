@@ -310,6 +310,56 @@ public class GatewayServiceFeishuNativeTest {
     }
 
     @TestCase
+    public func feishuDiagnoseAliasRunsDoctorAndHelpDocumentsEquivalence(): Unit {
+        withGatewayFeishuNativeTestHome("diagnose-alias", gatewayFeishuNativeTestRoot(appSecret: "diagnose-secret"), { =>
+            let adapter = GatewayFeishuNativeTestAdapter()
+            let service = gatewayFeishuNativeService(adapter)
+            service.start()
+            try {
+                adapter.queueDirect("/feishu_diagnose")
+                adapter.queueDirect("/feishu help")
+                service.processOnce()
+                service.processOnce()
+                @Expect(adapter.sentCount(), 2)
+
+                let diagnose = adapter.sentText(0)
+                @Expect(diagnose.contains("Metis Feishu doctor"), true)
+                @Expect(diagnose.contains("diagnose-secret"), false)
+                @Expect(diagnose.contains("\"ok\""), false)
+                @Expect(diagnose.contains("\"result\""), false)
+
+                let help = adapter.sentText(1)
+                @Expect(help.contains("/feishu_diagnose"), true)
+                @Expect(help.contains("alias of /feishu doctor"), true)
+                @Expect(help.contains("\"ok\""), false)
+                @Expect(help.contains("\"result\""), false)
+            } finally {
+                service.stop()
+            }
+        })
+    }
+
+    @TestCase
+    public func feishuDoctorStatesHelperActionDecisionsWithoutAdvertisingUnsupportedActions(): Unit {
+        withGatewayFeishuNativeTestHome("helper-decisions", gatewayFeishuNativeTestRoot(appSecret: "helper-secret"), { =>
+            let adapter = GatewayFeishuNativeTestAdapter()
+            let service = gatewayFeishuNativeService(adapter)
+            service.start()
+            try {
+                adapter.queueDirect("/feishu doctor")
+                service.processOnce()
+                let reply = adapter.sentText(0)
+                @Expect(reply.contains("helper typing: not-advertised"), true)
+                @Expect(reply.contains("helper forward: not-advertised"), true)
+                @Expect(reply.contains("helper chat-manage: tool-level-only feishu_chat/feishu_chat_members"), true)
+                @Expect(reply.contains("helper-secret"), false)
+            } finally {
+                service.stop()
+            }
+        })
+    }
+
+    @TestCase
     public func feishuNativeCommandsExposePairingCountsWithoutCodesOrSenderDetails(): Unit {
         withGatewayFeishuNativeTestHome("pairing-visible", gatewayFeishuNativeTestRoot(appSecret: "pairing-secret"), { =>
             let store = gatewayPairingAccountStore(channel: "feishu", accountId: "default", rootDir: CliConfig.dotDir)

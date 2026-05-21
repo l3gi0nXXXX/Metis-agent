@@ -868,6 +868,46 @@ public class GatewayServerMethodsChannelsTest {
     }
 
     @TestCase
+    public func feishuChannelDirectoryIncludesConfigRowsAndAuthDiagnostics(): Unit {
+        var user = GatewayUserSettings()
+        user.feishu.enabled = true
+        user.feishu.defaultAccount = "tenant-a"
+        user.feishu.appId = "global-app"
+        user.feishu.appSecret = "global-secret"
+        let accounts = JsonObject()
+        let tenantA = JsonObject()
+        let tenantAGroups = JsonObject()
+        tenantAGroups.put("tenant_a_group", JsonObject())
+        tenantA.put("groups", tenantAGroups)
+        accounts.put("tenant-a", tenantA)
+        accounts.put("tenant-b", JsonObject())
+        user.feishu.accounts = Some(accounts)
+        let groups = JsonObject()
+        groups.put("global_group", JsonObject())
+        user.feishu.groups = Some(groups)
+
+        let channel = gatewayChannelGetJson(user, "feishu")
+        let directory = channel.get("directory").getOrThrow().asObject()
+        let rows = directory.get("rows").getOrThrow().asArray()
+        @Expect(rows.size() >= 6, true)
+        @Expect(channelsRowsContainStringField(rows, "accountId", "tenant-a"), true)
+        @Expect(channelsRowsContainStringField(rows, "accountId", "tenant-b"), true)
+        @Expect(channelsRowsContainStringField(rows, "id", "global_group"), true)
+        @Expect(channelsRowsContainStringField(rows, "id", "tenant_a_group"), true)
+        @Expect(channelsRowsContainStringField(rows, "source", "config"), true)
+        @Expect(channelsRowsContainStringField(rows, "source", "oapi_diagnostic"), true)
+        @Expect(channelsRowsContainStringField(rows, "status", "auth_required"), true)
+        let authRow = channelsRowByStringField(rows, "source", "oapi_diagnostic")
+        @Expect(channelsTestString(authRow, "accountId"), "tenant-a")
+        @Expect(authRow.get("diagnostic").getOrThrow().asObject()
+            .get("code").getOrThrow().asString().getValue(), "auth_required")
+        let sources = directory.get("aggregationSources").getOrThrow().asArray().toJsonString()
+        @Expect(sources.contains("config"), true)
+        @Expect(sources.contains("oapi_diagnostic"), true)
+        @Expect(channelsTestInt(directory, "rowCount"), rows.size())
+    }
+
+    @TestCase
     public func feishuChannelGetExposesPairingSummaryWithoutCodesOrSenderDetails(): Unit {
         withGatewayChannelsTestHome {
             var user = GatewayUserSettings()
@@ -1040,10 +1080,25 @@ public class GatewayServerMethodsChannelsTest {
         @Expect(channelsTestString(nativeCommands, "surface"), "feishu-im-native-command")
         @Expect(commands.contains("/feishu start"), true)
         @Expect(commands.contains("/feishu doctor"), true)
+        @Expect(commands.contains("/feishu_diagnose"), true)
         @Expect(commands.contains("/feishu auth"), true)
         @Expect(rpcActions.contains("channels.feishu.auth.start"), true)
         @Expect(rpcActions.contains("channels.feishu.auth.status"), true)
         @Expect(diagnostics.get("nativeCommands").isSome(), true)
+
+        let aliases = nativeCommands.get("aliases").getOrThrow().asArray().toJsonString()
+        @Expect(aliases.contains("/feishu_diagnose"), true)
+        @Expect(aliases.contains("/feishu doctor"), true)
+
+        let helperActions = diagnostics.get("helperActions").getOrThrow().asObject()
+        let typing = helperActions.get("typing").getOrThrow().asObject()
+        let forward = helperActions.get("forward").getOrThrow().asObject()
+        let chatManage = helperActions.get("chatManage").getOrThrow().asObject()
+        @Expect(channelsTestString(typing, "state"), "not-advertised")
+        @Expect(channelsTestString(forward, "state"), "not-advertised")
+        @Expect(channelsTestString(chatManage, "state"), "tool-level-only")
+        @Expect(chatManage.get("tools").getOrThrow().asArray().toJsonString().contains("feishu_chat_members"), true)
+
         @Expect(raw.contains("tenant-app"), false)
         @Expect(raw.contains("legacy-secret-never-visible"), false)
     }
