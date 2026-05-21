@@ -494,6 +494,29 @@ public class FeishuAdapter <: ChannelAdapter {
         }
     }
 
+    private func logFeishuSidecarLifecycle(
+        level: String,
+        event: String,
+        phase: String,
+        status: String,
+        message: String,
+        errorKind!: String = "none",
+        error!: String = "",
+        extra!: JsonObject = JsonObject()
+    ): Unit {
+        this.logChannel(
+            level,
+            event,
+            phase,
+            status,
+            message,
+            errorKind: errorKind,
+            error: error,
+            accountId: this.accountId,
+            extra: extra
+        )
+    }
+
     private func feishuErrorKind(detail: String): String {
         let lowered = detail.trimAscii().toAsciiLower()
         if (lowered.isEmpty()) { return "unknown" }
@@ -3692,48 +3715,70 @@ public class FeishuAdapter <: ChannelAdapter {
                     case None =>
                         this.feishuMonitorReady = false
                         this.feishuMonitorLastError = ""
-                        let process = launch(
-                            "node",
-                            this.feishuOfficialSdkMonitorHostArgs(),
-                            stdIn: ProcessRedirect.Pipe,
-                            stdOut: ProcessRedirect.Pipe,
-                            workingDirectory: Some(this.feishuProjectRootForMonitorHost())
-                        )
-                        this.feishuMonitorProcess = Some(process)
-                        let writer = StringWriter(process.stdInPipe)
-                        this.feishuMonitorStdIn = Some(writer)
-                        launchedProcessOpt = Some(process)
-                        launchedWriterOpt = Some(writer)
                         false
                 }
             }
             if (alreadyRunning) {
                 return true
             }
-            match (launchedProcessOpt) {
-                case Some(process) =>
-                    let stdoutFuture = spawn {
-                        let reader = StringReader(process.stdOutPipe)
-                        while (true) {
-                            match (reader.readln()) {
-                                case Some(line) => this.handleFeishuOfficialSdkMonitorHostLine(line)
-                                case None => break
-                            }
-                        }
-                        synchronized(this.feishuMonitorLock) {
-                            this.feishuMonitorProcess = None
-                            this.feishuMonitorStdIn = None
-                            this.feishuMonitorReady = false
-                            if (this.feishuMonitorLastError.isEmpty()) {
-                                this.feishuMonitorLastError = "monitor-host-stdout-closed"
-                            }
-                        }
+            let launchMeta = JsonObject()
+            launchMeta.put("scriptPath", JsonString(this.feishuOfficialSdkMonitorHostScript().toString()))
+            launchMeta.put("depsRoot", JsonString(this.feishuOfficialSdkDepsRoot().toString()))
+            this.logFeishuSidecarLifecycle(
+                "info",
+                MetisLogEvent.channelStarting,
+                "sidecar.launch",
+                "begin",
+                "Feishu official SDK monitor host launch begin",
+                extra: launchMeta
+            )
+            let process = launch(
+                "node",
+                this.feishuOfficialSdkMonitorHostArgs(),
+                stdIn: ProcessRedirect.Pipe,
+                stdOut: ProcessRedirect.Pipe,
+                workingDirectory: Some(this.feishuProjectRootForMonitorHost())
+            )
+            let writer = StringWriter(process.stdInPipe)
+            launchedProcessOpt = Some(process)
+            launchedWriterOpt = Some(writer)
+            let stdoutFuture = spawn {
+                this.logFeishuSidecarLifecycle(
+                    "info",
+                    MetisLogEvent.channelStarted,
+                    "sidecar.stdout.reader",
+                    "started",
+                    "Feishu official SDK monitor host stdout reader started"
+                )
+                let reader = StringReader(process.stdOutPipe)
+                while (true) {
+                    match (reader.readln()) {
+                        case Some(line) => this.handleFeishuOfficialSdkMonitorHostLine(line)
+                        case None => break
                     }
-                    synchronized(this.feishuMonitorLock) {
-                        this.feishuMonitorStdoutFuture = Some(stdoutFuture)
+                }
+                synchronized(this.feishuMonitorLock) {
+                    this.feishuMonitorProcess = None
+                    this.feishuMonitorStdIn = None
+                    this.feishuMonitorReady = false
+                    if (this.feishuMonitorLastError.isEmpty()) {
+                        this.feishuMonitorLastError = "monitor-host-stdout-closed"
                     }
-                case None => ()
+                }
             }
+            synchronized(this.feishuMonitorLock) {
+                this.feishuMonitorProcess = launchedProcessOpt
+                this.feishuMonitorStdIn = launchedWriterOpt
+                this.feishuMonitorStdoutFuture = Some(stdoutFuture)
+            }
+            this.logFeishuSidecarLifecycle(
+                "info",
+                MetisLogEvent.channelStarted,
+                "sidecar.launch",
+                "started",
+                "Feishu official SDK monitor host launch started",
+                extra: launchMeta
+            )
             match (launchedWriterOpt) {
                 case Some(writer) =>
                     writer.write(this.feishuOfficialSdkMonitorHostInitFrame())
@@ -3748,6 +3793,16 @@ public class FeishuAdapter <: ChannelAdapter {
         }
         var waitedMs: Int64 = 0
         let timeoutMs = this.feishuOfficialSdkMonitorStartupTimeoutMs()
+        let readyMeta = JsonObject()
+        readyMeta.put("timeoutMs", JsonInt(timeoutMs))
+        this.logFeishuSidecarLifecycle(
+            "info",
+            MetisLogEvent.channelStarted,
+            "sidecar.ready",
+            "waiting",
+            "Feishu official SDK monitor host ready wait begin",
+            extra: readyMeta
+        )
         while (waitedMs < timeoutMs) {
             var failedBeforeReady = false
             synchronized(this.feishuMonitorLock) {
@@ -3759,7 +3814,10 @@ public class FeishuAdapter <: ChannelAdapter {
                 }
                 match (this.feishuMonitorProcess) {
                     case Some(_) => ()
-                    case None => return false
+                    case None =>
+                        if (!failedBeforeReady) {
+                            return false
+                        }
                 }
             }
             if (failedBeforeReady) {
@@ -3774,6 +3832,19 @@ public class FeishuAdapter <: ChannelAdapter {
                 this.feishuMonitorLastError = "monitor-host-timeout"
             }
         }
+        let timeoutMeta = JsonObject()
+        timeoutMeta.put("timeoutMs", JsonInt(timeoutMs))
+        timeoutMeta.put("waitedMs", JsonInt(waitedMs))
+        this.logFeishuSidecarLifecycle(
+            "warn",
+            MetisLogEvent.channelFailed,
+            "sidecar.ready",
+            "timeout",
+            "Feishu official SDK monitor host ready wait timed out",
+            errorKind: "sidecar",
+            error: "monitor-host-timeout",
+            extra: timeoutMeta
+        )
         this.stopFeishuOfficialSdkMonitorHost()
         false
     }
@@ -3785,6 +3856,18 @@ public class FeishuAdapter <: ChannelAdapter {
             processOpt = this.feishuMonitorProcess
             writerOpt = this.feishuMonitorStdIn
         }
+        let beginMeta = JsonObject()
+        beginMeta.put("processPresent", JsonBool(processOpt.isSome()))
+        beginMeta.put("writerPresent", JsonBool(writerOpt.isSome()))
+        this.logFeishuSidecarLifecycle(
+            "info",
+            MetisLogEvent.channelStopped,
+            "sidecar.stop",
+            "begin",
+            "Feishu official SDK monitor host stop begin",
+            extra: beginMeta
+        )
+        var forced = false
         match (writerOpt) {
             case Some(writer) =>
                 try {
@@ -3799,6 +3882,7 @@ public class FeishuAdapter <: ChannelAdapter {
             case Some(process) =>
                 let gracefulStopped = feishuWaitForMonitorHostExit(process, feishuMonitorHostGraceStopWaitMs())
                 if (!gracefulStopped) {
+                    forced = true
                     try {
                         process.terminate(force: true)
                     } catch (_e: Exception) {
@@ -3814,17 +3898,49 @@ public class FeishuAdapter <: ChannelAdapter {
             this.feishuMonitorStdoutFuture = None
             this.feishuMonitorReady = false
         }
+        let doneMeta = JsonObject()
+        doneMeta.put("processPresent", JsonBool(processOpt.isSome()))
+        doneMeta.put("forced", JsonBool(forced))
+        this.logFeishuSidecarLifecycle(
+            "info",
+            MetisLogEvent.channelStopped,
+            "sidecar.stop",
+            "done",
+            "Feishu official SDK monitor host stop done",
+            extra: doneMeta
+        )
     }
 
     private func cleanupStaleFeishuOfficialSdkMonitorHosts(): Unit {
+        let beginMeta = JsonObject()
+        beginMeta.put("scriptPath", JsonString(this.feishuOfficialSdkMonitorHostScript().toString()))
+        this.logFeishuSidecarLifecycle(
+            "info",
+            MetisLogEvent.channelStarting,
+            "sidecar.cleanup",
+            "begin",
+            "Feishu official SDK monitor host cleanup begin",
+            extra: beginMeta
+        )
         let stalePids = feishuFindStaleMonitorHostPids(
             this.feishuOfficialSdkMonitorHostScript().toString(),
             this.config.appId
         )
-        if (stalePids.isEmpty()) {
-            return
+        var killed: Array<Int64> = []
+        if (!stalePids.isEmpty()) {
+            killed = feishuKillMonitorHostPids(stalePids)
         }
-        let killed = feishuKillMonitorHostPids(stalePids)
+        let doneMeta = JsonObject()
+        doneMeta.put("stalePidCount", stalePids.size.toJsonValue())
+        doneMeta.put("killedPidCount", killed.size.toJsonValue())
+        this.logFeishuSidecarLifecycle(
+            "info",
+            MetisLogEvent.channelStopped,
+            "sidecar.cleanup",
+            "done",
+            "Feishu official SDK monitor host cleanup done",
+            extra: doneMeta
+        )
         if (killed.size > 0) {
             let killedText = String.join(killed.map({ pid => pid.toString() }), delimiter: ",")
             let extra = JsonObject()
@@ -4340,7 +4456,7 @@ private func feishuFindStaleMonitorHostPids(scriptPath: String, appId: String): 
         return []
     }
     let (exitCode, stdOut, _) = ShellUtils.execute(
-        ["sh", "-c", feishuMonitorHostPsLookupCommand(scriptPath, appId)],
+        ["sh", "-c", "${feishuMonitorHostPsLookupCommand(scriptPath, appId)} || true"],
         withWrap: false
     )
     if (exitCode != 0) {

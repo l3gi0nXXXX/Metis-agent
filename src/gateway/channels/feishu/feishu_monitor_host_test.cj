@@ -1,5 +1,7 @@
 package metis.gateway.channels.feishu
 
+import metis.core.config.{CliConfig, CliSettingManager}
+import metis.gateway.logging.gatewayLoggingResetForTest
 import metis.gateway.model.FeishuConfig
 import metis.utils.ShellUtils
 import std.env.{getVariable, setVariable}
@@ -61,6 +63,72 @@ private func feishuMonitorHostFakeScript(): String {
     "setInterval(() => {}, 1000);\n"
 }
 
+private func restoreFeishuMonitorHostEnv(name: String, oldValue: Option<String>): Unit {
+    match (oldValue) {
+        case Some(value) => setVariable(name, value)
+        case None => setVariable(name, "")
+    }
+}
+
+private func withFeishuMonitorHostLogCapture<T>(label: String, block: (String) -> T): T {
+    let oldHome = getVariable("METIS_HOME")
+    let oldLogLevel = getVariable("METIS_LOG_LEVEL")
+    let oldLogFile = getVariable("METIS_LOG_FILE")
+    let oldConsoleLevel = getVariable("METIS_CONSOLE_LEVEL")
+    let root = feishuMonitorHostTestRoot("logs-${label}")
+    let logPath = root.join("logs").join("feishu-monitor-host.log")
+    try {
+        setVariable("METIS_HOME", root.toString())
+        setVariable("METIS_LOG_LEVEL", "debug")
+        setVariable("METIS_LOG_FILE", logPath.toString())
+        setVariable("METIS_CONSOLE_LEVEL", "silent")
+        CliConfig.invalidatePathCache()
+        CliSettingManager.invalidate()
+        gatewayLoggingResetForTest()
+        return block(logPath.toString())
+    } finally {
+        restoreFeishuMonitorHostEnv("METIS_HOME", oldHome)
+        restoreFeishuMonitorHostEnv("METIS_LOG_LEVEL", oldLogLevel)
+        restoreFeishuMonitorHostEnv("METIS_LOG_FILE", oldLogFile)
+        restoreFeishuMonitorHostEnv("METIS_CONSOLE_LEVEL", oldConsoleLevel)
+        CliConfig.invalidatePathCache()
+        CliSettingManager.invalidate()
+        gatewayLoggingResetForTest()
+        try { remove(root, recursive: true) } catch (_e: Exception) { () }
+    }
+}
+
+private func readFeishuMonitorHostLog(path: String): String {
+    if (!exists(Path(path))) {
+        return ""
+    }
+    String.fromUtf8(File.readFrom(Path(path)))
+}
+
+private func feishuMonitorHostLogFieldContains(raw: String, key: String, value: String): Bool {
+    raw.contains("\"${key}\":\"${value}\"") || raw.contains("\"${key}\": \"${value}\"")
+}
+
+private func feishuMonitorHostLogContains(raw: String, phase: String, status: String): Bool {
+    for (entry in raw.split("{")) {
+        if (feishuMonitorHostLogFieldContains(entry, "phase", phase) &&
+            feishuMonitorHostLogFieldContains(entry, "status", status)) {
+            return true
+        }
+    }
+    false
+}
+
+private func expectFeishuMonitorHostLogHas(raw: String, phase: String, status: String): Unit {
+    @Expect(feishuMonitorHostLogContains(raw, phase, status), true)
+}
+
+private func expectFeishuMonitorHostLogSecretsRedacted(raw: String): Unit {
+    @Expect(raw.contains("sidecar-secret-never-in-argv"), false)
+    @Expect(raw.contains("verification-token-never-in-argv"), false)
+    @Expect(raw.contains("encrypt-key-never-in-argv"), false)
+}
+
 private func createFeishuMonitorHostFixture(label: String): (Path, Path) {
     let root = feishuMonitorHostTestRoot(label)
     let script = root.join("scripts").join("feishu-ws-sidecar.mjs")
@@ -86,9 +154,10 @@ private func feishuMonitorHostTestConfig(appId: String): FeishuConfig {
 }
 
 private func feishuMonitorHostProcessAlive(pidFile: Path): Bool {
-    let command = "test -s ${feishuMonitorHostShellSingleQuote(pidFile.toString())} && kill -0 $(cat ${feishuMonitorHostShellSingleQuote(pidFile.toString())}) 2>/dev/null"
-    let (exitCode, _, _) = ShellUtils.execute(["sh", "-c", command], withWrap: false)
-    exitCode == 0
+    let quotedPath = feishuMonitorHostShellSingleQuote(pidFile.toString())
+    let command = "if test -s ${quotedPath} && kill -0 $(cat ${quotedPath}) 2>/dev/null; then echo alive; fi"
+    let (_, stdOut, _) = ShellUtils.execute(["sh", "-c", command], withWrap: false)
+    stdOut.trimAscii() == "alive"
 }
 
 @Test
@@ -148,17 +217,29 @@ public class FeishuMonitorHostTest {
 
     @TestCase
     public func longConnectMarksRunningOnlyAfterMonitorHostReady(): Unit {
-        let (script, depsRoot) = createFeishuMonitorHostFixture("ready")
-        let adapter = FeishuAdapter(
-            config: feishuMonitorHostTestConfig("metis-sidecar-ready"),
-            monitorHostScriptForTest: script.toString(),
-            monitorHostDepsRootForTest: depsRoot.toString(),
-            monitorHostStartupTimeoutMsForTest: 800
-        )
-        adapter.start()
-        @Expect(adapter.debugIsRunningForTest(), true)
-        @Expect(adapter.debugFeishuMonitorLastErrorForTest(), "")
-        adapter.stop()
+        withFeishuMonitorHostLogCapture("ready", { logPath =>
+            let (script, depsRoot) = createFeishuMonitorHostFixture("ready")
+            let adapter = FeishuAdapter(
+                config: feishuMonitorHostTestConfig("metis-sidecar-ready"),
+                monitorHostScriptForTest: script.toString(),
+                monitorHostDepsRootForTest: depsRoot.toString(),
+                monitorHostStartupTimeoutMsForTest: 800
+            )
+            adapter.start()
+            @Expect(adapter.debugIsRunningForTest(), true)
+            @Expect(adapter.debugFeishuMonitorLastErrorForTest(), "")
+            adapter.stop()
+            let raw = readFeishuMonitorHostLog(logPath)
+            expectFeishuMonitorHostLogHas(raw, "sidecar.cleanup", "begin")
+            expectFeishuMonitorHostLogHas(raw, "sidecar.cleanup", "done")
+            expectFeishuMonitorHostLogHas(raw, "sidecar.launch", "begin")
+            expectFeishuMonitorHostLogHas(raw, "sidecar.launch", "started")
+            expectFeishuMonitorHostLogHas(raw, "sidecar.stdout.reader", "started")
+            expectFeishuMonitorHostLogHas(raw, "sidecar.ready", "waiting")
+            expectFeishuMonitorHostLogHas(raw, "sidecar.stop", "begin")
+            expectFeishuMonitorHostLogHas(raw, "sidecar.stop", "done")
+            expectFeishuMonitorHostLogSecretsRedacted(raw)
+        })
     }
 
     @TestCase
@@ -174,41 +255,54 @@ public class FeishuMonitorHostTest {
 
     @TestCase
     public func longConnectStartErrorLeavesAdapterNotRunning(): Unit {
-        let (script, depsRoot) = createFeishuMonitorHostFixture("error")
-        let adapter = FeishuAdapter(
-            config: feishuMonitorHostTestConfig("metis-sidecar-error"),
-            monitorHostScriptForTest: script.toString(),
-            monitorHostDepsRootForTest: depsRoot.toString(),
-            monitorHostStartupTimeoutMsForTest: 800
-        )
-        adapter.start()
-        @Expect(adapter.debugIsRunningForTest(), false)
-        @Expect(adapter.debugFeishuMonitorLastErrorForTest().contains("synthetic-start-error"), true)
+        withFeishuMonitorHostLogCapture("error", { logPath =>
+            let (script, depsRoot) = createFeishuMonitorHostFixture("error")
+            let adapter = FeishuAdapter(
+                config: feishuMonitorHostTestConfig("metis-sidecar-error"),
+                monitorHostScriptForTest: script.toString(),
+                monitorHostDepsRootForTest: depsRoot.toString(),
+                monitorHostStartupTimeoutMsForTest: 800
+            )
+            adapter.start()
+            @Expect(adapter.debugIsRunningForTest(), false)
+            @Expect(adapter.debugFeishuMonitorLastErrorForTest().contains("synthetic-start-error"), true)
+            let raw = readFeishuMonitorHostLog(logPath)
+            expectFeishuMonitorHostLogHas(raw, "sidecar.launch", "begin")
+            expectFeishuMonitorHostLogHas(raw, "sidecar.launch", "started")
+            expectFeishuMonitorHostLogHas(raw, "sidecar.stdout.reader", "started")
+            expectFeishuMonitorHostLogHas(raw, "sidecar.stop", "begin")
+            expectFeishuMonitorHostLogHas(raw, "sidecar.stop", "done")
+            expectFeishuMonitorHostLogSecretsRedacted(raw)
+        })
     }
 
     @TestCase
     public func longConnectHangTimesOutAndCleansSidecarProcess(): Unit {
-        let (script, depsRoot) = createFeishuMonitorHostFixture("hang")
-        let pidFile = script.parent.parent.join("hang.pid")
-        let oldPidFile = getVariable("METIS_FEISHU_TEST_PID_FILE")
-        setVariable("METIS_FEISHU_TEST_PID_FILE", pidFile.toString())
-        try {
-            let adapter = FeishuAdapter(
-                config: feishuMonitorHostTestConfig("metis-sidecar-hang"),
-                monitorHostScriptForTest: script.toString(),
-                monitorHostDepsRootForTest: depsRoot.toString(),
-                monitorHostStartupTimeoutMsForTest: 150
-            )
-            adapter.start()
-            @Expect(adapter.debugIsRunningForTest(), false)
-            @Expect(adapter.debugFeishuMonitorLastErrorForTest(), "monitor-host-timeout")
-            @Expect(adapter.debugFeishuMonitorProcessPresentForTest(), false)
-            @Expect(feishuMonitorHostProcessAlive(pidFile), false)
-        } finally {
-            match (oldPidFile) {
-                case Some(value) => setVariable("METIS_FEISHU_TEST_PID_FILE", value)
-                case None => setVariable("METIS_FEISHU_TEST_PID_FILE", "")
+        withFeishuMonitorHostLogCapture("hang", { logPath =>
+            let (script, depsRoot) = createFeishuMonitorHostFixture("hang")
+            let pidFile = script.parent.parent.join("hang.pid")
+            let oldPidFile = getVariable("METIS_FEISHU_TEST_PID_FILE")
+            setVariable("METIS_FEISHU_TEST_PID_FILE", pidFile.toString())
+            try {
+                let adapter = FeishuAdapter(
+                    config: feishuMonitorHostTestConfig("metis-sidecar-hang"),
+                    monitorHostScriptForTest: script.toString(),
+                    monitorHostDepsRootForTest: depsRoot.toString(),
+                    monitorHostStartupTimeoutMsForTest: 150
+                )
+                adapter.start()
+                @Expect(adapter.debugIsRunningForTest(), false)
+                @Expect(adapter.debugFeishuMonitorLastErrorForTest(), "monitor-host-timeout")
+                @Expect(adapter.debugFeishuMonitorProcessPresentForTest(), false)
+                @Expect(feishuMonitorHostProcessAlive(pidFile), false)
+                let raw = readFeishuMonitorHostLog(logPath)
+                expectFeishuMonitorHostLogHas(raw, "sidecar.ready", "timeout")
+                expectFeishuMonitorHostLogHas(raw, "sidecar.stop", "begin")
+                expectFeishuMonitorHostLogHas(raw, "sidecar.stop", "done")
+                expectFeishuMonitorHostLogSecretsRedacted(raw)
+            } finally {
+                restoreFeishuMonitorHostEnv("METIS_FEISHU_TEST_PID_FILE", oldPidFile)
             }
-        }
+        })
     }
 }
