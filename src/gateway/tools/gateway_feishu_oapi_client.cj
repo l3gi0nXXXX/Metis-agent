@@ -2292,11 +2292,14 @@ private func feishuOapiScopeDiagnostic(
             offline.put("status", JsonString("not_checked"))
             out.put("offline_access", offline)
     }
-    out.put("repair_hints", feishuOapiRepairHints(request))
+    out.put("repair_hints", feishuOapiRepairHints(request, userToken))
     out
 }
 
-private func feishuOapiRepairHints(request: FeishuOapiRequest): JsonObject {
+private func feishuOapiRepairHints(
+    request: FeishuOapiRequest,
+    tokenLookup: Option<FeishuOapiTokenLookup>
+): JsonObject {
     let out = JsonObject()
     out.put("token_mode", JsonString(request.tokenMode))
     out.put("required_scopes", feishuOapiJsonStringArray(request.requiredScopes))
@@ -2320,9 +2323,30 @@ private func feishuOapiRepairHints(request: FeishuOapiRequest): JsonObject {
     out.put("app_scope", appScope)
 
     let credentials = JsonObject()
+    let credentialStatus = match (tokenLookup) {
+        case Some(token) =>
+            if (token.status == "missing_credential") {
+                "missing"
+            } else if (
+                token.status == "authorized" ||
+                token.status == "scope_missing" ||
+                token.status == "app_scope_missing" ||
+                token.status == "auth_required" ||
+                token.status == "expired" ||
+                token.status == "api_error"
+            ) {
+                "not_missing"
+            } else {
+                "not_checked"
+            }
+        case None => "not_checked"
+    }
     credentials.put("required", JsonBool(request.tokenMode != "user_access_token"))
     credentials.put("repair_method", JsonString("configure_feishu_app_credentials"))
-    credentials.put("missing_fields", feishuOapiJsonStringArray(["app_id", "credential_value"]))
+    credentials.put("status", JsonString(credentialStatus))
+    if (credentialStatus == "missing") {
+        credentials.put("missing_fields", feishuOapiJsonStringArray(["app_id", "credential_value"]))
+    }
     credentials.put("network", JsonString("not_started"))
     credentials.put("redacted", JsonBool(true))
     out.put("app_credentials", credentials)

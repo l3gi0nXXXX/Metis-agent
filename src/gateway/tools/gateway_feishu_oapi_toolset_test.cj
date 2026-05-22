@@ -870,6 +870,35 @@ public class GatewayFeishuOapiToolsetTest {
     }
 
     @TestCase
+    public func apiErrorRepairHintsDoNotPretendAppCredentialsAreMissing(): Unit {
+        let params = JsonObject()
+        params.put("message_id", JsonString("om_1"))
+        params.put("file_key", JsonString("img_1"))
+        params.put("type", JsonString("image"))
+        let request = feishuOapiBuildRequest("feishu_im_bot_image", "download", "tenant-a", params)
+
+        let json = MetisFeishuOapiClient(
+            tokenProvider: Some<FeishuOapiTokenProvider>(FeishuOapiToolsetOkTokenProvider()),
+            httpClient: Some<FeishuOapiHttpClient>(FeishuNativeOapiHttpClient(
+                transport: Some<FeishuOapiRawHttpTransport>(FeishuOapiToolsetStaticRawTransport(
+                    503,
+                    body: "{\"code\":1255001,\"msg\":\"busy\"}",
+                    error: "TLS handshake failed (client): certificate verify failed"
+                ))
+            ))
+        ).invoke(request)
+
+        @Expect(json.get("status").getOrThrow().asString().getValue(), "api_error")
+        let appCredentials = json.get("scope_diagnostic").getOrThrow().asObject()
+            .get("repair_hints").getOrThrow().asObject()
+            .get("app_credentials").getOrThrow().asObject()
+        @Expect(appCredentials.get("required").getOrThrow().asBool().getValue(), true)
+        @Expect(appCredentials.get("status").getOrThrow().asString().getValue(), "not_missing")
+        @Expect(appCredentials.get("missing_fields").isNone(), true)
+        @Expect(json.toJsonString().contains("app_secret"), false)
+    }
+
+    @TestCase
     public func firstDomainAndAStageReferenceToolNamesRouteThroughEnvelope(): Unit {
         let captured = ArrayList<String>()
         debugSetGatewayFeishuOapiToolCallRunnerForTest(Some({ method: String, payload: JsonObject =>

@@ -127,6 +127,18 @@ public class GatewayConfigBuilderTest {
     }
 
     @TestCase
+    public func feishuMediaDownloadDefaultsToEnabledWhenUserConfigOmitsMedia(): Unit {
+        var user = GatewayUserSettings()
+        user.feishu.enabled = true
+
+        let (feishu, _, _) = mergeGatewayUserSettings(user)
+
+        @Expect(feishu.media.downloadEnabled, true)
+        @Expect(feishu.media.mediaMaxBytes, 20 * 1024 * 1024)
+        @Expect(feishu.media.downloadRoot, "/tmp/metis-feishu-media")
+    }
+
+    @TestCase
     public func feishuTransportModeDefaultsToSidecarAndNormalizesExplicitNativeLegacy(): Unit {
         var user = GatewayUserSettings()
 
