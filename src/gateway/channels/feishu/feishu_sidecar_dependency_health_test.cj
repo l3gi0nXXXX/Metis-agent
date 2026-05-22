@@ -14,7 +14,7 @@ private func feishuHealthWriteFile(path: Path, content!: String = "{}"): Unit {
 
 private func feishuHealthCreateProject(root: Path): Unit {
     Directory.create(root.join("scripts"), recursive: true)
-    feishuHealthWriteFile(root.join("scripts").join("feishu-openclaw-sidecar.mjs"), content: "console.log('fake')")
+    feishuHealthWriteFile(root.join("scripts").join("feishu-sidecar.mjs"), content: "console.log('fake')")
 }
 
 private func feishuHealthCreateRuntimePackage(runtimeRoot: Path): Unit {
@@ -48,7 +48,7 @@ public class FeishuSidecarDependencyHealthTest {
     public func reportsMissingSidecarScript(): Unit {
         let root = feishuHealthTestTempRoot("missing-script")
         try {
-            let runtimeRoot = root.join("tools").join("feishu-openclaw-sidecar")
+            let runtimeRoot = root.join("tools").join("feishu-sidecar")
             feishuHealthCreateRuntimePackage(runtimeRoot)
             feishuHealthCreateFakeNodeModules(runtimeRoot)
 
@@ -59,7 +59,9 @@ public class FeishuSidecarDependencyHealthTest {
             )
             @Expect(health.status, "missing")
             @Expect(health.missingRequirements.contains("sidecar_script"), true)
-            @Expect(health.installHint.contains("npm --prefix tools/feishu-openclaw-sidecar install"), true)
+            @Expect(health.installHint.contains("npm --prefix tools/feishu-sidecar install"), true)
+            let forbidden = "open" + "claw"
+            @Expect(health.toJson().toJsonString().contains(forbidden), false)
         } finally {
             try { remove(root, recursive: true) } catch (_e: Exception) { () }
         }
@@ -70,7 +72,7 @@ public class FeishuSidecarDependencyHealthTest {
         let root = feishuHealthTestTempRoot("missing-package")
         try {
             feishuHealthCreateProject(root)
-            let runtimeRoot = root.join("tools").join("feishu-openclaw-sidecar")
+            let runtimeRoot = root.join("tools").join("feishu-sidecar")
             Directory.create(runtimeRoot, recursive: true)
 
             let health = feishuSidecarDependencyHealth(
@@ -90,7 +92,7 @@ public class FeishuSidecarDependencyHealthTest {
         let root = feishuHealthTestTempRoot("missing-node")
         try {
             feishuHealthCreateProject(root)
-            let runtimeRoot = root.join("tools").join("feishu-openclaw-sidecar")
+            let runtimeRoot = root.join("tools").join("feishu-sidecar")
             feishuHealthCreateRuntimePackage(runtimeRoot)
             feishuHealthCreateFakeNodeModules(runtimeRoot)
 
@@ -112,7 +114,7 @@ public class FeishuSidecarDependencyHealthTest {
         let root = feishuHealthTestTempRoot("missing-node-modules")
         try {
             feishuHealthCreateProject(root)
-            let runtimeRoot = root.join("tools").join("feishu-openclaw-sidecar")
+            let runtimeRoot = root.join("tools").join("feishu-sidecar")
             feishuHealthCreateRuntimePackage(runtimeRoot)
 
             let health = feishuSidecarDependencyHealth(
@@ -124,7 +126,9 @@ public class FeishuSidecarDependencyHealthTest {
             @Expect(health.missingRequirements.contains("node_modules"), true)
             @Expect(health.missingRequirements.contains("@larksuiteoapi/node-sdk"), true)
             @Expect(health.missingRequirements.contains("https-proxy-agent"), true)
-            @Expect(health.installHint, "Run `npm --prefix tools/feishu-openclaw-sidecar install` from the Metis repository root.")
+            @Expect(health.installHint, "Run `npm --prefix tools/feishu-sidecar install` from the Metis repository root.")
+            let forbidden = "open" + "claw"
+            @Expect(health.toJson().toJsonString().contains(forbidden), false)
         } finally {
             try { remove(root, recursive: true) } catch (_e: Exception) { () }
         }
@@ -135,7 +139,7 @@ public class FeishuSidecarDependencyHealthTest {
         let root = feishuHealthTestTempRoot("ready")
         try {
             feishuHealthCreateProject(root)
-            let runtimeRoot = root.join("tools").join("feishu-openclaw-sidecar")
+            let runtimeRoot = root.join("tools").join("feishu-sidecar")
             feishuHealthCreateRuntimePackage(runtimeRoot)
             feishuHealthCreateFakeNodeModules(runtimeRoot)
 
@@ -157,7 +161,9 @@ public class FeishuSidecarDependencyHealthTest {
     public func readmeDocumentsSidecarDependencyInstallWithoutNativeNoNodeClaim(): Unit {
         @Expect(exists(Path("README.md")), true)
         let readme = String.fromUtf8(File.readFrom(Path("README.md")))
-        @Expect(readme.contains("npm --prefix tools/feishu-openclaw-sidecar install"), true)
+        @Expect(readme.contains("npm --prefix tools/feishu-sidecar install"), true)
+        let forbiddenPath = "feishu-" + "open" + "claw-sidecar"
+        @Expect(readme.contains(forbiddenPath), false)
         @Expect(readme.contains("Feishu long-connect native adapter"), false)
         @Expect(readme.contains("no longer requires Node/npm"), false)
     }

@@ -78,7 +78,7 @@ private func gatewayFeishuLongConnectTransportForConfig(config: FeishuConfig): F
     if (config.receiveMode == "webhook") {
         return FeishuWebhookLongConnectTransport()
     }
-    if (config.transportMode == "openclaw-sidecar") {
+    if (config.transportMode == "sidecar") {
         return FeishuSidecarTransport(
             runner: FeishuSidecarStdioRunner(),
             options: FeishuSidecarTransportOptions(startBackgroundReader: true)
@@ -88,7 +88,7 @@ private func gatewayFeishuLongConnectTransportForConfig(config: FeishuConfig): F
 }
 
 private func gatewayFeishuApiClientForConfig(config: FeishuConfig): FeishuApiClient {
-    if (config.receiveMode == "long_connect" && config.transportMode == "openclaw-sidecar") {
+    if (config.receiveMode == "long_connect" && config.transportMode == "sidecar") {
         return FeishuSidecarApiClient(
             runner: FeishuSidecarProcessRequestRunner(
                 account: FeishuSidecarRequestAccount(

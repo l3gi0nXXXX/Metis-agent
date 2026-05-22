@@ -663,7 +663,7 @@ public class FeishuAdapter <: ChannelAdapter {
             return "webhook"
         }
         if (this.longConnectTransport is FeishuSidecarTransport) {
-            return "openclaw-sidecar"
+            return "sidecar"
         }
         if (this.longConnectTransport is FeishuNativeLongConnectTransport) {
             return "native-legacy"
@@ -673,7 +673,7 @@ public class FeishuAdapter <: ChannelAdapter {
 
     public func debugFeishuApiClientKindForTest(): String {
         if (this.apiClient is FeishuSidecarApiClient) {
-            return "openclaw-sidecar"
+            return "sidecar"
         }
         "native-legacy"
     }

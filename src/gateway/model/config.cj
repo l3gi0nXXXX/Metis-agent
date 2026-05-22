@@ -951,7 +951,7 @@ public class FeishuConfig {
      * `webhook`（HTTP 回调，需公网地址或内网穿透）。不承载实现选择。
      */
     public let receiveMode: String
-    /** 长连接实现选择：`openclaw-sidecar` 为默认主路线；`native-legacy` 为显式冻结旧实现。 */
+    /** 长连接实现选择：`sidecar` 为默认主路线；`native-legacy` 为显式冻结旧实现。 */
     public let transportMode: String
     /** 开放平台域名，如 `https://open.feishu.cn` 或国际版 `https://open.larksuite.com`。 */
     public let domain: String
@@ -987,7 +987,7 @@ public class FeishuConfig {
         appSecret!: String = "",
         accounts!: Option<JsonObject> = None,
         receiveMode!: String = "long_connect",
-        transportMode!: String = "openclaw-sidecar",
+        transportMode!: String = "sidecar",
         domain!: String = "https://open.feishu.cn",
         botOpenId!: String = "",
         webhookHost!: String = "127.0.0.1",

@@ -464,9 +464,9 @@ public class GatewayFeishuOapiToolsetTest {
     public func feishuSidecarOapiToolKeepsMetisToolOutputContract(): Unit {
         debugSetGatewayFeishuOapiToolCallRunnerForTest(Some({ _method: String, _payload: JsonObject =>
             let sidecarResult = JsonObject()
-            sidecarResult.put("image", JsonString("openclaw-image-key"))
-            sidecarResult.put("schedule", JsonString("openclaw-schedule"))
-            sidecarResult.put("sessions", JsonArray([JsonString("openclaw-session")]))
+            sidecarResult.put("image", JsonString("feishu-image-key"))
+            sidecarResult.put("schedule", JsonString("feishu-schedule"))
+            sidecarResult.put("sessions", JsonArray([JsonString("feishu-session")]))
             let out = JsonObject()
             out.put("ok", JsonBool(true))
             out.put("status", JsonString("success"))
@@ -839,7 +839,7 @@ public class GatewayFeishuOapiToolsetTest {
     }
 
     @TestCase
-    public func firstDomainAndAStageOpenClawToolNamesRouteThroughEnvelope(): Unit {
+    public func firstDomainAndAStageReferenceToolNamesRouteThroughEnvelope(): Unit {
         let captured = ArrayList<String>()
         debugSetGatewayFeishuOapiToolCallRunnerForTest(Some({ method: String, payload: JsonObject =>
             captured.add(method)
@@ -870,7 +870,7 @@ public class GatewayFeishuOapiToolsetTest {
     }
 
     @TestCase
-    public func requestBoundaryMapsOpenClawDomains(): Unit {
+    public func requestBoundaryMapsReferenceDomains(): Unit {
         let common = feishuOapiBuildRequest("feishu_get_user", "get", "a", JsonObject())
         @Expect(common.category, "user")
         @Expect(common.domain, "common")
@@ -918,7 +918,7 @@ public class GatewayFeishuOapiToolsetTest {
     }
 
     @TestCase
-    public func firstBatchActionMapUsesOpenClawActionKeysPathsMethodsTokenModeAndScopes(): Unit {
+    public func firstBatchActionMapUsesReferenceActionKeysPathsMethodsTokenModeAndScopes(): Unit {
         let imSend = feishuOapiBuildRequest("feishu_im_user_message", "send", "a", JsonObject())
         @Expect(imSend.actionKey, "feishu_im_user_message.send")
         @Expect(imSend.path, "/open-apis/im/v1/messages")
@@ -1023,8 +1023,8 @@ public class GatewayFeishuOapiToolsetTest {
     }
 
     @TestCase
-    public func openClawActionParityIsTrackedAtActionLevelAndIncludesBasicBatch(): Unit {
-        let keys = feishuOapiOpenClawActionKeys()
+    public func referenceActionParityIsTrackedAtActionLevelAndIncludesBasicBatch(): Unit {
+        let keys = feishuOapiReferenceActionKeys()
         @Expect(keys.size >= 96, true)
         @Expect(keys.contains("feishu_get_user.basic_batch"), true)
         @Expect(keys.contains("feishu_chat.get"), true)
@@ -1040,18 +1040,18 @@ public class GatewayFeishuOapiToolsetTest {
     }
 
     @TestCase
-    public func openClawActionParityMatrixMapsEveryActionKeyWithSourceEvidence(): Unit {
-        let matrix = feishuOapiOpenClawParityMatrix()
+    public func referenceActionParityMatrixMapsEveryActionKeyWithSourceEvidence(): Unit {
+        let matrix = feishuOapiReferenceParityMatrix()
         @Expect(matrix.get("status").getOrThrow().asString().getValue(), "source_backed")
-        @Expect(matrix.get("openclaw_source").getOrThrow().asString().getValue().contains("src/tools/oapi/index.ts"), true)
+        @Expect(matrix.get("reference_source").getOrThrow().asString().getValue().contains("src/tools/oapi/index.ts"), true)
         let mapped = matrix.get("mapped").getOrThrow().asArray()
         let notApplicable = matrix.get("not_applicable").getOrThrow().asArray()
         @Expect(notApplicable.size(), 0)
-        @Expect(mapped.size(), feishuOapiOpenClawActionKeys().size)
+        @Expect(mapped.size(), feishuOapiReferenceActionKeys().size)
         for (i in 0..mapped.size()) {
             let row = mapped[i].asObject()
             let key = row.get("action_key").getOrThrow().asString().getValue()
-            @Expect(feishuOapiOpenClawActionKeys().contains(key), true)
+            @Expect(feishuOapiReferenceActionKeys().contains(key), true)
             @Expect(row.get("status").getOrThrow().asString().getValue(), "mapped")
             @Expect(row.get("path").getOrThrow().asString().getValue().startsWith("/open-apis/"), true)
             @Expect(row.get("method").getOrThrow().asString().getValue().isEmpty(), false)
@@ -1112,11 +1112,11 @@ public class GatewayFeishuOapiToolsetTest {
     }
 
     @TestCase
-    public func allOpenClawActionsHaveKnownDefaultTokenModes(): Unit {
+    public func allReferenceActionsHaveKnownDefaultTokenModes(): Unit {
         let allowed = ["user_access_token", "tenant_access_token", "bot_access_token", "app_access_token"]
         var tenantCount: Int64 = 0
         var botCount: Int64 = 0
-        for (key in feishuOapiOpenClawActionKeys()) {
+        for (key in feishuOapiReferenceActionKeys()) {
             let parts = key.split(".")
             let request = feishuOapiBuildRequest(parts[0], parts[1], "tenant-a", JsonObject())
             @Expect(allowed.contains(request.tokenMode), true)

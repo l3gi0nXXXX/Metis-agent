@@ -13,7 +13,7 @@ private func expectFeishuOapiScopes(actionKey: String, expected: Array<String>):
 @Test
 public class GatewayFeishuOapiScopeExactTest {
     @TestCase
-    public func partialOpenClawActionsUseExactRequiredScopes(): Unit {
+    public func partialReferenceActionsUseExactRequiredScopes(): Unit {
         expectFeishuOapiScopes("feishu_bitable_app.copy", ["base:app:copy"])
         expectFeishuOapiScopes("feishu_bitable_app_table.batch_create", ["base:table:create"])
         expectFeishuOapiScopes("feishu_bitable_app_table.create", ["base:table:create"])

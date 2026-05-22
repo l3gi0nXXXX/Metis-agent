@@ -24,7 +24,7 @@ public class FeishuSidecarTransportOptions {
 
     public init(
         command!: String = "node",
-        args!: Array<String> = ["scripts/feishu-openclaw-sidecar.mjs"],
+        args!: Array<String> = ["scripts/feishu-sidecar.mjs"],
         runtimeRoot!: String = "",
         workingDirectory!: String = "",
         env!: Array<(String, String)> = [],
@@ -696,7 +696,7 @@ public func feishuSidecarDefaultWorkingDirectory(): String {
 }
 
 public func feishuSidecarDefaultRuntimeRoot(): String {
-    CliConfig.cwd.join("tools").join("feishu-openclaw-sidecar").toString()
+    CliConfig.cwd.join("tools").join("feishu-sidecar").toString()
 }
 
 private func feishuSidecarNormalizeRuntimeRoot(raw: String): String {

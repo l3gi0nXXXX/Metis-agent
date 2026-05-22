@@ -260,7 +260,7 @@ private func mergeFeishu(fs: FeishuUserSettings): FeishuConfig {
     let receiveModeRaw = fs.receiveMode.trimAscii().toAsciiLower()
     let receiveMode = if (receiveModeRaw == "webhook") { "webhook" } else { "long_connect" }
     let transportModeRaw = fs.transportMode.trimAscii().toAsciiLower()
-    let transportMode = if (transportModeRaw == "native-legacy") { "native-legacy" } else { "openclaw-sidecar" }
+    let transportMode = if (transportModeRaw == "native-legacy") { "native-legacy" } else { "sidecar" }
     let groupSessionScopeRaw = fs.groupSessionScope.toAsciiLower()
     let groupSessionScope = if (
         groupSessionScopeRaw == "group_sender" ||

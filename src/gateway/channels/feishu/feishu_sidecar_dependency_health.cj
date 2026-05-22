@@ -8,7 +8,7 @@ import std.fs.{Path, exists}
 import std.time.*
 import stdx.encoding.json.{JsonArray, JsonBool, JsonObject, JsonString}
 
-private let FEISHU_SIDECAR_INSTALL_HINT = "Run `npm --prefix tools/feishu-openclaw-sidecar install` from the Metis repository root."
+private let FEISHU_SIDECAR_INSTALL_HINT = "Run `npm --prefix tools/feishu-sidecar install` from the Metis repository root."
 private var feishuSidecarDependencyHealthProviderForTest: Option<() -> FeishuSidecarDependencyHealth> =
     None<() -> FeishuSidecarDependencyHealth>
 
@@ -166,13 +166,13 @@ private func feishuSidecarHealthDetails(missing: Array<String>, invalid: Array<S
 
 public func feishuSidecarDependencyHealth(
     projectRoot!: Path = CliConfig.cwd,
-    runtimeRoot!: Path = CliConfig.cwd.join("tools").join("feishu-openclaw-sidecar"),
+    runtimeRoot!: Path = CliConfig.cwd.join("tools").join("feishu-sidecar"),
     commandProbe!: (String, Array<String>) -> FeishuSidecarDependencyCommandProbeResult = feishuSidecarDefaultCommandProbe
 ): FeishuSidecarDependencyHealth {
     let missing = ArrayList<String>()
     let invalid = ArrayList<String>()
     let commandErrors = ArrayList<String>()
-    let scriptPath = projectRoot.join("scripts").join("feishu-openclaw-sidecar.mjs")
+    let scriptPath = projectRoot.join("scripts").join("feishu-sidecar.mjs")
     let packageJson = runtimeRoot.join("package.json")
     let packageLock = runtimeRoot.join("package-lock.json")
     let nodeModules = runtimeRoot.join("node_modules")

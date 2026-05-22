@@ -15,11 +15,11 @@ import {
   writeProtocol,
 } from "./lib/metis-sidecar-logger.mjs";
 
-const PREFIX = "feishu-openclaw-sidecar";
+const PREFIX = "feishu-sidecar";
 const DEFAULT_READY_TIMEOUT_MS = 15_000;
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.dirname(SCRIPT_DIR);
-const DEFAULT_RUNTIME_ROOT = path.join(PROJECT_ROOT, "tools", "feishu-openclaw-sidecar");
+const DEFAULT_RUNTIME_ROOT = path.join(PROJECT_ROOT, "tools", "feishu-sidecar");
 const WITHDRAWN_REPLY_ERROR_CODES = new Set([230011, 231003]);
 const SENSITIVE_ARG = /^(?:--)?(?:app[-_]?secret|verification[-_]?token|encrypt[-_]?key)$/i;
 
@@ -109,7 +109,7 @@ function resolveSidecarRuntimeRoot(frame = {}) {
   const raw = String(
     frame.runtimeRoot ??
       process.env.METIS_FEISHU_SIDECAR_RUNTIME_ROOT ??
-      process.env.METIS_FEISHU_OPENCLAW_SIDECAR_RUNTIME_ROOT ??
+      process.env.METIS_FEISHU_LEGACY_SIDECAR_RUNTIME_ROOT ??
       DEFAULT_RUNTIME_ROOT,
   ).trim();
   return raw ? path.resolve(raw) : DEFAULT_RUNTIME_ROOT;

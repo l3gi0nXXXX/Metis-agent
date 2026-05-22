@@ -26,11 +26,11 @@ That gives the project a few defining characteristics:
 
 ## High performance
 
-Without undergoing any specialized performance optimization, Metis has achieved a more than 20-fold leap in startup and shutdown efficiency compared with OpenClaw in the measured baseline scenario.
+Without undergoing any specialized performance optimization, Metis has achieved a more than 20-fold leap in startup and shutdown efficiency compared with vendor baseline in the measured baseline scenario.
 
 Absent any specialized performance optimization, Metis has realized a qualitative leap in its startup and shutdown efficiency:
 
-| Comparison Item               | OpenClaw Average Duration | Metis Average Duration | Magnification Factor |
+| Comparison Item               | vendor baseline Average Duration | Metis Average Duration | Magnification Factor |
 | ----------------------------- | ------------------------- | ---------------------- | -------------------- |
 | onboard（Cold Start）         | 2\.591s                   | 0\.122s                | 21\.2 times          |
 | gateway restart（Cold Start） | 2\.366s                   | 0\.073s                | 32\.4 times          |
@@ -39,7 +39,7 @@ Absent any specialized performance optimization, Metis has realized a qualitativ
 
 The detailed data is presented below; notably, these figures were achieved without any performance optimizations whatsoever (perhaps because Metis's feature set is not yet fully comprehensive?).
 
-| Num     | OpenClaw onboard | OpenClaw gateway restart | OpenClaw gateway start | OpenClaw gateway stop |
+| Num     | vendor baseline onboard | vendor baseline gateway restart | vendor baseline gateway start | vendor baseline gateway stop |
 | ------- | ---------------: | -----------------------: | ---------------------: | --------------------: |
 | 1       |           3.563s |                   1.989s |                 2.462s |                2.136s |
 | 2       |           2.470s |                   2.044s |                 2.397s |                1.955s |
@@ -161,7 +161,7 @@ For Telegram image understanding, configure a dedicated image model whose model 
 IM channels need their own credentials only when that channel is enabled:
 
 - Telegram: bot token from BotFather, configured under `gateway.telegram` or a Telegram account entry.
-- Feishu: app id/app secret. The default long-connect path uses the Metis-owned OpenClaw-backed Node sidecar, so install its local Node dependencies before enabling `gateway.feishu.receiveMode = "long_connect"`.
+- Feishu: app id/app secret. The default long-connect path uses the Metis-owned vendor SDK-backed Node sidecar, so install its local Node dependencies before enabling `gateway.feishu.receiveMode = "long_connect"`.
 - QQ: app id/app secret or the official gateway credentials required by the selected QQ mode.
 - Plugin IM adapters: plugin runtime files plus the Python dependencies and credentials for that adapter.
 
@@ -205,7 +205,7 @@ Use `gateway run --verbose` for temporary runtime detail while diagnosing channe
 |---|---|---|---|
 | Control UI source rebuild and UI tests | Node.js + npm from the official Node.js download page: https://nodejs.org/en/download | `npm --prefix ui install` | Required when changing `ui/` source or running `npm --prefix ui run build` / UI tests. The committed `assets/control-ui` bundle is enough for normal Gateway startup. |
 | PDF fallback extraction | Node.js + npm from the official Node.js download page: https://nodejs.org/en/download; `tools/pdf_extract` packages `pdfjs-dist` and `@napi-rs/canvas` | `npm --prefix tools/pdf_extract install` | Required when PDF analysis uses non-native PDF models and Metis must extract text or render page images locally. Check with `metis models pdf-status`. |
-| Feishu OpenClaw-backed long-connect sidecar | Node.js + npm; `tools/feishu-openclaw-sidecar` packages `@larksuiteoapi/node-sdk` and `https-proxy-agent`. | `npm --prefix tools/feishu-openclaw-sidecar install` | Required for `gateway.feishu.receiveMode = "long_connect"` with `gateway.feishu.transportMode = "openclaw-sidecar"`. `tools/feishu-openclaw-sidecar/node_modules` is intentionally ignored; do not force-add it or bypass `.gitignore`. |
+| Feishu vendor SDK-backed long-connect sidecar | Node.js + npm; `tools/feishu-sidecar` packages `@larksuiteoapi/node-sdk` and `https-proxy-agent`. | `npm --prefix tools/feishu-sidecar install` | Required for `gateway.feishu.receiveMode = "long_connect"` with `gateway.feishu.transportMode = "sidecar"`. `tools/feishu-sidecar/node_modules` is intentionally ignored; do not force-add it or bypass `.gitignore`. |
 | Gateway plugin IM adapters | Python 3 + pip; per-channel requirements under `tools/gateway_plugin_tool/requirements/` | `python tools/gateway_plugin_tool/install.py deps all` or `python tools/gateway_plugin_tool/install.py deps dingtalk` | Required only for plugin-style adapters such as DingTalk, WeChat, WeCom, plugin Feishu, or plugin QQ. Built-in Telegram/QQ/Feishu Cangjie adapters do not need these Python packages. |
 | Docker image build | Docker + Docker Compose; `CANGJIE_HOME` pointing to SDK | `scripts/build-docker-image.sh` | Required only when building the container image. |
 | Faster source search | ripgrep | `brew install ripgrep` | Optional. Metis/Magic workflows can fall back to slower search tools, but `rg` is recommended for development. |
@@ -215,7 +215,7 @@ Run optional verification only for the features you installed:
 ```bash
 npm --prefix ui run build
 npm --prefix tools/pdf_extract run check
-npm --prefix tools/feishu-openclaw-sidecar install
+npm --prefix tools/feishu-sidecar install
 cjpm run --skip-build --name metis --run-args "models pdf-status"
 cjpm run --skip-build --name metis --run-args "gateway channels get feishu"
 ```
@@ -230,8 +230,8 @@ cjpm run --skip-build --name metis --run-args "gateway channels get feishu"
 | TLS/OpenSSL errors on macOS | OpenSSL 3 runtime library is not visible to dyld. | `brew install openssl@3` and export `DYLD_LIBRARY_PATH="/opt/homebrew/opt/openssl@3/lib:$DYLD_LIBRARY_PATH"`. |
 | `stdx` `.dylib` fails with `library load disallowed by system policy` on macOS | macOS quarantine attribute on downloaded libraries. | Run `xattr -rd com.apple.quarantine "$MAGIC_PATH/libs"`; if the directory is not writable by your user, retry with `sudo`. |
 | PDF upload says extractor failed or `pdfjs-dist` is `not_loadable` | PDF fallback dependencies are not installed. | Install Node.js from https://nodejs.org/en/download, run `npm --prefix tools/pdf_extract install`, restart Gateway, then run `metis models pdf-status`. |
-| Feishu long-connect status reports `sidecarDependencyStatus=missing` or `invalid` | The sidecar script, runtime package files, Node/npm, or `tools/feishu-openclaw-sidecar/node_modules` are missing. | Install Node.js from https://nodejs.org/en/download, run `npm --prefix tools/feishu-openclaw-sidecar install`, keep `node_modules` untracked, then restart Gateway and check `metis gateway channels get feishu` or `metis gateway status`. |
-| Feishu long-connect transport startup fails after dependencies are ready | Feishu app credentials are missing or the sidecar transport rejected startup. | Verify `gateway.feishu.appId`, `gateway.feishu.appSecret`, `gateway.feishu.receiveMode = "long_connect"`, and `gateway.feishu.transportMode = "openclaw-sidecar"`, then restart Gateway. |
+| Feishu long-connect status reports `sidecarDependencyStatus=missing` or `invalid` | The sidecar script, runtime package files, Node/npm, or `tools/feishu-sidecar/node_modules` are missing. | Install Node.js from https://nodejs.org/en/download, run `npm --prefix tools/feishu-sidecar install`, keep `node_modules` untracked, then restart Gateway and check `metis gateway channels get feishu` or `metis gateway status`. |
+| Feishu long-connect transport startup fails after dependencies are ready | Feishu app credentials are missing or the sidecar transport rejected startup. | Verify `gateway.feishu.appId`, `gateway.feishu.appSecret`, `gateway.feishu.receiveMode = "long_connect"`, and `gateway.feishu.transportMode = "sidecar"`, then restart Gateway. |
 
 ## Common Workflows
 

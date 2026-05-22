@@ -50,7 +50,7 @@ public class GatewayAdapterRegistrationProfilesTest {
         @Expect(feishu.enabled, true)
         @Expect(feishu.configured, true)
         @Expect(feishu.healthMonitorEnabled, true)
-        @Expect(feishu.compatibilityMode, "openclaw-sidecar")
+        @Expect(feishu.compatibilityMode, "sidecar")
 
         let qq = findProfile(profiles, "qq")
         @Expect(qq.accountId, "default")
@@ -79,7 +79,7 @@ public class GatewayAdapterRegistrationProfilesTest {
         user.feishu.appSecret = "feishu-secret"
 
         let defaultFeishu = findProfile(gatewayBuiltinAdapterRegistrationProfiles(user, true), "feishu")
-        @Expect(defaultFeishu.compatibilityMode, "openclaw-sidecar")
+        @Expect(defaultFeishu.compatibilityMode, "sidecar")
 
         user.feishu.transportMode = "native-legacy"
         let nativeFeishu = findProfile(gatewayBuiltinAdapterRegistrationProfiles(user, true), "feishu")
@@ -94,9 +94,9 @@ public class GatewayAdapterRegistrationProfilesTest {
         user.feishu.appSecret = "feishu-secret"
 
         let sidecarAdapter = gatewayFeishuAdapterForConfig(buildGatewayConfigFromUserSettings(user).feishu, "default")
-        @Expect(sidecarAdapter.debugFeishuTransportModeForTest(), "openclaw-sidecar")
-        @Expect(sidecarAdapter.debugFeishuLongConnectTransportKindForTest(), "openclaw-sidecar")
-        @Expect(sidecarAdapter.debugFeishuApiClientKindForTest(), "openclaw-sidecar")
+        @Expect(sidecarAdapter.debugFeishuTransportModeForTest(), "sidecar")
+        @Expect(sidecarAdapter.debugFeishuLongConnectTransportKindForTest(), "sidecar")
+        @Expect(sidecarAdapter.debugFeishuApiClientKindForTest(), "sidecar")
 
         user.feishu.transportMode = "native-legacy"
         let nativeAdapter = gatewayFeishuAdapterForConfig(buildGatewayConfigFromUserSettings(user).feishu, "default")
@@ -104,10 +104,10 @@ public class GatewayAdapterRegistrationProfilesTest {
         @Expect(nativeAdapter.debugFeishuLongConnectTransportKindForTest(), "native-legacy")
         @Expect(nativeAdapter.debugFeishuApiClientKindForTest(), "native-legacy")
 
-        user.feishu.transportMode = "openclaw-sidecar"
+        user.feishu.transportMode = "sidecar"
         user.feishu.receiveMode = "webhook"
         let webhookAdapter = gatewayFeishuAdapterForConfig(buildGatewayConfigFromUserSettings(user).feishu, "default")
-        @Expect(webhookAdapter.debugFeishuTransportModeForTest(), "openclaw-sidecar")
+        @Expect(webhookAdapter.debugFeishuTransportModeForTest(), "sidecar")
         @Expect(webhookAdapter.debugFeishuLongConnectTransportKindForTest(), "webhook")
         @Expect(webhookAdapter.debugFeishuApiClientKindForTest(), "native-legacy")
     }

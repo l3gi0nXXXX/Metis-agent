@@ -1508,7 +1508,7 @@ public func feishuOapiIsSupportedActionKey(actionKey: String): Bool {
     feishuOapiPathForActionKey(actionKey) != ""
 }
 
-public func feishuOapiOpenClawActionKeys(): Array<String> {
+public func feishuOapiReferenceActionKeys(): Array<String> {
     [
         "feishu_bitable_app.copy", "feishu_bitable_app.create", "feishu_bitable_app.get", "feishu_bitable_app.list",
         "feishu_bitable_app.patch", "feishu_bitable_app_table.batch_create", "feishu_bitable_app_table.create",
@@ -1546,14 +1546,14 @@ public func feishuOapiOpenClawActionKeys(): Array<String> {
     ]
 }
 
-public func feishuOapiOpenClawParityMatrix(): JsonObject {
+public func feishuOapiReferenceParityMatrix(): JsonObject {
     let out = JsonObject()
     out.put("status", JsonString("source_backed"))
-    out.put("openclaw_source", JsonString("/Users/l3gi0n/work/workspace_cangjie/openclaw-lark/src/tools/oapi/index.ts:46-95"))
+    out.put("reference_source", JsonString("external-reference/src/tools/oapi/index.ts:46-95"))
     out.put("metis_source", JsonString("src/gateway/tools/gateway_feishu_oapi_client.cj:1393-1788"))
     let mapped = JsonArray([])
     let notApplicable = JsonArray([])
-    for (key in feishuOapiOpenClawActionKeys()) {
+    for (key in feishuOapiReferenceActionKeys()) {
         let row = JsonObject()
         row.put("action_key", JsonString(key))
         row.put("status", JsonString(if (feishuOapiIsSupportedActionKey(key)) { "mapped" } else { "missing" }))
@@ -1561,7 +1561,7 @@ public func feishuOapiOpenClawParityMatrix(): JsonObject {
         row.put("method", JsonString(feishuOapiMethodForActionKey(key)))
         row.put("token_mode", JsonString(feishuOapiTokenModeForActionKey(key)))
         row.put("required_scopes", feishuOapiJsonStringArray(feishuOapiRequiredScopesForActionKey(key)))
-        row.put("openclaw_source", JsonString("/Users/l3gi0n/work/workspace_cangjie/openclaw-lark/src/tools/oapi/index.ts:46-95"))
+        row.put("reference_source", JsonString("external-reference/src/tools/oapi/index.ts:46-95"))
         row.put("metis_source", JsonString("src/gateway/tools/gateway_feishu_oapi_client.cj"))
         mapped.add(row)
     }
