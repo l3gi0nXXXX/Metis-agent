@@ -566,16 +566,24 @@ test("sdk background close emits closed frame after ready without leaking secret
 test("ready initializes the vendor SDK model without putting secrets in argv or logs", async () => {
   const root = createTempRoot();
   const { sdkPath, callsPath } = writeFakeSdk(root);
+  const runtimeRoot = path.join(root, "runtime-root-for-ready-frame");
   try {
     const proc = spawnSidecar({
       sdkPath,
       callsPath,
       env: { HTTPS_PROXY: "http://127.0.0.1:7897" },
     });
-    proc.writeFrame(baseInit({ domain: "lark" }));
+    proc.writeFrame(baseInit({ domain: "lark", runtimeRoot }));
     const ready = await proc.waitForFrame((frame) => frame.type === "ready");
     assert.equal(ready.accountId, "acct-1");
     assert.equal(ready.transport, "websocket");
+    assert.equal(ready.runtimeRoot, runtimeRoot);
+    assert.equal(ready.sdk, "@larksuiteoapi/node-sdk");
+    assert.deepEqual(ready.proxy, {
+      configured: true,
+      source: "HTTPS_PROXY",
+      scheme: "http",
+    });
 
     const result = await proc.close();
     assert.equal(result.status, 0, result.stderr);

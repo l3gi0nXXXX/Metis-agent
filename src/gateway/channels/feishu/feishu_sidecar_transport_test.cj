@@ -285,6 +285,32 @@ public class FeishuSidecarTransportTest {
     }
 
     @TestCase
+    public func diagnosticFailureAfterReadyMarksUnavailableAndReportsBackgroundFailure(): Unit {
+        let process = FeishuSidecarFakeProcess(stdout: [
+            "{\"type\":\"ready\",\"accountId\":\"tenant-a\",\"transport\":\"websocket\"}"
+        ])
+        let runner = FeishuSidecarFakeRunner(process)
+        let transport = FeishuSidecarTransport(runner: runner, options: this.options())
+        let diagnostics = ArrayList<JsonObject>()
+        let result = transport.start(this.spec(), { root => diagnostics.add(root) })
+        @Expect(result.ok, true)
+
+        process.push("{\"type\":\"diagnostic\",\"level\":\"error\",\"phase\":\"websocket.read\",\"status\":\"failed\",\"message\":\"websocket closed 1006\"}")
+        transport.debugDrainAvailableForTest()
+
+        @Expect(transport.healthSnapshot().ready, false)
+        @Expect(transport.healthSnapshot().connected, false)
+        @Expect(transport.healthSnapshot().lastError.contains("websocket closed 1006"), true)
+        @Expect(diagnostics.size, 1)
+        let header = diagnostics[0].get("header").getOrThrow().asObject()
+        @Expect(header.get("event_type").getOrThrow().asString().getValue(), "metis.feishu.sidecar.diagnostic")
+        let sidecar = diagnostics[0].get("sidecar").getOrThrow().asObject()
+        @Expect(sidecar.get("phase").getOrThrow().asString().getValue(), "websocket.read")
+        @Expect(sidecar.get("status").getOrThrow().asString().getValue(), "failed")
+        @Expect(sidecar.get("message").getOrThrow().asString().getValue(), "websocket closed 1006")
+    }
+
+    @TestCase
     public func diagnosticRingKeepsLast64EntriesAndStopTerminatesHungProcess(): Unit {
         let process = FeishuSidecarFakeProcess(stdout: [
             "{\"type\":\"ready\",\"accountId\":\"tenant-a\",\"transport\":\"websocket\"}"

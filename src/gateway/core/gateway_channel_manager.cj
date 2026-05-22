@@ -660,13 +660,14 @@ public class GatewayChannelManager {
             return this.lifecycleAccountRow(entry, true, "started", "", runtime)
         } catch (e: Exception) {
             let reason = gatewaySanitizeChannelDiagnostic(e.message)
+            let errorKind = this.startFailureErrorKind("failed", reason)
             this.updateLiveAccount(entry.channelId, entry.accountId, { state =>
                 state.configured = entry.configured
                 state.running = false
                 state.connected = false
                 state.lastError = reason
             })
-            let runtime = gatewayChannelRuntimeMarkFailure(entry.channelId, accountId: entry.accountId, lifecycleState: "failed", error: reason, errorKind: "start_failed")
+            let runtime = gatewayChannelRuntimeMarkFailure(entry.channelId, accountId: entry.accountId, lifecycleState: "failed", error: reason, errorKind: errorKind)
             gatewayLogEventError(
                 "gateway/channel/${entry.channelId}",
                 "channel.failed",
@@ -676,7 +677,7 @@ public class GatewayChannelManager {
                     .string("accountId", entry.accountId)
                     .string("phase", "start")
                     .string("status", "failed")
-                    .string("errorKind", "start_failed")
+                    .string("errorKind", errorKind)
                     .rawString("error", reason)
                     .object()
             )
@@ -1070,6 +1071,17 @@ public class GatewayChannelManager {
         ("ok", "")
     }
 
+    private func startFailureErrorKind(startStatus: String, safeError: String): String {
+        if (startStatus.trimAscii() == "timed_out") {
+            return "start_timeout"
+        }
+        let lowered = safeError.trimAscii().toAsciiLower()
+        if (lowered.contains("ready_timeout") || lowered.contains("ready timeout")) {
+            return "ready_timeout"
+        }
+        "start_failed"
+    }
+
     private func startEntry(entry: GatewayRegisteredAdapter): JsonObject {
         let entryStartMs = this.timingNowMs()
         if (!gatewayChannelRuntimeCanStart(entry.channelId, accountId: entry.accountId)) {
@@ -1132,6 +1144,7 @@ public class GatewayChannelManager {
         } else {
             let timedOut = startStatus == "timed_out"
             let safeError = gatewaySanitizeChannelDiagnostic(startError)
+            let errorKind = this.startFailureErrorKind(startStatus, safeError)
             this.bestEffortStopAfterStartFailure(entry, if (timedOut) { "start-timeout" } else { "start-failed" })
             this.updateLiveAccount(entry.channelId, entry.accountId, { state =>
                 state.configured = entry.configured
@@ -1139,7 +1152,7 @@ public class GatewayChannelManager {
                 state.connected = false
                 state.lastError = safeError
             })
-            gatewayChannelRuntimeMarkFailure(entry.channelId, accountId: entry.accountId, lifecycleState: "failed", error: safeError, errorKind: if (timedOut) { "start_timeout" } else { "start_failed" })
+            gatewayChannelRuntimeMarkFailure(entry.channelId, accountId: entry.accountId, lifecycleState: "failed", error: safeError, errorKind: errorKind)
             gatewayLogEventError(
                 "gateway/channel/${entry.channelId}",
                 "channel.failed",
@@ -1149,7 +1162,7 @@ public class GatewayChannelManager {
                     .string("accountId", entry.accountId)
                     .string("phase", "start")
                     .string("status", startStatus)
-                    .string("errorKind", if (timedOut) { "start_timeout" } else { "start_failed" })
+                    .string("errorKind", errorKind)
                     .rawString("error", safeError)
                     .int("durationMs", this.timingNowMs() - entryStartMs)
                     .object()
@@ -1159,7 +1172,7 @@ public class GatewayChannelManager {
             return this.startupOutcome(
                 entry,
                 startStatus,
-                errorKind: if (timedOut) { "start_timeout" } else { "start_failed" },
+                errorKind: errorKind,
                 error: safeError,
                 startMs: entryStartMs
             )

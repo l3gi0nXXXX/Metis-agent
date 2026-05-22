@@ -152,14 +152,21 @@ async function createProxyAgent(sdk, proxyUrl, runtimeRoot) {
   return new mod.HttpsProxyAgent(proxyUrl);
 }
 
-function getProxyUrl() {
-  return (
-    process.env.https_proxy ||
-    process.env.HTTPS_PROXY ||
-    process.env.http_proxy ||
-    process.env.HTTP_PROXY ||
-    ""
-  ).trim();
+function getProxyConfig() {
+  for (const source of ["https_proxy", "HTTPS_PROXY", "http_proxy", "HTTP_PROXY"]) {
+    const url = String(process.env[source] ?? "").trim();
+    if (!url) {
+      continue;
+    }
+    let scheme = "";
+    try {
+      scheme = new URL(url).protocol.replace(/:$/, "");
+    } catch {
+      scheme = "";
+    }
+    return { url, summary: { configured: true, source, scheme } };
+  }
+  return { url: "", summary: { configured: false, source: "", scheme: "" } };
 }
 
 function resolveDomain(sdk, domain) {
@@ -218,7 +225,8 @@ async function initialize(frame) {
       : loadRuntimeModules(state.runtimeRoot).sdk;
     state.sdk = sdk;
     const domain = resolveDomain(sdk, frame.domain);
-    const proxyAgent = await createProxyAgent(sdk, getProxyUrl(), state.runtimeRoot);
+    const proxy = getProxyConfig();
+    const proxyAgent = await createProxyAgent(sdk, proxy.url, state.runtimeRoot);
 
     emitDiagnostic("info", "dependency.preflight", "Feishu sidecar dependencies resolved", {
       status: "ok",
@@ -259,6 +267,8 @@ async function initialize(frame) {
       accountId: state.accountId,
       transport: "websocket",
       sdk: "@larksuiteoapi/node-sdk",
+      runtimeRoot: state.runtimeRoot,
+      proxy: proxy.summary,
       domain: String(frame.domain ?? "feishu"),
     });
   } catch (error) {

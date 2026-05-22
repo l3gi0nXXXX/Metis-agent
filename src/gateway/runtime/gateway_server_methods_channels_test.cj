@@ -1134,6 +1134,11 @@ public class GatewayServerMethodsChannelsTest {
         @Expect(channelsTestString(defaultTransport, "mode"), "sidecar")
         @Expect(channelsTestString(defaultTransport, "effectiveRuntime"), "sidecar")
         @Expect(channelsTestString(defaultTransport, "capabilityRoute"), "sidecar_primary")
+        let defaultRaw = defaultChannel.toJsonString()
+        @Expect(defaultRaw.contains("\"transportMode\":\"native\""), false)
+        @Expect(defaultRaw.contains("\"transport\":\"native\""), false)
+        let forbiddenReference = "open" + "claw"
+        @Expect(defaultRaw.contains(forbiddenReference), false)
 
         user.feishu.transportMode = "native-legacy"
         let nativeChannel = gatewayChannelGetJson(user, "feishu")

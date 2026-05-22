@@ -490,7 +490,16 @@ public class FeishuSidecarTransport <: FeishuLongConnectTransport {
             let message = feishuSidecarTransportRedactSensitiveText(this.readString(frame, "message"))
             this.recordDiagnostic(level, phase, status, message)
             if (level == "error" || status == "failed") {
-                this.setLastError(this.composeError(phase, status, message))
+                let error = this.composeError(phase, status, message)
+                let callback = synchronized(this.lock) {
+                    this.ready = false
+                    this.connected = false
+                    this.lastError = error
+                    this.handler
+                }
+                if (let Some(h) <- callback) {
+                    h(this.diagnosticRoot(level, phase, status, message))
+                }
             }
             return FeishuSidecarProtocolOutcome()
         }
@@ -551,6 +560,21 @@ public class FeishuSidecarTransport <: FeishuLongConnectTransport {
         let root = JsonObject()
         root.put("header", header)
         root.put("event", event)
+        root
+    }
+
+    private func diagnosticRoot(level: String, phase: String, status: String, message: String): JsonObject {
+        let header = JsonObject()
+        header.put("event_type", JsonString("metis.feishu.sidecar.diagnostic"))
+        header.put("account_id", JsonString(""))
+        let sidecar = JsonObject()
+        sidecar.put("level", JsonString(level))
+        sidecar.put("phase", JsonString(phase))
+        sidecar.put("status", JsonString(status))
+        sidecar.put("message", JsonString(message))
+        let root = JsonObject()
+        root.put("header", header)
+        root.put("sidecar", sidecar)
         root
     }
 

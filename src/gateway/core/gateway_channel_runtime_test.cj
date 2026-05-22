@@ -165,6 +165,34 @@ private class GatewayChannelRuntimeSidecarFailureAdapter <: ChannelAdapter {
     }
 }
 
+private class GatewayChannelRuntimeSidecarClosedAfterReadyAdapter <: ChannelAdapter {
+    private var closed = false
+
+    public prop name: String {
+        get() { "feishu" }
+    }
+
+    public func start(): Unit {}
+
+    public func stop(): Unit {}
+
+    public func pullInbound(): Array<InboundMessage> {
+        if (!this.closed) {
+            this.closed = true
+            throw Exception("feishu sidecar closed: websocket.close 1006")
+        }
+        []
+    }
+
+    public func send(_message: OutboundMessage): SendResult {
+        SendResult.Success
+    }
+
+    public func sendWithMessageId(_message: OutboundMessage): String {
+        "fake-message"
+    }
+}
+
 private class GatewayChannelLifecycleFakeAdapter <: ChannelAdapter {
     private let adapterName: String
     private let accountId: String
@@ -341,6 +369,32 @@ public class GatewayChannelRuntimeTest {
     }
 
     @TestCase
+    public func feishuSidecarReadyTimeoutPreservesRuntimeErrorKind(): Unit {
+        withGatewayChannelRuntimeTestHome {
+            let manager = GatewayChannelManager(startupAccountTimeoutMs: 1000)
+            manager.registerAdapter(
+                GatewayChannelLifecycleFakeAdapter(
+                    "feishu",
+                    "tenant-a",
+                    failMessage: "Feishu long-connect transport failed to start: ready_timeout: sidecar ready timeout"
+                ),
+                channelId: "feishu",
+                accountId: "tenant-a"
+            )
+
+            manager.startChannels()
+
+            let accounts = gatewayChannelRuntimeAccountsJson("feishu")
+            let row = accounts[0].asObject()
+            @Expect(gatewayRuntimeTestString(row, "lifecycleState"), "failed")
+            @Expect(gatewayRuntimeTestString(row, "errorKind"), "ready_timeout")
+            @Expect(gatewayRuntimeTestBool(row, "running"), false)
+            @Expect(gatewayRuntimeTestBool(row, "connected"), false)
+            @Expect(gatewayRuntimeTestString(row, "lastError").contains("ready timeout"), true)
+        }
+    }
+
+    @TestCase
     public func startChannelsMarksTimedOutAccountAndContinuesLaterAccounts(): Unit {
         withGatewayChannelRuntimeTestHome {
             let manager = GatewayChannelManager(startupAccountTimeoutMs: 30)
@@ -458,6 +512,29 @@ public class GatewayChannelRuntimeTest {
             @Expect(raw.contains("sidecar-token"), false)
             @Expect(raw.contains("sidecar-secret-never-visible"), false)
             @Expect(raw.contains("Authorization"), false)
+        }
+    }
+
+    @TestCase
+    public func feishuSidecarClosedAfterReadyMovesGatewayRuntimeToBackoff(): Unit {
+        withGatewayChannelRuntimeTestHome {
+            let manager = GatewayChannelManager()
+            manager.registerAdapter(GatewayChannelRuntimeSidecarClosedAfterReadyAdapter(), channelId: "feishu", accountId: "tenant-a")
+            manager.startChannels()
+
+            let runningRow = gatewayChannelRuntimeAccountsJson("feishu")[0].asObject()
+            @Expect(gatewayRuntimeTestString(runningRow, "lifecycleState"), "running")
+            @Expect(gatewayRuntimeTestBool(runningRow, "running"), true)
+            @Expect(gatewayRuntimeTestBool(runningRow, "connected"), true)
+
+            manager.processOnce({ _message, _accountId => () })
+
+            let failedRow = gatewayChannelRuntimeAccountsJson("feishu")[0].asObject()
+            @Expect(gatewayRuntimeTestString(failedRow, "lifecycleState"), "backoff")
+            @Expect(gatewayRuntimeTestString(failedRow, "errorKind"), "pull_failed")
+            @Expect(gatewayRuntimeTestBool(failedRow, "running"), false)
+            @Expect(gatewayRuntimeTestBool(failedRow, "connected"), false)
+            @Expect(gatewayRuntimeTestString(failedRow, "lastError").contains("websocket.close 1006"), true)
         }
     }
 
