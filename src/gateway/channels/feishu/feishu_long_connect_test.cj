@@ -268,6 +268,101 @@ public class FeishuLongConnectTest {
     }
 
     @TestCase
+    public func disabledLongConnectDoesNotFailWhenTransportWouldFail(): Unit {
+        let transport = FeishuFakeLongConnectTransport(
+            result: FeishuLongConnectStartResult(ok: false, status: "missing_dependency", error: "sidecar sdk missing")
+        )
+        let adapter = FeishuAdapter(
+            config: FeishuConfig(
+                enabled: true,
+                receiveMode: "webhook"
+            ),
+            accountId: "tenant-a",
+            longConnectTransport: transport
+        )
+
+        adapter.start()
+
+        @Expect(adapter.debugIsRunningForTest(), true)
+        @Expect(adapter.debugFeishuNativeLongConnectLastErrorForTest(), "")
+        @Expect(transport.startCount, 0)
+    }
+
+    @TestCase
+    public func feishuAdapterThrowsWhenSidecarStartFails(): Unit {
+        let transport = FeishuFakeLongConnectTransport(
+            result: FeishuLongConnectStartResult(
+                ok: false,
+                status: "missing_dependency",
+                error: "Feishu sidecar dependency missing: @larksuiteoapi/node-sdk under /tmp/metis-feishu-runtime"
+            )
+        )
+        let adapter = FeishuAdapter(
+            config: FeishuConfig(
+                enabled: true,
+                appId: "cli_sidecar_app",
+                appSecret: "sidecar-secret-never-output",
+                receiveMode: "long_connect"
+            ),
+            accountId: "tenant-a",
+            longConnectTransport: transport
+        )
+        var threw = false
+        var message = ""
+
+        try {
+            adapter.start()
+        } catch (e: Exception) {
+            threw = true
+            message = e.message
+        }
+
+        @Expect(threw, true)
+        @Expect(adapter.debugIsRunningForTest(), false)
+        @Expect(adapter.debugFeishuNativeLongConnectLastErrorForTest().contains("missing_dependency"), true)
+        @Expect(adapter.debugFeishuNativeLongConnectLastErrorForTest().contains("@larksuiteoapi/node-sdk"), true)
+        @Expect(message.contains("Feishu long-connect transport failed to start"), true)
+        @Expect(message.contains("missing_dependency"), true)
+        @Expect(transport.startCount, 1)
+    }
+
+    @TestCase
+    public func sidecarStartFailureIsRedactedBeforeAdapterPersistence(): Unit {
+        let transport = FeishuFakeLongConnectTransport(
+            result: FeishuLongConnectStartResult(
+                ok: false,
+                status: "missing_dependency",
+                error: "Authorization: Bearer sidecar-token appSecret=sidecar-secret-never-output"
+            )
+        )
+        let adapter = FeishuAdapter(
+            config: FeishuConfig(
+                enabled: true,
+                appId: "cli_sidecar_app",
+                appSecret: "sidecar-secret-never-output",
+                receiveMode: "long_connect"
+            ),
+            accountId: "tenant-a",
+            longConnectTransport: transport
+        )
+        var message = ""
+
+        try {
+            adapter.start()
+        } catch (e: Exception) {
+            message = e.message
+        }
+
+        let lastError = adapter.debugFeishuNativeLongConnectLastErrorForTest()
+        @Expect(lastError.contains("[redacted]"), true)
+        @Expect(message.contains("[redacted]"), true)
+        @Expect(lastError.contains("sidecar-token"), false)
+        @Expect(lastError.contains("sidecar-secret-never-output"), false)
+        @Expect(message.contains("sidecar-token"), false)
+        @Expect(message.contains("sidecar-secret-never-output"), false)
+    }
+
+    @TestCase
     public func nativeLongConnectEventsEnterSharedDispatchPath(): Unit {
         let transport = FeishuFakeLongConnectTransport(events: [
             this.messageReceiveRoot(),

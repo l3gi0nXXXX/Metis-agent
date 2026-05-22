@@ -63,6 +63,16 @@ private class FeishuSidecarFakeProcess <: FeishuSidecarProtocolProcess {
         }
     }
 
+    public func stdoutSummary(): String {
+        synchronized(this.lock) {
+            String.join(this.stdinLines.toArray(), delimiter: "\n")
+        }
+    }
+
+    public func stderrSummary(): String {
+        ""
+    }
+
     public func push(line: String): Unit {
         synchronized(this.lock) {
             this.stdoutLines.add(line)
@@ -146,6 +156,41 @@ public class FeishuSidecarTransportTest {
     }
 
     @TestCase
+    public func launchSpecCarriesRuntimeRootWorkingDirectoryAndEnvForLongConnect(): Unit {
+        let runtimeRoot = "/tmp/metis-sidecar-runtime"
+        let process = FeishuSidecarFakeProcess(stdout: [
+            "{\"type\":\"ready\",\"accountId\":\"tenant-a\",\"transport\":\"websocket\"}"
+        ])
+        let runner = FeishuSidecarFakeRunner(process)
+        let transport = FeishuSidecarTransport(
+            runner: runner,
+            options: FeishuSidecarTransportOptions(
+                command: "node",
+                args: ["scripts/feishu-openclaw-sidecar.mjs"],
+                runtimeRoot: runtimeRoot,
+                workingDirectory: "/tmp/metis",
+                env: [("METIS_FEISHU_SIDECAR_RUNTIME_ROOT", runtimeRoot)],
+                readyTimeoutMs: 1,
+                readTimeoutMs: 1,
+                stopTimeoutMs: 1,
+                startBackgroundReader: false
+            )
+        )
+
+        let result = transport.start(this.spec(), { _root => () })
+
+        @Expect(result.ok, true)
+        @Expect(runner.lastLaunch.runtimeRoot, runtimeRoot)
+        @Expect(runner.lastLaunch.workingDirectory.getOrThrow(), "/tmp/metis")
+        @Expect(runner.lastLaunch.env.size, 1)
+        @Expect(runner.lastLaunch.env[0][0], "METIS_FEISHU_SIDECAR_RUNTIME_ROOT")
+        @Expect(runner.lastLaunch.env[0][1], runtimeRoot)
+        @Expect(process.stdinLines[0].contains("\"runtimeRoot\":\"${runtimeRoot}\""), true)
+        @Expect(String.join(runner.lastLaunch.args, delimiter: " ").contains(runtimeRoot), false)
+        @Expect(String.join(runner.lastLaunch.args, delimiter: " ").contains("secret-app"), false)
+    }
+
+    @TestCase
     public func inboundFrameDispatchesOnlyJsonEventRoot(): Unit {
         let process = FeishuSidecarFakeProcess(stdout: [
             "{\"type\":\"ready\",\"accountId\":\"tenant-a\",\"transport\":\"websocket\"}",
@@ -212,12 +257,31 @@ public class FeishuSidecarTransportTest {
 
         process.push("{\"type\":\"closed\",\"accountId\":\"tenant-a\",\"reason\":\"websocket.close\"}")
         transport.debugDrainAvailableForTest()
+        @Expect(transport.healthSnapshot().ready, false)
         @Expect(transport.healthSnapshot().connected, false)
         @Expect(transport.healthSnapshot().lastError.contains("websocket.close"), true)
 
         process.exitNow()
         transport.debugDrainAvailableForTest()
         @Expect(transport.healthSnapshot().lastError.contains("unexpected exit"), true)
+    }
+
+    @TestCase
+    public func errorFrameAfterReadyMarksTransportUnavailable(): Unit {
+        let process = FeishuSidecarFakeProcess(stdout: [
+            "{\"type\":\"ready\",\"accountId\":\"tenant-a\",\"transport\":\"websocket\"}"
+        ])
+        let runner = FeishuSidecarFakeRunner(process)
+        let transport = FeishuSidecarTransport(runner: runner, options: this.options())
+        let result = transport.start(this.spec(), { _root => () })
+        @Expect(result.ok, true)
+
+        process.push("{\"type\":\"error\",\"phase\":\"websocket.read\",\"status\":\"sdk_error\",\"message\":\"sdk failed\"}")
+        transport.debugDrainAvailableForTest()
+
+        @Expect(transport.healthSnapshot().ready, false)
+        @Expect(transport.healthSnapshot().connected, false)
+        @Expect(transport.healthSnapshot().lastError.contains("sdk failed"), true)
     }
 
     @TestCase
@@ -255,5 +319,25 @@ public class FeishuSidecarTransportTest {
         @Expect(result.status, "not_configured")
         @Expect(transport.healthSnapshot().ready, false)
         @Expect(transport.healthSnapshot().connected, false)
+    }
+
+    @TestCase
+    public func diagnosticErrorRedactsSecretsFromHealthAndRing(): Unit {
+        let process = FeishuSidecarFakeProcess(stdout: [
+            "{\"type\":\"ready\",\"accountId\":\"tenant-a\",\"transport\":\"websocket\"}",
+            "{\"type\":\"diagnostic\",\"level\":\"error\",\"phase\":\"dependency.preflight\",\"status\":\"missing_dependency\",\"message\":\"missing @larksuiteoapi/node-sdk appSecret=secret-app token=secret-verification\"}"
+        ])
+        let runner = FeishuSidecarFakeRunner(process)
+        let transport = FeishuSidecarTransport(runner: runner, options: this.options())
+        let result = transport.start(this.spec(), { _root => () })
+        @Expect(result.ok, true)
+
+        transport.debugDrainAvailableForTest()
+
+        @Expect(transport.healthSnapshot().lastError.contains("secret-app"), false)
+        @Expect(transport.healthSnapshot().lastError.contains("secret-verification"), false)
+        let diagnostics = transport.diagnosticsSnapshot()
+        @Expect(diagnostics[1].message.contains("secret-app"), false)
+        @Expect(diagnostics[1].message.contains("secret-verification"), false)
     }
 }

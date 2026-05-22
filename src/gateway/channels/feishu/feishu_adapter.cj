@@ -822,6 +822,17 @@ public class FeishuAdapter <: ChannelAdapter {
         "unknown"
     }
 
+    private func feishuLongConnectStartFailureDetail(startResult: FeishuLongConnectStartResult): String {
+        let status = startResult.status.trimAscii()
+        let rawDetail = if (startResult.error.trimAscii().isEmpty()) { status } else { startResult.error.trimAscii() }
+        let redacted = this.feishuRedactDiagnosticText(rawDetail).trimAscii()
+        let safeDetail = if (redacted.isEmpty()) { status } else { redacted }
+        if (status.isEmpty() || safeDetail == status) {
+            return safeDetail
+        }
+        "${status}: ${safeDetail}"
+    }
+
     private func logSendFailure(message: OutboundMessage, accountId: String, detail: String): Unit {
         let extra = JsonObject()
         extra.put("peerHash", JsonString(gatewayLogIdentityHash(message.peerId)))
@@ -884,7 +895,7 @@ public class FeishuAdapter <: ChannelAdapter {
             { root => this.handleFeishuNativeLongConnectEventRoot(root) }
         )
         if (!startResult.ok) {
-            let detail = if (startResult.error.trimAscii().isEmpty()) { startResult.status } else { startResult.error }
+            let detail = this.feishuLongConnectStartFailureDetail(startResult)
             this.feishuNativeLongConnectLastError = detail
             this.logChannel(
                 "warn",
@@ -896,7 +907,7 @@ public class FeishuAdapter <: ChannelAdapter {
                 error: detail,
                 accountId: this.accountId
             )
-            return
+            throw Exception("Feishu long-connect transport failed to start: ${detail}")
         }
         if (!this.feishuLongConnectBackgroundFailurePending) {
             this.feishuNativeLongConnectLastError = ""

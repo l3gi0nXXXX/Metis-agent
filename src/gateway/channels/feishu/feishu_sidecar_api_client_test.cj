@@ -76,11 +76,20 @@ private class FeishuSidecarApiProcessFakeProcess <: FeishuSidecarProtocolProcess
         this.terminated = true
         this.alive = false
     }
+
+    public func stdoutSummary(): String {
+        String.join(this.stdinLines.toArray(), delimiter: "\n")
+    }
+
+    public func stderrSummary(): String {
+        ""
+    }
 }
 
 private class FeishuSidecarApiProcessFakeRunner <: FeishuSidecarProtocolRunner {
     public let process: FeishuSidecarApiProcessFakeProcess
     public var launch: FeishuSidecarLaunchSpec = FeishuSidecarLaunchSpec(command: "", args: [])
+    public var failWith: String = ""
 
     public init(process: FeishuSidecarApiProcessFakeProcess) {
         this.process = process
@@ -88,6 +97,9 @@ private class FeishuSidecarApiProcessFakeRunner <: FeishuSidecarProtocolRunner {
 
     public func start(spec: FeishuSidecarLaunchSpec): FeishuSidecarProtocolStartResult {
         this.launch = spec
+        if (!this.failWith.trimAscii().isEmpty()) {
+            return FeishuSidecarProtocolStartResult.Failed(this.failWith)
+        }
         FeishuSidecarProtocolStartResult.Started(this.process)
     }
 }
@@ -207,6 +219,100 @@ public class FeishuSidecarApiClientTest {
         @Expect(process.stdinLines[1].contains("\"action\":\"uploadMedia\""), true)
         @Expect(process.stdinLines[1].contains("\"contentBase64\":\"ZmFrZQ==\""), true)
         @Expect(process.stdinLines[2].contains("\"type\":\"close\""), true)
+    }
+
+    @TestCase
+    public func processRunnerCarriesSameRuntimeRootWorkingDirectoryAndEnvAsTransport(): Unit {
+        let runtimeRoot = "/tmp/metis-sidecar-runtime"
+        let process = FeishuSidecarApiProcessFakeProcess(stdout: [
+            "{\"type\":\"ready\",\"accountId\":\"tenant-a\",\"transport\":\"websocket\"}",
+            "{\"type\":\"sendResult\",\"requestId\":\"metis-sidecar-api\",\"ok\":true,\"messageId\":\"om_sent\"}"
+        ])
+        let protocol = FeishuSidecarApiProcessFakeRunner(process)
+        let runner = FeishuSidecarProcessRequestRunner(
+            account: FeishuSidecarRequestAccount(accountId: "tenant-a", appId: "cli_app", appSecret: "secret-app"),
+            runner: protocol,
+            options: FeishuSidecarRequestRunnerOptions(
+                command: "node",
+                args: ["scripts/feishu-openclaw-sidecar.mjs"],
+                runtimeRoot: runtimeRoot,
+                workingDirectory: "/tmp/metis",
+                env: [("METIS_FEISHU_SIDECAR_RUNTIME_ROOT", runtimeRoot)],
+                readyTimeoutMs: 1,
+                requestTimeoutMs: 1,
+                readTimeoutMs: 1,
+                stopTimeoutMs: 1
+            )
+        )
+        let request = JsonObject()
+        request.put("operation", JsonString("message.create"))
+        request.put("accountId", JsonString("tenant-a"))
+        request.put("params", JsonObject())
+
+        let result = runner.run(request)
+
+        @Expect(sidecarTestBool(result, "ok"), true)
+        @Expect(protocol.launch.runtimeRoot, runtimeRoot)
+        @Expect(protocol.launch.workingDirectory.getOrThrow(), "/tmp/metis")
+        @Expect(protocol.launch.env.size, 1)
+        @Expect(protocol.launch.env[0][0], "METIS_FEISHU_SIDECAR_RUNTIME_ROOT")
+        @Expect(protocol.launch.env[0][1], runtimeRoot)
+        @Expect(process.stdinLines[0].contains("\"runtimeRoot\":\"${runtimeRoot}\""), true)
+        @Expect(String.join(protocol.launch.args, delimiter: " ").contains(runtimeRoot), false)
+        @Expect(String.join(protocol.launch.args, delimiter: " ").contains("secret-app"), false)
+    }
+
+    @TestCase
+    public func processRunnerMissingDependencyReturnsStructuredFailure(): Unit {
+        let process = FeishuSidecarApiProcessFakeProcess(stdout: [
+            "{\"type\":\"error\",\"phase\":\"dependency.preflight\",\"status\":\"missing_dependency\",\"message\":\"missing @larksuiteoapi/node-sdk under /tmp/metis-sidecar-runtime appSecret=secret-app\"}"
+        ])
+        let protocol = FeishuSidecarApiProcessFakeRunner(process)
+        let runner = FeishuSidecarProcessRequestRunner(
+            account: FeishuSidecarRequestAccount(accountId: "tenant-a", appId: "cli_app", appSecret: "secret-app"),
+            runner: protocol,
+            options: FeishuSidecarRequestRunnerOptions(
+                runtimeRoot: "/tmp/metis-sidecar-runtime",
+                readyTimeoutMs: 1,
+                requestTimeoutMs: 1,
+                readTimeoutMs: 1,
+                stopTimeoutMs: 1
+            )
+        )
+        let request = JsonObject()
+        request.put("operation", JsonString("message.create"))
+        request.put("accountId", JsonString("tenant-a"))
+        request.put("params", JsonObject())
+
+        let result = runner.run(request)
+
+        @Expect(sidecarTestBool(result, "ok"), false)
+        @Expect(sidecarTestString(result, "status"), "missing_dependency")
+        @Expect(sidecarTestString(result, "error").contains("@larksuiteoapi/node-sdk"), true)
+        @Expect(sidecarTestString(result, "error").contains("/tmp/metis-sidecar-runtime"), true)
+        @Expect(sidecarTestString(result, "error").contains("secret-app"), false)
+    }
+
+    @TestCase
+    public func processRunnerLaunchFailureReturnsStructuredFailureWithOutputSummaries(): Unit {
+        let process = FeishuSidecarApiProcessFakeProcess()
+        let protocol = FeishuSidecarApiProcessFakeRunner(process)
+        protocol.failWith = "launch_failed: Cannot find module @larksuiteoapi/node-sdk stdout=preflight stderr=missing package"
+        let runner = FeishuSidecarProcessRequestRunner(
+            account: FeishuSidecarRequestAccount(accountId: "tenant-a", appId: "cli_app", appSecret: "secret-app"),
+            runner: protocol,
+            options: FeishuSidecarRequestRunnerOptions(readyTimeoutMs: 1, requestTimeoutMs: 1, readTimeoutMs: 1)
+        )
+        let request = JsonObject()
+        request.put("operation", JsonString("message.create"))
+        request.put("accountId", JsonString("tenant-a"))
+        request.put("params", JsonObject())
+
+        let result = runner.run(request)
+
+        @Expect(sidecarTestBool(result, "ok"), false)
+        @Expect(sidecarTestString(result, "status"), "launch_failed")
+        @Expect(sidecarTestString(result, "error").contains("missing package"), true)
     }
 
     @TestCase
@@ -376,5 +482,19 @@ public class FeishuSidecarApiClientTest {
         @Expect(sent.error.contains("app_secret"), false)
         @Expect(sent.error.contains("\"ok\""), false)
         @Expect(sent.error.contains("\"Authorization\""), false)
+    }
+
+    @TestCase
+    public func apiClientSendTextFailsClosedOnMissingSdk(): Unit {
+        let runner = FeishuSidecarApiClientFakeRunner()
+        runner.enqueue(feishuSidecarTestResult(false, status: "missing_dependency", error: "Feishu sidecar dependency missing: @larksuiteoapi/node-sdk under tools/feishu-openclaw-sidecar"))
+        let client = FeishuSidecarApiClient(runner: runner)
+
+        let sent = client.sendTextMessage("tenant-a", "oc_chat", "oc_chat", "chat_id", "hello", None<String>, false)
+
+        @Expect(sent.ok, false)
+        @Expect(sent.status, "missing_dependency")
+        @Expect(sent.error.contains("@larksuiteoapi/node-sdk"), true)
+        @Expect(runner.operation(0), "message.create")
     }
 }

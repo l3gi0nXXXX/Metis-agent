@@ -9,6 +9,7 @@ import metis.gateway.channels.feishu.{
     gatewayFeishuListAccountIds,
     gatewayFeishuRedactedValue,
     gatewayFeishuResolveAccount,
+    feishuSidecarDependencyHealthSnapshot,
     feishuGatewayNativeAuthLiveSmoke
 }
 import metis.gateway.channels.qq.{gatewayQqDefaultAccountId, gatewayQqDescribeAccounts}
@@ -1326,6 +1327,7 @@ public func gatewayChannelGetJson(user: GatewayUserSettings, channelId: String):
         result.put("replyInThread", JsonString(user.feishu.replyInThread))
         result.put("configured", (!user.feishu.appId.trimAscii().isEmpty()).toJsonValue())
         result.put("media", gatewayFeishuMediaJson(user))
+        result.put("sidecarDependency", feishuSidecarDependencyHealthSnapshot().toJson())
         result.put("diagnostics", gatewayFeishuChannelDiagnosticsJson(user))
         result.put("nativeCommands", gatewayFeishuNativeCommandsJson())
         result.put("directory", gatewayFeishuDirectoryJson(user))
@@ -2663,6 +2665,7 @@ private func gatewayChannelStatusRow(user: GatewayUserSettings, channelId: Strin
         let auth = gatewayFeishuNativeAuthStatus(gatewayFeishuDefaultAccountId(user), user)
         row.put("auth", auth)
         row.put("oauth", auth)
+        row.put("sidecarDependency", feishuSidecarDependencyHealthSnapshot().toJson())
         row.put("doctor", gatewayFeishuChannelDiagnosticsJson(user, runtime: runtime))
         row.put("pairing", gatewayFeishuPairingCollectionJson(user))
         row.put("capabilities", JsonArray([

@@ -313,6 +313,34 @@ public class GatewayChannelRuntimeTest {
     }
 
     @TestCase
+    public func gatewayManagerKeepsFeishuSidecarStartFailureOutOfRunningState(): Unit {
+        withGatewayChannelRuntimeTestHome {
+            let manager = GatewayChannelManager(startupAccountTimeoutMs: 1000)
+            let adapter = GatewayChannelLifecycleFakeAdapter(
+                "feishu",
+                "tenant-a",
+                failMessage: "Feishu long-connect transport failed to start: missing_dependency: @larksuiteoapi/node-sdk under /tmp/metis-feishu-runtime"
+            )
+            manager.registerAdapter(adapter, channelId: "feishu", accountId: "tenant-a")
+
+            let summary = manager.startChannels()
+            let accounts = gatewayChannelRuntimeAccountsJson("feishu")
+            let row = accounts[0].asObject()
+
+            @Expect(gatewayRuntimeTestString(summary, "status"), "degraded")
+            @Expect(gatewayRuntimeTestInt(summary, "failedCount"), 1)
+            @Expect(gatewayRuntimeTestString(row, "lifecycleState"), "failed")
+            @Expect(gatewayRuntimeTestString(row, "errorKind"), "start_failed")
+            @Expect(gatewayRuntimeTestBool(row, "running"), false)
+            @Expect(gatewayRuntimeTestBool(row, "connected"), false)
+            @Expect(gatewayRuntimeTestString(row, "lastError").contains("missing_dependency"), true)
+            @Expect(gatewayRuntimeTestString(row, "lastError").contains("@larksuiteoapi/node-sdk"), true)
+            @Expect(adapter.startCount, 1)
+            @Expect(adapter.stopCount, 1)
+        }
+    }
+
+    @TestCase
     public func startChannelsMarksTimedOutAccountAndContinuesLaterAccounts(): Unit {
         withGatewayChannelRuntimeTestHome {
             let manager = GatewayChannelManager(startupAccountTimeoutMs: 30)

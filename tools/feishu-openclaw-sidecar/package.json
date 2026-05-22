@@ -1,0 +1,9 @@
+{
+  "name": "metis-feishu-openclaw-sidecar-runtime",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "^1.60.0",
+    "https-proxy-agent": "^9.0.0"
+  }
+}

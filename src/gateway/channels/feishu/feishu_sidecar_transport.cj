@@ -1,6 +1,10 @@
 package metis.gateway.channels.feishu
 
-import std.collection.ArrayList
+import metis.core.config.CliConfig
+
+import std.collection.{ArrayList, HashMap}
+import std.env.getVariables
+import std.fs.Path
 import std.io.*
 import std.process.*
 import std.sync.Mutex
@@ -14,10 +18,16 @@ public class FeishuSidecarTransportOptions {
     public let readTimeoutMs: Int64
     public let stopTimeoutMs: Int64
     public let startBackgroundReader: Bool
+    public let runtimeRoot: String
+    public let workingDirectory: String
+    public let env: Array<(String, String)>
 
     public init(
         command!: String = "node",
         args!: Array<String> = ["scripts/feishu-openclaw-sidecar.mjs"],
+        runtimeRoot!: String = "",
+        workingDirectory!: String = "",
+        env!: Array<(String, String)> = [],
         readyTimeoutMs!: Int64 = 10000,
         readTimeoutMs!: Int64 = 250,
         stopTimeoutMs!: Int64 = 500,
@@ -25,6 +35,9 @@ public class FeishuSidecarTransportOptions {
     ) {
         this.command = if (command.trimAscii().isEmpty()) { "node" } else { command.trimAscii() }
         this.args = args
+        this.runtimeRoot = feishuSidecarNormalizeRuntimeRoot(runtimeRoot)
+        this.workingDirectory = feishuSidecarNormalizeWorkingDirectory(workingDirectory)
+        this.env = feishuSidecarNormalizeEnv(env, this.runtimeRoot)
         this.readyTimeoutMs = if (readyTimeoutMs > 0) { readyTimeoutMs } else { 10000 }
         this.readTimeoutMs = if (readTimeoutMs > 0) { readTimeoutMs } else { 250 }
         this.stopTimeoutMs = if (stopTimeoutMs > 0) { stopTimeoutMs } else { 500 }
@@ -35,10 +48,29 @@ public class FeishuSidecarTransportOptions {
 public class FeishuSidecarLaunchSpec {
     public let command: String
     public let args: Array<String>
+    public let runtimeRoot: String
+    public let workingDirectory: Option<String>
+    public let env: Array<(String, String)>
 
-    public init(command!: String, args!: Array<String>) {
+    public init(
+        command!: String,
+        args!: Array<String>,
+        runtimeRoot!: String = "",
+        workingDirectory!: Option<String> = None<String>,
+        env!: Array<(String, String)> = []
+    ) {
         this.command = command.trimAscii()
         this.args = args
+        this.runtimeRoot = feishuSidecarNormalizeRuntimeRoot(runtimeRoot)
+        this.workingDirectory = match (workingDirectory) {
+            case Some(raw) =>
+                let normalized = feishuSidecarNormalizeWorkingDirectory(raw)
+                if (normalized.isEmpty()) { None<String> } else { Some(normalized) }
+            case None =>
+                let normalized = feishuSidecarNormalizeWorkingDirectory("")
+                if (normalized.isEmpty()) { None<String> } else { Some(normalized) }
+        }
+        this.env = feishuSidecarNormalizeEnv(env, this.runtimeRoot)
     }
 }
 
@@ -49,6 +81,8 @@ public interface FeishuSidecarProtocolProcess {
     func isAlive(): Bool
     func wait(timeoutMs: Int64): Option<Int64>
     func terminate(force: Bool): Unit
+    func stdoutSummary(): String
+    func stderrSummary(): String
 }
 
 public enum FeishuSidecarProtocolStartResult {
@@ -124,12 +158,22 @@ public class FeishuSidecarStdioProcess <: FeishuSidecarProtocolProcess {
     private let process: SubProcess
     private let reader: StringReader<InputStream>
     private let writer: StringWriter<OutputStream>
+    private let outputLock = Mutex()
+    private let stdoutLines = ArrayList<String>()
+    private var stderrText = ""
     private var closed = false
 
     public init(process: SubProcess) {
         this.process = process
         this.reader = StringReader<InputStream>(process.stdOutPipe)
         this.writer = StringWriter(process.stdInPipe)
+        spawn {
+            let stderrReader = StringReader<InputStream>(process.stdErrPipe)
+            let text = try { stderrReader.readToEnd() } catch (_: Exception) { "" }
+            synchronized(this.outputLock) {
+                this.stderrText = text
+            }
+        }
     }
 
     public func pid(): Int64 {
@@ -156,6 +200,10 @@ public class FeishuSidecarStdioProcess <: FeishuSidecarProtocolProcess {
         try {
             let line = fut.get()
             watchdog.cancel()
+            match (line) {
+                case Some(value) => this.rememberStdout(value)
+                case None => ()
+            }
             line
         } catch (_: Exception) {
             try { watchdog.cancel() } catch (_e: Exception) { () }
@@ -179,6 +227,27 @@ public class FeishuSidecarStdioProcess <: FeishuSidecarProtocolProcess {
         this.closed = true
         try { this.process.terminate(force: force) } catch (_: Exception) { () }
     }
+
+    public func stdoutSummary(): String {
+        synchronized(this.outputLock) {
+            feishuSidecarSummarizeText(String.join(this.stdoutLines.toArray(), delimiter: "\n"))
+        }
+    }
+
+    public func stderrSummary(): String {
+        synchronized(this.outputLock) {
+            feishuSidecarSummarizeText(this.stderrText)
+        }
+    }
+
+    private func rememberStdout(line: String): Unit {
+        synchronized(this.outputLock) {
+            this.stdoutLines.add(line)
+            while (this.stdoutLines.size > 16) {
+                this.stdoutLines.remove(at: 0)
+            }
+        }
+    }
 }
 
 public class FeishuSidecarStdioRunner <: FeishuSidecarProtocolRunner {
@@ -194,7 +263,9 @@ public class FeishuSidecarStdioRunner <: FeishuSidecarProtocolRunner {
                 spec.args,
                 stdIn: ProcessRedirect.Pipe,
                 stdOut: ProcessRedirect.Pipe,
-                stdErr: ProcessRedirect.Pipe
+                stdErr: ProcessRedirect.Pipe,
+                workingDirectory: spec.workingDirectory.map({ value => Path(value) }),
+                environment: Some(feishuSidecarProcessEnvironment(spec.env))
             )
             FeishuSidecarProtocolStartResult.Started(FeishuSidecarStdioProcess(process))
         } catch (e: Exception) {
@@ -226,6 +297,7 @@ public class FeishuSidecarTransport <: FeishuLongConnectTransport {
     private var handler: Option<(JsonObject) -> Unit> = None
     private var running = false
     private var ready = false
+    private var everReady = false
     private var connected = false
     private var pidValue: Int64 = 0
     private var lastError = ""
@@ -241,18 +313,26 @@ public class FeishuSidecarTransport <: FeishuLongConnectTransport {
     }
 
     public func start(spec: FeishuLongConnectStartSpec, eventHandler: (JsonObject) -> Unit): FeishuLongConnectStartResult {
-        let launch = FeishuSidecarLaunchSpec(command: this.options.command, args: this.options.args)
+        let launch = FeishuSidecarLaunchSpec(
+            command: this.options.command,
+            args: this.options.args,
+            runtimeRoot: this.options.runtimeRoot,
+            workingDirectory: Some(this.options.workingDirectory),
+            env: this.options.env
+        )
         match (this.runner.start(launch)) {
             case FeishuSidecarProtocolStartResult.Failed(reason) =>
                 let status = if (reason.contains("not_configured")) { "not_configured" } else { "launch_failed" }
-                this.recordFailure("start", status, reason)
-                return FeishuLongConnectStartResult(ok: false, status: status, error: reason)
+                let error = feishuSidecarTransportRedactSensitiveText(reason)
+                this.recordFailure("start", status, error)
+                return FeishuLongConnectStartResult(ok: false, status: status, error: error)
             case FeishuSidecarProtocolStartResult.Started(proc) =>
                 synchronized(this.lock) {
                     this.process = Some(proc)
                     this.handler = Some(eventHandler)
                     this.running = true
                     this.ready = false
+                    this.everReady = false
                     this.connected = false
                     this.pidValue = proc.pid()
                     this.lastError = ""
@@ -260,9 +340,9 @@ public class FeishuSidecarTransport <: FeishuLongConnectTransport {
                     this.generation += 1
                 }
                 try {
-                    proc.writeLine(this.compactJsonLine(this.initFrame(spec).toJsonString()))
+                    proc.writeLine(this.compactJsonLine(this.initFrame(spec, launch).toJsonString()))
                 } catch (e: Exception) {
-                    let error = "init write failed: ${e.message}"
+                    let error = feishuSidecarTransportRedactSensitiveText("init write failed: ${e.message}")
                     this.recordFailure("init", "write_failed", error)
                     return FeishuLongConnectStartResult(ok: false, status: "write_failed", error: error)
                 }
@@ -281,6 +361,7 @@ public class FeishuSidecarTransport <: FeishuLongConnectTransport {
         let proc = synchronized(this.lock) {
             this.running = false
             this.ready = false
+            this.everReady = false
             this.connected = false
             this.generation += 1
             this.process
@@ -348,14 +429,14 @@ public class FeishuSidecarTransport <: FeishuLongConnectTransport {
                     }
                 case None =>
                     if (!proc.isAlive()) {
-                        let error = "sidecar exited before ready"
+                        let error = this.processError("sidecar exited before ready", proc)
                         this.recordFailure("start", "unexpected_exit", error)
                         return FeishuLongConnectStartResult(ok: false, status: "unexpected_exit", error: error)
                     }
                     break
             }
         }
-        let error = "sidecar ready timeout"
+        let error = this.processError("sidecar ready timeout", proc)
         this.recordFailure("start", "ready_timeout", error)
         FeishuLongConnectStartResult(ok: false, status: "ready_timeout", error: error)
     }
@@ -395,6 +476,7 @@ public class FeishuSidecarTransport <: FeishuLongConnectTransport {
         if (frameType == "ready") {
             synchronized(this.lock) {
                 this.ready = true
+                this.everReady = true
                 this.connected = true
                 this.lastError = ""
             }
@@ -405,7 +487,7 @@ public class FeishuSidecarTransport <: FeishuLongConnectTransport {
             let level = this.readString(frame, "level", fallback: "info")
             let phase = this.readString(frame, "phase", fallback: "diagnostic")
             let status = this.readString(frame, "status", fallback: "ok")
-            let message = this.readString(frame, "message")
+            let message = feishuSidecarTransportRedactSensitiveText(this.readString(frame, "message"))
             this.recordDiagnostic(level, phase, status, message)
             if (level == "error" || status == "failed") {
                 this.setLastError(this.composeError(phase, status, message))
@@ -419,14 +501,19 @@ public class FeishuSidecarTransport <: FeishuLongConnectTransport {
         if (frameType == "error") {
             let phase = this.readString(frame, "phase", fallback: "error")
             let status = this.readString(frame, "status", fallback: "error")
-            let message = this.readString(frame, "message", fallback: this.readString(frame, "error"))
+            let message = feishuSidecarTransportRedactSensitiveText(this.readString(frame, "message", fallback: this.readString(frame, "error")))
             let error = this.composeError(phase, status, message)
+            synchronized(this.lock) {
+                this.ready = false
+                this.connected = false
+            }
             this.recordFailure(phase, status, error)
             return FeishuSidecarProtocolOutcome(done: readyPhase, ok: false, status: status, error: error)
         }
         if (frameType == "closed") {
-            let reason = this.readString(frame, "reason", fallback: "closed")
+            let reason = feishuSidecarTransportRedactSensitiveText(this.readString(frame, "reason", fallback: "closed"))
             synchronized(this.lock) {
+                this.ready = false
                 this.connected = false
             }
             let error = "sidecar closed: ${reason}"
@@ -470,12 +557,13 @@ public class FeishuSidecarTransport <: FeishuLongConnectTransport {
     private func recordUnexpectedExitIfNeeded(): Unit {
         let shouldRecord = synchronized(this.lock) {
             match (this.process) {
-                case Some(p) => this.running && this.ready && !p.isAlive()
+                case Some(p) => this.running && this.everReady && !p.isAlive()
                 case None => false
             }
         }
         if (shouldRecord) {
             synchronized(this.lock) {
+                this.ready = false
                 this.connected = false
             }
             this.recordFailure("process", "unexpected_exit", "sidecar unexpected exit")
@@ -509,7 +597,7 @@ public class FeishuSidecarTransport <: FeishuLongConnectTransport {
         }
     }
 
-    private func initFrame(spec: FeishuLongConnectStartSpec): JsonObject {
+    private func initFrame(spec: FeishuLongConnectStartSpec, launch: FeishuSidecarLaunchSpec): JsonObject {
         let out = JsonObject()
         out.put("type", JsonString("init"))
         out.put("accountId", JsonString(spec.accountId))
@@ -519,7 +607,23 @@ public class FeishuSidecarTransport <: FeishuLongConnectTransport {
         out.put("verificationToken", JsonString(spec.verificationToken))
         out.put("encryptKey", JsonString(spec.encryptKey))
         out.put("mode", JsonString("websocket"))
+        out.put("runtimeRoot", JsonString(launch.runtimeRoot))
         out
+    }
+
+    private func processError(prefix: String, proc: FeishuSidecarProtocolProcess): String {
+        let parts = ArrayList<String>()
+        let base = feishuSidecarTransportRedactSensitiveText(prefix)
+        parts.add(base)
+        let stdout = feishuSidecarTransportRedactSensitiveText(proc.stdoutSummary())
+        if (!stdout.isEmpty()) {
+            parts.add("stdout=${stdout}")
+        }
+        let stderr = feishuSidecarTransportRedactSensitiveText(proc.stderrSummary())
+        if (!stderr.isEmpty()) {
+            parts.add("stderr=${stderr}")
+        }
+        String.join(parts.toArray(), delimiter: "; ")
     }
 
     private func composeError(phase: String, status: String, message: String): String {
@@ -585,6 +689,112 @@ public class FeishuSidecarTransport <: FeishuLongConnectTransport {
             this.running && this.generation == expected
         }
     }
+}
+
+public func feishuSidecarDefaultWorkingDirectory(): String {
+    CliConfig.cwd.toString()
+}
+
+public func feishuSidecarDefaultRuntimeRoot(): String {
+    CliConfig.cwd.join("tools").join("feishu-openclaw-sidecar").toString()
+}
+
+private func feishuSidecarNormalizeRuntimeRoot(raw: String): String {
+    let trimmed = raw.trimAscii()
+    if (trimmed.isEmpty()) {
+        feishuSidecarDefaultRuntimeRoot()
+    } else {
+        trimmed
+    }
+}
+
+private func feishuSidecarNormalizeWorkingDirectory(raw: String): String {
+    let trimmed = raw.trimAscii()
+    if (trimmed.isEmpty()) {
+        feishuSidecarDefaultWorkingDirectory()
+    } else {
+        trimmed
+    }
+}
+
+private func feishuSidecarNormalizeEnv(raw: Array<(String, String)>, runtimeRoot: String): Array<(String, String)> {
+    let out = ArrayList<(String, String)>()
+    var hasRuntimeRoot = false
+    for (entry in raw) {
+        let key = entry[0].trimAscii()
+        if (key.isEmpty()) {
+            continue
+        }
+        let value = entry[1].trimAscii()
+        if (key == "METIS_FEISHU_SIDECAR_RUNTIME_ROOT") {
+            hasRuntimeRoot = true
+        }
+        out.add((key, value))
+    }
+    if (!hasRuntimeRoot) {
+        out.add(("METIS_FEISHU_SIDECAR_RUNTIME_ROOT", runtimeRoot))
+    }
+    out.toArray()
+}
+
+private func feishuSidecarProcessEnvironment(overrides: Array<(String, String)>): HashMap<String, String> {
+    let env = HashMap<String, String>()
+    for ((key, value) in getVariables()) {
+        env[key] = value
+    }
+    for (entry in overrides) {
+        env[entry[0]] = entry[1]
+    }
+    env
+}
+
+private func feishuSidecarSummarizeText(raw: String): String {
+    let text = raw.trimAscii()
+    if (text.size <= 512) {
+        return text
+    }
+    "${text[0..512]}..."
+}
+
+private func feishuSidecarTransportRedactSensitiveText(raw: String): String {
+    let text = raw.trimAscii()
+    if (text.isEmpty()) {
+        return ""
+    }
+    if (text.startsWith("{") || text.startsWith("[")) {
+        return "Feishu sidecar returned structured error."
+    }
+    var redacted = text
+    for (token in text.split(" ")) {
+        if (feishuSidecarTransportSensitiveToken(token)) {
+            redacted = redacted.replace(token, "[redacted]")
+        }
+    }
+    if (redacted != text) {
+        return redacted
+    }
+    text
+}
+
+private func feishuSidecarTransportSensitiveToken(raw: String): Bool {
+    let text = raw.trimAscii()
+    if (text.isEmpty()) {
+        return false
+    }
+    let lower = text.toAsciiLower()
+    lower.contains("authorization:") ||
+        lower.contains("\"authorization\"") ||
+        lower.contains("bearer ") ||
+        lower.contains("access_token") ||
+        lower.contains("refresh_token") ||
+        lower.contains("tenant_secret") ||
+        lower.contains("tenant secret") ||
+        lower.contains("appsecret") ||
+        lower.contains("app_secret") ||
+        lower.contains("client_secret") ||
+        lower.contains("secret") ||
+        lower.contains("token=") ||
+        lower.contains("password")
 }
 
 public class FeishuWebhookLongConnectTransport <: FeishuLongConnectTransport {

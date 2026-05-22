@@ -9,9 +9,11 @@ import metis.gateway.channels.feishu.{
     FeishuAuthHttpResponse,
     FeishuFileAuthSessionStore,
     FeishuFileTokenStore,
+    FeishuSidecarDependencyHealth,
     FeishuUserToken,
     feishuGatewayNativeAuthRevokeWithClient,
-    feishuGatewayNativeAuthStatusWithStores
+    feishuGatewayNativeAuthStatusWithStores,
+    setFeishuSidecarDependencyHealthProviderForTest
 }
 import metis.gateway.core.{
     ChannelAdapter,
@@ -376,6 +378,49 @@ public class GatewayServerMethodsChannelsTest {
         @Expect(channelsTestBool(telegramSupports, "mediaPhoto"), true)
         @Expect(channelsTestBool(telegramSupports, "mediaAudio"), true)
         @Expect(channelsTestBool(telegramSupports, "mediaVideoNote"), true)
+    }
+
+    @TestCase
+    public func feishuChannelStatusExposeSidecarDependencyDiagnosticsWithoutSecrets(): Unit {
+        try {
+            setFeishuSidecarDependencyHealthProviderForTest(Some({ =>
+                FeishuSidecarDependencyHealth(
+                    false,
+                    "missing",
+                    "/tmp/metis-project",
+                    "/tmp/metis-project/tools/feishu-openclaw-sidecar",
+                    "/tmp/metis-project/scripts/feishu-openclaw-sidecar.mjs",
+                    "Run `npm --prefix tools/feishu-openclaw-sidecar install` from the Metis repository root.",
+                    "missing=node_modules; command error contains secret-never-visible",
+                    ["node_modules", "@larksuiteoapi/node-sdk"],
+                    [],
+                    "v-test",
+                    "9-test"
+                )
+            }))
+            var user = GatewayUserSettings()
+            user.feishu.enabled = true
+            user.feishu.appId = "cli_a"
+            user.feishu.appSecret = "secret-never-visible"
+
+            let channel = gatewayChannelGetJson(user, "feishu")
+            let sidecar = channel.get("sidecarDependency").getOrThrow().asObject()
+            @Expect(channelsTestString(sidecar, "status"), "missing")
+            @Expect(channelsTestString(sidecar, "installHint").contains("npm --prefix tools/feishu-openclaw-sidecar install"), true)
+            @Expect(sidecar.toJsonString().contains("secret-never-visible"), false)
+
+            let supports = channel.get("supports").getOrThrow().asObject()
+            @Expect(channelsTestString(supports, "sidecarDependencyStatus"), "missing")
+            @Expect(channelsTestString(supports, "sidecarDependencyInstallHint").contains("npm --prefix tools/feishu-openclaw-sidecar install"), true)
+
+            let status = handleGatewayChannelsFamily("channels.status", user).getOrThrow().result.asObject()
+            let rawStatus = status.toJsonString()
+            @Expect(rawStatus.contains("sidecarDependencyStatus"), true)
+            @Expect(rawStatus.contains("npm --prefix tools/feishu-openclaw-sidecar install"), true)
+            @Expect(rawStatus.contains("secret-never-visible"), false)
+        } finally {
+            setFeishuSidecarDependencyHealthProviderForTest(None<() -> FeishuSidecarDependencyHealth>)
+        }
     }
 
     @TestCase

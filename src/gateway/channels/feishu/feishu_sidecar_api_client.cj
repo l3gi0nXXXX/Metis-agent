@@ -56,10 +56,16 @@ public class FeishuSidecarRequestRunnerOptions {
     public let requestTimeoutMs: Int64
     public let readTimeoutMs: Int64
     public let stopTimeoutMs: Int64
+    public let runtimeRoot: String
+    public let workingDirectory: String
+    public let env: Array<(String, String)>
 
     public init(
         command!: String = "node",
         args!: Array<String> = ["scripts/feishu-openclaw-sidecar.mjs"],
+        runtimeRoot!: String = "",
+        workingDirectory!: String = "",
+        env!: Array<(String, String)> = [],
         readyTimeoutMs!: Int64 = 10000,
         requestTimeoutMs!: Int64 = 30000,
         readTimeoutMs!: Int64 = 250,
@@ -67,6 +73,9 @@ public class FeishuSidecarRequestRunnerOptions {
     ) {
         this.command = if (command.trimAscii().isEmpty()) { "node" } else { command.trimAscii() }
         this.args = args
+        this.runtimeRoot = feishuSidecarNormalizeApiRuntimeRoot(runtimeRoot)
+        this.workingDirectory = feishuSidecarNormalizeApiWorkingDirectory(workingDirectory)
+        this.env = feishuSidecarNormalizeApiEnv(env, this.runtimeRoot)
         this.readyTimeoutMs = if (readyTimeoutMs > 0) { readyTimeoutMs } else { 10000 }
         this.requestTimeoutMs = if (requestTimeoutMs > 0) { requestTimeoutMs } else { 30000 }
         this.readTimeoutMs = if (readTimeoutMs > 0) { readTimeoutMs } else { 250 }
@@ -93,13 +102,19 @@ public class FeishuSidecarProcessRequestRunner <: FeishuSidecarRequestRunner {
         if (this.account.appId.isEmpty() || this.account.appSecret.isEmpty()) {
             return feishuSidecarProcessFailure("not_configured", "Feishu sidecar API requires appId and appSecret.")
         }
-        let spec = FeishuSidecarLaunchSpec(command: this.options.command, args: this.options.args)
+        let spec = FeishuSidecarLaunchSpec(
+            command: this.options.command,
+            args: this.options.args,
+            runtimeRoot: this.options.runtimeRoot,
+            workingDirectory: Some(this.options.workingDirectory),
+            env: this.options.env
+        )
         match (this.runner.start(spec)) {
             case FeishuSidecarProtocolStartResult.Failed(reason) =>
                 return feishuSidecarProcessFailure(if (reason.contains("not_configured")) { "not_configured" } else { "launch_failed" }, reason)
             case FeishuSidecarProtocolStartResult.Started(proc) =>
                 try {
-                    proc.writeLine(feishuSidecarCompactJsonLine(this.initFrame().toJsonString()))
+                    proc.writeLine(feishuSidecarCompactJsonLine(this.initFrame(spec).toJsonString()))
                     let ready = this.waitForReady(proc)
                     if (!feishuSidecarJsonBool(ready, "ok", fallback: false)) {
                         return ready
@@ -115,7 +130,7 @@ public class FeishuSidecarProcessRequestRunner <: FeishuSidecarRequestRunner {
         }
     }
 
-    private func initFrame(): JsonObject {
+    private func initFrame(spec: FeishuSidecarLaunchSpec): JsonObject {
         let out = JsonObject()
         out.put("type", JsonString("init"))
         out.put("accountId", JsonString(this.account.accountId))
@@ -126,6 +141,7 @@ public class FeishuSidecarProcessRequestRunner <: FeishuSidecarRequestRunner {
         out.put("encryptKey", JsonString(this.account.encryptKey))
         out.put("mode", JsonString("websocket"))
         out.put("readyTimeoutMs", JsonInt(this.options.readyTimeoutMs))
+        out.put("runtimeRoot", JsonString(spec.runtimeRoot))
         out
     }
 
@@ -226,11 +242,11 @@ public class FeishuSidecarProcessRequestRunner <: FeishuSidecarRequestRunner {
                     }
                 case None =>
                     if (!proc.isAlive()) {
-                        return feishuSidecarProcessFailure("unexpected_exit", "Feishu sidecar exited before ready.")
+                        return feishuSidecarProcessFailureWithProcess("unexpected_exit", "Feishu sidecar exited before ready.", proc)
                     }
             }
         }
-        feishuSidecarProcessFailure("ready_timeout", "Feishu sidecar ready timeout.")
+        feishuSidecarProcessFailureWithProcess("ready_timeout", "Feishu sidecar ready timeout.", proc)
     }
 
     private func waitForResponse(proc: FeishuSidecarProtocolProcess, requestId: String): JsonObject {
@@ -251,11 +267,11 @@ public class FeishuSidecarProcessRequestRunner <: FeishuSidecarRequestRunner {
                     }
                 case None =>
                     if (!proc.isAlive()) {
-                        return feishuSidecarProcessFailure("unexpected_exit", "Feishu sidecar exited before API response.")
+                        return feishuSidecarProcessFailureWithProcess("unexpected_exit", "Feishu sidecar exited before API response.", proc)
                     }
             }
         }
-        feishuSidecarProcessFailure("request_timeout", "Feishu sidecar API request timeout.")
+        feishuSidecarProcessFailureWithProcess("request_timeout", "Feishu sidecar API request timeout.", proc)
     }
 
     private func parseFrame(line: String): JsonObject {
@@ -692,8 +708,28 @@ private func feishuSidecarRedactSensitiveText(raw: String): String {
     if (text.isEmpty()) {
         return ""
     }
+    if (text.startsWith("{") || text.startsWith("[")) {
+        return "Feishu sidecar returned structured error."
+    }
+    var redacted = text
+    for (token in text.split(" ")) {
+        if (feishuSidecarSensitiveToken(token)) {
+            redacted = redacted.replace(token, "[redacted]")
+        }
+    }
+    if (redacted != text) {
+        return redacted
+    }
+    text
+}
+
+private func feishuSidecarSensitiveToken(raw: String): Bool {
+    let text = raw.trimAscii()
+    if (text.isEmpty()) {
+        return false
+    }
     let lower = text.toAsciiLower()
-    if (lower.contains("authorization:") ||
+    lower.contains("authorization:") ||
         lower.contains("\"authorization\"") ||
         lower.contains("bearer ") ||
         lower.contains("access_token") ||
@@ -705,13 +741,7 @@ private func feishuSidecarRedactSensitiveText(raw: String): String {
         lower.contains("client_secret") ||
         lower.contains("secret") ||
         lower.contains("token=") ||
-        lower.contains("password")) {
-        return "[redacted]"
-    }
-    if (text.startsWith("{") || text.startsWith("[")) {
-        return "Feishu sidecar returned structured error."
-    }
-    text
+        lower.contains("password")
 }
 
 private func feishuSidecarShouldFallbackReply(status: String, error: String): Bool {
@@ -730,6 +760,58 @@ private func feishuSidecarProcessFailure(status: String, error: String): JsonObj
     out.put("status", JsonString(if (status.trimAscii().isEmpty()) { "api_error" } else { status.trimAscii() }))
     out.put("error", JsonString(feishuSidecarRedactSensitiveText(error)))
     out
+}
+
+private func feishuSidecarProcessFailureWithProcess(status: String, error: String, proc: FeishuSidecarProtocolProcess): JsonObject {
+    let parts = ArrayList<String>()
+    parts.add(error.trimAscii())
+    let stdout = proc.stdoutSummary().trimAscii()
+    if (!stdout.isEmpty()) {
+        parts.add("stdout=${stdout}")
+    }
+    let stderr = proc.stderrSummary().trimAscii()
+    if (!stderr.isEmpty()) {
+        parts.add("stderr=${stderr}")
+    }
+    feishuSidecarProcessFailure(status, String.join(parts.toArray(), delimiter: "; "))
+}
+
+private func feishuSidecarNormalizeApiRuntimeRoot(raw: String): String {
+    let trimmed = raw.trimAscii()
+    if (trimmed.isEmpty()) {
+        feishuSidecarDefaultRuntimeRoot()
+    } else {
+        trimmed
+    }
+}
+
+private func feishuSidecarNormalizeApiWorkingDirectory(raw: String): String {
+    let trimmed = raw.trimAscii()
+    if (trimmed.isEmpty()) {
+        feishuSidecarDefaultWorkingDirectory()
+    } else {
+        trimmed
+    }
+}
+
+private func feishuSidecarNormalizeApiEnv(raw: Array<(String, String)>, runtimeRoot: String): Array<(String, String)> {
+    let out = ArrayList<(String, String)>()
+    var hasRuntimeRoot = false
+    for (entry in raw) {
+        let key = entry[0].trimAscii()
+        if (key.isEmpty()) {
+            continue
+        }
+        let value = entry[1].trimAscii()
+        if (key == "METIS_FEISHU_SIDECAR_RUNTIME_ROOT") {
+            hasRuntimeRoot = true
+        }
+        out.add((key, value))
+    }
+    if (!hasRuntimeRoot) {
+        out.add(("METIS_FEISHU_SIDECAR_RUNTIME_ROOT", runtimeRoot))
+    }
+    out.toArray()
 }
 
 private func feishuSidecarCompactJsonLine(raw: String): String {

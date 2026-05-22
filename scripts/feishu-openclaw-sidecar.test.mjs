@@ -79,7 +79,18 @@ function writeFakeSdk(root, options = {}) {
       export class WSClient {
         constructor(options) {
           this.options = options;
+          this.listeners = {};
           record("WSClient", options);
+        }
+        on(event, handler) {
+          this.listeners[event] = handler;
+          record("WSClient.on", { event });
+          return this;
+        }
+        once(event, handler) {
+          this.listeners[event] = handler;
+          record("WSClient.once", { event });
+          return this;
         }
         start({ eventDispatcher }) {
           record("WSClient.start", { hasDispatcher: Boolean(eventDispatcher) });
@@ -94,6 +105,12 @@ function writeFakeSdk(root, options = {}) {
             setTimeout(() => {
               void eventDispatcher.__emit(event.type, event.payload);
             }, event.delayMs ?? (index + 1));
+          }
+          if (behavior.backgroundCloseMs !== undefined) {
+            setTimeout(() => {
+              const handler = this.listeners.close || this.listeners.closed || this.listeners.error;
+              if (handler) handler(new Error("fake background close " + (behavior.secretEcho || "")));
+            }, behavior.backgroundCloseMs);
           }
           return behavior.start === "async" ? new Promise((resolve) => setTimeout(resolve, behavior.startDelayMs ?? 5)) : undefined;
         }
@@ -216,6 +233,107 @@ function writeFakeSdk(root, options = {}) {
   return { sdkPath, callsPath };
 }
 
+function writeFakeRuntimeRoot(root, options = {}) {
+  const runtimeRoot = path.join(root, "runtime");
+  const sdkRoot = path.join(runtimeRoot, "node_modules", "@larksuiteoapi", "node-sdk");
+  const proxyRoot = path.join(runtimeRoot, "node_modules", "https-proxy-agent");
+  const callsPath = path.join(root, "fake-runtime-calls.jsonl");
+  fs.mkdirSync(runtimeRoot, { recursive: true });
+  fs.writeFileSync(
+    path.join(runtimeRoot, "package.json"),
+    JSON.stringify({ name: "fake-runtime", private: true, type: "module", dependencies: {} }),
+  );
+
+  if (options.sdk !== false) {
+    fs.mkdirSync(sdkRoot, { recursive: true });
+    fs.writeFileSync(
+      path.join(sdkRoot, "package.json"),
+      JSON.stringify({ name: "@larksuiteoapi/node-sdk", version: "0.0.0-test", main: "index.cjs" }),
+    );
+    fs.writeFileSync(
+      path.join(sdkRoot, "index.cjs"),
+      `
+        const fs = require("node:fs");
+        const callsPath = process.env.METIS_FEISHU_FAKE_SDK_CALLS;
+        function record(kind, value) {
+          if (!callsPath) return;
+          fs.appendFileSync(callsPath, JSON.stringify({ kind, value }, (_key, entry) => {
+            if (typeof entry === "function") return "[Function]";
+            return entry;
+          }) + "\\n");
+        }
+        exports.AppType = { SelfBuild: "SelfBuild" };
+        exports.Domain = { Feishu: "https://open.feishu.cn", Lark: "https://open.larksuite.com" };
+        exports.LoggerLevel = { info: "info" };
+        ${options.sdkProxyAgent === false ? "" : `
+        exports.HttpsProxyAgent = class HttpsProxyAgent {
+          constructor(url) {
+            this.url = url;
+            record("sdk.proxyAgent", { url });
+          }
+        };`}
+        exports.EventDispatcher = class EventDispatcher {
+          constructor(options) {
+            this.options = options;
+            this.handlers = {};
+            record("EventDispatcher", options);
+          }
+          register(handlers) {
+            Object.assign(this.handlers, handlers);
+            record("EventDispatcher.register", Object.keys(handlers));
+          }
+        };
+        exports.WSClient = class WSClient {
+          constructor(options) {
+            this.options = options;
+            record("WSClient", options);
+          }
+          start({ eventDispatcher }) {
+            record("WSClient.start", { hasDispatcher: Boolean(eventDispatcher) });
+          }
+          close() {
+            record("WSClient.close", {});
+          }
+        };
+        exports.Client = class Client {
+          constructor(options) {
+            this.options = options;
+            record("Client", options);
+            this.im = { message: {} };
+          }
+        };
+      `,
+    );
+  }
+
+  if (options.proxyAgent !== false) {
+    fs.mkdirSync(proxyRoot, { recursive: true });
+    fs.writeFileSync(
+      path.join(proxyRoot, "package.json"),
+      JSON.stringify({ name: "https-proxy-agent", version: "0.0.0-test", main: "index.cjs" }),
+    );
+    fs.writeFileSync(
+      path.join(proxyRoot, "index.cjs"),
+      `
+        const fs = require("node:fs");
+        const callsPath = process.env.METIS_FEISHU_FAKE_SDK_CALLS;
+        function record(kind, value) {
+          if (!callsPath) return;
+          fs.appendFileSync(callsPath, JSON.stringify({ kind, value }) + "\\n");
+        }
+        exports.HttpsProxyAgent = class HttpsProxyAgent {
+          constructor(url) {
+            this.url = url;
+            record("runtime.proxyAgent", { url });
+          }
+        };
+      `,
+    );
+  }
+
+  return { runtimeRoot, callsPath };
+}
+
 function baseInit(overrides = {}) {
   return {
     type: "init",
@@ -231,17 +349,22 @@ function baseInit(overrides = {}) {
 }
 
 function spawnSidecar({ sdkPath, callsPath, behavior = {}, env = {}, args = [] } = {}) {
+  const childEnv = {
+    ...process.env,
+    METIS_FEISHU_FAKE_SDK_CALLS: callsPath,
+    METIS_FEISHU_FAKE_SDK_BEHAVIOR: JSON.stringify(behavior),
+    HOME: fs.mkdtempSync(path.join(os.tmpdir(), "metis-feishu-sidecar-home-")),
+    METIS_HOME: fs.mkdtempSync(path.join(os.tmpdir(), "metis-feishu-sidecar-metis-home-")),
+    ...env,
+  };
+  if (sdkPath) {
+    childEnv.METIS_FEISHU_SIDECAR_SDK = sdkPath;
+  } else {
+    delete childEnv.METIS_FEISHU_SIDECAR_SDK;
+  }
   const child = spawn(process.execPath, [sidecarPath, ...args], {
     encoding: "utf8",
-    env: {
-      ...process.env,
-      METIS_FEISHU_SIDECAR_SDK: sdkPath,
-      METIS_FEISHU_FAKE_SDK_CALLS: callsPath,
-      METIS_FEISHU_FAKE_SDK_BEHAVIOR: JSON.stringify(behavior),
-      HOME: fs.mkdtempSync(path.join(os.tmpdir(), "metis-feishu-sidecar-home-")),
-      METIS_HOME: fs.mkdtempSync(path.join(os.tmpdir(), "metis-feishu-sidecar-metis-home-")),
-      ...env,
-    },
+    env: childEnv,
   });
   child.stdout.setEncoding("utf8");
   child.stderr.setEncoding("utf8");
@@ -318,6 +441,127 @@ function readCalls(callsPath) {
 function callsOf(callsPath, kind) {
   return readCalls(callsPath).filter((call) => call.kind === kind).map((call) => call.value);
 }
+
+test("feishu sidecar resolves sdk from runtime root without METIS_FEISHU_SIDECAR_SDK", async () => {
+  const root = createTempRoot();
+  const { runtimeRoot, callsPath } = writeFakeRuntimeRoot(root);
+  try {
+    const proc = spawnSidecar({ callsPath });
+    proc.writeFrame(baseInit({ runtimeRoot }));
+    const preflight = await proc.waitForFrame((frame) => frame.type === "diagnostic" && frame.phase === "dependency.preflight");
+    assert.equal(preflight.status, "ok");
+    assert.equal(preflight.runtimeRoot, runtimeRoot);
+    const ready = await proc.waitForFrame((frame) => frame.type === "ready");
+    assert.equal(ready.accountId, "acct-1");
+    assert.equal(callsOf(callsPath, "WSClient.start")[0].hasDispatcher, true);
+    const result = await proc.close();
+    assert.equal(result.status, 0, result.stderr);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("feishu sidecar dependency preflight reports missing runtime package json", async () => {
+  const root = createTempRoot();
+  const runtimeRoot = path.join(root, "missing-runtime");
+  try {
+    const proc = spawnSidecar({});
+    proc.writeFrame(baseInit({ runtimeRoot }));
+    const error = await proc.waitForFrame((frame) => frame.type === "error" && frame.phase === "dependency.preflight");
+    assert.equal(error.status, "missing_dependency");
+    assert.match(error.message, /package\.json/);
+    assert.match(error.message, new RegExp(runtimeRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    for (const secret of Object.values(secretValues)) {
+      assert.equal(`${proc.stdoutLines.join("\n")}${proc.stderrLines.join("\n")}`.includes(secret), false);
+    }
+    proc.child.stdin.end();
+    await proc.waitForExit();
+    assert.notEqual(proc.child.exitCode, 0);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("feishu sidecar dependency preflight reports missing @larksuiteoapi/node-sdk", async () => {
+  const root = createTempRoot();
+  const { runtimeRoot } = writeFakeRuntimeRoot(root, { sdk: false });
+  try {
+    const proc = spawnSidecar({});
+    proc.writeFrame(baseInit({ runtimeRoot }));
+    const error = await proc.waitForFrame((frame) => frame.type === "error" && frame.phase === "dependency.preflight");
+    assert.equal(error.status, "missing_dependency");
+    assert.match(error.message, /@larksuiteoapi\/node-sdk/);
+    assert.equal(error.message.includes("Cannot find module"), false);
+    proc.child.stdin.end();
+    await proc.waitForExit();
+    assert.notEqual(proc.child.exitCode, 0);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("feishu sidecar dependency preflight reports missing https-proxy-agent", async () => {
+  const root = createTempRoot();
+  const { runtimeRoot } = writeFakeRuntimeRoot(root, { proxyAgent: false });
+  try {
+    const proc = spawnSidecar({});
+    proc.writeFrame(baseInit({ runtimeRoot }));
+    const error = await proc.waitForFrame((frame) => frame.type === "error" && frame.phase === "dependency.preflight");
+    assert.equal(error.status, "missing_dependency");
+    assert.match(error.message, /https-proxy-agent/);
+    assert.equal(error.message.includes("Require stack"), false);
+    proc.child.stdin.end();
+    await proc.waitForExit();
+    assert.notEqual(proc.child.exitCode, 0);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("feishu sidecar creates proxy agent from runtime root when SDK does not export one", async () => {
+  const root = createTempRoot();
+  const { runtimeRoot, callsPath } = writeFakeRuntimeRoot(root, { sdkProxyAgent: false });
+  try {
+    const proc = spawnSidecar({
+      callsPath,
+      env: {
+        https_proxy: "http://127.0.0.1:7897",
+        HTTPS_PROXY: "http://127.0.0.1:7898",
+        http_proxy: "http://127.0.0.1:7899",
+        HTTP_PROXY: "http://127.0.0.1:7900",
+      },
+    });
+    proc.writeFrame(baseInit({ runtimeRoot }));
+    await proc.waitForFrame((frame) => frame.type === "ready");
+    const result = await proc.close();
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(callsOf(callsPath, "runtime.proxyAgent")[0].url, "http://127.0.0.1:7897");
+    assert.equal(callsOf(callsPath, "sdk.proxyAgent").length, 0);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("sdk background close emits closed frame after ready without leaking secrets", async () => {
+  const root = createTempRoot();
+  const { sdkPath, callsPath } = writeFakeSdk(root);
+  try {
+    const proc = spawnSidecar({
+      sdkPath,
+      callsPath,
+      behavior: { backgroundCloseMs: 10, secretEcho: secretValues.appSecret },
+    });
+    proc.writeFrame(baseInit());
+    await proc.waitForFrame((frame) => frame.type === "ready");
+    const closed = await proc.waitForFrame((frame) => frame.type === "closed" && frame.reason === "sdk_close", 1000);
+    assert.equal(closed.accountId, "acct-1");
+    assert.equal(`${proc.stdoutLines.join("\n")}${proc.stderrLines.join("\n")}`.includes(secretValues.appSecret), false);
+    proc.child.stdin.end();
+    await proc.waitForExit();
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("ready initializes the OpenClaw-style SDK model without putting secrets in argv or logs", async () => {
   const root = createTempRoot();

@@ -1,9 +1,12 @@
 #!/usr/bin/env node
 
 import { Buffer } from "node:buffer";
+import fs from "node:fs";
+import { createRequire } from "node:module";
+import path from "node:path";
 import process from "node:process";
 import readline from "node:readline";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
   addKnownSecrets,
@@ -14,6 +17,9 @@ import {
 
 const PREFIX = "feishu-openclaw-sidecar";
 const DEFAULT_READY_TIMEOUT_MS = 15_000;
+const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
+const PROJECT_ROOT = path.dirname(SCRIPT_DIR);
+const DEFAULT_RUNTIME_ROOT = path.join(PROJECT_ROOT, "tools", "feishu-openclaw-sidecar");
 const WITHDRAWN_REPLY_ERROR_CODES = new Set([230011, 231003]);
 const SENSITIVE_ARG = /^(?:--)?(?:app[-_]?secret|verification[-_]?token|encrypt[-_]?key)$/i;
 
@@ -22,6 +28,7 @@ let state = {
   closing: false,
   accountId: "default",
   sdk: null,
+  runtimeRoot: "",
   client: null,
   wsClient: null,
   eventDispatcher: null,
@@ -56,6 +63,8 @@ function emitError(params) {
     errorKind: params.errorKind,
     requestId: params.requestId,
     message: String(params.message ?? "Feishu sidecar error"),
+    ...(params.runtimeRoot ? { runtimeRoot: params.runtimeRoot } : {}),
+    ...(params.missingPackage ? { missingPackage: params.missingPackage } : {}),
   });
 }
 
@@ -83,17 +92,63 @@ async function loadSdk() {
   if (injected) {
     return import(pathToFileURL(injected).href);
   }
-  return import("@larksuiteoapi/node-sdk");
+  return loadRuntimeModules(resolveSidecarRuntimeRoot()).sdk;
 }
 
-async function createProxyAgent(sdk, proxyUrl) {
+class DependencyPreflightError extends Error {
+  constructor(message, options = {}) {
+    super(message);
+    this.phase = "dependency.preflight";
+    this.status = "missing_dependency";
+    this.runtimeRoot = options.runtimeRoot;
+    this.missingPackage = options.missingPackage;
+  }
+}
+
+function resolveSidecarRuntimeRoot(frame = {}) {
+  const raw = String(
+    frame.runtimeRoot ??
+      process.env.METIS_FEISHU_SIDECAR_RUNTIME_ROOT ??
+      process.env.METIS_FEISHU_OPENCLAW_SIDECAR_RUNTIME_ROOT ??
+      DEFAULT_RUNTIME_ROOT,
+  ).trim();
+  return raw ? path.resolve(raw) : DEFAULT_RUNTIME_ROOT;
+}
+
+function requireRuntimePackage(runtimeRequire, runtimeRoot, packageName) {
+  try {
+    return runtimeRequire(packageName);
+  } catch {
+    throw new DependencyPreflightError(
+      `Feishu sidecar dependency missing: ${packageName} under ${runtimeRoot}`,
+      { runtimeRoot, missingPackage: packageName },
+    );
+  }
+}
+
+function loadRuntimeModules(runtimeRoot) {
+  const packageJson = path.join(runtimeRoot, "package.json");
+  if (!fs.existsSync(packageJson)) {
+    throw new DependencyPreflightError(
+      `Feishu sidecar runtime package.json missing under ${runtimeRoot}`,
+      { runtimeRoot, missingPackage: "package.json" },
+    );
+  }
+
+  const runtimeRequire = createRequire(packageJson);
+  const sdk = requireRuntimePackage(runtimeRequire, runtimeRoot, "@larksuiteoapi/node-sdk");
+  const proxyAgentModule = requireRuntimePackage(runtimeRequire, runtimeRoot, "https-proxy-agent");
+  return { sdk, proxyAgentModule, runtimeRoot };
+}
+
+async function createProxyAgent(sdk, proxyUrl, runtimeRoot) {
   if (!proxyUrl) {
     return undefined;
   }
   if (typeof sdk.HttpsProxyAgent === "function") {
     return new sdk.HttpsProxyAgent(proxyUrl);
   }
-  const mod = await import("https-proxy-agent");
+  const mod = loadRuntimeModules(runtimeRoot).proxyAgentModule;
   return new mod.HttpsProxyAgent(proxyUrl);
 }
 
@@ -157,10 +212,20 @@ async function initialize(frame) {
     return;
   }
   try {
-    const sdk = await loadSdk();
+    state.runtimeRoot = resolveSidecarRuntimeRoot(frame);
+    const sdk = process.env.METIS_FEISHU_SIDECAR_SDK?.trim()
+      ? await loadSdk()
+      : loadRuntimeModules(state.runtimeRoot).sdk;
     state.sdk = sdk;
     const domain = resolveDomain(sdk, frame.domain);
-    const proxyAgent = await createProxyAgent(sdk, getProxyUrl());
+    const proxyAgent = await createProxyAgent(sdk, getProxyUrl(), state.runtimeRoot);
+
+    emitDiagnostic("info", "dependency.preflight", "Feishu sidecar dependencies resolved", {
+      status: "ok",
+      runtimeRoot: state.runtimeRoot,
+      sdk: "@larksuiteoapi/node-sdk",
+      proxyAgent: "https-proxy-agent",
+    });
 
     state.eventDispatcher = new sdk.EventDispatcher({
       encryptKey: frame.encryptKey,
@@ -181,6 +246,7 @@ async function initialize(frame) {
       loggerLevel: sdk.LoggerLevel?.info,
       ...(proxyAgent ? { agent: proxyAgent } : {}),
     });
+    attachWsLifecycleHandlers(state.wsClient);
 
     await withTimeout(
       state.wsClient.start({ eventDispatcher: state.eventDispatcher }),
@@ -196,6 +262,17 @@ async function initialize(frame) {
       domain: String(frame.domain ?? "feishu"),
     });
   } catch (error) {
+    if (error?.phase === "dependency.preflight") {
+      emitError({
+        phase: "dependency.preflight",
+        status: error.status ?? "missing_dependency",
+        message: error.message,
+        runtimeRoot: error.runtimeRoot,
+        missingPackage: error.missingPackage,
+      });
+      exitSoon(1);
+      return;
+    }
     const status = error?.status ?? "start_failed";
     emitError({
       phase: "websocket.start",
@@ -204,6 +281,32 @@ async function initialize(frame) {
     });
     await closeSidecar(status);
     exitSoon(1);
+  }
+}
+
+function attachWsLifecycleHandlers(wsClient) {
+  if (!wsClient || typeof wsClient !== "object") {
+    return;
+  }
+  const on = typeof wsClient.on === "function" ? wsClient.on.bind(wsClient) : undefined;
+  const once = typeof wsClient.once === "function" ? wsClient.once.bind(wsClient) : on;
+  if (!once) {
+    return;
+  }
+  const handleClose = (error) => {
+    const message = error?.message ?? (error ? String(error) : "Feishu WebSocket client closed");
+    emitDiagnostic("error", "websocket.closed", message, { status: "closed" });
+    void closeSidecar("sdk_close");
+  };
+  try {
+    once("close", handleClose);
+    once("closed", handleClose);
+    once("error", handleClose);
+  } catch (error) {
+    emitDiagnostic("warn", "websocket.lifecycle", "Unable to attach Feishu WebSocket lifecycle handlers", {
+      status: "handler_attach_failed",
+      message: error?.message ?? String(error),
+    });
   }
 }
 

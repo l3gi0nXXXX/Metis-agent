@@ -3,6 +3,7 @@ package metis.gateway.config
 import magic.jsonable.*
 
 import metis.core.config.GatewayUserSettings
+import metis.gateway.channels.feishu.feishuSidecarDependencyHealthSnapshot
 
 import stdx.encoding.json.{JsonBool, JsonObject, JsonString, JsonValue}
 
@@ -23,6 +24,7 @@ private func gatewayBuiltinChannelSupportsJson(user: GatewayUserSettings, channe
         let cfg = buildGatewayConfigFromUserSettings(user).feishu
         let activeTransport = if (cfg.receiveMode == "webhook") { "webhook" } else { cfg.transportMode }
         let threadReplyEnabled = user.feishu.replyInThread.trimAscii().toAsciiLower() == "enabled"
+        let sidecarDependency = feishuSidecarDependencyHealthSnapshot()
         out.put("threadReply", JsonBool(true))
         out.put("quoteReply", JsonBool(true))
         out.put("accountBinding", JsonBool(false))
@@ -37,6 +39,10 @@ private func gatewayBuiltinChannelSupportsJson(user: GatewayUserSettings, channe
         out.put("transportMode", JsonString(cfg.transportMode))
         out.put("replyInThreadDefault", JsonBool(threadReplyEnabled))
         out.put("transport", JsonString(activeTransport))
+        out.put("sidecarDependencyStatus", JsonString(sidecarDependency.status))
+        out.put("sidecarDependencyReady", JsonBool(sidecarDependency.ready))
+        out.put("sidecarDependencyInstallHint", JsonString(sidecarDependency.installHint))
+        out.put("sidecarDependency", sidecarDependency.toJson())
         out.put("nativeLegacyFullCapabilityRoute", JsonBool(false))
         return out
     }
