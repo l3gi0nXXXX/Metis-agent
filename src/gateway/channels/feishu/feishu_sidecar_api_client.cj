@@ -62,7 +62,7 @@ public class FeishuSidecarRequestRunnerOptions {
 
     public init(
         command!: String = "node",
-        args!: Array<String> = ["scripts/feishu-openclaw-sidecar.mjs"],
+        args!: Array<String> = ["scripts/feishu-sidecar.mjs"],
         runtimeRoot!: String = "",
         workingDirectory!: String = "",
         env!: Array<(String, String)> = [],

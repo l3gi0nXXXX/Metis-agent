@@ -1164,7 +1164,7 @@ public class FeishuAdapterTest {
     }
 
     @TestCase
-    public func cardKitStreamingPlanDescribesOpenClawLifecycleWithoutNetwork(): Unit {
+    public func cardKitStreamingPlanDescribesSidecarLifecycleWithoutNetwork(): Unit {
         let plan = FeishuCardKitStreamingPlan.build(
             accountId: "tenant-a",
             receiveId: "oc_stream",
@@ -2305,7 +2305,7 @@ public class FeishuAdapterTest {
     }
 
     @TestCase
-    public func openClawBaselineMessageTypesProduceStableTextAndConversionMetadata(): Unit {
+    public func vendorBaselineMessageTypesProduceStableTextAndConversionMetadata(): Unit {
         let adapter = FeishuAdapter(config: FeishuConfig(enabled: true), accountId: "work")
         adapter.start()
         @Expect(adapter.ingestWebhookPayload(this.webhookPayload("om_location", "oc_group", "ou_1", "{\\\"name\\\":\\\"HQ\\\",\\\"address\\\":\\\"Road 1\\\",\\\"latitude\\\":31.2304,\\\"longitude\\\":121.4737}", messageType: "location")).contains("\"ok\":true"), true)
@@ -2318,7 +2318,7 @@ public class FeishuAdapterTest {
         @Expect(adapter.ingestWebhookPayload(this.webhookPayload("om_vote", "oc_group", "ou_1", "{\\\"topic\\\":\\\"Choose option\\\",\\\"options\\\":[\\\"A\\\",\\\"B\\\"]}", messageType: "vote")).contains("\"ok\":true"), true)
         @Expect(adapter.ingestWebhookPayload(this.webhookPayload("om_hongbao", "oc_group", "ou_1", "{\\\"title\\\":\\\"Spring bonus\\\",\\\"blessing\\\":\\\"good luck\\\"}", messageType: "hongbao")).contains("\"ok\":true"), true)
         @Expect(adapter.ingestWebhookPayload(this.webhookPayload("om_share_calendar_event", "oc_group", "ou_1", "{\\\"summary\\\":\\\"Release review\\\",\\\"start_time\\\":\\\"2026-05-21 15:00\\\",\\\"calendar_id\\\":\\\"cal_1\\\",\\\"event_id\\\":\\\"evt_1\\\"}", messageType: "share_calendar_event")).contains("\"ok\":true"), true)
-        @Expect(adapter.ingestWebhookPayload(this.webhookPayload("om_unknown", "oc_group", "ou_1", "{\\\"text\\\":\\\"new payload\\\",\\\"image_key\\\":\\\"img_unknown\\\"}", messageType: "new_openclaw_type")).contains("\"ok\":true"), true)
+        @Expect(adapter.ingestWebhookPayload(this.webhookPayload("om_unknown", "oc_group", "ou_1", "{\\\"text\\\":\\\"new payload\\\",\\\"image_key\\\":\\\"img_unknown\\\"}", messageType: "new_vendor_type")).contains("\"ok\":true"), true)
 
         let inbound = adapter.pullInbound()
         @Expect(inbound.size, 11)
@@ -2334,7 +2334,7 @@ public class FeishuAdapterTest {
         @Expect(inbound[7].text.contains("Choose option"), true)
         @Expect(inbound[8].text.contains("Spring bonus"), true)
         @Expect(inbound[9].text.contains("Release review"), true)
-        @Expect(inbound[10].text.contains("new_openclaw_type"), true)
+        @Expect(inbound[10].text.contains("new_vendor_type"), true)
         for (i in 0..inbound.size) {
             let conversion = inbound[i].mediaContext.get("context").getOrThrow().asObject()
                 .get("feishuMessageConversion").getOrThrow().asObject()

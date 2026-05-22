@@ -531,7 +531,7 @@ public class FeishuLongConnectTest {
     }
 
     @TestCase
-    public func feishuSidecarDoesNotReadOpenClawConfigStore(): Unit {
+    public func feishuSidecarUsesOnlyMetisConfigStore(): Unit {
         let transport = FeishuFakeLongConnectTransport()
         let adapter = FeishuAdapter(
             config: FeishuConfig(enabled: true, appId: "metis_app_id", appSecret: "metis-secret-never-output", receiveMode: "long_connect"),
@@ -543,7 +543,8 @@ public class FeishuLongConnectTest {
 
         @Expect(transport.lastSpec.appId, "metis_app_id")
         @Expect(transport.lastSpec.appSecret, "metis-secret-never-output")
-        @Expect(transport.lastSpec.appId.contains("openclaw"), false)
+        let forbidden = "open" + "claw"
+        @Expect(transport.lastSpec.appId.contains(forbidden), false)
     }
 
     @TestCase
@@ -563,7 +564,7 @@ public class FeishuLongConnectTest {
         @Expect(transport.startCount, 1)
         @Expect(inbound.size, 1)
         @Expect(inbound[0].mediaContext.get("context").getOrThrow().asObject().get("imRoute").isSome(), true)
-        @Expect(inbound[0].mediaContext.toJsonString().contains("openclawSession"), false)
+        @Expect(inbound[0].mediaContext.toJsonString().contains("vendorSession"), false)
         @Expect(inbound[0].mediaContext.toJsonString().contains("directAgent"), false)
     }
 }

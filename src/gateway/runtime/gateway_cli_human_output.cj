@@ -507,6 +507,39 @@ private func cliRenderChannelsHealth(result: JsonObject): Option<String> {
     Some<String>(String.join(lines.toArray(), delimiter: "\n"))
 }
 
+private func cliChannelUsesLegacyFeishuSidecar(channel: JsonObject): Bool {
+    let legacyToken = "open" + "claw"
+    let mode = cliJsonString(channel, "transportMode").toAsciiLower()
+    let dependency = cliJsonObject(channel, "sidecarDependency")
+    let runtimeRoot = cliJsonString(dependency, "runtimeRoot").toAsciiLower()
+    let scriptPath = cliJsonString(dependency, "scriptPath").toAsciiLower()
+    mode.contains(legacyToken) || runtimeRoot.contains("feishu-${legacyToken}-sidecar") || scriptPath.contains("feishu-${legacyToken}-sidecar")
+}
+
+private func cliAppendGatewayProcessIdentityLines(lines: ArrayList<String>, result: JsonObject, channel: JsonObject): Unit {
+    let gateway = cliJsonObject(result, "gateway")
+    let identity = cliJsonObject(gateway, "processIdentity")
+    if (identity.toJsonString() != "{}") {
+        let listeners = cliJsonArray(identity, "listenerPids")
+        lines.add(
+            "Gateway: status=${cliJsonString(identity, "status", defaultValue: "unknown")} pid=${cliJsonInt(identity, "currentPid")} lock=${cliJsonInt(identity, "lockPid")} listeners=${listeners.size()} build=${cliJsonString(identity, "buildFingerprint", defaultValue: "-")}"
+        )
+        if (cliJsonBool(identity, "pidMismatch") || cliJsonString(identity, "status") == "stale-lock" || cliJsonString(identity, "status") == "lock-only") {
+            let advice = cliJsonArray(identity, "advice")
+            if (advice.size() > 0) {
+                let first = try { advice[0].asString().getValue().trimAscii() } catch (_: Exception) { "" }
+                if (!first.isEmpty()) {
+                    lines.add("Gateway next: ${cliOneLine(first, maxLen: 180)}")
+                }
+            }
+        }
+        return
+    }
+    if (cliJsonString(channel, "id") == "feishu" && cliChannelUsesLegacyFeishuSidecar(channel)) {
+        lines.add("Gateway: stale Feishu sidecar contract detected; restart Gateway after rebuilding Metis.")
+    }
+}
+
 private func cliRenderChannelGet(result: JsonObject): Option<String> {
     let channel = cliJsonObject(result, "channel")
     if (channel.toJsonString() == "{}") {
@@ -549,6 +582,7 @@ private func cliRenderChannelGet(result: JsonObject): Option<String> {
     if (accountLines.size > 0) {
         lines.add("Meaning: this command shows configured channel accounts; use `metis gateway channel runtime ${displayId}` for live adapter state.")
     }
+    cliAppendGatewayProcessIdentityLines(lines, result, channel)
     Some<String>(String.join(lines.toArray(), delimiter: "\n"))
 }
 

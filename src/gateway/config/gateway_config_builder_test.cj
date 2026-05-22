@@ -45,7 +45,7 @@ public class GatewayConfigBuilderTest {
     }
 
     @TestCase
-    public func telegramTypedOpenClawParityConfigMapsIntoRuntimeConfig(): Unit {
+    public func telegramTypedParityConfigMapsIntoRuntimeConfig(): Unit {
         var user = GatewayUserSettings()
         user.telegram.enabled = true
         user.telegram.defaultAccount = "work"
@@ -82,7 +82,7 @@ public class GatewayConfigBuilderTest {
     }
 
     @TestCase
-    public func feishuTypedOpenClawParityConfigMapsIntoRuntimeConfig(): Unit {
+    public func feishuTypedParityConfigMapsIntoRuntimeConfig(): Unit {
         var user = GatewayUserSettings()
         user.feishu.enabled = true
         user.feishu.defaultAccount = "tenant-a"
@@ -132,7 +132,7 @@ public class GatewayConfigBuilderTest {
 
         let (defaultFeishu, _, _) = mergeGatewayUserSettings(user)
         @Expect(defaultFeishu.receiveMode, "long_connect")
-        @Expect(defaultFeishu.transportMode, "openclaw-sidecar")
+        @Expect(defaultFeishu.transportMode, "sidecar")
 
         user.feishu.transportMode = "native-legacy"
         let (nativeFeishu, _, _) = mergeGatewayUserSettings(user)
@@ -140,12 +140,12 @@ public class GatewayConfigBuilderTest {
 
         user.feishu.transportMode = "native"
         let (normalizedFeishu, _, _) = mergeGatewayUserSettings(user)
-        @Expect(normalizedFeishu.transportMode, "openclaw-sidecar")
+        @Expect(normalizedFeishu.transportMode, "sidecar")
 
         user.feishu.receiveMode = "webhook"
         let (webhookFeishu, _, _) = mergeGatewayUserSettings(user)
         @Expect(webhookFeishu.receiveMode, "webhook")
-        @Expect(webhookFeishu.transportMode, "openclaw-sidecar")
+        @Expect(webhookFeishu.transportMode, "sidecar")
     }
 
     @TestCase

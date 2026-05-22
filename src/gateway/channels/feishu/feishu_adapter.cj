@@ -228,6 +228,7 @@ public class FeishuFakeApiClient <: FeishuApiClient {
     private let messages = HashMap<String, FeishuMessageFetchResult>()
     private let mergeForwardMessages = HashMap<String, Array<FeishuMessageFetchResult>>()
     private let textMessages = ArrayList<String>()
+    private let textMessageRequests = ArrayList<JsonObject>()
     private let sentCards = ArrayList<FeishuInteractiveCard>()
     private let patchedCards = ArrayList<FeishuInteractiveCard>()
     private let uploadedMedia = ArrayList<String>()
@@ -355,6 +356,18 @@ public class FeishuFakeApiClient <: FeishuApiClient {
         _replyInThread: Bool
     ): FeishuApiSendResult {
         this.textMessages.add("${this.normalize(accountId)}|${rawPeerId.trimAscii()}|${receiveId.trimAscii()}|${receiveIdType.trimAscii()}|${text}")
+        let request = JsonObject()
+        request.put("accountId", JsonString(this.normalize(accountId)))
+        request.put("rawPeerId", JsonString(rawPeerId.trimAscii()))
+        request.put("receiveId", JsonString(receiveId.trimAscii()))
+        request.put("receiveIdType", JsonString(receiveIdType.trimAscii()))
+        request.put("text", JsonString(text))
+        request.put("replyInThread", JsonBool(_replyInThread))
+        match (_replyToMessageId) {
+            case Some(messageId) => request.put("replyToMessageId", JsonString(messageId.trimAscii()))
+            case None => request.put("replyToMessageId", JsonString(""))
+        }
+        this.textMessageRequests.add(request)
         if (!this.nextTextSendFailureStatus.trimAscii().isEmpty()) {
             let status = this.nextTextSendFailureStatus.trimAscii()
             let error = this.nextTextSendFailureError.trimAscii()
@@ -492,6 +505,13 @@ public class FeishuFakeApiClient <: FeishuApiClient {
             return ""
         }
         this.textMessages[this.textMessages.size - 1]
+    }
+
+    public func lastTextMessageRequest(): JsonObject {
+        if (this.textMessageRequests.isEmpty()) {
+            return JsonObject()
+        }
+        this.textMessageRequests[this.textMessageRequests.size - 1]
     }
 
     public func cardPatchCount(): Int64 {
@@ -663,7 +683,7 @@ public class FeishuAdapter <: ChannelAdapter {
             return "webhook"
         }
         if (this.longConnectTransport is FeishuSidecarTransport) {
-            return "openclaw-sidecar"
+            return "sidecar"
         }
         if (this.longConnectTransport is FeishuNativeLongConnectTransport) {
             return "native-legacy"
@@ -673,7 +693,7 @@ public class FeishuAdapter <: ChannelAdapter {
 
     public func debugFeishuApiClientKindForTest(): String {
         if (this.apiClient is FeishuSidecarApiClient) {
-            return "openclaw-sidecar"
+            return "sidecar"
         }
         "native-legacy"
     }

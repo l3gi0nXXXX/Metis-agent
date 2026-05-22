@@ -838,7 +838,7 @@ private func gatewayFeishuReceiveMode(raw: String): String {
 }
 
 private func gatewayFeishuTransportMode(raw: String): String {
-    if (raw.trimAscii().toAsciiLower() == "native-legacy") { "native-legacy" } else { "openclaw-sidecar" }
+    if (raw.trimAscii().toAsciiLower() == "native-legacy") { "native-legacy" } else { "sidecar" }
 }
 
 private func gatewayFeishuGroupSessionScope(raw: String): String {

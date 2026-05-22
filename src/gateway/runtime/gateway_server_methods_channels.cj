@@ -1168,9 +1168,9 @@ private func gatewayFeishuTransportModeDiagnosticsJson(user: GatewayUserSettings
     let out = JsonObject()
     out.put("mode", JsonString(cfg.transportMode))
     out.put("effectiveRuntime", JsonString(effectiveRuntime))
-    out.put("supportedModes", JsonArray([JsonString("openclaw-sidecar"), JsonString("native-legacy")]))
+    out.put("supportedModes", JsonArray([JsonString("sidecar"), JsonString("native-legacy")]))
     out.put("receiveMode", JsonString(cfg.receiveMode))
-    out.put("defaultLongConnectRuntime", JsonString("openclaw-sidecar"))
+    out.put("defaultLongConnectRuntime", JsonString("sidecar"))
     out.put("nativeLegacyStatus", JsonString("explicit_opt_in_only"))
     out.put("nativeLegacyFullCapabilityRoute", false.toJsonValue())
     out.put("state", JsonString(
@@ -3255,6 +3255,9 @@ public func handleGatewayChannelsFamily(method: String, user: GatewayUserSetting
         let channelId = gatewayRpcStringParam(requestValue, ["id", "channel", "channelId"], "feishu")
         let result = JsonObject()
         result.put("channel", gatewayChannelGetJson(user, channelId))
+        let gateway = JsonObject()
+        gateway.put("processIdentity", gatewayProcessIdentitySnapshot(user))
+        result.put("gateway", gateway)
         return Some(GatewayRpcResponse(true, method, result: result))
     }
     if (method == "channels.health") {

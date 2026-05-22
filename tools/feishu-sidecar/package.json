@@ -1,5 +1,5 @@
 {
-  "name": "metis-feishu-openclaw-sidecar-runtime",
+  "name": "metis-feishu-sidecar-runtime",
   "private": true,
   "type": "module",
   "dependencies": {

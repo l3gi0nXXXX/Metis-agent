@@ -183,7 +183,7 @@ public class GatewayFeishuOapiToolset {
         ).toJsonString()
     }
 
-    @tool[description: "Fetch a Feishu document through the Metis-native Feishu OAPI client boundary. When auth is absent it returns structured auth_required JSON. Pass OpenClaw-compatible parameters as params_json."]
+    @tool[description: "Fetch a Feishu document through the Metis-native Feishu OAPI client boundary. When auth is absent it returns structured auth_required JSON. Pass Feishu OAPI-compatible parameters as params_json."]
     public func feishu_fetch_doc(action: String, params_json: Option<String>, account_id: Option<String>): String {
         PrintUtils.printTool("feishu_fetch_doc", shortMessage: action)
         feishuOapiInvokeByTool("feishu_fetch_doc", action, params_json, account_id)
@@ -195,7 +195,7 @@ public class GatewayFeishuOapiToolset {
         feishuOapiInvokeByTool("feishu_create_doc", action, params_json, account_id)
     }
 
-    @tool[description: "Update a Feishu document through the Metis-native Feishu OAPI client boundary. Pass OpenClaw-compatible update parameters as params_json."]
+    @tool[description: "Update a Feishu document through the Metis-native Feishu OAPI client boundary. Pass Feishu OAPI-compatible update parameters as params_json."]
     public func feishu_update_doc(action: String, params_json: Option<String>, account_id: Option<String>): String {
         PrintUtils.printTool("feishu_update_doc", shortMessage: action)
         feishuOapiInvokeByTool("feishu_update_doc", action, params_json, account_id)

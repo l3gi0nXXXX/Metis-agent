@@ -31,7 +31,7 @@ private func gatewayBuiltinChannelSupportsJson(user: GatewayUserSettings, channe
         out.put("multiAccount", JsonBool(false))
         out.put("webhookIngress", JsonBool(true))
         out.put("streamIngress", JsonBool(true))
-        out.put("sidecarLongConnect", JsonBool(cfg.receiveMode == "long_connect" && cfg.transportMode == "openclaw-sidecar"))
+        out.put("sidecarLongConnect", JsonBool(cfg.receiveMode == "long_connect" && cfg.transportMode == "sidecar"))
         out.put("nativeLongConnect", JsonBool(cfg.receiveMode == "long_connect" && cfg.transportMode == "native-legacy"))
         out.put("officialGateway", JsonBool(false))
         out.put("mentionRouting", JsonBool(true))

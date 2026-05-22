@@ -8,7 +8,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-const sidecarPath = path.join(import.meta.dirname, "feishu-openclaw-sidecar.mjs");
+const sidecarPath = path.join(import.meta.dirname, "feishu-sidecar.mjs");
 const secretValues = {
   appSecret: "fixture-app-secret-0123456789",
   verificationToken: "fixture-verification-token-0123456789",
@@ -563,7 +563,7 @@ test("sdk background close emits closed frame after ready without leaking secret
   }
 });
 
-test("ready initializes the OpenClaw-style SDK model without putting secrets in argv or logs", async () => {
+test("ready initializes the vendor SDK model without putting secrets in argv or logs", async () => {
   const root = createTempRoot();
   const { sdkPath, callsPath } = writeFakeSdk(root);
   try {
@@ -770,7 +770,7 @@ test("send text, media, card, reaction, delete, and download requests route to S
   }
 });
 
-test("send errors are redacted and reply fallback follows OpenClaw safety semantics", async () => {
+test("send errors are redacted and reply fallback follows sidecar safety semantics", async () => {
   const root = createTempRoot();
   const { sdkPath, callsPath } = writeFakeSdk(root);
   try {

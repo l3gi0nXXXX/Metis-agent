@@ -190,7 +190,7 @@ public class FeishuSidecarApiClientTest {
             runner: protocol,
             options: FeishuSidecarRequestRunnerOptions(
                 command: "node",
-                args: ["scripts/feishu-openclaw-sidecar.mjs"],
+                args: ["scripts/feishu-sidecar.mjs"],
                 readyTimeoutMs: 1,
                 requestTimeoutMs: 1,
                 readTimeoutMs: 1,
@@ -234,7 +234,7 @@ public class FeishuSidecarApiClientTest {
             runner: protocol,
             options: FeishuSidecarRequestRunnerOptions(
                 command: "node",
-                args: ["scripts/feishu-openclaw-sidecar.mjs"],
+                args: ["scripts/feishu-sidecar.mjs"],
                 runtimeRoot: runtimeRoot,
                 workingDirectory: "/tmp/metis",
                 env: [("METIS_FEISHU_SIDECAR_RUNTIME_ROOT", runtimeRoot)],
@@ -487,7 +487,7 @@ public class FeishuSidecarApiClientTest {
     @TestCase
     public func apiClientSendTextFailsClosedOnMissingSdk(): Unit {
         let runner = FeishuSidecarApiClientFakeRunner()
-        runner.enqueue(feishuSidecarTestResult(false, status: "missing_dependency", error: "Feishu sidecar dependency missing: @larksuiteoapi/node-sdk under tools/feishu-openclaw-sidecar"))
+        runner.enqueue(feishuSidecarTestResult(false, status: "missing_dependency", error: "Feishu sidecar dependency missing: @larksuiteoapi/node-sdk under tools/feishu-sidecar"))
         let client = FeishuSidecarApiClient(runner: runner)
 
         let sent = client.sendTextMessage("tenant-a", "oc_chat", "oc_chat", "chat_id", "hello", None<String>, false)

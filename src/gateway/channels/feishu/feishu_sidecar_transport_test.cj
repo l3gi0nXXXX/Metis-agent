@@ -122,7 +122,7 @@ public class FeishuSidecarTransportTest {
     private func options(): FeishuSidecarTransportOptions {
         FeishuSidecarTransportOptions(
             command: "node",
-            args: ["scripts/feishu-openclaw-sidecar.mjs"],
+            args: ["scripts/feishu-sidecar.mjs"],
             readyTimeoutMs: 1,
             readTimeoutMs: 1,
             stopTimeoutMs: 1,
@@ -166,7 +166,7 @@ public class FeishuSidecarTransportTest {
             runner: runner,
             options: FeishuSidecarTransportOptions(
                 command: "node",
-                args: ["scripts/feishu-openclaw-sidecar.mjs"],
+                args: ["scripts/feishu-sidecar.mjs"],
                 runtimeRoot: runtimeRoot,
                 workingDirectory: "/tmp/metis",
                 env: [("METIS_FEISHU_SIDECAR_RUNTIME_ROOT", runtimeRoot)],

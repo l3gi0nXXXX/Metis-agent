@@ -80,12 +80,19 @@ public class GatewayServerMethodsStatusTest {
         @Expect(healthResult.contains("surfaces"), true)
         @Expect(healthResult.contains("platform"), true)
         @Expect(healthResult.contains("openclawCompatHost"), true)
+        @Expect(healthResult.contains("processIdentity"), true)
 
         let readiness = handleGatewayStatusFamily("readiness", GatewayUserSettings()).getOrThrow()
         let readinessResult = readiness.result.toJsonString()
         @Expect(readinessResult.contains("surfaces"), true)
         @Expect(readinessResult.contains("platform"), true)
         @Expect(readinessResult.contains("openclawCompatHost"), true)
+        @Expect(readinessResult.contains("processIdentity"), true)
+
+        let status = buildGatewayRpcStatusJson(GatewayUserSettings())
+        let identity = statusTestObject(status, "processIdentity")
+        @Expect(statusTestString(identity, "schema"), "metis.gateway.process.v1")
+        @Expect(statusTestString(identity, "buildFingerprint"), gatewayBuildFingerprint())
     }
 
     @TestCase

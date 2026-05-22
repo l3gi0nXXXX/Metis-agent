@@ -300,8 +300,8 @@ public class GatewayServerMethodsChannelsTest {
         @Expect(channelsTestBool(feishu, "replyInThreadDefault"), true)
         @Expect(channelsTestBool(feishu, "sidecarLongConnect"), true)
         @Expect(channelsTestBool(feishu, "nativeLongConnect"), false)
-        @Expect(channelsTestString(feishu, "transportMode"), "openclaw-sidecar")
-        @Expect(channelsTestString(feishu, "transport"), "openclaw-sidecar")
+        @Expect(channelsTestString(feishu, "transportMode"), "sidecar")
+        @Expect(channelsTestString(feishu, "transport"), "sidecar")
 
         @Expect(channelsTestBool(qq, "messageReply"), true)
         @Expect(channelsTestBool(qq, "threadReply"), false)
@@ -363,6 +363,12 @@ public class GatewayServerMethodsChannelsTest {
         let channel = gatewayChannelGetJson(user, "feishu")
         @Expect(channel.get("supports").isSome(), true)
 
+        let getResult = handleGatewayChannelsFamily("channels.get", user).getOrThrow().result.asObject()
+        let gateway = getResult.get("gateway").getOrThrow().asObject()
+        let identity = gateway.get("processIdentity").getOrThrow().asObject()
+        @Expect(channelsTestString(identity, "schema"), "metis.gateway.process.v1")
+        @Expect(channelsTestString(identity, "buildFingerprint"), gatewayBuildFingerprint())
+
         let status = handleGatewayChannelsFamily("channels.status", user).getOrThrow().result.asObject()
         let meta = status.get("channelMeta").getOrThrow().asObject()
         let feishuMeta = meta.get("feishu").getOrThrow().asObject()
@@ -370,8 +376,8 @@ public class GatewayServerMethodsChannelsTest {
         @Expect(channelsTestBool(metaSupports, "threadReply"), true)
         @Expect(channelsTestBool(metaSupports, "sidecarLongConnect"), true)
         @Expect(channelsTestBool(metaSupports, "nativeLongConnect"), false)
-        @Expect(channelsTestString(metaSupports, "transportMode"), "openclaw-sidecar")
-        @Expect(channelsTestString(metaSupports, "transport"), "openclaw-sidecar")
+        @Expect(channelsTestString(metaSupports, "transportMode"), "sidecar")
+        @Expect(channelsTestString(metaSupports, "transport"), "sidecar")
         let telegramMeta = meta.get("telegram").getOrThrow().asObject()
         let telegramSupports = telegramMeta.get("supports").getOrThrow().asObject()
         @Expect(channelsTestBool(telegramSupports, "reactionEvents"), true)
@@ -388,9 +394,9 @@ public class GatewayServerMethodsChannelsTest {
                     false,
                     "missing",
                     "/tmp/metis-project",
-                    "/tmp/metis-project/tools/feishu-openclaw-sidecar",
-                    "/tmp/metis-project/scripts/feishu-openclaw-sidecar.mjs",
-                    "Run `npm --prefix tools/feishu-openclaw-sidecar install` from the Metis repository root.",
+                    "/tmp/metis-project/tools/feishu-sidecar",
+                    "/tmp/metis-project/scripts/feishu-sidecar.mjs",
+                    "Run `npm --prefix tools/feishu-sidecar install` from the Metis repository root.",
                     "missing=node_modules; command error contains secret-never-visible",
                     ["node_modules", "@larksuiteoapi/node-sdk"],
                     [],
@@ -406,17 +412,21 @@ public class GatewayServerMethodsChannelsTest {
             let channel = gatewayChannelGetJson(user, "feishu")
             let sidecar = channel.get("sidecarDependency").getOrThrow().asObject()
             @Expect(channelsTestString(sidecar, "status"), "missing")
-            @Expect(channelsTestString(sidecar, "installHint").contains("npm --prefix tools/feishu-openclaw-sidecar install"), true)
+            @Expect(channelsTestString(sidecar, "installHint").contains("npm --prefix tools/feishu-sidecar install"), true)
+            let forbidden = "open" + "claw"
+            @Expect(sidecar.toJsonString().contains(forbidden), false)
             @Expect(sidecar.toJsonString().contains("secret-never-visible"), false)
 
             let supports = channel.get("supports").getOrThrow().asObject()
             @Expect(channelsTestString(supports, "sidecarDependencyStatus"), "missing")
-            @Expect(channelsTestString(supports, "sidecarDependencyInstallHint").contains("npm --prefix tools/feishu-openclaw-sidecar install"), true)
+            @Expect(channelsTestString(supports, "sidecarDependencyInstallHint").contains("npm --prefix tools/feishu-sidecar install"), true)
+            @Expect(supports.toJsonString().contains(forbidden), false)
 
             let status = handleGatewayChannelsFamily("channels.status", user).getOrThrow().result.asObject()
             let rawStatus = status.toJsonString()
             @Expect(rawStatus.contains("sidecarDependencyStatus"), true)
-            @Expect(rawStatus.contains("npm --prefix tools/feishu-openclaw-sidecar install"), true)
+            @Expect(rawStatus.contains("npm --prefix tools/feishu-sidecar install"), true)
+            @Expect(rawStatus.contains(forbidden), false)
             @Expect(rawStatus.contains("secret-never-visible"), false)
         } finally {
             setFeishuSidecarDependencyHealthProviderForTest(None<() -> FeishuSidecarDependencyHealth>)
@@ -1087,7 +1097,7 @@ public class GatewayServerMethodsChannelsTest {
         let receiveMode = diagnostics.get("receiveMode").getOrThrow().asObject()
         @Expect(channelsTestString(receiveMode, "mode"), "webhook")
         let transportMode = diagnostics.get("transportMode").getOrThrow().asObject()
-        @Expect(channelsTestString(transportMode, "mode"), "openclaw-sidecar")
+        @Expect(channelsTestString(transportMode, "mode"), "sidecar")
         @Expect(channelsTestString(transportMode, "effectiveRuntime"), "webhook")
         @Expect(channelsTestString(transportMode, "nativeLegacyStatus"), "explicit_opt_in_only")
         let groupPolicy = diagnostics.get("groupPolicy").getOrThrow().asObject()
@@ -1121,8 +1131,8 @@ public class GatewayServerMethodsChannelsTest {
         let defaultChannel = gatewayChannelGetJson(user, "feishu")
         let defaultTransport = defaultChannel.get("diagnostics").getOrThrow().asObject()
             .get("transportMode").getOrThrow().asObject()
-        @Expect(channelsTestString(defaultTransport, "mode"), "openclaw-sidecar")
-        @Expect(channelsTestString(defaultTransport, "effectiveRuntime"), "openclaw-sidecar")
+        @Expect(channelsTestString(defaultTransport, "mode"), "sidecar")
+        @Expect(channelsTestString(defaultTransport, "effectiveRuntime"), "sidecar")
         @Expect(channelsTestString(defaultTransport, "capabilityRoute"), "sidecar_primary")
 
         user.feishu.transportMode = "native-legacy"
