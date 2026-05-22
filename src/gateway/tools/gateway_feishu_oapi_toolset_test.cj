@@ -1,6 +1,6 @@
 package metis.gateway.tools
 
-import metis.core.config.{GatewayUserSettings, MetisProcessEnvironmentLock}
+import metis.core.config.{CliConfig, CliSettingManager, GatewayUserSettings, MetisConfigManager, MetisProcessEnvironmentLock}
 
 import std.collection.{ArrayList, HashMap}
 import std.env.{getVariable, setVariable}
@@ -335,6 +335,37 @@ private class FeishuOapiMatrixCase {
 
 private func feishuOapiToolsetTempRoot(label: String): Path {
     Path("/tmp/metis-feishu-oapi-${label}-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
+}
+
+private func feishuOapiToolsetResetConfigCaches(): Unit {
+    CliConfig.invalidatePathCache()
+    MetisConfigManager.invalidate()
+    CliSettingManager.invalidate()
+}
+
+private func feishuOapiToolsetRestoreVariable(name: String, value: Option<String>): Unit {
+    match (value) {
+        case Some(v) => setVariable(name, v)
+        case None => setVariable(name, "")
+    }
+}
+
+private func withFeishuOapiToolsetTestHome<T>(label: String, block: (Path) -> T): T {
+    synchronized(MetisProcessEnvironmentLock) {
+        let home = feishuOapiToolsetTempRoot(label)
+        try { remove(home, recursive: true) } catch (_: Exception) { () }
+        Directory.create(home, recursive: true)
+        let oldHome = getVariable("METIS_HOME")
+        setVariable("METIS_HOME", home.toString())
+        feishuOapiToolsetResetConfigCaches()
+        try {
+            return block(home)
+        } finally {
+            feishuOapiToolsetRestoreVariable("METIS_HOME", oldHome)
+            feishuOapiToolsetResetConfigCaches()
+            try { remove(home, recursive: true) } catch (_: Exception) { () }
+        }
+    }
 }
 
 private func feishuOapiWriteStoredToken(
@@ -1219,6 +1250,113 @@ public class GatewayFeishuOapiToolsetTest {
         @Expect(json.toJsonString().contains("issued-"), false)
         @Expect(json.toJsonString().contains("app-secret-never-visible"), false)
         @Expect(json.toJsonString().contains("Authorization"), false)
+        @Expect(json.toJsonString().contains("Bearer"), false)
+        @Expect(json.toJsonString().contains("appSecret"), false)
+        @Expect(json.toJsonString().contains("tenant_secret"), false)
+    }
+
+    @TestCase
+    public func defaultToolsetReadsTopLevelGatewayFeishuCredentialsBeforeAppTokenLookup(): Unit {
+        withFeishuOapiToolsetTestHome("default-top-credentials") { _home: Path =>
+            var user = GatewayUserSettings()
+            user.feishu.appId = "top-app"
+            user.feishu.appSecret = "top-secret-never-visible"
+            user.feishu.domain = "https://open.feishu.cn"
+            CliSettingManager.writeGatewaySettings(user)
+            CliSettingManager.invalidate()
+
+            let appTokenClient = FeishuOapiToolsetFakeAppTokenClient(status: "api_error", error: "fake token endpoint unavailable")
+            debugSetGatewayFeishuOapiAppTokenClientForTest(Some<FeishuOapiAppTokenClient>(appTokenClient))
+            try {
+                let raw = GatewayFeishuOapiToolset().debugFeishuOapiInvokeForTest(
+                    "feishu_task_task",
+                    "append_steps",
+                    Some("default"),
+                    Some("{}")
+                )
+                let json = JsonValue.fromStr(raw).asObject()
+                @Expect(json.get("status").getOrThrow().asString().getValue(), "api_error")
+                @Expect(appTokenClient.accountIds[0], "default")
+                @Expect(appTokenClient.credentialAppIds[0], "top-app")
+                @Expect(appTokenClient.credentialAppSecrets[0], "top-secret-never-visible")
+                @Expect(raw.contains("missing_credential"), false)
+                @Expect(raw.contains("top-secret-never-visible"), false)
+                @Expect(raw.contains("Authorization"), false)
+                @Expect(raw.contains("Bearer"), false)
+                @Expect(raw.contains("appSecret"), false)
+                @Expect(raw.contains("tenant_secret"), false)
+            } finally {
+                debugSetGatewayFeishuOapiAppTokenClientForTest(None<FeishuOapiAppTokenClient>)
+            }
+        }
+    }
+
+    @TestCase
+    public func defaultToolsetPrefersAccountGatewayFeishuCredentialsOverTopLevelCredentials(): Unit {
+        withFeishuOapiToolsetTestHome("default-account-credentials") { _home: Path =>
+            var user = GatewayUserSettings()
+            user.feishu.appId = "top-app"
+            user.feishu.appSecret = "top-secret-never-visible"
+            let account = JsonObject()
+            account.put("appId", JsonString("account-app"))
+            account.put("appSecret", JsonString("account-secret-never-visible"))
+            account.put("domain", JsonString("https://open.larksuite.com/"))
+            let accounts = JsonObject()
+            accounts.put("default", account)
+            user.feishu.accounts = Some(accounts)
+            CliSettingManager.writeGatewaySettings(user)
+            CliSettingManager.invalidate()
+
+            let appTokenClient = FeishuOapiToolsetFakeAppTokenClient(status: "api_error", error: "fake token endpoint unavailable")
+            debugSetGatewayFeishuOapiAppTokenClientForTest(Some<FeishuOapiAppTokenClient>(appTokenClient))
+            try {
+                let raw = GatewayFeishuOapiToolset().debugFeishuOapiInvokeForTest(
+                    "feishu_task_task",
+                    "append_steps",
+                    Some("default"),
+                    Some("{}")
+                )
+                let json = JsonValue.fromStr(raw).asObject()
+                @Expect(json.get("status").getOrThrow().asString().getValue(), "api_error")
+                @Expect(appTokenClient.credentialAppIds[0], "account-app")
+                @Expect(appTokenClient.credentialAppSecrets[0], "account-secret-never-visible")
+                @Expect(appTokenClient.credentialDomains[0], "https://open.larksuite.com")
+                @Expect(raw.contains("missing_credential"), false)
+                @Expect(raw.contains("top-secret-never-visible"), false)
+                @Expect(raw.contains("account-secret-never-visible"), false)
+                @Expect(raw.contains("Authorization"), false)
+                @Expect(raw.contains("Bearer"), false)
+                @Expect(raw.contains("appSecret"), false)
+                @Expect(raw.contains("tenant_secret"), false)
+            } finally {
+                debugSetGatewayFeishuOapiAppTokenClientForTest(None<FeishuOapiAppTokenClient>)
+            }
+        }
+    }
+
+    @TestCase
+    public func nativeAppTokenHttpFailuresAreApiErrorNotMissingCredential(): Unit {
+        let statuses: Array<Int64> = [401, 403, 503]
+        for (statusCode in statuses) {
+            let transport = FeishuOapiToolsetStaticRawTransport(
+                statusCode,
+                body: "{\"code\":99991663,\"msg\":\"token request rejected\"}",
+                error: "token request rejected"
+            )
+            let provider = MetisFeishuOapiTokenProvider(
+                appId: "app-id",
+                appSecret: "app-secret-never-visible",
+                appTokenClient: Some<FeishuOapiAppTokenClient>(FeishuNativeOapiAppTokenClient(
+                    transport: Some<FeishuOapiRawHttpTransport>(transport)
+                ))
+            )
+            let lookup = provider.tokenLookup("default", "tenant_access_token", ["task:task:write"])
+            @Expect(lookup.status, "api_error")
+            @Expect(lookup.status == "missing_credential", false)
+            @Expect(lookup.error.contains("app-secret-never-visible"), false)
+            @Expect(lookup.error.contains("Authorization"), false)
+            @Expect(lookup.error.contains("Bearer"), false)
+        }
     }
 
     @TestCase

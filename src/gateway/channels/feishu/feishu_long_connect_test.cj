@@ -1,8 +1,8 @@
 package metis.gateway.channels.feishu
 
-import metis.gateway.model.FeishuConfig
+import metis.gateway.model.{FeishuConfig, FeishuMediaConfig}
 import std.collection.ArrayList
-import std.fs.{Directory, Path, exists, remove}
+import std.fs.{Directory, File, Path, exists, remove}
 import std.time.DateTime
 import std.unittest.testmacro.*
 import stdx.encoding.json.{JsonBool, JsonObject, JsonString}
@@ -437,6 +437,60 @@ public class FeishuLongConnectTest {
         @Expect(inbound[3].mediaContext.get("records").getOrThrow().asArray()[0].asObject().get("mediaKind").getOrThrow().asString().getValue(), "file")
         @Expect(inbound[4].mediaContext.get("records").getOrThrow().asArray()[0].asObject().get("mediaKind").getOrThrow().asString().getValue(), "audio")
         @Expect(inbound[5].mediaContext.get("records").getOrThrow().asArray()[0].asObject().get("mediaKind").getOrThrow().asString().getValue(), "video")
+    }
+
+    @TestCase
+    public func sidecarInboundMediaDownloadsWithCurrentTurnPersistenceSemantics(): Unit {
+        let root = "/tmp/metis-feishu-sidecar-media-${DateTime.now().toUnixTimeStamp().toMilliseconds()}"
+        try { remove(Path(root), recursive: true) } catch (_e: Exception) { () }
+        let transport = FeishuFakeLongConnectTransport(events: [
+            this.sidecarMessageRoot("om_sidecar_image_dl", "image", "{\"image_key\":\"img_sidecar_dl\",\"file_name\":\"diagram.png\",\"mime_type\":\"image/png\"}"),
+            this.sidecarMessageRoot("om_sidecar_file_dl", "file", "{\"file_key\":\"file_sidecar_dl\",\"file_name\":\"report.pdf\",\"mime_type\":\"application/pdf\"}"),
+            this.sidecarMessageRoot("om_sidecar_audio_dl", "audio", "{\"file_key\":\"audio_sidecar_dl\",\"file_name\":\"voice.ogg\",\"mime_type\":\"audio/ogg\"}"),
+            this.sidecarMessageRoot("om_sidecar_video_dl", "video", "{\"file_key\":\"video_sidecar_dl\",\"file_name\":\"demo.mp4\",\"mime_type\":\"video/mp4\",\"cover_image_key\":\"cover_sidecar\"}")
+        ])
+        let client = FeishuFakeApiClient()
+        client.setResource("tenant-a", "om_sidecar_image_dl", "img_sidecar_dl", "image", "sidecar-image".toArray(), contentType: "image/png", fileName: "diagram.png")
+        client.setResource("tenant-a", "om_sidecar_file_dl", "file_sidecar_dl", "file", "sidecar-pdf".toArray(), contentType: "application/pdf", fileName: "report.pdf")
+        client.setResource("tenant-a", "om_sidecar_audio_dl", "audio_sidecar_dl", "file", "sidecar-audio".toArray(), contentType: "audio/ogg", fileName: "voice.ogg")
+        client.setResource("tenant-a", "om_sidecar_video_dl", "video_sidecar_dl", "file", "sidecar-video".toArray(), contentType: "video/mp4", fileName: "demo.mp4")
+        let adapter = FeishuAdapter(
+            config: FeishuConfig(
+                enabled: true,
+                appId: "cli_sidecar_app",
+                appSecret: "sidecar-secret-never-output",
+                receiveMode: "long_connect",
+                media: FeishuMediaConfig(downloadRoot: root)
+            ),
+            accountId: "tenant-a",
+            apiClient: client,
+            longConnectTransport: transport
+        )
+
+        try {
+            adapter.start()
+            let inbound = adapter.pullInbound()
+
+            @Expect(inbound.size, 4)
+            let expectedBytes = ["sidecar-image", "sidecar-pdf", "sidecar-audio", "sidecar-video"]
+            for (i in 0..inbound.size) {
+                let record = inbound[i].mediaContext.get("records").getOrThrow().asArray()[0].asObject()
+                @Expect(record.get("downloaded").getOrThrow().asBool().getValue(), true)
+                let localPath = record.get("localPath").getOrThrow().asString().getValue()
+                @Expect(localPath.startsWith(root), true)
+                @Expect(record.get("downloadPath").getOrThrow().asString().getValue(), localPath)
+                @Expect(record.get("mediaPath").getOrThrow().asString().getValue(), localPath)
+                @Expect(String.fromUtf8(File.readFrom(Path(localPath))), expectedBytes[i])
+                let fetch = record.get("resourceFetch").getOrThrow().asObject()
+                @Expect(fetch.get("status").getOrThrow().asString().getValue(), "downloaded")
+                @Expect(fetch.get("networkAttempted").getOrThrow().asBool().getValue(), true)
+            }
+            let video = inbound[3].mediaContext.get("records").getOrThrow().asArray()[0].asObject()
+            @Expect(video.get("fileKey").getOrThrow().asString().getValue(), "video_sidecar_dl")
+            @Expect(video.get("coverImageKey").getOrThrow().asString().getValue(), "cover_sidecar")
+        } finally {
+            try { remove(Path(root), recursive: true) } catch (_e: Exception) { () }
+        }
     }
 
     @TestCase

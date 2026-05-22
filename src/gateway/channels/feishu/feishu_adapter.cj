@@ -1,6 +1,6 @@
 package metis.gateway.channels.feishu
 
-import metis.core.{parseGatewayAudioParts, parseGatewayDocumentParts, parseGatewayEditText, parseGatewayPhotoParts, parseGatewayReactionRemove, parseGatewayReactionStatus, parseGatewayReactionToken, parseGatewayVideoParts}
+import metis.core.{parseGatewayAudioParts, parseGatewayDocumentParts, parseGatewayEditText, parseGatewayPhotoParts, parseGatewayReactionRemove, parseGatewayReactionStatus, parseGatewayReactionToken, parseGatewayVideoParts, parseGatewayVoiceParts}
 import metis.core.config.CliConfig
 import metis.gateway.core.{ChannelAdapter, gatewayLogIdentityHash}
 import metis.gateway.logging.{MetisLogEvent, metisCreateSubsystemLogger}
@@ -1110,6 +1110,10 @@ public class FeishuAdapter <: ChannelAdapter {
         }
         if (normalized.startsWith("[audio]")) {
             let parsed = parseGatewayAudioParts(raw)
+            return Some(("audio", "audio", parsed[0], parsed[1]))
+        }
+        if (normalized.startsWith("[voice]")) {
+            let parsed = parseGatewayVoiceParts(raw)
             return Some(("audio", "audio", parsed[0], parsed[1]))
         }
         if (normalized.startsWith("[video]")) {
@@ -3157,7 +3161,7 @@ public class FeishuAdapter <: ChannelAdapter {
         contentJsonString: String
     ): Unit {
         let normalizedType = messageType.trimAscii().toAsciiLower()
-        if (!(normalizedType == "image" || normalizedType == "file" || normalizedType == "media" || normalizedType == "audio" || normalizedType == "video")) {
+        if (!(normalizedType == "image" || normalizedType == "file" || normalizedType == "media" || normalizedType == "audio" || normalizedType == "video" || normalizedType == "post")) {
             return
         }
         let content = try {
@@ -3165,10 +3169,110 @@ public class FeishuAdapter <: ChannelAdapter {
         } catch (_e: Exception) {
             JsonObject()
         }
+        if (normalizedType == "post") {
+            let records = this.feishuPostEmbeddedMediaRecords(cfg, accountId, chatId, senderId, messageId, content)
+            if (records.size() > 0) {
+                mediaContext.put("records", records)
+            }
+            return
+        }
         let fileId = this.feishuAttachmentFileId(normalizedType, content)
         if (fileId.isEmpty()) {
             return
         }
+        let records = JsonArray([])
+        records.add(this.feishuCurrentMediaRecord(
+            cfg,
+            accountId,
+            chatId,
+            senderId,
+            messageId,
+            normalizedType,
+            fileId,
+            content
+        ))
+        mediaContext.put("records", records)
+    }
+
+    private func feishuPostEmbeddedMediaRecords(
+        cfg: FeishuConfig,
+        accountId: String,
+        chatId: String,
+        senderId: String,
+        messageId: String,
+        content: JsonObject
+    ): JsonArray {
+        let records = JsonArray([])
+        let payload = match (content.get("content")) {
+            case Some(_v) => content
+            case None => match (content.get("zh_cn")) {
+                case Some(v) => try { v.asObject() } catch (_e: Exception) { JsonObject() }
+                case None => match (content.get("en_us")) {
+                    case Some(ev) => try { ev.asObject() } catch (_e: Exception) { JsonObject() }
+                    case None => match (content.get("post")) {
+                        case Some(pv) => try {
+                            let post = pv.asObject()
+                            match (post.get("zh_cn")) {
+                                case Some(zhv) => zhv.asObject()
+                                case None => match (post.get("en_us")) {
+                                    case Some(env) => env.asObject()
+                                    case None => JsonObject()
+                                }
+                            }
+                        } catch (_e: Exception) { JsonObject() }
+                        case None => JsonObject()
+                    }
+                }
+            }
+        }
+        let rows = match (payload.get("content")) {
+            case Some(v) => try { v.asArray() } catch (_e: Exception) { JsonArray([]) }
+            case None => JsonArray([])
+        }
+        for (i in 0..rows.size()) {
+            let items = try { rows[i].asArray() } catch (_e: Exception) { JsonArray([]) }
+            for (j in 0..items.size()) {
+                let obj = try { items[j].asObject() } catch (_e: Exception) { JsonObject() }
+                let tag = this.readStringField(obj, "tag").trimAscii().toAsciiLower()
+                let mediaKind = if (tag == "img" || tag == "image") {
+                    "image"
+                } else if (tag == "file") {
+                    "file"
+                } else if (tag == "media" || tag == "video") {
+                    "video"
+                } else {
+                    ""
+                }
+                if (!mediaKind.isEmpty()) {
+                    let fileId = this.feishuAttachmentFileId(mediaKind, obj)
+                    if (!fileId.trimAscii().isEmpty()) {
+                        records.add(this.feishuCurrentMediaRecord(
+                            cfg,
+                            accountId,
+                            chatId,
+                            senderId,
+                            messageId,
+                            mediaKind,
+                            fileId,
+                            obj
+                        ))
+                    }
+                }
+            }
+        }
+        records
+    }
+
+    private func feishuCurrentMediaRecord(
+        cfg: FeishuConfig,
+        accountId: String,
+        chatId: String,
+        senderId: String,
+        messageId: String,
+        normalizedType: String,
+        fileId: String,
+        content: JsonObject
+    ): JsonObject {
         let originalFileName = this.feishuAttachmentFileName(content)
         let originalMimeType = this.feishuAttachmentMimeType(normalizedType, content)
         let declaredSize = this.feishuAttachmentFileSize(content)
@@ -3281,9 +3385,7 @@ public class FeishuAdapter <: ChannelAdapter {
             resourceNetworkAttempted,
             this.feishuAttachmentEligibility(normalizedType)
         ))
-        let records = JsonArray([])
-        records.add(record)
-        mediaContext.put("records", records)
+        record
     }
 
     private func attachFeishuQuoteContext(
@@ -4060,12 +4162,17 @@ public class FeishuAdapter <: ChannelAdapter {
     }
 
     private func feishuMediaMimeAllowed(cfg: FeishuConfig, mimeType: String): Bool {
-        let mime = mimeType.trimAscii().toAsciiLower()
-        if (cfg.media.allowedMimes.isEmpty()) {
-            return true
+        let mime = this.feishuNormalizeMimeType(mimeType)
+        if (mime.isEmpty()) {
+            return false
         }
-        for (raw in cfg.media.allowedMimes) {
-            let allowed = raw.trimAscii().toAsciiLower()
+        let allowedMimes = if (cfg.media.allowedMimes.isEmpty()) {
+            this.feishuDefaultAllowedMediaMimes()
+        } else {
+            cfg.media.allowedMimes
+        }
+        for (raw in allowedMimes) {
+            let allowed = this.feishuNormalizeMimeType(raw)
             if (allowed == "*" || allowed == mime) {
                 return true
             }
@@ -4077,6 +4184,26 @@ public class FeishuAdapter <: ChannelAdapter {
             }
         }
         false
+    }
+
+    private func feishuDefaultAllowedMediaMimes(): Array<String> {
+        [
+            "image/*",
+            "audio/*",
+            "video/*",
+            "application/pdf",
+            "application/json",
+            "text/*"
+        ]
+    }
+
+    private func feishuNormalizeMimeType(raw: String): String {
+        let trimmed = raw.trimAscii().toAsciiLower()
+        let semi = match (trimmed.indexOf(";")) {
+            case Some(i) => i
+            case None => trimmed.size
+        }
+        trimmed[0..semi].trimAscii()
     }
 
     private func feishuMediaSizeExceedsLimit(cfg: FeishuConfig, sizeBytes: Int64): Bool {
@@ -4242,6 +4369,18 @@ public class FeishuAdapter <: ChannelAdapter {
             let value = this.readStringField(content, key).trimAscii().toAsciiLower()
             if (!value.isEmpty()) { return value }
         }
+        let fileName = this.feishuAttachmentFileName(content).trimAscii().toAsciiLower()
+        if (fileName.endsWith(".pdf")) { return "application/pdf" }
+        if (fileName.endsWith(".txt") || fileName.endsWith(".md") || fileName.endsWith(".csv")) { return "text/plain" }
+        if (fileName.endsWith(".json")) { return "application/json" }
+        if (fileName.endsWith(".png")) { return "image/png" }
+        if (fileName.endsWith(".jpg") || fileName.endsWith(".jpeg")) { return "image/jpeg" }
+        if (fileName.endsWith(".gif")) { return "image/gif" }
+        if (fileName.endsWith(".webp")) { return "image/webp" }
+        if (fileName.endsWith(".ogg") || fileName.endsWith(".opus")) { return "audio/ogg" }
+        if (fileName.endsWith(".mp3")) { return "audio/mpeg" }
+        if (fileName.endsWith(".m4a")) { return "audio/mp4" }
+        if (fileName.endsWith(".mp4")) { return if (kind == "audio") { "audio/mp4" } else { "video/mp4" } }
         if (kind == "image") { return "image/*" }
         if (kind == "audio") { return "audio/*" }
         if (kind == "media" || kind == "video") { return "video/*" }

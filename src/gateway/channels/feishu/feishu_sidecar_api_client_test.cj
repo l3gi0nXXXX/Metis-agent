@@ -316,6 +316,125 @@ public class FeishuSidecarApiClientTest {
     }
 
     @TestCase
+    public func processRunnerMapsResourceDownloadToImageOrMessageResourceActions(): Unit {
+        let imageProcess = FeishuSidecarApiProcessFakeProcess(stdout: [
+            "{\"type\":\"ready\",\"accountId\":\"tenant-a\",\"transport\":\"websocket\"}",
+            "{\"type\":\"sendResult\",\"requestId\":\"metis-sidecar-api\",\"ok\":true,\"contentBase64\":\"aW1hZ2U=\",\"contentType\":\"image/png\",\"fileName\":\"a.png\",\"size\":5}"
+        ])
+        let imageProtocol = FeishuSidecarApiProcessFakeRunner(imageProcess)
+        let imageRunner = FeishuSidecarProcessRequestRunner(
+            account: FeishuSidecarRequestAccount(accountId: "tenant-a", appId: "cli_app", appSecret: "secret-app"),
+            runner: imageProtocol,
+            options: FeishuSidecarRequestRunnerOptions(readyTimeoutMs: 1, requestTimeoutMs: 1, readTimeoutMs: 1)
+        )
+        let imageParams = JsonObject()
+        imageParams.put("messageId", JsonString("om_1"))
+        imageParams.put("fileKey", JsonString("img_1"))
+        imageParams.put("resourceType", JsonString("image"))
+        let imageRequest = JsonObject()
+        imageRequest.put("operation", JsonString("resource.download"))
+        imageRequest.put("accountId", JsonString("tenant-a"))
+        imageRequest.put("params", imageParams)
+
+        let imageResult = imageRunner.run(imageRequest)
+
+        @Expect(sidecarTestBool(imageResult, "ok"), true)
+        @Expect(sidecarTestString(imageResult, "bytesBase64"), "aW1hZ2U=")
+        @Expect(imageProcess.stdinLines[1].contains("\"action\":\"downloadImage\""), true)
+        @Expect(imageProcess.stdinLines[1].contains("\"messageId\":\"om_1\""), true)
+        @Expect(imageProcess.stdinLines[1].contains("\"fileKey\":\"img_1\""), true)
+        @Expect(imageProcess.stdinLines[1].contains("\"resourceType\":\"image\""), true)
+        @Expect(imageProcess.stdinLines[1].contains("\"imageKey\":\"img_1\""), true)
+
+        let fileProcess = FeishuSidecarApiProcessFakeProcess(stdout: [
+            "{\"type\":\"ready\",\"accountId\":\"tenant-a\",\"transport\":\"websocket\"}",
+            "{\"type\":\"sendResult\",\"requestId\":\"metis-sidecar-api\",\"ok\":true,\"bytesBase64\":\"ZmlsZQ==\",\"contentType\":\"application/octet-stream\",\"fileName\":\"a.bin\",\"size\":4}"
+        ])
+        let fileProtocol = FeishuSidecarApiProcessFakeRunner(fileProcess)
+        let fileRunner = FeishuSidecarProcessRequestRunner(
+            account: FeishuSidecarRequestAccount(accountId: "tenant-a", appId: "cli_app", appSecret: "secret-app"),
+            runner: fileProtocol,
+            options: FeishuSidecarRequestRunnerOptions(readyTimeoutMs: 1, requestTimeoutMs: 1, readTimeoutMs: 1)
+        )
+        let fileParams = JsonObject()
+        fileParams.put("messageId", JsonString("om_1"))
+        fileParams.put("fileKey", JsonString("file_1"))
+        fileParams.put("resourceType", JsonString("file"))
+        let fileRequest = JsonObject()
+        fileRequest.put("operation", JsonString("resource.download"))
+        fileRequest.put("accountId", JsonString("tenant-a"))
+        fileRequest.put("params", fileParams)
+
+        let fileResult = fileRunner.run(fileRequest)
+
+        @Expect(sidecarTestBool(fileResult, "ok"), true)
+        @Expect(sidecarTestString(fileResult, "bytesBase64"), "ZmlsZQ==")
+        @Expect(fileProcess.stdinLines[1].contains("\"action\":\"downloadResource\""), true)
+        @Expect(fileProcess.stdinLines[1].contains("\"messageId\":\"om_1\""), true)
+        @Expect(fileProcess.stdinLines[1].contains("\"fileKey\":\"file_1\""), true)
+        @Expect(fileProcess.stdinLines[1].contains("\"resourceType\":\"file\""), true)
+    }
+
+    @TestCase
+    public func processRunnerDiagnosticFailuresAreStructuredAndNeverRunning(): Unit {
+        let errorProcess = FeishuSidecarApiProcessFakeProcess(stdout: [
+            "{\"type\":\"ready\",\"accountId\":\"tenant-a\",\"transport\":\"websocket\"}",
+            "{\"type\":\"error\",\"requestId\":\"metis-sidecar-api\",\"status\":\"scope_missing\",\"message\":\"missing scope appSecret=secret-app\"}"
+        ])
+        let errorRunner = FeishuSidecarProcessRequestRunner(
+            account: FeishuSidecarRequestAccount(accountId: "tenant-a", appId: "cli_app", appSecret: "secret-app"),
+            runner: FeishuSidecarApiProcessFakeRunner(errorProcess),
+            options: FeishuSidecarRequestRunnerOptions(readyTimeoutMs: 1, requestTimeoutMs: 1, readTimeoutMs: 1)
+        )
+        let request = JsonObject()
+        request.put("operation", JsonString("message.create"))
+        request.put("accountId", JsonString("tenant-a"))
+        request.put("params", JsonObject())
+        let errorResult = errorRunner.run(request)
+
+        @Expect(sidecarTestBool(errorResult, "ok"), false)
+        @Expect(sidecarTestString(errorResult, "status"), "scope_missing")
+        @Expect(sidecarTestString(errorResult, "status") == "running", false)
+        @Expect(sidecarTestString(errorResult, "error").contains("secret-app"), false)
+
+        let exitProcess = FeishuSidecarApiProcessFakeProcess()
+        exitProcess.alive = false
+        let exitRunner = FeishuSidecarProcessRequestRunner(
+            account: FeishuSidecarRequestAccount(accountId: "tenant-a", appId: "cli_app", appSecret: "secret-app"),
+            runner: FeishuSidecarApiProcessFakeRunner(exitProcess),
+            options: FeishuSidecarRequestRunnerOptions(readyTimeoutMs: 1, requestTimeoutMs: 1, readTimeoutMs: 1)
+        )
+        let exitResult = exitRunner.run(request)
+        @Expect(sidecarTestBool(exitResult, "ok"), false)
+        @Expect(sidecarTestString(exitResult, "status"), "unexpected_exit")
+        @Expect(sidecarTestString(exitResult, "status") == "running", false)
+
+        let readyTimeoutProcess = FeishuSidecarApiProcessFakeProcess()
+        let readyTimeoutRunner = FeishuSidecarProcessRequestRunner(
+            account: FeishuSidecarRequestAccount(accountId: "tenant-a", appId: "cli_app", appSecret: "secret-app"),
+            runner: FeishuSidecarApiProcessFakeRunner(readyTimeoutProcess),
+            options: FeishuSidecarRequestRunnerOptions(readyTimeoutMs: 1, requestTimeoutMs: 1, readTimeoutMs: 1)
+        )
+        let readyTimeoutResult = readyTimeoutRunner.run(request)
+        @Expect(sidecarTestBool(readyTimeoutResult, "ok"), false)
+        @Expect(sidecarTestString(readyTimeoutResult, "status"), "ready_timeout")
+        @Expect(sidecarTestString(readyTimeoutResult, "status") == "running", false)
+
+        let requestTimeoutProcess = FeishuSidecarApiProcessFakeProcess(stdout: [
+            "{\"type\":\"ready\",\"accountId\":\"tenant-a\",\"transport\":\"websocket\"}"
+        ])
+        let requestTimeoutRunner = FeishuSidecarProcessRequestRunner(
+            account: FeishuSidecarRequestAccount(accountId: "tenant-a", appId: "cli_app", appSecret: "secret-app"),
+            runner: FeishuSidecarApiProcessFakeRunner(requestTimeoutProcess),
+            options: FeishuSidecarRequestRunnerOptions(readyTimeoutMs: 1, requestTimeoutMs: 1, readTimeoutMs: 1)
+        )
+        let requestTimeoutResult = requestTimeoutRunner.run(request)
+        @Expect(sidecarTestBool(requestTimeoutResult, "ok"), false)
+        @Expect(sidecarTestString(requestTimeoutResult, "status"), "request_timeout")
+        @Expect(sidecarTestString(requestTimeoutResult, "status") == "running", false)
+    }
+
+    @TestCase
     public func textCreateReplyAndFallbackUseExpectedSidecarOperations(): Unit {
         let runner = FeishuSidecarApiClientFakeRunner()
         runner.enqueue(feishuSidecarTestResult(true, status: "ok", messageId: "om_create"))

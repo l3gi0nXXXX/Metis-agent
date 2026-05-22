@@ -160,6 +160,76 @@ public class GatewayVideoGenerationToolsetTest {
     }
 
     @TestCase
+    public func videoGenerationToolDeliversFakeVideoThroughCurrentFeishuContext(): Unit {
+        let home = gatewayVideoGenerationToolTestHome("feishu-deliver")
+        let oldHome = getVariable("METIS_HOME")
+        try { remove(Path(home), recursive: true) } catch (_: Exception) { () }
+        Directory.create(home, recursive: true)
+        setVariable("METIS_HOME", home)
+        MetisConfigManager.invalidate()
+        CliSettingManager.invalidate()
+        CliConfig.invalidatePathCache()
+        gatewayVideoGenerationToolInstallConfig(home)
+
+        let videoPath = Path(home).join("gateway-video-generation").join("feishu-demo.mp4")
+        File.writeTo(videoPath, "fake-video".toArray())
+        setGatewayVideoGenerationRunnerForTest(Some({ _config: JsonObject, request: JsonObject =>
+            @Expect(request.get("prompt").getOrThrow().asString().getValue(), "make a Feishu demo")
+            let video = JsonObject()
+            video.put("path", JsonString(videoPath.toString()))
+            video.put("mimeType", JsonString("video/mp4"))
+            video.put("fileName", JsonString("feishu-demo.mp4"))
+            let videos = JsonArray([])
+            videos.add(video)
+            let result = JsonObject()
+            result.put("ok", JsonBool(true))
+            result.put("status", JsonString("ok"))
+            result.put("provider", JsonString("fake-video"))
+            result.put("providerKind", JsonString("fake-video-generation"))
+            result.put("model", JsonString("fake-wan"))
+            result.put("videos", videos)
+            result
+        }))
+
+        let sentTexts = ArrayList<String>()
+        let sentPeerIds = ArrayList<String>()
+        debugSetGatewayVideoGenerationToolCallRunnerForTest(Some({ method: String, payload: JsonObject =>
+            @Expect(method, "channels.send")
+            @Expect(payload.get("id").getOrThrow().asString().getValue(), "feishu")
+            @Expect(payload.get("channel").getOrThrow().asString().getValue(), "feishu")
+            sentPeerIds.add(payload.get("peerId").getOrThrow().asString().getValue())
+            sentTexts.add(payload.get("text").getOrThrow().asString().getValue())
+            let out = JsonObject()
+            out.put("ok", JsonBool(true))
+            out
+        }))
+        try {
+            let toolset = GatewayVideoGenerationToolset()
+            let context = GatewayToolRuntimeContext(
+                "feishu",
+                channelName: "feishu",
+                sessionKey: "feishu:group:oc_1"
+            )
+            let out = gatewayWithToolRuntimeContext(context, { =>
+                toolset.debugGatewayVideoGenerateForTest("make a Feishu demo", Some("feishu"), true)
+            })
+            let result = JsonValue.fromStr(out).asObject()
+            @Expect(result.get("ok").getOrThrow().asBool().getValue(), true)
+            @Expect(result.get("status").getOrThrow().asString().getValue(), "ok")
+            @Expect(result.get("delivered").getOrThrow().asBool().getValue(), true)
+            @Expect(context.hasVisibleReplyDelivered(), true)
+            @Expect(sentPeerIds[0], "oc_1")
+            @Expect(sentTexts.size, 1)
+            @Expect(sentTexts[0].startsWith("[video]"), true)
+            @Expect(sentTexts[0].contains(videoPath.toString()), true)
+        } finally {
+            debugSetGatewayVideoGenerationToolCallRunnerForTest(None<(String, JsonObject) -> JsonObject>)
+            setGatewayVideoGenerationRunnerForTest(None<(JsonObject, JsonObject) -> JsonObject>)
+            gatewayVideoGenerationToolResetEnv(oldHome, home)
+        }
+    }
+
+    @TestCase
     public func videoGenerationToolSkipsTelegramDeliveryWhenVideoActionDisabled(): Unit {
         let home = gatewayVideoGenerationToolTestHome("action-disabled")
         let oldHome = getVariable("METIS_HOME")

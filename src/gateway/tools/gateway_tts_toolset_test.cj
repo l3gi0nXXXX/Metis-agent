@@ -236,6 +236,55 @@ public class GatewayTtsToolsetTest {
     }
 
     @TestCase
+    public func ttsToolDeliversAudioThroughCurrentFeishuContext(): Unit {
+        let home = gatewayTtsToolTestHome("feishu-deliver")
+        let oldHome = getVariable("METIS_HOME")
+        try { remove(Path(home), recursive: true) } catch (_: Exception) { () }
+        Directory.create(home, recursive: true)
+        setVariable("METIS_HOME", home)
+        MetisConfigManager.invalidate()
+        CliSettingManager.invalidate()
+        CliConfig.invalidatePathCache()
+        gatewayTtsToolInstallProviderConfig(home)
+
+        let sentTexts = ArrayList<String>()
+        let sentPeerIds = ArrayList<String>()
+        debugSetGatewayTtsToolCallRunnerForTest(Some({ method: String, payload: JsonObject =>
+            @Expect(method, "channels.send")
+            @Expect(payload.get("id").getOrThrow().asString().getValue(), "feishu")
+            @Expect(payload.get("channel").getOrThrow().asString().getValue(), "feishu")
+            sentPeerIds.add(payload.get("peerId").getOrThrow().asString().getValue())
+            sentTexts.add(payload.get("text").getOrThrow().asString().getValue())
+            let out = JsonObject()
+            out.put("ok", JsonBool(true))
+            out
+        }))
+        try {
+            let toolset = GatewayTtsToolset()
+            let context = GatewayToolRuntimeContext(
+                "feishu",
+                channelName: "feishu",
+                sessionKey: "feishu:group:oc_1"
+            )
+            let out = gatewayWithToolRuntimeContext(context, { =>
+                toolset.debugTtsForTest("你好飞书", "feishu", false)
+            })
+            let result = JsonValue.fromStr(out).asObject()
+            @Expect(result.get("ok").getOrThrow().asBool().getValue(), true)
+            @Expect(result.get("channel").getOrThrow().asString().getValue(), "feishu")
+            @Expect(result.get("payloadKind").getOrThrow().asString().getValue(), "audio")
+            @Expect(result.get("delivered").getOrThrow().asBool().getValue(), true)
+            @Expect(context.hasVisibleReplyDelivered(), true)
+            @Expect(sentPeerIds[0], "oc_1")
+            @Expect(sentTexts.size, 1)
+            @Expect(sentTexts[0].startsWith("[audio]"), true)
+        } finally {
+            debugSetGatewayTtsToolCallRunnerForTest(None<(String, JsonObject) -> JsonObject>)
+            gatewayTtsToolResetEnv(oldHome, home)
+        }
+    }
+
+    @TestCase
     public func ttsToolDashScopeQwenDeliversVoiceAndMarksSilentReply(): Unit {
         let home = gatewayTtsToolTestHome("dashscope-deliver")
         let oldHome = getVariable("METIS_HOME")

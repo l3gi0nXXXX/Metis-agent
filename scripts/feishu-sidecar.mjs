@@ -770,10 +770,19 @@ async function sendText(frame) {
 
 function detectFileType(fileName, mediaType) {
   const name = String(fileName ?? "").toLowerCase();
-  if (mediaType === "audio" || name.endsWith(".opus") || name.endsWith(".ogg")) {
+  if (mediaType === "audio" || mediaType === "opus" || mediaType === "ogg" || name.endsWith(".opus") || name.endsWith(".ogg")) {
     return "opus";
   }
-  if (mediaType === "video" || name.endsWith(".mp4") || name.endsWith(".mov") || name.endsWith(".avi")) {
+  if (
+    mediaType === "video" ||
+    mediaType === "media" ||
+    mediaType === "mp4" ||
+    mediaType === "mov" ||
+    mediaType === "avi" ||
+    name.endsWith(".mp4") ||
+    name.endsWith(".mov") ||
+    name.endsWith(".avi")
+  ) {
     return "mp4";
   }
   if (name.endsWith(".pdf")) return "pdf";
@@ -785,8 +794,17 @@ function detectFileType(fileName, mediaType) {
 
 function msgTypeForMedia(fileType, mediaType) {
   if (mediaType === "image") return "image";
-  if (mediaType === "audio" || fileType === "opus") return "audio";
-  if (mediaType === "video" || fileType === "mp4") return "media";
+  if (mediaType === "audio" || mediaType === "opus" || mediaType === "ogg" || fileType === "opus") return "audio";
+  if (
+    mediaType === "video" ||
+    mediaType === "media" ||
+    mediaType === "mp4" ||
+    mediaType === "mov" ||
+    mediaType === "avi" ||
+    fileType === "mp4"
+  ) {
+    return "media";
+  }
   return "file";
 }
 
@@ -1040,6 +1058,9 @@ function responseBuffer(response) {
   if (Buffer.isBuffer(response?.data)) {
     return response.data;
   }
+  if (response?.data?.type === "Buffer" && Array.isArray(response.data.data)) {
+    return Buffer.from(response.data.data);
+  }
   if (response?.data instanceof ArrayBuffer) {
     return Buffer.from(response.data);
   }
@@ -1050,16 +1071,29 @@ function contentTypeOf(response) {
   return response?.headers?.["content-type"] ?? response?.header?.["content-type"] ?? response?.contentType;
 }
 
+function fileNameOf(response) {
+  return response?.file_name ?? response?.fileName ?? response?.data?.file_name ?? response?.data?.fileName;
+}
+
+function nonEmptyDownloadBuffer(response, errorPrefix) {
+  const buffer = responseBuffer(response);
+  if (buffer.length <= 0) {
+    throw new Error(`${errorPrefix}: empty response buffer`);
+  }
+  return buffer;
+}
+
 async function downloadImage(frame) {
   const response = await state.client.im.image.get({
     path: { image_key: frame.imageKey },
   });
   assertApiSuccess(response, "Feishu image download failed");
-  const buffer = responseBuffer(response);
+  const buffer = nonEmptyDownloadBuffer(response, "Feishu image download failed");
   return {
     contentBase64: buffer.toString("base64"),
     bytesBase64: buffer.toString("base64"),
     contentType: contentTypeOf(response),
+    fileName: fileNameOf(response),
     size: buffer.length,
   };
 }
@@ -1070,12 +1104,12 @@ async function downloadResource(frame) {
     params: { type: frame.resourceType === "image" ? "image" : "file" },
   });
   assertApiSuccess(response, "Feishu message resource download failed");
-  const buffer = responseBuffer(response);
+  const buffer = nonEmptyDownloadBuffer(response, "Feishu message resource download failed");
   return {
     contentBase64: buffer.toString("base64"),
     bytesBase64: buffer.toString("base64"),
     contentType: contentTypeOf(response),
-    fileName: response?.file_name ?? response?.fileName ?? response?.data?.file_name,
+    fileName: fileNameOf(response),
     size: buffer.length,
   };
 }

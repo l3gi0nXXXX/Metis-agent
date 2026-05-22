@@ -121,6 +121,21 @@ public class GatewayFeishuMediaToolsetTest {
     }
 
     @TestCase
+    public func feishuFetchCurrentMetadataOnlyRecordReturnsMetadataOnlyWithoutCredentialHint(): Unit {
+        let out = gatewayWithToolRuntimeContext(
+            GatewayToolRuntimeContext("feishu", channelName: "feishu", sessionKey: "feishu:chat:1", mediaContext: this.mediaContext(downloaded: false, skippedReason: "metadata_only")),
+            { => GatewayFeishuMediaToolset().debugFeishuFetchResourceForTest("om_1", "img_1", Some("image")) }
+        )
+        let json = JsonValue.fromStr(out).asObject()
+        @Expect(json.get("ok").getOrThrow().asBool().getValue(), false)
+        @Expect(json.get("status").getOrThrow().asString().getValue(), "metadata_only")
+        @Expect(json.get("reason").getOrThrow().asString().getValue(), "metadata_only")
+        @Expect(out.contains("missing_app_credentials"), false)
+        @Expect(out.contains("configure_feishu_app_credentials"), false)
+        @Expect(out.contains("app_credentials"), false)
+    }
+
+    @TestCase
     public func feishuFetchResourceUsesHistoricalRunnerAndTempCacheWhenCurrentTurnMisses(): Unit {
         let root = "/tmp/metis-feishu-historical-${DateTime.now().toUnixTimeStamp().toMilliseconds()}"
         try { remove(Path(root), recursive: true) } catch (_e: Exception) { () }

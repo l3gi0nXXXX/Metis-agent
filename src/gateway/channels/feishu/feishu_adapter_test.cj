@@ -2008,7 +2008,14 @@ public class FeishuAdapterTest {
         tenant.put("appId", JsonString("cli_app_a"))
         let accounts = JsonObject()
         accounts.put("tenant-a", tenant)
-        let adapter = FeishuAdapter(config: FeishuConfig(enabled: true, accounts: Some(accounts)), accountId: "tenant-a")
+        let adapter = FeishuAdapter(
+            config: FeishuConfig(
+                enabled: true,
+                accounts: Some(accounts),
+                media: FeishuMediaConfig(downloadEnabled: false)
+            ),
+            accountId: "tenant-a"
+        )
         adapter.start()
         let expectedInbound = ArrayList<JsonObject>()
         var ignoredCount = 0
@@ -2190,8 +2197,14 @@ public class FeishuAdapterTest {
     }
 
     @TestCase
-    public func imageFileMediaAndAudioCreateAttachmentContextWithoutDownload(): Unit {
-        let adapter = FeishuAdapter(config: FeishuConfig(enabled: true), accountId: "work")
+    public func imageFileMediaAndAudioCreateAttachmentContextWithoutDownloadWhenDisabled(): Unit {
+        let adapter = FeishuAdapter(
+            config: FeishuConfig(
+                enabled: true,
+                media: FeishuMediaConfig(downloadEnabled: false)
+            ),
+            accountId: "work"
+        )
         adapter.start()
         @Expect(adapter.ingestWebhookPayload(
             this.webhookPayload(
@@ -2258,6 +2271,61 @@ public class FeishuAdapterTest {
         @Expect(media.get("resourceFetch").getOrThrow().asObject().get("eligibleFor").getOrThrow().asString().getValue(), "video")
         @Expect(audio.get("mediaKind").getOrThrow().asString().getValue(), "audio")
         @Expect(audio.get("resourceFetch").getOrThrow().asObject().get("eligibleFor").getOrThrow().asString().getValue(), "audio")
+    }
+
+    @TestCase
+    public func currentImageFileAudioAndVideoDownloadByDefaultWithSafeMimeSet(): Unit {
+        let root = "/tmp/metis-feishu-media-default-${DateTime.now().toUnixTimeStamp().toMilliseconds()}"
+        try { remove(Path(root), recursive: true) } catch (_e: Exception) { () }
+        let client = FeishuFakeApiClient()
+        client.setResource("work", "om_image_default", "img_default", "image", "fake-image".toArray(), contentType: "image/png", fileName: "diagram.png")
+        client.setResource("work", "om_file_default", "file_default", "file", "fake-pdf".toArray(), contentType: "application/pdf", fileName: "report.pdf")
+        client.setResource("work", "om_audio_default", "audio_default", "file", "fake-audio".toArray(), contentType: "audio/ogg", fileName: "voice.ogg")
+        client.setResource("work", "om_video_default", "video_default", "file", "fake-video".toArray(), contentType: "video/mp4", fileName: "clip.mp4")
+        let adapter = FeishuAdapter(
+            config: FeishuConfig(
+                enabled: true,
+                media: FeishuMediaConfig(downloadRoot: root)
+            ),
+            accountId: "work",
+            apiClient: client
+        )
+        adapter.start()
+        try {
+            @Expect(adapter.ingestWebhookPayload(this.webhookPayload("om_image_default", "oc_group", "ou_1", "{\\\"image_key\\\":\\\"img_default\\\",\\\"file_name\\\":\\\"diagram.png\\\",\\\"mime_type\\\":\\\"image/png\\\"}", messageType: "image")).contains("\"ok\":true"), true)
+            @Expect(adapter.ingestWebhookPayload(this.webhookPayload("om_file_default", "oc_group", "ou_1", "{\\\"file_key\\\":\\\"file_default\\\",\\\"file_name\\\":\\\"report.pdf\\\",\\\"mime_type\\\":\\\"application/pdf\\\",\\\"size\\\":8}", messageType: "file")).contains("\"ok\":true"), true)
+            @Expect(adapter.ingestWebhookPayload(this.webhookPayload("om_audio_default", "oc_group", "ou_1", "{\\\"file_key\\\":\\\"audio_default\\\",\\\"file_name\\\":\\\"voice.ogg\\\",\\\"mime_type\\\":\\\"audio/ogg\\\"}", messageType: "audio")).contains("\"ok\":true"), true)
+            @Expect(adapter.ingestWebhookPayload(this.webhookPayload("om_video_default", "oc_group", "ou_1", "{\\\"file_key\\\":\\\"video_default\\\",\\\"file_name\\\":\\\"clip.mp4\\\",\\\"mime_type\\\":\\\"video/mp4\\\",\\\"cover_image_key\\\":\\\"cover_default\\\"}", messageType: "video")).contains("\"ok\":true"), true)
+
+            let inbound = adapter.pullInbound()
+            @Expect(inbound.size, 4)
+            let expected = ["fake-image", "fake-pdf", "fake-audio", "fake-video"]
+            for (i in 0..inbound.size) {
+                let record = inbound[i].mediaContext.get("records").getOrThrow().asArray()[0].asObject()
+                @Expect(record.get("downloaded").getOrThrow().asBool().getValue(), true)
+                @Expect(record.get("skippedReason").getOrThrow().asString().getValue(), "")
+                @Expect(record.get("mimeType").getOrThrow().asString().getValue().isEmpty(), false)
+                @Expect(record.get("fileSize").getOrThrow().asInt().getValue() > 0, true)
+                @Expect(record.get("fileName").getOrThrow().asString().getValue().isEmpty(), false)
+                let localPath = record.get("localPath").getOrThrow().asString().getValue()
+                @Expect(localPath.startsWith(root), true)
+                @Expect(record.get("downloadPath").getOrThrow().asString().getValue(), localPath)
+                @Expect(record.get("mediaPath").getOrThrow().asString().getValue(), localPath)
+                @Expect(exists(Path(localPath)), true)
+                @Expect(String.fromUtf8(File.readFrom(Path(localPath))), expected[i])
+                let fetch = record.get("resourceFetch").getOrThrow().asObject()
+                @Expect(fetch.get("status").getOrThrow().asString().getValue(), "downloaded")
+                @Expect(fetch.get("errorClass").getOrThrow().asString().getValue(), "ok")
+                @Expect(fetch.get("networkAttempted").getOrThrow().asBool().getValue(), true)
+                @Expect(fetch.get("requiredScopes").getOrThrow().asArray()[0].asString().getValue(), "im:message.resource:read")
+            }
+            let video = inbound[3].mediaContext.get("records").getOrThrow().asArray()[0].asObject()
+            @Expect(video.get("fileKey").getOrThrow().asString().getValue(), "video_default")
+            @Expect(video.get("coverImageKey").getOrThrow().asString().getValue(), "cover_default")
+            @Expect(video.get("mediaPath").getOrThrow().asString().getValue().contains("cover_default"), false)
+        } finally {
+            try { remove(Path(root), recursive: true) } catch (_e: Exception) { () }
+        }
     }
 
     @TestCase
@@ -2359,7 +2427,13 @@ public class FeishuAdapterTest {
 
     @TestCase
     public func currentMediaRecordsPreserveDurationCoverAndMediaPathHints(): Unit {
-        let adapter = FeishuAdapter(config: FeishuConfig(enabled: true), accountId: "work")
+        let adapter = FeishuAdapter(
+            config: FeishuConfig(
+                enabled: true,
+                media: FeishuMediaConfig(downloadEnabled: false)
+            ),
+            accountId: "work"
+        )
         adapter.start()
         @Expect(adapter.ingestWebhookPayload(
             this.webhookPayload(
@@ -3010,6 +3084,188 @@ public class FeishuAdapterTest {
             @Expect(localPath.startsWith(root), true)
             @Expect(localPath.contains(".."), false)
             @Expect(exists(Path(localPath)), true)
+        } finally {
+            try { remove(Path(root), recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func defaultMediaMimeSetRejectsUnsafeDownloadedMimeWithoutCustomAllowList(): Unit {
+        let root = "/tmp/metis-feishu-media-unsafe-mime-${DateTime.now().toUnixTimeStamp().toMilliseconds()}"
+        try { remove(Path(root), recursive: true) } catch (_e: Exception) { () }
+        let client = FeishuFakeApiClient()
+        client.setResource(
+            "work",
+            "om_unsafe_mime",
+            "file_unsafe",
+            "file",
+            "fake-exe".toArray(),
+            contentType: "application/x-msdownload",
+            fileName: "tool.exe"
+        )
+        let adapter = FeishuAdapter(
+            config: FeishuConfig(
+                enabled: true,
+                media: FeishuMediaConfig(downloadRoot: root)
+            ),
+            accountId: "work",
+            apiClient: client
+        )
+        adapter.start()
+        try {
+            @Expect(adapter.ingestWebhookPayload(
+                this.webhookPayload(
+                    "om_unsafe_mime",
+                    "oc_group",
+                    "ou_1",
+                    "{\\\"file_key\\\":\\\"file_unsafe\\\",\\\"file_name\\\":\\\"tool.exe\\\",\\\"mime_type\\\":\\\"application/pdf\\\"}",
+                    messageType: "file"
+                )
+            ).contains("\"ok\":true"), true)
+
+            let inbound = adapter.pullInbound()
+            let record = inbound[0].mediaContext.get("records").getOrThrow().asArray()[0].asObject()
+            @Expect(record.get("downloaded").getOrThrow().asBool().getValue(), false)
+            @Expect(record.get("skippedReason").getOrThrow().asString().getValue(), "mime_not_allowed")
+            @Expect(record.get("localPath").getOrThrow().asString().getValue(), "")
+            let fetch = record.get("resourceFetch").getOrThrow().asObject()
+            @Expect(fetch.get("status").getOrThrow().asString().getValue(), "mime_not_allowed")
+            @Expect(fetch.get("networkAttempted").getOrThrow().asBool().getValue(), true)
+        } finally {
+            try { remove(Path(root), recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func currentFileDownloadHonorsDeclaredSizeLimitBeforeNetwork(): Unit {
+        let client = FeishuFakeApiClient()
+        client.setResource(
+            "work",
+            "om_too_large",
+            "file_too_large",
+            "file",
+            "large".toArray(),
+            contentType: "application/pdf",
+            fileName: "large.pdf"
+        )
+        let adapter = FeishuAdapter(
+            config: FeishuConfig(
+                enabled: true,
+                media: FeishuMediaConfig(mediaMaxBytes: 4)
+            ),
+            accountId: "work",
+            apiClient: client
+        )
+        adapter.start()
+        @Expect(adapter.ingestWebhookPayload(
+            this.webhookPayload(
+                "om_too_large",
+                "oc_group",
+                "ou_1",
+                "{\\\"file_key\\\":\\\"file_too_large\\\",\\\"file_name\\\":\\\"large.pdf\\\",\\\"mime_type\\\":\\\"application/pdf\\\",\\\"size\\\":64}",
+                messageType: "file"
+            )
+        ).contains("\"ok\":true"), true)
+
+        let inbound = adapter.pullInbound()
+        let record = inbound[0].mediaContext.get("records").getOrThrow().asArray()[0].asObject()
+        @Expect(record.get("downloaded").getOrThrow().asBool().getValue(), false)
+        @Expect(record.get("skippedReason").getOrThrow().asString().getValue(), "size_limit_exceeded")
+        let fetch = record.get("resourceFetch").getOrThrow().asObject()
+        @Expect(fetch.get("status").getOrThrow().asString().getValue(), "size_limit_exceeded")
+        @Expect(fetch.get("networkAttempted").getOrThrow().asBool().getValue(), false)
+    }
+
+    @TestCase
+    public func postEmbeddedImageFileAndVideoCreateDownloadedCurrentRecords(): Unit {
+        let root = "/tmp/metis-feishu-post-media-${DateTime.now().toUnixTimeStamp().toMilliseconds()}"
+        try { remove(Path(root), recursive: true) } catch (_e: Exception) { () }
+        let client = FeishuFakeApiClient()
+        client.setResource("work", "om_post_media", "post_img", "image", "post-image".toArray(), contentType: "image/png", fileName: "post.png")
+        client.setResource("work", "om_post_media", "post_pdf", "file", "post-pdf".toArray(), contentType: "application/pdf", fileName: "post.pdf")
+        client.setResource("work", "om_post_media", "post_video", "file", "post-video".toArray(), contentType: "video/mp4", fileName: "post.mp4")
+        let adapter = FeishuAdapter(
+            config: FeishuConfig(
+                enabled: true,
+                media: FeishuMediaConfig(downloadRoot: root)
+            ),
+            accountId: "work",
+            apiClient: client
+        )
+        adapter.start()
+        try {
+            let postContent = "{\\\"zh_cn\\\":{\\\"title\\\":\\\"media post\\\",\\\"content\\\":[[{\\\"tag\\\":\\\"text\\\",\\\"text\\\":\\\"body\\\"},{\\\"tag\\\":\\\"img\\\",\\\"image_key\\\":\\\"post_img\\\"},{\\\"tag\\\":\\\"file\\\",\\\"file_key\\\":\\\"post_pdf\\\",\\\"file_name\\\":\\\"post.pdf\\\",\\\"mime_type\\\":\\\"application/pdf\\\"},{\\\"tag\\\":\\\"media\\\",\\\"file_key\\\":\\\"post_video\\\",\\\"file_name\\\":\\\"post.mp4\\\",\\\"mime_type\\\":\\\"video/mp4\\\"}]]}}"
+            @Expect(adapter.ingestWebhookPayload(
+                this.webhookPayload(
+                    "om_post_media",
+                    "oc_group",
+                    "ou_1",
+                    postContent,
+                    messageType: "post"
+                )
+            ).contains("\"ok\":true"), true)
+
+            let inbound = adapter.pullInbound()
+            @Expect(inbound.size, 1)
+            @Expect(inbound[0].text.contains("body"), true)
+            let records = inbound[0].mediaContext.get("records").getOrThrow().asArray()
+            @Expect(records.size(), 3)
+            let image = records[0].asObject()
+            let file = records[1].asObject()
+            let video = records[2].asObject()
+            @Expect(image.get("mediaKind").getOrThrow().asString().getValue(), "image")
+            @Expect(image.get("eligibleFor").getOrThrow().asString().getValue(), "image")
+            @Expect(file.get("mediaKind").getOrThrow().asString().getValue(), "file")
+            @Expect(file.get("eligibleFor").getOrThrow().asString().getValue(), "document")
+            @Expect(video.get("mediaKind").getOrThrow().asString().getValue(), "video")
+            @Expect(video.get("eligibleFor").getOrThrow().asString().getValue(), "video")
+            for (i in 0..records.size()) {
+                let record = records[i].asObject()
+                @Expect(record.get("relation").getOrThrow().asString().getValue(), "current")
+                @Expect(record.get("downloaded").getOrThrow().asBool().getValue(), true)
+                @Expect(record.get("mediaPath").getOrThrow().asString().getValue().startsWith(root), true)
+                @Expect(record.get("resourceFetch").getOrThrow().asObject().get("status").getOrThrow().asString().getValue(), "downloaded")
+            }
+        } finally {
+            try { remove(Path(root), recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func videoDownloadUsesFileKeyAndKeepsCoverOnlyAsMetadata(): Unit {
+        let root = "/tmp/metis-feishu-video-file-key-${DateTime.now().toUnixTimeStamp().toMilliseconds()}"
+        try { remove(Path(root), recursive: true) } catch (_e: Exception) { () }
+        let client = FeishuFakeApiClient()
+        client.setResource("work", "om_video_file_key", "video_file_key", "file", "video-bytes".toArray(), contentType: "video/mp4", fileName: "video.mp4")
+        client.setResource("work", "om_video_file_key", "cover_image_key", "image", "cover-bytes".toArray(), contentType: "image/png", fileName: "cover.png")
+        let adapter = FeishuAdapter(
+            config: FeishuConfig(
+                enabled: true,
+                media: FeishuMediaConfig(downloadRoot: root)
+            ),
+            accountId: "work",
+            apiClient: client
+        )
+        adapter.start()
+        try {
+            @Expect(adapter.ingestWebhookPayload(
+                this.webhookPayload(
+                    "om_video_file_key",
+                    "oc_group",
+                    "ou_1",
+                    "{\\\"file_key\\\":\\\"video_file_key\\\",\\\"image_key\\\":\\\"cover_image_key\\\",\\\"cover_image_key\\\":\\\"cover_image_key\\\",\\\"file_name\\\":\\\"video.mp4\\\",\\\"mime_type\\\":\\\"video/mp4\\\"}",
+                    messageType: "video"
+                )
+            ).contains("\"ok\":true"), true)
+
+            let inbound = adapter.pullInbound()
+            let video = inbound[0].mediaContext.get("records").getOrThrow().asArray()[0].asObject()
+            @Expect(video.get("fileKey").getOrThrow().asString().getValue(), "video_file_key")
+            @Expect(video.get("coverImageKey").getOrThrow().asString().getValue(), "cover_image_key")
+            @Expect(video.get("resourceFetch").getOrThrow().asObject().get("fileKey").getOrThrow().asString().getValue(), "video_file_key")
+            let localPath = video.get("localPath").getOrThrow().asString().getValue()
+            @Expect(String.fromUtf8(File.readFrom(Path(localPath))), "video-bytes")
+            @Expect(localPath.contains("cover_image_key"), false)
         } finally {
             try { remove(Path(root), recursive: true) } catch (_e: Exception) { () }
         }

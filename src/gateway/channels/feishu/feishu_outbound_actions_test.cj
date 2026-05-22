@@ -1,6 +1,6 @@
 package metis.gateway.channels.feishu
 
-import metis.core.{renderGatewayAudioText, renderGatewayDeleteText, renderGatewayDocumentText, renderGatewayPhotoText, renderGatewayReactionText, renderGatewayVideoText}
+import metis.core.{renderGatewayAudioText, renderGatewayDeleteText, renderGatewayDocumentText, renderGatewayPhotoText, renderGatewayReactionText, renderGatewayVideoText, renderGatewayVoiceText}
 import metis.gateway.model.{ChannelType, FeishuConfig, FeishuMediaConfig, OutboundMessage, SendResult}
 import std.fs.{Directory, File, Path, remove}
 import std.time.DateTime
@@ -99,6 +99,53 @@ public class FeishuOutboundActionsTest {
             @Expect(client.textSendCount(), 0)
             @Expect(client.uploadedMediaCount(), 3)
             @Expect(client.mediaSendCount(), 3)
+        } finally {
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func localVoiceAndAudioPayloadsBothUseFeishuAudioMessagesWithoutTextFallback(): Unit {
+        let root = this.tempRoot("voice-audio")
+        try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        let voicePath = root.join("voice.ogg")
+        let audioPath = root.join("track.ogg")
+        Directory.create(root, recursive: true)
+        File.writeTo(voicePath, "fake-voice".toArray())
+        File.writeTo(audioPath, "fake-audio".toArray())
+        try {
+            let client = FeishuFakeApiClient()
+            let adapter = FeishuAdapter(
+                config: FeishuConfig(
+                    enabled: true,
+                    streaming: "text",
+                    media: FeishuMediaConfig(
+                        mediaMaxBytes: 1024,
+                        allowedMimes: ["audio/*"]
+                    )
+                ),
+                apiClient: client
+            )
+            adapter.start()
+
+            let voiceId = adapter.sendWithMessageId(OutboundMessage(
+                ChannelType.Feishu,
+                "oc_media",
+                renderGatewayVoiceText(voicePath.toString(), caption: "voice"),
+                accountId: "tenant-a"
+            ))
+            let audioId = adapter.sendWithMessageId(OutboundMessage(
+                ChannelType.Feishu,
+                "oc_media",
+                renderGatewayAudioText(audioPath.toString(), caption: "audio"),
+                accountId: "tenant-a"
+            ))
+
+            @Expect(voiceId, "fake-feishu-audio-1")
+            @Expect(audioId, "fake-feishu-audio-2")
+            @Expect(client.textSendCount(), 0)
+            @Expect(client.uploadedMediaCount(), 2)
+            @Expect(client.mediaSendCount(), 2)
         } finally {
             try { remove(root, recursive: true) } catch (_e: Exception) { () }
         }

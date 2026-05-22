@@ -925,7 +925,7 @@ public class FeishuMediaConfig {
     public let downloadRoot: String
 
     public init(
-        downloadEnabled!: Bool = false,
+        downloadEnabled!: Bool = true,
         mediaMaxBytes!: Int64 = 20 * 1024 * 1024,
         allowedMimes!: Array<String> = [],
         downloadRoot!: String = "/tmp/metis-feishu-media"

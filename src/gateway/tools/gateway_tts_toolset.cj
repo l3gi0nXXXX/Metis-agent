@@ -92,6 +92,12 @@ private func gatewayTtsToolCurrentTarget(): (String, String, String) {
             if (channel == "telegram" && sessionKey.startsWith("telegram:group:")) {
                 return ("telegram", sessionKey["telegram:group:".size..], sessionKey)
             }
+            if (channel == "feishu" && sessionKey.startsWith("feishu:direct:")) {
+                return ("feishu", sessionKey["feishu:direct:".size..], sessionKey)
+            }
+            if (channel == "feishu" && sessionKey.startsWith("feishu:group:")) {
+                return ("feishu", sessionKey["feishu:group:".size..], sessionKey)
+            }
             return (channel, "", sessionKey)
         case None => ("", "", "")
     }

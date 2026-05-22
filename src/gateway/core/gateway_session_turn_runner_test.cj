@@ -111,6 +111,29 @@ private func gatewaySessionTurnImageMediaContext(
     media
 }
 
+private func gatewaySessionTurnFeishuMetadataOnlyDocumentContext(): JsonObject {
+    let media = JsonObject()
+    media.put("channel", JsonString("feishu"))
+    media.put("accountId", JsonString("default"))
+    let records = JsonArray([])
+    let record = JsonObject()
+    record.put("mediaId", JsonString("default:oc_1:om_1:file:file_1"))
+    record.put("channel", JsonString("feishu"))
+    record.put("accountId", JsonString("default"))
+    record.put("peerId", JsonString("oc_1"))
+    record.put("messageId", JsonString("om_1"))
+    record.put("mediaKind", JsonString("document"))
+    record.put("mimeType", JsonString("application/octet-stream"))
+    record.put("fileName", JsonString("archive.bin"))
+    record.put("downloaded", JsonBool(false))
+    record.put("skippedReason", JsonString("metadata_only"))
+    record.put("mediaUnderstandingStatus", JsonString("metadata_only"))
+    record.put("mediaUnderstandingCapability", JsonString("document"))
+    records.add(record)
+    media.put("records", records)
+    media
+}
+
 @Test
 public class GatewaySessionTurnRunnerTest {
     @TestCase
@@ -120,6 +143,20 @@ public class GatewaySessionTurnRunnerTest {
         @Expect(prompt.contains("Call the `tts` tool"), true)
         @Expect(prompt.contains("<silent_reply>"), true)
         @Expect(prompt.contains("Write the exact text that should be spoken as the final answer; the Telegram Gateway will synthesize and deliver"), false)
+    }
+
+    @TestCase
+    public func feishuMetadataOnlyMediaPromptDoesNotSuggestMissingAppCredentials(): Unit {
+        let prompt = gatewayBuildMediaContextPromptForUser(
+            gatewaySessionTurnFeishuMetadataOnlyDocumentContext(),
+            GatewayUserSettings()
+        )
+        @Expect(prompt.contains("MediaUnderstandingStatus=metadata_only"), true)
+        @Expect(prompt.contains("skippedReason=metadata_only"), true)
+        @Expect(prompt.contains("missing_app_credentials"), false)
+        @Expect(prompt.contains("configure_feishu_app_credentials"), false)
+        @Expect(prompt.contains("app credentials"), false)
+        @Expect(prompt.contains("missing appId/appSecret"), false)
     }
 
     @TestCase

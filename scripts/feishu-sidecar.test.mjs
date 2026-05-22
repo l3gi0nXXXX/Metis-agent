@@ -175,7 +175,7 @@ function writeFakeSdk(root, options = {}) {
               },
               get: async (request) => {
                 record("im.image.get", request);
-                return nextResponse({ code: 0, data: Buffer.from("image-bytes"), headers: { "content-type": "image/png" } });
+                return nextResponse({ code: 0, data: Buffer.from("image-bytes"), file_name: "image.png", headers: { "content-type": "image/png" } });
               },
             },
             file: {
@@ -774,6 +774,112 @@ test("send text, media, card, reaction, delete, and download requests route to S
     const videoSend = callsOf(callsPath, "im.message.create").find((call) => call.data.msg_type === "media");
     assert.match(videoSend.data.content, /file_uploaded/);
   } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("send media maps Feishu file_type and msg_type from media kind and extension", async () => {
+  const root = createTempRoot();
+  const { sdkPath, callsPath } = writeFakeSdk(root);
+  let proc;
+  try {
+    proc = spawnSidecar({ sdkPath, callsPath });
+    proc.writeFrame(baseInit());
+    await proc.waitForFrame((frame) => frame.type === "ready");
+
+    const requests = [
+      { requestId: "image-kind", mediaType: "image", fileName: "no-extension" },
+      { requestId: "audio-kind", mediaType: "audio", fileName: "voice.bin" },
+      { requestId: "opus-kind", mediaType: "opus", fileName: "voice.bin" },
+      { requestId: "ogg-kind", mediaType: "ogg", fileName: "voice.bin" },
+      { requestId: "mp4-kind", mediaType: "mp4", fileName: "clip.bin" },
+      { requestId: "mov-kind", mediaType: "mov", fileName: "clip.bin" },
+      { requestId: "avi-kind", mediaType: "avi", fileName: "clip.bin" },
+      { requestId: "file-kind", mediaType: "archive", fileName: "archive.bin" },
+    ];
+    for (const request of requests) {
+      proc.writeFrame({
+        type: "send",
+        action: "sendMedia",
+        to: "oc_chat",
+        contentBase64: Buffer.from(request.requestId).toString("base64"),
+        ...request,
+      });
+      const result = await proc.waitForFrame((frame) => frame.type === "sendResult" && frame.requestId === request.requestId);
+      assert.equal(result.ok, true, request.requestId);
+    }
+    await proc.close();
+
+    const creates = callsOf(callsPath, "im.message.create");
+    const uploads = callsOf(callsPath, "im.file.create");
+    assert.equal(callsOf(callsPath, "im.image.create").length, 1);
+    assert.equal(creates.find((call) => call.data.msg_type === "image").data.msg_type, "image");
+    assert.deepEqual(
+      uploads.map((call) => call.data.file_type),
+      ["opus", "opus", "opus", "mp4", "mp4", "mp4", "stream"],
+    );
+    assert.deepEqual(
+      creates.filter((call) => call.data.msg_type !== "image").map((call) => call.data.msg_type),
+      ["audio", "audio", "audio", "media", "media", "media", "file"],
+    );
+  } finally {
+    await proc?.close?.();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("download image and resource return byte metadata and reject empty buffers without secrets", async () => {
+  const root = createTempRoot();
+  const { sdkPath, callsPath } = writeFakeSdk(root);
+  let proc;
+  try {
+    proc = spawnSidecar({
+      sdkPath,
+      callsPath,
+      behavior: {
+        responses: [
+          { code: 0, data: Buffer.from("image-bytes"), file_name: "image.png", headers: { "content-type": "image/png" } },
+          { code: 0, data: Buffer.from("resource-bytes"), file_name: "resource.bin", headers: { "content-type": "application/octet-stream" } },
+          { code: 0, data: Buffer.alloc(0), msg: secretValues.appSecret },
+          { code: 230001, msg: "download denied " + secretValues.appSecret },
+        ],
+      },
+    });
+    proc.writeFrame(baseInit());
+    await proc.waitForFrame((frame) => frame.type === "ready");
+
+    proc.writeFrame({ type: "send", action: "downloadImage", requestId: "image", imageKey: "img_1" });
+    const image = await proc.waitForFrame((frame) => frame.type === "sendResult" && frame.requestId === "image");
+    assert.equal(image.contentBase64, Buffer.from("image-bytes").toString("base64"));
+    assert.equal(image.bytesBase64, image.contentBase64);
+    assert.equal(image.contentType, "image/png");
+    assert.equal(image.fileName, "image.png");
+    assert.equal(image.size, Buffer.byteLength("image-bytes"));
+
+    proc.writeFrame({ type: "send", action: "downloadResource", requestId: "resource", messageId: "om_1", fileKey: "file_1", resourceType: "file" });
+    const resource = await proc.waitForFrame((frame) => frame.type === "sendResult" && frame.requestId === "resource");
+    assert.equal(resource.contentBase64, Buffer.from("resource-bytes").toString("base64"));
+    assert.equal(resource.bytesBase64, resource.contentBase64);
+    assert.equal(resource.contentType, "application/octet-stream");
+    assert.equal(resource.fileName, "resource.bin");
+    assert.equal(resource.size, Buffer.byteLength("resource-bytes"));
+
+    proc.writeFrame({ type: "send", action: "downloadImage", requestId: "empty", imageKey: "img_empty" });
+    const empty = await proc.waitForFrame((frame) => frame.type === "error" && frame.requestId === "empty");
+    assert.equal(empty.status, "api_error");
+    assert.equal(empty.errorKind, "api_error");
+    assert.match(empty.message, /empty/i);
+    assert.equal(empty.message.includes(secretValues.appSecret), false);
+
+    proc.writeFrame({ type: "send", action: "downloadResource", requestId: "api-error", messageId: "om_1", fileKey: "file_1", resourceType: "file" });
+    const apiError = await proc.waitForFrame((frame) => frame.type === "error" && frame.requestId === "api-error");
+    assert.equal(apiError.status, "api_error");
+    assert.equal(apiError.message.includes(secretValues.appSecret), false);
+
+    const result = await proc.close();
+    assert.equal(`${result.stdout}${result.stderr}`.includes(secretValues.appSecret), false);
+  } finally {
+    await proc?.close?.();
     fs.rmSync(root, { recursive: true, force: true });
   }
 });

@@ -229,7 +229,7 @@ public class FeishuOapiResult {
             false,
             "missing_credential",
             error: if (error.trimAscii().isEmpty()) {
-                "Feishu appId/appSecret is required before issuing ${request.tokenMode}."
+                "Feishu app credentials are required before issuing ${request.tokenMode}."
             } else {
                 error.trimAscii()
             },
@@ -271,7 +271,7 @@ public class FeishuOapiResult {
             let credential = JsonObject()
             credential.put("required", JsonBool(true))
             credential.put("mode", JsonString(this.request.tokenMode))
-            credential.put("missing_fields", feishuOapiJsonStringArray(["app_id", "appSecret"]))
+            credential.put("missing_fields", feishuOapiJsonStringArray(["app_id", "credential_value"]))
             credential.put("redacted", JsonBool(true))
             out.put("credential", credential)
         }
@@ -679,7 +679,7 @@ public class MetisFeishuOapiTokenProvider <: FeishuOapiTokenProvider {
         if (credentials.appId.isEmpty() || credentials.appSecret.isEmpty()) {
             return FeishuOapiTokenLookup(
                 "missing_credential",
-                error: "Feishu appId/appSecret is required before issuing ${cleanMode}."
+                error: "Feishu app credentials are required before issuing ${cleanMode}."
             )
         }
         let cacheKey = "${normalized}\u{0000}${cleanMode}"
@@ -1043,7 +1043,7 @@ public class FeishuNativeOapiAppTokenClient <: FeishuOapiAppTokenClient {
         if (credentials.appId.isEmpty() || credentials.appSecret.isEmpty()) {
             return FeishuOapiAppTokenResult(
                 "missing_credential",
-                error: "Feishu appId/appSecret is required before issuing ${tokenMode.trimAscii()}."
+                error: "Feishu app credentials are required before issuing ${tokenMode.trimAscii()}."
             )
         }
         let cleanMode = tokenMode.trimAscii()
@@ -2322,7 +2322,7 @@ private func feishuOapiRepairHints(request: FeishuOapiRequest): JsonObject {
     let credentials = JsonObject()
     credentials.put("required", JsonBool(request.tokenMode != "user_access_token"))
     credentials.put("repair_method", JsonString("configure_feishu_app_credentials"))
-    credentials.put("missing_fields", feishuOapiJsonStringArray(["app_id", "appSecret"]))
+    credentials.put("missing_fields", feishuOapiJsonStringArray(["app_id", "credential_value"]))
     credentials.put("network", JsonString("not_started"))
     credentials.put("redacted", JsonBool(true))
     out.put("app_credentials", credentials)

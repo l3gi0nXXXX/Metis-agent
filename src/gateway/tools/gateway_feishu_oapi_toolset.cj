@@ -3,6 +3,7 @@ package metis.gateway.tools
 import magic.dsl.{tool, toolset}
 import magic.prelude.*
 
+import metis.core.config.CliSettingManager
 import metis.io.PrintUtils
 
 import stdx.encoding.json.{JsonObject, JsonString, JsonValue}
@@ -12,12 +13,19 @@ private var gatewayFeishuOapiToolCallRunnerForTest: Option<(String, JsonObject) 
 
 private var gatewayFeishuOapiClientForTest: Option<FeishuOapiClient> = None<FeishuOapiClient>
 
+private var gatewayFeishuOapiAppTokenClientForTest: Option<FeishuOapiAppTokenClient> =
+    None<FeishuOapiAppTokenClient>
+
 public func debugSetGatewayFeishuOapiToolCallRunnerForTest(runner: Option<(String, JsonObject) -> JsonObject>): Unit {
     gatewayFeishuOapiToolCallRunnerForTest = runner
 }
 
 public func debugSetGatewayFeishuOapiClientForTest(client: Option<FeishuOapiClient>): Unit {
     gatewayFeishuOapiClientForTest = client
+}
+
+public func debugSetGatewayFeishuOapiAppTokenClientForTest(client: Option<FeishuOapiAppTokenClient>): Unit {
+    gatewayFeishuOapiAppTokenClientForTest = client
 }
 
 private func feishuOapiParseParamsJson(paramsJson: Option<String>): (Bool, JsonObject, String) {
@@ -118,7 +126,10 @@ private func feishuOapiInvoke(
             match (gatewayFeishuOapiClientForTest) {
                 case Some(client) => gatewayFeishuOapiAttachRepairActionForToolResult(client.invoke(request), request).toJsonString()
                 case None => gatewayFeishuOapiAttachRepairActionForToolResult(MetisFeishuOapiClient(
-                    tokenProvider: Some<FeishuOapiTokenProvider>(MetisFeishuOapiTokenProvider()),
+                    tokenProvider: Some<FeishuOapiTokenProvider>(MetisFeishuOapiTokenProvider(
+                        userSettings: Some(CliSettingManager.readGatewaySettings()),
+                        appTokenClient: gatewayFeishuOapiAppTokenClientForTest
+                    )),
                     httpClient: Some<FeishuOapiHttpClient>(FeishuNativeOapiHttpClient())
                 ).invoke(request), request).toJsonString()
             }

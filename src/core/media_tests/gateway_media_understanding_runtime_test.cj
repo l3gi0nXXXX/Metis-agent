@@ -601,6 +601,92 @@ public class GatewayMediaUnderstandingRuntimeTest {
     }
 
     @TestCase
+    public func downloadedFeishuImageUsesVisionRuntimeAndReturnsDescription(): Unit {
+        let root = mediaAsrTestTempRoot("feishu-image-runtime")
+        let image = root.join("image.jpg")
+        File.writeTo(image, "fake-feishu-image".toArray())
+        setGatewayMediaVisionRunnerForTest(Some({ path: String, mime: String, kind: String, prompt: String, maxBytes: Int64 =>
+            @Expect(path, image.toString())
+            @Expect(mime, "image/jpeg")
+            @Expect(kind, "image")
+            @Expect(prompt, "describe")
+            @Expect(maxBytes, 8192)
+            "fake vision provider feishu image"
+        }))
+        try {
+            let result = gatewayMediaUnderstandingForRecordWithSettings(
+                mediaImageTestRecord(image.toString(), channel: "feishu", kind: "image"),
+                GatewayUserSettings(),
+                capability: "image",
+                prompt: "describe"
+            )
+
+            @Expect(mediaAsrString(result, "status"), "ok")
+            @Expect(mediaAsrString(result, "imageDescription"), "fake vision provider feishu image")
+            let outputs = result.get("outputs").getOrThrow().asArray()
+            @Expect(outputs[0].asObject().get("kind").getOrThrow().asString().getValue(), "image.description")
+            @Expect(outputs[0].asObject().get("source").getOrThrow().asString().getValue(), "native_vision_runtime")
+        } finally {
+            setGatewayMediaVisionRunnerForTest(None<(String, String, String, String, Int64) -> String>)
+            try { remove(root, recursive: true) } catch (_: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func feishuTextDocumentRecordReturnsDocumentPreview(): Unit {
+        let root = mediaAsrTestTempRoot("feishu-text-doc")
+        let doc = root.join("notes.txt")
+        File.writeTo(doc, "Feishu document preview text".toArray())
+        try {
+            let result = gatewayMediaUnderstandingForRecordWithSettings(
+                mediaDocumentTestRecord(doc.toString(), mime: "text/plain", fileName: "notes.txt", channel: "feishu"),
+                GatewayUserSettings(),
+                capability: "document"
+            )
+
+            @Expect(mediaAsrString(result, "status"), "ok")
+            @Expect(mediaAsrString(result, "documentTextPreview"), "Feishu document preview text")
+            @Expect(gatewayMediaUnderstandingFirstText(result), "Feishu document preview text")
+        } finally {
+            try { remove(root, recursive: true) } catch (_: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func feishuPdfDocumentRecordUsesFakePdfRuntime(): Unit {
+        let root = mediaAsrTestTempRoot("feishu-pdf-runtime")
+        let doc = root.join("brief.pdf")
+        File.writeTo(doc, "%PDF-1.7\nfake".toArray())
+        setGatewayMediaPdfRuntimeForTest(Some({ path: String, mime: String, fileName: String, prompt: String, _maxBytes: Int64 =>
+            @Expect(path, doc.toString())
+            @Expect(mime, "application/pdf")
+            @Expect(fileName, "brief.pdf")
+            @Expect(prompt, "summarize")
+            let out = JsonObject()
+            out.put("status", JsonString("ok"))
+            out.put("text", JsonString("fake PDF extract for Feishu"))
+            out.put("provider", JsonString("fake"))
+            out
+        }))
+        try {
+            let result = gatewayMediaUnderstandingForRecordWithSettings(
+                mediaDocumentTestRecord(doc.toString(), fileName: "brief.pdf", channel: "feishu"),
+                GatewayUserSettings(),
+                capability: "document",
+                prompt: "summarize"
+            )
+
+            @Expect(mediaAsrString(result, "status"), "ok")
+            @Expect(mediaAsrString(result, "documentExtractStatus"), "ok")
+            @Expect(mediaAsrString(result, "documentTextPreview"), "fake PDF extract for Feishu")
+            @Expect(mediaAsrString(result, "extractor"), "pdf_runtime")
+        } finally {
+            setGatewayMediaPdfRuntimeForTest(None<(String, String, String, String, Int64) -> JsonObject>)
+            try { remove(root, recursive: true) } catch (_: Exception) { () }
+        }
+    }
+
+    @TestCase
     public func imageTooLargeResultIncludesDiagnosticLimitSourceFields(): Unit {
         let root = mediaAsrTestTempRoot("image-too-large-diagnostics")
         let image = root.join("image.jpg")
