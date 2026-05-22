@@ -6,7 +6,7 @@ import metis.core.config.{CliConfig, CliSettingManager}
 import metis.core.config.GatewayUserSettings
 
 import metis.gateway.{gatewayRuntimeEffectiveAuthPassword, gatewayRuntimeEffectiveAuthToken}
-import metis.gateway.protocol.{GATEWAY_ERROR_INVALID_RESPONSE, GATEWAY_ERROR_REMOTE_UNAVAILABLE, GatewayClientInfo, GatewayConnectParams, GatewayProtocolRequest, GatewayProtocolResponse}
+import metis.gateway.protocol.{GATEWAY_ERROR_CONNECT_CHALLENGE_REQUIRED, GATEWAY_ERROR_INVALID_RESPONSE, GATEWAY_ERROR_REMOTE_UNAVAILABLE, GatewayClientInfo, GatewayConnectParams, GatewayProtocolRequest, GatewayProtocolResponse}
 import magic.utils.http.HttpUtils
 
 import std.collection.{ArrayList, HashMap}
@@ -136,8 +136,7 @@ public class RemoteGatewayTransportAdapter <: GatewayTransportAdapter {
             gatewayTransportIntOr(this.endpoint, gatewayRemoteConsecutiveFailureCountByEndpoint, 0) > 0 &&
             !gatewayTransportBoolOr(this.endpoint, gatewayRemoteConnectedByEndpoint, false)
         }
-        if (req.method != "connect" &&
-            req.method != "disconnect" &&
+        if (!gatewayRemoteBypassReconnectForMethod(req.method) &&
             synchronized(gatewayTransportRuntimeLock) { gatewayRemoteEligibleForReconnectUnlocked(this.endpoint) } &&
             !synchronized(gatewayTransportRuntimeLock) { gatewayTransportBoolOr(this.endpoint, gatewayRemoteConnectedByEndpoint, false) }) {
             gatewayRemoteSetState(this.endpoint, "reconnecting")
@@ -473,6 +472,11 @@ private func gatewayRemoteRetryable(errorCode: String): Bool {
     errorCode == GATEWAY_ERROR_REMOTE_UNAVAILABLE || errorCode == GATEWAY_ERROR_INVALID_RESPONSE
 }
 
+private func gatewayRemoteBypassReconnectForMethod(method: String): Bool {
+    let normalized = method.trimAscii().toAsciiLower()
+    normalized == "connect" || normalized == "connect.ack" || normalized == "disconnect"
+}
+
 private func gatewayRemoteRuntimeSnapshot(endpoint: String): JsonObject {
     synchronized(gatewayTransportRuntimeLock) {
         gatewayEnsureTransportStateLoadedLocked()
@@ -624,6 +628,13 @@ private func gatewayRemoteRecordResult(endpoint: String, response: GatewayProtoc
                 if (previousFailures > 0 && now - gatewayTransportIntOr(endpoint, gatewayRemoteStableConnectedAtByEndpoint, now) < gatewayRemoteStableWindowMs) { "recovering" } else { "connected" }
             gatewayRemoteLastProtocolVersionByEndpoint[endpoint] = response.protocolVersion
             gatewayRemoteAppendLifecycleLocked(endpoint, "request.ok", detail: response.method)
+        } else if (response.errorCode == GATEWAY_ERROR_CONNECT_CHALLENGE_REQUIRED) {
+            gatewayRemoteLastFailureAtByEndpoint[endpoint] = gatewayTransportNowMs()
+            gatewayRemoteLastErrorByEndpoint[endpoint] = response.error
+            gatewayRemoteConnectedByEndpoint[endpoint] = true
+            gatewayRemoteReconnectStateByEndpoint[endpoint] = "challenge"
+            gatewayRemoteLastProtocolVersionByEndpoint[endpoint] = response.protocolVersion
+            gatewayRemoteAppendLifecycleLocked(endpoint, "request.challenge", detail: response.method)
         } else {
             gatewayRemoteFailureCountByEndpoint[endpoint] = gatewayTransportIntOr(endpoint, gatewayRemoteFailureCountByEndpoint, 0) + 1
             gatewayRemoteConsecutiveFailureCountByEndpoint[endpoint] =
