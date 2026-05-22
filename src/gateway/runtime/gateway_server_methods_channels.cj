@@ -3255,6 +3255,9 @@ public func handleGatewayChannelsFamily(method: String, user: GatewayUserSetting
         let channelId = gatewayRpcStringParam(requestValue, ["id", "channel", "channelId"], "feishu")
         let result = JsonObject()
         result.put("channel", gatewayChannelGetJson(user, channelId))
+        let gateway = JsonObject()
+        gateway.put("processIdentity", gatewayProcessIdentitySnapshot(user))
+        result.put("gateway", gateway)
         return Some(GatewayRpcResponse(true, method, result: result))
     }
     if (method == "channels.health") {

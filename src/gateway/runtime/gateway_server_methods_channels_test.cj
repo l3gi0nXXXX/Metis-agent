@@ -363,6 +363,12 @@ public class GatewayServerMethodsChannelsTest {
         let channel = gatewayChannelGetJson(user, "feishu")
         @Expect(channel.get("supports").isSome(), true)
 
+        let getResult = handleGatewayChannelsFamily("channels.get", user).getOrThrow().result.asObject()
+        let gateway = getResult.get("gateway").getOrThrow().asObject()
+        let identity = gateway.get("processIdentity").getOrThrow().asObject()
+        @Expect(channelsTestString(identity, "schema"), "metis.gateway.process.v1")
+        @Expect(channelsTestString(identity, "buildFingerprint"), gatewayBuildFingerprint())
+
         let status = handleGatewayChannelsFamily("channels.status", user).getOrThrow().result.asObject()
         let meta = status.get("channelMeta").getOrThrow().asObject()
         let feishuMeta = meta.get("feishu").getOrThrow().asObject()

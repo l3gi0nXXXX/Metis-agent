@@ -229,6 +229,29 @@ public class GatewayCliHumanOutputTest {
     }
 
     @TestCase
+    public func formatsChannelGetGatewayProcessIdentityWithoutRawJson(): Unit {
+        let raw = "{\"ok\":true,\"method\":\"channels.get\",\"result\":{\"channel\":{\"id\":\"feishu\",\"enabled\":true,\"configured\":true,\"mode\":\"event\"},\"gateway\":{\"processIdentity\":{\"schema\":\"metis.gateway.process.v1\",\"status\":\"pid-mismatch\",\"currentPid\":123,\"lockPid\":456,\"listenerPids\":[789],\"pidMismatch\":true,\"buildFingerprint\":\"metis-gateway-feishu-sidecar-2026-05-22\",\"advice\":[\"restart gateway after rebuilding Metis\"]}}}}"
+        let out = gatewayFormatCommandOutput(raw)
+        @Expect(out.contains("Channel: feishu"), true)
+        @Expect(out.contains("Gateway: status=pid-mismatch pid=123 lock=456 listeners=1"), true)
+        @Expect(out.contains("Gateway next: restart gateway after rebuilding Metis"), true)
+        @Expect(out.contains("\"processIdentity\""), false)
+        @Expect(out.contains("{"), false)
+    }
+
+    @TestCase
+    public func formatsLegacyFeishuSidecarContractAsStaleGatewayHint(): Unit {
+        let legacy = "open" + "claw"
+        let raw = "{\"ok\":true,\"method\":\"channels.get\",\"result\":{\"channel\":{\"id\":\"feishu\",\"enabled\":true,\"configured\":true,\"mode\":\"event\",\"transportMode\":\"${legacy}-sidecar\",\"sidecarDependency\":{\"runtimeRoot\":\"tools/feishu-${legacy}-sidecar\"}}}}"
+        let out = gatewayFormatCommandOutput(raw)
+        @Expect(out.contains("Channel: feishu"), true)
+        @Expect(out.contains("stale Feishu sidecar contract detected"), true)
+        @Expect(out.contains(legacy), false)
+        @Expect(out.contains("\"sidecarDependency\""), false)
+        @Expect(out.contains("{"), false)
+    }
+
+    @TestCase
     public func formatsQqChannelGetAccountsWithoutSecrets(): Unit {
         let out = gatewayFormatCommandOutput(gatewayHumanQqChannelGetRaw())
         @Expect(out.contains("Channel: qq"), true)
