@@ -223,6 +223,111 @@ public class GatewayImageGenerationToolsetTest {
     }
 
     @TestCase
+    public func imageGenerationToolDeliversPhotoThroughRuntimeHookWithoutCliSelfCall(): Unit {
+        let home = gatewayImageGenerationToolTestHome("runtime-hook")
+        let oldHome = getVariable("METIS_HOME")
+        try { remove(Path(home), recursive: true) } catch (_: Exception) { () }
+        Directory.create(home, recursive: true)
+        setVariable("METIS_HOME", home)
+        MetisConfigManager.invalidate()
+        CliSettingManager.invalidate()
+        CliConfig.invalidatePathCache()
+        gatewayImageGenerationToolInstallConfig(home)
+
+        let imagePath = Path(home).join("gateway-image-generation").join("hook.png")
+        File.writeTo(imagePath, "fake-image".toArray())
+        setGatewayImageGenerationRunnerForTest(Some({ _config: JsonObject, _request: JsonObject =>
+            let image = JsonObject()
+            image.put("path", JsonString(imagePath.toString()))
+            image.put("mimeType", JsonString("image/png"))
+            image.put("fileName", JsonString("hook.png"))
+            let images = JsonArray([])
+            images.add(image)
+            let result = JsonObject()
+            result.put("ok", JsonBool(true))
+            result.put("status", JsonString("ok"))
+            result.put("images", images)
+            result
+        }))
+        let calls = ArrayList<String>()
+        try {
+            let context = GatewayToolRuntimeContext(
+                "telegram",
+                channelName: "telegram",
+                sessionKey: "telegram:direct:user:1",
+                gatewayCallHook: Some({ method: String, payload: JsonObject =>
+                    let text = payload.get("text").getOrThrow().asString().getValue()
+                    calls.add("${method}:${text}")
+                    let out = JsonObject()
+                    out.put("ok", JsonBool(true))
+                    out
+                })
+            )
+            let out = gatewayWithToolRuntimeContext(context, { =>
+                GatewayImageGenerationToolset().debugGatewayImageGenerateForTest("draw an eagle", Some("telegram"), true)
+            })
+            let result = JsonValue.fromStr(out).asObject()
+            @Expect(result.get("ok").getOrThrow().asBool().getValue(), true)
+            @Expect(result.get("delivered").getOrThrow().asBool().getValue(), true)
+            @Expect(context.hasVisibleReplyDelivered(), true)
+            @Expect(calls.size, 1)
+            @Expect(calls[0].startsWith("channels.send:[photo]"), true)
+        } finally {
+            setGatewayImageGenerationRunnerForTest(None<(JsonObject, JsonObject) -> JsonObject>)
+            gatewayImageGenerationToolResetEnv(oldHome, home)
+        }
+    }
+
+    @TestCase
+    public func imageGenerationToolDoesNotCliSelfCallWhenRuntimeHookMissing(): Unit {
+        let home = gatewayImageGenerationToolTestHome("runtime-hook-missing")
+        let oldHome = getVariable("METIS_HOME")
+        try { remove(Path(home), recursive: true) } catch (_: Exception) { () }
+        Directory.create(home, recursive: true)
+        setVariable("METIS_HOME", home)
+        MetisConfigManager.invalidate()
+        CliSettingManager.invalidate()
+        CliConfig.invalidatePathCache()
+        gatewayImageGenerationToolInstallConfig(home)
+
+        let imagePath = Path(home).join("gateway-image-generation").join("missing-hook.png")
+        File.writeTo(imagePath, "fake-image".toArray())
+        setGatewayImageGenerationRunnerForTest(Some({ _config: JsonObject, _request: JsonObject =>
+            let image = JsonObject()
+            image.put("path", JsonString(imagePath.toString()))
+            image.put("mimeType", JsonString("image/png"))
+            image.put("fileName", JsonString("missing-hook.png"))
+            let images = JsonArray([])
+            images.add(image)
+            let result = JsonObject()
+            result.put("ok", JsonBool(true))
+            result.put("status", JsonString("ok"))
+            result.put("images", images)
+            result
+        }))
+        try {
+            let context = GatewayToolRuntimeContext(
+                "telegram",
+                channelName: "telegram",
+                sessionKey: "telegram:direct:user:1"
+            )
+            let out = gatewayWithToolRuntimeContext(context, { =>
+                GatewayImageGenerationToolset().debugGatewayImageGenerateForTest("draw an eagle", Some("telegram"), true)
+            })
+            let result = JsonValue.fromStr(out).asObject()
+            let deliveryResult = result.get("deliveryResult").getOrThrow().asObject()
+            @Expect(result.get("ok").getOrThrow().asBool().getValue(), true)
+            @Expect(result.get("delivered").getOrThrow().asBool().getValue(), false)
+            @Expect(result.get("delivery").getOrThrow().asString().getValue(), "failed")
+            @Expect(deliveryResult.get("status").getOrThrow().asString().getValue(), "gateway_call_unavailable")
+            @Expect(context.hasVisibleReplyDelivered(), false)
+        } finally {
+            setGatewayImageGenerationRunnerForTest(None<(JsonObject, JsonObject) -> JsonObject>)
+            gatewayImageGenerationToolResetEnv(oldHome, home)
+        }
+    }
+
+    @TestCase
     public func imageGenerationToolSkipsTelegramDeliveryWhenPhotoActionDisabled(): Unit {
         let home = gatewayImageGenerationToolTestHome("action-disabled")
         let oldHome = getVariable("METIS_HOME")

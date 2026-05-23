@@ -3,8 +3,8 @@ package metis.gateway.tools
 import magic.dsl.{tool, toolset}
 import magic.prelude.*
 
-import metis.core.{GatewayToolRuntimeContext, gatewayActionIsProtectedPathSensitive, gatewayActionIsReadOnly, gatewayActionNormalize, gatewayConfigPathIsProtected, gatewayActionRequiresExplicitUserRequest, gatewayActionRequiresOwner, gatewayCurrentToolRuntimeContext}
-import metis.core.config.MetisPaths
+import metis.core.{GatewayToolRuntimeContext, gatewayActionIsProtectedPathSensitive, gatewayActionIsReadOnly, gatewayActionNormalize, gatewayConfigPathIsProtected, gatewayActionRequiresExplicitUserRequest, gatewayActionRequiresOwner, gatewayCurrentToolRuntimeContext, gatewayInvokeCurrentToolRuntimeGatewayCall}
+import metis.core.config.{CliSettingManager, GatewayUserSettings, MetisPaths}
 import metis.io.PrintUtils
 
 import std.fs.{Path, exists}
@@ -18,6 +18,143 @@ public func gatewayToolRequiresOwnerApproval(action: String): Bool {
 
 public func gatewayToolRequiresExplicitRequestApproval(action: String): Bool {
     gatewayActionRequiresExplicitUserRequest(action)
+}
+
+private func gatewayToolRpcEnvelope(
+    method: String,
+    ok!: Bool,
+    result!: JsonValue = JsonObject(),
+    error!: String = "",
+    errorCode!: String = ""
+): JsonObject {
+    let out = JsonObject()
+    out.put("ok", JsonBool(ok))
+    out.put("method", JsonString(method.trimAscii()))
+    out.put("requestId", JsonString(""))
+    if (ok) {
+        out.put("result", result)
+    } else {
+        out.put("error", JsonString(error))
+        out.put("errorCode", JsonString(errorCode))
+        out.put("details", JsonObject())
+    }
+    out
+}
+
+private func gatewayToolConfigValueAtPath(user: GatewayUserSettings, path: String): Option<JsonValue> {
+    let normalized = path.trimAscii().toAsciiLower()
+    if (normalized.isEmpty() || normalized == "gateway") {
+        return Some(user.toJsonValue())
+    }
+    match (normalized) {
+        case "enabled" | "gateway.enabled" => Some(user.enabled.toJsonValue())
+        case "port" | "gateway.port" => Some(user.port.toJsonValue())
+        case "mode" | "gateway.mode" => Some(JsonString(user.mode))
+        case "bind" | "gateway.bind" => Some(JsonString(user.bind))
+        case "custombindhost" | "gateway.custombindhost" => Some(JsonString(user.customBindHost))
+        case "session" | "gateway.session" => Some(user.session.toJsonValue())
+        case "session.dmscope" | "gateway.session.dmscope" => Some(JsonString(user.session.dmScope))
+        case "session.persistenceenabled" | "gateway.session.persistenceenabled" => Some(user.session.persistenceEnabled.toJsonValue())
+        case "feishu" | "gateway.feishu" => Some(user.feishu.toJsonValue())
+        case "qq" | "gateway.qq" => Some(user.qq.toJsonValue())
+        case "telegram" | "gateway.telegram" => Some(user.telegram.toJsonValue())
+        case "tools" | "gateway.tools" => Some(user.tools.toJsonValue())
+        case "gatewayplugins" | "gateway.gatewayplugins" => Some(user.gatewayPlugins.toJsonValue())
+        case "channelmodels" | "gateway.channelmodels" => Some(user.channelModels.toJsonValue())
+        case "tls" | "gateway.tls" => Some(user.tls.toJsonValue())
+        case "discovery" | "gateway.discovery" => Some(user.discovery.toJsonValue())
+        case "controlui" | "gateway.controlui" => Some(user.controlUi.toJsonValue())
+        case "auth" | "gateway.auth" => Some(user.auth.toJsonValue())
+        case "tailscale" | "gateway.tailscale" => Some(user.tailscale.toJsonValue())
+        case "remote" | "gateway.remote" => Some(user.remote.toJsonValue())
+        case "reload" | "gateway.reload" => Some(user.reload.toJsonValue())
+        case "http" | "gateway.http" => Some(user.http.toJsonValue())
+        case "push" | "gateway.push" => Some(user.push.toJsonValue())
+        case "nodes" | "gateway.nodes" => Some(user.nodes.toJsonValue())
+        case "canvas" | "gateway.canvas" => Some(user.canvas.toJsonValue())
+        case "talk" | "gateway.talk" => Some(user.talk.toJsonValue())
+        case "webchat" | "gateway.webchat" => Some(user.webchat.toJsonValue())
+        case "trustedproxies" | "gateway.trustedproxies" => Some(user.trustedProxies.toJsonValue())
+        case "allowrealipfallback" | "gateway.allowrealipfallback" => Some(user.allowRealIpFallback.toJsonValue())
+        case "channelsextra" | "gateway.channelsextra" =>
+            match (user.channelsExtra) {
+                case Some(v) => Some(v)
+                case None => Some(JsonObject())
+            }
+        case _ => None<JsonValue>
+    }
+}
+
+private func gatewayToolSchemaLookup(path: String): String {
+    let normalized = path.trimAscii().toAsciiLower()
+    match (normalized) {
+        case "" | "gateway" =>
+            "gateway: root object. Keys include enabled, port, mode, bind, session, feishu, qq, telegram, discovery, tls, controlUi, auth, remote, reload, http, push, nodes, canvas, talk, tools, gatewayPlugins, channelsExtra."
+        case "enabled" | "gateway.enabled" =>
+            "gateway.enabled: Bool. Master switch for the gateway runtime."
+        case "port" | "gateway.port" =>
+            "gateway.port: Int64. Primary gateway listen port."
+        case "mode" | "gateway.mode" =>
+            "gateway.mode: String. Gateway mode hint."
+        case "bind" | "gateway.bind" =>
+            "gateway.bind: String. Bind policy such as loopback, lan, auto, custom, or tailnet."
+        case "session" | "gateway.session" =>
+            "gateway.session: object. Keys: dmScope (String), persistenceEnabled (Bool)."
+        case "feishu" | "gateway.feishu" =>
+            "gateway.feishu: object. Feishu channel configuration."
+        case "qq" | "gateway.qq" =>
+            "gateway.qq: object. QQ channel configuration."
+        case "telegram" | "gateway.telegram" =>
+            "gateway.telegram: object. Telegram Bot API channel configuration."
+        case "discovery" | "gateway.discovery" =>
+            "gateway.discovery: object. Keys: wideArea, mdns."
+        case "tls" | "gateway.tls" =>
+            "gateway.tls: object. Keys: enabled, autoGenerate, certPath, keyPath, caPath."
+        case "controlui" | "gateway.controlui" =>
+            "gateway.controlUi: object. Control UI config surface."
+        case "auth" | "gateway.auth" =>
+            "gateway.auth: object. Keys: mode, token, password, allowTailscale, rateLimit, trustedProxy."
+        case "http" | "gateway.http" =>
+            "gateway.http: object. HTTP endpoints and security headers."
+        case "gatewayplugins" | "gateway.gatewayplugins" =>
+            "gateway.gatewayPlugins: array<object>. Each item has id and enabled."
+        case _ =>
+            "Unknown gateway config path: ${path.trimAscii()}"
+    }
+}
+
+private func gatewayToolParamPath(params: Option<JsonObject>): String {
+    match (params) {
+        case Some(obj) =>
+            match (obj.get("path")) {
+                case Some(v) =>
+                    let raw = try { v.asString().getValue().trimAscii() } catch (_: Exception) { "gateway" }
+                    if (raw.isEmpty()) { "gateway" } else { raw }
+                case None => "gateway"
+            }
+        case None => "gateway"
+    }
+}
+
+private func gatewayToolInProcessConfigGet(method: String, params: Option<JsonObject>): JsonObject {
+    let path = gatewayToolParamPath(params)
+    match (gatewayToolConfigValueAtPath(CliSettingManager.readGatewaySettings(), path)) {
+        case Some(value) =>
+            let result = JsonObject()
+            result.put("path", JsonString(path))
+            result.put("value", value)
+            gatewayToolRpcEnvelope(method, ok: true, result: result)
+        case None =>
+            gatewayToolRpcEnvelope(method, ok: false, error: "Unknown gateway config path.", errorCode: "unknown_config_path")
+    }
+}
+
+private func gatewayToolInProcessSchemaLookup(method: String, params: Option<JsonObject>): JsonObject {
+    let path = gatewayToolParamPath(params)
+    let result = JsonObject()
+    result.put("path", JsonString(path))
+    result.put("schema", JsonString(gatewayToolSchemaLookup(path)))
+    gatewayToolRpcEnvelope(method, ok: true, result: result)
 }
 
 public func gatewayToolAutoOwnerApprovedForSource(sourceLabel: String): Bool {
@@ -237,6 +374,17 @@ public func gatewayToolAuthorizationFailureJson(
 
 @toolset
 public class GatewayGatewayToolset {
+    public func debugGatewayForTest(action: String, path: Option<String>): String {
+        this.__tool_impl_of_gateway(
+            action,
+            path,
+            None<String>,
+            None<String>,
+            None<Bool>,
+            None<Bool>
+        )
+    }
+
     private func gatewayBinaryCommand(): (String, Option<Path>) {
         match (MetisPaths.projectRoot()) {
             case Some(root) =>
@@ -250,12 +398,51 @@ public class GatewayGatewayToolset {
     }
 
     private func invokeGatewayCall(method: String, params!: Option<JsonObject> = None<JsonObject>): JsonObject {
+        let normalizedMethod = gatewayActionNormalize(method)
+        match (params) {
+            case Some(obj) =>
+                match (gatewayInvokeCurrentToolRuntimeGatewayCall(normalizedMethod, obj)) {
+                    case Some(result) => return result
+                    case None => ()
+                }
+            case None =>
+                match (gatewayInvokeCurrentToolRuntimeGatewayCall(normalizedMethod, JsonObject())) {
+                    case Some(result) => return result
+                    case None => ()
+                }
+        }
+
+        if (normalizedMethod == "config.get") {
+            return gatewayToolInProcessConfigGet(normalizedMethod, params)
+        }
+        if (normalizedMethod == "config.schema.lookup") {
+            return gatewayToolInProcessSchemaLookup(normalizedMethod, params)
+        }
+        if (gatewayActionIsReadOnly(normalizedMethod)) {
+            return gatewayToolRpcEnvelope(
+                normalizedMethod,
+                ok: false,
+                error: "No Gateway runtime hook or in-process reader is available for `${normalizedMethod}`; read-only Gateway tool call failed fast instead of self-calling the Gateway CLI.",
+                errorCode: "gateway_call_unavailable"
+            )
+        }
         let (command, workDir) = this.gatewayBinaryCommand()
         let args = match (params) {
-            case Some(obj) => ["gateway", "call", method, obj.toJsonString()]
-            case None => ["gateway", "call", method]
+            case Some(obj) => ["gateway", "call", normalizedMethod, obj.toJsonString()]
+            case None => ["gateway", "call", normalizedMethod]
         }
-        let (exitCode, stdoutBytes, stderrBytes) = executeWithOutput(command, args, workingDirectory: workDir)
+        let (exitCode, stdoutBytes, stderrBytes) = try {
+            executeWithOutput(command, args, workingDirectory: workDir)
+        } catch (e: Exception) {
+            let err = gatewayToolRpcEnvelope(
+                normalizedMethod,
+                ok: false,
+                error: "Gateway CLI subprocess failed fast: ${e.message}",
+                errorCode: "gateway_call_failed"
+            )
+            err.put("exception", JsonString(e.message))
+            return err
+        }
         let stdout = try { String.fromUtf8(stdoutBytes).trimAscii() } catch (_: Exception) { "" }
         let stderr = try { String.fromUtf8(stderrBytes).trimAscii() } catch (_: Exception) { "" }
         if (!stdout.isEmpty()) {

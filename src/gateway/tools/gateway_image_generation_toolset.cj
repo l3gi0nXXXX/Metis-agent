@@ -3,13 +3,11 @@ package metis.gateway.tools
 import magic.dsl.{tool, toolset}
 import magic.prelude.*
 
-import metis.core.{gatewayCurrentToolRuntimeContext, gatewayImageGenerationGenerate, gatewayImageGenerationResolveConfig, gatewayMarkCurrentToolRuntimeVisibleReplyDelivered, gatewayMessagePayloadPreview, renderGatewayPhotoText}
-import metis.core.config.{CliConfig, CliSettingManager, MetisPaths}
+import metis.core.{gatewayCurrentToolRuntimeContext, gatewayImageGenerationGenerate, gatewayImageGenerationResolveConfig, gatewayInvokeCurrentToolRuntimeGatewayCall, gatewayMarkCurrentToolRuntimeVisibleReplyDelivered, gatewayMessagePayloadPreview, renderGatewayPhotoText}
+import metis.core.config.CliSettingManager
 import metis.io.PrintUtils
 
-import std.fs.{Path, exists}
-import std.process.executeWithOutput
-import stdx.encoding.json.{JsonBool, JsonInt, JsonObject, JsonString, JsonValue}
+import stdx.encoding.json.{JsonBool, JsonInt, JsonObject, JsonString}
 
 private var gatewayImageGenerationToolCallRunnerForTest: Option<(String, JsonObject) -> JsonObject> =
     None<(String, JsonObject) -> JsonObject>
@@ -44,45 +42,20 @@ private func gatewayImageGenerationToolFirstImagePath(result: JsonObject): Strin
     gatewayImageGenerationToolJsonString(image, "path", "")
 }
 
-private func gatewayImageGenerationToolBinaryCommand(): (String, Option<Path>) {
-    match (MetisPaths.projectRoot()) {
-        case Some(root) =>
-            let devBinary = root.join("target").join("release").join("bin").join("metis")
-            if (exists(devBinary)) {
-                return (devBinary.toString(), Some(root))
-            }
-            return ("metis", Some(root))
-        case None => ("metis", None<Path>)
-    }
-}
-
 private func gatewayImageGenerationToolInvokeGatewaySend(payload: JsonObject): JsonObject {
     match (gatewayImageGenerationToolCallRunnerForTest) {
         case Some(runner) => return runner("channels.send", payload)
         case None => ()
     }
-    let (command, workDir) = gatewayImageGenerationToolBinaryCommand()
-    let args = ["gateway", "call", "channels.send", payload.toJsonString()]
-    let (exitCode, stdoutBytes, stderrBytes) = executeWithOutput(command, args, workingDirectory: workDir)
-    let stdout = try { String.fromUtf8(stdoutBytes).trimAscii() } catch (_: Exception) { "" }
-    let stderr = try { String.fromUtf8(stderrBytes).trimAscii() } catch (_: Exception) { "" }
-    if (!stdout.isEmpty()) {
-        try {
-            let obj = JsonValue.fromStr(stdout).asObject()
-            obj.put("exitCode", exitCode.toJsonValue())
-            if (!stderr.isEmpty()) {
-                obj.put("stderr", JsonString(stderr))
-            }
-            return obj
-        } catch (_: Exception) {
-            ()
-        }
+    match (gatewayInvokeCurrentToolRuntimeGatewayCall("channels.send", payload)) {
+        case Some(result) => return result
+        case None => ()
     }
     let out = JsonObject()
-    out.put("ok", JsonBool(exitCode == 0))
-    out.put("exitCode", exitCode.toJsonValue())
-    out.put("stdout", JsonString(stdout))
-    out.put("stderr", JsonString(stderr))
+    out.put("ok", JsonBool(false))
+    out.put("status", JsonString("gateway_call_unavailable"))
+    out.put("method", JsonString("channels.send"))
+    out.put("error", JsonString("Gateway runtime call hook is unavailable; skipped internal CLI/RPC self-call."))
     out
 }
 

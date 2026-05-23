@@ -1,9 +1,14 @@
 package metis.gateway.tools
 
 import metis.core.{GatewayToolRuntimeContext, gatewayActionIsReadOnly, gatewayConfigPathIsProtected, gatewayWithToolRuntimeContext}
+import metis.core.config.{CliConfig, CliSettingManager, MetisConfigManager}
 
+import std.collection.ArrayList
+import std.env.{getVariable, setVariable}
+import std.fs.{Directory, Path, remove}
+import std.time.DateTime
 import std.unittest.testmacro.*
-import stdx.encoding.json.JsonObject
+import stdx.encoding.json.{JsonBool, JsonObject, JsonString, JsonValue}
 
 private func gatewayToolsetTestString(obj: JsonObject, key: String): String {
     match (obj.get(key)) {
@@ -11,6 +16,21 @@ private func gatewayToolsetTestString(obj: JsonObject, key: String): String {
             try { v.asString().getValue() } catch (_: Exception) { "" }
         case None => ""
     }
+}
+
+private func gatewayToolsetTestHome(label: String): String {
+    "/tmp/metis-gateway-gateway-toolset-${label}-${DateTime.now().toUnixTimeStamp().toMilliseconds()}"
+}
+
+private func gatewayToolsetResetEnv(oldHome: Option<String>, home: String): Unit {
+    match (oldHome) {
+        case Some(value) => setVariable("METIS_HOME", value)
+        case None => setVariable("METIS_HOME", "")
+    }
+    MetisConfigManager.invalidate()
+    CliSettingManager.invalidate()
+    CliConfig.invalidatePathCache()
+    try { remove(Path(home), recursive: true) } catch (_: Exception) { () }
 }
 
 @Test
@@ -186,5 +206,98 @@ public class GatewayGatewayToolsetTest {
         )
         @Expect(gatewayToolAutoOwnerApprovedForRuntimeContext(context), true)
         @Expect(gatewayToolAuthorizationFailureJson("restart", ownerApproved: true).isNone(), true)
+    }
+
+    @TestCase
+    public func gatewayToolReadOnlyActionUsesRuntimeHookWhenAvailable(): Unit {
+        let calls = Array<String>(1, repeat: "")
+        let context = GatewayToolRuntimeContext(
+            "telegram",
+            channelName: "telegram",
+            sessionKey: "telegram:direct:user:1",
+            gatewayCallHook: Some({ method: String, params: JsonObject =>
+                calls[0] = "${method}:${gatewayToolsetTestString(params, "path")}"
+                let out = JsonObject()
+                out.put("ok", JsonBool(true))
+                out.put("status", JsonString("ok"))
+                out.put("method", JsonString(method))
+                out.put("path", JsonString(gatewayToolsetTestString(params, "path")))
+                out
+            })
+        )
+
+        let raw = gatewayWithToolRuntimeContext(context, { =>
+            GatewayGatewayToolset().debugGatewayForTest("config.get", Some("gateway.feishu"))
+        })
+        let result = JsonValue.fromStr(raw).asObject()
+
+        @Expect(gatewayToolsetTestString(result, "status"), "ok")
+        @Expect(gatewayToolsetTestString(result, "method"), "config.get")
+        @Expect(gatewayToolsetTestString(result, "path"), "gateway.feishu")
+        @Expect(calls[0], "config.get:gateway.feishu")
+    }
+
+    @TestCase
+    public func gatewayToolConfigGetWithoutRuntimeHookReadsInProcessWithoutExitCode(): Unit {
+        let home = gatewayToolsetTestHome("config-get-in-process")
+        let oldHome = getVariable("METIS_HOME")
+        try { remove(Path(home), recursive: true) } catch (_: Exception) { () }
+        Directory.create(home, recursive: true)
+        setVariable("METIS_HOME", home)
+        MetisConfigManager.invalidate()
+        CliSettingManager.invalidate()
+        CliConfig.invalidatePathCache()
+
+        let root = JsonObject()
+        let gateway = JsonObject()
+        gateway.put("enabled", JsonBool(false))
+        root.put("gateway", gateway)
+        MetisConfigManager.writeRoot(root)
+        CliSettingManager.invalidate()
+
+        try {
+            let raw = GatewayGatewayToolset().debugGatewayForTest("config.get", Some("gateway.enabled"))
+            let result = JsonValue.fromStr(raw).asObject()
+            let resultObj = result.get("result").getOrThrow().asObject()
+
+            @Expect(result.get("ok").getOrThrow().asBool().getValue(), true)
+            @Expect(gatewayToolsetTestString(result, "method"), "config.get")
+            @Expect(gatewayToolsetTestString(resultObj, "path"), "gateway.enabled")
+            @Expect(resultObj.get("value").getOrThrow().asBool().getValue(), false)
+            @Expect(result.get("exitCode").isNone(), true)
+        } finally {
+            gatewayToolsetResetEnv(oldHome, home)
+        }
+    }
+
+    @TestCase
+    public func gatewayToolConfigSchemaLookupWithoutRuntimeHookReadsInProcessWithoutExitCode(): Unit {
+        let raw = GatewayGatewayToolset().debugGatewayForTest("config.schema.lookup", Some("gateway.telegram"))
+        let result = JsonValue.fromStr(raw).asObject()
+        let resultObj = result.get("result").getOrThrow().asObject()
+
+        @Expect(result.get("ok").getOrThrow().asBool().getValue(), true)
+        @Expect(gatewayToolsetTestString(result, "method"), "config.schema.lookup")
+        @Expect(gatewayToolsetTestString(resultObj, "path"), "gateway.telegram")
+        @Expect(gatewayToolsetTestString(resultObj, "schema").contains("Telegram"), true)
+        @Expect(result.get("exitCode").isNone(), true)
+    }
+
+    @TestCase
+    public func gatewayToolReadOnlyStatusFailsFastWhenRuntimeHookMissing(): Unit {
+        let context = GatewayToolRuntimeContext(
+            "telegram",
+            channelName: "telegram",
+            sessionKey: "telegram:direct:user:1"
+        )
+
+        let raw = gatewayWithToolRuntimeContext(context, { =>
+            GatewayGatewayToolset().debugGatewayForTest("status", None<String>)
+        })
+        let result = JsonValue.fromStr(raw).asObject()
+
+        @Expect(result.get("ok").getOrThrow().asBool().getValue(), false)
+        @Expect(gatewayToolsetTestString(result, "errorCode"), "gateway_call_unavailable")
+        @Expect(gatewayToolsetTestString(result, "method"), "status")
     }
 }

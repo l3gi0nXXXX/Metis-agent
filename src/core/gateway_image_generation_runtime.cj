@@ -9,6 +9,7 @@ import std.convert.*
 import std.env.getVariable
 import std.fs.{Directory, File, Path, exists}
 import std.time.*
+import stdx.encoding.base64.toBase64String
 import stdx.encoding.json.{JsonArray, JsonBool, JsonInt, JsonObject, JsonString, JsonValue}
 import stdx.net.http.*
 
@@ -39,6 +40,16 @@ private var imageGenerationOpenAiRunnerOverride: Option<(JsonObject, JsonObject)
     None<(JsonObject, JsonObject) -> GatewayImageGenerationHttpResult>
 private var imageGenerationDashScopeRunnerOverride: Option<(JsonObject, JsonObject) -> GatewayImageGenerationHttpResult> =
     None<(JsonObject, JsonObject) -> GatewayImageGenerationHttpResult>
+private var imageGenerationGoogleRunnerOverride: Option<(JsonObject, JsonObject) -> GatewayImageGenerationHttpResult> =
+    None<(JsonObject, JsonObject) -> GatewayImageGenerationHttpResult>
+private var imageGenerationMiniMaxRunnerOverride: Option<(JsonObject, JsonObject) -> GatewayImageGenerationHttpResult> =
+    None<(JsonObject, JsonObject) -> GatewayImageGenerationHttpResult>
+private var imageGenerationFalRunnerOverride: Option<(JsonObject, JsonObject) -> GatewayImageGenerationHttpResult> =
+    None<(JsonObject, JsonObject) -> GatewayImageGenerationHttpResult>
+private var imageGenerationVydraRunnerOverride: Option<(JsonObject, JsonObject) -> GatewayImageGenerationHttpResult> =
+    None<(JsonObject, JsonObject) -> GatewayImageGenerationHttpResult>
+private var imageGenerationComfyRunnerOverride: Option<(JsonObject, JsonObject) -> GatewayImageGenerationHttpResult> =
+    None<(JsonObject, JsonObject) -> GatewayImageGenerationHttpResult>
 private var imageGenerationDownloaderOverride: Option<(String, Int64, Int64, JsonObject) -> GatewayImageGenerationHttpResult> =
     None<(String, Int64, Int64, JsonObject) -> GatewayImageGenerationHttpResult>
 private var imageGenerationRunnerOverride: Option<(JsonObject, JsonObject) -> JsonObject> =
@@ -50,6 +61,26 @@ public func setGatewayImageGenerationOpenAiRunnerForTest(runner: Option<(JsonObj
 
 public func setGatewayImageGenerationDashScopeRunnerForTest(runner: Option<(JsonObject, JsonObject) -> GatewayImageGenerationHttpResult>): Unit {
     imageGenerationDashScopeRunnerOverride = runner
+}
+
+public func setGatewayImageGenerationGoogleRunnerForTest(runner: Option<(JsonObject, JsonObject) -> GatewayImageGenerationHttpResult>): Unit {
+    imageGenerationGoogleRunnerOverride = runner
+}
+
+public func setGatewayImageGenerationMiniMaxRunnerForTest(runner: Option<(JsonObject, JsonObject) -> GatewayImageGenerationHttpResult>): Unit {
+    imageGenerationMiniMaxRunnerOverride = runner
+}
+
+public func setGatewayImageGenerationFalRunnerForTest(runner: Option<(JsonObject, JsonObject) -> GatewayImageGenerationHttpResult>): Unit {
+    imageGenerationFalRunnerOverride = runner
+}
+
+public func setGatewayImageGenerationVydraRunnerForTest(runner: Option<(JsonObject, JsonObject) -> GatewayImageGenerationHttpResult>): Unit {
+    imageGenerationVydraRunnerOverride = runner
+}
+
+public func setGatewayImageGenerationComfyRunnerForTest(runner: Option<(JsonObject, JsonObject) -> GatewayImageGenerationHttpResult>): Unit {
+    imageGenerationComfyRunnerOverride = runner
 }
 
 public func setGatewayImageGenerationDownloaderForTest(downloader: Option<(String, Int64, Int64, JsonObject) -> GatewayImageGenerationHttpResult>): Unit {
@@ -152,11 +183,26 @@ private func imageGenerationProviderKind(provider: String, providerConfig: JsonO
     let explicit = imageGenerationString(providerConfig, "kind").toAsciiLower()
     match (explicit) {
         case "openai" => "openai-images"
+        case "openai-compatible" => "openai-images"
+        case "openai-compatible-images" => "openai-images"
+        case "openai-qwen-image" => "openai-images"
+        case "qwen-openai-image" => "openai-images"
         case "openai-image-generation" => "openai-images"
         case "openai-images" => "openai-images"
         case "dashscope-qwen-image" => "dashscope-qwen-image-generation"
         case "qwen-image" => "dashscope-qwen-image-generation"
         case "dashscope-qwen-image-generation" => "dashscope-qwen-image-generation"
+        case "google" => "google-gemini-image"
+        case "gemini-image" => "google-gemini-image"
+        case "google-gemini-image" => "google-gemini-image"
+        case "minimax" => "minimax-image"
+        case "minimax-image" => "minimax-image"
+        case "fal" => "fal-image"
+        case "fal-image" => "fal-image"
+        case "vydra" => "vydra-image"
+        case "vydra-image" => "vydra-image"
+        case "comfy" => "comfy-image"
+        case "comfy-image" => "comfy-image"
         case "fake" => "fake-image-generation"
         case "fake-image-generation" => "fake-image-generation"
         case _ => if (!explicit.isEmpty()) { explicit } else { "missing" }
@@ -191,6 +237,33 @@ private func imageGenerationAttachAttempt(result: JsonObject, attempt: JsonObjec
     attempts.add(attempt)
     result.put("attempts", attempts)
     result
+}
+
+private func imageGenerationUrlPath(url: String): String {
+    let withoutQuery = match (url.indexOf("?")) {
+        case Some(i) => url[..i]
+        case None => url
+    }
+    match (withoutQuery.indexOf("://")) {
+        case Some(schemeEnd) =>
+            let hostStart = schemeEnd + 3
+            match (withoutQuery.indexOf("/", hostStart)) {
+                case Some(pathStart) => withoutQuery[pathStart..]
+                case None => "/"
+            }
+        case None => withoutQuery
+    }
+}
+
+private func imageGenerationAttachDiagnostics(result: JsonObject, providerKind: String, submitRequest: JsonObject): Unit {
+    let diagnostics = JsonObject()
+    diagnostics.put("providerKind", JsonString(providerKind))
+    let request = JsonObject()
+    request.put("urlPath", JsonString(imageGenerationUrlPath(imageGenerationString(submitRequest, "url"))))
+    request.put("timeoutMs", JsonInt(imageGenerationInt(submitRequest, "timeoutMs", 0)))
+    diagnostics.put("request", request)
+    diagnostics.put("transportRoute", imageGenerationObject(submitRequest, "transportRoute"))
+    result.put("diagnostics", diagnostics)
 }
 
 public func gatewayImageGenerationResolveOutputRoot(config: JsonObject): Path {
@@ -236,8 +309,108 @@ private func imageGenerationTrimBaseUrl(raw: String, fallback: String): String {
     baseUrl
 }
 
+private func imageGenerationUrlOrigin(raw: String, fallback: String): String {
+    let baseUrl = imageGenerationTrimBaseUrl(raw, fallback)
+    match (baseUrl.indexOf("://")) {
+        case Some(schemeEnd) =>
+            let hostStart = schemeEnd + 3
+            match (baseUrl.indexOf("/", hostStart)) {
+                case Some(pathStart) => baseUrl[..pathStart]
+                case None => baseUrl
+            }
+        case None => imageGenerationTrimBaseUrl(fallback, "")
+    }
+}
+
+private func imageGenerationGoogleBaseUrl(providerConfig: JsonObject): String {
+    let baseUrl = imageGenerationTrimBaseUrl(
+        imageGenerationString(providerConfig, "baseUrl"),
+        "https://generativelanguage.googleapis.com/v1beta"
+    )
+    let lowered = baseUrl.toAsciiLower()
+    if (lowered == "https://generativelanguage.googleapis.com") {
+        return "${baseUrl}/v1beta"
+    }
+    baseUrl
+}
+
 private func imageGenerationOpenAiEndpoint(providerConfig: JsonObject): String {
+    let endpoint = imageGenerationString(providerConfig, "endpoint")
+    if (!endpoint.isEmpty()) {
+        return imageGenerationTrimBaseUrl(endpoint, "")
+    }
     "${imageGenerationTrimBaseUrl(imageGenerationString(providerConfig, "baseUrl"), "https://api.openai.com/v1")}/images/generations"
+}
+
+private func imageGenerationGoogleEndpoint(providerConfig: JsonObject, model: String): String {
+    let endpoint = imageGenerationString(providerConfig, "endpoint")
+    if (!endpoint.isEmpty()) {
+        return imageGenerationTrimBaseUrl(endpoint, "")
+    }
+    "${imageGenerationGoogleBaseUrl(providerConfig)}/models/${model}:generateContent"
+}
+
+private func imageGenerationMiniMaxEndpoint(providerConfig: JsonObject): String {
+    let endpoint = imageGenerationString(providerConfig, "endpoint")
+    if (!endpoint.isEmpty()) {
+        return imageGenerationTrimBaseUrl(endpoint, "")
+    }
+    "${imageGenerationUrlOrigin(imageGenerationString(providerConfig, "baseUrl"), "https://api.minimax.io")}/v1/image_generation"
+}
+
+private func imageGenerationFalEndpoint(providerConfig: JsonObject, model: String): String {
+    let endpoint = imageGenerationString(providerConfig, "endpoint")
+    if (!endpoint.isEmpty()) {
+        return imageGenerationTrimBaseUrl(endpoint, "")
+    }
+    "${imageGenerationTrimBaseUrl(imageGenerationString(providerConfig, "baseUrl"), "https://fal.run")}/${model}"
+}
+
+private func imageGenerationVydraBaseUrl(providerConfig: JsonObject): String {
+    let raw = imageGenerationTrimBaseUrl(imageGenerationString(providerConfig, "baseUrl"), "https://www.vydra.ai/api/v1")
+    let lowered = raw.toAsciiLower()
+    if (lowered == "https://vydra.ai" || lowered == "https://www.vydra.ai") {
+        return "https://www.vydra.ai/api/v1"
+    }
+    raw
+}
+
+private func imageGenerationVydraEndpoint(providerConfig: JsonObject, model: String): String {
+    let endpoint = imageGenerationString(providerConfig, "endpoint")
+    if (!endpoint.isEmpty()) {
+        return imageGenerationTrimBaseUrl(endpoint, "")
+    }
+    "${imageGenerationVydraBaseUrl(providerConfig)}/models/${model}"
+}
+
+private func imageGenerationComfyBaseUrl(providerConfig: JsonObject): String {
+    let mode = imageGenerationString(providerConfig, "mode").toAsciiLower()
+    let fallback = if (mode == "cloud") { "https://cloud.comfy.org" } else { "http://127.0.0.1:8188" }
+    imageGenerationTrimBaseUrl(imageGenerationString(providerConfig, "baseUrl"), fallback)
+}
+
+private func imageGenerationComfySubmitEndpoint(providerConfig: JsonObject): String {
+    let endpoint = imageGenerationString(providerConfig, "endpoint")
+    if (!endpoint.isEmpty()) {
+        return imageGenerationTrimBaseUrl(endpoint, "")
+    }
+    let mode = imageGenerationString(providerConfig, "mode").toAsciiLower()
+    if (mode == "cloud") {
+        return "${imageGenerationComfyBaseUrl(providerConfig)}/api/prompt"
+    }
+    "${imageGenerationComfyBaseUrl(providerConfig)}/prompt"
+}
+
+private func imageGenerationComfyPollEndpoint(providerConfig: JsonObject, promptId: String): String {
+    let pollEndpoint = imageGenerationString(providerConfig, "pollEndpoint")
+    if (!pollEndpoint.isEmpty()) {
+        return imageGenerationTrimBaseUrl(pollEndpoint, "")
+    }
+    let mode = imageGenerationString(providerConfig, "mode").toAsciiLower()
+    if (mode == "cloud") {
+        return "${imageGenerationComfyBaseUrl(providerConfig)}/api/job/${promptId}/status"
+    }
+    "${imageGenerationComfyBaseUrl(providerConfig)}/history/${promptId}"
 }
 
 private func imageGenerationDashScopeEndpoint(providerConfig: JsonObject): String {
@@ -297,6 +470,206 @@ private func imageGenerationOpenAiRequest(providerConfig: JsonObject, request: J
     req.put("authorization", JsonString("Bearer ${imageGenerationSecretString(providerConfig, "apiKey")}"))
     req.put("timeoutMs", JsonInt(timeoutMs))
     req.put("body", imageGenerationOpenAiBody(providerConfig, request))
+    imageGenerationAttachTransportRoute(req, providerConfig)
+    req
+}
+
+private func imageGenerationGoogleBody(config: JsonObject, request: JsonObject): JsonObject {
+    let parts = JsonArray([])
+    let ref = imageGenerationReferenceImageBase64(config, request, true)
+    if (!ref[0].isEmpty()) {
+        let inlineData = JsonObject()
+        inlineData.put("mimeType", JsonString(ref[1]))
+        inlineData.put("data", JsonString(ref[0]))
+        let imagePart = JsonObject()
+        imagePart.put("inlineData", inlineData)
+        parts.add(imagePart)
+    }
+    let text = JsonObject()
+    text.put("text", JsonString(imageGenerationString(request, "prompt")))
+    parts.add(text)
+    let content = JsonObject()
+    content.put("role", JsonString("user"))
+    content.put("parts", parts)
+    let contents = JsonArray([])
+    contents.add(content)
+    let body = JsonObject()
+    body.put("contents", contents)
+    let generationConfig = JsonObject()
+    generationConfig.put("responseModalities", JsonArray([JsonString("TEXT"), JsonString("IMAGE")]))
+    let aspectRatio = imageGenerationString(request, "aspectRatio")
+    if (!aspectRatio.isEmpty()) {
+        let imageConfig = JsonObject()
+        imageConfig.put("aspectRatio", JsonString(aspectRatio))
+        generationConfig.put("imageConfig", imageConfig)
+    }
+    body.put("generationConfig", generationConfig)
+    body
+}
+
+private func imageGenerationGoogleRequest(config: JsonObject, providerConfig: JsonObject, request: JsonObject, timeoutMs: Int64): JsonObject {
+    let modelOverride = imageGenerationString(request, "model")
+    let model = if (!modelOverride.isEmpty()) {
+        modelOverride
+    } else {
+        let configured = imageGenerationString(providerConfig, "model")
+        if (configured.isEmpty()) { "gemini-3.1-flash-image-preview" } else { configured }
+    }
+    let req = JsonObject()
+    req.put("url", JsonString(imageGenerationGoogleEndpoint(providerConfig, model)))
+    req.put("authorization", JsonString("Bearer ${imageGenerationSecretString(providerConfig, "apiKey")}"))
+    req.put("timeoutMs", JsonInt(timeoutMs))
+    req.put("body", imageGenerationGoogleBody(config, request))
+    req.put("model", JsonString(model))
+    imageGenerationAttachTransportRoute(req, providerConfig)
+    req
+}
+
+private func imageGenerationMiniMaxBody(config: JsonObject, providerConfig: JsonObject, request: JsonObject): JsonObject {
+    let body = JsonObject()
+    let modelOverride = imageGenerationString(request, "model")
+    let model = if (!modelOverride.isEmpty()) {
+        modelOverride
+    } else {
+        let configured = imageGenerationString(providerConfig, "model")
+        if (configured.isEmpty()) { "image-01" } else { configured }
+    }
+    body.put("model", JsonString(model))
+    body.put("prompt", JsonString(imageGenerationString(request, "prompt")))
+    body.put("response_format", JsonString("base64"))
+    body.put("n", JsonInt(imageGenerationInt(request, "count", 1)))
+    let aspectRatio = imageGenerationString(request, "aspectRatio")
+    if (!aspectRatio.isEmpty()) {
+        body.put("aspect_ratio", JsonString(aspectRatio))
+    }
+    let ref = imageGenerationReferenceImageBase64(config, request, true)
+    if (!ref[0].isEmpty()) {
+        let subject = JsonObject()
+        subject.put("type", JsonString("base64"))
+        subject.put("image_base64", JsonString(ref[0]))
+        subject.put("mime_type", JsonString(ref[1]))
+        let refs = JsonArray([])
+        refs.add(subject)
+        body.put("subject_reference", refs)
+    }
+    body
+}
+
+private func imageGenerationMiniMaxRequest(config: JsonObject, providerConfig: JsonObject, request: JsonObject, timeoutMs: Int64): JsonObject {
+    let req = JsonObject()
+    req.put("url", JsonString(imageGenerationMiniMaxEndpoint(providerConfig)))
+    req.put("authorization", JsonString("Bearer ${imageGenerationSecretString(providerConfig, "apiKey")}"))
+    req.put("timeoutMs", JsonInt(timeoutMs))
+    req.put("body", imageGenerationMiniMaxBody(config, providerConfig, request))
+    imageGenerationAttachTransportRoute(req, providerConfig)
+    req
+}
+
+private func imageGenerationFalBody(config: JsonObject, request: JsonObject): JsonObject {
+    let body = JsonObject()
+    body.put("prompt", JsonString(imageGenerationString(request, "prompt")))
+    body.put("num_images", JsonInt(imageGenerationInt(request, "count", 1)))
+    body.put("output_format", JsonString("png"))
+    let size = imageGenerationString(request, "size")
+    if (!size.isEmpty()) {
+        body.put("image_size", JsonString(size))
+    }
+    let ref = imageGenerationReferenceImageDataUrl(config, request, true)
+    if (!ref.isEmpty()) {
+        body.put("image_url", JsonString(ref))
+    }
+    body
+}
+
+private func imageGenerationFalEditModel(model: String, request: JsonObject): String {
+    if (imageGenerationString(request, "referenceImage").isEmpty()) {
+        return model
+    }
+    if (model.contains("image-to-image")) {
+        return model
+    }
+    "${model}/image-to-image"
+}
+
+private func imageGenerationFalRequest(config: JsonObject, providerConfig: JsonObject, request: JsonObject, timeoutMs: Int64): JsonObject {
+    let modelOverride = imageGenerationString(request, "model")
+    let configuredModel = if (!modelOverride.isEmpty()) {
+        modelOverride
+    } else {
+        let configured = imageGenerationString(providerConfig, "model")
+        if (configured.isEmpty()) { "fal-ai/flux/dev" } else { configured }
+    }
+    let model = imageGenerationFalEditModel(configuredModel, request)
+    let req = JsonObject()
+    req.put("url", JsonString(imageGenerationFalEndpoint(providerConfig, model)))
+    req.put("authorization", JsonString("Key ${imageGenerationSecretString(providerConfig, "apiKey")}"))
+    req.put("timeoutMs", JsonInt(timeoutMs))
+    req.put("body", imageGenerationFalBody(config, request))
+    req.put("model", JsonString(model))
+    imageGenerationAttachTransportRoute(req, providerConfig)
+    req
+}
+
+private func imageGenerationVydraRequest(providerConfig: JsonObject, request: JsonObject, timeoutMs: Int64): JsonObject {
+    let modelOverride = imageGenerationString(request, "model")
+    let model = if (!modelOverride.isEmpty()) {
+        modelOverride
+    } else {
+        let configured = imageGenerationString(providerConfig, "model")
+        if (configured.isEmpty()) { "grok-imagine" } else { configured }
+    }
+    let body = JsonObject()
+    body.put("prompt", JsonString(imageGenerationString(request, "prompt")))
+    body.put("model", JsonString("text-to-image"))
+    let req = JsonObject()
+    req.put("url", JsonString(imageGenerationVydraEndpoint(providerConfig, model)))
+    req.put("authorization", JsonString("Bearer ${imageGenerationSecretString(providerConfig, "apiKey")}"))
+    req.put("timeoutMs", JsonInt(timeoutMs))
+    req.put("body", body)
+    req.put("model", JsonString(model))
+    imageGenerationAttachTransportRoute(req, providerConfig)
+    req
+}
+
+private func imageGenerationComfyWorkflow(providerConfig: JsonObject): JsonObject {
+    match (providerConfig.get("workflow")) {
+        case Some(value) =>
+            try { return value.asObject() } catch (_: Exception) { () }
+        case None => ()
+    }
+    let workflowPath = imageGenerationString(providerConfig, "workflowPath")
+    if (!workflowPath.isEmpty()) {
+        return JsonValue.fromStr(String.fromUtf8(File.readFrom(Path(workflowPath)))).asObject()
+    }
+    JsonObject()
+}
+
+private func imageGenerationComfyRequest(providerConfig: JsonObject, request: JsonObject, timeoutMs: Int64): JsonObject {
+    let workflow = imageGenerationComfyWorkflow(providerConfig)
+    if (workflow.size() == 0) {
+        throw ImageGenerationException("not_configured", "Configured Comfy image generation provider requires workflow or workflowPath.")
+    }
+    let promptNodeId = imageGenerationString(providerConfig, "promptNodeId")
+    if (promptNodeId.isEmpty()) {
+        throw ImageGenerationException("not_configured", "Configured Comfy image generation provider requires promptNodeId.")
+    }
+    let body = JsonObject()
+    body.put("prompt", workflow)
+    body.put("promptText", JsonString(imageGenerationString(request, "prompt")))
+    body.put("promptNodeId", JsonString(promptNodeId))
+    let clientId = imageGenerationString(providerConfig, "clientId")
+    if (!clientId.isEmpty()) {
+        body.put("client_id", JsonString(clientId))
+    }
+    let req = JsonObject()
+    req.put("url", JsonString(imageGenerationComfySubmitEndpoint(providerConfig)))
+    let apiKey = imageGenerationSecretString(providerConfig, "apiKey")
+    if (!apiKey.isEmpty()) {
+        req.put("authorization", JsonString("Bearer ${apiKey}"))
+    }
+    req.put("timeoutMs", JsonInt(timeoutMs))
+    req.put("body", body)
+    req.put("model", JsonString(imageGenerationString(providerConfig, "model")))
     imageGenerationAttachTransportRoute(req, providerConfig)
     req
 }
@@ -388,7 +761,12 @@ private func imageGenerationNativeSend(request: JsonObject, providerConfig: Json
     let clientParts = buildGatewayProviderHttpClientBuilder(url, resolveGatewayProviderHttpTransportConfig(providerConfig))
     let client = clientParts[0].build()
     try {
-        let reqBuilder = HttpRequestBuilder().url(url).post().body(imageGenerationObject(request, "body").toJsonString())
+        let method = imageGenerationString(request, "method").toAsciiUpper()
+        let reqBuilder = if (method == "GET") {
+            HttpRequestBuilder().url(url).get()
+        } else {
+            HttpRequestBuilder().url(url).post().body(imageGenerationObject(request, "body").toJsonString())
+        }
         for ((key, value) in headers) {
             if (!value.isEmpty()) {
                 reqBuilder.header(key, value)
@@ -411,6 +789,41 @@ private func imageGenerationOpenAiSubmit(request: JsonObject, providerConfig: Js
 
 private func imageGenerationDashScopeSubmit(request: JsonObject, providerConfig: JsonObject): GatewayImageGenerationHttpResult {
     match (imageGenerationDashScopeRunnerOverride) {
+        case Some(runner) => runner(request, providerConfig)
+        case None => imageGenerationNativeSend(request, providerConfig)
+    }
+}
+
+private func imageGenerationGoogleSubmit(request: JsonObject, providerConfig: JsonObject): GatewayImageGenerationHttpResult {
+    match (imageGenerationGoogleRunnerOverride) {
+        case Some(runner) => runner(request, providerConfig)
+        case None => imageGenerationNativeSend(request, providerConfig)
+    }
+}
+
+private func imageGenerationMiniMaxSubmit(request: JsonObject, providerConfig: JsonObject): GatewayImageGenerationHttpResult {
+    match (imageGenerationMiniMaxRunnerOverride) {
+        case Some(runner) => runner(request, providerConfig)
+        case None => imageGenerationNativeSend(request, providerConfig)
+    }
+}
+
+private func imageGenerationFalSubmit(request: JsonObject, providerConfig: JsonObject): GatewayImageGenerationHttpResult {
+    match (imageGenerationFalRunnerOverride) {
+        case Some(runner) => runner(request, providerConfig)
+        case None => imageGenerationNativeSend(request, providerConfig)
+    }
+}
+
+private func imageGenerationVydraSubmit(request: JsonObject, providerConfig: JsonObject): GatewayImageGenerationHttpResult {
+    match (imageGenerationVydraRunnerOverride) {
+        case Some(runner) => runner(request, providerConfig)
+        case None => imageGenerationNativeSend(request, providerConfig)
+    }
+}
+
+private func imageGenerationComfySubmit(request: JsonObject, providerConfig: JsonObject): GatewayImageGenerationHttpResult {
+    match (imageGenerationComfyRunnerOverride) {
         case Some(runner) => runner(request, providerConfig)
         case None => imageGenerationNativeSend(request, providerConfig)
     }
@@ -568,6 +981,54 @@ private func imageGenerationMimeFromExtension(extension: String, contentType: St
     }
 }
 
+private func imageGenerationMimeFromPath(path: Path): String {
+    let lower = path.toString().toAsciiLower()
+    if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) {
+        return "image/jpeg"
+    }
+    if (lower.endsWith(".webp")) {
+        return "image/webp"
+    }
+    if (lower.endsWith(".gif")) {
+        return "image/gif"
+    }
+    "image/png"
+}
+
+private func imageGenerationReferenceImagePath(config: JsonObject, request: JsonObject, providerSupportsEdit: Bool): Option<Path> {
+    let ref = imageGenerationString(request, "referenceImage")
+    if (ref.isEmpty()) {
+        return None<Path>
+    }
+    if (!providerSupportsEdit) {
+        throw ImageGenerationException("provider_unsupported", "referenceImage was provided but the configured provider does not support image editing.")
+    }
+    let path = Path(ref)
+    if (!exists(path)) {
+        throw ImageGenerationException("invalid_request", "referenceImage does not exist.")
+    }
+    if (!imageGenerationPathAllowed(path, config)) {
+        throw ImageGenerationException("write_denied", "referenceImage must be under an allowed Metis media/output root.")
+    }
+    Some(path)
+}
+
+private func imageGenerationReferenceImageDataUrl(config: JsonObject, request: JsonObject, providerSupportsEdit: Bool): String {
+    match (imageGenerationReferenceImagePath(config, request, providerSupportsEdit)) {
+        case Some(path) =>
+            let mimeType = imageGenerationMimeFromPath(path)
+            "data:${mimeType};base64,${toBase64String(File.readFrom(path))}"
+        case None => ""
+    }
+}
+
+private func imageGenerationReferenceImageBase64(config: JsonObject, request: JsonObject, providerSupportsEdit: Bool): (String, String) {
+    match (imageGenerationReferenceImagePath(config, request, providerSupportsEdit)) {
+        case Some(path) => (toBase64String(File.readFrom(path)), imageGenerationMimeFromPath(path))
+        case None => ("", "")
+    }
+}
+
 private func imageGenerationSanitizeFileName(raw: String, extension: String, index: Int64): String {
     var name = raw.trimAscii()
     if (name.isEmpty()) {
@@ -719,20 +1180,262 @@ private func imageGenerationImagesFromDashScopeResponse(bytes: Array<Byte>, prov
     images
 }
 
-private func imageGenerationValidateReferenceImage(config: JsonObject, providerConfig: JsonObject, request: JsonObject): Unit {
-    let ref = imageGenerationString(request, "referenceImage")
-    if (ref.isEmpty()) {
-        return
+private func imageGenerationAddInlineImage(images: JsonArray, outputRoot: Path, request: JsonObject, data: String, mimeType: String, index: Int64): Bool {
+    let imageBytes = imageGenerationDecodeBase64(data)
+    if (imageBytes.isEmpty()) {
+        return false
     }
-    if (!imageGenerationBool(providerConfig, "supportsEdit", false)) {
-        throw ImageGenerationException("provider_unsupported", "referenceImage was provided but the configured provider does not support image editing.")
+    let extension = imageGenerationExtensionFromMimeOrUrl(mimeType, "")
+    let fileName = imageGenerationSanitizeFileName(imageGenerationString(request, "filename"), extension, index)
+    images.add(imageGenerationWriteAsset(outputRoot, fileName, imageBytes, imageGenerationMimeFromExtension(extension, mimeType)))
+    true
+}
+
+private func imageGenerationImagesFromGoogleResponse(bytes: Array<Byte>, _providerConfig: JsonObject, request: JsonObject, outputRoot: Path): JsonArray {
+    let raw = String.fromUtf8(bytes).trimAscii()
+    let root = JsonValue.fromStr(raw).asObject()
+    let candidates = match (root.get("candidates")) {
+        case Some(v) => try { v.asArray() } catch (_: Exception) { JsonArray([]) }
+        case None => JsonArray([])
     }
-    let path = Path(ref)
-    if (!exists(path)) {
-        throw ImageGenerationException("invalid_request", "referenceImage does not exist.")
+    let images = JsonArray([])
+    var index: Int64 = 0
+    for (candidate in candidates.getItems()) {
+        let candidateObj = try { candidate.asObject() } catch (_: Exception) { continue }
+        let content = imageGenerationObject(candidateObj, "content")
+        let parts = match (content.get("parts")) {
+            case Some(v) => try { v.asArray() } catch (_: Exception) { JsonArray([]) }
+            case None => JsonArray([])
+        }
+        for (partValue in parts.getItems()) {
+            let part = try { partValue.asObject() } catch (_: Exception) { continue }
+            var inline = imageGenerationObject(part, "inlineData")
+            if (inline.size() == 0) {
+                inline = imageGenerationObject(part, "inline_data")
+            }
+            let data = imageGenerationString(inline, "data")
+            if (data.isEmpty()) {
+                continue
+            }
+            var mimeType = imageGenerationString(inline, "mimeType")
+            if (mimeType.isEmpty()) {
+                mimeType = imageGenerationString(inline, "mime_type")
+            }
+            if (mimeType.isEmpty()) {
+                mimeType = "image/png"
+            }
+            if (imageGenerationAddInlineImage(images, outputRoot, request, data, mimeType, index)) {
+                index += 1
+            }
+        }
     }
-    if (!imageGenerationPathAllowed(path, config)) {
-        throw ImageGenerationException("write_denied", "referenceImage must be under an allowed Metis media/output root.")
+    images
+}
+
+private func imageGenerationImagesFromMiniMaxResponse(bytes: Array<Byte>, _providerConfig: JsonObject, request: JsonObject, outputRoot: Path): JsonArray {
+    let raw = String.fromUtf8(bytes).trimAscii()
+    let root = JsonValue.fromStr(raw).asObject()
+    let baseResp = imageGenerationObject(root, "base_resp")
+    let statusCode = imageGenerationInt(baseResp, "status_code", 0)
+    if (statusCode != 0) {
+        let statusMsg = imageGenerationString(baseResp, "status_msg")
+        throw ImageGenerationException("provider_error", "MiniMax image generation API error (${statusCode}): ${statusMsg}")
+    }
+    let dataObj = imageGenerationObject(root, "data")
+    let values = match (dataObj.get("image_base64")) {
+        case Some(v) => try { v.asArray() } catch (_: Exception) { JsonArray([]) }
+        case None => JsonArray([])
+    }
+    let images = JsonArray([])
+    var index: Int64 = 0
+    for (item in values.getItems()) {
+        let data = try { item.asString().getValue().trimAscii() } catch (_: Exception) { "" }
+        if (imageGenerationAddInlineImage(images, outputRoot, request, data, "image/png", index)) {
+            index += 1
+        }
+    }
+    images
+}
+
+private func imageGenerationFalImageUrls(bytes: Array<Byte>): Array<String> {
+    let raw = String.fromUtf8(bytes).trimAscii()
+    let root = JsonValue.fromStr(raw).asObject()
+    let urls = ArrayList<String>()
+    let images = match (root.get("images")) {
+        case Some(v) => try { v.asArray() } catch (_: Exception) { JsonArray([]) }
+        case None => JsonArray([])
+    }
+    for (item in images.getItems()) {
+        let entry = try { item.asObject() } catch (_: Exception) { continue }
+        imageGenerationAddDashScopeImageUrl(urls, imageGenerationFirstString(entry, ["url", "image_url", "imageUrl"]))
+    }
+    urls.toArray()
+}
+
+private func imageGenerationImagesFromUrlList(urls: Array<String>, providerConfig: JsonObject, request: JsonObject, outputRoot: Path, context: String): JsonArray {
+    let images = JsonArray([])
+    let timeoutMs = max(1, imageGenerationInt(providerConfig, "timeoutMs", 120000))
+    let maxImageBytes = max(1, imageGenerationInt(providerConfig, "maxImageBytes", 25 * 1024 * 1024))
+    var index: Int64 = 0
+    for (sourceUrl in urls) {
+        let download = imageGenerationDownload(sourceUrl, timeoutMs, maxImageBytes, providerConfig)
+        imageGenerationEnsureSuccess(download, providerConfig, context)
+        let extension = imageGenerationExtensionFromMimeOrUrl(download.contentType, sourceUrl)
+        let mimeType = imageGenerationMimeFromExtension(extension, download.contentType)
+        let fileName = imageGenerationSanitizeFileName(imageGenerationString(request, "filename"), extension, index)
+        images.add(imageGenerationWriteAsset(outputRoot, fileName, download.bodyBytes, mimeType))
+        index += 1
+    }
+    images
+}
+
+private func imageGenerationVydraImageUrls(bytes: Array<Byte>): Array<String> {
+    let raw = String.fromUtf8(bytes).trimAscii()
+    let root = JsonValue.fromStr(raw).asObject()
+    let urls = ArrayList<String>()
+    imageGenerationAddDashScopeImageUrl(urls, imageGenerationFirstString(root, ["imageUrl", "image_url", "resultUrl", "result_url", "url"]))
+    let dataObj = imageGenerationObject(root, "data")
+    imageGenerationAddDashScopeImageUrl(urls, imageGenerationFirstString(dataObj, ["imageUrl", "image_url", "resultUrl", "result_url", "url"]))
+    urls.toArray()
+}
+
+private func imageGenerationVydraJobId(bytes: Array<Byte>): String {
+    let raw = String.fromUtf8(bytes).trimAscii()
+    let root = JsonValue.fromStr(raw).asObject()
+    let direct = imageGenerationFirstString(root, ["jobId", "job_id", "id", "taskId", "task_id"])
+    if (!direct.isEmpty()) {
+        return direct
+    }
+    imageGenerationFirstString(imageGenerationObject(root, "data"), ["jobId", "job_id", "id", "taskId", "task_id"])
+}
+
+private func imageGenerationVydraFailureMessage(bytes: Array<Byte>): String {
+    let raw = String.fromUtf8(bytes).trimAscii()
+    let root = JsonValue.fromStr(raw).asObject()
+    let status = imageGenerationFirstString(root, ["status", "state"]).toAsciiLower()
+    if (status == "failed" || status == "error" || status == "cancelled" || status == "canceled") {
+        let message = imageGenerationFirstString(root, ["error", "message", "status_msg", "statusMessage"])
+        return if (message.isEmpty()) { "Vydra image generation job ${status}." } else { "Vydra image generation job ${status}: ${message}" }
+    }
+    let data = imageGenerationObject(root, "data")
+    let dataStatus = imageGenerationFirstString(data, ["status", "state"]).toAsciiLower()
+    if (dataStatus == "failed" || dataStatus == "error" || dataStatus == "cancelled" || dataStatus == "canceled") {
+        let message = imageGenerationFirstString(data, ["error", "message", "status_msg", "statusMessage"])
+        return if (message.isEmpty()) { "Vydra image generation job ${dataStatus}." } else { "Vydra image generation job ${dataStatus}: ${message}" }
+    }
+    ""
+}
+
+private func imageGenerationVydraPollRequest(providerConfig: JsonObject, jobId: String, timeoutMs: Int64): JsonObject {
+    let req = JsonObject()
+    req.put("url", JsonString("${imageGenerationVydraBaseUrl(providerConfig)}/jobs/${jobId}"))
+    req.put("method", JsonString("GET"))
+    req.put("authorization", JsonString("Bearer ${imageGenerationSecretString(providerConfig, "apiKey")}"))
+    req.put("timeoutMs", JsonInt(timeoutMs))
+    imageGenerationAttachTransportRoute(req, providerConfig)
+    req
+}
+
+private func imageGenerationVydraPollUrls(jobId: String, providerConfig: JsonObject, timeoutMs: Int64): Array<String> {
+    let maxPolls = max(1, imageGenerationInt(providerConfig, "pollMaxAttempts", 20))
+    let pollIntervalMs = max(0, imageGenerationInt(providerConfig, "pollIntervalMs", 1000))
+    for (i in 0..maxPolls) {
+        if (i > 0 && pollIntervalMs > 0) {
+            sleep(Duration.millisecond * pollIntervalMs)
+        }
+        let pollRequest = imageGenerationVydraPollRequest(providerConfig, jobId, timeoutMs)
+        let pollResult = imageGenerationVydraSubmit(pollRequest, providerConfig)
+        imageGenerationEnsureSuccess(pollResult, providerConfig, "Vydra image generation poll")
+        let failure = imageGenerationVydraFailureMessage(pollResult.bodyBytes)
+        if (!failure.isEmpty()) {
+            throw ImageGenerationException("provider_error", failure)
+        }
+        let urls = imageGenerationVydraImageUrls(pollResult.bodyBytes)
+        if (urls.size > 0) {
+            return urls
+        }
+    }
+    throw ImageGenerationException("timeout", "Vydra image generation job timed out before an image URL was available.")
+}
+
+private func imageGenerationComfyPromptId(bytes: Array<Byte>): String {
+    let raw = String.fromUtf8(bytes).trimAscii()
+    let root = JsonValue.fromStr(raw).asObject()
+    imageGenerationFirstString(root, ["prompt_id", "promptId", "jobId", "job_id", "id"])
+}
+
+private func imageGenerationComfyFailureMessage(bytes: Array<Byte>): String {
+    let raw = String.fromUtf8(bytes).trimAscii()
+    let root = JsonValue.fromStr(raw).asObject()
+    let statusObj = imageGenerationObject(root, "status")
+    var status = imageGenerationFirstString(root, ["status", "state"]).toAsciiLower()
+    if (status.isEmpty()) {
+        status = imageGenerationFirstString(statusObj, ["status_str", "status", "state"]).toAsciiLower()
+    }
+    if (status == "failed" || status == "error" || status == "cancelled" || status == "canceled") {
+        let message = imageGenerationFirstString(root, ["error", "message"])
+        return if (message.isEmpty()) { "Comfy image generation job ${status}." } else { "Comfy image generation job ${status}: ${message}" }
+    }
+    ""
+}
+
+private func imageGenerationComfyImageUrls(bytes: Array<Byte>): Array<String> {
+    let raw = String.fromUtf8(bytes).trimAscii()
+    let root = JsonValue.fromStr(raw).asObject()
+    let urls = ArrayList<String>()
+    imageGenerationAddDashScopeImageUrl(urls, imageGenerationFirstString(root, ["imageUrl", "image_url", "resultUrl", "result_url", "url"]))
+    let images = match (root.get("images")) {
+        case Some(v) => try { v.asArray() } catch (_: Exception) { JsonArray([]) }
+        case None => JsonArray([])
+    }
+    for (item in images.getItems()) {
+        let entry = try { item.asObject() } catch (_: Exception) { continue }
+        imageGenerationAddDashScopeImageUrl(urls, imageGenerationFirstString(entry, ["url", "image_url", "imageUrl"]))
+    }
+    let dataObj = imageGenerationObject(root, "data")
+    imageGenerationAddDashScopeImageUrl(urls, imageGenerationFirstString(dataObj, ["imageUrl", "image_url", "resultUrl", "result_url", "url"]))
+    urls.toArray()
+}
+
+private func imageGenerationComfyPollRequest(providerConfig: JsonObject, promptId: String, timeoutMs: Int64): JsonObject {
+    let req = JsonObject()
+    req.put("url", JsonString(imageGenerationComfyPollEndpoint(providerConfig, promptId)))
+    req.put("method", JsonString("GET"))
+    let apiKey = imageGenerationSecretString(providerConfig, "apiKey")
+    if (!apiKey.isEmpty()) {
+        req.put("authorization", JsonString("Bearer ${apiKey}"))
+    }
+    req.put("timeoutMs", JsonInt(timeoutMs))
+    imageGenerationAttachTransportRoute(req, providerConfig)
+    req
+}
+
+private func imageGenerationComfyPollUrls(promptId: String, providerConfig: JsonObject, timeoutMs: Int64): Array<String> {
+    let maxPolls = max(1, imageGenerationInt(providerConfig, "pollMaxAttempts", 20))
+    let pollIntervalMs = max(0, imageGenerationInt(providerConfig, "pollIntervalMs", 1000))
+    for (i in 0..maxPolls) {
+        if (i > 0 && pollIntervalMs > 0) {
+            sleep(Duration.millisecond * pollIntervalMs)
+        }
+        let pollRequest = imageGenerationComfyPollRequest(providerConfig, promptId, timeoutMs)
+        let pollResult = imageGenerationComfySubmit(pollRequest, providerConfig)
+        imageGenerationEnsureSuccess(pollResult, providerConfig, "Comfy image generation poll")
+        let failure = imageGenerationComfyFailureMessage(pollResult.bodyBytes)
+        if (!failure.isEmpty()) {
+            throw ImageGenerationException("provider_error", failure)
+        }
+        let urls = imageGenerationComfyImageUrls(pollResult.bodyBytes)
+        if (urls.size > 0) {
+            return urls
+        }
+    }
+    throw ImageGenerationException("timeout", "Comfy image generation job timed out before an image URL was available.")
+}
+
+private func imageGenerationValidateReferenceImage(config: JsonObject, request: JsonObject, providerSupportsEdit: Bool): Unit {
+    match (imageGenerationReferenceImagePath(config, request, providerSupportsEdit)) {
+        case Some(_) => ()
+        case None => ()
     }
 }
 
@@ -746,7 +1449,7 @@ private func imageGenerationDashScopeGenerate(config: JsonObject, request: JsonO
         if (!routeError.isEmpty()) {
             throw ImageGenerationException("provider_error", routeError)
         }
-        imageGenerationValidateReferenceImage(config, providerConfig, request)
+        imageGenerationValidateReferenceImage(config, request, false)
         if (!imageGenerationString(request, "referenceImage").isEmpty()) {
             throw ImageGenerationException("provider_unsupported", "referenceImage editing is not implemented for dashscope-qwen-image-generation provider.")
         }
@@ -767,6 +1470,7 @@ private func imageGenerationDashScopeGenerate(config: JsonObject, request: JsonO
         out.put("provider", JsonString(provider))
         out.put("providerKind", JsonString(providerKind))
         out.put("model", JsonString(model))
+        imageGenerationAttachDiagnostics(out, providerKind, submitRequest)
         imageGenerationAttachAttempt(out, imageGenerationAttempt(provider, providerKind, e.status, imageGenerationRedact(e.message, providerConfig)))
     } catch (e: Exception) {
         let status = if (e.message.toAsciiLower().contains("timeout")) { "timeout" } else { "provider_error" }
@@ -774,6 +1478,7 @@ private func imageGenerationDashScopeGenerate(config: JsonObject, request: JsonO
         out.put("provider", JsonString(provider))
         out.put("providerKind", JsonString(providerKind))
         out.put("model", JsonString(model))
+        imageGenerationAttachDiagnostics(out, providerKind, submitRequest)
         imageGenerationAttachAttempt(out, imageGenerationAttempt(provider, providerKind, status, imageGenerationRedact(e.message, providerConfig)))
     }
 }
@@ -788,9 +1493,9 @@ private func imageGenerationOpenAiGenerate(config: JsonObject, request: JsonObje
         if (!routeError.isEmpty()) {
             throw ImageGenerationException("provider_error", routeError)
         }
-        imageGenerationValidateReferenceImage(config, providerConfig, request)
+        imageGenerationValidateReferenceImage(config, request, false)
         if (!imageGenerationString(request, "referenceImage").isEmpty()) {
-            throw ImageGenerationException("provider_unsupported", "referenceImage editing is not implemented for openai-images provider.")
+            throw ImageGenerationException("provider_unsupported", "referenceImage editing is not implemented for ${providerKind} provider.")
         }
         let submitResult = imageGenerationOpenAiSubmit(submitRequest, providerConfig)
         imageGenerationEnsureSuccess(submitResult, providerConfig, "OpenAI image generation")
@@ -809,6 +1514,7 @@ private func imageGenerationOpenAiGenerate(config: JsonObject, request: JsonObje
         out.put("provider", JsonString(provider))
         out.put("providerKind", JsonString(providerKind))
         out.put("model", JsonString(model))
+        imageGenerationAttachDiagnostics(out, providerKind, submitRequest)
         imageGenerationAttachAttempt(out, imageGenerationAttempt(provider, providerKind, e.status, imageGenerationRedact(e.message, providerConfig)))
     } catch (e: Exception) {
         let status = if (e.message.toAsciiLower().contains("timeout")) { "timeout" } else { "provider_error" }
@@ -816,6 +1522,231 @@ private func imageGenerationOpenAiGenerate(config: JsonObject, request: JsonObje
         out.put("provider", JsonString(provider))
         out.put("providerKind", JsonString(providerKind))
         out.put("model", JsonString(model))
+        imageGenerationAttachDiagnostics(out, providerKind, submitRequest)
+        imageGenerationAttachAttempt(out, imageGenerationAttempt(provider, providerKind, status, imageGenerationRedact(e.message, providerConfig)))
+    }
+}
+
+private func imageGenerationGoogleGenerate(config: JsonObject, request: JsonObject, provider: String, providerKind: String, providerConfig: JsonObject, outputRoot: Path): JsonObject {
+    let timeoutMs = max(1, imageGenerationInt(providerConfig, "timeoutMs", imageGenerationInt(config, "timeoutMs", 120000)))
+    var submitRequest = JsonObject()
+    var model = ""
+    try {
+        imageGenerationValidateReferenceImage(config, request, true)
+        submitRequest = imageGenerationGoogleRequest(config, providerConfig, request, timeoutMs)
+        model = imageGenerationString(submitRequest, "model")
+        let route = imageGenerationObject(submitRequest, "transportRoute")
+        let routeError = imageGenerationString(route, "error")
+        if (!routeError.isEmpty()) {
+            throw ImageGenerationException("provider_error", routeError)
+        }
+        let submitResult = imageGenerationGoogleSubmit(submitRequest, providerConfig)
+        imageGenerationEnsureSuccess(submitResult, providerConfig, "Google image generation")
+        let images = imageGenerationImagesFromGoogleResponse(submitResult.bodyBytes, providerConfig, request, outputRoot)
+        if (images.size() == 0) {
+            throw ImageGenerationException("empty_result", "Google image generation returned no images.")
+        }
+        let out = imageGenerationStatus("ok", ok: true)
+        out.put("provider", JsonString(provider))
+        out.put("providerKind", JsonString(providerKind))
+        out.put("model", JsonString(model))
+        out.put("images", images)
+        imageGenerationAttachAttempt(out, imageGenerationAttempt(provider, providerKind, "ok", ""))
+    } catch (e: ImageGenerationException) {
+        let out = imageGenerationStatus(e.status, ok: false, message: imageGenerationRedact(e.message, providerConfig))
+        out.put("provider", JsonString(provider))
+        out.put("providerKind", JsonString(providerKind))
+        out.put("model", JsonString(model))
+        imageGenerationAttachDiagnostics(out, providerKind, submitRequest)
+        imageGenerationAttachAttempt(out, imageGenerationAttempt(provider, providerKind, e.status, imageGenerationRedact(e.message, providerConfig)))
+    } catch (e: Exception) {
+        let status = if (e.message.toAsciiLower().contains("timeout")) { "timeout" } else { "provider_error" }
+        let out = imageGenerationStatus(status, ok: false, message: imageGenerationRedact(e.message, providerConfig))
+        out.put("provider", JsonString(provider))
+        out.put("providerKind", JsonString(providerKind))
+        out.put("model", JsonString(model))
+        imageGenerationAttachDiagnostics(out, providerKind, submitRequest)
+        imageGenerationAttachAttempt(out, imageGenerationAttempt(provider, providerKind, status, imageGenerationRedact(e.message, providerConfig)))
+    }
+}
+
+private func imageGenerationMiniMaxGenerate(config: JsonObject, request: JsonObject, provider: String, providerKind: String, providerConfig: JsonObject, outputRoot: Path): JsonObject {
+    let timeoutMs = max(1, imageGenerationInt(providerConfig, "timeoutMs", imageGenerationInt(config, "timeoutMs", 120000)))
+    var submitRequest = JsonObject()
+    var model = ""
+    try {
+        imageGenerationValidateReferenceImage(config, request, true)
+        submitRequest = imageGenerationMiniMaxRequest(config, providerConfig, request, timeoutMs)
+        model = imageGenerationString(imageGenerationObject(submitRequest, "body"), "model")
+        let route = imageGenerationObject(submitRequest, "transportRoute")
+        let routeError = imageGenerationString(route, "error")
+        if (!routeError.isEmpty()) {
+            throw ImageGenerationException("provider_error", routeError)
+        }
+        let submitResult = imageGenerationMiniMaxSubmit(submitRequest, providerConfig)
+        imageGenerationEnsureSuccess(submitResult, providerConfig, "MiniMax image generation")
+        let images = imageGenerationImagesFromMiniMaxResponse(submitResult.bodyBytes, providerConfig, request, outputRoot)
+        if (images.size() == 0) {
+            throw ImageGenerationException("empty_result", "MiniMax image generation returned no images.")
+        }
+        let out = imageGenerationStatus("ok", ok: true)
+        out.put("provider", JsonString(provider))
+        out.put("providerKind", JsonString(providerKind))
+        out.put("model", JsonString(model))
+        out.put("images", images)
+        imageGenerationAttachAttempt(out, imageGenerationAttempt(provider, providerKind, "ok", ""))
+    } catch (e: ImageGenerationException) {
+        let out = imageGenerationStatus(e.status, ok: false, message: imageGenerationRedact(e.message, providerConfig))
+        out.put("provider", JsonString(provider))
+        out.put("providerKind", JsonString(providerKind))
+        out.put("model", JsonString(model))
+        imageGenerationAttachDiagnostics(out, providerKind, submitRequest)
+        imageGenerationAttachAttempt(out, imageGenerationAttempt(provider, providerKind, e.status, imageGenerationRedact(e.message, providerConfig)))
+    } catch (e: Exception) {
+        let status = if (e.message.toAsciiLower().contains("timeout")) { "timeout" } else { "provider_error" }
+        let out = imageGenerationStatus(status, ok: false, message: imageGenerationRedact(e.message, providerConfig))
+        out.put("provider", JsonString(provider))
+        out.put("providerKind", JsonString(providerKind))
+        out.put("model", JsonString(model))
+        imageGenerationAttachDiagnostics(out, providerKind, submitRequest)
+        imageGenerationAttachAttempt(out, imageGenerationAttempt(provider, providerKind, status, imageGenerationRedact(e.message, providerConfig)))
+    }
+}
+
+private func imageGenerationFalGenerate(config: JsonObject, request: JsonObject, provider: String, providerKind: String, providerConfig: JsonObject, outputRoot: Path): JsonObject {
+    let timeoutMs = max(1, imageGenerationInt(providerConfig, "timeoutMs", imageGenerationInt(config, "timeoutMs", 120000)))
+    var submitRequest = JsonObject()
+    var model = ""
+    try {
+        imageGenerationValidateReferenceImage(config, request, true)
+        submitRequest = imageGenerationFalRequest(config, providerConfig, request, timeoutMs)
+        model = imageGenerationString(submitRequest, "model")
+        let route = imageGenerationObject(submitRequest, "transportRoute")
+        let routeError = imageGenerationString(route, "error")
+        if (!routeError.isEmpty()) {
+            throw ImageGenerationException("provider_error", routeError)
+        }
+        let submitResult = imageGenerationFalSubmit(submitRequest, providerConfig)
+        imageGenerationEnsureSuccess(submitResult, providerConfig, "fal image generation")
+        let images = imageGenerationImagesFromUrlList(imageGenerationFalImageUrls(submitResult.bodyBytes), providerConfig, request, outputRoot, "fal generated image download")
+        if (images.size() == 0) {
+            throw ImageGenerationException("empty_result", "fal image generation returned no images.")
+        }
+        let out = imageGenerationStatus("ok", ok: true)
+        out.put("provider", JsonString(provider))
+        out.put("providerKind", JsonString(providerKind))
+        out.put("model", JsonString(model))
+        out.put("images", images)
+        imageGenerationAttachAttempt(out, imageGenerationAttempt(provider, providerKind, "ok", ""))
+    } catch (e: ImageGenerationException) {
+        let out = imageGenerationStatus(e.status, ok: false, message: imageGenerationRedact(e.message, providerConfig))
+        out.put("provider", JsonString(provider))
+        out.put("providerKind", JsonString(providerKind))
+        out.put("model", JsonString(model))
+        imageGenerationAttachDiagnostics(out, providerKind, submitRequest)
+        imageGenerationAttachAttempt(out, imageGenerationAttempt(provider, providerKind, e.status, imageGenerationRedact(e.message, providerConfig)))
+    } catch (e: Exception) {
+        let status = if (e.message.toAsciiLower().contains("timeout")) { "timeout" } else { "provider_error" }
+        let out = imageGenerationStatus(status, ok: false, message: imageGenerationRedact(e.message, providerConfig))
+        out.put("provider", JsonString(provider))
+        out.put("providerKind", JsonString(providerKind))
+        out.put("model", JsonString(model))
+        imageGenerationAttachDiagnostics(out, providerKind, submitRequest)
+        imageGenerationAttachAttempt(out, imageGenerationAttempt(provider, providerKind, status, imageGenerationRedact(e.message, providerConfig)))
+    }
+}
+
+private func imageGenerationVydraGenerate(config: JsonObject, request: JsonObject, provider: String, providerKind: String, providerConfig: JsonObject, outputRoot: Path): JsonObject {
+    let timeoutMs = max(1, imageGenerationInt(providerConfig, "timeoutMs", imageGenerationInt(config, "timeoutMs", 120000)))
+    let submitRequest = imageGenerationVydraRequest(providerConfig, request, timeoutMs)
+    let model = imageGenerationString(submitRequest, "model")
+    try {
+        let route = imageGenerationObject(submitRequest, "transportRoute")
+        let routeError = imageGenerationString(route, "error")
+        if (!routeError.isEmpty()) {
+            throw ImageGenerationException("provider_error", routeError)
+        }
+        imageGenerationValidateReferenceImage(config, request, false)
+        let submitResult = imageGenerationVydraSubmit(submitRequest, providerConfig)
+        imageGenerationEnsureSuccess(submitResult, providerConfig, "Vydra image generation")
+        var urls = imageGenerationVydraImageUrls(submitResult.bodyBytes)
+        if (urls.size == 0) {
+            let jobId = imageGenerationVydraJobId(submitResult.bodyBytes)
+            if (!jobId.isEmpty()) {
+                urls = imageGenerationVydraPollUrls(jobId, providerConfig, timeoutMs)
+            }
+        }
+        let images = imageGenerationImagesFromUrlList(urls, providerConfig, request, outputRoot, "Vydra generated image download")
+        if (images.size() == 0) {
+            throw ImageGenerationException("empty_result", "Vydra image generation returned no images.")
+        }
+        let out = imageGenerationStatus("ok", ok: true)
+        out.put("provider", JsonString(provider))
+        out.put("providerKind", JsonString(providerKind))
+        out.put("model", JsonString(model))
+        out.put("images", images)
+        imageGenerationAttachAttempt(out, imageGenerationAttempt(provider, providerKind, "ok", ""))
+    } catch (e: ImageGenerationException) {
+        let out = imageGenerationStatus(e.status, ok: false, message: imageGenerationRedact(e.message, providerConfig))
+        out.put("provider", JsonString(provider))
+        out.put("providerKind", JsonString(providerKind))
+        out.put("model", JsonString(model))
+        imageGenerationAttachDiagnostics(out, providerKind, submitRequest)
+        imageGenerationAttachAttempt(out, imageGenerationAttempt(provider, providerKind, e.status, imageGenerationRedact(e.message, providerConfig)))
+    } catch (e: Exception) {
+        let status = if (e.message.toAsciiLower().contains("timeout")) { "timeout" } else { "provider_error" }
+        let out = imageGenerationStatus(status, ok: false, message: imageGenerationRedact(e.message, providerConfig))
+        out.put("provider", JsonString(provider))
+        out.put("providerKind", JsonString(providerKind))
+        out.put("model", JsonString(model))
+        imageGenerationAttachDiagnostics(out, providerKind, submitRequest)
+        imageGenerationAttachAttempt(out, imageGenerationAttempt(provider, providerKind, status, imageGenerationRedact(e.message, providerConfig)))
+    }
+}
+
+private func imageGenerationComfyGenerate(config: JsonObject, request: JsonObject, provider: String, providerKind: String, providerConfig: JsonObject, outputRoot: Path): JsonObject {
+    let timeoutMs = max(1, imageGenerationInt(providerConfig, "timeoutMs", imageGenerationInt(config, "timeoutMs", 120000)))
+    var submitRequest = JsonObject()
+    var model = imageGenerationString(providerConfig, "model")
+    try {
+        imageGenerationValidateReferenceImage(config, request, false)
+        submitRequest = imageGenerationComfyRequest(providerConfig, request, timeoutMs)
+        let route = imageGenerationObject(submitRequest, "transportRoute")
+        let routeError = imageGenerationString(route, "error")
+        if (!routeError.isEmpty()) {
+            throw ImageGenerationException("provider_error", routeError)
+        }
+        let submitResult = imageGenerationComfySubmit(submitRequest, providerConfig)
+        imageGenerationEnsureSuccess(submitResult, providerConfig, "Comfy image generation submit")
+        let promptId = imageGenerationComfyPromptId(submitResult.bodyBytes)
+        var urls = imageGenerationComfyImageUrls(submitResult.bodyBytes)
+        if (urls.size == 0 && !promptId.isEmpty()) {
+            urls = imageGenerationComfyPollUrls(promptId, providerConfig, timeoutMs)
+        }
+        let images = imageGenerationImagesFromUrlList(urls, providerConfig, request, outputRoot, "Comfy generated image download")
+        if (images.size() == 0) {
+            throw ImageGenerationException("empty_result", "Comfy image generation returned no images.")
+        }
+        let out = imageGenerationStatus("ok", ok: true)
+        out.put("provider", JsonString(provider))
+        out.put("providerKind", JsonString(providerKind))
+        out.put("model", JsonString(model))
+        out.put("images", images)
+        imageGenerationAttachAttempt(out, imageGenerationAttempt(provider, providerKind, "ok", ""))
+    } catch (e: ImageGenerationException) {
+        let out = imageGenerationStatus(e.status, ok: false, message: imageGenerationRedact(e.message, providerConfig))
+        out.put("provider", JsonString(provider))
+        out.put("providerKind", JsonString(providerKind))
+        out.put("model", JsonString(model))
+        imageGenerationAttachDiagnostics(out, providerKind, submitRequest)
+        imageGenerationAttachAttempt(out, imageGenerationAttempt(provider, providerKind, e.status, imageGenerationRedact(e.message, providerConfig)))
+    } catch (e: Exception) {
+        let status = if (e.message.toAsciiLower().contains("timeout")) { "timeout" } else { "provider_error" }
+        let out = imageGenerationStatus(status, ok: false, message: imageGenerationRedact(e.message, providerConfig))
+        out.put("provider", JsonString(provider))
+        out.put("providerKind", JsonString(providerKind))
+        out.put("model", JsonString(model))
+        imageGenerationAttachDiagnostics(out, providerKind, submitRequest)
         imageGenerationAttachAttempt(out, imageGenerationAttempt(provider, providerKind, status, imageGenerationRedact(e.message, providerConfig)))
     }
 }
@@ -892,10 +1823,53 @@ public func gatewayImageGenerationGenerate(config: JsonObject, request: JsonObje
         }
         return imageGenerationDashScopeGenerate(config, request, provider, providerKind, providerConfig, outputRoot)
     }
-    let out = imageGenerationStatus("not_found", ok: false, message: "Configured image generation provider '${provider}' is not available.")
+    if (providerKind == "google-gemini-image") {
+        let apiKey = imageGenerationSecretString(providerConfig, "apiKey")
+        if (apiKey.isEmpty()) {
+            let out = imageGenerationStatus("not_configured", ok: false, message: "Configured Google image generation provider '${provider}' is missing apiKey.")
+            out.put("provider", JsonString(provider))
+            out.put("providerKind", JsonString(providerKind))
+            return out
+        }
+        return imageGenerationGoogleGenerate(config, request, provider, providerKind, providerConfig, outputRoot)
+    }
+    if (providerKind == "minimax-image") {
+        let apiKey = imageGenerationSecretString(providerConfig, "apiKey")
+        if (apiKey.isEmpty()) {
+            let out = imageGenerationStatus("not_configured", ok: false, message: "Configured MiniMax image generation provider '${provider}' is missing apiKey.")
+            out.put("provider", JsonString(provider))
+            out.put("providerKind", JsonString(providerKind))
+            return out
+        }
+        return imageGenerationMiniMaxGenerate(config, request, provider, providerKind, providerConfig, outputRoot)
+    }
+    if (providerKind == "fal-image") {
+        let apiKey = imageGenerationSecretString(providerConfig, "apiKey")
+        if (apiKey.isEmpty()) {
+            let out = imageGenerationStatus("not_configured", ok: false, message: "Configured fal image generation provider '${provider}' is missing apiKey.")
+            out.put("provider", JsonString(provider))
+            out.put("providerKind", JsonString(providerKind))
+            return out
+        }
+        return imageGenerationFalGenerate(config, request, provider, providerKind, providerConfig, outputRoot)
+    }
+    if (providerKind == "vydra-image") {
+        let apiKey = imageGenerationSecretString(providerConfig, "apiKey")
+        if (apiKey.isEmpty()) {
+            let out = imageGenerationStatus("not_configured", ok: false, message: "Configured Vydra image generation provider '${provider}' is missing apiKey.")
+            out.put("provider", JsonString(provider))
+            out.put("providerKind", JsonString(providerKind))
+            return out
+        }
+        return imageGenerationVydraGenerate(config, request, provider, providerKind, providerConfig, outputRoot)
+    }
+    if (providerKind == "comfy-image") {
+        return imageGenerationComfyGenerate(config, request, provider, providerKind, providerConfig, outputRoot)
+    }
+    let out = imageGenerationStatus("unsupported_provider_kind", ok: false, message: "Configured image generation provider '${provider}' has unsupported kind '${providerKind}'.")
     out.put("provider", JsonString(provider))
     out.put("providerKind", JsonString(providerKind))
-    out
+    imageGenerationAttachAttempt(out, imageGenerationAttempt(provider, providerKind, "unsupported_provider_kind", imageGenerationString(out, "message")))
 }
 
 public func gatewayImageGenerationOutputRoot(config: JsonObject): String {
