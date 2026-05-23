@@ -3,7 +3,7 @@ package metis.gateway.core
 import metis.core.{GatewayToolRuntimeContext, gatewayCurrentToolRuntimeContext, gatewayMarkCurrentToolRuntimeVisibleReplyDelivered, gatewayNotifyCurrentToolRuntimeStatus}
 import metis.core.{gatewayMediaUnderstandingFirstText, gatewayMediaUnderstandingForRecord, gatewayMediaUnderstandingForRecordWithSettings, setGatewayMediaAsrRunnerForTest, setGatewayMediaDocumentExtractorForTest, setGatewayMediaVideoRunnerForTest, setGatewayMediaVisionRunnerForTest}
 import metis.core.config.{CliConfig, GatewayUserSettings, CliSettingManager, MetisConfigManager, MetisProcessEnvironmentLock}
-import metis.gateway.tools.{GatewayTtsToolset, debugSetGatewayTtsToolCallRunnerForTest}
+import metis.gateway.tools.{GatewayMessageToolset, GatewayTtsToolset, debugSetGatewayTtsToolCallRunnerForTest}
 import metis.gateway.session.{GatewayDeliveryTarget, GatewayIngressSource, GatewaySessionContext, GatewaySessionRequest}
 
 import std.collection.ArrayList
@@ -223,6 +223,64 @@ public class GatewaySessionTurnRunnerTest {
                 CliSettingManager.invalidate()
                 try { remove(home, recursive: true) } catch (_e: Exception) { () }
             }
+        }
+    }
+
+    @TestCase
+    public func feishuMessageToolDeliveryDuringSessionRequestUsesCurrentGatewayHook(): Unit {
+        let sentChannels = ArrayList<String>()
+        let sentPeers = ArrayList<String>()
+        let sentTexts = ArrayList<String>()
+        setGatewayAgentBridgeReplyRunnerForTest(Some({
+            _conversationKey: String,
+            _prompt: String,
+            _channelName: String,
+            _agentId: String,
+            _streamingEnabled: Bool,
+            _streamChunkHook: Option<(String) -> Unit> =>
+                let _ = GatewayMessageToolset().debugMessageForTest("photo", "feishu", "ou_1", "/tmp/pic.png")
+                "<SILENT_REPLY>"
+        }))
+        try {
+            let store = GatewaySessionStore(Path("."), enabled: false, agentId: "general")
+            let bridge = AgentBridge(sessionStore: store)
+            let request = GatewaySessionRequest(
+                GatewayIngressSource.Channel("feishu"),
+                channelName: "feishu",
+                sessionHint: "feishu:direct:ou_1",
+                agentId: "general",
+                text: "把这张图片发给我",
+                accountId: "default",
+                peerId: "ou_1",
+                senderId: "ou_1",
+                deliver: true
+            )
+            let result = gatewayExecuteSessionRequestTurn(
+                bridge,
+                request,
+                "把这张图片发给我",
+                deliver: true,
+                deliverHook: Some({
+                    channelName: String,
+                    _accountId: String,
+                    peerId: String,
+                    text: String,
+                    _replyToMessageId: Option<String>,
+                    _replyInThread: Bool =>
+                        sentChannels.add(channelName)
+                        sentPeers.add(peerId)
+                        sentTexts.add(text)
+                        "tool-${sentTexts.size}"
+                })
+            )
+            @Expect(result.execution.delivered, true)
+            @Expect(result.execution.deliveryStatus, "delivered-by-tool")
+            @Expect(sentChannels.size, 1)
+            @Expect(sentChannels[0], "feishu")
+            @Expect(sentPeers[0], "ou_1")
+            @Expect(sentTexts[0].startsWith("[photo]"), true)
+        } finally {
+            setGatewayAgentBridgeReplyRunnerForTest(None<(String, String, String, String, Bool, Option<(String) -> Unit>) -> String>)
         }
     }
 

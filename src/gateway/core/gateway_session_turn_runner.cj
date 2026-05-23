@@ -6,7 +6,7 @@ import metis.gateway.session.{GatewaySessionContext, GatewaySessionRequest}
 import std.collection.ArrayList
 import std.convert.Parsable
 import std.fs.{Path, exists}
-import stdx.encoding.json.{JsonArray, JsonObject, JsonString}
+import stdx.encoding.json.{JsonArray, JsonBool, JsonObject, JsonString}
 
 private func gatewayJsonString(obj: JsonObject, key: String): String {
     match (obj.get(key)) {
@@ -19,6 +19,77 @@ private func gatewayJsonBool(obj: JsonObject, key: String): Bool {
     match (obj.get(key)) {
         case Some(v) => try { v.asBool().getValue() } catch (_e: Exception) { false }
         case None => false
+    }
+}
+
+private func gatewaySessionTurnInvokeDeliverHook(
+    send: (String, String, String, String, Option<String>, Bool) -> String,
+    method: String,
+    params: JsonObject
+): JsonObject {
+    let out = JsonObject()
+    if (method.trimAscii() != "channels.send") {
+        out.put("ok", JsonBool(false))
+        out.put("status", JsonString("error"))
+        out.put("code", JsonString("unsupported_method"))
+        out.put("method", JsonString(method.trimAscii()))
+        return out
+    }
+    let channel = if (!gatewayJsonString(params, "channel").isEmpty()) {
+        gatewayJsonString(params, "channel")
+    } else {
+        gatewayJsonString(params, "id")
+    }
+    let peerId = if (!gatewayJsonString(params, "peerId").isEmpty()) {
+        gatewayJsonString(params, "peerId")
+    } else {
+        gatewayJsonString(params, "to")
+    }
+    let text = if (!gatewayJsonString(params, "text").isEmpty()) {
+        gatewayJsonString(params, "text")
+    } else {
+        gatewayJsonString(params, "message")
+    }
+    if (channel.isEmpty() || peerId.isEmpty() || text.isEmpty()) {
+        out.put("ok", JsonBool(false))
+        out.put("status", JsonString("error"))
+        out.put("code", JsonString("invalid_request"))
+        return out
+    }
+    let replyTo = if (!gatewayJsonString(params, "replyToMessageId").isEmpty()) {
+        gatewayJsonString(params, "replyToMessageId")
+    } else {
+        gatewayJsonString(params, "replyTo")
+    }
+    let replyToOption = if (replyTo.isEmpty()) { None<String> } else { Some(replyTo) }
+    try {
+        let messageId = send(
+            channel,
+            gatewayJsonString(params, "accountId"),
+            peerId,
+            text,
+            replyToOption,
+            gatewayJsonBool(params, "replyInThread")
+        )
+        out.put("ok", JsonBool(true))
+        out.put("status", JsonString("accepted"))
+        out.put("messageId", JsonString(messageId))
+    } catch (e: Exception) {
+        out.put("ok", JsonBool(false))
+        out.put("status", JsonString("error"))
+        out.put("error", JsonString(e.message))
+    }
+    out
+}
+
+private func gatewaySessionTurnGatewayCallHookFromDeliverHook(
+    deliverHook: Option<(String, String, String, String, Option<String>, Bool) -> String>
+): Option<(String, JsonObject) -> JsonObject> {
+    match (deliverHook) {
+        case Some(send) => Some({ method: String, params: JsonObject =>
+            gatewaySessionTurnInvokeDeliverHook(send, method, params)
+        })
+        case None => None<(String, JsonObject) -> JsonObject>
     }
 }
 
@@ -511,7 +582,8 @@ public func gatewayExecuteSessionRequestTurn(
         prompt: prompt,
         mediaContext: request.mediaContext,
         memorySearchPolicy: gatewayMemorySearchPolicyFromScope(context.turnContext.agentScope),
-        lifecycleHook: lifecycleHook
+        lifecycleHook: lifecycleHook,
+        gatewayCallHook: gatewaySessionTurnGatewayCallHookFromDeliverHook(deliverHook)
     )
     let mediaPrompt = gatewayBuildMediaContextPrompt(request.mediaContext)
     let mergedExtraSystemPrompt = if (mediaPrompt.trimAscii().isEmpty()) {

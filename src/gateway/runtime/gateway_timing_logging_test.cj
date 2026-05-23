@@ -39,4 +39,15 @@ public class GatewayTimingLoggingTest {
             }
         }
     }
+
+    @TestCase
+    public func startupTlsDefaultsMatchMacosSystemCaWithoutOverwritingUserValues(): Unit {
+        @Expect(gatewayResolveStartupCaFile("", "macos", true), "/etc/ssl/cert.pem")
+        @Expect(gatewayResolveStartupCaFile("/custom/ca.pem", "macos", true), "/custom/ca.pem")
+        @Expect(gatewayResolveStartupCaFile("", "macos", false), "")
+        @Expect(gatewayResolveStartupCaFile("", "linux", true), "")
+        @Expect(gatewayResolveStartupNodeUseSystemCa("", "macos"), "1")
+        @Expect(gatewayResolveStartupNodeUseSystemCa("0", "macos"), "0")
+        @Expect(gatewayResolveStartupNodeUseSystemCa("", "linux"), "")
+    }
 }

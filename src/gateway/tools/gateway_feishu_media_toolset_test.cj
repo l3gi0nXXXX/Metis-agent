@@ -60,6 +60,7 @@ public class GatewayFeishuMediaToolsetTest {
         let media = JsonObject()
         media.put("channel", JsonString("feishu"))
         media.put("accountId", JsonString("default"))
+        media.put("peerId", JsonString("oc_1"))
         let records = JsonArray([])
         let record = JsonObject()
         record.put("mediaId", JsonString("default:oc_1:om_1:image:img_1"))
@@ -80,6 +81,88 @@ public class GatewayFeishuMediaToolsetTest {
         records.add(record)
         media.put("records", records)
         media
+    }
+
+    @TestCase
+    public func feishuMediaSendPhotoBuildsChannelsSendPayloadFromCurrentContext(): Unit {
+        let capturedMethods = ArrayList<String>()
+        let capturedPayloads = ArrayList<JsonObject>()
+        let context = GatewayToolRuntimeContext(
+            "feishu",
+            channelName: "feishu",
+            sessionKey: "feishu:direct:ou_1",
+            senderId: "ou_1",
+            mediaContext: this.mediaContext(),
+            gatewayCallHook: Some({ method: String, payload: JsonObject =>
+                capturedMethods.add(method)
+                capturedPayloads.add(payload)
+                let out = JsonObject()
+                out.put("ok", JsonBool(true))
+                out
+            })
+        )
+        let out = gatewayWithToolRuntimeContext(context, { =>
+            GatewayFeishuMediaToolset().debugFeishuMediaSendForTest("/tmp/pic.png", Some("caption"), Some("photo"), None<Bool>)
+        })
+        let json = JsonValue.fromStr(out).asObject()
+        @Expect(json.get("ok").getOrThrow().asBool().getValue(), true)
+        @Expect(json.get("action").getOrThrow().asString().getValue(), "feishu_media_send")
+        @Expect(capturedMethods[0], "channels.send")
+        let capturedPayload = capturedPayloads[0]
+        @Expect(capturedPayload.get("channel").getOrThrow().asString().getValue(), "feishu")
+        @Expect(capturedPayload.get("to").getOrThrow().asString().getValue(), "ou_1")
+        @Expect(capturedPayload.get("text").getOrThrow().asString().getValue().startsWith("[photo]"), true)
+        @Expect(capturedPayload.get("text").getOrThrow().asString().getValue().contains("caption=caption"), true)
+        @Expect(context.hasVisibleReplyDelivered(), true)
+    }
+
+    @TestCase
+    public func feishuMediaSendMissingTargetReturnsErrorWithoutFallbackRpc(): Unit {
+        let calls = ArrayList<String>()
+        let context = GatewayToolRuntimeContext(
+            "feishu",
+            channelName: "feishu",
+            sessionKey: "feishu:chat",
+            mediaContext: JsonObject(),
+            gatewayCallHook: Some({ _method: String, _payload: JsonObject =>
+                calls.add("called")
+                let out = JsonObject()
+                out.put("ok", JsonBool(true))
+                out
+            })
+        )
+        let out = gatewayWithToolRuntimeContext(context, { =>
+            GatewayFeishuMediaToolset().debugFeishuMediaSendForTest("/tmp/pic.png", None<String>, Some("photo"), None<Bool>)
+        })
+        let json = JsonValue.fromStr(out).asObject()
+        @Expect(json.get("ok").getOrThrow().asBool().getValue(), false)
+        @Expect(json.get("status").getOrThrow().asString().getValue(), "error")
+        @Expect(calls.size, 0)
+    }
+
+    @TestCase
+    public func feishuMediaSendDoesNotUseOapiUserMessageBoundary(): Unit {
+        let capturedMethods = ArrayList<String>()
+        let context = GatewayToolRuntimeContext(
+            "feishu",
+            channelName: "feishu",
+            sessionKey: "feishu:direct:ou_1",
+            senderId: "ou_1",
+            mediaContext: this.mediaContext(),
+            gatewayCallHook: Some({ method: String, _payload: JsonObject =>
+                capturedMethods.add(method)
+                let out = JsonObject()
+                out.put("ok", JsonBool(true))
+                out
+            })
+        )
+        let out = gatewayWithToolRuntimeContext(context, { =>
+            GatewayFeishuMediaToolset().debugFeishuMediaSendForTest("/tmp/pic.png", None<String>, Some("photo"), None<Bool>)
+        })
+        let json = JsonValue.fromStr(out).asObject()
+        @Expect(json.get("ok").getOrThrow().asBool().getValue(), true)
+        @Expect(capturedMethods[0], "channels.send")
+        @Expect(capturedMethods[0] == "feishu_im_user_message", false)
     }
 
     @TestCase

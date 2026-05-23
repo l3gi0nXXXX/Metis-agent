@@ -6,7 +6,7 @@ import metis.gateway.core.{ChannelAdapter, gatewayLogIdentityHash}
 import metis.gateway.logging.{MetisLogEvent, metisCreateSubsystemLogger}
 import metis.gateway.model.*
 import metis.gateway.model.FeishuConfig
-import metis.gateway.security.{GatewayPairingStore, gatewayPairingAccountStore}
+import metis.gateway.security.{GatewayPairingStore, gatewayPairingAccountStore, gatewayPairingAccountStateDir}
 import magic.jsonable.*
 import magic.utils.http.HttpUtils
 
@@ -615,6 +615,8 @@ public class FeishuEventReplayLiveSmokeChecklist {
         root
     }
 }
+
+private let FEISHU_MEDIA_STATE_MAX_RECORDS: Int64 = 200
 
 public class FeishuAdapter <: ChannelAdapter {
     private var running = false
@@ -2755,6 +2757,7 @@ public class FeishuAdapter <: ChannelAdapter {
             (accountConfig.botOpenId.isEmpty() && (text.contains("@") || text.contains("<at ")))
         let mediaContext = JsonObject()
         this.attachFeishuImRouteContext(mediaContext, accountConfig, accountId, chatId, chatType, senderId, messageId, rootId, threadId)
+        this.attachFeishuMediaStateContext(mediaContext, accountConfig, accountId, messageId)
         this.attachFeishuGateContext(mediaContext, accountConfig, accountId, chatType, mentioned, chatId, senderId)
         this.attachFeishuQuoteContext(mediaContext, accountId, chatId, senderId, messageId, rootId, threadId, chatType)
         this.attachFeishuAliasCandidates(mediaContext, accountConfig, messageObj)
@@ -3173,6 +3176,7 @@ public class FeishuAdapter <: ChannelAdapter {
             let records = this.feishuPostEmbeddedMediaRecords(cfg, accountId, chatId, senderId, messageId, content)
             if (records.size() > 0) {
                 mediaContext.put("records", records)
+                this.persistFeishuMediaRecords(records, cfg)
             }
             return
         }
@@ -3192,6 +3196,7 @@ public class FeishuAdapter <: ChannelAdapter {
             content
         ))
         mediaContext.put("records", records)
+        this.persistFeishuMediaRecords(records, cfg)
     }
 
     private func feishuPostEmbeddedMediaRecords(
@@ -3286,6 +3291,8 @@ public class FeishuAdapter <: ChannelAdapter {
         record.put("peerId", JsonString(chatId.trimAscii()))
         record.put("messageId", JsonString(messageId.trimAscii()))
         record.put("relation", JsonString("current"))
+        record.put("sourceScope", JsonString("current"))
+        record.put("operatorId", JsonString(senderId.trimAscii()))
         record.put("mediaKind", JsonString(normalizedType))
         record.put("kind", JsonString(normalizedType))
         record.put("fileId", JsonString(fileId))
@@ -3457,6 +3464,7 @@ public class FeishuAdapter <: ChannelAdapter {
             if (records.size() > 0) {
                 quoteContext.put("records", records)
                 this.appendFeishuMediaRecords(mediaContext, records)
+                this.persistFeishuMediaRecords(records, this.feishuConfigForAccount(accountId))
             }
         } else {
             quoteContext.put("expanded", JsonBool(false))
@@ -3558,6 +3566,7 @@ public class FeishuAdapter <: ChannelAdapter {
             if (records.size() > 0) {
                 forward.put("records", records)
                 this.appendFeishuMediaRecords(mediaContext, records)
+                this.persistFeishuMediaRecords(records, this.feishuConfigForAccount(accountId))
             }
             let baseText = this.extractMergeForwardText(contentJsonString)
             let joined = String.join(textPieces.toArray(), delimiter: "\n")
@@ -3788,6 +3797,7 @@ public class FeishuAdapter <: ChannelAdapter {
         record.put("messageId", JsonString(messageId.trimAscii()))
         record.put("relation", JsonString("historical"))
         record.put("source", JsonString(source.trimAscii()))
+        record.put("sourceScope", JsonString(if (source.trimAscii().isEmpty()) { "historical" } else { source.trimAscii() }))
         record.put("operatorId", JsonString(senderId.trimAscii()))
         record.put("mediaKind", JsonString(normalizedType))
         record.put("kind", JsonString(normalizedType))
@@ -4211,6 +4221,145 @@ public class FeishuAdapter <: ChannelAdapter {
         limit > 0 && sizeBytes > limit
     }
 
+    private func attachFeishuMediaStateContext(
+        mediaContext: JsonObject,
+        cfg: FeishuConfig,
+        accountId: String,
+        messageId: String
+    ): Unit {
+        let archiveRoot = this.feishuMediaArchiveRoot(cfg, accountId: accountId).toString()
+        mediaContext.put("messageId", JsonString(messageId.trimAscii()))
+        mediaContext.put("mediaStatePath", JsonString(this.feishuMediaStatePath(accountId: accountId).toString()))
+        mediaContext.put("archiveRoot", JsonString(archiveRoot))
+        mediaContext.put("downloadRoot", JsonString(cfg.media.downloadRoot.trimAscii()))
+        mediaContext.put("mediaArchiveRoot", JsonString(archiveRoot))
+    }
+
+    private func feishuMediaStatePath(accountId!: String = ""): Path {
+        this.feishuAccountStateDir(accountId: accountId).join("media-state.json")
+    }
+
+    private func readFeishuMediaState(cfg: FeishuConfig, accountId: String): JsonObject {
+        let path = this.feishuMediaStatePath(accountId: accountId)
+        var root = if (exists(path)) {
+            try {
+                JsonValue.fromStr(String.fromUtf8(File.readFrom(path))).asObject()
+            } catch (_e: Exception) {
+                JsonObject()
+            }
+        } else {
+            JsonObject()
+        }
+        root.put("channel", JsonString("feishu"))
+        root.put("accountId", JsonString(this.normalizeAccountId(accountId)))
+        root.put("mediaStatePath", JsonString(path.toString()))
+        root.put("statePath", JsonString(path.toString()))
+        root.put("downloadEnabled", JsonBool(cfg.media.downloadEnabled))
+        root.put("mediaMaxBytes", JsonInt(cfg.media.mediaMaxBytes))
+        root.put("allowedMimes", this.feishuAllowedMimesJson(cfg))
+        root.put("downloadRoot", JsonString(cfg.media.downloadRoot.trimAscii()))
+        root.put("archiveRoot", JsonString(this.feishuMediaArchiveRoot(cfg, accountId: accountId).toString()))
+        if (root.get("lastMedia").isNone()) {
+            root.put("lastMedia", JsonObject())
+        }
+        if (root.get("records").isNone()) {
+            root.put("records", JsonArray([]))
+        }
+        root
+    }
+
+    private func readFeishuMediaRecords(root: JsonObject): JsonArray {
+        match (root.get("records")) {
+            case Some(v) => try { v.asArray() } catch (_e: Exception) { JsonArray([]) }
+            case None => JsonArray([])
+        }
+    }
+
+    private func persistFeishuMediaRecords(records: JsonArray, cfg: FeishuConfig): Unit {
+        for (item in records.getItems()) {
+            try {
+                this.persistFeishuMediaRecord(item.asObject(), cfg)
+            } catch (_e: Exception) {
+                ()
+            }
+        }
+    }
+
+    private func persistFeishuMediaRecord(record: JsonObject, cfg: FeishuConfig): Unit {
+        let accountId = this.readStringField(record, "accountId").trimAscii()
+        let mediaId = this.readStringField(record, "mediaId").trimAscii()
+        if (accountId.isEmpty() || mediaId.isEmpty()) {
+            return
+        }
+        let stateRecord = this.feishuStateRecord(record)
+        let root = this.readFeishuMediaState(cfg, accountId)
+        let existing = this.readFeishuMediaRecords(root)
+        let deduped = JsonArray([])
+        for (item in existing.getItems()) {
+            let obj = try { item.asObject() } catch (_e: Exception) { JsonObject() }
+            if (this.readStringField(obj, "mediaId").trimAscii() != mediaId) {
+                deduped.add(item)
+            }
+        }
+        deduped.add(stateRecord)
+        let bounded = JsonArray([])
+        let start = if (deduped.size() > FEISHU_MEDIA_STATE_MAX_RECORDS) {
+            deduped.size() - FEISHU_MEDIA_STATE_MAX_RECORDS
+        } else {
+            0
+        }
+        for (i in start..deduped.size()) {
+            bounded.add(deduped[i])
+        }
+        let nowMs = DateTime.now().toUnixTimeStamp().toMilliseconds()
+        root.put("accountId", JsonString(this.normalizeAccountId(accountId)))
+        root.put("channel", JsonString("feishu"))
+        root.put("lastMediaRecordId", JsonString(mediaId))
+        root.put("lastMedia", stateRecord)
+        root.put("records", bounded)
+        root.put("persistedAtMs", JsonInt(nowMs))
+        let path = this.feishuMediaStatePath(accountId: accountId)
+        if (!exists(path.parent)) {
+            Directory.create(path.parent, recursive: true)
+        }
+        File.writeTo(path, root.toJsonString().toArray())
+    }
+
+    private func feishuStateRecord(record: JsonObject): JsonObject {
+        let out = JsonObject()
+        for (key in record.getFields().keys()) {
+            match (record.get(key)) {
+                case Some(value) => out.put(key, value)
+                case None => ()
+            }
+        }
+        let sourceScope = this.readStringField(out, "sourceScope").trimAscii()
+        if (sourceScope == "quote" || sourceScope == "merge_forward") {
+            out.put("relation", JsonString(sourceScope))
+        } else if (sourceScope.isEmpty()) {
+            out.put("sourceScope", JsonString(this.readStringField(out, "relation").trimAscii()))
+        }
+        let nowMs = DateTime.now().toUnixTimeStamp().toMilliseconds()
+        out.put("persistedAtMs", JsonInt(nowMs))
+        if (out.get("createdAtMs").isNone()) {
+            out.put("createdAtMs", JsonInt(nowMs))
+        }
+        out
+    }
+
+    private func feishuAllowedMimesJson(cfg: FeishuConfig): JsonArray {
+        let out = JsonArray([])
+        let values = if (cfg.media.allowedMimes.isEmpty()) {
+            this.feishuDefaultAllowedMediaMimes()
+        } else {
+            cfg.media.allowedMimes
+        }
+        for (item in values) {
+            out.add(JsonString(item))
+        }
+        out
+    }
+
     private func feishuPersistDownloadedResourceBytes(
         cfg: FeishuConfig,
         bytes: Array<Byte>,
@@ -4222,14 +4371,9 @@ public class FeishuAdapter <: ChannelAdapter {
         fileName!: String,
         mimeType!: String
     ): String {
-        let root = Path(if (cfg.media.downloadRoot.trimAscii().isEmpty()) {
-            "/tmp/metis-feishu-media"
-        } else {
-            cfg.media.downloadRoot.trimAscii()
-        })
+        let root = this.feishuMediaArchiveRoot(cfg, accountId: accountId)
         let dir = root
-            .join(this.feishuSafeMediaSegment(this.normalizeAccountId(accountId)))
-            .join(this.feishuSafeMediaSegment(chatId))
+            .join(DateTime.now().format("yyyy-MM-dd"))
             .join(this.feishuSafeMediaSegment(messageId))
         let safeName = this.feishuSafeMediaFileName(fileKey, mediaKind: mediaKind, fileName: fileName, mimeType: mimeType)
         try {
@@ -4242,6 +4386,22 @@ public class FeishuAdapter <: ChannelAdapter {
         } catch (_e: Exception) {
             ""
         }
+    }
+
+    private func feishuAccountStateDir(accountId!: String = ""): Path {
+        gatewayPairingAccountStateDir(
+            this.pairingRoot,
+            "feishu",
+            this.normalizeAccountId(if (accountId.trimAscii().isEmpty()) { this.effectiveAccountId() } else { accountId })
+        )
+    }
+
+    private func feishuMediaArchiveRoot(cfg: FeishuConfig, accountId!: String = ""): Path {
+        let configured = cfg.media.downloadRoot.trimAscii()
+        if (configured.isEmpty()) {
+            return this.feishuAccountStateDir(accountId: accountId).join("media")
+        }
+        Path(configured)
     }
 
     private func feishuSafeMediaSegment(raw: String): String {

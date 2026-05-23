@@ -928,12 +928,12 @@ public class FeishuMediaConfig {
         downloadEnabled!: Bool = true,
         mediaMaxBytes!: Int64 = 20 * 1024 * 1024,
         allowedMimes!: Array<String> = [],
-        downloadRoot!: String = "/tmp/metis-feishu-media"
+        downloadRoot!: String = ""
     ) {
         this.downloadEnabled = downloadEnabled
         this.mediaMaxBytes = mediaMaxBytes
         this.allowedMimes = allowedMimes
-        this.downloadRoot = if (downloadRoot.trimAscii().isEmpty()) { "/tmp/metis-feishu-media" } else { downloadRoot.trimAscii() }
+        this.downloadRoot = downloadRoot.trimAscii()
     }
 }
 

@@ -214,6 +214,8 @@ public class FeishuSidecarApiClientTest {
         @Expect(protocol.launch.command, "node")
         @Expect(String.join(protocol.launch.args, delimiter: " ").contains("secret-app"), false)
         @Expect(process.stdinLines[0].contains("\"type\":\"init\""), true)
+        @Expect(process.stdinLines[0].contains("\"mode\":\"api\""), true)
+        @Expect(process.stdinLines[0].contains("\"mode\":\"websocket\""), false)
         @Expect(process.stdinLines[0].contains("secret-app"), true)
         @Expect(process.stdinLines[1].contains("\"type\":\"request\""), true)
         @Expect(process.stdinLines[1].contains("\"action\":\"uploadMedia\""), true)
@@ -340,11 +342,10 @@ public class FeishuSidecarApiClientTest {
 
         @Expect(sidecarTestBool(imageResult, "ok"), true)
         @Expect(sidecarTestString(imageResult, "bytesBase64"), "aW1hZ2U=")
-        @Expect(imageProcess.stdinLines[1].contains("\"action\":\"downloadImage\""), true)
+        @Expect(imageProcess.stdinLines[1].contains("\"action\":\"downloadResource\""), true)
         @Expect(imageProcess.stdinLines[1].contains("\"messageId\":\"om_1\""), true)
         @Expect(imageProcess.stdinLines[1].contains("\"fileKey\":\"img_1\""), true)
         @Expect(imageProcess.stdinLines[1].contains("\"resourceType\":\"image\""), true)
-        @Expect(imageProcess.stdinLines[1].contains("\"imageKey\":\"img_1\""), true)
 
         let fileProcess = FeishuSidecarApiProcessFakeProcess(stdout: [
             "{\"type\":\"ready\",\"accountId\":\"tenant-a\",\"transport\":\"websocket\"}",

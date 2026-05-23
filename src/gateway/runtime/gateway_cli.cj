@@ -70,6 +70,54 @@ public func gatewayCliApplyVerboseRuntimeLogging(verbose: Bool): Unit {
     }
 }
 
+public func gatewayResolveStartupCaFile(currentValue: String, platform: String, caPathExists: Bool, defaultPath!: String = "/etc/ssl/cert.pem"): String {
+    let existing = currentValue.trimAscii()
+    if (!existing.isEmpty()) {
+        return existing
+    }
+    if (platform == "macos" && caPathExists) {
+        return defaultPath
+    }
+    ""
+}
+
+public func gatewayResolveStartupNodeUseSystemCa(currentValue: String, platform: String): String {
+    let existing = currentValue.trimAscii()
+    if (!existing.isEmpty()) {
+        return existing
+    }
+    if (platform == "macos") {
+        return "1"
+    }
+    ""
+}
+
+public func gatewayApplyStartupTlsEnvironmentDefaults(): JsonObject {
+    let caPath = "/etc/ssl/cert.pem"
+    let caPathExists = exists(Path(caPath))
+    let currentSslCertFile = getVariable("SSL_CERT_FILE") ?? ""
+    let currentNodeExtraCaCerts = getVariable("NODE_EXTRA_CA_CERTS") ?? ""
+    let currentNodeUseSystemCa = getVariable("NODE_USE_SYSTEM_CA") ?? ""
+    let sslCertFile = gatewayResolveStartupCaFile(currentSslCertFile, InfoUtils.os, caPathExists, defaultPath: caPath)
+    let nodeExtraCaCerts = gatewayResolveStartupCaFile(currentNodeExtraCaCerts, InfoUtils.os, caPathExists, defaultPath: caPath)
+    let nodeUseSystemCa = gatewayResolveStartupNodeUseSystemCa(currentNodeUseSystemCa, InfoUtils.os)
+    if (currentSslCertFile.trimAscii().isEmpty() && !sslCertFile.isEmpty()) {
+        setVariable("SSL_CERT_FILE", sslCertFile)
+    }
+    if (currentNodeExtraCaCerts.trimAscii().isEmpty() && !nodeExtraCaCerts.isEmpty()) {
+        setVariable("NODE_EXTRA_CA_CERTS", nodeExtraCaCerts)
+    }
+    if (currentNodeUseSystemCa.trimAscii().isEmpty() && !nodeUseSystemCa.isEmpty()) {
+        setVariable("NODE_USE_SYSTEM_CA", nodeUseSystemCa)
+    }
+    let out = JsonObject()
+    out.put("sslCertFile", JsonString(sslCertFile))
+    out.put("nodeExtraCaCerts", JsonString(nodeExtraCaCerts))
+    out.put("nodeUseSystemCa", JsonString(nodeUseSystemCa))
+    out.put("platform", JsonString(InfoUtils.os))
+    out
+}
+
 private func gatewayShellJsonString(obj: JsonObject, key: String, defaultValue!: String = ""): String {
     match (obj.get(key)) {
         case Some(v) => try { v.asString().getValue().trimAscii() } catch (_e: Exception) { defaultValue }
@@ -1218,6 +1266,7 @@ public func runGatewayDashboardCli(args: Array<String>): Int64 {
  */
 private func applyRuntimeForGatewayServe(): Unit {
     // 与 parseArgsAndSetConfig 对齐：否则 Gateway runtime 日志可能不写入当前日志文件。
+    let _ = gatewayApplyStartupTlsEnvironmentDefaults()
     Config.logLevel = "INFO"
     Config.logFile = CliConfig.logFile.toString()
     Config.modelRequestDir = CliConfig.dotDir.join("model-requests").toString()

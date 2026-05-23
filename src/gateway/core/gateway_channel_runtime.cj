@@ -102,10 +102,15 @@ private func channelRuntimeReadAccounts(root: JsonObject): JsonArray {
         let row = try { raw[idx].asObject() } catch (_e: Exception) { JsonObject() }
         let compact = channelRuntimeCompactAccountRow(row)
         let channelId = channelRuntimeReadString(compact, "channelId", "").trimAscii().toAsciiLower()
-        let accountId = channelRuntimeReadString(compact, "accountId", "").trimAscii()
+        let accountId = gatewayCanonicalChannelAccountId(
+            channelId,
+            channelRuntimeReadString(compact, "accountId", "").trimAscii()
+        )
         if (channelId.isEmpty() || accountId.isEmpty()) {
             continue
         }
+        compact.put("channelId", JsonString(channelId))
+        compact.put("accountId", JsonString(accountId))
         let key = "${channelId}:${accountId}"
         if (seen.contains(key)) {
             continue
@@ -244,15 +249,18 @@ private func channelRuntimeUpsertAccount(
     let existing = channelRuntimeReadAccounts(root)
     let next = JsonArray([])
     let normalizedChannel = channelId.trimAscii().toAsciiLower()
-    let normalizedAccount = accountId.trimAscii()
+    let normalizedAccount = gatewayCanonicalChannelAccountId(normalizedChannel, accountId)
     var found = false
     var updated = JsonObject()
     for (i in 0..existing.size()) {
         let row = try { existing[i].asObject() } catch (_e: Exception) { JsonObject() }
-        if (channelRuntimeReadString(row, "channelId", "") == normalizedChannel &&
-            channelRuntimeReadString(row, "accountId", "") == normalizedAccount) {
+        let rowChannel = channelRuntimeReadString(row, "channelId", "").trimAscii().toAsciiLower()
+        let rowAccount = gatewayCanonicalChannelAccountId(rowChannel, channelRuntimeReadString(row, "accountId", ""))
+        if (rowChannel == normalizedChannel && rowAccount == normalizedAccount) {
             found = true
             updated = updater(row)
+            updated.put("channelId", JsonString(normalizedChannel))
+            updated.put("accountId", JsonString(normalizedAccount))
             next.add(updated)
         } else {
             next.add(row)
@@ -260,6 +268,8 @@ private func channelRuntimeUpsertAccount(
     }
     if (!found) {
         updated = updater(JsonObject())
+        updated.put("channelId", JsonString(normalizedChannel))
+        updated.put("accountId", JsonString(normalizedAccount))
         next.add(updated)
     }
     root.put("accounts", next)
@@ -289,7 +299,7 @@ public func gatewayChannelRuntimeRegisterAccount(
             case None => JsonArray([])
         }
         out.put("channelId", JsonString(channelId.trimAscii().toAsciiLower()))
-        out.put("accountId", JsonString(accountId.trimAscii()))
+        out.put("accountId", JsonString(gatewayCanonicalChannelAccountId(channelId, accountId)))
         out.put("pluginId", JsonString(pluginId.trimAscii().toAsciiLower()))
         out.put("label", JsonString(label.trimAscii()))
         out.put("detailLabel", JsonString(detailLabel.trimAscii()))
@@ -402,7 +412,7 @@ private func gatewayChannelRuntimeNewBaseAccountRow(
     let now = gatewayChannelRuntimeNowMs()
     let base = JsonObject()
     base.put("channelId", JsonString(channelId.trimAscii().toAsciiLower()))
-    base.put("accountId", JsonString(accountId.trimAscii()))
+    base.put("accountId", JsonString(gatewayCanonicalChannelAccountId(channelId, accountId)))
     base.put("pluginId", JsonString(""))
     base.put("label", JsonString(""))
     base.put("detailLabel", JsonString(""))
@@ -463,7 +473,7 @@ public func gatewayChannelRuntimePrimeAccounts(entries: JsonArray): Int64 {
     for (j in 0..entries.size()) {
         let spec = try { entries[j].asObject() } catch (_e: Exception) { JsonObject() }
         let channelId = channelRuntimeReadString(spec, "channelId", "").trimAscii().toAsciiLower()
-        let accountId = channelRuntimeReadString(spec, "accountId", "default").trimAscii()
+        let accountId = gatewayCanonicalChannelAccountId(channelId, channelRuntimeReadString(spec, "accountId", "default"))
         if (channelId.isEmpty() || accountId.isEmpty()) {
             continue
         }
@@ -708,7 +718,8 @@ public func gatewayChannelRuntimeMarkMonitorTick(channelId: String, accountId!: 
 
 public func gatewayChannelRuntimeCanStart(channelId: String, accountId!: String = "default"): Bool {
     let accounts = gatewayChannelRuntimeAccountsJson(channelId)
-    let normalizedAccount = accountId.trimAscii()
+    let normalized = channelId.trimAscii().toAsciiLower()
+    let normalizedAccount = gatewayCanonicalChannelAccountId(normalized, accountId)
     let now = gatewayChannelRuntimeNowMs()
     for (i in 0..accounts.size()) {
         let row = try { accounts[i].asObject() } catch (_e: Exception) { JsonObject() }

@@ -1,6 +1,7 @@
 package metis.gateway.channels.feishu
 
 import std.collection.ArrayList
+import std.core.Duration
 import std.sync.Mutex
 import std.unittest.testmacro.*
 import stdx.encoding.json.{JsonObject, JsonString}
@@ -134,6 +135,10 @@ public class FeishuSidecarTransportTest {
         "{\"message\":{\"message_id\":\"${messageId}\"}}"
     }
 
+    private func delayedStdioScript(): String {
+        "read ignored; printf '%s\\n' '{\"type\":\"ready\",\"accountId\":\"tenant-a\",\"transport\":\"websocket\"}'; sleep 0.35; printf '%s\\n' '{\"type\":\"inbound\",\"accountId\":\"tenant-a\",\"eventType\":\"im.message.receive_v1\",\"event\":{\"message\":{\"message_id\":\"om_delayed_stdio\"}}}'; sleep 0.2"
+    }
+
     @TestCase
     public func readyWritesInitFrameThroughStdinAndMarksHealth(): Unit {
         let process = FeishuSidecarFakeProcess(stdout: [
@@ -212,6 +217,34 @@ public class FeishuSidecarTransportTest {
         let message = event.get("message").getOrThrow().asObject()
         @Expect(message.get("message_id").getOrThrow().asString().getValue(), "om_sidecar")
         @Expect(transport.healthSnapshot().lastInboundAt > 0, true)
+    }
+
+    @TestCase
+    public func stdioBackgroundReaderKeepsDelayedInboundAfterReadTimeouts(): Unit {
+        let transport = FeishuSidecarTransport(
+            runner: FeishuSidecarStdioRunner(),
+            options: FeishuSidecarTransportOptions(
+                command: "/bin/zsh",
+                args: ["-lc", this.delayedStdioScript()],
+                readyTimeoutMs: 1000,
+                readTimeoutMs: 20,
+                stopTimeoutMs: 100,
+                startBackgroundReader: true
+            )
+        )
+        let events = ArrayList<JsonObject>()
+
+        let result = transport.start(this.spec(), { root => events.add(root) })
+        @Expect(result.ok, true)
+        sleep(Duration.millisecond * 700)
+
+        @Expect(events.size, 1)
+        let header = events[0].get("header").getOrThrow().asObject()
+        @Expect(header.get("event_type").getOrThrow().asString().getValue(), "im.message.receive_v1")
+        let event = events[0].get("event").getOrThrow().asObject()
+        let message = event.get("message").getOrThrow().asObject()
+        @Expect(message.get("message_id").getOrThrow().asString().getValue(), "om_delayed_stdio")
+        transport.stop()
     }
 
     @TestCase

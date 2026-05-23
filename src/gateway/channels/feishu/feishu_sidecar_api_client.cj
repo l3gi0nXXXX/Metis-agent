@@ -139,7 +139,7 @@ public class FeishuSidecarProcessRequestRunner <: FeishuSidecarRequestRunner {
         out.put("domain", JsonString(this.account.domain))
         out.put("verificationToken", JsonString(this.account.verificationToken))
         out.put("encryptKey", JsonString(this.account.encryptKey))
-        out.put("mode", JsonString("websocket"))
+        out.put("mode", JsonString("api"))
         out.put("readyTimeoutMs", JsonInt(this.options.readyTimeoutMs))
         out.put("runtimeRoot", JsonString(spec.runtimeRoot))
         out
@@ -174,8 +174,7 @@ public class FeishuSidecarProcessRequestRunner <: FeishuSidecarRequestRunner {
             case "message.delete" => "deleteMessage"
             case "message.fetch" => "message.fetch"
             case "message.list_merge_forward" => "message.list_merge_forward"
-            case "resource.download" =>
-                if (feishuSidecarJsonString(params, "resourceType").toAsciiLower() == "image") { "downloadImage" } else { "downloadResource" }
+            case "resource.download" => "downloadResource"
             case "chat.thread_capable" => "chat.thread_capable"
             case _ => operation.trimAscii()
         }

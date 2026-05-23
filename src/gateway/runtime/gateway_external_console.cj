@@ -154,9 +154,16 @@ public func gatewayLaunchDedicatedConsole(): Bool {
         let envsetup = "/Users/l3gi0n/cangjie100/envsetup.sh"
         let opensslLibExport =
             "export DYLD_LIBRARY_PATH=\"/opt/homebrew/opt/openssl@3/lib:/opt/homebrew/opt/openssl@3.5/lib:/usr/local/opt/openssl@3/lib:\${DYLD_LIBRARY_PATH}\""
+        let tlsCaExport = if (InfoUtils.os == "macos") {
+            "export SSL_CERT_FILE=\"\${SSL_CERT_FILE:-/etc/ssl/cert.pem}\" && " +
+                "export NODE_EXTRA_CA_CERTS=\"\${NODE_EXTRA_CA_CERTS:-/etc/ssl/cert.pem}\" && " +
+                "export NODE_USE_SYSTEM_CA=\"\${NODE_USE_SYSTEM_CA:-1}\""
+        } else {
+            "true"
+        }
         let script =
             "cd \"${cwd}\" && " +
-            "nohup /bin/zsh -lc 'source \"${envsetup}\" && ${opensslLibExport} && rtk cjpm run --skip-script --skip-build --name metis --run-args \"gateway serve\"' >> \"${logStr}\" 2>&1 &"
+            "nohup /bin/zsh -lc 'source \"${envsetup}\" && ${opensslLibExport} && ${tlsCaExport} && rtk cjpm run --skip-script --skip-build --name metis --run-args \"gateway serve\"' >> \"${logStr}\" 2>&1 &"
         let proc = launch(
             "/bin/sh",
             ["-c", script],

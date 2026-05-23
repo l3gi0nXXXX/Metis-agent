@@ -2,7 +2,7 @@ package metis.core
 
 import std.collection.{ArrayList, HashMap}
 import std.sync.Mutex
-import stdx.encoding.json.{JsonObject, JsonValue}
+import stdx.encoding.json.{JsonBool, JsonObject, JsonString, JsonValue}
 
 private func gatewayToolRuntimeCloneObject(value: JsonObject): JsonObject {
     try {
@@ -28,6 +28,7 @@ public class GatewayToolRuntimeContext {
     public let mediaContext: JsonObject
     public let memorySearchPolicy: JsonObject
     public let lifecycleHook: Option<(String) -> Unit>
+    public let gatewayCallHook: Option<(String, JsonObject) -> JsonObject>
     private var visibleReplyDelivered: Bool = false
 
     public init(
@@ -45,7 +46,8 @@ public class GatewayToolRuntimeContext {
         prompt!: String = "",
         mediaContext!: JsonObject = JsonObject(),
         memorySearchPolicy!: JsonObject = JsonObject(),
-        lifecycleHook!: Option<(String) -> Unit> = None<(String) -> Unit>
+        lifecycleHook!: Option<(String) -> Unit> = None<(String) -> Unit>,
+        gatewayCallHook!: Option<(String, JsonObject) -> JsonObject> = None<(String, JsonObject) -> JsonObject>
     ) {
         this.sourceLabel = sourceLabel.trimAscii().toAsciiLower()
         this.channelName = channelName.trimAscii().toAsciiLower()
@@ -69,6 +71,7 @@ public class GatewayToolRuntimeContext {
         this.mediaContext = mediaContext
         this.memorySearchPolicy = gatewayToolRuntimeCloneObject(memorySearchPolicy)
         this.lifecycleHook = lifecycleHook
+        this.gatewayCallHook = gatewayCallHook
     }
 
     public func notifyLifecycleStatus(status: String): Unit {
@@ -161,6 +164,28 @@ public func gatewayMarkCurrentToolRuntimeVisibleReplyDelivered(): Unit {
         case Some(context) => context.markVisibleReplyDelivered()
         case None => ()
     }
+}
+
+public func gatewayInvokeCurrentToolRuntimeGatewayCall(method: String, params: JsonObject): Option<JsonObject> {
+    match (gatewayCurrentToolRuntimeContext()) {
+        case Some(context) =>
+            match (context.gatewayCallHook) {
+                case Some(hook) =>
+                    try {
+                        return Some(hook(method.trimAscii(), params))
+                    } catch (e: Exception) {
+                        let out = JsonObject()
+                        out.put("ok", JsonBool(false))
+                        out.put("status", JsonString("error"))
+                        out.put("method", JsonString(method.trimAscii()))
+                        out.put("error", JsonString(e.message))
+                        return Some(out)
+                    }
+                case None => ()
+            }
+        case None => ()
+    }
+    None<JsonObject>
 }
 
 public func gatewayWithToolRuntimeContext<T>(context: GatewayToolRuntimeContext, block: () -> T): T {

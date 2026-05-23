@@ -45,6 +45,7 @@ public class GatewayConfiguredBindingProfilesTest {
 
         let first = primeEntries[0].asObject()
         @Expect(bindingProfileBool(first, "configuredBinding"), true)
+        @Expect(bindingProfileString(first, "accountId"), "default")
     }
 
     @TestCase
@@ -55,6 +56,7 @@ public class GatewayConfiguredBindingProfilesTest {
         let primed = gatewayConfiguredPrimeEntryFromBindingRow(row)
         @Expect(bindingProfileBool(primed, "configuredBinding"), true)
         @Expect(bindingProfileBool(primed, "autoEnabled"), true)
+        @Expect(bindingProfileString(primed, "accountId"), "default")
     }
 
     @TestCase
@@ -76,5 +78,6 @@ public class GatewayConfiguredBindingProfilesTest {
         let first = primed[0].asObject()
         @Expect(bindingProfileBool(first, "configuredBinding"), true)
         @Expect(bindingProfileString(first, "bindingKind"), "configured")
+        @Expect(bindingProfileString(first, "accountId"), "default")
     }
 }

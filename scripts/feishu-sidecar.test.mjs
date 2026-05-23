@@ -26,6 +26,7 @@ function writeFakeSdk(root, options = {}) {
     sdkPath,
     `
       import fs from "node:fs";
+      import { Readable } from "node:stream";
 
       const callsPath = process.env.METIS_FEISHU_FAKE_SDK_CALLS;
       const behavior = JSON.parse(process.env.METIS_FEISHU_FAKE_SDK_BEHAVIOR || "{}");
@@ -100,6 +101,11 @@ function writeFakeSdk(root, options = {}) {
           if (behavior.start === "never") {
             return new Promise(() => {});
           }
+          if (behavior.start !== "noReady") {
+            setTimeout(() => {
+              this.options.onReady?.();
+            }, behavior.readyDelayMs ?? 0);
+          }
           const events = behavior.events || [];
           for (const [index, event] of events.entries()) {
             setTimeout(() => {
@@ -112,6 +118,11 @@ function writeFakeSdk(root, options = {}) {
               if (handler) handler(new Error("fake background close " + (behavior.secretEcho || "")));
             }, behavior.backgroundCloseMs);
           }
+          if (behavior.backgroundErrorMs !== undefined) {
+            setTimeout(() => {
+              this.options.onError?.(new Error("fake background error " + (behavior.secretEcho || "")));
+            }, behavior.backgroundErrorMs);
+          }
           return behavior.start === "async" ? new Promise((resolve) => setTimeout(resolve, behavior.startDelayMs ?? 5)) : undefined;
         }
         close() {
@@ -120,6 +131,28 @@ function writeFakeSdk(root, options = {}) {
       }
 
       const responseQueue = Array.isArray(behavior.responses) ? [...behavior.responses] : [];
+      function bufferFromFixture(value) {
+        if (Buffer.isBuffer(value)) return value;
+        if (value?.type === "Buffer" && Array.isArray(value.data)) return Buffer.from(value.data);
+        return Buffer.from(String(value ?? ""));
+      }
+      function materializeResponse(entry) {
+        if (entry?.writeFileBytes !== undefined) {
+          const buffer = bufferFromFixture(entry.writeFileBytes);
+          return {
+            headers: entry.headers ?? {},
+            file_name: entry.file_name,
+            fileName: entry.fileName,
+            writeFile: async (targetPath) => {
+              fs.writeFileSync(targetPath, buffer);
+            },
+            getReadableStream: () => {
+              return Readable.from([buffer]);
+            },
+          };
+        }
+        return entry;
+      }
       function nextResponse(defaultValue) {
         const entry = responseQueue.length > 0 ? responseQueue.shift() : undefined;
         if (entry?.throw) {
@@ -127,7 +160,7 @@ function writeFakeSdk(root, options = {}) {
           if (entry.throw.code !== undefined) error.code = entry.throw.code;
           throw error;
         }
-        return entry ?? defaultValue;
+        return materializeResponse(entry ?? defaultValue);
       }
 
       export class Client {
@@ -290,6 +323,9 @@ function writeFakeRuntimeRoot(root, options = {}) {
           }
           start({ eventDispatcher }) {
             record("WSClient.start", { hasDispatcher: Boolean(eventDispatcher) });
+            setTimeout(() => {
+              this.options.onReady?.();
+            }, 0);
           }
           close() {
             record("WSClient.close", {});
@@ -299,7 +335,14 @@ function writeFakeRuntimeRoot(root, options = {}) {
           constructor(options) {
             this.options = options;
             record("Client", options);
-            this.im = { message: {} };
+            this.im = {
+              message: {
+                create: async (request) => {
+                  record("im.message.create", request);
+                  return { code: 0, data: { message_id: "om_created", chat_id: request.data.receive_id } };
+                },
+              },
+            };
           }
         };
       `,
@@ -461,6 +504,55 @@ test("feishu sidecar resolves sdk from runtime root without METIS_FEISHU_SIDECAR
   }
 });
 
+test("api mode initializes REST client without opening a websocket connection", async () => {
+  const root = createTempRoot();
+  const { runtimeRoot, callsPath } = writeFakeRuntimeRoot(root);
+  let proc;
+  try {
+    proc = spawnSidecar({ callsPath });
+    proc.writeFrame(baseInit({ mode: "api", runtimeRoot }));
+    const ready = await proc.waitForFrame((frame) => frame.type === "ready");
+    assert.equal(ready.transport, "api");
+    proc.writeFrame({ type: "request", action: "sendText", requestId: "api-text", to: "oc_chat", text: "hello" });
+    const resultFrame = await proc.waitForFrame((frame) => frame.type === "sendResult" && frame.requestId === "api-text");
+    assert.equal(resultFrame.ok, true);
+    assert.equal(resultFrame.messageId, "om_created");
+    assert.equal(callsOf(callsPath, "Client").length, 1);
+    assert.equal(callsOf(callsPath, "im.message.create").length, 1);
+    assert.equal(callsOf(callsPath, "EventDispatcher").length, 0);
+    assert.equal(callsOf(callsPath, "WSClient").length, 0);
+    assert.equal(callsOf(callsPath, "WSClient.start").length, 0);
+    const result = await proc.close();
+    assert.equal(result.status, 0, result.stderr);
+  } finally {
+    if (proc && proc.child.exitCode == null && !proc.child.killed) {
+      await proc.close();
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("feishu sidecar does not emit ready until SDK reports websocket ready", async () => {
+  const root = createTempRoot();
+  const { sdkPath, callsPath } = writeFakeSdk(root);
+  try {
+    const proc = spawnSidecar({
+      sdkPath,
+      callsPath,
+      behavior: { start: "noReady" },
+    });
+    proc.writeFrame(baseInit({ readyTimeoutMs: 30 }));
+    const error = await proc.waitForFrame((frame) => frame.type === "error" && frame.phase === "websocket.start", 1000);
+    assert.equal(error.status, "ready_timeout");
+    assert.equal(proc.frames.some((frame) => frame.type === "ready"), false);
+    proc.child.stdin.end();
+    await proc.waitForExit();
+    assert.notEqual(proc.child.exitCode, 0);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("feishu sidecar dependency preflight reports missing runtime package json", async () => {
   const root = createTempRoot();
   const runtimeRoot = path.join(root, "missing-runtime");
@@ -537,6 +629,31 @@ test("feishu sidecar creates proxy agent from runtime root when SDK does not exp
     assert.equal(result.status, 0, result.stderr);
     assert.equal(callsOf(callsPath, "runtime.proxyAgent")[0].url, "http://127.0.0.1:7897");
     assert.equal(callsOf(callsPath, "sdk.proxyAgent").length, 0);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("sdk background error emits diagnostic failure after ready without leaking secrets", async () => {
+  const root = createTempRoot();
+  const { sdkPath, callsPath } = writeFakeSdk(root);
+  try {
+    const proc = spawnSidecar({
+      sdkPath,
+      callsPath,
+      behavior: { backgroundErrorMs: 10, secretEcho: secretValues.appSecret },
+    });
+    proc.writeFrame(baseInit());
+    await proc.waitForFrame((frame) => frame.type === "ready");
+    const diagnostic = await proc.waitForFrame(
+      (frame) => frame.type === "diagnostic" && frame.level === "error" && frame.phase === "websocket.error",
+      1000,
+    );
+    assert.equal(diagnostic.status, "failed");
+    assert.match(diagnostic.message, /fake background error/);
+    assert.equal(`${proc.stdoutLines.join("\n")}${proc.stderrLines.join("\n")}`.includes(secretValues.appSecret), false);
+    proc.child.stdin.end();
+    await proc.waitForExit();
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -738,7 +855,7 @@ test("send text, media, card, reaction, delete, and download requests route to S
       { type: "send", action: "message.fetch", requestId: "fetch", messageId: "om_1" },
       { type: "send", action: "message.list_merge_forward", requestId: "merge", messageId: "om_merge" },
       { type: "send", action: "chat.thread_capable", requestId: "thread", chatId: "oc_chat" },
-      { type: "send", action: "downloadImage", requestId: "download-image", imageKey: "img_1" },
+      { type: "send", action: "downloadResource", requestId: "download-image", messageId: "om_img", fileKey: "img_1", resourceType: "image" },
       { type: "send", action: "downloadResource", requestId: "download-resource", messageId: "om_1", fileKey: "file_1", resourceType: "file" },
     ];
     for (const request of requests) {
@@ -759,8 +876,12 @@ test("send text, media, card, reaction, delete, and download requests route to S
     assert.equal(callsOf(callsPath, "im.message.delete")[0].path.message_id, "om_1");
     assert.equal(callsOf(callsPath, "im.message.get").length, 2);
     assert.equal(callsOf(callsPath, "im.chat.get")[0].path.chat_id, "oc_chat");
-    assert.equal(callsOf(callsPath, "im.image.get")[0].path.image_key, "img_1");
+    assert.equal(callsOf(callsPath, "im.image.get").length, 0);
     assert.deepEqual(callsOf(callsPath, "im.messageResource.get")[0], {
+      path: { message_id: "om_img", file_key: "img_1" },
+      params: { type: "image" },
+    });
+    assert.deepEqual(callsOf(callsPath, "im.messageResource.get")[1], {
       path: { message_id: "om_1", file_key: "file_1" },
       params: { type: "file" },
     });
@@ -878,6 +999,52 @@ test("download image and resource return byte metadata and reject empty buffers 
 
     const result = await proc.close();
     assert.equal(`${result.stdout}${result.stderr}`.includes(secretValues.appSecret), false);
+  } finally {
+    await proc?.close?.();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("message resource downloads read Feishu SDK writeFile responses", async () => {
+  const root = createTempRoot();
+  const { sdkPath, callsPath } = writeFakeSdk(root);
+  let proc;
+  try {
+    proc = spawnSidecar({
+      sdkPath,
+      callsPath,
+      behavior: {
+        responses: [
+          {
+            writeFileBytes: "image-resource-bytes",
+            fileName: "resource-image.png",
+            headers: { "content-type": "image/png" },
+          },
+        ],
+      },
+    });
+    proc.writeFrame(baseInit());
+    await proc.waitForFrame((frame) => frame.type === "ready");
+
+    proc.writeFrame({
+      type: "send",
+      action: "downloadResource",
+      requestId: "resource-write-file",
+      messageId: "om_img",
+      fileKey: "img_1",
+      resourceType: "image",
+    });
+    const resource = await proc.waitForFrame((frame) => frame.requestId === "resource-write-file");
+
+    assert.equal(resource.type, "sendResult");
+    assert.equal(resource.contentBase64, Buffer.from("image-resource-bytes").toString("base64"));
+    assert.equal(resource.bytesBase64, resource.contentBase64);
+    assert.equal(resource.contentType, "image/png");
+    assert.equal(resource.fileName, "resource-image.png");
+    assert.deepEqual(callsOf(callsPath, "im.messageResource.get")[0], {
+      path: { message_id: "om_img", file_key: "img_1" },
+      params: { type: "image" },
+    });
   } finally {
     await proc?.close?.();
     fs.rmSync(root, { recursive: true, force: true });

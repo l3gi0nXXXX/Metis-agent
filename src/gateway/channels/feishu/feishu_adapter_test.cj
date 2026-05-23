@@ -74,6 +74,22 @@ public class FeishuAdapterTest {
         Path("/tmp/metis-feishu-pairing-${suffix}-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
     }
 
+    private func feishuMediaStatePathForTest(root: Path, accountId: String): Path {
+        root.join("gateway-feishu").join("accounts").join(accountId).join("media-state.json")
+    }
+
+    private func readFeishuMediaStateForTest(root: Path, accountId: String): JsonObject {
+        let path = this.feishuMediaStatePathForTest(root, accountId)
+        if (!exists(path)) {
+            return JsonObject()
+        }
+        try {
+            JsonValue.fromStr(String.fromUtf8(File.readFrom(path))).asObject()
+        } catch (_e: Exception) {
+            JsonObject()
+        }
+    }
+
     private func feishuGate(inbound: InboundMessage): JsonObject {
         inbound.mediaContext.get("context").getOrThrow().asObject()
             .get("feishuGate").getOrThrow().asObject()
@@ -2993,6 +3009,420 @@ public class FeishuAdapterTest {
         @Expect(mergeEvidence.get("operatorId").getOrThrow().asString().getValue(), "ou_forwarder")
         @Expect(mergeEvidence.get("operation").getOrThrow().asString().getValue(), "merge_forward")
         @Expect(merge.get("historicalFetch").getOrThrow().asObject().get("status").getOrThrow().asString().getValue(), "auth_required")
+    }
+
+    @TestCase
+    public func imageResourceDownloadDefaultsToFeishuAccountMediaArchive(): Unit {
+        let root = this.pairingTestRoot("media-default-archive")
+        try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        let client = FeishuFakeApiClient()
+        client.setResource(
+            "work",
+            "om_image_archive",
+            "img_archive",
+            "image",
+            "fake-image".toArray(),
+            contentType: "image/png",
+            fileName: "diagram.png"
+        )
+        let adapter = FeishuAdapter(
+            config: FeishuConfig(
+                enabled: true,
+                media: FeishuMediaConfig(downloadEnabled: true, allowedMimes: ["image/*"])
+            ),
+            accountId: "work",
+            apiClient: client,
+            pairingRoot: root
+        )
+        adapter.start()
+        try {
+            @Expect(adapter.ingestWebhookPayload(
+                this.webhookPayload(
+                    "om_image_archive",
+                    "oc_group",
+                    "ou_1",
+                    "{\\\"image_key\\\":\\\"img_archive\\\",\\\"file_name\\\":\\\"diagram.png\\\",\\\"mime_type\\\":\\\"image/png\\\"}",
+                    messageType: "image"
+                )
+            ).contains("\"ok\":true"), true)
+
+            let inbound = adapter.pullInbound()
+            @Expect(inbound.size, 1)
+            let record = inbound[0].mediaContext.get("records").getOrThrow().asArray()[0].asObject()
+            let localPath = record.get("localPath").getOrThrow().asString().getValue()
+            let archiveRoot = root.join("gateway-feishu").join("accounts").join("work").join("media").toString()
+            @Expect(localPath.startsWith(archiveRoot), true)
+            @Expect(localPath.startsWith("/tmp/metis-feishu-media"), false)
+            @Expect(exists(Path(localPath)), true)
+        } finally {
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func imageResourceDownloadHonorsExplicitDownloadRoot(): Unit {
+        let pairingRoot = this.pairingTestRoot("media-explicit-pairing")
+        let downloadRoot = "/tmp/metis-feishu-explicit-download-${DateTime.now().toUnixTimeStamp().toMilliseconds()}"
+        try { remove(pairingRoot, recursive: true) } catch (_e: Exception) { () }
+        try { remove(Path(downloadRoot), recursive: true) } catch (_e: Exception) { () }
+        let client = FeishuFakeApiClient()
+        client.setResource("work", "om_explicit_root", "img_explicit", "image", "fake-image".toArray(), contentType: "image/png", fileName: "diagram.png")
+        let adapter = FeishuAdapter(
+            config: FeishuConfig(
+                enabled: true,
+                media: FeishuMediaConfig(downloadEnabled: true, allowedMimes: ["image/*"], downloadRoot: downloadRoot)
+            ),
+            accountId: "work",
+            apiClient: client,
+            pairingRoot: pairingRoot
+        )
+        adapter.start()
+        try {
+            @Expect(adapter.ingestWebhookPayload(this.webhookPayload(
+                "om_explicit_root",
+                "oc_group",
+                "ou_1",
+                "{\\\"image_key\\\":\\\"img_explicit\\\",\\\"file_name\\\":\\\"diagram.png\\\",\\\"mime_type\\\":\\\"image/png\\\"}",
+                messageType: "image"
+            )).contains("\"ok\":true"), true)
+            let record = adapter.pullInbound()[0].mediaContext.get("records").getOrThrow().asArray()[0].asObject()
+            let localPath = record.get("localPath").getOrThrow().asString().getValue()
+            @Expect(localPath.startsWith(downloadRoot), true)
+            @Expect(localPath.contains("/om_explicit_root/"), true)
+        } finally {
+            try { remove(pairingRoot, recursive: true) } catch (_e: Exception) { () }
+            try { remove(Path(downloadRoot), recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func feishuDefaultMediaArchiveUsesDateAndMessageDirectory(): Unit {
+        let root = this.pairingTestRoot("media-date-message")
+        try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        let client = FeishuFakeApiClient()
+        client.setResource("work", "om_date_dir", "img_date_dir", "image", "fake-image".toArray(), contentType: "image/png", fileName: "diagram.png")
+        let adapter = FeishuAdapter(
+            config: FeishuConfig(enabled: true, media: FeishuMediaConfig(downloadEnabled: true, allowedMimes: ["image/*"])),
+            accountId: "work",
+            apiClient: client,
+            pairingRoot: root
+        )
+        adapter.start()
+        try {
+            @Expect(adapter.ingestWebhookPayload(this.webhookPayload(
+                "om_date_dir",
+                "oc_group",
+                "ou_1",
+                "{\\\"image_key\\\":\\\"img_date_dir\\\",\\\"file_name\\\":\\\"diagram.png\\\",\\\"mime_type\\\":\\\"image/png\\\"}",
+                messageType: "image"
+            )).contains("\"ok\":true"), true)
+            let record = adapter.pullInbound()[0].mediaContext.get("records").getOrThrow().asArray()[0].asObject()
+            let localPath = record.get("localPath").getOrThrow().asString().getValue()
+            @Expect(localPath.contains("/${DateTime.now().format("yyyy-MM-dd")}/om_date_dir/"), true)
+        } finally {
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func feishuDefaultMediaArchiveDoesNotUseTmpFallback(): Unit {
+        let root = this.pairingTestRoot("media-no-tmp-fallback")
+        try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        let client = FeishuFakeApiClient()
+        client.setResource("work", "om_no_tmp", "img_no_tmp", "image", "fake-image".toArray(), contentType: "image/png", fileName: "diagram.png")
+        let adapter = FeishuAdapter(
+            config: FeishuConfig(enabled: true, media: FeishuMediaConfig(downloadEnabled: true, allowedMimes: ["image/*"])),
+            accountId: "work",
+            apiClient: client,
+            pairingRoot: root
+        )
+        adapter.start()
+        try {
+            @Expect(adapter.ingestWebhookPayload(this.webhookPayload(
+                "om_no_tmp",
+                "oc_group",
+                "ou_1",
+                "{\\\"image_key\\\":\\\"img_no_tmp\\\",\\\"file_name\\\":\\\"diagram.png\\\",\\\"mime_type\\\":\\\"image/png\\\"}",
+                messageType: "image"
+            )).contains("\"ok\":true"), true)
+            let record = adapter.pullInbound()[0].mediaContext.get("records").getOrThrow().asArray()[0].asObject()
+            @Expect(record.get("localPath").getOrThrow().asString().getValue().startsWith("/tmp/metis-feishu-media"), false)
+        } finally {
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func currentImageDownloadPersistsFeishuMediaState(): Unit {
+        let root = this.pairingTestRoot("media-state-image")
+        try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        let client = FeishuFakeApiClient()
+        client.setResource("work", "om_state_image", "img_state", "image", "fake-image".toArray(), contentType: "image/png", fileName: "diagram.png")
+        let adapter = FeishuAdapter(
+            config: FeishuConfig(enabled: true, media: FeishuMediaConfig(downloadEnabled: true, allowedMimes: ["image/*"])),
+            accountId: "work",
+            apiClient: client,
+            pairingRoot: root
+        )
+        adapter.start()
+        try {
+            @Expect(adapter.ingestWebhookPayload(this.webhookPayload(
+                "om_state_image",
+                "oc_group",
+                "ou_1",
+                "{\\\"image_key\\\":\\\"img_state\\\",\\\"file_name\\\":\\\"diagram.png\\\",\\\"mime_type\\\":\\\"image/png\\\"}",
+                messageType: "image"
+            )).contains("\"ok\":true"), true)
+            let statePath = this.feishuMediaStatePathForTest(root, "work")
+            @Expect(exists(statePath), true)
+            let state = this.readFeishuMediaStateForTest(root, "work")
+            let records = state.get("records").getOrThrow().asArray()
+            let last = state.get("lastMedia").getOrThrow().asObject()
+            @Expect(state.get("channel").getOrThrow().asString().getValue(), "feishu")
+            @Expect(state.get("accountId").getOrThrow().asString().getValue(), "work")
+            @Expect(state.get("mediaStatePath").getOrThrow().asString().getValue(), statePath.toString())
+            @Expect(state.get("archiveRoot").getOrThrow().asString().getValue().endsWith("/gateway-feishu/accounts/work/media"), true)
+            @Expect(state.get("downloadRoot").getOrThrow().asString().getValue(), "")
+            @Expect(state.get("lastMediaRecordId").getOrThrow().asString().getValue(), last.get("mediaId").getOrThrow().asString().getValue())
+            @Expect(records[0].asObject().get("mediaId").getOrThrow().asString().getValue(), last.get("mediaId").getOrThrow().asString().getValue())
+            @Expect(last.get("downloaded").getOrThrow().asBool().getValue(), true)
+            @Expect(last.get("sourceScope").getOrThrow().asString().getValue(), "current")
+        } finally {
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func currentFileMetadataOnlyAlsoPersistsFeishuMediaState(): Unit {
+        let root = this.pairingTestRoot("media-state-metadata")
+        try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        let adapter = FeishuAdapter(
+            config: FeishuConfig(enabled: true, media: FeishuMediaConfig(downloadEnabled: false)),
+            accountId: "work",
+            pairingRoot: root
+        )
+        adapter.start()
+        try {
+            @Expect(adapter.ingestWebhookPayload(this.webhookPayload(
+                "om_state_file",
+                "oc_group",
+                "ou_1",
+                "{\\\"file_key\\\":\\\"file_state\\\",\\\"file_name\\\":\\\"report.pdf\\\",\\\"mime_type\\\":\\\"application/pdf\\\",\\\"size\\\":64}",
+                messageType: "file"
+            )).contains("\"ok\":true"), true)
+            let state = this.readFeishuMediaStateForTest(root, "work")
+            let last = state.get("lastMedia").getOrThrow().asObject()
+            @Expect(state.get("downloadEnabled").getOrThrow().asBool().getValue(), false)
+            @Expect(last.get("mediaKind").getOrThrow().asString().getValue(), "file")
+            @Expect(last.get("downloaded").getOrThrow().asBool().getValue(), false)
+            @Expect(last.get("skippedReason").getOrThrow().asString().getValue(), "metadata_only")
+            @Expect(last.get("fileKey").getOrThrow().asString().getValue(), "file_state")
+        } finally {
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func feishuMediaStateDeduplicatesSameMediaId(): Unit {
+        let root = this.pairingTestRoot("media-state-dedupe")
+        try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        try {
+            for (_i in 0..2) {
+                let adapter = FeishuAdapter(
+                    config: FeishuConfig(enabled: true, media: FeishuMediaConfig(downloadEnabled: false)),
+                    accountId: "work",
+                    pairingRoot: root
+                )
+                adapter.start()
+                @Expect(adapter.ingestWebhookPayload(this.webhookPayload(
+                    "om_dedupe",
+                    "oc_group",
+                    "ou_1",
+                    "{\\\"image_key\\\":\\\"img_dedupe\\\",\\\"file_name\\\":\\\"same.png\\\",\\\"mime_type\\\":\\\"image/png\\\"}",
+                    messageType: "image"
+                )).contains("\"ok\":true"), true)
+            }
+            let records = this.readFeishuMediaStateForTest(root, "work").get("records").getOrThrow().asArray()
+            @Expect(records.size(), 1)
+            @Expect(records[0].asObject().get("messageId").getOrThrow().asString().getValue(), "om_dedupe")
+        } finally {
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func feishuMediaStateKeepsRecentBoundedRecords(): Unit {
+        let root = this.pairingTestRoot("media-state-bounded")
+        try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        let adapter = FeishuAdapter(
+            config: FeishuConfig(enabled: true, media: FeishuMediaConfig(downloadEnabled: false)),
+            accountId: "work",
+            pairingRoot: root
+        )
+        adapter.start()
+        try {
+            for (i in 0..205) {
+                @Expect(adapter.ingestWebhookPayload(this.webhookPayload(
+                    "om_bound_${i}",
+                    "oc_group",
+                    "ou_1",
+                    "{\\\"image_key\\\":\\\"img_bound_${i}\\\",\\\"file_name\\\":\\\"${i}.png\\\",\\\"mime_type\\\":\\\"image/png\\\"}",
+                    messageType: "image"
+                )).contains("\"ok\":true"), true)
+            }
+            let state = this.readFeishuMediaStateForTest(root, "work")
+            let records = state.get("records").getOrThrow().asArray()
+            @Expect(records.size(), 200)
+            @Expect(records[0].asObject().get("messageId").getOrThrow().asString().getValue(), "om_bound_5")
+            @Expect(state.get("lastMedia").getOrThrow().asObject().get("messageId").getOrThrow().asString().getValue(), "om_bound_204")
+        } finally {
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func feishuInboundMediaContextCarriesMediaStatePathAndMessageId(): Unit {
+        let root = this.pairingTestRoot("media-context-state")
+        try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        let adapter = FeishuAdapter(
+            config: FeishuConfig(enabled: true, media: FeishuMediaConfig(downloadEnabled: false)),
+            accountId: "work",
+            pairingRoot: root
+        )
+        adapter.start()
+        try {
+            @Expect(adapter.ingestWebhookPayload(this.webhookPayload(
+                "om_context_state",
+                "oc_group",
+                "ou_1",
+                "{\\\"image_key\\\":\\\"img_context\\\",\\\"file_name\\\":\\\"diagram.png\\\",\\\"mime_type\\\":\\\"image/png\\\"}",
+                messageType: "image"
+            )).contains("\"ok\":true"), true)
+            let mediaContext = adapter.pullInbound()[0].mediaContext
+            @Expect(mediaContext.get("messageId").getOrThrow().asString().getValue(), "om_context_state")
+            @Expect(mediaContext.get("mediaStatePath").getOrThrow().asString().getValue(), this.feishuMediaStatePathForTest(root, "work").toString())
+            @Expect(mediaContext.get("archiveRoot").getOrThrow().asString().getValue().endsWith("/gateway-feishu/accounts/work/media"), true)
+            @Expect(mediaContext.get("mediaArchiveRoot").getOrThrow().asString().getValue(), mediaContext.get("archiveRoot").getOrThrow().asString().getValue())
+            @Expect(mediaContext.get("downloadRoot").getOrThrow().asString().getValue(), "")
+            let record = mediaContext.get("records").getOrThrow().asArray()[0].asObject()
+            @Expect(record.get("sourceScope").getOrThrow().asString().getValue(), "current")
+            @Expect(record.get("messageId").getOrThrow().asString().getValue(), "om_context_state")
+        } finally {
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func feishuQuoteMediaRecordPersistsWithRelationQuote(): Unit {
+        let root = this.pairingTestRoot("media-state-quote")
+        try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        let client = FeishuFakeApiClient()
+        client.setMessage("work", "om_quote_source", "image", "{\"image_key\":\"img_quote_state\",\"file_name\":\"quote.png\",\"mime_type\":\"image/png\"}")
+        let adapter = FeishuAdapter(
+            config: FeishuConfig(enabled: true, media: FeishuMediaConfig(downloadEnabled: false)),
+            accountId: "work",
+            apiClient: client,
+            pairingRoot: root
+        )
+        adapter.start()
+        try {
+            @Expect(adapter.ingestWebhookPayload(this.webhookPayload(
+                "om_quote_state",
+                "oc_group",
+                "ou_reply",
+                "{\\\"text\\\":\\\"reply\\\"}",
+                rootId: "om_quote_source"
+            )).contains("\"ok\":true"), true)
+            let last = this.readFeishuMediaStateForTest(root, "work").get("lastMedia").getOrThrow().asObject()
+            @Expect(last.get("relation").getOrThrow().asString().getValue(), "quote")
+            @Expect(last.get("sourceScope").getOrThrow().asString().getValue(), "quote")
+            @Expect(last.get("messageId").getOrThrow().asString().getValue(), "om_quote_source")
+            @Expect(last.get("fileKey").getOrThrow().asString().getValue(), "img_quote_state")
+        } finally {
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func feishuMergeForwardMediaRecordPersistsWithRelationMergeForward(): Unit {
+        let root = this.pairingTestRoot("media-state-merge")
+        try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        let client = FeishuFakeApiClient()
+        client.setMergeForwardMessages("work", "om_merge_state", [
+            FeishuMessageFetchResult(ok: true, status: "ok", messageId: "om_forward_state", messageType: "image", content: "{\"image_key\":\"img_merge_state\",\"file_name\":\"forward.png\",\"mime_type\":\"image/png\"}")
+        ])
+        let adapter = FeishuAdapter(
+            config: FeishuConfig(enabled: true, media: FeishuMediaConfig(downloadEnabled: false)),
+            accountId: "work",
+            apiClient: client,
+            pairingRoot: root
+        )
+        adapter.start()
+        try {
+            @Expect(adapter.ingestWebhookPayload(this.webhookPayload(
+                "om_merge_state",
+                "oc_group",
+                "ou_forwarder",
+                "{\\\"title\\\":\\\"forwarded\\\",\\\"message_count\\\":1}",
+                messageType: "merge_forward"
+            )).contains("\"ok\":true"), true)
+            let last = this.readFeishuMediaStateForTest(root, "work").get("lastMedia").getOrThrow().asObject()
+            @Expect(last.get("relation").getOrThrow().asString().getValue(), "merge_forward")
+            @Expect(last.get("sourceScope").getOrThrow().asString().getValue(), "merge_forward")
+            @Expect(last.get("messageId").getOrThrow().asString().getValue(), "om_forward_state")
+            @Expect(last.get("fileKey").getOrThrow().asString().getValue(), "img_merge_state")
+        } finally {
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func imageFileAudioVideoRecordsPersistToFeishuMediaState(): Unit {
+        let root = this.pairingTestRoot("media-state-kinds")
+        try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        let adapter = FeishuAdapter(
+            config: FeishuConfig(enabled: true, media: FeishuMediaConfig(downloadEnabled: false)),
+            accountId: "work",
+            pairingRoot: root
+        )
+        adapter.start()
+        try {
+            @Expect(adapter.ingestWebhookPayload(this.webhookPayload("om_kind_image", "oc_group", "ou_1", "{\\\"image_key\\\":\\\"img_kind\\\",\\\"file_name\\\":\\\"a.png\\\",\\\"mime_type\\\":\\\"image/png\\\"}", messageType: "image")).contains("\"ok\":true"), true)
+            @Expect(adapter.ingestWebhookPayload(this.webhookPayload("om_kind_file", "oc_group", "ou_1", "{\\\"file_key\\\":\\\"file_kind\\\",\\\"file_name\\\":\\\"a.pdf\\\",\\\"mime_type\\\":\\\"application/pdf\\\"}", messageType: "file")).contains("\"ok\":true"), true)
+            @Expect(adapter.ingestWebhookPayload(this.webhookPayload("om_kind_audio", "oc_group", "ou_1", "{\\\"file_key\\\":\\\"audio_kind\\\",\\\"file_name\\\":\\\"a.ogg\\\",\\\"mime_type\\\":\\\"audio/ogg\\\"}", messageType: "audio")).contains("\"ok\":true"), true)
+            @Expect(adapter.ingestWebhookPayload(this.webhookPayload("om_kind_video", "oc_group", "ou_1", "{\\\"file_key\\\":\\\"video_kind\\\",\\\"file_name\\\":\\\"a.mp4\\\",\\\"mime_type\\\":\\\"video/mp4\\\"}", messageType: "video")).contains("\"ok\":true"), true)
+            let records = this.readFeishuMediaStateForTest(root, "work").get("records").getOrThrow().asArray()
+            @Expect(records.size(), 4)
+            @Expect(records[0].asObject().get("mediaKind").getOrThrow().asString().getValue(), "image")
+            @Expect(records[1].asObject().get("mediaKind").getOrThrow().asString().getValue(), "file")
+            @Expect(records[2].asObject().get("mediaKind").getOrThrow().asString().getValue(), "audio")
+            @Expect(records[3].asObject().get("mediaKind").getOrThrow().asString().getValue(), "video")
+        } finally {
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func feishuPostEmbeddedMediaRecordsPersistAllItemsToState(): Unit {
+        let root = this.pairingTestRoot("media-state-post")
+        try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        let adapter = FeishuAdapter(
+            config: FeishuConfig(enabled: true, media: FeishuMediaConfig(downloadEnabled: false)),
+            accountId: "work",
+            pairingRoot: root
+        )
+        adapter.start()
+        try {
+            let postContent = "{\\\"zh_cn\\\":{\\\"title\\\":\\\"media post\\\",\\\"content\\\":[[{\\\"tag\\\":\\\"text\\\",\\\"text\\\":\\\"body\\\"},{\\\"tag\\\":\\\"img\\\",\\\"image_key\\\":\\\"post_img_state\\\"},{\\\"tag\\\":\\\"file\\\",\\\"file_key\\\":\\\"post_pdf_state\\\",\\\"file_name\\\":\\\"post.pdf\\\",\\\"mime_type\\\":\\\"application/pdf\\\"},{\\\"tag\\\":\\\"media\\\",\\\"file_key\\\":\\\"post_video_state\\\",\\\"file_name\\\":\\\"post.mp4\\\",\\\"mime_type\\\":\\\"video/mp4\\\"}]]}}"
+            @Expect(adapter.ingestWebhookPayload(this.webhookPayload("om_post_state", "oc_group", "ou_1", postContent, messageType: "post")).contains("\"ok\":true"), true)
+            let records = this.readFeishuMediaStateForTest(root, "work").get("records").getOrThrow().asArray()
+            @Expect(records.size(), 3)
+            @Expect(records[0].asObject().get("fileKey").getOrThrow().asString().getValue(), "post_img_state")
+            @Expect(records[1].asObject().get("fileKey").getOrThrow().asString().getValue(), "post_pdf_state")
+            @Expect(records[2].asObject().get("fileKey").getOrThrow().asString().getValue(), "post_video_state")
+        } finally {
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
     }
 
     @TestCase

@@ -1,6 +1,7 @@
 package metis.gateway.config
 
 import metis.core.config.GatewayUserSettings
+import metis.gateway.core.gatewayCanonicalChannelAccountId
 
 import magic.jsonable.*
 import stdx.encoding.json.{JsonArray, JsonObject, JsonString}
@@ -86,8 +87,10 @@ public func gatewayConfiguredBuiltinPrimeEntries(user: GatewayUserSettings): Jso
             continue
         }
         let primed = JsonObject()
-        primed.put("channelId", row.get("channelId") ?? JsonString(""))
-        primed.put("accountId", row.get("accountId") ?? JsonString(""))
+        let channelId = bindingProfileReadString(row, "channelId")
+        let accountId = bindingProfileReadString(row, "accountId")
+        primed.put("channelId", JsonString(channelId))
+        primed.put("accountId", JsonString(gatewayCanonicalChannelAccountId(channelId, accountId)))
         primed.put("configuredBinding", true.toJsonValue())
         primed.put("autoEnabled", row.get("autoEnabled") ?? false.toJsonValue())
         primed.put("detail", JsonString("configured-binding-primed"))
@@ -116,8 +119,10 @@ public func gatewayConfiguredPluginDefaultBindingRow(
 
 public func gatewayConfiguredPrimeEntryFromBindingRow(row: JsonObject): JsonObject {
     let primed = JsonObject()
-    primed.put("channelId", row.get("channelId") ?? JsonString(""))
-    primed.put("accountId", row.get("accountId") ?? JsonString(""))
+    let channelId = bindingProfileReadString(row, "channelId")
+    let accountId = bindingProfileReadString(row, "accountId")
+    primed.put("channelId", JsonString(channelId))
+    primed.put("accountId", JsonString(gatewayCanonicalChannelAccountId(channelId, accountId)))
     primed.put("configuredBinding", true.toJsonValue())
     primed.put("autoEnabled", row.get("autoEnabled") ?? false.toJsonValue())
     primed.put("detail", JsonString("configured-binding-primed"))
@@ -149,6 +154,13 @@ private func gatewayBindingStringField(obj: JsonObject, key: String): String {
     match (obj.get(key)) {
         case Some(v) =>
             try { v.asString().getValue().trimAscii().toAsciiLower() } catch (_e: Exception) { "" }
+        case None => ""
+    }
+}
+
+private func bindingProfileReadString(obj: JsonObject, key: String): String {
+    match (obj.get(key)) {
+        case Some(v) => try { v.asString().getValue().trimAscii() } catch (_e: Exception) { "" }
         case None => ""
     }
 }

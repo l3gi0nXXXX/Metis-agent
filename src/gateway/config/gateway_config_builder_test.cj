@@ -135,7 +135,7 @@ public class GatewayConfigBuilderTest {
 
         @Expect(feishu.media.downloadEnabled, true)
         @Expect(feishu.media.mediaMaxBytes, 20 * 1024 * 1024)
-        @Expect(feishu.media.downloadRoot, "/tmp/metis-feishu-media")
+        @Expect(feishu.media.downloadRoot, "")
     }
 
     @TestCase

@@ -4,6 +4,7 @@ import metis.core.config.CliConfig
 import metis.gateway.logging.{gatewayLoggingCaptureConsoleForTest, gatewayLoggingCapturedConsoleForTest, gatewayLoggingResetForTest}
 import metis.gateway.model.{ChannelType, ChatType, InboundMessage, OutboundMessage, SendResult}
 import magic.config.Config
+import magic.jsonable.*
 
 import std.collection.ArrayList
 import std.env.{getVariable, setVariable}
@@ -11,7 +12,7 @@ import std.fs.{Directory, File, Path, exists, remove}
 import std.time.DateTime
 import std.core.Duration
 import std.unittest.testmacro.*
-import stdx.encoding.json.JsonObject
+import stdx.encoding.json.{JsonArray, JsonObject, JsonString}
 
 private func gatewayChannelRuntimeTestReadState(): String {
     let path = Path(gatewayChannelRuntimeStatePath())
@@ -440,6 +441,38 @@ public class GatewayChannelRuntimeTest {
             @Expect(primed.get("manualStop").getOrThrow().asBool().getValue(), false)
             @Expect(primed.get("abortState").getOrThrow().asString().getValue(), "clear")
             @Expect(gatewayChannelRuntimeCanStart("qq", accountId: "qq:test"), true)
+        }
+    }
+
+    @TestCase
+    public func prefixedConfiguredBindingAndCanonicalAdapterRegistrationShareRuntimeRow(): Unit {
+        withGatewayChannelRuntimeTestHome {
+            let entries = JsonArray([])
+            let entry = JsonObject()
+            entry.put("channelId", JsonString("feishu"))
+            entry.put("accountId", JsonString("feishu:default"))
+            entry.put("configuredBinding", true.toJsonValue())
+            entry.put("autoEnabled", true.toJsonValue())
+            entry.put("detail", JsonString("configured-binding-primed"))
+            entries.add(entry)
+
+            @Expect(gatewayChannelRuntimePrimeAccounts(entries), 1)
+            gatewayChannelRuntimeRegisterAccount(
+                "feishu",
+                accountId: "default",
+                runtimeKind: "builtin-adapter",
+                compatibilityMode: "sidecar"
+            )
+
+            let accounts = gatewayChannelRuntimeAccountsJson("feishu")
+            @Expect(accounts.size(), 1)
+            let row = accounts[0].asObject()
+            @Expect(gatewayRuntimeTestString(row, "accountId"), "default")
+            @Expect(gatewayRuntimeTestBool(row, "configuredBinding"), true)
+            @Expect(gatewayRuntimeTestBool(row, "primed"), true)
+            @Expect(gatewayRuntimeTestString(row, "runtimeKind"), "builtin-adapter")
+            @Expect(gatewayRuntimeTestString(row, "compatibilityMode"), "sidecar")
+            @Expect(gatewayRuntimeTestString(row, "bindingState"), "primed")
         }
     }
 

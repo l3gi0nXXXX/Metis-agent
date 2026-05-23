@@ -3,7 +3,7 @@ package metis.gateway.tools
 import magic.dsl.{tool, toolset}
 import magic.prelude.*
 
-import metis.core.{gatewayCurrentToolRuntimeContext, gatewayMarkCurrentToolRuntimeVisibleReplyDelivered, gatewayMessagePayloadPreview, gatewaySpeechResolveDeliveryPrefs, gatewaySpeechResolveTtsConfig, gatewaySpeechTtsSynthesize, parseGatewayPollParts, renderGatewayAudioText, renderGatewayChatActionText, renderGatewayDeleteText, renderGatewayDocumentText, renderGatewayEditText, renderGatewayPhotoText, renderGatewayPinText, renderGatewayPollTextAdvanced, renderGatewayReactionText, renderGatewayTopicCreateText, renderGatewayTopicEditText, renderGatewayUnpinText, renderGatewayVideoNoteText, renderGatewayVideoText, renderGatewayVoiceText}
+import metis.core.{gatewayCurrentToolRuntimeContext, gatewayInvokeCurrentToolRuntimeGatewayCall, gatewayMarkCurrentToolRuntimeVisibleReplyDelivered, gatewayMessagePayloadPreview, gatewaySpeechResolveDeliveryPrefs, gatewaySpeechResolveTtsConfig, gatewaySpeechTtsSynthesize, parseGatewayPollParts, renderGatewayAudioText, renderGatewayChatActionText, renderGatewayDeleteText, renderGatewayDocumentText, renderGatewayEditText, renderGatewayPhotoText, renderGatewayPinText, renderGatewayPollTextAdvanced, renderGatewayReactionText, renderGatewayTopicCreateText, renderGatewayTopicEditText, renderGatewayUnpinText, renderGatewayVideoNoteText, renderGatewayVideoText, renderGatewayVoiceText}
 import metis.core.config.{CliConfig, CliSettingManager, MetisPaths}
 import metis.io.PrintUtils
 
@@ -72,6 +72,10 @@ public class GatewayMessageToolset {
     private func invokeGatewaySend(payload: JsonObject): JsonObject {
         match (gatewayMessageToolCallRunnerForTest) {
             case Some(runner) => return runner("channels.send", payload)
+            case None => ()
+        }
+        match (gatewayInvokeCurrentToolRuntimeGatewayCall("channels.send", payload)) {
+            case Some(result) => return result
             case None => ()
         }
         let (command, workDir) = this.gatewayMessageBinaryCommand()

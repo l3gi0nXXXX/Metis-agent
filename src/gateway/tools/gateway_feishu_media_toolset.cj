@@ -3,7 +3,7 @@ package metis.gateway.tools
 import magic.dsl.{tool, toolset}
 import magic.prelude.*
 
-import metis.core.{GatewayToolRuntimeContext, gatewayCurrentToolRuntimeContext}
+import metis.core.{GatewayToolRuntimeContext, gatewayCurrentToolRuntimeContext, gatewayInvokeCurrentToolRuntimeGatewayCall, gatewayMarkCurrentToolRuntimeVisibleReplyDelivered, gatewayMessagePayloadPreview, renderGatewayAudioText, renderGatewayDocumentText, renderGatewayPhotoText, renderGatewayVideoNoteText, renderGatewayVideoText, renderGatewayVoiceText}
 import metis.io.PrintUtils
 
 import std.collection.ArrayList
@@ -150,6 +150,145 @@ private func feishuMediaToolCurrentContext(): Option<GatewayToolRuntimeContext> 
             None<GatewayToolRuntimeContext>
         case None => None<GatewayToolRuntimeContext>
     }
+}
+
+private func feishuMediaToolCurrentChannel(ctx: GatewayToolRuntimeContext): String {
+    if (!ctx.channelName.isEmpty()) {
+        return ctx.channelName
+    }
+    ctx.sourceLabel
+}
+
+private func feishuMediaToolTargetFromSessionKey(sessionKey: String): String {
+    let key = sessionKey.trimAscii()
+    let directPrefix = "feishu:direct:"
+    if (key.startsWith(directPrefix)) {
+        return key[directPrefix.size..].trimAscii()
+    }
+    let chatPrefix = "feishu:chat:"
+    if (key.startsWith(chatPrefix)) {
+        return key[chatPrefix.size..].trimAscii()
+    }
+    ""
+}
+
+private func feishuMediaToolCurrentTarget(ctx: GatewayToolRuntimeContext): String {
+    if (!ctx.senderId.isEmpty()) {
+        return ctx.senderId
+    }
+    let peerId = feishuMediaToolString(ctx.mediaContext, "peerId")
+    if (!peerId.isEmpty()) {
+        return peerId
+    }
+    let to = feishuMediaToolString(ctx.mediaContext, "to")
+    if (!to.isEmpty()) {
+        return to
+    }
+    feishuMediaToolTargetFromSessionKey(ctx.sessionKey)
+}
+
+private func feishuMediaToolSendError(code: String, reason: String, media: String, payloadKind: String): String {
+    let out = JsonObject()
+    out.put("ok", JsonBool(false))
+    out.put("status", JsonString("error"))
+    out.put("code", JsonString(code.trimAscii()))
+    out.put("action", JsonString("feishu_media_send"))
+    out.put("media", JsonString(media.trimAscii()))
+    out.put("payloadKind", JsonString(payloadKind.trimAscii()))
+    out.put("reason", JsonString(feishuMediaToolRedactSensitiveText(reason)))
+    out.toJsonString()
+}
+
+private func feishuMediaToolNormalizePayloadKind(kind: String, forceDocument: Bool): String {
+    if (forceDocument) {
+        return "document"
+    }
+    let normalized = kind.trimAscii().toAsciiLower()
+    if (normalized == "photo" || normalized == "image" || normalized == "picture") {
+        return "photo"
+    }
+    if (normalized == "audio") {
+        return "audio"
+    }
+    if (normalized == "voice") {
+        return "voice"
+    }
+    if (normalized == "video") {
+        return "video"
+    }
+    if (normalized == "video-note" || normalized == "videonote") {
+        return "video-note"
+    }
+    "document"
+}
+
+private func feishuMediaToolRenderSendText(media: String, caption: String, payloadKind: String): String {
+    if (payloadKind == "photo") {
+        return renderGatewayPhotoText(media, caption: caption)
+    }
+    if (payloadKind == "audio") {
+        return renderGatewayAudioText(media, caption: caption)
+    }
+    if (payloadKind == "voice") {
+        return renderGatewayVoiceText(media, caption: caption)
+    }
+    if (payloadKind == "video") {
+        return renderGatewayVideoText(media, caption: caption)
+    }
+    if (payloadKind == "video-note") {
+        return renderGatewayVideoNoteText(media)
+    }
+    renderGatewayDocumentText(media, caption: caption)
+}
+
+private func feishuMediaToolSend(media: String, caption: Option<String>, kind: Option<String>, forceDocument: Option<Bool>): String {
+    let fileId = media.trimAscii()
+    let payloadKind = feishuMediaToolNormalizePayloadKind(kind ?? "document", forceDocument ?? false)
+    if (fileId.isEmpty()) {
+        return feishuMediaToolSendError("invalid_request", "pathOrUrl is required", fileId, payloadKind)
+    }
+    let ctx = match (feishuMediaToolCurrentContext()) {
+        case Some(value) => value
+        case None => return feishuMediaToolSendError("not_in_feishu_context", "feishu_media_send requires a current Feishu runtime context", fileId, payloadKind)
+    }
+    let channel = feishuMediaToolCurrentChannel(ctx)
+    if (channel != "feishu") {
+        return feishuMediaToolSendError("not_in_feishu_context", "current runtime channel is not feishu", fileId, payloadKind)
+    }
+    let target = feishuMediaToolCurrentTarget(ctx)
+    if (target.isEmpty()) {
+        return feishuMediaToolSendError("missing_target", "current Feishu runtime context has no sender or peer target", fileId, payloadKind)
+    }
+    let messageText = feishuMediaToolRenderSendText(fileId, caption ?? "", payloadKind)
+    if (messageText.trimAscii().isEmpty()) {
+        return feishuMediaToolSendError("invalid_request", "media payload is empty", fileId, payloadKind)
+    }
+    let payload = JsonObject()
+    payload.put("id", JsonString(channel))
+    payload.put("channel", JsonString(channel))
+    payload.put("peerId", JsonString(target))
+    payload.put("to", JsonString(target))
+    payload.put("text", JsonString(messageText))
+    payload.put("message", JsonString(messageText))
+    let sent = match (gatewayInvokeCurrentToolRuntimeGatewayCall("channels.send", payload)) {
+        case Some(result) => result
+        case None => return feishuMediaToolSendError("send_hook_missing", "in-process gateway channels.send hook is not available", fileId, payloadKind)
+    }
+    let ok = feishuMediaToolBool(sent, "ok")
+    if (ok) {
+        gatewayMarkCurrentToolRuntimeVisibleReplyDelivered()
+    }
+    let result = JsonObject()
+    result.put("ok", JsonBool(ok))
+    result.put("status", JsonString(if (ok) { "accepted" } else { "error" }))
+    result.put("action", JsonString("feishu_media_send"))
+    result.put("channel", JsonString(channel))
+    result.put("to", JsonString(target))
+    result.put("media", JsonString(fileId))
+    result.put("payloadKind", JsonString(payloadKind))
+    result.put("payloadPreview", JsonString(gatewayMessagePayloadPreview(messageText)))
+    result.put("gateway", sent)
+    result.toJsonString()
 }
 
 private func feishuMediaToolRecords(): JsonArray {
@@ -666,6 +805,10 @@ public class GatewayFeishuMediaToolset {
         feishuMediaToolCleanup(policy, accountId)
     }
 
+    public func debugFeishuMediaSendForTest(pathOrUrl: String, caption: Option<String>, kind: Option<String>, forceDocument: Option<Bool>): String {
+        feishuMediaToolSend(pathOrUrl, caption, kind, forceDocument)
+    }
+
     @tool[
         description: "List Feishu media resources attached to the current turn. The list contains only metadata and local paths already staged by the Feishu channel runtime."
     ]
@@ -693,5 +836,13 @@ public class GatewayFeishuMediaToolset {
     public func feishu_im_bot_image(message_id: String, file_key: String, `type`: Option<String>): String {
         PrintUtils.printTool("feishu_im_bot_image", shortMessage: "current")
         feishuMediaToolFetchBotImage(message_id, file_key, `type` ?? "image")
+    }
+
+    @tool[
+        description: "Send a Feishu media payload through the current Gateway channels.send runtime. pathOrUrl is a local path or URL, kind can be photo, document, audio, voice, video, or video-note, and caption is optional."
+    ]
+    public func feishu_media_send(pathOrUrl: String, caption: Option<String>, kind: Option<String>, forceDocument: Option<Bool>): String {
+        PrintUtils.printTool("feishu_media_send", shortMessage: "current")
+        feishuMediaToolSend(pathOrUrl, caption, kind, forceDocument)
     }
 }

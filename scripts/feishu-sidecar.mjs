@@ -3,6 +3,7 @@
 import { Buffer } from "node:buffer";
 import fs from "node:fs";
 import { createRequire } from "node:module";
+import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import readline from "node:readline";
@@ -206,6 +207,28 @@ async function withTimeout(promise, timeoutMs) {
   }
 }
 
+function sidecarErrorMessage(error, fallback = "Feishu WebSocket error") {
+  const message = error?.message ?? (error ? String(error) : fallback);
+  return String(message || fallback);
+}
+
+function websocketStatusMeta() {
+  try {
+    const status = state.wsClient?.getConnectionStatus?.();
+    if (!status || typeof status !== "object") {
+      return {};
+    }
+    return {
+      wsState: String(status.state ?? ""),
+      reconnectAttempts: Number.isFinite(Number(status.reconnectAttempts)) ? Number(status.reconnectAttempts) : 0,
+      ...(status.lastConnectTime ? { lastConnectTime: status.lastConnectTime } : {}),
+      ...(status.nextConnectTime ? { nextConnectTime: status.nextConnectTime } : {}),
+    };
+  } catch {
+    return {};
+  }
+}
+
 async function initialize(frame) {
   if (state.initialized) {
     emitError({ phase: "init", status: "already_initialized", message: "Feishu sidecar is already initialized" });
@@ -213,6 +236,8 @@ async function initialize(frame) {
   }
   state.accountId = String(frame.accountId ?? "default").trim() || "default";
   addKnownSecrets([frame.appSecret, frame.verificationToken, frame.encryptKey]);
+  const mode = String(frame.mode ?? "websocket").trim().toLowerCase();
+  const apiMode = mode === "api" || mode === "rest" || mode === "request";
   if (!frame.appId || !frame.appSecret) {
     emitError({ phase: "init", status: "invalid_init", message: "Feishu init requires appId and appSecret" });
     exitSoon(1);
@@ -235,11 +260,56 @@ async function initialize(frame) {
       proxyAgent: "https-proxy-agent",
     });
 
-    state.eventDispatcher = new sdk.EventDispatcher({
-      encryptKey: frame.encryptKey,
-      verificationToken: frame.verificationToken,
+    let readySettled = false;
+    let resolveReady;
+    let rejectReady;
+    const readyPromise = new Promise((resolve, reject) => {
+      resolveReady = resolve;
+      rejectReady = reject;
     });
-    registerEventHandlers(state.eventDispatcher);
+    const resolveReadyOnce = () => {
+      if (readySettled) {
+        return;
+      }
+      readySettled = true;
+      resolveReady();
+    };
+    const rejectReadyOnce = (error) => {
+      if (readySettled) {
+        return;
+      }
+      readySettled = true;
+      rejectReady(error);
+    };
+    const lifecycle = {
+      onReady: () => {
+        emitDiagnostic("info", "websocket.open", "Feishu WebSocket client connected", {
+          status: "connected",
+          ...websocketStatusMeta(),
+        });
+        resolveReadyOnce();
+      },
+      onError: (error) => {
+        const message = sidecarErrorMessage(error);
+        emitDiagnostic("error", "websocket.error", message, {
+          status: "failed",
+          ...websocketStatusMeta(),
+        });
+        rejectReadyOnce(error instanceof Error ? error : new Error(message));
+      },
+      onReconnecting: () => {
+        emitDiagnostic("warn", "websocket.reconnecting", "Feishu WebSocket client reconnecting", {
+          status: "reconnecting",
+          ...websocketStatusMeta(),
+        });
+      },
+      onReconnected: () => {
+        emitDiagnostic("info", "websocket.reconnected", "Feishu WebSocket client reconnected", {
+          status: "connected",
+          ...websocketStatusMeta(),
+        });
+      },
+    };
 
     state.client = new sdk.Client({
       appId: frame.appId,
@@ -247,21 +317,47 @@ async function initialize(frame) {
       appType: sdk.AppType?.SelfBuild,
       domain,
     });
+    if (apiMode) {
+      state.initialized = true;
+      emitDiagnostic("info", "api.start", "Feishu REST API client ready", {
+        status: "ok",
+      });
+      emitProtocol({
+        type: "ready",
+        accountId: state.accountId,
+        transport: "api",
+        sdk: "@larksuiteoapi/node-sdk",
+        runtimeRoot: state.runtimeRoot,
+        proxy: proxy.summary,
+        domain: String(frame.domain ?? "feishu"),
+      });
+      return;
+    }
+    state.eventDispatcher = new sdk.EventDispatcher({
+      encryptKey: frame.encryptKey,
+      verificationToken: frame.verificationToken,
+    });
+    registerEventHandlers(state.eventDispatcher);
     state.wsClient = new sdk.WSClient({
       appId: frame.appId,
       appSecret: frame.appSecret,
       domain,
       loggerLevel: sdk.LoggerLevel?.info,
+      ...lifecycle,
       ...(proxyAgent ? { agent: proxyAgent } : {}),
     });
     attachWsLifecycleHandlers(state.wsClient);
 
-    await withTimeout(
-      state.wsClient.start({ eventDispatcher: state.eventDispatcher }),
-      readyTimeoutMs(frame),
-    );
+    const startResult = state.wsClient.start({ eventDispatcher: state.eventDispatcher });
+    if (startResult && typeof startResult.then === "function") {
+      startResult.catch((error) => rejectReadyOnce(error));
+    }
+    await withTimeout(readyPromise, readyTimeoutMs(frame));
     state.initialized = true;
-    emitDiagnostic("info", "websocket.start", "Feishu WebSocket client started", { status: "ok" });
+    emitDiagnostic("info", "websocket.start", "Feishu WebSocket client started", {
+      status: "ok",
+      ...websocketStatusMeta(),
+    });
     emitProtocol({
       type: "ready",
       accountId: state.accountId,
@@ -1051,9 +1147,30 @@ async function chatThreadCapable(frame) {
   };
 }
 
-function responseBuffer(response) {
+async function readStreamBuffer(stream) {
+  const chunks = [];
+  for await (const chunk of stream) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks);
+}
+
+async function withTempDownloadPath(prefix, fn) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  try {
+    const target = path.join(dir, "download");
+    return await fn(target);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+async function responseBuffer(response) {
   if (Buffer.isBuffer(response)) {
     return response;
+  }
+  if (response instanceof ArrayBuffer) {
+    return Buffer.from(response);
   }
   if (Buffer.isBuffer(response?.data)) {
     return response.data;
@@ -1063,6 +1180,21 @@ function responseBuffer(response) {
   }
   if (response?.data instanceof ArrayBuffer) {
     return Buffer.from(response.data);
+  }
+  if (typeof response?.getReadableStream === "function") {
+    return await readStreamBuffer(response.getReadableStream());
+  }
+  if (typeof response?.writeFile === "function") {
+    return await withTempDownloadPath("metis-feishu-sidecar-download-", async (target) => {
+      await response.writeFile(target);
+      return fs.readFileSync(target);
+    });
+  }
+  if (typeof response?.[Symbol.asyncIterator] === "function") {
+    return await readStreamBuffer(response);
+  }
+  if (typeof response?.pipe === "function" || typeof response?.read === "function") {
+    return await readStreamBuffer(response);
   }
   return Buffer.alloc(0);
 }
@@ -1075,8 +1207,8 @@ function fileNameOf(response) {
   return response?.file_name ?? response?.fileName ?? response?.data?.file_name ?? response?.data?.fileName;
 }
 
-function nonEmptyDownloadBuffer(response, errorPrefix) {
-  const buffer = responseBuffer(response);
+async function nonEmptyDownloadBuffer(response, errorPrefix) {
+  const buffer = await responseBuffer(response);
   if (buffer.length <= 0) {
     throw new Error(`${errorPrefix}: empty response buffer`);
   }
@@ -1088,7 +1220,7 @@ async function downloadImage(frame) {
     path: { image_key: frame.imageKey },
   });
   assertApiSuccess(response, "Feishu image download failed");
-  const buffer = nonEmptyDownloadBuffer(response, "Feishu image download failed");
+  const buffer = await nonEmptyDownloadBuffer(response, "Feishu image download failed");
   return {
     contentBase64: buffer.toString("base64"),
     bytesBase64: buffer.toString("base64"),
@@ -1104,7 +1236,7 @@ async function downloadResource(frame) {
     params: { type: frame.resourceType === "image" ? "image" : "file" },
   });
   assertApiSuccess(response, "Feishu message resource download failed");
-  const buffer = nonEmptyDownloadBuffer(response, "Feishu message resource download failed");
+  const buffer = await nonEmptyDownloadBuffer(response, "Feishu message resource download failed");
   return {
     contentBase64: buffer.toString("base64"),
     bytesBase64: buffer.toString("base64"),

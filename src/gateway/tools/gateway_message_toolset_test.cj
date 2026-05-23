@@ -333,4 +333,58 @@ public class GatewayMessageToolsetTest {
             debugSetGatewayMessageToolCallRunnerForTest(None<(String, JsonObject) -> JsonObject>)
         }
     }
+
+    @TestCase
+    public func messagePhotoUsesRuntimeGatewayCallHookWhenInsideGatewayContext(): Unit {
+        let calls = ArrayList<JsonObject>()
+        let context = GatewayToolRuntimeContext(
+            "feishu",
+            channelName: "feishu",
+            sessionKey: "agent:main:feishu:peer",
+            gatewayCallHook: Some({ method: String, payload: JsonObject =>
+                @Expect(method, "channels.send")
+                calls.add(payload)
+                let out = JsonObject()
+                out.put("ok", JsonBool(true))
+                out
+            })
+        )
+        let out = gatewayWithToolRuntimeContext(context, { =>
+            GatewayMessageToolset().debugMessageForTest("photo", "feishu", "ou_user", "/tmp/a.png")
+        })
+        let result = JsonValue.fromStr(out).asObject()
+        @Expect(result.get("ok").getOrThrow().asBool().getValue(), true)
+        @Expect(calls.size, 1)
+        let payload = calls[0]
+        @Expect(payload.get("channel").getOrThrow().asString().getValue(), "feishu")
+        @Expect(payload.get("to").getOrThrow().asString().getValue(), "ou_user")
+        @Expect(payload.get("text").getOrThrow().asString().getValue().startsWith("[photo]"), true)
+        @Expect(context.hasVisibleReplyDelivered(), true)
+    }
+
+    @TestCase
+    public func messagePhotoRuntimeHookFailureReturnsStructuredError(): Unit {
+        let context = GatewayToolRuntimeContext(
+            "feishu",
+            channelName: "feishu",
+            sessionKey: "feishu:direct:ou_1",
+            senderId: "ou_1",
+            gatewayCallHook: Some({ _method: String, _payload: JsonObject =>
+                let out = JsonObject()
+                out.put("ok", JsonBool(false))
+                out.put("status", JsonString("error"))
+                out.put("error", JsonString("send failed"))
+                out
+            })
+        )
+        let out = gatewayWithToolRuntimeContext(context, { =>
+            GatewayMessageToolset().debugMessageForTest("photo", "feishu", "ou_1", "/tmp/pic.png")
+        })
+        let json = JsonValue.fromStr(out).asObject()
+        @Expect(json.get("ok").getOrThrow().asBool().getValue(), false)
+        @Expect(json.get("status").getOrThrow().asString().getValue(), "error")
+        @Expect(json.get("action").getOrThrow().asString().getValue(), "photo")
+        @Expect(json.get("gateway").getOrThrow().asObject().get("error").getOrThrow().asString().getValue(), "send failed")
+        @Expect(context.hasVisibleReplyDelivered(), false)
+    }
 }
