@@ -240,26 +240,7 @@ private func videoGenerationDashScopeBaseUrl(providerConfig: JsonObject): String
 }
 
 private func videoGenerationDashScopeAigcBaseUrl(providerConfig: JsonObject): String {
-    let baseUrl = videoGenerationDashScopeBaseUrl(providerConfig)
-    try {
-        let parsed = URL.parse(baseUrl)
-        let host = parsed.hostName
-        if (host == "dashscope.aliyuncs.com" ||
-            host == "dashscope-intl.aliyuncs.com" ||
-            host == "coding.dashscope.aliyuncs.com" ||
-            host == "coding-intl.dashscope.aliyuncs.com") {
-            return "${parsed.scheme}://${host}"
-        }
-    } catch (_: Exception) {
-        ()
-    }
-    if (baseUrl.startsWith("https://dashscope.aliyuncs.com/compatible-mode/")) {
-        return "https://dashscope.aliyuncs.com"
-    }
-    if (baseUrl.startsWith("https://dashscope-intl.aliyuncs.com/compatible-mode/")) {
-        return "https://dashscope-intl.aliyuncs.com"
-    }
-    baseUrl
+    resolveDashScopeAigcOriginForVideo(videoGenerationDashScopeBaseUrl(providerConfig))
 }
 
 private func videoGenerationDashScopeEndpoint(providerConfig: JsonObject): String {

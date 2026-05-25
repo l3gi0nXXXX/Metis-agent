@@ -215,6 +215,34 @@ public class GatewayVideoGenerationRuntimeTest {
     }
 
     @TestCase
+    public func dashScopeProviderMapsCodingBaseUrlForAigcVideoApi(): Unit {
+        let root = videoRuntimeTempRoot("dashscope-coding-mode")
+        let provider = videoRuntimeDashScopeProvider()
+        provider.put("baseUrl", JsonString("https://coding.dashscope.aliyuncs.com/v1"))
+        setGatewayVideoGenerationDashScopeRunnerForTest(Some({ request: JsonObject =>
+            @Expect(videoGenerationRuntimeTestString(request, "url"), "https://dashscope.aliyuncs.com/api/v1/services/aigc/video-generation/video-synthesis")
+            GatewayVideoGenerationDashScopeHttpResult(200, bodyBytes: "{\"output\":{\"task_id\":\"task-coding\"}}".toArray())
+        }))
+        setGatewayVideoGenerationDashScopePollerForTest(Some({ request: JsonObject =>
+            @Expect(videoGenerationRuntimeTestString(request, "url"), "https://dashscope.aliyuncs.com/api/v1/tasks/task-coding")
+            GatewayVideoGenerationDashScopeHttpResult(200, bodyBytes: "{\"output\":{\"task_status\":\"SUCCEEDED\",\"video_url\":\"https://cdn.example.invalid/out/demo.mp4\"}}".toArray())
+        }))
+        setGatewayVideoGenerationDashScopeDownloaderForTest(Some({ _url: String, _timeoutMs: Int64, _maxBytes: Int64, _providerConfig: JsonObject =>
+            GatewayVideoGenerationDashScopeHttpResult(200, bodyBytes: "FAKE-MP4".toArray(), contentType: "video/mp4")
+        }))
+        try {
+            let result = gatewayVideoGenerationGenerate(videoRuntimeConfig("wan", provider, outputRoot: root), videoRuntimeRequest("make a coding mode video"))
+
+            @Expect(videoRuntimeBool(result, "ok"), true)
+            @Expect(videoGenerationRuntimeTestString(result, "status"), "ok")
+        } finally {
+            setGatewayVideoGenerationDashScopeRunnerForTest(None<(JsonObject) -> GatewayVideoGenerationDashScopeHttpResult>)
+            setGatewayVideoGenerationDashScopePollerForTest(None<(JsonObject) -> GatewayVideoGenerationDashScopeHttpResult>)
+            setGatewayVideoGenerationDashScopeDownloaderForTest(None<(String, Int64, Int64, JsonObject) -> GatewayVideoGenerationDashScopeHttpResult>)
+        }
+    }
+
+    @TestCase
     public func dashScopeProviderMapsFailureTimeoutTooLargeAndRedactsSecrets(): Unit {
         let root = videoRuntimeTempRoot("dashscope-errors")
         setGatewayVideoGenerationDashScopeRunnerForTest(Some({ _request: JsonObject =>

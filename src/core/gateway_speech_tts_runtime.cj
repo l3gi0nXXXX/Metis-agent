@@ -182,6 +182,9 @@ private func speechTtsProviderKind(provider: String, providerConfig: JsonObject)
     let explicit = speechTtsString(providerConfig, "kind").toAsciiLower()
     if (!explicit.isEmpty()) {
         if (explicit == "dashscope" || explicit == "qwen-tts" || explicit == "dashscope-qwen-tts") {
+            if (speechTtsDashScopeShouldUseOpenAICompatible(providerConfig)) {
+                return "openai-compatible"
+            }
             return "dashscope-qwen-tts"
         }
         return explicit
@@ -190,6 +193,18 @@ private func speechTtsProviderKind(provider: String, providerConfig: JsonObject)
         return "command"
     }
     return "missing"
+}
+
+private func speechTtsEndpointClass(providerConfig: JsonObject): String {
+    providerEndpointClassId(resolveProviderEndpoint("tts", speechTtsString(providerConfig, "baseUrl")).endpointClass)
+}
+
+private func speechTtsDashScopeShouldUseOpenAICompatible(providerConfig: JsonObject): Bool {
+    let endpointClass = speechTtsEndpointClass(providerConfig)
+    if (endpointClass == "modelstudio-compatible" || endpointClass == "openai-compatible-custom" || endpointClass == "openrouter" || endpointClass == "local") {
+        return true
+    }
+    normalizeProviderBaseUrl(speechTtsString(providerConfig, "baseUrl")).toAsciiLower().contains("/compatible-mode/")
 }
 
 private func speechTtsDashScopeQwenBaseUrl(providerConfig: JsonObject): String {

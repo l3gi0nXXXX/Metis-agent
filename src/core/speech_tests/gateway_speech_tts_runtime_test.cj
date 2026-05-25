@@ -371,6 +371,41 @@ public class GatewaySpeechTtsRuntimeTest {
     }
 
     @TestCase
+    public func dashScopeQwenTtsUsesOpenAICompatibleAudioSpeechWhenBaseUrlIsCompatibleMode(): Unit {
+        let root = ttsTestTempRoot("dashscope-compatible-tts")
+        let provider = ttsTestDashScopeQwenProvider()
+        provider.put("baseUrl", JsonString("https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"))
+        let dashRequests = ArrayList<String>()
+        let openAiRequests = ArrayList<String>()
+        setGatewaySpeechTtsDashScopeQwenRunnerForTest(Some({ request: JsonObject =>
+            dashRequests.add(request.toJsonString())
+            GatewaySpeechTtsDashScopeQwenHttpResult(500, error: "DashScope native runner must not be used for compatible-mode TTS")
+        }))
+        setGatewaySpeechTtsOpenAICompatibleRunnerForTest(Some({ request: JsonObject =>
+            openAiRequests.add(request.toJsonString())
+            let body = ttsTestOpenAICompatibleBody(request)
+            @Expect(ttsTestString(request, "url"), "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/audio/speech")
+            @Expect(ttsTestString(request, "authorization"), "Bearer dashscope-test-key")
+            @Expect(ttsTestString(body, "model"), "qwen3-tts-flash")
+            @Expect(ttsTestString(body, "input"), "你好，Metis")
+            @Expect(ttsTestString(body, "voice"), "Chelsie")
+            GatewaySpeechTtsOpenAICompatibleHttpResult(200, bodyBytes: "OPENAI-COMPAT-TTS".toArray())
+        }))
+        try {
+            let result = gatewaySpeechTtsSynthesize(ttsTestConfig("dashscope", provider), ttsTestPrefs(true), ttsTestState(), "你好，Metis", outputRoot: root)
+
+            @Expect(ttsTestBool(result, "ok"), true)
+            @Expect(ttsTestString(result, "providerKind"), "openai-compatible")
+            @Expect(dashRequests.size, 0)
+            @Expect(openAiRequests.size, 1)
+            @Expect(String.fromUtf8(File.readFrom(Path(ttsTestString(result, "audioPath")))), "OPENAI-COMPAT-TTS")
+        } finally {
+            setGatewaySpeechTtsDashScopeQwenRunnerForTest(None<(JsonObject) -> GatewaySpeechTtsDashScopeQwenHttpResult>)
+            setGatewaySpeechTtsOpenAICompatibleRunnerForTest(None<(JsonObject) -> GatewaySpeechTtsOpenAICompatibleHttpResult>)
+        }
+    }
+
+    @TestCase
     public func dashScopeQwenTtsStatusRequiresApiKeyAndVoiceAndAcceptsAliases(): Unit {
         let okStatus = gatewaySpeechTtsStatus(ttsTestConfig("dashscope", ttsTestDashScopeQwenProvider()), ttsTestPrefs(true), ttsTestState())
         @Expect(ttsTestString(okStatus, "status"), "ok")
