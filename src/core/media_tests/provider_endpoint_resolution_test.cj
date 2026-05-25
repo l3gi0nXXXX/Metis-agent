@@ -21,6 +21,7 @@ public class ProviderEndpointResolutionTest {
         @Expect(providerEndpointClassId(resolveProviderEndpoint("azure", "https://metis-test.openai.azure.com/openai/v1").endpointClass), "azure-openai")
         @Expect(providerEndpointClassId(resolveProviderEndpoint("local", "http://127.0.0.1:8000/v1/").endpointClass), "local")
         @Expect(providerEndpointClassId(resolveProviderEndpoint("custom", "https://token-plan.cn-beijing.maas.aliyuncs.com/v1").endpointClass), "custom")
+        @Expect(providerEndpointClassId(resolveProviderEndpoint("qwen", "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1").endpointClass), "openai-compatible-custom")
     }
 
     @TestCase

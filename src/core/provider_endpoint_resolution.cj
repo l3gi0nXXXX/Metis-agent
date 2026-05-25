@@ -162,6 +162,9 @@ private func providerEndpointClassFor(kind: String, host: String, path: String, 
         lowerPath.startsWith("/compatible-mode")) {
         return ModelStudioCompatible
     }
+    if (lowerPath.startsWith("/compatible-mode")) {
+        return OpenAiCompatibleCustom
+    }
     if ((lowerHost == "dashscope.aliyuncs.com" || lowerHost == "dashscope-intl.aliyuncs.com") &&
         (lowerPath == "/api/v1" || lowerPath.startsWith("/api/v1/") || lowerPath == "")) {
         return DashScopeAigcNative

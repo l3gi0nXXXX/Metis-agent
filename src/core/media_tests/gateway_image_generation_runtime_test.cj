@@ -209,35 +209,24 @@ public class GatewayImageGenerationRuntimeTest {
     }
 
     @TestCase
-    public func dashScopeQwenImageProviderDoesNotSwitchToOpenAiImagesWhenBaseUrlIsCompatibleMode(): Unit {
+    public func dashScopeQwenImageProviderUsesOpenAiCompatibleImagesWhenBaseUrlIsCompatibleMode(): Unit {
         let root = imageRuntimeTempRoot("dashscope-qwen-compatible")
         let provider = imageRuntimeDashScopeProvider()
         provider.put("baseUrl", JsonString("https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"))
         let dashScopeRequests = ArrayList<String>()
         let openAiRequests = ArrayList<String>()
-        let downloads = ArrayList<String>()
         setGatewayImageGenerationDashScopeRunnerForTest(Some({ request: JsonObject, _providerConfig: JsonObject =>
             dashScopeRequests.add(request.toJsonString())
-            let body = imageRuntimeObj(request, "body")
-            let input = imageRuntimeObj(body, "input")
-            let messages = imageRuntimeArr(input, "messages")
-            let message = messages[0].asObject()
-            let content = imageRuntimeArr(message, "content")
-            let text = content[0].asObject()
-            @Expect(imageRuntimeString(request, "url"), "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/services/aigc/multimodal-generation/generation")
-            @Expect(imageRuntimeString(request, "authorization"), "Bearer dashscope-secret-key")
-            @Expect(imageRuntimeString(body, "model"), "qwen-image-2.0-pro")
-            @Expect(imageRuntimeString(text, "text"), "draw an eagle")
-            @Expect(request.toJsonString().contains("apiKey"), false)
-            GatewayImageGenerationHttpResult(200, bodyBytes: "{\"output\":{\"images\":[\"https://dashscope-compatible.example/eagle.png\"]}}".toArray(), contentType: "application/json")
+            GatewayImageGenerationHttpResult(500, error: "DashScope native runner must not be used for compatible-mode images")
         }))
         setGatewayImageGenerationOpenAiRunnerForTest(Some({ request: JsonObject, _providerConfig: JsonObject =>
             openAiRequests.add(request.toJsonString())
-            GatewayImageGenerationHttpResult(500, error: "OpenAI runner must not be used for DashScope kind")
-        }))
-        setGatewayImageGenerationDownloaderForTest(Some({ url: String, _timeoutMs: Int64, _maxBytes: Int64, _providerConfig: JsonObject =>
-            downloads.add(url)
-            GatewayImageGenerationHttpResult(200, bodyBytes: "DASH_COMPAT_IMAGE".toArray(), contentType: "image/png")
+            let body = imageRuntimeObj(request, "body")
+            @Expect(imageRuntimeString(request, "url"), "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/images/generations")
+            @Expect(imageRuntimeString(request, "authorization"), "Bearer dashscope-secret-key")
+            @Expect(imageRuntimeString(body, "model"), "qwen-image-2.0-pro")
+            @Expect(imageRuntimeString(body, "prompt"), "draw an eagle")
+            GatewayImageGenerationHttpResult(200, bodyBytes: "{\"data\":[{\"b64_json\":\"Q09NUEFUSU1BR0U=\"}]}".toArray(), contentType: "application/json")
         }))
         try {
             let result = gatewayImageGenerationGenerate(imageRuntimeConfig("dashscope", provider, outputRoot: root), imageRuntimeRequest("draw an eagle"))
@@ -247,20 +236,17 @@ public class GatewayImageGenerationRuntimeTest {
             @Expect(imageRuntimeBool(result, "ok"), true)
             @Expect(imageRuntimeString(result, "status"), "ok")
             @Expect(imageRuntimeString(result, "provider"), "dashscope")
-            @Expect(imageRuntimeString(result, "providerKind"), "dashscope-qwen-image-generation")
+            @Expect(imageRuntimeString(result, "providerKind"), "openai-images")
             @Expect(imageRuntimeString(result, "model"), "qwen-image-2.0-pro")
             @Expect(imageRuntimeString(image, "mimeType"), "image/png")
             @Expect(imageRuntimeString(image, "fileName"), "eagle-image.png")
             @Expect(exists(imagePath), true)
-            @Expect(String.fromUtf8(File.readFrom(imagePath)), "DASH_COMPAT_IMAGE")
-            @Expect(dashScopeRequests.size, 1)
-            @Expect(openAiRequests.size, 0)
-            @Expect(downloads.size, 1)
-            @Expect(downloads[0], "https://dashscope-compatible.example/eagle.png")
+            @Expect(String.fromUtf8(File.readFrom(imagePath)), "COMPATIMAGE")
+            @Expect(dashScopeRequests.size, 0)
+            @Expect(openAiRequests.size, 1)
         } finally {
             setGatewayImageGenerationDashScopeRunnerForTest(None<(JsonObject, JsonObject) -> GatewayImageGenerationHttpResult>)
             setGatewayImageGenerationOpenAiRunnerForTest(None<(JsonObject, JsonObject) -> GatewayImageGenerationHttpResult>)
-            setGatewayImageGenerationDownloaderForTest(None<(String, Int64, Int64, JsonObject) -> GatewayImageGenerationHttpResult>)
         }
     }
 

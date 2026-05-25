@@ -209,6 +209,22 @@ private func imageGenerationProviderKind(provider: String, providerConfig: JsonO
     }
 }
 
+private func imageGenerationEndpointClass(providerKind: String, providerConfig: JsonObject): String {
+    providerEndpointClassId(resolveProviderEndpoint(providerKind, imageGenerationString(providerConfig, "baseUrl")).endpointClass)
+}
+
+private func imageGenerationDashScopeShouldUseOpenAiCompatible(providerConfig: JsonObject): Bool {
+    if (!imageGenerationString(providerConfig, "endpoint").trimAscii().isEmpty()) {
+        return false
+    }
+    let endpointClass = imageGenerationEndpointClass("dashscope", providerConfig)
+    if (endpointClass == "modelstudio-compatible" || endpointClass == "openai-compatible-custom" || endpointClass == "openrouter" || endpointClass == "local") {
+        return true
+    }
+    let baseUrl = normalizeProviderBaseUrl(imageGenerationString(providerConfig, "baseUrl")).toAsciiLower()
+    baseUrl.contains("/compatible-mode/")
+}
+
 private func imageGenerationStatus(status: String, ok!: Bool = false, message!: String = ""): JsonObject {
     let out = JsonObject()
     out.put("ok", JsonBool(ok))
@@ -1820,6 +1836,9 @@ public func gatewayImageGenerationGenerate(config: JsonObject, request: JsonObje
             out.put("provider", JsonString(provider))
             out.put("providerKind", JsonString(providerKind))
             return out
+        }
+        if (imageGenerationDashScopeShouldUseOpenAiCompatible(providerConfig)) {
+            return imageGenerationOpenAiGenerate(config, request, provider, "openai-images", providerConfig, outputRoot)
         }
         return imageGenerationDashScopeGenerate(config, request, provider, providerKind, providerConfig, outputRoot)
     }
