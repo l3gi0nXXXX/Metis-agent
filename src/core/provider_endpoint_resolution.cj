@@ -236,3 +236,35 @@ public func resolveDashScopeAigcOriginForVideo(baseUrl: String): String {
     }
     normalized
 }
+
+public func resolveDashScopeAigcBaseUrlForImage(baseUrl: String): String {
+    let normalized = normalizeProviderBaseUrl(baseUrl)
+    if (normalized.isEmpty()) {
+        return "https://dashscope.aliyuncs.com/api/v1"
+    }
+    try {
+        let parsed = URL.parse(normalized)
+        let scheme = parsed.scheme.toAsciiLower()
+        let host = parsed.hostName.toAsciiLower()
+        let path = providerEndpointPath(parsed.path).toAsciiLower()
+        let resolvedHost = match (host) {
+            case "coding.dashscope.aliyuncs.com" => "dashscope.aliyuncs.com"
+            case "coding-intl.dashscope.aliyuncs.com" => "dashscope-intl.aliyuncs.com"
+            case _ => host
+        }
+        if (host == "dashscope.aliyuncs.com" ||
+            host == "dashscope-intl.aliyuncs.com" ||
+            host == "coding.dashscope.aliyuncs.com" ||
+            host == "coding-intl.dashscope.aliyuncs.com" ||
+            path.startsWith("/compatible-mode") ||
+            path.isEmpty()) {
+            return "${scheme}://${resolvedHost}/api/v1"
+        }
+        if (path == "/api/v1" || path.endsWith("/api/v1") || path.startsWith("/api/v1/")) {
+            return normalized
+        }
+    } catch (_: Exception) {
+        ()
+    }
+    normalized
+}

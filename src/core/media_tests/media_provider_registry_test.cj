@@ -35,6 +35,6 @@ public class MediaProviderRegistryTest {
             }
         }
         @Expect(sawNative, true)
-        @Expect(sawCompatible, false)
+        @Expect(sawCompatible, true)
     }
 }

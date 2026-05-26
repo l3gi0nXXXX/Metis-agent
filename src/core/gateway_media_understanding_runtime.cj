@@ -12,7 +12,7 @@ import std.convert.*
 import std.fs.{File, Path, exists}
 import std.regex.{Regex, RegexFlag}
 import stdx.encoding.base64.toBase64String
-import stdx.encoding.json.{JsonArray, JsonBool, JsonFloat, JsonObject, JsonString}
+import stdx.encoding.json.{JsonArray, JsonBool, JsonFloat, JsonInt, JsonObject, JsonString}
 
 private var gatewayMediaAsrRunnerOverride: Option<(String, String) -> String> = None<(String, String) -> String>
 private var gatewayMediaVisionRunnerOverride: Option<(String, String, String, String, Int64) -> String> = None<(String, String, String, String, Int64) -> String>
@@ -558,6 +558,155 @@ private func gatewayMediaRuntimeCopyFields(source: JsonObject, target: JsonObjec
     }
 }
 
+private func gatewayMediaRuntimeDiagnosticBase(
+    record: JsonObject,
+    capability: String,
+    resolvedCapability: String,
+    downloaded: Bool,
+    fileBytes!: Int64 = -1,
+    limitBytes!: Int64 = -1,
+    stage!: String = ""
+): JsonObject {
+    let meta = JsonObject()
+    meta.put("capability", JsonString(capability.trimAscii().toAsciiLower()))
+    meta.put("resolvedCapability", JsonString(resolvedCapability.trimAscii().toAsciiLower()))
+    meta.put("mediaKind", JsonString(gatewayMediaRuntimeString(record, "mediaKind").toAsciiLower()))
+    meta.put("mimeType", JsonString(gatewayMediaRuntimeString(record, "mimeType").toAsciiLower()))
+    meta.put("downloaded", JsonBool(downloaded))
+    let channel = gatewayMediaRuntimeString(record, "channel")
+    if (!channel.isEmpty()) {
+        meta.put("channel", JsonString(channel))
+    }
+    for (key in ["mediaId", "messageId", "chatId", "senderId", "sessionId", "turnId", "traceId", "accountId"]) {
+        let value = gatewayMediaRuntimeString(record, key)
+        if (!value.isEmpty()) {
+            meta.put(key, JsonString(value))
+        }
+    }
+    let mediaIndex = gatewayMediaRuntimeInt(record, "mediaIndex", -1)
+    if (mediaIndex >= 0) {
+        meta.put("mediaIndex", JsonInt(mediaIndex))
+    }
+    let fileName = if (!gatewayMediaRuntimeString(record, "fileName").isEmpty()) {
+        gatewayMediaRuntimeString(record, "fileName")
+    } else {
+        gatewayMediaRuntimeString(record, "originalFileName")
+    }
+    if (!fileName.isEmpty()) {
+        meta.put("fileName", JsonString(fileName))
+    }
+    if (fileBytes >= 0) {
+        meta.put("fileBytes", JsonInt(fileBytes))
+    }
+    if (limitBytes > 0) {
+        meta.put("limitBytes", JsonInt(limitBytes))
+    }
+    let normalizedStage = if (stage.trimAscii().isEmpty()) {
+        gatewayMediaRuntimeUnderstandingStage(record)
+    } else {
+        stage.trimAscii()
+    }
+    meta.put("mediaUnderstandingStage", JsonString(normalizedStage))
+    meta
+}
+
+private func gatewayMediaRuntimeDiagnosticFileBytes(record: JsonObject): Int64 {
+    let fileBytes = gatewayMediaRuntimeInt(record, "fileBytes", -1)
+    if (fileBytes >= 0) {
+        return fileBytes
+    }
+    gatewayMediaRuntimeInt(record, "mediaFileBytes", -1)
+}
+
+private func gatewayMediaRuntimeDiagnosticOutputChars(text: String): Int64 {
+    Int64(text.trimAscii().size)
+}
+
+private func gatewayMediaRuntimeDiagnosticFirstAttempt(result: JsonObject): JsonObject {
+    match (result.get("attempts")) {
+        case Some(v) =>
+            try {
+                let arr = v.asArray()
+                if (arr.size() > 0) {
+                    return arr[0].asObject()
+                }
+            } catch (_: Exception) {
+                ()
+            }
+        case None => ()
+    }
+    JsonObject()
+}
+
+private func gatewayMediaRuntimeDiagnosticProviderFromResult(result: JsonObject): JsonObject {
+    let meta = mediaDiagnosticProviderMeta(
+        gatewayMediaRuntimeString(result, "provider"),
+        providerKind: gatewayMediaRuntimeString(result, "providerKind"),
+        model: gatewayMediaRuntimeString(result, "model")
+    )
+    if (gatewayMediaRuntimeString(meta, "provider").isEmpty()) {
+        let first = gatewayMediaRuntimeDiagnosticFirstAttempt(result)
+        let source = gatewayMediaRuntimeString(first, "source")
+        let model = gatewayMediaRuntimeString(first, "model")
+        if (!source.isEmpty()) {
+            meta.put("provider", JsonString(source))
+        }
+        if (!model.isEmpty()) {
+            meta.put("model", JsonString(model))
+        }
+    }
+    meta
+}
+
+private func gatewayMediaRuntimeEmitDiagnostic(level: String, event: String, message: String, base: JsonObject, extra: JsonObject): Unit {
+    emitGatewayMediaDiagnostic(level, event, message, meta: mediaDiagnosticMergeMeta(base, extra))
+}
+
+private func gatewayMediaRuntimeAttemptMeta(
+    source: String,
+    outcome: String,
+    status!: String = "",
+    reason!: String = "",
+    entryType!: String = "",
+    outputChars!: Int64 = -1
+): JsonObject {
+    let meta = JsonObject()
+    if (!source.trimAscii().isEmpty()) {
+        meta.put("source", JsonString(source.trimAscii()))
+    }
+    if (!entryType.trimAscii().isEmpty()) {
+        meta.put("entryType", JsonString(entryType.trimAscii()))
+    }
+    if (!outcome.trimAscii().isEmpty()) {
+        meta.put("outcome", JsonString(outcome.trimAscii()))
+    }
+    if (!status.trimAscii().isEmpty()) {
+        meta.put("status", JsonString(status.trimAscii()))
+    }
+    if (!reason.trimAscii().isEmpty()) {
+        meta.put("reason", JsonString(gatewayMediaRuntimeRedactProviderError(reason)))
+    }
+    if (outputChars >= 0) {
+        meta.put("outputChars", JsonInt(outputChars))
+    }
+    meta
+}
+
+private func gatewayMediaRuntimeFinishedMeta(status: String, source: String, outputKind!: String = "", outputChars!: Int64 = -1): JsonObject {
+    let meta = JsonObject()
+    meta.put("status", JsonString(status.trimAscii()))
+    if (!source.trimAscii().isEmpty()) {
+        meta.put("source", JsonString(source.trimAscii()))
+    }
+    if (!outputKind.trimAscii().isEmpty()) {
+        meta.put("outputKind", JsonString(outputKind.trimAscii()))
+    }
+    if (outputChars >= 0) {
+        meta.put("outputChars", JsonInt(outputChars))
+    }
+    meta
+}
+
 public func gatewayMediaUnderstandingForRecord(
     record: JsonObject,
     capability!: String = "auto",
@@ -592,26 +741,81 @@ public func gatewayMediaUnderstandingForRecordWithSettings(
     let limitSource = gatewayMediaRuntimeLimitSource(record, maxBytes)
     let understandingStage = gatewayMediaRuntimeUnderstandingStage(record)
     let outputs = JsonArray([])
+    let diagnosticBase = gatewayMediaRuntimeDiagnosticBase(
+        record,
+        capability,
+        resolvedCapability,
+        downloaded,
+        fileBytes: gatewayMediaRuntimeDiagnosticFileBytes(record),
+        limitBytes: effectiveMaxBytes,
+        stage: understandingStage
+    )
+    gatewayMediaRuntimeEmitDiagnostic(
+        "info",
+        MediaDiagnosticEvent.mediaUnderstandingStarted,
+        "media understanding started",
+        diagnosticBase,
+        JsonObject()
+    )
 
     if (!downloaded || localPath.isEmpty() || !exists(Path(localPath))) {
+        let reason = "media localPath is missing or not downloaded"
+        gatewayMediaRuntimeEmitDiagnostic(
+            "debug",
+            MediaDiagnosticEvent.mediaUnderstandingAttempt,
+            "media local file skipped",
+            diagnosticBase,
+            gatewayMediaRuntimeAttemptMeta("local_file", "skipped", status: "unsupported", reason: reason, entryType: "local-file")
+        )
+        gatewayMediaRuntimeEmitDiagnostic(
+            "info",
+            MediaDiagnosticEvent.mediaUnderstandingFinished,
+            "media understanding finished",
+            diagnosticBase,
+            gatewayMediaRuntimeFinishedMeta("unsupported", "local_file")
+        )
         return gatewayMediaRuntimeResult(
             record,
             resolvedCapability,
             "unsupported",
             outputs,
-            gatewayMediaRuntimeDecision(resolvedCapability, "skipped", "media localPath is missing or not downloaded"),
-            error: "media localPath is missing or not downloaded"
+            gatewayMediaRuntimeDecision(resolvedCapability, "skipped", reason),
+            error: reason
         )
     }
     let bytes = File.readFrom(Path(localPath))
+    let diagnosticBaseWithBytes = gatewayMediaRuntimeDiagnosticBase(
+        record,
+        capability,
+        resolvedCapability,
+        downloaded,
+        fileBytes: Int64(bytes.size),
+        limitBytes: effectiveMaxBytes,
+        stage: understandingStage
+    )
     if (resolvedCapability != "audio" && resolvedCapability != "video" && effectiveMaxBytes > 0 && Int64(bytes.size) > effectiveMaxBytes) {
+        let reason = "media exceeds configured maxBytes"
+        gatewayMediaRuntimeEmitDiagnostic(
+            "warn",
+            MediaDiagnosticEvent.mediaUnderstandingAttempt,
+            "media understanding rejected by size limit",
+            diagnosticBaseWithBytes,
+            gatewayMediaRuntimeAttemptMeta("preflight", "rejected", status: "too_large", reason: reason)
+        )
+        gatewayMediaRuntimeEmitDiagnostic(
+            "warn",
+            MediaDiagnosticEvent.mediaUnderstandingFailed,
+            "media understanding failed",
+            diagnosticBaseWithBytes,
+            gatewayMediaRuntimeFinishedMeta("too_large", "preflight")
+        )
         let out = gatewayMediaRuntimeResult(
             record,
             resolvedCapability,
             "too_large",
             outputs,
-            gatewayMediaRuntimeDecision(resolvedCapability, "rejected", "media exceeds configured maxBytes"),
-            error: "media exceeds configured maxBytes"
+            gatewayMediaRuntimeDecision(resolvedCapability, "rejected", reason),
+            error: reason
         )
         gatewayMediaRuntimePutLimitDiagnostics(out, Int64(bytes.size), effectiveMaxBytes, limitSource, understandingStage)
         return out
@@ -619,13 +823,28 @@ public func gatewayMediaUnderstandingForRecordWithSettings(
 
     if (resolvedCapability == "audio") {
         if (!gatewayMediaRuntimeIsAudioLike(kind, mime)) {
+            let reason = "selected media is not audio-like"
+            gatewayMediaRuntimeEmitDiagnostic(
+                "debug",
+                MediaDiagnosticEvent.mediaUnderstandingAttempt,
+                "audio understanding skipped",
+                diagnosticBaseWithBytes,
+                gatewayMediaRuntimeAttemptMeta("preflight", "skipped", status: "unsupported", reason: reason)
+            )
+            gatewayMediaRuntimeEmitDiagnostic(
+                "info",
+                MediaDiagnosticEvent.mediaUnderstandingFinished,
+                "media understanding finished",
+                diagnosticBaseWithBytes,
+                gatewayMediaRuntimeFinishedMeta("unsupported", "preflight")
+            )
             return gatewayMediaRuntimeResult(
                 record,
                 resolvedCapability,
                 "unsupported",
                 outputs,
-                gatewayMediaRuntimeDecision(resolvedCapability, "skipped", "selected media is not audio-like"),
-                error: "selected media is not audio-like"
+                gatewayMediaRuntimeDecision(resolvedCapability, "skipped", reason),
+                error: reason
             )
         }
         let recordTranscript = gatewayMediaRuntimeString(record, "transcript")
@@ -663,14 +882,56 @@ public func gatewayMediaUnderstandingForRecordWithSettings(
             } else {
                 "transcript_companion_file"
             }
+            var attemptMeta = gatewayMediaRuntimeAttemptMeta(source, "success", status: "ok", outputChars: gatewayMediaRuntimeDiagnosticOutputChars(transcript))
+            if (!configuredTranscript.isEmpty()) {
+                attemptMeta = mediaDiagnosticMergeMeta(attemptMeta, gatewayMediaRuntimeDiagnosticProviderFromResult(configuredAsr))
+            }
+            gatewayMediaRuntimeEmitDiagnostic(
+                "debug",
+                MediaDiagnosticEvent.mediaUnderstandingAttempt,
+                "audio understanding attempt succeeded",
+                diagnosticBaseWithBytes,
+                attemptMeta
+            )
+            gatewayMediaRuntimeEmitDiagnostic(
+                "info",
+                MediaDiagnosticEvent.mediaUnderstandingFinished,
+                "media understanding finished",
+                diagnosticBaseWithBytes,
+                mediaDiagnosticMergeMeta(
+                    gatewayMediaRuntimeFinishedMeta("ok", source, outputKind: "audio.transcription", outputChars: gatewayMediaRuntimeDiagnosticOutputChars(transcript)),
+                    if (!configuredTranscript.isEmpty()) { gatewayMediaRuntimeDiagnosticProviderFromResult(configuredAsr) } else { JsonObject() }
+                )
+            )
             outputs.add(gatewayMediaRuntimeOutput("audio.transcription", transcript, source))
             let out = gatewayMediaRuntimeResult(record, resolvedCapability, "ok", outputs, gatewayMediaRuntimeDecision(resolvedCapability, "applied", source))
             out.put("transcript", JsonString(transcript))
             out.put("ASRStatus", JsonString("transcribed"))
             return out
         }
-        if (configuredStatus == "provider_error" || configuredStatus == "timeout" || configuredStatus == "too_large" || configuredStatus == "disabled" || configuredStatus == "not_found") {
+        if (configuredStatus == "provider_error" || configuredStatus == "timeout" || configuredStatus == "too_large" || configuredStatus == "disabled" || configuredStatus == "not_found" || configuredStatus == "auth_error" || configuredStatus == "empty_result") {
             let message = gatewayMediaRuntimeString(configuredAsr, "message")
+            var failureMeta = gatewayMediaRuntimeAttemptMeta("gateway_asr_runtime", "failed", status: configuredStatus, reason: message)
+            failureMeta.put("fileBytes", JsonInt(Int64(bytes.size)))
+            if (effectiveMaxBytes > 0) {
+                failureMeta.put("limitBytes", JsonInt(effectiveMaxBytes))
+            }
+            match (configuredAsr.get("timeoutMs")) { case Some(v) => failureMeta.put("timeoutMs", v) case None => () }
+            failureMeta = mediaDiagnosticMergeMeta(failureMeta, gatewayMediaRuntimeDiagnosticProviderFromResult(configuredAsr))
+            gatewayMediaRuntimeEmitDiagnostic(
+                "warn",
+                MediaDiagnosticEvent.mediaUnderstandingAttempt,
+                "audio configured provider failed",
+                diagnosticBaseWithBytes,
+                failureMeta
+            )
+            gatewayMediaRuntimeEmitDiagnostic(
+                "warn",
+                MediaDiagnosticEvent.mediaUnderstandingFailed,
+                "media understanding failed",
+                diagnosticBaseWithBytes,
+                failureMeta
+            )
             let out = gatewayMediaRuntimeResult(
                 record,
                 resolvedCapability,
@@ -686,6 +947,20 @@ public func gatewayMediaUnderstandingForRecordWithSettings(
             }
             return out
         }
+        gatewayMediaRuntimeEmitDiagnostic(
+            "debug",
+            MediaDiagnosticEvent.mediaUnderstandingAttempt,
+            "audio companion transcript skipped",
+            diagnosticBaseWithBytes,
+            gatewayMediaRuntimeAttemptMeta("transcript_companion_file", "skipped", status: "not_configured", reason: "no transcript companion file exists")
+        )
+        gatewayMediaRuntimeEmitDiagnostic(
+            "info",
+            MediaDiagnosticEvent.mediaUnderstandingFinished,
+            "media understanding finished",
+            diagnosticBaseWithBytes,
+            gatewayMediaRuntimeFinishedMeta("not_configured", "transcript_companion_file")
+        )
         let out = gatewayMediaRuntimeResult(
             record,
             resolvedCapability,
@@ -700,13 +975,28 @@ public func gatewayMediaUnderstandingForRecordWithSettings(
 
     if (resolvedCapability == "image" || resolvedCapability == "sticker") {
         if (!gatewayMediaRuntimeIsImageLike(kind, mime)) {
+            let reason = "selected media is not image-like"
+            gatewayMediaRuntimeEmitDiagnostic(
+                "debug",
+                MediaDiagnosticEvent.mediaUnderstandingAttempt,
+                "image understanding skipped",
+                diagnosticBaseWithBytes,
+                gatewayMediaRuntimeAttemptMeta("preflight", "skipped", status: "unsupported", reason: reason)
+            )
+            gatewayMediaRuntimeEmitDiagnostic(
+                "info",
+                MediaDiagnosticEvent.mediaUnderstandingFinished,
+                "media understanding finished",
+                diagnosticBaseWithBytes,
+                gatewayMediaRuntimeFinishedMeta("unsupported", "preflight")
+            )
             return gatewayMediaRuntimeResult(
                 record,
                 resolvedCapability,
                 "unsupported",
                 outputs,
-                gatewayMediaRuntimeDecision(resolvedCapability, "skipped", "selected media is not image-like"),
-                error: "selected media is not image-like"
+                gatewayMediaRuntimeDecision(resolvedCapability, "skipped", reason),
+                error: reason
             )
         }
         let recordDescription = gatewayMediaRuntimeString(record, "description")
@@ -748,6 +1038,27 @@ public func gatewayMediaUnderstandingForRecordWithSettings(
             } else {
                 "gateway_image_understanding_runtime"
             }
+            var attemptMeta = gatewayMediaRuntimeAttemptMeta(source, "success", status: "ok", outputChars: gatewayMediaRuntimeDiagnosticOutputChars(text))
+            if (source == "gateway_image_understanding_runtime") {
+                attemptMeta = mediaDiagnosticMergeMeta(attemptMeta, gatewayMediaRuntimeDiagnosticProviderFromResult(configuredAnalysis))
+            }
+            gatewayMediaRuntimeEmitDiagnostic(
+                "debug",
+                MediaDiagnosticEvent.mediaUnderstandingAttempt,
+                "image understanding attempt succeeded",
+                diagnosticBaseWithBytes,
+                attemptMeta
+            )
+            gatewayMediaRuntimeEmitDiagnostic(
+                "info",
+                MediaDiagnosticEvent.mediaUnderstandingFinished,
+                "media understanding finished",
+                diagnosticBaseWithBytes,
+                mediaDiagnosticMergeMeta(
+                    gatewayMediaRuntimeFinishedMeta("ok", source, outputKind: outputKind, outputChars: gatewayMediaRuntimeDiagnosticOutputChars(text)),
+                    if (source == "gateway_image_understanding_runtime") { gatewayMediaRuntimeDiagnosticProviderFromResult(configuredAnalysis) } else { JsonObject() }
+                )
+            )
             outputs.add(gatewayMediaRuntimeOutput(outputKind, text, source))
             let out = gatewayMediaRuntimeResult(record, resolvedCapability, "ok", outputs, gatewayMediaRuntimeDecision(resolvedCapability, "applied", source))
             out.put("analysis", JsonString(text))
@@ -772,6 +1083,31 @@ public func gatewayMediaUnderstandingForRecordWithSettings(
         }
         let configuredStatus = gatewayMediaRuntimeString(configuredAnalysis, "status")
         if (!configuredStatus.isEmpty() && configuredStatus != "not_configured") {
+            var failureMeta = gatewayMediaRuntimeAttemptMeta("gateway_image_understanding_runtime", "failed", status: configuredStatus, reason: gatewayMediaRuntimeString(configuredAnalysis, "error"))
+            failureMeta.put("fileBytes", JsonInt(Int64(bytes.size)))
+            if (effectiveMaxBytes > 0) {
+                failureMeta.put("limitBytes", JsonInt(effectiveMaxBytes))
+            }
+            failureMeta = mediaDiagnosticMergeMeta(failureMeta, gatewayMediaRuntimeDiagnosticProviderFromResult(configuredAnalysis))
+            let failureEvent = if (configuredStatus == "too_large" || configuredStatus == "provider_error" || configuredStatus == "timeout") {
+                MediaDiagnosticEvent.mediaUnderstandingFailed
+            } else {
+                MediaDiagnosticEvent.mediaUnderstandingFinished
+            }
+            gatewayMediaRuntimeEmitDiagnostic(
+                if (failureEvent == MediaDiagnosticEvent.mediaUnderstandingFailed) { "warn" } else { "info" },
+                MediaDiagnosticEvent.mediaUnderstandingAttempt,
+                "image configured provider failed",
+                diagnosticBaseWithBytes,
+                failureMeta
+            )
+            gatewayMediaRuntimeEmitDiagnostic(
+                if (failureEvent == MediaDiagnosticEvent.mediaUnderstandingFailed) { "warn" } else { "info" },
+                failureEvent,
+                "media understanding finished",
+                diagnosticBaseWithBytes,
+                failureMeta
+            )
             let out = gatewayMediaRuntimeResult(
                 record,
                 resolvedCapability,
@@ -791,6 +1127,20 @@ public func gatewayMediaUnderstandingForRecordWithSettings(
             }
             return out
         }
+        gatewayMediaRuntimeEmitDiagnostic(
+            "debug",
+            MediaDiagnosticEvent.mediaUnderstandingAttempt,
+            "image configured provider skipped",
+            diagnosticBaseWithBytes,
+            gatewayMediaRuntimeAttemptMeta("gateway_image_understanding_runtime", "skipped", status: "not_configured", reason: "vision provider is not configured")
+        )
+        gatewayMediaRuntimeEmitDiagnostic(
+            "info",
+            MediaDiagnosticEvent.mediaUnderstandingFinished,
+            "media understanding finished",
+            diagnosticBaseWithBytes,
+            gatewayMediaRuntimeFinishedMeta("not_configured", "gateway_image_understanding_runtime")
+        )
         let out = gatewayMediaRuntimeResult(
             record,
             resolvedCapability,
@@ -805,13 +1155,28 @@ public func gatewayMediaUnderstandingForRecordWithSettings(
 
     if (resolvedCapability == "video") {
         if (!gatewayMediaRuntimeIsVideoLike(kind, mime)) {
+            let reason = "selected media is not video-like"
+            gatewayMediaRuntimeEmitDiagnostic(
+                "debug",
+                MediaDiagnosticEvent.mediaUnderstandingAttempt,
+                "video understanding skipped",
+                diagnosticBaseWithBytes,
+                gatewayMediaRuntimeAttemptMeta("preflight", "skipped", status: "unsupported", reason: reason)
+            )
+            gatewayMediaRuntimeEmitDiagnostic(
+                "info",
+                MediaDiagnosticEvent.mediaUnderstandingFinished,
+                "media understanding finished",
+                diagnosticBaseWithBytes,
+                gatewayMediaRuntimeFinishedMeta("unsupported", "preflight")
+            )
             return gatewayMediaRuntimeResult(
                 record,
                 resolvedCapability,
                 "unsupported",
                 outputs,
-                gatewayMediaRuntimeDecision(resolvedCapability, "skipped", "selected media is not video-like"),
-                error: "selected media is not video-like"
+                gatewayMediaRuntimeDecision(resolvedCapability, "skipped", reason),
+                error: reason
             )
         }
         let recordDescription = gatewayMediaRuntimeString(record, "description")
@@ -828,6 +1193,26 @@ public func gatewayMediaUnderstandingForRecordWithSettings(
         }
         let configuredStatus = gatewayMediaRuntimeString(configuredVideo, "status")
         let configuredDescription = gatewayMediaRuntimeString(configuredVideo, "description")
+        if (!configuredStatus.isEmpty()) {
+            var configuredMeta = gatewayMediaRuntimeAttemptMeta(
+                "gateway_video_runtime",
+                if (configuredStatus == "ok") { "success" } else { "failed" },
+                status: configuredStatus,
+                reason: gatewayMediaRuntimeString(configuredVideo, "message"),
+                outputChars: if (configuredDescription.isEmpty()) { -1 } else { gatewayMediaRuntimeDiagnosticOutputChars(configuredDescription) }
+            )
+            for (key in ["fileBytes", "base64Bytes", "limitBytes", "timeoutMs"]) {
+                match (configuredVideo.get(key)) { case Some(v) => configuredMeta.put(key, v) case None => () }
+            }
+            configuredMeta = mediaDiagnosticMergeMeta(configuredMeta, gatewayMediaRuntimeDiagnosticProviderFromResult(configuredVideo))
+            gatewayMediaRuntimeEmitDiagnostic(
+                if (configuredStatus == "ok") { "debug" } else { "warn" },
+                MediaDiagnosticEvent.mediaUnderstandingAttempt,
+                "video configured provider attempt",
+                diagnosticBaseWithBytes,
+                configuredMeta
+            )
+        }
         let companionVideo = if (nativeVideo.isEmpty() && configuredDescription.isEmpty()) {
             gatewayMediaRuntimeCompanionText(localPath, [".video.txt", ".analysis.txt", ".description.txt"], maxBytes: 4096)
         } else {
@@ -854,6 +1239,25 @@ public func gatewayMediaUnderstandingForRecordWithSettings(
             } else {
                 "video_companion_file"
             }
+            if (source != "gateway_video_runtime") {
+                gatewayMediaRuntimeEmitDiagnostic(
+                    "debug",
+                    MediaDiagnosticEvent.mediaUnderstandingAttempt,
+                    "video understanding attempt succeeded",
+                    diagnosticBaseWithBytes,
+                    gatewayMediaRuntimeAttemptMeta(source, "success", status: "ok", outputChars: gatewayMediaRuntimeDiagnosticOutputChars(videoText))
+                )
+            }
+            gatewayMediaRuntimeEmitDiagnostic(
+                "info",
+                MediaDiagnosticEvent.mediaUnderstandingFinished,
+                "media understanding finished",
+                diagnosticBaseWithBytes,
+                mediaDiagnosticMergeMeta(
+                    gatewayMediaRuntimeFinishedMeta("ok", source, outputKind: "video.description", outputChars: gatewayMediaRuntimeDiagnosticOutputChars(videoText)),
+                    if (source == "gateway_video_runtime") { gatewayMediaRuntimeDiagnosticProviderFromResult(configuredVideo) } else { JsonObject() }
+                )
+            )
             outputs.add(gatewayMediaRuntimeOutput("video.description", videoText, source))
             let out = gatewayMediaRuntimeResult(record, resolvedCapability, "ok", outputs, gatewayMediaRuntimeDecision(resolvedCapability, "applied", source))
             out.put("videoDescription", JsonString(videoText))
@@ -866,6 +1270,18 @@ public func gatewayMediaUnderstandingForRecordWithSettings(
         }
         if (configuredStatus == "provider_error" || configuredStatus == "timeout" || configuredStatus == "too_large" || configuredStatus == "disabled" || configuredStatus == "not_found") {
             let message = gatewayMediaRuntimeString(configuredVideo, "message")
+            var failureMeta = gatewayMediaRuntimeAttemptMeta("gateway_video_runtime", "failed", status: configuredStatus, reason: message)
+            for (key in ["fileBytes", "base64Bytes", "limitBytes", "timeoutMs"]) {
+                match (configuredVideo.get(key)) { case Some(v) => failureMeta.put(key, v) case None => () }
+            }
+            failureMeta = mediaDiagnosticMergeMeta(failureMeta, gatewayMediaRuntimeDiagnosticProviderFromResult(configuredVideo))
+            gatewayMediaRuntimeEmitDiagnostic(
+                "warn",
+                MediaDiagnosticEvent.mediaUnderstandingFailed,
+                "media understanding failed",
+                diagnosticBaseWithBytes,
+                failureMeta
+            )
             let out = gatewayMediaRuntimeResult(
                 record,
                 resolvedCapability,
@@ -887,6 +1303,20 @@ public func gatewayMediaUnderstandingForRecordWithSettings(
             }
             return out
         }
+        gatewayMediaRuntimeEmitDiagnostic(
+            "debug",
+            MediaDiagnosticEvent.mediaUnderstandingAttempt,
+            "video configured provider skipped",
+            diagnosticBaseWithBytes,
+            gatewayMediaRuntimeAttemptMeta("gateway_video_runtime", "skipped", status: "not_configured", reason: "video understanding provider is not configured")
+        )
+        gatewayMediaRuntimeEmitDiagnostic(
+            "info",
+            MediaDiagnosticEvent.mediaUnderstandingFinished,
+            "media understanding finished",
+            diagnosticBaseWithBytes,
+            gatewayMediaRuntimeFinishedMeta("not_configured", "gateway_video_runtime")
+        )
         let out = gatewayMediaRuntimeResult(
             record,
             resolvedCapability,

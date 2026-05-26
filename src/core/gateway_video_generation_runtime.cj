@@ -192,6 +192,71 @@ private func videoGenerationAttachAttempt(result: JsonObject, attempt: JsonObjec
     result
 }
 
+private func videoGenerationDiagnosticBase(provider: String, providerKind: String, model: String, prompt: String, outputRoot: Path): JsonObject {
+    var meta = mediaDiagnosticProviderMeta(provider, providerKind: providerKind, model: model, capability: "video")
+    meta.put("generationKind", JsonString("video"))
+    meta.put("promptChars", JsonInt(Int64(prompt.size)))
+    meta = mediaDiagnosticMergeMeta(meta, mediaDiagnosticPathMeta(outputRoot.toString()))
+    meta
+}
+
+private func videoGenerationDiagnosticMetaForResult(base: JsonObject, result: JsonObject): JsonObject {
+    let meta = mediaDiagnosticMergeMeta(base, JsonObject())
+    let status = videoGenerationString(result, "status")
+    if (!status.isEmpty()) {
+        meta.put("status", JsonString(status))
+    }
+    let message = videoGenerationString(result, "message")
+    if (!message.isEmpty()) {
+        meta.put("reason", JsonString(message))
+    }
+    match (result.get("ok")) {
+        case Some(v) => meta.put("ok", v)
+        case None => ()
+    }
+    match (result.get("videos")) {
+        case Some(v) =>
+            try {
+                let videos = v.asArray()
+                meta.put("videoCount", JsonInt(Int64(videos.size())))
+                if (videos.size() > 0) {
+                    let first = videos[0].asObject()
+                    let fileName = videoGenerationString(first, "fileName")
+                    if (!fileName.isEmpty()) {
+                        meta.put("outputFileName", JsonString(fileName))
+                    }
+                }
+            } catch (_: Exception) {
+                ()
+            }
+        case None => ()
+    }
+    let metadata = videoGenerationObject(result, "metadata")
+    let taskId = videoGenerationString(metadata, "taskId")
+    if (!taskId.isEmpty()) {
+        meta.put("taskId", JsonString(taskId))
+    }
+    meta
+}
+
+private func videoGenerationEmitStarted(provider: String, providerKind: String, model: String, prompt: String, outputRoot: Path): JsonObject {
+    let meta = videoGenerationDiagnosticBase(provider, providerKind, model, prompt, outputRoot)
+    emitGatewayMediaDiagnostic("info", MediaDiagnosticEvent.mediaGenerationStarted, "video generation started", meta: meta)
+    meta
+}
+
+private func videoGenerationEmitResult(base: JsonObject, result: JsonObject): JsonObject {
+    let meta = videoGenerationDiagnosticMetaForResult(base, result)
+    let ok = videoGenerationBool(result, "ok", false)
+    emitGatewayMediaDiagnostic(
+        if (ok) { "info" } else { "warn" },
+        if (ok) { MediaDiagnosticEvent.mediaGenerationFinished } else { MediaDiagnosticEvent.mediaGenerationFailed },
+        if (ok) { "video generation finished" } else { "video generation failed" },
+        meta: meta
+    )
+    result
+}
+
 public func gatewayVideoGenerationResolveOutputRoot(config: JsonObject): Path {
     let configured = videoGenerationString(config, "outputRoot")
     if (!configured.isEmpty()) {
@@ -499,10 +564,29 @@ private func videoGenerationDashScopeWaitForVideoUrl(providerConfig: JsonObject,
             throw VideoGenerationException("timeout", "DashScope video generation task ${taskId} did not finish in time.")
         }
         let pollRequest = videoGenerationDashScopePollRequest(providerConfig, taskId, timeoutMs)
+        var pollMeta = mediaDiagnosticHttpMetaFromRequest(pollRequest, method: "GET")
+        pollMeta.put("generationKind", JsonString("video"))
+        pollMeta.put("capability", JsonString("video"))
+        pollMeta.put("taskId", JsonString(taskId))
+        emitGatewayMediaDiagnostic("debug", MediaDiagnosticEvent.mediaGenerationPoll, "video generation poll started", meta: pollMeta)
+        let pollStartedAtMs = videoGenerationNowMs()
         let pollResult = videoGenerationDashScopePoll(pollRequest, providerConfig)
+        pollMeta = mediaDiagnosticHttpMetaFromRequest(
+            pollRequest,
+            method: "GET",
+            statusCode: pollResult.statusCode,
+            contentType: pollResult.contentType,
+            responseBytes: Int64(pollResult.bodyBytes.size),
+            elapsedMs: max(0, videoGenerationNowMs() - pollStartedAtMs)
+        )
+        pollMeta.put("generationKind", JsonString("video"))
+        pollMeta.put("capability", JsonString("video"))
+        pollMeta.put("taskId", JsonString(taskId))
         videoGenerationEnsureSuccess(pollResult, providerConfig, "DashScope video generation task poll")
         let payload = videoGenerationJsonRoot(pollResult.bodyBytes)
         let status = videoGenerationTaskStatus(payload)
+        pollMeta.put("pollStatus", JsonString(status))
+        emitGatewayMediaDiagnostic("debug", MediaDiagnosticEvent.mediaGenerationPoll, "video generation poll finished", meta: pollMeta)
         if (status == "SUCCEEDED") {
             let url = videoGenerationVideoUrl(payload)
             if (url.isEmpty()) {
@@ -543,13 +627,48 @@ private func videoGenerationDownload(url: String, timeoutMs: Int64, maxBytes: In
     if (!(trimmed.startsWith("https://") || trimmed.startsWith("http://"))) {
         throw VideoGenerationException("provider_error", "DashScope video URL is not http(s): ${videoGenerationSafeUrl(trimmed)}")
     }
+    let request = JsonObject()
+    request.put("url", JsonString(trimmed))
+    request.put("timeoutMs", JsonInt(timeoutMs))
+    var startedMeta = mediaDiagnosticHttpMetaFromRequest(request, method: "GET")
+    startedMeta.put("generationKind", JsonString("video"))
+    startedMeta.put("capability", JsonString("video"))
+    if (maxBytes > 0) {
+        startedMeta.put("limitBytes", JsonInt(maxBytes))
+    }
+    emitGatewayMediaDiagnostic("debug", MediaDiagnosticEvent.mediaGenerationDownload, "generated video download started", meta: startedMeta)
+    let startedAtMs = videoGenerationNowMs()
     let result = match (videoGenerationDashScopeDownloaderOverride) {
         case Some(downloader) => downloader(trimmed, timeoutMs, maxBytes, providerConfig)
         case None => videoGenerationNativeDownload(trimmed, timeoutMs, maxBytes, providerConfig)
     }
     if (result.statusCode >= 200 && result.statusCode < 300 && maxBytes > 0 && Int64(result.bodyBytes.size) > maxBytes) {
-        return GatewayVideoGenerationDashScopeHttpResult(413, error: "downloaded video exceeds maxVideoBytes")
+        let tooLarge = GatewayVideoGenerationDashScopeHttpResult(413, error: "downloaded video exceeds maxVideoBytes")
+        let failedMeta = mediaDiagnosticHttpMetaFromRequest(request, method: "GET", statusCode: tooLarge.statusCode, responseBytes: Int64(result.bodyBytes.size), elapsedMs: max(0, videoGenerationNowMs() - startedAtMs))
+        failedMeta.put("generationKind", JsonString("video"))
+        failedMeta.put("capability", JsonString("video"))
+        failedMeta.put("status", JsonString("too_large"))
+        failedMeta.put("reason", JsonString(tooLarge.error))
+        emitGatewayMediaDiagnostic("warn", MediaDiagnosticEvent.mediaGenerationDownload, "generated video download failed", meta: failedMeta)
+        return tooLarge
     }
+    let finishedMeta = mediaDiagnosticHttpMetaFromRequest(
+        request,
+        method: "GET",
+        statusCode: result.statusCode,
+        contentType: result.contentType,
+        responseBytes: Int64(result.bodyBytes.size),
+        elapsedMs: max(0, videoGenerationNowMs() - startedAtMs)
+    )
+    finishedMeta.put("generationKind", JsonString("video"))
+    finishedMeta.put("capability", JsonString("video"))
+    finishedMeta.put("status", JsonString(if (result.statusCode >= 200 && result.statusCode < 300) { "ok" } else { "http_error" }))
+    emitGatewayMediaDiagnostic(
+        if (result.statusCode >= 200 && result.statusCode < 300) { "debug" } else { "warn" },
+        MediaDiagnosticEvent.mediaGenerationDownload,
+        if (result.statusCode >= 200 && result.statusCode < 300) { "generated video download finished" } else { "generated video download failed" },
+        meta: finishedMeta
+    )
     result
 }
 
@@ -604,7 +723,31 @@ private func videoGenerationDashScopeGenerate(config: JsonObject, request: JsonO
     let submitRequest = videoGenerationDashScopeRequest(providerConfig, request, timeoutMs)
     let model = videoGenerationString(videoGenerationObject(submitRequest, "body"), "model")
     try {
+        var submitMeta = mediaDiagnosticMergeMeta(
+            mediaDiagnosticProviderMeta(provider, providerKind: providerKind, model: model, capability: "video"),
+            mediaDiagnosticHttpMetaFromRequest(submitRequest, method: "POST")
+        )
+        submitMeta.put("generationKind", JsonString("video"))
+        emitGatewayMediaDiagnostic("debug", MediaDiagnosticEvent.mediaGenerationAttempt, "video generation submit started", meta: submitMeta)
+        let submitStartedAtMs = videoGenerationNowMs()
         let submitResult = videoGenerationDashScopeSubmit(submitRequest, providerConfig)
+        submitMeta = mediaDiagnosticMergeMeta(
+            submitMeta,
+            mediaDiagnosticHttpMetaFromRequest(
+                submitRequest,
+                method: "POST",
+                statusCode: submitResult.statusCode,
+                contentType: submitResult.contentType,
+                responseBytes: Int64(submitResult.bodyBytes.size),
+                elapsedMs: max(0, videoGenerationNowMs() - submitStartedAtMs)
+            )
+        )
+        emitGatewayMediaDiagnostic(
+            if (submitResult.statusCode >= 200 && submitResult.statusCode < 300) { "debug" } else { "warn" },
+            MediaDiagnosticEvent.mediaGenerationAttempt,
+            if (submitResult.statusCode >= 200 && submitResult.statusCode < 300) { "video generation submit finished" } else { "video generation submit failed" },
+            meta: submitMeta
+        )
         videoGenerationEnsureSuccess(submitResult, providerConfig, "DashScope video generation submit")
         let submitted = videoGenerationJsonRoot(submitResult.bodyBytes)
         let taskId = videoGenerationTaskId(submitted)
@@ -677,10 +820,12 @@ public func gatewayVideoGenerationGenerate(config: JsonObject, request: JsonObje
     let providerConfig = videoGenerationProviderConfig(config, provider)
     let providerKind = videoGenerationProviderKind(provider, providerConfig)
     let outputRoot = gatewayVideoGenerationResolveOutputRoot(config)
+    let diagnosticBase = videoGenerationEmitStarted(provider, providerKind, videoGenerationString(providerConfig, "model"), prompt, outputRoot)
+    emitGatewayMediaDiagnostic("debug", MediaDiagnosticEvent.mediaGenerationAttempt, "video generation provider selected", meta: diagnosticBase)
     if (!videoGenerationPathAllowed(outputRoot, config)) {
         let out = videoGenerationStatus("invalid_request", ok: false, message: "video generation outputRoot is not under an allowed managed root.")
         out.put("outputRoot", JsonString(outputRoot.toString()))
-        return out
+        return videoGenerationEmitResult(diagnosticBase, out)
     }
     match (videoGenerationRunnerOverride) {
         case Some(runner) =>
@@ -698,7 +843,7 @@ public func gatewayVideoGenerationGenerate(config: JsonObject, request: JsonObje
                 result.put("model", JsonString(videoGenerationString(providerConfig, "model")))
             }
             result.put("outputRoot", JsonString(outputRoot.toString()))
-            return result
+            return videoGenerationEmitResult(diagnosticBase, result)
         case None => ()
     }
     if (providerKind == "dashscope-qwen-video-generation") {
@@ -707,14 +852,14 @@ public func gatewayVideoGenerationGenerate(config: JsonObject, request: JsonObje
             let out = videoGenerationStatus("not_configured", ok: false, message: "Configured DashScope video generation provider '${provider}' is missing apiKey.")
             out.put("provider", JsonString(provider))
             out.put("providerKind", JsonString(providerKind))
-            return out
+            return videoGenerationEmitResult(diagnosticBase, out)
         }
-        return videoGenerationDashScopeGenerate(config, request, provider, providerKind, providerConfig, outputRoot)
+        return videoGenerationEmitResult(diagnosticBase, videoGenerationDashScopeGenerate(config, request, provider, providerKind, providerConfig, outputRoot))
     }
     let out = videoGenerationStatus("not_found", ok: false, message: "Configured video generation provider '${provider}' is not available.")
     out.put("provider", JsonString(provider))
     out.put("providerKind", JsonString(providerKind))
-    out
+    videoGenerationEmitResult(diagnosticBase, out)
 }
 
 public func gatewayVideoGenerationOutputRoot(config: JsonObject): String {

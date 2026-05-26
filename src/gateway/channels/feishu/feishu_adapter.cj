@@ -1,6 +1,6 @@
 package metis.gateway.channels.feishu
 
-import metis.core.{parseGatewayAudioParts, parseGatewayDocumentParts, parseGatewayEditText, parseGatewayPhotoParts, parseGatewayReactionRemove, parseGatewayReactionStatus, parseGatewayReactionToken, parseGatewayVideoParts, parseGatewayVoiceParts}
+import metis.core.{mediaDiagnosticPathMeta, parseGatewayAudioParts, parseGatewayDocumentParts, parseGatewayEditText, parseGatewayPhotoParts, parseGatewayReactionRemove, parseGatewayReactionStatus, parseGatewayReactionToken, parseGatewayVideoParts, parseGatewayVoiceParts}
 import metis.core.config.CliConfig
 import metis.gateway.core.{ChannelAdapter, gatewayLogIdentityHash}
 import metis.gateway.logging.{MetisLogEvent, metisCreateSubsystemLogger}
@@ -825,6 +825,53 @@ public class FeishuAdapter <: ChannelAdapter {
         }
     }
 
+    private func logFeishuMediaStage(
+        level: String,
+        event: String,
+        phase: String,
+        status: String,
+        record: JsonObject,
+        extra!: JsonObject = JsonObject()
+    ): Unit {
+        let mediaExtra = JsonObject()
+        mediaExtra.put("mediaId", record.get("mediaId") ?? JsonString(""))
+        mediaExtra.put("messageId", record.get("messageId") ?? JsonString(""))
+        mediaExtra.put("chatId", record.get("peerId") ?? JsonString(""))
+        mediaExtra.put("senderId", record.get("operatorId") ?? JsonString(""))
+        mediaExtra.put("mediaKind", record.get("mediaKind") ?? JsonString(""))
+        mediaExtra.put("mimeType", record.get("mimeType") ?? JsonString(""))
+        mediaExtra.put("fileName", record.get("fileName") ?? JsonString(""))
+        mediaExtra.put("fileBytes", record.get("fileSize") ?? 0.toJsonValue())
+        mediaExtra.put("downloaded", record.get("downloaded") ?? JsonBool(false))
+        mediaExtra.put("sourceScope", record.get("sourceScope") ?? JsonString(""))
+        mediaExtra.put("relation", record.get("relation") ?? JsonString(""))
+        mediaExtra.put("resourceType", record.get("resourceType") ?? JsonString(""))
+        let localPath = this.readStringField(record, "localPath").trimAscii()
+        if (!localPath.isEmpty()) {
+            let pathMeta = mediaDiagnosticPathMeta(localPath)
+            for (key in pathMeta.getFields().keys()) {
+                match (pathMeta.get(key)) {
+                    case Some(value) => mediaExtra.put(key, value)
+                    case None => ()
+                }
+            }
+        }
+        for (key in extra.getFields().keys()) {
+            match (extra.get(key)) {
+                case Some(value) => mediaExtra.put(key, value)
+                case None => ()
+            }
+        }
+        let meta = this.channelLogMeta(phase, status, accountId: this.readStringField(record, "accountId"), extra: mediaExtra)
+        let logger = metisCreateSubsystemLogger("gateway/channel/feishu/media")
+        match (level.trimAscii().toAsciiLower()) {
+            case "debug" => logger.debug(event, "Feishu media stage state", meta: meta)
+            case "warn" => logger.warn(event, "Feishu media stage state", meta: meta)
+            case "error" => logger.error(event, "Feishu media stage state", meta: meta)
+            case _ => logger.info(event, "Feishu media stage state", meta: meta)
+        }
+    }
+
     private func feishuErrorKind(detail: String): String {
         let lowered = detail.trimAscii().toAsciiLower()
         if (lowered.isEmpty()) { return "unknown" }
@@ -1350,6 +1397,7 @@ public class FeishuAdapter <: ChannelAdapter {
         if (lower.endsWith(".json")) { return "application/json" }
         if (lower.endsWith(".ogg")) { return "audio/ogg" }
         if (lower.endsWith(".mp3")) { return "audio/mpeg" }
+        if (lower.endsWith(".wav")) { return "audio/wav" }
         if (lower.endsWith(".m4a")) { return "audio/mp4" }
         if (lower.endsWith(".mp4")) { return if (messageType == "audio") { "audio/mp4" } else { "video/mp4" } }
         "application/octet-stream"
@@ -3308,6 +3356,7 @@ public class FeishuAdapter <: ChannelAdapter {
         record.put("mediaPath", JsonString(""))
         record.put("eligibleFor", JsonString(this.feishuAttachmentEligibility(normalizedType)))
         record.put("createdAtMs", JsonInt(DateTime.now().toUnixTimeStamp().toMilliseconds()))
+        this.logFeishuMediaStage("debug", MetisLogEvent.mediaInboundDetected, "media-detected", "detected", record)
         var downloaded = false
         var skippedReason = "metadata_only"
         var localPath = ""
@@ -3322,6 +3371,7 @@ public class FeishuAdapter <: ChannelAdapter {
                 skippedReason = "size_limit_exceeded"
             } else {
                 resourceNetworkAttempted = true
+                this.logFeishuMediaStage("debug", MetisLogEvent.mediaDownloadStarted, "media-download", "started", record)
                 let result = this.fetchFeishuMessageResource(
                     this.normalizeAccountId(accountId),
                     messageId,
@@ -3392,6 +3442,13 @@ public class FeishuAdapter <: ChannelAdapter {
             resourceNetworkAttempted,
             this.feishuAttachmentEligibility(normalizedType)
         ))
+        this.logFeishuMediaStage(
+            if (downloaded) { "debug" } else { "warn" },
+            if (downloaded) { MetisLogEvent.mediaDownloadFinished } else { MetisLogEvent.mediaDownloadFailed },
+            "media-download",
+            finalStatus,
+            record
+        )
         record
     }
 
@@ -3827,6 +3884,15 @@ public class FeishuAdapter <: ChannelAdapter {
             resourceNetworkAttempted,
             eligibleFor
         ))
+        this.logFeishuMediaStage("debug", MetisLogEvent.mediaInboundDetected, "media-detected", "detected", record)
+        let finalStatus = if (downloaded) { "downloaded" } else { skippedReason }
+        this.logFeishuMediaStage(
+            if (downloaded) { "debug" } else { "warn" },
+            if (downloaded) { MetisLogEvent.mediaDownloadFinished } else { MetisLogEvent.mediaDownloadFailed },
+            "media-download",
+            finalStatus,
+            record
+        )
         record
     }
 
@@ -4279,8 +4345,12 @@ public class FeishuAdapter <: ChannelAdapter {
         for (item in records.getItems()) {
             try {
                 this.persistFeishuMediaRecord(item.asObject(), cfg)
-            } catch (_e: Exception) {
-                ()
+            } catch (e: Exception) {
+                let record = try { item.asObject() } catch (_inner: Exception) { JsonObject() }
+                let extra = JsonObject()
+                extra.put("statePersisted", JsonBool(false))
+                extra.put("reason", JsonString(e.message))
+                this.logFeishuMediaStage("warn", MetisLogEvent.mediaDownloadFailed, "media-state", "media_state_write_failed", record, extra: extra)
             }
         }
     }
@@ -4323,6 +4393,9 @@ public class FeishuAdapter <: ChannelAdapter {
             Directory.create(path.parent, recursive: true)
         }
         File.writeTo(path, root.toJsonString().toArray())
+        let extra = JsonObject()
+        extra.put("statePersisted", JsonBool(true))
+        this.logFeishuMediaStage("debug", MetisLogEvent.mediaPreflightFinished, "media-state", "persisted", record, extra: extra)
     }
 
     private func feishuStateRecord(record: JsonObject): JsonObject {
@@ -4464,6 +4537,7 @@ public class FeishuAdapter <: ChannelAdapter {
         if (mime == "image/webp") { return ".webp" }
         if (mime == "audio/ogg") { return ".ogg" }
         if (mime == "audio/mpeg") { return ".mp3" }
+        if (mime == "audio/wav") { return ".wav" }
         if (mime == "audio/mp4") { return ".m4a" }
         if (mime == "video/mp4") { return ".mp4" }
         if (mime == "application/pdf") { return ".pdf" }

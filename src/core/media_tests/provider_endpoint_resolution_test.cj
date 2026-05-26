@@ -42,6 +42,15 @@ public class ProviderEndpointResolutionTest {
     }
 
     @TestCase
+    public func resolvesDashScopeImageAigcBaseUrlFromCompatibleAndNativeInputs(): Unit {
+        @Expect(resolveDashScopeAigcBaseUrlForImage("https://dashscope.aliyuncs.com/compatible-mode/v1"), "https://dashscope.aliyuncs.com/api/v1")
+        @Expect(resolveDashScopeAigcBaseUrlForImage("https://dashscope-intl.aliyuncs.com/compatible-mode/v1"), "https://dashscope-intl.aliyuncs.com/api/v1")
+        @Expect(resolveDashScopeAigcBaseUrlForImage("https://coding.dashscope.aliyuncs.com/v1"), "https://dashscope.aliyuncs.com/api/v1")
+        @Expect(resolveDashScopeAigcBaseUrlForImage("https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"), "https://token-plan.cn-beijing.maas.aliyuncs.com/api/v1")
+        @Expect(resolveDashScopeAigcBaseUrlForImage("https://token-plan.cn-beijing.maas.aliyuncs.com/api/v1"), "https://token-plan.cn-beijing.maas.aliyuncs.com/api/v1")
+    }
+
+    @TestCase
     public func invalidInputsRemainDiagnosable(): Unit {
         @Expect(providerEndpointClassId(resolveProviderEndpoint("openai", "").endpointClass), "invalid")
         @Expect(resolveProviderEndpoint("openai", "").reason, "empty_base_url")

@@ -1,12 +1,12 @@
 package metis.gateway.core
 
-import metis.core.{GatewayToolRuntimeContext, gatewayMediaUnderstandingFirstText, gatewayMediaUnderstandingForRecordWithSettings}
+import metis.core.{GatewayToolRuntimeContext, MediaDiagnosticEvent, emitGatewayMediaDiagnostic, gatewayMediaUnderstandingFirstText, gatewayMediaUnderstandingForRecordWithSettings}
 import metis.core.config.{CliSettingManager, GatewayUserSettings}
 import metis.gateway.session.{GatewaySessionContext, GatewaySessionRequest}
 import std.collection.ArrayList
 import std.convert.Parsable
 import std.fs.{Path, exists}
-import stdx.encoding.json.{JsonArray, JsonBool, JsonObject, JsonString}
+import stdx.encoding.json.{JsonArray, JsonBool, JsonInt, JsonObject, JsonString}
 
 private func gatewayJsonString(obj: JsonObject, key: String): String {
     match (obj.get(key)) {
@@ -586,6 +586,14 @@ public func gatewayExecuteSessionRequestTurn(
         gatewayCallHook: gatewaySessionTurnGatewayCallHookFromDeliverHook(deliverHook)
     )
     let mediaPrompt = gatewayBuildMediaContextPrompt(request.mediaContext)
+    if (!mediaPrompt.trimAscii().isEmpty()) {
+        let meta = JsonObject()
+        meta.put("channel", JsonString(context.channelName))
+        meta.put("sessionId", JsonString(context.sessionKey))
+        meta.put("recordCount", JsonInt(Int64(gatewayMediaRecords(request.mediaContext).size())))
+        meta.put("promptChars", JsonInt(Int64(mediaPrompt.size)))
+        emitGatewayMediaDiagnostic("info", MediaDiagnosticEvent.mediaPromptInjected, "media prompt injected into model context", meta: meta)
+    }
     let mergedExtraSystemPrompt = if (mediaPrompt.trimAscii().isEmpty()) {
         extraSystemPrompt
     } else if (extraSystemPrompt.trimAscii().isEmpty()) {

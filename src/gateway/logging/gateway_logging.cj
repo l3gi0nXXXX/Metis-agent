@@ -46,6 +46,30 @@ public class MetisLogEvent {
     public static const modelRequest: String = "model.request"
     public static const modelResponse: String = "model.response"
     public static const modelFailed: String = "model.failed"
+    public static const mediaInboundDetected: String = "media.inbound.detected"
+    public static const mediaDownloadStarted: String = "media.download.started"
+    public static const mediaDownloadFinished: String = "media.download.finished"
+    public static const mediaDownloadFailed: String = "media.download.failed"
+    public static const mediaPreflightStarted: String = "media.preflight.started"
+    public static const mediaPreflightFinished: String = "media.preflight.finished"
+    public static const mediaUnderstandingStarted: String = "media.understanding.started"
+    public static const mediaUnderstandingAttempt: String = "media.understanding.attempt"
+    public static const mediaUnderstandingFinished: String = "media.understanding.finished"
+    public static const mediaUnderstandingFailed: String = "media.understanding.failed"
+    public static const mediaPromptInjected: String = "media.prompt.injected"
+    public static const mediaGenerationStarted: String = "media.generation.started"
+    public static const mediaGenerationAttempt: String = "media.generation.attempt"
+    public static const mediaGenerationPoll: String = "media.generation.poll"
+    public static const mediaGenerationDownload: String = "media.generation.download"
+    public static const mediaGenerationFinished: String = "media.generation.finished"
+    public static const mediaGenerationFailed: String = "media.generation.failed"
+    public static const mediaOutboundResolve: String = "media.outbound.resolve"
+    public static const mediaOutboundUpload: String = "media.outbound.upload"
+    public static const mediaOutboundSend: String = "media.outbound.send"
+    public static const mediaOutboundFailed: String = "media.outbound.failed"
+    public static const mediaToolInvoked: String = "media.tool.invoked"
+    public static const mediaToolResult: String = "media.tool.result"
+    public static const mediaToolFailed: String = "media.tool.failed"
     public static const toolInvoked: String = "tool.invoked"
     public static const toolFailed: String = "tool.failed"
     public static const skillMatched: String = "skill.matched"
@@ -75,7 +99,14 @@ public class MetisLogEvent {
             channelStarted, channelFailed, channelStopped, channelTiming, channelStartupSummary,
             channelPull, channelSend, messageInbound, messageInboundPreview, messageRouted,
             messageReplyGenerated, messageOutbound, messageSent, messageSendFailed, messageSendFailedLegacy,
-            modelRequest, modelResponse, modelFailed, toolInvoked, toolFailed, skillMatched, skillSkipped,
+            modelRequest, modelResponse, modelFailed,
+            mediaInboundDetected, mediaDownloadStarted, mediaDownloadFinished, mediaDownloadFailed,
+            mediaPreflightStarted, mediaPreflightFinished, mediaUnderstandingStarted, mediaUnderstandingAttempt,
+            mediaUnderstandingFinished, mediaUnderstandingFailed, mediaPromptInjected, mediaGenerationStarted,
+            mediaGenerationAttempt, mediaGenerationPoll, mediaGenerationDownload, mediaGenerationFinished,
+            mediaGenerationFailed, mediaOutboundResolve, mediaOutboundUpload, mediaOutboundSend,
+            mediaOutboundFailed, mediaToolInvoked, mediaToolResult, mediaToolFailed,
+            toolInvoked, toolFailed, skillMatched, skillSkipped,
             sessionReadFailed, sessionWriteFailed, sessionMigrationFailed, sessionReaped,
             cronScheduled, cronStarted, cronSucceeded, cronFailed, cronDisabled, cronSkipped,
             processMemory, chatTurnPublished, rpcRequestSlow, rpcRequestFailed, rpcSlow, rpcFailed, loggingRaw,

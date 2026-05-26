@@ -2,6 +2,7 @@ package metis.gateway.logging
 
 import magic.config.Config
 
+import metis.core.{MediaDiagnosticEvent, emitGatewayMediaDiagnostic, mediaDiagnosticProviderMeta, resetGatewayMediaDiagnosticSinkForTest}
 import metis.core.config.{CliConfig, CliSettingManager}
 
 import std.env.{getVariable, setVariable}
@@ -377,6 +378,78 @@ public class GatewayLoggingTest {
             loggingTestRestoreEnv("METIS_LOG_FILE", oldFile)
             loggingTestRestoreEnv("METIS_CONSOLE_LEVEL", oldConsoleLevel)
             loggingTestRestoreEnv("METIS_LOG_LEVEL", oldLevel)
+            CliConfig.invalidatePathCache()
+            CliSettingManager.invalidate()
+            gatewayLoggingResetForTest()
+        }
+    }
+
+    @TestCase
+    public func mediaEventsStayInDictionary(): Unit {
+        let expected = [
+            MetisLogEvent.mediaInboundDetected,
+            MetisLogEvent.mediaDownloadStarted,
+            MetisLogEvent.mediaDownloadFinished,
+            MetisLogEvent.mediaDownloadFailed,
+            MetisLogEvent.mediaPreflightStarted,
+            MetisLogEvent.mediaPreflightFinished,
+            MetisLogEvent.mediaUnderstandingStarted,
+            MetisLogEvent.mediaUnderstandingAttempt,
+            MetisLogEvent.mediaUnderstandingFinished,
+            MetisLogEvent.mediaUnderstandingFailed,
+            MetisLogEvent.mediaPromptInjected,
+            MetisLogEvent.mediaGenerationStarted,
+            MetisLogEvent.mediaGenerationAttempt,
+            MetisLogEvent.mediaGenerationPoll,
+            MetisLogEvent.mediaGenerationDownload,
+            MetisLogEvent.mediaGenerationFinished,
+            MetisLogEvent.mediaGenerationFailed,
+            MetisLogEvent.mediaOutboundResolve,
+            MetisLogEvent.mediaOutboundUpload,
+            MetisLogEvent.mediaOutboundSend,
+            MetisLogEvent.mediaOutboundFailed,
+            MetisLogEvent.mediaToolInvoked,
+            MetisLogEvent.mediaToolResult,
+            MetisLogEvent.mediaToolFailed
+        ]
+        for (event in expected) {
+            @Expect(event.startsWith("media."), true)
+            @Expect(gatewayLogEventIsKnown(event), true)
+        }
+    }
+
+    @TestCase
+    public func installedMediaDiagnosticSinkWritesThroughGatewayLogger(): Unit {
+        let oldHome = getVariable("METIS_HOME")
+        let oldLevel = getVariable("METIS_LOG_LEVEL")
+        let oldFile = getVariable("METIS_LOG_FILE")
+        let oldConsoleLevel = getVariable("METIS_CONSOLE_LEVEL")
+        let home = loggingTestHome("media-sink")
+        let file = home.join("logs").join("media-sink.log").toString()
+        try {
+            loggingTestReset(home)
+            setVariable("METIS_LOG_LEVEL", "debug")
+            setVariable("METIS_LOG_FILE", file)
+            setVariable("METIS_CONSOLE_LEVEL", "silent")
+            gatewayInstallMediaDiagnosticLoggingSinkForRuntime()
+            emitGatewayMediaDiagnostic(
+                "debug",
+                MediaDiagnosticEvent.mediaUnderstandingAttempt,
+                "video provider attempt",
+                meta: mediaDiagnosticProviderMeta("qwen-video-understanding", providerKind: "qwen-vl-video", model: "qwen3-vl-plus", capability: "video")
+            )
+            let raw = String.fromUtf8(File.readFrom(Path(file)))
+            let row = JsonValue.fromStr(raw.trimAscii()).asObject()
+            @Expect(row.get("event").getOrThrow().asString().getValue(), "media.understanding.attempt")
+            @Expect(row.get("subsystem").getOrThrow().asString().getValue(), "gateway/media/understanding")
+            @Expect(row.get("provider").getOrThrow().asString().getValue(), "qwen-video-understanding")
+            @Expect(row.get("providerKind").getOrThrow().asString().getValue(), "qwen-vl-video")
+        } finally {
+            resetGatewayMediaDiagnosticSinkForTest()
+            loggingTestRestoreEnv("METIS_HOME", oldHome)
+            loggingTestRestoreEnv("METIS_LOG_LEVEL", oldLevel)
+            loggingTestRestoreEnv("METIS_LOG_FILE", oldFile)
+            loggingTestRestoreEnv("METIS_CONSOLE_LEVEL", oldConsoleLevel)
             CliConfig.invalidatePathCache()
             CliSettingManager.invalidate()
             gatewayLoggingResetForTest()

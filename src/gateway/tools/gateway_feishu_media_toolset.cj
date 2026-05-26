@@ -704,6 +704,7 @@ private func feishuMediaToolExtensionFromMime(mimeType: String): String {
     if (mime == "image/webp") { return ".webp" }
     if (mime == "audio/ogg") { return ".ogg" }
     if (mime == "audio/mpeg") { return ".mp3" }
+    if (mime == "audio/wav") { return ".wav" }
     if (mime == "video/mp4") { return ".mp4" }
     if (mime == "application/pdf") { return ".pdf" }
     if (mime.startsWith("text/")) { return ".txt" }

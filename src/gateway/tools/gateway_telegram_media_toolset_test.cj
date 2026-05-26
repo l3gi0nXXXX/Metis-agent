@@ -1,6 +1,6 @@
 package metis.gateway.tools
 
-import metis.core.{GatewayMediaVideoHttpResult, GatewayToolRuntimeContext, gatewayWithToolRuntimeContext, setGatewayMediaPdfRuntimeForTest, setGatewayMediaVideoHttpRunnerForTest}
+import metis.core.{GatewayMediaDiagnosticSink, GatewayMediaVideoHttpResult, GatewayToolRuntimeContext, MediaDiagnosticEvent, gatewayWithToolRuntimeContext, resetGatewayMediaDiagnosticSinkForTest, setGatewayMediaDiagnosticSinkForRuntime, setGatewayMediaPdfRuntimeForTest, setGatewayMediaVideoHttpRunnerForTest}
 import metis.core.config.{CliConfig, CliSettingManager, GatewayUserSettings, MetisConfigManager}
 import magic.core.message.Message
 import magic.core.model.{AsyncChatResponse, ChatModel, ChatRequest, ChatResponse}
@@ -106,6 +106,67 @@ private class TelegramMediaToolsetVisionEmptyResponseFakeModel <: ChatModel {
     }
 }
 
+private class GatewayMediaToolDiagnosticCaptureSink <: GatewayMediaDiagnosticSink {
+    public let events = ArrayList<JsonObject>()
+
+    public func emit(level: String, event: String, message: String, meta: JsonObject): Unit {
+        let row = JsonObject()
+        row.put("level", JsonString(level))
+        row.put("event", JsonString(event))
+        row.put("message", JsonString(message))
+        row.put("meta", meta)
+        this.events.add(row)
+    }
+}
+
+private func gatewayMediaToolDiagString(row: JsonObject, key: String): String {
+    let meta = match (row.get("meta")) {
+        case Some(value) => try { value.asObject() } catch (_e: Exception) { JsonObject() }
+        case None => JsonObject()
+    }
+    match (meta.get(key)) {
+        case Some(value) => try { value.asString().getValue() } catch (_e: Exception) { "" }
+        case None => ""
+    }
+}
+
+private func gatewayMediaToolDiagInt(row: JsonObject, key: String): Int64 {
+    let meta = match (row.get("meta")) {
+        case Some(value) => try { value.asObject() } catch (_e: Exception) { JsonObject() }
+        case None => JsonObject()
+    }
+    match (meta.get(key)) {
+        case Some(value) => try { value.asInt().getValue() } catch (_e: Exception) { 0 }
+        case None => 0
+    }
+}
+
+private func gatewayMediaToolDiagEvent(row: JsonObject): String {
+    match (row.get("event")) {
+        case Some(value) => try { value.asString().getValue() } catch (_e: Exception) { "" }
+        case None => ""
+    }
+}
+
+private func gatewayMediaToolDiagCount(sink: GatewayMediaToolDiagnosticCaptureSink, event: String): Int64 {
+    var count: Int64 = 0
+    for (row in sink.events) {
+        if (gatewayMediaToolDiagEvent(row) == event) {
+            count += 1
+        }
+    }
+    count
+}
+
+private func gatewayMediaToolDiagFind(sink: GatewayMediaToolDiagnosticCaptureSink, event: String): JsonObject {
+    for (row in sink.events) {
+        if (gatewayMediaToolDiagEvent(row) == event) {
+            return row
+        }
+    }
+    JsonObject()
+}
+
 @Test
 public class GatewayTelegramMediaToolsetTest {
     private func withTelegramMediaToolsetConfigHome<T>(block: () -> T): T {
@@ -166,6 +227,133 @@ public class GatewayTelegramMediaToolsetTest {
         media.put("peerId", JsonString(peerId))
         media.put("messageId", JsonString(messageId))
         media
+    }
+
+    @TestCase
+    public func telegramMediaSendUsesRuntimeMediaContextPeerForRoutedSession(): Unit {
+        let root = Path("/tmp/metis-telegram-media-send-route-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
+        Directory.create(root, recursive: true)
+        let source = root.join("metis-orca.png")
+        File.writeTo(source, "fake-orca-image".toArray())
+        let toolset = GatewayTelegramMediaToolset()
+        let sent = ArrayList<JsonObject>()
+        toolset.debugSetGatewayCallRunnerForTest(Some({ method: String, params: JsonObject =>
+            @Expect(method, "channels.send")
+            sent.add(params)
+            let out = JsonObject()
+            out.put("ok", JsonBool(true))
+            out.put("messageId", JsonString("9001"))
+            out
+        }))
+        try {
+            let context = GatewayToolRuntimeContext(
+                "telegram",
+                channelName: "telegram",
+                sessionKey: "agent:writer:main",
+                senderId: "1059872384",
+                mediaContext: this.telegramScopeContext("default", "user:1059872384", "501")
+            )
+            let out = gatewayWithToolRuntimeContext(context, { =>
+                toolset.debugTelegramMediaSendForTest(source.toString(), Some("orca mascot"), Some("photo"), Some(false))
+            })
+            let json = JsonValue.fromStr(out).asObject()
+            @Expect(json.get("ok").getOrThrow().asBool().getValue(), true)
+            @Expect(json.get("status").getOrThrow().asString().getValue(), "accepted")
+            @Expect(json.get("to").getOrThrow().asString().getValue(), "user:1059872384")
+            @Expect(json.get("sessionKey").getOrThrow().asString().getValue(), "agent:writer:main")
+            @Expect(sent.size, 1)
+            @Expect(sent[0].get("peerId").getOrThrow().asString().getValue(), "user:1059872384")
+            let text = sent[0].get("text").getOrThrow().asString().getValue()
+            @Expect(text.startsWith("[photo]"), true)
+            @Expect(text.contains(source.toString()), true)
+        } finally {
+            toolset.debugSetGatewayCallRunnerForTest(None<(String, JsonObject) -> JsonObject>)
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func telegramMediaSendLocalImageEmitsToolAndOutboundDiagnostics(): Unit {
+        let root = Path("/tmp/metis-telegram-media-send-diag-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
+        Directory.create(root, recursive: true)
+        let source = root.join("local.png")
+        File.writeTo(source, "fake-local-image".toArray())
+        let sink = GatewayMediaToolDiagnosticCaptureSink()
+        setGatewayMediaDiagnosticSinkForRuntime(Some(sink))
+        let toolset = GatewayTelegramMediaToolset()
+        let sent = ArrayList<JsonObject>()
+        toolset.debugSetGatewayCallRunnerForTest(Some({ method: String, params: JsonObject =>
+            @Expect(method, "channels.send")
+            sent.add(params)
+            let out = JsonObject()
+            out.put("ok", JsonBool(true))
+            out
+        }))
+        try {
+            let out = gatewayWithToolRuntimeContext(
+                GatewayToolRuntimeContext("telegram", channelName: "telegram", sessionKey: "telegram:direct:user:1"),
+                { => toolset.debugTelegramMediaSendForTest(source.toString(), Some("caption"), Some("photo"), Some(false)) }
+            )
+            let json = JsonValue.fromStr(out).asObject()
+            @Expect(json.get("ok").getOrThrow().asBool().getValue(), true)
+            @Expect(sent.size, 1)
+            @Expect(gatewayMediaToolDiagCount(sink, MediaDiagnosticEvent.mediaToolInvoked), 1)
+            @Expect(gatewayMediaToolDiagCount(sink, MediaDiagnosticEvent.mediaOutboundResolve), 1)
+            @Expect(gatewayMediaToolDiagCount(sink, MediaDiagnosticEvent.mediaOutboundUpload), 1)
+            @Expect(gatewayMediaToolDiagCount(sink, MediaDiagnosticEvent.mediaOutboundSend), 1)
+            @Expect(gatewayMediaToolDiagCount(sink, MediaDiagnosticEvent.mediaToolResult), 1)
+            let resolve = gatewayMediaToolDiagFind(sink, MediaDiagnosticEvent.mediaOutboundResolve)
+            @Expect(gatewayMediaToolDiagString(resolve, "toolName"), "telegram_media_send")
+            @Expect(gatewayMediaToolDiagString(resolve, "channel"), "telegram")
+            @Expect(gatewayMediaToolDiagString(resolve, "payloadKind"), "photo")
+            @Expect(gatewayMediaToolDiagString(resolve, "pathBasename"), "local.png")
+            @Expect(gatewayMediaToolDiagString(resolve, "mimeType"), "image/png")
+            @Expect(gatewayMediaToolDiagInt(resolve, "fileBytes"), 16)
+            @Expect(sink.events.size > 0, true)
+            if (sink.events.size > 0) {
+                @Expect(sink.events[0].toJsonString().contains(source.toString()), false)
+            }
+        } finally {
+            resetGatewayMediaDiagnosticSinkForTest()
+            toolset.debugSetGatewayCallRunnerForTest(None<(String, JsonObject) -> JsonObject>)
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func telegramMediaSendMissingLocalFileEmitsResolveFailureWithoutSend(): Unit {
+        let missing = "/tmp/metis-telegram-missing-${DateTime.now().toUnixTimeStamp().toMilliseconds()}.png"
+        let sink = GatewayMediaToolDiagnosticCaptureSink()
+        setGatewayMediaDiagnosticSinkForRuntime(Some(sink))
+        let toolset = GatewayTelegramMediaToolset()
+        let calls = ArrayList<String>()
+        toolset.debugSetGatewayCallRunnerForTest(Some({ method: String, _params: JsonObject =>
+            calls.add(method)
+            let out = JsonObject()
+            out.put("ok", JsonBool(true))
+            out
+        }))
+        try {
+            let out = gatewayWithToolRuntimeContext(
+                GatewayToolRuntimeContext("telegram", channelName: "telegram", sessionKey: "telegram:direct:user:1"),
+                { => toolset.debugTelegramMediaSendForTest(missing, None<String>, Some("photo"), Some(false)) }
+            )
+            let json = JsonValue.fromStr(out).asObject()
+            @Expect(json.get("ok").getOrThrow().asBool().getValue(), false)
+            @Expect(calls.size, 0)
+            @Expect(gatewayMediaToolDiagCount(sink, MediaDiagnosticEvent.mediaOutboundResolve), 1)
+            @Expect(gatewayMediaToolDiagCount(sink, MediaDiagnosticEvent.mediaOutboundUpload), 0)
+            @Expect(gatewayMediaToolDiagCount(sink, MediaDiagnosticEvent.mediaOutboundSend), 0)
+            @Expect(gatewayMediaToolDiagCount(sink, MediaDiagnosticEvent.mediaOutboundFailed), 1)
+            @Expect(gatewayMediaToolDiagCount(sink, MediaDiagnosticEvent.mediaToolFailed), 1)
+            let failed = gatewayMediaToolDiagFind(sink, MediaDiagnosticEvent.mediaOutboundFailed)
+            @Expect(gatewayMediaToolDiagString(failed, "toolName"), "telegram_media_send")
+            @Expect(gatewayMediaToolDiagString(failed, "errorKind"), "file_not_found")
+            @Expect(failed.toJsonString().contains(missing), false)
+        } finally {
+            resetGatewayMediaDiagnosticSinkForTest()
+            toolset.debugSetGatewayCallRunnerForTest(None<(String, JsonObject) -> JsonObject>)
+        }
     }
 
     private func recentRecord(localPath: String, accountId: String, peerId: String, messageId: String, mediaId: String, fileId: String): JsonObject {

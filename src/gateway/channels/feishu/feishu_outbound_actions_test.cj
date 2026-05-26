@@ -152,6 +152,44 @@ public class FeishuOutboundActionsTest {
     }
 
     @TestCase
+    public func localWavVoicePayloadUsesFeishuAudioMessageWithoutTextFallback(): Unit {
+        let root = this.tempRoot("voice-wav")
+        try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        let voicePath = root.join("tts.wav")
+        Directory.create(root, recursive: true)
+        File.writeTo(voicePath, "fake-wav".toArray())
+        try {
+            let client = FeishuFakeApiClient()
+            let adapter = FeishuAdapter(
+                config: FeishuConfig(
+                    enabled: true,
+                    streaming: "text",
+                    media: FeishuMediaConfig(
+                        mediaMaxBytes: 1024,
+                        allowedMimes: ["audio/*"]
+                    )
+                ),
+                apiClient: client
+            )
+            adapter.start()
+
+            let voiceId = adapter.sendWithMessageId(OutboundMessage(
+                ChannelType.Feishu,
+                "oc_media",
+                renderGatewayVoiceText(voicePath.toString(), caption: "voice"),
+                accountId: "tenant-a"
+            ))
+
+            @Expect(voiceId, "fake-feishu-audio-1")
+            @Expect(client.textSendCount(), 0)
+            @Expect(client.uploadedMediaCount(), 1)
+            @Expect(client.mediaSendCount(), 1)
+        } finally {
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
     public func reactionAndDeletePayloadsUseMessageActionsWithoutTextFallback(): Unit {
         let client = FeishuFakeApiClient()
         let adapter = FeishuAdapter(config: FeishuConfig(enabled: true, streaming: "text"), apiClient: client)

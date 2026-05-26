@@ -27,7 +27,7 @@ public struct MediaProviderDescriptor {
 
 private let MEDIA_PROVIDER_DESCRIPTORS = [
     MediaProviderDescriptor("openai-images", "openai-images", ["openai", "openai-compatible", "openai-qwen-image"], [ImageGenerate, ImageEdit], "https://api.openai.com/v1", [OpenAiPublic, OpenAiCompatibleCustom, ModelStudioCompatible, OpenRouter, Local, Custom]),
-    MediaProviderDescriptor("dashscope-qwen-image", "dashscope-qwen-image-generation", ["dashscope-qwen-image-generation", "qwen-image-native"], [ImageGenerate], "https://dashscope.aliyuncs.com/api/v1", [DashScopeAigcNative]),
+    MediaProviderDescriptor("dashscope-qwen-image", "dashscope-qwen-image-generation", ["dashscope-qwen-image-generation", "qwen-image-native"], [ImageGenerate], "https://dashscope.aliyuncs.com/api/v1", [DashScopeAigcNative, ModelStudioCompatible, ModelStudioCoding, OpenAiCompatibleCustom, Custom]),
     MediaProviderDescriptor("google-image", "google-image-generation", ["gemini-image", "google"], [ImageGenerate, ImageUnderstand], "https://generativelanguage.googleapis.com/v1beta", [GoogleGenerativeAi, Custom]),
     MediaProviderDescriptor("minimax-image", "minimax-image-generation", ["minimax"], [ImageGenerate], "https://api.minimax.io", [Custom]),
     MediaProviderDescriptor("fal-image", "fal-image-generation", ["fal"], [ImageGenerate], "https://fal.run", [Custom]),

@@ -10,6 +10,7 @@ import metis.core.gatewayCurrentToolRuntimeContext
 import metis.core.{renderGatewayAudioText, renderGatewayDeleteText, renderGatewayDocumentText, renderGatewayEditText, renderGatewayPhotoText, renderGatewayPollText, renderGatewayReactionText, renderGatewayStickerText, renderGatewayTopicCreateText, renderGatewayTopicEditText, renderGatewayVideoNoteText, renderGatewayVideoText, renderGatewayVoiceText}
 import metis.core.config.{CliConfig, CliSettingManager, MetisConfigManager, MetisPaths}
 import metis.core.{gatewayImageUnderstandingCandidateSummary, gatewayMediaUnderstandingFirstText, gatewayMediaUnderstandingForRecord, gatewayMediaUnderstandingOutputs}
+import metis.core.{MediaDiagnosticEvent, emitGatewayMediaDiagnostic, mediaDiagnosticMergeMeta, mediaDiagnosticPathMeta}
 import metis.core.model.{gatewayImageCapabilityDecisionJson, gatewayModelSupportsImageInput}
 import metis.io.PrintUtils
 
@@ -20,7 +21,7 @@ import std.process.executeWithOutput
 import std.regex.{Regex, RegexFlag}
 import std.time.DateTime
 import stdx.encoding.base64.toBase64String
-import stdx.encoding.json.{JsonArray, JsonBool, JsonObject, JsonString, JsonValue}
+import stdx.encoding.json.{JsonArray, JsonBool, JsonInt, JsonObject, JsonString, JsonValue}
 
 private var telegramMediaToolGatewayCallRunnerOverride: Option<(String, JsonObject) -> JsonObject> = None<(String, JsonObject) -> JsonObject>
 private func telegramMediaToolString(obj: JsonObject, key: String): String {
@@ -781,17 +782,66 @@ private func telegramMediaToolInvokeGatewayCall(method: String, params!: Option<
 private func telegramMediaToolCurrentTarget(): (String, String, String) {
     match (gatewayCurrentToolRuntimeContext()) {
         case Some(ctx) =>
-            let channel = if (ctx.channelName.isEmpty()) { ctx.sourceLabel } else { ctx.channelName }
+            let mediaChannel = telegramMediaToolString(ctx.mediaContext, "channel").toAsciiLower()
+            let channel = if (!ctx.channelName.isEmpty()) {
+                ctx.channelName
+            } else if (!mediaChannel.isEmpty()) {
+                mediaChannel
+            } else {
+                ctx.sourceLabel
+            }
             let sessionKey = ctx.sessionKey.trimAscii()
-            if (channel == "telegram" && sessionKey.startsWith("telegram:direct:")) {
-                return ("telegram", sessionKey["telegram:direct:".size..], ctx.sessionKey)
+            if (channel != "telegram" && mediaChannel != "telegram") {
+                return (channel, "", sessionKey)
             }
-            if (channel == "telegram" && sessionKey.startsWith("telegram:group:")) {
-                return ("telegram", sessionKey["telegram:group:".size..], ctx.sessionKey)
+            let sessionTarget = telegramMediaToolTargetFromSessionKey(sessionKey)
+            if (!sessionTarget.isEmpty()) {
+                return ("telegram", sessionTarget, sessionKey)
             }
-            return (channel, "", sessionKey)
+            let peerId = telegramMediaToolStripPerPeerSuffix(telegramMediaToolString(ctx.mediaContext, "peerId"))
+            if (!peerId.isEmpty()) {
+                return ("telegram", peerId, sessionKey)
+            }
+            let to = telegramMediaToolStripPerPeerSuffix(telegramMediaToolString(ctx.mediaContext, "to"))
+            if (!to.isEmpty()) {
+                return ("telegram", to, sessionKey)
+            }
+            if (!ctx.senderId.isEmpty()) {
+                return ("telegram", telegramMediaToolNormalizeDirectTarget(ctx.senderId), sessionKey)
+            }
+            return ("telegram", "", sessionKey)
         case None => ("", "", "")
     }
+}
+
+private func telegramMediaToolStripPerPeerSuffix(raw: String): String {
+    let target = raw.trimAscii()
+    match (target.indexOf(":u:")) {
+        case Some(idx) => target[..idx].trimAscii()
+        case None => target
+    }
+}
+
+private func telegramMediaToolNormalizeDirectTarget(raw: String): String {
+    let target = raw.trimAscii()
+    if (target.isEmpty() || target.startsWith("user:") || target.startsWith("group:") || target.startsWith("@")) {
+        return target
+    }
+    "user:${target}"
+}
+
+private func telegramMediaToolTargetFromSessionKey(sessionKey: String): String {
+    let key = sessionKey.trimAscii()
+    if (key.startsWith("telegram:direct:")) {
+        return key["telegram:direct:".size..].trimAscii()
+    }
+    if (key.startsWith("telegram:dm:u:")) {
+        return telegramMediaToolNormalizeDirectTarget(key["telegram:dm:u:".size..])
+    }
+    if (key.startsWith("telegram:group:")) {
+        return telegramMediaToolStripPerPeerSuffix(key["telegram:group:".size..])
+    }
+    ""
 }
 
 private func telegramMediaToolBuildMediaText(kind: String, media: String, caption: String): String {
@@ -817,10 +867,88 @@ private func telegramMediaToolBuildMediaText(kind: String, media: String, captio
     renderGatewayDocumentText(media, caption: caption)
 }
 
+private func telegramMediaToolLooksLikeLocalPath(media: String): Bool {
+    let trimmed = media.trimAscii()
+    trimmed.startsWith("/") || trimmed.startsWith("./") || trimmed.startsWith("../") || trimmed.startsWith("~/")
+}
+
+private func telegramMediaToolPathSourceKind(media: String): String {
+    let trimmed = media.trimAscii().toAsciiLower()
+    if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) {
+        return "url"
+    }
+    if (telegramMediaToolLooksLikeLocalPath(media)) {
+        return "local_path"
+    }
+    "telegram_file_id"
+}
+
+private func telegramMediaToolMimeFromMedia(media: String, payloadKind: String): String {
+    let lower = media.trimAscii().toAsciiLower()
+    if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) { return "image/jpeg" }
+    if (lower.endsWith(".png")) { return "image/png" }
+    if (lower.endsWith(".gif")) { return "image/gif" }
+    if (lower.endsWith(".webp")) { return "image/webp" }
+    if (lower.endsWith(".ogg")) { return "audio/ogg" }
+    if (lower.endsWith(".mp3")) { return "audio/mpeg" }
+    if (lower.endsWith(".m4a")) { return "audio/mp4" }
+    if (lower.endsWith(".wav")) { return "audio/wav" }
+    if (lower.endsWith(".mp4")) { return "video/mp4" }
+    if (lower.endsWith(".mov")) { return "video/quicktime" }
+    if (lower.endsWith(".pdf")) { return "application/pdf" }
+    let kind = payloadKind.trimAscii().toAsciiLower()
+    if (kind == "photo" || kind == "image") { return "image/*" }
+    if (kind == "voice") { return "audio/ogg" }
+    if (kind == "audio") { return "audio/*" }
+    if (kind == "video" || kind == "video-note" || kind == "video_note" || kind == "videonote") { return "video/*" }
+    "application/octet-stream"
+}
+
+private func telegramMediaToolDiagnosticMeta(
+    toolName: String,
+    channel: String,
+    accountId: String,
+    peerId: String,
+    sessionKey: String,
+    payloadKind: String
+): JsonObject {
+    let meta = JsonObject()
+    meta.put("toolName", JsonString(toolName))
+    meta.put("channel", JsonString(channel))
+    if (!accountId.trimAscii().isEmpty()) {
+        meta.put("accountId", JsonString(accountId.trimAscii()))
+    }
+    if (!peerId.trimAscii().isEmpty()) {
+        meta.put("peerId", JsonString(peerId.trimAscii()))
+    }
+    if (!sessionKey.trimAscii().isEmpty()) {
+        meta.put("sessionKey", JsonString(sessionKey.trimAscii()))
+    }
+    if (!payloadKind.trimAscii().isEmpty()) {
+        meta.put("payloadKind", JsonString(payloadKind.trimAscii()))
+    }
+    meta
+}
+
+private func telegramMediaToolCurrentAccountId(): String {
+    match (gatewayCurrentToolRuntimeContext()) {
+        case Some(ctx) => telegramMediaToolNormalizeAccountId(telegramMediaToolString(ctx.mediaContext, "accountId"))
+        case None => "default"
+    }
+}
+
+private func telegramMediaToolEmitDiagnostic(level: String, event: String, message: String, base: JsonObject, extra: JsonObject): Unit {
+    emitGatewayMediaDiagnostic(level, event, message, meta: mediaDiagnosticMergeMeta(base, extra))
+}
+
 @toolset
 public class GatewayTelegramMediaToolset {
     public func debugSetGatewayCallRunnerForTest(runner: Option<(String, JsonObject) -> JsonObject>): Unit {
         telegramMediaToolGatewayCallRunnerOverride = runner
+    }
+
+    public func debugTelegramMediaSendForTest(pathOrUrl: String, caption: Option<String>, kind: Option<String>, forceDocument: Option<Bool>): String {
+        this.sendTelegramMedia(pathOrUrl, caption, kind, forceDocument)
     }
 
     public func debugTelegramMediaListForTest(): String {
@@ -1496,17 +1624,6 @@ public class GatewayTelegramMediaToolset {
 
     private func sendTelegramMedia(pathOrUrl: String, caption: Option<String>, kind: Option<String>, forceDocument: Option<Bool>): String {
         let media = pathOrUrl.trimAscii()
-        if (media.isEmpty()) {
-            return telegramMediaError("telegram_media_send", "pathOrUrl is required")
-        }
-        let (channel, target, sessionKey) = telegramMediaToolCurrentTarget()
-        if (channel != "telegram" || target.isEmpty()) {
-            return telegramMediaError("telegram_media_send", "telegram_media_send requires a current Telegram session delivery target")
-        }
-        let cap = match (caption) {
-            case Some(v) => v.trimAscii()
-            case None => ""
-        }
         let requestedKind = match (kind) {
             case Some(v) => v.trimAscii().toAsciiLower()
             case None => "document"
@@ -1515,6 +1632,77 @@ public class GatewayTelegramMediaToolset {
             case Some(v) => if (v) { "document" } else { requestedKind }
             case None => requestedKind
         }
+        let (channel, target, sessionKey) = telegramMediaToolCurrentTarget()
+        let baseMeta = telegramMediaToolDiagnosticMeta(
+            "telegram_media_send",
+            "telegram",
+            telegramMediaToolCurrentAccountId(),
+            target,
+            sessionKey,
+            actualKind
+        )
+        telegramMediaToolEmitDiagnostic("info", MediaDiagnosticEvent.mediaToolInvoked, "telegram media send tool invoked", baseMeta, JsonObject())
+        if (media.isEmpty()) {
+            let failedMeta = JsonObject()
+            failedMeta.put("errorKind", JsonString("missing_media"))
+            telegramMediaToolEmitDiagnostic("warn", MediaDiagnosticEvent.mediaToolFailed, "telegram media send rejected empty media", baseMeta, failedMeta)
+            return telegramMediaError("telegram_media_send", "pathOrUrl is required")
+        }
+        if (channel != "telegram" || target.isEmpty()) {
+            let failedMeta = JsonObject()
+            failedMeta.put("errorKind", JsonString("missing_delivery_target"))
+            telegramMediaToolEmitDiagnostic("warn", MediaDiagnosticEvent.mediaToolFailed, "telegram media send missing delivery target", baseMeta, failedMeta)
+            return telegramMediaError("telegram_media_send", "telegram_media_send requires a current Telegram session delivery target")
+        }
+        let cap = match (caption) {
+            case Some(v) => v.trimAscii()
+            case None => ""
+        }
+        let pathSourceKind = telegramMediaToolPathSourceKind(media)
+        let localPath = pathSourceKind == "local_path"
+        let mimeType = telegramMediaToolMimeFromMedia(media, actualKind)
+        let resolveExtra = JsonObject()
+        resolveExtra.put("pathSourceKind", JsonString(pathSourceKind))
+        resolveExtra.put("mimeType", JsonString(mimeType))
+        var fileBytes: Int64 = 0
+        if (localPath) {
+            let path = Path(media)
+            let pathMeta = mediaDiagnosticPathMeta(media)
+            for (key in pathMeta.getFields().keys()) {
+                match (pathMeta.get(key)) {
+                    case Some(value) => resolveExtra.put(key, value)
+                    case None => ()
+                }
+            }
+            if (!exists(path)) {
+                let failedMeta = JsonObject()
+                failedMeta.put("errorKind", JsonString("file_not_found"))
+                failedMeta.put("pathSourceKind", JsonString(pathSourceKind))
+                failedMeta.put("mimeType", JsonString(mimeType))
+                for (key in pathMeta.getFields().keys()) {
+                    match (pathMeta.get(key)) {
+                        case Some(value) => failedMeta.put(key, value)
+                        case None => ()
+                    }
+                }
+                telegramMediaToolEmitDiagnostic("debug", MediaDiagnosticEvent.mediaOutboundResolve, "telegram media send resolved local path", baseMeta, resolveExtra)
+                telegramMediaToolEmitDiagnostic("warn", MediaDiagnosticEvent.mediaOutboundFailed, "telegram media send local file missing", baseMeta, failedMeta)
+                telegramMediaToolEmitDiagnostic("warn", MediaDiagnosticEvent.mediaToolFailed, "telegram media send failed before gateway send", baseMeta, failedMeta)
+                return telegramMediaError("telegram_media_send", "local media file does not exist")
+            }
+            fileBytes = try { Int64(File.readFrom(path).size) } catch (_e: Exception) { 0 }
+            resolveExtra.put("fileBytes", JsonInt(fileBytes))
+        } else {
+            resolveExtra.put("pathKind", JsonString(pathSourceKind))
+        }
+        telegramMediaToolEmitDiagnostic("debug", MediaDiagnosticEvent.mediaOutboundResolve, "telegram media send resolved media input", baseMeta, resolveExtra)
+        let uploadExtra = JsonObject()
+        uploadExtra.put("pathSourceKind", JsonString(pathSourceKind))
+        uploadExtra.put("mimeType", JsonString(mimeType))
+        if (fileBytes > 0) {
+            uploadExtra.put("fileBytes", JsonInt(fileBytes))
+        }
+        telegramMediaToolEmitDiagnostic("debug", MediaDiagnosticEvent.mediaOutboundUpload, "telegram media send prepared upload payload", baseMeta, uploadExtra)
         let payload = JsonObject()
         payload.put("id", JsonString("telegram"))
         payload.put("channel", JsonString("telegram"))
@@ -1523,9 +1711,22 @@ public class GatewayTelegramMediaToolset {
         payload.put("text", JsonString(telegramMediaToolBuildMediaText(actualKind, media, cap)))
         payload.put("message", payload.get("text").getOrThrow())
         let sent = telegramMediaToolInvokeGatewayCall("channels.send", params: Some(payload))
+        let sentOk = try { sent.get("ok").getOrThrow().asBool().getValue() } catch (_e: Exception) { false }
+        let sendMeta = JsonObject()
+        sendMeta.put("pathSourceKind", JsonString(pathSourceKind))
+        sendMeta.put("mimeType", JsonString(mimeType))
+        if (fileBytes > 0) {
+            sendMeta.put("fileBytes", JsonInt(fileBytes))
+        }
+        if (sentOk) {
+            telegramMediaToolEmitDiagnostic("info", MediaDiagnosticEvent.mediaOutboundSend, "telegram media send accepted by gateway", baseMeta, sendMeta)
+        } else {
+            sendMeta.put("errorKind", JsonString("gateway_send_failed"))
+            telegramMediaToolEmitDiagnostic("warn", MediaDiagnosticEvent.mediaOutboundFailed, "telegram media send rejected by gateway", baseMeta, sendMeta)
+        }
         let result = JsonObject()
         result.put("ok", sent.get("ok") ?? JsonBool(false))
-        result.put("status", JsonString(if (try { (sent.get("ok").getOrThrow().asBool().getValue()) } catch (_e: Exception) { false }) { "accepted" } else { "error" }))
+        result.put("status", JsonString(if (sentOk) { "accepted" } else { "error" }))
         result.put("action", JsonString("telegram_media_send"))
         result.put("channel", JsonString("telegram"))
         result.put("to", JsonString(target))
@@ -1533,6 +1734,13 @@ public class GatewayTelegramMediaToolset {
         result.put("kind", JsonString(actualKind))
         result.put("media", JsonString(media))
         result.put("gateway", sent)
+        telegramMediaToolEmitDiagnostic(
+            if (sentOk) { "info" } else { "warn" },
+            if (sentOk) { MediaDiagnosticEvent.mediaToolResult } else { MediaDiagnosticEvent.mediaToolFailed },
+            if (sentOk) { "telegram media send tool completed" } else { "telegram media send tool failed" },
+            baseMeta,
+            sendMeta
+        )
         result.toJsonString()
     }
 

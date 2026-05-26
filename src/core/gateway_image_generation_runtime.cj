@@ -209,22 +209,6 @@ private func imageGenerationProviderKind(provider: String, providerConfig: JsonO
     }
 }
 
-private func imageGenerationEndpointClass(providerKind: String, providerConfig: JsonObject): String {
-    providerEndpointClassId(resolveProviderEndpoint(providerKind, imageGenerationString(providerConfig, "baseUrl")).endpointClass)
-}
-
-private func imageGenerationDashScopeShouldUseOpenAiCompatible(providerConfig: JsonObject): Bool {
-    if (!imageGenerationString(providerConfig, "endpoint").trimAscii().isEmpty()) {
-        return false
-    }
-    let endpointClass = imageGenerationEndpointClass("dashscope", providerConfig)
-    if (endpointClass == "modelstudio-compatible" || endpointClass == "openai-compatible-custom" || endpointClass == "openrouter" || endpointClass == "local") {
-        return true
-    }
-    let baseUrl = normalizeProviderBaseUrl(imageGenerationString(providerConfig, "baseUrl")).toAsciiLower()
-    baseUrl.contains("/compatible-mode/")
-}
-
 private func imageGenerationStatus(status: String, ok!: Bool = false, message!: String = ""): JsonObject {
     let out = JsonObject()
     out.put("ok", JsonBool(ok))
@@ -280,6 +264,90 @@ private func imageGenerationAttachDiagnostics(result: JsonObject, providerKind: 
     diagnostics.put("request", request)
     diagnostics.put("transportRoute", imageGenerationObject(submitRequest, "transportRoute"))
     result.put("diagnostics", diagnostics)
+}
+
+private func imageGenerationDiagnosticBase(
+    provider: String,
+    providerKind: String,
+    model: String,
+    prompt: String,
+    outputRoot: Path
+): JsonObject {
+    var meta = mediaDiagnosticProviderMeta(provider, providerKind: providerKind, model: model, capability: "image")
+    meta.put("generationKind", JsonString("image"))
+    meta.put("promptChars", JsonInt(Int64(prompt.size)))
+    meta = mediaDiagnosticMergeMeta(meta, mediaDiagnosticPathMeta(outputRoot.toString()))
+    meta
+}
+
+private func imageGenerationDiagnosticMetaForResult(base: JsonObject, result: JsonObject): JsonObject {
+    let meta = mediaDiagnosticMergeMeta(base, JsonObject())
+    let status = imageGenerationString(result, "status")
+    if (!status.isEmpty()) {
+        meta.put("status", JsonString(status))
+    }
+    match (result.get("ok")) {
+        case Some(v) => meta.put("ok", v)
+        case None => ()
+    }
+    let message = imageGenerationString(result, "message")
+    if (!message.isEmpty()) {
+        meta.put("reason", JsonString(message))
+    }
+    match (result.get("images")) {
+        case Some(v) =>
+            try {
+                let images = v.asArray()
+                meta.put("imageCount", JsonInt(Int64(images.size())))
+                if (images.size() > 0) {
+                    let first = images[0].asObject()
+                    let fileName = imageGenerationString(first, "fileName")
+                    if (!fileName.isEmpty()) {
+                        meta.put("outputFileName", JsonString(fileName))
+                    }
+                    let path = imageGenerationString(first, "path")
+                    if (!path.isEmpty()) {
+                        meta.put("outputPathHash", JsonString(mediaDiagnosticPathMeta(path).get("pathHash").getOrThrow().asString().getValue()))
+                    }
+                }
+            } catch (_: Exception) {
+                ()
+            }
+        case None => ()
+    }
+    let diagnostics = imageGenerationObject(result, "diagnostics")
+    let request = imageGenerationObject(diagnostics, "request")
+    let urlPath = imageGenerationString(request, "urlPath")
+    if (!urlPath.isEmpty()) {
+        meta.put("urlPath", JsonString(urlPath))
+    }
+    let timeoutMs = imageGenerationInt(request, "timeoutMs", 0)
+    if (timeoutMs > 0) {
+        meta.put("timeoutMs", JsonInt(timeoutMs))
+    }
+    let route = imageGenerationObject(diagnostics, "transportRoute")
+    if (route.size() > 0) {
+        meta.put("transportRoute", route)
+    }
+    meta
+}
+
+private func imageGenerationEmitStarted(provider: String, providerKind: String, model: String, prompt: String, outputRoot: Path): JsonObject {
+    let meta = imageGenerationDiagnosticBase(provider, providerKind, model, prompt, outputRoot)
+    emitGatewayMediaDiagnostic("info", MediaDiagnosticEvent.mediaGenerationStarted, "image generation started", meta: meta)
+    meta
+}
+
+private func imageGenerationEmitResult(base: JsonObject, result: JsonObject): JsonObject {
+    let meta = imageGenerationDiagnosticMetaForResult(base, result)
+    let ok = imageGenerationBool(result, "ok", false)
+    emitGatewayMediaDiagnostic(
+        if (ok) { "info" } else { "warn" },
+        if (ok) { MediaDiagnosticEvent.mediaGenerationFinished } else { MediaDiagnosticEvent.mediaGenerationFailed },
+        if (ok) { "image generation finished" } else { "image generation failed" },
+        meta: meta
+    )
+    result
 }
 
 public func gatewayImageGenerationResolveOutputRoot(config: JsonObject): Path {
@@ -432,9 +500,14 @@ private func imageGenerationComfyPollEndpoint(providerConfig: JsonObject, prompt
 private func imageGenerationDashScopeEndpoint(providerConfig: JsonObject): String {
     let endpoint = imageGenerationString(providerConfig, "endpoint")
     if (!endpoint.isEmpty()) {
-        return endpoint
+        return imageGenerationTrimBaseUrl(endpoint, "")
     }
-    "${imageGenerationTrimBaseUrl(imageGenerationString(providerConfig, "baseUrl"), "https://dashscope.aliyuncs.com/api/v1")}/services/aigc/multimodal-generation/generation"
+    let suffix = "/services/aigc/multimodal-generation/generation"
+    let baseUrl = resolveDashScopeAigcBaseUrlForImage(imageGenerationString(providerConfig, "baseUrl"))
+    if (baseUrl.endsWith(suffix)) {
+        return baseUrl
+    }
+    "${baseUrl}${suffix}"
 }
 
 private func imageGenerationAttachTransportRoute(request: JsonObject, providerConfig: JsonObject): Unit {
@@ -950,13 +1023,48 @@ private func imageGenerationDownload(url: String, timeoutMs: Int64, maxBytes: In
     if (!(trimmed.startsWith("https://") || trimmed.startsWith("http://"))) {
         throw ImageGenerationException("provider_error", "generated image URL is not http(s): ${imageGenerationSafeUrl(trimmed)}")
     }
+    let request = JsonObject()
+    request.put("url", JsonString(trimmed))
+    request.put("timeoutMs", JsonInt(timeoutMs))
+    let startedMeta = mediaDiagnosticHttpMetaFromRequest(request, method: "GET")
+    startedMeta.put("generationKind", JsonString("image"))
+    startedMeta.put("capability", JsonString("image"))
+    if (maxBytes > 0) {
+        startedMeta.put("limitBytes", JsonInt(maxBytes))
+    }
+    emitGatewayMediaDiagnostic("debug", MediaDiagnosticEvent.mediaGenerationDownload, "generated image download started", meta: startedMeta)
+    let startedAtMs = imageGenerationNowMs()
     let result = match (imageGenerationDownloaderOverride) {
         case Some(downloader) => downloader(trimmed, timeoutMs, maxBytes, providerConfig)
         case None => imageGenerationNativeDownload(trimmed, timeoutMs, maxBytes, providerConfig)
     }
     if (result.statusCode >= 200 && result.statusCode < 300 && maxBytes > 0 && Int64(result.bodyBytes.size) > maxBytes) {
-        return GatewayImageGenerationHttpResult(413, error: "downloaded image exceeds maxImageBytes")
+        let tooLarge = GatewayImageGenerationHttpResult(413, error: "downloaded image exceeds maxImageBytes")
+        let failedMeta = mediaDiagnosticHttpMetaFromRequest(request, method: "GET", statusCode: tooLarge.statusCode, responseBytes: Int64(result.bodyBytes.size), elapsedMs: max(0, imageGenerationNowMs() - startedAtMs))
+        failedMeta.put("generationKind", JsonString("image"))
+        failedMeta.put("capability", JsonString("image"))
+        failedMeta.put("status", JsonString("too_large"))
+        failedMeta.put("reason", JsonString(tooLarge.error))
+        emitGatewayMediaDiagnostic("warn", MediaDiagnosticEvent.mediaGenerationDownload, "generated image download failed", meta: failedMeta)
+        return tooLarge
     }
+    let finishedMeta = mediaDiagnosticHttpMetaFromRequest(
+        request,
+        method: "GET",
+        statusCode: result.statusCode,
+        contentType: result.contentType,
+        responseBytes: Int64(result.bodyBytes.size),
+        elapsedMs: max(0, imageGenerationNowMs() - startedAtMs)
+    )
+    finishedMeta.put("generationKind", JsonString("image"))
+    finishedMeta.put("capability", JsonString("image"))
+    finishedMeta.put("status", JsonString(if (result.statusCode >= 200 && result.statusCode < 300) { "ok" } else { "http_error" }))
+    emitGatewayMediaDiagnostic(
+        if (result.statusCode >= 200 && result.statusCode < 300) { "debug" } else { "warn" },
+        MediaDiagnosticEvent.mediaGenerationDownload,
+        if (result.statusCode >= 200 && result.statusCode < 300) { "generated image download finished" } else { "generated image download failed" },
+        meta: finishedMeta
+    )
     result
 }
 
@@ -1795,10 +1903,12 @@ public func gatewayImageGenerationGenerate(config: JsonObject, request: JsonObje
     let providerConfig = imageGenerationProviderConfig(config, provider)
     let providerKind = imageGenerationProviderKind(provider, providerConfig)
     let outputRoot = gatewayImageGenerationResolveOutputRoot(config)
+    let diagnosticBase = imageGenerationEmitStarted(provider, providerKind, imageGenerationString(providerConfig, "model"), prompt, outputRoot)
+    emitGatewayMediaDiagnostic("debug", MediaDiagnosticEvent.mediaGenerationAttempt, "image generation provider selected", meta: diagnosticBase)
     if (!imageGenerationPathAllowed(outputRoot, config)) {
         let out = imageGenerationStatus("invalid_request", ok: false, message: "image generation outputRoot is not under an allowed managed root.")
         out.put("outputRoot", JsonString(outputRoot.toString()))
-        return out
+        return imageGenerationEmitResult(diagnosticBase, out)
     }
     match (imageGenerationRunnerOverride) {
         case Some(runner) =>
@@ -1816,7 +1926,7 @@ public func gatewayImageGenerationGenerate(config: JsonObject, request: JsonObje
                 result.put("model", JsonString(imageGenerationString(providerConfig, "model")))
             }
             result.put("outputRoot", JsonString(outputRoot.toString()))
-            return result
+            return imageGenerationEmitResult(diagnosticBase, result)
         case None => ()
     }
     if (providerKind == "openai-images") {
@@ -1825,9 +1935,9 @@ public func gatewayImageGenerationGenerate(config: JsonObject, request: JsonObje
             let out = imageGenerationStatus("not_configured", ok: false, message: "Configured OpenAI image generation provider '${provider}' is missing apiKey.")
             out.put("provider", JsonString(provider))
             out.put("providerKind", JsonString(providerKind))
-            return out
+            return imageGenerationEmitResult(diagnosticBase, out)
         }
-        return imageGenerationOpenAiGenerate(config, request, provider, providerKind, providerConfig, outputRoot)
+        return imageGenerationEmitResult(diagnosticBase, imageGenerationOpenAiGenerate(config, request, provider, providerKind, providerConfig, outputRoot))
     }
     if (providerKind == "dashscope-qwen-image-generation") {
         let apiKey = imageGenerationSecretString(providerConfig, "apiKey")
@@ -1837,9 +1947,6 @@ public func gatewayImageGenerationGenerate(config: JsonObject, request: JsonObje
             out.put("providerKind", JsonString(providerKind))
             return out
         }
-        if (imageGenerationDashScopeShouldUseOpenAiCompatible(providerConfig)) {
-            return imageGenerationOpenAiGenerate(config, request, provider, "openai-images", providerConfig, outputRoot)
-        }
         return imageGenerationDashScopeGenerate(config, request, provider, providerKind, providerConfig, outputRoot)
     }
     if (providerKind == "google-gemini-image") {
@@ -1848,9 +1955,9 @@ public func gatewayImageGenerationGenerate(config: JsonObject, request: JsonObje
             let out = imageGenerationStatus("not_configured", ok: false, message: "Configured Google image generation provider '${provider}' is missing apiKey.")
             out.put("provider", JsonString(provider))
             out.put("providerKind", JsonString(providerKind))
-            return out
+            return imageGenerationEmitResult(diagnosticBase, out)
         }
-        return imageGenerationGoogleGenerate(config, request, provider, providerKind, providerConfig, outputRoot)
+        return imageGenerationEmitResult(diagnosticBase, imageGenerationGoogleGenerate(config, request, provider, providerKind, providerConfig, outputRoot))
     }
     if (providerKind == "minimax-image") {
         let apiKey = imageGenerationSecretString(providerConfig, "apiKey")
@@ -1858,9 +1965,9 @@ public func gatewayImageGenerationGenerate(config: JsonObject, request: JsonObje
             let out = imageGenerationStatus("not_configured", ok: false, message: "Configured MiniMax image generation provider '${provider}' is missing apiKey.")
             out.put("provider", JsonString(provider))
             out.put("providerKind", JsonString(providerKind))
-            return out
+            return imageGenerationEmitResult(diagnosticBase, out)
         }
-        return imageGenerationMiniMaxGenerate(config, request, provider, providerKind, providerConfig, outputRoot)
+        return imageGenerationEmitResult(diagnosticBase, imageGenerationMiniMaxGenerate(config, request, provider, providerKind, providerConfig, outputRoot))
     }
     if (providerKind == "fal-image") {
         let apiKey = imageGenerationSecretString(providerConfig, "apiKey")
@@ -1868,9 +1975,9 @@ public func gatewayImageGenerationGenerate(config: JsonObject, request: JsonObje
             let out = imageGenerationStatus("not_configured", ok: false, message: "Configured fal image generation provider '${provider}' is missing apiKey.")
             out.put("provider", JsonString(provider))
             out.put("providerKind", JsonString(providerKind))
-            return out
+            return imageGenerationEmitResult(diagnosticBase, out)
         }
-        return imageGenerationFalGenerate(config, request, provider, providerKind, providerConfig, outputRoot)
+        return imageGenerationEmitResult(diagnosticBase, imageGenerationFalGenerate(config, request, provider, providerKind, providerConfig, outputRoot))
     }
     if (providerKind == "vydra-image") {
         let apiKey = imageGenerationSecretString(providerConfig, "apiKey")
@@ -1878,17 +1985,18 @@ public func gatewayImageGenerationGenerate(config: JsonObject, request: JsonObje
             let out = imageGenerationStatus("not_configured", ok: false, message: "Configured Vydra image generation provider '${provider}' is missing apiKey.")
             out.put("provider", JsonString(provider))
             out.put("providerKind", JsonString(providerKind))
-            return out
+            return imageGenerationEmitResult(diagnosticBase, out)
         }
-        return imageGenerationVydraGenerate(config, request, provider, providerKind, providerConfig, outputRoot)
+        return imageGenerationEmitResult(diagnosticBase, imageGenerationVydraGenerate(config, request, provider, providerKind, providerConfig, outputRoot))
     }
     if (providerKind == "comfy-image") {
-        return imageGenerationComfyGenerate(config, request, provider, providerKind, providerConfig, outputRoot)
+        return imageGenerationEmitResult(diagnosticBase, imageGenerationComfyGenerate(config, request, provider, providerKind, providerConfig, outputRoot))
     }
     let out = imageGenerationStatus("unsupported_provider_kind", ok: false, message: "Configured image generation provider '${provider}' has unsupported kind '${providerKind}'.")
     out.put("provider", JsonString(provider))
     out.put("providerKind", JsonString(providerKind))
     imageGenerationAttachAttempt(out, imageGenerationAttempt(provider, providerKind, "unsupported_provider_kind", imageGenerationString(out, "message")))
+    imageGenerationEmitResult(diagnosticBase, out)
 }
 
 public func gatewayImageGenerationOutputRoot(config: JsonObject): String {

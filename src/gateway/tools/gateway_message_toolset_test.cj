@@ -363,6 +363,32 @@ public class GatewayMessageToolsetTest {
     }
 
     @TestCase
+    public func messagePhotoRejectsHumanCaptionTextBeforeGatewaySend(): Unit {
+        let calls = ArrayList<JsonObject>()
+        debugSetGatewayMessageToolCallRunnerForTest(Some({ _method: String, payload: JsonObject =>
+            calls.add(payload)
+            let out = JsonObject()
+            out.put("ok", JsonBool(true))
+            out
+        }))
+        try {
+            let out = GatewayMessageToolset().debugMessageForTest(
+                "photo",
+                "telegram",
+                "user:1059872384",
+                "Metis Orca 吉祥物 一只跃出海面的虎鲸"
+            )
+            let json = JsonValue.fromStr(out).asObject()
+            @Expect(json.get("ok").getOrThrow().asBool().getValue(), false)
+            @Expect(json.get("status").getOrThrow().asString().getValue(), "error")
+            @Expect(json.get("errorCode").getOrThrow().asString().getValue(), "invalid_media_reference")
+            @Expect(calls.size, 0)
+        } finally {
+            debugSetGatewayMessageToolCallRunnerForTest(None<(String, JsonObject) -> JsonObject>)
+        }
+    }
+
+    @TestCase
     public func messagePhotoRuntimeHookFailureReturnsStructuredError(): Unit {
         let context = GatewayToolRuntimeContext(
             "feishu",

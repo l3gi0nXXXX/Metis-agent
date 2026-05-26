@@ -759,6 +759,41 @@ private func speechTtsAttachAttempts(result: JsonObject, attempts: JsonArray): J
     result
 }
 
+private func speechTtsDiagnosticBase(provider: String, providerKind: String, text: String, outputRoot: Path): JsonObject {
+    var meta = mediaDiagnosticProviderMeta(provider, providerKind: providerKind, capability: "audio")
+    meta.put("generationKind", JsonString("audio"))
+    meta.put("promptChars", JsonInt(Int64(text.size)))
+    meta = mediaDiagnosticMergeMeta(meta, mediaDiagnosticPathMeta(outputRoot.toString()))
+    meta
+}
+
+private func speechTtsDiagnosticMetaForResult(base: JsonObject, result: JsonObject): JsonObject {
+    let meta = mediaDiagnosticMergeMeta(base, JsonObject())
+    let status = speechTtsString(result, "status")
+    if (!status.isEmpty()) {
+        meta.put("status", JsonString(status))
+    }
+    let message = speechTtsString(result, "message")
+    if (!message.isEmpty()) {
+        meta.put("reason", JsonString(message))
+    }
+    match (result.get("ok")) {
+        case Some(v) => meta.put("ok", v)
+        case None => ()
+    }
+    let payloadKind = speechTtsString(result, "payloadKind")
+    if (!payloadKind.isEmpty()) {
+        meta.put("payloadKind", JsonString(payloadKind))
+    }
+    let audioPath = speechTtsString(result, "audioPath")
+    if (!audioPath.isEmpty()) {
+        let pathMeta = mediaDiagnosticPathMeta(audioPath)
+        match (pathMeta.get("pathBasename")) { case Some(v) => meta.put("outputFileName", v) case None => () }
+        match (pathMeta.get("pathHash")) { case Some(v) => meta.put("outputPathHash", v) case None => () }
+    }
+    meta
+}
+
 private func speechTtsPutConfigDiagnostics(out: JsonObject, config: JsonObject): Unit {
     if (speechTtsBool(config, "legacy", false)) {
         out.put("legacy", JsonBool(true))
@@ -991,17 +1026,41 @@ public func gatewaySpeechTtsSynthesize(config: JsonObject, deliveryPrefs: JsonOb
     let attempts = JsonArray()
     let order = speechTtsProviderOrder(config, state)
     if (order.size == 0) {
-        return gatewaySpeechTtsSynthesizeWithProvider(config, deliveryPrefs, state, text, outputRoot, "")
+        let base = speechTtsDiagnosticBase("", "", text, outputRoot)
+        emitGatewayMediaDiagnostic("info", MediaDiagnosticEvent.mediaGenerationStarted, "speech generation started", meta: base)
+        let result = gatewaySpeechTtsSynthesizeWithProvider(config, deliveryPrefs, state, text, outputRoot, "")
+        emitGatewayMediaDiagnostic(
+            if (speechTtsBool(result, "ok", false)) { "info" } else { "warn" },
+            if (speechTtsBool(result, "ok", false)) { MediaDiagnosticEvent.mediaGenerationFinished } else { MediaDiagnosticEvent.mediaGenerationFailed },
+            if (speechTtsBool(result, "ok", false)) { "speech generation finished" } else { "speech generation failed" },
+            meta: speechTtsDiagnosticMetaForResult(base, result)
+        )
+        return result
     }
 
     var last = JsonObject()
     for (provider in order) {
         let startedAtMs = speechTtsNowMs()
+        let statusBefore = gatewaySpeechTtsStatusForProvider(config, deliveryPrefs, state, provider)
+        let providerKind = speechTtsString(statusBefore, "providerKind")
+        let base = speechTtsDiagnosticBase(provider, providerKind, text, outputRoot)
+        if (attempts.size() == 0) {
+            emitGatewayMediaDiagnostic("info", MediaDiagnosticEvent.mediaGenerationStarted, "speech generation started", meta: base)
+        }
+        emitGatewayMediaDiagnostic("debug", MediaDiagnosticEvent.mediaGenerationAttempt, "speech generation provider attempt started", meta: base)
         let result = gatewaySpeechTtsSynthesizeWithProvider(config, deliveryPrefs, state, text, outputRoot, provider)
         let ok = speechTtsBool(result, "ok", false)
         let status = speechTtsString(result, "status")
-        let providerKind = speechTtsString(result, "providerKind")
-        attempts.add(speechTtsAttempt(provider, providerKind, if (ok) { "ok" } else { "failed" }, if (ok) { "" } else { status }, startedAtMs))
+        let resultProviderKind = if (!speechTtsString(result, "providerKind").isEmpty()) { speechTtsString(result, "providerKind") } else { providerKind }
+        attempts.add(speechTtsAttempt(provider, resultProviderKind, if (ok) { "ok" } else { "failed" }, if (ok) { "" } else { status }, startedAtMs))
+        var resultMeta = speechTtsDiagnosticMetaForResult(speechTtsDiagnosticBase(provider, resultProviderKind, text, outputRoot), result)
+        resultMeta.put("latencyMs", JsonInt(max(0, speechTtsNowMs() - startedAtMs)))
+        emitGatewayMediaDiagnostic(
+            if (ok) { "info" } else { "warn" },
+            if (ok) { MediaDiagnosticEvent.mediaGenerationFinished } else { MediaDiagnosticEvent.mediaGenerationAttempt },
+            if (ok) { "speech generation finished" } else { "speech generation provider attempt failed" },
+            meta: resultMeta
+        )
         if (ok) {
             return speechTtsAttachAttempts(result, attempts)
         }
@@ -1014,7 +1073,10 @@ public func gatewaySpeechTtsSynthesize(config: JsonObject, deliveryPrefs: JsonOb
         degraded.put("provider", JsonString(speechTtsString(config, "provider")))
         degraded.put("payloadKind", JsonString("text"))
         degraded.put("payload", JsonString(degradeMessage))
+        emitGatewayMediaDiagnostic("warn", MediaDiagnosticEvent.mediaGenerationFinished, "speech generation degraded", meta: speechTtsDiagnosticMetaForResult(speechTtsDiagnosticBase(speechTtsString(config, "provider"), "", text, outputRoot), degraded))
         return speechTtsAttachAttempts(degraded, attempts)
     }
-    speechTtsAttachAttempts(last, attempts)
+    let failed = speechTtsAttachAttempts(last, attempts)
+    emitGatewayMediaDiagnostic("warn", MediaDiagnosticEvent.mediaGenerationFailed, "speech generation failed", meta: speechTtsDiagnosticMetaForResult(speechTtsDiagnosticBase(speechTtsString(failed, "provider"), speechTtsString(failed, "providerKind"), text, outputRoot), failed))
+    failed
 }

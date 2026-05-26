@@ -194,6 +194,52 @@ private func videoTooLargeResult(message: String, fileBytes: Int64, limitBytes: 
     out
 }
 
+private func videoDiagnosticProviderMeta(
+    provider: String,
+    providerKind: String,
+    model: String,
+    inputPath: String,
+    mime: String,
+    fileBytes!: Int64 = -1,
+    base64Bytes!: Int64 = -1,
+    limitBytes!: Int64 = -1,
+    status!: String = "",
+    reason!: String = ""
+): JsonObject {
+    var meta = mediaDiagnosticProviderMeta(provider, providerKind: providerKind, model: model, capability: "video")
+    meta = mediaDiagnosticMergeMeta(meta, mediaDiagnosticPathMeta(inputPath))
+    meta.put("mediaKind", JsonString("video"))
+    if (!mime.trimAscii().isEmpty()) {
+        meta.put("mimeType", JsonString(mime.trimAscii().toAsciiLower()))
+    }
+    if (fileBytes >= 0) {
+        meta.put("fileBytes", JsonInt(fileBytes))
+    }
+    if (base64Bytes >= 0) {
+        meta.put("base64Bytes", JsonInt(base64Bytes))
+    }
+    if (limitBytes > 0) {
+        meta.put("limitBytes", JsonInt(limitBytes))
+    }
+    if (!status.trimAscii().isEmpty()) {
+        meta.put("status", JsonString(status.trimAscii()))
+    }
+    if (!reason.trimAscii().isEmpty()) {
+        meta.put("reason", JsonString(reason.trimAscii()))
+    }
+    meta
+}
+
+private func videoDiagnosticModel(providerKind: String, providerConfig: JsonObject): String {
+    if (providerKind == "qwen-vl-video") {
+        return videoQwenModel(providerConfig)
+    }
+    if (providerKind == "gemini-inline-video") {
+        return videoGeminiModel(providerConfig)
+    }
+    videoString(providerConfig, "model")
+}
+
 private func videoReadAllBytes(response: HttpResponse): Array<Byte> {
     let out = ArrayList<Byte>()
     let buffer = Array<Byte>(8192, repeat: 0)
@@ -456,10 +502,24 @@ public func gatewayMediaVideoDescribePath(config: JsonObject, path: String, mime
     }
     let providerConfig = videoProviderConfig(config, provider)
     let providerKind = videoProviderKind(provider, providerConfig)
+    let providerModel = videoDiagnosticModel(providerKind, providerConfig)
+    let earlyMeta = videoDiagnosticProviderMeta(provider, providerKind, providerModel, inputPath, mime)
+    emitGatewayMediaDiagnostic(
+        "info",
+        MediaDiagnosticEvent.mediaUnderstandingStarted,
+        "video provider understanding started",
+        meta: earlyMeta
+    )
     let outBase = { status: String, message: String =>
         let out = videoResult(status, ok: false, message: message)
         out.put("provider", JsonString(provider))
         out.put("providerKind", JsonString(providerKind))
+        emitGatewayMediaDiagnostic(
+            if (status == "not_configured" || status == "disabled") { "info" } else { "warn" },
+            if (status == "not_configured" || status == "disabled") { MediaDiagnosticEvent.mediaUnderstandingFinished } else { MediaDiagnosticEvent.mediaUnderstandingFailed },
+            "video provider understanding finished",
+            meta: videoDiagnosticProviderMeta(provider, providerKind, providerModel, inputPath, mime, status: status, reason: message)
+        )
         out
     }
     if (providerKind != "gemini-inline-video" && providerKind != "qwen-vl-video") {
@@ -476,6 +536,9 @@ public func gatewayMediaVideoDescribePath(config: JsonObject, path: String, mime
         let out = videoTooLargeResult("video input exceeds configured maxBytes", fileBytes, effectiveMaxBytes)
         out.put("provider", JsonString(provider))
         out.put("providerKind", JsonString(providerKind))
+        let meta = videoDiagnosticProviderMeta(provider, providerKind, providerModel, inputPath, mime, fileBytes: fileBytes, limitBytes: effectiveMaxBytes, status: "too_large", reason: "video input exceeds configured maxBytes")
+        emitGatewayMediaDiagnostic("warn", MediaDiagnosticEvent.mediaUnderstandingAttempt, "video provider preflight rejected input", meta: meta)
+        emitGatewayMediaDiagnostic("warn", MediaDiagnosticEvent.mediaUnderstandingFailed, "video provider understanding failed", meta: meta)
         return out
     }
     let providerMaxBytes = videoInt(providerConfig, "maxBytes", 0)
@@ -483,6 +546,9 @@ public func gatewayMediaVideoDescribePath(config: JsonObject, path: String, mime
         let out = videoTooLargeResult("video input exceeds provider maxBytes", fileBytes, providerMaxBytes)
         out.put("provider", JsonString(provider))
         out.put("providerKind", JsonString(providerKind))
+        let meta = videoDiagnosticProviderMeta(provider, providerKind, providerModel, inputPath, mime, fileBytes: fileBytes, limitBytes: providerMaxBytes, status: "too_large", reason: "video input exceeds provider maxBytes")
+        emitGatewayMediaDiagnostic("warn", MediaDiagnosticEvent.mediaUnderstandingAttempt, "video provider preflight rejected input", meta: meta)
+        emitGatewayMediaDiagnostic("warn", MediaDiagnosticEvent.mediaUnderstandingFailed, "video provider understanding failed", meta: meta)
         return out
     }
     let estimatedBase64Bytes = videoEstimateBase64Bytes(fileBytes)
@@ -494,6 +560,9 @@ public func gatewayMediaVideoDescribePath(config: JsonObject, path: String, mime
         out.put("fileBytes", JsonInt(fileBytes))
         out.put("base64Bytes", JsonInt(estimatedBase64Bytes))
         out.put("limitBytes", JsonInt(maxBase64Bytes))
+        let meta = videoDiagnosticProviderMeta(provider, providerKind, providerModel, inputPath, mime, fileBytes: fileBytes, base64Bytes: estimatedBase64Bytes, limitBytes: maxBase64Bytes, status: "too_large", reason: "video base64 payload exceeds configured maxBase64Bytes")
+        emitGatewayMediaDiagnostic("warn", MediaDiagnosticEvent.mediaUnderstandingAttempt, "video provider preflight rejected payload", meta: meta)
+        emitGatewayMediaDiagnostic("warn", MediaDiagnosticEvent.mediaUnderstandingFailed, "video provider understanding failed", meta: meta)
         return out
     }
     let timeoutMs = max(1, videoInt(providerConfig, "timeoutMs", videoInt(config, "timeoutMs", 120000)))
@@ -502,8 +571,29 @@ public func gatewayMediaVideoDescribePath(config: JsonObject, path: String, mime
     } else {
         videoGeminiRequest(config, providerConfig, inputBytes, mime, prompt, timeoutMs)
     }
+    let requestMeta = mediaDiagnosticMergeMeta(
+        videoDiagnosticProviderMeta(provider, providerKind, videoString(request, "model"), inputPath, mime, fileBytes: fileBytes, base64Bytes: estimatedBase64Bytes),
+        mediaDiagnosticHttpMetaFromRequest(request, method: "POST")
+    )
+    requestMeta.put("stage", JsonString("provider.request"))
+    emitGatewayMediaDiagnostic("debug", MediaDiagnosticEvent.mediaUnderstandingAttempt, "video provider request started", meta: requestMeta)
+    let startedAtMs = DateTime.now().toUnixTimeStamp().toMilliseconds()
     try {
         let result = videoPost(request, providerConfig)
+        let elapsedMs = max(0, DateTime.now().toUnixTimeStamp().toMilliseconds() - startedAtMs)
+        let responseMeta = mediaDiagnosticMergeMeta(
+            videoDiagnosticProviderMeta(provider, providerKind, videoString(request, "model"), inputPath, mime, fileBytes: fileBytes, base64Bytes: estimatedBase64Bytes, status: "http_response"),
+            mediaDiagnosticHttpMetaFromRequest(
+                request,
+                method: "POST",
+                statusCode: result.statusCode,
+                contentType: result.contentType,
+                responseBytes: Int64(result.bodyBytes.size),
+                elapsedMs: elapsedMs
+            )
+        )
+        responseMeta.put("stage", JsonString("provider.response"))
+        emitGatewayMediaDiagnostic("debug", MediaDiagnosticEvent.mediaUnderstandingAttempt, "video provider response received", meta: responseMeta)
         let description = if (providerKind == "qwen-vl-video") {
             videoQwenDescription(result, providerConfig, request, inputPath)
         } else {
@@ -514,8 +604,19 @@ public func gatewayMediaVideoDescribePath(config: JsonObject, path: String, mime
         out.put("providerKind", JsonString(providerKind))
         out.put("model", JsonString(videoString(request, "model")))
         out.put("description", JsonString(description))
+        let finishedMeta = mediaDiagnosticMergeMeta(
+            responseMeta,
+            videoDiagnosticProviderMeta(provider, providerKind, videoString(request, "model"), inputPath, mime, fileBytes: fileBytes, base64Bytes: estimatedBase64Bytes, status: "ok")
+        )
+        emitGatewayMediaDiagnostic("info", MediaDiagnosticEvent.mediaUnderstandingFinished, "video provider understanding finished", meta: finishedMeta)
         return out
     } catch (e: GatewayMediaVideoProviderException) {
+        let elapsedMs = max(0, DateTime.now().toUnixTimeStamp().toMilliseconds() - startedAtMs)
+        let meta = mediaDiagnosticMergeMeta(
+            videoDiagnosticProviderMeta(provider, providerKind, videoString(request, "model"), inputPath, mime, fileBytes: fileBytes, base64Bytes: estimatedBase64Bytes, status: e.status, reason: videoRedactSensitive(e.message, providerConfig, request, inputPath)),
+            mediaDiagnosticHttpMetaFromRequest(request, method: "POST", elapsedMs: elapsedMs)
+        )
+        emitGatewayMediaDiagnostic("warn", MediaDiagnosticEvent.mediaUnderstandingFailed, "video provider understanding failed", meta: meta)
         let out = outBase(e.status, videoRedactSensitive(e.message, providerConfig, request, inputPath))
         if (e.status == "timeout") {
             out.put("timeoutMs", JsonInt(timeoutMs))
@@ -524,10 +625,22 @@ public func gatewayMediaVideoDescribePath(config: JsonObject, path: String, mime
     } catch (e: Exception) {
         let msg = e.message.toAsciiLower()
         if (msg.contains("timeout") || msg.contains("timed out")) {
+            let elapsedMs = max(0, DateTime.now().toUnixTimeStamp().toMilliseconds() - startedAtMs)
+            let meta = mediaDiagnosticMergeMeta(
+                videoDiagnosticProviderMeta(provider, providerKind, videoString(request, "model"), inputPath, mime, fileBytes: fileBytes, base64Bytes: estimatedBase64Bytes, status: "timeout", reason: "Configured video understanding provider request timed out."),
+                mediaDiagnosticHttpMetaFromRequest(request, method: "POST", elapsedMs: elapsedMs)
+            )
+            emitGatewayMediaDiagnostic("warn", MediaDiagnosticEvent.mediaUnderstandingFailed, "video provider understanding failed", meta: meta)
             let out = outBase("timeout", "Configured video understanding provider request timed out.")
             out.put("timeoutMs", JsonInt(timeoutMs))
             return out
         }
+        let elapsedMs = max(0, DateTime.now().toUnixTimeStamp().toMilliseconds() - startedAtMs)
+        let meta = mediaDiagnosticMergeMeta(
+            videoDiagnosticProviderMeta(provider, providerKind, videoString(request, "model"), inputPath, mime, fileBytes: fileBytes, base64Bytes: estimatedBase64Bytes, status: "provider_error", reason: videoRedactSensitive(e.message, providerConfig, request, inputPath)),
+            mediaDiagnosticHttpMetaFromRequest(request, method: "POST", elapsedMs: elapsedMs)
+        )
+        emitGatewayMediaDiagnostic("warn", MediaDiagnosticEvent.mediaUnderstandingFailed, "video provider understanding failed", meta: meta)
         outBase("provider_error", videoRedactSensitive(e.message, providerConfig, request, inputPath))
     }
 }

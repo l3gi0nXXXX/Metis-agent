@@ -55,6 +55,30 @@ private func gatewayMessageToolStripInternalDirectives(raw: String): String {
     out.toString().trimAscii()
 }
 
+private func gatewayMessageToolIsMediaAction(action: String): Bool {
+    action == "photo" ||
+        action == "document" ||
+        action == "audio" ||
+        action == "voice" ||
+        action == "video" ||
+        action == "video-note"
+}
+
+private func gatewayMessageToolLooksLikeMediaReference(raw: String): Bool {
+    let value = raw.trimAscii()
+    if (value.isEmpty()) {
+        return false
+    }
+    if (value.startsWith("/") ||
+        value.startsWith("file://") ||
+        value.startsWith("http://") ||
+        value.startsWith("https://") ||
+        value.startsWith("data:")) {
+        return true
+    }
+    !(value.contains(" ") || value.contains("\n") || value.contains("\r") || value.contains("\t"))
+}
+
 @toolset
 public class GatewayMessageToolset {
     private func gatewayMessageBinaryCommand(): (String, Option<Path>) {
@@ -306,6 +330,17 @@ public class GatewayMessageToolset {
             case None => ""
         }
         var payloadKind = "text"
+        if (gatewayMessageToolIsMediaAction(act) && !gatewayMessageToolLooksLikeMediaReference(text)) {
+            let err = JsonObject()
+            err.put("ok", JsonBool(false))
+            err.put("status", JsonString("error"))
+            err.put("action", JsonString(act))
+            err.put("errorCode", JsonString("invalid_media_reference"))
+            err.put("error", JsonString("${act} requires message to be a media path, URL, data URL, or remote file id"))
+            let out = err.toJsonString()
+            PrintUtils.printToolResult(out)
+            return out
+        }
         if (act == "reaction") {
             payloadKind = "reaction"
             text = match (reaction) {

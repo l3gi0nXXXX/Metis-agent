@@ -3,7 +3,7 @@ package metis.gateway.tools
 import magic.dsl.{tool, toolset}
 import magic.prelude.*
 
-import metis.core.{gatewayCurrentToolRuntimeContext, gatewayImageGenerationGenerate, gatewayImageGenerationResolveConfig, gatewayInvokeCurrentToolRuntimeGatewayCall, gatewayMarkCurrentToolRuntimeVisibleReplyDelivered, gatewayMessagePayloadPreview, renderGatewayPhotoText}
+import metis.core.{MediaDiagnosticEvent, emitGatewayMediaDiagnostic, gatewayCurrentToolRuntimeContext, gatewayImageGenerationGenerate, gatewayImageGenerationResolveConfig, gatewayInvokeCurrentToolRuntimeGatewayCall, gatewayMarkCurrentToolRuntimeVisibleReplyDelivered, gatewayMessagePayloadPreview, mediaDiagnosticMergeMeta, mediaDiagnosticPathMeta, renderGatewayPhotoText}
 import metis.core.config.CliSettingManager
 import metis.io.PrintUtils
 
@@ -42,6 +42,44 @@ private func gatewayImageGenerationToolFirstImagePath(result: JsonObject): Strin
     gatewayImageGenerationToolJsonString(image, "path", "")
 }
 
+private func gatewayImageGenerationToolStripPerPeerSuffix(raw: String): String {
+    let target = raw.trimAscii()
+    match (target.indexOf(":u:")) {
+        case Some(idx) => target[..idx].trimAscii()
+        case None => target
+    }
+}
+
+private func gatewayImageGenerationToolNormalizeTelegramDirectTarget(raw: String): String {
+    let target = raw.trimAscii()
+    if (target.isEmpty() || target.startsWith("user:") || target.startsWith("group:") || target.startsWith("@")) {
+        return target
+    }
+    "user:${target}"
+}
+
+private func gatewayImageGenerationToolTargetFromSessionKey(channel: String, sessionKey: String): String {
+    let key = sessionKey.trimAscii()
+    if (channel == "telegram") {
+        if (key.startsWith("telegram:direct:")) {
+            return key["telegram:direct:".size..].trimAscii()
+        }
+        if (key.startsWith("telegram:dm:u:")) {
+            return gatewayImageGenerationToolNormalizeTelegramDirectTarget(key["telegram:dm:u:".size..])
+        }
+        if (key.startsWith("telegram:group:")) {
+            return gatewayImageGenerationToolStripPerPeerSuffix(key["telegram:group:".size..])
+        }
+    }
+    if (channel == "feishu" && key.startsWith("feishu:direct:")) {
+        return key["feishu:direct:".size..].trimAscii()
+    }
+    if (channel == "feishu" && key.startsWith("feishu:group:")) {
+        return key["feishu:group:".size..].trimAscii()
+    }
+    ""
+}
+
 private func gatewayImageGenerationToolInvokeGatewaySend(payload: JsonObject): JsonObject {
     match (gatewayImageGenerationToolCallRunnerForTest) {
         case Some(runner) => return runner("channels.send", payload)
@@ -62,19 +100,46 @@ private func gatewayImageGenerationToolInvokeGatewaySend(payload: JsonObject): J
 private func gatewayImageGenerationToolCurrentTarget(): (String, String, String) {
     match (gatewayCurrentToolRuntimeContext()) {
         case Some(ctx) =>
-            let channel = if (ctx.channelName.isEmpty()) { ctx.sourceLabel } else { ctx.channelName }
+            let mediaChannel = gatewayImageGenerationToolJsonString(ctx.mediaContext, "channel", "").toAsciiLower()
+            let channel = if (!ctx.channelName.isEmpty()) {
+                ctx.channelName
+            } else if (!mediaChannel.isEmpty()) {
+                mediaChannel
+            } else {
+                ctx.sourceLabel
+            }
             let sessionKey = ctx.sessionKey.trimAscii()
-            if (channel == "telegram" && sessionKey.startsWith("telegram:direct:")) {
-                return ("telegram", sessionKey["telegram:direct:".size..], sessionKey)
+            let sessionTarget = gatewayImageGenerationToolTargetFromSessionKey(channel, sessionKey)
+            if (!sessionTarget.isEmpty()) {
+                return (channel, sessionTarget, sessionKey)
             }
-            if (channel == "telegram" && sessionKey.startsWith("telegram:group:")) {
-                return ("telegram", sessionKey["telegram:group:".size..], sessionKey)
+            if (channel == "telegram" || mediaChannel == "telegram") {
+                let peerId = gatewayImageGenerationToolStripPerPeerSuffix(gatewayImageGenerationToolJsonString(ctx.mediaContext, "peerId", ""))
+                if (!peerId.isEmpty()) {
+                    return ("telegram", peerId, sessionKey)
+                }
+                let to = gatewayImageGenerationToolStripPerPeerSuffix(gatewayImageGenerationToolJsonString(ctx.mediaContext, "to", ""))
+                if (!to.isEmpty()) {
+                    return ("telegram", to, sessionKey)
+                }
+                if (!ctx.senderId.isEmpty()) {
+                    return ("telegram", gatewayImageGenerationToolNormalizeTelegramDirectTarget(ctx.senderId), sessionKey)
+                }
+                return ("telegram", "", sessionKey)
             }
-            if (channel == "feishu" && sessionKey.startsWith("feishu:direct:")) {
-                return ("feishu", sessionKey["feishu:direct:".size..], sessionKey)
-            }
-            if (channel == "feishu" && sessionKey.startsWith("feishu:group:")) {
-                return ("feishu", sessionKey["feishu:group:".size..], sessionKey)
+            if (channel == "feishu" || mediaChannel == "feishu") {
+                let peerId = gatewayImageGenerationToolJsonString(ctx.mediaContext, "peerId", "")
+                if (!peerId.isEmpty()) {
+                    return ("feishu", peerId, sessionKey)
+                }
+                let to = gatewayImageGenerationToolJsonString(ctx.mediaContext, "to", "")
+                if (!to.isEmpty()) {
+                    return ("feishu", to, sessionKey)
+                }
+                if (!ctx.senderId.isEmpty()) {
+                    return ("feishu", ctx.senderId, sessionKey)
+                }
+                return ("feishu", "", sessionKey)
             }
             return (channel, "", sessionKey)
         case None => ("", "", "")
@@ -90,6 +155,18 @@ private func gatewayImageGenerationToolBuildSendPayload(channel: String, target:
     out.put("text", JsonString(payload))
     out.put("message", JsonString(payload))
     out
+}
+
+private func gatewayImageGenerationToolDiagnosticMeta(action: String, channel: String, status: String): JsonObject {
+    let meta = JsonObject()
+    meta.put("tool", JsonString(action.trimAscii()))
+    meta.put("channel", JsonString(channel.trimAscii()))
+    meta.put("capability", JsonString("image"))
+    meta.put("generationKind", JsonString("image"))
+    if (!status.trimAscii().isEmpty()) {
+        meta.put("status", JsonString(status.trimAscii()))
+    }
+    meta
 }
 
 @toolset
@@ -144,6 +221,9 @@ public class GatewayImageGenerationToolset {
             case Some(v) => v
             case None => true
         }
+        var toolMeta = gatewayImageGenerationToolDiagnosticMeta("gateway_image_generate", resolvedChannel, "invoked")
+        toolMeta.put("deliver", JsonBool(shouldDeliver))
+        emitGatewayMediaDiagnostic("info", MediaDiagnosticEvent.mediaToolInvoked, "image generation tool invoked", meta: toolMeta)
 
         let request = JsonObject()
         request.put("prompt", JsonString(prompt.trimAscii()))
@@ -197,6 +277,9 @@ public class GatewayImageGenerationToolset {
         let imagePath = gatewayImageGenerationToolFirstImagePath(result)
         if (!imagePath.isEmpty()) {
             result.put("imagePath", JsonString(imagePath))
+            toolMeta = gatewayImageGenerationToolDiagnosticMeta("gateway_image_generate", resolvedChannel, gatewayImageGenerationToolJsonString(result, "status", ""))
+            toolMeta = mediaDiagnosticMergeMeta(toolMeta, mediaDiagnosticPathMeta(imagePath))
+            emitGatewayMediaDiagnostic("debug", MediaDiagnosticEvent.mediaOutboundResolve, "image generation tool resolved output image", meta: toolMeta)
             result.put("payloadKind", JsonString("photo"))
             let payload = renderGatewayPhotoText(imagePath, caption: "Generated image")
             result.put("payloadPreview", JsonString(gatewayMessagePayloadPreview(payload)))
@@ -214,9 +297,13 @@ public class GatewayImageGenerationToolset {
                     result.put("deliveryResult", sent)
                     if (delivered) {
                         result.put("delivery", JsonString("accepted"))
+                        let sendMeta = gatewayImageGenerationToolDiagnosticMeta("gateway_image_generate", resolvedChannel, "accepted")
+                        emitGatewayMediaDiagnostic("info", MediaDiagnosticEvent.mediaOutboundSend, "image generation tool delivered media", meta: sendMeta)
                         gatewayMarkCurrentToolRuntimeVisibleReplyDelivered()
                     } else {
                         result.put("delivery", JsonString("failed"))
+                        let sendMeta = gatewayImageGenerationToolDiagnosticMeta("gateway_image_generate", resolvedChannel, "failed")
+                        emitGatewayMediaDiagnostic("warn", MediaDiagnosticEvent.mediaOutboundFailed, "image generation tool media delivery failed", meta: sendMeta)
                     }
                 } else {
                     result.put("delivered", JsonBool(false))
@@ -225,6 +312,14 @@ public class GatewayImageGenerationToolset {
             }
         }
 
+        let finalStatus = gatewayImageGenerationToolJsonString(result, "status", "")
+        let finalMeta = gatewayImageGenerationToolDiagnosticMeta("gateway_image_generate", resolvedChannel, finalStatus)
+        emitGatewayMediaDiagnostic(
+            if (gatewayImageGenerationToolJsonBool(result, "ok", false)) { "info" } else { "warn" },
+            if (gatewayImageGenerationToolJsonBool(result, "ok", false)) { MediaDiagnosticEvent.mediaToolResult } else { MediaDiagnosticEvent.mediaToolFailed },
+            if (gatewayImageGenerationToolJsonBool(result, "ok", false)) { "image generation tool finished" } else { "image generation tool failed" },
+            meta: finalMeta
+        )
         let out = result.toJsonString()
         PrintUtils.printToolResult(out)
         out

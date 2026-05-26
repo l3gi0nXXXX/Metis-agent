@@ -155,6 +155,80 @@ public class GatewayImageGenerationToolsetTest {
     }
 
     @TestCase
+    public func imageGenerationToolDeliversTelegramPhotoThroughRuntimeMediaContextPeerForRoutedSession(): Unit {
+        let home = gatewayImageGenerationToolTestHome("telegram-routed-deliver")
+        let oldHome = getVariable("METIS_HOME")
+        try { remove(Path(home), recursive: true) } catch (_: Exception) { () }
+        Directory.create(home, recursive: true)
+        setVariable("METIS_HOME", home)
+        MetisConfigManager.invalidate()
+        CliSettingManager.invalidate()
+        CliConfig.invalidatePathCache()
+        gatewayImageGenerationToolInstallConfig(home)
+
+        let imagePath = Path(home).join("gateway-image-generation").join("orca.png")
+        File.writeTo(imagePath, "fake-image".toArray())
+        setGatewayImageGenerationRunnerForTest(Some({ _config: JsonObject, request: JsonObject =>
+            @Expect(request.get("prompt").getOrThrow().asString().getValue(), "draw an orca")
+            let image = JsonObject()
+            image.put("path", JsonString(imagePath.toString()))
+            image.put("mimeType", JsonString("image/png"))
+            image.put("fileName", JsonString("orca.png"))
+            let images = JsonArray([])
+            images.add(image)
+            let result = JsonObject()
+            result.put("ok", JsonBool(true))
+            result.put("status", JsonString("ok"))
+            result.put("provider", JsonString("fake-image"))
+            result.put("providerKind", JsonString("fake-image-generation"))
+            result.put("model", JsonString("fake-image-model"))
+            result.put("images", images)
+            result
+        }))
+
+        let sentPeerIds = ArrayList<String>()
+        let sentTexts = ArrayList<String>()
+        debugSetGatewayImageGenerationToolCallRunnerForTest(Some({ method: String, payload: JsonObject =>
+            @Expect(method, "channels.send")
+            sentPeerIds.add(payload.get("peerId").getOrThrow().asString().getValue())
+            sentTexts.add(payload.get("text").getOrThrow().asString().getValue())
+            let out = JsonObject()
+            out.put("ok", JsonBool(true))
+            out
+        }))
+        try {
+            let mediaContext = JsonObject()
+            mediaContext.put("channel", JsonString("telegram"))
+            mediaContext.put("accountId", JsonString("default"))
+            mediaContext.put("peerId", JsonString("user:1059872384"))
+            mediaContext.put("messageId", JsonString("501"))
+            let context = GatewayToolRuntimeContext(
+                "telegram",
+                channelName: "telegram",
+                sessionKey: "agent:writer:main",
+                senderId: "1059872384",
+                mediaContext: mediaContext
+            )
+            let out = gatewayWithToolRuntimeContext(context, { =>
+                GatewayImageGenerationToolset().debugGatewayImageGenerateForTest("draw an orca", Some("telegram"), true)
+            })
+            let result = JsonValue.fromStr(out).asObject()
+            @Expect(result.get("ok").getOrThrow().asBool().getValue(), true)
+            @Expect(result.get("delivered").getOrThrow().asBool().getValue(), true)
+            @Expect(result.get("delivery").getOrThrow().asString().getValue(), "accepted")
+            @Expect(context.hasVisibleReplyDelivered(), true)
+            @Expect(sentPeerIds.size, 1)
+            @Expect(sentPeerIds[0], "user:1059872384")
+            @Expect(sentTexts[0].startsWith("[photo]"), true)
+            @Expect(sentTexts[0].contains(imagePath.toString()), true)
+        } finally {
+            debugSetGatewayImageGenerationToolCallRunnerForTest(None<(String, JsonObject) -> JsonObject>)
+            setGatewayImageGenerationRunnerForTest(None<(JsonObject, JsonObject) -> JsonObject>)
+            gatewayImageGenerationToolResetEnv(oldHome, home)
+        }
+    }
+
+    @TestCase
     public func imageGenerationToolDeliversPhotoThroughCurrentFeishuContext(): Unit {
         let home = gatewayImageGenerationToolTestHome("feishu-deliver")
         let oldHome = getVariable("METIS_HOME")

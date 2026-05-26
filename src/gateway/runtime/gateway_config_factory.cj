@@ -34,7 +34,7 @@ import metis.gateway.core.{
     gatewayPersistedSessionsRootForUser
 }
 import metis.gateway.model.*
-import metis.gateway.logging.{MetisLogEvent, metisCreateSubsystemLogger}
+import metis.gateway.logging.{MetisLogEvent, gatewayInstallMediaDiagnosticLoggingSinkForRuntime, metisCreateSubsystemLogger}
 
 import std.collection.HashMap
 import std.convert.Parsable
@@ -94,6 +94,7 @@ public func gatewayHasAnyEnabledChannel(user: GatewayUserSettings): Bool {
  */
 public func buildGatewayServiceFromUserSettings(user: GatewayUserSettings): (GatewayService, FeishuAdapter) {
     let startMs = gatewayConfigFactoryNowMs()
+    gatewayInstallMediaDiagnosticLoggingSinkForRuntime()
     gatewayInstallOpenClawCompatHostLifecycleHooks()
     ensureInstalledGatewayPluginsRegistered()
     gatewayConfigFactoryTimingLog("plugins-registered", startMs)

@@ -668,7 +668,14 @@ public class TelegramAdapter <: ChannelAdapter {
     private func collectTelegramMediaGroupsForPull(messages: Array<InboundMessage>): Array<InboundMessage> {
         let out = ArrayList<InboundMessage>()
         let nowMs = DateTime.now().toUnixTimeStamp().toMilliseconds()
-        this.flushTelegramPendingMediaGroups(out, nowMs, force: false)
+        let incomingGroupKeys = HashSet<String>()
+        for (msg in messages) {
+            let groupId = this.inboundPrimaryMediaGroupId(msg)
+            if (!groupId.isEmpty()) {
+                incomingGroupKeys.add(this.telegramInboundBurstKey(msg) + "|album:" + groupId)
+            }
+        }
+        this.flushTelegramPendingMediaGroupsExcept(out, nowMs, force: false, skipKeys: incomingGroupKeys)
         for (msg in messages) {
             let groupId = this.inboundPrimaryMediaGroupId(msg)
             if (groupId.isEmpty()) {
@@ -695,9 +702,18 @@ public class TelegramAdapter <: ChannelAdapter {
     }
 
     private func flushTelegramPendingMediaGroups(out: ArrayList<InboundMessage>, nowMs: Int64, force!: Bool): Unit {
+        this.flushTelegramPendingMediaGroupsExcept(out, nowMs, force: force, skipKeys: HashSet<String>())
+    }
+
+    private func flushTelegramPendingMediaGroupsExcept(
+        out: ArrayList<InboundMessage>,
+        nowMs: Int64,
+        force!: Bool,
+        skipKeys!: HashSet<String>
+    ): Unit {
         let flushKeys = ArrayList<String>()
         for ((key, pending) in this.pendingMediaGroups) {
-            if (force || pending.messages.size > 1 || nowMs - pending.firstSeenAtMs >= 700) {
+            if (!skipKeys.contains(key) && (force || pending.messages.size > 1 || nowMs - pending.firstSeenAtMs >= 700)) {
                 out.add(this.mergeTelegramMediaGroupPending(pending))
                 flushKeys.add(key)
             }
@@ -4639,14 +4655,18 @@ public class TelegramAdapter <: ChannelAdapter {
         extra.put("capability", stage.get("capability") ?? JsonString(""))
         extra.put("provider", stage.get("provider") ?? JsonString(""))
         extra.put("model", stage.get("model") ?? JsonString(""))
-        this.logChannel(
-            "debug",
-            MetisLogEvent.messageInbound,
-            "media-${normalizedStage}",
-            if (status.isEmpty()) { "unknown" } else { status },
-            "Telegram media stage state",
-            extra: extra
-        )
+        extra.put("statePersisted", JsonBool(true))
+        let event = if (normalizedStage == "download") {
+            if (status == "downloaded") {
+                MetisLogEvent.mediaDownloadFinished
+            } else {
+                MetisLogEvent.mediaDownloadFailed
+            }
+        } else {
+            MetisLogEvent.mediaPreflightFinished
+        }
+        let logger = metisCreateSubsystemLogger("gateway/channel/telegram/media")
+        logger.debug(event, "Telegram media stage state", meta: this.channelLogMeta("media-${normalizedStage}", if (status.isEmpty()) { "unknown" } else { status }, extra: extra))
     }
 
     private func applyTelegramMediaUnderstandingPreflight(record: JsonObject, kind: String): Unit {
