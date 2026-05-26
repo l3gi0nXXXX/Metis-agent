@@ -319,7 +319,10 @@ private func mergeFeishu(fs: FeishuUserSettings): FeishuConfig {
             downloadEnabled: fs.media.downloadEnabled,
             mediaMaxBytes: fs.media.mediaMaxBytes,
             allowedMimes: fs.media.allowedMimes,
-            downloadRoot: fs.media.downloadRoot
+            downloadRoot: fs.media.downloadRoot,
+            outboundAllowLocalPath: fs.media.outboundAllowLocalPath,
+            outboundLocalRoots: fs.media.outboundLocalRoots,
+            trustedLocalFileRoots: fs.media.trustedLocalFileRoots
         ),
         policy: ChannelPolicyConfig(
             allowFrom: fs.allowFrom,

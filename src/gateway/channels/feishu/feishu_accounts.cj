@@ -829,7 +829,10 @@ private func gatewayFeishuMedia(obj: JsonObject, fallback: FeishuMediaConfig): F
         downloadEnabled: gatewayFeishuBoolKeys(media, ["downloadEnabled", "download_enabled"], fallback.downloadEnabled),
         mediaMaxBytes: gatewayFeishuInt(media, ["mediaMaxBytes", "media_max_bytes"], fallback.mediaMaxBytes),
         allowedMimes: gatewayFeishuStringArray(media, ["allowedMimes", "allowed_mimes"], fallback.allowedMimes),
-        downloadRoot: gatewayFeishuString(media, ["downloadRoot", "download_root"], fallback.downloadRoot)
+        downloadRoot: gatewayFeishuString(media, ["downloadRoot", "download_root"], fallback.downloadRoot),
+        outboundAllowLocalPath: gatewayFeishuBoolKeys(media, ["outboundAllowLocalPath", "outbound_allow_local_path"], fallback.outboundAllowLocalPath),
+        outboundLocalRoots: gatewayFeishuStringArray(media, ["outboundLocalRoots", "outbound_local_roots"], fallback.outboundLocalRoots),
+        trustedLocalFileRoots: gatewayFeishuStringArray(media, ["trustedLocalFileRoots", "trusted_local_file_roots"], fallback.trustedLocalFileRoots)
     )
 }
 

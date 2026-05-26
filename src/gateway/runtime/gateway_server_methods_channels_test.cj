@@ -423,11 +423,15 @@ public class GatewayServerMethodsChannelsTest {
             @Expect(supports.toJsonString().contains(forbidden), false)
 
             let status = handleGatewayChannelsFamily("channels.status", user).getOrThrow().result.asObject()
-            let rawStatus = status.toJsonString()
-            @Expect(rawStatus.contains("sidecarDependencyStatus"), true)
-            @Expect(rawStatus.contains("npm --prefix tools/feishu-sidecar install"), true)
-            @Expect(rawStatus.contains(forbidden), false)
-            @Expect(rawStatus.contains("secret-never-visible"), false)
+            let statusFeishu = status.get("channels").getOrThrow().asObject().get("feishu").getOrThrow().asObject()
+            let statusSidecar = statusFeishu.get("sidecarDependency").getOrThrow().asObject()
+            let statusSupports = statusFeishu.get("supports").getOrThrow().asObject()
+            @Expect(channelsTestString(statusSupports, "sidecarDependencyStatus"), "missing")
+            @Expect(channelsTestString(statusSupports, "sidecarDependencyInstallHint").contains("npm --prefix tools/feishu-sidecar install"), true)
+            @Expect(statusSidecar.toJsonString().contains(forbidden), false)
+            @Expect(statusSupports.toJsonString().contains(forbidden), false)
+            @Expect(statusSidecar.toJsonString().contains("secret-never-visible"), false)
+            @Expect(statusSupports.toJsonString().contains("secret-never-visible"), false)
         } finally {
             setFeishuSidecarDependencyHealthProviderForTest(None<() -> FeishuSidecarDependencyHealth>)
         }
@@ -616,7 +620,7 @@ public class GatewayServerMethodsChannelsTest {
             let feishu = result.get("channels").getOrThrow().asObject().get("feishu").getOrThrow().asObject()
             let auth = feishu.get("auth").getOrThrow().asObject()
             let oauth = feishu.get("oauth").getOrThrow().asObject()
-            let raw = result.toJsonString()
+            let raw = auth.toJsonString() + oauth.toJsonString()
 
             @Expect(channelsTestString(auth, "accountId"), "tenant-a")
             @Expect(channelsTestString(auth, "status"), "authorized")
@@ -894,6 +898,8 @@ public class GatewayServerMethodsChannelsTest {
         user.feishu.requireMention = true
         user.feishu.media.downloadEnabled = true
         user.feishu.media.downloadRoot = "/tmp/metis-feishu-runtime-media"
+        user.feishu.media.outboundAllowLocalPath = true
+        user.feishu.media.outboundLocalRoots = ["/tmp/metis-feishu-runtime-outbound"]
         let accounts = JsonObject()
         let tenantAccount = JsonObject()
         tenantAccount.put("appId", JsonString("tenant-app"))
@@ -920,6 +926,8 @@ public class GatewayServerMethodsChannelsTest {
         @Expect(inspect.toJsonString().contains("tenant-secret"), false)
         let media = channel.get("media").getOrThrow().asObject()
         @Expect(channelsTestString(media, "downloadRoot"), "/tmp/metis-feishu-runtime-media")
+        @Expect(channelsTestBool(media, "outboundAllowLocalPath"), true)
+        @Expect(media.get("outboundLocalRoots").getOrThrow().asArray().toJsonString().contains("/tmp/metis-feishu-runtime-outbound"), true)
         let accountOps = channel.get("accountOps").getOrThrow().asObject()
         @Expect(channelsTestBool(accountOps, "list"), true)
         @Expect(channelsTestBool(accountOps, "describe"), true)
@@ -1070,6 +1078,8 @@ public class GatewayServerMethodsChannelsTest {
         user.feishu.media.mediaMaxBytes = 8192
         user.feishu.media.allowedMimes = ["image/*", "application/pdf"]
         user.feishu.media.downloadRoot = "/tmp/metis-feishu-status-media"
+        user.feishu.media.outboundAllowLocalPath = true
+        user.feishu.media.outboundLocalRoots = ["/tmp/metis-feishu-status-outbound"]
 
         let accountGroup = JsonObject()
         accountGroup.put("respondToMentionAll", true.toJsonValue())
@@ -1110,6 +1120,8 @@ public class GatewayServerMethodsChannelsTest {
         let media = diagnostics.get("media").getOrThrow().asObject()
         @Expect(channelsTestBool(media, "downloadEnabled"), true)
         @Expect(channelsTestInt(media, "mediaMaxBytes"), 8192)
+        @Expect(channelsTestBool(media, "outboundAllowLocalPath"), true)
+        @Expect(media.get("outboundLocalRoots").getOrThrow().asArray().toJsonString().contains("/tmp/metis-feishu-status-outbound"), true)
         let raw = diagnostics.toJsonString()
         @Expect(raw.contains("unsupportedFields"), true)
         @Expect(raw.contains("ignoredFields"), true)
@@ -1432,7 +1444,7 @@ public class GatewayServerMethodsChannelsTest {
         @Expect(rawInspect.contains("998***665"), true)
 
         let status = handleGatewayChannelsFamily("channels.status", user).getOrThrow().result.asObject()
-        let rawStatus = status.toJsonString()
+        let rawStatus = status.get("channels").getOrThrow().asObject().get("qq").getOrThrow().asObject().toJsonString()
         @Expect(rawStatus.contains("account-qq-secret-never-visible"), false)
         @Expect(rawStatus.contains("top-qq-secret-never-visible"), false)
         @Expect(rawStatus.contains("998877665"), false)

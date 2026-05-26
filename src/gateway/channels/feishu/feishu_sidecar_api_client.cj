@@ -190,7 +190,10 @@ public class FeishuSidecarProcessRequestRunner <: FeishuSidecarRequestRunner {
             out.put("messageId", JsonString(messageId))
         }
         if (operation == "media.upload") {
-            out.put("contentBase64", JsonString(feishuSidecarJsonString(params, "bytesBase64")))
+            let bytesBase64 = feishuSidecarJsonString(params, "bytesBase64")
+            if (!bytesBase64.isEmpty()) {
+                out.put("contentBase64", JsonString(bytesBase64))
+            }
         }
         if (operation == "message.send_media" || operation == "message.reply_media") {
             let messageType = feishuSidecarJsonString(params, "messageType").toAsciiLower()
@@ -473,11 +476,42 @@ public class FeishuSidecarApiClient <: FeishuApiClient {
     ): FeishuApiSendResult {
         let params = JsonObject()
         params.put("mediaType", JsonString(mediaType.trimAscii().toAsciiLower()))
+        params.put("sourceKind", JsonString("inMemory"))
         params.put("localPath", JsonString(localPath.trimAscii()))
         params.put("bytesBase64", JsonString(toBase64String(bytes)))
         params.put("byteCount", JsonInt(bytes.size))
         params.put("mimeType", JsonString(mimeType.trimAscii()))
         params.put("fileName", JsonString(fileName.trimAscii()))
+        this.sendResult(
+            this.invoke("media.upload", accountId, params),
+            idKeys: ["mediaKey", "imageKey", "fileKey", "key", "messageId", "message_id"]
+        )
+    }
+
+    public func uploadLocalMedia(
+        accountId: String,
+        mediaType: String,
+        localPath: String,
+        byteCount: Int64,
+        mimeType: String,
+        fileName: String,
+        allowedLocalRoots: Array<String>
+    ): FeishuApiSendResult {
+        let params = JsonObject()
+        params.put("mediaType", JsonString(mediaType.trimAscii().toAsciiLower()))
+        params.put("sourceKind", JsonString("localPath"))
+        params.put("localPath", JsonString(localPath.trimAscii()))
+        params.put("byteCount", JsonInt(byteCount))
+        params.put("mimeType", JsonString(mimeType.trimAscii()))
+        params.put("fileName", JsonString(fileName.trimAscii()))
+        let roots = JsonArray([])
+        for (root in allowedLocalRoots) {
+            let trimmed = root.trimAscii()
+            if (!trimmed.isEmpty()) {
+                roots.add(JsonString(trimmed))
+            }
+        }
+        params.put("allowedLocalRoots", roots)
         this.sendResult(
             this.invoke("media.upload", accountId, params),
             idKeys: ["mediaKey", "imageKey", "fileKey", "key", "messageId", "message_id"]

@@ -96,6 +96,9 @@ public class GatewayConfigBuilderTest {
         user.feishu.media.downloadEnabled = true
         user.feishu.media.mediaMaxBytes = 1024
         user.feishu.media.downloadRoot = "/tmp/metis-feishu-test-media"
+        user.feishu.media.outboundAllowLocalPath = true
+        user.feishu.media.outboundLocalRoots = ["/tmp/metis-feishu-outbound"]
+        user.feishu.media.trustedLocalFileRoots = ["/tmp/metis-feishu-trusted"]
         let groups = JsonObject()
         let groupRule = JsonObject()
         groupRule.put("requireMention", true.toJsonValue())
@@ -124,6 +127,9 @@ public class GatewayConfigBuilderTest {
         @Expect(feishu.media.downloadEnabled, true)
         @Expect(feishu.media.mediaMaxBytes, 1024)
         @Expect(feishu.media.downloadRoot, "/tmp/metis-feishu-test-media")
+        @Expect(feishu.media.outboundAllowLocalPath, true)
+        @Expect(feishu.media.outboundLocalRoots[0], "/tmp/metis-feishu-outbound")
+        @Expect(feishu.media.trustedLocalFileRoots[0], "/tmp/metis-feishu-trusted")
     }
 
     @TestCase
@@ -136,6 +142,9 @@ public class GatewayConfigBuilderTest {
         @Expect(feishu.media.downloadEnabled, true)
         @Expect(feishu.media.mediaMaxBytes, 20 * 1024 * 1024)
         @Expect(feishu.media.downloadRoot, "")
+        @Expect(feishu.media.outboundAllowLocalPath, true)
+        @Expect(feishu.media.outboundLocalRoots.isEmpty(), true)
+        @Expect(feishu.media.trustedLocalFileRoots.isEmpty(), true)
     }
 
     @TestCase

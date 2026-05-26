@@ -1,6 +1,6 @@
 package metis.gateway.channels.feishu
 
-import metis.core.{mediaDiagnosticPathMeta, parseGatewayAudioParts, parseGatewayDocumentParts, parseGatewayEditText, parseGatewayPhotoParts, parseGatewayReactionRemove, parseGatewayReactionStatus, parseGatewayReactionToken, parseGatewayVideoParts, parseGatewayVoiceParts}
+import metis.core.{MediaDiagnosticEvent, emitGatewayMediaDiagnostic, mediaDiagnosticMergeMeta, mediaDiagnosticPathMeta, parseGatewayAudioParts, parseGatewayDocumentParts, parseGatewayEditText, parseGatewayPhotoParts, parseGatewayReactionRemove, parseGatewayReactionStatus, parseGatewayReactionToken, parseGatewayVideoParts, parseGatewayVoiceParts}
 import metis.core.config.CliConfig
 import metis.gateway.core.{ChannelAdapter, gatewayLogIdentityHash}
 import metis.gateway.logging.{MetisLogEvent, metisCreateSubsystemLogger}
@@ -13,7 +13,7 @@ import magic.utils.http.HttpUtils
 import std.collection.{ArrayList, HashMap}
 import std.convert.Parsable
 import std.env.getVariable
-import std.fs.{Directory, File, Path, canonicalize, exists}
+import std.fs.{Directory, File, FileInfo, Path, canonicalize, exists}
 import std.time.DateTime
 import std.sync.Mutex
 import stdx.encoding.url.*
@@ -38,6 +38,7 @@ public interface FeishuApiClient {
     func sendInteractiveCard(accountId: String, rawPeerId: String, receiveId: String, receiveIdType: String, card: FeishuInteractiveCard, replyToMessageId: Option<String>, replyInThread: Bool): FeishuApiSendResult
     func patchInteractiveCard(accountId: String, messageId: String, card: FeishuInteractiveCard): FeishuApiSendResult
     func uploadMedia(accountId: String, mediaType: String, localPath: String, bytes: Array<Byte>, mimeType: String, fileName: String): FeishuApiSendResult
+    func uploadLocalMedia(accountId: String, mediaType: String, localPath: String, byteCount: Int64, mimeType: String, fileName: String, allowedLocalRoots: Array<String>): FeishuApiSendResult
     func sendMediaMessage(accountId: String, rawPeerId: String, receiveId: String, receiveIdType: String, messageType: String, mediaKey: String, caption: String, replyToMessageId: Option<String>, replyInThread: Bool): FeishuApiSendResult
     func addMessageReaction(accountId: String, messageId: String, reactionType: String): FeishuApiSendResult
     func removeMessageReaction(accountId: String, messageId: String, reactionType: String): FeishuApiSendResult
@@ -186,6 +187,18 @@ public class FeishuNoopApiClient <: FeishuApiClient {
         _bytes: Array<Byte>,
         _mimeType: String,
         _fileName: String
+    ): FeishuApiSendResult {
+        FeishuApiSendResult(status: "not_configured", error: "feishu api client is not configured")
+    }
+
+    public func uploadLocalMedia(
+        _accountId: String,
+        _mediaType: String,
+        _localPath: String,
+        _byteCount: Int64,
+        _mimeType: String,
+        _fileName: String,
+        _allowedLocalRoots: Array<String>
     ): FeishuApiSendResult {
         FeishuApiSendResult(status: "not_configured", error: "feishu api client is not configured")
     }
@@ -430,6 +443,27 @@ public class FeishuFakeApiClient <: FeishuApiClient {
         FeishuApiSendResult(ok: true, status: "ok", messageId: "fake-feishu-${kind}-key-${this.uploadedMedia.size}")
     }
 
+    public func uploadLocalMedia(
+        accountId: String,
+        mediaType: String,
+        localPath: String,
+        byteCount: Int64,
+        mimeType: String,
+        fileName: String,
+        allowedLocalRoots: Array<String>
+    ): FeishuApiSendResult {
+        let kind = mediaType.trimAscii().toAsciiLower()
+        this.uploadedMedia.add("${this.normalize(accountId)}|${kind}|localPath|${localPath.trimAscii()}|${mimeType.trimAscii()}|${fileName.trimAscii()}|${byteCount}|roots=${allowedLocalRoots.size}")
+        if (!this.nextMediaUploadFailureStatus.trimAscii().isEmpty()) {
+            let status = this.nextMediaUploadFailureStatus.trimAscii()
+            let error = this.nextMediaUploadFailureError.trimAscii()
+            this.nextMediaUploadFailureStatus = ""
+            this.nextMediaUploadFailureError = ""
+            return FeishuApiSendResult(status: status, error: error)
+        }
+        FeishuApiSendResult(ok: true, status: "ok", messageId: "fake-feishu-${kind}-key-${this.uploadedMedia.size}")
+    }
+
     public func sendMediaMessage(
         accountId: String,
         rawPeerId: String,
@@ -490,6 +524,13 @@ public class FeishuFakeApiClient <: FeishuApiClient {
 
     public func uploadedMediaCount(): Int64 {
         this.uploadedMedia.size
+    }
+
+    public func lastUploadedMedia(): String {
+        if (this.uploadedMedia.isEmpty()) {
+            return ""
+        }
+        this.uploadedMedia[this.uploadedMedia.size - 1]
     }
 
     public func mediaSendCount(): Int64 {
@@ -1254,40 +1295,158 @@ public class FeishuAdapter <: ChannelAdapter {
             this.lastSendError = "feishu outbound local media path does not exist"
             return ""
         }
-        let bytes = try {
-            File.readFrom(Path(canonicalPath))
+        let fileInfo = try {
+            FileInfo(Path(canonicalPath))
         } catch (e: Exception) {
-            this.lastSendError = "feishu outbound local media read failed: ${e.message}"
+            this.lastSendError = "feishu outbound local media stat failed: ${e.message}"
             return ""
         }
-        let sizeBytes = Int64(bytes.size)
+        if (!fileInfo.isRegular()) {
+            this.lastSendError = "path_not_allowed: feishu outbound local media path must be a regular file"
+            this.emitFeishuOutboundMediaDiagnostic(
+                "warn",
+                MediaDiagnosticEvent.mediaOutboundFailed,
+                "feishu outbound media local path rejected",
+                accountId,
+                messageType,
+                mediaType,
+                canonicalPath,
+                0,
+                "",
+                "path_not_allowed"
+            )
+            return ""
+        }
+        let sizeBytes = fileInfo.size
         let cfg = this.feishuConfigForAccount(accountId)
+        let allowedLocalRoots = this.feishuOutboundAllowedLocalRoots(cfg, accountId: accountId)
+        if (!cfg.media.outboundAllowLocalPath || !this.feishuLocalPathWithinAllowedRoots(canonicalPath, allowedLocalRoots)) {
+            this.lastSendError = "path_not_allowed: feishu outbound local media path is outside configured roots"
+            this.emitFeishuOutboundMediaDiagnostic(
+                "warn",
+                MediaDiagnosticEvent.mediaOutboundFailed,
+                "feishu outbound media local path rejected",
+                accountId,
+                messageType,
+                mediaType,
+                canonicalPath,
+                sizeBytes,
+                "",
+                "path_not_allowed"
+            )
+            return ""
+        }
         if (this.feishuMediaSizeExceedsLimit(cfg, sizeBytes)) {
             this.lastSendError = "size_limit_exceeded: feishu outbound media size ${sizeBytes} exceeds limit ${cfg.media.mediaMaxBytes}"
+            this.emitFeishuOutboundMediaDiagnostic(
+                "warn",
+                MediaDiagnosticEvent.mediaOutboundFailed,
+                "feishu outbound media size rejected",
+                accountId,
+                messageType,
+                mediaType,
+                canonicalPath,
+                sizeBytes,
+                "",
+                "size_limit_exceeded"
+            )
             return ""
         }
         let mimeType = this.feishuOutboundMimeTypeForPath(canonicalPath, messageType)
         if (!this.feishuMediaMimeAllowed(cfg, mimeType)) {
             this.lastSendError = "mime_not_allowed: feishu outbound media MIME ${mimeType} is not allowed"
+            this.emitFeishuOutboundMediaDiagnostic(
+                "warn",
+                MediaDiagnosticEvent.mediaOutboundFailed,
+                "feishu outbound media MIME rejected",
+                accountId,
+                messageType,
+                mediaType,
+                canonicalPath,
+                sizeBytes,
+                mimeType,
+                "mime_not_allowed"
+            )
             return ""
         }
         let fileName = Path(canonicalPath).fileName
-        let upload = this.apiClient.uploadMedia(
+        this.emitFeishuOutboundMediaDiagnostic(
+            "debug",
+            MediaDiagnosticEvent.mediaOutboundResolve,
+            "feishu outbound media local path resolved",
+            accountId,
+            messageType,
+            mediaType,
+            canonicalPath,
+            sizeBytes,
+            mimeType,
+            "ok"
+        )
+        this.emitFeishuOutboundMediaDiagnostic(
+            "debug",
+            MediaDiagnosticEvent.mediaOutboundUpload,
+            "feishu outbound media upload started",
+            accountId,
+            messageType,
+            mediaType,
+            canonicalPath,
+            sizeBytes,
+            mimeType,
+            "started"
+        )
+        let upload = this.apiClient.uploadLocalMedia(
             gatewayFeishuNormalizeAccountId(accountId),
             mediaType,
             canonicalPath,
-            bytes,
+            sizeBytes,
             mimeType,
-            fileName
+            fileName,
+            allowedLocalRoots
         )
         if (upload.ok && !upload.messageId.isEmpty()) {
+            this.emitFeishuOutboundMediaDiagnostic(
+                "info",
+                MediaDiagnosticEvent.mediaOutboundUpload,
+                "feishu outbound media upload finished",
+                accountId,
+                messageType,
+                mediaType,
+                canonicalPath,
+                sizeBytes,
+                mimeType,
+                "ok"
+            )
             return upload.messageId
         }
         if (upload.status != "not_configured") {
             this.lastSendError = this.feishuHumanReadableApiError(upload.status, upload.error)
+            this.emitFeishuOutboundMediaDiagnostic(
+                "warn",
+                MediaDiagnosticEvent.mediaOutboundFailed,
+                "feishu outbound media upload failed",
+                accountId,
+                messageType,
+                mediaType,
+                canonicalPath,
+                sizeBytes,
+                mimeType,
+                upload.status
+            )
             return ""
         }
         this.lastSendError = "feishu native media upload is not configured"
+        this.emitFeishuOutboundMediaDiagnostic(
+            "warn",
+            MediaDiagnosticEvent.mediaOutboundFailed,
+            "feishu outbound media upload unavailable",
+            accountId,
+            messageType,
+            mediaType,
+            canonicalPath,
+            sizeBytes,
+            mimeType,
+            "not_configured"
+        )
         ""
     }
 
@@ -1384,6 +1543,94 @@ public class FeishuAdapter <: ChannelAdapter {
             return trimmed[7..]
         }
         trimmed
+    }
+
+    private func feishuAddOutboundRoot(roots: ArrayList<String>, raw: String): Unit {
+        let trimmed = raw.trimAscii()
+        if (trimmed.isEmpty()) {
+            return
+        }
+        let canonicalRoot = try {
+            canonicalize(Path(trimmed)).toString()
+        } catch (_e: Exception) {
+            return
+        }
+        if (canonicalRoot.isEmpty() || canonicalRoot == "/") {
+            return
+        }
+        for (existing in roots) {
+            if (existing == canonicalRoot) {
+                return
+            }
+        }
+        roots.add(canonicalRoot)
+    }
+
+    private func feishuOutboundAllowedLocalRoots(cfg: FeishuConfig, accountId!: String = ""): Array<String> {
+        let roots = ArrayList<String>()
+        for (root in cfg.media.outboundLocalRoots) {
+            this.feishuAddOutboundRoot(roots, root)
+        }
+        for (root in cfg.media.trustedLocalFileRoots) {
+            this.feishuAddOutboundRoot(roots, root)
+        }
+        this.feishuAddOutboundRoot(roots, this.feishuMediaArchiveRoot(cfg, accountId: accountId).toString())
+        this.feishuAddOutboundRoot(roots, CliConfig.dotDir.join("gateway-image-generation").toString())
+        this.feishuAddOutboundRoot(roots, CliConfig.dotDir.join("gateway-video-generation").toString())
+        this.feishuAddOutboundRoot(roots, CliConfig.dotDir.join("gateway-tts").toString())
+        roots.toArray()
+    }
+
+    private func feishuLocalPathWithinAllowedRoots(canonicalPath: String, allowedRoots: Array<String>): Bool {
+        if (allowedRoots.isEmpty()) {
+            return false
+        }
+        let normalized = canonicalPath.trimAscii()
+        for (root in allowedRoots) {
+            let normalizedRoot = root.trimAscii()
+            if (normalizedRoot.isEmpty() || normalizedRoot == "/") {
+                continue
+            }
+            if (normalized == normalizedRoot || normalized.startsWith(normalizedRoot + "/")) {
+                return true
+            }
+        }
+        false
+    }
+
+    private func emitFeishuOutboundMediaDiagnostic(
+        level: String,
+        event: String,
+        message: String,
+        accountId: String,
+        messageType: String,
+        mediaType: String,
+        path: String,
+        fileBytes: Int64,
+        mimeType: String,
+        status: String
+    ): Unit {
+        var meta = mediaDiagnosticPathMeta(path)
+        let extra = JsonObject()
+        extra.put("channel", JsonString("feishu"))
+        extra.put("accountId", JsonString(gatewayLogIdentityHash(accountId.trimAscii())))
+        extra.put("messageType", JsonString(messageType.trimAscii()))
+        extra.put("mediaType", JsonString(mediaType.trimAscii().toAsciiLower()))
+        extra.put("fileBytes", JsonInt(fileBytes))
+        extra.put("mimeType", JsonString(mimeType.trimAscii()))
+        extra.put("status", JsonString(status.trimAscii()))
+        meta = mediaDiagnosticMergeMeta(meta, extra)
+        emitGatewayMediaDiagnostic(level, event, message, meta: meta)
+        this.logChannel(
+            if (level.trimAscii().isEmpty()) { "debug" } else { level },
+            event,
+            "media-outbound",
+            status.trimAscii(),
+            message,
+            errorKind: if (status == "ok" || status == "started") { "none" } else { status },
+            accountId: accountId,
+            extra: meta
+        )
     }
 
     private func feishuOutboundMimeTypeForPath(path: String, messageType: String): String {

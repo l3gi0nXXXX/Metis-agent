@@ -923,17 +923,26 @@ public class FeishuMediaConfig {
     public let mediaMaxBytes: Int64
     public let allowedMimes: Array<String>
     public let downloadRoot: String
+    public let outboundAllowLocalPath: Bool
+    public let outboundLocalRoots: Array<String>
+    public let trustedLocalFileRoots: Array<String>
 
     public init(
         downloadEnabled!: Bool = true,
         mediaMaxBytes!: Int64 = 20 * 1024 * 1024,
         allowedMimes!: Array<String> = [],
-        downloadRoot!: String = ""
+        downloadRoot!: String = "",
+        outboundAllowLocalPath!: Bool = true,
+        outboundLocalRoots!: Array<String> = [],
+        trustedLocalFileRoots!: Array<String> = []
     ) {
         this.downloadEnabled = downloadEnabled
         this.mediaMaxBytes = mediaMaxBytes
         this.allowedMimes = allowedMimes
         this.downloadRoot = downloadRoot.trimAscii()
+        this.outboundAllowLocalPath = outboundAllowLocalPath
+        this.outboundLocalRoots = outboundLocalRoots
+        this.trustedLocalFileRoots = trustedLocalFileRoots
     }
 }
 

@@ -25,7 +25,7 @@ public class FeishuOutboundActionsTest {
                 config: FeishuConfig(
                     enabled: true,
                     streaming: "text",
-                    media: FeishuMediaConfig(mediaMaxBytes: 1024, allowedMimes: ["image/*"])
+                    media: FeishuMediaConfig(mediaMaxBytes: 1024, allowedMimes: ["image/*"], outboundLocalRoots: [root.toString()])
                 ),
                 apiClient: client
             )
@@ -67,7 +67,8 @@ public class FeishuOutboundActionsTest {
                     streaming: "text",
                     media: FeishuMediaConfig(
                         mediaMaxBytes: 1024,
-                        allowedMimes: ["application/pdf", "audio/*", "video/*"]
+                        allowedMimes: ["application/pdf", "audio/*", "video/*"],
+                        outboundLocalRoots: [root.toString()]
                     )
                 ),
                 apiClient: client
@@ -121,7 +122,8 @@ public class FeishuOutboundActionsTest {
                     streaming: "text",
                     media: FeishuMediaConfig(
                         mediaMaxBytes: 1024,
-                        allowedMimes: ["audio/*"]
+                        allowedMimes: ["audio/*"],
+                        outboundLocalRoots: [root.toString()]
                     )
                 ),
                 apiClient: client
@@ -166,7 +168,8 @@ public class FeishuOutboundActionsTest {
                     streaming: "text",
                     media: FeishuMediaConfig(
                         mediaMaxBytes: 1024,
-                        allowedMimes: ["audio/*"]
+                        allowedMimes: ["audio/*"],
+                        outboundLocalRoots: [root.toString()]
                     )
                 ),
                 apiClient: client
@@ -261,7 +264,7 @@ public class FeishuOutboundActionsTest {
                 config: FeishuConfig(
                     enabled: true,
                     streaming: "text",
-                    media: FeishuMediaConfig(mediaMaxBytes: 1024, allowedMimes: ["image/*"])
+                    media: FeishuMediaConfig(mediaMaxBytes: 1024, allowedMimes: ["image/*"], outboundLocalRoots: [root.toString()])
                 ),
                 apiClient: client
             )
@@ -288,6 +291,104 @@ public class FeishuOutboundActionsTest {
     }
 
     @TestCase
+    public func localVideoPayloadUsesLocalPathUploadWithoutLargeBase64Payload(): Unit {
+        let root = this.tempRoot("large-video")
+        try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        let videoPath = root.join("generated.mp4")
+        Directory.create(root, recursive: true)
+        File.writeTo(videoPath, Array<Byte>(8 * 1024 * 1024, repeat: 0))
+        try {
+            let client = FeishuFakeApiClient()
+            let adapter = FeishuAdapter(
+                config: FeishuConfig(
+                    enabled: true,
+                    streaming: "text",
+                    media: FeishuMediaConfig(
+                        mediaMaxBytes: 16 * 1024 * 1024,
+                        allowedMimes: ["video/*"],
+                        outboundLocalRoots: [root.toString()]
+                    )
+                ),
+                apiClient: client
+            )
+            adapter.start()
+
+            let messageId = adapter.sendWithMessageId(OutboundMessage(
+                ChannelType.Feishu,
+                "oc_media",
+                renderGatewayVideoText(videoPath.toString(), caption: "clip"),
+                accountId: "tenant-a"
+            ))
+
+            @Expect(messageId, "fake-feishu-media-1")
+            @Expect(client.uploadedMediaCount(), 1)
+            let uploaded = client.lastUploadedMedia()
+            @Expect(uploaded.contains("|localPath|"), true)
+            @Expect(uploaded.contains(videoPath.toString()), true)
+            @Expect(uploaded.contains("|8388608|"), true)
+            @Expect(uploaded.contains("base64"), false)
+            @Expect(uploaded.size < 16 * 1024, true)
+        } finally {
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func localMediaPathPolicyRejectsUnconfiguredAndUnsafeRootsBeforeUpload(): Unit {
+        let root = this.tempRoot("roots")
+        try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        let videoPath = root.join("clip.mp4")
+        Directory.create(root, recursive: true)
+        File.writeTo(videoPath, "fake-video".toArray())
+        try {
+            let client = FeishuFakeApiClient()
+            let adapter = FeishuAdapter(
+                config: FeishuConfig(
+                    enabled: true,
+                    streaming: "text",
+                    media: FeishuMediaConfig(mediaMaxBytes: 1024, allowedMimes: ["video/*"], outboundLocalRoots: [])
+                ),
+                apiClient: client
+            )
+            adapter.start()
+
+            match (adapter.send(OutboundMessage(
+                ChannelType.Feishu,
+                "oc_media",
+                renderGatewayVideoText(videoPath.toString(), caption: "clip"),
+                accountId: "tenant-a"
+            ))) {
+                case SendResult.Success => @Expect(false, true)
+                case SendResult.Failed(reason) => @Expect(reason.contains("path_not_allowed"), true)
+            }
+            @Expect(client.uploadedMediaCount(), 0)
+
+            let unsafeClient = FeishuFakeApiClient()
+            let unsafeAdapter = FeishuAdapter(
+                config: FeishuConfig(
+                    enabled: true,
+                    streaming: "text",
+                    media: FeishuMediaConfig(mediaMaxBytes: 1024, allowedMimes: ["video/*"], outboundLocalRoots: ["/"])
+                ),
+                apiClient: unsafeClient
+            )
+            unsafeAdapter.start()
+            match (unsafeAdapter.send(OutboundMessage(
+                ChannelType.Feishu,
+                "oc_media",
+                renderGatewayVideoText(videoPath.toString(), caption: "clip"),
+                accountId: "tenant-a"
+            ))) {
+                case SendResult.Success => @Expect(false, true)
+                case SendResult.Failed(reason) => @Expect(reason.contains("path_not_allowed"), true)
+            }
+            @Expect(unsafeClient.uploadedMediaCount(), 0)
+        } finally {
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
     public func localPhotoPayloadReportsSizeLimitBeforeTextFallback(): Unit {
         let root = this.tempRoot("size")
         try { remove(root, recursive: true) } catch (_e: Exception) { () }
@@ -302,7 +403,7 @@ public class FeishuOutboundActionsTest {
                 config: FeishuConfig(
                     enabled: true,
                     streaming: "text",
-                    media: FeishuMediaConfig(mediaMaxBytes: 4, allowedMimes: ["image/*"])
+                    media: FeishuMediaConfig(mediaMaxBytes: 4, allowedMimes: ["image/*"], outboundLocalRoots: [root.toString()])
                 ),
                 apiClient: client
             )
@@ -325,7 +426,7 @@ public class FeishuOutboundActionsTest {
                 config: FeishuConfig(
                     enabled: true,
                     streaming: "text",
-                    media: FeishuMediaConfig(mediaMaxBytes: 1024, allowedMimes: ["image/png"])
+                    media: FeishuMediaConfig(mediaMaxBytes: 1024, allowedMimes: ["image/png"], outboundLocalRoots: [root.toString()])
                 ),
                 apiClient: mimeClient
             )

@@ -457,6 +457,9 @@ public struct FeishuMediaUserSettings {
     public var mediaMaxBytes: Int64 = 20 * 1024 * 1024
     public var allowedMimes: Array<String> = []
     public var downloadRoot: String = ""
+    public var outboundAllowLocalPath: Bool = true
+    public var outboundLocalRoots: Array<String> = []
+    public var trustedLocalFileRoots: Array<String> = []
 }
 
 @jsonable

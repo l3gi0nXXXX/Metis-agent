@@ -1150,6 +1150,12 @@ private func gatewayFeishuMediaJson(user: GatewayUserSettings): JsonObject {
     }
     media.put("allowedMimes", allowedMimes)
     media.put("downloadRoot", JsonString(user.feishu.media.downloadRoot))
+    media.put("outboundAllowLocalPath", user.feishu.media.outboundAllowLocalPath.toJsonValue())
+    let outboundRoots = JsonArray([])
+    for (root in user.feishu.media.outboundLocalRoots) {
+        outboundRoots.add(JsonString(root))
+    }
+    media.put("outboundLocalRoots", outboundRoots)
     return media
 }
 

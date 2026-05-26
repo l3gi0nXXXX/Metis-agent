@@ -914,6 +914,86 @@ function decodeContentBuffer(frame) {
   return Buffer.alloc(0);
 }
 
+function isFilesystemRoot(candidate) {
+  const normalized = path.resolve(candidate);
+  return normalized === path.parse(normalized).root;
+}
+
+function isPathWithinRoot(candidate, root) {
+  const relative = path.relative(root, candidate);
+  return relative === "" || (relative && !relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+function resolveAllowedLocalRoots(frame) {
+  const rawRoots = Array.isArray(frame.allowedLocalRoots)
+    ? frame.allowedLocalRoots
+    : typeof frame.allowedLocalRoots === "string"
+      ? [frame.allowedLocalRoots]
+      : [];
+  const roots = rawRoots.map((entry) => String(entry ?? "").trim()).filter(Boolean);
+  if (roots.length === 0) {
+    throw new Error("localPath upload requires non-empty allowed roots");
+  }
+  return roots.map((root) => {
+    if (!path.isAbsolute(root)) {
+      throw new Error("configured localPath root is not allowed");
+    }
+    let realRoot;
+    try {
+      realRoot = fs.realpathSync(root);
+    } catch {
+      throw new Error("configured localPath root is unavailable");
+    }
+    if (isFilesystemRoot(realRoot)) {
+      throw new Error("configured localPath root is not allowed");
+    }
+    return realRoot;
+  });
+}
+
+function assertLocalPathUploadAllowed(localPath, allowedRoots) {
+  const rawPath = String(localPath ?? "").trim();
+  if (!rawPath || !path.isAbsolute(rawPath)) {
+    throw new Error("localPath upload requires an absolute path");
+  }
+
+  let realPath;
+  try {
+    realPath = fs.realpathSync(rawPath);
+  } catch {
+    throw new Error("localPath file is unavailable");
+  }
+  if (!allowedRoots.some((root) => isPathWithinRoot(realPath, root))) {
+    throw new Error("path outside configured roots");
+  }
+
+  let stat;
+  try {
+    stat = fs.statSync(realPath);
+  } catch {
+    throw new Error("localPath file is unavailable");
+  }
+  if (!stat.isFile()) {
+    throw new Error("localPath target is not a regular file");
+  }
+  return { realPath, stat };
+}
+
+function resolveUploadContent(frame) {
+  if (String(frame.sourceKind ?? "").trim() !== "localPath") {
+    return decodeContentBuffer(frame);
+  }
+  const allowedRoots = resolveAllowedLocalRoots(frame);
+  const { realPath, stat } = assertLocalPathUploadAllowed(frame.localPath, allowedRoots);
+  if (frame.byteCount !== undefined && frame.byteCount !== null) {
+    const expected = Number(frame.byteCount);
+    if (!Number.isSafeInteger(expected) || expected < 0 || expected !== stat.size) {
+      throw new Error("localPath byte count mismatch");
+    }
+  }
+  return fs.createReadStream(realPath);
+}
+
 async function uploadImage(frame) {
   if (frame.imageKey) {
     return String(frame.imageKey);
@@ -921,7 +1001,7 @@ async function uploadImage(frame) {
   const response = await state.client.im.image.create({
     data: {
       image_type: frame.imageType ?? "message",
-      image: decodeContentBuffer(frame),
+      image: resolveUploadContent(frame),
     },
   });
   assertApiSuccess(response, "Feishu image upload failed");
@@ -940,7 +1020,7 @@ async function uploadFile(frame, fileType) {
     data: {
       file_type: fileType,
       file_name: String(frame.fileName ?? "file").replace(/[\x00-\x1F\x7F\r\n"\\]/g, "_"),
-      file: decodeContentBuffer(frame),
+      file: resolveUploadContent(frame),
       ...(frame.duration !== undefined ? { duration: frame.duration } : {}),
     },
   });

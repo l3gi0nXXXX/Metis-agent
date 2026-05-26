@@ -40,11 +40,26 @@ function writeFakeSdk(root, options = {}) {
           if (entry && entry.type === "Buffer" && Array.isArray(entry.data)) {
             return { bufferLength: entry.data.length };
           }
+          if (entry && typeof entry === "object" && typeof entry.pipe === "function") {
+            return {
+              streamLike: true,
+              readable: entry.readable !== false,
+              constructorName: entry.constructor?.name ?? "",
+            };
+          }
           if (typeof entry === "function") {
             return "[Function]";
           }
           return entry;
         }) + "\\n");
+      }
+
+      function closeUploadStreams(request) {
+        for (const value of [request?.data?.image, request?.data?.file]) {
+          if (value && typeof value.destroy === "function") {
+            value.destroy();
+          }
+        }
       }
 
       export const AppType = { SelfBuild: "SelfBuild" };
@@ -204,6 +219,7 @@ function writeFakeSdk(root, options = {}) {
             image: {
               create: async (request) => {
                 record("im.image.create", request);
+                closeUploadStreams(request);
                 return nextResponse({ code: 0, data: { image_key: "img_uploaded" } });
               },
               get: async (request) => {
@@ -214,6 +230,7 @@ function writeFakeSdk(root, options = {}) {
             file: {
               create: async (request) => {
                 record("im.file.create", request);
+                closeUploadStreams(request);
                 return nextResponse({ code: 0, data: { file_key: "file_uploaded" } });
               },
             },
@@ -483,6 +500,18 @@ function readCalls(callsPath) {
 
 function callsOf(callsPath, kind) {
   return readCalls(callsPath).filter((call) => call.kind === kind).map((call) => call.value);
+}
+
+function makeUploadFrame(overrides = {}) {
+  return {
+    type: "send",
+    action: "uploadMedia",
+    requestId: "upload-local",
+    mediaType: "file",
+    fileName: "upload.bin",
+    sourceKind: "localPath",
+    ...overrides,
+  };
 }
 
 test("feishu sidecar resolves sdk from runtime root without METIS_FEISHU_SIDECAR_SDK", async () => {
@@ -943,6 +972,115 @@ test("send media maps Feishu file_type and msg_type from media kind and extensio
       creates.filter((call) => call.data.msg_type !== "image").map((call) => call.data.msg_type),
       ["audio", "audio", "audio", "media", "media", "media", "file"],
     );
+  } finally {
+    await proc?.close?.();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("localPath uploads images, files, audio, and video as SDK streams", async () => {
+  const root = createTempRoot();
+  const mediaRoot = path.join(root, "media");
+  fs.mkdirSync(mediaRoot);
+  const fixtures = [
+    { requestId: "local-image", mediaType: "image", fileName: "image.png", bytes: "image-from-file" },
+    { requestId: "local-file", mediaType: "file", fileName: "report.pdf", bytes: "file-from-disk" },
+    { requestId: "local-audio", mediaType: "audio", fileName: "voice.ogg", bytes: "audio-from-disk" },
+    { requestId: "local-video", mediaType: "video", fileName: "clip.mp4", bytes: "video-from-disk" },
+  ];
+  for (const fixture of fixtures) {
+    const fixturePath = path.join(mediaRoot, fixture.fileName);
+    fs.writeFileSync(fixturePath, fixture.bytes);
+    fixture.localPath = fixturePath;
+    fixture.byteCount = Buffer.byteLength(fixture.bytes);
+  }
+  const { sdkPath, callsPath } = writeFakeSdk(root);
+  let proc;
+  try {
+    proc = spawnSidecar({ sdkPath, callsPath });
+    proc.writeFrame(baseInit());
+    await proc.waitForFrame((frame) => frame.type === "ready");
+
+    for (const fixture of fixtures) {
+      proc.writeFrame(makeUploadFrame({
+        requestId: fixture.requestId,
+        mediaType: fixture.mediaType,
+        fileName: fixture.fileName,
+        localPath: fixture.localPath,
+        allowedLocalRoots: [mediaRoot],
+        byteCount: fixture.byteCount,
+        contentBase64: Buffer.from("must-not-be-used").toString("base64"),
+      }));
+      const result = await proc.waitForFrame((frame) => frame.type === "sendResult" && frame.requestId === fixture.requestId);
+      assert.equal(result.ok, true, fixture.requestId);
+    }
+    await proc.close();
+
+    const imageUploads = callsOf(callsPath, "im.image.create");
+    const fileUploads = callsOf(callsPath, "im.file.create");
+    assert.equal(imageUploads.length, 1);
+    assert.equal(imageUploads[0].data.image.streamLike, true);
+    assert.equal(imageUploads[0].data.image.bufferLength, undefined);
+    assert.equal(imageUploads[0].data.image_type, "message");
+    assert.deepEqual(
+      fileUploads.map((call) => [call.data.file_name, call.data.file_type, call.data.file.streamLike, call.data.file.bufferLength]),
+      [
+        ["report.pdf", "pdf", true, undefined],
+        ["voice.ogg", "opus", true, undefined],
+        ["clip.mp4", "mp4", true, undefined],
+      ],
+    );
+  } finally {
+    await proc?.close?.();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("localPath upload rejects unsafe or invalid filesystem inputs without exposing full paths", async () => {
+  const root = createTempRoot();
+  const allowedRoot = path.join(root, "allowed");
+  const outsideRoot = path.join(root, "outside");
+  fs.mkdirSync(allowedRoot);
+  fs.mkdirSync(outsideRoot);
+  const insideFile = path.join(allowedRoot, "inside.bin");
+  const outsideFile = path.join(outsideRoot, "outside.bin");
+  const directoryPath = path.join(allowedRoot, "directory.bin");
+  const symlinkPath = path.join(allowedRoot, "link.bin");
+  const missingPath = path.join(allowedRoot, "missing.bin");
+  fs.writeFileSync(insideFile, "inside");
+  fs.writeFileSync(outsideFile, "outside");
+  fs.mkdirSync(directoryPath);
+  fs.symlinkSync(outsideFile, symlinkPath);
+
+  const invalidFrames = [
+    makeUploadFrame({ requestId: "empty-roots", localPath: insideFile, allowedLocalRoots: [] }),
+    makeUploadFrame({ requestId: "filesystem-root", localPath: insideFile, allowedLocalRoots: [path.parse(insideFile).root] }),
+    makeUploadFrame({ requestId: "path-outside", localPath: outsideFile, allowedLocalRoots: [allowedRoot] }),
+    makeUploadFrame({ requestId: "symlink-outside", localPath: symlinkPath, allowedLocalRoots: [allowedRoot] }),
+    makeUploadFrame({ requestId: "directory-path", localPath: directoryPath, allowedLocalRoots: [allowedRoot] }),
+    makeUploadFrame({ requestId: "byte-count-mismatch", localPath: insideFile, allowedLocalRoots: [allowedRoot], byteCount: 999 }),
+    makeUploadFrame({ requestId: "missing-file", localPath: missingPath, allowedLocalRoots: [allowedRoot] }),
+    makeUploadFrame({ requestId: "relative-path", localPath: "relative.bin", allowedLocalRoots: [allowedRoot] }),
+  ];
+
+  const { sdkPath, callsPath } = writeFakeSdk(root);
+  let proc;
+  try {
+    proc = spawnSidecar({ sdkPath, callsPath });
+    proc.writeFrame(baseInit());
+    await proc.waitForFrame((frame) => frame.type === "ready");
+
+    for (const frame of invalidFrames) {
+      proc.writeFrame(frame);
+      const error = await proc.waitForFrame((entry) => entry.type === "error" && entry.requestId === frame.requestId);
+      assert.equal(error.status, "api_error", frame.requestId);
+      assert.equal(error.message.includes(root), false, `${frame.requestId} leaked temp root in ${error.message}`);
+      assert.equal(error.message.includes(frame.localPath), false, `${frame.requestId} leaked localPath in ${error.message}`);
+    }
+    await proc.close();
+
+    assert.equal(callsOf(callsPath, "im.image.create").length, 0);
+    assert.equal(callsOf(callsPath, "im.file.create").length, 0);
   } finally {
     await proc?.close?.();
     fs.rmSync(root, { recursive: true, force: true });

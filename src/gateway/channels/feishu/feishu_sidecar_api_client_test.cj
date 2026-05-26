@@ -2,7 +2,7 @@ package metis.gateway.channels.feishu
 
 import std.collection.ArrayList
 import std.unittest.testmacro.*
-import stdx.encoding.json.{JsonArray, JsonBool, JsonObject, JsonString}
+import stdx.encoding.json.{JsonArray, JsonBool, JsonInt, JsonObject, JsonString}
 
 private class FeishuSidecarApiClientFakeRunner <: FeishuSidecarRequestRunner {
     public let requests = ArrayList<JsonObject>()
@@ -462,7 +462,7 @@ public class FeishuSidecarApiClientTest {
     }
 
     @TestCase
-    public func mediaUploadAndSendShapesCoverImageFileAudioVideo(): Unit {
+    public func localPathUploadShapeDoesNotCarryBase64AndSendShapesCoverImageFileAudioVideo(): Unit {
         let runner = FeishuSidecarApiClientFakeRunner()
         runner.enqueue(feishuSidecarTestResult(true, status: "ok", mediaKey: "img_key"))
         runner.enqueue(feishuSidecarTestResult(true, status: "ok", messageId: "om_img"))
@@ -474,13 +474,14 @@ public class FeishuSidecarApiClientTest {
         runner.enqueue(feishuSidecarTestResult(true, status: "ok", messageId: "om_video"))
         let client = FeishuSidecarApiClient(runner: runner)
 
-        let imageKey = client.uploadMedia("tenant-a", "image", "/tmp/a.png", "fake-image".toArray(), "image/png", "a.png").messageId
+        let roots = ["/tmp/metis-feishu-local-root"]
+        let imageKey = client.uploadLocalMedia("tenant-a", "image", "/tmp/metis-feishu-local-root/a.png", 10, "image/png", "a.png", roots).messageId
         let imageSend = client.sendMediaMessage("tenant-a", "oc_chat", "oc_chat", "chat_id", "image", imageKey, "diagram", None<String>, false)
-        let fileKey = client.uploadMedia("tenant-a", "file", "/tmp/report.pdf", "fake-pdf".toArray(), "application/pdf", "report.pdf").messageId
+        let fileKey = client.uploadLocalMedia("tenant-a", "file", "/tmp/metis-feishu-local-root/report.pdf", 8, "application/pdf", "report.pdf", roots).messageId
         let fileSend = client.sendMediaMessage("tenant-a", "oc_chat", "oc_chat", "chat_id", "file", fileKey, "report", None<String>, false)
-        let audioKey = client.uploadMedia("tenant-a", "audio", "/tmp/voice.ogg", "fake-audio".toArray(), "audio/ogg", "voice.ogg").messageId
+        let audioKey = client.uploadLocalMedia("tenant-a", "audio", "/tmp/metis-feishu-local-root/voice.ogg", 10, "audio/ogg", "voice.ogg", roots).messageId
         let audioSend = client.sendMediaMessage("tenant-a", "oc_chat", "oc_chat", "chat_id", "audio", audioKey, "voice", None<String>, false)
-        let videoKey = client.uploadMedia("tenant-a", "video", "/tmp/clip.mp4", "fake-video".toArray(), "video/mp4", "clip.mp4").messageId
+        let videoKey = client.uploadLocalMedia("tenant-a", "video", "/tmp/metis-feishu-local-root/clip.mp4", 10, "video/mp4", "clip.mp4", roots).messageId
         let videoSend = client.sendMediaMessage("tenant-a", "oc_chat", "oc_chat", "chat_id", "media", videoKey, "clip", None<String>, false)
 
         @Expect(imageKey, "img_key")
@@ -490,14 +491,68 @@ public class FeishuSidecarApiClientTest {
         @Expect(videoSend.messageId, "om_video")
         @Expect(runner.operation(0), "media.upload")
         @Expect(sidecarTestString(runner.params(0), "mediaType"), "image")
+        @Expect(sidecarTestString(runner.params(0), "sourceKind"), "localPath")
+        @Expect(sidecarTestString(runner.params(0), "localPath"), "/tmp/metis-feishu-local-root/a.png")
         @Expect(sidecarTestString(runner.params(0), "fileName"), "a.png")
-        @Expect(sidecarTestString(runner.params(0), "bytesBase64"), "ZmFrZS1pbWFnZQ==")
+        @Expect(runner.params(0).get("allowedLocalRoots").getOrThrow().asArray().size(), 1)
+        @Expect(runner.params(0).toJsonString().contains("bytesBase64"), false)
+        @Expect(runner.params(0).toJsonString().contains("contentBase64"), false)
         @Expect(runner.operation(1), "message.send_media")
         @Expect(sidecarTestString(runner.params(1), "messageType"), "image")
         @Expect(runner.operation(5), "message.send_media")
         @Expect(sidecarTestString(runner.params(5), "messageType"), "audio")
         @Expect(runner.operation(7), "message.send_media")
         @Expect(sidecarTestString(runner.params(7), "messageType"), "media")
+    }
+
+    @TestCase
+    public func inMemoryUploadShapeStillCarriesBase64ForCompatibility(): Unit {
+        let runner = FeishuSidecarApiClientFakeRunner()
+        runner.enqueue(feishuSidecarTestResult(true, status: "ok", mediaKey: "img_key"))
+        let client = FeishuSidecarApiClient(runner: runner)
+
+        let imageKey = client.uploadMedia("tenant-a", "image", "/tmp/a.png", "fake-image".toArray(), "image/png", "a.png").messageId
+
+        @Expect(imageKey, "img_key")
+        @Expect(runner.operation(0), "media.upload")
+        @Expect(sidecarTestString(runner.params(0), "mediaType"), "image")
+        @Expect(sidecarTestString(runner.params(0), "sourceKind"), "inMemory")
+        @Expect(sidecarTestString(runner.params(0), "bytesBase64"), "ZmFrZS1pbWFnZQ==")
+    }
+
+    @TestCase
+    public func processRunnerMapsLocalPathUploadWithoutContentBase64(): Unit {
+        let process = FeishuSidecarApiProcessFakeProcess(stdout: [
+            "{\"type\":\"ready\",\"accountId\":\"tenant-a\",\"transport\":\"websocket\"}",
+            "{\"type\":\"sendResult\",\"requestId\":\"metis-sidecar-api\",\"ok\":true,\"mediaKey\":\"video_key\"}"
+        ])
+        let protocol = FeishuSidecarApiProcessFakeRunner(process)
+        let runner = FeishuSidecarProcessRequestRunner(
+            account: FeishuSidecarRequestAccount(accountId: "tenant-a", appId: "cli_app", appSecret: "secret-app"),
+            runner: protocol,
+            options: FeishuSidecarRequestRunnerOptions(readyTimeoutMs: 1, requestTimeoutMs: 1, readTimeoutMs: 1, stopTimeoutMs: 1)
+        )
+        let params = JsonObject()
+        params.put("mediaType", JsonString("video"))
+        params.put("sourceKind", JsonString("localPath"))
+        params.put("localPath", JsonString("/tmp/metis-feishu-local-root/clip.mp4"))
+        params.put("byteCount", JsonInt(8388608))
+        params.put("mimeType", JsonString("video/mp4"))
+        params.put("fileName", JsonString("clip.mp4"))
+        params.put("allowedLocalRoots", JsonArray([JsonString("/tmp/metis-feishu-local-root")]))
+        let request = JsonObject()
+        request.put("operation", JsonString("media.upload"))
+        request.put("accountId", JsonString("tenant-a"))
+        request.put("params", params)
+
+        let result = runner.run(request)
+
+        @Expect(sidecarTestBool(result, "ok"), true)
+        @Expect(process.stdinLines[1].contains("\"action\":\"uploadMedia\""), true)
+        @Expect(process.stdinLines[1].contains("\"sourceKind\":\"localPath\""), true)
+        @Expect(process.stdinLines[1].contains("\"localPath\":\"/tmp/metis-feishu-local-root/clip.mp4\""), true)
+        @Expect(process.stdinLines[1].contains("contentBase64"), false)
+        @Expect(process.stdinLines[1].contains("bytesBase64"), false)
     }
 
     @TestCase
