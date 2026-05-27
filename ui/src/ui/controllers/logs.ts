@@ -21,6 +21,7 @@ export type LogsState = {
 
 const LOG_BUFFER_LIMIT = 2000;
 const LEVELS = new Set<LogLevel>(["trace", "debug", "info", "warn", "error", "fatal"]);
+const logsRequestsInFlight = new WeakSet<LogsState>();
 
 function parseMaybeJsonString(value: unknown) {
   if (typeof value !== "string") {
@@ -47,6 +48,16 @@ function normalizeLevel(value: unknown): LogLevel | null {
   }
   const lowered = value.toLowerCase() as LogLevel;
   return LEVELS.has(lowered) ? lowered : null;
+}
+
+function formatLogsLoadError(err: unknown): string {
+  if (err instanceof Error && err.message.trim()) {
+    return err.message.trim();
+  }
+  if (typeof err === "string" && err.trim()) {
+    return err.trim();
+  }
+  return "Logs could not be loaded.";
 }
 
 export function parseLogLine(line: string): LogEntry {
@@ -115,9 +126,10 @@ export async function loadLogs(state: LogsState, opts?: { reset?: boolean; quiet
   if (!state.client || !state.connected) {
     return;
   }
-  if (state.logsLoading && !opts?.quiet) {
+  if (logsRequestsInFlight.has(state)) {
     return;
   }
+  logsRequestsInFlight.add(state);
   if (!opts?.quiet) {
     state.logsLoading = true;
   }
@@ -157,9 +169,10 @@ export async function loadLogs(state: LogsState, opts?: { reset?: boolean; quiet
       state.logsEntries = [];
       state.logsError = formatMissingOperatorReadScopeMessage("logs");
     } else {
-      state.logsError = String(err);
+      state.logsError = formatLogsLoadError(err);
     }
   } finally {
+    logsRequestsInFlight.delete(state);
     if (!opts?.quiet) {
       state.logsLoading = false;
     }

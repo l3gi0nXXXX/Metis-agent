@@ -209,7 +209,7 @@ public class GatewayRpcServerMethodsTest {
                 metisCreateSubsystemLogger("gateway").info(MetisLogEvent.gatewayReady, "rpc log ready")
 
                 let params = JsonObject()
-                params.put("file", JsonString(logFile))
+                params.put("file", JsonString("current"))
                 params.put("limit", JsonInt(10))
                 params.put("cursor", JsonInt(-1))
                 let tail = gatewayDispatchLocalMethod(GatewayRpcRequest("logs.tail", params: params))

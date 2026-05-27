@@ -1392,19 +1392,30 @@ public class GatewayChannelManager {
                         state.lastError = ""
                     })
                 }
-                gatewayChannelRuntimeMarkPull(entry.channelId, accountId: entry.accountId, inboundCount: Int64(messages.size))
-                gatewayLogEventInfo(
-                    "gateway/channel/${entry.channelId}",
-                    "channel.pull",
-                    "channel pull completed",
-                    meta: gatewayLogMeta()
-                        .string("channel", entry.channelId)
-                        .string("accountId", entry.accountId)
-                        .string("phase", "pull")
-                        .string("status", "ok")
-                        .int("inboundCount", Int64(messages.size))
-                        .object()
-                )
+                let inboundCount = Int64(messages.size)
+                gatewayChannelRuntimeMarkPull(entry.channelId, accountId: entry.accountId, inboundCount: inboundCount)
+                let pullMeta = gatewayLogMeta()
+                    .string("channel", entry.channelId)
+                    .string("accountId", entry.accountId)
+                    .string("phase", "pull")
+                    .string("status", "ok")
+                    .int("inboundCount", inboundCount)
+                    .object()
+                if (inboundCount > 0) {
+                    gatewayLogEventInfo(
+                        "gateway/channel/${entry.channelId}",
+                        "channel.pull",
+                        "channel pull completed",
+                        meta: pullMeta
+                    )
+                } else {
+                    gatewayLogEventDebug(
+                        "gateway/channel/${entry.channelId}",
+                        "channel.pull",
+                        "channel pull completed",
+                        meta: pullMeta
+                    )
+                }
                 for (message in messages) {
                     try {
                         handleInbound(message, entry.accountId)

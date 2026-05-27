@@ -42,6 +42,8 @@ import { resolveTheme, type ResolvedTheme, type ThemeMode, type ThemeName } from
 import type { AgentsListResult, AttentionItem } from "./types.ts";
 import { resetChatViewState } from "./views/chat.ts";
 
+const overviewLogsInFlight = new WeakSet<MetisApp>();
+
 type SettingsHost = {
   settings: UiSettings;
   password?: string;
@@ -574,6 +576,10 @@ async function loadOverviewLogs(host: MetisApp) {
   if (!host.client || !host.connected) {
     return;
   }
+  if (overviewLogsInFlight.has(host)) {
+    return;
+  }
+  overviewLogsInFlight.add(host);
   try {
     const res = await host.client.request("logs.tail", {
       cursor: host.overviewLogCursor || undefined,
@@ -593,6 +599,8 @@ async function loadOverviewLogs(host: MetisApp) {
     }
   } catch {
     /* non-critical */
+  } finally {
+    overviewLogsInFlight.delete(host);
   }
 }
 

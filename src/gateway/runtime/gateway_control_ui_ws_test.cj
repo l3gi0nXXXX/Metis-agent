@@ -4,7 +4,7 @@ import metis.core.config.{CliSettingManager, GatewayUserSettings, MetisConfigMan
 import metis.core.skills.setClawHubHttpGetForTest
 import metis.gateway.config.buildGatewayConfigFromUserSettings
 import metis.gateway.core.{gatewayFindSessionConversationViewForUser, gatewaySessionStoreForUserWithAgentId, setGatewayFeishuNativeAuthRunnerForTest}
-import metis.gateway.protocol.GatewayProtocolResponse
+import metis.gateway.protocol.{GatewayClientInfo, GatewayConnectParams, GatewayProtocolResponse}
 
 import magic.jsonable.*
 import std.env.{getVariable, setVariable}
@@ -46,6 +46,30 @@ private func withGatewayControlUiWsTestHome<T>(block: () -> T): T {
         }
         MetisConfigManager.invalidate()
         CliSettingManager.invalidate()
+    }
+}
+
+private class GatewayControlUiWsRequestRunnerProbe {
+    public var calls: Int64 = 0
+
+    public func run(
+        _connect: GatewayConnectParams,
+        frameId: String,
+        method: String,
+        _params: JsonObject
+    ): GatewayProtocolResponse {
+        this.calls += 1
+        if (this.calls == 1) {
+            var longTail = ""
+            for (_i in 0..400) {
+                longTail += "x"
+            }
+            throw Exception("local rpc failed Authorization: Bearer ws-secret-token-never-visible ${longTail}")
+        }
+        let result = JsonObject()
+        result.put("handled", JsonBool(true))
+        result.put("method", JsonString(method))
+        GatewayProtocolResponse(true, method, requestId: frameId, result: result)
     }
 }
 
@@ -102,6 +126,55 @@ public class GatewayControlUiWsTest {
         @Expect(preview.contains("device-token-never-visible"), false)
         @Expect(preview.contains("[redacted]"), true)
         @Expect(preview.size <= 240, true)
+    }
+
+    @TestCase
+    public func requestBoundaryReturnsErrorFrameAndAllowsNextRequestAfterRpcException(): Unit {
+        withGatewayControlUiWsTestHome {
+            let probe = GatewayControlUiWsRequestRunnerProbe()
+            try {
+                setGatewayControlUiWsGatewayRequestRunnerForTest(Some({
+                    connect: GatewayConnectParams,
+                    frameId: String,
+                    method: String,
+                    params: JsonObject =>
+                    probe.run(connect, frameId, method, params)
+                }))
+                let connect = GatewayConnectParams(
+                    GatewayClientInfo("ws-rpc-isolation-test", name: "Control UI Test", mode: "control-ui"),
+                    transport: "remote",
+                    transportKind: "websocket",
+                    gatewayUrl: "ws://127.0.0.1/control/ws",
+                    connectionId: "conn-ws-rpc-isolation-test"
+                )
+                let cfg = buildGatewayConfigFromUserSettings(CliSettingManager.readGatewaySettings())
+
+                let failed = gatewayControlUiWsBoundRequestResponseForTest(connect, cfg, "req-1", "logs.tail", JsonObject())
+                @Expect(failed.ok, false)
+                @Expect(failed.method, "logs.tail")
+                @Expect(failed.requestId, "req-1")
+                @Expect(failed.errorCode, "INTERNAL_ERROR")
+                @Expect(failed.error.contains("ws-secret-token-never-visible"), false)
+                @Expect(failed.error.contains("[redacted]"), true)
+                @Expect(failed.error.size <= 240, true)
+
+                let frame = gatewayControlUiWsResponseFrameForTest(failed, "req-1")
+                @Expect(gatewayControlUiWsTestString(frame, "type"), "res")
+                @Expect(gatewayControlUiWsTestString(frame, "id"), "req-1")
+                @Expect(frame.get("ok").getOrThrow().asBool().getValue(), false)
+                let frameError = frame.get("error").getOrThrow().asObject()
+                @Expect(gatewayControlUiWsTestString(frameError, "code"), "INTERNAL_ERROR")
+                @Expect(gatewayControlUiWsTestString(frameError, "message").contains("ws-secret-token-never-visible"), false)
+
+                let recovered = gatewayControlUiWsBoundRequestResponseForTest(connect, cfg, "req-2", "logs.status", JsonObject())
+                @Expect(recovered.ok, true)
+                @Expect(recovered.requestId, "req-2")
+                @Expect(gatewayControlUiWsTestString(recovered.result.asObject(), "method"), "logs.status")
+                @Expect(probe.calls, 2)
+            } finally {
+                setGatewayControlUiWsGatewayRequestRunnerForTest(None<(GatewayConnectParams, String, String, JsonObject) -> GatewayProtocolResponse>)
+            }
+        }
     }
 
     @TestCase

@@ -96,6 +96,24 @@ private func gatewayChannelRuntimeReadLog(path: String): String {
     String.fromUtf8(File.readFrom(Path(path))) + "\n" + captured
 }
 
+private func gatewayChannelRuntimeReadFileLog(path: String): String {
+    if (!exists(Path(path))) {
+        return ""
+    }
+    String.fromUtf8(File.readFrom(Path(path)))
+}
+
+private func gatewayChannelRuntimeLogOccurrenceCount(text: String, needle: String): Int64 {
+    if (needle.isEmpty()) {
+        return 0
+    }
+    text.split(needle).size - 1
+}
+
+private func gatewayChannelRuntimeHasEvent(log: String, event: String): Bool {
+    log.contains("\"event\":\"${event}\"") || log.contains("event=${event}")
+}
+
 private class GatewayChannelRuntimeFailingInboundAdapter <: ChannelAdapter {
     private let inbound = ArrayList<InboundMessage>()
     public var sentCount: Int64 = 0
@@ -307,6 +325,77 @@ public class GatewayChannelRuntimeTest {
                 let log = gatewayChannelRuntimeReadLog(path)
                 @Expect(log.contains("\"event\":\"channel.timing\"") || log.contains("event=channel.timing"), true)
                 @Expect(log.contains("can-start-checked"), true)
+            })
+        }
+    }
+
+    @TestCase
+    public func channelManagerDoesNotWriteInfoPullLogsForEmptyPulls(): Unit {
+        withGatewayChannelRuntimeTestHome {
+            withGatewayChannelRuntimeLogCapture("empty-pull-info", "info", { path =>
+                let manager = GatewayChannelManager()
+                manager.registerAdapter(GatewayChannelLifecycleFakeAdapter("telegram", "default"), channelId: "telegram", accountId: "default")
+                manager.startChannels()
+
+                for (_ in 0..10) {
+                    manager.processOnce({ _message, _accountId => () })
+                }
+
+                let log = gatewayChannelRuntimeReadLog(path)
+                @Expect(gatewayChannelRuntimeLogOccurrenceCount(log, "\"event\":\"channel.pull\""), 0)
+                @Expect(gatewayChannelRuntimeLogOccurrenceCount(log, "event=channel.pull"), 0)
+
+                let row = gatewayChannelRuntimeAccountsJson("telegram")[0].asObject()
+                @Expect(gatewayRuntimeTestInt(row, "pullCount"), 10)
+                @Expect(gatewayRuntimeTestInt(row, "inboundCount"), 0)
+            })
+        }
+    }
+
+    @TestCase
+    public func channelManagerKeepsInfoPullLogWhenInboundMessagesArrive(): Unit {
+        withGatewayChannelRuntimeTestHome {
+            withGatewayChannelRuntimeLogCapture("inbound-pull-info", "info", { path =>
+                let manager = GatewayChannelManager()
+                let adapter = GatewayChannelRuntimeFailingInboundAdapter()
+                manager.registerAdapter(adapter, channelId: "telegram", accountId: "default")
+                manager.startChannels()
+                adapter.queue("hello")
+
+                manager.processOnce({ _message, _accountId => () })
+
+                let log = gatewayChannelRuntimeReadLog(path)
+                @Expect(gatewayChannelRuntimeHasEvent(log, "channel.pull"), true)
+                @Expect(log.contains("\"level\":\"info\"") || log.contains("] info "), true)
+                @Expect(log.contains("\"inboundCount\":1") || log.contains("inboundCount=1"), true)
+
+                let row = gatewayChannelRuntimeAccountsJson("telegram")[0].asObject()
+                @Expect(gatewayRuntimeTestInt(row, "pullCount"), 1)
+                @Expect(gatewayRuntimeTestInt(row, "inboundCount"), 1)
+            })
+        }
+    }
+
+    @TestCase
+    public func channelManagerKeepsFailureLogAndBackoffStateWhenPullFails(): Unit {
+        withGatewayChannelRuntimeTestHome {
+            withGatewayChannelRuntimeLogCapture("pull-failed-info", "info", { path =>
+                let manager = GatewayChannelManager()
+                manager.registerAdapter(GatewayChannelRuntimeSidecarClosedAfterReadyAdapter(), channelId: "feishu", accountId: "tenant-a")
+                manager.startChannels()
+
+                manager.processOnce({ _message, _accountId => () })
+
+                let log = gatewayChannelRuntimeReadLog(path)
+                @Expect(gatewayChannelRuntimeHasEvent(log, "channel.failed"), true)
+                @Expect(log.contains("\"level\":\"error\"") || log.contains("] error "), true)
+                @Expect(log.contains("\"errorKind\":\"pull_failed\"") || log.contains("errorKind=pull_failed"), true)
+
+                let row = gatewayChannelRuntimeAccountsJson("feishu")[0].asObject()
+                @Expect(gatewayRuntimeTestString(row, "lifecycleState"), "backoff")
+                @Expect(gatewayRuntimeTestString(row, "errorKind"), "pull_failed")
+                @Expect(gatewayRuntimeTestBool(row, "running"), false)
+                @Expect(gatewayRuntimeTestBool(row, "connected"), false)
             })
         }
     }

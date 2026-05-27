@@ -32,7 +32,10 @@ private const GATEWAY_CONTROL_UI_AGENT_FILE_INITIAL_LIMIT: Int64 = 32 * 1024
 private const GATEWAY_CONTROL_UI_AGENT_FILE_MAX_LIMIT: Int64 = 256 * 1024
 private const GATEWAY_CONTROL_UI_WS_SLOW_MS: Int64 = 1000
 private const GATEWAY_CONTROL_UI_WS_PREVIEW_LIMIT: Int64 = 240
+private const GATEWAY_CONTROL_UI_WS_ERROR_INTERNAL: String = "INTERNAL_ERROR"
 private let gatewayControlUiWsLogger = metisCreateSubsystemLogger("gateway/ws")
+private var gatewayControlUiWsGatewayRequestRunnerForTest: Option<(GatewayConnectParams, String, String, JsonObject) -> GatewayProtocolResponse> =
+    None<(GatewayConnectParams, String, String, JsonObject) -> GatewayProtocolResponse>
 
 private class GatewayControlUiWsSessionState {
     public var connectParams: Option<GatewayConnectParams> = None<GatewayConnectParams>
@@ -171,6 +174,12 @@ private func gatewayControlUiWsSafePreview(value: JsonValue): String {
 
 public func gatewayControlUiWsRedactedPreviewForTest(value: JsonValue): String {
     gatewayControlUiWsSafePreview(value)
+}
+
+func setGatewayControlUiWsGatewayRequestRunnerForTest(
+    runner: Option<(GatewayConnectParams, String, String, JsonObject) -> GatewayProtocolResponse>
+): Unit {
+    gatewayControlUiWsGatewayRequestRunnerForTest = runner
 }
 
 public func gatewayControlUiWsShouldLogRpcSummary(ok: Bool, durationMs: Int64, verbose: Bool): Bool {
@@ -354,6 +363,10 @@ private func gatewayControlUiWsResponseFrame(response: GatewayProtocolResponse, 
         out.put("error", error)
     }
     out
+}
+
+func gatewayControlUiWsResponseFrameForTest(response: GatewayProtocolResponse, frameId: String): JsonObject {
+    gatewayControlUiWsResponseFrame(response, frameId)
 }
 
 private func gatewayControlUiWsEventFrame(event: JsonObject): JsonObject {
@@ -687,6 +700,10 @@ private func gatewayControlUiWsGatewayRequest(
 ): GatewayProtocolResponse {
     let normalizedMethod = gatewayControlUiWsMethodAlias(method)
     let effectiveParams = gatewayControlUiWsRequestParams(normalizedMethod, params)
+    match (gatewayControlUiWsGatewayRequestRunnerForTest) {
+        case Some(runner) => return runner(connect, frameId, normalizedMethod, effectiveParams)
+        case None => ()
+    }
     GatewayServer.defaultServer().request(
         GatewayProtocolRequest(normalizedMethod, connect, params: effectiveParams, requestId: frameId)
     )
@@ -3561,6 +3578,94 @@ private func gatewayControlUiWsHandleConnect(
     gatewayControlUiWsWriteJson(websocket, writeLock, gatewayControlUiWsResponseFrame(response, frameId))
 }
 
+private func gatewayControlUiWsRequestExceptionMessage(e: Exception): String {
+    let message = gatewayLogTruncateText(gatewayLogRedactText(e.message), limit: GATEWAY_CONTROL_UI_WS_PREVIEW_LIMIT)
+    if (message.trimAscii().isEmpty()) {
+        return "Gateway websocket request failed."
+    }
+    message
+}
+
+private func gatewayControlUiWsRequestExceptionResponse(
+    method: String,
+    frameId: String,
+    e: Exception
+): GatewayProtocolResponse {
+    let normalized = gatewayControlUiWsMethodAlias(method).trimAscii()
+    GatewayProtocolResponse(
+        false,
+        if (normalized.isEmpty()) { "unknown" } else { normalized },
+        requestId: frameId,
+        error: gatewayControlUiWsRequestExceptionMessage(e),
+        errorCode: GATEWAY_CONTROL_UI_WS_ERROR_INTERNAL
+    )
+}
+
+private func gatewayControlUiWsLogErrorResponseWriteFailure(
+    method: String,
+    frameId: String,
+    clientId: String,
+    e: Exception
+): Unit {
+    let meta = JsonObject()
+    meta.put("method", JsonString(method.trimAscii()))
+    meta.put("requestId", JsonString(gatewayControlUiWsShortId(frameId)))
+    if (!clientId.trimAscii().isEmpty()) {
+        meta.put("clientId", JsonString(gatewayControlUiWsShortId(clientId)))
+    }
+    meta.put("errorKind", JsonString(GATEWAY_CONTROL_UI_WS_ERROR_INTERNAL))
+    meta.put("error", JsonString(gatewayControlUiWsRequestExceptionMessage(e)))
+    gatewayControlUiWsLogger.error(MetisLogEvent.rpcFailed, "rpc.request.failed error response write failed", meta: meta)
+}
+
+private func gatewayControlUiWsBuildBoundRequestResponse(
+    bound: GatewayConnectParams,
+    cfg: GatewayConfig,
+    frameId: String,
+    method: String,
+    params: JsonObject,
+    streamWriter!: Option<(JsonValue) -> Unit> = None<(JsonValue) -> Unit>
+): GatewayProtocolResponse {
+    let methodKey = method.trimAscii().toAsciiLower()
+    if (methodKey == "sessions.subscribe") {
+        return gatewayControlUiWsSessionSubscribeRequest(bound, frameId)
+    }
+    if (methodKey == "sessions.unsubscribe") {
+        return gatewayControlUiWsSessionUnsubscribeRequest(bound, frameId)
+    }
+    match (gatewayControlUiWsCompatResponse(method, params, cfg)) {
+        case Some(compatResponse) => return compatResponse
+        case None => ()
+    }
+    let normalizedMethod = gatewayControlUiWsMethodAlias(method)
+    let response = gatewayControlUiWsGatewayRequest(bound, frameId, normalizedMethod, params: params)
+    if (response.ok && normalizedMethod.trimAscii().toAsciiLower() == "events.stream") {
+        match (streamWriter) {
+            case Some(push) => push(response.result)
+            case None => ()
+        }
+    }
+    gatewayControlUiWsMaybeEmitChatEvents(bound.client.id, normalizedMethod, params, response)
+    if (response.ok) {
+        gatewayControlUiWsPublishInvalidate(bound, normalizedMethod, params: params, response: Some(response))
+    }
+    response
+}
+
+func gatewayControlUiWsBoundRequestResponseForTest(
+    bound: GatewayConnectParams,
+    cfg: GatewayConfig,
+    frameId: String,
+    method: String,
+    params: JsonObject
+): GatewayProtocolResponse {
+    try {
+        gatewayControlUiWsBuildBoundRequestResponse(bound, cfg, frameId, method, params)
+    } catch (e: Exception) {
+        gatewayControlUiWsRequestExceptionResponse(method, frameId, e)
+    }
+}
+
 private func gatewayControlUiWsHandleRequest(
     websocket: WebSocket,
     cfg: GatewayConfig,
@@ -3578,40 +3683,41 @@ private func gatewayControlUiWsHandleRequest(
     match (connect) {
         case Some(bound) =>
             gatewayControlUiWsLogRpcRequest(method, frameId, bound.client.id, params)
-            if (method.trimAscii().toAsciiLower() == "sessions.subscribe") {
-                let response = gatewayControlUiWsSessionSubscribeRequest(bound, frameId)
-                gatewayControlUiWsLogRpcResponse("sessions.subscribe", frameId, bound.client.id, response, startMs, params)
-                gatewayControlUiWsWriteJson(websocket, writeLock, gatewayControlUiWsResponseFrame(response, frameId))
-                return
-            }
-            if (method.trimAscii().toAsciiLower() == "sessions.unsubscribe") {
-                let response = gatewayControlUiWsSessionUnsubscribeRequest(bound, frameId)
-                gatewayControlUiWsLogRpcResponse("sessions.unsubscribe", frameId, bound.client.id, response, startMs, params)
-                gatewayControlUiWsWriteJson(websocket, writeLock, gatewayControlUiWsResponseFrame(response, frameId))
-                return
-            }
-            match (gatewayControlUiWsCompatResponse(method, params, cfg)) {
-                case Some(compatResponse) =>
-                    gatewayControlUiWsLogRpcResponse(method, frameId, bound.client.id, compatResponse, startMs, params)
-                    gatewayControlUiWsWriteJson(websocket, writeLock, gatewayControlUiWsResponseFrame(compatResponse, frameId))
-                    return
-                case None => ()
-            }
             let normalizedMethod = gatewayControlUiWsMethodAlias(method)
             if (normalizedMethod.trimAscii().toAsciiLower() == "dashboard.chat.send") {
-                gatewayControlUiWsHandleChatSendAsync(websocket, writeLock, bound, frameId, params)
+                try {
+                    gatewayControlUiWsHandleChatSendAsync(websocket, writeLock, bound, frameId, params)
+                } catch (e: Exception) {
+                    let response = gatewayControlUiWsRequestExceptionResponse(normalizedMethod, frameId, e)
+                    gatewayControlUiWsLogRpcResponse(response.method, frameId, bound.client.id, response, startMs, params)
+                    try {
+                        gatewayControlUiWsWriteJson(websocket, writeLock, gatewayControlUiWsResponseFrame(response, frameId))
+                    } catch (writeError: Exception) {
+                        gatewayControlUiWsLogErrorResponseWriteFailure(response.method, frameId, bound.client.id, writeError)
+                    }
+                }
                 return
             }
-            let response = gatewayControlUiWsGatewayRequest(bound, frameId, normalizedMethod, params: params)
-            if (response.ok && normalizedMethod.trimAscii().toAsciiLower() == "events.stream") {
-                gatewayControlUiWsPushStreamEvents(websocket, writeLock, response.result)
+            try {
+                let response = gatewayControlUiWsBuildBoundRequestResponse(
+                    bound,
+                    cfg,
+                    frameId,
+                    method,
+                    params,
+                    streamWriter: Some({ result: JsonValue => gatewayControlUiWsPushStreamEvents(websocket, writeLock, result) })
+                )
+                gatewayControlUiWsLogRpcResponse(response.method, frameId, bound.client.id, response, startMs, params)
+                gatewayControlUiWsWriteJson(websocket, writeLock, gatewayControlUiWsResponseFrame(response, frameId))
+            } catch (e: Exception) {
+                let response = gatewayControlUiWsRequestExceptionResponse(normalizedMethod, frameId, e)
+                gatewayControlUiWsLogRpcResponse(response.method, frameId, bound.client.id, response, startMs, params)
+                try {
+                    gatewayControlUiWsWriteJson(websocket, writeLock, gatewayControlUiWsResponseFrame(response, frameId))
+                } catch (writeError: Exception) {
+                    gatewayControlUiWsLogErrorResponseWriteFailure(response.method, frameId, bound.client.id, writeError)
+                }
             }
-            gatewayControlUiWsMaybeEmitChatEvents(bound.client.id, normalizedMethod, params, response)
-            if (response.ok) {
-                gatewayControlUiWsPublishInvalidate(bound, normalizedMethod, params: params, response: Some(response))
-            }
-            gatewayControlUiWsLogRpcResponse(normalizedMethod, frameId, bound.client.id, response, startMs, params)
-            gatewayControlUiWsWriteJson(websocket, writeLock, gatewayControlUiWsResponseFrame(response, frameId))
         case None =>
             let response = GatewayProtocolResponse(false, method, requestId: frameId, error: "Gateway websocket client is not connected.", errorCode: GATEWAY_ERROR_NOT_CONNECTED)
             gatewayControlUiWsLogRpcRequest(method, frameId, "", params)

@@ -448,9 +448,17 @@ describe("Metis control-ui browser smoke", () => {
           waitUntil: "domcontentloaded",
         });
         await page.waitForFunction(() => Boolean(customElements.get("metis-app")));
+        if (route === "/channels") {
+          await page.waitForFunction(() =>
+            document.querySelector("metis-app")?.textContent?.includes("poll timeout"),
+          );
+        }
         appStates.push(await page.evaluate(() => ({
           defined: Boolean(customElements.get("metis-app")),
           renderedText: document.querySelector("metis-app")?.textContent?.trim().slice(0, 4096) ?? "",
+          hasPollTimeout: Boolean(
+            document.querySelector("metis-app")?.textContent?.includes("poll timeout"),
+          ),
           visible:
             document.querySelector("metis-app") instanceof HTMLElement &&
             document.querySelector("metis-app")!.getBoundingClientRect().height > 0,
@@ -471,7 +479,7 @@ describe("Metis control-ui browser smoke", () => {
         expect(appState.legacyLocalToken).toBeNull();
         expect(appState.scopedLocalToken).toBeNull();
       }
-      expect(appStates[1]?.renderedText).toContain("poll timeout");
+      expect(appStates[1]?.hasPollTimeout).toBe(true);
       expect(appStates[2]?.pathname).toBe("/agent-teams");
     } finally {
       await browser.close();
