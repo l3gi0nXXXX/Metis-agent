@@ -187,6 +187,43 @@ public class GatewayVideoGenerationRuntimeTest {
     }
 
     @TestCase
+    public func dashScopeVideoDownloadProtectsOssSignedUrlBeforeHttpBuilder(): Unit {
+        let root = videoRuntimeTempRoot("dashscope-signed-url-protected")
+        let provider = videoRuntimeDashScopeProvider()
+        provider.put("maxPollSeconds", JsonInt(1))
+        let seenBuilderUrls = ArrayList<String>()
+        setGatewayVideoGenerationDashScopeRunnerForTest(Some({ _request: JsonObject =>
+            GatewayVideoGenerationDashScopeHttpResult(200, bodyBytes: "{\"output\":{\"task_id\":\"task-signed\"}}".toArray())
+        }))
+        setGatewayVideoGenerationDashScopePollerForTest(Some({ _request: JsonObject =>
+            GatewayVideoGenerationDashScopeHttpResult(200, bodyBytes: "{\"output\":{\"task_status\":\"SUCCEEDED\",\"video_url\":\"https://dashscope-result.example.com/out%2Fdemo.mp4?Expires=1770000000&OSSAccessKeyId=LTAI&Signature=a%2Bb%3D\"}}".toArray())
+        }))
+        setGatewaySignedUrlHttpSendForTest(Some({ builderUrl: String, originalUrl: String, _timeoutMs: Int64, _maxBytes: Int64, _providerConfig: JsonObject =>
+            seenBuilderUrls.add(builderUrl)
+            @Expect(originalUrl.contains("Signature=a%2Bb%3D"), true)
+            GatewaySignedUrlDownloadResult(200, bodyBytes: "FAKE-MP4".toArray(), contentType: "video/mp4")
+        }))
+        try {
+            let result = gatewayVideoGenerationGenerate(videoRuntimeConfig("wan", provider, outputRoot: root), videoRuntimeRequest("make a signed url video"))
+            let video = videoRuntimeFirstObj(videoRuntimeArr(result, "videos"))
+            let videoPath = Path(videoGenerationRuntimeTestString(video, "path"))
+
+            @Expect(videoRuntimeBool(result, "ok"), true)
+            @Expect(videoGenerationRuntimeTestString(result, "status"), "ok")
+            @Expect(videoGenerationRuntimeTestString(video, "mimeType"), "video/mp4")
+            @Expect(exists(videoPath), true)
+            @Expect(String.fromUtf8(File.readFrom(videoPath)), "FAKE-MP4")
+            @Expect(seenBuilderUrls.size, 1)
+            @Expect(seenBuilderUrls[0].contains("/out%252Fdemo.mp4"), true)
+            @Expect(seenBuilderUrls[0].contains("Signature=a%252Bb%253D"), true)
+        } finally {
+            setGatewayVideoGenerationDashScopeRunnerForTest(None<(JsonObject) -> GatewayVideoGenerationDashScopeHttpResult>)
+            setGatewayVideoGenerationDashScopePollerForTest(None<(JsonObject) -> GatewayVideoGenerationDashScopeHttpResult>)
+            setGatewaySignedUrlHttpSendForTest(None<(String, String, Int64, Int64, JsonObject) -> GatewaySignedUrlDownloadResult>)
+        }
+    }
+
+    @TestCase
     public func dashScopeProviderNormalizesCompatibleModeBaseUrlForAigcVideoApi(): Unit {
         let root = videoRuntimeTempRoot("dashscope-compatible-mode")
         let provider = videoRuntimeDashScopeProvider()

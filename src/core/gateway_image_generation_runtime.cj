@@ -1003,19 +1003,13 @@ private func imageGenerationDecodeBase64(data: String): Array<Byte> {
 }
 
 private func imageGenerationNativeDownload(url: String, timeoutMs: Int64, maxBytes: Int64, providerConfig: JsonObject): GatewayImageGenerationHttpResult {
-    let clientParts = buildGatewayProviderHttpClientBuilder(url, resolveGatewayProviderHttpTransportConfig(providerConfig))
-    let client = clientParts[0].build()
-    try {
-        let response = client.send(HttpRequestBuilder().url(url).get().build())
-        let bytes = imageGenerationReadAllBytes(response)
-        if (response.status >= 200 && response.status < 300 && maxBytes > 0 && Int64(bytes.size) > maxBytes) {
-            return GatewayImageGenerationHttpResult(413, error: "downloaded image exceeds maxImageBytes")
-        }
-        let contentType = response.headers.getFirst("content-type") ?? response.headers.getFirst("Content-Type") ?? ""
-        GatewayImageGenerationHttpResult(Int64(response.status), bodyBytes: bytes, contentType: contentType)
-    } finally {
-        client.close()
-    }
+    let downloaded = gatewaySignedUrlDownload(url, timeoutMs, maxBytes, providerConfig)
+    GatewayImageGenerationHttpResult(
+        downloaded.statusCode,
+        bodyBytes: downloaded.bodyBytes,
+        error: downloaded.error,
+        contentType: downloaded.contentType
+    )
 }
 
 private func imageGenerationDownload(url: String, timeoutMs: Int64, maxBytes: Int64, providerConfig: JsonObject): GatewayImageGenerationHttpResult {

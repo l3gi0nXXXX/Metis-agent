@@ -606,20 +606,13 @@ private func videoGenerationDashScopeWaitForVideoUrl(providerConfig: JsonObject,
 }
 
 private func videoGenerationNativeDownload(url: String, timeoutMs: Int64, maxBytes: Int64, providerConfig: JsonObject): GatewayVideoGenerationDashScopeHttpResult {
-    let transportConfig = resolveGatewayProviderHttpTransportConfig(providerConfig)
-    let clientParts = buildGatewayProviderHttpClientBuilder(url, transportConfig)
-    let client = clientParts[0].build()
-    try {
-        let response = client.send(HttpRequestBuilder().url(url).get().build())
-        let bytes = videoGenerationReadAllBytes(response)
-        if (response.status >= 200 && response.status < 300 && maxBytes > 0 && Int64(bytes.size) > maxBytes) {
-            return GatewayVideoGenerationDashScopeHttpResult(413, error: "downloaded video exceeds maxVideoBytes")
-        }
-        let contentType = response.headers.getFirst("content-type") ?? response.headers.getFirst("Content-Type") ?? ""
-        GatewayVideoGenerationDashScopeHttpResult(Int64(response.status), bodyBytes: bytes, contentType: contentType)
-    } finally {
-        client.close()
-    }
+    let downloaded = gatewaySignedUrlDownload(url, timeoutMs, maxBytes, providerConfig)
+    GatewayVideoGenerationDashScopeHttpResult(
+        downloaded.statusCode,
+        bodyBytes: downloaded.bodyBytes,
+        error: downloaded.error,
+        contentType: downloaded.contentType
+    )
 }
 
 private func videoGenerationDownload(url: String, timeoutMs: Int64, maxBytes: Int64, providerConfig: JsonObject): GatewayVideoGenerationDashScopeHttpResult {

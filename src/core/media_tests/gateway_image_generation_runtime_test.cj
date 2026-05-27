@@ -209,6 +209,39 @@ public class GatewayImageGenerationRuntimeTest {
     }
 
     @TestCase
+    public func dashScopeImageDownloadProtectsOssSignedUrlBeforeHttpBuilder(): Unit {
+        let root = imageRuntimeTempRoot("dashscope-signed-url-protected")
+        let provider = imageRuntimeDashScopeProvider()
+        provider.put("timeoutMs", JsonInt(1000))
+        let seenBuilderUrls = ArrayList<String>()
+        setGatewayImageGenerationDashScopeRunnerForTest(Some({ _request: JsonObject, _providerConfig: JsonObject =>
+            GatewayImageGenerationHttpResult(200, bodyBytes: "{\"output\":{\"choices\":[{\"message\":{\"content\":[{\"image\":\"https://dashscope-result.example.com/out%2Fdemo.png?Expires=1770000000&OSSAccessKeyId=LTAI&Signature=a%2Bb%3D\"}]}}]}}".toArray(), contentType: "application/json")
+        }))
+        setGatewaySignedUrlHttpSendForTest(Some({ builderUrl: String, originalUrl: String, _timeoutMs: Int64, _maxBytes: Int64, _providerConfig: JsonObject =>
+            seenBuilderUrls.add(builderUrl)
+            @Expect(originalUrl.contains("Signature=a%2Bb%3D"), true)
+            GatewaySignedUrlDownloadResult(200, bodyBytes: "DASH_IMAGE".toArray(), contentType: "image/png")
+        }))
+        try {
+            let result = gatewayImageGenerationGenerate(imageRuntimeConfig("dashscope", provider, outputRoot: root), imageRuntimeRequest("draw an eagle"))
+            let image = imageRuntimeArr(result, "images")[0].asObject()
+            let imagePath = Path(imageRuntimeString(image, "path"))
+
+            @Expect(imageRuntimeBool(result, "ok"), true)
+            @Expect(imageRuntimeString(result, "status"), "ok")
+            @Expect(imageRuntimeString(image, "mimeType"), "image/png")
+            @Expect(exists(imagePath), true)
+            @Expect(String.fromUtf8(File.readFrom(imagePath)), "DASH_IMAGE")
+            @Expect(seenBuilderUrls.size, 1)
+            @Expect(seenBuilderUrls[0].contains("/out%252Fdemo.png"), true)
+            @Expect(seenBuilderUrls[0].contains("Signature=a%252Bb%253D"), true)
+        } finally {
+            setGatewayImageGenerationDashScopeRunnerForTest(None<(JsonObject, JsonObject) -> GatewayImageGenerationHttpResult>)
+            setGatewaySignedUrlHttpSendForTest(None<(String, String, Int64, Int64, JsonObject) -> GatewaySignedUrlDownloadResult>)
+        }
+    }
+
+    @TestCase
     public func dashScopeQwenImageProviderUsesNativeAigcEndpointWhenBaseUrlIsCompatibleMode(): Unit {
         let root = imageRuntimeTempRoot("dashscope-qwen-compatible")
         let provider = imageRuntimeDashScopeProvider()
