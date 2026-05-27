@@ -141,6 +141,17 @@ private func gatewayMediaToolDiagInt(row: JsonObject, key: String): Int64 {
     }
 }
 
+private func gatewayMediaToolDiagBool(row: JsonObject, key: String): Bool {
+    let meta = match (row.get("meta")) {
+        case Some(value) => try { value.asObject() } catch (_e: Exception) { JsonObject() }
+        case None => JsonObject()
+    }
+    match (meta.get(key)) {
+        case Some(value) => try { value.asBool().getValue() } catch (_e: Exception) { false }
+        case None => false
+    }
+}
+
 private func gatewayMediaToolDiagEvent(row: JsonObject): String {
     match (row.get("event")) {
         case Some(value) => try { value.asString().getValue() } catch (_e: Exception) { "" }
@@ -227,6 +238,138 @@ public class GatewayTelegramMediaToolsetTest {
         media.put("peerId", JsonString(peerId))
         media.put("messageId", JsonString(messageId))
         media
+    }
+
+    @TestCase
+    public func telegramMediaSendUsesRuntimeHookWithoutDebugRunnerAndMarksVisibleReply(): Unit {
+        let root = Path("/tmp/metis-telegram-media-send-runtime-hook-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
+        Directory.create(root, recursive: true)
+        let source = root.join("local.png")
+        File.writeTo(source, "fake-local-image".toArray())
+        let sent = ArrayList<JsonObject>()
+        let context = GatewayToolRuntimeContext(
+            "telegram",
+            channelName: "telegram",
+            sessionKey: "telegram:direct:user:8734062810",
+            gatewayCallHook: Some({ method: String, params: JsonObject =>
+                @Expect(method, "channels.send")
+                sent.add(params)
+                let out = JsonObject()
+                out.put("ok", JsonBool(true))
+                out.put("messageId", JsonString("runtime-1"))
+                out
+            })
+        )
+        try {
+            let out = gatewayWithToolRuntimeContext(context, { =>
+                GatewayTelegramMediaToolset().debugTelegramMediaSendForTest(source.toString(), Some("caption"), Some("photo"), Some(false))
+            })
+            let json = JsonValue.fromStr(out).asObject()
+            @Expect(json.get("ok").getOrThrow().asBool().getValue(), true)
+            @Expect(json.get("status").getOrThrow().asString().getValue(), "accepted")
+            @Expect(sent.size, 1)
+            @Expect(sent[0].get("peerId").getOrThrow().asString().getValue(), "user:8734062810")
+            @Expect(sent[0].get("text").getOrThrow().asString().getValue().startsWith("[photo]"), true)
+            @Expect(sent[0].get("text").getOrThrow().asString().getValue().contains("fileId=${source.toString()}"), true)
+            @Expect(context.hasVisibleReplyDelivered(), true)
+        } finally {
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func telegramMediaSendRuntimeHookFailureDoesNotMarkVisibleReply(): Unit {
+        let root = Path("/tmp/metis-telegram-media-send-runtime-failure-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
+        Directory.create(root, recursive: true)
+        let source = root.join("local.png")
+        File.writeTo(source, "fake-local-image".toArray())
+        let context = GatewayToolRuntimeContext(
+            "telegram",
+            channelName: "telegram",
+            sessionKey: "telegram:direct:user:8734062810",
+            gatewayCallHook: Some({ method: String, _params: JsonObject =>
+                @Expect(method, "channels.send")
+                let out = JsonObject()
+                out.put("ok", JsonBool(false))
+                out.put("code", JsonString("send_rejected"))
+                out.put("sendPath", JsonString("runtime_hook"))
+                out
+            })
+        )
+        try {
+            let out = gatewayWithToolRuntimeContext(context, { =>
+                GatewayTelegramMediaToolset().debugTelegramMediaSendForTest(source.toString(), None<String>, Some("photo"), Some(false))
+            })
+            let json = JsonValue.fromStr(out).asObject()
+            @Expect(json.get("ok").getOrThrow().asBool().getValue(), false)
+            @Expect(json.get("status").getOrThrow().asString().getValue(), "error")
+            @Expect(json.get("gateway").getOrThrow().asObject().get("code").getOrThrow().asString().getValue(), "send_rejected")
+            @Expect(context.hasVisibleReplyDelivered(), false)
+        } finally {
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func telegramMediaSendHookMissingFailsFastWithoutCliFallbackAndEmitsDiagnostics(): Unit {
+        let root = Path("/tmp/metis-telegram-media-send-hook-missing-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
+        Directory.create(root, recursive: true)
+        let source = root.join("local.png")
+        File.writeTo(source, "fake-local-image".toArray())
+        let sink = GatewayMediaToolDiagnosticCaptureSink()
+        setGatewayMediaDiagnosticSinkForRuntime(Some(sink))
+        let context = GatewayToolRuntimeContext(
+            "telegram",
+            channelName: "telegram",
+            sessionKey: "telegram:direct:user:8734062810"
+        )
+        try {
+            let out = gatewayWithToolRuntimeContext(context, { =>
+                GatewayTelegramMediaToolset().debugTelegramMediaSendForTest(source.toString(), Some("caption"), Some("photo"), Some(false))
+            })
+            let json = JsonValue.fromStr(out).asObject()
+            @Expect(json.get("ok").getOrThrow().asBool().getValue(), false)
+            let gateway = json.get("gateway").getOrThrow().asObject()
+            @Expect(gateway.get("code").getOrThrow().asString().getValue(), "send_hook_missing")
+            @Expect(gateway.get("method").getOrThrow().asString().getValue(), "channels.send")
+            @Expect(gateway.get("toolName").getOrThrow().asString().getValue(), "telegram_media_send")
+            @Expect(gateway.get("sendPath").getOrThrow().asString().getValue(), "runtime_hook")
+            @Expect(gateway.get("selfCallPrevented").getOrThrow().asBool().getValue(), true)
+            @Expect(context.hasVisibleReplyDelivered(), false)
+            @Expect(gatewayMediaToolDiagCount(sink, MediaDiagnosticEvent.mediaOutboundFailed), 1)
+            let failed = gatewayMediaToolDiagFind(sink, MediaDiagnosticEvent.mediaOutboundFailed)
+            @Expect(gatewayMediaToolDiagString(failed, "gatewayCode"), "send_hook_missing")
+            @Expect(gatewayMediaToolDiagString(failed, "sendPath"), "runtime_hook")
+            @Expect(gatewayMediaToolDiagBool(failed, "selfCallPrevented"), true)
+            @Expect(failed.toJsonString().contains(source.toString()), false)
+        } finally {
+            resetGatewayMediaDiagnosticSinkForTest()
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func telegramMediaSendMissingLocalFileDoesNotInvokeRuntimeHook(): Unit {
+        let missing = "/tmp/metis-telegram-runtime-missing-${DateTime.now().toUnixTimeStamp().toMilliseconds()}.png"
+        let calls = ArrayList<String>()
+        let context = GatewayToolRuntimeContext(
+            "telegram",
+            channelName: "telegram",
+            sessionKey: "telegram:direct:user:8734062810",
+            gatewayCallHook: Some({ method: String, _params: JsonObject =>
+                calls.add(method)
+                let out = JsonObject()
+                out.put("ok", JsonBool(true))
+                out
+            })
+        )
+        let out = gatewayWithToolRuntimeContext(context, { =>
+            GatewayTelegramMediaToolset().debugTelegramMediaSendForTest(missing, None<String>, Some("photo"), Some(false))
+        })
+        let json = JsonValue.fromStr(out).asObject()
+        @Expect(json.get("ok").getOrThrow().asBool().getValue(), false)
+        @Expect(calls.size, 0)
+        @Expect(context.hasVisibleReplyDelivered(), false)
     }
 
     @TestCase
@@ -1593,6 +1736,54 @@ public class GatewayTelegramMediaToolsetTest {
     }
 
     @TestCase
+    public func telegramSendToTargetLiteralUsesRuntimeHookAndMarksVisibleReply(): Unit {
+        let sent = ArrayList<JsonObject>()
+        let context = GatewayToolRuntimeContext(
+            "telegram",
+            channelName: "telegram",
+            sessionKey: "telegram:direct:user:1",
+            gatewayCallHook: Some({ method: String, params: JsonObject =>
+                @Expect(method, "channels.send")
+                sent.add(params)
+                let out = JsonObject()
+                out.put("ok", JsonBool(true))
+                out.put("messageId", JsonString("send-target-1"))
+                out
+            })
+        )
+        let out = gatewayWithToolRuntimeContext(context, { =>
+            GatewayTelegramMediaToolset().debugTelegramSendToTargetForTest("8734062810", "hello", None<String>, None<Bool>)
+        })
+        let json = JsonValue.fromStr(out).asObject()
+        @Expect(json.get("status").getOrThrow().asString().getValue(), "accepted")
+        @Expect(json.get("resolvedTarget").getOrThrow().asString().getValue(), "user:8734062810")
+        @Expect(sent.size, 1)
+        @Expect(sent[0].get("peerId").getOrThrow().asString().getValue(), "user:8734062810")
+        @Expect(sent[0].get("text").getOrThrow().asString().getValue(), "hello")
+        @Expect(context.hasVisibleReplyDelivered(), true)
+    }
+
+    @TestCase
+    public func telegramSendToTargetHookMissingFailsFastWithoutCliFallback(): Unit {
+        let context = GatewayToolRuntimeContext(
+            "telegram",
+            channelName: "telegram",
+            sessionKey: "telegram:direct:user:1"
+        )
+        let out = gatewayWithToolRuntimeContext(context, { =>
+            GatewayTelegramMediaToolset().debugTelegramSendToTargetForTest("8734062810", "hello", None<String>, None<Bool>)
+        })
+        let json = JsonValue.fromStr(out).asObject()
+        @Expect(json.get("ok").getOrThrow().asBool().getValue(), false)
+        @Expect(json.get("status").getOrThrow().asString().getValue(), "error")
+        let gateway = json.get("gateway").getOrThrow().asObject()
+        @Expect(gateway.get("code").getOrThrow().asString().getValue(), "send_hook_missing")
+        @Expect(gateway.get("toolName").getOrThrow().asString().getValue(), "telegram_send_to_target")
+        @Expect(gateway.get("selfCallPrevented").getOrThrow().asBool().getValue(), true)
+        @Expect(context.hasVisibleReplyDelivered(), false)
+    }
+
+    @TestCase
     public func telegramSendToUsernameTargetResolvesWithGetChatAndSendsWithoutWriteback(): Unit {
         this.withTelegramMediaToolsetConfigHome {
             var user = GatewayUserSettings()
@@ -1706,6 +1897,53 @@ public class GatewayTelegramMediaToolsetTest {
                 toolset.debugSetGatewayCallRunnerForTest(None<(String, JsonObject) -> JsonObject>)
             }
         }
+    }
+
+    @TestCase
+    public func telegramActionUsesRuntimeHookAndMarksVisibleReply(): Unit {
+        let sent = ArrayList<JsonObject>()
+        let context = GatewayToolRuntimeContext(
+            "telegram",
+            channelName: "telegram",
+            sessionKey: "telegram:direct:user:8734062810",
+            gatewayCallHook: Some({ method: String, params: JsonObject =>
+                @Expect(method, "channels.send")
+                sent.add(params)
+                let out = JsonObject()
+                out.put("ok", JsonBool(true))
+                out.put("messageId", JsonString("action-1"))
+                out
+            })
+        )
+        let out = gatewayWithToolRuntimeContext(context, { =>
+            GatewayTelegramMediaToolset().debugTelegramActionForTest("sendMessage", None<String>, Some("hello"), None<String>, None<String>, None<Array<String>>, None<String>, None<String>)
+        })
+        let json = JsonValue.fromStr(out).asObject()
+        @Expect(json.get("status").getOrThrow().asString().getValue(), "accepted")
+        @Expect(sent.size, 1)
+        @Expect(sent[0].get("peerId").getOrThrow().asString().getValue(), "user:8734062810")
+        @Expect(sent[0].get("text").getOrThrow().asString().getValue(), "hello")
+        @Expect(context.hasVisibleReplyDelivered(), true)
+    }
+
+    @TestCase
+    public func telegramActionHookMissingFailsFastWithoutCliFallback(): Unit {
+        let context = GatewayToolRuntimeContext(
+            "telegram",
+            channelName: "telegram",
+            sessionKey: "telegram:direct:user:8734062810"
+        )
+        let out = gatewayWithToolRuntimeContext(context, { =>
+            GatewayTelegramMediaToolset().debugTelegramActionForTest("sendMessage", None<String>, Some("hello"), None<String>, None<String>, None<Array<String>>, None<String>, None<String>)
+        })
+        let json = JsonValue.fromStr(out).asObject()
+        @Expect(json.get("ok").getOrThrow().asBool().getValue(), false)
+        @Expect(json.get("status").getOrThrow().asString().getValue(), "error")
+        let gateway = json.get("gateway").getOrThrow().asObject()
+        @Expect(gateway.get("code").getOrThrow().asString().getValue(), "send_hook_missing")
+        @Expect(gateway.get("toolName").getOrThrow().asString().getValue(), "telegram_action")
+        @Expect(gateway.get("selfCallPrevented").getOrThrow().asBool().getValue(), true)
+        @Expect(context.hasVisibleReplyDelivered(), false)
     }
 
     @TestCase

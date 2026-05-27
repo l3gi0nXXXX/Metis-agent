@@ -13,9 +13,15 @@ import stdx.encoding.json.{JsonBool, JsonObject, JsonString, JsonValue}
 
 private var gatewayVideoGenerationToolCallRunnerForTest: Option<(String, JsonObject) -> JsonObject> =
     None<(String, JsonObject) -> JsonObject>
+private var gatewayVideoGenerationToolCliFallbackForTest: Option<() -> JsonObject> =
+    None<() -> JsonObject>
 
 public func debugSetGatewayVideoGenerationToolCallRunnerForTest(runner: Option<(String, JsonObject) -> JsonObject>): Unit {
     gatewayVideoGenerationToolCallRunnerForTest = runner
+}
+
+public func debugSetGatewayVideoGenerationToolCliFallbackForTest(runner: Option<() -> JsonObject>): Unit {
+    gatewayVideoGenerationToolCliFallbackForTest = runner
 }
 
 private func gatewayVideoGenerationToolJsonBool(obj: JsonObject, key: String, fallback: Bool): Bool {
@@ -56,11 +62,7 @@ private func gatewayVideoGenerationToolBinaryCommand(): (String, Option<Path>) {
     }
 }
 
-private func gatewayVideoGenerationToolInvokeGatewaySend(payload: JsonObject): JsonObject {
-    match (gatewayVideoGenerationToolCallRunnerForTest) {
-        case Some(runner) => return runner("channels.send", payload)
-        case None => ()
-    }
+private func gatewayVideoGenerationToolInvokeGatewaySendCliFallback(payload: JsonObject): JsonObject {
     let (command, workDir) = gatewayVideoGenerationToolBinaryCommand()
     let args = ["gateway", "call", "channels.send", payload.toJsonString()]
     let (exitCode, stdoutBytes, stderrBytes) = executeWithOutput(command, args, workingDirectory: workDir)
@@ -84,6 +86,38 @@ private func gatewayVideoGenerationToolInvokeGatewaySend(payload: JsonObject): J
     out.put("stdout", JsonString(stdout))
     out.put("stderr", JsonString(stderr))
     out
+}
+
+private func gatewayVideoGenerationToolInvokeGatewaySend(payload: JsonObject): JsonObject {
+    let sendPath = match (gatewayVideoGenerationToolCallRunnerForTest) {
+        case Some(_) => "test_runner"
+        case None =>
+            match (gatewayCurrentToolRuntimeContext()) {
+                case Some(_) => "runtime_hook"
+                case None => "cli_fallback"
+            }
+    }
+    let fallback = match (gatewayVideoGenerationToolCliFallbackForTest) {
+        case Some(runner) => Some(runner)
+        case None => Some({ => gatewayVideoGenerationToolInvokeGatewaySendCliFallback(payload) })
+    }
+    let result = gatewayToolInvokeChannelsSend(
+        "gateway_video_generate",
+        payload,
+        callRunnerForTest: gatewayVideoGenerationToolCallRunnerForTest,
+        cliFallback: fallback
+    )
+    let effectivePath = if (gatewayVideoGenerationToolJsonString(result, "code", "") == "send_hook_missing") {
+        "unavailable"
+    } else {
+        sendPath
+    }
+    result.put("sendPath", JsonString(effectivePath))
+    return result
+}
+
+public func debugGatewayVideoGenerationInvokeGatewaySendForTest(payload: JsonObject): JsonObject {
+    gatewayVideoGenerationToolInvokeGatewaySend(payload)
 }
 
 private func gatewayVideoGenerationToolCurrentTarget(): (String, String, String) {

@@ -413,4 +413,100 @@ public class GatewayMessageToolsetTest {
         @Expect(json.get("gateway").getOrThrow().asObject().get("error").getOrThrow().asString().getValue(), "send failed")
         @Expect(context.hasVisibleReplyDelivered(), false)
     }
+
+    @TestCase
+    public func messageToolSendUsesRuntimeHookInsideContext(): Unit {
+        let calls = ArrayList<JsonObject>()
+        let context = GatewayToolRuntimeContext(
+            "telegram",
+            channelName: "telegram",
+            sessionKey: "telegram:direct:user:1",
+            senderId: "user:1",
+            gatewayCallHook: Some({ method: String, payload: JsonObject =>
+                @Expect(method, "channels.send")
+                calls.add(payload)
+                let out = JsonObject()
+                out.put("ok", JsonBool(true))
+                out.put("messageId", JsonString("runtime-hook-message"))
+                out
+            })
+        )
+        let out = gatewayWithToolRuntimeContext(context, { =>
+            GatewayMessageToolset().debugMessageForTest("send", "telegram", "user:1", "runtime hello")
+        })
+        let json = JsonValue.fromStr(out).asObject()
+        @Expect(json.get("ok").getOrThrow().asBool().getValue(), true)
+        @Expect(json.get("status").getOrThrow().asString().getValue(), "accepted")
+        @Expect(calls.size, 1)
+        @Expect(calls[0].get("channel").getOrThrow().asString().getValue(), "telegram")
+        @Expect(calls[0].get("to").getOrThrow().asString().getValue(), "user:1")
+        @Expect(calls[0].get("text").getOrThrow().asString().getValue(), "runtime hello")
+        @Expect(context.hasVisibleReplyDelivered(), true)
+    }
+
+    @TestCase
+    public func messageToolSendFailsFastWhenRuntimeHookMissing(): Unit {
+        let context = GatewayToolRuntimeContext(
+            "telegram",
+            channelName: "telegram",
+            sessionKey: "telegram:direct:user:1",
+            senderId: "user:1"
+        )
+        let out = gatewayWithToolRuntimeContext(context, { =>
+            GatewayMessageToolset().debugMessageForTest("send", "telegram", "user:1", "hook missing")
+        })
+        let json = JsonValue.fromStr(out).asObject()
+        @Expect(json.get("ok").getOrThrow().asBool().getValue(), false)
+        @Expect(json.get("status").getOrThrow().asString().getValue(), "error")
+        let gateway = json.get("gateway").getOrThrow().asObject()
+        @Expect(gateway.get("ok").getOrThrow().asBool().getValue(), false)
+        @Expect(gateway.get("code").getOrThrow().asString().getValue(), "send_hook_missing")
+        @Expect(gateway.get("method").getOrThrow().asString().getValue(), "channels.send")
+        @Expect(gateway.get("selfCallPrevented").getOrThrow().asBool().getValue(), true)
+        @Expect(context.hasVisibleReplyDelivered(), false)
+    }
+
+    @TestCase
+    public func messageToolSendUsesCliFallbackOnlyOutsideRuntime(): Unit {
+        let calls = ArrayList<JsonObject>()
+        debugSetGatewayMessageToolCallRunnerForTest(Some({ method: String, payload: JsonObject =>
+            @Expect(method, "channels.send")
+            calls.add(payload)
+            let out = JsonObject()
+            out.put("ok", JsonBool(true))
+            out.put("messageId", JsonString("legacy-fallback-message"))
+            out
+        }))
+        try {
+            let out = GatewayMessageToolset().debugMessageForTest("send", "telegram", "user:1", "fallback hello")
+            let json = JsonValue.fromStr(out).asObject()
+            @Expect(json.get("ok").getOrThrow().asBool().getValue(), true)
+            @Expect(json.get("status").getOrThrow().asString().getValue(), "accepted")
+            @Expect(calls.size, 1)
+            @Expect(calls[0].get("channel").getOrThrow().asString().getValue(), "telegram")
+            @Expect(calls[0].get("to").getOrThrow().asString().getValue(), "user:1")
+        } finally {
+            debugSetGatewayMessageToolCallRunnerForTest(None<(String, JsonObject) -> JsonObject>)
+        }
+    }
+
+    @TestCase
+    public func messageToolSendDefaultOutputIsHumanReadable(): Unit {
+        debugSetGatewayMessageToolCallRunnerForTest(Some({ _method: String, _payload: JsonObject =>
+            let out = JsonObject()
+            out.put("ok", JsonBool(true))
+            out
+        }))
+        try {
+            let out = GatewayMessageToolset().debugMessageForTest("send", "telegram", "user:1", "hello default output")
+            let json = JsonValue.fromStr(out).asObject()
+            @Expect(json.get("payloadPreview").getOrThrow().asString().getValue(), "hello default output")
+            @Expect(json.get("message").getOrThrow().asString().getValue(), "hello default output")
+            @Expect(json.get("payloadPreview").getOrThrow().asString().getValue().contains("\"ok\""), false)
+            @Expect(json.get("payloadPreview").getOrThrow().asString().getValue().contains("\"result\""), false)
+            @Expect(json.get("payloadPreview").getOrThrow().asString().getValue().contains("\"sessions\""), false)
+        } finally {
+            debugSetGatewayMessageToolCallRunnerForTest(None<(String, JsonObject) -> JsonObject>)
+        }
+    }
 }

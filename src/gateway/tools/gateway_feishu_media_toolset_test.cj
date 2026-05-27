@@ -166,6 +166,76 @@ public class GatewayFeishuMediaToolsetTest {
     }
 
     @TestCase
+    public func feishuMediaSendStillUsesRuntimeGatewayHook(): Unit {
+        let capturedMethods = ArrayList<String>()
+        let capturedPayloads = ArrayList<JsonObject>()
+        let context = GatewayToolRuntimeContext(
+            "feishu",
+            channelName: "feishu",
+            sessionKey: "feishu:direct:ou_1",
+            senderId: "ou_1",
+            mediaContext: this.mediaContext(),
+            gatewayCallHook: Some({ method: String, payload: JsonObject =>
+                capturedMethods.add(method)
+                capturedPayloads.add(payload)
+                let out = JsonObject()
+                out.put("ok", JsonBool(true))
+                out
+            })
+        )
+        let out = gatewayWithToolRuntimeContext(context, { =>
+            GatewayFeishuMediaToolset().debugFeishuMediaSendForTest("/tmp/pic.png", Some("caption"), Some("photo"), None<Bool>)
+        })
+        let json = JsonValue.fromStr(out).asObject()
+        @Expect(json.get("ok").getOrThrow().asBool().getValue(), true)
+        @Expect(capturedMethods.size, 1)
+        @Expect(capturedMethods[0], "channels.send")
+        @Expect(capturedPayloads[0].get("channel").getOrThrow().asString().getValue(), "feishu")
+        @Expect(capturedPayloads[0].get("to").getOrThrow().asString().getValue(), "ou_1")
+    }
+
+    @TestCase
+    public func feishuMediaSendStillFailsFastWhenHookMissing(): Unit {
+        let context = GatewayToolRuntimeContext(
+            "feishu",
+            channelName: "feishu",
+            sessionKey: "feishu:direct:ou_1",
+            senderId: "ou_1",
+            mediaContext: this.mediaContext()
+        )
+        let out = gatewayWithToolRuntimeContext(context, { =>
+            GatewayFeishuMediaToolset().debugFeishuMediaSendForTest("/tmp/pic.png", None<String>, Some("photo"), None<Bool>)
+        })
+        let json = JsonValue.fromStr(out).asObject()
+        @Expect(json.get("ok").getOrThrow().asBool().getValue(), false)
+        @Expect(json.get("status").getOrThrow().asString().getValue(), "error")
+        @Expect(json.get("code").getOrThrow().asString().getValue(), "send_hook_missing")
+        @Expect(context.hasVisibleReplyDelivered(), false)
+    }
+
+    @TestCase
+    public func feishuMediaSendStillMarksVisibleReplyDelivered(): Unit {
+        let context = GatewayToolRuntimeContext(
+            "feishu",
+            channelName: "feishu",
+            sessionKey: "feishu:direct:ou_1",
+            senderId: "ou_1",
+            mediaContext: this.mediaContext(),
+            gatewayCallHook: Some({ _method: String, _payload: JsonObject =>
+                let out = JsonObject()
+                out.put("ok", JsonBool(true))
+                out
+            })
+        )
+        let out = gatewayWithToolRuntimeContext(context, { =>
+            GatewayFeishuMediaToolset().debugFeishuMediaSendForTest("/tmp/pic.png", None<String>, Some("photo"), None<Bool>)
+        })
+        let json = JsonValue.fromStr(out).asObject()
+        @Expect(json.get("ok").getOrThrow().asBool().getValue(), true)
+        @Expect(context.hasVisibleReplyDelivered(), true)
+    }
+
+    @TestCase
     public func feishuMediaListReadsCurrentRuntimeContext(): Unit {
         let out = gatewayWithToolRuntimeContext(
             GatewayToolRuntimeContext("feishu", channelName: "feishu", sessionKey: "feishu:chat:1", mediaContext: this.mediaContext()),

@@ -6,7 +6,7 @@ import magic.core.model.ChatRequest
 import magic.model.ModelManager
 import magic.prelude.*
 
-import metis.core.gatewayCurrentToolRuntimeContext
+import metis.core.{gatewayCurrentToolRuntimeContext, gatewayMarkCurrentToolRuntimeVisibleReplyDelivered}
 import metis.core.{renderGatewayAudioText, renderGatewayDeleteText, renderGatewayDocumentText, renderGatewayEditText, renderGatewayPhotoText, renderGatewayPollText, renderGatewayReactionText, renderGatewayStickerText, renderGatewayTopicCreateText, renderGatewayTopicEditText, renderGatewayVideoNoteText, renderGatewayVideoText, renderGatewayVoiceText}
 import metis.core.config.{CliConfig, CliSettingManager, MetisConfigManager, MetisPaths}
 import metis.core.{gatewayImageUnderstandingCandidateSummary, gatewayMediaUnderstandingFirstText, gatewayMediaUnderstandingForRecord, gatewayMediaUnderstandingOutputs}
@@ -777,6 +777,19 @@ private func telegramMediaToolInvokeGatewayCall(method: String, params!: Option<
     out.put("stdout", JsonString(stdout))
     out.put("stderr", JsonString(stderr))
     out
+}
+
+private func telegramMediaToolInvokeChannelsSend(toolName: String, payload: JsonObject): JsonObject {
+    let sent = gatewayToolInvokeChannelsSend(
+        toolName,
+        payload,
+        callRunnerForTest: telegramMediaToolGatewayCallRunnerOverride,
+        cliFallback: Some({ => telegramMediaToolInvokeGatewayCall("channels.send", params: Some(payload)) })
+    )
+    if (telegramMediaToolString(sent, "code") == "send_hook_missing" && telegramMediaToolString(sent, "sendPath").isEmpty()) {
+        sent.put("sendPath", JsonString("runtime_hook"))
+    }
+    sent
 }
 
 private func telegramMediaToolCurrentTarget(): (String, String, String) {
@@ -1710,7 +1723,7 @@ public class GatewayTelegramMediaToolset {
         payload.put("to", JsonString(target))
         payload.put("text", JsonString(telegramMediaToolBuildMediaText(actualKind, media, cap)))
         payload.put("message", payload.get("text").getOrThrow())
-        let sent = telegramMediaToolInvokeGatewayCall("channels.send", params: Some(payload))
+        let sent = telegramMediaToolInvokeChannelsSend("telegram_media_send", payload)
         let sentOk = try { sent.get("ok").getOrThrow().asBool().getValue() } catch (_e: Exception) { false }
         let sendMeta = JsonObject()
         sendMeta.put("pathSourceKind", JsonString(pathSourceKind))
@@ -1719,9 +1732,22 @@ public class GatewayTelegramMediaToolset {
             sendMeta.put("fileBytes", JsonInt(fileBytes))
         }
         if (sentOk) {
+            gatewayMarkCurrentToolRuntimeVisibleReplyDelivered()
             telegramMediaToolEmitDiagnostic("info", MediaDiagnosticEvent.mediaOutboundSend, "telegram media send accepted by gateway", baseMeta, sendMeta)
         } else {
             sendMeta.put("errorKind", JsonString("gateway_send_failed"))
+            let code = telegramMediaToolString(sent, "code")
+            if (!code.isEmpty()) {
+                sendMeta.put("gatewayCode", JsonString(code))
+            }
+            let sendPath = telegramMediaToolString(sent, "sendPath")
+            if (!sendPath.isEmpty()) {
+                sendMeta.put("sendPath", JsonString(sendPath))
+            }
+            match (sent.get("selfCallPrevented")) {
+                case Some(value) => sendMeta.put("selfCallPrevented", value)
+                case None => ()
+            }
             telegramMediaToolEmitDiagnostic("warn", MediaDiagnosticEvent.mediaOutboundFailed, "telegram media send rejected by gateway", baseMeta, sendMeta)
         }
         let result = JsonObject()
@@ -1783,8 +1809,11 @@ public class GatewayTelegramMediaToolset {
         if (!replyTo.trimAscii().isEmpty()) {
             payload.put("replyToMessageId", JsonString(replyTo.trimAscii()))
         }
-        let sent = telegramMediaToolInvokeGatewayCall("channels.send", params: Some(payload))
+        let sent = telegramMediaToolInvokeChannelsSend("telegram_action", payload)
         let ok = telegramMediaToolBool(sent, "ok")
+        if (ok) {
+            gatewayMarkCurrentToolRuntimeVisibleReplyDelivered()
+        }
         let out = JsonObject()
         out.put("ok", ok.toJsonValue())
         out.put("status", JsonString(if (ok) { "accepted" } else { "error" }))
@@ -2289,8 +2318,11 @@ public class GatewayTelegramMediaToolset {
         payload.put("to", JsonString(resolvedTarget))
         payload.put("text", JsonString(msg))
         payload.put("message", JsonString(msg))
-        let sent = telegramMediaToolInvokeGatewayCall("channels.send", params: Some(payload))
+        let sent = telegramMediaToolInvokeChannelsSend("telegram_send_to_target", payload)
         let ok = try { sent.get("ok").getOrThrow().asBool().getValue() } catch (_e: Exception) { false }
+        if (ok) {
+            gatewayMarkCurrentToolRuntimeVisibleReplyDelivered()
+        }
         let out = JsonObject()
         out.put("ok", ok.toJsonValue())
         out.put("status", JsonString(if (ok) { "accepted" } else { "error" }))

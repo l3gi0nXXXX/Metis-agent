@@ -236,6 +236,177 @@ public class GatewayTtsToolsetTest {
     }
 
     @TestCase
+    public func ttsSendUsesRuntimeGatewayHookInsideContext(): Unit {
+        let home = gatewayTtsToolTestHome("runtime-hook")
+        let oldHome = getVariable("METIS_HOME")
+        try { remove(Path(home), recursive: true) } catch (_: Exception) { () }
+        Directory.create(home, recursive: true)
+        setVariable("METIS_HOME", home)
+        MetisConfigManager.invalidate()
+        CliSettingManager.invalidate()
+        CliConfig.invalidatePathCache()
+        gatewayTtsToolInstallProviderConfig(home)
+
+        let sentTexts = ArrayList<String>()
+        try {
+            let toolset = GatewayTtsToolset()
+            let context = GatewayToolRuntimeContext(
+                "telegram",
+                channelName: "telegram",
+                sessionKey: "telegram:direct:user:runtime",
+                gatewayCallHook: Some({ method: String, payload: JsonObject =>
+                    @Expect(method, "channels.send")
+                    @Expect(payload.get("peerId").getOrThrow().asString().getValue(), "user:runtime")
+                    sentTexts.add(payload.get("text").getOrThrow().asString().getValue())
+                    let out = JsonObject()
+                    out.put("ok", JsonBool(true))
+                    out
+                })
+            )
+            let out = gatewayWithToolRuntimeContext(context, { =>
+                toolset.debugTtsForTest("你好", "telegram", true)
+            })
+            let result = JsonValue.fromStr(out).asObject()
+            @Expect(result.get("delivered").getOrThrow().asBool().getValue(), true)
+            @Expect(context.hasVisibleReplyDelivered(), true)
+            @Expect(sentTexts.size, 1)
+            @Expect(sentTexts[0].startsWith("[voice]"), true)
+        } finally {
+            gatewayTtsToolResetEnv(oldHome, home)
+        }
+    }
+
+    @TestCase
+    public func ttsSendFailsFastWhenRuntimeHookMissing(): Unit {
+        let home = gatewayTtsToolTestHome("hook-missing")
+        let oldHome = getVariable("METIS_HOME")
+        try { remove(Path(home), recursive: true) } catch (_: Exception) { () }
+        Directory.create(home, recursive: true)
+        setVariable("METIS_HOME", home)
+        MetisConfigManager.invalidate()
+        CliSettingManager.invalidate()
+        CliConfig.invalidatePathCache()
+        gatewayTtsToolInstallProviderConfig(home)
+
+        try {
+            let toolset = GatewayTtsToolset()
+            let context = GatewayToolRuntimeContext(
+                "telegram",
+                channelName: "telegram",
+                sessionKey: "telegram:direct:user:missing"
+            )
+            let out = gatewayWithToolRuntimeContext(context, { =>
+                toolset.debugTtsForTest("你好", "telegram", true)
+            })
+            let result = JsonValue.fromStr(out).asObject()
+            @Expect(result.get("delivered").getOrThrow().asBool().getValue(), false)
+            let deliveryResult = JsonValue.fromStr(result.get("deliveryResult").getOrThrow().asString().getValue()).asObject()
+            @Expect(deliveryResult.get("code").getOrThrow().asString().getValue(), "send_hook_missing")
+            @Expect(deliveryResult.get("selfCallPrevented").getOrThrow().asBool().getValue(), true)
+            @Expect(deliveryResult.get("sendPath").getOrThrow().asString().getValue(), "unavailable")
+            @Expect(context.hasVisibleReplyDelivered(), false)
+        } finally {
+            gatewayTtsToolResetEnv(oldHome, home)
+        }
+    }
+
+    @TestCase
+    public func ttsSendUsesCliFallbackOnlyOutsideRuntime(): Unit {
+        let fallbackCalls = ArrayList<String>()
+        debugSetGatewayTtsToolCliFallbackForTest(Some({ =>
+            fallbackCalls.add("called")
+            let out = JsonObject()
+            out.put("ok", JsonBool(true))
+            out.put("status", JsonString("ok"))
+            out
+        }))
+        try {
+            let toolset = GatewayTtsToolset()
+            let out = toolset.debugSendForTest("telegram", "user:cli", "[voice] file:///tmp/fake.ogg")
+            let result = JsonValue.fromStr(out).asObject()
+            @Expect(result.get("ok").getOrThrow().asBool().getValue(), true)
+            @Expect(result.get("sendPath").getOrThrow().asString().getValue(), "cli_fallback")
+            @Expect(result.get("method").getOrThrow().asString().getValue(), "channels.send")
+            @Expect(fallbackCalls.size, 1)
+        } finally {
+            debugSetGatewayTtsToolCliFallbackForTest(None<() -> JsonObject>)
+        }
+    }
+
+    @TestCase
+    public func ttsSendMarksVisibleReplyDeliveredOnSuccess(): Unit {
+        let home = gatewayTtsToolTestHome("visible-success")
+        let oldHome = getVariable("METIS_HOME")
+        try { remove(Path(home), recursive: true) } catch (_: Exception) { () }
+        Directory.create(home, recursive: true)
+        setVariable("METIS_HOME", home)
+        MetisConfigManager.invalidate()
+        CliSettingManager.invalidate()
+        CliConfig.invalidatePathCache()
+        gatewayTtsToolInstallProviderConfig(home)
+
+        try {
+            let toolset = GatewayTtsToolset()
+            let context = GatewayToolRuntimeContext(
+                "telegram",
+                channelName: "telegram",
+                sessionKey: "telegram:direct:user:visible",
+                gatewayCallHook: Some({ _method: String, _payload: JsonObject =>
+                    let out = JsonObject()
+                    out.put("ok", JsonBool(true))
+                    out
+                })
+            )
+            let out = gatewayWithToolRuntimeContext(context, { =>
+                toolset.debugTtsForTest("你好", "telegram", true)
+            })
+            let result = JsonValue.fromStr(out).asObject()
+            @Expect(result.get("delivered").getOrThrow().asBool().getValue(), true)
+            @Expect(context.hasVisibleReplyDelivered(), true)
+        } finally {
+            gatewayTtsToolResetEnv(oldHome, home)
+        }
+    }
+
+    @TestCase
+    public func ttsSendDoesNotMarkVisibleReplyDeliveredOnGatewayFailure(): Unit {
+        let home = gatewayTtsToolTestHome("visible-failure")
+        let oldHome = getVariable("METIS_HOME")
+        try { remove(Path(home), recursive: true) } catch (_: Exception) { () }
+        Directory.create(home, recursive: true)
+        setVariable("METIS_HOME", home)
+        MetisConfigManager.invalidate()
+        CliSettingManager.invalidate()
+        CliConfig.invalidatePathCache()
+        gatewayTtsToolInstallProviderConfig(home)
+
+        try {
+            let toolset = GatewayTtsToolset()
+            let context = GatewayToolRuntimeContext(
+                "telegram",
+                channelName: "telegram",
+                sessionKey: "telegram:direct:user:failure",
+                gatewayCallHook: Some({ _method: String, _payload: JsonObject =>
+                    let out = JsonObject()
+                    out.put("ok", JsonBool(false))
+                    out.put("code", JsonString("send_failed"))
+                    out
+                })
+            )
+            let out = gatewayWithToolRuntimeContext(context, { =>
+                toolset.debugTtsForTest("你好", "telegram", true)
+            })
+            let result = JsonValue.fromStr(out).asObject()
+            @Expect(result.get("delivered").getOrThrow().asBool().getValue(), false)
+            @Expect(context.hasVisibleReplyDelivered(), false)
+            let deliveryResult = JsonValue.fromStr(result.get("deliveryResult").getOrThrow().asString().getValue()).asObject()
+            @Expect(deliveryResult.get("code").getOrThrow().asString().getValue(), "send_failed")
+        } finally {
+            gatewayTtsToolResetEnv(oldHome, home)
+        }
+    }
+
+    @TestCase
     public func ttsToolDeliversAudioThroughCurrentFeishuContext(): Unit {
         let home = gatewayTtsToolTestHome("feishu-deliver")
         let oldHome = getVariable("METIS_HOME")

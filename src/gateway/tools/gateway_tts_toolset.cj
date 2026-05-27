@@ -12,9 +12,14 @@ import std.process.executeWithOutput
 import stdx.encoding.json.{JsonBool, JsonObject, JsonString, JsonValue}
 
 private var gatewayTtsToolCallRunnerForTest: Option<(String, JsonObject) -> JsonObject> = None<(String, JsonObject) -> JsonObject>
+private var gatewayTtsToolCliFallbackForTest: Option<() -> JsonObject> = None<() -> JsonObject>
 
 public func debugSetGatewayTtsToolCallRunnerForTest(runner: Option<(String, JsonObject) -> JsonObject>): Unit {
     gatewayTtsToolCallRunnerForTest = runner
+}
+
+public func debugSetGatewayTtsToolCliFallbackForTest(runner: Option<() -> JsonObject>): Unit {
+    gatewayTtsToolCliFallbackForTest = runner
 }
 
 private func gatewayTtsToolJsonBool(obj: JsonObject, key: String, fallback: Bool): Bool {
@@ -51,11 +56,49 @@ private func gatewayTtsToolBinaryCommand(): (String, Option<Path>) {
     }
 }
 
-private func gatewayTtsToolInvokeGatewaySend(payload: JsonObject): JsonObject {
-    match (gatewayTtsToolCallRunnerForTest) {
-        case Some(runner) => return runner("channels.send", payload)
+private func gatewayTtsToolEnsureSendDiagnostics(result: JsonObject, sendPath: String): JsonObject {
+    if (result.get("method").isNone()) {
+        result.put("method", JsonString("channels.send"))
+    }
+    if (result.get("toolName").isNone()) {
+        result.put("toolName", JsonString("gateway_tts_generate"))
+    }
+    if (result.get("sendPath").isNone()) {
+        result.put("sendPath", JsonString(sendPath))
+    }
+    match (result.get("status")) {
+        case Some(status) =>
+            if (result.get("gatewayStatus").isNone()) {
+                result.put("gatewayStatus", status)
+            }
         case None => ()
     }
+    match (result.get("code")) {
+        case Some(code) =>
+            if (result.get("gatewayErrorCode").isNone()) {
+                result.put("gatewayErrorCode", code)
+            }
+        case None => ()
+    }
+    result
+}
+
+private func gatewayTtsToolSendPathForCurrentContext(): String {
+    match (gatewayTtsToolCallRunnerForTest) {
+        case Some(_) => return "test_runner"
+        case None => ()
+    }
+    match (gatewayCurrentToolRuntimeContext()) {
+        case Some(ctx) =>
+            match (ctx.gatewayCallHook) {
+                case Some(_) => "runtime_hook"
+                case None => "unavailable"
+            }
+        case None => "cli_fallback"
+    }
+}
+
+private func gatewayTtsToolCliFallback(payload: JsonObject): JsonObject {
     let (command, workDir) = gatewayTtsToolBinaryCommand()
     let args = ["gateway", "call", "channels.send", payload.toJsonString()]
     let (exitCode, stdoutBytes, stderrBytes) = executeWithOutput(command, args, workingDirectory: workDir)
@@ -79,6 +122,22 @@ private func gatewayTtsToolInvokeGatewaySend(payload: JsonObject): JsonObject {
     out.put("stdout", JsonString(stdout))
     out.put("stderr", JsonString(stderr))
     out
+}
+
+private func gatewayTtsToolInvokeGatewaySend(payload: JsonObject): JsonObject {
+    let sendPath = gatewayTtsToolSendPathForCurrentContext()
+    let result = gatewayToolInvokeChannelsSend(
+        "gateway_tts_generate",
+        payload,
+        callRunnerForTest: gatewayTtsToolCallRunnerForTest,
+        cliFallback: Some({ =>
+            match (gatewayTtsToolCliFallbackForTest) {
+                case Some(runner) => runner()
+                case None => gatewayTtsToolCliFallback(payload)
+            }
+        })
+    )
+    gatewayTtsToolEnsureSendDiagnostics(result, sendPath)
 }
 
 private func gatewayTtsToolCurrentTarget(): (String, String, String) {
@@ -116,6 +175,10 @@ private func gatewayTtsToolBuildSendPayload(channel: String, target: String, pay
 
 @toolset
 public class GatewayTtsToolset {
+    public func debugSendForTest(channel: String, target: String, payload: String): String {
+        gatewayTtsToolInvokeGatewaySend(gatewayTtsToolBuildSendPayload(channel, target, payload)).toJsonString()
+    }
+
     public func debugTtsForTest(text: String, channel: String, asVoice: Bool): String {
         this.__tool_impl_of_tts(text, Some(channel), Some(asVoice))
     }

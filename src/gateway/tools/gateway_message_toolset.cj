@@ -3,7 +3,7 @@ package metis.gateway.tools
 import magic.dsl.{tool, toolset}
 import magic.prelude.*
 
-import metis.core.{gatewayCurrentToolRuntimeContext, gatewayInvokeCurrentToolRuntimeGatewayCall, gatewayMarkCurrentToolRuntimeVisibleReplyDelivered, gatewayMessagePayloadPreview, gatewaySpeechResolveDeliveryPrefs, gatewaySpeechResolveTtsConfig, gatewaySpeechTtsSynthesize, parseGatewayPollParts, renderGatewayAudioText, renderGatewayChatActionText, renderGatewayDeleteText, renderGatewayDocumentText, renderGatewayEditText, renderGatewayPhotoText, renderGatewayPinText, renderGatewayPollTextAdvanced, renderGatewayReactionText, renderGatewayTopicCreateText, renderGatewayTopicEditText, renderGatewayUnpinText, renderGatewayVideoNoteText, renderGatewayVideoText, renderGatewayVoiceText}
+import metis.core.{gatewayCurrentToolRuntimeContext, gatewayMarkCurrentToolRuntimeVisibleReplyDelivered, gatewayMessagePayloadPreview, gatewaySpeechResolveDeliveryPrefs, gatewaySpeechResolveTtsConfig, gatewaySpeechTtsSynthesize, parseGatewayPollParts, renderGatewayAudioText, renderGatewayChatActionText, renderGatewayDeleteText, renderGatewayDocumentText, renderGatewayEditText, renderGatewayPhotoText, renderGatewayPinText, renderGatewayPollTextAdvanced, renderGatewayReactionText, renderGatewayTopicCreateText, renderGatewayTopicEditText, renderGatewayUnpinText, renderGatewayVideoNoteText, renderGatewayVideoText, renderGatewayVoiceText}
 import metis.core.config.{CliConfig, CliSettingManager, MetisPaths}
 import metis.io.PrintUtils
 
@@ -94,37 +94,36 @@ public class GatewayMessageToolset {
     }
 
     private func invokeGatewaySend(payload: JsonObject): JsonObject {
-        match (gatewayMessageToolCallRunnerForTest) {
-            case Some(runner) => return runner("channels.send", payload)
-            case None => ()
-        }
-        match (gatewayInvokeCurrentToolRuntimeGatewayCall("channels.send", payload)) {
-            case Some(result) => return result
-            case None => ()
-        }
-        let (command, workDir) = this.gatewayMessageBinaryCommand()
-        let args = ["gateway", "call", "channels.send", payload.toJsonString()]
-        let (exitCode, stdoutBytes, stderrBytes) = executeWithOutput(command, args, workingDirectory: workDir)
-        let stdout = try { String.fromUtf8(stdoutBytes).trimAscii() } catch (_: Exception) { "" }
-        let stderr = try { String.fromUtf8(stderrBytes).trimAscii() } catch (_: Exception) { "" }
-        if (!stdout.isEmpty()) {
-            try {
-                let obj = JsonValue.fromStr(stdout).asObject()
-                obj.put("exitCode", exitCode.toJsonValue())
-                if (!stderr.isEmpty()) {
-                    obj.put("stderr", JsonString(stderr))
+        gatewayToolInvokeChannelsSend(
+            "message",
+            payload,
+            callRunnerForTest: gatewayMessageToolCallRunnerForTest,
+            cliFallback: Some({ =>
+                let (command, workDir) = this.gatewayMessageBinaryCommand()
+                let args = ["gateway", "call", "channels.send", payload.toJsonString()]
+                let (exitCode, stdoutBytes, stderrBytes) = executeWithOutput(command, args, workingDirectory: workDir)
+                let stdout = try { String.fromUtf8(stdoutBytes).trimAscii() } catch (_: Exception) { "" }
+                let stderr = try { String.fromUtf8(stderrBytes).trimAscii() } catch (_: Exception) { "" }
+                if (!stdout.isEmpty()) {
+                    try {
+                        let obj = JsonValue.fromStr(stdout).asObject()
+                        obj.put("exitCode", exitCode.toJsonValue())
+                        if (!stderr.isEmpty()) {
+                            obj.put("stderr", JsonString(stderr))
+                        }
+                        return obj
+                    } catch (_: Exception) {
+                        ()
+                    }
                 }
-                return obj
-            } catch (_: Exception) {
-                ()
-            }
-        }
-        let out = JsonObject()
-        out.put("ok", JsonBool(exitCode == 0))
-        out.put("exitCode", exitCode.toJsonValue())
-        out.put("stdout", JsonString(stdout))
-        out.put("stderr", JsonString(stderr))
-        return out
+                let out = JsonObject()
+                out.put("ok", JsonBool(exitCode == 0))
+                out.put("exitCode", exitCode.toJsonValue())
+                out.put("stdout", JsonString(stdout))
+                out.put("stderr", JsonString(stderr))
+                out
+            })
+        )
     }
 
     private func jsonBool(obj: JsonObject, key: String, fallback: Bool): Bool {
