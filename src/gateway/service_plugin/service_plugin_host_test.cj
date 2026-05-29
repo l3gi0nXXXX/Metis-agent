@@ -82,9 +82,12 @@ public class ServicePluginHostTest {
     @TestCase
     public func invokeCapabilityReturnsQueuedRedactedPayloadAndLimitErrors(): Unit {
         let _ = registerSample()
+        setServicePluginCapabilityInvokerForTest(Some({ _registration: ServicePluginRegistration, request: CapabilityInvokeRequest =>
+            CapabilityInvokeResult(true, "ok", serviceId: "sample-service", capabilityId: request.capabilityId, payload: redactServicePayload(request.payload).text)
+        }))
         let ok = invokeRegisteredCapability(CapabilityInvokeRequest("sample.monitor.scan_once", payload: "{\"repo\":\"safe\"}"))
         @Expect(ok.ok, true)
-        @Expect(ok.status, "queued")
+        @Expect(ok.status, "ok")
         @Expect(ok.payload.contains("safe"), true)
 
         let secret = invokeRegisteredCapability(CapabilityInvokeRequest("sample.monitor.scan_once", payload: "{\"token\":\"secret\"}"))
@@ -94,6 +97,7 @@ public class ServicePluginHostTest {
         let missing = invokeRegisteredCapability(CapabilityInvokeRequest("missing", payload: "{}"))
         @Expect(missing.ok, false)
         @Expect(missing.status, "capability_missing")
+        setServicePluginCapabilityInvokerForTest(None)
     }
 
     @TestCase
@@ -102,8 +106,8 @@ public class ServicePluginHostTest {
         @Expect(queryServicePluginStatus("sample-service").running, false)
         let started = startServicePlugin("sample-service", context: ServiceStartContext(nowMillis: 7))
         @Expect(started.ok, true)
-        @Expect(started.status, "running")
-        @Expect(queryServicePluginStatus("sample-service").running, true)
+        @Expect(started.status, "registered")
+        @Expect(queryServicePluginStatus("sample-service").running, false)
         let first = started.instanceId
 
         let stopped = stopServicePlugin("sample-service", reason: "test")
@@ -172,8 +176,12 @@ public class ServicePluginHostTest {
         @Expect(status.snapshot.serviceId, "sample-service")
         let start = handleServicePluginControlAction(ServicePluginControlAction("start", serviceId: "sample-service"))
         @Expect(start.ok, true)
+        setServicePluginCapabilityInvokerForTest(Some({ _registration: ServicePluginRegistration, request: CapabilityInvokeRequest =>
+            CapabilityInvokeResult(true, "ok", serviceId: "sample-service", capabilityId: request.capabilityId, payload: "{\"ok\":true,\"status\":\"ok\"}")
+        }))
         let invoke = handleServicePluginControlAction(ServicePluginControlAction("invoke", capabilityId: "sample.monitor.status", payload: "{}"))
         @Expect(invoke.ok, true)
+        setServicePluginCapabilityInvokerForTest(None)
 
         let denied = handleServicePluginControlAction(ServicePluginControlAction("restart", serviceId: "sample-service", caller: CapabilityCaller(isOperator: false)))
         @Expect(denied.ok, false)

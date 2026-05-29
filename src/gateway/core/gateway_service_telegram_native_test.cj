@@ -4,6 +4,7 @@ import metis.core.config.{CliConfig, CliSettingManager, GatewayServicePluginUser
 import metis.core.{GatewaySpeechTtsDashScopeQwenHttpResult, gatewaySubagentCreateRunRecord, gatewaySubagentListRunRecords, gatewaySubagentRunRecordString, setGatewaySpeechTtsDashScopeQwenRunnerForTest}
 import metis.gateway.logging.{gatewayLoggingCaptureConsoleForTest, gatewayLoggingCapturedConsoleForTest, gatewayLoggingResetForTest}
 import metis.gateway.model.{ChannelPolicyConfig, ChannelType, ChatType, InboundMessage, OutboundMessage, SendResult}
+import metis.gateway.service_plugin.{CapabilityInvokeResult, CapabilityInvokeRequest, ServicePluginRegistration, setServicePluginCapabilityInvokerForTest}
 import metis.core.memory.memorySessionStoreForGatewayUser
 
 import magic.core.message.Message
@@ -328,6 +329,21 @@ private func gatewayTelegramNativeGitcodePluginSettings(accountId: String): Gate
     var plugin = GatewayServicePluginUserSettings()
     plugin.pluginId = "gitcode-monitor"
     plugin.enabled = true
+    let manifestPath = CliConfig.dotDir.join("gitcode-monitor-service-plugin.json")
+    File.writeTo(
+        manifestPath,
+        (
+            "{\"schema\":\"metis.servicePlugin.v1\",\"pluginId\":\"gitcode-monitor\",\"kind\":\"service\",\"protocolVersion\":\"1.0\"," +
+            "\"entry\":{\"command\":\"gitcode-monitor\"}," +
+            "\"configSchema\":{}," +
+            "\"capabilityDeclarations\":[" +
+            "{\"capabilityId\":\"gitcode.monitor.status\",\"kind\":\"controlAction\"}," +
+            "{\"capabilityId\":\"gitcode.monitor.scan_once\",\"kind\":\"controlAction\"}" +
+            "]}"
+        ).toArray()
+    )
+    plugin.manifestPath = manifestPath.toString()
+    plugin.grants = ["host.agent.invoke", "host.notification.publish", "host.audit.append"]
     let binding = JsonObject()
     binding.put("accountId", JsonString(accountId))
     binding.put("commandPrefix", JsonString("/gitcode"))
@@ -530,16 +546,58 @@ public class GatewayServiceTelegramNativeTest {
                 user.telegram.allowFrom = ["*"]
                 user.servicePlugins = [gatewayTelegramNativeGitcodePluginSettings("tg-gitcode-monitor")]
                 CliSettingManager.writeGatewaySettings(user)
+                setServicePluginCapabilityInvokerForTest(Some({ _registration: ServicePluginRegistration, request: CapabilityInvokeRequest =>
+                    CapabilityInvokeResult(true, "ok", serviceId: "gitcode-monitor", capabilityId: request.capabilityId, payload: "{\"ok\":true,\"status\":\"running\",\"summary\":\"dryRun=true seen=0\"}")
+                }))
 
                 service.start()
                 adapter.queue("/gitcode status")
                 service.processOnce()
 
                 @Expect(adapter.sentCount(), 1)
-                @Expect(adapter.sentText(0).contains("gitcode enabled=true"), true)
+                @Expect(adapter.sentText(0).contains("GitCode status:"), true)
+                @Expect(adapter.sentText(0).contains("dryRun=true"), true)
                 @Expect(adapter.sentText(0).contains("fake telegram native session answer"), false)
                 @Expect(adapter.sentAccount(0), "tg-gitcode-monitor")
             } finally {
+                setServicePluginCapabilityInvokerForTest(None)
+                service.stop()
+                CliConfig.model = oldModel
+            }
+        }
+    }
+
+    @TestCase
+    public func telegramGitcodeScanOnceReturnsScanSummaryNotQueuedPlaceholder(): Unit {
+        withGatewayTelegramNativeTestHome {
+            let modelName = "metis-test-telegram-gitcode-scan-${DateTime.now().toUnixTimeStamp().toMilliseconds()}"
+            ModelManager.registerChatModel(modelName, { => GatewayTelegramNativeFakeModel() })
+            let oldModel = CliConfig.model
+            CliConfig.model = modelName
+            let adapter = GatewayTelegramNativeTestAdapter()
+            let service = gatewayTelegramNativeServiceForAccount(adapter, "tg-gitcode-monitor")
+            try {
+                var user = GatewayUserSettings()
+                user.telegram.enabled = true
+                user.telegram.allowFrom = ["*"]
+                user.servicePlugins = [gatewayTelegramNativeGitcodePluginSettings("tg-gitcode-monitor")]
+                CliSettingManager.writeGatewaySettings(user)
+                setServicePluginCapabilityInvokerForTest(Some({ _registration: ServicePluginRegistration, request: CapabilityInvokeRequest =>
+                    @Expect(request.capabilityId, "gitcode.monitor.scan_once")
+                    CapabilityInvokeResult(true, "ok", serviceId: "gitcode-monitor", capabilityId: request.capabilityId, payload: "{\"ok\":true,\"status\":\"ok\",\"accepted\":2,\"ignored\":1,\"emitted\":3}")
+                }))
+
+                service.start()
+                adapter.queue("/gitcode scan once")
+                service.processOnce()
+
+                @Expect(adapter.sentCount(), 1)
+                @Expect(adapter.sentText(0), "GitCode scan completed: status=ok accepted=2 ignored=1 emitted=3")
+                @Expect(adapter.sentText(0).contains("status=queued capability="), false)
+                @Expect(adapter.sentText(0).contains("\"accepted\""), false)
+                @Expect(adapter.sentAccount(0), "tg-gitcode-monitor")
+            } finally {
+                setServicePluginCapabilityInvokerForTest(None)
                 service.stop()
                 CliConfig.model = oldModel
             }
