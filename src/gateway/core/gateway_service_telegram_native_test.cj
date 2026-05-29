@@ -605,6 +605,58 @@ public class GatewayServiceTelegramNativeTest {
     }
 
     @TestCase
+    public func telegramGitcodeFailureDoesNotExposeRawJsonDiagnostic(): Unit {
+        withGatewayTelegramNativeTestHome {
+            let modelName = "metis-test-telegram-gitcode-failure-${DateTime.now().toUnixTimeStamp().toMilliseconds()}"
+            ModelManager.registerChatModel(modelName, { => GatewayTelegramNativeFakeModel() })
+            let oldModel = CliConfig.model
+            CliConfig.model = modelName
+            let adapter = GatewayTelegramNativeTestAdapter()
+            let service = gatewayTelegramNativeServiceForAccount(adapter, "tg-gitcode-monitor")
+            try {
+                var user = GatewayUserSettings()
+                user.telegram.enabled = true
+                user.telegram.allowFrom = ["*"]
+                user.servicePlugins = [gatewayTelegramNativeGitcodePluginSettings("tg-gitcode-monitor")]
+                CliSettingManager.writeGatewaySettings(user)
+                let diagnostic = "{ \"ok\": true, \"status\": \"ok\", \"capabilities\": 8 }"
+                setServicePluginCapabilityInvokerForTest(Some({ _registration: ServicePluginRegistration, request: CapabilityInvokeRequest =>
+                    @Expect(request.capabilityId.startsWith("gitcode.monitor."), true)
+                    CapabilityInvokeResult(false, "initialize_failed", serviceId: "gitcode-monitor", capabilityId: request.capabilityId, diagnostic: diagnostic)
+                }))
+
+                service.start()
+                adapter.queue("/gitcode status")
+                service.processOnce()
+                adapter.queue("/gitcode scan once")
+                service.processOnce()
+
+                @Expect(adapter.sentCount(), 2)
+                let statusText = adapter.sentText(0)
+                let scanText = adapter.sentText(1)
+                @Expect(statusText.contains("GitCode status failed:"), true)
+                @Expect(scanText.contains("GitCode scan failed:"), true)
+                @Expect(statusText.contains("{"), false)
+                @Expect(statusText.contains("}"), false)
+                @Expect(statusText.contains("\"ok\""), false)
+                @Expect(statusText.contains("\"status\""), false)
+                @Expect(statusText.contains("\"capabilities\""), false)
+                @Expect(scanText.contains("{"), false)
+                @Expect(scanText.contains("}"), false)
+                @Expect(scanText.contains("\"ok\""), false)
+                @Expect(scanText.contains("\"status\""), false)
+                @Expect(scanText.contains("\"capabilities\""), false)
+                @Expect(adapter.sentAccount(0), "tg-gitcode-monitor")
+                @Expect(adapter.sentAccount(1), "tg-gitcode-monitor")
+            } finally {
+                setServicePluginCapabilityInvokerForTest(None)
+                service.stop()
+                CliConfig.model = oldModel
+            }
+        }
+    }
+
+    @TestCase
     public func telegramGitcodePlainTextFallsBackToAgentSameAccount(): Unit {
         withGatewayTelegramNativeTestHome {
             let modelName = "metis-test-telegram-gitcode-fallback-${DateTime.now().toUnixTimeStamp().toMilliseconds()}"

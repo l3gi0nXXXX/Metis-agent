@@ -338,6 +338,52 @@ public class GatewayServiceFeishuNativeTest {
     }
 
     @TestCase
+    public func feishuGitcodeFailureDoesNotExposeRawJsonDiagnostic(): Unit {
+        withGatewayFeishuNativeTestHome("gitcode-failure", gatewayFeishuNativeTestRoot(), { =>
+            var user = CliSettingManager.readGatewaySettings()
+            user.servicePlugins = [gatewayFeishuNativeGitcodePluginSettings("feishu-gitcode-monitor")]
+            CliSettingManager.writeGatewaySettings(user)
+
+            let adapter = GatewayFeishuNativeTestAdapter(accountId: "feishu-gitcode-monitor")
+            let service = gatewayFeishuNativeService(adapter, enableGroup: false, accountId: "feishu-gitcode-monitor")
+            service.start()
+            try {
+                let diagnostic = "{ \"ok\": true, \"status\": \"ok\", \"capabilities\": 8 }"
+                setServicePluginCapabilityInvokerForTest(Some({ _registration: ServicePluginRegistration, request: CapabilityInvokeRequest =>
+                    @Expect(request.capabilityId.startsWith("gitcode.monitor."), true)
+                    CapabilityInvokeResult(false, "initialize_failed", serviceId: "gitcode-monitor", capabilityId: request.capabilityId, diagnostic: diagnostic)
+                }))
+
+                adapter.queueDirect("/gitcode status")
+                service.processOnce()
+                adapter.queueDirect("/gitcode scan once")
+                service.processOnce()
+
+                @Expect(adapter.sentCount(), 2)
+                let statusText = adapter.sentText(0)
+                let scanText = adapter.sentText(1)
+                @Expect(statusText.contains("GitCode status failed:"), true)
+                @Expect(scanText.contains("GitCode scan failed:"), true)
+                @Expect(statusText.contains("{"), false)
+                @Expect(statusText.contains("}"), false)
+                @Expect(statusText.contains("\"ok\""), false)
+                @Expect(statusText.contains("\"status\""), false)
+                @Expect(statusText.contains("\"capabilities\""), false)
+                @Expect(scanText.contains("{"), false)
+                @Expect(scanText.contains("}"), false)
+                @Expect(scanText.contains("\"ok\""), false)
+                @Expect(scanText.contains("\"status\""), false)
+                @Expect(scanText.contains("\"capabilities\""), false)
+                @Expect(adapter.sentAccount(0), "feishu-gitcode-monitor")
+                @Expect(adapter.sentAccount(1), "feishu-gitcode-monitor")
+            } finally {
+                setServicePluginCapabilityInvokerForTest(None)
+                service.stop()
+            }
+        })
+    }
+
+    @TestCase
     public func feishuGitcodeManifestMissingReturnsDegradedReply(): Unit {
         withGatewayFeishuNativeTestHome("gitcode-manifest-missing", gatewayFeishuNativeTestRoot(), { =>
             var user = CliSettingManager.readGatewaySettings()
