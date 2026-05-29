@@ -462,7 +462,7 @@ public class GatewayChannelManager {
     private var started = false
 
     public init(startupAccountTimeoutMs!: Int64 = 3000) {
-        this.startupAccountTimeoutMs = if (startupAccountTimeoutMs > 0) { startupAccountTimeoutMs } else { 3000 }
+        this.startupAccountTimeoutMs = if (startupAccountTimeoutMs >= 0) { startupAccountTimeoutMs } else { 3000 }
     }
 
     private func timingNowMs(): Int64 {
@@ -1084,6 +1084,53 @@ public class GatewayChannelManager {
 
     private func startEntry(entry: GatewayRegisteredAdapter): JsonObject {
         let entryStartMs = this.timingNowMs()
+        if (!entry.enabled) {
+            this.updateLiveAccount(entry.channelId, entry.accountId, { state =>
+                state.configured = entry.configured
+                state.running = false
+                state.connected = false
+                state.lastError = "disabled"
+            })
+            gatewayChannelRuntimeMarkStopped(entry.channelId, accountId: entry.accountId, reason: "disabled", manualStop: false)
+            gatewayLogEventInfo(
+                "gateway/channel/${entry.channelId}",
+                "channel.starting",
+                "channel account start skipped",
+                meta: gatewayLogMeta()
+                    .string("channel", entry.channelId)
+                    .string("accountId", entry.accountId)
+                    .string("phase", "start")
+                    .string("status", "skipped")
+                    .string("reason", "disabled")
+                    .object()
+            )
+            this.timingLog("skip-disabled", entryStartMs, channelId: entry.channelId, accountId: entry.accountId)
+            return this.startupOutcome(entry, "skipped", errorKind: "disabled", error: "disabled", startMs: entryStartMs)
+        }
+        if (!entry.configured) {
+            this.updateLiveAccount(entry.channelId, entry.accountId, { state =>
+                state.configured = false
+                state.running = false
+                state.connected = false
+                state.lastError = "account-not-configured"
+            })
+            gatewayChannelRuntimeMarkFailure(entry.channelId, accountId: entry.accountId, lifecycleState: "failed", error: "account-not-configured", errorKind: "account_not_configured")
+            gatewayLogEventError(
+                "gateway/channel/${entry.channelId}",
+                "channel.failed",
+                "channel account start skipped because account is not configured",
+                meta: gatewayLogMeta()
+                    .string("channel", entry.channelId)
+                    .string("accountId", entry.accountId)
+                    .string("phase", "start")
+                    .string("status", "failed")
+                    .string("errorKind", "account_not_configured")
+                    .rawString("error", "account-not-configured")
+                    .object()
+            )
+            this.timingLog("skip-not-configured", entryStartMs, channelId: entry.channelId, accountId: entry.accountId)
+            return this.startupOutcome(entry, "failed", errorKind: "account_not_configured", error: "account-not-configured", startMs: entryStartMs)
+        }
         if (!gatewayChannelRuntimeCanStart(entry.channelId, accountId: entry.accountId)) {
             gatewayLogEventInfo(
                 "gateway/channel/${entry.channelId}",
