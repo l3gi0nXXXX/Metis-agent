@@ -73,6 +73,10 @@ public func registerConfiguredServicePlugins(user: GatewayUserSettings): Unit {
             servicePluginConfigLog("service_plugin.skipped", pluginId, "disabled", errorKind: "plugin_disabled")
             continue
         }
+        if (getServicePluginSnapshot(pluginId).isSome()) {
+            servicePluginConfigLog("service_plugin.registered", pluginId, "registered")
+            continue
+        }
         let manifestPath = plugin.manifestPath.trimAscii()
         if (manifestPath.isEmpty()) {
             servicePluginConfigLog("service_plugin.skipped", pluginId, "configured", errorKind: "manifest_not_required")
@@ -86,7 +90,11 @@ public func registerConfiguredServicePlugins(user: GatewayUserSettings): Unit {
         let result = registerServicePlugin(
             ServicePluginRegistration(
                 loaded.manifest,
-                configRef: ServicePluginConfigRef(configPath: plugin.configRef),
+                configRef: ServicePluginConfigRef(
+                    configPath: plugin.configRef,
+                    manifestPath: manifestPath,
+                    workingDirectory: Path(manifestPath).parent.toString()
+                ),
                 enabled: plugin.enabled,
                 grants: plugin.grants
             )
