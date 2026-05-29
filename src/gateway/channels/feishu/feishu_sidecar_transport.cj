@@ -7,7 +7,7 @@ import std.env.getVariables
 import std.fs.Path
 import std.io.*
 import std.process.*
-import std.sync.Mutex
+import std.sync.*
 import std.time.*
 import stdx.encoding.json.{JsonInt, JsonObject, JsonString, JsonValue}
 
@@ -154,25 +154,154 @@ public class FeishuSidecarNotConfiguredRunner <: FeishuSidecarProtocolRunner {
     }
 }
 
+private let FEISHU_SIDECAR_STDIO_MAX_QUEUED_LINES: Int64 = 256
+private let FEISHU_SIDECAR_STDIO_SUMMARY_LINES: Int64 = 16
+private let FEISHU_SIDECAR_STDIO_MAX_LINE_CHARS: Int64 = 1048576
+
+public class FeishuSidecarLineBuffer {
+    private let lock = Mutex()
+    private let condition: Condition
+    private let name: String
+    private let maxLines: Int64
+    private let maxSummaryLines: Int64
+    private let maxLineChars: Int64
+    private let lines = ArrayList<String>()
+    private let summaryLines = ArrayList<String>()
+    private var closed = false
+    private var lastErrorText = ""
+    private var dropped: Int64 = 0
+
+    public init(
+        name!: String = "stdio",
+        maxLines!: Int64 = FEISHU_SIDECAR_STDIO_MAX_QUEUED_LINES,
+        maxLineChars!: Int64 = FEISHU_SIDECAR_STDIO_MAX_LINE_CHARS,
+        maxSummaryLines!: Int64 = FEISHU_SIDECAR_STDIO_SUMMARY_LINES
+    ) {
+        let normalizedName = name.trimAscii()
+        this.name = if (normalizedName.isEmpty()) { "stdio" } else { normalizedName }
+        this.maxLines = if (maxLines > 0) { maxLines } else { 1 }
+        this.maxLineChars = if (maxLineChars > 0) { maxLineChars } else { FEISHU_SIDECAR_STDIO_MAX_LINE_CHARS }
+        this.maxSummaryLines = if (maxSummaryLines > 0) { maxSummaryLines } else { FEISHU_SIDECAR_STDIO_SUMMARY_LINES }
+        synchronized(this.lock) {
+            this.condition = this.lock.condition()
+        }
+    }
+
+    public func appendLine(line: String): Unit {
+        synchronized(this.lock) {
+            if (this.closed) {
+                return
+            }
+            if (line.size > this.maxLineChars) {
+                this.dropped += 1
+                this.rememberSummaryLocked("${this.name} dropped oversized line chars=${line.size} max=${this.maxLineChars}")
+                return
+            }
+            while (this.lines.size >= this.maxLines) {
+                this.lines.remove(at: 0)
+                this.dropped += 1
+            }
+            this.lines.add(line)
+            this.rememberSummaryLocked(line)
+            this.condition.notifyAll()
+        }
+    }
+
+    public func readLine(timeoutMs: Int64): Option<String> {
+        let effectiveTimeoutMs = if (timeoutMs > 0) { timeoutMs } else { 250 }
+        synchronized(this.lock) {
+            if (this.lines.isEmpty() && !this.closed) {
+                let _ = this.condition.waitUntil(
+                    { => !this.lines.isEmpty() || this.closed },
+                    timeout: Duration.millisecond * effectiveTimeoutMs
+                )
+            }
+            if (this.lines.isEmpty()) {
+                return None<String>
+            }
+            let line = this.lines[0]
+            this.lines.remove(at: 0)
+            Some(line)
+        }
+    }
+
+    public func close(error!: String = ""): Unit {
+        synchronized(this.lock) {
+            if (!this.closed) {
+                this.closed = true
+                this.lastErrorText = error.trimAscii()
+            } else if (this.lastErrorText.isEmpty()) {
+                this.lastErrorText = error.trimAscii()
+            }
+            this.condition.notifyAll()
+        }
+    }
+
+    public func droppedCount(): Int64 {
+        synchronized(this.lock) {
+            this.dropped
+        }
+    }
+
+    public func lastError(): String {
+        synchronized(this.lock) {
+            this.lastErrorText
+        }
+    }
+
+    public func summary(): String {
+        synchronized(this.lock) {
+            let parts = ArrayList<String>()
+            if (this.dropped > 0) {
+                parts.add("${this.name} dropped=${this.dropped}")
+            }
+            if (!this.lastErrorText.isEmpty()) {
+                parts.add("${this.name} error=${this.lastErrorText}")
+            }
+            let text = String.join(this.summaryLines.toArray(), delimiter: "\n")
+            if (!text.isEmpty()) {
+                parts.add(text)
+            }
+            feishuSidecarSummarizeText(String.join(parts.toArray(), delimiter: "\n"))
+        }
+    }
+
+    private func rememberSummaryLocked(line: String): Unit {
+        this.summaryLines.add(line)
+        while (this.summaryLines.size > this.maxSummaryLines) {
+            this.summaryLines.remove(at: 0)
+        }
+    }
+}
+
 public class FeishuSidecarStdioProcess <: FeishuSidecarProtocolProcess {
     private let process: SubProcess
-    private let reader: StringReader<InputStream>
     private let writer: StringWriter<OutputStream>
-    private let outputLock = Mutex()
-    private let stdoutLines = ArrayList<String>()
-    private var stderrText = ""
+    private let stateLock = Mutex()
+    private let stdoutBuffer = FeishuSidecarLineBuffer(
+        name: "stdout",
+        maxLines: FEISHU_SIDECAR_STDIO_MAX_QUEUED_LINES,
+        maxLineChars: FEISHU_SIDECAR_STDIO_MAX_LINE_CHARS,
+        maxSummaryLines: FEISHU_SIDECAR_STDIO_SUMMARY_LINES
+    )
+    private let stderrBuffer = FeishuSidecarLineBuffer(
+        name: "stderr",
+        maxLines: FEISHU_SIDECAR_STDIO_SUMMARY_LINES,
+        maxLineChars: FEISHU_SIDECAR_STDIO_MAX_LINE_CHARS,
+        maxSummaryLines: FEISHU_SIDECAR_STDIO_SUMMARY_LINES
+    )
     private var closed = false
 
     public init(process: SubProcess) {
         this.process = process
-        this.reader = StringReader<InputStream>(process.stdOutPipe)
         this.writer = StringWriter(process.stdInPipe)
+        let stdoutReader = StringReader<InputStream>(process.stdOutPipe)
+        let stderrReader = StringReader<InputStream>(process.stdErrPipe)
         spawn {
-            let stderrReader = StringReader<InputStream>(process.stdErrPipe)
-            let text = try { stderrReader.readToEnd() } catch (_: Exception) { "" }
-            synchronized(this.outputLock) {
-                this.stderrText = text
-            }
+            this.readPipeLines(stdoutReader, this.stdoutBuffer)
+        }
+        spawn {
+            this.readPipeLines(stderrReader, this.stderrBuffer)
         }
     }
 
@@ -186,66 +315,64 @@ public class FeishuSidecarStdioProcess <: FeishuSidecarProtocolProcess {
     }
 
     public func readLine(timeoutMs: Int64): Option<String> {
-        if (this.closed) {
-            return None<String>
-        }
-        let effectiveTimeoutMs = if (timeoutMs > 0) { timeoutMs } else { 250 }
-        let fut = spawn {
-            try { this.reader.readln() } catch (_: Exception) { None<String> }
-        }
-        let watchdog = spawn {
-            sleep(Duration.millisecond * effectiveTimeoutMs)
-            fut.cancel()
-        }
-        try {
-            let line = fut.get()
-            watchdog.cancel()
-            match (line) {
-                case Some(value) => this.rememberStdout(value)
-                case None => ()
-            }
-            line
-        } catch (_: Exception) {
-            try { watchdog.cancel() } catch (_e: Exception) { () }
-            None<String>
-        }
+        this.stdoutBuffer.readLine(timeoutMs)
     }
 
     public func isAlive(): Bool {
-        !this.closed && this.process.isAlive()
+        !this.isClosed() && this.process.isAlive()
     }
 
     public func wait(timeoutMs: Int64): Option<Int64> {
         try {
-            Some(this.process.wait(timeout: Some(Duration.millisecond * if (timeoutMs > 0) { timeoutMs } else { 500 })))
+            let result = this.process.wait(timeout: Some(Duration.millisecond * if (timeoutMs > 0) { timeoutMs } else { 500 }))
+            this.closeBuffers("")
+            Some(result)
         } catch (_: Exception) {
             None<Int64>
         }
     }
 
     public func terminate(force: Bool): Unit {
-        this.closed = true
+        this.closeBuffers("terminated")
         try { this.process.terminate(force: force) } catch (_: Exception) { () }
     }
 
     public func stdoutSummary(): String {
-        synchronized(this.outputLock) {
-            feishuSidecarSummarizeText(String.join(this.stdoutLines.toArray(), delimiter: "\n"))
-        }
+        this.stdoutBuffer.summary()
     }
 
     public func stderrSummary(): String {
-        synchronized(this.outputLock) {
-            feishuSidecarSummarizeText(this.stderrText)
+        this.stderrBuffer.summary()
+    }
+
+    private func readPipeLines(reader: StringReader<InputStream>, buffer: FeishuSidecarLineBuffer): Unit {
+        while (!this.isClosed()) {
+            let line = try {
+                reader.readln()
+            } catch (e: Exception) {
+                buffer.close(error: "read failed: ${e.message}")
+                return
+            }
+            match (line) {
+                case Some(value) => buffer.appendLine(value)
+                case None =>
+                    buffer.close()
+                    return
+            }
         }
     }
 
-    private func rememberStdout(line: String): Unit {
-        synchronized(this.outputLock) {
-            this.stdoutLines.add(line)
-            while (this.stdoutLines.size > 16) {
-                this.stdoutLines.remove(at: 0)
-            }
+    private func closeBuffers(reason: String): Unit {
+        synchronized(this.stateLock) {
+            this.closed = true
+        }
+        this.stdoutBuffer.close(error: reason)
+        this.stderrBuffer.close(error: reason)
+    }
+
+    private func isClosed(): Bool {
+        synchronized(this.stateLock) {
+            this.closed
         }
     }
 }
@@ -433,7 +560,6 @@ public class FeishuSidecarTransport <: FeishuLongConnectTransport {
                         this.recordFailure("start", "unexpected_exit", error)
                         return FeishuLongConnectStartResult(ok: false, status: "unexpected_exit", error: error)
                     }
-                    break
             }
         }
         let error = this.processError("sidecar ready timeout", proc)

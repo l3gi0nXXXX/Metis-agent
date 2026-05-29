@@ -2,6 +2,7 @@ package metis.gateway.channels.feishu
 
 import std.collection.ArrayList
 import std.core.Duration
+import std.process.*
 import std.sync.Mutex
 import std.unittest.testmacro.*
 import stdx.encoding.json.{JsonObject, JsonString}
@@ -137,6 +138,85 @@ public class FeishuSidecarTransportTest {
 
     private func delayedStdioScript(): String {
         "read ignored; printf '%s\\n' '{\"type\":\"ready\",\"accountId\":\"tenant-a\",\"transport\":\"websocket\"}'; sleep 0.35; printf '%s\\n' '{\"type\":\"inbound\",\"accountId\":\"tenant-a\",\"eventType\":\"im.message.receive_v1\",\"event\":{\"message\":{\"message_id\":\"om_delayed_stdio\"}}}'; sleep 0.2"
+    }
+
+    private func delayedPlainLineScript(): String {
+        "read ignored; printf '%s\\n' 'line-after-timeouts'; sleep 0.2"
+    }
+
+    private func stderrBurstScript(): String {
+        "for i in {0..129}; do printf 'stderr-line-%s\\n' \"$i\" >&2; done; sleep 0.8"
+    }
+
+    private func startStdioScript(script: String): FeishuSidecarProtocolProcess {
+        match (FeishuSidecarStdioRunner().start(FeishuSidecarLaunchSpec(command: "/bin/zsh", args: ["-lc", script]))) {
+            case FeishuSidecarProtocolStartResult.Started(proc) => proc
+            case FeishuSidecarProtocolStartResult.Failed(reason) => throw Exception(reason)
+        }
+    }
+
+    @TestCase
+    public func lineBufferReturnsQueuedLineWithoutReaderSpawn(): Unit {
+        let buffer = FeishuSidecarLineBuffer(name: "stdout", maxLines: 4, maxLineChars: 1024)
+
+        buffer.appendLine("queued-line")
+
+        @Expect(buffer.readLine(30000).getOrThrow(), "queued-line")
+        @Expect(buffer.readLine(1).isNone(), true)
+        @Expect(buffer.droppedCount(), 0)
+    }
+
+    @TestCase
+    public func readLineTimeoutDoesNotSpawnUnboundedReaders(): Unit {
+        let process = this.startStdioScript(this.delayedPlainLineScript())
+
+        for (_ in 0..100) {
+            @Expect(process.readLine(1).isNone(), true)
+        }
+        process.writeLine("go")
+
+        @Expect(process.readLine(1000).getOrThrow(), "line-after-timeouts")
+        process.terminate(true)
+    }
+
+    @TestCase
+    public func stderrReaderUsesBoundedRingBuffer(): Unit {
+        let process = this.startStdioScript(this.stderrBurstScript())
+        sleep(Duration.millisecond * 300)
+
+        let summary = process.stderrSummary()
+
+        @Expect(summary.contains("stderr-line-129"), true)
+        @Expect(summary.contains("stderr-line-0"), false)
+        @Expect(Int64(summary.size) < 4096, true)
+        process.terminate(true)
+    }
+
+    @TestCase
+    public func closeWakesPendingReadLine(): Unit {
+        let buffer = FeishuSidecarLineBuffer(name: "stdout", maxLines: 4, maxLineChars: 1024)
+        let pending = spawn {
+            buffer.readLine(30000)
+        }
+        sleep(Duration.millisecond * 50)
+
+        buffer.close(error: "closed for test")
+
+        @Expect(pending.get(Duration.millisecond * 500).isNone(), true)
+        @Expect(buffer.lastError(), "closed for test")
+    }
+
+    @TestCase
+    public func oversizedLineIsDroppedWithDiagnostic(): Unit {
+        let buffer = FeishuSidecarLineBuffer(name: "stdout", maxLines: 4, maxLineChars: 8)
+
+        buffer.appendLine("0123456789")
+        buffer.appendLine("ok")
+
+        @Expect(buffer.readLine(1).getOrThrow(), "ok")
+        @Expect(buffer.droppedCount(), 1)
+        @Expect(buffer.summary().contains("dropped=1"), true)
+        @Expect(buffer.summary().contains("0123456789"), false)
     }
 
     @TestCase
