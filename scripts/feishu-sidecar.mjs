@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import { Buffer } from "node:buffer";
 import fs from "node:fs";
 import { createRequire } from "node:module";
@@ -25,40 +26,129 @@ const WITHDRAWN_REPLY_ERROR_CODES = new Set([230011, 231003]);
 const SENSITIVE_ARG = /^(?:--)?(?:app[-_]?secret|verification[-_]?token|encrypt[-_]?key)$/i;
 
 let state = {
-  initialized: false,
   closing: false,
-  accountId: "default",
-  sdk: null,
-  runtimeRoot: "",
-  client: null,
-  wsClient: null,
-  eventDispatcher: null,
-  seenEventIds: new Set(),
+  accounts: new Map(),
 };
+const accountContext = new AsyncLocalStorage();
 
 installConsoleStderrPatch({ prefix: PREFIX });
+
+function normalizeAccountId(value) {
+  return String(value ?? "default").trim() || "default";
+}
+
+function createAccountState(accountId, frame = {}) {
+  return {
+    accountId,
+    appId: String(frame.appId ?? ""),
+    sdk: null,
+    runtimeRoot: "",
+    client: null,
+    wsClient: null,
+    eventDispatcher: null,
+    seenEventIds: new Set(),
+    ready: false,
+    connected: false,
+    lastError: null,
+    closing: false,
+  };
+}
+
+function currentAccount() {
+  return accountContext.getStore() ?? onlyAccount();
+}
+
+function withAccount(account, fn) {
+  return accountContext.run(account, fn);
+}
+
+function hasReadyAccount() {
+  return [...state.accounts.values()].some((account) => account.ready);
+}
+
+function onlyAccount() {
+  return state.accounts.size === 1 ? state.accounts.values().next().value : null;
+}
+
+function resolveFrameAccountId(frame) {
+  if (frame && Object.prototype.hasOwnProperty.call(frame, "accountId")) {
+    return normalizeAccountId(frame.accountId);
+  }
+  return onlyAccount()?.accountId ?? "default";
+}
+
+function accountIdOf(accountOrId) {
+  if (accountOrId && typeof accountOrId === "object") {
+    return normalizeAccountId(accountOrId.accountId);
+  }
+  return normalizeAccountId(accountOrId);
+}
+
+for (const key of ["sdk", "runtimeRoot", "client", "wsClient", "eventDispatcher", "seenEventIds"]) {
+  Object.defineProperty(state, key, {
+    get() {
+      return currentAccount()?.[key] ?? (key === "seenEventIds" ? new Set() : null);
+    },
+    set(value) {
+      const account = currentAccount();
+      if (account) {
+        account[key] = value;
+      }
+    },
+  });
+}
+
+Object.defineProperty(state, "accountId", {
+  get() {
+    return currentAccount()?.accountId ?? "default";
+  },
+});
+
+Object.defineProperty(state, "initialized", {
+  get() {
+    return Boolean(currentAccount()?.ready);
+  },
+  set(value) {
+    const account = currentAccount();
+    if (account) {
+      account.ready = Boolean(value);
+    }
+  },
+});
 
 function emitProtocol(frame) {
   writeProtocol(frame);
 }
 
-function emitDiagnostic(level, phase, message, meta = {}) {
+function emitDiagnostic(accountOrId, level, phase, message, meta = {}) {
+  if (["debug", "info", "warn", "error"].includes(String(accountOrId))) {
+    meta = message ?? {};
+    message = phase;
+    phase = level;
+    level = accountOrId;
+    accountOrId = currentAccount() ?? "default";
+  }
+  const accountId = accountIdOf(accountOrId);
   const frame = {
     type: "diagnostic",
     level,
     phase,
-    accountId: state.accountId,
+    accountId,
     message,
     ...meta,
   };
   emitProtocol(frame);
-  writeDiagnostic(level, message, { phase, accountId: state.accountId, ...meta }, { prefix: PREFIX });
+  writeDiagnostic(level, message, { phase, accountId, ...meta }, { prefix: PREFIX });
 }
 
-function emitError(params) {
+function emitError(accountOrId, params) {
+  if (params === undefined) {
+    params = accountOrId;
+    accountOrId = currentAccount() ?? "default";
+  }
   emitProtocol({
     type: "error",
-    accountId: state.accountId,
+    accountId: accountIdOf(accountOrId),
     phase: params.phase,
     status: params.status ?? "error",
     errorKind: params.errorKind,
@@ -229,168 +319,195 @@ function websocketStatusMeta() {
   }
 }
 
-async function initialize(frame) {
-  if (state.initialized) {
-    emitError({ phase: "init", status: "already_initialized", message: "Feishu sidecar is already initialized" });
+async function initialize(frame, options = {}) {
+  const legacy = options.legacy === true;
+  const phase = legacy ? "init" : "initAccount";
+  const accountId = normalizeAccountId(frame.accountId);
+  if (state.accounts.has(accountId)) {
+    emitError(accountId, {
+      phase,
+      status: legacy ? "already_initialized" : "conflict",
+      message: `Feishu sidecar account ${accountId} is already initialized`,
+    });
     return;
   }
-  state.accountId = String(frame.accountId ?? "default").trim() || "default";
+
+  const account = createAccountState(accountId, frame);
+  state.accounts.set(accountId, account);
   addKnownSecrets([frame.appSecret, frame.verificationToken, frame.encryptKey]);
   const mode = String(frame.mode ?? "websocket").trim().toLowerCase();
   const apiMode = mode === "api" || mode === "rest" || mode === "request";
   if (!frame.appId || !frame.appSecret) {
-    emitError({ phase: "init", status: "invalid_init", message: "Feishu init requires appId and appSecret" });
-    exitSoon(1);
+    emitError(account, { phase, status: "invalid_init", message: "Feishu init requires appId and appSecret" });
+    state.accounts.delete(accountId);
+    if (legacy) {
+      exitSoon(1);
+    }
     return;
   }
-  try {
-    state.runtimeRoot = resolveSidecarRuntimeRoot(frame);
-    const sdk = process.env.METIS_FEISHU_SIDECAR_SDK?.trim()
-      ? await loadSdk()
-      : loadRuntimeModules(state.runtimeRoot).sdk;
-    state.sdk = sdk;
-    const domain = resolveDomain(sdk, frame.domain);
-    const proxy = getProxyConfig();
-    const proxyAgent = await createProxyAgent(sdk, proxy.url, state.runtimeRoot);
+  return withAccount(account, async () => {
+    try {
+      account.runtimeRoot = resolveSidecarRuntimeRoot(frame);
+      const sdk = process.env.METIS_FEISHU_SIDECAR_SDK?.trim()
+        ? await loadSdk()
+        : loadRuntimeModules(account.runtimeRoot).sdk;
+      account.sdk = sdk;
+      const domain = resolveDomain(sdk, frame.domain);
+      const proxy = getProxyConfig();
+      const proxyAgent = await createProxyAgent(sdk, proxy.url, account.runtimeRoot);
 
-    emitDiagnostic("info", "dependency.preflight", "Feishu sidecar dependencies resolved", {
-      status: "ok",
-      runtimeRoot: state.runtimeRoot,
-      sdk: "@larksuiteoapi/node-sdk",
-      proxyAgent: "https-proxy-agent",
-    });
-
-    let readySettled = false;
-    let resolveReady;
-    let rejectReady;
-    const readyPromise = new Promise((resolve, reject) => {
-      resolveReady = resolve;
-      rejectReady = reject;
-    });
-    const resolveReadyOnce = () => {
-      if (readySettled) {
-        return;
-      }
-      readySettled = true;
-      resolveReady();
-    };
-    const rejectReadyOnce = (error) => {
-      if (readySettled) {
-        return;
-      }
-      readySettled = true;
-      rejectReady(error);
-    };
-    const lifecycle = {
-      onReady: () => {
-        emitDiagnostic("info", "websocket.open", "Feishu WebSocket client connected", {
-          status: "connected",
-          ...websocketStatusMeta(),
-        });
-        resolveReadyOnce();
-      },
-      onError: (error) => {
-        const message = sidecarErrorMessage(error);
-        emitDiagnostic("error", "websocket.error", message, {
-          status: "failed",
-          ...websocketStatusMeta(),
-        });
-        rejectReadyOnce(error instanceof Error ? error : new Error(message));
-      },
-      onReconnecting: () => {
-        emitDiagnostic("warn", "websocket.reconnecting", "Feishu WebSocket client reconnecting", {
-          status: "reconnecting",
-          ...websocketStatusMeta(),
-        });
-      },
-      onReconnected: () => {
-        emitDiagnostic("info", "websocket.reconnected", "Feishu WebSocket client reconnected", {
-          status: "connected",
-          ...websocketStatusMeta(),
-        });
-      },
-    };
-
-    state.client = new sdk.Client({
-      appId: frame.appId,
-      appSecret: frame.appSecret,
-      appType: sdk.AppType?.SelfBuild,
-      domain,
-    });
-    if (apiMode) {
-      state.initialized = true;
-      emitDiagnostic("info", "api.start", "Feishu REST API client ready", {
+      emitDiagnostic("info", "dependency.preflight", "Feishu sidecar dependencies resolved", {
         status: "ok",
+        runtimeRoot: account.runtimeRoot,
+        sdk: "@larksuiteoapi/node-sdk",
+        proxyAgent: "https-proxy-agent",
+      });
+
+      let readySettled = false;
+      let resolveReady;
+      let rejectReady;
+      const readyPromise = new Promise((resolve, reject) => {
+        resolveReady = resolve;
+        rejectReady = reject;
+      });
+      const resolveReadyOnce = () => {
+        if (readySettled) {
+          return;
+        }
+        readySettled = true;
+        resolveReady();
+      };
+      const rejectReadyOnce = (error) => {
+        if (readySettled) {
+          return;
+        }
+        readySettled = true;
+        rejectReady(error);
+      };
+      const lifecycle = {
+        onReady: () => withAccount(account, () => {
+          account.connected = true;
+          emitDiagnostic("info", "websocket.open", "Feishu WebSocket client connected", {
+            status: "connected",
+            ...websocketStatusMeta(),
+          });
+          resolveReadyOnce();
+        }),
+        onError: (error) => withAccount(account, () => {
+          const message = sidecarErrorMessage(error);
+          account.connected = false;
+          account.lastError = error;
+          emitDiagnostic("error", "websocket.error", message, {
+            status: "failed",
+            ...websocketStatusMeta(),
+          });
+          rejectReadyOnce(error instanceof Error ? error : new Error(message));
+        }),
+        onReconnecting: () => withAccount(account, () => {
+          account.connected = false;
+          emitDiagnostic("warn", "websocket.reconnecting", "Feishu WebSocket client reconnecting", {
+            status: "reconnecting",
+            ...websocketStatusMeta(),
+          });
+        }),
+        onReconnected: () => withAccount(account, () => {
+          account.connected = true;
+          emitDiagnostic("info", "websocket.reconnected", "Feishu WebSocket client reconnected", {
+            status: "connected",
+            ...websocketStatusMeta(),
+          });
+        }),
+      };
+
+      account.client = new sdk.Client({
+        appId: frame.appId,
+        appSecret: frame.appSecret,
+        appType: sdk.AppType?.SelfBuild,
+        domain,
+      });
+      if (apiMode) {
+        account.ready = true;
+        account.connected = true;
+        emitDiagnostic("info", "api.start", "Feishu REST API client ready", {
+          status: "ok",
+        });
+        emitProtocol({
+          type: "ready",
+          accountId,
+          transport: "api",
+          sdk: "@larksuiteoapi/node-sdk",
+          runtimeRoot: account.runtimeRoot,
+          proxy: proxy.summary,
+          domain: String(frame.domain ?? "feishu"),
+        });
+        return;
+      }
+      account.eventDispatcher = new sdk.EventDispatcher({
+        encryptKey: frame.encryptKey,
+        verificationToken: frame.verificationToken,
+      });
+      registerEventHandlers(account, account.eventDispatcher);
+      account.wsClient = new sdk.WSClient({
+        appId: frame.appId,
+        appSecret: frame.appSecret,
+        domain,
+        loggerLevel: sdk.LoggerLevel?.info,
+        ...lifecycle,
+        ...(proxyAgent ? { agent: proxyAgent } : {}),
+      });
+      attachWsLifecycleHandlers(account, account.wsClient);
+
+      const startResult = account.wsClient.start({ eventDispatcher: account.eventDispatcher });
+      if (startResult && typeof startResult.then === "function") {
+        startResult.catch((error) => rejectReadyOnce(error));
+      }
+      await withTimeout(readyPromise, readyTimeoutMs(frame));
+      account.ready = true;
+      emitDiagnostic("info", "websocket.start", "Feishu WebSocket client started", {
+        status: "ok",
+        ...websocketStatusMeta(),
       });
       emitProtocol({
         type: "ready",
-        accountId: state.accountId,
-        transport: "api",
+        accountId,
+        transport: "websocket",
         sdk: "@larksuiteoapi/node-sdk",
-        runtimeRoot: state.runtimeRoot,
+        runtimeRoot: account.runtimeRoot,
         proxy: proxy.summary,
         domain: String(frame.domain ?? "feishu"),
       });
-      return;
-    }
-    state.eventDispatcher = new sdk.EventDispatcher({
-      encryptKey: frame.encryptKey,
-      verificationToken: frame.verificationToken,
-    });
-    registerEventHandlers(state.eventDispatcher);
-    state.wsClient = new sdk.WSClient({
-      appId: frame.appId,
-      appSecret: frame.appSecret,
-      domain,
-      loggerLevel: sdk.LoggerLevel?.info,
-      ...lifecycle,
-      ...(proxyAgent ? { agent: proxyAgent } : {}),
-    });
-    attachWsLifecycleHandlers(state.wsClient);
-
-    const startResult = state.wsClient.start({ eventDispatcher: state.eventDispatcher });
-    if (startResult && typeof startResult.then === "function") {
-      startResult.catch((error) => rejectReadyOnce(error));
-    }
-    await withTimeout(readyPromise, readyTimeoutMs(frame));
-    state.initialized = true;
-    emitDiagnostic("info", "websocket.start", "Feishu WebSocket client started", {
-      status: "ok",
-      ...websocketStatusMeta(),
-    });
-    emitProtocol({
-      type: "ready",
-      accountId: state.accountId,
-      transport: "websocket",
-      sdk: "@larksuiteoapi/node-sdk",
-      runtimeRoot: state.runtimeRoot,
-      proxy: proxy.summary,
-      domain: String(frame.domain ?? "feishu"),
-    });
-  } catch (error) {
-    if (error?.phase === "dependency.preflight") {
-      emitError({
-        phase: "dependency.preflight",
-        status: error.status ?? "missing_dependency",
-        message: error.message,
-        runtimeRoot: error.runtimeRoot,
-        missingPackage: error.missingPackage,
+    } catch (error) {
+      account.lastError = error;
+      if (error?.phase === "dependency.preflight") {
+        emitError(account, {
+          phase: "dependency.preflight",
+          status: error.status ?? "missing_dependency",
+          message: error.message,
+          runtimeRoot: error.runtimeRoot,
+          missingPackage: error.missingPackage,
+        });
+        state.accounts.delete(accountId);
+        if (legacy) {
+          exitSoon(1);
+        }
+        return;
+      }
+      const status = error?.status ?? "start_failed";
+      emitError(account, {
+        phase: "websocket.start",
+        status,
+        message: error?.message ?? String(error),
       });
-      exitSoon(1);
-      return;
+      await closeSidecar(status);
+      state.accounts.delete(accountId);
+      if (legacy) {
+        exitSoon(1);
+      }
     }
-    const status = error?.status ?? "start_failed";
-    emitError({
-      phase: "websocket.start",
-      status,
-      message: error?.message ?? String(error),
-    });
-    await closeSidecar(status);
-    exitSoon(1);
-  }
+  });
 }
 
-function attachWsLifecycleHandlers(wsClient) {
+function attachWsLifecycleHandlers(account, wsClient) {
   if (!wsClient || typeof wsClient !== "object") {
     return;
   }
@@ -400,23 +517,27 @@ function attachWsLifecycleHandlers(wsClient) {
     return;
   }
   const handleClose = (error) => {
-    const message = error?.message ?? (error ? String(error) : "Feishu WebSocket client closed");
-    emitDiagnostic("error", "websocket.closed", message, { status: "closed" });
-    void closeSidecar("sdk_close");
+    void withAccount(account, async () => {
+      const message = error?.message ?? (error ? String(error) : "Feishu WebSocket client closed");
+      account.connected = false;
+      account.lastError = error;
+      emitDiagnostic("error", "websocket.closed", message, { status: "closed" });
+      await closeSidecar("sdk_close");
+    });
   };
   try {
     once("close", handleClose);
     once("closed", handleClose);
     once("error", handleClose);
   } catch (error) {
-    emitDiagnostic("warn", "websocket.lifecycle", "Unable to attach Feishu WebSocket lifecycle handlers", {
+    emitDiagnostic(account, "warn", "websocket.lifecycle", "Unable to attach Feishu WebSocket lifecycle handlers", {
       status: "handler_attach_failed",
       message: error?.message ?? String(error),
     });
   }
 }
 
-function registerEventHandlers(eventDispatcher) {
+function registerEventHandlers(account, eventDispatcher) {
   const handlers = {};
   for (const eventType of [
     "im.message.receive_v1",
@@ -432,7 +553,7 @@ function registerEventHandlers(eventDispatcher) {
     "vc.meeting.invited_v1",
     "bitable.field.changed_v1",
   ]) {
-    handlers[eventType] = async (data) => handleSdkEvent(eventType, data);
+    handlers[eventType] = async (data) => withAccount(account, () => handleSdkEvent(eventType, data));
   }
   eventDispatcher.register(handlers);
 }
@@ -1326,13 +1447,15 @@ async function downloadResource(frame) {
   };
 }
 
-async function closeSidecar(reason = "stop") {
-  if (state.closing) {
+async function closeAccountState(account, reason = "stop", options = {}) {
+  if (!account || account.closing) {
     return;
   }
-  state.closing = true;
+  account.closing = true;
+  account.ready = false;
+  account.connected = false;
   try {
-    state.wsClient?.close?.();
+    account.wsClient?.close?.();
   } catch (error) {
     writeDiagnostic("warn", `error closing Feishu WS client: ${error?.message ?? String(error)}`, undefined, {
       prefix: PREFIX,
@@ -1340,9 +1463,30 @@ async function closeSidecar(reason = "stop") {
   }
   emitProtocol({
     type: "closed",
-    accountId: state.accountId,
+    accountId: account.accountId,
     reason,
   });
+  if (options.remove) {
+    state.accounts.delete(account.accountId);
+  }
+}
+
+async function closeSidecar(reason = "stop") {
+  const account = currentAccount();
+  if (!account) {
+    return;
+  }
+  await closeAccountState(account, reason);
+}
+
+async function closeAllAccounts(reason = "stop") {
+  if (state.closing) {
+    return;
+  }
+  state.closing = true;
+  for (const account of [...state.accounts.values()]) {
+    await withAccount(account, () => closeAccountState(account, reason));
+  }
 }
 
 async function handleFrame(frame) {
@@ -1352,19 +1496,54 @@ async function handleFrame(frame) {
   }
   switch (frame.type) {
     case "init":
+      await initialize(frame, { legacy: true });
+      return;
+    case "initAccount":
       await initialize(frame);
       return;
     case "send":
     case "request":
-      await handleSend(frame);
+      {
+        const accountId = resolveFrameAccountId(frame);
+        const account = state.accounts.get(accountId);
+        if (!account) {
+          emitError(accountId, {
+            phase: frame.type,
+            status: "unknown_account",
+            requestId: frame.requestId,
+            message: `Unknown Feishu sidecar account: ${accountId}`,
+          });
+          return;
+        }
+        await withAccount(account, () => handleSend(frame));
+      }
+      return;
+    case "closeAccount":
+      {
+        const accountId = resolveFrameAccountId(frame);
+        const account = state.accounts.get(accountId);
+        if (!account) {
+          emitError(accountId, {
+            phase: "closeAccount",
+            status: "unknown_account",
+            message: `Unknown Feishu sidecar account: ${accountId}`,
+          });
+          return;
+        }
+        await withAccount(account, () => closeAccountState(account, frame.reason ?? "stop", { remove: true }));
+      }
       return;
     case "close":
-      await closeSidecar(frame.reason ?? "stop");
+      await closeAllAccounts(frame.reason ?? "stop");
       process.exitCode = 0;
       process.exit(0);
       return;
     default:
-      emitError({ phase: "stdin", status: "unknown_frame", message: `Unknown Feishu sidecar frame type: ${frame.type}` });
+      emitError(resolveFrameAccountId(frame), {
+        phase: "stdin",
+        status: "unknown_frame",
+        message: `Unknown Feishu sidecar frame type: ${frame.type}`,
+      });
   }
 }
 
@@ -1395,7 +1574,7 @@ async function main() {
       frame = JSON.parse(line);
     } catch {
       emitError({ phase: "stdin", status: "invalid_json", message: "Invalid JSON protocol frame" });
-      if (!state.initialized) {
+      if (!hasReadyAccount()) {
         exitSoon(1);
         return;
       }
@@ -1408,17 +1587,17 @@ async function main() {
     exitSoon(1);
     return;
   }
-  if (state.initialized && !state.closing) {
-    await closeSidecar("stdin_eof");
+  if (hasReadyAccount() && !state.closing) {
+    await closeAllAccounts("stdin_eof");
   }
 }
 
 process.on("SIGTERM", () => {
-  void closeSidecar("sigterm").finally(() => process.exit(0));
+  void closeAllAccounts("sigterm").finally(() => process.exit(0));
 });
 
 process.on("SIGINT", () => {
-  void closeSidecar("sigint").finally(() => process.exit(0));
+  void closeAllAccounts("sigint").finally(() => process.exit(0));
 });
 
 void main().catch((error) => {

@@ -31,6 +31,11 @@ function writeFakeSdk(root, options = {}) {
       const callsPath = process.env.METIS_FEISHU_FAKE_SDK_CALLS;
       const behavior = JSON.parse(process.env.METIS_FEISHU_FAKE_SDK_BEHAVIOR || "{}");
 
+      function activeBehavior(appId) {
+        const perApp = behavior.byAppId && behavior.byAppId[appId] ? behavior.byAppId[appId] : {};
+        return { ...behavior, ...perApp };
+      }
+
       function record(kind, value) {
         if (!callsPath) return;
         fs.appendFileSync(callsPath, JSON.stringify({ kind, value }, (_key, entry) => {
@@ -95,6 +100,7 @@ function writeFakeSdk(root, options = {}) {
       export class WSClient {
         constructor(options) {
           this.options = options;
+          this.behavior = activeBehavior(options.appId);
           this.listeners = {};
           record("WSClient", options);
         }
@@ -110,6 +116,7 @@ function writeFakeSdk(root, options = {}) {
         }
         start({ eventDispatcher }) {
           record("WSClient.start", { hasDispatcher: Boolean(eventDispatcher) });
+          const behavior = this.behavior;
           if (behavior.start === "throw") {
             throw new Error("start failed with " + (behavior.secretEcho || "no secret"));
           }
@@ -141,7 +148,7 @@ function writeFakeSdk(root, options = {}) {
           return behavior.start === "async" ? new Promise((resolve) => setTimeout(resolve, behavior.startDelayMs ?? 5)) : undefined;
         }
         close() {
-          record("WSClient.close", {});
+          record("WSClient.close", { appId: this.options.appId });
         }
       }
 
@@ -513,6 +520,203 @@ function makeUploadFrame(overrides = {}) {
     ...overrides,
   };
 }
+
+test("legacy init frame still works", async () => {
+  const root = createTempRoot();
+  const { sdkPath, callsPath } = writeFakeSdk(root);
+  let proc;
+  try {
+    proc = spawnSidecar({ sdkPath, callsPath });
+    proc.writeFrame(baseInit({ type: "init", accountId: undefined }));
+    const ready = await proc.waitForFrame((frame) => frame.type === "ready");
+    assert.equal(ready.accountId, "default");
+
+    proc.writeFrame({ type: "send", action: "sendText", requestId: "legacy-send", to: "oc_chat", text: "legacy" });
+    const sent = await proc.waitForFrame((frame) => frame.type === "sendResult" && frame.requestId === "legacy-send");
+    assert.equal(sent.accountId, "default");
+    assert.equal(sent.ok, true);
+
+    const result = await proc.close();
+    assert.equal(result.status, 0, result.stderr);
+  } finally {
+    await proc?.close?.();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("two initAccount frames create two independent accounts", async () => {
+  const root = createTempRoot();
+  const { sdkPath, callsPath } = writeFakeSdk(root);
+  let proc;
+  try {
+    proc = spawnSidecar({ sdkPath, callsPath });
+    proc.writeFrame(baseInit({ type: "initAccount", accountId: "acct-a", appId: "app-a" }));
+    proc.writeFrame(baseInit({ type: "initAccount", accountId: "acct-b", appId: "app-b" }));
+
+    const readyA = await proc.waitForFrame((frame) => frame.type === "ready" && frame.accountId === "acct-a");
+    const readyB = await proc.waitForFrame((frame) => frame.type === "ready" && frame.accountId === "acct-b");
+    assert.equal(readyA.transport, "websocket");
+    assert.equal(readyB.transport, "websocket");
+
+    proc.writeFrame({ type: "send", accountId: "acct-a", action: "sendText", requestId: "send-a", to: "oc_a", text: "a" });
+    proc.writeFrame({ type: "request", accountId: "acct-b", action: "sendText", requestId: "send-b", to: "oc_b", text: "b" });
+    const sentA = await proc.waitForFrame((frame) => frame.type === "sendResult" && frame.requestId === "send-a");
+    const sentB = await proc.waitForFrame((frame) => frame.type === "sendResult" && frame.requestId === "send-b");
+    assert.equal(sentA.accountId, "acct-a");
+    assert.equal(sentB.accountId, "acct-b");
+    assert.deepEqual(callsOf(callsPath, "Client").map((call) => call.appId), ["app-a", "app-b"]);
+
+    const result = await proc.close();
+    assert.equal(result.status, 0, result.stderr);
+  } finally {
+    await proc?.close?.();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("duplicate initAccount returns conflict", async () => {
+  const root = createTempRoot();
+  const { sdkPath, callsPath } = writeFakeSdk(root);
+  let proc;
+  try {
+    proc = spawnSidecar({ sdkPath, callsPath });
+    proc.writeFrame(baseInit({ type: "initAccount", accountId: "dup", appId: "first-app" }));
+    await proc.waitForFrame((frame) => frame.type === "ready" && frame.accountId === "dup");
+
+    proc.writeFrame(baseInit({ type: "initAccount", accountId: "dup", appId: "second-app" }));
+    const error = await proc.waitForFrame((frame) => frame.type === "error" && frame.accountId === "dup");
+    assert.equal(error.phase, "initAccount");
+    assert.equal(error.status, "conflict");
+    assert.equal(callsOf(callsPath, "Client").length, 1);
+
+    const result = await proc.close();
+    assert.equal(result.status, 0, result.stderr);
+  } finally {
+    await proc?.close?.();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("unknown account frame is logged/error and dropped", async () => {
+  const root = createTempRoot();
+  const { sdkPath, callsPath } = writeFakeSdk(root);
+  let proc;
+  try {
+    proc = spawnSidecar({ sdkPath, callsPath });
+    proc.writeFrame(baseInit({ type: "initAccount", accountId: "known", appId: "known-app" }));
+    await proc.waitForFrame((frame) => frame.type === "ready" && frame.accountId === "known");
+
+    proc.writeFrame({ type: "send", accountId: "missing-send", action: "sendText", requestId: "missing-send", to: "oc_x", text: "x" });
+    proc.writeFrame({ type: "request", accountId: "missing-request", action: "sendText", requestId: "missing-request", to: "oc_x", text: "x" });
+    proc.writeFrame({ type: "closeAccount", accountId: "missing-close", reason: "test" });
+
+    const sendError = await proc.waitForFrame((frame) => frame.type === "error" && frame.requestId === "missing-send");
+    const requestError = await proc.waitForFrame((frame) => frame.type === "error" && frame.requestId === "missing-request");
+    const closeError = await proc.waitForFrame((frame) => frame.type === "error" && frame.accountId === "missing-close");
+    assert.equal(sendError.accountId, "missing-send");
+    assert.equal(requestError.accountId, "missing-request");
+    assert.equal(closeError.accountId, "missing-close");
+    assert.equal(sendError.status, "unknown_account");
+    assert.equal(requestError.status, "unknown_account");
+    assert.equal(closeError.status, "unknown_account");
+    assert.equal(callsOf(callsPath, "im.message.create").length, 0);
+
+    const result = await proc.close();
+    assert.equal(result.status, 0, result.stderr);
+  } finally {
+    await proc?.close?.();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("one account init failure does not fail another account", async () => {
+  const root = createTempRoot();
+  const { sdkPath, callsPath } = writeFakeSdk(root);
+  let proc;
+  try {
+    proc = spawnSidecar({
+      sdkPath,
+      callsPath,
+      behavior: {
+        byAppId: {
+          bad_app: { start: "throw", secretEcho: secretValues.appSecret },
+        },
+      },
+    });
+    proc.writeFrame(baseInit({ type: "initAccount", accountId: "acct-ok", appId: "good_app" }));
+    await proc.waitForFrame((frame) => frame.type === "ready" && frame.accountId === "acct-ok");
+
+    proc.writeFrame(baseInit({ type: "initAccount", accountId: "acct-bad", appId: "bad_app" }));
+    const initError = await proc.waitForFrame((frame) => frame.type === "error" && frame.accountId === "acct-bad");
+    assert.equal(initError.phase, "websocket.start");
+    assert.equal(initError.message.includes(secretValues.appSecret), false);
+
+    proc.writeFrame({ type: "send", accountId: "acct-ok", action: "sendText", requestId: "after-bad-init", to: "oc_ok", text: "still works" });
+    const sent = await proc.waitForFrame((frame) => frame.type === "sendResult" && frame.requestId === "after-bad-init");
+    assert.equal(sent.accountId, "acct-ok");
+    assert.equal(sent.ok, true);
+    assert.equal(proc.child.exitCode, null);
+
+    const result = await proc.close();
+    assert.equal(result.status, 0, result.stderr);
+  } finally {
+    await proc?.close?.();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("closeAccount closes only target account", async () => {
+  const root = createTempRoot();
+  const { sdkPath, callsPath } = writeFakeSdk(root);
+  let proc;
+  try {
+    proc = spawnSidecar({ sdkPath, callsPath });
+    proc.writeFrame(baseInit({ type: "initAccount", accountId: "stay-open", appId: "stay-app" }));
+    proc.writeFrame(baseInit({ type: "initAccount", accountId: "close-me", appId: "close-app" }));
+    await proc.waitForFrame((frame) => frame.type === "ready" && frame.accountId === "stay-open");
+    await proc.waitForFrame((frame) => frame.type === "ready" && frame.accountId === "close-me");
+
+    proc.writeFrame({ type: "closeAccount", accountId: "close-me", reason: "targeted-test" });
+    const closed = await proc.waitForFrame((frame) => frame.type === "closed" && frame.accountId === "close-me");
+    assert.equal(closed.reason, "targeted-test");
+    assert.deepEqual(callsOf(callsPath, "WSClient.close").map((call) => call.appId), ["close-app"]);
+
+    proc.writeFrame({ type: "send", accountId: "stay-open", action: "sendText", requestId: "after-close-account", to: "oc_ok", text: "ok" });
+    const sent = await proc.waitForFrame((frame) => frame.type === "sendResult" && frame.requestId === "after-close-account");
+    assert.equal(sent.accountId, "stay-open");
+    assert.equal(sent.ok, true);
+
+    const result = await proc.close();
+    assert.equal(result.status, 0, result.stderr);
+  } finally {
+    await proc?.close?.();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("global close closes all accounts", async () => {
+  const root = createTempRoot();
+  const { sdkPath, callsPath } = writeFakeSdk(root);
+  let proc;
+  try {
+    proc = spawnSidecar({ sdkPath, callsPath });
+    proc.writeFrame(baseInit({ type: "initAccount", accountId: "global-a", appId: "global-app-a" }));
+    proc.writeFrame(baseInit({ type: "initAccount", accountId: "global-b", appId: "global-app-b" }));
+    await proc.waitForFrame((frame) => frame.type === "ready" && frame.accountId === "global-a");
+    await proc.waitForFrame((frame) => frame.type === "ready" && frame.accountId === "global-b");
+
+    proc.writeFrame({ type: "close", reason: "global-test" });
+    proc.child.stdin.end();
+    await proc.waitForExit();
+    assert.equal(proc.child.exitCode, 0, proc.stderrLines.join("\n"));
+    const closed = proc.frames.filter((frame) => frame.type === "closed" && frame.reason === "global-test");
+    assert.deepEqual(closed.map((frame) => frame.accountId).sort(), ["global-a", "global-b"]);
+    assert.deepEqual(callsOf(callsPath, "WSClient.close").map((call) => call.appId).sort(), ["global-app-a", "global-app-b"]);
+  } finally {
+    await proc?.close?.();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("feishu sidecar resolves sdk from runtime root without METIS_FEISHU_SIDECAR_SDK", async () => {
   const root = createTempRoot();
