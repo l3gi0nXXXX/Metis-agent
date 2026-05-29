@@ -102,6 +102,57 @@ public class ServicePluginContractTest {
     }
 
     @TestCase
+    public func parseServicePluginPayloadStatusCoversJsonAndTextStates(): Unit {
+        let compact = parseServicePluginPayloadStatus("{\"ok\":true,\"status\":\"ok\"}")
+        @Expect(compact.parsed, true)
+        @Expect(compact.okPresent, true)
+        @Expect(compact.ok, true)
+        @Expect(compact.status, "ok")
+        @Expect(compact.diagnostic, "")
+        @Expect(compact.payloadKind, "json_object")
+
+        let formatted = parseServicePluginPayloadStatus("{ \"ok\": true, \"status\": \"ok\" }")
+        @Expect(formatted.parsed, true)
+        @Expect(formatted.okPresent, true)
+        @Expect(formatted.ok, true)
+        @Expect(formatted.status, "ok")
+        @Expect(formatted.diagnostic, "")
+        @Expect(formatted.payloadKind, "json_object")
+
+        let failed = parseServicePluginPayloadStatus("{ \"ok\": false, \"status\": \"runtime_required\", \"diagnostic\": \"runtime missing\" }")
+        @Expect(failed.parsed, true)
+        @Expect(failed.okPresent, true)
+        @Expect(failed.ok, false)
+        @Expect(failed.status, "runtime_required")
+        @Expect(failed.diagnostic, "runtime missing")
+        @Expect(failed.payloadKind, "json_object")
+
+        let invalidOk = parseServicePluginPayloadStatus("{ \"ok\": \"true\", \"status\": \"ok\" }")
+        @Expect(invalidOk.parsed, true)
+        @Expect(invalidOk.okPresent, true)
+        @Expect(invalidOk.ok, false)
+        @Expect(invalidOk.status, "invalid_payload")
+        @Expect(invalidOk.diagnostic.contains("ok field must be boolean"), true)
+        @Expect(invalidOk.payloadKind, "json_object")
+
+        let plain = parseServicePluginPayloadStatus("not json")
+        @Expect(plain.parsed, false)
+        @Expect(plain.okPresent, false)
+        @Expect(plain.ok, false)
+        @Expect(plain.status, "invalid_payload")
+        @Expect(plain.diagnostic.contains("not valid JSON"), true)
+        @Expect(plain.payloadKind, "plain_text")
+
+        let missingStatus = parseServicePluginPayloadStatus("{ \"ok\": true }")
+        @Expect(missingStatus.parsed, true)
+        @Expect(missingStatus.okPresent, true)
+        @Expect(missingStatus.ok, true)
+        @Expect(missingStatus.status, "ok")
+        @Expect(missingStatus.diagnostic.contains("missing field: status"), true)
+        @Expect(missingStatus.payloadKind, "json_object")
+    }
+
+    @TestCase
     public func enforceServiceFrameLimitsAcceptsBoundaryAndRejectsOversizedPayload(): Unit {
         let frame = ServiceFrame("event", "f", "sample", capabilityId: "release.event.accepted", payload: "12345")
         @Expect(enforceServiceFrameLimits(frame, limits: ServiceFrameLimits(maxPayloadBytes: 5)).ok, true)
