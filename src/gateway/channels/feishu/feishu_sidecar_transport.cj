@@ -841,6 +841,693 @@ public class FeishuSidecarTransport <: FeishuLongConnectTransport {
     }
 }
 
+private class FeishuSidecarSupervisorAccountState {
+    private let lock = Mutex()
+    private var condition: Condition
+    public let accountId: String
+    private let diagnostics = ArrayList<FeishuSidecarDiagnosticSnapshot>()
+    private var handler: Option<(JsonObject) -> Unit> = None
+    private var startPending = false
+    private var ready = false
+    private var connected = false
+    private var pidValue: Int64 = 0
+    private var lastError = ""
+    private var lastStatus = ""
+    private var lastInboundAt = 0
+
+    public init(accountId: String) {
+        this.accountId = accountId.trimAscii()
+        synchronized(this.lock) {
+            this.condition = this.lock.condition()
+        }
+    }
+
+    public func beginStart(pid: Int64, eventHandler: (JsonObject) -> Unit): Unit {
+        synchronized(this.lock) {
+            this.handler = Some(eventHandler)
+            this.startPending = true
+            this.ready = false
+            this.connected = false
+            this.pidValue = pid
+            this.lastError = ""
+            this.lastStatus = ""
+            this.lastInboundAt = 0
+            this.condition.notifyAll()
+        }
+    }
+
+    public func markReady(pid: Int64): Unit {
+        synchronized(this.lock) {
+            this.startPending = false
+            this.ready = true
+            this.connected = true
+            this.pidValue = pid
+            this.lastError = ""
+            this.lastStatus = "ready"
+            this.condition.notifyAll()
+        }
+    }
+
+    public func markInbound(): Unit {
+        synchronized(this.lock) {
+            this.connected = true
+            this.lastInboundAt = DateTime.now().toUnixTimeStamp().toMilliseconds()
+        }
+    }
+
+    public func markFailure(status: String, message: String): Unit {
+        synchronized(this.lock) {
+            this.startPending = false
+            this.ready = false
+            this.connected = false
+            this.lastStatus = if (status.trimAscii().isEmpty()) { "error" } else { status.trimAscii() }
+            this.lastError = message.trimAscii()
+            this.condition.notifyAll()
+        }
+    }
+
+    public func markStopped(): Unit {
+        synchronized(this.lock) {
+            this.startPending = false
+            this.ready = false
+            this.connected = false
+            this.condition.notifyAll()
+        }
+    }
+
+    public func recordDiagnostic(level: String, phase: String, status: String, message: String): Unit {
+        let entry = FeishuSidecarDiagnosticSnapshot(
+            atMs: DateTime.now().toUnixTimeStamp().toMilliseconds(),
+            level: level,
+            phase: phase,
+            status: status,
+            message: message
+        )
+        synchronized(this.lock) {
+            this.diagnostics.add(entry)
+            while (this.diagnostics.size > 64) {
+                this.diagnostics.remove(at: 0)
+            }
+        }
+    }
+
+    public func waitForReady(timeoutMs: Int64): FeishuLongConnectStartResult {
+        let deadline = DateTime.now().toUnixTimeStamp().toMilliseconds() + timeoutMs
+        synchronized(this.lock) {
+            while (this.startPending) {
+                let remaining = deadline - DateTime.now().toUnixTimeStamp().toMilliseconds()
+                if (remaining <= 0) {
+                    this.startPending = false
+                    this.ready = false
+                    this.connected = false
+                    this.lastStatus = "ready_timeout"
+                    this.lastError = "sidecar account ready timeout"
+                    return FeishuLongConnectStartResult(ok: false, status: "ready_timeout", error: this.lastError)
+                }
+                let _ = this.condition.wait(timeout: Duration.millisecond * remaining)
+            }
+            if (this.ready) {
+                return FeishuLongConnectStartResult(ok: true, status: "ready")
+            }
+            FeishuLongConnectStartResult(
+                ok: false,
+                status: if (this.lastStatus.isEmpty()) { "error" } else { this.lastStatus },
+                error: this.lastError
+            )
+        }
+    }
+
+    public func startOutcome(): Option<FeishuLongConnectStartResult> {
+        synchronized(this.lock) {
+            if (this.startPending) {
+                return None<FeishuLongConnectStartResult>
+            }
+            if (this.ready) {
+                return Some(FeishuLongConnectStartResult(ok: true, status: "ready"))
+            }
+            Some(FeishuLongConnectStartResult(
+                ok: false,
+                status: if (this.lastStatus.isEmpty()) { "error" } else { this.lastStatus },
+                error: this.lastError
+            ))
+        }
+    }
+
+    public func handlerSnapshot(): Option<(JsonObject) -> Unit> {
+        synchronized(this.lock) {
+            this.handler
+        }
+    }
+
+    public func healthSnapshot(): FeishuSidecarHealthSnapshot {
+        synchronized(this.lock) {
+            FeishuSidecarHealthSnapshot(
+                pid: this.pidValue,
+                ready: this.ready,
+                connected: this.connected,
+                lastError: this.lastError,
+                lastInboundAt: this.lastInboundAt,
+                diagnosticRingSize: this.diagnostics.size
+            )
+        }
+    }
+
+    public func diagnosticsSnapshot(): Array<FeishuSidecarDiagnosticSnapshot> {
+        let out = ArrayList<FeishuSidecarDiagnosticSnapshot>()
+        synchronized(this.lock) {
+            for (entry in this.diagnostics) {
+                out.add(entry)
+            }
+        }
+        out.toArray()
+    }
+}
+
+public class FeishuSidecarSupervisorRegistry {
+    private let lock = Mutex()
+    private let runner: FeishuSidecarProtocolRunner
+    private let options: FeishuSidecarTransportOptions
+    private let accounts = HashMap<String, FeishuSidecarSupervisorAccountState>()
+    private var process: Option<FeishuSidecarProtocolProcess> = None
+    private var generation: Int64 = 0
+    private var processStartCount: Int64 = 0
+    private var registryLastError = ""
+
+    public init(
+        runner!: FeishuSidecarProtocolRunner = FeishuSidecarNotConfiguredRunner(),
+        options!: FeishuSidecarTransportOptions = FeishuSidecarTransportOptions()
+    ) {
+        this.runner = runner
+        this.options = options
+    }
+
+    public func startAccount(spec: FeishuLongConnectStartSpec, eventHandler: (JsonObject) -> Unit): FeishuLongConnectStartResult {
+        let accountId = this.normalizeAccountId(spec.accountId)
+        let state = this.registerAccount(accountId, eventHandler)
+        match (this.ensureProcess()) {
+            case FeishuSidecarProtocolStartResult.Failed(reason) =>
+                let status = if (reason.contains("not_configured")) { "not_configured" } else { "launch_failed" }
+                let error = feishuSidecarTransportRedactSensitiveText(reason)
+                state.markFailure(status, error)
+                state.recordDiagnostic("error", "start", status, error)
+                return FeishuLongConnectStartResult(ok: false, status: status, error: error)
+            case FeishuSidecarProtocolStartResult.Started(proc) =>
+                state.beginStart(proc.pid(), eventHandler)
+                try {
+                    proc.writeLine(this.compactJsonLine(this.initAccountFrame(spec, accountId).toJsonString()))
+                } catch (e: Exception) {
+                    let error = feishuSidecarTransportRedactSensitiveText("initAccount write failed: ${e.message}")
+                    state.markFailure("write_failed", error)
+                    state.recordDiagnostic("error", "initAccount", "write_failed", error)
+                    return FeishuLongConnectStartResult(ok: false, status: "write_failed", error: error)
+                }
+                if (this.options.startBackgroundReader) {
+                    let result = state.waitForReady(this.options.readyTimeoutMs)
+                    if (!result.ok && result.status == "ready_timeout") {
+                        let error = this.processError("sidecar account ready timeout", proc)
+                        state.markFailure("ready_timeout", error)
+                        state.recordDiagnostic("error", "start", "ready_timeout", error)
+                        return FeishuLongConnectStartResult(ok: false, status: "ready_timeout", error: error)
+                    }
+                    return result
+                }
+                this.waitForReadyByPolling(proc, state)
+        }
+    }
+
+    public func stopAccount(accountId: String): Unit {
+        let normalized = this.normalizeAccountId(accountId)
+        var proc: Option<FeishuSidecarProtocolProcess> = None
+        var shouldStopProcess = false
+        var state: Option<FeishuSidecarSupervisorAccountState> = None
+        synchronized(this.lock) {
+            if (this.accounts.contains(normalized)) {
+                state = Some(this.accounts[normalized])
+                this.accounts.remove(normalized)
+            }
+            proc = this.process
+            shouldStopProcess = this.accounts.isEmpty()
+            if (shouldStopProcess) {
+                this.process = None<FeishuSidecarProtocolProcess>
+                this.generation += 1
+            }
+        }
+        if (let Some(s) <- state) {
+            s.markStopped()
+        }
+        if (let Some(p) <- proc) {
+            try {
+                p.writeLine(this.compactJsonLine(this.closeAccountFrame(normalized).toJsonString()))
+            } catch (_: Exception) {
+                ()
+            }
+            if (shouldStopProcess) {
+                match (p.wait(this.options.stopTimeoutMs)) {
+                    case Some(_) => ()
+                    case None => p.terminate(true)
+                }
+            }
+        }
+    }
+
+    public func healthSnapshot(accountId: String): FeishuSidecarHealthSnapshot {
+        let normalized = this.normalizeAccountId(accountId)
+        let state = synchronized(this.lock) {
+            if (this.accounts.contains(normalized)) {
+                Some(this.accounts[normalized])
+            } else {
+                None<FeishuSidecarSupervisorAccountState>
+            }
+        }
+        match (state) {
+            case Some(s) => s.healthSnapshot()
+            case None => FeishuSidecarHealthSnapshot(lastError: this.registryLastError)
+        }
+    }
+
+    public func diagnosticsSnapshot(accountId: String): Array<FeishuSidecarDiagnosticSnapshot> {
+        let normalized = this.normalizeAccountId(accountId)
+        let state = synchronized(this.lock) {
+            if (this.accounts.contains(normalized)) {
+                Some(this.accounts[normalized])
+            } else {
+                None<FeishuSidecarSupervisorAccountState>
+            }
+        }
+        match (state) {
+            case Some(s) => s.diagnosticsSnapshot()
+            case None => Array<FeishuSidecarDiagnosticSnapshot>(0, repeat: FeishuSidecarDiagnosticSnapshot(atMs: 0))
+        }
+    }
+
+    public func debugProcessStartCountForTest(): Int64 {
+        synchronized(this.lock) {
+            this.processStartCount
+        }
+    }
+
+    public func debugDrainAvailableForTest(): Unit {
+        while (this.drainOne()) {
+            ()
+        }
+        this.recordUnexpectedExitIfNeeded()
+    }
+
+    private func registerAccount(accountId: String, eventHandler: (JsonObject) -> Unit): FeishuSidecarSupervisorAccountState {
+        synchronized(this.lock) {
+            if (!this.accounts.contains(accountId)) {
+                this.accounts[accountId] = FeishuSidecarSupervisorAccountState(accountId)
+            }
+            let state = this.accounts[accountId]
+            state.beginStart(0, eventHandler)
+            state
+        }
+    }
+
+    private func ensureProcess(): FeishuSidecarProtocolStartResult {
+        synchronized(this.lock) {
+            match (this.process) {
+                case Some(p) =>
+                    if (p.isAlive()) {
+                        return FeishuSidecarProtocolStartResult.Started(p)
+                    }
+                    this.process = None<FeishuSidecarProtocolProcess>
+                case None => ()
+            }
+            let launch = FeishuSidecarLaunchSpec(
+                command: this.options.command,
+                args: this.options.args,
+                runtimeRoot: this.options.runtimeRoot,
+                workingDirectory: Some(this.options.workingDirectory),
+                env: this.options.env
+            )
+            match (this.runner.start(launch)) {
+                case FeishuSidecarProtocolStartResult.Failed(reason) =>
+                    this.registryLastError = feishuSidecarTransportRedactSensitiveText(reason)
+                    return FeishuSidecarProtocolStartResult.Failed(reason)
+                case FeishuSidecarProtocolStartResult.Started(proc) =>
+                    this.process = Some(proc)
+                    this.registryLastError = ""
+                    this.processStartCount += 1
+                    this.generation += 1
+                    if (this.options.startBackgroundReader) {
+                        let currentGeneration = this.generation
+                        spawn {
+                            this.readLoop(currentGeneration)
+                        }
+                    }
+                    return FeishuSidecarProtocolStartResult.Started(proc)
+            }
+        }
+    }
+
+    private func waitForReadyByPolling(
+        proc: FeishuSidecarProtocolProcess,
+        state: FeishuSidecarSupervisorAccountState
+    ): FeishuLongConnectStartResult {
+        let deadline = DateTime.now().toUnixTimeStamp().toMilliseconds() + this.options.readyTimeoutMs
+        while (DateTime.now().toUnixTimeStamp().toMilliseconds() <= deadline) {
+            match (state.startOutcome()) {
+                case Some(result) => return result
+                case None => ()
+            }
+            match (proc.readLine(this.options.readTimeoutMs)) {
+                case Some(line) => let _ = this.handleLine(line)
+                case None =>
+                    if (!proc.isAlive()) {
+                        let error = this.processError("sidecar exited before account ready", proc)
+                        state.markFailure("unexpected_exit", error)
+                        state.recordDiagnostic("error", "process", "unexpected_exit", error)
+                        return FeishuLongConnectStartResult(ok: false, status: "unexpected_exit", error: error)
+                    }
+            }
+        }
+        let error = this.processError("sidecar account ready timeout", proc)
+        state.markFailure("ready_timeout", error)
+        state.recordDiagnostic("error", "start", "ready_timeout", error)
+        FeishuLongConnectStartResult(ok: false, status: "ready_timeout", error: error)
+    }
+
+    private func readLoop(expectedGeneration: Int64): Unit {
+        while (this.activeGeneration(expectedGeneration)) {
+            let proc = synchronized(this.lock) { this.process }
+            match (proc) {
+                case Some(p) =>
+                    match (p.readLine(this.options.readTimeoutMs)) {
+                        case Some(line) => let _ = this.handleLine(line)
+                        case None =>
+                            if (!p.isAlive()) {
+                                this.markAllAccountsFailed("process", "unexpected_exit", this.processError("sidecar unexpected exit", p))
+                                return
+                            }
+                    }
+                case None => return
+            }
+        }
+    }
+
+    private func drainOne(): Bool {
+        let proc = synchronized(this.lock) { this.process }
+        match (proc) {
+            case Some(p) =>
+                match (p.readLine(this.options.readTimeoutMs)) {
+                    case Some(line) =>
+                        let _ = this.handleLine(line)
+                        true
+                    case None => false
+                }
+            case None => false
+        }
+    }
+
+    private func handleLine(line: String): Bool {
+        let trimmed = line.trimAscii()
+        if (trimmed.isEmpty()) {
+            return false
+        }
+        let frame: JsonObject
+        try {
+            frame = JsonValue.fromStr(trimmed).asObject()
+        } catch (_: Exception) {
+            this.markAllAccountsFailed("protocol", "protocol_error", "sidecar non-json protocol line")
+            return true
+        }
+        let frameType = this.readString(frame, "type")
+        let accountId = this.normalizeAccountId(this.readString(frame, "accountId"))
+        if (accountId.isEmpty()) {
+            this.registryLastError = "sidecar frame missing accountId"
+            return true
+        }
+        let state = this.accountState(accountId)
+        if (state.isNone()) {
+            this.registryLastError = "sidecar frame for unknown account: ${accountId}"
+            return true
+        }
+        let accountState = state.getOrThrow()
+        if (frameType == "ready") {
+            let pid = synchronized(this.lock) {
+                match (this.process) {
+                    case Some(p) => p.pid()
+                    case None => 0
+                }
+            }
+            accountState.markReady(pid)
+            accountState.recordDiagnostic("info", "ready", "ok", "")
+            return true
+        }
+        if (frameType == "inbound") {
+            accountState.markInbound()
+            accountState.recordDiagnostic("info", "event.dispatch", "ok", this.readString(frame, "eventType"))
+            this.emit(accountState, this.inboundRoot(frame, accountId))
+            return true
+        }
+        if (frameType == "diagnostic") {
+            let level = this.readString(frame, "level", fallback: "info")
+            let phase = this.readString(frame, "phase", fallback: "diagnostic")
+            let status = this.readString(frame, "status", fallback: "ok")
+            let message = feishuSidecarTransportRedactSensitiveText(this.readString(frame, "message"))
+            accountState.recordDiagnostic(level, phase, status, message)
+            if (level == "error" || status == "failed") {
+                let error = this.composeError(phase, status, message)
+                accountState.markFailure(status, error)
+                this.emit(accountState, this.diagnosticRoot(accountId, level, phase, status, message))
+            }
+            return true
+        }
+        if (frameType == "error") {
+            let phase = this.readString(frame, "phase", fallback: "error")
+            let status = this.readString(frame, "status", fallback: "error")
+            let message = feishuSidecarTransportRedactSensitiveText(this.readString(frame, "message", fallback: this.readString(frame, "error")))
+            let error = this.composeError(phase, status, message)
+            accountState.markFailure(status, error)
+            accountState.recordDiagnostic("error", phase, status, error)
+            return true
+        }
+        if (frameType == "closed") {
+            let reason = feishuSidecarTransportRedactSensitiveText(this.readString(frame, "reason", fallback: "closed"))
+            let error = "sidecar closed: ${reason}"
+            accountState.markFailure("closed", error)
+            accountState.recordDiagnostic("error", "closed", "closed", error)
+            this.emit(accountState, this.diagnosticRoot(accountId, "error", "closed", "closed", reason))
+            return true
+        }
+        let error = "unknown sidecar frame type: ${frameType}"
+        accountState.markFailure("protocol_error", error)
+        accountState.recordDiagnostic("error", "protocol", "protocol_error", error)
+        true
+    }
+
+    private func recordUnexpectedExitIfNeeded(): Unit {
+        let proc = synchronized(this.lock) { this.process }
+        if (let Some(p) <- proc) {
+            if (!p.isAlive()) {
+                this.markAllAccountsFailed("process", "unexpected_exit", this.processError("sidecar unexpected exit", p))
+            }
+        }
+    }
+
+    private func markAllAccountsFailed(phase: String, status: String, message: String): Unit {
+        let states = ArrayList<FeishuSidecarSupervisorAccountState>()
+        var proc: Option<FeishuSidecarProtocolProcess> = None
+        synchronized(this.lock) {
+            this.registryLastError = message
+            for ((_, state) in this.accounts) {
+                states.add(state)
+            }
+            proc = this.process
+            this.process = None<FeishuSidecarProtocolProcess>
+            this.generation += 1
+        }
+        if (let Some(p) <- proc) {
+            if (p.isAlive()) {
+                p.terminate(true)
+            }
+        }
+        for (state in states) {
+            state.markFailure(status, message)
+            state.recordDiagnostic("error", phase, status, message)
+            this.emit(state, this.diagnosticRoot(state.accountId, "error", phase, status, message))
+        }
+    }
+
+    private func accountState(accountId: String): Option<FeishuSidecarSupervisorAccountState> {
+        synchronized(this.lock) {
+            if (this.accounts.contains(accountId)) {
+                Some(this.accounts[accountId])
+            } else {
+                None<FeishuSidecarSupervisorAccountState>
+            }
+        }
+    }
+
+    private func emit(state: FeishuSidecarSupervisorAccountState, root: JsonObject): Unit {
+        match (state.handlerSnapshot()) {
+            case Some(h) => h(root)
+            case None => ()
+        }
+    }
+
+    private func initAccountFrame(spec: FeishuLongConnectStartSpec, accountId: String): JsonObject {
+        let out = JsonObject()
+        out.put("type", JsonString("initAccount"))
+        out.put("accountId", JsonString(accountId))
+        out.put("appId", JsonString(spec.appId))
+        out.put("appSecret", JsonString(spec.appSecret))
+        out.put("domain", JsonString(spec.domain))
+        out.put("verificationToken", JsonString(spec.verificationToken))
+        out.put("encryptKey", JsonString(spec.encryptKey))
+        out.put("mode", JsonString("websocket"))
+        out.put("runtimeRoot", JsonString(this.options.runtimeRoot))
+        out
+    }
+
+    private func closeAccountFrame(accountId: String): JsonObject {
+        let out = JsonObject()
+        out.put("type", JsonString("closeAccount"))
+        out.put("accountId", JsonString(accountId))
+        out
+    }
+
+    private func inboundRoot(frame: JsonObject, accountId: String): JsonObject {
+        let eventType = this.readString(frame, "eventType")
+        let event = match (frame.get("event")) {
+            case Some(v) => try { v.asObject() } catch (_: Exception) { JsonObject() }
+            case None => JsonObject()
+        }
+        let header = JsonObject()
+        header.put("event_type", JsonString(eventType))
+        header.put("account_id", JsonString(accountId))
+        let root = JsonObject()
+        root.put("header", header)
+        root.put("event", event)
+        root
+    }
+
+    private func diagnosticRoot(accountId: String, level: String, phase: String, status: String, message: String): JsonObject {
+        let header = JsonObject()
+        header.put("event_type", JsonString("metis.feishu.sidecar.diagnostic"))
+        header.put("account_id", JsonString(accountId))
+        let sidecar = JsonObject()
+        sidecar.put("level", JsonString(level))
+        sidecar.put("phase", JsonString(phase))
+        sidecar.put("status", JsonString(status))
+        sidecar.put("message", JsonString(message))
+        let root = JsonObject()
+        root.put("header", header)
+        root.put("sidecar", sidecar)
+        root
+    }
+
+    private func processError(prefix: String, proc: FeishuSidecarProtocolProcess): String {
+        let parts = ArrayList<String>()
+        parts.add(feishuSidecarTransportRedactSensitiveText(prefix))
+        let stdout = feishuSidecarTransportRedactSensitiveText(proc.stdoutSummary())
+        if (!stdout.isEmpty()) {
+            parts.add("stdout=${stdout}")
+        }
+        let stderr = feishuSidecarTransportRedactSensitiveText(proc.stderrSummary())
+        if (!stderr.isEmpty()) {
+            parts.add("stderr=${stderr}")
+        }
+        String.join(parts.toArray(), delimiter: "; ")
+    }
+
+    private func composeError(phase: String, status: String, message: String): String {
+        if (message.trimAscii().isEmpty()) {
+            return "${phase}: ${status}"
+        }
+        "${phase}: ${status}: ${message.trimAscii()}"
+    }
+
+    private func readString(obj: JsonObject, key: String, fallback!: String = ""): String {
+        match (obj.get(key)) {
+            case Some(value) =>
+                try {
+                    let text = value.asString().getValue().trimAscii()
+                    if (text.isEmpty()) { fallback } else { text }
+                } catch (_: Exception) {
+                    fallback
+                }
+            case None => fallback
+        }
+    }
+
+    private func normalizeAccountId(raw: String): String {
+        let trimmed = raw.trimAscii()
+        if (trimmed.isEmpty()) { "default" } else { trimmed }
+    }
+
+    private func compactJsonLine(raw: String): String {
+        let out = StringBuilder()
+        var inString = false
+        var escaped = false
+        for (ch in raw.toRuneArray()) {
+            if (escaped) {
+                out.append(ch)
+                escaped = false
+                continue
+            }
+            if (inString && ch == r'\\') {
+                out.append(ch)
+                escaped = true
+                continue
+            }
+            if (ch == r'"') {
+                out.append(ch)
+                inString = !inString
+                continue
+            }
+            if (!inString && (ch == r' ' || ch == r'\n' || ch == r'\r' || ch == r'\t')) {
+                continue
+            }
+            out.append(ch)
+        }
+        out.toString()
+    }
+
+    private func activeGeneration(expected: Int64): Bool {
+        synchronized(this.lock) {
+            this.generation == expected && this.process.isSome()
+        }
+    }
+}
+
+public class FeishuSidecarSupervisorTransport <: FeishuLongConnectTransport {
+    private let registry: FeishuSidecarSupervisorRegistry
+    private let lock = Mutex()
+    private var accountId = ""
+
+    public init(registry!: FeishuSidecarSupervisorRegistry) {
+        this.registry = registry
+    }
+
+    public func start(spec: FeishuLongConnectStartSpec, eventHandler: (JsonObject) -> Unit): FeishuLongConnectStartResult {
+        synchronized(this.lock) {
+            this.accountId = if (spec.accountId.trimAscii().isEmpty()) { "default" } else { spec.accountId.trimAscii() }
+        }
+        this.registry.startAccount(spec, eventHandler)
+    }
+
+    public func stop(): Unit {
+        let id = synchronized(this.lock) { this.accountId }
+        if (!id.trimAscii().isEmpty()) {
+            this.registry.stopAccount(id)
+        }
+    }
+
+    public func healthSnapshot(): FeishuSidecarHealthSnapshot {
+        this.registry.healthSnapshot(synchronized(this.lock) { this.accountId })
+    }
+
+    public func diagnosticsSnapshot(): Array<FeishuSidecarDiagnosticSnapshot> {
+        this.registry.diagnosticsSnapshot(synchronized(this.lock) { this.accountId })
+    }
+
+    public func debugDrainAvailableForTest(): Unit {
+        this.registry.debugDrainAvailableForTest()
+    }
+}
+
 public func feishuSidecarDefaultWorkingDirectory(): String {
     CliConfig.cwd.toString()
 }

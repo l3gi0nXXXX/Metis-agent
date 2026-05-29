@@ -768,6 +768,9 @@ public class FeishuAdapter <: ChannelAdapter {
         if (this.longConnectTransport is FeishuSidecarTransport) {
             return "sidecar"
         }
+        if (this.longConnectTransport is FeishuSidecarSupervisorTransport) {
+            return "sidecar-supervisor"
+        }
         if (this.longConnectTransport is FeishuNativeLongConnectTransport) {
             return "native-legacy"
         }

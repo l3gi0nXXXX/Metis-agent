@@ -11,6 +11,8 @@ import metis.gateway.channels.feishu.{
     FeishuSidecarProcessRequestRunner,
     FeishuSidecarRequestAccount,
     FeishuSidecarStdioRunner,
+    FeishuSidecarSupervisorRegistry,
+    FeishuSidecarSupervisorTransport,
     FeishuSidecarTransport,
     FeishuSidecarTransportOptions,
     FeishuWebhookLongConnectTransport,
@@ -74,11 +76,17 @@ private func qqConfigForAccount(config: QQConfig, accountId: String): QQConfig {
     )
 }
 
-private func gatewayFeishuLongConnectTransportForConfig(config: FeishuConfig): FeishuLongConnectTransport {
+private func gatewayFeishuLongConnectTransportForConfig(
+    config: FeishuConfig,
+    supervisorRegistry!: Option<FeishuSidecarSupervisorRegistry> = None<FeishuSidecarSupervisorRegistry>
+): FeishuLongConnectTransport {
     if (config.receiveMode == "webhook") {
         return FeishuWebhookLongConnectTransport()
     }
     if (config.transportMode == "sidecar") {
+        if (let Some(registry) <- supervisorRegistry) {
+            return FeishuSidecarSupervisorTransport(registry: registry)
+        }
         return FeishuSidecarTransport(
             runner: FeishuSidecarStdioRunner(),
             options: FeishuSidecarTransportOptions(startBackgroundReader: true)
@@ -105,24 +113,29 @@ private func gatewayFeishuApiClientForConfig(config: FeishuConfig): FeishuApiCli
     FeishuNoopApiClient()
 }
 
-public func gatewayFeishuAdapterForConfig(config: FeishuConfig, accountId: String): FeishuAdapter {
+public func gatewayFeishuAdapterForConfig(
+    config: FeishuConfig,
+    accountId: String,
+    supervisorRegistry!: Option<FeishuSidecarSupervisorRegistry> = None<FeishuSidecarSupervisorRegistry>
+): FeishuAdapter {
     let resolved = gatewayFeishuResolveAccount(config, accountId)
     FeishuAdapter(
         config: config,
         accountId: resolved.accountId,
         apiClient: gatewayFeishuApiClientForConfig(resolved.config),
-        longConnectTransport: gatewayFeishuLongConnectTransportForConfig(resolved.config)
+        longConnectTransport: gatewayFeishuLongConnectTransportForConfig(resolved.config, supervisorRegistry: supervisorRegistry)
     )
 }
 
 private func gatewayAdapterForProfile(
     user: GatewayUserSettings,
-    profile: GatewayAdapterRegistrationProfile
+    profile: GatewayAdapterRegistrationProfile,
+    feishuSupervisorRegistry!: Option<FeishuSidecarSupervisorRegistry> = None<FeishuSidecarSupervisorRegistry>
 ): ChannelAdapter {
     let cfg = buildGatewayConfigFromUserSettings(user)
     let accountId = gatewayProfileRuntimeAccountId(profile)
     if (profile.channelId == "feishu") {
-        return gatewayFeishuAdapterForConfig(cfg.feishu, accountId)
+        return gatewayFeishuAdapterForConfig(cfg.feishu, accountId, supervisorRegistry: feishuSupervisorRegistry)
     }
     if (profile.channelId == "qq") {
         return QQAdapter(config: qqConfigForAccount(cfg.qq, accountId))
@@ -145,12 +158,21 @@ public func gatewayPreparedBuiltinAdapterRegistrations(
     healthMonitorEnabled: Bool
 ): Array<GatewayPreparedAdapterRegistration> {
     let rows = ArrayList<GatewayPreparedAdapterRegistration>()
+    let feishuSupervisorRegistry = FeishuSidecarSupervisorRegistry(
+        runner: FeishuSidecarStdioRunner(),
+        options: FeishuSidecarTransportOptions(startBackgroundReader: true)
+    )
     for (profile in gatewayBuiltinAdapterRegistrationProfiles(user, healthMonitorEnabled)) {
         if (!profile.enabled || !profile.configured) {
             continue
         }
+        let supervisor = if (profile.channelId == "feishu") {
+            Some(feishuSupervisorRegistry)
+        } else {
+            None<FeishuSidecarSupervisorRegistry>
+        }
         rows.add(GatewayPreparedAdapterRegistration(
-            gatewayAdapterForProfile(user, profile),
+            gatewayAdapterForProfile(user, profile, feishuSupervisorRegistry: supervisor),
             profile
         ))
     }

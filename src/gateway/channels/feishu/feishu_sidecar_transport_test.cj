@@ -121,6 +121,17 @@ public class FeishuSidecarTransportTest {
         )
     }
 
+    private func specFor(accountId: String): FeishuLongConnectStartSpec {
+        FeishuLongConnectStartSpec(
+            accountId: accountId,
+            appId: "cli_app_${accountId}",
+            appSecret: "secret-app-${accountId}",
+            domain: "https://open.feishu.cn",
+            verificationToken: "secret-verification-${accountId}",
+            encryptKey: "secret-encrypt-${accountId}"
+        )
+    }
+
     private func options(): FeishuSidecarTransportOptions {
         FeishuSidecarTransportOptions(
             command: "node",
@@ -478,5 +489,139 @@ public class FeishuSidecarTransportTest {
         let diagnostics = transport.diagnosticsSnapshot()
         @Expect(diagnostics[1].message.contains("secret-app"), false)
         @Expect(diagnostics[1].message.contains("secret-verification"), false)
+    }
+
+    @TestCase
+    public func supervisorStartsTwoAccountsThroughOneSidecarProcess(): Unit {
+        let process = FeishuSidecarFakeProcess(stdout: [
+            "{\"type\":\"ready\",\"accountId\":\"tenant-a\",\"transport\":\"websocket\"}",
+            "{\"type\":\"ready\",\"accountId\":\"tenant-b\",\"transport\":\"websocket\"}"
+        ])
+        let runner = FeishuSidecarFakeRunner(process)
+        let registry = FeishuSidecarSupervisorRegistry(runner: runner, options: this.options())
+        let transportA = FeishuSidecarSupervisorTransport(registry: registry)
+        let transportB = FeishuSidecarSupervisorTransport(registry: registry)
+
+        let resultA = transportA.start(this.specFor("tenant-a"), { _root => () })
+        let resultB = transportB.start(this.specFor("tenant-b"), { _root => () })
+
+        @Expect(resultA.ok, true)
+        @Expect(resultB.ok, true)
+        @Expect(runner.startCount, 1)
+        @Expect(process.stdinLines.size, 2)
+        @Expect(process.stdinLines[0].contains("\"type\":\"initAccount\""), true)
+        @Expect(process.stdinLines[0].contains("\"accountId\":\"tenant-a\""), true)
+        @Expect(process.stdinLines[1].contains("\"type\":\"initAccount\""), true)
+        @Expect(process.stdinLines[1].contains("\"accountId\":\"tenant-b\""), true)
+        @Expect(transportA.healthSnapshot().ready, true)
+        @Expect(transportB.healthSnapshot().ready, true)
+    }
+
+    @TestCase
+    public func supervisorRoutesInboundFramesByAccountId(): Unit {
+        let process = FeishuSidecarFakeProcess(stdout: [
+            "{\"type\":\"ready\",\"accountId\":\"tenant-a\",\"transport\":\"websocket\"}",
+            "{\"type\":\"ready\",\"accountId\":\"tenant-b\",\"transport\":\"websocket\"}",
+            "{\"type\":\"inbound\",\"accountId\":\"tenant-b\",\"eventType\":\"im.message.receive_v1\",\"event\":${this.jsonEvent("om_b")}}",
+            "{\"type\":\"inbound\",\"accountId\":\"tenant-a\",\"eventType\":\"im.message.receive_v1\",\"event\":${this.jsonEvent("om_a")}}"
+        ])
+        let registry = FeishuSidecarSupervisorRegistry(runner: FeishuSidecarFakeRunner(process), options: this.options())
+        let transportA = FeishuSidecarSupervisorTransport(registry: registry)
+        let transportB = FeishuSidecarSupervisorTransport(registry: registry)
+        let eventsA = ArrayList<JsonObject>()
+        let eventsB = ArrayList<JsonObject>()
+
+        @Expect(transportA.start(this.specFor("tenant-a"), { root => eventsA.add(root) }).ok, true)
+        @Expect(transportB.start(this.specFor("tenant-b"), { root => eventsB.add(root) }).ok, true)
+        registry.debugDrainAvailableForTest()
+
+        @Expect(eventsA.size, 1)
+        @Expect(eventsB.size, 1)
+        let headerA = eventsA[0].get("header").getOrThrow().asObject()
+        let headerB = eventsB[0].get("header").getOrThrow().asObject()
+        @Expect(headerA.get("account_id").getOrThrow().asString().getValue(), "tenant-a")
+        @Expect(headerB.get("account_id").getOrThrow().asString().getValue(), "tenant-b")
+        let messageA = eventsA[0].get("event").getOrThrow().asObject().get("message").getOrThrow().asObject()
+        let messageB = eventsB[0].get("event").getOrThrow().asObject().get("message").getOrThrow().asObject()
+        @Expect(messageA.get("message_id").getOrThrow().asString().getValue(), "om_a")
+        @Expect(messageB.get("message_id").getOrThrow().asString().getValue(), "om_b")
+    }
+
+    @TestCase
+    public func supervisorBackgroundReaderCompletesReadyAndInboundDispatch(): Unit {
+        let process = FeishuSidecarFakeProcess(stdout: [
+            "{\"type\":\"ready\",\"accountId\":\"tenant-a\",\"transport\":\"websocket\"}",
+            "{\"type\":\"inbound\",\"accountId\":\"tenant-a\",\"eventType\":\"im.message.receive_v1\",\"event\":${this.jsonEvent("om_background")}}"
+        ])
+        let registry = FeishuSidecarSupervisorRegistry(
+            runner: FeishuSidecarFakeRunner(process),
+            options: FeishuSidecarTransportOptions(
+                command: "node",
+                args: ["scripts/feishu-sidecar.mjs"],
+                readyTimeoutMs: 200,
+                readTimeoutMs: 1,
+                stopTimeoutMs: 1,
+                startBackgroundReader: true
+            )
+        )
+        let transport = FeishuSidecarSupervisorTransport(registry: registry)
+        let events = ArrayList<JsonObject>()
+
+        let result = transport.start(this.specFor("tenant-a"), { root => events.add(root) })
+        sleep(Duration.millisecond * 20)
+
+        @Expect(result.ok, true)
+        @Expect(events.size, 1)
+        let message = events[0].get("event").getOrThrow().asObject().get("message").getOrThrow().asObject()
+        @Expect(message.get("message_id").getOrThrow().asString().getValue(), "om_background")
+        transport.stop()
+    }
+
+    @TestCase
+    public func supervisorAccountFailureDoesNotPoisonReadyAccount(): Unit {
+        let process = FeishuSidecarFakeProcess(stdout: [
+            "{\"type\":\"ready\",\"accountId\":\"tenant-a\",\"transport\":\"websocket\"}",
+            "{\"type\":\"error\",\"accountId\":\"tenant-b\",\"phase\":\"start\",\"status\":\"sdk_error\",\"message\":\"tenant b failed\"}",
+            "{\"type\":\"inbound\",\"accountId\":\"tenant-a\",\"eventType\":\"im.message.receive_v1\",\"event\":${this.jsonEvent("om_a_after_b_failure")}}"
+        ])
+        let registry = FeishuSidecarSupervisorRegistry(runner: FeishuSidecarFakeRunner(process), options: this.options())
+        let transportA = FeishuSidecarSupervisorTransport(registry: registry)
+        let transportB = FeishuSidecarSupervisorTransport(registry: registry)
+        let eventsA = ArrayList<JsonObject>()
+
+        let resultA = transportA.start(this.specFor("tenant-a"), { root => eventsA.add(root) })
+        let resultB = transportB.start(this.specFor("tenant-b"), { _root => () })
+        registry.debugDrainAvailableForTest()
+
+        @Expect(resultA.ok, true)
+        @Expect(resultB.ok, false)
+        @Expect(resultB.status, "sdk_error")
+        @Expect(transportA.healthSnapshot().ready, true)
+        @Expect(transportA.healthSnapshot().connected, true)
+        @Expect(transportB.healthSnapshot().lastError.contains("tenant b failed"), true)
+        @Expect(eventsA.size, 1)
+    }
+
+    @TestCase
+    public func supervisorStopOneAccountKeepsOtherAccountProcessAlive(): Unit {
+        let process = FeishuSidecarFakeProcess(stdout: [
+            "{\"type\":\"ready\",\"accountId\":\"tenant-a\",\"transport\":\"websocket\"}",
+            "{\"type\":\"ready\",\"accountId\":\"tenant-b\",\"transport\":\"websocket\"}"
+        ])
+        let registry = FeishuSidecarSupervisorRegistry(runner: FeishuSidecarFakeRunner(process), options: this.options())
+        let transportA = FeishuSidecarSupervisorTransport(registry: registry)
+        let transportB = FeishuSidecarSupervisorTransport(registry: registry)
+
+        @Expect(transportA.start(this.specFor("tenant-a"), { _root => () }).ok, true)
+        @Expect(transportB.start(this.specFor("tenant-b"), { _root => () }).ok, true)
+
+        transportA.stop()
+        @Expect(process.waitCalls, 0)
+        @Expect(process.stdinLines[2].contains("\"type\":\"closeAccount\""), true)
+        @Expect(process.stdinLines[2].contains("\"accountId\":\"tenant-a\""), true)
+
+        transportB.stop()
+        @Expect(process.waitCalls, 1)
+        @Expect(process.stdinLines[3].contains("\"accountId\":\"tenant-b\""), true)
     }
 }

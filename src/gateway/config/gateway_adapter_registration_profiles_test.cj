@@ -1,6 +1,7 @@
 package metis.gateway.config
 
 import metis.core.config.GatewayUserSettings
+import metis.gateway.channels.feishu.FeishuAdapter
 
 import std.unittest.testmacro.*
 import stdx.encoding.json.{JsonBool, JsonObject, JsonString}
@@ -167,5 +168,31 @@ public class GatewayAdapterRegistrationProfilesTest {
         @Expect(profile.accountId, "tg-disabled")
         @Expect(profile.enabled, false)
         @Expect(profile.configured, true)
+    }
+
+    @TestCase
+    public func preparedFeishuSidecarAccountsUseSharedSupervisorTransport(): Unit {
+        var user = GatewayUserSettings()
+        user.feishu.enabled = true
+        user.feishu.appId = "feishu-default-app"
+        user.feishu.appSecret = "feishu-default-secret"
+        let accounts = JsonObject()
+        let writer = JsonObject()
+        writer.put("appId", JsonString("feishu-writer-app"))
+        writer.put("appSecret", JsonString("feishu-writer-secret"))
+        accounts.put("feishu-writer", writer)
+        user.feishu.accounts = Some(accounts)
+
+        let registrations = gatewayPreparedBuiltinAdapterRegistrations(user, false)
+        var feishuCount = 0
+        for (registration in registrations) {
+            if (registration.profile.channelId == "feishu") {
+                feishuCount += 1
+                let adapter = (registration.adapter as FeishuAdapter).getOrThrow()
+                @Expect(adapter.debugFeishuLongConnectTransportKindForTest(), "sidecar-supervisor")
+            }
+        }
+
+        @Expect(feishuCount, 2)
     }
 }
