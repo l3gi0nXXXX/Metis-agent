@@ -2972,21 +2972,25 @@ public class TelegramAdapterTest {
             )
         )
         adapter.start()
-        let payload = "{\"update_id\":1,\"message\":{\"message_id\":202,\"text\":\"save this\",\"reply_to_message\":{\"message_id\":201,\"photo\":[{\"file_id\":\"reply-small\"},{\"file_id\":\"reply-large\"}],\"chat\":{\"id\":745123456,\"type\":\"private\"},\"from\":{\"id\":745123456}},\"chat\":{\"id\":745123456,\"type\":\"private\"},\"from\":{\"id\":745123456}}}"
-        let ack = adapter.ingestWebhookPayload(payload)
-        @Expect(ack.contains("\"ok\":true"), true)
+        try {
+            let payload = "{\"update_id\":1,\"message\":{\"message_id\":202,\"text\":\"save this\",\"reply_to_message\":{\"message_id\":201,\"photo\":[{\"file_id\":\"reply-small\"},{\"file_id\":\"reply-large\"}],\"chat\":{\"id\":745123456,\"type\":\"private\"},\"from\":{\"id\":745123456}},\"chat\":{\"id\":745123456,\"type\":\"private\"},\"from\":{\"id\":745123456}}}"
+            let ack = adapter.ingestWebhookPayload(payload)
+            @Expect(ack.contains("\"ok\":true"), true)
 
-        let inbound = adapter.pullInbound()
-        @Expect(inbound.size, 1)
-        @Expect(inbound[0].text, "save this")
-        @Expect(inbound[0].replyTargetMessageId.getOrThrow(), "201")
-        let mediaRecords = inbound[0].mediaContext.get("records").getOrThrow().asArray()
-        @Expect(mediaRecords.size(), 1)
-        let record = mediaRecords[0].asObject()
-        @Expect(record.get("mediaKind").getOrThrow().asString().getValue(), "photo")
-        @Expect(record.get("fileId").getOrThrow().asString().getValue(), "reply-large")
-        @Expect(record.get("messageId").getOrThrow().asString().getValue(), "201")
-        @Expect(record.get("relation").getOrThrow().asString().getValue(), "replyTarget")
+            let inbound = adapter.pullInbound()
+            @Expect(inbound.size, 1)
+            @Expect(inbound[0].text, "save this")
+            @Expect(inbound[0].replyTargetMessageId.getOrThrow(), "201")
+            let mediaRecords = inbound[0].mediaContext.get("records").getOrThrow().asArray()
+            @Expect(mediaRecords.size(), 1)
+            let record = mediaRecords[0].asObject()
+            @Expect(record.get("mediaKind").getOrThrow().asString().getValue(), "photo")
+            @Expect(record.get("fileId").getOrThrow().asString().getValue(), "reply-large")
+            @Expect(record.get("messageId").getOrThrow().asString().getValue(), "201")
+            @Expect(record.get("relation").getOrThrow().asString().getValue(), "replyTarget")
+        } finally {
+            adapter.stop()
+        }
     }
 
     @TestCase
