@@ -6,7 +6,7 @@ import metis.core.model.{findModelCapabilityCatalogEntry, modelCapabilityCatalog
 import metis.core.skills.SkillsPrompt
 import metis.gateway.model.*
 import metis.gateway.security.gatewayPairingAccountStore
-import metis.gateway.service_plugin.{CapabilityCaller, CapabilityInvokeRequest, buildServicePluginImBindingRules, invokeRegisteredCapability, matchServicePluginImBinding, registerConfiguredServicePlugins, servicePluginConfiguredStatusForUser}
+import metis.gateway.service_plugin.{CapabilityCaller, CapabilityInvokeRequest, CapabilityInvokeResult, buildServicePluginImBindingRules, invokeRegisteredCapability, matchServicePluginImBinding, registerConfiguredServicePlugins, servicePluginConfiguredStatusForUser}
 import metis.gateway.session.{GatewaySessionContext, GatewaySessionRequest, gatewayResolveSessionContext, gatewaySessionRequestFromInbound}
 import metis.gateway.tools.{gatewayHandleNativeCommandLine, gatewayHandleSubagentsCommandLine}
 import metis.gateway.gitcode_plugin.{GatewayCommandContext, buildGitCodeSubscriptionTarget, formatGitCodeSubscribeResult, handleGitCodeKnowledgeQueryCommand, parseGitCodeCommand, removeGitCodeSubscription, saveGitCodeSubscription}
@@ -660,9 +660,7 @@ public class GatewayService {
             timeoutMillis: 60000
         ))
         if (!result.ok) {
-            let diagnostic = result.diagnostic.trimAscii()
-            let suffix = if (diagnostic.isEmpty()) { "" } else { " diagnostic=${diagnostic}" }
-            return "GitCode ${action} failed: status=${result.status}${suffix}"
+            return this.servicePluginRenderGitCodeFailure(action, result)
         }
         if (capabilityId == "gitcode.monitor.scan_once") {
             return this.servicePluginRenderGitCodeScanResult(result.payload)
@@ -671,6 +669,26 @@ public class GatewayService {
             return this.servicePluginRenderGitCodeStatusResult(result.payload)
         }
         "GitCode ${action} completed: status=${result.status}"
+    }
+
+    private func servicePluginRenderGitCodeFailure(action: String, result: CapabilityInvokeResult): String {
+        let normalizedAction = match (action.trimAscii()) {
+            case "" => "request"
+            case "scan_once" => "scan"
+            case other => other
+        }
+        let message = match (result.status.trimAscii()) {
+            case "initialize_timeout" => "service plugin startup timed out before it became ready"
+            case "initialize_failed" => "service plugin initialization failed before it became ready"
+            case "initialize_invalid" => "service plugin returned an invalid initialization response"
+            case "process_start_failed" => "service plugin process could not be started"
+            case "invoke_timeout" => "service plugin did not respond before the request timed out"
+            case "frame_decode_failed" => "service plugin returned a response that could not be decoded"
+            case "correlation_mismatch" => "service plugin response did not match the request"
+            case "runtime_required" => "service plugin runtime is required but is not available"
+            case _ => "service plugin reported an unknown failure"
+        }
+        "GitCode ${normalizedAction} failed: ${message}."
     }
 
     private func servicePluginRenderGitCodeScanResult(payload: String): String {
