@@ -100,6 +100,84 @@ public class ServicePluginManifestResult {
     }
 }
 
+public class ServicePluginPayloadStatus {
+    public let parsed: Bool
+    public let okPresent: Bool
+    public let ok: Bool
+    public let status: String
+    public let diagnostic: String
+    public let payloadKind: String
+
+    public init(
+        parsed: Bool,
+        okPresent!: Bool = false,
+        ok!: Bool = false,
+        status!: String = "invalid_payload",
+        diagnostic!: String = "",
+        payloadKind!: String = "plain_text"
+    ) {
+        this.parsed = parsed
+        this.okPresent = okPresent
+        this.ok = ok
+        this.status = status.trimAscii()
+        this.diagnostic = diagnostic.trimAscii()
+        this.payloadKind = payloadKind.trimAscii()
+    }
+}
+
+public func parseServicePluginPayloadStatus(payload: String): ServicePluginPayloadStatus {
+    let raw = payload.trimAscii()
+    if (raw.isEmpty()) {
+        return ServicePluginPayloadStatus(false, diagnostic: "payload is empty", payloadKind: "plain_text")
+    }
+    let value = try {
+        JsonValue.fromStr(raw)
+    } catch (_: Exception) {
+        return ServicePluginPayloadStatus(false, diagnostic: "payload is not valid JSON", payloadKind: "plain_text")
+    }
+    let root = try {
+        value.asObject()
+    } catch (_: Exception) {
+        return ServicePluginPayloadStatus(false, diagnostic: "payload is not a JSON object", payloadKind: "json_value")
+    }
+
+    let diagnostics = ArrayList<String>()
+    let okPresent = root.get("ok").isSome()
+    var ok = false
+    var okValid = false
+    match (root.get("ok")) {
+        case Some(v) =>
+            try {
+                ok = v.asBool().getValue()
+                okValid = true
+            } catch (_: Exception) {
+                diagnostics.add("ok field must be boolean")
+            }
+        case None => diagnostics.add("missing field: ok")
+    }
+
+    var status = serviceJsonString(root, "status")
+    if (!okValid) {
+        status = "invalid_payload"
+    } else if (status.isEmpty()) {
+        diagnostics.add("missing field: status")
+        status = if (ok) { "ok" } else { "invoke_failed" }
+    }
+
+    let payloadDiagnostic = serviceJsonString(root, "diagnostic")
+    if (!payloadDiagnostic.isEmpty()) {
+        diagnostics.add(payloadDiagnostic)
+    }
+    ServicePluginPayloadStatus(
+        true,
+        okPresent: okPresent,
+        ok: okValid && ok,
+        status: if (status.isEmpty()) { "invalid_payload" } else { status },
+        diagnostic: String.join(diagnostics.toArray(), delimiter: "; "),
+        payloadKind: "json_object"
+    )
+}
+
 public func loadServicePluginManifest(path: String): ServicePluginManifestResult {
     let p = Path(path)
     if (!exists(p)) {

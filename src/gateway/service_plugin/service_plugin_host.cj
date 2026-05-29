@@ -769,12 +769,13 @@ private func servicePluginInvokeViaStdioProcess(record: ServicePluginRuntimeReco
             process.stop()
             return CapabilityInvokeResult(false, record.degradedReason, serviceId: serviceId, capabilityId: request.capabilityId, diagnostic: record.lastError)
         }
-        if (!initDecoded.frame.payload.contains("\"ok\":true")) {
+        let initPayloadStatus = parseServicePluginPayloadStatus(initDecoded.frame.payload)
+        if (!initPayloadStatus.parsed || !initPayloadStatus.okPresent || !initPayloadStatus.ok) {
             record.status = "degraded"
-            record.degradedReason = "initialize_failed"
-            record.lastError = redactServicePayload(initDecoded.frame.payload).text
+            record.degradedReason = if (initPayloadStatus.status == "ok") { "initialize_failed" } else { initPayloadStatus.status }
+            record.lastError = if (initPayloadStatus.diagnostic.isEmpty()) { redactServicePayload(initDecoded.frame.payload).text } else { initPayloadStatus.diagnostic }
             process.stop()
-            return CapabilityInvokeResult(false, "initialize_failed", serviceId: serviceId, capabilityId: request.capabilityId, diagnostic: record.lastError)
+            return CapabilityInvokeResult(false, record.degradedReason, serviceId: serviceId, capabilityId: request.capabilityId, diagnostic: record.lastError)
         }
 
         let correlationId = "corr-${record.instanceId}-${request.capabilityId}"
@@ -812,13 +813,15 @@ private func servicePluginInvokeViaStdioProcess(record: ServicePluginRuntimeReco
             process.stop()
             return CapabilityInvokeResult(false, "correlation_mismatch", serviceId: serviceId, capabilityId: request.capabilityId, diagnostic: record.lastError)
         }
-        record.status = if (response.frame.payload.contains("\"ok\":false")) { "degraded" } else { "running" }
-        record.degradedReason = if (record.status == "running") { "" } else { "invoke_failed" }
-        record.lastError = if (record.status == "running") { "" } else { redactServicePayload(response.frame.payload).text }
+        let payloadStatus = parseServicePluginPayloadStatus(response.frame.payload)
+        let invokeOk = payloadStatus.parsed && payloadStatus.okPresent && payloadStatus.ok
+        record.status = if (invokeOk) { "running" } else { "degraded" }
+        record.degradedReason = if (invokeOk) { "" } else { payloadStatus.status }
+        record.lastError = if (invokeOk) { "" } else if (payloadStatus.diagnostic.isEmpty()) { redactServicePayload(response.frame.payload).text } else { payloadStatus.diagnostic }
         record.lastInvokeAtMillis += 1
         process.writeLine(encodeServiceFrame(ServiceFrame("request", "stop-${record.instanceId}", serviceId, method: "stop", correlationId: "stop-${record.instanceId}", payload: "{}")).trimAscii())
         process.stop()
-        CapabilityInvokeResult(record.status == "running", servicePluginPayloadStatus(response.frame.payload, if (record.status == "running") { "ok" } else { "invoke_failed" }), serviceId: serviceId, capabilityId: request.capabilityId, payload: response.frame.payload, diagnostic: record.lastError)
+        CapabilityInvokeResult(invokeOk, payloadStatus.status, serviceId: serviceId, capabilityId: request.capabilityId, payload: response.frame.payload, diagnostic: record.lastError)
     } catch (e: Exception) {
         record.status = "degraded"
         record.degradedReason = "invoke_exception"
@@ -882,14 +885,6 @@ private func servicePluginProcessError(prefix: String, process: ServicePluginStd
         parts.add("stderr=${stderr}")
     }
     redactServicePayload(String.join(parts.toArray(), delimiter: " ")).text
-}
-
-private func servicePluginPayloadStatus(payload: String, fallback: String): String {
-    let needle = "\"status\":\""
-    if (!payload.contains(needle)) {
-        return fallback
-    }
-    payload.split(needle, 2)[1].split("\"", 2)[0].trimAscii()
 }
 
 public func startServicePlugin(serviceId: String, context!: ServiceStartContext = ServiceStartContext()): ServiceStartResult {

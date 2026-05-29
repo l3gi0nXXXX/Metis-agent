@@ -32,6 +32,34 @@ public class ServicePluginHostTest {
         ))
     }
 
+    private func stdioManifest(responsePayload: String, initPayload!: String = "{ \"ok\": true, \"status\": \"ready\" }"): ServicePluginManifest {
+        let caps = ArrayList<ServiceCapabilityRecord>()
+        caps.add(ServiceCapabilityRecord("stdio.monitor.status", "controlAction"))
+        ServicePluginManifest(
+            schema: METIS_SERVICE_PLUGIN_SCHEMA,
+            pluginId: "stdio-service",
+            displayName: "Stdio Service",
+            kind: "service",
+            protocolVersion: "1.0",
+            entryCommand: "/bin/zsh",
+            entryArgs: ["-lc", this.stdioScript(responsePayload, initPayload: initPayload)],
+            hasConfigSchema: true,
+            capabilityDeclarations: caps
+        )
+    }
+
+    private func stdioScript(responsePayload: String, initPayload!: String): String {
+        let initLine = "{\"type\":\"response\",\"frameId\":\"init-1\",\"serviceId\":\"stdio-service\",\"method\":\"initialize\",\"payload\":${initPayload}}"
+        let responseLine = "{\"type\":\"response\",\"frameId\":\"invoke-1\",\"serviceId\":\"stdio-service\",\"capabilityId\":\"stdio.monitor.status\",\"correlationId\":\"corr-stdio-service-1-stdio.monitor.status\",\"payload\":${responsePayload}}"
+        "printf '%s\\n' '${initLine}'; read ignored; printf '%s\\n' '${responseLine}'; read ignored || true"
+    }
+
+    private func registerStdio(responsePayload: String, initPayload!: String = "{ \"ok\": true, \"status\": \"ready\" }"): Unit {
+        resetServicePluginHostForTest()
+        let result = registerServicePlugin(ServicePluginRegistration(this.stdioManifest(responsePayload, initPayload: initPayload)))
+        @Expect(result.ok, true)
+    }
+
     @TestCase
     public func registerListAndGetServicePluginSnapshot(): Unit {
         let result = registerSample()
@@ -192,5 +220,43 @@ public class ServicePluginHostTest {
         let snapshot = buildServicePluginControlSnapshot()
         @Expect(snapshot.plugins.size, 1)
         @Expect(renderServicePluginDiagnostics(snapshot.plugins[0]).contains("token"), false)
+    }
+
+    @TestCase
+    public func stdioInvokeAcceptsFormattedInitializeAndOkPayload(): Unit {
+        this.registerStdio("{ \"ok\": true, \"status\": \"ok\" }")
+        try {
+            let result = invokeRegisteredCapability(CapabilityInvokeRequest("stdio.monitor.status", payload: "{}"))
+            @Expect(result.ok, true)
+            @Expect(result.status, "ok")
+        } finally {
+            resetServicePluginHostForTest()
+        }
+    }
+
+    @TestCase
+    public func stdioInvokeReturnsFormattedFailureStatus(): Unit {
+        this.registerStdio("{ \"ok\": false, \"status\": \"runtime_required\", \"diagnostic\": \"runtime missing\" }")
+        try {
+            let result = invokeRegisteredCapability(CapabilityInvokeRequest("stdio.monitor.status", payload: "{}"))
+            @Expect(result.ok, false)
+            @Expect(result.status, "runtime_required")
+            @Expect(result.diagnostic.contains("runtime missing"), true)
+        } finally {
+            resetServicePluginHostForTest()
+        }
+    }
+
+    @TestCase
+    public func stdioInvokeRejectsNonBooleanOkField(): Unit {
+        this.registerStdio("{ \"ok\": \"true\", \"status\": \"ok\" }")
+        try {
+            let result = invokeRegisteredCapability(CapabilityInvokeRequest("stdio.monitor.status", payload: "{}"))
+            @Expect(result.ok, false)
+            @Expect(result.status, "invalid_payload")
+            @Expect(result.diagnostic.contains("ok field must be boolean"), true)
+        } finally {
+            resetServicePluginHostForTest()
+        }
     }
 }
