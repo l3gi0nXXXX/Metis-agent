@@ -659,9 +659,40 @@ public class FeishuEventReplayLiveSmokeChecklist {
 
 private let FEISHU_MEDIA_STATE_MAX_RECORDS: Int64 = 200
 
+private class FeishuLongConnectRuntimeDiagnosticSnapshot {
+    public let accountId: String
+    public var lifecycleState: String
+    public var running: Bool
+    public var connected: Bool
+    public var lastError: String
+    public var errorKind: String
+    public var lastDiagnosticPhase: String
+    public var lastInboundAt: Int64
+    public var lastReadyAt: Int64
+    public var transportMode: String
+    public var supervisorPid: Int64
+    public var sidecarProtocolVersion: String
+
+    public init(accountId: String, transportMode!: String = "") {
+        this.accountId = gatewayFeishuNormalizeAccountId(accountId)
+        this.lifecycleState = "stopped"
+        this.running = false
+        this.connected = false
+        this.lastError = ""
+        this.errorKind = "none"
+        this.lastDiagnosticPhase = ""
+        this.lastInboundAt = 0
+        this.lastReadyAt = 0
+        this.transportMode = transportMode.trimAscii()
+        this.supervisorPid = 0
+        this.sidecarProtocolVersion = ""
+    }
+}
+
 public class FeishuAdapter <: ChannelAdapter {
     private var running = false
     private let queueMutex = Mutex()
+    private let runtimeMutex = Mutex()
     private let inboundQueue = ArrayList<InboundMessage>()
     private let outboundLog = ArrayList<OutboundMessage>()
     private let baseConfig: FeishuConfig
@@ -675,6 +706,7 @@ public class FeishuAdapter <: ChannelAdapter {
     private let threadCapabilityCache = HashMap<String, Bool>()
     private var feishuNativeLongConnectLastError: String = ""
     private var feishuLongConnectBackgroundFailurePending = false
+    private let feishuLongConnectRuntimeDiagnostics = HashMap<String, FeishuLongConnectRuntimeDiagnosticSnapshot>()
     private let longConnectTransport: FeishuLongConnectTransport
     private let accountId: String
     private let chatQueue = FeishuChatQueue()
@@ -715,6 +747,14 @@ public class FeishuAdapter <: ChannelAdapter {
 
     public func debugFeishuNativeLongConnectLastErrorForTest(): String {
         this.feishuNativeLongConnectLastError
+    }
+
+    public func debugFeishuLongConnectRuntimeDiagnosticsForAccountForTest(accountId: String): JsonObject {
+        synchronized(this.runtimeMutex) {
+            this.feishuLongConnectRuntimeSnapshotJson(
+                this.feishuLongConnectRuntimeSnapshotLocked(accountId)
+            )
+        }
     }
 
     public func debugFeishuTransportModeForTest(): String {
@@ -932,10 +972,207 @@ public class FeishuAdapter <: ChannelAdapter {
         "unknown"
     }
 
+    private func feishuRuntimeNowMs(): Int64 {
+        DateTime.now().toUnixTimeStamp().toMilliseconds()
+    }
+
+    private func feishuRuntimeNormalizeAccountId(raw: String): String {
+        gatewayFeishuNormalizeAccountId(raw)
+    }
+
+    private func feishuLongConnectRuntimeSnapshotLocked(accountId: String): FeishuLongConnectRuntimeDiagnosticSnapshot {
+        let normalized = this.feishuRuntimeNormalizeAccountId(accountId)
+        match (this.feishuLongConnectRuntimeDiagnostics.get(normalized)) {
+            case Some(snapshot) => snapshot
+            case None =>
+                let snapshot = FeishuLongConnectRuntimeDiagnosticSnapshot(normalized, transportMode: this.config.transportMode)
+                this.feishuLongConnectRuntimeDiagnostics[normalized] = snapshot
+                snapshot
+        }
+    }
+
+    private func feishuLongConnectRuntimeSnapshotJson(snapshot: FeishuLongConnectRuntimeDiagnosticSnapshot): JsonObject {
+        let out = JsonObject()
+        out.put("accountId", JsonString(snapshot.accountId))
+        out.put("lifecycleState", JsonString(snapshot.lifecycleState))
+        out.put("running", JsonBool(snapshot.running))
+        out.put("connected", JsonBool(snapshot.connected))
+        out.put("lastError", JsonString(this.feishuRedactRuntimeDiagnosticText(snapshot.lastError, accountId: snapshot.accountId)))
+        out.put("errorKind", JsonString(snapshot.errorKind))
+        out.put("lastDiagnosticPhase", JsonString(snapshot.lastDiagnosticPhase))
+        out.put("lastInboundAt", JsonInt(snapshot.lastInboundAt))
+        out.put("lastReadyAt", JsonInt(snapshot.lastReadyAt))
+        out.put("transportMode", JsonString(snapshot.transportMode))
+        out.put("supervisorPid", JsonInt(snapshot.supervisorPid))
+        out.put("sidecarProtocolVersion", JsonString(snapshot.sidecarProtocolVersion))
+        out.put("redacted", JsonBool(true))
+        out
+    }
+
+    private func feishuLongConnectRuntimeMarkRunning(
+        accountId: String,
+        connected!: Bool = false,
+        clearError!: Bool = true
+    ): Unit {
+        synchronized(this.runtimeMutex) {
+            let snapshot = this.feishuLongConnectRuntimeSnapshotLocked(accountId)
+            snapshot.lifecycleState = "running"
+            snapshot.running = true
+            if (connected) {
+                snapshot.connected = true
+            }
+            if (snapshot.transportMode.trimAscii().isEmpty()) {
+                snapshot.transportMode = this.config.transportMode
+            }
+            if (clearError) {
+                snapshot.lastError = ""
+                snapshot.errorKind = "none"
+            }
+        }
+    }
+
+    private func feishuLongConnectRuntimeMarkStopped(accountId: String): Unit {
+        synchronized(this.runtimeMutex) {
+            let snapshot = this.feishuLongConnectRuntimeSnapshotLocked(accountId)
+            snapshot.lifecycleState = "stopped"
+            snapshot.running = false
+            snapshot.connected = false
+        }
+    }
+
+    private func feishuLongConnectRuntimeMarkReady(root: JsonObject): Unit {
+        let accountId = this.feishuSidecarRuntimeAccountId(root)
+        synchronized(this.runtimeMutex) {
+            let snapshot = this.feishuLongConnectRuntimeSnapshotLocked(accountId)
+            snapshot.lifecycleState = "running"
+            snapshot.running = true
+            snapshot.connected = true
+            snapshot.lastError = ""
+            snapshot.errorKind = "none"
+            snapshot.lastReadyAt = this.feishuRuntimeNowMs()
+            let transport = this.firstNonEmpty([
+                this.readStringField(root, "transport"),
+                this.readStringField(root, "transportMode"),
+                snapshot.transportMode,
+                this.config.transportMode
+            ])
+            snapshot.transportMode = transport
+            let pid = this.firstPositiveInt([
+                this.readIntField(root, "supervisorPid"),
+                this.readIntField(root, "pid")
+            ])
+            if (pid > 0) {
+                snapshot.supervisorPid = pid
+            }
+            let protocolVersion = this.firstNonEmpty([
+                this.readStringField(root, "sidecarProtocolVersion"),
+                this.readStringField(root, "protocolVersion"),
+                this.readStringField(root, "protocol")
+            ])
+            if (!protocolVersion.trimAscii().isEmpty()) {
+                snapshot.sidecarProtocolVersion = protocolVersion.trimAscii()
+            }
+        }
+    }
+
+    private func feishuLongConnectRuntimeMarkInbound(root: JsonObject): Unit {
+        let accountId = this.feishuSidecarRuntimeAccountId(root)
+        synchronized(this.runtimeMutex) {
+            let snapshot = this.feishuLongConnectRuntimeSnapshotLocked(accountId)
+            snapshot.lifecycleState = "running"
+            snapshot.running = true
+            snapshot.connected = true
+            snapshot.lastInboundAt = this.feishuRuntimeNowMs()
+            let transport = this.firstNonEmpty([
+                this.readStringField(root, "transport"),
+                this.readStringField(root, "transportMode"),
+                snapshot.transportMode,
+                this.config.transportMode
+            ])
+            snapshot.transportMode = transport
+        }
+    }
+
+    private func feishuLongConnectRuntimeMarkDiagnostic(
+        accountId: String,
+        phase: String,
+        status: String,
+        detail: String,
+        failed: Bool
+    ): String {
+        let safeDetail = this.feishuRedactRuntimeDiagnosticText(detail, accountId: accountId).trimAscii()
+        let safePhase = if (phase.trimAscii().isEmpty()) { "background" } else { phase.trimAscii() }
+        synchronized(this.runtimeMutex) {
+            let snapshot = this.feishuLongConnectRuntimeSnapshotLocked(accountId)
+            snapshot.lastDiagnosticPhase = safePhase
+            if (snapshot.transportMode.trimAscii().isEmpty()) {
+                snapshot.transportMode = this.config.transportMode
+            }
+            if (failed) {
+                snapshot.lifecycleState = "failed"
+                snapshot.running = false
+                snapshot.connected = false
+                snapshot.lastError = safeDetail
+                snapshot.errorKind = this.feishuLongConnectRuntimeErrorKind(status, safeDetail)
+            } else {
+                if (this.running || snapshot.running) {
+                    snapshot.lifecycleState = "running"
+                    snapshot.running = true
+                }
+                if (snapshot.lastError.trimAscii().isEmpty()) {
+                    snapshot.errorKind = "none"
+                }
+            }
+        }
+        safeDetail
+    }
+
+    private func feishuLongConnectRuntimeMarkFailure(
+        accountId: String,
+        lifecycleState: String,
+        errorKind: String,
+        detail: String,
+        phase!: String = ""
+    ): String {
+        let safeDetail = this.feishuRedactRuntimeDiagnosticText(detail, accountId: accountId).trimAscii()
+        synchronized(this.runtimeMutex) {
+            let snapshot = this.feishuLongConnectRuntimeSnapshotLocked(accountId)
+            snapshot.lifecycleState = if (lifecycleState.trimAscii().isEmpty()) { "failed" } else { lifecycleState.trimAscii() }
+            snapshot.running = false
+            snapshot.connected = false
+            snapshot.lastError = safeDetail
+            snapshot.errorKind = this.feishuLongConnectRuntimeErrorKind(errorKind, safeDetail)
+            if (!phase.trimAscii().isEmpty()) {
+                snapshot.lastDiagnosticPhase = phase.trimAscii()
+            }
+            if (snapshot.transportMode.trimAscii().isEmpty()) {
+                snapshot.transportMode = this.config.transportMode
+            }
+        }
+        safeDetail
+    }
+
+    private func feishuLongConnectRuntimeErrorKind(rawKind: String, detail: String): String {
+        let trimmed = rawKind.trimAscii()
+        if (!trimmed.isEmpty() && trimmed != "failed" && trimmed != "error") {
+            return trimmed
+        }
+        this.feishuErrorKind(detail)
+    }
+
+    private func firstPositiveInt(values: Array<Int64>): Int64 {
+        for (value in values) {
+            if (value > 0) {
+                return value
+            }
+        }
+        0
+    }
+
     private func feishuLongConnectStartFailureDetail(startResult: FeishuLongConnectStartResult): String {
         let status = startResult.status.trimAscii()
         let rawDetail = if (startResult.error.trimAscii().isEmpty()) { status } else { startResult.error.trimAscii() }
-        let redacted = this.feishuRedactDiagnosticText(rawDetail).trimAscii()
+        let redacted = this.feishuRedactRuntimeDiagnosticText(rawDetail, accountId: this.accountId).trimAscii()
         let safeDetail = if (redacted.isEmpty()) { status } else { redacted }
         if (status.isEmpty() || safeDetail == status) {
             return safeDetail
@@ -971,6 +1208,7 @@ public class FeishuAdapter <: ChannelAdapter {
         }
         if (this.config.receiveMode == "webhook") {
             this.running = true
+            this.feishuLongConnectRuntimeMarkRunning(this.accountId, connected: true)
             let startMeta = JsonObject()
             startMeta.put("mode", JsonString(this.config.receiveMode))
             startMeta.put("transport", JsonString("webhook"))
@@ -980,6 +1218,8 @@ public class FeishuAdapter <: ChannelAdapter {
             return
         }
         if (this.config.appId.isEmpty() || this.config.appSecret.isEmpty()) {
+            let detail = "gateway.feishu.appId / gateway.feishu.appSecret is required"
+            this.feishuLongConnectRuntimeMarkFailure(this.accountId, "failed", "credential", detail, phase: "start")
             this.logChannel(
                 "warn",
                 MetisLogEvent.channelFailed,
@@ -987,7 +1227,7 @@ public class FeishuAdapter <: ChannelAdapter {
                 "failed",
                 "Feishu long connection credentials are required",
                 errorKind: "credential",
-                error: "gateway.feishu.appId / gateway.feishu.appSecret is required",
+                error: detail,
                 accountId: this.accountId
             )
             this.running = true
@@ -1007,6 +1247,13 @@ public class FeishuAdapter <: ChannelAdapter {
         if (!startResult.ok) {
             let detail = this.feishuLongConnectStartFailureDetail(startResult)
             this.feishuNativeLongConnectLastError = detail
+            this.feishuLongConnectRuntimeMarkFailure(
+                this.accountId,
+                "failed",
+                startResult.status,
+                detail,
+                phase: "start"
+            )
             this.logChannel(
                 "warn",
                 MetisLogEvent.channelFailed,
@@ -1021,6 +1268,10 @@ public class FeishuAdapter <: ChannelAdapter {
         }
         if (!this.feishuLongConnectBackgroundFailurePending) {
             this.feishuNativeLongConnectLastError = ""
+            this.feishuLongConnectRuntimeMarkRunning(
+                this.accountId,
+                connected: startResult.status.trimAscii() == "ready"
+            )
         }
         this.running = true
         let startMeta = JsonObject()
@@ -1056,6 +1307,7 @@ public class FeishuAdapter <: ChannelAdapter {
 
     public func stop(): Unit {
         this.running = false
+        this.feishuLongConnectRuntimeMarkStopped(this.accountId)
         this.longConnectTransport.stop()
         if (let Some(server) <- this.webhookServer) {
             try {
@@ -1828,11 +2080,15 @@ public class FeishuAdapter <: ChannelAdapter {
     }
 
     private func handleFeishuNativeLongConnectEventRoot(root: JsonObject): Unit {
+        if (this.handleFeishuSidecarRuntimeFrame(root)) {
+            return
+        }
         let encrypted = this.readStringField(root, "encrypt").trimAscii()
         if (!encrypted.isEmpty()) {
             let decrypt = feishuDecryptEncryptedEventPayload(encryptKey: this.config.encryptKey, encryptedPayload: encrypted)
             if (!decrypt.ok) {
                 this.feishuNativeLongConnectLastError = decrypt.error
+                this.feishuLongConnectRuntimeMarkFailure(this.accountId, "failed", "validation", decrypt.error, phase: "decrypt")
                 this.logChannel(
                     "warn",
                     MetisLogEvent.channelFailed,
@@ -1849,12 +2105,62 @@ public class FeishuAdapter <: ChannelAdapter {
                 JsonValue.fromStr(decrypt.payload).asObject()
             } catch (_e: Exception) {
                 this.feishuNativeLongConnectLastError = "Feishu encrypted event decrypted to invalid JSON"
+                this.feishuLongConnectRuntimeMarkFailure(this.accountId, "failed", "parse", this.feishuNativeLongConnectLastError, phase: "decrypt")
                 return
             }
             let _ = this.feishuDispatchEventRoot(decryptedRoot)
             return
         }
         let _ = this.feishuDispatchEventRoot(root)
+    }
+
+    private func handleFeishuSidecarRuntimeFrame(root: JsonObject): Bool {
+        let frameType = this.readStringField(root, "type").trimAscii().toAsciiLower()
+        if (frameType.isEmpty()) {
+            return false
+        }
+        if (frameType == "ready") {
+            this.feishuLongConnectRuntimeMarkReady(root)
+            return true
+        }
+        if (frameType == "inbound") {
+            this.feishuLongConnectRuntimeMarkInbound(root)
+            let _ = this.feishuDispatchEventRoot(this.feishuSidecarInboundRoot(root))
+            return true
+        }
+        if (frameType == "diagnostic") {
+            let _ = this.handleFeishuSidecarDiagnosticEvent(root)
+            return true
+        }
+        if (frameType == "error") {
+            let accountId = this.feishuSidecarRuntimeAccountId(root)
+            let phase = this.firstNonEmpty([
+                this.readStringField(root, "phase"),
+                "error"
+            ])
+            let status = this.firstNonEmpty([
+                this.readStringField(root, "status"),
+                "error"
+            ])
+            let detail = this.firstNonEmpty([
+                this.readStringField(root, "error"),
+                this.readStringField(root, "message"),
+                status
+            ])
+            this.recordFeishuSidecarBackgroundFailure(accountId, phase, status, detail, lifecycleState: "failed")
+            return true
+        }
+        if (frameType == "closed") {
+            let accountId = this.feishuSidecarRuntimeAccountId(root)
+            let reason = this.firstNonEmpty([
+                this.readStringField(root, "reason"),
+                this.readStringField(root, "message"),
+                "closed"
+            ])
+            this.recordFeishuSidecarBackgroundFailure(accountId, "closed", "closed", "sidecar closed: ${reason}", lifecycleState: "disconnected")
+            return true
+        }
+        false
     }
 
     /**
@@ -2325,14 +2631,90 @@ public class FeishuAdapter <: ChannelAdapter {
         recorded
     }
 
-    private func handleFeishuSidecarDiagnosticEvent(root: JsonObject): String {
-        let diagnostic = match (root.get("sidecar")) {
+    private func feishuSidecarRuntimeAccountId(root: JsonObject): String {
+        let explicit = this.firstNonEmpty([
+            this.readStringField(root, "accountId"),
+            this.readStringField(root, "account_id"),
+            this.readFeishuEnvelopeAccountId(root)
+        ])
+        if (!explicit.trimAscii().isEmpty()) {
+            return gatewayFeishuNormalizeAccountId(explicit)
+        }
+        let sidecar = match (root.get("sidecar")) {
+            case Some(v) => try { v.asObject() } catch (_e: Exception) { JsonObject() }
+            case None => JsonObject()
+        }
+        let sidecarAccountId = this.firstNonEmpty([
+            this.readStringField(sidecar, "accountId"),
+            this.readStringField(sidecar, "account_id")
+        ])
+        if (!sidecarAccountId.trimAscii().isEmpty()) {
+            return gatewayFeishuNormalizeAccountId(sidecarAccountId)
+        }
+        this.effectiveAccountId()
+    }
+
+    private func feishuSidecarInboundRoot(frame: JsonObject): JsonObject {
+        let header = JsonObject()
+        header.put("event_type", JsonString(this.readStringField(frame, "eventType")))
+        header.put("account_id", JsonString(this.feishuSidecarRuntimeAccountId(frame)))
+        let event = match (frame.get("event")) {
+            case Some(v) => try { v.asObject() } catch (_e: Exception) { JsonObject() }
+            case None => JsonObject()
+        }
+        let root = JsonObject()
+        root.put("header", header)
+        root.put("event", event)
+        root
+    }
+
+    private func feishuSidecarDiagnosticObject(root: JsonObject): JsonObject {
+        if (this.readStringField(root, "type").trimAscii().toAsciiLower() == "diagnostic") {
+            return root
+        }
+        match (root.get("sidecar")) {
             case Some(v) => try { v.asObject() } catch (_e: Exception) { JsonObject() }
             case None => match (root.get("event")) {
                 case Some(v) => try { v.asObject() } catch (_e: Exception) { JsonObject() }
                 case None => JsonObject()
             }
         }
+    }
+
+    private func recordFeishuSidecarBackgroundFailure(
+        accountId: String,
+        phase: String,
+        status: String,
+        detail: String,
+        lifecycleState!: String = "failed"
+    ): String {
+        let normalizedAccountId = gatewayFeishuNormalizeAccountId(accountId)
+        let safeDetail = this.feishuLongConnectRuntimeMarkFailure(
+            normalizedAccountId,
+            lifecycleState,
+            status,
+            detail,
+            phase: phase
+        )
+        if (normalizedAccountId == this.accountId) {
+            this.feishuNativeLongConnectLastError = safeDetail
+            this.feishuLongConnectBackgroundFailurePending = true
+        }
+        this.logChannel(
+            "warn",
+            MetisLogEvent.channelFailed,
+            "sidecar",
+            "failed",
+            "Feishu sidecar background failure",
+            errorKind: this.feishuLongConnectRuntimeErrorKind(status, safeDetail),
+            error: safeDetail,
+            accountId: normalizedAccountId
+        )
+        safeDetail
+    }
+
+    private func handleFeishuSidecarDiagnosticEvent(root: JsonObject): String {
+        let diagnostic = this.feishuSidecarDiagnosticObject(root)
         let status = this.firstNonEmpty([
             this.readStringField(diagnostic, "status"),
             this.readStringField(diagnostic, "state")
@@ -2348,9 +2730,12 @@ public class FeishuAdapter <: ChannelAdapter {
             status
         ])
         let loweredStatus = status.trimAscii().toAsciiLower()
-        let failed = loweredStatus.contains("fail") || loweredStatus.contains("error") || !this.readStringField(diagnostic, "error").trimAscii().isEmpty()
+        let failed = loweredStatus.contains("fail") ||
+            loweredStatus.contains("error") ||
+            !this.readStringField(diagnostic, "error").trimAscii().isEmpty()
+        let accountId = this.feishuSidecarRuntimeAccountId(root)
         if (failed) {
-            let redacted = this.feishuRedactDiagnosticText(detail).trimAscii()
+            let redacted = this.feishuRedactRuntimeDiagnosticText(detail, accountId: accountId).trimAscii()
             let safeDetail = if (redacted == "[redacted]") {
                 "feishu sidecar ${phase.trimAscii()} failure: [redacted]"
             } else if (redacted.isEmpty()) {
@@ -2358,18 +2743,9 @@ public class FeishuAdapter <: ChannelAdapter {
             } else {
                 "feishu sidecar ${phase.trimAscii()} failure: ${redacted}"
             }
-            this.feishuNativeLongConnectLastError = safeDetail
-            this.feishuLongConnectBackgroundFailurePending = true
-            this.logChannel(
-                "warn",
-                MetisLogEvent.channelFailed,
-                "sidecar",
-                "failed",
-                "Feishu sidecar background failure",
-                errorKind: this.feishuErrorKind(safeDetail),
-                error: safeDetail,
-                accountId: this.resolveFeishuAccountId(root)
-            )
+            this.recordFeishuSidecarBackgroundFailure(accountId, phase, status, safeDetail)
+        } else {
+            this.feishuLongConnectRuntimeMarkDiagnostic(accountId, phase, status, detail, false)
         }
         "{\"ok\":true}"
     }
@@ -5378,6 +5754,39 @@ public class FeishuAdapter <: ChannelAdapter {
             return "[redacted]"
         }
         raw
+    }
+
+    private func feishuRedactRuntimeDiagnosticText(raw: String, accountId!: String = ""): String {
+        var redacted = raw.trimAscii()
+        if (redacted.isEmpty()) {
+            return ""
+        }
+        let values = ArrayList<String>()
+        values.add(this.config.appSecret)
+        values.add(this.config.verificationToken)
+        values.add(this.config.encryptKey)
+        values.add(this.baseConfig.appSecret)
+        values.add(this.baseConfig.verificationToken)
+        values.add(this.baseConfig.encryptKey)
+        if (!accountId.trimAscii().isEmpty()) {
+            let cfg = this.feishuConfigForAccount(accountId)
+            values.add(cfg.appSecret)
+            values.add(cfg.verificationToken)
+            values.add(cfg.encryptKey)
+        }
+        for (candidateAccountId in gatewayFeishuListAccountIds(this.baseConfig)) {
+            let cfg = this.feishuConfigForAccount(candidateAccountId)
+            values.add(cfg.appSecret)
+            values.add(cfg.verificationToken)
+            values.add(cfg.encryptKey)
+        }
+        for (value in values.toArray()) {
+            let trimmed = value.trimAscii()
+            if (!trimmed.isEmpty()) {
+                redacted = redacted.replace(trimmed, "[redacted]")
+            }
+        }
+        this.feishuRedactDiagnosticText(redacted)
     }
 
     private func extractMergeForwardText(contentJsonString: String): String {
