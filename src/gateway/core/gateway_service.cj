@@ -6,8 +6,10 @@ import metis.core.model.{findModelCapabilityCatalogEntry, modelCapabilityCatalog
 import metis.core.skills.SkillsPrompt
 import metis.gateway.model.*
 import metis.gateway.security.gatewayPairingAccountStore
+import metis.gateway.service_plugin.{buildServicePluginImBindingRules, matchServicePluginImBinding, servicePluginConfiguredStatusForUser}
 import metis.gateway.session.{GatewaySessionContext, GatewaySessionRequest, gatewayResolveSessionContext, gatewaySessionRequestFromInbound}
 import metis.gateway.tools.{gatewayHandleNativeCommandLine, gatewayHandleSubagentsCommandLine}
+import metis.gateway.gitcode_plugin.{GatewayCommandContext, GitCodeScanOnceArgs, buildGitCodeSubscriptionTarget, formatGitCodeSubscribeResult, handleGitCodeKnowledgeQueryCommand, handleGitCodeScanOnceCommand, handleGitCodeStatusCommand, parseGitCodeCommand, removeGitCodeSubscription, saveGitCodeSubscription}
 import magic.jsonable.*
 import std.collection.{ArrayList, HashSet}
 import std.convert.Parsable
@@ -283,7 +285,8 @@ public class GatewayService {
                     if (execution.delivered) { "gateway reply delivered" } else { "gateway reply delivery failed" },
                     meta: gatewayLogMeta()
                         .string("channel", target.channelName)
-                        .string("accountId", context.accountId)
+                        .string("accountId", target.accountId)
+                        .string("contextAccountId", context.accountId)
                         .string("sessionKey", context.sessionKey)
                         .identityHash("peerHash", target.peerId)
                         .string("deliveryStatus", execution.deliveryStatus)
@@ -411,6 +414,9 @@ public class GatewayService {
         }
         if (message.systemEvent) {
             this.handleInboundSystemEvent(message, effectiveAccountId, user, conversationKey)
+            return
+        }
+        if (this.handleServicePluginImCommand(message, effectiveAccountId, user, conversationKey)) {
             return
         }
         if (channelToString(message.channel) == "telegram" && this.handleTelegramNativeCommand(message, effectiveAccountId, user, conversationKey)) {
@@ -589,6 +595,150 @@ public class GatewayService {
 
     private func telegramVoiceFallbackText(message: InboundMessage): String {
         this.telegramSilentVoiceFallbackText(message)
+    }
+
+    private func servicePluginSendImReply(message: InboundMessage, accountId: String, reply: String): Unit {
+        let channelName = channelToString(message.channel)
+        let _ = this.sendTextToPeerDetailed(
+            channelName,
+            message.peerId,
+            reply,
+            replyToMessageId: message.replyTargetMessageId,
+            replyInThread: message.replyInThread,
+            accountId: accountId
+        )
+    }
+
+    private func servicePluginGitCodeReply(message: InboundMessage, accountId: String, sessionKey: String): String {
+        let parsed = parseGitCodeCommand(message.text)
+        if (!parsed.handled) {
+            return "unknown gitcode command"
+        }
+        let context = GatewayCommandContext(
+            channel: channelToString(message.channel),
+            accountId: accountId,
+            peerId: message.peerId,
+            threadId: message.threadId ?? "",
+            senderId: message.senderId,
+            sessionKey: sessionKey,
+            authorized: true,
+            isOperator: true
+        )
+        match (parsed.action) {
+            case "help" =>
+                "gitcode commands: /gitcode status, /gitcode subscribe, /gitcode unsubscribe, /gitcode scan once, /gitcode query <question>"
+            case "status" | "config" =>
+                handleGitCodeStatusCommand(context).message
+            case "subscribe" =>
+                formatGitCodeSubscribeResult(saveGitCodeSubscription(buildGitCodeSubscriptionTarget(context)))
+            case "unsubscribe" =>
+                let result = removeGitCodeSubscription(buildGitCodeSubscriptionTarget(context))
+                "gitcode unsubscribe status=${result.status}"
+            case "scan_once" =>
+                handleGitCodeScanOnceCommand(context, GitCodeScanOnceArgs()).message
+            case "query" =>
+                handleGitCodeKnowledgeQueryCommand(context, parsed.query).message
+            case _ =>
+                if (!parsed.diagnostic.trimAscii().isEmpty()) {
+                    parsed.diagnostic.trimAscii()
+                } else {
+                    "unknown gitcode command"
+                }
+        }
+    }
+
+    private func servicePluginCommandActionForLog(text: String, prefix: String): String {
+        let trimmed = text.trimAscii()
+        let commandPrefix = prefix.trimAscii()
+        if (commandPrefix.isEmpty() || !trimmed.startsWith(commandPrefix)) {
+            return "unknown"
+        }
+        let tail = trimmed[commandPrefix.size..].trimAscii()
+        if (tail.isEmpty()) {
+            return "help"
+        }
+        tail.split(" ")[0].trimAscii().toAsciiLower()
+    }
+
+    private func handleServicePluginImCommand(
+        message: InboundMessage,
+        accountId: String,
+        user: GatewayUserSettings,
+        sessionKey: String
+    ): Bool {
+        let channelName = channelToString(message.channel)
+        let rules = buildServicePluginImBindingRules(user)
+        let matched = matchServicePluginImBinding(rules, channelName, accountId, message.text)
+        gatewayLogEventDebug(
+            "gateway/service_plugin",
+            "service_plugin.im.checked",
+            "service plugin IM binding checked",
+            meta: gatewayLogMeta()
+                .string("channel", channelName)
+                .string("accountId", accountId)
+                .string("pluginId", matched.pluginId)
+                .bool("prefixMatched", matched.prefixMatched)
+                .string("reason", matched.reason)
+                .object()
+        )
+        if (!matched.matched) {
+            if (matched.reason == "binding_conflict") {
+                gatewayLogEventWarn(
+                    "gateway/service_plugin",
+                    "service_plugin.im.failed",
+                    "service plugin IM binding conflict",
+                    meta: gatewayLogMeta()
+                        .string("channel", channelName)
+                        .string("accountId", accountId)
+                        .string("pluginId", matched.pluginId)
+                        .string("errorKind", "binding_conflict")
+                        .string("status", "conflict")
+                        .object()
+                )
+                this.servicePluginSendImReply(message, accountId, "service plugin command conflict: ${matched.pluginId}")
+                return true
+            }
+            return false
+        }
+
+        gatewayLogEventInfo(
+            "gateway/service_plugin",
+            "service_plugin.im.matched",
+            "service plugin IM command matched",
+            meta: gatewayLogMeta()
+                .string("channel", channelName)
+                .string("accountId", accountId)
+                .string("pluginId", matched.pluginId)
+                .string("commandPrefix", matched.commandPrefix)
+                .string("commandAction", this.servicePluginCommandActionForLog(matched.commandText, matched.commandPrefix))
+                .object()
+        )
+
+        let configured = servicePluginConfiguredStatusForUser(user, matched.pluginId)
+        if (!configured.ok && configured.status == "degraded") {
+            gatewayLogEventWarn(
+                "gateway/service_plugin",
+                "service_plugin.im.failed",
+                "service plugin IM command degraded",
+                meta: gatewayLogMeta()
+                    .string("channel", channelName)
+                    .string("accountId", accountId)
+                    .string("pluginId", matched.pluginId)
+                    .string("errorKind", configured.errorKind)
+                    .string("status", configured.status)
+                    .object()
+            )
+            this.servicePluginSendImReply(message, accountId, "service plugin ${matched.pluginId} degraded: ${configured.errorKind}")
+            return true
+        }
+
+        let reply = if (matched.pluginId == "gitcode-monitor") {
+            this.servicePluginGitCodeReply(message, accountId, sessionKey)
+        } else {
+            "service plugin command dispatch unsupported: pluginId=${matched.pluginId}"
+        }
+        this.servicePluginSendImReply(message, accountId, reply)
+        return true
     }
 
     private func telegramTranscriptFromInboundText(text: String): String {

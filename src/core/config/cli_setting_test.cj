@@ -211,4 +211,39 @@ public class CliSettingManagerTest {
             @Expect(parsed.telegram.autoTopicLabel.prompt, "label prompt")
         }
     }
+
+    @TestCase
+    public func gatewaySettingsReadParsesServicePluginImBindings(): Unit {
+        withMetisConfigTestHome("service-plugin-im-binding-read") { _home =>
+            let root = JsonObject()
+            let gateway = JsonObject()
+            let plugin = JsonObject()
+            plugin.put("pluginId", JsonString("gitcode-monitor"))
+            plugin.put("enabled", JsonBool(true))
+            plugin.put("manifestPath", JsonString("/tmp/metis-gitcode-service-plugin.json"))
+            plugin.put("configRef", JsonString("/tmp/metis-gitcode-config.json"))
+            plugin.put("grants", JsonArray([JsonString("host.agent.invoke")]))
+            let imBindings = JsonObject()
+            let telegram = JsonObject()
+            telegram.put("accountId", JsonString("tg-gitcode-monitor"))
+            telegram.put("commandPrefix", JsonString("/gitcode"))
+            telegram.put("scopes", JsonArray([JsonString("direct"), JsonString("group")]))
+            imBindings.put("telegram", telegram)
+            plugin.put("imBindings", imBindings)
+            gateway.put("servicePlugins", JsonArray([plugin]))
+            root.put("gateway", gateway)
+            MetisConfigManager.writeRoot(root)
+            CliSettingManager.invalidate()
+
+            let parsed = CliSettingManager.readGatewaySettings()
+
+            @Expect(parsed.servicePlugins.size, 1)
+            @Expect(parsed.servicePlugins[0].pluginId, "gitcode-monitor")
+            @Expect(parsed.servicePlugins[0].enabled, true)
+            @Expect(parsed.servicePlugins[0].grants[0], "host.agent.invoke")
+            let binding = parsed.servicePlugins[0].imBindings.get("telegram").getOrThrow().asObject()
+            @Expect(binding.get("accountId").getOrThrow().asString().getValue(), "tg-gitcode-monitor")
+            @Expect(binding.get("commandPrefix").getOrThrow().asString().getValue(), "/gitcode")
+        }
+    }
 }

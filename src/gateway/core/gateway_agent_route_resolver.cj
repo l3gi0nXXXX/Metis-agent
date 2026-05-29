@@ -653,7 +653,7 @@ public func gatewayResolveAgentRoute(input: GatewayAgentRouteInput): GatewayAgen
 
     var agentId = fallbackAgentId
     var matchedBy = "default"
-    var preferredAccountId = defaultAccountId
+    var preferredAccountId = accountId
     if (!input.explicitAgentId.isEmpty()) {
         agentId = gatewayRouteSanitizeAgentId(input.explicitAgentId)
         matchedBy = if (!input.explicitMatchedBy.isEmpty()) { input.explicitMatchedBy } else { "explicit.agentId" }

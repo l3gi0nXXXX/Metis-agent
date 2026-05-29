@@ -1,6 +1,6 @@
 package metis.gateway.core
 
-import metis.core.config.{CliConfig, CliSettingManager, GatewayUserSettings, MetisConfigManager, MetisProcessEnvironmentLock, TelegramCustomCommandUserSettings}
+import metis.core.config.{CliConfig, CliSettingManager, GatewayServicePluginUserSettings, GatewayUserSettings, MetisConfigManager, MetisProcessEnvironmentLock, TelegramCustomCommandUserSettings}
 import metis.core.{GatewaySpeechTtsDashScopeQwenHttpResult, gatewaySubagentCreateRunRecord, gatewaySubagentListRunRecords, gatewaySubagentRunRecordString, setGatewaySpeechTtsDashScopeQwenRunnerForTest}
 import metis.gateway.logging.{gatewayLoggingCaptureConsoleForTest, gatewayLoggingCapturedConsoleForTest, gatewayLoggingResetForTest}
 import metis.gateway.model.{ChannelPolicyConfig, ChannelType, ChatType, InboundMessage, OutboundMessage, SendResult}
@@ -98,6 +98,13 @@ private class GatewayTelegramNativeTestAdapter <: ChannelAdapter {
     public func sentReplyTo(index: Int64): String {
         match (this.sent.get(index)) {
             case Some(v) => v.replyToMessageId ?? ""
+            case None => ""
+        }
+    }
+
+    public func sentAccount(index: Int64): String {
+        match (this.sent.get(index)) {
+            case Some(v) => v.accountId
             case None => ""
         }
     }
@@ -309,6 +316,26 @@ private func gatewayTelegramNativeService(adapter: GatewayTelegramNativeTestAdap
     service
 }
 
+private func gatewayTelegramNativeServiceForAccount(adapter: GatewayTelegramNativeTestAdapter, accountId: String): GatewayService {
+    let policies = HashMap<String, ChannelPolicyConfig>()
+    policies["telegram"] = ChannelPolicyConfig(enableDirect: true, allowFrom: ["*"])
+    let service = GatewayService(GatewayRouter(policies))
+    service.registerAdapter(adapter, channelId: "telegram", accountId: accountId)
+    service
+}
+
+private func gatewayTelegramNativeGitcodePluginSettings(accountId: String): GatewayServicePluginUserSettings {
+    var plugin = GatewayServicePluginUserSettings()
+    plugin.pluginId = "gitcode-monitor"
+    plugin.enabled = true
+    let binding = JsonObject()
+    binding.put("accountId", JsonString(accountId))
+    binding.put("commandPrefix", JsonString("/gitcode"))
+    binding.put("scopes", JsonArray([JsonString("direct"), JsonString("group")]))
+    plugin.imBindings.put("telegram", binding)
+    plugin
+}
+
 private func gatewayTelegramNativeDashScopeQwenTtsProviders(): JsonObject {
     let providers = JsonObject()
     let provider = JsonObject()
@@ -454,6 +481,106 @@ public class GatewayServiceTelegramSendDiagnosticsTest {
 
 @Test
 public class GatewayServiceTelegramNativeTest {
+    @TestCase
+    public func nonDefaultTelegramAccountReplyUsesSameAccount(): Unit {
+        withGatewayTelegramNativeTestHome {
+            let modelName = "metis-test-telegram-non-default-${DateTime.now().toUnixTimeStamp().toMilliseconds()}"
+            ModelManager.registerChatModel(modelName, { => GatewayTelegramNativeFakeModel() })
+            let oldModel = CliConfig.model
+            CliConfig.model = modelName
+            let adapter = GatewayTelegramNativeTestAdapter()
+            let service = gatewayTelegramNativeServiceForAccount(adapter, "tg-gitcode-monitor")
+            try {
+                var user = GatewayUserSettings()
+                user.telegram.enabled = true
+                user.telegram.allowFrom = ["*"]
+                CliSettingManager.writeGatewaySettings(user)
+
+                service.start()
+                adapter.queue("hello")
+                service.processOnce()
+
+                var found = false
+                for (i in 0..adapter.sentCount()) {
+                    if (adapter.sentText(i) == "fake telegram native session answer" &&
+                        adapter.sentAccount(i) == "tg-gitcode-monitor") {
+                        found = true
+                    }
+                }
+                @Expect(found, true)
+            } finally {
+                service.stop()
+                CliConfig.model = oldModel
+            }
+        }
+    }
+
+    @TestCase
+    public func telegramGitcodeCommandDispatchesBeforeAgentRoute(): Unit {
+        withGatewayTelegramNativeTestHome {
+            let modelName = "metis-test-telegram-gitcode-${DateTime.now().toUnixTimeStamp().toMilliseconds()}"
+            ModelManager.registerChatModel(modelName, { => GatewayTelegramNativeFakeModel() })
+            let oldModel = CliConfig.model
+            CliConfig.model = modelName
+            let adapter = GatewayTelegramNativeTestAdapter()
+            let service = gatewayTelegramNativeServiceForAccount(adapter, "tg-gitcode-monitor")
+            try {
+                var user = GatewayUserSettings()
+                user.telegram.enabled = true
+                user.telegram.allowFrom = ["*"]
+                user.servicePlugins = [gatewayTelegramNativeGitcodePluginSettings("tg-gitcode-monitor")]
+                CliSettingManager.writeGatewaySettings(user)
+
+                service.start()
+                adapter.queue("/gitcode status")
+                service.processOnce()
+
+                @Expect(adapter.sentCount(), 1)
+                @Expect(adapter.sentText(0).contains("gitcode enabled=true"), true)
+                @Expect(adapter.sentText(0).contains("fake telegram native session answer"), false)
+                @Expect(adapter.sentAccount(0), "tg-gitcode-monitor")
+            } finally {
+                service.stop()
+                CliConfig.model = oldModel
+            }
+        }
+    }
+
+    @TestCase
+    public func telegramGitcodePlainTextFallsBackToAgentSameAccount(): Unit {
+        withGatewayTelegramNativeTestHome {
+            let modelName = "metis-test-telegram-gitcode-fallback-${DateTime.now().toUnixTimeStamp().toMilliseconds()}"
+            ModelManager.registerChatModel(modelName, { => GatewayTelegramNativeFakeModel() })
+            let oldModel = CliConfig.model
+            CliConfig.model = modelName
+            let adapter = GatewayTelegramNativeTestAdapter()
+            let service = gatewayTelegramNativeServiceForAccount(adapter, "tg-gitcode-monitor")
+            try {
+                var user = GatewayUserSettings()
+                user.telegram.enabled = true
+                user.telegram.allowFrom = ["*"]
+                user.servicePlugins = [gatewayTelegramNativeGitcodePluginSettings("tg-gitcode-monitor")]
+                CliSettingManager.writeGatewaySettings(user)
+
+                service.start()
+                adapter.queue("hello")
+                service.processOnce()
+
+                var found = false
+                for (i in 0..adapter.sentCount()) {
+                    if (adapter.sentText(i) == "fake telegram native session answer" &&
+                        adapter.sentAccount(i) == "tg-gitcode-monitor") {
+                        found = true
+                    }
+                }
+                @Expect(found, true)
+            } finally {
+                service.stop()
+                CliConfig.model = oldModel
+            }
+        }
+    }
+
     @TestCase
     public func gatewayMessageFlowLogsStructuredEventsWithoutInfoTextBody(): Unit {
         withGatewayTelegramNativeTestHome {

@@ -35,6 +35,7 @@ import metis.gateway.core.{
 }
 import metis.gateway.model.*
 import metis.gateway.logging.{MetisLogEvent, gatewayInstallMediaDiagnosticLoggingSinkForRuntime, metisCreateSubsystemLogger}
+import metis.gateway.service_plugin.registerConfiguredServicePlugins
 
 import std.collection.HashMap
 import std.convert.Parsable
@@ -98,6 +99,8 @@ public func buildGatewayServiceFromUserSettings(user: GatewayUserSettings): (Gat
     gatewayInstallOpenClawCompatHostLifecycleHooks()
     ensureInstalledGatewayPluginsRegistered()
     gatewayConfigFactoryTimingLog("plugins-registered", startMs)
+    registerConfiguredServicePlugins(user)
+    gatewayConfigFactoryTimingLog("service-plugins-registered", startMs)
     gatewayPrimeConfiguredChannelBindings(user)
     gatewayConfigFactoryTimingLog("bindings-primed", startMs)
     let cfg = buildGatewayConfigFromUserSettings(user)

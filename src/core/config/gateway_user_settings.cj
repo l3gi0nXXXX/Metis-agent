@@ -574,6 +574,35 @@ public struct GatewayPluginUserSettings {
 }
 
 /**
+ * Service plugin 的 IM 命令绑定配置。
+ *
+ * `gateway.servicePlugins[].imBindings` 的 key 是动态渠道名（如 `telegram`、`feishu`），
+ * 因此顶层保持 `JsonObject`，每个 value 再按该结构解析。
+ */
+@jsonable
+public struct GatewayServicePluginImBindingUserSettings {
+    public var accountId: String = ""
+    public var commandPrefix: String = ""
+    public var scopes: Array<String> = []
+}
+
+/**
+ * Service capability plugin 配置。
+ *
+ * 该结构与 `GatewayPluginUserSettings` 不同：`gatewayPlugins` 是扩展 channel adapter，
+ * `servicePlugins` 是 Gateway 内可被 IM 命令、工具或控制面调用的 service capability。
+ */
+@jsonable
+public struct GatewayServicePluginUserSettings {
+    public var pluginId: String = ""
+    public var enabled: Bool = true
+    public var manifestPath: String = ""
+    public var configRef: String = ""
+    public var grants: Array<String> = []
+    public var imBindings: JsonObject = JsonObject()
+}
+
+/**
  * 网关总配置（`gateway` 根键）。
  *
  * - `channelsExtra`：预留给钉钉等后续渠道；实现新适配器后可在此存放任意 JSON，
@@ -634,5 +663,7 @@ public struct GatewayUserSettings {
      * 已注册的扩展渠道插件实例开关（飞书/QQ 仍走 `feishu` / `qq` 强类型字段，不在此列表）。
      */
     public var gatewayPlugins: Array<GatewayPluginUserSettings> = []
+    /** 已注册的 service capability plugin。 */
+    public var servicePlugins: Array<GatewayServicePluginUserSettings> = []
     public var channelsExtra: Option<JsonObject> = None
 }

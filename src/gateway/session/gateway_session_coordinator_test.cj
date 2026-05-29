@@ -145,6 +145,30 @@ public class GatewaySessionCoordinatorTest {
     }
 
     @TestCase
+    public func telegramNonDefaultInboundDeliveryTargetUsesInboundAccount(): Unit {
+        let target = gatewayResolveDeliveryTarget(
+            GatewaySessionRequest(
+                GatewayIngressSource.Channel("telegram"),
+                channelName: "telegram",
+                accountId: "tg-gitcode-monitor",
+                peerId: "user:1059872384",
+                replyToMessageId: "4",
+                deliver: true
+            ),
+            "telegram:direct:user:1059872384"
+        )
+
+        match (target) {
+            case Some(value) =>
+                @Expect(value.channelName, "telegram")
+                @Expect(value.accountId, "tg-gitcode-monitor")
+                @Expect(value.replyToMessageId, "4")
+            case None =>
+                @Expect("missing", "delivery-target")
+        }
+    }
+
+    @TestCase
     public func groupSessionKeyUsesSharedBuilder(): Unit {
         let sessionKey = gatewayBuildChannelSessionKey(
             "qq",

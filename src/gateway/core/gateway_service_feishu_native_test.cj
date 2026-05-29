@@ -1,6 +1,6 @@
 package metis.gateway.core
 
-import metis.core.config.{CliConfig, CliSettingManager, GatewayUserSettings, MetisConfigManager, MetisProcessEnvironmentLock}
+import metis.core.config.{CliConfig, CliSettingManager, GatewayServicePluginUserSettings, GatewayUserSettings, MetisConfigManager, MetisProcessEnvironmentLock}
 import metis.gateway.model.{ChannelPolicyConfig, ChannelType, ChatType, InboundMessage, OutboundMessage, SendResult}
 import metis.gateway.security.gatewayPairingAccountStore
 
@@ -90,6 +90,13 @@ private class GatewayFeishuNativeTestAdapter <: ChannelAdapter {
     public func sentText(index: Int64): String {
         match (this.sent.get(index)) {
             case Some(v) => v.text
+            case None => ""
+        }
+    }
+
+    public func sentAccount(index: Int64): String {
+        match (this.sent.get(index)) {
+            case Some(v) => v.accountId
             case None => ""
         }
     }
@@ -235,8 +242,73 @@ private func gatewayFeishuNativeService(adapter: GatewayFeishuNativeTestAdapter,
     service
 }
 
+private func gatewayFeishuNativeGitcodePluginSettings(accountId: String, manifestPath!: String = ""): GatewayServicePluginUserSettings {
+    var plugin = GatewayServicePluginUserSettings()
+    plugin.pluginId = "gitcode-monitor"
+    plugin.enabled = true
+    plugin.manifestPath = manifestPath
+    let binding = JsonObject()
+    binding.put("accountId", JsonString(accountId))
+    binding.put("commandPrefix", JsonString("/gitcode"))
+    binding.put("scopes", JsonArray([JsonString("direct"), JsonString("group")]))
+    plugin.imBindings.put("feishu", binding)
+    plugin
+}
+
 @Test
 public class GatewayServiceFeishuNativeTest {
+    @TestCase
+    public func feishuGitcodeCommandDispatchesBeforeAgentRoute(): Unit {
+        withGatewayFeishuNativeTestHome("gitcode-dispatch", gatewayFeishuNativeTestRoot(), { =>
+            var user = CliSettingManager.readGatewaySettings()
+            user.servicePlugins = [gatewayFeishuNativeGitcodePluginSettings("feishu-gitcode-monitor")]
+            CliSettingManager.writeGatewaySettings(user)
+
+            let adapter = GatewayFeishuNativeTestAdapter(accountId: "feishu-gitcode-monitor")
+            let service = gatewayFeishuNativeService(adapter, enableGroup: false, accountId: "feishu-gitcode-monitor")
+            service.start()
+            try {
+                adapter.queueDirect("/gitcode status")
+                service.processOnce()
+
+                @Expect(adapter.sentCount(), 1)
+                @Expect(adapter.sentText(0).contains("gitcode enabled=true"), true)
+                @Expect(adapter.sentAccount(0), "feishu-gitcode-monitor")
+            } finally {
+                service.stop()
+            }
+        })
+    }
+
+    @TestCase
+    public func feishuGitcodeManifestMissingReturnsDegradedReply(): Unit {
+        withGatewayFeishuNativeTestHome("gitcode-manifest-missing", gatewayFeishuNativeTestRoot(), { =>
+            var user = CliSettingManager.readGatewaySettings()
+            user.servicePlugins = [
+                gatewayFeishuNativeGitcodePluginSettings(
+                    "feishu-gitcode-monitor",
+                    manifestPath: "/tmp/metis-missing-gitcode-service-plugin-manifest-${DateTime.now().toUnixTimeStamp().toNanoseconds()}.json"
+                )
+            ]
+            CliSettingManager.writeGatewaySettings(user)
+
+            let adapter = GatewayFeishuNativeTestAdapter(accountId: "feishu-gitcode-monitor")
+            let service = gatewayFeishuNativeService(adapter, enableGroup: false, accountId: "feishu-gitcode-monitor")
+            service.start()
+            try {
+                adapter.queueDirect("/gitcode status")
+                service.processOnce()
+
+                @Expect(adapter.sentCount(), 1)
+                @Expect(adapter.sentText(0).contains("degraded"), true)
+                @Expect(adapter.sentText(0).contains("manifest_missing"), true)
+                @Expect(adapter.sentAccount(0), "feishu-gitcode-monitor")
+            } finally {
+                service.stop()
+            }
+        })
+    }
+
     @TestCase
     public func feishuStartNativeCommandBypassesGroupGate(): Unit {
         withGatewayFeishuNativeTestHome("start", gatewayFeishuNativeTestRoot(), { =>

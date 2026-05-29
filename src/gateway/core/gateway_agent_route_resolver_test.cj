@@ -270,8 +270,73 @@ public class GatewayAgentRouteResolverTest {
             GatewayAgentRouteInput(root, "telegram", accountId: "bot-b", peerKind: "group", peerId: "-100_a"))
         @Expect(nonDefaultAccount.agentId, "assistant-b")
         @Expect(nonDefaultAccount.accountId, "bot-b")
-        @Expect(nonDefaultAccount.preferredAccountId, "bot-a")
+        @Expect(nonDefaultAccount.preferredAccountId, "bot-b")
         @Expect(nonDefaultAccount.matchedBy, "binding.channel")
+    }
+
+    @TestCase
+    public func nonDefaultTelegramAccountKeepsPreferredAccountWhenNoBinding(): Unit {
+        let root = routeTestConfig()
+
+        let route = gatewayResolveAgentRoute(
+            GatewayAgentRouteInput(
+                root,
+                "telegram",
+                accountId: "bot-b",
+                defaultAccountId: "bot-a",
+                peerKind: "direct",
+                peerId: "1059872384",
+                dmScope: "per-chat"
+            )
+        )
+
+        @Expect(route.accountId, "bot-b")
+        @Expect(route.preferredAccountId, "bot-b")
+        @Expect(route.matchedBy, "default")
+    }
+
+    @TestCase
+    public func explicitAccountBindingStillOverridesInboundAccount(): Unit {
+        let root = routeTestConfig()
+        putBindings(root, [routeBinding("assistant-a", "telegram", accountId: "bot-a")])
+
+        let route = gatewayResolveAgentRoute(
+            GatewayAgentRouteInput(
+                root,
+                "telegram",
+                accountId: "bot-a",
+                defaultAccountId: "bot-b",
+                peerKind: "direct",
+                peerId: "1059872384"
+            )
+        )
+
+        @Expect(route.agentId, "assistant-a")
+        @Expect(route.accountId, "bot-a")
+        @Expect(route.preferredAccountId, "bot-a")
+        @Expect(route.matchedBy, "binding.account")
+    }
+
+    @TestCase
+    public func wildcardAccountBindingKeepsInboundAccount(): Unit {
+        let root = routeTestConfig()
+        putBindings(root, [routeBinding("assistant-b", "telegram", accountId: "*")])
+
+        let route = gatewayResolveAgentRoute(
+            GatewayAgentRouteInput(
+                root,
+                "telegram",
+                accountId: "bot-b",
+                defaultAccountId: "bot-a",
+                peerKind: "direct",
+                peerId: "1059872384"
+            )
+        )
+
+        @Expect(route.agentId, "assistant-b")
+        @Expect(route.accountId, "bot-b")
+        @Expect(route.preferredAccountId, "bot-b")
+        @Expect(route.matchedBy, "binding.channel")
     }
 
     @TestCase
