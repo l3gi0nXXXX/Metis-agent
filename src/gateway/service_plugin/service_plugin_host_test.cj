@@ -259,4 +259,31 @@ public class ServicePluginHostTest {
             resetServicePluginHostForTest()
         }
     }
+
+    @TestCase
+    public func stdioInvokeKeepsLegacyPayloadWithoutOkCompatible(): Unit {
+        this.registerStdio("{ \"accepted\": 1, \"ignored\": 0 }")
+        try {
+            let result = invokeRegisteredCapability(CapabilityInvokeRequest("stdio.monitor.status", payload: "{}"))
+            @Expect(result.ok, true)
+            @Expect(result.status, "ok")
+            @Expect(result.payload.contains("\"accepted\""), true)
+        } finally {
+            resetServicePluginHostForTest()
+        }
+    }
+
+    @TestCase
+    public func stdioInitializeFalseReturnsInitializeFailedWithStatusDiagnostic(): Unit {
+        this.registerStdio("{ \"ok\": true, \"status\": \"ok\" }", initPayload: "{ \"ok\": false, \"status\": \"config_missing\" }")
+        try {
+            let result = invokeRegisteredCapability(CapabilityInvokeRequest("stdio.monitor.status", payload: "{}"))
+            @Expect(result.ok, false)
+            @Expect(result.status, "initialize_failed")
+            @Expect(result.diagnostic.contains("config_missing"), true)
+            @Expect(result.diagnostic.contains("{"), false)
+        } finally {
+            resetServicePluginHostForTest()
+        }
+    }
 }

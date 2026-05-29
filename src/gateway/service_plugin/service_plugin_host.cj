@@ -772,8 +772,14 @@ private func servicePluginInvokeViaStdioProcess(record: ServicePluginRuntimeReco
         let initPayloadStatus = parseServicePluginPayloadStatus(initDecoded.frame.payload)
         if (!initPayloadStatus.parsed || !initPayloadStatus.okPresent || !initPayloadStatus.ok) {
             record.status = "degraded"
-            record.degradedReason = if (initPayloadStatus.status == "ok") { "initialize_failed" } else { initPayloadStatus.status }
-            record.lastError = if (initPayloadStatus.diagnostic.isEmpty()) { redactServicePayload(initDecoded.frame.payload).text } else { initPayloadStatus.diagnostic }
+            record.degradedReason = "initialize_failed"
+            record.lastError = if (!initPayloadStatus.diagnostic.isEmpty()) {
+                initPayloadStatus.diagnostic
+            } else if (!initPayloadStatus.status.isEmpty() && initPayloadStatus.status != "ok" && initPayloadStatus.status != "invalid_payload") {
+                "initialize rejected: ${initPayloadStatus.status}"
+            } else {
+                "initialize payload missing boolean ok"
+            }
             process.stop()
             return CapabilityInvokeResult(false, record.degradedReason, serviceId: serviceId, capabilityId: request.capabilityId, diagnostic: record.lastError)
         }
@@ -814,14 +820,23 @@ private func servicePluginInvokeViaStdioProcess(record: ServicePluginRuntimeReco
             return CapabilityInvokeResult(false, "correlation_mismatch", serviceId: serviceId, capabilityId: request.capabilityId, diagnostic: record.lastError)
         }
         let payloadStatus = parseServicePluginPayloadStatus(response.frame.payload)
-        let invokeOk = payloadStatus.parsed && payloadStatus.okPresent && payloadStatus.ok
+        let invokeOk = !payloadStatus.parsed || !payloadStatus.okPresent || payloadStatus.ok
+        let resultStatus = if (invokeOk) {
+            if (payloadStatus.okPresent && !payloadStatus.status.isEmpty() && payloadStatus.status != "invalid_payload") {
+                payloadStatus.status
+            } else {
+                "ok"
+            }
+        } else {
+            payloadStatus.status
+        }
         record.status = if (invokeOk) { "running" } else { "degraded" }
-        record.degradedReason = if (invokeOk) { "" } else { payloadStatus.status }
+        record.degradedReason = if (invokeOk) { "" } else { resultStatus }
         record.lastError = if (invokeOk) { "" } else if (payloadStatus.diagnostic.isEmpty()) { redactServicePayload(response.frame.payload).text } else { payloadStatus.diagnostic }
         record.lastInvokeAtMillis += 1
         process.writeLine(encodeServiceFrame(ServiceFrame("request", "stop-${record.instanceId}", serviceId, method: "stop", correlationId: "stop-${record.instanceId}", payload: "{}")).trimAscii())
         process.stop()
-        CapabilityInvokeResult(invokeOk, payloadStatus.status, serviceId: serviceId, capabilityId: request.capabilityId, payload: response.frame.payload, diagnostic: record.lastError)
+        CapabilityInvokeResult(invokeOk, resultStatus, serviceId: serviceId, capabilityId: request.capabilityId, payload: response.frame.payload, diagnostic: record.lastError)
     } catch (e: Exception) {
         record.status = "degraded"
         record.degradedReason = "invoke_exception"
