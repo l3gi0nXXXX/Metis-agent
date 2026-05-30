@@ -72,6 +72,23 @@ Example invoke response:
 {"type":"response","frameId":"response-scan-1","serviceId":"gitcode-monitor","method":"invokeCapability","capabilityId":"gitcode.monitor.scan_once","correlationId":"corr-scan-1","payload":{"ok":true,"status":"ok","accepted":0,"ignored":0,"emitted":0,"stateSaved":true}}
 ```
 
+## Sync RPC Boundary
+
+Synchronous `invokeCapability` is only for short control actions whose response
+is the final result. It must not be used to hold an IM request open while a
+long-running external scan, polling loop, or writeback workflow completes.
+
+Long-running work must use the service plugin job protocol:
+
+1. Metis invokes the capability with an async job start payload.
+2. The plugin responds quickly with `status: "accepted"` and a `jobId`.
+3. Later lifecycle updates are emitted as `event` frames and delivered by Metis
+   through the recorded delivery target.
+
+For GitCodeMonitor, `gitcode.monitor.scan_once` is an async job start. The
+accepted response confirms only that GCM accepted the job; it is not a completed
+scan result.
+
 ## Payload Status
 
 New response payloads must be JSON objects. They must include:

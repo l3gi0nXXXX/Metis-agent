@@ -642,6 +642,112 @@ private class ServicePluginStdoutReadResult {
     }
 }
 
+private class ServicePluginResponseQueue {
+    private let lock = Mutex()
+    private let condition: Condition
+    private let responses = ArrayList<ServiceFrame>()
+    private var closed = false
+    private var closeStatus = "process_exited"
+    private var closeDiagnostic = ""
+
+    public init() {
+        synchronized(this.lock) {
+            this.condition = this.lock.condition()
+        }
+    }
+
+    public func append(frame: ServiceFrame): Unit {
+        synchronized(this.lock) {
+            if (this.closed) {
+                return
+            }
+            this.responses.add(frame)
+            this.condition.notifyAll()
+        }
+    }
+
+    public func close(status!: String = "process_exited", diagnostic!: String = ""): Unit {
+        synchronized(this.lock) {
+            this.closed = true
+            this.closeStatus = status.trimAscii()
+            if (this.closeDiagnostic.isEmpty()) {
+                this.closeDiagnostic = diagnostic.trimAscii()
+            }
+            this.condition.notifyAll()
+        }
+    }
+
+    public func readResponse(
+        correlationId: String,
+        expectedServiceId: String,
+        expectedMethod: String,
+        expectedCapabilityId: String,
+        timeoutMs: Int64
+    ): ServicePluginStdoutReadResult {
+        let corr = correlationId.trimAscii()
+        let effective = if (timeoutMs > 0) { timeoutMs } else { 30000 }
+        synchronized(this.lock) {
+            let _ = this.condition.waitUntil({ => this.closed || !this.responses.isEmpty() }, timeout: Duration.millisecond * effective)
+            if (!this.responses.isEmpty()) {
+                let frame = this.responses[0]
+                this.responses.remove(at: 0)
+                let validation = validateServicePluginResponseFrame(
+                    frame,
+                    expectedServiceId,
+                    expectedMethod,
+                    expectedCapabilityId: expectedCapabilityId,
+                    expectedCorrelationId: corr
+                )
+                if (!validation.ok) {
+                    return ServicePluginStdoutReadResult(false, frame: frame, status: validation.status, diagnostic: validation.diagnostic)
+                }
+                return ServicePluginStdoutReadResult(true, frame: frame)
+            }
+            if (this.closed) {
+                return ServicePluginStdoutReadResult(false, status: if (this.closeStatus.isEmpty()) { "process_exited" } else { this.closeStatus }, diagnostic: this.closeDiagnostic)
+            }
+            ServicePluginStdoutReadResult(false, status: "timeout", diagnostic: "timeout waiting for response correlationId=${corr}")
+        }
+    }
+
+    private func findResponseIndex(correlationId: String): Int64 {
+        var idx: Int64 = 0
+        while (idx < this.responses.size) {
+            if (this.responses[idx].correlationId == correlationId) {
+                return idx
+            }
+            idx++
+        }
+        -1
+    }
+}
+
+private class ServicePluginProcessEnsureResult {
+    public let ok: Bool
+    public let status: String
+    public let diagnostic: String
+    public let process: ?ServicePluginStdioProcess
+    public let queue: ?ServicePluginResponseQueue
+
+    public init(
+        ok: Bool,
+        status: String,
+        diagnostic!: String = "",
+        process!: ?ServicePluginStdioProcess = None<ServicePluginStdioProcess>,
+        queue!: ?ServicePluginResponseQueue = None<ServicePluginResponseQueue>
+    ) {
+        this.ok = ok
+        this.status = status.trimAscii()
+        this.diagnostic = diagnostic.trimAscii()
+        this.process = process
+        this.queue = queue
+    }
+}
+
+private var servicePluginActiveProcesses = HashMap<String, ServicePluginStdioProcess>()
+private var servicePluginResponseQueues = HashMap<String, ServicePluginResponseQueue>()
+private let servicePluginProcessLock = Mutex()
+
 private func readExpectedServiceFrame(process: ServicePluginStdioProcess, policy: ServicePluginStdoutReadPolicy): ServicePluginStdoutReadResult {
     var noiseLineCount: Int64 = 0
     var emptyLineCount: Int64 = 0
@@ -749,6 +855,7 @@ public func setServicePluginCapabilityInvokerForTest(
 }
 
 public func resetServicePluginHostForTest(): Unit {
+    stopAllActiveServicePluginProcesses()
     servicePluginRegistry = HashMap<String, ServicePluginRuntimeRecord>()
     serviceCapabilityRoutes = HashMap<String, (String, ServiceCapabilityRecord)>()
     servicePluginCapabilityInvokerForTest = None<(ServicePluginRegistration, CapabilityInvokeRequest) -> CapabilityInvokeResult>
@@ -872,75 +979,19 @@ public func invokeRegisteredCapability(request: CapabilityInvokeRequest): Capabi
 
 private func servicePluginInvokeViaStdioProcess(record: ServicePluginRuntimeRecord, request: CapabilityInvokeRequest): CapabilityInvokeResult {
     let serviceId = record.registration.manifest.pluginId
-    if (record.registration.manifest.entryCommand.isEmpty()) {
-        record.status = "degraded"
-        record.degradedReason = "missing_entry_command"
-        record.lastError = record.degradedReason
-        return CapabilityInvokeResult(false, "missing_entry_command", serviceId: serviceId, capabilityId: request.capabilityId, diagnostic: record.lastError)
+    let ensured = ensureServicePluginStdioProcess(record)
+    if (!ensured.ok) {
+        return CapabilityInvokeResult(false, ensured.status, serviceId: serviceId, capabilityId: request.capabilityId, diagnostic: ensured.diagnostic)
     }
-    let cwd = servicePluginEffectiveWorkingDirectory(record.registration.configRef)
-    if (!cwd.isEmpty() && !exists(Path(cwd))) {
-        record.status = "degraded"
-        record.degradedReason = "cwd_missing"
-        record.lastError = "service plugin working directory missing: ${redactServicePayload(cwd).text}"
-        return CapabilityInvokeResult(false, "cwd_missing", serviceId: serviceId, capabilityId: request.capabilityId, diagnostic: record.lastError)
+    let process = match (ensured.process) {
+        case Some(value) => value
+        case None => return CapabilityInvokeResult(false, "process_start_failed", serviceId: serviceId, capabilityId: request.capabilityId, diagnostic: "service plugin process missing after start")
     }
-    record.instanceSeq++
-    record.instanceId = "${serviceId}-${record.instanceSeq}"
-    let args = servicePluginArgsWithConfigRef(record.registration.manifest.entryArgs, record.registration.configRef.configPath)
-    let process = try {
-        let proc = launch(
-            record.registration.manifest.entryCommand,
-            args,
-            stdIn: ProcessRedirect.Pipe,
-            stdOut: ProcessRedirect.Pipe,
-            stdErr: ProcessRedirect.Pipe,
-            workingDirectory: if (cwd.isEmpty()) { None<Path> } else { Some(Path(cwd)) }
-        )
-        ServicePluginStdioProcess(proc)
-    } catch (e: Exception) {
-        record.status = "degraded"
-        record.degradedReason = "process_start_failed"
-        record.lastError = e.message
-        return CapabilityInvokeResult(false, "process_start_failed", serviceId: serviceId, capabilityId: request.capabilityId, diagnostic: e.message)
+    let queue = match (ensured.queue) {
+        case Some(value) => value
+        case None => return CapabilityInvokeResult(false, "process_start_failed", serviceId: serviceId, capabilityId: request.capabilityId, diagnostic: "service plugin response queue missing after start")
     }
-
     try {
-        let initRead = readExpectedServiceFrame(process, ServicePluginStdoutReadPolicy(10000, serviceId, "initialize"))
-        if (!initRead.ok) {
-            record.status = "degraded"
-            record.degradedReason = if (initRead.status == "timeout") { "initialize_timeout" } else { initRead.status }
-            record.lastError = if (initRead.status == "timeout") {
-                servicePluginProcessError("service plugin initialize timeout", process)
-            } else {
-                initRead.diagnostic
-            }
-            process.stop()
-            return CapabilityInvokeResult(false, record.degradedReason, serviceId: serviceId, capabilityId: request.capabilityId, diagnostic: record.lastError)
-        }
-        let initPayloadValidation = validateServicePluginPayloadObject(initRead.frame.payload)
-        if (!initPayloadValidation.ok) {
-            record.status = "degraded"
-            record.degradedReason = "payload_invalid"
-            record.lastError = redactServicePayload(initPayloadValidation.diagnostic).text
-            process.stop()
-            return CapabilityInvokeResult(false, "payload_invalid", serviceId: serviceId, capabilityId: request.capabilityId, diagnostic: record.lastError)
-        }
-        let initPayloadStatus = parseServicePluginPayloadStatus(initRead.frame.payload)
-        if (!initPayloadStatus.parsed || !initPayloadStatus.okPresent || !initPayloadStatus.ok) {
-            record.status = "degraded"
-            record.degradedReason = "initialize_failed"
-            record.lastError = if (!initPayloadStatus.diagnostic.isEmpty()) {
-                initPayloadStatus.diagnostic
-            } else if (!initPayloadStatus.status.isEmpty() && initPayloadStatus.status != "ok" && initPayloadStatus.status != "invalid_payload") {
-                "initialize rejected: ${initPayloadStatus.status}"
-            } else {
-                "initialize payload missing boolean ok"
-            }
-            process.stop()
-            return CapabilityInvokeResult(false, record.degradedReason, serviceId: serviceId, capabilityId: request.capabilityId, diagnostic: record.lastError)
-        }
-
         let correlationId = "corr-${record.instanceId}-${request.capabilityId}"
         let invokeFrame = ServiceFrame(
             "request",
@@ -952,15 +1003,12 @@ private func servicePluginInvokeViaStdioProcess(record: ServicePluginRuntimeReco
             payload: request.payload
         )
         process.writeLine(encodeServiceFrame(invokeFrame).trimAscii())
-        let responseRead = readExpectedServiceFrame(
-            process,
-            ServicePluginStdoutReadPolicy(
-                if (request.timeoutMillis > 0) { request.timeoutMillis } else { 30000 },
-                serviceId,
-                "invokeCapability",
-                expectedCapabilityId: request.capabilityId,
-                expectedCorrelationId: correlationId
-            )
+        let responseRead = queue.readResponse(
+            correlationId,
+            serviceId,
+            "invokeCapability",
+            request.capabilityId,
+            if (request.timeoutMillis > 0) { request.timeoutMillis } else { 30000 }
         )
         if (!responseRead.ok) {
             record.status = "degraded"
@@ -970,7 +1018,6 @@ private func servicePluginInvokeViaStdioProcess(record: ServicePluginRuntimeReco
             } else {
                 redactServicePayload(responseRead.diagnostic).text
             }
-            process.stop()
             return CapabilityInvokeResult(false, record.degradedReason, serviceId: serviceId, capabilityId: request.capabilityId, diagnostic: record.lastError)
         }
         let payloadValidation = validateServicePluginPayloadObject(responseRead.frame.payload)
@@ -978,7 +1025,6 @@ private func servicePluginInvokeViaStdioProcess(record: ServicePluginRuntimeReco
             record.status = "degraded"
             record.degradedReason = "payload_invalid"
             record.lastError = redactServicePayload(payloadValidation.diagnostic).text
-            process.stop()
             return CapabilityInvokeResult(false, "payload_invalid", serviceId: serviceId, capabilityId: request.capabilityId, payload: responseRead.frame.payload, diagnostic: record.lastError)
         }
         let payloadStatus = parseServicePluginPayloadStatus(responseRead.frame.payload)
@@ -994,14 +1040,11 @@ private func servicePluginInvokeViaStdioProcess(record: ServicePluginRuntimeReco
             redactServicePayload(payloadStatus.diagnostic).text
         }
         record.lastInvokeAtMillis += 1
-        process.writeLine(encodeServiceFrame(ServiceFrame("request", "stop-${record.instanceId}", serviceId, method: "stop", correlationId: "stop-${record.instanceId}", payload: "{}")).trimAscii())
-        process.stop()
         CapabilityInvokeResult(invokeOk, resultStatus, serviceId: serviceId, capabilityId: request.capabilityId, payload: responseRead.frame.payload, diagnostic: record.lastError)
     } catch (e: Exception) {
         record.status = "degraded"
         record.degradedReason = "invoke_exception"
         record.lastError = e.message
-        process.stop()
         CapabilityInvokeResult(false, "invoke_exception", serviceId: serviceId, capabilityId: request.capabilityId, diagnostic: e.message)
     }
 }
@@ -1062,6 +1105,190 @@ private func servicePluginProcessError(prefix: String, process: ServicePluginStd
     redactServicePayload(String.join(parts.toArray(), delimiter: " ")).text
 }
 
+private func stopAllActiveServicePluginProcesses(): Unit {
+    synchronized(servicePluginProcessLock) {
+        for ((_, process) in servicePluginActiveProcesses) {
+            process.stop()
+        }
+        for ((_, queue) in servicePluginResponseQueues) {
+            queue.close(status: "stopped", diagnostic: "service plugin host reset")
+        }
+        servicePluginActiveProcesses = HashMap<String, ServicePluginStdioProcess>()
+        servicePluginResponseQueues = HashMap<String, ServicePluginResponseQueue>()
+    }
+}
+
+private func ensureServicePluginStdioProcess(record: ServicePluginRuntimeRecord): ServicePluginProcessEnsureResult {
+    let serviceId = record.registration.manifest.pluginId
+    synchronized(servicePluginProcessLock) {
+        if (servicePluginActiveProcesses.contains(serviceId) && servicePluginResponseQueues.contains(serviceId)) {
+            return ServicePluginProcessEnsureResult(true, "running", process: Some(servicePluginActiveProcesses[serviceId]), queue: Some(servicePluginResponseQueues[serviceId]))
+        }
+        if (record.registration.manifest.entryCommand.isEmpty()) {
+            record.status = "degraded"
+            record.degradedReason = "missing_entry_command"
+            record.lastError = record.degradedReason
+            return ServicePluginProcessEnsureResult(false, "missing_entry_command", diagnostic: record.lastError)
+        }
+        let cwd = servicePluginEffectiveWorkingDirectory(record.registration.configRef)
+        if (!cwd.isEmpty() && !exists(Path(cwd))) {
+            record.status = "degraded"
+            record.degradedReason = "cwd_missing"
+            record.lastError = "service plugin working directory missing: ${redactServicePayload(cwd).text}"
+            return ServicePluginProcessEnsureResult(false, "cwd_missing", diagnostic: record.lastError)
+        }
+        record.instanceSeq++
+        record.instanceId = "${serviceId}-${record.instanceSeq}"
+        let args = servicePluginArgsWithConfigRef(record.registration.manifest.entryArgs, record.registration.configRef.configPath)
+        let process = try {
+            let proc = launch(
+                record.registration.manifest.entryCommand,
+                args,
+                stdIn: ProcessRedirect.Pipe,
+                stdOut: ProcessRedirect.Pipe,
+                stdErr: ProcessRedirect.Pipe,
+                workingDirectory: if (cwd.isEmpty()) { None<Path> } else { Some(Path(cwd)) }
+            )
+            ServicePluginStdioProcess(proc)
+        } catch (e: Exception) {
+            record.status = "degraded"
+            record.degradedReason = "process_start_failed"
+            record.lastError = e.message
+            return ServicePluginProcessEnsureResult(false, "process_start_failed", diagnostic: e.message)
+        }
+        let initRead = readExpectedServiceFrame(process, ServicePluginStdoutReadPolicy(10000, serviceId, "initialize"))
+        if (!initRead.ok) {
+            record.status = "degraded"
+            record.degradedReason = if (initRead.status == "timeout") { "initialize_timeout" } else { initRead.status }
+            record.lastError = if (initRead.status == "timeout") {
+                servicePluginProcessError("service plugin initialize timeout", process)
+            } else {
+                initRead.diagnostic
+            }
+            process.stop()
+            return ServicePluginProcessEnsureResult(false, record.degradedReason, diagnostic: record.lastError)
+        }
+        let initPayloadValidation = validateServicePluginPayloadObject(initRead.frame.payload)
+        if (!initPayloadValidation.ok) {
+            record.status = "degraded"
+            record.degradedReason = "payload_invalid"
+            record.lastError = redactServicePayload(initPayloadValidation.diagnostic).text
+            process.stop()
+            return ServicePluginProcessEnsureResult(false, "payload_invalid", diagnostic: record.lastError)
+        }
+        let initPayloadStatus = parseServicePluginPayloadStatus(initRead.frame.payload)
+        if (!initPayloadStatus.parsed || !initPayloadStatus.okPresent || !initPayloadStatus.ok) {
+            record.status = "degraded"
+            record.degradedReason = "initialize_failed"
+            record.lastError = if (!initPayloadStatus.diagnostic.isEmpty()) {
+                initPayloadStatus.diagnostic
+            } else if (!initPayloadStatus.status.isEmpty() && initPayloadStatus.status != "ok" && initPayloadStatus.status != "invalid_payload") {
+                "initialize rejected: ${initPayloadStatus.status}"
+            } else {
+                "initialize payload missing boolean ok"
+            }
+            process.stop()
+            return ServicePluginProcessEnsureResult(false, record.degradedReason, diagnostic: record.lastError)
+        }
+
+        let queue = ServicePluginResponseQueue()
+        servicePluginActiveProcesses[serviceId] = process
+        servicePluginResponseQueues[serviceId] = queue
+        record.status = "running"
+        record.degradedReason = ""
+        record.lastError = ""
+        spawn { servicePluginEventPump(record, process, queue) }
+        ServicePluginProcessEnsureResult(true, "running", process: Some(process), queue: Some(queue))
+    }
+}
+
+private func servicePluginEventPump(record: ServicePluginRuntimeRecord, process: ServicePluginStdioProcess, queue: ServicePluginResponseQueue): Unit {
+    let serviceId = record.registration.manifest.pluginId
+    var noiseLineCount: Int64 = 0
+    var noiseBytes: Int64 = 0
+    var idlePolls: Int64 = 0
+    let noiseSamples = ArrayList<String>()
+    while (true) {
+        let line = match (process.readStdoutLine(1000)) {
+            case Some(value) => value
+            case None =>
+                idlePolls++
+                if (idlePolls < 3600) {
+                    continue
+                }
+                record.status = "degraded"
+                record.degradedReason = "process_exited"
+                record.lastError = servicePluginProcessError("service plugin process stdout closed", process)
+                queue.close(status: "process_exited", diagnostic: record.lastError)
+                synchronized(servicePluginProcessLock) {
+                    if (servicePluginActiveProcesses.contains(serviceId)) { servicePluginActiveProcesses.remove(serviceId) }
+                    if (servicePluginResponseQueues.contains(serviceId)) { servicePluginResponseQueues.remove(serviceId) }
+                }
+                return
+        }
+        idlePolls = 0
+        let trimmed = line.trimAscii()
+        if (trimmed.isEmpty() || !trimmed.startsWith("{")) {
+            let noise = servicePluginRecordStdoutNoise(line, noiseLineCount, noiseBytes, noiseSamples)
+            noiseLineCount = noise[0]
+            noiseBytes = noise[1]
+            if (servicePluginStdoutNoiseExceeded(noiseLineCount, noiseBytes, ServicePluginStdoutReadPolicy(1000, serviceId, "eventPump"))) {
+                record.status = "degraded"
+                record.degradedReason = "stdout_protocol_violation"
+                record.lastError = servicePluginStdoutNoiseDiagnostic("stdout_protocol_violation", noiseLineCount, noiseBytes, noiseSamples)
+                queue.close(status: "stdout_protocol_violation", diagnostic: record.lastError)
+                process.stop()
+                return
+            }
+            continue
+        }
+        let decoded = decodeServiceFrame(trimmed)
+        if (!decoded.ok) {
+            let noise = servicePluginRecordStdoutNoise(trimmed, noiseLineCount, noiseBytes, noiseSamples)
+            noiseLineCount = noise[0]
+            noiseBytes = noise[1]
+            record.lastError = servicePluginStdoutNoiseDiagnostic(decoded.errorKind, noiseLineCount, noiseBytes, noiseSamples)
+            if (decoded.errorKind == "frame_too_large") {
+                record.status = "degraded"
+                record.degradedReason = "frame_too_large"
+                queue.close(status: "frame_too_large", diagnostic: "frame_too_large ${hashRawPayload(trimmed)}")
+                process.stop()
+                return
+            }
+            if (servicePluginStdoutNoiseExceeded(noiseLineCount, noiseBytes, ServicePluginStdoutReadPolicy(1000, serviceId, "eventPump"))) {
+                record.status = "degraded"
+                record.degradedReason = "frame_decode_failed"
+                queue.close(status: "frame_decode_failed", diagnostic: record.lastError)
+                process.stop()
+                return
+            }
+            continue
+        }
+        let frame = decoded.frame
+        if (frame.frameType == "response") {
+            queue.append(frame)
+            continue
+        }
+        if (frame.frameType == "heartbeat" || frame.method == "heartbeat") {
+            let _ = handleServiceHeartbeat(frame)
+            continue
+        }
+        if (frame.frameType == "event") {
+            record.eventFrames.add(frame)
+            let handled = handleServiceCapabilityEvent(ServiceCapabilityEvent(frame.serviceId, frame.capabilityId, payload: frame.payload))
+            if (handled.ok) {
+                let _ = dispatchServicePluginEvent(frame)
+            } else {
+                record.lastError = redactServicePayload(handled.diagnostic).text
+            }
+            continue
+        }
+        if (frame.frameType == "audit") {
+            continue
+        }
+    }
+}
+
 public func startServicePlugin(serviceId: String, context!: ServiceStartContext = ServiceStartContext()): ServiceStartResult {
     match (servicePluginRegistry.get(serviceId.trimAscii())) {
         case Some(record) =>
@@ -1102,6 +1329,25 @@ public func stopServicePlugin(serviceId: String, reason!: String = "", timeoutMi
                 record.status = "degraded"
                 record.degradedReason = "stop timeout"
                 return ServiceStopResult(false, serviceId.trimAscii(), "degraded", diagnostic: record.degradedReason)
+            }
+            synchronized(servicePluginProcessLock) {
+                match (servicePluginActiveProcesses.get(serviceId.trimAscii())) {
+                    case Some(process) =>
+                        try {
+                            process.writeLine(encodeServiceFrame(ServiceFrame("request", "stop-${record.instanceId}", serviceId.trimAscii(), method: "stop", correlationId: "stop-${record.instanceId}", payload: "{}")).trimAscii())
+                        } catch (_: Exception) {
+                            ()
+                        }
+                        process.stop()
+                        servicePluginActiveProcesses.remove(serviceId.trimAscii())
+                    case None => ()
+                }
+                match (servicePluginResponseQueues.get(serviceId.trimAscii())) {
+                    case Some(queue) =>
+                        queue.close(status: "stopped", diagnostic: "service plugin stopped: ${reason.trimAscii()}")
+                        servicePluginResponseQueues.remove(serviceId.trimAscii())
+                    case None => ()
+                }
             }
             record.status = "stopped"
             record.degradedReason = reason.trimAscii()

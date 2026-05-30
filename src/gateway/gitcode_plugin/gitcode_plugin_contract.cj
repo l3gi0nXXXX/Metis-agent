@@ -1,6 +1,9 @@
 package metis.gateway.gitcode_plugin
 
+import metis.gateway.service_plugin.{ServicePluginDeliveryTarget, hashRawPayload, servicePluginDeliveryTargetToJson}
 import std.collection.{ArrayList, HashMap, HashSet}
+import std.convert.Parsable
+import stdx.encoding.json.{JsonBool, JsonInt, JsonObject, JsonString}
 
 public class GitCodePluginCommandParseResult {
     public let handled: Bool
@@ -144,11 +147,27 @@ public class GitCodeScanOnceArgs {
     public let maxRepos: Int64
     public let maxItems: Int64
     public let timeoutMillis: Int64
-    public init(dryRun!: Bool = true, maxRepos!: Int64 = 5, maxItems!: Int64 = 30, timeoutMillis!: Int64 = 30000) {
+    public let offlineFixture: Bool
+    public init(dryRun!: Bool = true, maxRepos!: Int64 = 5, maxItems!: Int64 = 30, timeoutMillis!: Int64 = 30000, offlineFixture!: Bool = false) {
         this.dryRun = dryRun
         this.maxRepos = maxRepos
         this.maxItems = maxItems
         this.timeoutMillis = timeoutMillis
+        this.offlineFixture = offlineFixture
+    }
+}
+
+public class GitCodeScanOnceArgsParseResult {
+    public let ok: Bool
+    public let status: String
+    public let diagnostic: String
+    public let args: GitCodeScanOnceArgs
+
+    public init(ok: Bool, status!: String = "ok", diagnostic!: String = "", args!: GitCodeScanOnceArgs = GitCodeScanOnceArgs()) {
+        this.ok = ok
+        this.status = status.trimAscii()
+        this.diagnostic = diagnostic.trimAscii()
+        this.args = args
     }
 }
 
@@ -368,6 +387,12 @@ public func parseGitCodeCommand(text: String): GitCodePluginCommandParseResult {
     if (first == "subscribe" || first == "unsubscribe") {
         return GitCodePluginCommandParseResult(true, action: first, args: parts[2..])
     }
+    if (first == "scan" && parts.size > 3 && parts[2].trimAscii().toAsciiLower() == "status") {
+        return GitCodePluginCommandParseResult(true, action: "scan_status", args: parts[3..])
+    }
+    if (first == "scan" && parts.size > 3 && parts[2].trimAscii().toAsciiLower() == "cancel") {
+        return GitCodePluginCommandParseResult(true, action: "scan_cancel", args: parts[3..])
+    }
     if (first == "scan" && parts.size > 2 && parts[2].trimAscii().toAsciiLower() == "once") {
         return GitCodePluginCommandParseResult(true, action: "scan_once", args: parts[3..])
     }
@@ -443,6 +468,83 @@ public func handleGitCodeScanOnceCommand(context: GatewayCommandContext, args: G
 
 public func buildGitCodeScanOncePayload(args: GitCodeScanOnceArgs): String {
     "{\"dryRun\":${args.dryRun},\"maxRepos\":${boundedNonNegative(args.maxRepos)},\"maxItems\":${boundedNonNegative(args.maxItems)},\"timeoutMillis\":${boundedNonNegative(args.timeoutMillis)}}"
+}
+
+public func parseGitCodeScanOnceArgs(args: Array<String>): GitCodeScanOnceArgsParseResult {
+    var maxRepos: Int64 = 5
+    var maxItems: Int64 = 30
+    var timeoutMs: Int64 = 30000
+    var offlineFixture = false
+    var i = 0
+    while (i < args.size) {
+        let arg = args[i].trimAscii()
+        if (arg.isEmpty()) {
+            i++
+            continue
+        }
+        if (arg == "--offline-fixture") {
+            offlineFixture = true
+            i++
+            continue
+        }
+        if (arg == "--max-repos" || arg == "--max-items" || arg == "--timeout-ms") {
+            if (i + 1 >= args.size) {
+                return GitCodeScanOnceArgsParseResult(false, status: "invalid_args", diagnostic: "${arg} requires a numeric value")
+            }
+            let parsed = try {
+                Int64.parse(args[i + 1].trimAscii())
+            } catch (_: Exception) {
+                return GitCodeScanOnceArgsParseResult(false, status: "invalid_args", diagnostic: "${arg} requires a numeric value")
+            }
+            if (parsed < 0) {
+                return GitCodeScanOnceArgsParseResult(false, status: "invalid_args", diagnostic: "${arg} must be non-negative")
+            }
+            if (arg == "--max-repos") {
+                maxRepos = parsed
+            } else if (arg == "--max-items") {
+                maxItems = parsed
+            } else {
+                timeoutMs = parsed
+            }
+            i += 2
+            continue
+        }
+        return GitCodeScanOnceArgsParseResult(false, status: "invalid_args", diagnostic: "unknown scan option: ${arg}")
+    }
+    GitCodeScanOnceArgsParseResult(true, args: GitCodeScanOnceArgs(maxRepos: maxRepos, maxItems: maxItems, timeoutMillis: timeoutMs, offlineFixture: offlineFixture))
+}
+
+public func buildGitCodeAsyncScanPayload(
+    context: GatewayCommandContext,
+    args: GitCodeScanOnceArgs,
+    jobId: String,
+    idempotencyKey: String,
+    deliveryTarget: ServicePluginDeliveryTarget
+): String {
+    let root = JsonObject()
+    root.put("ok", JsonBool(true))
+    root.put("mode", JsonString("async"))
+    root.put("jobId", JsonString(jobId.trimAscii()))
+    root.put("idempotencyKey", JsonString(idempotencyKey.trimAscii()))
+    let requestedBy = JsonObject()
+    requestedBy.put("channel", JsonString(context.channel))
+    requestedBy.put("accountId", JsonString(context.accountId))
+    requestedBy.put("peerHash", JsonString(hashRawPayload(context.peerId)))
+    requestedBy.put("senderHash", JsonString(hashRawPayload(context.senderId)))
+    root.put("requestedBy", requestedBy)
+    root.put("deliveryTarget", servicePluginDeliveryTargetToJson(deliveryTarget))
+    let limits = JsonObject()
+    limits.put("maxRepos", JsonInt(boundedNonNegative(args.maxRepos)))
+    limits.put("maxItems", JsonInt(boundedNonNegative(args.maxItems)))
+    limits.put("maxDurationMillis", JsonInt(boundedNonNegative(args.timeoutMillis)))
+    limits.put("perRequestTimeoutMillis", JsonInt(30000))
+    limits.put("progressIntervalMillis", JsonInt(10000))
+    root.put("limits", limits)
+    let options = JsonObject()
+    options.put("offlineFixture", JsonBool(args.offlineFixture))
+    options.put("dryRun", JsonBool(args.dryRun))
+    root.put("options", options)
+    root.toJsonString()
 }
 
 public func formatGitCodeScanOnceResult(result: CapabilityInvokeResult): String {

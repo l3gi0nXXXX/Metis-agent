@@ -54,6 +54,8 @@ test/
 /test/fixtures/service_plugin/*
 !/test/fixtures/service_plugin/stdio_protocol/
 !/test/fixtures/service_plugin/stdio_protocol/*
+!/test/fixtures/service_plugin/job_protocol/
+!/test/fixtures/service_plugin/job_protocol/*
 test_examples/
 
 # External modules

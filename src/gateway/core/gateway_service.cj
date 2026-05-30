@@ -6,10 +6,10 @@ import metis.core.model.{findModelCapabilityCatalogEntry, modelCapabilityCatalog
 import metis.core.skills.SkillsPrompt
 import metis.gateway.model.*
 import metis.gateway.security.gatewayPairingAccountStore
-import metis.gateway.service_plugin.{CapabilityCaller, CapabilityInvokeRequest, CapabilityInvokeResult, buildServicePluginImBindingRules, invokeRegisteredCapability, matchServicePluginImBinding, registerConfiguredServicePlugins, servicePluginConfiguredStatusForUser}
+import metis.gateway.service_plugin.{CapabilityCaller, CapabilityInvokeRequest, CapabilityInvokeResult, ServicePluginDeliveryTarget, ServicePluginEventDeliveryResult, buildServicePluginImBindingRules, invokeRegisteredCapability, matchServicePluginImBinding, parseServicePluginJobAcceptedPayload, servicePluginPendingJobStore, registerConfiguredServicePlugins, servicePluginConfiguredStatusForUser, setServicePluginEventDelivery}
 import metis.gateway.session.{GatewaySessionContext, GatewaySessionRequest, gatewayResolveSessionContext, gatewaySessionRequestFromInbound}
 import metis.gateway.tools.{gatewayHandleNativeCommandLine, gatewayHandleSubagentsCommandLine}
-import metis.gateway.gitcode_plugin.{GatewayCommandContext, buildGitCodeSubscriptionTarget, formatGitCodeSubscribeResult, handleGitCodeKnowledgeQueryCommand, parseGitCodeCommand, removeGitCodeSubscription, saveGitCodeSubscription}
+import metis.gateway.gitcode_plugin.{GatewayCommandContext, buildGitCodeAsyncScanPayload, buildGitCodeSubscriptionTarget, formatGitCodeSubscribeResult, handleGitCodeKnowledgeQueryCommand, parseGitCodeCommand, parseGitCodeScanOnceArgs, removeGitCodeSubscription, saveGitCodeSubscription}
 import magic.jsonable.*
 import std.collection.{ArrayList, HashSet}
 import std.convert.Parsable
@@ -126,6 +126,21 @@ public class GatewayService {
         let startupSummary = this.channelManager.startChannels()
         let user = CliSettingManager.readGatewaySettings()
         registerConfiguredServicePlugins(user)
+        setServicePluginEventDelivery(Some({ target: ServicePluginDeliveryTarget, text: String =>
+            let sentId = this.sendTextToPeerDetailed(
+                target.channel,
+                target.peerId,
+                text,
+                replyToMessageId: target.replyToMessageId,
+                replyInThread: target.replyInThread,
+                accountId: target.accountId
+            )
+            if (sentId.isEmpty()) {
+                ServicePluginEventDeliveryResult(false, "send_failed", diagnostic: "channel delivery returned empty message id")
+            } else {
+                ServicePluginEventDeliveryResult(true, "sent", messageId: sentId)
+            }
+        }))
         let _ = gatewayOpenClawCompatHostStart(user)
         let _ = gatewayOpenClawPluginSidecarStart(user)
         let startupStatus = try {
@@ -636,7 +651,11 @@ public class GatewayService {
                 let result = removeGitCodeSubscription(buildGitCodeSubscriptionTarget(context))
                 "gitcode unsubscribe status=${result.status}"
             case "scan_once" =>
-                this.servicePluginGitCodeInvokeReply("gitcode.monitor.scan_once", "{}", "scan_once")
+                this.servicePluginGitCodeStartAsyncScanReply(message, accountId, context, parsed.args)
+            case "scan_status" =>
+                this.servicePluginGitCodeScanStatusReply(parsed.args)
+            case "scan_cancel" =>
+                this.servicePluginGitCodeScanCancelReply(parsed.args)
             case "query" =>
                 handleGitCodeKnowledgeQueryCommand(context, parsed.query).message
             case _ =>
@@ -648,15 +667,143 @@ public class GatewayService {
         }
     }
 
+    private func servicePluginGitCodeStartAsyncScanReply(message: InboundMessage, accountId: String, context: GatewayCommandContext, args: Array<String>): String {
+        let parsedArgs = parseGitCodeScanOnceArgs(args)
+        if (!parsedArgs.ok) {
+            return "GitCode scan failed: invalid arguments: ${parsedArgs.diagnostic}."
+        }
+        let replyTo = match (message.replyTargetMessageId) {
+            case Some(value) => value
+            case None => message.messageId
+        }
+        let target = ServicePluginDeliveryTarget(
+            channelToString(message.channel),
+            accountId,
+            message.peerId,
+            threadId: message.threadId ?? "",
+            replyToMessageId: replyTo,
+            replyInThread: message.replyInThread
+        )
+        let jobId = this.servicePluginBuildGitCodeScanJobId(message)
+        let idempotencyKey = this.servicePluginBuildGitCodeScanIdempotencyKey(message, accountId)
+        let store = servicePluginPendingJobStore()
+        let created = store.createOrGetByIdempotencyKey(
+            "gitcode-monitor",
+            "gitcode.monitor.scan_once",
+            jobId,
+            idempotencyKey,
+            target,
+            nowMillis: this.startNowMs()
+        )
+        if (!created.ok) {
+            return "GitCode scan failed: invalid job request."
+        }
+        if (!created.created) {
+            return "GitCode 扫描已在运行，scanId=${created.job.jobId}。完成后会在当前会话通知。"
+        }
+        let payload = buildGitCodeAsyncScanPayload(context, parsedArgs.args, created.job.jobId, idempotencyKey, target)
+        let result = invokeRegisteredCapability(CapabilityInvokeRequest(
+            "gitcode.monitor.scan_once",
+            payload: payload,
+            caller: this.servicePluginGitCodeCaller(),
+            timeoutMillis: 5000
+        ))
+        if (!result.ok) {
+            store.markFailed(created.job.jobId, error: result.status, nowMillis: this.startNowMs())
+            return this.servicePluginRenderGitCodeFailure("scan_once", result)
+        }
+        let accepted = parseServicePluginJobAcceptedPayload(result.payload, expectedJobId: created.job.jobId)
+        if (!accepted.ok) {
+            store.markFailed(created.job.jobId, error: accepted.status, nowMillis: this.startNowMs())
+            return "GitCode scan failed: service plugin returned an invalid accepted response."
+        }
+        store.markAccepted(created.job.jobId, nowMillis: this.startNowMs())
+        store.markRunning(created.job.jobId, stage: "accepted", nowMillis: this.startNowMs())
+        "GitCode 扫描已启动，scanId=${created.job.jobId}。完成后会在当前会话通知。"
+    }
+
+    private func servicePluginGitCodeScanStatusReply(args: Array<String>): String {
+        let jobId = if (args.size > 0) { args[0].trimAscii() } else { "" }
+        if (jobId.isEmpty()) {
+            return "GitCode scan failed: missing scanId."
+        }
+        let result = invokeRegisteredCapability(CapabilityInvokeRequest(
+            "gitcode.monitor.job_status",
+            payload: this.servicePluginGitCodeJobIdPayload(jobId),
+            caller: this.servicePluginGitCodeCaller(),
+            timeoutMillis: 5000
+        ))
+        if (!result.ok) {
+            match (servicePluginPendingJobStore().findByJobId(jobId)) {
+                case Some(job) => return "GitCode 扫描状态：scanId=${job.jobId} status=${job.status} stage=${job.stage}"
+                case None => return this.servicePluginRenderGitCodeFailure("scan status", result)
+            }
+        }
+        this.servicePluginRenderGitCodeJobStatusResult(result.payload, jobId)
+    }
+
+    private func servicePluginGitCodeScanCancelReply(args: Array<String>): String {
+        let jobId = if (args.size > 0) { args[0].trimAscii() } else { "" }
+        if (jobId.isEmpty()) {
+            return "GitCode scan failed: missing scanId."
+        }
+        let result = invokeRegisteredCapability(CapabilityInvokeRequest(
+            "gitcode.monitor.cancel_job",
+            payload: this.servicePluginGitCodeJobIdPayload(jobId),
+            caller: this.servicePluginGitCodeCaller(),
+            timeoutMillis: 5000
+        ))
+        if (!result.ok) {
+            return this.servicePluginRenderGitCodeFailure("scan cancel", result)
+        }
+        servicePluginPendingJobStore().markCancelled(jobId, nowMillis: this.startNowMs())
+        "GitCode 扫描取消请求已提交，scanId=${jobId}。"
+    }
+
+    private func servicePluginGitCodeCaller(): CapabilityCaller {
+        CapabilityCaller(
+            callerId: "gateway.im.gitcode",
+            grantedHostApis: ["host.agent.invoke", "host.notification.publish", "host.audit.append", "host.capability.invoke"],
+            isOperator: true
+        )
+    }
+
+    private func servicePluginGitCodeJobIdPayload(jobId: String): String {
+        "{\"jobId\":\"${this.telegramCallbackJsonEscape(jobId.trimAscii())}\"}"
+    }
+
+    private func servicePluginBuildGitCodeScanJobId(message: InboundMessage): String {
+        "gcm-scan-${this.startNowMs()}-${this.servicePluginSafeJobIdPart(message.messageId)}"
+    }
+
+    private func servicePluginBuildGitCodeScanIdempotencyKey(message: InboundMessage, accountId: String): String {
+        "${channelToString(message.channel)}:${accountId}:${message.peerId}:${message.messageId}:${message.text.trimAscii()}"
+    }
+
+    private func servicePluginSafeJobIdPart(raw: String): String {
+        let trimmed = raw.trimAscii()
+        var out = ""
+        var i = 0
+        while (i < trimmed.size) {
+            let b = trimmed[i]
+            if ((b >= 97u8 && b <= 122u8) || (b >= 65u8 && b <= 90u8) || (b >= 48u8 && b <= 57u8) || b == 45u8 || b == 95u8 || b == 46u8) {
+                out += trimmed[i..(i + 1)]
+            } else if (b == 58u8 || b == 32u8) {
+                out += "-"
+            }
+            if (out.size >= 32) {
+                break
+            }
+            i++
+        }
+        if (out.isEmpty()) { "message" } else { out }
+    }
+
     private func servicePluginGitCodeInvokeReply(capabilityId: String, payload: String, action: String): String {
         let result = invokeRegisteredCapability(CapabilityInvokeRequest(
             capabilityId,
             payload: payload,
-            caller: CapabilityCaller(
-                callerId: "gateway.im.gitcode",
-                grantedHostApis: ["host.agent.invoke", "host.notification.publish", "host.audit.append", "host.capability.invoke"],
-                isOperator: true
-            ),
+            caller: this.servicePluginGitCodeCaller(),
             timeoutMillis: 60000
         ))
         if (!result.ok) {
@@ -722,6 +869,27 @@ public class GatewayService {
             return "GitCode status: ${normalizedStatus}"
         }
         "GitCode status: ${normalizedStatus} ${summary}"
+    }
+
+    private func servicePluginRenderGitCodeJobStatusResult(payload: String, fallbackJobId: String): String {
+        let root = try {
+            JsonValue.fromStr(payload).asObject()
+        } catch (_: Exception) {
+            return "GitCode 扫描状态：scanId=${fallbackJobId} status=unknown"
+        }
+        let status = this.feishuNativeJsonString(root, "status")
+        let jobId = this.feishuNativeJsonString(root, "jobId")
+        let stage = this.feishuNativeJsonString(root, "stage")
+        let summary = this.feishuNativeJsonString(root, "summary")
+        let scanId = if (jobId.isEmpty()) { fallbackJobId } else { jobId }
+        var text = "GitCode 扫描状态：scanId=${scanId} status=${if (status.isEmpty()) { "unknown" } else { status }}"
+        if (!stage.isEmpty()) {
+            text += " stage=${stage}"
+        }
+        if (!summary.isEmpty()) {
+            text += " ${summary}"
+        }
+        text
     }
 
     private func servicePluginCommandActionForLog(text: String, prefix: String): String {
