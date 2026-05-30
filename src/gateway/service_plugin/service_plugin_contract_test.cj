@@ -1,12 +1,68 @@
 package metis.gateway.service_plugin
 
 import std.collection.ArrayList
-import std.fs.{File, Path, remove}
+import std.fs.{File, Path, exists, remove}
 import std.time.DateTime
 import std.unittest.testmacro.*
 
 @Test
 public class ServicePluginContractTest {
+    private func stdioProtocolFixturePath(name: String): Path {
+        Path("test").join("fixtures").join("service_plugin").join("stdio_protocol").join(name)
+    }
+
+    private func readStdioProtocolFixture(name: String): String {
+        String.fromUtf8(File.readFrom(this.stdioProtocolFixturePath(name)))
+    }
+
+    private func repeatText(text: String, count: Int64): String {
+        var out = ""
+        for (_ in 0..count) {
+            out += text
+        }
+        out
+    }
+
+    @TestCase
+    public func servicePluginStdioProtocolFixturesDecodeGoldenFrames(): Unit {
+        let docPath = Path("docs").join("service-plugin-stdio-protocol.md")
+        @Expect(exists(docPath), true)
+        let doc = String.fromUtf8(File.readFrom(docPath))
+        @Expect(doc.contains("stdout_protocol_violation"), true)
+        @Expect(doc.contains("payload_invalid"), true)
+
+        let initLine = this.readStdioProtocolFixture("valid_initialize.jsonl").trimAscii()
+        let initDecoded = decodeServiceFrame(initLine)
+        @Expect(initDecoded.ok, true)
+        @Expect(initDecoded.frame.frameType, "response")
+        @Expect(initDecoded.frame.serviceId, "gitcode-monitor")
+        @Expect(initDecoded.frame.method, "initialize")
+
+        let scanLine = this.readStdioProtocolFixture("valid_scan_response.jsonl").trimAscii()
+        let scanDecoded = decodeServiceFrame(scanLine)
+        @Expect(scanDecoded.ok, true)
+        @Expect(scanDecoded.frame.frameType, "response")
+        @Expect(scanDecoded.frame.method, "invokeCapability")
+        @Expect(scanDecoded.frame.capabilityId, "gitcode.monitor.scan_once")
+        @Expect(scanDecoded.frame.correlationId, "corr-scan-1")
+
+        let noisyLines = this.readStdioProtocolFixture("noisy_stdout_before_response.txt").trimAscii().split("\n")
+        @Expect(noisyLines.size, 3)
+        @Expect(decodeServiceFrame(noisyLines[0]).ok, true)
+        @Expect(decodeServiceFrame(noisyLines[1]).ok, false)
+        @Expect(decodeServiceFrame(noisyLines[2]).ok, true)
+
+        for (name in ["valid_initialize.jsonl", "valid_scan_response.jsonl", "noisy_stdout_before_response.txt"]) {
+            let raw = this.readStdioProtocolFixture(name)
+            @Expect(raw.contains("Authorization"), false)
+            @Expect(raw.contains("token"), false)
+            @Expect(raw.contains("cookie"), false)
+            @Expect(raw.contains("/Users/"), false)
+        }
+        let oversized = "{\"type\":\"response\",\"frameId\":\"huge\",\"serviceId\":\"gitcode-monitor\",\"payload\":\"${this.repeatText("x", 65537)}\"}"
+        @Expect(decodeServiceFrame(oversized).errorKind, "frame_too_large")
+    }
+
     @TestCase
     public func parseServicePluginManifestValidMinimal(): Unit {
         let raw = "{\"schema\":\"metis.servicePlugin.v1\",\"pluginId\":\"sample\",\"kind\":\"service\",\"protocolVersion\":\"1.0\",\"entry\":{\"command\":\"sample-plugin\",\"args\":[\"stdio\"]},\"configSchema\":{\"type\":\"object\"},\"capabilityDeclarations\":[{\"capabilityId\":\"release.monitor.scan\",\"kind\":\"controlAction\"}]}"
@@ -150,6 +206,81 @@ public class ServicePluginContractTest {
         @Expect(missingStatus.status, "ok")
         @Expect(missingStatus.diagnostic.contains("missing field: status"), true)
         @Expect(missingStatus.payloadKind, "json_object")
+    }
+
+    @TestCase
+    public func validateResponseRequiresExpectedResponseFrame(): Unit {
+        let notResponse = validateServicePluginResponseFrame(
+            ServiceFrame("request", "f", "sample", method: "invokeCapability", capabilityId: "sample.monitor.status", correlationId: "corr-1"),
+            "sample",
+            "invokeCapability",
+            expectedCapabilityId: "sample.monitor.status",
+            expectedCorrelationId: "corr-1"
+        )
+        @Expect(notResponse.ok, false)
+        @Expect(notResponse.status, "unexpected_frame")
+
+        let wrongCorrelation = validateServicePluginResponseFrame(
+            ServiceFrame("response", "f", "sample", method: "invokeCapability", capabilityId: "sample.monitor.status", correlationId: "corr-other"),
+            "sample",
+            "invokeCapability",
+            expectedCapabilityId: "sample.monitor.status",
+            expectedCorrelationId: "corr-1"
+        )
+        @Expect(wrongCorrelation.ok, false)
+        @Expect(wrongCorrelation.status, "correlation_mismatch")
+
+        let wrongCapability = validateServicePluginResponseFrame(
+            ServiceFrame("response", "f", "sample", method: "invokeCapability", capabilityId: "sample.monitor.other", correlationId: "corr-1"),
+            "sample",
+            "invokeCapability",
+            expectedCapabilityId: "sample.monitor.status",
+            expectedCorrelationId: "corr-1"
+        )
+        @Expect(wrongCapability.ok, false)
+        @Expect(wrongCapability.status, "unexpected_frame")
+
+        let ok = validateServicePluginResponseFrame(
+            ServiceFrame("response", "f", "sample", method: "invokeCapability", capabilityId: "sample.monitor.status", correlationId: "corr-1"),
+            "sample",
+            "invokeCapability",
+            expectedCapabilityId: "sample.monitor.status",
+            expectedCorrelationId: "corr-1"
+        )
+        @Expect(ok.ok, true)
+        @Expect(ok.status, "ok")
+    }
+
+    @TestCase
+    public func validatePayloadObjectRequiresOkStatusAndDiagnosticTypes(): Unit {
+        let ok = validateServicePluginPayloadObject("{\"ok\":true,\"status\":\"ok\",\"accepted\":0}")
+        @Expect(ok.ok, true)
+        @Expect(ok.status, "ok")
+
+        let stringOk = validateServicePluginPayloadObject("{\"ok\":\"true\",\"status\":\"ok\"}")
+        @Expect(stringOk.ok, false)
+        @Expect(stringOk.status, "payload_invalid")
+        @Expect(stringOk.diagnostic.contains("ok field must be boolean"), true)
+
+        let nonObject = validateServicePluginPayloadObject("\"ok\"")
+        @Expect(nonObject.ok, false)
+        @Expect(nonObject.status, "payload_invalid")
+        @Expect(nonObject.diagnostic.contains("JSON object"), true)
+
+        let missingStatus = validateServicePluginPayloadObject("{\"ok\":true}")
+        @Expect(missingStatus.ok, false)
+        @Expect(missingStatus.status, "payload_invalid")
+        @Expect(missingStatus.diagnostic.contains("missing field: status"), true)
+
+        let badDiagnostic = validateServicePluginPayloadObject("{\"ok\":false,\"status\":\"failed\",\"diagnostic\":false}")
+        @Expect(badDiagnostic.ok, false)
+        @Expect(badDiagnostic.status, "payload_invalid")
+        @Expect(badDiagnostic.diagnostic.contains("diagnostic field must be string"), true)
+
+        let oversized = validateServicePluginPayloadObject("{\"ok\":true,\"status\":\"ok\",\"diagnostic\":\"${this.repeatText("x", 4097)}\"}")
+        @Expect(oversized.ok, false)
+        @Expect(oversized.status, "payload_invalid")
+        @Expect(oversized.diagnostic.contains("diagnostic field too large"), true)
     }
 
     @TestCase

@@ -1,0 +1,1 @@
+{"type":"response","frameId":"response-scan-1","serviceId":"gitcode-monitor","method":"invokeCapability","capabilityId":"gitcode.monitor.scan_once","correlationId":"corr-scan-1","payload":{"ok":true,"status":"ok","accepted":0,"ignored":0,"emitted":0,"stateSaved":true}}

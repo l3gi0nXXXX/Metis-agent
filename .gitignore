@@ -46,6 +46,14 @@ todo.md
 
 # Test files
 test/
+!test/
+test/*
+!test/fixtures/
+test/fixtures/*
+!test/fixtures/service_plugin/
+test/fixtures/service_plugin/*
+!test/fixtures/service_plugin/stdio_protocol/
+!test/fixtures/service_plugin/stdio_protocol/*
 test_examples/
 
 # External modules

@@ -35,6 +35,13 @@ public class ServicePluginHostTest {
     private func stdioManifest(responsePayload: String, initPayload!: String = "{ \"ok\": true, \"status\": \"ready\" }"): ServicePluginManifest {
         let caps = ArrayList<ServiceCapabilityRecord>()
         caps.add(ServiceCapabilityRecord("stdio.monitor.status", "controlAction"))
+        this.stdioManifestFromScript(this.stdioScript(responsePayload, initPayload: initPayload), caps: caps)
+    }
+
+    private func stdioManifestFromScript(script: String, caps!: ArrayList<ServiceCapabilityRecord> = ArrayList<ServiceCapabilityRecord>()): ServicePluginManifest {
+        if (caps.size == 0) {
+            caps.add(ServiceCapabilityRecord("stdio.monitor.status", "controlAction"))
+        }
         ServicePluginManifest(
             schema: METIS_SERVICE_PLUGIN_SCHEMA,
             pluginId: "stdio-service",
@@ -42,7 +49,7 @@ public class ServicePluginHostTest {
             kind: "service",
             protocolVersion: "1.0",
             entryCommand: "/bin/zsh",
-            entryArgs: ["-lc", this.stdioScript(responsePayload, initPayload: initPayload)],
+            entryArgs: ["-lc", script],
             hasConfigSchema: true,
             capabilityDeclarations: caps
         )
@@ -50,14 +57,41 @@ public class ServicePluginHostTest {
 
     private func stdioScript(responsePayload: String, initPayload!: String): String {
         let initLine = "{\"type\":\"response\",\"frameId\":\"init-1\",\"serviceId\":\"stdio-service\",\"method\":\"initialize\",\"payload\":${initPayload}}"
-        let responseLine = "{\"type\":\"response\",\"frameId\":\"invoke-1\",\"serviceId\":\"stdio-service\",\"capabilityId\":\"stdio.monitor.status\",\"correlationId\":\"corr-stdio-service-1-stdio.monitor.status\",\"payload\":${responsePayload}}"
-        "printf '%s\\n' '${initLine}'; read ignored; printf '%s\\n' '${responseLine}'; read ignored || true"
+        let responseLine = this.stdioInvokeResponseLine(responsePayload)
+        this.stdioScriptWithInvokeLines(initLine, [responseLine])
+    }
+
+    private func stdioScriptWithInvokeLines(initLine: String, invokeLines: Array<String>): String {
+        var script = "printf '%s\\n' '${initLine}'; read ignored"
+        for (line in invokeLines) {
+            script += "; printf '%s\\n' '${line}'"
+        }
+        script += "; read ignored || true"
+        script
+    }
+
+    private func stdioInvokeResponseLine(payload: String, serviceId!: String = "stdio-service", capabilityId!: String = "stdio.monitor.status", correlationId!: String = "corr-stdio-service-1-stdio.monitor.status"): String {
+        "{\"type\":\"response\",\"frameId\":\"invoke-1\",\"serviceId\":\"${serviceId}\",\"method\":\"invokeCapability\",\"capabilityId\":\"${capabilityId}\",\"correlationId\":\"${correlationId}\",\"payload\":${payload}}"
     }
 
     private func registerStdio(responsePayload: String, initPayload!: String = "{ \"ok\": true, \"status\": \"ready\" }"): Unit {
         resetServicePluginHostForTest()
         let result = registerServicePlugin(ServicePluginRegistration(this.stdioManifest(responsePayload, initPayload: initPayload)))
         @Expect(result.ok, true)
+    }
+
+    private func registerStdioScript(script: String): Unit {
+        resetServicePluginHostForTest()
+        let result = registerServicePlugin(ServicePluginRegistration(this.stdioManifestFromScript(script)))
+        @Expect(result.ok, true)
+    }
+
+    private func repeatText(text: String, count: Int64): String {
+        var out = ""
+        for (_ in 0..count) {
+            out += text
+        }
+        out
     }
 
     @TestCase
@@ -253,7 +287,7 @@ public class ServicePluginHostTest {
         try {
             let result = invokeRegisteredCapability(CapabilityInvokeRequest("stdio.monitor.status", payload: "{}"))
             @Expect(result.ok, false)
-            @Expect(result.status, "invalid_payload")
+            @Expect(result.status, "payload_invalid")
             @Expect(result.diagnostic.contains("ok field must be boolean"), true)
         } finally {
             resetServicePluginHostForTest()
@@ -261,13 +295,128 @@ public class ServicePluginHostTest {
     }
 
     @TestCase
-    public func stdioInvokeKeepsLegacyPayloadWithoutOkCompatible(): Unit {
+    public func stdioInvokeRejectsLegacyPayloadWithoutOkForNewProtocol(): Unit {
         this.registerStdio("{ \"accepted\": 1, \"ignored\": 0 }")
+        try {
+            let result = invokeRegisteredCapability(CapabilityInvokeRequest("stdio.monitor.status", payload: "{}"))
+            @Expect(result.ok, false)
+            @Expect(result.status, "payload_invalid")
+            @Expect(result.diagnostic.contains("missing field: ok"), true)
+        } finally {
+            resetServicePluginHostForTest()
+        }
+    }
+
+    @TestCase
+    public func stdioInvokeSkipsBoundedNonFrameNoiseBeforeResponse(): Unit {
+        let initLine = "{\"type\":\"response\",\"frameId\":\"init-1\",\"serviceId\":\"stdio-service\",\"method\":\"initialize\",\"payload\":{\"ok\":true,\"status\":\"ready\"}}"
+        let warning = "2026-05-30T00:54:06.196142+08:00 WARN [HttpEngine1#connect] TLS handshake error"
+        let responseLine = this.stdioInvokeResponseLine("{\"ok\":true,\"status\":\"ok\"}")
+        this.registerStdioScript(this.stdioScriptWithInvokeLines(initLine, [warning, responseLine]))
         try {
             let result = invokeRegisteredCapability(CapabilityInvokeRequest("stdio.monitor.status", payload: "{}"))
             @Expect(result.ok, true)
             @Expect(result.status, "ok")
-            @Expect(result.payload.contains("\"accepted\""), true)
+        } finally {
+            resetServicePluginHostForTest()
+        }
+    }
+
+    @TestCase
+    public func stdioInvokeRejectsNoiseBudgetExceededWithRedactedDiagnostic(): Unit {
+        let initLine = "{\"type\":\"response\",\"frameId\":\"init-1\",\"serviceId\":\"stdio-service\",\"method\":\"initialize\",\"payload\":{\"ok\":true,\"status\":\"ready\"}}"
+        let lines = ArrayList<String>()
+        for (i in 0..9) {
+            lines.add("WARN noisy stdout ${i} Authorization: Bearer secret-value path=/Users/name/private")
+        }
+        lines.add(this.stdioInvokeResponseLine("{\"ok\":true,\"status\":\"ok\"}"))
+        this.registerStdioScript(this.stdioScriptWithInvokeLines(initLine, lines.toArray()))
+        try {
+            let result = invokeRegisteredCapability(CapabilityInvokeRequest("stdio.monitor.status", payload: "{}"))
+            @Expect(result.ok, false)
+            @Expect(result.status, "stdout_protocol_violation")
+            @Expect(result.diagnostic.contains("secret-value"), false)
+            @Expect(result.diagnostic.contains("/Users/name"), false)
+            @Expect(result.diagnostic.contains("payload-"), true)
+        } finally {
+            resetServicePluginHostForTest()
+        }
+    }
+
+    @TestCase
+    public func stdioInvokeRejectsOversizedFrameImmediately(): Unit {
+        let initLine = "{\"type\":\"response\",\"frameId\":\"init-1\",\"serviceId\":\"stdio-service\",\"method\":\"initialize\",\"payload\":{\"ok\":true,\"status\":\"ready\"}}"
+        let hugeFrame = "{\"type\":\"response\",\"frameId\":\"huge\",\"serviceId\":\"stdio-service\",\"payload\":\"${this.repeatText("x", 65537)}\"}"
+        let responseLine = this.stdioInvokeResponseLine("{\"ok\":true,\"status\":\"ok\"}")
+        this.registerStdioScript(this.stdioScriptWithInvokeLines(initLine, [hugeFrame, responseLine]))
+        try {
+            let result = invokeRegisteredCapability(CapabilityInvokeRequest("stdio.monitor.status", payload: "{}"))
+            @Expect(result.ok, false)
+            @Expect(result.status, "frame_too_large")
+        } finally {
+            resetServicePluginHostForTest()
+        }
+    }
+
+    @TestCase
+    public func stdioInvokeDoesNotTreatEventAuditOrHeartbeatAsResponse(): Unit {
+        let initLine = "{\"type\":\"response\",\"frameId\":\"init-1\",\"serviceId\":\"stdio-service\",\"method\":\"initialize\",\"payload\":{\"ok\":true,\"status\":\"ready\"}}"
+        let eventLine = "{\"type\":\"event\",\"frameId\":\"event-1\",\"serviceId\":\"stdio-service\",\"method\":\"emitCapabilityEvent\",\"capabilityId\":\"stdio.monitor.status\",\"payload\":{\"ok\":true,\"status\":\"event\"}}"
+        let auditLine = "{\"type\":\"audit\",\"frameId\":\"audit-1\",\"serviceId\":\"stdio-service\",\"method\":\"audit\",\"payload\":{\"ok\":true,\"status\":\"audit\"}}"
+        let heartbeatLine = "{\"type\":\"heartbeat\",\"frameId\":\"heartbeat-1\",\"serviceId\":\"stdio-service\",\"method\":\"heartbeat\",\"payload\":{\"ok\":true,\"status\":\"alive\"}}"
+        let responseLine = this.stdioInvokeResponseLine("{\"ok\":true,\"status\":\"ok\"}")
+        this.registerStdioScript(this.stdioScriptWithInvokeLines(initLine, [eventLine, auditLine, heartbeatLine, responseLine]))
+        try {
+            let result = invokeRegisteredCapability(CapabilityInvokeRequest("stdio.monitor.status", payload: "{}"))
+            @Expect(result.ok, true)
+            @Expect(result.status, "ok")
+        } finally {
+            resetServicePluginHostForTest()
+        }
+    }
+
+    @TestCase
+    public func stdioInvokeRejectsWrongRequestIdentity(): Unit {
+        let initLine = "{\"type\":\"response\",\"frameId\":\"init-1\",\"serviceId\":\"stdio-service\",\"method\":\"initialize\",\"payload\":{\"ok\":true,\"status\":\"ready\"}}"
+        let wrongService = this.stdioInvokeResponseLine("{\"ok\":true,\"status\":\"ok\"}", serviceId: "other-service")
+        this.registerStdioScript(this.stdioScriptWithInvokeLines(initLine, [wrongService]))
+        try {
+            let result = invokeRegisteredCapability(CapabilityInvokeRequest("stdio.monitor.status", payload: "{}"))
+            @Expect(result.ok, false)
+            @Expect(result.status, "unexpected_frame")
+        } finally {
+            resetServicePluginHostForTest()
+        }
+
+        let wrongCapability = this.stdioInvokeResponseLine("{\"ok\":true,\"status\":\"ok\"}", capabilityId: "stdio.monitor.other")
+        this.registerStdioScript(this.stdioScriptWithInvokeLines(initLine, [wrongCapability]))
+        try {
+            let result = invokeRegisteredCapability(CapabilityInvokeRequest("stdio.monitor.status", payload: "{}"))
+            @Expect(result.ok, false)
+            @Expect(result.status, "unexpected_frame")
+        } finally {
+            resetServicePluginHostForTest()
+        }
+
+        let wrongCorrelation = this.stdioInvokeResponseLine("{\"ok\":true,\"status\":\"ok\"}", correlationId: "corr-other")
+        let correctResponse = this.stdioInvokeResponseLine("{\"ok\":true,\"status\":\"ok\"}")
+        this.registerStdioScript(this.stdioScriptWithInvokeLines(initLine, [wrongCorrelation, correctResponse]))
+        try {
+            let result = invokeRegisteredCapability(CapabilityInvokeRequest("stdio.monitor.status", payload: "{}"))
+            @Expect(result.ok, false)
+            @Expect(result.status, "correlation_mismatch")
+        } finally {
+            resetServicePluginHostForTest()
+        }
+    }
+
+    @TestCase
+    public func stdioInvokeRejectsNonObjectPayloadForNewProtocol(): Unit {
+        this.registerStdio("\"ok\"")
+        try {
+            let result = invokeRegisteredCapability(CapabilityInvokeRequest("stdio.monitor.status", payload: "{}"))
+            @Expect(result.ok, false)
+            @Expect(result.status, "payload_invalid")
         } finally {
             resetServicePluginHostForTest()
         }

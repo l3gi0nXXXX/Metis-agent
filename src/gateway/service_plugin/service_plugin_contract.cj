@@ -360,6 +360,30 @@ public class ServiceFrameDecodeResult {
     }
 }
 
+public class ServiceFrameValidationResult {
+    public let ok: Bool
+    public let status: String
+    public let diagnostic: String
+
+    public init(ok: Bool, status!: String = "ok", diagnostic!: String = "") {
+        this.ok = ok
+        this.status = status.trimAscii()
+        this.diagnostic = diagnostic.trimAscii()
+    }
+}
+
+public class ServicePayloadValidationResult {
+    public let ok: Bool
+    public let status: String
+    public let diagnostic: String
+
+    public init(ok: Bool, status!: String = "ok", diagnostic!: String = "") {
+        this.ok = ok
+        this.status = status.trimAscii()
+        this.diagnostic = diagnostic.trimAscii()
+    }
+}
+
 public func encodeServiceFrame(frame: ServiceFrame): String {
     let root = JsonObject()
     root.put("type", JsonString(frame.frameType))
@@ -405,6 +429,101 @@ public func decodeServiceFrame(line: String, maxBytes!: Int64 = 65536): ServiceF
         case None => "{}"
     }
     ServiceFrameDecodeResult(true, frame: ServiceFrame(frameType, frameId, serviceId, method: method, capabilityId: capabilityId, correlationId: correlationId, payload: payload))
+}
+
+public func validateServicePluginResponseFrame(
+    frame: ServiceFrame,
+    expectedServiceId: String,
+    expectedMethod: String,
+    expectedCapabilityId!: String = "",
+    expectedCorrelationId!: String = ""
+): ServiceFrameValidationResult {
+    if (frame.frameType != "response") {
+        return ServiceFrameValidationResult(false, status: "unexpected_frame", diagnostic: "expected response frame")
+    }
+    if (frame.serviceId != expectedServiceId.trimAscii()) {
+        return ServiceFrameValidationResult(false, status: "unexpected_frame", diagnostic: "response serviceId mismatch")
+    }
+    if (frame.method != expectedMethod.trimAscii()) {
+        return ServiceFrameValidationResult(false, status: "unexpected_frame", diagnostic: "response method mismatch")
+    }
+    let expectedCap = expectedCapabilityId.trimAscii()
+    if (!expectedCap.isEmpty() && frame.capabilityId != expectedCap) {
+        return ServiceFrameValidationResult(false, status: "unexpected_frame", diagnostic: "response capabilityId mismatch")
+    }
+    let expectedCorr = expectedCorrelationId.trimAscii()
+    if (!expectedCorr.isEmpty() && frame.correlationId != expectedCorr) {
+        return ServiceFrameValidationResult(false, status: "correlation_mismatch", diagnostic: "response correlationId mismatch")
+    }
+    ServiceFrameValidationResult(true)
+}
+
+public func validateServicePluginPayloadObject(
+    payload: String,
+    requireOkStatus!: Bool = true
+): ServicePayloadValidationResult {
+    let raw = payload.trimAscii()
+    if (raw.isEmpty()) {
+        return ServicePayloadValidationResult(false, status: "payload_invalid", diagnostic: "payload is empty")
+    }
+    if (raw.size > ServiceFrameLimits().maxPayloadBytes) {
+        return ServicePayloadValidationResult(false, status: "payload_invalid", diagnostic: "payload too large: ${hashRawPayload(raw)}")
+    }
+    let root = try {
+        JsonValue.fromStr(raw).asObject()
+    } catch (_: Exception) {
+        return ServicePayloadValidationResult(false, status: "payload_invalid", diagnostic: "payload must be a JSON object")
+    }
+
+    let diagnostics = ArrayList<String>()
+    var payloadStatus = "ok"
+    match (root.get("ok")) {
+        case Some(v) =>
+            try {
+                let _ = v.asBool().getValue()
+            } catch (_: Exception) {
+                diagnostics.add("ok field must be boolean")
+            }
+        case None =>
+            if (requireOkStatus) {
+                diagnostics.add("missing field: ok")
+            }
+    }
+
+    match (root.get("status")) {
+        case Some(v) =>
+            try {
+                payloadStatus = v.asString().getValue().trimAscii()
+                if (payloadStatus.isEmpty()) {
+                    diagnostics.add("status field must be non-empty string")
+                }
+            } catch (_: Exception) {
+                diagnostics.add("status field must be string")
+            }
+        case None =>
+            if (requireOkStatus) {
+                diagnostics.add("missing field: status")
+            }
+    }
+
+    match (root.get("diagnostic")) {
+        case Some(v) =>
+            let diagnostic = try {
+                v.asString().getValue()
+            } catch (_: Exception) {
+                diagnostics.add("diagnostic field must be string")
+                ""
+            }
+            if (diagnostic.size > 4096) {
+                diagnostics.add("diagnostic field too large: ${hashRawPayload(diagnostic)}")
+            }
+        case None => ()
+    }
+
+    if (diagnostics.size > 0) {
+        return ServicePayloadValidationResult(false, status: "payload_invalid", diagnostic: String.join(diagnostics.toArray(), delimiter: "; "))
+    }
+    ServicePayloadValidationResult(true, status: payloadStatus)
 }
 
 public class PendingFrameStore {
