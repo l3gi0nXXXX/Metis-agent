@@ -6,8 +6,8 @@ import metis.core.model.{findModelCapabilityCatalogEntry, modelCapabilityCatalog
 import metis.core.skills.SkillsPrompt
 import metis.gateway.model.*
 import metis.gateway.security.gatewayPairingAccountStore
-import metis.gateway.service_plugin.{CapabilityCaller, CapabilityInvokeRequest, CapabilityInvokeResult, ServicePluginDeliveryTarget, ServicePluginEventDeliveryResult, buildServicePluginImBindingRules, invokeRegisteredCapability, matchServicePluginImBinding, parseServicePluginJobAcceptedPayload, renderServicePluginJobSnapshotMessage, servicePluginPendingJobStore, registerConfiguredServicePlugins, servicePluginConfiguredStatusForUser, setServicePluginEventDelivery}
-import metis.gateway.session.{GatewaySessionContext, GatewaySessionRequest, gatewayResolveSessionContext, gatewaySessionRequestFromInbound}
+import metis.gateway.service_plugin.{CapabilityCaller, CapabilityInvokeRequest, CapabilityInvokeResult, ServicePluginAcceptedGitCodeEvent, ServicePluginDeliveryTarget, ServicePluginEventDeliveryResult, ServicePluginGeneratedReplyResult, ServicePluginPendingJob, buildServicePluginImBindingRules, invokeRegisteredCapability, matchServicePluginImBinding, parseServicePluginJobAcceptedPayload, renderServicePluginJobSnapshotMessage, servicePluginPendingJobStore, registerConfiguredServicePlugins, servicePluginConfiguredStatusForUser, setServicePluginEventDelivery, setServicePluginGeneratedReplyHandler}
+import metis.gateway.session.{GatewayIngressSource, GatewaySessionContext, GatewaySessionRequest, gatewayResolveSessionContext, gatewaySessionRequestFromInbound}
 import metis.gateway.tools.{gatewayHandleNativeCommandLine, gatewayHandleSubagentsCommandLine}
 import metis.gateway.gitcode_plugin.{GatewayCommandContext, buildGitCodeAsyncScanPayload, buildGitCodeSubscriptionTarget, formatGitCodeSubscribeResult, handleGitCodeKnowledgeQueryCommand, parseGitCodeCommand, parseGitCodeScanOnceArgs, removeGitCodeSubscription, saveGitCodeSubscription}
 import magic.jsonable.*
@@ -140,6 +140,9 @@ public class GatewayService {
             } else {
                 ServicePluginEventDeliveryResult(true, "sent", messageId: sentId)
             }
+        }))
+        setServicePluginGeneratedReplyHandler(Some({ job: ServicePluginPendingJob, event: ServicePluginAcceptedGitCodeEvent =>
+            this.servicePluginGenerateGitCodeReplyDraft(user, job, event)
         }))
         let _ = gatewayOpenClawCompatHostStart(user)
         let _ = gatewayOpenClawPluginSidecarStart(user)
@@ -840,6 +843,54 @@ public class GatewayService {
             case _ => "service plugin reported an unknown failure"
         }
         "GitCode ${normalizedAction} failed: ${message}."
+    }
+
+    private func servicePluginGenerateGitCodeReplyDraft(
+        user: GatewayUserSettings,
+        job: ServicePluginPendingJob,
+        event: ServicePluginAcceptedGitCodeEvent
+    ): ServicePluginGeneratedReplyResult {
+        let prompt = this.servicePluginBuildGitCodeReplyPrompt(event)
+        let request = GatewaySessionRequest(
+            GatewayIngressSource.Channel(job.deliveryTarget.channel),
+            channelName: job.deliveryTarget.channel,
+            sessionHint: "service-plugin/gitcode/${job.jobId}",
+            text: prompt,
+            accountId: job.deliveryTarget.accountId,
+            peerId: job.deliveryTarget.peerId,
+            senderId: "gitcode-monitor",
+            threadId: job.deliveryTarget.threadId,
+            sourceMessageId: job.deliveryTarget.replyToMessageId,
+            replyToMessageId: job.deliveryTarget.replyToMessageId,
+            replyInThread: job.deliveryTarget.replyInThread,
+            deliver: false
+        )
+        let turn = try {
+            gatewayExecuteSessionRequestTurnForUser(
+                user,
+                request,
+                prompt,
+                deliver: false,
+                timeoutSeconds: 90
+            )
+        } catch (e: Exception) {
+            return ServicePluginGeneratedReplyResult(false, status: "llm_degraded", diagnostic: "Agent Runtime failed: ${e.message}", needsHumanReview: true)
+        }
+        let draft = turn.execution.answer.trimAscii()
+        if (draft.isEmpty()) {
+            return ServicePluginGeneratedReplyResult(false, status: "draft_empty", diagnostic: "Agent Runtime returned empty draft", needsHumanReview: true)
+        }
+        if (draft.startsWith("Gateway agent failed:")) {
+            return ServicePluginGeneratedReplyResult(false, status: "llm_degraded", diagnostic: draft, needsHumanReview: true)
+        }
+        ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: draft)
+    }
+
+    private func servicePluginBuildGitCodeReplyPrompt(event: ServicePluginAcceptedGitCodeEvent): String {
+        let source = if (event.url.isEmpty()) { "${event.repo} ${event.kind} #${event.number}" } else { "${event.repo} ${event.kind} #${event.number} ${event.url}" }
+        let title = if (event.title.isEmpty()) { "(no title)" } else { event.title }
+        let content = if (event.content.isEmpty()) { "(no content)" } else { event.content }
+        "你是 Metis 的 GitCode 回复草稿生成器。请基于下面的 GitCode PR/Issue/comment 生成一段可以发给维护者人工确认的中文回复草稿。只输出草稿正文，不要输出 JSON，不要声称已经写回 GitCode，不要泄露任何 token、cookie、Authorization header 或本机路径。\n\n来源: ${source}\n标题: ${title}\n作者: ${event.author}\n内容:\n${content}"
     }
 
     private func servicePluginRenderGitCodeScanResult(payload: String): String {
