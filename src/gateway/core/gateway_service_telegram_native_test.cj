@@ -657,6 +657,61 @@ public class GatewayServiceTelegramNativeTest {
     }
 
     @TestCase
+    public func telegramGitcodeProtocolFailuresAreHumanReadable(): Unit {
+        withGatewayTelegramNativeTestHome {
+            let modelName = "metis-test-telegram-gitcode-protocol-failure-${DateTime.now().toUnixTimeStamp().toMilliseconds()}"
+            ModelManager.registerChatModel(modelName, { => GatewayTelegramNativeFakeModel() })
+            let oldModel = CliConfig.model
+            CliConfig.model = modelName
+            let adapter = GatewayTelegramNativeTestAdapter()
+            let service = gatewayTelegramNativeServiceForAccount(adapter, "tg-gitcode-monitor")
+            try {
+                var user = GatewayUserSettings()
+                user.telegram.enabled = true
+                user.telegram.allowFrom = ["*"]
+                user.servicePlugins = [gatewayTelegramNativeGitcodePluginSettings("tg-gitcode-monitor")]
+                CliSettingManager.writeGatewaySettings(user)
+                setServicePluginCapabilityInvokerForTest(Some({ _registration: ServicePluginRegistration, request: CapabilityInvokeRequest =>
+                    CapabilityInvokeResult(false, "stdout_protocol_violation", serviceId: "gitcode-monitor", capabilityId: request.capabilityId, diagnostic: "{\"ok\":false,\"status\":\"stdout_protocol_violation\",\"diagnostic\":\"Authorization: Bearer secret /Users/name/private\"}")
+                }))
+                service.start()
+                adapter.queue("/gitcode scan once")
+                service.processOnce()
+
+                setServicePluginCapabilityInvokerForTest(Some({ _registration: ServicePluginRegistration, request: CapabilityInvokeRequest =>
+                    CapabilityInvokeResult(false, "unexpected_frame", serviceId: "gitcode-monitor", capabilityId: request.capabilityId, diagnostic: "{\"ok\":false,\"status\":\"unexpected_frame\",\"diagnostic\":\"Authorization: Bearer secret /Users/name/private\"}")
+                }))
+                adapter.queue("/gitcode scan once")
+                service.processOnce()
+
+                setServicePluginCapabilityInvokerForTest(Some({ _registration: ServicePluginRegistration, request: CapabilityInvokeRequest =>
+                    CapabilityInvokeResult(false, "payload_invalid", serviceId: "gitcode-monitor", capabilityId: request.capabilityId, diagnostic: "{\"ok\":false,\"status\":\"payload_invalid\",\"diagnostic\":\"Authorization: Bearer secret /Users/name/private\"}")
+                }))
+                adapter.queue("/gitcode scan once")
+                service.processOnce()
+
+                @Expect(adapter.sentCount(), 3)
+                @Expect(adapter.sentText(0), "GitCode scan failed: service plugin wrote invalid data to stdout before the response.")
+                @Expect(adapter.sentText(1), "GitCode scan failed: service plugin returned a response for a different request.")
+                @Expect(adapter.sentText(2), "GitCode scan failed: service plugin returned an invalid payload.")
+                for (i in 0..3) {
+                    let text = adapter.sentText(i)
+                    @Expect(text.contains("{"), false)
+                    @Expect(text.contains("}"), false)
+                    @Expect(text.contains("\"ok\""), false)
+                    @Expect(text.contains("\"status\""), false)
+                    @Expect(text.contains("secret"), false)
+                    @Expect(text.contains("/Users/"), false)
+                }
+            } finally {
+                setServicePluginCapabilityInvokerForTest(None)
+                service.stop()
+                CliConfig.model = oldModel
+            }
+        }
+    }
+
+    @TestCase
     public func telegramGitcodePlainTextFallsBackToAgentSameAccount(): Unit {
         withGatewayTelegramNativeTestHome {
             let modelName = "metis-test-telegram-gitcode-fallback-${DateTime.now().toUnixTimeStamp().toMilliseconds()}"

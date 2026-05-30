@@ -1,0 +1,3 @@
+{"type":"response","frameId":"initialize","serviceId":"gitcode-monitor","method":"initialize","payload":{"ok":true,"status":"ok","capabilities":8}}
+2026-05-30T00:54:06.196142+08:00 WARN [HttpEngine1#connect] TLS handshake error, the connection is closed.
+{"type":"response","frameId":"response-scan-1","serviceId":"gitcode-monitor","method":"invokeCapability","capabilityId":"gitcode.monitor.scan_once","correlationId":"corr-scan-1","payload":{"ok":true,"status":"ok","accepted":0,"ignored":0,"emitted":0,"stateSaved":true}}

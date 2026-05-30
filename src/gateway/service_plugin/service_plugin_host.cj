@@ -482,8 +482,9 @@ private class ServicePluginLineBuffer {
             while (this.lines.size >= 256) {
                 this.lines.remove(at: 0)
             }
+            let stored = if (line.size > 65537) { line[..65537] + "...[TRUNCATED]" } else { line }
             let clipped = if (line.size > 4096) { line[..4096] + "...[TRUNCATED]" } else { line }
-            this.lines.add(clipped)
+            this.lines.add(stored)
             this.summaryLines.add(clipped)
             while (this.summaryLines.size > 8) {
                 this.summaryLines.remove(at: 0)
@@ -586,6 +587,159 @@ private class ServicePluginStdioProcess {
             }
         }
     }
+}
+
+private class ServicePluginStdoutReadPolicy {
+    public let timeoutMs: Int64
+    public let maxNoiseLines: Int64
+    public let maxNoiseBytes: Int64
+    public let expectedServiceId: String
+    public let expectedMethod: String
+    public let expectedCapabilityId: String
+    public let expectedCorrelationId: String
+
+    public init(
+        timeoutMs: Int64,
+        expectedServiceId: String,
+        expectedMethod: String,
+        expectedCapabilityId!: String = "",
+        expectedCorrelationId!: String = "",
+        maxNoiseLines!: Int64 = 8,
+        maxNoiseBytes!: Int64 = 8192
+    ) {
+        this.timeoutMs = timeoutMs
+        this.maxNoiseLines = maxNoiseLines
+        this.maxNoiseBytes = maxNoiseBytes
+        this.expectedServiceId = expectedServiceId.trimAscii()
+        this.expectedMethod = expectedMethod.trimAscii()
+        this.expectedCapabilityId = expectedCapabilityId.trimAscii()
+        this.expectedCorrelationId = expectedCorrelationId.trimAscii()
+    }
+}
+
+private class ServicePluginStdoutReadResult {
+    public let ok: Bool
+    public let frame: ServiceFrame
+    public let status: String
+    public let diagnostic: String
+    public let noiseLineCount: Int64
+    public let noiseHash: String
+
+    public init(
+        ok: Bool,
+        frame!: ServiceFrame = ServiceFrame("", "", ""),
+        status!: String = "ok",
+        diagnostic!: String = "",
+        noiseLineCount!: Int64 = 0,
+        noiseHash!: String = ""
+    ) {
+        this.ok = ok
+        this.frame = frame
+        this.status = status.trimAscii()
+        this.diagnostic = diagnostic.trimAscii()
+        this.noiseLineCount = noiseLineCount
+        this.noiseHash = noiseHash.trimAscii()
+    }
+}
+
+private func readExpectedServiceFrame(process: ServicePluginStdioProcess, policy: ServicePluginStdoutReadPolicy): ServicePluginStdoutReadResult {
+    var noiseLineCount: Int64 = 0
+    var emptyLineCount: Int64 = 0
+    var noiseBytes: Int64 = 0
+    let noiseSamples = ArrayList<String>()
+
+    while (true) {
+        let line = match (process.readStdoutLine(policy.timeoutMs)) {
+            case Some(value) => value
+            case None =>
+                return ServicePluginStdoutReadResult(false, status: "timeout", diagnostic: servicePluginStdoutNoiseDiagnostic("timeout", noiseLineCount, noiseBytes, noiseSamples))
+        }
+        let trimmed = line.trimAscii()
+        if (trimmed.isEmpty()) {
+            emptyLineCount++
+            let noise = servicePluginRecordStdoutNoise(line, noiseLineCount, noiseBytes, noiseSamples)
+            noiseLineCount = noise[0]
+            noiseBytes = noise[1]
+            if (emptyLineCount > 2 || servicePluginStdoutNoiseExceeded(noiseLineCount, noiseBytes, policy)) {
+                return ServicePluginStdoutReadResult(false, status: "stdout_protocol_violation", diagnostic: servicePluginStdoutNoiseDiagnostic("stdout_protocol_violation", noiseLineCount, noiseBytes, noiseSamples), noiseLineCount: noiseLineCount, noiseHash: hashRawPayload(String.join(noiseSamples.toArray(), delimiter: "\n")))
+            }
+            continue
+        }
+
+        if (!trimmed.startsWith("{")) {
+            let noise = servicePluginRecordStdoutNoise(line, noiseLineCount, noiseBytes, noiseSamples)
+            noiseLineCount = noise[0]
+            noiseBytes = noise[1]
+            if (servicePluginStdoutNoiseExceeded(noiseLineCount, noiseBytes, policy)) {
+                return ServicePluginStdoutReadResult(false, status: "stdout_protocol_violation", diagnostic: servicePluginStdoutNoiseDiagnostic("stdout_protocol_violation", noiseLineCount, noiseBytes, noiseSamples), noiseLineCount: noiseLineCount, noiseHash: hashRawPayload(String.join(noiseSamples.toArray(), delimiter: "\n")))
+            }
+            continue
+        }
+
+        let decoded = decodeServiceFrame(trimmed)
+        if (!decoded.ok) {
+            if (decoded.errorKind == "frame_too_large") {
+                return ServicePluginStdoutReadResult(false, status: "frame_too_large", diagnostic: "frame_too_large ${hashRawPayload(trimmed)}", noiseLineCount: noiseLineCount, noiseHash: hashRawPayload(String.join(noiseSamples.toArray(), delimiter: "\n")))
+            }
+            let noise = servicePluginRecordStdoutNoise(trimmed, noiseLineCount, noiseBytes, noiseSamples)
+            noiseLineCount = noise[0]
+            noiseBytes = noise[1]
+            if (servicePluginStdoutNoiseExceeded(noiseLineCount, noiseBytes, policy)) {
+                return ServicePluginStdoutReadResult(false, status: "frame_decode_failed", diagnostic: servicePluginStdoutNoiseDiagnostic("frame_decode_failed", noiseLineCount, noiseBytes, noiseSamples), noiseLineCount: noiseLineCount, noiseHash: hashRawPayload(String.join(noiseSamples.toArray(), delimiter: "\n")))
+            }
+            continue
+        }
+
+        let validation = validateServicePluginResponseFrame(
+            decoded.frame,
+            policy.expectedServiceId,
+            policy.expectedMethod,
+            expectedCapabilityId: policy.expectedCapabilityId,
+            expectedCorrelationId: policy.expectedCorrelationId
+        )
+        if (validation.ok) {
+            let noiseHash = hashRawPayload(String.join(noiseSamples.toArray(), delimiter: "\n"))
+            return ServicePluginStdoutReadResult(
+                true,
+                frame: decoded.frame,
+                status: if (noiseLineCount > 0) { "stdout_protocol_noise" } else { "ok" },
+                diagnostic: if (noiseLineCount > 0) { servicePluginStdoutNoiseDiagnostic("stdout_protocol_noise", noiseLineCount, noiseBytes, noiseSamples) } else { "" },
+                noiseLineCount: noiseLineCount,
+                noiseHash: noiseHash
+            )
+        }
+
+        if (decoded.frame.frameType == "event" || decoded.frame.frameType == "audit" || decoded.frame.frameType == "heartbeat") {
+            let noise = servicePluginRecordStdoutNoise(trimmed, noiseLineCount, noiseBytes, noiseSamples)
+            noiseLineCount = noise[0]
+            noiseBytes = noise[1]
+            if (servicePluginStdoutNoiseExceeded(noiseLineCount, noiseBytes, policy)) {
+                return ServicePluginStdoutReadResult(false, status: "stdout_protocol_violation", diagnostic: servicePluginStdoutNoiseDiagnostic("stdout_protocol_violation", noiseLineCount, noiseBytes, noiseSamples), noiseLineCount: noiseLineCount, noiseHash: hashRawPayload(String.join(noiseSamples.toArray(), delimiter: "\n")))
+            }
+            continue
+        }
+
+        return ServicePluginStdoutReadResult(false, frame: decoded.frame, status: validation.status, diagnostic: validation.diagnostic, noiseLineCount: noiseLineCount, noiseHash: hashRawPayload(String.join(noiseSamples.toArray(), delimiter: "\n")))
+    }
+    ServicePluginStdoutReadResult(false, status: "timeout", diagnostic: servicePluginStdoutNoiseDiagnostic("timeout", noiseLineCount, noiseBytes, noiseSamples))
+}
+
+private func servicePluginRecordStdoutNoise(line: String, count: Int64, bytes: Int64, samples: ArrayList<String>): (Int64, Int64) {
+    if (samples.size < 8) {
+        samples.add(line)
+    }
+    (count + 1, bytes + line.size)
+}
+
+private func servicePluginStdoutNoiseExceeded(count: Int64, bytes: Int64, policy: ServicePluginStdoutReadPolicy): Bool {
+    count > policy.maxNoiseLines || bytes > policy.maxNoiseBytes
+}
+
+private func servicePluginStdoutNoiseDiagnostic(kind: String, count: Int64, bytes: Int64, samples: ArrayList<String>): String {
+    let raw = String.join(samples.toArray(), delimiter: "\n")
+    let redacted = redactServicePayload(raw).text
+    let sample = if (redacted.isEmpty()) { "" } else { " sample=${redacted}" }
+    "${kind} noiseLines=${count} noiseBytes=${bytes} noiseHash=${hashRawPayload(raw)}${sample}"
 }
 
 public func setServicePluginCapabilityInvokerForTest(
@@ -752,24 +906,27 @@ private func servicePluginInvokeViaStdioProcess(record: ServicePluginRuntimeReco
     }
 
     try {
-        let initLine = match (process.readStdoutLine(10000)) {
-            case Some(line) => line
-            case None =>
-                record.status = "degraded"
-                record.degradedReason = "initialize_timeout"
-                record.lastError = servicePluginProcessError("service plugin initialize timeout", process)
-                process.stop()
-                return CapabilityInvokeResult(false, "initialize_timeout", serviceId: serviceId, capabilityId: request.capabilityId, diagnostic: record.lastError)
-        }
-        let initDecoded = decodeServiceFrame(initLine)
-        if (!initDecoded.ok || initDecoded.frame.serviceId != serviceId || initDecoded.frame.method != "initialize") {
+        let initRead = readExpectedServiceFrame(process, ServicePluginStdoutReadPolicy(10000, serviceId, "initialize"))
+        if (!initRead.ok) {
             record.status = "degraded"
-            record.degradedReason = if (!initDecoded.ok) { initDecoded.errorKind } else { "initialize_invalid" }
-            record.lastError = if (!initDecoded.ok) { initDecoded.diagnostic } else { "initialize response mismatch" }
+            record.degradedReason = if (initRead.status == "timeout") { "initialize_timeout" } else { initRead.status }
+            record.lastError = if (initRead.status == "timeout") {
+                servicePluginProcessError("service plugin initialize timeout", process)
+            } else {
+                initRead.diagnostic
+            }
             process.stop()
             return CapabilityInvokeResult(false, record.degradedReason, serviceId: serviceId, capabilityId: request.capabilityId, diagnostic: record.lastError)
         }
-        let initPayloadStatus = parseServicePluginPayloadStatus(initDecoded.frame.payload)
+        let initPayloadValidation = validateServicePluginPayloadObject(initRead.frame.payload)
+        if (!initPayloadValidation.ok) {
+            record.status = "degraded"
+            record.degradedReason = "payload_invalid"
+            record.lastError = redactServicePayload(initPayloadValidation.diagnostic).text
+            process.stop()
+            return CapabilityInvokeResult(false, "payload_invalid", serviceId: serviceId, capabilityId: request.capabilityId, diagnostic: record.lastError)
+        }
+        let initPayloadStatus = parseServicePluginPayloadStatus(initRead.frame.payload)
         if (!initPayloadStatus.parsed || !initPayloadStatus.okPresent || !initPayloadStatus.ok) {
             record.status = "degraded"
             record.degradedReason = "initialize_failed"
@@ -795,48 +952,51 @@ private func servicePluginInvokeViaStdioProcess(record: ServicePluginRuntimeReco
             payload: request.payload
         )
         process.writeLine(encodeServiceFrame(invokeFrame).trimAscii())
-        let responseLine = match (process.readStdoutLine(if (request.timeoutMillis > 0) { request.timeoutMillis } else { 30000 })) {
-            case Some(line) => line
-            case None =>
-                record.status = "degraded"
-                record.degradedReason = "invoke_timeout"
-                record.lastError = servicePluginProcessError("service plugin invoke timeout", process)
-                process.stop()
-                return CapabilityInvokeResult(false, "invoke_timeout", serviceId: serviceId, capabilityId: request.capabilityId, diagnostic: record.lastError)
-        }
-        let response = decodeServiceFrame(responseLine)
-        if (!response.ok) {
+        let responseRead = readExpectedServiceFrame(
+            process,
+            ServicePluginStdoutReadPolicy(
+                if (request.timeoutMillis > 0) { request.timeoutMillis } else { 30000 },
+                serviceId,
+                "invokeCapability",
+                expectedCapabilityId: request.capabilityId,
+                expectedCorrelationId: correlationId
+            )
+        )
+        if (!responseRead.ok) {
             record.status = "degraded"
-            record.degradedReason = "frame_decode_failed"
-            record.lastError = response.diagnostic
-            process.stop()
-            return CapabilityInvokeResult(false, "frame_decode_failed", serviceId: serviceId, capabilityId: request.capabilityId, diagnostic: response.diagnostic)
-        }
-        if (response.frame.serviceId != serviceId || response.frame.correlationId != correlationId || response.frame.capabilityId != request.capabilityId) {
-            record.status = "degraded"
-            record.degradedReason = "correlation_mismatch"
-            record.lastError = "serviceId/correlationId/capabilityId mismatch"
-            process.stop()
-            return CapabilityInvokeResult(false, "correlation_mismatch", serviceId: serviceId, capabilityId: request.capabilityId, diagnostic: record.lastError)
-        }
-        let payloadStatus = parseServicePluginPayloadStatus(response.frame.payload)
-        let invokeOk = !payloadStatus.parsed || !payloadStatus.okPresent || payloadStatus.ok
-        let resultStatus = if (invokeOk) {
-            if (payloadStatus.okPresent && !payloadStatus.status.isEmpty() && payloadStatus.status != "invalid_payload") {
-                payloadStatus.status
+            record.degradedReason = if (responseRead.status == "timeout") { "invoke_timeout" } else { responseRead.status }
+            record.lastError = if (responseRead.status == "timeout") {
+                servicePluginProcessError("service plugin invoke timeout", process)
             } else {
-                "ok"
+                redactServicePayload(responseRead.diagnostic).text
             }
-        } else {
-            payloadStatus.status
+            process.stop()
+            return CapabilityInvokeResult(false, record.degradedReason, serviceId: serviceId, capabilityId: request.capabilityId, diagnostic: record.lastError)
         }
+        let payloadValidation = validateServicePluginPayloadObject(responseRead.frame.payload)
+        if (!payloadValidation.ok) {
+            record.status = "degraded"
+            record.degradedReason = "payload_invalid"
+            record.lastError = redactServicePayload(payloadValidation.diagnostic).text
+            process.stop()
+            return CapabilityInvokeResult(false, "payload_invalid", serviceId: serviceId, capabilityId: request.capabilityId, payload: responseRead.frame.payload, diagnostic: record.lastError)
+        }
+        let payloadStatus = parseServicePluginPayloadStatus(responseRead.frame.payload)
+        let invokeOk = payloadStatus.ok
+        let resultStatus = if (payloadStatus.status.isEmpty()) { if (invokeOk) { "ok" } else { "invoke_failed" } } else { payloadStatus.status }
         record.status = if (invokeOk) { "running" } else { "degraded" }
         record.degradedReason = if (invokeOk) { "" } else { resultStatus }
-        record.lastError = if (invokeOk) { "" } else if (payloadStatus.diagnostic.isEmpty()) { redactServicePayload(response.frame.payload).text } else { payloadStatus.diagnostic }
+        record.lastError = if (invokeOk) {
+            responseRead.diagnostic
+        } else if (payloadStatus.diagnostic.isEmpty()) {
+            redactServicePayload(responseRead.frame.payload).text
+        } else {
+            redactServicePayload(payloadStatus.diagnostic).text
+        }
         record.lastInvokeAtMillis += 1
         process.writeLine(encodeServiceFrame(ServiceFrame("request", "stop-${record.instanceId}", serviceId, method: "stop", correlationId: "stop-${record.instanceId}", payload: "{}")).trimAscii())
         process.stop()
-        CapabilityInvokeResult(invokeOk, resultStatus, serviceId: serviceId, capabilityId: request.capabilityId, payload: response.frame.payload, diagnostic: record.lastError)
+        CapabilityInvokeResult(invokeOk, resultStatus, serviceId: serviceId, capabilityId: request.capabilityId, payload: responseRead.frame.payload, diagnostic: record.lastError)
     } catch (e: Exception) {
         record.status = "degraded"
         record.degradedReason = "invoke_exception"
