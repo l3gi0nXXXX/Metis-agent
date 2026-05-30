@@ -72,4 +72,72 @@ public class ServicePluginJobContractTest {
         @Expect(message.contains("secret"), false)
         @Expect(message.contains("/Users/"), false)
     }
+
+    @TestCase
+    public func completedScanReportRendersDuplicateSamplesDryRunAndNoRawJson(): Unit {
+        let payload = "{\"ok\":true,\"status\":\"completed\",\"jobId\":\"gcm-scan-1\",\"accepted\":0,\"ignored\":0,\"emitted\":0,\"durationMs\":28800,\"stateSaved\":true,\"report\":{\"orgs\":[\"cangjie\",\"cangjie-sig\"],\"limits\":{\"maxRepos\":1,\"maxItems\":30,\"timeoutMillis\":60000},\"scannedRepos\":1,\"checkedItems\":31,\"newEvents\":0,\"duplicateEvents\":31,\"filteredEvents\":0,\"failedEvents\":0,\"draftsGenerated\":0,\"draftsFailed\":0,\"notificationsSent\":0,\"writes\":0,\"writeMode\":\"dry_run\",\"samples\":{\"duplicate\":[{\"repo\":\"cangjie/community\",\"kind\":\"pr\",\"number\":70,\"reason\":\"seen\"},{\"repo\":\"cangjie/community\",\"kind\":\"pr\",\"number\":69,\"reason\":\"seen\"}]}}}"
+        let parsed = parseServicePluginJobEventPayload("gitcode.monitor.scan_completed", payload)
+        @Expect(parsed.ok, true)
+        let text = renderServicePluginJobEventMessage(parsed.payload)
+        @Expect(text.contains("GitCode 扫描完成"), true)
+        @Expect(text.contains("范围: orgs=cangjie,cangjie-sig maxRepos=1 maxItems=30 timeout=60s"), true)
+        @Expect(text.contains("扫描: 仓库 1 个，候选 PR/Issue/comment 31 条"), true)
+        @Expect(text.contains("结果: 新增 0 条，重复 31 条，过滤 0 条，失败 0 条"), true)
+        @Expect(text.contains("本次没有新增未处理事件，因此未生成新回复"), true)
+        @Expect(text.contains("写回: dryRun=true，未写回 GitCode。"), true)
+        @Expect(text.contains("最近重复事件:"), true)
+        @Expect(text.contains("cangjie/community PR #70 - seen"), true)
+        @Expect(text.contains("还有 29 条重复事件未展示"), true)
+        @Expect(text.contains("\"ok\""), false)
+        @Expect(text.contains("\"result\""), false)
+        @Expect(text.contains("\"payload\""), false)
+    }
+
+    @TestCase
+    public func completedScanReportRendersNewPrSourceUrlDraftStatusAndTruncates(): Unit {
+        let payload = "{\"ok\":true,\"status\":\"completed\",\"jobId\":\"gcm-scan-2\",\"durationMs\":31200,\"report\":{\"orgs\":[\"cangjie\"],\"scannedRepos\":3,\"checkedItems\":42,\"newEvents\":6,\"duplicateEvents\":38,\"filteredEvents\":2,\"failedEvents\":0,\"draftsGenerated\":1,\"draftsFailed\":1,\"notificationsSent\":1,\"writes\":0,\"writeMode\":\"dry_run\",\"samples\":{\"new\":[{\"eventId\":\"e1\",\"repo\":\"cangjie/community\",\"kind\":\"pr\",\"number\":71,\"title\":\"修复 xxx\",\"url\":\"https://gitcode.com/cangjie/community/pulls/71\",\"status\":\"draft_generated\",\"notification\":\"telegram:sent\",\"writeback\":\"dry_run\"},{\"eventId\":\"e2\",\"repo\":\"cangjie/community\",\"kind\":\"issue\",\"number\":102,\"title\":\"讨论 yyy\",\"url\":\"\",\"status\":\"needsHumanReview\",\"reason\":\"CKB unavailable\",\"notification\":\"notification_failed\",\"writeback\":\"write_skipped_dry_run\"},{\"repo\":\"r\",\"kind\":\"pr\",\"number\":3,\"title\":\"t\",\"url\":\"u\"},{\"repo\":\"r\",\"kind\":\"pr\",\"number\":4,\"title\":\"t\",\"url\":\"u\"},{\"repo\":\"r\",\"kind\":\"pr\",\"number\":5,\"title\":\"t\",\"url\":\"u\"},{\"repo\":\"r\",\"kind\":\"pr\",\"number\":6,\"title\":\"t\",\"url\":\"u\"}]}}}"
+        let parsed = parseServicePluginJobEventPayload("gitcode.monitor.scan_completed", payload)
+        @Expect(parsed.ok, true)
+        let text = renderServicePluginJobEventMessage(parsed.payload)
+        @Expect(text.contains("回复: 已生成草稿 1 条，需人工确认 1 条，生成失败 1 条"), true)
+        @Expect(text.contains("通知: 已发送 1 条"), true)
+        @Expect(text.contains("来源: cangjie/community PR #71 https://gitcode.com/cangjie/community/pulls/71"), true)
+        @Expect(text.contains("标题: 修复 xxx"), true)
+        @Expect(text.contains("状态: 已生成回复草稿"), true)
+        @Expect(text.contains("来源: cangjie/community Issue #102 链接: unavailable"), true)
+        @Expect(text.contains("状态: needsHumanReview"), true)
+        @Expect(text.contains("原因: CKB unavailable"), true)
+        @Expect(text.contains("还有 1 条新增事件未展示"), true)
+    }
+
+    @TestCase
+    public func malformedReportFallsBackAndSecretsAreRedacted(): Unit {
+        let malformed = parseServicePluginJobEventPayload("gitcode.monitor.scan_completed", "{\"ok\":true,\"status\":\"completed\",\"jobId\":\"gcm-scan-3\",\"accepted\":0,\"ignored\":0,\"emitted\":0,\"report\":\"bad\"}")
+        @Expect(malformed.ok, true)
+        let fallback = renderServicePluginJobEventMessage(malformed.payload)
+        @Expect(fallback.contains("当前 GCM 未返回扫描明细"), true)
+        @Expect(fallback.contains("accepted=0 ignored=0 emitted=0"), true)
+
+        let secret = parseServicePluginJobEventPayload("gitcode.monitor.scan_completed", "{\"ok\":true,\"status\":\"completed\",\"jobId\":\"gcm-scan-4\",\"report\":{\"scannedRepos\":1,\"checkedItems\":1,\"newEvents\":1,\"samples\":{\"new\":[{\"repo\":\"cangjie/community\",\"kind\":\"pr\",\"number\":1,\"title\":\"token=should-not-leak\",\"url\":\"https://gitcode.com/cangjie/community/pulls/1?cookie=bad\",\"status\":\"draft_generated\"}]}}}")
+        @Expect(secret.ok, true)
+        let text = renderServicePluginJobEventMessage(secret.payload)
+        @Expect(text.contains("should-not-leak"), false)
+        @Expect(text.contains("cookie=bad"), false)
+        @Expect(text.contains("[REDACTED]"), true)
+    }
+
+    @TestCase
+    public func jobStatusSnapshotUsesSameReportRenderer(): Unit {
+        let payload = "{\"ok\":true,\"status\":\"completed\",\"jobId\":\"gcm-scan-5\",\"report\":{\"orgs\":[\"cangjie\"],\"scannedRepos\":1,\"checkedItems\":31,\"newEvents\":0,\"duplicateEvents\":31,\"writeMode\":\"dry_run\",\"samples\":{\"duplicate\":[{\"repo\":\"cangjie/community\",\"kind\":\"pr\",\"number\":70,\"reason\":\"seen\"}]}}}"
+        let text = renderServicePluginJobSnapshotMessage(payload, fallbackJobId: "fallback")
+        @Expect(text.contains("GitCode 扫描完成"), true)
+        @Expect(text.contains("scanId: gcm-scan-5"), true)
+        @Expect(text.contains("重复 31 条"), true)
+
+        let running = renderServicePluginJobSnapshotMessage("{\"ok\":true,\"status\":\"running\",\"jobId\":\"gcm-scan-6\",\"stage\":\"scan_repo\",\"report\":{\"scannedRepos\":2,\"checkedItems\":9}}", fallbackJobId: "fallback")
+        @Expect(running.contains("GitCode 扫描状态"), true)
+        @Expect(running.contains("scanId=gcm-scan-6"), true)
+        @Expect(running.contains("已扫描仓库 2 个"), true)
+        @Expect(running.contains("候选事件 9 条"), true)
+    }
 }

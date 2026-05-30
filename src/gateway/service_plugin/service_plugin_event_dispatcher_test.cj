@@ -80,4 +80,80 @@ public class ServicePluginEventDispatcherTest {
             setServicePluginEventDeliveryForTest(None)
         }
     }
+
+    @TestCase
+    public func acceptedGitCodeEventIsRecordedWithoutBreakingTerminalDelivery(): Unit {
+        let messages = ArrayList<String>()
+        setServicePluginEventDeliveryForTest(Some({ _target: ServicePluginDeliveryTarget, text: String =>
+            messages.add(text)
+            ServicePluginEventDeliveryResult(true, "sent")
+        }))
+        setServicePluginGeneratedReplyHandlerForTest(Some({ _job: ServicePluginPendingJob, event: ServicePluginAcceptedGitCodeEvent =>
+            ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "请补充 ${event.repo} 的对应测试。")
+        }))
+        resetServicePluginGeneratedReplyStateForTest()
+        try {
+            let store = this.storeWithRunningJob()
+            let accepted = ServiceFrame("event", "a1", "gitcode-monitor", method: "emitCapabilityEvent", capabilityId: "gitcode.event.accepted", payload: "{\"jobId\":\"job-1\",\"eventId\":\"e1\",\"repo\":\"cangjie/community\",\"kind\":\"pr\",\"number\":71,\"title\":\"修复 xxx\",\"url\":\"https://gitcode.com/cangjie/community/pulls/71\"}")
+            let acceptedResult = dispatchServicePluginEvent(accepted, store: store)
+            @Expect(acceptedResult.ok, true)
+            @Expect(acceptedResult.status, "generated_reply_delivered")
+            @Expect(messages.size, 1)
+            @Expect(messages[0].contains("GitCode 回复草稿"), true)
+            @Expect(messages[0].contains("来源: cangjie/community PR #71 https://gitcode.com/cangjie/community/pulls/71"), true)
+            @Expect(messages[0].contains("标题: 修复 xxx"), true)
+            @Expect(messages[0].contains("请补充 cangjie/community 的对应测试。"), true)
+            @Expect(messages[0].contains("\"eventId\""), false)
+            @Expect((store.findByJobId("job-1") ?? ServicePluginPendingJob()).status, "running")
+
+            let duplicate = dispatchServicePluginEvent(accepted, store: store)
+            @Expect(duplicate.status, "duplicate_event")
+            @Expect(messages.size, 1)
+
+            let completed = ServiceFrame("event", "e1", "gitcode-monitor", method: "emitCapabilityEvent", capabilityId: "gitcode.monitor.scan_completed", payload: "{\"ok\":true,\"status\":\"completed\",\"jobId\":\"job-1\",\"accepted\":1,\"ignored\":0,\"emitted\":1,\"durationMs\":1200,\"stateSaved\":true}")
+            let completedResult = dispatchServicePluginEvent(completed, store: store)
+            @Expect(completedResult.ok, true)
+            @Expect(completedResult.status, "completed_delivered")
+            @Expect(messages.size, 2)
+            @Expect(messages[1].contains("GitCode 扫描完成"), true)
+            @Expect(messages[1].contains("回复草稿状态"), true)
+            @Expect(messages[1].contains("已生成草稿 1 条"), true)
+        } finally {
+            setServicePluginEventDeliveryForTest(None)
+            setServicePluginGeneratedReplyHandlerForTest(None<(ServicePluginPendingJob, ServicePluginAcceptedGitCodeEvent) -> ServicePluginGeneratedReplyResult>)
+            resetServicePluginGeneratedReplyStateForTest()
+        }
+    }
+
+    @TestCase
+    public func acceptedGitCodeEventSendsDegradedNotificationWhenDraftFails(): Unit {
+        let messages = ArrayList<String>()
+        setServicePluginEventDeliveryForTest(Some({ _target: ServicePluginDeliveryTarget, text: String =>
+            messages.add(text)
+            ServicePluginEventDeliveryResult(true, "sent")
+        }))
+        setServicePluginGeneratedReplyHandlerForTest(Some({ _job: ServicePluginPendingJob, _event: ServicePluginAcceptedGitCodeEvent =>
+            ServicePluginGeneratedReplyResult(false, status: "llm_degraded", diagnostic: "LLM timeout", needsHumanReview: true)
+        }))
+        resetServicePluginGeneratedReplyStateForTest()
+        try {
+            let store = this.storeWithRunningJob()
+            let accepted = ServiceFrame("event", "a2", "gitcode-monitor", method: "emitCapabilityEvent", capabilityId: "gitcode.event.accepted", payload: "{\"jobId\":\"job-1\",\"eventId\":\"e2\",\"repo\":\"cangjie/community\",\"kind\":\"issue\",\"number\":\"72\",\"url\":\"\"}")
+            let acceptedResult = dispatchServicePluginEvent(accepted, store: store)
+            @Expect(acceptedResult.ok, true)
+            @Expect(acceptedResult.status, "generated_reply_degraded_delivered")
+            @Expect(messages.size, 1)
+            @Expect(messages[0].contains("状态: needsHumanReview"), true)
+            @Expect(messages[0].contains("LLM timeout"), true)
+
+            let completed = ServiceFrame("event", "e2", "gitcode-monitor", method: "emitCapabilityEvent", capabilityId: "gitcode.monitor.scan_completed", payload: "{\"ok\":true,\"status\":\"completed\",\"jobId\":\"job-1\",\"accepted\":1,\"ignored\":0,\"emitted\":1,\"durationMs\":1200,\"stateSaved\":true}")
+            let completedResult = dispatchServicePluginEvent(completed, store: store)
+            @Expect(completedResult.ok, true)
+            @Expect(messages[messages.size - 1].contains("生成失败 1 条"), true)
+        } finally {
+            setServicePluginEventDeliveryForTest(None)
+            setServicePluginGeneratedReplyHandlerForTest(None<(ServicePluginPendingJob, ServicePluginAcceptedGitCodeEvent) -> ServicePluginGeneratedReplyResult>)
+            resetServicePluginGeneratedReplyStateForTest()
+        }
+    }
 }
