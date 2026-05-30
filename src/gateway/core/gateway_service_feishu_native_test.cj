@@ -3,14 +3,14 @@ package metis.gateway.core
 import metis.core.config.{CliConfig, CliSettingManager, GatewayServicePluginUserSettings, GatewayUserSettings, MetisConfigManager, MetisProcessEnvironmentLock}
 import metis.gateway.model.{ChannelPolicyConfig, ChannelType, ChatType, InboundMessage, OutboundMessage, SendResult}
 import metis.gateway.security.gatewayPairingAccountStore
-import metis.gateway.service_plugin.{CapabilityInvokeResult, CapabilityInvokeRequest, ServicePluginRegistration, setServicePluginCapabilityInvokerForTest}
+import metis.gateway.service_plugin.{CapabilityInvokeResult, CapabilityInvokeRequest, ServicePluginRegistration, resetServicePluginPendingJobStoreForTest, setServicePluginCapabilityInvokerForTest}
 
 import std.collection.{ArrayList, HashMap}
 import std.env.{getVariable, setVariable}
 import std.fs.{Directory, File, Path, remove}
 import std.time.DateTime
 import std.unittest.testmacro.*
-import stdx.encoding.json.{JsonArray, JsonBool, JsonObject, JsonString}
+import stdx.encoding.json.{JsonArray, JsonBool, JsonObject, JsonString, JsonValue}
 
 private class GatewayFeishuNativeTestAdapter <: ChannelAdapter {
     private let inbound = ArrayList<InboundMessage>()
@@ -307,7 +307,7 @@ public class GatewayServiceFeishuNativeTest {
     }
 
     @TestCase
-    public func feishuGitcodeScanOnceReturnsScanSummaryNotQueuedPlaceholder(): Unit {
+    public func feishuGitcodeScanOnceStartsAsyncJobAndDoesNotWaitForScanCompletion(): Unit {
         withGatewayFeishuNativeTestHome("gitcode-scan", gatewayFeishuNativeTestRoot(), { =>
             var user = CliSettingManager.readGatewaySettings()
             user.servicePlugins = [gatewayFeishuNativeGitcodePluginSettings("feishu-gitcode-monitor")]
@@ -317,21 +317,28 @@ public class GatewayServiceFeishuNativeTest {
             let service = gatewayFeishuNativeService(adapter, enableGroup: false, accountId: "feishu-gitcode-monitor")
             service.start()
             try {
+                resetServicePluginPendingJobStoreForTest()
                 setServicePluginCapabilityInvokerForTest(Some({ _registration: ServicePluginRegistration, request: CapabilityInvokeRequest =>
                     @Expect(request.capabilityId, "gitcode.monitor.scan_once")
-                    CapabilityInvokeResult(true, "ok", serviceId: "gitcode-monitor", capabilityId: request.capabilityId, payload: "{\"ok\":true,\"status\":\"ok\",\"accepted\":2,\"ignored\":1,\"emitted\":3}")
+                    @Expect(request.timeoutMillis <= 5000, true)
+                    let root = JsonValue.fromStr(request.payload).asObject()
+                    @Expect(root.get("mode").getOrThrow().asString().getValue(), "async")
+                    let jobId = root.get("jobId").getOrThrow().asString().getValue()
+                    CapabilityInvokeResult(true, "accepted", serviceId: "gitcode-monitor", capabilityId: request.capabilityId, payload: "{\"ok\":true,\"status\":\"accepted\",\"mode\":\"async\",\"jobId\":\"${jobId}\",\"alreadyRunning\":false}")
                 }))
 
                 adapter.queueDirect("/gitcode scan once")
                 service.processOnce()
 
                 @Expect(adapter.sentCount(), 1)
-                @Expect(adapter.sentText(0), "GitCode scan completed: status=ok accepted=2 ignored=1 emitted=3")
+                @Expect(adapter.sentText(0).contains("GitCode 扫描已启动"), true)
+                @Expect(adapter.sentText(0).contains("scanId=gcm-scan-"), true)
                 @Expect(adapter.sentText(0).contains("status=queued capability="), false)
                 @Expect(adapter.sentText(0).contains("\"accepted\""), false)
                 @Expect(adapter.sentAccount(0), "feishu-gitcode-monitor")
             } finally {
                 setServicePluginCapabilityInvokerForTest(None)
+                resetServicePluginPendingJobStoreForTest()
                 service.stop()
             }
         })
@@ -348,6 +355,7 @@ public class GatewayServiceFeishuNativeTest {
             let service = gatewayFeishuNativeService(adapter, enableGroup: false, accountId: "feishu-gitcode-monitor")
             service.start()
             try {
+                resetServicePluginPendingJobStoreForTest()
                 let diagnostic = "{ \"ok\": true, \"status\": \"ok\", \"capabilities\": 8 }"
                 setServicePluginCapabilityInvokerForTest(Some({ _registration: ServicePluginRegistration, request: CapabilityInvokeRequest =>
                     @Expect(request.capabilityId.startsWith("gitcode.monitor."), true)
@@ -378,6 +386,7 @@ public class GatewayServiceFeishuNativeTest {
                 @Expect(adapter.sentAccount(1), "feishu-gitcode-monitor")
             } finally {
                 setServicePluginCapabilityInvokerForTest(None)
+                resetServicePluginPendingJobStoreForTest()
                 service.stop()
             }
         })
@@ -394,22 +403,23 @@ public class GatewayServiceFeishuNativeTest {
             let service = gatewayFeishuNativeService(adapter, enableGroup: false, accountId: "feishu-gitcode-monitor")
             service.start()
             try {
+                resetServicePluginPendingJobStoreForTest()
                 setServicePluginCapabilityInvokerForTest(Some({ _registration: ServicePluginRegistration, request: CapabilityInvokeRequest =>
                     CapabilityInvokeResult(false, "stdout_protocol_violation", serviceId: "gitcode-monitor", capabilityId: request.capabilityId, diagnostic: "{\"ok\":false,\"status\":\"stdout_protocol_violation\",\"diagnostic\":\"Authorization: Bearer secret /Users/name/private\"}")
                 }))
-                adapter.queueDirect("/gitcode scan once")
+                adapter.queueDirect("/gitcode scan once --max-repos 1")
                 service.processOnce()
 
                 setServicePluginCapabilityInvokerForTest(Some({ _registration: ServicePluginRegistration, request: CapabilityInvokeRequest =>
                     CapabilityInvokeResult(false, "unexpected_frame", serviceId: "gitcode-monitor", capabilityId: request.capabilityId, diagnostic: "{\"ok\":false,\"status\":\"unexpected_frame\",\"diagnostic\":\"Authorization: Bearer secret /Users/name/private\"}")
                 }))
-                adapter.queueDirect("/gitcode scan once")
+                adapter.queueDirect("/gitcode scan once --max-repos 2")
                 service.processOnce()
 
                 setServicePluginCapabilityInvokerForTest(Some({ _registration: ServicePluginRegistration, request: CapabilityInvokeRequest =>
                     CapabilityInvokeResult(false, "payload_invalid", serviceId: "gitcode-monitor", capabilityId: request.capabilityId, diagnostic: "{\"ok\":false,\"status\":\"payload_invalid\",\"diagnostic\":\"Authorization: Bearer secret /Users/name/private\"}")
                 }))
-                adapter.queueDirect("/gitcode scan once")
+                adapter.queueDirect("/gitcode scan once --max-repos 3")
                 service.processOnce()
 
                 @Expect(adapter.sentCount(), 3)
@@ -427,6 +437,7 @@ public class GatewayServiceFeishuNativeTest {
                 }
             } finally {
                 setServicePluginCapabilityInvokerForTest(None)
+                resetServicePluginPendingJobStoreForTest()
                 service.stop()
             }
         })

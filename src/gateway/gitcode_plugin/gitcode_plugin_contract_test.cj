@@ -1,5 +1,6 @@
 package metis.gateway.gitcode_plugin
 
+import metis.gateway.service_plugin.{ServicePluginDeliveryTarget, parseServicePluginJobStartPayload}
 import std.unittest.testmacro.*
 
 @Test
@@ -11,10 +12,53 @@ public class GitCodePluginContractTest {
         @Expect(parseGitCodeCommand("/gitcode subscribe").action, "subscribe")
         @Expect(parseGitCodeCommand("/gitcode unsubscribe").action, "unsubscribe")
         @Expect(parseGitCodeCommand("/gitcode scan once --max-repos 1").action, "scan_once")
+        @Expect(parseGitCodeCommand("/gitcode scan status gcm-scan-1").action, "scan_status")
+        @Expect(parseGitCodeCommand("/gitcode scan cancel gcm-scan-1").action, "scan_cancel")
         let query = parseGitCodeCommand("/gitcode query 如何使用 HttpClient")
         @Expect(query.action, "query")
         @Expect(query.query.contains("HttpClient"), true)
         @Expect(parseGitCodeCommand("/gitcode nope").action, "unknown")
+    }
+
+    @TestCase
+    public func parseAndBuildAsyncScanPayloadIncludesDeliveryTargetAndLimits(): Unit {
+        let parsed = parseGitCodeCommand("/gitcode scan once --max-repos 2 --max-items 20 --timeout-ms 5000 --offline-fixture")
+        let args = parseGitCodeScanOnceArgs(parsed.args)
+        @Expect(args.ok, true)
+        @Expect(args.args.maxRepos, 2)
+        @Expect(args.args.maxItems, 20)
+        @Expect(args.args.timeoutMillis, 5000)
+        @Expect(args.args.offlineFixture, true)
+
+        let target = ServicePluginDeliveryTarget("telegram", "tg-gitcode-monitor", "chat-secret", replyToMessageId: "24")
+        let payload = buildGitCodeAsyncScanPayload(
+            GatewayCommandContext(channel: "telegram", accountId: "tg-gitcode-monitor", peerId: "chat-secret", senderId: "sender-secret"),
+            args.args,
+            "gcm-scan-1",
+            "idem-1",
+            target
+        )
+        let parsedPayload = parseServicePluginJobStartPayload(payload)
+        @Expect(parsedPayload.ok, true)
+        @Expect(parsedPayload.payload.mode, "async")
+        @Expect(parsedPayload.payload.jobId, "gcm-scan-1")
+        @Expect(parsedPayload.payload.deliveryTarget.peerId, "chat-secret")
+        @Expect(parsedPayload.payload.offlineFixture, true)
+        @Expect(parsedPayload.payload.limits.maxRepos, 2)
+        @Expect(parsedPayload.payload.limits.maxItems, 20)
+    }
+
+    @TestCase
+    public func scanArgsRejectInvalidNumbersBeforeInvokingGcm(): Unit {
+        let negative = parseGitCodeScanOnceArgs(["--max-repos", "-1"])
+        @Expect(negative.ok, false)
+        @Expect(negative.status, "invalid_args")
+        let missing = parseGitCodeScanOnceArgs(["--max-items"])
+        @Expect(missing.ok, false)
+        @Expect(missing.diagnostic.contains("requires"), true)
+        let unknown = parseGitCodeScanOnceArgs(["--bad"])
+        @Expect(unknown.ok, false)
+        @Expect(unknown.diagnostic.contains("unknown"), true)
     }
 
     @TestCase
