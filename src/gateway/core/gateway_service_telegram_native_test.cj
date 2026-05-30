@@ -568,7 +568,7 @@ public class GatewayServiceTelegramNativeTest {
     }
 
     @TestCase
-    public func telegramGitcodeScanOnceStartsAsyncJobAndDoesNotWaitForScanCompletion(): Unit {
+    public func telegramGitcodeScanOnceStartsAsyncJobWithUnboundedDefaultsAndExplicitLimits(): Unit {
         withGatewayTelegramNativeTestHome {
             let modelName = "metis-test-telegram-gitcode-scan-${DateTime.now().toUnixTimeStamp().toMilliseconds()}"
             ModelManager.registerChatModel(modelName, { => GatewayTelegramNativeFakeModel() })
@@ -583,7 +583,9 @@ public class GatewayServiceTelegramNativeTest {
                 user.servicePlugins = [gatewayTelegramNativeGitcodePluginSettings("tg-gitcode-monitor")]
                 CliSettingManager.writeGatewaySettings(user)
                 resetServicePluginPendingJobStoreForTest()
+                let payloads = ArrayList<String>()
                 setServicePluginCapabilityInvokerForTest(Some({ _registration: ServicePluginRegistration, request: CapabilityInvokeRequest =>
+                    payloads.add(request.payload)
                     @Expect(request.capabilityId, "gitcode.monitor.scan_once")
                     @Expect(request.timeoutMillis <= 5000, true)
                     let root = JsonValue.fromStr(request.payload).asObject()
@@ -595,13 +597,67 @@ public class GatewayServiceTelegramNativeTest {
                 service.start()
                 adapter.queue("/gitcode scan once")
                 service.processOnce()
+                adapter.queue("/gitcode scan once --max-repos 2 --max-items 20")
+                service.processOnce()
 
-                @Expect(adapter.sentCount(), 1)
+                @Expect(adapter.sentCount(), 2)
                 @Expect(adapter.sentText(0).contains("GitCode 扫描已启动"), true)
                 @Expect(adapter.sentText(0).contains("scanId=gcm-scan-"), true)
                 @Expect(adapter.sentText(0).contains("status=queued capability="), false)
                 @Expect(adapter.sentText(0).contains("\"accepted\""), false)
+                @Expect(adapter.sentText(1).contains("GitCode 扫描已启动"), true)
                 @Expect(adapter.sentAccount(0), "tg-gitcode-monitor")
+                @Expect(adapter.sentAccount(1), "tg-gitcode-monitor")
+                @Expect(payloads.size, 2)
+                let defaultLimits = JsonValue.fromStr(payloads[0]).asObject().get("limits").getOrThrow().asObject()
+                @Expect(defaultLimits.get("maxRepos").getOrThrow().asInt().getValue(), 0)
+                @Expect(defaultLimits.get("maxItems").getOrThrow().asInt().getValue(), 0)
+                @Expect(defaultLimits.get("maxDurationMillis").getOrThrow().asInt().getValue(), 0)
+                let explicitLimits = JsonValue.fromStr(payloads[1]).asObject().get("limits").getOrThrow().asObject()
+                @Expect(explicitLimits.get("maxRepos").getOrThrow().asInt().getValue(), 2)
+                @Expect(explicitLimits.get("maxItems").getOrThrow().asInt().getValue(), 20)
+                @Expect(explicitLimits.get("maxDurationMillis").getOrThrow().asInt().getValue(), 0)
+            } finally {
+                setServicePluginCapabilityInvokerForTest(None)
+                resetServicePluginPendingJobStoreForTest()
+                service.stop()
+                CliConfig.model = oldModel
+            }
+        }
+    }
+
+    @TestCase
+    public func telegramGitcodeScanOnceRejectsTimeoutWithoutInvokingGcm(): Unit {
+        withGatewayTelegramNativeTestHome {
+            let modelName = "metis-test-telegram-gitcode-timeout-${DateTime.now().toUnixTimeStamp().toMilliseconds()}"
+            ModelManager.registerChatModel(modelName, { => GatewayTelegramNativeFakeModel() })
+            let oldModel = CliConfig.model
+            CliConfig.model = modelName
+            let adapter = GatewayTelegramNativeTestAdapter()
+            let service = gatewayTelegramNativeServiceForAccount(adapter, "tg-gitcode-monitor")
+            try {
+                var user = GatewayUserSettings()
+                user.telegram.enabled = true
+                user.telegram.allowFrom = ["*"]
+                user.servicePlugins = [gatewayTelegramNativeGitcodePluginSettings("tg-gitcode-monitor")]
+                CliSettingManager.writeGatewaySettings(user)
+                resetServicePluginPendingJobStoreForTest()
+                let payloads = ArrayList<String>()
+                setServicePluginCapabilityInvokerForTest(Some({ _registration: ServicePluginRegistration, request: CapabilityInvokeRequest =>
+                    payloads.add(request.payload)
+                    CapabilityInvokeResult(false, "unexpected_invocation", serviceId: "gitcode-monitor", capabilityId: request.capabilityId)
+                }))
+
+                service.start()
+                adapter.queue("/gitcode scan once --timeout-ms 1000")
+                service.processOnce()
+
+                @Expect(adapter.sentCount(), 1)
+                @Expect(adapter.sentText(0).contains("--timeout-ms is no longer supported for async scan jobs"), true)
+                @Expect(adapter.sentText(0).contains("{"), false)
+                @Expect(adapter.sentText(0).contains("\"ok\""), false)
+                @Expect(adapter.sentText(0).contains("scanId=gcm-scan-"), false)
+                @Expect(payloads.size, 0)
             } finally {
                 setServicePluginCapabilityInvokerForTest(None)
                 resetServicePluginPendingJobStoreForTest()

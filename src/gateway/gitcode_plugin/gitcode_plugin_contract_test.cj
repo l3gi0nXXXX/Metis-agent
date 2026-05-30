@@ -21,13 +21,28 @@ public class GitCodePluginContractTest {
     }
 
     @TestCase
-    public func parseAndBuildAsyncScanPayloadIncludesDeliveryTargetAndLimits(): Unit {
-        let parsed = parseGitCodeCommand("/gitcode scan once --max-repos 2 --max-items 20 --timeout-ms 5000 --offline-fixture")
+    public func defaultScanOnceArgsAreUnboundedAndHaveNoUserTimeout(): Unit {
+        let args = parseGitCodeScanOnceArgs([])
+        @Expect(args.ok, true)
+        @Expect(args.args.maxRepos, 0)
+        @Expect(args.args.maxItems, 0)
+        @Expect(args.args.timeoutMillis, 0)
+
+        let payload = buildGitCodeScanOncePayload(args.args)
+        @Expect(payload.contains("\"maxRepos\":0"), true)
+        @Expect(payload.contains("\"maxItems\":0"), true)
+        @Expect(payload.contains("timeoutMillis"), false)
+        @Expect(payload.contains("\"timeoutMillis\":30000"), false)
+    }
+
+    @TestCase
+    public func parseAndBuildAsyncScanPayloadIncludesDeliveryTargetAndExplicitLimits(): Unit {
+        let parsed = parseGitCodeCommand("/gitcode scan once --max-repos 2 --max-items 20 --offline-fixture")
         let args = parseGitCodeScanOnceArgs(parsed.args)
         @Expect(args.ok, true)
         @Expect(args.args.maxRepos, 2)
         @Expect(args.args.maxItems, 20)
-        @Expect(args.args.timeoutMillis, 5000)
+        @Expect(args.args.timeoutMillis, 0)
         @Expect(args.args.offlineFixture, true)
 
         let target = ServicePluginDeliveryTarget("telegram", "tg-gitcode-monitor", "chat-secret", replyToMessageId: "24")
@@ -46,6 +61,28 @@ public class GitCodePluginContractTest {
         @Expect(parsedPayload.payload.offlineFixture, true)
         @Expect(parsedPayload.payload.limits.maxRepos, 2)
         @Expect(parsedPayload.payload.limits.maxItems, 20)
+        @Expect(parsedPayload.payload.limits.maxDurationMillis, 0)
+        @Expect(payload.contains("\"timeoutMillis\":30000"), false)
+    }
+
+    @TestCase
+    public func defaultAsyncScanPayloadCarriesNoRepoItemOrDurationLimit(): Unit {
+        let target = ServicePluginDeliveryTarget("telegram", "tg-gitcode-monitor", "chat-secret", replyToMessageId: "24")
+        let payload = buildGitCodeAsyncScanPayload(
+            GatewayCommandContext(channel: "telegram", accountId: "tg-gitcode-monitor", peerId: "chat-secret", senderId: "sender-secret"),
+            GitCodeScanOnceArgs(),
+            "gcm-scan-1",
+            "idem-1",
+            target
+        )
+        let parsedPayload = parseServicePluginJobStartPayload(payload)
+        @Expect(parsedPayload.ok, true)
+        @Expect(parsedPayload.payload.limits.maxRepos, 0)
+        @Expect(parsedPayload.payload.limits.maxItems, 0)
+        @Expect(parsedPayload.payload.limits.maxDurationMillis, 0)
+        @Expect(payload.contains("\"maxRepos\":5"), false)
+        @Expect(payload.contains("\"maxItems\":30"), false)
+        @Expect(payload.contains("\"timeoutMillis\":30000"), false)
     }
 
     @TestCase
@@ -59,6 +96,17 @@ public class GitCodePluginContractTest {
         let unknown = parseGitCodeScanOnceArgs(["--bad"])
         @Expect(unknown.ok, false)
         @Expect(unknown.diagnostic.contains("unknown"), true)
+
+        let timeout = parseGitCodeScanOnceArgs(["--timeout-ms", "30000"])
+        @Expect(timeout.ok, false)
+        @Expect(timeout.status, "invalid_args")
+        @Expect(timeout.diagnostic, "--timeout-ms is no longer supported for async scan jobs")
+        @Expect(timeout.diagnostic.contains("{"), false)
+        @Expect(timeout.diagnostic.contains("\"ok\""), false)
+
+        let timeoutMissing = parseGitCodeScanOnceArgs(["--timeout-ms"])
+        @Expect(timeoutMissing.ok, false)
+        @Expect(timeoutMissing.diagnostic, "--timeout-ms is no longer supported for async scan jobs")
     }
 
     @TestCase
