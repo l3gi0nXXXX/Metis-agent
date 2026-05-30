@@ -645,7 +645,7 @@ public class GatewayService {
         )
         match (parsed.action) {
             case "help" =>
-                "gitcode commands: /gitcode status, /gitcode subscribe, /gitcode unsubscribe, /gitcode scan once, /gitcode query <question>"
+                "gitcode commands: /gitcode status, /gitcode subscribe, /gitcode unsubscribe, /gitcode scan once [--max-repos N] [--max-items N], /gitcode query <question>"
             case "status" | "config" =>
                 this.servicePluginGitCodeInvokeReply("gitcode.monitor.status", "{}", "status")
             case "subscribe" =>

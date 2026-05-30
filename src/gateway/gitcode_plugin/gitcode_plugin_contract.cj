@@ -148,7 +148,7 @@ public class GitCodeScanOnceArgs {
     public let maxItems: Int64
     public let timeoutMillis: Int64
     public let offlineFixture: Bool
-    public init(dryRun!: Bool = true, maxRepos!: Int64 = 5, maxItems!: Int64 = 30, timeoutMillis!: Int64 = 30000, offlineFixture!: Bool = false) {
+    public init(dryRun!: Bool = true, maxRepos!: Int64 = 0, maxItems!: Int64 = 0, timeoutMillis!: Int64 = 0, offlineFixture!: Bool = false) {
         this.dryRun = dryRun
         this.maxRepos = maxRepos
         this.maxItems = maxItems
@@ -467,13 +467,13 @@ public func handleGitCodeScanOnceCommand(context: GatewayCommandContext, args: G
 }
 
 public func buildGitCodeScanOncePayload(args: GitCodeScanOnceArgs): String {
-    "{\"dryRun\":${args.dryRun},\"maxRepos\":${boundedNonNegative(args.maxRepos)},\"maxItems\":${boundedNonNegative(args.maxItems)},\"timeoutMillis\":${boundedNonNegative(args.timeoutMillis)}}"
+    "{\"dryRun\":${args.dryRun},\"maxRepos\":${boundedNonNegative(args.maxRepos)},\"maxItems\":${boundedNonNegative(args.maxItems)}}"
 }
 
 public func parseGitCodeScanOnceArgs(args: Array<String>): GitCodeScanOnceArgsParseResult {
-    var maxRepos: Int64 = 5
-    var maxItems: Int64 = 30
-    var timeoutMs: Int64 = 30000
+    var maxRepos: Int64 = 0
+    var maxItems: Int64 = 0
+    var timeoutMs: Int64 = 0
     var offlineFixture = false
     var i = 0
     while (i < args.size) {
@@ -487,7 +487,10 @@ public func parseGitCodeScanOnceArgs(args: Array<String>): GitCodeScanOnceArgsPa
             i++
             continue
         }
-        if (arg == "--max-repos" || arg == "--max-items" || arg == "--timeout-ms") {
+        if (arg == "--timeout-ms") {
+            return GitCodeScanOnceArgsParseResult(false, status: "invalid_args", diagnostic: "--timeout-ms is no longer supported for async scan jobs")
+        }
+        if (arg == "--max-repos" || arg == "--max-items") {
             if (i + 1 >= args.size) {
                 return GitCodeScanOnceArgsParseResult(false, status: "invalid_args", diagnostic: "${arg} requires a numeric value")
             }
@@ -501,10 +504,8 @@ public func parseGitCodeScanOnceArgs(args: Array<String>): GitCodeScanOnceArgsPa
             }
             if (arg == "--max-repos") {
                 maxRepos = parsed
-            } else if (arg == "--max-items") {
-                maxItems = parsed
             } else {
-                timeoutMs = parsed
+                maxItems = parsed
             }
             i += 2
             continue
@@ -536,7 +537,7 @@ public func buildGitCodeAsyncScanPayload(
     let limits = JsonObject()
     limits.put("maxRepos", JsonInt(boundedNonNegative(args.maxRepos)))
     limits.put("maxItems", JsonInt(boundedNonNegative(args.maxItems)))
-    limits.put("maxDurationMillis", JsonInt(boundedNonNegative(args.timeoutMillis)))
+    limits.put("maxDurationMillis", JsonInt(0))
     limits.put("perRequestTimeoutMillis", JsonInt(30000))
     limits.put("progressIntervalMillis", JsonInt(10000))
     root.put("limits", limits)

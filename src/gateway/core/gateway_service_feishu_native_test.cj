@@ -307,7 +307,7 @@ public class GatewayServiceFeishuNativeTest {
     }
 
     @TestCase
-    public func feishuGitcodeScanOnceStartsAsyncJobAndDoesNotWaitForScanCompletion(): Unit {
+    public func feishuGitcodeScanOnceStartsAsyncJobWithUnboundedDefaultsAndExplicitLimits(): Unit {
         withGatewayFeishuNativeTestHome("gitcode-scan", gatewayFeishuNativeTestRoot(), { =>
             var user = CliSettingManager.readGatewaySettings()
             user.servicePlugins = [gatewayFeishuNativeGitcodePluginSettings("feishu-gitcode-monitor")]
@@ -318,7 +318,9 @@ public class GatewayServiceFeishuNativeTest {
             service.start()
             try {
                 resetServicePluginPendingJobStoreForTest()
+                let payloads = ArrayList<String>()
                 setServicePluginCapabilityInvokerForTest(Some({ _registration: ServicePluginRegistration, request: CapabilityInvokeRequest =>
+                    payloads.add(request.payload)
                     @Expect(request.capabilityId, "gitcode.monitor.scan_once")
                     @Expect(request.timeoutMillis <= 5000, true)
                     let root = JsonValue.fromStr(request.payload).asObject()
@@ -329,13 +331,61 @@ public class GatewayServiceFeishuNativeTest {
 
                 adapter.queueDirect("/gitcode scan once")
                 service.processOnce()
+                adapter.queueDirect("/gitcode scan once --max-repos 2 --max-items 20")
+                service.processOnce()
 
-                @Expect(adapter.sentCount(), 1)
+                @Expect(adapter.sentCount(), 2)
                 @Expect(adapter.sentText(0).contains("GitCode 扫描已启动"), true)
                 @Expect(adapter.sentText(0).contains("scanId=gcm-scan-"), true)
                 @Expect(adapter.sentText(0).contains("status=queued capability="), false)
                 @Expect(adapter.sentText(0).contains("\"accepted\""), false)
+                @Expect(adapter.sentText(1).contains("GitCode 扫描已启动"), true)
                 @Expect(adapter.sentAccount(0), "feishu-gitcode-monitor")
+                @Expect(adapter.sentAccount(1), "feishu-gitcode-monitor")
+                @Expect(payloads.size, 2)
+                let defaultLimits = JsonValue.fromStr(payloads[0]).asObject().get("limits").getOrThrow().asObject()
+                @Expect(defaultLimits.get("maxRepos").getOrThrow().asInt().getValue(), 0)
+                @Expect(defaultLimits.get("maxItems").getOrThrow().asInt().getValue(), 0)
+                @Expect(defaultLimits.get("maxDurationMillis").getOrThrow().asInt().getValue(), 0)
+                let explicitLimits = JsonValue.fromStr(payloads[1]).asObject().get("limits").getOrThrow().asObject()
+                @Expect(explicitLimits.get("maxRepos").getOrThrow().asInt().getValue(), 2)
+                @Expect(explicitLimits.get("maxItems").getOrThrow().asInt().getValue(), 20)
+                @Expect(explicitLimits.get("maxDurationMillis").getOrThrow().asInt().getValue(), 0)
+            } finally {
+                setServicePluginCapabilityInvokerForTest(None)
+                resetServicePluginPendingJobStoreForTest()
+                service.stop()
+            }
+        })
+    }
+
+    @TestCase
+    public func feishuGitcodeScanOnceRejectsTimeoutWithoutInvokingGcm(): Unit {
+        withGatewayFeishuNativeTestHome("gitcode-timeout", gatewayFeishuNativeTestRoot(), { =>
+            var user = CliSettingManager.readGatewaySettings()
+            user.servicePlugins = [gatewayFeishuNativeGitcodePluginSettings("feishu-gitcode-monitor")]
+            CliSettingManager.writeGatewaySettings(user)
+
+            let adapter = GatewayFeishuNativeTestAdapter(accountId: "feishu-gitcode-monitor")
+            let service = gatewayFeishuNativeService(adapter, enableGroup: false, accountId: "feishu-gitcode-monitor")
+            service.start()
+            try {
+                resetServicePluginPendingJobStoreForTest()
+                let payloads = ArrayList<String>()
+                setServicePluginCapabilityInvokerForTest(Some({ _registration: ServicePluginRegistration, request: CapabilityInvokeRequest =>
+                    payloads.add(request.payload)
+                    CapabilityInvokeResult(false, "unexpected_invocation", serviceId: "gitcode-monitor", capabilityId: request.capabilityId)
+                }))
+
+                adapter.queueDirect("/gitcode scan once --timeout-ms 1000")
+                service.processOnce()
+
+                @Expect(adapter.sentCount(), 1)
+                @Expect(adapter.sentText(0).contains("--timeout-ms is no longer supported for async scan jobs"), true)
+                @Expect(adapter.sentText(0).contains("{"), false)
+                @Expect(adapter.sentText(0).contains("\"ok\""), false)
+                @Expect(adapter.sentText(0).contains("scanId=gcm-scan-"), false)
+                @Expect(payloads.size, 0)
             } finally {
                 setServicePluginCapabilityInvokerForTest(None)
                 resetServicePluginPendingJobStoreForTest()

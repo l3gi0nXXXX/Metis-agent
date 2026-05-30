@@ -143,6 +143,7 @@ public class ServicePluginScanReportPayload {
     public let maxRepos: Int64
     public let maxItems: Int64
     public let timeoutMillis: Int64
+    public let stopReason: String
     public let scannedRepos: Int64
     public let checkedItems: Int64
     public let newEvents: Int64
@@ -164,6 +165,7 @@ public class ServicePluginScanReportPayload {
         maxRepos!: Int64 = 0,
         maxItems!: Int64 = 0,
         timeoutMillis!: Int64 = 0,
+        stopReason!: String = "completed",
         scannedRepos!: Int64 = 0,
         checkedItems!: Int64 = 0,
         newEvents!: Int64 = 0,
@@ -184,6 +186,7 @@ public class ServicePluginScanReportPayload {
         this.maxRepos = jobBoundNonNegative(maxRepos)
         this.maxItems = jobBoundNonNegative(maxItems)
         this.timeoutMillis = jobBoundNonNegative(timeoutMillis)
+        this.stopReason = scanReportSafeField(stopReason, maxRunes: 80)
         this.scannedRepos = jobBoundNonNegative(scannedRepos)
         this.checkedItems = jobBoundNonNegative(checkedItems)
         this.newEvents = jobBoundNonNegative(newEvents)
@@ -504,6 +507,7 @@ private func parseServicePluginScanReport(root: JsonObject): Option<ServicePlugi
         maxRepos: jobOptionalInt(limits, "maxRepos", 0, diagnostics),
         maxItems: jobOptionalInt(limits, "maxItems", 0, diagnostics),
         timeoutMillis: jobOptionalInt(limits, "timeoutMillis", 0, diagnostics),
+        stopReason: jobOptionalString(reportRoot, "stopReason", diagnostics),
         scannedRepos: jobOptionalInt(reportRoot, "scannedRepos", 0, diagnostics),
         checkedItems: jobOptionalInt(reportRoot, "checkedItems", 0, diagnostics),
         newEvents: jobOptionalInt(reportRoot, "newEvents", 0, diagnostics),
@@ -563,6 +567,10 @@ private func renderServicePluginScanReportSummary(event: ServicePluginJobEventPa
     if (!scope.isEmpty()) {
         text += "范围: ${scope}\n"
     }
+    let stopReason = renderServicePluginScanStopReason(report)
+    if (!stopReason.isEmpty()) {
+        text += "${stopReason}\n"
+    }
     text += "扫描: 仓库 ${report.scannedRepos} 个，候选 PR/Issue/comment ${report.checkedItems} 条\n"
     text += "结果: 新增 ${report.newEvents} 条，重复 ${report.duplicateEvents} 条，过滤 ${report.filteredEvents} 条，失败 ${report.failedEvents} 条\n"
     text += "回复: ${renderServicePluginScanReplyLine(report)}\n"
@@ -586,10 +594,27 @@ private func renderServicePluginScanScope(report: ServicePluginScanReportPayload
     if (report.maxItems > 0) {
         parts.add("maxItems=${report.maxItems}")
     }
-    if (report.timeoutMillis > 0) {
-        parts.add("timeout=${report.timeoutMillis / 1000}s")
-    }
     String.join(parts.toArray(), delimiter: " ")
+}
+
+private func renderServicePluginScanStopReason(report: ServicePluginScanReportPayload): String {
+    let reason = report.stopReason.trimAscii()
+    if (reason.isEmpty() || reason == "completed") {
+        return ""
+    }
+    if (reason == "max_repos_reached") {
+        if (report.maxRepos > 0) {
+            return "停止原因: 达到用户设置的 maxRepos=${report.maxRepos}"
+        }
+        return "停止原因: 达到用户设置的 maxRepos 限制"
+    }
+    if (reason == "max_items_reached") {
+        if (report.maxItems > 0) {
+            return "停止原因: 达到用户设置的 maxItems=${report.maxItems}"
+        }
+        return "停止原因: 达到用户设置的 maxItems 限制"
+    }
+    "停止原因: ${reason}"
 }
 
 private func renderServicePluginScanReplyLine(report: ServicePluginScanReportPayload): String {

@@ -23,6 +23,9 @@ public class ServicePluginJobContractTest {
         @Expect(start.payload.jobId, "gcm-scan-20260530-095017-0001")
         @Expect(start.payload.deliveryTarget.channel, "telegram")
         @Expect(start.payload.deliveryTarget.peerId, "internal-peer-24")
+        @Expect(start.payload.limits.maxRepos, 0)
+        @Expect(start.payload.limits.maxItems, 0)
+        @Expect(start.payload.limits.maxDurationMillis, 0)
 
         let acceptedFrame = decodeServiceFrame(this.fixture("scan_accepted_response.jsonl"))
         @Expect(acceptedFrame.ok, true)
@@ -71,16 +74,28 @@ public class ServicePluginJobContractTest {
         let message = renderServicePluginJobEventMessage(diagnostic.payload)
         @Expect(message.contains("secret"), false)
         @Expect(message.contains("/Users/"), false)
+
+        let missingLimits = parseServicePluginJobStartPayload("{\"ok\":true,\"mode\":\"async\",\"jobId\":\"j\",\"idempotencyKey\":\"k\",\"deliveryTarget\":{\"channel\":\"telegram\",\"accountId\":\"a\",\"peerId\":\"p\"}}")
+        @Expect(missingLimits.ok, true)
+        @Expect(missingLimits.payload.limits.maxRepos, 0)
+        @Expect(missingLimits.payload.limits.maxItems, 0)
+        @Expect(missingLimits.payload.limits.maxDurationMillis, 0)
+
+        let missingDuration = parseServicePluginJobStartPayload("{\"ok\":true,\"mode\":\"async\",\"jobId\":\"j2\",\"idempotencyKey\":\"k2\",\"deliveryTarget\":{\"channel\":\"telegram\",\"accountId\":\"a\",\"peerId\":\"p\"},\"limits\":{\"maxRepos\":0,\"maxItems\":0}}")
+        @Expect(missingDuration.ok, true)
+        @Expect(missingDuration.payload.limits.maxDurationMillis, 0)
     }
 
     @TestCase
     public func completedScanReportRendersDuplicateSamplesDryRunAndNoRawJson(): Unit {
-        let payload = "{\"ok\":true,\"status\":\"completed\",\"jobId\":\"gcm-scan-1\",\"accepted\":0,\"ignored\":0,\"emitted\":0,\"durationMs\":28800,\"stateSaved\":true,\"report\":{\"orgs\":[\"cangjie\",\"cangjie-sig\"],\"limits\":{\"maxRepos\":1,\"maxItems\":30,\"timeoutMillis\":60000},\"scannedRepos\":1,\"checkedItems\":31,\"newEvents\":0,\"duplicateEvents\":31,\"filteredEvents\":0,\"failedEvents\":0,\"draftsGenerated\":0,\"draftsFailed\":0,\"notificationsSent\":0,\"writes\":0,\"writeMode\":\"dry_run\",\"samples\":{\"duplicate\":[{\"repo\":\"cangjie/community\",\"kind\":\"pr\",\"number\":70,\"reason\":\"seen\"},{\"repo\":\"cangjie/community\",\"kind\":\"pr\",\"number\":69,\"reason\":\"seen\"}]}}}"
+        let payload = "{\"ok\":true,\"status\":\"completed\",\"jobId\":\"gcm-scan-1\",\"accepted\":0,\"ignored\":0,\"emitted\":0,\"durationMs\":28800,\"stateSaved\":true,\"report\":{\"orgs\":[\"cangjie\",\"cangjie-sig\"],\"stopReason\":\"completed\",\"limits\":{\"maxRepos\":1,\"maxItems\":30,\"timeoutMillis\":60000},\"scannedRepos\":1,\"checkedItems\":31,\"newEvents\":0,\"duplicateEvents\":31,\"filteredEvents\":0,\"failedEvents\":0,\"draftsGenerated\":0,\"draftsFailed\":0,\"notificationsSent\":0,\"writes\":0,\"writeMode\":\"dry_run\",\"samples\":{\"duplicate\":[{\"repo\":\"cangjie/community\",\"kind\":\"pr\",\"number\":70,\"reason\":\"seen\"},{\"repo\":\"cangjie/community\",\"kind\":\"pr\",\"number\":69,\"reason\":\"seen\"}]}}}"
         let parsed = parseServicePluginJobEventPayload("gitcode.monitor.scan_completed", payload)
         @Expect(parsed.ok, true)
         let text = renderServicePluginJobEventMessage(parsed.payload)
         @Expect(text.contains("GitCode 扫描完成"), true)
-        @Expect(text.contains("范围: orgs=cangjie,cangjie-sig maxRepos=1 maxItems=30 timeout=60s"), true)
+        @Expect(text.contains("范围: orgs=cangjie,cangjie-sig maxRepos=1 maxItems=30"), true)
+        @Expect(text.contains("timeout=60s"), false)
+        @Expect(text.contains("停止原因"), false)
         @Expect(text.contains("扫描: 仓库 1 个，候选 PR/Issue/comment 31 条"), true)
         @Expect(text.contains("结果: 新增 0 条，重复 31 条，过滤 0 条，失败 0 条"), true)
         @Expect(text.contains("本次没有新增未处理事件，因此未生成新回复"), true)
@@ -91,6 +106,36 @@ public class ServicePluginJobContractTest {
         @Expect(text.contains("\"ok\""), false)
         @Expect(text.contains("\"result\""), false)
         @Expect(text.contains("\"payload\""), false)
+    }
+
+    @TestCase
+    public func completedScanReportRendersOnlyExplicitStopReasons(): Unit {
+        let completed = parseServicePluginJobEventPayload("gitcode.monitor.scan_completed", "{\"ok\":true,\"status\":\"completed\",\"jobId\":\"gcm-scan-stop-0\",\"report\":{\"orgs\":[\"cangjie\"],\"stopReason\":\"completed\",\"limits\":{\"maxRepos\":0,\"maxItems\":0,\"timeoutMillis\":30000},\"scannedRepos\":6,\"checkedItems\":36,\"newEvents\":0,\"writeMode\":\"dry_run\"}}")
+        @Expect(completed.ok, true)
+        let completedText = renderServicePluginJobEventMessage(completed.payload)
+        @Expect(completedText.contains("范围: orgs=cangjie"), true)
+        @Expect(completedText.contains("maxRepos=5"), false)
+        @Expect(completedText.contains("maxItems=30"), false)
+        @Expect(completedText.contains("timeout="), false)
+        @Expect(completedText.contains("停止原因"), false)
+
+        let maxRepos = parseServicePluginJobEventPayload("gitcode.monitor.scan_completed", "{\"ok\":true,\"status\":\"completed\",\"jobId\":\"gcm-scan-stop-1\",\"report\":{\"orgs\":[\"cangjie\"],\"stopReason\":\"max_repos_reached\",\"limits\":{\"maxRepos\":2,\"maxItems\":0},\"scannedRepos\":2,\"checkedItems\":12,\"newEvents\":0,\"writeMode\":\"dry_run\"}}")
+        @Expect(maxRepos.ok, true)
+        let maxReposText = renderServicePluginJobEventMessage(maxRepos.payload)
+        @Expect(maxReposText.contains("停止原因: 达到用户设置的 maxRepos=2"), true)
+        @Expect(maxReposText.contains("\"stopReason\""), false)
+
+        let maxItems = parseServicePluginJobEventPayload("gitcode.monitor.scan_completed", "{\"ok\":true,\"status\":\"completed\",\"jobId\":\"gcm-scan-stop-2\",\"report\":{\"orgs\":[\"cangjie\"],\"stopReason\":\"max_items_reached\",\"limits\":{\"maxRepos\":0,\"maxItems\":30},\"scannedRepos\":2,\"checkedItems\":30,\"newEvents\":0,\"writeMode\":\"dry_run\"}}")
+        @Expect(maxItems.ok, true)
+        let maxItemsText = renderServicePluginJobEventMessage(maxItems.payload)
+        @Expect(maxItemsText.contains("停止原因: 达到用户设置的 maxItems=30"), true)
+        @Expect(maxItemsText.contains("timeout"), false)
+
+        let unknown = parseServicePluginJobEventPayload("gitcode.monitor.scan_completed", "{\"ok\":true,\"status\":\"completed\",\"jobId\":\"gcm-scan-stop-3\",\"report\":{\"stopReason\":\"future_reason\",\"scannedRepos\":1,\"checkedItems\":1,\"newEvents\":0,\"writeMode\":\"dry_run\"}}")
+        @Expect(unknown.ok, true)
+        let unknownText = renderServicePluginJobEventMessage(unknown.payload)
+        @Expect(unknownText.contains("停止原因: future_reason"), true)
+        @Expect(unknownText.contains("{"), false)
     }
 
     @TestCase
