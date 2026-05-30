@@ -2,7 +2,7 @@ package metis.gateway.service_plugin
 
 import std.collection.ArrayList
 import std.convert.Parsable
-import stdx.encoding.json.{JsonBool, JsonObject, JsonString, JsonValue}
+import stdx.encoding.json.{JsonArray, JsonBool, JsonObject, JsonString, JsonValue}
 
 public class ServicePluginDeliveryTarget {
     public let channel: String
@@ -98,6 +98,110 @@ public class ServicePluginJobAcceptedPayload {
     }
 }
 
+public class ServicePluginScanEventSummary {
+    public let eventId: String
+    public let repo: String
+    public let kind: String
+    public let number: String
+    public let commentId: String
+    public let title: String
+    public let url: String
+    public let status: String
+    public let reason: String
+    public let notification: String
+    public let writeback: String
+
+    public init(
+        eventId!: String = "",
+        repo!: String = "",
+        kind!: String = "",
+        number!: String = "",
+        commentId!: String = "",
+        title!: String = "",
+        url!: String = "",
+        status!: String = "",
+        reason!: String = "",
+        notification!: String = "",
+        writeback!: String = ""
+    ) {
+        this.eventId = scanReportSafeField(eventId, maxRunes: 96)
+        this.repo = scanReportSafeField(repo, maxRunes: 120)
+        this.kind = scanReportSafeField(kind, maxRunes: 32).toAsciiLower()
+        this.number = scanReportSafeField(number, maxRunes: 32)
+        this.commentId = scanReportSafeField(commentId, maxRunes: 48)
+        this.title = scanReportSafeField(title, maxRunes: 180)
+        this.url = scanReportSafeField(url, maxRunes: 240)
+        this.status = scanReportSafeField(status, maxRunes: 80)
+        this.reason = scanReportSafeField(reason, maxRunes: 160)
+        this.notification = scanReportSafeField(notification, maxRunes: 120)
+        this.writeback = scanReportSafeField(writeback, maxRunes: 120)
+    }
+}
+
+public class ServicePluginScanReportPayload {
+    public let orgs: Array<String>
+    public let maxRepos: Int64
+    public let maxItems: Int64
+    public let timeoutMillis: Int64
+    public let scannedRepos: Int64
+    public let checkedItems: Int64
+    public let newEvents: Int64
+    public let duplicateEvents: Int64
+    public let filteredEvents: Int64
+    public let failedEvents: Int64
+    public let draftsGenerated: Int64
+    public let draftsFailed: Int64
+    public let notificationsSent: Int64
+    public let writes: Int64
+    public let writeMode: String
+    public let samplesNew: Array<ServicePluginScanEventSummary>
+    public let samplesDuplicate: Array<ServicePluginScanEventSummary>
+    public let samplesFiltered: Array<ServicePluginScanEventSummary>
+    public let samplesFailed: Array<ServicePluginScanEventSummary>
+
+    public init(
+        orgs!: Array<String> = [],
+        maxRepos!: Int64 = 0,
+        maxItems!: Int64 = 0,
+        timeoutMillis!: Int64 = 0,
+        scannedRepos!: Int64 = 0,
+        checkedItems!: Int64 = 0,
+        newEvents!: Int64 = 0,
+        duplicateEvents!: Int64 = 0,
+        filteredEvents!: Int64 = 0,
+        failedEvents!: Int64 = 0,
+        draftsGenerated!: Int64 = 0,
+        draftsFailed!: Int64 = 0,
+        notificationsSent!: Int64 = 0,
+        writes!: Int64 = 0,
+        writeMode!: String = "",
+        samplesNew!: Array<ServicePluginScanEventSummary> = [],
+        samplesDuplicate!: Array<ServicePluginScanEventSummary> = [],
+        samplesFiltered!: Array<ServicePluginScanEventSummary> = [],
+        samplesFailed!: Array<ServicePluginScanEventSummary> = []
+    ) {
+        this.orgs = orgs
+        this.maxRepos = jobBoundNonNegative(maxRepos)
+        this.maxItems = jobBoundNonNegative(maxItems)
+        this.timeoutMillis = jobBoundNonNegative(timeoutMillis)
+        this.scannedRepos = jobBoundNonNegative(scannedRepos)
+        this.checkedItems = jobBoundNonNegative(checkedItems)
+        this.newEvents = jobBoundNonNegative(newEvents)
+        this.duplicateEvents = jobBoundNonNegative(duplicateEvents)
+        this.filteredEvents = jobBoundNonNegative(filteredEvents)
+        this.failedEvents = jobBoundNonNegative(failedEvents)
+        this.draftsGenerated = jobBoundNonNegative(draftsGenerated)
+        this.draftsFailed = jobBoundNonNegative(draftsFailed)
+        this.notificationsSent = jobBoundNonNegative(notificationsSent)
+        this.writes = jobBoundNonNegative(writes)
+        this.writeMode = scanReportSafeField(writeMode, maxRunes: 48).toAsciiLower()
+        this.samplesNew = samplesNew
+        this.samplesDuplicate = samplesDuplicate
+        this.samplesFiltered = samplesFiltered
+        this.samplesFailed = samplesFailed
+    }
+}
+
 public class ServicePluginJobEventPayload {
     public let ok: Bool
     public let status: String
@@ -114,6 +218,7 @@ public class ServicePluginJobEventPayload {
     public let retryable: Bool
     public let diagnostic: String
     public let diagnosticHash: String
+    public let report: Option<ServicePluginScanReportPayload>
 
     public init(
         ok!: Bool = false,
@@ -130,7 +235,8 @@ public class ServicePluginJobEventPayload {
         errorKind!: String = "",
         retryable!: Bool = false,
         diagnostic!: String = "",
-        diagnosticHash!: String = ""
+        diagnosticHash!: String = "",
+        report!: Option<ServicePluginScanReportPayload> = None<ServicePluginScanReportPayload>
     ) {
         this.ok = ok
         this.status = status.trimAscii()
@@ -147,6 +253,7 @@ public class ServicePluginJobEventPayload {
         this.retryable = retryable
         this.diagnostic = diagnostic
         this.diagnosticHash = diagnosticHash.trimAscii()
+        this.report = report
     }
 }
 
@@ -306,14 +413,15 @@ public func parseServicePluginJobEventPayload(capabilityId: String, payload: Str
         errorKind: jobOptionalString(root, "errorKind", diagnostics),
         retryable: jobOptionalBool(root, "retryable", false, diagnostics),
         diagnostic: diagnostic,
-        diagnosticHash: jobOptionalString(root, "diagnosticHash", diagnostics)
+        diagnosticHash: jobOptionalString(root, "diagnosticHash", diagnostics),
+        report: parseServicePluginScanReport(root)
     ))
 }
 
 public func renderServicePluginJobEventMessage(event: ServicePluginJobEventPayload): String {
     let status = event.status.trimAscii()
     if (status == "completed") {
-        return "GitCode 扫描完成：accepted=${event.accepted} ignored=${event.ignored} emitted=${event.emitted} duration=${formatJobDuration(event.durationMs)} stateSaved=${event.stateSaved}"
+        return renderServicePluginScanCompletedMessage(event)
     }
     if (status == "cancelled") {
         return "GitCode 扫描已取消。scanId=${event.jobId}"
@@ -326,6 +434,52 @@ public func renderServicePluginJobEventMessage(event: ServicePluginJobEventPaylo
     "GitCode 扫描状态：status=${status} stage=${event.stage} scanId=${event.jobId}"
 }
 
+public func renderServicePluginScanCompletedMessage(event: ServicePluginJobEventPayload): String {
+    match (event.report) {
+        case Some(report) =>
+            return redactServicePayload(renderServicePluginScanReportSummary(event, report)).text
+        case None =>
+            return "GitCode 扫描完成\n结果: accepted=${event.accepted} ignored=${event.ignored} emitted=${event.emitted}\n说明: 当前 GCM 未返回扫描明细，无法展示仓库和 PR/Issue 列表。"
+    }
+}
+
+public func renderServicePluginJobSnapshotMessage(payload: String, fallbackJobId!: String = ""): String {
+    let root = match (jobParseObject(payload)) {
+        case Some(obj) => obj
+        case None => return "GitCode 扫描状态：scanId=${fallbackJobId} status=unknown"
+    }
+    let diagnostics = ArrayList<String>()
+    let status = jobOptionalString(root, "status", diagnostics)
+    let jobId = jobOptionalString(root, "jobId", diagnostics)
+    let scanId = if (jobId.isEmpty()) { fallbackJobId.trimAscii() } else { jobId }
+    let report = parseServicePluginScanReport(root)
+    if (status == "completed") {
+        return renderServicePluginScanCompletedMessage(ServicePluginJobEventPayload(
+            ok: jobOptionalBool(root, "ok", true, diagnostics),
+            status: "completed",
+            jobId: scanId,
+            stage: jobOptionalString(root, "stage", diagnostics),
+            accepted: jobOptionalInt(root, "accepted", 0, diagnostics),
+            ignored: jobOptionalInt(root, "ignored", 0, diagnostics),
+            emitted: jobOptionalInt(root, "emitted", 0, diagnostics),
+            durationMs: jobOptionalInt(root, "durationMs", 0, diagnostics),
+            stateSaved: jobOptionalBool(root, "stateSaved", false, diagnostics),
+            report: report
+        ))
+    }
+    var text = "GitCode 扫描状态：scanId=${scanId} status=${if (status.isEmpty()) { "unknown" } else { status }}"
+    let stage = jobOptionalString(root, "stage", diagnostics)
+    if (!stage.isEmpty()) {
+        text += " stage=${stage}"
+    }
+    match (report) {
+        case Some(r) =>
+            text += " 已扫描仓库 ${r.scannedRepos} 个，候选事件 ${r.checkedItems} 条"
+        case None => ()
+    }
+    redactServicePayload(text).text
+}
+
 public func servicePluginDeliveryTargetToJson(target: ServicePluginDeliveryTarget): JsonObject {
     let obj = JsonObject()
     obj.put("channel", JsonString(target.channel))
@@ -335,6 +489,254 @@ public func servicePluginDeliveryTargetToJson(target: ServicePluginDeliveryTarge
     obj.put("replyToMessageId", JsonString(target.replyToMessageId))
     obj.put("replyInThread", JsonBool(target.replyInThread))
     obj
+}
+
+private func parseServicePluginScanReport(root: JsonObject): Option<ServicePluginScanReportPayload> {
+    let reportRoot = match (root.get("report")) {
+        case Some(v) => try { v.asObject() } catch (_: Exception) { return None<ServicePluginScanReportPayload> }
+        case None => return None<ServicePluginScanReportPayload>
+    }
+    let diagnostics = ArrayList<String>()
+    let limits = jobOptionalObjectLenient(reportRoot, "limits")
+    let samples = jobOptionalObjectLenient(reportRoot, "samples")
+    Some(ServicePluginScanReportPayload(
+        orgs: jobOptionalStringArray(reportRoot, "orgs"),
+        maxRepos: jobOptionalInt(limits, "maxRepos", 0, diagnostics),
+        maxItems: jobOptionalInt(limits, "maxItems", 0, diagnostics),
+        timeoutMillis: jobOptionalInt(limits, "timeoutMillis", 0, diagnostics),
+        scannedRepos: jobOptionalInt(reportRoot, "scannedRepos", 0, diagnostics),
+        checkedItems: jobOptionalInt(reportRoot, "checkedItems", 0, diagnostics),
+        newEvents: jobOptionalInt(reportRoot, "newEvents", 0, diagnostics),
+        duplicateEvents: jobOptionalInt(reportRoot, "duplicateEvents", 0, diagnostics),
+        filteredEvents: jobOptionalInt(reportRoot, "filteredEvents", 0, diagnostics),
+        failedEvents: jobOptionalInt(reportRoot, "failedEvents", 0, diagnostics),
+        draftsGenerated: jobOptionalInt(reportRoot, "draftsGenerated", 0, diagnostics),
+        draftsFailed: jobOptionalInt(reportRoot, "draftsFailed", 0, diagnostics),
+        notificationsSent: jobOptionalInt(reportRoot, "notificationsSent", 0, diagnostics),
+        writes: jobOptionalInt(reportRoot, "writes", 0, diagnostics),
+        writeMode: jobOptionalString(reportRoot, "writeMode", diagnostics),
+        samplesNew: parseServicePluginScanEventSamples(samples, "new"),
+        samplesDuplicate: parseServicePluginScanEventSamples(samples, "duplicate"),
+        samplesFiltered: parseServicePluginScanEventSamples(samples, "filtered"),
+        samplesFailed: parseServicePluginScanEventSamples(samples, "failed")
+    ))
+}
+
+private func parseServicePluginScanEventSamples(samples: JsonObject, key: String): Array<ServicePluginScanEventSummary> {
+    let arr = match (samples.get(key)) {
+        case Some(v) => try { v.asArray() } catch (_: Exception) { JsonArray([]) }
+        case None => JsonArray([])
+    }
+    let out = ArrayList<ServicePluginScanEventSummary>()
+    var count = 0
+    for (item in arr.getItems()) {
+        if (count >= 20) {
+            break
+        }
+        try {
+            let obj = item.asObject()
+            out.add(ServicePluginScanEventSummary(
+                eventId: jobOptionalAnyString(obj, "eventId"),
+                repo: jobOptionalAnyString(obj, "repo"),
+                kind: jobOptionalAnyString(obj, "kind"),
+                number: jobOptionalAnyString(obj, "number"),
+                commentId: jobOptionalAnyString(obj, "commentId"),
+                title: jobOptionalAnyString(obj, "title"),
+                url: jobOptionalAnyString(obj, "url"),
+                status: jobOptionalAnyString(obj, "status"),
+                reason: jobOptionalAnyString(obj, "reason"),
+                notification: jobOptionalAnyString(obj, "notification"),
+                writeback: jobOptionalAnyString(obj, "writeback")
+            ))
+            count++
+        } catch (_: Exception) {
+            ()
+        }
+    }
+    out.toArray()
+}
+
+private func renderServicePluginScanReportSummary(event: ServicePluginJobEventPayload, report: ServicePluginScanReportPayload): String {
+    var text = "GitCode 扫描完成\nscanId: ${event.jobId}\n"
+    text += "耗时: ${formatJobDuration(event.durationMs)}\n"
+    let scope = renderServicePluginScanScope(report)
+    if (!scope.isEmpty()) {
+        text += "范围: ${scope}\n"
+    }
+    text += "扫描: 仓库 ${report.scannedRepos} 个，候选 PR/Issue/comment ${report.checkedItems} 条\n"
+    text += "结果: 新增 ${report.newEvents} 条，重复 ${report.duplicateEvents} 条，过滤 ${report.filteredEvents} 条，失败 ${report.failedEvents} 条\n"
+    text += "回复: ${renderServicePluginScanReplyLine(report)}\n"
+    text += "通知: ${renderServicePluginScanNotificationLine(report)}\n"
+    text += "写回: ${renderServicePluginScanWriteLine(report)}"
+    text += renderServicePluginSampleSection("新增事件", report.samplesNew, report.newEvents, true)
+    text += renderServicePluginSampleSection("最近重复事件", report.samplesDuplicate, report.duplicateEvents, false)
+    text += renderServicePluginSampleSection("过滤事件样例", report.samplesFiltered, report.filteredEvents, false)
+    text += renderServicePluginSampleSection("失败事件样例", report.samplesFailed, report.failedEvents, false)
+    text
+}
+
+private func renderServicePluginScanScope(report: ServicePluginScanReportPayload): String {
+    let parts = ArrayList<String>()
+    if (report.orgs.size > 0) {
+        parts.add("orgs=${String.join(report.orgs, delimiter: ",")}")
+    }
+    if (report.maxRepos > 0) {
+        parts.add("maxRepos=${report.maxRepos}")
+    }
+    if (report.maxItems > 0) {
+        parts.add("maxItems=${report.maxItems}")
+    }
+    if (report.timeoutMillis > 0) {
+        parts.add("timeout=${report.timeoutMillis / 1000}s")
+    }
+    String.join(parts.toArray(), delimiter: " ")
+}
+
+private func renderServicePluginScanReplyLine(report: ServicePluginScanReportPayload): String {
+    if (report.newEvents == 0) {
+        return "本次没有新增未处理事件，因此未生成新回复。"
+    }
+    let human = countNeedsHumanReview(report.samplesNew)
+    "已生成草稿 ${report.draftsGenerated} 条，需人工确认 ${human} 条，生成失败 ${report.draftsFailed} 条"
+}
+
+private func renderServicePluginScanNotificationLine(report: ServicePluginScanReportPayload): String {
+    if (report.notificationsSent > 0) {
+        return "已发送 ${report.notificationsSent} 条"
+    }
+    if (report.newEvents == 0) {
+        return "本次无新增事件，未发送草稿通知"
+    }
+    "未返回通知明细"
+}
+
+private func renderServicePluginScanWriteLine(report: ServicePluginScanReportPayload): String {
+    if (report.writeMode == "dry_run" || report.writeMode == "dryrun") {
+        return "dryRun=true，未写回 GitCode。"
+    }
+    if (report.writes > 0) {
+        return "已写回 ${report.writes} 条。"
+    }
+    "未写回 GitCode。"
+}
+
+private func renderServicePluginSampleSection(title: String, samples: Array<ServicePluginScanEventSummary>, total: Int64, detailed: Bool): String {
+    if (samples.size == 0) {
+        return ""
+    }
+    var text = "\n\n${title}:\n"
+    let limit = 5
+    var i = 0
+    while (i < samples.size && i < limit) {
+        let sample = samples[i]
+        if (detailed) {
+            text += "${i + 1}. 来源: ${renderServicePluginEventSource(sample)}\n"
+            if (!sample.title.isEmpty()) {
+                text += "   标题: ${sample.title}\n"
+            }
+            if (!sample.status.isEmpty()) {
+                text += "   状态: ${renderServicePluginEventStatus(sample.status)}\n"
+            }
+            if (!sample.reason.isEmpty()) {
+                text += "   原因: ${sample.reason}\n"
+            }
+            if (!sample.notification.isEmpty()) {
+                text += "   通知: ${sample.notification}\n"
+            }
+            let write = renderServicePluginEventWriteback(sample)
+            if (!write.isEmpty()) {
+                text += "   写回: ${write}\n"
+            }
+        } else {
+            let reason = if (sample.reason.isEmpty()) { sample.status } else { sample.reason }
+            text += "${i + 1}. ${renderServicePluginCompactEvent(sample)}"
+            if (!reason.isEmpty()) {
+                text += " - ${reason}"
+            }
+            text += "\n"
+        }
+        i++
+    }
+    let remaining = if (total > i) { total - i } else { if (samples.size > i) { samples.size - i } else { 0 } }
+    if (remaining > 0) {
+        text += "... 还有 ${remaining} 条${sampleSectionItemName(title)}未展示"
+    }
+    text
+}
+
+private func renderServicePluginEventSource(sample: ServicePluginScanEventSummary): String {
+    let base = renderServicePluginCompactEvent(sample)
+    if (sample.url.isEmpty()) {
+        return "${base} 链接: unavailable"
+    }
+    "${base} ${sample.url}"
+}
+
+private func renderServicePluginCompactEvent(sample: ServicePluginScanEventSummary): String {
+    var text = if (sample.repo.isEmpty()) { "unknown/repo" } else { sample.repo }
+    let kind = renderServicePluginEventKind(sample.kind)
+    if (!kind.isEmpty()) {
+        text += " ${kind}"
+    }
+    if (!sample.number.isEmpty()) {
+        text += " #${sample.number}"
+    }
+    if (!sample.commentId.isEmpty()) {
+        text += " comment #${sample.commentId}"
+    }
+    text
+}
+
+private func renderServicePluginEventKind(kind: String): String {
+    match (kind.toAsciiLower()) {
+        case "pr" | "pull_request" | "pullrequest" => "PR"
+        case "issue" => "Issue"
+        case "comment" => "Comment"
+        case other => other
+    }
+}
+
+private func renderServicePluginEventStatus(status: String): String {
+    match (status.trimAscii()) {
+        case "draft_generated" => "已生成回复草稿"
+        case "draft_failed" => "回复生成失败"
+        case "ckb_degraded" => "CKB 降级"
+        case "llm_degraded" => "LLM 降级"
+        case other => other
+    }
+}
+
+private func renderServicePluginEventWriteback(sample: ServicePluginScanEventSummary): String {
+    match (sample.writeback.toAsciiLower()) {
+        case "dry_run" | "write_skipped_dry_run" => "dry_run，未写回"
+        case "write_applied" => "已写回"
+        case "write_failed" => "写回失败"
+        case other => other
+    }
+}
+
+private func sampleSectionItemName(title: String): String {
+    if (title.contains("新增")) {
+        return "新增事件"
+    }
+    if (title.contains("重复")) {
+        return "重复事件"
+    }
+    if (title.contains("过滤")) {
+        return "过滤事件"
+    }
+    "失败事件"
+}
+
+private func countNeedsHumanReview(samples: Array<ServicePluginScanEventSummary>): Int64 {
+    var count: Int64 = 0
+    for (sample in samples) {
+        let status = sample.status.toAsciiLower()
+        if (status.contains("needshumanreview") || status.contains("needs_human_review")) {
+            count++
+        }
+    }
+    count
 }
 
 private func jobParseObject(payload: String): ?JsonObject {
@@ -352,6 +754,49 @@ private func jobOptionalObject(obj: JsonObject, key: String, diagnostics: ArrayL
             JsonObject()
         }
         case None => JsonObject()
+    }
+}
+
+private func jobOptionalObjectLenient(obj: JsonObject, key: String): JsonObject {
+    match (obj.get(key)) {
+        case Some(v) => try { v.asObject() } catch (_: Exception) { JsonObject() }
+        case None => JsonObject()
+    }
+}
+
+private func jobOptionalStringArray(obj: JsonObject, key: String): Array<String> {
+    match (obj.get(key)) {
+        case Some(v) =>
+            try {
+                let arr = v.asArray()
+                let out = ArrayList<String>()
+                for (item in arr.getItems()) {
+                    try {
+                        let value = scanReportSafeField(item.asString().getValue(), maxRunes: 80)
+                        if (!value.isEmpty()) {
+                            out.add(value)
+                        }
+                    } catch (_: Exception) {
+                        ()
+                    }
+                }
+                out.toArray()
+            } catch (_: Exception) {
+                []
+            }
+        case None => []
+    }
+}
+
+private func jobOptionalAnyString(obj: JsonObject, key: String): String {
+    match (obj.get(key)) {
+        case Some(v) =>
+            try {
+                return v.asString().getValue().trimAscii()
+            } catch (_: Exception) {
+                return v.toJsonString().trimAscii()
+            }
+        case None => ""
     }
 }
 
@@ -403,6 +848,14 @@ private func jobOptionalInt(obj: JsonObject, key: String, fallback: Int64, diagn
             jobBoundNonNegative(parsed)
         case None => fallback
     }
+}
+
+private func scanReportSafeField(raw: String, maxRunes!: Int64 = 160): String {
+    let trimmed = raw.trimAscii()
+    if (trimmed.isEmpty()) {
+        return ""
+    }
+    redactServicePayload(trimmed, policy: RedactionPolicy(maxPayloadBytes: maxRunes)).text
 }
 
 private func validateJobId(jobId: String, diagnostics: ArrayList<String>): Unit {

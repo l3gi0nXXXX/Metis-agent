@@ -6,7 +6,7 @@ import metis.core.model.{findModelCapabilityCatalogEntry, modelCapabilityCatalog
 import metis.core.skills.SkillsPrompt
 import metis.gateway.model.*
 import metis.gateway.security.gatewayPairingAccountStore
-import metis.gateway.service_plugin.{CapabilityCaller, CapabilityInvokeRequest, CapabilityInvokeResult, ServicePluginDeliveryTarget, ServicePluginEventDeliveryResult, buildServicePluginImBindingRules, invokeRegisteredCapability, matchServicePluginImBinding, parseServicePluginJobAcceptedPayload, servicePluginPendingJobStore, registerConfiguredServicePlugins, servicePluginConfiguredStatusForUser, setServicePluginEventDelivery}
+import metis.gateway.service_plugin.{CapabilityCaller, CapabilityInvokeRequest, CapabilityInvokeResult, ServicePluginDeliveryTarget, ServicePluginEventDeliveryResult, buildServicePluginImBindingRules, invokeRegisteredCapability, matchServicePluginImBinding, parseServicePluginJobAcceptedPayload, renderServicePluginJobSnapshotMessage, servicePluginPendingJobStore, registerConfiguredServicePlugins, servicePluginConfiguredStatusForUser, setServicePluginEventDelivery}
 import metis.gateway.session.{GatewaySessionContext, GatewaySessionRequest, gatewayResolveSessionContext, gatewaySessionRequestFromInbound}
 import metis.gateway.tools.{gatewayHandleNativeCommandLine, gatewayHandleSubagentsCommandLine}
 import metis.gateway.gitcode_plugin.{GatewayCommandContext, buildGitCodeAsyncScanPayload, buildGitCodeSubscriptionTarget, formatGitCodeSubscribeResult, handleGitCodeKnowledgeQueryCommand, parseGitCodeCommand, parseGitCodeScanOnceArgs, removeGitCodeSubscription, saveGitCodeSubscription}
@@ -872,24 +872,7 @@ public class GatewayService {
     }
 
     private func servicePluginRenderGitCodeJobStatusResult(payload: String, fallbackJobId: String): String {
-        let root = try {
-            JsonValue.fromStr(payload).asObject()
-        } catch (_: Exception) {
-            return "GitCode 扫描状态：scanId=${fallbackJobId} status=unknown"
-        }
-        let status = this.feishuNativeJsonString(root, "status")
-        let jobId = this.feishuNativeJsonString(root, "jobId")
-        let stage = this.feishuNativeJsonString(root, "stage")
-        let summary = this.feishuNativeJsonString(root, "summary")
-        let scanId = if (jobId.isEmpty()) { fallbackJobId } else { jobId }
-        var text = "GitCode 扫描状态：scanId=${scanId} status=${if (status.isEmpty()) { "unknown" } else { status }}"
-        if (!stage.isEmpty()) {
-            text += " stage=${stage}"
-        }
-        if (!summary.isEmpty()) {
-            text += " ${summary}"
-        }
-        text
+        renderServicePluginJobSnapshotMessage(payload, fallbackJobId: fallbackJobId)
     }
 
     private func servicePluginCommandActionForLog(text: String, prefix: String): String {

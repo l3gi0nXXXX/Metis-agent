@@ -1,5 +1,8 @@
 package metis.gateway.service_plugin
 
+import std.collection.ArrayList
+import stdx.encoding.json.{JsonObject, JsonValue}
+
 public class ServicePluginEventDeliveryResult {
     public let ok: Bool
     public let status: String
@@ -51,6 +54,9 @@ public func dispatchServicePluginEvent(
     if (frame.serviceId != "gitcode-monitor") {
         return ServicePluginEventDispatchResult(false, "service_mismatch", diagnostic: "unsupported event service")
     }
+    if (frame.capabilityId == "gitcode.event.accepted") {
+        return recordGitCodeAcceptedEventForFutureReply(frame, store: store)
+    }
     let parsed = parseServicePluginJobEventPayload(frame.capabilityId, frame.payload)
     if (!parsed.ok) {
         return ServicePluginEventDispatchResult(false, parsed.status, diagnostic: parsed.diagnostic)
@@ -88,4 +94,45 @@ public func dispatchServicePluginEvent(
     }
     store.markDelivered(event.jobId, deliveredStatus, summary: text)
     ServicePluginEventDispatchResult(true, deliveredStatus)
+}
+
+private func recordGitCodeAcceptedEventForFutureReply(
+    frame: ServiceFrame,
+    store!: ServicePluginPendingJobStore = servicePluginPendingJobStore()
+): ServicePluginEventDispatchResult {
+    let root = try {
+        JsonValue.fromStr(frame.payload).asObject()
+    } catch (_: Exception) {
+        return ServicePluginEventDispatchResult(false, "event_payload_invalid", diagnostic: "accepted event payload must be a JSON object")
+    }
+    let diagnostics = ArrayList<String>()
+    let eventId = jobAcceptedEventString(root, "eventId", diagnostics)
+    let jobId = jobAcceptedEventString(root, "jobId", diagnostics)
+    if (eventId.isEmpty()) {
+        diagnostics.add("eventId is required")
+    }
+    if (diagnostics.size > 0) {
+        return ServicePluginEventDispatchResult(false, "event_payload_invalid", diagnostic: String.join(diagnostics.toArray(), delimiter: "; "))
+    }
+    if (!jobId.isEmpty()) {
+        match (store.findByJobId(jobId)) {
+            case Some(_) => store.markRunning(jobId, stage: "event_accepted")
+            case None => return ServicePluginEventDispatchResult(false, "orphan_event", diagnostic: "pending job not found for accepted event")
+        }
+    }
+    ServicePluginEventDispatchResult(
+        true,
+        "accepted_event_recorded",
+        diagnostic: "TODO generated_reply dispatch not implemented; accepted event recorded without terminal delivery"
+    )
+}
+
+private func jobAcceptedEventString(root: JsonObject, key: String, diagnostics: ArrayList<String>): String {
+    match (root.get(key)) {
+        case Some(v) => try { v.asString().getValue().trimAscii() } catch (_: Exception) {
+            diagnostics.add("${key} must be string")
+            ""
+        }
+        case None => ""
+    }
 }

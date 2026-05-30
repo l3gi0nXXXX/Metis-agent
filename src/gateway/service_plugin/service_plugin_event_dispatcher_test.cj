@@ -80,4 +80,32 @@ public class ServicePluginEventDispatcherTest {
             setServicePluginEventDeliveryForTest(None)
         }
     }
+
+    @TestCase
+    public func acceptedGitCodeEventIsRecordedWithoutBreakingTerminalDelivery(): Unit {
+        let messages = ArrayList<String>()
+        setServicePluginEventDeliveryForTest(Some({ _target: ServicePluginDeliveryTarget, text: String =>
+            messages.add(text)
+            ServicePluginEventDeliveryResult(true, "sent")
+        }))
+        try {
+            let store = this.storeWithRunningJob()
+            let accepted = ServiceFrame("event", "a1", "gitcode-monitor", method: "emitCapabilityEvent", capabilityId: "gitcode.event.accepted", payload: "{\"jobId\":\"job-1\",\"eventId\":\"e1\",\"repo\":\"cangjie/community\",\"kind\":\"pr\",\"number\":71,\"url\":\"https://gitcode.com/cangjie/community/pulls/71\"}")
+            let acceptedResult = dispatchServicePluginEvent(accepted, store: store)
+            @Expect(acceptedResult.ok, true)
+            @Expect(acceptedResult.status, "accepted_event_recorded")
+            @Expect(acceptedResult.diagnostic.contains("generated_reply"), true)
+            @Expect(messages.size, 0)
+            @Expect((store.findByJobId("job-1") ?? ServicePluginPendingJob()).status, "running")
+
+            let completed = ServiceFrame("event", "e1", "gitcode-monitor", method: "emitCapabilityEvent", capabilityId: "gitcode.monitor.scan_completed", payload: "{\"ok\":true,\"status\":\"completed\",\"jobId\":\"job-1\",\"accepted\":1,\"ignored\":0,\"emitted\":1,\"durationMs\":1200,\"stateSaved\":true}")
+            let completedResult = dispatchServicePluginEvent(completed, store: store)
+            @Expect(completedResult.ok, true)
+            @Expect(completedResult.status, "completed_delivered")
+            @Expect(messages.size, 1)
+            @Expect(messages[0].contains("GitCode 扫描完成"), true)
+        } finally {
+            setServicePluginEventDeliveryForTest(None)
+        }
+    }
 }
