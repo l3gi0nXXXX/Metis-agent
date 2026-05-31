@@ -87,6 +87,47 @@ public class ServicePluginJobContractTest {
     }
 
     @TestCase
+    public func failedAndExpiredEventsRenderHumanReadableDiagnosticsWithRedaction(): Unit {
+        let failed = parseServicePluginJobEventPayload(
+            "gitcode.monitor.scan_failed",
+            "{\"ok\":false,\"status\":\"failed\",\"jobId\":\"gcm-scan-failed-1\",\"stage\":\"scan_runtime\",\"errorKind\":\"utf8_summary_failed\",\"retryable\":true,\"diagnostic\":\"repo=cangjie/cangjie_python_interop eventId=gitcode:cangjie/cangjie_python_interop:pr:9:comment:156890959 kind=pr item=9 exception=Invalid utf8 byte sequence. token=secret Authorization: Bearer bearer-secret path=/Users/name/private\"}"
+        )
+        @Expect(failed.ok, true)
+        let failedText = renderServicePluginJobEventMessage(failed.payload)
+        @Expect(failedText.contains("GitCode 扫描失败"), true)
+        @Expect(failedText.contains("status=utf8_summary_failed"), true)
+        @Expect(failedText.contains("stage=scan_runtime"), true)
+        @Expect(failedText.contains("诊断:"), true)
+        @Expect(failedText.contains("repo=cangjie/cangjie_python_interop"), true)
+        @Expect(failedText.contains("eventId=gitcode:cangjie/cangjie_python_interop:pr:9:comment:156890959"), true)
+        @Expect(failedText.contains("Invalid utf8 byte sequence."), true)
+        @Expect(failedText.contains("secret"), false)
+        @Expect(failedText.contains("Authorization"), false)
+        @Expect(failedText.contains("/Users/"), false)
+        @Expect(failedText.contains("{"), false)
+        @Expect(failedText.contains("\"ok\""), false)
+
+        let expired = parseServicePluginJobEventPayload(
+            "gitcode.monitor.scan_failed",
+            "{\"ok\":false,\"status\":\"expired\",\"jobId\":\"gcm-scan-expired-1\",\"stage\":\"scan_runtime\",\"retryable\":false,\"diagnostic\":\"{\\\"repo\\\":\\\"cangjie/community\\\",\\\"eventId\\\":\\\"gitcode:cangjie/community:issue:42\\\",\\\"errorKind\\\":\\\"scan_timeout\\\",\\\"message\\\":\\\"request exceeded max duration token=secret\\\"}\"}"
+        )
+        @Expect(expired.ok, true)
+        let expiredText = renderServicePluginJobEventMessage(expired.payload)
+        @Expect(expiredText.contains("status=job_timeout"), true)
+        @Expect(expiredText.contains("诊断:"), true)
+        @Expect(expiredText.contains("repo=cangjie/community"), true)
+        @Expect(expiredText.contains("eventId=gitcode:cangjie/community:issue:42"), true)
+        @Expect(expiredText.contains("request exceeded max duration"), true)
+        @Expect(expiredText.contains("token=secret"), false)
+        @Expect(expiredText.contains("{"), false)
+        @Expect(expiredText.contains("\"repo\""), false)
+
+        let noDiagnostic = parseServicePluginJobEventPayload("gitcode.monitor.scan_failed", "{\"ok\":false,\"status\":\"failed\",\"jobId\":\"gcm-scan-failed-2\",\"stage\":\"scan_runtime\",\"errorKind\":\"gitcode_timeout\",\"retryable\":true}")
+        @Expect(noDiagnostic.ok, true)
+        @Expect(renderServicePluginJobEventMessage(noDiagnostic.payload), "GitCode 扫描失败：status=gitcode_timeout stage=scan_runtime retryable=true。可稍后重试。")
+    }
+
+    @TestCase
     public func completedScanReportRendersDuplicateSamplesDryRunAndNoRawJson(): Unit {
         let payload = "{\"ok\":true,\"status\":\"completed\",\"jobId\":\"gcm-scan-1\",\"accepted\":0,\"ignored\":0,\"emitted\":0,\"durationMs\":28800,\"stateSaved\":true,\"report\":{\"orgs\":[\"cangjie\",\"cangjie-sig\"],\"stopReason\":\"completed\",\"limits\":{\"maxRepos\":1,\"maxItems\":30,\"timeoutMillis\":60000},\"scannedRepos\":1,\"checkedItems\":31,\"newEvents\":0,\"duplicateEvents\":31,\"filteredEvents\":0,\"failedEvents\":0,\"draftsGenerated\":0,\"draftsFailed\":0,\"notificationsSent\":0,\"writes\":0,\"writeMode\":\"dry_run\",\"samples\":{\"duplicate\":[{\"repo\":\"cangjie/community\",\"kind\":\"pr\",\"number\":70,\"reason\":\"seen\"},{\"repo\":\"cangjie/community\",\"kind\":\"pr\",\"number\":69,\"reason\":\"seen\"}]}}}"
         let parsed = parseServicePluginJobEventPayload("gitcode.monitor.scan_completed", payload)

@@ -2,6 +2,7 @@ package metis.gateway.service_plugin
 
 import std.collection.ArrayList
 import std.convert.Parsable
+import std.regex.{Regex, RegexFlag}
 import stdx.encoding.json.{JsonArray, JsonBool, JsonObject, JsonString, JsonValue}
 
 public class ServicePluginDeliveryTarget {
@@ -453,9 +454,76 @@ public func renderServicePluginJobEventMessage(event: ServicePluginJobEventPaylo
     if (status == "failed" || status == "expired") {
         let kind = if (event.errorKind.isEmpty()) { if (status == "expired") { "job_timeout" } else { "job_failed" } } else { event.errorKind }
         let stage = if (event.stage.isEmpty()) { "" } else { " stage=${event.stage}" }
-        return redactServicePayload("GitCode 扫描失败：status=${kind}${stage} retryable=${event.retryable}。可稍后重试。").text
+        var text = "GitCode 扫描失败：status=${kind}${stage} retryable=${event.retryable}。可稍后重试。"
+        let diagnostic = renderServicePluginJobDiagnosticLine(event.diagnostic)
+        if (!diagnostic.isEmpty()) {
+            text += "\n${diagnostic}"
+        }
+        return redactServicePayload(text).text
     }
     "GitCode 扫描状态：status=${status} stage=${event.stage} scanId=${event.jobId}"
+}
+
+private func renderServicePluginJobDiagnosticLine(raw: String): String {
+    let trimmed = raw.trimAscii()
+    if (trimmed.isEmpty()) {
+        return ""
+    }
+    let structured = renderServicePluginJobDiagnosticObject(trimmed)
+    let text = if (structured.isEmpty()) { sanitizeServicePluginJobDiagnostic(trimmed) } else { structured }
+    if (text.isEmpty()) {
+        return ""
+    }
+    "诊断: ${text}"
+}
+
+private func renderServicePluginJobDiagnosticObject(raw: String): String {
+    let root = match (jobParseObject(raw)) {
+        case Some(obj) => obj
+        case None => return ""
+    }
+    let parts = ArrayList<String>()
+    addServicePluginJobDiagnosticPart(parts, "repo", jobOptionalAnyString(root, "repo"))
+    addServicePluginJobDiagnosticPart(parts, "eventId", jobOptionalAnyString(root, "eventId"))
+    addServicePluginJobDiagnosticPart(parts, "kind", jobOptionalAnyString(root, "kind"))
+    addServicePluginJobDiagnosticPart(parts, "item", jobOptionalAnyString(root, "item"))
+    addServicePluginJobDiagnosticPart(parts, "itemId", jobOptionalAnyString(root, "itemId"))
+    addServicePluginJobDiagnosticPart(parts, "stage", jobOptionalAnyString(root, "stage"))
+    addServicePluginJobDiagnosticPart(parts, "errorKind", jobOptionalAnyString(root, "errorKind"))
+    addServicePluginJobDiagnosticPart(parts, "errorHash", jobOptionalAnyString(root, "errorHash"))
+    addServicePluginJobDiagnosticPart(parts, "exception", jobOptionalAnyString(root, "exception"))
+    addServicePluginJobDiagnosticPart(parts, "exceptionHash", jobOptionalAnyString(root, "exceptionHash"))
+    addServicePluginJobDiagnosticPart(parts, "message", jobOptionalAnyString(root, "message"))
+    String.join(parts.toArray(), delimiter: " ")
+}
+
+private func addServicePluginJobDiagnosticPart(parts: ArrayList<String>, key: String, raw: String): Unit {
+    let value = sanitizeServicePluginJobDiagnostic(raw)
+    if (!value.isEmpty()) {
+        parts.add("${key}=${value}")
+    }
+}
+
+private func sanitizeServicePluginJobDiagnostic(raw: String): String {
+    var out = raw.replace("\n", " ").replace("\r", " ").trimAscii()
+    if (out.isEmpty()) {
+        return ""
+    }
+    out = servicePluginJobRegexReplace(out, "Authorization\\s*[:=]\\s*Bearer\\s+[^\\s,;\\}\\]]+", "credential=[REDACTED]")
+    out = servicePluginJobRegexReplace(out, "Authorization\\s*[:=]\\s*[^\\s,;\\}\\]]+", "credential=[REDACTED]")
+    out = servicePluginJobRegexReplace(out, "Bearer\\s+[^\\s,;\\}\\]]+", "credential=[REDACTED]")
+    out = servicePluginJobRegexReplace(out, "(access[_-]?token|token|cookie|password|private-token|app[_-]?secret)\\s*[:=]\\s*[^\\s,;\\}\\]]+", "credential=[REDACTED]")
+    out = servicePluginJobRegexReplace(out, "(/Users|/home)/[^\\s,;\\}\\]]+", "[LOCAL_PATH]")
+    out = servicePluginJobRegexReplace(out, "C:\\\\[^\\s,;\\}\\]]+", "[LOCAL_PATH]")
+    redactServicePayload(out, policy: RedactionPolicy(maxPayloadBytes: 600)).text
+}
+
+private func servicePluginJobRegexReplace(text: String, pattern: String, replacement: String): String {
+    try {
+        Regex(pattern, [RegexFlag.IgnoreCase]).replaceAll(text, replacement)
+    } catch (_: Exception) {
+        text
+    }
 }
 
 public func renderServicePluginScanCompletedMessage(event: ServicePluginJobEventPayload): String {
