@@ -150,6 +150,12 @@ public class ServicePluginScanReportPayload {
     public let duplicateEvents: Int64
     public let filteredEvents: Int64
     public let failedEvents: Int64
+    public let baselineEnabled: Bool
+    public let baselineCreatedScopes: Int64
+    public let baselineSeededEvents: Int64
+    public let backfillEvents: Int64
+    public let baselineBackfill: Bool
+    public let baselineStatus: String
     public let draftsGenerated: Int64
     public let draftsFailed: Int64
     public let notificationsSent: Int64
@@ -159,6 +165,7 @@ public class ServicePluginScanReportPayload {
     public let samplesDuplicate: Array<ServicePluginScanEventSummary>
     public let samplesFiltered: Array<ServicePluginScanEventSummary>
     public let samplesFailed: Array<ServicePluginScanEventSummary>
+    public let samplesBaseline: Array<ServicePluginScanEventSummary>
 
     public init(
         orgs!: Array<String> = [],
@@ -172,6 +179,12 @@ public class ServicePluginScanReportPayload {
         duplicateEvents!: Int64 = 0,
         filteredEvents!: Int64 = 0,
         failedEvents!: Int64 = 0,
+        baselineEnabled!: Bool = false,
+        baselineCreatedScopes!: Int64 = 0,
+        baselineSeededEvents!: Int64 = 0,
+        backfillEvents!: Int64 = 0,
+        baselineBackfill!: Bool = false,
+        baselineStatus!: String = "",
         draftsGenerated!: Int64 = 0,
         draftsFailed!: Int64 = 0,
         notificationsSent!: Int64 = 0,
@@ -180,7 +193,8 @@ public class ServicePluginScanReportPayload {
         samplesNew!: Array<ServicePluginScanEventSummary> = [],
         samplesDuplicate!: Array<ServicePluginScanEventSummary> = [],
         samplesFiltered!: Array<ServicePluginScanEventSummary> = [],
-        samplesFailed!: Array<ServicePluginScanEventSummary> = []
+        samplesFailed!: Array<ServicePluginScanEventSummary> = [],
+        samplesBaseline!: Array<ServicePluginScanEventSummary> = []
     ) {
         this.orgs = orgs
         this.maxRepos = jobBoundNonNegative(maxRepos)
@@ -193,6 +207,12 @@ public class ServicePluginScanReportPayload {
         this.duplicateEvents = jobBoundNonNegative(duplicateEvents)
         this.filteredEvents = jobBoundNonNegative(filteredEvents)
         this.failedEvents = jobBoundNonNegative(failedEvents)
+        this.baselineEnabled = baselineEnabled
+        this.baselineCreatedScopes = jobBoundNonNegative(baselineCreatedScopes)
+        this.baselineSeededEvents = jobBoundNonNegative(baselineSeededEvents)
+        this.backfillEvents = jobBoundNonNegative(backfillEvents)
+        this.baselineBackfill = baselineBackfill
+        this.baselineStatus = scanReportSafeField(baselineStatus, maxRunes: 80).toAsciiLower()
         this.draftsGenerated = jobBoundNonNegative(draftsGenerated)
         this.draftsFailed = jobBoundNonNegative(draftsFailed)
         this.notificationsSent = jobBoundNonNegative(notificationsSent)
@@ -202,6 +222,7 @@ public class ServicePluginScanReportPayload {
         this.samplesDuplicate = samplesDuplicate
         this.samplesFiltered = samplesFiltered
         this.samplesFailed = samplesFailed
+        this.samplesBaseline = samplesBaseline
     }
 }
 
@@ -502,6 +523,11 @@ private func parseServicePluginScanReport(root: JsonObject): Option<ServicePlugi
     let diagnostics = ArrayList<String>()
     let limits = jobOptionalObjectLenient(reportRoot, "limits")
     let samples = jobOptionalObjectLenient(reportRoot, "samples")
+    let baseline = jobOptionalObjectLenient(reportRoot, "baseline")
+    let baselineDiagnostics = ArrayList<String>()
+    let baselineCreatedScopes = jobOptionalInt(baseline, "createdScopes", jobOptionalInt(reportRoot, "baselineScopesCreated", 0, baselineDiagnostics), baselineDiagnostics)
+    let baselineSeededEvents = jobOptionalInt(baseline, "seededEvents", jobOptionalInt(reportRoot, "baselineSeededEvents", 0, baselineDiagnostics), baselineDiagnostics)
+    let backfillEvents = jobOptionalInt(baseline, "backfillEvents", jobOptionalInt(reportRoot, "backfillEvents", 0, baselineDiagnostics), baselineDiagnostics)
     Some(ServicePluginScanReportPayload(
         orgs: jobOptionalStringArray(reportRoot, "orgs"),
         maxRepos: jobOptionalInt(limits, "maxRepos", 0, diagnostics),
@@ -514,6 +540,12 @@ private func parseServicePluginScanReport(root: JsonObject): Option<ServicePlugi
         duplicateEvents: jobOptionalInt(reportRoot, "duplicateEvents", 0, diagnostics),
         filteredEvents: jobOptionalInt(reportRoot, "filteredEvents", 0, diagnostics),
         failedEvents: jobOptionalInt(reportRoot, "failedEvents", 0, diagnostics),
+        baselineEnabled: jobOptionalBool(baseline, "enabled", false, baselineDiagnostics),
+        baselineCreatedScopes: baselineCreatedScopes,
+        baselineSeededEvents: baselineSeededEvents,
+        backfillEvents: backfillEvents,
+        baselineBackfill: jobOptionalBool(baseline, "backfill", false, baselineDiagnostics),
+        baselineStatus: jobOptionalAnyString(baseline, "status"),
         draftsGenerated: jobOptionalInt(reportRoot, "draftsGenerated", 0, diagnostics),
         draftsFailed: jobOptionalInt(reportRoot, "draftsFailed", 0, diagnostics),
         notificationsSent: jobOptionalInt(reportRoot, "notificationsSent", 0, diagnostics),
@@ -522,7 +554,8 @@ private func parseServicePluginScanReport(root: JsonObject): Option<ServicePlugi
         samplesNew: parseServicePluginScanEventSamples(samples, "new"),
         samplesDuplicate: parseServicePluginScanEventSamples(samples, "duplicate"),
         samplesFiltered: parseServicePluginScanEventSamples(samples, "filtered"),
-        samplesFailed: parseServicePluginScanEventSamples(samples, "failed")
+        samplesFailed: parseServicePluginScanEventSamples(samples, "failed"),
+        samplesBaseline: parseServicePluginScanEventSamples(samples, "baseline")
     ))
 }
 
@@ -571,16 +604,64 @@ private func renderServicePluginScanReportSummary(event: ServicePluginJobEventPa
     if (!stopReason.isEmpty()) {
         text += "${stopReason}\n"
     }
+    let mode = renderServicePluginBaselineModeLine(report)
+    if (!mode.isEmpty()) {
+        text += "模式: ${mode}\n"
+    }
     text += "扫描: 仓库 ${report.scannedRepos} 个，候选 PR/Issue/comment ${report.checkedItems} 条\n"
-    text += "结果: 新增 ${report.newEvents} 条，重复 ${report.duplicateEvents} 条，过滤 ${report.filteredEvents} 条，失败 ${report.failedEvents} 条\n"
+    text += "结果: ${renderServicePluginScanResultLine(report)}\n"
+    let warning = renderServicePluginBaselineWarningLine(report)
+    if (!warning.isEmpty()) {
+        text += "警告: ${warning}\n"
+    }
     text += "回复: ${renderServicePluginScanReplyLine(report)}\n"
     text += "通知: ${renderServicePluginScanNotificationLine(report)}\n"
     text += "写回: ${renderServicePluginScanWriteLine(report)}"
     text += renderServicePluginSampleSection("新增事件", report.samplesNew, report.newEvents, true)
     text += renderServicePluginSampleSection("最近重复事件", report.samplesDuplicate, report.duplicateEvents, false)
+    text += renderServicePluginSampleSection("基线历史事件样例", report.samplesBaseline, report.baselineSeededEvents, false)
     text += renderServicePluginSampleSection("过滤事件样例", report.samplesFiltered, report.filteredEvents, false)
     text += renderServicePluginSampleSection("失败事件样例", report.samplesFailed, report.failedEvents, false)
     text
+}
+
+private func renderServicePluginBaselineModeLine(report: ServicePluginScanReportPayload): String {
+    if (!report.baselineEnabled && report.baselineCreatedScopes == 0 && report.baselineSeededEvents == 0 && report.backfillEvents == 0 && report.baselineStatus.isEmpty()) {
+        return ""
+    }
+    match (report.baselineStatus) {
+        case "created" => "首次基线"
+        case "partial" => "首次基线未完成"
+        case "state_save_failed" => "首次基线保存失败"
+        case "existing" => "增量扫描"
+        case "backfill" => "历史回填"
+        case _ =>
+            if (report.baselineCreatedScopes > 0 || report.baselineSeededEvents > 0) {
+                return if (report.failedEvents > 0) { "首次基线未完成" } else { "首次基线" }
+            }
+            if (report.baselineEnabled) { "增量扫描" } else { "" }
+    }
+}
+
+private func renderServicePluginScanResultLine(report: ServicePluginScanReportPayload): String {
+    let mode = renderServicePluginBaselineModeLine(report)
+    if (mode == "首次基线" || mode == "首次基线保存失败") {
+        return "建立基线 ${report.baselineCreatedScopes} 个仓库，标记历史事件 ${report.baselineSeededEvents} 条"
+    }
+    if (mode == "首次基线未完成") {
+        return "建立基线 ${report.baselineCreatedScopes} 个仓库，标记历史事件 ${report.baselineSeededEvents} 条，失败 ${report.failedEvents} 条"
+    }
+    "新增 ${report.newEvents} 条，重复 ${report.duplicateEvents} 条，过滤 ${report.filteredEvents} 条，失败 ${report.failedEvents} 条"
+}
+
+private func renderServicePluginBaselineWarningLine(report: ServicePluginScanReportPayload): String {
+    if (report.baselineStatus == "state_save_failed") {
+        return "基线状态保存失败，本次基线不能视为已生效。"
+    }
+    if (report.baselineStatus == "partial" || ((report.baselineCreatedScopes > 0 || report.baselineSeededEvents > 0) && report.failedEvents > 0)) {
+        return "基线只完成部分仓库，未完成的仓库不会被视为已建立基线。"
+    }
+    ""
 }
 
 private func renderServicePluginScanScope(report: ServicePluginScanReportPayload): String {
@@ -618,6 +699,10 @@ private func renderServicePluginScanStopReason(report: ServicePluginScanReportPa
 }
 
 private func renderServicePluginScanReplyLine(report: ServicePluginScanReportPayload): String {
+    let mode = renderServicePluginBaselineModeLine(report)
+    if (mode == "首次基线" || mode == "首次基线未完成" || mode == "首次基线保存失败") {
+        return "本次只建立基线，不对历史 PR/Issue/comment 生成回复。后续新增事件会生成回复草稿。"
+    }
     if (report.newEvents == 0) {
         return "本次没有新增未处理事件，因此未生成新回复。"
     }
@@ -749,6 +834,9 @@ private func sampleSectionItemName(title: String): String {
     }
     if (title.contains("过滤")) {
         return "过滤事件"
+    }
+    if (title.contains("基线")) {
+        return "基线历史事件"
     }
     "失败事件"
 }

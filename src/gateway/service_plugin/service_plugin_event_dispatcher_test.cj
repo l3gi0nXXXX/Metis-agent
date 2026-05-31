@@ -126,6 +126,37 @@ public class ServicePluginEventDispatcherTest {
     }
 
     @TestCase
+    public func baselineOnlyCompletedEventDoesNotTriggerGeneratedReply(): Unit {
+        let messages = ArrayList<String>()
+        let generatedCalls = ArrayList<String>()
+        setServicePluginEventDeliveryForTest(Some({ _target: ServicePluginDeliveryTarget, text: String =>
+            messages.add(text)
+            ServicePluginEventDeliveryResult(true, "sent")
+        }))
+        setServicePluginGeneratedReplyHandlerForTest(Some({ _job: ServicePluginPendingJob, _event: ServicePluginAcceptedGitCodeEvent =>
+            generatedCalls.add("called")
+            ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "should not be generated")
+        }))
+        resetServicePluginGeneratedReplyStateForTest()
+        try {
+            let store = this.storeWithRunningJob(jobId: "baseline-only")
+            let completed = ServiceFrame("event", "baseline-completed", "gitcode-monitor", method: "emitCapabilityEvent", capabilityId: "gitcode.monitor.scan_completed", payload: "{\"ok\":true,\"status\":\"completed\",\"jobId\":\"baseline-only\",\"accepted\":0,\"ignored\":31,\"emitted\":0,\"durationMs\":1200,\"stateSaved\":true,\"report\":{\"scannedRepos\":2,\"checkedItems\":31,\"newEvents\":0,\"duplicateEvents\":0,\"filteredEvents\":0,\"failedEvents\":0,\"draftsGenerated\":0,\"draftsFailed\":0,\"notificationsSent\":0,\"writes\":0,\"writeMode\":\"dry_run\",\"baseline\":{\"enabled\":true,\"createdScopes\":2,\"seededEvents\":31,\"backfill\":false,\"status\":\"created\"}}}")
+            let result = dispatchServicePluginEvent(completed, store: store)
+            @Expect(result.ok, true)
+            @Expect(result.status, "completed_delivered")
+            @Expect(generatedCalls.size, 0)
+            @Expect(messages.size, 1)
+            @Expect(messages[0].contains("模式: 首次基线"), true)
+            @Expect(messages[0].contains("GitCode 回复草稿"), false)
+            @Expect(messages[0].contains("回复草稿状态"), false)
+        } finally {
+            setServicePluginEventDeliveryForTest(None)
+            setServicePluginGeneratedReplyHandlerForTest(None<(ServicePluginPendingJob, ServicePluginAcceptedGitCodeEvent) -> ServicePluginGeneratedReplyResult>)
+            resetServicePluginGeneratedReplyStateForTest()
+        }
+    }
+
+    @TestCase
     public func acceptedGitCodeEventSendsDegradedNotificationWhenDraftFails(): Unit {
         let messages = ArrayList<String>()
         setServicePluginEventDeliveryForTest(Some({ _target: ServicePluginDeliveryTarget, text: String =>

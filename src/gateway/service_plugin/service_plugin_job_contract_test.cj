@@ -109,6 +109,62 @@ public class ServicePluginJobContractTest {
     }
 
     @TestCase
+    public func completedScanReportRendersCreatedBaselineWithoutClaimingReplies(): Unit {
+        let payload = "{\"ok\":true,\"status\":\"completed\",\"jobId\":\"gcm-baseline-1\",\"accepted\":0,\"ignored\":31,\"emitted\":0,\"durationMs\":2400,\"stateSaved\":true,\"report\":{\"orgs\":[\"cangjie\"],\"stopReason\":\"completed\",\"limits\":{\"maxRepos\":2,\"maxItems\":0},\"scannedRepos\":2,\"checkedItems\":31,\"newEvents\":0,\"duplicateEvents\":0,\"filteredEvents\":0,\"failedEvents\":0,\"draftsGenerated\":0,\"draftsFailed\":0,\"notificationsSent\":0,\"writes\":0,\"writeMode\":\"dry_run\",\"baseline\":{\"enabled\":true,\"createdScopes\":2,\"seededEvents\":31,\"backfill\":false,\"status\":\"created\"},\"baselineSeededEvents\":31,\"baselineScopesCreated\":2,\"samples\":{\"baseline\":[{\"repo\":\"cangjie/community\",\"kind\":\"pr\",\"number\":70,\"reason\":\"baseline_seeded\"}]}}}"
+        let parsed = parseServicePluginJobEventPayload("gitcode.monitor.scan_completed", payload)
+        @Expect(parsed.ok, true)
+        let text = renderServicePluginJobEventMessage(parsed.payload)
+        @Expect(text.contains("GitCode 扫描完成"), true)
+        @Expect(text.contains("模式: 首次基线"), true)
+        @Expect(text.contains("结果: 建立基线 2 个仓库，标记历史事件 31 条"), true)
+        @Expect(text.contains("本次只建立基线，不对历史 PR/Issue/comment 生成回复。后续新增事件会生成回复草稿。"), true)
+        @Expect(text.contains("新增事件:"), false)
+        @Expect(text.contains("\"baseline\""), false)
+        @Expect(text.contains("\"createdScopes\""), false)
+    }
+
+    @TestCase
+    public func completedScanReportRendersExistingBaselineNoNewEventsAsIncremental(): Unit {
+        let payload = "{\"ok\":true,\"status\":\"completed\",\"jobId\":\"gcm-baseline-2\",\"accepted\":0,\"ignored\":12,\"emitted\":0,\"durationMs\":1800,\"stateSaved\":true,\"report\":{\"orgs\":[\"cangjie\"],\"scannedRepos\":3,\"checkedItems\":18,\"newEvents\":0,\"duplicateEvents\":12,\"filteredEvents\":5,\"failedEvents\":1,\"draftsGenerated\":0,\"draftsFailed\":0,\"notificationsSent\":0,\"writes\":0,\"writeMode\":\"dry_run\",\"baseline\":{\"enabled\":true,\"createdScopes\":0,\"seededEvents\":0,\"backfill\":false,\"status\":\"existing\"},\"samples\":{\"duplicate\":[{\"repo\":\"cangjie/community\",\"kind\":\"issue\",\"number\":11,\"reason\":\"seen\"}],\"filtered\":[{\"repo\":\"cangjie/community\",\"kind\":\"pr\",\"number\":12,\"reason\":\"author_allowlist\"}],\"failed\":[{\"repo\":\"cangjie/community\",\"kind\":\"comment\",\"number\":12,\"commentId\":55,\"reason\":\"parse_failed\"}]}}}"
+        let parsed = parseServicePluginJobEventPayload("gitcode.monitor.scan_completed", payload)
+        @Expect(parsed.ok, true)
+        let text = renderServicePluginJobEventMessage(parsed.payload)
+        @Expect(text.contains("模式: 增量扫描"), true)
+        @Expect(text.contains("结果: 新增 0 条，重复 12 条，过滤 5 条，失败 1 条"), true)
+        @Expect(text.contains("本次没有新增未处理事件，因此未生成新回复"), true)
+        @Expect(text.contains("最近重复事件:"), true)
+        @Expect(text.contains("过滤事件样例:"), true)
+        @Expect(text.contains("失败事件样例:"), true)
+        @Expect(text.contains("{"), false)
+    }
+
+    @TestCase
+    public func completedScanReportWarnsForPartialFailedAndMalformedBaseline(): Unit {
+        let partial = parseServicePluginJobEventPayload("gitcode.monitor.scan_completed", "{\"ok\":true,\"status\":\"completed\",\"jobId\":\"gcm-baseline-3\",\"report\":{\"scannedRepos\":2,\"checkedItems\":20,\"newEvents\":0,\"duplicateEvents\":0,\"filteredEvents\":0,\"failedEvents\":2,\"writeMode\":\"dry_run\",\"baseline\":{\"enabled\":true,\"createdScopes\":1,\"seededEvents\":10,\"backfill\":false,\"status\":\"partial\"}}}")
+        @Expect(partial.ok, true)
+        let partialText = renderServicePluginJobEventMessage(partial.payload)
+        @Expect(partialText.contains("模式: 首次基线未完成"), true)
+        @Expect(partialText.contains("警告: 基线只完成部分仓库，未完成的仓库不会被视为已建立基线。"), true)
+        @Expect(partialText.contains("建立基线 2 个仓库"), false)
+
+        let failed = parseServicePluginJobEventPayload("gitcode.monitor.scan_completed", "{\"ok\":true,\"status\":\"completed\",\"jobId\":\"gcm-baseline-4\",\"diagnostic\":\"token=secret /Users/name/private\",\"report\":{\"scannedRepos\":1,\"checkedItems\":3,\"newEvents\":0,\"failedEvents\":3,\"writeMode\":\"dry_run\",\"baseline\":{\"enabled\":true,\"createdScopes\":0,\"seededEvents\":3,\"backfill\":false,\"status\":\"state_save_failed\"}}}")
+        @Expect(failed.ok, true)
+        let failedText = renderServicePluginJobEventMessage(failed.payload)
+        @Expect(failedText.contains("警告: 基线状态保存失败，本次基线不能视为已生效。"), true)
+        @Expect(failedText.contains("secret"), false)
+        @Expect(failedText.contains("/Users/"), false)
+        @Expect(failedText.contains("\"status\""), false)
+
+        let malformed = parseServicePluginJobEventPayload("gitcode.monitor.scan_completed", "{\"ok\":true,\"status\":\"completed\",\"jobId\":\"gcm-baseline-5\",\"report\":{\"scannedRepos\":1,\"checkedItems\":2,\"newEvents\":0,\"duplicateEvents\":0,\"filteredEvents\":0,\"failedEvents\":0,\"baseline\":{\"enabled\":\"yes\",\"createdScopes\":\"/Users/name/private\",\"seededEvents\":{\"bad\":true},\"backfill\":\"no\",\"status\":42},\"baselineSeededEvents\":\"token=hidden\",\"baselineScopesCreated\":[],\"backfillEvents\":\"bad\",\"samples\":{\"baseline\":\"bad\"}}}")
+        @Expect(malformed.ok, true)
+        let malformedText = renderServicePluginJobEventMessage(malformed.payload)
+        @Expect(malformedText.contains("GitCode 扫描完成"), true)
+        @Expect(malformedText.contains("token=hidden"), false)
+        @Expect(malformedText.contains("/Users/"), false)
+        @Expect(malformedText.contains("\"bad\""), false)
+    }
+
+    @TestCase
     public func completedScanReportRendersOnlyExplicitStopReasons(): Unit {
         let completed = parseServicePluginJobEventPayload("gitcode.monitor.scan_completed", "{\"ok\":true,\"status\":\"completed\",\"jobId\":\"gcm-scan-stop-0\",\"report\":{\"orgs\":[\"cangjie\"],\"stopReason\":\"completed\",\"limits\":{\"maxRepos\":0,\"maxItems\":0,\"timeoutMillis\":30000},\"scannedRepos\":6,\"checkedItems\":36,\"newEvents\":0,\"writeMode\":\"dry_run\"}}")
         @Expect(completed.ok, true)
