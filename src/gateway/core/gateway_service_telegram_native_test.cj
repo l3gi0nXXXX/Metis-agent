@@ -338,7 +338,14 @@ private func gatewayTelegramNativeGitcodePluginSettings(accountId: String): Gate
             "\"configSchema\":{}," +
             "\"capabilityDeclarations\":[" +
             "{\"capabilityId\":\"gitcode.monitor.status\",\"kind\":\"controlAction\"}," +
-            "{\"capabilityId\":\"gitcode.monitor.scan_once\",\"kind\":\"controlAction\"}" +
+            "{\"capabilityId\":\"gitcode.monitor.scan_once\",\"kind\":\"controlAction\"}," +
+            "{\"capabilityId\":\"gitcode.webhook.status\",\"kind\":\"controlAction\"}," +
+            "{\"capabilityId\":\"gitcode.webhook.dead_letter_list\",\"kind\":\"controlAction\"}," +
+            "{\"capabilityId\":\"gitcode.webhook.dead_letter_inspect\",\"kind\":\"controlAction\"}," +
+            "{\"capabilityId\":\"gitcode.webhook.replay\",\"kind\":\"controlAction\"}," +
+            "{\"capabilityId\":\"gitcode.webhook.cancel\",\"kind\":\"controlAction\"}," +
+            "{\"capabilityId\":\"gitcode.webhook.reconcile_hooks\",\"kind\":\"controlAction\"}," +
+            "{\"capabilityId\":\"gitcode.webhook.reconcile_events\",\"kind\":\"controlAction\"}" +
             "]}"
         ).toArray()
     )
@@ -568,7 +575,95 @@ public class GatewayServiceTelegramNativeTest {
     }
 
     @TestCase
-    public func telegramGitcodeScanOnceStartsAsyncJobWithUnboundedDefaultsAndExplicitLimits(): Unit {
+    public func telegramGitcodeWebhookOperationsInvokePlannedGcmCapabilities(): Unit {
+        withGatewayTelegramNativeTestHome {
+            let modelName = "metis-test-telegram-gitcode-webhook-${DateTime.now().toUnixTimeStamp().toMilliseconds()}"
+            ModelManager.registerChatModel(modelName, { => GatewayTelegramNativeFakeModel() })
+            let oldModel = CliConfig.model
+            CliConfig.model = modelName
+            let adapter = GatewayTelegramNativeTestAdapter()
+            let service = gatewayTelegramNativeServiceForAccount(adapter, "tg-gitcode-monitor")
+            try {
+                var user = GatewayUserSettings()
+                user.telegram.enabled = true
+                user.telegram.allowFrom = ["*"]
+                user.servicePlugins = [gatewayTelegramNativeGitcodePluginSettings("tg-gitcode-monitor")]
+                CliSettingManager.writeGatewaySettings(user)
+                let capabilityIds = ArrayList<String>()
+                let payloads = ArrayList<String>()
+                setServicePluginCapabilityInvokerForTest(Some({ _registration: ServicePluginRegistration, request: CapabilityInvokeRequest =>
+                    capabilityIds.add(request.capabilityId)
+                    payloads.add(request.payload)
+                    match (request.capabilityId) {
+                        case "gitcode.webhook.status" =>
+                            CapabilityInvokeResult(true, "ok", serviceId: "gitcode-monitor", capabilityId: request.capabilityId, payload: "{\"status\":\"running\",\"queue\":{\"pending\":1,\"processing\":0,\"deadLetter\":0}}")
+                        case "gitcode.webhook.dead_letter_list" =>
+                            CapabilityInvokeResult(true, "ok", serviceId: "gitcode-monitor", capabilityId: request.capabilityId, payload: "{\"items\":[{\"deliveryId\":\"d1\",\"repo\":\"Cangjie/stdx\",\"kind\":\"issue\",\"stage\":\"parse\",\"errorKind\":\"payload_invalid\",\"retryable\":false,\"payloadHash\":\"sha256:abc\"}]}")
+                        case "gitcode.webhook.dead_letter_inspect" =>
+                            CapabilityInvokeResult(true, "ok", serviceId: "gitcode-monitor", capabilityId: request.capabilityId, payload: "{\"deliveryId\":\"d1\",\"repo\":\"Cangjie/stdx\",\"summary\":\"payload dropped\",\"suggestion\":\"replay\"}")
+                        case "gitcode.webhook.replay" =>
+                            CapabilityInvokeResult(true, "ok", serviceId: "gitcode-monitor", capabilityId: request.capabilityId, payload: "{\"accepted\":true,\"deliveryId\":\"d1\",\"fromStatus\":\"dead-letter\",\"toStatus\":\"pending\"}")
+                        case "gitcode.webhook.cancel" =>
+                            CapabilityInvokeResult(true, "ok", serviceId: "gitcode-monitor", capabilityId: request.capabilityId, payload: "{\"cancelled\":true,\"deliveryId\":\"d2\",\"fromStatus\":\"pending\",\"toStatus\":\"cancelled\"}")
+                        case "gitcode.webhook.reconcile_hooks" =>
+                            CapabilityInvokeResult(true, "ok", serviceId: "gitcode-monitor", capabilityId: request.capabilityId, payload: "{\"apply\":true,\"summary\":{\"aligned\":1,\"missing\":0,\"drifted\":0,\"failed\":0}}")
+                        case "gitcode.webhook.reconcile_events" =>
+                            let root = JsonValue.fromStr(request.payload).asObject()
+                            @Expect(root.get("mode").getOrThrow().asString().getValue(), "async")
+                            let jobId = root.get("jobId").getOrThrow().asString().getValue()
+                            CapabilityInvokeResult(true, "accepted", serviceId: "gitcode-monitor", capabilityId: request.capabilityId, payload: "{\"ok\":true,\"status\":\"accepted\",\"mode\":\"async\",\"jobId\":\"${jobId}\",\"alreadyRunning\":false}")
+                        case _ =>
+                            CapabilityInvokeResult(false, "unexpected_invocation", serviceId: "gitcode-monitor", capabilityId: request.capabilityId)
+                    }
+                }))
+
+                service.start()
+                adapter.queue("/gitcode webhook status")
+                service.processOnce()
+                adapter.queue("/gitcode webhook dead-letter list")
+                service.processOnce()
+                adapter.queue("/gitcode webhook dead-letter inspect d1")
+                service.processOnce()
+                adapter.queue("/gitcode webhook replay d1")
+                service.processOnce()
+                adapter.queue("/gitcode webhook cancel d2")
+                service.processOnce()
+                adapter.queue("/gitcode reconcile hooks --apply")
+                service.processOnce()
+                adapter.queue("/gitcode reconcile once --lookback-hours 3 --max-repos 1 --max-items 2")
+                service.processOnce()
+
+                @Expect(capabilityIds.toArray(), [
+                    "gitcode.webhook.status",
+                    "gitcode.webhook.dead_letter_list",
+                    "gitcode.webhook.dead_letter_inspect",
+                    "gitcode.webhook.replay",
+                    "gitcode.webhook.cancel",
+                    "gitcode.webhook.reconcile_hooks",
+                    "gitcode.webhook.reconcile_events"
+                ])
+                @Expect(adapter.sentText(0).contains("GitCode Webhook 状态"), true)
+                @Expect(adapter.sentText(1).contains("dead-letter"), true)
+                @Expect(adapter.sentText(2).contains("deliveryId=d1"), true)
+                @Expect(adapter.sentText(3).contains("deliveryId=d1"), true)
+                @Expect(adapter.sentText(4).contains("deliveryId=d2"), true)
+                @Expect(adapter.sentText(5).contains("hook reconcile"), true)
+                @Expect(adapter.sentText(6).contains("GitCode webhook-first reconcile 已启动"), true)
+                @Expect(adapter.sentText(6).contains("scanId=gcm-scan-"), true)
+                for (payload in payloads) {
+                    @Expect(payload.contains("token"), false)
+                    @Expect(payload.contains("Authorization"), false)
+                }
+            } finally {
+                setServicePluginCapabilityInvokerForTest(None)
+                service.stop()
+                CliConfig.model = oldModel
+            }
+        }
+    }
+
+    @TestCase
+    public func telegramGitcodeScanOnceUsesWebhookReconcileAliasWithRedactedPayload(): Unit {
         withGatewayTelegramNativeTestHome {
             let modelName = "metis-test-telegram-gitcode-scan-${DateTime.now().toUnixTimeStamp().toMilliseconds()}"
             ModelManager.registerChatModel(modelName, { => GatewayTelegramNativeFakeModel() })
@@ -586,8 +681,8 @@ public class GatewayServiceTelegramNativeTest {
                 let payloads = ArrayList<String>()
                 setServicePluginCapabilityInvokerForTest(Some({ _registration: ServicePluginRegistration, request: CapabilityInvokeRequest =>
                     payloads.add(request.payload)
-                    @Expect(request.capabilityId, "gitcode.monitor.scan_once")
-                    @Expect(request.timeoutMillis <= 5000, true)
+                    @Expect(request.capabilityId, "gitcode.webhook.reconcile_events")
+                    @Expect(request.timeoutMillis <= 60000, true)
                     let root = JsonValue.fromStr(request.payload).asObject()
                     @Expect(root.get("mode").getOrThrow().asString().getValue(), "async")
                     let jobId = root.get("jobId").getOrThrow().asString().getValue()
@@ -601,22 +696,21 @@ public class GatewayServiceTelegramNativeTest {
                 service.processOnce()
 
                 @Expect(adapter.sentCount(), 2)
-                @Expect(adapter.sentText(0).contains("GitCode 扫描已启动"), true)
+                @Expect(adapter.sentText(0).contains("GitCode webhook-first reconcile 已启动"), true)
                 @Expect(adapter.sentText(0).contains("scanId=gcm-scan-"), true)
                 @Expect(adapter.sentText(0).contains("status=queued capability="), false)
                 @Expect(adapter.sentText(0).contains("\"accepted\""), false)
-                @Expect(adapter.sentText(1).contains("GitCode 扫描已启动"), true)
+                @Expect(adapter.sentText(1).contains("GitCode webhook-first reconcile 已启动"), true)
                 @Expect(adapter.sentAccount(0), "tg-gitcode-monitor")
                 @Expect(adapter.sentAccount(1), "tg-gitcode-monitor")
                 @Expect(payloads.size, 2)
                 let defaultLimits = JsonValue.fromStr(payloads[0]).asObject().get("limits").getOrThrow().asObject()
                 @Expect(defaultLimits.get("maxRepos").getOrThrow().asInt().getValue(), 0)
                 @Expect(defaultLimits.get("maxItems").getOrThrow().asInt().getValue(), 0)
-                @Expect(defaultLimits.get("maxDurationMillis").getOrThrow().asInt().getValue(), 0)
+                @Expect(payloads[0].contains("Authorization"), false)
                 let explicitLimits = JsonValue.fromStr(payloads[1]).asObject().get("limits").getOrThrow().asObject()
                 @Expect(explicitLimits.get("maxRepos").getOrThrow().asInt().getValue(), 2)
                 @Expect(explicitLimits.get("maxItems").getOrThrow().asInt().getValue(), 20)
-                @Expect(explicitLimits.get("maxDurationMillis").getOrThrow().asInt().getValue(), 0)
             } finally {
                 setServicePluginCapabilityInvokerForTest(None)
                 resetServicePluginPendingJobStoreForTest()
@@ -653,7 +747,7 @@ public class GatewayServiceTelegramNativeTest {
                 service.processOnce()
 
                 @Expect(adapter.sentCount(), 1)
-                @Expect(adapter.sentText(0).contains("--timeout-ms is no longer supported for async scan jobs"), true)
+                @Expect(adapter.sentText(0).contains("--timeout-ms is not supported for webhook-first reconcile"), true)
                 @Expect(adapter.sentText(0).contains("{"), false)
                 @Expect(adapter.sentText(0).contains("\"ok\""), false)
                 @Expect(adapter.sentText(0).contains("scanId=gcm-scan-"), false)
@@ -685,7 +779,7 @@ public class GatewayServiceTelegramNativeTest {
                 resetServicePluginPendingJobStoreForTest()
                 let diagnostic = "{ \"ok\": true, \"status\": \"ok\", \"capabilities\": 8 }"
                 setServicePluginCapabilityInvokerForTest(Some({ _registration: ServicePluginRegistration, request: CapabilityInvokeRequest =>
-                    @Expect(request.capabilityId.startsWith("gitcode.monitor."), true)
+                    @Expect(request.capabilityId.startsWith("gitcode."), true)
                     CapabilityInvokeResult(false, "initialize_failed", serviceId: "gitcode-monitor", capabilityId: request.capabilityId, diagnostic: diagnostic)
                 }))
 
@@ -699,7 +793,7 @@ public class GatewayServiceTelegramNativeTest {
                 let statusText = adapter.sentText(0)
                 let scanText = adapter.sentText(1)
                 @Expect(statusText.contains("GitCode status failed:"), true)
-                @Expect(scanText.contains("GitCode scan failed:"), true)
+                @Expect(scanText.contains("GitCode reconcile failed:"), true)
                 @Expect(statusText.contains("{"), false)
                 @Expect(statusText.contains("}"), false)
                 @Expect(statusText.contains("\"ok\""), false)
@@ -757,9 +851,9 @@ public class GatewayServiceTelegramNativeTest {
                 service.processOnce()
 
                 @Expect(adapter.sentCount(), 3)
-                @Expect(adapter.sentText(0), "GitCode scan failed: service plugin wrote invalid data to stdout before the response.")
-                @Expect(adapter.sentText(1), "GitCode scan failed: service plugin returned a response for a different request.")
-                @Expect(adapter.sentText(2), "GitCode scan failed: service plugin returned an invalid payload.")
+                @Expect(adapter.sentText(0), "GitCode reconcile failed: service plugin wrote invalid data to stdout before the response.")
+                @Expect(adapter.sentText(1), "GitCode reconcile failed: service plugin returned a response for a different request.")
+                @Expect(adapter.sentText(2), "GitCode reconcile failed: service plugin returned an invalid payload.")
                 for (i in 0..3) {
                     let text = adapter.sentText(i)
                     @Expect(text.contains("{"), false)

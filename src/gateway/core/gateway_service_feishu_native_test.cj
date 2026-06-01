@@ -257,7 +257,14 @@ private func gatewayFeishuNativeGitcodePluginSettings(accountId: String, manifes
                 "\"configSchema\":{}," +
                 "\"capabilityDeclarations\":[" +
                 "{\"capabilityId\":\"gitcode.monitor.status\",\"kind\":\"controlAction\"}," +
-                "{\"capabilityId\":\"gitcode.monitor.scan_once\",\"kind\":\"controlAction\"}" +
+                "{\"capabilityId\":\"gitcode.monitor.scan_once\",\"kind\":\"controlAction\"}," +
+                "{\"capabilityId\":\"gitcode.webhook.status\",\"kind\":\"controlAction\"}," +
+                "{\"capabilityId\":\"gitcode.webhook.dead_letter_list\",\"kind\":\"controlAction\"}," +
+                "{\"capabilityId\":\"gitcode.webhook.dead_letter_inspect\",\"kind\":\"controlAction\"}," +
+                "{\"capabilityId\":\"gitcode.webhook.replay\",\"kind\":\"controlAction\"}," +
+                "{\"capabilityId\":\"gitcode.webhook.cancel\",\"kind\":\"controlAction\"}," +
+                "{\"capabilityId\":\"gitcode.webhook.reconcile_hooks\",\"kind\":\"controlAction\"}," +
+                "{\"capabilityId\":\"gitcode.webhook.reconcile_events\",\"kind\":\"controlAction\"}" +
                 "]}"
             ).toArray()
         )
@@ -307,7 +314,7 @@ public class GatewayServiceFeishuNativeTest {
     }
 
     @TestCase
-    public func feishuGitcodeScanOnceStartsAsyncJobWithUnboundedDefaultsAndExplicitLimits(): Unit {
+    public func feishuGitcodeScanOnceUsesWebhookReconcileAliasWithRedactedPayload(): Unit {
         withGatewayFeishuNativeTestHome("gitcode-scan", gatewayFeishuNativeTestRoot(), { =>
             var user = CliSettingManager.readGatewaySettings()
             user.servicePlugins = [gatewayFeishuNativeGitcodePluginSettings("feishu-gitcode-monitor")]
@@ -321,8 +328,8 @@ public class GatewayServiceFeishuNativeTest {
                 let payloads = ArrayList<String>()
                 setServicePluginCapabilityInvokerForTest(Some({ _registration: ServicePluginRegistration, request: CapabilityInvokeRequest =>
                     payloads.add(request.payload)
-                    @Expect(request.capabilityId, "gitcode.monitor.scan_once")
-                    @Expect(request.timeoutMillis <= 5000, true)
+                    @Expect(request.capabilityId, "gitcode.webhook.reconcile_events")
+                    @Expect(request.timeoutMillis <= 60000, true)
                     let root = JsonValue.fromStr(request.payload).asObject()
                     @Expect(root.get("mode").getOrThrow().asString().getValue(), "async")
                     let jobId = root.get("jobId").getOrThrow().asString().getValue()
@@ -335,22 +342,21 @@ public class GatewayServiceFeishuNativeTest {
                 service.processOnce()
 
                 @Expect(adapter.sentCount(), 2)
-                @Expect(adapter.sentText(0).contains("GitCode 扫描已启动"), true)
+                @Expect(adapter.sentText(0).contains("GitCode webhook-first reconcile 已启动"), true)
                 @Expect(adapter.sentText(0).contains("scanId=gcm-scan-"), true)
                 @Expect(adapter.sentText(0).contains("status=queued capability="), false)
                 @Expect(adapter.sentText(0).contains("\"accepted\""), false)
-                @Expect(adapter.sentText(1).contains("GitCode 扫描已启动"), true)
+                @Expect(adapter.sentText(1).contains("GitCode webhook-first reconcile 已启动"), true)
                 @Expect(adapter.sentAccount(0), "feishu-gitcode-monitor")
                 @Expect(adapter.sentAccount(1), "feishu-gitcode-monitor")
                 @Expect(payloads.size, 2)
                 let defaultLimits = JsonValue.fromStr(payloads[0]).asObject().get("limits").getOrThrow().asObject()
                 @Expect(defaultLimits.get("maxRepos").getOrThrow().asInt().getValue(), 0)
                 @Expect(defaultLimits.get("maxItems").getOrThrow().asInt().getValue(), 0)
-                @Expect(defaultLimits.get("maxDurationMillis").getOrThrow().asInt().getValue(), 0)
+                @Expect(payloads[0].contains("Authorization"), false)
                 let explicitLimits = JsonValue.fromStr(payloads[1]).asObject().get("limits").getOrThrow().asObject()
                 @Expect(explicitLimits.get("maxRepos").getOrThrow().asInt().getValue(), 2)
                 @Expect(explicitLimits.get("maxItems").getOrThrow().asInt().getValue(), 20)
-                @Expect(explicitLimits.get("maxDurationMillis").getOrThrow().asInt().getValue(), 0)
             } finally {
                 setServicePluginCapabilityInvokerForTest(None)
                 resetServicePluginPendingJobStoreForTest()
@@ -381,7 +387,7 @@ public class GatewayServiceFeishuNativeTest {
                 service.processOnce()
 
                 @Expect(adapter.sentCount(), 1)
-                @Expect(adapter.sentText(0).contains("--timeout-ms is no longer supported for async scan jobs"), true)
+                @Expect(adapter.sentText(0).contains("--timeout-ms is not supported for webhook-first reconcile"), true)
                 @Expect(adapter.sentText(0).contains("{"), false)
                 @Expect(adapter.sentText(0).contains("\"ok\""), false)
                 @Expect(adapter.sentText(0).contains("scanId=gcm-scan-"), false)
@@ -408,7 +414,7 @@ public class GatewayServiceFeishuNativeTest {
                 resetServicePluginPendingJobStoreForTest()
                 let diagnostic = "{ \"ok\": true, \"status\": \"ok\", \"capabilities\": 8 }"
                 setServicePluginCapabilityInvokerForTest(Some({ _registration: ServicePluginRegistration, request: CapabilityInvokeRequest =>
-                    @Expect(request.capabilityId.startsWith("gitcode.monitor."), true)
+                    @Expect(request.capabilityId.startsWith("gitcode."), true)
                     CapabilityInvokeResult(false, "initialize_failed", serviceId: "gitcode-monitor", capabilityId: request.capabilityId, diagnostic: diagnostic)
                 }))
 
@@ -421,7 +427,7 @@ public class GatewayServiceFeishuNativeTest {
                 let statusText = adapter.sentText(0)
                 let scanText = adapter.sentText(1)
                 @Expect(statusText.contains("GitCode status failed:"), true)
-                @Expect(scanText.contains("GitCode scan failed:"), true)
+                @Expect(scanText.contains("GitCode reconcile failed:"), true)
                 @Expect(statusText.contains("{"), false)
                 @Expect(statusText.contains("}"), false)
                 @Expect(statusText.contains("\"ok\""), false)
@@ -473,9 +479,9 @@ public class GatewayServiceFeishuNativeTest {
                 service.processOnce()
 
                 @Expect(adapter.sentCount(), 3)
-                @Expect(adapter.sentText(0), "GitCode scan failed: service plugin wrote invalid data to stdout before the response.")
-                @Expect(adapter.sentText(1), "GitCode scan failed: service plugin returned a response for a different request.")
-                @Expect(adapter.sentText(2), "GitCode scan failed: service plugin returned an invalid payload.")
+                @Expect(adapter.sentText(0), "GitCode reconcile failed: service plugin wrote invalid data to stdout before the response.")
+                @Expect(adapter.sentText(1), "GitCode reconcile failed: service plugin returned a response for a different request.")
+                @Expect(adapter.sentText(2), "GitCode reconcile failed: service plugin returned an invalid payload.")
                 for (i in 0..3) {
                     let text = adapter.sentText(i)
                     @Expect(text.contains("{"), false)
