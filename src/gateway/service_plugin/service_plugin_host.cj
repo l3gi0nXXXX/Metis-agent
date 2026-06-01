@@ -1118,7 +1118,7 @@ private func stopAllActiveServicePluginProcesses(): Unit {
     }
 }
 
-private func ensureServicePluginStdioProcess(record: ServicePluginRuntimeRecord): ServicePluginProcessEnsureResult {
+private func ensureServicePluginStdioProcess(record: ServicePluginRuntimeRecord, startupTimeoutMs!: Int64 = 10000): ServicePluginProcessEnsureResult {
     let serviceId = record.registration.manifest.pluginId
     synchronized(servicePluginProcessLock) {
         if (servicePluginActiveProcesses.contains(serviceId) && servicePluginResponseQueues.contains(serviceId)) {
@@ -1153,10 +1153,10 @@ private func ensureServicePluginStdioProcess(record: ServicePluginRuntimeRecord)
         } catch (e: Exception) {
             record.status = "degraded"
             record.degradedReason = "process_start_failed"
-            record.lastError = e.message
-            return ServicePluginProcessEnsureResult(false, "process_start_failed", diagnostic: e.message)
+            record.lastError = redactServicePayload(e.message).text
+            return ServicePluginProcessEnsureResult(false, "process_start_failed", diagnostic: record.lastError)
         }
-        let initRead = readExpectedServiceFrame(process, ServicePluginStdoutReadPolicy(10000, serviceId, "initialize"))
+        let initRead = readExpectedServiceFrame(process, ServicePluginStdoutReadPolicy(startupTimeoutMs, serviceId, "initialize"))
         if (!initRead.ok) {
             record.status = "degraded"
             record.degradedReason = if (initRead.status == "timeout") { "initialize_timeout" } else { initRead.status }
@@ -1181,9 +1181,9 @@ private func ensureServicePluginStdioProcess(record: ServicePluginRuntimeRecord)
             record.status = "degraded"
             record.degradedReason = "initialize_failed"
             record.lastError = if (!initPayloadStatus.diagnostic.isEmpty()) {
-                initPayloadStatus.diagnostic
+                redactServicePayload(initPayloadStatus.diagnostic).text
             } else if (!initPayloadStatus.status.isEmpty() && initPayloadStatus.status != "ok" && initPayloadStatus.status != "invalid_payload") {
-                "initialize rejected: ${initPayloadStatus.status}"
+                "initialize rejected: ${redactServicePayload(initPayloadStatus.status).text}"
             } else {
                 "initialize payload missing boolean ok"
             }
@@ -1322,6 +1322,27 @@ public func startServicePlugin(serviceId: String, context!: ServiceStartContext 
     }
 }
 
+public func ensureRegisteredServicePluginStarted(serviceId: String, startupTimeoutMs!: Int64 = 10000): ServiceStartResult {
+    let sid = serviceId.trimAscii()
+    match (servicePluginRegistry.get(sid)) {
+        case Some(record) =>
+            if (!record.registration.enabled) {
+                record.status = "disabled"
+                record.degradedReason = "plugin disabled"
+                return ServiceStartResult(false, sid, "disabled", diagnostic: record.degradedReason)
+            }
+            let ensured = ensureServicePluginStdioProcess(record, startupTimeoutMs: startupTimeoutMs)
+            ServiceStartResult(
+                ensured.ok,
+                sid,
+                if (ensured.ok) { "running" } else { record.degradedReason },
+                instanceId: record.instanceId,
+                diagnostic: ensured.diagnostic
+            )
+        case None => ServiceStartResult(false, sid, "missing", diagnostic: "service plugin is not registered")
+    }
+}
+
 public func stopServicePlugin(serviceId: String, reason!: String = "", timeoutMillis!: Int64 = 30000): ServiceStopResult {
     match (servicePluginRegistry.get(serviceId.trimAscii())) {
         case Some(record) =>
@@ -1415,6 +1436,16 @@ public func markServiceHealth(serviceId: String, health: ServiceHealth): Unit {
                 record.status = "degraded"
                 record.degradedReason = if (health.reason.isEmpty()) { status } else { health.reason }
             }
+        case None => ()
+    }
+}
+
+public func markServicePluginDegraded(serviceId: String, reason: String, diagnostic!: String = ""): Unit {
+    match (servicePluginRegistry.get(serviceId.trimAscii())) {
+        case Some(record) =>
+            record.status = "degraded"
+            record.degradedReason = reason.trimAscii()
+            record.lastError = redactServicePayload(if (diagnostic.trimAscii().isEmpty()) { reason } else { diagnostic }).text
         case None => ()
     }
 }

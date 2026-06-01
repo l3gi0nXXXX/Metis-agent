@@ -596,6 +596,9 @@ public struct GatewayServicePluginImBindingUserSettings {
 public struct GatewayServicePluginUserSettings {
     public var pluginId: String = ""
     public var enabled: Bool = true
+    public var autostart: Bool = false
+    public var startupTimeoutMs: Int64 = 10000
+    public var restartPolicy: String = "on-failure"
     public var manifestPath: String = ""
     public var configRef: String = ""
     public var grants: Array<String> = []
