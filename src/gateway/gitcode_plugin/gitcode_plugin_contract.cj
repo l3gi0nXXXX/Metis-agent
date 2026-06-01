@@ -171,6 +171,83 @@ public class GitCodeScanOnceArgsParseResult {
     }
 }
 
+public class GitCodeDeliveryCommandArgs {
+    public let deliveryId: String
+    public init(deliveryId!: String = "") {
+        this.deliveryId = deliveryId.trimAscii()
+    }
+}
+
+public class GitCodeDeliveryCommandArgsParseResult {
+    public let ok: Bool
+    public let status: String
+    public let diagnostic: String
+    public let args: GitCodeDeliveryCommandArgs
+
+    public init(ok: Bool, status!: String = "ok", diagnostic!: String = "", args!: GitCodeDeliveryCommandArgs = GitCodeDeliveryCommandArgs()) {
+        this.ok = ok
+        this.status = status.trimAscii()
+        this.diagnostic = diagnostic.trimAscii()
+        this.args = args
+    }
+}
+
+public class GitCodeHookReconcileArgs {
+    public let apply: Bool
+    public init(apply!: Bool = false) {
+        this.apply = apply
+    }
+}
+
+public class GitCodeHookReconcileArgsParseResult {
+    public let ok: Bool
+    public let status: String
+    public let diagnostic: String
+    public let args: GitCodeHookReconcileArgs
+
+    public init(ok: Bool, status!: String = "ok", diagnostic!: String = "", args!: GitCodeHookReconcileArgs = GitCodeHookReconcileArgs()) {
+        this.ok = ok
+        this.status = status.trimAscii()
+        this.diagnostic = diagnostic.trimAscii()
+        this.args = args
+    }
+}
+
+public class GitCodeEventReconcileArgs {
+    public let lookbackHours: Int64
+    public let maxRepos: Int64
+    public let maxItems: Int64
+    public let dryRun: Bool
+
+    public init(lookbackHours!: Int64 = 24, maxRepos!: Int64 = 0, maxItems!: Int64 = 0, dryRun!: Bool = true) {
+        this.lookbackHours = if (lookbackHours <= 0) { 24 } else { lookbackHours }
+        this.maxRepos = boundedNonNegative(maxRepos)
+        this.maxItems = boundedNonNegative(maxItems)
+        this.dryRun = dryRun
+    }
+}
+
+public class GitCodeEventReconcileArgsParseResult {
+    public let ok: Bool
+    public let status: String
+    public let diagnostic: String
+    public let args: GitCodeEventReconcileArgs
+
+    public init(ok: Bool, status!: String = "ok", diagnostic!: String = "", args!: GitCodeEventReconcileArgs = GitCodeEventReconcileArgs()) {
+        this.ok = ok
+        this.status = status.trimAscii()
+        this.diagnostic = diagnostic.trimAscii()
+        this.args = args
+    }
+}
+
+public class GitCodeWebhookStatusArgs {
+    public let includeDeadLetter: Bool
+    public init(includeDeadLetter!: Bool = false) {
+        this.includeDeadLetter = includeDeadLetter
+    }
+}
+
 public class CapabilityInvokeResult {
     public let ok: Bool
     public let status: String
@@ -387,6 +464,48 @@ public func parseGitCodeCommand(text: String): GitCodePluginCommandParseResult {
     if (first == "subscribe" || first == "unsubscribe") {
         return GitCodePluginCommandParseResult(true, action: first, args: parts[2..])
     }
+    if (first == "webhook") {
+        if (parts.size > 2) {
+            let second = parts[2].trimAscii().toAsciiLower()
+            if (second == "status") {
+                return GitCodePluginCommandParseResult(true, action: "webhook_status", args: parts[3..])
+            }
+            if (second == "dead-letter" && parts.size > 3) {
+                let third = parts[3].trimAscii().toAsciiLower()
+                if (third == "list") {
+                    return GitCodePluginCommandParseResult(true, action: "webhook_dead_letter_list", args: parts[4..])
+                }
+                if (third == "inspect") {
+                    return GitCodePluginCommandParseResult(true, action: "webhook_dead_letter_inspect", args: parts[4..])
+                }
+            }
+            if (second == "replay") {
+                return GitCodePluginCommandParseResult(true, action: "webhook_replay", args: parts[3..])
+            }
+            if (second == "cancel") {
+                return GitCodePluginCommandParseResult(true, action: "webhook_cancel", args: parts[3..])
+            }
+        }
+        return GitCodePluginCommandParseResult(true, action: "unknown", args: parts[1..], diagnostic: "unknown gitcode webhook command")
+    }
+    if (first == "reconcile") {
+        if (parts.size > 2) {
+            let second = parts[2].trimAscii().toAsciiLower()
+            if (second == "hooks") {
+                let args = parts[3..]
+                for (arg in args) {
+                    if (arg.trimAscii() == "--apply") {
+                        return GitCodePluginCommandParseResult(true, action: "reconcile_hooks_apply", args: args)
+                    }
+                }
+                return GitCodePluginCommandParseResult(true, action: "reconcile_hooks", args: args)
+            }
+            if (second == "once") {
+                return GitCodePluginCommandParseResult(true, action: "reconcile_once", args: parts[3..])
+            }
+        }
+        return GitCodePluginCommandParseResult(true, action: "unknown", args: parts[1..], diagnostic: "unknown gitcode reconcile command")
+    }
     if (first == "scan" && parts.size > 3 && parts[2].trimAscii().toAsciiLower() == "status") {
         return GitCodePluginCommandParseResult(true, action: "scan_status", args: parts[3..])
     }
@@ -394,7 +513,7 @@ public func parseGitCodeCommand(text: String): GitCodePluginCommandParseResult {
         return GitCodePluginCommandParseResult(true, action: "scan_cancel", args: parts[3..])
     }
     if (first == "scan" && parts.size > 2 && parts[2].trimAscii().toAsciiLower() == "once") {
-        return GitCodePluginCommandParseResult(true, action: "scan_once", args: parts[3..])
+        return GitCodePluginCommandParseResult(true, action: "scan_once_alias", args: parts[3..])
     }
     if (first == "auto-reply") {
         return GitCodePluginCommandParseResult(true, action: "auto_reply", args: parts[2..])
@@ -515,6 +634,78 @@ public func parseGitCodeScanOnceArgs(args: Array<String>): GitCodeScanOnceArgsPa
     GitCodeScanOnceArgsParseResult(true, args: GitCodeScanOnceArgs(maxRepos: maxRepos, maxItems: maxItems, timeoutMillis: timeoutMs, offlineFixture: offlineFixture))
 }
 
+public func parseGitCodeDeliveryArgs(args: Array<String>): GitCodeDeliveryCommandArgsParseResult {
+    if (args.size != 1) {
+        return GitCodeDeliveryCommandArgsParseResult(false, status: "invalid_delivery_id", diagnostic: "deliveryId is required")
+    }
+    let deliveryId = args[0].trimAscii()
+    if (!gitCodeDeliveryIdValid(deliveryId)) {
+        return GitCodeDeliveryCommandArgsParseResult(false, status: "invalid_delivery_id", diagnostic: "deliveryId contains unsupported characters")
+    }
+    GitCodeDeliveryCommandArgsParseResult(true, args: GitCodeDeliveryCommandArgs(deliveryId: deliveryId))
+}
+
+public func parseGitCodeHookReconcileArgs(args: Array<String>): GitCodeHookReconcileArgsParseResult {
+    var apply = false
+    for (arg in args) {
+        let value = arg.trimAscii()
+        if (value.isEmpty()) { continue }
+        if (value == "--apply") {
+            apply = true
+            continue
+        }
+        return GitCodeHookReconcileArgsParseResult(false, status: "invalid_args", diagnostic: "unknown reconcile hooks option: ${value}")
+    }
+    GitCodeHookReconcileArgsParseResult(true, args: GitCodeHookReconcileArgs(apply: apply))
+}
+
+public func parseGitCodeReconcileOnceArgs(args: Array<String>): GitCodeEventReconcileArgsParseResult {
+    var lookbackHours: Int64 = 24
+    var maxRepos: Int64 = 0
+    var maxItems: Int64 = 0
+    var dryRun = true
+    var i = 0
+    while (i < args.size) {
+        let arg = args[i].trimAscii()
+        if (arg.isEmpty()) {
+            i++
+            continue
+        }
+        if (arg == "--apply") {
+            dryRun = false
+            i++
+            continue
+        }
+        if (arg == "--timeout-ms") {
+            return GitCodeEventReconcileArgsParseResult(false, status: "invalid_args", diagnostic: "--timeout-ms is not supported for webhook-first reconcile")
+        }
+        if (arg == "--lookback-hours" || arg == "--max-repos" || arg == "--max-items") {
+            if (i + 1 >= args.size) {
+                return GitCodeEventReconcileArgsParseResult(false, status: "invalid_args", diagnostic: "${arg} requires a numeric value")
+            }
+            let parsed = try {
+                Int64.parse(args[i + 1].trimAscii())
+            } catch (_: Exception) {
+                return GitCodeEventReconcileArgsParseResult(false, status: "invalid_args", diagnostic: "${arg} requires a numeric value")
+            }
+            if (parsed < 0 || (arg == "--lookback-hours" && parsed == 0)) {
+                return GitCodeEventReconcileArgsParseResult(false, status: "invalid_args", diagnostic: "${arg} must be positive")
+            }
+            if (arg == "--lookback-hours") {
+                lookbackHours = parsed
+            } else if (arg == "--max-repos") {
+                maxRepos = parsed
+            } else {
+                maxItems = parsed
+            }
+            i += 2
+            continue
+        }
+        return GitCodeEventReconcileArgsParseResult(false, status: "invalid_args", diagnostic: "unknown reconcile option: ${arg}")
+    }
+    GitCodeEventReconcileArgsParseResult(true, args: GitCodeEventReconcileArgs(lookbackHours: lookbackHours, maxRepos: maxRepos, maxItems: maxItems, dryRun: dryRun))
+}
+
 public func buildGitCodeAsyncScanPayload(
     context: GatewayCommandContext,
     args: GitCodeScanOnceArgs,
@@ -548,8 +739,146 @@ public func buildGitCodeAsyncScanPayload(
     root.toJsonString()
 }
 
+public func buildGitCodeWebhookStatusPayload(context: GatewayCommandContext): String {
+    let root = gitCodeCommandPayloadBase(context, "gitcode.webhook.status")
+    root.toJsonString()
+}
+
+public func buildGitCodeDeadLetterListPayload(context: GatewayCommandContext): String {
+    let root = gitCodeCommandPayloadBase(context, "gitcode.webhook.dead_letter_list")
+    root.toJsonString()
+}
+
+public func buildGitCodeDeadLetterInspectPayload(context: GatewayCommandContext, deliveryId: String): String {
+    let root = gitCodeCommandPayloadBase(context, "gitcode.webhook.dead_letter_inspect")
+    root.put("deliveryId", JsonString(deliveryId.trimAscii()))
+    root.toJsonString()
+}
+
+public func buildGitCodeWebhookReplayPayload(context: GatewayCommandContext, deliveryId: String): String {
+    let root = gitCodeCommandPayloadBase(context, "gitcode.webhook.replay")
+    root.put("deliveryId", JsonString(deliveryId.trimAscii()))
+    root.put("operatorIntent", JsonBool(true))
+    root.toJsonString()
+}
+
+public func buildGitCodeWebhookCancelPayload(context: GatewayCommandContext, deliveryId: String): String {
+    let root = gitCodeCommandPayloadBase(context, "gitcode.webhook.cancel")
+    root.put("deliveryId", JsonString(deliveryId.trimAscii()))
+    root.put("operatorIntent", JsonBool(true))
+    root.toJsonString()
+}
+
+public func buildGitCodeHookReconcilePayload(context: GatewayCommandContext, args: GitCodeHookReconcileArgs): String {
+    let root = gitCodeCommandPayloadBase(context, "gitcode.webhook.reconcile_hooks")
+    root.put("apply", JsonBool(args.apply))
+    root.put("operatorIntent", JsonBool(args.apply))
+    root.toJsonString()
+}
+
+public func buildGitCodeEventReconcilePayload(context: GatewayCommandContext, args: GitCodeEventReconcileArgs, deliveryTarget: ServicePluginDeliveryTarget, jobId!: String = "", idempotencyKey!: String = ""): String {
+    let root = gitCodeCommandPayloadBase(context, "gitcode.webhook.reconcile_events")
+    root.put("mode", JsonString("async"))
+    if (!jobId.trimAscii().isEmpty()) { root.put("jobId", JsonString(jobId.trimAscii())) }
+    if (!idempotencyKey.trimAscii().isEmpty()) { root.put("idempotencyKey", JsonString(idempotencyKey.trimAscii())) }
+    root.put("lookbackHours", JsonInt(args.lookbackHours))
+    root.put("dryRun", JsonBool(args.dryRun))
+    let limits = JsonObject()
+    limits.put("maxRepos", JsonInt(args.maxRepos))
+    limits.put("maxItems", JsonInt(args.maxItems))
+    root.put("limits", limits)
+    root.put("deliveryTarget", servicePluginDeliveryTargetToJson(deliveryTarget))
+    root.toJsonString()
+}
+
 public func formatGitCodeScanOnceResult(result: CapabilityInvokeResult): String {
     "gitcode scan_once status=${result.status} capability=${result.capabilityId}"
+}
+
+public func renderGitCodeWebhookStatusResult(payload: String): String {
+    if (!payload.trimAscii().startsWith("{")) {
+        return "GitCode Webhook 状态：插件返回无法解析的响应。"
+    }
+    let status = jsonStringField(payload, "status", fallback: "ok")
+    let receiver = jsonStringField(payload, "receiver", fallback: jsonStringField(payload, "receiverStatus", fallback: "unknown"))
+    let pending = jsonIntField(payload, "pending", fallback: jsonIntField(payload, "pendingCount", fallback: 0))
+    let dead = jsonIntField(payload, "deadLetter", fallback: jsonIntField(payload, "deadLetterCount", fallback: 0))
+    let lastError = redactGitCodePluginText(jsonStringField(payload, "lastError"))
+    let suffix = if (lastError.isEmpty()) { "" } else { " lastError=${lastError}" }
+    "GitCode Webhook 状态：status=${status} receiver=${receiver} pending=${pending} dead-letter=${dead}${suffix}"
+}
+
+public func renderGitCodeDeadLetterListResult(payload: String): String {
+    if (!payload.trimAscii().startsWith("{")) {
+        return "GitCode webhook dead-letter：插件返回无法解析的响应。"
+    }
+    let status = jsonStringField(payload, "status", fallback: "ok")
+    let count = jsonIntField(payload, "count", fallback: jsonIntField(payload, "deadLetter", fallback: 0))
+    let latest = jsonStringField(payload, "latest", fallback: jsonStringField(payload, "deliveryId"))
+    let errorKind = jsonStringField(payload, "errorKind")
+    "GitCode webhook dead-letter：status=${status} count=${count} latest=${safeDeliveryForDisplay(latest)} error=${redactGitCodePluginText(errorKind)}"
+}
+
+public func renderGitCodeDeadLetterInspectResult(payload: String): String {
+    if (!payload.trimAscii().startsWith("{")) {
+        return "GitCode webhook dead-letter inspect：插件返回无法解析的响应。"
+    }
+    let deliveryId = safeDeliveryForDisplay(jsonStringField(payload, "deliveryId"))
+    let stage = jsonStringField(payload, "stage", fallback: "unknown")
+    let errorKind = redactGitCodePluginText(jsonStringField(payload, "errorKind"))
+    let diagnostic = redactGitCodePluginText(jsonStringField(payload, "diagnostic"))
+    "GitCode webhook dead-letter 诊断：deliveryId=${deliveryId} stage=${stage} error=${errorKind} diagnostic=${diagnostic}"
+}
+
+public func renderGitCodeWebhookReplayResult(payload: String): String {
+    if (!payload.trimAscii().startsWith("{")) {
+        return "GitCode webhook replay：插件返回无法解析的响应。"
+    }
+    let status = jsonStringField(payload, "status", fallback: "ok")
+    let deliveryId = safeDeliveryForDisplay(jsonStringField(payload, "deliveryId"))
+    let previous = jsonStringField(payload, "previousStatus")
+    let next = jsonStringField(payload, "newStatus", fallback: jsonStringField(payload, "statusAfter", fallback: "pending"))
+    "GitCode webhook replay：status=${status} deliveryId=${deliveryId} ${previous}->${next}"
+}
+
+public func renderGitCodeWebhookCancelResult(payload: String): String {
+    if (!payload.trimAscii().startsWith("{")) {
+        return "GitCode webhook cancel：插件返回无法解析的响应。"
+    }
+    let status = jsonStringField(payload, "status", fallback: "ok")
+    let deliveryId = safeDeliveryForDisplay(jsonStringField(payload, "deliveryId"))
+    let reason = redactGitCodePluginText(jsonStringField(payload, "reason"))
+    "GitCode webhook cancel：status=${status} deliveryId=${deliveryId} reason=${reason}"
+}
+
+public func renderGitCodeHookReconcileResult(payload: String): String {
+    if (!payload.trimAscii().startsWith("{")) {
+        return "GitCode webhook hook reconcile：插件返回无法解析的响应。"
+    }
+    let status = jsonStringField(payload, "status", fallback: "ok")
+    let aligned = jsonIntField(payload, "aligned", fallback: 0)
+    let missing = jsonIntField(payload, "missing", fallback: 0)
+    let drifted = jsonIntField(payload, "drifted", fallback: 0)
+    let created = jsonIntField(payload, "created", fallback: 0)
+    let updated = jsonIntField(payload, "updated", fallback: 0)
+    let failed = jsonIntField(payload, "failed", fallback: 0)
+    "GitCode webhook hook reconcile：status=${status} aligned=${aligned} missing=${missing} drifted=${drifted} created=${created} updated=${updated} failed=${failed}"
+}
+
+public func renderGitCodeEventReconcileResult(payload: String, aliasFromScanOnce!: Bool = false): String {
+    if (!payload.trimAscii().startsWith("{")) {
+        return "GitCode reconcile：插件返回无法解析的响应。"
+    }
+    let prefix = if (aliasFromScanOnce) { "已切换为 webhook-first，/gitcode scan once 按 reconcile/fallback 执行，不做历史全量扫描。\n" } else { "" }
+    let status = jsonStringField(payload, "status", fallback: "ok")
+    let lookback = jsonIntField(payload, "lookbackHours", fallback: 24)
+    let repos = jsonIntField(payload, "repos", fallback: jsonIntField(payload, "scannedRepos", fallback: 0))
+    let candidates = jsonIntField(payload, "candidates", fallback: jsonIntField(payload, "checkedItems", fallback: 0))
+    let newEvents = jsonIntField(payload, "newEvents", fallback: 0)
+    let drafts = jsonIntField(payload, "drafts", fallback: jsonIntField(payload, "draftsGenerated", fallback: 0))
+    let notifications = jsonIntField(payload, "notifications", fallback: jsonIntField(payload, "notificationsSent", fallback: 0))
+    let writes = jsonIntField(payload, "writes", fallback: 0)
+    prefix + "GitCode reconcile 完成：status=${status} 窗口=${lookback}h 仓库 ${repos} 个，候选事件 ${candidates} 条，新增事件 ${newEvents} 条，草稿 ${drafts} 条，通知 ${notifications} 条，写回 ${writes} 条。"
 }
 
 public func handleGitCodeKnowledgeQueryCommand(context: GatewayCommandContext, query: String): GatewayCommandResult {
@@ -693,6 +1022,56 @@ public func runGitCodeMonitorEndToEndSmoke(config: EndToEndSmokeConfig): EndToEn
 
 public func assertEndToEndBoundaries(result: EndToEndSmokeResult): Bool {
     result.ok && result.generatedReplySent && !result.secretLeak
+}
+
+private func gitCodeCommandPayloadBase(context: GatewayCommandContext, action: String): JsonObject {
+    let root = JsonObject()
+    root.put("ok", JsonBool(true))
+    root.put("action", JsonString(action))
+    let requestedBy = JsonObject()
+    requestedBy.put("channel", JsonString(context.channel))
+    requestedBy.put("accountId", JsonString(context.accountId))
+    requestedBy.put("peerHash", JsonString(hashRawPayload(context.peerId)))
+    requestedBy.put("senderHash", JsonString(hashRawPayload(context.senderId)))
+    requestedBy.put("sessionHash", JsonString(hashRawPayload(context.sessionKey)))
+    requestedBy.put("operator", JsonBool(context.isOperator))
+    root.put("requestedBy", requestedBy)
+    root
+}
+
+private func gitCodeDeliveryIdValid(deliveryId: String): Bool {
+    if (deliveryId.isEmpty() || deliveryId.size > 160) { return false }
+    if (deliveryId.contains("..")) { return false }
+    for (r in deliveryId.runes()) {
+        let ok = (r >= r'a' && r <= r'z') ||
+            (r >= r'A' && r <= r'Z') ||
+            (r >= r'0' && r <= r'9') ||
+            r == r'-' ||
+            r == r'_' ||
+            r == r'.'
+        if (!ok) { return false }
+    }
+    true
+}
+
+private func safeDeliveryForDisplay(deliveryId: String): String {
+    if (deliveryId.isEmpty()) { return "(unknown)" }
+    if (gitCodeDeliveryIdValid(deliveryId)) { return deliveryId }
+    "delivery-${deliveryId.size}"
+}
+
+private func jsonStringField(raw: String, key: String, fallback!: String = ""): String {
+    let value = fieldValue(raw, key)
+    if (value.isEmpty()) { fallback } else { redactGitCodePluginText(value) }
+}
+
+private func jsonIntField(raw: String, key: String, fallback!: Int64 = 0): Int64 {
+    let needle = "\"${key}\":"
+    if (!raw.contains(needle)) { return fallback }
+    let tail = raw.split(needle, 2)[1].trimAscii()
+    let text = tail.split(",", 2)[0].split("}", 2)[0].trimAscii()
+    if (text.isEmpty() || text == "-") { return fallback }
+    try { Int64.parse(text) } catch (_: Exception) { fallback }
 }
 
 private func boundedNonNegative(value: Int64): Int64 {

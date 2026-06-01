@@ -11,13 +11,85 @@ public class GitCodePluginContractTest {
         @Expect(parseGitCodeCommand("/gitcode status").action, "status")
         @Expect(parseGitCodeCommand("/gitcode subscribe").action, "subscribe")
         @Expect(parseGitCodeCommand("/gitcode unsubscribe").action, "unsubscribe")
-        @Expect(parseGitCodeCommand("/gitcode scan once --max-repos 1").action, "scan_once")
+        @Expect(parseGitCodeCommand("/gitcode scan once --max-repos 1").action, "scan_once_alias")
         @Expect(parseGitCodeCommand("/gitcode scan status gcm-scan-1").action, "scan_status")
         @Expect(parseGitCodeCommand("/gitcode scan cancel gcm-scan-1").action, "scan_cancel")
+        @Expect(parseGitCodeCommand("/gitcode webhook status").action, "webhook_status")
+        @Expect(parseGitCodeCommand("/gitcode webhook dead-letter list").action, "webhook_dead_letter_list")
+        @Expect(parseGitCodeCommand("/gitcode webhook dead-letter inspect d-1").action, "webhook_dead_letter_inspect")
+        @Expect(parseGitCodeCommand("/gitcode webhook replay d-1").action, "webhook_replay")
+        @Expect(parseGitCodeCommand("/gitcode webhook cancel d-1").action, "webhook_cancel")
+        @Expect(parseGitCodeCommand("/gitcode reconcile hooks").action, "reconcile_hooks")
+        @Expect(parseGitCodeCommand("/gitcode reconcile hooks --apply").action, "reconcile_hooks_apply")
+        @Expect(parseGitCodeCommand("/gitcode reconcile once --lookback-hours 24").action, "reconcile_once")
         let query = parseGitCodeCommand("/gitcode query 如何使用 HttpClient")
         @Expect(query.action, "query")
         @Expect(query.query.contains("HttpClient"), true)
         @Expect(parseGitCodeCommand("/gitcode nope").action, "unknown")
+    }
+
+    @TestCase
+    public func webhookCommandArgsValidateDeliveryIdsAndReconcileOptions(): Unit {
+        let delivery = parseGitCodeDeliveryArgs(["abc-123_456.789"])
+        @Expect(delivery.ok, true)
+        @Expect(delivery.args.deliveryId, "abc-123_456.789")
+        @Expect(parseGitCodeDeliveryArgs([]).ok, false)
+        @Expect(parseGitCodeDeliveryArgs(["../x"]).status, "invalid_delivery_id")
+        @Expect(parseGitCodeDeliveryArgs(["a/b"]).status, "invalid_delivery_id")
+        @Expect(parseGitCodeDeliveryArgs(["a b"]).status, "invalid_delivery_id")
+
+        let hooks = parseGitCodeHookReconcileArgs([])
+        @Expect(hooks.ok, true)
+        @Expect(hooks.args.apply, false)
+        let hooksApply = parseGitCodeHookReconcileArgs(["--apply"])
+        @Expect(hooksApply.ok, true)
+        @Expect(hooksApply.args.apply, true)
+        @Expect(parseGitCodeHookReconcileArgs(["--bad"]).ok, false)
+
+        let reconcile = parseGitCodeReconcileOnceArgs(["--lookback-hours", "24", "--max-repos", "10", "--max-items", "100", "--apply"])
+        @Expect(reconcile.ok, true)
+        @Expect(reconcile.args.lookbackHours, 24)
+        @Expect(reconcile.args.maxRepos, 10)
+        @Expect(reconcile.args.maxItems, 100)
+        @Expect(reconcile.args.dryRun, false)
+        @Expect(parseGitCodeReconcileOnceArgs(["--timeout-ms", "1"]).ok, false)
+        @Expect(parseGitCodeReconcileOnceArgs(["--max-repos", "-1"]).ok, false)
+        @Expect(parseGitCodeReconcileOnceArgs(["--unknown"]).ok, false)
+    }
+
+    @TestCase
+    public func webhookPayloadBuildersRedactRequesterAndRenderHumanReadableOutput(): Unit {
+        let context = GatewayCommandContext(channel: "telegram", accountId: "tg-gitcode-monitor", peerId: "chat-secret", senderId: "sender-secret")
+        let target = ServicePluginDeliveryTarget("telegram", "tg-gitcode-monitor", "chat-secret", replyToMessageId: "24")
+        let statusPayload = buildGitCodeWebhookStatusPayload(context)
+        @Expect(statusPayload.contains("chat-secret"), false)
+        @Expect(statusPayload.contains("sender-secret"), false)
+        @Expect(statusPayload.contains("peerHash"), true)
+
+        let replayPayload = buildGitCodeWebhookReplayPayload(context, "delivery-1")
+        @Expect(replayPayload.contains("deliveryId"), true)
+        @Expect(replayPayload.contains("delivery-1"), true)
+        @Expect(replayPayload.contains("Authorization"), false)
+        @Expect(replayPayload.contains("token"), false)
+
+        let reconcilePayload = buildGitCodeEventReconcilePayload(context, GitCodeEventReconcileArgs(lookbackHours: 12, maxRepos: 3, maxItems: 9, dryRun: true), target, jobId: "gcm-reconcile-1", idempotencyKey: "idem-1")
+        @Expect(reconcilePayload.contains("lookbackHours"), true)
+        @Expect(reconcilePayload.contains("12"), true)
+        @Expect(reconcilePayload.contains("gcm-reconcile-1"), true)
+        @Expect(reconcilePayload.contains("idem-1"), true)
+        @Expect(reconcilePayload.contains("chat-secret"), true)
+        @Expect(reconcilePayload.contains("sender-secret"), false)
+
+        let status = renderGitCodeWebhookStatusResult("{\"status\":\"ok\",\"receiver\":\"running\",\"pending\":2,\"deadLetter\":1,\"lastError\":\"\"}")
+        @Expect(status.contains("GitCode Webhook 状态"), true)
+        @Expect(status.contains("{\"status\""), false)
+        let dead = renderGitCodeDeadLetterListResult("{\"status\":\"ok\",\"count\":1,\"latest\":\"delivery-1\",\"errorKind\":\"payload_invalid\"}")
+        @Expect(dead.contains("dead-letter"), true)
+        @Expect(dead.contains("payload_invalid"), true)
+        let event = renderGitCodeEventReconcileResult("{\"status\":\"completed\",\"lookbackHours\":12,\"repos\":2,\"candidates\":8,\"newEvents\":1,\"drafts\":1,\"notifications\":1,\"writes\":0}", aliasFromScanOnce: true)
+        @Expect(event.contains("webhook-first"), true)
+        @Expect(event.contains("新增事件 1"), true)
+        @Expect(event.contains("\"status\""), false)
     }
 
     @TestCase

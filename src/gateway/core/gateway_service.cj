@@ -9,7 +9,7 @@ import metis.gateway.security.gatewayPairingAccountStore
 import metis.gateway.service_plugin.{CapabilityCaller, CapabilityInvokeRequest, CapabilityInvokeResult, ServicePluginAcceptedGitCodeEvent, ServicePluginDeliveryTarget, ServicePluginEventDeliveryResult, ServicePluginGeneratedReplyResult, ServicePluginPendingJob, buildServicePluginImBindingRules, invokeRegisteredCapability, matchServicePluginImBinding, parseServicePluginJobAcceptedPayload, renderServicePluginJobSnapshotMessage, servicePluginPendingJobStore, registerConfiguredServicePlugins, servicePluginConfiguredStatusForUser, setServicePluginEventDelivery, setServicePluginGeneratedReplyHandler}
 import metis.gateway.session.{GatewayIngressSource, GatewaySessionContext, GatewaySessionRequest, gatewayResolveSessionContext, gatewaySessionRequestFromInbound}
 import metis.gateway.tools.{gatewayHandleNativeCommandLine, gatewayHandleSubagentsCommandLine}
-import metis.gateway.gitcode_plugin.{GatewayCommandContext, buildGitCodeAsyncScanPayload, buildGitCodeSubscriptionTarget, formatGitCodeSubscribeResult, handleGitCodeKnowledgeQueryCommand, parseGitCodeCommand, parseGitCodeScanOnceArgs, removeGitCodeSubscription, saveGitCodeSubscription}
+import metis.gateway.gitcode_plugin.{GatewayCommandContext, buildGitCodeAsyncScanPayload, buildGitCodeDeadLetterInspectPayload, buildGitCodeDeadLetterListPayload, buildGitCodeEventReconcilePayload, buildGitCodeHookReconcilePayload, buildGitCodeSubscriptionTarget, buildGitCodeWebhookCancelPayload, buildGitCodeWebhookReplayPayload, buildGitCodeWebhookStatusPayload, formatGitCodeSubscribeResult, handleGitCodeKnowledgeQueryCommand, parseGitCodeCommand, parseGitCodeDeliveryArgs, parseGitCodeHookReconcileArgs, parseGitCodeReconcileOnceArgs, parseGitCodeScanOnceArgs, removeGitCodeSubscription, renderGitCodeDeadLetterInspectResult, renderGitCodeDeadLetterListResult, renderGitCodeEventReconcileResult, renderGitCodeHookReconcileResult, renderGitCodeWebhookCancelResult, renderGitCodeWebhookReplayResult, renderGitCodeWebhookStatusResult, saveGitCodeSubscription}
 import magic.jsonable.*
 import std.collection.{ArrayList, HashSet}
 import std.convert.Parsable
@@ -645,7 +645,7 @@ public class GatewayService {
         )
         match (parsed.action) {
             case "help" =>
-                "gitcode commands: /gitcode status, /gitcode subscribe, /gitcode unsubscribe, /gitcode scan once [--max-repos N] [--max-items N], /gitcode query <question>"
+                "gitcode commands: /gitcode webhook status, /gitcode webhook dead-letter list, /gitcode webhook replay <deliveryId>, /gitcode reconcile hooks [--apply], /gitcode reconcile once [--lookback-hours N], /gitcode scan once (compatibility alias), /gitcode status, /gitcode subscribe, /gitcode unsubscribe, /gitcode query <question>"
             case "status" | "config" =>
                 this.servicePluginGitCodeInvokeReply("gitcode.monitor.status", "{}", "status")
             case "subscribe" =>
@@ -653,8 +653,24 @@ public class GatewayService {
             case "unsubscribe" =>
                 let result = removeGitCodeSubscription(buildGitCodeSubscriptionTarget(context))
                 "gitcode unsubscribe status=${result.status}"
+            case "webhook_status" =>
+                this.servicePluginGitCodeWebhookStatusReply(context)
+            case "webhook_dead_letter_list" =>
+                this.servicePluginGitCodeDeadLetterListReply(context)
+            case "webhook_dead_letter_inspect" =>
+                this.servicePluginGitCodeDeadLetterInspectReply(context, parsed.args)
+            case "webhook_replay" =>
+                this.servicePluginGitCodeWebhookReplayReply(context, parsed.args)
+            case "webhook_cancel" =>
+                this.servicePluginGitCodeWebhookCancelReply(context, parsed.args)
+            case "reconcile_hooks" | "reconcile_hooks_apply" =>
+                this.servicePluginGitCodeReconcileHooksReply(context, parsed.args)
+            case "reconcile_once" =>
+                this.servicePluginGitCodeReconcileOnceReply(message, accountId, context, parsed.args, aliasFromScanOnce: false)
             case "scan_once" =>
                 this.servicePluginGitCodeStartAsyncScanReply(message, accountId, context, parsed.args)
+            case "scan_once_alias" =>
+                this.servicePluginGitCodeReconcileOnceReply(message, accountId, context, parsed.args, aliasFromScanOnce: true)
             case "scan_status" =>
                 this.servicePluginGitCodeScanStatusReply(parsed.args)
             case "scan_cancel" =>
@@ -667,6 +683,179 @@ public class GatewayService {
                 } else {
                     "unknown gitcode command"
                 }
+        }
+    }
+
+    private func servicePluginGitCodeWebhookStatusReply(context: GatewayCommandContext): String {
+        if (!context.authorized) {
+            return "GitCode webhook status failed: sender is not authorized."
+        }
+        let result = invokeRegisteredCapability(CapabilityInvokeRequest(
+            "gitcode.webhook.status",
+            payload: buildGitCodeWebhookStatusPayload(context),
+            caller: this.servicePluginGitCodeCaller(),
+            timeoutMillis: 5000
+        ))
+        if (!result.ok) {
+            return this.servicePluginRenderGitCodeFailure("webhook status", result)
+        }
+        renderGitCodeWebhookStatusResult(result.payload)
+    }
+
+    private func servicePluginGitCodeDeadLetterListReply(context: GatewayCommandContext): String {
+        if (!context.authorized) {
+            return "GitCode webhook dead-letter failed: sender is not authorized."
+        }
+        let result = invokeRegisteredCapability(CapabilityInvokeRequest(
+            "gitcode.webhook.dead_letter_list",
+            payload: buildGitCodeDeadLetterListPayload(context),
+            caller: this.servicePluginGitCodeCaller(),
+            timeoutMillis: 5000
+        ))
+        if (!result.ok) {
+            return this.servicePluginRenderGitCodeFailure("webhook dead-letter list", result)
+        }
+        renderGitCodeDeadLetterListResult(result.payload)
+    }
+
+    private func servicePluginGitCodeDeadLetterInspectReply(context: GatewayCommandContext, args: Array<String>): String {
+        if (!context.isOperator) {
+            return "GitCode command failed: operator permission required."
+        }
+        let parsed = parseGitCodeDeliveryArgs(args)
+        if (!parsed.ok) {
+            return "GitCode webhook dead-letter inspect failed: invalid arguments: ${parsed.diagnostic}."
+        }
+        let result = invokeRegisteredCapability(CapabilityInvokeRequest(
+            "gitcode.webhook.dead_letter_inspect",
+            payload: buildGitCodeDeadLetterInspectPayload(context, parsed.args.deliveryId),
+            caller: this.servicePluginGitCodeCaller(),
+            timeoutMillis: 5000
+        ))
+        if (!result.ok) {
+            return this.servicePluginRenderGitCodeFailure("webhook dead-letter inspect", result)
+        }
+        renderGitCodeDeadLetterInspectResult(result.payload)
+    }
+
+    private func servicePluginGitCodeWebhookReplayReply(context: GatewayCommandContext, args: Array<String>): String {
+        if (!context.isOperator) {
+            return "GitCode command failed: operator permission required."
+        }
+        let parsed = parseGitCodeDeliveryArgs(args)
+        if (!parsed.ok) {
+            return "GitCode webhook replay failed: invalid arguments: ${parsed.diagnostic}."
+        }
+        let result = invokeRegisteredCapability(CapabilityInvokeRequest(
+            "gitcode.webhook.replay",
+            payload: buildGitCodeWebhookReplayPayload(context, parsed.args.deliveryId),
+            caller: this.servicePluginGitCodeCaller(),
+            timeoutMillis: 5000
+        ))
+        if (!result.ok) {
+            return this.servicePluginRenderGitCodeFailure("webhook replay", result)
+        }
+        renderGitCodeWebhookReplayResult(result.payload)
+    }
+
+    private func servicePluginGitCodeWebhookCancelReply(context: GatewayCommandContext, args: Array<String>): String {
+        if (!context.isOperator) {
+            return "GitCode command failed: operator permission required."
+        }
+        let parsed = parseGitCodeDeliveryArgs(args)
+        if (!parsed.ok) {
+            return "GitCode webhook cancel failed: invalid arguments: ${parsed.diagnostic}."
+        }
+        let result = invokeRegisteredCapability(CapabilityInvokeRequest(
+            "gitcode.webhook.cancel",
+            payload: buildGitCodeWebhookCancelPayload(context, parsed.args.deliveryId),
+            caller: this.servicePluginGitCodeCaller(),
+            timeoutMillis: 5000
+        ))
+        if (!result.ok) {
+            return this.servicePluginRenderGitCodeFailure("webhook cancel", result)
+        }
+        renderGitCodeWebhookCancelResult(result.payload)
+    }
+
+    private func servicePluginGitCodeReconcileHooksReply(context: GatewayCommandContext, args: Array<String>): String {
+        if (!context.isOperator) {
+            return "GitCode command failed: operator permission required."
+        }
+        let parsed = parseGitCodeHookReconcileArgs(args)
+        if (!parsed.ok) {
+            return "GitCode reconcile hooks failed: invalid arguments: ${parsed.diagnostic}."
+        }
+        let result = invokeRegisteredCapability(CapabilityInvokeRequest(
+            "gitcode.webhook.reconcile_hooks",
+            payload: buildGitCodeHookReconcilePayload(context, parsed.args),
+            caller: this.servicePluginGitCodeCaller(),
+            timeoutMillis: 5000
+        ))
+        if (!result.ok) {
+            return this.servicePluginRenderGitCodeFailure("reconcile hooks", result)
+        }
+        renderGitCodeHookReconcileResult(result.payload)
+    }
+
+    private func servicePluginGitCodeReconcileOnceReply(message: InboundMessage, accountId: String, context: GatewayCommandContext, args: Array<String>, aliasFromScanOnce!: Bool = false): String {
+        if (!context.isOperator) {
+            return "GitCode command failed: operator permission required."
+        }
+        let parsed = parseGitCodeReconcileOnceArgs(args)
+        if (!parsed.ok) {
+            return "GitCode reconcile failed: invalid arguments: ${parsed.diagnostic}."
+        }
+        let replyTo = match (message.replyTargetMessageId) {
+            case Some(value) => value
+            case None => message.messageId
+        }
+        let target = ServicePluginDeliveryTarget(
+            channelToString(message.channel),
+            accountId,
+            message.peerId,
+            threadId: message.threadId ?? "",
+            replyToMessageId: replyTo,
+            replyInThread: message.replyInThread
+        )
+        let jobId = this.servicePluginBuildGitCodeScanJobId(message)
+        let idempotencyKey = this.servicePluginBuildGitCodeScanIdempotencyKey(message, accountId)
+        let store = servicePluginPendingJobStore()
+        let created = store.createOrGetByIdempotencyKey(
+            "gitcode-monitor",
+            "gitcode.webhook.reconcile_events",
+            jobId,
+            idempotencyKey,
+            target,
+            nowMillis: this.startNowMs()
+        )
+        if (!created.ok) {
+            return "GitCode reconcile failed: invalid job request."
+        }
+        if (!created.created) {
+            return "GitCode webhook-first reconcile 已在运行，scanId=${created.job.jobId}。完成后会在当前会话通知。"
+        }
+        let result = invokeRegisteredCapability(CapabilityInvokeRequest(
+            "gitcode.webhook.reconcile_events",
+            payload: buildGitCodeEventReconcilePayload(context, parsed.args, target, jobId: created.job.jobId, idempotencyKey: idempotencyKey),
+            caller: this.servicePluginGitCodeCaller(),
+            timeoutMillis: 5000
+        ))
+        if (!result.ok) {
+            store.markFailed(created.job.jobId, error: result.status, nowMillis: this.startNowMs())
+            return this.servicePluginRenderGitCodeFailure("reconcile", result)
+        }
+        let accepted = parseServicePluginJobAcceptedPayload(result.payload, expectedJobId: created.job.jobId)
+        if (!accepted.ok) {
+            store.markFailed(created.job.jobId, error: accepted.status, nowMillis: this.startNowMs())
+            return "GitCode reconcile failed: service plugin returned an invalid accepted response."
+        }
+        store.markAccepted(created.job.jobId, nowMillis: this.startNowMs())
+        store.markRunning(created.job.jobId, stage: "accepted", nowMillis: this.startNowMs())
+        if (aliasFromScanOnce) {
+            "GitCode webhook-first reconcile 已启动，scanId=${created.job.jobId}。完成后会在当前会话通知。"
+        } else {
+            "GitCode webhook-first reconcile 已启动，scanId=${created.job.jobId}。完成后会在当前会话通知。"
         }
     }
 
