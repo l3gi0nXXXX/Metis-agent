@@ -126,6 +126,60 @@ public class ServicePluginEventDispatcherTest {
     }
 
     @TestCase
+    public func acceptedGitCodePrIssueAndCommentEventsRenderSafeUserVisibleDrafts(): Unit {
+        let messages = ArrayList<String>()
+        setServicePluginEventDeliveryForTest(Some({ _target: ServicePluginDeliveryTarget, text: String =>
+            messages.add(text)
+            ServicePluginEventDeliveryResult(true, "sent")
+        }))
+        setServicePluginGeneratedReplyHandlerForTest(Some({ _job: ServicePluginPendingJob, event: ServicePluginAcceptedGitCodeEvent =>
+            ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "draft for ${event.kind}: ${event.content}")
+        }))
+        resetServicePluginGeneratedReplyStateForTest()
+        try {
+            let store = ServicePluginPendingJobStore()
+            let _ = store.createOrGetByIdempotencyKey("gitcode-monitor", "gitcode.webhook.reconcile_events", "job-pr", "idem-pr", this.target(), nowMillis: 1)
+            let _ = store.createOrGetByIdempotencyKey("gitcode-monitor", "gitcode.webhook.reconcile_events", "job-issue", "idem-issue", this.target(), nowMillis: 1)
+            let _ = store.createOrGetByIdempotencyKey("gitcode-monitor", "gitcode.webhook.reconcile_events", "job-comment", "idem-comment", this.target(), nowMillis: 1)
+            store.markAccepted("job-pr", nowMillis: 2)
+            store.markAccepted("job-issue", nowMillis: 2)
+            store.markAccepted("job-comment", nowMillis: 2)
+
+            let pr = ServiceFrame("event", "accepted-pr", "gitcode-monitor", method: "emitCapabilityEvent", capabilityId: "gitcode.event.accepted", payload: "{\"jobId\":\"job-pr\",\"eventId\":\"event-pr\",\"repo\":\"cangjie/community\",\"kind\":\"pr\",\"number\":\"71\",\"title\":\"PR title\",\"url\":\"https://gitcode.com/cangjie/community/pulls/71\",\"author\":\"alice\",\"content\":\"please review\"}")
+            let issue = ServiceFrame("event", "accepted-issue", "gitcode-monitor", method: "emitCapabilityEvent", capabilityId: "gitcode.event.accepted", payload: "{\"jobId\":\"job-issue\",\"eventId\":\"event-issue\",\"repo\":\"cangjie/community\",\"kind\":\"issue\",\"number\":\"72\",\"title\":\"Issue title\",\"url\":\"https://gitcode.com/cangjie/community/issues/72\",\"author\":\"bob\",\"content\":\"bug report\"}")
+            let comment = ServiceFrame("event", "accepted-comment", "gitcode-monitor", method: "emitCapabilityEvent", capabilityId: "gitcode.event.accepted", payload: "{\"jobId\":\"job-comment\",\"eventId\":\"event-comment\",\"repo\":\"cangjie/community\",\"kind\":\"comment\",\"number\":\"71\",\"commentId\":\"9001\",\"title\":\"Comment title\",\"url\":\"https://gitcode.com/cangjie/community/pulls/71#note_9001\",\"author\":\"carol\",\"content\":\"Authorization: Bearer secret token=abc path=/Users/name/private\"}")
+
+            @Expect(dispatchServicePluginEvent(pr, store: store).status, "generated_reply_delivered")
+            @Expect(dispatchServicePluginEvent(issue, store: store).status, "generated_reply_delivered")
+            @Expect(dispatchServicePluginEvent(comment, store: store).status, "generated_reply_delivered")
+            @Expect(messages.size, 3)
+
+            @Expect(messages[0].contains("来源: cangjie/community PR #71 https://gitcode.com/cangjie/community/pulls/71"), true)
+            @Expect(messages[0].contains("标题: PR title"), true)
+            @Expect(messages[0].contains("状态: dryRun=true"), true)
+            @Expect(messages[1].contains("来源: cangjie/community Issue #72 https://gitcode.com/cangjie/community/issues/72"), true)
+            @Expect(messages[1].contains("标题: Issue title"), true)
+            @Expect(messages[1].contains("状态: dryRun=true"), true)
+            @Expect(messages[2].contains("来源: cangjie/community Comment #71 comment #9001 https://gitcode.com/cangjie/community/pulls/71#note_9001"), true)
+            @Expect(messages[2].contains("标题: Comment title"), true)
+            @Expect(messages[2].contains("状态: dryRun=true"), true)
+
+            for (message in messages) {
+                @Expect(message.contains("\"jobId\""), false)
+                @Expect(message.contains("\"eventId\""), false)
+                @Expect(message.contains("Authorization"), false)
+                @Expect(message.contains("Bearer secret"), false)
+                @Expect(message.contains("token=abc"), false)
+                @Expect(message.contains("/Users/"), false)
+            }
+        } finally {
+            setServicePluginEventDeliveryForTest(None)
+            setServicePluginGeneratedReplyHandlerForTest(None<(ServicePluginPendingJob, ServicePluginAcceptedGitCodeEvent) -> ServicePluginGeneratedReplyResult>)
+            resetServicePluginGeneratedReplyStateForTest()
+        }
+    }
+
+    @TestCase
     public func baselineOnlyCompletedEventDoesNotTriggerGeneratedReply(): Unit {
         let messages = ArrayList<String>()
         let generatedCalls = ArrayList<String>()

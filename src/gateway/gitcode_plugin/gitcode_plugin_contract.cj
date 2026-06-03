@@ -800,12 +800,27 @@ public func renderGitCodeWebhookStatusResult(payload: String): String {
         return "GitCode Webhook 状态：插件返回无法解析的响应。"
     }
     let status = jsonStringField(payload, "status", fallback: "ok")
-    let receiver = jsonStringField(payload, "receiver", fallback: jsonStringField(payload, "receiverStatus", fallback: "unknown"))
+    let listenerStatus = jsonStringField(payload, "listenerStatus", fallback: "unknown")
+    let processorStatus = jsonStringField(payload, "processorStatus", fallback: "unknown")
+    let receiver = jsonStringField(payload, "receiver", fallback: deriveGitCodeWebhookReceiverStatus(listenerStatus, processorStatus))
+    let bind = jsonStringField(payload, "webhookBind")
     let pending = jsonIntField(payload, "pending", fallback: jsonIntField(payload, "pendingCount", fallback: 0))
+    let processing = jsonIntField(payload, "processing", fallback: 0)
+    let processed = jsonIntField(payload, "processed", fallback: 0)
     let dead = jsonIntField(payload, "deadLetter", fallback: jsonIntField(payload, "deadLetterCount", fallback: 0))
+    let cancelled = jsonIntField(payload, "cancelled", fallback: 0)
+    let lastBatchProcessed = jsonIntField(payload, "lastBatchProcessed", fallback: 0)
+    let publicBaseUrl = if (jsonBoolField(payload, "publicBaseUrlConfigured")) { "configured" } else { "missing" }
     let lastError = redactGitCodePluginText(jsonStringField(payload, "lastError"))
-    let suffix = if (lastError.isEmpty()) { "" } else { " lastError=${lastError}" }
-    "GitCode Webhook 状态：status=${status} receiver=${receiver} pending=${pending} dead-letter=${dead}${suffix}"
+    let listenerLine = if (!bind.isEmpty() && listenerStatus == "listening") { "${bind} ${listenerStatus}" } else { listenerStatus }
+    let errorLine = if (lastError.isEmpty()) { "" } else { "\nlastError: ${lastError}" }
+    "GitCode Webhook 状态\n" +
+        "status: ${status}\n" +
+        "receiver: ${receiver}\n" +
+        "listener: ${listenerLine}\n" +
+        "queue: pending=${pending} processing=${processing} processed=${processed} dead-letter=${dead} cancelled=${cancelled}\n" +
+        "processor: ${processorStatus} lastBatchProcessed=${lastBatchProcessed}\n" +
+        "publicBaseUrl: ${publicBaseUrl}${errorLine}"
 }
 
 public func renderGitCodeDeadLetterListResult(payload: String): String {
@@ -856,13 +871,19 @@ public func renderGitCodeHookReconcileResult(payload: String): String {
         return "GitCode webhook hook reconcile：插件返回无法解析的响应。"
     }
     let status = jsonStringField(payload, "status", fallback: "ok")
+    let applyRejected = status == "apply_rejected" || jsonBoolField(payload, "applyRejected")
     let aligned = jsonIntField(payload, "aligned", fallback: 0)
     let missing = jsonIntField(payload, "missing", fallback: 0)
     let drifted = jsonIntField(payload, "drifted", fallback: 0)
+    let wrongUrl = jsonIntField(payload, "wrong_url", fallback: jsonIntField(payload, "wrongUrl", fallback: 0))
+    let wrongEvents = jsonIntField(payload, "wrong_events", fallback: jsonIntField(payload, "wrongEvents", fallback: 0))
+    let authFailed = jsonIntField(payload, "auth_failed", fallback: jsonIntField(payload, "authFailed", fallback: 0))
     let created = jsonIntField(payload, "created", fallback: 0)
     let updated = jsonIntField(payload, "updated", fallback: 0)
     let failed = jsonIntField(payload, "failed", fallback: 0)
-    "GitCode webhook hook reconcile：status=${status} aligned=${aligned} missing=${missing} drifted=${drifted} created=${created} updated=${updated} failed=${failed}"
+    let reason = redactGitCodePluginText(jsonStringField(payload, "rejectReason"))
+    let rejectLine = if (applyRejected) { " apply rejected reason=${if (reason.isEmpty()) { "unknown" } else { reason }}" } else { "" }
+    "GitCode webhook hook reconcile：status=${status}${rejectLine} aligned=${aligned} missing=${missing} drifted=${drifted} wrong_url=${wrongUrl} wrong_events=${wrongEvents} auth_failed=${authFailed} created=${created} updated=${updated} failed=${failed}"
 }
 
 public func renderGitCodeEventReconcileResult(payload: String, aliasFromScanOnce!: Bool = false): String {
@@ -1072,6 +1093,19 @@ private func jsonIntField(raw: String, key: String, fallback!: Int64 = 0): Int64
     let text = tail.split(",", 2)[0].split("}", 2)[0].trimAscii()
     if (text.isEmpty() || text == "-") { return fallback }
     try { Int64.parse(text) } catch (_: Exception) { fallback }
+}
+
+private func jsonBoolField(raw: String, key: String): Bool {
+    let needle = "\"${key}\":"
+    if (!raw.contains(needle)) { return false }
+    let tail = raw.split(needle, 2)[1].trimAscii()
+    tail.startsWith("true")
+}
+
+private func deriveGitCodeWebhookReceiverStatus(listenerStatus: String, processorStatus: String): String {
+    if (listenerStatus == "unknown" && processorStatus == "unknown") { return "unknown" }
+    if (listenerStatus == "listening" && (processorStatus == "running" || processorStatus == "disabled")) { return "running" }
+    "degraded"
 }
 
 private func boundedNonNegative(value: Int64): Int64 {

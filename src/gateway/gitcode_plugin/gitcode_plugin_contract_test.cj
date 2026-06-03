@@ -93,6 +93,49 @@ public class GitCodePluginContractTest {
     }
 
     @TestCase
+    public func webhookStatusRendererUsesRuntimeFieldsAndNeverFallsBackToRawJson(): Unit {
+        let running = renderGitCodeWebhookStatusResult("{\"status\":\"ok\",\"configStatus\":\"valid\",\"queueStatus\":\"ready\",\"listenerStatus\":\"listening\",\"processorStatus\":\"running\",\"webhookBind\":\"127.0.0.1:18080\",\"publicBaseUrlConfigured\":true,\"queue\":{\"pending\":0,\"processing\":1,\"processed\":3,\"deadLetter\":0,\"cancelled\":0},\"lastBatchProcessed\":1,\"lastError\":\"\"}")
+        @Expect(running.contains("receiver: running"), true)
+        @Expect(running.contains("listener: 127.0.0.1:18080 listening"), true)
+        @Expect(running.contains("queue: pending=0 processing=1 processed=3 dead-letter=0 cancelled=0"), true)
+        @Expect(running.contains("processor: running lastBatchProcessed=1"), true)
+        @Expect(running.contains("publicBaseUrl: configured"), true)
+        @Expect(running.contains("{\"status\""), false)
+        @Expect(running.contains("\"listenerStatus\""), false)
+
+        let degraded = renderGitCodeWebhookStatusResult("{\"status\":\"ok\",\"configStatus\":\"valid\",\"queueStatus\":\"ready\",\"listenerStatus\":\"not_started\",\"processorStatus\":\"running\",\"lastError\":\"Authorization: Bearer secret /Users/name/private\"}")
+        @Expect(degraded.contains("receiver: degraded"), true)
+        @Expect(degraded.contains("listener: not_started"), true)
+        @Expect(degraded.contains("lastError: [redacted]"), true)
+        @Expect(degraded.contains("secret"), false)
+        @Expect(degraded.contains("/Users/"), false)
+
+        let missingFields = renderGitCodeWebhookStatusResult("{\"status\":\"ok\"}")
+        @Expect(missingFields.contains("receiver: unknown"), true)
+        @Expect(missingFields.contains("listener: unknown"), true)
+        @Expect(missingFields.contains("{\"status\""), false)
+    }
+
+    @TestCase
+    public func hookReconcileRendererShowsHumanReadableDriftAndApplyRejection(): Unit {
+        let dryRun = renderGitCodeHookReconcileResult("{\"status\":\"ok\",\"apply\":false,\"aligned\":2,\"missing\":1,\"wrong_url\":3,\"wrong_events\":4,\"auth_failed\":5,\"failed\":0}")
+        @Expect(dryRun.contains("GitCode webhook hook reconcile"), true)
+        @Expect(dryRun.contains("aligned=2"), true)
+        @Expect(dryRun.contains("missing=1"), true)
+        @Expect(dryRun.contains("wrong_url=3"), true)
+        @Expect(dryRun.contains("wrong_events=4"), true)
+        @Expect(dryRun.contains("auth_failed=5"), true)
+        @Expect(dryRun.contains("\"status\""), false)
+
+        let rejected = renderGitCodeHookReconcileResult("{\"status\":\"apply_rejected\",\"applyRejected\":true,\"rejectReason\":\"publicBaseUrl missing token=secret /Users/name/private\",\"aligned\":0,\"missing\":1}")
+        @Expect(rejected.contains("apply rejected"), true)
+        @Expect(rejected.contains("reason=[redacted]"), true)
+        @Expect(rejected.contains("token=secret"), false)
+        @Expect(rejected.contains("/Users/"), false)
+        @Expect(rejected.contains("{\"status\""), false)
+    }
+
+    @TestCase
     public func defaultScanOnceArgsAreUnboundedAndHaveNoUserTimeout(): Unit {
         let args = parseGitCodeScanOnceArgs([])
         @Expect(args.ok, true)
