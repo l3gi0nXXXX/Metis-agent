@@ -314,6 +314,45 @@ public class GatewayServiceFeishuNativeTest {
     }
 
     @TestCase
+    public func feishuGitcodeWebhookStatusShowsGcmDiagnosticsWithoutRawJson(): Unit {
+        withGatewayFeishuNativeTestHome("gitcode-webhook-status", gatewayFeishuNativeTestRoot(), { =>
+            var user = CliSettingManager.readGatewaySettings()
+            user.servicePlugins = [gatewayFeishuNativeGitcodePluginSettings("feishu-gitcode-monitor")]
+            CliSettingManager.writeGatewaySettings(user)
+
+            let adapter = GatewayFeishuNativeTestAdapter(accountId: "feishu-gitcode-monitor")
+            let service = gatewayFeishuNativeService(adapter, enableGroup: false, accountId: "feishu-gitcode-monitor")
+            service.start()
+            try {
+                setServicePluginCapabilityInvokerForTest(Some({ _registration: ServicePluginRegistration, request: CapabilityInvokeRequest =>
+                    @Expect(request.capabilityId, "gitcode.webhook.status")
+                    CapabilityInvokeResult(true, "ok", serviceId: "gitcode-monitor", capabilityId: request.capabilityId, payload: "{\"status\":\"running\",\"receiver\":\"running\",\"listener\":{\"status\":\"listening\",\"bind\":\"127.0.0.1:18080\",\"lastStatus\":202,\"lastDurationMs\":2,\"healthz\":\"ok\"},\"processor\":{\"status\":\"running\",\"pending\":0,\"processing\":0,\"processed\":10,\"deadLetter\":0,\"emptyTicks\":42},\"stateSave\":{\"status\":\"skipped_empty_queue\",\"lastDurationMs\":0,\"bytes\":215647,\"auditCount\":595,\"auditMax\":1000},\"authorization\":\"Bearer must-not-show\"}")
+                }))
+
+                adapter.queueDirect("/gitcode webhook status")
+                service.processOnce()
+
+                @Expect(adapter.sentCount(), 1)
+                let text = adapter.sentText(0)
+                @Expect(text.contains("GitCode Webhook 状态"), true)
+                @Expect(text.contains("receiver: running"), true)
+                @Expect(text.contains("listener: 127.0.0.1:18080 listening lastStatus=202 lastDuration=2ms healthz=ok"), true)
+                @Expect(text.contains("queue: pending=0 processing=0 processed=10 dead-letter=0 cancelled=0"), true)
+                @Expect(text.contains("processor: running lastBatchProcessed=10 claimed=0 emptyTicks=42"), true)
+                @Expect(text.contains("stateSave: skipped_empty_queue lastDuration=0ms bytes=215647 audit=595/1000"), true)
+                @Expect(text.contains("{"), false)
+                @Expect(text.contains("\"status\""), false)
+                @Expect(text.contains("Bearer"), false)
+                @Expect(text.contains("must-not-show"), false)
+                @Expect(adapter.sentAccount(0), "feishu-gitcode-monitor")
+            } finally {
+                setServicePluginCapabilityInvokerForTest(None)
+                service.stop()
+            }
+        })
+    }
+
+    @TestCase
     public func feishuGitcodeScanOnceUsesWebhookReconcileAliasWithRedactedPayload(): Unit {
         withGatewayFeishuNativeTestHome("gitcode-scan", gatewayFeishuNativeTestRoot(), { =>
             var user = CliSettingManager.readGatewaySettings()

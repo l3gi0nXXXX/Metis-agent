@@ -596,7 +596,7 @@ public class GatewayServiceTelegramNativeTest {
                     payloads.add(request.payload)
                     match (request.capabilityId) {
                         case "gitcode.webhook.status" =>
-                            CapabilityInvokeResult(true, "ok", serviceId: "gitcode-monitor", capabilityId: request.capabilityId, payload: "{\"status\":\"running\",\"queue\":{\"pending\":1,\"processing\":0,\"deadLetter\":0}}")
+                            CapabilityInvokeResult(true, "ok", serviceId: "gitcode-monitor", capabilityId: request.capabilityId, payload: "{\"status\":\"running\",\"receiver\":\"running\",\"listener\":{\"status\":\"listening\",\"bind\":\"127.0.0.1:18080\",\"lastStatus\":202,\"lastDurationMs\":2,\"healthz\":\"ok\"},\"processor\":{\"status\":\"running\",\"pending\":0,\"processing\":0,\"processed\":10,\"deadLetter\":0,\"emptyTicks\":42},\"stateSave\":{\"status\":\"skipped_empty_queue\",\"lastDurationMs\":0,\"bytes\":215647,\"auditCount\":595,\"auditMax\":1000},\"token\":\"must-not-show\"}")
                         case "gitcode.webhook.dead_letter_list" =>
                             CapabilityInvokeResult(true, "ok", serviceId: "gitcode-monitor", capabilityId: request.capabilityId, payload: "{\"items\":[{\"deliveryId\":\"d1\",\"repo\":\"Cangjie/stdx\",\"kind\":\"issue\",\"stage\":\"parse\",\"errorKind\":\"payload_invalid\",\"retryable\":false,\"payloadHash\":\"sha256:abc\"}]}")
                         case "gitcode.webhook.dead_letter_inspect" =>
@@ -643,6 +643,13 @@ public class GatewayServiceTelegramNativeTest {
                     "gitcode.webhook.reconcile_events"
                 ])
                 @Expect(adapter.sentText(0).contains("GitCode Webhook 状态"), true)
+                @Expect(adapter.sentText(0).contains("listener: 127.0.0.1:18080 listening lastStatus=202 lastDuration=2ms healthz=ok"), true)
+                @Expect(adapter.sentText(0).contains("queue: pending=0 processing=0 processed=10 dead-letter=0 cancelled=0"), true)
+                @Expect(adapter.sentText(0).contains("processor: running lastBatchProcessed=10 claimed=0 emptyTicks=42"), true)
+                @Expect(adapter.sentText(0).contains("stateSave: skipped_empty_queue lastDuration=0ms bytes=215647 audit=595/1000"), true)
+                @Expect(adapter.sentText(0).contains("{"), false)
+                @Expect(adapter.sentText(0).contains("\"status\""), false)
+                @Expect(adapter.sentText(0).contains("must-not-show"), false)
                 @Expect(adapter.sentText(1).contains("dead-letter"), true)
                 @Expect(adapter.sentText(2).contains("deliveryId=d1"), true)
                 @Expect(adapter.sentText(3).contains("deliveryId=d1"), true)

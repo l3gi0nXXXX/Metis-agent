@@ -100,8 +100,15 @@ public class GitCodePluginContractTest {
         @Expect(running.contains("queue: pending=0 processing=1 processed=3 dead-letter=0 cancelled=0"), true)
         @Expect(running.contains("processor: running lastBatchProcessed=1"), true)
         @Expect(running.contains("publicBaseUrl: configured"), true)
+        @Expect(running.contains("missing diagnostics:"), true)
         @Expect(running.contains("{\"status\""), false)
         @Expect(running.contains("\"listenerStatus\""), false)
+
+        let flat = renderGitCodeWebhookStatusResult("{\"status\":\"ok\",\"configStatus\":\"valid\",\"queueStatus\":\"ready\",\"listenerStatus\":\"listening\",\"processorStatus\":\"running\",\"webhookBind\":\"127.0.0.1:18080\",\"publicBaseUrlConfigured\":true,\"queue\":{\"pending\":0,\"processing\":1,\"processed\":3,\"deadLetter\":0,\"cancelled\":0},\"lastBatchClaimed\":1,\"lastBatchProcessed\":1,\"emptyTickCount\":7,\"listenerLastStatus\":202,\"listenerLastDurationMs\":3,\"healthzCount\":2,\"activeRequestCount\":0,\"stateSaveStatus\":\"saved\",\"stateSaveSkipped\":false,\"stateSaveDurationMs\":4,\"stateSaveBytes\":512,\"auditCount\":12,\"auditMax\":1000,\"lastError\":\"\"}")
+        @Expect(flat.contains("listener: 127.0.0.1:18080 listening lastStatus=202 lastDuration=3ms healthz=2 active=0"), true)
+        @Expect(flat.contains("processor: running lastBatchProcessed=1 claimed=1 emptyTicks=7"), true)
+        @Expect(flat.contains("stateSave: saved skipped=false lastDuration=4ms bytes=512 audit=12/1000"), true)
+        @Expect(flat.contains("{\"status\""), false)
 
         let degraded = renderGitCodeWebhookStatusResult("{\"status\":\"ok\",\"configStatus\":\"valid\",\"queueStatus\":\"ready\",\"listenerStatus\":\"not_started\",\"processorStatus\":\"running\",\"lastError\":\"Authorization: Bearer secret /Users/name/private\"}")
         @Expect(degraded.contains("receiver: degraded"), true)
@@ -113,7 +120,53 @@ public class GitCodePluginContractTest {
         let missingFields = renderGitCodeWebhookStatusResult("{\"status\":\"ok\"}")
         @Expect(missingFields.contains("receiver: unknown"), true)
         @Expect(missingFields.contains("listener: unknown"), true)
+        @Expect(missingFields.contains("missing diagnostics:"), true)
         @Expect(missingFields.contains("{\"status\""), false)
+    }
+
+    @TestCase
+    public func webhookStatusRendererShowsGcmDiagnosticsAndRedactsSensitivePayloadFields(): Unit {
+        let payload = "{\"ok\":true,\"status\":\"running\",\"receiver\":\"running\",\"token\":\"must-not-show\"," +
+            "\"listener\":{\"status\":\"listening\",\"bind\":\"127.0.0.1:18080\",\"lastStatus\":202,\"lastDurationMs\":2,\"healthz\":\"ok\"}," +
+            "\"queue\":{\"pending\":0,\"processing\":0,\"processed\":10,\"deadLetter\":0,\"cancelled\":0}," +
+            "\"processor\":{\"status\":\"running\",\"pending\":0,\"processing\":0,\"processed\":10,\"deadLetter\":0,\"emptyTicks\":42}," +
+            "\"stateSave\":{\"status\":\"skipped_empty_queue\",\"lastDurationMs\":0,\"bytes\":215647,\"auditCount\":595,\"auditMax\":1000,\"secretPath\":\"/Users/name/.gitcodemonitor/state.json\"}}"
+        let text = renderGitCodeWebhookStatusResult(payload)
+        @Expect(text.contains("GitCode Webhook 状态"), true)
+        @Expect(text.contains("receiver: running"), true)
+        @Expect(text.contains("listener: 127.0.0.1:18080 listening lastStatus=202 lastDuration=2ms healthz=ok"), true)
+        @Expect(text.contains("queue: pending=0 processing=0 processed=10 dead-letter=0 cancelled=0"), true)
+        @Expect(text.contains("processor: running lastBatchProcessed=10 claimed=0 emptyTicks=42"), true)
+        @Expect(text.contains("stateSave: skipped_empty_queue lastDuration=0ms bytes=215647 audit=595/1000"), true)
+        @Expect(text.contains("missing diagnostics:"), false)
+        @Expect(text.contains("{"), false)
+        @Expect(text.contains("}"), false)
+        @Expect(text.contains("\"status\""), false)
+        @Expect(text.contains("must-not-show"), false)
+        @Expect(text.contains("secretPath"), false)
+        @Expect(text.contains("/Users/"), false)
+    }
+
+    @TestCase
+    public func webhookStatusRendererShowsDegradedErrorKindWithoutRawJsonOrSecrets(): Unit {
+        let payload = "{\"ok\":false,\"status\":\"degraded\",\"receiver\":\"degraded\",\"errorKind\":\"listener_unhealthy\"," +
+            "\"listener\":{\"status\":\"error\",\"bind\":\"127.0.0.1:18080\",\"lastStatus\":524,\"lastDurationMs\":5006,\"healthz\":\"timeout\",\"lastError\":\"Authorization: Bearer secret /Users/name/private\"}," +
+            "\"queue\":{\"pending\":7,\"processing\":1,\"processed\":9,\"deadLetter\":2}," +
+            "\"processor\":{\"status\":\"running\",\"pending\":7,\"processing\":1,\"processed\":9,\"deadLetter\":2,\"emptyTicks\":0}," +
+            "\"stateSave\":{\"status\":\"error\",\"lastDurationMs\":1200,\"bytes\":215647,\"auditCount\":1000,\"auditMax\":1000}}"
+        let text = renderGitCodeWebhookStatusResult(payload)
+        @Expect(text.contains("status: degraded"), true)
+        @Expect(text.contains("receiver: degraded"), true)
+        @Expect(text.contains("errorKind: listener_unhealthy"), true)
+        @Expect(text.contains("listener: 127.0.0.1:18080 error lastStatus=524 lastDuration=5006ms healthz=timeout"), true)
+        @Expect(text.contains("queue: pending=7 processing=1 processed=9 dead-letter=2 cancelled=0"), true)
+        @Expect(text.contains("processor: running lastBatchProcessed=9 claimed=0 emptyTicks=0"), true)
+        @Expect(text.contains("stateSave: error lastDuration=1200ms bytes=215647 audit=1000/1000"), true)
+        @Expect(text.contains("{"), false)
+        @Expect(text.contains("\"ok\""), false)
+        @Expect(text.contains("Authorization"), false)
+        @Expect(text.contains("secret"), false)
+        @Expect(text.contains("/Users/"), false)
     }
 
     @TestCase

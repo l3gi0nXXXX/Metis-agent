@@ -800,27 +800,70 @@ public func renderGitCodeWebhookStatusResult(payload: String): String {
         return "GitCode Webhook 状态：插件返回无法解析的响应。"
     }
     let status = jsonStringField(payload, "status", fallback: "ok")
-    let listenerStatus = jsonStringField(payload, "listenerStatus", fallback: "unknown")
-    let processorStatus = jsonStringField(payload, "processorStatus", fallback: "unknown")
+    let listenerJson = jsonObjectField(payload, "listener")
+    let queueJson = jsonObjectField(payload, "queue")
+    let processorJson = jsonObjectField(payload, "processor")
+    let stateSaveJson = jsonObjectField(payload, "stateSave")
+    let listenerStatusValue = jsonStringField(payload, "listenerStatus")
+    let listenerStatus = if (!listenerStatusValue.isEmpty()) { listenerStatusValue } else { jsonStringField(listenerJson, "status", fallback: "unknown") }
+    let processorStatusValue = jsonStringField(payload, "processorStatus")
+    let processorStatus = if (!processorStatusValue.isEmpty()) { processorStatusValue } else { jsonStringField(processorJson, "status", fallback: "unknown") }
     let receiver = jsonStringField(payload, "receiver", fallback: deriveGitCodeWebhookReceiverStatus(listenerStatus, processorStatus))
-    let bind = jsonStringField(payload, "webhookBind")
-    let pending = jsonIntField(payload, "pending", fallback: jsonIntField(payload, "pendingCount", fallback: 0))
-    let processing = jsonIntField(payload, "processing", fallback: 0)
-    let processed = jsonIntField(payload, "processed", fallback: 0)
-    let dead = jsonIntField(payload, "deadLetter", fallback: jsonIntField(payload, "deadLetterCount", fallback: 0))
-    let cancelled = jsonIntField(payload, "cancelled", fallback: 0)
-    let lastBatchProcessed = jsonIntField(payload, "lastBatchProcessed", fallback: 0)
+    let bindValue = jsonStringField(payload, "webhookBind")
+    let bind = if (!bindValue.isEmpty()) { bindValue } else { jsonStringField(listenerJson, "bind") }
+    let pending = jsonIntField(queueJson, "pending", fallback: jsonIntField(payload, "pending", fallback: jsonIntField(payload, "pendingCount", fallback: 0)))
+    let processing = jsonIntField(queueJson, "processing", fallback: jsonIntField(payload, "processing", fallback: 0))
+    let processed = jsonIntField(queueJson, "processed", fallback: jsonIntField(payload, "processed", fallback: 0))
+    let dead = jsonIntField(queueJson, "deadLetter", fallback: jsonIntField(payload, "deadLetter", fallback: jsonIntField(payload, "deadLetterCount", fallback: 0)))
+    let cancelled = jsonIntField(queueJson, "cancelled", fallback: jsonIntField(payload, "cancelled", fallback: 0))
+    let lastBatchProcessed = jsonIntField(payload, "lastBatchProcessed", fallback: jsonIntField(processorJson, "processed", fallback: processed))
+    let lastBatchClaimed = jsonIntField(payload, "lastBatchClaimed", fallback: 0)
+    let emptyTickCount = jsonIntField(payload, "emptyTickCount", fallback: jsonIntField(processorJson, "emptyTicks", fallback: 0))
+    let listenerLastStatus = jsonIntField(payload, "listenerLastStatus", fallback: jsonIntField(listenerJson, "lastStatus", fallback: 0))
+    let listenerLastDurationMs = jsonIntField(payload, "listenerLastDurationMs", fallback: jsonIntField(listenerJson, "lastDurationMs", fallback: 0))
+    let healthzValue = jsonStringField(listenerJson, "healthz")
+    let healthzText = if (!healthzValue.isEmpty()) { healthzValue } else if (payload.contains("\"healthzCount\":")) { "${jsonIntField(payload, "healthzCount", fallback: 0)}" } else { "" }
+    let activeRequestCount = jsonIntField(payload, "activeRequestCount", fallback: 0)
+    let stateSaveStatusValue = jsonStringField(payload, "stateSaveStatus")
+    let stateSaveStatus = if (!stateSaveStatusValue.isEmpty()) { stateSaveStatusValue } else { jsonStringField(stateSaveJson, "status") }
+    let stateSaveSkipped = jsonBoolField(payload, "stateSaveSkipped")
+    let stateSaveDurationMs = jsonIntField(payload, "stateSaveDurationMs", fallback: jsonIntField(stateSaveJson, "lastDurationMs", fallback: 0))
+    let stateSaveBytes = jsonIntField(payload, "stateSaveBytes", fallback: jsonIntField(stateSaveJson, "bytes", fallback: 0))
+    let auditCount = jsonIntField(payload, "auditCount", fallback: jsonIntField(stateSaveJson, "auditCount", fallback: 0))
+    let auditMax = jsonIntField(payload, "auditMax", fallback: jsonIntField(stateSaveJson, "auditMax", fallback: 0))
     let publicBaseUrl = if (jsonBoolField(payload, "publicBaseUrlConfigured")) { "configured" } else { "missing" }
     let lastError = redactGitCodePluginText(jsonStringField(payload, "lastError"))
-    let listenerLine = if (!bind.isEmpty() && listenerStatus == "listening") { "${bind} ${listenerStatus}" } else { listenerStatus }
-    let errorLine = if (lastError.isEmpty()) { "" } else { "\nlastError: ${lastError}" }
+    let listenerError = redactGitCodePluginText(jsonStringField(listenerJson, "lastError"))
+    let errorKind = redactGitCodePluginText(jsonStringField(payload, "errorKind"))
+    let listenerLine = if (!bind.isEmpty()) { "${bind} ${listenerStatus}" } else { listenerStatus }
+    let listenerRuntimeLine = if (payload.contains("\"listenerLastStatus\":") || payload.contains("\"listenerLastDurationMs\":") || payload.contains("\"healthzCount\":") || payload.contains("\"activeRequestCount\":") || !listenerJson.isEmpty()) {
+        let healthzPart = if (healthzText.isEmpty()) { "" } else { " healthz=${healthzText}" }
+        let activePart = if (payload.contains("\"activeRequestCount\":")) { " active=${activeRequestCount}" } else { "" }
+        " lastStatus=${listenerLastStatus} lastDuration=${listenerLastDurationMs}ms${healthzPart}${activePart}"
+    } else {
+        ""
+    }
+    let processorRuntimeLine = if (payload.contains("\"lastBatchClaimed\":") || payload.contains("\"emptyTickCount\":") || !processorJson.isEmpty()) {
+        " lastBatchProcessed=${lastBatchProcessed} claimed=${lastBatchClaimed} emptyTicks=${emptyTickCount}"
+    } else {
+        " lastBatchProcessed=${lastBatchProcessed}"
+    }
+    let stateSaveLine = if (stateSaveStatus.isEmpty()) {
+        "stateSave: diagnostics-missing\nmissing diagnostics: stateSave"
+    } else {
+        let skippedPart = if (payload.contains("\"stateSaveSkipped\":")) { " skipped=${stateSaveSkipped}" } else { "" }
+        "stateSave: ${stateSaveStatus}${skippedPart} lastDuration=${stateSaveDurationMs}ms bytes=${stateSaveBytes} audit=${auditCount}/${auditMax}"
+    }
+    let errorKindLine = if (errorKind.isEmpty()) { "" } else { "\nerrorKind: ${errorKind}" }
+    let mergedLastError = if (!lastError.isEmpty()) { lastError } else { listenerError }
     "GitCode Webhook 状态\n" +
         "status: ${status}\n" +
-        "receiver: ${receiver}\n" +
-        "listener: ${listenerLine}\n" +
+        "receiver: ${receiver}${errorKindLine}\n" +
+        "listener: ${listenerLine}${listenerRuntimeLine}\n" +
         "queue: pending=${pending} processing=${processing} processed=${processed} dead-letter=${dead} cancelled=${cancelled}\n" +
-        "processor: ${processorStatus} lastBatchProcessed=${lastBatchProcessed}\n" +
-        "publicBaseUrl: ${publicBaseUrl}${errorLine}"
+        "processor: ${processorStatus}${processorRuntimeLine}\n" +
+        "${stateSaveLine}\n" +
+        "publicBaseUrl: ${publicBaseUrl}${if (mergedLastError.isEmpty()) { "" } else { "\nlastError: ${mergedLastError}" }}"
 }
 
 public func renderGitCodeDeadLetterListResult(payload: String): String {
@@ -1079,6 +1122,13 @@ private func safeDeliveryForDisplay(deliveryId: String): String {
     if (deliveryId.isEmpty()) { return "(unknown)" }
     if (gitCodeDeliveryIdValid(deliveryId)) { return deliveryId }
     "delivery-${deliveryId.size}"
+}
+
+private func jsonObjectField(raw: String, key: String): String {
+    let needle = "\"${key}\":{"
+    if (!raw.contains(needle)) { return "" }
+    let tail = raw.split(needle, 2)[1]
+    "{" + tail.split("}", 2)[0] + "}"
 }
 
 private func jsonStringField(raw: String, key: String, fallback!: String = ""): String {
