@@ -831,39 +831,26 @@ public func renderGitCodeWebhookStatusResult(payload: String): String {
     let stateSaveBytes = jsonIntField(payload, "stateSaveBytes", fallback: jsonIntField(stateSaveJson, "bytes", fallback: 0))
     let auditCount = jsonIntField(payload, "auditCount", fallback: jsonIntField(stateSaveJson, "auditCount", fallback: 0))
     let auditMax = jsonIntField(payload, "auditMax", fallback: jsonIntField(stateSaveJson, "auditMax", fallback: 0))
-    let publicBaseUrl = if (jsonBoolField(payload, "publicBaseUrlConfigured")) { "configured" } else { "missing" }
     let lastError = redactGitCodePluginText(jsonStringField(payload, "lastError"))
     let listenerError = redactGitCodePluginText(jsonStringField(listenerJson, "lastError"))
     let errorKind = redactGitCodePluginText(jsonStringField(payload, "errorKind"))
-    let listenerLine = if (!bind.isEmpty()) { "${bind} ${listenerStatus}" } else { listenerStatus }
-    let listenerRuntimeLine = if (payload.contains("\"listenerLastStatus\":") || payload.contains("\"listenerLastDurationMs\":") || payload.contains("\"healthzCount\":") || payload.contains("\"activeRequestCount\":") || !listenerJson.isEmpty()) {
-        let healthzPart = if (healthzText.isEmpty()) { "" } else { " healthz=${healthzText}" }
-        let activePart = if (payload.contains("\"activeRequestCount\":")) { " active=${activeRequestCount}" } else { "" }
-        " lastStatus=${listenerLastStatus} lastDuration=${listenerLastDurationMs}ms${healthzPart}${activePart}"
-    } else {
-        ""
-    }
-    let processorRuntimeLine = if (payload.contains("\"lastBatchClaimed\":") || payload.contains("\"emptyTickCount\":") || !processorJson.isEmpty()) {
-        " lastBatchProcessed=${lastBatchProcessed} claimed=${lastBatchClaimed} emptyTicks=${emptyTickCount}"
-    } else {
-        " lastBatchProcessed=${lastBatchProcessed}"
-    }
-    let stateSaveLine = if (stateSaveStatus.isEmpty()) {
-        "stateSave: diagnostics-missing\nmissing diagnostics: stateSave"
-    } else {
-        let skippedPart = if (payload.contains("\"stateSaveSkipped\":")) { " skipped=${stateSaveSkipped}" } else { "" }
-        "stateSave: ${stateSaveStatus}${skippedPart} lastDuration=${stateSaveDurationMs}ms bytes=${stateSaveBytes} audit=${auditCount}/${auditMax}"
-    }
-    let errorKindLine = if (errorKind.isEmpty()) { "" } else { "\nerrorKind: ${errorKind}" }
     let mergedLastError = if (!lastError.isEmpty()) { lastError } else { listenerError }
-    "GitCode Webhook 状态\n" +
-        "status: ${status}\n" +
-        "receiver: ${receiver}${errorKindLine}\n" +
-        "listener: ${listenerLine}${listenerRuntimeLine}\n" +
-        "queue: pending=${pending} processing=${processing} processed=${processed} dead-letter=${dead} cancelled=${cancelled}\n" +
-        "processor: ${processorStatus}${processorRuntimeLine}\n" +
-        "${stateSaveLine}\n" +
-        "publicBaseUrl: ${publicBaseUrl}${if (mergedLastError.isEmpty()) { "" } else { "\nlastError: ${mergedLastError}" }}"
+    let listenerHasRuntime = payload.contains("\"listenerLastStatus\":") ||
+        payload.contains("\"listenerLastDurationMs\":") ||
+        payload.contains("\"healthzCount\":") ||
+        payload.contains("\"activeRequestCount\":") ||
+        !listenerJson.isEmpty()
+    let processorHasRuntime = payload.contains("\"lastBatchClaimed\":") ||
+        payload.contains("\"emptyTickCount\":") ||
+        !processorJson.isEmpty()
+    let publicBaseUrl = if (jsonBoolField(payload, "publicBaseUrlConfigured")) { "已配置" } else { "未配置" }
+    let errorKindLine = if (errorKind.isEmpty()) { "" } else { "\n错误类型：${errorKind}" }
+    "GitCode Webhook 状态：${describeGitCodeWebhookOverall(status, receiver, listenerLastStatus)}${errorKindLine}\n" +
+        "接收端：${describeGitCodeWebhookListener(listenerStatus, bind, listenerLastStatus, listenerLastDurationMs, healthzText, activeRequestCount, listenerHasRuntime, payload.contains("\"activeRequestCount\":"))}\n" +
+        "队列：${describeGitCodeWebhookQueue(pending, processing, processed, dead, cancelled)}\n" +
+        "处理器：${describeGitCodeWebhookProcessor(processorStatus, lastBatchClaimed, lastBatchProcessed, emptyTickCount, processorHasRuntime)}\n" +
+        "状态保存：${describeGitCodeWebhookStateSave(stateSaveStatus, stateSaveDurationMs, stateSaveBytes, auditCount, auditMax)}\n" +
+        "公网地址：${publicBaseUrl}${if (mergedLastError.isEmpty()) { "" } else { "\n最近错误：${mergedLastError}" }}"
 }
 
 public func renderGitCodeDeadLetterListResult(payload: String): String {
@@ -1122,6 +1109,116 @@ private func safeDeliveryForDisplay(deliveryId: String): String {
     if (deliveryId.isEmpty()) { return "(unknown)" }
     if (gitCodeDeliveryIdValid(deliveryId)) { return deliveryId }
     "delivery-${deliveryId.size}"
+}
+
+private func describeGitCodeWebhookOverall(status: String, receiver: String, listenerLastStatus: Int64): String {
+    if (receiver == "running") { return "运行正常" }
+    if (receiver == "degraded" || status == "degraded" || status == "failed" || status == "error") {
+        return "降级或异常"
+    }
+    if (listenerLastStatus >= 200 && listenerLastStatus < 300) {
+        return "可接收请求，但插件运行诊断不完整"
+    }
+    "状态信息不完整，无法判断整体健康"
+}
+
+private func describeGitCodeWebhookListener(status: String, bind: String, lastStatus: Int64, durationMs: Int64, healthz: String, activeRequests: Int64, hasRuntime: Bool, hasActiveCount: Bool): String {
+    var text = match (status) {
+        case "listening" => "正在监听"
+        case "not_started" => "未启动"
+        case "error" => "异常"
+        case "unknown" =>
+            if (lastStatus >= 200 && lastStatus < 300) {
+                "最近一次请求成功，但插件未返回监听状态"
+            } else if (lastStatus >= 400) {
+                "最近一次请求失败，但插件未返回监听状态"
+            } else {
+                "插件未返回监听状态"
+            }
+        case _ => "状态 ${status}"
+    }
+    if (!bind.isEmpty()) {
+        text += "（地址 ${bind}）"
+    }
+    if (!hasRuntime) {
+        return text + "。"
+    }
+    if (lastStatus > 0) {
+        text += "；最近 HTTP ${lastStatus}，耗时 ${durationMs}ms"
+    }
+    if (!healthz.isEmpty()) {
+        text += "；${describeGitCodeWebhookHealthz(healthz)}"
+    }
+    if (hasActiveCount) {
+        text += if (activeRequests == 0) { "；当前没有正在处理的请求" } else { "；当前正在处理 ${activeRequests} 个请求" }
+    }
+    text + "。"
+}
+
+private func describeGitCodeWebhookHealthz(value: String): String {
+    let normalized = value.trimAscii().toAsciiLower()
+    if (normalized == "ok") { return "健康检查正常" }
+    if (normalized == "timeout") { return "健康检查超时" }
+    try {
+        let count = Int64.parse(normalized)
+        if (count <= 0) { return "健康检查暂无成功记录" }
+        "健康检查成功 ${count} 次"
+    } catch (_: Exception) {
+        "健康检查状态 ${value}"
+    }
+}
+
+private func describeGitCodeWebhookQueue(pending: Int64, processing: Int64, processed: Int64, dead: Int64, cancelled: Int64): String {
+    let prefix = if (pending == 0 && processing == 0) {
+        "没有积压"
+    } else if (pending > 0 && processing > 0) {
+        "待处理 ${pending} 条，正在处理 ${processing} 条"
+    } else if (pending > 0) {
+        "待处理 ${pending} 条"
+    } else {
+        "正在处理 ${processing} 条"
+    }
+    "${prefix}，已处理 ${processed} 条，失败 ${dead} 条，取消 ${cancelled} 条。"
+}
+
+private func describeGitCodeWebhookProcessor(status: String, claimed: Int64, processed: Int64, emptyTicks: Int64, hasRuntime: Bool): String {
+    var text = match (status) {
+        case "running" => "正在运行"
+        case "disabled" => "已禁用"
+        case "not_started" => "未启动"
+        case "degraded" => "降级运行"
+        case "unknown" =>
+            if (emptyTicks > 0) {
+                "正在空闲轮询，但插件未返回生命周期状态"
+            } else {
+                "插件未返回处理器状态"
+            }
+        case _ => "状态 ${status}"
+    }
+    if (!hasRuntime) {
+        return text + "；最近处理 ${processed} 条。"
+    }
+    let claimText = if (claimed > 0) { "最近领取 ${claimed} 条" } else { "最近未领取新事件" }
+    text + "；${claimText}，处理 ${processed} 条；空闲轮询 ${emptyTicks} 次。"
+}
+
+private func describeGitCodeWebhookStateSave(status: String, durationMs: Int64, bytes: Int64, auditCount: Int64, auditMax: Int64): String {
+    if (status.isEmpty()) {
+        return "插件没有返回状态保存诊断，暂时无法判断最近一次状态是否写入。"
+    }
+    let prefix = match (status) {
+        case "saved" => "最近一次状态保存成功"
+        case "skipped_empty_queue" => "空队列，无需保存状态"
+        case "skipped_unchanged" => "状态没有变化，无需保存"
+        case "not_started" => "处理器尚未执行状态保存"
+        case "state_save_failed" => "状态保存异常"
+        case "error" => "状态保存异常"
+        case _ => "状态保存状态 ${status}"
+    }
+    if (status == "not_started") {
+        return "${prefix}。"
+    }
+    "${prefix}，耗时 ${durationMs}ms，写入 ${bytes} 字节，审计记录 ${auditCount}/${auditMax}。"
 }
 
 private func jsonObjectField(raw: String, key: String): String {
