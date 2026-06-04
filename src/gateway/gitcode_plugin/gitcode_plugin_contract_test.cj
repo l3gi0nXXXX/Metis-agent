@@ -1,10 +1,16 @@
 package metis.gateway.gitcode_plugin
 
 import metis.gateway.service_plugin.{ServicePluginDeliveryTarget, parseServicePluginJobStartPayload}
+import std.fs.{File, Path, exists, remove}
+import std.time.DateTime
 import std.unittest.testmacro.*
 
 @Test
 public class GitCodePluginContractTest {
+    private func tempSubscriptionPath(label: String): String {
+        "/tmp/metis-gitcode-subscription-${label}-${DateTime.now().toUnixTimeStamp().toNanoseconds()}.jsonl"
+    }
+
     @TestCase
     public func parseGitCodeCommandsCoversStatusSubscribeScanQueryAndUnknown(): Unit {
         @Expect(parseGitCodeCommand("hello").handled, false)
@@ -93,6 +99,78 @@ public class GitCodePluginContractTest {
     }
 
     @TestCase
+    public func gitCodeSubscriptionStorePersistsReloadsAndKeepsSubscribeIdempotent(): Unit {
+        let path = this.tempSubscriptionPath("persist")
+        resetGitCodePluginHostForTest()
+        setGitCodeSubscriptionStoreForTest(Some(loadGitCodeSubscriptionStore(path)))
+        try {
+            let target = GitCodeSubscriptionTarget("telegram", "tg-gitcode", "peer-1")
+            let first = saveGitCodeSubscription(target)
+            let second = saveGitCodeSubscription(target)
+            @Expect(first.ok, true)
+            @Expect(first.status, "created")
+            @Expect(second.ok, true)
+            @Expect(second.status, "already_present")
+            @Expect(listGitCodeSubscriptions().size, 1)
+            @Expect(exists(Path(path)), true)
+
+            resetGitCodePluginHostForTest()
+            setGitCodeSubscriptionStoreForTest(Some(loadGitCodeSubscriptionStore(path)))
+            let loaded = listGitCodeSubscriptions()
+            @Expect(loaded.size, 1)
+            @Expect(loaded[0].target.channel, "telegram")
+            @Expect(loaded[0].target.accountId, "tg-gitcode")
+            @Expect(loaded[0].target.peerId, "peer-1")
+        } finally {
+            resetGitCodePluginHostForTest()
+            try { remove(Path(path)) } catch (_: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func gitCodeSubscriptionStoreRemoveInvalidCorruptAndLimitCasesAreSafe(): Unit {
+        let path = this.tempSubscriptionPath("negative")
+        resetGitCodePluginHostForTest()
+        setGitCodeSubscriptionStoreForTest(Some(loadGitCodeSubscriptionStore(path)))
+        try {
+            let invalid = saveGitCodeSubscription(GitCodeSubscriptionTarget("telegram", "acct", ""))
+            @Expect(invalid.ok, false)
+            @Expect(invalid.status, "invalid_target")
+            @Expect(exists(Path(path)), false)
+
+            let target = GitCodeSubscriptionTarget("feishu", "fs", "peer-2")
+            @Expect(saveGitCodeSubscription(target).status, "created")
+            @Expect(removeGitCodeSubscription(target).status, "removed")
+            @Expect(listGitCodeSubscriptions().size, 0)
+
+            resetGitCodePluginHostForTest()
+            File.writeTo(Path(path), "bad-line\n".toArray())
+            setGitCodeSubscriptionStoreForTest(Some(loadGitCodeSubscriptionStore(path)))
+            @Expect(listGitCodeSubscriptions().size, 0)
+
+            resetGitCodePluginHostForTest()
+            setGitCodeSubscriptionStoreForTest(Some(loadGitCodeSubscriptionStore(path)))
+            let inactiveAtLimit = GitCodeSubscriptionTarget("telegram", "acct", "peer-inactive-at-limit")
+            @Expect(saveGitCodeSubscription(inactiveAtLimit).status, "created")
+            @Expect(removeGitCodeSubscription(inactiveAtLimit).status, "removed")
+            for (i in 0..100) {
+                let saved = saveGitCodeSubscription(GitCodeSubscriptionTarget("telegram", "acct", "peer-${i}"))
+                @Expect(saved.ok, true)
+            }
+            let overflow = saveGitCodeSubscription(GitCodeSubscriptionTarget("telegram", "acct", "peer-overflow"))
+            @Expect(overflow.ok, false)
+            @Expect(overflow.status, "subscription_limit_reached")
+            let reactivationOverflow = saveGitCodeSubscription(inactiveAtLimit)
+            @Expect(reactivationOverflow.ok, false)
+            @Expect(reactivationOverflow.status, "subscription_limit_reached")
+            @Expect(listGitCodeSubscriptions().size, 100)
+        } finally {
+            resetGitCodePluginHostForTest()
+            try { remove(Path(path)) } catch (_: Exception) { () }
+        }
+    }
+
+    @TestCase
     public func webhookStatusRendererUsesRuntimeFieldsAndNeverFallsBackToRawJson(): Unit {
         let running = renderGitCodeWebhookStatusResult("{\"status\":\"ok\",\"configStatus\":\"valid\",\"queueStatus\":\"ready\",\"listenerStatus\":\"listening\",\"processorStatus\":\"running\",\"webhookBind\":\"127.0.0.1:18080\",\"publicBaseUrlConfigured\":true,\"queue\":{\"pending\":0,\"processing\":1,\"processed\":3,\"deadLetter\":0,\"cancelled\":0},\"lastBatchProcessed\":1,\"lastError\":\"\"}")
         @Expect(running.contains("GitCode Webhook 状态：运行正常"), true)
@@ -111,6 +189,12 @@ public class GitCodePluginContractTest {
         @Expect(flat.contains("处理器：正在运行；最近领取 1 条，处理 1 条；空闲轮询 7 次。"), true)
         @Expect(flat.contains("状态保存：最近一次状态保存成功，耗时 4ms，写入 512 字节，审计记录 12/1000。"), true)
         @Expect(flat.contains("{\"status\""), false)
+
+        let delivery = renderGitCodeWebhookStatusResult("{\"status\":\"ok\",\"receiver\":\"running\",\"listenerStatus\":\"listening\",\"processorStatus\":\"running\",\"queue\":{\"pending\":0,\"processing\":0,\"processed\":3,\"deadLetter\":0,\"cancelled\":0},\"dispatch\":{\"telegram\":1,\"feishu\":1,\"failed\":0,\"orphan\":0},\"subscribers\":{\"telegram\":1,\"feishu\":1},\"publicBaseUrlConfigured\":true}")
+        @Expect(delivery.contains("投递：最近事件已发送到 TG 1 个、Feishu 1 个；最近失败 0 个；无对应任务事件 0 个。"), true)
+        @Expect(delivery.contains("订阅：TG 1 个，Feishu 1 个。"), true)
+        @Expect(delivery.contains("\"dispatch\""), false)
+        @Expect(delivery.contains("\"subscribers\""), false)
 
         let degraded = renderGitCodeWebhookStatusResult("{\"status\":\"ok\",\"configStatus\":\"valid\",\"queueStatus\":\"ready\",\"listenerStatus\":\"not_started\",\"processorStatus\":\"running\",\"lastError\":\"Authorization: Bearer secret /Users/name/private\"}")
         @Expect(degraded.contains("GitCode Webhook 状态：降级或异常"), true)

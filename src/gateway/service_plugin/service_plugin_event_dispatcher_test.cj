@@ -17,6 +17,179 @@ public class ServicePluginEventDispatcherTest {
         store
     }
 
+    private func acceptedFrame(jobId!: String = "webhook-d1", eventId!: String = "gitcode:cangjie/community:pr:71", repo!: String = "cangjie/community", kind!: String = "pr", number!: String = "71", url!: String = "https://gitcode.com/cangjie/community/pulls/71", title!: String = "修复 xxx", content!: String = "please review"): ServiceFrame {
+        ServiceFrame("event", "accepted-${eventId}", "gitcode-monitor", method: "emitCapabilityEvent", capabilityId: "gitcode.event.accepted", payload: "{\"jobId\":\"${jobId}\",\"eventId\":\"${eventId}\",\"repo\":\"${repo}\",\"kind\":\"${kind}\",\"number\":\"${number}\",\"title\":\"${title}\",\"url\":\"${url}\",\"content\":\"${content}\"}")
+    }
+
+    private func resetDispatcherHooks(): Unit {
+        setServicePluginEventDeliveryForTest(None)
+        setServicePluginGeneratedReplyHandlerForTest(None<(ServicePluginPendingJob, ServicePluginAcceptedGitCodeEvent) -> ServicePluginGeneratedReplyResult>)
+        setServicePluginWebhookGeneratedReplyHandlerForTest(None<(ServicePluginAcceptedGitCodeEvent, ServicePluginDeliveryTarget) -> ServicePluginGeneratedReplyResult>)
+        setServicePluginWebhookSubscribersProviderForTest(None<(ServicePluginAcceptedGitCodeEvent) -> ArrayList<ServicePluginDeliveryTarget>>)
+        resetServicePluginGeneratedReplyStateForTest()
+    }
+
+    private func targetRows(targets: Array<ServicePluginDeliveryTarget>): ArrayList<ServicePluginDeliveryTarget> {
+        let out = ArrayList<ServicePluginDeliveryTarget>()
+        for (target in targets) {
+            out.add(target)
+        }
+        out
+    }
+
+    @TestCase
+    public func webhookAcceptedEventWithoutPendingJobReportsOrphan(): Unit {
+        this.resetDispatcherHooks()
+        let result = dispatchServicePluginEvent(this.acceptedFrame(jobId: "job-without-pending"), store: ServicePluginPendingJobStore())
+        @Expect(result.ok, false)
+        @Expect(result.status, "orphan_event")
+        @Expect(result.diagnostic, "pending job not found for gitcode.event.accepted")
+        @Expect(result.capabilityId, "gitcode.event.accepted")
+        @Expect(result.diagnosticHash.size, 64)
+    }
+
+    @TestCase
+    public func acceptedEventInvalidPayloadStopsBeforeDeliveryAndDraft(): Unit {
+        this.resetDispatcherHooks()
+        let messages = ArrayList<String>()
+        let draftCalls = ArrayList<String>()
+        setServicePluginEventDeliveryForTest(Some({ _target: ServicePluginDeliveryTarget, text: String =>
+            messages.add(text)
+            ServicePluginEventDeliveryResult(true, "sent")
+        }))
+        setServicePluginWebhookGeneratedReplyHandlerForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent, _target: ServicePluginDeliveryTarget =>
+            draftCalls.add("called")
+            ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "draft")
+        }))
+        try {
+            let missingEventId = dispatchServicePluginEvent(this.acceptedFrame(eventId: ""), store: ServicePluginPendingJobStore())
+            @Expect(missingEventId.ok, false)
+            @Expect(missingEventId.status, "event_payload_invalid")
+            @Expect(missingEventId.diagnostic, "missing eventId")
+
+            let missingRepo = dispatchServicePluginEvent(this.acceptedFrame(repo: ""), store: ServicePluginPendingJobStore())
+            @Expect(missingRepo.ok, false)
+            @Expect(missingRepo.status, "event_payload_invalid")
+            @Expect(missingRepo.diagnostic, "missing repo")
+
+            let missingUrl = dispatchServicePluginEvent(this.acceptedFrame(url: ""), store: ServicePluginPendingJobStore())
+            @Expect(missingUrl.ok, false)
+            @Expect(missingUrl.status, "event_payload_invalid")
+            @Expect(missingUrl.diagnostic, "missing url")
+            @Expect(messages.size, 0)
+            @Expect(draftCalls.size, 0)
+        } finally {
+            this.resetDispatcherHooks()
+        }
+    }
+
+    @TestCase
+    public func dispatchDiagnosticSummaryRedactsRawPayloadAndSensitiveText(): Unit {
+        let frame = this.acceptedFrame(content: "Authorization: Bearer secret /Users/name/private")
+        let result = ServicePluginEventDispatchResult(false, "orphan_event", diagnostic: "Authorization: Bearer secret /Users/name/private", eventId: "event-1", capabilityId: "gitcode.event.accepted")
+        let summary = servicePluginDispatchDiagnosticSummary(frame, result)
+        @Expect(summary.contains("serviceId=gitcode-monitor"), true)
+        @Expect(summary.contains("capabilityId=gitcode.event.accepted"), true)
+        @Expect(summary.contains("status=orphan_event"), true)
+        @Expect(summary.contains("diagnosticHash="), true)
+        @Expect(summary.contains("Authorization"), false)
+        @Expect(summary.contains("Bearer"), false)
+        @Expect(summary.contains("/Users/name/private"), false)
+        @Expect(summary.contains("\"jobId\""), false)
+    }
+
+    @TestCase
+    public func webhookAcceptedEventUsesSubscriptionFallbackAndDeliversDraft(): Unit {
+        this.resetDispatcherHooks()
+        let messages = ArrayList<String>()
+        setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent =>
+            this.targetRows([this.target(channel: "telegram", peerId: "tg-peer")])
+        }))
+        setServicePluginWebhookGeneratedReplyHandlerForTest(Some({ event: ServicePluginAcceptedGitCodeEvent, target: ServicePluginDeliveryTarget =>
+            @Expect(event.repo, "cangjie/community")
+            @Expect(target.channel, "telegram")
+            ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "请补充测试。")
+        }))
+        setServicePluginEventDeliveryForTest(Some({ target: ServicePluginDeliveryTarget, text: String =>
+            @Expect(target.peerId, "tg-peer")
+            messages.add(text)
+            ServicePluginEventDeliveryResult(true, "sent")
+        }))
+        try {
+            let result = dispatchServicePluginEvent(this.acceptedFrame(), store: ServicePluginPendingJobStore())
+            @Expect(result.ok, true)
+            @Expect(result.status, "generated_reply_delivered")
+            @Expect(result.targetCount, 1)
+            @Expect(result.deliverySuccess, 1)
+            @Expect(result.diagnosticHash.size, 64)
+            @Expect(messages.size, 1)
+            @Expect(messages[0].contains("GitCode 回复草稿"), true)
+            @Expect(messages[0].contains("https://gitcode.com/cangjie/community/pulls/71"), true)
+            @Expect(servicePluginWebhookDispatchStatsSnapshot().size, 1)
+        } finally {
+            this.resetDispatcherHooks()
+        }
+    }
+
+    @TestCase
+    public func webhookAcceptedEventWithoutSubscribersDoesNotCallDraftHandler(): Unit {
+        this.resetDispatcherHooks()
+        let draftCalls = ArrayList<String>()
+        setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent =>
+            ArrayList<ServicePluginDeliveryTarget>()
+        }))
+        setServicePluginWebhookGeneratedReplyHandlerForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent, _target: ServicePluginDeliveryTarget =>
+            draftCalls.add("called")
+            ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "draft")
+        }))
+        try {
+            let result = dispatchServicePluginEvent(this.acceptedFrame(), store: ServicePluginPendingJobStore())
+            @Expect(result.ok, true)
+            @Expect(result.status, "no_subscribers")
+            @Expect(result.targetCount, 0)
+            @Expect(draftCalls.size, 0)
+        } finally {
+            this.resetDispatcherHooks()
+        }
+    }
+
+    @TestCase
+    public func webhookAcceptedEventSupportsMultipleTargetsPartialFailureAndDedupe(): Unit {
+        this.resetDispatcherHooks()
+        let messages = ArrayList<String>()
+        setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent =>
+            this.targetRows([this.target(channel: "telegram", peerId: "tg-peer"), this.target(channel: "feishu", peerId: "fs-peer")])
+        }))
+        setServicePluginWebhookGeneratedReplyHandlerForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent, _target: ServicePluginDeliveryTarget =>
+            ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "draft")
+        }))
+        setServicePluginEventDeliveryForTest(Some({ target: ServicePluginDeliveryTarget, text: String =>
+            messages.add("${target.channel}:${text}")
+            if (target.channel == "telegram") {
+                ServicePluginEventDeliveryResult(false, "send_failed", diagnostic: "tg failed")
+            } else {
+                ServicePluginEventDeliveryResult(true, "sent")
+            }
+        }))
+        try {
+            let first = dispatchServicePluginEvent(this.acceptedFrame(), store: ServicePluginPendingJobStore())
+            @Expect(first.ok, true)
+            @Expect(first.status, "generated_reply_partially_delivered")
+            @Expect(first.targetCount, 2)
+            @Expect(first.deliverySuccess, 1)
+            @Expect(first.deliveryFailed, 1)
+            @Expect(first.failureDetails.size, 1)
+            @Expect(messages.size, 2)
+
+            let duplicate = dispatchServicePluginEvent(this.acceptedFrame(), store: ServicePluginPendingJobStore())
+            @Expect(duplicate.ok, true)
+            @Expect(duplicate.status, "duplicate_event")
+            @Expect(messages.size, 2)
+        } finally {
+            this.resetDispatcherHooks()
+        }
+    }
+
     @TestCase
     public func dispatchCompletedFailedAndCancelledEventsToOriginalTarget(): Unit {
         let messages = ArrayList<String>()
@@ -223,7 +396,7 @@ public class ServicePluginEventDispatcherTest {
         resetServicePluginGeneratedReplyStateForTest()
         try {
             let store = this.storeWithRunningJob()
-            let accepted = ServiceFrame("event", "a2", "gitcode-monitor", method: "emitCapabilityEvent", capabilityId: "gitcode.event.accepted", payload: "{\"jobId\":\"job-1\",\"eventId\":\"e2\",\"repo\":\"cangjie/community\",\"kind\":\"issue\",\"number\":\"72\",\"url\":\"\"}")
+            let accepted = ServiceFrame("event", "a2", "gitcode-monitor", method: "emitCapabilityEvent", capabilityId: "gitcode.event.accepted", payload: "{\"jobId\":\"job-1\",\"eventId\":\"e2\",\"repo\":\"cangjie/community\",\"kind\":\"issue\",\"number\":\"72\",\"url\":\"https://gitcode.com/cangjie/community/issues/72\"}")
             let acceptedResult = dispatchServicePluginEvent(accepted, store: store)
             @Expect(acceptedResult.ok, true)
             @Expect(acceptedResult.status, "generated_reply_degraded_delivered")

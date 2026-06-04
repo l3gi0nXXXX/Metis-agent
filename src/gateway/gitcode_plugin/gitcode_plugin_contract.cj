@@ -1,6 +1,6 @@
 package metis.gateway.gitcode_plugin
 
-import metis.gateway.service_plugin.{ServicePluginDeliveryTarget, hashRawPayload, servicePluginDeliveryTargetToJson}
+import metis.gateway.service_plugin.{ServicePluginAcceptedGitCodeEvent, ServicePluginDeliveryTarget, hashRawPayload, servicePluginDeliveryTargetToJson}
 import std.collection.{ArrayList, HashMap, HashSet}
 import std.convert.Parsable
 import stdx.encoding.json.{JsonBool, JsonInt, JsonObject, JsonString}
@@ -117,10 +117,14 @@ public class SubscriptionSaveResult {
     public let ok: Bool
     public let status: String
     public let targetKey: String
-    public init(ok: Bool, status: String, targetKey!: String = "") {
+    public let diagnostic: String
+    public let limit: Int64
+    public init(ok: Bool, status: String, targetKey!: String = "", diagnostic!: String = "", limit!: Int64 = 0) {
         this.ok = ok
         this.status = status
         this.targetKey = targetKey
+        this.diagnostic = diagnostic.trimAscii()
+        this.limit = limit
     }
 }
 
@@ -442,10 +446,29 @@ public class EndToEndSmokeResult {
 
 private var gitcodeSubscriptions = HashMap<String, GitCodeSubscriptionSnapshot>()
 private var gitcodeSeenEvents = HashSet<String>()
+private var gitcodeSubscriptionStore: Option<GitCodeSubscriptionStore> = None<GitCodeSubscriptionStore>
 
 public func resetGitCodePluginHostForTest(): Unit {
     gitcodeSubscriptions = HashMap<String, GitCodeSubscriptionSnapshot>()
     gitcodeSeenEvents = HashSet<String>()
+    gitcodeSubscriptionStore = None<GitCodeSubscriptionStore>
+}
+
+public func setGitCodeSubscriptionStore(store: Option<GitCodeSubscriptionStore>): Unit {
+    gitcodeSubscriptionStore = store
+}
+
+public func setGitCodeSubscriptionStoreForTest(store: Option<GitCodeSubscriptionStore>): Unit {
+    setGitCodeSubscriptionStore(store)
+}
+
+public func gitCodeSubscriptionStoreSnapshotForDispatcher(_event: ServicePluginAcceptedGitCodeEvent): ArrayList<ServicePluginDeliveryTarget> {
+    let out = ArrayList<ServicePluginDeliveryTarget>()
+    for (row in listGitCodeSubscriptions()) {
+        if (!row.scope.generatedReplies) { continue }
+        out.add(ServicePluginDeliveryTarget(row.target.channel, row.target.accountId, row.target.peerId, threadId: row.target.threadId))
+    }
+    out
 }
 
 public func parseGitCodeCommand(text: String): GitCodePluginCommandParseResult {
@@ -541,9 +564,21 @@ public func buildGitCodeSubscriptionTarget(context: GatewayCommandContext): GitC
     GitCodeSubscriptionTarget(context.channel, context.accountId, context.peerId, threadId: context.threadId)
 }
 
+private func gitCodeSubscriptionTargetDiagnostic(target: GitCodeSubscriptionTarget): String {
+    if (target.channel.isEmpty()) { return "channel is empty" }
+    if (target.accountId.isEmpty()) { return "accountId is empty" }
+    if (target.peerId.isEmpty()) { return "peerId is empty" }
+    ""
+}
+
 public func saveGitCodeSubscription(target: GitCodeSubscriptionTarget, scope!: GitCodeSubscriptionScope = GitCodeSubscriptionScope()): SubscriptionSaveResult {
-    if (target.channel.isEmpty() || target.accountId.isEmpty() || target.peerId.isEmpty()) {
-        return SubscriptionSaveResult(false, "invalid_target", targetKey: target.targetKey)
+    match (gitcodeSubscriptionStore) {
+        case Some(store) => return store.createOrUpdate(target, scope: scope)
+        case None => ()
+    }
+    let validation = gitCodeSubscriptionTargetDiagnostic(target)
+    if (!validation.isEmpty()) {
+        return SubscriptionSaveResult(false, "invalid_target", targetKey: target.targetKey, diagnostic: validation)
     }
     let status = if (gitcodeSubscriptions.contains(target.targetKey)) { "already_present" } else { "created" }
     gitcodeSubscriptions[target.targetKey] = GitCodeSubscriptionSnapshot(target, scope, active: true)
@@ -551,10 +586,17 @@ public func saveGitCodeSubscription(target: GitCodeSubscriptionTarget, scope!: G
 }
 
 public func formatGitCodeSubscribeResult(result: SubscriptionSaveResult): String {
-    "gitcode subscribe status=${result.status} target=${safeTargetKey(result.targetKey)}"
+    if (!result.ok) {
+        return "GitCode 订阅失败\n状态: ${result.status}${if (result.diagnostic.isEmpty()) { "" } else { "\n诊断: ${redactGitCodePluginText(result.diagnostic)}" }}"
+    }
+    "GitCode 订阅已开启\n状态: ${result.status}\n目标: ${safeTargetKey(result.targetKey)}"
 }
 
 public func removeGitCodeSubscription(target: GitCodeSubscriptionTarget): SubscriptionRemoveResult {
+    match (gitcodeSubscriptionStore) {
+        case Some(store) => return store.remove(target)
+        case None => ()
+    }
     if (!gitcodeSubscriptions.contains(target.targetKey)) {
         return SubscriptionRemoveResult(true, "already_absent", targetKey: target.targetKey)
     }
@@ -567,6 +609,10 @@ public func removeGitCodeSubscription(target: GitCodeSubscriptionTarget): Subscr
 }
 
 public func listGitCodeSubscriptions(filter!: GitCodeSubscriptionFilter = GitCodeSubscriptionFilter()): ArrayList<GitCodeSubscriptionSnapshot> {
+    match (gitcodeSubscriptionStore) {
+        case Some(store) => return store.listActive(filter: filter)
+        case None => ()
+    }
     let out = ArrayList<GitCodeSubscriptionSnapshot>()
     for ((_, row) in gitcodeSubscriptions) {
         if (row.active && (filter.channel.isEmpty() || row.target.channel == filter.channel)) {
@@ -804,6 +850,8 @@ public func renderGitCodeWebhookStatusResult(payload: String): String {
     let queueJson = jsonObjectField(payload, "queue")
     let processorJson = jsonObjectField(payload, "processor")
     let stateSaveJson = jsonObjectField(payload, "stateSave")
+    let dispatchJson = jsonObjectField(payload, "dispatch")
+    let subscribersJson = jsonObjectField(payload, "subscribers")
     let listenerStatusValue = jsonStringField(payload, "listenerStatus")
     let listenerStatus = if (!listenerStatusValue.isEmpty()) { listenerStatusValue } else { jsonStringField(listenerJson, "status", fallback: "unknown") }
     let processorStatusValue = jsonStringField(payload, "processorStatus")
@@ -845,12 +893,14 @@ public func renderGitCodeWebhookStatusResult(payload: String): String {
         !processorJson.isEmpty()
     let publicBaseUrl = if (jsonBoolField(payload, "publicBaseUrlConfigured")) { "已配置" } else { "未配置" }
     let errorKindLine = if (errorKind.isEmpty()) { "" } else { "\n错误类型：${errorKind}" }
+    let dispatchLine = if (dispatchJson.isEmpty()) { "" } else { "\n投递：${describeGitCodeWebhookDispatch(dispatchJson)}" }
+    let subscribersLine = if (subscribersJson.isEmpty()) { "" } else { "\n订阅：${describeGitCodeWebhookSubscribers(subscribersJson)}" }
     "GitCode Webhook 状态：${describeGitCodeWebhookOverall(status, receiver, listenerLastStatus)}${errorKindLine}\n" +
         "接收端：${describeGitCodeWebhookListener(listenerStatus, bind, listenerLastStatus, listenerLastDurationMs, healthzText, activeRequestCount, listenerHasRuntime, payload.contains("\"activeRequestCount\":"))}\n" +
         "队列：${describeGitCodeWebhookQueue(pending, processing, processed, dead, cancelled)}\n" +
         "处理器：${describeGitCodeWebhookProcessor(processorStatus, lastBatchClaimed, lastBatchProcessed, emptyTickCount, processorHasRuntime)}\n" +
         "状态保存：${describeGitCodeWebhookStateSave(stateSaveStatus, stateSaveDurationMs, stateSaveBytes, auditCount, auditMax)}\n" +
-        "公网地址：${publicBaseUrl}${if (mergedLastError.isEmpty()) { "" } else { "\n最近错误：${mergedLastError}" }}"
+        "公网地址：${publicBaseUrl}${dispatchLine}${subscribersLine}${if (mergedLastError.isEmpty()) { "" } else { "\n最近错误：${mergedLastError}" }}"
 }
 
 public func renderGitCodeDeadLetterListResult(payload: String): String {
@@ -1219,6 +1269,20 @@ private func describeGitCodeWebhookStateSave(status: String, durationMs: Int64, 
         return "${prefix}。"
     }
     "${prefix}，耗时 ${durationMs}ms，写入 ${bytes} 字节，审计记录 ${auditCount}/${auditMax}。"
+}
+
+private func describeGitCodeWebhookDispatch(raw: String): String {
+    let tg = jsonIntField(raw, "telegram", fallback: jsonIntField(raw, "tg", fallback: 0))
+    let feishu = jsonIntField(raw, "feishu", fallback: 0)
+    let failed = jsonIntField(raw, "failed", fallback: jsonIntField(raw, "deliveryFailed", fallback: 0))
+    let orphan = jsonIntField(raw, "orphan", fallback: jsonIntField(raw, "orphanEvent", fallback: 0))
+    "最近事件已发送到 TG ${tg} 个、Feishu ${feishu} 个；最近失败 ${failed} 个；无对应任务事件 ${orphan} 个。"
+}
+
+private func describeGitCodeWebhookSubscribers(raw: String): String {
+    let tg = jsonIntField(raw, "telegram", fallback: jsonIntField(raw, "tg", fallback: 0))
+    let feishu = jsonIntField(raw, "feishu", fallback: 0)
+    "TG ${tg} 个，Feishu ${feishu} 个。"
 }
 
 private func jsonObjectField(raw: String, key: String): String {

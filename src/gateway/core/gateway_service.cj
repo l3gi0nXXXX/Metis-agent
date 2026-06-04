@@ -6,10 +6,10 @@ import metis.core.model.{findModelCapabilityCatalogEntry, modelCapabilityCatalog
 import metis.core.skills.SkillsPrompt
 import metis.gateway.model.*
 import metis.gateway.security.gatewayPairingAccountStore
-import metis.gateway.service_plugin.{CapabilityCaller, CapabilityInvokeRequest, CapabilityInvokeResult, ServicePluginAcceptedGitCodeEvent, ServicePluginDeliveryTarget, ServicePluginEventDeliveryResult, ServicePluginGeneratedReplyResult, ServicePluginPendingJob, buildServicePluginImBindingRules, invokeRegisteredCapability, matchServicePluginImBinding, parseServicePluginJobAcceptedPayload, renderServicePluginJobSnapshotMessage, servicePluginPendingJobStore, registerConfiguredServicePlugins, servicePluginConfiguredStatusForUser, setServicePluginEventDelivery, setServicePluginGeneratedReplyHandler}
+import metis.gateway.service_plugin.{CapabilityCaller, CapabilityInvokeRequest, CapabilityInvokeResult, ServicePluginAcceptedGitCodeEvent, ServicePluginDeliveryTarget, ServicePluginEventDeliveryResult, ServicePluginGeneratedReplyResult, ServicePluginPendingJob, buildServicePluginImBindingRules, invokeRegisteredCapability, matchServicePluginImBinding, parseServicePluginJobAcceptedPayload, renderServicePluginJobSnapshotMessage, servicePluginPendingJobStore, registerConfiguredServicePlugins, servicePluginConfiguredStatusForUser, setServicePluginEventDelivery, setServicePluginGeneratedReplyHandler, setServicePluginWebhookGeneratedReplyHandler, setServicePluginWebhookSubscribersProvider}
 import metis.gateway.session.{GatewayIngressSource, GatewaySessionContext, GatewaySessionRequest, gatewayResolveSessionContext, gatewaySessionRequestFromInbound}
 import metis.gateway.tools.{gatewayHandleNativeCommandLine, gatewayHandleSubagentsCommandLine}
-import metis.gateway.gitcode_plugin.{GatewayCommandContext, buildGitCodeAsyncScanPayload, buildGitCodeDeadLetterInspectPayload, buildGitCodeDeadLetterListPayload, buildGitCodeEventReconcilePayload, buildGitCodeHookReconcilePayload, buildGitCodeSubscriptionTarget, buildGitCodeWebhookCancelPayload, buildGitCodeWebhookReplayPayload, buildGitCodeWebhookStatusPayload, formatGitCodeSubscribeResult, handleGitCodeKnowledgeQueryCommand, parseGitCodeCommand, parseGitCodeDeliveryArgs, parseGitCodeHookReconcileArgs, parseGitCodeReconcileOnceArgs, parseGitCodeScanOnceArgs, removeGitCodeSubscription, renderGitCodeDeadLetterInspectResult, renderGitCodeDeadLetterListResult, renderGitCodeEventReconcileResult, renderGitCodeHookReconcileResult, renderGitCodeWebhookCancelResult, renderGitCodeWebhookReplayResult, renderGitCodeWebhookStatusResult, saveGitCodeSubscription}
+import metis.gateway.gitcode_plugin.{GatewayCommandContext, buildGitCodeAsyncScanPayload, buildGitCodeDeadLetterInspectPayload, buildGitCodeDeadLetterListPayload, buildGitCodeEventReconcilePayload, buildGitCodeHookReconcilePayload, buildGitCodeSubscriptionTarget, buildGitCodeWebhookCancelPayload, buildGitCodeWebhookReplayPayload, buildGitCodeWebhookStatusPayload, formatGitCodeSubscribeResult, gitCodeSubscriptionStoreSnapshotForDispatcher, handleGitCodeKnowledgeQueryCommand, loadGitCodeSubscriptionStore, parseGitCodeCommand, parseGitCodeDeliveryArgs, parseGitCodeHookReconcileArgs, parseGitCodeReconcileOnceArgs, parseGitCodeScanOnceArgs, removeGitCodeSubscription, renderGitCodeDeadLetterInspectResult, renderGitCodeDeadLetterListResult, renderGitCodeEventReconcileResult, renderGitCodeHookReconcileResult, renderGitCodeWebhookCancelResult, renderGitCodeWebhookReplayResult, renderGitCodeWebhookStatusResult, saveGitCodeSubscription, setGitCodeSubscriptionStore}
 import magic.jsonable.*
 import std.collection.{ArrayList, HashSet}
 import std.convert.Parsable
@@ -126,6 +126,7 @@ public class GatewayService {
         let startupSummary = this.channelManager.startChannels()
         let user = CliSettingManager.readGatewaySettings()
         registerConfiguredServicePlugins(user)
+        setGitCodeSubscriptionStore(Some(loadGitCodeSubscriptionStore(CliConfig.dotDir.join("service-plugin").join("gitcode").join("subscriptions.jsonl").toString())))
         setServicePluginEventDelivery(Some({ target: ServicePluginDeliveryTarget, text: String =>
             let sentId = this.sendTextToPeerDetailed(
                 target.channel,
@@ -143,6 +144,12 @@ public class GatewayService {
         }))
         setServicePluginGeneratedReplyHandler(Some({ job: ServicePluginPendingJob, event: ServicePluginAcceptedGitCodeEvent =>
             this.servicePluginGenerateGitCodeReplyDraft(user, job, event)
+        }))
+        setServicePluginWebhookGeneratedReplyHandler(Some({ event: ServicePluginAcceptedGitCodeEvent, target: ServicePluginDeliveryTarget =>
+            this.servicePluginGenerateGitCodeWebhookReplyDraft(user, event, target)
+        }))
+        setServicePluginWebhookSubscribersProvider(Some({ event: ServicePluginAcceptedGitCodeEvent =>
+            gitCodeSubscriptionStoreSnapshotForDispatcher(event)
         }))
         let _ = gatewayOpenClawCompatHostStart(user)
         let _ = gatewayOpenClawPluginSidecarStart(user)
@@ -1052,6 +1059,47 @@ public class GatewayService {
             sourceMessageId: job.deliveryTarget.replyToMessageId,
             replyToMessageId: job.deliveryTarget.replyToMessageId,
             replyInThread: job.deliveryTarget.replyInThread,
+            deliver: false
+        )
+        let turn = try {
+            gatewayExecuteSessionRequestTurnForUser(
+                user,
+                request,
+                prompt,
+                deliver: false,
+                timeoutSeconds: 90
+            )
+        } catch (e: Exception) {
+            return ServicePluginGeneratedReplyResult(false, status: "llm_degraded", diagnostic: "Agent Runtime failed: ${e.message}", needsHumanReview: true)
+        }
+        let draft = turn.execution.answer.trimAscii()
+        if (draft.isEmpty()) {
+            return ServicePluginGeneratedReplyResult(false, status: "draft_empty", diagnostic: "Agent Runtime returned empty draft", needsHumanReview: true)
+        }
+        if (draft.startsWith("Gateway agent failed:")) {
+            return ServicePluginGeneratedReplyResult(false, status: "llm_degraded", diagnostic: draft, needsHumanReview: true)
+        }
+        ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: draft)
+    }
+
+    private func servicePluginGenerateGitCodeWebhookReplyDraft(
+        user: GatewayUserSettings,
+        event: ServicePluginAcceptedGitCodeEvent,
+        target: ServicePluginDeliveryTarget
+    ): ServicePluginGeneratedReplyResult {
+        let prompt = this.servicePluginBuildGitCodeReplyPrompt(event)
+        let request = GatewaySessionRequest(
+            GatewayIngressSource.Channel(target.channel),
+            channelName: target.channel,
+            sessionHint: "service-plugin/gitcode/webhook/${event.eventId}",
+            text: prompt,
+            accountId: target.accountId,
+            peerId: target.peerId,
+            senderId: "gitcode-monitor",
+            threadId: target.threadId,
+            sourceMessageId: target.replyToMessageId,
+            replyToMessageId: target.replyToMessageId,
+            replyInThread: target.replyInThread,
             deliver: false
         )
         let turn = try {

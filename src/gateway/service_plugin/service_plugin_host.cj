@@ -1277,7 +1277,12 @@ private func servicePluginEventPump(record: ServicePluginRuntimeRecord, process:
             record.eventFrames.add(frame)
             let handled = handleServiceCapabilityEvent(ServiceCapabilityEvent(frame.serviceId, frame.capabilityId, payload: frame.payload))
             if (handled.ok) {
-                let _ = dispatchServicePluginEvent(frame)
+                let dispatch = dispatchServicePluginEvent(frame)
+                if (!dispatch.ok) {
+                    record.lastError = servicePluginDispatchDiagnosticSummary(frame, dispatch)
+                } else {
+                    record.lastError = ""
+                }
             } else {
                 record.lastError = redactServicePayload(handled.diagnostic).text
             }

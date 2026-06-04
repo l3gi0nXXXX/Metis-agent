@@ -21,11 +21,39 @@ public class ServicePluginEventDispatchResult {
     public let ok: Bool
     public let status: String
     public let diagnostic: String
+    public let eventId: String
+    public let eventIdHash: String
+    public let capabilityId: String
+    public let targetCount: Int64
+    public let deliverySuccess: Int64
+    public let deliveryFailed: Int64
+    public let diagnosticHash: String
+    public let failureDetails: Array<String>
 
-    public init(ok: Bool, status: String, diagnostic!: String = "") {
+    public init(
+        ok: Bool,
+        status: String,
+        diagnostic!: String = "",
+        eventId!: String = "",
+        eventIdHash!: String = "",
+        capabilityId!: String = "",
+        targetCount!: Int64 = 0,
+        deliverySuccess!: Int64 = 0,
+        deliveryFailed!: Int64 = 0,
+        diagnosticHash!: String = "",
+        failureDetails!: Array<String> = []
+    ) {
         this.ok = ok
         this.status = status.trimAscii()
         this.diagnostic = diagnostic.trimAscii()
+        this.eventId = eventId.trimAscii()
+        this.eventIdHash = eventIdHash.trimAscii()
+        this.capabilityId = capabilityId.trimAscii()
+        this.targetCount = targetCount
+        this.deliverySuccess = deliverySuccess
+        this.deliveryFailed = deliveryFailed
+        this.diagnosticHash = diagnosticHash.trimAscii()
+        this.failureDetails = failureDetails
     }
 }
 
@@ -94,8 +122,32 @@ private var servicePluginEventDeliveryForTest: Option<(ServicePluginDeliveryTarg
     None<(ServicePluginDeliveryTarget, String) -> ServicePluginEventDeliveryResult>
 private var servicePluginGeneratedReplyHandlerForTest: Option<(ServicePluginPendingJob, ServicePluginAcceptedGitCodeEvent) -> ServicePluginGeneratedReplyResult> =
     None<(ServicePluginPendingJob, ServicePluginAcceptedGitCodeEvent) -> ServicePluginGeneratedReplyResult>
+private var servicePluginWebhookGeneratedReplyHandlerForTest: Option<(ServicePluginAcceptedGitCodeEvent, ServicePluginDeliveryTarget) -> ServicePluginGeneratedReplyResult> =
+    None<(ServicePluginAcceptedGitCodeEvent, ServicePluginDeliveryTarget) -> ServicePluginGeneratedReplyResult>
+private var servicePluginWebhookSubscribersProviderForTest: Option<(ServicePluginAcceptedGitCodeEvent) -> ArrayList<ServicePluginDeliveryTarget>> =
+    None<(ServicePluginAcceptedGitCodeEvent) -> ArrayList<ServicePluginDeliveryTarget>>
 private let servicePluginGeneratedReplyKeys = HashSet<String>()
 private let servicePluginGeneratedReplyStatsByJob = HashMap<String, ServicePluginGeneratedReplyStats>()
+private let servicePluginWebhookDispatchKeys = HashSet<String>()
+
+public class ServicePluginWebhookDispatchStat {
+    public let eventId: String
+    public let eventIdHash: String
+    public let status: String
+    public let targetCount: Int64
+    public let deliverySuccess: Int64
+    public let deliveryFailed: Int64
+    public init(eventId: String, eventIdHash: String, status: String, targetCount: Int64, deliverySuccess: Int64, deliveryFailed: Int64) {
+        this.eventId = eventId
+        this.eventIdHash = eventIdHash
+        this.status = status
+        this.targetCount = targetCount
+        this.deliverySuccess = deliverySuccess
+        this.deliveryFailed = deliveryFailed
+    }
+}
+
+private let servicePluginWebhookDispatchStats = ArrayList<ServicePluginWebhookDispatchStat>()
 
 public func setServicePluginEventDelivery(
     delivery: Option<(ServicePluginDeliveryTarget, String) -> ServicePluginEventDeliveryResult>
@@ -121,9 +173,47 @@ public func setServicePluginGeneratedReplyHandlerForTest(
     setServicePluginGeneratedReplyHandler(handler)
 }
 
+public func setServicePluginWebhookGeneratedReplyHandler(
+    handler: Option<(ServicePluginAcceptedGitCodeEvent, ServicePluginDeliveryTarget) -> ServicePluginGeneratedReplyResult>
+): Unit {
+    servicePluginWebhookGeneratedReplyHandlerForTest = handler
+}
+
+public func setServicePluginWebhookGeneratedReplyHandlerForTest(
+    handler: Option<(ServicePluginAcceptedGitCodeEvent, ServicePluginDeliveryTarget) -> ServicePluginGeneratedReplyResult>
+): Unit {
+    setServicePluginWebhookGeneratedReplyHandler(handler)
+}
+
+public func setServicePluginWebhookSubscribersProvider(
+    provider: Option<(ServicePluginAcceptedGitCodeEvent) -> ArrayList<ServicePluginDeliveryTarget>>
+): Unit {
+    servicePluginWebhookSubscribersProviderForTest = provider
+}
+
+public func setServicePluginWebhookSubscribersProviderForTest(
+    provider: Option<(ServicePluginAcceptedGitCodeEvent) -> ArrayList<ServicePluginDeliveryTarget>>
+): Unit {
+    setServicePluginWebhookSubscribersProvider(provider)
+}
+
 public func resetServicePluginGeneratedReplyStateForTest(): Unit {
     servicePluginGeneratedReplyKeys.clear()
     servicePluginGeneratedReplyStatsByJob.clear()
+    servicePluginWebhookDispatchKeys.clear()
+    servicePluginWebhookDispatchStats.clear()
+}
+
+public func servicePluginWebhookDispatchStatsSnapshot(): ArrayList<ServicePluginWebhookDispatchStat> {
+    let out = ArrayList<ServicePluginWebhookDispatchStat>()
+    for (stat in servicePluginWebhookDispatchStats) {
+        out.add(stat)
+    }
+    out
+}
+
+public func recordServicePluginWebhookDispatchStatForTest(stat: ServicePluginWebhookDispatchStat): Unit {
+    servicePluginRecordWebhookDispatchStat(stat)
 }
 
 public func dispatchServicePluginEvent(
@@ -131,32 +221,32 @@ public func dispatchServicePluginEvent(
     store!: ServicePluginPendingJobStore = servicePluginPendingJobStore()
 ): ServicePluginEventDispatchResult {
     if (frame.frameType != "event") {
-        return ServicePluginEventDispatchResult(false, "unexpected_frame", diagnostic: "expected event frame")
+        return servicePluginDispatchResult(frame, false, "unexpected_frame", diagnostic: "expected event frame")
     }
     if (frame.serviceId != "gitcode-monitor") {
-        return ServicePluginEventDispatchResult(false, "service_mismatch", diagnostic: "unsupported event service")
+        return servicePluginDispatchResult(frame, false, "service_mismatch", diagnostic: "unsupported event service")
     }
     if (frame.capabilityId == "gitcode.event.accepted") {
         return recordGitCodeAcceptedEventForFutureReply(frame, store: store)
     }
     let parsed = parseServicePluginJobEventPayload(frame.capabilityId, frame.payload)
     if (!parsed.ok) {
-        return ServicePluginEventDispatchResult(false, parsed.status, diagnostic: parsed.diagnostic)
+        return servicePluginDispatchResult(frame, false, parsed.status, diagnostic: parsed.diagnostic)
     }
     let event = parsed.payload
     let job = match (store.findByJobId(event.jobId)) {
         case Some(row) => row
-        case None => return ServicePluginEventDispatchResult(false, "orphan_event", diagnostic: "pending job not found")
+        case None => return servicePluginDispatchResult(frame, false, "orphan_event", diagnostic: "pending job not found")
     }
     if (job.serviceId != frame.serviceId) {
-        return ServicePluginEventDispatchResult(false, "service_mismatch", diagnostic: "job belongs to another service")
+        return servicePluginDispatchResult(frame, false, "service_mismatch", diagnostic: "job belongs to another service")
     }
     if (event.status == "progress") {
         store.markRunning(event.jobId, stage: event.stage)
-        return ServicePluginEventDispatchResult(true, "progress_recorded")
+        return servicePluginDispatchResult(frame, true, "progress_recorded")
     }
     if (job.status.endsWith("_delivered")) {
-        return ServicePluginEventDispatchResult(true, "duplicate_event")
+        return servicePluginDispatchResult(frame, true, "duplicate_event")
     }
     var text = renderServicePluginJobEventMessage(event)
     let replySummary = servicePluginGeneratedReplySummaryForJob(event.jobId)
@@ -169,7 +259,7 @@ public func dispatchServicePluginEvent(
     }
     if (!delivery.ok) {
         store.markDelivered(event.jobId, "${event.status}_delivery_failed", summary: text)
-        return ServicePluginEventDispatchResult(false, "event_delivery_failed", diagnostic: redactServicePayload(delivery.diagnostic).text)
+        return servicePluginDispatchResult(frame, false, "event_delivery_failed", diagnostic: redactServicePayload(delivery.diagnostic).text, targetCount: 1, deliveryFailed: 1)
     }
     let deliveredStatus = match (event.status) {
         case "completed" => "completed_delivered"
@@ -179,7 +269,7 @@ public func dispatchServicePluginEvent(
         case _ => "${event.status}_delivered"
     }
     store.markDelivered(event.jobId, deliveredStatus, summary: text)
-    ServicePluginEventDispatchResult(true, deliveredStatus)
+    servicePluginDispatchResult(frame, true, deliveredStatus, targetCount: 1, deliverySuccess: 1)
 }
 
 private func recordGitCodeAcceptedEventForFutureReply(
@@ -188,23 +278,28 @@ private func recordGitCodeAcceptedEventForFutureReply(
 ): ServicePluginEventDispatchResult {
     let root = match (servicePluginAcceptedEventPayloadRoot(frame.payload)) {
         case Some(obj) => obj
-        case None => return ServicePluginEventDispatchResult(false, "event_payload_invalid", diagnostic: "accepted event payload must be a JSON object")
+        case None => return servicePluginDispatchResult(frame, false, "event_payload_invalid", diagnostic: "accepted event payload must be a JSON object")
     }
     let diagnostics = ArrayList<String>()
     let event = parseServicePluginAcceptedGitCodeEvent(root, diagnostics)
-    if (event.jobId.isEmpty()) { diagnostics.add("jobId is required") }
-    if (event.eventId.isEmpty()) { diagnostics.add("eventId is required") }
-    if (event.repo.isEmpty()) { diagnostics.add("repo is required") }
+    if (event.jobId.isEmpty()) { diagnostics.add("missing jobId") }
+    if (event.eventId.isEmpty()) { diagnostics.add("missing eventId") }
+    if (event.repo.isEmpty()) { diagnostics.add("missing repo") }
+    if (event.url.isEmpty()) { diagnostics.add("missing url") }
     if (diagnostics.size > 0) {
-        return ServicePluginEventDispatchResult(false, "event_payload_invalid", diagnostic: String.join(diagnostics.toArray(), delimiter: "; "))
+        return servicePluginDispatchResult(frame, false, "event_payload_invalid", diagnostic: diagnostics[0], eventId: event.eventId)
     }
     let job = match (store.findByJobId(event.jobId)) {
         case Some(row) => row
-        case None => return ServicePluginEventDispatchResult(false, "orphan_event", diagnostic: "pending job not found for accepted event")
+        case None =>
+            if (event.jobId.startsWith("webhook-")) {
+                return dispatchGitCodeWebhookAcceptedEvent(frame, event)
+            }
+            return servicePluginDispatchResult(frame, false, "orphan_event", diagnostic: "pending job not found for gitcode.event.accepted", eventId: event.eventId)
     }
     let key = "${event.jobId}:${event.eventId}"
     if (servicePluginGeneratedReplyKeys.contains(key)) {
-        return ServicePluginEventDispatchResult(true, "duplicate_event")
+        return servicePluginDispatchResult(frame, true, "duplicate_event", eventId: event.eventId)
     }
     servicePluginGeneratedReplyKeys.add(key)
     store.markRunning(event.jobId, stage: "event_accepted")
@@ -219,12 +314,90 @@ private func recordGitCodeAcceptedEventForFutureReply(
     }
     servicePluginRecordGeneratedReplyStats(event.jobId, generated, delivery)
     if (!delivery.ok) {
-        return ServicePluginEventDispatchResult(false, "generated_reply_delivery_failed", diagnostic: redactServicePayload(delivery.diagnostic).text)
+        return servicePluginDispatchResult(frame, false, "generated_reply_delivery_failed", diagnostic: redactServicePayload(delivery.diagnostic).text, eventId: event.eventId, targetCount: 1, deliveryFailed: 1)
     }
     if (!generated.ok) {
-        return ServicePluginEventDispatchResult(true, "generated_reply_degraded_delivered", diagnostic: generated.diagnostic)
+        return servicePluginDispatchResult(frame, true, "generated_reply_degraded_delivered", diagnostic: generated.diagnostic, eventId: event.eventId, targetCount: 1, deliverySuccess: 1)
     }
-    ServicePluginEventDispatchResult(true, "generated_reply_delivered")
+    servicePluginDispatchResult(frame, true, "generated_reply_delivered", eventId: event.eventId, targetCount: 1, deliverySuccess: 1)
+}
+
+public func dispatchGitCodeWebhookAcceptedEvent(frame: ServiceFrame, event: ServicePluginAcceptedGitCodeEvent): ServicePluginEventDispatchResult {
+    let key = servicePluginAcceptedEventDedupeKey(event)
+    if (servicePluginWebhookDispatchKeys.contains(key)) {
+        let result = servicePluginDispatchResult(frame, true, "duplicate_event", eventId: event.eventId)
+        servicePluginRecordWebhookDispatchResult(result)
+        return result
+    }
+    let targets = resolveGitCodeWebhookSubscribers(event)
+    if (targets.size == 0) {
+        let result = servicePluginDispatchResult(frame, true, "no_subscribers", eventId: event.eventId, targetCount: 0)
+        servicePluginRecordWebhookDispatchResult(result)
+        return result
+    }
+    servicePluginWebhookDispatchKeys.add(key)
+    var success: Int64 = 0
+    var failed: Int64 = 0
+    let failures = ArrayList<String>()
+    let primary = targets[0]
+    let generated = match (servicePluginWebhookGeneratedReplyHandlerForTest) {
+        case Some(handler) => handler(event, primary)
+        case None => ServicePluginGeneratedReplyResult(false, status: "handler_unconfigured", diagnostic: "generated reply handler is not configured", needsHumanReview: true)
+    }
+    let text = renderServicePluginGeneratedReplyNotification(event, generated)
+    for (target in targets) {
+        let delivery = match (servicePluginEventDeliveryForTest) {
+            case Some(sender) => sender(target, text)
+            case None => ServicePluginEventDeliveryResult(false, "delivery_unconfigured", diagnostic: "service plugin event delivery is not configured")
+        }
+        if (delivery.ok) {
+            success++
+        } else {
+            failed++
+            failures.add("${target.channel}:${target.accountId}:send_failed")
+        }
+    }
+    let status = if (failed == 0 && generated.ok) {
+        "generated_reply_delivered"
+    } else if (failed == 0) {
+        "generated_reply_degraded_delivered"
+    } else if (success > 0) {
+        "generated_reply_partially_delivered"
+    } else {
+        "generated_reply_delivery_failed"
+    }
+    let result = servicePluginDispatchResult(
+        frame,
+        success > 0 || status == "generated_reply_degraded_delivered",
+        status,
+        diagnostic: generated.diagnostic,
+        eventId: event.eventId,
+        targetCount: targets.size,
+        deliverySuccess: success,
+        deliveryFailed: failed,
+        failureDetails: failures.toArray()
+    )
+    servicePluginRecordWebhookDispatchResult(result)
+    result
+}
+
+public func resolveGitCodeWebhookSubscribers(event: ServicePluginAcceptedGitCodeEvent): ArrayList<ServicePluginDeliveryTarget> {
+    match (servicePluginWebhookSubscribersProviderForTest) {
+        case Some(provider) => provider(event)
+        case None => ArrayList<ServicePluginDeliveryTarget>()
+    }
+}
+
+public func servicePluginAcceptedEventDedupeKey(event: ServicePluginAcceptedGitCodeEvent): String {
+    if (!event.eventId.isEmpty()) { event.eventId } else { "${event.repo}:${event.kind}:${event.number}:${event.url}" }
+}
+
+public func servicePluginDispatchDiagnosticSummary(frame: ServiceFrame, result: ServicePluginEventDispatchResult): String {
+    let eventHash = if (!result.eventIdHash.isEmpty()) { result.eventIdHash } else { servicePluginDiagnosticHash(frame.payload) }
+    let diagnosticHash = if (!result.diagnosticHash.isEmpty()) { result.diagnosticHash } else { servicePluginDiagnosticHash(result.diagnostic) }
+    let base = "serviceId=${frame.serviceId} capabilityId=${frame.capabilityId} status=${result.status} eventIdHash=${eventHash} diagnosticHash=${diagnosticHash} targetCount=${result.targetCount} deliverySuccess=${result.deliverySuccess} deliveryFailed=${result.deliveryFailed}"
+    if (base.size <= 512) { return base }
+    base[0..512]
 }
 
 public func renderServicePluginGeneratedReplyNotification(event: ServicePluginAcceptedGitCodeEvent, result: ServicePluginGeneratedReplyResult): String {
@@ -269,6 +442,60 @@ private func servicePluginRecordGeneratedReplyStats(jobId: String, result: Servi
         stats.notificationsSent++
     } else {
         stats.notificationsFailed++
+    }
+}
+
+private func servicePluginDispatchResult(
+    frame: ServiceFrame,
+    ok: Bool,
+    status: String,
+    diagnostic!: String = "",
+    eventId!: String = "",
+    targetCount!: Int64 = 0,
+    deliverySuccess!: Int64 = 0,
+    deliveryFailed!: Int64 = 0,
+    failureDetails!: Array<String> = []
+): ServicePluginEventDispatchResult {
+    let safeDiagnostic = redactServicePayload(diagnostic).text
+    let safeEventId = eventId.trimAscii()
+    ServicePluginEventDispatchResult(
+        ok,
+        status,
+        diagnostic: safeDiagnostic,
+        eventId: safeEventId,
+        eventIdHash: servicePluginDiagnosticHash(if (safeEventId.isEmpty()) { frame.payload } else { safeEventId }),
+        capabilityId: frame.capabilityId,
+        targetCount: targetCount,
+        deliverySuccess: deliverySuccess,
+        deliveryFailed: deliveryFailed,
+        diagnosticHash: servicePluginDiagnosticHash(safeDiagnostic),
+        failureDetails: failureDetails
+    )
+}
+
+private func servicePluginDiagnosticHash(text: String): String {
+    var out = hashRawPayload(text)
+    while (out.size < 64) {
+        out += hashRawPayload("${out}:${text.size}")
+    }
+    out[0..64]
+}
+
+private func servicePluginRecordWebhookDispatchResult(result: ServicePluginEventDispatchResult): Unit {
+    servicePluginRecordWebhookDispatchStat(ServicePluginWebhookDispatchStat(
+        result.eventId,
+        result.eventIdHash,
+        result.status,
+        result.targetCount,
+        result.deliverySuccess,
+        result.deliveryFailed
+    ))
+}
+
+private func servicePluginRecordWebhookDispatchStat(stat: ServicePluginWebhookDispatchStat): Unit {
+    servicePluginWebhookDispatchStats.add(stat)
+    while (servicePluginWebhookDispatchStats.size > 50) {
+        servicePluginWebhookDispatchStats.remove(at: 0)
     }
 }
 
