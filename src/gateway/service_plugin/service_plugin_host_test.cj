@@ -231,6 +231,22 @@ public class ServicePluginHostTest {
     }
 
     @TestCase
+    public func a4NoSubscribersDispatchStatusRemainsRuntimeDiagnosable(): Unit {
+        // A4-DIAG-UT-002
+        let _ = registerSample()
+        let frame = ServiceFrame("event", "e-no-subs", "sample-service", capabilityId: "gitcode.event.accepted", payload: "{\"jobId\":\"webhook-d1\",\"eventId\":\"event-1\"}")
+        let result = ServicePluginEventDispatchResult(true, "no_subscribers", diagnostic: "当前没有 GitCode Webhook 通知目标。")
+        recordServicePluginRuntimeDispatchForTest("sample-service", frame, result)
+        match (getServicePluginSnapshot("sample-service")) {
+            case Some(snapshot) =>
+                @Expect(snapshot.status, "running")
+                @Expect(snapshot.lastError.contains("no_subscribers"), true)
+                @Expect(snapshot.lastError.contains("当前没有 GitCode Webhook 通知目标"), false)
+            case None => @Expect(true, false)
+        }
+    }
+
+    @TestCase
     public func controlSurfaceStatusInvokeAndRestartRequireAuthorization(): Unit {
         let _ = registerSample()
         let status = handleServicePluginControlAction(ServicePluginControlAction("status", serviceId: "sample-service"))

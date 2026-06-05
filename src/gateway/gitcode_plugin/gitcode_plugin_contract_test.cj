@@ -4,11 +4,16 @@ import metis.gateway.service_plugin.{ServicePluginDeliveryTarget, parseServicePl
 import std.fs.{File, Path, exists, remove}
 import std.time.DateTime
 import std.unittest.testmacro.*
+import stdx.encoding.json.JsonObject
 
 @Test
 public class GitCodePluginContractTest {
     private func tempSubscriptionPath(label: String): String {
         "/tmp/metis-gitcode-subscription-${label}-${DateTime.now().toUnixTimeStamp().toNanoseconds()}.jsonl"
+    }
+
+    private func jsonInt(obj: JsonObject, key: String): Int64 {
+        try { obj.get(key).getOrThrow().asInt().getValue() } catch (_: Exception) { -1 }
     }
 
     @TestCase
@@ -168,6 +173,90 @@ public class GitCodePluginContractTest {
             resetGitCodePluginHostForTest()
             try { remove(Path(path)) } catch (_: Exception) { () }
         }
+    }
+
+    @TestCase
+    public func a3SubscriptionStatusJsonCountsTargetsAndNeverLeaksPeerIds(): Unit {
+        // A3-SUB-UT-001, A3-SUB-UT-002
+        let path = this.tempSubscriptionPath("a3-status")
+        resetGitCodePluginHostForTest()
+        setGitCodeSubscriptionStoreForTest(Some(loadGitCodeSubscriptionStore(path)))
+        try {
+            let empty = gitCodeSubscriptionStatusJson()
+            @Expect(this.jsonInt(empty, "total"), 0)
+            @Expect(this.jsonInt(empty, "telegram"), 0)
+            @Expect(this.jsonInt(empty, "feishu"), 0)
+            let emptyText = renderGitCodeWebhookStatusResult("{\"status\":\"ok\",\"subscribers\":${empty.toJsonString()}}")
+            @Expect(emptyText.contains("当前没有 GitCode Webhook 通知目标"), true)
+            @Expect(emptyText.contains("/gitcode subscribe"), true)
+            @Expect(emptyText.contains("\"total\""), false)
+
+            let _ = saveGitCodeSubscription(GitCodeSubscriptionTarget("telegram", "tg-gitcode", "tg-peer-secret"))
+            let _ = saveGitCodeSubscription(GitCodeSubscriptionTarget("feishu", "fs-gitcode", "fs-peer-secret"))
+            let status = gitCodeSubscriptionStatusJson()
+            let statusText = status.toJsonString()
+            @Expect(this.jsonInt(status, "total"), 2)
+            @Expect(this.jsonInt(status, "telegram"), 1)
+            @Expect(this.jsonInt(status, "feishu"), 1)
+            @Expect(this.jsonInt(status, "generatedReplies"), 2)
+            @Expect(statusText.contains("tg-peer-secret"), false)
+            @Expect(statusText.contains("fs-peer-secret"), false)
+        } finally {
+            resetGitCodePluginHostForTest()
+            try { remove(Path(path)) } catch (_: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func a3SubscribeHumanOutputIdempotentAndInvalidTargetSafe(): Unit {
+        // A3-SUB-POS-001, A3-SUB-NEG-001, A3-SUB-BND-001
+        let path = this.tempSubscriptionPath("a3-subscribe")
+        resetGitCodePluginHostForTest()
+        setGitCodeSubscriptionStoreForTest(Some(loadGitCodeSubscriptionStore(path)))
+        try {
+            let invalidText = formatGitCodeSubscribeResult(saveGitCodeSubscription(GitCodeSubscriptionTarget("telegram", "tg-gitcode", "")))
+            @Expect(invalidText.contains("GitCode 订阅失败"), true)
+            @Expect(invalidText.contains("peerId is empty"), true)
+            @Expect(listGitCodeSubscriptions().size, 0)
+
+            let target = GitCodeSubscriptionTarget("telegram", "tg-gitcode", "tg-peer-secret")
+            let firstText = formatGitCodeSubscribeResult(saveGitCodeSubscription(target))
+            @Expect(firstText.split("\n")[0], "GitCode 订阅已开启")
+            @Expect(firstText.contains("created"), true)
+            @Expect(firstText.contains("后续 GitCode webhook 生成的回复草稿会发送到当前会话"), true)
+            for (_ in 0..9) {
+                let text = formatGitCodeSubscribeResult(saveGitCodeSubscription(target))
+                @Expect(text.contains("already_present"), true)
+            }
+            @Expect(listGitCodeSubscriptions().size, 1)
+
+            let statusText = renderGitCodeWebhookStatusResult("{\"status\":\"ok\",\"subscribers\":${gitCodeSubscriptionStatusJson().toJsonString()}}")
+            @Expect(statusText.contains("订阅：TG 1 个"), true)
+            @Expect(statusText.contains("tg-peer-secret"), false)
+            @Expect(statusText.contains("\"subscribers\""), false)
+        } finally {
+            resetGitCodePluginHostForTest()
+            try { remove(Path(path)) } catch (_: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func a0AndA4WebhookStatusRendererExplainsNoSubscribersAndDispatchStats(): Unit {
+        // A0-SUB-NEG-001, A4-DIAG-POS-001, A4-DIAG-NEG-001
+        let noSubscribers = renderGitCodeWebhookStatusResult("{\"status\":\"ok\",\"subscribers\":{\"total\":0,\"telegram\":0,\"feishu\":0,\"generatedReplies\":0,\"rawEvents\":0},\"dispatch\":{\"latestStatus\":\"no_subscribers\",\"noSubscribers\":1,\"success\":0,\"failed\":0}}")
+        @Expect(noSubscribers.contains("当前没有 GitCode Webhook 通知目标"), true)
+        @Expect(noSubscribers.contains("servicePlugins.imBindings"), true)
+        @Expect(noSubscribers.contains("/gitcode subscribe"), true)
+        @Expect(noSubscribers.contains("\"ok\""), false)
+
+        let delivered = renderGitCodeWebhookStatusResult("{\"status\":\"ok\",\"subscribers\":{\"total\":2,\"telegram\":1,\"feishu\":1,\"generatedReplies\":2},\"dispatch\":{\"telegram\":1,\"feishu\":1,\"failed\":0,\"latestStatus\":\"generated_reply_delivered\"}}")
+        @Expect(delivered.contains("订阅：TG 1 个，Feishu 1 个，生成草稿通知 2 个。"), true)
+        @Expect(delivered.contains("投递：最近事件已发送到 TG 1 个、Feishu 1 个；最近失败 0 个"), true)
+
+        let partial = renderGitCodeWebhookStatusResult("{\"status\":\"ok\",\"subscribers\":{\"total\":2,\"telegram\":1,\"feishu\":1},\"dispatch\":{\"telegram\":0,\"feishu\":1,\"failed\":1,\"latestStatus\":\"generated_reply_partially_delivered\",\"diagnostic\":\"Authorization: Bearer secret token=abc\"}}")
+        @Expect(partial.contains("最近失败 1 个"), true)
+        @Expect(partial.contains("Bearer secret"), false)
+        @Expect(partial.contains("token=abc"), false)
     }
 
     @TestCase

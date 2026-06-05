@@ -36,7 +36,7 @@ private let gatewayMcpGitCodeRecentErrors = ArrayList<JsonObject>()
 public type GatewayMcpGitCodeModelRunner = (String, JsonObject) -> String
 public type GatewayMcpGitCodeKnowledgeRunner = (String, JsonObject) -> JsonObject
 
-public func gatewayMcpGitCodeRegisteredToolNames(): Array<String> {
+private func gatewayMcpGitCodeCanonicalToolNames(): Array<String> {
     [
         "gitcode_issue_summarize",
         "gitcode_pr_summarize",
@@ -44,6 +44,41 @@ public func gatewayMcpGitCodeRegisteredToolNames(): Array<String> {
         "gitcode_pr_draft_reply",
         "gitcode_reply_safety_review"
     ]
+}
+
+public func gatewayMcpGitCodeToolAliasNames(): Array<String> {
+    [
+        "gitcode_issue_summary",
+        "gitcode_pr_summary",
+        "gitcode_safety_review"
+    ]
+}
+
+public func gatewayMcpGitCodeRegisteredToolNames(): Array<String> {
+    [
+        "gitcode_issue_summarize",
+        "gitcode_pr_summarize",
+        "gitcode_issue_draft_reply",
+        "gitcode_pr_draft_reply",
+        "gitcode_reply_safety_review",
+        "gitcode_issue_summary",
+        "gitcode_pr_summary",
+        "gitcode_safety_review"
+    ]
+}
+
+public func gatewayMcpGitCodeCanonicalToolName(name: String): String {
+    let normalized = name.trimAscii().toAsciiLower()
+    if (normalized == "gitcode_issue_summary") {
+        return "gitcode_issue_summarize"
+    }
+    if (normalized == "gitcode_pr_summary") {
+        return "gitcode_pr_summarize"
+    }
+    if (normalized == "gitcode_safety_review") {
+        return "gitcode_reply_safety_review"
+    }
+    normalized
 }
 
 private func gatewayMcpAppendTool(tools: JsonArray, name: String, description: String): Unit {
@@ -214,14 +249,17 @@ private func gatewayMcpAppendGitCodeTool(
     tools: JsonArray,
     name: String,
     description: String,
-    inputSchema: JsonObject
+    inputSchema: JsonObject,
+    canonicalName!: String = ""
 ): Unit {
+    let canonical = if (canonicalName.trimAscii().isEmpty()) { name } else { canonicalName.trimAscii().toAsciiLower() }
     let row = JsonObject()
     row.put("name", JsonString(name))
     row.put("description", JsonString(description))
     row.put("inputSchema", inputSchema)
     row.put("resultSchema", gatewayMcpGitCodeResultSchema())
     let meta = JsonObject()
+    meta.put("canonicalName", JsonString(canonical))
     meta.put("readOnly", true.toJsonValue())
     meta.put("writebackImplemented", false.toJsonValue())
     meta.put("directModelProviderCalls", false.toJsonValue())
@@ -268,12 +306,33 @@ public func gatewayMcpAppendGitCodeTools(tools: JsonArray): Unit {
         "Read-only safety review contract for caller-provided GitCode reply text. It never posts a reply.",
         gatewayMcpGitCodeSafetyReviewInputSchema()
     )
+    gatewayMcpAppendGitCodeTool(
+        tools,
+        "gitcode_issue_summary",
+        "Compatibility alias for gitcode_issue_summarize. Read-only GitCode issue summarization through AgentBridge and CKB evidence.",
+        gatewayMcpGitCodeBaseInputSchema("issueId"),
+        canonicalName: "gitcode_issue_summarize"
+    )
+    gatewayMcpAppendGitCodeTool(
+        tools,
+        "gitcode_pr_summary",
+        "Compatibility alias for gitcode_pr_summarize. Read-only GitCode pull request summarization through AgentBridge and CKB evidence.",
+        gatewayMcpGitCodeBaseInputSchema("prId"),
+        canonicalName: "gitcode_pr_summarize"
+    )
+    gatewayMcpAppendGitCodeTool(
+        tools,
+        "gitcode_safety_review",
+        "Compatibility alias for gitcode_reply_safety_review. Read-only safety review contract for caller-provided GitCode reply text. It never posts a reply.",
+        gatewayMcpGitCodeSafetyReviewInputSchema(),
+        canonicalName: "gitcode_reply_safety_review"
+    )
 }
 
 public func gatewayMcpIsGitCodeTool(name: String): Bool {
-    let normalized = name.trimAscii().toAsciiLower()
-    for (tool in gatewayMcpGitCodeRegisteredToolNames()) {
-        if (normalized == tool) {
+    let canonical = gatewayMcpGitCodeCanonicalToolName(name)
+    for (tool in gatewayMcpGitCodeCanonicalToolNames()) {
+        if (canonical == tool) {
             return true
         }
     }
@@ -1222,29 +1281,48 @@ public func gatewayMcpGitCodeRuntimeStatusJson(authMode!: String = "gateway-http
     out
 }
 
+private func gatewayMcpGitCodeAttachToolNames(result: JsonObject, requested: String, canonical: String): JsonObject {
+    result.put("tool", JsonString(canonical))
+    result.put("toolName", JsonString(canonical))
+    result.put("canonicalToolName", JsonString(canonical))
+    result.put("requestedToolName", JsonString(requested))
+    let audit = try {
+        result.get("audit").getOrThrow().asObject()
+    } catch (_e: Exception) {
+        JsonObject()
+    }
+    if (!requested.isEmpty()) {
+        audit.put("requestedToolName", JsonString(requested))
+    }
+    audit.put("canonicalToolName", JsonString(canonical))
+    result.put("audit", audit)
+    result
+}
+
 public func gatewayMcpGitCodeToolResultJsonWithRuntime(
     name: String,
     args: JsonObject,
     modelRunner!: Option<GatewayMcpGitCodeModelRunner> = None<GatewayMcpGitCodeModelRunner>,
     knowledgeRunner!: Option<GatewayMcpGitCodeKnowledgeRunner> = None<GatewayMcpGitCodeKnowledgeRunner>
 ): JsonObject {
-    let normalized = name.trimAscii().toAsciiLower()
+    let requested = name.trimAscii()
+    let normalized = gatewayMcpGitCodeCanonicalToolName(name)
     if (normalized == "gitcode_issue_summarize") {
-        return gatewayMcpGitCodeSummaryResult(normalized, args, "issueId", modelRunner, knowledgeRunner)
+        return gatewayMcpGitCodeAttachToolNames(gatewayMcpGitCodeSummaryResult(normalized, args, "issueId", modelRunner, knowledgeRunner), requested, normalized)
     }
     if (normalized == "gitcode_pr_summarize") {
-        return gatewayMcpGitCodeSummaryResult(normalized, args, "prId", modelRunner, knowledgeRunner)
+        return gatewayMcpGitCodeAttachToolNames(gatewayMcpGitCodeSummaryResult(normalized, args, "prId", modelRunner, knowledgeRunner), requested, normalized)
     }
     if (normalized == "gitcode_issue_draft_reply") {
-        return gatewayMcpGitCodeDraftReplyResult(normalized, args, "issueId", modelRunner, knowledgeRunner)
+        return gatewayMcpGitCodeAttachToolNames(gatewayMcpGitCodeDraftReplyResult(normalized, args, "issueId", modelRunner, knowledgeRunner), requested, normalized)
     }
     if (normalized == "gitcode_pr_draft_reply") {
-        return gatewayMcpGitCodeDraftReplyResult(normalized, args, "prId", modelRunner, knowledgeRunner)
+        return gatewayMcpGitCodeAttachToolNames(gatewayMcpGitCodeDraftReplyResult(normalized, args, "prId", modelRunner, knowledgeRunner), requested, normalized)
     }
     if (normalized == "gitcode_reply_safety_review") {
-        return gatewayMcpGitCodeSafetyReviewResult(normalized, args, modelRunner, knowledgeRunner)
+        return gatewayMcpGitCodeAttachToolNames(gatewayMcpGitCodeSafetyReviewResult(normalized, args, modelRunner, knowledgeRunner), requested, normalized)
     }
-    gatewayMcpGitCodeUnknownResult(normalized, args)
+    gatewayMcpGitCodeAttachToolNames(gatewayMcpGitCodeUnknownResult(normalized, args), requested, normalized)
 }
 
 public func gatewayMcpGitCodeToolResultJson(name: String, args: JsonObject): JsonObject {

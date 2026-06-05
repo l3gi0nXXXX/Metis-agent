@@ -1,7 +1,7 @@
 package metis.gateway.service_plugin
 
 import std.collection.{ArrayList, HashMap, HashSet}
-import stdx.encoding.json.{JsonObject, JsonValue}
+import stdx.encoding.json.{JsonInt, JsonObject, JsonString, JsonValue}
 
 public class ServicePluginEventDeliveryResult {
     public let ok: Bool
@@ -29,6 +29,9 @@ public class ServicePluginEventDispatchResult {
     public let deliveryFailed: Int64
     public let diagnosticHash: String
     public let failureDetails: Array<String>
+    public let telegram: Int64
+    public let feishu: Int64
+    public let noSubscriberCount: Int64
 
     public init(
         ok: Bool,
@@ -41,7 +44,10 @@ public class ServicePluginEventDispatchResult {
         deliverySuccess!: Int64 = 0,
         deliveryFailed!: Int64 = 0,
         diagnosticHash!: String = "",
-        failureDetails!: Array<String> = []
+        failureDetails!: Array<String> = [],
+        telegram!: Int64 = 0,
+        feishu!: Int64 = 0,
+        noSubscriberCount!: Int64 = 0
     ) {
         this.ok = ok
         this.status = status.trimAscii()
@@ -54,6 +60,9 @@ public class ServicePluginEventDispatchResult {
         this.deliveryFailed = deliveryFailed
         this.diagnosticHash = diagnosticHash.trimAscii()
         this.failureDetails = failureDetails
+        this.telegram = telegram
+        this.feishu = feishu
+        this.noSubscriberCount = noSubscriberCount
     }
 }
 
@@ -137,13 +146,35 @@ public class ServicePluginWebhookDispatchStat {
     public let targetCount: Int64
     public let deliverySuccess: Int64
     public let deliveryFailed: Int64
-    public init(eventId: String, eventIdHash: String, status: String, targetCount: Int64, deliverySuccess: Int64, deliveryFailed: Int64) {
+    public let diagnosticHash: String
+    public let noSubscriberCount: Int64
+    public let telegram: Int64
+    public let feishu: Int64
+    public let updatedAtMs: Int64
+    public init(
+        eventId: String,
+        eventIdHash: String,
+        status: String,
+        targetCount: Int64,
+        deliverySuccess: Int64,
+        deliveryFailed: Int64,
+        diagnosticHash!: String = "",
+        noSubscriberCount!: Int64 = 0,
+        telegram!: Int64 = 0,
+        feishu!: Int64 = 0,
+        updatedAtMs!: Int64 = 0
+    ) {
         this.eventId = eventId
         this.eventIdHash = eventIdHash
         this.status = status
         this.targetCount = targetCount
         this.deliverySuccess = deliverySuccess
         this.deliveryFailed = deliveryFailed
+        this.diagnosticHash = diagnosticHash
+        this.noSubscriberCount = noSubscriberCount
+        this.telegram = telegram
+        this.feishu = feishu
+        this.updatedAtMs = updatedAtMs
     }
 }
 
@@ -214,6 +245,44 @@ public func servicePluginWebhookDispatchStatsSnapshot(): ArrayList<ServicePlugin
 
 public func recordServicePluginWebhookDispatchStatForTest(stat: ServicePluginWebhookDispatchStat): Unit {
     servicePluginRecordWebhookDispatchStat(stat)
+}
+
+public func servicePluginWebhookDispatchStatsJson(): JsonObject {
+    let root = JsonObject()
+    var noSubscribers: Int64 = 0
+    var success: Int64 = 0
+    var partialFailed: Int64 = 0
+    var failed: Int64 = 0
+    var latestStatus = ""
+    var latestEventIdHash = ""
+    var latestTelegram: Int64 = 0
+    var latestFeishu: Int64 = 0
+    for (stat in servicePluginWebhookDispatchStats) {
+        if (stat.noSubscriberCount > 0 || stat.status == "no_subscribers") {
+            noSubscribers++
+        } else if (stat.status == "generated_reply_partially_delivered") {
+            partialFailed++
+            failed += stat.deliveryFailed
+        } else if (stat.deliveryFailed > 0 || stat.status == "generated_reply_delivery_failed") {
+            failed += if (stat.deliveryFailed > 0) { stat.deliveryFailed } else { 1 }
+        } else if (stat.status == "generated_reply_delivered" || stat.status == "generated_reply_degraded_delivered") {
+            success++
+        }
+        latestStatus = stat.status
+        latestEventIdHash = stat.eventIdHash
+        latestTelegram = stat.telegram
+        latestFeishu = stat.feishu
+    }
+    root.put("total", JsonInt(servicePluginWebhookDispatchStats.size))
+    root.put("noSubscribers", JsonInt(noSubscribers))
+    root.put("success", JsonInt(success))
+    root.put("partialFailed", JsonInt(partialFailed))
+    root.put("failed", JsonInt(failed))
+    root.put("telegram", JsonInt(latestTelegram))
+    root.put("feishu", JsonInt(latestFeishu))
+    root.put("latestStatus", JsonString(latestStatus))
+    root.put("latestEventIdHash", JsonString(latestEventIdHash))
+    root
 }
 
 public func dispatchServicePluginEvent(
@@ -331,13 +400,23 @@ public func dispatchGitCodeWebhookAcceptedEvent(frame: ServiceFrame, event: Serv
     }
     let targets = resolveGitCodeWebhookSubscribers(event)
     if (targets.size == 0) {
-        let result = servicePluginDispatchResult(frame, true, "no_subscribers", eventId: event.eventId, targetCount: 0)
+        let result = servicePluginDispatchResult(
+            frame,
+            true,
+            "no_subscribers",
+            diagnostic: servicePluginGitCodeNoSubscriberHint(),
+            eventId: event.eventId,
+            targetCount: 0,
+            noSubscriberCount: 1
+        )
         servicePluginRecordWebhookDispatchResult(result)
         return result
     }
     servicePluginWebhookDispatchKeys.add(key)
     var success: Int64 = 0
     var failed: Int64 = 0
+    var telegram: Int64 = 0
+    var feishu: Int64 = 0
     let failures = ArrayList<String>()
     let primary = targets[0]
     let generated = match (servicePluginWebhookGeneratedReplyHandlerForTest) {
@@ -352,6 +431,12 @@ public func dispatchGitCodeWebhookAcceptedEvent(frame: ServiceFrame, event: Serv
         }
         if (delivery.ok) {
             success++
+            let channel = target.channel.toAsciiLower()
+            if (channel == "telegram") {
+                telegram++
+            } else if (channel == "feishu") {
+                feishu++
+            }
         } else {
             failed++
             failures.add("${target.channel}:${target.accountId}:send_failed")
@@ -375,7 +460,9 @@ public func dispatchGitCodeWebhookAcceptedEvent(frame: ServiceFrame, event: Serv
         targetCount: targets.size,
         deliverySuccess: success,
         deliveryFailed: failed,
-        failureDetails: failures.toArray()
+        failureDetails: failures.toArray(),
+        telegram: telegram,
+        feishu: feishu
     )
     servicePluginRecordWebhookDispatchResult(result)
     result
@@ -454,7 +541,10 @@ private func servicePluginDispatchResult(
     targetCount!: Int64 = 0,
     deliverySuccess!: Int64 = 0,
     deliveryFailed!: Int64 = 0,
-    failureDetails!: Array<String> = []
+    failureDetails!: Array<String> = [],
+    telegram!: Int64 = 0,
+    feishu!: Int64 = 0,
+    noSubscriberCount!: Int64 = 0
 ): ServicePluginEventDispatchResult {
     let safeDiagnostic = redactServicePayload(diagnostic).text
     let safeEventId = eventId.trimAscii()
@@ -469,7 +559,10 @@ private func servicePluginDispatchResult(
         deliverySuccess: deliverySuccess,
         deliveryFailed: deliveryFailed,
         diagnosticHash: servicePluginDiagnosticHash(safeDiagnostic),
-        failureDetails: failureDetails
+        failureDetails: failureDetails,
+        telegram: telegram,
+        feishu: feishu,
+        noSubscriberCount: noSubscriberCount
     )
 }
 
@@ -488,7 +581,11 @@ private func servicePluginRecordWebhookDispatchResult(result: ServicePluginEvent
         result.status,
         result.targetCount,
         result.deliverySuccess,
-        result.deliveryFailed
+        result.deliveryFailed,
+        diagnosticHash: result.diagnosticHash,
+        noSubscriberCount: result.noSubscriberCount,
+        telegram: result.telegram,
+        feishu: result.feishu
     ))
 }
 
@@ -497,6 +594,12 @@ private func servicePluginRecordWebhookDispatchStat(stat: ServicePluginWebhookDi
     while (servicePluginWebhookDispatchStats.size > 50) {
         servicePluginWebhookDispatchStats.remove(at: 0)
     }
+}
+
+private func servicePluginGitCodeNoSubscriberHint(): String {
+    "当前没有 GitCode Webhook 通知目标。\n" +
+        "请在要接收通知的 TG/Feishu 会话中发送 /gitcode subscribe。\n" +
+        "静态 servicePlugins.imBindings 只用于命令路由授权，不包含真实 peerId，不能自动变成通知目标。"
 }
 
 private func servicePluginAcceptedEventPayloadRoot(payload: String): ?JsonObject {

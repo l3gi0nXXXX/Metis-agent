@@ -186,6 +186,28 @@ public class GatewayHttpSurfaceTest {
     }
 
     @TestCase
+    public func mcpToolCatalogCarriesGitCodeLegacyAliases(): Unit {
+        withGatewayHttpSurfaceTestSettings<Unit>({ =>
+            let response = gatewayHandleMcpRequest(
+                gatewayHttpSurfaceTestUser(),
+                "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}"
+            )
+            for (name in [
+                "gitcode_issue_summary",
+                "gitcode_pr_summary",
+                "gitcode_safety_review"
+            ]) {
+                @Expect(response.contains(name), true)
+            }
+            @Expect(response.contains("Compatibility alias for gitcode_issue_summarize"), true)
+            @Expect(response.contains("Compatibility alias for gitcode_pr_summarize"), true)
+            @Expect(response.contains("Compatibility alias for gitcode_reply_safety_review"), true)
+            @Expect(response.contains("\"canonicalName\""), true)
+            @Expect(response.contains("\"writebackImplemented\""), true)
+        })
+    }
+
+    @TestCase
     public func mcpGitCodeToolCallReturnsStructuredContentAndStaysReadOnly(): Unit {
         withGatewayHttpSurfaceTestSettings<Unit>({ =>
             let response = gatewayHandleMcpRequest(
@@ -203,6 +225,28 @@ public class GatewayHttpSurfaceTest {
             @Expect(audit.get("writebackAttempted").getOrThrow().asBool().getValue(), false)
             @Expect(audit.get("modelProviderCalled").getOrThrow().asBool().getValue(), false)
             @Expect(audit.get("ckbLocalPathRead").getOrThrow().asBool().getValue(), false)
+        })
+    }
+
+    @TestCase
+    public func mcpGitCodeLegacyAliasToolCallReturnsCanonicalStructuredContent(): Unit {
+        withGatewayHttpSurfaceTestSettings<Unit>({ =>
+            let response = gatewayHandleMcpRequest(
+                gatewayHttpSurfaceTestUser(),
+                "{\"jsonrpc\":\"2.0\",\"id\":25,\"method\":\"tools/call\",\"params\":{\"name\":\" GitCode_Issue_Summary \",\"arguments\":{\"requestId\":\"req-runtime-alias\",\"caller\":\"monitor\",\"repository\":\"owner/repo\",\"issueId\":\"42\"}}}"
+            )
+            let root = JsonValue.fromStr(response).asObject()
+            let result = root.get("result").getOrThrow().asObject()
+            let structured = result.get("structuredContent").getOrThrow().asObject()
+            @Expect(structured.get("requestId").getOrThrow().asString().getValue(), "req-runtime-alias")
+            @Expect(structured.get("status").getOrThrow().asString().getValue(), "needs_human_review")
+            @Expect(structured.get("tool").getOrThrow().asString().getValue(), "gitcode_issue_summarize")
+            @Expect(structured.get("canonicalToolName").getOrThrow().asString().getValue(), "gitcode_issue_summarize")
+            @Expect(structured.get("requestedToolName").getOrThrow().asString().getValue(), "gitcode_issue_summary")
+            @Expect(response.contains("UNKNOWN_GITCODE_TOOL"), false)
+            @Expect(structured.get("readOnly").getOrThrow().asBool().getValue(), true)
+            let audit = structured.get("audit").getOrThrow().asObject()
+            @Expect(audit.get("writebackAttempted").getOrThrow().asBool().getValue(), false)
         })
     }
 

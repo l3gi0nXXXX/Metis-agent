@@ -3,7 +3,7 @@ package metis.gateway.gitcode_plugin
 import metis.gateway.service_plugin.{ServicePluginAcceptedGitCodeEvent, ServicePluginDeliveryTarget, hashRawPayload, servicePluginDeliveryTargetToJson}
 import std.collection.{ArrayList, HashMap, HashSet}
 import std.convert.Parsable
-import stdx.encoding.json.{JsonBool, JsonInt, JsonObject, JsonString}
+import stdx.encoding.json.{JsonBool, JsonInt, JsonObject, JsonString, JsonValue}
 
 public class GitCodePluginCommandParseResult {
     public let handled: Bool
@@ -589,7 +589,7 @@ public func formatGitCodeSubscribeResult(result: SubscriptionSaveResult): String
     if (!result.ok) {
         return "GitCode 订阅失败\n状态: ${result.status}${if (result.diagnostic.isEmpty()) { "" } else { "\n诊断: ${redactGitCodePluginText(result.diagnostic)}" }}"
     }
-    "GitCode 订阅已开启\n状态: ${result.status}\n目标: ${safeTargetKey(result.targetKey)}"
+    "GitCode 订阅已开启\n状态: ${result.status}\n目标: ${safeTargetKey(result.targetKey)}\n后续 GitCode webhook 生成的回复草稿会发送到当前会话。"
 }
 
 public func removeGitCodeSubscription(target: GitCodeSubscriptionTarget): SubscriptionRemoveResult {
@@ -620,6 +620,39 @@ public func listGitCodeSubscriptions(filter!: GitCodeSubscriptionFilter = GitCod
         }
     }
     out
+}
+
+public func gitCodeSubscriptionStatusJson(): JsonObject {
+    let root = JsonObject()
+    var total: Int64 = 0
+    var telegram: Int64 = 0
+    var feishu: Int64 = 0
+    var generatedReplies: Int64 = 0
+    var rawEvents: Int64 = 0
+    for (row in listGitCodeSubscriptions()) {
+        total++
+        let channel = row.target.channel.toAsciiLower()
+        if (channel == "telegram") {
+            telegram++
+        } else if (channel == "feishu") {
+            feishu++
+        }
+        if (row.scope.generatedReplies) { generatedReplies++ }
+        if (row.scope.rawEvents) { rawEvents++ }
+    }
+    root.put("total", JsonInt(total))
+    root.put("active", JsonInt(total))
+    root.put("telegram", JsonInt(telegram))
+    root.put("feishu", JsonInt(feishu))
+    root.put("generatedReplies", JsonInt(generatedReplies))
+    root.put("rawEvents", JsonInt(rawEvents))
+    root
+}
+
+public func formatGitCodeNoSubscriberHint(): String {
+    "当前没有 GitCode Webhook 通知目标。\n" +
+        "请在要接收通知的 TG/Feishu 会话中发送 /gitcode subscribe。\n" +
+        "静态 servicePlugins.imBindings 只用于命令路由授权，不包含真实 peerId，不能自动变成通知目标。"
 }
 
 public func handleGitCodeScanOnceCommand(context: GatewayCommandContext, args: GitCodeScanOnceArgs): GatewayCommandResult {
@@ -1276,16 +1309,39 @@ private func describeGitCodeWebhookDispatch(raw: String): String {
     let feishu = jsonIntField(raw, "feishu", fallback: 0)
     let failed = jsonIntField(raw, "failed", fallback: jsonIntField(raw, "deliveryFailed", fallback: 0))
     let orphan = jsonIntField(raw, "orphan", fallback: jsonIntField(raw, "orphanEvent", fallback: 0))
+    let noSubscribers = jsonIntField(raw, "noSubscribers", fallback: jsonIntField(raw, "noSubscriberCount", fallback: 0))
+    let latestStatus = jsonStringField(raw, "latestStatus")
+    if (latestStatus == "no_subscribers" || noSubscribers > 0) {
+        return "最近事件已处理，但没有通知目标；请在目标 IM 会话执行 /gitcode subscribe。"
+    }
     "最近事件已发送到 TG ${tg} 个、Feishu ${feishu} 个；最近失败 ${failed} 个；无对应任务事件 ${orphan} 个。"
 }
 
 private func describeGitCodeWebhookSubscribers(raw: String): String {
     let tg = jsonIntField(raw, "telegram", fallback: jsonIntField(raw, "tg", fallback: 0))
     let feishu = jsonIntField(raw, "feishu", fallback: 0)
+    let total = jsonIntField(raw, "total", fallback: tg + feishu)
+    if (total == 0) {
+        return formatGitCodeNoSubscriberHint()
+    }
+    let generatedReplies = jsonIntField(raw, "generatedReplies", fallback: -1)
+    if (generatedReplies >= 0) {
+        return "TG ${tg} 个，Feishu ${feishu} 个，生成草稿通知 ${generatedReplies} 个。"
+    }
     "TG ${tg} 个，Feishu ${feishu} 个。"
 }
 
 private func jsonObjectField(raw: String, key: String): String {
+    let parsed = try {
+        JsonValue.fromStr(raw).asObject()
+    } catch (_: Exception) {
+        JsonObject()
+    }
+    match (parsed.get(key)) {
+        case Some(v) =>
+            try { return v.asObject().toJsonString() } catch (_: Exception) { () }
+        case None => ()
+    }
     let needle = "\"${key}\":{"
     if (!raw.contains(needle)) { return "" }
     let tail = raw.split(needle, 2)[1]
@@ -1298,6 +1354,15 @@ private func jsonStringField(raw: String, key: String, fallback!: String = ""): 
 }
 
 private func jsonIntField(raw: String, key: String, fallback!: Int64 = 0): Int64 {
+    let parsed = try {
+        JsonValue.fromStr(raw).asObject()
+    } catch (_: Exception) {
+        JsonObject()
+    }
+    match (parsed.get(key)) {
+        case Some(v) => try { return v.asInt().getValue() } catch (_: Exception) { () }
+        case None => ()
+    }
     let needle = "\"${key}\":"
     if (!raw.contains(needle)) { return fallback }
     let tail = raw.split(needle, 2)[1].trimAscii()
@@ -1307,6 +1372,15 @@ private func jsonIntField(raw: String, key: String, fallback!: Int64 = 0): Int64
 }
 
 private func jsonBoolField(raw: String, key: String): Bool {
+    let parsed = try {
+        JsonValue.fromStr(raw).asObject()
+    } catch (_: Exception) {
+        JsonObject()
+    }
+    match (parsed.get(key)) {
+        case Some(v) => try { return v.asBool().getValue() } catch (_: Exception) { () }
+        case None => ()
+    }
     let needle = "\"${key}\":"
     if (!raw.contains(needle)) { return false }
     let tail = raw.split(needle, 2)[1].trimAscii()
@@ -1324,6 +1398,15 @@ private func boundedNonNegative(value: Int64): Int64 {
 }
 
 private func fieldValue(raw: String, key: String): String {
+    let parsed = try {
+        JsonValue.fromStr(raw).asObject()
+    } catch (_: Exception) {
+        JsonObject()
+    }
+    match (parsed.get(key)) {
+        case Some(v) => try { return v.asString().getValue() } catch (_: Exception) { () }
+        case None => ()
+    }
     let needle = "\"${key}\":\""
     if (!raw.contains(needle)) { return "" }
     let tail = raw.split(needle, 2)[1]

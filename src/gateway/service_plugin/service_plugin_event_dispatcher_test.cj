@@ -1,10 +1,18 @@
 package metis.gateway.service_plugin
-
 import std.collection.ArrayList
 import std.unittest.testmacro.*
+import stdx.encoding.json.JsonObject
 
 @Test
 public class ServicePluginEventDispatcherTest {
+    private func jsonInt(obj: JsonObject, key: String): Int64 {
+        try { obj.get(key).getOrThrow().asInt().getValue() } catch (_: Exception) { -1 }
+    }
+
+    private func jsonString(obj: JsonObject, key: String): String {
+        try { obj.get(key).getOrThrow().asString().getValue() } catch (_: Exception) { "" }
+    }
+
     private func target(channel!: String = "telegram", peerId!: String = "peer-secret"): ServicePluginDeliveryTarget {
         ServicePluginDeliveryTarget(channel, "acct", peerId, replyToMessageId: "msg-1")
     }
@@ -133,8 +141,10 @@ public class ServicePluginEventDispatcherTest {
 
     @TestCase
     public func webhookAcceptedEventWithoutSubscribersDoesNotCallDraftHandler(): Unit {
+        // A0-SUB-UT-001, A4-DIAG-UT-001, A5-E2E-UT-002
         this.resetDispatcherHooks()
         let draftCalls = ArrayList<String>()
+        let messages = ArrayList<String>()
         setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent =>
             ArrayList<ServicePluginDeliveryTarget>()
         }))
@@ -142,12 +152,25 @@ public class ServicePluginEventDispatcherTest {
             draftCalls.add("called")
             ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "draft")
         }))
+        setServicePluginEventDeliveryForTest(Some({ _target: ServicePluginDeliveryTarget, text: String =>
+            messages.add(text)
+            ServicePluginEventDeliveryResult(true, "sent")
+        }))
         try {
             let result = dispatchServicePluginEvent(this.acceptedFrame(), store: ServicePluginPendingJobStore())
             @Expect(result.ok, true)
             @Expect(result.status, "no_subscribers")
             @Expect(result.targetCount, 0)
+            @Expect(result.diagnostic.contains("当前没有 GitCode Webhook 通知目标"), true)
+            @Expect(result.diagnostic.contains("/gitcode subscribe"), true)
             @Expect(draftCalls.size, 0)
+            @Expect(messages.size, 0)
+            let stats = servicePluginWebhookDispatchStatsJson()
+            @Expect(this.jsonInt(stats, "total"), 1)
+            @Expect(this.jsonInt(stats, "noSubscribers"), 1)
+            @Expect(this.jsonInt(stats, "success"), 0)
+            @Expect(this.jsonInt(stats, "failed"), 0)
+            @Expect(this.jsonString(stats, "latestStatus"), "no_subscribers")
         } finally {
             this.resetDispatcherHooks()
         }
@@ -155,6 +178,7 @@ public class ServicePluginEventDispatcherTest {
 
     @TestCase
     public func webhookAcceptedEventSupportsMultipleTargetsPartialFailureAndDedupe(): Unit {
+        // A4-DIAG-NEG-001, A5-E2E-BND-001
         this.resetDispatcherHooks()
         let messages = ArrayList<String>()
         setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent =>
@@ -180,11 +204,117 @@ public class ServicePluginEventDispatcherTest {
             @Expect(first.deliveryFailed, 1)
             @Expect(first.failureDetails.size, 1)
             @Expect(messages.size, 2)
+            let stats = servicePluginWebhookDispatchStatsJson()
+            @Expect(this.jsonInt(stats, "failed"), 1)
+            @Expect(this.jsonString(stats, "latestStatus"), "generated_reply_partially_delivered")
 
             let duplicate = dispatchServicePluginEvent(this.acceptedFrame(), store: ServicePluginPendingJobStore())
             @Expect(duplicate.ok, true)
             @Expect(duplicate.status, "duplicate_event")
             @Expect(messages.size, 2)
+        } finally {
+            this.resetDispatcherHooks()
+        }
+    }
+
+    @TestCase
+    public func a5WebhookAcceptedEventWithTelegramAndFeishuSubscribersDeliversGeneratedDraft(): Unit {
+        // A5-E2E-UT-001, A5-E2E-POS-001, A5-E2E-BND-001, A4-DIAG-POS-001
+        this.resetDispatcherHooks()
+        let messages = ArrayList<String>()
+        let draftCalls = ArrayList<String>()
+        setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent =>
+            this.targetRows([this.target(channel: "telegram", peerId: "tg-peer"), this.target(channel: "feishu", peerId: "fs-peer")])
+        }))
+        setServicePluginWebhookGeneratedReplyHandlerForTest(Some({ event: ServicePluginAcceptedGitCodeEvent, target: ServicePluginDeliveryTarget =>
+            draftCalls.add("${event.kind}:${target.channel}")
+            ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "请补充测试。")
+        }))
+        setServicePluginEventDeliveryForTest(Some({ target: ServicePluginDeliveryTarget, text: String =>
+            messages.add("${target.channel}:${text}")
+            ServicePluginEventDeliveryResult(true, "sent")
+        }))
+        try {
+            let issue = dispatchServicePluginEvent(this.acceptedFrame(eventId: "issue-1", kind: "issue", number: "1", url: "https://gitcode.com/cangjie/community/issues/1", title: "Issue title"), store: ServicePluginPendingJobStore())
+            @Expect(issue.ok, true)
+            @Expect(issue.status, "generated_reply_delivered")
+            @Expect(issue.targetCount, 2)
+            @Expect(issue.deliverySuccess, 2)
+            @Expect(messages.size, 2)
+            @Expect(draftCalls.size, 1)
+            @Expect(messages[0].contains("GitCode 回复草稿"), true)
+            @Expect(messages[0].contains("来源:"), true)
+            @Expect(messages[0].contains("https://gitcode.com/cangjie/community/issues/1"), true)
+            @Expect(messages[0].contains("dryRun=true"), true)
+
+            for (_ in 0..9) {
+                let duplicate = dispatchServicePluginEvent(this.acceptedFrame(eventId: "issue-1", kind: "issue", number: "1", url: "https://gitcode.com/cangjie/community/issues/1", title: "Issue title"), store: ServicePluginPendingJobStore())
+                @Expect(duplicate.ok, true)
+                @Expect(duplicate.status, "duplicate_event")
+            }
+            @Expect(messages.size, 2)
+            @Expect(draftCalls.size, 1)
+
+            @Expect(dispatchServicePluginEvent(this.acceptedFrame(eventId: "pr-1", kind: "pr", number: "2", url: "https://gitcode.com/cangjie/community/pulls/2"), store: ServicePluginPendingJobStore()).status, "generated_reply_delivered")
+            @Expect(dispatchServicePluginEvent(this.acceptedFrame(eventId: "comment-1", kind: "comment", number: "2", url: "https://gitcode.com/cangjie/community/pulls/2#note_9", content: "comment"), store: ServicePluginPendingJobStore()).status, "generated_reply_delivered")
+            @Expect(messages[2].contains("/pulls/2"), true)
+            @Expect(messages[4].contains("#note_9"), true)
+
+            let stats = servicePluginWebhookDispatchStatsJson()
+            @Expect(this.jsonInt(stats, "success"), 3)
+            @Expect(this.jsonInt(stats, "telegram"), 1)
+            @Expect(this.jsonInt(stats, "feishu"), 1)
+        } finally {
+            this.resetDispatcherHooks()
+        }
+    }
+
+    @TestCase
+    public func a5WebhookAcceptedEventRedactsSecretsFromDraftPromptMessageAndDiagnostic(): Unit {
+        // A5-E2E-NEG-001
+        this.resetDispatcherHooks()
+        let messages = ArrayList<String>()
+        let prompts = ArrayList<String>()
+        setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent =>
+            this.targetRows([this.target(channel: "telegram", peerId: "tg-peer")])
+        }))
+        setServicePluginWebhookGeneratedReplyHandlerForTest(Some({ event: ServicePluginAcceptedGitCodeEvent, _target: ServicePluginDeliveryTarget =>
+            prompts.add(event.content)
+            ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "safe draft")
+        }))
+        setServicePluginEventDeliveryForTest(Some({ _target: ServicePluginDeliveryTarget, text: String =>
+            messages.add(text)
+            ServicePluginEventDeliveryResult(true, "sent", diagnostic: "Authorization: Bearer secret token=abc")
+        }))
+        try {
+            let result = dispatchServicePluginEvent(this.acceptedFrame(content: "Authorization: Bearer secret token=abc https://gitcode.com/cangjie/community/issues/1"), store: ServicePluginPendingJobStore())
+            @Expect(result.ok, true)
+            @Expect(result.diagnostic.contains("Bearer secret"), false)
+            @Expect(prompts[0].contains("Bearer secret"), false)
+            @Expect(prompts[0].contains("token=abc"), false)
+            @Expect(messages[0].contains("Bearer secret"), false)
+            @Expect(messages[0].contains("token=abc"), false)
+            @Expect(messages[0].contains("https://gitcode.com/cangjie/community/pulls/71"), true)
+        } finally {
+            this.resetDispatcherHooks()
+        }
+    }
+
+    @TestCase
+    public func a4WebhookDispatchStatsKeepLatestFiftyRows(): Unit {
+        // A4-DIAG-BND-001
+        this.resetDispatcherHooks()
+        try {
+            for (i in 0..60) {
+                recordServicePluginWebhookDispatchStatForTest(ServicePluginWebhookDispatchStat("event-${i}", "hash-${i}", "generated_reply_delivered", 2, 2, 0, diagnosticHash: "diag-${i}", noSubscriberCount: 0, telegram: 1, feishu: 1, updatedAtMs: i))
+            }
+            let rows = servicePluginWebhookDispatchStatsSnapshot()
+            @Expect(rows.size, 50)
+            @Expect(rows[0].eventId, "event-10")
+            @Expect(rows[49].eventId, "event-59")
+            let stats = servicePluginWebhookDispatchStatsJson()
+            @Expect(this.jsonInt(stats, "total"), 50)
+            @Expect(this.jsonString(stats, "latestStatus"), "generated_reply_delivered")
         } finally {
             this.resetDispatcherHooks()
         }

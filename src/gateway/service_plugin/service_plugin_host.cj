@@ -1278,11 +1278,7 @@ private func servicePluginEventPump(record: ServicePluginRuntimeRecord, process:
             let handled = handleServiceCapabilityEvent(ServiceCapabilityEvent(frame.serviceId, frame.capabilityId, payload: frame.payload))
             if (handled.ok) {
                 let dispatch = dispatchServicePluginEvent(frame)
-                if (!dispatch.ok) {
-                    record.lastError = servicePluginDispatchDiagnosticSummary(frame, dispatch)
-                } else {
-                    record.lastError = ""
-                }
+                servicePluginRecordRuntimeDispatch(record, frame, dispatch)
             } else {
                 record.lastError = redactServicePayload(handled.diagnostic).text
             }
@@ -1291,6 +1287,25 @@ private func servicePluginEventPump(record: ServicePluginRuntimeRecord, process:
         if (frame.frameType == "audit") {
             continue
         }
+    }
+}
+
+private func servicePluginRecordRuntimeDispatch(record: ServicePluginRuntimeRecord, frame: ServiceFrame, dispatch: ServicePluginEventDispatchResult): Unit {
+    if (!dispatch.ok || dispatch.status == "no_subscribers" || dispatch.status == "generated_reply_partially_delivered" || dispatch.status == "generated_reply_delivery_failed") {
+        record.lastError = servicePluginDispatchDiagnosticSummary(frame, dispatch)
+        return
+    }
+    record.lastError = ""
+}
+
+public func recordServicePluginRuntimeDispatchForTest(serviceId: String, frame: ServiceFrame, dispatch: ServicePluginEventDispatchResult): Unit {
+    match (servicePluginRegistry.get(serviceId.trimAscii())) {
+        case Some(record) =>
+            if (record.status == "registered") {
+                record.status = "running"
+            }
+            servicePluginRecordRuntimeDispatch(record, frame, dispatch)
+        case None => ()
     }
 }
 

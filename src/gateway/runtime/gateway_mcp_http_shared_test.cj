@@ -6,6 +6,8 @@ import metis.gateway.{
     GATEWAY_MCP_PATH,
     GATEWAY_MCP_PROTOCOL_VERSION,
     GATEWAY_MCP_SERVER_NAME,
+    gatewayMcpGitCodeCanonicalToolName,
+    gatewayMcpIsGitCodeTool,
     gatewayMcpGitCodeToolResultJson,
     gatewayMcpGitCodeToolResultJsonWithRuntime,
     gatewayMcpGitCodeParseStructuredOutputJson,
@@ -79,6 +81,20 @@ private func testToolListContains(tools: JsonArray, name: String): Bool {
     false
 }
 
+private func testFindTool(tools: JsonArray, name: String): JsonObject {
+    for (i in 0..tools.size()) {
+        let row = try {
+            tools[i].asObject()
+        } catch (_e: Exception) {
+            JsonObject()
+        }
+        if (testJsonString(row, "name") == name) {
+            return row
+        }
+    }
+    JsonObject()
+}
+
 @Test
 public class GatewayMcpHttpSharedTest {
     @TestCase
@@ -143,6 +159,61 @@ public class GatewayMcpHttpSharedTest {
     }
 
     @TestCase
+    public func gitCodeToolListExposesLegacyAliasesForGcmContract(): Unit {
+        // A0-MCP-UT-001
+        let tools = testJsonArray(gatewayMcpToolListResultJson(), "tools")
+        for (name in [
+            "gitcode_issue_summarize",
+            "gitcode_pr_summarize",
+            "gitcode_reply_safety_review",
+            "gitcode_issue_summary",
+            "gitcode_pr_summary",
+            "gitcode_safety_review"
+        ]) {
+            @Expect(testToolListContains(tools, name), true)
+        }
+    }
+
+    @TestCase
+    public func gitCodeAliasSchemasMirrorCanonicalMetadata(): Unit {
+        let tools = testJsonArray(gatewayMcpToolListResultJson(), "tools")
+        let canonical = testFindTool(tools, "gitcode_reply_safety_review")
+        let alias = testFindTool(tools, "gitcode_safety_review")
+        @Expect(testJsonString(alias, "name"), "gitcode_safety_review")
+        @Expect(testJsonString(alias, "description").contains("Compatibility alias for gitcode_reply_safety_review"), true)
+        @Expect(alias.get("inputSchema").isSome(), true)
+        @Expect(alias.get("resultSchema").isSome(), true)
+        let canonicalMeta = testJsonObject(canonical, "_meta")
+        let aliasMeta = testJsonObject(alias, "_meta")
+        @Expect(testJsonBool(aliasMeta, "readOnly"), testJsonBool(canonicalMeta, "readOnly"))
+        @Expect(testJsonBool(aliasMeta, "writebackImplemented"), testJsonBool(canonicalMeta, "writebackImplemented"))
+        @Expect(testJsonString(aliasMeta, "canonicalName"), "gitcode_reply_safety_review")
+    }
+
+    @TestCase
+    public func gitCodeCanonicalToolNameMapsLegacyAliasesAndNormalizesInput(): Unit {
+        // A1-MCP-UT-001
+        @Expect(gatewayMcpGitCodeCanonicalToolName("gitcode_issue_summary"), "gitcode_issue_summarize")
+        @Expect(gatewayMcpGitCodeCanonicalToolName("gitcode_pr_summary"), "gitcode_pr_summarize")
+        @Expect(gatewayMcpGitCodeCanonicalToolName("gitcode_safety_review"), "gitcode_reply_safety_review")
+        @Expect(gatewayMcpGitCodeCanonicalToolName("gitcode_issue_summarize"), "gitcode_issue_summarize")
+        @Expect(gatewayMcpGitCodeCanonicalToolName("gitcode_pr_summarize"), "gitcode_pr_summarize")
+        @Expect(gatewayMcpGitCodeCanonicalToolName("gitcode_reply_safety_review"), "gitcode_reply_safety_review")
+        @Expect(gatewayMcpGitCodeCanonicalToolName(" GitCode_Issue_Summary "), "gitcode_issue_summarize")
+        @Expect(gatewayMcpGitCodeCanonicalToolName("GITCODE_SAFETY_REVIEW"), "gitcode_reply_safety_review")
+    }
+
+    @TestCase
+    public func gitCodeToolPredicateAcceptsAliasesAndRejectsUnknownGitCodeTools(): Unit {
+        // A1-MCP-UT-002
+        @Expect(gatewayMcpIsGitCodeTool("gitcode_issue_summarize"), true)
+        @Expect(gatewayMcpIsGitCodeTool("gitcode_issue_summary"), true)
+        @Expect(gatewayMcpIsGitCodeTool(" GitCode_Pr_Summary "), true)
+        @Expect(gatewayMcpIsGitCodeTool("gitcode_safety_review"), true)
+        @Expect(gatewayMcpIsGitCodeTool("gitcode_unknown_tool"), false)
+    }
+
+    @TestCase
     public func gitCodeMissingRequiredFieldsReturnStructuredError(): Unit {
         let result = gatewayMcpGitCodeToolResultJson("gitcode_issue_summarize", JsonObject())
         @Expect(testJsonString(result, "status"), "error")
@@ -161,6 +232,83 @@ public class GatewayMcpHttpSharedTest {
         @Expect(testJsonString(result, "status"), "error")
         let error = testJsonObject(result, "error")
         @Expect(testJsonString(error, "code"), "UNKNOWN_GITCODE_TOOL")
+    }
+
+    @TestCase
+    public func gitCodeLegacyAliasCallsRouteToCanonicalImplementations(): Unit {
+        // A1-MCP-POS-001
+        let args = JsonObject()
+        args.put("requestId", JsonString("req-alias-issue"))
+        args.put("caller", JsonString("monitor"))
+        args.put("repository", JsonString("owner/repo"))
+        args.put("issueId", JsonString("42"))
+        let evidence = JsonArray([])
+        let row = JsonObject()
+        row.put("source", JsonString("fixture"))
+        row.put("text", JsonString("The issue asks how to configure Cangjie imports."))
+        evidence.add(row)
+        args.put("evidence", evidence)
+        let result = gatewayMcpGitCodeToolResultJsonWithRuntime(
+            "gitcode_issue_summary",
+            args,
+            modelRunner: Some({ _: String, _: JsonObject => "{\"text\":\"Use the documented Cangjie imports.\"}" })
+        )
+        @Expect(testJsonString(result, "status"), "ok")
+        @Expect(testJsonString(result, "tool"), "gitcode_issue_summarize")
+        @Expect(testJsonString(result, "toolName"), "gitcode_issue_summarize")
+        @Expect(testJsonString(result, "canonicalToolName"), "gitcode_issue_summarize")
+        @Expect(testJsonString(result, "requestedToolName"), "gitcode_issue_summary")
+        let summary = testJsonObject(result, "summary")
+        @Expect(testJsonString(summary, "text"), "Use the documented Cangjie imports.")
+    }
+
+    @TestCase
+    public func gitCodeUnknownToolDoesNotInvokeRunners(): Unit {
+        // A1-MCP-NEG-001
+        let args = JsonObject()
+        args.put("requestId", JsonString("req-unknown-alias"))
+        args.put("caller", JsonString("monitor"))
+        args.put("repository", JsonString("owner/repo"))
+        args.put("issueId", JsonString("42"))
+        let result = gatewayMcpGitCodeToolResultJsonWithRuntime(
+            "gitcode_unknown_tool",
+            args,
+            modelRunner: Some({ _: String, _: JsonObject =>
+                throw Exception("model runner should not be invoked for an unknown GitCode tool")
+            }),
+            knowledgeRunner: Some({ _: String, _: JsonObject =>
+                throw Exception("knowledge runner should not be invoked for an unknown GitCode tool")
+            })
+        )
+        @Expect(testJsonString(result, "status"), "error")
+        let error = testJsonObject(result, "error")
+        @Expect(testJsonString(error, "code"), "UNKNOWN_GITCODE_TOOL")
+    }
+
+    @TestCase
+    public func gitCodeAliasBoundaryInputsTrimLowerAndRoute(): Unit {
+        // A1-MCP-BND-001
+        let args = JsonObject()
+        args.put("requestId", JsonString("req-alias-boundary"))
+        args.put("caller", JsonString("monitor"))
+        args.put("repository", JsonString("owner/repo"))
+        args.put("replyText", JsonString("Thanks for the report."))
+        let evidence = JsonArray([])
+        let row = JsonObject()
+        row.put("source", JsonString("fixture"))
+        row.put("text", JsonString("The response is safe and only asks for logs."))
+        evidence.add(row)
+        args.put("evidence", evidence)
+        let result = gatewayMcpGitCodeToolResultJsonWithRuntime(
+            " GITCODE_SAFETY_REVIEW ",
+            args,
+            modelRunner: Some({ _: String, _: JsonObject => "{\"safeToSend\":true,\"reason\":\"Safe.\"}" })
+        )
+        @Expect(testJsonString(result, "status"), "ok")
+        @Expect(testJsonString(result, "tool"), "gitcode_reply_safety_review")
+        @Expect(testJsonString(result, "requestedToolName"), "GITCODE_SAFETY_REVIEW")
+        let review = testJsonObject(result, "review")
+        @Expect(testJsonBool(review, "safeToSend"), true)
     }
 
     @TestCase
@@ -376,8 +524,13 @@ public class GatewayMcpHttpSharedTest {
     @TestCase
     public func gitCodeRegistryAndRuntimeStatusExposePolicyAuditAndAuth(): Unit {
         let registry = gatewayMcpGitCodeToolMetadataRegistryJson()
-        @Expect(testJsonInt(registry, "toolCount"), 5)
+        @Expect(testJsonInt(registry, "toolCount"), 8)
         @Expect(testJsonInt(registry, "maxInputBytes") > 0, true)
+        let tools = testJsonArray(registry, "tools")
+        let alias = testFindTool(tools, "gitcode_safety_review")
+        @Expect(testJsonString(alias, "name"), "gitcode_safety_review")
+        @Expect(testJsonBool(alias, "readOnly"), true)
+        @Expect(testJsonBool(alias, "writebackImplemented"), false)
 
         let status = gatewayMcpGitCodeRuntimeStatusJson(authMode: "token")
         @Expect(testJsonString(status, "server"), GATEWAY_MCP_SERVER_NAME)
