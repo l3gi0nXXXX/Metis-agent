@@ -1774,7 +1774,9 @@ public class GatewayServiceTelegramNativeTest {
                 let callbackPayload = JsonObject()
                 callbackPayload.put("data", JsonString("plugin:demo:ok"))
                 let callback = gatewayOpenClawPluginSidecarInvoke(user, "interactive.dispatch", callbackPayload)
-                @Expect(callback.get("matched").getOrThrow().asBool().getValue(), true)
+                if (!callback.get("matched").getOrThrow().asBool().getValue()) {
+                    throw Exception("interactive.dispatch sidecar response: ${callback.toJsonString()}")
+                }
                 let callbackIntent = callback.get("intents").getOrThrow().asArray()[0].asObject()
                 @Expect(callbackIntent.get("text").getOrThrow().asString().getValue(), "interactive ok")
                 @Expect(callbackIntent.get("buttons").getOrThrow().asArray().size(), 1)
