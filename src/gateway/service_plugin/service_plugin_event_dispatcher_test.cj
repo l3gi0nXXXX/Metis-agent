@@ -5,6 +5,8 @@ import stdx.encoding.json.JsonObject
 
 @Test
 public class ServicePluginEventDispatcherTest {
+    private let gitCodeReviewContractVersion = "gcm-metis-gitcode-review-v1"
+
     private func jsonInt(obj: JsonObject, key: String): Int64 {
         try { obj.get(key).getOrThrow().asInt().getValue() } catch (_: Exception) { -1 }
     }
@@ -29,12 +31,53 @@ public class ServicePluginEventDispatcherTest {
         ServiceFrame("event", "accepted-${eventId}", "gitcode-monitor", method: "emitCapabilityEvent", capabilityId: "gitcode.event.accepted", payload: "{\"jobId\":\"${jobId}\",\"eventId\":\"${eventId}\",\"repo\":\"${repo}\",\"kind\":\"${kind}\",\"number\":\"${number}\",\"title\":\"${title}\",\"url\":\"${url}\",\"content\":\"${content}\"}")
     }
 
+    private func acceptedContractFrame(jobId!: String = "webhook-d1", eventId!: String = "gitcode:Cangjie/cangjie_tools:issue:123"): ServiceFrame {
+        let payload = "{" +
+            "\"jobId\":\"${jobId}\"," +
+            "\"eventId\":\"${eventId}\"," +
+            "\"repo\":\"Cangjie/cangjie_tools\"," +
+            "\"kind\":\"issue\"," +
+            "\"number\":\"123\"," +
+            "\"title\":\"[Bug]: build failed\"," +
+            "\"url\":\"https://gitcode.com/Cangjie/cangjie_tools/issues/123\"," +
+            "\"content\":\"redacted compact legacy content\"," +
+            "\"contractVersion\":\"${this.gitCodeReviewContractVersion}\"," +
+            "\"reviewRequest\":{" +
+                "\"schemaVersion\":1," +
+                "\"event\":{\"eventId\":\"${eventId}\",\"eventType\":\"issue\",\"repo\":{\"fullName\":\"Cangjie/cangjie_tools\"},\"item\":{\"number\":\"123\",\"title\":\"[Bug]: build failed\",\"url\":\"https://gitcode.com/Cangjie/cangjie_tools/issues/123\"},\"comment\":{\"commentId\":\"\",\"body\":\"\",\"url\":\"\"}}," +
+                "\"templates\":{\"issueKind\":\"bug\",\"fields\":{\"cjcVersion\":\"cjc 1.0.0\",\"branchVersions\":[\"main\"]}}," +
+                "\"policy\":{\"requiresCkb\":true,\"requiresSourceWorkspace\":true,\"requiresCodeReview\":false}," +
+                "\"diagnostics\":[]" +
+            "}" +
+        "}"
+        ServiceFrame("event", "accepted-contract-${eventId}", "gitcode-monitor", method: "emitCapabilityEvent", capabilityId: "gitcode.event.accepted", payload: payload)
+    }
+
+    private func registerGitCodeWritebackPlugin(): Unit {
+        resetServicePluginHostForTest()
+        let caps = ArrayList<ServiceCapabilityRecord>()
+        caps.add(ServiceCapabilityRecord("gitcode.writeback.apply_result", "controlAction"))
+        let manifest = ServicePluginManifest(
+            schema: METIS_SERVICE_PLUGIN_SCHEMA,
+            pluginId: "gitcode-monitor",
+            displayName: "GitCode Monitor",
+            kind: "service",
+            protocolVersion: "1.0",
+            entryCommand: "fake-gcm",
+            hasConfigSchema: true,
+            capabilityDeclarations: caps
+        )
+        let result = registerServicePlugin(ServicePluginRegistration(manifest))
+        @Expect(result.ok, true)
+    }
+
     private func resetDispatcherHooks(): Unit {
         setServicePluginEventDeliveryForTest(None)
         setServicePluginGeneratedReplyHandlerForTest(None<(ServicePluginPendingJob, ServicePluginAcceptedGitCodeEvent) -> ServicePluginGeneratedReplyResult>)
         setServicePluginWebhookGeneratedReplyHandlerForTest(None<(ServicePluginAcceptedGitCodeEvent, ServicePluginDeliveryTarget) -> ServicePluginGeneratedReplyResult>)
         setServicePluginWebhookSubscribersProviderForTest(None<(ServicePluginAcceptedGitCodeEvent) -> ArrayList<ServicePluginDeliveryTarget>>)
         resetServicePluginGeneratedReplyStateForTest()
+        resetServicePluginHostForTest()
     }
 
     private func targetRows(targets: Array<ServicePluginDeliveryTarget>): ArrayList<ServicePluginDeliveryTarget> {
@@ -543,5 +586,144 @@ public class ServicePluginEventDispatcherTest {
             setServicePluginGeneratedReplyHandlerForTest(None<(ServicePluginPendingJob, ServicePluginAcceptedGitCodeEvent) -> ServicePluginGeneratedReplyResult>)
             resetServicePluginGeneratedReplyStateForTest()
         }
+    }
+
+    @TestCase
+    public func tWriteback011DispatcherInvokesApplyResultWithContractPayload(): Unit {
+        this.resetDispatcherHooks()
+        this.registerGitCodeWritebackPlugin()
+        let calls = ArrayList<String>()
+        let messages = ArrayList<String>()
+        setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent =>
+            this.targetRows([this.target(channel: "telegram", peerId: "tg-peer")])
+        }))
+        setServicePluginWebhookGeneratedReplyHandlerForTest(Some({ event: ServicePluginAcceptedGitCodeEvent, _target: ServicePluginDeliveryTarget =>
+            @Expect(event.contractVersion, this.gitCodeReviewContractVersion)
+            @Expect(event.reviewRequestRaw.contains("\"schemaVersion\""), true)
+            ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "建议补充回归测试。")
+        }))
+        setServicePluginCapabilityInvokerForTest(Some({ _registration: ServicePluginRegistration, request: CapabilityInvokeRequest =>
+            calls.add(request.capabilityId)
+            @Expect(request.capabilityId, "gitcode.writeback.apply_result")
+            @Expect(request.payload.contains("\"contractVersion\""), true)
+            @Expect(request.payload.contains(this.gitCodeReviewContractVersion), true)
+            @Expect(request.payload.contains("\"eventId\""), true)
+            @Expect(request.payload.contains("gitcode:Cangjie/cangjie_tools:issue:123"), true)
+            @Expect(request.payload.contains("\"draft\""), true)
+            @Expect(request.payload.contains("建议补充回归测试。"), true)
+            CapabilityInvokeResult(true, "ok", serviceId: "gitcode-monitor", capabilityId: request.capabilityId, payload: "{\"status\":\"skipped\",\"posted\":false,\"reason\":\"dry_run\"}")
+        }))
+        setServicePluginEventDeliveryForTest(Some({ _target: ServicePluginDeliveryTarget, text: String =>
+            messages.add(text)
+            ServicePluginEventDeliveryResult(true, "sent")
+        }))
+        try {
+            let result = dispatchServicePluginEvent(this.acceptedContractFrame(), store: ServicePluginPendingJobStore())
+            @Expect(result.ok, true)
+            @Expect(calls.toArray(), ["gitcode.writeback.apply_result"])
+            @Expect(messages.size, 1)
+            @Expect(messages[0].contains("写回未执行"), true)
+            @Expect(messages[0].contains("\"status\""), false)
+        } finally {
+            this.resetDispatcherHooks()
+        }
+    }
+
+    @TestCase
+    public func tWriteback012TimeoutStillNotifiesDraft(): Unit {
+        this.resetDispatcherHooks()
+        this.registerGitCodeWritebackPlugin()
+        let messages = ArrayList<String>()
+        setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent =>
+            this.targetRows([this.target(channel: "telegram", peerId: "tg-peer")])
+        }))
+        setServicePluginWebhookGeneratedReplyHandlerForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent, _target: ServicePluginDeliveryTarget =>
+            ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "草稿仍需通知。")
+        }))
+        setServicePluginCapabilityInvokerForTest(Some({ _registration: ServicePluginRegistration, request: CapabilityInvokeRequest =>
+            CapabilityInvokeResult(false, "invoke_timeout", serviceId: "gitcode-monitor", capabilityId: request.capabilityId, diagnostic: "timeout")
+        }))
+        setServicePluginEventDeliveryForTest(Some({ _target: ServicePluginDeliveryTarget, text: String =>
+            messages.add(text)
+            ServicePluginEventDeliveryResult(true, "sent")
+        }))
+        try {
+            let result = dispatchServicePluginEvent(this.acceptedContractFrame(), store: ServicePluginPendingJobStore())
+            @Expect(result.ok, true)
+            @Expect(result.status, "generated_reply_degraded_delivered")
+            @Expect(messages[0].contains("写回状态未知/超时"), true)
+            @Expect(messages[0].contains("草稿仍需通知。"), true)
+        } finally {
+            this.resetDispatcherHooks()
+        }
+    }
+
+    @TestCase
+    public func tWriteback013MalformedResponseIsHumanReadable(): Unit {
+        this.resetDispatcherHooks()
+        this.registerGitCodeWritebackPlugin()
+        let messages = ArrayList<String>()
+        setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent =>
+            this.targetRows([this.target(channel: "telegram", peerId: "tg-peer")])
+        }))
+        setServicePluginWebhookGeneratedReplyHandlerForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent, _target: ServicePluginDeliveryTarget =>
+            ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "草稿")
+        }))
+        setServicePluginCapabilityInvokerForTest(Some({ _registration: ServicePluginRegistration, request: CapabilityInvokeRequest =>
+            CapabilityInvokeResult(true, "ok", serviceId: "gitcode-monitor", capabilityId: request.capabilityId, payload: "not-json")
+        }))
+        setServicePluginEventDeliveryForTest(Some({ _target: ServicePluginDeliveryTarget, text: String =>
+            messages.add(text)
+            ServicePluginEventDeliveryResult(true, "sent")
+        }))
+        try {
+            let result = dispatchServicePluginEvent(this.acceptedContractFrame(), store: ServicePluginPendingJobStore())
+            @Expect(result.status, "generated_reply_degraded_delivered")
+            @Expect(messages[0].contains("writeback_response_decode_failed"), true)
+            @Expect(messages[0].contains("not-json"), false)
+        } finally {
+            this.resetDispatcherHooks()
+        }
+    }
+
+    @TestCase
+    public func tWriteback014PostedResponseRendersReplyUrl(): Unit {
+        this.resetDispatcherHooks()
+        this.registerGitCodeWritebackPlugin()
+        let messages = ArrayList<String>()
+        setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent =>
+            this.targetRows([this.target(channel: "telegram", peerId: "tg-peer")])
+        }))
+        setServicePluginWebhookGeneratedReplyHandlerForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent, _target: ServicePluginDeliveryTarget =>
+            ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "已生成草稿。")
+        }))
+        setServicePluginCapabilityInvokerForTest(Some({ _registration: ServicePluginRegistration, request: CapabilityInvokeRequest =>
+            CapabilityInvokeResult(true, "ok", serviceId: "gitcode-monitor", capabilityId: request.capabilityId, payload: "{\"status\":\"posted\",\"posted\":true,\"replyUrl\":\"https://gitcode.com/Cangjie/cangjie_tools/issues/123#note_9\"}")
+        }))
+        setServicePluginEventDeliveryForTest(Some({ _target: ServicePluginDeliveryTarget, text: String =>
+            messages.add(text)
+            ServicePluginEventDeliveryResult(true, "sent")
+        }))
+        try {
+            let result = dispatchServicePluginEvent(this.acceptedContractFrame(), store: ServicePluginPendingJobStore())
+            @Expect(result.status, "generated_reply_delivered")
+            @Expect(messages[0].contains("GitCode 回复已写回"), true)
+            @Expect(messages[0].contains("https://gitcode.com/Cangjie/cangjie_tools/issues/123#note_9"), true)
+            @Expect(messages[0].contains("\"replyUrl\""), false)
+        } finally {
+            this.resetDispatcherHooks()
+        }
+    }
+
+    @TestCase
+    public func tDiag005And006GeneratedReplyNotificationExplainsDegradedContext(): Unit {
+        let event = ServicePluginAcceptedGitCodeEvent(repo: "Cangjie/cangjie_tools", kind: "issue", number: "123", url: "https://gitcode.com/Cangjie/cangjie_tools/issues/123")
+        let ckb = renderServicePluginGeneratedReplyNotification(event, ServicePluginGeneratedReplyResult(false, status: "ckb_unavailable", diagnostic: "ckb_unavailable", needsHumanReview: true))
+        @Expect(ckb.contains("知识库不可用，已保守生成/需要人工确认"), true)
+        @Expect(ckb.contains("\"diagnostics\""), false)
+
+        let pr = renderServicePluginGeneratedReplyNotification(event, ServicePluginGeneratedReplyResult(false, status: "pr_review_timeout", diagnostic: "adapter timeout raw={\"ok\":false}", needsHumanReview: true))
+        @Expect(pr.contains("PR review 阶段超时，已保守生成草稿，需要人工确认"), true)
+        @Expect(pr.contains("\"ok\""), false)
     }
 }

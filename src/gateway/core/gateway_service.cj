@@ -9,7 +9,7 @@ import metis.gateway.security.gatewayPairingAccountStore
 import metis.gateway.service_plugin.{CapabilityCaller, CapabilityInvokeRequest, CapabilityInvokeResult, ServicePluginAcceptedGitCodeEvent, ServicePluginDeliveryTarget, ServicePluginEventDeliveryResult, ServicePluginGeneratedReplyResult, ServicePluginPendingJob, buildServicePluginImBindingRules, invokeRegisteredCapability, matchServicePluginImBinding, parseServicePluginJobAcceptedPayload, renderServicePluginJobSnapshotMessage, servicePluginPendingJobStore, registerConfiguredServicePlugins, servicePluginConfiguredStatusForUser, servicePluginWebhookDispatchStatsJson, setServicePluginEventDelivery, setServicePluginGeneratedReplyHandler, setServicePluginWebhookGeneratedReplyHandler, setServicePluginWebhookSubscribersProvider}
 import metis.gateway.session.{GatewayIngressSource, GatewaySessionContext, GatewaySessionRequest, gatewayResolveSessionContext, gatewaySessionRequestFromInbound}
 import metis.gateway.tools.{gatewayHandleNativeCommandLine, gatewayHandleSubagentsCommandLine}
-import metis.gateway.gitcode_plugin.{GatewayCommandContext, buildGitCodeAsyncScanPayload, buildGitCodeDeadLetterInspectPayload, buildGitCodeDeadLetterListPayload, buildGitCodeEventReconcilePayload, buildGitCodeHookReconcilePayload, buildGitCodeSubscriptionTarget, buildGitCodeWebhookCancelPayload, buildGitCodeWebhookReplayPayload, buildGitCodeWebhookStatusPayload, formatGitCodeSubscribeResult, gitCodeSubscriptionStatusJson, gitCodeSubscriptionStoreSnapshotForDispatcher, handleGitCodeKnowledgeQueryCommand, loadGitCodeSubscriptionStore, parseGitCodeCommand, parseGitCodeDeliveryArgs, parseGitCodeHookReconcileArgs, parseGitCodeReconcileOnceArgs, parseGitCodeScanOnceArgs, removeGitCodeSubscription, renderGitCodeDeadLetterInspectResult, renderGitCodeDeadLetterListResult, renderGitCodeEventReconcileResult, renderGitCodeHookReconcileResult, renderGitCodeWebhookCancelResult, renderGitCodeWebhookReplayResult, renderGitCodeWebhookStatusResult, saveGitCodeSubscription, setGitCodeSubscriptionStore}
+import metis.gateway.gitcode_plugin.{GatewayCommandContext, buildGitCodeAsyncScanPayload, buildGitCodeDeadLetterInspectPayload, buildGitCodeDeadLetterListPayload, buildGitCodeEventReconcilePayload, buildGitCodeHookReconcilePayload, buildGitCodeSubscriptionTarget, buildGitCodeWebhookCancelPayload, buildGitCodeWebhookReplayPayload, buildGitCodeWebhookStatusPayload, formatGitCodeSubscribeResult, gitCodeSubscriptionStatusJson, gitCodeSubscriptionStoreSnapshotForDispatcher, handleGitCodeKnowledgeQueryCommand, loadGitCodeSubscriptionStore, parseGitCodeCommand, parseGitCodeDeliveryArgs, parseGitCodeHookReconcileArgs, parseGitCodeReconcileOnceArgs, parseGitCodeReviewRequest, parseGitCodeScanOnceArgs, removeGitCodeSubscription, renderGitCodeDeadLetterInspectResult, renderGitCodeDeadLetterListResult, renderGitCodeEventReconcileResult, renderGitCodeHookReconcileResult, renderGitCodeWebhookCancelResult, renderGitCodeWebhookReplayResult, renderGitCodeWebhookStatusResult, routeGitCodeReviewRequest, saveGitCodeSubscription, setGitCodeSubscriptionStore}
 import magic.jsonable.*
 import std.collection.{ArrayList, HashSet}
 import std.convert.Parsable
@@ -1139,6 +1139,36 @@ public class GatewayService {
     }
 
     private func servicePluginBuildGitCodeReplyPrompt(event: ServicePluginAcceptedGitCodeEvent): String {
+        if (!event.reviewRequestRaw.isEmpty()) {
+            let contractPayload = "{" +
+                "\"jobId\":${JsonString(event.jobId).toJsonString()}," +
+                "\"eventId\":${JsonString(event.eventId).toJsonString()}," +
+                "\"repo\":${JsonString(event.repo).toJsonString()}," +
+                "\"kind\":${JsonString(event.kind).toJsonString()}," +
+                "\"number\":${JsonString(event.number).toJsonString()}," +
+                "\"commentId\":${JsonString(event.commentId).toJsonString()}," +
+                "\"title\":${JsonString(event.title).toJsonString()}," +
+                "\"url\":${JsonString(event.url).toJsonString()}," +
+                "\"author\":${JsonString(event.author).toJsonString()}," +
+                "\"content\":${JsonString(event.content).toJsonString()}," +
+                "\"contractVersion\":${JsonString(event.contractVersion).toJsonString()}," +
+                "\"reviewRequest\":${event.reviewRequestRaw}" +
+            "}"
+            let parsed = parseGitCodeReviewRequest(contractPayload)
+            if (parsed.ok) {
+                let route = routeGitCodeReviewRequest(parsed.request)
+                let diagnostics = if (parsed.request.diagnostics.size == 0) { "无" } else { String.join(parsed.request.diagnostics, delimiter: ", ") }
+                return "你是 Metis 的 GitCode review task worker。请根据结构化契约生成中文回复草稿，只输出草稿正文，不要输出 JSON，不要声称已经写回 GitCode，不要包含维护者提及句、auto-reply、bot attribution、hidden marker、token、cookie、Authorization header 或本机路径。\n\n" +
+                    "契约版本: ${parsed.request.contractVersion}\n" +
+                    "路由: ${route.route}\n" +
+                    "任务: ${route.task.taskBrief}\n" +
+                    "来源: ${parsed.request.repoFullName} ${parsed.request.eventType} #${parsed.request.number} ${parsed.request.url}\n" +
+                    "标题: ${parsed.request.title}\n" +
+                    "作者: ${parsed.request.author}\n" +
+                    "诊断: ${diagnostics}\n" +
+                    "内容:\n${parsed.request.content}\n${parsed.request.commentBody}"
+            }
+        }
         let source = if (event.url.isEmpty()) { "${event.repo} ${event.kind} #${event.number}" } else { "${event.repo} ${event.kind} #${event.number} ${event.url}" }
         let title = if (event.title.isEmpty()) { "(no title)" } else { event.title }
         let content = if (event.content.isEmpty()) { "(no content)" } else { event.content }

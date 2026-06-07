@@ -1,7 +1,9 @@
 package metis.gateway.service_plugin
 
 import std.collection.{ArrayList, HashMap, HashSet}
-import stdx.encoding.json.{JsonInt, JsonObject, JsonString, JsonValue}
+import stdx.encoding.json.{JsonBool, JsonInt, JsonObject, JsonString, JsonValue}
+
+private const SERVICE_PLUGIN_GITCODE_REVIEW_CONTRACT_VERSION: String = "gcm-metis-gitcode-review-v1"
 
 public class ServicePluginEventDeliveryResult {
     public let ok: Bool
@@ -77,6 +79,8 @@ public class ServicePluginAcceptedGitCodeEvent {
     public let url: String
     public let author: String
     public let content: String
+    public let contractVersion: String
+    public let reviewRequestRaw: String
 
     public init(
         jobId!: String = "",
@@ -88,7 +92,9 @@ public class ServicePluginAcceptedGitCodeEvent {
         title!: String = "",
         url!: String = "",
         author!: String = "",
-        content!: String = ""
+        content!: String = "",
+        contractVersion!: String = "",
+        reviewRequestRaw!: String = ""
     ) {
         this.jobId = servicePluginAcceptedEventSafeField(jobId, maxBytes: 128)
         this.eventId = servicePluginAcceptedEventSafeField(eventId, maxBytes: 160)
@@ -100,6 +106,8 @@ public class ServicePluginAcceptedGitCodeEvent {
         this.url = servicePluginAcceptedEventSafeField(url, maxBytes: 260)
         this.author = servicePluginAcceptedEventSafeField(author, maxBytes: 120)
         this.content = servicePluginAcceptedEventSafeField(content, maxBytes: 1200)
+        this.contractVersion = servicePluginAcceptedEventSafeField(contractVersion, maxBytes: 128)
+        this.reviewRequestRaw = servicePluginAcceptedEventSafeField(reviewRequestRaw, maxBytes: 6000)
     }
 }
 
@@ -125,6 +133,37 @@ private class ServicePluginGeneratedReplyStats {
     public var notificationsSent: Int64 = 0
     public var notificationsFailed: Int64 = 0
     public init() {}
+}
+
+public class ServicePluginWritebackApplyState {
+    public let configured: Bool
+    public let ok: Bool
+    public let status: String
+    public let posted: Bool
+    public let skipped: Bool
+    public let timedOut: Bool
+    public let replyUrl: String
+    public let diagnostic: String
+
+    public init(
+        configured!: Bool = false,
+        ok!: Bool = true,
+        status!: String = "not_configured",
+        posted!: Bool = false,
+        skipped!: Bool = false,
+        timedOut!: Bool = false,
+        replyUrl!: String = "",
+        diagnostic!: String = ""
+    ) {
+        this.configured = configured
+        this.ok = ok
+        this.status = status.trimAscii()
+        this.posted = posted
+        this.skipped = skipped
+        this.timedOut = timedOut
+        this.replyUrl = servicePluginAcceptedEventSafeField(replyUrl, maxBytes: 320)
+        this.diagnostic = servicePluginAcceptedEventSafeField(diagnostic, maxBytes: 240)
+    }
 }
 
 private var servicePluginEventDeliveryForTest: Option<(ServicePluginDeliveryTarget, String) -> ServicePluginEventDeliveryResult> =
@@ -355,6 +394,7 @@ private func recordGitCodeAcceptedEventForFutureReply(
     if (event.eventId.isEmpty()) { diagnostics.add("missing eventId") }
     if (event.repo.isEmpty()) { diagnostics.add("missing repo") }
     if (event.url.isEmpty()) { diagnostics.add("missing url") }
+    servicePluginValidateAcceptedReviewContract(event, diagnostics)
     if (diagnostics.size > 0) {
         return servicePluginDispatchResult(frame, false, "event_payload_invalid", diagnostic: diagnostics[0], eventId: event.eventId)
     }
@@ -376,7 +416,8 @@ private func recordGitCodeAcceptedEventForFutureReply(
         case Some(handler) => handler(job, event)
         case None => ServicePluginGeneratedReplyResult(false, status: "handler_unconfigured", diagnostic: "generated reply handler is not configured", needsHumanReview: true)
     }
-    let text = renderServicePluginGeneratedReplyNotification(event, generated)
+    let writeback = servicePluginApplyGeneratedReplyWriteback(event, generated)
+    let text = renderServicePluginGeneratedReplyNotification(event, generated, writeback: writeback)
     let delivery = match (servicePluginEventDeliveryForTest) {
         case Some(sender) => sender(job.deliveryTarget, text)
         case None => ServicePluginEventDeliveryResult(false, "delivery_unconfigured", diagnostic: "service plugin event delivery is not configured")
@@ -385,7 +426,7 @@ private func recordGitCodeAcceptedEventForFutureReply(
     if (!delivery.ok) {
         return servicePluginDispatchResult(frame, false, "generated_reply_delivery_failed", diagnostic: redactServicePayload(delivery.diagnostic).text, eventId: event.eventId, targetCount: 1, deliveryFailed: 1)
     }
-    if (!generated.ok) {
+    if (!generated.ok || servicePluginWritebackDegraded(writeback)) {
         return servicePluginDispatchResult(frame, true, "generated_reply_degraded_delivered", diagnostic: generated.diagnostic, eventId: event.eventId, targetCount: 1, deliverySuccess: 1)
     }
     servicePluginDispatchResult(frame, true, "generated_reply_delivered", eventId: event.eventId, targetCount: 1, deliverySuccess: 1)
@@ -423,7 +464,8 @@ public func dispatchGitCodeWebhookAcceptedEvent(frame: ServiceFrame, event: Serv
         case Some(handler) => handler(event, primary)
         case None => ServicePluginGeneratedReplyResult(false, status: "handler_unconfigured", diagnostic: "generated reply handler is not configured", needsHumanReview: true)
     }
-    let text = renderServicePluginGeneratedReplyNotification(event, generated)
+    let writeback = servicePluginApplyGeneratedReplyWriteback(event, generated)
+    let text = renderServicePluginGeneratedReplyNotification(event, generated, writeback: writeback)
     for (target in targets) {
         let delivery = match (servicePluginEventDeliveryForTest) {
             case Some(sender) => sender(target, text)
@@ -442,7 +484,8 @@ public func dispatchGitCodeWebhookAcceptedEvent(frame: ServiceFrame, event: Serv
             failures.add("${target.channel}:${target.accountId}:send_failed")
         }
     }
-    let status = if (failed == 0 && generated.ok) {
+    let writebackDegraded = servicePluginWritebackDegraded(writeback)
+    let status = if (failed == 0 && generated.ok && !writebackDegraded) {
         "generated_reply_delivered"
     } else if (failed == 0) {
         "generated_reply_degraded_delivered"
@@ -487,7 +530,11 @@ public func servicePluginDispatchDiagnosticSummary(frame: ServiceFrame, result: 
     base[0..512]
 }
 
-public func renderServicePluginGeneratedReplyNotification(event: ServicePluginAcceptedGitCodeEvent, result: ServicePluginGeneratedReplyResult): String {
+public func renderServicePluginGeneratedReplyNotification(
+    event: ServicePluginAcceptedGitCodeEvent,
+    result: ServicePluginGeneratedReplyResult,
+    writeback!: ServicePluginWritebackApplyState = ServicePluginWritebackApplyState()
+): String {
     var text = "GitCode 回复草稿\n"
     text += "来源: ${servicePluginAcceptedEventSource(event)}\n"
     let title = if (!event.title.isEmpty()) { event.title } else { servicePluginAcceptedEventFirstLine(event.content) }
@@ -495,9 +542,10 @@ public func renderServicePluginGeneratedReplyNotification(event: ServicePluginAc
         text += "标题: ${title}\n"
     }
     if (result.ok) {
-        text += "状态: dryRun=true，未写回 GitCode\n\n草稿:\n${result.draft}"
+        text += servicePluginWritebackNotificationLine(writeback)
+        text += "\n\n草稿:\n${result.draft}"
     } else {
-        let reason = if (result.diagnostic.isEmpty()) { result.status } else { result.diagnostic }
+        let reason = servicePluginGeneratedReplyHumanReason(result)
         text += "状态: needsHumanReview，未写回 GitCode\n原因: ${reason}\n\n草稿:\n"
     }
     redactServicePayload(text).text
@@ -621,7 +669,9 @@ private func parseServicePluginAcceptedGitCodeEvent(root: JsonObject, diagnostic
         title: servicePluginAcceptedEventAnyString(root, "title"),
         url: servicePluginAcceptedEventAnyString(root, "url"),
         author: servicePluginAcceptedEventAnyString(root, "author"),
-        content: servicePluginAcceptedEventAnyString(root, "content")
+        content: servicePluginAcceptedEventAnyString(root, "content"),
+        contractVersion: servicePluginAcceptedEventAnyString(root, "contractVersion"),
+        reviewRequestRaw: servicePluginAcceptedEventObjectString(root, "reviewRequest")
     )
 }
 
@@ -645,6 +695,131 @@ private func servicePluginAcceptedEventAnyString(root: JsonObject, key: String):
             }
         case None => ""
     }
+}
+
+private func servicePluginAcceptedEventObjectString(root: JsonObject, key: String): String {
+    match (root.get(key)) {
+        case Some(v) => try { v.asObject().toJsonString().trimAscii() } catch (_: Exception) { "" }
+        case None => ""
+    }
+}
+
+private func servicePluginValidateAcceptedReviewContract(event: ServicePluginAcceptedGitCodeEvent, diagnostics: ArrayList<String>): Unit {
+    if (event.reviewRequestRaw.isEmpty()) {
+        return
+    }
+    if (event.contractVersion.isEmpty()) {
+        diagnostics.add("contract_version_missing")
+    } else if (event.contractVersion != SERVICE_PLUGIN_GITCODE_REVIEW_CONTRACT_VERSION) {
+        diagnostics.add("contract_version_unsupported")
+    }
+    let raw = event.reviewRequestRaw.toAsciiLower()
+    if (raw.contains("/users/") || raw.contains("/var/folders/") || raw.contains("file://") || raw.contains("c:\\")) {
+        diagnostics.add("payload_contains_local_path")
+    }
+    if (raw.contains("authorization:") || raw.contains("bearer ") || raw.contains("cookie:") || raw.contains("token=") || raw.contains("\"token\"")) {
+        diagnostics.add("payload_contains_secret")
+    }
+}
+
+private func servicePluginApplyGeneratedReplyWriteback(event: ServicePluginAcceptedGitCodeEvent, result: ServicePluginGeneratedReplyResult): ServicePluginWritebackApplyState {
+    if (!result.ok || result.needsHumanReview || result.draft.trimAscii().isEmpty()) {
+        return ServicePluginWritebackApplyState()
+    }
+    let payload = servicePluginGeneratedReplyWritebackPayload(event, result)
+    let applied = invokeGitCodeWritebackApplyResult("gitcode-monitor", payload, 5000)
+    if (!applied.ok && (applied.status == "capability_missing" || applied.status == "service_missing")) {
+        return ServicePluginWritebackApplyState()
+    }
+    servicePluginParseWritebackApplyResult(applied)
+}
+
+private func servicePluginGeneratedReplyWritebackPayload(event: ServicePluginAcceptedGitCodeEvent, result: ServicePluginGeneratedReplyResult): String {
+    let root = JsonObject()
+    root.put("contractVersion", JsonString(SERVICE_PLUGIN_GITCODE_REVIEW_CONTRACT_VERSION))
+    root.put("eventId", JsonString(event.eventId))
+    root.put("repo", JsonString(event.repo))
+    root.put("kind", JsonString(event.kind))
+    root.put("number", JsonString(event.number))
+    root.put("commentId", JsonString(event.commentId))
+    root.put("url", JsonString(event.url))
+    root.put("draft", JsonString(result.draft))
+    root.put("summary", JsonString(""))
+    root.put("safety", JsonString(if (result.needsHumanReview) { "needs_human_review" } else { "approved" }))
+    root.put("needsHumanReview", JsonBool(result.needsHumanReview))
+    root.toJsonString()
+}
+
+private func servicePluginParseWritebackApplyResult(result: CapabilityInvokeResult): ServicePluginWritebackApplyState {
+    if (!result.ok) {
+        if (result.status == "invoke_timeout" || result.status == "timeout") {
+            return ServicePluginWritebackApplyState(configured: true, ok: false, status: "writeback_timeout", timedOut: true, diagnostic: result.diagnostic)
+        }
+        return ServicePluginWritebackApplyState(configured: true, ok: false, status: result.status, diagnostic: result.diagnostic)
+    }
+    let root = try {
+        JsonValue.fromStr(result.payload).asObject()
+    } catch (_: Exception) {
+        return ServicePluginWritebackApplyState(configured: true, ok: false, status: "writeback_response_decode_failed", diagnostic: "writeback_response_decode_failed")
+    }
+    let status = servicePluginAcceptedEventAnyString(root, "status")
+    let posted = servicePluginJsonBool(root, "posted")
+    let skipped = servicePluginJsonBool(root, "skipped") || status == "skipped" || status == "dry_run" || status == "auto_reply_disabled"
+    let replyUrl = servicePluginAcceptedEventAnyString(root, "replyUrl")
+    let ok = posted || skipped || status == "posted" || status == "ok"
+    ServicePluginWritebackApplyState(
+        configured: true,
+        ok: ok,
+        status: if (status.isEmpty()) { if (posted) { "posted" } else { "ok" } } else { status },
+        posted: posted || status == "posted",
+        skipped: skipped,
+        replyUrl: replyUrl,
+        diagnostic: servicePluginAcceptedEventAnyString(root, "reason")
+    )
+}
+
+private func servicePluginJsonBool(root: JsonObject, key: String): Bool {
+    match (root.get(key)) {
+        case Some(v) => try { v.asBool().getValue() } catch (_: Exception) { false }
+        case None => false
+    }
+}
+
+private func servicePluginWritebackDegraded(writeback: ServicePluginWritebackApplyState): Bool {
+    writeback.configured && !writeback.ok
+}
+
+private func servicePluginWritebackNotificationLine(writeback: ServicePluginWritebackApplyState): String {
+    if (!writeback.configured) {
+        return "状态: dryRun=true，未写回 GitCode"
+    }
+    if (writeback.posted) {
+        let suffix = if (writeback.replyUrl.isEmpty()) { "" } else { "\n写回链接: ${writeback.replyUrl}" }
+        return "状态: GitCode 回复已写回${suffix}"
+    }
+    if (writeback.timedOut) {
+        return "状态: 写回状态未知/超时，草稿已通知"
+    }
+    if (!writeback.ok) {
+        return "状态: 写回结果异常（${writeback.status}），草稿已通知"
+    }
+    if (writeback.skipped) {
+        let reason = if (writeback.diagnostic.isEmpty()) { writeback.status } else { writeback.diagnostic }
+        return "状态: 写回未执行（${reason}），草稿已通知"
+    }
+    "状态: 写回未执行（${writeback.status}），草稿已通知"
+}
+
+private func servicePluginGeneratedReplyHumanReason(result: ServicePluginGeneratedReplyResult): String {
+    let status = result.status.trimAscii()
+    let diagnostic = result.diagnostic.trimAscii()
+    if (status == "ckb_unavailable" || diagnostic.contains("ckb_unavailable")) {
+        return "知识库不可用，已保守生成/需要人工确认"
+    }
+    if (status == "pr_review_timeout" || status == "review_adapter_timeout" || diagnostic.contains("review_adapter_timeout") || diagnostic.contains("adapter timeout")) {
+        return "PR review 阶段超时，已保守生成草稿，需要人工确认"
+    }
+    if (diagnostic.isEmpty()) { status } else { diagnostic }
 }
 
 private func servicePluginAcceptedEventSafeField(raw: String, maxBytes!: Int64 = 160): String {
