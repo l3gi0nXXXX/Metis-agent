@@ -977,6 +977,20 @@ public func invokeRegisteredCapability(request: CapabilityInvokeRequest): Capabi
     }
 }
 
+public func invokeGitCodeWritebackApplyResult(pluginId: String, payload: String, timeoutMs: Int64): CapabilityInvokeResult {
+    let expectedPluginId = pluginId.trimAscii()
+    let capabilityId = "gitcode.writeback.apply_result"
+    let caller = CapabilityCaller(callerId: "gateway-gitcode-writeback", isOperator: true)
+    let resolution = resolveCapabilityRoute(capabilityId, caller)
+    if (!resolution.ok) {
+        return CapabilityInvokeResult(false, resolution.status, serviceId: resolution.serviceId, capabilityId: capabilityId, diagnostic: resolution.reason)
+    }
+    if (!expectedPluginId.isEmpty() && resolution.serviceId != expectedPluginId) {
+        return CapabilityInvokeResult(false, "service_mismatch", serviceId: resolution.serviceId, capabilityId: capabilityId, diagnostic: "writeback capability is owned by another service plugin")
+    }
+    invokeRegisteredCapability(CapabilityInvokeRequest(capabilityId, payload: payload, caller: caller, timeoutMillis: timeoutMs))
+}
+
 private func servicePluginInvokeViaStdioProcess(record: ServicePluginRuntimeRecord, request: CapabilityInvokeRequest): CapabilityInvokeResult {
     let serviceId = record.registration.manifest.pluginId
     let ensured = ensureServicePluginStdioProcess(record)
