@@ -138,7 +138,9 @@ public class GitCodeReviewContextPromptTest {
     }
 
     private func writeTemplate(dir: Path, file: String, templateId: String, body: String): Unit {
-        Directory.create(dir, recursive: true)
+        if (!exists(dir)) {
+            Directory.create(dir, recursive: true)
+        }
         File.writeTo(
             dir.join(file),
             ("---\n" +
@@ -226,7 +228,10 @@ public class GitCodeReviewContextPromptTest {
             let srcDir = Path(workspace.workspacePath).join("src")
             Directory.create(srcDir, recursive: true)
             File.writeTo(srcDir.join("example.cj"), gitCodeReviewRepeat("a", 4096).toArray())
-            let pack = buildSourceContextPack(["src/example.cj", "/tmp/secret.cj", "../secret.cj"], workspace.workspacePath, cfg)
+            let smallFileBudget = GitCodeReviewRuntimeConfig(
+                sourceWorkspace: GitCodeSourceWorkspaceConfig(root: root.toString(), allowedHosts: ["gitcode.com"], maxFileBytes: 1024)
+            )
+            let pack = buildSourceContextPack(["src/example.cj", "/tmp/secret.cj", "../secret.cj"], workspace.workspacePath, smallFileBudget)
             @Expect(pack.status == "resolved" || pack.status == "stale_available", true)
             @Expect(pack.files.size, 1)
             @Expect(pack.files[0].path, "src/example.cj")

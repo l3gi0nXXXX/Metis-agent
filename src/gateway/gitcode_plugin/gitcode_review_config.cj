@@ -235,7 +235,7 @@ public func gitCodeReviewRedactSensitiveText(raw: String): String {
                 let start = idx + auth.size
                 var end = start
                 while (end < out.size && out[end] != b' ' && out[end] != b'\n' && out[end] != b'\t') { end += 1 }
-                out = out[..start] + "[redacted]" + out[end..]
+                out = out[..idx] + "Authorization: [redacted]" + out[end..]
             case None => authDone = true
         }
     }

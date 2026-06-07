@@ -185,12 +185,16 @@ public func ensureRepoWorkspace(repo: String, ref: String, config: GitCodeReview
     let repoKey = sourceRepoKey(repo)
     let repoDir = Path(root).join(sourceHash("${host}/${repoKey}"))
     if (!exists(repoDir)) {
-        Directory.create(repoDir.parent, recursive: true)
+        if (!exists(repoDir.parent)) {
+            Directory.create(repoDir.parent, recursive: true)
+        }
         let cloned = runGit("clone", repo, safeRef, repoDir.toString())
         if (!cloned.ok) {
             return GitCodeSourceWorkspaceResult("clone_failed", sourceContextStatus: "clone_failed", cloneStatus: "clone_failed", refStatus: refStatus, workspacePath: repoDir.toString(), repoKey: repoKey, ref: safeRef)
         }
-        Directory.create(repoDir, recursive: true)
+        if (!exists(repoDir)) {
+            Directory.create(repoDir, recursive: true)
+        }
         return GitCodeSourceWorkspaceResult("ready", sourceContextStatus: "resolved", cloneStatus: "cloned", refStatus: refStatus, workspacePath: repoDir.toString(), repoKey: repoKey, ref: safeRef)
     }
     updateRepoWorkspace(repo, safeRef, config, workspacePath: repoDir.toString(), repoKey: repoKey, refStatus: refStatus)
