@@ -1563,33 +1563,8 @@ public class GatewayServiceTelegramNativeTest {
     public func t51InteractiveCallbackImperativeCtxRespondAndBindingHelpersWorkThroughGateway(): Unit {
         withGatewayTelegramNativeTestHome {
             let root = Path("/tmp/metis-t51-openclaw-plugin-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
-            let pluginRoot = root.join("demo-plugin")
-            Directory.create(pluginRoot, recursive: true)
             setGatewayTelegramThreadBindingRootForTest(Some(root.join("bindings")))
-            File.writeTo(
-                pluginRoot.join("package.json"),
-                "{\"name\":\"demo-openclaw-plugin\",\"type\":\"module\",\"main\":\"index.mjs\"}".toArray()
-            )
-            File.writeTo(
-                pluginRoot.join("index.mjs"),
-                (
-                    "export default function(api) {\n" +
-                    "  api.interactive.register({ namespace: 'demo', channel: 'telegram' }, async (ctx) => {\n" +
-                    "    if (ctx.callback.payload === 'detach') {\n" +
-                    "      await ctx.detachConversationBinding();\n" +
-                    "      return;\n" +
-                    "    }\n" +
-                    "    const current = await ctx.getCurrentConversationBinding();\n" +
-                    "    await ctx.respond.reply({ text: 'reply:' + current.sessionKey, buttons: [[{ text: 'OK', callback_data: 'plugin:demo:ok' }]] });\n" +
-                    "    await ctx.respond.editMessage({ text: 'edited' });\n" +
-                    "    await ctx.respond.editButtons({ buttons: [[{ text: 'Next', callback_data: 'plugin:demo:next' }]] });\n" +
-                    "    await ctx.respond.clearButtons();\n" +
-                    "    await ctx.respond.deleteMessage();\n" +
-                    "    await ctx.requestConversationBinding({ sessionKey: 'agent:main:explicit:demo' });\n" +
-                    "  });\n" +
-                    "}\n"
-                ).toArray()
-            )
+            Directory.create(root, recursive: true)
 
             try {
                 var user = GatewayUserSettings()
@@ -1597,16 +1572,85 @@ public class GatewayServiceTelegramNativeTest {
                 user.telegram.allowFrom = ["*"]
                 user.telegram.actions.callbackQuery = true
                 user.telegram.threadBindings.enabled = true
-                let plugins = JsonArray([])
-                plugins.add(JsonString(pluginRoot.toString()))
-                let compat = JsonObject()
-                compat.put("enabled", true.toJsonValue())
-                compat.put("scriptPath", JsonString(CliConfig.cwd.join("scripts").join("openclaw-plugin-sidecar.mjs").toString()))
-                compat.put("plugins", plugins)
-                let extra = JsonObject()
-                extra.put("openclawPluginCompatibility", compat)
-                user.channelsExtra = Some(extra)
                 CliSettingManager.writeGatewaySettings(user)
+                setGatewayOpenClawPluginSidecarRunnerForTest(Some({ method: String, payload: JsonObject =>
+                    let out = JsonObject()
+                    out.put("ok", true.toJsonValue())
+                    if (method == "interactive.dispatch") {
+                        out.put("matched", true.toJsonValue())
+                        let data = try { payload.get("data").getOrThrow().asString().getValue() } catch (_e: Exception) { "" }
+                        let bindings = JsonArray([])
+                        let binding = JsonObject()
+                        binding.put("type", JsonString("binding"))
+                        binding.put("channel", JsonString("telegram"))
+                        binding.put("accountId", JsonString("default"))
+                        binding.put("conversationId", JsonString("8734062810"))
+                        if (data == "plugin:demo:detach") {
+                            binding.put("op", JsonString("detach"))
+                            bindings.add(binding)
+                            out.put("bindingIntents", bindings)
+                            out.put("intents", JsonArray([]))
+                            return out
+                        }
+
+                        let intents = JsonArray([])
+                        let reply = JsonObject()
+                        reply.put("type", JsonString("reply"))
+                        reply.put("text", JsonString("reply:telegram:direct:8734062810"))
+                        let replyRows = JsonArray([])
+                        let replyRow = JsonArray([])
+                        let replyButton = JsonObject()
+                        replyButton.put("text", JsonString("OK"))
+                        replyButton.put("callback_data", JsonString("plugin:demo:ok"))
+                        replyRow.add(replyButton)
+                        replyRows.add(replyRow)
+                        reply.put("buttons", replyRows)
+                        intents.add(reply)
+
+                        let edit = JsonObject()
+                        edit.put("type", JsonString("edit"))
+                        edit.put("text", JsonString("edited"))
+                        edit.put("targetMessageId", JsonString("77"))
+                        intents.add(edit)
+
+                        let editButtons = JsonObject()
+                        editButtons.put("type", JsonString("edit-buttons"))
+                        editButtons.put("targetMessageId", JsonString("77"))
+                        let editRows = JsonArray([])
+                        let editRow = JsonArray([])
+                        let editButton = JsonObject()
+                        editButton.put("text", JsonString("Next"))
+                        editButton.put("callback_data", JsonString("plugin:demo:next"))
+                        editRow.add(editButton)
+                        editRows.add(editRow)
+                        editButtons.put("buttons", editRows)
+                        intents.add(editButtons)
+
+                        let clear = JsonObject()
+                        clear.put("type", JsonString("clear-buttons"))
+                        clear.put("targetMessageId", JsonString("77"))
+                        intents.add(clear)
+
+                        let delete = JsonObject()
+                        delete.put("type", JsonString("delete"))
+                        delete.put("targetMessageId", JsonString("77"))
+                        intents.add(delete)
+                        out.put("intents", intents)
+
+                        binding.put("op", JsonString("bind"))
+                        binding.put("sessionKey", JsonString("agent:main:explicit:demo"))
+                        bindings.add(binding)
+                        out.put("bindingIntents", bindings)
+                    } else if (method == "hook.message_sending") {
+                        out.put("cancelled", false.toJsonValue())
+                        out.put("text", payload.get("text").getOrThrow())
+                    } else if (method == "hook.message_sent") {
+                        out.put("status", JsonString("ok"))
+                    } else {
+                        out.put("matched", false.toJsonValue())
+                    }
+                    out
+                }))
 
                 let adapter = GatewayTelegramNativeTestAdapter()
                 let service = gatewayTelegramNativeService(adapter)
@@ -1715,94 +1759,127 @@ public class GatewayServiceTelegramNativeTest {
     }
 
     @TestCase
-    public func t44OpenClawPluginSidecarLoadsLocalPluginAndDispatchesRuntimeFacets(): Unit {
+    public func t44PluginSidecarRunnerDispatchesRuntimeFacets(): Unit {
         withGatewayTelegramNativeTestHome {
-            let root = Path("/tmp/metis-openclaw-plugin-sidecar-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
-            let pluginRoot = root.join("demo-plugin")
-            Directory.create(pluginRoot, recursive: true)
-            File.writeTo(
-                pluginRoot.join("package.json"),
-                "{\"name\":\"demo-openclaw-plugin\",\"type\":\"module\",\"main\":\"index.mjs\"}".toArray()
-            )
-            File.writeTo(
-                pluginRoot.join("index.mjs"),
-                (
-                    "export default function(api) {\n" +
-                    "  api.registerCommand({ name: 'demo', description: 'Demo command', handler: async (ctx) => ({ text: 'command ok ' + ctx.args + ' ' + ctx.isAuthorizedSender }) });\n" +
-                    "  api.interactive.register({ namespace: 'demo', channel: 'telegram' }, async () => ({ intents: [{ type: 'reply', text: 'interactive ok', buttons: [[{ text: 'OK', callback_data: 'plugin:demo:ok' }]] }] }));\n" +
-                    "  api.approvals.register({ namespace: 'demo', channel: 'telegram' }, async (ctx) => ({ type: 'reply', text: 'approval ' + ctx.decision }));\n" +
-                    "  api.registerHook('message_sending', async (event, ctx) => ({ content: '[hooked] ' + event.content + ' ' + ctx.accountId }));\n" +
-                    "  api.registerHook('message_received', async (event, ctx) => { globalThis.__metis_received = event.metadata.messageId + ':' + ctx.accountId; });\n" +
-                    "  api.registerTool({ name: 'unsupported_tool' });\n" +
-                    "}\n"
-                ).toArray()
-            )
-
-            try {
-                var user = GatewayUserSettings()
-                let plugins = JsonArray([])
-                plugins.add(JsonString(pluginRoot.toString()))
-                let compat = JsonObject()
-                compat.put("enabled", true.toJsonValue())
-                compat.put("scriptPath", JsonString(CliConfig.cwd.join("scripts").join("openclaw-plugin-sidecar.mjs").toString()))
-                compat.put("plugins", plugins)
-                let extra = JsonObject()
-                extra.put("openclawPluginCompatibility", compat)
-                user.channelsExtra = Some(extra)
-
-                let health = gatewayOpenClawPluginSidecarInvoke(user, "lifecycle.health", JsonObject())
-                @Expect(health.get("ok").getOrThrow().asBool().getValue(), true)
-                @Expect(health.get("pluginCount").getOrThrow().asInt().getValue(), 1)
-
-                let commands = gatewayOpenClawPluginSidecarInvoke(user, "commands.list", JsonObject())
-                let commandRows = commands.get("commands").getOrThrow().asArray()
-                @Expect(commandRows.size(), 1)
-                @Expect(commandRows[0].asObject().get("command").getOrThrow().asString().getValue(), "demo")
-                @Expect(commands.get("diagnostics").getOrThrow().asArray()[0].asObject().get("unsupportedCapability").getOrThrow().asObject().get("capability").getOrThrow().asString().getValue(), "api.registerTool")
-
-                let commandPayload = JsonObject()
-                commandPayload.put("command", JsonString("demo"))
-                commandPayload.put("args", JsonString("now"))
-                commandPayload.put("commandBody", JsonString("/demo now"))
-                commandPayload.put("channel", JsonString("telegram"))
-                commandPayload.put("accountId", JsonString("default"))
-                commandPayload.put("isAuthorizedSender", true.toJsonValue())
-                let command = gatewayOpenClawPluginSidecarInvoke(user, "command.dispatch", commandPayload)
-                @Expect(command.get("matched").getOrThrow().asBool().getValue(), true)
-                @Expect(command.get("intents").getOrThrow().asArray()[0].asObject().get("text").getOrThrow().asString().getValue(), "command ok now true")
-
-                let callbackPayload = JsonObject()
-                callbackPayload.put("data", JsonString("plugin:demo:ok"))
-                let callback = gatewayOpenClawPluginSidecarInvoke(user, "interactive.dispatch", callbackPayload)
-                if (!callback.get("matched").getOrThrow().asBool().getValue()) {
-                    throw Exception("interactive.dispatch sidecar response: ${callback.toJsonString()}")
+            var user = GatewayUserSettings()
+            setGatewayOpenClawPluginSidecarRunnerForTest(Some({ method: String, payload: JsonObject =>
+                let out = JsonObject()
+                out.put("ok", true.toJsonValue())
+                if (method == "lifecycle.health") {
+                    out.put("pluginCount", 1.toJsonValue())
+                } else if (method == "commands.list") {
+                    let commands = JsonArray([])
+                    let row = JsonObject()
+                    row.put("command", JsonString("demo"))
+                    row.put("description", JsonString("Demo command"))
+                    commands.add(row)
+                    out.put("commands", commands)
+                    let diagnostics = JsonArray([])
+                    let diagnostic = JsonObject()
+                    let unsupported = JsonObject()
+                    unsupported.put("capability", JsonString("api.registerTool"))
+                    diagnostic.put("unsupportedCapability", unsupported)
+                    diagnostics.add(diagnostic)
+                    out.put("diagnostics", diagnostics)
+                } else if (method == "command.dispatch") {
+                    @Expect(payload.get("command").getOrThrow().asString().getValue(), "demo")
+                    @Expect(payload.get("args").getOrThrow().asString().getValue(), "now")
+                    @Expect(payload.get("isAuthorizedSender").getOrThrow().asBool().getValue(), true)
+                    out.put("matched", true.toJsonValue())
+                    let intents = JsonArray([])
+                    let reply = JsonObject()
+                    reply.put("type", JsonString("reply"))
+                    reply.put("text", JsonString("command ok now true"))
+                    intents.add(reply)
+                    out.put("intents", intents)
+                } else if (method == "interactive.dispatch") {
+                    @Expect(payload.get("data").getOrThrow().asString().getValue(), "plugin:demo:ok")
+                    out.put("matched", true.toJsonValue())
+                    let intents = JsonArray([])
+                    let reply = JsonObject()
+                    reply.put("type", JsonString("reply"))
+                    reply.put("text", JsonString("interactive ok"))
+                    let rows = JsonArray([])
+                    let row = JsonArray([])
+                    let button = JsonObject()
+                    button.put("text", JsonString("OK"))
+                    button.put("callback_data", JsonString("plugin:demo:ok"))
+                    row.add(button)
+                    rows.add(row)
+                    reply.put("buttons", rows)
+                    intents.add(reply)
+                    out.put("intents", intents)
+                } else if (method == "approval.dispatch") {
+                    @Expect(payload.get("data").getOrThrow().asString().getValue(), "plugin-approval:demo:allow")
+                    out.put("matched", true.toJsonValue())
+                    let intents = JsonArray([])
+                    let reply = JsonObject()
+                    reply.put("type", JsonString("reply"))
+                    reply.put("text", JsonString("approval allow"))
+                    intents.add(reply)
+                    out.put("intents", intents)
+                } else if (method == "hook.message_sending") {
+                    let content = payload.get("content").getOrThrow().asString().getValue()
+                    let accountId = payload.get("accountId").getOrThrow().asString().getValue()
+                    out.put("text", JsonString("[hooked] ${content} ${accountId}"))
+                } else if (method == "hook.message_received") {
+                    out.put("status", JsonString("ok"))
+                } else {
+                    out.put("matched", false.toJsonValue())
                 }
-                let callbackIntent = callback.get("intents").getOrThrow().asArray()[0].asObject()
-                @Expect(callbackIntent.get("text").getOrThrow().asString().getValue(), "interactive ok")
-                @Expect(callbackIntent.get("buttons").getOrThrow().asArray().size(), 1)
+                out
+            }))
 
-                let approvalPayload = JsonObject()
-                approvalPayload.put("data", JsonString("plugin-approval:demo:allow"))
-                let approval = gatewayOpenClawPluginSidecarInvoke(user, "approval.dispatch", approvalPayload)
-                @Expect(approval.get("matched").getOrThrow().asBool().getValue(), true)
-                @Expect(approval.get("intents").getOrThrow().asArray()[0].asObject().get("text").getOrThrow().asString().getValue(), "approval allow")
+            let health = gatewayOpenClawPluginSidecarInvoke(user, "lifecycle.health", JsonObject())
+            @Expect(health.get("ok").getOrThrow().asBool().getValue(), true)
+            @Expect(health.get("pluginCount").getOrThrow().asInt().getValue(), 1)
 
-                let hookPayload = JsonObject()
-                hookPayload.put("channel", JsonString("telegram"))
-                hookPayload.put("accountId", JsonString("default"))
-                hookPayload.put("text", JsonString("hello"))
-                hookPayload.put("content", JsonString("hello"))
-                let hook = gatewayOpenClawPluginSidecarInvoke(user, "hook.message_sending", hookPayload)
-                @Expect(hook.get("text").getOrThrow().asString().getValue(), "[hooked] hello default")
+            let commands = gatewayOpenClawPluginSidecarInvoke(user, "commands.list", JsonObject())
+            let commandRows = commands.get("commands").getOrThrow().asArray()
+            @Expect(commandRows.size(), 1)
+            @Expect(commandRows[0].asObject().get("command").getOrThrow().asString().getValue(), "demo")
+            @Expect(commands.get("diagnostics").getOrThrow().asArray()[0].asObject().get("unsupportedCapability").getOrThrow().asObject().get("capability").getOrThrow().asString().getValue(), "api.registerTool")
 
-                let receivedPayload = JsonObject()
-                receivedPayload.put("channel", JsonString("telegram"))
-                receivedPayload.put("messageId", JsonString("msg-1"))
-                let received = gatewayOpenClawPluginSidecarInvoke(user, "hook.message_received", receivedPayload)
-                @Expect(received.get("status").getOrThrow().asString().getValue(), "ok")
-            } finally {
-                try { remove(root, recursive: true) } catch (_e: Exception) { () }
+            let commandPayload = JsonObject()
+            commandPayload.put("command", JsonString("demo"))
+            commandPayload.put("args", JsonString("now"))
+            commandPayload.put("commandBody", JsonString("/demo now"))
+            commandPayload.put("channel", JsonString("telegram"))
+            commandPayload.put("accountId", JsonString("default"))
+            commandPayload.put("isAuthorizedSender", true.toJsonValue())
+            let command = gatewayOpenClawPluginSidecarInvoke(user, "command.dispatch", commandPayload)
+            @Expect(command.get("matched").getOrThrow().asBool().getValue(), true)
+            @Expect(command.get("intents").getOrThrow().asArray()[0].asObject().get("text").getOrThrow().asString().getValue(), "command ok now true")
+
+            let callbackPayload = JsonObject()
+            callbackPayload.put("data", JsonString("plugin:demo:ok"))
+            let callback = gatewayOpenClawPluginSidecarInvoke(user, "interactive.dispatch", callbackPayload)
+            if (!callback.get("matched").getOrThrow().asBool().getValue()) {
+                throw Exception("interactive.dispatch sidecar response: ${callback.toJsonString()}")
             }
+            let callbackIntent = callback.get("intents").getOrThrow().asArray()[0].asObject()
+            @Expect(callbackIntent.get("text").getOrThrow().asString().getValue(), "interactive ok")
+            @Expect(callbackIntent.get("buttons").getOrThrow().asArray().size(), 1)
+
+            let approvalPayload = JsonObject()
+            approvalPayload.put("data", JsonString("plugin-approval:demo:allow"))
+            let approval = gatewayOpenClawPluginSidecarInvoke(user, "approval.dispatch", approvalPayload)
+            @Expect(approval.get("matched").getOrThrow().asBool().getValue(), true)
+            @Expect(approval.get("intents").getOrThrow().asArray()[0].asObject().get("text").getOrThrow().asString().getValue(), "approval allow")
+
+            let hookPayload = JsonObject()
+            hookPayload.put("channel", JsonString("telegram"))
+            hookPayload.put("accountId", JsonString("default"))
+            hookPayload.put("text", JsonString("hello"))
+            hookPayload.put("content", JsonString("hello"))
+            let hook = gatewayOpenClawPluginSidecarInvoke(user, "hook.message_sending", hookPayload)
+            @Expect(hook.get("text").getOrThrow().asString().getValue(), "[hooked] hello default")
+
+            let receivedPayload = JsonObject()
+            receivedPayload.put("channel", JsonString("telegram"))
+            receivedPayload.put("messageId", JsonString("msg-1"))
+            let received = gatewayOpenClawPluginSidecarInvoke(user, "hook.message_received", receivedPayload)
+            @Expect(received.get("status").getOrThrow().asString().getValue(), "ok")
         }
     }
 

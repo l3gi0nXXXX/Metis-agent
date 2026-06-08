@@ -137,6 +137,29 @@ test("interactive respond contract and unsupported capabilities are structured",
   }
 });
 
+test("interactive handlers may return intents directly", () => {
+  const { root, pluginRoot } = writePlugin(`
+    export default function(api) {
+      api.interactive.register({ namespace: "demo", channel: "telegram" }, async () => ({
+        intents: [{
+          type: "reply",
+          text: "interactive ok",
+          buttons: [[{ text: "OK", callback_data: "plugin:demo:ok" }]],
+        }],
+      }));
+    }
+  `);
+  try {
+    const result = invoke("interactive.dispatch", { data: "plugin:demo:ok" }, pluginRoot);
+    assert.equal(result.matched, true);
+    assert.equal(result.intents[0].type, "reply");
+    assert.equal(result.intents[0].text, "interactive ok");
+    assert.equal(result.intents[0].buttons[0][0].callback_data, "plugin:demo:ok");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("plugin console output is routed to stderr and redacted away from protocol stdout", () => {
   const { root, pluginRoot } = writePlugin(`
     export default function(api) {
