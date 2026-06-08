@@ -202,7 +202,15 @@ Telegram 内置 channel 的配置、DM/群聊策略、图片/文件/语音收发
 
 （文档内后续会补充其他 IM 平台章节。）
 
-### 4.7 Dashboard 网页使用（新增）
+### 4.7 GitCode Review 配置（新增）
+
+Metis 与 GitCodeMonitor 联动处理 GitCode issue、PR、评论事件时，源码工作区、外部 PR review adapter 和 prompt 模板目录的配置见独立文档：
+
+- **[GitCode Review 配置说明](./gitcode-review.md)**
+
+其中 `gateway.gitcodeReview.sourceWorkspace` 是长期源码缓存目录配置，默认根目录为 `~/.metis/gitcode/repo-source-code`。
+
+### 4.8 Dashboard 网页使用（新增）
 
 Dashboard 用于在浏览器里查看和操作会话（Chat / Sessions / Skills / Gateway / Logs / Appearance）。
 
