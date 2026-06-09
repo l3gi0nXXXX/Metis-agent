@@ -1,6 +1,8 @@
 package metis.gateway.service_plugin
 
 import std.collection.ArrayList
+import std.convert.Parsable
+import std.fs.{File, Path, exists}
 import std.sync.Mutex
 import std.time.*
 import std.unittest.testmacro.*
@@ -178,6 +180,18 @@ public class ServicePluginHostTest {
         }
     }
 
+    private func waitForFile(path: Path, timeoutMillis!: Int64 = 1000): Bool {
+        var waited: Int64 = 0
+        while (waited < timeoutMillis) {
+            if (exists(path)) {
+                return true
+            }
+            sleep(Duration.millisecond * 25)
+            waited += 25
+        }
+        exists(path)
+    }
+
     private func registerStdio(responsePayload: String, initPayload!: String = "{ \"ok\": true, \"status\": \"ready\" }"): Unit {
         resetServicePluginHostForTest()
         let result = registerServicePlugin(ServicePluginRegistration(this.stdioManifest(responsePayload, initPayload: initPayload)))
@@ -285,6 +299,29 @@ public class ServicePluginHostTest {
         @Expect(restarted.ok, true)
         @Expect(restarted.previousInstanceId, first)
         @Expect(restarted.instanceId == first, false)
+    }
+
+    @TestCase
+    public func stdioProcessReceivesLeaseEnvironmentAndTracksPid(): Unit {
+        let capturePath = Path("/private/tmp/metis-service-plugin-env-${DateTime.now().toUnixTimeStamp().toNanoseconds()}.txt")
+        let initLine = "{\"type\":\"response\",\"frameId\":\"init-1\",\"serviceId\":\"stdio-service\",\"method\":\"initialize\",\"payload\":{\"ok\":true,\"status\":\"ready\"}}"
+        let script = "printf '%s\\n' \"$METIS_SERVICE_PLUGIN_SESSION_ID|$METIS_SERVICE_PLUGIN_LEASE_PATH|$METIS_SERVICE_PLUGIN_PARENT_PID\" > '${capturePath.toString()}'; printf '%s\\n' '${initLine}'; read ignored || true"
+        this.registerStdioScript(script)
+        let started = ensureRegisteredServicePluginStarted("stdio-service", startupTimeoutMs: 2000)
+        @Expect(started.ok, true)
+        @Expect(this.waitForFile(capturePath, timeoutMillis: 2000), true)
+        let captured = String.fromUtf8(File.readFrom(capturePath)).trimAscii()
+        let parts = captured.split("|")
+        @Expect(parts.size, 3)
+        @Expect(parts[0], "stdio-service-1")
+        @Expect(parts[1].contains("/service-plugin/runtime/stdio-service/stdio-service-1.lease.json"), true)
+        @Expect(try { Int64.parse(parts[2]) > 0 } catch (_: Exception) { false }, true)
+        match (getServicePluginSnapshot("stdio-service")) {
+            case Some(snapshot) => @Expect(snapshot.pid > 0, true)
+            case None => @Expect(true, false)
+        }
+        let stopped = stopServicePlugin("stdio-service", reason: "test")
+        @Expect(stopped.ok, true)
     }
 
     @TestCase

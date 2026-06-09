@@ -1,5 +1,6 @@
 package metis.gateway.gitcode_plugin
 
+import metis.core.metisSafeUtf8Prefix
 import std.collection.ArrayList
 import stdx.encoding.json.{JsonArray, JsonBool, JsonInt, JsonObject, JsonString, JsonValue}
 
@@ -557,8 +558,5 @@ private func reviewContainsSecret(text: String): Bool {
 private func reviewSafeField(raw: String, maxBytes!: Int64 = 512): String {
     var text = raw.trimAscii()
     text = text.replace("\r", " ").replace("\u{0000}", "")
-    if (text.size > maxBytes) {
-        text = text[0..maxBytes]
-    }
-    text
+    metisSafeUtf8Prefix(text, maxBytes)
 }

@@ -1,8 +1,11 @@
 package metis.gateway.service_plugin
 
+import metis.core.metisSafeUtf8Prefix
+import metis.core.config.CliConfig
 import std.collection.{ArrayList, HashMap, HashSet}
 import std.fs.{Path, exists}
 import std.io.*
+import std.env.{getProcessId, getVariables}
 import std.process.*
 import std.sync.*
 import std.time.*
@@ -482,8 +485,8 @@ private class ServicePluginLineBuffer {
             while (this.lines.size >= 256) {
                 this.lines.remove(at: 0)
             }
-            let stored = if (line.size > 65537) { line[..65537] + "...[TRUNCATED]" } else { line }
-            let clipped = if (line.size > 4096) { line[..4096] + "...[TRUNCATED]" } else { line }
+            let stored = metisSafeUtf8Prefix(line, 65537, marker: "...[TRUNCATED]")
+            let clipped = metisSafeUtf8Prefix(line, 4096, marker: "...[TRUNCATED]")
             this.lines.add(stored)
             this.summaryLines.add(clipped)
             while (this.summaryLines.size > 8) {
@@ -564,11 +567,28 @@ private class ServicePluginStdioProcess {
         redactServicePayload(this.stdoutBuffer.summary()).text
     }
 
-    public func stop(): Unit {
+    public func stop(timeoutMs!: Int64 = 500): Bool {
+        let effective = if (timeoutMs > 0) { timeoutMs } else { 500 }
+        try {
+            let _ = this.process.wait(timeout: Some(Duration.millisecond * effective))
+            this.stdoutBuffer.close()
+            this.stderrBuffer.close()
+            return true
+        } catch (_waitBeforeTerminate: Exception) {
+            ()
+        }
         try { this.process.terminate(force: false) } catch (_: Exception) { () }
-        try { let _ = this.process.wait(timeout: Some(Duration.millisecond * 500)) } catch (_: Exception) { try { this.process.terminate(force: true) } catch (_inner: Exception) { () } }
+        try {
+            let _ = this.process.wait(timeout: Some(Duration.millisecond * effective))
+            this.stdoutBuffer.close()
+            this.stderrBuffer.close()
+            return true
+        } catch (_waitAfterTerminate: Exception) {
+            try { this.process.terminate(force: true) } catch (_inner: Exception) { () }
+        }
         this.stdoutBuffer.close()
         this.stderrBuffer.close()
+        false
     }
 
     private func readLines(reader: StringReader<InputStream>, buffer: ServicePluginLineBuffer): Unit {
@@ -580,7 +600,13 @@ private class ServicePluginStdioProcess {
                 return
             }
             match (line) {
-                case Some(value) => buffer.appendLine(value)
+                case Some(value) =>
+                    try {
+                        buffer.appendLine(value)
+                    } catch (e: Exception) {
+                        buffer.close(error: "line buffer append failed: ${e.message}")
+                        return
+                    }
                 case None =>
                     buffer.close()
                     return
@@ -1121,6 +1147,36 @@ private func servicePluginProcessError(prefix: String, process: ServicePluginStd
     redactServicePayload(String.join(parts.toArray(), delimiter: " ")).text
 }
 
+private func servicePluginPathSegment(raw: String): String {
+    let trimmed = raw.trimAscii()
+    if (trimmed.isEmpty()) { return "service-plugin" }
+    trimmed.replace("/", "_").replace("\\", "_").replace(":", "_")
+}
+
+private func servicePluginLeasePath(record: ServicePluginRuntimeRecord): String {
+    let serviceId = servicePluginPathSegment(record.registration.manifest.pluginId)
+    let instanceId = servicePluginPathSegment(record.instanceId)
+    CliConfig.dotDir
+        .join("service-plugin")
+        .join("runtime")
+        .join(serviceId)
+        .join("${instanceId}.lease.json")
+        .toString()
+}
+
+private func servicePluginProcessEnvironment(record: ServicePluginRuntimeRecord): HashMap<String, String> {
+    let env = HashMap<String, String>()
+    for ((key, value) in getVariables()) {
+        env[key] = value
+    }
+    env["METIS_SERVICE_PLUGIN_ID"] = record.registration.manifest.pluginId
+    env["METIS_SERVICE_PLUGIN_INSTANCE_ID"] = record.instanceId
+    env["METIS_SERVICE_PLUGIN_SESSION_ID"] = record.instanceId
+    env["METIS_SERVICE_PLUGIN_PARENT_PID"] = "${getProcessId()}"
+    env["METIS_SERVICE_PLUGIN_LEASE_PATH"] = servicePluginLeasePath(record)
+    env
+}
+
 private func stopAllActiveServicePluginProcesses(): Unit {
     synchronized(servicePluginProcessLock) {
         for ((_, process) in servicePluginActiveProcesses) {
@@ -1131,6 +1187,18 @@ private func stopAllActiveServicePluginProcesses(): Unit {
         }
         servicePluginActiveProcesses = HashMap<String, ServicePluginStdioProcess>()
         servicePluginResponseQueues = HashMap<String, ServicePluginResponseQueue>()
+    }
+}
+
+public func shutdownServicePluginHost(reason!: String = "shutdown", timeoutMillis!: Int64 = 30000): Unit {
+    let ids = ArrayList<String>()
+    synchronized(servicePluginProcessLock) {
+        for ((serviceId, _) in servicePluginActiveProcesses) {
+            ids.add(serviceId)
+        }
+    }
+    for (serviceId in ids) {
+        let _ = stopServicePlugin(serviceId, reason: reason, timeoutMillis: timeoutMillis)
     }
 }
 
@@ -1163,8 +1231,10 @@ private func ensureServicePluginStdioProcess(record: ServicePluginRuntimeRecord,
                 stdIn: ProcessRedirect.Pipe,
                 stdOut: ProcessRedirect.Pipe,
                 stdErr: ProcessRedirect.Pipe,
-                workingDirectory: if (cwd.isEmpty()) { None<Path> } else { Some(Path(cwd)) }
+                workingDirectory: if (cwd.isEmpty()) { None<Path> } else { Some(Path(cwd)) },
+                environment: Some(servicePluginProcessEnvironment(record))
             )
+            record.pid = proc.pid
             ServicePluginStdioProcess(proc)
         } catch (e: Exception) {
             record.status = "degraded"
@@ -1411,8 +1481,11 @@ public func stopServicePlugin(serviceId: String, reason!: String = "", timeoutMi
                         } catch (_: Exception) {
                             ()
                         }
-                        process.stop()
+                        let exited = process.stop(timeoutMs: min(timeoutMillis, 30000))
                         servicePluginActiveProcesses.remove(serviceId.trimAscii())
+                        if (!exited && record.lastError.isEmpty()) {
+                            record.lastError = servicePluginProcessError("service plugin stop forced", process)
+                        }
                     case None => ()
                 }
                 match (servicePluginResponseQueues.get(serviceId.trimAscii())) {
@@ -1425,7 +1498,8 @@ public func stopServicePlugin(serviceId: String, reason!: String = "", timeoutMi
             record.status = "stopped"
             record.degradedReason = reason.trimAscii()
             record.stateFlushed = true
-            ServiceStopResult(true, serviceId.trimAscii(), "stopped", stateFlushed: true)
+            record.pid = 0
+            ServiceStopResult(true, serviceId.trimAscii(), "stopped", stateFlushed: true, diagnostic: record.lastError)
         case None => ServiceStopResult(false, serviceId.trimAscii(), "missing", diagnostic: "service plugin is not registered")
     }
 }

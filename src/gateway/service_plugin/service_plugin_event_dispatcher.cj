@@ -337,6 +337,9 @@ public func dispatchServicePluginEvent(
     if (frame.capabilityId == "gitcode.event.accepted") {
         return recordGitCodeAcceptedEventForFutureReply(frame, store: store)
     }
+    if (frame.capabilityId == "gitcode.monitor.orphan_detected") {
+        return recordGitCodeMonitorOrphanDetected(frame)
+    }
     let parsed = parseServicePluginJobEventPayload(frame.capabilityId, frame.payload)
     if (!parsed.ok) {
         return servicePluginDispatchResult(frame, false, parsed.status, diagnostic: parsed.diagnostic)
@@ -378,6 +381,23 @@ public func dispatchServicePluginEvent(
     }
     store.markDelivered(event.jobId, deliveredStatus, summary: text)
     servicePluginDispatchResult(frame, true, deliveredStatus, targetCount: 1, deliverySuccess: 1)
+}
+
+private func recordGitCodeMonitorOrphanDetected(frame: ServiceFrame): ServicePluginEventDispatchResult {
+    let root = match (servicePluginAcceptedEventPayloadRoot(frame.payload)) {
+        case Some(obj) => obj
+        case None => return servicePluginDispatchResult(frame, false, "event_payload_invalid", diagnostic: "orphan payload must be a JSON object")
+    }
+    let status = servicePluginAcceptedEventAnyString(root, "status")
+    if (status != "orphan_detected") {
+        return servicePluginDispatchResult(frame, false, "event_payload_invalid", diagnostic: "unsupported orphan status: ${status}")
+    }
+    let sessionId = servicePluginAcceptedEventAnyString(root, "sessionId")
+    let reason = servicePluginAcceptedEventAnyString(root, "orphanReason")
+    let pid = servicePluginJsonInt(root, "pid")
+    let parentPid = servicePluginJsonInt(root, "parentPid")
+    let diagnostic = "GCM service plugin orphan detected sessionId=${sessionId} pid=${pid} parentPid=${parentPid} reason=${reason}"
+    servicePluginDispatchResult(frame, false, "orphan_detected", diagnostic: diagnostic, eventId: sessionId)
 }
 
 private func recordGitCodeAcceptedEventForFutureReply(
@@ -785,6 +805,13 @@ private func servicePluginJsonBool(root: JsonObject, key: String): Bool {
     match (root.get(key)) {
         case Some(v) => try { v.asBool().getValue() } catch (_: Exception) { false }
         case None => false
+    }
+}
+
+private func servicePluginJsonInt(root: JsonObject, key: String): Int64 {
+    match (root.get(key)) {
+        case Some(v) => try { v.asInt().getValue() } catch (_: Exception) { 0 }
+        case None => 0
     }
 }
 
