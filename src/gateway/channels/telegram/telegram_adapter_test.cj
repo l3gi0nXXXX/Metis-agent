@@ -1472,6 +1472,168 @@ public class TelegramAdapterTest {
     }
 
     @TestCase
+    public func tgU002PollingStartReturnsBeforeSlowWebhookCleanupAndDiagnosesFailure(): Unit {
+        let seen = ArrayList<String>()
+        let seenLock = Mutex()
+        try {
+            setTelegramTransportRunnerForTest(Some({ request: TelegramTransportRequest =>
+                synchronized(seenLock) {
+                    seen.add(request.context)
+                }
+                if (request.context.startsWith("deleteWebhook:")) {
+                    sleep(Duration.millisecond * 220)
+                    return TelegramTransportResponse(
+                        false,
+                        error: "DNS lookup failed for https://api.telegram.org/bot123456:SECRET/deleteWebhook",
+                        outcome: "dns"
+                    )
+                }
+                TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":[]}", outcome: "ok")
+            }))
+            let adapter = TelegramAdapter(
+                config: TelegramConfig(enabled: true, botToken: "123456:SECRET")
+            )
+
+            let startedAtMs = DateTime.now().toUnixTimeStamp().toMilliseconds()
+            adapter.start()
+            let elapsedMs = DateTime.now().toUnixTimeStamp().toMilliseconds() - startedAtMs
+            @Expect(elapsedMs < 120, true)
+
+            sleep(Duration.millisecond * 280)
+            let polling = adapter.debugBuildPollingDiagnosticSnapshot()
+            let lifecycle = adapter.debugBuildWebhookLifecycleDiagnostics()
+            let health = adapter.debugBuildHealthSnapshot()
+            adapter.stop()
+
+            @Expect(lifecycle.get("cleanupStatus").getOrThrow().asString().getValue(), "error")
+            @Expect(lifecycle.get("cleanupError").getOrThrow().asString().getValue().contains("123456:SECRET"), false)
+            @Expect(polling.get("lastOutcome").getOrThrow().asString().getValue(), "webhook_cleanup_failed")
+            @Expect(polling.get("lastError").getOrThrow().asString().getValue().contains("deleteWebhook"), true)
+            @Expect(polling.get("lastError").getOrThrow().asString().getValue().contains("123456:SECRET"), false)
+            @Expect(polling.get("consecutiveFailures").getOrThrow().asInt().getValue() >= 1, true)
+            @Expect(polling.get("nextRetryAtMs").getOrThrow().asInt().getValue() > 0, true)
+            let summary = health.get("summary").getOrThrow().asObject()
+            @Expect(summary.get("mode").getOrThrow().asString().getValue(), "polling")
+            @Expect(summary.get("pollingLastOutcome").getOrThrow().asString().getValue(), "webhook_cleanup_failed")
+            synchronized(seenLock) {
+                @Expect(seen.size >= 1, true)
+                @Expect(seen[0].startsWith("deleteWebhook:"), true)
+            }
+        } finally {
+            setTelegramTransportRunnerForTest(None)
+        }
+    }
+
+    @TestCase
+    public func tgB002PollingConflictRecordsBackoffAndRedactsToken(): Unit {
+        let seen = ArrayList<String>()
+        try {
+            setTelegramTransportRunnerForTest(Some({ request: TelegramTransportRequest =>
+                seen.add(request.context)
+                if (request.context == "getUpdates") {
+                    return TelegramTransportResponse(
+                        true,
+                        body: "{\"ok\":false,\"error_code\":409,\"description\":\"Conflict: terminated by other getUpdates request for bot 123456:SECRET\"}",
+                        outcome: "ok"
+                    )
+                }
+                TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":true}", outcome: "ok")
+            }))
+            let adapter = TelegramAdapter(
+                config: TelegramConfig(enabled: true, botToken: "123456:SECRET")
+            )
+            @Expect(adapter.debugRunPollingIterationForTest(), 0)
+            let polling = adapter.debugBuildPollingDiagnosticSnapshot()
+            let raw = polling.toJsonString()
+
+            @Expect(polling.get("lastOutcome").getOrThrow().asString().getValue(), "conflict")
+            @Expect(polling.get("state").getOrThrow().asString().getValue(), "recovering")
+            @Expect(adapter.debugCurrentPollBackoffMsForTest(), 2000)
+            @Expect(raw.contains("123456:SECRET"), false)
+            @Expect(raw.contains("<redacted>"), true)
+            @Expect(seen.size >= 2, true)
+        } finally {
+            setTelegramTransportRunnerForTest(None)
+        }
+    }
+
+    @TestCase
+    public func tgP002PollingStartSuccessQueuesInboundAndSendReturnsMessageId(): Unit {
+        let fake = TelegramFakeBotApi()
+        let root = "/tmp/metis-telegram-tg-p-002-${DateTime.now().toUnixTimeStamp().toMilliseconds()}"
+        try {
+            setTelegramTransportRunnerForTest(Some({ request: TelegramTransportRequest =>
+                fake.handle(request)
+            }))
+            let adapter = TelegramAdapter(
+                config: TelegramConfig(enabled: true, botToken: "123456:FAKE", dmPolicy: "open", allowFrom: ["*"]),
+                pairingRoot: root
+            )
+            adapter.start()
+            sleep(Duration.millisecond * 90)
+
+            let polled = adapter.pullInbound()
+            @Expect(polled.size >= 1, true)
+            @Expect(polled[0].text, "hello from fake polling")
+            let messageId = adapter.sendWithMessageId(
+                OutboundMessage(ChannelType.Telegram, "user:8734062810", "hello from tg-p-002")
+            )
+            let polling = adapter.debugBuildPollingDiagnosticSnapshot()
+            adapter.stop()
+
+            @Expect(messageId, "501")
+            @Expect(polling.get("lastSuccessAtMs").getOrThrow().asInt().getValue() > 0, true)
+            @Expect(polling.get("consecutiveFailures").getOrThrow().asInt().getValue(), 0)
+        } finally {
+            setTelegramTransportRunnerForTest(None)
+            try {
+                remove(Path(root), recursive: true)
+            } catch (_: Exception) {
+                ()
+            }
+        }
+    }
+
+    @TestCase
+    public func tgN002SendNetworkFailureAndNotRunningExposeClearDiagnostics(): Unit {
+        try {
+            setTelegramTransportRunnerForTest(Some({ request: TelegramTransportRequest =>
+                if (request.context.startsWith("deleteWebhook:") || request.context == "getUpdates") {
+                    return TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":[]}", outcome: "ok")
+                }
+                TelegramTransportResponse(false, error: "Operation timed out", outcome: "timeout")
+            }))
+            let notRunning = TelegramAdapter(config: TelegramConfig(enabled: true, botToken: "123456:SECRET"))
+            let notRunningResult = notRunning.send(
+                OutboundMessage(ChannelType.Telegram, "user:8734062810", "hello")
+            )
+            match (notRunningResult) {
+                case SendResult.Success => @Expect(false, true)
+                case SendResult.Failed(reason) =>
+                    @Expect(reason.contains("not running"), true)
+                    @Expect(reason.contains("123456:SECRET"), false)
+            }
+
+            let adapter = TelegramAdapter(config: TelegramConfig(enabled: true, botToken: "123456:SECRET"))
+            adapter.start()
+            let result = adapter.send(
+                OutboundMessage(ChannelType.Telegram, "user:8734062810", "hello")
+            )
+            adapter.stop()
+            match (result) {
+                case SendResult.Success => @Expect(false, true)
+                case SendResult.Failed(reason) =>
+                    @Expect(reason.contains("Operation timed out"), true)
+                    @Expect(reason.contains("123456:SECRET"), false)
+            }
+            @Expect(adapter.debugLastSendErrorForTest().contains("Operation timed out"), true)
+            @Expect(adapter.debugLastSendErrorForTest().contains("123456:SECRET"), false)
+        } finally {
+            setTelegramTransportRunnerForTest(None)
+        }
+    }
+
+    @TestCase
     public func webhookSecretHeaderIsRequiredWhenConfigured(): Unit {
         let adapter = TelegramAdapter(
             config: TelegramConfig(

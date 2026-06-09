@@ -384,7 +384,6 @@ public class TelegramAdapter <: ChannelAdapter {
             this.logChannel("info", MetisLogEvent.channelStarted, "start", "started", "Telegram adapter started", extra: startMeta)
             return
         }
-        this.ensurePollingWebhookCleared("polling-start")
         this.startPollingLoop()
         this.startNativeCommandSyncIfNeeded()
         this.logChannel("info", MetisLogEvent.channelStarted, "start", "started", "Telegram adapter started", extra: startMeta)
@@ -1790,7 +1789,7 @@ public class TelegramAdapter <: ChannelAdapter {
     }
 
     private func recordPollError(error: String, outcome!: String = "error"): Unit {
-        this.pollingRunnerOrThrow().recordError(error, outcome: outcome)
+        this.pollingRunnerOrThrow().recordError(this.redactTelegramSensitive(error), outcome: outcome)
     }
 
     private func pollErrorRecordedForCurrentIteration(): Bool {
@@ -2135,7 +2134,17 @@ public class TelegramAdapter <: ChannelAdapter {
         if (token.isEmpty()) {
             return ""
         }
-        this.ensurePollingWebhookCleared("before-getUpdates")
+        if (!this.ensurePollingWebhookCleared("before-getUpdates")) {
+            let cleanupDetail = if (this.webhookCleanupError.trimAscii().isEmpty()) {
+                "deleteWebhook preflight failed"
+            } else {
+                "deleteWebhook preflight failed: ${this.webhookCleanupError}"
+            }
+            if (!this.pollErrorRecordedForCurrentIteration()) {
+                this.recordPollError(cleanupDetail, outcome: "webhook_cleanup_failed")
+            }
+            return ""
+        }
         let payload = JsonObject()
         let lastInbound = this.readLastInboundUpdateId()
         if (!lastInbound.isEmpty()) {
@@ -8807,7 +8816,8 @@ public class TelegramAdapter <: ChannelAdapter {
     private func recordTelegramRequestError(context: String, detail: String, outcome!: String = "request-error"): Unit {
         let message = this.redactTelegramSensitive("${context} ${detail}".trimAscii())
         if (this.isPollingContext(context)) {
-            this.recordPollError(message, outcome: outcome)
+            let pollingOutcome = if (context.startsWith("deleteWebhook:")) { "webhook_cleanup_failed" } else { outcome }
+            this.recordPollError(message, outcome: pollingOutcome)
         } else {
             if (!(context.startsWith("send:") && this.lastSendError.trimAscii().startsWith("telegram send error class="))) {
                 this.setLastSendError(message)
