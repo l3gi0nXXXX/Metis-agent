@@ -158,6 +158,8 @@ public class TelegramPollingRunner {
             out.put("consecutiveFailures", this.consecutiveFailures.toJsonValue())
             out.put("nextRetryAtMs", this.nextRetryAtMs.toJsonValue())
             out.put("lastOutcome", JsonString(this.lastOutcome))
+            out.put("lastErrorKind", JsonString(this.errorKindForDiagnostics(this.lastError, this.lastOutcome)))
+            out.put("currentBackoffMs", this.currentBackoffMsForFailureCount(this.consecutiveFailures).toJsonValue())
             out.put("watchdogEnabled", true.toJsonValue())
             out.put("watchdogStallMs", this.watchdogStallMs.toJsonValue())
             out.put("watchdogIntervalMs", this.watchdogIntervalMs.toJsonValue())
@@ -311,9 +313,37 @@ public class TelegramPollingRunner {
             if (this.consecutiveFailures > 0) {
                 this.pollingState = "backoff"
                 this.nextRetryAtMs = now + backoffMs
-                this.lastOutcome = "backoff"
             }
         }
+    }
+
+    private func currentBackoffMsForFailureCount(failures: Int64): Int64 {
+        if (failures <= 0) {
+            return 0
+        }
+        var delay: Int64 = 2000
+        var i: Int64 = 1
+        while (i < failures) {
+            let next = delay * 2
+            delay = if (next > 30000) { 30000 } else { next }
+            i += 1
+        }
+        delay
+    }
+
+    private func errorKindForDiagnostics(error: String, outcome: String): String {
+        let normalizedOutcome = outcome.trimAscii().toAsciiLower()
+        if (normalizedOutcome == "webhook_cleanup_failed") { return "webhook_cleanup_failed" }
+        if (normalizedOutcome == "conflict") { return "conflict" }
+        if (normalizedOutcome == "rate-limit") { return "rate-limit" }
+        if (normalizedOutcome == "timeout") { return "timeout" }
+        let lowered = error.trimAscii().toAsciiLower()
+        if (lowered.contains("conflict") || lowered.contains("409")) { return "conflict" }
+        if (lowered.contains("timeout") || lowered.contains("timed out")) { return "timeout" }
+        if (lowered.contains("dns")) { return "dns" }
+        if (lowered.contains("transport") || lowered.contains("http")) { return "transport" }
+        if (lowered.contains("token") || lowered.contains("unauthorized")) { return "credential" }
+        if (normalizedOutcome.isEmpty()) { "unknown" } else { normalizedOutcome }
     }
 
     private func waitForBackoff(backoffMs: Int64): Unit {
