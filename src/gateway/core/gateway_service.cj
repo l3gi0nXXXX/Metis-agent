@@ -6,7 +6,7 @@ import metis.core.model.{findModelCapabilityCatalogEntry, modelCapabilityCatalog
 import metis.core.skills.SkillsPrompt
 import metis.gateway.model.*
 import metis.gateway.security.gatewayPairingAccountStore
-import metis.gateway.service_plugin.{CapabilityCaller, CapabilityInvokeRequest, CapabilityInvokeResult, ServicePluginAcceptedGitCodeEvent, ServicePluginDeliveryTarget, ServicePluginEventDeliveryResult, ServicePluginGeneratedReplyResult, ServicePluginPendingJob, buildServicePluginImBindingRules, invokeRegisteredCapability, matchServicePluginImBinding, parseServicePluginJobAcceptedPayload, renderServicePluginJobSnapshotMessage, servicePluginPendingJobStore, registerConfiguredServicePlugins, servicePluginConfiguredStatusForUser, servicePluginWebhookDispatchStatsJson, setServicePluginEventDelivery, setServicePluginGeneratedReplyHandler, setServicePluginWebhookGeneratedReplyHandler, setServicePluginWebhookSubscribersProvider}
+import metis.gateway.service_plugin.{CapabilityCaller, CapabilityInvokeRequest, CapabilityInvokeResult, ServicePluginAcceptedGitCodeEvent, ServicePluginDeliveryTarget, ServicePluginEventDeliveryResult, ServicePluginGeneratedReplyResult, ServicePluginPendingJob, buildServicePluginImBindingRules, invokeRegisteredCapability, matchServicePluginImBinding, parseServicePluginJobAcceptedPayload, redactServicePayload, renderServicePluginJobSnapshotMessage, servicePluginPendingJobStore, registerConfiguredServicePlugins, servicePluginConfiguredStatusForUser, servicePluginWebhookDispatchStatsJson, setServicePluginEventDelivery, setServicePluginGeneratedReplyHandler, setServicePluginWebhookGeneratedReplyHandler, setServicePluginWebhookSubscribersProvider}
 import metis.gateway.session.{GatewayIngressSource, GatewaySessionContext, GatewaySessionRequest, gatewayResolveSessionContext, gatewaySessionRequestFromInbound}
 import metis.gateway.tools.{gatewayHandleNativeCommandLine, gatewayHandleSubagentsCommandLine}
 import metis.gateway.gitcode_plugin.{GatewayCommandContext, buildGitCodeAsyncScanPayload, buildGitCodeDeadLetterInspectPayload, buildGitCodeDeadLetterListPayload, buildGitCodeEventReconcilePayload, buildGitCodeHookReconcilePayload, buildGitCodeSubscriptionTarget, buildGitCodeWebhookCancelPayload, buildGitCodeWebhookReplayPayload, buildGitCodeWebhookStatusPayload, formatGitCodeSubscribeResult, gitCodeSubscriptionStatusJson, gitCodeSubscriptionStoreSnapshotForDispatcher, handleGitCodeKnowledgeQueryCommand, loadGitCodeSubscriptionStore, parseGitCodeCommand, parseGitCodeDeliveryArgs, parseGitCodeHookReconcileArgs, parseGitCodeReconcileOnceArgs, parseGitCodeReviewRequest, parseGitCodeScanOnceArgs, removeGitCodeSubscription, renderGitCodeDeadLetterInspectResult, renderGitCodeDeadLetterListResult, renderGitCodeEventReconcileResult, renderGitCodeHookReconcileResult, renderGitCodeWebhookCancelResult, renderGitCodeWebhookReplayResult, renderGitCodeWebhookStatusResult, routeGitCodeReviewRequest, saveGitCodeSubscription, setGitCodeSubscriptionStore}
@@ -128,18 +128,22 @@ public class GatewayService {
         registerConfiguredServicePlugins(user)
         setGitCodeSubscriptionStore(Some(loadGitCodeSubscriptionStore(CliConfig.dotDir.join("service-plugin").join("gitcode").join("subscriptions.jsonl").toString())))
         setServicePluginEventDelivery(Some({ target: ServicePluginDeliveryTarget, text: String =>
-            let sentId = this.sendTextToPeerDetailed(
-                target.channel,
-                target.peerId,
-                text,
-                replyToMessageId: target.replyToMessageId,
-                replyInThread: target.replyInThread,
-                accountId: target.accountId
-            )
-            if (sentId.isEmpty()) {
-                ServicePluginEventDeliveryResult(false, "send_failed", diagnostic: "channel delivery returned empty message id")
-            } else {
-                ServicePluginEventDeliveryResult(true, "sent", messageId: sentId)
+            try {
+                let sentId = this.sendTextToPeerDetailed(
+                    target.channel,
+                    target.peerId,
+                    text,
+                    replyToMessageId: target.replyToMessageId,
+                    replyInThread: target.replyInThread,
+                    accountId: target.accountId
+                )
+                if (sentId.isEmpty()) {
+                    ServicePluginEventDeliveryResult(false, "send_failed", diagnostic: "channel delivery returned empty message id")
+                } else {
+                    ServicePluginEventDeliveryResult(true, "sent", messageId: sentId)
+                }
+            } catch (e: Exception) {
+                ServicePluginEventDeliveryResult(false, "send_failed", diagnostic: redactServicePayload(e.message).text)
             }
         }))
         setServicePluginGeneratedReplyHandler(Some({ job: ServicePluginPendingJob, event: ServicePluginAcceptedGitCodeEvent =>

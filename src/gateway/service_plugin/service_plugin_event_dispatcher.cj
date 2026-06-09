@@ -467,10 +467,7 @@ public func dispatchGitCodeWebhookAcceptedEvent(frame: ServiceFrame, event: Serv
     let writeback = servicePluginApplyGeneratedReplyWriteback(event, generated)
     let text = renderServicePluginGeneratedReplyNotification(event, generated, writeback: writeback)
     for (target in targets) {
-        let delivery = match (servicePluginEventDeliveryForTest) {
-            case Some(sender) => sender(target, text)
-            case None => ServicePluginEventDeliveryResult(false, "delivery_unconfigured", diagnostic: "service plugin event delivery is not configured")
-        }
+        let delivery = servicePluginDeliverWebhookTarget(target, text)
         if (delivery.ok) {
             success++
             let channel = target.channel.toAsciiLower()
@@ -481,7 +478,7 @@ public func dispatchGitCodeWebhookAcceptedEvent(frame: ServiceFrame, event: Serv
             }
         } else {
             failed++
-            failures.add("${target.channel}:${target.accountId}:send_failed")
+            failures.add(servicePluginDeliveryFailureDetail(target, delivery))
         }
     }
     let writebackDegraded = servicePluginWritebackDegraded(writeback)
@@ -535,18 +532,56 @@ public func renderServicePluginGeneratedReplyNotification(
     result: ServicePluginGeneratedReplyResult,
     writeback!: ServicePluginWritebackApplyState = ServicePluginWritebackApplyState()
 ): String {
+    try {
+        var text = "GitCode 回复草稿\n"
+        text += "来源: ${servicePluginAcceptedEventSource(event)}\n"
+        let title = if (!event.title.isEmpty()) { event.title } else { servicePluginAcceptedEventFirstLine(event.content) }
+        if (!title.isEmpty()) {
+            text += "标题: ${title}\n"
+        }
+        if (result.ok) {
+            text += servicePluginWritebackNotificationLine(writeback)
+            text += "\n\n草稿:\n${result.draft}"
+        } else {
+            let reason = servicePluginGeneratedReplyHumanReason(result)
+            text += "状态: needsHumanReview，未写回 GitCode\n原因: ${reason}\n\n草稿:\n"
+        }
+        redactServicePayload(text).text
+    } catch (e: Exception) {
+        servicePluginGeneratedReplyNotificationFallback(event, e.message)
+    }
+}
+
+private func servicePluginDeliverWebhookTarget(target: ServicePluginDeliveryTarget, text: String): ServicePluginEventDeliveryResult {
+    try {
+        match (servicePluginEventDeliveryForTest) {
+            case Some(sender) => sender(target, text)
+            case None => ServicePluginEventDeliveryResult(false, "delivery_unconfigured", diagnostic: "service plugin event delivery is not configured")
+        }
+    } catch (e: Exception) {
+        ServicePluginEventDeliveryResult(false, "send_failed", diagnostic: redactServicePayload(e.message).text)
+    }
+}
+
+private func servicePluginDeliveryFailureDetail(target: ServicePluginDeliveryTarget, delivery: ServicePluginEventDeliveryResult): String {
+    let channel = target.channel.trimAscii()
+    let accountId = target.accountId.trimAscii()
+    let status = if (delivery.status.isEmpty()) { "send_failed" } else { delivery.status }
+    let diagnostic = redactServicePayload(delivery.diagnostic).text
+    var detail = "channel=${channel} accountId=${accountId} status=${status}"
+    if (!diagnostic.isEmpty()) {
+        detail += " diagnostic=${diagnostic}"
+    }
+    redactServicePayload(detail).text
+}
+
+private func servicePluginGeneratedReplyNotificationFallback(event: ServicePluginAcceptedGitCodeEvent, diagnostic: String): String {
     var text = "GitCode 回复草稿\n"
     text += "来源: ${servicePluginAcceptedEventSource(event)}\n"
-    let title = if (!event.title.isEmpty()) { event.title } else { servicePluginAcceptedEventFirstLine(event.content) }
-    if (!title.isEmpty()) {
-        text += "标题: ${title}\n"
-    }
-    if (result.ok) {
-        text += servicePluginWritebackNotificationLine(writeback)
-        text += "\n\n草稿:\n${result.draft}"
-    } else {
-        let reason = servicePluginGeneratedReplyHumanReason(result)
-        text += "状态: needsHumanReview，未写回 GitCode\n原因: ${reason}\n\n草稿:\n"
+    text += "状态: needsHumanReview，未写回 GitCode\n原因: render_failed\n"
+    let safeDiagnostic = redactServicePayload(diagnostic).text
+    if (!safeDiagnostic.isEmpty()) {
+        text += "诊断: ${safeDiagnostic}\n"
     }
     redactServicePayload(text).text
 }

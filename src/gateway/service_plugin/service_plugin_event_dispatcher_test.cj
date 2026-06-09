@@ -264,6 +264,147 @@ public class ServicePluginEventDispatcherTest {
     }
 
     @TestCase
+    public func tgU001WebhookFanoutContinuesWhenFirstTelegramSenderThrows(): Unit {
+        // TG-U-001
+        this.resetDispatcherHooks()
+        let calls = ArrayList<String>()
+        setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent =>
+            this.targetRows([this.target(channel: "telegram", peerId: "tg-peer"), this.target(channel: "feishu", peerId: "fs-peer")])
+        }))
+        setServicePluginWebhookGeneratedReplyHandlerForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent, _target: ServicePluginDeliveryTarget =>
+            ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "draft")
+        }))
+        setServicePluginEventDeliveryForTest(Some({ target: ServicePluginDeliveryTarget, _text: String =>
+            calls.add(target.channel)
+            if (target.channel == "telegram") {
+                throw Exception("telegram adapter not running Authorization: Bearer secret path=/Users/name/private")
+            }
+            ServicePluginEventDeliveryResult(true, "sent", messageId: "fs-msg")
+        }))
+        try {
+            let result = dispatchServicePluginEvent(this.acceptedFrame(eventId: "tg-u-001"), store: ServicePluginPendingJobStore())
+            @Expect(result.ok, true)
+            @Expect(result.status, "generated_reply_partially_delivered")
+            @Expect(result.deliverySuccess, 1)
+            @Expect(result.deliveryFailed, 1)
+            @Expect(calls.size, 2)
+            @Expect(result.failureDetails.size, 1)
+            @Expect(result.failureDetails[0].contains("telegram"), true)
+            @Expect(result.failureDetails[0].contains("acct"), true)
+            @Expect(result.failureDetails[0].contains("send_failed"), true)
+            @Expect(result.failureDetails[0].contains("Authorization"), false)
+            @Expect(result.failureDetails[0].contains("/Users/name/private"), false)
+        } finally {
+            this.resetDispatcherHooks()
+        }
+    }
+
+    @TestCase
+    public func tgB001WebhookFanoutAttemptsAllTargetsAndRedactsFailureDetails(): Unit {
+        // TG-B-001
+        this.resetDispatcherHooks()
+        let calls = ArrayList<String>()
+        setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent =>
+            this.targetRows([this.target(channel: "telegram", peerId: "tg-peer"), this.target(channel: "feishu", peerId: "fs-peer"), this.target(channel: "telegram", peerId: "tg-peer-2")])
+        }))
+        setServicePluginWebhookGeneratedReplyHandlerForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent, _target: ServicePluginDeliveryTarget =>
+            ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "draft")
+        }))
+        setServicePluginEventDeliveryForTest(Some({ target: ServicePluginDeliveryTarget, _text: String =>
+            calls.add("${target.channel}:${target.peerId}")
+            if (target.peerId == "tg-peer") {
+                throw Exception("tg1 not running token=abc Authorization: Bearer secret /Users/name/private")
+            }
+            if (target.peerId == "tg-peer-2") {
+                ServicePluginEventDeliveryResult(false, "send_failed", diagnostic: "channel delivery returned empty message id token=abc")
+            } else {
+                ServicePluginEventDeliveryResult(true, "sent", messageId: "fs-msg")
+            }
+        }))
+        try {
+            let result = dispatchServicePluginEvent(this.acceptedFrame(eventId: "tg-b-001"), store: ServicePluginPendingJobStore())
+            @Expect(result.ok, true)
+            @Expect(result.status, "generated_reply_partially_delivered")
+            @Expect(result.deliverySuccess, 1)
+            @Expect(result.deliveryFailed, 2)
+            @Expect(calls.size, 3)
+            @Expect(result.failureDetails.size, 2)
+            for (detail in result.failureDetails) {
+                @Expect(detail.contains("acct"), true)
+                @Expect(detail.contains("send_failed"), true)
+                @Expect(detail.contains("Authorization"), false)
+                @Expect(detail.contains("Bearer"), false)
+                @Expect(detail.contains("token=abc"), false)
+                @Expect(detail.contains("/Users/name/private"), false)
+            }
+        } finally {
+            this.resetDispatcherHooks()
+        }
+    }
+
+    @TestCase
+    public func tgP001WebhookFanoutAllTargetsSuccessReportsDelivered(): Unit {
+        // TG-P-001
+        this.resetDispatcherHooks()
+        this.registerGitCodeWritebackPlugin()
+        let calls = ArrayList<String>()
+        setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent =>
+            this.targetRows([this.target(channel: "telegram", peerId: "tg-peer"), this.target(channel: "feishu", peerId: "fs-peer")])
+        }))
+        setServicePluginWebhookGeneratedReplyHandlerForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent, _target: ServicePluginDeliveryTarget =>
+            ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "draft")
+        }))
+        setServicePluginCapabilityInvokerForTest(Some({ _registration: ServicePluginRegistration, request: CapabilityInvokeRequest =>
+            CapabilityInvokeResult(true, "ok", serviceId: "gitcode-monitor", capabilityId: request.capabilityId, payload: "{\"status\":\"posted\",\"posted\":true,\"replyUrl\":\"https://gitcode.com/cangjie/community/pulls/71#note_1\"}")
+        }))
+        setServicePluginEventDeliveryForTest(Some({ target: ServicePluginDeliveryTarget, _text: String =>
+            calls.add(target.channel)
+            ServicePluginEventDeliveryResult(true, "sent", messageId: "${target.channel}-msg")
+        }))
+        try {
+            let result = dispatchServicePluginEvent(this.acceptedFrame(eventId: "tg-p-001"), store: ServicePluginPendingJobStore())
+            @Expect(result.ok, true)
+            @Expect(result.status, "generated_reply_delivered")
+            @Expect(result.deliverySuccess, 2)
+            @Expect(result.deliveryFailed, 0)
+            @Expect(calls.size, 2)
+        } finally {
+            this.resetDispatcherHooks()
+        }
+    }
+
+    @TestCase
+    public func tgN001WebhookFanoutAllTargetsFailWithoutCrash(): Unit {
+        // TG-N-001
+        this.resetDispatcherHooks()
+        let calls = ArrayList<String>()
+        setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent =>
+            this.targetRows([this.target(channel: "telegram", peerId: "tg-peer"), this.target(channel: "feishu", peerId: "fs-peer")])
+        }))
+        setServicePluginWebhookGeneratedReplyHandlerForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent, _target: ServicePluginDeliveryTarget =>
+            ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "draft")
+        }))
+        setServicePluginEventDeliveryForTest(Some({ target: ServicePluginDeliveryTarget, _text: String =>
+            calls.add(target.channel)
+            if (target.channel == "telegram") {
+                throw Exception("telegram adapter not running token=abc")
+            }
+            ServicePluginEventDeliveryResult(false, "send_failed", diagnostic: "feishu send failed Authorization: Bearer secret")
+        }))
+        try {
+            let result = dispatchServicePluginEvent(this.acceptedFrame(eventId: "tg-n-001"), store: ServicePluginPendingJobStore())
+            @Expect(result.ok, false)
+            @Expect(result.status, "generated_reply_delivery_failed")
+            @Expect(result.deliverySuccess, 0)
+            @Expect(result.deliveryFailed, 2)
+            @Expect(calls.size, 2)
+            @Expect(result.failureDetails.size, 2)
+        } finally {
+            this.resetDispatcherHooks()
+        }
+    }
+
+    @TestCase
     public func a5WebhookAcceptedEventWithTelegramAndFeishuSubscribersDeliversGeneratedDraft(): Unit {
         // A5-E2E-UT-001, A5-E2E-POS-001, A5-E2E-BND-001, A4-DIAG-POS-001
         this.resetDispatcherHooks()
