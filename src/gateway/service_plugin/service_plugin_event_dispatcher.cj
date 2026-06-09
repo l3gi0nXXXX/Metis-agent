@@ -764,7 +764,13 @@ private func servicePluginParseWritebackApplyResult(result: CapabilityInvokeResu
     }
     let status = servicePluginAcceptedEventAnyString(root, "status")
     let posted = servicePluginJsonBool(root, "posted")
-    let skipped = servicePluginJsonBool(root, "skipped") || status == "skipped" || status == "dry_run" || status == "auto_reply_disabled"
+    let reason = servicePluginAcceptedEventAnyString(root, "reason")
+    let skipped = servicePluginJsonBool(root, "skipped") ||
+        status == "skipped" ||
+        status == "dry_run" ||
+        status == "auto_reply_disabled" ||
+        servicePluginWritebackKnownSkipReason(status) ||
+        servicePluginWritebackKnownSkipReason(reason)
     let replyUrl = servicePluginAcceptedEventAnyString(root, "replyUrl")
     let ok = posted || skipped || status == "posted" || status == "ok"
     ServicePluginWritebackApplyState(
@@ -774,7 +780,7 @@ private func servicePluginParseWritebackApplyResult(result: CapabilityInvokeResu
         posted: posted || status == "posted",
         skipped: skipped,
         replyUrl: replyUrl,
-        diagnostic: servicePluginAcceptedEventAnyString(root, "reason")
+        diagnostic: reason
     )
 }
 
@@ -800,6 +806,10 @@ private func servicePluginWritebackNotificationLine(writeback: ServicePluginWrit
     if (writeback.timedOut) {
         return "状态: 写回状态未知/超时，草稿已通知"
     }
+    let humanSkip = servicePluginWritebackHumanSkipLine(writeback)
+    if (!humanSkip.isEmpty()) {
+        return humanSkip
+    }
     if (!writeback.ok) {
         return "状态: 写回结果异常（${writeback.status}），草稿已通知"
     }
@@ -808,6 +818,30 @@ private func servicePluginWritebackNotificationLine(writeback: ServicePluginWrit
         return "状态: 写回未执行（${reason}），草稿已通知"
     }
     "状态: 写回未执行（${writeback.status}），草稿已通知"
+}
+
+private func servicePluginWritebackKnownSkipReason(reason: String): Bool {
+    let value = reason.trimAscii()
+    value == "repo_denied_by_writeback_scope" || value == "repo_not_allowlisted"
+}
+
+private func servicePluginWritebackReason(writeback: ServicePluginWritebackApplyState): String {
+    if (!writeback.diagnostic.isEmpty()) { return writeback.diagnostic }
+    writeback.status
+}
+
+private func servicePluginWritebackHumanSkipLine(writeback: ServicePluginWritebackApplyState): String {
+    let reason = servicePluginWritebackReason(writeback)
+    if (reason == "repo_denied_by_writeback_scope") {
+        return "状态: 该仓库被 GCM writebackScope.deniedRepos 排除，已生成草稿但未写回 GitCode"
+    }
+    if (reason == "repo_not_allowlisted") {
+        return "状态: 当前仓库未命中 GCM writebackScope 允许范围，已生成草稿但未写回 GitCode"
+    }
+    if (reason == "dry_run") {
+        return "状态: dryRun=true，未写回 GitCode（写回未执行），草稿已通知"
+    }
+    ""
 }
 
 private func servicePluginGeneratedReplyHumanReason(result: ServicePluginGeneratedReplyResult): String {

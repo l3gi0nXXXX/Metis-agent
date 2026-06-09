@@ -716,6 +716,116 @@ public class ServicePluginEventDispatcherTest {
     }
 
     @TestCase
+    public func wbScopeP3Neg001WritebackScopeDeniedReasonIsHumanReadable(): Unit {
+        let event = ServicePluginAcceptedGitCodeEvent(repo: "Cangjie/community", kind: "issue", number: "1", url: "https://gitcode.com/Cangjie/community/issues/1")
+        let denied = renderServicePluginGeneratedReplyNotification(
+            event,
+            ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "建议补充测试。"),
+            writeback: ServicePluginWritebackApplyState(configured: true, ok: true, status: "skipped", skipped: true, diagnostic: "repo_denied_by_writeback_scope")
+        )
+        @Expect(denied.contains("该仓库被 GCM writebackScope.deniedRepos 排除，已生成草稿但未写回 GitCode"), true)
+        @Expect(denied.contains("\"reason\""), false)
+        @Expect(denied.contains("{"), false)
+
+        let notAllowlisted = renderServicePluginGeneratedReplyNotification(
+            event,
+            ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "建议补充测试。"),
+            writeback: ServicePluginWritebackApplyState(configured: true, ok: true, status: "repo_not_allowlisted", skipped: true)
+        )
+        @Expect(notAllowlisted.contains("当前仓库未命中 GCM writebackScope 允许范围，已生成草稿但未写回 GitCode"), true)
+        @Expect(notAllowlisted.contains("\"reason\""), false)
+        @Expect(notAllowlisted.contains("{"), false)
+    }
+
+    @TestCase
+    public func wbScopeP3Reg001DryRunDraftModeStillShowsNotWrittenBack(): Unit {
+        let event = ServicePluginAcceptedGitCodeEvent(repo: "Cangjie/community", kind: "issue", number: "1", url: "https://gitcode.com/Cangjie/community/issues/1")
+        let text = renderServicePluginGeneratedReplyNotification(event, ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "草稿。"))
+        @Expect(text.contains("dryRun=true"), true)
+        @Expect(text.contains("未写回 GitCode"), true)
+        @Expect(text.contains("\"status\""), false)
+        @Expect(text.contains("{"), false)
+    }
+
+    @TestCase
+    public func wbScopeP4E2E001FakeWebhookGeneratedReplyAndPostedWritebackNotifyAllTargets(): Unit {
+        this.resetDispatcherHooks()
+        this.registerGitCodeWritebackPlugin()
+        let calls = ArrayList<String>()
+        let messages = ArrayList<String>()
+        setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent =>
+            this.targetRows([this.target(channel: "telegram", peerId: "tg-peer"), this.target(channel: "feishu", peerId: "fs-peer")])
+        }))
+        setServicePluginWebhookGeneratedReplyHandlerForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent, _target: ServicePluginDeliveryTarget =>
+            ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "建议补充回归测试。")
+        }))
+        setServicePluginCapabilityInvokerForTest(Some({ _registration: ServicePluginRegistration, request: CapabilityInvokeRequest =>
+            calls.add(request.capabilityId)
+            @Expect(request.capabilityId, "gitcode.writeback.apply_result")
+            @Expect(request.payload.contains("Cangjie/cangjie_tools"), true)
+            CapabilityInvokeResult(true, "ok", serviceId: "gitcode-monitor", capabilityId: request.capabilityId, payload: "{\"status\":\"posted\",\"posted\":true,\"replyUrl\":\"https://gitcode.com/Cangjie/cangjie_tools/issues/123#note_9\"}")
+        }))
+        setServicePluginEventDeliveryForTest(Some({ target: ServicePluginDeliveryTarget, text: String =>
+            messages.add("${target.channel}:${text}")
+            ServicePluginEventDeliveryResult(true, "sent")
+        }))
+        try {
+            let result = dispatchServicePluginEvent(this.acceptedContractFrame(), store: ServicePluginPendingJobStore())
+            @Expect(result.ok, true)
+            @Expect(result.status, "generated_reply_delivered")
+            @Expect(result.deliverySuccess, 2)
+            @Expect(calls.size, 1)
+            @Expect(messages.size, 2)
+            for (message in messages) {
+                @Expect(message.contains("GitCode 回复已写回"), true)
+                @Expect(message.contains("https://gitcode.com/Cangjie/cangjie_tools/issues/123#note_9"), true)
+                @Expect(message.contains("\"replyUrl\""), false)
+            }
+        } finally {
+            this.resetDispatcherHooks()
+        }
+    }
+
+    @TestCase
+    public func wbScopeP4E2E002FakeWebhookGeneratedReplyAndDeniedWritebackNotifyDraftOnly(): Unit {
+        this.resetDispatcherHooks()
+        this.registerGitCodeWritebackPlugin()
+        let calls = ArrayList<String>()
+        let messages = ArrayList<String>()
+        setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent =>
+            this.targetRows([this.target(channel: "telegram", peerId: "tg-peer"), this.target(channel: "feishu", peerId: "fs-peer")])
+        }))
+        setServicePluginWebhookGeneratedReplyHandlerForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent, _target: ServicePluginDeliveryTarget =>
+            ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "建议补充回归测试。")
+        }))
+        setServicePluginCapabilityInvokerForTest(Some({ _registration: ServicePluginRegistration, request: CapabilityInvokeRequest =>
+            calls.add(request.capabilityId)
+            CapabilityInvokeResult(true, "ok", serviceId: "gitcode-monitor", capabilityId: request.capabilityId, payload: "{\"status\":\"skipped\",\"posted\":false,\"reason\":\"repo_denied_by_writeback_scope\"}")
+        }))
+        setServicePluginEventDeliveryForTest(Some({ target: ServicePluginDeliveryTarget, text: String =>
+            messages.add("${target.channel}:${text}")
+            ServicePluginEventDeliveryResult(true, "sent")
+        }))
+        try {
+            let result = dispatchServicePluginEvent(this.acceptedContractFrame(), store: ServicePluginPendingJobStore())
+            @Expect(result.ok, true)
+            @Expect(result.status, "generated_reply_delivered")
+            @Expect(result.deliverySuccess, 2)
+            @Expect(calls.size, 1)
+            @Expect(messages.size, 2)
+            for (message in messages) {
+                @Expect(message.contains("该仓库被 GCM writebackScope.deniedRepos 排除，已生成草稿但未写回 GitCode"), true)
+                @Expect(message.contains("建议补充回归测试。"), true)
+                @Expect(message.contains("GitCode 回复已写回"), false)
+                @Expect(message.contains("\"reason\""), false)
+                @Expect(message.contains("{"), false)
+            }
+        } finally {
+            this.resetDispatcherHooks()
+        }
+    }
+
+    @TestCase
     public func tDiag005And006GeneratedReplyNotificationExplainsDegradedContext(): Unit {
         let event = ServicePluginAcceptedGitCodeEvent(repo: "Cangjie/cangjie_tools", kind: "issue", number: "123", url: "https://gitcode.com/Cangjie/cangjie_tools/issues/123")
         let ckb = renderServicePluginGeneratedReplyNotification(event, ServicePluginGeneratedReplyResult(false, status: "ckb_unavailable", diagnostic: "ckb_unavailable", needsHumanReview: true))

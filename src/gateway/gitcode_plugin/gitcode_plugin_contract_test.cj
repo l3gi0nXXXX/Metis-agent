@@ -302,6 +302,19 @@ public class GitCodePluginContractTest {
     }
 
     @TestCase
+    public func wbScopeP3Pos001WebhookStatusRendererShowsWritebackScopeSummary(): Unit {
+        let flat = renderGitCodeWebhookStatusResult("{\"status\":\"ok\",\"receiver\":\"running\",\"listenerStatus\":\"listening\",\"processorStatus\":\"running\",\"publicBaseUrlConfigured\":true,\"writebackAllowedOrgs\":3,\"writebackAllowedRepos\":0,\"writebackDeniedRepos\":1,\"writebackLegacyRepoAllowlist\":2}")
+        @Expect(flat.contains("写回范围：组织 3 个，仓库 0 个，排除仓库 1 个，旧 allowlist 2 个。"), true)
+        @Expect(flat.contains("\"writebackAllowedOrgs\""), false)
+        @Expect(flat.contains("{"), false)
+
+        let nested = renderGitCodeWebhookStatusResult("{\"status\":\"ok\",\"receiver\":\"running\",\"listenerStatus\":\"listening\",\"processorStatus\":\"running\",\"publicBaseUrlConfigured\":true,\"writebackScope\":{\"allowedOrgs\":3,\"allowedRepos\":4,\"deniedRepos\":5,\"legacyRepoAllowlist\":6}}")
+        @Expect(nested.contains("写回范围：组织 3 个，仓库 4 个，排除仓库 5 个，旧 allowlist 6 个。"), true)
+        @Expect(nested.contains("\"writebackScope\""), false)
+        @Expect(nested.contains("{"), false)
+    }
+
+    @TestCase
     public func webhookStatusRendererExplainsPartialLivePayloadWithoutInternalUnknownWords(): Unit {
         let payload = "{\"status\":\"ok\",\"receiver\":\"unknown\",\"listenerLastStatus\":202,\"listenerLastDurationMs\":1,\"healthzCount\":1,\"activeRequestCount\":0,\"pending\":0,\"processing\":0,\"processed\":10,\"deadLetter\":0,\"cancelled\":0,\"lastBatchProcessed\":0,\"lastBatchClaimed\":0,\"emptyTickCount\":482,\"publicBaseUrlConfigured\":true}"
         let text = renderGitCodeWebhookStatusResult(payload)

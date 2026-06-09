@@ -928,12 +928,13 @@ public func renderGitCodeWebhookStatusResult(payload: String): String {
     let errorKindLine = if (errorKind.isEmpty()) { "" } else { "\n错误类型：${errorKind}" }
     let dispatchLine = if (dispatchJson.isEmpty()) { "" } else { "\n投递：${describeGitCodeWebhookDispatch(dispatchJson)}" }
     let subscribersLine = if (subscribersJson.isEmpty()) { "" } else { "\n订阅：${describeGitCodeWebhookSubscribers(subscribersJson)}" }
+    let writebackScopeLine = describeGitCodeWebhookWritebackScope(payload)
     "GitCode Webhook 状态：${describeGitCodeWebhookOverall(status, receiver, listenerLastStatus)}${errorKindLine}\n" +
         "接收端：${describeGitCodeWebhookListener(listenerStatus, bind, listenerLastStatus, listenerLastDurationMs, healthzText, activeRequestCount, listenerHasRuntime, payload.contains("\"activeRequestCount\":"))}\n" +
         "队列：${describeGitCodeWebhookQueue(pending, processing, processed, dead, cancelled)}\n" +
         "处理器：${describeGitCodeWebhookProcessor(processorStatus, lastBatchClaimed, lastBatchProcessed, emptyTickCount, processorHasRuntime)}\n" +
         "状态保存：${describeGitCodeWebhookStateSave(stateSaveStatus, stateSaveDurationMs, stateSaveBytes, auditCount, auditMax)}\n" +
-        "公网地址：${publicBaseUrl}${dispatchLine}${subscribersLine}${if (mergedLastError.isEmpty()) { "" } else { "\n最近错误：${mergedLastError}" }}"
+        "公网地址：${publicBaseUrl}${writebackScopeLine}${dispatchLine}${subscribersLine}${if (mergedLastError.isEmpty()) { "" } else { "\n最近错误：${mergedLastError}" }}"
 }
 
 public func renderGitCodeDeadLetterListResult(payload: String): String {
@@ -1329,6 +1330,43 @@ private func describeGitCodeWebhookSubscribers(raw: String): String {
         return "TG ${tg} 个，Feishu ${feishu} 个，生成草稿通知 ${generatedReplies} 个。"
     }
     "TG ${tg} 个，Feishu ${feishu} 个。"
+}
+
+private func describeGitCodeWebhookWritebackScope(raw: String): String {
+    let direct = describeGitCodeWebhookWritebackScopeObject(jsonObjectField(raw, "writebackScope"))
+    if (!direct.isEmpty()) { return "\n${direct}" }
+    let flat = describeGitCodeWebhookWritebackScopeFlat(raw)
+    if (!flat.isEmpty()) { return "\n${flat}" }
+    let summary = jsonObjectField(raw, "summary")
+    if (summary.isEmpty()) { return "" }
+    let summaryScope = describeGitCodeWebhookWritebackScopeObject(jsonObjectField(summary, "writebackScope"))
+    if (!summaryScope.isEmpty()) { return "\n${summaryScope}" }
+    let summaryFlat = describeGitCodeWebhookWritebackScopeFlat(summary)
+    if (!summaryFlat.isEmpty()) { return "\n${summaryFlat}" }
+    ""
+}
+
+private func describeGitCodeWebhookWritebackScopeObject(raw: String): String {
+    if (raw.isEmpty()) { return "" }
+    let allowedOrgs = jsonIntField(raw, "allowedOrgs", fallback: 0)
+    let allowedRepos = jsonIntField(raw, "allowedRepos", fallback: 0)
+    let deniedRepos = jsonIntField(raw, "deniedRepos", fallback: 0)
+    let legacy = jsonIntField(raw, "legacyRepoAllowlist", fallback: 0)
+    "写回范围：组织 ${allowedOrgs} 个，仓库 ${allowedRepos} 个，排除仓库 ${deniedRepos} 个，旧 allowlist ${legacy} 个。"
+}
+
+private func describeGitCodeWebhookWritebackScopeFlat(raw: String): String {
+    if (!raw.contains("\"writebackAllowedOrgs\"") &&
+        !raw.contains("\"writebackAllowedRepos\"") &&
+        !raw.contains("\"writebackDeniedRepos\"") &&
+        !raw.contains("\"writebackLegacyRepoAllowlist\"")) {
+        return ""
+    }
+    let allowedOrgs = jsonIntField(raw, "writebackAllowedOrgs", fallback: 0)
+    let allowedRepos = jsonIntField(raw, "writebackAllowedRepos", fallback: 0)
+    let deniedRepos = jsonIntField(raw, "writebackDeniedRepos", fallback: 0)
+    let legacy = jsonIntField(raw, "writebackLegacyRepoAllowlist", fallback: 0)
+    "写回范围：组织 ${allowedOrgs} 个，仓库 ${allowedRepos} 个，排除仓库 ${deniedRepos} 个，旧 allowlist ${legacy} 个。"
 }
 
 private func jsonObjectField(raw: String, key: String): String {
