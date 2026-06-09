@@ -377,6 +377,87 @@ private func telegramRepeatedText(size: Int64, chunk!: String = "x"): String {
     sb.toString()
 }
 
+private let telegramAdapterLifecycleLock = Mutex()
+private let telegramStartedAdaptersForTest = ArrayList<TelegramAdapter>()
+
+private func telegramResetAdapterTestOverrides(): Unit {
+    setTelegramTransportRunnerForTest(None)
+    setTelegramAsrRunnerForTest(None)
+    setGatewayOpenClawPluginSidecarRunnerForTest(None)
+}
+
+private func telegramSafeTransportResponseForTest(request: TelegramTransportRequest): TelegramTransportResponse {
+    if (request.context == "get") {
+        if (request.url.contains("/getMe")) {
+            return TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":{\"id\":10001,\"is_bot\":true,\"username\":\"metis_bot\"}}", outcome: "ok")
+        }
+        if (request.url.contains("/getWebhookInfo")) {
+            return TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":{\"url\":\"\",\"pending_update_count\":0}}", outcome: "ok")
+        }
+        if (request.url.contains("/getChat")) {
+            return TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":{\"id\":-1001234567890,\"type\":\"supergroup\",\"title\":\"Metis Test\",\"is_forum\":false}}", outcome: "ok")
+        }
+        if (request.url.contains("/getChatMember")) {
+            return TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":{\"status\":\"administrator\",\"user\":{\"id\":10001,\"is_bot\":true}}}", outcome: "ok")
+        }
+        if (request.url.contains("/getFile")) {
+            return TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":{\"file_path\":\"photos/fake-photo.jpg\",\"file_size\":12}}", outcome: "ok")
+        }
+    }
+    if (request.context == "getUpdates") {
+        return TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":[]}", outcome: "ok")
+    }
+    if (request.context.startsWith("deleteWebhook:") || request.context == "setWebhook" ||
+        request.context == "setMyCommands" || request.context == "setMyCommands:retry" ||
+        request.context == "deleteMyCommands" || request.context == "answerCallbackQuery" ||
+        request.context.startsWith("editMessageReplyMarkup:")) {
+        return TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":true}", outcome: "ok")
+    }
+    if (request.context.startsWith("send:media-group")) {
+        return TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":[{\"message_id\":777}]}", outcome: "ok")
+    }
+    if (request.context.startsWith("send:topic-create")) {
+        return TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":{\"message_thread_id\":42,\"name\":\"Sprint\"}}", outcome: "ok")
+    }
+    if (request.context.startsWith("send:")) {
+        return TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":{\"message_id\":777}}", outcome: "ok")
+    }
+    TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":true}", outcome: "ok")
+}
+
+private func telegramEnsureSafeTransportRunnerForTest(): Unit {
+    if (!hasTelegramTransportRunnerForTest()) {
+        setTelegramTransportRunnerForTest(Some({ request: TelegramTransportRequest => telegramSafeTransportResponseForTest(request) }))
+    }
+}
+
+private func telegramStartAdapterForTest(adapter: TelegramAdapter): Unit {
+    telegramStopStartedAdaptersForTest()
+    telegramEnsureSafeTransportRunnerForTest()
+    adapter.start()
+    synchronized(telegramAdapterLifecycleLock) {
+        telegramStartedAdaptersForTest.add(adapter)
+    }
+}
+
+private func telegramStopStartedAdaptersForTest(): Unit {
+    let adapters = ArrayList<TelegramAdapter>()
+    synchronized(telegramAdapterLifecycleLock) {
+        for (adapter in telegramStartedAdaptersForTest) {
+            adapters.add(adapter)
+        }
+        telegramStartedAdaptersForTest.clear()
+    }
+    for (adapter in adapters) {
+        try {
+            telegramEnsureSafeTransportRunnerForTest()
+            adapter.stop()
+        } catch (_e: Exception) {
+            ()
+        }
+    }
+}
+
 private class TelegramThreadFallbackFakeBotApi {
     public let bodies: ArrayList<String> = ArrayList<String>()
     public var sends: Int64 = 0
@@ -481,9 +562,26 @@ public class TelegramAdapterTest {
     }
 
     public init() {
-        setTelegramTransportRunnerForTest(None)
-        setTelegramAsrRunnerForTest(None)
-        setGatewayOpenClawPluginSidecarRunnerForTest(None)
+        telegramResetAdapterTestOverrides()
+    }
+
+    @BeforeEach
+    public func resetTelegramAdapterStateBeforeEachTest(): Unit {
+        telegramStopStartedAdaptersForTest()
+        telegramResetAdapterTestOverrides()
+        telegramEnsureSafeTransportRunnerForTest()
+    }
+
+    @AfterEach
+    public func cleanupTelegramAdapterStateAfterEachTest(): Unit {
+        telegramStopStartedAdaptersForTest()
+        telegramResetAdapterTestOverrides()
+    }
+
+    @AfterAll
+    public func cleanupTelegramAdapterStateAfterAllTests(): Unit {
+        telegramStopStartedAdaptersForTest()
+        telegramResetAdapterTestOverrides()
     }
 
     @TestCase
@@ -558,7 +656,7 @@ public class TelegramAdapterTest {
             accounts: Some(accounts)
         )
         let adapter = TelegramAdapter(config: cfg)
-        adapter.start()
+        telegramStartAdapterForTest(adapter)
         let payload = "{\"update_id\":251,\"message\":{\"message_id\":11,\"text\":\"hello\",\"chat\":{\"id\":745123456,\"type\":\"private\"},\"from\":{\"id\":\"old-user\"}}}"
 
         let ack = adapter.ingestWebhookPayload(payload)
@@ -586,7 +684,7 @@ public class TelegramAdapterTest {
             accounts: Some(accounts)
         )
         let adapter = TelegramAdapter(config: cfg)
-        adapter.start()
+        telegramStartAdapterForTest(adapter)
         let payload = "{\"update_id\":252,\"message\":{\"message_id\":101,\"text\":\"/status\",\"chat\":{\"id\":-1001234567890,\"type\":\"supergroup\"},\"from\":{\"id\":\"old-user\"}}}"
 
         let ack = adapter.ingestWebhookPayload(payload)
@@ -600,7 +698,7 @@ public class TelegramAdapterTest {
     @TestCase
     public func simulateIncomingTextQueuesTelegramMessages(): Unit {
         let adapter = TelegramAdapter(config: TelegramConfig(enabled: true, botToken: "telegram-token"))
-        adapter.start()
+        telegramStartAdapterForTest(adapter)
         adapter.simulateIncomingText("msg-1", "group:-100123:topic:42", "8734062810", "hello", chatType: ChatType.Group, mentioned: true, threadId: Some("42"))
 
         let inbound = adapter.pullInbound()
@@ -629,7 +727,7 @@ public class TelegramAdapterTest {
     public func fakeInboundTelegramAliasMentionRoutesWriterAndDefaultsOtherwise(): Unit {
         let root = telegramAliasRouteRoot()
         let adapter = TelegramAdapter(config: TelegramConfig(enabled: true, botToken: "telegram-token"))
-        adapter.start()
+        telegramStartAdapterForTest(adapter)
         adapter.simulateIncomingText("msg-default", "group:-100123", "8734062810", "hello team", chatType: ChatType.Group, mentioned: true)
         adapter.simulateIncomingText("msg-slash", "group:-100123", "8734062810", "/agent writer draft this", chatType: ChatType.Group, mentioned: true)
         adapter.simulateIncomingText("msg-mention", "group:-100123", "8734062810", "@writer draft this", chatType: ChatType.Group, mentioned: true)
@@ -652,7 +750,7 @@ public class TelegramAdapterTest {
     public func fakeInboundTelegramInvalidAliasPatternDoesNotCrashOrOverrideDefault(): Unit {
         let root = telegramAliasRouteRoot()
         let adapter = TelegramAdapter(config: TelegramConfig(enabled: true, botToken: "telegram-token"))
-        adapter.start()
+        telegramStartAdapterForTest(adapter)
         adapter.simulateIncomingText("msg-invalid", "group:-100123", "8734062810", "plain message (with invalid literal", chatType: ChatType.Group, mentioned: true)
 
         let inbound = adapter.pullInbound()
@@ -667,7 +765,7 @@ public class TelegramAdapterTest {
     public func fakeInboundTelegramAgentTeamRoutesPrivateGroupTopicMentionAndBroadcast(): Unit {
         let root = telegramAgentTeamRouteRoot()
         let adapter = TelegramAdapter(config: TelegramConfig(enabled: true, botToken: "telegram-token"))
-        adapter.start()
+        telegramStartAdapterForTest(adapter)
         adapter.simulateIncomingText("msg-private", "user:8734062810", "8734062810", "private route", chatType: ChatType.Direct)
         adapter.simulateIncomingText("msg-group", "group:-1001234567890", "8734062810", "group route", chatType: ChatType.Group, mentioned: true)
         adapter.simulateIncomingText("msg-topic", "group:-1001234567890:topic:42", "8734062810", "topic route", chatType: ChatType.Group, mentioned: true, threadId: Some("42"))
@@ -714,7 +812,7 @@ public class TelegramAdapterTest {
             actions: TelegramActionConfig(sendMessage: false)
         )
         let adapter = TelegramAdapter(config: cfg)
-        adapter.start()
+        telegramStartAdapterForTest(adapter)
         let result = adapter.send(OutboundMessage(ChannelType.Telegram, "user:8734062810", "hello"))
         match (result) {
             case SendResult.Success => @Expect(false, true)
@@ -917,7 +1015,7 @@ public class TelegramAdapterTest {
     @TestCase
     public func textEntitiesExpandLinksAndMentionDetectionUsesTelegramEntities(): Unit {
         let adapter = TelegramAdapter(config: TelegramConfig(enabled: true, botToken: "telegram-token", dmPolicy: "open", allowFrom: ["*"]))
-        adapter.start()
+        telegramStartAdapterForTest(adapter)
         let linked = "{\"update_id\":1,\"message\":{\"message_id\":101,\"text\":\"hello @metis_bot see docs\",\"entities\":[{\"type\":\"mention\",\"offset\":6,\"length\":10},{\"type\":\"text_link\",\"offset\":21,\"length\":4,\"url\":\"https://example.com/docs\"}],\"chat\":{\"id\":8734062810,\"type\":\"private\"},\"from\":{\"id\":8734062810}}}"
         @Expect(adapter.ingestWebhookPayload(linked).contains("\"ok\":true"), true)
         let first = adapter.pullInbound()
@@ -947,7 +1045,7 @@ public class TelegramAdapterTest {
             groupRule.put("allowFrom", allowFrom)
             groups.put("-100123", groupRule)
             let adapter = TelegramAdapter(config: TelegramConfig(enabled: true, botToken: "10001:telegram-token", groupPolicy: "allowlist", groups: Some(groups)))
-            adapter.start()
+            telegramStartAdapterForTest(adapter)
             let other = "{\"update_id\":1,\"message\":{\"message_id\":201,\"text\":\"@other_bot hello\",\"entities\":[{\"type\":\"mention\",\"offset\":0,\"length\":10}],\"chat\":{\"id\":-100123,\"type\":\"supergroup\"},\"from\":{\"id\":8734062810}}}"
             @Expect(adapter.ingestWebhookPayload(other).contains("\"ok\":true"), true)
             let first = adapter.pullInbound()
@@ -967,7 +1065,7 @@ public class TelegramAdapterTest {
     @TestCase
     public func inboundTelegramCommandMentionIsNormalizedBeforeGatewayDispatch(): Unit {
         let adapter = TelegramAdapter(config: TelegramConfig(enabled: true, botToken: "telegram-token", dmPolicy: "open", allowFrom: ["*"]))
-        adapter.start()
+        telegramStartAdapterForTest(adapter)
         let payload = "{\"update_id\":1,\"message\":{\"message_id\":101,\"text\":\"/status@metis_bot now\",\"chat\":{\"id\":8734062810,\"type\":\"private\"},\"from\":{\"id\":8734062810}}}"
         let ack = adapter.ingestWebhookPayload(payload)
         @Expect(ack.contains("\"ok\":true"), true)
@@ -1066,7 +1164,7 @@ public class TelegramAdapterTest {
                 pairingRoot: "/tmp/metis-telegram-native-command-start-${DateTime.now().toUnixTimeStamp().toMilliseconds()}"
             )
             let startedAt = DateTime.now().toUnixTimeStamp().toMilliseconds()
-            adapter.start()
+            telegramStartAdapterForTest(adapter)
             let elapsed = DateTime.now().toUnixTimeStamp().toMilliseconds() - startedAt
             @Expect(elapsed < 150, true)
             sleep(Duration.millisecond * 40)
@@ -1237,7 +1335,7 @@ public class TelegramAdapterTest {
             }))
             let adapter = TelegramAdapter(config: TelegramConfig(enabled: true, botToken: "telegram-token"))
             try {
-                adapter.start()
+                telegramStartAdapterForTest(adapter)
                 let message = OutboundMessage(ChannelType.Telegram, "user:8734062810", "hello")
                 @Expect(adapter.sendWithMessageId(message), "")
                 match (adapter.send(message)) {
@@ -1283,7 +1381,7 @@ public class TelegramAdapterTest {
                 )
             )
             let adapter = TelegramAdapter(config: cfg, pairingRoot: root)
-            adapter.start()
+            telegramStartAdapterForTest(adapter)
             sleep(Duration.millisecond * 80)
 
             let polled = adapter.pullInbound()
@@ -1495,7 +1593,7 @@ public class TelegramAdapterTest {
             )
 
             let startedAtMs = DateTime.now().toUnixTimeStamp().toMilliseconds()
-            adapter.start()
+            telegramStartAdapterForTest(adapter)
             let elapsedMs = DateTime.now().toUnixTimeStamp().toMilliseconds() - startedAtMs
             @Expect(elapsedMs < 120, true)
 
@@ -1569,7 +1667,7 @@ public class TelegramAdapterTest {
                 config: TelegramConfig(enabled: true, botToken: "123456:FAKE", dmPolicy: "open", allowFrom: ["*"]),
                 pairingRoot: root
             )
-            adapter.start()
+            telegramStartAdapterForTest(adapter)
             sleep(Duration.millisecond * 90)
 
             let polled = adapter.pullInbound()
@@ -1615,7 +1713,7 @@ public class TelegramAdapterTest {
             }
 
             let adapter = TelegramAdapter(config: TelegramConfig(enabled: true, botToken: "123456:SECRET"))
-            adapter.start()
+            telegramStartAdapterForTest(adapter)
             let result = adapter.send(
                 OutboundMessage(ChannelType.Telegram, "user:8734062810", "hello")
             )
@@ -1730,7 +1828,7 @@ public class TelegramAdapterTest {
             config: TelegramConfig(enabled: true, botToken: "telegram-token", reactionNotifications: "all"),
             pairingRoot: root.toString()
         )
-        adapter.start()
+        telegramStartAdapterForTest(adapter)
         let ack = adapter.ingestWebhookPayload(
             "{\"update_id\":42,\"message\":{\"message_id\":101,\"text\":\"hello\",\"chat\":{\"id\":8734062810,\"type\":\"private\"},\"from\":{\"id\":8734062810}}}"
         )
@@ -2381,7 +2479,7 @@ public class TelegramAdapterTest {
     @TestCase
     public func webhookTopicMessagesPreserveTopicScopedPeerAndThreadMetadata(): Unit {
         let adapter = TelegramAdapter(config: TelegramConfig(enabled: true, botToken: "telegram-token"))
-        adapter.start()
+        telegramStartAdapterForTest(adapter)
         let payload = "{\"update_id\":1,\"message\":{\"message_id\":101,\"message_thread_id\":42,\"text\":\"/status\",\"chat\":{\"id\":-1001234567890,\"type\":\"supergroup\"},\"from\":{\"id\":8734062810},\"reply_to_message\":{\"message_id\":88}}}"
         let ack = adapter.ingestWebhookPayload(payload)
         @Expect(ack.contains("\"ok\":true"), true)
@@ -2406,7 +2504,7 @@ public class TelegramAdapterTest {
             allowFrom: ["8734062810"]
         )
         let adapter = TelegramAdapter(config: cfg)
-        adapter.start()
+        telegramStartAdapterForTest(adapter)
         let deniedPayload = "{\"update_id\":1,\"message\":{\"message_id\":11,\"text\":\"hello\",\"chat\":{\"id\":745123456,\"type\":\"private\"},\"from\":{\"id\":745123456}}}"
         let allowedPayload = "{\"update_id\":2,\"message\":{\"message_id\":12,\"text\":\"hello\",\"chat\":{\"id\":8734062810,\"type\":\"private\"},\"from\":{\"id\":8734062810}}}"
 
@@ -2436,7 +2534,7 @@ public class TelegramAdapterTest {
             allowFrom: ["8734062810"]
         )
         let adapter = TelegramAdapter(config: cfg)
-        adapter.start()
+        telegramStartAdapterForTest(adapter)
         let payload = "{\"update_id\":31,\"message\":{\"message_id\":11,\"text\":\"hello\",\"chat\":{\"id\":745123456,\"type\":\"private\"},\"from\":{\"id\":745123456}}}"
         let ack = adapter.ingestWebhookPayload(payload)
         @Expect(ack.contains("\"ignored\":true"), true)
@@ -2458,7 +2556,7 @@ public class TelegramAdapterTest {
             groupPolicy: "disabled"
         )
         let adapter = TelegramAdapter(config: cfg)
-        adapter.start()
+        telegramStartAdapterForTest(adapter)
         let payload = "{\"update_id\":1,\"message\":{\"message_id\":101,\"text\":\"/status\",\"chat\":{\"id\":-1001234567890,\"type\":\"supergroup\"},\"from\":{\"id\":8734062810}}}"
         let ack = adapter.ingestWebhookPayload(payload)
         @Expect(ack.contains("\"ignored\":true"), true)
@@ -2473,7 +2571,7 @@ public class TelegramAdapterTest {
             groupPolicy: "open"
         )
         let adapter = TelegramAdapter(config: cfg)
-        adapter.start()
+        telegramStartAdapterForTest(adapter)
         let payload = "{\"update_id\":32,\"message\":{\"message_id\":101,\"text\":\"status\",\"chat\":{\"id\":-1001234567890,\"type\":\"supergroup\"},\"from\":{\"id\":8734062810}}}"
         let ack = adapter.ingestWebhookPayload(payload)
         @Expect(ack.contains("\"ignored\":true"), true)
@@ -2496,7 +2594,7 @@ public class TelegramAdapterTest {
             groupHistoryLimit: 2
         )
         let adapter = TelegramAdapter(config: cfg)
-        adapter.start()
+        telegramStartAdapterForTest(adapter)
         let silent = "{\"update_id\":41,\"message\":{\"message_id\":201,\"text\":\"background context\",\"chat\":{\"id\":-1001234567890,\"type\":\"supergroup\"},\"from\":{\"id\":8734062810}}}"
         @Expect(adapter.ingestWebhookPayload(silent).contains("\"ignored\":true"), true)
         @Expect(adapter.pullInbound().isEmpty(), true)
@@ -2533,7 +2631,7 @@ public class TelegramAdapterTest {
                 groupHistoryEnabled: true
             )
             let adapter = TelegramAdapter(config: cfg)
-            adapter.start()
+            telegramStartAdapterForTest(adapter)
             let silent = "{\"update_id\":49,\"message\":{\"message_id\":201,\"text\":\"background context\",\"chat\":{\"id\":-1001234567890,\"type\":\"supergroup\"},\"from\":{\"id\":8734062810}}}"
             @Expect(adapter.ingestWebhookPayload(silent).contains("\"ignored\":true"), true)
             @Expect(adapter.pullInbound().isEmpty(), true)
@@ -2551,7 +2649,7 @@ public class TelegramAdapterTest {
     @TestCase
     public func editedAndChannelPostPolicyDiagnosticsPreserveTelegramUpdateKind(): Unit {
         let adapter = TelegramAdapter(config: TelegramConfig(enabled: true, botToken: "telegram-token", groupPolicy: "disabled"))
-        adapter.start()
+        telegramStartAdapterForTest(adapter)
 
         let editedPayload = "{\"update_id\":33,\"edited_message\":{\"message_id\":101,\"text\":\"/status\",\"chat\":{\"id\":-1001234567890,\"type\":\"supergroup\"},\"from\":{\"id\":8734062810}}}"
         let editedAck = adapter.ingestWebhookPayload(editedPayload)
@@ -2572,7 +2670,7 @@ public class TelegramAdapterTest {
     @TestCase
     public func topicServiceMessageIsIgnoredWithVisibleInboundPolicyReason(): Unit {
         let adapter = TelegramAdapter(config: TelegramConfig(enabled: true, botToken: "telegram-token", groupPolicy: "open"))
-        adapter.start()
+        telegramStartAdapterForTest(adapter)
         let payload = "{\"update_id\":35,\"message\":{\"message_id\":103,\"message_thread_id\":42,\"forum_topic_created\":{\"name\":\"topic\"},\"chat\":{\"id\":-1001234567890,\"type\":\"supergroup\"},\"from\":{\"id\":8734062810}}}"
         let ack = adapter.ingestWebhookPayload(payload)
         @Expect(ack.contains("\"ignored\":true"), true)
@@ -2595,7 +2693,7 @@ public class TelegramAdapterTest {
             groupAllowFrom: ["8734062810"]
         )
         let adapter = TelegramAdapter(config: cfg)
-        adapter.start()
+        telegramStartAdapterForTest(adapter)
         let payload = "{\"update_id\":1,\"message\":{\"message_id\":101,\"text\":\"@bot status\",\"chat\":{\"id\":-1001234567890,\"type\":\"supergroup\"},\"from\":{\"id\":8734062810}}}"
         let ack = adapter.ingestWebhookPayload(payload)
         @Expect(ack.contains("\"ignored\":true"), true)
@@ -2618,7 +2716,7 @@ public class TelegramAdapterTest {
             groups: Some(groups)
         )
         let adapter = TelegramAdapter(config: cfg)
-        adapter.start()
+        telegramStartAdapterForTest(adapter)
         let payload = "{\"update_id\":1,\"message\":{\"message_id\":101,\"message_thread_id\":42,\"text\":\"status\",\"chat\":{\"id\":-1001234567890,\"type\":\"supergroup\"},\"from\":{\"id\":8734062810}}}"
         let ack = adapter.ingestWebhookPayload(payload)
         @Expect(ack.contains("\"ok\":true"), true)
@@ -2654,7 +2752,7 @@ public class TelegramAdapterTest {
                 groups: Some(groups)
             )
         )
-        adapter.start()
+        telegramStartAdapterForTest(adapter)
         let allowedPayload = "{\"update_id\":11,\"message\":{\"message_id\":201,\"message_thread_id\":42,\"text\":\"status\",\"chat\":{\"id\":-1001234567890,\"type\":\"supergroup\"},\"from\":{\"id\":222}}}"
         let allowedAck = adapter.ingestWebhookPayload(allowedPayload)
         @Expect(allowedAck.contains("\"ok\":true"), true)
@@ -2696,7 +2794,7 @@ public class TelegramAdapterTest {
                 groups: Some(groups)
             )
         )
-        adapter.start()
+        telegramStartAdapterForTest(adapter)
         let payload = "{\"update_id\":51,\"message\":{\"message_id\":301,\"message_thread_id\":42,\"text\":\"status\",\"chat\":{\"id\":-1001234567890,\"type\":\"supergroup\"},\"from\":{\"id\":222}}}"
         @Expect(adapter.ingestWebhookPayload(payload).contains("\"ok\":true"), true)
         let inbound = adapter.pullInbound()
@@ -2733,7 +2831,7 @@ public class TelegramAdapterTest {
                 groups: Some(groups)
             )
         )
-        adapter.start()
+        telegramStartAdapterForTest(adapter)
         let payload = "{\"update_id\":1,\"message\":{\"message_id\":101,\"message_thread_id\":42,\"caption\":\"hello photo\",\"photo\":[{\"file_id\":\"small\"},{\"file_id\":\"large\"}],\"chat\":{\"id\":-1001234567890,\"type\":\"supergroup\"},\"from\":{\"id\":8734062810}}}"
         let ack = adapter.ingestWebhookPayload(payload)
         @Expect(ack.contains("\"ok\":true"), true)
@@ -2766,7 +2864,7 @@ public class TelegramAdapterTest {
                 allowFrom: ["*"]
             )
         )
-        adapter.start()
+        telegramStartAdapterForTest(adapter)
         let payload = "{\"update_id\":1,\"message\":{\"message_id\":202,\"text\":\"保存图片\",\"chat\":{\"id\":745123456,\"type\":\"private\"},\"from\":{\"id\":745123456}}}"
         let ack = adapter.ingestWebhookPayload(payload)
         @Expect(ack.contains("\"ok\":true"), true)
@@ -2805,7 +2903,7 @@ public class TelegramAdapterTest {
                 ),
                 pairingRoot: root.toString()
             )
-            adapter.start()
+            telegramStartAdapterForTest(adapter)
             let result = adapter.send(OutboundMessage(ChannelType.Telegram, "user:745123456", "图片已经保存"))
             match (result) {
                 case SendResult.Success => ()
@@ -2830,7 +2928,7 @@ public class TelegramAdapterTest {
                 media: TelegramMediaConfig(downloadEnabled: false)
             )
         )
-        adapter.start()
+        telegramStartAdapterForTest(adapter)
         let payload = "{\"update_id\":1,\"message\":{\"message_id\":101,\"sticker\":{\"file_id\":\"sticker-file-id\",\"emoji\":\"🙂\",\"set_name\":\"metis_pack\",\"is_animated\":false,\"is_video\":false},\"chat\":{\"id\":745123456,\"type\":\"private\"},\"from\":{\"id\":745123456}}}"
         let ack = adapter.ingestWebhookPayload(payload)
         @Expect(ack.contains("\"ok\":true"), true)
@@ -2862,7 +2960,7 @@ public class TelegramAdapterTest {
                 media: TelegramMediaConfig(downloadEnabled: false)
             )
         )
-        adapter.start()
+        telegramStartAdapterForTest(adapter)
         let payload = "{\"update_id\":1,\"message\":{\"message_id\":102,\"caption\":\"report\",\"media_group_id\":\"album-1\",\"document\":{\"file_id\":\"doc-file-id\",\"file_unique_id\":\"doc-unique\",\"mime_type\":\"application/pdf\",\"file_size\":1024,\"file_name\":\"report.pdf\"},\"chat\":{\"id\":745123456,\"type\":\"private\"},\"from\":{\"id\":745123456}}}"
         let ack = adapter.ingestWebhookPayload(payload)
         @Expect(ack.contains("\"ok\":true"), true)
@@ -2907,7 +3005,7 @@ public class TelegramAdapterTest {
                     )
                 )
             )
-            adapter.start()
+            telegramStartAdapterForTest(adapter)
             let payload = "{\"update_id\":1,\"message\":{\"message_id\":303,\"document\":{\"file_id\":\"doc-file-id\",\"mime_type\":\"application/pdf\",\"file_size\":1024,\"file_name\":\"report.pdf\"},\"chat\":{\"id\":745123456,\"type\":\"private\"},\"from\":{\"id\":745123456}}}"
             let ack = adapter.ingestWebhookPayload(payload)
             @Expect(ack.contains("\"ok\":true"), true)
@@ -3133,7 +3231,7 @@ public class TelegramAdapterTest {
                 allowFrom: ["*"]
             )
         )
-        adapter.start()
+        telegramStartAdapterForTest(adapter)
         try {
             let payload = "{\"update_id\":1,\"message\":{\"message_id\":202,\"text\":\"save this\",\"reply_to_message\":{\"message_id\":201,\"photo\":[{\"file_id\":\"reply-small\"},{\"file_id\":\"reply-large\"}],\"chat\":{\"id\":745123456,\"type\":\"private\"},\"from\":{\"id\":745123456}},\"chat\":{\"id\":745123456,\"type\":\"private\"},\"from\":{\"id\":745123456}}}"
             let ack = adapter.ingestWebhookPayload(payload)
@@ -3165,7 +3263,7 @@ public class TelegramAdapterTest {
                 allowFrom: ["*"]
             )
         )
-        adapter.start()
+        telegramStartAdapterForTest(adapter)
         let first = "{\"update_id\":1,\"message\":{\"message_id\":301,\"caption\":\"album caption\",\"media_group_id\":\"album-1\",\"photo\":[{\"file_id\":\"p1-small\"},{\"file_id\":\"p1-large\"}],\"chat\":{\"id\":745123456,\"type\":\"private\"},\"from\":{\"id\":745123456}}}"
         let second = "{\"update_id\":2,\"message\":{\"message_id\":302,\"media_group_id\":\"album-1\",\"photo\":[{\"file_id\":\"p2-small\"},{\"file_id\":\"p2-large\"}],\"chat\":{\"id\":745123456,\"type\":\"private\"},\"from\":{\"id\":745123456}}}"
         @Expect(adapter.ingestWebhookPayload(first).contains("\"ok\":true"), true)
@@ -3212,7 +3310,7 @@ public class TelegramAdapterTest {
                 ),
                 pairingRoot: root.toString()
             )
-            adapter.start()
+            telegramStartAdapterForTest(adapter)
             let first = "{\"update_id\":1,\"message\":{\"message_id\":401,\"caption\":\"album caption\",\"media_group_id\":\"album-limit\",\"photo\":[{\"file_id\":\"too-large\",\"file_size\":40}],\"chat\":{\"id\":745123456,\"type\":\"private\"},\"from\":{\"id\":745123456}}}"
             let second = "{\"update_id\":2,\"message\":{\"message_id\":402,\"media_group_id\":\"album-limit\",\"photo\":[{\"file_id\":\"allowed\",\"file_size\":12}],\"chat\":{\"id\":745123456,\"type\":\"private\"},\"from\":{\"id\":745123456}}}"
             @Expect(adapter.ingestWebhookPayload(first).contains("\"ok\":true"), true)
@@ -3253,7 +3351,7 @@ public class TelegramAdapterTest {
                 media: TelegramMediaConfig(downloadEnabled: false)
             )
         )
-        adapter.start()
+        telegramStartAdapterForTest(adapter)
         let first = "{\"update_id\":1,\"message\":{\"message_id\":311,\"caption\":\"album caption\",\"media_group_id\":\"album-cross\",\"photo\":[{\"file_id\":\"p1-small\"},{\"file_id\":\"p1-large\"}],\"chat\":{\"id\":745123456,\"type\":\"private\"},\"from\":{\"id\":745123456}}}"
         let second = "{\"update_id\":2,\"message\":{\"message_id\":312,\"media_group_id\":\"album-cross\",\"photo\":[{\"file_id\":\"p2-small\"},{\"file_id\":\"p2-large\"}],\"chat\":{\"id\":745123456,\"type\":\"private\"},\"from\":{\"id\":745123456}}}"
         @Expect(adapter.ingestWebhookPayload(first).contains("\"ok\":true"), true)
@@ -3286,7 +3384,7 @@ public class TelegramAdapterTest {
                 ),
                 pairingRoot: root.toString()
             )
-            adapter.start()
+            telegramStartAdapterForTest(adapter)
             let payload = "{\"update_id\":1,\"message\":{\"message_id\":502,\"text\":\"save external\",\"external_reply\":{\"message_id\":501,\"caption\":\"external photo\",\"photo\":[{\"file_id\":\"external-small\"},{\"file_id\":\"external-large\"}],\"from\":{\"id\":111,\"username\":\"source_user\"}},\"chat\":{\"id\":745123456,\"type\":\"private\"},\"from\":{\"id\":745123456}}}"
             @Expect(adapter.ingestWebhookPayload(payload).contains("\"ok\":true"), true)
 
@@ -3309,7 +3407,7 @@ public class TelegramAdapterTest {
     @TestCase
     public func telegramTextBurstDoesNotMergeNonAdjacentMessageIds(): Unit {
         let adapter = TelegramAdapter(config: TelegramConfig(enabled: true, botToken: "telegram-token", dmPolicy: "open", allowFrom: ["*"]))
-        adapter.start()
+        telegramStartAdapterForTest(adapter)
         let first = "{\"update_id\":1,\"message\":{\"message_id\":601,\"text\":\"first\",\"chat\":{\"id\":745123456,\"type\":\"private\"},\"from\":{\"id\":745123456}}}"
         let second = "{\"update_id\":2,\"message\":{\"message_id\":610,\"text\":\"second\",\"chat\":{\"id\":745123456,\"type\":\"private\"},\"from\":{\"id\":745123456}}}"
         @Expect(adapter.ingestWebhookPayload(first).contains("\"ok\":true"), true)
@@ -3330,7 +3428,7 @@ public class TelegramAdapterTest {
                 allowFrom: ["*"]
             )
         )
-        adapter.start()
+        telegramStartAdapterForTest(adapter)
         let payload = "{\"update_id\":1,\"message\":{\"message_id\":401,\"text\":\"where was this?\",\"reply_to_message\":{\"message_id\":400,\"text\":\"meet here\",\"chat\":{\"id\":745123456,\"type\":\"private\"},\"from\":{\"id\":745123456}},\"location\":{\"latitude\":31.2304,\"longitude\":121.4737},\"chat\":{\"id\":745123456,\"type\":\"private\"},\"from\":{\"id\":745123456}}}"
         @Expect(adapter.ingestWebhookPayload(payload).contains("\"ok\":true"), true)
         let inbound = adapter.pullInbound()
@@ -3355,7 +3453,7 @@ public class TelegramAdapterTest {
                 allowFrom: ["*"]
             )
         )
-        adapter.start()
+        telegramStartAdapterForTest(adapter)
         let payload = "{\"update_id\":1,\"message\":{\"message_id\":402,\"text\":\"context\",\"forward_origin\":{\"type\":\"channel\",\"chat\":{\"id\":-1001,\"type\":\"channel\",\"title\":\"Announcements\"}},\"venue\":{\"title\":\"Office\",\"address\":\"Road 1\",\"location\":{\"latitude\":31.23,\"longitude\":121.47}},\"contact\":{\"first_name\":\"Ada\",\"last_name\":\"Lovelace\",\"phone_number\":\"123\",\"user_id\":888},\"chat\":{\"id\":745123456,\"type\":\"private\"},\"from\":{\"id\":745123456}}}"
         @Expect(adapter.ingestWebhookPayload(payload).contains("\"ok\":true"), true)
         let inbound = adapter.pullInbound()
@@ -3376,7 +3474,7 @@ public class TelegramAdapterTest {
                 allowFrom: ["*"]
             )
         )
-        adapter.start()
+        telegramStartAdapterForTest(adapter)
         let first = "{\"update_id\":1,\"message\":{\"message_id\":501,\"text\":\"first fragment\",\"chat\":{\"id\":745123456,\"type\":\"private\"},\"from\":{\"id\":745123456}}}"
         let second = "{\"update_id\":2,\"message\":{\"message_id\":502,\"text\":\"second fragment\",\"chat\":{\"id\":745123456,\"type\":\"private\"},\"from\":{\"id\":745123456}}}"
         @Expect(adapter.ingestWebhookPayload(first).contains("\"ok\":true"), true)
@@ -3401,7 +3499,7 @@ public class TelegramAdapterTest {
                     allowFrom: ["*"]
                 )
             )
-            adapter.start()
+            telegramStartAdapterForTest(adapter)
             let sb1 = StringBuilder()
             let sb2 = StringBuilder()
             for (_ in 0..3600) {
@@ -3438,7 +3536,7 @@ public class TelegramAdapterTest {
                     allowFrom: ["*"]
                 )
             )
-            adapter.start()
+            telegramStartAdapterForTest(adapter)
             let first = "{\"update_id\":1,\"message\":{\"message_id\":701,\"text\":\"forward one\",\"forward_origin\":{\"type\":\"channel\",\"chat\":{\"id\":-1001,\"type\":\"channel\",\"title\":\"Announcements\"}},\"chat\":{\"id\":745123456,\"type\":\"private\"},\"from\":{\"id\":745123456}}}"
             let second = "{\"update_id\":2,\"message\":{\"message_id\":702,\"text\":\"forward two\",\"forward_origin\":{\"type\":\"channel\",\"chat\":{\"id\":-1001,\"type\":\"channel\",\"title\":\"Announcements\"}},\"chat\":{\"id\":745123456,\"type\":\"private\"},\"from\":{\"id\":745123456}}}"
             @Expect(adapter.ingestWebhookPayload(first).contains("\"ok\":true"), true)
@@ -3500,7 +3598,7 @@ public class TelegramAdapterTest {
             ),
             pairingRoot: root
         )
-        adapter.start()
+        telegramStartAdapterForTest(adapter)
         let payload = "{\"update_id\":1,\"message\":{\"message_id\":11,\"text\":\"hello\",\"chat\":{\"id\":745123456,\"type\":\"private\"},\"from\":{\"id\":745123456}}}"
         let firstAck = adapter.ingestWebhookPayload(payload)
         @Expect(firstAck.contains("\"ignored\":true"), true)
@@ -3554,7 +3652,7 @@ public class TelegramAdapterTest {
             ),
             pairingRoot: "/tmp/metis-telegram-polling-basic-${DateTime.now().toUnixTimeStamp().toMilliseconds()}"
         )
-        adapter.start()
+        telegramStartAdapterForTest(adapter)
         let raw = "{\"ok\":true,\"result\":[{\"update_id\":99,\"message\":{\"message_id\":21,\"text\":\"Hi\",\"chat\":{\"id\":745123456,\"type\":\"private\"},\"from\":{\"id\":745123456}}}]}"
         @Expect(adapter.debugIngestPollingResponse(raw), 1)
         let inbound = adapter.pullInbound()
@@ -3767,7 +3865,7 @@ public class TelegramAdapterTest {
                 )
             )
             adapter.debugSetPollingWatchdogForTest(25, 5)
-            adapter.start()
+            telegramStartAdapterForTest(adapter)
             sleep(Duration.millisecond * 80)
             let snapshot = adapter.debugBuildPollingDiagnosticSnapshot()
             @Expect(snapshot.get("watchdogRestartCount").getOrThrow().asInt().getValue() >= 1, true)
@@ -3807,6 +3905,26 @@ public class TelegramAdapterTest {
         @Expect(ingests.size, 0)
         let snapshot = runner.diagnostics()
         @Expect(snapshot.get("watchdogRestartCount").getOrThrow().asInt().getValue() >= 1, true)
+    }
+
+    @TestCase
+    public func pollingRunnerYieldsBetweenImmediateEmptyResults(): Unit {
+        let fetchStartedAtMs = ArrayList<Int64>()
+        let runner = TelegramPollingRunner(
+            { =>
+                fetchStartedAtMs.add(DateTime.now().toUnixTimeStamp().toMilliseconds())
+                "{\"ok\":true,\"result\":[]}"
+            },
+            { _raw: String => 0 },
+            { => true },
+            idleDelayMs: 20
+        )
+        runner.start()
+        sleep(Duration.millisecond * 75)
+        runner.stop()
+
+        @Expect(fetchStartedAtMs.size >= 2, true)
+        @Expect(fetchStartedAtMs.size <= 8, true)
     }
 
     @TestCase
@@ -3911,7 +4029,7 @@ public class TelegramAdapterTest {
                     proxy: "http://127.0.0.1:7897"
                 )
             )
-            adapter.start()
+            telegramStartAdapterForTest(adapter)
             let messageId = adapter.sendWithMessageId(
                 OutboundMessage(ChannelType.Telegram, "user:8734062810", "hello")
             )
@@ -4188,7 +4306,7 @@ public class TelegramAdapterTest {
                 )
             }))
             let adapter = TelegramAdapter(config: TelegramConfig(enabled: true, botToken: "123456:SECRET"))
-            adapter.start()
+            telegramStartAdapterForTest(adapter)
             let messageId = adapter.sendWithMessageId(
                 OutboundMessage(ChannelType.Telegram, "user:8734062810", "<b>& hello</b>")
             )
@@ -4224,7 +4342,7 @@ public class TelegramAdapterTest {
                     proxy: "http://user:pass@127.0.0.1:7897"
                 )
             )
-            adapter.start()
+            telegramStartAdapterForTest(adapter)
             let result = adapter.send(
                 OutboundMessage(ChannelType.Telegram, "user:8734062810", "hello")
             )
@@ -4278,7 +4396,7 @@ public class TelegramAdapterTest {
             actions: TelegramActionConfig(sendMessage: true, poll: false)
         )
         let adapter = TelegramAdapter(config: cfg)
-        adapter.start()
+        telegramStartAdapterForTest(adapter)
         let result = adapter.send(
             OutboundMessage(
                 ChannelType.Telegram,
@@ -4345,7 +4463,7 @@ public class TelegramAdapterTest {
         )
         @Expect(anonymousPayloads[0].asObject().get("is_anonymous").getOrThrow().asBool().getValue(), true)
 
-        adapter.start()
+        telegramStartAdapterForTest(adapter)
         let invalid = adapter.send(
             OutboundMessage(
                 ChannelType.Telegram,
@@ -4368,7 +4486,7 @@ public class TelegramAdapterTest {
                 actions: TelegramActionConfig(poll: true)
             )
         )
-        adapter.start()
+        telegramStartAdapterForTest(adapter)
         let result = adapter.send(
             OutboundMessage(
                 ChannelType.Telegram,
@@ -4460,7 +4578,7 @@ public class TelegramAdapterTest {
                     actions: TelegramActionConfig(pinMessage: true, unpinMessage: true)
                 )
             )
-            adapter.start()
+            telegramStartAdapterForTest(adapter)
             let pinResult = adapter.send(
                 OutboundMessage(ChannelType.Telegram, "user:8734062810", "[pin]", replyToMessageId: Some("88"))
             )
@@ -4609,7 +4727,7 @@ public class TelegramAdapterTest {
                 config: TelegramConfig(enabled: true, botToken: "telegram-token"),
                 pairingRoot: root.toString()
             )
-            adapter.start()
+            telegramStartAdapterForTest(adapter)
             let sentId = adapter.sendWithMessageId(
                 OutboundMessage(ChannelType.Telegram, "user:8734062810", "hello", replyToMessageId: Some("44"))
             )
@@ -4638,7 +4756,7 @@ public class TelegramAdapterTest {
                     actions: TelegramActionConfig(reactions: true)
                 )
             )
-            adapter.start()
+            telegramStartAdapterForTest(adapter)
             let sentId = adapter.sendWithMessageId(
                 OutboundMessage(ChannelType.Telegram, "user:8734062810", "reply", replyToMessageId: Some("77"))
             )
@@ -4667,7 +4785,7 @@ public class TelegramAdapterTest {
                     network: TelegramNetworkConfig(autoSelectFamily: false, dnsResultOrder: "verbatim")
                 )
             )
-            adapter.start()
+            telegramStartAdapterForTest(adapter)
             let sentId = adapter.sendWithMessageId(OutboundMessage(ChannelType.Telegram, "user:8734062810", "hello"))
             @Expect(sentId, "900")
             @Expect(seen.size > 0, true)
@@ -4689,7 +4807,7 @@ public class TelegramAdapterTest {
         setTelegramTransportRunnerForTest(Some({ request => fake.handle(request) }))
         try {
             let adapter = TelegramAdapter(config: TelegramConfig(enabled: true, botToken: "telegram-token"))
-            adapter.start()
+            telegramStartAdapterForTest(adapter)
             let result = adapter.send(
                 OutboundMessage(ChannelType.Telegram, "user:8734062810", "[chat-action]\naction=typing")
             )
@@ -4716,7 +4834,7 @@ public class TelegramAdapterTest {
                     actions: TelegramActionConfig(editMessage: true)
                 )
             )
-            adapter.start()
+            telegramStartAdapterForTest(adapter)
             let result = adapter.send(
                 OutboundMessage(ChannelType.Telegram, "user:8734062810", "[draft]\npreview=Working\nfinal=Done")
             )
@@ -4737,7 +4855,7 @@ public class TelegramAdapterTest {
         setTelegramTransportRunnerForTest(Some({ request => fake.handle(request) }))
         try {
             let adapter = TelegramAdapter(config: TelegramConfig(enabled: true, botToken: "telegram-token"))
-            adapter.start()
+            telegramStartAdapterForTest(adapter)
             let first = adapter.send(OutboundMessage(ChannelType.Telegram, "user:8734062810", "[chat-action]\naction=typing"))
             match (first) {
                 case SendResult.Success => @Expect("failed", "first-send")
@@ -4927,7 +5045,7 @@ public class TelegramAdapterTest {
                     media: TelegramMediaConfig(outboundAllowLocalPath: true, outboundLocalRoots: [root.toString()])
                 )
             )
-            adapter.start()
+            telegramStartAdapterForTest(adapter)
             let result = adapter.send(OutboundMessage(ChannelType.Telegram, "user:8734062810", "[photo]\nfileId=${gifPath.toString()}\ncaption=gif"))
             match (result) {
                 case SendResult.Success => ()
@@ -4958,7 +5076,7 @@ public class TelegramAdapterTest {
                     media: TelegramMediaConfig(outboundAllowLocalPath: true, outboundLocalRoots: [root.toString()])
                 )
             )
-            adapter.start()
+            telegramStartAdapterForTest(adapter)
             let result = adapter.send(OutboundMessage(ChannelType.Telegram, "user:8734062810", "[voice]\nfileId=${mp3Path.toString()}\ncaption=memo"))
             match (result) {
                 case SendResult.Success => ()
@@ -4984,7 +5102,7 @@ public class TelegramAdapterTest {
                     actions: TelegramActionConfig(voice: true, sendMessage: true)
                 )
             )
-            adapter.start()
+            telegramStartAdapterForTest(adapter)
             let id = adapter.sendWithMessageId(
                 OutboundMessage(ChannelType.Telegram, "user:8734062810", "[voice]\nfileId=voice-file-id\ncaption=voice fallback text")
             )
@@ -5093,7 +5211,7 @@ public class TelegramAdapterTest {
             let adapter = TelegramAdapter(
                 config: TelegramConfig(enabled: true, botToken: "telegram-token", replyToMode: "thread")
             )
-            adapter.start()
+            telegramStartAdapterForTest(adapter)
             let id = adapter.sendWithMessageId(
                 OutboundMessage(ChannelType.Telegram, "group:-1001234567890:topic:42", "hello topic", replyInThread: true)
             )
@@ -5115,7 +5233,7 @@ public class TelegramAdapterTest {
                 actions: TelegramActionConfig(photo: true)
             )
         )
-        adapter.start()
+        telegramStartAdapterForTest(adapter)
         let result = adapter.send(OutboundMessage(ChannelType.Telegram, "user:8734062810", "[photo]\nfileId=https://example.test/photo.jpg"))
         match (result) {
             case SendResult.Success => @Expect(false, true)
@@ -5166,7 +5284,7 @@ public class TelegramAdapterTest {
                     )
                 )
             )
-            adapter.start()
+            telegramStartAdapterForTest(adapter)
             let result = adapter.send(
                 OutboundMessage(ChannelType.Telegram, "user:8734062810", "[photo]\nfileId=https://cdn.example.test/photo.png\ncaption=remote")
             )
@@ -5207,7 +5325,7 @@ public class TelegramAdapterTest {
                     )
                 )
             )
-            adapter.start()
+            telegramStartAdapterForTest(adapter)
             let deniedDomain = adapter.send(OutboundMessage(ChannelType.Telegram, "user:8734062810", "[photo]\nfileId=https://evil.example/photo.png"))
             match (deniedDomain) {
                 case SendResult.Success => @Expect(false, true)
@@ -5259,7 +5377,7 @@ public class TelegramAdapterTest {
                     media: TelegramMediaConfig(outboundAllowLocalPath: false)
                 )
             )
-            adapter.start()
+            telegramStartAdapterForTest(adapter)
             let result = adapter.send(OutboundMessage(ChannelType.Telegram, "user:8734062810", "[document]\nfileId=/tmp/report.pdf"))
             match (result) {
                 case SendResult.Success => @Expect(false, true)
@@ -5288,7 +5406,7 @@ public class TelegramAdapterTest {
                     media: TelegramMediaConfig(outboundAllowLocalPath: true, outboundLocalRoots: [root.toString()])
                 )
             )
-            adapter.start()
+            telegramStartAdapterForTest(adapter)
             let result = adapter.send(
                 OutboundMessage(ChannelType.Telegram, "user:8734062810", "[photo]\nfileId=${photoPath.toString()}\ncaption=local photo")
             )
@@ -5326,7 +5444,7 @@ public class TelegramAdapterTest {
                     media: TelegramMediaConfig(outboundAllowLocalPath: true, outboundLocalRoots: [root.toString()])
                 )
             )
-            adapter.start()
+            telegramStartAdapterForTest(adapter)
             let result = adapter.send(
                 OutboundMessage(ChannelType.Telegram, "user:8734062810", "[photo]\nfileId=${photoPath.toString()}\ncaption=binary photo")
             )
@@ -5367,7 +5485,7 @@ public class TelegramAdapterTest {
                     media: TelegramMediaConfig(outboundAllowLocalPath: true, outboundLocalRoots: [root.toString()])
                 )
             )
-            adapter.start()
+            telegramStartAdapterForTest(adapter)
             let result = adapter.send(
                 OutboundMessage(ChannelType.Telegram, "user:8734062810", "[photo]\nfileId=${photoPath.toString()}\ncaption=wide")
             )
@@ -5401,7 +5519,7 @@ public class TelegramAdapterTest {
                     media: TelegramMediaConfig(outboundAllowLocalPath: true, outboundLocalRoots: [root.toString()])
                 )
             )
-            adapter.start()
+            telegramStartAdapterForTest(adapter)
             let result = adapter.send(
                 OutboundMessage(ChannelType.Telegram, "user:8734062810", "[photo]\nfileId=${photoPath.toString()}\ncaption=broken")
             )
@@ -5440,7 +5558,7 @@ public class TelegramAdapterTest {
                     )
                 )
             )
-            adapter.start()
+            telegramStartAdapterForTest(adapter)
             let result = adapter.send(
                 OutboundMessage(ChannelType.Telegram, "user:8734062810", "[photo]\nfileId=https://cdn.example.test/huge.png\ncaption=huge")
             )
@@ -5474,7 +5592,7 @@ public class TelegramAdapterTest {
                     media: TelegramMediaConfig(outboundAllowLocalPath: true, outboundLocalRoots: [root.toString()])
                 )
             )
-            adapter.start()
+            telegramStartAdapterForTest(adapter)
             let result = adapter.send(
                 OutboundMessage(ChannelType.Telegram, "user:8734062810", "[document]\nfileId=file://${docPath.toString()}\ncaption=report")
             )
@@ -5504,7 +5622,7 @@ public class TelegramAdapterTest {
                     actions: TelegramActionConfig(editMessage: true)
                 )
             )
-            adapter.start()
+            telegramStartAdapterForTest(adapter)
             let result = adapter.send(
                 OutboundMessage(ChannelType.Telegram, "user:8734062810", "[draft]\npreview=Working...\nfinal=Done")
             )
@@ -5534,7 +5652,7 @@ public class TelegramAdapterTest {
                     actions: TelegramActionConfig(editMessage: true)
                 )
             )
-            adapter.start()
+            telegramStartAdapterForTest(adapter)
             let result = adapter.send(
                 OutboundMessage(ChannelType.Telegram, "user:8734062810", "[draft]\npreview=Working...\nfinal=Final answer")
             )
@@ -5563,7 +5681,7 @@ public class TelegramAdapterTest {
                     actions: TelegramActionConfig(inlineKeyboard: true)
                 )
             )
-            adapter.start()
+            telegramStartAdapterForTest(adapter)
             let result = adapter.send(
                 OutboundMessage(
                     ChannelType.Telegram,
@@ -5592,7 +5710,7 @@ public class TelegramAdapterTest {
             actions: TelegramActionConfig(sendMessage: true, reactions: false)
         )
         let adapter = TelegramAdapter(config: cfg)
-        adapter.start()
+        telegramStartAdapterForTest(adapter)
         let result = adapter.send(
             OutboundMessage(
                 ChannelType.Telegram,
@@ -5615,7 +5733,7 @@ public class TelegramAdapterTest {
             actions: TelegramActionConfig(sendMessage: true, deleteMessage: false)
         )
         let adapter = TelegramAdapter(config: cfg)
-        adapter.start()
+        telegramStartAdapterForTest(adapter)
         let result = adapter.send(
             OutboundMessage(
                 ChannelType.Telegram,
@@ -5638,7 +5756,7 @@ public class TelegramAdapterTest {
             actions: TelegramActionConfig(sendMessage: true, editMessage: false)
         )
         let adapter = TelegramAdapter(config: cfg)
-        adapter.start()
+        telegramStartAdapterForTest(adapter)
         let result = adapter.send(
             OutboundMessage(
                 ChannelType.Telegram,
@@ -5661,7 +5779,7 @@ public class TelegramAdapterTest {
             actions: TelegramActionConfig(sendMessage: true, inlineKeyboard: false)
         )
         let adapter = TelegramAdapter(config: cfg)
-        adapter.start()
+        telegramStartAdapterForTest(adapter)
         let result = adapter.send(
             OutboundMessage(
                 ChannelType.Telegram,
@@ -5684,7 +5802,7 @@ public class TelegramAdapterTest {
             inlineButtons: TelegramInlineButtonsConfig(scope: "group")
         )
         let adapter = TelegramAdapter(config: cfg)
-        adapter.start()
+        telegramStartAdapterForTest(adapter)
         let result = adapter.send(
             OutboundMessage(
                 ChannelType.Telegram,
@@ -5706,7 +5824,7 @@ public class TelegramAdapterTest {
             actions: TelegramActionConfig(sendMessage: true, sticker: false)
         )
         let adapter = TelegramAdapter(config: cfg)
-        adapter.start()
+        telegramStartAdapterForTest(adapter)
         let result = adapter.send(
             OutboundMessage(
                 ChannelType.Telegram,
@@ -5728,7 +5846,7 @@ public class TelegramAdapterTest {
             actions: TelegramActionConfig(sendMessage: true, photo: false)
         )
         let adapter = TelegramAdapter(config: cfg)
-        adapter.start()
+        telegramStartAdapterForTest(adapter)
         let result = adapter.send(
             OutboundMessage(
                 ChannelType.Telegram,
@@ -5750,7 +5868,7 @@ public class TelegramAdapterTest {
             actions: TelegramActionConfig(sendMessage: true, document: false)
         )
         let adapter = TelegramAdapter(config: cfg)
-        adapter.start()
+        telegramStartAdapterForTest(adapter)
         let result = adapter.send(
             OutboundMessage(
                 ChannelType.Telegram,
@@ -5772,7 +5890,7 @@ public class TelegramAdapterTest {
             actions: TelegramActionConfig(sendMessage: true, audio: false)
         )
         let adapter = TelegramAdapter(config: cfg)
-        adapter.start()
+        telegramStartAdapterForTest(adapter)
         let result = adapter.send(
             OutboundMessage(
                 ChannelType.Telegram,
@@ -5794,7 +5912,7 @@ public class TelegramAdapterTest {
             actions: TelegramActionConfig(sendMessage: true, voice: false)
         )
         let adapter = TelegramAdapter(config: cfg)
-        adapter.start()
+        telegramStartAdapterForTest(adapter)
         let result = adapter.send(
             OutboundMessage(
                 ChannelType.Telegram,
@@ -5816,7 +5934,7 @@ public class TelegramAdapterTest {
             actions: TelegramActionConfig(sendMessage: true, video: false)
         )
         let adapter = TelegramAdapter(config: cfg)
-        adapter.start()
+        telegramStartAdapterForTest(adapter)
         let result = adapter.send(
             OutboundMessage(
                 ChannelType.Telegram,
@@ -5838,7 +5956,7 @@ public class TelegramAdapterTest {
             actions: TelegramActionConfig(sendMessage: true, videoNote: false)
         )
         let adapter = TelegramAdapter(config: cfg)
-        adapter.start()
+        telegramStartAdapterForTest(adapter)
         let result = adapter.send(
             OutboundMessage(
                 ChannelType.Telegram,
@@ -5860,7 +5978,7 @@ public class TelegramAdapterTest {
             actions: TelegramActionConfig(sendMessage: true, editForumTopic: false)
         )
         let adapter = TelegramAdapter(config: cfg)
-        adapter.start()
+        telegramStartAdapterForTest(adapter)
         let result = adapter.send(
             OutboundMessage(
                 ChannelType.Telegram,
@@ -5892,7 +6010,7 @@ public class TelegramAdapterTest {
             reactionNotifications: "all"
         )
         let adapter = TelegramAdapter(config: cfg)
-        adapter.start()
+        telegramStartAdapterForTest(adapter)
         let payload = "{\"update_id\":1,\"message_reaction\":{\"chat\":{\"id\":-1001234567890,\"type\":\"supergroup\"},\"message_id\":101,\"user\":{\"id\":8734062810},\"new_reaction\":[{\"type\":\"emoji\",\"emoji\":\"👍\"}]}}"
         let ack = adapter.ingestWebhookPayload(payload)
         @Expect(ack.contains("\"ok\":true"), true)
@@ -5930,7 +6048,7 @@ public class TelegramAdapterTest {
                 ),
                 pairingRoot: root.toString()
             )
-            adapter.start()
+            telegramStartAdapterForTest(adapter)
             let sentMessageId = adapter.sendWithMessageId(
                 OutboundMessage(ChannelType.Telegram, "group:-1001234567890", "bot reply")
             )
@@ -6083,7 +6201,7 @@ public class TelegramAdapterTest {
             actions: TelegramActionConfig(callbackQuery: true)
         )
         let adapter = TelegramAdapter(config: cfg)
-        adapter.start()
+        telegramStartAdapterForTest(adapter)
         let payload = "{\"update_id\":2,\"callback_query\":{\"id\":\"cb-1\",\"from\":{\"id\":8734062810},\"message\":{\"message_id\":101,\"chat\":{\"id\":8734062810,\"type\":\"private\"}},\"data\":\"approve-1\"}}"
         let ack = adapter.ingestWebhookPayload(payload)
         @Expect(ack.contains("\"ok\":true"), true)
@@ -6108,7 +6226,7 @@ public class TelegramAdapterTest {
             actions: TelegramActionConfig(callbackQuery: true)
         )
         let adapter = TelegramAdapter(config: cfg)
-        adapter.start()
+        telegramStartAdapterForTest(adapter)
         let payload = "{\"update_id\":4,\"callback_query\":{\"id\":\"cb-approval-1\",\"from\":{\"id\":8734062810},\"message\":{\"message_id\":103,\"chat\":{\"id\":8734062810,\"type\":\"private\"}},\"data\":\"approval:appr-1:allow-once:${future}\"}}"
         let ack = adapter.ingestWebhookPayload(payload)
         @Expect(ack.contains("\"ok\":true"), true)
@@ -6137,7 +6255,7 @@ public class TelegramAdapterTest {
             actions: TelegramActionConfig(callbackQuery: true)
         )
         let adapter = TelegramAdapter(config: cfg)
-        adapter.start()
+        telegramStartAdapterForTest(adapter)
         let payload = "{\"update_id\":6,\"callback_query\":{\"id\":\"cb-expired\",\"from\":{\"id\":8734062810},\"message\":{\"message_id\":104,\"chat\":{\"id\":8734062810,\"type\":\"private\"}},\"data\":\"approval:appr-2:deny:${expired}\"}}"
         let ack = adapter.ingestWebhookPayload(payload)
         @Expect(ack.contains("\"ignored\":true"), true)
@@ -6149,7 +6267,7 @@ public class TelegramAdapterTest {
     @TestCase
     public func callbackQueryWebhookRecordsDisabledInboundPolicyReason(): Unit {
         let adapter = TelegramAdapter(config: TelegramConfig(enabled: true, botToken: "telegram-token"))
-        adapter.start()
+        telegramStartAdapterForTest(adapter)
         let payload = "{\"update_id\":3,\"callback_query\":{\"id\":\"cb-2\",\"from\":{\"id\":8734062810},\"message\":{\"message_id\":102,\"chat\":{\"id\":745123456,\"type\":\"private\"}},\"data\":\"approve-2\"}}"
         let ack = adapter.ingestWebhookPayload(payload)
         @Expect(ack.contains("\"ignored\":true"), true)
@@ -6173,7 +6291,7 @@ public class TelegramAdapterTest {
                 actions: TelegramActionConfig(callbackQuery: true)
             )
             let adapter = TelegramAdapter(config: cfg)
-            adapter.start()
+            telegramStartAdapterForTest(adapter)
             let payload = "{\"update_id\":16,\"callback_query\":{\"id\":\"cb-approval-clear\",\"from\":{\"id\":8734062810},\"message\":{\"message_id\":104,\"chat\":{\"id\":8734062810,\"type\":\"private\"}},\"data\":\"approval:appr-2:allow-once:${future}\"}}"
             let ack = adapter.ingestWebhookPayload(payload)
             @Expect(ack.contains("\"ok\":true"), true)
@@ -6203,7 +6321,7 @@ public class TelegramAdapterTest {
                     media: TelegramMediaConfig(outboundAllowLocalPath: true, outboundLocalRoots: [root.toString()])
                 )
             )
-            adapter.start()
+            telegramStartAdapterForTest(adapter)
             let text = "[media-group]\nitem=photo|${first.toString()}|first\nitem=photo|${second.toString()}|second"
             let result = adapter.send(OutboundMessage(ChannelType.Telegram, "user:8734062810", text))
             match (result) {
@@ -6233,7 +6351,7 @@ public class TelegramAdapterTest {
                     actions: TelegramActionConfig(editMessage: true, photo: true)
                 )
             )
-            adapter.start()
+            telegramStartAdapterForTest(adapter)
             let result = adapter.send(
                 OutboundMessage(
                     ChannelType.Telegram,
@@ -6264,7 +6382,7 @@ public class TelegramAdapterTest {
                 config: TelegramConfig(enabled: true, botToken: "telegram-token", dmPolicy: "open", allowFrom: ["*"]),
                 pairingRoot: root.toString()
             )
-            adapter.start()
+            telegramStartAdapterForTest(adapter)
             let payload = "{\"update_id\":42,\"message\":{\"message_id\":11,\"text\":\"hello\",\"chat\":{\"id\":8734062810,\"type\":\"private\"},\"from\":{\"id\":8734062810}}}"
             let ack = adapter.ingestWebhookPayload(payload)
             @Expect(ack.contains("\"ok\":true"), true)
@@ -6306,7 +6424,7 @@ public class TelegramAdapterTest {
         setTelegramTransportRunnerForTest(Some({ request => fake.handle(request) }))
         try {
             let adapter = TelegramAdapter(config: TelegramConfig(enabled: true, botToken: "telegram-token", dmPolicy: "open", allowFrom: ["*"]))
-            adapter.start()
+            telegramStartAdapterForTest(adapter)
             let payload = "{\"update_id\":510051,\"message\":{\"message_id\":510,\"text\":\"answer this\",\"quote\":{\"text\":\"/reset should stay quoted\"},\"external_reply\":{\"message_id\":509,\"quote\":{\"text\":\"external quote\"},\"text\":\"external body\"},\"chat\":{\"id\":8734062810,\"type\":\"private\"},\"from\":{\"id\":8734062810}}}"
             let ack = adapter.ingestWebhookPayload(payload)
             @Expect(ack.contains("\"ok\":true"), true)
@@ -6428,7 +6546,7 @@ public class TelegramAdapterTest {
             let adapter = TelegramAdapter(
                 config: TelegramConfig(enabled: true, botToken: "telegram-token", actions: TelegramActionConfig(editMessage: true))
             )
-            adapter.start()
+            telegramStartAdapterForTest(adapter)
             let result = adapter.send(OutboundMessage(ChannelType.Telegram, "user:8734062810", "[edit]\nupdated", replyToMessageId: Some("99")))
             match (result) {
                 case SendResult.Success => ()
@@ -6446,7 +6564,7 @@ public class TelegramAdapterTest {
             let adapter = TelegramAdapter(
                 config: TelegramConfig(enabled: true, botToken: "telegram-token", actions: TelegramActionConfig(editMessage: true))
             )
-            adapter.start()
+            telegramStartAdapterForTest(adapter)
             let result = adapter.send(OutboundMessage(ChannelType.Telegram, "user:8734062810", "[edit]\nsame", replyToMessageId: Some("99")))
             match (result) {
                 case SendResult.Success => ()
@@ -6461,7 +6579,7 @@ public class TelegramAdapterTest {
                 TelegramTransportResponse(true, body: "{\"ok\":false,\"error_code\":400,\"description\":\"Bad Request: invalid reaction type\"}", outcome: "api-ok-false")
             }))
             let adapter = TelegramAdapter(config: TelegramConfig(enabled: true, botToken: "telegram-token"))
-            adapter.start()
+            telegramStartAdapterForTest(adapter)
             let result = adapter.send(OutboundMessage(ChannelType.Telegram, "user:8734062810", "[reaction]\ntoken=invalid\nrender=invalid", replyToMessageId: Some("99")))
             match (result) {
                 case SendResult.Success => @Expect(false, true)

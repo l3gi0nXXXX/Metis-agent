@@ -114,6 +114,13 @@ public func setTelegramTransportRunnerForTest(runner: Option<(TelegramTransportR
     telegramTransportRunnerOverride = runner
 }
 
+public func hasTelegramTransportRunnerForTest(): Bool {
+    match (telegramTransportRunnerOverride) {
+        case Some(_) => true
+        case None => false
+    }
+}
+
 public class TelegramTransport {
     private let proxy: String
     private let envProxyEnabled: Bool

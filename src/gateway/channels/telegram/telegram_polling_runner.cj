@@ -29,6 +29,7 @@ public class TelegramPollingRunner {
     private var transportRebuildCount: Int64 = 0
     private var watchdogStallMs: Int64 = 45000
     private var watchdogIntervalMs: Int64 = 500
+    private var idleDelayMs: Int64 = 25
     private var loopGeneration: Int64 = 0
 
     public init(
@@ -37,7 +38,8 @@ public class TelegramPollingRunner {
         shouldContinue: () -> Bool,
         rebuildTransport!: () -> Unit = { => () },
         watchdogStallMs!: Int64 = 45000,
-        watchdogIntervalMs!: Int64 = 500
+        watchdogIntervalMs!: Int64 = 500,
+        idleDelayMs!: Int64 = 25
     ) {
         this.fetchUpdates = fetchUpdates
         this.ingestUpdates = ingestUpdates
@@ -45,6 +47,7 @@ public class TelegramPollingRunner {
         this.rebuildTransport = rebuildTransport
         this.watchdogStallMs = if (watchdogStallMs > 0) { watchdogStallMs } else { 45000 }
         this.watchdogIntervalMs = if (watchdogIntervalMs > 0) { watchdogIntervalMs } else { 500 }
+        this.idleDelayMs = if (idleDelayMs > 0) { idleDelayMs } else { 25 }
     }
 
     public func start(): Unit {
@@ -199,6 +202,8 @@ public class TelegramPollingRunner {
             if (backoffMs > 0) {
                 this.markBackoff(backoffMs)
                 this.waitForBackoff(backoffMs)
+            } else {
+                this.waitForIdleDelay()
             }
         }
     }
@@ -353,6 +358,17 @@ public class TelegramPollingRunner {
             sleep(Duration.millisecond * chunk)
             remaining -= chunk
         }
+    }
+
+    private func waitForIdleDelay(): Unit {
+        var delayMs: Int64 = 25
+        synchronized(this.stateLock) {
+            delayMs = this.idleDelayMs
+        }
+        if (delayMs <= 0 || !this.isActive()) {
+            return
+        }
+        sleep(Duration.millisecond * delayMs)
     }
 
     private func isActive(): Bool {
