@@ -4,6 +4,14 @@ import std.unittest.testmacro.*
 
 @Test
 public class GitCodeReviewContractTest {
+    private func repeatText(text: String, count: Int64): String {
+        let out = StringBuilder()
+        for (_ in 0..count) {
+            out.append(text)
+        }
+        out.toString()
+    }
+
     private func issueBugPayload(extra!: String = ""): String {
         "{" +
             "\"jobId\":\"webhook-d1\"," +
@@ -129,6 +137,24 @@ public class GitCodeReviewContractTest {
         @Expect(parsed.request.eventType, "comment")
         @Expect(parsed.request.commentBody, "please explain")
         @Expect(parsed.request.parentUrl.contains("/pulls/99"), true)
+    }
+
+    @TestCase
+    public func tMetisContract011UnicodeFieldTruncationDoesNotBreakUtf8(): Unit {
+        let req = GitCodeReviewRequest(
+            eventId: "gitcode:Cangjie/community:issue:3",
+            eventType: "issue",
+            repoFullName: "Cangjie/community",
+            repoOrg: "Cangjie",
+            repoName: "community",
+            number: "3",
+            url: "https://gitcode.com/Cangjie/community/issues/3",
+            title: this.repeatText("中文🙂", 120),
+            content: this.repeatText("复现步骤🙂", 900)
+        )
+        @Expect(req.title.contains("中文"), true)
+        @Expect(req.content.contains("复现步骤"), true)
+        @Expect(validateGitCodeReviewRequest(req).ok, true)
     }
 
     @TestCase

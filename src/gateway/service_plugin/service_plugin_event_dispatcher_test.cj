@@ -100,6 +100,33 @@ public class ServicePluginEventDispatcherTest {
     }
 
     @TestCase
+    public func orphanDetectedEventRecordsVisibleRuntimeDiagnostic(): Unit {
+        this.resetDispatcherHooks()
+        this.registerGitCodeWritebackPlugin()
+        let frame = ServiceFrame(
+            "event",
+            "orphan-session-1",
+            "gitcode-monitor",
+            method: "emitCapabilityEvent",
+            capabilityId: "gitcode.monitor.orphan_detected",
+            payload: "{\"ok\":true,\"status\":\"orphan_detected\",\"pluginId\":\"gitcode-monitor\",\"sessionId\":\"gitcode-monitor-1\",\"pid\":1234,\"parentPid\":5678,\"orphanReason\":\"parent_lost\"}"
+        )
+        let result = dispatchServicePluginEvent(frame, store: ServicePluginPendingJobStore())
+        @Expect(result.ok, false)
+        @Expect(result.status, "orphan_detected")
+        @Expect(result.eventId, "gitcode-monitor-1")
+        @Expect(result.diagnostic.contains("parent_lost"), true)
+        recordServicePluginRuntimeDispatchForTest("gitcode-monitor", frame, result)
+        match (getServicePluginSnapshot("gitcode-monitor")) {
+            case Some(snapshot) =>
+                @Expect(snapshot.lastError.contains("status=orphan_detected"), true)
+                @Expect(snapshot.lastError.contains("eventIdHash="), true)
+            case None => @Expect(true, false)
+        }
+        this.resetDispatcherHooks()
+    }
+
+    @TestCase
     public func acceptedEventInvalidPayloadStopsBeforeDeliveryAndDraft(): Unit {
         this.resetDispatcherHooks()
         let messages = ArrayList<String>()
