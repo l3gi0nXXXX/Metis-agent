@@ -133,6 +133,40 @@ private func channelsRowByStringField(rows: JsonArray, key: String, value: Strin
     JsonObject()
 }
 
+private func channelsTelegramRuntimeProbeTransportForTest(request: TelegramTransportRequest): TelegramTransportResponse {
+    if (request.context == "get") {
+        if (request.url.contains("/getMe")) {
+            return TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":{\"id\":10001,\"is_bot\":true,\"username\":\"metis_bot\"}}", outcome: "ok")
+        }
+        if (request.url.contains("/getWebhookInfo")) {
+            return TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":{\"url\":\"https://example.test/telegram-webhook\",\"pending_update_count\":0}}", outcome: "ok")
+        }
+        if (request.url.contains("/getChat")) {
+            return TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":{\"id\":-1001234567890,\"type\":\"supergroup\",\"title\":\"Metis Test\",\"is_forum\":false}}", outcome: "ok")
+        }
+        if (request.url.contains("/getChatMember")) {
+            return TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":{\"status\":\"administrator\",\"user\":{\"id\":10001,\"is_bot\":true}}}", outcome: "ok")
+        }
+    }
+    if (request.context == "getUpdates") {
+        return TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":[]}", outcome: "ok")
+    }
+    if (request.context.startsWith("deleteWebhook:") || request.context == "setWebhook" ||
+        request.context == "setMyCommands" || request.context == "deleteMyCommands") {
+        return TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":true}", outcome: "ok")
+    }
+    TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":true}", outcome: "ok")
+}
+
+private func withChannelsTelegramTransportForTest<T>(block: () -> T): T {
+    setTelegramTransportRunnerForTest(Some({ request: TelegramTransportRequest => channelsTelegramRuntimeProbeTransportForTest(request) }))
+    try {
+        return block()
+    } finally {
+        setTelegramTransportRunnerForTest(None)
+    }
+}
+
 private func channelsTelegramRouteBinding(agentId: String, peerKind: String, peerId: String): JsonObject {
     let binding = JsonObject()
     binding.put("type", JsonString("route"))
@@ -1467,43 +1501,46 @@ public class GatewayServerMethodsChannelsTest {
         let params = JsonObject()
         params.put("channelId", JsonString("telegram"))
         params.put("probe", true.toJsonValue())
-        let result = handleGatewayChannelsFamily(
-            "channels.runtime",
-            user,
-            request: Some(GatewayRpcRequest("channels.runtime", params: params))
-        ).getOrThrow().result.asObject()
-        let telegram = result.get("telegram").getOrThrow().asObject()
-        @Expect(channelsTestString(telegram, "mode"), "webhook")
-        @Expect(channelsTestBool(telegram, "webhookConfigured"), true)
-        @Expect(channelsTestBool(telegram, "allowedUpdatesAuto"), true)
-        @Expect(channelsTestBool(telegram, "groupHistoryEnabled"), true)
-        @Expect(channelsTestInt(telegram, "groupHistoryLimit"), 9)
-        let runtimeNetwork = telegram.get("network").getOrThrow().asObject()
-        @Expect(channelsTestBool(runtimeNetwork, "envProxyEnabled"), true)
-        let allowed = telegram.get("allowedUpdates").getOrThrow().asArray()
-        @Expect(allowed.size() >= 5, true)
-        @Expect(allowed[4].asString().getValue(), "message_reaction")
-        @Expect(allowed.toJsonString().contains("callback_query"), true)
-        let registration = telegram.get("registrationPayload").getOrThrow().asObject()
-        @Expect(registration.get("allowed_updates").isSome(), true)
-        let health = telegram.get("healthSnapshot").getOrThrow().asObject()
-        @Expect(health.get("summary").isSome(), true)
-        @Expect(health.get("webhook").isSome(), true)
-        let capabilityState = telegram.get("capabilityState").getOrThrow().asObject()
-        @Expect(channelsTestString(capabilityState, "approvalResolverState"), "button-resolver-ready")
-        @Expect(channelsTestString(capabilityState, "directoryAggregationState"), "config-session-history-ready")
-        @Expect(channelsTestString(capabilityState, "modelButtonState"), "available")
-        @Expect(channelsTestString(capabilityState, "videoUnderstandingState"), "not_configured")
-        @Expect(channelsTestString(capabilityState, "videoGenerationState"), "not_configured")
-        let summary = health.get("summary").getOrThrow().asObject()
-        @Expect(channelsTestBool(summary, "offsetPersistenceEnabled"), true)
-        @Expect(summary.get("lastInboundUpdateId").isSome(), true)
-        let offset = health.get("offset").getOrThrow().asObject()
-        @Expect(channelsTestBool(offset, "persistenceEnabled"), true)
-        @Expect(offset.get("statePath").isSome(), true)
-        let liveProbe = telegram.get("liveProbe").getOrThrow().asObject()
-        @Expect(channelsTestBool(liveProbe, "supported"), true)
-        @Expect(channelsTestBool(liveProbe, "executed"), true)
+        let configuredUser = user
+        withChannelsTelegramTransportForTest {
+            let result = handleGatewayChannelsFamily(
+                "channels.runtime",
+                configuredUser,
+                request: Some(GatewayRpcRequest("channels.runtime", params: params))
+            ).getOrThrow().result.asObject()
+            let telegram = result.get("telegram").getOrThrow().asObject()
+            @Expect(channelsTestString(telegram, "mode"), "webhook")
+            @Expect(channelsTestBool(telegram, "webhookConfigured"), true)
+            @Expect(channelsTestBool(telegram, "allowedUpdatesAuto"), true)
+            @Expect(channelsTestBool(telegram, "groupHistoryEnabled"), true)
+            @Expect(channelsTestInt(telegram, "groupHistoryLimit"), 9)
+            let runtimeNetwork = telegram.get("network").getOrThrow().asObject()
+            @Expect(channelsTestBool(runtimeNetwork, "envProxyEnabled"), true)
+            let allowed = telegram.get("allowedUpdates").getOrThrow().asArray()
+            @Expect(allowed.size() >= 5, true)
+            @Expect(allowed[4].asString().getValue(), "message_reaction")
+            @Expect(allowed.toJsonString().contains("callback_query"), true)
+            let registration = telegram.get("registrationPayload").getOrThrow().asObject()
+            @Expect(registration.get("allowed_updates").isSome(), true)
+            let health = telegram.get("healthSnapshot").getOrThrow().asObject()
+            @Expect(health.get("summary").isSome(), true)
+            @Expect(health.get("webhook").isSome(), true)
+            let capabilityState = telegram.get("capabilityState").getOrThrow().asObject()
+            @Expect(channelsTestString(capabilityState, "approvalResolverState"), "button-resolver-ready")
+            @Expect(channelsTestString(capabilityState, "directoryAggregationState"), "config-session-history-ready")
+            @Expect(channelsTestString(capabilityState, "modelButtonState"), "available")
+            @Expect(channelsTestString(capabilityState, "videoUnderstandingState"), "not_configured")
+            @Expect(channelsTestString(capabilityState, "videoGenerationState"), "not_configured")
+            let summary = health.get("summary").getOrThrow().asObject()
+            @Expect(channelsTestBool(summary, "offsetPersistenceEnabled"), true)
+            @Expect(summary.get("lastInboundUpdateId").isSome(), true)
+            let offset = health.get("offset").getOrThrow().asObject()
+            @Expect(channelsTestBool(offset, "persistenceEnabled"), true)
+            @Expect(offset.get("statePath").isSome(), true)
+            let liveProbe = telegram.get("liveProbe").getOrThrow().asObject()
+            @Expect(channelsTestBool(liveProbe, "supported"), true)
+            @Expect(channelsTestBool(liveProbe, "executed"), true)
+        }
     }
 
     @TestCase
@@ -1517,33 +1554,36 @@ public class GatewayServerMethodsChannelsTest {
         user.telegram.actions.videoNote = true
         let params = JsonObject()
         params.put("probe", true.toJsonValue())
+        let configuredUser = user
 
-        let result = handleGatewayChannelsFamily(
-            "channels.health",
-            user,
-            request: Some(GatewayRpcRequest("channels.health", params: params))
-        ).getOrThrow().result.asObject()
-        let telegram = result.get("telegram").getOrThrow().asObject()
-        @Expect(channelsTestString(telegram, "mode"), "webhook")
-        @Expect(channelsTestBool(telegram, "webhookConfigured"), true)
-        @Expect(channelsTestBool(telegram, "allowedUpdatesAuto"), true)
-        let supports = telegram.get("supports").getOrThrow().asObject()
-        @Expect(channelsTestBool(supports, "mediaPhoto"), true)
-        @Expect(channelsTestBool(supports, "mediaVideoNote"), true)
-        let actions = telegram.get("actions").getOrThrow().asObject()
-        @Expect(channelsTestBool(actions, "photo"), true)
-        @Expect(channelsTestBool(actions, "videoNote"), true)
-        let registration = telegram.get("registrationPayload").getOrThrow().asObject()
-        @Expect(registration.get("allowed_updates").isSome(), true)
-        let health = telegram.get("healthSnapshot").getOrThrow().asObject()
-        @Expect(health.get("summary").isSome(), true)
-        let summary = health.get("summary").getOrThrow().asObject()
-        @Expect(channelsTestBool(summary, "offsetPersistenceEnabled"), true)
-        let offset = health.get("offset").getOrThrow().asObject()
-        @Expect(channelsTestBool(offset, "persistenceEnabled"), true)
-        let liveProbe = telegram.get("liveProbe").getOrThrow().asObject()
-        @Expect(channelsTestBool(liveProbe, "supported"), true)
-        @Expect(channelsTestBool(liveProbe, "executed"), true)
+        withChannelsTelegramTransportForTest {
+            let result = handleGatewayChannelsFamily(
+                "channels.health",
+                configuredUser,
+                request: Some(GatewayRpcRequest("channels.health", params: params))
+            ).getOrThrow().result.asObject()
+            let telegram = result.get("telegram").getOrThrow().asObject()
+            @Expect(channelsTestString(telegram, "mode"), "webhook")
+            @Expect(channelsTestBool(telegram, "webhookConfigured"), true)
+            @Expect(channelsTestBool(telegram, "allowedUpdatesAuto"), true)
+            let supports = telegram.get("supports").getOrThrow().asObject()
+            @Expect(channelsTestBool(supports, "mediaPhoto"), true)
+            @Expect(channelsTestBool(supports, "mediaVideoNote"), true)
+            let actions = telegram.get("actions").getOrThrow().asObject()
+            @Expect(channelsTestBool(actions, "photo"), true)
+            @Expect(channelsTestBool(actions, "videoNote"), true)
+            let registration = telegram.get("registrationPayload").getOrThrow().asObject()
+            @Expect(registration.get("allowed_updates").isSome(), true)
+            let health = telegram.get("healthSnapshot").getOrThrow().asObject()
+            @Expect(health.get("summary").isSome(), true)
+            let summary = health.get("summary").getOrThrow().asObject()
+            @Expect(channelsTestBool(summary, "offsetPersistenceEnabled"), true)
+            let offset = health.get("offset").getOrThrow().asObject()
+            @Expect(channelsTestBool(offset, "persistenceEnabled"), true)
+            let liveProbe = telegram.get("liveProbe").getOrThrow().asObject()
+            @Expect(channelsTestBool(liveProbe, "supported"), true)
+            @Expect(channelsTestBool(liveProbe, "executed"), true)
+        }
     }
 
     @TestCase
@@ -1558,49 +1598,52 @@ public class GatewayServerMethodsChannelsTest {
 
         let params = JsonObject()
         params.put("channelId", JsonString("telegram"))
-        let result = handleGatewayChannelsFamily(
-            "channels.audit",
-            user,
-            request: Some(GatewayRpcRequest("channels.audit", params: params))
-        ).getOrThrow().result.asObject()
-        let audit = result.get("audit").getOrThrow().asObject()
-        @Expect(channelsTestString(audit, "kind"), "gateway-channels-audit")
-        let summary = audit.get("summary").getOrThrow().asObject()
-        @Expect(channelsTestString(summary, "phase"), "T12")
-        let closure = summary.get("closure").getOrThrow().asObject()
-        @Expect(channelsTestBool(closure, "telegramNativeRuntimeVisible"), true)
-        @Expect(channelsTestBool(closure, "telegramLiveProbeRuntimeVisible"), true)
-        @Expect(channelsTestBool(closure, "telegramReactionRuntimeVisible"), true)
-        @Expect(channelsTestBool(closure, "telegramMediaRuntimeVisible"), true)
-        @Expect(channelsTestBool(closure, "telegramMediaPersistenceVisible"), true)
-        @Expect(channelsTestBool(closure, "controlUiSessionsHttpAvailable"), true)
-        @Expect(channelsTestBool(closure, "controlUiSessionsWsAvailable"), true)
-        @Expect(channelsTestBool(closure, "telegramThreadBindingVisibleInDashboardSessions"), true)
-        @Expect(channelsTestBool(closure, "telegramThreadBindingVisibleInControlUiSessions"), true)
-        @Expect(channelsTestBool(closure, "telegramThreadBindingVisibleInControlUiWsSessions"), true)
-        let consumers = summary.get("consumers").getOrThrow().asObject()
-        @Expect(channelsTestBool(consumers, "mcpOverHttp"), true)
-        @Expect(channelsTestBool(consumers, "dashboardSessions"), true)
-        @Expect(channelsTestBool(consumers, "controlUiSessionsHttp"), true)
-        @Expect(channelsTestBool(consumers, "controlUiSessionsWs"), true)
-        let runtime = audit.get("runtime").getOrThrow().asObject()
-        let telegram = runtime.get("telegram").getOrThrow().asObject()
-        @Expect(telegram.get("healthSnapshot").isSome(), true)
-        let liveProbe = telegram.get("liveProbe").getOrThrow().asObject()
-        @Expect(channelsTestBool(liveProbe, "supported"), true)
-        @Expect(channelsTestBool(liveProbe, "executed"), true)
-        let media = telegram.get("media").getOrThrow().asObject()
-        @Expect(channelsTestBool(media, "persistenceEnabled"), true)
-        @Expect(channelsTestBool(media, "downloadEnabled"), true)
-        @Expect(telegram.get("supports").isSome(), true)
-        @Expect(telegram.get("actions").isSome(), true)
-        let accepted = audit.get("acceptance").getOrThrow().asArray()
-        @Expect(accepted.toJsonString().contains("telegram-live-probe-runtime-is-visible-across-consumers"), true)
-        @Expect(accepted.toJsonString().contains("telegram-reaction-and-media-runtime-are-visible-across-consumers"), true)
-        @Expect(accepted.toJsonString().contains("telegram-media-download-and-file-persistence-are-visible-across-consumers"), true)
-        let remaining = audit.get("remaining").getOrThrow().asArray()
-        @Expect(remaining.toJsonString().contains("telegram-webhook-live-probe-remains-ops-followup"), false)
-        @Expect(remaining.toJsonString().contains("telegram-media-download-and-file-persistence-remain-followups"), false)
+        let configuredUser = user
+        withChannelsTelegramTransportForTest {
+            let result = handleGatewayChannelsFamily(
+                "channels.audit",
+                configuredUser,
+                request: Some(GatewayRpcRequest("channels.audit", params: params))
+            ).getOrThrow().result.asObject()
+            let audit = result.get("audit").getOrThrow().asObject()
+            @Expect(channelsTestString(audit, "kind"), "gateway-channels-audit")
+            let summary = audit.get("summary").getOrThrow().asObject()
+            @Expect(channelsTestString(summary, "phase"), "T12")
+            let closure = summary.get("closure").getOrThrow().asObject()
+            @Expect(channelsTestBool(closure, "telegramNativeRuntimeVisible"), true)
+            @Expect(channelsTestBool(closure, "telegramLiveProbeRuntimeVisible"), true)
+            @Expect(channelsTestBool(closure, "telegramReactionRuntimeVisible"), true)
+            @Expect(channelsTestBool(closure, "telegramMediaRuntimeVisible"), true)
+            @Expect(channelsTestBool(closure, "telegramMediaPersistenceVisible"), true)
+            @Expect(channelsTestBool(closure, "controlUiSessionsHttpAvailable"), true)
+            @Expect(channelsTestBool(closure, "controlUiSessionsWsAvailable"), true)
+            @Expect(channelsTestBool(closure, "telegramThreadBindingVisibleInDashboardSessions"), true)
+            @Expect(channelsTestBool(closure, "telegramThreadBindingVisibleInControlUiSessions"), true)
+            @Expect(channelsTestBool(closure, "telegramThreadBindingVisibleInControlUiWsSessions"), true)
+            let consumers = summary.get("consumers").getOrThrow().asObject()
+            @Expect(channelsTestBool(consumers, "mcpOverHttp"), true)
+            @Expect(channelsTestBool(consumers, "dashboardSessions"), true)
+            @Expect(channelsTestBool(consumers, "controlUiSessionsHttp"), true)
+            @Expect(channelsTestBool(consumers, "controlUiSessionsWs"), true)
+            let runtime = audit.get("runtime").getOrThrow().asObject()
+            let telegram = runtime.get("telegram").getOrThrow().asObject()
+            @Expect(telegram.get("healthSnapshot").isSome(), true)
+            let liveProbe = telegram.get("liveProbe").getOrThrow().asObject()
+            @Expect(channelsTestBool(liveProbe, "supported"), true)
+            @Expect(channelsTestBool(liveProbe, "executed"), true)
+            let media = telegram.get("media").getOrThrow().asObject()
+            @Expect(channelsTestBool(media, "persistenceEnabled"), true)
+            @Expect(channelsTestBool(media, "downloadEnabled"), true)
+            @Expect(telegram.get("supports").isSome(), true)
+            @Expect(telegram.get("actions").isSome(), true)
+            let accepted = audit.get("acceptance").getOrThrow().asArray()
+            @Expect(accepted.toJsonString().contains("telegram-live-probe-runtime-is-visible-across-consumers"), true)
+            @Expect(accepted.toJsonString().contains("telegram-reaction-and-media-runtime-are-visible-across-consumers"), true)
+            @Expect(accepted.toJsonString().contains("telegram-media-download-and-file-persistence-are-visible-across-consumers"), true)
+            let remaining = audit.get("remaining").getOrThrow().asArray()
+            @Expect(remaining.toJsonString().contains("telegram-webhook-live-probe-remains-ops-followup"), false)
+            @Expect(remaining.toJsonString().contains("telegram-media-download-and-file-persistence-remain-followups"), false)
+        }
     }
 
     @TestCase
