@@ -3,12 +3,14 @@ package metis.gateway.service_plugin
 import metis.core.metisSafeUtf8Prefix
 import metis.core.config.CliConfig
 import std.collection.{ArrayList, HashMap, HashSet}
-import std.fs.{Path, exists}
+import std.convert.Parsable
+import std.fs.{Directory, File, Path, exists, remove}
 import std.io.*
-import std.env.{getProcessId, getVariables}
+import std.env.{getProcessId, getVariable, getVariables, setVariable}
 import std.process.*
 import std.sync.*
 import std.time.*
+import stdx.encoding.json.{JsonObject, JsonValue}
 
 public class ServicePluginConfigRef {
     public let configPath: String
@@ -567,13 +569,13 @@ private class ServicePluginStdioProcess {
         redactServicePayload(this.stdoutBuffer.summary()).text
     }
 
-    public func stop(timeoutMs!: Int64 = 500): Bool {
+    public func stop(timeoutMs!: Int64 = 500): ServicePluginProcessStopResult {
         let effective = if (timeoutMs > 0) { timeoutMs } else { 500 }
         try {
             let _ = this.process.wait(timeout: Some(Duration.millisecond * effective))
             this.stdoutBuffer.close()
             this.stderrBuffer.close()
-            return true
+            return ServicePluginProcessStopResult(true, "graceful_exited")
         } catch (_waitBeforeTerminate: Exception) {
             ()
         }
@@ -582,13 +584,17 @@ private class ServicePluginStdioProcess {
             let _ = this.process.wait(timeout: Some(Duration.millisecond * effective))
             this.stdoutBuffer.close()
             this.stderrBuffer.close()
-            return true
+            return ServicePluginProcessStopResult(true, "terminated")
         } catch (_waitAfterTerminate: Exception) {
             try { this.process.terminate(force: true) } catch (_inner: Exception) { () }
         }
+        sleep(Duration.millisecond * 25)
         this.stdoutBuffer.close()
         this.stderrBuffer.close()
-        false
+        if (this.process.isAlive()) {
+            return ServicePluginProcessStopResult(false, "still_alive")
+        }
+        ServicePluginProcessStopResult(true, "force_terminated")
     }
 
     private func readLines(reader: StringReader<InputStream>, buffer: ServicePluginLineBuffer): Unit {
@@ -612,6 +618,16 @@ private class ServicePluginStdioProcess {
                     return
             }
         }
+    }
+}
+
+private class ServicePluginProcessStopResult {
+    public let ok: Bool
+    public let status: String
+
+    public init(ok: Bool, status: String) {
+        this.ok = ok
+        this.status = status.trimAscii()
     }
 }
 
@@ -889,6 +905,25 @@ public func resetServicePluginHostForTest(): Unit {
     servicePluginCapabilityInvokerForTest = None<(ServicePluginRegistration, CapabilityInvokeRequest) -> CapabilityInvokeResult>
 }
 
+public func withServicePluginHostTestHome<T>(label: String, block: (Path) -> T): T {
+    let home = Path("/tmp").join("metis-service-plugin-${servicePluginPathSegment(label)}-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
+    try { remove(home, recursive: true) } catch (_: Exception) { () }
+    Directory.create(home, recursive: true)
+    let oldHome = getVariable("METIS_HOME")
+    setVariable("METIS_HOME", home.toString())
+    CliConfig.invalidatePathCache()
+    try {
+        return block(home)
+    } finally {
+        match (oldHome) {
+            case Some(value) => setVariable("METIS_HOME", value)
+            case None => setVariable("METIS_HOME", "")
+        }
+        CliConfig.invalidatePathCache()
+        try { remove(home, recursive: true) } catch (_: Exception) { () }
+    }
+}
+
 public func registerServicePlugin(registration: ServicePluginRegistration): ServicePluginRegistrationResult {
     let manifestValidation = validateServicePluginManifest(registration.manifest)
     let serviceId = registration.manifest.pluginId
@@ -1153,15 +1188,119 @@ private func servicePluginPathSegment(raw: String): String {
     trimmed.replace("/", "_").replace("\\", "_").replace(":", "_")
 }
 
-private func servicePluginLeasePath(record: ServicePluginRuntimeRecord): String {
-    let serviceId = servicePluginPathSegment(record.registration.manifest.pluginId)
-    let instanceId = servicePluginPathSegment(record.instanceId)
+private func servicePluginRuntimeLeaseDir(serviceId: String): Path {
     CliConfig.dotDir
         .join("service-plugin")
         .join("runtime")
-        .join(serviceId)
+        .join(servicePluginPathSegment(serviceId))
+}
+
+private func servicePluginLeasePath(record: ServicePluginRuntimeRecord): String {
+    let instanceId = servicePluginPathSegment(record.instanceId)
+    servicePluginRuntimeLeaseDir(record.registration.manifest.pluginId)
         .join("${instanceId}.lease.json")
         .toString()
+}
+
+private class ServicePluginLeaseSnapshot {
+    public let path: String
+    public let state: String
+    public let sessionId: String
+    public let pid: Int64
+    public let port: Int64
+
+    public init(path: String, state!: String = "", sessionId!: String = "", pid!: Int64 = 0, port!: Int64 = 0) {
+        this.path = path
+        this.state = state.trimAscii()
+        this.sessionId = sessionId.trimAscii()
+        this.pid = pid
+        this.port = port
+    }
+}
+
+private func servicePluginReadLease(path: Path): ?ServicePluginLeaseSnapshot {
+    if (!exists(path)) {
+        return None<ServicePluginLeaseSnapshot>
+    }
+    try {
+        let root = JsonValue.fromStr(String.fromUtf8(File.readFrom(path))).asObject()
+        let state = servicePluginLeaseString(root, "state", fallback: servicePluginLeaseString(root, "status"))
+        Some(ServicePluginLeaseSnapshot(
+            path.toString(),
+            state: state,
+            sessionId: servicePluginLeaseString(root, "sessionId"),
+            pid: servicePluginLeaseInt(root, "pid"),
+            port: servicePluginLeaseInt(root, "port")
+        ))
+    } catch (_: Exception) {
+        None<ServicePluginLeaseSnapshot>
+    }
+}
+
+private func servicePluginLeaseString(root: JsonObject, key: String, fallback!: String = ""): String {
+    match (root.get(key)) {
+        case Some(value) => try { value.asString().getValue().trimAscii() } catch (_: Exception) { fallback }
+        case None => fallback
+    }
+}
+
+private func servicePluginLeaseInt(root: JsonObject, key: String): Int64 {
+    match (root.get(key)) {
+        case Some(value) =>
+            try { value.asInt().getValue() } catch (_: Exception) {
+                try { Int64.parse(value.asString().getValue().trimAscii()) } catch (_inner: Exception) { 0 }
+            }
+        case None => 0
+    }
+}
+
+private func servicePluginPidAlive(pid: Int64): Bool {
+    if (pid <= 0) {
+        return false
+    }
+    try {
+        let (exitCode, _, _) = executeWithOutput("kill", ["-0", "${pid}"])
+        exitCode == 0
+    } catch (_: Exception) {
+        false
+    }
+}
+
+private func servicePluginStaleRunningLeaseBeforeStart(serviceId: String): ?ServicePluginLeaseSnapshot {
+    let dir = servicePluginRuntimeLeaseDir(serviceId)
+    if (!exists(dir)) {
+        return None<ServicePluginLeaseSnapshot>
+    }
+    try {
+        for (entry in Directory.readFrom(dir)) {
+            if (!entry.isRegular() || !entry.name.endsWith(".lease.json")) {
+                continue
+            }
+            match (servicePluginReadLease(entry.path)) {
+                case Some(lease) =>
+                    if (lease.state == "running" && servicePluginPidAlive(lease.pid)) {
+                        return Some(lease)
+                    }
+                case None => ()
+            }
+        }
+    } catch (_: Exception) {
+        ()
+    }
+    None<ServicePluginLeaseSnapshot>
+}
+
+private func servicePluginLeaseStopDiagnostic(record: ServicePluginRuntimeRecord): String {
+    let leasePath = Path(servicePluginLeasePath(record))
+    match (servicePluginReadLease(leasePath)) {
+        case Some(lease) =>
+            let pidAlive = servicePluginPidAlive(lease.pid)
+            if (lease.state != "stopped" || pidAlive) {
+                return "lease_not_stopped_after_stop state=${lease.state} pid=${lease.pid} pidAlive=${pidAlive} port=${lease.port}"
+            }
+            "lease_stopped state=stopped pid=${lease.pid}"
+        case None => "lease_missing_after_stop"
+    }
 }
 
 private func servicePluginProcessEnvironment(record: ServicePluginRuntimeRecord): HashMap<String, String> {
@@ -1221,8 +1360,17 @@ private func ensureServicePluginStdioProcess(record: ServicePluginRuntimeRecord,
             record.lastError = "service plugin working directory missing: ${redactServicePayload(cwd).text}"
             return ServicePluginProcessEnsureResult(false, "cwd_missing", diagnostic: record.lastError)
         }
+        match (servicePluginStaleRunningLeaseBeforeStart(serviceId)) {
+            case Some(lease) =>
+                record.status = "degraded"
+                record.degradedReason = "stale_lease_before_start"
+                record.lastError = "stale_lease_before_start sessionId=${lease.sessionId} pid=${lease.pid} port=${lease.port}"
+                return ServicePluginProcessEnsureResult(false, "stale_lease_before_start", diagnostic: record.lastError)
+            case None => ()
+        }
         record.instanceSeq++
         record.instanceId = "${serviceId}-${record.instanceSeq}"
+        try { Directory.create(servicePluginRuntimeLeaseDir(serviceId), recursive: true) } catch (_: Exception) { () }
         let args = servicePluginArgsWithConfigRef(record.registration.manifest.entryArgs, record.registration.configRef.configPath)
         let process = try {
             let proc = launch(
@@ -1393,11 +1541,24 @@ private func servicePluginRecordRuntimeDispatchLocked(record: ServicePluginRunti
 }
 
 private func servicePluginRecordRuntimeDispatch(record: ServicePluginRuntimeRecord, frame: ServiceFrame, dispatch: ServicePluginEventDispatchResult): Unit {
+    if (frame.capabilityId == "gitcode.monitor.orphan_detected" || dispatch.status == "orphan_detected") {
+        record.status = "degraded"
+        record.degradedReason = "orphan_detected"
+        record.lastError = servicePluginDispatchDiagnosticSummary(frame, dispatch)
+        return
+    }
     if (!dispatch.ok || dispatch.status == "no_subscribers" || dispatch.status == "generated_reply_degraded_delivered" || dispatch.status == "generated_reply_partially_delivered" || dispatch.status == "generated_reply_delivery_failed") {
         record.lastError = servicePluginDispatchDiagnosticSummary(frame, dispatch)
         return
     }
     record.lastError = ""
+}
+
+public func servicePluginRuntimeIsOrphanDrainingForDispatch(serviceId: String): Bool {
+    match (servicePluginRegistry.get(serviceId.trimAscii())) {
+        case Some(record) => record.degradedReason == "orphan_detected"
+        case None => false
+    }
 }
 
 public func recordServicePluginRuntimeDispatchForTest(serviceId: String, frame: ServiceFrame, dispatch: ServicePluginEventDispatchResult): Unit {
@@ -1481,10 +1642,19 @@ public func stopServicePlugin(serviceId: String, reason!: String = "", timeoutMi
                         } catch (_: Exception) {
                             ()
                         }
-                        let exited = process.stop(timeoutMs: min(timeoutMillis, 30000))
-                        servicePluginActiveProcesses.remove(serviceId.trimAscii())
-                        if (!exited && record.lastError.isEmpty()) {
-                            record.lastError = servicePluginProcessError("service plugin stop forced", process)
+                        let stop = process.stop(timeoutMs: min(timeoutMillis, 30000))
+                        if (stop.status != "still_alive") {
+                            servicePluginActiveProcesses.remove(serviceId.trimAscii())
+                        }
+                        let stopDiagnostic = "stop_status=${stop.status}"
+                        if (!stop.ok) {
+                            record.lastError = if (record.lastError.isEmpty()) {
+                                "${stopDiagnostic} ${servicePluginProcessError("service plugin stop forced", process)}"
+                            } else {
+                                "${record.lastError} ${stopDiagnostic}"
+                            }
+                        } else if (record.lastError.isEmpty()) {
+                            record.lastError = stopDiagnostic
                         }
                     case None => ()
                 }
@@ -1495,11 +1665,29 @@ public func stopServicePlugin(serviceId: String, reason!: String = "", timeoutMi
                     case None => ()
                 }
             }
+            let leaseDiagnostic = servicePluginLeaseStopDiagnostic(record)
+            let cleanLease = !leaseDiagnostic.startsWith("lease_not_stopped_after_stop")
+            if (!cleanLease) {
+                record.status = "degraded"
+                record.degradedReason = "lease_not_stopped_after_stop"
+                record.stateFlushed = false
+                if (!record.lastError.isEmpty()) {
+                    record.lastError = "${record.lastError} ${leaseDiagnostic}"
+                } else {
+                    record.lastError = leaseDiagnostic
+                }
+                if (!servicePluginPidAlive(record.pid)) {
+                    record.pid = 0
+                }
+                return ServiceStopResult(false, serviceId.trimAscii(), "degraded", stateFlushed: false, diagnostic: record.lastError)
+            }
             record.status = "stopped"
             record.degradedReason = reason.trimAscii()
             record.stateFlushed = true
             record.pid = 0
-            ServiceStopResult(true, serviceId.trimAscii(), "stopped", stateFlushed: true, diagnostic: record.lastError)
+            let diagnostic = if (record.lastError.isEmpty()) { leaseDiagnostic } else { "${record.lastError} ${leaseDiagnostic}" }
+            record.lastError = diagnostic
+            ServiceStopResult(true, serviceId.trimAscii(), "stopped", stateFlushed: true, diagnostic: diagnostic)
         case None => ServiceStopResult(false, serviceId.trimAscii(), "missing", diagnostic: "service plugin is not registered")
     }
 }
