@@ -119,11 +119,88 @@ public class ServicePluginEventDispatcherTest {
         recordServicePluginRuntimeDispatchForTest("gitcode-monitor", frame, result)
         match (getServicePluginSnapshot("gitcode-monitor")) {
             case Some(snapshot) =>
+                @Expect(snapshot.status, "degraded")
+                @Expect(snapshot.degradedReason, "orphan_detected")
                 @Expect(snapshot.lastError.contains("status=orphan_detected"), true)
                 @Expect(snapshot.lastError.contains("eventIdHash="), true)
             case None => @Expect(true, false)
         }
         this.resetDispatcherHooks()
+    }
+
+    @TestCase
+    public func tP6P001OrphanDiagnosticKeepsLaterGitCodeEventsFailClosedInRuntime(): Unit {
+        // T-P6-P-001: once Metis records orphan_detected, later GCM business
+        // frames from that process must not fan out to IM or writeback.
+        this.resetDispatcherHooks()
+        this.registerGitCodeWritebackPlugin()
+        let orphan = ServiceFrame(
+            "event",
+            "orphan-session-2",
+            "gitcode-monitor",
+            method: "emitCapabilityEvent",
+            capabilityId: "gitcode.monitor.orphan_detected",
+            payload: "{\"ok\":true,\"status\":\"orphan_detected\",\"pluginId\":\"gitcode-monitor\",\"sessionId\":\"gitcode-monitor-2\",\"pid\":1234,\"parentPid\":5678,\"orphanReason\":\"parent_lost\"}"
+        )
+        let orphanResult = dispatchServicePluginEvent(orphan, store: ServicePluginPendingJobStore())
+        recordServicePluginRuntimeDispatchForTest("gitcode-monitor", orphan, orphanResult)
+        let messages = ArrayList<String>()
+        let drafts = ArrayList<String>()
+        setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent =>
+            this.targetRows([this.target(channel: "telegram", peerId: "tg-peer")])
+        }))
+        setServicePluginWebhookGeneratedReplyHandlerForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent, _target: ServicePluginDeliveryTarget =>
+            drafts.add("called")
+            ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "must not run")
+        }))
+        setServicePluginEventDeliveryForTest(Some({ _target: ServicePluginDeliveryTarget, text: String =>
+            messages.add(text)
+            ServicePluginEventDeliveryResult(true, "sent")
+        }))
+        try {
+            let accepted = this.acceptedFrame(eventId: "gitcode:cangjie/community:issue:orphan-after")
+            let result = dispatchServicePluginEvent(accepted, store: ServicePluginPendingJobStore())
+            recordServicePluginRuntimeDispatchForTest("gitcode-monitor", accepted, result)
+            @Expect(result.ok, false)
+            @Expect(result.status, "service_orphan_draining")
+            @Expect(messages.size, 0)
+            @Expect(drafts.size, 0)
+        } finally {
+            this.resetDispatcherHooks()
+        }
+    }
+
+    @TestCase
+    public func tP6N001NormalGitCodeEventHasNoOrphanRuntimeDiagnostic(): Unit {
+        // T-P6-N-001.
+        this.resetDispatcherHooks()
+        this.registerGitCodeWritebackPlugin()
+        let messages = ArrayList<String>()
+        setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent =>
+            this.targetRows([this.target(channel: "telegram", peerId: "tg-peer")])
+        }))
+        setServicePluginWebhookGeneratedReplyHandlerForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent, _target: ServicePluginDeliveryTarget =>
+            ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "normal draft")
+        }))
+        setServicePluginEventDeliveryForTest(Some({ _target: ServicePluginDeliveryTarget, text: String =>
+            messages.add(text)
+            ServicePluginEventDeliveryResult(true, "sent")
+        }))
+        try {
+            let result = dispatchServicePluginEvent(this.acceptedFrame(eventId: "gitcode:cangjie/community:issue:normal-after"), store: ServicePluginPendingJobStore())
+            recordServicePluginRuntimeDispatchForTest("gitcode-monitor", this.acceptedFrame(eventId: "gitcode:cangjie/community:issue:normal-after"), result)
+            @Expect(result.ok, true)
+            @Expect(result.status.contains("generated_reply"), true)
+            @Expect(messages.size, 1)
+            match (getServicePluginSnapshot("gitcode-monitor")) {
+                case Some(snapshot) =>
+                    @Expect(snapshot.degradedReason.contains("orphan"), false)
+                    @Expect(snapshot.lastError.contains("orphan_detected"), false)
+                case None => @Expect(true, false)
+            }
+        } finally {
+            this.resetDispatcherHooks()
+        }
     }
 
     @TestCase

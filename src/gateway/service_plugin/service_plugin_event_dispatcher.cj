@@ -334,6 +334,9 @@ public func dispatchServicePluginEvent(
     if (frame.serviceId != "gitcode-monitor") {
         return servicePluginDispatchResult(frame, false, "service_mismatch", diagnostic: "unsupported event service")
     }
+    if (frame.capabilityId != "gitcode.monitor.orphan_detected" && servicePluginRuntimeIsOrphanDrainingForDispatch(frame.serviceId)) {
+        return servicePluginDispatchResult(frame, false, "service_orphan_draining", diagnostic: "service plugin is draining after orphan_detected")
+    }
     if (frame.capabilityId == "gitcode.event.accepted") {
         return recordGitCodeAcceptedEventForFutureReply(frame, store: store)
     }

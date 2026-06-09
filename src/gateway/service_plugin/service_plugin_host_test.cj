@@ -2,7 +2,8 @@ package metis.gateway.service_plugin
 
 import std.collection.ArrayList
 import std.convert.Parsable
-import std.fs.{File, Path, exists}
+import std.env.getProcessId
+import std.fs.{Directory, File, Path, exists, remove}
 import std.sync.Mutex
 import std.time.*
 import std.unittest.testmacro.*
@@ -192,6 +193,17 @@ public class ServicePluginHostTest {
         exists(path)
     }
 
+    private func writeGitCodeLease(home: Path, instanceId: String, state: String, pid: Int64): Path {
+        let dir = home.join("service-plugin").join("runtime").join("gitcode-monitor")
+        Directory.create(dir, recursive: true)
+        let leasePath = dir.join("${instanceId}.lease.json")
+        File.writeTo(
+            leasePath,
+            ("{\"state\":\"${state}\",\"status\":\"${state}\",\"pluginId\":\"gitcode-monitor\",\"sessionId\":\"${instanceId}\",\"pid\":${pid},\"parentPid\":${getProcessId()},\"bindHost\":\"127.0.0.1\",\"port\":18080}").toArray()
+        )
+        leasePath
+    }
+
     private func registerStdio(responsePayload: String, initPayload!: String = "{ \"ok\": true, \"status\": \"ready\" }"): Unit {
         resetServicePluginHostForTest()
         let result = registerServicePlugin(ServicePluginRegistration(this.stdioManifest(responsePayload, initPayload: initPayload)))
@@ -322,6 +334,134 @@ public class ServicePluginHostTest {
         }
         let stopped = stopServicePlugin("stdio-service", reason: "test")
         @Expect(stopped.ok, true)
+    }
+
+    @TestCase
+    public func tP5MetisEnvInjectionForGitCodeMonitorStartupPrerequisites(): Unit {
+        // T-P5 Metis-side env injection coverage.
+        withServicePluginHostTestHome("service-plugin-p5-gcm-env", { _home: Path =>
+            let capturePath = Path("/tmp/metis-gcm-service-plugin-env-${DateTime.now().toUnixTimeStamp().toNanoseconds()}.txt")
+            try { remove(capturePath, recursive: true) } catch (_: Exception) { () }
+            let initLine = this.gitCodeInitLine()
+            let script = "printf '%s\\n' \"$METIS_SERVICE_PLUGIN_SESSION_ID|$METIS_SERVICE_PLUGIN_LEASE_PATH|$METIS_SERVICE_PLUGIN_PARENT_PID\" > '${capturePath.toString()}'; printf '%s\\n' '${initLine}'; read ignored || true"
+            this.registerGitCodeStdioScript(script)
+            try {
+                let started = ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 2000)
+                @Expect(started.ok, true)
+                @Expect(this.waitForFile(capturePath, timeoutMillis: 2000), true)
+                let captured = String.fromUtf8(File.readFrom(capturePath)).trimAscii()
+                let parts = captured.split("|")
+                @Expect(parts.size, 3)
+                @Expect(parts[0], "gitcode-monitor-1")
+                @Expect(parts[1].contains("/service-plugin/runtime/gitcode-monitor/gitcode-monitor-1.lease.json"), true)
+                @Expect(try { Int64.parse(parts[2]) > 0 } catch (_: Exception) { false }, true)
+            } finally {
+                resetServicePluginHostForTest()
+                try { remove(capturePath, recursive: true) } catch (_: Exception) { () }
+            }
+        })
+    }
+
+    @TestCase
+    public func tP4N001StartupFailsFastWhenRunningLeaseOwnerIsAlive(): Unit {
+        // T-P4-N-001, T-P7-E2E-006 Metis-side prerequisite.
+        withServicePluginHostTestHome("service-plugin-p4-stale-running-lease", { home: Path =>
+            let launchMarker = home.join("gcm-launch-marker.txt")
+            let _ = this.writeGitCodeLease(home, "gitcode-monitor-old", "running", getProcessId())
+            let script = "printf started > '${launchMarker.toString()}'; printf '%s\\n' '${this.gitCodeInitLine()}'; read ignored || true"
+            this.registerGitCodeStdioScript(script)
+            try {
+                let started = ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000)
+                @Expect(started.ok, false)
+                @Expect(started.status, "stale_lease_before_start")
+                @Expect(started.diagnostic.contains("stale_lease_before_start"), true)
+                @Expect(exists(launchMarker), false)
+                match (getServicePluginSnapshot("gitcode-monitor")) {
+                    case Some(snapshot) =>
+                        @Expect(snapshot.status, "degraded")
+                        @Expect(snapshot.degradedReason, "stale_lease_before_start")
+                        @Expect(snapshot.pid, 0)
+                    case None => @Expect(true, false)
+                }
+            } finally {
+                resetServicePluginHostForTest()
+            }
+        })
+    }
+
+    @TestCase
+    public func tP4P001StoppedOldLeaseDoesNotBlockNewGitCodeMonitorStart(): Unit {
+        // T-P4-P-001, T-P7-E2E-006 Metis-side restart prerequisite.
+        withServicePluginHostTestHome("service-plugin-p4-stopped-old-lease", { home: Path =>
+            let launchMarker = home.join("gcm-launch-marker.txt")
+            let _ = this.writeGitCodeLease(home, "gitcode-monitor-old", "stopped", getProcessId())
+            let script = "printf started > '${launchMarker.toString()}'; printf '%s\\n' '${this.gitCodeInitLine()}'; read ignored || true"
+            this.registerGitCodeStdioScript(script)
+            try {
+                let started = ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000)
+                @Expect(started.ok, true)
+                @Expect(this.waitForFile(launchMarker, timeoutMillis: 1000), true)
+                match (getServicePluginSnapshot("gitcode-monitor")) {
+                    case Some(snapshot) =>
+                        @Expect(snapshot.status, "running")
+                        @Expect(snapshot.pid > 0, true)
+                    case None => @Expect(true, false)
+                }
+            } finally {
+                let _ = stopServicePlugin("gitcode-monitor", reason: "test", timeoutMillis: 1000)
+                resetServicePluginHostForTest()
+            }
+        })
+    }
+
+    @TestCase
+    public func tP4U001GracefulStopReportsExitedAndVerifiesStoppedLease(): Unit {
+        // T-P4-U-001.
+        withServicePluginHostTestHome("service-plugin-p4-graceful-stop", { _home: Path =>
+            let script = "printf '%s\\n' '${this.gitCodeInitLine()}'; while read line; do printf '{\"state\":\"stopped\",\"status\":\"stopped\",\"pluginId\":\"gitcode-monitor\",\"sessionId\":\"%s\",\"pid\":%s,\"parentPid\":%s}\\n' \"$METIS_SERVICE_PLUGIN_SESSION_ID\" \"$$\" \"$METIS_SERVICE_PLUGIN_PARENT_PID\" > \"$METIS_SERVICE_PLUGIN_LEASE_PATH\"; exit 0; done"
+            this.registerGitCodeStdioScript(script)
+            try {
+                let started = ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000)
+                @Expect(started.ok, true)
+                let stopped = stopServicePlugin("gitcode-monitor", reason: "test", timeoutMillis: 3000)
+                @Expect(stopped.ok, true)
+                @Expect(stopped.status, "stopped")
+                @Expect(stopped.diagnostic.contains("lease_stopped"), true)
+                @Expect(stopped.diagnostic.contains("still_alive"), false)
+                @Expect(stopped.diagnostic.contains("lease_not_stopped_after_stop"), false)
+                match (getServicePluginSnapshot("gitcode-monitor")) {
+                    case Some(snapshot) =>
+                        @Expect(snapshot.status, "stopped")
+                        @Expect(snapshot.pid, 0)
+                    case None => @Expect(true, false)
+                }
+            } finally {
+                resetServicePluginHostForTest()
+            }
+        })
+    }
+
+    @TestCase
+    public func tP4B001ForcedStopKeepsDiagnosticWhenLeaseNotStopped(): Unit {
+        // T-P4-B-001.
+        withServicePluginHostTestHome("service-plugin-p4-forced-stop-lease", { _home: Path =>
+            let script = "printf '%s\\n' '${this.gitCodeInitLine()}'; printf '{\"state\":\"running\",\"status\":\"running\",\"pluginId\":\"gitcode-monitor\",\"sessionId\":\"%s\",\"pid\":%s,\"parentPid\":%s}\\n' \"$METIS_SERVICE_PLUGIN_SESSION_ID\" \"$$\" \"$METIS_SERVICE_PLUGIN_PARENT_PID\" > \"$METIS_SERVICE_PLUGIN_LEASE_PATH\"; trap '' TERM; while true; do read -t 1 ignored || true; done"
+            this.registerGitCodeStdioScript(script)
+            try {
+                let started = ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000)
+                @Expect(started.ok, true)
+                match (getServicePluginSnapshot("gitcode-monitor")) {
+                    case Some(snapshot) =>
+                        let leasePath = Path("/tmp").join("unused")
+                        @Expect(snapshot.pid > 0, true)
+                    case None => @Expect(true, false)
+                }
+                let stopped = stopServicePlugin("gitcode-monitor", reason: "test", timeoutMillis: 200)
+                @Expect(stopped.diagnostic.contains("lease_not_stopped_after_stop"), true)
+            } finally {
+                resetServicePluginHostForTest()
+            }
+        })
     }
 
     @TestCase
