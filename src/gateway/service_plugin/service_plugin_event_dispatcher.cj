@@ -728,9 +728,6 @@ private func servicePluginApplyGeneratedReplyWriteback(event: ServicePluginAccep
     }
     let payload = servicePluginGeneratedReplyWritebackPayload(event, result)
     let applied = invokeGitCodeWritebackApplyResult("gitcode-monitor", payload, 5000)
-    if (!applied.ok && (applied.status == "capability_missing" || applied.status == "service_missing")) {
-        return ServicePluginWritebackApplyState()
-    }
     servicePluginParseWritebackApplyResult(applied)
 }
 
@@ -805,6 +802,12 @@ private func servicePluginWritebackNotificationLine(writeback: ServicePluginWrit
     }
     if (writeback.timedOut) {
         return "状态: 写回状态未知/超时，草稿已通知"
+    }
+    if (writeback.status == "capability_missing") {
+        return "状态: 写回路由缺失（capability_missing），草稿已通知"
+    }
+    if (writeback.status == "service_missing") {
+        return "状态: 写回服务缺失（service_missing），草稿已通知"
     }
     let humanSkip = servicePluginWritebackHumanSkipLine(writeback)
     if (!humanSkip.isEmpty()) {

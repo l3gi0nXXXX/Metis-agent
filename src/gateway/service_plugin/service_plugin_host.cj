@@ -687,10 +687,11 @@ private class ServicePluginResponseQueue {
         let corr = correlationId.trimAscii()
         let effective = if (timeoutMs > 0) { timeoutMs } else { 30000 }
         synchronized(this.lock) {
-            let _ = this.condition.waitUntil({ => this.closed || !this.responses.isEmpty() }, timeout: Duration.millisecond * effective)
-            if (!this.responses.isEmpty()) {
-                let frame = this.responses[0]
-                this.responses.remove(at: 0)
+            let _ = this.condition.waitUntil({ => this.closed || this.findResponseIndex(corr) >= 0 }, timeout: Duration.millisecond * effective)
+            let responseIndex = this.findResponseIndex(corr)
+            if (responseIndex >= 0) {
+                let frame = this.responses[responseIndex]
+                this.responses.remove(at: responseIndex)
                 let validation = validateServicePluginResponseFrame(
                     frame,
                     expectedServiceId,
@@ -747,6 +748,7 @@ private class ServicePluginProcessEnsureResult {
 private var servicePluginActiveProcesses = HashMap<String, ServicePluginStdioProcess>()
 private var servicePluginResponseQueues = HashMap<String, ServicePluginResponseQueue>()
 private let servicePluginProcessLock = Mutex()
+private let servicePluginRuntimeRecordLock = Mutex()
 
 private func readExpectedServiceFrame(process: ServicePluginStdioProcess, policy: ServicePluginStdoutReadPolicy): ServicePluginStdoutReadResult {
     var noiseLineCount: Int64 = 0
@@ -1288,13 +1290,16 @@ private func servicePluginEventPump(record: ServicePluginRuntimeRecord, process:
             continue
         }
         if (frame.frameType == "event") {
-            record.eventFrames.add(frame)
+            synchronized(servicePluginRuntimeRecordLock) {
+                record.eventFrames.add(frame)
+            }
             let handled = handleServiceCapabilityEvent(ServiceCapabilityEvent(frame.serviceId, frame.capabilityId, payload: frame.payload))
             if (handled.ok) {
-                let dispatch = dispatchServicePluginEvent(frame)
-                servicePluginRecordRuntimeDispatch(record, frame, dispatch)
+                servicePluginScheduleEventDispatch(record, frame)
             } else {
-                record.lastError = redactServicePayload(handled.diagnostic).text
+                synchronized(servicePluginRuntimeRecordLock) {
+                    record.lastError = redactServicePayload(handled.diagnostic).text
+                }
             }
             continue
         }
@@ -1304,8 +1309,21 @@ private func servicePluginEventPump(record: ServicePluginRuntimeRecord, process:
     }
 }
 
+private func servicePluginScheduleEventDispatch(record: ServicePluginRuntimeRecord, frame: ServiceFrame): Unit {
+    spawn {
+        let dispatch = dispatchServicePluginEvent(frame)
+        servicePluginRecordRuntimeDispatchLocked(record, frame, dispatch)
+    }
+}
+
+private func servicePluginRecordRuntimeDispatchLocked(record: ServicePluginRuntimeRecord, frame: ServiceFrame, dispatch: ServicePluginEventDispatchResult): Unit {
+    synchronized(servicePluginRuntimeRecordLock) {
+        servicePluginRecordRuntimeDispatch(record, frame, dispatch)
+    }
+}
+
 private func servicePluginRecordRuntimeDispatch(record: ServicePluginRuntimeRecord, frame: ServiceFrame, dispatch: ServicePluginEventDispatchResult): Unit {
-    if (!dispatch.ok || dispatch.status == "no_subscribers" || dispatch.status == "generated_reply_partially_delivered" || dispatch.status == "generated_reply_delivery_failed") {
+    if (!dispatch.ok || dispatch.status == "no_subscribers" || dispatch.status == "generated_reply_degraded_delivered" || dispatch.status == "generated_reply_partially_delivered" || dispatch.status == "generated_reply_delivery_failed") {
         record.lastError = servicePluginDispatchDiagnosticSummary(frame, dispatch)
         return
     }
@@ -1318,7 +1336,7 @@ public func recordServicePluginRuntimeDispatchForTest(serviceId: String, frame: 
             if (record.status == "registered") {
                 record.status = "running"
             }
-            servicePluginRecordRuntimeDispatch(record, frame, dispatch)
+            servicePluginRecordRuntimeDispatchLocked(record, frame, dispatch)
         case None => ()
     }
 }

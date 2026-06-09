@@ -1,6 +1,8 @@
 package metis.gateway.service_plugin
 
 import std.collection.ArrayList
+import std.sync.Mutex
+import std.time.*
 import std.unittest.testmacro.*
 
 @Test
@@ -72,6 +74,108 @@ public class ServicePluginHostTest {
 
     private func stdioInvokeResponseLine(payload: String, serviceId!: String = "stdio-service", capabilityId!: String = "stdio.monitor.status", correlationId!: String = "corr-stdio-service-1-stdio.monitor.status"): String {
         "{\"type\":\"response\",\"frameId\":\"invoke-1\",\"serviceId\":\"${serviceId}\",\"method\":\"invokeCapability\",\"capabilityId\":\"${capabilityId}\",\"correlationId\":\"${correlationId}\",\"payload\":${payload}}"
+    }
+
+    private func gitCodeStdioManifestFromScript(script: String): ServicePluginManifest {
+        let caps = ArrayList<ServiceCapabilityRecord>()
+        caps.add(ServiceCapabilityRecord("gitcode.event.accepted", "event"))
+        caps.add(ServiceCapabilityRecord("gitcode.writeback.apply_result", "controlAction"))
+        ServicePluginManifest(
+            schema: METIS_SERVICE_PLUGIN_SCHEMA,
+            pluginId: "gitcode-monitor",
+            displayName: "GitCode Monitor",
+            kind: "service",
+            protocolVersion: "1.0",
+            entryCommand: "/bin/zsh",
+            entryArgs: ["-lc", script],
+            hasConfigSchema: true,
+            capabilityDeclarations: caps
+        )
+    }
+
+    private func registerGitCodeStdioScript(script: String): Unit {
+        resetServicePluginHostForTest()
+        let result = registerServicePlugin(ServicePluginRegistration(this.gitCodeStdioManifestFromScript(script)))
+        @Expect(result.ok, true)
+    }
+
+    private func gitCodeInitLine(): String {
+        "{\"type\":\"response\",\"frameId\":\"init-1\",\"serviceId\":\"gitcode-monitor\",\"method\":\"initialize\",\"payload\":{\"ok\":true,\"status\":\"ready\"}}"
+    }
+
+    private func gitCodeAcceptedEventLine(eventId!: String = "gitcode:Cangjie/community:issue:3", frameId!: String = "event-accepted-1"): String {
+        "{\"type\":\"event\",\"frameId\":\"${frameId}\",\"serviceId\":\"gitcode-monitor\",\"method\":\"emitCapabilityEvent\",\"capabilityId\":\"gitcode.event.accepted\",\"payload\":{\"jobId\":\"webhook-${eventId}\",\"eventId\":\"${eventId}\",\"repo\":\"Cangjie/community\",\"kind\":\"issue\",\"number\":\"3\",\"title\":\"Issue 3\",\"url\":\"https://gitcode.com/Cangjie/community/issues/3\",\"author\":\"external-user\",\"content\":\"please review\"}}"
+    }
+
+    private func gitCodeWritebackResponseLine(
+        frameId!: String = "writeback-response-1",
+        correlationId!: String = "corr-gitcode-monitor-1-gitcode.writeback.apply_result",
+        replyUrl!: String = "https://gitcode.com/Cangjie/community/issues/3#note_1"
+    ): String {
+        "{\"type\":\"response\",\"frameId\":\"${frameId}\",\"serviceId\":\"gitcode-monitor\",\"method\":\"invokeCapability\",\"capabilityId\":\"gitcode.writeback.apply_result\",\"correlationId\":\"${correlationId}\",\"payload\":{\"ok\":true,\"status\":\"posted\",\"posted\":true,\"replyUrl\":\"${replyUrl}\"}}"
+    }
+
+    private func gitCodeHeartbeatLine(frameId!: String = "heartbeat-1"): String {
+        "{\"type\":\"heartbeat\",\"frameId\":\"${frameId}\",\"serviceId\":\"gitcode-monitor\",\"method\":\"heartbeat\",\"payload\":{\"ok\":true,\"status\":\"alive\"}}"
+    }
+
+    private func gitCodeReentrantWritebackScript(includeUnrelatedFrames!: Bool = false): String {
+        let initLine = this.gitCodeInitLine()
+        let eventLine = this.gitCodeAcceptedEventLine()
+        let heartbeatLine = this.gitCodeHeartbeatLine()
+        let unrelatedResponse = this.gitCodeWritebackResponseLine(frameId: "unrelated-response", correlationId: "corr-unrelated")
+        let responseLine = this.gitCodeWritebackResponseLine()
+        var script = "printf '%s\\n' '${initLine}'; printf '%s\\n' '${eventLine}'; read request"
+        if (includeUnrelatedFrames) {
+            script += "; printf '%s\\n' '${heartbeatLine}'; printf '%s\\n' '${unrelatedResponse}'"
+        }
+        script += "; printf '%s\\n' '${responseLine}'; read ignored || true"
+        script
+    }
+
+    private func gitCodeNoWritebackResponseScript(): String {
+        let initLine = this.gitCodeInitLine()
+        let eventLine = this.gitCodeAcceptedEventLine(eventId: "gitcode:Cangjie/community:issue:timeout", frameId: "event-timeout")
+        let heartbeatLine = this.gitCodeHeartbeatLine(frameId: "heartbeat-during-timeout")
+        "printf '%s\\n' '${initLine}'; printf '%s\\n' '${eventLine}'; read request; printf '%s\\n' '${heartbeatLine}'; read ignored || true"
+    }
+
+    private func waitForMessage(messages: ArrayList<String>, lock: Mutex, timeoutMillis!: Int64 = 2000): Bool {
+        var waited: Int64 = 0
+        while (waited < timeoutMillis) {
+            let hasMessage = synchronized(lock) { messages.size > 0 }
+            if (hasMessage) {
+                return true
+            }
+            sleep(Duration.millisecond * 25)
+            waited += 25
+        }
+        synchronized(lock) { messages.size > 0 }
+    }
+
+    private func firstMessage(messages: ArrayList<String>, lock: Mutex): String {
+        synchronized(lock) {
+            if (messages.size == 0) { "" } else { messages[0] }
+        }
+    }
+
+    private func waitForHeartbeat(serviceId: String, timeoutMillis!: Int64 = 1000): Bool {
+        var waited: Int64 = 0
+        while (waited < timeoutMillis) {
+            match (getServicePluginSnapshot(serviceId)) {
+                case Some(snapshot) =>
+                    if (snapshot.lastHeartbeatAtMillis >= 0) {
+                        return true
+                    }
+                case None => ()
+            }
+            sleep(Duration.millisecond * 25)
+            waited += 25
+        }
+        match (getServicePluginSnapshot(serviceId)) {
+            case Some(snapshot) => snapshot.lastHeartbeatAtMillis >= 0
+            case None => false
+        }
     }
 
     private func registerStdio(responsePayload: String, initPayload!: String = "{ \"ok\": true, \"status\": \"ready\" }"): Unit {
@@ -419,9 +523,110 @@ public class ServicePluginHostTest {
         this.registerStdioScript(this.stdioScriptWithInvokeLines(initLine, [wrongCorrelation, correctResponse]))
         try {
             let result = invokeRegisteredCapability(CapabilityInvokeRequest("stdio.monitor.status", payload: "{}"))
-            @Expect(result.ok, false)
-            @Expect(result.status, "correlation_mismatch")
+            @Expect(result.ok, true)
+            @Expect(result.status, "ok")
         } finally {
+            resetServicePluginHostForTest()
+        }
+    }
+
+    @TestCase
+    public func tRoot001AsyncEventPumpAllowsSamePluginWritebackResponse(): Unit {
+        // T-ROOT-001, T-ASYNC-001, T-E2E-SP-001 (Metis half-chain)
+        this.registerGitCodeStdioScript(this.gitCodeReentrantWritebackScript())
+        let messages = ArrayList<String>()
+        let lock = Mutex()
+        setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent =>
+            let rows = ArrayList<ServicePluginDeliveryTarget>()
+            rows.add(ServicePluginDeliveryTarget("telegram", "acct", "peer"))
+            rows
+        }))
+        setServicePluginWebhookGeneratedReplyHandlerForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent, _target: ServicePluginDeliveryTarget =>
+            ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "建议补充回归测试。")
+        }))
+        setServicePluginEventDeliveryForTest(Some({ _target: ServicePluginDeliveryTarget, text: String =>
+            synchronized(lock) { messages.add(text) }
+            ServicePluginEventDeliveryResult(true, "sent")
+        }))
+        try {
+            let started = ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000)
+            @Expect(started.ok, true)
+            @Expect(this.waitForMessage(messages, lock, timeoutMillis: 6500), true)
+            let message = this.firstMessage(messages, lock)
+            @Expect(message.contains("GitCode 回复已写回"), true)
+            @Expect(message.contains("写回状态未知/超时"), false)
+            @Expect(message.contains("\"replyUrl\""), false)
+        } finally {
+            setServicePluginWebhookSubscribersProviderForTest(None<(ServicePluginAcceptedGitCodeEvent) -> ArrayList<ServicePluginDeliveryTarget>>)
+            setServicePluginWebhookGeneratedReplyHandlerForTest(None<(ServicePluginAcceptedGitCodeEvent, ServicePluginDeliveryTarget) -> ServicePluginGeneratedReplyResult>)
+            setServicePluginEventDeliveryForTest(None)
+            resetServicePluginGeneratedReplyStateForTest()
+            resetServicePluginHostForTest()
+        }
+    }
+
+    @TestCase
+    public func tRoot002AsyncWritebackIgnoresUnrelatedHeartbeatAndResponseFrames(): Unit {
+        // T-ROOT-002, T-ASYNC-002, T-ASYNC-005
+        this.registerGitCodeStdioScript(this.gitCodeReentrantWritebackScript(includeUnrelatedFrames: true))
+        let messages = ArrayList<String>()
+        let lock = Mutex()
+        setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent =>
+            let rows = ArrayList<ServicePluginDeliveryTarget>()
+            rows.add(ServicePluginDeliveryTarget("telegram", "acct", "peer"))
+            rows
+        }))
+        setServicePluginWebhookGeneratedReplyHandlerForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent, _target: ServicePluginDeliveryTarget =>
+            ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "建议补充回归测试。")
+        }))
+        setServicePluginEventDeliveryForTest(Some({ _target: ServicePluginDeliveryTarget, text: String =>
+            synchronized(lock) { messages.add(text) }
+            ServicePluginEventDeliveryResult(true, "sent")
+        }))
+        try {
+            let started = ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000)
+            @Expect(started.ok, true)
+            @Expect(this.waitForMessage(messages, lock, timeoutMillis: 6500), true)
+            let message = this.firstMessage(messages, lock)
+            @Expect(message.contains("GitCode 回复已写回"), true)
+            @Expect(message.contains("unexpected_frame"), false)
+            match (getServicePluginSnapshot("gitcode-monitor")) {
+                case Some(snapshot) => @Expect(snapshot.status, "running")
+                case None => @Expect(true, false)
+            }
+        } finally {
+            setServicePluginWebhookSubscribersProviderForTest(None<(ServicePluginAcceptedGitCodeEvent) -> ArrayList<ServicePluginDeliveryTarget>>)
+            setServicePluginWebhookGeneratedReplyHandlerForTest(None<(ServicePluginAcceptedGitCodeEvent, ServicePluginDeliveryTarget) -> ServicePluginGeneratedReplyResult>)
+            setServicePluginEventDeliveryForTest(None)
+            resetServicePluginGeneratedReplyStateForTest()
+            resetServicePluginHostForTest()
+        }
+    }
+
+    @TestCase
+    public func tAsync005PumpContinuesHeartbeatWhileWritebackWaits(): Unit {
+        // T-ASYNC-003, T-ASYNC-005, T-E2E-SP-007
+        this.registerGitCodeStdioScript(this.gitCodeNoWritebackResponseScript())
+        setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent =>
+            let rows = ArrayList<ServicePluginDeliveryTarget>()
+            rows.add(ServicePluginDeliveryTarget("telegram", "acct", "peer"))
+            rows
+        }))
+        setServicePluginWebhookGeneratedReplyHandlerForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent, _target: ServicePluginDeliveryTarget =>
+            ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "超时也要通知。")
+        }))
+        setServicePluginEventDeliveryForTest(Some({ _target: ServicePluginDeliveryTarget, _text: String =>
+            ServicePluginEventDeliveryResult(true, "sent")
+        }))
+        try {
+            let started = ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000)
+            @Expect(started.ok, true)
+            @Expect(this.waitForHeartbeat("gitcode-monitor", timeoutMillis: 1000), true)
+        } finally {
+            setServicePluginWebhookSubscribersProviderForTest(None<(ServicePluginAcceptedGitCodeEvent) -> ArrayList<ServicePluginDeliveryTarget>>)
+            setServicePluginWebhookGeneratedReplyHandlerForTest(None<(ServicePluginAcceptedGitCodeEvent, ServicePluginDeliveryTarget) -> ServicePluginGeneratedReplyResult>)
+            setServicePluginEventDeliveryForTest(None)
+            resetServicePluginGeneratedReplyStateForTest()
             resetServicePluginHostForTest()
         }
     }
