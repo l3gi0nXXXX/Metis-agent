@@ -169,13 +169,16 @@ public class ServicePluginEventDispatcherTest {
         try {
             let result = dispatchServicePluginEvent(this.acceptedFrame(), store: ServicePluginPendingJobStore())
             @Expect(result.ok, true)
-            @Expect(result.status, "generated_reply_delivered")
+            @Expect(result.status, "generated_reply_degraded_delivered")
             @Expect(result.targetCount, 1)
             @Expect(result.deliverySuccess, 1)
             @Expect(result.diagnosticHash.size, 64)
             @Expect(messages.size, 1)
             @Expect(messages[0].contains("GitCode 回复草稿"), true)
             @Expect(messages[0].contains("https://gitcode.com/cangjie/community/pulls/71"), true)
+            @Expect(messages[0].contains("写回路由缺失"), true)
+            @Expect(messages[0].contains("capability_missing"), true)
+            @Expect(messages[0].contains("dryRun=true"), false)
             @Expect(servicePluginWebhookDispatchStatsSnapshot().size, 1)
         } finally {
             this.resetDispatcherHooks()
@@ -280,7 +283,7 @@ public class ServicePluginEventDispatcherTest {
         try {
             let issue = dispatchServicePluginEvent(this.acceptedFrame(eventId: "issue-1", kind: "issue", number: "1", url: "https://gitcode.com/cangjie/community/issues/1", title: "Issue title"), store: ServicePluginPendingJobStore())
             @Expect(issue.ok, true)
-            @Expect(issue.status, "generated_reply_delivered")
+            @Expect(issue.status, "generated_reply_degraded_delivered")
             @Expect(issue.targetCount, 2)
             @Expect(issue.deliverySuccess, 2)
             @Expect(messages.size, 2)
@@ -288,7 +291,9 @@ public class ServicePluginEventDispatcherTest {
             @Expect(messages[0].contains("GitCode 回复草稿"), true)
             @Expect(messages[0].contains("来源:"), true)
             @Expect(messages[0].contains("https://gitcode.com/cangjie/community/issues/1"), true)
-            @Expect(messages[0].contains("dryRun=true"), true)
+            @Expect(messages[0].contains("写回路由缺失"), true)
+            @Expect(messages[0].contains("capability_missing"), true)
+            @Expect(messages[0].contains("dryRun=true"), false)
 
             for (_ in 0..9) {
                 let duplicate = dispatchServicePluginEvent(this.acceptedFrame(eventId: "issue-1", kind: "issue", number: "1", url: "https://gitcode.com/cangjie/community/issues/1", title: "Issue title"), store: ServicePluginPendingJobStore())
@@ -298,8 +303,8 @@ public class ServicePluginEventDispatcherTest {
             @Expect(messages.size, 2)
             @Expect(draftCalls.size, 1)
 
-            @Expect(dispatchServicePluginEvent(this.acceptedFrame(eventId: "pr-1", kind: "pr", number: "2", url: "https://gitcode.com/cangjie/community/pulls/2"), store: ServicePluginPendingJobStore()).status, "generated_reply_delivered")
-            @Expect(dispatchServicePluginEvent(this.acceptedFrame(eventId: "comment-1", kind: "comment", number: "2", url: "https://gitcode.com/cangjie/community/pulls/2#note_9", content: "comment"), store: ServicePluginPendingJobStore()).status, "generated_reply_delivered")
+            @Expect(dispatchServicePluginEvent(this.acceptedFrame(eventId: "pr-1", kind: "pr", number: "2", url: "https://gitcode.com/cangjie/community/pulls/2"), store: ServicePluginPendingJobStore()).status, "generated_reply_degraded_delivered")
+            @Expect(dispatchServicePluginEvent(this.acceptedFrame(eventId: "comment-1", kind: "comment", number: "2", url: "https://gitcode.com/cangjie/community/pulls/2#note_9", content: "comment"), store: ServicePluginPendingJobStore()).status, "generated_reply_degraded_delivered")
             @Expect(messages[2].contains("/pulls/2"), true)
             @Expect(messages[4].contains("#note_9"), true)
 
@@ -443,12 +448,15 @@ public class ServicePluginEventDispatcherTest {
             let accepted = ServiceFrame("event", "a1", "gitcode-monitor", method: "emitCapabilityEvent", capabilityId: "gitcode.event.accepted", payload: "{\"jobId\":\"job-1\",\"eventId\":\"e1\",\"repo\":\"cangjie/community\",\"kind\":\"pr\",\"number\":71,\"title\":\"修复 xxx\",\"url\":\"https://gitcode.com/cangjie/community/pulls/71\"}")
             let acceptedResult = dispatchServicePluginEvent(accepted, store: store)
             @Expect(acceptedResult.ok, true)
-            @Expect(acceptedResult.status, "generated_reply_delivered")
+            @Expect(acceptedResult.status, "generated_reply_degraded_delivered")
             @Expect(messages.size, 1)
             @Expect(messages[0].contains("GitCode 回复草稿"), true)
             @Expect(messages[0].contains("来源: cangjie/community PR #71 https://gitcode.com/cangjie/community/pulls/71"), true)
             @Expect(messages[0].contains("标题: 修复 xxx"), true)
             @Expect(messages[0].contains("请补充 cangjie/community 的对应测试。"), true)
+            @Expect(messages[0].contains("写回路由缺失"), true)
+            @Expect(messages[0].contains("capability_missing"), true)
+            @Expect(messages[0].contains("dryRun=true"), false)
             @Expect(messages[0].contains("\"eventId\""), false)
             @Expect((store.findByJobId("job-1") ?? ServicePluginPendingJob()).status, "running")
 
@@ -495,20 +503,26 @@ public class ServicePluginEventDispatcherTest {
             let issue = ServiceFrame("event", "accepted-issue", "gitcode-monitor", method: "emitCapabilityEvent", capabilityId: "gitcode.event.accepted", payload: "{\"jobId\":\"job-issue\",\"eventId\":\"event-issue\",\"repo\":\"cangjie/community\",\"kind\":\"issue\",\"number\":\"72\",\"title\":\"Issue title\",\"url\":\"https://gitcode.com/cangjie/community/issues/72\",\"author\":\"bob\",\"content\":\"bug report\"}")
             let comment = ServiceFrame("event", "accepted-comment", "gitcode-monitor", method: "emitCapabilityEvent", capabilityId: "gitcode.event.accepted", payload: "{\"jobId\":\"job-comment\",\"eventId\":\"event-comment\",\"repo\":\"cangjie/community\",\"kind\":\"comment\",\"number\":\"71\",\"commentId\":\"9001\",\"title\":\"Comment title\",\"url\":\"https://gitcode.com/cangjie/community/pulls/71#note_9001\",\"author\":\"carol\",\"content\":\"Authorization: Bearer secret token=abc path=/Users/name/private\"}")
 
-            @Expect(dispatchServicePluginEvent(pr, store: store).status, "generated_reply_delivered")
-            @Expect(dispatchServicePluginEvent(issue, store: store).status, "generated_reply_delivered")
-            @Expect(dispatchServicePluginEvent(comment, store: store).status, "generated_reply_delivered")
+            @Expect(dispatchServicePluginEvent(pr, store: store).status, "generated_reply_degraded_delivered")
+            @Expect(dispatchServicePluginEvent(issue, store: store).status, "generated_reply_degraded_delivered")
+            @Expect(dispatchServicePluginEvent(comment, store: store).status, "generated_reply_degraded_delivered")
             @Expect(messages.size, 3)
 
             @Expect(messages[0].contains("来源: cangjie/community PR #71 https://gitcode.com/cangjie/community/pulls/71"), true)
             @Expect(messages[0].contains("标题: PR title"), true)
-            @Expect(messages[0].contains("状态: dryRun=true"), true)
+            @Expect(messages[0].contains("写回路由缺失"), true)
+            @Expect(messages[0].contains("capability_missing"), true)
+            @Expect(messages[0].contains("dryRun=true"), false)
             @Expect(messages[1].contains("来源: cangjie/community Issue #72 https://gitcode.com/cangjie/community/issues/72"), true)
             @Expect(messages[1].contains("标题: Issue title"), true)
-            @Expect(messages[1].contains("状态: dryRun=true"), true)
+            @Expect(messages[1].contains("写回路由缺失"), true)
+            @Expect(messages[1].contains("capability_missing"), true)
+            @Expect(messages[1].contains("dryRun=true"), false)
             @Expect(messages[2].contains("来源: cangjie/community Comment #71 comment #9001 https://gitcode.com/cangjie/community/pulls/71#note_9001"), true)
             @Expect(messages[2].contains("标题: Comment title"), true)
-            @Expect(messages[2].contains("状态: dryRun=true"), true)
+            @Expect(messages[2].contains("写回路由缺失"), true)
+            @Expect(messages[2].contains("capability_missing"), true)
+            @Expect(messages[2].contains("dryRun=true"), false)
 
             for (message in messages) {
                 @Expect(message.contains("\"jobId\""), false)
@@ -656,6 +670,50 @@ public class ServicePluginEventDispatcherTest {
         } finally {
             this.resetDispatcherHooks()
         }
+    }
+
+    @TestCase
+    public func tSuite005RouteMissingWritebackIsVisibleAndNotDryRun(): Unit {
+        // T-SUITE-005
+        this.resetDispatcherHooks()
+        let messages = ArrayList<String>()
+        setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent =>
+            this.targetRows([this.target(channel: "telegram", peerId: "tg-peer")])
+        }))
+        setServicePluginWebhookGeneratedReplyHandlerForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent, _target: ServicePluginDeliveryTarget =>
+            ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "已生成草稿。")
+        }))
+        setServicePluginEventDeliveryForTest(Some({ _target: ServicePluginDeliveryTarget, text: String =>
+            messages.add(text)
+            ServicePluginEventDeliveryResult(true, "sent")
+        }))
+        try {
+            let result = dispatchServicePluginEvent(this.acceptedContractFrame(eventId: "gitcode:Cangjie/cangjie_tools:issue:route-missing"), store: ServicePluginPendingJobStore())
+            @Expect(result.ok, true)
+            @Expect(result.status, "generated_reply_degraded_delivered")
+            @Expect(messages.size, 1)
+            @Expect(messages[0].contains("写回路由缺失"), true)
+            @Expect(messages[0].contains("capability_missing"), true)
+            @Expect(messages[0].contains("dryRun=true"), false)
+            @Expect(messages[0].contains("\"status\""), false)
+        } finally {
+            this.resetDispatcherHooks()
+        }
+    }
+
+    @TestCase
+    public func tSuite005ServiceMissingWritebackStateRendersVisibleDiagnostic(): Unit {
+        // T-SUITE-005
+        let event = ServicePluginAcceptedGitCodeEvent(repo: "Cangjie/community", kind: "issue", number: "1", url: "https://gitcode.com/Cangjie/community/issues/1")
+        let text = renderServicePluginGeneratedReplyNotification(
+            event,
+            ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "草稿。"),
+            writeback: ServicePluginWritebackApplyState(configured: true, ok: false, status: "service_missing", diagnostic: "registered route points to missing service")
+        )
+        @Expect(text.contains("写回服务缺失"), true)
+        @Expect(text.contains("service_missing"), true)
+        @Expect(text.contains("dryRun=true"), false)
+        @Expect(text.contains("\"status\""), false)
     }
 
     @TestCase
