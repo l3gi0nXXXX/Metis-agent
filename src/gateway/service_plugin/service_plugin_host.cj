@@ -1834,6 +1834,9 @@ private func servicePluginRunSupervisorTick(serviceId: String, nowMs: Int64, all
 }
 
 public func runServicePluginSupervisorTickForTest(serviceId: String, nowMs!: Int64 = servicePluginNowMs()): ServicePluginSupervisorTickResult {
+    // Manual supervisor tests own the probe sequence; stop the background worker
+    // so fake healthz probes are not consumed by a concurrent tick.
+    servicePluginStopSupervisorWorker(serviceId.trimAscii())
     servicePluginRunSupervisorTick(serviceId, nowMs, allowRecover: true)
 }
 
