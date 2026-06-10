@@ -399,7 +399,8 @@ private func recordGitCodeMonitorOrphanDetected(frame: ServiceFrame): ServicePlu
     let reason = servicePluginAcceptedEventAnyString(root, "orphanReason")
     let pid = servicePluginJsonInt(root, "pid")
     let parentPid = servicePluginJsonInt(root, "parentPid")
-    let diagnostic = "GCM service plugin orphan detected sessionId=${sessionId} pid=${pid} parentPid=${parentPid} reason=${reason}"
+    let port = servicePluginJsonInt(root, "port")
+    let diagnostic = "GCM service plugin orphan detected sessionId=${sessionId} pid=${pid} parentPid=${parentPid} port=${port} reason=${reason}"
     servicePluginDispatchResult(frame, false, "orphan_detected", diagnostic: diagnostic, eventId: sessionId)
 }
 
@@ -545,7 +546,10 @@ public func servicePluginAcceptedEventDedupeKey(event: ServicePluginAcceptedGitC
 public func servicePluginDispatchDiagnosticSummary(frame: ServiceFrame, result: ServicePluginEventDispatchResult): String {
     let eventHash = if (!result.eventIdHash.isEmpty()) { result.eventIdHash } else { servicePluginDiagnosticHash(frame.payload) }
     let diagnosticHash = if (!result.diagnosticHash.isEmpty()) { result.diagnosticHash } else { servicePluginDiagnosticHash(result.diagnostic) }
-    let base = "serviceId=${frame.serviceId} capabilityId=${frame.capabilityId} status=${result.status} eventIdHash=${eventHash} diagnosticHash=${diagnosticHash} targetCount=${result.targetCount} deliverySuccess=${result.deliverySuccess} deliveryFailed=${result.deliveryFailed}"
+    var base = "serviceId=${frame.serviceId} capabilityId=${frame.capabilityId} status=${result.status} eventIdHash=${eventHash} diagnosticHash=${diagnosticHash} targetCount=${result.targetCount} deliverySuccess=${result.deliverySuccess} deliveryFailed=${result.deliveryFailed}"
+    if (result.status == "orphan_detected" && !result.diagnostic.isEmpty()) {
+        base += " diagnostic=${result.diagnostic}"
+    }
     if (base.size <= 512) { return base }
     base[0..512]
 }

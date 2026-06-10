@@ -1207,14 +1207,26 @@ private class ServicePluginLeaseSnapshot {
     public let state: String
     public let sessionId: String
     public let pid: Int64
+    public let parentPid: Int64
     public let port: Int64
 
-    public init(path: String, state!: String = "", sessionId!: String = "", pid!: Int64 = 0, port!: Int64 = 0) {
+    public init(path: String, state!: String = "", sessionId!: String = "", pid!: Int64 = 0, parentPid!: Int64 = 0, port!: Int64 = 0) {
         this.path = path
         this.state = state.trimAscii()
         this.sessionId = sessionId.trimAscii()
         this.pid = pid
+        this.parentPid = parentPid
         this.port = port
+    }
+}
+
+private class ServicePluginLeaseStartBlock {
+    public let status: String
+    public let diagnostic: String
+
+    public init(status: String, diagnostic: String) {
+        this.status = status.trimAscii()
+        this.diagnostic = diagnostic.trimAscii()
     }
 }
 
@@ -1230,6 +1242,7 @@ private func servicePluginReadLease(path: Path): ?ServicePluginLeaseSnapshot {
             state: state,
             sessionId: servicePluginLeaseString(root, "sessionId"),
             pid: servicePluginLeaseInt(root, "pid"),
+            parentPid: servicePluginLeaseInt(root, "parentPid"),
             port: servicePluginLeaseInt(root, "port")
         ))
     } catch (_: Exception) {
@@ -1266,10 +1279,34 @@ private func servicePluginPidAlive(pid: Int64): Bool {
     }
 }
 
-private func servicePluginStaleRunningLeaseBeforeStart(serviceId: String): ?ServicePluginLeaseSnapshot {
+private func servicePluginPortOwnedByPid(port: Int64, pid: Int64): Bool {
+    if (port <= 0 || pid <= 0) {
+        return false
+    }
+    try {
+        let (exitCode, stdout, _) = executeWithOutput("lsof", ["-nP", "-iTCP:${port}", "-sTCP:LISTEN", "-Fp"])
+        if (exitCode != 0) {
+            return false
+        }
+        for (line in String.fromUtf8(stdout).split("\n")) {
+            if (line.trimAscii() == "p${pid}") {
+                return true
+            }
+        }
+        false
+    } catch (_: Exception) {
+        false
+    }
+}
+
+private func servicePluginLeaseStartDiagnostic(status: String, lease: ServicePluginLeaseSnapshot, pidAlive: Bool, portOwnerAlive: Bool): String {
+    "${status} sessionId=${lease.sessionId} state=${lease.state} pid=${lease.pid} parentPid=${lease.parentPid} pidAlive=${pidAlive} port=${lease.port} portOwnerAlive=${portOwnerAlive}"
+}
+
+private func servicePluginBlockingLeaseBeforeStart(serviceId: String): ?ServicePluginLeaseStartBlock {
     let dir = servicePluginRuntimeLeaseDir(serviceId)
     if (!exists(dir)) {
-        return None<ServicePluginLeaseSnapshot>
+        return None<ServicePluginLeaseStartBlock>
     }
     try {
         for (entry in Directory.readFrom(dir)) {
@@ -1278,8 +1315,21 @@ private func servicePluginStaleRunningLeaseBeforeStart(serviceId: String): ?Serv
             }
             match (servicePluginReadLease(entry.path)) {
                 case Some(lease) =>
-                    if (lease.state == "running" && servicePluginPidAlive(lease.pid)) {
-                        return Some(lease)
+                    let pidAlive = servicePluginPidAlive(lease.pid)
+                    if (lease.state == "running" && pidAlive) {
+                        let status = "stale_lease_before_start"
+                        return Some(ServicePluginLeaseStartBlock(status, servicePluginLeaseStartDiagnostic(status, lease, pidAlive, false)))
+                    }
+                    if (lease.state == "orphan_detected") {
+                        if (pidAlive) {
+                            let status = "orphan_lease_alive_before_start"
+                            return Some(ServicePluginLeaseStartBlock(status, servicePluginLeaseStartDiagnostic(status, lease, pidAlive, false)))
+                        }
+                        let portOwnerAlive = servicePluginPortOwnedByPid(lease.port, lease.pid)
+                        if (portOwnerAlive) {
+                            let status = "orphan_port_owner_alive_before_start"
+                            return Some(ServicePluginLeaseStartBlock(status, servicePluginLeaseStartDiagnostic(status, lease, pidAlive, portOwnerAlive)))
+                        }
                     }
                 case None => ()
             }
@@ -1287,7 +1337,7 @@ private func servicePluginStaleRunningLeaseBeforeStart(serviceId: String): ?Serv
     } catch (_: Exception) {
         ()
     }
-    None<ServicePluginLeaseSnapshot>
+    None<ServicePluginLeaseStartBlock>
 }
 
 private func servicePluginLeaseStopDiagnostic(record: ServicePluginRuntimeRecord): String {
@@ -1296,9 +1346,9 @@ private func servicePluginLeaseStopDiagnostic(record: ServicePluginRuntimeRecord
         case Some(lease) =>
             let pidAlive = servicePluginPidAlive(lease.pid)
             if (lease.state != "stopped" || pidAlive) {
-                return "lease_not_stopped_after_stop state=${lease.state} pid=${lease.pid} pidAlive=${pidAlive} port=${lease.port}"
+                return "lease_not_stopped_after_stop state=${lease.state} pid=${lease.pid} parentPid=${lease.parentPid} pidAlive=${pidAlive} port=${lease.port}"
             }
-            "lease_stopped state=stopped pid=${lease.pid}"
+            "lease_stopped state=stopped pid=${lease.pid} parentPid=${lease.parentPid}"
         case None => "lease_missing_after_stop"
     }
 }
@@ -1360,12 +1410,12 @@ private func ensureServicePluginStdioProcess(record: ServicePluginRuntimeRecord,
             record.lastError = "service plugin working directory missing: ${redactServicePayload(cwd).text}"
             return ServicePluginProcessEnsureResult(false, "cwd_missing", diagnostic: record.lastError)
         }
-        match (servicePluginStaleRunningLeaseBeforeStart(serviceId)) {
-            case Some(lease) =>
+        match (servicePluginBlockingLeaseBeforeStart(serviceId)) {
+            case Some(block) =>
                 record.status = "degraded"
-                record.degradedReason = "stale_lease_before_start"
-                record.lastError = "stale_lease_before_start sessionId=${lease.sessionId} pid=${lease.pid} port=${lease.port}"
-                return ServicePluginProcessEnsureResult(false, "stale_lease_before_start", diagnostic: record.lastError)
+                record.degradedReason = block.status
+                record.lastError = block.diagnostic
+                return ServicePluginProcessEnsureResult(false, block.status, diagnostic: record.lastError)
             case None => ()
         }
         record.instanceSeq++
