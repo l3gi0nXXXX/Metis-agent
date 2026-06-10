@@ -776,102 +776,108 @@ public class ServicePluginHostTest {
     @TestCase
     public func tRoot001AsyncEventPumpAllowsSamePluginWritebackResponse(): Unit {
         // T-ROOT-001, T-ASYNC-001, T-E2E-SP-001 (Metis half-chain)
-        this.registerGitCodeStdioScript(this.gitCodeReentrantWritebackScript())
-        let messages = ArrayList<String>()
-        let lock = Mutex()
-        setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent =>
-            let rows = ArrayList<ServicePluginDeliveryTarget>()
-            rows.add(ServicePluginDeliveryTarget("telegram", "acct", "peer"))
-            rows
-        }))
-        setServicePluginWebhookGeneratedReplyHandlerForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent, _target: ServicePluginDeliveryTarget =>
-            ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "建议补充回归测试。")
-        }))
-        setServicePluginEventDeliveryForTest(Some({ _target: ServicePluginDeliveryTarget, text: String =>
-            synchronized(lock) { messages.add(text) }
-            ServicePluginEventDeliveryResult(true, "sent")
-        }))
-        try {
-            let started = ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000)
-            @Expect(started.ok, true)
-            @Expect(this.waitForMessage(messages, lock, timeoutMillis: 6500), true)
-            let message = this.firstMessage(messages, lock)
-            @Expect(message.contains("GitCode 回复已写回"), true)
-            @Expect(message.contains("写回状态未知/超时"), false)
-            @Expect(message.contains("\"replyUrl\""), false)
-        } finally {
-            setServicePluginWebhookSubscribersProviderForTest(None<(ServicePluginAcceptedGitCodeEvent) -> ArrayList<ServicePluginDeliveryTarget>>)
-            setServicePluginWebhookGeneratedReplyHandlerForTest(None<(ServicePluginAcceptedGitCodeEvent, ServicePluginDeliveryTarget) -> ServicePluginGeneratedReplyResult>)
-            setServicePluginEventDeliveryForTest(None)
-            resetServicePluginGeneratedReplyStateForTest()
-            resetServicePluginHostForTest()
-        }
+        withServicePluginHostTestHome("service-plugin-root-async-writeback", { _home: Path =>
+            this.registerGitCodeStdioScript(this.gitCodeReentrantWritebackScript())
+            let messages = ArrayList<String>()
+            let lock = Mutex()
+            setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent =>
+                let rows = ArrayList<ServicePluginDeliveryTarget>()
+                rows.add(ServicePluginDeliveryTarget("telegram", "acct", "peer"))
+                rows
+            }))
+            setServicePluginWebhookGeneratedReplyHandlerForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent, _target: ServicePluginDeliveryTarget =>
+                ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "建议补充回归测试。")
+            }))
+            setServicePluginEventDeliveryForTest(Some({ _target: ServicePluginDeliveryTarget, text: String =>
+                synchronized(lock) { messages.add(text) }
+                ServicePluginEventDeliveryResult(true, "sent")
+            }))
+            try {
+                let started = ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000)
+                @Expect(started.ok, true)
+                @Expect(this.waitForMessage(messages, lock, timeoutMillis: 6500), true)
+                let message = this.firstMessage(messages, lock)
+                @Expect(message.contains("GitCode 回复已写回"), true)
+                @Expect(message.contains("写回状态未知/超时"), false)
+                @Expect(message.contains("\"replyUrl\""), false)
+            } finally {
+                setServicePluginWebhookSubscribersProviderForTest(None<(ServicePluginAcceptedGitCodeEvent) -> ArrayList<ServicePluginDeliveryTarget>>)
+                setServicePluginWebhookGeneratedReplyHandlerForTest(None<(ServicePluginAcceptedGitCodeEvent, ServicePluginDeliveryTarget) -> ServicePluginGeneratedReplyResult>)
+                setServicePluginEventDeliveryForTest(None)
+                resetServicePluginGeneratedReplyStateForTest()
+                resetServicePluginHostForTest()
+            }
+        })
     }
 
     @TestCase
     public func tRoot002AsyncWritebackIgnoresUnrelatedHeartbeatAndResponseFrames(): Unit {
         // T-ROOT-002, T-ASYNC-002, T-ASYNC-005
-        this.registerGitCodeStdioScript(this.gitCodeReentrantWritebackScript(includeUnrelatedFrames: true))
-        let messages = ArrayList<String>()
-        let lock = Mutex()
-        setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent =>
-            let rows = ArrayList<ServicePluginDeliveryTarget>()
-            rows.add(ServicePluginDeliveryTarget("telegram", "acct", "peer"))
-            rows
-        }))
-        setServicePluginWebhookGeneratedReplyHandlerForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent, _target: ServicePluginDeliveryTarget =>
-            ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "建议补充回归测试。")
-        }))
-        setServicePluginEventDeliveryForTest(Some({ _target: ServicePluginDeliveryTarget, text: String =>
-            synchronized(lock) { messages.add(text) }
-            ServicePluginEventDeliveryResult(true, "sent")
-        }))
-        try {
-            let started = ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000)
-            @Expect(started.ok, true)
-            @Expect(this.waitForMessage(messages, lock, timeoutMillis: 6500), true)
-            let message = this.firstMessage(messages, lock)
-            @Expect(message.contains("GitCode 回复已写回"), true)
-            @Expect(message.contains("unexpected_frame"), false)
-            match (getServicePluginSnapshot("gitcode-monitor")) {
-                case Some(snapshot) => @Expect(snapshot.status, "running")
-                case None => @Expect(true, false)
+        withServicePluginHostTestHome("service-plugin-root-async-unrelated", { _home: Path =>
+            this.registerGitCodeStdioScript(this.gitCodeReentrantWritebackScript(includeUnrelatedFrames: true))
+            let messages = ArrayList<String>()
+            let lock = Mutex()
+            setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent =>
+                let rows = ArrayList<ServicePluginDeliveryTarget>()
+                rows.add(ServicePluginDeliveryTarget("telegram", "acct", "peer"))
+                rows
+            }))
+            setServicePluginWebhookGeneratedReplyHandlerForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent, _target: ServicePluginDeliveryTarget =>
+                ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "建议补充回归测试。")
+            }))
+            setServicePluginEventDeliveryForTest(Some({ _target: ServicePluginDeliveryTarget, text: String =>
+                synchronized(lock) { messages.add(text) }
+                ServicePluginEventDeliveryResult(true, "sent")
+            }))
+            try {
+                let started = ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000)
+                @Expect(started.ok, true)
+                @Expect(this.waitForMessage(messages, lock, timeoutMillis: 6500), true)
+                let message = this.firstMessage(messages, lock)
+                @Expect(message.contains("GitCode 回复已写回"), true)
+                @Expect(message.contains("unexpected_frame"), false)
+                match (getServicePluginSnapshot("gitcode-monitor")) {
+                    case Some(snapshot) => @Expect(snapshot.status, "running")
+                    case None => @Expect(true, false)
+                }
+            } finally {
+                setServicePluginWebhookSubscribersProviderForTest(None<(ServicePluginAcceptedGitCodeEvent) -> ArrayList<ServicePluginDeliveryTarget>>)
+                setServicePluginWebhookGeneratedReplyHandlerForTest(None<(ServicePluginAcceptedGitCodeEvent, ServicePluginDeliveryTarget) -> ServicePluginGeneratedReplyResult>)
+                setServicePluginEventDeliveryForTest(None)
+                resetServicePluginGeneratedReplyStateForTest()
+                resetServicePluginHostForTest()
             }
-        } finally {
-            setServicePluginWebhookSubscribersProviderForTest(None<(ServicePluginAcceptedGitCodeEvent) -> ArrayList<ServicePluginDeliveryTarget>>)
-            setServicePluginWebhookGeneratedReplyHandlerForTest(None<(ServicePluginAcceptedGitCodeEvent, ServicePluginDeliveryTarget) -> ServicePluginGeneratedReplyResult>)
-            setServicePluginEventDeliveryForTest(None)
-            resetServicePluginGeneratedReplyStateForTest()
-            resetServicePluginHostForTest()
-        }
+        })
     }
 
     @TestCase
     public func tAsync005PumpContinuesHeartbeatWhileWritebackWaits(): Unit {
         // T-ASYNC-003, T-ASYNC-005, T-E2E-SP-007
-        this.registerGitCodeStdioScript(this.gitCodeNoWritebackResponseScript())
-        setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent =>
-            let rows = ArrayList<ServicePluginDeliveryTarget>()
-            rows.add(ServicePluginDeliveryTarget("telegram", "acct", "peer"))
-            rows
-        }))
-        setServicePluginWebhookGeneratedReplyHandlerForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent, _target: ServicePluginDeliveryTarget =>
-            ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "超时也要通知。")
-        }))
-        setServicePluginEventDeliveryForTest(Some({ _target: ServicePluginDeliveryTarget, _text: String =>
-            ServicePluginEventDeliveryResult(true, "sent")
-        }))
-        try {
-            let started = ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000)
-            @Expect(started.ok, true)
-            @Expect(this.waitForHeartbeat("gitcode-monitor", timeoutMillis: 1000), true)
-        } finally {
-            setServicePluginWebhookSubscribersProviderForTest(None<(ServicePluginAcceptedGitCodeEvent) -> ArrayList<ServicePluginDeliveryTarget>>)
-            setServicePluginWebhookGeneratedReplyHandlerForTest(None<(ServicePluginAcceptedGitCodeEvent, ServicePluginDeliveryTarget) -> ServicePluginGeneratedReplyResult>)
-            setServicePluginEventDeliveryForTest(None)
-            resetServicePluginGeneratedReplyStateForTest()
-            resetServicePluginHostForTest()
-        }
+        withServicePluginHostTestHome("service-plugin-root-async-timeout", { _home: Path =>
+            this.registerGitCodeStdioScript(this.gitCodeNoWritebackResponseScript())
+            setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent =>
+                let rows = ArrayList<ServicePluginDeliveryTarget>()
+                rows.add(ServicePluginDeliveryTarget("telegram", "acct", "peer"))
+                rows
+            }))
+            setServicePluginWebhookGeneratedReplyHandlerForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent, _target: ServicePluginDeliveryTarget =>
+                ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "超时也要通知。")
+            }))
+            setServicePluginEventDeliveryForTest(Some({ _target: ServicePluginDeliveryTarget, _text: String =>
+                ServicePluginEventDeliveryResult(true, "sent")
+            }))
+            try {
+                let started = ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000)
+                @Expect(started.ok, true)
+                @Expect(this.waitForHeartbeat("gitcode-monitor", timeoutMillis: 1000), true)
+            } finally {
+                setServicePluginWebhookSubscribersProviderForTest(None<(ServicePluginAcceptedGitCodeEvent) -> ArrayList<ServicePluginDeliveryTarget>>)
+                setServicePluginWebhookGeneratedReplyHandlerForTest(None<(ServicePluginAcceptedGitCodeEvent, ServicePluginDeliveryTarget) -> ServicePluginGeneratedReplyResult>)
+                setServicePluginEventDeliveryForTest(None)
+                resetServicePluginGeneratedReplyStateForTest()
+                resetServicePluginHostForTest()
+            }
+        })
     }
 
     @TestCase

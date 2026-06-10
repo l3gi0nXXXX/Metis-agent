@@ -1,7 +1,7 @@
 package metis.gateway.service_plugin
 
 import metis.core.metisSafeUtf8Prefix
-import metis.core.config.CliConfig
+import metis.core.config.{CliConfig, MetisProcessEnvironmentLock}
 import std.collection.{ArrayList, HashMap, HashSet}
 import std.convert.Parsable
 import std.fs.{Directory, File, Path, exists, remove}
@@ -906,21 +906,23 @@ public func resetServicePluginHostForTest(): Unit {
 }
 
 public func withServicePluginHostTestHome<T>(label: String, block: (Path) -> T): T {
-    let home = Path("/tmp").join("metis-service-plugin-${servicePluginPathSegment(label)}-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
-    try { remove(home, recursive: true) } catch (_: Exception) { () }
-    Directory.create(home, recursive: true)
-    let oldHome = getVariable("METIS_HOME")
-    setVariable("METIS_HOME", home.toString())
-    CliConfig.invalidatePathCache()
-    try {
-        return block(home)
-    } finally {
-        match (oldHome) {
-            case Some(value) => setVariable("METIS_HOME", value)
-            case None => setVariable("METIS_HOME", "")
-        }
-        CliConfig.invalidatePathCache()
+    synchronized(MetisProcessEnvironmentLock) {
+        let home = Path("/tmp").join("metis-service-plugin-${servicePluginPathSegment(label)}-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
         try { remove(home, recursive: true) } catch (_: Exception) { () }
+        Directory.create(home, recursive: true)
+        let oldHome = getVariable("METIS_HOME")
+        setVariable("METIS_HOME", home.toString())
+        CliConfig.invalidatePathCache()
+        try {
+            return block(home)
+        } finally {
+            match (oldHome) {
+                case Some(value) => setVariable("METIS_HOME", value)
+                case None => setVariable("METIS_HOME", "")
+            }
+            CliConfig.invalidatePathCache()
+            try { remove(home, recursive: true) } catch (_: Exception) { () }
+        }
     }
 }
 
