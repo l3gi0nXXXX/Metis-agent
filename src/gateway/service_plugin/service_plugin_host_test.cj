@@ -194,12 +194,16 @@ public class ServicePluginHostTest {
     }
 
     private func writeGitCodeLease(home: Path, instanceId: String, state: String, pid: Int64): Path {
+        this.writeGitCodeLeaseWithDetails(home, instanceId, state, pid, parentPid: getProcessId(), port: 18080)
+    }
+
+    private func writeGitCodeLeaseWithDetails(home: Path, instanceId: String, state: String, pid: Int64, parentPid!: Int64, port!: Int64): Path {
         let dir = home.join("service-plugin").join("runtime").join("gitcode-monitor")
         Directory.create(dir, recursive: true)
         let leasePath = dir.join("${instanceId}.lease.json")
         File.writeTo(
             leasePath,
-            ("{\"state\":\"${state}\",\"status\":\"${state}\",\"pluginId\":\"gitcode-monitor\",\"sessionId\":\"${instanceId}\",\"pid\":${pid},\"parentPid\":${getProcessId()},\"bindHost\":\"127.0.0.1\",\"port\":18080}").toArray()
+            ("{\"state\":\"${state}\",\"status\":\"${state}\",\"pluginId\":\"gitcode-monitor\",\"sessionId\":\"${instanceId}\",\"pid\":${pid},\"parentPid\":${parentPid},\"bindHost\":\"127.0.0.1\",\"port\":${port}}").toArray()
         )
         leasePath
     }
@@ -364,7 +368,7 @@ public class ServicePluginHostTest {
 
     @TestCase
     public func tP4N001StartupFailsFastWhenRunningLeaseOwnerIsAlive(): Unit {
-        // T-P4-N-001, T-P7-E2E-006 Metis-side prerequisite.
+        // METIS-ORPHAN-U-001, T-P4-N-001, T-P7-E2E-006 Metis-side prerequisite.
         withServicePluginHostTestHome("service-plugin-p4-stale-running-lease", { home: Path =>
             let launchMarker = home.join("gcm-launch-marker.txt")
             let _ = this.writeGitCodeLease(home, "gitcode-monitor-old", "running", getProcessId())
@@ -384,6 +388,55 @@ public class ServicePluginHostTest {
                     case None => @Expect(true, false)
                 }
             } finally {
+                resetServicePluginHostForTest()
+            }
+        })
+    }
+
+    @TestCase
+    public func metisOrphanB001StartupFailsFastWhenOrphanLeaseOwnerIsAlive(): Unit {
+        // METIS-ORPHAN-B-001.
+        withServicePluginHostTestHome("service-plugin-orphan-live-lease", { home: Path =>
+            let launchMarker = home.join("gcm-launch-marker.txt")
+            let _ = this.writeGitCodeLeaseWithDetails(home, "gitcode-monitor-orphan", "orphan_detected", getProcessId(), parentPid: getProcessId(), port: 18080)
+            let script = "printf started > '${launchMarker.toString()}'; printf '%s\\n' '${this.gitCodeInitLine()}'; read ignored || true"
+            this.registerGitCodeStdioScript(script)
+            try {
+                let started = ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000)
+                @Expect(started.ok, false)
+                @Expect(started.status, "orphan_lease_alive_before_start")
+                @Expect(started.diagnostic.contains("orphan_lease_alive_before_start"), true)
+                @Expect(started.diagnostic.contains("pid=${getProcessId()}"), true)
+                @Expect(started.diagnostic.contains("port=18080"), true)
+                @Expect(exists(launchMarker), false)
+                match (getServicePluginSnapshot("gitcode-monitor")) {
+                    case Some(snapshot) =>
+                        @Expect(snapshot.status, "degraded")
+                        @Expect(snapshot.degradedReason, "orphan_lease_alive_before_start")
+                        @Expect(snapshot.pid, 0)
+                    case None => @Expect(true, false)
+                }
+            } finally {
+                resetServicePluginHostForTest()
+            }
+        })
+    }
+
+    @TestCase
+    public func metisOrphanB002OrphanLeaseWithMissingPidDoesNotBlockStart(): Unit {
+        // METIS-ORPHAN-B-002.
+        withServicePluginHostTestHome("service-plugin-orphan-missing-pid", { home: Path =>
+            let launchMarker = home.join("gcm-launch-marker.txt")
+            let _ = this.writeGitCodeLeaseWithDetails(home, "gitcode-monitor-orphan", "orphan_detected", 0, parentPid: getProcessId(), port: 18080)
+            let script = "printf started > '${launchMarker.toString()}'; printf '%s\\n' '${this.gitCodeInitLine()}'; read ignored || true"
+            this.registerGitCodeStdioScript(script)
+            try {
+                let started = ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000)
+                @Expect(started.ok, true)
+                @Expect(started.status, "running")
+                @Expect(this.waitForFile(launchMarker, timeoutMillis: 1000), true)
+            } finally {
+                let _ = stopServicePlugin("gitcode-monitor", reason: "test", timeoutMillis: 1000)
                 resetServicePluginHostForTest()
             }
         })
@@ -443,9 +496,9 @@ public class ServicePluginHostTest {
 
     @TestCase
     public func tP4B001ForcedStopKeepsDiagnosticWhenLeaseNotStopped(): Unit {
-        // T-P4-B-001.
+        // METIS-ORPHAN-P-002, T-P4-B-001.
         withServicePluginHostTestHome("service-plugin-p4-forced-stop-lease", { _home: Path =>
-            let script = "printf '%s\\n' '${this.gitCodeInitLine()}'; printf '{\"state\":\"running\",\"status\":\"running\",\"pluginId\":\"gitcode-monitor\",\"sessionId\":\"%s\",\"pid\":%s,\"parentPid\":%s}\\n' \"$METIS_SERVICE_PLUGIN_SESSION_ID\" \"$$\" \"$METIS_SERVICE_PLUGIN_PARENT_PID\" > \"$METIS_SERVICE_PLUGIN_LEASE_PATH\"; trap '' TERM; while true; do read -t 1 ignored || true; done"
+            let script = "printf '%s\\n' '${this.gitCodeInitLine()}'; printf '{\"state\":\"running\",\"status\":\"running\",\"pluginId\":\"gitcode-monitor\",\"sessionId\":\"%s\",\"pid\":%s,\"parentPid\":%s,\"bindHost\":\"127.0.0.1\",\"port\":18080}\\n' \"$METIS_SERVICE_PLUGIN_SESSION_ID\" \"$$\" \"$METIS_SERVICE_PLUGIN_PARENT_PID\" > \"$METIS_SERVICE_PLUGIN_LEASE_PATH\"; trap '' TERM; while true; do read -t 1 ignored || true; done"
             this.registerGitCodeStdioScript(script)
             try {
                 let started = ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000)
@@ -457,7 +510,20 @@ public class ServicePluginHostTest {
                     case None => @Expect(true, false)
                 }
                 let stopped = stopServicePlugin("gitcode-monitor", reason: "test", timeoutMillis: 200)
+                @Expect(stopped.ok, false)
+                @Expect(stopped.status, "degraded")
                 @Expect(stopped.diagnostic.contains("lease_not_stopped_after_stop"), true)
+                @Expect(stopped.diagnostic.contains("state=running"), true)
+                @Expect(stopped.diagnostic.contains("pidAlive="), true)
+                @Expect(stopped.diagnostic.contains("port=18080"), true)
+                @Expect(stopped.diagnostic.contains("parentPid="), true)
+                match (getServicePluginSnapshot("gitcode-monitor")) {
+                    case Some(snapshot) =>
+                        @Expect(snapshot.status, "degraded")
+                        @Expect(snapshot.degradedReason, "lease_not_stopped_after_stop")
+                        @Expect(renderServicePluginDiagnostics(snapshot).contains("parentPid="), true)
+                    case None => @Expect(true, false)
+                }
             } finally {
                 resetServicePluginHostForTest()
             }

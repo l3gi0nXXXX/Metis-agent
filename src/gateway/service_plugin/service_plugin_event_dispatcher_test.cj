@@ -101,6 +101,7 @@ public class ServicePluginEventDispatcherTest {
 
     @TestCase
     public func orphanDetectedEventRecordsVisibleRuntimeDiagnostic(): Unit {
+        // METIS-ORPHAN-P-001.
         this.resetDispatcherHooks()
         this.registerGitCodeWritebackPlugin()
         let frame = ServiceFrame(
@@ -109,13 +110,18 @@ public class ServicePluginEventDispatcherTest {
             "gitcode-monitor",
             method: "emitCapabilityEvent",
             capabilityId: "gitcode.monitor.orphan_detected",
-            payload: "{\"ok\":true,\"status\":\"orphan_detected\",\"pluginId\":\"gitcode-monitor\",\"sessionId\":\"gitcode-monitor-1\",\"pid\":1234,\"parentPid\":5678,\"orphanReason\":\"parent_lost\"}"
+            payload: "{\"ok\":true,\"status\":\"orphan_detected\",\"pluginId\":\"gitcode-monitor\",\"sessionId\":\"gitcode-monitor-1\",\"pid\":1234,\"parentPid\":5678,\"port\":18080,\"orphanReason\":\"parent_lost\",\"token\":\"secret-token\",\"Authorization\":\"Bearer secret\"}"
         )
         let result = dispatchServicePluginEvent(frame, store: ServicePluginPendingJobStore())
         @Expect(result.ok, false)
         @Expect(result.status, "orphan_detected")
         @Expect(result.eventId, "gitcode-monitor-1")
         @Expect(result.diagnostic.contains("parent_lost"), true)
+        @Expect(result.diagnostic.contains("pid=1234"), true)
+        @Expect(result.diagnostic.contains("parentPid=5678"), true)
+        @Expect(result.diagnostic.contains("port=18080"), true)
+        @Expect(result.diagnostic.contains("secret-token"), false)
+        @Expect(result.diagnostic.contains("Bearer secret"), false)
         recordServicePluginRuntimeDispatchForTest("gitcode-monitor", frame, result)
         match (getServicePluginSnapshot("gitcode-monitor")) {
             case Some(snapshot) =>
@@ -123,6 +129,13 @@ public class ServicePluginEventDispatcherTest {
                 @Expect(snapshot.degradedReason, "orphan_detected")
                 @Expect(snapshot.lastError.contains("status=orphan_detected"), true)
                 @Expect(snapshot.lastError.contains("eventIdHash="), true)
+                @Expect(snapshot.lastError.contains("reason=parent_lost"), true)
+                @Expect(snapshot.lastError.contains("pid=1234"), true)
+                @Expect(snapshot.lastError.contains("parentPid=5678"), true)
+                @Expect(snapshot.lastError.contains("port=18080"), true)
+                let diagnostic = renderServicePluginDiagnostics(snapshot)
+                @Expect(diagnostic.contains("secret-token"), false)
+                @Expect(diagnostic.contains("Bearer secret"), false)
             case None => @Expect(true, false)
         }
         this.resetDispatcherHooks()
@@ -130,7 +143,7 @@ public class ServicePluginEventDispatcherTest {
 
     @TestCase
     public func tP6P001OrphanDiagnosticKeepsLaterGitCodeEventsFailClosedInRuntime(): Unit {
-        // T-P6-P-001: once Metis records orphan_detected, later GCM business
+        // METIS-ORPHAN-N-001, T-P6-P-001: once Metis records orphan_detected, later GCM business
         // frames from that process must not fan out to IM or writeback.
         this.resetDispatcherHooks()
         this.registerGitCodeWritebackPlugin()
