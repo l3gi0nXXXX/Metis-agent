@@ -11,6 +11,7 @@ import std.process.*
 import std.sync.*
 import std.time.*
 import stdx.encoding.json.{JsonObject, JsonValue}
+import stdx.net.http.*
 
 public class ServicePluginConfigRef {
     public let configPath: String
@@ -74,6 +75,10 @@ public class ServicePluginSnapshot {
     public let instanceId: String
     public let pid: Int64
     public let lastError: String
+    public let supervisorLastProbe: String
+    public let supervisorFailureCount: Int64
+    public let supervisorRestartCount: Int64
+    public let supervisorDegradedReason: String
 
     public init(
         serviceId: String,
@@ -86,7 +91,11 @@ public class ServicePluginSnapshot {
         lastHeartbeatAtMillis!: Int64 = -1,
         instanceId!: String = "",
         pid!: Int64 = 0,
-        lastError!: String = ""
+        lastError!: String = "",
+        supervisorLastProbe!: String = "",
+        supervisorFailureCount!: Int64 = 0,
+        supervisorRestartCount!: Int64 = 0,
+        supervisorDegradedReason!: String = ""
     ) {
         this.serviceId = serviceId
         this.displayName = displayName
@@ -99,6 +108,10 @@ public class ServicePluginSnapshot {
         this.instanceId = instanceId
         this.pid = pid
         this.lastError = lastError
+        this.supervisorLastProbe = supervisorLastProbe
+        this.supervisorFailureCount = supervisorFailureCount
+        this.supervisorRestartCount = supervisorRestartCount
+        this.supervisorDegradedReason = supervisorDegradedReason
     }
 }
 
@@ -317,6 +330,114 @@ public class ServiceHealth {
     }
 }
 
+public class ServicePluginSupervisorConfig {
+    public let enabled: Bool
+    public let intervalMs: Int64
+    public let healthTimeoutMs: Int64
+    public let failureThreshold: Int64
+    public let restartCooldownMs: Int64
+
+    public init(
+        enabled!: Bool = true,
+        intervalMs!: Int64 = 60000,
+        healthTimeoutMs!: Int64 = 2000,
+        failureThreshold!: Int64 = 3,
+        restartCooldownMs!: Int64 = 60000
+    ) {
+        this.enabled = enabled
+        this.intervalMs = max(100, intervalMs)
+        this.healthTimeoutMs = max(1, healthTimeoutMs)
+        this.failureThreshold = max(1, failureThreshold)
+        this.restartCooldownMs = max(0, restartCooldownMs)
+    }
+}
+
+public class ServicePluginHealthProbeResult {
+    public let pidAlive: Bool
+    public let stdioAlive: Bool
+    public let leaseState: String
+    public let leaseAgeMs: Int64
+    public let healthzOk: Bool
+    public let healthzDurationMs: Int64
+    public let port: Int64
+    public let diagnostic: String
+
+    public init(
+        pidAlive!: Bool = false,
+        stdioAlive!: Bool = false,
+        leaseState!: String = "",
+        leaseAgeMs!: Int64 = -1,
+        healthzOk!: Bool = true,
+        healthzDurationMs!: Int64 = -1,
+        port!: Int64 = 0,
+        diagnostic!: String = ""
+    ) {
+        this.pidAlive = pidAlive
+        this.stdioAlive = stdioAlive
+        this.leaseState = leaseState.trimAscii()
+        this.leaseAgeMs = leaseAgeMs
+        this.healthzOk = healthzOk
+        this.healthzDurationMs = healthzDurationMs
+        this.port = port
+        this.diagnostic = diagnostic.trimAscii()
+    }
+}
+
+public class ServicePluginHealthzProbeResult {
+    public let ok: Bool
+    public let statusCode: Int64
+    public let durationMs: Int64
+    public let diagnostic: String
+
+    public init(ok: Bool, statusCode!: Int64 = 0, durationMs!: Int64 = -1, diagnostic!: String = "") {
+        this.ok = ok
+        this.statusCode = statusCode
+        this.durationMs = durationMs
+        this.diagnostic = diagnostic.trimAscii()
+    }
+}
+
+public class ServicePluginHealthClassification {
+    public let status: String
+    public let reason: String
+    public let failureCount: Int64
+    public let shouldRecover: Bool
+    public let diagnostic: String
+
+    public init(status: String, reason!: String = "", failureCount!: Int64 = 0, shouldRecover!: Bool = false, diagnostic!: String = "") {
+        this.status = status.trimAscii()
+        this.reason = reason.trimAscii()
+        this.failureCount = failureCount
+        this.shouldRecover = shouldRecover
+        this.diagnostic = diagnostic.trimAscii()
+    }
+}
+
+public class ServicePluginSupervisorTickResult {
+    public let ok: Bool
+    public let status: String
+    public let probe: ServicePluginHealthProbeResult
+    public let classification: ServicePluginHealthClassification
+    public let recovered: Bool
+    public let diagnostic: String
+
+    public init(
+        ok: Bool,
+        status: String,
+        probe!: ServicePluginHealthProbeResult = ServicePluginHealthProbeResult(),
+        classification!: ServicePluginHealthClassification = ServicePluginHealthClassification("healthy"),
+        recovered!: Bool = false,
+        diagnostic!: String = ""
+    ) {
+        this.ok = ok
+        this.status = status.trimAscii()
+        this.probe = probe
+        this.classification = classification
+        this.recovered = recovered
+        this.diagnostic = diagnostic.trimAscii()
+    }
+}
+
 public class ServiceEventReadResult {
     public let ok: Bool
     public let status: String
@@ -443,6 +564,12 @@ private class ServicePluginRuntimeRecord {
     public var pid: Int64
     public var lastError: String
     public var lastInvokeAtMillis: Int64
+    public var supervisorFailureCount: Int64
+    public var supervisorRestartCount: Int64
+    public var supervisorLastProbe: String
+    public var supervisorLastDegradedReason: String
+    public var supervisorLastProbeAtMs: Int64
+    public var supervisorLastRestartAtMs: Int64
     public let eventFrames: ArrayList<ServiceFrame>
 
     public init(registration: ServicePluginRegistration) {
@@ -456,7 +583,28 @@ private class ServicePluginRuntimeRecord {
         this.pid = 0
         this.lastError = ""
         this.lastInvokeAtMillis = -1
+        this.supervisorFailureCount = 0
+        this.supervisorRestartCount = 0
+        this.supervisorLastProbe = ""
+        this.supervisorLastDegradedReason = ""
+        this.supervisorLastProbeAtMs = -1
+        this.supervisorLastRestartAtMs = -1
         this.eventFrames = ArrayList<ServiceFrame>()
+    }
+}
+
+private class ServicePluginSupervisorStopFlag {
+    private let lock = Mutex()
+    private var stoppedValue = false
+
+    public func stop(): Unit {
+        synchronized(this.lock) {
+            this.stoppedValue = true
+        }
+    }
+
+    public func stopped(): Bool {
+        synchronized(this.lock) { this.stoppedValue }
     }
 }
 
@@ -464,6 +612,13 @@ private var servicePluginRegistry = HashMap<String, ServicePluginRuntimeRecord>(
 private var serviceCapabilityRoutes = HashMap<String, (String, ServiceCapabilityRecord)>()
 private var servicePluginCapabilityInvokerForTest: Option<(ServicePluginRegistration, CapabilityInvokeRequest) -> CapabilityInvokeResult> =
     None<(ServicePluginRegistration, CapabilityInvokeRequest) -> CapabilityInvokeResult>
+private var servicePluginSupervisorConfig = ServicePluginSupervisorConfig()
+private var servicePluginHealthzProbeForTest: Option<(String, Int64) -> ServicePluginHealthzProbeResult> =
+    None<(String, Int64) -> ServicePluginHealthzProbeResult>
+private var servicePluginPortOwnerProbeForTest: Option<(Int64, Int64) -> Bool> =
+    None<(Int64, Int64) -> Bool>
+private var servicePluginSupervisorWorkers = HashMap<String, ServicePluginSupervisorStopFlag>()
+private let servicePluginSupervisorLock = Mutex()
 
 private class ServicePluginLineBuffer {
     private let lock = Mutex()
@@ -719,6 +874,10 @@ private class ServicePluginResponseQueue {
         }
     }
 
+    public func isClosed(): Bool {
+        synchronized(this.lock) { this.closed }
+    }
+
     public func readResponse(
         correlationId: String,
         expectedServiceId: String,
@@ -898,11 +1057,31 @@ public func setServicePluginCapabilityInvokerForTest(
     servicePluginCapabilityInvokerForTest = invoker
 }
 
+public func setServicePluginSupervisorConfigForTest(config: ServicePluginSupervisorConfig): Unit {
+    servicePluginSupervisorConfig = config
+}
+
+public func setServicePluginHealthzProbeForTest(
+    probe: Option<(String, Int64) -> ServicePluginHealthzProbeResult>
+): Unit {
+    servicePluginHealthzProbeForTest = probe
+}
+
+public func setServicePluginPortOwnerProbeForTest(
+    probe: Option<(Int64, Int64) -> Bool>
+): Unit {
+    servicePluginPortOwnerProbeForTest = probe
+}
+
 public func resetServicePluginHostForTest(): Unit {
+    stopAllServicePluginSupervisors()
     stopAllActiveServicePluginProcesses()
     servicePluginRegistry = HashMap<String, ServicePluginRuntimeRecord>()
     serviceCapabilityRoutes = HashMap<String, (String, ServiceCapabilityRecord)>()
     servicePluginCapabilityInvokerForTest = None<(ServicePluginRegistration, CapabilityInvokeRequest) -> CapabilityInvokeResult>
+    servicePluginHealthzProbeForTest = None<(String, Int64) -> ServicePluginHealthzProbeResult>
+    servicePluginPortOwnerProbeForTest = None<(Int64, Int64) -> Bool>
+    servicePluginSupervisorConfig = ServicePluginSupervisorConfig()
 }
 
 public func withServicePluginHostTestHome<T>(label: String, block: (Path) -> T): T {
@@ -1210,15 +1389,31 @@ private class ServicePluginLeaseSnapshot {
     public let sessionId: String
     public let pid: Int64
     public let parentPid: Int64
+    public let bindHost: String
     public let port: Int64
+    public let lastHeartbeatMs: Int64
+    public let startedAtMs: Int64
 
-    public init(path: String, state!: String = "", sessionId!: String = "", pid!: Int64 = 0, parentPid!: Int64 = 0, port!: Int64 = 0) {
+    public init(
+        path: String,
+        state!: String = "",
+        sessionId!: String = "",
+        pid!: Int64 = 0,
+        parentPid!: Int64 = 0,
+        bindHost!: String = "",
+        port!: Int64 = 0,
+        lastHeartbeatMs!: Int64 = 0,
+        startedAtMs!: Int64 = 0
+    ) {
         this.path = path
         this.state = state.trimAscii()
         this.sessionId = sessionId.trimAscii()
         this.pid = pid
         this.parentPid = parentPid
+        this.bindHost = bindHost.trimAscii()
         this.port = port
+        this.lastHeartbeatMs = lastHeartbeatMs
+        this.startedAtMs = startedAtMs
     }
 }
 
@@ -1245,7 +1440,10 @@ private func servicePluginReadLease(path: Path): ?ServicePluginLeaseSnapshot {
             sessionId: servicePluginLeaseString(root, "sessionId"),
             pid: servicePluginLeaseInt(root, "pid"),
             parentPid: servicePluginLeaseInt(root, "parentPid"),
-            port: servicePluginLeaseInt(root, "port")
+            bindHost: servicePluginLeaseString(root, "bindHost"),
+            port: servicePluginLeaseInt(root, "port"),
+            lastHeartbeatMs: servicePluginLeaseInt(root, "lastHeartbeatMs"),
+            startedAtMs: servicePluginLeaseInt(root, "startedAtMs")
         ))
     } catch (_: Exception) {
         None<ServicePluginLeaseSnapshot>
@@ -1298,6 +1496,391 @@ private func servicePluginPortOwnedByPid(port: Int64, pid: Int64): Bool {
         false
     } catch (_: Exception) {
         false
+    }
+}
+
+private func servicePluginPortOwnerAlive(port: Int64, pid: Int64): Bool {
+    match (servicePluginPortOwnerProbeForTest) {
+        case Some(probe) => probe(port, pid)
+        case None => servicePluginPortOwnedByPid(port, pid)
+    }
+}
+
+private func servicePluginNowMs(): Int64 {
+    DateTime.now().toUnixTimeStamp().toMilliseconds()
+}
+
+private func servicePluginReadHttpBytes(response: HttpResponse): Array<Byte> {
+    let out = ArrayList<Byte>()
+    let buffer = Array<Byte>(1024, repeat: 0)
+    while (true) {
+        let n = response.body.read(buffer)
+        if (n <= 0) {
+            break
+        }
+        out.add(all: buffer[..n])
+        if (out.size > 1024) {
+            break
+        }
+    }
+    out.toArray()
+}
+
+private func servicePluginNativeHealthzProbe(url: String, timeoutMs: Int64): ServicePluginHealthzProbeResult {
+    let startedAtMs = servicePluginNowMs()
+    try {
+        let builder = ClientBuilder()
+        builder.readTimeout(Duration.millisecond * max(1, timeoutMs))
+        let client = builder.build()
+        try {
+            let response = client.send(HttpRequestBuilder().url(url).get().build())
+            let _ = servicePluginReadHttpBytes(response)
+            let elapsedMs = max(0, servicePluginNowMs() - startedAtMs)
+            let statusCode = Int64(response.status)
+            let ok = statusCode >= 200 && statusCode < 300
+            ServicePluginHealthzProbeResult(ok, statusCode: statusCode, durationMs: elapsedMs, diagnostic: "healthz_status=${statusCode}")
+        } finally {
+            client.close()
+        }
+    } catch (e: Exception) {
+        let elapsedMs = max(0, servicePluginNowMs() - startedAtMs)
+        let diagnostic = if (elapsedMs >= timeoutMs) { "healthz_timeout" } else { "healthz_error ${e.message}" }
+        ServicePluginHealthzProbeResult(false, statusCode: 0, durationMs: elapsedMs, diagnostic: redactServicePayload(diagnostic).text)
+    }
+}
+
+private func servicePluginHealthzProbe(url: String, timeoutMs: Int64): ServicePluginHealthzProbeResult {
+    match (servicePluginHealthzProbeForTest) {
+        case Some(probe) => probe(url, timeoutMs)
+        case None => servicePluginNativeHealthzProbe(url, timeoutMs)
+    }
+}
+
+private func servicePluginLeaseAgeMs(lease: ServicePluginLeaseSnapshot, nowMs: Int64): Int64 {
+    if (lease.lastHeartbeatMs > 0) {
+        return max(0, nowMs - lease.lastHeartbeatMs)
+    }
+    if (lease.startedAtMs > 0) {
+        return max(0, nowMs - lease.startedAtMs)
+    }
+    -1
+}
+
+public func probeServicePluginHealth(serviceId: String, nowMs!: Int64 = servicePluginNowMs()): ServicePluginHealthProbeResult {
+    match (servicePluginRegistry.get(serviceId.trimAscii())) {
+        case Some(record) => probeServicePluginHealth(record, nowMs: nowMs)
+        case None => ServicePluginHealthProbeResult(diagnostic: "service_missing")
+    }
+}
+
+private func probeServicePluginHealth(record: ServicePluginRuntimeRecord, nowMs!: Int64 = servicePluginNowMs()): ServicePluginHealthProbeResult {
+    let serviceId = record.registration.manifest.pluginId
+    if (record.status == "registered" || record.status == "stopped" || record.status == "disabled") {
+        return ServicePluginHealthProbeResult(
+            pidAlive: false,
+            stdioAlive: false,
+            healthzOk: true,
+            diagnostic: "supervisor_skipped_status=${record.status}"
+        )
+    }
+
+    var pidAlive = false
+    var stdioAlive = false
+    synchronized(servicePluginProcessLock) {
+        match (servicePluginActiveProcesses.get(serviceId)) {
+            case Some(process) =>
+                pidAlive = process.process.isAlive()
+                match (servicePluginResponseQueues.get(serviceId)) {
+                    case Some(queue) => stdioAlive = pidAlive && !queue.isClosed()
+                    case None => stdioAlive = false
+                }
+            case None =>
+                pidAlive = false
+                stdioAlive = false
+        }
+    }
+
+    let leasePath = Path(servicePluginLeasePath(record))
+    match (servicePluginReadLease(leasePath)) {
+        case Some(lease) =>
+            let leaseAgeMs = servicePluginLeaseAgeMs(lease, nowMs)
+            if (!pidAlive) {
+                return ServicePluginHealthProbeResult(
+                    pidAlive: false,
+                    stdioAlive: false,
+                    leaseState: lease.state,
+                    leaseAgeMs: leaseAgeMs,
+                    healthzOk: false,
+                    port: lease.port,
+                    diagnostic: "process_exited leaseState=${lease.state} pid=${lease.pid} port=${lease.port}"
+                )
+            }
+            if (lease.bindHost.isEmpty() || lease.port <= 0) {
+                return ServicePluginHealthProbeResult(
+                    pidAlive: pidAlive,
+                    stdioAlive: stdioAlive,
+                    leaseState: lease.state,
+                    leaseAgeMs: leaseAgeMs,
+                    healthzOk: true,
+                    port: lease.port,
+                    diagnostic: "listener_endpoint_missing leaseState=${lease.state} bindHost=${lease.bindHost} port=${lease.port}"
+                )
+            }
+            let healthz = servicePluginHealthzProbe("http://${lease.bindHost}:${lease.port}/healthz", servicePluginSupervisorConfig.healthTimeoutMs)
+            ServicePluginHealthProbeResult(
+                pidAlive: pidAlive,
+                stdioAlive: stdioAlive,
+                leaseState: lease.state,
+                leaseAgeMs: leaseAgeMs,
+                healthzOk: healthz.ok,
+                healthzDurationMs: healthz.durationMs,
+                port: lease.port,
+                diagnostic: "${healthz.diagnostic} leaseState=${lease.state} bindHost=${lease.bindHost} port=${lease.port}"
+            )
+        case None =>
+            if (!pidAlive) {
+                return ServicePluginHealthProbeResult(
+                    pidAlive: false,
+                    stdioAlive: false,
+                    healthzOk: false,
+                    diagnostic: "process_exited lease_missing"
+                )
+            }
+            ServicePluginHealthProbeResult(
+                pidAlive: pidAlive,
+                stdioAlive: stdioAlive,
+                healthzOk: true,
+                diagnostic: "lease_missing"
+            )
+    }
+}
+
+public func classifyServicePluginHealth(
+    probe: ServicePluginHealthProbeResult,
+    previousFailures!: Int64,
+    config!: ServicePluginSupervisorConfig = ServicePluginSupervisorConfig()
+): ServicePluginHealthClassification {
+    if (probe.diagnostic.contains("supervisor_skipped_status=")) {
+        return ServicePluginHealthClassification("healthy", diagnostic: probe.diagnostic)
+    }
+    if (!probe.pidAlive) {
+        return ServicePluginHealthClassification(
+            "degraded",
+            reason: "process_exited",
+            failureCount: max(1, previousFailures + 1),
+            shouldRecover: true,
+            diagnostic: probe.diagnostic
+        )
+    }
+    if (!probe.stdioAlive) {
+        let failures = previousFailures + 1
+        return ServicePluginHealthClassification(
+            "degraded",
+            reason: "stdio_closed",
+            failureCount: failures,
+            shouldRecover: failures >= config.failureThreshold,
+            diagnostic: probe.diagnostic
+        )
+    }
+    if (probe.diagnostic.contains("lease_missing") || probe.diagnostic.contains("listener_endpoint_missing")) {
+        return ServicePluginHealthClassification("healthy", diagnostic: probe.diagnostic)
+    }
+    if (!probe.healthzOk) {
+        let failures = previousFailures + 1
+        let reason = if (probe.diagnostic.contains("healthz_timeout")) {
+            "healthz_timeout"
+        } else if (probe.diagnostic.contains("port_not_owned")) {
+            "port_not_owned"
+        } else {
+            "healthz_unhealthy"
+        }
+        return ServicePluginHealthClassification(
+            "degraded",
+            reason: reason,
+            failureCount: failures,
+            shouldRecover: failures >= config.failureThreshold,
+            diagnostic: probe.diagnostic
+        )
+    }
+    ServicePluginHealthClassification("healthy", failureCount: 0, diagnostic: probe.diagnostic)
+}
+
+private func servicePluginSupervisorReason(reason: String): Bool {
+    let normalized = reason.trimAscii()
+    normalized == "process_exited" ||
+        normalized == "stdio_closed" ||
+        normalized == "healthz_timeout" ||
+        normalized == "healthz_unhealthy" ||
+        normalized == "port_not_owned"
+}
+
+private func servicePluginSupervisorProbeSummary(probe: ServicePluginHealthProbeResult, classification: ServicePluginHealthClassification): String {
+    let diag = redactServicePayload(probe.diagnostic).text
+    "status=${classification.status} reason=${classification.reason} pidAlive=${probe.pidAlive} stdioAlive=${probe.stdioAlive} leaseState=${probe.leaseState} leaseAgeMs=${probe.leaseAgeMs} healthzOk=${probe.healthzOk} healthzDurationMs=${probe.healthzDurationMs} port=${probe.port} failureCount=${classification.failureCount} diagnostic=${diag}"
+}
+
+private func servicePluginSupervisorRecordProbe(record: ServicePluginRuntimeRecord, probe: ServicePluginHealthProbeResult, classification: ServicePluginHealthClassification, nowMs: Int64): Unit {
+    record.supervisorFailureCount = classification.failureCount
+    record.supervisorLastProbeAtMs = nowMs
+    record.supervisorLastProbe = servicePluginSupervisorProbeSummary(probe, classification)
+    if (classification.status == "healthy") {
+        record.supervisorLastDegradedReason = ""
+        if (record.status == "degraded" && servicePluginSupervisorReason(record.degradedReason)) {
+            record.status = "running"
+            record.degradedReason = ""
+            record.lastError = ""
+        }
+        return
+    }
+    record.status = "degraded"
+    record.degradedReason = classification.reason
+    record.supervisorLastDegradedReason = classification.reason
+    record.lastError = redactServicePayload(if (classification.diagnostic.isEmpty()) { classification.reason } else { classification.diagnostic }).text
+}
+
+private func servicePluginSupervisorStopTimeoutMs(config: ServicePluginSupervisorConfig): Int64 {
+    max(200, min(5000, config.healthTimeoutMs * 10))
+}
+
+private func recoverServicePlugin(record: ServicePluginRuntimeRecord, reason: String, nowMs!: Int64 = servicePluginNowMs()): Bool {
+    let serviceId = record.registration.manifest.pluginId
+    let config = servicePluginSupervisorConfig
+    if (record.supervisorLastRestartAtMs > 0 && nowMs - record.supervisorLastRestartAtMs < config.restartCooldownMs) {
+        record.lastError = serviceJoinStrings([record.lastError, "restart_cooldown reason=${reason}"], " ")
+        return false
+    }
+
+    if (reason == "process_exited") {
+        servicePluginStopSupervisorWorker(serviceId)
+        synchronized(servicePluginProcessLock) {
+            if (servicePluginActiveProcesses.contains(serviceId)) { servicePluginActiveProcesses.remove(serviceId) }
+            if (servicePluginResponseQueues.contains(serviceId)) { servicePluginResponseQueues.remove(serviceId) }
+        }
+        record.pid = 0
+        record.status = "stopped"
+    } else {
+        let previousPid = record.pid
+        let stopped = stopServicePlugin(serviceId, reason: "supervisor_${reason}", timeoutMillis: servicePluginSupervisorStopTimeoutMs(config))
+        if (!stopped.ok) {
+            let lease = servicePluginReadLease(Path(servicePluginLeasePath(record)))
+            let portOwnerAlive = match (lease) {
+                case Some(value) => servicePluginPortOwnerAlive(value.port, value.pid)
+                case None => false
+            }
+            if (portOwnerAlive) {
+                match (lease) {
+                    case Some(value) =>
+                        record.lastError = "${stopped.diagnostic} port_release_timeout port=${value.port} pid=${value.pid} portOwnerAlive=true"
+                    case None =>
+                        record.lastError = "${stopped.diagnostic} port_release_timeout port=0 pid=0 portOwnerAlive=true"
+                }
+                record.pid = previousPid
+            } else {
+                record.lastError = stopped.diagnostic
+            }
+            record.status = "degraded"
+            record.degradedReason = reason
+            return false
+        }
+    }
+
+    match (servicePluginReadLease(Path(servicePluginLeasePath(record)))) {
+        case Some(lease) =>
+            if (servicePluginPortOwnerAlive(lease.port, lease.pid)) {
+                record.status = "degraded"
+                record.degradedReason = reason
+                record.lastError = "port_release_timeout port=${lease.port} pid=${lease.pid} portOwnerAlive=true"
+                return false
+            }
+        case None => ()
+    }
+
+    let ensured = ensureServicePluginStdioProcess(record, startupTimeoutMs: max(1000, config.healthTimeoutMs * 10))
+    if (!ensured.ok) {
+        record.status = "degraded"
+        record.degradedReason = if (record.degradedReason.isEmpty()) { reason } else { record.degradedReason }
+        record.lastError = if (ensured.diagnostic.isEmpty()) { reason } else { ensured.diagnostic }
+        return false
+    }
+    record.supervisorRestartCount++
+    record.supervisorLastRestartAtMs = nowMs
+    record.status = "degraded"
+    record.degradedReason = reason
+    record.supervisorLastDegradedReason = reason
+    record.lastError = "supervisor_restarted reason=${reason}"
+    true
+}
+
+private func servicePluginRunSupervisorTick(serviceId: String, nowMs: Int64, allowRecover!: Bool = true): ServicePluginSupervisorTickResult {
+    let sid = serviceId.trimAscii()
+    match (servicePluginRegistry.get(sid)) {
+        case Some(record) =>
+            if (!servicePluginSupervisorConfig.enabled) {
+                let probe = ServicePluginHealthProbeResult(healthzOk: true, diagnostic: "supervisor_disabled")
+                let classification = ServicePluginHealthClassification("healthy", diagnostic: "supervisor_disabled")
+                servicePluginSupervisorRecordProbe(record, probe, classification, nowMs)
+                return ServicePluginSupervisorTickResult(true, "disabled", probe: probe, classification: classification)
+            }
+            let probe = probeServicePluginHealth(record, nowMs: nowMs)
+            let classification = classifyServicePluginHealth(probe, previousFailures: record.supervisorFailureCount, config: servicePluginSupervisorConfig)
+            servicePluginSupervisorRecordProbe(record, probe, classification, nowMs)
+            var recovered = false
+            if (allowRecover && classification.shouldRecover) {
+                recovered = recoverServicePlugin(record, classification.reason, nowMs: nowMs)
+            }
+            ServicePluginSupervisorTickResult(true, classification.status, probe: probe, classification: classification, recovered: recovered, diagnostic: record.lastError)
+        case None => ServicePluginSupervisorTickResult(false, "missing", diagnostic: "service plugin is not registered")
+    }
+}
+
+public func runServicePluginSupervisorTickForTest(serviceId: String, nowMs!: Int64 = servicePluginNowMs()): ServicePluginSupervisorTickResult {
+    servicePluginRunSupervisorTick(serviceId, nowMs, allowRecover: true)
+}
+
+private func servicePluginStartSupervisorWorker(record: ServicePluginRuntimeRecord): Unit {
+    if (!servicePluginSupervisorConfig.enabled) {
+        return
+    }
+    let serviceId = record.registration.manifest.pluginId
+    let flag = ServicePluginSupervisorStopFlag()
+    synchronized(servicePluginSupervisorLock) {
+        match (servicePluginSupervisorWorkers.get(serviceId)) {
+            case Some(existing) =>
+                if (!existing.stopped()) {
+                    return
+                }
+            case None => ()
+        }
+        servicePluginSupervisorWorkers[serviceId] = flag
+    }
+    spawn {
+        while (!flag.stopped()) {
+            sleep(Duration.millisecond * servicePluginSupervisorConfig.intervalMs)
+            if (flag.stopped()) {
+                return
+            }
+            let _ = servicePluginRunSupervisorTick(serviceId, servicePluginNowMs(), allowRecover: true)
+        }
+    }
+}
+
+private func servicePluginStopSupervisorWorker(serviceId: String): Unit {
+    synchronized(servicePluginSupervisorLock) {
+        match (servicePluginSupervisorWorkers.get(serviceId.trimAscii())) {
+            case Some(flag) =>
+                flag.stop()
+                servicePluginSupervisorWorkers.remove(serviceId.trimAscii())
+            case None => ()
+        }
+    }
+}
+
+private func stopAllServicePluginSupervisors(): Unit {
+    synchronized(servicePluginSupervisorLock) {
+        for ((_, flag) in servicePluginSupervisorWorkers) {
+            flag.stop()
+        }
+        servicePluginSupervisorWorkers = HashMap<String, ServicePluginSupervisorStopFlag>()
     }
 }
 
@@ -1391,6 +1974,7 @@ public func shutdownServicePluginHost(reason!: String = "shutdown", timeoutMilli
     for (serviceId in ids) {
         let _ = stopServicePlugin(serviceId, reason: reason, timeoutMillis: timeoutMillis)
     }
+    stopAllServicePluginSupervisors()
 }
 
 private func ensureServicePluginStdioProcess(record: ServicePluginRuntimeRecord, startupTimeoutMs!: Int64 = 10000): ServicePluginProcessEnsureResult {
@@ -1484,6 +2068,7 @@ private func ensureServicePluginStdioProcess(record: ServicePluginRuntimeRecord,
         record.degradedReason = ""
         record.lastError = ""
         spawn { servicePluginEventPump(record, process, queue) }
+        servicePluginStartSupervisorWorker(record)
         ServicePluginProcessEnsureResult(true, "running", process: Some(process), queue: Some(queue))
     }
 }
@@ -1652,6 +2237,7 @@ public func startServicePlugin(serviceId: String, context!: ServiceStartContext 
             record.lastError = ""
             record.lastHeartbeatAtMillis = context.nowMillis
             record.stateFlushed = false
+            servicePluginStartSupervisorWorker(record)
             ServiceStartResult(true, serviceId.trimAscii(), record.status, instanceId: record.instanceId)
         case None => ServiceStartResult(false, serviceId.trimAscii(), "missing", diagnostic: "service plugin is not registered")
     }
@@ -1681,6 +2267,7 @@ public func ensureRegisteredServicePluginStarted(serviceId: String, startupTimeo
 public func stopServicePlugin(serviceId: String, reason!: String = "", timeoutMillis!: Int64 = 30000): ServiceStopResult {
     match (servicePluginRegistry.get(serviceId.trimAscii())) {
         case Some(record) =>
+            servicePluginStopSupervisorWorker(serviceId.trimAscii())
             if (timeoutMillis <= 0) {
                 record.status = "degraded"
                 record.degradedReason = "stop timeout"
@@ -1910,7 +2497,9 @@ public func handleServicePluginControlAction(action: ServicePluginControlAction)
 public func renderServicePluginDiagnostics(snapshot: ServicePluginSnapshot): String {
     let redactedReason = redactServicePayload(snapshot.degradedReason).text
     let redactedLastError = redactServicePayload(snapshot.lastError).text
-    "serviceId=${snapshot.serviceId} status=${snapshot.status} enabled=${snapshot.enabled} capabilities=${serviceJoinStrings(snapshot.capabilityIds, ",")} config=${snapshot.configSummary} degradedReason=${redactedReason} lastError=${redactedLastError}"
+    let redactedSupervisorProbe = redactServicePayload(snapshot.supervisorLastProbe).text
+    let redactedSupervisorReason = redactServicePayload(snapshot.supervisorDegradedReason).text
+    "serviceId=${snapshot.serviceId} status=${snapshot.status} enabled=${snapshot.enabled} capabilities=${serviceJoinStrings(snapshot.capabilityIds, ",")} config=${snapshot.configSummary} degradedReason=${redactedReason} lastError=${redactedLastError} supervisorLastProbe=${redactedSupervisorProbe} supervisorFailureCount=${snapshot.supervisorFailureCount} supervisorRestartCount=${snapshot.supervisorRestartCount} supervisorDegradedReason=${redactedSupervisorReason}"
 }
 
 private func serviceSnapshot(record: ServicePluginRuntimeRecord): ServicePluginSnapshot {
@@ -1929,7 +2518,11 @@ private func serviceSnapshot(record: ServicePluginRuntimeRecord): ServicePluginS
             lastHeartbeatAtMillis: record.lastHeartbeatAtMillis,
             instanceId: record.instanceId,
             pid: record.pid,
-            lastError: record.lastError
+            lastError: record.lastError,
+            supervisorLastProbe: record.supervisorLastProbe,
+            supervisorFailureCount: record.supervisorFailureCount,
+            supervisorRestartCount: record.supervisorRestartCount,
+            supervisorDegradedReason: record.supervisorLastDegradedReason
         )
     }
 
