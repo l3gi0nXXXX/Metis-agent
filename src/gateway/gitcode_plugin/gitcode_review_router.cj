@@ -154,7 +154,13 @@ public func buildPrReviewTask(request: GitCodeReviewRequest): GitCodeReviewTask 
 }
 
 public func buildCommentReplyTask(request: GitCodeReviewRequest): GitCodeReviewTask {
-    let parentKind = if (request.parentUrl.contains("/pulls/") || request.url.contains("/pulls/")) { "pr" } else { "issue" }
+    let parentKind = if (request.hasDiscussionContext && request.discussionContext.parent.kind == "pr") {
+        "pr"
+    } else if (request.parentUrl.contains("/pulls/") || request.url.contains("/pulls/")) {
+        "pr"
+    } else {
+        "issue"
+    }
     GitCodeReviewTask(
         taskType: "comment_reply",
         eventId: request.eventId,
@@ -243,7 +249,12 @@ private func reviewRouteIsDegraded(request: GitCodeReviewRequest): Bool {
     request.diagnostics.contains("ckb_unavailable") ||
         request.diagnostics.contains("source_unavailable") ||
         request.diagnostics.contains("pr_review_timeout") ||
-        request.diagnostics.contains("review_adapter_timeout")
+        request.diagnostics.contains("review_adapter_timeout") ||
+        request.diagnostics.contains("comment_context_missing") ||
+        request.diagnostics.contains("comment_context_malformed") ||
+        request.diagnostics.contains("comment_context_incomplete") ||
+        request.diagnostics.contains("comment_context_degraded") ||
+        request.diagnostics.contains("comment_context_truncated")
 }
 
 private func reviewRouteNeedsHumanReview(request: GitCodeReviewRequest): Bool {

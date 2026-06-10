@@ -18,6 +18,111 @@ public class GitCodeReviewValidationResult {
     }
 }
 
+public class GitCodeReviewDiscussionParent {
+    public let kind: String
+    public let number: String
+    public let title: String
+    public let body: String
+    public let url: String
+    public let author: String
+    public let authorUrl: String
+    public let source: String
+
+    public init(
+        kind!: String = "",
+        number!: String = "",
+        title!: String = "",
+        body!: String = "",
+        url!: String = "",
+        author!: String = "",
+        authorUrl!: String = "",
+        source!: String = ""
+    ) {
+        this.kind = normalizeReviewEventType(reviewSafeField(kind, maxBytes: 32))
+        this.number = reviewSafeField(number, maxBytes: 64)
+        this.title = reviewSafeField(title, maxBytes: 240)
+        this.body = reviewSafeField(body, maxBytes: 4096)
+        this.url = reviewSafeField(url, maxBytes: 320)
+        this.author = reviewSafeField(author, maxBytes: 160)
+        this.authorUrl = reviewSafeField(authorUrl, maxBytes: 320)
+        this.source = reviewSafeField(source, maxBytes: 64).toAsciiLower()
+    }
+}
+
+public class GitCodeReviewDiscussionComment {
+    public let id: String
+    public let body: String
+    public let url: String
+    public let author: String
+    public let authorUrl: String
+    public let createdAt: String
+    public let createdAtMs: Int64
+    public let updatedAtMs: Int64
+
+    public init(
+        id!: String = "",
+        body!: String = "",
+        url!: String = "",
+        author!: String = "",
+        authorUrl!: String = "",
+        createdAt!: String = "",
+        createdAtMs!: Int64 = 0,
+        updatedAtMs!: Int64 = 0
+    ) {
+        this.id = reviewSafeField(id, maxBytes: 80)
+        this.body = reviewSafeField(body, maxBytes: 2048)
+        this.url = reviewSafeField(url, maxBytes: 320)
+        this.author = reviewSafeField(author, maxBytes: 160)
+        this.authorUrl = reviewSafeField(authorUrl, maxBytes: 320)
+        this.createdAt = reviewSafeField(createdAt, maxBytes: 80)
+        this.createdAtMs = createdAtMs
+        this.updatedAtMs = updatedAtMs
+    }
+}
+
+public class GitCodeReviewDiscussionContext {
+    public let status: String
+    public let repo: String
+    public let kind: String
+    public let number: String
+    public let commentId: String
+    public let parent: GitCodeReviewDiscussionParent
+    public let triggerComment: GitCodeReviewDiscussionComment
+    public let previousComments: Array<GitCodeReviewDiscussionComment>
+    public let previousCommentsTotal: Int64
+    public let previousCommentsIncluded: Int64
+    public let truncated: Bool
+    public let diagnostics: Array<String>
+
+    public init(
+        status!: String = "",
+        repo!: String = "",
+        kind!: String = "",
+        number!: String = "",
+        commentId!: String = "",
+        parent!: GitCodeReviewDiscussionParent = GitCodeReviewDiscussionParent(),
+        triggerComment!: GitCodeReviewDiscussionComment = GitCodeReviewDiscussionComment(),
+        previousComments!: Array<GitCodeReviewDiscussionComment> = [],
+        previousCommentsTotal!: Int64 = -1,
+        previousCommentsIncluded!: Int64 = -1,
+        truncated!: Bool = false,
+        diagnostics!: Array<String> = []
+    ) {
+        this.status = reviewSafeField(status, maxBytes: 32).toAsciiLower()
+        this.repo = reviewSafeField(repo, maxBytes: 180)
+        this.kind = normalizeReviewEventType(reviewSafeField(kind, maxBytes: 32))
+        this.number = reviewSafeField(number, maxBytes: 64)
+        this.commentId = reviewSafeField(commentId, maxBytes: 80)
+        this.parent = parent
+        this.triggerComment = triggerComment
+        this.previousComments = reviewSafeDiscussionComments(previousComments, maxItems: 30)
+        this.previousCommentsTotal = if (previousCommentsTotal >= 0) { previousCommentsTotal } else { this.previousComments.size }
+        this.previousCommentsIncluded = if (previousCommentsIncluded >= 0) { previousCommentsIncluded } else { this.previousComments.size }
+        this.truncated = truncated
+        this.diagnostics = reviewSafeArray(reviewDedupeArray(diagnostics), maxBytes: 160)
+    }
+}
+
 public class GitCodeReviewRequest {
     public let contractVersion: String
     public let schemaVersion: Int64
@@ -51,6 +156,8 @@ public class GitCodeReviewRequest {
     public let diagnostics: Array<String>
     public let routeHint: String
     public let draftContext: String
+    public let hasDiscussionContext: Bool
+    public let discussionContext: GitCodeReviewDiscussionContext
 
     public init(
         contractVersion!: String = GITCODE_REVIEW_CONTRACT_VERSION,
@@ -84,7 +191,9 @@ public class GitCodeReviewRequest {
         needsHumanReview!: Bool = false,
         diagnostics!: Array<String> = [],
         routeHint!: String = "",
-        draftContext!: String = ""
+        draftContext!: String = "",
+        hasDiscussionContext!: Bool = false,
+        discussionContext!: GitCodeReviewDiscussionContext = GitCodeReviewDiscussionContext()
     ) {
         this.contractVersion = reviewSafeField(contractVersion, maxBytes: 128)
         this.schemaVersion = schemaVersion
@@ -118,6 +227,8 @@ public class GitCodeReviewRequest {
         this.diagnostics = reviewSafeArray(reviewDedupeArray(diagnostics), maxBytes: 160)
         this.routeHint = routeHint.trimAscii()
         this.draftContext = draftContext.trimAscii()
+        this.hasDiscussionContext = hasDiscussionContext
+        this.discussionContext = discussionContext
     }
 }
 
@@ -249,31 +360,63 @@ public func parseGitCodeReviewRequest(payload: String): GitCodeReviewRequestPars
     let fieldsObj = reviewObject(templatesObj, "fields")
     let prObj = reviewObject(requestObj, "pr")
     let policyObj = reviewObject(requestObj, "policy")
+    let contentObj = reviewObject(requestObj, "content")
+    let contextKeyExists = requestObj.get("context").isSome()
+    let contextObjectExists = reviewObjectPresent(requestObj, "context")
+    let discussionContext = if (contextObjectExists) {
+        parseGitCodeReviewDiscussionContext(reviewObject(requestObj, "context"))
+    } else {
+        GitCodeReviewDiscussionContext()
+    }
+    let hasDiscussionContext = contextObjectExists && reviewDiscussionContextHasFacts(discussionContext)
+    let eventType = reviewFirstNonEmpty([reviewString(eventObj, "eventType"), reviewString(eventObj, "type"), reviewString(root, "kind")])
     let diagnostics = ArrayList<String>()
     reviewAppendStrings(diagnostics, reviewStringArray(maintainersObj, "diagnostics"))
     reviewAppendStrings(diagnostics, reviewStringArray(templatesObj, "diagnostics"))
     reviewAppendStrings(diagnostics, reviewStringArray(requestObj, "diagnostics"))
+    if (eventType == "comment") {
+        if (!contextKeyExists) {
+            diagnostics.add("comment_context_missing")
+        } else if (!contextObjectExists) {
+            diagnostics.add("comment_context_malformed")
+        } else if (!hasDiscussionContext) {
+            diagnostics.add("comment_context_incomplete")
+        } else {
+            reviewAppendStrings(diagnostics, discussionContext.diagnostics)
+            if (discussionContext.status != "resolved") {
+                diagnostics.add("comment_context_degraded")
+            }
+            if (discussionContext.truncated) {
+                diagnostics.add("comment_context_truncated")
+            }
+        }
+    }
     if (reviewString(maintainersObj, "teamLeaderStatus") == "missing" || reviewString(maintainersObj, "teamLeaderStatus") == "failed") {
         diagnostics.add("team_leader_missing")
     }
     let issueKind = reviewString(templatesObj, "issueKind")
-    let content = reviewFirstNonEmpty([reviewString(root, "content"), reviewString(fieldsObj, "bugDescription"), reviewString(commentObj, "body")])
+    let content = if (eventType == "comment") {
+        reviewFirstNonEmpty([discussionContext.parent.body, reviewString(contentObj, "body"), reviewString(fieldsObj, "bugDescription"), reviewString(commentObj, "body"), discussionContext.triggerComment.body, reviewString(root, "content")])
+    } else {
+        reviewFirstNonEmpty([reviewString(root, "content"), reviewString(contentObj, "body"), reviewString(fieldsObj, "bugDescription"), reviewString(commentObj, "body")])
+    }
     let redacted = diagnostics.contains("content_redacted") || content.toAsciiLower().contains("redacted")
+    let repoFullName = reviewFirstNonEmpty([reviewString(repoObj, "fullName"), reviewString(requestObj, "repo"), reviewString(root, "repo")])
     let request = GitCodeReviewRequest(
         contractVersion: contractVersion,
         schemaVersion: reviewInt(requestObj, "schemaVersion", fallback: 1),
         legacy: false,
-        eventId: reviewFirstNonEmpty([reviewString(eventObj, "eventId"), reviewString(root, "eventId")]),
-        eventType: reviewFirstNonEmpty([reviewString(eventObj, "eventType"), reviewString(root, "kind")]),
+        eventId: reviewFirstNonEmpty([reviewString(eventObj, "eventId"), reviewString(requestObj, "eventId"), reviewString(root, "eventId")]),
+        eventType: eventType,
         action: reviewString(eventObj, "action"),
-        repoFullName: reviewFirstNonEmpty([reviewString(repoObj, "fullName"), reviewString(root, "repo")]),
+        repoFullName: repoFullName,
         repoOrg: reviewString(repoObj, "org"),
         repoName: reviewString(repoObj, "name"),
-        number: reviewFirstNonEmpty([reviewString(itemObj, "number"), reviewAnyString(root, "number")]),
-        commentId: reviewFirstNonEmpty([reviewString(commentObj, "commentId"), reviewAnyString(root, "commentId")]),
-        url: reviewFirstNonEmpty([reviewString(itemObj, "url"), reviewString(root, "url")]),
-        title: reviewFirstNonEmpty([reviewString(itemObj, "title"), reviewString(root, "title")]),
-        author: reviewFirstNonEmpty([reviewString(authorObj, "login"), reviewString(root, "author")]),
+        number: reviewFirstNonEmpty([reviewString(itemObj, "number"), reviewAnyString(eventObj, "number"), discussionContext.parent.number, reviewAnyString(root, "number")]),
+        commentId: reviewFirstNonEmpty([reviewString(commentObj, "commentId"), reviewAnyString(eventObj, "commentId"), discussionContext.triggerComment.id, reviewAnyString(root, "commentId")]),
+        url: reviewFirstNonEmpty([reviewString(commentObj, "url"), reviewString(root, "url"), reviewString(itemObj, "url"), discussionContext.triggerComment.url, discussionContext.parent.url]),
+        title: reviewFirstNonEmpty([reviewString(itemObj, "title"), reviewString(contentObj, "title"), discussionContext.parent.title, reviewString(root, "title")]),
+        author: reviewFirstNonEmpty([reviewString(authorObj, "login"), reviewString(authorObj, "username"), reviewString(authorObj, "name"), reviewString(root, "author")]),
         content: content,
         issueKind: issueKind,
         cjcVersion: reviewString(fieldsObj, "cjcVersion"),
@@ -282,20 +425,57 @@ public func parseGitCodeReviewRequest(payload: String): GitCodeReviewRequestPars
         reviewFindings: reviewStringArray(prObj, "reviewFindings"),
         teamLeaders: reviewMentionArray(maintainersObj, "teamLeaders"),
         codeowners: reviewMentionArray(maintainersObj, "codeowners"),
-        commentBody: reviewString(commentObj, "body"),
-        parentUrl: reviewString(itemObj, "url"),
+        commentBody: reviewFirstNonEmpty([reviewString(commentObj, "body"), discussionContext.triggerComment.body, if (eventType == "comment") { reviewString(root, "content") } else { "" }]),
+        parentUrl: reviewFirstNonEmpty([reviewString(itemObj, "url"), discussionContext.parent.url, if (eventType == "comment") { reviewString(root, "url") } else { "" }]),
         requiresCkb: reviewBool(policyObj, "requiresCkb"),
         requiresSourceWorkspace: reviewBool(policyObj, "requiresSourceWorkspace"),
         requiresCodeReview: reviewBool(policyObj, "requiresCodeReview"),
         contentRedacted: redacted,
         diagnostics: diagnostics.toArray(),
-        draftContext: buildReviewDraftContext(issueKind, reviewStringArray(fieldsObj, "branchVersions"), reviewString(fieldsObj, "cjcVersion"), reviewStringArray(prObj, "changedFiles"), reviewStringArray(prObj, "reviewFindings"))
+        draftContext: buildReviewDraftContext(issueKind, reviewStringArray(fieldsObj, "branchVersions"), reviewString(fieldsObj, "cjcVersion"), reviewStringArray(prObj, "changedFiles"), reviewStringArray(prObj, "reviewFindings")),
+        hasDiscussionContext: hasDiscussionContext,
+        discussionContext: discussionContext
     )
     let validation = validateGitCodeReviewRequest(request)
     if (!validation.ok) {
         return GitCodeReviewRequestParseResult(false, status: validation.status, diagnostic: validation.diagnostic, request: request)
     }
     GitCodeReviewRequestParseResult(true, request: request)
+}
+
+public func renderGitCodeReviewCommentContextPromptBlock(request: GitCodeReviewRequest): String {
+    if (request.eventType != "comment") {
+        return ""
+    }
+    if (!request.hasDiscussionContext) {
+        return "评论上下文: missing\n必须把当前评论视为上下文不完整的降级事件，不能假设父 issue/PR 原文或前序评论。"
+    }
+    let context = request.discussionContext
+    let lines = ArrayList<String>()
+    lines.add("评论上下文: status=${context.status} truncated=${context.truncated}")
+    lines.add("父项: ${context.parent.kind} #${context.parent.number} ${context.parent.url}")
+    if (!context.parent.title.isEmpty()) { lines.add("父项标题: ${context.parent.title}") }
+    if (!context.parent.author.isEmpty()) { lines.add("父项作者: ${context.parent.author}") }
+    if (!context.parent.body.isEmpty()) {
+        lines.add("父项原文:")
+        lines.add(context.parent.body)
+    }
+    lines.add("触发评论: #${context.triggerComment.id} author=${context.triggerComment.author} ${context.triggerComment.url}")
+    if (!context.triggerComment.body.isEmpty()) {
+        lines.add("触发评论正文:")
+        lines.add(context.triggerComment.body)
+    }
+    lines.add("前序评论: included=${context.previousCommentsIncluded} total=${context.previousCommentsTotal}")
+    var index: Int64 = 1
+    for (comment in context.previousComments) {
+        lines.add("前序评论 ${index}: #${comment.id} author=${comment.author} ${comment.url}")
+        lines.add(comment.body)
+        index++
+    }
+    if (context.diagnostics.size > 0) {
+        lines.add("上下文诊断: ${String.join(context.diagnostics, delimiter: ", ")}")
+    }
+    gitCodeReviewRedactSensitiveText(String.join(lines.toArray(), delimiter: "\n"))
 }
 
 public func validateGitCodeReviewRequest(request: GitCodeReviewRequest): GitCodeReviewValidationResult {
@@ -311,7 +491,7 @@ public func validateGitCodeReviewRequest(request: GitCodeReviewRequest): GitCode
     if (!reviewUrlValid(request.url)) {
         return GitCodeReviewValidationResult(false, status: "url_invalid", diagnostic: "GitCode URL must be an https://gitcode.com URL")
     }
-    let text = "${request.repoFullName}\n${request.url}\n${request.content}\n${request.commentBody}\n${request.parentUrl}\n${request.draftContext}"
+    let text = "${request.repoFullName}\n${request.url}\n${request.content}\n${request.commentBody}\n${request.parentUrl}\n${request.draftContext}\n${renderGitCodeReviewCommentContextPromptBlock(request)}"
     if (reviewContainsLocalPath(text)) {
         return GitCodeReviewValidationResult(false, status: "payload_contains_local_path", diagnostic: "contract contains a local filesystem path")
     }
@@ -418,6 +598,16 @@ private func reviewObject(obj: JsonObject, key: String): JsonObject {
     }
 }
 
+private func reviewObjectPresent(obj: JsonObject, key: String): Bool {
+    match (obj.get(key)) {
+        case Some(v) => try {
+            let _ = v.asObject()
+            true
+        } catch (_: Exception) { false }
+        case None => false
+    }
+}
+
 private func reviewArray(obj: JsonObject, key: String): JsonArray {
     match (obj.get(key)) {
         case Some(v) => try { v.asArray() } catch (_: Exception) { JsonArray([]) }
@@ -463,6 +653,69 @@ private func reviewStringArray(obj: JsonObject, key: String): Array<String> {
         if (!value.isEmpty()) { out.add(reviewSafeField(value, maxBytes: 300)) }
     }
     out.toArray()
+}
+
+private func parseGitCodeReviewDiscussionContext(obj: JsonObject): GitCodeReviewDiscussionContext {
+    GitCodeReviewDiscussionContext(
+        status: reviewString(obj, "status"),
+        repo: reviewString(obj, "repo"),
+        kind: reviewString(obj, "kind"),
+        number: reviewAnyString(obj, "number"),
+        commentId: reviewAnyString(obj, "commentId"),
+        parent: parseGitCodeReviewDiscussionParent(reviewObject(obj, "parent")),
+        triggerComment: parseGitCodeReviewDiscussionComment(reviewObject(obj, "triggerComment")),
+        previousComments: parseGitCodeReviewDiscussionComments(obj, "previousComments"),
+        previousCommentsTotal: reviewInt(obj, "previousCommentsTotal", fallback: -1),
+        previousCommentsIncluded: reviewInt(obj, "previousCommentsIncluded", fallback: -1),
+        truncated: reviewBool(obj, "truncated"),
+        diagnostics: reviewStringArray(obj, "diagnostics")
+    )
+}
+
+private func parseGitCodeReviewDiscussionParent(obj: JsonObject): GitCodeReviewDiscussionParent {
+    GitCodeReviewDiscussionParent(
+        kind: reviewString(obj, "kind"),
+        number: reviewAnyString(obj, "number"),
+        title: reviewString(obj, "title"),
+        body: reviewString(obj, "body"),
+        url: reviewString(obj, "url"),
+        author: reviewFirstNonEmpty([reviewString(obj, "author"), reviewString(obj, "username"), reviewString(obj, "login")]),
+        authorUrl: reviewString(obj, "authorUrl"),
+        source: reviewString(obj, "source")
+    )
+}
+
+private func parseGitCodeReviewDiscussionComment(obj: JsonObject): GitCodeReviewDiscussionComment {
+    GitCodeReviewDiscussionComment(
+        id: reviewAnyString(obj, "id"),
+        body: reviewString(obj, "body"),
+        url: reviewString(obj, "url"),
+        author: reviewFirstNonEmpty([reviewString(obj, "author"), reviewString(obj, "username"), reviewString(obj, "login")]),
+        authorUrl: reviewString(obj, "authorUrl"),
+        createdAt: reviewString(obj, "createdAt"),
+        createdAtMs: reviewInt(obj, "createdAtMs"),
+        updatedAtMs: reviewInt(obj, "updatedAtMs")
+    )
+}
+
+private func parseGitCodeReviewDiscussionComments(obj: JsonObject, key: String): Array<GitCodeReviewDiscussionComment> {
+    let out = ArrayList<GitCodeReviewDiscussionComment>()
+    for (item in reviewArray(obj, key).getItems()) {
+        if (out.size >= 30) {
+            break
+        }
+        let row = try { item.asObject() } catch (_: Exception) { JsonObject() }
+        let comment = parseGitCodeReviewDiscussionComment(row)
+        if (!comment.id.isEmpty() || !comment.body.isEmpty()) {
+            out.add(comment)
+        }
+    }
+    out.toArray()
+}
+
+private func reviewDiscussionContextHasFacts(context: GitCodeReviewDiscussionContext): Bool {
+    (!context.parent.url.isEmpty() || !context.parent.body.isEmpty() || !context.parent.title.isEmpty()) &&
+        (!context.triggerComment.id.isEmpty() || !context.triggerComment.body.isEmpty())
 }
 
 private func reviewMentionArray(obj: JsonObject, key: String): Array<String> {
@@ -517,6 +770,17 @@ private func reviewSafeArray(values: Array<String>, maxBytes!: Int64 = 160): Arr
     for (value in values) {
         let text = reviewSafeField(value, maxBytes: maxBytes)
         if (!text.isEmpty()) { out.add(text) }
+    }
+    out.toArray()
+}
+
+private func reviewSafeDiscussionComments(values: Array<GitCodeReviewDiscussionComment>, maxItems!: Int64 = 30): Array<GitCodeReviewDiscussionComment> {
+    let out = ArrayList<GitCodeReviewDiscussionComment>()
+    for (value in values) {
+        if (out.size >= maxItems) {
+            break
+        }
+        out.add(value)
     }
     out.toArray()
 }

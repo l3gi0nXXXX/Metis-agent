@@ -7,6 +7,14 @@ import stdx.encoding.json.JsonObject
 public class ServicePluginEventDispatcherTest {
     private let gitCodeReviewContractVersion = "gcm-metis-gitcode-review-v1"
 
+    private func repeatText(text: String, count: Int64): String {
+        let out = StringBuilder()
+        for (_ in 0..count) {
+            out.append(text)
+        }
+        out.toString()
+    }
+
     private func jsonInt(obj: JsonObject, key: String): Int64 {
         try { obj.get(key).getOrThrow().asInt().getValue() } catch (_: Exception) { -1 }
     }
@@ -51,6 +59,44 @@ public class ServicePluginEventDispatcherTest {
             "}" +
         "}"
         ServiceFrame("event", "accepted-contract-${eventId}", "gitcode-monitor", method: "emitCapabilityEvent", capabilityId: "gitcode.event.accepted", payload: payload)
+    }
+
+    private func acceptedCommentContextFrame(): ServiceFrame {
+        let parentBody = this.repeatText("parent-context-", 650)
+        let payload = "{" +
+            "\"jobId\":\"webhook-context\"," +
+            "\"eventId\":\"gitcode:Cangjie/community:comment:9003\"," +
+            "\"repo\":\"Cangjie/community\"," +
+            "\"kind\":\"comment\"," +
+            "\"number\":\"4\"," +
+            "\"commentId\":\"9003\"," +
+            "\"title\":\"Issue 4\"," +
+            "\"url\":\"https://gitcode.com/Cangjie/community/issues/4#note_9003\"," +
+            "\"content\":\"trigger context final sentinel\"," +
+            "\"contractVersion\":\"${this.gitCodeReviewContractVersion}\"," +
+            "\"reviewRequest\":{" +
+                "\"contractVersion\":\"${this.gitCodeReviewContractVersion}\"," +
+                "\"jobId\":\"webhook-context\"," +
+                "\"eventId\":\"gitcode:Cangjie/community:comment:9003\"," +
+                "\"repo\":\"Cangjie/community\"," +
+                "\"event\":{\"type\":\"comment\",\"itemKind\":\"issue\",\"number\":\"4\",\"commentId\":\"9003\",\"action\":\"comment\"}," +
+                "\"author\":{\"login\":\"bob\"}," +
+                "\"templates\":{\"issueKind\":\"question\",\"fields\":{\"branchVersions\":[]}}," +
+                "\"pr\":{\"changedFiles\":[],\"reviewFindings\":[]}," +
+                "\"content\":{\"title\":\"Issue 4\",\"body\":\"${parentBody}\"}," +
+                "\"context\":{" +
+                    "\"status\":\"resolved\"," +
+                    "\"parent\":{\"kind\":\"issue\",\"number\":\"4\",\"title\":\"Issue 4\",\"body\":\"${parentBody}\",\"url\":\"https://gitcode.com/Cangjie/community/issues/4\",\"author\":\"alice\",\"authorUrl\":\"\",\"source\":\"api\"}," +
+                    "\"triggerComment\":{\"id\":\"9003\",\"body\":\"trigger context final sentinel\",\"url\":\"https://gitcode.com/Cangjie/community/issues/4#note_9003\",\"author\":\"bob\",\"authorUrl\":\"\",\"createdAt\":\"\",\"createdAtMs\":3000,\"updatedAtMs\":3000}," +
+                    "\"previousComments\":[{\"id\":\"9001\",\"body\":\"previous context final sentinel\",\"url\":\"https://gitcode.com/Cangjie/community/issues/4#note_9001\",\"author\":\"carol\",\"authorUrl\":\"\",\"createdAt\":\"\",\"createdAtMs\":1000,\"updatedAtMs\":1000}]," +
+                    "\"previousCommentsTotal\":1," +
+                    "\"previousCommentsIncluded\":1," +
+                    "\"truncated\":false," +
+                    "\"diagnostics\":[]" +
+                "}" +
+            "}" +
+        "}"
+        ServiceFrame("event", "accepted-comment-context", "gitcode-monitor", method: "emitCapabilityEvent", capabilityId: "gitcode.event.accepted", payload: payload)
     }
 
     private func registerGitCodeWritebackPlugin(): Unit {
@@ -896,6 +942,36 @@ public class ServicePluginEventDispatcherTest {
             @Expect(messages.size, 1)
             @Expect(messages[0].contains("写回未执行"), true)
             @Expect(messages[0].contains("\"status\""), false)
+        } finally {
+            this.resetDispatcherHooks()
+        }
+    }
+
+    @TestCase
+    public func tContext001DispatcherPreservesLargeCommentReviewRequestContext(): Unit {
+        this.resetDispatcherHooks()
+        let calls = ArrayList<String>()
+        let messages = ArrayList<String>()
+        setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent =>
+            this.targetRows([this.target(channel: "telegram", peerId: "tg-peer")])
+        }))
+        setServicePluginWebhookGeneratedReplyHandlerForTest(Some({ event: ServicePluginAcceptedGitCodeEvent, _target: ServicePluginDeliveryTarget =>
+            calls.add(event.eventId)
+            @Expect(event.reviewRequestRaw.contains("\"context\""), true)
+            @Expect(event.reviewRequestRaw.contains("trigger context final sentinel"), true)
+            @Expect(event.reviewRequestRaw.contains("previous context final sentinel"), true)
+            ServicePluginGeneratedReplyResult(false, status: "llm_degraded", diagnostic: "test degraded", needsHumanReview: true)
+        }))
+        setServicePluginEventDeliveryForTest(Some({ _target: ServicePluginDeliveryTarget, text: String =>
+            messages.add(text)
+            ServicePluginEventDeliveryResult(true, "sent")
+        }))
+        try {
+            let result = dispatchServicePluginEvent(this.acceptedCommentContextFrame(), store: ServicePluginPendingJobStore())
+            @Expect(result.ok, true)
+            @Expect(result.status, "generated_reply_degraded_delivered")
+            @Expect(calls.size, 1)
+            @Expect(messages.size, 1)
         } finally {
             this.resetDispatcherHooks()
         }

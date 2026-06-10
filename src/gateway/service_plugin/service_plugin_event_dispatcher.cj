@@ -107,7 +107,7 @@ public class ServicePluginAcceptedGitCodeEvent {
         this.author = servicePluginAcceptedEventSafeField(author, maxBytes: 120)
         this.content = servicePluginAcceptedEventSafeField(content, maxBytes: 1200)
         this.contractVersion = servicePluginAcceptedEventSafeField(contractVersion, maxBytes: 128)
-        this.reviewRequestRaw = servicePluginAcceptedEventSafeField(reviewRequestRaw, maxBytes: 6000)
+        this.reviewRequestRaw = servicePluginAcceptedEventSafeField(reviewRequestRaw, maxBytes: 24000)
     }
 }
 

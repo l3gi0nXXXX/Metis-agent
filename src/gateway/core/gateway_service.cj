@@ -9,7 +9,7 @@ import metis.gateway.security.gatewayPairingAccountStore
 import metis.gateway.service_plugin.{CapabilityCaller, CapabilityInvokeRequest, CapabilityInvokeResult, ServicePluginAcceptedGitCodeEvent, ServicePluginDeliveryTarget, ServicePluginEventDeliveryResult, ServicePluginGeneratedReplyResult, ServicePluginPendingJob, buildServicePluginImBindingRules, invokeRegisteredCapability, matchServicePluginImBinding, parseServicePluginJobAcceptedPayload, redactServicePayload, renderServicePluginJobSnapshotMessage, servicePluginPendingJobStore, registerConfiguredServicePlugins, servicePluginConfiguredStatusForUser, servicePluginWebhookDispatchStatsJson, setServicePluginEventDelivery, setServicePluginGeneratedReplyHandler, setServicePluginWebhookGeneratedReplyHandler, setServicePluginWebhookSubscribersProvider, shutdownServicePluginHost}
 import metis.gateway.session.{GatewayIngressSource, GatewaySessionContext, GatewaySessionRequest, gatewayResolveSessionContext, gatewaySessionRequestFromInbound}
 import metis.gateway.tools.{gatewayHandleNativeCommandLine, gatewayHandleSubagentsCommandLine}
-import metis.gateway.gitcode_plugin.{GatewayCommandContext, buildGitCodeAsyncScanPayload, buildGitCodeDeadLetterInspectPayload, buildGitCodeDeadLetterListPayload, buildGitCodeEventReconcilePayload, buildGitCodeHookReconcilePayload, buildGitCodeSubscriptionTarget, buildGitCodeWebhookCancelPayload, buildGitCodeWebhookReplayPayload, buildGitCodeWebhookStatusPayload, formatGitCodeSubscribeResult, gitCodeSubscriptionStatusJson, gitCodeSubscriptionStoreSnapshotForDispatcher, handleGitCodeKnowledgeQueryCommand, loadGitCodeSubscriptionStore, parseGitCodeCommand, parseGitCodeDeliveryArgs, parseGitCodeHookReconcileArgs, parseGitCodeReconcileOnceArgs, parseGitCodeReviewRequest, parseGitCodeScanOnceArgs, removeGitCodeSubscription, renderGitCodeDeadLetterInspectResult, renderGitCodeDeadLetterListResult, renderGitCodeEventReconcileResult, renderGitCodeHookReconcileResult, renderGitCodeWebhookCancelResult, renderGitCodeWebhookReplayResult, renderGitCodeWebhookStatusResult, routeGitCodeReviewRequest, saveGitCodeSubscription, setGitCodeSubscriptionStore}
+import metis.gateway.gitcode_plugin.{GatewayCommandContext, buildGitCodeAsyncScanPayload, buildGitCodeDeadLetterInspectPayload, buildGitCodeDeadLetterListPayload, buildGitCodeEventReconcilePayload, buildGitCodeHookReconcilePayload, buildGitCodeSubscriptionTarget, buildGitCodeWebhookCancelPayload, buildGitCodeWebhookReplayPayload, buildGitCodeWebhookStatusPayload, formatGitCodeSubscribeResult, gitCodeSubscriptionStatusJson, gitCodeSubscriptionStoreSnapshotForDispatcher, handleGitCodeKnowledgeQueryCommand, loadGitCodeSubscriptionStore, parseGitCodeCommand, parseGitCodeDeliveryArgs, parseGitCodeHookReconcileArgs, parseGitCodeReconcileOnceArgs, parseGitCodeReviewRequest, parseGitCodeScanOnceArgs, removeGitCodeSubscription, renderGitCodeDeadLetterInspectResult, renderGitCodeDeadLetterListResult, renderGitCodeEventReconcileResult, renderGitCodeHookReconcileResult, renderGitCodeWebhookCancelResult, renderGitCodeWebhookReplayResult, renderGitCodeWebhookStatusResult, renderGitCodeReviewCommentContextPromptBlock, routeGitCodeReviewRequest, saveGitCodeSubscription, setGitCodeSubscriptionStore}
 import magic.jsonable.*
 import std.collection.{ArrayList, HashSet}
 import std.convert.Parsable
@@ -1163,6 +1163,8 @@ public class GatewayService {
             if (parsed.ok) {
                 let route = routeGitCodeReviewRequest(parsed.request)
                 let diagnostics = if (parsed.request.diagnostics.size == 0) { "无" } else { String.join(parsed.request.diagnostics, delimiter: ", ") }
+                let commentContext = renderGitCodeReviewCommentContextPromptBlock(parsed.request)
+                let commentContextSection = if (commentContext.isEmpty()) { "" } else { "\n\n${commentContext}" }
                 return "你是 Metis 的 GitCode review task worker。请根据结构化契约生成中文回复草稿，只输出草稿正文，不要输出 JSON，不要声称已经写回 GitCode，不要包含维护者提及句、auto-reply、bot attribution、hidden marker、token、cookie、Authorization header 或本机路径。\n\n" +
                     "契约版本: ${parsed.request.contractVersion}\n" +
                     "路由: ${route.route}\n" +
@@ -1171,7 +1173,7 @@ public class GatewayService {
                     "标题: ${parsed.request.title}\n" +
                     "作者: ${parsed.request.author}\n" +
                     "诊断: ${diagnostics}\n" +
-                    "内容:\n${parsed.request.content}\n${parsed.request.commentBody}"
+                    "内容:\n${parsed.request.content}\n${parsed.request.commentBody}${commentContextSection}"
             }
         }
         let source = if (event.url.isEmpty()) { "${event.repo} ${event.kind} #${event.number}" } else { "${event.repo} ${event.kind} #${event.number} ${event.url}" }

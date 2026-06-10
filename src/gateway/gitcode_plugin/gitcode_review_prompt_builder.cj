@@ -12,6 +12,7 @@ public class PromptInputV1 {
     public let sourceContext: JsonObject
     public let ckbEvidence: JsonObject
     public let reviewFindings: JsonObject
+    public let discussionContext: JsonObject
     public let diagnostics: Array<String>
 
     public init(
@@ -22,6 +23,7 @@ public class PromptInputV1 {
         sourceContext!: JsonObject = JsonObject(),
         ckbEvidence!: JsonObject = JsonObject(),
         reviewFindings!: JsonObject = JsonObject(),
+        discussionContext!: JsonObject = JsonObject(),
         diagnostics!: Array<String> = []
     ) {
         this.role = "cangjie_community_technical_expert"
@@ -32,6 +34,7 @@ public class PromptInputV1 {
         this.sourceContext = sourceContext
         this.ckbEvidence = ckbEvidence
         this.reviewFindings = reviewFindings
+        this.discussionContext = discussionContext
         this.diagnostics = diagnostics
     }
 }
@@ -84,6 +87,10 @@ private func safePromptJson(obj: JsonObject, maxChars!: Int64 = 6000): String {
         safe = safe[..maxChars] + "\ntruncated=true"
     }
     safe
+}
+
+private func promptJsonObjectHasFields(obj: JsonObject): Bool {
+    obj.toJsonString() != "{}"
 }
 
 private func buildPrompt(template: GitCodePromptTemplate, input: PromptInputV1, extra: Array<String>): String {
@@ -187,6 +194,9 @@ public func buildCommentPrompt(input: PromptInputV1, templates: GitCodePromptTem
         extra.add("parent issue title=${promptStr(input.templateFields, "parentIssueTitle")}")
         extra.add("parent issue url=${promptStr(input.templateFields, "parentIssueUrl")}")
         extra.add("parent issue body summary=${promptStr(input.event, "body")}")
+    }
+    if (promptJsonObjectHasFields(input.discussionContext)) {
+        extra.add("discussionContext=${safePromptJson(input.discussionContext, maxChars: 12000)}")
     }
     extra.add("CKB evidence=${safePromptJson(input.ckbEvidence)}")
     buildPrompt(templates.commentReply, input, extra.toArray())

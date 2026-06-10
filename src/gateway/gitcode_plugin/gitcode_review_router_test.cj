@@ -69,6 +69,47 @@ public class GitCodeReviewRouterTest {
     }
 
     @TestCase
+    public func tRouter011CommentParentKindPrefersDiscussionContext(): Unit {
+        let req = GitCodeReviewRequest(
+            eventId: "comment-context-pr",
+            eventType: "comment",
+            repoFullName: "Cangjie/cangjie_tools",
+            number: "7",
+            url: "https://gitcode.com/Cangjie/cangjie_tools/issues/7#note_9",
+            parentUrl: "https://gitcode.com/Cangjie/cangjie_tools/issues/7",
+            commentBody: "please explain",
+            hasDiscussionContext: true,
+            discussionContext: GitCodeReviewDiscussionContext(
+                parent: GitCodeReviewDiscussionParent(kind: "pr", number: "7", url: "https://gitcode.com/Cangjie/cangjie_tools/pulls/7"),
+                triggerComment: GitCodeReviewDiscussionComment(id: "9", body: "please explain")
+            )
+        )
+        let route = routeGitCodeReviewRequest(req)
+        @Expect(route.route, "comment_reply")
+        @Expect(route.task.parentKind, "pr")
+        @Expect(route.task.requiresCodeReview, true)
+    }
+
+    @TestCase
+    public func tRouter012MissingCommentContextDegradesWriteback(): Unit {
+        let req = GitCodeReviewRequest(
+            eventId: "comment-missing-context",
+            eventType: "comment",
+            repoFullName: "Cangjie/cangjie_tools",
+            number: "8",
+            url: "https://gitcode.com/Cangjie/cangjie_tools/issues/8#note_9",
+            parentUrl: "https://gitcode.com/Cangjie/cangjie_tools/issues/8",
+            commentBody: "please explain",
+            diagnostics: ["comment_context_missing"]
+        )
+        let route = routeGitCodeReviewRequest(req)
+        @Expect(route.route, "comment_reply")
+        @Expect(route.degraded, true)
+        @Expect(route.needsHumanReview, true)
+        @Expect(route.allowWriteback, false)
+    }
+
+    @TestCase
     public func tRouter006UnknownIssueKindNeedsHumanReview(): Unit {
         let route = routeGitCodeReviewRequest(this.request(issueKind: "support"))
         @Expect(route.route, "issue_generic")

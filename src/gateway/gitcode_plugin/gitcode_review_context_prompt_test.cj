@@ -133,6 +133,39 @@ public class GitCodeReviewContextPromptTest {
         PromptInputV1(event, fields, sourceContext: source, ckbEvidence: ckb, reviewFindings: review)
     }
 
+    private func discussionContextFixture(): JsonObject {
+        let parent = JsonObject()
+        parent.put("kind", JsonString("issue"))
+        parent.put("number", JsonString("4"))
+        parent.put("title", JsonString("Issue 4"))
+        parent.put("body", JsonString("Parent issue body"))
+        parent.put("url", JsonString("https://gitcode.com/Cangjie/community/issues/4"))
+        parent.put("author", JsonString("alice"))
+
+        let trigger = JsonObject()
+        trigger.put("id", JsonString("9003"))
+        trigger.put("body", JsonString("trigger body"))
+        trigger.put("url", JsonString("https://gitcode.com/Cangjie/community/issues/4#note_9003"))
+        trigger.put("author", JsonString("bob"))
+
+        let previous = JsonObject()
+        previous.put("id", JsonString("9001"))
+        previous.put("body", JsonString("previous comment body"))
+        previous.put("url", JsonString("https://gitcode.com/Cangjie/community/issues/4#note_9001"))
+        previous.put("author", JsonString("carol"))
+
+        let context = JsonObject()
+        context.put("status", JsonString("resolved"))
+        context.put("parent", parent)
+        context.put("triggerComment", trigger)
+        context.put("previousComments", JsonArray([previous]))
+        context.put("previousCommentsTotal", JsonInt(1))
+        context.put("previousCommentsIncluded", JsonInt(1))
+        context.put("truncated", JsonBool(false))
+        context.put("diagnostics", JsonArray([]))
+        context
+    }
+
     private func templateConfig(dir: String): GitCodePromptTemplatesConfig {
         GitCodePromptTemplatesConfig(dir: dir, maxTemplateBytes: 4096)
     }
@@ -530,6 +563,26 @@ public class GitCodeReviewContextPromptTest {
 
         @Expect(buildCommentPrompt(this.promptInput("comment_issue"), templates).contains("parent issue"), true)
         @Expect(buildCommentPrompt(this.promptInput("comment_pr"), templates).contains("parent PR"), true)
+
+        let commentBase = this.promptInput("comment_issue")
+        let commentWithContext = buildCommentPrompt(
+            PromptInputV1(
+                commentBase.event,
+                commentBase.templateFields,
+                author: commentBase.author,
+                maintainers: commentBase.maintainers,
+                sourceContext: commentBase.sourceContext,
+                ckbEvidence: commentBase.ckbEvidence,
+                reviewFindings: commentBase.reviewFindings,
+                discussionContext: this.discussionContextFixture()
+            ),
+            templates
+        )
+        @Expect(commentWithContext.contains("discussionContext"), true)
+        @Expect(commentWithContext.contains("Parent issue body"), true)
+        @Expect(commentWithContext.contains("previous comment body"), true)
+        @Expect(commentWithContext.contains("trigger body"), true)
+        @Expect(commentWithContext.contains("Authorization: Bearer should-not-leak"), false)
 
         let longSource = JsonObject()
         longSource.put("status", JsonString("resolved"))

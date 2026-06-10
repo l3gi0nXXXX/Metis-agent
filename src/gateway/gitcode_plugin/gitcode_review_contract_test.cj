@@ -58,6 +58,64 @@ public class GitCodeReviewContractTest {
             .replace("/issues/123", "/pulls/99")
     }
 
+    private func commentContextPayload(context!: String = ""): String {
+        let contextJson = if (context.isEmpty()) {
+            ""
+        } else {
+            ",\"context\":${context}"
+        }
+        "{" +
+            "\"jobId\":\"job-context\"," +
+            "\"eventId\":\"gitcode:Cangjie/community:comment:9003\"," +
+            "\"repo\":\"Cangjie/community\"," +
+            "\"kind\":\"comment\"," +
+            "\"number\":\"4\"," +
+            "\"commentId\":\"9003\"," +
+            "\"author\":\"bob\"," +
+            "\"url\":\"https://gitcode.com/Cangjie/community/issues/4#note_9003\"," +
+            "\"title\":\"Issue 4\"," +
+            "\"content\":\"trigger body\"," +
+            "\"contractVersion\":\"gcm-metis-gitcode-review-v1\"," +
+            "\"reviewRequest\":{" +
+                "\"contractVersion\":\"gcm-metis-gitcode-review-v1\"," +
+                "\"jobId\":\"job-context\"," +
+                "\"eventId\":\"gitcode:Cangjie/community:comment:9003\"," +
+                "\"repo\":\"Cangjie/community\"," +
+                "\"event\":{\"type\":\"comment\",\"itemKind\":\"issue\",\"number\":\"4\",\"commentId\":\"9003\",\"action\":\"comment\"}," +
+                "\"author\":{\"login\":\"bob\",\"decision\":\"process\"}," +
+                "\"maintainers\":{\"teamLeaders\":[],\"codeowners\":[],\"teamLeaderStatus\":\"not_found\",\"codeownerStatus\":\"not_applicable\"}," +
+                "\"templates\":{\"issueKind\":\"question\",\"fields\":{\"cjcVersion\":\"\",\"branchVersions\":[]}}," +
+                "\"pr\":{\"changedFiles\":[],\"reviewFindings\":[]}," +
+                "\"content\":{\"title\":\"Issue 4\",\"body\":\"Parent issue body from content fallback\"}" +
+                contextJson +
+            "}" +
+        "}"
+    }
+
+    private func resolvedCommentContext(): String {
+        "{" +
+            "\"status\":\"resolved\"," +
+            "\"repo\":\"Cangjie/community\"," +
+            "\"kind\":\"comment\"," +
+            "\"number\":\"4\"," +
+            "\"commentId\":\"9003\"," +
+            "\"parent\":{\"kind\":\"issue\",\"number\":\"4\",\"title\":\"Issue 4\",\"body\":\"Parent issue body\",\"url\":\"https://gitcode.com/Cangjie/community/issues/4\",\"author\":\"alice\",\"authorUrl\":\"https://gitcode.com/alice\",\"source\":\"api\"}," +
+            "\"triggerComment\":{\"id\":\"9003\",\"body\":\"trigger body\",\"url\":\"https://gitcode.com/Cangjie/community/issues/4#note_9003\",\"author\":\"bob\",\"authorUrl\":\"https://gitcode.com/bob\",\"createdAt\":\"2026-06-10T01:02:03Z\",\"createdAtMs\":3000,\"updatedAtMs\":3000}," +
+            "\"previousComments\":[{\"id\":\"9001\",\"body\":\"previous comment body\",\"url\":\"https://gitcode.com/Cangjie/community/issues/4#note_9001\",\"author\":\"carol\",\"authorUrl\":\"https://gitcode.com/carol\",\"createdAt\":\"2026-06-10T01:00:00Z\",\"createdAtMs\":1000,\"updatedAtMs\":1000}]," +
+            "\"previousCommentsTotal\":1," +
+            "\"previousCommentsIncluded\":1," +
+            "\"truncated\":false," +
+            "\"diagnostics\":[]" +
+        "}"
+    }
+
+    private func degradedCommentContext(): String {
+        this.resolvedCommentContext()
+            .replace("\"status\":\"resolved\"", "\"status\":\"degraded\"")
+            .replace("\"truncated\":false", "\"truncated\":true")
+            .replace("\"diagnostics\":[]", "\"diagnostics\":[\"detail_fetch_failed:server_error\"]")
+    }
+
     @TestCase
     public func tMetisContract001ParsesV1IssueBugAndValidates(): Unit {
         let parsed = parseGitCodeReviewRequest(this.issueBugPayload())
@@ -137,6 +195,48 @@ public class GitCodeReviewContractTest {
         @Expect(parsed.request.eventType, "comment")
         @Expect(parsed.request.commentBody, "please explain")
         @Expect(parsed.request.parentUrl.contains("/pulls/99"), true)
+    }
+
+    @TestCase
+    public func tMetisContract012ParsesGcmCommentDiscussionContext(): Unit {
+        let parsed = parseGitCodeReviewRequest(this.commentContextPayload(context: this.resolvedCommentContext()))
+        @Expect(parsed.ok, true)
+        @Expect(parsed.request.eventType, "comment")
+        @Expect(parsed.request.number, "4")
+        @Expect(parsed.request.commentId, "9003")
+        @Expect(parsed.request.title, "Issue 4")
+        @Expect(parsed.request.parentUrl, "https://gitcode.com/Cangjie/community/issues/4")
+        @Expect(parsed.request.commentBody, "trigger body")
+        @Expect(parsed.request.hasDiscussionContext, true)
+        @Expect(parsed.request.discussionContext.parent.kind, "issue")
+        @Expect(parsed.request.discussionContext.parent.body, "Parent issue body")
+        @Expect(parsed.request.discussionContext.triggerComment.id, "9003")
+        @Expect(parsed.request.discussionContext.previousComments.size, 1)
+        @Expect(parsed.request.discussionContext.previousComments[0].body, "previous comment body")
+        @Expect(parsed.request.content.contains("Parent issue body"), true)
+        @Expect(validateGitCodeReviewRequest(parsed.request).ok, true)
+    }
+
+    @TestCase
+    public func tMetisContract013MissingCommentContextIsCompatibleButDegraded(): Unit {
+        let parsed = parseGitCodeReviewRequest(this.commentContextPayload())
+        @Expect(parsed.ok, true)
+        @Expect(parsed.request.eventType, "comment")
+        @Expect(parsed.request.hasDiscussionContext, false)
+        @Expect(parsed.request.content, "Parent issue body from content fallback")
+        @Expect(parsed.request.diagnostics.contains("comment_context_missing"), true)
+    }
+
+    @TestCase
+    public func tMetisContract014DegradedCommentContextCarriesDiagnostics(): Unit {
+        let parsed = parseGitCodeReviewRequest(this.commentContextPayload(context: this.degradedCommentContext()))
+        @Expect(parsed.ok, true)
+        @Expect(parsed.request.hasDiscussionContext, true)
+        @Expect(parsed.request.discussionContext.status, "degraded")
+        @Expect(parsed.request.discussionContext.truncated, true)
+        @Expect(parsed.request.diagnostics.contains("comment_context_degraded"), true)
+        @Expect(parsed.request.diagnostics.contains("comment_context_truncated"), true)
+        @Expect(parsed.request.diagnostics.contains("detail_fetch_failed:server_error"), true)
     }
 
     @TestCase
