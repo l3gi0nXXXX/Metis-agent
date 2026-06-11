@@ -1,6 +1,10 @@
 package metis.core.model
 
 import std.collection.{ArrayList, HashMap}
+import std.convert.Parsable
+import std.fs.{Directory, File, Path, exists, remove}
+import std.process.executeWithOutput
+import std.time.*
 import std.unittest.testmacro.*
 import stdx.encoding.json.{JsonArray, JsonBool, JsonInt, JsonObject, JsonString}
 
@@ -121,6 +125,7 @@ public class CodexAppServerM5Test {
         req.put("params", JsonObject())
         let frame = codexAppServerFrame(req)
         @Expect(frame.endsWith("\n"), true)
+        @Expect(frame.trimAscii().contains("\n"), false)
         @Expect(frame.contains("Content-Length"), false)
         @Expect(frame.contains("\"jsonrpc\""), false)
 
@@ -298,6 +303,92 @@ public class CodexAppServerM5Test {
         @Expect(codexAppServerDispatchMetisMcpTool("delegate_task").status, "forbidden")
         @Expect(codexAppServerDispatchMetisMcpTool("unknown_tool").status, "not_applicable")
     }
+
+    @TestCase
+    public func m5N5ClientCloseTerminatesWrapperDescendantsAfterInitializeTimeout(): Unit {
+        let root = m5TempRoot("client-close-tree")
+        let codex = root.join("codex")
+        let parentPidPath = root.join("parent.pid")
+        let childPidPath = root.join("child.pid")
+        File.writeTo(codex, (
+            "#!/bin/sh\n" +
+            "if [ \"$1\" != \"app-server\" ]; then exit 2; fi\n" +
+            "echo $$ > \"${parentPidPath.toString()}\"\n" +
+            "(while :; do sleep 60; done) &\n" +
+            "echo $! > \"${childPidPath.toString()}\"\n" +
+            "printf '%s\\n' 'startup diagnostic from fake codex' >&2\n" +
+            "while :; do sleep 60; done\n"
+        ).toArray())
+        let (_chmodCode, _, _) = executeWithOutput("chmod", ["+x", codex.toString()])
+
+        let client = CodexAppServerClient(codexBin: codex.toString(), cwd: Some(root.toString()))
+        var error = ""
+        try {
+            let _ = client.request("initialize", JsonObject(), 80)
+        } catch (e: Exception) {
+            error = e.message
+        }
+        client.close()
+
+        let parentPid = m5ReadPid(parentPidPath)
+        let childPid = m5ReadPid(childPidPath)
+        let parentGone = m5WaitPidGone(parentPid, 1000)
+        let childGone = m5WaitPidGone(childPid, 1000)
+        if (!parentGone) { m5KillPid(parentPid) }
+        if (!childGone) { m5KillPid(childPid) }
+        try { remove(root, recursive: true) } catch (_: Exception) { () }
+
+        @Expect(error.contains("initialize"), true)
+        @Expect(error.contains("startup diagnostic from fake codex"), true)
+        @Expect(parentGone, true)
+        @Expect(childGone, true)
+    }
+}
+
+private func m5TempRoot(label: String): Path {
+    let root = Path("/tmp/metis-codex-app-server-${label}-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
+    if (exists(root)) {
+        remove(root, recursive: true)
+    }
+    Directory.create(root, recursive: true)
+    root
+}
+
+private func m5ReadPid(path: Path): Int64 {
+    try {
+        Int64.parse(String.fromUtf8(File.readFrom(path)).trimAscii())
+    } catch (_: Exception) {
+        0
+    }
+}
+
+private func m5PidAlive(pid: Int64): Bool {
+    if (pid <= 0) {
+        return false
+    }
+    let (exitCode, _, _) = executeWithOutput("kill", ["-0", "${pid}"])
+    exitCode == 0
+}
+
+private func m5KillPid(pid: Int64): Unit {
+    if (pid <= 0) {
+        return
+    }
+    let _ = executeWithOutput("kill", ["-KILL", "${pid}"])
+}
+
+private func m5WaitPidGone(pid: Int64, timeoutMs: Int64): Bool {
+    if (pid <= 0) {
+        return true
+    }
+    let started = DateTime.now().toUnixTimeStamp().toMilliseconds()
+    while (DateTime.now().toUnixTimeStamp().toMilliseconds() - started < timeoutMs) {
+        if (!m5PidAlive(pid)) {
+            return true
+        }
+        sleep(Duration.millisecond * 25)
+    }
+    !m5PidAlive(pid)
 }
 
 private func m5ThreadResultFromThread(field: String, value: String): JsonObject {

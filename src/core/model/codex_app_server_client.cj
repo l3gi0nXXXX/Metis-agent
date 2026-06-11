@@ -138,7 +138,9 @@ public class CodexAppServerClient <: CodexAppServerTransport {
                     case None => return JsonObject()
                 }
             case None =>
-                throw CodexAppServerProtocolException("Timed out waiting for codex app-server response to ${method}", code: -32001)
+                let message = codexAppServerTimeoutMessage(method, this.diagnostics())
+                try { this.close() } catch (_: Exception) { () }
+                throw CodexAppServerProtocolException(message, code: -32001)
         }
     }
 
@@ -189,16 +191,23 @@ public class CodexAppServerClient <: CodexAppServerTransport {
     }
 
     public func close(): Unit {
+        var processToStop = None<SubProcess>
+        var rootPid: Int64 = 0
         synchronized(this.lock) {
             try { this.stdoutFuture?.cancel() } catch (_: Exception) { () }
             try { this.stderrFuture?.cancel() } catch (_: Exception) { () }
             match (this.process) {
                 case Some(proc) =>
-                    try { proc.terminate(force: true) } catch (_: Exception) { () }
+                    processToStop = Some(proc)
+                    rootPid = proc.pid
                 case None => ()
             }
             this.process = None<SubProcess>
             this.writer = None<StringWriter<OutputStream>>
+        }
+        match (processToStop) {
+            case Some(proc) => codexAppServerTerminateProcessTree(proc, rootPid)
+            case None => ()
         }
         this.responses.close()
         this.serverRequests.close()
@@ -268,7 +277,35 @@ public class CodexAppServerClient <: CodexAppServerTransport {
 }
 
 public func codexAppServerFrame(obj: JsonObject): String {
-    obj.toJsonString() + "\n"
+    codexAppServerCompactJsonLine(obj.toJsonString()) + "\n"
+}
+
+private func codexAppServerCompactJsonLine(raw: String): String {
+    let out = StringBuilder()
+    var inString = false
+    var escaped = false
+    for (ch in raw.toRuneArray()) {
+        if (escaped) {
+            out.append(ch)
+            escaped = false
+            continue
+        }
+        if (inString && ch == r'\\') {
+            out.append(ch)
+            escaped = true
+            continue
+        }
+        if (ch == r'"') {
+            out.append(ch)
+            inString = !inString
+            continue
+        }
+        if (!inString && (ch == r' ' || ch == r'\n' || ch == r'\r' || ch == r'\t')) {
+            continue
+        }
+        out.append(ch)
+    }
+    out.toString()
 }
 
 public func codexAppServerParseStdoutLine(line: String): CodexAppServerParsedLine {
@@ -412,4 +449,140 @@ private func codexClientJsonInt(obj: JsonObject, key: String, fallback: Int64): 
         case None => ()
     }
     fallback
+}
+
+private func codexAppServerTimeoutMessage(method: String, diagnostics: Array<String>): String {
+    let base = "Timed out waiting for codex app-server response to ${method}"
+    let diag = codexAppServerJoinDiagnostics(diagnostics)
+    if (diag.isEmpty()) {
+        return base
+    }
+    "${base}; diagnostics: ${diag}"
+}
+
+private func codexAppServerJoinDiagnostics(diagnostics: Array<String>): String {
+    let parts = ArrayList<String>()
+    for (line in diagnostics) {
+        let text = codexAppServerRedactDiagnostic(line).trimAscii()
+        if (!text.isEmpty()) {
+            parts.add(text)
+        }
+    }
+    if (parts.isEmpty()) {
+        return ""
+    }
+    String.join(parts.toArray(), delimiter: " | ")
+}
+
+private func codexAppServerTerminateProcessTree(proc: SubProcess, rootPid: Int64): Unit {
+    let descendants = codexAppServerCollectDescendantPids(rootPid)
+    for (pid in descendants) {
+        codexAppServerSignalPid(pid, "-TERM")
+    }
+    try { proc.terminate(force: false) } catch (_: Exception) { () }
+    if (!codexAppServerWaitProcessExit(proc, 250)) {
+        for (pid in descendants) {
+            codexAppServerSignalPid(pid, "-KILL")
+        }
+        try { proc.terminate(force: true) } catch (_: Exception) { () }
+        let _ = codexAppServerWaitProcessExit(proc, 250)
+    } else {
+        for (pid in descendants) {
+            if (codexAppServerPidAlive(pid)) {
+                codexAppServerSignalPid(pid, "-KILL")
+            }
+        }
+    }
+}
+
+private func codexAppServerWaitProcessExit(proc: SubProcess, timeoutMs: Int64): Bool {
+    let effective = if (timeoutMs > 0) { timeoutMs } else { 250 }
+    try {
+        let _ = proc.wait(timeout: Some(Duration.millisecond * effective))
+        return true
+    } catch (_: Exception) {
+        return !proc.isAlive()
+    }
+}
+
+private func codexAppServerCollectDescendantPids(rootPid: Int64): Array<Int64> {
+    let out = ArrayList<Int64>()
+    codexAppServerCollectDescendantPidsInto(rootPid, out, 0)
+    out.toArray()
+}
+
+private func codexAppServerCollectDescendantPidsInto(pid: Int64, out: ArrayList<Int64>, depth: Int64): Unit {
+    if (pid <= 0 || depth >= 8) {
+        return
+    }
+    for (child in codexAppServerChildPids(pid)) {
+        if (child <= 0 || codexAppServerPidListContains(out, child)) {
+            continue
+        }
+        out.add(child)
+        codexAppServerCollectDescendantPidsInto(child, out, depth + 1)
+    }
+}
+
+private func codexAppServerChildPids(pid: Int64): Array<Int64> {
+    if (pid <= 0) {
+        return []
+    }
+    let (exitCode, stdoutBytes, _) = try {
+        executeWithOutput("pgrep", ["-P", "${pid}"])
+    } catch (_: Exception) {
+        return []
+    }
+    if (exitCode != 0) {
+        return []
+    }
+    let out = ArrayList<Int64>()
+    let text = try { String.fromUtf8(stdoutBytes) } catch (_: Exception) { "" }
+    for (line in text.split("\n")) {
+        let trimmed = line.trimAscii()
+        if (trimmed.isEmpty()) {
+            continue
+        }
+        try {
+            let child = Int64.parse(trimmed)
+            if (child > 0) {
+                out.add(child)
+            }
+        } catch (_: Exception) {
+            ()
+        }
+    }
+    out.toArray()
+}
+
+private func codexAppServerPidListContains(items: ArrayList<Int64>, pid: Int64): Bool {
+    for (item in items) {
+        if (item == pid) {
+            return true
+        }
+    }
+    false
+}
+
+private func codexAppServerSignalPid(pid: Int64, signal: String): Unit {
+    if (pid <= 0) {
+        return
+    }
+    try {
+        let _ = executeWithOutput("kill", [signal, "${pid}"])
+    } catch (_: Exception) {
+        ()
+    }
+}
+
+private func codexAppServerPidAlive(pid: Int64): Bool {
+    if (pid <= 0) {
+        return false
+    }
+    let (exitCode, _, _) = try {
+        executeWithOutput("kill", ["-0", "${pid}"])
+    } catch (_: Exception) {
+        return false
+    }
+    exitCode == 0
 }
