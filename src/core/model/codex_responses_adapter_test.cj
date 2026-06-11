@@ -13,6 +13,7 @@ import stdx.encoding.json.*
 private var m2CallCount: Int64 = 0
 private var m2LastUrl: String = ""
 private var m2LastAuth: String = ""
+private var m2LastAccept: String = ""
 private var m2LastSession: String = ""
 private var m2LastRequestBody = JsonObject()
 
@@ -143,6 +144,7 @@ private func m2ResetHttpCapture(): Unit {
     m2CallCount = 0
     m2LastUrl = ""
     m2LastAuth = ""
+    m2LastAccept = ""
     m2LastSession = ""
     m2LastRequestBody = JsonObject()
 }
@@ -165,9 +167,13 @@ public class CodexResponsesAdapterTest {
         @Expect(m2String(payload, "prompt_cache_key"), "session-a")
         @Expect(m2Arr(payload, "input").size(), 2)
         let firstInput = m2Arr(payload, "input")[0].asObject()
+        @Expect(firstInput.get("type").isNone(), true)
         let firstContent = m2Arr(firstInput, "content")
         @Expect(m2String(firstContent[0].asObject(), "type"), "input_text")
         @Expect(m2String(firstContent[1].asObject(), "type"), "input_image")
+        let assistantInput = m2Arr(payload, "input")[1].asObject()
+        @Expect(assistantInput.get("type").isNone(), true)
+        @Expect(m2String(assistantInput, "content"), "done")
         let tool = m2Arr(payload, "tools")[0].asObject()
         @Expect(m2String(tool, "type"), "function")
         @Expect(m2String(tool, "name"), "inspect_file")
@@ -184,6 +190,11 @@ public class CodexResponsesAdapterTest {
         valid.put("function", M2FakeTool().toJsonValue())
         rawTools.add(valid)
         @Expect(codexJsonToolsToResponsesTools(rawTools).size(), 1)
+
+        let textOnly = codexBuildResponsesPayload("gpt-5.5", ChatRequest("hello"))
+        let textOnlyInput = m2Arr(textOnly, "input")[0].asObject()
+        @Expect(textOnlyInput.get("type").isNone(), true)
+        @Expect(m2String(textOnlyInput, "content"), "hello")
     }
 
     @TestCase
@@ -370,9 +381,12 @@ public class CodexResponsesAdapterTest {
             m2CallCount += 1
             m2LastUrl = request.url
             m2LastAuth = request.headers.get("Authorization").getOrThrow()
+            m2LastAccept = request.headers.get("Accept").getOrThrow()
             m2LastSession = request.headers.get("session_id").getOrThrow()
             m2LastRequestBody = request.body
-            CodexResponsesHttpResult(200, body: "{\"model\":\"gpt-5.5\",\"status\":\"completed\",\"output_text\":\"model ok\"}")
+            let output = JsonArray()
+            output.add(m2MessageItem("model ok"))
+            CodexResponsesHttpResult(200, streamEvents: [m2CompletedEvent(output)])
         }))
         try {
             let model = CodexResponsesChatModel("gpt-5.5", "https://chatgpt.example/backend", "test-token", sessionId: "session-a")
@@ -380,8 +394,10 @@ public class CodexResponsesAdapterTest {
             @Expect(response.message.content, "model ok")
             @Expect(m2LastUrl, "https://chatgpt.example/backend/responses")
             @Expect(m2LastAuth, "Bearer test-token")
+            @Expect(m2LastAccept, "text/event-stream")
             @Expect(m2LastSession, "session-a")
             @Expect(m2String(m2LastRequestBody, "model"), "gpt-5.5")
+            @Expect(m2Bool(m2LastRequestBody, "stream"), true)
         } finally {
             setCodexResponsesHttpRunnerForTest(None<CodexResponsesHttpRunner>)
         }
@@ -475,5 +491,33 @@ public class CodexResponsesAdapterTest {
         @Expect(codexNonStreamStaleTimeoutSeconds(small, baseUrl: "http://127.0.0.1:8080") > 1000000.0, true)
         @Expect(codexSilentHangHint("codex_responses", "openai-codex", "gpt-5.5").contains("gpt-5.4"), true)
         @Expect(codexSilentHangHint("chat_completions", "openai-codex", "gpt-5.5"), "")
+    }
+
+    @TestCase
+    public func m2N7PreflightRejectsUserTypeMessageInput(): Unit {
+        let payload = JsonObject()
+        payload.put("model", JsonString("gpt-5.5"))
+        payload.put("instructions", JsonString("rules"))
+        payload.put("store", JsonBool(false))
+        let input = JsonArray()
+        let badUserMessage = JsonObject()
+        badUserMessage.put("type", JsonString("message"))
+        badUserMessage.put("role", JsonString("user"))
+        let content = JsonArray()
+        let text = JsonObject()
+        text.put("type", JsonString("input_text"))
+        text.put("text", JsonString("hello"))
+        content.add(text)
+        badUserMessage.put("content", content)
+        input.add(badUserMessage)
+        payload.put("input", input)
+
+        var code = ""
+        try {
+            let _ = codexPreflightResponsesPayload(payload)
+        } catch (ex: CodexResponsesException) {
+            code = ex.code
+        }
+        @Expect(code, "invalid_input")
     }
 }

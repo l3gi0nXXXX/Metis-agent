@@ -135,9 +135,17 @@ private func codexInputImagePart(image: String): JsonObject {
 
 private func codexMessageInputItem(role: String, content: JsonArray): JsonObject {
     let item = JsonObject()
-    item.put("type", JsonString("message"))
+    // Fresh user/assistant turns use the role/content Responses item shape.
+    // Provider-returned assistant message items keep type="message" when replayed.
     item.put("role", JsonString(role))
     item.put("content", content)
+    return item
+}
+
+private func codexTextInputItem(role: String, text: String): JsonObject {
+    let item = JsonObject()
+    item.put("role", JsonString(role))
+    item.put("content", JsonString(text))
     return item
 }
 
@@ -248,18 +256,18 @@ public func codexMessagesToResponsesInput(
             continue
         }
 
-        let content = JsonArray()
         let output = role == "assistant"
         let text = crJsonString(msg, "content")
-        if (!text.isEmpty()) {
-            content.add(codexInputTextPart(text, output: output))
-        }
         let image = crJsonString(msg, "image")
         if (!image.isEmpty()) {
+            let content = JsonArray()
+            if (!text.isEmpty()) {
+                content.add(codexInputTextPart(text, output: output))
+            }
             content.add(codexInputImagePart(image))
-        }
-        if (content.size() > 0) {
             out.add(codexMessageInputItem(role, content))
+        } else if (!text.isEmpty()) {
+            out.add(codexTextInputItem(role, text))
         }
     }
     return out
@@ -412,6 +420,7 @@ public func codexPreflightResponsesPayload(payload: JsonObject, allowStream!: Bo
     if (crJsonArray(payload, "input").size() == 0) {
         throw CodexResponsesException("missing_input", "Codex Responses request is missing input")
     }
+    codexPreflightResponsesInputItems(crJsonArray(payload, "input"))
     if (crJsonBool(payload, "store")) {
         throw CodexResponsesException("invalid_store", "Codex Responses request must use store=false")
     }
@@ -429,6 +438,97 @@ public func codexPreflightResponsesPayload(payload: JsonObject, allowStream!: Bo
         }
     }
     return payload
+}
+
+private func codexPreflightResponsesInputItems(input: JsonArray): Unit {
+    for (value in input.getItems()) {
+        let item = try { value.asObject() } catch (_: Exception) {
+            throw CodexResponsesException("invalid_input", "Codex Responses input items must be objects")
+        }
+        let itemType = crJsonString(item, "type")
+        if (itemType == "function_call") {
+            if (crJsonString(item, "call_id").trimAscii().isEmpty() || crJsonString(item, "name").trimAscii().isEmpty()) {
+                throw CodexResponsesException("invalid_input", "Codex Responses function_call input is missing call_id or name")
+            }
+            continue
+        }
+        if (itemType == "function_call_output") {
+            if (crJsonString(item, "call_id").trimAscii().isEmpty()) {
+                throw CodexResponsesException("invalid_input", "Codex Responses function_call_output input is missing call_id")
+            }
+            continue
+        }
+        if (itemType == "reasoning") {
+            if (crJsonString(item, "encrypted_content").trimAscii().isEmpty()) {
+                throw CodexResponsesException("invalid_input", "Codex Responses reasoning input is missing encrypted_content")
+            }
+            continue
+        }
+        if (itemType == "message") {
+            if (crJsonString(item, "role") != "assistant") {
+                throw CodexResponsesException("invalid_input", "Codex Responses type=message input is only valid for replayed assistant messages")
+            }
+            codexPreflightResponsesContent(item, "assistant", replayedMessage: true)
+            continue
+        }
+        let role = crJsonString(item, "role")
+        if (role == "user" || role == "assistant") {
+            codexPreflightResponsesContent(item, role)
+            continue
+        }
+        throw CodexResponsesException("invalid_input", "Codex Responses input item has unsupported type or role")
+    }
+}
+
+private func codexPreflightResponsesContent(
+    item: JsonObject,
+    role: String,
+    replayedMessage!: Bool = false
+): Unit {
+    let contentValue = match (item.get("content")) {
+        case Some(value) => value
+        case None => throw CodexResponsesException("invalid_input", "Codex Responses message input is missing content")
+    }
+    if (replayedMessage) {
+        let content = try { contentValue.asArray() } catch (_: Exception) {
+            throw CodexResponsesException("invalid_input", "Codex Responses replayed assistant message content must be an array")
+        }
+        if (content.size() == 0) {
+            throw CodexResponsesException("invalid_input", "Codex Responses replayed assistant message content is empty")
+        }
+        for (partValue in content.getItems()) {
+            let part = try { partValue.asObject() } catch (_: Exception) {
+                throw CodexResponsesException("invalid_input", "Codex Responses content parts must be objects")
+            }
+            let partType = crJsonString(part, "type")
+            if (partType != "output_text" && partType != "text") {
+                throw CodexResponsesException("invalid_input", "Codex Responses replayed assistant message content has unsupported part type")
+            }
+        }
+        return
+    }
+    try {
+        let _ = contentValue.asString()
+        return
+    } catch (_: Exception) { () }
+
+    let content = try { contentValue.asArray() } catch (_: Exception) {
+        throw CodexResponsesException("invalid_input", "Codex Responses message content must be a string or array")
+    }
+    let expectedTextType = if (role == "assistant") { "output_text" } else { "input_text" }
+    for (partValue in content.getItems()) {
+        let part = try { partValue.asObject() } catch (_: Exception) {
+            throw CodexResponsesException("invalid_input", "Codex Responses content parts must be objects")
+        }
+        let partType = crJsonString(part, "type")
+        if (partType == expectedTextType || partType == "text") {
+            continue
+        }
+        if (!replayedMessage && role == "user" && partType == "input_image" && !crJsonString(part, "image_url").trimAscii().isEmpty()) {
+            continue
+        }
+        throw CodexResponsesException("invalid_input", "Codex Responses message content has unsupported part type")
+    }
 }
 
 private func codexArgumentsToJsonObject(argumentsValue: JsonValue): JsonObject {

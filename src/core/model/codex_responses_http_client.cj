@@ -58,6 +58,37 @@ private func codexResponsesReadHttpBody(response: HttpResponse): String {
     try { String.fromUtf8(out.toArray()) } catch (_: Exception) { "" }
 }
 
+private func codexResponsesFlushSseData(events: ArrayList<JsonObject>, data: String): String {
+    let raw = data.trimAscii()
+    if (raw.isEmpty() || raw == "[DONE]") {
+        return ""
+    }
+    try {
+        events.add(JsonValue.fromStr(raw).asObject())
+    } catch (_: Exception) { () }
+    return ""
+}
+
+private func codexResponsesParseSseEvents(raw: String): Array<JsonObject> {
+    let events = ArrayList<JsonObject>()
+    var data = ""
+    for (line0 in raw.replace("\r\n", "\n").replace("\r", "\n").split("\n")) {
+        let line = line0.trimAscii()
+        if (line.isEmpty()) {
+            data = codexResponsesFlushSseData(events, data)
+            continue
+        }
+        if (line.startsWith("data:")) {
+            if (!data.isEmpty()) {
+                data += "\n"
+            }
+            data += line["data:".size..].trimAscii()
+        }
+    }
+    data = codexResponsesFlushSseData(events, data)
+    return events.toArray()
+}
+
 private func codexResponsesRouteDiagnostic(route: OpenAICodexOAuthRoute): String {
     let parts = ArrayList<String>()
     if (!route.mode.isEmpty()) {
@@ -111,6 +142,9 @@ public class CodexResponsesHttpClient {
             ("Content-Type", "application/json"),
             ("Authorization", "Bearer ${accessToken}")
         ])
+        if (stream) {
+            headers.add("Accept", "text/event-stream")
+        }
         for ((key, value) in extraHeaders) {
             headers.add(key, value)
         }
@@ -138,9 +172,6 @@ public class CodexResponsesHttpClient {
     private func run(request: CodexResponsesHttpRequest): CodexResponsesHttpResult {
         if (let Some(runner) <- codexResponsesHttpRunnerForTest) {
             return runner(request)
-        }
-        if (request.stream) {
-            throw CodexResponsesException("stream_transport_unavailable", "Codex Responses stream requires an injected stream runner in this layer")
         }
         try {
             return this.runNativePost(request)
@@ -187,7 +218,11 @@ public class CodexResponsesHttpClient {
                 reqBuilder.header(key, value)
             }
             let response = client.send(reqBuilder.build())
-            return CodexResponsesHttpResult(Int64(response.status), body: codexResponsesReadHttpBody(response))
+            let body = codexResponsesReadHttpBody(response)
+            if (request.stream && response.status >= 200 && response.status < 300) {
+                return CodexResponsesHttpResult(Int64(response.status), body: body, streamEvents: codexResponsesParseSseEvents(body))
+            }
+            return CodexResponsesHttpResult(Int64(response.status), body: body)
         } catch (ex: Exception) {
             throw CodexResponsesException(
                 "http_error",

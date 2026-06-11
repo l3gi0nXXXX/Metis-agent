@@ -72,8 +72,32 @@ public class CodexResponsesChatModel <: ChatModel {
         return payload
     }
 
+    private func createFromNormalized(normalized: CodexResponsesNormalized): ChatResponse {
+        return ChatResponse(
+            if (normalized.model.isEmpty()) { this.fullName } else { normalized.model },
+            Message.assistant(normalized.content),
+            toolRequests: normalized.toolRequests,
+            usage: normalized.usage
+        )
+    }
+
+    private prop usesCodexStreamingBackend: Bool {
+        get() {
+            codexResponsesIssuerKind(this.provider, baseUrl: this.baseUrl) == "codex_backend"
+        }
+    }
+
     override public func create(request: ChatRequest): ChatResponse {
         let payload = this.buildPayload(request)
+        if (this.usesCodexStreamingBackend) {
+            return this.createFromNormalized(this.client.streamResponses(
+                this.baseUrl,
+                this.accessToken,
+                payload,
+                extraHeaders: codexResponsesExtraHeaders(this.sessionId),
+                model: this.name
+            ))
+        }
         let response = this.client.postResponses(
             this.baseUrl,
             this.accessToken,
@@ -84,12 +108,7 @@ public class CodexResponsesChatModel <: ChatModel {
             response,
             issuerKind: codexResponsesIssuerKind(this.provider, baseUrl: this.baseUrl)
         )
-        return ChatResponse(
-            if (normalized.model.isEmpty()) { this.fullName } else { normalized.model },
-            Message.assistant(normalized.content),
-            toolRequests: normalized.toolRequests,
-            usage: normalized.usage
-        )
+        return this.createFromNormalized(normalized)
     }
 
     override public func asyncCreate(request: ChatRequest): AsyncChatResponse {

@@ -176,8 +176,35 @@ private class AgentBridgeCodexResponsesCapture {
     public let urls = ArrayList<String>()
     public let bodies = ArrayList<JsonObject>()
     public let authHeaders = ArrayList<String>()
+    public let acceptHeaders = ArrayList<String>()
 
     public init() {}
+}
+
+private func agentBridgeCodexResponsesMessageItem(text: String): JsonObject {
+    let item = JsonObject()
+    item.put("type", JsonString("message"))
+    item.put("role", JsonString("assistant"))
+    let content = JsonArray()
+    let part = JsonObject()
+    part.put("type", JsonString("output_text"))
+    part.put("text", JsonString(text))
+    content.add(part)
+    item.put("content", content)
+    item
+}
+
+private func agentBridgeCodexResponsesCompletedEvent(text: String): JsonObject {
+    let output = JsonArray()
+    output.add(agentBridgeCodexResponsesMessageItem(text))
+    let response = JsonObject()
+    response.put("model", JsonString("gpt-5.5"))
+    response.put("status", JsonString("completed"))
+    response.put("output", output)
+    let event = JsonObject()
+    event.put("type", JsonString("response.completed"))
+    event.put("response", response)
+    event
 }
 
 @Test
@@ -692,7 +719,8 @@ public class AgentBridgeRuntimeTest {
                 capture.urls.add(request.url)
                 capture.bodies.add(request.body)
                 capture.authHeaders.add(request.headers.get("Authorization").getOrThrow())
-                CodexResponsesHttpResult(200, body: "{\"model\":\"gpt-5.5\",\"status\":\"completed\",\"output_text\":\"codex responses ok\"}")
+                capture.acceptHeaders.add(request.headers.get("Accept").getOrThrow())
+                CodexResponsesHttpResult(200, streamEvents: [agentBridgeCodexResponsesCompletedEvent("codex responses ok")])
             }))
             try {
                 let store = GatewaySessionStore(home.join("sessions"), enabled: true, agentId: "codex")
@@ -725,9 +753,13 @@ public class AgentBridgeRuntimeTest {
                 for (auth in capture.authHeaders) {
                     @Expect(auth, "Bearer m3-access-token-never-log")
                 }
+                for (accept in capture.acceptHeaders) {
+                    @Expect(accept, "text/event-stream")
+                }
                 for (body in capture.bodies) {
                     @Expect(agentBridgeJsonString(body, "model"), "gpt-5.5")
                     @Expect(agentBridgeJsonBool(body, "store"), false)
+                    @Expect(agentBridgeJsonBool(body, "stream"), true)
                     @Expect(body.get("max_output_tokens").isNone(), true)
                 }
             } finally {
