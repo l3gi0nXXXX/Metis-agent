@@ -366,6 +366,31 @@ public class CliLocalFlowsTest {
     }
 
     @TestCase
+    public func modelsAuthOpenAICodexDefaultNativeClientUsesConfiguredProxyDiagnostic(): Unit {
+        withModelsAuthCliTestHome("metis-models-auth-openai-codex-native-proxy", { _home: Path =>
+            let root = JsonObject()
+            let models = JsonObject()
+            let providers = JsonObject()
+            let codex = JsonObject()
+            codex.put("proxy", JsonString("https://user:secret@127.0.0.1:7897"))
+            providers.put("openai-codex", codex)
+            models.put("providers", providers)
+            root.put("models", models)
+            MetisConfigManager.writeRoot(root)
+            CliSettingManager.applyPersistedFieldsToCliConfig()
+
+            let (loginText, loginCode) = executeCliModelsAuthCommand(["openai-codex", "login", "--force"])
+
+            @Expect(loginCode, 1)
+            @Expect(loginText.contains("OpenAI Codex OAuth login failed"), true)
+            @Expect(loginText.contains("true HTTPS proxy is not implemented"), true)
+            @Expect(loginText.contains("unsupportedHttpsProxy"), true)
+            @Expect(loginText.contains("secret"), false)
+            @Expect(loginText.contains("[redacted]@127.0.0.1:7897"), true)
+        })
+    }
+
+    @TestCase
     public func modelsAuthOpenAICodexImportRequiresExplicitConsent(): Unit {
         withModelsAuthCliTestHome("metis-models-auth-openai-codex-import", { home: Path =>
             let codexHome = home.join(".codex")

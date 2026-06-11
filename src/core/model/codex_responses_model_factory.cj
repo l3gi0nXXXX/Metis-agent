@@ -2,7 +2,7 @@ package metis.core.model
 
 import magic.core.model.{AsyncChatResponse, ChatModel, ChatRequest, ChatResponse}
 
-import metis.core.config.{MetisConfigManager, readOpenAICodexOAuthProfile}
+import metis.core.config.{MetisConfigManager, readOpenAICodexOAuthProfile, resolveOpenAICodexOAuthTransportConfigFromMetis}
 
 import std.time.DateTime
 
@@ -87,7 +87,8 @@ public func buildOpenAICodexResponsesChatModelForRef(modelRef: String): ChatMode
                 modelName,
                 if (profile.baseUrl.trimAscii().isEmpty()) { "https://chatgpt.com/backend-api/codex" } else { profile.baseUrl },
                 profile.accessToken,
-                provider: provider
+                provider: provider,
+                client: CodexResponsesHttpClient(transportConfig: Some(resolveOpenAICodexOAuthTransportConfigFromMetis()))
             )
         case None =>
             CodexAuthUnavailableChatModel(

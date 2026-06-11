@@ -2,7 +2,7 @@ package metis.gateway.runtime
 
 import magic.jsonable.*
 
-import metis.core.config.{CliConfig, GatewayUserSettings, MetisConfigManager, MetisPaths, OPENAI_CODEX_OAUTH_PROVIDER_ID, OpenAICodexClock, OpenAICodexHttpClient, OpenAICodexNativeHttpClient, OpenAICodexSystemClock, getOpenAICodexAuthStatus, startOpenAICodexDashboardDeviceFlow}
+import metis.core.config.{CliConfig, GatewayUserSettings, MetisConfigManager, MetisPaths, OPENAI_CODEX_OAUTH_PROVIDER_ID, OpenAICodexClock, OpenAICodexHttpClient, OpenAICodexNativeHttpClient, OpenAICodexSystemClock, getOpenAICodexAuthStatus, resolveOpenAICodexOAuthTransportConfigFromMetis, startOpenAICodexDashboardDeviceFlow}
 import metis.gateway.config.buildGatewayConfigFromUserSettings
 import metis.gateway.core.gatewayAgentTeamDoctorScan
 import metis.gateway.logging.{gatewayLoggingCurrentLogFile, gatewayLoggingResolveSettings}
@@ -30,7 +30,7 @@ public func setGatewayOpenAICodexAuthRuntimeForTest(
 private func gatewayOpenAICodexAuthHttpClient(): OpenAICodexHttpClient {
     match (gatewayOpenAICodexAuthHttpClientForTest) {
         case Some(client) => client
-        case None => OpenAICodexNativeHttpClient()
+        case None => OpenAICodexNativeHttpClient(transportConfig: Some(resolveOpenAICodexOAuthTransportConfigFromMetis()))
     }
 }
 

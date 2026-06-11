@@ -8,6 +8,7 @@ import std.env.{getVariable, setVariable}
 import std.fs.{Directory, Path, remove}
 import std.time.DateTime
 import std.unittest.testmacro.*
+import stdx.encoding.json.{JsonObject, JsonString}
 
 private func codexFactoryTestRestoreVariable(name: String, value: Option<String>): Unit {
     match (value) {
@@ -74,5 +75,45 @@ public class CodexResponsesModelFactoryTest {
             }
             @Expect(message.contains("metis models auth openai-codex login"), true)
         }
+    }
+
+    @TestCase
+    public func factoryCodexResponsesModelUsesConfiguredTransportDiagnostic(): Unit {
+        withCodexFactoryTestHome("m5-codex-responses-proxy", { _home =>
+            let root = JsonObject()
+            let models = JsonObject()
+            let providers = JsonObject()
+            let codex = JsonObject()
+            codex.put("proxy", JsonString("https://user:secret@127.0.0.1:7897"))
+            providers.put("openai-codex", codex)
+            models.put("providers", providers)
+            root.put("models", models)
+            MetisConfigManager.writeRoot(root)
+            CliSettingManager.applyPersistedFieldsToCliConfig()
+
+            let now = DateTime.now().toUnixTimeStamp().toSeconds()
+            let _ = writeOpenAICodexOAuthProfile(OpenAICodexOAuthProfile(
+                accessToken: "factory-access-token-never-print",
+                refreshToken: "factory-refresh-token-never-print",
+                expiresAtUnixSeconds: now + 3600,
+                lastRefreshUnixSeconds: now,
+                accountLabel: "factory",
+                source: "test"
+            ))
+            let model = buildOpenAICodexResponsesChatModelForRef("openai-codex:gpt-5.5")
+            var message = ""
+            try {
+                let _ = model.create(ChatRequest("hello"))
+            } catch (ex: Exception) {
+                message = ex.message
+            }
+
+            @Expect(message.contains("Codex Responses HTTP request failed"), true)
+            @Expect(message.contains("true HTTPS proxy is not implemented"), true)
+            @Expect(message.contains("unsupportedHttpsProxy"), true)
+            @Expect(message.contains("[redacted]@127.0.0.1:7897"), true)
+            @Expect(message.contains("secret"), false)
+            @Expect(message.contains("factory-access-token-never-print"), false)
+        })
     }
 }

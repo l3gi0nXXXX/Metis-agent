@@ -5,7 +5,7 @@ import magic.jsonable.*
 
 import metis.cliapp.runEmbeddedPrompt
 import metis.core.config.{CliConfig, MetisConfigManager, MetisPaths, CliSettingManager, cliFindModelProviderDescriptor, cliModelProviderCatalogDescriptors, cliValidateProviderBaseUrl}
-import metis.core.config.{OPENAI_CODEX_OAUTH_PROVIDER_ID, OpenAICodexAuthStatus, OpenAICodexClock, OpenAICodexDeviceAuthStartResult, OpenAICodexHttpClient, OpenAICodexNativeHttpClient, OpenAICodexOAuthProfile, OpenAICodexSystemClock, addOpenAICodexManualDeviceCodeCredential, beginOpenAICodexDeviceAuth, exchangeOpenAICodexAuthorizationCode, getOpenAICodexAuthStatus, importCodexCliAuthWithConsent, openAICodexDefaultCodexHome, pollOpenAICodexDeviceToken, persistOpenAICodexLogoutAndReset, readOpenAICodexOAuthProfile, renderOpenAICodexAuthStatus, syncOpenAICodexPoolOnReauth, unsuppressOpenAICodexDeviceCodeReseed, writeOpenAICodexOAuthProfile}
+import metis.core.config.{OPENAI_CODEX_OAUTH_PROVIDER_ID, OpenAICodexAuthStatus, OpenAICodexClock, OpenAICodexDeviceAuthStartResult, OpenAICodexHttpClient, OpenAICodexNativeHttpClient, OpenAICodexOAuthProfile, OpenAICodexSystemClock, addOpenAICodexManualDeviceCodeCredential, beginOpenAICodexDeviceAuth, exchangeOpenAICodexAuthorizationCode, getOpenAICodexAuthStatus, importCodexCliAuthWithConsent, openAICodexDefaultCodexHome, pollOpenAICodexDeviceToken, persistOpenAICodexLogoutAndReset, readOpenAICodexOAuthProfile, renderOpenAICodexAuthStatus, resolveOpenAICodexOAuthTransportConfigFromMetis, syncOpenAICodexPoolOnReauth, unsuppressOpenAICodexDeviceCodeReseed, writeOpenAICodexOAuthProfile}
 import metis.core.mcp.{mcpConfiguredServerJson, mcpConfiguredServersJson, mcpConfiguredServersPath, mcpResolveSecretOption, mcpSetConfiguredServerJson, mcpUnsetConfiguredServerJson}
 import metis.gateway.channels.telegram.telegramPairingAccountStore
 import metis.gateway.logging.gatewayLoggingCurrentLogFile
@@ -3300,7 +3300,7 @@ private func cliModelsAuthArgValue(args: Array<String>, flag: String): String {
 private func cliModelsAuthHttpClient(httpClient: Option<OpenAICodexHttpClient>): OpenAICodexHttpClient {
     match (httpClient) {
         case Some(client) => client
-        case None => OpenAICodexNativeHttpClient()
+        case None => OpenAICodexNativeHttpClient(transportConfig: Some(resolveOpenAICodexOAuthTransportConfigFromMetis()))
     }
 }
 

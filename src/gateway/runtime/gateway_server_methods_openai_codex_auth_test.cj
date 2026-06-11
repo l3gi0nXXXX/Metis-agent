@@ -7,7 +7,7 @@ import std.collection.ArrayList
 import std.env.{getVariable, setVariable}
 import std.fs.{Directory, Path, remove}
 import std.unittest.testmacro.*
-import stdx.encoding.json.JsonObject
+import stdx.encoding.json.{JsonObject, JsonString}
 
 private class GatewayOpenAICodexAuthFakeClock <: OpenAICodexClock {
     private let nowSeconds: Int64
@@ -150,6 +150,33 @@ public class GatewayServerMethodsOpenAICodexAuthTest {
             @Expect(gatewayOpenAICodexAuthTestString(flow, "userCode"), "GW-CODE")
             @Expect(result.toJsonString().contains("access-gateway-secret"), false)
             @Expect(result.toJsonString().contains("refresh-gateway-secret"), false)
+        })
+    }
+
+    @TestCase
+    public func startRpcDefaultNativeClientUsesConfiguredProxyDiagnostic(): Unit {
+        withGatewayOpenAICodexAuthTestHome("start-rpc-native-proxy", { =>
+            let root = JsonObject()
+            let models = JsonObject()
+            let providers = JsonObject()
+            let codex = JsonObject()
+            codex.put("proxy", JsonString("https://user:secret@127.0.0.1:7897"))
+            providers.put("openai-codex", codex)
+            models.put("providers", providers)
+            root.put("models", models)
+            MetisConfigManager.writeRoot(root)
+            CliSettingManager.applyPersistedFieldsToCliConfig()
+
+            let response = gatewayDispatchLocalMethod(GatewayRpcRequest("models.auth.openai-codex.start"))
+
+            @Expect(response.ok, true)
+            let flow = gatewayOpenAICodexAuthTestObject(response.result.asObject(), "flow")
+            @Expect(gatewayOpenAICodexAuthTestString(flow, "status"), "failed")
+            @Expect(gatewayOpenAICodexAuthTestString(flow, "errorCode"), "network_error")
+            @Expect(gatewayOpenAICodexAuthTestString(flow, "message").contains("true HTTPS proxy is not implemented"), true)
+            @Expect(flow.toJsonString().contains("unsupportedHttpsProxy"), true)
+            @Expect(flow.toJsonString().contains("secret"), false)
+            @Expect(flow.toJsonString().contains("[redacted]@127.0.0.1:7897"), true)
         })
     }
 

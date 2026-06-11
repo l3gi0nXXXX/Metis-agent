@@ -143,6 +143,27 @@ private func deviceBodyErrorCode(body: String): String {
     }
 }
 
+private func deviceBodyErrorMessage(body: String): String {
+    try {
+        let root = JsonValue.fromStr(body).asObject()
+        return deviceJsonString(root, "message").getOrDefault {
+            deviceJsonString(root, "error_description").getOrDefault {
+                deviceJsonString(root, "detail").getOrDefault { "" }
+            }
+        }.trimAscii()
+    } catch (_: Exception) {
+        ""
+    }
+}
+
+private func deviceFailureMessage(prefix: String, body: String): String {
+    let detail = deviceBodyErrorMessage(body)
+    if (detail.isEmpty()) {
+        return prefix
+    }
+    "${prefix} ${detail}"
+}
+
 public func beginOpenAICodexDeviceAuth(httpClient: OpenAICodexHttpClient): OpenAICodexDeviceAuthStartResult {
     let body = "{\"client_id\":\"${OPENAI_CODEX_OAUTH_CLIENT_ID}\"}"
     let response = httpClient.postJson(OPENAI_CODEX_DEVICE_AUTH_USERCODE_URL, body)
@@ -150,7 +171,7 @@ public func beginOpenAICodexDeviceAuth(httpClient: OpenAICodexHttpClient): OpenA
         return OpenAICodexDeviceAuthStartResult(
             "failed",
             errorCode: deviceBodyErrorCode(response.body),
-            message: "OpenAI Codex device authorization request failed."
+            message: deviceFailureMessage("OpenAI Codex device authorization request failed.", response.body)
         )
     }
     try {
@@ -267,7 +288,7 @@ public func pollOpenAICodexDeviceToken(
         return OpenAICodexDeviceTokenPollResult(
             "failed",
             errorCode: if (errorCode.isEmpty()) { "device_poll_failed" } else { errorCode },
-            message: "OpenAI Codex device authorization polling failed.",
+            message: deviceFailureMessage("OpenAI Codex device authorization polling failed.", response.body),
             pollAttempts: attempts,
             pollIntervalSeconds: interval,
             maxWaitSeconds: waitLimit
@@ -384,6 +405,22 @@ public func startOpenAICodexDashboardDeviceFlow(
     out.put("verificationUrl", JsonString(login.start.verificationUrl))
     out.put("userCode", JsonString(login.start.userCode))
     out.put("pollAttempts", JsonInt(login.poll.pollAttempts))
+    let errorCode = if (!login.start.errorCode.isEmpty()) {
+        login.start.errorCode
+    } else if (!login.poll.errorCode.isEmpty()) {
+        login.poll.errorCode
+    } else {
+        login.exchange.errorCode
+    }
+    let message = if (!login.start.message.isEmpty()) {
+        login.start.message
+    } else if (!login.poll.message.isEmpty()) {
+        login.poll.message
+    } else {
+        login.exchange.message
+    }
+    out.put("errorCode", JsonString(errorCode))
+    out.put("message", JsonString(message))
     match (login.profile) {
         case Some(profile) =>
             out.put("oauthConfigured", true.toJsonValue())

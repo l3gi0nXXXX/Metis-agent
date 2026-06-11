@@ -1,9 +1,10 @@
 package metis.core.model
 
-import magic.utils.http.HttpUtils
+import metis.core.config.{OpenAICodexOAuthRoute, OpenAICodexOAuthTransportConfig, buildOpenAICodexOAuthHttpClientBuilder, resolveOpenAICodexOAuthRoute}
 
-import std.collection.HashMap
+import std.collection.{ArrayList, HashMap}
 import stdx.encoding.json.*
+import stdx.net.http.*
 
 public type CodexResponsesHttpRunner = (CodexResponsesHttpRequest) -> CodexResponsesHttpResult
 
@@ -44,6 +45,36 @@ private func codexTrimResponsesBaseUrl(baseUrl: String): String {
     return baseUrl.trimAscii().trimEnd("/")
 }
 
+private func codexResponsesReadHttpBody(response: HttpResponse): String {
+    let out = ArrayList<Byte>()
+    let buffer = Array<Byte>(8192, repeat: 0)
+    while (true) {
+        let n = response.body.read(buffer)
+        if (n <= 0) {
+            break
+        }
+        out.add(all: buffer[..n])
+    }
+    try { String.fromUtf8(out.toArray()) } catch (_: Exception) { "" }
+}
+
+private func codexResponsesRouteDiagnostic(route: OpenAICodexOAuthRoute): String {
+    let parts = ArrayList<String>()
+    if (!route.mode.isEmpty()) {
+        parts.add("route=${route.mode}")
+    }
+    if (!route.proxySource.isEmpty()) {
+        parts.add("proxySource=${route.proxySource}")
+    }
+    if (!route.redactedProxy.isEmpty()) {
+        parts.add("proxy=${route.redactedProxy}")
+    }
+    if (!route.targetHost.isEmpty()) {
+        parts.add("targetHost=${route.targetHost}")
+    }
+    String.join(parts.toArray(), delimiter: " ")
+}
+
 private func codexPreflightClientConfig(baseUrl: String, accessToken: String, payload: JsonObject): Unit {
     if (accessToken.trimAscii().isEmpty()) {
         throw CodexResponsesException("missing_token", "Codex Responses access token is missing")
@@ -57,7 +88,14 @@ private func codexPreflightClientConfig(baseUrl: String, accessToken: String, pa
 }
 
 public class CodexResponsesHttpClient {
-    public init() { }
+    private let transportConfig: OpenAICodexOAuthTransportConfig
+
+    public init(transportConfig!: Option<OpenAICodexOAuthTransportConfig> = None<OpenAICodexOAuthTransportConfig>) {
+        this.transportConfig = match (transportConfig) {
+            case Some(cfg) => cfg
+            case None => OpenAICodexOAuthTransportConfig(timeoutMs: 120000)
+        }
+    }
 
     public func preparePostRequest(
         baseUrl: String,
@@ -105,12 +143,58 @@ public class CodexResponsesHttpClient {
             throw CodexResponsesException("stream_transport_unavailable", "Codex Responses stream requires an injected stream runner in this layer")
         }
         try {
-            if (let Some(body) <- HttpUtils.post(request.url, request.headers, request.body)) {
-                return CodexResponsesHttpResult(200, body: body)
-            }
-            throw CodexResponsesException("empty_response", "Codex Responses HTTP response body is empty")
+            return this.runNativePost(request)
+        } catch (ex: CodexResponsesException) {
+            throw ex
         } catch (ex: Exception) {
             throw CodexResponsesException("http_error", "Codex Responses HTTP request failed: ${ex.message}")
+        }
+    }
+
+    private func requestTransportConfig(request: CodexResponsesHttpRequest): OpenAICodexOAuthTransportConfig {
+        if (request.timeoutMs <= 0 || request.timeoutMs == this.transportConfig.timeoutMs) {
+            return this.transportConfig
+        }
+        OpenAICodexOAuthTransportConfig(
+            proxy: this.transportConfig.proxy,
+            envProxyEnabled: this.transportConfig.envProxyEnabled,
+            noProxy: this.transportConfig.noProxy,
+            insecureSkipTlsVerify: this.transportConfig.insecureSkipTlsVerify,
+            timeoutMs: request.timeoutMs,
+            proxySource: this.transportConfig.proxySource
+        )
+    }
+
+    private func runNativePost(request: CodexResponsesHttpRequest): CodexResponsesHttpResult {
+        let cfg = this.requestTransportConfig(request)
+        let route = resolveOpenAICodexOAuthRoute(request.url, cfg)
+        if (route.mode == "unsupportedHttpsProxy" || route.mode == "unsupportedSocksProxy" || route.mode == "invalidProxy") {
+            throw CodexResponsesException(
+                "http_error",
+                "Codex Responses HTTP request failed: ${route.error} ${codexResponsesRouteDiagnostic(route)}"
+            )
+        }
+        let builderRoute = buildOpenAICodexOAuthHttpClientBuilder(request.url, cfg)
+        let builder = builderRoute[0]
+        let activeRoute = builderRoute[1]
+        let client = builder.build()
+        try {
+            let reqBuilder = HttpRequestBuilder()
+                .url(request.url)
+                .post()
+                .body(request.body.toJsonString())
+            for ((key, value) in request.headers) {
+                reqBuilder.header(key, value)
+            }
+            let response = client.send(reqBuilder.build())
+            return CodexResponsesHttpResult(Int64(response.status), body: codexResponsesReadHttpBody(response))
+        } catch (ex: Exception) {
+            throw CodexResponsesException(
+                "http_error",
+                "Codex Responses HTTP request failed: ${ex.message} ${codexResponsesRouteDiagnostic(activeRoute)}"
+            )
+        } finally {
+            client.close()
         }
     }
 
