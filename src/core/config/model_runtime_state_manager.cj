@@ -237,8 +237,15 @@ public class CliModelRuntimeStateManager {
             row.put("runtimeProvider", JsonString(descriptor.runtimeProviderId))
             row.put("displayName", JsonString(descriptor.displayName))
             row.put("groupId", JsonString(descriptor.groupId))
+            row.put("apiMode", JsonString(cliProviderApiMode(descriptor.providerId)))
+            row.put("authKind", JsonString(cliProviderAuthKind(descriptor.providerId)))
+            row.put("runtimeMode", JsonString(cliProviderRuntimeMode(descriptor.providerId)))
+            row.put("requiresApiKey", cliProviderRequiresApiKey(descriptor.providerId).toJsonValue())
             row.put("defaultModelRef", JsonString(descriptor.defaultModelRef))
-            row.put("configured", (!MetisConfigManager.readProviderApiKey(descriptor.providerId).trimAscii().isEmpty()).toJsonValue())
+            row.put("configured", (
+                !MetisConfigManager.readProviderApiKey(descriptor.providerId).trimAscii().isEmpty() ||
+                cliProviderApiKeyEnvConfigured(descriptor.providerId)
+            ).toJsonValue())
             row.put("apiKeyConfigPath", JsonString(cliProviderApiKeyConfigPath(descriptor.providerId)))
             row.put("baseUrlConfigPath", JsonString(cliProviderBaseUrlConfigPath(descriptor.providerId)))
             let baseUrl = MetisConfigManager.readProviderBaseUrl(descriptor.providerId).trimAscii()

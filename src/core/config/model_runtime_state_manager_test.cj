@@ -1,5 +1,6 @@
 package metis.core.config
 
+import std.env.{getVariable, setVariable}
 import std.fs.{Directory, File, Path}
 import std.unittest.testmacro.*
 import stdx.encoding.json.{JsonArray, JsonInt, JsonObject, JsonString, JsonValue}
@@ -30,6 +31,28 @@ private func runtimeStateTestInt(obj: JsonObject, key: String): Int64 {
 
 private func runtimeStateTestRead(path: Path): JsonObject {
     JsonValue.fromStr(String.fromUtf8(File.readFrom(path))).asObject()
+}
+
+private func runtimeStateTestProvider(root: JsonObject, providerId: String): JsonObject {
+    match (root.get("providers")) {
+        case Some(value) =>
+            let providers = try { value.asArray() } catch (_: Exception) { JsonArray([]) }
+            for (item in providers.getItems()) {
+                let row = try { item.asObject() } catch (_: Exception) { JsonObject() }
+                if (runtimeStateTestString(row, "provider") == providerId) {
+                    return row
+                }
+            }
+        case None => ()
+    }
+    JsonObject()
+}
+
+private func runtimeStateRestoreEnv(name: String, value: Option<String>): Unit {
+    match (value) {
+        case Some(existing) => setVariable(name, existing)
+        case None => setVariable(name, "")
+    }
 }
 
 private func runtimeStateTestRoot(agentId: String, modelRef: String): JsonObject {
@@ -64,6 +87,38 @@ public class CliModelRuntimeStateManagerTest {
             } finally {
                 CliConfig.defaultModelInputLimit = oldInput
                 CliConfig.defaultModelOutputLimit = oldOutput
+            }
+        })
+    }
+
+    @TestCase
+    public func materializedRuntimeStateMarksOpenAICodexAsOAuthCodexResponsesWithoutApiKey(): Unit {
+        withMetisConfigTestHome("runtime-state-openai-codex-provider-row", { _home: Path =>
+            CliModelRuntimeStateManager.writeMaterializedRuntimeState()
+            let root = runtimeStateTestRead(CliModelRuntimeStateManager.runtimePath())
+            let codex = runtimeStateTestProvider(root, "openai-codex")
+            @Expect(runtimeStateTestString(codex, "runtimeProvider"), "openai-codex")
+            @Expect(runtimeStateTestString(codex, "apiMode"), "codex_responses")
+            @Expect(runtimeStateTestString(codex, "authKind"), "oauth_external")
+            @Expect(runtimeStateTestString(codex, "runtimeMode"), "metis_tool_loop")
+            @Expect(runtimeStateTestBool(codex, "requiresApiKey"), false)
+            @Expect(runtimeStateTestString(codex, "baseUrl"), "https://chatgpt.com/backend-api/codex")
+            @Expect(runtimeStateTestBool(codex, "configured"), false)
+        })
+    }
+
+    @TestCase
+    public func openAIEnvConfiguresOpenAIProviderButNotOpenAICodex(): Unit {
+        withMetisConfigTestHome("runtime-state-openai-env-not-codex", { _home: Path =>
+            let oldOpenAI = getVariable("OPENAI_API_KEY")
+            try {
+                setVariable("OPENAI_API_KEY", "test-openai-key")
+                CliModelRuntimeStateManager.writeMaterializedRuntimeState()
+                let root = runtimeStateTestRead(CliModelRuntimeStateManager.runtimePath())
+                @Expect(runtimeStateTestBool(runtimeStateTestProvider(root, "openai"), "configured"), true)
+                @Expect(runtimeStateTestBool(runtimeStateTestProvider(root, "openai-codex"), "configured"), false)
+            } finally {
+                runtimeStateRestoreEnv("OPENAI_API_KEY", oldOpenAI)
             }
         })
     }

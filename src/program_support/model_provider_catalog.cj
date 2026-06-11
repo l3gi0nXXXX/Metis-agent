@@ -4,8 +4,13 @@ import metis.core.config.{
     MetisConfigManager,
     cliFindModelAuthChoicesForProvider,
     cliModelProviderCatalogDescriptors,
+    cliProviderApiMode,
+    cliProviderApiKeyEnvConfigured,
     cliProviderApiKeyConfigPath,
-    cliProviderBaseUrlConfigPath
+    cliProviderAuthKind,
+    cliProviderBaseUrlConfigPath,
+    cliProviderRequiresApiKey,
+    cliProviderRuntimeMode
 }
 import metis.core.model.{modelCapabilityCatalogEntriesForProvider, modelCapabilityCatalogEntryToJson}
 
@@ -20,12 +25,19 @@ public func programSupportBuildProviderCatalog(): JsonArray {
         row.put("displayName", JsonString(preset.displayName))
         row.put("groupId", JsonString(preset.groupId))
         row.put("runtimeProvider", JsonString(preset.runtimeProviderId))
+        row.put("apiMode", JsonString(cliProviderApiMode(preset.providerId)))
+        row.put("authKind", JsonString(cliProviderAuthKind(preset.providerId)))
+        row.put("runtimeMode", JsonString(cliProviderRuntimeMode(preset.providerId)))
+        row.put("requiresApiKey", JsonBool(cliProviderRequiresApiKey(preset.providerId)))
         row.put("apiKeyConfigPath", JsonString(cliProviderApiKeyConfigPath(preset.providerId)))
         row.put("baseUrlConfigPath", JsonString(cliProviderBaseUrlConfigPath(preset.providerId)))
         row.put("defaultModelRef", JsonString(preset.defaultModelRef))
         let baseUrl = MetisConfigManager.readProviderBaseUrl(preset.providerId)
         row.put("baseUrl", JsonString(if (baseUrl.isEmpty()) { preset.defaultBaseUrl } else { baseUrl }))
-        row.put("configured", JsonBool(!(MetisConfigManager.readProviderApiKey(preset.providerId).isEmpty())))
+        row.put("configured", JsonBool(
+            !(MetisConfigManager.readProviderApiKey(preset.providerId).isEmpty()) ||
+            cliProviderApiKeyEnvConfigured(preset.providerId)
+        ))
         row.put("highPriority", JsonBool(preset.highPriority))
         let aliases = ArrayList<JsonValue>()
         for (alias in preset.aliases) {

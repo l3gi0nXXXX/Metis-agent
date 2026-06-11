@@ -1,5 +1,6 @@
 package metis.core.config
 
+import std.env.{getVariable, setVariable}
 import std.fs.{Directory, File, Path, exists, remove}
 import std.unittest.testmacro.*
 import stdx.encoding.json.{JsonArray, JsonBool, JsonObject, JsonString}
@@ -49,6 +50,13 @@ private func scopePrepareDir(path: Path): Unit {
         ()
     }
     Directory.create(path, recursive: true)
+}
+
+private func scopeRestoreEnv(name: String, value: Option<String>): Unit {
+    match (value) {
+        case Some(existing) => setVariable(name, existing)
+        case None => setVariable(name, "")
+    }
 }
 
 private func scopeAgentConfigRoot(defaults!: JsonObject = JsonObject(), list!: JsonArray = JsonArray([])): JsonObject {
@@ -495,5 +503,30 @@ public class MetisAgentScopeTest {
         @Expect(rendered.contains("agent-auth-secret"), false)
         @Expect(rendered.contains("agent-model-secret"), false)
         @Expect(rendered.contains("global-secret"), false)
+    }
+
+    @TestCase
+    public func codexHomeAuthJsonAloneDoesNotConfigureOpenAICodexProvider(): Unit {
+        let home = scopeTestHome("codex-home-not-metis-auth")
+        let codexHome = home.join(".codex")
+        scopePrepareDir(codexHome)
+        File.writeTo(codexHome.join("auth.json"), "{\"tokens\":{\"access_token\":\"codex-cli-token\"}}".toArray())
+        let oldCodexHome = getVariable("CODEX_HOME")
+        try {
+            setVariable("CODEX_HOME", codexHome.toString())
+            let root = JsonObject()
+            let agents = JsonObject()
+            let defaults = JsonObject()
+            defaults.put("model", scopeModel("openai-codex/gpt-5.5", fallbacks: JsonArray([])))
+            agents.put("defaults", defaults)
+            root.put("agents", agents)
+            let scope = MetisAgentScope.resolve(root, homeRoot: home, defaultWorkspace: home.join("workspace"))
+            let accountSummary = scopeTestObject(scope, "accountSummary")
+            @Expect(scopeTestString(scopeTestObject(scope, "providerSummary"), "providerId"), "openai-codex")
+            @Expect(scopeTestString(accountSummary, "status"), "not-configured")
+            @Expect(scopeTestBool(accountSummary, "configured"), false)
+        } finally {
+            scopeRestoreEnv("CODEX_HOME", oldCodexHome)
+        }
     }
 }

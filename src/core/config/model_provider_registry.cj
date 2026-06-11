@@ -1,24 +1,64 @@
 package metis.core.config
 
 import std.collection.ArrayList
+import std.env.getVariable
 
-public struct CliModelProviderDescriptor {
-    public CliModelProviderDescriptor(
-        public let providerId: String,
-        public let displayName: String,
-        public let groupId: String,
-        public let runtimeProviderId: String,
-        public let aliases: Array<String>,
-        public let apiKeyEnv: String,
-        public let baseUrlEnv: String,
-        public let apiKeyEnvAliases: Array<String>,
-        public let baseUrlEnvAliases: Array<String>,
-        public let defaultModelRef: String,
-        public let defaultBaseUrl: String,
-        public let docsUrl: String,
-        public let highPriority: Bool,
-        public let setupVisible: Bool
-    ) {}
+public class CliModelProviderDescriptor {
+    public let providerId: String
+    public let displayName: String
+    public let groupId: String
+    public let runtimeProviderId: String
+    public let aliases: Array<String>
+    public let apiKeyEnv: String
+    public let baseUrlEnv: String
+    public let apiKeyEnvAliases: Array<String>
+    public let baseUrlEnvAliases: Array<String>
+    public let defaultModelRef: String
+    public let defaultBaseUrl: String
+    public let docsUrl: String
+    public let highPriority: Bool
+    public let setupVisible: Bool
+    public let apiMode: String
+    public let authKind: String
+    public let runtimeMode: String
+
+    public init(
+        providerId: String,
+        displayName: String,
+        groupId: String,
+        runtimeProviderId: String,
+        aliases: Array<String>,
+        apiKeyEnv: String,
+        baseUrlEnv: String,
+        apiKeyEnvAliases: Array<String>,
+        baseUrlEnvAliases: Array<String>,
+        defaultModelRef: String,
+        defaultBaseUrl: String,
+        docsUrl: String,
+        highPriority: Bool,
+        setupVisible: Bool,
+        apiMode!: String = "chat_completions",
+        authKind!: String = "api_key",
+        runtimeMode!: String = "metis_tool_loop"
+    ) {
+        this.providerId = providerId
+        this.displayName = displayName
+        this.groupId = groupId
+        this.runtimeProviderId = runtimeProviderId
+        this.aliases = aliases
+        this.apiKeyEnv = apiKeyEnv
+        this.baseUrlEnv = baseUrlEnv
+        this.apiKeyEnvAliases = apiKeyEnvAliases
+        this.baseUrlEnvAliases = baseUrlEnvAliases
+        this.defaultModelRef = defaultModelRef
+        this.defaultBaseUrl = defaultBaseUrl
+        this.docsUrl = docsUrl
+        this.highPriority = highPriority
+        this.setupVisible = setupVisible
+        this.apiMode = apiMode
+        this.authKind = authKind
+        this.runtimeMode = runtimeMode
+    }
 }
 
 private let CLI_MODEL_PROVIDER_DESCRIPTORS = [
@@ -43,7 +83,7 @@ private let CLI_MODEL_PROVIDER_DESCRIPTORS = [
     CliModelProviderDescriptor("moonshot", "Moonshot AI (Kimi K2.5)", "domestic", "moonshot", ["moonshot", "kimi"], "MOONSHOT_API_KEY", "MOONSHOT_BASE_URL", ["MOONSHOT_API_KEY"], ["MOONSHOT_BASE_URL"], "moonshot:kimi-k2.5", "https://api.kimi.com/coding/v1", "https://platform.moonshot.cn/", true, true),
     CliModelProviderDescriptor("ollama", "Ollama", "local", "ollama", ["ollama"], "", "OLLAMA_BASE_URL", Array<String>(), ["OLLAMA_BASE_URL"], "ollama:qwen3:latest", "http://127.0.0.1:11434/v1", "https://ollama.com/", false, true),
     CliModelProviderDescriptor("openai", "OpenAI", "global", "openai", ["openai"], "OPENAI_API_KEY", "OPENAI_BASE_URL", ["OPENAI_API_KEY"], ["OPENAI_BASE_URL"], "openai:gpt-5.4", "https://api.openai.com/v1", "https://platform.openai.com/", true, true),
-    CliModelProviderDescriptor("openai-codex", "OpenAI Codex", "global", "openai", ["openai-codex", "codex"], "OPENAI_API_KEY", "OPENAI_BASE_URL", ["OPENAI_API_KEY"], ["OPENAI_BASE_URL"], "openai-codex:gpt-5.4", "https://api.openai.com/v1", "https://platform.openai.com/", false, true),
+    CliModelProviderDescriptor("openai-codex", "OpenAI Codex", "global", "openai-codex", ["openai-codex", "codex"], "", "", Array<String>(), Array<String>(), "openai-codex:gpt-5.5", "https://chatgpt.com/backend-api/codex", "https://chatgpt.com/", false, true, apiMode: "codex_responses", authKind: "oauth_external", runtimeMode: "metis_tool_loop"),
     CliModelProviderDescriptor("opencode", "OpenCode", "global", "opencode", ["opencode"], "OPENCODE_API_KEY", "OPENCODE_BASE_URL", ["OPENCODE_API_KEY"], ["OPENCODE_BASE_URL"], "opencode:claude-opus-4-6", "", "https://docs.metis.ai/providers/opencode", false, true),
     CliModelProviderDescriptor("openrouter", "OpenRouter", "global", "openrouter", ["openrouter"], "OPENROUTER_API_KEY", "OPENROUTER_BASE_URL", ["OPENROUTER_API_KEY"], ["OPENROUTER_BASE_URL"], "openrouter:openai/gpt-5.4", "https://openrouter.ai/api/v1", "https://openrouter.ai/", false, true),
     CliModelProviderDescriptor("qianfan", "Qianfan", "domestic", "openai", ["qianfan"], "QIANFAN_API_KEY", "QIANFAN_BASE_URL", ["QIANFAN_API_KEY"], ["QIANFAN_BASE_URL"], "qianfan:deepseek-v3.2", "https://qianfan.baidubce.com/v2", "https://cloud.baidu.com/product/wenxinworkshop", false, true),
@@ -93,6 +133,56 @@ public func cliRuntimeModelProviderId(providerId: String): String {
         case Some(descriptor) => descriptor.runtimeProviderId
         case None => providerId.trimAscii().toAsciiLower()
     }
+}
+
+public func cliProviderApiMode(providerId: String): String {
+    match (cliFindModelProviderDescriptor(providerId)) {
+        case Some(descriptor) => descriptor.apiMode
+        case None => "chat_completions"
+    }
+}
+
+public func cliProviderAuthKind(providerId: String): String {
+    match (cliFindModelProviderDescriptor(providerId)) {
+        case Some(descriptor) =>
+            if (descriptor.authKind == "api_key" && descriptor.apiKeyEnv.trimAscii().isEmpty()) {
+                "none"
+            } else {
+                descriptor.authKind
+            }
+        case None => "api_key"
+    }
+}
+
+public func cliProviderRuntimeMode(providerId: String): String {
+    match (cliFindModelProviderDescriptor(providerId)) {
+        case Some(descriptor) => descriptor.runtimeMode
+        case None => "metis_tool_loop"
+    }
+}
+
+public func cliProviderRequiresApiKey(providerId: String): Bool {
+    match (cliFindModelProviderDescriptor(providerId)) {
+        case Some(descriptor) => descriptor.authKind == "api_key" && !descriptor.apiKeyEnv.trimAscii().isEmpty()
+        case None => false
+    }
+}
+
+public func cliProviderApiKeyEnvConfigured(providerId: String): Bool {
+    for (key in cliProviderApiKeyEnvAliases(providerId)) {
+        let normalized = key.trimAscii()
+        if (normalized.isEmpty()) {
+            continue
+        }
+        match (getVariable(normalized)) {
+            case Some(value) =>
+                if (!value.trimAscii().isEmpty()) {
+                    return true
+                }
+            case None => ()
+        }
+    }
+    false
 }
 
 public func cliProviderPrimaryEnvNames(providerId: String): (String, String) {

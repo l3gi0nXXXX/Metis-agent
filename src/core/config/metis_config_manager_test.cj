@@ -21,6 +21,18 @@ public class MetisConfigManagerTest {
     }
 
     @TestCase
+    public func normalizeModelRefPreservesOpenAICodexProvider(): Unit {
+        @Expect(
+            MetisConfigManager.normalizeModelRef("openai-codex:gpt-5.5"),
+            "openai-codex:gpt-5.5"
+        )
+        @Expect(
+            MetisConfigManager.normalizeModelRef("openai-codex/gpt-5.5"),
+            "openai-codex:gpt-5.5"
+        )
+    }
+
+    @TestCase
     public func canonicalModelRefRewritesLegacyArkQwenProviderToQwen(): Unit {
         @Expect(
             MetisConfigManager.canonicalModelRef("ark:qwen3.5-plus"),
