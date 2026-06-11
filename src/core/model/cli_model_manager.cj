@@ -3,7 +3,7 @@ package metis.core.model
 import magic.core.model.ChatModel
 import magic.model.ModelManager
 
-import metis.core.config.{CliConfig, CliModelRuntimeStateManager, MetisConfigManager}
+import metis.core.config.{CliConfig, CliModelRuntimeStateManager, MetisConfigManager, cliProviderApiMode}
 
 import std.collection.ArrayList
 import stdx.encoding.json.{JsonArray, JsonObject}
@@ -212,7 +212,12 @@ protected class CliModelManager {
     }
 
     private static func buildModel(model: String): ChatModel {
-        let m = ModelManager.createChatModel(model)
+        let provider = codexResponsesModelProviderId(model)
+        let m = if (!provider.isEmpty() && shouldBuildCodexResponsesModel(provider, cliProviderApiMode(provider))) {
+            buildOpenAICodexResponsesChatModelForRef(model)
+        } else {
+            ModelManager.createChatModel(model)
+        }
         m.maxTokens = ModelTokenLimits.getOutputLimit(model)
         return m
     }

@@ -1082,6 +1082,18 @@ private func gatewayControlUiWsAgentsFamilyCompatResponse(method: String, params
     }
 }
 
+private func gatewayControlUiWsLocalRpcCompatResponse(method: String, params: JsonObject): GatewayProtocolResponse {
+    let response = gatewayDispatchLocalMethod(GatewayRpcRequest(method, params: params, clientId: "control-ui", clientName: "control-ui", mode: "local-rpc", transport: "local", transportKind: "local"))
+    GatewayProtocolResponse(
+        response.ok,
+        method,
+        result: response.result,
+        error: response.error,
+        errorCode: response.errorCode,
+        details: response.details
+    )
+}
+
 private func gatewayControlUiWsSkillSourceLabel(location: String): String {
     skillsSourceTagForLocation(location)
 }
@@ -2965,6 +2977,18 @@ public func gatewayControlUiWsCompatResponse(method: String, params: JsonObject,
     }
     if (normalized == "channels.feishu.auth.start") {
         return Some(GatewayProtocolResponse(true, method, result: gatewayControlUiWsFeishuAuthStartResult(params)))
+    }
+    if (
+        normalized == "models.auth.openai-codex.status" ||
+        normalized == "models.auth.openai_codex.status" ||
+        normalized == "oauth.openai-codex.status" ||
+        normalized == "oauth.openai_codex.status" ||
+        normalized == "models.auth.openai-codex.start" ||
+        normalized == "models.auth.openai_codex.start" ||
+        normalized == "oauth.openai-codex.start" ||
+        normalized == "oauth.openai_codex.start"
+    ) {
+        return Some(gatewayControlUiWsLocalRpcCompatResponse(normalized, params))
     }
     if (normalized == "channels.runtime") {
         return Some(GatewayProtocolResponse(true, method, result: gatewayControlUiWsChannelsRuntimeResult(params)))

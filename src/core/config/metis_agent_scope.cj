@@ -797,6 +797,72 @@ private func scopeProviderCredentialStatus(provider: JsonObject): (Bool, Bool, S
     (apiKeyConfigured, baseUrlConfigured, status)
 }
 
+private func scopeAuthProfileFromRoot(root: JsonObject, profileId: String): JsonObject {
+    match (scopeJsonObject(root, "auth")) {
+        case Some(auth) =>
+            match (scopeJsonObject(auth, "profiles")) {
+                case Some(profiles) =>
+                    match (profiles.get(profileId.trimAscii())) {
+                        case Some(value) => try { value.asObject() } catch (_: Exception) { JsonObject() }
+                        case None => JsonObject()
+                    }
+                case None => JsonObject()
+            }
+        case None => JsonObject()
+    }
+}
+
+private func scopeOpenAICodexOAuthConfigured(profile: JsonObject): Bool {
+    let provider = scopeJsonString(profile, "provider").getOrDefault { "" }.trimAscii().toAsciiLower()
+    let authMethod = scopeJsonString(profile, "authMethod").getOrDefault { "" }.trimAscii().toAsciiLower()
+    let accessToken = scopeJsonString(profile, "accessToken").getOrDefault { "" }
+    let refreshToken = scopeJsonString(profile, "refreshToken").getOrDefault { "" }
+    provider == "openai-codex" && authMethod != "api-key" && !accessToken.isEmpty() && !refreshToken.isEmpty()
+}
+
+private func scopeOpenAICodexCredentialSummary(root: JsonObject, modelRef: String): JsonObject {
+    let out = JsonObject()
+    let sources = JsonArray([])
+    let profile = scopeAuthProfileFromRoot(root, "openai-codex:default")
+    let oauthConfigured = scopeOpenAICodexOAuthConfigured(profile)
+    let profileBaseUrl = scopeProviderField(profile, ["baseUrl", "baseURL", "base_url"])
+    let globalProvider = scopeProviderConfig(root, "openai-codex")
+    let globalBaseUrl = scopeProviderField(globalProvider, ["baseUrl", "baseURL", "base_url"])
+    let baseUrlConfigured = !profileBaseUrl.isEmpty() || !globalBaseUrl.isEmpty()
+
+    sources.add(scopeCredentialSourceRow(
+        "auth.profiles.openai-codex:default",
+        if (oauthConfigured) { "configured" } else { "not-configured" },
+        false,
+        !profileBaseUrl.isEmpty(),
+        profileId: "openai-codex:default"
+    ))
+    sources.add(scopeCredentialSourceRow(
+        "models.providers.openai-codex",
+        if (globalProvider.size() > 0) { "present" } else { "not-configured" },
+        false,
+        !globalBaseUrl.isEmpty()
+    ))
+    sources.add(scopeCredentialSourceRow("env.openai-codex", "not-configured", false, false))
+
+    out.put("providerId", JsonString("openai-codex"))
+    out.put("modelRef", JsonString(modelRef.trimAscii()))
+    out.put("authKind", JsonString("oauth_external"))
+    out.put("source", JsonString(if (oauthConfigured) { "auth.profiles.openai-codex:default" } else { "unconfigured" }))
+    out.put("status", JsonString(if (oauthConfigured) { "configured" } else { "not-configured" }))
+    out.put("configured", oauthConfigured.toJsonValue())
+    out.put("oauthConfigured", oauthConfigured.toJsonValue())
+    out.put("apiKeyConfigured", false.toJsonValue())
+    out.put("baseUrlConfigured", baseUrlConfigured.toJsonValue())
+    out.put("sources", sources)
+    out.put("sourceOrder", scopeJsonArrayFromStrings([
+        "auth.profiles.openai-codex:default",
+        "models.providers.openai-codex",
+        "env.openai-codex"
+    ]))
+    out
+}
+
 private func scopeProviderFromProviderMap(root: JsonObject, providerId: String): JsonObject {
     let providers = scopeJsonObject(root, "providers") ?? JsonObject()
     scopeJsonObject(providers, providerId) ?? JsonObject()
@@ -877,6 +943,10 @@ private func scopeCredentialSummary(root: JsonObject, modelRef: String, agentDir
         out.put("baseUrlConfigured", false.toJsonValue())
         out.put("sources", sources)
         return out
+    }
+
+    if (providerId == "openai-codex") {
+        return scopeOpenAICodexCredentialSummary(root, modelRef)
     }
 
     let authPath = agentDir.join("auth-profiles.json")

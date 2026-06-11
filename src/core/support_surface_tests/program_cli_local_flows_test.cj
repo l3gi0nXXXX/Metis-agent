@@ -1,8 +1,9 @@
 package metis.core.support_surface_tests
 
 import metis.core.config.{CliConfig, CliSettingManager, MetisConfigManager}
+import metis.core.config.{OpenAICodexClock, OpenAICodexHttpClient, OpenAICodexHttpResponse, OpenAICodexOAuthProfile, listOpenAICodexPoolEntries, readOpenAICodexOAuthProfile, writeOpenAICodexOAuthProfile}
 import metis.gateway.logging.{gatewayLoggingCurrentLogFile, gatewayLoggingResetForTest}
-import metis.program.executeCliLogsCommand
+import metis.program.{executeCliLogsCommand, executeCliModelsAuthCommand}
 import metis.program_support.*
 
 import std.env.{getVariable, setVariable}
@@ -42,6 +43,94 @@ private func withLogsCliTestHome<T>(block: () -> T): T {
         CliSettingManager.invalidate()
         gatewayLoggingResetForTest()
     }
+}
+
+private class CliAuthFakeClock <: OpenAICodexClock {
+    public let nowSeconds: Int64
+
+    public init(nowSeconds: Int64) {
+        this.nowSeconds = nowSeconds
+    }
+
+    public func unixSeconds(): Int64 {
+        this.nowSeconds
+    }
+}
+
+private class CliAuthFakeHttpClient <: OpenAICodexHttpClient {
+    public let jsonUrls = ArrayList<String>()
+    public let formUrls = ArrayList<String>()
+    private let jsonResponses = ArrayList<OpenAICodexHttpResponse>()
+    private let formResponses = ArrayList<OpenAICodexHttpResponse>()
+
+    public init() {}
+
+    public func queueJson(statusCode: Int64, body: String): Unit {
+        this.jsonResponses.add(OpenAICodexHttpResponse(statusCode, body))
+    }
+
+    public func queueForm(statusCode: Int64, body: String): Unit {
+        this.formResponses.add(OpenAICodexHttpResponse(statusCode, body))
+    }
+
+    public func postJson(url: String, body: String): OpenAICodexHttpResponse {
+        this.jsonUrls.add(url)
+        if (this.jsonResponses.size == 0) {
+            return OpenAICodexHttpResponse(500, "{\"error\":\"unexpected_json_call\"}")
+        }
+        this.jsonResponses.remove(at: 0)
+    }
+
+    public func postForm(url: String, body: String): OpenAICodexHttpResponse {
+        this.formUrls.add(url)
+        if (this.formResponses.size == 0) {
+            return OpenAICodexHttpResponse(500, "{\"error\":\"unexpected_form_call\"}")
+        }
+        this.formResponses.remove(at: 0)
+    }
+}
+
+private func withModelsAuthCliTestHome<T>(name: String, block: (Path) -> T): T {
+    let testHome = "/tmp/${name}"
+    try {
+        remove(Path(testHome), recursive: true)
+    } catch (_e: Exception) {
+        ()
+    }
+    Directory.create(testHome, recursive: true)
+    let oldHome = getVariable("METIS_HOME")
+    let oldCodexHome = getVariable("CODEX_HOME")
+    setVariable("METIS_HOME", testHome)
+    setVariable("CODEX_HOME", "")
+    CliConfig.invalidatePathCache()
+    MetisConfigManager.invalidate()
+    CliSettingManager.invalidate()
+    try {
+        return block(Path(testHome))
+    } finally {
+        match (oldHome) {
+            case Some(value) => setVariable("METIS_HOME", value)
+            case None => setVariable("METIS_HOME", "")
+        }
+        match (oldCodexHome) {
+            case Some(value) => setVariable("CODEX_HOME", value)
+            case None => setVariable("CODEX_HOME", "")
+        }
+        CliConfig.invalidatePathCache()
+        MetisConfigManager.invalidate()
+        CliSettingManager.invalidate()
+    }
+}
+
+private func cliAuthProfile(access: String, refresh!: String = "refresh-secret", expiresAt!: Int64 = 5000): OpenAICodexOAuthProfile {
+    OpenAICodexOAuthProfile(
+        accessToken: access,
+        refreshToken: refresh,
+        expiresAtUnixSeconds: expiresAt,
+        lastRefreshUnixSeconds: 1000,
+        accountLabel: "acct",
+        source: "device-code"
+    )
 }
 
 @Test
@@ -237,6 +326,96 @@ public class CliLocalFlowsTest {
             @Expect(code, 0)
             @Expect(tail.contains("尾部中文"), true)
             @Expect(tail.contains("前置日志"), false)
+        })
+    }
+
+    @TestCase
+    public func modelsAuthOpenAICodexLoginStatusAndLogoutUseHumanRedactedOutput(): Unit {
+        withModelsAuthCliTestHome("metis-models-auth-openai-codex-login", { _home: Path =>
+            let http = CliAuthFakeHttpClient()
+            http.queueJson(200, "{\"device_auth_id\":\"dev-1\",\"user_code\":\"USER-1\",\"verification_uri\":\"https://auth.example/device\",\"interval\":3,\"expires_in\":3}")
+            http.queueJson(200, "{\"authorization_code\":\"auth-code-1\",\"code_verifier\":\"verifier-1\"}")
+            http.queueForm(200, "{\"access_token\":\"access-secret-never-print\",\"refresh_token\":\"refresh-secret-never-print\",\"expires_in\":3600}")
+
+            let (loginText, loginCode) = executeCliModelsAuthCommand(
+                ["openai-codex", "login", "--force"],
+                httpClient: Some<OpenAICodexHttpClient>(http),
+                clock: CliAuthFakeClock(1000)
+            )
+            @Expect(loginCode, 0)
+            @Expect(loginText.contains("OpenAI Codex device login"), true)
+            @Expect(loginText.contains("USER-1"), true)
+            @Expect(loginText.contains("logged in"), true)
+            @Expect(loginText.contains("access-secret-never-print"), false)
+            @Expect(loginText.contains("refresh-secret-never-print"), false)
+            @Expect(readOpenAICodexOAuthProfile().isSome(), true)
+
+            let (statusText, statusCode) = executeCliModelsAuthCommand(
+                ["openai-codex", "status"],
+                clock: CliAuthFakeClock(1001)
+            )
+            @Expect(statusCode, 0)
+            @Expect(statusText.contains("OpenAI Codex OAuth: logged in"), true)
+            @Expect(statusText.contains("access-secret-never-print"), false)
+
+            let (logoutText, logoutCode) = executeCliModelsAuthCommand(["openai-codex", "logout"])
+            @Expect(logoutCode, 0)
+            @Expect(logoutText.contains("Logged out of OpenAI Codex"), true)
+            @Expect(readOpenAICodexOAuthProfile().isNone(), true)
+        })
+    }
+
+    @TestCase
+    public func modelsAuthOpenAICodexImportRequiresExplicitConsent(): Unit {
+        withModelsAuthCliTestHome("metis-models-auth-openai-codex-import", { home: Path =>
+            let codexHome = home.join(".codex")
+            Directory.create(codexHome, recursive: true)
+            File.writeTo(
+                codexHome.join("auth.json"),
+                "{\"access_token\":\"codex-cli-access-secret\",\"refresh_token\":\"codex-cli-refresh-secret\",\"account_id\":\"cli-account\"}".toArray()
+            )
+
+            let (blockedText, blockedCode) = executeCliModelsAuthCommand(
+                ["openai-codex", "import-codex-cli", "--codex-home", codexHome.toString()]
+            )
+            @Expect(blockedCode, 1)
+            @Expect(blockedText.contains("explicit consent"), true)
+            @Expect(readOpenAICodexOAuthProfile().isNone(), true)
+
+            let (importText, importCode) = executeCliModelsAuthCommand(
+                ["openai-codex", "import-codex-cli", "--codex-home", codexHome.toString(), "--yes"],
+                clock: CliAuthFakeClock(2000)
+            )
+            @Expect(importCode, 0)
+            @Expect(importText.contains("Imported OpenAI Codex OAuth credentials"), true)
+            @Expect(importText.contains("codex-cli-access-secret"), false)
+            @Expect(importText.contains("codex-cli-refresh-secret"), false)
+            @Expect(readOpenAICodexOAuthProfile().getOrThrow().source, "codex-cli-import")
+        })
+    }
+
+    @TestCase
+    public func modelsAuthAddOpenAICodexWritesManualPoolWithoutReplacingSingleton(): Unit {
+        withModelsAuthCliTestHome("metis-models-auth-openai-codex-add", { _home: Path =>
+            writeOpenAICodexOAuthProfile(cliAuthProfile("singleton-access", refresh: "singleton-refresh"))
+            let http = CliAuthFakeHttpClient()
+            http.queueJson(200, "{\"device_auth_id\":\"dev-add\",\"user_code\":\"ADD-1\",\"verification_uri\":\"https://auth.example/device\",\"interval\":3,\"expires_in\":3}")
+            http.queueJson(200, "{\"authorization_code\":\"add-code\",\"code_verifier\":\"add-verifier\"}")
+            http.queueForm(200, "{\"access_token\":\"manual-access-secret\",\"refresh_token\":\"manual-refresh-secret\",\"expires_in\":3600}")
+
+            let (addText, addCode) = executeCliModelsAuthCommand(
+                ["add", "openai-codex", "--label", "work"],
+                httpClient: Some<OpenAICodexHttpClient>(http),
+                clock: CliAuthFakeClock(3000)
+            )
+            @Expect(addCode, 0)
+            @Expect(addText.contains("OpenAI Codex account added"), true)
+            @Expect(addText.contains("manual-access-secret"), false)
+            @Expect(readOpenAICodexOAuthProfile().getOrThrow().accessToken, "singleton-access")
+            let pool = listOpenAICodexPoolEntries()
+            @Expect(pool.size, 1)
+            @Expect(pool[0].label, "work")
+            @Expect(pool[0].source, "manual:device_code")
         })
     }
 }

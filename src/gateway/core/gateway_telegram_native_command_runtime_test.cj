@@ -68,11 +68,31 @@ public class GatewayTelegramNativeCommandRuntimeTest {
         @Expect(validation.get("invalidStatuses").getOrThrow().asArray().size(), 0)
         @Expect(validation.get("missingHandlers").getOrThrow().asArray().size(), 0)
         @Expect(gatewayFindTelegramNativeCommandSpec("allowlist").getOrThrow().status, "implemented")
+        @Expect(gatewayFindTelegramNativeCommandSpec("codex_runtime").getOrThrow().command, "codex-runtime")
         @Expect(gatewayFindTelegramNativeCommandSpec("acp").getOrThrow().status, "not_applicable")
         @Expect(gatewayFindTelegramNativeCommandSpec("btw").getOrThrow().status, "not_applicable")
         @Expect(gatewayFindTelegramNativeCommandSpec("session").getOrThrow().argsMenuChoices.size, 0)
         @Expect(gatewayFindTelegramNativeCommandSpec("tools").getOrThrow().argsMenuChoices.size, 0)
         @Expect(gatewayFindTelegramNativeCommandSpec("activation").getOrThrow().argsMenuChoices.size, 0)
         @Expect(gatewayFindTelegramNativeCommandSpec("compact").getOrThrow().args.size, 0)
+    }
+
+    @TestCase
+    public func codexRuntimeUnderscoreMenuCommandRoutesToGatewaySlashText(): Unit {
+        let runtime = GatewayTelegramNativeCommandRuntime()
+        let decision = runtime.resolveText(
+            "/codex_runtime on",
+            "8734062810",
+            "default",
+            "telegram:direct:8734062810",
+            true
+        )
+
+        @Expect(decision.handled, true)
+        @Expect(decision.preflightReply, "")
+        let context = decision.context.getOrThrow()
+        @Expect(context.command, "codex-runtime")
+        @Expect(context.commandText, "/codex-runtime on")
+        @Expect(context.argsText, "on")
     }
 }

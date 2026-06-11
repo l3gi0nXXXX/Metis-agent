@@ -6,22 +6,36 @@ import stdx.encoding.json.{JsonObject, JsonValue}
 /**
  * 单渠道路由策略（P0 最小版）。
  * - allowFrom: 允许的 senderId 列表；包含 "*" 表示放开。
+ * - allowAdminFrom/userAllowedCommands: 私聊 slash command 管理员与普通用户命令白名单。
+ * - groupAllowAdminFrom/groupUserAllowedCommands: 群聊 slash command 管理员与普通用户命令白名单。
  * - requireMentionInGroup: 群消息是否必须 @ 机器人。
  * - enableDirect/enableGroup: 私聊或群聊是否开启处理。
  */
 public class ChannelPolicyConfig {
     public let allowFrom: Array<String>
+    public let allowAdminFrom: Array<String>
+    public let userAllowedCommands: Array<String>
+    public let groupAllowAdminFrom: Array<String>
+    public let groupUserAllowedCommands: Array<String>
     public let requireMentionInGroup: Bool
     public let enableDirect: Bool
     public let enableGroup: Bool
 
     public init(
         allowFrom!: Array<String> = [],
+        allowAdminFrom!: Array<String> = [],
+        userAllowedCommands!: Array<String> = [],
+        groupAllowAdminFrom!: Array<String> = [],
+        groupUserAllowedCommands!: Array<String> = [],
         requireMentionInGroup!: Bool = true,
         enableDirect!: Bool = true,
         enableGroup!: Bool = true
     ) {
         this.allowFrom = allowFrom
+        this.allowAdminFrom = allowAdminFrom
+        this.userAllowedCommands = userAllowedCommands
+        this.groupAllowAdminFrom = groupAllowAdminFrom
+        this.groupUserAllowedCommands = groupUserAllowedCommands
         this.requireMentionInGroup = requireMentionInGroup
         this.enableDirect = enableDirect
         this.enableGroup = enableGroup

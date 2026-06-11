@@ -1,0 +1,207 @@
+package metis.core.model
+
+import magic.utils.http.HttpUtils
+
+import std.collection.HashMap
+import stdx.encoding.json.*
+
+public type CodexResponsesHttpRunner = (CodexResponsesHttpRequest) -> CodexResponsesHttpResult
+
+private var codexResponsesHttpRunnerForTest: Option<CodexResponsesHttpRunner> = None<CodexResponsesHttpRunner>
+
+public func setCodexResponsesHttpRunnerForTest(runner: Option<CodexResponsesHttpRunner>): Unit {
+    codexResponsesHttpRunnerForTest = runner
+}
+
+private func codexHttpString(obj: JsonObject, key: String): String {
+    try {
+        if (let Some(value) <- obj.get(key)) {
+            return value.asString().getValue()
+        }
+    } catch (_: Exception) { () }
+    return ""
+}
+
+private func codexHttpBool(obj: JsonObject, key: String): Bool {
+    try {
+        if (let Some(value) <- obj.get(key)) {
+            return value.asBool().getValue()
+        }
+    } catch (_: Exception) { () }
+    return false
+}
+
+private func codexHttpObject(obj: JsonObject, key: String): JsonObject {
+    try {
+        if (let Some(value) <- obj.get(key)) {
+            return value.asObject()
+        }
+    } catch (_: Exception) { () }
+    return JsonObject()
+}
+
+private func codexTrimResponsesBaseUrl(baseUrl: String): String {
+    return baseUrl.trimAscii().trimEnd("/")
+}
+
+private func codexPreflightClientConfig(baseUrl: String, accessToken: String, payload: JsonObject): Unit {
+    if (accessToken.trimAscii().isEmpty()) {
+        throw CodexResponsesException("missing_token", "Codex Responses access token is missing")
+    }
+    if (baseUrl.trimAscii().isEmpty()) {
+        throw CodexResponsesException("missing_base_url", "Codex Responses baseUrl is missing")
+    }
+    if (codexHttpString(payload, "model").trimAscii().isEmpty()) {
+        throw CodexResponsesException("missing_model", "Codex Responses model is missing")
+    }
+}
+
+public class CodexResponsesHttpClient {
+    public init() { }
+
+    public func preparePostRequest(
+        baseUrl: String,
+        accessToken: String,
+        payload: JsonObject,
+        extraHeaders!: HashMap<String, String> = HashMap<String, String>(),
+        timeoutMs!: Int64 = 0,
+        stream!: Bool = false
+    ): CodexResponsesHttpRequest {
+        codexPreflightClientConfig(baseUrl, accessToken, payload)
+        codexPreflightResponsesPayload(payload, allowStream: stream)
+        let headers = HashMap<String, String>([
+            ("Content-Type", "application/json"),
+            ("Authorization", "Bearer ${accessToken}")
+        ])
+        for ((key, value) in extraHeaders) {
+            headers.add(key, value)
+        }
+        let cfHeaders = codexCloudflareHeaders(accessToken)
+        for ((key, value) in cfHeaders.getFields()) {
+            try {
+                headers.add(key, value.asString().getValue())
+            } catch (_: Exception) { () }
+        }
+        var body = payload
+        if (stream) {
+            body = JsonValue.fromStr(payload.toJsonString()).asObject()
+            body.put("stream", JsonBool(true))
+        }
+        return CodexResponsesHttpRequest(
+            "POST",
+            "${codexTrimResponsesBaseUrl(baseUrl)}/responses",
+            headers,
+            body,
+            stream: stream,
+            timeoutMs: timeoutMs
+        )
+    }
+
+    private func run(request: CodexResponsesHttpRequest): CodexResponsesHttpResult {
+        if (let Some(runner) <- codexResponsesHttpRunnerForTest) {
+            return runner(request)
+        }
+        if (request.stream) {
+            throw CodexResponsesException("stream_transport_unavailable", "Codex Responses stream requires an injected stream runner in this layer")
+        }
+        try {
+            if (let Some(body) <- HttpUtils.post(request.url, request.headers, request.body)) {
+                return CodexResponsesHttpResult(200, body: body)
+            }
+            throw CodexResponsesException("empty_response", "Codex Responses HTTP response body is empty")
+        } catch (ex: Exception) {
+            throw CodexResponsesException("http_error", "Codex Responses HTTP request failed: ${ex.message}")
+        }
+    }
+
+    private func resultToObject(result: CodexResponsesHttpResult, contextTokens!: Int64 = 0): JsonObject {
+        if (result.statusCode >= 200 && result.statusCode < 300) {
+            try {
+                return JsonValue.fromStr(result.body).asObject()
+            } catch (_: Exception) {
+                throw CodexResponsesException("malformed_json", "Codex Responses returned malformed JSON")
+            }
+        }
+        let errorClass = codexClassifyResponsesError(result.statusCode, result.body + result.error, contextTokens: contextTokens)
+        throw CodexResponsesException(errorClass, "Codex Responses HTTP ${result.statusCode}: ${errorClass}")
+    }
+
+    public func postResponses(
+        baseUrl: String,
+        accessToken: String,
+        payload: JsonObject,
+        extraHeaders!: HashMap<String, String> = HashMap<String, String>(),
+        timeoutMs!: Int64 = 0
+    ): JsonObject {
+        let request = this.preparePostRequest(baseUrl, accessToken, payload, extraHeaders: extraHeaders, timeoutMs: timeoutMs)
+        let first = this.run(request)
+        if (first.statusCode >= 200 && first.statusCode < 300) {
+            return this.resultToObject(first, contextTokens: codexEstimateRequestContextTokens(payload))
+        }
+        let classification = codexClassifyResponsesError(first.statusCode, first.body + first.error, contextTokens: codexEstimateRequestContextTokens(payload))
+        if (codexShouldRetryWithoutEncryptedReasoning(classification)) {
+            let retryPayload = codexStripReasoningReplayForRetry(payload)
+            let retryRequest = this.preparePostRequest(baseUrl, accessToken, retryPayload, extraHeaders: extraHeaders, timeoutMs: timeoutMs)
+            return this.resultToObject(this.run(retryRequest), contextTokens: codexEstimateRequestContextTokens(retryPayload))
+        }
+        if (first.statusCode == 400) {
+            let retry = codexUnsupportedParameterRetryPayload(payload, first.body + first.error)
+            if (codexHttpBool(retry, "shouldRetry")) {
+                let retryPayload = codexHttpObject(retry, "payload")
+                let retryRequest = this.preparePostRequest(baseUrl, accessToken, retryPayload, extraHeaders: extraHeaders, timeoutMs: timeoutMs)
+                return this.resultToObject(this.run(retryRequest), contextTokens: codexEstimateRequestContextTokens(retryPayload))
+            }
+        }
+        return this.resultToObject(first, contextTokens: codexEstimateRequestContextTokens(payload))
+    }
+
+    public func streamResponses(
+        baseUrl: String,
+        accessToken: String,
+        payload: JsonObject,
+        extraHeaders!: HashMap<String, String> = HashMap<String, String>(),
+        timeoutMs!: Int64 = 0,
+        model!: String = ""
+    ): CodexResponsesNormalized {
+        let request = this.preparePostRequest(baseUrl, accessToken, payload, extraHeaders: extraHeaders, timeoutMs: timeoutMs, stream: true)
+        let first = this.run(request)
+        if (!first.error.isEmpty()) {
+            let retry = this.run(request)
+            if (!retry.error.isEmpty()) {
+                throw CodexResponsesException("stream_transport_error", "Codex Responses stream transport failed after retry")
+            }
+            return codexNormalizeResponsesEvents(retry.streamEvents, model: model)
+        }
+        if (first.statusCode >= 400) {
+            let classification = codexClassifyResponsesError(first.statusCode, first.body + first.error, contextTokens: codexEstimateRequestContextTokens(payload))
+            throw CodexResponsesException(classification, "Codex Responses stream HTTP ${first.statusCode}: ${classification}")
+        }
+        return codexNormalizeResponsesEvents(first.streamEvents, model: model)
+    }
+}
+
+public func codexResponsesRunStreamWithWatchdog(
+    events: Array<JsonObject>,
+    model!: String = "",
+    ttfbTimeoutSeconds!: Float64 = 45.0,
+    idleTimeoutSeconds!: Float64 = 45.0
+): CodexResponsesHttpResult {
+    let decision = codexResponsesWatchdogDecision(events, ttfbTimeoutSeconds: ttfbTimeoutSeconds, idleTimeoutSeconds: idleTimeoutSeconds)
+    if (decision.action == "kill") {
+        return CodexResponsesHttpResult(0, streamEvents: events, closeReason: decision.closeReason, error: decision.message)
+    }
+    try {
+        let response = codexResponsesEventsToResponse(events, model: model)
+        return CodexResponsesHttpResult(200, body: response.toJsonString(), streamEvents: events)
+    } catch (ex: CodexResponsesException) {
+        if (ex.code != "missing_terminal") {
+            throw ex
+        }
+        let response = JsonObject()
+        response.put("status", JsonString("completed"))
+        response.put("model", JsonString(model))
+        response.put("output", JsonArray())
+        response.put("synthesized_terminal", JsonBool(true))
+        return CodexResponsesHttpResult(200, body: response.toJsonString(), streamEvents: events, closeReason: "missing_terminal")
+    }
+}

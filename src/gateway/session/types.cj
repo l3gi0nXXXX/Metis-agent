@@ -161,6 +161,9 @@ public class GatewayTurnContext {
     public let accountId: String
     public let peerId: String
     public let threadId: String
+    public let senderId: String
+    public let operatorScopes: Array<String>
+    public let chatType: Option<ChatType>
     public let route: JsonObject
     public let agentScope: JsonObject
 
@@ -181,6 +184,9 @@ public class GatewayTurnContext {
         accountId!: String = "",
         peerId!: String = "",
         threadId!: String = "",
+        senderId!: String = "",
+        operatorScopes!: Array<String> = [],
+        chatType!: Option<ChatType> = None,
         route!: JsonObject = JsonObject(),
         agentScope!: JsonObject = JsonObject()
     ) {
@@ -200,6 +206,9 @@ public class GatewayTurnContext {
         this.accountId = accountId.trimAscii()
         this.peerId = peerId.trimAscii()
         this.threadId = threadId.trimAscii()
+        this.senderId = senderId.trimAscii()
+        this.operatorScopes = operatorScopes
+        this.chatType = chatType
         this.route = route
         this.agentScope = agentScope
     }

@@ -911,6 +911,10 @@ public class AgentBridge {
                         case None => ()
                     }
                 }
+                match (gatewayHandleCodexRuntimeCommandLine(trimmedPrompt, conversationKey, turnContext: turnContext)) {
+                    case Some(out) => return out
+                    case None => ()
+                }
                 match (gatewayHandleNativeCommandLine(trimmedPrompt)) {
                     case Some(out) => return out
                     case None => ()
@@ -1163,6 +1167,30 @@ public class AgentBridge {
                         note: "attempt=${idx + 1}, promptChars=${builtPrompt.size}"
                     )
                     var firstTokenMs: Int64 = -1
+                    var codexAppServerPromptTokens: Int64 = -1
+                    var codexAppServerCompletionTokens: Int64 = -1
+                    let attemptRuntime = match (turnContext) {
+                        case Some(ctx) => gatewayResolveAttemptRuntime(currModel.fullName, ctx.agentScope)
+                        case None => gatewayResolveAttemptRuntime(currModel.fullName, JsonObject())
+                    }
+                    let codexAppServerGate = gatewayCodexAppServerGate(attemptRuntime)
+                    gatewayLogEventInfo(
+                        "gateway/model",
+                        "model.request",
+                        "gateway attempt runtime resolved",
+                        meta: gatewayLogMeta()
+                            .string("channel", channelName.trimAscii().toAsciiLower())
+                            .string("agentId", effectiveAgentId)
+                            .string("sessionKey", conversationKey)
+                            .string("model", currModel.fullName)
+                            .string("providerId", attemptRuntime.providerId)
+                            .string("apiMode", attemptRuntime.apiMode)
+                            .string("runtimeMode", attemptRuntime.runtimeMode)
+                            .string("openaiRuntime", attemptRuntime.openaiRuntime)
+                            .string("codexAppServerGate", codexAppServerGate.reason)
+                            .bool("codexAppServerEnabled", codexAppServerGate.enabled)
+                            .object()
+                    )
                     gatewayBeginUsageCapture(agent.name)
                     runtimePushToolInvocationPolicyContext(RuntimeToolInvocationPolicyContext(
                         invocationPolicyRoot,
@@ -1171,7 +1199,27 @@ public class AgentBridge {
                         provider: currModel.fullName
                     ))
                     try {
-                            if (streamingEnabled) {
+                            if (codexAppServerGate.enabled) {
+                                let codexResult = gatewayRunCodexAppServerTurn(GatewayCodexAppServerTurnRequest(
+                                    conversationKey,
+                                    gatewayTurnWorkspacePath(turnContext).toString(),
+                                    channelName,
+                                    effectiveAgentId,
+                                    currModel.fullName,
+                                    builtPrompt,
+                                    modelInput,
+                                    turnContext: turnContext
+                                ))
+                                answer = codexResult.finalText
+                                codexAppServerPromptTokens = codexResult.promptTokens
+                                codexAppServerCompletionTokens = codexResult.completionTokens
+                                gatewayLogEventInfo(
+                                    "gateway/model",
+                                    "model.response",
+                                    "codex app-server turn completed",
+                                    meta: codexResult.metadata
+                                )
+                            } else if (streamingEnabled) {
                                 let response = agent.asyncChat(modelInput)
                                 var lastChunkContent = ""
                                 try {
@@ -1207,8 +1255,8 @@ public class AgentBridge {
                         runtimePopToolInvocationPolicyContext()
                     }
                     let usagePair = gatewayFinishUsageCapture()
-                    successfulPromptTokens = usagePair[0]
-                    successfulCompletionTokens = usagePair[1]
+                    successfulPromptTokens = if (codexAppServerPromptTokens >= 0) { codexAppServerPromptTokens } else { usagePair[0] }
+                    successfulCompletionTokens = if (codexAppServerCompletionTokens >= 0) { codexAppServerCompletionTokens } else { usagePair[1] }
                     successfulModelName = currModel.fullName
                     let modelCallFinishedAtMs = DateTime.now().toUnixTimeStamp().toMilliseconds()
                     gatewayLogReplyMemory(

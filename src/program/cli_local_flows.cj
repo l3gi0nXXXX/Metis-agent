@@ -5,6 +5,7 @@ import magic.jsonable.*
 
 import metis.cliapp.runEmbeddedPrompt
 import metis.core.config.{CliConfig, MetisConfigManager, MetisPaths, CliSettingManager, cliFindModelProviderDescriptor, cliModelProviderCatalogDescriptors, cliValidateProviderBaseUrl}
+import metis.core.config.{OPENAI_CODEX_OAUTH_PROVIDER_ID, OpenAICodexAuthStatus, OpenAICodexClock, OpenAICodexDeviceAuthStartResult, OpenAICodexHttpClient, OpenAICodexNativeHttpClient, OpenAICodexOAuthProfile, OpenAICodexSystemClock, addOpenAICodexManualDeviceCodeCredential, beginOpenAICodexDeviceAuth, exchangeOpenAICodexAuthorizationCode, getOpenAICodexAuthStatus, importCodexCliAuthWithConsent, openAICodexDefaultCodexHome, pollOpenAICodexDeviceToken, persistOpenAICodexLogoutAndReset, readOpenAICodexOAuthProfile, renderOpenAICodexAuthStatus, syncOpenAICodexPoolOnReauth, unsuppressOpenAICodexDeviceCodeReseed, writeOpenAICodexOAuthProfile}
 import metis.core.mcp.{mcpConfiguredServerJson, mcpConfiguredServersJson, mcpConfiguredServersPath, mcpResolveSecretOption, mcpSetConfiguredServerJson, mcpUnsetConfiguredServerJson}
 import metis.gateway.channels.telegram.telegramPairingAccountStore
 import metis.gateway.logging.gatewayLoggingCurrentLogFile
@@ -19,7 +20,7 @@ import std.convert.*
 import std.fs.{Directory, File, exists}
 import std.fs.Path
 import std.sort.*
-import stdx.encoding.json.{JsonArray, JsonBool, JsonObject, JsonString, JsonValue}
+import stdx.encoding.json.{JsonArray, JsonBool, JsonInt, JsonObject, JsonString, JsonValue}
 
 private func firstArg(args: Array<String>): String {
     if (args.isEmpty()) {
@@ -3276,6 +3277,200 @@ public func cliRunTasksFlow(args: Array<String>): Int64 {
     printUnknownLocalSubcommand("tasks", sub, "list | show | current | next | help")
 }
 
+private func cliModelsAuthHasFlag(args: Array<String>, flag: String): Bool {
+    let expected = flag.trimAscii().toAsciiLower()
+    for (arg in args) {
+        if (arg.trimAscii().toAsciiLower() == expected) {
+            return true
+        }
+    }
+    false
+}
+
+private func cliModelsAuthArgValue(args: Array<String>, flag: String): String {
+    let expected = flag.trimAscii().toAsciiLower()
+    for (idx in 0..args.size) {
+        if (args[idx].trimAscii().toAsciiLower() == expected && idx + 1 < args.size) {
+            return args[idx + 1].trimAscii()
+        }
+    }
+    ""
+}
+
+private func cliModelsAuthHttpClient(httpClient: Option<OpenAICodexHttpClient>): OpenAICodexHttpClient {
+    match (httpClient) {
+        case Some(client) => client
+        case None => OpenAICodexNativeHttpClient()
+    }
+}
+
+private func cliOpenAICodexStatusJson(status: OpenAICodexAuthStatus): JsonObject {
+    let out = JsonObject()
+    out.put("provider", JsonString(OPENAI_CODEX_OAUTH_PROVIDER_ID))
+    out.put("status", JsonString(status.status))
+    out.put("loggedIn", JsonBool(status.loggedIn))
+    out.put("source", JsonString(status.source))
+    out.put("accountLabel", JsonString(status.accountLabel))
+    out.put("tokenPreview", JsonString(status.tokenPreview))
+    out.put("lastRefreshUnixSeconds", JsonInt(status.lastRefreshUnixSeconds))
+    out.put("expiresAtUnixSeconds", JsonInt(status.expiresAtUnixSeconds))
+    out.put("oauthConfigured", JsonBool(status.oauthConfigured))
+    out
+}
+
+private func cliRenderOpenAICodexDeviceStart(start: OpenAICodexDeviceAuthStartResult): String {
+    "OpenAI Codex device login\nOpen: ${start.verificationUrl}\nCode: ${start.userCode}\nWaiting for browser authorization..."
+}
+
+private func cliOpenAICodexAuthUsage(): String {
+    "Usage: metis models auth openai-codex status|login|logout|add|import-codex-cli\n" +
+        "Aliases: metis models auth add openai-codex\n" +
+        "Use --json for machine-readable output. Use import-codex-cli --yes to import an existing Codex CLI auth.json."
+}
+
+private func cliOpenAICodexActionAndProvider(args: Array<String>): (String, String) {
+    let first = firstArg(args)
+    let second = argAt(args, 1).toAsciiLower()
+    if (first == OPENAI_CODEX_OAUTH_PROVIDER_ID || first == "codex") {
+        let action = if (second.isEmpty() || second.startsWith("--")) { "status" } else { second }
+        return (action, OPENAI_CODEX_OAUTH_PROVIDER_ID)
+    }
+    if (first == "add") {
+        return ("add", if (second.isEmpty() || second.startsWith("--")) { OPENAI_CODEX_OAUTH_PROVIDER_ID } else { second })
+    }
+    if (first == "status" || first == "login" || first == "logout" || first == "import" || first == "import-codex-cli") {
+        return (first, if (second.isEmpty() || second.startsWith("--")) { OPENAI_CODEX_OAUTH_PROVIDER_ID } else { second })
+    }
+    ("", "")
+}
+
+private func cliOpenAICodexFinishSingletonLogin(
+    profile: OpenAICodexOAuthProfile,
+    previousProfile: Option<OpenAICodexOAuthProfile>,
+    clock: OpenAICodexClock
+): String {
+    let persisted = writeOpenAICodexOAuthProfile(profile)
+    let _synced = syncOpenAICodexPoolOnReauth(previousProfile, persisted)
+    unsuppressOpenAICodexDeviceCodeReseed()
+    CliSettingManager.applyPersistedFieldsToCliConfig()
+    renderOpenAICodexAuthStatus(getOpenAICodexAuthStatus(clock))
+}
+
+private func cliRunOpenAICodexDeviceLogin(
+    args: Array<String>,
+    httpClient: OpenAICodexHttpClient,
+    clock: OpenAICodexClock,
+    emitProgress!: Bool,
+    manualPool!: Bool
+): (String, Int64) {
+    let lines = ArrayList<String>()
+    let start = beginOpenAICodexDeviceAuth(httpClient)
+    if (start.status != "pending") {
+        return ("OpenAI Codex OAuth login failed: ${start.message} ${start.errorCode}".trimAscii(), CLI_EXIT_USAGE_ERROR)
+    }
+    let startText = cliRenderOpenAICodexDeviceStart(start)
+    if (emitProgress) {
+        PrintUtils.printLine(startText)
+    } else {
+        lines.add(startText)
+    }
+    let poll = pollOpenAICodexDeviceToken(
+        start.deviceAuthId,
+        start.userCode,
+        httpClient,
+        pollIntervalSeconds: start.pollIntervalSeconds,
+        maxWaitSeconds: start.expiresInSeconds,
+        sleepBetweenPolls: emitProgress
+    )
+    if (poll.status != "authorized") {
+        lines.add("OpenAI Codex OAuth login failed: ${poll.message} ${poll.errorCode}".trimAscii())
+        return (String.join(lines.toArray(), delimiter: "\n"), CLI_EXIT_USAGE_ERROR)
+    }
+    let exchange = exchangeOpenAICodexAuthorizationCode(
+        poll.authorizationCode,
+        poll.codeVerifier,
+        httpClient,
+        clock,
+        source: if (manualPool) { "manual:device_code" } else { "device-code" }
+    )
+    match (exchange.profile) {
+        case Some(profile) =>
+            if (manualPool) {
+                let label = cliModelsAuthArgValue(args, "--label")
+                let entry = addOpenAICodexManualDeviceCodeCredential(if (label.isEmpty()) { "OpenAI Codex manual device-code" } else { label }, profile)
+                lines.add("OpenAI Codex account added: ${entry.id} (${entry.source}).")
+            } else {
+                lines.add(cliOpenAICodexFinishSingletonLogin(profile, readOpenAICodexOAuthProfile(), clock))
+            }
+            (String.join(lines.toArray(), delimiter: "\n"), CLI_EXIT_OK)
+        case None =>
+            lines.add("OpenAI Codex OAuth login failed: ${exchange.message} ${exchange.errorCode}".trimAscii())
+            (String.join(lines.toArray(), delimiter: "\n"), CLI_EXIT_USAGE_ERROR)
+    }
+}
+
+public func executeCliModelsAuthCommand(
+    args: Array<String>,
+    httpClient!: Option<OpenAICodexHttpClient> = None<OpenAICodexHttpClient>,
+    clock!: OpenAICodexClock = OpenAICodexSystemClock(),
+    emitProgress!: Bool = false
+): (String, Int64) {
+    let (action, provider) = cliOpenAICodexActionAndProvider(args)
+    if (provider != OPENAI_CODEX_OAUTH_PROVIDER_ID || action.isEmpty()) {
+        return (cliOpenAICodexAuthUsage(), CLI_EXIT_USAGE_ERROR)
+    }
+    let wantsJson = localArgsWantJson(args)
+    if (action == "status") {
+        let status = getOpenAICodexAuthStatus(clock)
+        if (wantsJson) {
+            return (cliOpenAICodexStatusJson(status).toJsonString(), CLI_EXIT_OK)
+        }
+        return (renderOpenAICodexAuthStatus(status), CLI_EXIT_OK)
+    }
+    if (action == "logout") {
+        let result = persistOpenAICodexLogoutAndReset()
+        CliSettingManager.applyPersistedFieldsToCliConfig()
+        if (wantsJson) {
+            let out = JsonObject()
+            out.put("provider", JsonString(OPENAI_CODEX_OAUTH_PROVIDER_ID))
+            out.put("status", JsonString(result.status))
+            out.put("removedProfile", JsonBool(result.removedProfile))
+            out.put("resetProvider", JsonBool(result.resetProvider))
+            return (out.toJsonString(), CLI_EXIT_OK)
+        }
+        return ("Logged out of OpenAI Codex. ${result.message}", CLI_EXIT_OK)
+    }
+    if (action == "import" || action == "import-codex-cli") {
+        let consent = cliModelsAuthHasFlag(args, "--yes") || cliModelsAuthHasFlag(args, "--confirm")
+        let homeOverride = cliModelsAuthArgValue(args, "--codex-home")
+        let codexHome = if (homeOverride.isEmpty()) { openAICodexDefaultCodexHome() } else { Path(homeOverride) }
+        let result = importCodexCliAuthWithConsent(codexHome, consent)
+        if (result.status == "ok") {
+            CliSettingManager.applyPersistedFieldsToCliConfig()
+            return ("Imported OpenAI Codex OAuth credentials from Codex CLI auth.json.\n${renderOpenAICodexAuthStatus(getOpenAICodexAuthStatus(clock))}", CLI_EXIT_OK)
+        }
+        let message = match (result.error) {
+            case Some(err) => err.message
+            case None => "Codex CLI auth import failed."
+        }
+        return ("OpenAI Codex CLI auth import failed: ${message}", CLI_EXIT_USAGE_ERROR)
+    }
+    if (action == "login") {
+        if (!cliModelsAuthHasFlag(args, "--force")) {
+            match (readOpenAICodexOAuthProfile()) {
+                case Some(_profile) =>
+                    return ("${renderOpenAICodexAuthStatus(getOpenAICodexAuthStatus(clock))}\nUse `metis models auth openai-codex login --force` to re-authenticate.", CLI_EXIT_OK)
+                case None => ()
+            }
+        }
+        return cliRunOpenAICodexDeviceLogin(args, cliModelsAuthHttpClient(httpClient), clock, emitProgress: emitProgress, manualPool: false)
+    }
+    if (action == "add") {
+        return cliRunOpenAICodexDeviceLogin(args, cliModelsAuthHttpClient(httpClient), clock, emitProgress: emitProgress, manualPool: true)
+    }
+    (cliOpenAICodexAuthUsage(), CLI_EXIT_USAGE_ERROR)
+}
+
 public func cliRunModelsFlow(args: Array<String>): Int64 {
     let sub = firstArg(args)
     if (sub.isEmpty() || sub == "help") {
@@ -3307,6 +3502,13 @@ public func cliRunModelsFlow(args: Array<String>): Int64 {
         return localPrintCommandResult(args, obj)
     }
     if (sub == "auth") {
+        if (args.size > 1) {
+            let (text, code) = executeCliModelsAuthCommand(args[1..], emitProgress: true)
+            if (!text.trimAscii().isEmpty()) {
+                PrintUtils.printLine(text)
+            }
+            return code
+        }
         let obj = buildCommandEnvelope("models", "auth")
         obj.put("groups", cliBuildModelAuthChoiceGroups())
         obj.put("authChoices", cliBuildModelAuthChoiceCatalog())

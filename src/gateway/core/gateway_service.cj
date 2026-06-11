@@ -3064,6 +3064,7 @@ public class GatewayService {
             case "new" | "reset" => this.renderTelegramSessionLifecycleCommand(text, user, sessionKey)
             case "compact" => this.renderTelegramCompactCommand(text, user, sessionKey)
             case "think" | "reasoning" | "fast" | "verbose" | "send" | "usage" | "queue" | "elevated" | "exec" => this.renderTelegramSessionOptionCommand(spec.command, text, user, sessionKey)
+            case "codex-runtime" => this.renderTelegramGatewaySlashCommand(text, message, accountId, user, sessionKey)
             case "tasks" => this.renderTelegramTasksCommand(user, sessionKey)
             case "context" => this.renderTelegramContextCommand(message, accountId, sessionKey)
             case "plugins" => this.renderTelegramPluginsCommand(text, user, message.senderId)
@@ -3109,6 +3110,25 @@ public class GatewayService {
         }
         let input = if (parts.size > 1) { parts[1].trimAscii() } else { "" }
         let prompt = if (input.isEmpty()) { "/${name}" } else { "/${name} ${input}" }
+        let request = gatewaySessionRequestFromInbound(message, sessionHint: sessionKey, accountId: accountId)
+        let turn = gatewayExecuteSessionRequestTurnForUser(user, request, prompt)
+        turn.execution.answer
+    }
+
+    private func renderTelegramGatewaySlashCommand(
+        text: String,
+        message: InboundMessage,
+        accountId: String,
+        user: GatewayUserSettings,
+        sessionKey: String
+    ): String {
+        let command = gatewayTelegramNativeCommandNameFromText(text).replace("_", "-")
+        let args = gatewayTelegramNativeCommandArgsFromText(text)
+        let prompt = if (args.trimAscii().isEmpty()) {
+            "/${command}"
+        } else {
+            "/${command} ${args.trimAscii()}"
+        }
         let request = gatewaySessionRequestFromInbound(message, sessionHint: sessionKey, accountId: accountId)
         let turn = gatewayExecuteSessionRequestTurnForUser(user, request, prompt)
         turn.execution.answer

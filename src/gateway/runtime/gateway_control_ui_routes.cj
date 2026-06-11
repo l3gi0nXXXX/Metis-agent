@@ -79,6 +79,12 @@ public func gatewayRegisterControlUiRoutes(server: Server, cfg: GatewayConfig): 
     GatewayControlUiRuntime.registerRoute(server, cfg, "/api/models", { ctx =>
         gatewayControlUiReplyJson(ctx, "models.status", { => gatewayDashboardBuildModelsJson() })
     })
+    GatewayControlUiRuntime.registerRoute(server, cfg, "/api/oauth/openai-codex/status", { ctx =>
+        gatewayControlUiReplyJson(ctx, "models.auth.openai-codex.status", { => gatewayOpenAICodexAuthStatusResultJson().toJsonString() })
+    })
+    GatewayControlUiRuntime.registerRoute(server, cfg, "/api/oauth/openai-codex/start", { ctx =>
+        gatewayControlUiReplyJson(ctx, "models.auth.openai-codex.start", { => gatewayOpenAICodexAuthStartResultJson().toJsonString() })
+    })
     GatewayControlUiRuntime.registerRoute(server, cfg, "/api/model", { ctx =>
         gatewayControlUiReplyJson(ctx, "config.apply", { => gatewayDashboardHandleModelSwitch(ctx) })
     })

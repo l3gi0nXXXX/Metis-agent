@@ -491,6 +491,16 @@ private func cfgEnsureObject(root: JsonObject, key: String): JsonObject {
     }
 }
 
+private func cfgObjectWithoutKey(root: JsonObject, keyToRemove: String): JsonObject {
+    let out = JsonObject()
+    for ((key, value) in root.getFields()) {
+        if (key != keyToRemove) {
+            out.put(key, value)
+        }
+    }
+    out
+}
+
 private func rootHasExplicitUserConfig(root: JsonObject): Bool {
     for (key in ["gateway", "session", "tools", "models", "auth", "channels", "plugins", "wizard", "memory"]) {
         match (cfgGetObject(root, key)) {
@@ -2139,8 +2149,97 @@ public class MetisConfigManager {
         value
     }
 
+    public static func readAuthProfile(profileId: String): Option<JsonObject> {
+        match (rawConfig()) {
+            case Some(root) =>
+                match (cfgGetObject(root, "auth")) {
+                    case Some(auth) =>
+                        match (cfgGetObject(auth, "profiles")) {
+                            case Some(profiles) =>
+                                match (profiles.get(profileId.trimAscii())) {
+                                    case Some(value) =>
+                                        try {
+                                            Some(JsonValue.fromStr(value.asObject().toJsonString()).asObject())
+                                        } catch (_: Exception) {
+                                            None
+                                        }
+                                    case None => None
+                                }
+                            case None => None
+                        }
+                    case None => None
+                }
+            case None => None
+        }
+    }
+
+    public static func writeAuthProfile(profileId: String, profile: JsonObject): Unit {
+        let key = profileId.trimAscii()
+        if (key.isEmpty()) {
+            throw Exception("auth profile id cannot be empty")
+        }
+        let root = mutableRoot()
+        let auth = cfgEnsureObject(root, "auth")
+        let profiles = cfgEnsureObject(auth, "profiles")
+        profiles.put(key, JsonValue.fromStr(profile.toJsonString()).asObject())
+        writeRoot(root)
+        applyPersistedFieldsToCliConfig()
+    }
+
+    public static func removeAuthProfile(profileId: String): Bool {
+        let root = mutableRoot()
+        var removed = false
+        match (cfgGetObject(root, "auth")) {
+            case Some(auth) =>
+                match (cfgGetObject(auth, "profiles")) {
+                    case Some(profiles) =>
+                        if (profiles.get(profileId.trimAscii()).isSome()) {
+                            auth.put("profiles", cfgObjectWithoutKey(profiles, profileId.trimAscii()))
+                            removed = true
+                        }
+                    case None => ()
+                }
+            case None => ()
+        }
+        if (removed) {
+            writeRoot(root)
+            applyPersistedFieldsToCliConfig()
+        }
+        removed
+    }
+
+    public static func removeProviderApiKeyIfPresent(providerId: String): Bool {
+        let canonicalProvider = canonicalModelProviderId(providerId)
+        let root = mutableRoot()
+        var removed = false
+        match (cfgGetObject(root, "models")) {
+            case Some(models) =>
+                match (cfgGetObject(models, "providers")) {
+                    case Some(providers) =>
+                        match (cfgGetObject(providers, canonicalProvider)) {
+                            case Some(provider) =>
+                                if (provider.get("apiKey").isSome()) {
+                                    providers.put(canonicalProvider, cfgObjectWithoutKey(provider, "apiKey"))
+                                    removed = true
+                                }
+                            case None => ()
+                        }
+                    case None => ()
+                }
+            case None => ()
+        }
+        if (removed) {
+            writeRoot(root)
+            applyPersistedFieldsToCliConfig()
+        }
+        removed
+    }
+
     public static func setProviderApiKey(providerId: String, apiKey: String): String {
         let canonicalProvider = canonicalModelProviderId(providerId)
+        if (canonicalProvider == "openai-codex") {
+            throw Exception("openai-codex uses OAuth profile auth; refusing to write provider apiKey.")
+        }
         let value = apiKey.trimAscii()
         let root = mutableRoot()
         let models = cfgEnsureObject(root, "models")
@@ -2168,12 +2267,14 @@ public class MetisConfigManager {
         let provider = cfgEnsureObject(providers, canonicalProvider)
         provider.put("baseUrl", JsonString(value))
 
-        let auth = cfgEnsureObject(root, "auth")
-        let profiles = cfgEnsureObject(auth, "profiles")
-        let profile = cfgEnsureObject(profiles, "${canonicalProvider}:default")
-        profile.put("provider", JsonString(canonicalProvider))
-        profile.put("authMethod", JsonString("api-key"))
-        profile.put("baseUrl", JsonString(value))
+        if (canonicalProvider != "openai-codex") {
+            let auth = cfgEnsureObject(root, "auth")
+            let profiles = cfgEnsureObject(auth, "profiles")
+            let profile = cfgEnsureObject(profiles, "${canonicalProvider}:default")
+            profile.put("provider", JsonString(canonicalProvider))
+            profile.put("authMethod", JsonString("api-key"))
+            profile.put("baseUrl", JsonString(value))
+        }
         writeRoot(root)
         applyPersistedFieldsToCliConfig()
         value

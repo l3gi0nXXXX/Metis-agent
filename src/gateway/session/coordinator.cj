@@ -779,6 +779,9 @@ public func gatewayResolveSessionContext(request: GatewaySessionRequest): Gatewa
         accountId: request.accountId,
         peerId: request.peerId,
         threadId: request.threadId,
+        senderId: request.senderId,
+        operatorScopes: request.operatorScopes,
+        chatType: request.chatType,
         route: turnRoute,
         agentScope: scope
     )

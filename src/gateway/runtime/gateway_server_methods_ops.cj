@@ -2,18 +2,44 @@ package metis.gateway.runtime
 
 import magic.jsonable.*
 
-import metis.core.config.{CliConfig, GatewayUserSettings, MetisConfigManager, MetisPaths}
+import metis.core.config.{CliConfig, GatewayUserSettings, MetisConfigManager, MetisPaths, OPENAI_CODEX_OAUTH_PROVIDER_ID, OpenAICodexClock, OpenAICodexHttpClient, OpenAICodexNativeHttpClient, OpenAICodexSystemClock, getOpenAICodexAuthStatus, startOpenAICodexDashboardDeviceFlow}
 import metis.gateway.config.buildGatewayConfigFromUserSettings
 import metis.gateway.core.gatewayAgentTeamDoctorScan
 import metis.gateway.logging.{gatewayLoggingCurrentLogFile, gatewayLoggingResolveSettings}
 import metis.gateway.model.GatewayConfig
 import metis.core.model.CliModelManager
+import metis.core.model.renderOpenAICodexDashboardStatus
 
 import std.collection.ArrayList
 import std.convert.Parsable
 import std.fs.{Directory, FileInfo, Path, exists}
-import stdx.encoding.json.{JsonArray, JsonObject, JsonString, JsonValue}
+import stdx.encoding.json.{JsonArray, JsonBool, JsonInt, JsonObject, JsonString, JsonValue}
 import std.sort.*
+
+private var gatewayOpenAICodexAuthHttpClientForTest: Option<OpenAICodexHttpClient> = None<OpenAICodexHttpClient>
+private var gatewayOpenAICodexAuthClockForTest: Option<OpenAICodexClock> = None<OpenAICodexClock>
+
+public func setGatewayOpenAICodexAuthRuntimeForTest(
+    httpClient: Option<OpenAICodexHttpClient>,
+    clock: Option<OpenAICodexClock>
+): Unit {
+    gatewayOpenAICodexAuthHttpClientForTest = httpClient
+    gatewayOpenAICodexAuthClockForTest = clock
+}
+
+private func gatewayOpenAICodexAuthHttpClient(): OpenAICodexHttpClient {
+    match (gatewayOpenAICodexAuthHttpClientForTest) {
+        case Some(client) => client
+        case None => OpenAICodexNativeHttpClient()
+    }
+}
+
+private func gatewayOpenAICodexAuthClock(): OpenAICodexClock {
+    match (gatewayOpenAICodexAuthClockForTest) {
+        case Some(clock) => clock
+        case None => OpenAICodexSystemClock()
+    }
+}
 
 private func gatewayOpsStringParam(request: GatewayRpcRequest, keys: Array<String>, defaultValue: String): String {
     for (key in keys) {
@@ -560,6 +586,54 @@ private func gatewayModelGetJson(modelId: String): JsonObject {
     result.put("owner", JsonString(if (normalized.contains(":")) { normalized.split(":")[0] } else { "metis" }))
     result.put("fallback", CliConfig.fallbackModels.contains(normalized).toJsonValue())
     result
+}
+
+private func gatewayOpenAICodexAuthStatusJson(): JsonObject {
+    let status = getOpenAICodexAuthStatus(gatewayOpenAICodexAuthClock())
+    let out = JsonObject()
+    out.put("provider", JsonString(OPENAI_CODEX_OAUTH_PROVIDER_ID))
+    out.put("status", JsonString(status.status))
+    out.put("loggedIn", JsonBool(status.loggedIn))
+    out.put("source", JsonString(status.source))
+    out.put("accountLabel", JsonString(status.accountLabel))
+    out.put("tokenPreview", JsonString(status.tokenPreview))
+    out.put("lastRefreshUnixSeconds", JsonInt(status.lastRefreshUnixSeconds))
+    out.put("expiresAtUnixSeconds", JsonInt(status.expiresAtUnixSeconds))
+    out.put("oauthConfigured", JsonBool(status.oauthConfigured))
+    out
+}
+
+public func gatewayOpenAICodexAuthStatusResultJson(): JsonObject {
+    let status = gatewayOpenAICodexAuthStatusJson()
+    let result = JsonObject()
+    result.put("providerId", JsonString(OPENAI_CODEX_OAUTH_PROVIDER_ID))
+    result.put("auth", status)
+    result.put("dashboard", renderOpenAICodexDashboardStatus(status))
+    result
+}
+
+public func gatewayOpenAICodexAuthStartResultJson(): JsonObject {
+    let flow = startOpenAICodexDashboardDeviceFlow(
+        gatewayOpenAICodexAuthHttpClient(),
+        gatewayOpenAICodexAuthClock()
+    )
+    let result = gatewayOpenAICodexAuthStatusResultJson()
+    result.put("flow", flow)
+    result
+}
+
+private func gatewayOpsIsOpenAICodexAuthStatusMethod(method: String): Bool {
+    method == "models.auth.openai-codex.status" ||
+        method == "models.auth.openai_codex.status" ||
+        method == "oauth.openai-codex.status" ||
+        method == "oauth.openai_codex.status"
+}
+
+private func gatewayOpsIsOpenAICodexAuthStartMethod(method: String): Bool {
+    method == "models.auth.openai-codex.start" ||
+        method == "models.auth.openai_codex.start" ||
+        method == "oauth.openai-codex.start" ||
+        method == "oauth.openai_codex.start"
 }
 
 private func gatewayLogsStatusJson(): JsonObject {
@@ -1856,6 +1930,12 @@ public func handleGatewayOpsFamily(method: String, user: GatewayUserSettings, re
         let result = JsonObject()
         result.put("models", gatewayModelsStatusJson())
         return Some(GatewayRpcResponse(true, method, result: result))
+    }
+    if (gatewayOpsIsOpenAICodexAuthStatusMethod(method)) {
+        return Some(GatewayRpcResponse(true, method, result: gatewayOpenAICodexAuthStatusResultJson()))
+    }
+    if (gatewayOpsIsOpenAICodexAuthStartMethod(method)) {
+        return Some(GatewayRpcResponse(true, method, result: gatewayOpenAICodexAuthStartResultJson()))
     }
     if (method == "models.get") {
         let modelId = gatewayOpsStringParam(requestValue, ["id", "model", "modelId"], CliConfig.model)

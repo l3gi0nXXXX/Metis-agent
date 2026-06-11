@@ -30,7 +30,9 @@ public func gatewayResolveRequiredOperatorScope(method: String): String {
         m == "channels.status" || m == "channels.list" || m == "channels.runtime" || m == "channels.manager" ||
         m == "plugins.status" || m == "plugins.list" || m == "plugins.runtime" || m == "plugins.manager" ||
         m == "plugins.actions" || m == "plugins.approvals" || m == "plugins.package_state" || m == "plugins.setup" ||
-        m == "models.status" || m == "models.list" || m == "logs.status" || m == "logs.list" || m == "doctor" ||
+        m == "models.status" || m == "models.list" || m == "models.auth.openai-codex.status" ||
+        m == "models.auth.openai_codex.status" || m == "oauth.openai-codex.status" || m == "oauth.openai_codex.status" ||
+        m == "logs.status" || m == "logs.list" || m == "doctor" ||
         m == "nodes.status" || m == "devices.status" || m == "push.status" ||
         m == "usage-cost" || m == "secrets.status" || m == "canvas.status" || m == "talk.status" ||
         m == "http.models" || m == "http.mcp") {

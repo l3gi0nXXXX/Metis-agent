@@ -106,6 +106,7 @@ public func gatewayTelegramNativeCommandCatalog(): Array<GatewayTelegramNativeCo
         spec("think", "Set thinking level.", "options", args: ["level"], menu: ["off", "minimal", "low", "medium", "high", "xhigh"], aliases: ["thinking", "t"]),
         spec("verbose", "Toggle verbose mode.", "options", args: ["mode"], menu: ["on", "off"], aliases: ["v"]),
         spec("fast", "Toggle fast mode.", "options", args: ["mode"], menu: ["status", "on", "off"]),
+        spec("codex-runtime", "Toggle Codex app-server runtime.", "options", aliases: ["codex_runtime"], args: ["mode"], menu: ["status", "on", "off"]),
         spec("reasoning", "Toggle reasoning visibility.", "options", args: ["mode"], menu: ["on", "off", "stream"], aliases: ["reason"]),
         spec("elevated", "Toggle elevated mode.", "options", auth: "operator", args: ["mode"], menu: ["on", "off", "ask", "full"], aliases: ["elev"]),
         spec("exec", "Set exec defaults for this session.", "options", auth: "operator", args: ["host", "security", "ask", "node"], menu: ["sandbox", "gateway", "node"]),
@@ -122,12 +123,14 @@ public func gatewayFindTelegramNativeCommandSpec(raw: String): Option<GatewayTel
     if (normalized.isEmpty()) {
         return None
     }
+    let normalizedAlias = normalized.replace("_", "-")
     for (entry in gatewayTelegramNativeCommandCatalog()) {
-        if (entry.command == normalized) {
+        if (entry.command == normalized || entry.command == normalizedAlias) {
             return Some(entry)
         }
         for (alias in entry.aliases) {
-            if (alias.trimAscii().toAsciiLower() == normalized) {
+            let cleanAlias = alias.trimAscii().toAsciiLower()
+            if (cleanAlias == normalized || cleanAlias.replace("_", "-") == normalizedAlias) {
                 return Some(entry)
             }
         }

@@ -1,6 +1,7 @@
 package metis.gateway.core
 
-import metis.core.config.{CliConfig, CliSettingManager, MetisConfigManager, MetisProcessEnvironmentLock}
+import metis.core.config.{CliConfig, CliSettingManager, MetisConfigManager, MetisProcessEnvironmentLock, OpenAICodexOAuthProfile, writeOpenAICodexOAuthProfile}
+import metis.core.model.{CodexResponsesHttpRequest, CodexResponsesHttpResult, CodexResponsesHttpRunner, setCodexResponsesHttpRunnerForTest}
 import metis.gateway.session.{GatewayIngressSource, GatewaySessionRequest, GatewayTurnContext, gatewayResolveSessionContext}
 
 import std.collection.ArrayList
@@ -8,7 +9,7 @@ import std.env.{getVariable, setVariable}
 import std.fs.{Directory, File, Path, exists, remove}
 import std.time.DateTime
 import std.unittest.testmacro.*
-import stdx.encoding.json.{JsonArray, JsonObject, JsonString, JsonValue}
+import stdx.encoding.json.{JsonArray, JsonInt, JsonObject, JsonString, JsonValue}
 
 private func withAgentBridgeTempHome<T>(label: String, block: (Path) -> T): T {
     synchronized(MetisProcessEnvironmentLock) {
@@ -63,6 +64,55 @@ private func writeAgentBridgeAgentConfig(home: Path): Unit {
     CliSettingManager.invalidate()
 }
 
+private func writeAgentBridgeCodexAppServerAgentConfig(home: Path): Unit {
+    let root = JsonObject()
+    let agents = JsonObject()
+    let defaults = JsonObject()
+    defaults.put("workspace", JsonString(home.join("workspaces").toString()))
+    agents.put("defaults", defaults)
+    let list = JsonArray([])
+    let entry = JsonObject()
+    entry.put("id", JsonString("codex"))
+    entry.put("workspace", JsonString(home.join("workspaces").join("codex").toString()))
+    entry.put("agentDir", JsonString(home.join("agents").join("codex").join("agent").toString()))
+    let model = JsonObject()
+    model.put("primary", JsonString("openai-codex:gpt-5.5"))
+    model.put("fallbacks", JsonArray([]))
+    model.put("openaiRuntime", JsonString("codex_app_server"))
+    entry.put("model", model)
+    list.add(entry)
+    agents.put("list", list)
+    root.put("agents", agents)
+    File.writeTo(MetisConfigManager.configPath(), root.toJsonString().toArray())
+    CliConfig.invalidatePathCache()
+    MetisConfigManager.invalidate()
+    CliSettingManager.invalidate()
+}
+
+private func writeAgentBridgeCodexResponsesAgentConfig(home: Path): Unit {
+    let root = JsonObject()
+    let agents = JsonObject()
+    let defaults = JsonObject()
+    defaults.put("workspace", JsonString(home.join("workspaces").toString()))
+    agents.put("defaults", defaults)
+    let list = JsonArray([])
+    let entry = JsonObject()
+    entry.put("id", JsonString("codex"))
+    entry.put("workspace", JsonString(home.join("workspaces").join("codex").toString()))
+    entry.put("agentDir", JsonString(home.join("agents").join("codex").join("agent").toString()))
+    let model = JsonObject()
+    model.put("primary", JsonString("openai-codex:gpt-5.5"))
+    model.put("fallbacks", JsonArray([]))
+    entry.put("model", model)
+    list.add(entry)
+    agents.put("list", list)
+    root.put("agents", agents)
+    File.writeTo(MetisConfigManager.configPath(), root.toJsonString().toArray())
+    CliConfig.invalidatePathCache()
+    MetisConfigManager.invalidate()
+    CliSettingManager.invalidate()
+}
+
 private func writeAgentBridgeAuthProfile(path: Path, provider: String, secret: String): Unit {
     Directory.create(path.parent, recursive: true)
     let root = JsonObject()
@@ -76,6 +126,22 @@ private func writeAgentBridgeAuthProfile(path: Path, provider: String, secret: S
 
 private func readAgentBridgeJson(path: Path): JsonObject {
     JsonValue.fromStr(String.fromUtf8(File.readFrom(path))).asObject()
+}
+
+private func agentBridgeJsonString(obj: JsonObject, key: String): String {
+    match (obj.get(key)) {
+        case Some(value) => try { return value.asString().getValue().trimAscii() } catch (_: Exception) { () }
+        case None => ()
+    }
+    ""
+}
+
+private func agentBridgeJsonBool(obj: JsonObject, key: String): Bool {
+    match (obj.get(key)) {
+        case Some(value) => try { return value.asBool().getValue() } catch (_: Exception) { () }
+        case None => ()
+    }
+    false
 }
 
 private class MockGitCodeMcpRuntimeAdapter <: GatewayGitCodeMcpRuntimeAdapter {
@@ -94,6 +160,24 @@ private class MockGitCodeMcpRuntimeAdapter <: GatewayGitCodeMcpRuntimeAdapter {
         out.put("providerClientConstructed", JsonValue.fromStr("false"))
         out
     }
+}
+
+private class AgentBridgeCodexAppServerCapture {
+    public var called: Bool = false
+    public var workspace: String = ""
+    public var model: String = ""
+    public var input: String = ""
+
+    public init() {}
+}
+
+private class AgentBridgeCodexResponsesCapture {
+    public var callCount: Int64 = 0
+    public let urls = ArrayList<String>()
+    public let bodies = ArrayList<JsonObject>()
+    public let authHeaders = ArrayList<String>()
+
+    public init() {}
 }
 
 @Test
@@ -487,6 +571,168 @@ public class AgentBridgeRuntimeTest {
             @Expect(writerRuntime.contains("ops-secret-never-log"), false)
             @Expect(opsRuntime.contains("writer-secret-never-log"), false)
             @Expect(opsRuntime.contains("ops-secret-never-log"), false)
+        })
+    }
+
+    @TestCase
+    public func codexAppServerBranchRunsInsideAgentBridgeAttemptWithoutRealCli(): Unit {
+        withAgentBridgeTempHome("metis-m6-agent-bridge-codex-app-server", { home: Path =>
+            writeAgentBridgeCodexAppServerAgentConfig(home)
+            let context = gatewayResolveSessionContext(
+                GatewaySessionRequest(
+                    GatewayIngressSource.DashboardRpc,
+                    sessionHint: "main",
+                    agentId: "codex"
+                )
+            )
+            let capture = AgentBridgeCodexAppServerCapture()
+            setGatewayCodexAppServerRunnerForTest(Some({ request: GatewayCodexAppServerTurnRequest =>
+                capture.called = true
+                capture.workspace = request.workspaceDir
+                capture.model = request.modelName
+                capture.input = gatewayBuildCodexAppServerInput(request.systemPrompt, request.modelInput)
+                let usage = JsonObject()
+                usage.put("promptTokens", JsonInt(12))
+                usage.put("outputTokens", JsonInt(4))
+                GatewayCodexAppServerRuntimeResult(
+                    "codex app-server reply",
+                    threadId: "thread-m6",
+                    turnId: "turn-m6",
+                    completed: true,
+                    promptTokens: 12,
+                    completionTokens: 4,
+                    usage: Some(usage),
+                    metadata: gatewayCodexAppServerRuntimeMetadata(
+                        request.modelName,
+                        request.channelName,
+                        request.sessionKey,
+                        threadId: "thread-m6",
+                        turnId: "turn-m6",
+                        completed: true,
+                        usage: Some(usage)
+                    )
+                )
+            }))
+            try {
+                let store = GatewaySessionStore(home.join("sessions"), enabled: true, agentId: "codex")
+                let bridge = AgentBridge(sessionStore: store)
+                let reply = bridge.reply(
+                    context.sessionKey,
+                    "hello codex",
+                    channelName: "dashboard",
+                    agentId: "codex",
+                    turnContext: Some(context.turnContext)
+                )
+
+                @Expect(reply, "codex app-server reply")
+                @Expect(capture.called, true)
+                @Expect(capture.workspace, home.join("workspaces").join("codex").toString())
+                @Expect(capture.model, "openai-codex:gpt-5.5")
+                @Expect(capture.input.contains("<system>"), true)
+                @Expect(capture.input.contains("<input>"), true)
+                @Expect(capture.input.contains("hello codex"), true)
+                let transcript = String.fromUtf8(File.readFrom(store.transcriptPath(context.sessionKey)))
+                @Expect(transcript.contains("codex app-server reply"), true)
+                @Expect(transcript.contains("openai-codex:gpt-5.5"), true)
+                @Expect(transcript.contains("\"usage\""), true)
+                @Expect(transcript.contains("\"input\""), true)
+                @Expect(transcript.contains("\"output\""), true)
+                @Expect(transcript.contains("12"), true)
+                @Expect(transcript.contains("4"), true)
+            } finally {
+                setGatewayCodexAppServerRunnerForTest(None<(GatewayCodexAppServerTurnRequest) -> GatewayCodexAppServerRuntimeResult>)
+            }
+        })
+    }
+
+    @TestCase
+    public func codexAppServerInputAndMetadataStayHumanSafeAndStructured(): Unit {
+        let usage = JsonObject()
+        usage.put("promptTokens", JsonInt(3))
+        usage.put("outputTokens", JsonInt(2))
+        let input = gatewayBuildCodexAppServerInput("system rule", "user: hi")
+        let meta = gatewayCodexAppServerRuntimeMetadata(
+            "openai-codex:gpt-5.5",
+            "Telegram",
+            "agent:codex:telegram:direct:u1",
+            threadId: "thread-1",
+            turnId: "turn-1",
+            completed: true,
+            interrupted: false,
+            toolIterations: 1,
+            usage: Some(usage)
+        )
+
+        @Expect(input.contains("<system>\nsystem rule\n</system>"), true)
+        @Expect(input.contains("<input>\nuser: hi\n</input>"), true)
+        @Expect(meta.get("runtime").getOrThrow().asString().getValue(), "codex_app_server")
+        @Expect(meta.get("channel").getOrThrow().asString().getValue(), "telegram")
+        @Expect(meta.get("completed").getOrThrow().asBool().getValue(), true)
+        @Expect(meta.get("toolIterations").getOrThrow().asInt().getValue(), 1)
+        @Expect(gatewayCodexAppServerUsageInt(Some(usage), "promptTokens"), 3)
+        @Expect(gatewayCodexAppServerUsageInt(Some(usage), "missing"), -1)
+    }
+
+    @TestCase
+    public func codexResponsesDefaultModelFlowsThroughGatewaySessionForImChannels(): Unit {
+        withAgentBridgeTempHome("metis-m3-codex-responses-im", { home: Path =>
+            writeAgentBridgeCodexResponsesAgentConfig(home)
+            let now = DateTime.now().toUnixTimeStamp().toSeconds()
+            let _ = writeOpenAICodexOAuthProfile(OpenAICodexOAuthProfile(
+                accessToken: "m3-access-token-never-log",
+                refreshToken: "m3-refresh-token-never-log",
+                expiresAtUnixSeconds: now + 3600,
+                lastRefreshUnixSeconds: now,
+                accountLabel: "m3",
+                source: "test"
+            ))
+            let capture = AgentBridgeCodexResponsesCapture()
+            setCodexResponsesHttpRunnerForTest(Some({ request: CodexResponsesHttpRequest =>
+                capture.callCount += 1
+                capture.urls.add(request.url)
+                capture.bodies.add(request.body)
+                capture.authHeaders.add(request.headers.get("Authorization").getOrThrow())
+                CodexResponsesHttpResult(200, body: "{\"model\":\"gpt-5.5\",\"status\":\"completed\",\"output_text\":\"codex responses ok\"}")
+            }))
+            try {
+                let store = GatewaySessionStore(home.join("sessions"), enabled: true, agentId: "codex")
+                let bridge = AgentBridge(sessionStore: store)
+                for (channel in ["telegram", "feishu", "qq"]) {
+                    let request = GatewaySessionRequest(
+                        GatewayIngressSource.Channel(channel),
+                        channelName: channel,
+                        sessionHint: "m3-${channel}",
+                        agentId: "codex",
+                        text: "hello ${channel}",
+                        accountId: "acct-${channel}",
+                        peerId: "peer-${channel}"
+                    )
+                    let turn = gatewayExecuteSessionRequestTurn(
+                        bridge,
+                        request,
+                        "hello ${channel}",
+                        streamingEnabled: false
+                    )
+                    @Expect(turn.context.channelName, channel)
+                    @Expect(turn.execution.answer, "codex responses ok")
+                    @Expect(turn.execution.delivered, false)
+                }
+
+                @Expect(capture.callCount >= 3, true)
+                for (url in capture.urls) {
+                    @Expect(url, "https://chatgpt.com/backend-api/codex/responses")
+                }
+                for (auth in capture.authHeaders) {
+                    @Expect(auth, "Bearer m3-access-token-never-log")
+                }
+                for (body in capture.bodies) {
+                    @Expect(agentBridgeJsonString(body, "model"), "gpt-5.5")
+                    @Expect(agentBridgeJsonBool(body, "store"), false)
+                    @Expect(body.get("max_output_tokens").isNone(), true)
+                }
+            } finally {
+                setCodexResponsesHttpRunnerForTest(None<CodexResponsesHttpRunner>)
+            }
         })
     }
 
