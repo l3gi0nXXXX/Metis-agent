@@ -4,7 +4,7 @@ import magic.log.LogUtils
 
 import metis.cliapp.CliApp
 import metis.core.config.CliConfig
-import metis.gateway.runtime.{gatewayCliShouldPrintRuntimeRequiredHint, gatewayInvokeCliAgent, runFeishuWebhookGatewayService, runGatewayP0Demo, runGatewayP1DemoWithFeishuWebhook}
+import metis.gateway.runtime.{gatewayApplyStartupTlsEnvironmentDefaults, gatewayCliShouldPrintRuntimeRequiredHint, gatewayInvokeCliAgent, runFeishuWebhookGatewayService, runGatewayP0Demo, runGatewayP1DemoWithFeishuWebhook}
 import metis.io.PrintUtils
 import metis.io.InputUtils
 import metis.program.{CLI_EXIT_OK, CLI_EXIT_USAGE_ERROR, cliDispatchProgramFastPath, cliProgramCommandArgs, cliProgramInteractiveMode, cliProgramShouldEnterInteractive,
@@ -67,6 +67,7 @@ private func cliRunProgramDemos(): Option<Int64> {
 }
 
 public func runCliProgram(args: Array<String>): Int64 {
+    let _ = gatewayApplyStartupTlsEnvironmentDefaults()
     let ctx = createCliProgramContext(args)
     if (let Some(code) <- cliDispatchProgramFastPath(ctx)) {
         return code
