@@ -948,6 +948,149 @@ public class ServicePluginEventDispatcherTest {
     }
 
     @TestCase
+    public func draftM3B001PendingJobJsonArrayDraftNeedsHumanReviewWithoutWriteback(): Unit {
+        // DRAFT-M3-B-001.
+        this.resetDispatcherHooks()
+        this.registerGitCodeWritebackPlugin()
+        let calls = ArrayList<String>()
+        let messages = ArrayList<String>()
+        setServicePluginGeneratedReplyHandlerForTest(Some({ _job: ServicePluginPendingJob, _event: ServicePluginAcceptedGitCodeEvent =>
+            ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "[]")
+        }))
+        setServicePluginCapabilityInvokerForTest(Some({ _registration: ServicePluginRegistration, request: CapabilityInvokeRequest =>
+            calls.add(request.capabilityId)
+            CapabilityInvokeResult(true, "ok", serviceId: "gitcode-monitor", capabilityId: request.capabilityId, payload: "{\"status\":\"posted\",\"posted\":true}")
+        }))
+        setServicePluginEventDeliveryForTest(Some({ _target: ServicePluginDeliveryTarget, text: String =>
+            messages.add(text)
+            ServicePluginEventDeliveryResult(true, "sent")
+        }))
+        try {
+            let store = this.storeWithRunningJob(jobId: "draft-m3-b-001")
+            let accepted = this.acceptedFrame(jobId: "draft-m3-b-001", eventId: "gitcode:cangjie/community:issue:draft-m3-b-001")
+            let result = dispatchServicePluginEvent(accepted, store: store)
+
+            @Expect(result.ok, true)
+            @Expect(result.status, "generated_reply_degraded_delivered")
+            @Expect(calls.size, 0)
+            @Expect(messages.size, 1)
+            @Expect(messages[0].contains("状态: needsHumanReview"), true)
+            @Expect(messages[0].contains("原始 JSON"), true)
+            @Expect(messages[0].contains("[]"), false)
+        } finally {
+            this.resetDispatcherHooks()
+        }
+    }
+
+    @TestCase
+    public func draftM3P001WebhookValidDraftWritesBackOnceAndNotifiesDraft(): Unit {
+        // DRAFT-M3-P-001.
+        this.resetDispatcherHooks()
+        this.registerGitCodeWritebackPlugin()
+        let calls = ArrayList<String>()
+        let messages = ArrayList<String>()
+        setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent =>
+            this.targetRows([this.target(channel: "telegram", peerId: "tg-peer")])
+        }))
+        setServicePluginWebhookGeneratedReplyHandlerForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent, _target: ServicePluginDeliveryTarget =>
+            ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "建议补充回归测试。")
+        }))
+        setServicePluginCapabilityInvokerForTest(Some({ _registration: ServicePluginRegistration, request: CapabilityInvokeRequest =>
+            calls.add(request.capabilityId)
+            @Expect(request.capabilityId, "gitcode.writeback.apply_result")
+            @Expect(request.payload.contains("建议补充回归测试。"), true)
+            CapabilityInvokeResult(true, "ok", serviceId: "gitcode-monitor", capabilityId: request.capabilityId, payload: "{\"status\":\"posted\",\"posted\":true,\"replyUrl\":\"https://gitcode.com/Cangjie/cangjie_tools/issues/123#note_9\"}")
+        }))
+        setServicePluginEventDeliveryForTest(Some({ _target: ServicePluginDeliveryTarget, text: String =>
+            messages.add(text)
+            ServicePluginEventDeliveryResult(true, "sent")
+        }))
+        try {
+            let result = dispatchServicePluginEvent(this.acceptedContractFrame(eventId: "gitcode:Cangjie/cangjie_tools:issue:draft-m3-p-001"), store: ServicePluginPendingJobStore())
+
+            @Expect(result.ok, true)
+            @Expect(result.status, "generated_reply_delivered")
+            @Expect(calls.toArray(), ["gitcode.writeback.apply_result"])
+            @Expect(messages.size, 1)
+            @Expect(messages[0].contains("建议补充回归测试。"), true)
+        } finally {
+            this.resetDispatcherHooks()
+        }
+    }
+
+    @TestCase
+    public func draftM3N001WebhookToolJsonDraftDoesNotWriteBackOrLeakRawJson(): Unit {
+        // DRAFT-M3-N-001.
+        this.resetDispatcherHooks()
+        this.registerGitCodeWritebackPlugin()
+        let calls = ArrayList<String>()
+        let messages = ArrayList<String>()
+        setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent =>
+            this.targetRows([this.target(channel: "telegram", peerId: "tg-peer")])
+        }))
+        setServicePluginWebhookGeneratedReplyHandlerForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent, _target: ServicePluginDeliveryTarget =>
+            ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "{\"tool\":\"functions._answer_\",\"reason\":\"当前任务只需要输出中文回复草稿\"}")
+        }))
+        setServicePluginCapabilityInvokerForTest(Some({ _registration: ServicePluginRegistration, request: CapabilityInvokeRequest =>
+            calls.add(request.capabilityId)
+            CapabilityInvokeResult(true, "ok", serviceId: "gitcode-monitor", capabilityId: request.capabilityId, payload: "{\"status\":\"posted\",\"posted\":true}")
+        }))
+        setServicePluginEventDeliveryForTest(Some({ _target: ServicePluginDeliveryTarget, text: String =>
+            messages.add(text)
+            ServicePluginEventDeliveryResult(true, "sent")
+        }))
+        try {
+            let result = dispatchServicePluginEvent(this.acceptedContractFrame(eventId: "gitcode:Cangjie/cangjie_tools:issue:draft-m3-n-001"), store: ServicePluginPendingJobStore())
+
+            @Expect(result.ok, true)
+            @Expect(result.status, "generated_reply_degraded_delivered")
+            @Expect(calls.size, 0)
+            @Expect(messages.size, 1)
+            @Expect(messages[0].contains("模型返回了工具调用 JSON"), true)
+            @Expect(messages[0].contains("\"tool\""), false)
+            @Expect(messages[0].contains("functions._answer_"), false)
+            @Expect(messages[0].contains("\"reason\""), false)
+        } finally {
+            this.resetDispatcherHooks()
+        }
+    }
+
+    @TestCase
+    public func draftM3N002WebhookSecretDraftDoesNotWriteBackOrLeakSecret(): Unit {
+        // DRAFT-M3-N-002.
+        this.resetDispatcherHooks()
+        this.registerGitCodeWritebackPlugin()
+        let calls = ArrayList<String>()
+        let messages = ArrayList<String>()
+        setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent =>
+            this.targetRows([this.target(channel: "telegram", peerId: "tg-peer")])
+        }))
+        setServicePluginWebhookGeneratedReplyHandlerForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent, _target: ServicePluginDeliveryTarget =>
+            ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "token=secret")
+        }))
+        setServicePluginCapabilityInvokerForTest(Some({ _registration: ServicePluginRegistration, request: CapabilityInvokeRequest =>
+            calls.add(request.capabilityId)
+            CapabilityInvokeResult(true, "ok", serviceId: "gitcode-monitor", capabilityId: request.capabilityId, payload: "{\"status\":\"posted\",\"posted\":true}")
+        }))
+        setServicePluginEventDeliveryForTest(Some({ _target: ServicePluginDeliveryTarget, text: String =>
+            messages.add(text)
+            ServicePluginEventDeliveryResult(true, "sent")
+        }))
+        try {
+            let result = dispatchServicePluginEvent(this.acceptedContractFrame(eventId: "gitcode:Cangjie/cangjie_tools:issue:draft-m3-n-002"), store: ServicePluginPendingJobStore())
+
+            @Expect(result.ok, true)
+            @Expect(result.status, "generated_reply_degraded_delivered")
+            @Expect(calls.size, 0)
+            @Expect(messages.size, 1)
+            @Expect(messages[0].contains("敏感信息"), true)
+            @Expect(messages[0].contains("secret"), false)
+        } finally {
+            this.resetDispatcherHooks()
+        }
+    }
+
+    @TestCase
     public func tContext001DispatcherPreservesLargeCommentReviewRequestContext(): Unit {
         this.resetDispatcherHooks()
         let calls = ArrayList<String>()

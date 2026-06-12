@@ -436,10 +436,11 @@ private func recordGitCodeAcceptedEventForFutureReply(
     }
     servicePluginGeneratedReplyKeys.add(key)
     store.markRunning(event.jobId, stage: "event_accepted")
-    let generated = match (servicePluginGeneratedReplyHandlerForTest) {
+    let rawGenerated = match (servicePluginGeneratedReplyHandlerForTest) {
         case Some(handler) => handler(job, event)
         case None => ServicePluginGeneratedReplyResult(false, status: "handler_unconfigured", diagnostic: "generated reply handler is not configured", needsHumanReview: true)
     }
+    let generated = normalizeServicePluginGeneratedReplyResult(rawGenerated)
     let writeback = servicePluginApplyGeneratedReplyWriteback(event, generated)
     let text = renderServicePluginGeneratedReplyNotification(event, generated, writeback: writeback)
     let delivery = match (servicePluginEventDeliveryForTest) {
@@ -484,10 +485,11 @@ public func dispatchGitCodeWebhookAcceptedEvent(frame: ServiceFrame, event: Serv
     var feishu: Int64 = 0
     let failures = ArrayList<String>()
     let primary = targets[0]
-    let generated = match (servicePluginWebhookGeneratedReplyHandlerForTest) {
+    let rawGenerated = match (servicePluginWebhookGeneratedReplyHandlerForTest) {
         case Some(handler) => handler(event, primary)
         case None => ServicePluginGeneratedReplyResult(false, status: "handler_unconfigured", diagnostic: "generated reply handler is not configured", needsHumanReview: true)
     }
+    let generated = normalizeServicePluginGeneratedReplyResult(rawGenerated)
     let writeback = servicePluginApplyGeneratedReplyWriteback(event, generated)
     let text = renderServicePluginGeneratedReplyNotification(event, generated, writeback: writeback)
     for (target in targets) {
@@ -785,10 +787,11 @@ private func servicePluginValidateAcceptedReviewContract(event: ServicePluginAcc
 }
 
 private func servicePluginApplyGeneratedReplyWriteback(event: ServicePluginAcceptedGitCodeEvent, result: ServicePluginGeneratedReplyResult): ServicePluginWritebackApplyState {
-    if (!result.ok || result.needsHumanReview || result.draft.trimAscii().isEmpty()) {
+    let safeResult = normalizeServicePluginGeneratedReplyResult(result)
+    if (!safeResult.ok || safeResult.needsHumanReview || safeResult.draft.trimAscii().isEmpty()) {
         return ServicePluginWritebackApplyState()
     }
-    let payload = servicePluginGeneratedReplyWritebackPayload(event, result)
+    let payload = servicePluginGeneratedReplyWritebackPayload(event, safeResult)
     let applied = invokeGitCodeWritebackApplyResult("gitcode-monitor", payload, 5000)
     servicePluginParseWritebackApplyResult(applied)
 }
@@ -924,6 +927,21 @@ private func servicePluginGeneratedReplyHumanReason(result: ServicePluginGenerat
     }
     if (status == "pr_review_timeout" || status == "review_adapter_timeout" || diagnostic.contains("review_adapter_timeout") || diagnostic.contains("adapter timeout")) {
         return "PR review 阶段超时，已保守生成草稿，需要人工确认"
+    }
+    if (status == "draft_invalid_tool_json") {
+        return "模型返回了工具调用 JSON，已拦截，需要人工确认"
+    }
+    if (status == "draft_raw_json") {
+        return "模型返回了原始 JSON，已拦截，需要人工确认"
+    }
+    if (status == "draft_contains_secret") {
+        return "模型草稿包含敏感信息，已拦截，需要人工确认"
+    }
+    if (status == "draft_contains_local_path") {
+        return "模型草稿包含本机路径，已拦截，需要人工确认"
+    }
+    if (status == "draft_forbidden_marker") {
+        return "模型草稿包含禁止标记，已拦截，需要人工确认"
     }
     if (diagnostic.isEmpty()) { status } else { diagnostic }
 }
