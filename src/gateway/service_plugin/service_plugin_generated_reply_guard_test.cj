@@ -81,4 +81,41 @@ public class ServicePluginGeneratedReplyGuardTest {
         @Expect(result.status, "draft_forbidden_marker")
         @Expect(result.needsHumanReview, true)
     }
+
+    @TestCase
+    public func draftM2U001GatewayAgentFailureIsLlmDegraded(): Unit {
+        let result = servicePluginGeneratedReplyResultFromAgentAnswer("Gateway agent failed: timeout")
+
+        @Expect(result.ok, false)
+        @Expect(result.status, "llm_degraded")
+        @Expect(result.needsHumanReview, true)
+    }
+
+    @TestCase
+    public func draftM2B001EmptyAgentAnswerIsRejected(): Unit {
+        let result = servicePluginGeneratedReplyResultFromAgentAnswer("")
+
+        @Expect(result.ok, false)
+        @Expect(result.status, "draft_empty")
+        @Expect(result.needsHumanReview, true)
+    }
+
+    @TestCase
+    public func draftM2P001NormalChineseAgentAnswerPasses(): Unit {
+        let result = servicePluginGeneratedReplyResultFromAgentAnswer("建议补充回归测试。")
+
+        @Expect(result.ok, true)
+        @Expect(result.status, "draft_generated")
+        @Expect(result.draft, "建议补充回归测试。")
+        @Expect(result.needsHumanReview, false)
+    }
+
+    @TestCase
+    public func draftM2N001Pr1036ToolJsonAgentAnswerIsRejected(): Unit {
+        let result = servicePluginGeneratedReplyResultFromAgentAnswer("{\"tool\":\"functions._answer_\",\"reason\":\"当前任务只需要输出中文回复草稿\"}")
+
+        @Expect(result.ok, false)
+        @Expect(result.status, "draft_invalid_tool_json")
+        @Expect(result.needsHumanReview, true)
+    }
 }
