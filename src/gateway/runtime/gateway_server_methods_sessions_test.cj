@@ -101,25 +101,27 @@ private func withGatewaySessionsTestHome<T>(block: () -> T): T {
 public class GatewayServerMethodsSessionsTest {
     @TestCase
     public func sessionsListAggregatesAcrossAgentStores(): Unit {
-        let mainStore = gatewaySessionStoreForUserWithAgentId(GatewayUserSettings(), "main")
-        let generalStore = gatewaySessionStoreForUserWithAgentId(GatewayUserSettings(), "general")
-        let mainKey = "agent:main:main"
-        let generalKey = "agent:general:main"
-        mainStore.deleteSession(mainKey)
-        generalStore.deleteSession(generalKey)
-        mainStore.appendUser(mainKey, "hello-main")
-        generalStore.appendUser(generalKey, "hello-general")
+        withGatewaySessionsTestHome {
+            let mainStore = gatewaySessionStoreForUserWithAgentId(GatewayUserSettings(), "main")
+            let generalStore = gatewaySessionStoreForUserWithAgentId(GatewayUserSettings(), "general")
+            let mainKey = "agent:main:main"
+            let generalKey = "agent:general:main"
+            mainStore.deleteSession(mainKey)
+            generalStore.deleteSession(generalKey)
+            mainStore.appendUser(mainKey, "hello-main")
+            generalStore.appendUser(generalKey, "hello-general")
 
-        let response = handleGatewaySessionsFamily("sessions.list").getOrThrow()
-        let result = response.result.asObject()
-        let sessions = result.get("sessions").getOrThrow().asArray()
-        @Expect(sessionRowExists(sessions, mainKey, "main"), true)
-        @Expect(sessionRowExists(sessions, generalKey, "general"), true)
-        @Expect(sessionRowHasProjection(sessions, mainKey), true)
-        @Expect(sessionRowHasProjection(sessions, generalKey), true)
+            let response = handleGatewaySessionsFamily("sessions.list").getOrThrow()
+            let result = response.result.asObject()
+            let sessions = result.get("sessions").getOrThrow().asArray()
+            @Expect(sessionRowExists(sessions, mainKey, "main"), true)
+            @Expect(sessionRowExists(sessions, generalKey, "general"), true)
+            @Expect(sessionRowHasProjection(sessions, mainKey), true)
+            @Expect(sessionRowHasProjection(sessions, generalKey), true)
 
-        mainStore.deleteSession(mainKey)
-        generalStore.deleteSession(generalKey)
+            mainStore.deleteSession(mainKey)
+            generalStore.deleteSession(generalKey)
+        }
     }
 
     @TestCase
@@ -137,12 +139,14 @@ public class GatewayServerMethodsSessionsTest {
 
     @TestCase
     public func sessionsListExposesDefaultModelSummary(): Unit {
-        let response = handleGatewaySessionsFamily("sessions.list").getOrThrow()
-        @Expect(response.ok, true)
-        let defaults = response.result.asObject().get("defaults").getOrThrow().asObject()
-        @Expect(defaults.get("model").isSome(), true)
-        @Expect(defaults.get("modelProvider").isSome(), true)
-        @Expect(defaults.get("contextTokens").isSome(), true)
+        withGatewaySessionsTestHome {
+            let response = handleGatewaySessionsFamily("sessions.list").getOrThrow()
+            @Expect(response.ok, true)
+            let defaults = response.result.asObject().get("defaults").getOrThrow().asObject()
+            @Expect(defaults.get("model").isSome(), true)
+            @Expect(defaults.get("modelProvider").isSome(), true)
+            @Expect(defaults.get("contextTokens").isSome(), true)
+        }
     }
 
     @TestCase
@@ -309,38 +313,40 @@ public class GatewayServerMethodsSessionsTest {
 
     @TestCase
     public func sessionsPatchReturnsEntryAndSessionsListReflectsMetadata(): Unit {
-        let store = gatewaySessionStoreForUserWithAgentId(GatewayUserSettings(), "main")
-        let sessionKey = "agent:main:main"
-        store.deleteSession(sessionKey)
-        store.appendUser(sessionKey, "hello")
+        withGatewaySessionsTestHome {
+            let store = gatewaySessionStoreForUserWithAgentId(GatewayUserSettings(), "main")
+            let sessionKey = "agent:main:main"
+            store.deleteSession(sessionKey)
+            store.appendUser(sessionKey, "hello")
 
-        let patchParams = JsonObject()
-        patchParams.put("key", JsonString("main"))
-        patchParams.put("verboseLevel", JsonString("on"))
-        patchParams.put("responseUsage", JsonString("full"))
-        patchParams.put("fastMode", true.toJsonValue())
-        patchParams.put("sendPolicy", JsonString("deny"))
-        let patchRequest = GatewayRpcRequest("sessions.patch", params: patchParams, clientId: "metis-cli")
-        let patchResponse = handleGatewaySessionsFamily("sessions.patch", request: Some(patchRequest)).getOrThrow()
-        @Expect(patchResponse.ok, true)
-        let patchResult = patchResponse.result.asObject()
-        @Expect(patchResult.get("ok").getOrThrow().asBool().getValue(), true)
-        @Expect(patchResult.get("key").getOrThrow().asString().getValue(), "agent:main:main")
-        let entry = patchResult.get("entry").getOrThrow().asObject()
-        @Expect(entry.get("verboseLevel").getOrThrow().asString().getValue(), "on")
-        @Expect(entry.get("responseUsage").getOrThrow().asString().getValue(), "full")
-        @Expect(entry.get("fastMode").getOrThrow().asBool().getValue(), true)
-        @Expect(entry.get("sendPolicy").getOrThrow().asString().getValue(), "deny")
+            let patchParams = JsonObject()
+            patchParams.put("key", JsonString("main"))
+            patchParams.put("verboseLevel", JsonString("on"))
+            patchParams.put("responseUsage", JsonString("full"))
+            patchParams.put("fastMode", true.toJsonValue())
+            patchParams.put("sendPolicy", JsonString("deny"))
+            let patchRequest = GatewayRpcRequest("sessions.patch", params: patchParams, clientId: "metis-cli")
+            let patchResponse = handleGatewaySessionsFamily("sessions.patch", request: Some(patchRequest)).getOrThrow()
+            @Expect(patchResponse.ok, true)
+            let patchResult = patchResponse.result.asObject()
+            @Expect(patchResult.get("ok").getOrThrow().asBool().getValue(), true)
+            @Expect(patchResult.get("key").getOrThrow().asString().getValue(), "agent:main:main")
+            let entry = patchResult.get("entry").getOrThrow().asObject()
+            @Expect(entry.get("verboseLevel").getOrThrow().asString().getValue(), "on")
+            @Expect(entry.get("responseUsage").getOrThrow().asString().getValue(), "full")
+            @Expect(entry.get("fastMode").getOrThrow().asBool().getValue(), true)
+            @Expect(entry.get("sendPolicy").getOrThrow().asString().getValue(), "deny")
 
-        let listResponse = handleGatewaySessionsFamily("sessions.list").getOrThrow()
-        let sessions = listResponse.result.asObject().get("sessions").getOrThrow().asArray()
-        let row = previewEntryFor(sessions, "agent:main:main")
-        @Expect(row.get("verboseLevel").getOrThrow().asString().getValue(), "on")
-        @Expect(row.get("responseUsage").getOrThrow().asString().getValue(), "full")
-        @Expect(row.get("fastMode").getOrThrow().asBool().getValue(), true)
-        @Expect(row.get("sendPolicy").getOrThrow().asString().getValue(), "deny")
+            let listResponse = handleGatewaySessionsFamily("sessions.list").getOrThrow()
+            let sessions = listResponse.result.asObject().get("sessions").getOrThrow().asArray()
+            let row = previewEntryFor(sessions, "agent:main:main")
+            @Expect(row.get("verboseLevel").getOrThrow().asString().getValue(), "on")
+            @Expect(row.get("responseUsage").getOrThrow().asString().getValue(), "full")
+            @Expect(row.get("fastMode").getOrThrow().asBool().getValue(), true)
+            @Expect(row.get("sendPolicy").getOrThrow().asString().getValue(), "deny")
 
-        store.deleteSession(sessionKey)
+            store.deleteSession(sessionKey)
+        }
     }
 
     @TestCase
@@ -397,135 +403,143 @@ public class GatewayServerMethodsSessionsTest {
 
     @TestCase
     public func sessionsListFallsBackToTranscriptUsageAndModelMetadata(): Unit {
-        let store = gatewaySessionStoreForUserWithAgentId(GatewayUserSettings(), "main")
-        let sessionKey = "agent:main:list-fallback-test"
-        store.deleteSession(sessionKey)
-        store.appendUser(sessionKey, "hello")
+        withGatewaySessionsTestHome {
+            let store = gatewaySessionStoreForUserWithAgentId(GatewayUserSettings(), "main")
+            let sessionKey = "agent:main:list-fallback-test"
+            store.deleteSession(sessionKey)
+            store.appendUser(sessionKey, "hello")
 
-        let root = JsonObject()
-        let entry = JsonObject()
-        entry.put("sessionKey", JsonString(sessionKey))
-        entry.put("updatedAt", 123.toJsonValue())
-        entry.put("sessionFile", JsonString("agent_main_list-fallback-test.jsonl"))
-        entry.put("sessionId", JsonString("agent_main_list-fallback-test"))
-        entry.put("modelProvider", JsonString("anthropic"))
-        entry.put("model", JsonString("claude-sonnet-4-6"))
-        entry.put("contextTokens", 0.toJsonValue())
-        entry.put("totalTokens", 0.toJsonValue())
-        entry.put("totalTokensFresh", false.toJsonValue())
-        entry.put("estimatedCostUsd", 0.0.toJsonValue())
-        root.put(sessionKey, entry)
-        File.writeTo(store.sessionsRoot().join("sessions.json"), root.toJsonString().toArray())
+            let root = JsonObject()
+            let entry = JsonObject()
+            entry.put("sessionKey", JsonString(sessionKey))
+            entry.put("updatedAt", 123.toJsonValue())
+            entry.put("sessionFile", JsonString("agent_main_list-fallback-test.jsonl"))
+            entry.put("sessionId", JsonString("agent_main_list-fallback-test"))
+            entry.put("modelProvider", JsonString("anthropic"))
+            entry.put("model", JsonString("claude-sonnet-4-6"))
+            entry.put("contextTokens", 0.toJsonValue())
+            entry.put("totalTokens", 0.toJsonValue())
+            entry.put("totalTokensFresh", false.toJsonValue())
+            entry.put("estimatedCostUsd", 0.0.toJsonValue())
+            root.put(sessionKey, entry)
+            File.writeTo(store.sessionsRoot().join("sessions.json"), root.toJsonString().toArray())
 
-        let transcriptLines = [
-            "{\"kind\":\"meta\",\"v\":\"1\",\"sessionKey\":\"${sessionKey}\"}",
-            "{\"message\":{\"role\":\"assistant\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input\":2000,\"output\":500,\"cacheRead\":1000,\"cost\":{\"total\":0.0042}}}}",
-            "{\"message\":{\"role\":\"assistant\",\"provider\":\"metis\",\"model\":\"delivery-mirror\",\"usage\":{\"input\":0,\"output\":0,\"cacheRead\":0,\"cacheWrite\":0}}}"
-        ]
-        File.writeTo(store.transcriptPath(sessionKey), concatLines(transcriptLines).toArray())
+            let transcriptLines = [
+                "{\"kind\":\"meta\",\"v\":\"1\",\"sessionKey\":\"${sessionKey}\"}",
+                "{\"message\":{\"role\":\"assistant\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-4-6\",\"usage\":{\"input\":2000,\"output\":500,\"cacheRead\":1000,\"cost\":{\"total\":0.0042}}}}",
+                "{\"message\":{\"role\":\"assistant\",\"provider\":\"metis\",\"model\":\"delivery-mirror\",\"usage\":{\"input\":0,\"output\":0,\"cacheRead\":0,\"cacheWrite\":0}}}"
+            ]
+            File.writeTo(store.transcriptPath(sessionKey), concatLines(transcriptLines).toArray())
 
-        let listResponse = handleGatewaySessionsFamily("sessions.list").getOrThrow()
-        @Expect(listResponse.ok, true)
-        let sessions = listResponse.result.asObject().get("sessions").getOrThrow().asArray()
-        let row = previewEntryFor(sessions, sessionKey)
-        @Expect(row.get("modelProvider").getOrThrow().asString().getValue(), "anthropic")
-        @Expect(row.get("model").getOrThrow().asString().getValue(), "claude-sonnet-4-6")
-        @Expect(row.get("totalTokens").getOrThrow().toJsonString(), "3500")
-        @Expect(row.get("totalTokensFresh").getOrThrow().asBool().getValue(), true)
-        @Expect(row.get("estimatedCostUsd").getOrThrow().toJsonString().contains("0.0042"), true)
-        @Expect(row.get("contextTokens").getOrThrow().toJsonString(), "131072")
+            let listResponse = handleGatewaySessionsFamily("sessions.list").getOrThrow()
+            @Expect(listResponse.ok, true)
+            let sessions = listResponse.result.asObject().get("sessions").getOrThrow().asArray()
+            let row = previewEntryFor(sessions, sessionKey)
+            @Expect(row.get("modelProvider").getOrThrow().asString().getValue(), "anthropic")
+            @Expect(row.get("model").getOrThrow().asString().getValue(), "claude-sonnet-4-6")
+            @Expect(row.get("totalTokens").getOrThrow().toJsonString(), "3500")
+            @Expect(row.get("totalTokensFresh").getOrThrow().asBool().getValue(), true)
+            @Expect(row.get("estimatedCostUsd").getOrThrow().toJsonString().contains("0.0042"), true)
+            @Expect(row.get("contextTokens").getOrThrow().toJsonString(), "131072")
 
-        store.deleteSession(sessionKey)
+            store.deleteSession(sessionKey)
+        }
     }
 
     @TestCase
     public func sessionsListProjectsDeliveryContextFromDeliverySnapshot(): Unit {
-        let store = gatewaySessionStoreForUserWithAgentId(GatewayUserSettings(), "main")
-        let sessionKey = "agent:main:list-delivery-context-test"
-        store.deleteSession(sessionKey)
-        store.appendUser(sessionKey, "hello")
+        withGatewaySessionsTestHome {
+            let store = gatewaySessionStoreForUserWithAgentId(GatewayUserSettings(), "main")
+            let sessionKey = "agent:main:list-delivery-context-test"
+            store.deleteSession(sessionKey)
+            store.appendUser(sessionKey, "hello")
 
-        let root = JsonObject()
-        let entry = JsonObject()
-        entry.put("sessionKey", JsonString(sessionKey))
-        entry.put("updatedAt", 123.toJsonValue())
-        entry.put("sessionFile", JsonString("agent_main_list-delivery-context-test.jsonl"))
-        entry.put("sessionId", JsonString("agent_main_list-delivery-context-test"))
-        let delivery = JsonObject()
-        delivery.put("channel", JsonString("whatsapp"))
-        delivery.put("peer", JsonString("+1555"))
-        delivery.put("replyTo", JsonString("+1555"))
-        delivery.put("conversationId", JsonString("+1555"))
-        delivery.put("threadId", JsonString("1737500000.123456"))
-        delivery.put("accountId", JsonString("work"))
-        delivery.put("deliverable", true.toJsonValue())
-        delivery.put("mode", JsonString("binding-snapshot"))
-        entry.put("delivery", delivery)
-        root.put(sessionKey, entry)
-        File.writeTo(store.sessionsRoot().join("sessions.json"), root.toJsonString().toArray())
+            let root = JsonObject()
+            let entry = JsonObject()
+            entry.put("sessionKey", JsonString(sessionKey))
+            entry.put("updatedAt", 123.toJsonValue())
+            entry.put("sessionFile", JsonString("agent_main_list-delivery-context-test.jsonl"))
+            entry.put("sessionId", JsonString("agent_main_list-delivery-context-test"))
+            let delivery = JsonObject()
+            delivery.put("channel", JsonString("whatsapp"))
+            delivery.put("peer", JsonString("+1555"))
+            delivery.put("replyTo", JsonString("+1555"))
+            delivery.put("conversationId", JsonString("+1555"))
+            delivery.put("threadId", JsonString("1737500000.123456"))
+            delivery.put("accountId", JsonString("work"))
+            delivery.put("deliverable", true.toJsonValue())
+            delivery.put("mode", JsonString("binding-snapshot"))
+            entry.put("delivery", delivery)
+            root.put(sessionKey, entry)
+            File.writeTo(store.sessionsRoot().join("sessions.json"), root.toJsonString().toArray())
 
-        let listResponse = handleGatewaySessionsFamily("sessions.list").getOrThrow()
-        @Expect(listResponse.ok, true)
-        let sessions = listResponse.result.asObject().get("sessions").getOrThrow().asArray()
-        let row = previewEntryFor(sessions, sessionKey)
-        let deliveryContext = row.get("deliveryContext").getOrThrow().asObject()
-        @Expect(deliveryContext.get("channel").getOrThrow().asString().getValue(), "agent")
-        @Expect(deliveryContext.get("to").getOrThrow().asString().getValue(), "list-delivery-context-test")
-        @Expect(row.get("lastChannel").getOrThrow().asString().getValue(), "agent")
-        @Expect(row.get("lastTo").getOrThrow().asString().getValue(), "list-delivery-context-test")
-        @Expect(row.get("kind").getOrThrow().asString().getValue(), "direct")
+            let listResponse = handleGatewaySessionsFamily("sessions.list").getOrThrow()
+            @Expect(listResponse.ok, true)
+            let sessions = listResponse.result.asObject().get("sessions").getOrThrow().asArray()
+            let row = previewEntryFor(sessions, sessionKey)
+            let deliveryContext = row.get("deliveryContext").getOrThrow().asObject()
+            @Expect(deliveryContext.get("channel").getOrThrow().asString().getValue(), "agent")
+            @Expect(deliveryContext.get("to").getOrThrow().asString().getValue(), "list-delivery-context-test")
+            @Expect(row.get("lastChannel").getOrThrow().asString().getValue(), "agent")
+            @Expect(row.get("lastTo").getOrThrow().asString().getValue(), "list-delivery-context-test")
+            @Expect(row.get("kind").getOrThrow().asString().getValue(), "direct")
 
-        store.deleteSession(sessionKey)
+            store.deleteSession(sessionKey)
+        }
     }
 
     @TestCase
     public func sessionsListProjectsTelegramThreadBindingFromSpawnMetadataTranscript(): Unit {
-        let store = gatewaySessionStoreForUserWithAgentId(GatewayUserSettings(), "main")
-        let sessionKey = "agent:main:telegram-thread-bound-test"
-        store.deleteSession(sessionKey)
-        let transcriptLines = [
-            "{\"kind\":\"meta\",\"v\":\"1\",\"sessionKey\":\"${sessionKey}\"}",
-            "{\"role\":\"system\",\"text\":\"sessions_spawn metadata: runtime=subagent, streamTo=telegram:group:-1001234567890:topic:42, thread=true\"}"
-        ]
-        File.writeTo(store.transcriptPath(sessionKey), concatLines(transcriptLines).toArray())
+        withGatewaySessionsTestHome {
+            let store = gatewaySessionStoreForUserWithAgentId(GatewayUserSettings(), "main")
+            let sessionKey = "agent:main:telegram-thread-bound-test"
+            store.deleteSession(sessionKey)
+            let transcriptLines = [
+                "{\"kind\":\"meta\",\"v\":\"1\",\"sessionKey\":\"${sessionKey}\"}",
+                "{\"role\":\"system\",\"text\":\"sessions_spawn metadata: runtime=subagent, streamTo=telegram:group:-1001234567890:topic:42, thread=true\"}"
+            ]
+            File.writeTo(store.transcriptPath(sessionKey), concatLines(transcriptLines).toArray())
 
-        let listResponse = handleGatewaySessionsFamily("sessions.list").getOrThrow()
-        @Expect(listResponse.ok, true)
-        let sessions = listResponse.result.asObject().get("sessions").getOrThrow().asArray()
-        let row = previewEntryFor(sessions, sessionKey)
-        @Expect(row.get("streamTo").getOrThrow().asString().getValue(), "telegram:group:-1001234567890:topic:42")
-        @Expect(row.get("thread").getOrThrow().asBool().getValue(), true)
-        @Expect(row.get("lastChannel").getOrThrow().asString().getValue(), "agent")
-        @Expect(row.get("lastTo").getOrThrow().asString().getValue(), "telegram-thread-bound-test")
-        let deliveryContext = row.get("deliveryContext").getOrThrow().asObject()
-        @Expect(deliveryContext.get("channel").getOrThrow().asString().getValue(), "agent")
-        @Expect(deliveryContext.get("to").getOrThrow().asString().getValue(), "telegram-thread-bound-test")
-        if (row.get("threadBinding").isSome()) {
-            let threadBinding = row.get("threadBinding").getOrThrow().asObject()
-            @Expect(threadBinding.get("enabled").getOrThrow().asBool().getValue(), true)
-            @Expect(threadBinding.get("channel").getOrThrow().asString().getValue(), "telegram")
-            @Expect(threadBinding.get("threadId").getOrThrow().asString().getValue(), "42")
+            let listResponse = handleGatewaySessionsFamily("sessions.list").getOrThrow()
+            @Expect(listResponse.ok, true)
+            let sessions = listResponse.result.asObject().get("sessions").getOrThrow().asArray()
+            let row = previewEntryFor(sessions, sessionKey)
+            @Expect(row.get("streamTo").getOrThrow().asString().getValue(), "telegram:group:-1001234567890:topic:42")
+            @Expect(row.get("thread").getOrThrow().asBool().getValue(), true)
+            @Expect(row.get("lastChannel").getOrThrow().asString().getValue(), "agent")
+            @Expect(row.get("lastTo").getOrThrow().asString().getValue(), "telegram-thread-bound-test")
+            let deliveryContext = row.get("deliveryContext").getOrThrow().asObject()
+            @Expect(deliveryContext.get("channel").getOrThrow().asString().getValue(), "agent")
+            @Expect(deliveryContext.get("to").getOrThrow().asString().getValue(), "telegram-thread-bound-test")
+            if (row.get("threadBinding").isSome()) {
+                let threadBinding = row.get("threadBinding").getOrThrow().asObject()
+                @Expect(threadBinding.get("enabled").getOrThrow().asBool().getValue(), true)
+                @Expect(threadBinding.get("channel").getOrThrow().asString().getValue(), "telegram")
+                @Expect(threadBinding.get("threadId").getOrThrow().asString().getValue(), "42")
+            }
+
+            store.deleteSession(sessionKey)
         }
-
-        store.deleteSession(sessionKey)
     }
 
     @TestCase
     public func sessionsListProjectsDerivedTitleAndLastMessagePreviewFromTranscript(): Unit {
-        let store = gatewaySessionStoreForUserWithAgentId(GatewayUserSettings(), "main")
-        let sessionKey = "agent:main:list-derived-title-test"
-        store.deleteSession(sessionKey)
-        store.appendUser(sessionKey, "please summarize this very important issue")
-        store.appendAssistant(sessionKey, "working on it now")
+        withGatewaySessionsTestHome {
+            let store = gatewaySessionStoreForUserWithAgentId(GatewayUserSettings(), "main")
+            let sessionKey = "agent:main:list-derived-title-test"
+            store.deleteSession(sessionKey)
+            store.appendUser(sessionKey, "please summarize this very important issue")
+            store.appendAssistant(sessionKey, "working on it now")
 
-        let listResponse = handleGatewaySessionsFamily("sessions.list").getOrThrow()
-        @Expect(listResponse.ok, true)
-        let sessions = listResponse.result.asObject().get("sessions").getOrThrow().asArray()
-        let row = previewEntryFor(sessions, sessionKey)
-        @Expect(row.get("derivedTitle").getOrThrow().asString().getValue(), "list-derived-title-test")
-        @Expect(row.get("lastMessagePreview").getOrThrow().asString().getValue(), "working on it now")
+            let listResponse = handleGatewaySessionsFamily("sessions.list").getOrThrow()
+            @Expect(listResponse.ok, true)
+            let sessions = listResponse.result.asObject().get("sessions").getOrThrow().asArray()
+            let row = previewEntryFor(sessions, sessionKey)
+            @Expect(row.get("derivedTitle").getOrThrow().asString().getValue(), "list-derived-title-test")
+            @Expect(row.get("lastMessagePreview").getOrThrow().asString().getValue(), "working on it now")
 
-        store.deleteSession(sessionKey)
+            store.deleteSession(sessionKey)
+        }
     }
 
     @TestCase
@@ -548,25 +562,27 @@ public class GatewayServerMethodsSessionsTest {
 
     @TestCase
     public func sessionsDeleteArchivesTranscriptAndRemovesSession(): Unit {
-        let store = gatewaySessionStoreForUserWithAgentId(GatewayUserSettings(), "main")
-        let sessionKey = "agent:main:delete-me"
-        store.deleteSession(sessionKey)
-        store.appendUser(sessionKey, "hello delete")
+        withGatewaySessionsTestHome {
+            let store = gatewaySessionStoreForUserWithAgentId(GatewayUserSettings(), "main")
+            let sessionKey = "agent:main:delete-me"
+            store.deleteSession(sessionKey)
+            store.appendUser(sessionKey, "hello delete")
 
-        let deleteParams = JsonObject()
-        deleteParams.put("key", JsonString(sessionKey))
-        let deleteResponse = handleGatewaySessionsFamily("sessions.delete", request: Some(GatewayRpcRequest("sessions.delete", params: deleteParams, clientId: "metis-cli"))).getOrThrow()
-        @Expect(deleteResponse.ok, true)
-        let deleteResult = deleteResponse.result.asObject()
-        @Expect(deleteResult.get("deleted").getOrThrow().asBool().getValue(), true)
-        let archived = deleteResult.get("archived").getOrThrow().asArray()
-        @Expect(archived.size(), 1)
-        @Expect(archived[0].asString().getValue().contains(".deleted."), true)
-        @Expect(store.readTranscriptRaw(sessionKey).isNone(), true)
+            let deleteParams = JsonObject()
+            deleteParams.put("key", JsonString(sessionKey))
+            let deleteResponse = handleGatewaySessionsFamily("sessions.delete", request: Some(GatewayRpcRequest("sessions.delete", params: deleteParams, clientId: "metis-cli"))).getOrThrow()
+            @Expect(deleteResponse.ok, true)
+            let deleteResult = deleteResponse.result.asObject()
+            @Expect(deleteResult.get("deleted").getOrThrow().asBool().getValue(), true)
+            let archived = deleteResult.get("archived").getOrThrow().asArray()
+            @Expect(archived.size(), 1)
+            @Expect(archived[0].asString().getValue().contains(".deleted."), true)
+            @Expect(store.readTranscriptRaw(sessionKey).isNone(), true)
 
-        let listResponse = handleGatewaySessionsFamily("sessions.list").getOrThrow()
-        let sessions = listResponse.result.asObject().get("sessions").getOrThrow().asArray()
-        @Expect(sessionRowExists(sessions, sessionKey, "main"), false)
+            let listResponse = handleGatewaySessionsFamily("sessions.list").getOrThrow()
+            let sessions = listResponse.result.asObject().get("sessions").getOrThrow().asArray()
+            @Expect(sessionRowExists(sessions, sessionKey, "main"), false)
+        }
     }
 
     @TestCase
@@ -704,24 +720,26 @@ public class GatewayServerMethodsSessionsTest {
 
     @TestCase
     public func sessionsCliListLinesShowAgentScopedEntries(): Unit {
-        let mainStore = gatewaySessionStoreForUserWithAgentId(GatewayUserSettings(), "main")
-        let generalStore = gatewaySessionStoreForUserWithAgentId(GatewayUserSettings(), "general")
-        let mainKey = "agent:main:cli-list"
-        let generalKey = "agent:general:cli-list"
-        mainStore.deleteSession(mainKey)
-        generalStore.deleteSession(generalKey)
-        mainStore.appendUser(mainKey, "hello-main")
-        generalStore.appendUser(generalKey, "hello-general")
+        withGatewaySessionsTestHome {
+            let mainStore = gatewaySessionStoreForUserWithAgentId(GatewayUserSettings(), "main")
+            let generalStore = gatewaySessionStoreForUserWithAgentId(GatewayUserSettings(), "general")
+            let mainKey = "agent:main:cli-list"
+            let generalKey = "agent:general:cli-list"
+            mainStore.deleteSession(mainKey)
+            generalStore.deleteSession(generalKey)
+            mainStore.appendUser(mainKey, "hello-main")
+            generalStore.appendUser(generalKey, "hello-general")
 
-        let lines = concatLines(gatewaySessionsListLinesForUser(GatewayUserSettings()))
-        @Expect(lines.contains("[main] ${mainKey}"), true)
-        @Expect(lines.contains("[general] ${generalKey}"), true)
-        @Expect(lines.contains("channel=agent"), true)
-        @Expect(lines.contains("kind=direct"), true)
-        @Expect(lines.contains("sessionId="), true)
+            let lines = concatLines(gatewaySessionsListLinesForUser(GatewayUserSettings()))
+            @Expect(lines.contains("[main] ${mainKey}"), true)
+            @Expect(lines.contains("[general] ${generalKey}"), true)
+            @Expect(lines.contains("channel=agent"), true)
+            @Expect(lines.contains("kind=direct"), true)
+            @Expect(lines.contains("sessionId="), true)
 
-        mainStore.deleteSession(mainKey)
-        generalStore.deleteSession(generalKey)
+            mainStore.deleteSession(mainKey)
+            generalStore.deleteSession(generalKey)
+        }
     }
 
     @TestCase

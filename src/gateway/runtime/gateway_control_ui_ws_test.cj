@@ -1,6 +1,6 @@
 package metis.gateway.runtime
 
-import metis.core.config.{CliSettingManager, GatewayUserSettings, MetisConfigManager}
+import metis.core.config.{CliConfig, CliSettingManager, GatewayUserSettings, MetisConfigManager}
 import metis.core.skills.setClawHubHttpGetForTest
 import metis.gateway.config.buildGatewayConfigFromUserSettings
 import metis.gateway.core.{gatewayFindSessionConversationViewForUser, gatewaySessionStoreForUserWithAgentId, setGatewayFeishuNativeAuthRunnerForTest}
@@ -35,6 +35,7 @@ private func withGatewayControlUiWsTestHome<T>(block: () -> T): T {
     Directory.create(testHome, recursive: true)
     let oldHome = getVariable("METIS_HOME")
     setVariable("METIS_HOME", testHome)
+    CliConfig.invalidatePathCache()
     MetisConfigManager.invalidate()
     CliSettingManager.invalidate()
     try {
@@ -44,6 +45,7 @@ private func withGatewayControlUiWsTestHome<T>(block: () -> T): T {
             case Some(value) => setVariable("METIS_HOME", value)
             case None => setVariable("METIS_HOME", "")
         }
+        CliConfig.invalidatePathCache()
         MetisConfigManager.invalidate()
         CliSettingManager.invalidate()
     }
@@ -307,16 +309,18 @@ public class GatewayControlUiWsTest {
 
     @TestCase
     public func agentIdentityGetKeepsMainInternalIdButReturnsMetisDisplayName(): Unit {
-        let cfg = buildGatewayConfigFromUserSettings(CliSettingManager.readGatewaySettings())
-        let params = JsonObject()
-        params.put("sessionKey", JsonString("agent:main:main"))
+        withGatewayControlUiWsTestHome {
+            let cfg = buildGatewayConfigFromUserSettings(CliSettingManager.readGatewaySettings())
+            let params = JsonObject()
+            params.put("sessionKey", JsonString("agent:main:main"))
 
-        let response = gatewayControlUiWsCompatResponse("agent.identity.get", params, cfg)
+            let response = gatewayControlUiWsCompatResponse("agent.identity.get", params, cfg)
 
-        @Expect(response.isSome(), true)
-        let result = response.getOrThrow().result.asObject()
-        @Expect(gatewayControlUiWsTestString(result, "agentId"), "main")
-        @Expect(gatewayControlUiWsTestString(result, "name"), "Metis")
+            @Expect(response.isSome(), true)
+            let result = response.getOrThrow().result.asObject()
+            @Expect(gatewayControlUiWsTestString(result, "agentId"), "main")
+            @Expect(gatewayControlUiWsTestString(result, "name"), "Metis")
+        }
     }
 
     @TestCase
