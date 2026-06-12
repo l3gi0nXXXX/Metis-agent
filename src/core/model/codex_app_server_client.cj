@@ -138,7 +138,7 @@ public class CodexAppServerClient <: CodexAppServerTransport {
                     case None => return JsonObject()
                 }
             case None =>
-                let message = codexAppServerTimeoutMessage(method, this.diagnostics())
+                let message = codexAppServerTimeoutMessage(method, this.diagnosticsWithGrace(120))
                 try { this.close() } catch (_: Exception) { () }
                 throw CodexAppServerProtocolException(message, code: -32001)
         }
@@ -188,6 +188,22 @@ public class CodexAppServerClient <: CodexAppServerTransport {
 
     public func diagnostics(): Array<String> {
         this.diagnosticsBuffer.snapshot()
+    }
+
+    private func diagnosticsWithGrace(waitMs: Int64): Array<String> {
+        var items = this.diagnostics()
+        if (!items.isEmpty() || waitMs <= 0) {
+            return items
+        }
+        let started = DateTime.now().toUnixTimeStamp().toMilliseconds()
+        while (DateTime.now().toUnixTimeStamp().toMilliseconds() - started < waitMs) {
+            sleep(Duration.millisecond * 10)
+            items = this.diagnostics()
+            if (!items.isEmpty()) {
+                return items
+            }
+        }
+        items
     }
 
     public func close(): Unit {
