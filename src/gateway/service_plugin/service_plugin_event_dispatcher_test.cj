@@ -1091,6 +1091,85 @@ public class ServicePluginEventDispatcherTest {
     }
 
     @TestCase
+    public func tDraftGuard001ToolJsonDraftDoesNotInvokeWriteback(): Unit {
+        // DRAFT-E2E-001.
+        this.resetDispatcherHooks()
+        this.registerGitCodeWritebackPlugin()
+        let calls = ArrayList<String>()
+        let messages = ArrayList<String>()
+        setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent =>
+            this.targetRows([this.target(channel: "telegram", peerId: "tg-peer")])
+        }))
+        setServicePluginWebhookGeneratedReplyHandlerForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent, _target: ServicePluginDeliveryTarget =>
+            ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "{\"tool\":\"functions._answer_\",\"reason\":\"当前任务只需要输出中文回复草稿\"}")
+        }))
+        setServicePluginCapabilityInvokerForTest(Some({ _registration: ServicePluginRegistration, request: CapabilityInvokeRequest =>
+            calls.add(request.capabilityId)
+            CapabilityInvokeResult(true, "ok", serviceId: "gitcode-monitor", capabilityId: request.capabilityId, payload: "{\"status\":\"posted\",\"posted\":true}")
+        }))
+        setServicePluginEventDeliveryForTest(Some({ _target: ServicePluginDeliveryTarget, text: String =>
+            messages.add(text)
+            ServicePluginEventDeliveryResult(true, "sent")
+        }))
+        try {
+            let result = dispatchServicePluginEvent(this.acceptedContractFrame(eventId: "gitcode:Cangjie/cangjie_tools:issue:draft-e2e-001"), store: ServicePluginPendingJobStore())
+
+            @Expect(result.ok, true)
+            @Expect(result.status, "generated_reply_degraded_delivered")
+            @Expect(calls.size, 0)
+            @Expect(messages.size, 1)
+            @Expect(messages[0].contains("状态: needsHumanReview"), true)
+            @Expect(messages[0].contains("模型返回了工具调用 JSON"), true)
+            @Expect(messages[0].contains("\"tool\""), false)
+            @Expect(messages[0].contains("functions._answer_"), false)
+            @Expect(messages[0].contains("\"reason\""), false)
+        } finally {
+            this.resetDispatcherHooks()
+        }
+    }
+
+    @TestCase
+    public func tDraftGuard002SafeDraftStillInvokesWriteback(): Unit {
+        // DRAFT-E2E-002.
+        this.resetDispatcherHooks()
+        this.registerGitCodeWritebackPlugin()
+        let calls = ArrayList<String>()
+        let payloads = ArrayList<String>()
+        let messages = ArrayList<String>()
+        setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent =>
+            this.targetRows([this.target(channel: "telegram", peerId: "tg-peer")])
+        }))
+        setServicePluginWebhookGeneratedReplyHandlerForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent, _target: ServicePluginDeliveryTarget =>
+            ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "建议补充回归测试。")
+        }))
+        setServicePluginCapabilityInvokerForTest(Some({ _registration: ServicePluginRegistration, request: CapabilityInvokeRequest =>
+            calls.add(request.capabilityId)
+            payloads.add(request.payload)
+            CapabilityInvokeResult(true, "ok", serviceId: "gitcode-monitor", capabilityId: request.capabilityId, payload: "{\"status\":\"posted\",\"posted\":true}")
+        }))
+        setServicePluginEventDeliveryForTest(Some({ _target: ServicePluginDeliveryTarget, text: String =>
+            messages.add(text)
+            ServicePluginEventDeliveryResult(true, "sent")
+        }))
+        try {
+            let result = dispatchServicePluginEvent(this.acceptedContractFrame(eventId: "gitcode:Cangjie/cangjie_tools:issue:draft-e2e-002"), store: ServicePluginPendingJobStore())
+
+            @Expect(result.ok, true)
+            @Expect(result.status, "generated_reply_delivered")
+            @Expect(calls.toArray(), ["gitcode.writeback.apply_result"])
+            @Expect(payloads.size, 1)
+            @Expect(payloads[0].contains("\"contractVersion\""), true)
+            @Expect(payloads[0].contains(this.gitCodeReviewContractVersion), true)
+            @Expect(payloads[0].contains("\"draft\""), true)
+            @Expect(payloads[0].contains("建议补充回归测试。"), true)
+            @Expect(messages.size, 1)
+            @Expect(messages[0].contains("建议补充回归测试。"), true)
+        } finally {
+            this.resetDispatcherHooks()
+        }
+    }
+
+    @TestCase
     public func tContext001DispatcherPreservesLargeCommentReviewRequestContext(): Unit {
         this.resetDispatcherHooks()
         let calls = ArrayList<String>()
