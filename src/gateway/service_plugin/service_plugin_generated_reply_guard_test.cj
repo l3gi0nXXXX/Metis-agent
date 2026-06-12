@@ -118,4 +118,15 @@ public class ServicePluginGeneratedReplyGuardTest {
         @Expect(result.status, "draft_invalid_tool_json")
         @Expect(result.needsHumanReview, true)
     }
+
+    @TestCase
+    public func draftM3U001NormalizeRejectsToolJsonDraftResult(): Unit {
+        // DRAFT-M3-U-001.
+        let result = normalizeServicePluginGeneratedReplyResult(ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "{\"tool\":\"functions._answer_\"}"))
+
+        @Expect(result.ok, false)
+        @Expect(result.status, "draft_invalid_tool_json")
+        @Expect(result.draft, "")
+        @Expect(result.needsHumanReview, true)
+    }
 }
