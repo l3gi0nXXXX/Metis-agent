@@ -3988,9 +3988,12 @@ public class TelegramAdapterTest {
     @TestCase
     public func proxyConfiguredNativeCommandsUseTransportProxy(): Unit {
         let seen = ArrayList<String>()
+        let seenLock = Mutex()
         try {
             setTelegramTransportRunnerForTest(Some({ request: TelegramTransportRequest =>
-                seen.add("${request.method}|${request.context}|${request.url}|${request.proxy}|${request.body}")
+                synchronized(seenLock) {
+                    seen.add("${request.method}|${request.context}|${request.url}|${request.proxy}|${request.body}")
+                }
                 TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":true}", outcome: "ok")
             }))
             let adapter = TelegramAdapter(
@@ -4002,9 +4005,11 @@ public class TelegramAdapterTest {
             )
             @Expect(adapter.debugSyncNativeCommandsForTest(), true)
             var found = false
-            for (item in seen) {
-                if (item.contains("POST|setMyCommands|") && item.contains("/setMyCommands") && item.contains("|http://127.0.0.1:7897|") && item.contains("\"commands\"")) {
-                    found = true
+            synchronized(seenLock) {
+                for (item in seen) {
+                    if (item.contains("POST|setMyCommands|") && item.contains("/setMyCommands") && item.contains("|http://127.0.0.1:7897|") && item.contains("\"commands\"")) {
+                        found = true
+                    }
                 }
             }
             @Expect(found, true)
