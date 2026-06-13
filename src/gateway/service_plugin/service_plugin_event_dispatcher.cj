@@ -144,6 +144,14 @@ public class ServicePluginWritebackApplyState {
     public let timedOut: Bool
     public let replyUrl: String
     public let diagnostic: String
+    public let maintainerMentionAppended: Bool
+    public let teamLeaderCount: Int64
+    public let codeownerCount: Int64
+    public let contextSource: String
+    public let emailNotificationStatus: String
+    public let emailSentCount: Int64
+    public let emailFailedCount: Int64
+    public let emailRetryable: Bool
 
     public init(
         configured!: Bool = false,
@@ -153,7 +161,15 @@ public class ServicePluginWritebackApplyState {
         skipped!: Bool = false,
         timedOut!: Bool = false,
         replyUrl!: String = "",
-        diagnostic!: String = ""
+        diagnostic!: String = "",
+        maintainerMentionAppended!: Bool = false,
+        teamLeaderCount!: Int64 = 0,
+        codeownerCount!: Int64 = 0,
+        contextSource!: String = "",
+        emailNotificationStatus!: String = "",
+        emailSentCount!: Int64 = 0,
+        emailFailedCount!: Int64 = 0,
+        emailRetryable!: Bool = false
     ) {
         this.configured = configured
         this.ok = ok
@@ -163,6 +179,14 @@ public class ServicePluginWritebackApplyState {
         this.timedOut = timedOut
         this.replyUrl = servicePluginAcceptedEventSafeField(replyUrl, maxBytes: 320)
         this.diagnostic = servicePluginAcceptedEventSafeField(diagnostic, maxBytes: 240)
+        this.maintainerMentionAppended = maintainerMentionAppended
+        this.teamLeaderCount = teamLeaderCount
+        this.codeownerCount = codeownerCount
+        this.contextSource = servicePluginAcceptedEventSafeField(contextSource, maxBytes: 80)
+        this.emailNotificationStatus = servicePluginAcceptedEventSafeField(emailNotificationStatus, maxBytes: 80)
+        this.emailSentCount = emailSentCount
+        this.emailFailedCount = emailFailedCount
+        this.emailRetryable = emailRetryable
     }
 }
 
@@ -842,7 +866,15 @@ private func servicePluginParseWritebackApplyResult(result: CapabilityInvokeResu
         posted: posted || status == "posted",
         skipped: skipped,
         replyUrl: replyUrl,
-        diagnostic: reason
+        diagnostic: reason,
+        maintainerMentionAppended: servicePluginJsonBool(root, "maintainerMentionAppended"),
+        teamLeaderCount: servicePluginJsonInt(root, "teamLeaderCount"),
+        codeownerCount: servicePluginJsonInt(root, "codeownerCount"),
+        contextSource: servicePluginAcceptedEventAnyString(root, "contextSource"),
+        emailNotificationStatus: servicePluginAcceptedEventAnyString(root, "emailNotificationStatus"),
+        emailSentCount: servicePluginJsonInt(root, "emailSentCount"),
+        emailFailedCount: servicePluginJsonInt(root, "emailFailedCount"),
+        emailRetryable: servicePluginJsonBool(root, "emailRetryable")
     )
 }
 
@@ -869,8 +901,19 @@ private func servicePluginWritebackNotificationLine(writeback: ServicePluginWrit
         return "状态: dryRun=true，未写回 GitCode"
     }
     if (writeback.posted) {
-        let suffix = if (writeback.replyUrl.isEmpty()) { "" } else { "\n写回链接: ${writeback.replyUrl}" }
-        return "状态: GitCode 回复已写回${suffix}"
+        var text = "状态: GitCode 回复已写回"
+        let mentionLine = servicePluginWritebackMaintainerMentionLine(writeback)
+        if (!mentionLine.isEmpty()) {
+            text += "\n${mentionLine}"
+        }
+        let emailLine = servicePluginWritebackEmailNotificationLine(writeback)
+        if (!emailLine.isEmpty()) {
+            text += "\n${emailLine}"
+        }
+        if (!writeback.replyUrl.isEmpty()) {
+            text += "\n写回链接: ${writeback.replyUrl}"
+        }
+        return text
     }
     if (writeback.timedOut) {
         return "状态: 写回状态未知/超时，草稿已通知"
@@ -893,6 +936,43 @@ private func servicePluginWritebackNotificationLine(writeback: ServicePluginWrit
         return "状态: 写回未执行（${reason}），草稿已通知"
     }
     "状态: 写回未执行（${writeback.status}），草稿已通知"
+}
+
+private func servicePluginWritebackMaintainerMentionLine(writeback: ServicePluginWritebackApplyState): String {
+    if (!writeback.maintainerMentionAppended) {
+        return ""
+    }
+    "维护者提及: 已追加 teamLeader=${writeback.teamLeaderCount} codeowner=${writeback.codeownerCount}"
+}
+
+private func servicePluginWritebackEmailNotificationLine(writeback: ServicePluginWritebackApplyState): String {
+    let status = writeback.emailNotificationStatus.trimAscii()
+    if (status.isEmpty()) {
+        return ""
+    }
+    if (status == "sent") {
+        if (writeback.emailSentCount > 0) {
+            return "维护者邮件: 已发送 ${writeback.emailSentCount}"
+        }
+        return "维护者邮件: 已发送"
+    }
+    if (status == "email_disabled" || status == "disabled" || status == "not_configured") {
+        return "维护者邮件: 未启用"
+    }
+    if (status == "email_unavailable" || status == "unavailable") {
+        return "维护者邮件: 无可用邮箱"
+    }
+    if (status == "send_failed" || status == "failed") {
+        var line = "维护者邮件: 发送失败"
+        if (writeback.emailFailedCount > 0) {
+            line += " ${writeback.emailFailedCount}"
+        }
+        if (writeback.emailRetryable) {
+            line += "，可重试"
+        }
+        return line
+    }
+    ""
 }
 
 private func servicePluginWritebackKnownSkipReason(reason: String): Bool {

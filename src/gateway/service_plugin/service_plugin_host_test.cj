@@ -118,6 +118,14 @@ public class ServicePluginHostTest {
         "{\"type\":\"response\",\"frameId\":\"${frameId}\",\"serviceId\":\"gitcode-monitor\",\"method\":\"invokeCapability\",\"capabilityId\":\"gitcode.writeback.apply_result\",\"correlationId\":\"${correlationId}\",\"payload\":{\"ok\":true,\"status\":\"posted\",\"posted\":true,\"replyUrl\":\"${replyUrl}\"}}"
     }
 
+    private func gitCodeWritebackMaintainerEmailResponseLine(
+        frameId!: String = "writeback-response-1",
+        correlationId!: String = "corr-gitcode-monitor-1-gitcode.writeback.apply_result",
+        replyUrl!: String = "https://gitcode.com/Cangjie/community/issues/3#note_1"
+    ): String {
+        "{\"type\":\"response\",\"frameId\":\"${frameId}\",\"serviceId\":\"gitcode-monitor\",\"method\":\"invokeCapability\",\"capabilityId\":\"gitcode.writeback.apply_result\",\"correlationId\":\"${correlationId}\",\"payload\":{\"ok\":true,\"status\":\"posted\",\"posted\":true,\"replyUrl\":\"${replyUrl}\",\"maintainerMentionAppended\":true,\"teamLeaderCount\":1,\"codeownerCount\":2,\"contextSource\":\"store\",\"emailNotificationStatus\":\"sent\",\"emailSentCount\":2}}"
+    }
+
     private func gitCodeHeartbeatLine(frameId!: String = "heartbeat-1"): String {
         "{\"type\":\"heartbeat\",\"frameId\":\"${frameId}\",\"serviceId\":\"gitcode-monitor\",\"method\":\"heartbeat\",\"payload\":{\"ok\":true,\"status\":\"alive\"}}"
     }
@@ -134,6 +142,13 @@ public class ServicePluginHostTest {
         }
         script += "; printf '%s\\n' '${responseLine}'; read ignored || true"
         script
+    }
+
+    private func gitCodeMaintainerEmailWritebackScript(): String {
+        let initLine = this.gitCodeInitLine()
+        let eventLine = this.gitCodeAcceptedEventLine(eventId: "gitcode:Cangjie/community:issue:maintainer-email")
+        let responseLine = this.gitCodeWritebackMaintainerEmailResponseLine()
+        "printf '%s\\n' '${initLine}'; printf '%s\\n' '${eventLine}'; read request; printf '%s\\n' '${responseLine}'; read ignored || true"
     }
 
     private func gitCodeNoWritebackResponseScript(): String {
@@ -1076,6 +1091,48 @@ public class ServicePluginHostTest {
                 @Expect(message.contains("GitCode 回复已写回"), true)
                 @Expect(message.contains("写回状态未知/超时"), false)
                 @Expect(message.contains("\"replyUrl\""), false)
+            } finally {
+                setServicePluginWebhookSubscribersProviderForTest(None<(ServicePluginAcceptedGitCodeEvent) -> ArrayList<ServicePluginDeliveryTarget>>)
+                setServicePluginWebhookGeneratedReplyHandlerForTest(None<(ServicePluginAcceptedGitCodeEvent, ServicePluginDeliveryTarget) -> ServicePluginGeneratedReplyResult>)
+                setServicePluginEventDeliveryForTest(None)
+                resetServicePluginGeneratedReplyStateForTest()
+                resetServicePluginHostForTest()
+            }
+        })
+    }
+
+    @TestCase
+    public func tMaintainerEmailT5E2EPos002HostFakeGcmResponseRendersReadableStatus(): Unit {
+        // T5-E2E-POS-002.
+        withServicePluginHostTestHome("service-plugin-maintainer-email-writeback", { _home: Path =>
+            this.registerGitCodeStdioScript(this.gitCodeMaintainerEmailWritebackScript())
+            let messages = ArrayList<String>()
+            let lock = Mutex()
+            setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent =>
+                let rows = ArrayList<ServicePluginDeliveryTarget>()
+                rows.add(ServicePluginDeliveryTarget("telegram", "acct", "peer"))
+                rows
+            }))
+            setServicePluginWebhookGeneratedReplyHandlerForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent, _target: ServicePluginDeliveryTarget =>
+                ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "建议补充回归测试。")
+            }))
+            setServicePluginEventDeliveryForTest(Some({ _target: ServicePluginDeliveryTarget, text: String =>
+                synchronized(lock) { messages.add(text) }
+                ServicePluginEventDeliveryResult(true, "sent")
+            }))
+            try {
+                let started = ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000)
+                @Expect(started.ok, true)
+                @Expect(this.waitForMessage(messages, lock, timeoutMillis: 6500), true)
+                let message = this.firstMessage(messages, lock)
+                @Expect(message.contains("GitCode 回复已写回"), true)
+                @Expect(message.contains("维护者提及: 已追加 teamLeader=1 codeowner=2"), true)
+                @Expect(message.contains("维护者邮件: 已发送 2"), true)
+                @Expect(message.contains("\"ok\""), false)
+                @Expect(message.contains("\"emailNotificationStatus\""), false)
+                @Expect(message.contains("GitCodeMonitor"), false)
+                @Expect(message.contains("@Team Leader:"), false)
+                @Expect(message.contains("@Codeowner:"), false)
             } finally {
                 setServicePluginWebhookSubscribersProviderForTest(None<(ServicePluginAcceptedGitCodeEvent) -> ArrayList<ServicePluginDeliveryTarget>>)
                 setServicePluginWebhookGeneratedReplyHandlerForTest(None<(ServicePluginAcceptedGitCodeEvent, ServicePluginDeliveryTarget) -> ServicePluginGeneratedReplyResult>)
