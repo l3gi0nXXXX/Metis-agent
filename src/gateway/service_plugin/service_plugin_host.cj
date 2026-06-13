@@ -1739,7 +1739,7 @@ private func servicePluginSupervisorRecordProbe(record: ServicePluginRuntimeReco
 }
 
 private func servicePluginSupervisorStopTimeoutMs(config: ServicePluginSupervisorConfig): Int64 {
-    max(200, min(5000, config.healthTimeoutMs * 10))
+    max(1000, min(5000, config.healthTimeoutMs * 10))
 }
 
 private func recoverServicePlugin(record: ServicePluginRuntimeRecord, reason: String, nowMs!: Int64 = servicePluginNowMs()): Bool {
