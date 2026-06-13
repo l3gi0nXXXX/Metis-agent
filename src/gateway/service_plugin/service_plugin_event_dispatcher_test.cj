@@ -1,7 +1,7 @@
 package metis.gateway.service_plugin
 import std.collection.ArrayList
 import std.unittest.testmacro.*
-import stdx.encoding.json.JsonObject
+import stdx.encoding.json.{JsonObject, JsonValue}
 
 @Test
 public class ServicePluginEventDispatcherTest {
@@ -21,6 +21,10 @@ public class ServicePluginEventDispatcherTest {
 
     private func jsonString(obj: JsonObject, key: String): String {
         try { obj.get(key).getOrThrow().asString().getValue() } catch (_: Exception) { "" }
+    }
+
+    private func jsonBool(obj: JsonObject, key: String): Bool {
+        try { obj.get(key).getOrThrow().asBool().getValue() } catch (_: Exception) { false }
     }
 
     private func target(channel!: String = "telegram", peerId!: String = "peer-secret"): ServicePluginDeliveryTarget {
@@ -61,6 +65,27 @@ public class ServicePluginEventDispatcherTest {
         ServiceFrame("event", "accepted-contract-${eventId}", "gitcode-monitor", method: "emitCapabilityEvent", capabilityId: "gitcode.event.accepted", payload: payload)
     }
 
+    private func acceptedMaintainerContractFrame(jobId!: String = "webhook-d1", eventId!: String = "gitcode:Cangjie/cangjie_tools:issue:maintainer-123"): ServiceFrame {
+        let payload = "{" +
+            "\"jobId\":\"${jobId}\"," +
+            "\"eventId\":\"${eventId}\"," +
+            "\"repo\":\"Cangjie/cangjie_tools\"," +
+            "\"kind\":\"issue\"," +
+            "\"number\":\"123\"," +
+            "\"title\":\"[Bug]: build failed\"," +
+            "\"url\":\"https://gitcode.com/Cangjie/cangjie_tools/issues/123\"," +
+            "\"content\":\"redacted compact legacy content\"," +
+            "\"contractVersion\":\"${this.gitCodeReviewContractVersion}\"," +
+            "\"reviewRequest\":{" +
+                "\"schemaVersion\":1," +
+                "\"event\":{\"eventId\":\"${eventId}\",\"eventType\":\"issue\",\"repo\":{\"fullName\":\"Cangjie/cangjie_tools\"},\"item\":{\"number\":\"123\",\"title\":\"[Bug]: build failed\",\"url\":\"https://gitcode.com/Cangjie/cangjie_tools/issues/123\"}}," +
+                "\"maintainers\":{\"teamLeaderStatus\":\"resolved\",\"codeownerStatus\":\"resolved\",\"teamLeaders\":[{\"mention\":\"@alice\"}],\"codeowners\":[{\"mention\":\"@bob\"},{\"mention\":\"@carol\"}]}," +
+                "\"diagnostics\":[]" +
+            "}" +
+        "}"
+        ServiceFrame("event", "accepted-contract-maintainers-${eventId}", "gitcode-monitor", method: "emitCapabilityEvent", capabilityId: "gitcode.event.accepted", payload: payload)
+    }
+
     private func acceptedCommentContextFrame(): ServiceFrame {
         let parentBody = this.repeatText("parent-context-", 650)
         let payload = "{" +
@@ -99,6 +124,31 @@ public class ServicePluginEventDispatcherTest {
         ServiceFrame("event", "accepted-comment-context", "gitcode-monitor", method: "emitCapabilityEvent", capabilityId: "gitcode.event.accepted", payload: payload)
     }
 
+    private func acceptedLargeChineseReviewRequestFrame(): ServiceFrame {
+        let context = this.repeatText("多轮中文上下文片段，包含历史评论和触发评论。", 1050)
+        let eventId = "gitcode:Cangjie/community:comment:large-cn"
+        let payload = "{" +
+            "\"jobId\":\"webhook-large-cn\"," +
+            "\"eventId\":\"${eventId}\"," +
+            "\"repo\":\"Cangjie/community\"," +
+            "\"kind\":\"comment\"," +
+            "\"number\":\"4\"," +
+            "\"commentId\":\"9003\"," +
+            "\"title\":\"Issue 4\"," +
+            "\"url\":\"https://gitcode.com/Cangjie/community/issues/4#note_9003\"," +
+            "\"content\":\"触发评论\"," +
+            "\"contractVersion\":\"${this.gitCodeReviewContractVersion}\"," +
+            "\"reviewRequest\":{" +
+                "\"schemaVersion\":1," +
+                "\"event\":{\"eventId\":\"${eventId}\",\"eventType\":\"comment\",\"repo\":{\"fullName\":\"Cangjie/community\"},\"item\":{\"number\":\"4\",\"title\":\"Issue 4\",\"url\":\"https://gitcode.com/Cangjie/community/issues/4\"},\"comment\":{\"commentId\":\"9003\",\"body\":\"触发评论\",\"url\":\"https://gitcode.com/Cangjie/community/issues/4#note_9003\"}}," +
+                "\"context\":{\"status\":\"resolved\",\"body\":\"中文上下文起点 ${context}\"}," +
+                "\"maintainers\":{\"teamLeaderStatus\":\"resolved\",\"codeownerStatus\":\"resolved\",\"teamLeaders\":[{\"mention\":\"@alice\"}],\"codeowners\":[{\"mention\":\"@bob\"}]}," +
+                "\"diagnostics\":[]" +
+            "}" +
+        "}"
+        ServiceFrame("event", "accepted-large-cn", "gitcode-monitor", method: "emitCapabilityEvent", capabilityId: "gitcode.event.accepted", payload: payload)
+    }
+
     private func registerGitCodeWritebackPlugin(): Unit {
         resetServicePluginHostForTest()
         let caps = ArrayList<ServiceCapabilityRecord>()
@@ -132,6 +182,51 @@ public class ServicePluginEventDispatcherTest {
             out.add(target)
         }
         out
+    }
+
+    private func assertWritebackNotificationSafe(text: String): Unit {
+        @Expect(text.contains("\"ok\""), false)
+        @Expect(text.contains("\"result\""), false)
+        @Expect(text.contains("\"image\""), false)
+        @Expect(text.contains("\"schedule\""), false)
+        @Expect(text.contains("\"sessions\""), false)
+        @Expect(text.contains("token"), false)
+        @Expect(text.contains("/Users/"), false)
+        @Expect(text.contains("auto-reply"), false)
+        @Expect(text.contains("bot"), false)
+        @Expect(text.contains("generated by"), false)
+        @Expect(text.contains("GitCodeMonitor"), false)
+        @Expect(text.contains("@Team Leader:"), false)
+        @Expect(text.contains("@Codeowner:"), false)
+    }
+
+    private func dispatchWithFakeWritebackResponse(responsePayload: String, eventId!: String = "gitcode:Cangjie/cangjie_tools:issue:maintainer-response"): String {
+        this.resetDispatcherHooks()
+        this.registerGitCodeWritebackPlugin()
+        let messages = ArrayList<String>()
+        setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent =>
+            this.targetRows([this.target(channel: "telegram", peerId: "tg-peer")])
+        }))
+        setServicePluginWebhookGeneratedReplyHandlerForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent, _target: ServicePluginDeliveryTarget =>
+            ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "建议补充回归测试。")
+        }))
+        setServicePluginCapabilityInvokerForTest(Some({ _registration: ServicePluginRegistration, request: CapabilityInvokeRequest =>
+            CapabilityInvokeResult(true, "ok", serviceId: "gitcode-monitor", capabilityId: request.capabilityId, payload: responsePayload)
+        }))
+        setServicePluginEventDeliveryForTest(Some({ _target: ServicePluginDeliveryTarget, text: String =>
+            messages.add(text)
+            ServicePluginEventDeliveryResult(true, "sent")
+        }))
+        var message = ""
+        try {
+            let result = dispatchServicePluginEvent(this.acceptedContractFrame(eventId: eventId), store: ServicePluginPendingJobStore())
+            @Expect(result.ok, true)
+            @Expect(messages.size, 1)
+            message = messages[0]
+        } finally {
+            this.resetDispatcherHooks()
+        }
+        message
     }
 
     @TestCase
@@ -948,6 +1043,56 @@ public class ServicePluginEventDispatcherTest {
     }
 
     @TestCase
+    public func tMaintainerEmailT0T2T5PayloadStaysMinimalAndDoesNotCarryMaintainerFacts(): Unit {
+        // T0-METIS-UNIT-001, T2-METIS-REG-001, T5-E2E-POS-002.
+        this.resetDispatcherHooks()
+        this.registerGitCodeWritebackPlugin()
+        let payloads = ArrayList<String>()
+        let messages = ArrayList<String>()
+        setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent =>
+            this.targetRows([this.target(channel: "telegram", peerId: "tg-peer")])
+        }))
+        setServicePluginWebhookGeneratedReplyHandlerForTest(Some({ event: ServicePluginAcceptedGitCodeEvent, _target: ServicePluginDeliveryTarget =>
+            @Expect(event.reviewRequestRaw.contains("\"maintainers\""), true)
+            ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "建议补充回归测试。")
+        }))
+        setServicePluginCapabilityInvokerForTest(Some({ _registration: ServicePluginRegistration, request: CapabilityInvokeRequest =>
+            payloads.add(request.payload)
+            let root = JsonValue.fromStr(request.payload).asObject()
+            @Expect(this.jsonString(root, "contractVersion"), this.gitCodeReviewContractVersion)
+            @Expect(this.jsonString(root, "eventId"), "gitcode:Cangjie/cangjie_tools:issue:maintainer-123")
+            @Expect(this.jsonString(root, "repo"), "Cangjie/cangjie_tools")
+            @Expect(this.jsonString(root, "kind"), "issue")
+            @Expect(this.jsonString(root, "number"), "123")
+            @Expect(this.jsonString(root, "commentId"), "")
+            @Expect(this.jsonString(root, "url"), "https://gitcode.com/Cangjie/cangjie_tools/issues/123")
+            @Expect(this.jsonString(root, "draft"), "建议补充回归测试。")
+            @Expect(this.jsonString(root, "summary"), "")
+            @Expect(this.jsonString(root, "safety"), "approved")
+            @Expect(this.jsonBool(root, "needsHumanReview"), false)
+            @Expect(request.payload.contains("\"maintainers\""), false)
+            @Expect(request.payload.contains("\"reviewRequest\""), false)
+            @Expect(request.payload.contains("\"teamLeaderCount\""), false)
+            @Expect(request.payload.contains("\"codeownerCount\""), false)
+            @Expect(request.payload.contains("\"emailNotificationStatus\""), false)
+            CapabilityInvokeResult(true, "ok", serviceId: "gitcode-monitor", capabilityId: request.capabilityId, payload: "{\"status\":\"posted\",\"posted\":true,\"replyUrl\":\"https://gitcode.com/Cangjie/cangjie_tools/issues/123#note_9\"}")
+        }))
+        setServicePluginEventDeliveryForTest(Some({ _target: ServicePluginDeliveryTarget, text: String =>
+            messages.add(text)
+            ServicePluginEventDeliveryResult(true, "sent")
+        }))
+        try {
+            let result = dispatchServicePluginEvent(this.acceptedMaintainerContractFrame(), store: ServicePluginPendingJobStore())
+            @Expect(result.ok, true)
+            @Expect(result.status, "generated_reply_delivered")
+            @Expect(payloads.size, 1)
+            @Expect(messages.size, 1)
+        } finally {
+            this.resetDispatcherHooks()
+        }
+    }
+
+    @TestCase
     public func draftM3B001PendingJobJsonArrayDraftNeedsHumanReviewWithoutWriteback(): Unit {
         // DRAFT-M3-B-001.
         this.resetDispatcherHooks()
@@ -1200,6 +1345,50 @@ public class ServicePluginEventDispatcherTest {
     }
 
     @TestCase
+    public func tMaintainerEmailT5Bound003LargeChineseReviewRequestDoesNotPolluteWriteback(): Unit {
+        // T5-E2E-BOUND-003.
+        this.resetDispatcherHooks()
+        this.registerGitCodeWritebackPlugin()
+        let payloads = ArrayList<String>()
+        let messages = ArrayList<String>()
+        setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent =>
+            this.targetRows([this.target(channel: "telegram", peerId: "tg-peer")])
+        }))
+        setServicePluginWebhookGeneratedReplyHandlerForTest(Some({ event: ServicePluginAcceptedGitCodeEvent, _target: ServicePluginDeliveryTarget =>
+            @Expect(event.reviewRequestRaw.contains("中文上下文起点"), true)
+            @Expect(event.reviewRequestRaw.contains("\"maintainers\""), true)
+            ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "建议补充中文上下文回归测试。")
+        }))
+        setServicePluginCapabilityInvokerForTest(Some({ _registration: ServicePluginRegistration, request: CapabilityInvokeRequest =>
+            payloads.add(request.payload)
+            @Expect(request.payload.contains("\"eventId\""), true)
+            @Expect(request.payload.contains("gitcode:Cangjie/community:comment:large-cn"), true)
+            @Expect(request.payload.contains("\"draft\""), true)
+            @Expect(request.payload.contains("建议补充中文上下文回归测试。"), true)
+            @Expect(request.payload.contains("\"reviewRequest\""), false)
+            @Expect(request.payload.contains("\"maintainers\""), false)
+            @Expect(request.payload.contains("中文上下文起点"), false)
+            CapabilityInvokeResult(true, "ok", serviceId: "gitcode-monitor", capabilityId: request.capabilityId, payload: "{\"status\":\"posted\",\"posted\":true,\"maintainerMentionAppended\":true,\"teamLeaderCount\":1,\"codeownerCount\":1,\"contextSource\":\"store\",\"emailNotificationStatus\":\"email_unavailable\"}")
+        }))
+        setServicePluginEventDeliveryForTest(Some({ _target: ServicePluginDeliveryTarget, text: String =>
+            messages.add(text)
+            ServicePluginEventDeliveryResult(true, "sent")
+        }))
+        try {
+            let result = dispatchServicePluginEvent(this.acceptedLargeChineseReviewRequestFrame(), store: ServicePluginPendingJobStore())
+            @Expect(result.ok, true)
+            @Expect(result.status, "generated_reply_delivered")
+            @Expect(payloads.size, 1)
+            @Expect(messages.size, 1)
+            @Expect(messages[0].contains("维护者提及: 已追加 teamLeader=1 codeowner=1"), true)
+            @Expect(messages[0].contains("维护者邮件: 无可用邮箱"), true)
+            this.assertWritebackNotificationSafe(messages[0])
+        } finally {
+            this.resetDispatcherHooks()
+        }
+    }
+
+    @TestCase
     public func tWriteback012TimeoutStillNotifiesDraft(): Unit {
         this.resetDispatcherHooks()
         this.registerGitCodeWritebackPlugin()
@@ -1327,6 +1516,147 @@ public class ServicePluginEventDispatcherTest {
         } finally {
             this.resetDispatcherHooks()
         }
+    }
+
+    @TestCase
+    public func tMaintainerEmailT4Pos001PostedMentionAndEmailSentAreHumanReadable(): Unit {
+        // T4-METIS-POS-001.
+        let parsed = this.dispatchWithFakeWritebackResponse("{\"status\":\"posted\",\"posted\":true,\"replyUrl\":\"https://gitcode.com/Cangjie/community/pulls/71#note_9\",\"maintainerMentionAppended\":true,\"teamLeaderCount\":1,\"codeownerCount\":2,\"contextSource\":\"store\",\"emailNotificationStatus\":\"sent\",\"emailSentCount\":2}")
+        @Expect(parsed.contains("维护者提及: 已追加 teamLeader=1 codeowner=2"), true)
+        @Expect(parsed.contains("维护者邮件: 已发送 2"), true)
+        this.assertWritebackNotificationSafe(parsed)
+
+        let event = ServicePluginAcceptedGitCodeEvent(repo: "Cangjie/community", kind: "pr", number: "71", url: "https://gitcode.com/Cangjie/community/pulls/71")
+        let text = renderServicePluginGeneratedReplyNotification(
+            event,
+            ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "建议补充测试。"),
+            writeback: ServicePluginWritebackApplyState(
+                configured: true,
+                ok: true,
+                status: "posted",
+                posted: true,
+                replyUrl: "https://gitcode.com/Cangjie/community/pulls/71#note_9",
+                maintainerMentionAppended: true,
+                teamLeaderCount: 1,
+                codeownerCount: 2,
+                contextSource: "store",
+                emailNotificationStatus: "sent",
+                emailSentCount: 2
+            )
+        )
+        @Expect(text.contains("GitCode 回复已写回"), true)
+        @Expect(text.contains("维护者提及: 已追加 teamLeader=1 codeowner=2"), true)
+        @Expect(text.contains("维护者邮件: 已发送 2"), true)
+        this.assertWritebackNotificationSafe(text)
+    }
+
+    @TestCase
+    public func tMaintainerEmailT4Neg001PostedWithSendFailedKeepsCommentSuccess(): Unit {
+        // T4-METIS-NEG-001.
+        let parsed = this.dispatchWithFakeWritebackResponse("{\"status\":\"posted\",\"posted\":true,\"maintainerMentionAppended\":true,\"teamLeaderCount\":1,\"codeownerCount\":0,\"emailNotificationStatus\":\"send_failed\",\"emailFailedCount\":2,\"emailRetryable\":true}", eventId: "gitcode:Cangjie/cangjie_tools:issue:send-failed")
+        @Expect(parsed.contains("GitCode 回复已写回"), true)
+        @Expect(parsed.contains("维护者邮件: 发送失败"), true)
+        @Expect(parsed.contains("可重试"), true)
+        @Expect(parsed.contains("写回结果异常"), false)
+        this.assertWritebackNotificationSafe(parsed)
+
+        let event = ServicePluginAcceptedGitCodeEvent(repo: "Cangjie/community", kind: "issue", number: "72", url: "https://gitcode.com/Cangjie/community/issues/72")
+        let text = renderServicePluginGeneratedReplyNotification(
+            event,
+            ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "建议补充测试。"),
+            writeback: ServicePluginWritebackApplyState(
+                configured: true,
+                ok: true,
+                status: "posted",
+                posted: true,
+                maintainerMentionAppended: true,
+                teamLeaderCount: 1,
+                codeownerCount: 0,
+                emailNotificationStatus: "send_failed",
+                emailFailedCount: 2,
+                emailRetryable: true
+            )
+        )
+        @Expect(text.contains("GitCode 回复已写回"), true)
+        @Expect(text.contains("维护者邮件: 发送失败"), true)
+        @Expect(text.contains("2"), true)
+        @Expect(text.contains("可重试"), true)
+        @Expect(text.contains("写回结果异常"), false)
+        this.assertWritebackNotificationSafe(text)
+    }
+
+    @TestCase
+    public func tMaintainerEmailT4Bound001LegacyPostedResponseMissingFieldsStillRenders(): Unit {
+        // T4-METIS-BOUND-001.
+        let parsed = this.dispatchWithFakeWritebackResponse("{\"status\":\"posted\",\"posted\":true}", eventId: "gitcode:Cangjie/cangjie_tools:issue:legacy")
+        @Expect(parsed.contains("GitCode 回复已写回"), true)
+        @Expect(parsed.contains("维护者提及"), false)
+        @Expect(parsed.contains("维护者邮件"), false)
+        this.assertWritebackNotificationSafe(parsed)
+
+        let event = ServicePluginAcceptedGitCodeEvent(repo: "Cangjie/community", kind: "issue", number: "72", url: "https://gitcode.com/Cangjie/community/issues/72")
+        let text = renderServicePluginGeneratedReplyNotification(
+            event,
+            ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "建议补充测试。"),
+            writeback: ServicePluginWritebackApplyState(configured: true, ok: true, status: "posted", posted: true)
+        )
+        @Expect(text.contains("GitCode 回复已写回"), true)
+        @Expect(text.contains("维护者提及"), false)
+        @Expect(text.contains("维护者邮件"), false)
+        this.assertWritebackNotificationSafe(text)
+    }
+
+    @TestCase
+    public func tMaintainerEmailUnavailableAndDisabledStatusesAreHumanReadable(): Unit {
+        let parsedUnavailable = this.dispatchWithFakeWritebackResponse("{\"status\":\"posted\",\"posted\":true,\"emailNotificationStatus\":\"email_unavailable\"}", eventId: "gitcode:Cangjie/cangjie_tools:issue:email-unavailable")
+        @Expect(parsedUnavailable.contains("维护者邮件: 无可用邮箱"), true)
+        this.assertWritebackNotificationSafe(parsedUnavailable)
+
+        let event = ServicePluginAcceptedGitCodeEvent(repo: "Cangjie/community", kind: "issue", number: "72", url: "https://gitcode.com/Cangjie/community/issues/72")
+        let unavailable = renderServicePluginGeneratedReplyNotification(
+            event,
+            ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "建议补充测试。"),
+            writeback: ServicePluginWritebackApplyState(configured: true, ok: true, status: "posted", posted: true, emailNotificationStatus: "email_unavailable")
+        )
+        @Expect(unavailable.contains("维护者邮件: 无可用邮箱"), true)
+        this.assertWritebackNotificationSafe(unavailable)
+
+        let disabled = renderServicePluginGeneratedReplyNotification(
+            event,
+            ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "建议补充测试。"),
+            writeback: ServicePluginWritebackApplyState(configured: true, ok: true, status: "posted", posted: true, emailNotificationStatus: "email_disabled")
+        )
+        @Expect(disabled.contains("维护者邮件: 未启用"), true)
+        this.assertWritebackNotificationSafe(disabled)
+    }
+
+    @TestCase
+    public func tMaintainerEmailT4Reg001ExistingSkipReasonsRemainHumanReadable(): Unit {
+        // T4-METIS-REG-001.
+        let event = ServicePluginAcceptedGitCodeEvent(repo: "Cangjie/community", kind: "issue", number: "1", url: "https://gitcode.com/Cangjie/community/issues/1")
+        let dryRun = renderServicePluginGeneratedReplyNotification(
+            event,
+            ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "草稿。"),
+            writeback: ServicePluginWritebackApplyState(configured: true, ok: true, status: "dry_run", skipped: true, diagnostic: "dry_run")
+        )
+        @Expect(dryRun.contains("dryRun=true"), true)
+        this.assertWritebackNotificationSafe(dryRun)
+
+        let denied = renderServicePluginGeneratedReplyNotification(
+            event,
+            ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "草稿。"),
+            writeback: ServicePluginWritebackApplyState(configured: true, ok: true, status: "skipped", skipped: true, diagnostic: "repo_denied_by_writeback_scope")
+        )
+        @Expect(denied.contains("该仓库被 GCM writebackScope.deniedRepos 排除，已生成草稿但未写回 GitCode"), true)
+        this.assertWritebackNotificationSafe(denied)
+
+        let notAllowlisted = renderServicePluginGeneratedReplyNotification(
+            event,
+            ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "草稿。"),
+            writeback: ServicePluginWritebackApplyState(configured: true, ok: true, status: "repo_not_allowlisted", skipped: true)
+        )
+        @Expect(notAllowlisted.contains("当前仓库未命中 GCM writebackScope 允许范围，已生成草稿但未写回 GitCode"), true)
+        this.assertWritebackNotificationSafe(notAllowlisted)
     }
 
     @TestCase
