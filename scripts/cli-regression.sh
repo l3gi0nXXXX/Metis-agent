@@ -131,7 +131,7 @@ assert_contains "$root_help_out" "Docs: https://docs.metis.ai/cli"
 echo "[cli-regression] version"
 version_out="$(run_cli --version)"
 printf '%s\n' "$version_out"
-assert_contains "$version_out" "0.1.5"
+assert_contains "$version_out" "0.2.1-alpha.01"
 
 echo "[cli-regression] root prompt requires gateway"
 root_prompt_fail_out="$(run_cli --prompt hello 2>&1 || true)"

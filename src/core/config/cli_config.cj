@@ -16,7 +16,7 @@ protected class CliConfig {
     /**
      * The version of Magic Cli
      */
-    public static const version = "0.1.5"
+    public static const version = "0.2.1-alpha.01"
 
     private static const AGENTS_FILE_NAME = "AGENTS.md"
 
