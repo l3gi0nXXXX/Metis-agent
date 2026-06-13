@@ -138,7 +138,7 @@ public class CodexAppServerClient <: CodexAppServerTransport {
                     case None => return JsonObject()
                 }
             case None =>
-                let message = codexAppServerTimeoutMessage(method, this.diagnosticsWithGrace(120))
+                let message = codexAppServerTimeoutMessage(method, this.diagnosticsWithGrace(500))
                 try { this.close() } catch (_: Exception) { () }
                 throw CodexAppServerProtocolException(message, code: -32001)
         }
