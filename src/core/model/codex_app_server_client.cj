@@ -138,8 +138,10 @@ public class CodexAppServerClient <: CodexAppServerTransport {
                     case None => return JsonObject()
                 }
             case None =>
-                let message = codexAppServerTimeoutMessage(method, this.diagnosticsWithGrace(2000))
-                try { this.close() } catch (_: Exception) { () }
+                let diagnosticsBeforeClose = this.diagnosticsWithGrace(1200)
+                try { this.closeAfterTimeoutForDiagnostics() } catch (_: Exception) { () }
+                let diagnosticsAfterClose = if (!diagnosticsBeforeClose.isEmpty()) { diagnosticsBeforeClose } else { this.diagnostics() }
+                let message = codexAppServerTimeoutMessage(method, diagnosticsAfterClose)
                 throw CodexAppServerProtocolException(message, code: -32001)
         }
     }
@@ -207,27 +209,66 @@ public class CodexAppServerClient <: CodexAppServerTransport {
     }
 
     public func close(): Unit {
+        this.closeInternal(120)
+    }
+
+    private func closeAfterTimeoutForDiagnostics(): Unit {
+        this.closeInternal(1200)
+    }
+
+    private func closeInternal(diagnosticTailMs: Int64): Unit {
         var processToStop = None<SubProcess>
         var rootPid: Int64 = 0
+        var stdoutToCancel = None<Future<Unit>>
+        var stderrToCancel = None<Future<Unit>>
         synchronized(this.lock) {
-            try { this.stdoutFuture?.cancel() } catch (_: Exception) { () }
-            try { this.stderrFuture?.cancel() } catch (_: Exception) { () }
             match (this.process) {
                 case Some(proc) =>
                     processToStop = Some(proc)
                     rootPid = proc.pid
                 case None => ()
             }
-            this.process = None<SubProcess>
             this.writer = None<StringWriter<OutputStream>>
+            stdoutToCancel = this.stdoutFuture
+            stderrToCancel = this.stderrFuture
         }
         match (processToStop) {
             case Some(proc) => codexAppServerTerminateProcessTree(proc, rootPid)
             case None => ()
         }
+        this.waitForReaderDiagnosticTail(diagnosticTailMs)
+        synchronized(this.lock) {
+            this.process = None<SubProcess>
+            this.stdoutFuture = None<Future<Unit>>
+            this.stderrFuture = None<Future<Unit>>
+        }
+        try { stdoutToCancel?.cancel() } catch (_: Exception) { () }
+        try { stderrToCancel?.cancel() } catch (_: Exception) { () }
         this.responses.close()
         this.serverRequests.close()
         this.notifications.close()
+    }
+
+    private func waitForReaderDiagnosticTail(waitMs: Int64): Unit {
+        if (waitMs <= 0) {
+            return
+        }
+        let started = DateTime.now().toUnixTimeStamp().toMilliseconds()
+        var previousCount: Int64 = -1
+        var stableTicks: Int64 = 0
+        while (DateTime.now().toUnixTimeStamp().toMilliseconds() - started < waitMs) {
+            sleep(Duration.millisecond * 20)
+            let count = this.diagnostics().size
+            if (count > 0 && count == previousCount) {
+                stableTicks += 1
+                if (stableTicks >= 2) {
+                    return
+                }
+            } else {
+                previousCount = count
+                stableTicks = 0
+            }
+        }
     }
 
     private func send(obj: JsonObject): Unit {
