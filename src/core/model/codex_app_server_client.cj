@@ -9,6 +9,9 @@ import std.sync.*
 import std.time.*
 import stdx.encoding.json.{JsonInt, JsonObject, JsonString, JsonValue}
 
+private const CODEX_APP_SERVER_TIMEOUT_DIAGNOSTIC_GRACE_MS: Int64 = 3000
+private const CODEX_APP_SERVER_READER_DEAD_EMPTY_READ_LIMIT: Int64 = 30
+
 public class CodexAppServerProtocolException <: Exception {
     public let code: Int64
     public let data: JsonObject
@@ -138,9 +141,9 @@ public class CodexAppServerClient <: CodexAppServerTransport {
                     case None => return JsonObject()
                 }
             case None =>
-                let diagnosticsBeforeClose = this.diagnosticsWithGrace(1200)
+                let diagnosticsBeforeClose = this.diagnosticsWithGrace(CODEX_APP_SERVER_TIMEOUT_DIAGNOSTIC_GRACE_MS)
                 try { this.closeAfterTimeoutForDiagnostics() } catch (_: Exception) { () }
-                let diagnosticsAfterClose = if (!diagnosticsBeforeClose.isEmpty()) { diagnosticsBeforeClose } else { this.diagnostics() }
+                let diagnosticsAfterClose = codexAppServerMergeDiagnostics(diagnosticsBeforeClose, this.diagnostics())
                 let message = codexAppServerTimeoutMessage(method, diagnosticsAfterClose)
                 throw CodexAppServerProtocolException(message, code: -32001)
         }
@@ -213,7 +216,7 @@ public class CodexAppServerClient <: CodexAppServerTransport {
     }
 
     private func closeAfterTimeoutForDiagnostics(): Unit {
-        this.closeInternal(1200)
+        this.closeInternal(CODEX_APP_SERVER_TIMEOUT_DIAGNOSTIC_GRACE_MS)
     }
 
     private func closeInternal(diagnosticTailMs: Int64): Unit {
@@ -289,6 +292,7 @@ public class CodexAppServerClient <: CodexAppServerTransport {
     }
 
     private func readStdout(reader: StringReader<InputStream>): Unit {
+        var deadEmptyReads: Int64 = 0
         while (true) {
             if (Thread.currentThread.hasPendingCancellation) {
                 break
@@ -296,11 +300,17 @@ public class CodexAppServerClient <: CodexAppServerTransport {
             let line = try { reader.readln() ?? "" } catch (_: Exception) { "" }
             if (line.isEmpty()) {
                 if (!this.isAlive()) {
-                    break
+                    deadEmptyReads += 1
+                    if (deadEmptyReads >= CODEX_APP_SERVER_READER_DEAD_EMPTY_READ_LIMIT) {
+                        break
+                    }
+                } else {
+                    deadEmptyReads = 0
                 }
                 sleep(Duration.millisecond * 10)
                 continue
             }
+            deadEmptyReads = 0
             let parsed = codexAppServerParseStdoutLine(line)
             match (parsed.kind) {
                 case "response" => this.responses.append(parsed.message)
@@ -316,6 +326,7 @@ public class CodexAppServerClient <: CodexAppServerTransport {
     }
 
     private func readStderr(reader: StringReader<InputStream>): Unit {
+        var deadEmptyReads: Int64 = 0
         while (true) {
             if (Thread.currentThread.hasPendingCancellation) {
                 break
@@ -323,11 +334,17 @@ public class CodexAppServerClient <: CodexAppServerTransport {
             let line = try { reader.readln() ?? "" } catch (_: Exception) { "" }
             if (line.isEmpty()) {
                 if (!this.isAlive()) {
-                    break
+                    deadEmptyReads += 1
+                    if (deadEmptyReads >= CODEX_APP_SERVER_READER_DEAD_EMPTY_READ_LIMIT) {
+                        break
+                    }
+                } else {
+                    deadEmptyReads = 0
                 }
                 sleep(Duration.millisecond * 10)
                 continue
             }
+            deadEmptyReads = 0
             this.diagnosticsBuffer.append(codexAppServerRedactDiagnostic(line))
         }
     }
@@ -515,6 +532,23 @@ private func codexAppServerTimeoutMessage(method: String, diagnostics: Array<Str
         return base
     }
     "${base}; diagnostics: ${diag}"
+}
+
+private func codexAppServerMergeDiagnostics(first: Array<String>, second: Array<String>): Array<String> {
+    let out = ArrayList<String>()
+    for (line in first) {
+        let text = codexAppServerRedactDiagnostic(line).trimAscii()
+        if (!text.isEmpty() && !out.contains(text)) {
+            out.add(text)
+        }
+    }
+    for (line in second) {
+        let text = codexAppServerRedactDiagnostic(line).trimAscii()
+        if (!text.isEmpty() && !out.contains(text)) {
+            out.add(text)
+        }
+    }
+    out.toArray()
 }
 
 private func codexAppServerJoinDiagnostics(diagnostics: Array<String>): String {
