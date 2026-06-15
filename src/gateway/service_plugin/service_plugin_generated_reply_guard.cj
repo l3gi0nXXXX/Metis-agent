@@ -57,6 +57,7 @@ public func validateServicePluginGeneratedDraft(rawDraft: String): ServicePlugin
             if (servicePluginDraftJsonValueIsArray(value)) {
                 return servicePluginDraftGuardRejected("draft_raw_json", "", diagnostic: "Generated draft is raw JSON array; diagnosticHash=${redacted.rawHash}", diagnosticHash: redacted.rawHash)
             }
+            return servicePluginDraftGuardRejected("draft_raw_json_scalar", "", diagnostic: "Generated draft is raw JSON scalar; diagnosticHash=${redacted.rawHash}", diagnosticHash: redacted.rawHash)
         case None => ()
     }
 
@@ -162,5 +163,19 @@ private func servicePluginDraftContainsForbiddenMarker(text: String): Bool {
         lower.contains("gitcodemonitor") ||
         lower.contains("<!--") ||
         lower.contains("hidden marker") ||
-        lower.contains("bot attribution")
+        lower.contains("bot attribution") ||
+        lower.contains("functions._answer_") ||
+        lower.contains("functions.answer") ||
+        lower.contains("\"_answer_\"") ||
+        lower.contains("tool_call") ||
+        lower.contains("toolcalls") ||
+        servicePluginDraftLooksLikeJsonFence(lower)
+}
+
+private func servicePluginDraftLooksLikeJsonFence(lower: String): Bool {
+    let trimmed = lower.trimAscii()
+    if (trimmed.startsWith("```json")) {
+        return true
+    }
+    trimmed.startsWith("```\n{") || trimmed.startsWith("```\n[")
 }
