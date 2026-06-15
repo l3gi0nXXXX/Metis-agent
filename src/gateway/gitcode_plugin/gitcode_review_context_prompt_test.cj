@@ -757,9 +757,12 @@ public class GitCodeReviewContextPromptTest {
         @Expect(acceptedPr.prompt.contains("测试自验证=passed"), true)
 
         let accepted = buildGitCodeReplyPromptForServicePluginEvent(this.acceptedEvent("issue", issueKind: "bug", title: "bug", content: "复现"), templates)
-        @Expect(accepted.expectsJsonOutput, true)
+        @Expect(accepted.expectsJsonOutput, false)
         @Expect(accepted.prompt.contains("StructuredTask"), true)
         @Expect(accepted.prompt.contains("UserProvidedData"), true)
+        @Expect(accepted.prompt.contains("IMMUTABLE_OUTPUT_SCHEMA"), false)
+        @Expect(accepted.prompt.contains("只输出裸 JSON object"), false)
+        @Expect(accepted.prompt.contains("只输出可直接发送的中文回复草稿正文"), true)
 
         let legacy = buildGitCodeReplyPromptForServicePluginEvent(this.acceptedEvent("legacy", reviewRequestRaw: ""), templates)
         @Expect(legacy.expectsJsonOutput, false)
@@ -788,8 +791,10 @@ public class GitCodeReviewContextPromptTest {
             ]
             let sentinels = ["PROMPT-P4-issue-bug", "PROMPT-P4-issue-feature", "PROMPT-P4-issue-question", "PROMPT-P4-comment", "PROMPT-P4-pr-english", "PROMPT-P4-pr-chinese"]
             for (i in 0..plans.size) {
-                @Expect(plans[i].expectsJsonOutput, true)
+                @Expect(plans[i].expectsJsonOutput, false)
                 @Expect(plans[i].prompt.contains(sentinels[i]), true)
+                @Expect(plans[i].prompt.contains("只输出裸 JSON object"), false)
+                @Expect(plans[i].prompt.contains("只输出可直接发送的中文回复草稿正文"), true)
             }
         })
     }
@@ -835,9 +840,10 @@ public class GitCodeReviewContextPromptTest {
             let afterPlan = buildGitCodeReplyPromptForServicePluginEvent(this.acceptedEvent("issue", issueKind: "bug", title: "bug", content: "复现"), after)
             @Expect(afterPlan.prompt.contains("PROMPT-P4-after-role"), true)
             @Expect(afterPlan.prompt.contains("IMMUTABLE_SYSTEM_GUARD"), true)
-            @Expect(afterPlan.prompt.contains("IMMUTABLE_OUTPUT_SCHEMA"), true)
-            @Expect(afterPlan.prompt.contains("不要使用 Markdown 代码块"), true)
-            @Expect(afterPlan.prompt.contains("三反引号 json fence"), true)
+            @Expect(afterPlan.prompt.contains("IMMUTABLE_OUTPUT_SCHEMA"), false)
+            @Expect(afterPlan.prompt.contains("IMMUTABLE_OUTPUT_PLAIN_DRAFT"), true)
+            @Expect(afterPlan.prompt.contains("只输出可直接发送的中文回复草稿正文"), true)
+            @Expect(afterPlan.prompt.contains("不要输出 JSON"), true)
             @Expect(afterPlan.prompt.contains("UserProvidedData"), true)
             @Expect(afterPlan.prompt.contains("Evidence"), true)
         })

@@ -115,9 +115,9 @@ private func promptJsonObjectHasFields(obj: JsonObject): Bool {
     obj.toJsonString() != "{}"
 }
 
-private func buildPrompt(template: GitCodePromptTemplate, input: PromptInputV1, extra: Array<String>): String {
+private func buildPrompt(template: GitCodePromptTemplate, input: PromptInputV1, extra: Array<String>, outputMode!: String = GITCODE_PROMPT_OUTPUT_MODE_JSON_OBJECT): String {
     let lines = ArrayList<String>()
-    lines.add(renderPromptTemplate(template, input))
+    lines.add(renderPromptTemplate(template, input, outputMode: outputMode))
     lines.add("")
     lines.add("StructuredTask")
     for (line in extra) {
@@ -135,7 +135,15 @@ private func buildPrompt(template: GitCodePromptTemplate, input: PromptInputV1, 
     gitCodeReviewRedactSensitiveText(String.join(lines.toArray(), delimiter: "\n"))
 }
 
-public func buildBugIssuePrompt(input: PromptInputV1, templates: GitCodePromptTemplateSet): String {
+private func plainDraftReviewInstruction(outputMode: String): String {
+    if (gitCodePromptUsesPlainDraftOutput(outputMode)) {
+        "证据不足时必须在草稿正文中说明需要维护者人工确认。"
+    } else {
+        "needsHumanReview=true；证据不足时必须明确说明不足。"
+    }
+}
+
+public func buildBugIssuePrompt(input: PromptInputV1, templates: GitCodePromptTemplateSet, outputMode!: String = GITCODE_PROMPT_OUTPUT_MODE_JSON_OBJECT): String {
     let extra = ArrayList<String>()
     extra.add("bugDescription=${promptStr(input.templateFields, "bugDescription")}")
     extra.add("expectedBehavior=${promptStr(input.templateFields, "expectedBehavior")}")
@@ -150,11 +158,13 @@ public func buildBugIssuePrompt(input: PromptInputV1, templates: GitCodePromptTe
     if (branchJson == "[]") { extra.add("missing_branch_versions") }
     extra.add("sourceContext=${safePromptJson(input.sourceContext)}")
     extra.add("CKB evidence=${safePromptJson(input.ckbEvidence)}")
-    extra.add("output schema: header/result/safety/needsHumanReview/citations/diagnostics")
-    buildPrompt(templates.issueBug, input, extra.toArray())
+    if (!gitCodePromptUsesPlainDraftOutput(outputMode)) {
+        extra.add("output schema: header/result/safety/needsHumanReview/citations/diagnostics")
+    }
+    buildPrompt(templates.issueBug, input, extra.toArray(), outputMode: outputMode)
 }
 
-public func buildFeatureIssuePrompt(input: PromptInputV1, templates: GitCodePromptTemplateSet): String {
+public func buildFeatureIssuePrompt(input: PromptInputV1, templates: GitCodePromptTemplateSet, outputMode!: String = GITCODE_PROMPT_OUTPUT_MODE_JSON_OBJECT): String {
     let extra = ArrayList<String>()
     extra.add("featureDescription=${promptStr(input.templateFields, "featureDescription")}")
     extra.add("valueAndScenarios=${promptStr(input.templateFields, "valueAndScenarios")}")
@@ -163,35 +173,37 @@ public func buildFeatureIssuePrompt(input: PromptInputV1, templates: GitCodeProm
     if (promptStatus(input.sourceContext) != "resolved") {
         extra.add("源码证据不足：必须保守评估，不能声称已审源码。")
     }
-    extra.add("output schema: header/result/safety")
-    buildPrompt(templates.issueFeatureRequest, input, extra.toArray())
+    if (!gitCodePromptUsesPlainDraftOutput(outputMode)) {
+        extra.add("output schema: header/result/safety")
+    }
+    buildPrompt(templates.issueFeatureRequest, input, extra.toArray(), outputMode: outputMode)
 }
 
-public func buildQuestionIssuePrompt(input: PromptInputV1, templates: GitCodePromptTemplateSet): String {
+public func buildQuestionIssuePrompt(input: PromptInputV1, templates: GitCodePromptTemplateSet, outputMode!: String = GITCODE_PROMPT_OUTPUT_MODE_JSON_OBJECT): String {
     let extra = ArrayList<String>()
     extra.add("questionDescription=${promptStr(input.templateFields, "questionDescription")}")
     extra.add("branchVersions=${match (input.templateFields.get("branchVersions")) { case Some(v) => v.toJsonString() case None => "[]" }}")
     extra.add("CKB evidence=${safePromptJson(input.ckbEvidence)}")
     extra.add("必须优先基于 CKB evidence；不得伪造 CKB 引用。")
     if (promptStatus(input.ckbEvidence) != "resolved") {
-        extra.add("needsHumanReview=true；证据不足时必须明确说明不足。")
+        extra.add(plainDraftReviewInstruction(outputMode))
     }
-    buildPrompt(templates.issueQuestion, input, extra.toArray())
+    buildPrompt(templates.issueQuestion, input, extra.toArray(), outputMode: outputMode)
 }
 
-public func buildPrEnglishPrompt(input: PromptInputV1, templates: GitCodePromptTemplateSet): String {
+public func buildPrEnglishPrompt(input: PromptInputV1, templates: GitCodePromptTemplateSet, outputMode!: String = GITCODE_PROMPT_OUTPUT_MODE_JSON_OBJECT): String {
     let extra = ArrayList<String>()
     extra.add("English PR fields")
     extra.add("changedFiles=${safePromptJson(input.event)}")
     extra.add("reviewFindings=${safePromptJson(input.reviewFindings)}")
     extra.add("中文输出偏好：用中文总结审查结论。")
     if (promptStatus(input.reviewFindings) == "timeout") {
-        extra.add("review 阶段超时：不得伪造 findings，needsHumanReview=true。")
+        extra.add("review 阶段超时：不得伪造 findings，${plainDraftReviewInstruction(outputMode)}")
     }
-    buildPrompt(templates.prEnglish, input, extra.toArray())
+    buildPrompt(templates.prEnglish, input, extra.toArray(), outputMode: outputMode)
 }
 
-public func buildPrChinesePrompt(input: PromptInputV1, templates: GitCodePromptTemplateSet): String {
+public func buildPrChinesePrompt(input: PromptInputV1, templates: GitCodePromptTemplateSet, outputMode!: String = GITCODE_PROMPT_OUTPUT_MODE_JSON_OBJECT): String {
     let extra = ArrayList<String>()
     extra.add("中文 PR 字段")
     extra.add("变更类型：Bugfix / 问题修复 / feature")
@@ -199,12 +211,12 @@ public func buildPrChinesePrompt(input: PromptInputV1, templates: GitCodePromptT
     extra.add("测试自验证=${promptStr(input.templateFields, "testSelfCheck")}")
     extra.add("reviewFindings=${safePromptJson(input.reviewFindings)}")
     if (promptStatus(input.reviewFindings) == "timeout") {
-        extra.add("review 阶段超时：不得伪造 findings，needsHumanReview=true。")
+        extra.add("review 阶段超时：不得伪造 findings，${plainDraftReviewInstruction(outputMode)}")
     }
-    buildPrompt(templates.prChinese, input, extra.toArray())
+    buildPrompt(templates.prChinese, input, extra.toArray(), outputMode: outputMode)
 }
 
-public func buildCommentPrompt(input: PromptInputV1, templates: GitCodePromptTemplateSet): String {
+public func buildCommentPrompt(input: PromptInputV1, templates: GitCodePromptTemplateSet, outputMode!: String = GITCODE_PROMPT_OUTPUT_MODE_JSON_OBJECT): String {
     let kind = promptStr(input.event, "kind")
     let extra = ArrayList<String>()
     extra.add("comment body=${promptStr(input.templateFields, "commentBody")}")
@@ -221,7 +233,7 @@ public func buildCommentPrompt(input: PromptInputV1, templates: GitCodePromptTem
         extra.add("discussionContext=${safePromptJson(input.discussionContext, maxChars: 12000)}")
     }
     extra.add("CKB evidence=${safePromptJson(input.ckbEvidence)}")
-    buildPrompt(templates.commentReply, input, extra.toArray())
+    buildPrompt(templates.commentReply, input, extra.toArray(), outputMode: outputMode)
 }
 
 private func replyArray(obj: JsonObject, key: String): JsonArray {
