@@ -299,10 +299,16 @@ public class GatewayServiceGitCodePromptTest {
         let legacy = service.debugGitCodeGeneratedReplyResultForTest("建议补充回归测试。", legacyPlan)
         @Expect(legacy.ok, true)
         @Expect(legacy.draft, "建议补充回归测试。")
+
+        let plainReviewPlan = GitCodeReviewPromptPlan(true, status: "ok", prompt: "plain prompt", route: "issue_question", templateId: "issue_question", source: "builtin", expectsJsonOutput: false, needsHumanReview: true)
+        let plainReview = service.debugGitCodeGeneratedReplyResultForTest("证据不足，建议维护者人工确认。", plainReviewPlan)
+        @Expect(plainReview.ok, true)
+        @Expect(plainReview.draft, "证据不足，建议维护者人工确认。")
+        @Expect(plainReview.needsHumanReview, true)
     }
 
     @TestCase
-    public func gatewayPendingAndWebhookDebugGenerationShareTemplatePlanAndJsonParser(): Unit {
+    public func gatewayPendingAndWebhookDebugGenerationUsePlainDraftProductionPath(): Unit {
         gitCodePromptTestWithHome<Unit>("p3-prod-entries", { home: Path =>
             let promptDir = home.join("prompt")
             gitCodePromptTestWriteSixTemplates(promptDir, "PROMPT-P3")
@@ -310,48 +316,27 @@ public class GatewayServiceGitCodePromptTest {
             let service = gitCodePromptTestService()
             service.debugLoadGitCodeReviewPromptRuntimeForTest()
             let event = gitCodePromptTestEvent("issue", issueKind: "bug", title: "bug", content: "复现")
-            let raw = "{\"header\":\"结论\",\"result\":\"建议补测试\",\"safety\":\"approved\",\"needsHumanReview\":false}"
+            let raw = "建议补测试。"
             let pending = service.debugGenerateGitCodePendingReplyDraftForTest(event, raw)
             let webhook = service.debugGenerateGitCodeWebhookReplyDraftForTest(event, raw)
             @Expect(pending.ok, true)
             @Expect(webhook.ok, true)
-            @Expect(pending.draft, "结论\n\n建议补测试")
-            @Expect(webhook.draft, "结论\n\n建议补测试")
+            @Expect(pending.draft, "建议补测试。")
+            @Expect(webhook.draft, "建议补测试。")
 
-            let schemaRaw = "{\"header\":{\"taskKind\":\"issue-comment-reply\"},\"result\":{\"replyBody\":\"建议补充复现步骤\"},\"needsHumanReview\":false,\"citations\":[],\"diagnostics\":[]}"
-            let pendingSchema = service.debugGenerateGitCodePendingReplyDraftForTest(event, schemaRaw)
-            let webhookSchema = service.debugGenerateGitCodeWebhookReplyDraftForTest(event, schemaRaw)
-            @Expect(pendingSchema.ok, true)
-            @Expect(webhookSchema.ok, true)
-            @Expect(pendingSchema.draft, "建议补充复现步骤")
-            @Expect(webhookSchema.draft, "建议补充复现步骤")
-            @Expect(pendingSchema.draft.contains("```"), false)
-            @Expect(webhookSchema.draft.contains("```"), false)
-            @Expect(pendingSchema.draft.contains("replyBody"), false)
-            @Expect(webhookSchema.draft.contains("replyBody"), false)
-            @Expect(pendingSchema.draft.contains("header"), false)
-            @Expect(webhookSchema.draft.contains("header"), false)
-            @Expect(pendingSchema.draft.contains("result"), false)
-            @Expect(webhookSchema.draft.contains("result"), false)
-
-            let fencedRaw = "```json\n{\"header\":\"结论\",\"result\":\"建议补 fenced JSON\",\"safety\":\"approved\",\"needsHumanReview\":false}\n```"
-            let pendingFenced = service.debugGenerateGitCodePendingReplyDraftForTest(event, fencedRaw)
-            let webhookFenced = service.debugGenerateGitCodeWebhookReplyDraftForTest(event, fencedRaw)
-            @Expect(pendingFenced.ok, true)
-            @Expect(webhookFenced.ok, true)
-            @Expect(pendingFenced.draft, "结论\n\n建议补 fenced JSON")
-            @Expect(webhookFenced.draft, "结论\n\n建议补 fenced JSON")
-            @Expect(pendingFenced.draft.contains("```"), false)
-            @Expect(webhookFenced.draft.contains("```"), false)
+            let plan = service.debugBuildGitCodePromptPlanForTest(event)
+            @Expect(plan.expectsJsonOutput, false)
+            @Expect(plan.prompt.contains("只输出裸 JSON object"), false)
+            @Expect(plan.prompt.contains("只输出可直接发送的中文回复草稿正文"), true)
 
             let badFence = service.debugGenerateGitCodeWebhookReplyDraftForTest(event, "```json\n{\"header\":\"结论\",\"result\":\"坏 fence\",\"safety\":\"approved\",\"needsHumanReview\":false}")
             @Expect(badFence.ok, false)
-            @Expect(badFence.status, "llm_output_decode_failed")
+            @Expect(badFence.status, "draft_contains_forbidden_marker")
             @Expect(badFence.needsHumanReview, true)
 
             let fencedTool = service.debugGenerateGitCodeWebhookReplyDraftForTest(event, "```json\n{\"tool\":\"functions.answer\",\"reason\":\"x\"}\n```")
             @Expect(fencedTool.ok, false)
-            @Expect(fencedTool.status, "llm_output_invalid_tool_json")
+            @Expect(fencedTool.status, "draft_contains_forbidden_marker")
         })
     }
 }

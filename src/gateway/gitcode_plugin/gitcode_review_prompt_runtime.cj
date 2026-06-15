@@ -12,6 +12,7 @@ public class GitCodeReviewPromptPlan {
     public let templateId: String
     public let source: String
     public let expectsJsonOutput: Bool
+    public let needsHumanReview: Bool
     public let diagnostic: String
 
     public init(
@@ -22,6 +23,7 @@ public class GitCodeReviewPromptPlan {
         templateId!: String = "",
         source!: String = "",
         expectsJsonOutput!: Bool = false,
+        needsHumanReview!: Bool = false,
         diagnostic!: String = ""
     ) {
         this.ok = ok
@@ -31,6 +33,7 @@ public class GitCodeReviewPromptPlan {
         this.templateId = templateId.trimAscii()
         this.source = source.trimAscii()
         this.expectsJsonOutput = expectsJsonOutput
+        this.needsHumanReview = needsHumanReview
         this.diagnostic = diagnostic.trimAscii()
     }
 }
@@ -52,7 +55,7 @@ public func buildGitCodeReplyPromptForServicePluginEvent(
     if (parsed.request.legacy) {
         return legacyGitCodeReplyPromptPlan(event, "legacy_fallback_parse_failed", diagnostic: "reviewRequest schema missing")
     }
-    buildGitCodeReviewPromptForRequest(parsed.request, templates)
+    buildGitCodeReviewPromptForRequestWithOutputMode(parsed.request, templates, GITCODE_PROMPT_OUTPUT_MODE_PLAIN_DRAFT)
 }
 
 private func reviewRequestRawLooksLikeContractFragment(raw: String): Bool {
@@ -63,6 +66,14 @@ private func reviewRequestRawLooksLikeContractFragment(raw: String): Bool {
 public func buildGitCodeReviewPromptForRequest(
     request: GitCodeReviewRequest,
     templates: GitCodePromptTemplateSet
+): GitCodeReviewPromptPlan {
+    buildGitCodeReviewPromptForRequestWithOutputMode(request, templates, GITCODE_PROMPT_OUTPUT_MODE_JSON_OBJECT)
+}
+
+private func buildGitCodeReviewPromptForRequestWithOutputMode(
+    request: GitCodeReviewRequest,
+    templates: GitCodePromptTemplateSet,
+    outputMode: String
 ): GitCodeReviewPromptPlan {
     let route = routeGitCodeReviewRequest(request)
     if (!route.ok || route.route == "issue_generic") {
@@ -85,12 +96,12 @@ public func buildGitCodeReviewPromptForRequest(
         return legacyGitCodeReplyPromptPlan(servicePluginEventFromRequest(request), "legacy_fallback_unsupported_route", diagnostic: route.route)
     }
     let prompt = match (templateId) {
-        case "issue_bug" => buildBugIssuePrompt(input, templates)
-        case "issue_feature_request" => buildFeatureIssuePrompt(input, templates)
-        case "issue_question" => buildQuestionIssuePrompt(input, templates)
-        case "comment_reply" => buildCommentPrompt(input, templates)
-        case "pr_chinese" => buildPrChinesePrompt(input, templates)
-        case "pr_english" => buildPrEnglishPrompt(input, templates)
+        case "issue_bug" => buildBugIssuePrompt(input, templates, outputMode: outputMode)
+        case "issue_feature_request" => buildFeatureIssuePrompt(input, templates, outputMode: outputMode)
+        case "issue_question" => buildQuestionIssuePrompt(input, templates, outputMode: outputMode)
+        case "comment_reply" => buildCommentPrompt(input, templates, outputMode: outputMode)
+        case "pr_chinese" => buildPrChinesePrompt(input, templates, outputMode: outputMode)
+        case "pr_english" => buildPrEnglishPrompt(input, templates, outputMode: outputMode)
         case _ => legacyGitCodeReplyPromptForServicePluginEvent(servicePluginEventFromRequest(request))
     }
     let template = templates.get(templateId)
@@ -101,7 +112,8 @@ public func buildGitCodeReviewPromptForRequest(
         route: route.route,
         templateId: templateId,
         source: template.source,
-        expectsJsonOutput: true,
+        expectsJsonOutput: !gitCodePromptUsesPlainDraftOutput(outputMode),
+        needsHumanReview: route.needsHumanReview,
         diagnostic: template.reason
     )
 }
