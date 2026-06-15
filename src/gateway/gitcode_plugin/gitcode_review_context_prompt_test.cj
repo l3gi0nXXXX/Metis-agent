@@ -881,6 +881,36 @@ public class GitCodeReviewContextPromptTest {
         @Expect(parseGeneratedReplyModelOutput("```json\n{\"header\":\"h\",\"result\":\"/Users/name/private\",\"safety\":\"approved\",\"needsHumanReview\":false}\n```").status, "draft_contains_local_path")
     }
 
+    @TestCase
+    public func promptRuntimeP4ResultReplyBodySchemaIsAccepted(): Unit {
+        let reply = parseGeneratedReplyModelOutput("{\"header\":{\"taskKind\":\"issue-comment-reply\"},\"result\":{\"replyBody\":\"建议补充复现步骤\",\"commentRelation\":\"answer\",\"neededInfo\":[\"Cangjie 版本\"]},\"safety\":{\"noSecretsExposed\":true},\"needsHumanReview\":true,\"citations\":[],\"diagnostics\":[]}")
+        @Expect(reply.ok, true)
+        @Expect(reply.header, "")
+        @Expect(reply.result, "建议补充复现步骤")
+        @Expect(reply.needsHumanReview, true)
+        @Expect(renderGeneratedReplyDraft(reply), "建议补充复现步骤")
+
+        let fenced = parseGeneratedReplyModelOutput("```json\n{\"header\":{\"taskKind\":\"issue-comment-reply\"},\"result\":{\"replyBody\":\"fenced schema reply\"},\"needsHumanReview\":false}\n```")
+        @Expect(fenced.ok, true)
+        @Expect(renderGeneratedReplyDraft(fenced), "fenced schema reply")
+    }
+
+    @TestCase
+    public func promptRuntimeP4SchemaMismatchIsNotDraftEmpty(): Unit {
+        @Expect(parseGeneratedReplyModelOutput("{\"header\":\"结论\",\"safety\":\"approved\",\"needsHumanReview\":false}").status, "result_missing")
+        @Expect(parseGeneratedReplyModelOutput("{\"header\":\"结论\",\"result\":{\"summary\":\"只有摘要\"},\"needsHumanReview\":false}").status, "result_reply_body_missing")
+        @Expect(parseGeneratedReplyModelOutput("{\"header\":\"结论\",\"result\":{\"replyBody\":[\"不是字符串\"]},\"needsHumanReview\":false}").status, "result_reply_body_invalid_type")
+        @Expect(parseGeneratedReplyModelOutput("{\"header\":\"结论\",\"result\":[\"不是对象或字符串\"],\"needsHumanReview\":false}").status, "result_invalid_type")
+        @Expect(parseGeneratedReplyModelOutput("{\"header\":\"结论\",\"result\":{\"replyBody\":\"  \"},\"needsHumanReview\":false}").status, "draft_empty")
+    }
+
+    @TestCase
+    public func promptRuntimeP4ReplyBodyStillUsesSafetyGate(): Unit {
+        @Expect(parseGeneratedReplyModelOutput("{\"header\":{\"taskKind\":\"issue-comment-reply\"},\"result\":{\"replyBody\":\"Authorization: Bearer secret\"},\"needsHumanReview\":false}").status, "draft_contains_secret")
+        @Expect(parseGeneratedReplyModelOutput("{\"header\":{\"taskKind\":\"issue-comment-reply\"},\"result\":{\"replyBody\":\"/Users/name/private\"},\"needsHumanReview\":false}").status, "draft_contains_local_path")
+        @Expect(parseGeneratedReplyModelOutput("{\"header\":{\"taskKind\":\"issue-comment-reply\"},\"result\":{\"replyBody\":\"请 @Crownoth 看一下\"},\"needsHumanReview\":false}").status, "draft_contains_forbidden_maintainer_mention")
+    }
+
     private func parseDraft(header: String, result: String, needsHumanReview!: Bool = false, safety!: String = "approved"): GitCodeGeneratedReplyModelOutputV1 {
         parseGeneratedReplyModelOutput("{\"header\":\"${header}\",\"result\":\"${result}\",\"safety\":\"${safety}\",\"needsHumanReview\":${needsHumanReview},\"citations\":[],\"diagnostics\":[]}")
     }
