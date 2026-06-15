@@ -142,6 +142,8 @@ public class GitCodeReviewRequest {
     public let issueKind: String
     public let cjcVersion: String
     public let branchVersions: Array<String>
+    public let buildSelfCheck: String
+    public let testSelfCheck: String
     public let changedFiles: Array<String>
     public let reviewFindings: Array<String>
     public let teamLeaders: Array<String>
@@ -178,6 +180,8 @@ public class GitCodeReviewRequest {
         issueKind!: String = "",
         cjcVersion!: String = "",
         branchVersions!: Array<String> = [],
+        buildSelfCheck!: String = "",
+        testSelfCheck!: String = "",
         changedFiles!: Array<String> = [],
         reviewFindings!: Array<String> = [],
         teamLeaders!: Array<String> = [],
@@ -213,6 +217,8 @@ public class GitCodeReviewRequest {
         this.issueKind = normalizeIssueKind(issueKind)
         this.cjcVersion = reviewSafeField(cjcVersion, maxBytes: 240)
         this.branchVersions = reviewSafeArray(branchVersions, maxBytes: 120)
+        this.buildSelfCheck = reviewSafeField(buildSelfCheck, maxBytes: 240)
+        this.testSelfCheck = reviewSafeField(testSelfCheck, maxBytes: 240)
         this.changedFiles = reviewSafeArray(changedFiles, maxBytes: 240)
         this.reviewFindings = reviewSafeArray(reviewFindings, maxBytes: 500)
         this.teamLeaders = reviewSafeArray(teamLeaders, maxBytes: 120)
@@ -421,6 +427,8 @@ public func parseGitCodeReviewRequest(payload: String): GitCodeReviewRequestPars
         issueKind: issueKind,
         cjcVersion: reviewString(fieldsObj, "cjcVersion"),
         branchVersions: reviewStringArray(fieldsObj, "branchVersions"),
+        buildSelfCheck: reviewString(fieldsObj, "buildSelfCheck"),
+        testSelfCheck: reviewString(fieldsObj, "testSelfCheck"),
         changedFiles: reviewStringArray(prObj, "changedFiles"),
         reviewFindings: reviewStringArray(prObj, "reviewFindings"),
         teamLeaders: reviewMentionArray(maintainersObj, "teamLeaders"),

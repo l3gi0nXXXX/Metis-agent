@@ -9,13 +9,13 @@ import metis.gateway.security.gatewayPairingAccountStore
 import metis.gateway.service_plugin.{CapabilityCaller, CapabilityInvokeRequest, CapabilityInvokeResult, ServicePluginAcceptedGitCodeEvent, ServicePluginDeliveryTarget, ServicePluginEventDeliveryResult, ServicePluginGeneratedReplyResult, ServicePluginPendingJob, buildServicePluginImBindingRules, invokeRegisteredCapability, matchServicePluginImBinding, parseServicePluginJobAcceptedPayload, redactServicePayload, renderServicePluginJobSnapshotMessage, servicePluginGeneratedReplyResultFromAgentAnswer, servicePluginPendingJobStore, registerConfiguredServicePlugins, servicePluginConfiguredStatusForUser, servicePluginWebhookDispatchStatsJson, setServicePluginEventDelivery, setServicePluginGeneratedReplyHandler, setServicePluginWebhookGeneratedReplyHandler, setServicePluginWebhookSubscribersProvider, shutdownServicePluginHost}
 import metis.gateway.session.{GatewayIngressSource, GatewaySessionContext, GatewaySessionRequest, gatewayResolveSessionContext, gatewaySessionRequestFromInbound}
 import metis.gateway.tools.{gatewayHandleNativeCommandLine, gatewayHandleSubagentsCommandLine}
-import metis.gateway.gitcode_plugin.{GatewayCommandContext, buildGitCodeAsyncScanPayload, buildGitCodeDeadLetterInspectPayload, buildGitCodeDeadLetterListPayload, buildGitCodeEventReconcilePayload, buildGitCodeHookReconcilePayload, buildGitCodeSubscriptionTarget, buildGitCodeWebhookCancelPayload, buildGitCodeWebhookReplayPayload, buildGitCodeWebhookStatusPayload, formatGitCodeSubscribeResult, gitCodeSubscriptionStatusJson, gitCodeSubscriptionStoreSnapshotForDispatcher, handleGitCodeKnowledgeQueryCommand, loadGitCodeSubscriptionStore, parseGitCodeCommand, parseGitCodeDeliveryArgs, parseGitCodeHookReconcileArgs, parseGitCodeReconcileOnceArgs, parseGitCodeReviewRequest, parseGitCodeScanOnceArgs, removeGitCodeSubscription, renderGitCodeDeadLetterInspectResult, renderGitCodeDeadLetterListResult, renderGitCodeEventReconcileResult, renderGitCodeHookReconcileResult, renderGitCodeWebhookCancelResult, renderGitCodeWebhookReplayResult, renderGitCodeWebhookStatusResult, renderGitCodeReviewCommentContextPromptBlock, routeGitCodeReviewRequest, saveGitCodeSubscription, setGitCodeSubscriptionStore}
+import metis.gateway.gitcode_plugin.{GatewayCommandContext, GitCodePromptTemplate, GitCodePromptTemplateSet, GitCodeReviewPromptPlan, GitCodeReviewRuntimeConfig, buildGitCodeAsyncScanPayload, buildGitCodeDeadLetterInspectPayload, buildGitCodeDeadLetterListPayload, buildGitCodeEventReconcilePayload, buildGitCodeHookReconcilePayload, buildGitCodeReplyPromptForServicePluginEvent, buildGitCodeSubscriptionTarget, buildGitCodeWebhookCancelPayload, buildGitCodeWebhookReplayPayload, buildGitCodeWebhookStatusPayload, defaultGitCodePromptTemplateSet, defaultGitCodeReviewRuntimeConfig, formatGitCodeSubscribeResult, gitCodeSubscriptionStatusJson, gitCodeSubscriptionStoreSnapshotForDispatcher, handleGitCodeKnowledgeQueryCommand, loadGitCodePromptTemplates, loadGitCodeSubscriptionStore, parseGeneratedReplyModelOutput, parseGitCodeCommand, parseGitCodeDeliveryArgs, parseGitCodeHookReconcileArgs, parseGitCodeReconcileOnceArgs, parseGitCodeReviewRuntimeConfig, parseGitCodeScanOnceArgs, removeGitCodeSubscription, renderGeneratedReplyDraft, renderGitCodeDeadLetterInspectResult, renderGitCodeDeadLetterListResult, renderGitCodeEventReconcileResult, renderGitCodeHookReconcileResult, renderGitCodeWebhookCancelResult, renderGitCodeWebhookReplayResult, renderGitCodeWebhookStatusResult, saveGitCodeSubscription, setGitCodeSubscriptionStore}
 import magic.jsonable.*
 import std.collection.{ArrayList, HashSet}
 import std.convert.Parsable
 import std.fs.{Directory, File, Path, copy, exists, remove}
 import std.time.DateTime
-import stdx.encoding.json.{JsonArray, JsonObject, JsonString, JsonValue}
+import stdx.encoding.json.{JsonArray, JsonBool, JsonObject, JsonString, JsonValue}
 
 /**
  * GatewayService（P0）：
@@ -35,6 +35,10 @@ public class GatewayService {
     private let consumedTelegramPluginCallbackIds = HashSet<String>()
     private let telegramErrorPolicyState = GatewayTelegramErrorPolicyState()
     private let telegramNativeCommandRuntime = GatewayTelegramNativeCommandRuntime()
+    private var gitCodeReviewRuntimeConfig: GitCodeReviewRuntimeConfig = defaultGitCodeReviewRuntimeConfig()
+    private var gitCodePromptTemplates: GitCodePromptTemplateSet = defaultGitCodePromptTemplateSet()
+    private var gitCodePromptRuntimeStatus: String = "not_loaded"
+    private var gitCodePromptRuntimeDiagnostic: String = ""
 
     public init(
         router: GatewayRouter,
@@ -125,6 +129,7 @@ public class GatewayService {
         let startMs = this.startNowMs()
         let startupSummary = this.channelManager.startChannels()
         let user = CliSettingManager.readGatewaySettings()
+        this.loadGitCodeReviewPromptRuntimeFromConfig()
         registerConfiguredServicePlugins(user)
         setGitCodeSubscriptionStore(Some(loadGitCodeSubscriptionStore(CliConfig.dotDir.join("service-plugin").join("gitcode").join("subscriptions.jsonl").toString())))
         setServicePluginEventDelivery(Some({ target: ServicePluginDeliveryTarget, text: String =>
@@ -1066,7 +1071,8 @@ public class GatewayService {
         job: ServicePluginPendingJob,
         event: ServicePluginAcceptedGitCodeEvent
     ): ServicePluginGeneratedReplyResult {
-        let prompt = this.servicePluginBuildGitCodeReplyPrompt(event)
+        let promptPlan = buildGitCodeReplyPromptForServicePluginEvent(event, this.gitCodePromptTemplates)
+        let prompt = promptPlan.prompt
         let request = GatewaySessionRequest(
             GatewayIngressSource.Channel(job.deliveryTarget.channel),
             channelName: job.deliveryTarget.channel,
@@ -1092,7 +1098,7 @@ public class GatewayService {
         } catch (e: Exception) {
             return ServicePluginGeneratedReplyResult(false, status: "llm_degraded", diagnostic: "Agent Runtime failed: ${e.message}", needsHumanReview: true)
         }
-        servicePluginGeneratedReplyResultFromAgentAnswer(turn.execution.answer)
+        this.servicePluginGeneratedReplyResultFromGitCodeAnswer(turn.execution.answer, promptPlan)
     }
 
     private func servicePluginGenerateGitCodeWebhookReplyDraft(
@@ -1100,7 +1106,8 @@ public class GatewayService {
         event: ServicePluginAcceptedGitCodeEvent,
         target: ServicePluginDeliveryTarget
     ): ServicePluginGeneratedReplyResult {
-        let prompt = this.servicePluginBuildGitCodeReplyPrompt(event)
+        let promptPlan = buildGitCodeReplyPromptForServicePluginEvent(event, this.gitCodePromptTemplates)
+        let prompt = promptPlan.prompt
         let request = GatewaySessionRequest(
             GatewayIngressSource.Channel(target.channel),
             channelName: target.channel,
@@ -1126,46 +1133,111 @@ public class GatewayService {
         } catch (e: Exception) {
             return ServicePluginGeneratedReplyResult(false, status: "llm_degraded", diagnostic: "Agent Runtime failed: ${e.message}", needsHumanReview: true)
         }
-        servicePluginGeneratedReplyResultFromAgentAnswer(turn.execution.answer)
+        this.servicePluginGeneratedReplyResultFromGitCodeAnswer(turn.execution.answer, promptPlan)
     }
 
     private func servicePluginBuildGitCodeReplyPrompt(event: ServicePluginAcceptedGitCodeEvent): String {
-        if (!event.reviewRequestRaw.isEmpty()) {
-            let contractPayload = "{" +
-                "\"jobId\":${JsonString(event.jobId).toJsonString()}," +
-                "\"eventId\":${JsonString(event.eventId).toJsonString()}," +
-                "\"repo\":${JsonString(event.repo).toJsonString()}," +
-                "\"kind\":${JsonString(event.kind).toJsonString()}," +
-                "\"number\":${JsonString(event.number).toJsonString()}," +
-                "\"commentId\":${JsonString(event.commentId).toJsonString()}," +
-                "\"title\":${JsonString(event.title).toJsonString()}," +
-                "\"url\":${JsonString(event.url).toJsonString()}," +
-                "\"author\":${JsonString(event.author).toJsonString()}," +
-                "\"content\":${JsonString(event.content).toJsonString()}," +
-                "\"contractVersion\":${JsonString(event.contractVersion).toJsonString()}," +
-                "\"reviewRequest\":${event.reviewRequestRaw}" +
-            "}"
-            let parsed = parseGitCodeReviewRequest(contractPayload)
-            if (parsed.ok) {
-                let route = routeGitCodeReviewRequest(parsed.request)
-                let diagnostics = if (parsed.request.diagnostics.size == 0) { "无" } else { String.join(parsed.request.diagnostics, delimiter: ", ") }
-                let commentContext = renderGitCodeReviewCommentContextPromptBlock(parsed.request)
-                let commentContextSection = if (commentContext.isEmpty()) { "" } else { "\n\n${commentContext}" }
-                return "你是 Metis 的 GitCode review task worker。请根据结构化契约生成中文回复草稿，只输出草稿正文，不要输出 JSON，不要输出 {\"tool\":...}、{\"name\":\"_answer_\",...}、{\"arguments\":...} 或任何工具调用描述，不要声称已经写回 GitCode，不要包含维护者提及句、auto-reply、bot attribution、hidden marker、token、cookie、Authorization header 或本机路径。\n\n" +
-                    "契约版本: ${parsed.request.contractVersion}\n" +
-                    "路由: ${route.route}\n" +
-                    "任务: ${route.task.taskBrief}\n" +
-                    "来源: ${parsed.request.repoFullName} ${parsed.request.eventType} #${parsed.request.number} ${parsed.request.url}\n" +
-                    "标题: ${parsed.request.title}\n" +
-                    "作者: ${parsed.request.author}\n" +
-                    "诊断: ${diagnostics}\n" +
-                    "内容:\n${parsed.request.content}\n${parsed.request.commentBody}${commentContextSection}"
-            }
+        buildGitCodeReplyPromptForServicePluginEvent(event, this.gitCodePromptTemplates).prompt
+    }
+
+    private func servicePluginGeneratedReplyResultFromGitCodeAnswer(
+        rawAnswer: String,
+        promptPlan: GitCodeReviewPromptPlan
+    ): ServicePluginGeneratedReplyResult {
+        if (!promptPlan.expectsJsonOutput) {
+            return servicePluginGeneratedReplyResultFromAgentAnswer(rawAnswer)
         }
-        let source = if (event.url.isEmpty()) { "${event.repo} ${event.kind} #${event.number}" } else { "${event.repo} ${event.kind} #${event.number} ${event.url}" }
-        let title = if (event.title.isEmpty()) { "(no title)" } else { event.title }
-        let content = if (event.content.isEmpty()) { "(no content)" } else { event.content }
-        "你是 Metis 的 GitCode 回复草稿生成器。请基于下面的 GitCode PR/Issue/comment 生成一段可以发给维护者人工确认的中文回复草稿。只输出草稿正文，不要输出 JSON，不要输出 {\"tool\":...}、{\"name\":\"_answer_\",...}、{\"arguments\":...} 或任何工具调用描述，不要声称已经写回 GitCode，不要泄露任何 token、cookie、Authorization header 或本机路径。\n\n来源: ${source}\n标题: ${title}\n作者: ${event.author}\n内容:\n${content}"
+        let parsed = parseGeneratedReplyModelOutput(rawAnswer)
+        if (!parsed.ok) {
+            return ServicePluginGeneratedReplyResult(false, status: parsed.status, diagnostic: "GitCode JSON output rejected: ${parsed.status}", needsHumanReview: true)
+        }
+        let rendered = renderGeneratedReplyDraft(parsed)
+        let guarded = servicePluginGeneratedReplyResultFromAgentAnswer(rendered)
+        if (!guarded.ok) {
+            return guarded
+        }
+        ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: guarded.draft, needsHumanReview: parsed.needsHumanReview)
+    }
+
+    private func loadGitCodeReviewPromptRuntimeFromConfig(): Unit {
+        let raw = match (MetisConfigManager.rawConfig()) {
+            case Some(root) => root
+            case None => JsonObject()
+        }
+        let parsed = parseGitCodeReviewRuntimeConfig(raw)
+        if (!parsed.ok) {
+            this.gitCodeReviewRuntimeConfig = defaultGitCodeReviewRuntimeConfig()
+            this.gitCodePromptTemplates = defaultGitCodePromptTemplateSet()
+            this.gitCodePromptRuntimeStatus = parsed.status
+            this.gitCodePromptRuntimeDiagnostic = parsed.diagnostic
+            gatewayLogEventWarn(
+                "gateway/service",
+                "gitcode.prompt_runtime.config_invalid",
+                "GitCode prompt runtime config invalid; falling back to builtin templates",
+                meta: gatewayLogMeta().string("diagnostic", parsed.diagnostic).object()
+            )
+            return
+        }
+        this.gitCodeReviewRuntimeConfig = parsed.config
+        this.gitCodePromptTemplates = loadGitCodePromptTemplates(parsed.config.promptTemplates)
+        this.gitCodePromptRuntimeStatus = "ok"
+        this.gitCodePromptRuntimeDiagnostic = ""
+    }
+
+    public func debugLoadGitCodeReviewPromptRuntimeForTest(): Unit {
+        this.loadGitCodeReviewPromptRuntimeFromConfig()
+    }
+
+    public func debugGitCodePromptRuntimeSnapshotForTest(): JsonObject {
+        let out = JsonObject()
+        out.put("configStatus", JsonString(this.gitCodePromptRuntimeStatus))
+        out.put("diagnostic", JsonString(this.gitCodePromptRuntimeDiagnostic))
+        out.put("dir", JsonString(this.gitCodeReviewRuntimeConfig.promptTemplates.dir))
+        out.put("reloadPolicy", JsonString(this.gitCodeReviewRuntimeConfig.promptTemplates.reloadPolicy))
+        out.put("allowUserOverride", JsonBool(this.gitCodeReviewRuntimeConfig.promptTemplates.allowUserOverride))
+        let templates = JsonObject()
+        this.gitCodePromptRuntimeSnapshotPutTemplate(templates, "issue_bug", this.gitCodePromptTemplates.issueBug)
+        this.gitCodePromptRuntimeSnapshotPutTemplate(templates, "issue_feature_request", this.gitCodePromptTemplates.issueFeatureRequest)
+        this.gitCodePromptRuntimeSnapshotPutTemplate(templates, "issue_question", this.gitCodePromptTemplates.issueQuestion)
+        this.gitCodePromptRuntimeSnapshotPutTemplate(templates, "pr_english", this.gitCodePromptTemplates.prEnglish)
+        this.gitCodePromptRuntimeSnapshotPutTemplate(templates, "pr_chinese", this.gitCodePromptTemplates.prChinese)
+        this.gitCodePromptRuntimeSnapshotPutTemplate(templates, "comment_reply", this.gitCodePromptTemplates.commentReply)
+        out.put("templates", templates)
+        out
+    }
+
+    private func gitCodePromptRuntimeSnapshotPutTemplate(root: JsonObject, key: String, template: GitCodePromptTemplate): Unit {
+        let row = JsonObject()
+        row.put("source", JsonString(template.source))
+        row.put("status", JsonString(template.status))
+        row.put("sha12", JsonString(template.sha12))
+        row.put("reason", JsonString(template.reason))
+        row.put("fileName", JsonString(template.fileName))
+        root.put(key, row)
+    }
+
+    public func debugBuildGitCodePromptPlanForTest(event: ServicePluginAcceptedGitCodeEvent): GitCodeReviewPromptPlan {
+        buildGitCodeReplyPromptForServicePluginEvent(event, this.gitCodePromptTemplates)
+    }
+
+    public func debugGitCodeGeneratedReplyResultForTest(rawAnswer: String, promptPlan: GitCodeReviewPromptPlan): ServicePluginGeneratedReplyResult {
+        this.servicePluginGeneratedReplyResultFromGitCodeAnswer(rawAnswer, promptPlan)
+    }
+
+    public func debugGenerateGitCodePendingReplyDraftForTest(
+        event: ServicePluginAcceptedGitCodeEvent,
+        rawAnswer: String
+    ): ServicePluginGeneratedReplyResult {
+        let plan = buildGitCodeReplyPromptForServicePluginEvent(event, this.gitCodePromptTemplates)
+        this.servicePluginGeneratedReplyResultFromGitCodeAnswer(rawAnswer, plan)
+    }
+
+    public func debugGenerateGitCodeWebhookReplyDraftForTest(
+        event: ServicePluginAcceptedGitCodeEvent,
+        rawAnswer: String
+    ): ServicePluginGeneratedReplyResult {
+        let plan = buildGitCodeReplyPromptForServicePluginEvent(event, this.gitCodePromptTemplates)
+        this.servicePluginGeneratedReplyResultFromGitCodeAnswer(rawAnswer, plan)
     }
 
     private func servicePluginRenderGitCodeScanResult(payload: String): String {

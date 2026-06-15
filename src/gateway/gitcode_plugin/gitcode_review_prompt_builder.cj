@@ -213,8 +213,14 @@ public func parseGeneratedReplyModelOutput(raw: String): GitCodeGeneratedReplyMo
     let obj = try { JsonValue.fromStr(raw).asObject() } catch (_: Exception) {
         return GitCodeGeneratedReplyModelOutputV1(false, "llm_output_decode_failed", needsHumanReview: true)
     }
+    if (generatedReplyJsonObjectHasToolShape(obj)) {
+        return GitCodeGeneratedReplyModelOutputV1(false, "llm_output_invalid_tool_json", needsHumanReview: true)
+    }
     let header = promptStr(obj, "header")
     let result = promptStr(obj, "result")
+    if (result.trimAscii().isEmpty()) {
+        return GitCodeGeneratedReplyModelOutputV1(false, "draft_empty", header: "", result: "", needsHumanReview: true)
+    }
     let draft = "${header}\n\n${result}"
     if (draft.contains("/Users/")) {
         return GitCodeGeneratedReplyModelOutputV1(false, "draft_contains_local_path", header: "", result: "", needsHumanReview: true)
@@ -224,6 +230,9 @@ public func parseGeneratedReplyModelOutput(raw: String): GitCodeGeneratedReplyMo
     }
     if (draft.toAsciiLower().contains("auto-reply") || draft.toAsciiLower().contains("gitcodemonitor")) {
         return GitCodeGeneratedReplyModelOutputV1(false, "draft_contains_forbidden_marker", header: "", result: "", needsHumanReview: true)
+    }
+    if (gitCodeReviewContainsForbiddenContent(draft)) {
+        return GitCodeGeneratedReplyModelOutputV1(false, "draft_contains_secret", header: "", result: "", needsHumanReview: true)
     }
     let safety = promptStr(obj, "safety")
     let needs = try { obj.get("needsHumanReview").getOrThrow().asBool().getValue() } catch (_: Exception) { safety != "approved" }
@@ -235,4 +244,39 @@ public func renderGeneratedReplyDraft(reply: GitCodeGeneratedReplyModelOutputV1)
         return "需要人工确认\n\n${reply.status}"
     }
     "${reply.header}\n\n${reply.result}"
+}
+
+private func generatedReplyJsonObjectHasToolShape(obj: JsonObject): Bool {
+    for ((key, value) in obj.getFields()) {
+        let normalized = key.trimAscii()
+        if (normalized == "tool" ||
+            normalized == "name" ||
+            normalized == "arguments" ||
+            normalized == "function_call" ||
+            normalized == "tool_calls") {
+            return true
+        }
+        if (generatedReplyJsonValueContainsToolShape(value)) {
+            return true
+        }
+    }
+    false
+}
+
+private func generatedReplyJsonValueContainsToolShape(value: JsonValue): Bool {
+    let text = try { value.asString().getValue().trimAscii() } catch (_: Exception) { "" }
+    if (!text.isEmpty() && (text.contains("_answer_") || text.contains("functions.") || text.contains("tool_call"))) {
+        return true
+    }
+    let obj = try { value.asObject() } catch (_: Exception) { JsonObject() }
+    if (!obj.getFields().isEmpty()) {
+        return generatedReplyJsonObjectHasToolShape(obj)
+    }
+    let arr = try { value.asArray() } catch (_: Exception) { JsonArray([]) }
+    for (item in arr.getItems()) {
+        if (generatedReplyJsonValueContainsToolShape(item)) {
+            return true
+        }
+    }
+    false
 }
