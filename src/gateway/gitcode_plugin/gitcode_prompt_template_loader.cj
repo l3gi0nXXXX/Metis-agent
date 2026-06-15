@@ -217,6 +217,6 @@ public func renderPromptTemplate(template: GitCodePromptTemplate, input: PromptI
     lines.add(gitCodeReviewRedactSensitiveText(input.reviewFindings.toJsonString()))
     lines.add("")
     lines.add("IMMUTABLE_OUTPUT_SCHEMA")
-    lines.add("只输出 JSON object: header/result/safety/needsHumanReview/citations/diagnostics。最终 draft 只由 header + 空行 + result 组成。")
+    lines.add("只输出裸 JSON object: header/result/safety/needsHumanReview/citations/diagnostics。不要使用 Markdown 代码块或三反引号 json fence 包裹 JSON。最终 draft 只由 header + 空行 + result 组成。")
     String.join(lines.toArray(), delimiter: "\n")
 }

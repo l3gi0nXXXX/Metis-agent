@@ -836,6 +836,8 @@ public class GitCodeReviewContextPromptTest {
             @Expect(afterPlan.prompt.contains("PROMPT-P4-after-role"), true)
             @Expect(afterPlan.prompt.contains("IMMUTABLE_SYSTEM_GUARD"), true)
             @Expect(afterPlan.prompt.contains("IMMUTABLE_OUTPUT_SCHEMA"), true)
+            @Expect(afterPlan.prompt.contains("不要使用 Markdown 代码块"), true)
+            @Expect(afterPlan.prompt.contains("三反引号 json fence"), true)
             @Expect(afterPlan.prompt.contains("UserProvidedData"), true)
             @Expect(afterPlan.prompt.contains("Evidence"), true)
         })
@@ -851,10 +853,32 @@ public class GitCodeReviewContextPromptTest {
         @Expect(review.ok, true)
         @Expect(review.needsHumanReview, true)
 
+        let fenced = parseGeneratedReplyModelOutput("```json\n{\"header\":\"结论\",\"result\":\"建议补 fenced JSON\",\"safety\":\"approved\",\"needsHumanReview\":false}\n```")
+        @Expect(fenced.ok, true)
+        @Expect(renderGeneratedReplyDraft(fenced), "结论\n\n建议补 fenced JSON")
+
+        let upperFence = parseGeneratedReplyModelOutput("```JSON\n{\"header\":\"结论\",\"result\":\"大写 JSON fence\",\"safety\":\"approved\",\"needsHumanReview\":false}\n```")
+        @Expect(upperFence.ok, true)
+        @Expect(renderGeneratedReplyDraft(upperFence), "结论\n\n大写 JSON fence")
+
+        let noLangFence = parseGeneratedReplyModelOutput("```\n{\"header\":\"结论\",\"result\":\"无语言 fence\",\"safety\":\"approved\",\"needsHumanReview\":false}\n```")
+        @Expect(noLangFence.ok, true)
+        @Expect(renderGeneratedReplyDraft(noLangFence), "结论\n\n无语言 fence")
+
+        let paddedFence = parseGeneratedReplyModelOutput(" \n```json\n{\"header\":\"结论\",\"result\":\"带空白 fence\",\"safety\":\"approved\",\"needsHumanReview\":false}\n```\n ")
+        @Expect(paddedFence.ok, true)
+        @Expect(renderGeneratedReplyDraft(paddedFence), "结论\n\n带空白 fence")
+
         @Expect(parseGeneratedReplyModelOutput("{\"tool\":\"functions.answer\",\"reason\":\"x\"}").status, "llm_output_invalid_tool_json")
+        @Expect(parseGeneratedReplyModelOutput("下面是结果：\n```json\n{\"header\":\"结论\",\"result\":\"不应抽取\",\"safety\":\"approved\",\"needsHumanReview\":false}\n```").status, "llm_output_decode_failed")
+        @Expect(parseGeneratedReplyModelOutput("```json\n{\"header\":\"结论\",\"result\":\"未闭合\",\"safety\":\"approved\",\"needsHumanReview\":false}").status, "llm_output_decode_failed")
+        @Expect(parseGeneratedReplyModelOutput("```text\n{\"header\":\"结论\",\"result\":\"非 JSON fence\",\"safety\":\"approved\",\"needsHumanReview\":false}\n```").status, "llm_output_decode_failed")
+        @Expect(parseGeneratedReplyModelOutput("```json\n{\"tool\":\"functions.answer\",\"reason\":\"x\"}\n```").status, "llm_output_invalid_tool_json")
         @Expect(parseGeneratedReplyModelOutput("{\"header\":\"h\",\"result\":\"\",\"safety\":\"approved\",\"needsHumanReview\":false}").status, "draft_empty")
         @Expect(parseGeneratedReplyModelOutput("{\"header\":\"h\",\"result\":\"Authorization: Bearer secret\",\"safety\":\"approved\",\"needsHumanReview\":false}").status, "draft_contains_secret")
         @Expect(parseGeneratedReplyModelOutput("{\"header\":\"h\",\"result\":\"/Users/name/private\",\"safety\":\"approved\",\"needsHumanReview\":false}").status, "draft_contains_local_path")
+        @Expect(parseGeneratedReplyModelOutput("```json\n{\"header\":\"h\",\"result\":\"Authorization: Bearer secret\",\"safety\":\"approved\",\"needsHumanReview\":false}\n```").status, "draft_contains_secret")
+        @Expect(parseGeneratedReplyModelOutput("```json\n{\"header\":\"h\",\"result\":\"/Users/name/private\",\"safety\":\"approved\",\"needsHumanReview\":false}\n```").status, "draft_contains_local_path")
     }
 
     private func parseDraft(header: String, result: String, needsHumanReview!: Bool = false, safety!: String = "approved"): GitCodeGeneratedReplyModelOutputV1 {

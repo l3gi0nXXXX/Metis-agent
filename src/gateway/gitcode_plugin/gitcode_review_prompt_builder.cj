@@ -3,6 +3,8 @@ package metis.gateway.gitcode_plugin
 import std.collection.ArrayList
 import stdx.encoding.json.{JsonArray, JsonBool, JsonObject, JsonString, JsonValue}
 
+private let GENERATED_REPLY_JSON_FENCE = "```"
+
 public class PromptInputV1 {
     public let role: String
     public let event: JsonObject
@@ -209,8 +211,51 @@ private func replyArray(obj: JsonObject, key: String): JsonArray {
     }
 }
 
+private func generatedReplyFenceLanguageAllowed(firstLine: String): Bool {
+    let trimmed = firstLine.trimAscii()
+    if (!trimmed.startsWith(GENERATED_REPLY_JSON_FENCE)) {
+        return false
+    }
+    let language = trimmed[GENERATED_REPLY_JSON_FENCE.size..].trimAscii()
+    language.isEmpty() || language.toAsciiLower() == "json"
+}
+
+private func normalizeGeneratedReplyJsonPayload(raw: String): String {
+    let trimmed = raw.trimAscii()
+    if (!trimmed.startsWith(GENERATED_REPLY_JSON_FENCE)) {
+        return trimmed
+    }
+
+    let lines = trimmed.split("\n")
+    if (lines.size < 2) {
+        return trimmed
+    }
+    if (!generatedReplyFenceLanguageAllowed(lines[0])) {
+        return trimmed
+    }
+
+    var end = lines.size - 1
+    while (end > 0 && lines[end].trimAscii().isEmpty()) {
+        end--
+    }
+    if (end <= 0 || lines[end].trimAscii() != GENERATED_REPLY_JSON_FENCE) {
+        return trimmed
+    }
+
+    let bodyLines = ArrayList<String>()
+    for (i in 1..end) {
+        bodyLines.add(lines[i])
+    }
+    let body = String.join(bodyLines.toArray(), delimiter: "\n").trimAscii()
+    if (body.isEmpty()) {
+        return trimmed
+    }
+    body
+}
+
 public func parseGeneratedReplyModelOutput(raw: String): GitCodeGeneratedReplyModelOutputV1 {
-    let obj = try { JsonValue.fromStr(raw).asObject() } catch (_: Exception) {
+    let normalized = normalizeGeneratedReplyJsonPayload(raw)
+    let obj = try { JsonValue.fromStr(normalized).asObject() } catch (_: Exception) {
         return GitCodeGeneratedReplyModelOutputV1(false, "llm_output_decode_failed", needsHumanReview: true)
     }
     if (generatedReplyJsonObjectHasToolShape(obj)) {

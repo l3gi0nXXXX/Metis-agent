@@ -239,6 +239,12 @@ public class GatewayServiceGitCodePromptTest {
         @Expect(ok.draft, "结论\n\n建议补测试")
         @Expect(ok.needsHumanReview, false)
 
+        let fenced = service.debugGitCodeGeneratedReplyResultForTest("```json\n{\"header\":\"结论\",\"result\":\"建议补 fenced JSON\",\"safety\":\"approved\",\"needsHumanReview\":false}\n```", jsonPlan)
+        @Expect(fenced.ok, true)
+        @Expect(fenced.status, "draft_generated")
+        @Expect(fenced.draft, "结论\n\n建议补 fenced JSON")
+        @Expect(fenced.diagnostic.contains("llm_output_decode_failed"), false)
+
         let needsReview = service.debugGitCodeGeneratedReplyResultForTest("{\"header\":\"结论\",\"result\":\"建议人工确认\",\"safety\":\"needs_human_review\",\"needsHumanReview\":true}", jsonPlan)
         @Expect(needsReview.ok, true)
         @Expect(needsReview.needsHumanReview, true)
@@ -247,6 +253,15 @@ public class GatewayServiceGitCodePromptTest {
         @Expect(tool.ok, false)
         @Expect(tool.status, "llm_output_invalid_tool_json")
         @Expect(tool.needsHumanReview, true)
+
+        let fencedTool = service.debugGitCodeGeneratedReplyResultForTest("```json\n{\"tool\":\"functions.answer\",\"reason\":\"x\"}\n```", jsonPlan)
+        @Expect(fencedTool.ok, false)
+        @Expect(fencedTool.status, "llm_output_invalid_tool_json")
+
+        let badFence = service.debugGitCodeGeneratedReplyResultForTest("```json\n{\"header\":\"结论\",\"result\":\"坏 fence\",\"safety\":\"approved\",\"needsHumanReview\":false}", jsonPlan)
+        @Expect(badFence.ok, false)
+        @Expect(badFence.status, "llm_output_decode_failed")
+        @Expect(badFence.needsHumanReview, true)
 
         let empty = service.debugGitCodeGeneratedReplyResultForTest("{\"header\":\"结论\",\"result\":\"\",\"safety\":\"approved\",\"needsHumanReview\":false}", jsonPlan)
         @Expect(empty.ok, false)
@@ -279,6 +294,25 @@ public class GatewayServiceGitCodePromptTest {
             @Expect(webhook.ok, true)
             @Expect(pending.draft, "结论\n\n建议补测试")
             @Expect(webhook.draft, "结论\n\n建议补测试")
+
+            let fencedRaw = "```json\n{\"header\":\"结论\",\"result\":\"建议补 fenced JSON\",\"safety\":\"approved\",\"needsHumanReview\":false}\n```"
+            let pendingFenced = service.debugGenerateGitCodePendingReplyDraftForTest(event, fencedRaw)
+            let webhookFenced = service.debugGenerateGitCodeWebhookReplyDraftForTest(event, fencedRaw)
+            @Expect(pendingFenced.ok, true)
+            @Expect(webhookFenced.ok, true)
+            @Expect(pendingFenced.draft, "结论\n\n建议补 fenced JSON")
+            @Expect(webhookFenced.draft, "结论\n\n建议补 fenced JSON")
+            @Expect(pendingFenced.draft.contains("```"), false)
+            @Expect(webhookFenced.draft.contains("```"), false)
+
+            let badFence = service.debugGenerateGitCodeWebhookReplyDraftForTest(event, "```json\n{\"header\":\"结论\",\"result\":\"坏 fence\",\"safety\":\"approved\",\"needsHumanReview\":false}")
+            @Expect(badFence.ok, false)
+            @Expect(badFence.status, "llm_output_decode_failed")
+            @Expect(badFence.needsHumanReview, true)
+
+            let fencedTool = service.debugGenerateGitCodeWebhookReplyDraftForTest(event, "```json\n{\"tool\":\"functions.answer\",\"reason\":\"x\"}\n```")
+            @Expect(fencedTool.ok, false)
+            @Expect(fencedTool.status, "llm_output_invalid_tool_json")
         })
     }
 }
