@@ -210,7 +210,8 @@ public class GitCodeReviewContextPromptTest {
         content!: String = "复现步骤",
         commentBody!: String = "",
         changedFiles!: Array<String> = [],
-        reviewFindings!: Array<String> = []
+        reviewFindings!: Array<String> = [],
+        diagnostics!: Array<String> = []
     ): String {
         let request = JsonObject()
         request.put("schemaVersion", JsonInt(1))
@@ -264,6 +265,7 @@ public class GitCodeReviewContextPromptTest {
         pr.put("changedFiles", gitCodeReviewJsonArrayString(changedFiles))
         pr.put("reviewFindings", gitCodeReviewJsonArrayString(reviewFindings))
         request.put("pr", pr)
+        request.put("diagnostics", gitCodeReviewJsonArrayString(diagnostics))
 
         let policy = JsonObject()
         policy.put("requiresCkb", JsonBool(false))
@@ -279,7 +281,8 @@ public class GitCodeReviewContextPromptTest {
         title!: String = "空参数默认值异常",
         content!: String = "复现步骤",
         commentBody!: String = "",
-        reviewRequestRaw!: String = ""
+        reviewRequestRaw!: String = "",
+        diagnostics!: Array<String> = []
     ): ServicePluginAcceptedGitCodeEvent {
         let kind = if (eventType == "pr") { "pr" } else { eventType }
         ServicePluginAcceptedGitCodeEvent(
@@ -294,7 +297,7 @@ public class GitCodeReviewContextPromptTest {
             author: "alice",
             content: if (eventType == "comment") { commentBody } else { content },
             contractVersion: GITCODE_REVIEW_CONTRACT_VERSION,
-            reviewRequestRaw: if (reviewRequestRaw.isEmpty() && eventType != "legacy") { this.reviewRequestRaw(eventType, issueKind: issueKind, title: title, content: content, commentBody: commentBody) } else { reviewRequestRaw }
+            reviewRequestRaw: if (reviewRequestRaw.isEmpty() && eventType != "legacy") { this.reviewRequestRaw(eventType, issueKind: issueKind, title: title, content: content, commentBody: commentBody, diagnostics: diagnostics) } else { reviewRequestRaw }
         )
     }
 
@@ -734,10 +737,12 @@ public class GitCodeReviewContextPromptTest {
         let templates = this.runtimeTemplates("PROMPT-P1")
 
         let bug = buildGitCodeReviewPromptForRequest(GitCodeReviewRequest(eventType: "issue", issueKind: "bug", repoFullName: "Cangjie/cangjie_tools", number: "1", title: "bug", url: "https://gitcode.com/Cangjie/cangjie_tools/issues/1", content: "复现", cjcVersion: "cjc 1.0.0", branchVersions: ["main"]), templates)
+        // M1-N-001: public request builder remains JSON mode for compatibility.
         @Expect(bug.expectsJsonOutput, true)
         @Expect(bug.templateId, "issue_bug")
         @Expect(bug.prompt.contains("PROMPT-P1-issue-bug"), true)
         @Expect(bug.prompt.contains("IMMUTABLE_SYSTEM_GUARD"), true)
+        @Expect(bug.prompt.contains("只输出裸 JSON object"), true)
 
         let feature = buildGitCodeReviewPromptForRequest(GitCodeReviewRequest(eventType: "issue", issueKind: "feature-request", repoFullName: "Cangjie/cangjie_tools", number: "2", title: "feature", url: "https://gitcode.com/Cangjie/cangjie_tools/issues/2", content: "需求"), templates)
         let question = buildGitCodeReviewPromptForRequest(GitCodeReviewRequest(eventType: "issue", issueKind: "question", repoFullName: "Cangjie/cangjie_tools", number: "3", title: "question", url: "https://gitcode.com/Cangjie/cangjie_tools/issues/3", content: "问题"), templates)
@@ -757,12 +762,21 @@ public class GitCodeReviewContextPromptTest {
         @Expect(acceptedPr.prompt.contains("测试自验证=passed"), true)
 
         let accepted = buildGitCodeReplyPromptForServicePluginEvent(this.acceptedEvent("issue", issueKind: "bug", title: "bug", content: "复现"), templates)
+        // M1-U-001, M1-B-001, M1-P-001: service-plugin structured events use plain draft prompts.
         @Expect(accepted.expectsJsonOutput, false)
         @Expect(accepted.prompt.contains("StructuredTask"), true)
         @Expect(accepted.prompt.contains("UserProvidedData"), true)
+        @Expect(accepted.prompt.contains("Evidence"), true)
+        @Expect(accepted.prompt.contains("PROMPT-P1-issue-bug"), true)
         @Expect(accepted.prompt.contains("IMMUTABLE_OUTPUT_SCHEMA"), false)
-        @Expect(accepted.prompt.contains("只输出裸 JSON object"), false)
         @Expect(accepted.prompt.contains("只输出可直接发送的中文回复草稿正文"), true)
+        @Expect(accepted.prompt.contains("只输出裸 JSON object"), false)
+        @Expect(accepted.prompt.contains("```json"), false)
+
+        // M2-B-001: route-degraded structured events carry programmatic human-review state.
+        let acceptedNeedsReview = buildGitCodeReplyPromptForServicePluginEvent(this.acceptedEvent("issue", issueKind: "bug", title: "bug", content: "复现", diagnostics: ["ckb_unavailable"]), templates)
+        @Expect(acceptedNeedsReview.expectsJsonOutput, false)
+        @Expect(acceptedNeedsReview.needsHumanReview, true)
 
         let legacy = buildGitCodeReplyPromptForServicePluginEvent(this.acceptedEvent("legacy", reviewRequestRaw: ""), templates)
         @Expect(legacy.expectsJsonOutput, false)
@@ -791,10 +805,11 @@ public class GitCodeReviewContextPromptTest {
             ]
             let sentinels = ["PROMPT-P4-issue-bug", "PROMPT-P4-issue-feature", "PROMPT-P4-issue-question", "PROMPT-P4-comment", "PROMPT-P4-pr-english", "PROMPT-P4-pr-chinese"]
             for (i in 0..plans.size) {
+                // M1-U-002: every structured service-plugin template is plain draft mode.
                 @Expect(plans[i].expectsJsonOutput, false)
                 @Expect(plans[i].prompt.contains(sentinels[i]), true)
-                @Expect(plans[i].prompt.contains("只输出裸 JSON object"), false)
                 @Expect(plans[i].prompt.contains("只输出可直接发送的中文回复草稿正文"), true)
+                @Expect(plans[i].prompt.contains("只输出裸 JSON object"), false)
             }
         })
     }
@@ -844,6 +859,7 @@ public class GitCodeReviewContextPromptTest {
             @Expect(afterPlan.prompt.contains("IMMUTABLE_OUTPUT_PLAIN_DRAFT"), true)
             @Expect(afterPlan.prompt.contains("只输出可直接发送的中文回复草稿正文"), true)
             @Expect(afterPlan.prompt.contains("不要输出 JSON"), true)
+            @Expect(afterPlan.prompt.contains("只输出裸 JSON object"), false)
             @Expect(afterPlan.prompt.contains("UserProvidedData"), true)
             @Expect(afterPlan.prompt.contains("Evidence"), true)
         })

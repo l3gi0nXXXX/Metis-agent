@@ -475,7 +475,7 @@ private func recordGitCodeAcceptedEventForFutureReply(
     if (!delivery.ok) {
         return servicePluginDispatchResult(frame, false, "generated_reply_delivery_failed", diagnostic: redactServicePayload(delivery.diagnostic).text, eventId: event.eventId, targetCount: 1, deliveryFailed: 1)
     }
-    if (!generated.ok || servicePluginWritebackDegraded(writeback)) {
+    if (!generated.ok || generated.needsHumanReview || servicePluginWritebackDegraded(writeback)) {
         return servicePluginDispatchResult(frame, true, "generated_reply_degraded_delivered", diagnostic: generated.diagnostic, eventId: event.eventId, targetCount: 1, deliverySuccess: 1)
     }
     servicePluginDispatchResult(frame, true, "generated_reply_delivered", eventId: event.eventId, targetCount: 1, deliverySuccess: 1)
@@ -532,7 +532,8 @@ public func dispatchGitCodeWebhookAcceptedEvent(frame: ServiceFrame, event: Serv
         }
     }
     let writebackDegraded = servicePluginWritebackDegraded(writeback)
-    let status = if (failed == 0 && generated.ok && !writebackDegraded) {
+    let generatedDegraded = !generated.ok || generated.needsHumanReview
+    let status = if (failed == 0 && !generatedDegraded && !writebackDegraded) {
         "generated_reply_delivered"
     } else if (failed == 0) {
         "generated_reply_degraded_delivered"
@@ -593,7 +594,15 @@ public func renderServicePluginGeneratedReplyNotification(
             text += "标题: ${title}\n"
         }
         if (result.ok) {
-            text += servicePluginWritebackNotificationLine(writeback)
+            if (result.needsHumanReview) {
+                text += "状态: needsHumanReview，已生成草稿但需要人工审核，未写回 GitCode"
+                let reason = servicePluginGeneratedReplyHumanReason(result)
+                if (!reason.isEmpty() && reason != "draft_generated") {
+                    text += "\n原因: ${reason}"
+                }
+            } else {
+                text += servicePluginWritebackNotificationLine(writeback)
+            }
             text += "\n\n草稿:\n${result.draft}"
         } else {
             let reason = servicePluginGeneratedReplyHumanReason(result)

@@ -1315,6 +1315,59 @@ public class ServicePluginEventDispatcherTest {
     }
 
     @TestCase
+    public func draftM4U002NeedsHumanReviewDraftNotificationDoesNotRenderDryRun(): Unit {
+        // M4-U-002.
+        let event = ServicePluginAcceptedGitCodeEvent(repo: "Cangjie/community", kind: "issue", number: "1", url: "https://gitcode.com/Cangjie/community/issues/1")
+        let text = renderServicePluginGeneratedReplyNotification(
+            event,
+            ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "证据不足，请人工确认。", needsHumanReview: true)
+        )
+        @Expect(text.contains("状态: needsHumanReview"), true)
+        @Expect(text.contains("已生成草稿但需要人工审核，未写回 GitCode"), true)
+        @Expect(text.contains("证据不足，请人工确认。"), true)
+        @Expect(text.contains("dryRun=true"), false)
+        @Expect(text.contains("\"status\""), false)
+        @Expect(text.contains("{"), false)
+    }
+
+    @TestCase
+    public func draftM4U002WebhookNeedsHumanReviewDraftSkipsWriteback(): Unit {
+        // M4-U-002.
+        this.resetDispatcherHooks()
+        this.registerGitCodeWritebackPlugin()
+        let calls = ArrayList<String>()
+        let messages = ArrayList<String>()
+        setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent =>
+            this.targetRows([this.target(channel: "telegram", peerId: "tg-peer")])
+        }))
+        setServicePluginWebhookGeneratedReplyHandlerForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent, _target: ServicePluginDeliveryTarget =>
+            ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "证据不足，请人工确认。", needsHumanReview: true)
+        }))
+        setServicePluginCapabilityInvokerForTest(Some({ _registration: ServicePluginRegistration, request: CapabilityInvokeRequest =>
+            calls.add(request.capabilityId)
+            CapabilityInvokeResult(true, "ok", serviceId: "gitcode-monitor", capabilityId: request.capabilityId, payload: "{\"status\":\"posted\",\"posted\":true}")
+        }))
+        setServicePluginEventDeliveryForTest(Some({ _target: ServicePluginDeliveryTarget, text: String =>
+            messages.add(text)
+            ServicePluginEventDeliveryResult(true, "sent")
+        }))
+        try {
+            let result = dispatchServicePluginEvent(this.acceptedContractFrame(eventId: "gitcode:Cangjie/cangjie_tools:issue:draft-m4-u-002"), store: ServicePluginPendingJobStore())
+
+            @Expect(result.ok, true)
+            @Expect(result.status, "generated_reply_degraded_delivered")
+            @Expect(calls.size, 0)
+            @Expect(messages.size, 1)
+            @Expect(messages[0].contains("状态: needsHumanReview"), true)
+            @Expect(messages[0].contains("已生成草稿但需要人工审核，未写回 GitCode"), true)
+            @Expect(messages[0].contains("证据不足，请人工确认。"), true)
+            @Expect(messages[0].contains("dryRun=true"), false)
+        } finally {
+            this.resetDispatcherHooks()
+        }
+    }
+
+    @TestCase
     public func tContext001DispatcherPreservesLargeCommentReviewRequestContext(): Unit {
         this.resetDispatcherHooks()
         let calls = ArrayList<String>()
