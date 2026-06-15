@@ -239,6 +239,14 @@ public class GatewayServiceGitCodePromptTest {
         @Expect(ok.draft, "结论\n\n建议补测试")
         @Expect(ok.needsHumanReview, false)
 
+        let schemaReply = service.debugGitCodeGeneratedReplyResultForTest("{\"header\":{\"taskKind\":\"issue-comment-reply\"},\"result\":{\"replyBody\":\"建议补充复现步骤\"},\"safety\":{\"noSecretsExposed\":true},\"needsHumanReview\":true,\"citations\":[],\"diagnostics\":[]}", jsonPlan)
+        @Expect(schemaReply.ok, true)
+        @Expect(schemaReply.draft, "建议补充复现步骤")
+        @Expect(schemaReply.needsHumanReview, true)
+        @Expect(schemaReply.draft.contains("replyBody"), false)
+        @Expect(schemaReply.draft.contains("header"), false)
+        @Expect(schemaReply.draft.contains("result"), false)
+
         let fenced = service.debugGitCodeGeneratedReplyResultForTest("```json\n{\"header\":\"结论\",\"result\":\"建议补 fenced JSON\",\"safety\":\"approved\",\"needsHumanReview\":false}\n```", jsonPlan)
         @Expect(fenced.ok, true)
         @Expect(fenced.status, "draft_generated")
@@ -267,6 +275,21 @@ public class GatewayServiceGitCodePromptTest {
         @Expect(empty.ok, false)
         @Expect(empty.status, "draft_empty")
 
+        let schemaMissingResult = service.debugGitCodeGeneratedReplyResultForTest("{\"header\":{\"taskKind\":\"issue-comment-reply\"},\"needsHumanReview\":false}", jsonPlan)
+        @Expect(schemaMissingResult.ok, false)
+        @Expect(schemaMissingResult.status, "result_missing")
+        @Expect(schemaMissingResult.status != "draft_empty", true)
+
+        let schemaMissingReplyBody = service.debugGitCodeGeneratedReplyResultForTest("{\"header\":{\"taskKind\":\"issue-comment-reply\"},\"result\":{\"summary\":\"只有摘要\"},\"needsHumanReview\":false}", jsonPlan)
+        @Expect(schemaMissingReplyBody.ok, false)
+        @Expect(schemaMissingReplyBody.status, "result_reply_body_missing")
+        @Expect(schemaMissingReplyBody.status != "draft_empty", true)
+
+        let forbiddenMaintainerMention = service.debugGitCodeGeneratedReplyResultForTest("{\"header\":{\"taskKind\":\"issue-comment-reply\"},\"result\":{\"replyBody\":\"请 @Crownoth 看一下\"},\"needsHumanReview\":false}", jsonPlan)
+        @Expect(forbiddenMaintainerMention.ok, false)
+        @Expect(forbiddenMaintainerMention.status, "draft_contains_forbidden_maintainer_mention")
+        @Expect(forbiddenMaintainerMention.needsHumanReview, true)
+
         let localPath = service.debugGitCodeGeneratedReplyResultForTest("{\"header\":\"h\",\"result\":\"/Users/name/private Authorization: Bearer secret\",\"safety\":\"approved\",\"needsHumanReview\":false}", jsonPlan)
         @Expect(localPath.ok, false)
         @Expect(localPath.diagnostic.contains("/Users/name"), false)
@@ -294,6 +317,22 @@ public class GatewayServiceGitCodePromptTest {
             @Expect(webhook.ok, true)
             @Expect(pending.draft, "结论\n\n建议补测试")
             @Expect(webhook.draft, "结论\n\n建议补测试")
+
+            let schemaRaw = "{\"header\":{\"taskKind\":\"issue-comment-reply\"},\"result\":{\"replyBody\":\"建议补充复现步骤\"},\"needsHumanReview\":false,\"citations\":[],\"diagnostics\":[]}"
+            let pendingSchema = service.debugGenerateGitCodePendingReplyDraftForTest(event, schemaRaw)
+            let webhookSchema = service.debugGenerateGitCodeWebhookReplyDraftForTest(event, schemaRaw)
+            @Expect(pendingSchema.ok, true)
+            @Expect(webhookSchema.ok, true)
+            @Expect(pendingSchema.draft, "建议补充复现步骤")
+            @Expect(webhookSchema.draft, "建议补充复现步骤")
+            @Expect(pendingSchema.draft.contains("```"), false)
+            @Expect(webhookSchema.draft.contains("```"), false)
+            @Expect(pendingSchema.draft.contains("replyBody"), false)
+            @Expect(webhookSchema.draft.contains("replyBody"), false)
+            @Expect(pendingSchema.draft.contains("header"), false)
+            @Expect(webhookSchema.draft.contains("header"), false)
+            @Expect(pendingSchema.draft.contains("result"), false)
+            @Expect(webhookSchema.draft.contains("result"), false)
 
             let fencedRaw = "```json\n{\"header\":\"结论\",\"result\":\"建议补 fenced JSON\",\"safety\":\"approved\",\"needsHumanReview\":false}\n```"
             let pendingFenced = service.debugGenerateGitCodePendingReplyDraftForTest(event, fencedRaw)
