@@ -72,6 +72,26 @@ public class GitCodeGeneratedReplyModelOutputV1 {
     }
 }
 
+private class GitCodeGeneratedReplyTextRead {
+    public let ok: Bool
+    public let status: String
+    public let text: String
+
+    public init(ok: Bool, status!: String = "ok", text!: String = "") {
+        this.ok = ok
+        this.status = status.trimAscii()
+        this.text = text.trimAscii()
+    }
+}
+
+private func generatedReplyTextReadOk(text: String): GitCodeGeneratedReplyTextRead {
+    GitCodeGeneratedReplyTextRead(true, status: "ok", text: text.trimAscii())
+}
+
+private func generatedReplyTextReadRejected(status: String): GitCodeGeneratedReplyTextRead {
+    GitCodeGeneratedReplyTextRead(false, status: status.trimAscii(), text: "")
+}
+
 private func promptStr(obj: JsonObject, key: String): String {
     match (obj.get(key)) {
         case Some(v) => try { v.asString().getValue().trimAscii() } catch (_: Exception) { "" }
@@ -211,6 +231,30 @@ private func replyArray(obj: JsonObject, key: String): JsonArray {
     }
 }
 
+private func generatedReplyResultText(obj: JsonObject): GitCodeGeneratedReplyTextRead {
+    match (obj.get("result")) {
+        case Some(value) =>
+            let stringRead = try { Some(value.asString().getValue().trimAscii()) } catch (_: Exception) { None<String> }
+            match (stringRead) {
+                case Some(text) => return generatedReplyTextReadOk(text)
+                case None => ()
+            }
+
+            let resultObj = try { value.asObject() } catch (_: Exception) {
+                return generatedReplyTextReadRejected("result_invalid_type")
+            }
+            match (resultObj.get("replyBody")) {
+                case Some(replyBodyValue) =>
+                    let replyBody = try { replyBodyValue.asString().getValue().trimAscii() } catch (_: Exception) {
+                        return generatedReplyTextReadRejected("result_reply_body_invalid_type")
+                    }
+                    return generatedReplyTextReadOk(replyBody)
+                case None => return generatedReplyTextReadRejected("result_reply_body_missing")
+            }
+        case None => return generatedReplyTextReadRejected("result_missing")
+    }
+}
+
 private func generatedReplyFenceLanguageAllowed(firstLine: String): Bool {
     let trimmed = firstLine.trimAscii()
     if (!trimmed.startsWith(GENERATED_REPLY_JSON_FENCE)) {
@@ -262,7 +306,11 @@ public func parseGeneratedReplyModelOutput(raw: String): GitCodeGeneratedReplyMo
         return GitCodeGeneratedReplyModelOutputV1(false, "llm_output_invalid_tool_json", needsHumanReview: true)
     }
     let header = promptStr(obj, "header")
-    let result = promptStr(obj, "result")
+    let resultRead = generatedReplyResultText(obj)
+    if (!resultRead.ok) {
+        return GitCodeGeneratedReplyModelOutputV1(false, resultRead.status, header: "", result: "", needsHumanReview: true)
+    }
+    let result = resultRead.text
     if (result.trimAscii().isEmpty()) {
         return GitCodeGeneratedReplyModelOutputV1(false, "draft_empty", header: "", result: "", needsHumanReview: true)
     }
@@ -287,6 +335,9 @@ public func parseGeneratedReplyModelOutput(raw: String): GitCodeGeneratedReplyMo
 public func renderGeneratedReplyDraft(reply: GitCodeGeneratedReplyModelOutputV1): String {
     if (!reply.ok) {
         return "需要人工确认\n\n${reply.status}"
+    }
+    if (reply.header.trimAscii().isEmpty()) {
+        return reply.result.trimAscii()
     }
     "${reply.header}\n\n${reply.result}"
 }
