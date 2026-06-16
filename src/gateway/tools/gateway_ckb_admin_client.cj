@@ -166,6 +166,14 @@ private func ckbAdminJsonIntText(obj: JsonObject, key: String): String {
     }
 }
 
+private func ckbAdminJsonText(obj: JsonObject, key: String): String {
+    match (obj.get(key)) {
+        case Some(v) =>
+            try { v.asString().getValue().trimAscii() } catch (_: Exception) { v.toJsonString().trimAscii() }
+        case None => ""
+    }
+}
+
 private func ckbAdminResultObject(response: GatewayCkbAdminHttpResponse): Option<JsonObject> {
     if (response.statusCode < 200 || response.statusCode >= 300) {
         return None<JsonObject>
@@ -174,6 +182,10 @@ private func ckbAdminResultObject(response: GatewayCkbAdminHttpResponse): Option
     let ok = try { root.get("ok").getOrThrow().asBool().getValue() } catch (_: Exception) { false }
     if (!ok) {
         return None<JsonObject>
+    }
+    match (root.get("data")) {
+        case Some(v) => return try { Some<JsonObject>(v.asObject()) } catch (_: Exception) { None<JsonObject> }
+        case None => ()
     }
     match (root.get("result")) {
         case Some(v) => try { Some<JsonObject>(v.asObject()) } catch (_: Exception) { None<JsonObject> }
@@ -334,13 +346,30 @@ private func ckbAdminRenderScheduleLine(schedules: JsonObject, task: String): St
     match (schedules.get(task)) {
         case Some(v) =>
             let obj = try { v.asObject() } catch (_: Exception) { return "" }
-            let last = ckbAdminJsonString(obj, "lastSuccessAt")
+            let last = ckbAdminJsonText(obj, "lastSuccessAt")
             if (last.isEmpty()) {
                 ""
             } else {
                 "${task}.lastSuccessAt: ${last}"
             }
-        case None => ""
+        case None =>
+            match (schedules.get("entries")) {
+                case Some(v) =>
+                    let entries = try { v.asArray() } catch (_: Exception) { return "" }
+                    for (i in 0..entries.size()) {
+                        let obj = try { entries[i].asObject() } catch (_: Exception) { continue }
+                        if (ckbAdminJsonString(obj, "name") != task) {
+                            continue
+                        }
+                        let last = ckbAdminJsonText(obj, "lastSuccessAt")
+                        if (last.isEmpty()) {
+                            return ""
+                        }
+                        return "${task}.lastSuccessAt: ${last}"
+                    }
+                    ""
+                case None => ""
+            }
     }
 }
 
