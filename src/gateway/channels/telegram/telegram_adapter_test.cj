@@ -2,7 +2,7 @@ package metis.gateway.channels.telegram
 
 import metis.core.{GatewayToolRuntimeContext, gatewayWithToolRuntimeContext, setGatewayMediaAsrRunnerForTest, setGatewayMediaVisionRunnerForTest}
 import metis.core.config.{CliConfig, CliSettingManager, GatewayUserSettings, MetisConfigManager}
-import metis.gateway.core.{gatewayBuildMediaContextPrompt, gatewayResolveAgentTeamBroadcastPlan, gatewayResolveSessionContextWithAgentRoute, setGatewayOpenClawPluginSidecarRunnerForTest}
+import metis.gateway.core.{gatewayBuildMediaContextPrompt, gatewayResolveAgentTeamBroadcastPlan, gatewayResolveSessionContextWithAgentRoute, gatewayTelegramNativeCommandMenuRows, setGatewayOpenClawPluginSidecarRunnerForTest}
 import metis.gateway.model.*
 import metis.gateway.session.gatewaySessionRequestFromInbound
 import metis.gateway.tools.{GatewayTelegramMediaToolset, setGatewayTelegramStickerCacheRootForTest}
@@ -825,7 +825,7 @@ public class TelegramAdapterTest {
         let adapter = TelegramAdapter(config: TelegramConfig(enabled: true, botToken: "telegram-token"))
         let payload = adapter.debugBuildNativeCommandsPayload()
         let commands = payload.get("commands").getOrThrow().asArray()
-        @Expect(commands.size(), 45)
+        @Expect(commands.size(), gatewayTelegramNativeCommandMenuRows().size)
         let first = commands[0].asObject()
         @Expect(first.get("command").getOrThrow().asString().getValue(), "help")
         @Expect(first.get("description").getOrThrow().asString().getValue(), "Show available commands.")
@@ -833,6 +833,7 @@ public class TelegramAdapterTest {
         @Expect(this.telegramPayloadHasCommand(commands, "models"), true)
         @Expect(this.telegramPayloadHasCommand(commands, "subagents"), true)
         @Expect(this.telegramPayloadHasCommand(commands, "codex_runtime"), true)
+        @Expect(this.telegramPayloadHasCommand(commands, "ckb_refresh"), true)
         @Expect(this.telegramPayloadHasCommand(commands, "focus"), true)
         @Expect(this.telegramPayloadHasCommand(commands, "unfocus"), true)
         @Expect(this.telegramPayloadHasCommand(commands, "agents"), true)
@@ -933,7 +934,7 @@ public class TelegramAdapterTest {
         )
         let payload = adapter.debugBuildNativeCommandsPayload()
         let commands = payload.get("commands").getOrThrow().asArray()
-        @Expect(commands.size(), 46)
+        @Expect(commands.size(), gatewayTelegramNativeCommandMenuRows().size + 1)
         @Expect(this.telegramPayloadCommandCount(commands, "status"), 1)
         let last = commands[commands.size() - 1].asObject()
         @Expect(last.get("command").getOrThrow().asString().getValue(), "generate")
@@ -980,7 +981,7 @@ public class TelegramAdapterTest {
             let adapter = TelegramAdapter(config: TelegramConfig(enabled: true, botToken: "telegram-token"))
             let payload = adapter.debugBuildNativeCommandsPayload()
             let commands = payload.get("commands").getOrThrow().asArray()
-            @Expect(commands.size(), 46)
+            @Expect(commands.size(), gatewayTelegramNativeCommandMenuRows().size + 1)
             let pluginCommand = commands[commands.size() - 1].asObject()
             @Expect(pluginCommand.get("command").getOrThrow().asString().getValue(), "plugin_demo")
             @Expect(pluginCommand.get("description").getOrThrow().asString().getValue(), "Plugin demo command")
@@ -1090,7 +1091,7 @@ public class TelegramAdapterTest {
             let commands = snapshot.get("nativeCommands").getOrThrow().asObject()
             @Expect(commands.get("lastSyncStatus").getOrThrow().asString().getValue(), "error")
             @Expect(commands.get("lastSyncError").getOrThrow().asString().getValue().contains("Bad Request"), true)
-            @Expect(commands.get("lastSyncCommandCount").getOrThrow().asInt().getValue(), 45)
+            @Expect(commands.get("lastSyncCommandCount").getOrThrow().asInt().getValue(), gatewayTelegramNativeCommandMenuRows().size)
         } finally {
             setTelegramTransportRunnerForTest(None)
         }
