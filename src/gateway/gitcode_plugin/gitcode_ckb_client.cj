@@ -375,7 +375,14 @@ public func renderCkbDiagnostics(diagnostics: Array<GitCodeCkbDiagnostic>): Stri
 
 public func gitCodeCkbResultToContext(result: GitCodeCkbClientResult): JsonObject {
     let out = JsonObject()
-    out.put("status", JsonString(result.status))
+    var status = result.status
+    if (result.ok && result.capabilityId == GITCODE_CKB_EVIDENCE_PACK_CAPABILITY) {
+        let itemCount = try { result.payload.get("items").getOrThrow().asArray().size() } catch (_: Exception) { 0 }
+        if (itemCount == 0) {
+            status = "empty"
+        }
+    }
+    out.put("status", JsonString(status))
     out.put("capabilityId", JsonString(result.capabilityId))
     out.put("degraded", JsonBool(result.degraded))
     let diags = JsonArray([])
@@ -461,8 +468,9 @@ public func resolveGitCodeCkbContextForRequest(
             parentUrl: request.parentUrl
         )
         ckbContext = gitCodeCkbResultToContext(evidence)
-        degraded = degraded || evidence.degraded || !evidence.ok
-        needsHumanReview = needsHumanReview || !evidence.ok
+        let insufficient = ckbEvidenceInsufficient(ckbContext)
+        degraded = degraded || evidence.degraded || !evidence.ok || insufficient
+        needsHumanReview = needsHumanReview || !evidence.ok || insufficient
     }
 
     let shouldQuerySource =

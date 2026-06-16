@@ -59,6 +59,14 @@ public func buildGitCodeReplyPromptForServicePluginEvent(
     buildGitCodeReviewPromptForRequestWithRuntimeConfig(parsed.request, templates, config, outputMode: GITCODE_PROMPT_OUTPUT_MODE_PLAIN_DRAFT)
 }
 
+public func buildGitCodeReplyPromptForServicePluginEventWithRuntime(
+    event: ServicePluginAcceptedGitCodeEvent,
+    templates: GitCodePromptTemplateSet,
+    config: GitCodeReviewRuntimeConfig
+): GitCodeReviewPromptPlan {
+    buildGitCodeReplyPromptForServicePluginEvent(event, templates, config: config)
+}
+
 private func reviewRequestRawLooksLikeContractFragment(raw: String): Bool {
     let obj = try { JsonValue.fromStr(raw).asObject() } catch (_: Exception) { JsonObject() }
     obj.get("event").isSome() && obj.get("content").isSome() && obj.get("templates").isSome()

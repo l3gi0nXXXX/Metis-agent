@@ -704,6 +704,227 @@ public class GitCodeReviewContextPromptTest {
     }
 
     @TestCase
+    public func metis2ResolvedEvidenceIsInjectedIntoAcceptedPrompt(): Unit {
+        // METIS2-UT-001, METIS2-POS-001
+        let counter = GitCodeReviewTestCounter()
+        setGitCodeCkbHttpRunnerForTest(Some({ request: GitCodeCkbHttpRequest =>
+            counter.httpCalls += 1
+            @Expect(request.path, "/v1/evidence-pack")
+            let result = JsonObject()
+            result.put("knowledgeVersion", JsonString("ckb-test-v1"))
+            let item = JsonObject()
+            item.put("title", JsonString("参数解析 evidence"))
+            item.put("summary", JsonString("CKB resolved evidence text for parser defaults"))
+            item.put("visibility", JsonString("public"))
+            result.put("items", JsonArray([item]))
+            let citation = JsonObject()
+            citation.put("ref", JsonString("ckb://entry/parser-defaults"))
+            result.put("citations", JsonArray([citation]))
+            let envelope = JsonObject()
+            envelope.put("ok", JsonBool(true))
+            envelope.put("result", result)
+            GitCodeCkbHttpResponse(200, body: envelope.toJsonString())
+        }))
+        try {
+            let cfg = GitCodeReviewRuntimeConfig(
+                ckbService: GitCodeCkbServiceConfig(enabled: true, endpoint: "http://127.0.0.1:18080", sourceAnalysisEnabled: false)
+            )
+            let plan = buildGitCodeReplyPromptForServicePluginEventWithRuntime(
+                this.acceptedEvent("issue", issueKind: "bug", title: "bug", content: "复现", requiresCkb: true),
+                defaultGitCodePromptTemplateSet(),
+                cfg
+            )
+            @Expect(plan.ok, true)
+            @Expect(plan.route, "issue_bug")
+            @Expect(plan.prompt.contains("resolved"), true)
+            @Expect(plan.prompt.contains("ckb-test-v1"), true)
+            @Expect(plan.prompt.contains("CKB resolved evidence text"), true)
+            @Expect(plan.prompt.contains("ckb://entry/parser-defaults"), true)
+            @Expect(plan.prompt.contains("CKB evidence is not attached"), false)
+            @Expect(counter.httpCalls, 1)
+        } finally {
+            setGitCodeCkbHttpRunnerForTest(None<(GitCodeCkbHttpRequest) -> GitCodeCkbHttpResponse>)
+        }
+    }
+
+    @TestCase
+    public func metis2CkbNotRequiredDoesNotCallCkb(): Unit {
+        // METIS2-UT-002
+        let counter = GitCodeReviewTestCounter()
+        setGitCodeCkbHttpRunnerForTest(Some({ _request: GitCodeCkbHttpRequest =>
+            counter.httpCalls += 1
+            GitCodeCkbHttpResponse(500, body: "{}")
+        }))
+        try {
+            let cfg = GitCodeReviewRuntimeConfig(
+                ckbService: GitCodeCkbServiceConfig(enabled: true, endpoint: "http://127.0.0.1:18080", sourceAnalysisEnabled: true)
+            )
+            let plan = buildGitCodeReplyPromptForServicePluginEventWithRuntime(
+                this.acceptedEvent("pr", title: "fix parser", content: "english body", requiresCkb: false, changedFiles: ["src/a.cj"]),
+                defaultGitCodePromptTemplateSet(),
+                cfg
+            )
+            @Expect(plan.ok, true)
+            @Expect(plan.prompt.contains("not_required"), true)
+            @Expect(counter.httpCalls, 0)
+        } finally {
+            setGitCodeCkbHttpRunnerForTest(None<(GitCodeCkbHttpRequest) -> GitCodeCkbHttpResponse>)
+        }
+    }
+
+    @TestCase
+    public func metis2PrEventsOnlyUseReadCkbQueryPaths(): Unit {
+        // METIS2-UT-003, METIS2-UT-004
+        let counter = GitCodeReviewTestCounter()
+        setGitCodeCkbHttpRunnerForTest(Some({ request: GitCodeCkbHttpRequest =>
+            counter.httpCalls += 1
+            counter.captured.put("path${counter.httpCalls}", JsonString(request.path))
+            @Expect(request.path == "/v1/evidence-pack" || request.path == "/v1/source-analysis", true)
+            @Expect(request.path.contains("/v1/events/gitcode/repository-changed"), false)
+            @Expect(request.path.contains("/v1/admin/"), false)
+            let result = JsonObject()
+            if (request.path == "/v1/evidence-pack") {
+                result.put("knowledgeVersion", JsonString("ckb-test-v1"))
+                result.put("items", JsonArray([]))
+            } else {
+                result.put("analysis", JsonString("source analysis for changed file"))
+            }
+            let envelope = JsonObject()
+            envelope.put("ok", JsonBool(true))
+            envelope.put("result", result)
+            GitCodeCkbHttpResponse(200, body: envelope.toJsonString())
+        }))
+        try {
+            let cfg = GitCodeReviewRuntimeConfig(
+                ckbService: GitCodeCkbServiceConfig(enabled: true, endpoint: "http://127.0.0.1:18080", sourceAnalysisEnabled: true)
+            )
+            let plan = buildGitCodeReplyPromptForServicePluginEventWithRuntime(
+                this.acceptedEvent("pr", title: "fix parser", content: "english body", requiresCkb: true, changedFiles: ["src/a.cj"]),
+                defaultGitCodePromptTemplateSet(),
+                cfg
+            )
+            @Expect(plan.ok, true)
+            @Expect(this.str(counter.captured, "path1"), "/v1/evidence-pack")
+            @Expect(this.str(counter.captured, "path2"), "/v1/source-analysis")
+            @Expect(counter.captured.toJsonString().contains("/v1/events/gitcode/repository-changed"), false)
+            @Expect(counter.captured.toJsonString().contains("/v1/admin/repositories/sync"), false)
+            @Expect(counter.httpCalls, 2)
+        } finally {
+            setGitCodeCkbHttpRunnerForTest(None<(GitCodeCkbHttpRequest) -> GitCodeCkbHttpResponse>)
+        }
+
+        let repoListCounter = GitCodeReviewTestCounter()
+        setGitCodeCkbHttpRunnerForTest(Some({ request: GitCodeCkbHttpRequest =>
+            repoListCounter.httpCalls += 1
+            repoListCounter.captured.put("path${repoListCounter.httpCalls}", JsonString(request.path))
+            let result = JsonObject()
+            result.put("knowledgeVersion", JsonString("ckb-test-v1"))
+            let item = JsonObject()
+            item.put("summary", JsonString("repo list evidence"))
+            item.put("visibility", JsonString("public"))
+            result.put("items", JsonArray([item]))
+            let envelope = JsonObject()
+            envelope.put("ok", JsonBool(true))
+            envelope.put("result", result)
+            GitCodeCkbHttpResponse(200, body: envelope.toJsonString())
+        }))
+        try {
+            let cfg = GitCodeReviewRuntimeConfig(
+                ckbService: GitCodeCkbServiceConfig(enabled: true, endpoint: "http://127.0.0.1:18080", sourceAnalysisEnabled: true)
+            )
+            let plan = buildGitCodeReplyPromptForServicePluginEventWithRuntime(
+                this.acceptedEvent("pr", title: "update repo list", content: "english body", requiresCkb: true, changedFiles: ["repo_list.md"]),
+                defaultGitCodePromptTemplateSet(),
+                cfg
+            )
+            @Expect(plan.ok, true)
+            @Expect(this.str(repoListCounter.captured, "path1"), "/v1/evidence-pack")
+            @Expect(repoListCounter.captured.toJsonString().contains("/v1/admin/repo-list/refresh"), false)
+            @Expect(repoListCounter.captured.toJsonString().contains("/v1/events/gitcode/repository-changed"), false)
+            @Expect(repoListCounter.httpCalls, 1)
+        } finally {
+            setGitCodeCkbHttpRunnerForTest(None<(GitCodeCkbHttpRequest) -> GitCodeCkbHttpResponse>)
+        }
+    }
+
+    @TestCase
+    public func metis2CkbEmptyTimeoutAndSecretsDegradePromptSafely(): Unit {
+        // METIS2-BND-001, METIS2-BND-002, METIS2-BND-003
+        let cfg = GitCodeReviewRuntimeConfig(
+            ckbService: GitCodeCkbServiceConfig(enabled: true, endpoint: "http://127.0.0.1:18080", sourceAnalysisEnabled: false)
+        )
+        setGitCodeCkbHttpRunnerForTest(Some({ _request: GitCodeCkbHttpRequest =>
+            let result = JsonObject()
+            result.put("knowledgeVersion", JsonString("ckb-empty-v1"))
+            result.put("items", JsonArray([]))
+            let envelope = JsonObject()
+            envelope.put("ok", JsonBool(true))
+            envelope.put("result", result)
+            GitCodeCkbHttpResponse(200, body: envelope.toJsonString())
+        }))
+        try {
+            let plan = buildGitCodeReplyPromptForServicePluginEventWithRuntime(
+                this.acceptedEvent("issue", issueKind: "question", title: "question", content: "问题", requiresCkb: true),
+                defaultGitCodePromptTemplateSet(),
+                cfg
+            )
+            @Expect(plan.ok, true)
+            @Expect(plan.needsHumanReview, true)
+            @Expect(plan.prompt.contains("empty"), true)
+            @Expect(plan.prompt.contains("证据不足"), true)
+        } finally {
+            setGitCodeCkbHttpRunnerForTest(None<(GitCodeCkbHttpRequest) -> GitCodeCkbHttpResponse>)
+        }
+
+        setGitCodeCkbHttpRunnerForTest(Some({ _request: GitCodeCkbHttpRequest =>
+            let result = JsonObject()
+            result.put("knowledgeVersion", JsonString("ckb-secret-v1"))
+            let item = JsonObject()
+            item.put("summary", JsonString("unsafe /Users/x/private Authorization: Bearer secret-token evidence"))
+            item.put("visibility", JsonString("public"))
+            result.put("items", JsonArray([item]))
+            let envelope = JsonObject()
+            envelope.put("ok", JsonBool(true))
+            envelope.put("result", result)
+            GitCodeCkbHttpResponse(200, body: envelope.toJsonString())
+        }))
+        try {
+            let plan = buildGitCodeReplyPromptForServicePluginEventWithRuntime(
+                this.acceptedEvent("issue", issueKind: "bug", title: "bug", content: "复现", requiresCkb: true),
+                defaultGitCodePromptTemplateSet(),
+                cfg
+            )
+            @Expect(plan.prompt.contains("resolved"), true)
+            @Expect(plan.prompt.contains("/Users/x"), false)
+            @Expect(plan.prompt.contains("Bearer secret-token"), false)
+            @Expect(plan.prompt.contains("[local-path-redacted]"), true)
+            @Expect(plan.prompt.contains("Authorization: [redacted]"), true)
+        } finally {
+            setGitCodeCkbHttpRunnerForTest(None<(GitCodeCkbHttpRequest) -> GitCodeCkbHttpResponse>)
+        }
+
+        let timeoutCounter = GitCodeReviewTestCounter()
+        setGitCodeCkbHttpRunnerForTest(Some({ _request: GitCodeCkbHttpRequest =>
+            timeoutCounter.httpCalls += 1
+            GitCodeCkbHttpResponse(0, error: "read timeout")
+        }))
+        try {
+            let plan = buildGitCodeReplyPromptForServicePluginEventWithRuntime(
+                this.acceptedEvent("issue", issueKind: "question", title: "question", content: "问题", requiresCkb: true),
+                defaultGitCodePromptTemplateSet(),
+                cfg
+            )
+            @Expect(plan.ok, true)
+            @Expect(plan.needsHumanReview, true)
+            @Expect(plan.prompt.contains("ckb_timeout"), true)
+            @Expect(plan.prompt.contains("证据不足"), true)
+            @Expect(timeoutCounter.httpCalls, 1)
+        } finally {
+            setGitCodeCkbHttpRunnerForTest(None<(GitCodeCkbHttpRequest) -> GitCodeCkbHttpResponse>)
+        }
+    }
+
+    @TestCase
     public func prReviewAdapterSchemaMockExternalAndNormalization(): Unit {
         // T-REVIEW-001 through T-REVIEW-018, including T-REVIEW-010A and T-REVIEW-010B
         let request = buildPrReviewRequest(this.prFixture(), JsonObject(), JsonObject())
