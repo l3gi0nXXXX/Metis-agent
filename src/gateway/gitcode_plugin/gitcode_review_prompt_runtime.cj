@@ -40,7 +40,8 @@ public class GitCodeReviewPromptPlan {
 
 public func buildGitCodeReplyPromptForServicePluginEvent(
     event: ServicePluginAcceptedGitCodeEvent,
-    templates: GitCodePromptTemplateSet
+    templates: GitCodePromptTemplateSet,
+    config!: GitCodeReviewRuntimeConfig = defaultGitCodeReviewRuntimeConfig()
 ): GitCodeReviewPromptPlan {
     if (event.reviewRequestRaw.isEmpty()) {
         return legacyGitCodeReplyPromptPlan(event, "legacy_fallback", diagnostic: "reviewRequest missing")
@@ -55,7 +56,7 @@ public func buildGitCodeReplyPromptForServicePluginEvent(
     if (parsed.request.legacy) {
         return legacyGitCodeReplyPromptPlan(event, "legacy_fallback_parse_failed", diagnostic: "reviewRequest schema missing")
     }
-    buildGitCodeReviewPromptForRequestWithOutputMode(parsed.request, templates, GITCODE_PROMPT_OUTPUT_MODE_PLAIN_DRAFT)
+    buildGitCodeReviewPromptForRequestWithRuntimeConfig(parsed.request, templates, config, outputMode: GITCODE_PROMPT_OUTPUT_MODE_PLAIN_DRAFT)
 }
 
 private func reviewRequestRawLooksLikeContractFragment(raw: String): Bool {
@@ -67,13 +68,14 @@ public func buildGitCodeReviewPromptForRequest(
     request: GitCodeReviewRequest,
     templates: GitCodePromptTemplateSet
 ): GitCodeReviewPromptPlan {
-    buildGitCodeReviewPromptForRequestWithOutputMode(request, templates, GITCODE_PROMPT_OUTPUT_MODE_JSON_OBJECT)
+    buildGitCodeReviewPromptForRequestWithRuntimeConfig(request, templates, defaultGitCodeReviewRuntimeConfig(), outputMode: GITCODE_PROMPT_OUTPUT_MODE_JSON_OBJECT)
 }
 
-private func buildGitCodeReviewPromptForRequestWithOutputMode(
+public func buildGitCodeReviewPromptForRequestWithRuntimeConfig(
     request: GitCodeReviewRequest,
     templates: GitCodePromptTemplateSet,
-    outputMode: String
+    config: GitCodeReviewRuntimeConfig,
+    outputMode!: String = GITCODE_PROMPT_OUTPUT_MODE_JSON_OBJECT
 ): GitCodeReviewPromptPlan {
     let route = routeGitCodeReviewRequest(request)
     if (!route.ok || route.route == "issue_generic") {
@@ -83,7 +85,8 @@ private func buildGitCodeReviewPromptForRequestWithOutputMode(
             diagnostic: if (route.diagnostic.isEmpty()) { route.route } else { route.diagnostic }
         )
     }
-    let input = buildGitCodeReviewPromptInput(request)
+    let ckbContext = resolveGitCodeCkbContextForRequest(request, config)
+    let input = buildGitCodeReviewPromptInput(request, ckbContext: ckbContext)
     let templateId = match (route.route) {
         case "issue_bug" => "issue_bug"
         case "issue_feature" => "issue_feature_request"
@@ -113,12 +116,23 @@ private func buildGitCodeReviewPromptForRequestWithOutputMode(
         templateId: templateId,
         source: template.source,
         expectsJsonOutput: !gitCodePromptUsesPlainDraftOutput(outputMode),
-        needsHumanReview: route.needsHumanReview,
+        needsHumanReview: route.needsHumanReview || ckbContext.needsHumanReview,
         diagnostic: template.reason
     )
 }
 
-public func buildGitCodeReviewPromptInput(request: GitCodeReviewRequest): PromptInputV1 {
+private func buildGitCodeReviewPromptForRequestWithOutputMode(
+    request: GitCodeReviewRequest,
+    templates: GitCodePromptTemplateSet,
+    outputMode: String
+): GitCodeReviewPromptPlan {
+    buildGitCodeReviewPromptForRequestWithRuntimeConfig(request, templates, defaultGitCodeReviewRuntimeConfig(), outputMode: outputMode)
+}
+
+public func buildGitCodeReviewPromptInput(
+    request: GitCodeReviewRequest,
+    ckbContext!: GitCodeCkbResolvedContext = GitCodeCkbResolvedContext(JsonObject(), JsonObject())
+): PromptInputV1 {
     let event = JsonObject()
     event.put("kind", JsonString(request.eventType))
     event.put("repo", JsonString(request.repoFullName))
@@ -161,6 +175,8 @@ public func buildGitCodeReviewPromptInput(request: GitCodeReviewRequest): Prompt
     let ckb = JsonObject()
     ckb.put("status", JsonString(if (request.requiresCkb) { "unavailable" } else { "not_required" }))
     ckb.put("diagnostic", JsonString("CKB evidence is not attached to service-plugin reviewRequest"))
+    let resolvedSource = if (ckbContext.sourceContext.toJsonString() == "{}") { source } else { ckbContext.sourceContext }
+    let resolvedCkb = if (ckbContext.ckbEvidence.toJsonString() == "{}") { ckb } else { ckbContext.ckbEvidence }
 
     let review = JsonObject()
     review.put("status", JsonString(if (request.reviewFindings.size > 0) { "resolved" } else if (request.requiresCodeReview) { "unavailable" } else { "not_required" }))
@@ -171,8 +187,8 @@ public func buildGitCodeReviewPromptInput(request: GitCodeReviewRequest): Prompt
         fields,
         author: author,
         maintainers: maintainers,
-        sourceContext: source,
-        ckbEvidence: ckb,
+        sourceContext: resolvedSource,
+        ckbEvidence: resolvedCkb,
         reviewFindings: review,
         discussionContext: gitCodeReviewDiscussionContextToJson(request),
         diagnostics: request.diagnostics

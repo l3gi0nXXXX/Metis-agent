@@ -75,19 +75,50 @@ public class GitCodePromptTemplatesConfig {
     }
 }
 
+public class GitCodeCkbServiceConfig {
+    public let enabled: Bool
+    public let endpoint: String
+    public let timeoutMs: Int64
+    public let defaultBudget: Int64
+    public let maxBudget: Int64
+    public let includeCandidates: Bool
+    public let sourceAnalysisEnabled: Bool
+
+    public init(
+        enabled!: Bool = false,
+        endpoint!: String = "",
+        timeoutMs!: Int64 = 5000,
+        defaultBudget!: Int64 = 5,
+        maxBudget!: Int64 = 10,
+        includeCandidates!: Bool = false,
+        sourceAnalysisEnabled!: Bool = false
+    ) {
+        this.enabled = enabled
+        this.endpoint = endpoint.trimAscii()
+        this.timeoutMs = timeoutMs
+        this.defaultBudget = defaultBudget
+        this.maxBudget = maxBudget
+        this.includeCandidates = includeCandidates
+        this.sourceAnalysisEnabled = sourceAnalysisEnabled
+    }
+}
+
 public class GitCodeReviewRuntimeConfig {
     public let sourceWorkspace: GitCodeSourceWorkspaceConfig
     public let prReviewAdapter: GitCodePrReviewAdapterConfig
     public let promptTemplates: GitCodePromptTemplatesConfig
+    public let ckbService: GitCodeCkbServiceConfig
 
     public init(
         sourceWorkspace!: GitCodeSourceWorkspaceConfig = GitCodeSourceWorkspaceConfig(),
         prReviewAdapter!: GitCodePrReviewAdapterConfig = GitCodePrReviewAdapterConfig(),
-        promptTemplates!: GitCodePromptTemplatesConfig = GitCodePromptTemplatesConfig()
+        promptTemplates!: GitCodePromptTemplatesConfig = GitCodePromptTemplatesConfig(),
+        ckbService!: GitCodeCkbServiceConfig = GitCodeCkbServiceConfig()
     ) {
         this.sourceWorkspace = sourceWorkspace
         this.prReviewAdapter = prReviewAdapter
         this.promptTemplates = promptTemplates
+        this.ckbService = ckbService
     }
 }
 
@@ -178,6 +209,7 @@ public func parseGitCodeReviewRuntimeConfig(root: JsonObject): GitCodeReviewConf
     let source = grObj(cfg, "sourceWorkspace")
     let adapter = grObj(cfg, "prReviewAdapter")
     let templates = grObj(cfg, "promptTemplates")
+    let ckb = grObj(cfg, "ckbService")
     let config = GitCodeReviewRuntimeConfig(
         sourceWorkspace: GitCodeSourceWorkspaceConfig(
             root: grStr(source, "root", "~/.metis/gitcode/repo-source-code"),
@@ -200,6 +232,15 @@ public func parseGitCodeReviewRuntimeConfig(root: JsonObject): GitCodeReviewConf
             reloadPolicy: grStr(templates, "reloadPolicy", "on_plugin_load"),
             maxTemplateBytes: grInt(templates, "maxTemplateBytes", 32768),
             strictValidation: grBool(templates, "strictValidation", true)
+        ),
+        ckbService: GitCodeCkbServiceConfig(
+            enabled: grBool(ckb, "enabled", false),
+            endpoint: grStr(ckb, "endpoint", ""),
+            timeoutMs: grInt(ckb, "timeoutMs", 5000),
+            defaultBudget: grInt(ckb, "defaultBudget", 5),
+            maxBudget: grInt(ckb, "maxBudget", 10),
+            includeCandidates: grBool(ckb, "includeCandidates", false),
+            sourceAnalysisEnabled: grBool(ckb, "sourceAnalysisEnabled", false)
         )
     )
     let validation = validateGitCodeReviewRuntimeConfig(config)
@@ -234,13 +275,25 @@ public func gitCodeReviewRedactSensitiveText(raw: String): String {
             case Some(idx) =>
                 let start = idx + auth.size
                 var end = start
-                while (end < out.size && out[end] != b' ' && out[end] != b'\n' && out[end] != b'\t') { end += 1 }
+                while (end < out.size && out[end] != b' ' && out[end] != b'\n' && out[end] != b'\t' && out[end] != b'"' && out[end] != b',' && out[end] != b')') { end += 1 }
                 out = out[..idx] + "Authorization: [redacted]" + out[end..]
             case None => authDone = true
         }
     }
     if (out.contains("Cookie=")) {
         out = out.replace("Cookie=", "Cookie=[redacted]")
+    }
+    let tokenMarker = "token="
+    var tokenDone = false
+    while (!tokenDone) {
+        match (out.toAsciiLower().indexOf(tokenMarker)) {
+            case Some(idx) =>
+                let start = idx + tokenMarker.size
+                var end = start
+                while (end < out.size && out[end] != b' ' && out[end] != b'\n' && out[end] != b'\t' && out[end] != b'"' && out[end] != b',' && out[end] != b'&' && out[end] != b')') { end += 1 }
+                out = out[..idx] + "[token-redacted]" + out[end..]
+            case None => tokenDone = true
+        }
     }
     let marker = "/Users/"
     var pathDone = false
@@ -278,6 +331,26 @@ private func addDiag(diags: ArrayList<String>, code: String): Unit {
 private func invalid(diags: ArrayList<String>): GitCodeReviewConfigValidationResult {
     let arr = diags.toArray()
     GitCodeReviewConfigValidationResult(false, status: "config_invalid", diagnostic: if (arr.size > 0) { arr[0] } else { "config_invalid" }, diagnostics: arr)
+}
+
+private func gitCodeCkbEndpointAllowed(endpoint: String): Bool {
+    let e = endpoint.trimAscii()
+    if (!e.startsWith("http://127.0.0.1:")) {
+        return false
+    }
+    let rest = e["http://127.0.0.1:".size..]
+    if (rest.isEmpty()) {
+        return false
+    }
+    for (b in rest.toArray()) {
+        if (b == b'/') {
+            return true
+        }
+        if (b < b'0' || b > b'9') {
+            return false
+        }
+    }
+    true
 }
 
 public func validateGitCodeReviewRuntimeConfig(config: GitCodeReviewRuntimeConfig): GitCodeReviewConfigValidationResult {
@@ -340,6 +413,24 @@ public func validateGitCodeReviewRuntimeConfig(config: GitCodeReviewRuntimeConfi
     }
     if (!config.promptTemplates.strictValidation) {
         addDiag(diags, "promptTemplates.strictValidation")
+    }
+
+    let ckb = config.ckbService
+    if (ckb.enabled) {
+        if (ckb.endpoint.isEmpty() || !gitCodeCkbEndpointAllowed(ckb.endpoint)) {
+            addDiag(diags, "ckbService.endpoint")
+        }
+    } else if (!ckb.endpoint.isEmpty() && !gitCodeCkbEndpointAllowed(ckb.endpoint)) {
+        addDiag(diags, "ckbService.endpoint")
+    }
+    if (ckb.timeoutMs < 1000 || ckb.timeoutMs > 30000) {
+        addDiag(diags, "ckbService.timeoutMs")
+    }
+    if (ckb.defaultBudget < 1 || ckb.defaultBudget > 20) {
+        addDiag(diags, "ckbService.defaultBudget")
+    }
+    if (ckb.maxBudget < 1 || ckb.maxBudget > 20 || ckb.defaultBudget > ckb.maxBudget) {
+        addDiag(diags, "ckbService.maxBudget")
     }
     if (diags.size > 0) {
         return invalid(diags)

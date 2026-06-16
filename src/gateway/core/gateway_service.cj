@@ -1071,7 +1071,7 @@ public class GatewayService {
         job: ServicePluginPendingJob,
         event: ServicePluginAcceptedGitCodeEvent
     ): ServicePluginGeneratedReplyResult {
-        let promptPlan = buildGitCodeReplyPromptForServicePluginEvent(event, this.gitCodePromptTemplates)
+        let promptPlan = buildGitCodeReplyPromptForServicePluginEvent(event, this.gitCodePromptTemplates, config: this.gitCodeReviewRuntimeConfig)
         let prompt = promptPlan.prompt
         let request = GatewaySessionRequest(
             GatewayIngressSource.Channel(job.deliveryTarget.channel),
@@ -1106,7 +1106,7 @@ public class GatewayService {
         event: ServicePluginAcceptedGitCodeEvent,
         target: ServicePluginDeliveryTarget
     ): ServicePluginGeneratedReplyResult {
-        let promptPlan = buildGitCodeReplyPromptForServicePluginEvent(event, this.gitCodePromptTemplates)
+        let promptPlan = buildGitCodeReplyPromptForServicePluginEvent(event, this.gitCodePromptTemplates, config: this.gitCodeReviewRuntimeConfig)
         let prompt = promptPlan.prompt
         let request = GatewaySessionRequest(
             GatewayIngressSource.Channel(target.channel),
@@ -1137,7 +1137,7 @@ public class GatewayService {
     }
 
     private func servicePluginBuildGitCodeReplyPrompt(event: ServicePluginAcceptedGitCodeEvent): String {
-        buildGitCodeReplyPromptForServicePluginEvent(event, this.gitCodePromptTemplates).prompt
+        buildGitCodeReplyPromptForServicePluginEvent(event, this.gitCodePromptTemplates, config: this.gitCodeReviewRuntimeConfig).prompt
     }
 
     private func servicePluginGeneratedReplyResultFromGitCodeAnswer(
@@ -1228,7 +1228,7 @@ public class GatewayService {
     }
 
     public func debugBuildGitCodePromptPlanForTest(event: ServicePluginAcceptedGitCodeEvent): GitCodeReviewPromptPlan {
-        buildGitCodeReplyPromptForServicePluginEvent(event, this.gitCodePromptTemplates)
+        buildGitCodeReplyPromptForServicePluginEvent(event, this.gitCodePromptTemplates, config: this.gitCodeReviewRuntimeConfig)
     }
 
     public func debugGitCodeGeneratedReplyResultForTest(rawAnswer: String, promptPlan: GitCodeReviewPromptPlan): ServicePluginGeneratedReplyResult {
@@ -1239,7 +1239,7 @@ public class GatewayService {
         event: ServicePluginAcceptedGitCodeEvent,
         rawAnswer: String
     ): ServicePluginGeneratedReplyResult {
-        let plan = buildGitCodeReplyPromptForServicePluginEvent(event, this.gitCodePromptTemplates)
+        let plan = buildGitCodeReplyPromptForServicePluginEvent(event, this.gitCodePromptTemplates, config: this.gitCodeReviewRuntimeConfig)
         this.servicePluginGeneratedReplyResultFromGitCodeAnswer(rawAnswer, plan)
     }
 
@@ -1247,7 +1247,7 @@ public class GatewayService {
         event: ServicePluginAcceptedGitCodeEvent,
         rawAnswer: String
     ): ServicePluginGeneratedReplyResult {
-        let plan = buildGitCodeReplyPromptForServicePluginEvent(event, this.gitCodePromptTemplates)
+        let plan = buildGitCodeReplyPromptForServicePluginEvent(event, this.gitCodePromptTemplates, config: this.gitCodeReviewRuntimeConfig)
         this.servicePluginGeneratedReplyResultFromGitCodeAnswer(rawAnswer, plan)
     }
 

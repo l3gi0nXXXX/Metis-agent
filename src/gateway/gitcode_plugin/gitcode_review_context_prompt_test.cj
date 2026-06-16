@@ -211,6 +211,8 @@ public class GitCodeReviewContextPromptTest {
         commentBody!: String = "",
         changedFiles!: Array<String> = [],
         reviewFindings!: Array<String> = [],
+        requiresCkb!: Bool = false,
+        requiresSourceWorkspace!: Bool = false,
         diagnostics!: Array<String> = []
     ): String {
         let request = JsonObject()
@@ -268,8 +270,8 @@ public class GitCodeReviewContextPromptTest {
         request.put("diagnostics", gitCodeReviewJsonArrayString(diagnostics))
 
         let policy = JsonObject()
-        policy.put("requiresCkb", JsonBool(false))
-        policy.put("requiresSourceWorkspace", JsonBool(false))
+        policy.put("requiresCkb", JsonBool(requiresCkb))
+        policy.put("requiresSourceWorkspace", JsonBool(requiresSourceWorkspace))
         policy.put("requiresCodeReview", JsonBool(eventType == "pr"))
         request.put("policy", policy)
         request.toJsonString()
@@ -282,6 +284,9 @@ public class GitCodeReviewContextPromptTest {
         content!: String = "复现步骤",
         commentBody!: String = "",
         reviewRequestRaw!: String = "",
+        requiresCkb!: Bool = false,
+        requiresSourceWorkspace!: Bool = false,
+        changedFiles!: Array<String> = [],
         diagnostics!: Array<String> = []
     ): ServicePluginAcceptedGitCodeEvent {
         let kind = if (eventType == "pr") { "pr" } else { eventType }
@@ -297,7 +302,7 @@ public class GitCodeReviewContextPromptTest {
             author: "alice",
             content: if (eventType == "comment") { commentBody } else { content },
             contractVersion: GITCODE_REVIEW_CONTRACT_VERSION,
-            reviewRequestRaw: if (reviewRequestRaw.isEmpty() && eventType != "legacy") { this.reviewRequestRaw(eventType, issueKind: issueKind, title: title, content: content, commentBody: commentBody, diagnostics: diagnostics) } else { reviewRequestRaw }
+            reviewRequestRaw: if (reviewRequestRaw.isEmpty() && eventType != "legacy") { this.reviewRequestRaw(eventType, issueKind: issueKind, title: title, content: content, commentBody: commentBody, changedFiles: changedFiles, requiresCkb: requiresCkb, requiresSourceWorkspace: requiresSourceWorkspace, diagnostics: diagnostics) } else { reviewRequestRaw }
         )
     }
 
@@ -496,6 +501,205 @@ public class GitCodeReviewContextPromptTest {
             @Expect(diag.contains("Bearer secret"), false)
         } finally {
             setGitCodeCkbClientRunnerForTest(None<(String, JsonObject) -> GitCodeCkbClientResult>)
+        }
+    }
+
+    @TestCase
+    public func metis1CkbServiceConfigParsesAndValidates(): Unit {
+        // METIS1-UT-001, METIS1-UT-002, METIS1-UT-003
+        let defaults = parseGitCodeReviewRuntimeConfig(JsonObject())
+        @Expect(defaults.ok, true)
+        @Expect(defaults.config.ckbService.enabled, false)
+        @Expect(defaults.config.ckbService.endpoint, "")
+        @Expect(defaults.config.sourceWorkspace.root, "~/.metis/gitcode/repo-source-code")
+        @Expect(defaults.config.prReviewAdapter.mode, "disabled")
+
+        let root = JsonObject()
+        let gateway = JsonObject()
+        let review = JsonObject()
+        let ckb = JsonObject()
+        ckb.put("enabled", JsonBool(true))
+        ckb.put("endpoint", JsonString("http://127.0.0.1:18080"))
+        ckb.put("timeoutMs", JsonInt(7000))
+        ckb.put("defaultBudget", JsonInt(6))
+        ckb.put("maxBudget", JsonInt(12))
+        ckb.put("includeCandidates", JsonBool(true))
+        ckb.put("sourceAnalysisEnabled", JsonBool(true))
+        review.put("ckbService", ckb)
+        gateway.put("gitcodeReview", review)
+        root.put("gateway", gateway)
+        let parsed = parseGitCodeReviewRuntimeConfig(root)
+        @Expect(parsed.ok, true)
+        @Expect(parsed.config.ckbService.enabled, true)
+        @Expect(parsed.config.ckbService.endpoint, "http://127.0.0.1:18080")
+        @Expect(parsed.config.ckbService.timeoutMs, 7000)
+        @Expect(parsed.config.ckbService.defaultBudget, 6)
+        @Expect(parsed.config.ckbService.maxBudget, 12)
+        @Expect(parsed.config.ckbService.includeCandidates, true)
+        @Expect(parsed.config.ckbService.sourceAnalysisEnabled, true)
+
+        let badExternal = validateGitCodeReviewRuntimeConfig(GitCodeReviewRuntimeConfig(
+            ckbService: GitCodeCkbServiceConfig(enabled: true, endpoint: "https://ckb.example.com", timeoutMs: 7000, defaultBudget: 6, maxBudget: 12)
+        ))
+        @Expect(badExternal.ok, false)
+        @Expect(badExternal.diagnostic.contains("ckbService.endpoint"), true)
+        @Expect(badExternal.diagnostic.contains("ckb.example.com"), false)
+
+        let badRange = validateGitCodeReviewRuntimeConfig(GitCodeReviewRuntimeConfig(
+            ckbService: GitCodeCkbServiceConfig(enabled: true, endpoint: "http://127.0.0.1:18080", timeoutMs: 999, defaultBudget: 0, maxBudget: 21)
+        ))
+        @Expect(badRange.ok, false)
+        @Expect(badRange.diagnostics.contains("ckbService.timeoutMs"), true)
+        @Expect(badRange.diagnostics.contains("ckbService.defaultBudget"), true)
+        @Expect(badRange.diagnostics.contains("ckbService.maxBudget"), true)
+    }
+
+    @TestCase
+    public func metis1CkbHttpClientAllowsOnlyReadQueryPaths(): Unit {
+        // METIS1-UT-004, METIS1-POS-002, METIS1-POS-003, METIS1-NEG-001, METIS1-NEG-002
+        let counter = GitCodeReviewTestCounter()
+        setGitCodeCkbHttpRunnerForTest(Some({ request: GitCodeCkbHttpRequest =>
+            counter.httpCalls += 1
+            counter.captured.put("path${counter.httpCalls}", JsonString(request.path))
+            counter.captured.put("body${counter.httpCalls}", JsonString(request.body))
+            let payload = JsonObject()
+            payload.put("ok", JsonBool(true))
+            payload.put("result", JsonObject())
+            GitCodeCkbHttpResponse(200, body: payload.toJsonString())
+        }))
+        try {
+            let disabled = queryEvidencePack(GitCodeCkbServiceConfig(enabled: false), "参数解析")
+            @Expect(disabled.status, "ckb_disabled")
+            @Expect(counter.httpCalls, 0)
+
+            let cfg = GitCodeCkbServiceConfig(enabled: true, endpoint: "http://127.0.0.1:18080", defaultBudget: 5, maxBudget: 10)
+            let ev = queryEvidencePack(cfg, "参数解析", budget: 8, includeCandidates: false)
+            @Expect(ev.status, "resolved")
+            @Expect(this.str(counter.captured, "path1"), "/v1/evidence-pack")
+            @Expect(this.str(counter.captured, "body1").contains("\"q\""), true)
+            @Expect(this.str(counter.captured, "body1").contains("\"budget\""), true)
+            @Expect(this.str(counter.captured, "body1").contains("\"includeCandidates\""), true)
+
+            let src = querySourceAnalysis(cfg, "Cangjie/cangjie_tools", "main", ["src/example.cj"])
+            @Expect(src.status, "resolved")
+            @Expect(this.str(counter.captured, "path2"), "/v1/source-analysis")
+            @Expect(this.str(counter.captured, "body2").contains("\"repo\""), true)
+            @Expect(this.str(counter.captured, "body2").contains("\"ref\""), true)
+            @Expect(this.str(counter.captured, "body2").contains("\"changedFiles\""), true)
+            @Expect(counter.httpCalls, 2)
+        } finally {
+            setGitCodeCkbHttpRunnerForTest(None<(GitCodeCkbHttpRequest) -> GitCodeCkbHttpResponse>)
+        }
+    }
+
+    @TestCase
+    public func metis1CkbContextDegradesAndSanitizesPromptEvidence(): Unit {
+        // METIS1-BND-001, METIS1-BND-002, METIS1-BND-003, METIS1-POS-001, METIS1-POS-004, METIS1-NEG-003
+        let cfg = GitCodeReviewRuntimeConfig(
+            ckbService: GitCodeCkbServiceConfig(enabled: true, endpoint: "http://127.0.0.1:18080", defaultBudget: 5, maxBudget: 10, includeCandidates: false, sourceAnalysisEnabled: true)
+        )
+        setGitCodeCkbHttpRunnerForTest(Some({ request: GitCodeCkbHttpRequest =>
+            if (request.path == "/v1/evidence-pack") {
+                let result = JsonObject()
+                result.put("knowledgeVersion", JsonString("ckb-v1"))
+                let citation = JsonObject()
+                citation.put("ref", JsonString("ckb://entry/argument-parser"))
+                result.put("citations", JsonArray([citation]))
+                let item = JsonObject()
+                item.put("title", JsonString("参数解析规范"))
+                item.put("summary", JsonString("默认值需要显式处理 /Users/alice/private Authorization: Bearer secret token=abc"))
+                item.put("visibility", JsonString("public"))
+                result.put("items", JsonArray([item]))
+                let candidate = JsonObject()
+                candidate.put("title", JsonString("候选条目"))
+                candidate.put("requiresReview", JsonBool(true))
+                candidate.put("visibility", JsonString("public"))
+                result.put("candidates", JsonArray([candidate]))
+                let envelope = JsonObject()
+                envelope.put("ok", JsonBool(true))
+                envelope.put("result", result)
+                return GitCodeCkbHttpResponse(200, body: envelope.toJsonString())
+            }
+            let privateResult = JsonObject()
+            privateResult.put("visibility", JsonString("internal"))
+            privateResult.put("summary", JsonString("internal source"))
+            let envelope = JsonObject()
+            envelope.put("ok", JsonBool(true))
+            envelope.put("result", privateResult)
+            GitCodeCkbHttpResponse(200, body: envelope.toJsonString())
+        }))
+        try {
+            let request = GitCodeReviewRequest(eventType: "issue", issueKind: "question", repoFullName: "Cangjie/cangjie_tools", number: "3", title: "question", url: "https://gitcode.com/Cangjie/cangjie_tools/issues/3", content: "问题", requiresCkb: true, requiresSourceWorkspace: true, changedFiles: ["src/example.cj"])
+            let context = resolveGitCodeCkbContextForRequest(request, cfg)
+            let ckbJson = context.ckbEvidence.toJsonString()
+            @Expect(ckbJson.contains("ckb-v1"), true)
+            @Expect(ckbJson.contains("ckb://entry/argument-parser"), true)
+            @Expect(ckbJson.contains("参数解析规范"), true)
+            @Expect(ckbJson.contains("/Users/alice"), false)
+            @Expect(ckbJson.contains("Bearer secret"), false)
+            @Expect(ckbJson.contains("token=abc"), false)
+            @Expect(ckbJson.contains("候选条目"), true)
+            @Expect(ckbJson.contains("requiresReview"), true)
+            @Expect(context.sourceContext.toJsonString().contains("internal source"), false)
+            @Expect(context.sourceContext.toJsonString().contains("private_or_internal_visibility"), true)
+
+            let plan = buildGitCodeReviewPromptForRequestWithRuntimeConfig(request, defaultGitCodePromptTemplateSet(), cfg)
+            @Expect(plan.prompt.contains("ckb-v1"), true)
+            @Expect(plan.prompt.contains("ckb://entry/argument-parser"), true)
+            @Expect(plan.prompt.contains("/Users/alice"), false)
+            @Expect(plan.prompt.contains("Bearer secret"), false)
+            @Expect(plan.prompt.contains("token=abc"), false)
+            @Expect(plan.prompt.contains("requiresReview"), true)
+        } finally {
+            setGitCodeCkbHttpRunnerForTest(None<(GitCodeCkbHttpRequest) -> GitCodeCkbHttpResponse>)
+        }
+
+        setGitCodeCkbHttpRunnerForTest(Some({ _request: GitCodeCkbHttpRequest =>
+            GitCodeCkbHttpResponse(200, body: "{\"ok\":false,\"error\":{\"message\":\"timeout Authorization: Bearer x\"}}")
+        }))
+        try {
+            let request = GitCodeReviewRequest(eventType: "issue", issueKind: "question", repoFullName: "Cangjie/cangjie_tools", number: "3", title: "question", url: "https://gitcode.com/Cangjie/cangjie_tools/issues/3", content: "问题", requiresCkb: true)
+            let plan = buildGitCodeReviewPromptForRequestWithRuntimeConfig(request, defaultGitCodePromptTemplateSet(), cfg)
+            @Expect(plan.ok, true)
+            @Expect(plan.needsHumanReview, true)
+            @Expect(plan.prompt.contains("degraded"), true)
+            @Expect(plan.prompt.contains("Bearer x"), false)
+        } finally {
+            setGitCodeCkbHttpRunnerForTest(None<(GitCodeCkbHttpRequest) -> GitCodeCkbHttpResponse>)
+        }
+    }
+
+    @TestCase
+    public func metis1ServicePluginAcceptedEventOnlyQueriesReadCkbApis(): Unit {
+        // METIS1-POS-004, METIS1-NEG-002
+        let counter = GitCodeReviewTestCounter()
+        setGitCodeCkbHttpRunnerForTest(Some({ request: GitCodeCkbHttpRequest =>
+            counter.httpCalls += 1
+            @Expect(request.path == "/v1/evidence-pack" || request.path == "/v1/source-analysis", true)
+            @Expect(request.path.contains("/admin/"), false)
+            @Expect(request.path.contains("/events/gitcode/repository-changed"), false)
+            let result = JsonObject()
+            result.put("knowledgeVersion", JsonString("ckb-v2"))
+            result.put("items", JsonArray([]))
+            let envelope = JsonObject()
+            envelope.put("ok", JsonBool(true))
+            envelope.put("result", result)
+            GitCodeCkbHttpResponse(200, body: envelope.toJsonString())
+        }))
+        try {
+            let cfg = GitCodeReviewRuntimeConfig(
+                ckbService: GitCodeCkbServiceConfig(enabled: true, endpoint: "http://127.0.0.1:18080", sourceAnalysisEnabled: true)
+            )
+            let plan = buildGitCodeReplyPromptForServicePluginEvent(
+                this.acceptedEvent("issue", issueKind: "question", title: "question", content: "问题", requiresCkb: true),
+                defaultGitCodePromptTemplateSet(),
+                config: cfg
+            )
+            @Expect(plan.ok, true)
+            @Expect(plan.prompt.contains("ckb-v2"), true)
+            @Expect(counter.httpCalls, 2)
+        } finally {
+            setGitCodeCkbHttpRunnerForTest(None<(GitCodeCkbHttpRequest) -> GitCodeCkbHttpResponse>)
         }
     }
 
