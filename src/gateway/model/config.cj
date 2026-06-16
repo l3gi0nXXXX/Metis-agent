@@ -513,6 +513,49 @@ public class GatewayWebchatConfig {
     }
 }
 
+public func gatewayCkbAdminDefaultAllowedTasks(): Array<String> {
+    [
+        "community_repo_discovery_30d",
+        "docs_probe_30d",
+        "website_probe_weekly",
+        "website_full_weekly",
+        "web_candidate_weekly",
+        "web_candidate_recrawl_30d",
+        "weekly_full_rebuild"
+    ]
+}
+
+public class GatewayCkbAdminConfig {
+    public let enabled: Bool
+    public let endpoint: String
+    public let adminToken: String
+    public let adminTokenFile: String
+    public let timeoutMs: Int64
+    public let telegramEnabled: Bool
+    public let feishuEnabled: Bool
+    public let allowedTasks: Array<String>
+
+    public init(
+        enabled!: Bool = false,
+        endpoint!: String = "",
+        adminToken!: String = "",
+        adminTokenFile!: String = "",
+        timeoutMs!: Int64 = 5000,
+        telegramEnabled!: Bool = true,
+        feishuEnabled!: Bool = true,
+        allowedTasks!: Array<String> = gatewayCkbAdminDefaultAllowedTasks()
+    ) {
+        this.enabled = enabled
+        this.endpoint = endpoint.trimAscii()
+        this.adminToken = adminToken.trimAscii()
+        this.adminTokenFile = adminTokenFile.trimAscii()
+        this.timeoutMs = if (timeoutMs > 0) { timeoutMs } else { 5000 }
+        this.telegramEnabled = telegramEnabled
+        this.feishuEnabled = feishuEnabled
+        this.allowedTasks = if (allowedTasks.size == 0) { gatewayCkbAdminDefaultAllowedTasks() } else { allowedTasks }
+    }
+}
+
 public class TelegramActionConfig {
     public let reactions: Bool
     public let sendMessage: Bool
@@ -1193,6 +1236,7 @@ public class GatewayConfig {
     public let qq: QQConfig
     public let telegram: TelegramConfig
     public let webchat: GatewayWebchatConfig
+    public let ckbAdmin: GatewayCkbAdminConfig
     public let channelHealthCheckMinutes: Int64
     public let channelStaleEventThresholdMinutes: Int64
     public let channelMaxRestartsPerHour: Int64
@@ -1222,6 +1266,7 @@ public class GatewayConfig {
         qq!: QQConfig = QQConfig(),
         telegram!: TelegramConfig = TelegramConfig(),
         webchat!: GatewayWebchatConfig = GatewayWebchatConfig(),
+        ckbAdmin!: GatewayCkbAdminConfig = GatewayCkbAdminConfig(),
         channelHealthCheckMinutes!: Int64 = 5,
         channelStaleEventThresholdMinutes!: Int64 = 30,
         channelMaxRestartsPerHour!: Int64 = 10
@@ -1250,6 +1295,7 @@ public class GatewayConfig {
         this.qq = qq
         this.telegram = telegram
         this.webchat = webchat
+        this.ckbAdmin = ckbAdmin
         this.channelHealthCheckMinutes = channelHealthCheckMinutes
         this.channelStaleEventThresholdMinutes = channelStaleEventThresholdMinutes
         this.channelMaxRestartsPerHour = channelMaxRestartsPerHour

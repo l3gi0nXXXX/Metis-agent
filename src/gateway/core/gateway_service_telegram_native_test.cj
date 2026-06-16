@@ -2121,6 +2121,7 @@ public class GatewayServiceTelegramNativeTest {
             case "mcp" => "/mcp show"
             case "plugins" => "/plugins list"
             case "debug" => "/debug show"
+            case "ckb-refresh" => "/ckb-refresh status"
             case "usage" => "/usage status"
             case "restart" => "/restart"
             case "send" => "/send status"
@@ -2212,7 +2213,7 @@ public class GatewayServiceTelegramNativeTest {
             "acp", "focus", "unfocus", "agents", "kill", "steer", "config", "mcp",
             "plugins", "debug", "usage", "stop", "restart", "activation", "send", "reset",
             "new", "compact", "think", "verbose", "fast", "reasoning", "elevated", "exec",
-            "model", "models", "queue", "bash"
+            "model", "models", "queue", "bash", "ckb-refresh"
         ]
         for (command in expected) {
             @Expect(gatewayFindTelegramNativeCommandSpec(command).isSome(), true)

@@ -8,7 +8,7 @@ import metis.gateway.model.*
 import metis.gateway.security.gatewayPairingAccountStore
 import metis.gateway.service_plugin.{CapabilityCaller, CapabilityInvokeRequest, CapabilityInvokeResult, ServicePluginAcceptedGitCodeEvent, ServicePluginDeliveryTarget, ServicePluginEventDeliveryResult, ServicePluginGeneratedReplyResult, ServicePluginPendingJob, buildServicePluginImBindingRules, invokeRegisteredCapability, matchServicePluginImBinding, parseServicePluginJobAcceptedPayload, redactServicePayload, renderServicePluginJobSnapshotMessage, servicePluginGeneratedReplyResultFromAgentAnswer, servicePluginPendingJobStore, registerConfiguredServicePlugins, servicePluginConfiguredStatusForUser, servicePluginWebhookDispatchStatsJson, setServicePluginEventDelivery, setServicePluginGeneratedReplyHandler, setServicePluginWebhookGeneratedReplyHandler, setServicePluginWebhookSubscribersProvider, shutdownServicePluginHost, validateServicePluginGeneratedDraft}
 import metis.gateway.session.{GatewayIngressSource, GatewaySessionContext, GatewaySessionRequest, gatewayResolveSessionContext, gatewaySessionRequestFromInbound}
-import metis.gateway.tools.{gatewayHandleNativeCommandLine, gatewayHandleSubagentsCommandLine}
+import metis.gateway.tools.{gatewayCkbAdminCommand, gatewayHandleNativeCommandLine, gatewayHandleSubagentsCommandLine, gatewayRenderCkbAdminCommandResult}
 import metis.gateway.gitcode_plugin.{GatewayCommandContext, GitCodePromptTemplate, GitCodePromptTemplateSet, GitCodeReviewPromptPlan, GitCodeReviewRuntimeConfig, buildGitCodeAsyncScanPayload, buildGitCodeDeadLetterInspectPayload, buildGitCodeDeadLetterListPayload, buildGitCodeEventReconcilePayload, buildGitCodeHookReconcilePayload, buildGitCodeReplyPromptForServicePluginEvent, buildGitCodeSubscriptionTarget, buildGitCodeWebhookCancelPayload, buildGitCodeWebhookReplayPayload, buildGitCodeWebhookStatusPayload, defaultGitCodePromptTemplateSet, defaultGitCodeReviewRuntimeConfig, formatGitCodeSubscribeResult, gitCodeSubscriptionStatusJson, gitCodeSubscriptionStoreSnapshotForDispatcher, handleGitCodeKnowledgeQueryCommand, loadGitCodePromptTemplates, loadGitCodeSubscriptionStore, parseGeneratedReplyModelOutput, parseGitCodeCommand, parseGitCodeDeliveryArgs, parseGitCodeHookReconcileArgs, parseGitCodeReconcileOnceArgs, parseGitCodeReviewRuntimeConfig, parseGitCodeScanOnceArgs, removeGitCodeSubscription, renderGeneratedReplyDraft, renderGitCodeDeadLetterInspectResult, renderGitCodeDeadLetterListResult, renderGitCodeEventReconcileResult, renderGitCodeHookReconcileResult, renderGitCodeWebhookCancelResult, renderGitCodeWebhookReplayResult, renderGitCodeWebhookStatusResult, saveGitCodeSubscription, setGitCodeSubscriptionStore}
 import magic.jsonable.*
 import std.collection.{ArrayList, HashSet}
@@ -1487,6 +1487,13 @@ public class GatewayService {
             case "doctor" => this.renderFeishuDoctorCommand(message, accountId, user)
             case "auth" => this.renderFeishuAuthCommand(message, accountId, user)
             case "info" => this.renderFeishuInfoCommand(accountId, user)
+            case "ckb-refresh" => this.renderGatewayCkbRefreshCommand(
+                this.feishuNativeCkbRefreshCommandText(message.text),
+                user,
+                "feishu_native_command",
+                "feishu:${accountId}:${message.senderId}",
+                "feishu"
+            )
             case _ => this.renderFeishuHelpCommand()
         }
         this.sendTextToPeerDetailed(
@@ -1534,7 +1541,25 @@ public class GatewayService {
             normalized == "info --all") {
             return "info"
         }
+        if (normalized == "/feishu ckb-refresh" || normalized.startsWith("/feishu ckb-refresh ") ||
+            normalized == "/feishu_ckb_refresh" || normalized.startsWith("/feishu_ckb_refresh ")) {
+            return "ckb-refresh"
+        }
         ""
+    }
+
+    private func feishuNativeCkbRefreshCommandText(text: String): String {
+        let raw = text.trimAscii()
+        let lower = raw.toAsciiLower()
+        if (lower.startsWith("/feishu_ckb_refresh")) {
+            let rest = raw["/feishu_ckb_refresh".size..].trimAscii()
+            return if (rest.isEmpty()) { "/ckb-refresh" } else { "/ckb-refresh ${rest}" }
+        }
+        if (lower.startsWith("/feishu ckb-refresh")) {
+            let rest = raw["/feishu ckb-refresh".size..].trimAscii()
+            return if (rest.isEmpty()) { "/ckb-refresh" } else { "/ckb-refresh ${rest}" }
+        }
+        "/ckb-refresh"
     }
 
     private func renderFeishuHelpCommand(): String {
@@ -1543,7 +1568,8 @@ public class GatewayService {
             "- /feishu doctor: run read-only diagnostics\n" +
             "- /feishu_diagnose: alias of /feishu doctor\n" +
             "- /feishu auth: show authorization status and next steps\n" +
-            "- /feishu info --all: show redacted runtime information"
+            "- /feishu info --all: show redacted runtime information\n" +
+            "- /feishu ckb-refresh <target>: trigger allowed CKB refresh targets"
     }
 
     private func renderFeishuStartCommand(message: InboundMessage, accountId: String, user: GatewayUserSettings): String {
@@ -2562,6 +2588,32 @@ public class GatewayService {
         this.renderTelegramNativeHumanReply(raw)
     }
 
+    private func renderGatewayCkbRefreshCommand(
+        commandText: String,
+        user: GatewayUserSettings,
+        source: String,
+        requestedBy: String,
+        channel: String
+    ): String {
+        let ckbAdmin = GatewayCkbAdminConfig(
+            enabled: user.ckbAdmin.enabled,
+            endpoint: user.ckbAdmin.endpoint,
+            adminToken: user.ckbAdmin.adminToken,
+            adminTokenFile: user.ckbAdmin.adminTokenFile,
+            timeoutMs: user.ckbAdmin.timeoutMs,
+            telegramEnabled: user.ckbAdmin.telegramEnabled,
+            feishuEnabled: user.ckbAdmin.feishuEnabled,
+            allowedTasks: user.ckbAdmin.allowedTasks
+        )
+        if (channel == "telegram" && !ckbAdmin.telegramEnabled) {
+            return "CKB refresh failed: disabled\nCKB admin Telegram command is disabled."
+        }
+        if (channel == "feishu" && !ckbAdmin.feishuEnabled) {
+            return "CKB refresh failed: disabled\nCKB admin Feishu command is disabled."
+        }
+        gatewayRenderCkbAdminCommandResult(gatewayCkbAdminCommand(ckbAdmin, commandText, source, requestedBy))
+    }
+
     private func rememberTelegramNativeCommandBinding(
         message: InboundMessage,
         accountId: String,
@@ -3134,6 +3186,7 @@ public class GatewayService {
             case "compact" => this.renderTelegramCompactCommand(text, user, sessionKey)
             case "think" | "reasoning" | "fast" | "verbose" | "send" | "usage" | "queue" | "elevated" | "exec" => this.renderTelegramSessionOptionCommand(spec.command, text, user, sessionKey)
             case "codex-runtime" => this.renderTelegramGatewaySlashCommand(text, message, accountId, user, sessionKey)
+            case "ckb-refresh" => this.renderGatewayCkbRefreshCommand(text, user, "telegram_native_command", "telegram:${accountId}:${message.senderId}", "telegram")
             case "tasks" => this.renderTelegramTasksCommand(user, sessionKey)
             case "context" => this.renderTelegramContextCommand(message, accountId, sessionKey)
             case "plugins" => this.renderTelegramPluginsCommand(text, user, message.senderId)

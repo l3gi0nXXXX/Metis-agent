@@ -289,6 +289,26 @@ public struct GatewayWebchatUserSettings {
 }
 
 @jsonable
+public struct GatewayCkbAdminUserSettings {
+    public var enabled: Bool = false
+    public var endpoint: String = ""
+    public var adminToken: String = ""
+    public var adminTokenFile: String = ""
+    public var timeoutMs: Int64 = 5000
+    public var telegramEnabled: Bool = true
+    public var feishuEnabled: Bool = true
+    public var allowedTasks: Array<String> = [
+        "community_repo_discovery_30d",
+        "docs_probe_30d",
+        "website_probe_weekly",
+        "website_full_weekly",
+        "web_candidate_weekly",
+        "web_candidate_recrawl_30d",
+        "weekly_full_rebuild"
+    ]
+}
+
+@jsonable
 public struct TelegramActionUserSettings {
     public var reactions: Bool = true
     public var sendMessage: Bool = true
@@ -659,6 +679,7 @@ public struct GatewayUserSettings {
     /** Subagent 启动策略与资源上限。 */
     public var subagents: GatewaySubagentPolicyUserSettings = GatewaySubagentPolicyUserSettings()
     public var webchat: GatewayWebchatUserSettings = GatewayWebchatUserSettings()
+    public var ckbAdmin: GatewayCkbAdminUserSettings = GatewayCkbAdminUserSettings()
     public var channelHealthCheckMinutes: Int64 = 5
     public var channelStaleEventThresholdMinutes: Int64 = 30
     public var channelMaxRestartsPerHour: Int64 = 10

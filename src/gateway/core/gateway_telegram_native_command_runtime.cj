@@ -89,7 +89,7 @@ public func gatewayTelegramNativeCommandHandlerStatus(command: String): String {
             "kill" | "steer" | "config" | "mcp" | "plugins" | "debug" | "usage" |
             "stop" | "restart" | "activation" | "pair" | "send" | "reset" | "new" |
             "compact" | "think" | "verbose" | "fast" | "codex-runtime" |
-            "reasoning" | "elevated" | "exec" | "model" | "models" | "queue" |
+            "ckb-refresh" | "reasoning" | "elevated" | "exec" | "model" | "models" | "queue" |
             "bash" | "allowlist" => "implemented"
         case "acp" => "not_applicable"
         case _ => "missing"

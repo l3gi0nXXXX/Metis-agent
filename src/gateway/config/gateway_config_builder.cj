@@ -17,7 +17,8 @@ import metis.core.config.{
     GatewayNodesUserSettings,
     GatewayCanvasHostUserSettings,
     GatewayTalkUserSettings,
-    GatewayWebchatUserSettings
+    GatewayWebchatUserSettings,
+    GatewayCkbAdminUserSettings
 }
 import metis.gateway.{gatewayRuntimeEffectiveAuthPasswordString, gatewayRuntimeEffectiveAuthTokenString}
 import metis.gateway.model.*
@@ -254,6 +255,19 @@ private func buildGatewayTalkConfig(user: GatewayTalkUserSettings): GatewayTalkC
 
 private func buildGatewayWebchatConfig(user: GatewayWebchatUserSettings): GatewayWebchatConfig {
     GatewayWebchatConfig(chatHistoryMaxChars: user.chatHistoryMaxChars)
+}
+
+private func buildGatewayCkbAdminConfig(user: GatewayCkbAdminUserSettings): GatewayCkbAdminConfig {
+    GatewayCkbAdminConfig(
+        enabled: user.enabled,
+        endpoint: user.endpoint,
+        adminToken: user.adminToken,
+        adminTokenFile: user.adminTokenFile,
+        timeoutMs: user.timeoutMs,
+        telegramEnabled: user.telegramEnabled,
+        feishuEnabled: user.feishuEnabled,
+        allowedTasks: user.allowedTasks
+    )
 }
 
 private func mergeFeishu(fs: FeishuUserSettings): FeishuConfig {
@@ -583,6 +597,7 @@ public func buildGatewayConfigFromUserSettings(user: GatewayUserSettings): Gatew
         qq: qqCfg,
         telegram: telegramCfg,
         webchat: buildGatewayWebchatConfig(user.webchat),
+        ckbAdmin: buildGatewayCkbAdminConfig(user.ckbAdmin),
         channelHealthCheckMinutes: user.channelHealthCheckMinutes,
         channelStaleEventThresholdMinutes: user.channelStaleEventThresholdMinutes,
         channelMaxRestartsPerHour: user.channelMaxRestartsPerHour

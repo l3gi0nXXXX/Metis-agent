@@ -45,6 +45,20 @@ public class GatewayConfigBuilderTest {
     }
 
     @TestCase
+    public func metis3CkbAdminDefaultsRemainDisabled(): Unit {
+        // METIS3-UT-001
+        let cfg = buildGatewayConfigFromUserSettings(GatewayUserSettings())
+        @Expect(cfg.ckbAdmin.enabled, false)
+        @Expect(cfg.ckbAdmin.endpoint, "")
+        @Expect(cfg.ckbAdmin.adminTokenFile, "")
+        @Expect(cfg.ckbAdmin.timeoutMs, 5000)
+        @Expect(cfg.ckbAdmin.telegramEnabled, true)
+        @Expect(cfg.ckbAdmin.feishuEnabled, true)
+        @Expect(cfg.ckbAdmin.allowedTasks.contains("community_repo_discovery_30d"), true)
+        @Expect(cfg.ckbAdmin.allowedTasks.contains("active_repo_fetch_on_merge"), false)
+    }
+
+    @TestCase
     public func telegramTypedParityConfigMapsIntoRuntimeConfig(): Unit {
         var user = GatewayUserSettings()
         user.telegram.enabled = true

@@ -78,6 +78,27 @@ public class GatewayTelegramNativeCommandRuntimeTest {
     }
 
     @TestCase
+    public func metis3CkbRefreshCatalogIsOperatorOnlyAndAllowlistMenuOnly(): Unit {
+        let spec = gatewayFindTelegramNativeCommandSpec("ckb_refresh").getOrThrow()
+        @Expect(spec.command, "ckb-refresh")
+        @Expect(spec.auth, "operator")
+        @Expect(spec.aliases.contains("ckb_refresh"), true)
+        @Expect(spec.args, ["target"])
+        @Expect(spec.argsMenuChoices.contains("repo-catalog"), true)
+        @Expect(spec.argsMenuChoices.contains("docs"), true)
+        @Expect(spec.argsMenuChoices.contains("website-probe"), true)
+        @Expect(spec.argsMenuChoices.contains("website-full"), true)
+        @Expect(spec.argsMenuChoices.contains("web-candidates"), true)
+        @Expect(spec.argsMenuChoices.contains("web-candidates-recrawl"), true)
+        @Expect(spec.argsMenuChoices.contains("rebuild"), true)
+        @Expect(spec.argsMenuChoices.contains("both"), true)
+        @Expect(spec.argsMenuChoices.contains("status"), true)
+        @Expect(spec.argsMenuChoices.contains("active-item"), false)
+        @Expect(spec.argsMenuChoices.contains("active-repo"), false)
+        @Expect(spec.argsMenuChoices.contains("repo-list"), false)
+    }
+
+    @TestCase
     public func codexRuntimeUnderscoreMenuCommandRoutesToGatewaySlashText(): Unit {
         let runtime = GatewayTelegramNativeCommandRuntime()
         let decision = runtime.resolveText(
