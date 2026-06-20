@@ -307,6 +307,15 @@ public class CodexResponsesAdapterTest {
     }
 
     @TestCase
+    public func r1B002ProviderIncompleteKeepsOrdinaryContent(): Unit {
+        let response = m2ResponseFromOutputText("普通未完成响应片段")
+        response.put("status", JsonString("incomplete"))
+        let normalized = codexNormalizeResponses(response)
+        @Expect(normalized.finishReason, "incomplete")
+        @Expect(normalized.content, "普通未完成响应片段")
+    }
+
+    @TestCase
     public func m2U3U5U6HistoryProviderDataRoundTripAndSanitize(): Unit {
         let messages = JsonArray()
         let assistant = JsonObject()

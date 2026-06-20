@@ -144,7 +144,7 @@ public class CodexResponsesChatModel <: ChatModel {
         if (normalized.toolRequests.size > 0) {
             return false
         }
-        if (normalized.finishReason == "incomplete") {
+        if (normalized.finishReason == "incomplete" && normalized.content.trimAscii().isEmpty()) {
             return true
         }
         return codexContinuationNeeded(this.lastUserPrompt(originalRequest), normalized.content, normalized.toolRequests.size)
