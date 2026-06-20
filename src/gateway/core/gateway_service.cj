@@ -2,7 +2,7 @@ package metis.gateway.core
 
 import metis.core.{GatewayToolRuntimeContext, gatewaySpeechResolveDeliveryPrefs, gatewaySpeechResolveTtsConfig, gatewaySpeechTtsSynthesize, gatewayWithToolRuntimeContext, renderGatewayTopicEditText}
 import metis.core.config.{CliConfig, CliSettingManager, GatewayUserSettings, MetisConfigManager, MetisPaths, cliFindModelAuthChoicesForProvider, cliSetupVisibleModelProviders}
-import metis.core.model.{findModelCapabilityCatalogEntry, modelCapabilityCatalogEntriesForProvider}
+import metis.core.model.{CodexResponsesException, findModelCapabilityCatalogEntry, modelCapabilityCatalogEntriesForProvider}
 import metis.core.skills.SkillsPrompt
 import metis.gateway.model.*
 import metis.gateway.security.gatewayPairingAccountStore
@@ -1095,6 +1095,8 @@ public class GatewayService {
                 deliver: false,
                 timeoutSeconds: 90
             )
+        } catch (e: CodexResponsesException) {
+            return this.servicePluginGeneratedReplyResultFromCodexFailure(e)
         } catch (e: Exception) {
             return ServicePluginGeneratedReplyResult(false, status: "llm_degraded", diagnostic: "Agent Runtime failed: ${e.message}", needsHumanReview: true)
         }
@@ -1130,10 +1132,24 @@ public class GatewayService {
                 deliver: false,
                 timeoutSeconds: 90
             )
+        } catch (e: CodexResponsesException) {
+            return this.servicePluginGeneratedReplyResultFromCodexFailure(e)
         } catch (e: Exception) {
             return ServicePluginGeneratedReplyResult(false, status: "llm_degraded", diagnostic: "Agent Runtime failed: ${e.message}", needsHumanReview: true)
         }
         this.servicePluginGeneratedReplyResultFromGitCodeAnswer(turn.execution.answer, promptPlan)
+    }
+
+    private func servicePluginGeneratedReplyResultFromCodexFailure(e: CodexResponsesException): ServicePluginGeneratedReplyResult {
+        if (e.code == "tool_protocol_unfinalized") {
+            return ServicePluginGeneratedReplyResult(
+                false,
+                status: "tool_protocol_unfinalized",
+                diagnostic: "Agent Runtime failed: tool_protocol_unfinalized",
+                needsHumanReview: true
+            )
+        }
+        ServicePluginGeneratedReplyResult(false, status: "llm_degraded", diagnostic: "Agent Runtime failed: ${e.message}", needsHumanReview: true)
     }
 
     private func servicePluginBuildGitCodeReplyPrompt(event: ServicePluginAcceptedGitCodeEvent): String {
@@ -1249,6 +1265,14 @@ public class GatewayService {
     ): ServicePluginGeneratedReplyResult {
         let plan = buildGitCodeReplyPromptForServicePluginEvent(event, this.gitCodePromptTemplates, config: this.gitCodeReviewRuntimeConfig)
         this.servicePluginGeneratedReplyResultFromGitCodeAnswer(rawAnswer, plan)
+    }
+
+    public func debugGenerateGitCodeWebhookReplyDraftViaGatewayForTest(
+        user: GatewayUserSettings,
+        event: ServicePluginAcceptedGitCodeEvent,
+        target: ServicePluginDeliveryTarget
+    ): ServicePluginGeneratedReplyResult {
+        this.servicePluginGenerateGitCodeWebhookReplyDraft(user, event, target)
     }
 
     private func servicePluginRenderGitCodeScanResult(payload: String): String {

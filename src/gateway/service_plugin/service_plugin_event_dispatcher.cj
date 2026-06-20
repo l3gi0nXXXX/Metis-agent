@@ -1020,6 +1020,9 @@ private func servicePluginGeneratedReplyHumanReason(result: ServicePluginGenerat
     if (status == "draft_invalid_tool_json") {
         return "模型返回了工具调用 JSON，已拦截，需要人工确认"
     }
+    if (status == "tool_protocol_unfinalized") {
+        return "模型工具调用未收敛为最终文本，已转人工确认"
+    }
     if (status == "draft_raw_json") {
         return "模型返回了原始 JSON，已拦截，需要人工确认"
     }

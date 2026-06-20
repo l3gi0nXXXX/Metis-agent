@@ -1,9 +1,10 @@
 package metis.gateway.core
 
-import metis.core.config.{CliConfig, CliSettingManager, MetisConfigManager}
+import metis.core.config.{CliConfig, CliSettingManager, GatewayUserSettings, MetisConfigManager}
+import metis.core.model.CodexResponsesException
 import metis.gateway.gitcode_plugin.{GITCODE_REVIEW_CONTRACT_VERSION, GitCodeReviewPromptPlan, gitCodeReviewJsonArrayString}
 import metis.gateway.model.ChannelPolicyConfig
-import metis.gateway.service_plugin.ServicePluginAcceptedGitCodeEvent
+import metis.gateway.service_plugin.{ServicePluginAcceptedGitCodeEvent, ServicePluginDeliveryTarget}
 import std.collection.HashMap
 import std.env.{getVariable, setVariable}
 import std.fs.{Directory, File, Path, exists, remove}
@@ -386,6 +387,34 @@ public class GatewayServiceGitCodePromptTest {
             let fencedTool = service.debugGenerateGitCodeWebhookReplyDraftForTest(event, "```json\n{\"tool\":\"functions.answer\",\"reason\":\"x\"}\n```")
             @Expect(fencedTool.ok, false)
             @Expect(fencedTool.status, "draft_forbidden_marker")
+        })
+    }
+
+    @TestCase
+    public func r2U001WebhookDraftMapsUnfinalizedToolProtocolToHumanReview(): Unit {
+        gitCodePromptTestWithHome<Unit>("r2-tool-protocol-unfinalized", { _home: Path =>
+            let service = gitCodePromptTestService()
+            let event = gitCodePromptTestEvent("issue", issueKind: "bug", title: "bug", content: "复现")
+            let target = ServicePluginDeliveryTarget("telegram", "acct", "peer", replyToMessageId: "msg-1")
+            setGatewayAgentBridgeReplyRunnerForTest(Some({
+                _conversationKey: String,
+                _prompt: String,
+                _channelName: String,
+                _agentId: String,
+                _streamingEnabled: Bool,
+                _streamChunkHook: Option<(String) -> Unit> =>
+                    throw CodexResponsesException("tool_protocol_unfinalized", "assistant to=functions.search should not leak")
+            }))
+            try {
+                let result = service.debugGenerateGitCodeWebhookReplyDraftViaGatewayForTest(GatewayUserSettings(), event, target)
+                @Expect(result.ok, false)
+                @Expect(result.status, "tool_protocol_unfinalized")
+                @Expect(result.needsHumanReview, true)
+                @Expect(result.draft, "")
+                @Expect(result.diagnostic.contains("functions.search"), false)
+            } finally {
+                setGatewayAgentBridgeReplyRunnerForTest(None<(String, String, String, String, Bool, Option<(String) -> Unit>) -> String>)
+            }
         })
     }
 }

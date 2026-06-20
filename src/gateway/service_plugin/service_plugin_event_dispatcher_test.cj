@@ -1832,5 +1832,10 @@ public class ServicePluginEventDispatcherTest {
         let pr = renderServicePluginGeneratedReplyNotification(event, ServicePluginGeneratedReplyResult(false, status: "pr_review_timeout", diagnostic: "adapter timeout raw={\"ok\":false}", needsHumanReview: true))
         @Expect(pr.contains("PR review 阶段超时，已保守生成草稿，需要人工确认"), true)
         @Expect(pr.contains("\"ok\""), false)
+
+        let toolProtocol = renderServicePluginGeneratedReplyNotification(event, ServicePluginGeneratedReplyResult(false, status: "tool_protocol_unfinalized", diagnostic: "assistant to=functions.search {\"query\":\"secret\"}", needsHumanReview: true))
+        @Expect(toolProtocol.contains("模型工具调用未收敛为最终文本，已转人工确认"), true)
+        @Expect(toolProtocol.contains("functions.search"), false)
+        @Expect(toolProtocol.contains("\"query\""), false)
     }
 }
