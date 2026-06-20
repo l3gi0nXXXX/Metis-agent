@@ -5,6 +5,10 @@ import metis.gateway.model.{ChannelPolicyConfig, ChannelType, ChatType, InboundM
 import metis.gateway.security.gatewayPairingAccountStore
 import metis.gateway.service_plugin.{CapabilityInvokeResult, CapabilityInvokeRequest, ServicePluginRegistration, resetServicePluginPendingJobStoreForTest, setServicePluginCapabilityInvokerForTest}
 
+import magic.core.message.Message
+import magic.core.model.{AsyncChatResponse, ChatModel, ChatRequest, ChatResponse}
+import magic.model.ModelManager
+
 import std.collection.{ArrayList, HashMap}
 import std.env.{getVariable, setVariable}
 import std.fs.{Directory, File, Path, remove}
@@ -111,6 +115,40 @@ private class GatewayFeishuNativeTestAdapter <: ChannelAdapter {
 
     public func sentCount(): Int64 {
         this.sent.size
+    }
+}
+
+private class GatewayFeishuNativeFakeModel <: ChatModel {
+    private let answer: String
+    private var _maxTokens: Option<Int64> = None
+
+    public init(answer!: String = "feishu final answer") {
+        this.answer = answer
+    }
+
+    public prop provider: String {
+        get() { "fake" }
+    }
+
+    public prop name: String {
+        get() { "feishu-native" }
+    }
+
+    public prop contextLength: Int64 {
+        get() { 8192 }
+    }
+
+    public mut prop maxTokens: Option<Int64> {
+        get() { this._maxTokens }
+        set(v) { this._maxTokens = v }
+    }
+
+    public func create(_request: ChatRequest): ChatResponse {
+        ChatResponse(this.fullName, Message.assistant(this.answer))
+    }
+
+    public func asyncCreate(_request: ChatRequest): AsyncChatResponse {
+        throw Exception("async not used in feishu native tests")
     }
 }
 
@@ -1095,6 +1133,35 @@ public class GatewayServiceFeishuNativeTest {
                 @Expect(adapter.sentText(0).contains("Metis Feishu doctor"), true)
             } finally {
                 service.stop()
+            }
+        })
+    }
+
+    @TestCase
+    public func feishuAckLifecycleUsesGuardedFinalAnswerFromTerminalToolEnvelope(): Unit {
+        withGatewayFeishuNativeTestHome("ack-final-guard", gatewayFeishuNativeAckRoot(true), { =>
+            let modelName = "metis-test-feishu-final-guard-${DateTime.now().toUnixTimeStamp().toMilliseconds()}"
+            ModelManager.registerChatModel(modelName, { =>
+                GatewayFeishuNativeFakeModel(answer: "{\"tool\":\"final_answer\",\"answer\":\"guarded feishu answer\"}")
+            })
+            let oldModel = CliConfig.model
+            CliConfig.model = modelName
+            let adapter = GatewayFeishuNativeTestAdapter()
+            let service = gatewayFeishuNativeService(adapter)
+            service.start()
+            try {
+                adapter.queueDirect("hello")
+                service.processOnce()
+
+                @Expect(adapter.sentCount(), 3)
+                @Expect(adapter.sentText(0), "[reaction]\ntoken=Typing\nrender=Typing")
+                @Expect(adapter.sentText(1), "guarded feishu answer")
+                @Expect(adapter.sentText(1).contains("final_answer"), false)
+                @Expect(adapter.sentText(1).contains("\"tool\""), false)
+                @Expect(adapter.sentText(2), "[reaction]\nremove=true\ntoken=Typing\nrender=Typing")
+            } finally {
+                service.stop()
+                CliConfig.model = oldModel
             }
         })
     }
