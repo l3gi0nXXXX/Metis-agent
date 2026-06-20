@@ -16,6 +16,8 @@ import metis.core.skills.SkillsPrompt
 import metis.core.skills.tryHandleSkillsCommand
 import metis.cron.{executeGatewayCronCommand, parseSlashCronLine}
 import metis.gateway.{gatewayMcpGitCodeToolResultJson, gatewayMcpGitCodeToolResultJsonWithRuntime, gatewayMcpIsGitCodeTool}
+import metis.gateway.reply_guard.normalizeGatewayAssistantFinalReply
+import metis.gateway.reply_guard.safeFallbackTextForBlockedAssistantReply
 import metis.gateway.session.GatewayTurnContext
 import metis.gateway.tools.{GatewayCronToolset, GatewayFeishuMediaToolset, GatewayFeishuOapiToolset, GatewayFSToolset, GatewayGatewayToolset, GatewayImageGenerationToolset, GatewayManagedSessionsToolset, GatewayMemoryToolset, GatewayMessageToolset, GatewayPlanToolset, GatewaySessionTranscriptToolset, GatewayShellToolset, GatewayTelegramMediaToolset, GatewayTtsToolset, GatewayVideoGenerationToolset, GatewayWeatherToolset, gatewayHandleNativeCommandLine, gatewayHandleSubagentsCommandLine}
 import std.collection.{HashMap, ArrayList, enumerate}
@@ -1352,11 +1354,17 @@ public class AgentBridge {
                     "模型调用失败：空响应"
                 }
             }
-            let trimmed = answer.trimAscii()
+            let replyGuard = normalizeGatewayAssistantFinalReply(answer)
+            let guardedAnswer = if (replyGuard.ok) {
+                replyGuard.text
+            } else {
+                safeFallbackTextForBlockedAssistantReply(replyGuard.status)
+            }
+            let trimmed = guardedAnswer.trimAscii()
             let reply = if (trimmed.isEmpty()) {
                 "（模型未返回有效正文：请确认网关窗口已打印「使用模型」与 metis.json 中配置一致；若缺少提供商密钥或 Base URL，请直接写入 ~/.metis/metis.json。若用推理模型请使用已合并 reasoning 的 CangjieMagic 并重新编译。）"
             } else {
-                answer
+                guardedAnswer
             }
             history.add("assistant: ${reply}")
             this.sessionStore.appendAssistant(
@@ -1371,7 +1379,7 @@ public class AgentBridge {
                 conversationKey,
                 channelName,
                 agentId: effectiveAgentId,
-                note: "history=${history.size}, replyChars=${reply.size}"
+                note: "history=${history.size}, replyChars=${reply.size}, replyGuardStatus=${replyGuard.status}, replyGuardBlocked=${replyGuard.blocked}, diagnosticHash=${replyGuard.diagnosticHash}"
             )
             return reply
         }
