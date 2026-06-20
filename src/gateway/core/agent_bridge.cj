@@ -956,14 +956,10 @@ public class AgentBridge {
             // Skill-driven model selection:
             // - if a skill configured `model` + api key, try it first
             // - if apikey invalid/auth error occurs, fall back to global model config
-            var allModels = match (turnContext) {
-                case Some(ctx) =>
-                    gatewayEnsureTurnRuntimeState(ctx)
-                    CliModelManager.getAllModelsForAgentScope(ctx.agentScope)
-                case None => CliModelManager.getAllModels()
-            }
             let channelBoundModelOpt = resolveChannelBoundModelName(channelName, sessionKey: conversationKey)
-            allModels = applyChannelModelBinding(channelBoundModelOpt, allModels)
+            let modelChain = resolveGatewayModelChain(turnContext, channelBoundModelOpt)
+            let allModels = modelChain[0]
+            let channelBoundModelFullName = modelChain[1]
             let skillsEnabled = CliSettingManager.readSkillsEnabled()
             let runtimeSkillNames = gatewayRouteRuntimeSkillNames(turnContext)
             let forcedSkillName: Option<String> = parseForcedSkillFromSlash(prompt, agentId: effectiveAgentId,
@@ -1312,7 +1308,8 @@ public class AgentBridge {
                     lastEx = Some(e)
                     let isChannelBoundFirst = match (channelBoundModelOpt) {
                         case Some(boundModel) =>
-                            idx == 0 && currModel.fullName.trimAscii() == boundModel.trimAscii()
+                            idx == 0 && !boundModel.trimAscii().isEmpty() &&
+                                currModel.fullName.trimAscii() == channelBoundModelFullName
                         case None => false
                     }
                     if (idx == allModels.size - 1) {
@@ -1437,21 +1434,45 @@ public class AgentBridge {
         None
     }
 
-    private func applyChannelModelBinding(channelBoundModelOpt: Option<String>, models: Array<ChatModel>): Array<ChatModel> {
+    private func loadGatewayFallbackModels(turnContext: Option<GatewayTurnContext>): Array<ChatModel> {
+        match (turnContext) {
+            case Some(ctx) =>
+                gatewayEnsureTurnRuntimeState(ctx)
+                CliModelManager.getAllModelsForAgentScope(ctx.agentScope)
+            case None => CliModelManager.getAllModels()
+        }
+    }
+
+    private func resolveGatewayModelChain(
+        turnContext: Option<GatewayTurnContext>,
+        channelBoundModelOpt: Option<String>
+    ): (Array<ChatModel>, String) {
         let modelName = match (channelBoundModelOpt) {
             case Some(v) => v.trimAscii()
             case None => ""
         }
         if (modelName.isEmpty()) {
-            return models
+            return (loadGatewayFallbackModels(turnContext), "")
         }
         try {
             let boundModel = ModelManager.createChatModel(modelName)
             boundModel.maxTokens = ModelTokenLimits.getOutputLimit(modelName)
             let out = ArrayList<ChatModel>()
             out.add(boundModel)
-            for (m in models) {
-                out.add(m)
+            try {
+                for (m in loadGatewayFallbackModels(turnContext)) {
+                    out.add(m)
+                }
+            } catch (e: Exception) {
+                gatewayLogEventWarn(
+                    "gateway/model",
+                    "model.failed",
+                    "global model chain unavailable; using channel-bound model only",
+                    meta: gatewayLogMeta()
+                        .string("model", modelName)
+                        .rawString("error", e.message)
+                        .object()
+                )
             }
             gatewayLogEventInfo(
                 "gateway/model",
@@ -1459,7 +1480,7 @@ public class AgentBridge {
                 "channel-bound model applied",
                 meta: gatewayLogMeta().string("model", modelName).object()
             )
-            out.toArray()
+            (out.toArray(), boundModel.fullName.trimAscii())
         } catch (e: Exception) {
             // Invalid model name/provider or initialization failure: fall back to global models directly.
             gatewayLogEventWarn(
@@ -1471,7 +1492,7 @@ public class AgentBridge {
                     .rawString("error", e.message)
                     .object()
             )
-            models
+            (loadGatewayFallbackModels(turnContext), "")
         }
     }
 

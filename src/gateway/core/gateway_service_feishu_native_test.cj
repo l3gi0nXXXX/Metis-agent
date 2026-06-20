@@ -1144,8 +1144,9 @@ public class GatewayServiceFeishuNativeTest {
             ModelManager.registerChatModel(modelName, { =>
                 GatewayFeishuNativeFakeModel(answer: "{\"tool\":\"final_answer\",\"answer\":\"guarded feishu answer\"}")
             })
-            let oldModel = CliConfig.model
-            CliConfig.model = modelName
+            var user = CliSettingManager.readGatewaySettings()
+            user.channelModels["feishu"] = modelName
+            CliSettingManager.writeGatewaySettings(user)
             let adapter = GatewayFeishuNativeTestAdapter()
             let service = gatewayFeishuNativeService(adapter)
             service.start()
@@ -1161,7 +1162,6 @@ public class GatewayServiceFeishuNativeTest {
                 @Expect(adapter.sentText(2), "[reaction]\nremove=true\ntoken=Typing\nrender=Typing")
             } finally {
                 service.stop()
-                CliConfig.model = oldModel
             }
         })
     }
