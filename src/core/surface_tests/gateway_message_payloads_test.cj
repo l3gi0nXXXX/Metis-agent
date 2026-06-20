@@ -61,6 +61,13 @@ public class GatewayMessagePayloadsTest {
     }
 
     @TestCase
+    func renderGatewayReactionRemoveTextPreservesReactionToken(): Unit {
+        let rendered = renderGatewayReactionRemoveText("Typing")
+        @Expect(parseGatewayReactionRemove(rendered), true)
+        @Expect(parseGatewayReactionToken(rendered), "Typing")
+    }
+
+    @TestCase
     func t46ParseGatewayReactionStatusPayload(): Unit {
         @Expect(parseGatewayReactionStatus("[reaction]\nstatus=thinking"), "thinking")
         @Expect(parseGatewayReactionStatus("[reaction]\nstatus=tool"), "tool")

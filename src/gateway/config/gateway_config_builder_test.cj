@@ -184,6 +184,49 @@ public class GatewayConfigBuilderTest {
     }
 
     @TestCase
+    public func feishuAckDefaultsRemainDisabled(): Unit {
+        var user = GatewayUserSettings()
+
+        let (feishu, _, _) = mergeGatewayUserSettings(user)
+
+        @Expect(feishu.ack.enabled, false)
+        @Expect(feishu.ack.reaction, "Typing")
+        @Expect(feishu.ack.removeAfterReply, true)
+        @Expect(feishu.ack.scope, "handled")
+        @Expect(feishu.media.downloadEnabled, true)
+    }
+
+    @TestCase
+    public func feishuAckExplicitConfigBuildsRuntimeConfig(): Unit {
+        var user = GatewayUserSettings()
+        user.feishu.ack.enabled = true
+        user.feishu.ack.reaction = "敲键盘"
+        user.feishu.ack.removeAfterReply = false
+        user.feishu.ack.scope = "handled"
+
+        let (feishu, _, _) = mergeGatewayUserSettings(user)
+
+        @Expect(feishu.ack.enabled, true)
+        @Expect(feishu.ack.reaction, "敲键盘")
+        @Expect(feishu.ack.removeAfterReply, false)
+        @Expect(feishu.ack.scope, "handled")
+    }
+
+    @TestCase
+    public func feishuAckBlankValuesFallback(): Unit {
+        var user = GatewayUserSettings()
+        user.feishu.ack.enabled = true
+        user.feishu.ack.reaction = "   "
+        user.feishu.ack.scope = "   "
+
+        let (feishu, _, _) = mergeGatewayUserSettings(user)
+
+        @Expect(feishu.ack.enabled, true)
+        @Expect(feishu.ack.reaction, "Typing")
+        @Expect(feishu.ack.scope, "handled")
+    }
+
+    @TestCase
     public func qqPerAccountConfigMapsIntoRuntimeConfigWithoutDroppingTopLevelCompatibility(): Unit {
         var user = GatewayUserSettings()
         user.qq.enabled = true

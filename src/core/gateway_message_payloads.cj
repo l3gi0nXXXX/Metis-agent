@@ -92,6 +92,14 @@ public func renderGatewayReactionText(raw: String): String {
     return "[reaction]\ntoken=${text}\nrender=${text}"
 }
 
+public func renderGatewayReactionRemoveText(raw: String): String {
+    let text = raw.trimAscii()
+    if (text.isEmpty()) {
+        return ""
+    }
+    return "[reaction]\nremove=true\ntoken=${text}\nrender=${text}"
+}
+
 public func parseGatewayReactionToken(raw: String): String {
     let normalized = raw.replace("\r\n", "\n").replace("\r", "\n").trimAscii()
     if (!normalized.startsWith("[reaction]")) {

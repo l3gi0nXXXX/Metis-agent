@@ -1,6 +1,6 @@
 package metis.gateway.core
 
-import metis.core.{GatewayToolRuntimeContext, gatewaySpeechResolveDeliveryPrefs, gatewaySpeechResolveTtsConfig, gatewaySpeechTtsSynthesize, gatewayWithToolRuntimeContext, renderGatewayTopicEditText}
+import metis.core.{GatewayToolRuntimeContext, gatewaySpeechResolveDeliveryPrefs, gatewaySpeechResolveTtsConfig, gatewaySpeechTtsSynthesize, gatewayWithToolRuntimeContext, renderGatewayReactionRemoveText, renderGatewayReactionText, renderGatewayTopicEditText}
 import metis.core.config.{CliConfig, CliSettingManager, GatewayUserSettings, MetisConfigManager, MetisPaths, cliFindModelAuthChoicesForProvider, cliSetupVisibleModelProviders}
 import metis.core.model.{CodexResponsesException, findModelCapabilityCatalogEntry, modelCapabilityCatalogEntriesForProvider}
 import metis.core.skills.SkillsPrompt
@@ -276,6 +276,10 @@ public class GatewayService {
             lifecycleHook: if (channelToString(message.channel) == "telegram") {
                 Some({ status: String =>
                     this.maybeSendTelegramLifecycleSignal(user, message, effectiveAccountId, status)
+                })
+            } else if (channelToString(message.channel) == "feishu" && request.deliver) {
+                Some({ status: String =>
+                    this.maybeSendFeishuAckLifecycleSignal(user, message, effectiveAccountId, status)
                 })
             } else {
                 None<(String) -> Unit>
@@ -2130,6 +2134,85 @@ public class GatewayService {
                     .identityHash("peerHash", message.peerId)
                     .string("status", "skipped")
                     .string("errorKind", "reaction_failed")
+                    .rawString("error", e.message)
+                    .object()
+            )
+        }
+    }
+
+    private func feishuAckConfigFromUser(user: GatewayUserSettings): FeishuAckConfig {
+        FeishuAckConfig(
+            enabled: user.feishu.ack.enabled,
+            reaction: user.feishu.ack.reaction,
+            removeAfterReply: user.feishu.ack.removeAfterReply,
+            scope: user.feishu.ack.scope
+        )
+    }
+
+    private func feishuAckReplyTargetOrMessageId(message: InboundMessage): Option<String> {
+        match (message.replyTargetMessageId) {
+            case Some(v) =>
+                let target = v.trimAscii()
+                if (target.isEmpty()) { None<String> } else { Some(target) }
+            case None =>
+                let messageId = message.messageId.trimAscii()
+                if (messageId.isEmpty()) { None<String> } else { Some(messageId) }
+        }
+    }
+
+    private func maybeSendFeishuAckLifecycleSignal(
+        user: GatewayUserSettings,
+        message: InboundMessage,
+        accountId: String,
+        status: String
+    ): Unit {
+        if (channelToString(message.channel) != "feishu") {
+            return
+        }
+        let config = this.feishuAckConfigFromUser(user)
+        if (!gatewayFeishuShouldAckInbound(config, message)) {
+            return
+        }
+        let target = this.feishuAckReplyTargetOrMessageId(message)
+        if (target.isNone()) {
+            return
+        }
+        let normalized = status.trimAscii().toAsciiLower()
+        let reaction = gatewayFeishuAckReaction(config)
+        if (reaction.isEmpty()) {
+            return
+        }
+        let payload = if (normalized == "thinking") {
+            renderGatewayReactionText(reaction)
+        } else if ((normalized == "done" || normalized == "error") && config.removeAfterReply) {
+            renderGatewayReactionRemoveText(reaction)
+        } else {
+            ""
+        }
+        if (payload.trimAscii().isEmpty()) {
+            return
+        }
+        try {
+            let _ = this.sendTextToPeerDetailed(
+                "feishu",
+                message.peerId,
+                payload,
+                replyToMessageId: target,
+                replyInThread: message.replyInThread,
+                accountId: accountId
+            )
+        } catch (e: Exception) {
+            gatewayLogEventInfo(
+                "gateway/message",
+                "message.send.failed",
+                "feishu ack lifecycle reaction skipped",
+                meta: gatewayLogMeta()
+                    .string("channel", "feishu")
+                    .string("accountId", accountId)
+                    .identityHash("peerHash", message.peerId)
+                    .string("status", "skipped")
+                    .string("lifecycleStatus", normalized)
+                    .string("errorKind", if (normalized == "thinking") { "feishu_ack_add_failed" } else { "feishu_ack_remove_failed" })
                     .rawString("error", e.message)
                     .object()
             )

@@ -483,6 +483,14 @@ public struct FeishuMediaUserSettings {
 }
 
 @jsonable
+public struct FeishuAckUserSettings {
+    public var enabled: Bool = false
+    public var reaction: String = "Typing"
+    public var removeAfterReply: Bool = true
+    public var scope: String = "handled"
+}
+
+@jsonable
 public struct FeishuUserSettings {
     /** 默认 true，与原先未设置 FEISHU_ENABLED 时视为开启的行为对齐；可用 `gateway channel disable feishu` 关闭。 */
     public var enabled: Bool = true
@@ -514,6 +522,7 @@ public struct FeishuUserSettings {
     public var replyInThread: String = "disabled"
     public var requireSignatureHeaders: Bool = true
     public var requestMaxSkewSeconds: Int64 = 300
+    public var ack: FeishuAckUserSettings = FeishuAckUserSettings()
     public var media: FeishuMediaUserSettings = FeishuMediaUserSettings()
     public var speech: GatewayChannelSpeechUserSettings = GatewayChannelSpeechUserSettings()
     public var image: JsonObject = JsonObject()

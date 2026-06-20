@@ -269,6 +269,24 @@ public class GatewayMessageToolset {
         )
     }
 
+    public func debugMessageWithReplyForTest(action: String, channel: String, to: String, message: String, replyTo: String, reaction: String): String {
+        this.__tool_impl_of_message(
+            action,
+            Some(channel),
+            Some(to),
+            if (message.trimAscii().isEmpty()) { None<String> } else { Some(message) },
+            if (replyTo.trimAscii().isEmpty()) { None<String> } else { Some(replyTo) },
+            None<String>,
+            if (reaction.trimAscii().isEmpty()) { None<String> } else { Some(reaction) },
+            None<String>,
+            None<String>,
+            None<Bool>,
+            None<Int64>,
+            None<Bool>,
+            None<Bool>
+        )
+    }
+
     @tool[
         description: "Send one Gateway-backed message through the unified channels.send RPC surface. Supports action=send, reply, thread, reaction, chat-action, poll, delete, edit, pin, unpin, topic-create, topic-edit, photo, document, audio, voice, video, and video-note.",
         parameters: {
@@ -429,7 +447,7 @@ public class GatewayMessageToolset {
             return out
         }
 
-        let replyAnchor = if (act == "reply" || act == "edit" || act == "delete" || act == "pin" || act == "unpin" || act == "topic-edit") {
+        let replyAnchor = if (act == "reply" || act == "reaction" || act == "edit" || act == "delete" || act == "pin" || act == "unpin" || act == "topic-edit") {
             match (replyTo) {
                 case Some(v) => v.trimAscii()
                 case None => ""
@@ -442,7 +460,7 @@ public class GatewayMessageToolset {
         } else {
             ""
         }
-        if ((act == "reply" || act == "thread" || act == "edit" || act == "delete" || act == "pin" || act == "unpin" || act == "topic-edit") && replyAnchor.isEmpty()) {
+        if ((act == "reply" || act == "reaction" || act == "thread" || act == "edit" || act == "delete" || act == "pin" || act == "unpin" || act == "topic-edit") && replyAnchor.isEmpty()) {
             let err = JsonObject()
             err.put("ok", JsonBool(false))
             err.put("status", JsonString("error"))
@@ -450,6 +468,8 @@ public class GatewayMessageToolset {
             err.put("error", JsonString(
                 if (act == "reply") {
                     "reply requires replyTo"
+                } else if (act == "reaction") {
+                    "reaction requires replyTo"
                 } else if (act == "thread") {
                     "thread requires threadId"
                 } else if (act == "edit") {
@@ -501,7 +521,7 @@ public class GatewayMessageToolset {
         result.put("payloadKind", JsonString(payloadKind))
         result.put("payloadPreview", JsonString(gatewayMessagePayloadPreview(text)))
         if (!replyAnchor.isEmpty()) {
-            if (act == "reply") {
+            if (act == "reply" || act == "reaction") {
                 result.put("replyTo", JsonString(replyAnchor))
             } else {
                 result.put("threadId", JsonString(replyAnchor))
