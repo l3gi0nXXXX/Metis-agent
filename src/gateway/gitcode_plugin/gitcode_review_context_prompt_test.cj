@@ -748,6 +748,71 @@ public class GitCodeReviewContextPromptTest {
     }
 
     @TestCase
+    public func r3P001KnowledgeCommentInjectsFakeCkbEvidenceIntoPrompt(): Unit {
+        let counter = GitCodeReviewTestCounter()
+        setGitCodeCkbHttpRunnerForTest(Some({ request: GitCodeCkbHttpRequest =>
+            counter.httpCalls += 1
+            @Expect(request.path, "/v1/evidence-pack")
+            @Expect(request.body.contains("仓颉语法"), true)
+            let result = JsonObject()
+            result.put("knowledgeVersion", JsonString("ckb-comment-v1"))
+            let item = JsonObject()
+            item.put("title", JsonString("comment policy evidence"))
+            item.put("summary", JsonString("CKB evidence for Cangjie comment knowledge"))
+            item.put("visibility", JsonString("public"))
+            result.put("items", JsonArray([item]))
+            let envelope = JsonObject()
+            envelope.put("ok", JsonBool(true))
+            envelope.put("result", result)
+            GitCodeCkbHttpResponse(200, body: envelope.toJsonString())
+        }))
+        try {
+            let cfg = GitCodeReviewRuntimeConfig(
+                ckbService: GitCodeCkbServiceConfig(enabled: true, endpoint: "http://127.0.0.1:18080", sourceAnalysisEnabled: true)
+            )
+            let plan = buildGitCodeReplyPromptForServicePluginEventWithRuntime(
+                this.acceptedEvent("comment", commentBody: "仓颉语法和标准库 ArrayList 怎么用？"),
+                defaultGitCodePromptTemplateSet(),
+                cfg
+            )
+            @Expect(plan.ok, true)
+            @Expect(plan.route, "comment_reply")
+            @Expect(plan.prompt.contains("CKB evidence"), true)
+            @Expect(plan.prompt.contains("ckb-comment-v1"), true)
+            @Expect(plan.prompt.contains("comment policy evidence"), true)
+            @Expect(counter.httpCalls, 1)
+        } finally {
+            setGitCodeCkbHttpRunnerForTest(None<(GitCodeCkbHttpRequest) -> GitCodeCkbHttpResponse>)
+        }
+    }
+
+    @TestCase
+    public func r3N001KnowledgeCommentCkbTimeoutDegradesWithoutRealCkb(): Unit {
+        let counter = GitCodeReviewTestCounter()
+        setGitCodeCkbHttpRunnerForTest(Some({ _request: GitCodeCkbHttpRequest =>
+            counter.httpCalls += 1
+            GitCodeCkbHttpResponse(0, error: "read timeout")
+        }))
+        try {
+            let cfg = GitCodeReviewRuntimeConfig(
+                ckbService: GitCodeCkbServiceConfig(enabled: true, endpoint: "http://127.0.0.1:18080", sourceAnalysisEnabled: false)
+            )
+            let plan = buildGitCodeReplyPromptForServicePluginEventWithRuntime(
+                this.acceptedEvent("comment", commentBody: "Cangjie docs 里 cjpm test 的用法是什么？"),
+                defaultGitCodePromptTemplateSet(),
+                cfg
+            )
+            @Expect(plan.ok, true)
+            @Expect(plan.route, "comment_reply")
+            @Expect(plan.needsHumanReview, true)
+            @Expect(plan.prompt.contains("ckb_timeout"), true)
+            @Expect(counter.httpCalls, 1)
+        } finally {
+            setGitCodeCkbHttpRunnerForTest(None<(GitCodeCkbHttpRequest) -> GitCodeCkbHttpResponse>)
+        }
+    }
+
+    @TestCase
     public func metis2CkbNotRequiredDoesNotCallCkb(): Unit {
         // METIS2-UT-002
         let counter = GitCodeReviewTestCounter()

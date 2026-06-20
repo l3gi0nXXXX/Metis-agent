@@ -23,6 +23,20 @@ public class GitCodeReviewRouterTest {
         )
     }
 
+    private func commentRequest(body: String): GitCodeReviewRequest {
+        GitCodeReviewRequest(
+            eventId: "comment-r3",
+            eventType: "comment",
+            repoFullName: "Cangjie/cangjie_tools",
+            number: "9",
+            url: "https://gitcode.com/Cangjie/cangjie_tools/issues/9#note_1",
+            parentUrl: "https://gitcode.com/Cangjie/cangjie_tools/issues/9",
+            title: "comment",
+            content: "父 issue",
+            commentBody: body
+        )
+    }
+
     @TestCase
     public func tRouter001BugIssueRoutesToBugTask(): Unit {
         let route = routeGitCodeReviewRequest(this.request(issueKind: "bug"))
@@ -107,6 +121,28 @@ public class GitCodeReviewRouterTest {
         @Expect(route.degraded, true)
         @Expect(route.needsHumanReview, true)
         @Expect(route.allowWriteback, false)
+    }
+
+    @TestCase
+    public func r3U001CangjieKnowledgeCommentsRequireCkbWithoutSourceWorkspace(): Unit {
+        let syntax = routeGitCodeReviewRequest(this.commentRequest("仓颉语法里 match 表达式怎么写？"))
+        @Expect(syntax.task.requiresCkb, true)
+        @Expect(syntax.task.requiresSourceWorkspace, false)
+
+        let stdlib = routeGitCodeReviewRequest(this.commentRequest("标准库 ArrayList 和 std.collection 应该怎么导入？"))
+        @Expect(stdlib.task.requiresCkb, true)
+        @Expect(stdlib.task.requiresSourceWorkspace, false)
+
+        let tool = routeGitCodeReviewRequest(this.commentRequest("cjpm test 和 cjc 编译选项的推荐用法是什么？"))
+        @Expect(tool.task.requiresCkb, true)
+        @Expect(tool.task.requiresSourceWorkspace, false)
+    }
+
+    @TestCase
+    public func r3B001PlainAcknowledgementCommentsDoNotRequireCkb(): Unit {
+        let route = routeGitCodeReviewRequest(this.commentRequest("收到，谢谢"))
+        @Expect(route.task.requiresCkb, false)
+        @Expect(route.task.requiresSourceWorkspace, false)
     }
 
     @TestCase

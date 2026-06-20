@@ -161,6 +161,7 @@ public func buildCommentReplyTask(request: GitCodeReviewRequest): GitCodeReviewT
     } else {
         "issue"
     }
+    let requiresCkb = request.requiresCkb || gitCodeCommentNeedsCangjieKnowledgeCkb(request)
     GitCodeReviewTask(
         taskType: "comment_reply",
         eventId: request.eventId,
@@ -169,7 +170,7 @@ public func buildCommentReplyTask(request: GitCodeReviewRequest): GitCodeReviewT
         url: request.url,
         title: request.title,
         parentKind: parentKind,
-        requiresCkb: request.requiresCkb,
+        requiresCkb: requiresCkb,
         requiresSourceWorkspace: request.requiresSourceWorkspace,
         requiresCodeReview: parentKind == "pr",
         needsHumanReview: request.needsHumanReview,
@@ -243,6 +244,48 @@ private func reviewTaskBrief(request: GitCodeReviewRequest, label: String): Stri
     if (request.reviewFindings.size > 0) { parts.add("reviewFindings=${String.join(request.reviewFindings, delimiter: ";")}") }
     if (request.requiresSourceWorkspace) { parts.add("sourcePolicy=required") }
     String.join(parts.toArray(), delimiter: " ")
+}
+
+private func gitCodeCommentNeedsCangjieKnowledgeCkb(request: GitCodeReviewRequest): Bool {
+    if (request.eventType != "comment") {
+        return false
+    }
+    let text = gitCodeCommentKnowledgeText(request)
+    if (text.trimAscii().isEmpty()) {
+        return false
+    }
+    let lower = text.toAsciiLower()
+    if (gitCodeReviewTextContainsAny(text, ["仓颉语法", "仓颉标准库", "标准库", "工具链", "编译器", "包管理", "知识库"]) ||
+        gitCodeReviewTextContainsAny(lower, ["cjpm", "cjc", "ckb", "stdx", "std.collection", "std.regex", "std.time", "cangjie docs", "cangjie doc", "cangjie standard library"])) {
+        return true
+    }
+    let mentionsCangjie = text.contains("仓颉") || lower.contains("cangjie")
+    mentionsCangjie && (
+        gitCodeReviewTextContainsAny(text, ["语法", "标准库", "文档", "用法", "怎么", "如何", "知识", "工具"]) ||
+        gitCodeReviewTextContainsAny(lower, ["syntax", "stdlib", "standard library", "docs", "documentation", "api", "tool", "ckb"])
+    )
+}
+
+private func gitCodeCommentKnowledgeText(request: GitCodeReviewRequest): String {
+    let parts = ArrayList<String>()
+    if (!request.commentBody.trimAscii().isEmpty()) {
+        parts.add(request.commentBody)
+    } else if (!request.content.trimAscii().isEmpty()) {
+        parts.add(request.content)
+    }
+    if (request.hasDiscussionContext && !request.discussionContext.triggerComment.body.trimAscii().isEmpty()) {
+        parts.add(request.discussionContext.triggerComment.body)
+    }
+    String.join(parts.toArray(), delimiter: "\n")
+}
+
+private func gitCodeReviewTextContainsAny(text: String, needles: Array<String>): Bool {
+    for (needle in needles) {
+        if (text.contains(needle)) {
+            return true
+        }
+    }
+    false
 }
 
 private func reviewRouteIsDegraded(request: GitCodeReviewRequest): Bool {
