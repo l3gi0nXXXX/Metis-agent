@@ -415,6 +415,53 @@ public class GatewayMessageToolsetTest {
     }
 
     @TestCase
+    public func messageReactionRequiresReplyToBeforeGatewaySend(): Unit {
+        let calls = ArrayList<JsonObject>()
+        debugSetGatewayMessageToolCallRunnerForTest(Some({ _method: String, payload: JsonObject =>
+            calls.add(payload)
+            let out = JsonObject()
+            out.put("ok", JsonBool(true))
+            out
+        }))
+        try {
+            let out = GatewayMessageToolset().debugMessageWithReplyForTest("reaction", "feishu", "ou_1", "", "", "敲键盘")
+            let json = JsonValue.fromStr(out).asObject()
+            @Expect(json.get("ok").getOrThrow().asBool().getValue(), false)
+            @Expect(json.get("status").getOrThrow().asString().getValue(), "error")
+            @Expect(json.get("error").getOrThrow().asString().getValue(), "reaction requires replyTo")
+            @Expect(calls.size, 0)
+        } finally {
+            debugSetGatewayMessageToolCallRunnerForTest(None<(String, JsonObject) -> JsonObject>)
+        }
+    }
+
+    @TestCase
+    public func messageReactionSendsReplyAnchoredPayload(): Unit {
+        let calls = ArrayList<JsonObject>()
+        debugSetGatewayMessageToolCallRunnerForTest(Some({ method: String, payload: JsonObject =>
+            @Expect(method, "channels.send")
+            calls.add(payload)
+            let out = JsonObject()
+            out.put("ok", JsonBool(true))
+            out.put("messageId", JsonString("om_ack"))
+            out
+        }))
+        try {
+            let out = GatewayMessageToolset().debugMessageWithReplyForTest("reaction", "feishu", "ou_1", "", "om_ack", "敲键盘")
+            let json = JsonValue.fromStr(out).asObject()
+            @Expect(json.get("ok").getOrThrow().asBool().getValue(), true)
+            @Expect(json.get("payloadKind").getOrThrow().asString().getValue(), "reaction")
+            @Expect(json.get("replyTo").getOrThrow().asString().getValue(), "om_ack")
+            @Expect(calls.size, 1)
+            @Expect(calls[0].get("replyToMessageId").getOrThrow().asString().getValue(), "om_ack")
+            @Expect(calls[0].get("text").getOrThrow().asString().getValue().contains("[reaction]"), true)
+            @Expect(calls[0].get("text").getOrThrow().asString().getValue().contains("token=敲键盘"), true)
+        } finally {
+            debugSetGatewayMessageToolCallRunnerForTest(None<(String, JsonObject) -> JsonObject>)
+        }
+    }
+
+    @TestCase
     public func messageToolSendUsesRuntimeHookInsideContext(): Unit {
         let calls = ArrayList<JsonObject>()
         let context = GatewayToolRuntimeContext(

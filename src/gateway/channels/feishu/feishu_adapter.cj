@@ -1783,6 +1783,9 @@ public class FeishuAdapter <: ChannelAdapter {
         if (lower == "ok" || lower == "done") {
             return "OK"
         }
+        if (lower == "typing" || lower == "keyboard" || lower == "keystroke" || lower == "metis" || lower == "metis_ack" || lower == "敲键盘") {
+            return "Typing"
+        }
         token
     }
 

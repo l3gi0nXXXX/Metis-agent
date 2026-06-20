@@ -1,6 +1,6 @@
 package metis.gateway.channels.feishu
 
-import metis.core.{renderGatewayAudioText, renderGatewayDeleteText, renderGatewayDocumentText, renderGatewayPhotoText, renderGatewayReactionText, renderGatewayVideoText, renderGatewayVoiceText}
+import metis.core.{renderGatewayAudioText, renderGatewayDeleteText, renderGatewayDocumentText, renderGatewayPhotoText, renderGatewayReactionRemoveText, renderGatewayReactionText, renderGatewayVideoText, renderGatewayVoiceText}
 import metis.gateway.model.{ChannelType, FeishuConfig, FeishuMediaConfig, OutboundMessage, SendResult}
 import std.fs.{Directory, File, Path, remove}
 import std.time.DateTime
@@ -228,6 +228,36 @@ public class FeishuOutboundActionsTest {
         @Expect(deleteId, "om_delete")
         @Expect(client.listMessageReactions("tenant-a", "om_target").size, 0)
         @Expect(client.deletedMessageCount(), 1)
+        @Expect(client.textSendCount(), 0)
+    }
+
+    @TestCase
+    public func typingReactionPayloadAddsAndRemovesSameTokenWithoutTextFallback(): Unit {
+        let client = FeishuFakeApiClient()
+        let adapter = FeishuAdapter(config: FeishuConfig(enabled: true, streaming: "text"), apiClient: client)
+        adapter.start()
+
+        let addId = adapter.sendWithMessageId(OutboundMessage(
+            ChannelType.Feishu,
+            "oc_actions",
+            renderGatewayReactionText("敲键盘"),
+            replyToMessageId: Some("om_ack"),
+            accountId: "tenant-a"
+        ))
+        let afterAdd = client.listMessageReactions("tenant-a", "om_ack")
+        let removeId = adapter.sendWithMessageId(OutboundMessage(
+            ChannelType.Feishu,
+            "oc_actions",
+            renderGatewayReactionRemoveText("metis-ack"),
+            replyToMessageId: Some("om_ack"),
+            accountId: "tenant-a"
+        ))
+
+        @Expect(addId, "om_ack")
+        @Expect(afterAdd.size, 1)
+        @Expect(afterAdd[0], "Typing")
+        @Expect(removeId, "om_ack")
+        @Expect(client.listMessageReactions("tenant-a", "om_ack").size, 0)
         @Expect(client.textSendCount(), 0)
     }
 
