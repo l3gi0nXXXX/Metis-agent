@@ -1201,6 +1201,41 @@ public class ServicePluginEventDispatcherTest {
     }
 
     @TestCase
+    public func r4E2E002WebhookUnfinalizedToolProtocolDoesNotWriteBackOrLeakProtocol(): Unit {
+        this.resetDispatcherHooks()
+        this.registerGitCodeWritebackPlugin()
+        let calls = ArrayList<String>()
+        let messages = ArrayList<String>()
+        setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent =>
+            this.targetRows([this.target(channel: "telegram", peerId: "tg-peer")])
+        }))
+        setServicePluginWebhookGeneratedReplyHandlerForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent, _target: ServicePluginDeliveryTarget =>
+            ServicePluginGeneratedReplyResult(false, status: "tool_protocol_unfinalized", diagnostic: "assistant to=functions.search {\"query\":\"secret\"}", needsHumanReview: true)
+        }))
+        setServicePluginCapabilityInvokerForTest(Some({ _registration: ServicePluginRegistration, request: CapabilityInvokeRequest =>
+            calls.add(request.capabilityId)
+            CapabilityInvokeResult(true, "ok", serviceId: "gitcode-monitor", capabilityId: request.capabilityId, payload: "{\"status\":\"posted\",\"posted\":true}")
+        }))
+        setServicePluginEventDeliveryForTest(Some({ _target: ServicePluginDeliveryTarget, text: String =>
+            messages.add(text)
+            ServicePluginEventDeliveryResult(true, "sent")
+        }))
+        try {
+            let result = dispatchServicePluginEvent(this.acceptedContractFrame(eventId: "gitcode:Cangjie/cangjie_tools:issue:r4-e2e-002"), store: ServicePluginPendingJobStore())
+
+            @Expect(result.ok, true)
+            @Expect(result.status, "generated_reply_degraded_delivered")
+            @Expect(calls.size, 0)
+            @Expect(messages.size, 1)
+            @Expect(messages[0].contains("模型工具调用未收敛为最终文本，已转人工确认"), true)
+            @Expect(messages[0].contains("functions.search"), false)
+            @Expect(messages[0].contains("\"query\""), false)
+        } finally {
+            this.resetDispatcherHooks()
+        }
+    }
+
+    @TestCase
     public func draftM3N002WebhookSecretDraftDoesNotWriteBackOrLeakSecret(): Unit {
         // DRAFT-M3-N-002.
         this.resetDispatcherHooks()
