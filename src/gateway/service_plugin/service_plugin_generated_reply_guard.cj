@@ -1,6 +1,7 @@
 package metis.gateway.service_plugin
 
-import stdx.encoding.json.{JsonArray, JsonObject, JsonValue}
+import metis.gateway.reply_guard.detectToolProtocolJson
+import stdx.encoding.json.JsonValue
 
 public class ServicePluginGeneratedReplyGuardResult {
     public let ok: Bool
@@ -47,11 +48,11 @@ public func validateServicePluginGeneratedDraft(rawDraft: String): ServicePlugin
 
     match (servicePluginDraftParseFullJson(trimmed)) {
         case Some(value) =>
+            let toolDetection = detectToolProtocolJson(trimmed)
+            if (toolDetection.detected) {
+                return servicePluginDraftGuardRejected("draft_invalid_tool_json", "", diagnostic: "Generated draft is tool-call JSON; diagnosticHash=${redacted.rawHash}", diagnosticHash: redacted.rawHash)
+            }
             if (servicePluginDraftJsonValueIsObject(value)) {
-                let obj = value.asObject()
-                if (servicePluginDraftJsonObjectHasToolShape(obj)) {
-                    return servicePluginDraftGuardRejected("draft_invalid_tool_json", "", diagnostic: "Generated draft is tool-call JSON; diagnosticHash=${redacted.rawHash}", diagnosticHash: redacted.rawHash)
-                }
                 return servicePluginDraftGuardRejected("draft_raw_json", "", diagnostic: "Generated draft is raw JSON; diagnosticHash=${redacted.rawHash}", diagnosticHash: redacted.rawHash)
             }
             if (servicePluginDraftJsonValueIsArray(value)) {
@@ -120,41 +121,6 @@ private func servicePluginDraftJsonValueIsArray(value: JsonValue): Bool {
     } catch (_: Exception) {
         false
     }
-}
-
-private func servicePluginDraftJsonObjectHasToolShape(obj: JsonObject): Bool {
-    for ((key, value) in obj.getFields()) {
-        let normalizedKey = key.trimAscii()
-        if (normalizedKey == "tool" ||
-            normalizedKey == "name" ||
-            normalizedKey == "arguments" ||
-            normalizedKey == "function_call" ||
-            normalizedKey == "tool_calls") {
-            return true
-        }
-        if (servicePluginDraftJsonValueContainsAnswerTool(value)) {
-            return true
-        }
-    }
-    false
-}
-
-private func servicePluginDraftJsonValueContainsAnswerTool(value: JsonValue): Bool {
-    let text = try { value.asString().getValue().trimAscii() } catch (_: Exception) { "" }
-    if (!text.isEmpty() && (text.contains("_answer_") || text.contains("functions._answer_"))) {
-        return true
-    }
-    let obj = try { value.asObject() } catch (_: Exception) { JsonObject() }
-    if (!obj.getFields().isEmpty()) {
-        return servicePluginDraftJsonObjectHasToolShape(obj)
-    }
-    let arr = try { value.asArray() } catch (_: Exception) { JsonArray([]) }
-    for (item in arr.getItems()) {
-        if (servicePluginDraftJsonValueContainsAnswerTool(item)) {
-            return true
-        }
-    }
-    false
 }
 
 private func servicePluginDraftContainsForbiddenMarker(text: String): Bool {
