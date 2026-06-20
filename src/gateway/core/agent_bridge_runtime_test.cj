@@ -673,6 +673,114 @@ public class AgentBridgeRuntimeTest {
     }
 
     @TestCase
+    public func agentBridgeDoesNotPersistToolProtocolJsonAsAssistantReply(): Unit {
+        withAgentBridgeTempHome("metis-fg2-terminal-envelope", { home: Path =>
+            writeAgentBridgeCodexAppServerAgentConfig(home)
+            let context = gatewayResolveSessionContext(
+                GatewaySessionRequest(
+                    GatewayIngressSource.Channel("feishu"),
+                    channelName: "feishu",
+                    sessionHint: "main",
+                    agentId: "codex",
+                    text: "status"
+                )
+            )
+            setGatewayCodexAppServerRunnerForTest(Some({ request: GatewayCodexAppServerTurnRequest =>
+                GatewayCodexAppServerRuntimeResult(
+                    "{\"name\":\"answer\",\"arguments\":{\"result\":\"当前状态已获取成功🙂\"}}",
+                    threadId: "thread-fg2",
+                    turnId: "turn-fg2",
+                    completed: true,
+                    metadata: gatewayCodexAppServerRuntimeMetadata(
+                        request.modelName,
+                        request.channelName,
+                        request.sessionKey,
+                        threadId: "thread-fg2",
+                        turnId: "turn-fg2",
+                        completed: true
+                    )
+                )
+            }))
+            try {
+                let store = GatewaySessionStore(home.join("sessions"), enabled: true, agentId: "codex")
+                let bridge = AgentBridge(sessionStore: store)
+                let reply = bridge.reply(
+                    context.sessionKey,
+                    "status",
+                    channelName: "feishu",
+                    agentId: "codex",
+                    turnContext: Some(context.turnContext)
+                )
+
+                @Expect(reply, "当前状态已获取成功🙂")
+                let history = bridge.getHistory(context.sessionKey)
+                @Expect(history[history.size - 1], "assistant: 当前状态已获取成功🙂")
+                let transcript = String.fromUtf8(File.readFrom(store.transcriptPath(context.sessionKey)))
+                @Expect(transcript.contains("当前状态已获取成功🙂"), true)
+                @Expect(transcript.contains("\"arguments\""), false)
+                @Expect(transcript.contains("\"name\""), false)
+            } finally {
+                setGatewayCodexAppServerRunnerForTest(None<(GatewayCodexAppServerTurnRequest) -> GatewayCodexAppServerRuntimeResult>)
+            }
+        })
+    }
+
+    @TestCase
+    public func agentBridgeBlocksNonTerminalToolProtocolJsonBeforeSessionHistory(): Unit {
+        withAgentBridgeTempHome("metis-fg2-nonterminal-tool-json", { home: Path =>
+            writeAgentBridgeCodexAppServerAgentConfig(home)
+            let context = gatewayResolveSessionContext(
+                GatewaySessionRequest(
+                    GatewayIngressSource.Channel("telegram"),
+                    channelName: "telegram",
+                    sessionHint: "main",
+                    agentId: "codex",
+                    text: "status"
+                )
+            )
+            setGatewayCodexAppServerRunnerForTest(Some({ request: GatewayCodexAppServerTurnRequest =>
+                GatewayCodexAppServerRuntimeResult(
+                    "{\"name\":\"session_status\",\"arguments\":{}}",
+                    threadId: "thread-fg2-neg",
+                    turnId: "turn-fg2-neg",
+                    completed: true,
+                    metadata: gatewayCodexAppServerRuntimeMetadata(
+                        request.modelName,
+                        request.channelName,
+                        request.sessionKey,
+                        threadId: "thread-fg2-neg",
+                        turnId: "turn-fg2-neg",
+                        completed: true
+                    )
+                )
+            }))
+            try {
+                let store = GatewaySessionStore(home.join("sessions"), enabled: true, agentId: "codex")
+                let bridge = AgentBridge(sessionStore: store)
+                let reply = bridge.reply(
+                    context.sessionKey,
+                    "status",
+                    channelName: "telegram",
+                    agentId: "codex",
+                    turnContext: Some(context.turnContext)
+                )
+
+                @Expect(reply.contains("工具调用协议"), true)
+                @Expect(reply.contains("session_status"), false)
+                let history = bridge.getHistory(context.sessionKey)
+                @Expect(history[history.size - 1].contains("工具调用协议"), true)
+                @Expect(history[history.size - 1].contains("session_status"), false)
+                let transcript = String.fromUtf8(File.readFrom(store.transcriptPath(context.sessionKey)))
+                @Expect(transcript.contains("工具调用协议"), true)
+                @Expect(transcript.contains("session_status"), false)
+                @Expect(transcript.contains("\"arguments\""), false)
+            } finally {
+                setGatewayCodexAppServerRunnerForTest(None<(GatewayCodexAppServerTurnRequest) -> GatewayCodexAppServerRuntimeResult>)
+            }
+        })
+    }
+
+    @TestCase
     public func codexAppServerInputAndMetadataStayHumanSafeAndStructured(): Unit {
         let usage = JsonObject()
         usage.put("promptTokens", JsonInt(3))
