@@ -134,6 +134,25 @@ private func gatewaySessionTurnFeishuMetadataOnlyDocumentContext(): JsonObject {
     media
 }
 
+private func gatewaySessionTurnGuardContext(channelName: String): GatewaySessionContext {
+    GatewaySessionContext(
+        GatewayIngressSource.Channel(channelName),
+        channelName,
+        channelName,
+        "${channelName}:chat:guard",
+        "general",
+        deliveryTarget: Some(GatewayDeliveryTarget(channelName, "peer-1", accountId: "default", replyToMessageId: "msg-1"))
+    )
+}
+
+private func gatewaySessionTurnRepeatText(text: String, count: Int64): String {
+    let out = StringBuilder()
+    for (_ in 0..count) {
+        out.append(text)
+    }
+    out.toString()
+}
+
 @Test
 public class GatewaySessionTurnRunnerTest {
     @TestCase
@@ -279,6 +298,236 @@ public class GatewaySessionTurnRunnerTest {
             @Expect(sentChannels[0], "feishu")
             @Expect(sentPeers[0], "ou_1")
             @Expect(sentTexts[0].startsWith("[photo]"), true)
+        } finally {
+            setGatewayAgentBridgeReplyRunnerForTest(None<(String, String, String, String, Bool, Option<(String) -> Unit>) -> String>)
+        }
+    }
+
+    @TestCase
+    public func feishuFinalDeliveryUnwrapsTerminalToolEnvelope(): Unit {
+        let sentTexts = ArrayList<String>()
+        setGatewayAgentBridgeReplyRunnerForTest(Some({
+            _conversationKey: String,
+            _prompt: String,
+            _channelName: String,
+            _agentId: String,
+            _streamingEnabled: Bool,
+            _streamChunkHook: Option<(String) -> Unit> =>
+                "{\"name\":\"answer\",\"arguments\":{\"result\":\"当前状态已获取成功\"}}"
+        }))
+        try {
+            let store = GatewaySessionStore(Path("."), enabled: false, agentId: "general")
+            let bridge = AgentBridge(sessionStore: store)
+            let result = gatewayExecuteSessionTurn(
+                bridge,
+                gatewaySessionTurnGuardContext("feishu"),
+                "status",
+                deliver: true,
+                deliverHook: Some({
+                    _channelName: String,
+                    _accountId: String,
+                    _peerId: String,
+                    text: String,
+                    _replyToMessageId: Option<String>,
+                    _replyInThread: Bool =>
+                        sentTexts.add(text)
+                        "m-${sentTexts.size}"
+                })
+            )
+
+            @Expect(result.delivered, true)
+            @Expect(sentTexts.size, 1)
+            @Expect(sentTexts[0], "当前状态已获取成功")
+            @Expect(sentTexts[0].contains("\"name\""), false)
+            @Expect(sentTexts[0].contains("\"arguments\""), false)
+        } finally {
+            setGatewayAgentBridgeReplyRunnerForTest(None<(String, String, String, String, Bool, Option<(String) -> Unit>) -> String>)
+        }
+    }
+
+    @TestCase
+    public func feishuStreamingToolProtocolPrefixIsNotDelivered(): Unit {
+        let sentTexts = ArrayList<String>()
+        let runtimeContext = GatewayToolRuntimeContext("feishu", channelName: "feishu", sessionKey: "feishu:chat:guard")
+        setGatewayAgentBridgeReplyRunnerForTest(Some({
+            _conversationKey: String,
+            _prompt: String,
+            _channelName: String,
+            _agentId: String,
+            _streamingEnabled: Bool,
+            streamChunkHook: Option<(String) -> Unit> =>
+                match (streamChunkHook) {
+                    case Some(notify) => notify("{\"name\":\"session_status\"")
+                    case None => ()
+                }
+                gatewayMarkCurrentToolRuntimeVisibleReplyDelivered()
+                "<SILENT_REPLY>"
+        }))
+        try {
+            let store = GatewaySessionStore(Path("."), enabled: false, agentId: "general")
+            let bridge = AgentBridge(sessionStore: store)
+            let result = gatewayExecuteSessionTurn(
+                bridge,
+                gatewaySessionTurnGuardContext("feishu"),
+                "status",
+                deliver: true,
+                streamingEnabled: true,
+                toolRuntimeContext: Some(runtimeContext),
+                deliverHook: Some({
+                    _channelName: String,
+                    _accountId: String,
+                    _peerId: String,
+                    text: String,
+                    _replyToMessageId: Option<String>,
+                    _replyInThread: Bool =>
+                        sentTexts.add(text)
+                        "m-${sentTexts.size}"
+                })
+            )
+
+            @Expect(result.delivered, true)
+            @Expect(result.deliveryStatus, "delivered-by-tool")
+            @Expect(sentTexts.size, 0)
+        } finally {
+            setGatewayAgentBridgeReplyRunnerForTest(None<(String, String, String, String, Bool, Option<(String) -> Unit>) -> String>)
+        }
+    }
+
+    @TestCase
+    public func feishuFinalDeliveryStripsToolXmlAndKeepsCodeExample(): Unit {
+        let sentTexts = ArrayList<String>()
+        let raw = "开头\n<tool_call>\n{\"name\":\"session_status\",\"arguments\":{\"text\":\"literal </tool_call> inside\"}}\n</tool_call>\n结尾\n```xml\n<tool_call>{\"name\":\"session_status\"}</tool_call>\n```"
+        setGatewayAgentBridgeReplyRunnerForTest(Some({
+            _conversationKey: String,
+            _prompt: String,
+            _channelName: String,
+            _agentId: String,
+            _streamingEnabled: Bool,
+            _streamChunkHook: Option<(String) -> Unit> => raw
+        }))
+        try {
+            let store = GatewaySessionStore(Path("."), enabled: false, agentId: "general")
+            let bridge = AgentBridge(sessionStore: store)
+            let result = gatewayExecuteSessionTurn(
+                bridge,
+                gatewaySessionTurnGuardContext("feishu"),
+                "xml",
+                deliver: true,
+                deliverHook: Some({
+                    _channelName: String,
+                    _accountId: String,
+                    _peerId: String,
+                    text: String,
+                    _replyToMessageId: Option<String>,
+                    _replyInThread: Bool =>
+                        sentTexts.add(text)
+                        "m-${sentTexts.size}"
+                })
+            )
+
+            @Expect(result.delivered, true)
+            @Expect(sentTexts.size, 1)
+            @Expect(sentTexts[0].contains("开头"), true)
+            @Expect(sentTexts[0].contains("结尾"), true)
+            @Expect(sentTexts[0].contains("```xml\n<tool_call>{\"name\":\"session_status\"}</tool_call>\n```"), true)
+            @Expect(sentTexts[0].contains("\"arguments\""), false)
+            @Expect(sentTexts[0].contains("literal </tool_call> inside"), false)
+        } finally {
+            setGatewayAgentBridgeReplyRunnerForTest(None<(String, String, String, String, Bool, Option<(String) -> Unit>) -> String>)
+        }
+    }
+
+    @TestCase
+    public func qqNormalStreamingTextKeepsDeliveryCadence(): Unit {
+        let sentTexts = ArrayList<String>()
+        let finalText = "第一段" + gatewaySessionTurnRepeatText("继续增长", 20)
+        setGatewayAgentBridgeReplyRunnerForTest(Some({
+            _conversationKey: String,
+            _prompt: String,
+            _channelName: String,
+            _agentId: String,
+            _streamingEnabled: Bool,
+            streamChunkHook: Option<(String) -> Unit> =>
+                match (streamChunkHook) {
+                    case Some(notify) =>
+                        notify("第一段")
+                        notify(finalText)
+                    case None => ()
+                }
+                finalText
+        }))
+        try {
+            let store = GatewaySessionStore(Path("."), enabled: false, agentId: "general")
+            let bridge = AgentBridge(sessionStore: store)
+            let result = gatewayExecuteSessionTurn(
+                bridge,
+                gatewaySessionTurnGuardContext("qq"),
+                "stream",
+                deliver: true,
+                streamingEnabled: true,
+                deliverHook: Some({
+                    _channelName: String,
+                    _accountId: String,
+                    _peerId: String,
+                    text: String,
+                    _replyToMessageId: Option<String>,
+                    _replyInThread: Bool =>
+                        sentTexts.add(text)
+                        "m-${sentTexts.size}"
+                })
+            )
+
+            @Expect(result.delivered, true)
+            @Expect(sentTexts.size, 2)
+            @Expect(sentTexts[0], "第一段")
+            @Expect(sentTexts[1], finalText)
+        } finally {
+            setGatewayAgentBridgeReplyRunnerForTest(None<(String, String, String, String, Bool, Option<(String) -> Unit>) -> String>)
+        }
+    }
+
+    @TestCase
+    public func feishuHarmonyToolLeakIsSuppressedAndFinalUsesFallback(): Unit {
+        let sentTexts = ArrayList<String>()
+        let leaked = "assistant to=functions.exec_command {cmd:redacted}"
+        setGatewayAgentBridgeReplyRunnerForTest(Some({
+            _conversationKey: String,
+            _prompt: String,
+            _channelName: String,
+            _agentId: String,
+            _streamingEnabled: Bool,
+            streamChunkHook: Option<(String) -> Unit> =>
+                match (streamChunkHook) {
+                    case Some(notify) => notify(leaked)
+                    case None => ()
+                }
+                leaked
+        }))
+        try {
+            let store = GatewaySessionStore(Path("."), enabled: false, agentId: "general")
+            let bridge = AgentBridge(sessionStore: store)
+            let result = gatewayExecuteSessionTurn(
+                bridge,
+                gatewaySessionTurnGuardContext("feishu"),
+                "run",
+                deliver: true,
+                streamingEnabled: true,
+                deliverHook: Some({
+                    _channelName: String,
+                    _accountId: String,
+                    _peerId: String,
+                    text: String,
+                    _replyToMessageId: Option<String>,
+                    _replyInThread: Bool =>
+                        sentTexts.add(text)
+                        "m-${sentTexts.size}"
+                })
+            )
+
+            @Expect(result.delivered, true)
+            @Expect(sentTexts.size, 1)
+            @Expect(sentTexts[0].contains("工具调用协议"), true)
+            @Expect(sentTexts[0].contains("to=functions"), false)
         } finally {
             setGatewayAgentBridgeReplyRunnerForTest(None<(String, String, String, String, Bool, Option<(String) -> Unit>) -> String>)
         }

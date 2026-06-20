@@ -3,6 +3,7 @@ package metis.gateway.core
 import metis.core.{GatewayToolRuntimeContext, gatewaySpeechResolveDeliveryPrefs, gatewaySpeechResolveTtsConfig, gatewaySpeechTtsSynthesize, gatewayWithToolRuntimeContext}
 import metis.core.renderGatewayEditText
 import metis.core.config.{CliConfig, CliSettingManager}
+import metis.gateway.reply_guard.{normalizeGatewayAssistantVisibleTextForDelivery, stripAssistantToolXmlBlocks}
 import metis.gateway.session.GatewaySessionContext
 
 import std.core.Duration
@@ -80,7 +81,24 @@ private func gatewayVisibleDeliveryText(channelName: String, raw: String): Strin
     } else {
         raw
     }
-    gatewayStripInternalDeliveryDirectives(visible)
+    gatewayGuardVisibleDeliveryText(gatewayStripInternalDeliveryDirectives(visible))
+}
+
+private func gatewayVisiblePartialDeliveryText(channelName: String, raw: String): String {
+    let visible = if (channelName.trimAscii().toAsciiLower() == "telegram") {
+        gatewayStripTaggedReasoning(raw)
+    } else {
+        raw
+    }
+    gatewayGuardVisibleDeliveryText(gatewayStripInternalDeliveryDirectives(visible), partial: true)
+}
+
+private func gatewayGuardVisibleDeliveryText(raw: String, partial!: Bool = false): String {
+    let visible = stripAssistantToolXmlBlocks(raw)
+    if (visible.trimAscii().isEmpty()) {
+        return ""
+    }
+    normalizeGatewayAssistantVisibleTextForDelivery(visible, partial: partial).text.trimAscii()
 }
 
 private func gatewayIsSilentReplyText(text: String): Bool {
@@ -576,7 +594,7 @@ public func gatewayExecuteSessionTurn(
             toolRuntimeContext: toolRuntimeContext,
             streamingEnabled: streamingEnabled,
             streamChunkHook: Some({ currentText =>
-            let visibleText = gatewayVisibleDeliveryText(context.channelName, currentText)
+            let visibleText = gatewayVisiblePartialDeliveryText(context.channelName, currentText)
             let normalized = visibleText.trimAscii()
             match (streamHook) {
                 case Some(notify) => notify(context, currentText)
