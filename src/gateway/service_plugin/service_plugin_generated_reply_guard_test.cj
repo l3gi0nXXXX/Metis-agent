@@ -204,4 +204,56 @@ public class ServicePluginGeneratedReplyGuardTest {
         @Expect(camelToolCalls.ok, false)
         @Expect(camelToolCalls.status, "draft_forbidden_marker")
     }
+
+    @TestCase
+    public func draftM5B001TerminalAnswerEnvelopeStillNeedsHumanReview(): Unit {
+        // T5-B-001.
+        let result = validateServicePluginGeneratedDraft("{\"name\":\"answer\",\"arguments\":{\"result\":\"建议补充测试。\"}}")
+
+        @Expect(result.ok, false)
+        @Expect(result.status, "draft_invalid_tool_json")
+        @Expect(result.draft, "")
+        @Expect(result.needsHumanReview, true)
+    }
+
+    @TestCase
+    public func draftM5P001NormalChineseDraftStillPasses(): Unit {
+        // T5-P-001.
+        let result = validateServicePluginGeneratedDraft("建议补充中文回归测试，保持人工审核路径。")
+
+        @Expect(result.ok, true)
+        @Expect(result.status, "draft_generated")
+        @Expect(result.draft, "建议补充中文回归测试，保持人工审核路径。")
+        @Expect(result.needsHumanReview, false)
+    }
+
+    @TestCase
+    public func draftM5N001ToolJsonRawJsonScalarAndFenceKeepStatuses(): Unit {
+        // T5-N-001.
+        let toolObject = validateServicePluginGeneratedDraft("{\"tool\":\"functions._answer_\",\"arguments\":{\"answer\":\"草稿\"}}")
+        let toolArray = validateServicePluginGeneratedDraft("[{\"name\":\"session_status\",\"arguments\":{}}]")
+        let rawObject = validateServicePluginGeneratedDraft("{\"draft\":\"建议补充测试\"}")
+        let rawArray = validateServicePluginGeneratedDraft("[\"建议补充测试\"]")
+        let rawScalar = validateServicePluginGeneratedDraft("\"建议补充测试\"")
+        let jsonFence = validateServicePluginGeneratedDraft("```json\n{\"draft\":\"建议补充测试\"}\n```")
+
+        @Expect(toolObject.ok, false)
+        @Expect(toolObject.status, "draft_invalid_tool_json")
+        @Expect(toolObject.needsHumanReview, true)
+        @Expect(toolArray.ok, false)
+        @Expect(toolArray.status, "draft_invalid_tool_json")
+        @Expect(toolArray.needsHumanReview, true)
+        @Expect(rawObject.ok, false)
+        @Expect(rawObject.status, "draft_raw_json")
+        @Expect(rawObject.needsHumanReview, true)
+        @Expect(rawArray.ok, false)
+        @Expect(rawArray.status, "draft_raw_json")
+        @Expect(rawArray.needsHumanReview, true)
+        @Expect(rawScalar.ok, false)
+        @Expect(rawScalar.status, "draft_raw_json_scalar")
+        @Expect(rawScalar.needsHumanReview, true)
+        @Expect(jsonFence.ok, false)
+        @Expect(jsonFence.status, "draft_forbidden_marker")
+        @Expect(jsonFence.needsHumanReview, true)
+    }
 }
