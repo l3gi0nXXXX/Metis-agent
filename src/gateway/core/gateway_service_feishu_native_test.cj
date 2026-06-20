@@ -102,6 +102,13 @@ private class GatewayFeishuNativeTestAdapter <: ChannelAdapter {
         }
     }
 
+    public func sentReplyTo(index: Int64): String {
+        match (this.sent.get(index)) {
+            case Some(v) => v.replyToMessageId ?? ""
+            case None => ""
+        }
+    }
+
     public func sentCount(): Int64 {
         this.sent.size
     }
@@ -121,6 +128,19 @@ private func gatewayFeishuNativeTestRoot(appSecret!: String = ""): JsonObject {
     root.put("gateway", gateway)
     root.put("agents", JsonArray([]))
     root.put("bindings", JsonArray([]))
+    root
+}
+
+private func gatewayFeishuNativeAckRoot(enabled: Bool, removeAfterReply!: Bool = true): JsonObject {
+    let root = gatewayFeishuNativeTestRoot()
+    let gateway = root.get("gateway").getOrThrow().asObject()
+    let feishu = gateway.get("feishu").getOrThrow().asObject()
+    let ack = JsonObject()
+    ack.put("enabled", JsonBool(enabled))
+    ack.put("reaction", JsonString("敲键盘"))
+    ack.put("removeAfterReply", JsonBool(removeAfterReply))
+    ack.put("scope", JsonString("handled"))
+    feishu.put("ack", ack)
     root
 }
 
@@ -995,6 +1015,86 @@ public class GatewayServiceFeishuNativeTest {
             } finally {
                 service.stop()
                 setGatewayFeishuNativeAuthRunnerForTest(None<(String, GatewayUserSettings) -> JsonObject>)
+            }
+        })
+    }
+
+    @TestCase
+    public func feishuAckLifecycleAddsReplyAndRemovesTypingReaction(): Unit {
+        withGatewayFeishuNativeTestHome("ack-lifecycle", gatewayFeishuNativeAckRoot(true), { =>
+            let adapter = GatewayFeishuNativeTestAdapter()
+            let service = gatewayFeishuNativeService(adapter)
+            setGatewayAgentBridgeReplyRunnerForTest(Some({
+                _sessionKey: String,
+                _prompt: String,
+                _channelName: String,
+                _agentId: String,
+                _streamingEnabled: Bool,
+                _streamChunkHook: Option<(String) -> Unit> =>
+                    "feishu final answer"
+            }))
+            service.start()
+            try {
+                adapter.queueDirect("hello")
+                service.processOnce()
+
+                @Expect(adapter.sentCount(), 3)
+                @Expect(adapter.sentText(0), "[reaction]\ntoken=Typing\nrender=Typing")
+                @Expect(adapter.sentReplyTo(0), "om-0")
+                @Expect(adapter.sentText(1), "feishu final answer")
+                @Expect(adapter.sentText(2), "[reaction]\nremove=true\ntoken=Typing\nrender=Typing")
+                @Expect(adapter.sentReplyTo(2), "om-0")
+            } finally {
+                service.stop()
+                setGatewayAgentBridgeReplyRunnerForTest(None<(String, String, String, String, Bool, Option<(String) -> Unit>) -> String>)
+            }
+        })
+    }
+
+    @TestCase
+    public func feishuAckLifecycleKeepsReactionWhenRemovalDisabled(): Unit {
+        withGatewayFeishuNativeTestHome("ack-no-remove", gatewayFeishuNativeAckRoot(true, removeAfterReply: false), { =>
+            let adapter = GatewayFeishuNativeTestAdapter()
+            let service = gatewayFeishuNativeService(adapter)
+            setGatewayAgentBridgeReplyRunnerForTest(Some({
+                _sessionKey: String,
+                _prompt: String,
+                _channelName: String,
+                _agentId: String,
+                _streamingEnabled: Bool,
+                _streamChunkHook: Option<(String) -> Unit> =>
+                    "feishu final answer"
+            }))
+            service.start()
+            try {
+                adapter.queueDirect("hello")
+                service.processOnce()
+
+                @Expect(adapter.sentCount(), 2)
+                @Expect(adapter.sentText(0), "[reaction]\ntoken=Typing\nrender=Typing")
+                @Expect(adapter.sentText(1), "feishu final answer")
+            } finally {
+                service.stop()
+                setGatewayAgentBridgeReplyRunnerForTest(None<(String, String, String, String, Bool, Option<(String) -> Unit>) -> String>)
+            }
+        })
+    }
+
+    @TestCase
+    public func feishuNativeCommandDoesNotEmitAckReaction(): Unit {
+        withGatewayFeishuNativeTestHome("ack-command", gatewayFeishuNativeAckRoot(true), { =>
+            let adapter = GatewayFeishuNativeTestAdapter()
+            let service = gatewayFeishuNativeService(adapter)
+            service.start()
+            try {
+                adapter.queueDirect("/feishu doctor")
+                service.processOnce()
+
+                @Expect(adapter.sentCount(), 1)
+                @Expect(adapter.sentText(0).contains("[reaction]"), false)
+                @Expect(adapter.sentText(0).contains("Metis Feishu doctor"), true)
+            } finally {
+                service.stop()
             }
         })
     }
