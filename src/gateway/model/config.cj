@@ -1003,6 +1003,25 @@ public class FeishuMediaConfig {
     }
 }
 
+public class FeishuAckConfig {
+    public let enabled: Bool
+    public let reaction: String
+    public let removeAfterReply: Bool
+    public let scope: String
+
+    public init(
+        enabled!: Bool = false,
+        reaction!: String = "Typing",
+        removeAfterReply!: Bool = true,
+        scope!: String = "handled"
+    ) {
+        this.enabled = enabled
+        this.reaction = if (reaction.trimAscii().isEmpty()) { "Typing" } else { reaction.trimAscii() }
+        this.removeAfterReply = removeAfterReply
+        this.scope = if (scope.trimAscii().isEmpty()) { "handled" } else { scope.trimAscii().toAsciiLower() }
+    }
+}
+
 public class FeishuConfig {
     public let accountId: String
     public let defaultAccount: String
@@ -1040,6 +1059,7 @@ public class FeishuConfig {
     public let replyInThread: String
     public let requireSignatureHeaders: Bool
     public let requestMaxSkewSeconds: Int64
+    public let ack: FeishuAckConfig
     public let media: FeishuMediaConfig
     public let policy: ChannelPolicyConfig
 
@@ -1073,6 +1093,7 @@ public class FeishuConfig {
         replyInThread!: String = "disabled",
         requireSignatureHeaders!: Bool = true,
         requestMaxSkewSeconds!: Int64 = 300,
+        ack!: FeishuAckConfig = FeishuAckConfig(),
         media!: FeishuMediaConfig = FeishuMediaConfig(),
         policy!: ChannelPolicyConfig = ChannelPolicyConfig()
     ) {
@@ -1105,6 +1126,7 @@ public class FeishuConfig {
         this.replyInThread = replyInThread
         this.requireSignatureHeaders = requireSignatureHeaders
         this.requestMaxSkewSeconds = requestMaxSkewSeconds
+        this.ack = ack
         this.media = media
         this.policy = policy
     }

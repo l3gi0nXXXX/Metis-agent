@@ -329,6 +329,12 @@ private func mergeFeishu(fs: FeishuUserSettings): FeishuConfig {
         replyInThread: replyInThread,
         requireSignatureHeaders: fs.requireSignatureHeaders,
         requestMaxSkewSeconds: fs.requestMaxSkewSeconds,
+        ack: FeishuAckConfig(
+            enabled: fs.ack.enabled,
+            reaction: fs.ack.reaction,
+            removeAfterReply: fs.ack.removeAfterReply,
+            scope: fs.ack.scope
+        ),
         media: FeishuMediaConfig(
             downloadEnabled: fs.media.downloadEnabled,
             mediaMaxBytes: fs.media.mediaMaxBytes,
