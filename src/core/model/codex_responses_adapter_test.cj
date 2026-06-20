@@ -130,6 +130,22 @@ private func m2FunctionCall(name: String, args: String): JsonObject {
     return item
 }
 
+private func m2ResponseFromOutput(output: JsonArray): JsonObject {
+    let response = JsonObject()
+    response.put("model", JsonString("gpt-5.5"))
+    response.put("status", JsonString("completed"))
+    response.put("output", output)
+    return response
+}
+
+private func m2ResponseFromOutputText(text: String): JsonObject {
+    let response = JsonObject()
+    response.put("model", JsonString("gpt-5.5"))
+    response.put("status", JsonString("completed"))
+    response.put("output_text", JsonString(text))
+    return response
+}
+
 private func m2CompletedEvent(output: JsonArray): JsonObject {
     let response = JsonObject()
     response.put("model", JsonString("gpt-5.5"))
@@ -258,6 +274,39 @@ public class CodexResponsesAdapterTest {
     }
 
     @TestCase
+    public func r1U001StructuredFunctionCallStillReturnsToolCalls(): Unit {
+        let output = JsonArray()
+        output.add(m2FunctionCall("search", "{\"query\":\"cangjie\"}"))
+        let normalized = codexNormalizeResponses(m2ResponseFromOutput(output))
+        @Expect(normalized.toolRequests.size, 1)
+        @Expect(normalized.toolRequests[0].name, "search")
+        @Expect(normalized.finishReason, "tool_calls")
+    }
+
+    @TestCase
+    public func r1U002LeakedToolProtocolTextBecomesIncompleteAndRedacted(): Unit {
+        let normalized = codexNormalizeResponses(
+            m2ResponseFromOutputText("assistant to=functions.search {\"query\":\"cangjie\"}")
+        )
+        @Expect(normalized.toolRequests.size, 0)
+        @Expect(normalized.finishReason, "incomplete")
+        @Expect(normalized.content.contains("functions.search"), false)
+    }
+
+    @TestCase
+    public func r1B001OrdinaryChineseAndJsonDraftsAreNotMisclassified(): Unit {
+        let chineseDraft = "这是普通中文草稿，提到工具二字，但不是工具调用协议。"
+        let normalizedChinese = codexNormalizeResponses(m2ResponseFromOutputText(chineseDraft))
+        @Expect(normalizedChinese.finishReason, "stop")
+        @Expect(normalizedChinese.content, chineseDraft)
+
+        let jsonDraft = "{\"summary\":\"这是普通 JSON 草稿\",\"tool\":\"普通工具说明\"}"
+        let normalizedJson = codexNormalizeResponses(m2ResponseFromOutputText(jsonDraft))
+        @Expect(normalizedJson.finishReason, "stop")
+        @Expect(normalizedJson.content, jsonDraft)
+    }
+
+    @TestCase
     public func m2U3U5U6HistoryProviderDataRoundTripAndSanitize(): Unit {
         let messages = JsonArray()
         let assistant = JsonObject()
@@ -372,6 +421,54 @@ public class CodexResponsesAdapterTest {
         idle.put("gap_seconds", JsonFloat(60.0))
         @Expect(codexResponsesWatchdogDecision([first, idle], idleTimeoutSeconds: 45.0).closeReason, "codex_stream_idle_kill")
         @Expect(codexResponsesRunStreamWithWatchdog([first]).statusCode, 200)
+    }
+
+    @TestCase
+    public func r1P001ChatModelContinuesAfterLeakedProtocolText(): Unit {
+        m2ResetHttpCapture()
+        setCodexResponsesHttpRunnerForTest(Some({ request: CodexResponsesHttpRequest =>
+            m2CallCount += 1
+            m2LastRequestBody = request.body
+            let output = JsonArray()
+            if (m2CallCount == 1) {
+                output.add(m2MessageItem("assistant to=functions.search {\"query\":\"cangjie\"}"))
+            } else {
+                output.add(m2MessageItem("最终答复"))
+            }
+            CodexResponsesHttpResult(200, streamEvents: [m2CompletedEvent(output)])
+        }))
+        try {
+            let model = CodexResponsesChatModel("gpt-5.5", "https://chatgpt.example/backend", "test-token", sessionId: "session-a")
+            let response = model.create(ChatRequest("请检索仓颉文档", tools: [M2FakeTool()]))
+            @Expect(response.message.content, "最终答复")
+            @Expect(response.toolRequests.size, 0)
+            @Expect(m2CallCount, 2)
+        } finally {
+            setCodexResponsesHttpRunnerForTest(None<CodexResponsesHttpRunner>)
+        }
+    }
+
+    @TestCase
+    public func r1N001ChatModelThrowsWhenLeakedProtocolDoesNotConverge(): Unit {
+        m2ResetHttpCapture()
+        setCodexResponsesHttpRunnerForTest(Some({ request: CodexResponsesHttpRequest =>
+            m2CallCount += 1
+            m2LastRequestBody = request.body
+            let output = JsonArray()
+            output.add(m2MessageItem("assistant to=functions.search {\"query\":\"cangjie\"}"))
+            CodexResponsesHttpResult(200, streamEvents: [m2CompletedEvent(output)])
+        }))
+        var code = ""
+        try {
+            let model = CodexResponsesChatModel("gpt-5.5", "https://chatgpt.example/backend", "test-token", sessionId: "session-a")
+            let _ = model.create(ChatRequest("请检索仓颉文档", tools: [M2FakeTool()]))
+        } catch (ex: CodexResponsesException) {
+            code = ex.code
+        } finally {
+            setCodexResponsesHttpRunnerForTest(None<CodexResponsesHttpRunner>)
+        }
+        @Expect(code, "tool_protocol_unfinalized")
+        @Expect(m2CallCount, 3)
     }
 
     @TestCase

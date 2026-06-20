@@ -1,8 +1,9 @@
 package metis.core.model
 
-import magic.core.message.Message
+import magic.core.message.{Message, MessageRole}
 import magic.core.model.{AsyncChatResponse, ChatModel, ChatRequest, ChatResponse}
 
+import std.collection.ArrayList
 import stdx.encoding.json.{JsonInt, JsonObject}
 
 public class CodexResponsesChatModel <: ChatModel {
@@ -87,16 +88,16 @@ public class CodexResponsesChatModel <: ChatModel {
         }
     }
 
-    override public func create(request: ChatRequest): ChatResponse {
+    private func normalizeRequest(request: ChatRequest): CodexResponsesNormalized {
         let payload = this.buildPayload(request)
         if (this.usesCodexStreamingBackend) {
-            return this.createFromNormalized(this.client.streamResponses(
+            return this.client.streamResponses(
                 this.baseUrl,
                 this.accessToken,
                 payload,
                 extraHeaders: codexResponsesExtraHeaders(this.sessionId),
                 model: this.name
-            ))
+            )
         }
         let response = this.client.postResponses(
             this.baseUrl,
@@ -108,6 +109,62 @@ public class CodexResponsesChatModel <: ChatModel {
             response,
             issuerKind: codexResponsesIssuerKind(this.provider, baseUrl: this.baseUrl)
         )
+        return normalized
+    }
+
+    private func lastUserPrompt(request: ChatRequest): String {
+        var prompt = ""
+        for (message in request.messageList) {
+            if (message.role == MessageRole.User) {
+                prompt = message.content
+            }
+        }
+        return prompt
+    }
+
+    private func continuationRequest(request: ChatRequest, previousContent: String, attempt: Int64): ChatRequest {
+        let messages = ArrayList<Message>()
+        for (message in request.messageList) {
+            messages.add(message)
+        }
+        if (!previousContent.trimAscii().isEmpty()) {
+            messages.add(Message.assistant(previousContent))
+        }
+        messages.add(Message.user(codexContinuationPrompt(previousContent, attempt)))
+        return ChatRequest(
+            messages.toArray(),
+            temperature: request.temperature,
+            stop: request.stop,
+            tools: request.tools,
+            maxTokens: request.maxTokens
+        )
+    }
+
+    private func continuationNeeded(originalRequest: ChatRequest, normalized: CodexResponsesNormalized): Bool {
+        if (normalized.toolRequests.size > 0) {
+            return false
+        }
+        if (normalized.finishReason == "incomplete") {
+            return true
+        }
+        return codexContinuationNeeded(this.lastUserPrompt(originalRequest), normalized.content, normalized.toolRequests.size)
+    }
+
+    override public func create(request: ChatRequest): ChatResponse {
+        var currentRequest = request
+        var normalized = this.normalizeRequest(currentRequest)
+        var attempt: Int64 = 0
+        while (this.continuationNeeded(request, normalized) && attempt < 2) {
+            attempt += 1
+            currentRequest = this.continuationRequest(currentRequest, normalized.content, attempt)
+            normalized = this.normalizeRequest(currentRequest)
+        }
+        if (normalized.finishReason == "incomplete" && normalized.toolRequests.size == 0) {
+            throw CodexResponsesException(
+                "tool_protocol_unfinalized",
+                "Codex Responses did not converge to a structured tool call or final assistant text"
+            )
+        }
         return this.createFromNormalized(normalized)
     }
 

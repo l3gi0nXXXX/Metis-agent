@@ -556,6 +556,61 @@ private func codexReadTextFromContent(content: JsonArray, outputOnly!: Bool = fa
     return builder.toString()
 }
 
+private func codexJsonObjectLooksLikeLeakedToolProtocolText(obj: JsonObject): Bool {
+    if (crJsonString(obj, "tool").startsWith("functions.")) {
+        return true
+    }
+    let itemType = crJsonString(obj, "type")
+    if ((itemType == "function_call" || itemType == "custom_tool_call") && !crJsonString(obj, "name").isEmpty()) {
+        return true
+    }
+    if (let Some(toolCalls) <- obj.get("tool_calls")) {
+        try {
+            return toolCalls.asArray().size() > 0
+        } catch (_: Exception) { () }
+    }
+    if (let Some(functionCall) <- obj.get("function_call")) {
+        try {
+            return !functionCall.asObject().getFields().isEmpty()
+        } catch (_: Exception) { () }
+    }
+    return false
+}
+
+private func codexJsonLooksLikeLeakedToolProtocolText(content: String): Bool {
+    let value = try { JsonValue.fromStr(content) } catch (_: Exception) { return false }
+    try {
+        return codexJsonObjectLooksLikeLeakedToolProtocolText(value.asObject())
+    } catch (_: Exception) { () }
+    try {
+        for (itemValue in value.asArray().getItems()) {
+            let item = try { itemValue.asObject() } catch (_: Exception) { continue }
+            if (codexJsonObjectLooksLikeLeakedToolProtocolText(item)) {
+                return true
+            }
+        }
+    } catch (_: Exception) { () }
+    return false
+}
+
+private func codexLooksLikeLeakedToolProtocolText(content: String): Bool {
+    let text = content.trimAscii()
+    if (text.isEmpty()) {
+        return false
+    }
+    let lower = text.toAsciiLower()
+    if ((lower.startsWith("assistant to=functions.") || lower.startsWith("to=functions.")) && lower.contains("{")) {
+        return true
+    }
+    if ((lower.startsWith("tool_calls") || lower.startsWith("function_call")) && lower.contains("{")) {
+        return true
+    }
+    if ((lower.startsWith("{") && lower.endsWith("}")) || (lower.startsWith("[") && lower.endsWith("]"))) {
+        return codexJsonLooksLikeLeakedToolProtocolText(text)
+    }
+    return false
+}
+
 private func codexNormalizeOutputItem(
     item: JsonObject,
     issuerKind: String,
@@ -635,8 +690,12 @@ public func codexNormalizeResponses(
         codexNormalizeOutputItem(item, issuerKind, content, reasoningItems, messageItems, toolRequests)
     }
 
+    var normalizedContent = content.toString()
     let finish = if (toolRequests.size > 0) {
         "tool_calls"
+    } else if (codexLooksLikeLeakedToolProtocolText(normalizedContent)) {
+        normalizedContent = ""
+        "incomplete"
     } else if (status == "incomplete") {
         "incomplete"
     } else {
@@ -644,7 +703,7 @@ public func codexNormalizeResponses(
     }
     return CodexResponsesNormalized(
         crJsonString(response, "model"),
-        content.toString(),
+        normalizedContent,
         toolRequests.toArray(),
         reasoningItems,
         messageItems,
