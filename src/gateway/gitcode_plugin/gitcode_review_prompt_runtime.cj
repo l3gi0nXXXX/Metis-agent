@@ -93,14 +93,15 @@ public func buildGitCodeReviewPromptForRequestWithRuntimeConfig(
             diagnostic: if (route.diagnostic.isEmpty()) { route.route } else { route.diagnostic }
         )
     }
-    let ckbContext = resolveGitCodeCkbContextForRequest(request, config)
-    let input = buildGitCodeReviewPromptInput(request, ckbContext: ckbContext)
+    let effectiveRequest = gitCodeReviewRequestWithCommentRoutePolicy(request, route.task)
+    let ckbContext = resolveGitCodeCkbContextForRequest(effectiveRequest, config)
+    let input = buildGitCodeReviewPromptInput(effectiveRequest, ckbContext: ckbContext)
     let templateId = match (route.route) {
         case "issue_bug" => "issue_bug"
         case "issue_feature" => "issue_feature_request"
         case "issue_question" => "issue_question"
         case "comment_reply" => "comment_reply"
-        case "pr_review" => gitCodeReviewPrPromptTemplateId(request)
+        case "pr_review" => gitCodeReviewPrPromptTemplateId(effectiveRequest)
         case _ => ""
     }
     if (templateId.isEmpty()) {
@@ -113,7 +114,7 @@ public func buildGitCodeReviewPromptForRequestWithRuntimeConfig(
         case "comment_reply" => buildCommentPrompt(input, templates, outputMode: outputMode)
         case "pr_chinese" => buildPrChinesePrompt(input, templates, outputMode: outputMode)
         case "pr_english" => buildPrEnglishPrompt(input, templates, outputMode: outputMode)
-        case _ => legacyGitCodeReplyPromptForServicePluginEvent(servicePluginEventFromRequest(request))
+        case _ => legacyGitCodeReplyPromptForServicePluginEvent(servicePluginEventFromRequest(effectiveRequest))
     }
     let template = templates.get(templateId)
     GitCodeReviewPromptPlan(
@@ -126,6 +127,57 @@ public func buildGitCodeReviewPromptForRequestWithRuntimeConfig(
         expectsJsonOutput: !gitCodePromptUsesPlainDraftOutput(outputMode),
         needsHumanReview: route.needsHumanReview || ckbContext.needsHumanReview,
         diagnostic: template.reason
+    )
+}
+
+private func gitCodeReviewRequestWithCommentRoutePolicy(
+    request: GitCodeReviewRequest,
+    task: GitCodeReviewTask
+): GitCodeReviewRequest {
+    if (request.eventType != "comment" ||
+        (request.requiresCkb == task.requiresCkb &&
+            request.requiresSourceWorkspace == task.requiresSourceWorkspace &&
+            request.requiresCodeReview == task.requiresCodeReview &&
+            request.needsHumanReview == task.needsHumanReview)) {
+        return request
+    }
+    GitCodeReviewRequest(
+        contractVersion: request.contractVersion,
+        schemaVersion: request.schemaVersion,
+        legacy: request.legacy,
+        eventId: request.eventId,
+        eventType: request.eventType,
+        action: request.action,
+        repoFullName: request.repoFullName,
+        repoOrg: request.repoOrg,
+        repoName: request.repoName,
+        number: request.number,
+        commentId: request.commentId,
+        url: request.url,
+        title: request.title,
+        author: request.author,
+        content: request.content,
+        issueKind: request.issueKind,
+        cjcVersion: request.cjcVersion,
+        branchVersions: request.branchVersions,
+        buildSelfCheck: request.buildSelfCheck,
+        testSelfCheck: request.testSelfCheck,
+        changedFiles: request.changedFiles,
+        reviewFindings: request.reviewFindings,
+        teamLeaders: request.teamLeaders,
+        codeowners: request.codeowners,
+        commentBody: request.commentBody,
+        parentUrl: request.parentUrl,
+        requiresCkb: task.requiresCkb,
+        requiresSourceWorkspace: task.requiresSourceWorkspace,
+        requiresCodeReview: task.requiresCodeReview,
+        contentRedacted: request.contentRedacted,
+        needsHumanReview: task.needsHumanReview,
+        diagnostics: request.diagnostics,
+        routeHint: request.routeHint,
+        draftContext: request.draftContext,
+        hasDiscussionContext: request.hasDiscussionContext,
+        discussionContext: request.discussionContext
     )
 }
 
