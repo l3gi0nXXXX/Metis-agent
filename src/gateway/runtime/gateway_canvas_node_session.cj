@@ -4,32 +4,66 @@ import magic.jsonable.*
 
 import metis.gateway.model.GatewayConfig
 
-import std.collection.HashMap
+import std.collection.{ArrayList, HashMap}
 import std.convert.Parsable
 import std.random.Random
 import std.sync.Mutex
 import std.time.DateTime
-import stdx.encoding.json.{JsonObject, JsonString}
+import stdx.encoding.json.{JsonArray, JsonObject, JsonString}
 
 public class GatewayCanvasNodeSessionState {
     public let nodeId: String
     public let role: String
     public let capabilities: Array<String>
+    public let commands: Array<String>
+    public let connected: Bool
+    public let connectedAtMs: Int64
+    public let lastSeenAtMs: Int64
     public let expiresAtMs: Int64
     public let canvasHostUrl: String
+    public let connectionId: String
 
     public init(
         nodeId: String,
         role!: String = "node",
         capabilities!: Array<String> = [],
+        commands!: Array<String> = [],
+        connected!: Bool = true,
+        connectedAtMs!: Int64 = 0,
+        lastSeenAtMs!: Int64 = 0,
         expiresAtMs!: Int64 = 0,
-        canvasHostUrl!: String = ""
+        canvasHostUrl!: String = "",
+        connectionId!: String = ""
     ) {
         this.nodeId = nodeId
         this.role = role
         this.capabilities = capabilities
+        this.commands = commands
+        this.connected = connected
+        this.connectedAtMs = connectedAtMs
+        this.lastSeenAtMs = lastSeenAtMs
         this.expiresAtMs = expiresAtMs
         this.canvasHostUrl = canvasHostUrl
+        this.connectionId = connectionId
+    }
+}
+
+public class GatewayCanvasNodeLookupResult {
+    public let ok: Bool
+    public let state: GatewayCanvasNodeSessionState
+    public let errorCode: String
+    public let error: String
+
+    public init(
+        ok: Bool,
+        state!: GatewayCanvasNodeSessionState = GatewayCanvasNodeSessionState(""),
+        errorCode!: String = "",
+        error!: String = ""
+    ) {
+        this.ok = ok
+        this.state = state
+        this.errorCode = errorCode
+        this.error = error
     }
 }
 
@@ -90,11 +124,35 @@ public func debugGatewayCanvasMintCapabilityTokenForTest(): String {
 }
 
 private func gatewayCanvasSessionActive(state: GatewayCanvasNodeSessionState, now: Int64): Bool {
-    !state.nodeId.trimAscii().isEmpty() && state.expiresAtMs > now
+    state.connected && !state.nodeId.trimAscii().isEmpty() && state.expiresAtMs > now
 }
 
 private func gatewayCanvasSessionCanUseCanvas(state: GatewayCanvasNodeSessionState): Bool {
     state.role.trimAscii().toAsciiLower() == "node" && state.capabilities.contains("canvas")
+}
+
+private func gatewayCanvasSessionSupportsCommand(state: GatewayCanvasNodeSessionState, command: String): Bool {
+    state.commands.contains(command.trimAscii())
+}
+
+private func gatewayCanvasStringArrayParam(request: GatewayRpcRequest, key: String): Array<String> {
+    match (request.params.get(key)) {
+        case Some(v) =>
+            try {
+                let arr = v.asArray()
+                let out = ArrayList<String>()
+                for (item in arr.getItems()) {
+                    let text = item.asString().getValue().trimAscii()
+                    if (!text.isEmpty() && !out.contains(text)) {
+                        out.add(text)
+                    }
+                }
+                out.toArray()
+            } catch (_: Exception) {
+                []
+            }
+        case None => []
+    }
 }
 
 private func gatewayCanvasStringParam(request: GatewayRpcRequest, key: String, fallback: String): String {
@@ -121,6 +179,7 @@ public func debugGatewayCanvasRegisterNodeSessionForTest(
     nodeId: String,
     role!: String = "node",
     capabilities!: Array<String> = ["canvas"],
+    commands!: Array<String> = [],
     ttlMs!: Int64 = 600000
 ): Unit {
     let normalized = nodeId.trimAscii()
@@ -132,6 +191,10 @@ public func debugGatewayCanvasRegisterNodeSessionForTest(
             normalized,
             role: role,
             capabilities: capabilities,
+            commands: commands,
+            connected: true,
+            connectedAtMs: gatewayCanvasCapabilityNowMs(),
+            lastSeenAtMs: gatewayCanvasCapabilityNowMs(),
             expiresAtMs: gatewayCanvasCapabilityNowMs() + ttlMs,
             canvasHostUrl: ""
         )
@@ -150,6 +213,165 @@ public func debugGatewayCanvasClearNodeSessionsForTest(): Unit {
         gatewayCanvasCapabilityNodeByToken.clear()
         gatewayCanvasCapabilityRoleByToken.clear()
         gatewayCanvasCapabilityExpiresAtByToken.clear()
+    }
+}
+
+private func gatewayCanvasNodeSessionToJsonLocked(state: GatewayCanvasNodeSessionState, now: Int64): JsonObject {
+    let row = JsonObject()
+    let connected = gatewayCanvasSessionActive(state, now)
+    row.put("nodeId", JsonString(state.nodeId))
+    row.put("role", JsonString(state.role))
+    row.put("connected", connected.toJsonValue())
+    row.put("canvasCapable", (connected && gatewayCanvasSessionCanUseCanvas(state)).toJsonValue())
+    row.put("capabilities", state.capabilities.toJsonValue())
+    row.put("commands", state.commands.toJsonValue())
+    row.put("connectedAtMs", state.connectedAtMs.toJsonValue())
+    row.put("lastSeenAtMs", state.lastSeenAtMs.toJsonValue())
+    row.put("expiresAtMs", state.expiresAtMs.toJsonValue())
+    row.put("canvasHostUrl", JsonString(state.canvasHostUrl))
+    row.put("connectionId", JsonString(state.connectionId))
+    row
+}
+
+public func gatewayCanvasRegisterConnectedNode(request: GatewayRpcRequest): GatewayRpcResponse {
+    let method = "node.connect"
+    let nodeId = gatewayCanvasStringParam(request, "nodeId", request.clientId).trimAscii()
+    if (nodeId.isEmpty()) {
+        return GatewayRpcResponse(false, method, error: "nodeId is required", errorCode: "invalid_request")
+    }
+    let capabilities = gatewayCanvasStringArrayParam(request, "capabilities")
+    let commands = gatewayCanvasStringArrayParam(request, "commands")
+    let role = gatewayCanvasStringParam(request, "role", "node")
+    let ttlMs = max(1000, gatewayCanvasIntParam(request, "ttlMs", 600000))
+    let now = gatewayCanvasCapabilityNowMs()
+    let state = GatewayCanvasNodeSessionState(
+        nodeId,
+        role: role,
+        capabilities: capabilities,
+        commands: commands,
+        connected: true,
+        connectedAtMs: now,
+        lastSeenAtMs: now,
+        expiresAtMs: now + ttlMs,
+        canvasHostUrl: gatewayCanvasStringParam(request, "canvasHostUrl", ""),
+        connectionId: gatewayCanvasStringParam(request, "connectionId", request.clientId)
+    )
+    let result = JsonObject()
+    synchronized(gatewayCanvasNodeSessionLock) {
+        gatewayCanvasNodeSessions[nodeId] = state
+        result.put("node", gatewayCanvasNodeSessionToJsonLocked(state, now))
+    }
+    GatewayRpcResponse(true, method, result: result)
+}
+
+public func gatewayCanvasHeartbeatConnectedNode(request: GatewayRpcRequest): GatewayRpcResponse {
+    let method = "node.heartbeat"
+    let nodeId = gatewayCanvasStringParam(request, "nodeId", request.clientId).trimAscii()
+    if (nodeId.isEmpty()) {
+        return GatewayRpcResponse(false, method, error: "nodeId is required", errorCode: "invalid_request")
+    }
+    let ttlMs = max(1000, gatewayCanvasIntParam(request, "ttlMs", 600000))
+    let now = gatewayCanvasCapabilityNowMs()
+    synchronized(gatewayCanvasNodeSessionLock) {
+        let current = gatewayCanvasNodeSessions.get(nodeId) ?? GatewayCanvasNodeSessionState("")
+        if (!gatewayCanvasSessionActive(current, now)) {
+            return GatewayRpcResponse(false, method, error: "No active node session", errorCode: "unavailable")
+        }
+        let updated = GatewayCanvasNodeSessionState(
+            current.nodeId,
+            role: current.role,
+            capabilities: current.capabilities,
+            commands: current.commands,
+            connected: true,
+            connectedAtMs: current.connectedAtMs,
+            lastSeenAtMs: now,
+            expiresAtMs: now + ttlMs,
+            canvasHostUrl: current.canvasHostUrl,
+            connectionId: current.connectionId
+        )
+        gatewayCanvasNodeSessions[nodeId] = updated
+        let result = JsonObject()
+        result.put("node", gatewayCanvasNodeSessionToJsonLocked(updated, now))
+        return GatewayRpcResponse(true, method, result: result)
+    }
+}
+
+public func gatewayCanvasDisconnectConnectedNode(request: GatewayRpcRequest): GatewayRpcResponse {
+    let method = "node.disconnect"
+    let nodeId = gatewayCanvasStringParam(request, "nodeId", request.clientId).trimAscii()
+    if (nodeId.isEmpty()) {
+        return GatewayRpcResponse(false, method, error: "nodeId is required", errorCode: "invalid_request")
+    }
+    synchronized(gatewayCanvasNodeSessionLock) {
+        gatewayCanvasNodeSessions.remove(nodeId)
+        let staleTokens = ArrayList<String>()
+        for ((token, tokenNodeId) in gatewayCanvasCapabilityNodeByToken) {
+            if (tokenNodeId == nodeId) {
+                staleTokens.add(token)
+            }
+        }
+        for (token in staleTokens) {
+            gatewayCanvasCapabilityNodeByToken.remove(token)
+            gatewayCanvasCapabilityRoleByToken.remove(token)
+            gatewayCanvasCapabilityExpiresAtByToken.remove(token)
+        }
+    }
+    let result = JsonObject()
+    result.put("nodeId", JsonString(nodeId))
+    result.put("disconnected", true.toJsonValue())
+    GatewayRpcResponse(true, method, result: result)
+}
+
+public func gatewayCanvasNodeSessionsSnapshot(nodeId!: String = ""): JsonArray {
+    let normalized = nodeId.trimAscii()
+    let now = gatewayCanvasCapabilityNowMs()
+    synchronized(gatewayCanvasNodeSessionLock) {
+        let rows = JsonArray([])
+        for ((id, state) in gatewayCanvasNodeSessions) {
+            if (!normalized.isEmpty() && id != normalized) {
+                continue
+            }
+            rows.add(gatewayCanvasNodeSessionToJsonLocked(state, now))
+        }
+        rows
+    }
+}
+
+public func gatewayCanvasLookupNodeForCommand(nodeId: String, command: String): GatewayCanvasNodeLookupResult {
+    let normalizedNodeId = nodeId.trimAscii()
+    let normalizedCommand = command.trimAscii()
+    if (normalizedNodeId.isEmpty()) {
+        return GatewayCanvasNodeLookupResult(false, errorCode: "invalid_request", error: "nodeId is required")
+    }
+    if (normalizedCommand.isEmpty()) {
+        return GatewayCanvasNodeLookupResult(false, errorCode: "invalid_request", error: "command is required")
+    }
+    let now = gatewayCanvasCapabilityNowMs()
+    synchronized(gatewayCanvasNodeSessionLock) {
+        let state = gatewayCanvasNodeSessions.get(normalizedNodeId) ?? GatewayCanvasNodeSessionState("")
+        if (!gatewayCanvasSessionActive(state, now)) {
+            return GatewayCanvasNodeLookupResult(false, errorCode: "unavailable", error: "Node is offline")
+        }
+        if (!gatewayCanvasSessionSupportsCommand(state, normalizedCommand)) {
+            return GatewayCanvasNodeLookupResult(false, state: state, errorCode: "invalid_request", error: "Node command is not advertised")
+        }
+        GatewayCanvasNodeLookupResult(true, state: state)
+    }
+}
+
+public func gatewayCanvasSelectNodeForCommand(command: String): GatewayCanvasNodeLookupResult {
+    let normalizedCommand = command.trimAscii()
+    if (normalizedCommand.isEmpty()) {
+        return GatewayCanvasNodeLookupResult(false, errorCode: "invalid_request", error: "command is required")
+    }
+    let now = gatewayCanvasCapabilityNowMs()
+    synchronized(gatewayCanvasNodeSessionLock) {
+        for ((_id, state) in gatewayCanvasNodeSessions) {
+            if (gatewayCanvasSessionActive(state, now) && gatewayCanvasSessionSupportsCommand(state, normalizedCommand)) {
+                return GatewayCanvasNodeLookupResult(true, state: state)
+            }
+        }
+        GatewayCanvasNodeLookupResult(false, errorCode: "unavailable", error: "No connected node advertises command")
     }
 }
 

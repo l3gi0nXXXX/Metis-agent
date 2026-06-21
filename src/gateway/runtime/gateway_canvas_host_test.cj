@@ -1,5 +1,7 @@
 package metis.gateway.runtime
 
+import magic.jsonable.*
+
 import metis.core.config.GatewayUserSettings
 import metis.gateway.config.buildGatewayConfigFromUserSettings
 import metis.gateway.model.GatewayConfig
@@ -508,5 +510,255 @@ public class GatewayCanvasHostRootStateTest {
                 debugGatewayCanvasClearNodeSessionsForTest()
             }
         })
+    }
+
+    @TestCase
+    public func connectedFakeNodeRegistryReportsCanvasCapability(): Unit {
+        try {
+            debugGatewayCanvasClearNodeSessionsForTest()
+            debugGatewayNodeInvokeClearForTest()
+            let params = JsonObject()
+            params.put("nodeId", JsonString("node-registry"))
+            params.put("capabilities", JsonArray([JsonString("canvas")]))
+            params.put("commands", JsonArray([JsonString("canvas.present")]))
+            let connected = handleGatewayNodeFamily(
+                "node.connect",
+                GatewayUserSettings(),
+                request: Some(GatewayRpcRequest("node.connect", params: params, clientId: "node-registry", mode: "node"))
+            ).getOrThrow()
+            @Expect(connected.ok, true)
+            let listed = handleGatewayNodeFamily("node.list", GatewayUserSettings()).getOrThrow()
+            let nodes = listed.result.asObject().get("nodes").getOrThrow().asArray()
+            @Expect(nodes.size(), 1)
+            let node = nodes[0].asObject()
+            @Expect(canvasTestBool(node, "connected"), true)
+            @Expect(canvasTestBool(node, "canvasCapable"), true)
+            @Expect(canvasJsonArrayContains(node.get("commands").getOrThrow().asArray(), "canvas.present"), true)
+        } finally {
+            debugGatewayCanvasClearNodeSessionsForTest()
+            debugGatewayNodeInvokeClearForTest()
+        }
+    }
+
+    @TestCase
+    public func nodeHeartbeatAndDisconnectUpdateConnectedRegistry(): Unit {
+        try {
+            debugGatewayCanvasClearNodeSessionsForTest()
+            debugGatewayNodeInvokeClearForTest()
+            let params = JsonObject()
+            params.put("nodeId", JsonString("node-heartbeat"))
+            params.put("capabilities", JsonArray([JsonString("canvas")]))
+            params.put("commands", JsonArray([JsonString("canvas.present")]))
+            let connected = handleGatewayNodeFamily(
+                "node.connect",
+                GatewayUserSettings(),
+                request: Some(GatewayRpcRequest("node.connect", params: params, clientId: "node-heartbeat", mode: "node"))
+            ).getOrThrow()
+            @Expect(connected.ok, true)
+            let heartbeat = handleGatewayNodeFamily(
+                "node.heartbeat",
+                GatewayUserSettings(),
+                request: Some(GatewayRpcRequest("node.heartbeat", params: params, clientId: "node-heartbeat", mode: "node"))
+            ).getOrThrow()
+            @Expect(heartbeat.ok, true)
+            let disconnected = handleGatewayNodeFamily(
+                "node.disconnect",
+                GatewayUserSettings(),
+                request: Some(GatewayRpcRequest("node.disconnect", params: params, clientId: "node-heartbeat", mode: "node"))
+            ).getOrThrow()
+            @Expect(disconnected.ok, true)
+            let listed = handleGatewayNodeFamily("node.list", GatewayUserSettings()).getOrThrow()
+            @Expect(listed.result.asObject().get("nodes").getOrThrow().asArray().size(), 0)
+        } finally {
+            debugGatewayCanvasClearNodeSessionsForTest()
+            debugGatewayNodeInvokeClearForTest()
+        }
+    }
+
+    @TestCase
+    public func gatewayNodeInvokeCompletesWithFakeNodeResult(): Unit {
+        try {
+            debugGatewayCanvasClearNodeSessionsForTest()
+            debugGatewayNodeInvokeClearForTest()
+            let connectParams = JsonObject()
+            connectParams.put("nodeId", JsonString("node-invoke"))
+            connectParams.put("capabilities", JsonArray([JsonString("canvas")]))
+            connectParams.put("commands", JsonArray([JsonString("canvas.present")]))
+            let _ = handleGatewayNodeFamily(
+                "node.connect",
+                GatewayUserSettings(),
+                request: Some(GatewayRpcRequest("node.connect", params: connectParams, clientId: "node-invoke", mode: "node"))
+            ).getOrThrow()
+            let autoPayload = JsonObject()
+            autoPayload.put("presented", JsonString("ok"))
+            debugGatewayNodeInvokeAutoResultForTest("node-invoke", "canvas.present", autoPayload)
+
+            let payload = JsonObject()
+            payload.put("url", JsonString("http://127.0.0.1:18793/__metis__/canvas/cap/test/"))
+            let invokeParams = JsonObject()
+            invokeParams.put("nodeId", JsonString("node-invoke"))
+            invokeParams.put("command", JsonString("canvas.present"))
+            invokeParams.put("payload", payload)
+            let response = handleGatewayNodeFamily(
+                "node.invoke",
+                GatewayUserSettings(),
+                request: Some(GatewayRpcRequest("node.invoke", params: invokeParams, clientId: "operator", mode: "local-cli"))
+            ).getOrThrow()
+            @Expect(response.ok, true)
+            let result = response.result.asObject()
+            @Expect(canvasTestString(result, "nodeId"), "node-invoke")
+            @Expect(canvasTestString(result, "command"), "canvas.present")
+            @Expect(canvasTestString(result.get("payload").getOrThrow().asObject(), "presented"), "ok")
+            @Expect(debugGatewayNodeInvokeRequestCountForTest("node-invoke", "canvas.present"), 1)
+            let sent = debugGatewayNodeInvokeLastRequestForTest("node-invoke", "canvas.present")
+            @Expect(canvasTestString(sent, "command"), "canvas.present")
+            @Expect(canvasTestString(sent.get("payload").getOrThrow().asObject(), "url").contains("/__metis__/canvas/cap/test/"), true)
+        } finally {
+            debugGatewayCanvasClearNodeSessionsForTest()
+            debugGatewayNodeInvokeClearForTest()
+        }
+    }
+
+    @TestCase
+    public func lateInvokeResultIsIgnoredSuccess(): Unit {
+        try {
+            debugGatewayCanvasClearNodeSessionsForTest()
+            debugGatewayNodeInvokeClearForTest()
+            let params = JsonObject()
+            params.put("invokeId", JsonString("missing-invoke"))
+            params.put("nodeId", JsonString("node-late"))
+            let response = handleGatewayNodeFamily(
+                "node.invoke.result",
+                GatewayUserSettings(),
+                request: Some(GatewayRpcRequest("node.invoke.result", params: params, clientId: "node-late", mode: "node"))
+            ).getOrThrow()
+            @Expect(response.ok, true)
+            @Expect(canvasTestBool(response.result.asObject(), "ignored"), true)
+        } finally {
+            debugGatewayCanvasClearNodeSessionsForTest()
+            debugGatewayNodeInvokeClearForTest()
+        }
+    }
+
+    @TestCase
+    public func duplicateIdempotencyKeyDoesNotSendDuplicateRequest(): Unit {
+        try {
+            debugGatewayCanvasClearNodeSessionsForTest()
+            debugGatewayNodeInvokeClearForTest()
+            let connectParams = JsonObject()
+            connectParams.put("nodeId", JsonString("node-idempotent"))
+            connectParams.put("capabilities", JsonArray([JsonString("canvas")]))
+            connectParams.put("commands", JsonArray([JsonString("canvas.present")]))
+            let _ = handleGatewayNodeFamily(
+                "node.connect",
+                GatewayUserSettings(),
+                request: Some(GatewayRpcRequest("node.connect", params: connectParams, clientId: "node-idempotent", mode: "node"))
+            ).getOrThrow()
+            let autoPayload = JsonObject()
+            autoPayload.put("presented", JsonString("ok"))
+            debugGatewayNodeInvokeAutoResultForTest("node-idempotent", "canvas.present", autoPayload)
+            let invokeParams = JsonObject()
+            invokeParams.put("nodeId", JsonString("node-idempotent"))
+            invokeParams.put("command", JsonString("canvas.present"))
+            invokeParams.put("payload", JsonObject())
+            invokeParams.put("idempotencyKey", JsonString("same-action"))
+            let first = handleGatewayNodeFamily(
+                "node.invoke",
+                GatewayUserSettings(),
+                request: Some(GatewayRpcRequest("node.invoke", params: invokeParams, clientId: "operator", mode: "local-cli"))
+            ).getOrThrow()
+            let second = handleGatewayNodeFamily(
+                "node.invoke",
+                GatewayUserSettings(),
+                request: Some(GatewayRpcRequest("node.invoke", params: invokeParams, clientId: "operator", mode: "local-cli"))
+            ).getOrThrow()
+            @Expect(first.ok, true)
+            @Expect(second.ok, true)
+            @Expect(canvasTestString(first.result.asObject(), "invokeId"), canvasTestString(second.result.asObject(), "invokeId"))
+            @Expect(canvasTestBool(second.result.asObject(), "duplicate"), true)
+            @Expect(debugGatewayNodeInvokeRequestCountForTest("node-idempotent", "canvas.present"), 1)
+        } finally {
+            debugGatewayCanvasClearNodeSessionsForTest()
+            debugGatewayNodeInvokeClearForTest()
+        }
+    }
+
+    @TestCase
+    public func unadvertisedCanvasCommandIsRejectedWithoutSending(): Unit {
+        try {
+            debugGatewayCanvasClearNodeSessionsForTest()
+            debugGatewayNodeInvokeClearForTest()
+            let connectParams = JsonObject()
+            connectParams.put("nodeId", JsonString("node-no-snapshot"))
+            connectParams.put("capabilities", JsonArray([JsonString("canvas")]))
+            connectParams.put("commands", JsonArray([JsonString("canvas.present")]))
+            let _ = handleGatewayNodeFamily(
+                "node.connect",
+                GatewayUserSettings(),
+                request: Some(GatewayRpcRequest("node.connect", params: connectParams, clientId: "node-no-snapshot", mode: "node"))
+            ).getOrThrow()
+            let invokeParams = JsonObject()
+            invokeParams.put("nodeId", JsonString("node-no-snapshot"))
+            invokeParams.put("command", JsonString("canvas.snapshot"))
+            invokeParams.put("payload", JsonObject())
+            let response = handleGatewayNodeFamily(
+                "node.invoke",
+                GatewayUserSettings(),
+                request: Some(GatewayRpcRequest("node.invoke", params: invokeParams, clientId: "operator", mode: "local-cli"))
+            ).getOrThrow()
+            @Expect(response.ok, false)
+            @Expect(response.errorCode, "invalid_request")
+            @Expect(debugGatewayNodeInvokeRequestCountForTest("node-no-snapshot", "canvas.snapshot"), 0)
+        } finally {
+            debugGatewayCanvasClearNodeSessionsForTest()
+            debugGatewayNodeInvokeClearForTest()
+        }
+    }
+
+    @TestCase
+    public func offlineNodeInvokeReturnsUnavailableWithoutTimeoutWait(): Unit {
+        try {
+            debugGatewayCanvasClearNodeSessionsForTest()
+            debugGatewayNodeInvokeClearForTest()
+            let startedAt = gatewayCanvasCapabilityNowMs()
+            let invokeParams = JsonObject()
+            invokeParams.put("nodeId", JsonString("node-offline"))
+            invokeParams.put("command", JsonString("canvas.present"))
+            invokeParams.put("payload", JsonObject())
+            invokeParams.put("timeoutMs", 3000.toJsonValue())
+            let response = handleGatewayNodeFamily(
+                "node.invoke",
+                GatewayUserSettings(),
+                request: Some(GatewayRpcRequest("node.invoke", params: invokeParams, clientId: "operator", mode: "local-cli"))
+            ).getOrThrow()
+            let elapsed = gatewayCanvasCapabilityNowMs() - startedAt
+            @Expect(response.ok, false)
+            @Expect(response.errorCode, "unavailable")
+            @Expect(elapsed < 500, true)
+        } finally {
+            debugGatewayCanvasClearNodeSessionsForTest()
+            debugGatewayNodeInvokeClearForTest()
+        }
+    }
+
+    @TestCase
+    public func operatorCannotSubmitNodeInvokeResult(): Unit {
+        try {
+            debugGatewayCanvasClearNodeSessionsForTest()
+            debugGatewayNodeInvokeClearForTest()
+            let params = JsonObject()
+            params.put("invokeId", JsonString("invoke-from-operator"))
+            params.put("nodeId", JsonString("node-forbidden"))
+            let response = handleGatewayNodeFamily(
+                "node.invoke.result",
+                GatewayUserSettings(),
+                request: Some(GatewayRpcRequest("node.invoke.result", params: params, clientId: "operator", mode: "local-cli"))
+            ).getOrThrow()
+            @Expect(response.ok, false)
+            @Expect(response.errorCode, "forbidden")
+        } finally {
+            debugGatewayCanvasClearNodeSessionsForTest()
+            debugGatewayNodeInvokeClearForTest()
+        }
     }
 }
