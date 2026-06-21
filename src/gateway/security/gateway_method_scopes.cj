@@ -33,7 +33,8 @@ public func gatewayResolveRequiredOperatorScope(method: String): String {
         m == "models.status" || m == "models.list" || m == "models.auth.openai-codex.status" ||
         m == "models.auth.openai_codex.status" || m == "oauth.openai-codex.status" || m == "oauth.openai_codex.status" ||
         m == "logs.status" || m == "logs.list" || m == "doctor" ||
-        m == "nodes.status" || m == "devices.status" || m == "push.status" ||
+        m == "nodes.status" || m == "node.list" || m == "node.describe" ||
+        m == "devices.status" || m == "push.status" ||
         m == "usage-cost" || m == "secrets.status" || m == "canvas.status" || m == "talk.status" ||
         m == "http.models" || m == "http.mcp") {
         return GATEWAY_SCOPE_READ
