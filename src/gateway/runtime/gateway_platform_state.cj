@@ -436,20 +436,7 @@ private func makeSecretsJson(cfg: GatewayConfig): JsonObject {
 }
 
 private func makeCanvasJson(cfg: GatewayConfig): JsonObject {
-    let root = JsonObject()
-    let rootConfigured = !cfg.canvas.root.trimAscii().isEmpty()
-    let enabled = cfg.canvas.enabled
-    root.put("enabled", cfg.canvas.enabled.toJsonValue())
-    root.put("root", JsonString(cfg.canvas.root))
-    root.put("port", cfg.canvas.port.toJsonValue())
-    root.put("liveReload", cfg.canvas.liveReload.toJsonValue())
-    root.put("rootPresent", rootConfigured.toJsonValue())
-    root.put("assetState", JsonString(if (!enabled) { "disabled" } else if (rootConfigured) { "mounted" } else { "missing-root" }))
-    root.put("watchState", JsonString(if (!enabled) { "disabled" } else if (cfg.canvas.liveReload) { "watching" } else { "static" }))
-    root.put("phase", JsonString(if (!enabled) { "disabled" } else if (rootConfigured) { "ready" } else { "misconfigured" }))
-    root.put("healthy", (enabled && rootConfigured).toJsonValue())
-    root.put("httpUrl", JsonString(if (enabled) { "http://127.0.0.1:${cfg.canvas.port}/" } else { "" }))
-    root
+    gatewayCanvasResolveRootState(cfg)
 }
 
 private func makeTalkJson(cfg: GatewayConfig): JsonObject {
@@ -2855,12 +2842,25 @@ public func gatewayCanvasRuntimeSummary(cfg: GatewayConfig): JsonObject {
     out.put("phase", canvas.get("phase") ?? JsonString("disabled"))
     out.put("healthy", canvas.get("healthy") ?? false.toJsonValue())
     out.put("httpUrl", canvas.get("httpUrl") ?? JsonString(""))
+    out.put("hostStarted", canvas.get("hostStarted") ?? false.toJsonValue())
     out.put("root", canvas.get("root") ?? JsonString(""))
     out.put("rootPresent", canvas.get("rootPresent") ?? false.toJsonValue())
+    out.put("rootReadable", canvas.get("rootReadable") ?? false.toJsonValue())
     out.put("liveReload", canvas.get("liveReload") ?? false.toJsonValue())
     out.put("assetState", canvas.get("assetState") ?? JsonString("disabled"))
     out.put("watchState", canvas.get("watchState") ?? JsonString("disabled"))
-    out.put("policyState", JsonString(if (readJsonBool(canvas, "enabled", false) && readJsonBool(canvas, "rootPresent", false)) { "ready" } else if (readJsonBool(canvas, "enabled", false)) { "misconfigured" } else { "disabled" }))
+    out.put("errorKind", canvas.get("errorKind") ?? JsonString(""))
+    out.put("policyState", JsonString(
+        if (!readJsonBool(canvas, "enabled", false)) {
+            "disabled"
+        } else if (!readJsonBool(canvas, "rootPresent", false) || !readJsonBool(canvas, "rootReadable", false)) {
+            "misconfigured"
+        } else if (!readJsonBool(canvas, "hostStarted", false)) {
+            "host-not-started"
+        } else {
+            "ready"
+        }
+    ))
     out
 }
 
@@ -2882,20 +2882,37 @@ public func gatewayCanvasPipelineSummary(cfg: GatewayConfig): JsonObject {
             try { v.asBool().getValue() } catch (_e: Exception) { false }
         case None => false
     }
+    let rootPresent = readJsonBool(runtime, "rootPresent", false)
+    let rootReadable = readJsonBool(runtime, "rootReadable", false)
+    let hostStarted = readJsonBool(runtime, "hostStarted", false)
     out.put("enabled", enabled.toJsonValue())
     out.put("healthy", healthy.toJsonValue())
     out.put("liveReload", liveReload.toJsonValue())
-    out.put("pipelineState", JsonString(if (!enabled) { "disabled" } else if (healthy && liveReload) { "ready" } else if (healthy) { "serving" } else { "degraded" }))
+    out.put("hostStarted", hostStarted.toJsonValue())
+    out.put("rootPresent", rootPresent.toJsonValue())
+    out.put("rootReadable", rootReadable.toJsonValue())
+    out.put("pipelineState", JsonString(if (!enabled) { "disabled" } else if (!rootPresent || !rootReadable) { "misconfigured" } else if (!hostStarted) { "host-not-started" } else if (healthy && liveReload) { "ready" } else if (healthy) { "serving" } else { "degraded" }))
     out.put("httpUrl", runtime.get("httpUrl") ?? JsonString(""))
     out.put("root", runtime.get("root") ?? JsonString(""))
     out.put("policyState", runtime.get("policyState") ?? JsonString("disabled"))
-    out.put("remediationState", JsonString(if (!enabled) { "disabled" } else if (!healthy) { "repair-required" } else if (!liveReload) { "tunable" } else { "healthy" }))
+    out.put("errorKind", runtime.get("errorKind") ?? JsonString(""))
+    out.put("remediationState", JsonString(if (!enabled) { "disabled" } else if (!rootPresent || !rootReadable) { "repair-required" } else if (!hostStarted) { "start-required" } else if (!healthy) { "repair-required" } else if (!liveReload) { "tunable" } else { "healthy" }))
     let constraints = JsonArray([])
-    let rootPresent = JsonObject()
-    rootPresent.put("name", JsonString("root-present"))
-    rootPresent.put("ok", (runtime.get("rootPresent") ?? false.toJsonValue()))
-    rootPresent.put("detail", runtime.get("root") ?? JsonString(""))
-    constraints.add(rootPresent)
+    let rootPresentConstraint = JsonObject()
+    rootPresentConstraint.put("name", JsonString("root-present"))
+    rootPresentConstraint.put("ok", rootPresent.toJsonValue())
+    rootPresentConstraint.put("detail", runtime.get("root") ?? JsonString(""))
+    constraints.add(rootPresentConstraint)
+    let rootReadableConstraint = JsonObject()
+    rootReadableConstraint.put("name", JsonString("root-readable"))
+    rootReadableConstraint.put("ok", rootReadable.toJsonValue())
+    rootReadableConstraint.put("detail", runtime.get("assetState") ?? JsonString(""))
+    constraints.add(rootReadableConstraint)
+    let hostStartedConstraint = JsonObject()
+    hostStartedConstraint.put("name", JsonString("host-started"))
+    hostStartedConstraint.put("ok", hostStarted.toJsonValue())
+    hostStartedConstraint.put("detail", runtime.get("errorKind") ?? JsonString(""))
+    constraints.add(hostStartedConstraint)
     let healthyConstraint = JsonObject()
     healthyConstraint.put("name", JsonString("runtime-healthy"))
     healthyConstraint.put("ok", healthy.toJsonValue())
@@ -2908,17 +2925,27 @@ public func gatewayCanvasPipelineSummary(cfg: GatewayConfig): JsonObject {
     constraints.add(liveReloadConstraint)
     out.put("constraints", constraints)
     let actions = JsonArray([])
-    if (enabled && !healthy) {
+    if (enabled && (!rootPresent || !rootReadable)) {
         let action = JsonObject()
         action.put("method", JsonString("canvas.runtime"))
         action.put("policyState", JsonString("misconfigured"))
-        action.put("detail", JsonString("Canvas is enabled but root is missing or unhealthy."))
+        action.put("detail", JsonString("Canvas is enabled but root is missing or unreadable."))
         let params = JsonObject()
         params.put("target", JsonString("canvas-root"))
         action.put("params", params)
         actions.add(action)
     }
-    if (enabled && !liveReload) {
+    if (enabled && rootPresent && rootReadable && !hostStarted) {
+        let action = JsonObject()
+        action.put("method", JsonString("canvas.runtime"))
+        action.put("policyState", JsonString("host-not-started"))
+        action.put("detail", JsonString("Canvas root is mounted but Canvas Host is not started."))
+        let params = JsonObject()
+        params.put("target", JsonString("canvas-host"))
+        action.put("params", params)
+        actions.add(action)
+    }
+    if (enabled && hostStarted && !liveReload) {
         let action = JsonObject()
         action.put("method", JsonString("canvas.pipeline"))
         action.put("policyState", JsonString("static"))
