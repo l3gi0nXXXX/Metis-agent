@@ -203,6 +203,10 @@ public func gatewayCanvasBaseUrl(cfg: GatewayConfig): String {
     "http://127.0.0.1:${gatewayCanvasPortToUInt16(cfg.canvas.port, 18793u16)}${GATEWAY_CANVAS_ROUTE_PREFIX}/"
 }
 
+public func gatewayCanvasScopedRouteUrl(cfg: GatewayConfig, token: String): String {
+    "http://127.0.0.1:${gatewayCanvasPortToUInt16(cfg.canvas.port, 18793u16)}${GATEWAY_CANVAS_ROUTE_PREFIX}/cap/${token.trimAscii()}/"
+}
+
 private func gatewayCanvasCanServePath(path: String): Bool {
     let lower = path.toAsciiLower()
     lower.endsWith(".html") ||
@@ -319,8 +323,20 @@ private func gatewayCanvasHttpBodyForMethod(method: String, body: Array<Byte>): 
     body
 }
 
-private func gatewayCanvasReplyAsset(ctx: HttpContext, root: Path, requestPath: String): Unit {
+private func gatewayCanvasReplyUnauthorized(ctx: HttpContext): Unit {
     let rb = ctx.responseBuilder
+    rb.status(401)
+    rb.header("content-type", "text/plain; charset=utf-8")
+    rb.body("canvas capability required")
+}
+
+private func gatewayCanvasReplyAsset(ctx: HttpContext, root: Path, requestPath: String, token: String): Unit {
+    let rb = ctx.responseBuilder
+    let auth = gatewayCanvasAuthorizeCapabilityToken(token)
+    if (!auth.ok) {
+        gatewayCanvasReplyUnauthorized(ctx)
+        return
+    }
     let method = ctx.request.method
     if (!gatewayCanvasHttpMethodAllowed(method)) {
         rb.status(405)
@@ -419,7 +435,7 @@ public class GatewayCanvasHostRuntime {
                 }
                 let requestPath = gatewayCanvasRequestPathFromRoute(routePath)
                 s.distributor.register(routePath, { ctx =>
-                    gatewayCanvasReplyAsset(ctx, canonicalRoot, requestPath)
+                    gatewayCanvasReplyAsset(ctx, canonicalRoot, requestPath, "")
                 })
             }
             server = Some(s)
@@ -438,6 +454,41 @@ public class GatewayCanvasHostRuntime {
                         started = false
                         server = None
                     }
+                }
+            }
+        }
+    }
+
+    public static func registerCapabilityRoutes(cfg: GatewayConfig, token: String): Unit {
+        let normalizedToken = token.trimAscii()
+        if (normalizedToken.isEmpty()) {
+            return
+        }
+        synchronized(lock) {
+            if (!started) {
+                return
+            }
+            if (let Some(s) <- server) {
+                let root = Path(rootPath)
+                let registeredScopedRoutes = ArrayList<String>()
+                for (routeValue in registeredRoutes.getItems()) {
+                    let routePath = try {
+                        routeValue.asString().getValue()
+                    } catch (_: Exception) {
+                        ""
+                    }
+                    if (routePath.trimAscii().isEmpty()) {
+                        continue
+                    }
+                    let scopedRoute = gatewayCanvasScopedRouteFor(normalizedToken, routePath)
+                    if (registeredScopedRoutes.contains(scopedRoute)) {
+                        continue
+                    }
+                    registeredScopedRoutes.add(scopedRoute)
+                    let requestPath = gatewayCanvasRequestPathFromRoute(routePath)
+                    s.distributor.register(scopedRoute, { ctx =>
+                        gatewayCanvasReplyAsset(ctx, root, requestPath, normalizedToken)
+                    })
                 }
             }
         }
