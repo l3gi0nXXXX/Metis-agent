@@ -190,6 +190,22 @@ public func runGatewayService(verbose!: Bool = false): Unit {
             }
             gatewayServeTimingLog("control-ui-started", startMs)
         }
+        if (gatewayCfg.canvas.enabled) {
+            GatewayCanvasHostRuntime.startIfNeeded(gatewayCfg)
+            let canvas = GatewayCanvasHostRuntime.snapshot(gatewayCfg)
+            let phase = match (canvas.get("phase")) {
+                case Some(v) =>
+                    try { v.asString().getValue() } catch (_e: Exception) { "" }
+                case None => ""
+            }
+            let errorKind = match (canvas.get("errorKind")) {
+                case Some(v) =>
+                    try { v.asString().getValue() } catch (_e: Exception) { "" }
+                case None => ""
+            }
+            gatewayServeLogger.debug(MetisLogEvent.loggingRaw, "Gateway.serve: canvas host phase=${phase} errorKind=${errorKind}")
+            gatewayServeTimingLog("canvas-host-started", startMs)
+        }
         gatewayPlatformMarkRunning(gatewayCfg)
         gatewayServeLogger.debug(MetisLogEvent.loggingRaw, "Gateway.serve: calling gateway.start()")
         gatewayServeTimingLog("gateway-start-begin", startMs)
@@ -259,6 +275,7 @@ public func runGatewayService(verbose!: Bool = false): Unit {
         gatewayClearSubagentNoticeDeliveryHook()
         gatewayClearSubagentNoticeEventHook()
         gatewayResetSubagentNoticeEventPublisherRegistration()
+        GatewayCanvasHostRuntime.stopIfRunning()
         GatewayHttpSurface.stopIfRunning()
         GatewayServer.defaultServer().stopServer(reason: "gateway-serve-shutdown")
         gatewayPlatformMarkStopped(gatewayCfg)

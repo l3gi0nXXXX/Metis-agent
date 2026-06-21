@@ -5,8 +5,11 @@ import magic.jsonable.*
 import metis.gateway.model.GatewayConfig
 
 import std.collection.ArrayList
-import std.fs.{FileInfo, Path, canonicalize, exists}
-import stdx.encoding.json.{JsonObject, JsonString}
+import std.fs.{Directory, File, FileInfo, Path, canonicalize, exists}
+import std.sync.Mutex
+import stdx.encoding.json.{JsonArray, JsonObject, JsonString}
+import stdx.log.*
+import stdx.net.http.*
 
 public class GatewayCanvasResolveResult {
     public let ok: Bool
@@ -185,6 +188,316 @@ public func gatewayCanvasMimeType(path: String): String {
     if (lower.endsWith(".webp")) { return "image/webp" }
     if (lower.endsWith(".wasm")) { return "application/wasm" }
     "application/octet-stream"
+}
+
+private const GATEWAY_CANVAS_ROUTE_PREFIX: String = "/__metis__/canvas"
+
+private func gatewayCanvasPortToUInt16(v: Int64, fallback: UInt16): UInt16 {
+    if (v <= 0 || v > 65535) {
+        return fallback
+    }
+    UInt16(v)
+}
+
+public func gatewayCanvasBaseUrl(cfg: GatewayConfig): String {
+    "http://127.0.0.1:${gatewayCanvasPortToUInt16(cfg.canvas.port, 18793u16)}${GATEWAY_CANVAS_ROUTE_PREFIX}/"
+}
+
+private func gatewayCanvasCanServePath(path: String): Bool {
+    let lower = path.toAsciiLower()
+    lower.endsWith(".html") ||
+    lower.endsWith(".htm") ||
+    lower.endsWith(".js") ||
+    lower.endsWith(".mjs") ||
+    lower.endsWith(".css") ||
+    lower.endsWith(".json") ||
+    lower.endsWith(".svg") ||
+    lower.endsWith(".png") ||
+    lower.endsWith(".jpg") ||
+    lower.endsWith(".jpeg") ||
+    lower.endsWith(".webp") ||
+    lower.endsWith(".wasm")
+}
+
+private func gatewayCanvasRouteForRelative(relative: String): String {
+    let trimmed = gatewayCanvasNormalizeUrlPath(relative)
+    if (trimmed == "/" || trimmed == "/index.html") {
+        return GATEWAY_CANVAS_ROUTE_PREFIX + "/"
+    }
+    GATEWAY_CANVAS_ROUTE_PREFIX + trimmed
+}
+
+private func gatewayCanvasRemovePrefix(text: String, prefix: String): String {
+    if (!text.startsWith(prefix)) {
+        return text
+    }
+    let textRunes = text.toRuneArray()
+    let prefixSize = prefix.toRuneArray().size
+    if (textRunes.size <= prefixSize) {
+        return ""
+    }
+    String(textRunes[prefixSize..])
+}
+
+private func gatewayCanvasScanRoutesUnder(root: Path, dir: Path, out: ArrayList<String>): Unit {
+    let rootPrefix = root.normalize().toString().replace("\\", "/")
+    let rootPrefixWithSlash = if (rootPrefix.endsWith("/")) { rootPrefix } else { rootPrefix + "/" }
+    for (entry in Directory.readFrom(dir)) {
+        let path = entry.path
+        if (entry.isDirectory()) {
+            gatewayCanvasScanRoutesUnder(root, path, out)
+            continue
+        }
+        let info = FileInfo(path)
+        if (!info.isRegular()) {
+            continue
+        }
+        let full = path.normalize().toString().replace("\\", "/")
+        if (!full.startsWith(rootPrefixWithSlash)) {
+            continue
+        }
+        let rel = gatewayCanvasRemovePrefix(full, rootPrefixWithSlash)
+        if (rel.isEmpty() || !gatewayCanvasCanServePath(rel)) {
+            continue
+        }
+        let routePath = gatewayCanvasRouteForRelative(rel)
+        if (!out.contains(routePath)) {
+            out.add(routePath)
+        }
+    }
+}
+
+public func gatewayCanvasRegisteredRoutes(cfg: GatewayConfig): JsonArray {
+    let routes = ArrayList<String>()
+    if (!cfg.canvas.enabled || cfg.canvas.root.trimAscii().isEmpty()) {
+        return JsonArray([])
+    }
+    let root = Path(cfg.canvas.root)
+    let rootReady = try {
+        exists(root) && FileInfo(root).isDirectory()
+    } catch (_: Exception) {
+        false
+    }
+    if (!rootReady) {
+        return JsonArray([])
+    }
+    routes.add(GATEWAY_CANVAS_ROUTE_PREFIX)
+    routes.add(GATEWAY_CANVAS_ROUTE_PREFIX + "/")
+    gatewayCanvasScanRoutesUnder(root, root, routes)
+    let out = JsonArray([])
+    for (route in routes) {
+        out.add(JsonString(route))
+    }
+    out
+}
+
+private func gatewayCanvasRequestPathFromRoute(routePath: String): String {
+    if (routePath == GATEWAY_CANVAS_ROUTE_PREFIX || routePath == GATEWAY_CANVAS_ROUTE_PREFIX + "/") {
+        return "/"
+    }
+    let prefix = GATEWAY_CANVAS_ROUTE_PREFIX + "/"
+    if (!routePath.startsWith(prefix)) {
+        return "/"
+    }
+    let runes = routePath.toRuneArray()
+    let prefixSize = prefix.toRuneArray().size
+    if (runes.size <= prefixSize) {
+        return "/"
+    }
+    "/" + String(runes[prefixSize..])
+}
+
+private func gatewayCanvasHttpMethodAllowed(method: String): Bool {
+    let normalized = method.trimAscii().toAsciiUpper()
+    normalized == "GET" || normalized == "HEAD"
+}
+
+private func gatewayCanvasHttpBodyForMethod(method: String, body: Array<Byte>): Array<Byte> {
+    if (method.trimAscii().toAsciiUpper() == "HEAD") {
+        return Array<Byte>(0, repeat: 0)
+    }
+    body
+}
+
+private func gatewayCanvasReplyAsset(ctx: HttpContext, root: Path, requestPath: String): Unit {
+    let rb = ctx.responseBuilder
+    let method = ctx.request.method
+    if (!gatewayCanvasHttpMethodAllowed(method)) {
+        rb.status(405)
+        rb.header("allow", "GET, HEAD")
+        rb.header("content-type", "text/plain; charset=utf-8")
+        rb.body("Method Not Allowed")
+        return
+    }
+    let resolved = gatewayCanvasResolveFileWithinRoot(root, requestPath)
+    if (!resolved.ok) {
+        rb.status(404)
+        rb.header("content-type", "text/plain; charset=utf-8")
+        rb.body("canvas asset not found")
+        return
+    }
+    let filePath = Path(resolved.path)
+    if (!exists(filePath) || !FileInfo(filePath).isRegular()) {
+        rb.status(404)
+        rb.header("content-type", "text/plain; charset=utf-8")
+        rb.body("canvas asset not found")
+        return
+    }
+    try {
+        rb.header("content-type", resolved.mimeType)
+        rb.header("cache-control", "no-cache")
+        rb.body(gatewayCanvasHttpBodyForMethod(method, File.readFrom(filePath)))
+    } catch (_: Exception) {
+        rb.status(500)
+        rb.header("content-type", "text/plain; charset=utf-8")
+        rb.body("canvas asset read failed")
+    }
+}
+
+private func gatewayCanvasReadBool(obj: JsonObject, key: String, defaultValue: Bool): Bool {
+    match (obj.get(key)) {
+        case Some(v) => try { v.asBool().getValue() } catch (_: Exception) { defaultValue }
+        case None => defaultValue
+    }
+}
+
+private func gatewayCanvasReadString(obj: JsonObject, key: String, defaultValue: String): String {
+    match (obj.get(key)) {
+        case Some(v) => try { v.asString().getValue() } catch (_: Exception) { defaultValue }
+        case None => defaultValue
+    }
+}
+
+public class GatewayCanvasHostRuntime {
+    private static let lock = Mutex()
+    private static var started: Bool = false
+    private static var server: Option<Server> = None
+    private static var rootPath: String = ""
+    private static var listenPort: UInt16 = 18793u16
+    private static var registeredRoutes: JsonArray = JsonArray([])
+    private static var lastErrorKind: String = ""
+
+    public static func isRunning(): Bool {
+        synchronized(lock) {
+            started
+        }
+    }
+
+    public static func startIfNeeded(cfg: GatewayConfig): Unit {
+        synchronized(lock) {
+            if (started) {
+                return
+            }
+            let state = gatewayCanvasResolveRootState(cfg)
+            if (!gatewayCanvasReadBool(state, "enabled", false) ||
+                !gatewayCanvasReadBool(state, "rootPresent", false) ||
+                !gatewayCanvasReadBool(state, "rootReadable", false)) {
+                lastErrorKind = gatewayCanvasReadString(state, "errorKind", "root-unavailable")
+                return
+            }
+            let root = Path(cfg.canvas.root)
+            let canonicalRoot = try {
+                canonicalize(root)
+            } catch (_: Exception) {
+                lastErrorKind = "root-unavailable"
+                return
+            }
+            let s = ServerBuilder()
+                .addr("127.0.0.1")
+                .port(gatewayCanvasPortToUInt16(cfg.canvas.port, 18793u16))
+                .build()
+            s.logger.level = LogLevel.OFF
+            let routes = gatewayCanvasRegisteredRoutes(cfg)
+            for (routeValue in routes.getItems()) {
+                let routePath = try {
+                    routeValue.asString().getValue()
+                } catch (_: Exception) {
+                    ""
+                }
+                if (routePath.trimAscii().isEmpty()) {
+                    continue
+                }
+                let requestPath = gatewayCanvasRequestPathFromRoute(routePath)
+                s.distributor.register(routePath, { ctx =>
+                    gatewayCanvasReplyAsset(ctx, canonicalRoot, requestPath)
+                })
+            }
+            server = Some(s)
+            started = true
+            rootPath = canonicalRoot.toString()
+            listenPort = gatewayCanvasPortToUInt16(cfg.canvas.port, 18793u16)
+            registeredRoutes = routes
+            lastErrorKind = ""
+            spawn {
+                try {
+                    s.serve()
+                } catch (_: Exception) {
+                    ()
+                } finally {
+                    synchronized(lock) {
+                        started = false
+                        server = None
+                    }
+                }
+            }
+        }
+    }
+
+    public static func stopIfRunning(): Unit {
+        synchronized(lock) {
+            if (let Some(s) <- server) {
+                try {
+                    s.close()
+                } catch (_: Exception) {
+                    ()
+                }
+            }
+            started = false
+            server = None
+            rootPath = ""
+            registeredRoutes = JsonArray([])
+            lastErrorKind = ""
+        }
+    }
+
+    public static func snapshot(cfg: GatewayConfig): JsonObject {
+        let root = gatewayCanvasResolveRootState(cfg)
+        synchronized(lock) {
+            if (!started) {
+                if (!lastErrorKind.trimAscii().isEmpty()) {
+                    root.put("errorKind", JsonString(lastErrorKind))
+                }
+                root.put("routes", registeredRoutes)
+                root.put("routeCount", registeredRoutes.size().toJsonValue())
+                return root
+            }
+            let currentRoot = try {
+                canonicalize(Path(cfg.canvas.root)).toString()
+            } catch (_: Exception) {
+                ""
+            }
+            let cfgPort = gatewayCanvasPortToUInt16(cfg.canvas.port, 18793u16)
+            if (currentRoot == rootPath && cfgPort == listenPort) {
+                root.put("hostStarted", true.toJsonValue())
+                root.put("httpUrl", JsonString(gatewayCanvasBaseUrl(cfg)))
+                root.put("healthy", true.toJsonValue())
+                root.put("phase", JsonString("ready"))
+                root.put("errorKind", JsonString(""))
+                root.put("watchState", JsonString(if (cfg.canvas.liveReload) { "watching" } else { "static" }))
+                root.put("routes", registeredRoutes)
+                root.put("routeCount", registeredRoutes.size().toJsonValue())
+                return root
+            }
+            root.put("hostStarted", false.toJsonValue())
+            root.put("healthy", false.toJsonValue())
+            root.put("httpUrl", JsonString(""))
+            root.put("phase", JsonString("configured"))
+            root.put("errorKind", JsonString("host-config-mismatch"))
+            root.put("routes", JsonArray([]))
+            root.put("routeCount", 0.toJsonValue())
+            root
+        }
+    }
 }
 
 public func gatewayCanvasResolveRootState(cfg: GatewayConfig): JsonObject {

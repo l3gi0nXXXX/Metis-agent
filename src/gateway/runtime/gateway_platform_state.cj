@@ -436,7 +436,7 @@ private func makeSecretsJson(cfg: GatewayConfig): JsonObject {
 }
 
 private func makeCanvasJson(cfg: GatewayConfig): JsonObject {
-    gatewayCanvasResolveRootState(cfg)
+    GatewayCanvasHostRuntime.snapshot(cfg)
 }
 
 private func makeTalkJson(cfg: GatewayConfig): JsonObject {
