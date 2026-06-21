@@ -166,6 +166,9 @@ public class GatewayTurnContext {
     public let chatType: Option<ChatType>
     public let route: JsonObject
     public let agentScope: JsonObject
+    public let modelRefOverride: String
+    public let thinkingLevel: String
+    public let lightContext: Bool
 
     public init(
         agentId: String,
@@ -188,7 +191,10 @@ public class GatewayTurnContext {
         operatorScopes!: Array<String> = [],
         chatType!: Option<ChatType> = None,
         route!: JsonObject = JsonObject(),
-        agentScope!: JsonObject = JsonObject()
+        agentScope!: JsonObject = JsonObject(),
+        modelRefOverride!: String = "",
+        thinkingLevel!: String = "",
+        lightContext!: Bool = false
     ) {
         this.agentId = agentId.trimAscii()
         this.workspaceDir = workspaceDir.trimAscii()
@@ -211,6 +217,9 @@ public class GatewayTurnContext {
         this.chatType = chatType
         this.route = route
         this.agentScope = agentScope
+        this.modelRefOverride = modelRefOverride.trimAscii()
+        this.thinkingLevel = thinkingLevel.trimAscii().toAsciiLower()
+        this.lightContext = lightContext
     }
 }
 

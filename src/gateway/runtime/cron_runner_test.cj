@@ -10,13 +10,16 @@ import metis.cron.{
     cronStorePath,
     readCronRunLogEntriesForJob
 }
-import metis.gateway.core.GatewayService
-import metis.gateway.session.{GatewayIngressSource, GatewaySessionRequest, gatewayIngressSourceLabel}
+import metis.gateway.core.{ChannelAdapter, GatewayRouter, GatewayService}
+import metis.gateway.model.{ChannelPolicyConfig, InboundMessage, OutboundMessage, SendResult}
+import metis.gateway.session.{GatewayIngressSource, GatewaySessionRequest, GatewayTurnContext, gatewayIngressSourceLabel}
 
+import std.collection.HashMap
 import std.env.{getVariable, setVariable}
 import std.fs.{Directory, Path, remove}
 import std.time.DateTime
 import std.unittest.testmacro.*
+import stdx.encoding.json.JsonObject
 
 private func withCronRunnerTestHome<T>(block: (Path) -> T): T {
     synchronized(MetisProcessEnvironmentLock) {
@@ -55,6 +58,63 @@ private func cronRunnerTestJob(id: String): CronJob {
         sessionTarget: "main",
         agentId: "general"
     )
+}
+
+private class CronRunnerTestChannelAdapter <: ChannelAdapter {
+    private let adapterName: String
+    private let messageId: String
+    private let failSend: Bool
+    public var sendCount: Int64 = 0
+    public var lastAccountId: String = ""
+    public var lastPeerId: String = ""
+    public var lastText: String = ""
+
+    public init(adapterName: String, messageId!: String = "fake-message", failSend!: Bool = false) {
+        this.adapterName = adapterName
+        this.messageId = messageId
+        this.failSend = failSend
+    }
+
+    public prop name: String {
+        get() { this.adapterName }
+    }
+
+    public func start(): Unit {}
+
+    public func stop(): Unit {}
+
+    public func pullInbound(): Array<InboundMessage> {
+        []
+    }
+
+    public func send(message: OutboundMessage): SendResult {
+        this.capture(message)
+        if (this.failSend) {
+            return SendResult.Failed("fake send failed")
+        }
+        SendResult.Success
+    }
+
+    public func sendWithMessageId(message: OutboundMessage): String {
+        this.capture(message)
+        if (this.failSend) {
+            throw Exception("fake send failed")
+        }
+        this.messageId
+    }
+
+    private func capture(message: OutboundMessage): Unit {
+        this.sendCount += 1
+        this.lastAccountId = message.accountId
+        this.lastPeerId = message.peerId
+        this.lastText = message.text
+    }
+}
+
+private func cronRunnerTestGateway(adapter: CronRunnerTestChannelAdapter, channelId: String, accountId: String): GatewayService {
+    let service = GatewayService(GatewayRouter(HashMap<String, ChannelPolicyConfig>()))
+    service.registerAdapter(adapter, channelId: channelId, accountId: accountId)
+    service
 }
 
 @Test
@@ -175,6 +235,170 @@ public class CronRunnerTest {
                 @Expect(row.get("durationMs").getOrThrow().asInt().getValue() >= 0, true)
                 idx += 1
             }
+        })
+    }
+
+}
+
+@Test
+public class CronRunnerDeliveryTest {
+    @TestCase
+    public func cronExecutionOptionsConvertTimeoutAndTurnContextOverrides(): Unit {
+        let job = CronJob(
+            "options",
+            "hello cron",
+            CronSchedule.every(60000),
+            timeoutMs: 2501,
+            modelOverride: "openai:gpt-4o-mini",
+            thinkingLevel: "high",
+            lightContext: true,
+            bestEffortDeliver: true
+        )
+        let options = cronBuildSessionExecutionOptions(job)
+        @Expect(options.timeoutMs, 2501)
+        @Expect(options.timeoutSeconds, 3)
+        @Expect(options.modelOverride, "openai:gpt-4o-mini")
+        @Expect(options.thinkingLevel, "high")
+        @Expect(options.lightContext, true)
+        @Expect(options.bestEffortDeliver, true)
+
+        let base = GatewayTurnContext(
+            "general",
+            workspaceDir: "/tmp/metis-cron-options",
+            sessionKey: "agent:general:main",
+            channelName: "cron",
+            agentScope: JsonObject()
+        )
+        let overridden = cronTurnContextWithExecutionOptions(base, options)
+        @Expect(overridden.agentId, "general")
+        @Expect(overridden.workspaceDir, "/tmp/metis-cron-options")
+        @Expect(overridden.modelRefOverride, "openai:gpt-4o-mini")
+        @Expect(overridden.thinkingLevel, "high")
+        @Expect(overridden.lightContext, true)
+    }
+
+    @TestCase
+    public func cronBuildSessionRequestCarriesAnnounceDeliveryTarget(): Unit {
+        let job = CronJob(
+            "job-deliver",
+            "hello cron",
+            CronSchedule.every(60000),
+            deliveryChannel: "feishu",
+            deliveryTo: "chat-1",
+            deliveryAccountId: "tenant-a",
+            deliveryMode: "announce"
+        )
+        let request = cronBuildSessionRequest(job, 12345)
+        @Expect(request.deliver, true)
+        @Expect(request.replyChannel, "feishu")
+        @Expect(request.replyTo, "chat-1")
+        @Expect(request.replyAccountId, "tenant-a")
+    }
+
+    @TestCase
+    public func deliveryUsesConfiguredAccountIdAndRecordsDelivered(): Unit {
+        withCronRunnerTestHome({ storePath =>
+            let job = CronJob(
+                "delivery-account",
+                "hello cron",
+                CronSchedule.every(60000),
+                state: CronJobState(nextRunAtMs: 1),
+                deliveryChannel: "feishu",
+                deliveryTo: "chat-1",
+                deliveryAnnounce: true,
+                deliveryMode: "announce",
+                deliveryAccountId: "tenant-a"
+            )
+            cronSave(storePath, [job])
+            debugSetCronRunnerReplyForTest(Some({ _job: CronJob, _request: GatewaySessionRequest =>
+                "ok answer"
+            }))
+            let adapter = CronRunnerTestChannelAdapter("feishu", messageId: "msg-1")
+            let service = cronRunnerTestGateway(adapter, "feishu", "tenant-a")
+
+            let result = CronRunner.runJobOnceFromStore(Some(service), storePath, "delivery-account", true)
+            @Expect(result.get("ok").getOrThrow().asBool().getValue(), true)
+            @Expect(adapter.sendCount, 1)
+            @Expect(adapter.lastAccountId, "tenant-a")
+            @Expect(adapter.lastPeerId, "chat-1")
+            @Expect(adapter.lastText.contains("[cron:delivery-account]"), true)
+
+            let jobs = cronLoadOrEmpty(storePath)
+            @Expect(jobs[0].state.lastStatus, "success")
+            let runs = readCronRunLogEntriesForJob(storePath, "delivery-account", limit: 10)
+            let row = runs.get("entries").getOrThrow().asArray()[0].asObject()
+            @Expect(row.get("deliveryStatus").getOrThrow().asString().getValue(), "delivered")
+        })
+    }
+
+    @TestCase
+    public func deliveryFailureBestEffortKeepsAgentSuccess(): Unit {
+        withCronRunnerTestHome({ storePath =>
+            let job = CronJob(
+                "best-effort-delivery",
+                "hello cron",
+                CronSchedule.every(60000),
+                state: CronJobState(nextRunAtMs: 1),
+                deliveryChannel: "feishu",
+                deliveryTo: "chat-1",
+                deliveryMode: "announce",
+                deliveryAccountId: "tenant-a",
+                bestEffortDeliver: true
+            )
+            cronSave(storePath, [job])
+            debugSetCronRunnerReplyForTest(Some({ _job: CronJob, _request: GatewaySessionRequest =>
+                "ok answer"
+            }))
+            let adapter = CronRunnerTestChannelAdapter("feishu", failSend: true)
+            let service = cronRunnerTestGateway(adapter, "feishu", "tenant-a")
+
+            let result = CronRunner.runJobOnceFromStore(Some(service), storePath, "best-effort-delivery", true)
+            @Expect(result.get("ok").getOrThrow().asBool().getValue(), true)
+            let jobs = cronLoadOrEmpty(storePath)
+            @Expect(jobs[0].state.lastStatus, "success")
+            @Expect(jobs[0].state.lastError, "")
+            let runs = readCronRunLogEntriesForJob(storePath, "best-effort-delivery", limit: 10)
+            let row = runs.get("entries").getOrThrow().asArray()[0].asObject()
+            @Expect(row.get("deliveryStatus").getOrThrow().asString().getValue(), "not-delivered")
+        })
+    }
+
+    @TestCase
+    public func failureAlertHonorsThresholdAndCooldown(): Unit {
+        withCronRunnerTestHome({ storePath =>
+            let job = CronJob(
+                "failure-alert",
+                "hello cron",
+                CronSchedule.every(60000),
+                state: CronJobState(nextRunAtMs: 1),
+                failureChannel: "feishu",
+                failureTo: "chat-1",
+                failureDestMode: "announce",
+                failureAccountId: "tenant-a",
+                failureAlertAfter: 2,
+                failureAlertCooldownMs: 60_000
+            )
+            cronSave(storePath, [job])
+            debugSetCronRunnerReplyForTest(Some({ _job: CronJob, _request: GatewaySessionRequest =>
+                throw Exception("agent failed")
+            }))
+            let adapter = CronRunnerTestChannelAdapter("feishu", messageId: "fail-msg-1")
+            let service = cronRunnerTestGateway(adapter, "feishu", "tenant-a")
+
+            let _first = CronRunner.runJobOnceFromStore(Some(service), storePath, "failure-alert", true)
+            @Expect(adapter.sendCount, 0)
+
+            let _second = CronRunner.runJobOnceFromStore(Some(service), storePath, "failure-alert", true)
+            @Expect(adapter.sendCount, 1)
+            let afterSecond = cronLoadOrEmpty(storePath)[0]
+            @Expect(afterSecond.state.consecutiveErrors, 2)
+            @Expect(afterSecond.state.lastFailureAlertAtMs > 0, true)
+            @Expect(adapter.lastAccountId, "tenant-a")
+
+            let _third = CronRunner.runJobOnceFromStore(Some(service), storePath, "failure-alert", true)
+            @Expect(adapter.sendCount, 1)
+            let afterThird = cronLoadOrEmpty(storePath)[0]
+            @Expect(afterThird.state.consecutiveErrors, 3)
         })
     }
 }

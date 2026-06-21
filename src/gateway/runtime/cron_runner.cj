@@ -12,11 +12,14 @@ import metis.gateway.core.{
     gatewayLogEventWarn,
     gatewayLogMeta,
     gatewayListPersistedAgentIdsForUser,
+    gatewayResolveSessionContextWithAgentRoute,
     gatewaySessionStoreForUserWithAgentId
 }
-import metis.gateway.session.{GatewayIngressSource, GatewaySessionRequest}
+import metis.gateway.session.{GatewayIngressSource, GatewaySessionRequest, GatewayTurnContext}
 import metis.cron.{
     CronJob,
+    CronDeliveryResolved,
+    CronFailureResolved,
     appendCronRunLog,
     buildCronWebhookFailureBody,
     buildCronWebhookSuccessBody,
@@ -65,6 +68,81 @@ private let MAX_SCHEDULE_ERRORS: Int64 = 3
 
 /** 单次 arm sleep 的最大时长。 */
 private let MAX_TIMER_DELAY_MS: Int64 = 60_000
+
+public struct CronSessionExecutionOptions {
+    public let modelOverride: String
+    public let thinkingLevel: String
+    public let lightContext: Bool
+    public let timeoutMs: Int64
+    public let timeoutSeconds: Int64
+    public let bestEffortDeliver: Bool
+
+    public init(
+        modelOverride!: String = "",
+        thinkingLevel!: String = "",
+        lightContext!: Bool = false,
+        timeoutMs!: Int64 = 0,
+        timeoutSeconds!: Int64 = 0,
+        bestEffortDeliver!: Bool = false
+    ) {
+        this.modelOverride = modelOverride.trimAscii()
+        this.thinkingLevel = thinkingLevel.trimAscii().toAsciiLower()
+        this.lightContext = lightContext
+        this.timeoutMs = timeoutMs
+        this.timeoutSeconds = timeoutSeconds
+        this.bestEffortDeliver = bestEffortDeliver
+    }
+}
+
+private func cronTimeoutSecondsFromMs(timeoutMs: Int64): Int64 {
+    if (timeoutMs <= 0) {
+        return 0
+    }
+    (timeoutMs + 999) / 1000
+}
+
+public func cronBuildSessionExecutionOptions(job: CronJob): CronSessionExecutionOptions {
+    CronSessionExecutionOptions(
+        modelOverride: job.modelOverride,
+        thinkingLevel: job.thinkingLevel,
+        lightContext: job.lightContext,
+        timeoutMs: job.timeoutMs,
+        timeoutSeconds: cronTimeoutSecondsFromMs(job.timeoutMs),
+        bestEffortDeliver: job.bestEffortDeliver
+    )
+}
+
+public func cronTurnContextWithExecutionOptions(
+    context: GatewayTurnContext,
+    options: CronSessionExecutionOptions
+): GatewayTurnContext {
+    GatewayTurnContext(
+        context.agentId,
+        workspaceDir: context.workspaceDir,
+        agentDir: context.agentDir,
+        modelsJsonPath: context.modelsJsonPath,
+        authProfilesPath: context.authProfilesPath,
+        legacyAuthPath: context.legacyAuthPath,
+        sessionsDir: context.sessionsDir,
+        sessionKey: context.sessionKey,
+        mainSessionKey: context.mainSessionKey,
+        matchedBy: context.matchedBy,
+        lastRoutePolicy: context.lastRoutePolicy,
+        modelRef: context.modelRef,
+        channelName: context.channelName,
+        accountId: context.accountId,
+        peerId: context.peerId,
+        threadId: context.threadId,
+        senderId: context.senderId,
+        operatorScopes: context.operatorScopes,
+        chatType: context.chatType,
+        route: context.route,
+        agentScope: context.agentScope,
+        modelRefOverride: options.modelOverride,
+        thinkingLevel: options.thinkingLevel,
+        lightContext: options.lightContext
+    )
+}
 
 private func epochMs(): Int64 {
     DateTime.now().toUnixTimeStamp().toMilliseconds()
@@ -348,7 +426,13 @@ public class CronRunner {
         (gatewayBridgeForSessionRequest(user, request), request)
     }
 
-    private func executeJobReply(j: CronJob, bridge: AgentBridge, request: GatewaySessionRequest): String {
+    private func executeJobReply(
+        j: CronJob,
+        bridge: AgentBridge,
+        request: GatewaySessionRequest,
+        options: CronSessionExecutionOptions,
+        turnContextOverride: Option<GatewayTurnContext>
+    ): String {
         match (cronRunnerReplyHookForTest()) {
             case Some(hook) => return hook(j, request)
             case None => ()
@@ -366,10 +450,10 @@ public class CronRunner {
                             .object()
                     )
                     return result
-                case None => return cronBridgeReply(bridge, request, j.prompt, j.timeoutMs)
+                case None => return cronBridgeReply(bridge, request, j.prompt, options, turnContextOverride: turnContextOverride)
             }
         }
-        cronBridgeReply(bridge, request, j.prompt, j.timeoutMs)
+        cronBridgeReply(bridge, request, j.prompt, options, turnContextOverride: turnContextOverride)
     }
 
     private func appendRunLogIsolated(
@@ -414,6 +498,136 @@ public class CronRunner {
                     .object()
             )
         }
+    }
+
+    private func deliveryFailureMessage(kind: String, raw: String): String {
+        let trimmed = raw.trimAscii()
+        if (trimmed.isEmpty()) {
+            return "${kind} delivery failed"
+        }
+        "${kind} delivery failed: ${trimmed}"
+    }
+
+    private func markDeliveryFailure(
+        j: CronJob,
+        channel: String,
+        accountId: String,
+        peerId: String,
+        deliveryStatus: String,
+        errorKind: String,
+        error: String
+    ): Unit {
+        gatewayLogEventError(
+            "gateway/cron",
+            "cron.delivery_failed",
+            "cron delivery failed",
+            meta: gatewayLogMeta()
+                .string("jobId", j.id)
+                .string("channel", channel)
+                .string("accountId", accountId)
+                .identityHash("peerHash", peerId)
+                .string("deliveryStatus", deliveryStatus)
+                .string("errorKind", errorKind)
+                .rawString("error", error)
+                .object()
+        )
+    }
+
+    private func sendSuccessDelivery(
+        j: CronJob,
+        dplan: CronDeliveryResolved,
+        answer: String,
+        startedAtMs: Int64
+    ): (String, String) {
+        let dm = dplan.mode.trimAscii().toAsciiLower()
+        if (dm == "announce") {
+            let dc = cronEffectiveAnnounceChannel(dplan.channel, j.deliveryChannel)
+            let dt = dplan.to.trimAscii()
+            if (dc.isEmpty() || dt.isEmpty()) {
+                return ("not-delivered", "announce delivery target is empty")
+            }
+            if (let Some(gw) <- this.gatewayOpt) {
+                try {
+                    let body = if (j.deliveryAnnounce) {
+                        "[cron:${j.id}]\n${answer}"
+                    } else {
+                        answer
+                    }
+                    let messageId = gw.sendTextToPeerDetailed(dc, dt, body, accountId: dplan.accountId)
+                    return (if (messageId.trimAscii().isEmpty()) { "unknown" } else { "delivered" }, "")
+                } catch (sendError: Exception) {
+                    this.markDeliveryFailure(j, dc, dplan.accountId, dt, "not-delivered", "send_failed", sendError.message)
+                    return ("not-delivered", this.deliveryFailureMessage("announce", sendError.message))
+                }
+            }
+            this.markDeliveryFailure(j, dc, dplan.accountId, dt, "not-delivered", "gateway_unavailable", "GatewayService is not available")
+            return ("not-delivered", this.deliveryFailureMessage("announce", "GatewayService is not available"))
+        }
+        if (dm == "webhook") {
+            let url = dplan.to.trimAscii()
+            let body = buildCronWebhookSuccessBody(
+                j.id,
+                "ok",
+                answer,
+                startedAtMs,
+                j.sessionTarget
+            )
+            if (postCronWebhookJson(url, body)) {
+                return ("delivered", "")
+            }
+            this.markDeliveryFailure(j, "webhook", dplan.accountId, url, "not-delivered", "webhook_failed", "webhook post returned false")
+            return ("not-delivered", this.deliveryFailureMessage("webhook", "webhook post returned false"))
+        }
+        ("not-requested", "")
+    }
+
+    private func shouldSendFailureAlert(j: CronJob, fplan: CronFailureResolved, nowMs: Int64): Bool {
+        if (fplan.alertAfter > 0 && j.state.consecutiveErrors < fplan.alertAfter) {
+            return false
+        }
+        if (fplan.alertCooldownMs > 0 && j.state.lastFailureAlertAtMs > 0) {
+            if (nowMs - j.state.lastFailureAlertAtMs < fplan.alertCooldownMs) {
+                return false
+            }
+        }
+        true
+    }
+
+    private func sendFailureAlert(j: CronJob, fplan: CronFailureResolved, errMsg: String, startedAtMs: Int64): Bool {
+        let fm = fplan.mode.trimAscii().toAsciiLower()
+        if (fm == "announce") {
+            let fc = cronEffectiveAnnounceChannel(fplan.channel, j.failureChannel)
+            let ft = fplan.to.trimAscii()
+            if (fc.isEmpty() || ft.isEmpty()) {
+                return false
+            }
+            if (let Some(gw) <- this.gatewayOpt) {
+                try {
+                    let body = if (j.failureAnnounce) {
+                        "[cron-failure:${j.id}] ${errMsg}"
+                    } else {
+                        errMsg
+                    }
+                    let messageId = gw.sendTextToPeerDetailed(fc, ft, body, accountId: fplan.accountId)
+                    return !messageId.trimAscii().isEmpty()
+                } catch (sendError: Exception) {
+                    this.markDeliveryFailure(j, fc, fplan.accountId, ft, "not-delivered", "failure_alert_send_failed", sendError.message)
+                    return false
+                }
+            }
+            this.markDeliveryFailure(j, fc, fplan.accountId, ft, "not-delivered", "gateway_unavailable", "GatewayService is not available")
+            return false
+        }
+        if (fm == "webhook") {
+            let fu = fplan.to.trimAscii()
+            let fb = buildCronWebhookFailureBody(j.id, errMsg, startedAtMs, j.sessionTarget)
+            let delivered = postCronWebhookJson(fu, fb)
+            if (!delivered) {
+                this.markDeliveryFailure(j, "webhook", fplan.accountId, fu, "not-delivered", "failure_webhook_failed", "webhook post returned false")
+            }
+            return delivered
+        }
+        false
     }
 
     private func reloadJobsFromDisk(): Unit {
@@ -494,9 +708,16 @@ public class CronRunner {
                 case None => ()
             }
             let (jobBridge, jobRequest) = this.bridgeAndRequestForJob(j, startedAtMs)
+            let options = cronBuildSessionExecutionOptions(j)
+            let turnContextOverride = Some(
+                cronTurnContextWithExecutionOptions(
+                    gatewayResolveSessionContextWithAgentRoute(jobRequest).turnContext,
+                    options
+                )
+            )
             while (attempt < maxAttempts) {
                 try {
-                    answer = this.executeJobReply(j, jobBridge, jobRequest)
+                    answer = this.executeJobReply(j, jobBridge, jobRequest, options, turnContextOverride)
                     status = "success"
                     errMsg = ""
                     break
@@ -523,43 +744,12 @@ public class CronRunner {
             }
 
             if (status == "success" && dplan.requested) {
-                let dm = dplan.mode.trimAscii().toAsciiLower()
-                if (dm == "announce") {
-                    let dc = cronEffectiveAnnounceChannel(dplan.channel, j.deliveryChannel)
-                    let dt = dplan.to.trimAscii()
-                    if (!dc.isEmpty() && !dt.isEmpty()) {
-                        if (let Some(gw) <- this.gatewayOpt) {
-                            let body = if (j.deliveryAnnounce) {
-                                "[cron:${j.id}]\n${answer}"
-                            } else {
-                                answer
-                            }
-                            gw.sendTextToPeer(dc, dt, body)
-                            deliveryStatus = "unknown"
-                        } else {
-                            gatewayLogEventWarn(
-                                "gateway/cron",
-                                "cron.skipped",
-                                "cron announce delivery skipped without GatewayService",
-                                meta: gatewayLogMeta().string("jobId", j.id).object()
-                            )
-                            deliveryStatus = "not-delivered"
-                        }
-                    }
-                } else if (dm == "webhook") {
-                    let url = dplan.to.trimAscii()
-                    let body = buildCronWebhookSuccessBody(
-                        j.id,
-                        "ok",
-                        answer,
-                        startedAtMs,
-                        j.sessionTarget
-                    )
-                    if (postCronWebhookJson(url, body)) {
-                        deliveryStatus = "delivered"
-                    } else {
-                        deliveryStatus = "not-delivered"
-                    }
+                let deliveryResult = this.sendSuccessDelivery(j, dplan, answer, startedAtMs)
+                deliveryStatus = deliveryResult[0]
+                let deliveryError = deliveryResult[1]
+                if (deliveryStatus == "not-delivered" && !dplan.bestEffortDeliver) {
+                    status = "error"
+                    errMsg = deliveryError
                 }
             } else if (!dplan.requested) {
                 deliveryStatus = "not-requested"
@@ -572,24 +762,10 @@ public class CronRunner {
                 this.finalizeError(j, startedAtMs, afterRun, errMsg)
                 match (resolveCronFailurePlan(j, dplan)) {
                     case Some(fplan) =>
-                        let fm = fplan.mode.trimAscii().toAsciiLower()
-                        if (fm == "announce") {
-                            let fc = cronEffectiveAnnounceChannel(fplan.channel, j.failureChannel)
-                            let ft = fplan.to.trimAscii()
-                            if (!fc.isEmpty() && !ft.isEmpty()) {
-                                if (let Some(gw) <- this.gatewayOpt) {
-                                    let body = if (j.failureAnnounce) {
-                                        "[cron-failure:${j.id}] ${errMsg}"
-                                    } else {
-                                        errMsg
-                                    }
-                                    gw.sendTextToPeer(fc, ft, body)
-                                }
+                        if (this.shouldSendFailureAlert(j, fplan, afterRun)) {
+                            if (this.sendFailureAlert(j, fplan, errMsg, startedAtMs)) {
+                                j.state.lastFailureAlertAtMs = afterRun
                             }
-                        } else if (fm == "webhook") {
-                            let fu = fplan.to.trimAscii()
-                            let fb = buildCronWebhookFailureBody(j.id, errMsg, startedAtMs, j.sessionTarget)
-                            postCronWebhookJson(fu, fb)
                         }
                     case None => ()
                 }
@@ -890,11 +1066,28 @@ public class CronRunner {
 }
 
 public func cronBuildSessionRequest(job: CronJob, startedAtMs: Int64): GatewaySessionRequest {
+    let dplan = resolveCronDeliveryPlan(job)
+    let dm = dplan.mode.trimAscii().toAsciiLower()
+    let deliver = dplan.requested && dm == "announce"
+    let replyChannel = if (deliver) {
+        cronEffectiveAnnounceChannel(dplan.channel, job.deliveryChannel)
+    } else {
+        ""
+    }
+    let replyTo = if (deliver) {
+        dplan.to
+    } else {
+        ""
+    }
     GatewaySessionRequest(
         GatewayIngressSource.Cron,
         channelName: "cron",
         sessionHint: cronExecutionConversationKey(job, startedAtMs),
         agentId: job.agentId,
-        text: job.prompt
+        text: job.prompt,
+        replyChannel: replyChannel,
+        replyTo: replyTo,
+        replyAccountId: if (deliver) { dplan.accountId } else { "" },
+        deliver: deliver
     )
 }

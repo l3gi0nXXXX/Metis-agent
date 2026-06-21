@@ -622,6 +622,9 @@ private func gatewayEnsureTurnRuntimeState(turnContext: GatewayTurnContext): Uni
 }
 
 private func gatewayModelOrderForTurnContext(turnContext: GatewayTurnContext): Array<String> {
+    if (!turnContext.modelRefOverride.trimAscii().isEmpty()) {
+        return [turnContext.modelRefOverride.trimAscii()]
+    }
     gatewayEnsureTurnRuntimeState(turnContext)
     CliModelManager.modelSelectionSummaryForAgentScope(turnContext.agentScope)
 }
@@ -640,6 +643,13 @@ private func buildGatewaySystemPrompt(
     let runtimeSkillNames = gatewayRouteRuntimeSkillNames(turnContext)
     let params = MetisSystemPromptParams()
     params.workspaceDir = workspacePath.toString()
+    match (turnContext) {
+        case Some(ctx) =>
+            if (!ctx.thinkingLevel.trimAscii().isEmpty()) {
+                params.defaultThinkLevel = ctx.thinkingLevel
+            }
+        case None => ()
+    }
     params.toolNames = MetisSystemPromptBuilder.collectToolNames(agent.toolManager.tools)
     params.runtimeInfo.agentId = effectiveAgentId
     params.runtimeInfo.model = modelName.trimAscii()
@@ -660,10 +670,18 @@ private func buildGatewaySystemPrompt(
         agentId: effectiveAgentId,
         runtimeSkillNames: runtimeSkillNames
     )
-    let bootstrap = MetisWorkspaceBootstrap.resolveContextFilesDetailed(
-        workspacePath,
-        runtimeChannel: channelName
-    )
+    let lightContext = match (turnContext) {
+        case Some(ctx) => ctx.lightContext
+        case None => false
+    }
+    let bootstrap = if (lightContext) {
+        MetisBootstrapBudgetResult()
+    } else {
+        MetisWorkspaceBootstrap.resolveContextFilesDetailed(
+            workspacePath,
+            runtimeChannel: channelName
+        )
+    }
     params.contextFiles = bootstrap.files
     params.promptContribution = MetisSystemPromptBuilder.buildPromptContributionForModel(modelName)
     params.extraSystemPrompt = buildGatewayExtraSystemPrompt(
@@ -1315,6 +1333,13 @@ public class AgentBridge {
                     if (idx == allModels.size - 1) {
                         throw e
                     }
+                    let hasModelOverride = match (turnContext) {
+                        case Some(ctx) => !ctx.modelRefOverride.trimAscii().isEmpty()
+                        case None => false
+                    }
+                    if (hasModelOverride) {
+                        throw e
+                    }
                     // Strong guarantee for per-channel model binding:
                     // if channel-bound model fails for any reason (invalid key/model/endpoint),
                     // always continue to global model chain.
@@ -1447,6 +1472,19 @@ public class AgentBridge {
         turnContext: Option<GatewayTurnContext>,
         channelBoundModelOpt: Option<String>
     ): (Array<ChatModel>, String) {
+        let overrideModel = match (turnContext) {
+            case Some(ctx) => ctx.modelRefOverride.trimAscii()
+            case None => ""
+        }
+        if (!overrideModel.isEmpty()) {
+            try {
+                let model = ModelManager.createChatModel(overrideModel)
+                model.maxTokens = ModelTokenLimits.getOutputLimit(overrideModel)
+                return ([model], model.fullName.trimAscii())
+            } catch (e: Exception) {
+                throw Exception("cron_model_override_unavailable:${overrideModel}: ${e.message}")
+            }
+        }
         let modelName = match (channelBoundModelOpt) {
             case Some(v) => v.trimAscii()
             case None => ""

@@ -2,7 +2,7 @@ package metis.gateway.core
 
 import metis.core.{GatewayToolRuntimeContext, MediaDiagnosticEvent, emitGatewayMediaDiagnostic, gatewayMediaUnderstandingFirstText, gatewayMediaUnderstandingForRecordWithSettings}
 import metis.core.config.{CliSettingManager, GatewayUserSettings}
-import metis.gateway.session.{GatewaySessionContext, GatewaySessionRequest}
+import metis.gateway.session.{GatewaySessionContext, GatewaySessionRequest, GatewayTurnContext}
 import std.collection.ArrayList
 import std.convert.Parsable
 import std.fs.{Path, exists}
@@ -564,9 +564,28 @@ public func gatewayExecuteSessionRequestTurn(
     transcriptHook!: Option<(GatewaySessionContext, Int64, String, String) -> Unit> = None<(GatewaySessionContext, Int64, String, String) -> Unit>,
     streamHook!: Option<(GatewaySessionContext, String) -> Unit> = None<(GatewaySessionContext, String) -> Unit>,
     streamingEnabled!: Bool = false,
-    lifecycleHook!: Option<(String) -> Unit> = None<(String) -> Unit>
+    lifecycleHook!: Option<(String) -> Unit> = None<(String) -> Unit>,
+    turnContextOverride!: Option<GatewayTurnContext> = None<GatewayTurnContext>
 ): GatewayResolvedSessionTurnResult {
-    let context = gatewayResolveSessionContextWithAgentRoute(request)
+    let resolvedContext = gatewayResolveSessionContextWithAgentRoute(request)
+    let context = match (turnContextOverride) {
+        case Some(turnContext) => GatewaySessionContext(
+            resolvedContext.source,
+            resolvedContext.sourceLabel,
+            resolvedContext.channelName,
+            resolvedContext.sessionKey,
+            resolvedContext.agentId,
+            accountId: resolvedContext.accountId,
+            preferredAccountId: resolvedContext.preferredAccountId,
+            matchedBy: resolvedContext.matchedBy,
+            lastRoutePolicy: resolvedContext.lastRoutePolicy,
+            routeDiagnostics: resolvedContext.routeDiagnostics,
+            lane: resolvedContext.lane,
+            deliveryTarget: resolvedContext.deliveryTarget,
+            turnContext: Some(turnContext)
+        )
+        case None => resolvedContext
+    }
     let toolRuntimeContext = GatewayToolRuntimeContext(
         context.sourceLabel,
         channelName: context.channelName,
@@ -641,7 +660,8 @@ public func gatewayExecuteSessionRequestTurnForUser(
     deliverHook!: Option<(String, String, String, String, Option<String>, Bool) -> String> = None<(String, String, String, String, Option<String>, Bool) -> String>,
     transcriptHook!: Option<(GatewaySessionContext, Int64, String, String) -> Unit> = None<(GatewaySessionContext, Int64, String, String) -> Unit>,
     streamHook!: Option<(GatewaySessionContext, String) -> Unit> = None<(GatewaySessionContext, String) -> Unit>,
-    lifecycleHook!: Option<(String) -> Unit> = None<(String) -> Unit>
+    lifecycleHook!: Option<(String) -> Unit> = None<(String) -> Unit>,
+    turnContextOverride!: Option<GatewayTurnContext> = None<GatewayTurnContext>
 ): GatewayResolvedSessionTurnResult {
     let bridge = gatewayBridgeForSessionRequest(user, request)
     let context = gatewayResolveSessionContextWithAgentRoute(request)
@@ -659,6 +679,7 @@ public func gatewayExecuteSessionRequestTurnForUser(
         transcriptHook: transcriptHook,
         streamHook: streamHook,
         streamingEnabled: gatewayStreamingEnabledForUserChannel(user, context.channelName),
-        lifecycleHook: lifecycleHook
+        lifecycleHook: lifecycleHook,
+        turnContextOverride: turnContextOverride
     )
 }

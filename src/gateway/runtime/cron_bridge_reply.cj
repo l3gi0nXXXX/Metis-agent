@@ -1,7 +1,7 @@
 package metis.gateway.runtime
 
 import metis.gateway.core.{AgentBridge, gatewayExecuteSessionRequestTurn}
-import metis.gateway.session.GatewaySessionRequest
+import metis.gateway.session.{GatewaySessionRequest, GatewayTurnContext}
 import magic.prelude.*
 
 import std.core.Duration
@@ -18,14 +18,30 @@ public func cronBridgeReply(
     bridge: AgentBridge,
     request: GatewaySessionRequest,
     prompt: String,
-    timeoutMs: Int64
+    options: CronSessionExecutionOptions,
+    turnContextOverride!: Option<GatewayTurnContext> = None<GatewayTurnContext>
 ): String {
+    let timeoutMs = options.timeoutMs
     if (timeoutMs <= 0) {
-        return gatewayExecuteSessionRequestTurn(bridge, request, prompt).execution.answer
+        return gatewayExecuteSessionRequestTurn(
+            bridge,
+            request,
+            prompt,
+            timeoutSeconds: options.timeoutSeconds,
+            bestEffortDeliver: options.bestEffortDeliver,
+            turnContextOverride: turnContextOverride
+        ).execution.answer
     }
     let deadline = cronBridgeEpochMs() + timeoutMs
     let fut = spawn {
-        gatewayExecuteSessionRequestTurn(bridge, request, prompt).execution.answer
+        gatewayExecuteSessionRequestTurn(
+            bridge,
+            request,
+            prompt,
+            timeoutSeconds: options.timeoutSeconds,
+            bestEffortDeliver: options.bestEffortDeliver,
+            turnContextOverride: turnContextOverride
+        ).execution.answer
     }
     let watchdog = spawn {
         sleep(Duration.millisecond * timeoutMs)
@@ -42,7 +58,7 @@ public func cronBridgeReply(
             ()
         }
         if (cronBridgeEpochMs() >= deadline - 50) {
-            throw Exception(CRON_JOB_TIMEOUT_MESSAGE)
+            throw Exception("cron timeout after ${timeoutMs}ms")
         }
         throw e
     }

@@ -9,17 +9,23 @@ public struct CronDeliveryResolved {
     public var requested: Bool
     public var channel: String
     public var to: String
+    public var accountId: String
+    public var bestEffortDeliver: Bool
 
     public init(
         mode!: String = "none",
         requested!: Bool = false,
         channel!: String = "",
-        to!: String = ""
+        to!: String = "",
+        accountId!: String = "",
+        bestEffortDeliver!: Bool = false
     ) {
         this.mode = mode
         this.requested = requested
         this.channel = channel
         this.to = to
+        this.accountId = accountId
+        this.bestEffortDeliver = bestEffortDeliver
     }
 }
 
@@ -27,11 +33,24 @@ public struct CronFailureResolved {
     public var mode: String
     public var channel: String
     public var to: String
+    public var accountId: String
+    public var alertAfter: Int64
+    public var alertCooldownMs: Int64
 
-    public init(mode!: String = "announce", channel!: String = "", to!: String = "") {
+    public init(
+        mode!: String = "announce",
+        channel!: String = "",
+        to!: String = "",
+        accountId!: String = "",
+        alertAfter!: Int64 = 0,
+        alertCooldownMs!: Int64 = 0
+    ) {
         this.mode = mode
         this.channel = channel
         this.to = to
+        this.accountId = accountId
+        this.alertAfter = alertAfter
+        this.alertCooldownMs = alertCooldownMs
     }
 }
 
@@ -96,27 +115,57 @@ public func resolveCronDeliveryPlan(job: CronJob): CronDeliveryResolved {
     let dm = job.deliveryMode.trimAscii().toAsciiLower()
     let ch = job.deliveryChannel.trimAscii()
     let to = job.deliveryTo.trimAscii()
+    let accountId = job.deliveryAccountId.trimAscii()
+    let bestEffort = job.bestEffortDeliver
     if (dm == "none") {
         return CronDeliveryResolved(mode: "none", requested: false)
     }
     if (dm == "webhook") {
         match (normalizeCronWebhookUrl(to)) {
-            case Some(u) => return CronDeliveryResolved(mode: "webhook", requested: true, to: u)
+            case Some(u) =>
+                return CronDeliveryResolved(
+                    mode: "webhook",
+                    requested: true,
+                    to: u,
+                    accountId: accountId,
+                    bestEffortDeliver: bestEffort
+                )
             case None => return CronDeliveryResolved(mode: "none", requested: false)
         }
     }
     if (dm == "announce") {
         if (!ch.isEmpty() && !to.isEmpty()) {
-            return CronDeliveryResolved(mode: "announce", requested: true, channel: ch, to: to)
+            return CronDeliveryResolved(
+                mode: "announce",
+                requested: true,
+                channel: ch,
+                to: to,
+                accountId: accountId,
+                bestEffortDeliver: bestEffort
+            )
         }
         return CronDeliveryResolved(mode: "none", requested: false)
     }
     // legacy: 未显式设置 deliveryMode
     if (!ch.isEmpty() && !to.isEmpty()) {
-        return CronDeliveryResolved(mode: "announce", requested: true, channel: ch, to: to)
+        return CronDeliveryResolved(
+            mode: "announce",
+            requested: true,
+            channel: ch,
+            to: to,
+            accountId: accountId,
+            bestEffortDeliver: bestEffort
+        )
     }
     match (normalizeCronWebhookUrl(to)) {
-        case Some(u) => CronDeliveryResolved(mode: "webhook", requested: true, to: u)
+        case Some(u) =>
+            CronDeliveryResolved(
+                mode: "webhook",
+                requested: true,
+                to: u,
+                accountId: accountId,
+                bestEffortDeliver: bestEffort
+            )
         case None => CronDeliveryResolved(mode: "none", requested: false)
     }
 }
@@ -147,6 +196,9 @@ public func resolveCronFailurePlan(job: CronJob, primary: CronDeliveryResolved):
     let fto = job.failureTo.trimAscii()
     let dch = job.deliveryChannel.trimAscii()
     let dto = job.deliveryTo.trimAscii()
+    let accountId = job.failureAccountId.trimAscii()
+    let alertAfter = job.failureAlertAfter
+    let cooldownMs = job.failureAlertCooldownMs
 
     if (fm == "none") {
         return None<CronFailureResolved>
@@ -154,7 +206,13 @@ public func resolveCronFailurePlan(job: CronJob, primary: CronDeliveryResolved):
     if (fm == "webhook") {
         match (normalizeCronWebhookUrl(fto)) {
             case Some(u) =>
-                let fr = CronFailureResolved(mode: "webhook", to: u)
+                let fr = CronFailureResolved(
+                    mode: "webhook",
+                    to: u,
+                    accountId: accountId,
+                    alertAfter: alertAfter,
+                    alertCooldownMs: cooldownMs
+                )
                 if (failureModesMatchPrimary(primary, "webhook", "", u)) {
                     return None<CronFailureResolved>
                 }
@@ -179,7 +237,14 @@ public func resolveCronFailurePlan(job: CronJob, primary: CronDeliveryResolved):
         if (failureModesMatchPrimary(primary, "announce", ch, t)) {
             return None<CronFailureResolved>
         }
-        return Some(CronFailureResolved(mode: "announce", channel: ch, to: t))
+        return Some(CronFailureResolved(
+            mode: "announce",
+            channel: ch,
+            to: t,
+            accountId: accountId,
+            alertAfter: alertAfter,
+            alertCooldownMs: cooldownMs
+        ))
     }
     // legacy：未设置 failureDestMode，沿用原 failureChannel/failureTo 或回退 delivery
     let lch = if (!fch.isEmpty()) {
@@ -200,11 +265,24 @@ public func resolveCronFailurePlan(job: CronJob, primary: CronDeliveryResolved):
             if (failureModesMatchPrimary(primary, "webhook", "", u)) {
                 return None<CronFailureResolved>
             }
-            return Some(CronFailureResolved(mode: "webhook", to: u))
+            return Some(CronFailureResolved(
+                mode: "webhook",
+                to: u,
+                accountId: accountId,
+                alertAfter: alertAfter,
+                alertCooldownMs: cooldownMs
+            ))
         case None =>
             if (failureModesMatchPrimary(primary, "announce", lch, lt)) {
                 return None<CronFailureResolved>
             }
-            Some(CronFailureResolved(mode: "announce", channel: lch, to: lt))
+            Some(CronFailureResolved(
+                mode: "announce",
+                channel: lch,
+                to: lt,
+                accountId: accountId,
+                alertAfter: alertAfter,
+                alertCooldownMs: cooldownMs
+            ))
     }
 }

@@ -559,6 +559,68 @@ public class AgentBridgeRuntimeTest {
     }
 
     @TestCase
+    public func gatewayModelOrderUsesTurnModelOverrideOnly(): Unit {
+        let context = GatewayTurnContext(
+            "writer",
+            modelRefOverride: "openai:gpt-4o-mini"
+        )
+        let models = gatewayDebugModelOrderForTurnContext(context)
+        @Expect(models.size, 1)
+        @Expect(models[0], "openai:gpt-4o-mini")
+    }
+
+    @TestCase
+    public func gatewaySystemPromptAppliesThinkingAndLightContextOverride(): Unit {
+        withAgentBridgeTempHome("metis-cron-agent-bridge-light-context", { home: Path =>
+            writeAgentBridgeAgentConfig(home)
+            let writerWorkspace = home.join("workspaces").join("writer")
+            Directory.create(writerWorkspace, recursive: true)
+            File.writeTo(writerWorkspace.join("SOUL.md"), "# Soul\n\ncron-light-context-should-not-appear\n".toArray())
+            let resolved = gatewayResolveSessionContext(
+                GatewaySessionRequest(
+                    GatewayIngressSource.Cron,
+                    sessionHint: "main",
+                    agentId: "writer"
+                )
+            )
+            let base = resolved.turnContext
+            let context = GatewayTurnContext(
+                base.agentId,
+                workspaceDir: base.workspaceDir,
+                agentDir: base.agentDir,
+                modelsJsonPath: base.modelsJsonPath,
+                authProfilesPath: base.authProfilesPath,
+                legacyAuthPath: base.legacyAuthPath,
+                sessionsDir: base.sessionsDir,
+                sessionKey: base.sessionKey,
+                mainSessionKey: base.mainSessionKey,
+                matchedBy: base.matchedBy,
+                lastRoutePolicy: base.lastRoutePolicy,
+                modelRef: base.modelRef,
+                channelName: base.channelName,
+                accountId: base.accountId,
+                peerId: base.peerId,
+                threadId: base.threadId,
+                senderId: base.senderId,
+                operatorScopes: base.operatorScopes,
+                chatType: base.chatType,
+                route: base.route,
+                agentScope: base.agentScope,
+                thinkingLevel: "high",
+                lightContext: true
+            )
+
+            let prompt = gatewayPolicyFilteredSystemPromptForTurnContext(
+                context,
+                channelName: "cron",
+                modelName: "openai:gpt-4o-mini"
+            )
+            @Expect(prompt.contains("thinking=high"), true)
+            @Expect(prompt.contains("cron-light-context-should-not-appear"), false)
+        })
+    }
+
+    @TestCase
     public func gatewayRuntimeStateUsesSelectedAgentAuthProfileWithoutLeakingPeerSecrets(): Unit {
         withAgentBridgeTempHome("metis-s07-agent-bridge-auth-source", { home: Path =>
             writeAgentBridgeAgentConfig(home)
