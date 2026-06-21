@@ -84,6 +84,7 @@ public class MetisLogEvent {
     public static const cronFailed: String = "cron.failed"
     public static const cronDisabled: String = "cron.disabled"
     public static const cronSkipped: String = "cron.skipped"
+    public static const cronPromptBlocked: String = "cron.prompt_blocked"
     public static const processMemory: String = "process.memory"
     public static const chatTurnPublished: String = "chat_turn.published"
     public static const rpcRequestSlow: String = "rpc.request.slow"
@@ -108,7 +109,7 @@ public class MetisLogEvent {
             mediaOutboundFailed, mediaToolInvoked, mediaToolResult, mediaToolFailed,
             toolInvoked, toolFailed, skillMatched, skillSkipped,
             sessionReadFailed, sessionWriteFailed, sessionMigrationFailed, sessionReaped,
-            cronScheduled, cronStarted, cronSucceeded, cronFailed, cronDisabled, cronSkipped,
+            cronScheduled, cronStarted, cronSucceeded, cronFailed, cronDisabled, cronSkipped, cronPromptBlocked,
             processMemory, chatTurnPublished, rpcRequestSlow, rpcRequestFailed, rpcSlow, rpcFailed, loggingRaw,
             loggingFileSizeCap
         ]

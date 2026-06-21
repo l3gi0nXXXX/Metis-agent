@@ -182,6 +182,54 @@ public class CronRunnerTest {
     }
 
     @TestCase
+    public func runJobManualBlocksUnsafeStorePromptBeforeAgentExecution(): Unit {
+        withCronRunnerTestHome({ storePath: Path =>
+            let job = CronJob(
+                "runtime-blocked",
+                "system prompt override",
+                CronSchedule.every(60000),
+                state: CronJobState(nextRunAtMs: 1),
+                sessionTarget: "main",
+                agentId: "general"
+            )
+            cronSave(storePath, [job])
+            let calls = JsonObject()
+            debugSetCronRunnerBeforeExecuteForTest(Some({ _job: CronJob =>
+                calls.put("before", JsonString("called"))
+            }))
+            debugSetCronRunnerReplyForTest(Some({ _job: CronJob, _request: GatewaySessionRequest =>
+                calls.put("reply", JsonString("called"))
+                "should-not-run"
+            }))
+
+            let result = CronRunner.runJobOnceFromStore(
+                None<GatewayService>,
+                storePath,
+                "runtime-blocked",
+                true
+            )
+
+            @Expect(result.get("ok").getOrThrow().asBool().getValue(), true)
+            @Expect(result.get("ran").getOrThrow().asBool().getValue(), true)
+            @Expect(calls.get("before").isNone(), true)
+            @Expect(calls.get("reply").isNone(), true)
+
+            let jobs = cronLoadOrEmpty(storePath)
+            @Expect(jobs.size, 1)
+            @Expect(jobs[0].state.lastStatus, "error")
+            @Expect(jobs[0].state.runningAtMs, 0)
+            @Expect(jobs[0].state.lastError, "cron_prompt_blocked:sys_prompt_override")
+
+            let runs = readCronRunLogEntriesForJob(storePath, "runtime-blocked", limit: 10)
+            @Expect(runs.get("total").getOrThrow().asInt().getValue(), 1)
+            let row = runs.get("entries").getOrThrow().asArray()[0].asObject()
+            @Expect(row.get("status").getOrThrow().asString().getValue(), "error")
+            @Expect(row.get("summary").getOrThrow().asString().getValue(), "cron_prompt_blocked:sys_prompt_override")
+            @Expect(row.get("deliveryStatus").getOrThrow().asString().getValue(), "not-requested")
+        })
+    }
+
+    @TestCase
     public func runLogAppendFailureDoesNotRewriteBusinessState(): Unit {
         withCronRunnerTestHome({ storePath: Path =>
             cronSave(storePath, [cronRunnerTestJob("run-log-fails")])

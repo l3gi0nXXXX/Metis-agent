@@ -2,6 +2,7 @@ package metis.cron
 
 import metis.core.config.CliConfig
 import metis.core.config.CliSettingManager
+import metis.gateway.logging.{MetisLogEvent, metisCreateSubsystemLogger}
 
 import std.collection.ArrayList
 import std.convert.Parsable
@@ -120,6 +121,31 @@ public func executeGatewayCronCommand(sub: Array<String>): (String, Int64) {
 
 private func cronErr(message: String): (String, Int64) {
     ("Cron command failed\nError: ${message}", 1)
+}
+
+private func cronLogPromptBlocked(jobId: String, scan: CronPromptScanResult, prompt: String, source: String): Unit {
+    try {
+        metisCreateSubsystemLogger("gateway/cron").warn(
+            MetisLogEvent.cronPromptBlocked,
+            "cron prompt blocked",
+            meta: cronPromptScanMeta(jobId, scan, prompt, source)
+        )
+    } catch (_: Exception) {
+        ()
+    }
+}
+
+private func cronPromptBlockedOutput(jobId: String, scan: CronPromptScanResult, prompt: String, source: String, json: Bool): (String, Int64) {
+    cronLogPromptBlocked(jobId, scan, prompt, source)
+    if (json) {
+        let out = JsonObject()
+        out.put("ok", JsonBool(false))
+        out.put("errorCode", JsonString("cron_prompt_blocked"))
+        out.put("threatId", JsonString(scan.threatId))
+        out.put("message", JsonString(scan.message))
+        return (out.toJsonString(), 1)
+    }
+    cronErr(scan.message)
 }
 
 private func cronHelpText(): String {
@@ -1340,6 +1366,11 @@ private func cronCmdAddNamed(path: Path, sub: Array<String>): (String, Int64) {
         0
     }
 
+    let promptScan = scanCronPromptStrict(message)
+    if (!promptScan.ok) {
+        return cronPromptBlockedOutput(name, promptScan, message, "cron.add", json)
+    }
+
     let createdMs = DateTime.now().toUnixTimeStamp().toMilliseconds()
     if (let Some(ev) <- everyOpt) {
         // 使用主构造函数，避免部分仓颉版本在超长函数内对 `CronSchedule.every` 静态方法解析异常
@@ -1492,6 +1523,10 @@ private func cronCmdAddLegacy(path: Path, sub: Array<String>): (String, Int64) {
         if (prompt.isEmpty()) {
             return ("prompt 不能为空。", 1)
         }
+        let promptScan = scanCronPromptStrict(prompt)
+        if (!promptScan.ok) {
+            return cronPromptBlockedOutput(id, promptScan, prompt, "cron.add.legacy", false)
+        }
         let job = CronJob(
             id,
             prompt,
@@ -1522,6 +1557,10 @@ private func cronCmdAddLegacy(path: Path, sub: Array<String>): (String, Int64) {
                 let prompt = joinFrom(sub, 5)
                 if (prompt.isEmpty()) {
                     return ("prompt 不能为空。", 1)
+                }
+                let promptScan = scanCronPromptStrict(prompt)
+                if (!promptScan.ok) {
+                    return cronPromptBlockedOutput(id, promptScan, prompt, "cron.add.legacy", false)
                 }
                 let job = CronJob(
                     id,
@@ -1576,6 +1615,16 @@ private func cronCmdEdit(path: Path, sub: Array<String>): (String, Int64) {
 
     if (enabledOpt.isNone() && messageOpt.isNone()) {
         return ("请指定 --enabled 或 --message。", 1)
+    }
+    match (messageOpt) {
+        case Some(newPrompt) =>
+            if (!newPrompt.trimAscii().isEmpty()) {
+                let promptScan = scanCronPromptStrict(newPrompt)
+                if (!promptScan.ok) {
+                    return cronPromptBlockedOutput(jobId, promptScan, newPrompt, "cron.edit", false)
+                }
+            }
+        case None => ()
     }
 
     let list = ArrayList<CronJob>()
@@ -2073,6 +2122,17 @@ private func cronCmdUpdate(path: Path, sub: Array<String>): (String, Int64) {
             }
             if ((staggerExactPatch || staggerMsPatch.isSome()) && (everyOpt.isSome() || atOpt.isSome())) {
                 return cronErr("invalid cron.update params: --stagger/--exact are not valid with --every/--at")
+            }
+            match (messageOpt) {
+                case Some(newPrompt) =>
+                    let trimmedPrompt = newPrompt.trimAscii()
+                    if (!trimmedPrompt.isEmpty()) {
+                        let promptScan = scanCronPromptStrict(newPrompt)
+                        if (!promptScan.ok) {
+                            return cronPromptBlockedOutput(jobId, promptScan, newPrompt, "cron.update", json)
+                        }
+                    }
+                case None => ()
             }
             let list = ArrayList<CronJob>()
             var found = false

@@ -24,6 +24,7 @@ import metis.cron.{
     buildCronWebhookFailureBody,
     buildCronWebhookSuccessBody,
     computeJobNextRun,
+    cronPromptScanMeta,
     cronExecutionConversationKey,
     cronShouldRouteThroughDreaming,
     cronWebhookTimeoutMs,
@@ -36,7 +37,8 @@ import metis.cron.{
     postCronWebhookJson,
     cronEffectiveAnnounceChannel,
     resolveCronDeliveryPlan,
-    resolveCronFailurePlan
+    resolveCronFailurePlan,
+    scanCronPromptAssembled
 }
 
 import magic.prelude.*
@@ -704,6 +706,34 @@ public class CronRunner {
         let maxAttempts = max(1, j.maxRetries + 1)
 
         try {
+            let promptScan = scanCronPromptAssembled(j.prompt)
+            if (!promptScan.ok) {
+                let afterRun = epochMs()
+                status = "error"
+                errMsg = "cron_prompt_blocked:${promptScan.threatId}"
+                try {
+                    gatewayLogEventWarn(
+                        "gateway/cron",
+                        "cron.prompt_blocked",
+                        "cron prompt blocked",
+                        meta: cronPromptScanMeta(j.id, promptScan, j.prompt, "runtime")
+                    )
+                } catch (_: Exception) {
+                    ()
+                }
+                this.finalizeError(j, startedAtMs, afterRun, errMsg)
+                match (resolveCronFailurePlan(j, dplan)) {
+                    case Some(fplan) =>
+                        if (this.shouldSendFailureAlert(j, fplan, afterRun)) {
+                            if (this.sendFailureAlert(j, fplan, errMsg, startedAtMs)) {
+                                j.state.lastFailureAlertAtMs = afterRun
+                            }
+                        }
+                    case None => ()
+                }
+                this.appendRunLogIsolated(j, status, startedAtMs, afterRun, errMsg, answer, deliveryStatus)
+                return
+            }
             match (cronRunnerBeforeExecuteHookForTest()) {
                 case Some(hook) => hook(j)
                 case None => ()

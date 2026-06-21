@@ -3,7 +3,7 @@ package metis.gateway.tools
 import magic.dsl.{tool, toolset}
 import magic.prelude.*
 
-import metis.cron.executeGatewayCronCommand
+import metis.cron.{CronPromptScanResult, executeGatewayCronCommand, scanCronPromptStrict}
 import metis.io.PrintUtils
 
 import std.collection.ArrayList
@@ -68,6 +68,19 @@ public class GatewayCronToolset {
             return normalized
         }
         ""
+    }
+
+    private func promptBlockedResult(action: String, scan: CronPromptScanResult): String {
+        let err = JsonObject()
+        err.put("ok", false.toJsonValue())
+        err.put("action", JsonString(action))
+        err.put("status", JsonString("error"))
+        err.put("errorCode", JsonString("cron_prompt_blocked"))
+        err.put("threatId", JsonString(scan.threatId))
+        err.put("message", JsonString(scan.message))
+        let out = err.toJsonString()
+        PrintUtils.printToolResult(out)
+        out
     }
 
     @tool[
@@ -156,6 +169,10 @@ public class GatewayCronToolset {
                 PrintUtils.printToolResult(out)
                 return out
             }
+            let promptScan = scanCronPromptStrict(msg)
+            if (!promptScan.ok) {
+                return this.promptBlockedResult("add", promptScan)
+            }
             args.add("add")
             args.add("--name")
             args.add(jobName)
@@ -217,6 +234,17 @@ public class GatewayCronToolset {
                 let out = err.toJsonString()
                 PrintUtils.printToolResult(out)
                 return out
+            }
+            match (message) {
+                case Some(rawPrompt) =>
+                    let prompt = rawPrompt.trimAscii()
+                    if (!prompt.isEmpty()) {
+                        let promptScan = scanCronPromptStrict(rawPrompt)
+                        if (!promptScan.ok) {
+                            return this.promptBlockedResult("update", promptScan)
+                        }
+                    }
+                case None => ()
             }
             args.add("update")
             args.add("--job-id")
