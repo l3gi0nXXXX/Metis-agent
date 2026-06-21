@@ -1,5 +1,6 @@
 package metis.gateway.gitcode_plugin
 
+import metis.gateway.logging.{MetisLogEvent, metisCreateSubsystemLogger}
 import std.collection.ArrayList
 import std.time.*
 import stdx.encoding.json.{JsonArray, JsonBool, JsonInt, JsonObject, JsonString, JsonValue}
@@ -112,6 +113,8 @@ private var gitCodeCkbClientRunnerForTest: Option<(String, JsonObject) -> GitCod
 private var gitCodeCkbHttpRunnerForTest: Option<(GitCodeCkbHttpRequest) -> GitCodeCkbHttpResponse> =
     None<(GitCodeCkbHttpRequest) -> GitCodeCkbHttpResponse>
 
+private let gitCodeCkbHttpLogger = metisCreateSubsystemLogger("gateway/gitcode/ckb")
+
 public func setGitCodeCkbClientRunnerForTest(runner: Option<(String, JsonObject) -> GitCodeCkbClientResult>): Unit {
     gitCodeCkbClientRunnerForTest = runner
 }
@@ -206,11 +209,40 @@ public class GitCodeCkbHttpClient {
             return GitCodeCkbHttpResponse(0, error: "ckb path is not allowed")
         }
         let request = GitCodeCkbHttpRequest("POST", path, ckbEndpointUrl(this.config.endpoint, path), body.toJsonString(), this.config.timeoutMs)
-        match (gitCodeCkbHttpRunnerForTest) {
+        let startedAtMs = gitCodeCkbNowMillis()
+        gitCodeCkbLogRequest(request, this.config.endpoint)
+        let response = match (gitCodeCkbHttpRunnerForTest) {
             case Some(runner) => runner(request)
             case None => ckbNativePost(request)
         }
+        gitCodeCkbLogResponse(request, response, gitCodeCkbNowMillis() - startedAtMs)
+        response
     }
+}
+
+private func gitCodeCkbNowMillis(): Int64 {
+    DateTime.now().toUnixTimeStamp().toMilliseconds()
+}
+
+private func gitCodeCkbLogRequest(request: GitCodeCkbHttpRequest, endpoint: String): Unit {
+    let meta = JsonObject()
+    meta.put("method", JsonString(request.method))
+    meta.put("path", JsonString(request.path))
+    meta.put("endpoint", JsonString(gitCodeReviewRedactSensitiveText(endpoint.trimAscii())))
+    meta.put("timeoutMs", JsonInt(request.timeoutMs))
+    gitCodeCkbHttpLogger.info(MetisLogEvent.loggingRaw, "gitcode.ckb.request path=${request.path}", meta: meta)
+}
+
+private func gitCodeCkbLogResponse(request: GitCodeCkbHttpRequest, response: GitCodeCkbHttpResponse, durationMs: Int64): Unit {
+    let meta = JsonObject()
+    meta.put("method", JsonString(request.method))
+    meta.put("path", JsonString(request.path))
+    meta.put("statusCode", JsonInt(response.statusCode))
+    meta.put("durationMs", JsonInt(durationMs))
+    if (!response.error.isEmpty()) {
+        meta.put("error", JsonString(response.error))
+    }
+    gitCodeCkbHttpLogger.info(MetisLogEvent.loggingRaw, "gitcode.ckb.response path=${request.path} status=${response.statusCode}", meta: meta)
 }
 
 private func ckbObjectString(obj: JsonObject, key: String): String {
