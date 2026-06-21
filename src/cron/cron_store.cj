@@ -3,13 +3,16 @@ package metis.cron
 import magic.log.LogUtils
 
 import std.collection.ArrayList
-import std.fs.{Path, File, Directory, exists, copy, remove}
+import std.fs.{Path, File, Directory, exists, copy, remove, rename}
+import std.posix.chmod
+import std.sync.Mutex
 import std.time.DateTime
 import stdx.encoding.json.*
 
 private let STORE_VERSION: Int64 = 1
 private let STORE_DIR: String = "cron"
 private let FILE_NAME: String = "jobs.json"
+private let cronStoreWriteLock = Mutex()
 
 private func readStr(o: JsonObject, key: String, default!: String = ""): String {
     match (o.get(key)) {
@@ -143,16 +146,26 @@ public func cronLoadOrEmpty(path: Path): Array<CronJob> {
     if (!exists(path)) {
         return Array<CronJob>()
     }
-    try {
-        let text = String.fromUtf8(File.readFrom(path))
-        let root = JsonValue.fromStr(text).asObject()
-        let ver = readI64(root, "version", default: 0)
-        if (ver != STORE_VERSION) {
-            LogUtils.info("CronStore: version mismatch (got ${ver}, expect ${STORE_VERSION}), still trying to parse jobs")
-        }
-        let list = ArrayList<CronJob>()
-        match (root.get("jobs")) {
-            case Some(jv) =>
+    let text = try {
+        String.fromUtf8(File.readFrom(path))
+    } catch (_: Exception) {
+        LogUtils.error("CronStore: invalid_response_encoding")
+        return Array<CronJob>()
+    }
+    let root = try {
+        JsonValue.fromStr(text).asObject()
+    } catch (_: Exception) {
+        LogUtils.error("CronStore: malformed_json")
+        return Array<CronJob>()
+    }
+    let ver = readI64(root, "version", default: 0)
+    if (ver != STORE_VERSION) {
+        LogUtils.info("CronStore: version mismatch (got ${ver}, expect ${STORE_VERSION}), still trying to parse jobs")
+    }
+    let list = ArrayList<CronJob>()
+    match (root.get("jobs")) {
+        case Some(jv) =>
+            try {
                 let arr = jv.asArray()
                 for (item in arr.getItems()) {
                     try {
@@ -164,12 +177,57 @@ public func cronLoadOrEmpty(path: Path): Array<CronJob> {
                         ()
                     }
                 }
-            case None => ()
+            } catch (_: Exception) {
+                LogUtils.error("CronStore: malformed_jobs_array")
+            }
+        case None => ()
+    }
+    list.toArray()
+}
+
+public func cronEnsureCronDirPermissions(dir: Path): Unit {
+    if (!exists(dir)) {
+        Directory.create(dir, recursive: true)
+    }
+    try {
+        chmod(dir.toString(), UInt32(0o700))
+    } catch (_: Exception) {
+        LogUtils.error("CronStore: chmod_dir_failed")
+    }
+}
+
+public func cronEnsureCronFilePermissions(path: Path): Unit {
+    try {
+        chmod(path.toString(), UInt32(0o600))
+    } catch (_: Exception) {
+        LogUtils.error("CronStore: chmod_file_failed")
+    }
+}
+
+public func cronReplaceStoreFile(tmp: Path, target: Path): Unit {
+    var attempts: Int64 = 0
+    var lastError = ""
+    while (attempts < 3) {
+        try {
+            rename(tmp, to: target, overwrite: true)
+            return
+        } catch (e: Exception) {
+            attempts += 1
+            lastError = e.message
+            LogUtils.error("CronStore: rename_failed attempt=${attempts}")
         }
-        list.toArray()
-    } catch (e: Exception) {
-        LogUtils.error("CronStore: load failed: ${e.message}")
-        Array<CronJob>()
+    }
+    throw Exception("cron store replace failed: ${lastError}")
+}
+
+private func cronStoreContentChanged(path: Path, next: String): Bool {
+    if (!exists(path)) {
+        return false
+    }
+    try {
+        String.fromUtf8(File.readFrom(path)) != next
+    } catch (_: Exception) {
+        true
     }
 }
 
@@ -257,33 +315,40 @@ public func cronSave(path: Path, jobs: Array<CronJob>): Unit {
  * 与参考实现的 `saveCronStore` 类似：先写临时文件、尽力备份 `.bak`、再替换目标文件。
  */
 public func cronSaveAtomic(path: Path, jobs: Array<CronJob>): Unit {
-    let parent = path.parent
-    if (!exists(parent)) {
-        Directory.create(parent, recursive: true)
-    }
-    let bytes = buildStoreJsonBytes(jobs)
-    let stamp = DateTime.now().toUnixTimeStamp().toMilliseconds()
-    let tmp = parent.join("${FILE_NAME}.${stamp}.tmp")
-    File.writeTo(tmp, bytes)
-    let bak = parent.join("${FILE_NAME}.bak")
-    if (exists(path)) {
+    synchronized(cronStoreWriteLock) {
+        let parent = path.parent
+        cronEnsureCronDirPermissions(parent)
+        let nextText = JsonValue.fromStr(String.fromUtf8(buildStoreJsonBytes(jobs))).toJsonString()
+        let bytes = nextText.toArray()
+        let stamp = DateTime.now().toUnixTimeStamp().toNanoseconds()
+        let tmp = parent.join("${FILE_NAME}.${stamp}.tmp")
         try {
-            copy(path, to: bak, overwrite: true)
+            remove(tmp)
         } catch (_: Exception) {
             ()
         }
-    }
-    try {
-        if (exists(path)) {
-            remove(path)
+        File.writeTo(tmp, bytes)
+        cronEnsureCronFilePermissions(tmp)
+        let bak = parent.join("${FILE_NAME}.bak")
+        if (cronStoreContentChanged(path, nextText)) {
+            try {
+                copy(path, to: bak, overwrite: true)
+                cronEnsureCronFilePermissions(bak)
+            } catch (_: Exception) {
+                LogUtils.error("CronStore: backup_failed")
+            }
         }
-    } catch (_: Exception) {
-        ()
-    }
-    copy(tmp, to: path, overwrite: true)
-    try {
-        remove(tmp)
-    } catch (_: Exception) {
-        ()
+        try {
+            cronReplaceStoreFile(tmp, path)
+            cronEnsureCronFilePermissions(path)
+        } finally {
+            try {
+                if (exists(tmp)) {
+                    remove(tmp)
+                }
+            } catch (_: Exception) {
+                ()
+            }
+        }
     }
 }

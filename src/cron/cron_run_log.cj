@@ -3,9 +3,12 @@ package metis.cron
 import std.collection.ArrayList
 import std.fs.{Directory, File, Path, exists}
 import std.sort.sort
+import std.sync.Mutex
 import stdx.encoding.json.{JsonArray, JsonBool, JsonFloat, JsonInt, JsonObject, JsonString, JsonValue}
 
 private let DEFAULT_RUNS_LIMIT: Int64 = 50
+private let MAX_RUN_LOG_ENTRIES: Int64 = 2000
+private let cronRunLogAppendLock = Mutex()
 
 private func jsonEscape(raw: String): String {
     raw.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
@@ -16,8 +19,57 @@ public func cronRunsDirFromStore(storePath: Path): Path {
     storePath.parent.join("runs")
 }
 
+private func validateCronRunLogJobId(jobId: String): String {
+    let trimmed = jobId.trimAscii()
+    if (trimmed.isEmpty() ||
+        trimmed.contains("/") ||
+        trimmed.contains("\\") ||
+        trimmed.contains("\0") ||
+        trimmed.contains("..")) {
+        throw Exception("invalid cron run log job id")
+    }
+    trimmed
+}
+
 public func cronRunLogPathFromStore(storePath: Path, jobId: String): Path {
-    cronRunsDirFromStore(storePath).join("${jobId}.jsonl")
+    let safeJobId = validateCronRunLogJobId(jobId)
+    let dir = cronRunsDirFromStore(storePath)
+    let path = dir.join("${safeJobId}.jsonl")
+    if (!path.toString().startsWith(dir.toString() + "/")) {
+        throw Exception("invalid cron run log path")
+    }
+    path
+}
+
+private func readCronRunLogLines(path: Path): Array<String> {
+    try {
+        String.fromUtf8(File.readFrom(path)).split("\n")
+    } catch (_: Exception) {
+        Array<String>()
+    }
+}
+
+private func pruneCronRunLogLocked(path: Path, maxEntries: Int64): Unit {
+    if (maxEntries <= 0 || !exists(path)) {
+        return
+    }
+    let kept = ArrayList<String>()
+    for (line in readCronRunLogLines(path)) {
+        let t = line.trimAscii()
+        if (!t.isEmpty()) {
+            kept.add(t)
+        }
+    }
+    if (kept.size <= maxEntries) {
+        return
+    }
+    let out = ArrayList<String>()
+    var i = kept.size - maxEntries
+    while (i < kept.size) {
+        out.add(kept[i])
+        i += 1
+    }
+    File.writeTo(path, (String.join(out.toArray(), delimiter: "\n") + "\n").toArray())
 }
 
 public func appendCronRunLog(
@@ -33,32 +85,31 @@ public func appendCronRunLog(
     nextRunAtMs!: Int64 = 0,
     deliveryStatus!: String = "not-requested"
 ): Unit {
-    let dir = cronRunsDirFromStore(storePath)
-    if (!exists(dir)) {
-        Directory.create(dir, recursive: true)
-    }
-    let p = cronRunLogPathFromStore(storePath, jobId)
-    let durationMs = if (endedAtMs >= startedAtMs) { endedAtMs - startedAtMs } else { 0 }
-    let line = "{" +
-        "\"ts\":${endedAtMs}," +
-        "\"jobId\":\"${jsonEscape(jobId)}\"," +
-        "\"action\":\"finished\"," +
-        "\"status\":\"${jsonEscape(status)}\"," +
-        "\"summary\":\"${jsonEscape(summary)}\"," +
-        "\"runAtMs\":${if (runAtMs > 0) { runAtMs } else { startedAtMs }}," +
-        "\"startedAtMs\":${startedAtMs}," +
-        "\"endedAtMs\":${endedAtMs}," +
-        "\"durationMs\":${durationMs}," +
-        "\"nextRunAtMs\":${nextRunAtMs}," +
-        "\"deliveryStatus\":\"${jsonEscape(deliveryStatus)}\"," +
-        "\"sessionTarget\":\"${jsonEscape(sessionTarget)}\"," +
-        "\"error\":\"${jsonEscape(errorMessage)}\"" +
-        "}\n"
-    if (exists(p)) {
-        let old = String.fromUtf8(File.readFrom(p))
-        File.writeTo(p, (old + line).toArray())
-    } else {
-        File.writeTo(p, line.toArray())
+    synchronized(cronRunLogAppendLock) {
+        let safeJobId = validateCronRunLogJobId(jobId)
+        let dir = cronRunsDirFromStore(storePath)
+        if (!exists(dir)) {
+            Directory.create(dir, recursive: true)
+        }
+        let p = cronRunLogPathFromStore(storePath, safeJobId)
+        let durationMs = if (endedAtMs >= startedAtMs) { endedAtMs - startedAtMs } else { 0 }
+        let line = "{" +
+            "\"ts\":${endedAtMs}," +
+            "\"jobId\":\"${jsonEscape(safeJobId)}\"," +
+            "\"action\":\"finished\"," +
+            "\"status\":\"${jsonEscape(status)}\"," +
+            "\"summary\":\"${jsonEscape(summary)}\"," +
+            "\"runAtMs\":${if (runAtMs > 0) { runAtMs } else { startedAtMs }}," +
+            "\"startedAtMs\":${startedAtMs}," +
+            "\"endedAtMs\":${endedAtMs}," +
+            "\"durationMs\":${durationMs}," +
+            "\"nextRunAtMs\":${nextRunAtMs}," +
+            "\"deliveryStatus\":\"${jsonEscape(deliveryStatus)}\"," +
+            "\"sessionTarget\":\"${jsonEscape(sessionTarget)}\"," +
+            "\"error\":\"${jsonEscape(errorMessage)}\"" +
+            "}\n"
+        File.appendTo(p, line.toArray())
+        pruneCronRunLogLocked(p, MAX_RUN_LOG_ENTRIES)
     }
 }
 
@@ -101,9 +152,8 @@ public func readCronRunLogEntriesForJob(
         empty.put("nextOffset", JsonValue.fromStr("null"))
         return empty
     }
-    let text = String.fromUtf8(File.readFrom(p))
     let rows = ArrayList<JsonObject>()
-    for (line in text.split("\n")) {
+    for (line in readCronRunLogLines(p)) {
         let t = line.trimAscii()
         if (t.isEmpty()) {
             continue
