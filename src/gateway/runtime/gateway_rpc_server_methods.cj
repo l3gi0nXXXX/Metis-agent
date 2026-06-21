@@ -51,6 +51,10 @@ public func gatewayDispatchLocalMethod(request: GatewayRpcRequest): GatewayRpcRe
         case Some(res) => return res
         case None => ()
     }
+    match (handleGatewayNodeFamily(method, user, request: Some(request))) {
+        case Some(res) => return res
+        case None => ()
+    }
     match (handleGatewayWizardFamily(method)) {
         case Some(res) => return res
         case None => ()

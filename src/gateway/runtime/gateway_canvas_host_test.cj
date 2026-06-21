@@ -10,7 +10,7 @@ import std.fs.{Directory, File, Path, exists, remove}
 import std.process.executeWithOutput
 import std.time.*
 import std.unittest.testmacro.*
-import stdx.encoding.json.{JsonArray, JsonObject}
+import stdx.encoding.json.{JsonArray, JsonObject, JsonString}
 import stdx.net.http.*
 
 private func withGatewayCanvasTestRoot<T>(block: (Path) -> T): T {
@@ -34,13 +34,17 @@ private func withGatewayCanvasTestRoot<T>(block: (Path) -> T): T {
     }
 }
 
-private func canvasTestConfig(enabled: Bool, root: String, port!: Int64 = 18793): GatewayConfig {
+private func canvasTestUserSettings(enabled: Bool, root: String, port!: Int64 = 18793): GatewayUserSettings {
     var user = GatewayUserSettings()
     user.canvas.enabled = enabled
     user.canvas.root = root
     user.canvas.port = port
     user.canvas.liveReload = true
-    buildGatewayConfigFromUserSettings(user)
+    user
+}
+
+private func canvasTestConfig(enabled: Bool, root: String, port!: Int64 = 18793): GatewayConfig {
+    buildGatewayConfigFromUserSettings(canvasTestUserSettings(enabled, root, port: port))
 }
 
 private func canvasTestString(obj: JsonObject, key: String): String {
@@ -141,6 +145,25 @@ private func canvasJsonArrayContains(arr: JsonArray, expected: String): Bool {
         }
     }
     false
+}
+
+private func canvasScopedUrlForTest(cfg: GatewayConfig, nodeId: String): String {
+    debugGatewayCanvasRegisterNodeSessionForTest(nodeId, role: "node", capabilities: ["canvas"], ttlMs: 600000)
+    let params = JsonObject()
+    params.put("nodeId", JsonString(nodeId))
+    let response = gatewayCanvasRefreshNodeCapability(
+        cfg,
+        GatewayRpcRequest("node.canvas.capability.refresh", params: params, clientId: nodeId, mode: "node")
+    )
+    if (!response.ok) {
+        return ""
+    }
+    let result = try {
+        response.result.asObject()
+    } catch (_: Exception) {
+        JsonObject()
+    }
+    canvasTestString(result, "scopedUrl")
 }
 
 @Test
@@ -269,14 +292,18 @@ public class GatewayCanvasHostRootStateTest {
         withGatewayCanvasTestRoot<Unit>({ root =>
             File.writeTo(root.join("index.html"), "<html>metis</html>".toArray())
             let port = canvasTestPort()
-            let cfg = canvasTestConfig(true, root.toString(), port: port)
+            let user = canvasTestUserSettings(true, root.toString(), port: port)
+            let cfg = buildGatewayConfigFromUserSettings(user)
             try {
+                debugGatewayCanvasClearNodeSessionsForTest()
                 GatewayCanvasHostRuntime.startIfNeeded(cfg)
-                let result = canvasFetch("http://127.0.0.1:${port}/__metis__/canvas/missing.txt")
+                let scopedUrl = canvasScopedUrlForTest(cfg, "node-missing-asset")
+                let result = canvasFetch(scopedUrl + "missing.txt")
                 @Expect(result.status, 404)
                 @Expect(result.body.contains(root.toString()), false)
             } finally {
                 GatewayCanvasHostRuntime.stopIfRunning()
+                debugGatewayCanvasClearNodeSessionsForTest()
             }
         })
     }
@@ -288,13 +315,16 @@ public class GatewayCanvasHostRootStateTest {
             let port = canvasTestPort()
             let cfg = canvasTestConfig(true, root.toString(), port: port)
             try {
+                debugGatewayCanvasClearNodeSessionsForTest()
                 GatewayCanvasHostRuntime.startIfNeeded(cfg)
-                let post = canvasFetch("http://127.0.0.1:${port}/__metis__/canvas/", method: "POST")
-                let put = canvasFetch("http://127.0.0.1:${port}/__metis__/canvas/", method: "PUT")
+                let scopedUrl = canvasScopedUrlForTest(cfg, "node-methods")
+                let post = canvasFetch(scopedUrl, method: "POST")
+                let put = canvasFetch(scopedUrl, method: "PUT")
                 @Expect(post.status, 405)
                 @Expect(put.status, 405)
             } finally {
                 GatewayCanvasHostRuntime.stopIfRunning()
+                debugGatewayCanvasClearNodeSessionsForTest()
             }
         })
     }
@@ -306,8 +336,10 @@ public class GatewayCanvasHostRootStateTest {
             let port = canvasTestPort()
             let cfg = canvasTestConfig(true, root.toString(), port: port)
             try {
+                debugGatewayCanvasClearNodeSessionsForTest()
                 GatewayCanvasHostRuntime.startIfNeeded(cfg)
-                let result = canvasFetch("http://127.0.0.1:${port}/__metis__/canvas/")
+                let scopedUrl = canvasScopedUrlForTest(cfg, "node-started-host")
+                let result = canvasFetch(scopedUrl)
                 @Expect(result.status, 200)
                 @Expect(result.contentType, "text/html; charset=utf-8")
                 @Expect(result.body.contains("metis canvas"), true)
@@ -318,6 +350,7 @@ public class GatewayCanvasHostRootStateTest {
                 @Expect(canvasTestString(state, "httpUrl"), "http://127.0.0.1:${port}/__metis__/canvas/")
             } finally {
                 GatewayCanvasHostRuntime.stopIfRunning()
+                debugGatewayCanvasClearNodeSessionsForTest()
             }
         })
     }
@@ -329,6 +362,7 @@ public class GatewayCanvasHostRootStateTest {
             let missing = root.join("missing").toString()
             let cfg = canvasTestConfig(true, missing, port: port)
             try {
+                debugGatewayCanvasClearNodeSessionsForTest()
                 GatewayCanvasHostRuntime.startIfNeeded(cfg)
                 let state = GatewayCanvasHostRuntime.snapshot(cfg)
                 @Expect(GatewayCanvasHostRuntime.isRunning(), false)
@@ -338,6 +372,140 @@ public class GatewayCanvasHostRootStateTest {
                 @Expect(canvasTestString(state, "phase"), "misconfigured")
             } finally {
                 GatewayCanvasHostRuntime.stopIfRunning()
+                debugGatewayCanvasClearNodeSessionsForTest()
+            }
+        })
+    }
+
+    @TestCase
+    public func capabilityTokensAreNonEmptyAndUnique(): Unit {
+        let seen = ArrayList<String>()
+        for (_ in 0..100) {
+            let token = debugGatewayCanvasMintCapabilityTokenForTest()
+            @Expect(token.isEmpty(), false)
+            @Expect(seen.contains(token), false)
+            seen.add(token)
+        }
+    }
+
+    @TestCase
+    public func scopedCanvasUrlPathNormalizesTokenAndCanvasPath(): Unit {
+        let token = "metis_canvas_cap_test"
+        let good = gatewayCanvasNormalizeScopedUrlPath("/__metis__/canvas/cap/${token}/app.js")
+        @Expect(good.ok, true)
+        @Expect(good.token, token)
+        @Expect(good.canvasPath, "/app.js")
+        let root = gatewayCanvasNormalizeScopedUrlPath("/__metis__/canvas/cap/${token}/")
+        @Expect(root.ok, true)
+        @Expect(root.canvasPath, "/")
+        let malformed = gatewayCanvasNormalizeScopedUrlPath("/__metis__/canvas/app.js")
+        @Expect(malformed.ok, false)
+        @Expect(malformed.errorCode, "malformed_scoped_path")
+    }
+
+    @TestCase
+    public func expiredCapabilityCannotReadCanvasRoute(): Unit {
+        withGatewayCanvasTestRoot<Unit>({ root =>
+            File.writeTo(root.join("index.html"), "<html>expired</html>".toArray())
+            let port = canvasTestPort()
+            let cfg = canvasTestConfig(true, root.toString(), port: port)
+            try {
+                debugGatewayCanvasClearNodeSessionsForTest()
+                GatewayCanvasHostRuntime.startIfNeeded(cfg)
+                let token = "metis_canvas_cap_expired"
+                debugGatewayCanvasPutCapabilityForTest(token, "expired-node", "node", gatewayCanvasCapabilityNowMs() - 1000)
+                GatewayCanvasHostRuntime.registerCapabilityRoutes(cfg, token)
+                let result = canvasFetch(gatewayCanvasScopedRouteUrl(cfg, token))
+                @Expect(result.status, 401)
+            } finally {
+                GatewayCanvasHostRuntime.stopIfRunning()
+                debugGatewayCanvasClearNodeSessionsForTest()
+            }
+        })
+    }
+
+    @TestCase
+    public func operatorCapabilityCannotReadCanvasRoute(): Unit {
+        withGatewayCanvasTestRoot<Unit>({ root =>
+            File.writeTo(root.join("index.html"), "<html>operator</html>".toArray())
+            let port = canvasTestPort()
+            let cfg = canvasTestConfig(true, root.toString(), port: port)
+            try {
+                debugGatewayCanvasClearNodeSessionsForTest()
+                GatewayCanvasHostRuntime.startIfNeeded(cfg)
+                let token = "metis_canvas_cap_operator"
+                debugGatewayCanvasPutCapabilityForTest(token, "operator-session", "operator", gatewayCanvasCapabilityNowMs() + 600000)
+                GatewayCanvasHostRuntime.registerCapabilityRoutes(cfg, token)
+                let result = canvasFetch(gatewayCanvasScopedRouteUrl(cfg, token))
+                @Expect(result.status, 401)
+            } finally {
+                GatewayCanvasHostRuntime.stopIfRunning()
+                debugGatewayCanvasClearNodeSessionsForTest()
+            }
+        })
+    }
+
+    @TestCase
+    public func fakeActiveNodeRefreshesCapabilityAndReadsCanvas(): Unit {
+        withGatewayCanvasTestRoot<Unit>({ root =>
+            File.writeTo(root.join("index.html"), "<html>capability ok</html>".toArray())
+            let port = canvasTestPort()
+            let cfg = canvasTestConfig(true, root.toString(), port: port)
+            try {
+                debugGatewayCanvasClearNodeSessionsForTest()
+                GatewayCanvasHostRuntime.startIfNeeded(cfg)
+                let scopedUrl = canvasScopedUrlForTest(cfg, "node-capability-ok")
+                @Expect(scopedUrl.isEmpty(), false)
+                let result = canvasFetch(scopedUrl)
+                @Expect(result.status, 200)
+                @Expect(result.body.contains("capability ok"), true)
+            } finally {
+                GatewayCanvasHostRuntime.stopIfRunning()
+                debugGatewayCanvasClearNodeSessionsForTest()
+            }
+        })
+    }
+
+    @TestCase
+    public func refreshCapabilityWithoutActiveNodeReturnsUnavailable(): Unit {
+        withGatewayCanvasTestRoot<Unit>({ root =>
+            File.writeTo(root.join("index.html"), "<html>missing node</html>".toArray())
+            let port = canvasTestPort()
+            let user = canvasTestUserSettings(true, root.toString(), port: port)
+            let cfg = buildGatewayConfigFromUserSettings(user)
+            try {
+                debugGatewayCanvasClearNodeSessionsForTest()
+                GatewayCanvasHostRuntime.startIfNeeded(cfg)
+                let params = JsonObject()
+                params.put("nodeId", JsonString("missing-node"))
+                let response = handleGatewayNodeFamily(
+                    "node.canvas.capability.refresh",
+                    user,
+                    request: Some(GatewayRpcRequest("node.canvas.capability.refresh", params: params, clientId: "missing-node", mode: "node"))
+                ).getOrThrow()
+                @Expect(response.ok, false)
+                @Expect(response.errorCode, "unavailable")
+            } finally {
+                GatewayCanvasHostRuntime.stopIfRunning()
+                debugGatewayCanvasClearNodeSessionsForTest()
+            }
+        })
+    }
+
+    @TestCase
+    public func unscopedCanvasRouteRequiresCapability(): Unit {
+        withGatewayCanvasTestRoot<Unit>({ root =>
+            File.writeTo(root.join("index.html"), "<html>unscoped</html>".toArray())
+            let port = canvasTestPort()
+            let cfg = canvasTestConfig(true, root.toString(), port: port)
+            try {
+                debugGatewayCanvasClearNodeSessionsForTest()
+                GatewayCanvasHostRuntime.startIfNeeded(cfg)
+                let result = canvasFetch("http://127.0.0.1:${port}/__metis__/canvas/")
+                @Expect(result.status, 401)
+            } finally {
+                GatewayCanvasHostRuntime.stopIfRunning()
+                debugGatewayCanvasClearNodeSessionsForTest()
             }
         })
     }
