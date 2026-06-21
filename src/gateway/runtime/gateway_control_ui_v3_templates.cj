@@ -155,7 +155,7 @@ public func gatewayBuildControlUiV3TemplatesScript(): String {
             '<form id="cron-form-new" novalidate>' +
               '<div class="cron-section__title" style="margin-bottom:10px;">基本信息</div>' +
               '<div class="cron-field"><label>名称 <span class="muted">*</span></label><input type="text" id="cron-in-name" name="name" placeholder="晨间简报" required /></div>' +
-              '<div class="cron-field"><label>描述</label><textarea id="cron-in-desc" placeholder="此任务的可选说明" disabled></textarea><div class="cron-field-hint">描述字段当前未持久化（仅对齐 Metis 表单布局）。</div></div>' +
+              '<div class="cron-field"><label>描述</label><textarea id="cron-in-desc" placeholder="此任务的可选说明"></textarea></div>' +
               '<div class="cron-field"><label>代理 ID</label><input type="text" id="cron-in-agent" placeholder="main 或 ops" /></div>' +
               '<div class="cron-field-hint">输入以选择已绑定代理，或输入自定义 ID。未填时以「会话」下拉为准。</div>' +
               '<label class="field-inline checkbox" style="margin-top:6px;"><input type="checkbox" id="cron-in-enabled" checked /><span>已启用</span></label>' +
@@ -173,9 +173,20 @@ public func gatewayBuildControlUiV3TemplatesScript(): String {
                 '<div class="cron-field"><label>时区</label><input type="text" id="cron-in-tz" class="mono" placeholder="UTC、UTC+8" value="UTC" /><div class="cron-field-hint">固定 UTC 偏移（±HH 或 ±HH:MM），非完整 IANA。</div></div>' +
               '</div>' +
               '<div class="cron-section__title" style="margin:16px 0 10px;">投递（可选）</div>' +
+              '<div class="cron-field"><label>投递模式</label><select id="cron-in-delivery-mode"><option value="">兼容旧配置</option><option value="none">不投递</option><option value="announce">IM 通知</option><option value="webhook">Webhook</option></select></div>' +
               '<div class="cron-field"><label>渠道</label><input type="text" id="cron-in-delivery-channel" class="mono" placeholder="feishu" /></div>' +
-              '<div class="cron-field"><label>接收方 peer</label><input type="text" id="cron-in-delivery-to" placeholder="如飞书 chat_id" /></div>' +
+              '<div class="cron-field"><label>接收方 peer / Webhook URL</label><input type="text" id="cron-in-delivery-to" placeholder="如飞书 chat_id 或 https://example.com/hook" /></div>' +
+              '<div class="cron-field"><label>投递账号 ID</label><input type="text" id="cron-in-delivery-account" class="mono" placeholder="可选，多账号时使用" /></div>' +
               '<label class="field-inline checkbox" style="margin-top:6px;"><input type="checkbox" id="cron-in-delivery-announce" /><span>回复正文加任务前缀</span></label>' +
+              '<label class="field-inline checkbox" style="margin-top:6px;"><input type="checkbox" id="cron-in-best-effort" /><span>投递失败不阻断任务结果</span></label>' +
+              '<div class="cron-section__title" style="margin:16px 0 10px;">失败通知（可选）</div>' +
+              '<div class="cron-field"><label>失败投递模式</label><select id="cron-in-failure-dest-mode"><option value="">兼容旧配置</option><option value="none">不通知</option><option value="announce">IM 通知</option><option value="webhook">Webhook</option></select></div>' +
+              '<div class="cron-field"><label>失败通知渠道</label><input type="text" id="cron-in-failure-channel" class="mono" placeholder="telegram" /></div>' +
+              '<div class="cron-field"><label>失败通知接收方 / Webhook URL</label><input type="text" id="cron-in-failure-to" placeholder="user:ops 或 https://example.com/fail" /></div>' +
+              '<div class="cron-field"><label>失败通知账号 ID</label><input type="text" id="cron-in-failure-account" class="mono" placeholder="可选，多账号时使用" /></div>' +
+              '<label class="field-inline checkbox" style="margin-top:6px;"><input type="checkbox" id="cron-in-failure-announce" checked /><span>失败通知正文加任务前缀</span></label>' +
+              '<div class="cron-field"><label>连续失败阈值</label><input type="number" id="cron-in-failure-alert-after" min="0" placeholder="可选，如 2" /></div>' +
+              '<div class="cron-field"><label>失败通知冷却（毫秒）</label><input type="number" id="cron-in-failure-alert-cooldown-ms" min="0" placeholder="可选，如 60000" /></div>' +
               '<div class="cron-section__title" style="margin:16px 0 10px;">执行</div>' +
               '<div class="cron-field"><label>会话</label><select id="cron-in-session">' +
                 '<option value="main">主会话</option>' +
@@ -184,9 +195,14 @@ public func gatewayBuildControlUiV3TemplatesScript(): String {
               '</select><div class="cron-field-hint">主会话发布系统事件。隔离会话运行独立的代理轮次。</div></div>' +
               '<div class="cron-field"><label>系统事件</label><input type="text" id="cron-in-system-event" placeholder="可选，仅持久化" /></div>' +
               '<div class="cron-field"><label>唤醒模式</label><input type="text" id="cron-in-wake-mode" placeholder="可选，仅持久化" /></div>' +
+              '<div class="cron-field"><label>模型覆盖</label><input type="text" id="cron-in-model" class="mono" placeholder="可选，如 openai:gpt-5" /></div>' +
+              '<div class="cron-field"><label>思考等级</label><input type="text" id="cron-in-thinking-level" class="mono" placeholder="可选，如 high" /></div>' +
+              '<label class="field-inline checkbox" style="margin-top:6px;"><input type="checkbox" id="cron-in-light-context" /><span>使用轻上下文</span></label>' +
               '<div class="cron-field"><label>执行内容</label><select disabled><option>运行助手任务（隔离）</option></select><div class="cron-field-hint">使用您的提示在独立会话中启动助手运行。</div></div>' +
               '<div class="cron-field"><label>助手任务提示 <span class="muted">*</span></label><textarea id="cron-in-message" placeholder="代理消息（必填）" required></textarea></div>' +
-              '<div class="cron-field"><label>超时（秒）</label><input type="text" disabled placeholder="可选，如 90" /><div class="cron-field-hint">可选。留空以使用网关默认超时行为。</div></div>' +
+              '<div class="cron-field"><label>超时（秒）</label><input type="number" id="cron-in-timeout-seconds" min="0" placeholder="可选，如 90" /><div class="cron-field-hint">留空以使用网关默认超时行为。</div></div>' +
+              '<div class="cron-field"><label>最大重试次数</label><input type="number" id="cron-in-max-retries" min="0" placeholder="可选，如 2" /></div>' +
+              '<div class="cron-field"><label>重试退避（毫秒）</label><input type="number" id="cron-in-retry-backoff-ms" min="1" placeholder="可选，如 1000" /></div>' +
               '<div id="cron-form-errors" class="cron-form-errors" aria-live="polite"></div>' +
               '<div class="cron-form-actions cron-form-actions--footer">' +
                 '<div class="cron-form-footer-btns">' +

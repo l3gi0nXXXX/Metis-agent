@@ -12,7 +12,6 @@ import metis.gateway.session.{GatewayIngressSource, gatewayBuildChatHistoryRpcPa
 import metis.cron.{
     CronJob,
     conversationKeyForCronTarget,
-    cronDashboardSaveJob,
     cronLoadOrEmpty,
     cronStorePath
 }
@@ -153,7 +152,30 @@ func gatewayDashboardBuildCronPostParams(
     timeZone!: String = "",
     id!: String = "",
     enabled!: String = "",
-    scheduleKind!: String = ""
+    scheduleKind!: String = "",
+    description!: String = "",
+    deleteAfterRun!: String = "",
+    agentId!: String = "",
+    sessionKey!: String = "",
+    model!: String = "",
+    modelOverride!: String = "",
+    thinkingLevel!: String = "",
+    lightContext!: String = "",
+    deliveryMode!: String = "",
+    deliveryAccountId!: String = "",
+    bestEffortDeliver!: String = "",
+    payloadKind!: String = "",
+    timeoutMs!: String = "",
+    timeoutSeconds!: String = "",
+    maxRetries!: String = "",
+    retryBackoffMs!: String = "",
+    failureDestMode!: String = "",
+    failureChannel!: String = "",
+    failureTo!: String = "",
+    failureAnnounce!: String = "",
+    failureAccountId!: String = "",
+    failureAlertAfter!: String = "",
+    failureAlertCooldownMs!: String = ""
 ): JsonObject {
     let params = JsonObject()
     let entries = [
@@ -172,7 +194,30 @@ func gatewayDashboardBuildCronPostParams(
         ("time_zone", timeZone),
         ("id", id),
         ("enabled", enabled),
-        ("schedule_kind", scheduleKind)
+        ("schedule_kind", scheduleKind),
+        ("description", description),
+        ("delete_after_run", deleteAfterRun),
+        ("agent_id", agentId),
+        ("session_key", sessionKey),
+        ("model", model),
+        ("model_override", modelOverride),
+        ("thinking_level", thinkingLevel),
+        ("light_context", lightContext),
+        ("delivery_mode", deliveryMode),
+        ("delivery_account_id", deliveryAccountId),
+        ("best_effort_deliver", bestEffortDeliver),
+        ("payload_kind", payloadKind),
+        ("timeout_ms", timeoutMs),
+        ("timeout_seconds", timeoutSeconds),
+        ("max_retries", maxRetries),
+        ("retry_backoff_ms", retryBackoffMs),
+        ("failure_dest_mode", failureDestMode),
+        ("failure_channel", failureChannel),
+        ("failure_to", failureTo),
+        ("failure_announce", failureAnnounce),
+        ("failure_account_id", failureAccountId),
+        ("failure_alert_after", failureAlertAfter),
+        ("failure_alert_cooldown_ms", failureAlertCooldownMs)
     ]
     for ((key, value) in entries) {
         let normalized = value.trimAscii()
@@ -248,7 +293,12 @@ public func gatewayDashboardHandleCronPost(ctx: HttpContext): String {
         "dashboard.cron",
         ["action", "name", "every", "session", "message", "delivery_channel", "delivery_to",
          "delivery_announce", "system_event", "wake_mode", "at", "cron_expr", "time_zone",
-         "id", "enabled", "schedule_kind"]
+         "id", "enabled", "schedule_kind", "description", "delete_after_run", "agent_id",
+         "session_key", "model", "model_override", "thinking_level", "light_context",
+         "delivery_mode", "delivery_account_id", "best_effort_deliver", "payload_kind",
+         "timeout_ms", "timeout_seconds", "max_retries", "retry_backoff_ms",
+         "failure_dest_mode", "failure_channel", "failure_to", "failure_announce",
+         "failure_account_id", "failure_alert_after", "failure_alert_cooldown_ms"]
     )
 }
 
@@ -455,9 +505,12 @@ private func gatewayDashboardAppendCronJson(sb: StringBuilder): Unit {
         first = false
         sb.append("{")
         sb.append("\"id\":\"${gatewayDashboardJsonEscape(j.id)}\",")
+        sb.append("\"description\":\"${gatewayDashboardJsonEscape(j.description)}\",")
         sb.append("\"enabled\":${j.enabled},")
         sb.append("\"prompt\":\"${gatewayDashboardJsonEscape(j.prompt)}\",")
         sb.append("\"sessionTarget\":\"${gatewayDashboardJsonEscape(j.sessionTarget)}\",")
+        sb.append("\"agentId\":\"${gatewayDashboardJsonEscape(j.agentId)}\",")
+        sb.append("\"sessionKey\":\"${gatewayDashboardJsonEscape(j.sessionKey)}\",")
         sb.append("\"schedule\":{")
         sb.append("\"kind\":\"${gatewayDashboardJsonEscape(j.schedule.kind)}\",")
         sb.append("\"everyMs\":${j.schedule.everyMs},")
@@ -472,9 +525,23 @@ private func gatewayDashboardAppendCronJson(sb: StringBuilder): Unit {
         sb.append("\"deliveryChannel\":\"${gatewayDashboardJsonEscape(j.deliveryChannel)}\",")
         sb.append("\"deliveryTo\":\"${gatewayDashboardJsonEscape(j.deliveryTo)}\",")
         sb.append("\"deliveryAnnounce\":${j.deliveryAnnounce},")
+        sb.append("\"deliveryAccountId\":\"${gatewayDashboardJsonEscape(j.deliveryAccountId)}\",")
+        sb.append("\"bestEffortDeliver\":${j.bestEffortDeliver},")
+        sb.append("\"timeoutMs\":${j.timeoutMs},")
+        sb.append("\"maxRetries\":${j.maxRetries},")
+        sb.append("\"retryBackoffMs\":${j.retryBackoffMs},")
+        sb.append("\"failureChannel\":\"${gatewayDashboardJsonEscape(j.failureChannel)}\",")
+        sb.append("\"failureTo\":\"${gatewayDashboardJsonEscape(j.failureTo)}\",")
+        sb.append("\"failureAnnounce\":${j.failureAnnounce},")
+        sb.append("\"failureAccountId\":\"${gatewayDashboardJsonEscape(j.failureAccountId)}\",")
+        sb.append("\"failureAlertAfter\":${j.failureAlertAfter},")
+        sb.append("\"failureAlertCooldownMs\":${j.failureAlertCooldownMs},")
         sb.append("\"payloadKind\":\"${gatewayDashboardJsonEscape(j.payloadKind)}\",")
         sb.append("\"deliveryMode\":\"${gatewayDashboardJsonEscape(j.deliveryMode)}\",")
         sb.append("\"failureDestMode\":\"${gatewayDashboardJsonEscape(j.failureDestMode)}\",")
+        sb.append("\"modelOverride\":\"${gatewayDashboardJsonEscape(j.modelOverride)}\",")
+        sb.append("\"thinkingLevel\":\"${gatewayDashboardJsonEscape(j.thinkingLevel)}\",")
+        sb.append("\"lightContext\":${j.lightContext},")
         sb.append("\"state\":{")
         sb.append("\"nextRunAtMs\":${j.state.nextRunAtMs},")
         sb.append("\"lastRunAtMs\":${j.state.lastRunAtMs},")

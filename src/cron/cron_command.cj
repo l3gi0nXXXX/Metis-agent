@@ -930,6 +930,9 @@ private func cronCmdAddNamed(path: Path, sub: Array<String>): (String, Int64) {
     var failureAccountId = ""
     var failureAlertAfter: Int64 = 0
     var failureAlertCooldownMs: Int64 = 0
+    var payloadKind = "agentTurn"
+    var deliveryMode = ""
+    var failureDestMode = ""
 
     var i: Int64 = 2
     while (i < sub.size) {
@@ -1067,6 +1070,11 @@ private func cronCmdAddNamed(path: Path, sub: Array<String>): (String, Int64) {
         }
         if (k == "--announce") {
             announceFlag = true
+            i += 1
+            continue
+        }
+        if (k == "--no-announce") {
+            announceFlag = false
             i += 1
             continue
         }
@@ -1225,6 +1233,35 @@ private func cronCmdAddNamed(path: Path, sub: Array<String>): (String, Int64) {
             i += 1
             continue
         }
+        if (k == "--no-best-effort-deliver") {
+            bestEffortDeliver = false
+            i += 1
+            continue
+        }
+        if (k == "--payload-kind") {
+            if (i + 1 >= sub.size) {
+                return cronErr("invalid cron.add params: missing --payload-kind value")
+            }
+            payloadKind = sub[i + 1].trimAscii()
+            i += 2
+            continue
+        }
+        if (k == "--delivery-mode") {
+            if (i + 1 >= sub.size) {
+                return cronErr("invalid cron.add params: missing --delivery-mode value")
+            }
+            deliveryMode = sub[i + 1].trimAscii()
+            i += 2
+            continue
+        }
+        if (k == "--failure-dest-mode" || k == "--failure-mode") {
+            if (i + 1 >= sub.size) {
+                return cronErr("invalid cron.add params: missing --failure-dest-mode value")
+            }
+            failureDestMode = sub[i + 1].trimAscii()
+            i += 2
+            continue
+        }
         if (k == "--failure-account-id") {
             if (i + 1 >= sub.size) {
                 return cronErr("invalid cron.add params: missing --failure-account-id value")
@@ -1325,9 +1362,9 @@ private func cronCmdAddNamed(path: Path, sub: Array<String>): (String, Int64) {
             failureChannel: failureChannel,
             failureTo: failureTo,
             failureAnnounce: failureAnnounce,
-            payloadKind: "agentTurn",
-            deliveryMode: "",
-            failureDestMode: "",
+            payloadKind: payloadKind,
+            deliveryMode: deliveryMode,
+            failureDestMode: failureDestMode,
             deleteAfterRun: deleteAfterRun,
             updatedAtMs: createdMs,
             description: description,
@@ -1365,9 +1402,9 @@ private func cronCmdAddNamed(path: Path, sub: Array<String>): (String, Int64) {
             failureChannel: failureChannel,
             failureTo: failureTo,
             failureAnnounce: failureAnnounce,
-            payloadKind: "agentTurn",
-            deliveryMode: "",
-            failureDestMode: "",
+            payloadKind: payloadKind,
+            deliveryMode: deliveryMode,
+            failureDestMode: failureDestMode,
             deleteAfterRun: deleteAfterRun,
             updatedAtMs: createdMs,
             description: description,
@@ -1405,9 +1442,9 @@ private func cronCmdAddNamed(path: Path, sub: Array<String>): (String, Int64) {
             failureChannel: failureChannel,
             failureTo: failureTo,
             failureAnnounce: failureAnnounce,
-            payloadKind: "agentTurn",
-            deliveryMode: "",
-            failureDestMode: "",
+            payloadKind: payloadKind,
+            deliveryMode: deliveryMode,
+            failureDestMode: failureDestMode,
             deleteAfterRun: deleteAfterRun,
             updatedAtMs: createdMs,
             description: description,
@@ -1624,6 +1661,9 @@ private func cronCmdUpdate(path: Path, sub: Array<String>): (String, Int64) {
             var failureAccountIdOpt: Option<String> = None<String>
             var failureAlertAfterOpt: Option<Int64> = None<Int64>
             var failureAlertCooldownOpt: Option<Int64> = None<Int64>
+            var payloadKindOpt: Option<String> = None<String>
+            var deliveryModeOpt: Option<String> = None<String>
+            var failureDestModeOpt: Option<String> = None<String>
             var i: Int64 = 2
             var touched = false
             while (i < sub.size) {
@@ -1650,6 +1690,18 @@ private func cronCmdUpdate(path: Path, sub: Array<String>): (String, Int64) {
                     }
                     touched = true
                     i += 2
+                    continue
+                }
+                if (k == "--enable") {
+                    enabledOpt = Some(true)
+                    touched = true
+                    i += 1
+                    continue
+                }
+                if (k == "--disable") {
+                    enabledOpt = Some(false)
+                    touched = true
+                    i += 1
                     continue
                 }
                 if (k == "--message" || k == "-m") {
@@ -1949,6 +2001,33 @@ private func cronCmdUpdate(path: Path, sub: Array<String>): (String, Int64) {
                     i += 1
                     continue
                 }
+                if (k == "--payload-kind") {
+                    if (i + 1 >= sub.size) {
+                        return cronErr("invalid cron.update params: missing --payload-kind value")
+                    }
+                    payloadKindOpt = Some(sub[i + 1].trimAscii())
+                    touched = true
+                    i += 2
+                    continue
+                }
+                if (k == "--delivery-mode") {
+                    if (i + 1 >= sub.size) {
+                        return cronErr("invalid cron.update params: missing --delivery-mode value")
+                    }
+                    deliveryModeOpt = Some(sub[i + 1].trimAscii())
+                    touched = true
+                    i += 2
+                    continue
+                }
+                if (k == "--failure-dest-mode" || k == "--failure-mode") {
+                    if (i + 1 >= sub.size) {
+                        return cronErr("invalid cron.update params: missing --failure-dest-mode value")
+                    }
+                    failureDestModeOpt = Some(sub[i + 1].trimAscii())
+                    touched = true
+                    i += 2
+                    continue
+                }
                 if (k == "--failure-account-id") {
                     if (i + 1 >= sub.size) {
                         return cronErr("invalid cron.update params: missing --failure-account-id value")
@@ -2029,6 +2108,9 @@ private func cronCmdUpdate(path: Path, sub: Array<String>): (String, Int64) {
                     if (let Some(v) <- lightContextOpt) { j.lightContext = v }
                     if (let Some(v) <- deliveryAccountIdOpt) { j.deliveryAccountId = v }
                     if (let Some(v) <- bestEffortDeliverOpt) { j.bestEffortDeliver = v }
+                    if (let Some(v) <- payloadKindOpt) { j.payloadKind = v }
+                    if (let Some(v) <- deliveryModeOpt) { j.deliveryMode = v }
+                    if (let Some(v) <- failureDestModeOpt) { j.failureDestMode = v }
                     if (let Some(v) <- failureAccountIdOpt) { j.failureAccountId = v }
                     if (let Some(v) <- failureAlertAfterOpt) { j.failureAlertAfter = v }
                     if (let Some(v) <- failureAlertCooldownOpt) { j.failureAlertCooldownMs = v }

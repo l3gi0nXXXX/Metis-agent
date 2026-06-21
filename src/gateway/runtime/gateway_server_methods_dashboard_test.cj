@@ -1,6 +1,7 @@
 package metis.gateway.runtime
 
-import metis.core.config.{CliSettingManager, GatewayUserSettings, MetisConfigManager}
+import metis.core.config.{CliConfig, CliSettingManager, GatewayUserSettings, MetisConfigManager, MetisProcessEnvironmentLock}
+import metis.cron.{cronLoadOrEmpty, cronStorePath}
 import metis.gateway.core.{gatewayBuildSessionConversationView, gatewayFindSessionCatalogViewForUser, gatewaySessionStoreForUserWithAgentId}
 
 import std.fs.File
@@ -31,25 +32,29 @@ private func dashboardConcatLines(lines: Array<String>): String {
 }
 
 private func withGatewayDashboardTestHome<T>(home: String, block: () -> T): T {
-    try {
-        remove(Path(home), recursive: true)
-    } catch (_: Exception) {
-        ()
-    }
-    Directory.create(home, recursive: true)
-    let oldHome = getVariable("METIS_HOME")
-    setVariable("METIS_HOME", home)
-    MetisConfigManager.invalidate()
-    CliSettingManager.invalidate()
-    try {
-        return block()
-    } finally {
-        match (oldHome) {
-            case Some(value) => setVariable("METIS_HOME", value)
-            case None => setVariable("METIS_HOME", "")
+    synchronized(MetisProcessEnvironmentLock) {
+        try {
+            remove(Path(home), recursive: true)
+        } catch (_: Exception) {
+            ()
         }
+        Directory.create(home, recursive: true)
+        let oldHome = getVariable("METIS_HOME")
+        setVariable("METIS_HOME", home)
+        CliConfig.invalidatePathCache()
         MetisConfigManager.invalidate()
         CliSettingManager.invalidate()
+        try {
+            return block()
+        } finally {
+            match (oldHome) {
+                case Some(value) => setVariable("METIS_HOME", value)
+                case None => setVariable("METIS_HOME", "")
+            }
+            CliConfig.invalidatePathCache()
+            MetisConfigManager.invalidate()
+            CliSettingManager.invalidate()
+        }
     }
 }
 
@@ -399,6 +404,129 @@ public class GatewayServerMethodsDashboardTest {
             }
 
             store.deleteSession(sessionKey)
+        }
+    }
+
+    @TestCase
+    public func cronDashboardAddAndSaveReuseUnifiedAdvancedFields(): Unit {
+        withGatewayDashboardTestHome("/tmp/metis-dashboard-cron-advanced-test-home") {
+            let add = JsonObject()
+            add.put("action", JsonString("add_every"))
+            add.put("name", JsonString("dash-advanced"))
+            add.put("every", JsonString("1h"))
+            add.put("session", JsonString("isolated"))
+            add.put("message", JsonString("初始 cron 消息 😀"))
+            add.put("model", JsonString("openai:gpt-test"))
+            add.put("thinking_level", JsonString("high"))
+            add.put("light_context", JsonString("true"))
+            add.put("delivery_mode", JsonString("announce"))
+            add.put("delivery_channel", JsonString("feishu"))
+            add.put("delivery_to", JsonString("chat-1"))
+            add.put("delivery_account_id", JsonString("tenant-a"))
+            add.put("best_effort_deliver", JsonString("true"))
+            add.put("timeout_ms", JsonString("1500"))
+            add.put("max_retries", JsonString("2"))
+            add.put("retry_backoff_ms", JsonString("250"))
+            add.put("failure_dest_mode", JsonString("announce"))
+            add.put("failure_channel", JsonString("telegram"))
+            add.put("failure_to", JsonString("ops"))
+            add.put("failure_account_id", JsonString("bot-a"))
+            add.put("failure_alert_after", JsonString("2"))
+            add.put("failure_alert_cooldown_ms", JsonString("60000"))
+
+            let addResponse = handleGatewayDashboardFamily(
+                "dashboard.cron",
+                GatewayRpcRequest("dashboard.cron", params: add)
+            ).getOrThrow()
+            @Expect(addResponse.result.asObject().get("ok").getOrThrow().asBool().getValue(), true)
+
+            var jobs = cronLoadOrEmpty(cronStorePath(CliConfig.dotDir))
+            @Expect(jobs.size, 1)
+            var job = jobs[0]
+            @Expect(job.modelOverride, "openai:gpt-test")
+            @Expect(job.thinkingLevel, "high")
+            @Expect(job.lightContext, true)
+            @Expect(job.deliveryMode, "announce")
+            @Expect(job.deliveryAccountId, "tenant-a")
+            @Expect(job.bestEffortDeliver, true)
+            @Expect(job.timeoutMs, 1500)
+            @Expect(job.maxRetries, 2)
+            @Expect(job.retryBackoffMs, 250)
+            @Expect(job.failureDestMode, "announce")
+            @Expect(job.failureAccountId, "bot-a")
+            @Expect(job.failureAlertAfter, 2)
+            @Expect(job.failureAlertCooldownMs, 60000)
+
+            let save = JsonObject()
+            save.put("action", JsonString("save_job"))
+            save.put("id", JsonString("dash-advanced"))
+            save.put("message", JsonString("只修改调度和正文"))
+            save.put("session", JsonString("isolated"))
+            save.put("enabled", JsonString("true"))
+            save.put("schedule_kind", JsonString("every"))
+            save.put("every", JsonString("2h"))
+            let saveResponse = handleGatewayDashboardFamily(
+                "dashboard.cron",
+                GatewayRpcRequest("dashboard.cron", params: save)
+            ).getOrThrow()
+            @Expect(saveResponse.result.asObject().get("ok").getOrThrow().asBool().getValue(), true)
+
+            jobs = cronLoadOrEmpty(cronStorePath(CliConfig.dotDir))
+            @Expect(jobs.size, 1)
+            job = jobs[0]
+            @Expect(job.prompt, "只修改调度和正文")
+            @Expect(job.schedule.everyMs, 7200000)
+            @Expect(job.deliveryMode, "announce")
+            @Expect(job.deliveryAccountId, "tenant-a")
+            @Expect(job.bestEffortDeliver, true)
+            @Expect(job.modelOverride, "openai:gpt-test")
+            @Expect(job.thinkingLevel, "high")
+            @Expect(job.lightContext, true)
+            @Expect(job.failureDestMode, "announce")
+            @Expect(job.failureAccountId, "bot-a")
+            @Expect(job.failureAlertAfter, 2)
+            @Expect(job.failureAlertCooldownMs, 60000)
+        }
+    }
+
+    @TestCase
+    public func cronDashboardRejectsInvalidFailureAlertAfterWithoutStoreMutation(): Unit {
+        withGatewayDashboardTestHome("/tmp/metis-dashboard-cron-invalid-alert-test-home") {
+            let add = JsonObject()
+            add.put("action", JsonString("add_every"))
+            add.put("name", JsonString("dash-invalid-alert"))
+            add.put("every", JsonString("1h"))
+            add.put("session", JsonString("main"))
+            add.put("message", JsonString("seed"))
+            add.put("failure_alert_after", JsonString("3"))
+            let addResponse = handleGatewayDashboardFamily(
+                "dashboard.cron",
+                GatewayRpcRequest("dashboard.cron", params: add)
+            ).getOrThrow()
+            @Expect(addResponse.result.asObject().get("ok").getOrThrow().asBool().getValue(), true)
+
+            let bad = JsonObject()
+            bad.put("action", JsonString("save_job"))
+            bad.put("id", JsonString("dash-invalid-alert"))
+            bad.put("message", JsonString("should not persist"))
+            bad.put("enabled", JsonString("true"))
+            bad.put("schedule_kind", JsonString("every"))
+            bad.put("every", JsonString("2h"))
+            bad.put("failure_alert_after", JsonString("bad"))
+            let badResponse = handleGatewayDashboardFamily(
+                "dashboard.cron",
+                GatewayRpcRequest("dashboard.cron", params: bad)
+            ).getOrThrow()
+            let badResult = badResponse.result.asObject()
+            @Expect(badResult.get("ok").getOrThrow().asBool().getValue(), false)
+            @Expect(dashboardStringField(badResult, "message").contains("--failure-alert-after"), true)
+
+            let jobs = cronLoadOrEmpty(cronStorePath(CliConfig.dotDir))
+            @Expect(jobs.size, 1)
+            let job = jobs[0]
+            @Expect(job.prompt, "seed")
+            @Expect(job.schedule.everyMs, 3600000)
+            @Expect(job.failureAlertAfter, 3)
         }
     }
 }

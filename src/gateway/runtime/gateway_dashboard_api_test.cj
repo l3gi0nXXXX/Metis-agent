@@ -71,12 +71,38 @@ public class GatewayDashboardApiTest {
             deliveryAnnounce: "true",
             systemEvent: "",
             wakeMode: "",
-            scheduleKind: "every"
+            scheduleKind: "every",
+            model: "openai:gpt-test",
+            thinkingLevel: "high",
+            lightContext: "true",
+            deliveryMode: "announce",
+            deliveryAccountId: "tenant-a",
+            bestEffortDeliver: "true",
+            timeoutMs: "1500",
+            maxRetries: "2",
+            retryBackoffMs: "300",
+            failureDestMode: "announce",
+            failureAccountId: "bot-a",
+            failureAlertAfter: "2",
+            failureAlertCooldownMs: "60000"
         )
         @Expect(dashboardApiStringField(params, "action"), "save")
         @Expect(dashboardApiStringField(params, "delivery_channel"), "feishu")
         @Expect(dashboardApiStringField(params, "delivery_to"), "chat-1")
         @Expect(dashboardApiStringField(params, "schedule_kind"), "every")
+        @Expect(dashboardApiStringField(params, "model"), "openai:gpt-test")
+        @Expect(dashboardApiStringField(params, "thinking_level"), "high")
+        @Expect(dashboardApiStringField(params, "light_context"), "true")
+        @Expect(dashboardApiStringField(params, "delivery_mode"), "announce")
+        @Expect(dashboardApiStringField(params, "delivery_account_id"), "tenant-a")
+        @Expect(dashboardApiStringField(params, "best_effort_deliver"), "true")
+        @Expect(dashboardApiStringField(params, "timeout_ms"), "1500")
+        @Expect(dashboardApiStringField(params, "max_retries"), "2")
+        @Expect(dashboardApiStringField(params, "retry_backoff_ms"), "300")
+        @Expect(dashboardApiStringField(params, "failure_dest_mode"), "announce")
+        @Expect(dashboardApiStringField(params, "failure_account_id"), "bot-a")
+        @Expect(dashboardApiStringField(params, "failure_alert_after"), "2")
+        @Expect(dashboardApiStringField(params, "failure_alert_cooldown_ms"), "60000")
         @Expect(params.get("system_event").isSome(), false)
         @Expect(params.get("wake_mode").isSome(), false)
     }

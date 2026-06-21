@@ -42,6 +42,13 @@ public class GatewayCronToolset {
         }
     }
 
+    private func addBoolChoiceFlag(args: ArrayList<String>, trueFlag: String, falseFlag: String, value: Option<Bool>): Unit {
+        match (value) {
+            case Some(v) => args.add(if (v) { trueFlag } else { falseFlag })
+            case None => ()
+        }
+    }
+
     private func normalizeAction(action: String): String {
         let normalized = action.trimAscii().toAsciiLower()
         if (
@@ -76,6 +83,7 @@ public class GatewayCronToolset {
             enabled: "Optional enabled flag for update.",
             session: "Optional session target for add/update: main, isolated, current, or session:<key>.",
             deliveryChannel: "Optional delivery channel for add/update.",
+            deliveryMode: "Optional delivery mode for add/update: none, announce, or webhook.",
             deliveryTo: "Optional delivery peer/chat target for add/update.",
             deliveryAccountId: "Optional delivery account id for add/update.",
             bestEffortDeliver: "Optional best-effort delivery flag for add/update.",
@@ -83,6 +91,7 @@ public class GatewayCronToolset {
             maxRetries: "Optional max retry count for add/update.",
             retryBackoffMs: "Optional retry backoff milliseconds for add/update.",
             failureChannel: "Optional failure alert channel for add/update.",
+            failureDestMode: "Optional failure delivery mode for add/update: none, announce, or webhook.",
             failureTo: "Optional failure alert target for add/update.",
             failureAccountId: "Optional failure alert account id for add/update.",
             failureAlertAfter: "Optional consecutive failure threshold for alerts.",
@@ -106,6 +115,7 @@ public class GatewayCronToolset {
         enabled: Option<Bool>,
         session: Option<String>,
         deliveryChannel: Option<String>,
+        deliveryMode: Option<String>,
         deliveryTo: Option<String>,
         deliveryAccountId: Option<String>,
         bestEffortDeliver: Option<Bool>,
@@ -113,6 +123,7 @@ public class GatewayCronToolset {
         maxRetries: Option<Int64>,
         retryBackoffMs: Option<Int64>,
         failureChannel: Option<String>,
+        failureDestMode: Option<String>,
         failureTo: Option<String>,
         failureAccountId: Option<String>,
         failureAlertAfter: Option<Int64>,
@@ -176,13 +187,15 @@ public class GatewayCronToolset {
                 case None => ()
             }
             this.addStringFlag(args, "--session", session)
+            this.addStringFlag(args, "--delivery-mode", deliveryMode)
             this.addStringFlag(args, "--channel", deliveryChannel)
             this.addStringFlag(args, "--to", deliveryTo)
             this.addStringFlag(args, "--delivery-account-id", deliveryAccountId)
-            this.addBoolFlag(args, "--best-effort-deliver", bestEffortDeliver)
+            this.addBoolChoiceFlag(args, "--best-effort-deliver", "--no-best-effort-deliver", bestEffortDeliver)
             this.addIntFlag(args, "--timeout-ms", timeoutMs)
             this.addIntFlag(args, "--max-retries", maxRetries)
             this.addIntFlag(args, "--retry-backoff-ms", retryBackoffMs)
+            this.addStringFlag(args, "--failure-dest-mode", failureDestMode)
             this.addStringFlag(args, "--failure-channel", failureChannel)
             this.addStringFlag(args, "--failure-to", failureTo)
             this.addStringFlag(args, "--failure-account-id", failureAccountId)
@@ -190,10 +203,7 @@ public class GatewayCronToolset {
             this.addIntFlag(args, "--failure-alert-cooldown-ms", failureAlertCooldownMs)
             this.addStringFlag(args, "--model", model)
             this.addStringFlag(args, "--thinking-level", thinkingLevel)
-            match (lightContext) {
-                case Some(v) => args.add(if (v) { "--light-context" } else { "--no-light-context" })
-                case None => ()
-            }
+            this.addBoolChoiceFlag(args, "--light-context", "--no-light-context", lightContext)
             args.add("--message")
             args.add(msg)
         } else if (act == "update") {
@@ -252,13 +262,15 @@ public class GatewayCronToolset {
                 case None => ()
             }
             this.addStringFlag(args, "--session", session)
+            this.addStringFlag(args, "--delivery-mode", deliveryMode)
             this.addStringFlag(args, "--channel", deliveryChannel)
             this.addStringFlag(args, "--to", deliveryTo)
             this.addStringFlag(args, "--delivery-account-id", deliveryAccountId)
-            this.addBoolFlag(args, "--best-effort-deliver", bestEffortDeliver)
+            this.addBoolChoiceFlag(args, "--best-effort-deliver", "--no-best-effort-deliver", bestEffortDeliver)
             this.addIntFlag(args, "--timeout-ms", timeoutMs)
             this.addIntFlag(args, "--max-retries", maxRetries)
             this.addIntFlag(args, "--retry-backoff-ms", retryBackoffMs)
+            this.addStringFlag(args, "--failure-dest-mode", failureDestMode)
             this.addStringFlag(args, "--failure-channel", failureChannel)
             this.addStringFlag(args, "--failure-to", failureTo)
             this.addStringFlag(args, "--failure-account-id", failureAccountId)
@@ -266,10 +278,7 @@ public class GatewayCronToolset {
             this.addIntFlag(args, "--failure-alert-cooldown-ms", failureAlertCooldownMs)
             this.addStringFlag(args, "--model", model)
             this.addStringFlag(args, "--thinking-level", thinkingLevel)
-            match (lightContext) {
-                case Some(v) => args.add(if (v) { "--light-context" } else { "--no-light-context" })
-                case None => ()
-            }
+            this.addBoolChoiceFlag(args, "--light-context", "--no-light-context", lightContext)
             match (message) {
                 case Some(v) =>
                     let t = v.trimAscii()
@@ -346,6 +355,7 @@ public class GatewayCronToolset {
         enabled: Option<Bool>,
         session: Option<String>,
         deliveryChannel: Option<String>,
+        deliveryMode: Option<String>,
         deliveryTo: Option<String>,
         deliveryAccountId: Option<String>,
         bestEffortDeliver: Option<Bool>,
@@ -353,6 +363,7 @@ public class GatewayCronToolset {
         maxRetries: Option<Int64>,
         retryBackoffMs: Option<Int64>,
         failureChannel: Option<String>,
+        failureDestMode: Option<String>,
         failureTo: Option<String>,
         failureAccountId: Option<String>,
         failureAlertAfter: Option<Int64>,
@@ -375,6 +386,7 @@ public class GatewayCronToolset {
             enabled,
             session,
             deliveryChannel,
+            deliveryMode,
             deliveryTo,
             deliveryAccountId,
             bestEffortDeliver,
@@ -382,6 +394,7 @@ public class GatewayCronToolset {
             maxRetries,
             retryBackoffMs,
             failureChannel,
+            failureDestMode,
             failureTo,
             failureAccountId,
             failureAlertAfter,

@@ -2,6 +2,7 @@ package metis.gateway.runtime
 
 import metis.core.config.{CliConfig, CliSettingManager, GatewayUserSettings, MetisConfigManager, MetisProcessEnvironmentLock}
 import metis.core.skills.setClawHubHttpGetForTest
+import metis.cron.{CronJob, CronSchedule, cronSave, cronStorePath}
 import metis.gateway.config.buildGatewayConfigFromUserSettings
 import metis.gateway.core.{gatewayFindSessionConversationViewForUser, gatewaySessionStoreForUserWithAgentId, setGatewayFeishuNativeAuthRunnerForTest}
 import metis.gateway.protocol.{GatewayClientInfo, GatewayConnectParams, GatewayProtocolResponse}
@@ -849,6 +850,71 @@ public class GatewayControlUiWsCronStatusTest {
             @Expect(response.ok, true)
             let result = response.result.asObject()
             @Expect(result.get("enabled").getOrThrow().asBool().getValue(), false)
+        }
+    }
+
+    @TestCase
+    public func cronListIncludesAdvancedPayloadDeliveryAndFailureFields(): Unit {
+        withGatewayControlUiWsCronStatusTestHome {
+            var settings = GatewayUserSettings()
+            settings.enabled = true
+            settings.cronEnabled = true
+            let _ = MetisConfigManager.setGatewaySettings(settings)
+            let job = CronJob(
+                "ws-advanced",
+                "hello ws cron",
+                CronSchedule.every(60000),
+                sessionTarget: "isolated",
+                agentId: "ops",
+                modelOverride: "openai:gpt-test",
+                thinkingLevel: "high",
+                lightContext: true,
+                deliveryMode: "announce",
+                deliveryChannel: "feishu",
+                deliveryTo: "chat-1",
+                deliveryAccountId: "tenant-a",
+                bestEffortDeliver: true,
+                failureDestMode: "announce",
+                failureChannel: "telegram",
+                failureTo: "ops-chat",
+                failureAccountId: "bot-a",
+                failureAlertAfter: 2,
+                failureAlertCooldownMs: 60000
+            )
+            cronSave(cronStorePath(CliConfig.dotDir), [job])
+
+            let response = gatewayControlUiWsCompatResponse("cron.list", JsonObject(), buildGatewayConfigFromUserSettings(settings)).getOrThrow()
+
+            @Expect(response.ok, true)
+            let result = response.result.asObject()
+            let jobs = result.get("jobs").getOrThrow().asArray()
+            @Expect(jobs.size(), 1)
+            let row = jobs[0].asObject()
+            @Expect(gatewayControlUiWsTestString(row, "agentId"), "ops")
+
+            let payload = row.get("payload").getOrThrow().asObject()
+            @Expect(gatewayControlUiWsTestString(payload, "model"), "openai:gpt-test")
+            @Expect(gatewayControlUiWsTestString(payload, "thinking"), "high")
+            @Expect(payload.get("lightContext").getOrThrow().asBool().getValue(), true)
+            @Expect(payload.get("bestEffortDeliver").getOrThrow().asBool().getValue(), true)
+
+            let delivery = row.get("delivery").getOrThrow().asObject()
+            @Expect(gatewayControlUiWsTestString(delivery, "mode"), "announce")
+            @Expect(gatewayControlUiWsTestString(delivery, "channel"), "feishu")
+            @Expect(gatewayControlUiWsTestString(delivery, "to"), "chat-1")
+            @Expect(gatewayControlUiWsTestString(delivery, "accountId"), "tenant-a")
+            @Expect(delivery.get("bestEffort").getOrThrow().asBool().getValue(), true)
+            let failureDest = delivery.get("failureDestination").getOrThrow().asObject()
+            @Expect(gatewayControlUiWsTestString(failureDest, "mode"), "announce")
+            @Expect(gatewayControlUiWsTestString(failureDest, "channel"), "telegram")
+            @Expect(gatewayControlUiWsTestString(failureDest, "to"), "ops-chat")
+            @Expect(gatewayControlUiWsTestString(failureDest, "accountId"), "bot-a")
+
+            let failureAlert = row.get("failureAlert").getOrThrow().asObject()
+            @Expect(failureAlert.get("after").getOrThrow().toJsonString(), "2")
+            @Expect(failureAlert.get("cooldownMs").getOrThrow().toJsonString(), "60000")
+            @Expect(gatewayControlUiWsTestString(failureAlert, "mode"), "announce")
+            @Expect(gatewayControlUiWsTestString(failureAlert, "accountId"), "bot-a")
         }
     }
 }

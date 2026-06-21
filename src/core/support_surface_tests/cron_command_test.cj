@@ -181,6 +181,59 @@ public class CronCommandTest {
     }
 
     @TestCase
+    public func cronAddAndUpdateParseAdvancedDeliveryAndPayloadFlags(): Unit {
+        withCronCommandTestHome({ =>
+            let (addText, addCode) = executeGatewayCronCommand([
+                "cron", "add", "--name", "advanced-flags", "--every", "10m", "--session", "isolated",
+                "--payload-kind", "agentTurn",
+                "--delivery-mode", "announce",
+                "--delivery-account-id", "tenant-a",
+                "--best-effort-deliver",
+                "--failure-dest-mode", "announce",
+                "--failure-account-id", "bot-a",
+                "--failure-alert-after", "2",
+                "--failure-alert-cooldown-ms", "60000",
+                "--model", "openai:gpt-test",
+                "--thinking-level", "high",
+                "--light-context",
+                "--message", "hello advanced cron"
+            ])
+            @Expect(addCode, 0)
+            @Expect(addText.contains("Cron job created"), true)
+
+            let (updateText, updateCode) = executeGatewayCronCommand([
+                "cron", "update", "--job-id", "advanced-flags",
+                "--delivery-mode", "none",
+                "--no-best-effort-deliver",
+                "--failure-dest-mode", "none",
+                "--failure-alert-after", "0",
+                "--no-light-context",
+                "--enable"
+            ])
+            @Expect(updateCode, 0)
+            @Expect(updateText.contains("Cron job updated"), true)
+
+            let jobs = cronLoadOrEmpty(cronStorePath(CliConfig.dotDir))
+            @Expect(jobs.size, 1)
+            let job = jobs[0]
+            @Expect(job.id, "advanced-flags")
+            @Expect(job.prompt, "hello advanced cron")
+            @Expect(job.payloadKind, "agentTurn")
+            @Expect(job.deliveryMode, "none")
+            @Expect(job.deliveryAccountId, "tenant-a")
+            @Expect(job.bestEffortDeliver, false)
+            @Expect(job.failureDestMode, "none")
+            @Expect(job.failureAccountId, "bot-a")
+            @Expect(job.failureAlertAfter, 0)
+            @Expect(job.failureAlertCooldownMs, 60000)
+            @Expect(job.modelOverride, "openai:gpt-test")
+            @Expect(job.thinkingLevel, "high")
+            @Expect(job.lightContext, false)
+            @Expect(job.enabled, true)
+        })
+    }
+
+    @TestCase
     public func cronStatusUsesCronEnabledNotGatewayEnabled(): Unit {
         withCronCommandTestHome({ =>
             var settings = GatewayUserSettings()

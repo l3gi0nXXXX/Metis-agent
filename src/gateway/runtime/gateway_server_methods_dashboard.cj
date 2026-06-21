@@ -18,7 +18,7 @@ import metis.gateway.core.{
     gatewaySessionStoreForUserWithAgentId
 }
 import metis.gateway.session.{GatewayIngressSource, gatewayBuildSessionRpcParams, gatewayIngressSourceFromString, gatewayResolveSessionContext, gatewaySessionRequestFromRpcParams}
-import metis.cron.{cronDashboardSaveJob, cronLoadOrEmpty, cronSave, cronStorePath, readCronRunLogMergedFromStore}
+import metis.cron.{cronLoadOrEmpty, cronSave, cronStorePath, readCronRunLogMergedFromStore}
 
 import std.collection.{ArrayList, HashMap, HashSet}
 import std.convert.Parsable
@@ -586,30 +586,7 @@ private func gatewayDashboardCronJsonFromRpc(params: JsonObject): String {
     if (action.isEmpty()) {
         return "{\"ok\":false,\"message\":\"action is empty\"}"
     }
-    if (action == "save_job") {
-        let jobId = rpcString(params, "id").trimAscii()
-        let message = rpcString(params, "message")
-        let session = if (rpcString(params, "session").trimAscii().isEmpty()) { "main" } else { rpcString(params, "session").trimAscii() }
-        let enStr = if (rpcString(params, "enabled").trimAscii().isEmpty()) { "true" } else { rpcString(params, "enabled").trimAscii().toAsciiLower() }
-        let scheduleKind = if (rpcString(params, "schedule_kind").trimAscii().isEmpty()) { "every" } else { rpcString(params, "schedule_kind").trimAscii() }
-        let everyRaw = rpcString(params, "every").trimAscii()
-        let atRaw = rpcString(params, "at").trimAscii()
-        if (jobId.isEmpty() || message.trimAscii().isEmpty()) {
-            return "{\"ok\":false,\"message\":\"id or message empty\"}"
-        }
-        let enabled = enStr == "true" || enStr == "1" || enStr == "yes"
-        let cronEx = rpcString(params, "cron_expr").trimAscii()
-        let tz = if (rpcString(params, "time_zone").trimAscii().isEmpty()) { "UTC" } else { rpcString(params, "time_zone").trimAscii() }
-        let sysEv = rpcString(params, "system_event").trimAscii()
-        let wake = rpcString(params, "wake_mode").trimAscii()
-        let dCh = rpcString(params, "delivery_channel").trimAscii()
-        let dTo = rpcString(params, "delivery_to").trimAscii()
-        let annStr = if (rpcString(params, "delivery_announce").trimAscii().isEmpty()) { "false" } else { rpcString(params, "delivery_announce").trimAscii().toAsciiLower() }
-        let dAnn = annStr == "true" || annStr == "1" || annStr == "yes" || annStr == "on"
-        let path = cronStorePath(CliConfig.dotDir)
-        let (out, code) = cronDashboardSaveJob(path, jobId, message, session, enabled, scheduleKind, everyRaw, atRaw, cronEx, tz, sysEv, wake, dCh, dTo, dAnn)
-        return "{\"ok\":${code == 0},\"code\":${code},\"message\":\"${dashboardJsonEscape(out)}\"}"
-    } else if (action == "run_once") {
+    if (action == "run_once") {
         let jobId = rpcString(params, "id").trimAscii()
         if (jobId.isEmpty()) {
             return "{\"ok\":false,\"message\":\"id is empty\"}"
@@ -786,9 +763,12 @@ private func dashboardAppendCronJson(sb: StringBuilder): Unit {
         first = false
         sb.append("{")
         sb.append("\"id\":\"${dashboardJsonEscape(j.id)}\",")
+        sb.append("\"description\":\"${dashboardJsonEscape(j.description)}\",")
         sb.append("\"enabled\":${j.enabled},")
         sb.append("\"prompt\":\"${dashboardJsonEscape(j.prompt)}\",")
         sb.append("\"sessionTarget\":\"${dashboardJsonEscape(j.sessionTarget)}\",")
+        sb.append("\"agentId\":\"${dashboardJsonEscape(j.agentId)}\",")
+        sb.append("\"sessionKey\":\"${dashboardJsonEscape(j.sessionKey)}\",")
         sb.append("\"schedule\":{")
         sb.append("\"kind\":\"${dashboardJsonEscape(j.schedule.kind)}\",")
         sb.append("\"everyMs\":${j.schedule.everyMs},")
@@ -803,15 +783,23 @@ private func dashboardAppendCronJson(sb: StringBuilder): Unit {
         sb.append("\"deliveryChannel\":\"${dashboardJsonEscape(j.deliveryChannel)}\",")
         sb.append("\"deliveryTo\":\"${dashboardJsonEscape(j.deliveryTo)}\",")
         sb.append("\"deliveryAnnounce\":${j.deliveryAnnounce},")
+        sb.append("\"deliveryAccountId\":\"${dashboardJsonEscape(j.deliveryAccountId)}\",")
+        sb.append("\"bestEffortDeliver\":${j.bestEffortDeliver},")
         sb.append("\"timeoutMs\":${j.timeoutMs},")
         sb.append("\"maxRetries\":${j.maxRetries},")
         sb.append("\"retryBackoffMs\":${j.retryBackoffMs},")
         sb.append("\"failureChannel\":\"${dashboardJsonEscape(j.failureChannel)}\",")
         sb.append("\"failureTo\":\"${dashboardJsonEscape(j.failureTo)}\",")
         sb.append("\"failureAnnounce\":${j.failureAnnounce},")
+        sb.append("\"failureAccountId\":\"${dashboardJsonEscape(j.failureAccountId)}\",")
+        sb.append("\"failureAlertAfter\":${j.failureAlertAfter},")
+        sb.append("\"failureAlertCooldownMs\":${j.failureAlertCooldownMs},")
         sb.append("\"payloadKind\":\"${dashboardJsonEscape(j.payloadKind)}\",")
         sb.append("\"deliveryMode\":\"${dashboardJsonEscape(j.deliveryMode)}\",")
         sb.append("\"failureDestMode\":\"${dashboardJsonEscape(j.failureDestMode)}\",")
+        sb.append("\"modelOverride\":\"${dashboardJsonEscape(j.modelOverride)}\",")
+        sb.append("\"thinkingLevel\":\"${dashboardJsonEscape(j.thinkingLevel)}\",")
+        sb.append("\"lightContext\":${j.lightContext},")
         sb.append("\"state\":{")
         sb.append("\"nextRunAtMs\":${j.state.nextRunAtMs},")
         sb.append("\"lastRunAtMs\":${j.state.lastRunAtMs},")

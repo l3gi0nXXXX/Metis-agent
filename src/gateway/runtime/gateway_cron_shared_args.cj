@@ -10,9 +10,64 @@ public func gatewayCronRpcString(params: JsonObject, key: String): String {
             try {
                 v.asString().getValue()
             } catch (_e: Exception) {
-                ""
+                try { v.toJsonString() } catch (_e2: Exception) { "" }
             }
         case None => ""
+    }
+}
+
+private func gatewayCronRpcStringForKeys(params: JsonObject, keys: Array<String>): Option<String> {
+    for (key in keys) {
+        match (params.get(key)) {
+            case Some(_) => return Some(gatewayCronRpcString(params, key).trimAscii())
+            case None => ()
+        }
+    }
+    None<String>
+}
+
+private func gatewayCronRpcStringForKeysOrEmpty(params: JsonObject, keys: Array<String>): String {
+    match (gatewayCronRpcStringForKeys(params, keys)) {
+        case Some(v) => v
+        case None => ""
+    }
+}
+
+private func gatewayCronAppendStringFlagFromKeys(
+    parts: ArrayList<String>,
+    params: JsonObject,
+    flag: String,
+    keys: Array<String>,
+    allowEmpty!: Bool = false
+): Unit {
+    match (gatewayCronRpcStringForKeys(params, keys)) {
+        case Some(v) =>
+            if (allowEmpty || !v.isEmpty()) {
+                parts.add(flag)
+                parts.add(v)
+            }
+        case None => ()
+    }
+}
+
+private func gatewayCronAppendBoolFlagFromKeys(
+    parts: ArrayList<String>,
+    params: JsonObject,
+    trueFlag: String,
+    falseFlag: String,
+    keys: Array<String>
+): Unit {
+    match (gatewayCronRpcStringForKeys(params, keys)) {
+        case Some(raw) =>
+            let v = raw.trimAscii().toAsciiLower()
+            if (v == "true" || v == "1" || v == "yes" || v == "on") {
+                parts.add(trueFlag)
+            } else if (v == "false" || v == "0" || v == "no" || v == "off") {
+                if (!falseFlag.isEmpty()) {
+                    parts.add(falseFlag)
+                }
+            }
+        case None => ()
     }
 }
 
@@ -21,139 +76,85 @@ public func gatewayCronRpcString(params: JsonObject, key: String): String {
  */
 /** 与 `cron.add` 扩展字段一致，供 Dashboard / `cron.add` RPC 写入 CLI argv。 */
 public func gatewayCronAppendOptionalJobFieldsFromParams(parts: ArrayList<String>, params: JsonObject): Unit {
-    let desc = gatewayCronRpcString(params, "description").trimAscii()
-    if (!desc.isEmpty()) {
-        parts.add("--description")
-        parts.add(desc)
-    }
-    let dar = gatewayCronRpcString(params, "delete_after_run").trimAscii().toAsciiLower()
-    if (dar == "true" || dar == "1" || dar == "yes" || dar == "on") {
-        parts.add("--delete-after-run")
-    }
-    let agent = gatewayCronRpcString(params, "agent_id").trimAscii()
-    if (agent.isEmpty()) {
-        let agent2 = gatewayCronRpcString(params, "agentId").trimAscii()
-        if (!agent2.isEmpty()) {
-            parts.add("--agent-id")
-            parts.add(agent2)
-        }
-    } else {
-        parts.add("--agent-id")
-        parts.add(agent)
-    }
-    let sk = gatewayCronRpcString(params, "session_key").trimAscii()
-    if (sk.isEmpty()) {
-        let sk2 = gatewayCronRpcString(params, "sessionKey").trimAscii()
-        if (!sk2.isEmpty()) {
-            parts.add("--session-key")
-            parts.add(sk2)
-        }
-    } else {
-        parts.add("--session-key")
-        parts.add(sk)
-    }
-    let model = gatewayCronRpcString(params, "model").trimAscii()
-    if (model.isEmpty()) {
-        let mo = gatewayCronRpcString(params, "model_override").trimAscii()
-        if (!mo.isEmpty()) {
-            parts.add("--model")
-            parts.add(mo)
-        }
-    } else {
-        parts.add("--model")
-        parts.add(model)
-    }
-    let tl = gatewayCronRpcString(params, "thinking_level").trimAscii()
-    if (!tl.isEmpty()) {
-        parts.add("--thinking-level")
-        parts.add(tl)
-    }
-    let lc = gatewayCronRpcString(params, "light_context").trimAscii().toAsciiLower()
-    if (lc == "true" || lc == "1" || lc == "yes" || lc == "on") {
-        parts.add("--light-context")
-    }
-    let daid = gatewayCronRpcString(params, "delivery_account_id").trimAscii()
-    if (!daid.isEmpty()) {
-        parts.add("--delivery-account-id")
-        parts.add(daid)
-    }
-    let bed = gatewayCronRpcString(params, "best_effort_deliver").trimAscii().toAsciiLower()
-    if (bed == "true" || bed == "1" || bed == "yes" || bed == "on") {
-        parts.add("--best-effort-deliver")
-    }
-    let faid = gatewayCronRpcString(params, "failure_account_id").trimAscii()
-    if (!faid.isEmpty()) {
-        parts.add("--failure-account-id")
-        parts.add(faid)
-    }
-    let faa = gatewayCronRpcString(params, "failure_alert_after").trimAscii()
-    if (!faa.isEmpty()) {
-        parts.add("--failure-alert-after")
-        parts.add(faa)
-    }
-    let fac = gatewayCronRpcString(params, "failure_alert_cooldown_ms").trimAscii()
-    if (!fac.isEmpty()) {
-        parts.add("--failure-alert-cooldown-ms")
-        parts.add(fac)
-    }
+    gatewayCronAppendStringFlagFromKeys(parts, params, "--description", ["description"], allowEmpty: true)
+    gatewayCronAppendBoolFlagFromKeys(parts, params, "--delete-after-run", "--no-delete-after-run", ["delete_after_run", "deleteAfterRun"])
+    gatewayCronAppendStringFlagFromKeys(parts, params, "--agent-id", ["agent_id", "agentId"], allowEmpty: true)
+    gatewayCronAppendStringFlagFromKeys(parts, params, "--session-key", ["session_key", "sessionKey"], allowEmpty: true)
+    gatewayCronAppendStringFlagFromKeys(parts, params, "--model", ["model", "model_override", "modelOverride"], allowEmpty: true)
+    gatewayCronAppendStringFlagFromKeys(parts, params, "--thinking-level", ["thinking_level", "thinkingLevel"], allowEmpty: true)
+    gatewayCronAppendBoolFlagFromKeys(parts, params, "--light-context", "--no-light-context", ["light_context", "lightContext"])
+    gatewayCronAppendStringFlagFromKeys(parts, params, "--delivery-account-id", ["delivery_account_id", "deliveryAccountId"], allowEmpty: true)
+    gatewayCronAppendBoolFlagFromKeys(parts, params, "--best-effort-deliver", "--no-best-effort-deliver", ["best_effort_deliver", "bestEffortDeliver"])
+    gatewayCronAppendStringFlagFromKeys(parts, params, "--payload-kind", ["payload_kind", "payloadKind"], allowEmpty: true)
+    gatewayCronAppendStringFlagFromKeys(parts, params, "--failure-account-id", ["failure_account_id", "failureAccountId"], allowEmpty: true)
+    gatewayCronAppendStringFlagFromKeys(parts, params, "--failure-alert-after", ["failure_alert_after", "failureAlertAfter"])
+    gatewayCronAppendStringFlagFromKeys(parts, params, "--failure-alert-cooldown-ms", ["failure_alert_cooldown_ms", "failureAlertCooldownMs"])
 }
 
 public func gatewayCronAppendDeliveryArgs(parts: ArrayList<String>, params: JsonObject): Unit {
-    let sysEv = gatewayCronRpcString(params, "system_event").trimAscii()
-    let wake = gatewayCronRpcString(params, "wake_mode").trimAscii()
-    let dCh = gatewayCronRpcString(params, "delivery_channel").trimAscii()
-    let dTo = gatewayCronRpcString(params, "delivery_to").trimAscii()
-    let ann = gatewayCronRpcString(params, "delivery_announce").trimAscii().toAsciiLower()
-    let timeoutMs = gatewayCronRpcString(params, "timeout_ms").trimAscii()
-    let maxRetries = gatewayCronRpcString(params, "max_retries").trimAscii()
-    let retryBackoffMs = gatewayCronRpcString(params, "retry_backoff_ms").trimAscii()
-    let fc = gatewayCronRpcString(params, "failure_channel").trimAscii()
-    let ft = gatewayCronRpcString(params, "failure_to").trimAscii()
-    let fann = gatewayCronRpcString(params, "failure_announce").trimAscii().toAsciiLower()
-    if (!sysEv.isEmpty()) {
-        parts.add("--system-event")
-        parts.add(sysEv)
+    gatewayCronAppendStringFlagFromKeys(parts, params, "--system-event", ["system_event", "systemEvent"], allowEmpty: true)
+    gatewayCronAppendStringFlagFromKeys(parts, params, "--wake-mode", ["wake_mode", "wakeMode"], allowEmpty: true)
+    gatewayCronAppendStringFlagFromKeys(parts, params, "--delivery-mode", ["delivery_mode", "deliveryMode"], allowEmpty: true)
+    gatewayCronAppendStringFlagFromKeys(parts, params, "--channel", ["delivery_channel", "deliveryChannel"], allowEmpty: true)
+    gatewayCronAppendStringFlagFromKeys(parts, params, "--to", ["delivery_to", "deliveryTo"], allowEmpty: true)
+    gatewayCronAppendBoolFlagFromKeys(parts, params, "--announce", "--no-announce", ["delivery_announce", "deliveryAnnounce"])
+    gatewayCronAppendStringFlagFromKeys(parts, params, "--timeout-ms", ["timeout_ms", "timeoutMs"])
+    gatewayCronAppendStringFlagFromKeys(parts, params, "--timeout-seconds", ["timeout_seconds", "timeoutSeconds"])
+    gatewayCronAppendStringFlagFromKeys(parts, params, "--max-retries", ["max_retries", "maxRetries"])
+    gatewayCronAppendStringFlagFromKeys(parts, params, "--retry-backoff-ms", ["retry_backoff_ms", "retryBackoffMs"])
+    gatewayCronAppendStringFlagFromKeys(parts, params, "--failure-dest-mode", ["failure_dest_mode", "failureDestMode"], allowEmpty: true)
+    gatewayCronAppendStringFlagFromKeys(parts, params, "--failure-channel", ["failure_channel", "failureChannel"], allowEmpty: true)
+    gatewayCronAppendStringFlagFromKeys(parts, params, "--failure-to", ["failure_to", "failureTo"], allowEmpty: true)
+    gatewayCronAppendBoolFlagFromKeys(parts, params, "--failure-announce", "--no-failure-announce", ["failure_announce", "failureAnnounce"])
+}
+
+private func gatewayCronAppendOptionalSchedulePatch(
+    parts: ArrayList<String>,
+    params: JsonObject,
+    requireSchedule!: Bool = false
+): Option<String> {
+    let sk = gatewayCronRpcStringForKeysOrEmpty(params, ["schedule_kind", "scheduleKind"]).trimAscii().toAsciiLower()
+    let every = gatewayCronRpcStringForKeysOrEmpty(params, ["every"]).trimAscii()
+    let atRaw = gatewayCronRpcStringForKeysOrEmpty(params, ["at"]).trimAscii()
+    let cronExpr = gatewayCronRpcStringForKeysOrEmpty(params, ["cron_expr", "cronExpr"]).trimAscii()
+    let wantsEvery = sk == "every" || (sk.isEmpty() && !every.isEmpty())
+    let wantsAt = sk == "at" || (sk.isEmpty() && !atRaw.isEmpty())
+    let wantsCron = sk == "cron" || (sk.isEmpty() && !cronExpr.isEmpty())
+    if (wantsEvery) {
+        if (every.isEmpty()) {
+            return Some("every required")
+        }
+        parts.add("--every")
+        parts.add(every)
+        return None
     }
-    if (!wake.isEmpty()) {
-        parts.add("--wake-mode")
-        parts.add(wake)
+    if (wantsAt) {
+        if (atRaw.isEmpty()) {
+            return Some("at required")
+        }
+        parts.add("--at")
+        parts.add(atRaw)
+        return None
     }
-    if (!dCh.isEmpty()) {
-        parts.add("--channel")
-        parts.add(dCh)
+    if (wantsCron) {
+        if (cronExpr.isEmpty()) {
+            return Some("cron_expr required")
+        }
+        parts.add("--cron")
+        parts.add(cronExpr)
+        let tz = if (gatewayCronRpcStringForKeysOrEmpty(params, ["time_zone", "timeZone"]).trimAscii().isEmpty()) {
+            "UTC"
+        } else {
+            gatewayCronRpcStringForKeysOrEmpty(params, ["time_zone", "timeZone"]).trimAscii()
+        }
+        parts.add("--tz")
+        parts.add(tz)
+        return None
     }
-    if (!dTo.isEmpty()) {
-        parts.add("--to")
-        parts.add(dTo)
+    if (requireSchedule) {
+        return Some("schedule required")
     }
-    if (ann == "true" || ann == "1" || ann == "yes" || ann == "on") {
-        parts.add("--announce")
-    }
-    if (!timeoutMs.isEmpty()) {
-        parts.add("--timeout-ms")
-        parts.add(timeoutMs)
-    }
-    if (!maxRetries.isEmpty()) {
-        parts.add("--max-retries")
-        parts.add(maxRetries)
-    }
-    if (!retryBackoffMs.isEmpty()) {
-        parts.add("--retry-backoff-ms")
-        parts.add(retryBackoffMs)
-    }
-    if (!fc.isEmpty()) {
-        parts.add("--failure-channel")
-        parts.add(fc)
-    }
-    if (!ft.isEmpty()) {
-        parts.add("--failure-to")
-        parts.add(ft)
-    }
-    if (fann == "true" || fann == "1" || fann == "yes" || fann == "on") {
-        parts.add("--failure-announce")
-    } else if (fann == "false" || fann == "0" || fann == "no" || fann == "off") {
-        parts.add("--no-failure-announce")
-    }
+    None
 }
 
 /**
@@ -218,11 +219,12 @@ public func gatewayCronFillArgvForDashboardAction(
     }
     if (act == "add_cron") {
         let name = gatewayCronRpcString(params, "name").trimAscii()
-        let cronExpr = gatewayCronRpcString(params, "cron_expr").trimAscii()
-        let tz = if (gatewayCronRpcString(params, "time_zone").trimAscii().isEmpty()) {
+        let cronExpr = gatewayCronRpcStringForKeysOrEmpty(params, ["cron_expr", "cronExpr"]).trimAscii()
+        let tzRaw = gatewayCronRpcStringForKeysOrEmpty(params, ["time_zone", "timeZone"]).trimAscii()
+        let tz = if (tzRaw.isEmpty()) {
             "UTC"
         } else {
-            gatewayCronRpcString(params, "time_zone").trimAscii()
+            tzRaw
         }
         let session = if (gatewayCronRpcString(params, "session").trimAscii().isEmpty()) {
             "main"
@@ -261,7 +263,7 @@ public func gatewayCronFillArgvForDashboardAction(
         parts.add(act)
         return None
     }
-    if (act == "update") {
+    if (act == "update" || act == "save_job") {
         let targetId = if (gatewayCronRpcString(params, "jobId").trimAscii().isEmpty()) {
             gatewayCronRpcString(params, "id").trimAscii()
         } else {
@@ -275,16 +277,28 @@ public func gatewayCronFillArgvForDashboardAction(
         parts.add(targetId)
         let en = gatewayCronRpcString(params, "enabled").trimAscii().toAsciiLower()
         let msg = gatewayCronRpcString(params, "message")
+        let session = gatewayCronRpcString(params, "session").trimAscii()
         if (!en.isEmpty()) {
             parts.add("--enabled")
             parts.add(en)
+        }
+        if (!session.isEmpty()) {
+            parts.add("--session")
+            parts.add(session)
+        }
+        match (gatewayCronAppendOptionalSchedulePatch(parts, params, requireSchedule: act == "save_job")) {
+            case Some(err) => return Some(err)
+            case None => ()
+        }
+        gatewayCronAppendDeliveryArgs(parts, params)
+        gatewayCronAppendOptionalJobFieldsFromParams(parts, params)
+        if (act == "save_job" && msg.trimAscii().isEmpty()) {
+            return Some("id or message empty")
         }
         if (!msg.trimAscii().isEmpty()) {
             parts.add("--message")
             parts.add(msg)
         }
-        gatewayCronAppendDeliveryArgs(parts, params)
-        gatewayCronAppendOptionalJobFieldsFromParams(parts, params)
         return None
     }
     if (act == "run") {
@@ -374,7 +388,7 @@ public func gatewayCronInferAddAction(params: JsonObject): Option<String> {
     if (actRaw == "add_every" || actRaw == "add_at" || actRaw == "add_cron") {
         return Some(actRaw)
     }
-    let ce = gatewayCronRpcString(params, "cron_expr").trimAscii()
+    let ce = gatewayCronRpcStringForKeysOrEmpty(params, ["cron_expr", "cronExpr"]).trimAscii()
     let at = gatewayCronRpcString(params, "at").trimAscii()
     let ev = gatewayCronRpcString(params, "every").trimAscii()
     if (!ce.isEmpty()) {

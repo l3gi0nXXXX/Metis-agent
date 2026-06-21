@@ -74,6 +74,7 @@ private func gatewayCronToolsetCall(
     enabled!: Option<Bool> = None<Bool>,
     session!: Option<String> = None<String>,
     deliveryChannel!: Option<String> = None<String>,
+    deliveryMode!: Option<String> = None<String>,
     deliveryTo!: Option<String> = None<String>,
     deliveryAccountId!: Option<String> = None<String>,
     bestEffortDeliver!: Option<Bool> = None<Bool>,
@@ -81,6 +82,7 @@ private func gatewayCronToolsetCall(
     maxRetries!: Option<Int64> = None<Int64>,
     retryBackoffMs!: Option<Int64> = None<Int64>,
     failureChannel!: Option<String> = None<String>,
+    failureDestMode!: Option<String> = None<String>,
     failureTo!: Option<String> = None<String>,
     failureAccountId!: Option<String> = None<String>,
     failureAlertAfter!: Option<Int64> = None<Int64>,
@@ -103,6 +105,7 @@ private func gatewayCronToolsetCall(
         enabled,
         session,
         deliveryChannel,
+        deliveryMode,
         deliveryTo,
         deliveryAccountId,
         bestEffortDeliver,
@@ -110,6 +113,7 @@ private func gatewayCronToolsetCall(
         maxRetries,
         retryBackoffMs,
         failureChannel,
+        failureDestMode,
         failureTo,
         failureAccountId,
         failureAlertAfter,
@@ -136,6 +140,7 @@ public class GatewayCronToolsetTest {
                 every: Some("10m"),
                 session: Some("isolated"),
                 deliveryChannel: Some("feishu"),
+                deliveryMode: Some("announce"),
                 deliveryTo: Some("ou_user"),
                 deliveryAccountId: Some("tenant-a"),
                 bestEffortDeliver: Some(true),
@@ -143,6 +148,7 @@ public class GatewayCronToolsetTest {
                 maxRetries: Some(2),
                 retryBackoffMs: Some(250),
                 failureChannel: Some("telegram"),
+                failureDestMode: Some("announce"),
                 failureTo: Some("user:ops"),
                 failureAccountId: Some("bot-a"),
                 failureAlertAfter: Some(2),
@@ -162,6 +168,7 @@ public class GatewayCronToolsetTest {
             @Expect(job.schedule.everyMs, 600000)
             @Expect(job.sessionTarget, "isolated")
             @Expect(job.deliveryChannel, "feishu")
+            @Expect(job.deliveryMode, "announce")
             @Expect(job.deliveryTo, "ou_user")
             @Expect(job.deliveryAccountId, "tenant-a")
             @Expect(job.bestEffortDeliver, true)
@@ -169,6 +176,7 @@ public class GatewayCronToolsetTest {
             @Expect(job.maxRetries, 2)
             @Expect(job.retryBackoffMs, 250)
             @Expect(job.failureChannel, "telegram")
+            @Expect(job.failureDestMode, "announce")
             @Expect(job.failureTo, "user:ops")
             @Expect(job.failureAccountId, "bot-a")
             @Expect(job.failureAlertAfter, 2)

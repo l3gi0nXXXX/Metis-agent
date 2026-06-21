@@ -320,8 +320,11 @@ public func gatewayBuildControlUiCronScript(): String {
       var lastErrLine = (lr > 0 && err)
         ? '<div class="cron-task-card__lasterr muted">' + cronEsc(err.slice(0, 240)) + '</div>'
         : '';
-      var ds = ' data-cron-id="' + cronAttr(jid) + '" data-cron-message="' + cronAttr(j.prompt || '') + '" data-cron-schedule-kind="' + cronAttr((j.schedule && j.schedule.kind) ? j.schedule.kind : '') + '" data-cron-every-ms="' + cronAttr((j.schedule && j.schedule.everyMs) ? String(j.schedule.everyMs) : '0') + '" data-cron-at-ms="' + cronAttr((j.schedule && j.schedule.atMs) ? String(j.schedule.atMs) : '0') + '" data-cron-expr="' + cronAttr((j.schedule && j.schedule.cronExpr) ? j.schedule.cronExpr : '') + '" data-cron-tz="' + cronAttr((j.schedule && j.schedule.timeZone) ? j.schedule.timeZone : 'UTC') + '" data-cron-session="' + cronAttr(j.sessionTarget || 'main') + '" data-cron-enabled="' + (j.enabled ? 'true' : 'false') + '"' +
-        ' data-delivery-ch="' + cronAttr(j.deliveryChannel || '') + '" data-delivery-to="' + cronAttr(j.deliveryTo || '') + '" data-delivery-ann="' + (j.deliveryAnnounce ? 'true' : 'false') + '"' +
+      var ds = ' data-cron-id="' + cronAttr(jid) + '" data-cron-message="' + cronAttr(j.prompt || '') + '" data-cron-desc="' + cronAttr(j.description || '') + '" data-cron-schedule-kind="' + cronAttr((j.schedule && j.schedule.kind) ? j.schedule.kind : '') + '" data-cron-every-ms="' + cronAttr((j.schedule && j.schedule.everyMs) ? String(j.schedule.everyMs) : '0') + '" data-cron-at-ms="' + cronAttr((j.schedule && j.schedule.atMs) ? String(j.schedule.atMs) : '0') + '" data-cron-expr="' + cronAttr((j.schedule && j.schedule.cronExpr) ? j.schedule.cronExpr : '') + '" data-cron-tz="' + cronAttr((j.schedule && j.schedule.timeZone) ? j.schedule.timeZone : 'UTC') + '" data-cron-session="' + cronAttr(j.sessionTarget || 'main') + '" data-cron-enabled="' + (j.enabled ? 'true' : 'false') + '"' +
+        ' data-delivery-mode="' + cronAttr(j.deliveryMode || '') + '" data-delivery-ch="' + cronAttr(j.deliveryChannel || '') + '" data-delivery-to="' + cronAttr(j.deliveryTo || '') + '" data-delivery-ann="' + (j.deliveryAnnounce ? 'true' : 'false') + '" data-delivery-account="' + cronAttr(j.deliveryAccountId || '') + '" data-best-effort="' + (j.bestEffortDeliver ? 'true' : 'false') + '"' +
+        ' data-timeout-ms="' + cronAttr(j.timeoutMs ? String(j.timeoutMs) : '0') + '" data-max-retries="' + cronAttr(j.maxRetries ? String(j.maxRetries) : '0') + '" data-retry-backoff-ms="' + cronAttr(j.retryBackoffMs ? String(j.retryBackoffMs) : '0') + '"' +
+        ' data-failure-dest-mode="' + cronAttr(j.failureDestMode || '') + '" data-failure-ch="' + cronAttr(j.failureChannel || '') + '" data-failure-to="' + cronAttr(j.failureTo || '') + '" data-failure-ann="' + (j.failureAnnounce ? 'true' : 'false') + '" data-failure-account="' + cronAttr(j.failureAccountId || '') + '" data-failure-alert-after="' + cronAttr(j.failureAlertAfter ? String(j.failureAlertAfter) : '0') + '" data-failure-alert-cooldown-ms="' + cronAttr(j.failureAlertCooldownMs ? String(j.failureAlertCooldownMs) : '0') + '"' +
+        ' data-model-override="' + cronAttr(j.modelOverride || '') + '" data-thinking-level="' + cronAttr(j.thinkingLevel || '') + '" data-light-context="' + (j.lightContext ? 'true' : 'false') + '"' +
         ' data-system-event="' + cronAttr(j.systemEvent || '') + '" data-wake-mode="' + cronAttr(j.wakeMode || '') + '"';
       var sep = '<span class="cron-task-action-sep" aria-hidden="true"></span>';
       var toggleCls = 'cron-task-action cron-task-action--toggle ' + (j.enabled ? 'cron-task-action--toggle-on' : 'cron-task-action--toggle-off');
@@ -397,6 +400,8 @@ public func gatewayBuildControlUiCronScript(): String {
     if (nameEl) nameEl.value = job.id || '';
     var msgEl = document.getElementById('cron-in-message');
     if (msgEl) msgEl.value = job.prompt || '';
+    var descEl = document.getElementById('cron-in-desc');
+    if (descEl) descEl.value = job.description || '';
     var enEl = document.getElementById('cron-in-enabled');
     if (enEl) enEl.checked = !!job.enabled;
     var sess = String(job.sessionTarget || 'main').toLowerCase();
@@ -440,9 +445,41 @@ public func gatewayBuildControlUiCronScript(): String {
     var dch = document.getElementById('cron-in-delivery-channel');
     var dto = document.getElementById('cron-in-delivery-to');
     var dan = document.getElementById('cron-in-delivery-announce');
+    var dmode = document.getElementById('cron-in-delivery-mode');
+    var dacc = document.getElementById('cron-in-delivery-account');
+    var best = document.getElementById('cron-in-best-effort');
+    if (dmode) dmode.value = job.deliveryMode || '';
     if (dch) dch.value = job.deliveryChannel || '';
     if (dto) dto.value = job.deliveryTo || '';
     if (dan) dan.checked = !!job.deliveryAnnounce;
+    if (dacc) dacc.value = job.deliveryAccountId || '';
+    if (best) best.checked = !!job.bestEffortDeliver;
+    var fmode = document.getElementById('cron-in-failure-dest-mode');
+    var fch = document.getElementById('cron-in-failure-channel');
+    var fto = document.getElementById('cron-in-failure-to');
+    var fann = document.getElementById('cron-in-failure-announce');
+    var facc = document.getElementById('cron-in-failure-account');
+    var faAfter = document.getElementById('cron-in-failure-alert-after');
+    var faCooldown = document.getElementById('cron-in-failure-alert-cooldown-ms');
+    if (fmode) fmode.value = job.failureDestMode || '';
+    if (fch) fch.value = job.failureChannel || '';
+    if (fto) fto.value = job.failureTo || '';
+    if (fann) fann.checked = job.failureAnnounce !== false;
+    if (facc) facc.value = job.failureAccountId || '';
+    if (faAfter) faAfter.value = Number(job.failureAlertAfter || 0) > 0 ? String(job.failureAlertAfter) : '';
+    if (faCooldown) faCooldown.value = Number(job.failureAlertCooldownMs || 0) > 0 ? String(job.failureAlertCooldownMs) : '';
+    var modelEl = document.getElementById('cron-in-model');
+    var thinkingEl = document.getElementById('cron-in-thinking-level');
+    var lightEl = document.getElementById('cron-in-light-context');
+    var timeoutEl = document.getElementById('cron-in-timeout-seconds');
+    var retriesEl = document.getElementById('cron-in-max-retries');
+    var backoffEl = document.getElementById('cron-in-retry-backoff-ms');
+    if (modelEl) modelEl.value = job.modelOverride || '';
+    if (thinkingEl) thinkingEl.value = job.thinkingLevel || '';
+    if (lightEl) lightEl.checked = !!job.lightContext;
+    if (timeoutEl) timeoutEl.value = Number(job.timeoutMs || 0) > 0 ? String(Math.ceil(Number(job.timeoutMs || 0) / 1000)) : '';
+    if (retriesEl) retriesEl.value = Number(job.maxRetries || 0) > 0 ? String(job.maxRetries) : '';
+    if (backoffEl) backoffEl.value = Number(job.retryBackoffMs || 0) > 0 ? String(job.retryBackoffMs) : '';
     var sev = document.getElementById('cron-in-system-event');
     var wkm = document.getElementById('cron-in-wake-mode');
     if (sev) sev.value = job.systemEvent || '';
@@ -501,16 +538,50 @@ public func gatewayBuildControlUiCronScript(): String {
     }
     var agentEl = document.getElementById('cron-in-agent');
     if (agentEl) agentEl.value = '';
+    var descR = document.getElementById('cron-in-desc');
+    if (descR) descR.value = '';
     var exR = document.getElementById('cron-in-expr');
     if (exR) exR.value = '';
     var tzR = document.getElementById('cron-in-tz');
     if (tzR) tzR.value = 'UTC';
     var dchR = document.getElementById('cron-in-delivery-channel');
+    var dmR = document.getElementById('cron-in-delivery-mode');
+    if (dmR) dmR.value = '';
     if (dchR) dchR.value = '';
     var dtoR = document.getElementById('cron-in-delivery-to');
     if (dtoR) dtoR.value = '';
     var danR = document.getElementById('cron-in-delivery-announce');
     if (danR) danR.checked = false;
+    var daccR = document.getElementById('cron-in-delivery-account');
+    if (daccR) daccR.value = '';
+    var bestR = document.getElementById('cron-in-best-effort');
+    if (bestR) bestR.checked = false;
+    var fmodeR = document.getElementById('cron-in-failure-dest-mode');
+    if (fmodeR) fmodeR.value = '';
+    var fchR = document.getElementById('cron-in-failure-channel');
+    if (fchR) fchR.value = '';
+    var ftoR = document.getElementById('cron-in-failure-to');
+    if (ftoR) ftoR.value = '';
+    var fannR = document.getElementById('cron-in-failure-announce');
+    if (fannR) fannR.checked = true;
+    var faccR = document.getElementById('cron-in-failure-account');
+    if (faccR) faccR.value = '';
+    var faaR = document.getElementById('cron-in-failure-alert-after');
+    if (faaR) faaR.value = '';
+    var facR = document.getElementById('cron-in-failure-alert-cooldown-ms');
+    if (facR) facR.value = '';
+    var modelR = document.getElementById('cron-in-model');
+    if (modelR) modelR.value = '';
+    var thinkingR = document.getElementById('cron-in-thinking-level');
+    if (thinkingR) thinkingR.value = '';
+    var lightR = document.getElementById('cron-in-light-context');
+    if (lightR) lightR.checked = false;
+    var timeoutR = document.getElementById('cron-in-timeout-seconds');
+    if (timeoutR) timeoutR.value = '';
+    var retriesR = document.getElementById('cron-in-max-retries');
+    if (retriesR) retriesR.value = '';
+    var backoffR = document.getElementById('cron-in-retry-backoff-ms');
+    if (backoffR) backoffR.value = '';
     var seR = document.getElementById('cron-in-system-event');
     if (seR) seR.value = '';
     var wmR = document.getElementById('cron-in-wake-mode');
@@ -563,16 +634,66 @@ public func gatewayBuildControlUiCronScript(): String {
     var sess = btn.getAttribute('data-cron-session') || 'main';
     var en = String(btn.getAttribute('data-cron-enabled') || 'true') === 'true';
     var msg = btn.getAttribute('data-cron-message') || '';
+    var desc = btn.getAttribute('data-cron-desc') || '';
+    var dmode = btn.getAttribute('data-delivery-mode') || '';
     var dch = btn.getAttribute('data-delivery-ch') || '';
     var dto = btn.getAttribute('data-delivery-to') || '';
     var dAnn = String(btn.getAttribute('data-delivery-ann') || 'false') === 'true';
+    var dacc = btn.getAttribute('data-delivery-account') || '';
+    var best = String(btn.getAttribute('data-best-effort') || 'false') === 'true';
+    var timeoutMs = Number(btn.getAttribute('data-timeout-ms') || '0');
+    var maxRetries = Number(btn.getAttribute('data-max-retries') || '0');
+    var retryBackoffMs = Number(btn.getAttribute('data-retry-backoff-ms') || '0');
+    var fmode = btn.getAttribute('data-failure-dest-mode') || '';
+    var fch = btn.getAttribute('data-failure-ch') || '';
+    var fto = btn.getAttribute('data-failure-to') || '';
+    var fAnn = String(btn.getAttribute('data-failure-ann') || 'true') === 'true';
+    var facc = btn.getAttribute('data-failure-account') || '';
+    var faAfter = Number(btn.getAttribute('data-failure-alert-after') || '0');
+    var faCooldown = Number(btn.getAttribute('data-failure-alert-cooldown-ms') || '0');
+    var model = btn.getAttribute('data-model-override') || '';
+    var thinking = btn.getAttribute('data-thinking-level') || '';
+    var light = String(btn.getAttribute('data-light-context') || 'false') === 'true';
     var sysEv = btn.getAttribute('data-system-event') || '';
     var wake = btn.getAttribute('data-wake-mode') || '';
     var sch;
     if (sk === 'at') sch = { kind: 'at', atMs: atMs, everyMs: 0, cronExpr: '', timeZone: 'UTC' };
     else if (sk === 'cron') sch = { kind: 'cron', cronExpr: cronEx, timeZone: cronTz, everyMs: 0, atMs: 0 };
     else sch = { kind: 'every', everyMs: everyMs, atMs: 0, cronExpr: '', timeZone: 'UTC' };
-    return { id: jid, prompt: msg, enabled: en, sessionTarget: sess, schedule: sch, deliveryChannel: dch, deliveryTo: dto, deliveryAnnounce: dAnn, systemEvent: sysEv, wakeMode: wake };
+    return {
+      id: jid, description: desc, prompt: msg, enabled: en, sessionTarget: sess, schedule: sch,
+      deliveryMode: dmode, deliveryChannel: dch, deliveryTo: dto, deliveryAnnounce: dAnn,
+      deliveryAccountId: dacc, bestEffortDeliver: best, timeoutMs: timeoutMs, maxRetries: maxRetries,
+      retryBackoffMs: retryBackoffMs, failureDestMode: fmode, failureChannel: fch, failureTo: fto,
+      failureAnnounce: fAnn, failureAccountId: facc, failureAlertAfter: faAfter,
+      failureAlertCooldownMs: faCooldown, modelOverride: model, thinkingLevel: thinking,
+      lightContext: light, systemEvent: sysEv, wakeMode: wake
+    };
+  }
+
+  function cronAdvancedPayloadFromForm() {
+    return {
+      description: (document.getElementById('cron-in-desc') || {}).value || '',
+      delivery_mode: (document.getElementById('cron-in-delivery-mode') || {}).value || '',
+      delivery_channel: (document.getElementById('cron-in-delivery-channel') || {}).value || '',
+      delivery_to: (document.getElementById('cron-in-delivery-to') || {}).value || '',
+      delivery_announce: (document.getElementById('cron-in-delivery-announce') || {}).checked ? 'true' : 'false',
+      delivery_account_id: (document.getElementById('cron-in-delivery-account') || {}).value || '',
+      best_effort_deliver: (document.getElementById('cron-in-best-effort') || {}).checked ? 'true' : 'false',
+      failure_dest_mode: (document.getElementById('cron-in-failure-dest-mode') || {}).value || '',
+      failure_channel: (document.getElementById('cron-in-failure-channel') || {}).value || '',
+      failure_to: (document.getElementById('cron-in-failure-to') || {}).value || '',
+      failure_announce: (document.getElementById('cron-in-failure-announce') || {}).checked ? 'true' : 'false',
+      failure_account_id: (document.getElementById('cron-in-failure-account') || {}).value || '',
+      failure_alert_after: (document.getElementById('cron-in-failure-alert-after') || {}).value || '',
+      failure_alert_cooldown_ms: (document.getElementById('cron-in-failure-alert-cooldown-ms') || {}).value || '',
+      model: (document.getElementById('cron-in-model') || {}).value || '',
+      thinking_level: (document.getElementById('cron-in-thinking-level') || {}).value || '',
+      light_context: (document.getElementById('cron-in-light-context') || {}).checked ? 'true' : 'false',
+      timeout_seconds: (document.getElementById('cron-in-timeout-seconds') || {}).value || '',
+      max_retries: (document.getElementById('cron-in-max-retries') || {}).value || '',
+      retry_backoff_ms: (document.getElementById('cron-in-retry-backoff-ms') || {}).value || ''
+    };
   }
 
   function cronSyncNewTaskFormUi() {
@@ -956,7 +1077,7 @@ public func gatewayBuildControlUiCronScript(): String {
           else if (unitEd === 'd') { everyStrEdit = Math.round(nEd) + 'd'; }
           else { everyStrEdit = Math.round(nEd) + 'm'; }
         }
-        payload = {
+        payload = Object.assign({
           action: 'save_job',
           id: v3CronEditId,
           message: message,
@@ -967,12 +1088,9 @@ public func gatewayBuildControlUiCronScript(): String {
           at: atStrEdit,
           cron_expr: cronExSave,
           time_zone: tzSave,
-          delivery_channel: (document.getElementById('cron-in-delivery-channel') || {}).value || '',
-          delivery_to: (document.getElementById('cron-in-delivery-to') || {}).value || '',
-          delivery_announce: (document.getElementById('cron-in-delivery-announce') || {}).checked ? 'true' : 'false',
           system_event: (document.getElementById('cron-in-system-event') || {}).value || '',
           wake_mode: (document.getElementById('cron-in-wake-mode') || {}).value || ''
-        };
+        }, cronAdvancedPayloadFromForm());
         if (!String(payload.message || '').trim()) {
           cronSyncNewTaskFormUi();
           return;
@@ -990,13 +1108,10 @@ public func gatewayBuildControlUiCronScript(): String {
         });
         return;
       }
-      var cronExtra = {
-        delivery_channel: (document.getElementById('cron-in-delivery-channel') || {}).value || '',
-        delivery_to: (document.getElementById('cron-in-delivery-to') || {}).value || '',
-        delivery_announce: (document.getElementById('cron-in-delivery-announce') || {}).checked ? 'true' : 'false',
+      var cronExtra = Object.assign({
         system_event: (document.getElementById('cron-in-system-event') || {}).value || '',
         wake_mode: (document.getElementById('cron-in-wake-mode') || {}).value || ''
-      };
+      }, cronAdvancedPayloadFromForm());
       if (st === 'at') {
         var atEl = document.getElementById('cron-in-at');
         var atVal = atEl ? atEl.value : '';

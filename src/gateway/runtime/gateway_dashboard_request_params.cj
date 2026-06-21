@@ -8,9 +8,23 @@ import stdx.encoding.json.{JsonObject, JsonString, JsonValue}
 private func gatewayDashboardParamString(params: JsonObject, key: String): String {
     match (params.get(key)) {
         case Some(v) =>
-            try { v.asString().getValue().trimAscii() } catch (_e: Exception) { "" }
+            try {
+                v.asString().getValue().trimAscii()
+            } catch (_e: Exception) {
+                try { v.toJsonString().trimAscii() } catch (_e2: Exception) { "" }
+            }
         case None => ""
     }
+}
+
+private func gatewayDashboardParamFirstString(params: JsonObject, keys: Array<String>): String {
+    for (key in keys) {
+        let value = gatewayDashboardParamString(params, key)
+        if (!value.isEmpty()) {
+            return value
+        }
+    }
+    ""
 }
 
 private func gatewayDashboardParamBool(params: JsonObject, key: String): Bool {
@@ -152,7 +166,30 @@ public func gatewayDashboardRequestParams(
             timeZone: gatewayDashboardParamString(params, "time_zone"),
             id: gatewayDashboardParamString(params, "id"),
             enabled: gatewayDashboardParamString(params, "enabled"),
-            scheduleKind: gatewayDashboardParamString(params, "schedule_kind")
+            scheduleKind: gatewayDashboardParamString(params, "schedule_kind"),
+            description: gatewayDashboardParamString(params, "description"),
+            deleteAfterRun: gatewayDashboardParamFirstString(params, ["delete_after_run", "deleteAfterRun"]),
+            agentId: gatewayDashboardParamFirstString(params, ["agent_id", "agentId"]),
+            sessionKey: gatewayDashboardParamFirstString(params, ["session_key", "sessionKey"]),
+            model: gatewayDashboardParamString(params, "model"),
+            modelOverride: gatewayDashboardParamFirstString(params, ["model_override", "modelOverride"]),
+            thinkingLevel: gatewayDashboardParamFirstString(params, ["thinking_level", "thinkingLevel"]),
+            lightContext: gatewayDashboardParamFirstString(params, ["light_context", "lightContext"]),
+            deliveryMode: gatewayDashboardParamFirstString(params, ["delivery_mode", "deliveryMode"]),
+            deliveryAccountId: gatewayDashboardParamFirstString(params, ["delivery_account_id", "deliveryAccountId"]),
+            bestEffortDeliver: gatewayDashboardParamFirstString(params, ["best_effort_deliver", "bestEffortDeliver"]),
+            payloadKind: gatewayDashboardParamFirstString(params, ["payload_kind", "payloadKind"]),
+            timeoutMs: gatewayDashboardParamFirstString(params, ["timeout_ms", "timeoutMs"]),
+            timeoutSeconds: gatewayDashboardParamFirstString(params, ["timeout_seconds", "timeoutSeconds"]),
+            maxRetries: gatewayDashboardParamFirstString(params, ["max_retries", "maxRetries"]),
+            retryBackoffMs: gatewayDashboardParamFirstString(params, ["retry_backoff_ms", "retryBackoffMs"]),
+            failureDestMode: gatewayDashboardParamFirstString(params, ["failure_dest_mode", "failureDestMode"]),
+            failureChannel: gatewayDashboardParamFirstString(params, ["failure_channel", "failureChannel"]),
+            failureTo: gatewayDashboardParamFirstString(params, ["failure_to", "failureTo"]),
+            failureAnnounce: gatewayDashboardParamFirstString(params, ["failure_announce", "failureAnnounce"]),
+            failureAccountId: gatewayDashboardParamFirstString(params, ["failure_account_id", "failureAccountId"]),
+            failureAlertAfter: gatewayDashboardParamFirstString(params, ["failure_alert_after", "failureAlertAfter"]),
+            failureAlertCooldownMs: gatewayDashboardParamFirstString(params, ["failure_alert_cooldown_ms", "failureAlertCooldownMs"])
         )
     }
     if (normalized == "config.get") {
