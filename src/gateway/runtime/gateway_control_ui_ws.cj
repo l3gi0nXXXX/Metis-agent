@@ -2862,6 +2862,7 @@ private func gatewayControlUiWsCronJobsListResult(params: JsonObject): JsonValue
 }
 
 private func gatewayControlUiWsCronStatusResult(): JsonValue {
+    let settings = CliSettingManager.readGatewaySettings()
     let jobs = cronLoadOrEmpty(cronStorePath(CliConfig.dotDir))
     var nextWakeAtMs: Int64 = 0
     let nowMs = gatewayControlUiWsNowMs()
@@ -2878,7 +2879,7 @@ private func gatewayControlUiWsCronStatusResult(): JsonValue {
         }
     }
     let result = JsonObject()
-    result.put("enabled", true.toJsonValue())
+    result.put("enabled", settings.cronEnabled.toJsonValue())
     result.put("jobs", Int64(jobs.size).toJsonValue())
     if (nextWakeAtMs > 0) {
         result.put("nextWakeAtMs", nextWakeAtMs.toJsonValue())

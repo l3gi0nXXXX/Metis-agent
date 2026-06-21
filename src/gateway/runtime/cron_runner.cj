@@ -110,6 +110,48 @@ private func backoffDelayMs(job: CronJob, attempt: Int64): Int64 {
     base * factor
 }
 
+private let cronRunnerTestHookLock = Mutex()
+private var cronRunnerReplyForTest: Option<(CronJob, GatewaySessionRequest) -> String> =
+    None<(CronJob, GatewaySessionRequest) -> String>
+private var cronRunnerBeforeExecuteForTest: Option<(CronJob) -> Unit> = None<(CronJob) -> Unit>
+private var cronRunnerRunLogAppendForTest: Option<() -> Unit> = None<() -> Unit>
+
+public func debugSetCronRunnerReplyForTest(hook: Option<(CronJob, GatewaySessionRequest) -> String>): Unit {
+    synchronized(cronRunnerTestHookLock) {
+        cronRunnerReplyForTest = hook
+    }
+}
+
+public func debugSetCronRunnerBeforeExecuteForTest(hook: Option<(CronJob) -> Unit>): Unit {
+    synchronized(cronRunnerTestHookLock) {
+        cronRunnerBeforeExecuteForTest = hook
+    }
+}
+
+public func debugSetCronRunnerRunLogAppendForTest(hook: Option<() -> Unit>): Unit {
+    synchronized(cronRunnerTestHookLock) {
+        cronRunnerRunLogAppendForTest = hook
+    }
+}
+
+private func cronRunnerReplyHookForTest(): Option<(CronJob, GatewaySessionRequest) -> String> {
+    synchronized(cronRunnerTestHookLock) {
+        cronRunnerReplyForTest
+    }
+}
+
+private func cronRunnerBeforeExecuteHookForTest(): Option<(CronJob) -> Unit> {
+    synchronized(cronRunnerTestHookLock) {
+        cronRunnerBeforeExecuteForTest
+    }
+}
+
+private func cronRunnerRunLogAppendHookForTest(): Option<() -> Unit> {
+    synchronized(cronRunnerTestHookLock) {
+        cronRunnerRunLogAppendForTest
+    }
+}
+
 /**
  * 网关进程内定时任务执行器：提供锁、启动错峰、running 标记、错误退避等核心语义。
  */
@@ -306,6 +348,74 @@ public class CronRunner {
         (gatewayBridgeForSessionRequest(user, request), request)
     }
 
+    private func executeJobReply(j: CronJob, bridge: AgentBridge, request: GatewaySessionRequest): String {
+        match (cronRunnerReplyHookForTest()) {
+            case Some(hook) => return hook(j, request)
+            case None => ()
+        }
+        if (cronShouldRouteThroughDreaming(j)) {
+            match (DreamingPhaseRuntime.handleSystemEvent(j.systemEvent)) {
+                case Some(result) =>
+                    gatewayLogEventInfo(
+                        "gateway/cron",
+                        "cron.succeeded",
+                        "handled managed cron system event",
+                        meta: gatewayLogMeta()
+                            .string("jobId", j.id)
+                            .string("systemEvent", j.systemEvent)
+                            .object()
+                    )
+                    return result
+                case None => return cronBridgeReply(bridge, request, j.prompt, j.timeoutMs)
+            }
+        }
+        cronBridgeReply(bridge, request, j.prompt, j.timeoutMs)
+    }
+
+    private func appendRunLogIsolated(
+        j: CronJob,
+        status: String,
+        startedAtMs: Int64,
+        endedAtMs: Int64,
+        errMsg: String,
+        answer: String,
+        deliveryStatus: String
+    ): Unit {
+        try {
+            match (cronRunnerRunLogAppendHookForTest()) {
+                case Some(hook) =>
+                    hook()
+                    return
+                case None => ()
+            }
+            appendCronRunLog(
+                this.storePath,
+                j.id,
+                status,
+                startedAtMs,
+                endedAtMs,
+                errorMessage: errMsg,
+                sessionTarget: j.sessionTarget,
+                summary: answer,
+                runAtMs: startedAtMs,
+                nextRunAtMs: j.state.nextRunAtMs,
+                deliveryStatus: deliveryStatus
+            )
+        } catch (logError: Exception) {
+            gatewayLogEventError(
+                "gateway/cron",
+                "cron.run_log_failed",
+                "cron run log append failed",
+                meta: gatewayLogMeta()
+                    .string("jobId", j.id)
+                    .string("status", status)
+                    .int("durationMs", if (endedAtMs >= startedAtMs) { endedAtMs - startedAtMs } else { 0 })
+                    .rawString("error", logError.message)
+                    .object()
+            )
+        }
+    }
+
     private func reloadJobsFromDisk(): Unit {
         this.jobs.clear()
         for (j in cronLoadOrEmpty(this.storePath)) {
@@ -379,27 +489,14 @@ public class CronRunner {
         let maxAttempts = max(1, j.maxRetries + 1)
 
         try {
+            match (cronRunnerBeforeExecuteHookForTest()) {
+                case Some(hook) => hook(j)
+                case None => ()
+            }
             let (jobBridge, jobRequest) = this.bridgeAndRequestForJob(j, startedAtMs)
             while (attempt < maxAttempts) {
                 try {
-                    answer = if (cronShouldRouteThroughDreaming(j)) {
-                        match (DreamingPhaseRuntime.handleSystemEvent(j.systemEvent)) {
-                            case Some(result) =>
-                                gatewayLogEventInfo(
-                                    "gateway/cron",
-                                    "cron.succeeded",
-                                    "handled managed cron system event",
-                                    meta: gatewayLogMeta()
-                                        .string("jobId", j.id)
-                                        .string("systemEvent", j.systemEvent)
-                                        .object()
-                                )
-                                result
-                            case None => cronBridgeReply(jobBridge, jobRequest, j.prompt, j.timeoutMs)
-                        }
-                    } else {
-                        cronBridgeReply(jobBridge, jobRequest, j.prompt, j.timeoutMs)
-                    }
+                    answer = this.executeJobReply(j, jobBridge, jobRequest)
                     status = "success"
                     errMsg = ""
                     break
@@ -498,27 +595,29 @@ public class CronRunner {
                 }
             }
 
-            appendCronRunLog(
-                this.storePath,
-                j.id,
+            this.appendRunLogIsolated(
+                j,
                 status,
                 startedAtMs,
                 afterRun,
-                errorMessage: errMsg,
-                sessionTarget: j.sessionTarget,
-                summary: answer,
-                runAtMs: startedAtMs,
-                nextRunAtMs: j.state.nextRunAtMs,
-                deliveryStatus: deliveryStatus
+                errMsg,
+                answer,
+                deliveryStatus
             )
         } catch (fatal: Exception) {
-            j.state.runningAtMs = 0
+            let afterRun = epochMs()
+            status = "error"
+            errMsg = fatal.message
+            this.finalizeError(j, startedAtMs, afterRun, errMsg)
+            this.appendRunLogIsolated(j, status, startedAtMs, afterRun, errMsg, answer, deliveryStatus)
             gatewayLogEventError(
                 "gateway/cron",
                 "cron.failed",
                 "unexpected cron job failure",
                 meta: gatewayLogMeta()
                     .string("jobId", j.id)
+                    .string("status", status)
+                    .int("durationMs", if (afterRun >= startedAtMs) { afterRun - startedAtMs } else { 0 })
                     .rawString("error", fatal.message)
                     .object()
             )

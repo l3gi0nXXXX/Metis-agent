@@ -1,6 +1,6 @@
 package metis.gateway.runtime
 
-import metis.core.config.{CliConfig, CliSettingManager, GatewayUserSettings, MetisConfigManager}
+import metis.core.config.{CliConfig, CliSettingManager, GatewayUserSettings, MetisConfigManager, MetisProcessEnvironmentLock}
 import metis.core.skills.setClawHubHttpGetForTest
 import metis.gateway.config.buildGatewayConfigFromUserSettings
 import metis.gateway.core.{gatewayFindSessionConversationViewForUser, gatewaySessionStoreForUserWithAgentId, setGatewayFeishuNativeAuthRunnerForTest}
@@ -799,5 +799,56 @@ public class GatewayControlUiWsTest {
         let configPatchRequest = gatewayControlUiWsRequestParams("config.patch", configPatchParams)
         @Expect(configPatchRequest.get("path").getOrThrow().asString().getValue(), "gateway.http")
         @Expect(configPatchRequest.get("raw").getOrThrow().asString().getValue(), "{\"enabled\":true}")
+    }
+}
+
+private func withGatewayControlUiWsCronStatusTestHome<T>(block: () -> T): T {
+    synchronized(MetisProcessEnvironmentLock) {
+        let testHome = "/tmp/metis-gateway-control-ui-ws-cron-status-test-home"
+        try {
+            remove(Path(testHome), recursive: true)
+        } catch (_: Exception) {
+            ()
+        }
+        Directory.create(testHome, recursive: true)
+        let oldHome = getVariable("METIS_HOME")
+        setVariable("METIS_HOME", testHome)
+        CliConfig.invalidatePathCache()
+        MetisConfigManager.invalidate()
+        CliSettingManager.invalidate()
+        try {
+            return block()
+        } finally {
+            match (oldHome) {
+                case Some(value) => setVariable("METIS_HOME", value)
+                case None => setVariable("METIS_HOME", "")
+            }
+            CliConfig.invalidatePathCache()
+            MetisConfigManager.invalidate()
+            CliSettingManager.invalidate()
+            try {
+                remove(Path(testHome), recursive: true)
+            } catch (_: Exception) {
+                ()
+            }
+        }
+    }
+}
+
+@Test
+public class GatewayControlUiWsCronStatusTest {
+    @TestCase
+    public func cronStatusReadsCronEnabledSetting(): Unit {
+        withGatewayControlUiWsCronStatusTestHome {
+            var settings = GatewayUserSettings()
+            settings.enabled = true
+            settings.cronEnabled = false
+            let _ = MetisConfigManager.setGatewaySettings(settings)
+            let cfg = buildGatewayConfigFromUserSettings(settings)
+            let response = gatewayControlUiWsCompatResponse("cron.status", JsonObject(), cfg).getOrThrow()
+            @Expect(response.ok, true)
+            let result = response.result.asObject()
+            @Expect(result.get("enabled").getOrThrow().asBool().getValue(), false)
+        }
     }
 }

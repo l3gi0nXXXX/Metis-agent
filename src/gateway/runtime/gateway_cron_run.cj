@@ -22,12 +22,17 @@ private func gatewayParseCronRunJobIdAndDue(sub: Array<String>): (Option<String>
     }
     var i: Int64 = 2
     while (i < sub.size) {
-        if (sub[i].trimAscii().toAsciiLower() == "--due") {
+        let flag = sub[i].trimAscii().toAsciiLower()
+        if (flag == "--due" || flag == "--due-only") {
             dueOnly = true
         }
         i += 1
     }
     (jobIdOpt, dueOnly)
+}
+
+public func debugGatewayParseCronRunJobIdAndDueForTest(sub: Array<String>): (Option<String>, Bool) {
+    gatewayParseCronRunJobIdAndDue(sub)
 }
 
 private func gatewayCronRunWantsJson(sub: Array<String>): Bool {

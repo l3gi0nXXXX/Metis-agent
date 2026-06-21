@@ -11,6 +11,37 @@ import stdx.encoding.json.{JsonObject, JsonString}
 
 @toolset
 public class GatewayCronToolset {
+    private func addStringFlag(args: ArrayList<String>, flag: String, value: Option<String>): Unit {
+        match (value) {
+            case Some(v) =>
+                let t = v.trimAscii()
+                if (!t.isEmpty()) {
+                    args.add(flag)
+                    args.add(t)
+                }
+            case None => ()
+        }
+    }
+
+    private func addIntFlag(args: ArrayList<String>, flag: String, value: Option<Int64>): Unit {
+        match (value) {
+            case Some(v) =>
+                args.add(flag)
+                args.add(v.toString())
+            case None => ()
+        }
+    }
+
+    private func addBoolFlag(args: ArrayList<String>, flag: String, value: Option<Bool>): Unit {
+        match (value) {
+            case Some(v) =>
+                if (v) {
+                    args.add(flag)
+                }
+            case None => ()
+        }
+    }
+
     private func normalizeAction(action: String): String {
         let normalized = action.trimAscii().toAsciiLower()
         if (
@@ -43,6 +74,22 @@ public class GatewayCronToolset {
             at: "Optional absolute timestamp for add.",
             cronExpr: "Optional cron expression for add/update.",
             enabled: "Optional enabled flag for update.",
+            session: "Optional session target for add/update: main, isolated, current, or session:<key>.",
+            deliveryChannel: "Optional delivery channel for add/update.",
+            deliveryTo: "Optional delivery peer/chat target for add/update.",
+            deliveryAccountId: "Optional delivery account id for add/update.",
+            bestEffortDeliver: "Optional best-effort delivery flag for add/update.",
+            timeoutMs: "Optional execution timeout in milliseconds for add/update.",
+            maxRetries: "Optional max retry count for add/update.",
+            retryBackoffMs: "Optional retry backoff milliseconds for add/update.",
+            failureChannel: "Optional failure alert channel for add/update.",
+            failureTo: "Optional failure alert target for add/update.",
+            failureAccountId: "Optional failure alert account id for add/update.",
+            failureAlertAfter: "Optional consecutive failure threshold for alerts.",
+            failureAlertCooldownMs: "Optional failure alert cooldown milliseconds.",
+            model: "Optional model override for add/update.",
+            thinkingLevel: "Optional thinking level for add/update.",
+            lightContext: "Optional light context flag for add/update.",
             dueOnly: "Optional due_only flag for run.",
             mode: "Optional wake mode.",
             text: "Optional wake text."
@@ -57,6 +104,22 @@ public class GatewayCronToolset {
         at: Option<String>,
         cronExpr: Option<String>,
         enabled: Option<Bool>,
+        session: Option<String>,
+        deliveryChannel: Option<String>,
+        deliveryTo: Option<String>,
+        deliveryAccountId: Option<String>,
+        bestEffortDeliver: Option<Bool>,
+        timeoutMs: Option<Int64>,
+        maxRetries: Option<Int64>,
+        retryBackoffMs: Option<Int64>,
+        failureChannel: Option<String>,
+        failureTo: Option<String>,
+        failureAccountId: Option<String>,
+        failureAlertAfter: Option<Int64>,
+        failureAlertCooldownMs: Option<Int64>,
+        model: Option<String>,
+        thinkingLevel: Option<String>,
+        lightContext: Option<Bool>,
         dueOnly: Option<Bool>,
         mode: Option<String>,
         text: Option<String>
@@ -85,8 +148,6 @@ public class GatewayCronToolset {
             args.add("add")
             args.add("--name")
             args.add(jobName)
-            args.add("--message")
-            args.add(msg)
             match (every) {
                 case Some(v) =>
                     let t = v.trimAscii()
@@ -114,6 +175,27 @@ public class GatewayCronToolset {
                     }
                 case None => ()
             }
+            this.addStringFlag(args, "--session", session)
+            this.addStringFlag(args, "--channel", deliveryChannel)
+            this.addStringFlag(args, "--to", deliveryTo)
+            this.addStringFlag(args, "--delivery-account-id", deliveryAccountId)
+            this.addBoolFlag(args, "--best-effort-deliver", bestEffortDeliver)
+            this.addIntFlag(args, "--timeout-ms", timeoutMs)
+            this.addIntFlag(args, "--max-retries", maxRetries)
+            this.addIntFlag(args, "--retry-backoff-ms", retryBackoffMs)
+            this.addStringFlag(args, "--failure-channel", failureChannel)
+            this.addStringFlag(args, "--failure-to", failureTo)
+            this.addStringFlag(args, "--failure-account-id", failureAccountId)
+            this.addIntFlag(args, "--failure-alert-after", failureAlertAfter)
+            this.addIntFlag(args, "--failure-alert-cooldown-ms", failureAlertCooldownMs)
+            this.addStringFlag(args, "--model", model)
+            this.addStringFlag(args, "--thinking-level", thinkingLevel)
+            match (lightContext) {
+                case Some(v) => args.add(if (v) { "--light-context" } else { "--no-light-context" })
+                case None => ()
+            }
+            args.add("--message")
+            args.add(msg)
         } else if (act == "update") {
             let resolvedId = match (id) { case Some(v) => v.trimAscii() case None => "" }
             if (resolvedId.isEmpty()) {
@@ -134,15 +216,6 @@ public class GatewayCronToolset {
                     let t = v.trimAscii()
                     if (!t.isEmpty()) {
                         args.add("--name")
-                        args.add(t)
-                    }
-                case None => ()
-            }
-            match (message) {
-                case Some(v) =>
-                    let t = v.trimAscii()
-                    if (!t.isEmpty()) {
-                        args.add("--message")
                         args.add(t)
                     }
                 case None => ()
@@ -178,6 +251,34 @@ public class GatewayCronToolset {
                 case Some(v) => args.add(if (v) { "--enable" } else { "--disable" })
                 case None => ()
             }
+            this.addStringFlag(args, "--session", session)
+            this.addStringFlag(args, "--channel", deliveryChannel)
+            this.addStringFlag(args, "--to", deliveryTo)
+            this.addStringFlag(args, "--delivery-account-id", deliveryAccountId)
+            this.addBoolFlag(args, "--best-effort-deliver", bestEffortDeliver)
+            this.addIntFlag(args, "--timeout-ms", timeoutMs)
+            this.addIntFlag(args, "--max-retries", maxRetries)
+            this.addIntFlag(args, "--retry-backoff-ms", retryBackoffMs)
+            this.addStringFlag(args, "--failure-channel", failureChannel)
+            this.addStringFlag(args, "--failure-to", failureTo)
+            this.addStringFlag(args, "--failure-account-id", failureAccountId)
+            this.addIntFlag(args, "--failure-alert-after", failureAlertAfter)
+            this.addIntFlag(args, "--failure-alert-cooldown-ms", failureAlertCooldownMs)
+            this.addStringFlag(args, "--model", model)
+            this.addStringFlag(args, "--thinking-level", thinkingLevel)
+            match (lightContext) {
+                case Some(v) => args.add(if (v) { "--light-context" } else { "--no-light-context" })
+                case None => ()
+            }
+            match (message) {
+                case Some(v) =>
+                    let t = v.trimAscii()
+                    if (!t.isEmpty()) {
+                        args.add("--message")
+                        args.add(t)
+                    }
+                case None => ()
+            }
         } else if (act == "remove" || act == "enable" || act == "disable" || act == "run" || act == "runs" || act == "wake") {
             let resolvedId = match (id) { case Some(v) => v.trimAscii() case None => "" }
             if ((act == "remove" || act == "enable" || act == "disable" || act == "run" || act == "runs" || act == "wake") && resolvedId.isEmpty()) {
@@ -195,7 +296,7 @@ public class GatewayCronToolset {
             args.add(resolvedId)
             if (act == "run") {
                 if (dueOnly ?? false) {
-                    args.add("--due-only")
+                    args.add("--due")
                 }
             }
             if (act == "wake") {
@@ -232,5 +333,65 @@ public class GatewayCronToolset {
         let out = result.toJsonString()
         PrintUtils.printToolResult(out)
         return out
+    }
+
+    public func cronForTest(
+        action: String,
+        id: Option<String>,
+        name: Option<String>,
+        message: Option<String>,
+        every: Option<String>,
+        at: Option<String>,
+        cronExpr: Option<String>,
+        enabled: Option<Bool>,
+        session: Option<String>,
+        deliveryChannel: Option<String>,
+        deliveryTo: Option<String>,
+        deliveryAccountId: Option<String>,
+        bestEffortDeliver: Option<Bool>,
+        timeoutMs: Option<Int64>,
+        maxRetries: Option<Int64>,
+        retryBackoffMs: Option<Int64>,
+        failureChannel: Option<String>,
+        failureTo: Option<String>,
+        failureAccountId: Option<String>,
+        failureAlertAfter: Option<Int64>,
+        failureAlertCooldownMs: Option<Int64>,
+        model: Option<String>,
+        thinkingLevel: Option<String>,
+        lightContext: Option<Bool>,
+        dueOnly: Option<Bool>,
+        mode: Option<String>,
+        text: Option<String>
+    ): String {
+        this.__tool_impl_of_cron(
+            action,
+            id,
+            name,
+            message,
+            every,
+            at,
+            cronExpr,
+            enabled,
+            session,
+            deliveryChannel,
+            deliveryTo,
+            deliveryAccountId,
+            bestEffortDeliver,
+            timeoutMs,
+            maxRetries,
+            retryBackoffMs,
+            failureChannel,
+            failureTo,
+            failureAccountId,
+            failureAlertAfter,
+            failureAlertCooldownMs,
+            model,
+            thinkingLevel,
+            lightContext,
+            dueOnly,
+            mode,
+            text
+        )
     }
 }

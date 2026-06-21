@@ -11,18 +11,15 @@ import metis.gateway.core.{GatewaySessionConversationView, GatewaySessionStore, 
 import metis.gateway.session.{GatewayIngressSource, gatewayBuildChatHistoryRpcParams, gatewayBuildChatSendRpcParams, gatewayBuildSessionRpcParams, gatewayBuildSessionsDeleteRpcParams}
 import metis.cron.{
     CronJob,
-    computeJobNextRun,
     conversationKeyForCronTarget,
     cronDashboardSaveJob,
     cronLoadOrEmpty,
-    cronSave,
     cronStorePath
 }
 
 import std.collection.{ArrayList, HashMap, HashSet}
 import std.convert.Parsable
 import std.fs.{Directory, File, exists, Path}
-import std.time.DateTime
 import stdx.encoding.json.{JsonBool, JsonObject, JsonString, JsonValue}
 import stdx.net.http.HttpContext
 
@@ -392,67 +389,17 @@ private func gatewayDashboardAppendDeliveryArgs(parts: ArrayList<String>, ctx: H
 }
 
 private func gatewayDashboardRunCronJobNow(jobId: String): (Bool, String) {
-    let path = cronStorePath(CliConfig.dotDir)
-    let list = ArrayList<CronJob>()
     var found = false
-    var foundJob = None<CronJob>
-    for (j in cronLoadOrEmpty(path)) {
-        if (!found && j.id == jobId) {
+    for (j in cronLoadOrEmpty(cronStorePath(CliConfig.dotDir))) {
+        if (j.id == jobId) {
             found = true
-            foundJob = Some(j)
+            break
         }
-        list.add(j)
     }
     if (!found) {
         return (false, "未找到任务 id=${jobId}")
     }
-    let startedAtMs = DateTime.now().toUnixTimeStamp().toMilliseconds()
-    try {
-        let params = gatewayDashboardBuildCronRunNowParams(foundJob.getOrThrow())
-        let result = gatewayExecuteChatTurnFromRpc(params, fallbackSource: GatewayIngressSource.Cron)
-        if (let Some(error) <- result.get("error")) {
-            return (false, "运行失败: ${error.asString().getValue()}")
-        }
-    } catch (ex: Exception) {
-        for (jx in list) {
-            if (jx.id == jobId) {
-                jx.state.lastError = ex.message
-                jx.state.lastRunAtMs = DateTime.now().toUnixTimeStamp().toMilliseconds()
-                break
-            }
-        }
-        cronSave(path, list.toArray())
-        return (false, "运行失败: ${ex.message}")
-    }
-    for (jx in list) {
-        if (jx.id != jobId) {
-            continue
-        }
-        let nowMs = DateTime.now().toUnixTimeStamp().toMilliseconds()
-        jx.state.lastError = ""
-        jx.state.lastRunAtMs = startedAtMs
-        let sk = jx.schedule.kind.trimAscii().toAsciiLower()
-        if (sk == "at") {
-            jx.enabled = false
-            jx.state.nextRunAtMs = 0
-        } else {
-            match (computeJobNextRun(jx, nowMs)) {
-                case Some(nxt) =>
-                    var nn = nxt
-                    if (sk == "cron") {
-                        let minNext = nowMs + 2000
-                        if (nn < minNext) {
-                            nn = minNext
-                        }
-                    }
-                    jx.state.nextRunAtMs = nn
-                case None => jx.state.nextRunAtMs = 0
-            }
-        }
-        break
-    }
-    cronSave(path, list.toArray())
-    (true, "已立即运行任务 id=${jobId}")
+    gatewayCronRunOnceOutcome(jobId, true)
 }
 
 func gatewayDashboardBuildCronRunNowParams(job: CronJob): JsonObject {

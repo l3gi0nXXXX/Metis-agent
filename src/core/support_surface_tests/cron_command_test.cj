@@ -2,36 +2,44 @@ package metis.core.support_surface_tests
 
 import metis.cron.*
 
-import metis.core.config.{CliConfig, CliSettingManager, MetisConfigManager}
+import metis.core.config.{CliConfig, CliSettingManager, GatewayUserSettings, MetisConfigManager, MetisProcessEnvironmentLock}
 
 import std.env.{getVariable, setVariable}
 import std.fs.{Directory, Path, remove}
+import std.time.DateTime
 import std.unittest.testmacro.*
 import stdx.encoding.json.JsonValue
 
 private func withCronCommandTestHome<T>(block: () -> T): T {
-    let testHome = "/tmp/metis-cron-command-test-home"
-    try {
-        remove(Path(testHome), recursive: true)
-    } catch (_: Exception) {
-        ()
-    }
-    Directory.create(testHome, recursive: true)
-    let oldHome = getVariable("METIS_HOME")
-    setVariable("METIS_HOME", testHome)
-    CliConfig.invalidatePathCache()
-    MetisConfigManager.invalidate()
-    CliSettingManager.invalidate()
-    try {
-        return block()
-    } finally {
-        match (oldHome) {
-            case Some(value) => setVariable("METIS_HOME", value)
-            case None => setVariable("METIS_HOME", "")
+    synchronized(MetisProcessEnvironmentLock) {
+        let testHome = "/tmp/metis-cron-command-test-home-${DateTime.now().toUnixTimeStamp().toNanoseconds()}"
+        try {
+            remove(Path(testHome), recursive: true)
+        } catch (_: Exception) {
+            ()
         }
+        Directory.create(testHome, recursive: true)
+        let oldHome = getVariable("METIS_HOME")
+        setVariable("METIS_HOME", testHome)
         CliConfig.invalidatePathCache()
         MetisConfigManager.invalidate()
         CliSettingManager.invalidate()
+        try {
+            return block()
+        } finally {
+            match (oldHome) {
+                case Some(value) => setVariable("METIS_HOME", value)
+                case None => setVariable("METIS_HOME", "")
+            }
+            CliConfig.invalidatePathCache()
+            MetisConfigManager.invalidate()
+            CliSettingManager.invalidate()
+            try {
+                remove(Path(testHome), recursive: true)
+            } catch (_: Exception) {
+                ()
+            }
+        }
     }
 }
 
@@ -148,6 +156,66 @@ public class CronCommandTest {
             @Expect(errCode, 1)
             @Expect(errText.startsWith("{"), false)
             @Expect(errText.contains("Cron command failed"), true)
+        })
+    }
+
+    @TestCase
+    public func cronAddKeepsMessageWithFlagsInsideAndUtf8Text(): Unit {
+        withCronCommandTestHome({ =>
+            let (addText, addCode) = executeGatewayCronCommand([
+                "cron", "add", "--name", "message-flags", "--every", "10m", "--session", "isolated",
+                "--message", "检查 --cron \"*/5 * * * *\" 中文😀"
+            ])
+            @Expect(addCode, 0)
+            @Expect(addText.contains("Cron job created"), true)
+
+            let (json, jsonCode) = executeGatewayCronCommand(["cron", "list", "--json"])
+            @Expect(jsonCode, 0)
+            let jobs = JsonValue.fromStr(json).asObject().get("jobs").getOrThrow().asArray()
+            @Expect(jobs.size(), 1)
+            let job = jobs[0].asObject()
+            @Expect(job.get("id").getOrThrow().asString().getValue(), "message-flags")
+            @Expect(job.get("prompt").getOrThrow().asString().getValue(), "检查 --cron \"*/5 * * * *\" 中文😀")
+            @Expect(job.get("schedule").getOrThrow().asObject().get("kind").getOrThrow().asString().getValue(), "every")
+        })
+    }
+
+    @TestCase
+    public func cronStatusUsesCronEnabledNotGatewayEnabled(): Unit {
+        withCronCommandTestHome({ =>
+            var settings = GatewayUserSettings()
+            settings.enabled = true
+            settings.cronEnabled = false
+            let _ = MetisConfigManager.setGatewaySettings(settings)
+            addCronCommandFixtureJob("status-cron-disabled")
+
+            let (text, textCode) = executeGatewayCronCommand(["cron", "status"])
+            @Expect(textCode, 0)
+            @Expect(text.contains("Enabled: false"), true)
+
+            let (json, jsonCode) = executeGatewayCronCommand(["cron", "status", "--json"])
+            @Expect(jsonCode, 0)
+            let obj = JsonValue.fromStr(json).asObject()
+            @Expect(obj.get("enabled").getOrThrow().asBool().getValue(), false)
+        })
+    }
+
+    @TestCase
+    public func cronRemoveDefaultsToHumanTextAndJsonIsExplicit(): Unit {
+        withCronCommandTestHome({ =>
+            addCronCommandFixtureJob("remove-human")
+
+            let (text, textCode) = executeGatewayCronCommand(["cron", "remove", "--job-id", "remove-human"])
+            @Expect(textCode, 0)
+            @Expect(text.startsWith("{"), false)
+            @Expect(text.contains("Cron job removed"), true)
+            @Expect(text.contains("remove-human"), true)
+
+            addCronCommandFixtureJob("remove-json")
+            let (json, jsonCode) = executeGatewayCronCommand(["cron", "remove", "--json", "--job-id", "remove-json"])
+            @Expect(jsonCode, 0)
+            let obj = JsonValue.fromStr(json).asObject()
+            @Expect(obj.get("removed").getOrThrow().asBool().getValue(), true)
         })
     }
 }

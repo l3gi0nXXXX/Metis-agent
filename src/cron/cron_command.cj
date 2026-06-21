@@ -448,7 +448,7 @@ private func cronCmdStatus(path: Path): (String, Int64) {
     if (nextWakeAtMs > 0) {
         nextWakeAtMsText = "${nextWakeAtMs}"
     }
-    let cronEnabled = CliSettingManager.readGatewaySettings().enabled
+    let cronEnabled = CliSettingManager.readGatewaySettings().cronEnabled
     let out = ArrayList<String>()
     out.add("Cron status")
     out.add("Enabled: ${if (cronEnabled) { "true" } else { "false" }}")
@@ -470,7 +470,7 @@ private func cronCmdStatusJson(path: Path): (String, Int64) {
         }
     }
     let out = JsonObject()
-    out.put("enabled", JsonBool(CliSettingManager.readGatewaySettings().enabled))
+    out.put("enabled", JsonBool(CliSettingManager.readGatewaySettings().cronEnabled))
     out.put("storePath", JsonString(path.toString()))
     out.put("jobs", JsonInt(jobs.size))
     out.put("nextWakeAtMs", if (nextWakeAtMs > 0) { JsonInt(nextWakeAtMs) } else { JsonValue.fromStr("null") })
@@ -2328,16 +2328,26 @@ private func cronCmdRemove(path: Path, sub: Array<String>): (String, Int64) {
     if (sub.size < 3) {
         return cronErr("invalid cron.remove params")
     }
-    var id = ""
-    if (sub.size >= 4) {
-        let flag = sub[2].trimAscii().toAsciiLower()
-        if (flag == "--job-id" || flag == "--id") {
-            id = sub[3].trimAscii()
-        } else {
-            id = sub[2].trimAscii()
+    let json = cronArgvHasJsonFlag(sub, 2)
+    var id = match (parseJobIdFlag(sub, 2)) {
+        case Some(v) => v
+        case None => ""
+    }
+    if (id.isEmpty()) {
+        var i: Int64 = 2
+        while (i < sub.size) {
+            let token = sub[i].trimAscii()
+            let lower = token.toAsciiLower()
+            if (lower != "--json" && lower != "--job-id" && lower != "--id") {
+                id = token
+                break
+            }
+            if (lower == "--job-id" || lower == "--id") {
+                i += 2
+            } else {
+                i += 1
+            }
         }
-    } else {
-        id = sub[2].trimAscii()
     }
     if (id.isEmpty()) {
         return cronErr("invalid cron.remove params: missing id")
@@ -2352,10 +2362,24 @@ private func cronCmdRemove(path: Path, sub: Array<String>): (String, Int64) {
         }
     }
     if (!found) {
-        return ("{\"ok\":true,\"removed\":false}", 0)
+        if (json) {
+            return ("{\"ok\":true,\"removed\":false}", 0)
+        }
+        let lines = ArrayList<String>()
+        lines.add("Cron job remove")
+        lines.add("Job: ${id}")
+        lines.add("Removed: false")
+        return (String.join(lines.toArray(), delimiter: "\n"), 0)
     }
     cronSave(path, list.toArray())
-    return ("{\"ok\":true,\"removed\":true}", 0)
+    if (json) {
+        return ("{\"ok\":true,\"removed\":true}", 0)
+    }
+    let lines = ArrayList<String>()
+    lines.add("Cron job removed")
+    lines.add("Job: ${id}")
+    lines.add("Removed: true")
+    (String.join(lines.toArray(), delimiter: "\n"), 0)
 }
 
 private func cronCmdSetEnabled(path: Path, sub: Array<String>, enabled: Bool): (String, Int64) {
