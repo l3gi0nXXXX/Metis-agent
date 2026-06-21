@@ -5,10 +5,13 @@ import metis.cron.{
     CronJob,
     CronJobState,
     CronSchedule,
+    CronWebhookHttpRequest,
+    CronWebhookHttpResponse,
     cronLoadOrEmpty,
     cronSave,
     cronStorePath,
-    readCronRunLogEntriesForJob
+    readCronRunLogEntriesForJob,
+    setCronWebhookHttpRunnerForTest
 }
 import metis.gateway.core.{ChannelAdapter, GatewayRouter, GatewayService}
 import metis.gateway.model.{ChannelPolicyConfig, InboundMessage, OutboundMessage, SendResult}
@@ -19,7 +22,7 @@ import std.env.{getVariable, setVariable}
 import std.fs.{Directory, Path, remove}
 import std.time.DateTime
 import std.unittest.testmacro.*
-import stdx.encoding.json.JsonObject
+import stdx.encoding.json.{JsonObject, JsonString}
 
 private func withCronRunnerTestHome<T>(block: (Path) -> T): T {
     synchronized(MetisProcessEnvironmentLock) {
@@ -37,6 +40,7 @@ private func withCronRunnerTestHome<T>(block: (Path) -> T): T {
             debugSetCronRunnerReplyForTest(None<(CronJob, GatewaySessionRequest) -> String>)
             debugSetCronRunnerBeforeExecuteForTest(None<(CronJob) -> Unit>)
             debugSetCronRunnerRunLogAppendForTest(None<() -> Unit>)
+            setCronWebhookHttpRunnerForTest(None<(CronWebhookHttpRequest) -> CronWebhookHttpResponse>)
             match (oldHome) {
                 case Some(value) => setVariable("METIS_HOME", value)
                 case None => setVariable("METIS_HOME", "")
@@ -147,7 +151,7 @@ public class CronRunnerTest {
 
     @TestCase
     public func runJobManualFatalBeforeExecuteFinalizesErrorAndRunLog(): Unit {
-        withCronRunnerTestHome({ storePath =>
+        withCronRunnerTestHome({ storePath: Path =>
             cronSave(storePath, [cronRunnerTestJob("fatal-before-execute")])
             debugSetCronRunnerBeforeExecuteForTest(Some({ _job: CronJob =>
                 throw Exception("fatal-p2")
@@ -179,7 +183,7 @@ public class CronRunnerTest {
 
     @TestCase
     public func runLogAppendFailureDoesNotRewriteBusinessState(): Unit {
-        withCronRunnerTestHome({ storePath =>
+        withCronRunnerTestHome({ storePath: Path =>
             cronSave(storePath, [cronRunnerTestJob("run-log-fails")])
             debugSetCronRunnerReplyForTest(Some({ _job: CronJob, _request: GatewaySessionRequest =>
                 "ok answer"
@@ -210,7 +214,7 @@ public class CronRunnerTest {
 
     @TestCase
     public func tickAndManualRunUseSameRunLogShape(): Unit {
-        withCronRunnerTestHome({ storePath =>
+        withCronRunnerTestHome({ storePath: Path =>
             cronSave(storePath, [cronRunnerTestJob("shared-runner")])
             debugSetCronRunnerReplyForTest(Some({ _job: CronJob, _request: GatewaySessionRequest =>
                 "ok answer"
@@ -297,7 +301,7 @@ public class CronRunnerDeliveryTest {
 
     @TestCase
     public func deliveryUsesConfiguredAccountIdAndRecordsDelivered(): Unit {
-        withCronRunnerTestHome({ storePath =>
+        withCronRunnerTestHome({ storePath: Path =>
             let job = CronJob(
                 "delivery-account",
                 "hello cron",
@@ -333,7 +337,7 @@ public class CronRunnerDeliveryTest {
 
     @TestCase
     public func deliveryFailureBestEffortKeepsAgentSuccess(): Unit {
-        withCronRunnerTestHome({ storePath =>
+        withCronRunnerTestHome({ storePath: Path =>
             let job = CronJob(
                 "best-effort-delivery",
                 "hello cron",
@@ -365,7 +369,7 @@ public class CronRunnerDeliveryTest {
 
     @TestCase
     public func failureAlertHonorsThresholdAndCooldown(): Unit {
-        withCronRunnerTestHome({ storePath =>
+        withCronRunnerTestHome({ storePath: Path =>
             let job = CronJob(
                 "failure-alert",
                 "hello cron",
@@ -399,6 +403,54 @@ public class CronRunnerDeliveryTest {
             @Expect(adapter.sendCount, 1)
             let afterThird = cronLoadOrEmpty(storePath)[0]
             @Expect(afterThird.state.consecutiveErrors, 3)
+        })
+    }
+}
+
+@Test
+public class CronRunnerWebhookDeliveryTest {
+    @TestCase
+    public func webhookDeliveryUsesConfiguredTimeoutAndBody(): Unit {
+        withCronRunnerTestHome({ storePath: Path =>
+            let job = CronJob(
+                "webhook-delivery",
+                "hello cron",
+                CronSchedule.every(60000),
+                state: CronJobState(nextRunAtMs: 1),
+                sessionTarget: "main",
+                agentId: "general",
+                deliveryMode: "webhook",
+                deliveryTo: "https://example.com/cron-hook?token=secret",
+                timeoutMs: 2500
+            )
+            cronSave(storePath, [job])
+            debugSetCronRunnerReplyForTest(Some({ _job: CronJob, _request: GatewaySessionRequest =>
+                "webhook answer"
+            }))
+            let captured = JsonObject()
+            setCronWebhookHttpRunnerForTest(Some({ request: CronWebhookHttpRequest =>
+                captured.put("url", JsonString(request.url))
+                captured.put("timeoutMs", JsonString("${request.timeoutMs}"))
+                captured.put("verifyTls", JsonString("${request.verifyTls}"))
+                captured.put("jobId", request.body.get("jobId").getOrThrow())
+                captured.put("summary", request.body.get("summary").getOrThrow())
+                CronWebhookHttpResponse(true, statusCode: 200)
+            }))
+
+            let result = CronRunner.runJobOnceFromStore(None<GatewayService>, storePath, "webhook-delivery", true)
+            @Expect(result.get("ok").getOrThrow().asBool().getValue(), true)
+            @Expect(result.get("ran").getOrThrow().asBool().getValue(), true)
+            @Expect(captured.get("url").getOrThrow().asString().getValue(), "https://example.com/cron-hook?token=secret")
+            @Expect(captured.get("timeoutMs").getOrThrow().asString().getValue(), "2500")
+            @Expect(captured.get("verifyTls").getOrThrow().asString().getValue(), "true")
+            @Expect(captured.get("jobId").getOrThrow().asString().getValue(), "webhook-delivery")
+            @Expect(captured.get("summary").getOrThrow().asString().getValue(), "webhook answer")
+
+            let jobs = cronLoadOrEmpty(storePath)
+            @Expect(jobs[0].state.lastStatus, "success")
+            let runs = readCronRunLogEntriesForJob(storePath, "webhook-delivery", limit: 10)
+            let row = runs.get("entries").getOrThrow().asArray()[0].asObject()
+            @Expect(row.get("deliveryStatus").getOrThrow().asString().getValue(), "delivered")
         })
     }
 }

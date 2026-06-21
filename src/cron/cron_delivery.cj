@@ -63,15 +63,11 @@ public func cronEffectiveAnnounceChannel(planChannel: String, jobFallback: Strin
 }
 
 public func normalizeCronWebhookUrl(raw: String): Option<String> {
-    let t = raw.trimAscii()
-    if (t.isEmpty()) {
-        return None<String>
+    let decision = validateCronWebhookUrl(raw)
+    if (decision.ok) {
+        return Some(decision.normalizedUrl)
     }
-    let low = t.toAsciiLower()
-    if (!low.startsWith("https://") && !low.startsWith("http://")) {
-        return None<String>
-    }
-    Some(t)
+    None<String>
 }
 
 private func isMainishSessionTarget(sessionTarget: String): Bool {

@@ -26,6 +26,7 @@ import metis.cron.{
     computeJobNextRun,
     cronExecutionConversationKey,
     cronShouldRouteThroughDreaming,
+    cronWebhookTimeoutMs,
     cronLoadOrEmpty,
     cronSave,
     cronStorePath,
@@ -572,7 +573,7 @@ public class CronRunner {
                 startedAtMs,
                 j.sessionTarget
             )
-            if (postCronWebhookJson(url, body)) {
+            if (postCronWebhookJson(url, body, timeoutMs: cronWebhookTimeoutMs(j.timeoutMs))) {
                 return ("delivered", "")
             }
             this.markDeliveryFailure(j, "webhook", dplan.accountId, url, "not-delivered", "webhook_failed", "webhook post returned false")
@@ -621,7 +622,7 @@ public class CronRunner {
         if (fm == "webhook") {
             let fu = fplan.to.trimAscii()
             let fb = buildCronWebhookFailureBody(j.id, errMsg, startedAtMs, j.sessionTarget)
-            let delivered = postCronWebhookJson(fu, fb)
+            let delivered = postCronWebhookJson(fu, fb, timeoutMs: cronWebhookTimeoutMs(j.timeoutMs))
             if (!delivered) {
                 this.markDeliveryFailure(j, "webhook", fplan.accountId, fu, "not-delivered", "failure_webhook_failed", "webhook post returned false")
             }
