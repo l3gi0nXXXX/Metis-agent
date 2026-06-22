@@ -2376,7 +2376,7 @@ private func formatCronRunsPageForHuman(page: JsonObject, targetId: String): Str
     for (it in entries.getItems()) {
         let row = it.asObject()
         let deliveryStatus = jsonObjString(row, "deliveryStatus")
-        let deliveryError = jsonObjString(row, "deliveryError").trimAscii()
+        let deliveryError = cronRedactDeliveryErrorForHuman(jsonObjString(row, "deliveryError")).trimAscii()
         var summaryText = ellipsis(jsonObjString(row, "summary"), 60)
         if (deliveryStatus.trimAscii().toAsciiLower() == "not-delivered" && !deliveryError.isEmpty()) {
             let deliveryErrorSummary = ellipsis(deliveryError, 60)
@@ -2396,6 +2396,60 @@ private func formatCronRunsPageForHuman(page: JsonObject, targetId: String): Str
         )
     }
     String.join(lines.toArray(), delimiter: "\n")
+}
+
+private func cronRedactDeliveryErrorAfterMarker(raw: String, marker: String): String {
+    let parts = raw.split(marker, 2)
+    if (parts.size < 2) {
+        return raw
+    }
+    parts[0] + marker + "[redacted]"
+}
+
+private func cronRedactDeliveryErrorUrlUserInfo(raw: String): String {
+    if (raw.isEmpty()) {
+        return ""
+    }
+    let out = ArrayList<String>()
+    for (part in raw.split(" ")) {
+        if (part.contains("://") && part.contains("@")) {
+            let schemeParts = part.split("://", 2)
+            if (schemeParts.size == 2) {
+                let atParts = schemeParts[1].split("@", 2)
+                if (atParts.size == 2 && atParts[0].contains(":")) {
+                    out.add(schemeParts[0] + "://[redacted]@" + atParts[1])
+                    continue
+                }
+            }
+        }
+        out.add(part)
+    }
+    String.join(out.toArray(), delimiter: " ")
+}
+
+private func cronRedactDeliveryErrorForHuman(raw: String): String {
+    var out = raw.trimAscii().replace("\r", " ").replace("\n", " ")
+    if (out.isEmpty()) {
+        return ""
+    }
+    out = cronRedactDeliveryErrorUrlUserInfo(out)
+    out = cronRedactDeliveryErrorAfterMarker(out, "Authorization: Bearer ")
+    out = cronRedactDeliveryErrorAfterMarker(out, "authorization: bearer ")
+    out = cronRedactDeliveryErrorAfterMarker(out, "Authorization=")
+    out = cronRedactDeliveryErrorAfterMarker(out, "authorization=")
+    out = cronRedactDeliveryErrorAfterMarker(out, "Bearer ")
+    out = cronRedactDeliveryErrorAfterMarker(out, "bearer ")
+    out = cronRedactDeliveryErrorAfterMarker(out, "api_key=")
+    out = cronRedactDeliveryErrorAfterMarker(out, "apiKey=")
+    out = cronRedactDeliveryErrorAfterMarker(out, "token=")
+    out = cronRedactDeliveryErrorAfterMarker(out, "access_token=")
+    out = cronRedactDeliveryErrorAfterMarker(out, "auth_token=")
+    out = cronRedactDeliveryErrorAfterMarker(out, "password=")
+    out = cronRedactDeliveryErrorAfterMarker(out, "passwd=")
+    while (out.contains("  ")) {
+        out = out.replace("  ", " ")
+    }
+    out
 }
 
 private func cronCmdWake(path: Path, sub: Array<String>): (String, Int64) {

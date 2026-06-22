@@ -38,9 +38,9 @@ import metis.cron.{
     cronEffectiveAnnounceChannel,
     resolveCronDeliveryPlan,
     resolveCronFailurePlan,
-    scanCronPromptAssembled,
-    sanitizeCronDeliveryError
+    scanCronPromptAssembled
 }
+import metis.gateway.logging.gatewayLogRedactText
 
 import magic.prelude.*
 
@@ -507,7 +507,7 @@ public class CronRunner {
     }
 
     private func deliveryFailureMessage(kind: String, raw: String): String {
-        let trimmed = sanitizeCronDeliveryError(raw).trimAscii()
+        let trimmed = gatewayLogRedactText(raw).trimAscii()
         if (trimmed.isEmpty()) {
             return "${kind} delivery failed"
         }
