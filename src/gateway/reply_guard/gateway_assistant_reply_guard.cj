@@ -196,13 +196,13 @@ public func stripAssistantToolXmlBlocks(raw: String): String {
             continue
         }
         if (!inCodeFence && gatewayAssistantReplyLineStartsToolXmlBlock(trimmed)) {
-            if (!gatewayAssistantReplyLineEndsToolXmlBlock(trimmed)) {
+            if (!gatewayAssistantReplyLineHasCompleteToolXmlBlock(trimmed)) {
                 inToolBlock = true
             }
             continue
         }
         if (inToolBlock) {
-            if (gatewayAssistantReplyLineEndsToolXmlBlock(trimmed)) {
+            if (gatewayAssistantReplyLineIsClosingToolXmlBlock(trimmed)) {
                 inToolBlock = false
             }
             continue
@@ -359,6 +359,19 @@ private func gatewayAssistantReplyLineEndsToolXmlBlock(trimmed: String): Bool {
         lower.contains("</tool_calls>") ||
         lower.contains("</function_call>") ||
         lower.contains("</function_calls>")
+}
+
+private func gatewayAssistantReplyLineHasCompleteToolXmlBlock(trimmed: String): Bool {
+    gatewayAssistantReplyLineStartsToolXmlBlock(trimmed) &&
+        gatewayAssistantReplyLineEndsToolXmlBlock(trimmed)
+}
+
+private func gatewayAssistantReplyLineIsClosingToolXmlBlock(trimmed: String): Bool {
+    let lower = trimmed.toAsciiLower()
+    lower.startsWith("</tool_call>") ||
+        lower.startsWith("</tool_calls>") ||
+        lower.startsWith("</function_call>") ||
+        lower.startsWith("</function_calls>")
 }
 
 private func gatewayAssistantReplyLooksLikeToolProtocolPrefix(raw: String): Bool {

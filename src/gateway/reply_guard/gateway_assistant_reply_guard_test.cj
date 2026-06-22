@@ -124,6 +124,19 @@ public class GatewayAssistantReplyGuardTest {
     }
 
     @TestCase
+    public func toolXmlPayloadClosingTagLiteralDoesNotLeakOrBlockCodeFenceExample(): Unit {
+        let code = "```xml\n<tool_call>{\"name\":\"session_status\"}</tool_call>\n```"
+        let result = normalizeGatewayAssistantFinalReply("前文\n<tool_call>\n{\"name\":\"session_status\",\"arguments\":{\"text\":\"literal </tool_call> inside\"}}\n</tool_call>\n后文\n${code}")
+
+        @Expect(result.ok, true)
+        @Expect(result.text.contains("前文"), true)
+        @Expect(result.text.contains("后文"), true)
+        @Expect(result.text.contains(code), true)
+        @Expect(result.text.contains("\"arguments\""), false)
+        @Expect(result.text.contains("literal </tool_call> inside"), false)
+    }
+
+    @TestCase
     public func toolXmlInsideCodeFenceIsPreserved(): Unit {
         let text = "示例：\n```json\n<tool_call>{\"name\":\"session_status\"}</tool_call>\n```"
         let result = normalizeGatewayAssistantFinalReply(text)
