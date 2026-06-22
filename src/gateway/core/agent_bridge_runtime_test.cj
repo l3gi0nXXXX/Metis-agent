@@ -1,7 +1,12 @@
 package metis.gateway.core
 
+import magic.config.Config
+import magic.core.message.Message
+import magic.core.model.{AsyncChatResponse, ChatModel, ChatRequest, ChatResponse}
+import magic.model.ModelManager
 import metis.core.config.{CliConfig, CliSettingManager, MetisConfigManager, MetisProcessEnvironmentLock, OpenAICodexOAuthProfile, writeOpenAICodexOAuthProfile}
 import metis.core.model.{CodexResponsesHttpRequest, CodexResponsesHttpResult, CodexResponsesHttpRunner, setCodexResponsesHttpRunnerForTest}
+import metis.gateway.logging.{gatewayLoggingCaptureConsoleForTest, gatewayLoggingCapturedConsoleForTest, gatewayLoggingResetForTest}
 import metis.gateway.session.{GatewayIngressSource, GatewaySessionRequest, GatewayTurnContext, gatewayResolveSessionContext}
 
 import std.collection.ArrayList
@@ -113,6 +118,82 @@ private func writeAgentBridgeCodexResponsesAgentConfig(home: Path): Unit {
     CliSettingManager.invalidate()
 }
 
+private func writeAgentBridgePhase1FallbackAgentConfig(home: Path, primary: String, fallbacks: Array<String>): Unit {
+    let root = JsonObject()
+    let agents = JsonObject()
+    let defaults = JsonObject()
+    defaults.put("workspace", JsonString(home.join("workspaces").toString()))
+    agents.put("defaults", defaults)
+    let list = JsonArray([])
+    let entry = JsonObject()
+    entry.put("id", JsonString("phase1"))
+    entry.put("workspace", JsonString(home.join("workspaces").join("phase1").toString()))
+    entry.put("agentDir", JsonString(home.join("agents").join("phase1").join("agent").toString()))
+    let model = JsonObject()
+    model.put("primary", JsonString(primary))
+    let fallbackItems = JsonArray([])
+    for (fallback in fallbacks) {
+        fallbackItems.add(JsonString(fallback))
+    }
+    model.put("fallbacks", fallbackItems)
+    model.put("openaiRuntime", JsonString("codex_app_server"))
+    entry.put("model", model)
+    list.add(entry)
+    agents.put("list", list)
+    root.put("agents", agents)
+    File.writeTo(MetisConfigManager.configPath(), root.toJsonString().toArray())
+    CliConfig.invalidatePathCache()
+    MetisConfigManager.invalidate()
+    CliSettingManager.invalidate()
+}
+
+private func withAgentBridgeRuntimeLogCapture<T>(home: Path, name: String, block: (String) -> T): T {
+    let oldLevel = Config.logLevel
+    let oldFile = Config.logFile
+    let oldMetisLevel = getVariable("METIS_LOG_LEVEL")
+    let oldMetisFile = getVariable("METIS_LOG_FILE")
+    let oldMetisConsoleLevel = getVariable("METIS_CONSOLE_LEVEL")
+    let path = home.join("logs").join("agent-bridge-phase1-${name}.log").toString()
+    Directory.create(Path(path).parent, recursive: true)
+    try { remove(Path(path), recursive: true) } catch (_: Exception) { () }
+    Config.logLevel = "debug"
+    Config.logFile = path
+    setVariable("METIS_LOG_LEVEL", "debug")
+    setVariable("METIS_LOG_FILE", path)
+    setVariable("METIS_CONSOLE_LEVEL", "debug")
+    gatewayLoggingResetForTest()
+    gatewayLoggingCaptureConsoleForTest()
+    try {
+        return block(path)
+    } finally {
+        Config.logLevel = oldLevel
+        Config.logFile = oldFile
+        match (oldMetisLevel) {
+            case Some(value) => setVariable("METIS_LOG_LEVEL", value)
+            case None => setVariable("METIS_LOG_LEVEL", "")
+        }
+        match (oldMetisFile) {
+            case Some(value) => setVariable("METIS_LOG_FILE", value)
+            case None => setVariable("METIS_LOG_FILE", "")
+        }
+        match (oldMetisConsoleLevel) {
+            case Some(value) => setVariable("METIS_CONSOLE_LEVEL", value)
+            case None => setVariable("METIS_CONSOLE_LEVEL", "")
+        }
+        gatewayLoggingResetForTest()
+    }
+}
+
+private func agentBridgeRuntimeReadCapturedLog(path: String): String {
+    let captured = String.join(gatewayLoggingCapturedConsoleForTest(), delimiter: "\n")
+    let fileLog = if (exists(Path(path))) {
+        String.fromUtf8(File.readFrom(Path(path)))
+    } else {
+        ""
+    }
+    fileLog + "\n" + captured
+}
+
 private func writeAgentBridgeAuthProfile(path: Path, provider: String, secret: String): Unit {
     Directory.create(path.parent, recursive: true)
     let root = JsonObject()
@@ -219,6 +300,44 @@ private func agentBridgeCodexResponsesCompletedEvent(text: String): JsonObject {
     event
 }
 
+private var agentBridgePhase1PrimaryCalls: Int64 = 0
+private var agentBridgePhase1FallbackCalls: Int64 = 0
+
+private class AgentBridgePhase1FallbackModel <: ChatModel {
+    private var _maxTokens: Option<Int64> = None
+
+    public prop provider: String {
+        get() { "fake" }
+    }
+
+    public prop name: String {
+        get() { "agent-bridge-phase1-fallback" }
+    }
+
+    public prop contextLength: Int64 {
+        get() { 8192 }
+    }
+
+    public mut prop maxTokens: Option<Int64> {
+        get() { this._maxTokens }
+        set(v) { this._maxTokens = v }
+    }
+
+    public func create(_request: ChatRequest): ChatResponse {
+        agentBridgePhase1FallbackCalls += 1
+        ChatResponse(this.fullName, Message.assistant("phase1 fallback answer"))
+    }
+
+    public func asyncCreate(_request: ChatRequest): AsyncChatResponse {
+        throw Exception("async not used in phase1 agent bridge tests")
+    }
+}
+
+private func resetAgentBridgePhase1FakeModels(): Unit {
+    agentBridgePhase1PrimaryCalls = 0
+    agentBridgePhase1FallbackCalls = 0
+}
+
 @Test
 public class AgentBridgeRuntimeTest {
     @TestCase
@@ -254,6 +373,98 @@ public class AgentBridgeRuntimeTest {
         @Expect(agentBridgeToolRequiredContains(schema, "timeoutMs"), false)
         @Expect(agentBridgeToolRequiredContains(schema, "lightContext"), false)
         @Expect(agentBridgeToolRequiredContains(schema, "dueOnly"), false)
+    }
+
+    @TestCase
+    public func emptyModelResponseFallsBackAndPersistsAssistantReply(): Unit {
+        withAgentBridgeTempHome("metis-phase1-empty-response-fallback", { home: Path =>
+            resetAgentBridgePhase1FakeModels()
+            let suffix = DateTime.now().toUnixTimeStamp().toMilliseconds().toString()
+            let primary = "openai-codex:gpt-5.5"
+            let fallback = "metis-test-phase1-fallback-${suffix}"
+            ModelManager.registerChatModel(fallback, { => AgentBridgePhase1FallbackModel() })
+            writeAgentBridgePhase1FallbackAgentConfig(home, primary, [fallback])
+            let context = gatewayResolveSessionContext(
+                GatewaySessionRequest(
+                    GatewayIngressSource.DashboardRpc,
+                    sessionHint: "main",
+                    agentId: "phase1"
+                )
+            )
+            let store = GatewaySessionStore(home.join("sessions"), enabled: true, agentId: "phase1")
+            let bridge = AgentBridge(sessionStore: store)
+            setGatewayCodexAppServerRunnerForTest(Some({ _request: GatewayCodexAppServerTurnRequest =>
+                agentBridgePhase1PrimaryCalls += 1
+                throw Exception("  Http response body is empty\nAuthorization: Bearer phase1-secret-token token=abc")
+            }))
+            try {
+                let reply = bridge.reply(
+                    context.sessionKey,
+                    "trigger empty response fallback",
+                    channelName: "feishu",
+                    agentId: "phase1",
+                    turnContext: Some(context.turnContext)
+                )
+
+                @Expect(reply, "phase1 fallback answer")
+                @Expect(agentBridgePhase1PrimaryCalls, 1)
+                @Expect(agentBridgePhase1FallbackCalls > 0, true)
+                let transcript = String.fromUtf8(File.readFrom(store.transcriptPath(context.sessionKey)))
+                @Expect(transcript.contains("phase1 fallback answer"), true)
+                @Expect(transcript.contains("agent-bridge-phase1-fallback"), true)
+            } finally {
+                setGatewayCodexAppServerRunnerForTest(None<(GatewayCodexAppServerTurnRequest) -> GatewayCodexAppServerRuntimeResult>)
+            }
+        })
+    }
+
+    @TestCase
+    public func emptyModelResponseWithoutFallbackLogsConfigurationStateWithoutSecrets(): Unit {
+        withAgentBridgeTempHome("metis-phase1-empty-response-no-fallback", { home: Path =>
+            resetAgentBridgePhase1FakeModels()
+            let primary = "openai-codex:gpt-5.5"
+            writeAgentBridgePhase1FallbackAgentConfig(home, primary, [])
+            let context = gatewayResolveSessionContext(
+                GatewaySessionRequest(
+                    GatewayIngressSource.DashboardRpc,
+                    sessionHint: "main",
+                    agentId: "phase1"
+                )
+            )
+            withAgentBridgeRuntimeLogCapture(home, "no-fallback", { logPath: String =>
+                let store = GatewaySessionStore(home.join("sessions"), enabled: true, agentId: "phase1")
+                let bridge = AgentBridge(sessionStore: store)
+                setGatewayCodexAppServerRunnerForTest(Some({ _request: GatewayCodexAppServerTurnRequest =>
+                    agentBridgePhase1PrimaryCalls += 1
+                    throw Exception("  Http response body is empty\nAuthorization: Bearer phase1-secret-token token=abc")
+                }))
+                var thrown = false
+                try {
+                    _ = bridge.reply(
+                        context.sessionKey,
+                        "trigger empty response without fallback",
+                        channelName: "feishu",
+                        agentId: "phase1",
+                        turnContext: Some(context.turnContext)
+                    )
+                } catch (_: Exception) {
+                    thrown = true
+                } finally {
+                    setGatewayCodexAppServerRunnerForTest(None<(GatewayCodexAppServerTurnRequest) -> GatewayCodexAppServerRuntimeResult>)
+                }
+
+                @Expect(thrown, true)
+                @Expect(agentBridgePhase1PrimaryCalls, 1)
+                @Expect(agentBridgePhase1FallbackCalls, 0)
+                let log = agentBridgeRuntimeReadCapturedLog(logPath)
+                @Expect(log.contains("fallbackConfigured=false") || log.contains("\"fallbackConfigured\":false"), true)
+                @Expect(log.contains("fallbackCandidateCount=0") || log.contains("\"fallbackCandidateCount\":0"), true)
+                @Expect(log.contains("errorClass=model_empty_response") || log.contains("\"errorClass\":\"model_empty_response\""), true)
+                @Expect(log.contains("phase1-secret-token"), false)
+                @Expect(log.contains("Authorization"), false)
+                @Expect(log.contains("token=abc"), false)
+            })
+        })
     }
 
     @TestCase

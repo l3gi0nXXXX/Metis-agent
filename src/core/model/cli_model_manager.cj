@@ -187,6 +187,9 @@ protected class CliModelManager {
 
         // HTTP and model errors that should trigger fallback
         return message.contains("timeout") ||
+               message.contains("http response body is empty") ||
+               message.contains("empty response body") ||
+               message.contains("response body is empty") ||
                message.contains("5") ||  // 5xx server errors
                message.contains("connection") ||
                message.contains("network") ||
@@ -197,6 +200,10 @@ protected class CliModelManager {
                message.contains("api key") ||
                message.contains("unauthorized") ||
                message.contains("authentication")
+    }
+
+    public static func fallbackErrorEligibleForTest(ex: Exception): Bool {
+        isFallbackError(ex)
     }
 
     public static func shouldFallbackForAgentScope(ex: Exception, scope: JsonObject): Bool {

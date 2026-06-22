@@ -55,6 +55,23 @@ private class GatewayP1ChatAgent {
     @prompt("")
 }
 
+private func gatewayAgentBridgeModelErrorClass(ex: Exception): String {
+    let message = ex.message.toAsciiLower()
+    if (message.contains("http response body is empty") ||
+        message.contains("empty response body") ||
+        message.contains("response body is empty")) {
+        return "model_empty_response"
+    }
+    "model_execution_failed"
+}
+
+private func gatewayAgentBridgeModelErrorSummary(ex: Exception): String {
+    if (gatewayAgentBridgeModelErrorClass(ex) == "model_empty_response") {
+        return "Http response body is empty"
+    }
+    gatewayAgentBridgeModelErrorClass(ex)
+}
+
 private func buildGatewayExtraSystemPrompt(channelName: String, extraPrompt!: String = ""): String {
     let channel = channelName.trimAscii().toAsciiLower()
     let channelLabel = if (channel.isEmpty()) { "gateway" } else { channel }
@@ -1316,13 +1333,14 @@ public class AgentBridge {
                 } catch (e: Exception) {
                     gatewayFinishUsageCapture()
                     let modelCallFailedAtMs = DateTime.now().toUnixTimeStamp().toMilliseconds()
+                    let errorSummary = gatewayAgentBridgeModelErrorSummary(e)
                     gatewayLogReplyMemory(
                         "agent-chat-exception",
                         conversationKey,
                         channelName,
                         agentId: effectiveAgentId,
                         modelName: currModel.fullName,
-                        note: "attempt=${idx + 1}, error=${e.message}"
+                        note: "attempt=${idx + 1}, error=${errorSummary}"
                     )
                     gatewayLogModelTiming(
                         channelName,
@@ -1332,7 +1350,7 @@ public class AgentBridge {
                         Int64(answer.size),
                         modelCallFailedAtMs - preCallStartedAtMs,
                         "failed",
-                        error: e.message
+                        error: errorSummary
                     )
                     lastEx = Some(e)
                     let isChannelBoundFirst = match (channelBoundModelOpt) {
@@ -1342,6 +1360,18 @@ public class AgentBridge {
                         case None => false
                     }
                     if (idx == allModels.size - 1) {
+                        gatewayLogEventWarn(
+                            "gateway/model",
+                            "model.failed",
+                            "gateway model failed; no fallback candidate remains",
+                            meta: gatewayLogMeta()
+                                .string("model", currModel.fullName)
+                                .rawString("error", errorSummary)
+                                .bool("fallbackConfigured", allModels.size > 1)
+                                .int("fallbackCandidateCount", Int64(if (allModels.size > 1) { allModels.size - 1 } else { 0 }))
+                                .string("errorClass", gatewayAgentBridgeModelErrorClass(e))
+                                .object()
+                        )
                         throw e
                     }
                     let hasModelOverride = match (turnContext) {
@@ -1361,7 +1391,7 @@ public class AgentBridge {
                             "channel-bound model failed; falling back to global models",
                             meta: gatewayLogMeta()
                                 .string("model", currModel.fullName)
-                                .rawString("error", e.message)
+                                .rawString("error", errorSummary)
                                 .object()
                         )
                     } else if (match (turnContext) { case Some(ctx) => CliModelManager.shouldFallbackForAgentScope(e, ctx.agentScope) case None => CliModelManager.shouldFallback(e) }) {
@@ -1371,7 +1401,7 @@ public class AgentBridge {
                             "gateway model failed; trying fallback",
                             meta: gatewayLogMeta()
                                 .string("model", currModel.fullName)
-                                .rawString("error", e.message)
+                                .rawString("error", errorSummary)
                                 .object()
                         )
                     } else {
