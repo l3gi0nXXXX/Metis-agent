@@ -35,6 +35,38 @@ public func metisSafeUtf8Prefix(text: String, maxBytes: Int64, marker!: String =
     out.toString()
 }
 
+private func appendRunePrefix(out: StringBuilder, runes: Array<Rune>, maxRunes: Int64): Unit {
+    var idx: Int64 = 0
+    while (idx < maxRunes && idx < runes.size) {
+        out.append(String([runes[idx]]))
+        idx += 1
+    }
+}
+
+public func metisSafeRuneEllipsis(text: String, maxRunes: Int64, marker!: String = "..."): String {
+    if (maxRunes <= 0) {
+        return ""
+    }
+    let runes = text.toRuneArray()
+    if (runes.size <= maxRunes) {
+        return text
+    }
+    let markerRunes = marker.toRuneArray()
+    if (markerRunes.size == 0) {
+        let out = StringBuilder()
+        appendRunePrefix(out, runes, maxRunes)
+        return out.toString()
+    }
+    let out = StringBuilder()
+    if (maxRunes <= markerRunes.size) {
+        appendRunePrefix(out, markerRunes, maxRunes)
+        return out.toString()
+    }
+    appendRunePrefix(out, runes, maxRunes - markerRunes.size)
+    out.append(marker)
+    out.toString()
+}
+
 public func metisSafeDiagnosticText(text: String, maxBytes!: Int64 = 4096): String {
     var cleaned = text.replace("\u{0000}", "")
     cleaned = cleaned.replace("\r", " ")

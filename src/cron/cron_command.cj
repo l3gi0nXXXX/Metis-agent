@@ -2,6 +2,7 @@ package metis.cron
 
 import metis.core.config.CliConfig
 import metis.core.config.CliSettingManager
+import metis.core.metisSafeRuneEllipsis
 import metis.gateway.logging.{MetisLogEvent, metisCreateSubsystemLogger}
 
 import std.collection.ArrayList
@@ -576,13 +577,7 @@ private func padRight(text: String, width: Int64): String {
 }
 
 private func ellipsis(text: String, width: Int64): String {
-    if (text.size <= width) {
-        return text
-    }
-    if (width <= 3) {
-        return text[0..width]
-    }
-    text[0..width - 3] + "..."
+    metisSafeRuneEllipsis(text, width)
 }
 
 private func formatScheduleSummary(j: CronJob): String {
