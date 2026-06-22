@@ -20,6 +20,7 @@ private class GatewayFeishuNativeTestAdapter <: ChannelAdapter {
     private let inbound = ArrayList<InboundMessage>()
     private let sent = ArrayList<OutboundMessage>()
     private let accountId: String
+    private var failSends = false
 
     public init(accountId!: String = "default") {
         this.accountId = if (accountId.trimAscii().isEmpty()) { "default" } else { accountId.trimAscii() }
@@ -82,12 +83,22 @@ private class GatewayFeishuNativeTestAdapter <: ChannelAdapter {
         out
     }
 
+    public func failAllSends(): Unit {
+        this.failSends = true
+    }
+
     public func send(message: OutboundMessage): SendResult {
+        if (this.failSends) {
+            return SendResult.Failed("fake feishu send failed with Authorization: Bearer secret-token")
+        }
         this.sent.add(message)
         SendResult.Success
     }
 
     public func sendWithMessageId(message: OutboundMessage): String {
+        if (this.failSends) {
+            return ""
+        }
         this.sent.add(message)
         "feishu-native-${this.sent.size}"
     }
@@ -1162,6 +1173,102 @@ public class GatewayServiceFeishuNativeTest {
                 @Expect(adapter.sentText(2), "[reaction]\nremove=true\ntoken=Typing\nrender=Typing")
             } finally {
                 service.stop()
+            }
+        })
+    }
+
+    @TestCase
+    public func feishuInboundExecutionErrorSendsDiagnosticAndPersistsSession(): Unit {
+        withGatewayFeishuNativeTestHome("execution-error-diagnostic", gatewayFeishuNativeTestRoot(), { =>
+            let adapter = GatewayFeishuNativeTestAdapter()
+            let service = gatewayFeishuNativeService(adapter)
+            setGatewayAgentBridgeReplyRunnerForTest(Some({
+                _sessionKey: String,
+                _prompt: String,
+                _channelName: String,
+                _agentId: String,
+                _streamingEnabled: Bool,
+                _streamChunkHook: Option<(String) -> Unit> =>
+                    throw Exception("Http response body is empty")
+            }))
+            service.start()
+            try {
+                adapter.queueDirect("hello")
+                service.processOnce()
+
+                @Expect(adapter.sentCount(), 1)
+                @Expect(adapter.sentText(0), "模型服务本轮返回空响应，未能完成回复。请稍后重试或切换模型。")
+                @Expect(adapter.sentReplyTo(0), "om-0")
+                let store = gatewaySessionStoreForUser(CliSettingManager.readGatewaySettings())
+                let raw = store.readTranscriptRaw("feishu:direct:ou_peer").getOrThrow()
+                @Expect(raw.contains("【系统诊断】模型服务本轮返回空响应"), true)
+                @Expect(raw.contains("errorKind=model_empty_response"), true)
+            } finally {
+                service.stop()
+                setGatewayAgentBridgeReplyRunnerForTest(None<(String, String, String, String, Bool, Option<(String) -> Unit>) -> String>)
+            }
+        })
+    }
+
+    @TestCase
+    public func feishuInboundExecutionErrorRedactsLongUnicodeSecretAndDoesNotThrowWhenDiagnosticSendFails(): Unit {
+        withGatewayFeishuNativeTestHome("execution-error-diagnostic-send-failed", gatewayFeishuNativeTestRoot(), { =>
+            let adapter = GatewayFeishuNativeTestAdapter()
+            adapter.failAllSends()
+            let service = gatewayFeishuNativeService(adapter)
+            setGatewayAgentBridgeReplyRunnerForTest(Some({
+                _sessionKey: String,
+                _prompt: String,
+                _channelName: String,
+                _agentId: String,
+                _streamingEnabled: Bool,
+                _streamChunkHook: Option<(String) -> Unit> =>
+                    throw Exception("HTTP RESPONSE BODY IS EMPTY 仓颉🙂 Authorization: Bearer must-not-leak token=abc")
+            }))
+            service.start()
+            try {
+                adapter.queueDirect("hello")
+                service.processOnce()
+
+                @Expect(adapter.sentCount(), 0)
+                let store = gatewaySessionStoreForUser(CliSettingManager.readGatewaySettings())
+                let raw = store.readTranscriptRaw("feishu:direct:ou_peer").getOrThrow()
+                @Expect(raw.contains("【系统诊断】模型服务本轮返回空响应"), true)
+                @Expect(raw.contains("errorKind=model_empty_response"), true)
+                @Expect(raw.contains("must-not-leak"), false)
+                @Expect(raw.contains("token=abc"), false)
+            } finally {
+                service.stop()
+                setGatewayAgentBridgeReplyRunnerForTest(None<(String, String, String, String, Bool, Option<(String) -> Unit>) -> String>)
+            }
+        })
+    }
+
+    @TestCase
+    public func feishuInboundNormalReplyUnaffectedByExecutionErrorGuard(): Unit {
+        withGatewayFeishuNativeTestHome("execution-error-normal-reply", gatewayFeishuNativeTestRoot(), { =>
+            let adapter = GatewayFeishuNativeTestAdapter()
+            let service = gatewayFeishuNativeService(adapter)
+            setGatewayAgentBridgeReplyRunnerForTest(Some({
+                _sessionKey: String,
+                _prompt: String,
+                _channelName: String,
+                _agentId: String,
+                _streamingEnabled: Bool,
+                _streamChunkHook: Option<(String) -> Unit> =>
+                    "normal feishu answer"
+            }))
+            service.start()
+            try {
+                adapter.queueDirect("hello")
+                service.processOnce()
+
+                @Expect(adapter.sentCount(), 1)
+                @Expect(adapter.sentText(0), "normal feishu answer")
+                @Expect(adapter.sentText(0).contains("模型服务本轮"), false)
+            } finally {
+                service.stop()
+                setGatewayAgentBridgeReplyRunnerForTest(None<(String, String, String, String, Bool, Option<(String) -> Unit>) -> String>)
             }
         })
     }
