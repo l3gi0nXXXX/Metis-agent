@@ -20,6 +20,7 @@ import { shouldReloadHistoryForFinalEvent } from "./chat-event-reload.ts";
 import { formatConnectError } from "./connect-error.ts";
 import { loadAgents } from "./controllers/agents.ts";
 import { loadAssistantIdentity } from "./controllers/assistant-identity.ts";
+import { handleCanvasReloadEvent } from "./controllers/canvas.ts";
 import { loadChatHistory } from "./controllers/chat.ts";
 import { handleChatEvent, type ChatEventPayload } from "./controllers/chat.ts";
 import { loadDevices } from "./controllers/devices.ts";
@@ -413,6 +414,11 @@ function handleGatewayEventUnsafe(host: GatewayHost, evt: GatewayEventFrame) {
 
   if (evt.event === "sessions.changed") {
     void loadSessions(host as unknown as MetisApp);
+    return;
+  }
+
+  if (evt.event === "control-ui.canvas.reload") {
+    handleCanvasReloadEvent(host as unknown as MetisApp);
     return;
   }
 

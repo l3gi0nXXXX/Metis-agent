@@ -79,6 +79,7 @@ export function renderStreamingGroup(
   text: string,
   startedAt: number,
   onOpenSidebar?: (content: string) => void,
+  onOpenCanvas?: (content: string) => boolean,
   assistant?: AssistantIdentity,
   basePath?: string,
 ) {
@@ -100,6 +101,7 @@ export function renderStreamingGroup(
           },
           { isStreaming: true, showReasoning: false },
           onOpenSidebar,
+          onOpenCanvas,
         )}
         <div class="chat-group-footer">
           <span class="chat-sender-name">${name}</span>
@@ -114,6 +116,7 @@ export function renderMessageGroup(
   group: MessageGroup,
   opts: {
     onOpenSidebar?: (content: string) => void;
+    onOpenCanvas?: (content: string) => boolean;
     showReasoning: boolean;
     showToolCalls?: boolean;
     assistantName?: string;
@@ -170,6 +173,7 @@ export function renderMessageGroup(
               showToolCalls: opts.showToolCalls ?? true,
             },
             opts.onOpenSidebar,
+            opts.onOpenCanvas,
           ),
         )}
         <div class="chat-group-footer">
@@ -659,14 +663,23 @@ function jsonSummaryLabel(parsed: unknown): string {
   return "JSON";
 }
 
-function renderExpandButton(markdown: string, onOpenSidebar: (content: string) => void) {
+function renderExpandButton(
+  markdown: string,
+  onOpenSidebar: (content: string) => void,
+  onOpenCanvas?: (content: string) => boolean,
+) {
   return html`
     <button
       class="btn btn--xs chat-expand-btn"
       type="button"
       title="Open in canvas"
       aria-label="Open in canvas"
-      @click=${() => onOpenSidebar(markdown)}
+      @click=${() => {
+        if (onOpenCanvas?.(markdown) === true) {
+          return;
+        }
+        onOpenSidebar(markdown);
+      }}
     >
       <span class="chat-expand-btn__icon" aria-hidden="true">${icons.panelRightOpen}</span>
     </button>
@@ -677,6 +690,7 @@ function renderGroupedMessage(
   message: unknown,
   opts: { isStreaming: boolean; showReasoning: boolean; showToolCalls?: boolean },
   onOpenSidebar?: (content: string) => void,
+  onOpenCanvas?: (content: string) => boolean,
 ) {
   const m = message as Record<string, unknown>;
   const role = typeof m.role === "string" ? m.role : "unknown";
@@ -734,7 +748,7 @@ function renderGroupedMessage(
     <div class="${bubbleClasses}">
       ${hasActions
         ? html`<div class="chat-bubble-actions">
-            ${canExpand ? renderExpandButton(markdown!, onOpenSidebar!) : nothing}
+            ${canExpand ? renderExpandButton(markdown!, onOpenSidebar!, onOpenCanvas) : nothing}
             ${canCopyMarkdown ? renderCopyAsMarkdownButton(markdown!) : nothing}
           </div>`
         : nothing}

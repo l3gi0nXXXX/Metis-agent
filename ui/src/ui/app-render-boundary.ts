@@ -1,6 +1,13 @@
 const CHAT_TAB_RENDER_IGNORED_KEYS = new Set([
   "nodes",
   "nodesLoading",
+  "canvasActionBusy",
+  "canvasActionError",
+  "canvasActionMessage",
+  "canvasError",
+  "canvasLastReloadAt",
+  "canvasLoading",
+  "canvasRuntime",
 ]);
 
 export function shouldMetisAppRenderForChangedKeys(tab: string, keys: readonly string[]): boolean {

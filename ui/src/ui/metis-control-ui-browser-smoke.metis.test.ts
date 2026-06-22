@@ -173,6 +173,7 @@ function startServer(): Promise<{ url: string; close: () => Promise<void> }> {
       requestUrl.pathname === "/" ||
       requestUrl.pathname === "/chat" ||
       requestUrl.pathname === "/channels" ||
+      requestUrl.pathname === "/canvas" ||
       requestUrl.pathname === "/agent-teams"
         ? "index.html"
         : requestUrl.pathname.replace(/^\/+/, "");
@@ -277,7 +278,7 @@ async function installFakeGatewayWebSocket(page: Page) {
             type: "hello-ok",
             protocol: 3,
             server: { version: "smoke" },
-            features: { methods: ["channels.status", "health"], events: [] },
+            features: { methods: ["channels.status", "health", "canvas.runtime"], events: [] },
             snapshot: {
               health: {
                 ok: false,
@@ -303,6 +304,28 @@ async function installFakeGatewayWebSocket(page: Page) {
         }
         if (method === "channels.status") {
           return channelsStatus;
+        }
+        if (method === "canvas.runtime") {
+          return {
+            canvas: {
+              enabled: true,
+              root: "/tmp/metis-control-ui-canvas-smoke",
+              port: 18793,
+              liveReload: true,
+              hostStarted: true,
+              httpUrl: "http://127.0.0.1:18793/__metis__/canvas/",
+              healthy: true,
+              rootPresent: true,
+              rootReadable: true,
+              assetState: "mounted",
+              watchState: "watching",
+              phase: "ready",
+              errorKind: "",
+              routeCount: 2,
+              liveReloadEventCount: 1,
+              liveReloadLastEventAtMs: 1,
+            },
+          };
         }
         if (method === "health") {
           return {
@@ -440,6 +463,7 @@ describe("Metis control-ui browser smoke", () => {
       const routes = [
         "/chat?session=agent%3Amain%3Aexplicit%3Acli%3Amain",
         "/channels",
+        "/canvas",
         "/agent-teams",
       ];
       const appStates = [];
@@ -453,9 +477,22 @@ describe("Metis control-ui browser smoke", () => {
             document.querySelector("metis-app")?.textContent?.includes("poll timeout"),
           );
         }
+        if (route === "/canvas") {
+          await page.waitForFunction(() =>
+            document.querySelector("metis-app")?.textContent?.includes("Canvas Runtime"),
+          );
+        }
         appStates.push(await page.evaluate(() => ({
           defined: Boolean(customElements.get("metis-app")),
           renderedText: document.querySelector("metis-app")?.textContent?.trim().slice(0, 4096) ?? "",
+          hasCanvasRuntime: Boolean(
+            document.querySelector("metis-app")?.textContent?.includes("Canvas Runtime"),
+          ),
+          hasCanvasUrl: Boolean(
+            document
+              .querySelector("metis-app")
+              ?.textContent?.includes("http://127.0.0.1:18793/__metis__/canvas/"),
+          ),
           hasPollTimeout: Boolean(
             document.querySelector("metis-app")?.textContent?.includes("poll timeout"),
           ),
@@ -480,7 +517,10 @@ describe("Metis control-ui browser smoke", () => {
         expect(appState.scopedLocalToken).toBeNull();
       }
       expect(appStates[1]?.hasPollTimeout).toBe(true);
-      expect(appStates[2]?.pathname).toBe("/agent-teams");
+      expect(appStates[2]?.pathname).toBe("/canvas");
+      expect(appStates[2]?.hasCanvasRuntime).toBe(true);
+      expect(appStates[2]?.hasCanvasUrl).toBe(true);
+      expect(appStates[3]?.pathname).toBe("/agent-teams");
     } finally {
       await browser.close();
       await server.close();

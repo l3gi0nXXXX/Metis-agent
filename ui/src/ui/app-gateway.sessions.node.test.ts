@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 const loadSessionsMock = vi.fn();
+const handleCanvasReloadEventMock = vi.fn();
 
 vi.mock("./app-chat.ts", () => ({
   CHAT_SESSIONS_ACTIVE_MINUTES: 10,
@@ -26,6 +27,9 @@ vi.mock("./controllers/assistant-identity.ts", () => ({
 vi.mock("./controllers/chat.ts", () => ({
   loadChatHistory: vi.fn(),
   handleChatEvent: vi.fn(() => "idle"),
+}));
+vi.mock("./controllers/canvas.ts", () => ({
+  handleCanvasReloadEvent: handleCanvasReloadEventMock,
 }));
 vi.mock("./controllers/devices.ts", () => ({
   loadDevices: vi.fn(),
@@ -121,6 +125,23 @@ describe("handleGatewayEvent sessions.changed", () => {
 
     expect(loadSessionsMock).toHaveBeenCalledTimes(1);
     expect(loadSessionsMock).toHaveBeenCalledWith(host);
+  });
+});
+
+describe("handleGatewayEvent control-ui.canvas.reload", () => {
+  it("refreshes canvas runtime state when the host pushes a reload event", () => {
+    handleCanvasReloadEventMock.mockReset();
+    const host = createHost();
+
+    handleGatewayEvent(host, {
+      type: "event",
+      event: "control-ui.canvas.reload",
+      payload: { type: "reload", reason: "canvas-root-changed" },
+      seq: 2,
+    });
+
+    expect(handleCanvasReloadEventMock).toHaveBeenCalledTimes(1);
+    expect(handleCanvasReloadEventMock).toHaveBeenCalledWith(host);
   });
 });
 

@@ -112,6 +112,7 @@ import type {
   ToolsCatalogResult,
   ToolsEffectiveResult,
 } from "./types.ts";
+import type { CanvasRuntimeSnapshot } from "./controllers/canvas.ts";
 import { type ChatAttachment, type ChatQueueItem, type CronFormState } from "./ui-types.ts";
 import { generateUUID } from "./uuid.ts";
 import type { NostrProfileFormState } from "./views/channels.nostr-profile-form.ts";
@@ -204,6 +205,13 @@ export class MetisApp extends LitElement {
 
   @state() nodesLoading = false;
   @state() nodes: Array<Record<string, unknown>> = [];
+  @state() canvasLoading = false;
+  @state() canvasRuntime: CanvasRuntimeSnapshot | null = null;
+  @state() canvasError: string | null = null;
+  @state() canvasLastReloadAt: number | null = null;
+  @state() canvasActionBusy = false;
+  @state() canvasActionMessage: string | null = null;
+  @state() canvasActionError: string | null = null;
   @state() devicesLoading = false;
   @state() devicesError: string | null = null;
   @state() devicesList: DevicePairingList | null = null;

@@ -11,6 +11,7 @@ import magic.jsonable.*
 import std.env.{getVariable, setVariable}
 import std.fs.{Directory, Path, remove}
 import std.fs.File
+import std.time.DateTime
 import stdx.encoding.json.{JsonArray, JsonBool, JsonObject, JsonString}
 import std.unittest.testmacro.*
 
@@ -441,6 +442,38 @@ public class GatewayControlUiWsTest {
         let telegram = runtime.get("telegram").getOrThrow().asObject()
         @Expect(telegram.get("registrationPayload").isSome(), true)
         @Expect(telegram.get("healthSnapshot").isSome(), true)
+    }
+
+    @TestCase
+    public func canvasRuntimeCompatResponseReusesLocalGatewayRuntime(): Unit {
+        withGatewayControlUiWsTestHome {
+            let root = Path("/tmp/metis-control-ui-ws-canvas-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
+            try {
+                Directory.create(root, recursive: true)
+                File.writeTo(root.join("index.html"), "<html>canvas</html>".toArray())
+                var settings = CliSettingManager.readGatewaySettings()
+                settings.canvas.enabled = true
+                settings.canvas.root = root.toString()
+                CliSettingManager.writeGatewaySettings(settings)
+                let cfg = buildGatewayConfigFromUserSettings(CliSettingManager.readGatewaySettings())
+
+                let response = gatewayControlUiWsCompatResponse("canvas.runtime", JsonObject(), cfg)
+
+                @Expect(response.isSome(), true)
+                let canvas = response.getOrThrow().result.asObject().get("canvas").getOrThrow().asObject()
+                @Expect(gatewayControlUiWsTestString(canvas, "phase"), "configured")
+                @Expect(canvas.get("rootPresent").getOrThrow().asBool().getValue(), true)
+                @Expect(canvas.get("rootReadable").getOrThrow().asBool().getValue(), true)
+                @Expect(gatewayControlUiWsTestString(canvas, "assetState"), "mounted")
+                @Expect(gatewayControlUiWsTestString(canvas, "root"), root.toString())
+            } finally {
+                try {
+                    remove(root, recursive: true)
+                } catch (_: Exception) {
+                    ()
+                }
+            }
+        }
     }
 
     // @TestCase
