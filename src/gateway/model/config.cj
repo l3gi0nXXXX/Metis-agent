@@ -100,17 +100,20 @@ public class GatewayCanvasHostConfig {
     public let root: String
     public let port: Int64
     public let liveReload: Bool
+    public let openClawCompat: Bool
 
     public init(
         enabled!: Bool = false,
         root!: String = "",
         port!: Int64 = 18793,
-        liveReload!: Bool = true
+        liveReload!: Bool = true,
+        openClawCompat!: Bool = false
     ) {
         this.enabled = enabled
         this.root = root
         this.port = port
         this.liveReload = liveReload
+        this.openClawCompat = openClawCompat
     }
 }
 

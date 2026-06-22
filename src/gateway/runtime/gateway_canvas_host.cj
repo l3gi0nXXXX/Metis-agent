@@ -278,7 +278,7 @@ private func gatewayCanvasScanRoutesUnder(root: Path, dir: Path, out: ArrayList<
     }
 }
 
-public func gatewayCanvasRegisteredRoutes(cfg: GatewayConfig): JsonArray {
+private func gatewayCanvasCanonicalRegisteredRoutes(cfg: GatewayConfig): JsonArray {
     let routes = ArrayList<String>()
     if (!cfg.canvas.enabled || cfg.canvas.root.trimAscii().isEmpty()) {
         return JsonArray([])
@@ -300,6 +300,38 @@ public func gatewayCanvasRegisteredRoutes(cfg: GatewayConfig): JsonArray {
         out.add(JsonString(route))
     }
     out
+}
+
+private func gatewayCanvasAppendCompatRoutes(cfg: GatewayConfig, routes: JsonArray): JsonArray {
+    if (!gatewayCanvasCompatRoutesEnabled(cfg)) {
+        return routes
+    }
+    let out = JsonArray([])
+    let seen = ArrayList<String>()
+    for (routeValue in routes.getItems()) {
+        let route = try {
+            routeValue.asString().getValue()
+        } catch (_: Exception) {
+            ""
+        }
+        if (route.trimAscii().isEmpty()) {
+            continue
+        }
+        if (!seen.contains(route)) {
+            out.add(JsonString(route))
+            seen.add(route)
+        }
+        let compatRoute = gatewayCanvasOpenClawCompatPath(route)
+        if (!seen.contains(compatRoute)) {
+            out.add(JsonString(compatRoute))
+            seen.add(compatRoute)
+        }
+    }
+    out
+}
+
+public func gatewayCanvasRegisteredRoutes(cfg: GatewayConfig): JsonArray {
+    gatewayCanvasAppendCompatRoutes(cfg, gatewayCanvasCanonicalRegisteredRoutes(cfg))
 }
 
 private func gatewayCanvasRequestPathFromRoute(routePath: String): String {
@@ -653,6 +685,7 @@ public class GatewayCanvasHostRuntime {
     private static var server: Option<Server> = None
     private static var rootPath: String = ""
     private static var listenPort: UInt16 = 18793u16
+    private static var canonicalRoutes: JsonArray = JsonArray([])
     private static var registeredRoutes: JsonArray = JsonArray([])
     private static var lastErrorKind: String = ""
     private static var liveReloadRunning: Bool = false
@@ -695,7 +728,8 @@ public class GatewayCanvasHostRuntime {
                 .port(gatewayCanvasPortToUInt16(cfg.canvas.port, 18793u16))
                 .build()
             s.logger.level = LogLevel.OFF
-            let routes = gatewayCanvasRegisteredRoutes(cfg)
+            let routes = gatewayCanvasCanonicalRegisteredRoutes(cfg)
+            let publicRoutes = gatewayCanvasRegisteredRoutes(cfg)
             for (routeValue in routes.getItems()) {
                 let routePath = try {
                     routeValue.asString().getValue()
@@ -709,6 +743,14 @@ public class GatewayCanvasHostRuntime {
                 s.distributor.register(routePath, { ctx =>
                     gatewayCanvasReplyAsset(ctx, canonicalRoot, requestPath, "")
                 })
+                if (gatewayCanvasCompatRoutesEnabled(cfg)) {
+                    let compatRoute = gatewayCanvasOpenClawCompatPath(routePath)
+                    if (compatRoute != routePath) {
+                        s.distributor.register(compatRoute, { ctx =>
+                            gatewayCanvasReplyAsset(ctx, canonicalRoot, requestPath, "")
+                        })
+                    }
+                }
             }
             for (routeValue in gatewayCanvasA2uiRegisteredRoutes().getItems()) {
                 let routePath = try {
@@ -722,12 +764,21 @@ public class GatewayCanvasHostRuntime {
                 s.distributor.register(routePath, { ctx =>
                     gatewayCanvasReplyUnauthorized(ctx)
                 })
+                if (gatewayCanvasCompatRoutesEnabled(cfg)) {
+                    let compatRoute = gatewayCanvasOpenClawCompatPath(routePath)
+                    if (compatRoute != routePath) {
+                        s.distributor.register(compatRoute, { ctx =>
+                            gatewayCanvasReplyUnauthorized(ctx)
+                        })
+                    }
+                }
             }
             server = Some(s)
             started = true
             rootPath = canonicalRoot.toString()
             listenPort = gatewayCanvasPortToUInt16(cfg.canvas.port, 18793u16)
-            registeredRoutes = routes
+            canonicalRoutes = routes
+            registeredRoutes = publicRoutes
             lastErrorKind = ""
             if (cfg.canvas.liveReload) {
                 GatewayCanvasHostRuntime.startLiveReloadPoller(canonicalRoot)
@@ -828,7 +879,7 @@ public class GatewayCanvasHostRuntime {
             if (let Some(s) <- server) {
                 let root = Path(rootPath)
                 let registeredScopedRoutes = ArrayList<String>()
-                for (routeValue in registeredRoutes.getItems()) {
+                for (routeValue in canonicalRoutes.getItems()) {
                     let routePath = try {
                         routeValue.asString().getValue()
                     } catch (_: Exception) {
@@ -846,6 +897,15 @@ public class GatewayCanvasHostRuntime {
                     s.distributor.register(scopedRoute, { ctx =>
                         gatewayCanvasReplyAsset(ctx, root, requestPath, normalizedToken)
                     })
+                    if (gatewayCanvasCompatRoutesEnabled(cfg)) {
+                        let compatScopedRoute = gatewayCanvasOpenClawCompatPath(scopedRoute)
+                        if (!registeredScopedRoutes.contains(compatScopedRoute)) {
+                            registeredScopedRoutes.add(compatScopedRoute)
+                            s.distributor.register(compatScopedRoute, { ctx =>
+                                gatewayCanvasReplyAsset(ctx, root, requestPath, normalizedToken)
+                            })
+                        }
+                    }
                 }
                 for (routeValue in gatewayCanvasA2uiRegisteredRoutes().getItems()) {
                     let routePath = try {
@@ -865,6 +925,15 @@ public class GatewayCanvasHostRuntime {
                     s.distributor.register(scopedRoute, { ctx =>
                         gatewayCanvasReplyA2uiAsset(ctx, requestPath, normalizedToken)
                     })
+                    if (gatewayCanvasCompatRoutesEnabled(cfg)) {
+                        let compatScopedRoute = gatewayCanvasOpenClawCompatPath(scopedRoute)
+                        if (!registeredScopedRoutes.contains(compatScopedRoute)) {
+                            registeredScopedRoutes.add(compatScopedRoute)
+                            s.distributor.register(compatScopedRoute, { ctx =>
+                                gatewayCanvasReplyA2uiAsset(ctx, requestPath, normalizedToken)
+                            })
+                        }
+                    }
                 }
                 let actionRoute = gatewayCanvasA2uiRoutePrefix() + "/cap/${normalizedToken}/action"
                 if (!registeredScopedRoutes.contains(actionRoute)) {
@@ -872,6 +941,15 @@ public class GatewayCanvasHostRuntime {
                     s.distributor.register(actionRoute, { ctx =>
                         gatewayCanvasReplyA2uiAction(ctx, normalizedToken)
                     })
+                }
+                if (gatewayCanvasCompatRoutesEnabled(cfg)) {
+                    let compatActionRoute = gatewayCanvasOpenClawCompatPath(actionRoute)
+                    if (!registeredScopedRoutes.contains(compatActionRoute)) {
+                        registeredScopedRoutes.add(compatActionRoute)
+                        s.distributor.register(compatActionRoute, { ctx =>
+                            gatewayCanvasReplyA2uiAction(ctx, normalizedToken)
+                        })
+                    }
                 }
             }
         }
@@ -890,6 +968,7 @@ public class GatewayCanvasHostRuntime {
             started = false
             server = None
             rootPath = ""
+            canonicalRoutes = JsonArray([])
             registeredRoutes = JsonArray([])
             lastErrorKind = ""
         }
@@ -962,6 +1041,7 @@ public func gatewayCanvasResolveRootState(cfg: GatewayConfig): JsonObject {
     root.put("root", JsonString(cfg.canvas.root))
     root.put("port", cfg.canvas.port.toJsonValue())
     root.put("liveReload", cfg.canvas.liveReload.toJsonValue())
+    root.put("openClawCompat", cfg.canvas.openClawCompat.toJsonValue())
     root.put("hostStarted", false.toJsonValue())
     root.put("httpUrl", JsonString(""))
     root.put("healthy", false.toJsonValue())

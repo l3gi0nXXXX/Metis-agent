@@ -240,7 +240,8 @@ private func buildGatewayCanvasConfig(user: GatewayCanvasHostUserSettings): Gate
         enabled: user.enabled,
         root: user.root,
         port: user.port,
-        liveReload: user.liveReload
+        liveReload: user.liveReload,
+        openClawCompat: user.openClawCompat
     )
 }
 

@@ -76,6 +76,7 @@ public struct GatewayCanvasHostUserSettings {
     public var root: String = ""
     public var port: Int64 = 18793
     public var liveReload: Bool = true
+    public var openClawCompat: Bool = false
 }
 
 @jsonable

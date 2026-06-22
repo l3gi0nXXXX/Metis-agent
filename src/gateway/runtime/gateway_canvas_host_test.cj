@@ -39,12 +39,13 @@ private func withGatewayCanvasTestRoot<T>(block: (Path) -> T): T {
     }
 }
 
-private func canvasTestUserSettings(enabled: Bool, root: String, port!: Int64 = 18793): GatewayUserSettings {
+private func canvasTestUserSettings(enabled: Bool, root: String, port!: Int64 = 18793, openClawCompat!: Bool = false): GatewayUserSettings {
     var user = GatewayUserSettings()
     user.canvas.enabled = enabled
     user.canvas.root = root
     user.canvas.port = port
     user.canvas.liveReload = true
+    user.canvas.openClawCompat = openClawCompat
     user
 }
 
@@ -54,8 +55,8 @@ private func canvasTestUserSettingsWithLiveReload(enabled: Bool, root: String, p
     user
 }
 
-private func canvasTestConfig(enabled: Bool, root: String, port!: Int64 = 18793): GatewayConfig {
-    buildGatewayConfigFromUserSettings(canvasTestUserSettings(enabled, root, port: port))
+private func canvasTestConfig(enabled: Bool, root: String, port!: Int64 = 18793, openClawCompat!: Bool = false): GatewayConfig {
+    buildGatewayConfigFromUserSettings(canvasTestUserSettings(enabled, root, port: port, openClawCompat: openClawCompat))
 }
 
 private func canvasTestString(obj: JsonObject, key: String): String {
@@ -294,6 +295,91 @@ public class GatewayCanvasHostRootStateTest {
             @Expect(canvasJsonArrayContains(routes, "/__metis__/canvas/"), true)
             @Expect(canvasJsonArrayContains(routes, "/__metis__/canvas/app.js"), true)
             @Expect(routes.toJsonString().contains(root.toString()), false)
+        })
+    }
+
+    @TestCase
+    public func openClawCompatRoutesAreDisabledByDefault(): Unit {
+        withGatewayCanvasTestRoot<Unit>({ root =>
+            File.writeTo(root.join("index.html"), "<html>metis</html>".toArray())
+            let cfg = canvasTestConfig(true, root.toString(), port: canvasTestPort())
+            let routes = gatewayCanvasRegisteredRoutes(cfg)
+            @Expect(gatewayCanvasCompatRoutesEnabled(cfg), false)
+            @Expect(canvasJsonArrayContains(routes, "/__metis__/canvas/"), true)
+            @Expect(routes.toJsonString().contains("/__openclaw__/"), false)
+            @Expect(gatewayCanvasOpenClawCompatPath("/__metis__/canvas/cap/token/app.js"), "/__openclaw__/canvas/cap/token/app.js")
+            @Expect(gatewayCanvasOpenClawCompatPath("/__metis__/a2ui/cap/token/action"), "/__openclaw__/a2ui/cap/token/action")
+        })
+    }
+
+    @TestCase
+    public func openClawCompatRoutesAreRegisteredOnlyWhenEnabled(): Unit {
+        withGatewayCanvasTestRoot<Unit>({ root =>
+            File.writeTo(root.join("index.html"), "<html>metis</html>".toArray())
+            File.writeTo(root.join("app.js"), "console.log('metis')".toArray())
+            let cfg = canvasTestConfig(true, root.toString(), port: canvasTestPort(), openClawCompat: true)
+            let routes = gatewayCanvasRegisteredRoutes(cfg)
+            @Expect(gatewayCanvasCompatRoutesEnabled(cfg), true)
+            @Expect(canvasJsonArrayContains(routes, "/__metis__/canvas/"), true)
+            @Expect(canvasJsonArrayContains(routes, "/__openclaw__/canvas/"), true)
+            @Expect(canvasJsonArrayContains(routes, "/__openclaw__/canvas/app.js"), true)
+            @Expect(routes.toJsonString().contains("lobster"), false)
+            @Expect(routes.toJsonString().contains("openclaw/assets"), false)
+        })
+    }
+
+    @TestCase
+    public func openClawCompatAliasUsesSameCapabilityHandler(): Unit {
+        withGatewayCanvasTestRoot<Unit>({ root =>
+            File.writeTo(root.join("index.html"), "<html><body>metis compat canvas</body></html>".toArray())
+            let port = canvasTestPort()
+            let cfg = canvasTestConfig(true, root.toString(), port: port, openClawCompat: true)
+            try {
+                debugGatewayCanvasClearNodeSessionsForTest()
+                GatewayCanvasHostRuntime.startIfNeeded(cfg)
+                let unauth = canvasFetch("http://127.0.0.1:${port}/__openclaw__/canvas/")
+                @Expect(unauth.status, 401)
+
+                let scopedUrl = canvasScopedUrlForTest(cfg, "node-openclaw-compat")
+                let compatScopedUrl = scopedUrl.replace("/__metis__/canvas/", "/__openclaw__/canvas/")
+                let canonical = canvasFetch(scopedUrl)
+                let compat = canvasFetch(compatScopedUrl)
+                @Expect(canonical.status, 200)
+                @Expect(compat.status, 200)
+                @Expect(compat.body.contains("metis compat canvas"), true)
+
+                let state = GatewayCanvasHostRuntime.snapshot(cfg)
+                @Expect(canvasJsonArrayContains(state.get("routes").getOrThrow().asArray(), "/__openclaw__/canvas/"), true)
+                @Expect(canvasTestBool(state, "openClawCompat"), true)
+            } finally {
+                GatewayCanvasHostRuntime.stopIfRunning()
+                debugGatewayCanvasClearNodeSessionsForTest()
+            }
+        })
+    }
+
+    @TestCase
+    public func expiredCapabilityIsRejectedButRefreshedCompatUrlWorks(): Unit {
+        withGatewayCanvasTestRoot<Unit>({ root =>
+            File.writeTo(root.join("index.html"), "<html><body>fresh canvas</body></html>".toArray())
+            let port = canvasTestPort()
+            let cfg = canvasTestConfig(true, root.toString(), port: port, openClawCompat: true)
+            try {
+                debugGatewayCanvasClearNodeSessionsForTest()
+                GatewayCanvasHostRuntime.startIfNeeded(cfg)
+                debugGatewayCanvasPutCapabilityForTest("expired-token", "node-refresh", "node", gatewayCanvasCapabilityNowMs() - 1000)
+                GatewayCanvasHostRuntime.registerCapabilityRoutes(cfg, "expired-token")
+                let expired = canvasFetch(gatewayCanvasScopedRouteUrl(cfg, "expired-token"))
+                @Expect(expired.status, 401)
+
+                let freshScopedUrl = canvasScopedUrlForTest(cfg, "node-refresh")
+                let fresh = canvasFetch(freshScopedUrl.replace("/__metis__/canvas/", "/__openclaw__/canvas/"))
+                @Expect(fresh.status, 200)
+                @Expect(fresh.body.contains("fresh canvas"), true)
+            } finally {
+                GatewayCanvasHostRuntime.stopIfRunning()
+                debugGatewayCanvasClearNodeSessionsForTest()
+            }
         })
     }
 
