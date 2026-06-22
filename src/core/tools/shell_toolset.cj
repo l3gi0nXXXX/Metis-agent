@@ -3,6 +3,7 @@ package metis.core.tools
 import magic.dsl.*
 import magic.prelude.*
 
+import metis.core.resolveCurrentCronShellExecutionDecision
 import metis.io.{InputUtils, PrintUtils, Confirmation}
 import metis.utils.*
 
@@ -197,8 +198,25 @@ private let TOOL_DESCRIPTION = COMMON_GUIDELINES + specificGuidelines
     }
 ]
 protected func shellExecute(path: String, command: String, description: Option<String>, interactive: Option<Bool>): String {
-    if (InputUtils.confirm("Shell", description ?? "", command) == Confirmation.Deny) {
-        return "User denied the operation"
+    coreShellExecuteInternal(path, command, description, interactive, true)
+}
+
+private func coreShellPrintToolResult(text: String, emitToolResult: Bool): Unit {
+    if (emitToolResult) {
+        PrintUtils.printToolResult(text)
+    }
+}
+
+private func coreShellExecuteInternal(path: String, command: String, description: Option<String>, interactive: Option<Bool>, emitToolResult: Bool): String {
+    let cronDecision = resolveCurrentCronShellExecutionDecision(command)
+    if (cronDecision.applies) {
+        if (!cronDecision.approved) {
+            return cronDecision.message
+        }
+    } else {
+        if (InputUtils.confirm("Shell", description ?? "", command) == Confirmation.Deny) {
+            return "User denied the operation"
+        }
     }
 
     try {
@@ -229,21 +247,25 @@ protected func shellExecute(path: String, command: String, description: Option<S
 
             if (exitCode == 0) {
                 let outString = stdout.trimAscii()
-                PrintUtils.printToolResult(outString)
+                coreShellPrintToolResult(outString, emitToolResult)
                 return "Command executed successfully, output:\n${outString}"
             } else {
                 let errString = stderr.trimAscii()
-                PrintUtils.printToolResult(errString)
+                coreShellPrintToolResult(errString, emitToolResult)
                 return "Command execution failed, error output:\n${errString}"
             }
         }
     } catch (e: ShellTimeoutException) {
-        PrintUtils.printToolResult("Timeout")
+        coreShellPrintToolResult("Timeout", emitToolResult)
         return "Command execution timeout after 3 minutes: ${e.message}\n\nThe command appears to be a daemon/server process or is taking too long to execute.\n\nSuggestions:\n1. If this is a server/daemon (like 'python3 -m http.server'), it should be run in the background manually\n2. If the command legitimately needs more time, consider breaking it into smaller steps\n3. Check if the command is stuck waiting for input or has encountered an error"
     } catch (e: Exception) {
-        PrintUtils.printToolResult("Exception")
+        coreShellPrintToolResult("Exception", emitToolResult)
         return "Exception occurred while executing command: ${e}\nCommand: ${command}"
     }
+}
+
+public func debugCoreShellExecuteForTest(path: String, command: String, description: Option<String>, interactive: Option<Bool>): String {
+    coreShellExecuteInternal(path, command, description, interactive, false)
 }
 
 @toolset[

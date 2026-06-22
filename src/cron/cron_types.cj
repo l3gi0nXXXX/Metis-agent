@@ -1,5 +1,31 @@
 package metis.cron
 
+import std.collection.ArrayList
+
+public func cronNormalizeToolExecMode(raw: String): String {
+    let mode = raw.trimAscii().toAsciiLower()
+    if (mode == "allowlist" || mode == "yolo") {
+        return mode
+    }
+    "deny"
+}
+
+public func cronToolExecModeIsValid(raw: String): Bool {
+    let mode = raw.trimAscii().toAsciiLower()
+    mode == "deny" || mode == "allowlist" || mode == "yolo"
+}
+
+public func cronNormalizeToolExecAllowlist(values: Array<String>): Array<String> {
+    let out = ArrayList<String>()
+    for (value in values) {
+        let trimmed = value.trimAscii()
+        if (!trimmed.isEmpty() && !out.contains(trimmed)) {
+            out.add(trimmed)
+        }
+    }
+    out.toArray()
+}
+
 /**
  * 对齐参考实现的 `CronSchedule`：`every`、`at`、五段式 `cron`（`cronExpr` + `timeZone`）、可选 `staggerMs`。
  */
@@ -122,6 +148,9 @@ public class CronJob {
     public var lightContext: Bool
     public var deliveryAccountId: String
     public var bestEffortDeliver: Bool
+    /** cron/headless shell/network 工具执行策略：deny | allowlist | yolo。 */
+    public var toolExecMode: String
+    public var toolExecAllowlist: Array<String>
     public var failureAccountId: String
     /** >0：连续失败 N 次后才发 failure 通知（简化为与 lastFailureAlertAtMs 配合的门槛）。 */
     public var failureAlertAfter: Int64
@@ -159,6 +188,8 @@ public class CronJob {
         lightContext!: Bool = false,
         deliveryAccountId!: String = "",
         bestEffortDeliver!: Bool = false,
+        toolExecMode!: String = "deny",
+        toolExecAllowlist!: Array<String> = [],
         failureAccountId!: String = "",
         failureAlertAfter!: Int64 = 0,
         failureAlertCooldownMs!: Int64 = 0
@@ -194,6 +225,8 @@ public class CronJob {
         this.lightContext = lightContext
         this.deliveryAccountId = deliveryAccountId
         this.bestEffortDeliver = bestEffortDeliver
+        this.toolExecMode = cronNormalizeToolExecMode(toolExecMode)
+        this.toolExecAllowlist = cronNormalizeToolExecAllowlist(toolExecAllowlist)
         this.failureAccountId = failureAccountId
         this.failureAlertAfter = failureAlertAfter
         this.failureAlertCooldownMs = failureAlertCooldownMs

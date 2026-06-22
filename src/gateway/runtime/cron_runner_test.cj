@@ -1,6 +1,7 @@
 package metis.gateway.runtime
 
 import metis.core.config.{CliConfig, CliSettingManager, MetisConfigManager, MetisProcessEnvironmentLock}
+import metis.gateway.tools.debugGatewayShellExecuteForTest
 import metis.cron.{
     CronJob,
     CronJobState,
@@ -14,7 +15,7 @@ import metis.cron.{
     readCronRunLogEntriesForJob,
     setCronWebhookHttpRunnerForTest
 }
-import metis.gateway.core.{ChannelAdapter, GatewayRouter, GatewayService}
+import metis.gateway.core.{ChannelAdapter, GatewayRouter, GatewayService, setGatewayAgentBridgeReplyRunnerForTest}
 import metis.gateway.model.{ChannelPolicyConfig, InboundMessage, OutboundMessage, SendResult}
 import metis.gateway.session.{GatewayIngressSource, GatewaySessionRequest, GatewayTurnContext, gatewayIngressSourceLabel}
 
@@ -127,6 +128,14 @@ private func cronRunnerTestGateway(adapter: CronRunnerTestChannelAdapter, channe
     let service = GatewayService(GatewayRouter(HashMap<String, ChannelPolicyConfig>()))
     service.registerAdapter(adapter, channelId: channelId, accountId: accountId)
     service
+}
+
+private func cronRunnerRepeatedText(text: String, count: Int64): String {
+    let out = StringBuilder()
+    for (_ in 0..count) {
+        out.append(text)
+    }
+    out.toString()
 }
 
 @Test
@@ -346,13 +355,19 @@ public class CronRunnerDeliveryTest {
             deliveryChannel: "feishu",
             deliveryTo: "chat-1",
             deliveryAccountId: "tenant-a",
-            deliveryMode: "announce"
+            deliveryMode: "announce",
+            toolExecMode: "allowlist",
+            toolExecAllowlist: ["curl"]
         )
         let request = cronBuildSessionRequest(job, 12345)
         @Expect(request.deliver, true)
         @Expect(request.replyChannel, "feishu")
         @Expect(request.replyTo, "chat-1")
         @Expect(request.replyAccountId, "tenant-a")
+        @Expect(request.cronJobId, "job-deliver")
+        @Expect(request.toolExecMode, "allowlist")
+        @Expect(request.toolExecAllowlist.size, 1)
+        @Expect(request.toolExecAllowlist[0], "curl")
     }
 
     @TestCase
@@ -455,6 +470,108 @@ public class CronRunnerDeliveryTest {
             @Expect(row.get("deliveryStatus").getOrThrow().asString().getValue(), "not-delivered")
             @Expect(row.get("deliveryError").getOrThrow().asString().getValue().contains("announce delivery failed"), true)
             @Expect(row.get("deliveryError").getOrThrow().asString().getValue().contains("fake send failed"), true)
+        })
+    }
+
+    @TestCase
+    public func cronAllowlistShellToolFeedsLongUtf8DeliveryThroughSessionLoop(): Unit {
+        withCronRunnerTestHome({ storePath: Path =>
+            let longNews = cronRunnerRepeatedText("新闻🙂中文段落；", 420)
+            let job = CronJob(
+                "p5-allowlist-tool-delivery",
+                "collect news through shell",
+                CronSchedule.every(60000),
+                state: CronJobState(nextRunAtMs: 1),
+                deliveryChannel: "telegram",
+                deliveryTo: "user:8734062810",
+                deliveryMode: "announce",
+                toolExecMode: "allowlist",
+                toolExecAllowlist: ["printf"]
+            )
+            cronSave(storePath, [job])
+            setGatewayAgentBridgeReplyRunnerForTest(Some({
+                _conversationKey: String,
+                _prompt: String,
+                _channelName: String,
+                _agentId: String,
+                _streamingEnabled: Bool,
+                _streamChunkHook: Option<(String) -> Unit> =>
+                    debugGatewayShellExecuteForTest(
+                        CliConfig.cwd.toString(),
+                        "printf '${longNews}'",
+                        None<String>,
+                        Some(false)
+                    )
+            }))
+            try {
+                let adapter = CronRunnerTestChannelAdapter("telegram", messageId: "tg-1")
+                let service = cronRunnerTestGateway(adapter, "telegram", "")
+
+                let result = CronRunner.runJobOnceFromStore(Some(service), storePath, "p5-allowlist-tool-delivery", true)
+                @Expect(result.get("ok").getOrThrow().asBool().getValue(), true)
+                @Expect(adapter.sendCount, 1)
+                @Expect(adapter.lastText.contains("Command executed successfully"), true)
+                @Expect(adapter.lastText.contains("新闻🙂中文段落"), true)
+                @Expect(adapter.lastText.size > 4000, true)
+
+                let jobs = cronLoadOrEmpty(storePath)
+                @Expect(jobs[0].state.lastStatus, "success")
+                let runs = readCronRunLogEntriesForJob(storePath, "p5-allowlist-tool-delivery", limit: 10)
+                let row = runs.get("entries").getOrThrow().asArray()[0].asObject()
+                @Expect(row.get("deliveryStatus").getOrThrow().asString().getValue(), "delivered")
+            } finally {
+                setGatewayAgentBridgeReplyRunnerForTest(None<(String, String, String, String, Bool, Option<(String) -> Unit>) -> String>)
+            }
+        })
+    }
+
+    @TestCase
+    public func cronDefaultDenyShellToolReturnsBlockedWithoutWaitingForApproval(): Unit {
+        withCronRunnerTestHome({ storePath: Path =>
+            let job = CronJob(
+                "p5-deny-tool",
+                "collect news through shell",
+                CronSchedule.every(60000),
+                state: CronJobState(nextRunAtMs: 1),
+                deliveryChannel: "telegram",
+                deliveryTo: "user:8734062810",
+                deliveryMode: "announce"
+            )
+            cronSave(storePath, [job])
+            setGatewayAgentBridgeReplyRunnerForTest(Some({
+                _conversationKey: String,
+                _prompt: String,
+                _channelName: String,
+                _agentId: String,
+                _streamingEnabled: Bool,
+                _streamChunkHook: Option<(String) -> Unit> =>
+                    debugGatewayShellExecuteForTest(
+                        CliConfig.cwd.toString(),
+                        "printf should-not-run",
+                        None<String>,
+                        Some(false)
+                    )
+            }))
+            try {
+                let adapter = CronRunnerTestChannelAdapter("telegram", messageId: "tg-1")
+                let service = cronRunnerTestGateway(adapter, "telegram", "")
+
+                let result = CronRunner.runJobOnceFromStore(Some(service), storePath, "p5-deny-tool", true)
+                @Expect(result.get("ok").getOrThrow().asBool().getValue(), true)
+                @Expect(adapter.sendCount, 1)
+                @Expect(adapter.lastText.contains("Cron/headless shell execution blocked"), true)
+                @Expect(adapter.lastText.contains("cron cannot wait for interactive approval"), true)
+                @Expect(adapter.lastText.contains("should-not-run"), true)
+                @Expect(adapter.lastText.contains("Command executed successfully"), false)
+
+                let jobs = cronLoadOrEmpty(storePath)
+                @Expect(jobs[0].state.lastStatus, "success")
+                let runs = readCronRunLogEntriesForJob(storePath, "p5-deny-tool", limit: 10)
+                let row = runs.get("entries").getOrThrow().asArray()[0].asObject()
+                @Expect(row.get("deliveryStatus").getOrThrow().asString().getValue(), "delivered")
+            } finally {
+                setGatewayAgentBridgeReplyRunnerForTest(None<(String, String, String, String, Bool, Option<(String) -> Unit>) -> String>)
+            }
         })
     }
 

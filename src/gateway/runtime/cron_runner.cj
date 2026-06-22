@@ -1124,6 +1124,9 @@ public func cronBuildSessionRequest(job: CronJob, startedAtMs: Int64): GatewaySe
         replyChannel: replyChannel,
         replyTo: replyTo,
         replyAccountId: if (deliver) { dplan.accountId } else { "" },
-        deliver: deliver
+        deliver: deliver,
+        cronJobId: job.id,
+        toolExecMode: job.toolExecMode,
+        toolExecAllowlist: job.toolExecAllowlist
     )
 }

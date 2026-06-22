@@ -172,7 +172,8 @@ private func cronHelpText(): String {
         "  gateway cron add ... [--max-retries 2] [--retry-backoff-ms 1000]\n" +
         "  gateway cron update --job-id <jobId> [--failure-channel feishu] [--failure-to <chat_id>] [--failure-announce]\n" +
         "  add/update also supports: --description --delete-after-run --agent-id --session-key --model --thinking-level --light-context\n" +
-        "  --delivery-account-id --best-effort-deliver --failure-account-id --failure-alert-after N --failure-alert-cooldown-ms N\n" +
+        "  --delivery-account-id --best-effort-deliver --tool-exec-mode <mode> --tool-exec-allow <prefix>\n" +
+        "  --failure-account-id --failure-alert-after N --failure-alert-cooldown-ms N\n" +
         "\n" +
         "Notes:\n" +
         "  session selects the execution target.\n" +
@@ -276,6 +277,8 @@ private func cronSubcommandHelpText(subCmdNorm: String): String {
             "  --no-light-context\n" +
             "  --delivery-account-id <id>   Multi-account delivery id\n" +
             "  --best-effort-deliver        Do not fail the job if delivery fails\n" +
+            "  --tool-exec-mode <mode>      Cron shell policy: deny | allowlist | yolo\n" +
+            "  --tool-exec-allow <prefix>   Allowlisted command prefix; may repeat\n" +
             "  --failure-account-id <id>    Account for the failure channel\n" +
             "  --failure-alert-after <n>    Failures before alerting\n" +
             "  --failure-alert-cooldown-ms <n>  Minimum ms between failure alerts\n" +
@@ -327,6 +330,8 @@ private func cronSubcommandHelpText(subCmdNorm: String): String {
             "  --delivery-account-id <id> Delivery account id\n" +
             "  --best-effort-deliver      Do not fail the job if delivery fails\n" +
             "  --no-best-effort-deliver\n" +
+            "  --tool-exec-mode <mode>    Cron shell policy: deny | allowlist | yolo\n" +
+            "  --tool-exec-allow <prefix> Replace allowlist with command prefix; may repeat\n" +
             "  --failure-account-id <id>  Failure account id\n" +
             "  --failure-alert-after <n>  Failures before alerting\n" +
             "  --failure-alert-cooldown-ms <n>  Minimum ms between failure alerts\n" +
@@ -556,6 +561,12 @@ private func cronJobToJson(j: CronJob): JsonObject {
     o.put("lightContext", JsonBool(j.lightContext))
     o.put("deliveryAccountId", JsonString(j.deliveryAccountId))
     o.put("bestEffortDeliver", JsonBool(j.bestEffortDeliver))
+    o.put("toolExecMode", JsonString(cronNormalizeToolExecMode(j.toolExecMode)))
+    let toolExecAllowlist = JsonArray([])
+    for (entry in cronNormalizeToolExecAllowlist(j.toolExecAllowlist)) {
+        toolExecAllowlist.add(JsonString(entry))
+    }
+    o.put("toolExecAllowlist", toolExecAllowlist)
     o.put("failureAccountId", JsonString(j.failureAccountId))
     o.put("failureAlertAfter", JsonInt(j.failureAlertAfter))
     o.put("failureAlertCooldownMs", JsonInt(j.failureAlertCooldownMs))
@@ -610,6 +621,12 @@ private func formatCronJobMutationForHuman(action: String, j: CronJob, path: Pat
     }
     if (!j.deliveryChannel.trimAscii().isEmpty() || !j.deliveryTo.trimAscii().isEmpty()) {
         lines.add("Delivery: ${if (j.deliveryChannel.trimAscii().isEmpty()) { "default" } else { j.deliveryChannel }} -> ${if (j.deliveryTo.trimAscii().isEmpty()) { "(not set)" } else { j.deliveryTo }}")
+    }
+    let toolExecMode = cronNormalizeToolExecMode(j.toolExecMode)
+    lines.add("Tool exec: ${toolExecMode}")
+    let toolExecAllowlistSize = cronNormalizeToolExecAllowlist(j.toolExecAllowlist).size
+    if (toolExecAllowlistSize > 0) {
+        lines.add("Tool exec allowlist: ${toolExecAllowlistSize} entries")
     }
     if (j.state.nextRunAtMs > 0) {
         lines.add("Next run: ${j.state.nextRunAtMs}")
@@ -948,6 +965,8 @@ private func cronCmdAddNamed(path: Path, sub: Array<String>): (String, Int64) {
     var lightContext = false
     var deliveryAccountId = ""
     var bestEffortDeliver = false
+    var toolExecMode = "deny"
+    let toolExecAllowlist = ArrayList<String>()
     var failureAccountId = ""
     var failureAlertAfter: Int64 = 0
     var failureAlertCooldownMs: Int64 = 0
@@ -1259,6 +1278,32 @@ private func cronCmdAddNamed(path: Path, sub: Array<String>): (String, Int64) {
             i += 1
             continue
         }
+        if (k == "--tool-exec-mode") {
+            if (i + 1 >= sub.size) {
+                return cronErr("invalid cron.add params: missing --tool-exec-mode value")
+            }
+            let mode = sub[i + 1].trimAscii().toAsciiLower()
+            if (!cronToolExecModeIsValid(mode)) {
+                return cronErr("invalid cron.add params: --tool-exec-mode must be deny, allowlist, or yolo")
+            }
+            toolExecMode = mode
+            i += 2
+            continue
+        }
+        if (k == "--tool-exec-allow" || k == "--tool-exec-allowlist") {
+            if (i + 1 >= sub.size) {
+                return cronErr("invalid cron.add params: missing --tool-exec-allow value")
+            }
+            let prefix = sub[i + 1].trimAscii()
+            if (prefix.isEmpty()) {
+                return cronErr("invalid cron.add params: --tool-exec-allow must not be empty")
+            }
+            if (!toolExecAllowlist.contains(prefix)) {
+                toolExecAllowlist.add(prefix)
+            }
+            i += 2
+            continue
+        }
         if (k == "--payload-kind") {
             if (i + 1 >= sub.size) {
                 return cronErr("invalid cron.add params: missing --payload-kind value")
@@ -1401,6 +1446,8 @@ private func cronCmdAddNamed(path: Path, sub: Array<String>): (String, Int64) {
             lightContext: lightContext,
             deliveryAccountId: deliveryAccountId,
             bestEffortDeliver: bestEffortDeliver,
+            toolExecMode: toolExecMode,
+            toolExecAllowlist: toolExecAllowlist.toArray(),
             failureAccountId: failureAccountId,
             failureAlertAfter: failureAlertAfter,
             failureAlertCooldownMs: failureAlertCooldownMs
@@ -1441,6 +1488,8 @@ private func cronCmdAddNamed(path: Path, sub: Array<String>): (String, Int64) {
             lightContext: lightContext,
             deliveryAccountId: deliveryAccountId,
             bestEffortDeliver: bestEffortDeliver,
+            toolExecMode: toolExecMode,
+            toolExecAllowlist: toolExecAllowlist.toArray(),
             failureAccountId: failureAccountId,
             failureAlertAfter: failureAlertAfter,
             failureAlertCooldownMs: failureAlertCooldownMs
@@ -1481,6 +1530,8 @@ private func cronCmdAddNamed(path: Path, sub: Array<String>): (String, Int64) {
             lightContext: lightContext,
             deliveryAccountId: deliveryAccountId,
             bestEffortDeliver: bestEffortDeliver,
+            toolExecMode: toolExecMode,
+            toolExecAllowlist: toolExecAllowlist.toArray(),
             failureAccountId: failureAccountId,
             failureAlertAfter: failureAlertAfter,
             failureAlertCooldownMs: failureAlertCooldownMs
@@ -1702,6 +1753,9 @@ private func cronCmdUpdate(path: Path, sub: Array<String>): (String, Int64) {
             var lightContextOpt: Option<Bool> = None<Bool>
             var deliveryAccountIdOpt: Option<String> = None<String>
             var bestEffortDeliverOpt: Option<Bool> = None<Bool>
+            var toolExecModeOpt: Option<String> = None<String>
+            let toolExecAllowlistPatch = ArrayList<String>()
+            var toolExecAllowlistSet = false
             var failureAccountIdOpt: Option<String> = None<String>
             var failureAlertAfterOpt: Option<Int64> = None<Int64>
             var failureAlertCooldownOpt: Option<Int64> = None<Int64>
@@ -2045,6 +2099,35 @@ private func cronCmdUpdate(path: Path, sub: Array<String>): (String, Int64) {
                     i += 1
                     continue
                 }
+                if (k == "--tool-exec-mode") {
+                    if (i + 1 >= sub.size) {
+                        return cronErr("invalid cron.update params: missing --tool-exec-mode value")
+                    }
+                    let mode = sub[i + 1].trimAscii().toAsciiLower()
+                    if (!cronToolExecModeIsValid(mode)) {
+                        return cronErr("invalid cron.update params: --tool-exec-mode must be deny, allowlist, or yolo")
+                    }
+                    toolExecModeOpt = Some(mode)
+                    touched = true
+                    i += 2
+                    continue
+                }
+                if (k == "--tool-exec-allow" || k == "--tool-exec-allowlist") {
+                    if (i + 1 >= sub.size) {
+                        return cronErr("invalid cron.update params: missing --tool-exec-allow value")
+                    }
+                    let prefix = sub[i + 1].trimAscii()
+                    if (prefix.isEmpty()) {
+                        return cronErr("invalid cron.update params: --tool-exec-allow must not be empty")
+                    }
+                    if (!toolExecAllowlistPatch.contains(prefix)) {
+                        toolExecAllowlistPatch.add(prefix)
+                    }
+                    toolExecAllowlistSet = true
+                    touched = true
+                    i += 2
+                    continue
+                }
                 if (k == "--payload-kind") {
                     if (i + 1 >= sub.size) {
                         return cronErr("invalid cron.update params: missing --payload-kind value")
@@ -2163,6 +2246,8 @@ private func cronCmdUpdate(path: Path, sub: Array<String>): (String, Int64) {
                     if (let Some(v) <- lightContextOpt) { j.lightContext = v }
                     if (let Some(v) <- deliveryAccountIdOpt) { j.deliveryAccountId = v }
                     if (let Some(v) <- bestEffortDeliverOpt) { j.bestEffortDeliver = v }
+                    if (let Some(v) <- toolExecModeOpt) { j.toolExecMode = cronNormalizeToolExecMode(v) }
+                    if (toolExecAllowlistSet) { j.toolExecAllowlist = cronNormalizeToolExecAllowlist(toolExecAllowlistPatch.toArray()) }
                     if (let Some(v) <- payloadKindOpt) { j.payloadKind = v }
                     if (let Some(v) <- deliveryModeOpt) { j.deliveryMode = v }
                     if (let Some(v) <- failureDestModeOpt) { j.failureDestMode = v }

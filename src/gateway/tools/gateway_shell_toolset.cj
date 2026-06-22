@@ -3,6 +3,7 @@ package metis.gateway.tools
 import magic.dsl.{tool, toolset}
 import magic.prelude.*
 
+import metis.core.resolveCurrentCronShellExecutionDecision
 import metis.io.{InputUtils, PrintUtils, Confirmation}
 import metis.utils.{ShellUtils, ShellTimeoutException}
 
@@ -18,8 +19,25 @@ import std.fs.Path
     }
 ]
 protected func shellExecute(path: String, command: String, description: Option<String>, interactive: Option<Bool>): String {
-    if (InputUtils.confirm("Shell", description ?? "", command) == Confirmation.Deny) {
-        return "User denied the operation"
+    gatewayShellExecuteInternal(path, command, description, interactive, true)
+}
+
+private func gatewayShellPrintToolResult(text: String, emitToolResult: Bool): Unit {
+    if (emitToolResult) {
+        PrintUtils.printToolResult(text)
+    }
+}
+
+private func gatewayShellExecuteInternal(path: String, command: String, description: Option<String>, interactive: Option<Bool>, emitToolResult: Bool): String {
+    let cronDecision = resolveCurrentCronShellExecutionDecision(command)
+    if (cronDecision.applies) {
+        if (!cronDecision.approved) {
+            return cronDecision.message
+        }
+    } else {
+        if (InputUtils.confirm("Shell", description ?? "", command) == Confirmation.Deny) {
+            return "User denied the operation"
+        }
     }
 
     try {
@@ -48,19 +66,23 @@ protected func shellExecute(path: String, command: String, description: Option<S
         )
         if (exitCode == 0) {
             let outString = stdout.trimAscii()
-            PrintUtils.printToolResult(outString)
+            gatewayShellPrintToolResult(outString, emitToolResult)
             return "Command executed successfully, output:\n${outString}"
         }
         let errString = stderr.trimAscii()
-        PrintUtils.printToolResult(errString)
+        gatewayShellPrintToolResult(errString, emitToolResult)
         return "Command execution failed, error output:\n${errString}"
     } catch (e: ShellTimeoutException) {
-        PrintUtils.printToolResult("Timeout")
+        gatewayShellPrintToolResult("Timeout", emitToolResult)
         return "Command execution timeout after 3 minutes: ${e.message}"
     } catch (e: Exception) {
-        PrintUtils.printToolResult("Exception")
+        gatewayShellPrintToolResult("Exception", emitToolResult)
         return "Exception occurred while executing command: ${e}\nCommand: ${command}"
     }
+}
+
+public func debugGatewayShellExecuteForTest(path: String, command: String, description: Option<String>, interactive: Option<Bool>): String {
+    gatewayShellExecuteInternal(path, command, description, interactive, false)
 }
 
 @toolset[

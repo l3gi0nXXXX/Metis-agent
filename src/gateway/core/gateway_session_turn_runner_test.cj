@@ -246,6 +246,72 @@ public class GatewaySessionTurnRunnerTest {
     }
 
     @TestCase
+    public func sessionRequestTurnPushesCronToolExecPolicyIntoToolContext(): Unit {
+        synchronized(MetisProcessEnvironmentLock) {
+            let home = Path(gatewaySessionTurnTtsTestHome("cron-tool-policy"))
+            let oldHome = getVariable("METIS_HOME")
+            try { remove(home, recursive: true) } catch (_e: Exception) { () }
+            Directory.create(home, recursive: true)
+            setVariable("METIS_HOME", home.toString())
+            CliConfig.invalidatePathCache()
+            MetisConfigManager.invalidate()
+            CliSettingManager.invalidate()
+
+            let captured = ArrayList<String>()
+            setGatewayAgentBridgeReplyRunnerForTest(Some({
+                _conversationKey: String,
+                _prompt: String,
+                _channelName: String,
+                _agentId: String,
+                _streamingEnabled: Bool,
+                _streamChunkHook: Option<(String) -> Unit> =>
+                    match (gatewayCurrentToolRuntimeContext()) {
+                        case Some(ctx) =>
+                            captured.add(ctx.sourceLabel)
+                            captured.add(ctx.cronJobId)
+                            captured.add(ctx.toolExecMode)
+                            captured.add("${ctx.toolExecAllowlist.size}")
+                            if (ctx.toolExecAllowlist.size > 0) {
+                                captured.add(ctx.toolExecAllowlist[0])
+                            }
+                        case None => captured.add("missing-context")
+                    }
+                    "cron tool policy ok"
+            }))
+            try {
+                let user = CliSettingManager.readGatewaySettings()
+                let request = GatewaySessionRequest(
+                    GatewayIngressSource.Cron,
+                    sessionHint: "gateway:cron:isolated:job-a",
+                    agentId: "general",
+                    text: "hello",
+                    cronJobId: "job-a",
+                    toolExecMode: "ALLOWLIST",
+                    toolExecAllowlist: ["curl", "curl"]
+                )
+                let result = gatewayExecuteSessionRequestTurnForUser(user, request, "hello")
+                @Expect(result.context.sourceLabel, "cron")
+                @Expect(captured.size, 5)
+                @Expect(captured[0], "cron")
+                @Expect(captured[1], "job-a")
+                @Expect(captured[2], "allowlist")
+                @Expect(captured[3], "1")
+                @Expect(captured[4], "curl")
+            } finally {
+                setGatewayAgentBridgeReplyRunnerForTest(None<(String, String, String, String, Bool, Option<(String) -> Unit>) -> String>)
+                match (oldHome) {
+                    case Some(value) => setVariable("METIS_HOME", value)
+                    case None => setVariable("METIS_HOME", "")
+                }
+                CliConfig.invalidatePathCache()
+                MetisConfigManager.invalidate()
+                CliSettingManager.invalidate()
+                try { remove(home, recursive: true) } catch (_e: Exception) { () }
+            }
+        }
+    }
+
+    @TestCase
     public func feishuMessageToolDeliveryDuringSessionRequestUsesCurrentGatewayHook(): Unit {
         let sentChannels = ArrayList<String>()
         let sentPeers = ArrayList<String>()

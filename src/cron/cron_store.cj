@@ -49,6 +49,29 @@ private func readBool(o: JsonObject, key: String, default!: Bool = false): Bool 
     }
 }
 
+private func readStrArray(o: JsonObject, key: String): Array<String> {
+    let out = ArrayList<String>()
+    match (o.get(key)) {
+        case Some(v) =>
+            try {
+                for (item in v.asArray().getItems()) {
+                    try {
+                        let trimmed = item.asString().getValue().trimAscii()
+                        if (!trimmed.isEmpty() && !out.contains(trimmed)) {
+                            out.add(trimmed)
+                        }
+                    } catch (_: Exception) {
+                        ()
+                    }
+                }
+            } catch (_: Exception) {
+                ()
+            }
+        case None => ()
+    }
+    out.toArray()
+}
+
 private func parseSchedule(obj: JsonObject): CronSchedule {
     let kind = readStr(obj, "kind", default: "every").trimAscii().toAsciiLower()
     let everyMs = readI64(obj, "everyMs", default: 3600000)
@@ -128,6 +151,8 @@ private func parseJob(obj: JsonObject): Option<CronJob> {
             lightContext: readBool(obj, "lightContext", default: false),
             deliveryAccountId: readStr(obj, "deliveryAccountId", default: ""),
             bestEffortDeliver: readBool(obj, "bestEffortDeliver", default: false),
+            toolExecMode: cronNormalizeToolExecMode(readStr(obj, "toolExecMode", default: "deny")),
+            toolExecAllowlist: cronNormalizeToolExecAllowlist(readStrArray(obj, "toolExecAllowlist")),
             failureAccountId: readStr(obj, "failureAccountId", default: ""),
             failureAlertAfter: readI64(obj, "failureAlertAfter", default: 0),
             failureAlertCooldownMs: readI64(obj, "failureAlertCooldownMs", default: 0)
@@ -288,6 +313,12 @@ private func jobToJson(j: CronJob): JsonObject {
     o.put("lightContext", JsonBool(j.lightContext))
     o.put("deliveryAccountId", JsonString(j.deliveryAccountId))
     o.put("bestEffortDeliver", JsonBool(j.bestEffortDeliver))
+    o.put("toolExecMode", JsonString(cronNormalizeToolExecMode(j.toolExecMode)))
+    let toolExecAllowlist = ArrayList<JsonValue>()
+    for (entry in cronNormalizeToolExecAllowlist(j.toolExecAllowlist)) {
+        toolExecAllowlist.add(JsonString(entry))
+    }
+    o.put("toolExecAllowlist", JsonArray(toolExecAllowlist))
     o.put("failureAccountId", JsonString(j.failureAccountId))
     o.put("failureAlertAfter", JsonInt(j.failureAlertAfter))
     o.put("failureAlertCooldownMs", JsonInt(j.failureAlertCooldownMs))
