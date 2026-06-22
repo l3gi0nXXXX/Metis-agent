@@ -11,6 +11,7 @@ import std.convert.Parsable
 import std.collection.ArrayList
 import std.fs.{Directory, File, Path, exists, remove}
 import std.process.executeWithOutput
+import std.sync.Mutex
 import std.time.*
 import std.unittest.testmacro.*
 import stdx.encoding.base64.toBase64String
@@ -44,6 +45,12 @@ private func canvasTestUserSettings(enabled: Bool, root: String, port!: Int64 = 
     user.canvas.root = root
     user.canvas.port = port
     user.canvas.liveReload = true
+    user
+}
+
+private func canvasTestUserSettingsWithLiveReload(enabled: Bool, root: String, port: Int64, liveReload: Bool): GatewayUserSettings {
+    var user = canvasTestUserSettings(enabled, root, port: port)
+    user.canvas.liveReload = liveReload
     user
 }
 
@@ -168,6 +175,17 @@ private func canvasScopedUrlForTest(cfg: GatewayConfig, nodeId: String): String 
         JsonObject()
     }
     canvasTestString(result, "scopedUrl")
+}
+
+private func canvasWaitUntil(timeoutMs: Int64, condition: () -> Bool): Bool {
+    let startedAt = DateTime.now().toUnixTimeStamp().toMilliseconds()
+    while (DateTime.now().toUnixTimeStamp().toMilliseconds() - startedAt < timeoutMs) {
+        if (condition()) {
+            return true
+        }
+        sleep(Duration.millisecond * 50)
+    }
+    condition()
 }
 
 @Test
@@ -357,6 +375,85 @@ public class GatewayCanvasHostRootStateTest {
                 debugGatewayCanvasClearNodeSessionsForTest()
             }
         })
+    }
+
+    @TestCase
+    public func liveReloadDisabledReportsStaticWithoutPoller(): Unit {
+        withGatewayCanvasTestRoot<Unit>({ root =>
+            File.writeTo(root.join("index.html"), "<html>static</html>".toArray())
+            let port = canvasTestPort()
+            let cfg = buildGatewayConfigFromUserSettings(canvasTestUserSettingsWithLiveReload(true, root.toString(), port, false))
+            try {
+                GatewayCanvasHostRuntime.startIfNeeded(cfg)
+                let state = GatewayCanvasHostRuntime.snapshot(cfg)
+                let live = GatewayCanvasHostRuntime.debugLiveReloadStateForTest()
+                @Expect(canvasTestBool(state, "hostStarted"), true)
+                @Expect(canvasTestString(state, "watchState"), "static")
+                @Expect(canvasTestBool(live, "running"), false)
+                @Expect(canvasTestInt(live, "eventCount"), 0)
+            } finally {
+                GatewayCanvasHostRuntime.stopIfRunning()
+            }
+        })
+    }
+
+    @TestCase
+    public func liveReloadPollerPublishesReloadAndStopsCleanly(): Unit {
+        withGatewayCanvasTestRoot<Unit>({ root =>
+            File.writeTo(root.join("index.html"), "<html>reload</html>".toArray())
+            let port = canvasTestPort()
+            let cfg = canvasTestConfig(true, root.toString(), port: port)
+            let publishLock = Mutex()
+            let payloads = ArrayList<JsonObject>()
+            debugSetGatewayCanvasLiveReloadPublisherForTest(Some({ payload: JsonObject =>
+                var count: Int64 = 0
+                synchronized(publishLock) {
+                    payloads.add(payload)
+                    count = Int64(payloads.size)
+                }
+                count
+            }))
+            try {
+                GatewayCanvasHostRuntime.startIfNeeded(cfg)
+                @Expect(canvasWaitUntil(1000, { => canvasTestBool(GatewayCanvasHostRuntime.debugLiveReloadStateForTest(), "running") }), true)
+                sleep(Duration.millisecond * 320)
+                File.writeTo(root.join("app.js"), "console.log('reload')".toArray())
+                @Expect(canvasWaitUntil(2000, { =>
+                    synchronized(publishLock) {
+                        payloads.size > 0
+                    }
+                }), true)
+                let first = synchronized(publishLock) {
+                    payloads[0]
+                }
+                @Expect(canvasTestString(first, "type"), "reload")
+                @Expect(canvasTestString(first, "reason"), "canvas-root-changed")
+                @Expect(first.toJsonString().contains(root.toString()), false)
+                let state = GatewayCanvasHostRuntime.snapshot(cfg)
+                @Expect(canvasTestString(state, "watchState"), "watching")
+                @Expect(canvasTestInt(state, "liveReloadEventCount") > 0, true)
+                GatewayCanvasHostRuntime.stopIfRunning()
+                let countAfterStop = synchronized(publishLock) {
+                    payloads.size
+                }
+                File.writeTo(root.join("after-stop.js"), "console.log('stopped')".toArray())
+                sleep(Duration.millisecond * 420)
+                let finalCount = synchronized(publishLock) {
+                    payloads.size
+                }
+                @Expect(finalCount, countAfterStop)
+                @Expect(canvasTestBool(GatewayCanvasHostRuntime.debugLiveReloadStateForTest(), "running"), false)
+            } finally {
+                GatewayCanvasHostRuntime.stopIfRunning()
+                debugSetGatewayCanvasLiveReloadPublisherForTest(None<(JsonObject) -> Int64>)
+            }
+        })
+    }
+
+    @TestCase
+    public func canvasReloadEventKindIsControlUiDirectPushEligible(): Unit {
+        @Expect(debugGatewayServerShouldDirectPushControlUiEventForTest("control-ui-test", "control-ui.canvas.reload"), true)
+        @Expect(debugGatewayServerShouldDirectPushControlUiEventForTest("control-ui-test", "control-ui.unknown"), false)
     }
 
     @TestCase

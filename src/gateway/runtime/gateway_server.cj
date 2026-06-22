@@ -1676,10 +1676,16 @@ private func gatewayServerHasStreamEventSubscriptionLocked(clientId: String, kin
 
 private func gatewayServerShouldDirectPushControlUiEventLocked(clientId: String, kind: String): Bool {
     let normalizedKind = kind.trimAscii()
-    if (normalizedKind == "chat" || normalizedKind == "control-ui.invalidate") {
+    if (normalizedKind == "chat" || normalizedKind == "control-ui.invalidate" || normalizedKind == "control-ui.canvas.reload") {
         return true
     }
     gatewayServerShouldDirectPushSessionEventLocked(clientId, normalizedKind)
+}
+
+public func debugGatewayServerShouldDirectPushControlUiEventForTest(clientId: String, kind: String): Bool {
+    synchronized(gatewayServerLock) {
+        gatewayServerShouldDirectPushControlUiEventLocked(clientId, kind)
+    }
 }
 
 private func gatewayServerIsDirectWebsocketSubscriberLocked(clientId: String): Bool {
