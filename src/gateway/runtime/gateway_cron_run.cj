@@ -1,7 +1,7 @@
 package metis.gateway.runtime
 
 import metis.core.config.{CliConfig, CliSettingManager}
-import metis.cron.cronStorePath
+import metis.cron.{cronStorePath, executeGatewayCronCommand, registerGatewayCronRunUnified}
 
 import std.collection.ArrayList
 import stdx.encoding.json.{JsonBool, JsonObject, JsonString, JsonValue}
@@ -185,10 +185,20 @@ public func gatewayCronRunOnceOutcome(jobId: String, force: Bool): (Bool, String
     (false, gatewayCronRunResultForHuman(jobId, jo))
 }
 
-/**
- * 与 `CronRunner.runJobManual` 同源：本地组 `GatewayService` + `AgentBridge` 执行一次任务（不依赖仅 wake）。
- */
-public func gatewayCronRunUnified(sub: Array<String>): (String, Int64) {
+public func gatewayCronRunOnceOutcomeViaRegisteredHook(jobId: String, force: Bool): (Bool, String) {
+    let args = ArrayList<String>()
+    args.add("cron")
+    args.add("run")
+    args.add("--job-id")
+    args.add(jobId)
+    if (!force) {
+        args.add("--due")
+    }
+    let pair = executeGatewayCronCommand(args.toArray())
+    (pair[1] == 0, pair[0])
+}
+
+public func gatewayCronRunWithExecutor(sub: Array<String>, executor: (String, Bool) -> JsonObject): (String, Int64) {
     let (jobIdOpt, dueOnly) = gatewayParseCronRunJobIdAndDue(sub)
     let json = gatewayCronRunWantsJson(sub)
     match (jobIdOpt) {
@@ -201,10 +211,27 @@ public func gatewayCronRunUnified(sub: Array<String>): (String, Int64) {
             }
             ("Cron run failed\nError: missing id (cron run <id> or --job-id <id>)", 1)
         case Some(jobId) =>
-            let jo = gatewayCronExecuteJobOnce(jobId, !dueOnly)
+            let jo = executor(jobId, !dueOnly)
             if (json) {
                 return (jo.toJsonString(), cronRunResultExitCode(jo))
             }
             (gatewayCronRunResultForHuman(jobId, jo), cronRunResultExitCode(jo))
     }
+}
+
+public func registerGatewayCronRunHookForRunner(runner: CronRunner): Unit {
+    registerGatewayCronRunUnified({ sub: Array<String> =>
+        gatewayCronRunWithExecutor(sub, { jobId: String, force: Bool =>
+            runner.runJobManual(jobId, force)
+        })
+    })
+}
+
+/**
+ * 与 `CronRunner.runJobManual` 同源：本地组 `GatewayService` + `AgentBridge` 执行一次任务（不依赖仅 wake）。
+ */
+public func gatewayCronRunUnified(sub: Array<String>): (String, Int64) {
+    gatewayCronRunWithExecutor(sub, { jobId: String, force: Bool =>
+        gatewayCronExecuteJobOnce(jobId, force)
+    })
 }

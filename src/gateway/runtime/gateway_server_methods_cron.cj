@@ -86,14 +86,16 @@ public func handleGatewayCronFamily(method: String, request: GatewayRpcRequest):
     }
 
     if (m == "cron.run") {
-        let parts = ArrayList<String>()
-        parts.add("cron")
-        match (gatewayCronFillArgvForDashboardAction(parts, "run", p)) {
-            case Some(err) => return Some(GatewayRpcResponse(false, method, error: err))
-            case None => ()
+        let jobId = if (gatewayCronRpcString(p, "jobId").trimAscii().isEmpty()) {
+            gatewayCronRpcString(p, "id").trimAscii()
+        } else {
+            gatewayCronRpcString(p, "jobId").trimAscii()
         }
-        let pair = gatewayExecuteCronWithUnifiedRun(parts.toArray())
-        return Some(gatewayCronRpcResultResponse(method, pair[0], pair[1]))
+        if (jobId.isEmpty()) {
+            return Some(GatewayRpcResponse(false, method, error: "jobId is empty"))
+        }
+        let pair = gatewayCronRunOnceOutcomeViaRegisteredHook(jobId, true)
+        return Some(gatewayCronRpcResultResponse(method, pair[1], if (pair[0]) { 0 } else { 1 }))
     }
 
     if (m == "cron.remove") {
