@@ -377,6 +377,64 @@ private func telegramRepeatedText(size: Int64, chunk!: String = "x"): String {
     sb.toString()
 }
 
+private func telegramPayloadPlainTexts(payloads: JsonArray): Array<String> {
+    let out = ArrayList<String>()
+    for (i in 0..payloads.size()) {
+        let obj = payloads[i].asObject()
+        if (let Some(v) <- obj.get("plain_text")) {
+            out.add(v.asString().getValue())
+        } else if (let Some(v) <- obj.get("text")) {
+            out.add(v.asString().getValue())
+        }
+    }
+    out.toArray()
+}
+
+private func telegramJoinTexts(parts: Array<String>): String {
+    let out = StringBuilder()
+    for (part in parts) {
+        out.append(part)
+    }
+    out.toString()
+}
+
+private func telegramTextsAreValidUtf8(parts: Array<String>): Bool {
+    for (part in parts) {
+        try {
+            if (String.fromUtf8(part.toArray()) != part) {
+                return false
+            }
+        } catch (_e: Exception) {
+            return false
+        }
+    }
+    true
+}
+
+private func telegramTextsHaveNoEmptyChunk(parts: Array<String>): Bool {
+    for (part in parts) {
+        if (part.isEmpty()) {
+            return false
+        }
+    }
+    true
+}
+
+private func telegramSentTextBodies(fake: TelegramFakeBotApi): Array<String> {
+    let out = ArrayList<String>()
+    for (body in fake.bodies) {
+        try {
+            let obj = JsonValue.fromStr(body).asObject()
+            if (let Some(v) <- obj.get("text")) {
+                out.add(v.asString().getValue())
+            }
+        } catch (_e: Exception) {
+            ()
+        }
+    }
+    out.toArray()
+}
+
 private let telegramAdapterLifecycleLock = Mutex()
 private let telegramStartedAdaptersForTest = ArrayList<TelegramAdapter>()
 
@@ -4165,6 +4223,64 @@ public class TelegramAdapterTest {
     }
 
     @TestCase
+    public func tP1U01TelegramLengthChunksKeepUnicodeRuneBoundaries(): Unit {
+        let input = "中🙂文🙂"
+        let adapter = TelegramAdapter(
+            config: TelegramConfig(
+                enabled: true,
+                botToken: "telegram-token",
+                textChunkLimit: 4
+            )
+        )
+        let payloads = adapter.debugBuildSendPayloads(
+            OutboundMessage(ChannelType.Telegram, "user:8734062810", input)
+        )
+        let chunks = telegramPayloadPlainTexts(payloads)
+
+        @Expect(chunks.size, 4)
+        @Expect(telegramTextsAreValidUtf8(chunks), true)
+        @Expect(telegramJoinTexts(chunks), input)
+    }
+
+    @TestCase
+    public func tP1B01TelegramLengthChunkBoundariesStayCompatible(): Unit {
+        let limitAdapter = TelegramAdapter(
+            config: TelegramConfig(
+                enabled: true,
+                botToken: "telegram-token",
+                textChunkLimit: 4
+            )
+        )
+        let exact = telegramPayloadPlainTexts(limitAdapter.debugBuildSendPayloads(
+            OutboundMessage(ChannelType.Telegram, "user:8734062810", "abcd")
+        ))
+        let plusOne = telegramPayloadPlainTexts(limitAdapter.debugBuildSendPayloads(
+            OutboundMessage(ChannelType.Telegram, "user:8734062810", "abcde")
+        ))
+        let fallbackAdapter = TelegramAdapter(
+            config: TelegramConfig(
+                enabled: true,
+                botToken: "telegram-token",
+                textChunkLimit: 0
+            )
+        )
+        let fallbackText = telegramRepeatedText(4001)
+        let fallback = telegramPayloadPlainTexts(fallbackAdapter.debugBuildSendPayloads(
+            OutboundMessage(ChannelType.Telegram, "user:8734062810", fallbackText)
+        ))
+
+        @Expect(exact.size, 1)
+        @Expect(exact[0], "abcd")
+        @Expect(plusOne.size, 2)
+        @Expect(plusOne[0], "abcd")
+        @Expect(plusOne[1], "e")
+        @Expect(fallback.size, 2)
+        @Expect(fallback[0].size, 4000)
+        @Expect(fallback[1], "x")
+        @Expect(telegramJoinTexts(fallback), fallbackText)
+    }
+
+    @TestCase
     public func sendPayloadsKeepReplyTargetOnEveryChunkWhenReplyModeAll(): Unit {
         let adapter = TelegramAdapter(
             config: TelegramConfig(
@@ -4266,6 +4382,57 @@ public class TelegramAdapterTest {
         let second = payloads[1].asObject()
         @Expect(first.get("text").getOrThrow().asString().getValue(), "aaa\n\nbbb")
         @Expect(second.get("text").getOrThrow().asString().getValue(), "cccccccc")
+    }
+
+    @TestCase
+    public func tP1P01TelegramNewlineModeChunksUnicodeLongSegmentSafely(): Unit {
+        let input = "中🙂文🙂\n字🙂"
+        let adapter = TelegramAdapter(
+            config: TelegramConfig(
+                enabled: true,
+                botToken: "telegram-token",
+                textChunkLimit: 4,
+                chunkMode: "newline"
+            )
+        )
+        let chunks = telegramPayloadPlainTexts(adapter.debugBuildSendPayloads(
+            OutboundMessage(ChannelType.Telegram, "user:8734062810", input)
+        ))
+
+        @Expect(chunks.size > 1, true)
+        @Expect(telegramTextsAreValidUtf8(chunks), true)
+        @Expect(telegramJoinTexts(chunks), input)
+        @Expect(telegramTextsHaveNoEmptyChunk(chunks), true)
+    }
+
+    @TestCase
+    public func tP1N01TelegramFakeSendManyEmojiAndCjkChunksWithoutEmptyText(): Unit {
+        let fake = TelegramFakeBotApi()
+        setTelegramTransportRunnerForTest(Some({ request => fake.handle(request) }))
+        try {
+            let input = telegramRepeatedText(64, chunk: "🙂中文")
+            let adapter = TelegramAdapter(
+                config: TelegramConfig(
+                    enabled: true,
+                    botToken: "telegram-token",
+                    textChunkLimit: 5,
+                    actions: TelegramActionConfig(sendMessage: true)
+                )
+            )
+            telegramStartAdapterForTest(adapter)
+            let result = adapter.send(OutboundMessage(ChannelType.Telegram, "user:8734062810", input))
+            match (result) {
+                case SendResult.Success => ()
+                case SendResult.Failed(reason) => @Expect(reason, "")
+            }
+            let chunks = telegramSentTextBodies(fake)
+            @Expect(chunks.size > 1, true)
+            @Expect(fake.count("sendMessage"), chunks.size)
+            @Expect(telegramTextsHaveNoEmptyChunk(chunks), true)
+            @Expect(telegramTextsAreValidUtf8(chunks), true)
+        } finally {
+            setTelegramTransportRunnerForTest(None)
+        }
     }
 
     @TestCase
