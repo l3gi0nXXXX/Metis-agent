@@ -234,6 +234,12 @@ public class AgentBridgeRuntimeTest {
     }
 
     @TestCase
+    public func gatewayDefaultChatRuntimeNowIncludesCanvasTool(): Unit {
+        let names = gatewayDefaultChatToolNames()
+        @Expect(names.contains("canvas"), true)
+    }
+
+    @TestCase
     public func gitCodeMcpAgentBridgeAdapterUsesRuntimeSeamWithoutProviderClient(): Unit {
         let adapter = MockGitCodeMcpRuntimeAdapter()
         let args = JsonObject()
@@ -384,13 +390,14 @@ public class AgentBridgeRuntimeTest {
         try {
             var updated = original
             updated.tools.allow = []
-            updated.tools.deny = ["shellExecute", "process", "gateway", "message", "subagents"]
+            updated.tools.deny = ["shellExecute", "process", "gateway", "canvas", "message", "subagents"]
             CliSettingManager.setting.gateway = updated
             let names = gatewayAuthorizedChatToolNames()
             @Expect(names.contains("weather"), true)
             @Expect(names.contains("shellExecute"), false)
             @Expect(names.contains("process"), false)
             @Expect(names.contains("gateway"), false)
+            @Expect(names.contains("canvas"), false)
             @Expect(names.contains("message"), false)
             @Expect(names.contains("subagents"), false)
         } finally {
@@ -404,13 +411,14 @@ public class AgentBridgeRuntimeTest {
         try {
             var updated = original
             updated.tools.allow = []
-            updated.tools.deny = ["shellExecute", "process", "gateway", "message", "subagents"]
+            updated.tools.deny = ["shellExecute", "process", "gateway", "canvas", "message", "subagents"]
             CliSettingManager.setting.gateway = updated
             let names = gatewayPolicyFilteredChatToolNames()
             @Expect(names.contains("weather"), true)
             @Expect(names.contains("shellExecute"), false)
             @Expect(names.contains("process"), false)
             @Expect(names.contains("gateway"), false)
+            @Expect(names.contains("canvas"), false)
             @Expect(names.contains("message"), false)
             @Expect(names.contains("subagents"), false)
             @Expect(names.contains("sessions_spawn"), true)
@@ -425,7 +433,7 @@ public class AgentBridgeRuntimeTest {
         try {
             var updated = original
             updated.tools.allow = []
-            updated.tools.deny = ["shellExecute", "process", "gateway", "message", "subagents"]
+            updated.tools.deny = ["shellExecute", "process", "gateway", "canvas", "message", "subagents"]
             CliSettingManager.setting.gateway = updated
             let authorized = gatewayAuthorizedChatToolNames()
             let filtered = gatewayPolicyFilteredChatToolNames()
@@ -444,12 +452,13 @@ public class AgentBridgeRuntimeTest {
         try {
             var updated = original
             updated.tools.allow = []
-            updated.tools.deny = ["shellExecute", "process", "gateway", "message", "subagents"]
+            updated.tools.deny = ["shellExecute", "process", "gateway", "canvas", "message", "subagents"]
             CliSettingManager.setting.gateway = updated
             let prompt = gatewayPolicyFilteredSystemPrompt()
             @Expect(prompt.contains("shellExecute"), false)
             @Expect(prompt.contains("process(action=poll"), false)
             @Expect(prompt.contains("shellExecute/process"), false)
+            @Expect(prompt.contains("canvas(action="), false)
             @Expect(prompt.contains("## Metis Self-Update"), false)
             @Expect(prompt.contains("### message tool"), false)
             @Expect(prompt.contains("subagents"), false)

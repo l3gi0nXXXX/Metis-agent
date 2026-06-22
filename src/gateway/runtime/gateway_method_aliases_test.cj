@@ -15,4 +15,14 @@ public class GatewayMethodAliasesTest {
         @Expect(gatewayDashboardMethodAlias("sessions.reset"), "")
         @Expect(gatewayDashboardMethodAlias("unknown.method"), "")
     }
+
+    @TestCase
+    public func canvasNodeAliasesRouteThroughNodeInvoke(): Unit {
+        @Expect(gatewayDashboardMethodAlias("nodes.canvas.present"), "node.invoke")
+        @Expect(gatewayDashboardMethodAlias("nodes.canvas.snapshot"), "node.invoke")
+        @Expect(gatewayDashboardMethodAlias("nodes.canvas.navigate"), "node.invoke")
+        @Expect(gatewayDashboardMethodAlias("nodes.canvas.eval"), "node.invoke")
+        @Expect(gatewayDashboardMethodAlias("nodes.canvas.a2ui_push"), "node.invoke")
+        @Expect(gatewayDashboardMethodAlias("nodes.canvas.a2ui_reset"), "node.invoke")
+    }
 }

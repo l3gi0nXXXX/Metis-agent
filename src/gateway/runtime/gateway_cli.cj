@@ -377,6 +377,7 @@ private func printGatewayHelp(): Unit {
     PrintUtils.printLine("  gateway sessions ...             Inspect persisted gateway sessions")
     PrintUtils.printLine("  gateway subagents ...            Spawn or control background subagent runs")
     PrintUtils.printLine("  gateway cron ...                 Inspect or manage scheduled jobs")
+    PrintUtils.printLine("  gateway nodes canvas ...         Invoke Canvas commands on connected nodes")
     PrintUtils.printLine("Examples:")
     PrintUtils.printLine("  metis gateway run")
     PrintUtils.printLine("  metis gateway status")
@@ -1475,6 +1476,9 @@ public func runGatewayCli(sub: Array<String>): Int64 {
     }
     if (cmd == "cron") {
         return runGatewayCronCli(sub)
+    }
+    if (cmd == "nodes" && sub.size >= 2 && sub[1].trimAscii().toAsciiLower() == "canvas") {
+        return runGatewayNodesCanvasCli(sub)
     }
     if (cmd == "media" && sub.size >= 2 && sub[1].trimAscii().toAsciiLower() == "image") {
         return gatewayRunMediaImageCli(sub)

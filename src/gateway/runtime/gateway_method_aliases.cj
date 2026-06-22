@@ -11,6 +11,12 @@ public func gatewayDashboardMethodAlias(method: String): String {
         case "skills" => "skills.status"
         case "skills.list" => "skills.status"
         case "skills.compatibility" => "skills.compatibilityMatrix"
+        case "nodes.canvas.present" => "node.invoke"
+        case "nodes.canvas.snapshot" => "node.invoke"
+        case "nodes.canvas.navigate" => "node.invoke"
+        case "nodes.canvas.eval" => "node.invoke"
+        case "nodes.canvas.a2ui_push" => "node.invoke"
+        case "nodes.canvas.a2ui_reset" => "node.invoke"
         case _ => ""
     }
 }

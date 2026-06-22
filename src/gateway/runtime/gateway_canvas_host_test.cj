@@ -5,6 +5,7 @@ import magic.jsonable.*
 import metis.core.config.GatewayUserSettings
 import metis.gateway.config.buildGatewayConfigFromUserSettings
 import metis.gateway.model.GatewayConfig
+import metis.gateway.tools.debugSetGatewayCanvasToolArtifactRootForTest
 
 import std.convert.Parsable
 import std.collection.ArrayList
@@ -12,6 +13,7 @@ import std.fs.{Directory, File, Path, exists, remove}
 import std.process.executeWithOutput
 import std.time.*
 import std.unittest.testmacro.*
+import stdx.encoding.base64.toBase64String
 import stdx.encoding.json.{JsonArray, JsonObject, JsonString}
 import stdx.net.http.*
 
@@ -759,6 +761,63 @@ public class GatewayCanvasHostRootStateTest {
         } finally {
             debugGatewayCanvasClearNodeSessionsForTest()
             debugGatewayNodeInvokeClearForTest()
+        }
+    }
+
+    @TestCase
+    public func nodesCanvasCliSnapshotUsesFakeRunnerAndWritesArtifact(): Unit {
+        withGatewayCanvasTestRoot<Unit>({ root =>
+            debugSetGatewayCanvasToolArtifactRootForTest(Some(root))
+            debugSetGatewayNodesCanvasCliRunnerForTest(Some({ method: String, params: JsonObject =>
+                @Expect(method, "node.invoke")
+                @Expect(canvasTestString(params, "nodeId"), "node-cli")
+                @Expect(canvasTestString(params, "command"), "canvas.snapshot")
+                let requestPayload = params.get("payload").getOrThrow().asObject()
+                @Expect(canvasTestString(requestPayload, "format"), "png")
+                let snapshot = JsonObject()
+                snapshot.put("format", JsonString("png"))
+                snapshot.put("base64", JsonString(toBase64String("cli-png".toArray())))
+                let result = JsonObject()
+                result.put("payload", snapshot)
+                GatewayRpcResponse(true, method, result: result)
+            }))
+            try {
+                let response = gatewayNodesCanvasInvokeForCliForTest(
+                    "snapshot",
+                    ["--node", "node-cli", "--format", "png", "--json"]
+                )
+                @Expect(response.ok, true)
+                let result = response.result.asObject()
+                let artifact = result.get("artifact").getOrThrow().asObject()
+                let path = canvasTestString(artifact, "path")
+                @Expect(canvasTestString(artifact, "format"), "png")
+                @Expect(path.startsWith(root.toString()), true)
+                @Expect(exists(Path(path)), true)
+            } finally {
+                debugSetGatewayNodesCanvasCliRunnerForTest(None<(String, JsonObject) -> GatewayRpcResponse>)
+                debugSetGatewayCanvasToolArtifactRootForTest(None<Path>)
+            }
+        })
+    }
+
+    @TestCase
+    public func nodesCanvasCliOfflineReturnsStructuredError(): Unit {
+        debugSetGatewayNodesCanvasCliRunnerForTest(Some({ method: String, params: JsonObject =>
+            @Expect(method, "node.invoke")
+            @Expect(canvasTestString(params, "nodeId"), "missing-node")
+            @Expect(canvasTestString(params, "command"), "canvas.present")
+            GatewayRpcResponse(false, method, error: "Node is offline.", errorCode: "unavailable")
+        }))
+        try {
+            let response = gatewayNodesCanvasInvokeForCliForTest(
+                "present",
+                ["--node", "missing-node", "--url", "http://127.0.0.1:18793/__metis__/canvas/"]
+            )
+            @Expect(response.ok, false)
+            @Expect(response.errorCode, "unavailable")
+            @Expect(response.error.contains("offline"), true)
+        } finally {
+            debugSetGatewayNodesCanvasCliRunnerForTest(None<(String, JsonObject) -> GatewayRpcResponse>)
         }
     }
 }

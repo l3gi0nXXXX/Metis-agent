@@ -157,6 +157,7 @@ public class GatewayHttpSurfaceTest {
             @Expect(response.contains("gateway.http.start"), true)
             @Expect(response.contains("gateway.webchat.status"), true)
             @Expect(response.contains("gateway.webchat.start"), true)
+            @Expect(response.contains("gateway.canvas.invoke"), true)
             @Expect(response.contains("gateway.channels.audit"), true)
         })
     }

@@ -483,6 +483,26 @@ public class GatewayCliHumanOutputTest {
     }
 
     @TestCase
+    public func formatsCanvasNodeInvokeCliOutputWithoutRawJson(): Unit {
+        let okRaw = "{\"ok\":true,\"method\":\"node.invoke\",\"result\":{\"nodeId\":\"node-cli\",\"command\":\"canvas.snapshot\",\"payload\":{\"format\":\"png\"},\"artifact\":{\"path\":\"/tmp/metis-canvas-test/canvas.png\",\"format\":\"png\"}}}"
+        let okOut = gatewayFormatCommandOutput(okRaw)
+        @Expect(okOut.contains("Gateway call: node.invoke"), true)
+        @Expect(okOut.contains("Status: ok"), true)
+        @Expect(okOut.contains("Result fields:"), true)
+        @Expect(okOut.contains("\"payload\""), false)
+        @Expect(okOut.contains("\"artifact\""), false)
+        @Expect(okOut.contains("{"), false)
+
+        let errorRaw = "{\"ok\":false,\"method\":\"node.invoke\",\"error\":\"Node is offline.\",\"errorCode\":\"unavailable\"}"
+        let errorOut = gatewayFormatCommandOutput(errorRaw)
+        @Expect(errorOut.contains("Gateway call failed: node.invoke"), true)
+        @Expect(errorOut.contains("Node is offline."), true)
+        @Expect(errorOut.contains("unavailable"), true)
+        @Expect(errorOut.contains("\"ok\""), false)
+        @Expect(errorOut.contains("{"), false)
+    }
+
+    @TestCase
     public func pluginHelpDocumentsAliasAndSupportedActions(): Unit {
         let help = String.join(gatewayPluginHelpLines(), delimiter: "\n")
         @Expect(help.contains("gateway plugin list"), true)
