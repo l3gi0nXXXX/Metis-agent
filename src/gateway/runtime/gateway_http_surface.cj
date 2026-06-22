@@ -454,6 +454,7 @@ private func gatewayHandleMcpRequestWithPolicy(cfg: GatewayConfig, raw: String, 
             ("gateway.push.orchestrate", "Run gateway push orchestration once."),
             ("gateway.canvas.audit", "Read gateway canvas pipeline audit."),
             ("gateway.canvas.actions", "Read gateway canvas remediation actions."),
+            ("gateway.canvas.invoke", "Invoke a gateway canvas node command."),
             ("gateway.talk.audit", "Read gateway talk pipeline audit."),
             ("gateway.talk.actions", "Read gateway talk remediation actions."),
             ("gateway.discover.detail", "Read gateway channel and plugin discovery detail."),
@@ -1460,6 +1461,9 @@ private func gatewayMcpToolCall(user: GatewayUserSettings, name: String, args: J
     }
     if (normalized == "gateway.canvas.actions") {
         return client.request("canvas.actions", params: args)
+    }
+    if (normalized == "gateway.canvas.invoke") {
+        return client.request("node.invoke", params: args)
     }
     if (normalized == "gateway.talk.audit") {
         return client.request("talk.audit", params: args)

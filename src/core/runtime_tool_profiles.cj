@@ -74,6 +74,7 @@ public func gatewayMainRuntimeExtendedToolNames(): Array<String> {
     [
         "process",
         "gateway",
+        "canvas",
         "cron",
         "message",
         "sessions_spawn",

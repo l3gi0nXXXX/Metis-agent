@@ -81,6 +81,23 @@ public class RuntimeToolProfilesTest {
     }
 
     @TestCase
+    public func canvasIsExtendedGatewayToolAndCanBeDeniedAtInvocationGate(): Unit {
+        @Expect(runtimeToolNamesContain(gatewayMainRuntimeExtendedToolNames(), "canvas"), true)
+
+        let root = JsonObject()
+        root.put("tools", this.toolPolicy(deny: ["canvas"]))
+        let inventory = ["canvas", "weather"]
+        let report = resolveRuntimeToolPolicyFromRoot(root, inventory)
+        let decision = runtimeToolInvocationAllowedFromRoot(root, "canvas", inventory)
+
+        @Expect(runtimeToolNamesContain(report.visibleTools, "canvas"), false)
+        @Expect(runtimeToolNamesContain(report.deniedTools, "canvas"), true)
+        @Expect(decision.allowed, false)
+        @Expect(decision.reason.contains("tool denied by policy"), true)
+        @Expect(decision.reason.contains("canvas"), true)
+    }
+
+    @TestCase
     public func execAliasDenyHidesShellExecuteAndRejectsInvocation(): Unit {
         let agents = JsonArray([])
         agents.add(this.agentEntry("agent-a", tools: this.toolPolicy(deny: ["exec"])))

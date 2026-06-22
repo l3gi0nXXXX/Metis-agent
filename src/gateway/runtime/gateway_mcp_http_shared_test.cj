@@ -120,6 +120,7 @@ public class GatewayMcpHttpSharedTest {
     public func toolListContainsGatewayStatusAndOptionalConfiguredMarker(): Unit {
         let baseTools = testJsonArray(gatewayMcpToolListResultJson(), "tools")
         @Expect(testToolListContains(baseTools, "gateway.status"), true)
+        @Expect(testToolListContains(baseTools, "gateway.canvas.invoke"), true)
         @Expect(testToolListContains(baseTools, "mcp.configured"), false)
 
         let configuredTools = testJsonArray(
