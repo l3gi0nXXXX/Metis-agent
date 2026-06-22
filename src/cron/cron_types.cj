@@ -4,15 +4,15 @@ import std.collection.ArrayList
 
 public func cronNormalizeToolExecMode(raw: String): String {
     let mode = raw.trimAscii().toAsciiLower()
-    if (mode == "allowlist" || mode == "yolo") {
+    if (mode == "guarded" || mode == "deny" || mode == "allowlist" || mode == "yolo") {
         return mode
     }
-    "deny"
+    "guarded"
 }
 
 public func cronToolExecModeIsValid(raw: String): Bool {
     let mode = raw.trimAscii().toAsciiLower()
-    mode == "deny" || mode == "allowlist" || mode == "yolo"
+    mode == "guarded" || mode == "deny" || mode == "allowlist" || mode == "yolo"
 }
 
 public func cronNormalizeToolExecAllowlist(values: Array<String>): Array<String> {
@@ -148,7 +148,7 @@ public class CronJob {
     public var lightContext: Bool
     public var deliveryAccountId: String
     public var bestEffortDeliver: Bool
-    /** cron/headless shell/network 工具执行策略：deny | allowlist | yolo。 */
+    /** cron/headless shell/network 工具执行策略：guarded | deny | allowlist | yolo。 */
     public var toolExecMode: String
     public var toolExecAllowlist: Array<String>
     public var failureAccountId: String
@@ -188,7 +188,7 @@ public class CronJob {
         lightContext!: Bool = false,
         deliveryAccountId!: String = "",
         bestEffortDeliver!: Bool = false,
-        toolExecMode!: String = "deny",
+        toolExecMode!: String = "guarded",
         toolExecAllowlist!: Array<String> = [],
         failureAccountId!: String = "",
         failureAlertAfter!: Int64 = 0,

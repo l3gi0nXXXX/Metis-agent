@@ -2,6 +2,7 @@ package metis.gateway.runtime
 
 import metis.core.config.{CliConfig, CliSettingManager}
 import metis.core.memory.DreamingPhaseRuntime
+import metis.core.cronShellExecutionBlockedDiagnosticFromText
 import metis.gateway.core.{
     AgentBridge,
     GatewayCronSessionReaperState,
@@ -468,7 +469,9 @@ public class CronRunner {
         errMsg: String,
         answer: String,
         deliveryStatus: String,
-        deliveryError: String
+        deliveryError: String,
+        diagnosticCode!: String = "",
+        diagnosticMessage!: String = ""
     ): Unit {
         try {
             match (cronRunnerRunLogAppendHookForTest()) {
@@ -489,7 +492,9 @@ public class CronRunner {
                 runAtMs: startedAtMs,
                 nextRunAtMs: j.state.nextRunAtMs,
                 deliveryStatus: deliveryStatus,
-                deliveryError: deliveryError
+                deliveryError: deliveryError,
+                diagnosticCode: diagnosticCode,
+                diagnosticMessage: diagnosticMessage
             )
         } catch (logError: Exception) {
             gatewayLogEventError(
@@ -503,6 +508,20 @@ public class CronRunner {
                     .rawString("error", logError.message)
                     .object()
             )
+        }
+    }
+
+    private func cronShellRunDiagnosticCode(answer: String, errMsg: String): String {
+        match (cronShellExecutionBlockedDiagnosticFromText(answer + "\n" + errMsg)) {
+            case Some(diagnostic) => diagnostic.code
+            case None => ""
+        }
+    }
+
+    private func cronShellRunDiagnosticMessage(answer: String, errMsg: String): String {
+        match (cronShellExecutionBlockedDiagnosticFromText(answer + "\n" + errMsg)) {
+            case Some(diagnostic) => diagnostic.message
+            case None => ""
         }
     }
 
@@ -814,7 +833,9 @@ public class CronRunner {
                 errMsg,
                 answer,
                 deliveryStatus,
-                deliveryError
+                deliveryError,
+                diagnosticCode: cronShellRunDiagnosticCode(answer, errMsg),
+                diagnosticMessage: cronShellRunDiagnosticMessage(answer, errMsg)
             )
         } catch (fatal: Exception) {
             let afterRun = epochMs()

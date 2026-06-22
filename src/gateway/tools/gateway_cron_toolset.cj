@@ -3,7 +3,7 @@ package metis.gateway.tools
 import magic.dsl.{tool, toolset}
 import magic.prelude.*
 
-import metis.cron.{CronPromptScanResult, executeGatewayCronCommand, scanCronPromptStrict}
+import metis.cron.{CronPromptScanResult, cronToolExecModeIsValid, executeGatewayCronCommand, scanCronPromptStrict}
 import metis.io.PrintUtils
 
 import std.collection.ArrayList
@@ -83,6 +83,66 @@ public class GatewayCronToolset {
         out
     }
 
+    private func errorResult(action: String, message: String): String {
+        let err = JsonObject()
+        err.put("ok", false.toJsonValue())
+        err.put("action", JsonString(action))
+        err.put("status", JsonString("error"))
+        err.put("error", JsonString(message))
+        let out = err.toJsonString()
+        PrintUtils.printToolResult(out)
+        out
+    }
+
+    private func appendToolExecFlagsForCronTool(
+        args: ArrayList<String>,
+        toolExecMode: Option<String>,
+        toolExecAllow: Option<String>,
+        toolExecAllowlist: Option<Array<String>>
+    ): Option<String> {
+        match (toolExecMode) {
+            case Some(rawMode) =>
+                let mode = rawMode.trimAscii().toAsciiLower()
+                if (!mode.isEmpty()) {
+                    if (!cronToolExecModeIsValid(mode)) {
+                        return Some("invalid toolExecMode: must be guarded, deny, allowlist, or yolo")
+                    }
+                    args.add("--tool-exec-mode")
+                    args.add(mode)
+                }
+            case None => ()
+        }
+
+        let prefixes = ArrayList<String>()
+        match (toolExecAllow) {
+            case Some(rawPrefix) =>
+                let prefix = rawPrefix.trimAscii()
+                if (prefix.isEmpty()) {
+                    return Some("invalid toolExecAllow: prefix must not be empty")
+                }
+                prefixes.add(prefix)
+            case None => ()
+        }
+        match (toolExecAllowlist) {
+            case Some(rawList) =>
+                for (rawPrefix in rawList) {
+                    let prefix = rawPrefix.trimAscii()
+                    if (prefix.isEmpty()) {
+                        return Some("invalid toolExecAllowlist: prefix must not be empty")
+                    }
+                    if (!prefixes.contains(prefix)) {
+                        prefixes.add(prefix)
+                    }
+                }
+            case None => ()
+        }
+        for (prefix in prefixes) {
+            args.add("--tool-exec-allow")
+            args.add(prefix)
+        }
+        None<String>
+    }
+
     @tool[
         description: "Operate gateway cron jobs through the unified Gateway cron backend. Supported actions: help, path, status, list, add, update, remove, enable, disable, run, runs, wake.",
         parameters: {
@@ -112,6 +172,9 @@ public class GatewayCronToolset {
             model: "Optional model override for add/update.",
             thinkingLevel: "Optional thinking level for add/update.",
             lightContext: "Optional light context flag for add/update.",
+            toolExecMode: "Optional cron shell policy for add/update: guarded, deny, allowlist, or yolo. Omit for guarded default.",
+            toolExecAllow: "Optional single allowlisted command prefix for add/update.",
+            toolExecAllowlist: "Optional allowlisted command prefixes for add/update.",
             dueOnly: "Optional due_only flag for run.",
             mode: "Optional wake mode.",
             text: "Optional wake text."
@@ -144,6 +207,9 @@ public class GatewayCronToolset {
         model: Option<String>,
         thinkingLevel: Option<String>,
         lightContext: Option<Bool>,
+        toolExecMode: Option<String>,
+        toolExecAllow: Option<String>,
+        toolExecAllowlist: Option<Array<String>>,
         dueOnly: Option<Bool>,
         mode: Option<String>,
         text: Option<String>
@@ -221,6 +287,10 @@ public class GatewayCronToolset {
             this.addStringFlag(args, "--model", model)
             this.addStringFlag(args, "--thinking-level", thinkingLevel)
             this.addBoolChoiceFlag(args, "--light-context", "--no-light-context", lightContext)
+            match (this.appendToolExecFlagsForCronTool(args, toolExecMode, toolExecAllow, toolExecAllowlist)) {
+                case Some(error) => return this.errorResult("add", error)
+                case None => ()
+            }
             args.add("--message")
             args.add(msg)
         } else if (act == "update") {
@@ -307,6 +377,10 @@ public class GatewayCronToolset {
             this.addStringFlag(args, "--model", model)
             this.addStringFlag(args, "--thinking-level", thinkingLevel)
             this.addBoolChoiceFlag(args, "--light-context", "--no-light-context", lightContext)
+            match (this.appendToolExecFlagsForCronTool(args, toolExecMode, toolExecAllow, toolExecAllowlist)) {
+                case Some(error) => return this.errorResult("update", error)
+                case None => ()
+            }
             match (message) {
                 case Some(v) =>
                     let t = v.trimAscii()
@@ -399,6 +473,9 @@ public class GatewayCronToolset {
         model: Option<String>,
         thinkingLevel: Option<String>,
         lightContext: Option<Bool>,
+        toolExecMode: Option<String>,
+        toolExecAllow: Option<String>,
+        toolExecAllowlist: Option<Array<String>>,
         dueOnly: Option<Bool>,
         mode: Option<String>,
         text: Option<String>
@@ -430,6 +507,9 @@ public class GatewayCronToolset {
             model,
             thinkingLevel,
             lightContext,
+            toolExecMode,
+            toolExecAllow,
+            toolExecAllowlist,
             dueOnly,
             mode,
             text

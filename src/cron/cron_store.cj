@@ -151,7 +151,7 @@ private func parseJob(obj: JsonObject): Option<CronJob> {
             lightContext: readBool(obj, "lightContext", default: false),
             deliveryAccountId: readStr(obj, "deliveryAccountId", default: ""),
             bestEffortDeliver: readBool(obj, "bestEffortDeliver", default: false),
-            toolExecMode: cronNormalizeToolExecMode(readStr(obj, "toolExecMode", default: "deny")),
+            toolExecMode: cronNormalizeToolExecMode(readStr(obj, "toolExecMode", default: "guarded")),
             toolExecAllowlist: cronNormalizeToolExecAllowlist(readStrArray(obj, "toolExecAllowlist")),
             failureAccountId: readStr(obj, "failureAccountId", default: ""),
             failureAlertAfter: readI64(obj, "failureAlertAfter", default: 0),

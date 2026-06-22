@@ -277,7 +277,7 @@ private func cronSubcommandHelpText(subCmdNorm: String): String {
             "  --no-light-context\n" +
             "  --delivery-account-id <id>   Multi-account delivery id\n" +
             "  --best-effort-deliver        Do not fail the job if delivery fails\n" +
-            "  --tool-exec-mode <mode>      Cron shell policy: deny | allowlist | yolo\n" +
+            "  --tool-exec-mode <mode>      Cron shell policy: guarded | deny | allowlist | yolo\n" +
             "  --tool-exec-allow <prefix>   Allowlisted command prefix; may repeat\n" +
             "  --failure-account-id <id>    Account for the failure channel\n" +
             "  --failure-alert-after <n>    Failures before alerting\n" +
@@ -330,7 +330,7 @@ private func cronSubcommandHelpText(subCmdNorm: String): String {
             "  --delivery-account-id <id> Delivery account id\n" +
             "  --best-effort-deliver      Do not fail the job if delivery fails\n" +
             "  --no-best-effort-deliver\n" +
-            "  --tool-exec-mode <mode>    Cron shell policy: deny | allowlist | yolo\n" +
+            "  --tool-exec-mode <mode>    Cron shell policy: guarded | deny | allowlist | yolo\n" +
             "  --tool-exec-allow <prefix> Replace allowlist with command prefix; may repeat\n" +
             "  --failure-account-id <id>  Failure account id\n" +
             "  --failure-alert-after <n>  Failures before alerting\n" +
@@ -965,7 +965,7 @@ private func cronCmdAddNamed(path: Path, sub: Array<String>): (String, Int64) {
     var lightContext = false
     var deliveryAccountId = ""
     var bestEffortDeliver = false
-    var toolExecMode = "deny"
+    var toolExecMode = "guarded"
     let toolExecAllowlist = ArrayList<String>()
     var failureAccountId = ""
     var failureAlertAfter: Int64 = 0
@@ -1284,7 +1284,7 @@ private func cronCmdAddNamed(path: Path, sub: Array<String>): (String, Int64) {
             }
             let mode = sub[i + 1].trimAscii().toAsciiLower()
             if (!cronToolExecModeIsValid(mode)) {
-                return cronErr("invalid cron.add params: --tool-exec-mode must be deny, allowlist, or yolo")
+                return cronErr("invalid cron.add params: --tool-exec-mode must be guarded, deny, allowlist, or yolo")
             }
             toolExecMode = mode
             i += 2
@@ -2105,7 +2105,7 @@ private func cronCmdUpdate(path: Path, sub: Array<String>): (String, Int64) {
                     }
                     let mode = sub[i + 1].trimAscii().toAsciiLower()
                     if (!cronToolExecModeIsValid(mode)) {
-                        return cronErr("invalid cron.update params: --tool-exec-mode must be deny, allowlist, or yolo")
+                        return cronErr("invalid cron.update params: --tool-exec-mode must be guarded, deny, allowlist, or yolo")
                     }
                     toolExecModeOpt = Some(mode)
                     touched = true
@@ -2436,6 +2436,31 @@ private func jsonObjInt(o: JsonObject, key: String): Int64 {
     }
 }
 
+private func cronRunsDiagnosticTokenValue(raw: String, key: String): String {
+    for (part in raw.split(" ")) {
+        let token = part.trimAscii()
+        let pieces = token.split("=", 2)
+        if (pieces.size == 2 && pieces[0] == key) {
+            return pieces[1].replace(".", "").trimAscii()
+        }
+    }
+    ""
+}
+
+private func cronRunsBlockedDiagnosticFix(mode: String): String {
+    let normalized = mode.trimAscii().toAsciiLower()
+    if (normalized == "guarded") {
+        return "use_safer_command_or_explicit_allowlist"
+    }
+    if (normalized == "allowlist") {
+        return "add_matching_tool_exec_allow_prefix"
+    }
+    if (normalized == "deny" || normalized.isEmpty()) {
+        return "set_allowlist_or_guarded_for_safe_commands"
+    }
+    "review_cron_tool_exec_policy"
+}
+
 private func formatCronRunsPageForHuman(page: JsonObject, targetId: String): String {
     let entries = page.get("entries").getOrThrow().asArray()
     let total = jsonObjInt(page, "total")
@@ -2462,7 +2487,21 @@ private func formatCronRunsPageForHuman(page: JsonObject, targetId: String): Str
         let row = it.asObject()
         let deliveryStatus = jsonObjString(row, "deliveryStatus")
         let deliveryError = cronRedactDeliveryErrorForHuman(jsonObjString(row, "deliveryError")).trimAscii()
+        let diagnosticCode = jsonObjString(row, "diagnosticCode").trimAscii()
+        let diagnosticMessage = jsonObjString(row, "diagnosticMessage")
         var summaryText = ellipsis(jsonObjString(row, "summary"), 60)
+        if (diagnosticCode == "cron_tool_exec_blocked") {
+            let reasonRaw = cronRunsDiagnosticTokenValue(diagnosticMessage, "reason")
+            let modeRaw = cronRunsDiagnosticTokenValue(diagnosticMessage, "mode")
+            let reason = if (reasonRaw.isEmpty()) { "cron_headless_approval_required" } else { reasonRaw }
+            let mode = modeRaw
+            let diagnosticSummary = "Diagnostic: cron_tool_exec_blocked reason=${reason} mode=${mode} fix=${cronRunsBlockedDiagnosticFix(mode)}"
+            summaryText = if (summaryText.isEmpty()) {
+                diagnosticSummary
+            } else {
+                "${summaryText} | ${diagnosticSummary}"
+            }
+        }
         if (deliveryStatus.trimAscii().toAsciiLower() == "not-delivered" && !deliveryError.isEmpty()) {
             let deliveryErrorSummary = ellipsis(deliveryError, 60)
             summaryText = if (summaryText.isEmpty()) {
