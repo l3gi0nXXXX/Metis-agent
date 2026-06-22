@@ -460,6 +460,160 @@ public class GatewaySessionTurnRunnerTest {
     }
 
     @TestCase
+    public func telegramStreamingPartialSuppressesFunctionsAnswerMarker(): Unit {
+        let sentTexts = ArrayList<String>()
+        let finalText = "正常中文 final🙂"
+        setGatewayAgentBridgeReplyRunnerForTest(Some({
+            _conversationKey: String,
+            _prompt: String,
+            _channelName: String,
+            _agentId: String,
+            _streamingEnabled: Bool,
+            streamChunkHook: Option<(String) -> Unit> =>
+                match (streamChunkHook) {
+                    case Some(notify) =>
+                        notify("fun")
+                        notify("functions._answer_")
+                    case None => ()
+                }
+                finalText
+        }))
+        try {
+            let store = GatewaySessionStore(Path("."), enabled: false, agentId: "general")
+            let bridge = AgentBridge(sessionStore: store)
+            let result = gatewayExecuteSessionTurn(
+                bridge,
+                gatewaySessionTurnGuardContext("telegram"),
+                "status",
+                deliver: true,
+                streamingEnabled: true,
+                deliverHook: Some({
+                    _channelName: String,
+                    _accountId: String,
+                    _peerId: String,
+                    text: String,
+                    _replyToMessageId: Option<String>,
+                    _replyInThread: Bool =>
+                        sentTexts.add(text)
+                        "m-${sentTexts.size}"
+                })
+            )
+
+            @Expect(result.delivered, true)
+            @Expect(sentTexts.size, 2)
+            @Expect(sentTexts[0], "fun")
+            @Expect(sentTexts[1].contains(finalText), true)
+            for (text in sentTexts) {
+                @Expect(text.contains("functions._answer_"), false)
+            }
+        } finally {
+            setGatewayAgentBridgeReplyRunnerForTest(None<(String, String, String, String, Bool, Option<(String) -> Unit>) -> String>)
+        }
+    }
+
+    @TestCase
+    public func telegramStreamingNormalVisibleAnswerStillDelivered(): Unit {
+        let sentTexts = ArrayList<String>()
+        let visible = "visible answer🙂"
+        setGatewayAgentBridgeReplyRunnerForTest(Some({
+            _conversationKey: String,
+            _prompt: String,
+            _channelName: String,
+            _agentId: String,
+            _streamingEnabled: Bool,
+            streamChunkHook: Option<(String) -> Unit> =>
+                match (streamChunkHook) {
+                    case Some(notify) => notify(visible)
+                    case None => ()
+                }
+                visible
+        }))
+        try {
+            let store = GatewaySessionStore(Path("."), enabled: false, agentId: "general")
+            let bridge = AgentBridge(sessionStore: store)
+            let result = gatewayExecuteSessionTurn(
+                bridge,
+                gatewaySessionTurnGuardContext("telegram"),
+                "status",
+                deliver: true,
+                streamingEnabled: true,
+                deliverHook: Some({
+                    _channelName: String,
+                    _accountId: String,
+                    _peerId: String,
+                    text: String,
+                    _replyToMessageId: Option<String>,
+                    _replyInThread: Bool =>
+                        sentTexts.add(text)
+                        "m-${sentTexts.size}"
+                })
+            )
+
+            @Expect(result.delivered, true)
+            @Expect(sentTexts.size, 1)
+            @Expect(sentTexts[0], visible)
+            @Expect(sentTexts[0].contains("工具调用协议"), false)
+        } finally {
+            setGatewayAgentBridgeReplyRunnerForTest(None<(String, String, String, String, Bool, Option<(String) -> Unit>) -> String>)
+        }
+    }
+
+    @TestCase
+    public func telegramStreamingOnlyFunctionsAnswerMarkerUsesFallbackWithoutSendingMarker(): Unit {
+        let root = Path("/tmp/metis-m2-only-marker-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
+        Directory.create(root, recursive: true)
+        let sentTexts = ArrayList<String>()
+        let marker = "functions._answer_"
+        setGatewayAgentBridgeReplyRunnerForTest(Some({
+            _conversationKey: String,
+            _prompt: String,
+            _channelName: String,
+            _agentId: String,
+            _streamingEnabled: Bool,
+            streamChunkHook: Option<(String) -> Unit> =>
+                match (streamChunkHook) {
+                    case Some(notify) => notify(marker)
+                    case None => ()
+                }
+                marker
+        }))
+        try {
+            let store = GatewaySessionStore(root, enabled: true, agentId: "general")
+            let bridge = AgentBridge(sessionStore: store)
+            let context = gatewaySessionTurnGuardContext("telegram")
+            let result = gatewayExecuteSessionTurn(
+                bridge,
+                context,
+                "status",
+                deliver: true,
+                streamingEnabled: true,
+                deliverHook: Some({
+                    _channelName: String,
+                    _accountId: String,
+                    _peerId: String,
+                    text: String,
+                    _replyToMessageId: Option<String>,
+                    _replyInThread: Bool =>
+                        sentTexts.add(text)
+                        "m-${sentTexts.size}"
+                })
+            )
+
+            @Expect(result.delivered, true)
+            @Expect(sentTexts.size, 1)
+            @Expect(sentTexts[0].contains("工具调用协议"), true)
+            @Expect(sentTexts[0].contains(marker), false)
+            let history = bridge.getHistory(context.sessionKey)
+            for (line in history) {
+                @Expect(line.contains(marker), false)
+            }
+        } finally {
+            setGatewayAgentBridgeReplyRunnerForTest(None<(String, String, String, String, Bool, Option<(String) -> Unit>) -> String>)
+            try { remove(root, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    @TestCase
     public func feishuFinalDeliveryStripsToolXmlAndKeepsCodeExample(): Unit {
         let sentTexts = ArrayList<String>()
         let raw = "开头\n<tool_call>\n{\"name\":\"session_status\",\"arguments\":{\"text\":\"literal </tool_call> inside\"}}\n</tool_call>\n结尾\n```xml\n<tool_call>{\"name\":\"session_status\"}</tool_call>\n```"

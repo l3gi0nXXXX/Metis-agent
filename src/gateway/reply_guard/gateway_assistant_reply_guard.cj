@@ -53,6 +53,9 @@ public func normalizeGatewayAssistantFinalReply(raw: String): GatewayAssistantRe
             if (unwrapped.isEmpty()) {
                 return GatewayAssistantReplyGuardResult(false, status: "terminal_answer_empty", text: "", blocked: true, needsRepair: true, diagnostic: "terminal answer envelope contained empty text", diagnosticHash: gatewayAssistantReplyDiagnosticHash(raw))
             }
+            if (let Some(status) <- gatewayAssistantReplyForbiddenMarkerStatus(unwrapped)) {
+                return GatewayAssistantReplyGuardResult(false, status: status, text: "", blocked: true, needsRepair: true, diagnostic: "assistant reply contains tool marker", diagnosticHash: gatewayAssistantReplyDiagnosticHash(raw))
+            }
             return GatewayAssistantReplyGuardResult(true, status: "ok", text: stripAssistantToolXmlBlocks(unwrapped))
         case None => ()
     }
@@ -69,10 +72,20 @@ public func normalizeGatewayAssistantFinalReply(raw: String): GatewayAssistantRe
     if (detectHarmonyToolLeak(trimmed)) {
         return GatewayAssistantReplyGuardResult(false, status: "harmony_tool_leak", text: "", blocked: true, needsRepair: true, diagnostic: "assistant reply is harmony tool protocol", diagnosticHash: gatewayAssistantReplyDiagnosticHash(raw))
     }
+    if (let Some(status) <- gatewayAssistantReplyForbiddenMarkerStatus(xmlStripped)) {
+        return GatewayAssistantReplyGuardResult(false, status: status, text: "", blocked: true, needsRepair: true, diagnostic: "assistant reply contains tool marker", diagnosticHash: gatewayAssistantReplyDiagnosticHash(raw))
+    }
     GatewayAssistantReplyGuardResult(true, status: "ok", text: xmlStripped)
 }
 
 public func normalizeGatewayAssistantVisibleTextForDelivery(raw: String, partial!: Bool = false): GatewayAssistantReplyGuardResult {
+    if (partial) {
+        match (gatewayAssistantReplyForbiddenMarkerStatus(raw)) {
+            case Some(status) =>
+                return GatewayAssistantReplyGuardResult(false, status: status, text: "", blocked: true, needsRepair: true, diagnostic: "assistant partial reply contains tool marker", diagnosticHash: gatewayAssistantReplyDiagnosticHash(raw))
+            case None => ()
+        }
+    }
     if (partial && gatewayAssistantReplyLooksLikeToolProtocolPrefix(raw)) {
         return GatewayAssistantReplyGuardResult(false, status: "tool_protocol_prefix", text: "", blocked: true, needsRepair: true, diagnostic: "assistant partial reply is tool protocol prefix", diagnosticHash: gatewayAssistantReplyDiagnosticHash(raw))
     }
@@ -84,6 +97,27 @@ public func normalizeGatewayAssistantVisibleTextForDelivery(raw: String, partial
         return GatewayAssistantReplyGuardResult(false, status: result.status, text: "", blocked: true, needsRepair: result.needsRepair, diagnostic: result.diagnostic, diagnosticHash: result.diagnosticHash)
     }
     GatewayAssistantReplyGuardResult(true, status: result.status, text: safeFallbackTextForBlockedAssistantReply(result.status), blocked: true, needsRepair: result.needsRepair, diagnostic: result.diagnostic, diagnosticHash: result.diagnosticHash)
+}
+
+public func gatewayAssistantReplyForbiddenMarkerStatus(raw: String): ?String {
+    let scanText = gatewayAssistantReplyTextOutsideCodeFences(raw).trimAscii()
+    if (scanText.isEmpty()) {
+        return None<String>
+    }
+    let lower = scanText.toAsciiLower()
+    if (lower.contains("functions._answer_") ||
+        lower.contains("functions.answer") ||
+        lower.contains("\"_answer_\"") ||
+        lower.contains("tool_call") ||
+        lower.contains("toolcalls") ||
+        lower.contains("to=functions.")) {
+        return Some("assistant_tool_marker")
+    }
+    let unquoted = gatewayAssistantReplyUnquoteJsonString(scanText).trimAscii().toAsciiLower()
+    if (unquoted == "_answer_") {
+        return Some("assistant_tool_marker")
+    }
+    None<String>
 }
 
 public func extractTerminalAnswerEnvelope(raw: String, depth!: Int64): ?String {
@@ -267,9 +301,7 @@ private func gatewayAssistantReplyArrayHasToolShape(arr: JsonArray): Bool {
 private func gatewayAssistantReplyValueHasToolShape(value: JsonValue): Bool {
     let text = try { value.asString().getValue().trimAscii().toAsciiLower() } catch (_: Exception) { "" }
     if (!text.isEmpty()) {
-        return text.contains("functions._answer_") ||
-            text.contains("functions.answer") ||
-            text.contains("to=functions.") ||
+        return gatewayAssistantReplyForbiddenMarkerStatus(text).isSome() ||
             text.contains("\"tool\"") ||
             text.contains("\"tool_calls\"") ||
             text.contains("\"function_call\"")
@@ -280,6 +312,37 @@ private func gatewayAssistantReplyValueHasToolShape(value: JsonValue): Bool {
     }
     let arr = try { value.asArray() } catch (_: Exception) { JsonArray([]) }
     gatewayAssistantReplyArrayHasToolShape(arr)
+}
+
+private func gatewayAssistantReplyUnquoteJsonString(raw: String): String {
+    let trimmed = raw.trimAscii()
+    if (!trimmed.startsWith("\"") || !trimmed.endsWith("\"")) {
+        return trimmed
+    }
+    let value = gatewayAssistantReplyParseFullJson(trimmed)
+    if (value.isNone()) {
+        return trimmed
+    }
+    try { value.getOrThrow().asString().getValue() } catch (_: Exception) { trimmed }
+}
+
+private func gatewayAssistantReplyTextOutsideCodeFences(raw: String): String {
+    let lines = raw.split("\n")
+    let out = StringBuilder()
+    var inCodeFence = false
+    for (line in lines) {
+        let trimmed = line.trimAscii()
+        if (trimmed.startsWith("```")) {
+            inCodeFence = !inCodeFence
+            continue
+        }
+        if (inCodeFence) {
+            continue
+        }
+        if (out.size > 0) { out.append("\n") }
+        out.append(line)
+    }
+    out.toString()
 }
 
 private func gatewayAssistantReplyLineStartsToolXmlBlock(trimmed: String): Bool {
