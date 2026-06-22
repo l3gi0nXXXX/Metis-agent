@@ -2,11 +2,14 @@ package metis.gateway.runtime
 
 import magic.jsonable.*
 
+import metis.gateway.core.GATEWAY_CONTROL_UI_CLIENT_NAME
 import metis.gateway.model.GatewayConfig
 
 import std.collection.ArrayList
 import std.fs.{Directory, File, FileInfo, Path, canonicalize, exists}
+import std.sort.*
 import std.sync.Mutex
+import std.time.*
 import stdx.encoding.json.{JsonArray, JsonObject, JsonString, JsonValue}
 import stdx.log.*
 import stdx.net.http.*
@@ -538,6 +541,112 @@ private func gatewayCanvasReadString(obj: JsonObject, key: String, defaultValue:
     }
 }
 
+private func gatewayCanvasNowMs(): Int64 {
+    DateTime.now().toUnixTimeStamp().toMilliseconds()
+}
+
+private func gatewayCanvasFileMtimeMs(path: Path): Int64 {
+    try {
+        FileInfo(path).lastModificationTime.toUnixTimeStamp().toMilliseconds()
+    } catch (_: Exception) {
+        0
+    }
+}
+
+private func gatewayCanvasScanMaxMtimeMs(root: Path): Int64 {
+    var maxMtime = gatewayCanvasFileMtimeMs(root)
+    try {
+        for (entry in Directory.readFrom(root)) {
+            if (entry.isDirectory()) {
+                let nested = gatewayCanvasScanMaxMtimeMs(entry.path)
+                if (nested > maxMtime) {
+                    maxMtime = nested
+                }
+                continue
+            }
+            let info = FileInfo(entry.path)
+            if (!info.isRegular()) {
+                continue
+            }
+            let mtime = gatewayCanvasFileMtimeMs(entry.path)
+            if (mtime > maxMtime) {
+                maxMtime = mtime
+            }
+        }
+    } catch (_: Exception) {
+        ()
+    }
+    maxMtime
+}
+
+private func gatewayCanvasAppendFilesystemSignature(root: Path, dir: Path, out: ArrayList<String>): Unit {
+    let entries = ArrayList<FileInfo>()
+    try {
+        for (entry in Directory.readFrom(dir)) {
+            entries.add(entry)
+        }
+    } catch (_: Exception) {
+        out.add("error|${dir.normalize().toString()}")
+        return
+    }
+    sort(entries, by: { a, b => a.path.normalize().toString().compare(b.path.normalize().toString()) })
+    let rootPrefix = root.normalize().toString().replace("\\", "/")
+    let rootPrefixWithSlash = if (rootPrefix.endsWith("/")) { rootPrefix } else { rootPrefix + "/" }
+    for (entry in entries) {
+        let path = entry.path
+        let full = path.normalize().toString().replace("\\", "/")
+        let relative = if (full.startsWith(rootPrefixWithSlash)) {
+            gatewayCanvasRemovePrefix(full, rootPrefixWithSlash)
+        } else {
+            full
+        }
+        if (entry.isDirectory()) {
+            out.add("dir|${relative}|${gatewayCanvasFileMtimeMs(path)}")
+            gatewayCanvasAppendFilesystemSignature(root, path, out)
+            continue
+        }
+        let info = try {
+            FileInfo(path)
+        } catch (_: Exception) {
+            out.add("error|${relative}")
+            continue
+        }
+        if (!info.isRegular()) {
+            continue
+        }
+        out.add("file|${relative}|${gatewayCanvasFileMtimeMs(path)}|${info.size}")
+    }
+}
+
+private func gatewayCanvasFilesystemSignature(root: Path): String {
+    let lines = ArrayList<String>()
+    lines.add("root|${gatewayCanvasFileMtimeMs(root)}")
+    gatewayCanvasAppendFilesystemSignature(root, root, lines)
+    String.join(lines.toArray(), delimiter: "\n")
+}
+
+private var gatewayCanvasLiveReloadPublisherForTest: Option<(JsonObject) -> Int64> = None<(JsonObject) -> Int64>
+
+public func debugSetGatewayCanvasLiveReloadPublisherForTest(runner: Option<(JsonObject) -> Int64>): Unit {
+    gatewayCanvasLiveReloadPublisherForTest = runner
+}
+
+private func gatewayCanvasPublishLiveReloadEvent(payload: JsonObject): Int64 {
+    match (gatewayCanvasLiveReloadPublisherForTest) {
+        case Some(runner) => runner(payload)
+        case None =>
+            gatewayServerPublishEventToMatchingClients(
+                "control-ui.canvas.reload",
+                detail: "reload",
+                payload: payload,
+                predicate: { _clientId, clientName, clientMode =>
+                    clientName.trimAscii() == GATEWAY_CONTROL_UI_CLIENT_NAME ||
+                    clientMode.trimAscii() == "control-ui-browser"
+                }
+            )
+    }
+}
+
 public class GatewayCanvasHostRuntime {
     private static let lock = Mutex()
     private static var started: Bool = false
@@ -546,6 +655,15 @@ public class GatewayCanvasHostRuntime {
     private static var listenPort: UInt16 = 18793u16
     private static var registeredRoutes: JsonArray = JsonArray([])
     private static var lastErrorKind: String = ""
+    private static var liveReloadRunning: Bool = false
+    private static var liveReloadStopRequested: Bool = false
+    private static var liveReloadRootPath: String = ""
+    private static var liveReloadLastMtimeMs: Int64 = 0
+    private static var liveReloadLastSignature: String = ""
+    private static var liveReloadEventCount: Int64 = 0
+    private static var liveReloadLastEventAtMs: Int64 = 0
+    private static var liveReloadGeneration: Int64 = 0
+    private static let liveReloadPollIntervalMs: Int64 = 250
 
     public static func isRunning(): Bool {
         synchronized(lock) {
@@ -611,6 +729,11 @@ public class GatewayCanvasHostRuntime {
             listenPort = gatewayCanvasPortToUInt16(cfg.canvas.port, 18793u16)
             registeredRoutes = routes
             lastErrorKind = ""
+            if (cfg.canvas.liveReload) {
+                GatewayCanvasHostRuntime.startLiveReloadPoller(canonicalRoot)
+            } else {
+                GatewayCanvasHostRuntime.stopLiveReloadPollerLocked()
+            }
             spawn {
                 try {
                     s.serve()
@@ -620,10 +743,77 @@ public class GatewayCanvasHostRuntime {
                     synchronized(lock) {
                         started = false
                         server = None
+                        liveReloadStopRequested = true
+                        liveReloadRunning = false
+                        liveReloadRootPath = ""
                     }
                 }
             }
         }
+    }
+
+    private static func startLiveReloadPoller(root: Path): Unit {
+        liveReloadGeneration += 1
+        let generation = liveReloadGeneration
+        liveReloadStopRequested = false
+        liveReloadRunning = true
+        liveReloadRootPath = root.toString()
+        liveReloadLastMtimeMs = gatewayCanvasScanMaxMtimeMs(root)
+        liveReloadLastSignature = gatewayCanvasFilesystemSignature(root)
+        liveReloadEventCount = 0
+        liveReloadLastEventAtMs = 0
+        spawn {
+            while (true) {
+                sleep(Duration.millisecond * liveReloadPollIntervalMs)
+                let scanRoot = synchronized(lock) {
+                    if (liveReloadGeneration != generation || liveReloadStopRequested || !liveReloadRunning) {
+                        ""
+                    } else {
+                        liveReloadRootPath
+                    }
+                }
+                if (scanRoot.trimAscii().isEmpty()) {
+                    break
+                }
+                let scanPath = Path(scanRoot)
+                let nextMtime = gatewayCanvasScanMaxMtimeMs(scanPath)
+                let nextSignature = gatewayCanvasFilesystemSignature(scanPath)
+                var shouldPublish = false
+                synchronized(lock) {
+                    if (liveReloadGeneration != generation || liveReloadStopRequested || !liveReloadRunning) {
+                        shouldPublish = false
+                    } else if (nextMtime > 0 && !nextSignature.isEmpty() && nextSignature != liveReloadLastSignature) {
+                        liveReloadLastMtimeMs = nextMtime
+                        liveReloadLastSignature = nextSignature
+                        liveReloadEventCount += 1
+                        liveReloadLastEventAtMs = gatewayCanvasNowMs()
+                        shouldPublish = true
+                    }
+                }
+                if (shouldPublish) {
+                    let payload = JsonObject()
+                    payload.put("type", JsonString("reload"))
+                    payload.put("reason", JsonString("canvas-root-changed"))
+                    payload.put("mtimeMs", nextMtime.toJsonValue())
+                    payload.put("eventCount", synchronized(lock) { liveReloadEventCount }.toJsonValue())
+                    gatewayCanvasPublishLiveReloadEvent(payload)
+                }
+            }
+            synchronized(lock) {
+                if (liveReloadGeneration == generation) {
+                    liveReloadRunning = false
+                    liveReloadRootPath = ""
+                }
+            }
+        }
+    }
+
+    private static func stopLiveReloadPollerLocked(): Unit {
+        liveReloadGeneration += 1
+        liveReloadStopRequested = true
+        liveReloadRunning = false
+        liveReloadRootPath = ""
+        liveReloadLastSignature = ""
     }
 
     public static func registerCapabilityRoutes(cfg: GatewayConfig, token: String): Unit {
@@ -689,6 +879,7 @@ public class GatewayCanvasHostRuntime {
 
     public static func stopIfRunning(): Unit {
         synchronized(lock) {
+            GatewayCanvasHostRuntime.stopLiveReloadPollerLocked()
             if (let Some(s) <- server) {
                 try {
                     s.close()
@@ -727,7 +918,10 @@ public class GatewayCanvasHostRuntime {
                 root.put("healthy", true.toJsonValue())
                 root.put("phase", JsonString("ready"))
                 root.put("errorKind", JsonString(""))
-                root.put("watchState", JsonString(if (cfg.canvas.liveReload) { "watching" } else { "static" }))
+                root.put("watchState", JsonString(if (cfg.canvas.liveReload && liveReloadRunning) { "watching" } else { "static" }))
+                root.put("liveReloadEventCount", liveReloadEventCount.toJsonValue())
+                root.put("liveReloadLastEventAtMs", liveReloadLastEventAtMs.toJsonValue())
+                root.put("liveReloadPollIntervalMs", liveReloadPollIntervalMs.toJsonValue())
                 root.put("routes", registeredRoutes)
                 root.put("routeCount", registeredRoutes.size().toJsonValue())
                 return root
@@ -740,6 +934,22 @@ public class GatewayCanvasHostRuntime {
             root.put("routes", JsonArray([]))
             root.put("routeCount", 0.toJsonValue())
             root
+        }
+    }
+
+    public static func debugLiveReloadStateForTest(): JsonObject {
+        synchronized(lock) {
+            let out = JsonObject()
+            out.put("running", liveReloadRunning.toJsonValue())
+            out.put("stopRequested", liveReloadStopRequested.toJsonValue())
+            out.put("rootPath", JsonString(liveReloadRootPath))
+            out.put("lastMtimeMs", liveReloadLastMtimeMs.toJsonValue())
+            out.put("lastSignatureEmpty", liveReloadLastSignature.isEmpty().toJsonValue())
+            out.put("eventCount", liveReloadEventCount.toJsonValue())
+            out.put("lastEventAtMs", liveReloadLastEventAtMs.toJsonValue())
+            out.put("generation", liveReloadGeneration.toJsonValue())
+            out.put("pollIntervalMs", liveReloadPollIntervalMs.toJsonValue())
+            out
         }
     }
 }
