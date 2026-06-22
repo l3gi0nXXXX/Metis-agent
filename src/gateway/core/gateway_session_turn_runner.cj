@@ -601,6 +601,9 @@ public func gatewayExecuteSessionRequestTurn(
         prompt: prompt,
         mediaContext: request.mediaContext,
         memorySearchPolicy: gatewayMemorySearchPolicyFromScope(context.turnContext.agentScope),
+        cronJobId: request.cronJobId,
+        toolExecMode: request.toolExecMode,
+        toolExecAllowlist: request.toolExecAllowlist,
         lifecycleHook: lifecycleHook,
         gatewayCallHook: gatewaySessionTurnGatewayCallHookFromDeliverHook(deliverHook)
     )

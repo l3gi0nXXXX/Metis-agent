@@ -231,10 +231,15 @@ public class CronCommandTest {
                 "--model", "openai:gpt-test",
                 "--thinking-level", "high",
                 "--light-context",
+                "--tool-exec-mode", "allowlist",
+                "--tool-exec-allow", "curl",
+                "--tool-exec-allow", "python3 -m",
                 "--message", "hello advanced cron"
             ])
             @Expect(addCode, 0)
             @Expect(addText.contains("Cron job created"), true)
+            @Expect(addText.contains("Tool exec: allowlist"), true)
+            @Expect(addText.contains("Tool exec allowlist: 2 entries"), true)
 
             let (updateText, updateCode) = executeGatewayCronCommand([
                 "cron", "update", "--job-id", "advanced-flags",
@@ -242,11 +247,15 @@ public class CronCommandTest {
                 "--no-best-effort-deliver",
                 "--failure-dest-mode", "none",
                 "--failure-alert-after", "0",
+                "--tool-exec-mode", "yolo",
+                "--tool-exec-allow", "rg",
                 "--no-light-context",
                 "--enable"
             ])
             @Expect(updateCode, 0)
             @Expect(updateText.contains("Cron job updated"), true)
+            @Expect(updateText.contains("Tool exec: yolo"), true)
+            @Expect(updateText.contains("Tool exec allowlist: 1 entries"), true)
 
             let jobs = cronLoadOrEmpty(cronStorePath(CliConfig.dotDir))
             @Expect(jobs.size, 1)
@@ -264,6 +273,9 @@ public class CronCommandTest {
             @Expect(job.modelOverride, "openai:gpt-test")
             @Expect(job.thinkingLevel, "high")
             @Expect(job.lightContext, false)
+            @Expect(job.toolExecMode, "yolo")
+            @Expect(job.toolExecAllowlist.size, 1)
+            @Expect(job.toolExecAllowlist[0], "rg")
             @Expect(job.enabled, true)
         })
     }

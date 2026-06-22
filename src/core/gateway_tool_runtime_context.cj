@@ -27,6 +27,9 @@ public class GatewayToolRuntimeContext {
     public let prompt: String
     public let mediaContext: JsonObject
     public let memorySearchPolicy: JsonObject
+    public let cronJobId: String
+    public let toolExecMode: String
+    public let toolExecAllowlist: Array<String>
     public let lifecycleHook: Option<(String) -> Unit>
     public let gatewayCallHook: Option<(String, JsonObject) -> JsonObject>
     private var visibleReplyDelivered: Bool = false
@@ -46,6 +49,9 @@ public class GatewayToolRuntimeContext {
         prompt!: String = "",
         mediaContext!: JsonObject = JsonObject(),
         memorySearchPolicy!: JsonObject = JsonObject(),
+        cronJobId!: String = "",
+        toolExecMode!: String = "",
+        toolExecAllowlist!: Array<String> = [],
         lifecycleHook!: Option<(String) -> Unit> = None<(String) -> Unit>,
         gatewayCallHook!: Option<(String, JsonObject) -> JsonObject> = None<(String, JsonObject) -> JsonObject>
     ) {
@@ -70,6 +76,16 @@ public class GatewayToolRuntimeContext {
         this.prompt = prompt
         this.mediaContext = mediaContext
         this.memorySearchPolicy = gatewayToolRuntimeCloneObject(memorySearchPolicy)
+        this.cronJobId = cronJobId.trimAscii()
+        this.toolExecMode = toolExecMode.trimAscii().toAsciiLower()
+        let normalizedAllowlist = ArrayList<String>()
+        for (entry in toolExecAllowlist) {
+            let trimmed = entry.trimAscii()
+            if (!trimmed.isEmpty() && !normalizedAllowlist.contains(trimmed)) {
+                normalizedAllowlist.add(trimmed)
+            }
+        }
+        this.toolExecAllowlist = normalizedAllowlist.toArray()
         this.lifecycleHook = lifecycleHook
         this.gatewayCallHook = gatewayCallHook
     }

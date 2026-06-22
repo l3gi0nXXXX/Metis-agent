@@ -53,4 +53,21 @@ public class GatewayToolRuntimeContextTest {
         @Expect(context.agentId, "agent-a")
         @Expect(context.memorySearchPolicy.get("enabled").isSome(), true)
     }
+
+    @TestCase
+    public func runtimeContextCarriesCronToolExecPolicy(): Unit {
+        let context = GatewayToolRuntimeContext(
+            "cron",
+            cronJobId: "job-a",
+            toolExecMode: "ALLOWLIST",
+            toolExecAllowlist: ["curl", "", "curl", "python3 -m"]
+        )
+
+        @Expect(context.sourceLabel, "cron")
+        @Expect(context.cronJobId, "job-a")
+        @Expect(context.toolExecMode, "allowlist")
+        @Expect(context.toolExecAllowlist.size, 2)
+        @Expect(context.toolExecAllowlist[0], "curl")
+        @Expect(context.toolExecAllowlist[1], "python3 -m")
+    }
 }

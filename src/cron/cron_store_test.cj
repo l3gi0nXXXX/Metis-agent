@@ -50,6 +50,52 @@ private func cronTestPathModeOctal(path: Path): String {
 }
 
 @Test
+public class CronStoreToolExecPolicyTest {
+    @TestCase
+    public func cronSaveLoadPersistsToolExecPolicyAndNormalizesAllowlist(): Unit {
+        withCronStoreTestPath({ storePath =>
+            cronSave(storePath, [
+                CronJob(
+                    "tool-policy",
+                    "hello cron",
+                    CronSchedule.every(60000),
+                    toolExecMode: "allowlist",
+                    toolExecAllowlist: ["curl", "curl", ""]
+                )
+            ])
+
+            let jobs = cronLoadOrEmpty(storePath)
+            @Expect(jobs.size, 1)
+            @Expect(jobs[0].toolExecMode, "allowlist")
+            @Expect(jobs[0].toolExecAllowlist.size, 1)
+            @Expect(jobs[0].toolExecAllowlist[0], "curl")
+        })
+    }
+
+    @TestCase
+    public func cronLoadDefaultsAndSanitizesToolExecPolicy(): Unit {
+        withCronStoreTestPath({ storePath =>
+            Directory.create(storePath.parent, recursive: true)
+            File.writeTo(
+                storePath,
+                ("{\"version\":1,\"jobs\":[" +
+                    "{\"id\":\"legacy\",\"prompt\":\"hello\",\"schedule\":{\"kind\":\"every\",\"everyMs\":60000}}," +
+                    "{\"id\":\"bad-mode\",\"prompt\":\"hello\",\"toolExecMode\":\"approve\",\"toolExecAllowlist\":[\"curl\",42,\"\",\"curl\"],\"schedule\":{\"kind\":\"every\",\"everyMs\":60000}}" +
+                    "]}").toArray()
+            )
+
+            let jobs = cronLoadOrEmpty(storePath)
+            @Expect(jobs.size, 2)
+            @Expect(jobs[0].toolExecMode, "deny")
+            @Expect(jobs[0].toolExecAllowlist.size, 0)
+            @Expect(jobs[1].toolExecMode, "deny")
+            @Expect(jobs[1].toolExecAllowlist.size, 1)
+            @Expect(jobs[1].toolExecAllowlist[0], "curl")
+        })
+    }
+}
+
+@Test
 public class CronRunLogDeliveryErrorTest {
     @TestCase
     public func runLogAppendReadIncludesDeliveryError(): Unit {

@@ -1,6 +1,7 @@
 package metis.gateway.session
 
 import metis.gateway.model.ChatType
+import std.collection.ArrayList
 import stdx.encoding.json.JsonObject
 
 public enum GatewayIngressSource {
@@ -76,6 +77,9 @@ public class GatewaySessionRequest {
     public let routePeerId: String
     public let routeParentPeerKind: String
     public let routeParentPeerId: String
+    public let cronJobId: String
+    public let toolExecMode: String
+    public let toolExecAllowlist: Array<String>
 
     public init(
         source: GatewayIngressSource,
@@ -108,7 +112,10 @@ public class GatewaySessionRequest {
         routePeerKind!: String = "",
         routePeerId!: String = "",
         routeParentPeerKind!: String = "",
-        routeParentPeerId!: String = ""
+        routeParentPeerId!: String = "",
+        cronJobId!: String = "",
+        toolExecMode!: String = "",
+        toolExecAllowlist!: Array<String> = []
     ) {
         this.source = source
         this.channelName = channelName.trimAscii().toAsciiLower()
@@ -141,6 +148,16 @@ public class GatewaySessionRequest {
         this.routePeerId = routePeerId.trimAscii()
         this.routeParentPeerKind = routeParentPeerKind.trimAscii().toAsciiLower()
         this.routeParentPeerId = routeParentPeerId.trimAscii()
+        this.cronJobId = cronJobId.trimAscii()
+        this.toolExecMode = toolExecMode.trimAscii().toAsciiLower()
+        let normalizedAllowlist = ArrayList<String>()
+        for (entry in toolExecAllowlist) {
+            let trimmed = entry.trimAscii()
+            if (!trimmed.isEmpty() && !normalizedAllowlist.contains(trimmed)) {
+                normalizedAllowlist.add(trimmed)
+            }
+        }
+        this.toolExecAllowlist = normalizedAllowlist.toArray()
     }
 }
 
