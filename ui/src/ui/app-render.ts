@@ -43,6 +43,7 @@ import {
   refreshVisibleToolsEffectiveForCurrentSession,
   saveAgentsConfig,
 } from "./controllers/agents.ts";
+import { captureCanvasSnapshot, isCanvasReady, loadCanvasRuntime } from "./controllers/canvas.ts";
 import { loadChannels } from "./controllers/channels.ts";
 import { loadChatHistory } from "./controllers/chat.ts";
 import {
@@ -134,6 +135,7 @@ import { renderExecApprovalPrompt } from "./views/exec-approval.ts";
 import { renderGatewayUrlConfirmation } from "./views/gateway-url-confirmation.ts";
 import { renderLoginGate } from "./views/login-gate.ts";
 import { renderOverview } from "./views/overview.ts";
+import { openExternalUrlSafe } from "./open-external-url.ts";
 
 // Lazy-loaded view modules – deferred so the initial bundle stays small.
 // Each loader resolves once; subsequent calls return the cached module.
@@ -159,6 +161,7 @@ function createLazy<T>(loader: () => Promise<T>): () => T | null {
 }
 
 const lazyAgents = createLazy(() => import("./views/agents.ts"));
+const lazyCanvas = createLazy(() => import("./views/canvas.ts"));
 const lazyChannels = createLazy(() => import("./views/channels.ts"));
 const lazyCron = createLazy(() => import("./views/cron.ts"));
 const lazyDebug = createLazy(() => import("./views/debug.ts"));
@@ -484,6 +487,17 @@ export function renderApp(state: AppViewState) {
     state.cronForm.deliveryMode === "webhook"
       ? rawDeliveryToSuggestions.filter((value) => isHttpUrl(value))
       : rawDeliveryToSuggestions;
+  const openChatCanvas = (_content: string): boolean => {
+    if (!isCanvasReady(state.canvasRuntime)) {
+      return false;
+    }
+    const url = state.canvasRuntime?.httpUrl?.trim() ?? "";
+    if (!url) {
+      return false;
+    }
+    openExternalUrlSafe(url);
+    return true;
+  };
 
   return html`
     ${renderCommandPalette({
@@ -1631,6 +1645,21 @@ export function renderApp(state: AppViewState) {
               }),
             )
           : nothing}
+        ${state.tab === "canvas"
+          ? lazyRender(lazyCanvas, (m) =>
+              m.renderCanvasView({
+                loading: state.canvasLoading,
+                runtime: state.canvasRuntime,
+                error: state.canvasError,
+                lastReloadAt: state.canvasLastReloadAt,
+                actionBusy: state.canvasActionBusy,
+                actionMessage: state.canvasActionMessage,
+                actionError: state.canvasActionError,
+                onRefresh: () => loadCanvasRuntime(state),
+                onScreenshot: () => captureCanvasSnapshot(state),
+              }),
+            )
+          : nothing}
         ${state.tab === "chat"
           ? renderChat({
               sessionKey: state.sessionKey,
@@ -1742,6 +1771,7 @@ export function renderApp(state: AppViewState) {
               sidebarError: state.sidebarError,
               splitRatio: state.splitRatio,
               onOpenSidebar: (content: string) => state.handleOpenSidebar(content),
+              onOpenCanvas: openChatCanvas,
               onCloseSidebar: () => state.handleCloseSidebar(),
               onSplitRatioChange: (ratio: number) => state.handleSplitRatioChange(ratio),
               assistantName: state.assistantName,

@@ -1,4 +1,4 @@
-import{f as e,o as t,r as n,u as r}from"./i18n.js";import{l as i}from"./format.js";import{A as a,B as o,C as s,D as c,F as l,G as u,H as d,I as f,J as p,K as m,L as h,N as g,O as _,P as v,R as y,S as b,T as x,U as S,V as C,W as w,X as ee,Y as T,Z as E,_ as te,a as ne,b as D,d as re,f as ie,g as ae,h as oe,k as O,m as se,n as ce,p as le,q as ue,r as de,t as fe,u as pe,v as me,w as he,x as ge,y as _e,z as ve}from"./index.js";import{r as ye}from"./channel-config-extras.js";import{i as be,n as xe,r as Se,t as Ce}from"./skills-shared.js";function we(t){let{agent:i,configForm:a,agentFilesList:o,configLoading:s,configSaving:c,configDirty:l,onConfigReload:u,onConfigSave:d,onModelChange:f,onModelFallbacksChange:p,onSelectPanel:m}=t,h=me(a,i.id),g=i.model,_=(o&&o.agentId===i.id?o.workspace:null)||h.entry?.workspace||h.defaults?.workspace||i.workspace||`default`,v=h.entry?.model?D(h.entry?.model):h.defaults?.model?D(h.defaults?.model):D(g),y=D(h.defaults?.model??g),b=ge(h.entry?.model),x=ge(h.defaults?.model)||(y===`-`?null:ae(y))||(a?null:ge(g)),S=b??x??null,C=_e(h.entry?.model)??_e(h.defaults?.model)??(a?null:_e(g))??[],w=Array.isArray(h.entry?.skills)?h.entry?.skills:null,ee=w?.length??null,T=!!(t.defaultId&&i.id===t.defaultId),E=!a||s||c,ne=e=>{let t=C.filter((t,n)=>n!==e);p(i.id,t)};return e`
+import{f as e,o as t,r as n,u as r}from"./i18n.js";import{l as i}from"./format.js";import{$ as a,A as o,B as s,C as c,G as l,H as u,I as d,J as f,K as p,L as m,O as h,Q as g,R as _,S as v,T as y,U as b,V as x,W as S,X as C,Y as w,Z as ee,_ as te,a as T,b as E,d as D,et as O,f as ne,g as re,h as ie,j as ae,k as oe,m as se,n as ce,p as le,q as ue,r as de,t as fe,u as pe,v as me,w as he,x as ge,y as _e,z as ve}from"./index.js";import{r as ye}from"./channel-config-extras.js";import{i as be,n as xe,r as Se,t as Ce}from"./skills-shared.js";function we(t){let{agent:i,configForm:a,agentFilesList:o,configLoading:s,configSaving:c,configDirty:l,onConfigReload:u,onConfigSave:d,onModelChange:f,onModelFallbacksChange:p,onSelectPanel:m}=t,h=me(a,i.id),g=i.model,_=(o&&o.agentId===i.id?o.workspace:null)||h.entry?.workspace||h.defaults?.workspace||i.workspace||`default`,v=h.entry?.model?E(h.entry?.model):h.defaults?.model?E(h.defaults?.model):E(g),y=E(h.defaults?.model??g),b=ge(h.entry?.model),x=ge(h.defaults?.model)||(y===`-`?null:re(y))||(a?null:ge(g)),S=b??x??null,C=_e(h.entry?.model)??_e(h.defaults?.model)??(a?null:_e(g))??[],w=Array.isArray(h.entry?.skills)?h.entry?.skills:null,ee=w?.length??null,T=!!(t.defaultId&&i.id===t.defaultId),D=!a||s||c,O=e=>{let t=C.filter((t,n)=>n!==e);p(i.id,t)};return e`
     <section class="card">
       <div class="card-title">Overview</div>
       <div class="card-sub">Workspace paths and identity metadata.</div>
@@ -40,7 +40,7 @@ import{f as e,o as t,r as n,u as r}from"./i18n.js";import{l as i}from"./format.j
             <span>Primary model${T?` (default)`:``}</span>
             <select
               .value=${T?S??``:b??``}
-              ?disabled=${E}
+              ?disabled=${D}
               @change=${e=>f(i.id,e.target.value||null)}
             >
               ${T?e` <option value="">Not set</option> `:e`
@@ -48,7 +48,7 @@ import{f as e,o as t,r as n,u as r}from"./i18n.js";import{l as i}from"./format.j
                       ${x?`Inherit default (${x})`:`Inherit default`}
                     </option>
                   `}
-              ${ie(a,S??void 0,t.modelCatalog)}
+              ${ne(a,S??void 0,t.modelCatalog)}
             </select>
           </label>
           <div class="field">
@@ -63,15 +63,15 @@ import{f as e,o as t,r as n,u as r}from"./i18n.js";import{l as i}from"./format.j
                     <button
                       type="button"
                       class="chip-remove"
-                      ?disabled=${E}
-                      @click=${()=>ne(n)}
+                      ?disabled=${D}
+                      @click=${()=>O(n)}
                     >
                       &times;
                     </button>
                   </span>
                 `)}
               <input
-                ?disabled=${E}
+                ?disabled=${D}
                 placeholder=${C.length===0?`provider/model`:``}
                 @keydown=${e=>{let t=e.target;if(e.key===`Enter`||e.key===`,`){e.preventDefault();let n=te(t.value);n.length>0&&(p(i.id,[...C,...n]),t.value=``)}}}
                 @blur=${e=>{let t=e.target,n=te(t.value);n.length>0&&(p(i.id,[...C,...n]),t.value=``)}}
@@ -258,7 +258,7 @@ ${e}
           </div>
           <div class="stat">
             <div class="stat-label">Next wake</div>
-            <div class="stat-value">${ne(t.status?.nextWakeAtMs??null)}</div>
+            <div class="stat-value">${T(t.status?.nextWakeAtMs??null)}</div>
           </div>
         </div>
         ${t.error?e`<div class="callout danger" style="margin-top: 12px;">${t.error}</div>`:r}
@@ -299,7 +299,7 @@ ${e}
             </div>
           `}
     </section>
-  `}function et(t){let i=t.agentFilesList?.agentId===t.agentId?t.agentFilesList:null,o=i?.files??[],s=t.agentFileActive??null,l=s?o.find(e=>e.name===s)??null:null,u=s?t.agentFileContents[s]??``:``,d=s?t.agentFileDrafts[s]??u:``,f=s?d!==u:!1;return e`
+  `}function et(t){let i=t.agentFilesList?.agentId===t.agentId?t.agentFilesList:null,a=i?.files??[],s=t.agentFileActive??null,c=s?a.find(e=>e.name===s)??null:null,l=s?t.agentFileContents[s]??``:``,u=s?t.agentFileDrafts[s]??l:``,d=s?u!==l:!1;return e`
     <section class="card">
       <div class="row" style="justify-content: space-between;">
         <div>
@@ -320,9 +320,9 @@ ${e}
       ${t.agentFilesError?e`<div class="callout danger" style="margin-top: 12px;">
             ${t.agentFilesError}
           </div>`:r}
-      ${i?o.length===0?e` <div class="muted" style="margin-top: 16px">No files found.</div> `:e`
+      ${i?a.length===0?e` <div class="muted" style="margin-top: 16px">No files found.</div> `:e`
               <div class="agent-tabs" style="margin-top: 14px;">
-                ${o.map(n=>{let i=s===n.name,a=n.name.replace(/\.md$/i,``);return e`
+                ${a.map(n=>{let i=s===n.name,a=n.name.replace(/\.md$/i,``);return e`
                     <button
                       class="agent-tab ${i?`active`:``} ${n.missing?`agent-tab--missing`:``}"
                       @click=${()=>t.onSelectFile(n.name)}
@@ -331,10 +331,10 @@ ${e}
                     </button>
                   `})}
               </div>
-              ${l?e`
+              ${c?e`
                     <div class="agent-file-header" style="margin-top: 14px;">
                       <div>
-                        <div class="agent-file-sub mono">${l.path}</div>
+                        <div class="agent-file-sub mono">${c.path}</div>
                       </div>
                       <div class="agent-file-actions">
                         <button
@@ -342,25 +342,25 @@ ${e}
                           title="Preview rendered markdown"
                           @click=${e=>{let t=e.currentTarget.closest(`.card`)?.querySelector(`dialog`);t&&t.showModal()}}
                         >
-                          ${O.eye} Preview
+                          ${o.eye} Preview
                         </button>
                         <button
                           class="btn btn--sm"
-                          ?disabled=${!f}
-                          @click=${()=>t.onFileReset(l.name)}
+                          ?disabled=${!d}
+                          @click=${()=>t.onFileReset(c.name)}
                         >
                           Reset
                         </button>
                         <button
                           class="btn btn--sm primary"
-                          ?disabled=${t.agentFileSaving||!f}
-                          @click=${()=>t.onFileSave(l.name)}
+                          ?disabled=${t.agentFileSaving||!d}
+                          @click=${()=>t.onFileSave(c.name)}
                         >
                           ${t.agentFileSaving?`Saving…`:`Save`}
                         </button>
                       </div>
                     </div>
-                    ${l.missing?e`
+                    ${c.missing?e`
                           <div class="callout info" style="margin-top: 10px">
                             This file is missing. Saving will create it in the agent workspace.
                           </div>
@@ -369,8 +369,8 @@ ${e}
                       <span>Content</span>
                       <textarea
                         class="agent-file-textarea"
-                        .value=${d}
-                        @input=${e=>t.onFileDraftChange(l.name,e.target.value)}
+                        .value=${u}
+                        @input=${e=>t.onFileDraftChange(c.name,e.target.value)}
                       ></textarea>
                     </label>
                     <dialog
@@ -380,33 +380,33 @@ ${e}
                     >
                       <div class="md-preview-dialog__panel">
                         <div class="md-preview-dialog__header">
-                          <div class="md-preview-dialog__title mono">${l.name}</div>
+                          <div class="md-preview-dialog__title mono">${c.name}</div>
                           <div class="md-preview-dialog__actions">
                             <button
                               class="btn btn--sm md-preview-expand-btn"
                               title="Toggle fullscreen"
                               @click=${e=>{let t=e.currentTarget,n=t.closest(`.md-preview-dialog__panel`);if(!n)return;let r=n.classList.toggle(`fullscreen`);t.classList.toggle(`is-fullscreen`,r)}}
                             >
-                              <span class="when-normal">${O.maximize} Expand</span
-                              ><span class="when-fullscreen">${O.minimize} Collapse</span>
+                              <span class="when-normal">${o.maximize} Expand</span
+                              ><span class="when-fullscreen">${o.minimize} Collapse</span>
                             </button>
                             <button
                               class="btn btn--sm"
                               title="Edit file"
                               @click=${e=>{e.currentTarget.closest(`dialog`)?.close(),document.querySelector(`.agent-file-textarea`)?.focus()}}
                             >
-                              ${O.edit} Editor
+                              ${o.edit} Editor
                             </button>
                             <button
                               class="btn btn--sm"
                               @click=${e=>{e.currentTarget.closest(`dialog`)?.close()}}
                             >
-                              ${O.x} Close
+                              ${o.x} Close
                             </button>
                           </div>
                         </div>
                         <div class="md-preview-dialog__body">
-                          ${a(Ge(c.parse(d,{gfm:!0,breaks:!0}),{sanitize:e=>_.sanitize(e)}))}
+                          ${ae(Ge(h.parse(u,{gfm:!0,breaks:!0}),{sanitize:e=>oe.sanitize(e)}))}
                         </div>
                       </div>
                     </dialog>
@@ -421,14 +421,14 @@ ${e}
     <div style="display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px;">
       ${o.map(t=>e`<span class="agent-pill">${t}</span>`)}
     </div>
-  `}function nt(e){return e.source===`plugin`?e.pluginId?n(`agentTools.connectedSource`,{id:e.pluginId}):n(`agentTools.connected`):e.source===`channel`?e.channelId?n(`agentTools.channelSource`,{id:e.channelId}):n(`agentTools.channel`):n(`agentTools.builtIn`)}function rt(t){let i=me(t.configForm,t.agentId),a=i.entry?.tools??{},o=i.globalTools??{},c=a.profile??o.profile??`full`,l=s(t.toolsCatalogResult),u=he(t.toolsCatalogResult),d=a.profile?`agent override`:o.profile?`global default`:`default`,f=Array.isArray(a.allow)&&a.allow.length>0,p=Array.isArray(o.allow)&&o.allow.length>0,m=!!t.configForm&&!t.configLoading&&!t.configSaving&&!f&&!(t.toolsCatalogLoading&&!t.toolsCatalogResult&&!t.toolsCatalogError),h=f?[]:Array.isArray(a.alsoAllow)?a.alsoAllow:[],g=f?[]:Array.isArray(a.deny)?a.deny:[],_=f?{allow:a.allow??[],deny:a.deny??[]}:b(c)??void 0,v=u.flatMap(e=>e.tools.map(e=>e.id)),y=e=>{let t=le(e,_),n=se(e,h),r=se(e,g);return{allowed:(t||n)&&!r,baseAllowed:t,denied:r}},S=v.filter(e=>y(e).allowed).length,C=(e,n)=>{let r=new Set(h.map(e=>x(e)).filter(e=>e.length>0)),i=new Set(g.map(e=>x(e)).filter(e=>e.length>0)),a=y(e).baseAllowed,o=x(e);n?(i.delete(o),a||r.add(o)):(r.delete(o),i.add(o)),t.onOverridesChange(t.agentId,[...r],[...i])},w=e=>{let n=new Set(h.map(e=>x(e)).filter(e=>e.length>0)),r=new Set(g.map(e=>x(e)).filter(e=>e.length>0));for(let t of v){let i=y(t).baseAllowed,a=x(t);e?(r.delete(a),i||n.add(a)):(n.delete(a),r.add(a))}t.onOverridesChange(t.agentId,[...n],[...r])};return e`
+  `}function nt(e){return e.source===`plugin`?e.pluginId?n(`agentTools.connectedSource`,{id:e.pluginId}):n(`agentTools.connected`):e.source===`channel`?e.channelId?n(`agentTools.channelSource`,{id:e.channelId}):n(`agentTools.channel`):n(`agentTools.builtIn`)}function rt(t){let i=me(t.configForm,t.agentId),a=i.entry?.tools??{},o=i.globalTools??{},s=a.profile??o.profile??`full`,l=c(t.toolsCatalogResult),u=he(t.toolsCatalogResult),d=a.profile?`agent override`:o.profile?`global default`:`default`,f=Array.isArray(a.allow)&&a.allow.length>0,p=Array.isArray(o.allow)&&o.allow.length>0,m=!!t.configForm&&!t.configLoading&&!t.configSaving&&!f&&!(t.toolsCatalogLoading&&!t.toolsCatalogResult&&!t.toolsCatalogError),h=f?[]:Array.isArray(a.alsoAllow)?a.alsoAllow:[],g=f?[]:Array.isArray(a.deny)?a.deny:[],_=f?{allow:a.allow??[],deny:a.deny??[]}:v(s)??void 0,b=u.flatMap(e=>e.tools.map(e=>e.id)),x=e=>{let t=le(e,_),n=se(e,h),r=se(e,g);return{allowed:(t||n)&&!r,baseAllowed:t,denied:r}},S=b.filter(e=>x(e).allowed).length,C=(e,n)=>{let r=new Set(h.map(e=>y(e)).filter(e=>e.length>0)),i=new Set(g.map(e=>y(e)).filter(e=>e.length>0)),a=x(e).baseAllowed,o=y(e);n?(i.delete(o),a||r.add(o)):(r.delete(o),i.add(o)),t.onOverridesChange(t.agentId,[...r],[...i])},w=e=>{let n=new Set(h.map(e=>y(e)).filter(e=>e.length>0)),r=new Set(g.map(e=>y(e)).filter(e=>e.length>0));for(let t of b){let i=x(t).baseAllowed,a=y(t);e?(r.delete(a),i||n.add(a)):(n.delete(a),r.add(a))}t.onOverridesChange(t.agentId,[...n],[...r])};return e`
     <section class="card">
       <div class="row" style="justify-content: space-between; flex-wrap: wrap;">
         <div style="min-width: 0;">
           <div class="card-title">Tool Access</div>
           <div class="card-sub">
             Profile + per-tool overrides for this agent.
-            <span class="mono">${S}/${v.length}</span> enabled.
+            <span class="mono">${S}/${b.length}</span> enabled.
           </div>
         </div>
         <div class="row" style="gap: 8px; flex-wrap: wrap;">
@@ -484,7 +484,7 @@ ${e}
       <div class="agent-tools-meta" style="margin-top: 16px;">
         <div class="agent-kv">
           <div class="label">Profile</div>
-          <div class="mono">${c}</div>
+          <div class="mono">${s}</div>
         </div>
         <div class="agent-kv">
           <div class="label">Source</div>
@@ -551,7 +551,7 @@ ${e}
         <div class="agent-tools-buttons">
           ${l.map(n=>e`
               <button
-                class="btn btn--sm ${c===n.id?`active`:``}"
+                class="btn btn--sm ${s===n.id?`active`:``}"
                 ?disabled=${!m}
                 @click=${()=>t.onProfileChange(t.agentId,n.id,!0)}
               >
@@ -578,7 +578,7 @@ ${e}
                     >`:r}
               </div>
               <div class="agent-tools-list">
-                ${t.tools.map(n=>{let{allowed:r}=y(n.id);return e`
+                ${t.tools.map(n=>{let{allowed:r}=x(n.id);return e`
                     <div class="agent-tool-row">
                       <div>
                         <div class="agent-tool-title mono">${n.label}</div>
@@ -766,7 +766,7 @@ ${e}
     <section style="margin-top: 16px;">
       ${Ut(t,n,i)}
     </section>
-  `}function ct(t,n,r){let i=y({teamCount:n.length,memberCount:r.length,bindingCount:B(t.draft.bindingsJson),hasModelState:!!t.modelResult?.models,hasWorkspaceProfile:!!(t.workspace.workspace||t.workspace.files.length>0),channelsSnapshot:t.channelsSnapshot});return e`
+  `}function ct(t,n,r){let i=x({teamCount:n.length,memberCount:r.length,bindingCount:B(t.draft.bindingsJson),hasModelState:!!t.modelResult?.models,hasWorkspaceProfile:!!(t.workspace.workspace||t.workspace.files.length>0),channelsSnapshot:t.channelsSnapshot});return e`
     <section class="grid grid-cols-2" style="margin-bottom: 16px;">
       <section class="card">
         <div class="row" style="justify-content: space-between; align-items: flex-start;">
@@ -902,7 +902,7 @@ ${e}
           `)}
       </div>
     </section>
-  `}function ft(t){let n=d({draft:t.draft,channelsSnapshot:t.channelsSnapshot}),r=ve(t.draft,t.binding);return e`
+  `}function ft(t){let n=l({draft:t.draft,channelsSnapshot:t.channelsSnapshot}),r=u(t.draft,t.binding);return e`
     <section class="grid grid-cols-2" style="margin-bottom: 16px;">
       <section class="card">
         <div class="row" style="justify-content: space-between; align-items: flex-start;">
@@ -979,7 +979,7 @@ ${e}
         </div>
         <div class="agent-kv">
           <div class="label">Profile files</div>
-          <div>${g.length} supported</div>
+          <div>${d.length} supported</div>
         </div>
         <div class="agent-kv">
           <div class="label">Write boundary</div>
@@ -1044,7 +1044,7 @@ ${e}
         <div class="list-title">Template library</div>
         <div class="card-sub">Grouped templates for content, engineering, support, data, and operations teams.</div>
         <div class="list" style="margin-top: 10px;">
-          ${v.map(n=>e`
+          ${m.map(n=>e`
               <div class="list-item">
                 <div class="list-main">
                   <div class="row" style="justify-content: space-between; align-items: center; gap: 8px;">
@@ -1064,7 +1064,7 @@ ${e}
                             type="button"
                             class="btn btn--sm"
                             style="margin-top: 10px;"
-                            @click=${()=>t.onDraftChange(h(t.draft,n.id))}
+                            @click=${()=>t.onDraftChange(s(t.draft,n.id))}
                           >
                             Use template
                           </button>
@@ -1236,7 +1236,7 @@ ${e}
             ?disabled=${!!t.detail||r.length>0}
             @change=${e=>t.onDraftChange({template:$(e)})}
           >
-            ${v.flatMap(t=>t.templates.map(n=>e`<option value=${n.id}>${t.label} · ${n.label}</option>`))}
+            ${m.flatMap(t=>t.templates.map(n=>e`<option value=${n.id}>${t.label} · ${n.label}</option>`))}
             <option value="">Custom members</option>
           </select>
         </label>
@@ -1262,7 +1262,7 @@ ${e}
         <button
           type="button"
           class="btn btn--sm"
-          @click=${()=>t.onDraftChange(f(t.draft))}
+          @click=${()=>t.onDraftChange(ve(t.draft))}
         >
           Add Member
         </button>
@@ -1320,7 +1320,7 @@ ${e}
             <input
               .value=${n.agentId??``}
               placeholder="content-writer"
-              @input=${e=>t.onDraftChange(w(t.draft,r,{agentId:Q(e)}))}
+              @input=${e=>t.onDraftChange(ue(t.draft,r,{agentId:Q(e)}))}
             />
           </label>
           <label class="field">
@@ -1328,7 +1328,7 @@ ${e}
             <input
               .value=${n.role??``}
               placeholder="writer"
-              @input=${e=>t.onDraftChange(w(t.draft,r,{role:Q(e)}))}
+              @input=${e=>t.onDraftChange(ue(t.draft,r,{role:Q(e)}))}
             />
           </label>
           <label class="field">
@@ -1336,7 +1336,7 @@ ${e}
             <input
               .value=${n.name??``}
               placeholder="Writer"
-              @input=${e=>t.onDraftChange(w(t.draft,r,{name:Q(e)}))}
+              @input=${e=>t.onDraftChange(ue(t.draft,r,{name:Q(e)}))}
             />
           </label>
         </div>
@@ -1345,7 +1345,7 @@ ${e}
         <button
           type="button"
           class="btn btn--sm btn--ghost"
-          @click=${()=>t.onDraftChange(p(t.draft,r))}
+          @click=${()=>t.onDraftChange(ee(t.draft,r))}
         >
           Remove
         </button>
@@ -1407,7 +1407,7 @@ ${e}
       <button
         type="button"
         class="btn btn--sm"
-        @click=${()=>t.onDraftChange(l(t.draft))}
+        @click=${()=>t.onDraftChange(_(t.draft))}
       >
         Add Alias
       </button>
@@ -1426,14 +1426,14 @@ ${e}
             <input
               .value=${r.alias??``}
               placeholder="@writer"
-              @input=${e=>t.onDraftChange(S(t.draft,i,{alias:Q(e)}))}
+              @input=${e=>t.onDraftChange(p(t.draft,i,{alias:Q(e)}))}
             />
           </label>
           <label class="field">
             <span>Member</span>
             <select
               .value=${r.agentId??``}
-              @change=${e=>t.onDraftChange(S(t.draft,i,{agentId:$(e)}))}
+              @change=${e=>t.onDraftChange(p(t.draft,i,{agentId:$(e)}))}
             >
               <option value="">Choose member</option>
               ${n.map(t=>e`<option value=${t.agentId}>${R(t.agentId,n)}</option>`)}
@@ -1445,13 +1445,13 @@ ${e}
         <button
           type="button"
           class="btn btn--sm btn--ghost"
-          @click=${()=>t.onDraftChange(ue(t.draft,i))}
+          @click=${()=>t.onDraftChange(C(t.draft,i))}
         >
           Remove
         </button>
       </div>
     </div>
-  `}function At(t,n,r){let i=z(r),a=U(r.members);return e`
+  `}function At(t,n,r){let i=z(r),o=U(r.members);return e`
     <div style="margin-top: 16px;">
       <div class="row" style="justify-content: space-between; align-items: flex-start;">
         <div>
@@ -1463,7 +1463,7 @@ ${e}
             type="button"
             class="btn btn--sm btn--ghost"
             ?disabled=${!i||n.length===0}
-            @click=${()=>t.onDraftChange(E(t.draft,n,!0))}
+            @click=${()=>t.onDraftChange(O(t.draft,n,!0))}
           >
             Select all members
           </button>
@@ -1471,7 +1471,7 @@ ${e}
             type="button"
             class="btn btn--sm btn--ghost"
             ?disabled=${!i}
-            @click=${()=>t.onDraftChange(E(t.draft,n,!1))}
+            @click=${()=>t.onDraftChange(O(t.draft,n,!1))}
           >
             Clear selected
           </button>
@@ -1479,32 +1479,32 @@ ${e}
             <input
               type="checkbox"
               ?checked=${i}
-              @change=${e=>t.onDraftChange(T(t.draft,mn(e)))}
+              @change=${e=>t.onDraftChange(g(t.draft,mn(e)))}
             />
             <span>${i?`Broadcast enabled`:`Broadcast disabled`}</span>
           </label>
         </div>
       </div>
       <div class="list" style="margin-top: 12px;">
-        ${n.map(r=>{let o=a.includes(r.agentId);return e`
+        ${n.map(r=>{let s=o.includes(r.agentId);return e`
             <label class="list-item" style="cursor: pointer;">
               <div class="list-main">
                 <div class="list-title">${R(r.agentId,n)}</div>
-                <div class="list-sub">${o?`Included in broadcast`:`Not included`}</div>
+                <div class="list-sub">${s?`Included in broadcast`:`Not included`}</div>
               </div>
               <div class="list-meta">
                 <input
                   type="checkbox"
-                  ?checked=${o}
+                  ?checked=${s}
                   ?disabled=${!i}
-                  @change=${e=>t.onDraftChange(ee(t.draft,r.agentId,mn(e)))}
+                  @change=${e=>t.onDraftChange(a(t.draft,r.agentId,mn(e)))}
                 />
               </div>
             </label>
           `})}
       </div>
     </div>
-  `}function jt(t,n){let i=t.bindingPreview??o(t.binding);return e`
+  `}function jt(t,n){let i=t.bindingPreview??b(t.binding);return e`
     <section class="card">
       <div class="card-title">Binding Builder</div>
       <div class="card-sub">Build channel/account/peer/thread/group/team/role routes before applying them.</div>
@@ -1609,7 +1609,7 @@ ${e}
             .value=${t.workspace.fileName}
             @change=${e=>{let n=$(e);t.onWorkspaceChange({fileName:n}),t.onLoadWorkspaceFile(n)}}
           >
-            ${g.map(t=>e`<option value=${t}>${t}</option>`)}
+            ${d.map(t=>e`<option value=${t}>${t}</option>`)}
           </select>
         </label>
       </div>
@@ -1824,7 +1824,7 @@ ${e}
           `)}
       </div>
     </div>
-  `}var Lt=[{title:`AgentTeam Gateway RPC`,badge:`Gateway`,items:[`agents.teams.* team CRUD`,`agents.bind route bindings`,`agents.migration.dryRun read-only doctor preview`]},{title:`Workspace profile files`,badge:`profiles`,items:[...g]},{title:`Model and provider state`,badge:`models`,items:[`agents.models.get`,`agents.models.set`,`per-agent models.json`,`redacted credential source`]},{title:`Channel capabilities`,badge:`channels`,items:[`Telegram route/account/topic baseline`,`Feishu route/account/group/thread status`,`Feishu native commands: /feishu auth, /feishu doctor, /feishu info`]},{title:`Built-in tools`,badge:`tools`,items:[`feishu_media_list`,`feishu_im_user_fetch_resource`,`gateway control tools`,`memory tools`]},{title:`Built-in skills`,badge:`skills`,items:[`workspace skills`,`bundled Metis skills`,`per-agent skill allowlist`]}];function Rt(){return e`
+  `}var Lt=[{title:`AgentTeam Gateway RPC`,badge:`Gateway`,items:[`agents.teams.* team CRUD`,`agents.bind route bindings`,`agents.migration.dryRun read-only doctor preview`]},{title:`Workspace profile files`,badge:`profiles`,items:[...d]},{title:`Model and provider state`,badge:`models`,items:[`agents.models.get`,`agents.models.set`,`per-agent models.json`,`redacted credential source`]},{title:`Channel capabilities`,badge:`channels`,items:[`Telegram route/account/topic baseline`,`Feishu route/account/group/thread status`,`Feishu native commands: /feishu auth, /feishu doctor, /feishu info`]},{title:`Built-in tools`,badge:`tools`,items:[`feishu_media_list`,`feishu_im_user_fetch_resource`,`gateway control tools`,`memory tools`]},{title:`Built-in skills`,badge:`skills`,items:[`workspace skills`,`bundled Metis skills`,`per-agent skill allowlist`]}];function Rt(){return e`
     <section class="card">
       <div class="card-title">Metis capabilities</div>
       <div class="card-sub">Metis-owned built-in tools, skills, channel capabilities, and Gateway RPC surfaces.</div>
@@ -1957,7 +1957,7 @@ ${e}
           `)}
       </div>
     </div>
-  `}function Vt(t){let n=C({workspace:t.workspace,channelsSnapshot:t.channelsSnapshot}),i=[n.memory,n.heartbeat];return e`
+  `}function Vt(t){let n=S({workspace:t.workspace,channelsSnapshot:t.channelsSnapshot}),i=[n.memory,n.heartbeat];return e`
     <section class="card">
       <div class="row" style="justify-content: space-between; align-items: flex-start;">
         <div>
@@ -2051,7 +2051,7 @@ ${e}
         @input=${e=>r(pn(e))}
       ></textarea>
     </label>
-  `}function Wt(e){let t=u(e);if(typeof document>`u`||typeof URL>`u`||!URL.createObjectURL)return;let n=new Blob([t],{type:`application/json`}),r=URL.createObjectURL(n),i=document.createElement(`a`);i.href=r,i.download=`${e.id.trim()||`metis-agent-team-template`}.json`,i.click(),URL.revokeObjectURL(r)}function Gt(e,t){let n=e.target,r=n.files?.[0];if(!r)return;let i=new FileReader;i.onload=()=>{try{t.onDraftChange(m(String(i.result??``)))}catch{}finally{n.value=``}},i.readAsText(r)}function L(e){return e.displayName?.trim()||e.id}function R(e,t){if(!e)return`first configured member`;let n=t.find(t=>t.agentId===e);return n?`${n.name?.trim()||n.role?.trim()||n.agentId} (${n.agentId})`:e}function Kt(e){let t=[e.added?.length?`${e.added.length} added`:``,e.removed?.length?`${e.removed.length} removed`:``,e.skipped?.length?`${e.skipped.length} skipped`:``,e.missing?.length?`${e.missing.length} missing`:``,e.conflicts?.length?`${e.conflicts.length} conflicts`:``].filter(Boolean);return t.length?t.join(`, `):`Gateway accepted the binding request.`}function qt(e){try{let t=JSON.parse(e||`[]`);return Array.isArray(t)?t:[]}catch{return[]}}function Jt(e){try{let t=JSON.parse(e||`[]`);return Array.isArray(t)?t.map(e=>q(e)).filter(e=>!!e).map(e=>({alias:X(e.alias),agentId:X(e.agentId)})).filter(e=>e.alias||e.agentId):[]}catch{return[]}}function Yt(e){return Array.isArray(e?.aliases)?e.aliases.map(e=>q(e)).filter(e=>!!e).map(e=>({alias:X(e.alias),agentId:X(e.agentId)})).filter(e=>e.alias||e.agentId):[]}function Xt(e,t){try{return q(JSON.parse(e||`{}`))??t??{enabled:!1}}catch{return t??{enabled:!1}}}function z(e){return q(e)?.enabled===!0}function B(e){try{let t=JSON.parse(e||`[]`);return Array.isArray(t)?t.length:0}catch{return 0}}function Zt(e){try{let t=JSON.parse(e||`[]`);return Array.isArray(t)?t:[]}catch{return[]}}function Qt(e,t,n,r){let i=new Set(t.map(e=>e.agentId).filter(Boolean)),a=Zt(e.draft.bindingsJson).map(e=>q(e)).filter(Boolean).map(e=>X(e?.agentId)).filter(Boolean).filter(e=>!i.has(e)),o=$t(n.map(e=>e.alias.toLowerCase()).filter(Boolean)),s=t.filter(t=>t.agentId&&e.workspace.agentId!==t.agentId).map(e=>e.agentId),c=e.modelResult?.models?.agentId||e.modelDraft.agentId,l=t.filter(e=>e.agentId&&c!==e.agentId).map(e=>e.agentId),u=q(e.channelsSnapshot?.channels?.feishu),d=on(q(u?.auth)??q(u?.oauth))?[]:[`Feishu OAuth`],f=u?.configured===!0&&u?.running===!0&&(e.channelsSnapshot?.channelAccounts?.feishu??[]).length>0&&d.length===0;return[{label:`Routing conflicts`,value:[...a,...o].join(`, `)||`none`},{label:`Missing profiles`,value:s.join(`, `)||`none`},{label:`Missing model`,value:l.join(`, `)||`none`},{label:`Missing auth`,value:d.join(`, `)||`none`},{label:`Feishu readiness`,value:f?`ready`:`needs repair`},{label:`Broadcast members`,value:z(r)?V(U(r.members).length,`member`):`disabled`}]}function $t(e){let t=new Set,n=new Set;return e.forEach(e=>{t.has(e)?n.add(e):t.add(e)}),Array.from(n)}function V(e,t){return e===1?`${e} ${t}`:`${e} ${t===`alias`?`aliases`:`${t}s`}`}function en(e,t,n,r){return e.error?`Repair Gateway RPC access`:t.length===0&&n.length===0?`Start with a template`:n.length===0?`Add team members`:r===0&&!e.bindingPreview?.applyPayload?`Preview a channel binding`:e.workspace.workspace?e.modelResult?.models?H(e,`feishu`)||H(e,`telegram`)?`Review and save team changes`:`Repair channel setup`:`Load member model state`:`Load member profile files`}function tn(e,t){return`${t===`feishu`?`Feishu`:`Telegram`} ${H(e,t)?`ready`:`needs setup`}`}function H(e,t){let n=q(e.channelsSnapshot?.channels?.[t]),r=e.channelsSnapshot?.channelAccounts?.[t]??[];return n?.configured===!0||n?.running===!0||r.some(e=>e.configured===!0||e.running===!0||e.connected===!0)}function U(e){return Array.isArray(e)?e.filter(e=>typeof e==`string`).map(e=>e.trim()).filter(Boolean):[]}function W(e){let t=q(q(e.configForm?.gateway)?.feishu??e.configForm?.feishu),n=q(t?.accounts),r=q(t?.groups),i=e.channelsSnapshot?.channelAccounts?.feishu??[],a=n?Object.keys(n):[],o=X(t?.defaultAccount)||e.channelsSnapshot?.channelDefaultAccountId?.feishu||i[0]?.accountId||a[0]||``,s=i.length>0?i:a.map(e=>({accountId:e,configured:!0}));return{defaultAccount:o,threadSession:X(t?.threadSession)||X(t?.groupSessionScope)||`not configured`,groupCount:r?Object.keys(r).length:0,accounts:s}}function nn(e,t,n){return[{title:`Teams list`,message:t.length>0?`${t.length} team definitions loaded.`:`No team definitions loaded.`,status:t.length>0?`ok`:`info`},{title:`Members`,message:n.length>0?`${n.length} members available for edit.`:`No members selected.`,status:n.length>0?`ok`:`warn`},{title:`Binding preview`,message:e.bindingPreview?.applyPayload?`Apply payload is ready.`:`Preview a binding before applying.`,status:e.bindingPreview?.applyPayload?`ok`:`info`},{title:`Workspace profiles`,message:e.workspace.workspace?`Workspace loaded: ${e.workspace.workspace}`:`Choose a member and list files.`,status:e.workspace.workspace?`ok`:`info`},{title:`Model profile`,message:e.modelResult?.models?.path?`models.json: ${e.modelResult.models.path}`:`Load a member model.`,status:e.modelResult?.models?.path?`ok`:`info`},...rn(e)]}function rn(e){let t=W(e),n=q(e.channelsSnapshot?.channels?.feishu),r=U(n?.capabilities).map(e=>e.toLowerCase()),i=q(n?.auth)??q(n?.oauth),a=q(n?.doctor)??q(n?.diagnostics),o=r.some(e=>e.includes(`oapi`)||e.includes(`openapi`)),s=G(i,[`missingAppScopes`,`missing_app_scopes`,`appScopeMissing`]),c=G(i,[`missingUserScopes`,`missing_user_scopes`,`userScopeMissing`]),l=on(i),u=l&&c.length===0&&sn(i),d=t.groupCount===0||cn(a,`disabled_group_policy`),f=B(e.draft.bindingsJson)>0||!!e.bindingPreview?.applyPayload,p=t.accounts.length>0,m=s.length===0&&o;return[{title:l?`OAuth authorized`:`Missing OAuth`,message:l?`Feishu account ${t.defaultAccount||`default`} has an authorized OAuth status.`:`Start OAuth through Gateway RPC; the browser will not write token files.`,status:l?`ok`:`repair`,action:l?void 0:`start-feishu-oauth`},{title:m?`App scope ready`:`Missing app scope`,message:m?`Feishu OAPI/app scope capability is advertised by Gateway status.`:`Missing app scopes: ${s.length?s.join(`, `):`OAPI capability not advertised`}. Update the Feishu app in backend/admin config, then refresh.`,status:m?`ok`:`manual`,action:m?void 0:`refresh`},{title:u?`User scope ready`:`Missing user scope`,message:u?`User OAuth scopes include offline access.`:`Missing user scopes: ${c.length?c.join(`, `):`offline_access`}. Re-run Gateway OAuth after app scopes are granted.`,status:u?`ok`:`repair`,action:u?void 0:`start-feishu-oauth`},{title:p?`Channel account ready`:`Missing channel account`,message:p?`channels.status exposes a redacted Feishu channel account.`:`No redacted Feishu channel account is visible. Configure the account behind Gateway, then refresh.`,status:p?`ok`:`manual`,action:p?void 0:`refresh`},{title:d?`Disabled group policy`:`Group policy ready`,message:d?`No Feishu group policy is visible or doctor reports disabled_group_policy. Repair belongs in non-secret Gateway configuration.`:`Feishu group policy is visible in Control UI status/config.`,status:d?`manual`:`ok`,action:d?`refresh`:void 0},{title:f?`Binding ready`:`Missing binding`,message:f?`Team binding metadata or a Binding Builder preview is ready.`:`Seed a Telegram or Feishu route, preview it, then apply it through agents.bind.`,status:f?`ok`:`repair`,action:f?e.bindingPreview?.applyPayload?`apply-binding`:void 0:`preview-binding`}]}function an(t,n){if(!n.action)return r;if(n.action===`start-feishu-oauth`){let n=W(t).defaultAccount||t.channelsSnapshot?.channelDefaultAccountId?.feishu||`default`;return e`
+  `}function Wt(e){let t=f(e);if(typeof document>`u`||typeof URL>`u`||!URL.createObjectURL)return;let n=new Blob([t],{type:`application/json`}),r=URL.createObjectURL(n),i=document.createElement(`a`);i.href=r,i.download=`${e.id.trim()||`metis-agent-team-template`}.json`,i.click(),URL.revokeObjectURL(r)}function Gt(e,t){let n=e.target,r=n.files?.[0];if(!r)return;let i=new FileReader;i.onload=()=>{try{t.onDraftChange(w(String(i.result??``)))}catch{}finally{n.value=``}},i.readAsText(r)}function L(e){return e.displayName?.trim()||e.id}function R(e,t){if(!e)return`first configured member`;let n=t.find(t=>t.agentId===e);return n?`${n.name?.trim()||n.role?.trim()||n.agentId} (${n.agentId})`:e}function Kt(e){let t=[e.added?.length?`${e.added.length} added`:``,e.removed?.length?`${e.removed.length} removed`:``,e.skipped?.length?`${e.skipped.length} skipped`:``,e.missing?.length?`${e.missing.length} missing`:``,e.conflicts?.length?`${e.conflicts.length} conflicts`:``].filter(Boolean);return t.length?t.join(`, `):`Gateway accepted the binding request.`}function qt(e){try{let t=JSON.parse(e||`[]`);return Array.isArray(t)?t:[]}catch{return[]}}function Jt(e){try{let t=JSON.parse(e||`[]`);return Array.isArray(t)?t.map(e=>q(e)).filter(e=>!!e).map(e=>({alias:X(e.alias),agentId:X(e.agentId)})).filter(e=>e.alias||e.agentId):[]}catch{return[]}}function Yt(e){return Array.isArray(e?.aliases)?e.aliases.map(e=>q(e)).filter(e=>!!e).map(e=>({alias:X(e.alias),agentId:X(e.agentId)})).filter(e=>e.alias||e.agentId):[]}function Xt(e,t){try{return q(JSON.parse(e||`{}`))??t??{enabled:!1}}catch{return t??{enabled:!1}}}function z(e){return q(e)?.enabled===!0}function B(e){try{let t=JSON.parse(e||`[]`);return Array.isArray(t)?t.length:0}catch{return 0}}function Zt(e){try{let t=JSON.parse(e||`[]`);return Array.isArray(t)?t:[]}catch{return[]}}function Qt(e,t,n,r){let i=new Set(t.map(e=>e.agentId).filter(Boolean)),a=Zt(e.draft.bindingsJson).map(e=>q(e)).filter(Boolean).map(e=>X(e?.agentId)).filter(Boolean).filter(e=>!i.has(e)),o=$t(n.map(e=>e.alias.toLowerCase()).filter(Boolean)),s=t.filter(t=>t.agentId&&e.workspace.agentId!==t.agentId).map(e=>e.agentId),c=e.modelResult?.models?.agentId||e.modelDraft.agentId,l=t.filter(e=>e.agentId&&c!==e.agentId).map(e=>e.agentId),u=q(e.channelsSnapshot?.channels?.feishu),d=on(q(u?.auth)??q(u?.oauth))?[]:[`Feishu OAuth`],f=u?.configured===!0&&u?.running===!0&&(e.channelsSnapshot?.channelAccounts?.feishu??[]).length>0&&d.length===0;return[{label:`Routing conflicts`,value:[...a,...o].join(`, `)||`none`},{label:`Missing profiles`,value:s.join(`, `)||`none`},{label:`Missing model`,value:l.join(`, `)||`none`},{label:`Missing auth`,value:d.join(`, `)||`none`},{label:`Feishu readiness`,value:f?`ready`:`needs repair`},{label:`Broadcast members`,value:z(r)?V(U(r.members).length,`member`):`disabled`}]}function $t(e){let t=new Set,n=new Set;return e.forEach(e=>{t.has(e)?n.add(e):t.add(e)}),Array.from(n)}function V(e,t){return e===1?`${e} ${t}`:`${e} ${t===`alias`?`aliases`:`${t}s`}`}function en(e,t,n,r){return e.error?`Repair Gateway RPC access`:t.length===0&&n.length===0?`Start with a template`:n.length===0?`Add team members`:r===0&&!e.bindingPreview?.applyPayload?`Preview a channel binding`:e.workspace.workspace?e.modelResult?.models?H(e,`feishu`)||H(e,`telegram`)?`Review and save team changes`:`Repair channel setup`:`Load member model state`:`Load member profile files`}function tn(e,t){return`${t===`feishu`?`Feishu`:`Telegram`} ${H(e,t)?`ready`:`needs setup`}`}function H(e,t){let n=q(e.channelsSnapshot?.channels?.[t]),r=e.channelsSnapshot?.channelAccounts?.[t]??[];return n?.configured===!0||n?.running===!0||r.some(e=>e.configured===!0||e.running===!0||e.connected===!0)}function U(e){return Array.isArray(e)?e.filter(e=>typeof e==`string`).map(e=>e.trim()).filter(Boolean):[]}function W(e){let t=q(q(e.configForm?.gateway)?.feishu??e.configForm?.feishu),n=q(t?.accounts),r=q(t?.groups),i=e.channelsSnapshot?.channelAccounts?.feishu??[],a=n?Object.keys(n):[],o=X(t?.defaultAccount)||e.channelsSnapshot?.channelDefaultAccountId?.feishu||i[0]?.accountId||a[0]||``,s=i.length>0?i:a.map(e=>({accountId:e,configured:!0}));return{defaultAccount:o,threadSession:X(t?.threadSession)||X(t?.groupSessionScope)||`not configured`,groupCount:r?Object.keys(r).length:0,accounts:s}}function nn(e,t,n){return[{title:`Teams list`,message:t.length>0?`${t.length} team definitions loaded.`:`No team definitions loaded.`,status:t.length>0?`ok`:`info`},{title:`Members`,message:n.length>0?`${n.length} members available for edit.`:`No members selected.`,status:n.length>0?`ok`:`warn`},{title:`Binding preview`,message:e.bindingPreview?.applyPayload?`Apply payload is ready.`:`Preview a binding before applying.`,status:e.bindingPreview?.applyPayload?`ok`:`info`},{title:`Workspace profiles`,message:e.workspace.workspace?`Workspace loaded: ${e.workspace.workspace}`:`Choose a member and list files.`,status:e.workspace.workspace?`ok`:`info`},{title:`Model profile`,message:e.modelResult?.models?.path?`models.json: ${e.modelResult.models.path}`:`Load a member model.`,status:e.modelResult?.models?.path?`ok`:`info`},...rn(e)]}function rn(e){let t=W(e),n=q(e.channelsSnapshot?.channels?.feishu),r=U(n?.capabilities).map(e=>e.toLowerCase()),i=q(n?.auth)??q(n?.oauth),a=q(n?.doctor)??q(n?.diagnostics),o=r.some(e=>e.includes(`oapi`)||e.includes(`openapi`)),s=G(i,[`missingAppScopes`,`missing_app_scopes`,`appScopeMissing`]),c=G(i,[`missingUserScopes`,`missing_user_scopes`,`userScopeMissing`]),l=on(i),u=l&&c.length===0&&sn(i),d=t.groupCount===0||cn(a,`disabled_group_policy`),f=B(e.draft.bindingsJson)>0||!!e.bindingPreview?.applyPayload,p=t.accounts.length>0,m=s.length===0&&o;return[{title:l?`OAuth authorized`:`Missing OAuth`,message:l?`Feishu account ${t.defaultAccount||`default`} has an authorized OAuth status.`:`Start OAuth through Gateway RPC; the browser will not write token files.`,status:l?`ok`:`repair`,action:l?void 0:`start-feishu-oauth`},{title:m?`App scope ready`:`Missing app scope`,message:m?`Feishu OAPI/app scope capability is advertised by Gateway status.`:`Missing app scopes: ${s.length?s.join(`, `):`OAPI capability not advertised`}. Update the Feishu app in backend/admin config, then refresh.`,status:m?`ok`:`manual`,action:m?void 0:`refresh`},{title:u?`User scope ready`:`Missing user scope`,message:u?`User OAuth scopes include offline access.`:`Missing user scopes: ${c.length?c.join(`, `):`offline_access`}. Re-run Gateway OAuth after app scopes are granted.`,status:u?`ok`:`repair`,action:u?void 0:`start-feishu-oauth`},{title:p?`Channel account ready`:`Missing channel account`,message:p?`channels.status exposes a redacted Feishu channel account.`:`No redacted Feishu channel account is visible. Configure the account behind Gateway, then refresh.`,status:p?`ok`:`manual`,action:p?void 0:`refresh`},{title:d?`Disabled group policy`:`Group policy ready`,message:d?`No Feishu group policy is visible or doctor reports disabled_group_policy. Repair belongs in non-secret Gateway configuration.`:`Feishu group policy is visible in Control UI status/config.`,status:d?`manual`:`ok`,action:d?`refresh`:void 0},{title:f?`Binding ready`:`Missing binding`,message:f?`Team binding metadata or a Binding Builder preview is ready.`:`Seed a Telegram or Feishu route, preview it, then apply it through agents.bind.`,status:f?`ok`:`repair`,action:f?e.bindingPreview?.applyPayload?`apply-binding`:void 0:`preview-binding`}]}function an(t,n){if(!n.action)return r;if(n.action===`start-feishu-oauth`){let n=W(t).defaultAccount||t.channelsSnapshot?.channelDefaultAccountId?.feishu||`default`;return e`
       <button
         type="button"
         class="btn btn--sm"
@@ -2082,7 +2082,7 @@ ${e}
             >
               ${i.length===0?e` <option value="">No agents</option> `:i.map(t=>e`
                       <option value=${t.id} ?selected=${t.id===o}>
-                        ${oe(t)}${pe(t.id,a)?` (${pe(t.id,a)})`:``}
+                        ${ie(t)}${pe(t.id,a)?` (${pe(t.id,a)})`:``}
                       </option>
                     `)}
             </select>
@@ -2130,8 +2130,8 @@ ${e}
               ${t.activePanel===`files`?et({agentId:s.id,agentFilesList:t.agentFiles.list,agentFilesLoading:t.agentFiles.loading,agentFilesError:t.agentFiles.error,agentFileActive:t.agentFiles.active,agentFileContents:t.agentFiles.contents,agentFileDrafts:t.agentFiles.drafts,agentFileSaving:t.agentFiles.saving,onLoadFiles:t.onLoadFiles,onSelectFile:t.onSelectFile,onFileDraftChange:t.onFileDraftChange,onFileReset:t.onFileReset,onFileSave:t.onFileSave}):r}
               ${t.activePanel===`tools`?rt({agentId:s.id,configForm:t.config.form,configLoading:t.config.loading,configSaving:t.config.saving,configDirty:t.config.dirty,toolsCatalogLoading:t.toolsCatalog.loading,toolsCatalogError:t.toolsCatalog.error,toolsCatalogResult:t.toolsCatalog.result,toolsEffectiveLoading:t.toolsEffective.loading,toolsEffectiveError:t.toolsEffective.error,toolsEffectiveResult:t.toolsEffective.result,runtimeSessionKey:t.runtimeSessionKey,runtimeSessionMatchesSelectedAgent:t.runtimeSessionMatchesSelectedAgent,onProfileChange:t.onToolsProfileChange,onOverridesChange:t.onToolsOverridesChange,onConfigReload:t.onConfigReload,onConfigSave:t.onConfigSave}):r}
               ${t.activePanel===`skills`?it({agentId:s.id,report:t.agentSkills.report,loading:t.agentSkills.loading,error:t.agentSkills.error,activeAgentId:t.agentSkills.agentId,configForm:t.config.form,configLoading:t.config.loading,configSaving:t.config.saving,configDirty:t.config.dirty,filter:t.agentSkills.filter,onFilterChange:t.onSkillsFilterChange,onRefresh:t.onSkillsRefresh,onToggle:t.onAgentSkillToggle,onClear:t.onAgentSkillsClear,onDisableAll:t.onAgentSkillsDisableAll,onConfigReload:t.onConfigReload,onConfigSave:t.onConfigSave}):r}
-              ${t.activePanel===`channels`?Qe({context:re(s,t.config.form,t.agentFiles.list,a,t.agentIdentityById[s.id]??null),configForm:t.config.form,snapshot:t.channels.snapshot,loading:t.channels.loading,error:t.channels.error,lastSuccess:t.channels.lastSuccess,onRefresh:t.onChannelsRefresh,onSelectPanel:t.onSelectPanel}):r}
-              ${t.activePanel===`cron`?$e({context:re(s,t.config.form,t.agentFiles.list,a,t.agentIdentityById[s.id]??null),agentId:s.id,jobs:t.cron.jobs,status:t.cron.status,loading:t.cron.loading,error:t.cron.error,onRefresh:t.onCronRefresh,onRunNow:t.onCronRunNow,onSelectPanel:t.onSelectPanel}):r}
+              ${t.activePanel===`channels`?Qe({context:D(s,t.config.form,t.agentFiles.list,a,t.agentIdentityById[s.id]??null),configForm:t.config.form,snapshot:t.channels.snapshot,loading:t.channels.loading,error:t.channels.error,lastSuccess:t.channels.lastSuccess,onRefresh:t.onChannelsRefresh,onSelectPanel:t.onSelectPanel}):r}
+              ${t.activePanel===`cron`?$e({context:D(s,t.config.form,t.agentFiles.list,a,t.agentIdentityById[s.id]??null),agentId:s.id,jobs:t.cron.jobs,status:t.cron.status,loading:t.cron.loading,error:t.cron.error,onRefresh:t.onCronRefresh,onRunNow:t.onCronRunNow,onSelectPanel:t.onSelectPanel}):r}
               ${t.activePanel===`teams`?st({...t.agentTeams,onRefresh:t.onTeamsRefresh,onSelectTeam:t.onSelectTeam,onNewTeam:t.onNewTeam,onDraftChange:t.onTeamDraftChange,onCreateTeam:t.onCreateTeam,onUpdateTeam:t.onUpdateTeam,onDeleteTeam:t.onDeleteTeam,onBindingChange:t.onTeamBindingChange,onPreviewBinding:t.onPreviewTeamBinding,onApplyBinding:t.onApplyTeamBinding,onModelDraftChange:t.onTeamModelDraftChange,onLoadModel:t.onLoadTeamModel,onSaveModel:t.onSaveTeamModel,onWorkspaceChange:t.onWorkspaceChange,onLoadWorkspaceFiles:t.onLoadWorkspaceFiles,onLoadWorkspaceFile:t.onLoadWorkspaceFile,onSaveWorkspaceFile:t.onSaveWorkspaceFile,onStartFeishuOAuth:t.onStartFeishuOAuth}):r}
             `}
       </section>

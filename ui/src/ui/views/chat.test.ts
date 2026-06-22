@@ -965,6 +965,64 @@ describe("chat view", () => {
     }
   });
 
+  it("opens assistant markdown in canvas before falling back to the sidebar", () => {
+    const container = document.createElement("div");
+    const openCanvas = vi.fn(() => true);
+    const openSidebar = vi.fn();
+    render(
+      renderChat(
+        createProps({
+          messages: [
+            {
+              role: "assistant",
+              content: "canvas-ready markdown",
+              timestamp: 1000,
+            },
+          ],
+          onOpenCanvas: openCanvas,
+          onOpenSidebar: openSidebar,
+        }),
+      ),
+      container,
+    );
+
+    container
+      .querySelector<HTMLButtonElement>(".chat-expand-btn")
+      ?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+
+    expect(openCanvas).toHaveBeenCalledWith("canvas-ready markdown");
+    expect(openSidebar).not.toHaveBeenCalled();
+  });
+
+  it("falls back to the sidebar when canvas is unavailable", () => {
+    const container = document.createElement("div");
+    const openCanvas = vi.fn(() => false);
+    const openSidebar = vi.fn();
+    render(
+      renderChat(
+        createProps({
+          messages: [
+            {
+              role: "assistant",
+              content: "canvas-fallback markdown",
+              timestamp: 1000,
+            },
+          ],
+          onOpenCanvas: openCanvas,
+          onOpenSidebar: openSidebar,
+        }),
+      ),
+      container,
+    );
+
+    container
+      .querySelector<HTMLButtonElement>(".chat-expand-btn")
+      ?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+
+    expect(openCanvas).toHaveBeenCalledWith("canvas-fallback markdown");
+    expect(openSidebar).toHaveBeenCalledWith("canvas-fallback markdown");
+  });
+
   it("renders delete confirm with the expected safe structure", () => {
     const originalPreference = readDeleteConfirmPreference();
     clearDeleteConfirmPreference();

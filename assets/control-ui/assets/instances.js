@@ -1,4 +1,4 @@
-import{f as e,r as t,u as n}from"./i18n.js";import{k as r,o as i}from"./index.js";var a=!1;function o(i){let o=!a;return e`
+import{f as e,r as t,u as n}from"./i18n.js";import{A as r,o as i}from"./index.js";var a=!1;function o(i){let o=!a;return e`
     <section class="card">
       <div class="row" style="justify-content: space-between;">
         <div>

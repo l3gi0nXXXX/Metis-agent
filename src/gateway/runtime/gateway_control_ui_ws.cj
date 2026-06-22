@@ -3000,6 +3000,9 @@ public func gatewayControlUiWsCompatResponse(method: String, params: JsonObject,
     if (normalized == "channels.audit") {
         return Some(GatewayProtocolResponse(true, method, result: gatewayControlUiWsChannelsAuditResult(params)))
     }
+    if (normalized == "canvas.runtime") {
+        return Some(gatewayControlUiWsLocalRpcCompatResponse(normalized, params))
+    }
     if (normalized == "node.list") {
         return Some(GatewayProtocolResponse(true, method, result: gatewayControlUiWsNodeListResult(cfg)))
     }

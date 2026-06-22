@@ -15,6 +15,7 @@ import { loadAgentIdentities, loadAgentIdentity } from "./controllers/agent-iden
 import { loadAgentSkills } from "./controllers/agent-skills.ts";
 import { loadAgentTeams } from "./controllers/agent-teams.ts";
 import { loadAgents } from "./controllers/agents.ts";
+import { loadCanvasRuntime } from "./controllers/canvas.ts";
 import { loadChannels } from "./controllers/channels.ts";
 import { loadConfig, loadConfigSchema } from "./controllers/config.ts";
 import { loadCronJobs, loadCronRuns, loadCronStatus } from "./controllers/cron.ts";
@@ -286,6 +287,9 @@ export async function refreshActiveTab(host: SettingsHost) {
     await loadDevices(host as unknown as MetisApp);
     await loadConfig(host as unknown as MetisApp);
     await loadExecApprovals(host as unknown as MetisApp);
+  }
+  if (host.tab === "canvas") {
+    await loadCanvasRuntime(host as unknown as MetisApp);
   }
   if (host.tab === "dreams") {
     await loadConfig(host as unknown as MetisApp);

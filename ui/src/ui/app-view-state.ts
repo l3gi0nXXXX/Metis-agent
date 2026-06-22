@@ -83,6 +83,13 @@ export type AppViewState = {
   chatManualRefreshInFlight: boolean;
   nodesLoading: boolean;
   nodes: Array<Record<string, unknown>>;
+  canvasLoading: boolean;
+  canvasRuntime: import("./controllers/canvas.js").CanvasRuntimeSnapshot | null;
+  canvasError: string | null;
+  canvasLastReloadAt: number | null;
+  canvasActionBusy: boolean;
+  canvasActionMessage: string | null;
+  canvasActionError: string | null;
   chatNewMessagesBelow: boolean;
   navDrawerOpen: boolean;
   sidebarOpen: boolean;

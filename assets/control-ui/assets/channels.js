@@ -1,4 +1,4 @@
-import{f as e,r as t,u as n}from"./i18n.js";import{d as r,l as i}from"./format.js";import{$ as a,Q as o,c as s,l as c}from"./index.js";import{n as l,t as u}from"./channel-config-extras.js";function d(e,t){let n=e;for(let e of t){if(!n)return null;let t=a(n);if(t===`object`){let t=n.properties??{};if(typeof e==`string`&&t[e]){n=t[e];continue}let r=n.additionalProperties;if(typeof e==`string`&&r&&typeof r==`object`){n=r;continue}return null}if(t===`array`){if(typeof e!=`number`)return null;n=(Array.isArray(n.items)?n.items[0]:n.items)??null;continue}return null}return n}function f(e,t){return l(e,t)??{}}var p=[`groupPolicy`,`streamMode`,`dmPolicy`];function m(t){let n=p.flatMap(e=>e in t?[[e,t[e]]]:[]);return n.length===0?null:e`
+import{f as e,r as t,u as n}from"./i18n.js";import{d as r,l as i}from"./format.js";import{c as a,l as o,nt as s,tt as c}from"./index.js";import{n as l,t as u}from"./channel-config-extras.js";function d(e,t){let n=e;for(let e of t){if(!n)return null;let t=s(n);if(t===`object`){let t=n.properties??{};if(typeof e==`string`&&t[e]){n=t[e];continue}let r=n.additionalProperties;if(typeof e==`string`&&r&&typeof r==`object`){n=r;continue}return null}if(t===`array`){if(typeof e!=`number`)return null;n=(Array.isArray(n.items)?n.items[0]:n.items)??null;continue}return null}return n}function f(e,t){return l(e,t)??{}}var p=[`groupPolicy`,`streamMode`,`dmPolicy`];function m(t){let n=p.flatMap(e=>e in t?[[e,t[e]]]:[]);return n.length===0?null:e`
     <div class="status-list" style="margin-top: 12px;">
       ${n.map(([t,n])=>e`
           <div>
@@ -7,11 +7,11 @@ import{f as e,r as t,u as n}from"./i18n.js";import{d as r,l as i}from"./format.j
           </div>
         `)}
     </div>
-  `}function h(t){let n=s(t.schema),r=n.schema;if(!r)return e` <div class="callout danger">Schema unavailable. Use Raw.</div> `;let i=d(r,[`channels`,t.channelId]);if(!i)return e` <div class="callout danger">Channel config schema unavailable.</div> `;let a=f(t.configValue??{},t.channelId);return e`
+  `}function h(t){let n=a(t.schema),r=n.schema;if(!r)return e` <div class="callout danger">Schema unavailable. Use Raw.</div> `;let i=d(r,[`channels`,t.channelId]);if(!i)return e` <div class="callout danger">Channel config schema unavailable.</div> `;let s=f(t.configValue??{},t.channelId);return e`
     <div class="config-form">
-      ${c({schema:i,value:a,path:[`channels`,t.channelId],hints:t.uiHints,unsupported:new Set(n.unsupportedPaths),disabled:t.disabled,showLabel:!1,onPatch:t.onPatch})}
+      ${o({schema:i,value:s,path:[`channels`,t.channelId],hints:t.uiHints,unsupported:new Set(n.unsupportedPaths),disabled:t.disabled,showLabel:!1,onPatch:t.onPatch})}
     </div>
-    ${m(a)}
+    ${m(s)}
   `}function g(n){let{channelId:r,props:i}=n,a=i.configSaving||i.configSchemaLoading;return e`
     <div style="margin-top: 16px;">
       ${i.configSchemaLoading?e` <div class="muted">Loading config schema…</div> `:h({channelId:r,configValue:i.configForm,schema:i.configSchema,uiHints:i.configUiHints,disabled:a,onPatch:i.onConfigPatch})}
@@ -62,7 +62,7 @@ import{f as e,r as t,u as n}from"./i18n.js";import{d as r,l as i}from"./format.j
           ${o.probe.error??``}
         </div>`:n,configSection:g({channelId:`imessage`,props:a}),footer:e`<div class="row" style="margin-top: 12px;">
       <button class="btn" @click=${()=>a.onRefresh(!0)}>${t(`common.probe`)}</button>
-    </div>`})}function k(e){return e?e.length<=20?e:`${e.slice(0,8)}...${e.slice(-8)}`:t(`common.na`)}function A(r){let{props:a,nostr:s,nostrAccounts:c,accountCountLabel:l,profileFormState:u,profileFormCallbacks:d,onEditProfile:f}=r,p=c[0],m=s?.configured??p?.configured??!1,h=s?.running??p?.running??!1,_=s?.publicKey??p?.publicKey,v=s?.lastStartAt??p?.lastStartAt??null,y=s?.lastError??p?.lastError??null,b=c.length>1,x=u!=null,S=r=>{let a=r.publicKey,o=r.profile;return e`
+    </div>`})}function k(e){return e?e.length<=20?e:`${e.slice(0,8)}...${e.slice(-8)}`:t(`common.na`)}function A(r){let{props:a,nostr:o,nostrAccounts:s,accountCountLabel:l,profileFormState:u,profileFormCallbacks:d,onEditProfile:f}=r,p=s[0],m=o?.configured??p?.configured??!1,h=o?.running??p?.running??!1,_=o?.publicKey??p?.publicKey,v=o?.lastStartAt??p?.lastStartAt??null,y=o?.lastError??p?.lastError??null,b=s.length>1,x=u!=null,S=r=>{let a=r.publicKey,o=r.profile;return e`
       <div class="account-card">
         <div class="account-card-header">
           <div class="account-card-title">${o?.displayName??o?.name??r.name??r.accountId}</div>
@@ -97,7 +97,7 @@ import{f as e,r as t,u as n}from"./i18n.js";import{d as r,l as i}from"./format.j
       ${l}
       ${b?e`
             <div class="account-card-list">
-              ${c.map(e=>S(e))}
+              ${s.map(e=>S(e))}
             </div>
           `:e`
             <div class="status-list" style="margin-top: 16px;">
@@ -124,7 +124,7 @@ import{f as e,r as t,u as n}from"./i18n.js";import{d as r,l as i}from"./format.j
             </div>
           `}
       ${y?e`<div class="callout danger" style="margin-top: 12px;">${y}</div>`:n}
-      ${(()=>{if(x&&d)return o({state:u,callbacks:d,accountId:c[0]?.accountId??`default`});let{name:r,displayName:i,about:a,picture:l,nip05:h}=p?.profile??s?.profile??{},g=r||i||a||l||h;return e`
+      ${(()=>{if(x&&d)return c({state:u,callbacks:d,accountId:s[0]?.accountId??`default`});let{name:r,displayName:i,about:a,picture:l,nip05:h}=p?.profile??o?.profile??{},g=r||i||a||l||h;return e`
       <div
         style="margin-top: 16px; padding: 12px; background: var(--bg-secondary); border-radius: var(--radius-md);"
       >
