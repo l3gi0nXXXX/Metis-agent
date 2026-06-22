@@ -6622,12 +6622,35 @@ public class TelegramAdapter <: ChannelAdapter {
         if (Int64(text.size) <= limit) {
             return [text]
         }
+        this.telegramTextChunkByRuneLimit(text, limit)
+    }
+
+    private func telegramTextChunkByRuneLimit(text: String, limit: Int64): Array<String> {
+        var effectiveLimit = limit
+        if (effectiveLimit <= 0) {
+            effectiveLimit = 4000
+        }
         let chunks = ArrayList<String>()
-        var cursor = 0
-        while (cursor < text.size) {
-            let end = if (cursor + limit > text.size) { text.size } else { cursor + limit }
-            chunks.add(text[cursor..end])
-            cursor = end
+        var current = StringBuilder()
+        var currentSize: Int64 = 0
+        for (r in text.runes()) {
+            let one = StringBuilder()
+            one.append(r)
+            let runeSize = Int64(one.toString().size)
+            if (currentSize > 0 && currentSize + runeSize > effectiveLimit) {
+                let chunk = current.toString()
+                if (!chunk.isEmpty()) {
+                    chunks.add(chunk)
+                }
+                current = StringBuilder()
+                currentSize = 0
+            }
+            current.append(r)
+            currentSize += runeSize
+        }
+        let last = current.toString()
+        if (!last.isEmpty()) {
+            chunks.add(last)
         }
         chunks.toArray()
     }
@@ -6665,7 +6688,15 @@ public class TelegramAdapter <: ChannelAdapter {
                 if (!current.isEmpty()) {
                     chunks.add(current)
                 }
-                current = part
+                let pieces = this.telegramTextChunkByRuneLimit(part, limit)
+                if (pieces.size == 1) {
+                    current = pieces[0]
+                } else {
+                    for (piece in pieces) {
+                        chunks.add(piece)
+                    }
+                    current = ""
+                }
             }
         }
         if (!current.isEmpty()) {

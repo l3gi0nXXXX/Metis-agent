@@ -356,6 +356,39 @@ public class CronRunnerDeliveryTest {
     }
 
     @TestCase
+    public func cronAnnounceDeliveryDoesNotUseSessionLayerDeliverForBridgeReply(): Unit {
+        withCronRunnerTestHome({ storePath: Path =>
+            let job = CronJob(
+                "single-delivery",
+                "hello cron",
+                CronSchedule.every(60000),
+                state: CronJobState(nextRunAtMs: 1),
+                deliveryChannel: "feishu",
+                deliveryTo: "chat-1",
+                deliveryAnnounce: true,
+                deliveryMode: "announce",
+                deliveryAccountId: "tenant-a"
+            )
+            cronSave(storePath, [job])
+            debugSetCronRunnerReplyForTest(Some({ _job: CronJob, _request: GatewaySessionRequest =>
+                "ok answer"
+            }))
+            let adapter = CronRunnerTestChannelAdapter("feishu", messageId: "msg-1")
+            let service = cronRunnerTestGateway(adapter, "feishu", "tenant-a")
+
+            let result = CronRunner.runJobOnceFromStore(Some(service), storePath, "single-delivery", true)
+            @Expect(result.get("ok").getOrThrow().asBool().getValue(), true)
+            @Expect(result.get("ran").getOrThrow().asBool().getValue(), true)
+            @Expect(adapter.sendCount, 1)
+
+            let runs = readCronRunLogEntriesForJob(storePath, "single-delivery", limit: 10)
+            @Expect(runs.get("total").getOrThrow().asInt().getValue(), 1)
+            let row = runs.get("entries").getOrThrow().asArray()[0].asObject()
+            @Expect(row.get("deliveryStatus").getOrThrow().asString().getValue(), "delivered")
+        })
+    }
+
+    @TestCase
     public func deliveryUsesConfiguredAccountIdAndRecordsDelivered(): Unit {
         withCronRunnerTestHome({ storePath: Path =>
             let job = CronJob(
