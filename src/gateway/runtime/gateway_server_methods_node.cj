@@ -43,6 +43,9 @@ public func handleGatewayNodeFamily(
     if (method == "node.invoke.result") {
         return Some(gatewayNodeInvokeResult(req))
     }
+    if (method == "canvas.a2ui.action") {
+        return Some(gatewayCanvasHandleA2uiUserAction(req))
+    }
     if (method == "node.canvas.capability.refresh") {
         return Some(gatewayCanvasRefreshNodeCapability(buildGatewayConfigFromUserSettings(user), req))
     }

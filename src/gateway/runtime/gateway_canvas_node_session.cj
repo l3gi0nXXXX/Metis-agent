@@ -476,6 +476,7 @@ public func gatewayCanvasRefreshNodeCapability(cfg: GatewayConfig, request: Gate
     result.put("nodeId", JsonString(requestedNodeId))
     result.put("capability", JsonString("canvas"))
     result.put("scopedUrl", JsonString(gatewayCanvasScopedRouteUrl(cfg, token)))
+    result.put("a2uiUrl", JsonString(gatewayCanvasA2uiScopedRouteUrl(cfg, token)))
     result.put("expiresAtMs", expiresAtMs.toJsonValue())
     result.put("ttlMs", max(0, expiresAtMs - now).toJsonValue())
     GatewayRpcResponse(true, method, result: result)

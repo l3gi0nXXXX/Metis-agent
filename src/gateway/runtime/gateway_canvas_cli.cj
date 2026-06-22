@@ -21,7 +21,7 @@ private func gatewayNodesCanvasCommandForAction(action: String): String {
         case "navigate" => "canvas.navigate"
         case "eval" => "canvas.eval"
         case "snapshot" => "canvas.snapshot"
-        case "a2ui_push" | "a2ui.push" => "canvas.a2ui.push"
+        case "a2ui_push" | "a2ui.push" | "a2ui_push_jsonl" | "a2ui.pushjsonl" => "canvas.a2ui.pushJSONL"
         case "a2ui_reset" | "a2ui.reset" => "canvas.a2ui.reset"
         case _ => ""
     }
@@ -98,7 +98,7 @@ private func gatewayNodesCanvasBuildParams(action: String, args: Array<String>):
     } else if (command == "canvas.snapshot") {
         let format = gatewayNodesCanvasOption(args, "--format")
         payload.put("format", JsonString(if (format.trimAscii().isEmpty()) { "png" } else { format.trimAscii() }))
-    } else if (command == "canvas.a2ui.push") {
+    } else if (command == "canvas.a2ui.pushJSONL") {
         let jsonl = gatewayNodesCanvasOption(args, "--jsonl")
         let jsonlPath = gatewayNodesCanvasOption(args, "--jsonl-path")
         if (!jsonl.trimAscii().isEmpty()) {

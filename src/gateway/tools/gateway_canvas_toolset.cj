@@ -48,7 +48,7 @@ private func gatewayCanvasToolActionCommand(action: String): String {
         case "navigate" => "canvas.navigate"
         case "eval" => "canvas.eval"
         case "snapshot" => "canvas.snapshot"
-        case "a2ui_push" | "a2ui.push" => "canvas.a2ui.push"
+        case "a2ui_push" | "a2ui.push" | "a2ui_push_jsonl" | "a2ui.pushjsonl" => "canvas.a2ui.pushJSONL"
         case "a2ui_reset" | "a2ui.reset" => "canvas.a2ui.reset"
         case _ => ""
     }
@@ -253,7 +253,7 @@ private func gatewayCanvasBuildInvokePayload(
         payload.put("maxWidth", JsonInt(gatewayCanvasToolInt(maxWidth, 0)))
         payload.put("quality", JsonInt(gatewayCanvasToolInt(quality, 90)))
     }
-    if (normalizedAction == "a2ui_push" || normalizedAction == "a2ui.push") {
+    if (normalizedAction == "a2ui_push" || normalizedAction == "a2ui.push" || normalizedAction == "a2ui_push_jsonl" || normalizedAction == "a2ui.pushjsonl") {
         let direct = gatewayCanvasToolString(jsonl)
         if (!direct.isEmpty()) {
             payload.put("jsonl", JsonString(direct))

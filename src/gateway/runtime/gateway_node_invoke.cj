@@ -81,6 +81,7 @@ private func gatewayNodeInvokeAllowedCommand(command: String): Bool {
         normalized == "canvas.navigate" ||
         normalized == "canvas.eval" ||
         normalized == "canvas.snapshot" ||
+        normalized == "canvas.a2ui.pushJSONL" ||
         normalized == "canvas.a2ui.push" ||
         normalized == "canvas.a2ui.reset"
 }
