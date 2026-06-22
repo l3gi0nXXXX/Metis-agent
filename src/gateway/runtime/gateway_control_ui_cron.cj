@@ -23,6 +23,15 @@ public func gatewayBuildControlUiCronScript(): String {
       .replace(new RegExp('\\n', 'g'), ' ');
   }
 
+  function cronTextPreview(s, maxRunes) {
+    var text = String(s || '');
+    var max = Number(maxRunes || 0);
+    if (!Number.isFinite(max) || max <= 0) { return ''; }
+    var chars = Array.from(text);
+    if (chars.length <= max) { return text; }
+    return chars.slice(0, max).join('');
+  }
+
   function cronSchedLabel(j) {
     if (!j || !j.schedule) { return ''; }
     var sch = j.schedule;
@@ -109,7 +118,8 @@ public func gatewayBuildControlUiCronScript(): String {
     var q = String(v3CronRunSearch || '').trim().toLowerCase();
     var searched = !q ? scoped : scoped.filter(function(e) {
       var sum = String(e.summary || '');
-      var blob = (String(e.jobId || '') + ' ' + sum + ' ' + String(e.status || '')).toLowerCase();
+      var derr = String(e.deliveryError || '');
+      var blob = (String(e.jobId || '') + ' ' + sum + ' ' + derr + ' ' + String(e.status || '')).toLowerCase();
       return blob.indexOf(q) >= 0;
     });
 
@@ -216,6 +226,10 @@ public func gatewayBuildControlUiCronScript(): String {
           : (st === 'error' ? '<span class="cron-badge--no cron-run-history__badge">' + stLabel + '</span>' : '<span class="cron-badge--muted cron-run-history__badge">' + stLabel + '</span>');
         var sum = String(e.summary || '').trim() || '（无摘要）';
         var ds = String(e.deliveryStatus || 'not-requested');
+        var derr = cronTextPreview(String(e.deliveryError || '').trim(), 500);
+        var derrHtml = (ds === 'not-delivered' && derr)
+          ? '<div class="cron-run-history__delivery-error">投递错误：' + cronEsc(derr) + '</div>'
+          : '';
         var dlab = (ds === 'delivered') ? '已投递' : (ds === 'not-delivered') ? '未投递' : (ds === 'unknown') ? '未知' : '未请求';
         var ts = Number(e.ts || 0);
         var runAt = Number(e.runAtMs || ts);
@@ -228,8 +242,9 @@ public func gatewayBuildControlUiCronScript(): String {
         return '<div class="cron-run-history__item">' +
           '<div class="cron-run-history__item-main">' +
             '<div class="cron-run-history__item-title">' + cronEsc(jid) + ' · ' + stBadge + '</div>' +
-            '<div class="cron-run-history__item-sum">' + cronEsc(sum.slice(0, 500)) + '</div>' +
+            '<div class="cron-run-history__item-sum">' + cronEsc(cronTextPreview(sum, 500)) + '</div>' +
             '<span class="cron-run-history__deliv-pill">' + cronEsc(dlab) + '</span>' +
+            derrHtml +
           '</div>' +
           '<div class="cron-run-history__item-meta mono">' +
             '<div>' + cronEsc(tsStr) + '</div>' +

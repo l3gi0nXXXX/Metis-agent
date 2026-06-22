@@ -14,6 +14,54 @@ private func jsonEscape(raw: String): String {
     raw.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
 }
 
+private func cronRunLogRedactAfterMarker(raw: String, marker: String): String {
+    let parts = raw.split(marker, 2)
+    if (parts.size < 2) {
+        return raw
+    }
+    parts[0] + marker + "[redacted]"
+}
+
+private func cronRunLogRedactUrlUserInfo(raw: String): String {
+    let out = ArrayList<String>()
+    for (part in raw.split(" ")) {
+        if (part.contains("://") && part.contains("@")) {
+            let schemeParts = part.split("://", 2)
+            if (schemeParts.size == 2) {
+                let atParts = schemeParts[1].split("@", 2)
+                if (atParts.size == 2 && atParts[0].contains(":")) {
+                    out.add(schemeParts[0] + "://[redacted]@" + atParts[1])
+                    continue
+                }
+            }
+        }
+        out.add(part)
+    }
+    String.join(out.toArray(), delimiter: " ")
+}
+
+public func sanitizeCronDeliveryError(raw: String): String {
+    var out = raw.trimAscii().replace("\r", " ").replace("\n", " ")
+    out = cronRunLogRedactUrlUserInfo(out)
+    out = cronRunLogRedactAfterMarker(out, "Authorization: Bearer ")
+    out = cronRunLogRedactAfterMarker(out, "authorization: bearer ")
+    out = cronRunLogRedactAfterMarker(out, "Authorization=")
+    out = cronRunLogRedactAfterMarker(out, "authorization=")
+    out = cronRunLogRedactAfterMarker(out, "Bearer ")
+    out = cronRunLogRedactAfterMarker(out, "bearer ")
+    out = cronRunLogRedactAfterMarker(out, "api_key=")
+    out = cronRunLogRedactAfterMarker(out, "apiKey=")
+    out = cronRunLogRedactAfterMarker(out, "token=")
+    out = cronRunLogRedactAfterMarker(out, "access_token=")
+    out = cronRunLogRedactAfterMarker(out, "auth_token=")
+    out = cronRunLogRedactAfterMarker(out, "password=")
+    out = cronRunLogRedactAfterMarker(out, "passwd=")
+    while (out.contains("  ")) {
+        out = out.replace("  ", " ")
+    }
+    out
+}
+
 /** 与参考实现的 `resolveCronRunLogPath` 一致：`jobs.json` 同目录下的 `runs/`。 */
 public func cronRunsDirFromStore(storePath: Path): Path {
     storePath.parent.join("runs")
@@ -83,7 +131,8 @@ public func appendCronRunLog(
     summary!: String = "",
     runAtMs!: Int64 = 0,
     nextRunAtMs!: Int64 = 0,
-    deliveryStatus!: String = "not-requested"
+    deliveryStatus!: String = "not-requested",
+    deliveryError!: String = ""
 ): Unit {
     synchronized(cronRunLogAppendLock) {
         let safeJobId = validateCronRunLogJobId(jobId)
@@ -93,6 +142,7 @@ public func appendCronRunLog(
         }
         let p = cronRunLogPathFromStore(storePath, safeJobId)
         let durationMs = if (endedAtMs >= startedAtMs) { endedAtMs - startedAtMs } else { 0 }
+        let safeDeliveryError = sanitizeCronDeliveryError(deliveryError)
         let line = "{" +
             "\"ts\":${endedAtMs}," +
             "\"jobId\":\"${jsonEscape(safeJobId)}\"," +
@@ -105,6 +155,7 @@ public func appendCronRunLog(
             "\"durationMs\":${durationMs}," +
             "\"nextRunAtMs\":${nextRunAtMs}," +
             "\"deliveryStatus\":\"${jsonEscape(deliveryStatus)}\"," +
+            "\"deliveryError\":\"${jsonEscape(safeDeliveryError)}\"," +
             "\"sessionTarget\":\"${jsonEscape(sessionTarget)}\"," +
             "\"error\":\"${jsonEscape(errorMessage)}\"" +
             "}\n"
@@ -187,6 +238,7 @@ public func readCronRunLogEntriesForJob(
         row.put("durationMs", JsonInt(runLogReadI64(raw, "durationMs")))
         row.put("nextRunAtMs", JsonInt(runLogReadI64(raw, "nextRunAtMs")))
         row.put("deliveryStatus", JsonString(runLogReadStr(raw, "deliveryStatus", default: "not-requested")))
+        row.put("deliveryError", JsonString(sanitizeCronDeliveryError(runLogReadStr(raw, "deliveryError"))))
         out.add(row)
         i -= 1
         emitted += 1

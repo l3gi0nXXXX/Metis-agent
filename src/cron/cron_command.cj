@@ -2375,13 +2375,24 @@ private func formatCronRunsPageForHuman(page: JsonObject, targetId: String): Str
     )
     for (it in entries.getItems()) {
         let row = it.asObject()
+        let deliveryStatus = jsonObjString(row, "deliveryStatus")
+        let deliveryError = jsonObjString(row, "deliveryError").trimAscii()
+        var summaryText = ellipsis(jsonObjString(row, "summary"), 60)
+        if (deliveryStatus.trimAscii().toAsciiLower() == "not-delivered" && !deliveryError.isEmpty()) {
+            let deliveryErrorSummary = ellipsis(deliveryError, 60)
+            summaryText = if (summaryText.isEmpty()) {
+                "Delivery error: ${deliveryErrorSummary}"
+            } else {
+                "${summaryText} | Delivery error: ${deliveryErrorSummary}"
+            }
+        }
         lines.add(
             padRight("${jsonObjInt(row, "ts")}", 14) + " " +
                 padRight(ellipsis(jsonObjString(row, "jobId"), 28), 28) + " " +
                 padRight(ellipsis(jsonObjString(row, "status"), 8), 8) + " " +
                 padRight("${jsonObjInt(row, "durationMs")}ms", 10) + " " +
-                padRight(ellipsis(jsonObjString(row, "deliveryStatus"), 14), 14) + " " +
-                ellipsis(jsonObjString(row, "summary"), 60)
+                padRight(ellipsis(deliveryStatus, 14), 14) + " " +
+                summaryText
         )
     }
     String.join(lines.toArray(), delimiter: "\n")

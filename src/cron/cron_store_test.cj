@@ -50,6 +50,56 @@ private func cronTestPathModeOctal(path: Path): String {
 }
 
 @Test
+public class CronRunLogDeliveryErrorTest {
+    @TestCase
+    public func runLogAppendReadIncludesDeliveryError(): Unit {
+        withCronStoreTestPath({ storePath =>
+            appendCronRunLog(
+                storePath,
+                "delivery-error",
+                "success",
+                1000,
+                1010,
+                summary: "agent ok",
+                deliveryStatus: "not-delivered",
+                deliveryError: "telegram send failed"
+            )
+
+            let rows = readCronRunLogEntriesForJob(storePath, "delivery-error", limit: 10)
+            @Expect(rows.get("total").getOrThrow().asInt().getValue(), 1)
+            let row = rows.get("entries").getOrThrow().asArray()[0].asObject()
+            @Expect(row.get("deliveryStatus").getOrThrow().asString().getValue(), "not-delivered")
+            @Expect(row.get("deliveryError").getOrThrow().asString().getValue(), "telegram send failed")
+
+            let merged = readCronRunLogMergedFromStore(storePath, ["delivery-error"], resultLimit: 10)
+            let mergedRow = merged.get("entries").getOrThrow().asArray()[0].asObject()
+            @Expect(mergedRow.get("deliveryError").getOrThrow().asString().getValue(), "telegram send failed")
+        })
+    }
+
+    @TestCase
+    public func runLogReadLegacyEntryDefaultsDeliveryErrorEmpty(): Unit {
+        withCronStoreTestPath({ storePath =>
+            let runsDir = cronRunsDirFromStore(storePath)
+            Directory.create(runsDir, recursive: true)
+            File.writeTo(
+                runsDir.join("legacy-delivery.jsonl"),
+                ("{\"ts\":1010,\"jobId\":\"legacy-delivery\",\"action\":\"finished\",\"status\":\"success\"," +
+                    "\"summary\":\"old row\",\"runAtMs\":1000,\"startedAtMs\":1000,\"endedAtMs\":1010," +
+                    "\"durationMs\":10,\"nextRunAtMs\":0,\"deliveryStatus\":\"not-delivered\"," +
+                    "\"sessionTarget\":\"main\",\"error\":\"\"}\n").toArray()
+            )
+
+            let rows = readCronRunLogEntriesForJob(storePath, "legacy-delivery", limit: 10)
+            @Expect(rows.get("total").getOrThrow().asInt().getValue(), 1)
+            let row = rows.get("entries").getOrThrow().asArray()[0].asObject()
+            @Expect(row.get("deliveryStatus").getOrThrow().asString().getValue(), "not-delivered")
+            @Expect(row.get("deliveryError").getOrThrow().asString().getValue(), "")
+        })
+    }
+}
+
+@Test
 public class CronRunLogPathGuardTest {
     @TestCase
     public func runLogRejectsTraversalJobId(): Unit {
