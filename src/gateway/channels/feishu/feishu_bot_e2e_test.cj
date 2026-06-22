@@ -3,9 +3,13 @@ package metis.gateway.channels.feishu
 import metis.core.config.{CliConfig, CliSettingManager, MetisConfigManager, MetisProcessEnvironmentLock}
 import metis.gateway.core.{GatewayRouter, GatewayService, setGatewayAgentBridgeReplyRunnerForTest}
 import metis.gateway.model.{ChannelPolicyConfig, FeishuConfig}
+import magic.core.message.Message
+import magic.core.model.{AsyncChatResponse, ChatModel, ChatRequest, ChatResponse}
+import magic.model.ModelManager
 import std.collection.{ArrayList, HashMap}
 import std.env.setVariable
 import std.fs.{Directory, Path, remove}
+import std.time.DateTime
 import std.unittest.testmacro.*
 import stdx.encoding.json.{JsonArray, JsonBool, JsonObject, JsonString}
 
@@ -67,6 +71,10 @@ private func withFeishuBotE2eHome(name: String, body: () -> Unit): Unit {
 }
 
 private func feishuBotE2eRoot(): JsonObject {
+    feishuBotE2eRootWithModel("fake:main", [])
+}
+
+private func feishuBotE2eRootWithModel(primary: String, fallbacks: Array<String>): JsonObject {
     let root = JsonObject()
     let gateway = JsonObject()
     let feishu = JsonObject()
@@ -91,12 +99,94 @@ private func feishuBotE2eRoot(): JsonObject {
     agent.put("id", JsonString("main"))
     agent.put("default", JsonBool(true))
     let model = JsonObject()
-    model.put("primary", JsonString("fake:main"))
+    model.put("primary", JsonString(primary))
+    let fallbackItems = JsonArray()
+    for (fallback in fallbacks) {
+        fallbackItems.add(JsonString(fallback))
+    }
+    model.put("fallbacks", fallbackItems)
     agent.put("model", model)
     list.add(agent)
     agents.put("list", list)
     root.put("agents", agents)
     root
+}
+
+private func feishuBotE2eWriteModelRoot(primary: String, fallbacks: Array<String>): Unit {
+    MetisConfigManager.writeRoot(feishuBotE2eRootWithModel(primary, fallbacks))
+    CliConfig.invalidatePathCache()
+    MetisConfigManager.invalidate()
+    CliSettingManager.invalidate()
+}
+
+private class FeishuBotE2eEmptyResponseModel <: ChatModel {
+    private let modelName: String
+    private var _maxTokens: Option<Int64> = None
+
+    public init(modelName: String) {
+        this.modelName = modelName
+    }
+
+    public prop provider: String {
+        get() { "fake" }
+    }
+
+    public prop name: String {
+        get() { this.modelName }
+    }
+
+    public prop contextLength: Int64 {
+        get() { 8192 }
+    }
+
+    public mut prop maxTokens: Option<Int64> {
+        get() { this._maxTokens }
+        set(v) { this._maxTokens = v }
+    }
+
+    public func create(_request: ChatRequest): ChatResponse {
+        throw Exception("Http response body is empty")
+    }
+
+    public func asyncCreate(_request: ChatRequest): AsyncChatResponse {
+        throw Exception("async not used in feishu bot e2e tests")
+    }
+}
+
+private class FeishuBotE2eAnswerModel <: ChatModel {
+    private let modelName: String
+    private let answer: String
+    private var _maxTokens: Option<Int64> = None
+
+    public init(modelName: String, answer: String) {
+        this.modelName = modelName
+        this.answer = answer
+    }
+
+    public prop provider: String {
+        get() { "fake" }
+    }
+
+    public prop name: String {
+        get() { this.modelName }
+    }
+
+    public prop contextLength: Int64 {
+        get() { 8192 }
+    }
+
+    public mut prop maxTokens: Option<Int64> {
+        get() { this._maxTokens }
+        set(v) { this._maxTokens = v }
+    }
+
+    public func create(_request: ChatRequest): ChatResponse {
+        ChatResponse(this.fullName, Message.assistant(this.answer))
+    }
+
+    public func asyncCreate(_request: ChatRequest): AsyncChatResponse {
+        throw Exception("async not used in feishu bot e2e tests")
+    }
 }
 
 private func feishuBotE2eService(adapter: FeishuAdapter): GatewayService {
@@ -265,5 +355,87 @@ public func groupGateBlocksAgentAndSendWhenChatIsNotAllowed(): Unit {
 
         @Expect(agentRuns.size == 0)
         @Expect(apiClient.textSendCount() == 0)
+    })
+}
+
+@Test
+public func sidecarTextInboundEmptyModelResponseUsesFallbackAndRepliesCronDeliveryChannel(): Unit {
+    withFeishuBotE2eHome("feishu_bot_e2e_empty_model_fallback", { =>
+        let suffix = DateTime.now().toUnixTimeStamp().toMilliseconds().toString()
+        let primaryName = "phase4-empty-primary-${suffix}"
+        let fallbackName = "phase4-cron-fallback-${suffix}"
+        let primaryRef = "fake:${primaryName}"
+        let fallbackRef = "fake:${fallbackName}"
+        ModelManager.registerChatModel(primaryRef, { => FeishuBotE2eEmptyResponseModel(primaryName) })
+        ModelManager.registerChatModel(fallbackRef, { =>
+            FeishuBotE2eAnswerModel(
+                fallbackName,
+                "每日国际新闻与华为影响简报 的投递通道是 telegram，目标是 1059872384。"
+            )
+        })
+        feishuBotE2eWriteModelRoot(primaryRef, [fallbackRef])
+
+        let apiClient = FeishuFakeApiClient()
+        let transport = FeishuBotE2eLongConnectTransport(
+            events: [feishuBotE2eTextEvent("om_cron_channel", "这个定时任务的投递通道是什么")]
+        )
+        let adapter = FeishuAdapter(
+            config: feishuBotE2eConfig(),
+            accountId: FEISHU_BOT_E2E_ACCOUNT,
+            apiClient: apiClient,
+            longConnectTransport: transport
+        )
+        let service = feishuBotE2eService(adapter)
+
+        service.start()
+        try {
+            service.processOnce()
+        } finally {
+            service.stop()
+        }
+
+        @Expect(apiClient.textSendCount() == 1)
+        let request = apiClient.lastTextMessageRequest()
+        let text = feishuBotE2eString(request, "text")
+        @Expect(text.contains("telegram"))
+        @Expect(text.contains("1059872384"))
+        @Expect(text.contains("模型服务本轮"), false)
+        @Expect(feishuBotE2eString(request, "replyToMessageId") == "om_cron_channel")
+    })
+}
+
+@Test
+public func sidecarTextInboundEmptyModelResponseWithoutFallbackSendsVisibleDiagnostic(): Unit {
+    withFeishuBotE2eHome("feishu_bot_e2e_empty_model_diagnostic", { =>
+        let suffix = DateTime.now().toUnixTimeStamp().toMilliseconds().toString()
+        let primaryName = "phase4-empty-only-${suffix}"
+        let primaryRef = "fake:${primaryName}"
+        ModelManager.registerChatModel(primaryRef, { => FeishuBotE2eEmptyResponseModel(primaryName) })
+        feishuBotE2eWriteModelRoot(primaryRef, [])
+
+        let apiClient = FeishuFakeApiClient()
+        let transport = FeishuBotE2eLongConnectTransport(
+            events: [feishuBotE2eTextEvent("om_empty_diag", "这个定时任务的投递通道是什么")]
+        )
+        let adapter = FeishuAdapter(
+            config: feishuBotE2eConfig(),
+            accountId: FEISHU_BOT_E2E_ACCOUNT,
+            apiClient: apiClient,
+            longConnectTransport: transport
+        )
+        let service = feishuBotE2eService(adapter)
+
+        service.start()
+        try {
+            service.processOnce()
+        } finally {
+            service.stop()
+        }
+
+        @Expect(apiClient.textSendCount() == 1)
+        let request = apiClient.lastTextMessageRequest()
+        let text = feishuBotE2eString(request, "text")
+        @Expect(text, "模型服务本轮返回空响应，未能完成回复。请稍后重试或切换模型。")
+        @Expect(feishuBotE2eString(request, "replyToMessageId") == "om_empty_diag")
     })
 }
