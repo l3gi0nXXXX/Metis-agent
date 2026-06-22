@@ -185,6 +185,7 @@ private func cronHelpText(): String {
         "  gateway cron update --job-id <jobId> [--failure-channel feishu] [--failure-to <chat_id>] [--failure-announce]\n" +
         "  add/update also supports: --description --delete-after-run --agent-id --session-key --model --thinking-level --light-context\n" +
         "  --delivery-account-id --best-effort-deliver --tool-exec-mode <mode> --tool-exec-allow <prefix>\n" +
+        "  --script <relativePath> --script-mode none|inject|noAgent\n" +
         "  --failure-account-id --failure-alert-after N --failure-alert-cooldown-ms N\n" +
         "\n" +
         "Notes:\n" +
@@ -291,6 +292,8 @@ private func cronSubcommandHelpText(subCmdNorm: String): String {
             "  --best-effort-deliver        Do not fail the job if delivery fails\n" +
             "  --tool-exec-mode <mode>      Cron shell policy: guarded | deny | allowlist | yolo\n" +
             "  --tool-exec-allow <prefix>   Allowlisted command prefix; may repeat\n" +
+            "  --script <relativePath>      Script under cron/scripts; relative path only\n" +
+            "  --script-mode <mode>         none | inject | noAgent\n" +
             "  --failure-account-id <id>    Account for the failure channel\n" +
             "  --failure-alert-after <n>    Failures before alerting\n" +
             "  --failure-alert-cooldown-ms <n>  Minimum ms between failure alerts\n" +
@@ -344,6 +347,8 @@ private func cronSubcommandHelpText(subCmdNorm: String): String {
             "  --no-best-effort-deliver\n" +
             "  --tool-exec-mode <mode>    Cron shell policy: guarded | deny | allowlist | yolo\n" +
             "  --tool-exec-allow <prefix> Replace allowlist with command prefix; may repeat\n" +
+            "  --script <relativePath>    Script under cron/scripts; relative path only\n" +
+            "  --script-mode <mode>       none | inject | noAgent\n" +
             "  --failure-account-id <id>  Failure account id\n" +
             "  --failure-alert-after <n>  Failures before alerting\n" +
             "  --failure-alert-cooldown-ms <n>  Minimum ms between failure alerts\n" +
@@ -579,6 +584,8 @@ private func cronJobToJson(j: CronJob): JsonObject {
         toolExecAllowlist.add(JsonString(entry))
     }
     o.put("toolExecAllowlist", toolExecAllowlist)
+    o.put("scriptPath", JsonString(cronNormalizeScriptPath(j.scriptPath)))
+    o.put("scriptMode", JsonString(cronNormalizeScriptMode(j.scriptMode)))
     o.put("failureAccountId", JsonString(j.failureAccountId))
     o.put("failureAlertAfter", JsonInt(j.failureAlertAfter))
     o.put("failureAlertCooldownMs", JsonInt(j.failureAlertCooldownMs))
@@ -639,6 +646,12 @@ private func formatCronJobMutationForHuman(action: String, j: CronJob, path: Pat
     let toolExecAllowlistSize = cronNormalizeToolExecAllowlist(j.toolExecAllowlist).size
     if (toolExecAllowlistSize > 0) {
         lines.add("Tool exec allowlist: ${toolExecAllowlistSize} entries")
+    }
+    let scriptPath = cronNormalizeScriptPath(j.scriptPath)
+    let scriptMode = cronNormalizeScriptMode(j.scriptMode)
+    if (!scriptPath.isEmpty() || scriptMode != "none") {
+        lines.add("Script: ${if (scriptPath.isEmpty()) { "(not set)" } else { scriptPath }}")
+        lines.add("Script mode: ${scriptMode}")
     }
     if (j.state.nextRunAtMs > 0) {
         lines.add("Next run: ${j.state.nextRunAtMs}")
@@ -979,6 +992,8 @@ private func cronCmdAddNamed(path: Path, sub: Array<String>): (String, Int64) {
     var bestEffortDeliver = false
     var toolExecMode = "guarded"
     let toolExecAllowlist = ArrayList<String>()
+    var scriptPath = ""
+    var scriptMode = "none"
     var failureAccountId = ""
     var failureAlertAfter: Int64 = 0
     var failureAlertCooldownMs: Int64 = 0
@@ -1316,6 +1331,26 @@ private func cronCmdAddNamed(path: Path, sub: Array<String>): (String, Int64) {
             i += 2
             continue
         }
+        if (k == "--script") {
+            if (i + 1 >= sub.size) {
+                return cronErr("invalid cron.add params: missing --script value")
+            }
+            scriptPath = cronNormalizeScriptPath(sub[i + 1])
+            i += 2
+            continue
+        }
+        if (k == "--script-mode") {
+            if (i + 1 >= sub.size) {
+                return cronErr("invalid cron.add params: missing --script-mode value")
+            }
+            let mode = sub[i + 1].trimAscii()
+            if (!cronScriptModeIsValid(mode)) {
+                return cronErr("invalid cron.add params: --script-mode must be none, inject, or noAgent")
+            }
+            scriptMode = cronNormalizeScriptMode(mode)
+            i += 2
+            continue
+        }
         if (k == "--payload-kind") {
             if (i + 1 >= sub.size) {
                 return cronErr("invalid cron.add params: missing --payload-kind value")
@@ -1422,6 +1457,15 @@ private func cronCmdAddNamed(path: Path, sub: Array<String>): (String, Int64) {
     if (!promptScan.ok) {
         return cronPromptBlockedOutput(name, promptScan, message, "cron.add", json)
     }
+    let normalizedScriptPath = cronNormalizeScriptPath(scriptPath)
+    let normalizedScriptMode = if (!normalizedScriptPath.isEmpty() && cronNormalizeScriptMode(scriptMode) == "none") {
+        "inject"
+    } else {
+        cronNormalizeScriptMode(scriptMode)
+    }
+    if (normalizedScriptMode != "none" && normalizedScriptPath.isEmpty()) {
+        return cronErr("invalid cron.add params: --script is required when --script-mode is inject or noAgent")
+    }
 
     let createdMs = DateTime.now().toUnixTimeStamp().toMilliseconds()
     if (let Some(ev) <- everyOpt) {
@@ -1460,6 +1504,8 @@ private func cronCmdAddNamed(path: Path, sub: Array<String>): (String, Int64) {
             bestEffortDeliver: bestEffortDeliver,
             toolExecMode: toolExecMode,
             toolExecAllowlist: toolExecAllowlist.toArray(),
+            scriptPath: normalizedScriptPath,
+            scriptMode: normalizedScriptMode,
             failureAccountId: failureAccountId,
             failureAlertAfter: failureAlertAfter,
             failureAlertCooldownMs: failureAlertCooldownMs
@@ -1502,6 +1548,8 @@ private func cronCmdAddNamed(path: Path, sub: Array<String>): (String, Int64) {
             bestEffortDeliver: bestEffortDeliver,
             toolExecMode: toolExecMode,
             toolExecAllowlist: toolExecAllowlist.toArray(),
+            scriptPath: normalizedScriptPath,
+            scriptMode: normalizedScriptMode,
             failureAccountId: failureAccountId,
             failureAlertAfter: failureAlertAfter,
             failureAlertCooldownMs: failureAlertCooldownMs
@@ -1544,6 +1592,8 @@ private func cronCmdAddNamed(path: Path, sub: Array<String>): (String, Int64) {
             bestEffortDeliver: bestEffortDeliver,
             toolExecMode: toolExecMode,
             toolExecAllowlist: toolExecAllowlist.toArray(),
+            scriptPath: normalizedScriptPath,
+            scriptMode: normalizedScriptMode,
             failureAccountId: failureAccountId,
             failureAlertAfter: failureAlertAfter,
             failureAlertCooldownMs: failureAlertCooldownMs
@@ -1768,6 +1818,8 @@ private func cronCmdUpdate(path: Path, sub: Array<String>): (String, Int64) {
             var toolExecModeOpt: Option<String> = None<String>
             let toolExecAllowlistPatch = ArrayList<String>()
             var toolExecAllowlistSet = false
+            var scriptPathOpt: Option<String> = None<String>
+            var scriptModeOpt: Option<String> = None<String>
             var failureAccountIdOpt: Option<String> = None<String>
             var failureAlertAfterOpt: Option<Int64> = None<Int64>
             var failureAlertCooldownOpt: Option<Int64> = None<Int64>
@@ -2140,6 +2192,28 @@ private func cronCmdUpdate(path: Path, sub: Array<String>): (String, Int64) {
                     i += 2
                     continue
                 }
+                if (k == "--script") {
+                    if (i + 1 >= sub.size) {
+                        return cronErr("invalid cron.update params: missing --script value")
+                    }
+                    scriptPathOpt = Some(cronNormalizeScriptPath(sub[i + 1]))
+                    touched = true
+                    i += 2
+                    continue
+                }
+                if (k == "--script-mode") {
+                    if (i + 1 >= sub.size) {
+                        return cronErr("invalid cron.update params: missing --script-mode value")
+                    }
+                    let mode = sub[i + 1].trimAscii()
+                    if (!cronScriptModeIsValid(mode)) {
+                        return cronErr("invalid cron.update params: --script-mode must be none, inject, or noAgent")
+                    }
+                    scriptModeOpt = Some(cronNormalizeScriptMode(mode))
+                    touched = true
+                    i += 2
+                    continue
+                }
                 if (k == "--payload-kind") {
                     if (i + 1 >= sub.size) {
                         return cronErr("invalid cron.update params: missing --payload-kind value")
@@ -2260,6 +2334,22 @@ private func cronCmdUpdate(path: Path, sub: Array<String>): (String, Int64) {
                     if (let Some(v) <- bestEffortDeliverOpt) { j.bestEffortDeliver = v }
                     if (let Some(v) <- toolExecModeOpt) { j.toolExecMode = cronNormalizeToolExecMode(v) }
                     if (toolExecAllowlistSet) { j.toolExecAllowlist = cronNormalizeToolExecAllowlist(toolExecAllowlistPatch.toArray()) }
+                    var nextScriptPath = cronNormalizeScriptPath(j.scriptPath)
+                    if (let Some(v) <- scriptPathOpt) {
+                        nextScriptPath = cronNormalizeScriptPath(v)
+                    }
+                    var nextScriptMode = cronNormalizeScriptMode(j.scriptMode)
+                    if (let Some(v) <- scriptModeOpt) {
+                        nextScriptMode = cronNormalizeScriptMode(v)
+                    }
+                    if (scriptPathOpt.isSome() && scriptModeOpt.isNone() && !nextScriptPath.isEmpty() && nextScriptMode == "none") {
+                        nextScriptMode = "inject"
+                    }
+                    if (nextScriptMode != "none" && nextScriptPath.isEmpty()) {
+                        return cronErr("invalid cron.update params: --script is required when --script-mode is inject or noAgent")
+                    }
+                    j.scriptPath = nextScriptPath
+                    j.scriptMode = nextScriptMode
                     if (let Some(v) <- payloadKindOpt) { j.payloadKind = v }
                     if (let Some(v) <- deliveryModeOpt) { j.deliveryMode = v }
                     if (let Some(v) <- failureDestModeOpt) { j.failureDestMode = v }

@@ -9,6 +9,7 @@ import metis.cron.{
     CronWebhookHttpRequest,
     CronWebhookHttpResponse,
     cronLoadOrEmpty,
+    cronScriptsDir,
     cronRunLogPathFromStore,
     cronSave,
     cronStorePath,
@@ -304,6 +305,145 @@ public class CronRunnerTest {
                 @Expect(row.get("durationMs").getOrThrow().asInt().getValue() >= 0, true)
                 idx += 1
             }
+        })
+    }
+
+    @TestCase
+    public func noAgentScriptUsesStdoutAsAnswerAndSkipsAgent(): Unit {
+        withCronRunnerTestHome({ storePath: Path =>
+            Directory.create(cronScriptsDir(CliConfig.dotDir), recursive: true)
+            File.writeTo(cronScriptsDir(CliConfig.dotDir).join("daily.sh"), "printf '脚本结果 🙂'\n".toArray())
+            let job = CronJob(
+                "script-no-agent",
+                "agent should not run",
+                CronSchedule.every(60000),
+                state: CronJobState(nextRunAtMs: 1),
+                deliveryChannel: "telegram",
+                deliveryTo: "chat-1",
+                deliveryMode: "announce",
+                scriptPath: "daily.sh",
+                scriptMode: "noAgent"
+            )
+            cronSave(storePath, [job])
+            let calls = JsonObject()
+            debugSetCronRunnerReplyForTest(Some({ _job: CronJob, _request: GatewaySessionRequest =>
+                calls.put("agent", JsonString("called"))
+                "agent answer"
+            }))
+            let adapter = CronRunnerTestChannelAdapter("telegram")
+            let gateway = cronRunnerTestGateway(adapter, "telegram", "")
+
+            let result = CronRunner.runJobOnceFromStore(Some(gateway), storePath, "script-no-agent", true)
+            @Expect(result.get("ok").getOrThrow().asBool().getValue(), true)
+            @Expect(calls.get("agent").isNone(), true)
+            @Expect(adapter.sendCount, 1)
+            @Expect(adapter.lastText.contains("脚本结果"), true)
+            @Expect(adapter.lastText.contains("🙂"), true)
+
+            let runs = readCronRunLogEntriesForJob(storePath, "script-no-agent", limit: 10)
+            let row = runs.get("entries").getOrThrow().asArray()[0].asObject()
+            @Expect(row.get("status").getOrThrow().asString().getValue(), "ok")
+            @Expect(row.get("summary").getOrThrow().asString().getValue().contains("脚本结果"), true)
+            @Expect(row.get("deliveryStatus").getOrThrow().asString().getValue(), "delivered")
+        })
+    }
+
+    @TestCase
+    public func injectScriptOutputBuildsEffectivePromptWithoutMutatingJobPrompt(): Unit {
+        withCronRunnerTestHome({ storePath: Path =>
+            Directory.create(cronScriptsDir(CliConfig.dotDir), recursive: true)
+            File.writeTo(cronScriptsDir(CliConfig.dotDir).join("inject.sh"), "printf '事实: 今日无事故'\n".toArray())
+            let job = CronJob(
+                "script-inject",
+                "请总结脚本内容",
+                CronSchedule.every(60000),
+                state: CronJobState(nextRunAtMs: 1),
+                scriptPath: "inject.sh",
+                scriptMode: "inject"
+            )
+            cronSave(storePath, [job])
+            let capture = JsonObject()
+            debugSetCronRunnerReplyForTest(Some({ _job: CronJob, request: GatewaySessionRequest =>
+                capture.put("text", JsonString(request.text))
+                "agent ok"
+            }))
+
+            let result = CronRunner.runJobOnceFromStore(None<GatewayService>, storePath, "script-inject", true)
+            @Expect(result.get("ok").getOrThrow().asBool().getValue(), true)
+            let text = capture.get("text").getOrThrow().asString().getValue()
+            @Expect(text.contains("## Script Output"), true)
+            @Expect(text.contains("事实: 今日无事故"), true)
+            @Expect(text.contains("## Cron Prompt"), true)
+            @Expect(text.contains("请总结脚本内容"), true)
+
+            let jobs = cronLoadOrEmpty(storePath)
+            @Expect(jobs.size, 1)
+            @Expect(jobs[0].prompt, "请总结脚本内容")
+            @Expect(jobs[0].scriptMode, "inject")
+        })
+    }
+
+    @TestCase
+    public func emptyNoAgentScriptIsSilentSuccessAndDoesNotDeliver(): Unit {
+        withCronRunnerTestHome({ storePath: Path =>
+            Directory.create(cronScriptsDir(CliConfig.dotDir), recursive: true)
+            File.writeTo(cronScriptsDir(CliConfig.dotDir).join("empty.sh"), "exit 0\n".toArray())
+            let job = CronJob(
+                "script-empty",
+                "agent should not run",
+                CronSchedule.every(60000),
+                state: CronJobState(nextRunAtMs: 1),
+                deliveryChannel: "telegram",
+                deliveryTo: "chat-1",
+                deliveryMode: "announce",
+                scriptPath: "empty.sh",
+                scriptMode: "noAgent"
+            )
+            cronSave(storePath, [job])
+            let adapter = CronRunnerTestChannelAdapter("telegram")
+            let gateway = cronRunnerTestGateway(adapter, "telegram", "")
+
+            let result = CronRunner.runJobOnceFromStore(Some(gateway), storePath, "script-empty", true)
+            @Expect(result.get("ok").getOrThrow().asBool().getValue(), true)
+            @Expect(adapter.sendCount, 0)
+            let jobs = cronLoadOrEmpty(storePath)
+            @Expect(jobs[0].state.lastStatus, "success")
+
+            let runs = readCronRunLogEntriesForJob(storePath, "script-empty", limit: 10)
+            let row = runs.get("entries").getOrThrow().asArray()[0].asObject()
+            @Expect(row.get("status").getOrThrow().asString().getValue(), "ok")
+            @Expect(row.get("summary").getOrThrow().asString().getValue(), "")
+            @Expect(row.get("deliveryStatus").getOrThrow().asString().getValue(), "not-requested")
+        })
+    }
+
+    @TestCase
+    public func scriptFailureFinalizesErrorAndRunLogDiagnostic(): Unit {
+        withCronRunnerTestHome({ storePath: Path =>
+            Directory.create(cronScriptsDir(CliConfig.dotDir), recursive: true)
+            File.writeTo(cronScriptsDir(CliConfig.dotDir).join("bad.txt"), "printf should-not-run\n".toArray())
+            let job = CronJob(
+                "script-fails",
+                "agent should not run",
+                CronSchedule.every(60000),
+                state: CronJobState(nextRunAtMs: 1),
+                scriptPath: "bad.txt",
+                scriptMode: "inject"
+            )
+            cronSave(storePath, [job])
+
+            let result = CronRunner.runJobOnceFromStore(None<GatewayService>, storePath, "script-fails", true)
+            @Expect(result.get("ok").getOrThrow().asBool().getValue(), true)
+            let jobs = cronLoadOrEmpty(storePath)
+            @Expect(jobs[0].state.lastStatus, "error")
+            @Expect(jobs[0].state.lastError.contains("cron_script_unsupported_extension"), true)
+            @Expect(jobs[0].state.runningAtMs, 0)
+
+            let runs = readCronRunLogEntriesForJob(storePath, "script-fails", limit: 10)
+            let row = runs.get("entries").getOrThrow().asArray()[0].asObject()
+            @Expect(row.get("status").getOrThrow().asString().getValue(), "error")
+            @Expect(row.get("diagnosticCode").getOrThrow().asString().getValue(), "cron_script_unsupported_extension")
+            @Expect(row.get("summary").getOrThrow().asString().getValue().contains("cron_script_unsupported_extension"), true)
         })
     }
 

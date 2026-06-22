@@ -114,6 +114,11 @@ private func cronRunTestToolRun(jobId: String): String {
         None<String>,
         None<String>,
         None<Bool>,
+        None<String>,
+        None<String>,
+        None<Array<String>>,
+        None<String>,
+        None<String>,
         None<Bool>,
         None<String>,
         None<String>

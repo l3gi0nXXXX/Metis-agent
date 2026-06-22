@@ -39,7 +39,10 @@ import metis.cron.{
     cronEffectiveAnnounceChannel,
     resolveCronDeliveryPlan,
     resolveCronFailurePlan,
-    scanCronPromptAssembled
+    scanCronPromptAssembled,
+    cronNormalizeScriptMode,
+    runCronJobScriptForJob,
+    CronScriptRunResult
 }
 import metis.gateway.logging.gatewayLogRedactText
 
@@ -425,16 +428,11 @@ public class CronRunner {
         }
     }
 
-    private func bridgeAndRequestForJob(j: CronJob, startedAtMs: Int64): (AgentBridge, GatewaySessionRequest) {
-        let request = cronBuildSessionRequest(j, startedAtMs)
-        let user = CliSettingManager.readGatewaySettings()
-        (gatewayBridgeForSessionRequest(user, request), request)
-    }
-
     private func executeJobReply(
         j: CronJob,
         bridge: AgentBridge,
         request: GatewaySessionRequest,
+        prompt: String,
         options: CronSessionExecutionOptions,
         turnContextOverride: Option<GatewayTurnContext>
     ): String {
@@ -455,10 +453,10 @@ public class CronRunner {
                             .object()
                     )
                     return result
-                case None => return cronBridgeReply(bridge, request, j.prompt, options, turnContextOverride: turnContextOverride)
+                case None => return cronBridgeReply(bridge, request, prompt, options, turnContextOverride: turnContextOverride)
             }
         }
-        cronBridgeReply(bridge, request, j.prompt, options, turnContextOverride: turnContextOverride)
+        cronBridgeReply(bridge, request, prompt, options, turnContextOverride: turnContextOverride)
     }
 
     private func appendRunLogIsolated(
@@ -523,6 +521,22 @@ public class CronRunner {
             case Some(diagnostic) => diagnostic.message
             case None => ""
         }
+    }
+
+    private func cronScriptFailureMessage(result: CronScriptRunResult): String {
+        let code = if (result.errorCode.trimAscii().isEmpty()) { result.status } else { result.errorCode }
+        let detail = if (!result.message.trimAscii().isEmpty()) {
+            result.message
+        } else if (!result.stderr.trimAscii().isEmpty()) {
+            result.stderr
+        } else {
+            result.status
+        }
+        "cron_script_failed:${code}: ${detail}"
+    }
+
+    private func cronPromptWithScriptOutput(scriptOutput: String, prompt: String): String {
+        "## Script Output\n${scriptOutput}\n\n## Cron Prompt\n${prompt}"
     }
 
     private func deliveryFailureMessage(kind: String, raw: String): String {
@@ -725,6 +739,8 @@ public class CronRunner {
         var answer = ""
         var deliveryStatus = "not-requested"
         var deliveryError = ""
+        var diagnosticCode = ""
+        var diagnosticMessage = ""
         var attempt: Int64 = 0
         let maxAttempts = max(1, j.maxRetries + 1)
 
@@ -757,11 +773,60 @@ public class CronRunner {
                 this.appendRunLogIsolated(j, status, startedAtMs, afterRun, errMsg, answer, deliveryStatus, deliveryError)
                 return
             }
-            match (cronRunnerBeforeExecuteHookForTest()) {
-                case Some(hook) => hook(j)
-                case None => ()
+            var effectivePrompt = j.prompt
+            var skipAgent = false
+            var skipSuccessDelivery = false
+            let scriptMode = cronNormalizeScriptMode(j.scriptMode)
+            if (scriptMode != "none") {
+                let scriptResult = runCronJobScriptForJob(CliConfig.dotDir, j)
+                if (!scriptResult.ok) {
+                    let afterRun = epochMs()
+                    status = "error"
+                    errMsg = this.cronScriptFailureMessage(scriptResult)
+                    diagnosticCode = scriptResult.errorCode
+                    diagnosticMessage = errMsg
+                    this.finalizeError(j, startedAtMs, afterRun, errMsg)
+                    match (resolveCronFailurePlan(j, dplan)) {
+                        case Some(fplan) =>
+                            if (this.shouldSendFailureAlert(j, fplan, afterRun)) {
+                                if (this.sendFailureAlert(j, fplan, errMsg, startedAtMs)) {
+                                    j.state.lastFailureAlertAtMs = afterRun
+                                }
+                            }
+                        case None => ()
+                    }
+                    this.appendRunLogIsolated(
+                        j,
+                        status,
+                        startedAtMs,
+                        afterRun,
+                        errMsg,
+                        answer,
+                        deliveryStatus,
+                        deliveryError,
+                        diagnosticCode: diagnosticCode,
+                        diagnosticMessage: diagnosticMessage
+                    )
+                    return
+                }
+                if (scriptResult.output.trimAscii().isEmpty()) {
+                    answer = ""
+                    skipAgent = true
+                    skipSuccessDelivery = true
+                } else if (scriptMode == "noAgent") {
+                    answer = scriptResult.output
+                    skipAgent = true
+                } else {
+                    effectivePrompt = this.cronPromptWithScriptOutput(scriptResult.output, j.prompt)
+                }
             }
-            let (jobBridge, jobRequest) = this.bridgeAndRequestForJob(j, startedAtMs)
+            if (!skipAgent) {
+                match (cronRunnerBeforeExecuteHookForTest()) {
+                    case Some(hook) => hook(j)
+                    case None => ()
+                }
+            }
+            let jobRequest = cronBuildSessionRequestWithPrompt(j, startedAtMs, effectivePrompt)
             let options = cronBuildSessionExecutionOptions(j)
             let turnContextOverride = Some(
                 cronTurnContextWithExecutionOptions(
@@ -769,35 +834,38 @@ public class CronRunner {
                     options
                 )
             )
-            while (attempt < maxAttempts) {
-                try {
-                    answer = this.executeJobReply(j, jobBridge, jobRequest, options, turnContextOverride)
-                    status = "success"
-                    errMsg = ""
-                    break
-                } catch (e: Exception) {
-                    status = "error"
-                    errMsg = e.message
-                    gatewayLogEventError(
-                        "gateway/cron",
-                        "cron.failed",
-                        "cron job attempt failed",
-                        meta: gatewayLogMeta()
-                            .string("jobId", j.id)
-                            .int("attempt", attempt + 1)
-                            .int("maxAttempts", maxAttempts)
-                            .rawString("error", e.message)
-                            .object()
-                    )
-                    if (attempt + 1 >= maxAttempts) {
+            if (!skipAgent) {
+                let jobBridge = gatewayBridgeForSessionRequest(CliSettingManager.readGatewaySettings(), jobRequest)
+                while (attempt < maxAttempts) {
+                    try {
+                        answer = this.executeJobReply(j, jobBridge, jobRequest, effectivePrompt, options, turnContextOverride)
+                        status = "success"
+                        errMsg = ""
                         break
+                    } catch (e: Exception) {
+                        status = "error"
+                        errMsg = e.message
+                        gatewayLogEventError(
+                            "gateway/cron",
+                            "cron.failed",
+                            "cron job attempt failed",
+                            meta: gatewayLogMeta()
+                                .string("jobId", j.id)
+                                .int("attempt", attempt + 1)
+                                .int("maxAttempts", maxAttempts)
+                                .rawString("error", e.message)
+                                .object()
+                        )
+                        if (attempt + 1 >= maxAttempts) {
+                            break
+                        }
+                        sleep(Duration.millisecond * backoffDelayMs(j, attempt))
                     }
-                    sleep(Duration.millisecond * backoffDelayMs(j, attempt))
+                    attempt += 1
                 }
-                attempt += 1
             }
 
-            if (status == "success" && dplan.requested) {
+            if (status == "success" && dplan.requested && !skipSuccessDelivery) {
                 let deliveryResult = this.sendSuccessDelivery(j, dplan, answer, startedAtMs)
                 deliveryStatus = deliveryResult[0]
                 deliveryError = deliveryResult[1]
@@ -834,8 +902,8 @@ public class CronRunner {
                 answer,
                 deliveryStatus,
                 deliveryError,
-                diagnosticCode: cronShellRunDiagnosticCode(answer, errMsg),
-                diagnosticMessage: cronShellRunDiagnosticMessage(answer, errMsg)
+                diagnosticCode: if (diagnosticCode.isEmpty()) { cronShellRunDiagnosticCode(answer, errMsg) } else { diagnosticCode },
+                diagnosticMessage: if (diagnosticMessage.isEmpty()) { cronShellRunDiagnosticMessage(answer, errMsg) } else { diagnosticMessage }
             )
         } catch (fatal: Exception) {
             let afterRun = epochMs()
@@ -1123,6 +1191,10 @@ public class CronRunner {
 }
 
 public func cronBuildSessionRequest(job: CronJob, startedAtMs: Int64): GatewaySessionRequest {
+    cronBuildSessionRequestWithPrompt(job, startedAtMs, job.prompt)
+}
+
+public func cronBuildSessionRequestWithPrompt(job: CronJob, startedAtMs: Int64, prompt: String): GatewaySessionRequest {
     let dplan = resolveCronDeliveryPlan(job)
     let dm = dplan.mode.trimAscii().toAsciiLower()
     let deliver = dplan.requested && dm == "announce"
@@ -1141,7 +1213,7 @@ public func cronBuildSessionRequest(job: CronJob, startedAtMs: Int64): GatewaySe
         channelName: "cron",
         sessionHint: cronExecutionConversationKey(job, startedAtMs),
         agentId: job.agentId,
-        text: job.prompt,
+        text: prompt,
         replyChannel: replyChannel,
         replyTo: replyTo,
         replyAccountId: if (deliver) { dplan.accountId } else { "" },

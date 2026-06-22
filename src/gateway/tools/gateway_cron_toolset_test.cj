@@ -127,6 +127,8 @@ private func gatewayCronToolsetCall(
     toolExecMode!: Option<String> = None<String>,
     toolExecAllow!: Option<String> = None<String>,
     toolExecAllowlist!: Option<Array<String>> = None<Array<String>>,
+    scriptPath!: Option<String> = None<String>,
+    scriptMode!: Option<String> = None<String>,
     dueOnly!: Option<Bool> = None<Bool>,
     mode!: Option<String> = None<String>,
     text!: Option<String> = None<String>
@@ -161,6 +163,8 @@ private func gatewayCronToolsetCall(
         toolExecMode,
         toolExecAllow,
         toolExecAllowlist,
+        scriptPath,
+        scriptMode,
         dueOnly,
         mode,
         text
@@ -179,6 +183,8 @@ public class GatewayCronToolsetTest {
         @Expect(gatewayCronToolsetRequiredContains(cronTool, "lightContext"), false)
         @Expect(gatewayCronToolsetRequiredContains(cronTool, "toolExecMode"), false)
         @Expect(gatewayCronToolsetRequiredContains(cronTool, "toolExecAllowlist"), false)
+        @Expect(gatewayCronToolsetRequiredContains(cronTool, "scriptPath"), false)
+        @Expect(gatewayCronToolsetRequiredContains(cronTool, "scriptMode"), false)
         @Expect(gatewayCronToolsetRequiredContains(cronTool, "dueOnly"), false)
     }
 
@@ -257,6 +263,8 @@ public class GatewayCronToolsetTest {
             @Expect(job.lightContext, true)
             @Expect(job.toolExecMode, "guarded")
             @Expect(job.toolExecAllowlist.size, 0)
+            @Expect(job.scriptPath, "")
+            @Expect(job.scriptMode, "none")
         }
     }
 
@@ -304,6 +312,38 @@ public class GatewayCronToolsetTest {
             @Expect(jobs[0].toolExecAllowlist.size, 2)
             @Expect(jobs[0].toolExecAllowlist[0], "printf")
             @Expect(jobs[0].toolExecAllowlist[1], "rg")
+        }
+    }
+
+    @TestCase
+    public func cronToolInvokeAddAndUpdateScriptFields(): Unit {
+        withGatewayCronToolsetTestHome {
+            let toolset = GatewayCronToolset()
+            let addRaw = gatewayCronToolsetCall(
+                toolset,
+                "add",
+                name: Some("script-tool"),
+                message: Some("collect by script"),
+                every: Some("10m"),
+                scriptPath: Some("daily/report.sh")
+            )
+            @Expect(gatewayCronToolsetBool(addRaw, "ok"), true)
+
+            var jobs = cronLoadOrEmpty(cronStorePath(CliConfig.dotDir))
+            @Expect(jobs.size, 1)
+            @Expect(jobs[0].scriptPath, "daily/report.sh")
+            @Expect(jobs[0].scriptMode, "inject")
+
+            let updateRaw = gatewayCronToolsetCall(
+                toolset,
+                "update",
+                id: Some("script-tool"),
+                scriptMode: Some("noAgent")
+            )
+            @Expect(gatewayCronToolsetBool(updateRaw, "ok"), true)
+            jobs = cronLoadOrEmpty(cronStorePath(CliConfig.dotDir))
+            @Expect(jobs[0].scriptPath, "daily/report.sh")
+            @Expect(jobs[0].scriptMode, "noAgent")
         }
     }
 
@@ -356,6 +396,19 @@ public class GatewayCronToolsetTest {
             @Expect(afterAllow.size, before.size)
             @Expect(afterAllow[0].toolExecMode, before[0].toolExecMode)
             @Expect(afterAllow[0].toolExecAllowlist.size, before[0].toolExecAllowlist.size)
+
+            let badScriptMode = gatewayCronToolsetCall(
+                toolset,
+                "update",
+                id: Some("invalid-policy"),
+                scriptMode: Some("approve")
+            )
+            @Expect(gatewayCronToolsetBool(badScriptMode, "ok"), false)
+            @Expect(gatewayCronToolsetString(badScriptMode, "status"), "error")
+
+            let afterScript = cronLoadOrEmpty(cronStorePath(CliConfig.dotDir))
+            @Expect(afterScript.size, before.size)
+            @Expect(afterScript[0].scriptMode, before[0].scriptMode)
         }
     }
 

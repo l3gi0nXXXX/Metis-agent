@@ -3,7 +3,7 @@ package metis.gateway.tools
 import magic.dsl.{tool, toolset}
 import magic.prelude.*
 
-import metis.cron.{CronPromptScanResult, cronToolExecModeIsValid, executeGatewayCronCommand, scanCronPromptStrict}
+import metis.cron.{CronPromptScanResult, cronScriptModeIsValid, cronToolExecModeIsValid, executeGatewayCronCommand, scanCronPromptStrict}
 import metis.io.PrintUtils
 
 import std.collection.ArrayList
@@ -175,6 +175,8 @@ public class GatewayCronToolset {
             toolExecMode: "Optional cron shell policy for add/update: guarded, deny, allowlist, or yolo. Omit for guarded default.",
             toolExecAllow: "Optional single allowlisted command prefix for add/update.",
             toolExecAllowlist: "Optional allowlisted command prefixes for add/update.",
+            scriptPath: "Optional relative script path under cron/scripts for add/update.",
+            scriptMode: "Optional script mode for add/update: none, inject, or noAgent.",
             dueOnly: "Optional due_only flag for run.",
             mode: "Optional wake mode.",
             text: "Optional wake text."
@@ -210,6 +212,8 @@ public class GatewayCronToolset {
         toolExecMode: Option<String>,
         toolExecAllow: Option<String>,
         toolExecAllowlist: Option<Array<String>>,
+        scriptPath: Option<String>,
+        scriptMode: Option<String>,
         dueOnly: Option<Bool>,
         mode: Option<String>,
         text: Option<String>
@@ -289,6 +293,19 @@ public class GatewayCronToolset {
             this.addBoolChoiceFlag(args, "--light-context", "--no-light-context", lightContext)
             match (this.appendToolExecFlagsForCronTool(args, toolExecMode, toolExecAllow, toolExecAllowlist)) {
                 case Some(error) => return this.errorResult("add", error)
+                case None => ()
+            }
+            this.addStringFlag(args, "--script", scriptPath)
+            match (scriptMode) {
+                case Some(rawMode) =>
+                    let mode = rawMode.trimAscii()
+                    if (!mode.isEmpty()) {
+                        if (!cronScriptModeIsValid(mode)) {
+                            return this.errorResult("add", "invalid scriptMode: must be none, inject, or noAgent")
+                        }
+                        args.add("--script-mode")
+                        args.add(mode)
+                    }
                 case None => ()
             }
             args.add("--message")
@@ -379,6 +396,19 @@ public class GatewayCronToolset {
             this.addBoolChoiceFlag(args, "--light-context", "--no-light-context", lightContext)
             match (this.appendToolExecFlagsForCronTool(args, toolExecMode, toolExecAllow, toolExecAllowlist)) {
                 case Some(error) => return this.errorResult("update", error)
+                case None => ()
+            }
+            this.addStringFlag(args, "--script", scriptPath)
+            match (scriptMode) {
+                case Some(rawMode) =>
+                    let mode = rawMode.trimAscii()
+                    if (!mode.isEmpty()) {
+                        if (!cronScriptModeIsValid(mode)) {
+                            return this.errorResult("update", "invalid scriptMode: must be none, inject, or noAgent")
+                        }
+                        args.add("--script-mode")
+                        args.add(mode)
+                    }
                 case None => ()
             }
             match (message) {
@@ -476,6 +506,8 @@ public class GatewayCronToolset {
         toolExecMode: Option<String>,
         toolExecAllow: Option<String>,
         toolExecAllowlist: Option<Array<String>>,
+        scriptPath: Option<String>,
+        scriptMode: Option<String>,
         dueOnly: Option<Bool>,
         mode: Option<String>,
         text: Option<String>
@@ -510,6 +542,8 @@ public class GatewayCronToolset {
             toolExecMode,
             toolExecAllow,
             toolExecAllowlist,
+            scriptPath,
+            scriptMode,
             dueOnly,
             mode,
             text

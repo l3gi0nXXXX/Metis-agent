@@ -95,6 +95,47 @@ public class CronStoreToolExecPolicyTest {
             @Expect(jobs[2].toolExecAllowlist[0], "curl")
         })
     }
+
+    @TestCase
+    public func cronSaveLoadPersistsScriptFieldsAndSanitizesMode(): Unit {
+        withCronStoreTestPath({ storePath =>
+            cronSave(storePath, [
+                CronJob(
+                    "scripted",
+                    "hello cron",
+                    CronSchedule.every(60000),
+                    scriptPath: "daily/report.sh",
+                    scriptMode: "noAgent"
+                )
+            ])
+
+            let jobs = cronLoadOrEmpty(storePath)
+            @Expect(jobs.size, 1)
+            @Expect(jobs[0].scriptPath, "daily/report.sh")
+            @Expect(jobs[0].scriptMode, "noAgent")
+        })
+    }
+
+    @TestCase
+    public func cronLoadDefaultsAndSanitizesScriptFields(): Unit {
+        withCronStoreTestPath({ storePath =>
+            Directory.create(storePath.parent, recursive: true)
+            File.writeTo(
+                storePath,
+                ("{\"version\":1,\"jobs\":[" +
+                    "{\"id\":\"legacy\",\"prompt\":\"hello\",\"schedule\":{\"kind\":\"every\",\"everyMs\":60000}}," +
+                    "{\"id\":\"bad-script-mode\",\"prompt\":\"hello\",\"scriptPath\":\"report.sh\",\"scriptMode\":\"approve\",\"schedule\":{\"kind\":\"every\",\"everyMs\":60000}}" +
+                    "]}").toArray()
+            )
+
+            let jobs = cronLoadOrEmpty(storePath)
+            @Expect(jobs.size, 2)
+            @Expect(jobs[0].scriptPath, "")
+            @Expect(jobs[0].scriptMode, "none")
+            @Expect(jobs[1].scriptPath, "report.sh")
+            @Expect(jobs[1].scriptMode, "none")
+        })
+    }
 }
 
 @Test

@@ -153,6 +153,8 @@ private func parseJob(obj: JsonObject): Option<CronJob> {
             bestEffortDeliver: readBool(obj, "bestEffortDeliver", default: false),
             toolExecMode: cronNormalizeToolExecMode(readStr(obj, "toolExecMode", default: "guarded")),
             toolExecAllowlist: cronNormalizeToolExecAllowlist(readStrArray(obj, "toolExecAllowlist")),
+            scriptPath: cronNormalizeScriptPath(readStr(obj, "scriptPath", default: "")),
+            scriptMode: cronNormalizeScriptMode(readStr(obj, "scriptMode", default: "none")),
             failureAccountId: readStr(obj, "failureAccountId", default: ""),
             failureAlertAfter: readI64(obj, "failureAlertAfter", default: 0),
             failureAlertCooldownMs: readI64(obj, "failureAlertCooldownMs", default: 0)
@@ -319,6 +321,8 @@ private func jobToJson(j: CronJob): JsonObject {
         toolExecAllowlist.add(JsonString(entry))
     }
     o.put("toolExecAllowlist", JsonArray(toolExecAllowlist))
+    o.put("scriptPath", JsonString(cronNormalizeScriptPath(j.scriptPath)))
+    o.put("scriptMode", JsonString(cronNormalizeScriptMode(j.scriptMode)))
     o.put("failureAccountId", JsonString(j.failureAccountId))
     o.put("failureAlertAfter", JsonInt(j.failureAlertAfter))
     o.put("failureAlertCooldownMs", JsonInt(j.failureAlertCooldownMs))
