@@ -1086,6 +1086,64 @@ public class AgentBridgeRuntimeTest {
     }
 
     @TestCase
+    public func agentBridgeBlocksTerminalEnvelopeContainingToolMarkerBeforeSessionHistory(): Unit {
+        withAgentBridgeTempHome("metis-m2-terminal-marker", { home: Path =>
+            writeAgentBridgeCodexAppServerAgentConfig(home)
+            let context = gatewayResolveSessionContext(
+                GatewaySessionRequest(
+                    GatewayIngressSource.Channel("telegram"),
+                    channelName: "telegram",
+                    sessionHint: "main",
+                    agentId: "codex",
+                    text: "status"
+                )
+            )
+            setGatewayCodexAppServerRunnerForTest(Some({ request: GatewayCodexAppServerTurnRequest =>
+                GatewayCodexAppServerRuntimeResult(
+                    "{\"name\":\"_answer_\",\"arguments\":{\"result\":\"\\\"functions._answer_\\\"\"}}",
+                    threadId: "thread-m2-marker",
+                    turnId: "turn-m2-marker",
+                    completed: true,
+                    metadata: gatewayCodexAppServerRuntimeMetadata(
+                        request.modelName,
+                        request.channelName,
+                        request.sessionKey,
+                        threadId: "thread-m2-marker",
+                        turnId: "turn-m2-marker",
+                        completed: true
+                    )
+                )
+            }))
+            try {
+                let store = GatewaySessionStore(home.join("sessions"), enabled: true, agentId: "codex")
+                let bridge = AgentBridge(sessionStore: store)
+                let reply = bridge.reply(
+                    context.sessionKey,
+                    "status",
+                    channelName: "telegram",
+                    agentId: "codex",
+                    turnContext: Some(context.turnContext)
+                )
+
+                @Expect(reply.contains("工具调用协议"), true)
+                @Expect(reply.contains("functions._answer_"), false)
+                @Expect(reply.contains("\"arguments\""), false)
+                let history = bridge.getHistory(context.sessionKey)
+                @Expect(history[history.size - 1].contains("工具调用协议"), true)
+                @Expect(history[history.size - 1].contains("functions._answer_"), false)
+                @Expect(history[history.size - 1].contains("\"_answer_\""), false)
+                let transcript = String.fromUtf8(File.readFrom(store.transcriptPath(context.sessionKey)))
+                @Expect(transcript.contains("工具调用协议"), true)
+                @Expect(transcript.contains("functions._answer_"), false)
+                @Expect(transcript.contains("\"_answer_\""), false)
+                @Expect(transcript.contains("\"arguments\""), false)
+            } finally {
+                setGatewayCodexAppServerRunnerForTest(None<(GatewayCodexAppServerTurnRequest) -> GatewayCodexAppServerRuntimeResult>)
+            }
+        })
+    }
+
+    @TestCase
     public func codexAppServerInputAndMetadataStayHumanSafeAndStructured(): Unit {
         let usage = JsonObject()
         usage.put("promptTokens", JsonInt(3))

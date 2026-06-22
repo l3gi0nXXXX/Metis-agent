@@ -98,7 +98,11 @@ private func gatewayGuardVisibleDeliveryText(raw: String, partial!: Bool = false
     if (visible.trimAscii().isEmpty()) {
         return ""
     }
-    normalizeGatewayAssistantVisibleTextForDelivery(visible, partial: partial).text.trimAscii()
+    let result = normalizeGatewayAssistantVisibleTextForDelivery(visible, partial: partial)
+    if (partial && result.blocked) {
+        return ""
+    }
+    result.text.trimAscii()
 }
 
 private func gatewayIsSilentReplyText(text: String): Bool {
