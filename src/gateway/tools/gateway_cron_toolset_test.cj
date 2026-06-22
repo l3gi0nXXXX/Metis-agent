@@ -1,13 +1,15 @@
 package metis.gateway.tools
 
+import magic.core.tool.Tool
 import metis.core.config.{CliConfig, CliSettingManager, MetisConfigManager, MetisProcessEnvironmentLock}
 import metis.cron.{cronLoadOrEmpty, cronStorePath, registerGatewayCronRunUnified}
 
 import std.env.{getVariable, setVariable}
+import std.collection.HashMap
 import std.fs.{Directory, Path, remove}
 import std.time.DateTime
 import std.unittest.testmacro.*
-import stdx.encoding.json.JsonValue
+import stdx.encoding.json.{JsonBool, JsonInt, JsonString, JsonValue}
 
 private func withGatewayCronToolsetTestHome<T>(block: () -> T): T {
     synchronized(MetisProcessEnvironmentLock) {
@@ -60,6 +62,38 @@ private func gatewayCronToolsetBool(raw: String, key: String): Bool {
         case Some(v) => try { v.asBool().getValue() } catch (_: Exception) { false }
         case None => false
     }
+}
+
+private func gatewayCronToolsetRequiredContains(tool: Tool, paramName: String): Bool {
+    let schema = tool.toJsonValue().asObject()
+    let params = schema.get("parameters").getOrThrow().asObject()
+    let required = params.get("required").getOrThrow().asArray().getItems()
+    for (item in required) {
+        if (item.asString().getValue() == paramName) {
+            return true
+        }
+    }
+    return false
+}
+
+private func gatewayCronToolsetRawArgs(action: String): HashMap<String, JsonValue> {
+    let args = HashMap<String, JsonValue>()
+    args.add("action", JsonString(action))
+    for (key in [
+        "id", "name", "message", "every", "at", "cronExpr", "enabled", "session",
+        "deliveryChannel", "deliveryMode", "deliveryTo", "deliveryAccountId",
+        "bestEffortDeliver", "timeoutMs", "maxRetries", "retryBackoffMs",
+        "failureChannel", "failureDestMode", "failureTo", "failureAccountId",
+        "failureAlertAfter", "failureAlertCooldownMs", "model", "thinkingLevel",
+        "lightContext", "dueOnly", "mode", "text"
+    ]) {
+        args.add(key, JsonString(""))
+    }
+    args
+}
+
+private func gatewayCronToolsetInvokeRawArgsForTest(args: HashMap<String, JsonValue>): String {
+    GatewayCronToolset().cron.invoke(args).content
 }
 
 private func gatewayCronToolsetCall(
@@ -129,6 +163,205 @@ private func gatewayCronToolsetCall(
 
 @Test
 public class GatewayCronToolsetTest {
+    @TestCase
+    public func cronToolSchemaMarksOnlyActionAsRequired(): Unit {
+        let cronTool = GatewayCronToolset().cron
+        @Expect(gatewayCronToolsetRequiredContains(cronTool, "action"), true)
+        @Expect(gatewayCronToolsetRequiredContains(cronTool, "enabled"), false)
+        @Expect(gatewayCronToolsetRequiredContains(cronTool, "bestEffortDeliver"), false)
+        @Expect(gatewayCronToolsetRequiredContains(cronTool, "timeoutMs"), false)
+        @Expect(gatewayCronToolsetRequiredContains(cronTool, "lightContext"), false)
+        @Expect(gatewayCronToolsetRequiredContains(cronTool, "dueOnly"), false)
+    }
+
+    @TestCase
+    public func cronToolInvokeListAcceptsModelEmptyOptionalArguments(): Unit {
+        withGatewayCronToolsetTestHome {
+            let raw = gatewayCronToolsetInvokeRawArgsForTest(gatewayCronToolsetRawArgs("list"))
+            @Expect(gatewayCronToolsetBool(raw, "ok"), true)
+            @Expect(gatewayCronToolsetString(raw, "action"), "list")
+            @Expect(gatewayCronToolsetString(raw, "status"), "ok")
+        }
+    }
+
+    @TestCase
+    public func cronToolInvokeUpdateIgnoresEmptyScalarOptionalsAndPersistsDeliveryStrings(): Unit {
+        withGatewayCronToolsetTestHome {
+            let addRaw = gatewayCronToolsetCall(
+                GatewayCronToolset(),
+                "add",
+                name: Some("delivery-job"),
+                message: Some("deliver safely"),
+                every: Some("10m"),
+                bestEffortDeliver: Some(true),
+                timeoutMs: Some(5000),
+                maxRetries: Some(2),
+                lightContext: Some(true)
+            )
+            @Expect(gatewayCronToolsetBool(addRaw, "ok"), true)
+
+            let args = gatewayCronToolsetRawArgs("update")
+            args["id"] = JsonString("delivery-job")
+            args["deliveryMode"] = JsonString("announce")
+            args["deliveryChannel"] = JsonString("feishu")
+            args["deliveryTo"] = JsonString("ou_user")
+            args["deliveryAccountId"] = JsonString("tenant-a")
+            let updateRaw = gatewayCronToolsetInvokeRawArgsForTest(args)
+            @Expect(gatewayCronToolsetBool(updateRaw, "ok"), true)
+
+            let jobs = cronLoadOrEmpty(cronStorePath(CliConfig.dotDir))
+            @Expect(jobs.size, 1)
+            let job = jobs[0]
+            @Expect(job.deliveryMode, "announce")
+            @Expect(job.deliveryChannel, "feishu")
+            @Expect(job.deliveryTo, "ou_user")
+            @Expect(job.deliveryAccountId, "tenant-a")
+            @Expect(job.bestEffortDeliver, true)
+            @Expect(job.timeoutMs, 5000)
+            @Expect(job.maxRetries, 2)
+            @Expect(job.lightContext, true)
+        }
+    }
+
+    @TestCase
+    public func cronToolInvokeAddAcceptsTypedOptionalScalars(): Unit {
+        withGatewayCronToolsetTestHome {
+            let args = gatewayCronToolsetRawArgs("add")
+            args["name"] = JsonString("typed-optionals")
+            args["message"] = JsonString("typed optional values")
+            args["every"] = JsonString("10m")
+            args["bestEffortDeliver"] = JsonBool(true)
+            args["timeoutMs"] = JsonInt(1500)
+            args["maxRetries"] = JsonInt(3)
+            args["retryBackoffMs"] = JsonInt(250)
+            args["lightContext"] = JsonBool(true)
+            let raw = gatewayCronToolsetInvokeRawArgsForTest(args)
+            @Expect(gatewayCronToolsetBool(raw, "ok"), true)
+
+            let jobs = cronLoadOrEmpty(cronStorePath(CliConfig.dotDir))
+            @Expect(jobs.size, 1)
+            let job = jobs[0]
+            @Expect(job.id, "typed-optionals")
+            @Expect(job.bestEffortDeliver, true)
+            @Expect(job.timeoutMs, 1500)
+            @Expect(job.maxRetries, 3)
+            @Expect(job.retryBackoffMs, 250)
+            @Expect(job.lightContext, true)
+        }
+    }
+
+    @TestCase
+    public func cronToolInvokeRunDueOnlyAcceptsEmptyAndTrue(): Unit {
+        withGatewayCronToolsetTestHome {
+            registerGatewayCronRunUnified({ sub: Array<String> =>
+                var sawDue = false
+                for (arg in sub) {
+                    if (arg.trimAscii().toAsciiLower() == "--due") {
+                        sawDue = true
+                    }
+                    if (arg.trimAscii().toAsciiLower() == "--due-only") {
+                        return ("Cron run failed\nError: legacy due-only flag was used", 1)
+                    }
+                }
+                if (sawDue) {
+                    return ("Cron run\nJob: due-job\nSaw due flag", 0)
+                }
+                ("Cron run\nJob: due-job\nNo due flag", 0)
+            })
+            let addRaw = gatewayCronToolsetCall(
+                GatewayCronToolset(),
+                "add",
+                name: Some("due-job"),
+                message: Some("due run"),
+                every: Some("10m")
+            )
+            @Expect(gatewayCronToolsetBool(addRaw, "ok"), true)
+
+            let emptyArgs = gatewayCronToolsetRawArgs("run")
+            emptyArgs["id"] = JsonString("due-job")
+            let emptyRaw = gatewayCronToolsetInvokeRawArgsForTest(emptyArgs)
+            @Expect(gatewayCronToolsetBool(emptyRaw, "ok"), true)
+            @Expect(gatewayCronToolsetString(emptyRaw, "output").contains("No due flag"), true)
+
+            let trueArgs = gatewayCronToolsetRawArgs("run")
+            trueArgs["id"] = JsonString("due-job")
+            trueArgs["dueOnly"] = JsonBool(true)
+            let trueRaw = gatewayCronToolsetInvokeRawArgsForTest(trueArgs)
+            @Expect(gatewayCronToolsetBool(trueRaw, "ok"), true)
+            @Expect(gatewayCronToolsetString(trueRaw, "output").contains("Saw due flag"), true)
+        }
+    }
+
+    @TestCase
+    public func cronToolInvokeRejectsNonEmptyInvalidOptionalScalarWithoutStoreWrite(): Unit {
+        withGatewayCronToolsetTestHome {
+            let addRaw = gatewayCronToolsetCall(
+                GatewayCronToolset(),
+                "add",
+                name: Some("invalid-scalar"),
+                message: Some("invalid scalar"),
+                every: Some("10m")
+            )
+            @Expect(gatewayCronToolsetBool(addRaw, "ok"), true)
+
+            let before = cronLoadOrEmpty(cronStorePath(CliConfig.dotDir))
+            let args = gatewayCronToolsetRawArgs("update")
+            args["id"] = JsonString("invalid-scalar")
+            args["deliveryMode"] = JsonString("announce")
+            args["timeoutMs"] = JsonString("abc")
+
+            var failed = false
+            try {
+                gatewayCronToolsetInvokeRawArgsForTest(args)
+            } catch (_: Exception) {
+                failed = true
+            }
+            @Expect(failed, true)
+
+            let after = cronLoadOrEmpty(cronStorePath(CliConfig.dotDir))
+            @Expect(after.size, before.size)
+            @Expect(after[0].deliveryMode, before[0].deliveryMode)
+            @Expect(after[0].timeoutMs, before[0].timeoutMs)
+        }
+    }
+
+    @TestCase
+    public func cronToolInvokeEndToEndConfigureDeliveryWithModelStylePayload(): Unit {
+        withGatewayCronToolsetTestHome {
+            let addRaw = gatewayCronToolsetCall(
+                GatewayCronToolset(),
+                "add",
+                name: Some("delivery-e2e"),
+                message: Some("delivery e2e"),
+                every: Some("10m")
+            )
+            @Expect(gatewayCronToolsetBool(addRaw, "ok"), true)
+
+            let listBefore = gatewayCronToolsetInvokeRawArgsForTest(gatewayCronToolsetRawArgs("list"))
+            @Expect(gatewayCronToolsetBool(listBefore, "ok"), true)
+
+            let updateArgs = gatewayCronToolsetRawArgs("update")
+            updateArgs["id"] = JsonString("delivery-e2e")
+            updateArgs["deliveryMode"] = JsonString("announce")
+            updateArgs["deliveryChannel"] = JsonString("telegram")
+            updateArgs["deliveryTo"] = JsonString("user:ops")
+            updateArgs["deliveryAccountId"] = JsonString("bot-a")
+            let updateRaw = gatewayCronToolsetInvokeRawArgsForTest(updateArgs)
+            @Expect(gatewayCronToolsetBool(updateRaw, "ok"), true)
+
+            let listAfter = gatewayCronToolsetInvokeRawArgsForTest(gatewayCronToolsetRawArgs("list"))
+            @Expect(gatewayCronToolsetBool(listAfter, "ok"), true)
+
+            let jobs = cronLoadOrEmpty(cronStorePath(CliConfig.dotDir))
+            @Expect(jobs.size, 1)
+            let job = jobs[0]
+            @Expect(job.deliveryMode, "announce")
+            @Expect(job.deliveryChannel, "telegram")
+            @Expect(job.deliveryTo, "user:ops")
+            @Expect(job.deliveryAccountId, "bot-a")
+        }
+    }
+
     @TestCase
     public func cronToolAddKeepsScheduleSeparateFromMessage(): Unit {
         withGatewayCronToolsetTestHome {

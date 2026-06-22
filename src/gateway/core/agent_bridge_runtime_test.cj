@@ -144,6 +144,18 @@ private func agentBridgeJsonBool(obj: JsonObject, key: String): Bool {
     false
 }
 
+private func agentBridgeToolRequiredContains(schema: JsonValue, paramName: String): Bool {
+    let obj = schema.asObject()
+    let params = obj.get("parameters").getOrThrow().asObject()
+    let required = params.get("required").getOrThrow().asArray().getItems()
+    for (item in required) {
+        if (item.asString().getValue() == paramName) {
+            return true
+        }
+    }
+    return false
+}
+
 private class MockGitCodeMcpRuntimeAdapter <: GatewayGitCodeMcpRuntimeAdapter {
     public var called: Bool = false
     public var toolName: String = ""
@@ -231,6 +243,17 @@ public class AgentBridgeRuntimeTest {
             }
         }
         @Expect(found, true)
+    }
+
+    @TestCase
+    public func gatewayCronToolSchemaExposesOptionalParamsAsNonRequired(): Unit {
+        let schema = gatewayDefaultChatToolJsonValue("cron").getOrThrow()
+        @Expect(agentBridgeToolRequiredContains(schema, "action"), true)
+        @Expect(agentBridgeToolRequiredContains(schema, "enabled"), false)
+        @Expect(agentBridgeToolRequiredContains(schema, "bestEffortDeliver"), false)
+        @Expect(agentBridgeToolRequiredContains(schema, "timeoutMs"), false)
+        @Expect(agentBridgeToolRequiredContains(schema, "lightContext"), false)
+        @Expect(agentBridgeToolRequiredContains(schema, "dueOnly"), false)
     }
 
     @TestCase
