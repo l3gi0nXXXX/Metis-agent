@@ -1,6 +1,6 @@
 package metis.gateway.runtime
 
-import metis.cron.{executeGatewayCronCommand, formatCronHelpForTerminal, registerGatewayCronRunUnified,
+import metis.cron.{executeGatewayCronCommand, formatCronHelpForTerminal, gatewayCronRunHookRegistered, registerGatewayCronRunUnified,
     tryCronSubcommandHelpFromArgv}
 import metis.io.PrintUtils
 
@@ -23,7 +23,8 @@ private var gatewayCronHookInitDone: Bool = false
 /** 保证 IM `/cron run` 使用的 `executeGatewayCronCommand` 钩子已绑定（无需先 `gateway serve` 也能用 CLI `gateway cron run`）。 */
 private func ensureGatewayCronRunHookRegistered(): Unit {
     synchronized(gatewayCronHookInitLock) {
-        if (gatewayCronHookInitDone) {
+        if (gatewayCronRunHookRegistered()) {
+            gatewayCronHookInitDone = true
             return
         }
         registerGatewayCronRunUnified(gatewayCronRunUnified)
@@ -39,9 +40,6 @@ public func gatewayExecuteCronWithUnifiedRun(sub: Array<String>): (String, Int64
     match (tryCronSubcommandHelpFromArgv(sub)) {
         case Some(pair) => return pair
         case None => ()
-    }
-    if (sub.size >= 2 && sub[1].trimAscii().toAsciiLower() == "run") {
-        return gatewayCronRunUnified(sub)
     }
     executeGatewayCronCommand(sub)
 }

@@ -438,7 +438,7 @@ private func gatewayDashboardAppendDeliveryArgs(parts: ArrayList<String>, ctx: H
     }
 }
 
-private func gatewayDashboardRunCronJobNow(jobId: String): (Bool, String) {
+func gatewayDashboardRunCronJobNow(jobId: String): (Bool, String) {
     var found = false
     for (j in cronLoadOrEmpty(cronStorePath(CliConfig.dotDir))) {
         if (j.id == jobId) {
@@ -449,7 +449,7 @@ private func gatewayDashboardRunCronJobNow(jobId: String): (Bool, String) {
     if (!found) {
         return (false, "未找到任务 id=${jobId}")
     }
-    gatewayCronRunOnceOutcome(jobId, true)
+    gatewayCronRunOnceOutcomeViaRegisteredHook(jobId, true)
 }
 
 func gatewayDashboardBuildCronRunNowParams(job: CronJob): JsonObject {

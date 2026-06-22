@@ -25,6 +25,18 @@ public func registerGatewayCronRunUnified(hook: (Array<String>) -> (String, Int6
     }
 }
 
+public func gatewayCronRunHookRegistered(): Bool {
+    synchronized(gatewayCronRunHookLock) {
+        gatewayCronRunHook.isSome()
+    }
+}
+
+public func clearGatewayCronRunHookForTest(): Unit {
+    synchronized(gatewayCronRunHookLock) {
+        gatewayCronRunHook = None<(Array<String>) -> (String, Int64)>
+    }
+}
+
 /**
  * 将 `/cron ...` 整行解析为与 `gateway cron` 相同的参数数组（首元素为 `cron`）。
  * 若不是 `/cron` 前缀则返回空数组。

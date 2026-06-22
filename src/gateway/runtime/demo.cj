@@ -152,6 +152,7 @@ public func runGatewayService(verbose!: Bool = false): Unit {
         gatewayOpt: Some(gateway),
         cronEnabled: user.cronEnabled
     )
+    registerGatewayCronRunHookForRunner(cronRunner)
     try {
         if (generatedAuthToken) {
             gatewayServeLogger.debug(
