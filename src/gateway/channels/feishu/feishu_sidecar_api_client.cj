@@ -419,7 +419,7 @@ public class FeishuSidecarApiClient <: FeishuApiClient {
                 if (!replyId.isEmpty()) {
                     params.put("replyToMessageId", JsonString(replyId))
                     let reply = this.sendResult(this.invoke("message.reply", accountId, params))
-                    if (reply.ok || !feishuSidecarShouldFallbackReply(reply.status, reply.error)) {
+                    if (reply.ok || replyInThread || !feishuSidecarShouldFallbackReply(reply.status, reply.error)) {
                         return reply
                     }
                     let fallback = this.peerParams(rawPeerId, receiveId, receiveIdType, replyInThread)
@@ -779,12 +779,30 @@ private func feishuSidecarSensitiveToken(raw: String): Bool {
 
 private func feishuSidecarShouldFallbackReply(status: String, error: String): Bool {
     let probe = "${status.trimAscii().toAsciiLower()} ${error.trimAscii().toAsciiLower()}"
-    probe.contains("message_unavailable") ||
+    if (probe.contains("scope") ||
+        probe.contains("permission") ||
+        probe.contains("auth") ||
+        probe.contains("unauthorized") ||
+        probe.contains("forbidden") ||
+        probe.contains("access denied")) {
+        return false
+    }
+    let targetUnavailable = probe.contains("message_unavailable") ||
         probe.contains("not_found") ||
         probe.contains("not found") ||
+        probe.contains("unavailable") ||
+        probe.contains("reply target") ||
         probe.contains("deleted") ||
         probe.contains("recalled") ||
         probe.contains("withdrawn")
+    if (targetUnavailable) {
+        return true
+    }
+    let http400 = probe.contains("http 400") ||
+        probe.contains("http status 400") ||
+        probe.contains("status code 400") ||
+        probe.contains("400 bad request")
+    http400 && probe.contains("reply failed")
 }
 
 private func feishuSidecarProcessFailure(status: String, error: String): JsonObject {

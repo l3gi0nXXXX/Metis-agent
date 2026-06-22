@@ -180,6 +180,14 @@ function writeFakeSdk(root, options = {}) {
         if (entry?.throw) {
           const error = new Error(entry.throw.message || "fake sdk error");
           if (entry.throw.code !== undefined) error.code = entry.throw.code;
+          if (entry.throw.response !== undefined) {
+            error.response = entry.throw.response;
+          } else if (entry.throw.responseStatus !== undefined || entry.throw.responseData !== undefined) {
+            error.response = {
+              status: entry.throw.responseStatus,
+              data: entry.throw.responseData,
+            };
+          }
           throw error;
         }
         return materializeResponse(entry ?? defaultValue);
@@ -1402,10 +1410,23 @@ test("send errors are redacted and reply fallback follows sidecar safety semanti
       callsPath,
       behavior: {
         responses: [
-          { code: 230011, msg: "message was withdrawn" },
+          {
+            throw: {
+              message: "Request failed with status code 400",
+              responseStatus: 400,
+              responseData: { code: 230042, msg: "reply failed: message unavailable" },
+            },
+          },
           { code: 0, data: { message_id: "om_fallback", chat_id: "oc_chat" } },
           { code: 230011, msg: "message was withdrawn " + secretValues.appSecret },
           { code: 999, msg: "scope missing " + secretValues.appSecret },
+          {
+            throw: {
+              message: "Request failed with status code 400 " + secretValues.appSecret,
+              responseStatus: 400,
+              responseData: { code: 99991663, msg: "auth failed " + secretValues.appSecret },
+            },
+          },
         ],
       },
     });
@@ -1422,6 +1443,7 @@ test("send errors are redacted and reply fallback follows sidecar safety semanti
     });
     const fallback = await proc.waitForFrame((frame) => frame.type === "sendResult" && frame.requestId === "fallback");
     assert.equal(fallback.messageId, "om_fallback");
+    assert.equal(fallback.ok, true);
 
     proc.writeFrame({
       type: "send",
@@ -1445,11 +1467,28 @@ test("send errors are redacted and reply fallback follows sidecar safety semanti
     const apiError = await proc.waitForFrame((frame) => frame.type === "error" && frame.requestId === "api-error");
     assert.equal(apiError.status, "api_error");
     assert.equal(apiError.errorKind, "scope_missing");
+    assert.equal(apiError.feishuCode, 999);
+    assert.equal(apiError.feishuMsgClass, "scope_auth");
     assert.equal(apiError.message.includes(secretValues.appSecret), false);
+
+    proc.writeFrame({
+      type: "send",
+      action: "sendText",
+      requestId: "http-auth-error",
+      to: "oc_chat",
+      text: "auth",
+    });
+    const httpAuthError = await proc.waitForFrame((frame) => frame.type === "error" && frame.requestId === "http-auth-error");
+    assert.equal(httpAuthError.status, "api_error");
+    assert.equal(httpAuthError.errorKind, "scope_missing");
+    assert.equal(httpAuthError.httpStatus, 400);
+    assert.equal(httpAuthError.feishuCode, 99991663);
+    assert.equal(httpAuthError.feishuMsgClass, "scope_auth");
+    assert.equal(httpAuthError.message.includes(secretValues.appSecret), false);
     const result = await proc.close();
     assert.equal(`${result.stdout}${result.stderr}`.includes(secretValues.appSecret), false);
     assert.equal(callsOf(callsPath, "im.message.reply").length, 2);
-    assert.equal(callsOf(callsPath, "im.message.create").length, 2);
+    assert.equal(callsOf(callsPath, "im.message.create").length, 3);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

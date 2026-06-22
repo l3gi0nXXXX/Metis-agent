@@ -462,6 +462,67 @@ public class FeishuSidecarApiClientTest {
     }
 
     @TestCase
+    public func http400ReplyTargetUnavailableFallsBackToCreate(): Unit {
+        let runner = FeishuSidecarApiClientFakeRunner()
+        runner.enqueue(feishuSidecarTestResult(false, status: "api_error", error: "Feishu reply failed: Request failed with status code 400; reply target unavailable"))
+        runner.enqueue(feishuSidecarTestResult(true, status: "ok", messageId: "om_fallback_http400"))
+        let client = FeishuSidecarApiClient(runner: runner)
+
+        let result = client.sendTextMessage("tenant-a", "oc_chat", "oc_chat", "chat_id", "diagnostic", Some("om_missing"), false)
+
+        @Expect(result.ok, true)
+        @Expect(result.messageId, "om_fallback_http400")
+        @Expect(runner.requests.size, 2)
+        @Expect(runner.operation(0), "message.reply")
+        @Expect(runner.operation(1), "message.create")
+        @Expect(sidecarTestString(runner.params(1), "fallbackFromReplyToMessageId"), "om_missing")
+    }
+
+    @TestCase
+    public func threadReplyFailureDoesNotFallbackToTopLevelCreate(): Unit {
+        let runner = FeishuSidecarApiClientFakeRunner()
+        runner.enqueue(feishuSidecarTestResult(false, status: "api_error", error: "Feishu reply failed: Request failed with status code 400; reply target unavailable"))
+        let client = FeishuSidecarApiClient(runner: runner)
+
+        let result = client.sendTextMessage("tenant-a", "oc_chat", "oc_chat", "chat_id", "thread diagnostic", Some("om_missing"), true)
+
+        @Expect(result.ok, false)
+        @Expect(result.status, "api_error")
+        @Expect(runner.requests.size, 1)
+        @Expect(runner.operation(0), "message.reply")
+        @Expect(sidecarTestBool(runner.params(0), "replyInThread"), true)
+    }
+
+    @TestCase
+    public func successfulReplyDoesNotCreateFallbackMessage(): Unit {
+        let runner = FeishuSidecarApiClientFakeRunner()
+        runner.enqueue(feishuSidecarTestResult(true, status: "ok", messageId: "om_reply_ok"))
+        let client = FeishuSidecarApiClient(runner: runner)
+
+        let result = client.sendTextMessage("tenant-a", "oc_chat", "oc_chat", "chat_id", "reply ok", Some("om_parent"), false)
+
+        @Expect(result.ok, true)
+        @Expect(result.messageId, "om_reply_ok")
+        @Expect(runner.requests.size, 1)
+        @Expect(runner.operation(0), "message.reply")
+    }
+
+    @TestCase
+    public func scopeAuthReplyFailureDoesNotFallback(): Unit {
+        let runner = FeishuSidecarApiClientFakeRunner()
+        runner.enqueue(feishuSidecarTestResult(false, status: "api_error", error: "Feishu reply failed: Request failed with status code 400; missing scope auth permission"))
+        let client = FeishuSidecarApiClient(runner: runner)
+
+        let result = client.sendTextMessage("tenant-a", "oc_chat", "oc_chat", "chat_id", "diagnostic", Some("om_parent"), false)
+
+        @Expect(result.ok, false)
+        @Expect(result.status, "api_error")
+        @Expect(result.error.contains("scope"), true)
+        @Expect(runner.requests.size, 1)
+        @Expect(runner.operation(0), "message.reply")
+    }
+
+    @TestCase
     public func localPathUploadShapeDoesNotCarryBase64AndSendShapesCoverImageFileAudioVideo(): Unit {
         let runner = FeishuSidecarApiClientFakeRunner()
         runner.enqueue(feishuSidecarTestResult(true, status: "ok", mediaKey: "img_key"))
