@@ -156,6 +156,32 @@ public class CronCommandTest {
     }
 
     @TestCase
+    public func cronRunsHumanShowsShellBlockedDiagnostic(): Unit {
+        withCronCommandTestHome({ =>
+            addCronCommandFixtureJob("diag-human")
+            let storePath = cronStorePath(CliConfig.dotDir)
+            appendCronRunLog(
+                storePath,
+                "diag-human",
+                "success",
+                1000,
+                1010,
+                summary: "Cron/headless shell execution blocked for cron job 'diag-human'",
+                diagnosticCode: "cron_tool_exec_blocked",
+                diagnosticMessage: "code=cron_tool_exec_blocked reason=cron_tool_exec_guarded_hardline mode=guarded allowlistCount=0 commandPreview=rm -rf /"
+            )
+
+            let (out, code) = executeGatewayCronCommand(["cron", "runs", "--job-id", "diag-human"])
+            @Expect(code, 0)
+            @Expect(out.contains("Diagnostic: cron_tool_exec_blocked"), true)
+            @Expect(out.contains("reason=cron_tool_exec_guarded_hardline"), true)
+            @Expect(out.contains("mode=guarded"), true)
+            @Expect(out.contains("fix=use_safer_command_or_explicit_allowlist"), true)
+            @Expect(out.contains("\"diagnosticCode\""), false)
+        })
+    }
+
+    @TestCase
     public func cronAddUpdateWakeAndErrorsDefaultToHumanText(): Unit {
         withCronCommandTestHome({ =>
             let (addText, addCode) = executeGatewayCronCommand([
@@ -165,6 +191,7 @@ public class CronCommandTest {
             @Expect(addText.startsWith("{"), false)
             @Expect(addText.contains("Cron job created"), true)
             @Expect(addText.contains("human-add"), true)
+            @Expect(addText.contains("Tool exec: guarded"), true)
 
             let (addJson, addJsonCode) = executeGatewayCronCommand([
                 "cron", "add", "--json", "--name", "json-add", "--every", "1h", "--session", "main", "--message", "hello cron"

@@ -80,17 +80,19 @@ public class CronStoreToolExecPolicyTest {
                 storePath,
                 ("{\"version\":1,\"jobs\":[" +
                     "{\"id\":\"legacy\",\"prompt\":\"hello\",\"schedule\":{\"kind\":\"every\",\"everyMs\":60000}}," +
+                    "{\"id\":\"explicit-deny\",\"prompt\":\"hello\",\"toolExecMode\":\"deny\",\"schedule\":{\"kind\":\"every\",\"everyMs\":60000}}," +
                     "{\"id\":\"bad-mode\",\"prompt\":\"hello\",\"toolExecMode\":\"approve\",\"toolExecAllowlist\":[\"curl\",42,\"\",\"curl\"],\"schedule\":{\"kind\":\"every\",\"everyMs\":60000}}" +
                     "]}").toArray()
             )
 
             let jobs = cronLoadOrEmpty(storePath)
-            @Expect(jobs.size, 2)
-            @Expect(jobs[0].toolExecMode, "deny")
+            @Expect(jobs.size, 3)
+            @Expect(jobs[0].toolExecMode, "guarded")
             @Expect(jobs[0].toolExecAllowlist.size, 0)
             @Expect(jobs[1].toolExecMode, "deny")
-            @Expect(jobs[1].toolExecAllowlist.size, 1)
-            @Expect(jobs[1].toolExecAllowlist[0], "curl")
+            @Expect(jobs[2].toolExecMode, "guarded")
+            @Expect(jobs[2].toolExecAllowlist.size, 1)
+            @Expect(jobs[2].toolExecAllowlist[0], "curl")
         })
     }
 }
@@ -108,7 +110,9 @@ public class CronRunLogDeliveryErrorTest {
                 1010,
                 summary: "agent ok",
                 deliveryStatus: "not-delivered",
-                deliveryError: "telegram send failed"
+                deliveryError: "telegram send failed",
+                diagnosticCode: "cron_tool_exec_blocked",
+                diagnosticMessage: "code=cron_tool_exec_blocked reason=cron_headless_approval_required mode=deny allowlistCount=0"
             )
 
             let rows = readCronRunLogEntriesForJob(storePath, "delivery-error", limit: 10)
@@ -116,10 +120,13 @@ public class CronRunLogDeliveryErrorTest {
             let row = rows.get("entries").getOrThrow().asArray()[0].asObject()
             @Expect(row.get("deliveryStatus").getOrThrow().asString().getValue(), "not-delivered")
             @Expect(row.get("deliveryError").getOrThrow().asString().getValue(), "telegram send failed")
+            @Expect(row.get("diagnosticCode").getOrThrow().asString().getValue(), "cron_tool_exec_blocked")
+            @Expect(row.get("diagnosticMessage").getOrThrow().asString().getValue().contains("mode=deny"), true)
 
             let merged = readCronRunLogMergedFromStore(storePath, ["delivery-error"], resultLimit: 10)
             let mergedRow = merged.get("entries").getOrThrow().asArray()[0].asObject()
             @Expect(mergedRow.get("deliveryError").getOrThrow().asString().getValue(), "telegram send failed")
+            @Expect(mergedRow.get("diagnosticCode").getOrThrow().asString().getValue(), "cron_tool_exec_blocked")
         })
     }
 
@@ -141,6 +148,8 @@ public class CronRunLogDeliveryErrorTest {
             let row = rows.get("entries").getOrThrow().asArray()[0].asObject()
             @Expect(row.get("deliveryStatus").getOrThrow().asString().getValue(), "not-delivered")
             @Expect(row.get("deliveryError").getOrThrow().asString().getValue(), "")
+            @Expect(row.get("diagnosticCode").getOrThrow().asString().getValue(), "")
+            @Expect(row.get("diagnosticMessage").getOrThrow().asString().getValue(), "")
         })
     }
 }

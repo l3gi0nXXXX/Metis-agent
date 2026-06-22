@@ -18,6 +18,7 @@ public class GatewayShellToolsetCronPolicyTest {
 
         @Expect(out.contains("Cron/headless shell execution blocked"), true)
         @Expect(out.contains("cron cannot wait for interactive approval"), true)
+        @Expect(out.contains("Diagnostic: code=cron_tool_exec_blocked reason=cron_headless_approval_required mode=deny allowlistCount=0."), true)
         @Expect(out.contains("deny-job"), true)
     }
 
@@ -32,6 +33,19 @@ public class GatewayShellToolsetCronPolicyTest {
 
         @Expect(out.contains("Command executed successfully"), true)
         @Expect(out.contains("metis-p2-yolo"), true)
+    }
+
+    @TestCase
+    public func cronGuardedShellToolExecutesSafeCommandWithoutInteractiveConfirmation(): Unit {
+        let out = gatewayWithToolRuntimeContext(
+            GatewayToolRuntimeContext("cron", cronJobId: "guarded-job", toolExecMode: "guarded"),
+            { =>
+                debugGatewayShellExecuteForTest(CliConfig.cwd.toString(), "printf metis-m6-guarded", None<String>, Some(false))
+            }
+        )
+
+        @Expect(out.contains("Command executed successfully"), true)
+        @Expect(out.contains("metis-m6-guarded"), true)
     }
 
     @TestCase

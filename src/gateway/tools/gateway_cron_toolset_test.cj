@@ -124,6 +124,9 @@ private func gatewayCronToolsetCall(
     model!: Option<String> = None<String>,
     thinkingLevel!: Option<String> = None<String>,
     lightContext!: Option<Bool> = None<Bool>,
+    toolExecMode!: Option<String> = None<String>,
+    toolExecAllow!: Option<String> = None<String>,
+    toolExecAllowlist!: Option<Array<String>> = None<Array<String>>,
     dueOnly!: Option<Bool> = None<Bool>,
     mode!: Option<String> = None<String>,
     text!: Option<String> = None<String>
@@ -155,6 +158,9 @@ private func gatewayCronToolsetCall(
         model,
         thinkingLevel,
         lightContext,
+        toolExecMode,
+        toolExecAllow,
+        toolExecAllowlist,
         dueOnly,
         mode,
         text
@@ -171,6 +177,8 @@ public class GatewayCronToolsetTest {
         @Expect(gatewayCronToolsetRequiredContains(cronTool, "bestEffortDeliver"), false)
         @Expect(gatewayCronToolsetRequiredContains(cronTool, "timeoutMs"), false)
         @Expect(gatewayCronToolsetRequiredContains(cronTool, "lightContext"), false)
+        @Expect(gatewayCronToolsetRequiredContains(cronTool, "toolExecMode"), false)
+        @Expect(gatewayCronToolsetRequiredContains(cronTool, "toolExecAllowlist"), false)
         @Expect(gatewayCronToolsetRequiredContains(cronTool, "dueOnly"), false)
     }
 
@@ -247,6 +255,107 @@ public class GatewayCronToolsetTest {
             @Expect(job.maxRetries, 3)
             @Expect(job.retryBackoffMs, 250)
             @Expect(job.lightContext, true)
+            @Expect(job.toolExecMode, "guarded")
+            @Expect(job.toolExecAllowlist.size, 0)
+        }
+    }
+
+    @TestCase
+    public func cronToolInvokeAddAndUpdateToolExecPolicy(): Unit {
+        withGatewayCronToolsetTestHome {
+            let toolset = GatewayCronToolset()
+            let addRaw = gatewayCronToolsetCall(
+                toolset,
+                "add",
+                name: Some("tool-policy"),
+                message: Some("collect safely"),
+                every: Some("10m"),
+                toolExecAllowlist: Some(Array<String>())
+            )
+            @Expect(gatewayCronToolsetBool(addRaw, "ok"), true)
+
+            var jobs = cronLoadOrEmpty(cronStorePath(CliConfig.dotDir))
+            @Expect(jobs.size, 1)
+            @Expect(jobs[0].toolExecMode, "guarded")
+            @Expect(jobs[0].toolExecAllowlist.size, 0)
+
+            let yoloRaw = gatewayCronToolsetCall(
+                toolset,
+                "update",
+                id: Some("tool-policy"),
+                toolExecMode: Some("YOLO")
+            )
+            @Expect(gatewayCronToolsetBool(yoloRaw, "ok"), true)
+            jobs = cronLoadOrEmpty(cronStorePath(CliConfig.dotDir))
+            @Expect(jobs[0].toolExecMode, "yolo")
+            @Expect(jobs[0].prompt, "collect safely")
+
+            let allowRaw = gatewayCronToolsetCall(
+                toolset,
+                "update",
+                id: Some("tool-policy"),
+                toolExecMode: Some("allowlist"),
+                toolExecAllow: Some("printf"),
+                toolExecAllowlist: Some(["printf", "rg"])
+            )
+            @Expect(gatewayCronToolsetBool(allowRaw, "ok"), true)
+            jobs = cronLoadOrEmpty(cronStorePath(CliConfig.dotDir))
+            @Expect(jobs[0].toolExecMode, "allowlist")
+            @Expect(jobs[0].toolExecAllowlist.size, 2)
+            @Expect(jobs[0].toolExecAllowlist[0], "printf")
+            @Expect(jobs[0].toolExecAllowlist[1], "rg")
+        }
+    }
+
+    @TestCase
+    public func cronToolInvokeRejectsInvalidToolExecPolicyWithoutStoreWrite(): Unit {
+        withGatewayCronToolsetTestHome {
+            let toolset = GatewayCronToolset()
+            let addRaw = gatewayCronToolsetCall(
+                toolset,
+                "add",
+                name: Some("invalid-policy"),
+                message: Some("collect safely"),
+                every: Some("10m")
+            )
+            @Expect(gatewayCronToolsetBool(addRaw, "ok"), true)
+
+            let before = cronLoadOrEmpty(cronStorePath(CliConfig.dotDir))
+            let badMode = gatewayCronToolsetCall(
+                toolset,
+                "update",
+                id: Some("invalid-policy"),
+                toolExecMode: Some("approve")
+            )
+            @Expect(gatewayCronToolsetBool(badMode, "ok"), false)
+            @Expect(gatewayCronToolsetString(badMode, "status"), "error")
+
+            let afterMode = cronLoadOrEmpty(cronStorePath(CliConfig.dotDir))
+            @Expect(afterMode.size, before.size)
+            @Expect(afterMode[0].toolExecMode, before[0].toolExecMode)
+
+            let badAllow = gatewayCronToolsetCall(
+                toolset,
+                "update",
+                id: Some("invalid-policy"),
+                toolExecAllowlist: Some(["printf", "  "])
+            )
+            @Expect(gatewayCronToolsetBool(badAllow, "ok"), false)
+            @Expect(gatewayCronToolsetString(badAllow, "status"), "error")
+
+            let badSingleAllow = gatewayCronToolsetCall(
+                toolset,
+                "update",
+                id: Some("invalid-policy"),
+                toolExecAllow: Some("  ")
+            )
+            @Expect(gatewayCronToolsetBool(badSingleAllow, "ok"), false)
+            @Expect(gatewayCronToolsetString(badSingleAllow, "status"), "error")
+
+            let afterAllow = cronLoadOrEmpty(cronStorePath(CliConfig.dotDir))
+            @Expect(afterAllow.size, before.size)
+            @Expect(afterAllow[0].toolExecMode, before[0].toolExecMode)
+            @Expect(afterAllow[0].toolExecAllowlist.size, before[0].toolExecAllowlist.size)
         }
     }
 

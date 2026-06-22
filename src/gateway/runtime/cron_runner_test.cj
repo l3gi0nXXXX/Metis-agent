@@ -470,6 +470,57 @@ public class CronRunnerDeliveryTest {
             @Expect(row.get("deliveryStatus").getOrThrow().asString().getValue(), "not-delivered")
             @Expect(row.get("deliveryError").getOrThrow().asString().getValue().contains("announce delivery failed"), true)
             @Expect(row.get("deliveryError").getOrThrow().asString().getValue().contains("fake send failed"), true)
+            @Expect(row.get("diagnosticCode").getOrThrow().asString().getValue(), "")
+        })
+    }
+
+    @TestCase
+    public func cronDefaultGuardedShellToolFeedsSafeDeliveryThroughSessionLoop(): Unit {
+        withCronRunnerTestHome({ storePath: Path =>
+            let job = CronJob(
+                "m6-guarded-tool-delivery",
+                "collect news through shell",
+                CronSchedule.every(60000),
+                state: CronJobState(nextRunAtMs: 1),
+                deliveryChannel: "telegram",
+                deliveryTo: "user:8734062810",
+                deliveryMode: "announce"
+            )
+            cronSave(storePath, [job])
+            setGatewayAgentBridgeReplyRunnerForTest(Some({
+                _conversationKey: String,
+                _prompt: String,
+                _channelName: String,
+                _agentId: String,
+                _streamingEnabled: Bool,
+                _streamChunkHook: Option<(String) -> Unit> =>
+                    debugGatewayShellExecuteForTest(
+                        CliConfig.cwd.toString(),
+                        "printf guarded-fresh-news",
+                        None<String>,
+                        Some(false)
+                    )
+            }))
+            try {
+                let adapter = CronRunnerTestChannelAdapter("telegram", messageId: "tg-1")
+                let service = cronRunnerTestGateway(adapter, "telegram", "")
+
+                let result = CronRunner.runJobOnceFromStore(Some(service), storePath, "m6-guarded-tool-delivery", true)
+                @Expect(result.get("ok").getOrThrow().asBool().getValue(), true)
+                @Expect(adapter.sendCount, 1)
+                @Expect(adapter.lastText.contains("Command executed successfully"), true)
+                @Expect(adapter.lastText.contains("Cron/headless shell execution blocked"), false)
+
+                let jobs = cronLoadOrEmpty(storePath)
+                @Expect(jobs[0].toolExecMode, "guarded")
+                @Expect(jobs[0].state.lastStatus, "success")
+                let runs = readCronRunLogEntriesForJob(storePath, "m6-guarded-tool-delivery", limit: 10)
+                let row = runs.get("entries").getOrThrow().asArray()[0].asObject()
+                @Expect(row.get("deliveryStatus").getOrThrow().asString().getValue(), "delivered")
+                @Expect(row.get("diagnosticCode").getOrThrow().asString().getValue(), "")
+            } finally {
+                setGatewayAgentBridgeReplyRunnerForTest(None<(String, String, String, String, Bool, Option<(String) -> Unit>) -> String>)
+            }
         })
     }
 
@@ -526,7 +577,7 @@ public class CronRunnerDeliveryTest {
     }
 
     @TestCase
-    public func cronDefaultDenyShellToolReturnsBlockedWithoutWaitingForApproval(): Unit {
+    public func cronExplicitDenyShellToolReturnsBlockedWithoutWaitingForApproval(): Unit {
         withCronRunnerTestHome({ storePath: Path =>
             let job = CronJob(
                 "p5-deny-tool",
@@ -535,7 +586,8 @@ public class CronRunnerDeliveryTest {
                 state: CronJobState(nextRunAtMs: 1),
                 deliveryChannel: "telegram",
                 deliveryTo: "user:8734062810",
-                deliveryMode: "announce"
+                deliveryMode: "announce",
+                toolExecMode: "deny"
             )
             cronSave(storePath, [job])
             setGatewayAgentBridgeReplyRunnerForTest(Some({
@@ -561,6 +613,7 @@ public class CronRunnerDeliveryTest {
                 @Expect(adapter.sendCount, 1)
                 @Expect(adapter.lastText.contains("Cron/headless shell execution blocked"), true)
                 @Expect(adapter.lastText.contains("cron cannot wait for interactive approval"), true)
+                @Expect(adapter.lastText.contains("Diagnostic: code=cron_tool_exec_blocked reason=cron_headless_approval_required mode=deny allowlistCount=0."), true)
                 @Expect(adapter.lastText.contains("should-not-run"), true)
                 @Expect(adapter.lastText.contains("Command executed successfully"), false)
 
@@ -569,6 +622,8 @@ public class CronRunnerDeliveryTest {
                 let runs = readCronRunLogEntriesForJob(storePath, "p5-deny-tool", limit: 10)
                 let row = runs.get("entries").getOrThrow().asArray()[0].asObject()
                 @Expect(row.get("deliveryStatus").getOrThrow().asString().getValue(), "delivered")
+                @Expect(row.get("diagnosticCode").getOrThrow().asString().getValue(), "cron_tool_exec_blocked")
+                @Expect(row.get("diagnosticMessage").getOrThrow().asString().getValue().contains("mode=deny"), true)
             } finally {
                 setGatewayAgentBridgeReplyRunnerForTest(None<(String, String, String, String, Bool, Option<(String) -> Unit>) -> String>)
             }
@@ -648,6 +703,7 @@ public class CronRunnerDeliveryTest {
             @Expect(deliveryError.contains("raw-lower-secret"), false)
             @Expect(deliveryError.contains("user:pass"), false)
             @Expect(deliveryError.contains("redacted"), true)
+            @Expect(row.get("diagnosticCode").getOrThrow().asString().getValue(), "")
 
             let rawRunLog = String.fromUtf8(File.readFrom(cronRunLogPathFromStore(storePath, "redacted-delivery")))
             @Expect(rawRunLog.contains("secret-delivery-token-never-visible"), false)
