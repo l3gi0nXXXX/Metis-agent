@@ -234,7 +234,8 @@ public class ServicePluginHostTest {
             return script
         }
         if (stopUpdatesLease) {
-            script += "; while read line; do printf '{\"state\":\"stopped\",\"status\":\"stopped\",\"pluginId\":\"gitcode-monitor\",\"sessionId\":\"%s\",\"pid\":%s,\"parentPid\":%s${endpoint},\"startedAtMs\":1000,\"lastHeartbeatMs\":1000}\\n' \"$METIS_SERVICE_PLUGIN_SESSION_ID\" \"$$\" \"$METIS_SERVICE_PLUGIN_PARENT_PID\" > \"$METIS_SERVICE_PLUGIN_LEASE_PATH\"; exit 0; done"
+            let stoppedLeaseWrite = "printf '{\"state\":\"stopped\",\"status\":\"stopped\",\"pluginId\":\"gitcode-monitor\",\"sessionId\":\"%s\",\"pid\":%s,\"parentPid\":%s${endpoint},\"startedAtMs\":1000,\"lastHeartbeatMs\":1000}\\n' \"$METIS_SERVICE_PLUGIN_SESSION_ID\" \"$$\" \"$METIS_SERVICE_PLUGIN_PARENT_PID\" > \"$METIS_SERVICE_PLUGIN_LEASE_PATH\""
+            script += "; metis_stop_lease() { ${stoppedLeaseWrite}; }; trap 'metis_stop_lease; exit 0' TERM HUP INT; while read line; do metis_stop_lease; exit 0; done"
         } else {
             script += "; trap '' TERM; while true; do read -t 1 ignored || true; done"
         }
