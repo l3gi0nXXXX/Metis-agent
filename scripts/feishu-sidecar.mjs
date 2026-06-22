@@ -154,6 +154,9 @@ function emitError(accountOrId, params) {
     errorKind: params.errorKind,
     requestId: params.requestId,
     message: String(params.message ?? "Feishu sidecar error"),
+    ...(params.httpStatus !== undefined ? { httpStatus: params.httpStatus } : {}),
+    ...(params.feishuCode !== undefined ? { feishuCode: params.feishuCode } : {}),
+    ...(params.feishuMsgClass ? { feishuMsgClass: params.feishuMsgClass } : {}),
     ...(params.runtimeRoot ? { runtimeRoot: params.runtimeRoot } : {}),
     ...(params.missingPackage ? { missingPackage: params.missingPackage } : {}),
   });
@@ -774,33 +777,88 @@ function buildPostContent(text) {
 }
 
 function isWithdrawnReplyResponse(response) {
-  if (response?.code !== undefined && WITHDRAWN_REPLY_ERROR_CODES.has(response.code)) {
-    return true;
-  }
-  const msg = String(response?.msg ?? "").toLowerCase();
-  return msg.includes("withdrawn") || msg.includes("not found");
+  return isSafeReplyFallbackError(response);
 }
 
-function isWithdrawnReplyError(error) {
-  if (typeof error?.code === "number" && WITHDRAWN_REPLY_ERROR_CODES.has(error.code)) {
+function apiHttpStatus(errorOrResponse) {
+  const raw =
+    errorOrResponse?.response?.status ??
+    errorOrResponse?.status ??
+    errorOrResponse?.statusCode ??
+    errorOrResponse?.httpStatus;
+  const value = Number(raw);
+  return Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
+function apiFeishuCode(errorOrResponse) {
+  const raw = errorOrResponse?.response?.data?.code ?? errorOrResponse?.data?.code ?? errorOrResponse?.code;
+  return typeof raw === "number" ? raw : undefined;
+}
+
+function apiFeishuMessage(errorOrResponse) {
+  return String(
+    errorOrResponse?.response?.data?.msg ??
+      errorOrResponse?.response?.data?.message ??
+      errorOrResponse?.data?.msg ??
+      errorOrResponse?.data?.message ??
+      errorOrResponse?.msg ??
+      errorOrResponse?.message ??
+      "",
+  );
+}
+
+function feishuMsgClass(errorOrResponse) {
+  const msg = apiFeishuMessage(errorOrResponse).toLowerCase();
+  if (msg.includes("scope") || msg.includes("permission") || msg.includes("auth") || msg.includes("unauthorized") || msg.includes("forbidden")) {
+    return "scope_auth";
+  }
+  if (isSafeReplyFallbackError(errorOrResponse)) {
+    return "reply_target_unavailable";
+  }
+  return "api_error";
+}
+
+function isScopeAuthError(errorOrResponse) {
+  const code = apiFeishuCode(errorOrResponse);
+  if (code === 99991663 || code === 99991664) {
     return true;
   }
-  const code = error?.response?.data?.code;
+  const msg = apiFeishuMessage(errorOrResponse).toLowerCase();
+  return msg.includes("scope") || msg.includes("permission") || msg.includes("auth") || msg.includes("unauthorized") || msg.includes("forbidden");
+}
+
+function isSafeReplyFallbackError(error) {
+  if (isScopeAuthError(error)) {
+    return false;
+  }
+  const code = apiFeishuCode(error);
   if (typeof code === "number" && WITHDRAWN_REPLY_ERROR_CODES.has(code)) {
     return true;
   }
-  const msg = String(error?.message ?? "").toLowerCase();
-  return msg.includes("withdrawn") || msg.includes("not found");
+  const msg = apiFeishuMessage(error).toLowerCase();
+  const targetUnavailable =
+    msg.includes("message_unavailable") ||
+    msg.includes("not_found") ||
+    msg.includes("not found") ||
+    msg.includes("unavailable") ||
+    msg.includes("reply target") ||
+    msg.includes("deleted") ||
+    msg.includes("recalled") ||
+    msg.includes("withdrawn");
+  if (targetUnavailable) {
+    return true;
+  }
+  const status = apiHttpStatus(error);
+  return status === 400 && msg.includes("reply failed");
+}
+
+function isWithdrawnReplyError(error) {
+  return isSafeReplyFallbackError(error);
 }
 
 function classifyApiError(errorOrResponse) {
-  const code = errorOrResponse?.code ?? errorOrResponse?.response?.data?.code;
-  const msg = String(errorOrResponse?.msg ?? errorOrResponse?.message ?? errorOrResponse?.response?.data?.msg ?? "");
-  const lower = msg.toLowerCase();
-  if (lower.includes("scope") || lower.includes("permission") || lower.includes("auth")) {
-    return "scope_missing";
-  }
-  if (code === 99991663 || code === 99991664) {
+  const code = apiFeishuCode(errorOrResponse);
+  if (isScopeAuthError(errorOrResponse)) {
     return "scope_missing";
   }
   return "api_error";
@@ -892,12 +950,17 @@ async function handleSend(frame) {
       ...result,
     });
   } catch (error) {
+    const httpStatus = apiHttpStatus(error);
+    const feishuCode = apiFeishuCode(error);
     emitError({
       phase: `send.${frame.action ?? "unknown"}`,
       status: "api_error",
       errorKind: classifyApiError(error),
       requestId: frame.requestId,
       message: error?.message ?? String(error),
+      ...(httpStatus !== undefined ? { httpStatus } : {}),
+      ...(feishuCode !== undefined ? { feishuCode } : {}),
+      feishuMsgClass: feishuMsgClass(error),
     });
   }
 }
