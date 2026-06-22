@@ -308,6 +308,48 @@ public class CronCommandTest {
     }
 
     @TestCase
+    public func cronAddAndUpdateParseScriptFieldsAndRejectMissingScript(): Unit {
+        withCronCommandTestHome({ =>
+            let (addText, addCode) = executeGatewayCronCommand([
+                "cron", "add", "--name", "script-flags", "--every", "10m", "--session", "isolated",
+                "--script", "daily/report.sh",
+                "--message", "hello script cron"
+            ])
+            @Expect(addCode, 0)
+            @Expect(addText.contains("Cron job created"), true)
+            @Expect(addText.contains("Script: daily/report.sh"), true)
+            @Expect(addText.contains("Script mode: inject"), true)
+
+            var jobs = cronLoadOrEmpty(cronStorePath(CliConfig.dotDir))
+            @Expect(jobs.size, 1)
+            @Expect(jobs[0].scriptPath, "daily/report.sh")
+            @Expect(jobs[0].scriptMode, "inject")
+
+            let (updateText, updateCode) = executeGatewayCronCommand([
+                "cron", "update", "--job-id", "script-flags",
+                "--script-mode", "noAgent"
+            ])
+            @Expect(updateCode, 0)
+            @Expect(updateText.contains("Script mode: noAgent"), true)
+            jobs = cronLoadOrEmpty(cronStorePath(CliConfig.dotDir))
+            @Expect(jobs[0].scriptPath, "daily/report.sh")
+            @Expect(jobs[0].scriptMode, "noAgent")
+
+            let (badText, badCode) = executeGatewayCronCommand([
+                "cron", "update", "--job-id", "script-flags",
+                "--script", "",
+                "--script-mode", "noAgent"
+            ])
+            @Expect(badCode, 1)
+            @Expect(badText.contains("--script is required"), true)
+
+            jobs = cronLoadOrEmpty(cronStorePath(CliConfig.dotDir))
+            @Expect(jobs[0].scriptPath, "daily/report.sh")
+            @Expect(jobs[0].scriptMode, "noAgent")
+        })
+    }
+
+    @TestCase
     public func cronAddAndUpdateAllowNormalUtf8PromptWithEmojiZwj(): Unit {
         withCronCommandTestHome({ =>
             let longPrompt = repeatCronCommandText("每天汇总 PR 状态 👨‍👩‍👧 中文🙂；", 25)

@@ -26,6 +26,26 @@ public func cronNormalizeToolExecAllowlist(values: Array<String>): Array<String>
     out.toArray()
 }
 
+public func cronNormalizeScriptMode(raw: String): String {
+    let mode = raw.trimAscii().toAsciiLower()
+    if (mode == "inject") {
+        return "inject"
+    }
+    if (mode == "noagent" || mode == "no_agent" || mode == "no-agent") {
+        return "noAgent"
+    }
+    "none"
+}
+
+public func cronScriptModeIsValid(raw: String): Bool {
+    let mode = raw.trimAscii().toAsciiLower()
+    mode.isEmpty() || mode == "none" || mode == "inject" || mode == "noagent" || mode == "no_agent" || mode == "no-agent"
+}
+
+public func cronNormalizeScriptPath(raw: String): String {
+    raw.trimAscii()
+}
+
 /**
  * 对齐参考实现的 `CronSchedule`：`every`、`at`、五段式 `cron`（`cronExpr` + `timeZone`）、可选 `staggerMs`。
  */
@@ -151,6 +171,10 @@ public class CronJob {
     /** cron/headless shell/network 工具执行策略：guarded | deny | allowlist | yolo。 */
     public var toolExecMode: String
     public var toolExecAllowlist: Array<String>
+    /** 可选本地脚本，相对 `<METIS_HOME>/.metis/cron/scripts`。 */
+    public var scriptPath: String
+    /** none | inject | noAgent。inject 把 stdout 注入 Agent prompt；noAgent 直接投递 stdout。 */
+    public var scriptMode: String
     public var failureAccountId: String
     /** >0：连续失败 N 次后才发 failure 通知（简化为与 lastFailureAlertAtMs 配合的门槛）。 */
     public var failureAlertAfter: Int64
@@ -190,6 +214,8 @@ public class CronJob {
         bestEffortDeliver!: Bool = false,
         toolExecMode!: String = "guarded",
         toolExecAllowlist!: Array<String> = [],
+        scriptPath!: String = "",
+        scriptMode!: String = "none",
         failureAccountId!: String = "",
         failureAlertAfter!: Int64 = 0,
         failureAlertCooldownMs!: Int64 = 0
@@ -227,6 +253,8 @@ public class CronJob {
         this.bestEffortDeliver = bestEffortDeliver
         this.toolExecMode = cronNormalizeToolExecMode(toolExecMode)
         this.toolExecAllowlist = cronNormalizeToolExecAllowlist(toolExecAllowlist)
+        this.scriptPath = cronNormalizeScriptPath(scriptPath)
+        this.scriptMode = cronNormalizeScriptMode(scriptMode)
         this.failureAccountId = failureAccountId
         this.failureAlertAfter = failureAlertAfter
         this.failureAlertCooldownMs = failureAlertCooldownMs
