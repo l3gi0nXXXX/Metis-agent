@@ -236,6 +236,52 @@ public class GatewayCanvasToolsetTest {
     }
 
     @TestCase
+    public func a2uiPushToolUsesPushJsonlCommandAndSendsJsonl(): Unit {
+        let methods = ArrayList<String>()
+        let paramsSeen = ArrayList<JsonObject>()
+        let context = GatewayToolRuntimeContext(
+            "telegram",
+            channelName: "telegram",
+            sessionKey: "telegram:direct:user:a2ui",
+            gatewayCallHook: Some({ method: String, params: JsonObject =>
+                methods.add(method)
+                paramsSeen.add(params)
+                let payload = JsonObject()
+                payload.put("accepted", JsonBool(true))
+                let out = JsonObject()
+                out.put("ok", JsonBool(true))
+                out.put("payload", payload)
+                out
+            })
+        )
+
+        let raw = gatewayWithToolRuntimeContext(context, { =>
+            GatewayCanvasToolset().debugCanvasForTest(
+                "a2ui_push",
+                Some("node-a2ui"),
+                None<String>,
+                None<String>,
+                None<String>,
+                None<String>,
+                None<Int64>,
+                None<Int64>,
+                Some("{\"beginRendering\":{}}\n"),
+                None<String>,
+                Some(1000)
+            )
+        })
+        let result = canvasToolsetObj(raw)
+        let sent = paramsSeen[0]
+        let payload = sent.get("payload").getOrThrow().asObject()
+
+        @Expect(canvasToolsetBool(result, "ok"), true)
+        @Expect(methods[0], "node.invoke")
+        @Expect(canvasToolsetString(sent, "nodeId"), "node-a2ui")
+        @Expect(canvasToolsetString(sent, "command"), "canvas.a2ui.pushJSONL")
+        @Expect(canvasToolsetString(payload, "jsonl").contains("beginRendering"), true)
+    }
+
+    @TestCase
     public func canvasToolWithoutGatewayHookReturnsUnavailable(): Unit {
         let raw = GatewayCanvasToolset().debugCanvasForTest(
             "navigate",

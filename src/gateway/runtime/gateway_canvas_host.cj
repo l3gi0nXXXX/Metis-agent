@@ -7,7 +7,7 @@ import metis.gateway.model.GatewayConfig
 import std.collection.ArrayList
 import std.fs.{Directory, File, FileInfo, Path, canonicalize, exists}
 import std.sync.Mutex
-import stdx.encoding.json.{JsonArray, JsonObject, JsonString}
+import stdx.encoding.json.{JsonArray, JsonObject, JsonString, JsonValue}
 import stdx.log.*
 import stdx.net.http.*
 
@@ -207,6 +207,10 @@ public func gatewayCanvasScopedRouteUrl(cfg: GatewayConfig, token: String): Stri
     "http://127.0.0.1:${gatewayCanvasPortToUInt16(cfg.canvas.port, 18793u16)}${GATEWAY_CANVAS_ROUTE_PREFIX}/cap/${token.trimAscii()}/"
 }
 
+public func gatewayCanvasA2uiScopedRouteUrl(cfg: GatewayConfig, token: String): String {
+    "http://127.0.0.1:${gatewayCanvasPortToUInt16(cfg.canvas.port, 18793u16)}${gatewayCanvasA2uiRoutePrefix()}/cap/${token.trimAscii()}/"
+}
+
 private func gatewayCanvasCanServePath(path: String): Bool {
     let lower = path.toAsciiLower()
     lower.endsWith(".html") ||
@@ -311,6 +315,41 @@ private func gatewayCanvasRequestPathFromRoute(routePath: String): String {
     "/" + String(runes[prefixSize..])
 }
 
+private func gatewayCanvasA2uiRequestPathFromRoute(routePath: String): String {
+    let prefix = gatewayCanvasA2uiRoutePrefix()
+    if (routePath == prefix || routePath == prefix + "/") {
+        return "/"
+    }
+    let prefixWithSlash = prefix + "/"
+    if (!routePath.startsWith(prefixWithSlash)) {
+        return "/"
+    }
+    let runes = routePath.toRuneArray()
+    let prefixSize = prefixWithSlash.toRuneArray().size
+    if (runes.size <= prefixSize) {
+        return "/"
+    }
+    "/" + String(runes[prefixSize..])
+}
+
+private func gatewayCanvasA2uiScopedRouteFor(token: String, routePath: String): String {
+    let normalizedToken = token.trimAscii()
+    let prefix = gatewayCanvasA2uiRoutePrefix()
+    if (routePath == prefix || routePath == prefix + "/") {
+        return prefix + "/cap/${normalizedToken}/"
+    }
+    let prefixWithSlash = prefix + "/"
+    if (!routePath.startsWith(prefixWithSlash)) {
+        return prefix + "/cap/${normalizedToken}/"
+    }
+    let runes = routePath.toRuneArray()
+    let prefixSize = prefixWithSlash.toRuneArray().size
+    if (runes.size <= prefixSize) {
+        return prefix + "/cap/${normalizedToken}/"
+    }
+    prefix + "/cap/${normalizedToken}/" + String(runes[prefixSize..])
+}
+
 private func gatewayCanvasHttpMethodAllowed(method: String): Bool {
     let normalized = method.trimAscii().toAsciiUpper()
     normalized == "GET" || normalized == "HEAD"
@@ -323,11 +362,39 @@ private func gatewayCanvasHttpBodyForMethod(method: String, body: Array<Byte>): 
     body
 }
 
+private func gatewayCanvasReadRequestBody(ctx: HttpContext, maxBytes!: Int64 = 64 * 1024): (Bool, String) {
+    let chunks = ArrayList<Byte>()
+    let buffer = Array<Byte>(4096, repeat: 0)
+    try {
+        while (true) {
+            let n = ctx.request.body.read(buffer)
+            if (n <= 0) {
+                break
+            }
+            if (chunks.size + n > maxBytes) {
+                return (false, "")
+            }
+            chunks.add(all: buffer[..n])
+        }
+        return (true, String.fromUtf8(chunks.toArray()))
+    } catch (_: Exception) {
+        (false, "")
+    }
+}
+
 private func gatewayCanvasReplyUnauthorized(ctx: HttpContext): Unit {
     let rb = ctx.responseBuilder
     rb.status(401)
     rb.header("content-type", "text/plain; charset=utf-8")
     rb.body("canvas capability required")
+}
+
+private func gatewayCanvasReplyJson(ctx: HttpContext, status: UInt16, body: String): Unit {
+    let rb = ctx.responseBuilder
+    rb.status(status)
+    rb.header("content-type", "application/json; charset=utf-8")
+    rb.header("cache-control", "no-cache")
+    rb.body(body)
 }
 
 private func gatewayCanvasReplyAsset(ctx: HttpContext, root: Path, requestPath: String, token: String): Unit {
@@ -368,6 +435,93 @@ private func gatewayCanvasReplyAsset(ctx: HttpContext, root: Path, requestPath: 
         rb.header("content-type", "text/plain; charset=utf-8")
         rb.body("canvas asset read failed")
     }
+}
+
+private func gatewayCanvasReplyA2uiAsset(ctx: HttpContext, requestPath: String, token: String): Unit {
+    let rb = ctx.responseBuilder
+    let auth = gatewayCanvasAuthorizeCapabilityToken(token)
+    if (!auth.ok) {
+        gatewayCanvasReplyUnauthorized(ctx)
+        return
+    }
+    let method = ctx.request.method
+    if (!gatewayCanvasHttpMethodAllowed(method)) {
+        rb.status(405)
+        rb.header("allow", "GET, HEAD")
+        rb.header("content-type", "text/plain; charset=utf-8")
+        rb.body("Method Not Allowed")
+        return
+    }
+    let rootState = gatewayCanvasResolveA2uiRootState()
+    if (!gatewayCanvasReadBool(rootState, "rootPresent", false) ||
+        !gatewayCanvasReadBool(rootState, "rootReadable", false) ||
+        gatewayCanvasReadString(rootState, "errorKind", "") != "") {
+        rb.status(503)
+        rb.header("content-type", "text/plain; charset=utf-8")
+        rb.body("canvas a2ui assets unavailable")
+        return
+    }
+    let resolved = gatewayCanvasResolveFileWithinRoot(gatewayCanvasA2uiAssetRoot(), requestPath)
+    if (!resolved.ok) {
+        rb.status(404)
+        rb.header("content-type", "text/plain; charset=utf-8")
+        rb.body("canvas a2ui asset not found")
+        return
+    }
+    let filePath = Path(resolved.path)
+    if (!exists(filePath) || !FileInfo(filePath).isRegular()) {
+        rb.status(404)
+        rb.header("content-type", "text/plain; charset=utf-8")
+        rb.body("canvas a2ui asset not found")
+        return
+    }
+    try {
+        rb.header("content-type", resolved.mimeType)
+        rb.header("cache-control", "no-cache")
+        let body = File.readFrom(filePath)
+        if (resolved.relativePath == "index.html") {
+            let html = String.fromUtf8(body)
+            rb.body(gatewayCanvasHttpBodyForMethod(method, gatewayCanvasInjectBridgeAndLiveReload(html).toArray()))
+        } else {
+            rb.body(gatewayCanvasHttpBodyForMethod(method, body))
+        }
+    } catch (_: Exception) {
+        rb.status(500)
+        rb.header("content-type", "text/plain; charset=utf-8")
+        rb.body("canvas a2ui asset read failed")
+    }
+}
+
+private func gatewayCanvasReplyA2uiAction(ctx: HttpContext, token: String): Unit {
+    let auth = gatewayCanvasAuthorizeCapabilityToken(token)
+    if (!auth.ok) {
+        gatewayCanvasReplyUnauthorized(ctx)
+        return
+    }
+    if (ctx.request.method.trimAscii().toAsciiUpper() != "POST") {
+        let rb = ctx.responseBuilder
+        rb.status(405)
+        rb.header("allow", "POST")
+        rb.header("content-type", "text/plain; charset=utf-8")
+        rb.body("Method Not Allowed")
+        return
+    }
+    let body = gatewayCanvasReadRequestBody(ctx)
+    if (!body[0]) {
+        gatewayCanvasReplyJson(ctx, 400u16, GatewayRpcResponse(false, "canvas.a2ui.action", error: "invalid request body", errorCode: "invalid_request").toJson().toJsonString())
+        return
+    }
+    let params = try {
+        JsonValue.fromStr(body[1]).asObject()
+    } catch (_: Exception) {
+        gatewayCanvasReplyJson(ctx, 400u16, GatewayRpcResponse(false, "canvas.a2ui.action", error: "malformed JSON body", errorCode: "malformed_json").toJson().toJsonString())
+        return
+    }
+    params.put("capabilityToken", JsonString(token.trimAscii()))
+    let response = gatewayCanvasHandleA2uiUserAction(
+        GatewayRpcRequest("canvas.a2ui.action", params: params, clientId: auth.nodeId, mode: "node")
+    )
+    gatewayCanvasReplyJson(ctx, if (response.ok) { 200u16 } else { 400u16 }, response.toJson().toJsonString())
 }
 
 private func gatewayCanvasReadBool(obj: JsonObject, key: String, defaultValue: Bool): Bool {
@@ -438,6 +592,19 @@ public class GatewayCanvasHostRuntime {
                     gatewayCanvasReplyAsset(ctx, canonicalRoot, requestPath, "")
                 })
             }
+            for (routeValue in gatewayCanvasA2uiRegisteredRoutes().getItems()) {
+                let routePath = try {
+                    routeValue.asString().getValue()
+                } catch (_: Exception) {
+                    ""
+                }
+                if (routePath.trimAscii().isEmpty()) {
+                    continue
+                }
+                s.distributor.register(routePath, { ctx =>
+                    gatewayCanvasReplyUnauthorized(ctx)
+                })
+            }
             server = Some(s)
             started = true
             rootPath = canonicalRoot.toString()
@@ -488,6 +655,32 @@ public class GatewayCanvasHostRuntime {
                     let requestPath = gatewayCanvasRequestPathFromRoute(routePath)
                     s.distributor.register(scopedRoute, { ctx =>
                         gatewayCanvasReplyAsset(ctx, root, requestPath, normalizedToken)
+                    })
+                }
+                for (routeValue in gatewayCanvasA2uiRegisteredRoutes().getItems()) {
+                    let routePath = try {
+                        routeValue.asString().getValue()
+                    } catch (_: Exception) {
+                        ""
+                    }
+                    if (routePath.trimAscii().isEmpty()) {
+                        continue
+                    }
+                    let scopedRoute = gatewayCanvasA2uiScopedRouteFor(normalizedToken, routePath)
+                    if (registeredScopedRoutes.contains(scopedRoute)) {
+                        continue
+                    }
+                    registeredScopedRoutes.add(scopedRoute)
+                    let requestPath = gatewayCanvasA2uiRequestPathFromRoute(routePath)
+                    s.distributor.register(scopedRoute, { ctx =>
+                        gatewayCanvasReplyA2uiAsset(ctx, requestPath, normalizedToken)
+                    })
+                }
+                let actionRoute = gatewayCanvasA2uiRoutePrefix() + "/cap/${normalizedToken}/action"
+                if (!registeredScopedRoutes.contains(actionRoute)) {
+                    registeredScopedRoutes.add(actionRoute)
+                    s.distributor.register(actionRoute, { ctx =>
+                        gatewayCanvasReplyA2uiAction(ctx, normalizedToken)
                     })
                 }
             }
