@@ -40,6 +40,7 @@ import metis.cron.{
     resolveCronFailurePlan,
     scanCronPromptAssembled
 }
+import metis.gateway.logging.gatewayLogRedactText
 
 import magic.prelude.*
 
@@ -466,7 +467,8 @@ public class CronRunner {
         endedAtMs: Int64,
         errMsg: String,
         answer: String,
-        deliveryStatus: String
+        deliveryStatus: String,
+        deliveryError: String
     ): Unit {
         try {
             match (cronRunnerRunLogAppendHookForTest()) {
@@ -486,7 +488,8 @@ public class CronRunner {
                 summary: answer,
                 runAtMs: startedAtMs,
                 nextRunAtMs: j.state.nextRunAtMs,
-                deliveryStatus: deliveryStatus
+                deliveryStatus: deliveryStatus,
+                deliveryError: deliveryError
             )
         } catch (logError: Exception) {
             gatewayLogEventError(
@@ -504,7 +507,7 @@ public class CronRunner {
     }
 
     private func deliveryFailureMessage(kind: String, raw: String): String {
-        let trimmed = raw.trimAscii()
+        let trimmed = gatewayLogRedactText(raw).trimAscii()
         if (trimmed.isEmpty()) {
             return "${kind} delivery failed"
         }
@@ -702,6 +705,7 @@ public class CronRunner {
         var errMsg = ""
         var answer = ""
         var deliveryStatus = "not-requested"
+        var deliveryError = ""
         var attempt: Int64 = 0
         let maxAttempts = max(1, j.maxRetries + 1)
 
@@ -731,7 +735,7 @@ public class CronRunner {
                         }
                     case None => ()
                 }
-                this.appendRunLogIsolated(j, status, startedAtMs, afterRun, errMsg, answer, deliveryStatus)
+                this.appendRunLogIsolated(j, status, startedAtMs, afterRun, errMsg, answer, deliveryStatus, deliveryError)
                 return
             }
             match (cronRunnerBeforeExecuteHookForTest()) {
@@ -777,7 +781,7 @@ public class CronRunner {
             if (status == "success" && dplan.requested) {
                 let deliveryResult = this.sendSuccessDelivery(j, dplan, answer, startedAtMs)
                 deliveryStatus = deliveryResult[0]
-                let deliveryError = deliveryResult[1]
+                deliveryError = deliveryResult[1]
                 if (deliveryStatus == "not-delivered" && !dplan.bestEffortDeliver) {
                     status = "error"
                     errMsg = deliveryError
@@ -809,14 +813,15 @@ public class CronRunner {
                 afterRun,
                 errMsg,
                 answer,
-                deliveryStatus
+                deliveryStatus,
+                deliveryError
             )
         } catch (fatal: Exception) {
             let afterRun = epochMs()
             status = "error"
             errMsg = fatal.message
             this.finalizeError(j, startedAtMs, afterRun, errMsg)
-            this.appendRunLogIsolated(j, status, startedAtMs, afterRun, errMsg, answer, deliveryStatus)
+            this.appendRunLogIsolated(j, status, startedAtMs, afterRun, errMsg, answer, deliveryStatus, deliveryError)
             gatewayLogEventError(
                 "gateway/cron",
                 "cron.failed",

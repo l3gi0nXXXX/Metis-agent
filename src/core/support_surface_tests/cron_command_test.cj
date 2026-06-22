@@ -129,6 +129,33 @@ public class CronCommandTest {
     }
 
     @TestCase
+    public func cronRunsHumanShowsRedactedDeliveryErrorWithoutRawJson(): Unit {
+        withCronCommandTestHome({ =>
+            addCronCommandFixtureJob("delivery-secret")
+            let storePath = cronStorePath(CliConfig.dotDir)
+            appendCronRunLog(
+                storePath,
+                "delivery-secret",
+                "success",
+                1000,
+                1010,
+                summary: "agent ok",
+                deliveryStatus: "not-delivered",
+                deliveryError: "send failed Authorization: Bearer secret-delivery-token-never-visible token=raw-lower-secret https://user:pass@example.com/hook"
+            )
+
+            let (out, code) = executeGatewayCronCommand(["cron", "runs", "--job-id", "delivery-secret"])
+            @Expect(code, 0)
+            @Expect(out.contains("Delivery error:"), true)
+            @Expect(out.contains("secret-delivery-token-never-visible"), false)
+            @Expect(out.contains("raw-lower-secret"), false)
+            @Expect(out.contains("user:pass"), false)
+            @Expect(out.contains("\"deliveryError\""), false)
+            @Expect(out.contains("\"ok\""), false)
+        })
+    }
+
+    @TestCase
     public func cronAddUpdateWakeAndErrorsDefaultToHumanText(): Unit {
         withCronCommandTestHome({ =>
             let (addText, addCode) = executeGatewayCronCommand([

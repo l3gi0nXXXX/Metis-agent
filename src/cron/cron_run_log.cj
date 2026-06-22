@@ -83,7 +83,8 @@ public func appendCronRunLog(
     summary!: String = "",
     runAtMs!: Int64 = 0,
     nextRunAtMs!: Int64 = 0,
-    deliveryStatus!: String = "not-requested"
+    deliveryStatus!: String = "not-requested",
+    deliveryError!: String = ""
 ): Unit {
     synchronized(cronRunLogAppendLock) {
         let safeJobId = validateCronRunLogJobId(jobId)
@@ -105,6 +106,7 @@ public func appendCronRunLog(
             "\"durationMs\":${durationMs}," +
             "\"nextRunAtMs\":${nextRunAtMs}," +
             "\"deliveryStatus\":\"${jsonEscape(deliveryStatus)}\"," +
+            "\"deliveryError\":\"${jsonEscape(deliveryError)}\"," +
             "\"sessionTarget\":\"${jsonEscape(sessionTarget)}\"," +
             "\"error\":\"${jsonEscape(errorMessage)}\"" +
             "}\n"
@@ -187,6 +189,7 @@ public func readCronRunLogEntriesForJob(
         row.put("durationMs", JsonInt(runLogReadI64(raw, "durationMs")))
         row.put("nextRunAtMs", JsonInt(runLogReadI64(raw, "nextRunAtMs")))
         row.put("deliveryStatus", JsonString(runLogReadStr(raw, "deliveryStatus", default: "not-requested")))
+        row.put("deliveryError", JsonString(runLogReadStr(raw, "deliveryError")))
         out.add(row)
         i -= 1
         emitted += 1

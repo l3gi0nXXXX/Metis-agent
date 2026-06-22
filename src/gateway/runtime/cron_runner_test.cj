@@ -8,6 +8,7 @@ import metis.cron.{
     CronWebhookHttpRequest,
     CronWebhookHttpResponse,
     cronLoadOrEmpty,
+    cronRunLogPathFromStore,
     cronSave,
     cronStorePath,
     readCronRunLogEntriesForJob,
@@ -19,7 +20,7 @@ import metis.gateway.session.{GatewayIngressSource, GatewaySessionRequest, Gatew
 
 import std.collection.HashMap
 import std.env.{getVariable, setVariable}
-import std.fs.{Directory, Path, remove}
+import std.fs.{Directory, File, Path, remove}
 import std.time.DateTime
 import std.unittest.testmacro.*
 import stdx.encoding.json.{JsonObject, JsonString}
@@ -68,15 +69,22 @@ private class CronRunnerTestChannelAdapter <: ChannelAdapter {
     private let adapterName: String
     private let messageId: String
     private let failSend: Bool
+    private let failMessage: String
     public var sendCount: Int64 = 0
     public var lastAccountId: String = ""
     public var lastPeerId: String = ""
     public var lastText: String = ""
 
-    public init(adapterName: String, messageId!: String = "fake-message", failSend!: Bool = false) {
+    public init(
+        adapterName: String,
+        messageId!: String = "fake-message",
+        failSend!: Bool = false,
+        failMessage!: String = "fake send failed"
+    ) {
         this.adapterName = adapterName
         this.messageId = messageId
         this.failSend = failSend
+        this.failMessage = failMessage
     }
 
     public prop name: String {
@@ -94,7 +102,7 @@ private class CronRunnerTestChannelAdapter <: ChannelAdapter {
     public func send(message: OutboundMessage): SendResult {
         this.capture(message)
         if (this.failSend) {
-            return SendResult.Failed("fake send failed")
+            return SendResult.Failed(this.failMessage)
         }
         SendResult.Success
     }
@@ -102,7 +110,7 @@ private class CronRunnerTestChannelAdapter <: ChannelAdapter {
     public func sendWithMessageId(message: OutboundMessage): String {
         this.capture(message)
         if (this.failSend) {
-            throw Exception("fake send failed")
+            throw Exception(this.failMessage)
         }
         this.messageId
     }
@@ -445,6 +453,89 @@ public class CronRunnerDeliveryTest {
             let runs = readCronRunLogEntriesForJob(storePath, "best-effort-delivery", limit: 10)
             let row = runs.get("entries").getOrThrow().asArray()[0].asObject()
             @Expect(row.get("deliveryStatus").getOrThrow().asString().getValue(), "not-delivered")
+            @Expect(row.get("deliveryError").getOrThrow().asString().getValue().contains("announce delivery failed"), true)
+            @Expect(row.get("deliveryError").getOrThrow().asString().getValue().contains("fake send failed"), true)
+        })
+    }
+
+    @TestCase
+    public func deliveryFailureStrictMarksJobErrorAndRecordsLastError(): Unit {
+        withCronRunnerTestHome({ storePath: Path =>
+            let job = CronJob(
+                "strict-delivery",
+                "hello cron",
+                CronSchedule.every(60000),
+                state: CronJobState(nextRunAtMs: 1),
+                deliveryChannel: "feishu",
+                deliveryTo: "chat-1",
+                deliveryMode: "announce",
+                deliveryAccountId: "tenant-a",
+                bestEffortDeliver: false
+            )
+            cronSave(storePath, [job])
+            debugSetCronRunnerReplyForTest(Some({ _job: CronJob, _request: GatewaySessionRequest =>
+                "ok answer"
+            }))
+            let adapter = CronRunnerTestChannelAdapter("feishu", failSend: true)
+            let service = cronRunnerTestGateway(adapter, "feishu", "tenant-a")
+
+            let result = CronRunner.runJobOnceFromStore(Some(service), storePath, "strict-delivery", true)
+            @Expect(result.get("ok").getOrThrow().asBool().getValue(), true)
+            let jobs = cronLoadOrEmpty(storePath)
+            @Expect(jobs[0].state.lastStatus, "error")
+            @Expect(jobs[0].state.lastError.contains("announce delivery failed"), true)
+            @Expect(jobs[0].state.lastError.contains("fake send failed"), true)
+            let runs = readCronRunLogEntriesForJob(storePath, "strict-delivery", limit: 10)
+            let row = runs.get("entries").getOrThrow().asArray()[0].asObject()
+            @Expect(row.get("status").getOrThrow().asString().getValue(), "error")
+            @Expect(row.get("deliveryStatus").getOrThrow().asString().getValue(), "not-delivered")
+            @Expect(row.get("deliveryError").getOrThrow().asString().getValue().contains("fake send failed"), true)
+        })
+    }
+
+    @TestCase
+    public func deliveryFailureErrorIsRedactedBeforeStateAndRunLog(): Unit {
+        withCronRunnerTestHome({ storePath: Path =>
+            let job = CronJob(
+                "redacted-delivery",
+                "hello cron",
+                CronSchedule.every(60000),
+                state: CronJobState(nextRunAtMs: 1),
+                deliveryChannel: "feishu",
+                deliveryTo: "chat-1",
+                deliveryMode: "announce",
+                deliveryAccountId: "tenant-a",
+                bestEffortDeliver: false
+            )
+            cronSave(storePath, [job])
+            debugSetCronRunnerReplyForTest(Some({ _job: CronJob, _request: GatewaySessionRequest =>
+                "ok answer"
+            }))
+            let secretError = "send failed Authorization: Bearer secret-delivery-token-never-visible token=raw-lower-secret https://user:pass@example.com/hook"
+            let adapter = CronRunnerTestChannelAdapter("feishu", failSend: true, failMessage: secretError)
+            let service = cronRunnerTestGateway(adapter, "feishu", "tenant-a")
+
+            let result = CronRunner.runJobOnceFromStore(Some(service), storePath, "redacted-delivery", true)
+            @Expect(result.get("ok").getOrThrow().asBool().getValue(), true)
+            let jobs = cronLoadOrEmpty(storePath)
+            @Expect(jobs[0].state.lastStatus, "error")
+            @Expect(jobs[0].state.lastError.contains("secret-delivery-token-never-visible"), false)
+            @Expect(jobs[0].state.lastError.contains("raw-lower-secret"), false)
+            @Expect(jobs[0].state.lastError.contains("user:pass"), false)
+            @Expect(jobs[0].state.lastError.contains("redacted"), true)
+
+            let runs = readCronRunLogEntriesForJob(storePath, "redacted-delivery", limit: 10)
+            let row = runs.get("entries").getOrThrow().asArray()[0].asObject()
+            let deliveryError = row.get("deliveryError").getOrThrow().asString().getValue()
+            @Expect(deliveryError.contains("secret-delivery-token-never-visible"), false)
+            @Expect(deliveryError.contains("raw-lower-secret"), false)
+            @Expect(deliveryError.contains("user:pass"), false)
+            @Expect(deliveryError.contains("redacted"), true)
+
+            let rawRunLog = String.fromUtf8(File.readFrom(cronRunLogPathFromStore(storePath, "redacted-delivery")))
+            @Expect(rawRunLog.contains("secret-delivery-token-never-visible"), false)
+            @Expect(rawRunLog.contains("raw-lower-secret"), false)
+            @Expect(rawRunLog.contains("user:pass"), false)
         })
     }
 
