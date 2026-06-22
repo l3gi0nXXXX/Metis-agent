@@ -95,6 +95,16 @@ public func gatewayDefaultChatToolNames(): Array<String> {
     MetisSystemPromptBuilder.collectToolNames(agent.toolManager.tools)
 }
 
+public func gatewayDefaultChatToolJsonValue(toolName: String): Option<JsonValue> {
+    let agent = GatewayP1ChatAgent()
+    for (tool in agent.toolManager.tools) {
+        if (tool.name == toolName) {
+            return Some(tool.toJsonValue())
+        }
+    }
+    None<JsonValue>
+}
+
 private func gatewayStringArrayJson(values: Array<String>): JsonArray {
     let arr = JsonArray([])
     for (value in values) {
