@@ -1086,7 +1086,7 @@ public class ServicePluginHostTest {
             try {
                 let started = ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000)
                 @Expect(started.ok, true)
-                @Expect(this.waitForMessage(messages, lock, timeoutMillis: 6500), true)
+                @Expect(this.waitForMessage(messages, lock, timeoutMillis: 15000), true)
                 let message = this.firstMessage(messages, lock)
                 @Expect(message.contains("GitCode 回复已写回"), true)
                 @Expect(message.contains("写回状态未知/超时"), false)
@@ -1123,7 +1123,7 @@ public class ServicePluginHostTest {
             try {
                 let started = ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000)
                 @Expect(started.ok, true)
-                @Expect(this.waitForMessage(messages, lock, timeoutMillis: 6500), true)
+                @Expect(this.waitForMessage(messages, lock, timeoutMillis: 15000), true)
                 let message = this.firstMessage(messages, lock)
                 @Expect(message.contains("GitCode 回复已写回"), true)
                 @Expect(message.contains("维护者提及: 已追加 teamLeader=1 codeowner=2"), true)
@@ -1165,7 +1165,7 @@ public class ServicePluginHostTest {
             try {
                 let started = ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000)
                 @Expect(started.ok, true)
-                @Expect(this.waitForMessage(messages, lock, timeoutMillis: 6500), true)
+                @Expect(this.waitForMessage(messages, lock, timeoutMillis: 15000), true)
                 let message = this.firstMessage(messages, lock)
                 @Expect(message.contains("GitCode 回复已写回"), true)
                 @Expect(message.contains("unexpected_frame"), false)

@@ -1018,6 +1018,7 @@ public class ServicePluginEventDispatcherTest {
         setServicePluginCapabilityInvokerForTest(Some({ _registration: ServicePluginRegistration, request: CapabilityInvokeRequest =>
             calls.add(request.capabilityId)
             @Expect(request.capabilityId, "gitcode.writeback.apply_result")
+            @Expect(request.timeoutMillis, 15000)
             @Expect(request.payload.contains("\"contractVersion\""), true)
             @Expect(request.payload.contains(this.gitCodeReviewContractVersion), true)
             @Expect(request.payload.contains("\"eventId\""), true)

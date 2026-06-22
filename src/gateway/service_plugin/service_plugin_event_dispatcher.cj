@@ -4,6 +4,7 @@ import std.collection.{ArrayList, HashMap, HashSet}
 import stdx.encoding.json.{JsonBool, JsonInt, JsonObject, JsonString, JsonValue}
 
 private const SERVICE_PLUGIN_GITCODE_REVIEW_CONTRACT_VERSION: String = "gcm-metis-gitcode-review-v1"
+private const SERVICE_PLUGIN_GITCODE_WRITEBACK_APPLY_TIMEOUT_MS: Int64 = 15000
 
 public class ServicePluginEventDeliveryResult {
     public let ok: Bool
@@ -825,7 +826,7 @@ private func servicePluginApplyGeneratedReplyWriteback(event: ServicePluginAccep
         return ServicePluginWritebackApplyState()
     }
     let payload = servicePluginGeneratedReplyWritebackPayload(event, safeResult)
-    let applied = invokeGitCodeWritebackApplyResult("gitcode-monitor", payload, 5000)
+    let applied = invokeGitCodeWritebackApplyResult("gitcode-monitor", payload, SERVICE_PLUGIN_GITCODE_WRITEBACK_APPLY_TIMEOUT_MS)
     servicePluginParseWritebackApplyResult(applied)
 }
 
