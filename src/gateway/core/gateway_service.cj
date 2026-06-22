@@ -540,6 +540,10 @@ public class GatewayService {
                 this.handleTelegramInboundExecutionError(user, message, effectiveAccountId, e)
                 return
             }
+            if (channelToString(message.channel) == "feishu") {
+                this.handleFeishuInboundExecutionError(user, message, effectiveAccountId, request, e)
+                return
+            }
             throw e
         }
         this.logInboundTurnOutcome(conversationKey, message, turn)
@@ -2280,6 +2284,90 @@ public class GatewayService {
                     .string("status", "failed")
                     .string("errorKind", "error_reply_failed")
                     .rawString("error", sendError.message)
+                    .object()
+            )
+        }
+    }
+
+    private func classifyInboundExecutionError(error: Exception): String {
+        let message = error.message.toAsciiLower()
+        if (message.contains("http response body is empty") ||
+            message.contains("empty response body") ||
+            message.contains("response body is empty")) {
+            return "model_empty_response"
+        }
+        "model_execution_failed"
+    }
+
+    private func renderFeishuInboundExecutionErrorText(error: Exception): String {
+        match (this.classifyInboundExecutionError(error)) {
+            case "model_empty_response" => "模型服务本轮返回空响应，未能完成回复。请稍后重试或切换模型。"
+            case _ => "模型服务本轮调用失败，未能完成回复。请稍后重试或切换模型。"
+        }
+    }
+
+    private func handleFeishuInboundExecutionError(
+        user: GatewayUserSettings,
+        message: InboundMessage,
+        accountId: String,
+        request: GatewaySessionRequest,
+        error: Exception
+    ): Unit {
+        let errorKind = this.classifyInboundExecutionError(error)
+        let reply = this.renderFeishuInboundExecutionErrorText(error)
+        let context = gatewayResolveSessionContext(request)
+        let store = gatewaySessionStoreForResolvedRequest(user, request)
+        try {
+            store.appendAssistant(context.sessionKey, "【系统诊断】${reply} errorKind=${errorKind}")
+        } catch (sessionError: Exception) {
+            gatewayLogEventError(
+                "gateway/session",
+                "session.write.failed",
+                "feishu execution diagnostic session write failed",
+                meta: gatewayLogMeta()
+                    .string("channel", "feishu")
+                    .string("accountId", accountId)
+                    .string("sessionKey", context.sessionKey)
+                    .string("errorKind", "diagnostic_session_write_failed")
+                    .rawString("error", redactServicePayload(sessionError.message).text)
+                    .object()
+            )
+        }
+        gatewayLogEventWarn(
+            "gateway/message",
+            "message.execution.failed",
+            "feishu inbound execution failed; sending diagnostic",
+            meta: gatewayLogMeta()
+                .string("channel", "feishu")
+                .string("accountId", accountId)
+                .identityHash("peerHash", message.peerId)
+                .string("sessionKey", context.sessionKey)
+                .string("errorKind", errorKind)
+                .object()
+        )
+        try {
+            let _ = this.sendTextToPeerDetailed(
+                "feishu",
+                message.peerId,
+                reply,
+                replyToMessageId: this.telegramReplyTargetOrMessageId(message),
+                replyInThread: message.replyInThread,
+                accountId: accountId
+            )
+        } catch (sendError: Exception) {
+            gatewayLogEventError(
+                "gateway/message",
+                "message.send.failed",
+                "feishu execution diagnostic delivery failed",
+                meta: gatewayLogMeta()
+                    .string("channel", "feishu")
+                    .string("accountId", accountId)
+                    .identityHash("peerHash", message.peerId)
+                    .string("sessionKey", context.sessionKey)
+                    .string("status", "failed")
+                    .string("errorKind", "diagnostic_delivery_failed")
+                    .string("executionErrorKind", errorKind)
+                    .rawString("error", redactServicePayload(sendError.message).text)
                     .object()
             )
         }
