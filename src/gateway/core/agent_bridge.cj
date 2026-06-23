@@ -7,7 +7,7 @@ import magic.interaction.*
 import magic.jsonable.TypeSchema
 import magic.prelude.*
 
-import metis.core.{RuntimeToolInvocationPolicyContext, gatewayMainRuntimeRequiredToolNames, gatewayNotifyCurrentToolRuntimeStatus, resolveRuntimeToolPolicyFromRoot, runtimePopToolInvocationPolicyContext, runtimePushToolInvocationPolicyContext, runtimeToolInvocationAllowedFromRoot, runtimeToolNamesContain, runtimeToolNamesContainAll}
+import metis.core.{GatewayToolRuntimeContext, RuntimeToolInvocationPolicyContext, gatewayCurrentToolRuntimeContext, gatewayMainRuntimeRequiredToolNames, gatewayNotifyCurrentToolRuntimeStatus, gatewayWithToolRuntimeContext, resolveRuntimeToolPolicyFromRoot, runtimePopToolInvocationPolicyContext, runtimePushToolInvocationPolicyContext, runtimeToolInvocationAllowedFromRoot, runtimeToolNamesContain, runtimeToolNamesContainAll}
 import metis.core.model.CliModelManager
 import metis.core.model.ModelTokenLimits
 import metis.core.config.{CliConfig, CliModelRuntimeStateManager, CliSettingManager, GatewayUserSettings, MetisConfigManager}
@@ -464,19 +464,22 @@ private class GatewayLifecycleToolWrapper <: Tool {
     private let inventory: Array<String>
     private let agentId: String
     private let provider: String
+    private let capturedRuntimeContext: Option<GatewayToolRuntimeContext>
 
     public init(
         inner: Tool,
         policyRoot!: JsonObject = JsonObject(),
         inventory!: Array<String> = [],
         agentId!: String = "",
-        provider!: String = ""
+        provider!: String = "",
+        capturedRuntimeContext!: Option<GatewayToolRuntimeContext> = None<GatewayToolRuntimeContext>
     ) {
         this.inner = inner
         this.policyRoot = policyRoot
         this.inventory = inventory
         this.agentId = agentId.trimAscii()
         this.provider = provider.trimAscii()
+        this.capturedRuntimeContext = capturedRuntimeContext
     }
 
     public prop name: String {
@@ -518,7 +521,11 @@ private class GatewayLifecycleToolWrapper <: Tool {
                 isError: true
             )
         }
-        this.inner.invoke(args)
+        match (this.capturedRuntimeContext) {
+            case Some(context) =>
+                gatewayWithToolRuntimeContext(context, { => this.inner.invoke(args) })
+            case None => this.inner.invoke(args)
+        }
     }
 
     override public func toJsonValue(): JsonValue {
@@ -526,12 +533,13 @@ private class GatewayLifecycleToolWrapper <: Tool {
     }
 }
 
-private func gatewayLifecycleWrappedTools(
+func gatewayLifecycleWrappedTools(
     tools: ArrayList<Tool>,
     policyRoot!: JsonObject = JsonObject(),
     inventory!: Array<String> = [],
     agentId!: String = "",
-    provider!: String = ""
+    provider!: String = "",
+    capturedRuntimeContext!: Option<GatewayToolRuntimeContext> = None<GatewayToolRuntimeContext>
 ): ArrayList<Tool> {
     let wrapped = ArrayList<Tool>()
     for (tool in tools) {
@@ -540,7 +548,8 @@ private func gatewayLifecycleWrappedTools(
             policyRoot: policyRoot,
             inventory: inventory,
             agentId: agentId,
-            provider: provider
+            provider: provider,
+            capturedRuntimeContext: capturedRuntimeContext
         ))
     }
     wrapped
@@ -583,6 +592,7 @@ private func gatewayApplyToolPolicy(
 ): Array<String> {
     let inventory = MetisSystemPromptBuilder.collectToolNames(agent.toolManager.tools)
     let policyRoot = gatewayRuntimePolicyRootForTurn(user, turnContext)
+    let capturedRuntimeContext = gatewayCurrentToolRuntimeContext()
     let report = resolveRuntimeToolPolicyFromRoot(
         policyRoot,
         inventory,
@@ -601,7 +611,8 @@ private func gatewayApplyToolPolicy(
         policyRoot: policyRoot,
         inventory: inventory,
         agentId: agentId,
-        provider: provider
+        provider: provider,
+        capturedRuntimeContext: capturedRuntimeContext
     ))
     report.deniedTools
 }

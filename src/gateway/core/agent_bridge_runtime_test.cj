@@ -3,13 +3,16 @@ package metis.gateway.core
 import magic.config.Config
 import magic.core.message.Message
 import magic.core.model.{AsyncChatResponse, ChatModel, ChatRequest, ChatResponse}
+import magic.core.tool.*
+import magic.jsonable.TypeSchema
 import magic.model.ModelManager
 import metis.core.config.{CliConfig, CliSettingManager, MetisConfigManager, MetisProcessEnvironmentLock, OpenAICodexOAuthProfile, writeOpenAICodexOAuthProfile}
+import metis.core.{GatewayToolRuntimeContext, gatewayCurrentToolRuntimeContext, gatewayToolRuntimeContextDebugSummary, gatewayWithToolRuntimeContext}
 import metis.core.model.{CodexResponsesHttpRequest, CodexResponsesHttpResult, CodexResponsesHttpRunner, setCodexResponsesHttpRunnerForTest}
 import metis.gateway.logging.{gatewayLoggingCaptureConsoleForTest, gatewayLoggingCapturedConsoleForTest, gatewayLoggingResetForTest}
 import metis.gateway.session.{GatewayIngressSource, GatewaySessionRequest, GatewayTurnContext, gatewayResolveSessionContext}
 
-import std.collection.ArrayList
+import std.collection.{ArrayList, HashMap}
 import std.env.{getVariable, setVariable}
 import std.fs.{Directory, File, Path, exists, remove}
 import std.time.DateTime
@@ -338,6 +341,57 @@ private func resetAgentBridgePhase1FakeModels(): Unit {
     agentBridgePhase1FallbackCalls = 0
 }
 
+private class AgentBridgeRuntimeContextProbeTool <: Tool {
+    public prop name: String {
+        get() { "agent_bridge_context_probe" }
+    }
+
+    public prop description: String {
+        get() { "captures current gateway tool runtime context" }
+    }
+
+    public prop parameters: Array<ToolParameter> {
+        get() { [] }
+    }
+
+    public prop retType: TypeSchema {
+        get() { TypeSchema.Str }
+    }
+
+    public prop examples: Array<String> {
+        get() { [] }
+    }
+
+    public prop extra: HashMap<String, String> {
+        get() { HashMap<String, String>() }
+    }
+
+    public func invoke(_args: HashMap<String, JsonValue>): ToolResponse {
+        match (gatewayCurrentToolRuntimeContext()) {
+            case Some(context) =>
+                ToolResponse(gatewayToolRuntimeContextDebugSummary(context).toJsonString())
+            case None => ToolResponse("none", isError: true)
+        }
+    }
+
+    public func toJsonValue(): JsonValue {
+        JsonString(this.name)
+    }
+}
+
+private func agentBridgeRuntimeWrappedProbeForContext(context: GatewayToolRuntimeContext): Tool {
+    let tools = ArrayList<Tool>()
+    tools.add(AgentBridgeRuntimeContextProbeTool())
+    let wrapped = gatewayWithToolRuntimeContext(context, { =>
+        gatewayLifecycleWrappedTools(
+            tools,
+            inventory: ["agent_bridge_context_probe"],
+            capturedRuntimeContext: gatewayCurrentToolRuntimeContext()
+        )
+    })
+    wrapped[0]
+}
+
 @Test
 public class AgentBridgeRuntimeTest {
     @TestCase
@@ -362,6 +416,73 @@ public class AgentBridgeRuntimeTest {
             }
         }
         @Expect(found, true)
+    }
+
+    @TestCase
+    public func gatewayLifecycleToolWrapperPropagatesCapturedCronRuntimeContext(): Unit {
+        let wrapped = agentBridgeRuntimeWrappedProbeForContext(
+            GatewayToolRuntimeContext(
+                "cron",
+                channelName: "cron",
+                sessionKey: "cron:writer:manual",
+                cronJobId: "ut-p3-01",
+                toolExecMode: "allowlist",
+                toolExecAllowlist: ["curl", "python3"]
+            )
+        )
+
+        let response = wrapped.invoke(HashMap<String, JsonValue>())
+        let summary = JsonValue.fromStr(response.content).asObject()
+
+        @Expect(response.isError, false)
+        @Expect(agentBridgeJsonString(summary, "sourceLabel"), "cron")
+        @Expect(agentBridgeJsonString(summary, "channelName"), "cron")
+        @Expect(agentBridgeJsonString(summary, "sessionKey"), "cron:writer:manual")
+        @Expect(agentBridgeJsonString(summary, "cronJobId"), "ut-p3-01")
+        @Expect(agentBridgeJsonString(summary, "toolExecMode"), "allowlist")
+        @Expect(summary.get("allowlistSize").getOrThrow().asInt().getValue(), 2)
+    }
+
+    @TestCase
+    public func gatewayLifecycleToolWrapperKeepsConcurrentCronRuntimeContextsIsolated(): Unit {
+        let first = agentBridgeRuntimeWrappedProbeForContext(
+            GatewayToolRuntimeContext(
+                "cron",
+                channelName: "cron",
+                sessionKey: "cron:writer:a",
+                cronJobId: "bt-p3-01-a",
+                toolExecMode: "allowlist",
+                toolExecAllowlist: ["curl"]
+            )
+        )
+        let second = agentBridgeRuntimeWrappedProbeForContext(
+            GatewayToolRuntimeContext(
+                "cron",
+                channelName: "cron",
+                sessionKey: "cron:writer:b",
+                cronJobId: "bt-p3-01-b",
+                toolExecMode: "deny"
+            )
+        )
+
+        let firstRun = spawn {
+            first.invoke(HashMap<String, JsonValue>()).content
+        }
+        let secondRun = spawn {
+            second.invoke(HashMap<String, JsonValue>()).content
+        }
+
+        let firstOut = firstRun.get()
+        let secondOut = secondRun.get()
+        let firstSummary = JsonValue.fromStr(firstOut).asObject()
+        let secondSummary = JsonValue.fromStr(secondOut).asObject()
+
+        @Expect(agentBridgeJsonString(firstSummary, "cronJobId"), "bt-p3-01-a")
+        @Expect(agentBridgeJsonString(firstSummary, "toolExecMode"), "allowlist")
+        @Expect(firstSummary.get("allowlistSize").getOrThrow().asInt().getValue(), 1)
+        @Expect(agentBridgeJsonString(secondSummary, "cronJobId"), "bt-p3-01-b")
+        @Expect(agentBridgeJsonString(secondSummary, "toolExecMode"), "deny")
+        @Expect(secondSummary.get("allowlistSize").getOrThrow().asInt().getValue(), 0)
     }
 
     @TestCase

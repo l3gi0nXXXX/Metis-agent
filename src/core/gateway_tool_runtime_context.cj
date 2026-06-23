@@ -2,7 +2,7 @@ package metis.core
 
 import std.collection.{ArrayList, HashMap}
 import std.sync.Mutex
-import stdx.encoding.json.{JsonBool, JsonObject, JsonString, JsonValue}
+import stdx.encoding.json.{JsonBool, JsonInt, JsonObject, JsonString, JsonValue}
 
 private func gatewayToolRuntimeCloneObject(value: JsonObject): JsonObject {
     try {
@@ -166,6 +166,17 @@ public func gatewayCurrentToolRuntimeContext(): Option<GatewayToolRuntimeContext
             case None => None<GatewayToolRuntimeContext>
         }
     }
+}
+
+public func gatewayToolRuntimeContextDebugSummary(context: GatewayToolRuntimeContext): JsonObject {
+    let out = JsonObject()
+    out.put("sourceLabel", JsonString(context.sourceLabel))
+    out.put("channelName", JsonString(context.channelName))
+    out.put("sessionKey", JsonString(context.sessionKey))
+    out.put("cronJobId", JsonString(context.cronJobId))
+    out.put("toolExecMode", JsonString(context.toolExecMode))
+    out.put("allowlistSize", JsonInt(context.toolExecAllowlist.size))
+    out
 }
 
 public func gatewayNotifyCurrentToolRuntimeStatus(status: String): Unit {

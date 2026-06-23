@@ -1,6 +1,6 @@
 package metis.gateway.tools
 
-import metis.core.{GatewayToolRuntimeContext, gatewayWithToolRuntimeContext}
+import metis.core.{CRON_SHELL_BLOCKED_MARKER, GatewayToolRuntimeContext, gatewayWithToolRuntimeContext, resolveCurrentCronShellExecutionDecision}
 import metis.core.config.CliConfig
 
 import std.unittest.testmacro.*
@@ -64,5 +64,60 @@ public class GatewayShellToolsetCronPolicyTest {
 
         @Expect(out.contains("Command executed successfully"), true)
         @Expect(out.contains("metis-p2-allow"), true)
+    }
+
+    @TestCase
+    public func cronAllowlistCurlShellToolExecutesWithoutInteractiveConfirmation(): Unit {
+        let out = gatewayWithToolRuntimeContext(
+            GatewayToolRuntimeContext(
+                "cron",
+                cronJobId: "curl-allow-job",
+                toolExecMode: "allowlist",
+                toolExecAllowlist: ["curl"]
+            ),
+            { =>
+                debugGatewayShellExecuteForTest(CliConfig.cwd.toString(), "curl --version", None<String>, Some(false))
+            }
+        )
+
+        @Expect(out.contains("Command executed successfully"), true)
+        @Expect(out.contains("curl"), true)
+    }
+
+    @TestCase
+    public func cronAllowlistCurlDoesNotMatchCurlxPrefix(): Unit {
+        let out = gatewayWithToolRuntimeContext(
+            GatewayToolRuntimeContext(
+                "cron",
+                cronJobId: "curlx-deny-job",
+                toolExecMode: "allowlist",
+                toolExecAllowlist: ["curl"]
+            ),
+            { =>
+                debugGatewayShellExecuteForTest(CliConfig.cwd.toString(), "curlx --version", None<String>, Some(false))
+            }
+        )
+
+        @Expect(out.contains(CRON_SHELL_BLOCKED_MARKER), true)
+        @Expect(out.contains("cron_tool_exec_allowlist_miss"), true)
+        @Expect(out.contains("curlx --version"), true)
+    }
+
+    @TestCase
+    public func nonCronImShellContextKeepsInteractivePolicyPath(): Unit {
+        let decision = gatewayWithToolRuntimeContext(
+            GatewayToolRuntimeContext(
+                "telegram",
+                channelName: "telegram",
+                sessionKey: "telegram:chat:42",
+                toolExecMode: "allowlist",
+                toolExecAllowlist: ["curl"]
+            ),
+            { => resolveCurrentCronShellExecutionDecision("curl --version") }
+        )
+
+        @Expect(decision.applies, false)
+        @Expect(decision.status, "interactive")
+        @Expect(decision.reason, "not_cron_context")
     }
 }
