@@ -1,7 +1,13 @@
 package metis.gateway.tools
 
+import metis.core.config.{CliConfig, CliSettingManager, MetisConfigManager, MetisProcessEnvironmentLock}
+
 import std.collection.ArrayList
+import std.env.{getVariable, setVariable}
+import std.fs.{Directory, Path, remove}
+import std.time.DateTime
 import std.unittest.testmacro.*
+import stdx.encoding.json.{JsonObject, JsonString}
 
 private func gatewayWebFetchRuntimeRepeat(part: String, count: Int64): String {
     let out = StringBuilder()
@@ -23,6 +29,35 @@ private func gatewayWebFetchRuntimeFetch(
     maxRedirects!: Int64 = 3
 ): GatewayWebFetchResult {
     gatewayWebFetchUrl(GatewayWebFetchRequest(url, maxBytes: maxBytes, timeoutMs: 1000, maxRedirects: maxRedirects))
+}
+
+private func gatewayWebFetchRestoreEnv(name: String, value: Option<String>): Unit {
+    match (value) {
+        case Some(v) => setVariable(name, v)
+        case None => setVariable(name, "")
+    }
+}
+
+private func gatewayWebFetchWithTempHome<T>(label: String, block: () -> T): T {
+    synchronized(MetisProcessEnvironmentLock) {
+        let home = Path("/tmp").join("metis-web-fetch-${label}-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
+        try { remove(home, recursive: true) } catch (_: Exception) { () }
+        Directory.create(home, recursive: true)
+        let oldHome = getVariable("METIS_HOME")
+        setVariable("METIS_HOME", home.toString())
+        CliConfig.invalidatePathCache()
+        MetisConfigManager.invalidate()
+        CliSettingManager.invalidate()
+        try {
+            return block()
+        } finally {
+            gatewayWebFetchRestoreEnv("METIS_HOME", oldHome)
+            CliConfig.invalidatePathCache()
+            MetisConfigManager.invalidate()
+            CliSettingManager.invalidate()
+            try { remove(home, recursive: true) } catch (_: Exception) { () }
+        }
+    }
 }
 
 @Test
@@ -221,6 +256,51 @@ public class GatewayWebFetchRuntimeTest {
             let empty = gatewayWebFetchRuntimeFetch("https://example.com/empty")
             @Expect(empty.ok, false)
             @Expect(empty.code, "web_fetch_empty_body")
+        } finally {
+            setGatewayWebFetchHttpRunnerForTest(None<(GatewayWebFetchHttpRequest) -> GatewayWebFetchHttpResponse>)
+        }
+    }
+
+    @TestCase
+    public func webFetchDiagnosesUnsupportedHttpsProxyBeforeNetworkSend(): Unit {
+        gatewayWebFetchWithTempHome("unsupported-https-proxy", { =>
+            let root = JsonObject()
+            let tools = JsonObject()
+            let web = JsonObject()
+            web.put("proxy", JsonString("https://user:secret@127.0.0.1:7897"))
+            tools.put("web", web)
+            root.put("tools", tools)
+            MetisConfigManager.writeRoot(root)
+
+            setGatewayWebFetchHttpRunnerForTest(None<(GatewayWebFetchHttpRequest) -> GatewayWebFetchHttpResponse>)
+            let result = gatewayWebFetchRuntimeFetch("https://example.com/proxy")
+
+            @Expect(result.ok, false)
+            @Expect(result.code, "web_fetch_proxy_unsupported")
+            @Expect(result.message.contains("true HTTPS proxy is not implemented"), true)
+            @Expect(result.message.contains("secret"), false)
+        })
+    }
+
+    @TestCase
+    public func webFetchDiagnosesProxyConnectFailureWithoutLeakingSecrets(): Unit {
+        setGatewayWebFetchHttpRunnerForTest(Some({ _request: GatewayWebFetchHttpRequest =>
+            GatewayWebFetchHttpResponse(
+                0,
+                error: "provider HTTP proxy CONNECT failed: HTTP/1.1 407 Proxy Authentication Required password=never",
+                routeMode: "httpConnectTunnel",
+                proxySource: "explicit",
+                targetHost: "example.com",
+                redactedProxy: "http://[redacted]@127.0.0.1:7897"
+            )
+        }))
+        try {
+            let result = gatewayWebFetchRuntimeFetch("https://example.com/proxy-connect")
+
+            @Expect(result.ok, false)
+            @Expect(result.code, "web_fetch_proxy_connect_failed")
+            @Expect(result.message.contains("password="), false)
+            @Expect(result.message.contains("never"), false)
         } finally {
             setGatewayWebFetchHttpRunnerForTest(None<(GatewayWebFetchHttpRequest) -> GatewayWebFetchHttpResponse>)
         }

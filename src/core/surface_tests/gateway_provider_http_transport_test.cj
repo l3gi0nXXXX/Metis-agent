@@ -6,10 +6,19 @@ import std.env.{getVariable, setVariable}
 import std.unittest.*
 import stdx.encoding.json.{JsonBool, JsonInt, JsonObject, JsonString}
 
-private func providerTransportConfig(proxy!: String = "", envProxyEnabled!: Bool = false, noProxy!: String = "", insecure!: Bool = false): JsonObject {
+private func providerTransportConfig(
+    proxy!: String = "",
+    envProxyEnabled!: Bool = false,
+    noProxy!: String = "",
+    insecure!: Bool = false,
+    systemProxyEnabled!: Bool = false,
+    systemProxy!: String = ""
+): JsonObject {
     let obj = JsonObject()
     obj.put("proxy", JsonString(proxy))
     obj.put("envProxyEnabled", JsonBool(envProxyEnabled))
+    obj.put("systemProxyEnabled", JsonBool(systemProxyEnabled))
+    obj.put("systemProxy", JsonString(systemProxy))
     obj.put("noProxy", JsonString(noProxy))
     obj.put("insecureSkipTlsVerify", JsonBool(insecure))
     obj.put("timeoutMs", JsonInt(120000))
@@ -76,6 +85,48 @@ public class GatewayProviderHttpTransportTest {
             providerTransportRestoreEnv("HTTP_PROXY", oldHttp)
             providerTransportRestoreEnv("NO_PROXY", oldNoProxy)
         }
+    }
+
+    @TestCase
+    public func systemProxyIsUsedAfterEnvironmentProxy(): Unit {
+        let cfg = resolveGatewayProviderHttpTransportConfig(providerTransportConfig(
+            envProxyEnabled: false,
+            systemProxyEnabled: true,
+            systemProxy: "http://127.0.0.1:7897"
+        ))
+        let route = resolveGatewayProviderHttpRoute("https://news.google.com/rss", cfg)
+
+        @Expect(route.mode, "httpConnectTunnel")
+        @Expect(route.proxySource, "system")
+        @Expect(route.redactedProxy, "http://127.0.0.1:7897")
+        @Expect(route.targetHost, "news.google.com")
+    }
+
+    @TestCase
+    public func noProxyBypassesSystemProxy(): Unit {
+        let cfg = resolveGatewayProviderHttpTransportConfig(providerTransportConfig(
+            noProxy: "news.google.com",
+            systemProxyEnabled: true,
+            systemProxy: "http://127.0.0.1:7897"
+        ))
+        let route = resolveGatewayProviderHttpRoute("https://news.google.com/rss", cfg)
+
+        @Expect(route.mode, "direct")
+        @Expect(route.proxySource, "none")
+        @Expect(route.redactedProxy, "")
+    }
+
+    @TestCase
+    public func socksProxyIsDiagnosedInsteadOfUsedAsHttpProxy(): Unit {
+        let cfg = resolveGatewayProviderHttpTransportConfig(providerTransportConfig(
+            systemProxyEnabled: true,
+            systemProxy: "socks5://127.0.0.1:1086"
+        ))
+        let route = resolveGatewayProviderHttpRoute("https://news.google.com/rss", cfg)
+
+        @Expect(route.mode, "unsupportedSocksProxy")
+        @Expect(route.proxySource, "system")
+        @Expect(route.error.contains("SOCKS proxy is not implemented"), true)
     }
 
     @TestCase

@@ -8,7 +8,7 @@ import std.fs.{Directory, Path, remove, File}
 import std.collection.ArrayList
 import std.convert.Parsable
 import std.unittest.testmacro.*
-import stdx.encoding.json.{JsonArray, JsonObject, JsonString, JsonValue}
+import stdx.encoding.json.{JsonArray, JsonBool, JsonInt, JsonObject, JsonString, JsonValue}
 
 @Test
 public class MetisConfigManagerTest {
@@ -1183,6 +1183,50 @@ public class MetisConfigManagerTest {
         @Expect(MetisConfigManager.readTavilyApiKey(), "tvly-key")
     }
     */
+
+    @TestCase
+    public func readWebHttpTransportConfigDefaultsToEnvAndSystemProxy(): Unit {
+        withMetisConfigTestHome("web-http-transport-defaults", { _home =>
+            let cfg = MetisConfigManager.readWebHttpTransportConfig()
+
+            @Expect(cfg.get("proxy").getOrThrow().asString().getValue(), "")
+            @Expect(cfg.get("envProxyEnabled").getOrThrow().asBool().getValue(), true)
+            @Expect(cfg.get("systemProxyEnabled").getOrThrow().asBool().getValue(), true)
+            @Expect(cfg.get("systemProxy").getOrThrow().asString().getValue(), "")
+            @Expect(cfg.get("noProxy").getOrThrow().asString().getValue(), "")
+            @Expect(cfg.get("insecureSkipTlsVerify").getOrThrow().asBool().getValue(), false)
+            @Expect(Int64.parse(cfg.get("timeoutMs").getOrThrow().toJsonString()), 10000)
+        })
+    }
+
+    @TestCase
+    public func readWebHttpTransportConfigReadsToolsWebFields(): Unit {
+        withMetisConfigTestHome("web-http-transport-configured", { _home =>
+            let root = JsonObject()
+            let tools = JsonObject()
+            let web = JsonObject()
+            web.put("proxy", JsonString("http://127.0.0.1:7897"))
+            web.put("envProxyEnabled", JsonBool(false))
+            web.put("systemProxyEnabled", JsonBool(false))
+            web.put("systemProxy", JsonString("http://127.0.0.1:7898"))
+            web.put("noProxy", JsonString("news.google.com"))
+            web.put("insecureSkipTlsVerify", JsonBool(true))
+            web.put("timeoutMs", JsonInt(15000))
+            tools.put("web", web)
+            root.put("tools", tools)
+
+            MetisConfigManager.writeRoot(root)
+            let cfg = MetisConfigManager.readWebHttpTransportConfig()
+
+            @Expect(cfg.get("proxy").getOrThrow().asString().getValue(), "http://127.0.0.1:7897")
+            @Expect(cfg.get("envProxyEnabled").getOrThrow().asBool().getValue(), false)
+            @Expect(cfg.get("systemProxyEnabled").getOrThrow().asBool().getValue(), false)
+            @Expect(cfg.get("systemProxy").getOrThrow().asString().getValue(), "http://127.0.0.1:7898")
+            @Expect(cfg.get("noProxy").getOrThrow().asString().getValue(), "news.google.com")
+            @Expect(cfg.get("insecureSkipTlsVerify").getOrThrow().asBool().getValue(), true)
+            @Expect(Int64.parse(cfg.get("timeoutMs").getOrThrow().toJsonString()), 15000)
+        })
+    }
 
     @TestCase
     public func resolveAgentMemorySearchFallsBackToDefaults(): Unit {

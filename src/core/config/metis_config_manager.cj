@@ -716,6 +716,59 @@ private func cfgGetTavilyApiKey(root: JsonObject): Option<String> {
     }
 }
 
+private func cfgGetWebHttpTransportConfig(root: JsonObject): JsonObject {
+    let out = JsonObject()
+    out.put("proxy", JsonString(""))
+    out.put("envProxyEnabled", JsonBool(true))
+    out.put("systemProxyEnabled", JsonBool(true))
+    out.put("systemProxy", JsonString(""))
+    out.put("noProxy", JsonString(""))
+    out.put("insecureSkipTlsVerify", JsonBool(false))
+    out.put("timeoutMs", JsonInt(10000))
+
+    let webObj = match (cfgGetObject(root, "tools")) {
+        case Some(toolsObj) =>
+            match (cfgGetObject(toolsObj, "web")) {
+                case Some(value) => value
+                case None => return out
+            }
+        case None => return out
+    }
+    match (cfgGetString(webObj, "proxy")) {
+        case Some(value) => out.put("proxy", JsonString(value.trimAscii()))
+        case None => ()
+    }
+    match (cfgGetBool(webObj, "envProxyEnabled")) {
+        case Some(value) => out.put("envProxyEnabled", JsonBool(value))
+        case None => ()
+    }
+    match (cfgGetBool(webObj, "envProxy")) {
+        case Some(value) => out.put("envProxyEnabled", JsonBool(value))
+        case None => ()
+    }
+    match (cfgGetBool(webObj, "systemProxyEnabled")) {
+        case Some(value) => out.put("systemProxyEnabled", JsonBool(value))
+        case None => ()
+    }
+    match (cfgGetString(webObj, "systemProxy")) {
+        case Some(value) => out.put("systemProxy", JsonString(value.trimAscii()))
+        case None => ()
+    }
+    match (cfgGetString(webObj, "noProxy")) {
+        case Some(value) => out.put("noProxy", JsonString(value.trimAscii()))
+        case None => ()
+    }
+    match (cfgGetBool(webObj, "insecureSkipTlsVerify")) {
+        case Some(value) => out.put("insecureSkipTlsVerify", JsonBool(value))
+        case None => ()
+    }
+    match (cfgGetInt64(webObj, "timeoutMs")) {
+        case Some(value) => out.put("timeoutMs", JsonInt(max(1, value)))
+        case None => ()
+    }
+    out
+}
+
 private func cfgGetProviderFieldFromRaw(providerId: String, field: String): Option<String> {
     match (MetisConfigManager.rawConfig()) {
         case Some(root) =>
@@ -1786,6 +1839,13 @@ public class MetisConfigManager {
             case None => ()
         }
         ""
+    }
+
+    public static func readWebHttpTransportConfig(): JsonObject {
+        match (rawConfig()) {
+            case Some(root) => cfgGetWebHttpTransportConfig(root)
+            case None => cfgGetWebHttpTransportConfig(JsonObject())
+        }
     }
 
     public static func readProviderBaseUrl(providerId: String): String {

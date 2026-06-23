@@ -14,6 +14,8 @@ import stdx.net.tls.*
 public class GatewayProviderHttpTransportConfig {
     public let proxy: String
     public let envProxyEnabled: Bool
+    public let systemProxyEnabled: Bool
+    public let systemProxy: String
     public let noProxy: String
     public let insecureSkipTlsVerify: Bool
     public let timeoutMs: Int64
@@ -23,13 +25,17 @@ public class GatewayProviderHttpTransportConfig {
         envProxyEnabled: Bool,
         noProxy: String,
         insecureSkipTlsVerify: Bool,
-        timeoutMs: Int64
+        timeoutMs: Int64,
+        systemProxyEnabled!: Bool = false,
+        systemProxy!: String = ""
     ) {
-        this.proxy = proxy
+        this.proxy = proxy.trimAscii()
         this.envProxyEnabled = envProxyEnabled
-        this.noProxy = noProxy
+        this.systemProxyEnabled = systemProxyEnabled
+        this.systemProxy = systemProxy.trimAscii()
+        this.noProxy = noProxy.trimAscii()
         this.insecureSkipTlsVerify = insecureSkipTlsVerify
-        this.timeoutMs = timeoutMs
+        this.timeoutMs = max(1, timeoutMs)
     }
 }
 
@@ -105,7 +111,9 @@ public func resolveGatewayProviderHttpTransportConfig(providerConfig: JsonObject
         providerHttpBool(providerConfig, "envProxyEnabled", false),
         providerHttpString(providerConfig, "noProxy"),
         providerHttpBool(providerConfig, "insecureSkipTlsVerify", false),
-        max(1, providerHttpInt(providerConfig, "timeoutMs", 120000))
+        max(1, providerHttpInt(providerConfig, "timeoutMs", 120000)),
+        systemProxyEnabled: providerHttpBool(providerConfig, "systemProxyEnabled", false),
+        systemProxy: providerHttpString(providerConfig, "systemProxy")
     )
 }
 
@@ -178,12 +186,25 @@ private func providerHttpProxyForUrl(url: String, cfg: GatewayProviderHttpTransp
     if (!cfg.proxy.trimAscii().isEmpty()) {
         return (cfg.proxy.trimAscii(), "explicit")
     }
-    if (!cfg.envProxyEnabled || providerHttpNoProxyMatches(url, cfg)) {
+    if (providerHttpNoProxyMatches(url, cfg)) {
         return ("", "none")
     }
-    let envProxy = providerHttpEnvProxyForUrl(url)
-    if (!envProxy.isEmpty()) {
-        return (envProxy, "env")
+    if (cfg.envProxyEnabled) {
+        let envProxy = providerHttpEnvProxyForUrl(url)
+        if (!envProxy.isEmpty()) {
+            return (envProxy, "env")
+        }
+    }
+    if (cfg.systemProxyEnabled) {
+        let configuredSystemProxy = cfg.systemProxy.trimAscii()
+        let systemProxy = if (configuredSystemProxy.isEmpty()) {
+            resolveGatewaySystemProxy()
+        } else {
+            configuredSystemProxy
+        }
+        if (!systemProxy.isEmpty()) {
+            return (systemProxy, "system")
+        }
     }
     ("", "none")
 }
@@ -196,7 +217,31 @@ private func providerHttpProxyScheme(proxy: String): String {
     if (lower.startsWith("http://")) {
         return "http"
     }
+    if (lower.startsWith("socks5://") || lower.startsWith("socks4://") || lower.startsWith("socks://")) {
+        return "socks"
+    }
     "http"
+}
+
+private func providerHttpStripProxyScheme(proxy: String): String {
+    let trimmed = proxy.trimAscii()
+    let lower = trimmed.toAsciiLower()
+    if (lower.startsWith("https://")) {
+        return trimmed[8..]
+    }
+    if (lower.startsWith("http://")) {
+        return trimmed[7..]
+    }
+    if (lower.startsWith("socks5://")) {
+        return trimmed[9..]
+    }
+    if (lower.startsWith("socks4://")) {
+        return trimmed[9..]
+    }
+    if (lower.startsWith("socks://")) {
+        return trimmed[8..]
+    }
+    trimmed
 }
 
 public func redactGatewayProviderProxy(proxy: String): String {
@@ -226,6 +271,15 @@ public func resolveGatewayProviderHttpRoute(url: String, cfg: GatewayProviderHtt
         return GatewayProviderHttpRoute("direct", "none", "", targetHost)
     }
     let proxyScheme = providerHttpProxyScheme(proxy)
+    if (proxyScheme == "socks") {
+        return GatewayProviderHttpRoute(
+            "unsupportedSocksProxy",
+            source,
+            redactGatewayProviderProxy(proxy),
+            targetHost,
+            error: "SOCKS proxy is not implemented for provider HTTP transport; configure an HTTP proxy or bare host:port"
+        )
+    }
     if (targetScheme == "https" && proxyScheme == "https") {
         return GatewayProviderHttpRoute(
             "unsupportedHttpsProxy",
@@ -244,13 +298,7 @@ public func resolveGatewayProviderHttpRoute(url: String, cfg: GatewayProviderHtt
 public func parseGatewayProviderHttpProxyEndpoint(proxy: String): GatewayProviderHttpProxyEndpoint {
     let trimmed = proxy.trimAscii()
     let scheme = providerHttpProxyScheme(trimmed)
-    let withoutScheme = if (trimmed.toAsciiLower().startsWith("http://")) {
-        trimmed[7..]
-    } else if (trimmed.toAsciiLower().startsWith("https://")) {
-        trimmed[8..]
-    } else {
-        trimmed
-    }
+    let withoutScheme = providerHttpStripProxyScheme(trimmed)
     let authority = match (withoutScheme.indexOf("/")) {
         case Some(idx) => withoutScheme[..idx]
         case None => withoutScheme
@@ -329,7 +377,7 @@ private func openGatewayProviderHttpConnectTunnel(
 
 public func buildGatewayProviderHttpClientBuilder(url: String, cfg: GatewayProviderHttpTransportConfig): (ClientBuilder, GatewayProviderHttpRoute) {
     let route = resolveGatewayProviderHttpRoute(url, cfg)
-    if (route.mode == "unsupportedHttpsProxy") {
+    if (route.mode == "unsupportedHttpsProxy" || route.mode == "unsupportedSocksProxy") {
         throw Exception(route.error)
     }
     let builder = ClientBuilder()

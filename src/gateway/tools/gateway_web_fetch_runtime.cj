@@ -1,13 +1,13 @@
 package metis.gateway.tools
 
-import metis.core.{metisDecodeUtf8Bytes, metisSafeDiagnosticText, metisSafeRuneEllipsis}
+import metis.core.{GatewayProviderHttpRoute, buildGatewayProviderHttpClientBuilder, metisDecodeUtf8Bytes, metisSafeDiagnosticText, metisSafeRuneEllipsis, resolveGatewayProviderHttpRoute, resolveGatewayProviderHttpTransportConfig}
+import metis.core.config.MetisConfigManager
 
 import std.collection.ArrayList
 import std.sync.Mutex
 import std.time.*
-import stdx.encoding.url.URL
+import stdx.encoding.json.JsonInt
 import stdx.net.http.*
-import stdx.net.tls.TlsClientConfig
 
 public class GatewayWebFetchRequest {
     public let url: String
@@ -51,19 +51,31 @@ public class GatewayWebFetchHttpResponse {
     public let contentType: String
     public let location: String
     public let error: String
+    public let routeMode: String
+    public let proxySource: String
+    public let targetHost: String
+    public let redactedProxy: String
 
     public init(
         statusCode: Int64,
         bodyBytes!: Array<Byte> = [],
         contentType!: String = "",
         location!: String = "",
-        error!: String = ""
+        error!: String = "",
+        routeMode!: String = "",
+        proxySource!: String = "",
+        targetHost!: String = "",
+        redactedProxy!: String = ""
     ) {
         this.statusCode = statusCode
         this.bodyBytes = bodyBytes
         this.contentType = contentType.trimAscii()
         this.location = location.trimAscii()
         this.error = error.trimAscii()
+        this.routeMode = routeMode.trimAscii()
+        this.proxySource = proxySource.trimAscii()
+        this.targetHost = targetHost.trimAscii()
+        this.redactedProxy = redactedProxy.trimAscii()
     }
 }
 
@@ -284,14 +296,38 @@ private func gatewayWebFetchReadLimitedBytes(response: HttpResponse, maxBytes: I
     GatewayWebFetchReadResult(out.toArray())
 }
 
+private func gatewayWebFetchHttpResponseFromRoute(
+    statusCode: Int64,
+    route: GatewayProviderHttpRoute,
+    bodyBytes!: Array<Byte> = [],
+    contentType!: String = "",
+    location!: String = "",
+    error!: String = ""
+): GatewayWebFetchHttpResponse {
+    GatewayWebFetchHttpResponse(
+        statusCode,
+        bodyBytes: bodyBytes,
+        contentType: contentType,
+        location: location,
+        error: error,
+        routeMode: route.mode,
+        proxySource: route.proxySource,
+        targetHost: route.targetHost,
+        redactedProxy: route.redactedProxy
+    )
+}
+
 private func gatewayWebFetchNativeGet(request: GatewayWebFetchHttpRequest): GatewayWebFetchHttpResponse {
-    let builder = ClientBuilder()
-    builder.readTimeout(Duration.millisecond * request.timeoutMs)
-    if (request.url.toAsciiLower().startsWith("https://")) {
-        var tlsConfig = TlsClientConfig()
-        tlsConfig.domain = URL.parse(request.url).hostName
-        builder.tlsConfig(tlsConfig)
+    let transportConfigObject = MetisConfigManager.readWebHttpTransportConfig()
+    transportConfigObject.put("timeoutMs", JsonInt(request.timeoutMs))
+    let transportConfig = resolveGatewayProviderHttpTransportConfig(transportConfigObject)
+    let route = resolveGatewayProviderHttpRoute(request.url, transportConfig)
+    let builder = try {
+        buildGatewayProviderHttpClientBuilder(request.url, transportConfig)[0]
+    } catch (e: Exception) {
+        return gatewayWebFetchHttpResponseFromRoute(0, route, error: gatewayWebFetchSanitizeDetail(e.message))
     }
+    builder.readTimeout(Duration.millisecond * request.timeoutMs)
     let client = builder.build()
     try {
         let reqBuilder = HttpRequestBuilder()
@@ -304,11 +340,11 @@ private func gatewayWebFetchNativeGet(request: GatewayWebFetchHttpRequest): Gate
         let location = response.headers.getFirst("location") ?? response.headers.getFirst("Location") ?? ""
         let read = gatewayWebFetchReadLimitedBytes(response, request.maxBytes)
         if (read.tooLarge) {
-            return GatewayWebFetchHttpResponse(Int64(response.status), contentType: contentType, location: location, error: "response_too_large")
+            return gatewayWebFetchHttpResponseFromRoute(Int64(response.status), route, contentType: contentType, location: location, error: "response_too_large")
         }
-        GatewayWebFetchHttpResponse(Int64(response.status), bodyBytes: read.bodyBytes, contentType: contentType, location: location)
+        gatewayWebFetchHttpResponseFromRoute(Int64(response.status), route, bodyBytes: read.bodyBytes, contentType: contentType, location: location)
     } catch (e: Exception) {
-        GatewayWebFetchHttpResponse(0, error: gatewayWebFetchSanitizeDetail(e.message))
+        gatewayWebFetchHttpResponseFromRoute(0, route, error: gatewayWebFetchSanitizeDetail(e.message))
     } finally {
         client.close()
     }
@@ -357,8 +393,29 @@ private func gatewayWebFetchResolveRedirect(currentUrl: String, location: String
 }
 
 private func gatewayWebFetchNetworkFailure(response: GatewayWebFetchHttpResponse, redactedUrl: String, currentUrl: String): GatewayWebFetchResult {
+    let rawLower = response.error.trimAscii().toAsciiLower()
     let detail = gatewayWebFetchSanitizeDetail(response.error)
     let lower = detail.toAsciiLower()
+    if (response.routeMode == "unsupportedHttpsProxy" || response.routeMode == "unsupportedSocksProxy") {
+        return gatewayWebFetchFailure(
+            "web_fetch_proxy_unsupported",
+            if (detail.isEmpty()) { "Configured proxy is not supported for web_fetch." } else { detail },
+            url: currentUrl,
+            finalUrl: currentUrl,
+            redactedUrl: redactedUrl
+        )
+    }
+    if ((response.routeMode == "httpConnectTunnel" && rawLower.contains("connect failed")) ||
+        rawLower.contains("provider http proxy connect failed") ||
+        rawLower.contains("http proxy connect failed")) {
+        return gatewayWebFetchFailure(
+            "web_fetch_proxy_connect_failed",
+            if (detail.isEmpty()) { "HTTP proxy CONNECT failed." } else { detail },
+            url: currentUrl,
+            finalUrl: currentUrl,
+            redactedUrl: redactedUrl
+        )
+    }
     if (lower.contains("timeout") || lower.contains("timed out")) {
         return gatewayWebFetchFailure(
             "web_fetch_timeout",
