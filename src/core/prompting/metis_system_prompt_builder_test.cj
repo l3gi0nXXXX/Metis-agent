@@ -128,6 +128,37 @@ public class MetisSystemPromptBuilderTest {
     }
 
     @TestCase
+    public func webToolSummaryUsesProviderNeutralKeylessProviderText(): Unit {
+        let params = MetisSystemPromptParams()
+        params.promptMode = PromptMode.FullMode
+        params.toolNames = ["web_search", "web_fetch", "web_extract"]
+        params.runtimeInfo.webAvailabilitySummary =
+            "searchProvider=duckduckgo | searchStatus=ok | searchAvailable=true | fetchRoute=httpConnectTunnel | proxySource=system"
+        let prompt = MetisSystemPromptBuilder.build(params, cangjieMode: false)
+
+        @Expect(prompt.contains("web_search: Search current web through the configured provider or default keyless provider"), true)
+        @Expect(prompt.contains("web_fetch: Fetch and extract one public HTTP/HTTPS URL through the native web runtime"), true)
+        @Expect(prompt.contains("web_extract: Fetch and extract multiple public HTTP/HTTPS URLs through the native web runtime"), true)
+        @Expect(prompt.contains("Web tools: searchProvider=duckduckgo"), true)
+        @Expect(prompt.contains("Tavily API"), false)
+        @Expect(prompt.contains("gateway.webSearch"), false)
+    }
+
+    @TestCase
+    public func webAvailabilitySummaryIsHiddenWhenWebToolsAreHidden(): Unit {
+        let params = MetisSystemPromptParams()
+        params.promptMode = PromptMode.FullMode
+        params.toolNames = ["message"]
+        params.runtimeInfo.webAvailabilitySummary =
+            "searchProvider=duckduckgo | searchStatus=ok | searchAvailable=true | fetchRoute=httpConnectTunnel | proxySource=system"
+        let prompt = MetisSystemPromptBuilder.build(params, cangjieMode: false)
+
+        @Expect(prompt.contains("Web tools:"), false)
+        @Expect(prompt.contains("searchProvider=duckduckgo"), false)
+        @Expect(prompt.contains("web_search: Search current web"), false)
+    }
+
+    @TestCase
     public func pdfGuidanceAppearsForPdfToolWithoutProviderInternals(): Unit {
         let params = MetisSystemPromptParams()
         params.promptMode = PromptMode.FullMode

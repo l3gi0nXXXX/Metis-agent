@@ -7,7 +7,7 @@ import magic.interaction.*
 import magic.jsonable.TypeSchema
 import magic.prelude.*
 
-import metis.core.{GatewayToolRuntimeContext, RuntimeToolInvocationPolicyContext, gatewayCurrentToolRuntimeContext, gatewayMainRuntimeRequiredToolNames, gatewayNotifyCurrentToolRuntimeStatus, gatewayWithToolRuntimeContext, resolveRuntimeToolPolicyFromRoot, runtimePopToolInvocationPolicyContext, runtimePushToolInvocationPolicyContext, runtimeToolInvocationAllowedFromRoot, runtimeToolNamesContain, runtimeToolNamesContainAll}
+import metis.core.{GatewayToolRuntimeContext, RuntimeToolInvocationPolicyContext, gatewayCurrentToolRuntimeContext, gatewayMainRuntimeRequiredToolNames, gatewayNotifyCurrentToolRuntimeStatus, gatewayWithToolRuntimeContext, metisSafeRuneEllipsis, resolveGatewayProviderHttpRoute, resolveGatewayProviderHttpTransportConfig, resolveRuntimeToolPolicyFromRoot, runtimePopToolInvocationPolicyContext, runtimePushToolInvocationPolicyContext, runtimeToolInvocationAllowedFromRoot, runtimeToolNamesContain, runtimeToolNamesContainAll}
 import metis.core.model.CliModelManager
 import metis.core.model.ModelTokenLimits
 import metis.core.config.{CliConfig, CliModelRuntimeStateManager, CliSettingManager, GatewayUserSettings, MetisConfigManager}
@@ -16,10 +16,11 @@ import metis.core.skills.SkillsPrompt
 import metis.core.skills.tryHandleSkillsCommand
 import metis.cron.{executeGatewayCronCommand, parseSlashCronLine}
 import metis.gateway.{gatewayMcpGitCodeToolResultJson, gatewayMcpGitCodeToolResultJsonWithRuntime, gatewayMcpIsGitCodeTool}
+import metis.gateway.logging.gatewayLogRedactText
 import metis.gateway.reply_guard.normalizeGatewayAssistantFinalReply
 import metis.gateway.reply_guard.safeFallbackTextForBlockedAssistantReply
 import metis.gateway.session.GatewayTurnContext
-import metis.gateway.tools.{GatewayCanvasToolset, GatewayCronToolset, GatewayFeishuMediaToolset, GatewayFeishuOapiToolset, GatewayFSToolset, GatewayGatewayToolset, GatewayImageGenerationToolset, GatewayManagedSessionsToolset, GatewayMemoryToolset, GatewayMessageToolset, GatewayPlanToolset, GatewaySessionTranscriptToolset, GatewayShellToolset, GatewayTelegramMediaToolset, GatewayTtsToolset, GatewayVideoGenerationToolset, GatewayWeatherToolset, GatewayWebToolset, gatewayHandleNativeCommandLine, gatewayHandleSubagentsCommandLine}
+import metis.gateway.tools.{GatewayCanvasToolset, GatewayCronToolset, GatewayFeishuMediaToolset, GatewayFeishuOapiToolset, GatewayFSToolset, GatewayGatewayToolset, GatewayImageGenerationToolset, GatewayManagedSessionsToolset, GatewayMemoryToolset, GatewayMessageToolset, GatewayPlanToolset, GatewaySessionTranscriptToolset, GatewayShellToolset, GatewayTelegramMediaToolset, GatewayTtsToolset, GatewayVideoGenerationToolset, GatewayWeatherToolset, GatewayWebToolset, gatewayHandleNativeCommandLine, gatewayHandleSubagentsCommandLine, resolveGatewayWebProvider}
 import std.collection.{HashMap, ArrayList, enumerate}
 import std.fs.Path
 import std.sync.Mutex
@@ -91,6 +92,51 @@ private func buildGatewayExtraSystemPrompt(channelName: String, extraPrompt!: St
         base += "\n\n附加系统约束：\n${extra}"
     }
     return base
+}
+
+private func gatewayPromptBool(value: Bool): String {
+    if (value) { "true" } else { "false" }
+}
+
+private func gatewayPromptSafeDiagnostic(raw: String): String {
+    metisSafeRuneEllipsis(
+        gatewayLogRedactText(raw.replace("\r", " ").replace("\n", " ").trimAscii()),
+        120
+    )
+}
+
+private func buildGatewayWebAvailabilityPromptSummary(toolNames: Array<String>): String {
+    let hasSearch = runtimeToolNamesContain(toolNames, "web_search")
+    let hasFetch = runtimeToolNamesContain(toolNames, "web_fetch") || runtimeToolNamesContain(toolNames, "web_extract")
+    if (!hasSearch && !hasFetch) {
+        return ""
+    }
+    let parts = ArrayList<String>()
+    if (hasSearch) {
+        let provider = resolveGatewayWebProvider("search")
+        let providerId = if (provider.providerId.isEmpty()) { "none" } else { provider.providerId }
+        let providerStatus = if (provider.status.isEmpty()) { "unknown" } else { provider.status }
+        parts.add("searchProvider=${providerId}")
+        parts.add("searchStatus=${providerStatus}")
+        parts.add("searchAvailable=${gatewayPromptBool(provider.available && provider.supportsSearch)}")
+    }
+    if (hasFetch) {
+        try {
+            let configObject = MetisConfigManager.readWebHttpTransportConfig()
+            let transportConfig = resolveGatewayProviderHttpTransportConfig(configObject)
+            let route = resolveGatewayProviderHttpRoute("https://example.com/", transportConfig)
+            parts.add("fetchRoute=${route.mode}")
+            parts.add("proxySource=${route.proxySource}")
+            if (!route.error.trimAscii().isEmpty()) {
+                parts.add("fetchProxyDiagnostic=${gatewayPromptSafeDiagnostic(route.error)}")
+            }
+        } catch (e: Exception) {
+            parts.add("fetchRoute=unknown")
+            parts.add("proxySource=unknown")
+            parts.add("fetchProxyDiagnostic=${gatewayPromptSafeDiagnostic(e.message)}")
+        }
+    }
+    String.join(parts.toArray(), delimiter: " | ")
 }
 
 func gatewaySkillSelectionUserNotice(skillsEnabled: Bool, selectedSkillNameOpt: Option<String>): String {
@@ -691,6 +737,7 @@ private func buildGatewaySystemPrompt(
         case None => ()
     }
     params.toolNames = MetisSystemPromptBuilder.collectToolNames(agent.toolManager.tools)
+    params.runtimeInfo.webAvailabilitySummary = buildGatewayWebAvailabilityPromptSummary(params.toolNames)
     params.runtimeInfo.agentId = effectiveAgentId
     params.runtimeInfo.model = modelName.trimAscii()
     params.runtimeInfo.channel = channelName.trimAscii().toAsciiLower()

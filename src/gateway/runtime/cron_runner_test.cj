@@ -1,7 +1,7 @@
 package metis.gateway.runtime
 
 import metis.core.config.{CliConfig, CliSettingManager, MetisConfigManager, MetisProcessEnvironmentLock}
-import metis.core.{TavilySearchHttpRequest, TavilySearchHttpResponse, setTavilySearchHttpRunnerForTest}
+import metis.core.{DuckDuckGoSearchHttpRequest, DuckDuckGoSearchHttpResponse, TavilySearchHttpRequest, TavilySearchHttpResponse, setDuckDuckGoSearchHttpRunnerForTest, setTavilySearchHttpRunnerForTest}
 import metis.gateway.tools.{
     GatewayWebProviderResolution,
     GatewayWebToolset,
@@ -53,6 +53,7 @@ private func withCronRunnerTestHome<T>(block: (Path) -> T): T {
             debugSetCronRunnerRunLogAppendForTest(None<() -> Unit>)
             setGatewayAgentBridgeReplyRunnerForTest(None<(String, String, String, String, Bool, Option<(String) -> Unit>) -> String>)
             setGatewayWebProviderResolverForTest(None<(String) -> GatewayWebProviderResolution>)
+            setDuckDuckGoSearchHttpRunnerForTest(None<(DuckDuckGoSearchHttpRequest) -> DuckDuckGoSearchHttpResponse>)
             setTavilySearchHttpRunnerForTest(None<(TavilySearchHttpRequest) -> TavilySearchHttpResponse>)
             setCronWebhookHttpRunnerForTest(None<(CronWebhookHttpRequest) -> CronWebhookHttpResponse>)
             match (oldHome) {
@@ -169,6 +170,26 @@ private func cronRunnerInstallFakeTavilyProvider(): Unit {
 }
 
 private func cronRunnerFakeWebBrief(): String {
+    "每日国际新闻简报\n" +
+        GatewayWebToolset().webSearchForTest("today huawei news", Some(2), Some("news"), Some("day"))
+}
+
+private func cronRunnerInstallFakeDuckDuckGoProvider(): Unit {
+    setVariable("TAVILY_API_KEY", "")
+    setDuckDuckGoSearchHttpRunnerForTest(Some({ request: DuckDuckGoSearchHttpRequest =>
+        @Expect(request.url.contains("q=today+huawei+news"), true)
+        let html =
+            "<html><body>" +
+            "<a class=\"result__a\" href=\"https://example.com/2026-06-23-a\">2026-06-23 source marker 华为新闻 A</a>" +
+            "<a class=\"result__snippet\">来自 fake DuckDuckGo 的实时来源 A。</a>" +
+            "<a class=\"result__a\" href=\"https://example.com/2026-06-23-b\">2026-06-23 source marker 国际新闻 B</a>" +
+            "<a class=\"result__snippet\">来自 fake DuckDuckGo 的实时来源 B。</a>" +
+            "</body></html>"
+        DuckDuckGoSearchHttpResponse(200, bodyBytes: html.toArray())
+    }))
+}
+
+private func cronRunnerFakeDuckDuckGoWebBrief(): String {
     "每日国际新闻简报\n" +
         GatewayWebToolset().webSearchForTest("today huawei news", Some(2), Some("news"), Some("day"))
 }
@@ -691,6 +712,49 @@ public class CronRunnerDeliveryTest {
     }
 
     @TestCase
+    public func cronManualTriggerUsesWebSearchFallbackAndDeliversDuckDuckGoMarker(): Unit {
+        withCronRunnerTestHome({ storePath: Path =>
+            let job = CronJob(
+                "p5-duckduckgo-fallback",
+                "create a current web brief",
+                CronSchedule.every(60000),
+                state: CronJobState(nextRunAtMs: 1),
+                deliveryChannel: "telegram",
+                deliveryTo: "chat-1",
+                deliveryMode: "announce"
+            )
+            cronSave(storePath, [job])
+            cronRunnerInstallFakeDuckDuckGoProvider()
+            setGatewayAgentBridgeReplyRunnerForTest(Some({
+                _conversationKey: String,
+                _prompt: String,
+                _channelName: String,
+                _agentId: String,
+                _streamingEnabled: Bool,
+                _streamChunkHook: Option<(String) -> Unit> =>
+                    cronRunnerFakeDuckDuckGoWebBrief()
+            }))
+            let adapter = CronRunnerTestChannelAdapter("telegram", messageId: "tg-ddg")
+            let service = cronRunnerTestGateway(adapter, "telegram", "")
+
+            let result = CronRunner.runJobOnceFromStore(Some(service), storePath, "p5-duckduckgo-fallback", true)
+            @Expect(result.get("ok").getOrThrow().asBool().getValue(), true)
+            @Expect(result.get("ran").getOrThrow().asBool().getValue(), true)
+            @Expect(adapter.sendCount, 1)
+            @Expect(adapter.lastText.contains("Provider: duckduckgo"), true)
+            @Expect(adapter.lastText.contains("2026-06-23 source marker"), true)
+            @Expect(adapter.lastText.contains("web_provider_unavailable"), false)
+
+            let runs = readCronRunLogEntriesForJob(storePath, "p5-duckduckgo-fallback", limit: 10)
+            let row = runs.get("entries").getOrThrow().asArray()[0].asObject()
+            @Expect(row.get("status").getOrThrow().asString().getValue(), "ok")
+            @Expect(row.get("deliveryStatus").getOrThrow().asString().getValue(), "delivered")
+            @Expect(row.get("diagnosticCode").getOrThrow().asString().getValue(), "")
+            @Expect(row.get("summary").getOrThrow().asString().getValue().contains("2026-06-23 source marker"), true)
+        })
+    }
+
+    @TestCase
     public func m5n1UnavailableWebProviderIsDeliveredAndRecordedAsBusinessDiagnostic(): Unit {
         withCronRunnerTestHome({ storePath: Path =>
             let job = CronJob(
@@ -738,6 +802,78 @@ public class CronRunnerDeliveryTest {
             @Expect(row.get("deliveryStatus").getOrThrow().asString().getValue(), "delivered")
             @Expect(row.get("diagnosticCode").getOrThrow().asString().getValue(), "web_provider_unavailable")
             @Expect(row.get("diagnosticMessage").getOrThrow().asString().getValue().contains("Real-time web search"), true)
+        })
+    }
+
+    @TestCase
+    public func cronWebProxyDiagnosticIsDeliveredAndRecordedAsBusinessDiagnostic(): Unit {
+        withCronRunnerTestHome({ storePath: Path =>
+            let job = CronJob(
+                "m5-web-proxy-diagnostic",
+                "fetch a current RSS brief",
+                CronSchedule.every(60000),
+                state: CronJobState(nextRunAtMs: 1),
+                deliveryChannel: "telegram",
+                deliveryTo: "chat-1",
+                deliveryMode: "announce"
+            )
+            cronSave(storePath, [job])
+            debugSetCronRunnerReplyForTest(Some({ _job: CronJob, _request: GatewaySessionRequest =>
+                "本轮未获取实时来源。\nStatus: error\nDiagnostic: code=web_fetch_proxy_connect_failed message=provider HTTP proxy CONNECT failed: HTTP/1.1 407 Proxy Authentication Required"
+            }))
+            let adapter = CronRunnerTestChannelAdapter("telegram", messageId: "tg-m5-proxy")
+            let service = cronRunnerTestGateway(adapter, "telegram", "")
+
+            let result = CronRunner.runJobOnceFromStore(Some(service), storePath, "m5-web-proxy-diagnostic", true)
+            @Expect(result.get("ok").getOrThrow().asBool().getValue(), true)
+            @Expect(adapter.sendCount, 1)
+            @Expect(adapter.lastText.contains("web_fetch_proxy_connect_failed"), true)
+
+            let jobs = cronLoadOrEmpty(storePath)
+            @Expect(jobs[0].state.lastStatus, "success")
+            let runs = readCronRunLogEntriesForJob(storePath, "m5-web-proxy-diagnostic", limit: 10)
+            let row = runs.get("entries").getOrThrow().asArray()[0].asObject()
+            @Expect(row.get("status").getOrThrow().asString().getValue(), "ok")
+            @Expect(row.get("deliveryStatus").getOrThrow().asString().getValue(), "delivered")
+            @Expect(row.get("diagnosticCode").getOrThrow().asString().getValue(), "web_fetch_proxy_connect_failed")
+            let diagnosticMessage = row.get("diagnosticMessage").getOrThrow().asString().getValue()
+            @Expect(diagnosticMessage.contains("407"), true)
+            @Expect(diagnosticMessage.contains("password="), false)
+        })
+    }
+
+    @TestCase
+    public func cronNewsBriefDoesNotInventRealtimeWhenAllSourcesFail(): Unit {
+        withCronRunnerTestHome({ storePath: Path =>
+            let job = CronJob(
+                "p5-all-sources-fail",
+                "create a current web brief",
+                CronSchedule.every(60000),
+                state: CronJobState(nextRunAtMs: 1),
+                deliveryChannel: "telegram",
+                deliveryTo: "chat-1",
+                deliveryMode: "announce"
+            )
+            cronSave(storePath, [job])
+            debugSetCronRunnerReplyForTest(Some({ _job: CronJob, _request: GatewaySessionRequest =>
+                "本轮未获取实时来源，未生成新闻正文。\nStatus: error\nDiagnostic: code=web_search_provider_challenge message=DuckDuckGo returned a bot challenge"
+            }))
+            let adapter = CronRunnerTestChannelAdapter("telegram", messageId: "tg-all-fail")
+            let service = cronRunnerTestGateway(adapter, "telegram", "")
+
+            let result = CronRunner.runJobOnceFromStore(Some(service), storePath, "p5-all-sources-fail", true)
+            @Expect(result.get("ok").getOrThrow().asBool().getValue(), true)
+            @Expect(adapter.sendCount, 1)
+            @Expect(adapter.lastText.contains("本轮未获取实时来源"), true)
+            @Expect(adapter.lastText.contains("未生成新闻正文"), true)
+            @Expect(adapter.lastText.contains("Fake News"), false)
+            @Expect(adapter.lastText.contains("2026-06-23 source marker"), false)
+
+            let runs = readCronRunLogEntriesForJob(storePath, "p5-all-sources-fail", limit: 10)
+            let row = runs.get("entries").getOrThrow().asArray()[0].asObject()
+            @Expect(row.get("status").getOrThrow().asString().getValue(), "ok")
+            @Expect(row.get("deliveryStatus").getOrThrow().asString().getValue(), "delivered")
+            @Expect(row.get("diagnosticCode").getOrThrow().asString().getValue(), "web_search_provider_challenge")
         })
     }
 

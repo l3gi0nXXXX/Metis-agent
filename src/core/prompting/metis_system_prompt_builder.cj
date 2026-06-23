@@ -2,6 +2,7 @@ package metis.core.prompting
 
 import magic.core.tool.Tool
 
+import metis.core.metisSafeRuneEllipsis
 import metis.core.config.CliConfig
 
 import std.collection.{ArrayList, HashMap}
@@ -41,6 +42,7 @@ public class MetisPromptRuntimeInfo {
     public var nativeApprovalUiAvailable: Bool = false
     public var repoRoot: String = ""
     public var capabilities: Array<String> = []
+    public var webAvailabilitySummary: String = ""
     public init() {}
 }
 
@@ -131,7 +133,9 @@ private let TOOL_SUMMARIES = HashMap<String, String>([
     ("ls", "List directory contents"),
     ("exec", "Run shell commands"),
     ("process", "Manage background commands"),
-    ("web_search", "Search the web"),
+    ("web_search", "Search current web through the configured provider or default keyless provider"),
+    ("web_fetch", "Fetch and extract one public HTTP/HTTPS URL through the native web runtime"),
+    ("web_extract", "Fetch and extract multiple public HTTP/HTTPS URLs through the native web runtime"),
     ("fileRead", "Read file contents"),
     ("fileWrite", "Create or overwrite files"),
     ("fileEdit", "Make precise edits to files"),
@@ -723,6 +727,24 @@ private func buildRuntimeLine(
     return "Runtime: ${String.join(parts.toArray(), delimiter: " | ")}"
 }
 
+private func hasVisibleWebTool(toolNames: Array<String>): Bool {
+    containsTool(toolNames, "web_search") || containsTool(toolNames, "web_fetch") || containsTool(toolNames, "web_extract")
+}
+
+private func buildWebAvailabilityLine(toolNames: Array<String>, runtimeInfo: MetisPromptRuntimeInfo): String {
+    if (!hasVisibleWebTool(toolNames)) {
+        return ""
+    }
+    let summary = metisSafeRuneEllipsis(
+        runtimeInfo.webAvailabilitySummary.replace("\r", " ").replace("\n", " ").trimAscii(),
+        360
+    )
+    if (summary.isEmpty()) {
+        return ""
+    }
+    "Web tools: ${summary}"
+}
+
 private func resolveDefaultParams(toolNames: Array<String>): MetisSystemPromptParams {
     let params = MetisSystemPromptParams()
     params.workspaceDir = CliConfig.cwd.toString()
@@ -1090,6 +1112,10 @@ public class MetisSystemPromptBuilder {
             runtimeCapabilities,
             params.defaultThinkLevel.trimAscii()
         ))
+        let webAvailabilityLine = buildWebAvailabilityLine(toolNames, params.runtimeInfo)
+        if (!webAvailabilityLine.isEmpty()) {
+            lines.add(webAvailabilityLine)
+        }
         lines.add("Reasoning: ${params.reasoningLevel.trimAscii()} (hidden unless on/stream). Toggle /reasoning; /status shows Reasoning when enabled.")
 
         let filtered = ArrayList<String>()

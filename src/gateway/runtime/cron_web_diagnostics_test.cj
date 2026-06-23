@@ -18,6 +18,18 @@ public class CronWebDiagnosticsTest {
         @Expect(blocked.code, "web_fetch_blocked_url")
         @Expect(blocked.message.contains("private network"), true)
 
+        let proxyFailure = cronWebDiagnosticFromText(
+            "Status: error\nDiagnostic: code=web_fetch_proxy_connect_failed message=provider HTTP proxy CONNECT failed: HTTP/1.1 407"
+        ).getOrThrow()
+        @Expect(proxyFailure.code, "web_fetch_proxy_connect_failed")
+        @Expect(proxyFailure.message.contains("407"), true)
+
+        let providerChallenge = cronWebDiagnosticFromText(
+            "Status: error\nDiagnostic: code=web_search_provider_challenge message=DuckDuckGo returned a bot challenge"
+        ).getOrThrow()
+        @Expect(providerChallenge.code, "web_search_provider_challenge")
+        @Expect(providerChallenge.message.contains("bot challenge"), true)
+
         @Expect(cronWebDiagnosticFromText("normal cron answer without diagnostics").isNone(), true)
     }
 

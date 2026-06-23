@@ -809,6 +809,56 @@ public class AgentBridgeRuntimeTest {
     }
 
     @TestCase
+    public func gatewayPolicyFilteredSystemPromptOmitsWebAvailabilityWhenWebDenied(): Unit {
+        let original = CliSettingManager.setting.gateway
+        try {
+            var updated = original
+            updated.tools.allow = []
+            updated.tools.deny = ["web"]
+            CliSettingManager.setting.gateway = updated
+            let prompt = gatewayPolicyFilteredSystemPrompt(channelName: "telegram", modelName: "test-model")
+
+            @Expect(prompt.contains("Web tools:"), false)
+            @Expect(prompt.contains("web_search: Search current web"), false)
+            @Expect(prompt.contains("web_fetch: Fetch and extract"), false)
+            @Expect(prompt.contains("web_extract: Fetch and extract"), false)
+        } finally {
+            CliSettingManager.setting.gateway = original
+        }
+    }
+
+    @TestCase
+    public func gatewayPolicyFilteredSystemPromptReportsDefaultDuckDuckGoAndProxyRouteWithoutSecrets(): Unit {
+        withAgentBridgeTempHome("metis-web-prompt-summary", { _home: Path =>
+            let oldTavilyKey = getVariable("TAVILY_API_KEY")
+            setVariable("TAVILY_API_KEY", "")
+            let root = JsonObject()
+            let tools = JsonObject()
+            let web = JsonObject()
+            web.put("proxy", JsonString("http://user:secret@127.0.0.1:7897"))
+            tools.put("web", web)
+            root.put("tools", tools)
+            MetisConfigManager.writeRoot(root)
+            try {
+                let prompt = gatewayPolicyFilteredSystemPrompt(channelName: "telegram", modelName: "test-model")
+
+                @Expect(prompt.contains("Web tools: searchProvider=duckduckgo"), true)
+                @Expect(prompt.contains("searchAvailable=true"), true)
+                @Expect(prompt.contains("fetchRoute=httpConnectTunnel"), true)
+                @Expect(prompt.contains("proxySource=explicit"), true)
+                @Expect(prompt.contains("secret"), false)
+                @Expect(prompt.contains("user:secret"), false)
+                @Expect(prompt.contains("Authorization"), false)
+            } finally {
+                match (oldTavilyKey) {
+                    case Some(value) => setVariable("TAVILY_API_KEY", value)
+                    case None => setVariable("TAVILY_API_KEY", "")
+                }
+            }
+        })
+    }
+
+    @TestCase
     public func gatewayAuthorizedAndPolicyFilteredChatToolNamesStayAligned(): Unit {
         let original = CliSettingManager.setting.gateway
         try {
