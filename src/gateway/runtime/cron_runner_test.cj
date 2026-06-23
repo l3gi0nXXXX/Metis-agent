@@ -877,7 +877,6 @@ public class CronRunnerDeliveryTest {
     @TestCase
     public func cronAllowlistShellToolFeedsLongUtf8DeliveryThroughSessionLoop(): Unit {
         withCronRunnerTestHome({ storePath: Path =>
-            let longNews = cronRunnerRepeatedText("新闻🙂中文段落；", 420)
             let job = CronJob(
                 "p5-allowlist-tool-delivery",
                 "collect news through shell",
@@ -899,7 +898,7 @@ public class CronRunnerDeliveryTest {
                 _streamChunkHook: Option<(String) -> Unit> =>
                     debugGatewayShellExecuteForTest(
                         CliConfig.cwd.toString(),
-                        "printf '${longNews}'",
+                        "printf '%05000d新闻🙂中文段落' 0",
                         None<String>,
                         Some(false)
                     )
