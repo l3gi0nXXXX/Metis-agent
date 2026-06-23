@@ -37,20 +37,25 @@ private func withTavilyToolTempHome<T>(label: String, block: () -> T): T {
     }
 }
 
+private class TavilyToolCallCounter {
+    public var calls: Int64 = 0
+    public init() {}
+}
+
 @Test
 public class TavilyToolTest {
     @TestCase
     public func emptyQueryFailsClosedBeforeAnyNetworkCall(): Unit {
         withTavilyToolTempHome("metis-tavily-empty-query", { =>
             setVariable("TAVILY_API_KEY", "test-key")
-            var calls: Int64 = 0
+            let counter = TavilyToolCallCounter()
             setTavilySearchHttpRunnerForTest(Some({ _request: TavilySearchHttpRequest =>
-                calls += 1
+                counter.calls += 1
                 TavilySearchHttpResponse(200, body: "{}")
             }))
             let tool = TavilyTool()
             @Expect(tool.search(""), "Search query cannot be empty")
-            @Expect(calls, 0)
+            @Expect(counter.calls, 0)
         })
     }
 
