@@ -213,6 +213,13 @@ public class ServicePluginHostTest {
         exists(path)
     }
 
+    private func waitForGitCodeLease(home: Path, instanceId!: String = "gitcode-monitor-1", timeoutMillis!: Int64 = 1000): Bool {
+        this.waitForFile(
+            home.join("service-plugin").join("runtime").join("gitcode-monitor").join("${instanceId}.lease.json"),
+            timeoutMillis: timeoutMillis
+        )
+    }
+
     private func waitForSupervisorRestart(serviceId: String, minRestartCount: Int64, timeoutMillis!: Int64 = 2000): Bool {
         var waited: Int64 = 0
         while (waited < timeoutMillis) {
@@ -673,12 +680,13 @@ public class ServicePluginHostTest {
             }
         })
 
-        withServicePluginHostTestHome("service-plugin-p3-missing-endpoint", { _home: Path =>
+        withServicePluginHostTestHome("service-plugin-p3-missing-endpoint", { home: Path =>
             this.registerGitCodeStdioScript(this.gitCodeLeaseScript(0, includeEndpoint: false))
             setServicePluginSupervisorConfigForTest(ServicePluginSupervisorConfig(enabled: true, intervalMs: 1000, healthTimeoutMs: 10, failureThreshold: 1, restartCooldownMs: 1000))
             try {
                 let started = ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000)
                 @Expect(started.ok, true)
+                @Expect(this.waitForGitCodeLease(home), true)
                 let tick = runServicePluginSupervisorTickForTest("gitcode-monitor", nowMs: 2000)
                 @Expect(tick.probe.diagnostic.contains("listener_endpoint_missing"), true)
                 @Expect(tick.classification.status, "healthy")
@@ -693,7 +701,7 @@ public class ServicePluginHostTest {
     @TestCase
     public func tP3B002SingleTimeoutThenHealthyClearsFailureWithoutRestart(): Unit {
         // T-P3-B-002.
-        withServicePluginHostTestHome("service-plugin-p3-timeout-recovers", { _home: Path =>
+        withServicePluginHostTestHome("service-plugin-p3-timeout-recovers", { home: Path =>
             this.registerGitCodeStdioScript(this.gitCodeLeaseScript(18181))
             let callLock = Mutex()
             let healthzCalls = ArrayList<Int64>()
@@ -711,6 +719,7 @@ public class ServicePluginHostTest {
             try {
                 let started = ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000)
                 @Expect(started.ok, true)
+                @Expect(this.waitForGitCodeLease(home), true)
                 let first = runServicePluginSupervisorTickForTest("gitcode-monitor", nowMs: 2000)
                 @Expect(first.classification.reason, "healthz_timeout")
                 @Expect(first.classification.shouldRecover, false)
@@ -732,7 +741,7 @@ public class ServicePluginHostTest {
     @TestCase
     public func tP3P001HealthyFakeServiceKeepsFiveMinuteProbeHealthy(): Unit {
         // T-P3-P-001.
-        withServicePluginHostTestHome("service-plugin-p3-five-minute-healthy", { _home: Path =>
+        withServicePluginHostTestHome("service-plugin-p3-five-minute-healthy", { home: Path =>
             this.registerGitCodeStdioScript(this.gitCodeLeaseScript(18182))
             setServicePluginSupervisorConfigForTest(ServicePluginSupervisorConfig(enabled: true, intervalMs: 1000, healthTimeoutMs: 10, failureThreshold: 2, restartCooldownMs: 1000))
             setServicePluginHealthzProbeForTest(Some({ _url: String, _timeoutMs: Int64 =>
@@ -741,6 +750,7 @@ public class ServicePluginHostTest {
             try {
                 let started = ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000)
                 @Expect(started.ok, true)
+                @Expect(this.waitForGitCodeLease(home), true)
                 let tick = runServicePluginSupervisorTickForTest("gitcode-monitor", nowMs: 1000 + 300000)
                 @Expect(tick.classification.status, "healthy")
                 match (getServicePluginSnapshot("gitcode-monitor")) {
@@ -760,7 +770,7 @@ public class ServicePluginHostTest {
     @TestCase
     public func tP3N001PersistentHealthzTimeoutMarksDegradedAndRestartsBounded(): Unit {
         // T-P3-N-001.
-        withServicePluginHostTestHome("service-plugin-p3-persistent-timeout", { _home: Path =>
+        withServicePluginHostTestHome("service-plugin-p3-persistent-timeout", { home: Path =>
             this.registerGitCodeStdioScript(this.gitCodeLeaseScript(18183))
             setServicePluginSupervisorConfigForTest(ServicePluginSupervisorConfig(enabled: true, intervalMs: 1000, healthTimeoutMs: 10, failureThreshold: 2, restartCooldownMs: 60000))
             setServicePluginHealthzProbeForTest(Some({ _url: String, _timeoutMs: Int64 =>
@@ -769,6 +779,7 @@ public class ServicePluginHostTest {
             try {
                 let started = ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000)
                 @Expect(started.ok, true)
+                @Expect(this.waitForGitCodeLease(home), true)
                 let first = runServicePluginSupervisorTickForTest("gitcode-monitor", nowMs: 2000)
                 @Expect(first.recovered, false)
                 let second = runServicePluginSupervisorTickForTest("gitcode-monitor", nowMs: 3000)
@@ -794,7 +805,7 @@ public class ServicePluginHostTest {
     @TestCase
     public func tP3N002PortReleaseTimeoutBlocksSecondPluginStart(): Unit {
         // T-P3-N-002.
-        withServicePluginHostTestHome("service-plugin-p3-port-owned", { _home: Path =>
+        withServicePluginHostTestHome("service-plugin-p3-port-owned", { home: Path =>
             this.registerGitCodeStdioScript(this.gitCodeLeaseScript(18184, stopUpdatesLease: false))
             setServicePluginSupervisorConfigForTest(ServicePluginSupervisorConfig(enabled: true, intervalMs: 1000, healthTimeoutMs: 10, failureThreshold: 1, restartCooldownMs: 1000))
             setServicePluginHealthzProbeForTest(Some({ _url: String, _timeoutMs: Int64 =>
@@ -804,6 +815,7 @@ public class ServicePluginHostTest {
             try {
                 let started = ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000)
                 @Expect(started.ok, true)
+                @Expect(this.waitForGitCodeLease(home), true)
                 let firstPid = match (getServicePluginSnapshot("gitcode-monitor")) {
                     case Some(snapshot) => snapshot.pid
                     case None => 0
