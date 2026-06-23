@@ -130,25 +130,30 @@ public class ServicePluginHostTest {
         "{\"type\":\"heartbeat\",\"frameId\":\"${frameId}\",\"serviceId\":\"gitcode-monitor\",\"method\":\"heartbeat\",\"payload\":{\"ok\":true,\"status\":\"alive\"}}"
     }
 
+    private func gitCodeWritebackResponderScript(responseLine: String, includeUnrelatedFrames!: Bool = false): String {
+        let dynamicResponseLine = responseLine.replace("__METIS_CORRELATION__", "'\"$corr\"'")
+        let heartbeatLine = this.gitCodeHeartbeatLine()
+        let unrelatedResponse = this.gitCodeWritebackResponseLine(frameId: "unrelated-response", correlationId: "corr-unrelated")
+        var script = "while IFS= read -r request; do case \"$request\" in *gitcode.writeback.apply_result*) corr=$(printf '%s\\n' \"$request\" | sed -n 's/.*\"correlationId\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p'); "
+        if (includeUnrelatedFrames) {
+            script += "printf '%s\\n' '${heartbeatLine}'; printf '%s\\n' '${unrelatedResponse}'; "
+        }
+        script += "printf '%s\\n' '${dynamicResponseLine}'; break;; esac; done; read ignored || true"
+        script
+    }
+
     private func gitCodeReentrantWritebackScript(includeUnrelatedFrames!: Bool = false): String {
         let initLine = this.gitCodeInitLine()
         let eventLine = this.gitCodeAcceptedEventLine()
-        let heartbeatLine = this.gitCodeHeartbeatLine()
-        let unrelatedResponse = this.gitCodeWritebackResponseLine(frameId: "unrelated-response", correlationId: "corr-unrelated")
-        let responseLine = this.gitCodeWritebackResponseLine()
-        var script = "printf '%s\\n' '${initLine}'; printf '%s\\n' '${eventLine}'; read request"
-        if (includeUnrelatedFrames) {
-            script += "; printf '%s\\n' '${heartbeatLine}'; printf '%s\\n' '${unrelatedResponse}'"
-        }
-        script += "; printf '%s\\n' '${responseLine}'; read ignored || true"
-        script
+        let responseLine = this.gitCodeWritebackResponseLine(correlationId: "__METIS_CORRELATION__")
+        "printf '%s\\n' '${initLine}'; printf '%s\\n' '${eventLine}'; ${this.gitCodeWritebackResponderScript(responseLine, includeUnrelatedFrames: includeUnrelatedFrames)}"
     }
 
     private func gitCodeMaintainerEmailWritebackScript(): String {
         let initLine = this.gitCodeInitLine()
         let eventLine = this.gitCodeAcceptedEventLine(eventId: "gitcode:Cangjie/community:issue:maintainer-email")
-        let responseLine = this.gitCodeWritebackMaintainerEmailResponseLine()
-        "printf '%s\\n' '${initLine}'; printf '%s\\n' '${eventLine}'; read request; printf '%s\\n' '${responseLine}'; read ignored || true"
+        let responseLine = this.gitCodeWritebackMaintainerEmailResponseLine(correlationId: "__METIS_CORRELATION__")
+        "printf '%s\\n' '${initLine}'; printf '%s\\n' '${eventLine}'; ${this.gitCodeWritebackResponderScript(responseLine)}"
     }
 
     private func gitCodeNoWritebackResponseScript(): String {
