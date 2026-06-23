@@ -617,6 +617,7 @@ private var servicePluginHealthzProbeForTest: Option<(String, Int64) -> ServiceP
     None<(String, Int64) -> ServicePluginHealthzProbeResult>
 private var servicePluginPortOwnerProbeForTest: Option<(Int64, Int64) -> Bool> =
     None<(Int64, Int64) -> Bool>
+private var servicePluginSupervisorAutoStartForTest = true
 private var servicePluginSupervisorWorkers = HashMap<String, ServicePluginSupervisorStopFlag>()
 private let servicePluginSupervisorLock = Mutex()
 
@@ -1081,6 +1082,7 @@ public func resetServicePluginHostForTest(): Unit {
     servicePluginCapabilityInvokerForTest = None<(ServicePluginRegistration, CapabilityInvokeRequest) -> CapabilityInvokeResult>
     servicePluginHealthzProbeForTest = None<(String, Int64) -> ServicePluginHealthzProbeResult>
     servicePluginPortOwnerProbeForTest = None<(Int64, Int64) -> Bool>
+    servicePluginSupervisorAutoStartForTest = true
     servicePluginSupervisorConfig = ServicePluginSupervisorConfig()
 }
 
@@ -1836,12 +1838,16 @@ private func servicePluginRunSupervisorTick(serviceId: String, nowMs: Int64, all
 public func runServicePluginSupervisorTickForTest(serviceId: String, nowMs!: Int64 = servicePluginNowMs()): ServicePluginSupervisorTickResult {
     // Manual supervisor tests own the probe sequence; stop the background worker
     // so fake healthz probes are not consumed by a concurrent tick.
+    servicePluginSupervisorAutoStartForTest = false
     servicePluginStopSupervisorWorker(serviceId.trimAscii())
     servicePluginRunSupervisorTick(serviceId, nowMs, allowRecover: true)
 }
 
 private func servicePluginStartSupervisorWorker(record: ServicePluginRuntimeRecord): Unit {
     if (!servicePluginSupervisorConfig.enabled) {
+        return
+    }
+    if (!servicePluginSupervisorAutoStartForTest) {
         return
     }
     let serviceId = record.registration.manifest.pluginId
