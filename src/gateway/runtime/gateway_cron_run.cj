@@ -117,6 +117,12 @@ private func gatewayCronRunResultForHuman(jobId: String, jo: JsonObject): String
         let err = gatewayCronRunJsonString(jo, "error")
         if (!err.isEmpty()) { lines.add("Error: ${err}") }
     }
+    let diagnosticCode = cronWebSanitizeDiagnosticMessage(gatewayCronRunJsonString(jo, "diagnosticCode"), maxRunes: 80)
+    if (!diagnosticCode.isEmpty()) {
+        let diagnosticMessage = cronWebSanitizeDiagnosticMessage(gatewayCronRunJsonString(jo, "diagnosticMessage"), maxRunes: 240)
+        let suffix = if (diagnosticMessage.isEmpty()) { "" } else { " ${diagnosticMessage}" }
+        lines.add("Diagnostic: ${diagnosticCode}${suffix}")
+    }
     String.join(lines.toArray(), delimiter: "\n")
 }
 

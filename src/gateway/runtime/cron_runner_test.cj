@@ -1,7 +1,13 @@
 package metis.gateway.runtime
 
 import metis.core.config.{CliConfig, CliSettingManager, MetisConfigManager, MetisProcessEnvironmentLock}
-import metis.gateway.tools.debugGatewayShellExecuteForTest
+import metis.core.{TavilySearchHttpRequest, TavilySearchHttpResponse, setTavilySearchHttpRunnerForTest}
+import metis.gateway.tools.{
+    GatewayWebProviderResolution,
+    GatewayWebToolset,
+    debugGatewayShellExecuteForTest,
+    setGatewayWebProviderResolverForTest
+}
 import metis.cron.{
     CronJob,
     CronJobState,
@@ -33,7 +39,9 @@ private func withCronRunnerTestHome<T>(block: (Path) -> T): T {
         try { remove(Path(home), recursive: true) } catch (_: Exception) { () }
         Directory.create(home, recursive: true)
         let oldHome = getVariable("METIS_HOME")
+        let oldTavilyKey = getVariable("TAVILY_API_KEY")
         setVariable("METIS_HOME", home)
+        setVariable("TAVILY_API_KEY", "")
         CliConfig.invalidatePathCache()
         MetisConfigManager.invalidate()
         CliSettingManager.invalidate()
@@ -43,10 +51,17 @@ private func withCronRunnerTestHome<T>(block: (Path) -> T): T {
             debugSetCronRunnerReplyForTest(None<(CronJob, GatewaySessionRequest) -> String>)
             debugSetCronRunnerBeforeExecuteForTest(None<(CronJob) -> Unit>)
             debugSetCronRunnerRunLogAppendForTest(None<() -> Unit>)
+            setGatewayAgentBridgeReplyRunnerForTest(None<(String, String, String, String, Bool, Option<(String) -> Unit>) -> String>)
+            setGatewayWebProviderResolverForTest(None<(String) -> GatewayWebProviderResolution>)
+            setTavilySearchHttpRunnerForTest(None<(TavilySearchHttpRequest) -> TavilySearchHttpResponse>)
             setCronWebhookHttpRunnerForTest(None<(CronWebhookHttpRequest) -> CronWebhookHttpResponse>)
             match (oldHome) {
                 case Some(value) => setVariable("METIS_HOME", value)
                 case None => setVariable("METIS_HOME", "")
+            }
+            match (oldTavilyKey) {
+                case Some(value) => setVariable("TAVILY_API_KEY", value)
+                case None => setVariable("TAVILY_API_KEY", "")
             }
             CliConfig.invalidatePathCache()
             MetisConfigManager.invalidate()
@@ -137,6 +152,25 @@ private func cronRunnerRepeatedText(text: String, count: Int64): String {
         out.append(text)
     }
     out.toString()
+}
+
+private func cronRunnerInstallFakeTavilyProvider(): Unit {
+    setVariable("TAVILY_API_KEY", "fake-tavily-key")
+    setGatewayWebProviderResolverForTest(Some({ _capability: String =>
+        GatewayWebProviderResolution(providerId: "tavily", available: true, status: "ok", supportsSearch: true)
+    }))
+    setTavilySearchHttpRunnerForTest(Some({ request: TavilySearchHttpRequest =>
+        @Expect(request.body.get("query").getOrThrow().asString().getValue(), "today huawei news")
+        TavilySearchHttpResponse(
+            200,
+            body: "{\"query\":\"today huawei news\",\"answer\":\"brief\",\"response_time\":0.5,\"results\":[{\"title\":\"Fake News A\",\"url\":\"https://example.com/a\",\"content\":\"A current fake summary\",\"score\":0.9},{\"title\":\"Fake News B\",\"url\":\"https://example.com/b\",\"content\":\"B current fake summary\",\"score\":0.8}]}"
+        )
+    }))
+}
+
+private func cronRunnerFakeWebBrief(): String {
+    "每日国际新闻简报\n" +
+        GatewayWebToolset().webSearchForTest("today huawei news", Some(2), Some("news"), Some("day"))
 }
 
 @Test
@@ -611,6 +645,182 @@ public class CronRunnerDeliveryTest {
             @Expect(row.get("deliveryError").getOrThrow().asString().getValue().contains("announce delivery failed"), true)
             @Expect(row.get("deliveryError").getOrThrow().asString().getValue().contains("fake send failed"), true)
             @Expect(row.get("diagnosticCode").getOrThrow().asString().getValue(), "")
+        })
+    }
+
+    @TestCase
+    public func m5p1ManualCronRunDeliversFakeWebBriefThroughGatewayLoop(): Unit {
+        withCronRunnerTestHome({ storePath: Path =>
+            let job = CronJob(
+                "m5-web-manual",
+                "create a current web brief",
+                CronSchedule.every(60000),
+                state: CronJobState(nextRunAtMs: 1),
+                deliveryChannel: "telegram",
+                deliveryTo: "chat-1",
+                deliveryMode: "announce"
+            )
+            cronSave(storePath, [job])
+            cronRunnerInstallFakeTavilyProvider()
+            setGatewayAgentBridgeReplyRunnerForTest(Some({
+                _conversationKey: String,
+                _prompt: String,
+                _channelName: String,
+                _agentId: String,
+                _streamingEnabled: Bool,
+                _streamChunkHook: Option<(String) -> Unit> =>
+                    cronRunnerFakeWebBrief()
+            }))
+            let adapter = CronRunnerTestChannelAdapter("telegram", messageId: "tg-m5")
+            let service = cronRunnerTestGateway(adapter, "telegram", "")
+
+            let result = CronRunner.runJobOnceFromStore(Some(service), storePath, "m5-web-manual", true)
+            @Expect(result.get("ok").getOrThrow().asBool().getValue(), true)
+            @Expect(result.get("ran").getOrThrow().asBool().getValue(), true)
+            @Expect(adapter.sendCount, 1)
+            @Expect(adapter.lastText.contains("每日国际新闻简报"), true)
+            @Expect(adapter.lastText.contains("Fake News A"), true)
+            @Expect(adapter.lastText.contains("Tool: web_search"), true)
+
+            let runs = readCronRunLogEntriesForJob(storePath, "m5-web-manual", limit: 10)
+            let row = runs.get("entries").getOrThrow().asArray()[0].asObject()
+            @Expect(row.get("status").getOrThrow().asString().getValue(), "ok")
+            @Expect(row.get("deliveryStatus").getOrThrow().asString().getValue(), "delivered")
+            @Expect(row.get("diagnosticCode").getOrThrow().asString().getValue(), "")
+        })
+    }
+
+    @TestCase
+    public func m5n1UnavailableWebProviderIsDeliveredAndRecordedAsBusinessDiagnostic(): Unit {
+        withCronRunnerTestHome({ storePath: Path =>
+            let job = CronJob(
+                "m5-web-unavailable",
+                "create a current web brief",
+                CronSchedule.every(60000),
+                state: CronJobState(nextRunAtMs: 1),
+                deliveryChannel: "telegram",
+                deliveryTo: "chat-1",
+                deliveryMode: "announce"
+            )
+            cronSave(storePath, [job])
+            setGatewayWebProviderResolverForTest(Some({ _capability: String =>
+                GatewayWebProviderResolution(
+                    providerId: "tavily",
+                    available: false,
+                    status: "web_provider_unavailable",
+                    message: "Real-time web search is unavailable because Tavily API key is not configured.",
+                    supportsSearch: true
+                )
+            }))
+            setGatewayAgentBridgeReplyRunnerForTest(Some({
+                _conversationKey: String,
+                _prompt: String,
+                _channelName: String,
+                _agentId: String,
+                _streamingEnabled: Bool,
+                _streamChunkHook: Option<(String) -> Unit> =>
+                    "无法生成实时新闻。\n" + GatewayWebToolset().webSearchForTest("today huawei news", Some(2), Some("news"), Some("day"))
+            }))
+            let adapter = CronRunnerTestChannelAdapter("telegram", messageId: "tg-m5")
+            let service = cronRunnerTestGateway(adapter, "telegram", "")
+
+            let result = CronRunner.runJobOnceFromStore(Some(service), storePath, "m5-web-unavailable", true)
+            @Expect(result.get("ok").getOrThrow().asBool().getValue(), true)
+            @Expect(adapter.sendCount, 1)
+            @Expect(adapter.lastText.contains("web_provider_unavailable"), true)
+            @Expect(adapter.lastText.contains("Fake News"), false)
+
+            let jobs = cronLoadOrEmpty(storePath)
+            @Expect(jobs[0].state.lastStatus, "success")
+            let runs = readCronRunLogEntriesForJob(storePath, "m5-web-unavailable", limit: 10)
+            let row = runs.get("entries").getOrThrow().asArray()[0].asObject()
+            @Expect(row.get("status").getOrThrow().asString().getValue(), "ok")
+            @Expect(row.get("deliveryStatus").getOrThrow().asString().getValue(), "delivered")
+            @Expect(row.get("diagnosticCode").getOrThrow().asString().getValue(), "web_provider_unavailable")
+            @Expect(row.get("diagnosticMessage").getOrThrow().asString().getValue().contains("Real-time web search"), true)
+        })
+    }
+
+    @TestCase
+    public func m5b1ShellDiagnosticKeepsPriorityAndDeliveryErrorStaysRedacted(): Unit {
+        withCronRunnerTestHome({ storePath: Path =>
+            let job = CronJob(
+                "m5-shell-web-boundary",
+                "create a current web brief",
+                CronSchedule.every(60000),
+                state: CronJobState(nextRunAtMs: 1),
+                deliveryChannel: "feishu",
+                deliveryTo: "chat-1",
+                deliveryMode: "announce",
+                deliveryAccountId: "tenant-a",
+                bestEffortDeliver: true
+            )
+            cronSave(storePath, [job])
+            debugSetCronRunnerReplyForTest(Some({ _job: CronJob, _request: GatewaySessionRequest =>
+                "Cron/headless shell execution blocked: cron cannot wait for interactive approval. " +
+                    "Diagnostic: code=cron_tool_exec_blocked reason=cron_headless_approval_required mode=deny allowlistCount=0.\n" +
+                    "Status: error\nDiagnostic: code=web_provider_unavailable message=token=raw-lower-secret 中文🙂"
+            }))
+            let secretError = "send failed Authorization: Bearer secret-delivery-token-never-visible token=raw-lower-secret https://user:pass@example.com/hook"
+            let adapter = CronRunnerTestChannelAdapter("feishu", failSend: true, failMessage: secretError)
+            let service = cronRunnerTestGateway(adapter, "feishu", "tenant-a")
+
+            let result = CronRunner.runJobOnceFromStore(Some(service), storePath, "m5-shell-web-boundary", true)
+            @Expect(result.get("ok").getOrThrow().asBool().getValue(), true)
+            let jobs = cronLoadOrEmpty(storePath)
+            @Expect(jobs[0].state.lastStatus, "success")
+            let runs = readCronRunLogEntriesForJob(storePath, "m5-shell-web-boundary", limit: 10)
+            let row = runs.get("entries").getOrThrow().asArray()[0].asObject()
+            @Expect(row.get("deliveryStatus").getOrThrow().asString().getValue(), "not-delivered")
+            @Expect(row.get("diagnosticCode").getOrThrow().asString().getValue(), "cron_tool_exec_blocked")
+            @Expect(row.get("diagnosticMessage").getOrThrow().asString().getValue().contains("cron_tool_exec_blocked"), true)
+            let deliveryError = row.get("deliveryError").getOrThrow().asString().getValue()
+            @Expect(deliveryError.contains("secret-delivery-token-never-visible"), false)
+            @Expect(deliveryError.contains("raw-lower-secret"), false)
+            @Expect(deliveryError.contains("user:pass"), false)
+            @Expect(deliveryError.contains("redacted"), true)
+        })
+    }
+
+    @TestCase
+    public func m5e2e1DueCronTickDeliversFakeWebBriefWithoutManualRunBypass(): Unit {
+        withCronRunnerTestHome({ storePath: Path =>
+            let job = CronJob(
+                "m5-web-due",
+                "create a current web brief",
+                CronSchedule.every(60000),
+                state: CronJobState(nextRunAtMs: 1),
+                deliveryChannel: "telegram",
+                deliveryTo: "chat-1",
+                deliveryMode: "announce"
+            )
+            cronSave(storePath, [job])
+            cronRunnerInstallFakeTavilyProvider()
+            setGatewayAgentBridgeReplyRunnerForTest(Some({
+                _conversationKey: String,
+                _prompt: String,
+                _channelName: String,
+                _agentId: String,
+                _streamingEnabled: Bool,
+                _streamChunkHook: Option<(String) -> Unit> =>
+                    cronRunnerFakeWebBrief()
+            }))
+            let adapter = CronRunnerTestChannelAdapter("telegram", messageId: "tg-m5")
+            let service = cronRunnerTestGateway(adapter, "telegram", "")
+            let runner = CronRunner(gatewayOpt: Some(service), storePath: storePath, cronEnabled: true)
+
+            runner.tick(nowOverride: Some<Int64>(2000))
+
+            @Expect(adapter.sendCount, 1)
+            @Expect(adapter.lastText.contains("Fake News A"), true)
+            let jobs = cronLoadOrEmpty(storePath)
+            @Expect(jobs[0].state.lastStatus, "success")
+            @Expect(jobs[0].state.nextRunAtMs > 2000, true)
+            let runs = readCronRunLogEntriesForJob(storePath, "m5-web-due", limit: 10)
+            let row = runs.get("entries").getOrThrow().asArray()[0].asObject()
+            @Expect(row.get("status").getOrThrow().asString().getValue(), "ok")
+            @Expect(row.get("deliveryStatus").getOrThrow().asString().getValue(), "delivered")
+            @Expect(row.get("summary").getOrThrow().asString().getValue().contains("Fake News B"), true)
         })
     }
 

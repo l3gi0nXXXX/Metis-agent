@@ -253,6 +253,24 @@ public class GatewayCronRunExecutorTest {
     }
 
     @TestCase
+    public func m5e2e2CronRunHumanOutputShowsWebDiagnosticWithoutRawJson(): Unit {
+        let human = gatewayCronRunWithExecutor(["cron", "run", "web-job"], { _jobId: String, _force: Bool =>
+            let out = cronRunTestResult(true, true)
+            out.put("diagnosticCode", JsonString("web_provider_unavailable"))
+            out.put("diagnosticMessage", JsonString("Real-time web search unavailable token=raw-lower-secret"))
+            out
+        })
+
+        @Expect(human[1], 0)
+        @Expect(human[0].contains("Cron run"), true)
+        @Expect(human[0].contains("Job: web-job"), true)
+        @Expect(human[0].contains("Diagnostic: web_provider_unavailable"), true)
+        @Expect(human[0].contains("raw-lower-secret"), false)
+        @Expect(human[0].contains("\"ok\""), false)
+        @Expect(human[0].contains("\"result\""), false)
+    }
+
+    @TestCase
     public func m3N1GatewayCronCliEnsureDoesNotOverwriteExistingLiveHook(): Unit {
         withGatewayCronRunTestHome({ _storePath: Path =>
             let liveHook = CronRunTestCallState()

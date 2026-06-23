@@ -2,7 +2,7 @@ package metis.gateway.runtime
 
 import metis.core.config.{CliConfig, CliSettingManager}
 import metis.core.memory.DreamingPhaseRuntime
-import metis.core.cronShellExecutionBlockedDiagnosticFromText
+import metis.core.{cronShellExecutionBlockedDiagnosticFromText, metisSafeRuneEllipsis}
 import metis.gateway.core.{
     AgentBridge,
     GatewayCronSessionReaperState,
@@ -436,8 +436,12 @@ public class CronRunner {
         options: CronSessionExecutionOptions,
         turnContextOverride: Option<GatewayTurnContext>
     ): String {
+        let startedAt = epochMs()
         match (cronRunnerReplyHookForTest()) {
-            case Some(hook) => return hook(j, request)
+            case Some(hook) =>
+                let answer = hook(j, request)
+                this.logCronWebOutcome(j, answer, epochMs() - startedAt)
+                return answer
             case None => ()
         }
         if (cronShouldRouteThroughDreaming(j)) {
@@ -452,11 +456,65 @@ public class CronRunner {
                             .string("systemEvent", j.systemEvent)
                             .object()
                     )
+                    this.logCronWebOutcome(j, result, epochMs() - startedAt)
                     return result
-                case None => return cronBridgeReply(bridge, request, prompt, options, turnContextOverride: turnContextOverride)
+                case None =>
+                    let answer = cronBridgeReply(bridge, request, prompt, options, turnContextOverride: turnContextOverride)
+                    this.logCronWebOutcome(j, answer, epochMs() - startedAt)
+                    return answer
             }
         }
-        cronBridgeReply(bridge, request, prompt, options, turnContextOverride: turnContextOverride)
+        let answer = cronBridgeReply(bridge, request, prompt, options, turnContextOverride: turnContextOverride)
+        this.logCronWebOutcome(j, answer, epochMs() - startedAt)
+        answer
+    }
+
+    private func cronWebProviderIdFromAnswer(answer: String): String {
+        let parts = answer.split("Provider:", 2)
+        if (parts.size < 2) {
+            return ""
+        }
+        metisSafeRuneEllipsis(gatewayLogRedactText(parts[1].split("\n", 2)[0].trimAscii()), 80)
+    }
+
+    private func logCronWebOutcome(j: CronJob, answer: String, durationMs: Int64): Unit {
+        let providerId = this.cronWebProviderIdFromAnswer(answer)
+        let safeDurationMs = if (durationMs >= 0) { durationMs } else { 0 }
+        match (cronWebDiagnosticFromText(answer)) {
+            case Some(diagnostic) =>
+                try {
+                    gatewayLogEventWarn(
+                        "gateway/cron",
+                        "cron.web_tool_unavailable",
+                        "cron web tool returned diagnostic",
+                        meta: gatewayLogMeta()
+                            .string("jobId", j.id)
+                            .string("diagnosticCode", diagnostic.code)
+                            .string("providerId", providerId)
+                            .int("durationMs", safeDurationMs)
+                            .object()
+                    )
+                } catch (_: Exception) {
+                    ()
+                }
+            case None =>
+                if (answer.contains("Tool: web_search") || answer.contains("Tool: web_fetch") || answer.contains("Tool: web_extract")) {
+                    try {
+                        gatewayLogEventInfo(
+                            "gateway/cron",
+                            "cron.web_tool_used",
+                            "cron web tool returned content",
+                            meta: gatewayLogMeta()
+                                .string("jobId", j.id)
+                                .string("providerId", providerId)
+                                .int("durationMs", safeDurationMs)
+                                .object()
+                        )
+                    } catch (_: Exception) {
+                        ()
+                    }
+                }
+        }
     }
 
     private func appendRunLogIsolated(
@@ -518,6 +576,28 @@ public class CronRunner {
 
     private func cronShellRunDiagnosticMessage(answer: String, errMsg: String): String {
         match (cronShellExecutionBlockedDiagnosticFromText(answer + "\n" + errMsg)) {
+            case Some(diagnostic) => diagnostic.message
+            case None => ""
+        }
+    }
+
+    private func cronDerivedRunDiagnosticCode(answer: String, errMsg: String): String {
+        let shellCode = cronShellRunDiagnosticCode(answer, errMsg)
+        if (!shellCode.isEmpty()) {
+            return shellCode
+        }
+        match (cronWebDiagnosticFromText(answer + "\n" + errMsg)) {
+            case Some(diagnostic) => diagnostic.code
+            case None => ""
+        }
+    }
+
+    private func cronDerivedRunDiagnosticMessage(answer: String, errMsg: String): String {
+        let shellMessage = cronShellRunDiagnosticMessage(answer, errMsg)
+        if (!shellMessage.isEmpty()) {
+            return shellMessage
+        }
+        match (cronWebDiagnosticFromText(answer + "\n" + errMsg)) {
             case Some(diagnostic) => diagnostic.message
             case None => ""
         }
@@ -902,15 +982,26 @@ public class CronRunner {
                 answer,
                 deliveryStatus,
                 deliveryError,
-                diagnosticCode: if (diagnosticCode.isEmpty()) { cronShellRunDiagnosticCode(answer, errMsg) } else { diagnosticCode },
-                diagnosticMessage: if (diagnosticMessage.isEmpty()) { cronShellRunDiagnosticMessage(answer, errMsg) } else { diagnosticMessage }
+                diagnosticCode: if (diagnosticCode.isEmpty()) { this.cronDerivedRunDiagnosticCode(answer, errMsg) } else { diagnosticCode },
+                diagnosticMessage: if (diagnosticMessage.isEmpty()) { this.cronDerivedRunDiagnosticMessage(answer, errMsg) } else { diagnosticMessage }
             )
         } catch (fatal: Exception) {
             let afterRun = epochMs()
             status = "error"
             errMsg = fatal.message
             this.finalizeError(j, startedAtMs, afterRun, errMsg)
-            this.appendRunLogIsolated(j, status, startedAtMs, afterRun, errMsg, answer, deliveryStatus, deliveryError)
+            this.appendRunLogIsolated(
+                j,
+                status,
+                startedAtMs,
+                afterRun,
+                errMsg,
+                answer,
+                deliveryStatus,
+                deliveryError,
+                diagnosticCode: this.cronDerivedRunDiagnosticCode(answer, errMsg),
+                diagnosticMessage: this.cronDerivedRunDiagnosticMessage(answer, errMsg)
+            )
             gatewayLogEventError(
                 "gateway/cron",
                 "cron.failed",
