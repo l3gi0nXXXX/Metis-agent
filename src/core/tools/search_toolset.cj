@@ -4,6 +4,7 @@ import magic.dsl.{tool, toolset}
 import magic.prelude.*
 import magic.log.LogUtils
 
+import metis.core.TavilySearchClient
 import metis.core.config.MetisConfigManager
 import metis.io.PrintUtils
 

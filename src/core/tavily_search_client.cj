@@ -1,9 +1,7 @@
-package metis.core.tools
+package metis.core
 
 import magic.jsonable.*
 import magic.utils.http.HttpUtils
-
-import metis.core.metisSafeRuneEllipsis
 
 import std.collection.{ArrayList, HashMap}
 import std.sync.Mutex

@@ -1,5 +1,6 @@
 package metis.core.tools
 
+import metis.core.{TavilySearchClient, TavilySearchHttpRequest, TavilySearchHttpResponse, setTavilySearchHttpRunnerForTest}
 import metis.core.config.{CliConfig, MetisConfigManager, MetisProcessEnvironmentLock}
 
 import std.env.{getVariable, setVariable}
