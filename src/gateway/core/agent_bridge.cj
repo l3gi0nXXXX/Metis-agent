@@ -19,7 +19,7 @@ import metis.gateway.{gatewayMcpGitCodeToolResultJson, gatewayMcpGitCodeToolResu
 import metis.gateway.reply_guard.normalizeGatewayAssistantFinalReply
 import metis.gateway.reply_guard.safeFallbackTextForBlockedAssistantReply
 import metis.gateway.session.GatewayTurnContext
-import metis.gateway.tools.{GatewayCanvasToolset, GatewayCronToolset, GatewayFeishuMediaToolset, GatewayFeishuOapiToolset, GatewayFSToolset, GatewayGatewayToolset, GatewayImageGenerationToolset, GatewayManagedSessionsToolset, GatewayMemoryToolset, GatewayMessageToolset, GatewayPlanToolset, GatewaySessionTranscriptToolset, GatewayShellToolset, GatewayTelegramMediaToolset, GatewayTtsToolset, GatewayVideoGenerationToolset, GatewayWeatherToolset, gatewayHandleNativeCommandLine, gatewayHandleSubagentsCommandLine}
+import metis.gateway.tools.{GatewayCanvasToolset, GatewayCronToolset, GatewayFeishuMediaToolset, GatewayFeishuOapiToolset, GatewayFSToolset, GatewayGatewayToolset, GatewayImageGenerationToolset, GatewayManagedSessionsToolset, GatewayMemoryToolset, GatewayMessageToolset, GatewayPlanToolset, GatewaySessionTranscriptToolset, GatewayShellToolset, GatewayTelegramMediaToolset, GatewayTtsToolset, GatewayVideoGenerationToolset, GatewayWeatherToolset, GatewayWebToolset, gatewayHandleNativeCommandLine, gatewayHandleSubagentsCommandLine}
 import std.collection.{HashMap, ArrayList, enumerate}
 import std.fs.Path
 import std.sync.Mutex
@@ -35,6 +35,7 @@ import magic.core.model.ChatModel
         GatewayFSToolset(),
         GatewayMemoryToolset(),
         GatewayWeatherToolset(),
+        GatewayWebToolset(),
         GatewayShellToolset(),
         GatewayPlanToolset(),
         GatewayCanvasToolset(),

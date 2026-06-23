@@ -76,6 +76,9 @@ public func gatewayMainRuntimeExtendedToolNames(): Array<String> {
         "gateway",
         "canvas",
         "cron",
+        "web_search",
+        "web_fetch",
+        "web_extract",
         "message",
         "sessions_spawn",
         "subagents"
@@ -121,6 +124,7 @@ private func runtimeToolCanonicalNames(raw: String): Array<String> {
         case "exec" | "shell" | "shell-execute" | "shell_execute" => ["shellexecute"]
         case "fs" | "file" | "files" | "filesystem" => ["fileread", "listdirectory", "globsearch", "grepsearch"]
         case "memory" => ["memory_search", "memory_get"]
+        case "web" => ["web_search", "web_fetch", "web_extract"]
         case "sessions" | "subagent" => ["sessions_spawn", "sessions_batch_delegate", "subagents"]
         case _ => [normalized]
     }
@@ -345,8 +349,8 @@ private func runtimeToolProfileSet(profile: String, inventory: Array<String>): H
     let normalized = runtimeToolNormalizeName(profile)
     let names: Array<String> = match (normalized) {
         case "minimal" => ["fileread", "listdirectory", "memory_search", "memory_get", "weather"]
-        case "coding" => ["fileread", "listdirectory", "globsearch", "grepsearch", "shellexecute", "update_plan", "memory_search", "memory_get"]
-        case "messaging" => ["message", "sessions_list", "sessions_history", "sessions_send", "session_status", "weather"]
+        case "coding" => ["fileread", "listdirectory", "globsearch", "grepsearch", "shellexecute", "update_plan", "memory_search", "memory_get", "web_search", "web_fetch", "web_extract"]
+        case "messaging" => ["message", "sessions_list", "sessions_history", "sessions_send", "session_status", "weather", "web_search", "web_fetch", "web_extract"]
         case "full" => Array<String>() // Empty means all inventory for the full profile.
         case _ => Array<String>()
     }

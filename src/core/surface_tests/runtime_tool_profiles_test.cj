@@ -98,6 +98,43 @@ public class RuntimeToolProfilesTest {
     }
 
     @TestCase
+    public func webToolsAreExtendedAndProfileScopedGatewayTools(): Unit {
+        @Expect(runtimeToolNamesContain(gatewayMainRuntimeExtendedToolNames(), "web_search"), true)
+        @Expect(runtimeToolNamesContain(gatewayMainRuntimeExtendedToolNames(), "web_fetch"), true)
+        @Expect(runtimeToolNamesContain(gatewayMainRuntimeExtendedToolNames(), "web_extract"), true)
+
+        let inventory = ["fileRead", "weather", "message", "web_search", "web_fetch", "web_extract"]
+        let defaultFullPolicy = resolveRuntimeToolPolicyFromRoot(JsonObject(), inventory)
+        @Expect(runtimeToolNamesContain(defaultFullPolicy.visibleTools, "web_search"), true)
+
+        let minimalRoot = JsonObject()
+        minimalRoot.put("tools", this.toolPolicy(profile: "minimal"))
+        let minimalProfile = resolveRuntimeToolPolicyFromRoot(minimalRoot, inventory)
+        @Expect(runtimeToolNamesContain(minimalProfile.visibleTools, "weather"), true)
+        @Expect(runtimeToolNamesContain(minimalProfile.visibleTools, "web_search"), false)
+
+        let codingRoot = JsonObject()
+        codingRoot.put("tools", this.toolPolicy(profile: "coding"))
+        let coding = resolveRuntimeToolPolicyFromRoot(codingRoot, inventory)
+        @Expect(runtimeToolNamesContain(coding.visibleTools, "web_search"), true)
+        @Expect(runtimeToolNamesContain(coding.visibleTools, "web_fetch"), true)
+        @Expect(runtimeToolNamesContain(coding.visibleTools, "web_extract"), true)
+
+        let messagingRoot = JsonObject()
+        messagingRoot.put("tools", this.toolPolicy(profile: "messaging"))
+        let messaging = resolveRuntimeToolPolicyFromRoot(messagingRoot, inventory)
+        @Expect(runtimeToolNamesContain(messaging.visibleTools, "message"), true)
+        @Expect(runtimeToolNamesContain(messaging.visibleTools, "web_search"), true)
+
+        let deniedRoot = JsonObject()
+        deniedRoot.put("tools", this.toolPolicy(deny: ["web"]))
+        let denied = resolveRuntimeToolPolicyFromRoot(deniedRoot, inventory)
+        @Expect(runtimeToolNamesContain(denied.visibleTools, "web_search"), false)
+        @Expect(runtimeToolNamesContain(denied.visibleTools, "web_fetch"), false)
+        @Expect(runtimeToolNamesContain(denied.visibleTools, "web_extract"), false)
+    }
+
+    @TestCase
     public func execAliasDenyHidesShellExecuteAndRejectsInvocation(): Unit {
         let agents = JsonArray([])
         agents.add(this.agentEntry("agent-a", tools: this.toolPolicy(deny: ["exec"])))

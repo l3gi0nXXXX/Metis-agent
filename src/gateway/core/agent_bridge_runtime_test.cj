@@ -528,6 +528,14 @@ public class AgentBridgeRuntimeTest {
     }
 
     @TestCase
+    public func gatewayDefaultChatRuntimeNowIncludesWebTools(): Unit {
+        let names = gatewayDefaultChatToolNames()
+        @Expect(names.contains("web_search"), true)
+        @Expect(names.contains("web_fetch"), true)
+        @Expect(names.contains("web_extract"), true)
+    }
+
+    @TestCase
     public func gatewayDefaultChatRuntimeNowIncludesVideoGenerationTool(): Unit {
         let names = gatewayDefaultChatToolNames()
         @Expect(names.contains("gateway_video_generate"), true)
@@ -656,6 +664,24 @@ public class AgentBridgeRuntimeTest {
             @Expect(names.contains("message"), false)
             @Expect(names.contains("subagents"), false)
             @Expect(names.contains("sessions_spawn"), true)
+        } finally {
+            CliSettingManager.setting.gateway = original
+        }
+    }
+
+    @TestCase
+    public func gatewayPolicyFilteredChatToolNamesCanDenyWebTools(): Unit {
+        let original = CliSettingManager.setting.gateway
+        try {
+            var updated = original
+            updated.tools.allow = []
+            updated.tools.deny = ["web"]
+            CliSettingManager.setting.gateway = updated
+            let names = gatewayPolicyFilteredChatToolNames()
+            @Expect(names.contains("weather"), true)
+            @Expect(names.contains("web_search"), false)
+            @Expect(names.contains("web_fetch"), false)
+            @Expect(names.contains("web_extract"), false)
         } finally {
             CliSettingManager.setting.gateway = original
         }
