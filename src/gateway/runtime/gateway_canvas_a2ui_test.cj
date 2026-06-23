@@ -13,14 +13,16 @@ import stdx.encoding.json.{JsonArray, JsonBool, JsonObject, JsonString}
 import stdx.net.http.*
 
 private func withGatewayCanvasA2uiTestRoot<T>(block: (Path) -> T): T {
-    let root = Path("/tmp/metis-canvas-a2ui-test-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
-    try { remove(root, recursive: true) } catch (_: Exception) { () }
-    Directory.create(root, recursive: true)
-    try {
-        return block(root)
-    } finally {
+    debugWithGatewayCanvasHostRuntimeForTest<T>({ =>
+        let root = Path("/tmp/metis-canvas-a2ui-test-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
         try { remove(root, recursive: true) } catch (_: Exception) { () }
-    }
+        Directory.create(root, recursive: true)
+        try {
+            block(root)
+        } finally {
+            try { remove(root, recursive: true) } catch (_: Exception) { () }
+        }
+    })
 }
 
 private func a2uiTestConfig(root: String, port: Int64): GatewayConfig {
@@ -66,7 +68,7 @@ private class GatewayCanvasA2uiHttpProbeResult {
 }
 
 private func a2uiTestPort(): Int64 {
-    25000 + (DateTime.now().toUnixTimeStamp().toNanoseconds() % 15000)
+    debugNextGatewayCanvasHostRuntimePortForTest()
 }
 
 private func a2uiReadHttpBody(response: HttpResponse): String {
@@ -91,7 +93,7 @@ private func a2uiReadHttpBody(response: HttpResponse): String {
 
 private func a2uiFetch(url: String, method!: String = "GET"): GatewayCanvasA2uiHttpProbeResult {
     var attempts: Int64 = 0
-    while (attempts < 8) {
+    while (attempts < 30) {
         attempts += 1
         try {
             let builder = ClientBuilder()
@@ -112,7 +114,7 @@ private func a2uiFetch(url: String, method!: String = "GET"): GatewayCanvasA2uiH
                 client.close()
             }
         } catch (_: Exception) {
-            sleep(Duration.millisecond * 50)
+            sleep(Duration.millisecond * 100)
         }
     }
     GatewayCanvasA2uiHttpProbeResult(0, "", "")

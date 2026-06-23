@@ -658,9 +658,29 @@ private func gatewayCanvasFilesystemSignature(root: Path): String {
 }
 
 private var gatewayCanvasLiveReloadPublisherForTest: Option<(JsonObject) -> Int64> = None<(JsonObject) -> Int64>
+private let gatewayCanvasHostRuntimeTestLock = Mutex()
+private let gatewayCanvasHostRuntimeTestPortLock = Mutex()
+private var gatewayCanvasHostRuntimeNextTestPort: Int64 = 41000
 
 public func debugSetGatewayCanvasLiveReloadPublisherForTest(runner: Option<(JsonObject) -> Int64>): Unit {
     gatewayCanvasLiveReloadPublisherForTest = runner
+}
+
+public func debugWithGatewayCanvasHostRuntimeForTest<T>(block: () -> T): T {
+    synchronized(gatewayCanvasHostRuntimeTestLock) {
+        block()
+    }
+}
+
+public func debugNextGatewayCanvasHostRuntimePortForTest(): Int64 {
+    synchronized(gatewayCanvasHostRuntimeTestPortLock) {
+        let port = gatewayCanvasHostRuntimeNextTestPort
+        gatewayCanvasHostRuntimeNextTestPort += 1
+        if (gatewayCanvasHostRuntimeNextTestPort > 61000) {
+            gatewayCanvasHostRuntimeNextTestPort = 41000
+        }
+        port
+    }
 }
 
 private func gatewayCanvasPublishLiveReloadEvent(payload: JsonObject): Int64 {

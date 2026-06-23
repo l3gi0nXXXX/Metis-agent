@@ -19,24 +19,26 @@ import stdx.encoding.json.{JsonArray, JsonObject, JsonString}
 import stdx.net.http.*
 
 private func withGatewayCanvasTestRoot<T>(block: (Path) -> T): T {
-    let root = Path("/tmp/metis-canvas-host-test-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
-    try {
-        if (exists(root)) {
-            remove(root, recursive: true)
-        }
-    } catch (_: Exception) {
-        ()
-    }
-    Directory.create(root, recursive: true)
-    try {
-        return block(root)
-    } finally {
+    debugWithGatewayCanvasHostRuntimeForTest<T>({ =>
+        let root = Path("/tmp/metis-canvas-host-test-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
         try {
-            remove(root, recursive: true)
+            if (exists(root)) {
+                remove(root, recursive: true)
+            }
         } catch (_: Exception) {
             ()
         }
-    }
+        Directory.create(root, recursive: true)
+        try {
+            block(root)
+        } finally {
+            try {
+                remove(root, recursive: true)
+            } catch (_: Exception) {
+                ()
+            }
+        }
+    })
 }
 
 private func canvasTestUserSettings(enabled: Bool, root: String, port!: Int64 = 18793, openClawCompat!: Bool = false): GatewayUserSettings {
@@ -93,7 +95,7 @@ private class CanvasHttpProbeResult {
 }
 
 private func canvasTestPort(): Int64 {
-    20000 + (DateTime.now().toUnixTimeStamp().toNanoseconds() % 20000)
+    debugNextGatewayCanvasHostRuntimePortForTest()
 }
 
 private func canvasReadHttpBody(response: HttpResponse): String {
@@ -118,7 +120,7 @@ private func canvasReadHttpBody(response: HttpResponse): String {
 
 private func canvasFetch(url: String, method!: String = "GET"): CanvasHttpProbeResult {
     var attempts: Int64 = 0
-    while (attempts < 8) {
+    while (attempts < 30) {
         attempts += 1
         try {
             let builder = ClientBuilder()
@@ -139,7 +141,7 @@ private func canvasFetch(url: String, method!: String = "GET"): CanvasHttpProbeR
                 client.close()
             }
         } catch (_: Exception) {
-            sleep(Duration.millisecond * 50)
+            sleep(Duration.millisecond * 100)
         }
     }
     CanvasHttpProbeResult(0, "", "")
@@ -501,10 +503,10 @@ public class GatewayCanvasHostRootStateTest {
             }))
             try {
                 GatewayCanvasHostRuntime.startIfNeeded(cfg)
-                @Expect(canvasWaitUntil(1000, { => canvasTestBool(GatewayCanvasHostRuntime.debugLiveReloadStateForTest(), "running") }), true)
+                @Expect(canvasWaitUntil(3000, { => canvasTestBool(GatewayCanvasHostRuntime.debugLiveReloadStateForTest(), "running") }), true)
                 sleep(Duration.millisecond * 320)
                 File.writeTo(root.join("app.js"), "console.log('reload')".toArray())
-                @Expect(canvasWaitUntil(2000, { =>
+                @Expect(canvasWaitUntil(8000, { =>
                     synchronized(publishLock) {
                         payloads.size > 0
                     }

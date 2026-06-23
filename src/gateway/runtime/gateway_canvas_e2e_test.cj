@@ -28,15 +28,17 @@ private class GatewayCanvasE2eHttpResult {
 }
 
 private func withGatewayCanvasE2eRoot<T>(block: (Path) -> T): T {
-    let root = Path("/tmp/metis-canvas-e2e-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
-    try { remove(root, recursive: true) } catch (_: Exception) { () }
-    Directory.create(root, recursive: true)
-    try {
-        return block(root)
-    } finally {
+    debugWithGatewayCanvasHostRuntimeForTest<T>({ =>
+        let root = Path("/tmp/metis-canvas-e2e-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
         try { remove(root, recursive: true) } catch (_: Exception) { () }
-        debugSetGatewayCanvasToolArtifactRootForTest(None<Path>)
-    }
+        Directory.create(root, recursive: true)
+        try {
+            block(root)
+        } finally {
+            try { remove(root, recursive: true) } catch (_: Exception) { () }
+            debugSetGatewayCanvasToolArtifactRootForTest(None<Path>)
+        }
+    })
 }
 
 private func canvasE2eConfig(root: Path, port: Int64): GatewayConfig {
@@ -50,7 +52,7 @@ private func canvasE2eConfig(root: Path, port: Int64): GatewayConfig {
 }
 
 private func canvasE2ePort(): Int64 {
-    22000 + (DateTime.now().toUnixTimeStamp().toNanoseconds() % 20000)
+    debugNextGatewayCanvasHostRuntimePortForTest()
 }
 
 private func canvasE2eString(obj: JsonObject, key: String): String {
@@ -85,7 +87,7 @@ private func canvasE2eReadBody(response: HttpResponse): String {
 
 private func canvasE2eFetch(url: String): GatewayCanvasE2eHttpResult {
     var attempts: Int64 = 0
-    while (attempts < 8) {
+    while (attempts < 30) {
         attempts += 1
         try {
             let builder = ClientBuilder()
@@ -99,7 +101,7 @@ private func canvasE2eFetch(url: String): GatewayCanvasE2eHttpResult {
                 client.close()
             }
         } catch (_: Exception) {
-            sleep(Duration.millisecond * 50)
+            sleep(Duration.millisecond * 100)
         }
     }
     GatewayCanvasE2eHttpResult(0, "", "")
@@ -107,7 +109,7 @@ private func canvasE2eFetch(url: String): GatewayCanvasE2eHttpResult {
 
 private func canvasE2ePostJson(url: String, body: String): GatewayCanvasE2eHttpResult {
     var attempts: Int64 = 0
-    while (attempts < 8) {
+    while (attempts < 30) {
         attempts += 1
         try {
             let builder = ClientBuilder()
@@ -128,7 +130,7 @@ private func canvasE2ePostJson(url: String, body: String): GatewayCanvasE2eHttpR
                 client.close()
             }
         } catch (_: Exception) {
-            sleep(Duration.millisecond * 50)
+            sleep(Duration.millisecond * 100)
         }
     }
     GatewayCanvasE2eHttpResult(0, "", "")
