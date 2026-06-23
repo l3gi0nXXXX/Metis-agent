@@ -1,12 +1,13 @@
 package metis.gateway.tools
 
 import metis.core.config.{CliConfig, MetisConfigManager, MetisProcessEnvironmentLock}
-import metis.core.{TavilySearchHttpRequest, TavilySearchHttpResponse, setTavilySearchHttpRunnerForTest}
+import metis.core.{DuckDuckGoSearchHttpRequest, DuckDuckGoSearchHttpResponse, TavilySearchHttpRequest, TavilySearchHttpResponse, setDuckDuckGoSearchHttpRunnerForTest, setTavilySearchHttpRunnerForTest}
 
 import std.env.{getVariable, setVariable}
 import std.fs.{Directory, Path, remove}
 import std.time.DateTime
 import std.unittest.testmacro.*
+import stdx.encoding.json.{JsonObject, JsonString}
 
 private func withGatewayWebToolsetTempHome<T>(label: String, block: () -> T): T {
     synchronized(MetisProcessEnvironmentLock) {
@@ -31,6 +32,7 @@ private func withGatewayWebToolsetTempHome<T>(label: String, block: () -> T): T 
                 case None => setVariable("TAVILY_API_KEY", "")
             }
             setGatewayWebProviderResolverForTest(None<(String) -> GatewayWebProviderResolution>)
+            setDuckDuckGoSearchHttpRunnerForTest(None<(DuckDuckGoSearchHttpRequest) -> DuckDuckGoSearchHttpResponse>)
             setTavilySearchHttpRunnerForTest(None<(TavilySearchHttpRequest) -> TavilySearchHttpResponse>)
             setGatewayWebFetchHttpRunnerForTest(None<(GatewayWebFetchHttpRequest) -> GatewayWebFetchHttpResponse>)
             CliConfig.invalidatePathCache()
@@ -53,10 +55,11 @@ public class GatewayWebToolsetTest {
             @Expect(available.supportsSearch, true)
 
             setVariable("TAVILY_API_KEY", "")
-            let unavailable = resolveGatewayWebProvider("search")
-            @Expect(unavailable.available, false)
-            @Expect(unavailable.status, "web_provider_unavailable")
-            @Expect(unavailable.providerId, "tavily")
+            let fallback = resolveGatewayWebProvider("search")
+            @Expect(fallback.available, true)
+            @Expect(fallback.status, "ok")
+            @Expect(fallback.providerId, "duckduckgo")
+            @Expect(fallback.requiresCredential, false)
 
             let unknown = resolveGatewayWebProvider("unknown")
             @Expect(unknown.available, false)
@@ -111,6 +114,71 @@ public class GatewayWebToolsetTest {
             @Expect(out.contains("News A"), true)
             @Expect(out.contains("https://example.com/b"), true)
             @Expect(out.contains("\"result\""), false)
+        })
+    }
+
+    @TestCase
+    public func webSearchFallsBackToDuckDuckGoWithoutTavilyKey(): Unit {
+        withGatewayWebToolsetTempHome("metis-web-search-duckduckgo", { =>
+            setVariable("TAVILY_API_KEY", "")
+            setDuckDuckGoSearchHttpRunnerForTest(Some({ request: DuckDuckGoSearchHttpRequest =>
+                @Expect(request.url.contains("q=today+news"), true)
+                let html =
+                    "<html><body>" +
+                    "<a class=\"result__a\" href=\"https://example.com/a\">News A</a>" +
+                    "<a class=\"result__snippet\">A summary</a>" +
+                    "<a class=\"result__a\" href=\"https://example.com/b\">News B</a>" +
+                    "<a class=\"result__snippet\">B summary</a>" +
+                    "</body></html>"
+                DuckDuckGoSearchHttpResponse(200, bodyBytes: html.toArray())
+            }))
+
+            let out = GatewayWebToolset().webSearchForTest("today news", Some(2), None<String>, None<String>)
+
+            @Expect(out.contains("Status: ok"), true)
+            @Expect(out.contains("Tool: web_search"), true)
+            @Expect(out.contains("Provider: duckduckgo"), true)
+            @Expect(out.contains("News A"), true)
+            @Expect(out.contains("https://example.com/b"), true)
+            @Expect(out.contains("\"result\""), false)
+        })
+    }
+
+    @TestCase
+    public func webSearchDuckDuckGoChallengeReturnsStableDiagnostic(): Unit {
+        withGatewayWebToolsetTempHome("metis-web-search-duckduckgo-challenge", { =>
+            setDuckDuckGoSearchHttpRunnerForTest(Some({ _request: DuckDuckGoSearchHttpRequest =>
+                DuckDuckGoSearchHttpResponse(200, bodyBytes: "<html>captcha challenge verify you are a human</html>".toArray())
+            }))
+
+            let out = GatewayWebToolset().webSearchForTest("today news", Some(2), None<String>, None<String>)
+
+            @Expect(out.contains("Status: error"), true)
+            @Expect(out.contains("Diagnostic: code=web_search_provider_challenge"), true)
+            @Expect(out.contains("\"ok\""), false)
+        })
+    }
+
+    @TestCase
+    public func explicitUnknownSearchProviderDoesNotFallbackSilently(): Unit {
+        withGatewayWebToolsetTempHome("metis-web-search-unknown-provider", { =>
+            let root = JsonObject()
+            let tools = JsonObject()
+            let web = JsonObject()
+            web.put("searchProvider", JsonString("missing-provider"))
+            tools.put("web", web)
+            root.put("tools", tools)
+            MetisConfigManager.writeRoot(root)
+
+            let provider = resolveGatewayWebProvider("search")
+            @Expect(provider.available, false)
+            @Expect(provider.providerId, "missing_provider")
+            @Expect(provider.status, "web_provider_unsupported_provider")
+
+            let out = GatewayWebToolset().webSearchForTest("today news", Some(2), None<String>, None<String>)
+            @Expect(out.contains("Status: error"), true)
+            @Expect(out.contains("web_provider_unsupported_provider"), true)
+            @Expect(out.contains("Provider: duckduckgo"), false)
         })
     }
 

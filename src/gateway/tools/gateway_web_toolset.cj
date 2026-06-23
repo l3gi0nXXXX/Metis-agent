@@ -3,7 +3,7 @@ package metis.gateway.tools
 import magic.dsl.{tool, toolset}
 import magic.prelude.*
 
-import metis.core.TavilySearchClient
+import metis.core.{DuckDuckGoSearchClient, TavilySearchClient}
 import metis.core.config.MetisConfigManager
 import metis.core.metisSafeRuneEllipsis
 
@@ -33,9 +33,16 @@ public func gatewayWebHumanDiagnostic(code: String, message: String): String {
 }
 
 private func gatewayWebProviderDiagnostic(resolution: GatewayWebProviderResolution): String {
+    var message = if (resolution.message.trimAscii().isEmpty()) { "Web provider is unavailable." } else { resolution.message }
+    if (!resolution.configPath.isEmpty()) {
+        message += " Config path: ${resolution.configPath}."
+    }
+    if (resolution.envVars.size > 0) {
+        message += " Env: ${String.join(resolution.envVars, delimiter: ", ")}."
+    }
     gatewayWebHumanDiagnostic(
         if (resolution.status.trimAscii().isEmpty()) { "web_provider_unavailable" } else { resolution.status },
-        if (resolution.message.trimAscii().isEmpty()) { "Web provider is unavailable." } else { resolution.message }
+        message
     )
 }
 
@@ -169,20 +176,38 @@ public class GatewayWebToolset {
         if (!provider.available || !provider.supportsSearch) {
             return gatewayWebProviderDiagnostic(provider)
         }
-        let apiKey = gatewayWebConfiguredTavilyApiKey()
-        if (apiKey.isEmpty()) {
-            return gatewayWebHumanDiagnostic(
-                "web_provider_unavailable",
-                "Real-time web search is unavailable because Tavily API key is not configured."
-            )
+        if (provider.providerId == "tavily") {
+            let apiKey = gatewayWebConfiguredTavilyApiKey()
+            if (apiKey.isEmpty()) {
+                return gatewayWebProviderDiagnostic(resolveTavilyProviderAvailability())
+            }
+            let client = TavilySearchClient(apiKey)
+            let response = try {
+                client.search(safeQuery, maxResults: gatewayWebSearchLimit(limit))
+            } catch (e: Exception) {
+                return gatewayWebHumanDiagnostic("web_search_failed", e.message)
+            }
+            return "Status: ok\nTool: web_search\nProvider: ${provider.providerId}\n\n" + client.renderSearchResponse(response)
         }
-        let client = TavilySearchClient(apiKey)
-        let response = try {
-            client.search(safeQuery, maxResults: gatewayWebSearchLimit(limit))
-        } catch (e: Exception) {
-            return gatewayWebHumanDiagnostic("web_search_failed", e.message)
+        if (provider.providerId == "duckduckgo") {
+            let client = DuckDuckGoSearchClient()
+            let response = try {
+                client.search(safeQuery, limit: gatewayWebSearchLimit(limit))
+            } catch (e: Exception) {
+                let msg = e.message.trimAscii()
+                if (msg.startsWith("web_search_provider_challenge")) {
+                    return gatewayWebHumanDiagnostic("web_search_provider_challenge", msg)
+                }
+                return gatewayWebHumanDiagnostic("web_search_failed", msg)
+            }
+            return "Status: ok\nTool: web_search\nProvider: ${provider.providerId}\n\n" + client.renderSearchResponse(response)
         }
-        "Status: ok\nTool: web_search\nProvider: ${provider.providerId}\n\n" + client.renderSearchResponse(response)
+        gatewayWebProviderDiagnostic(GatewayWebProviderResolution(
+            providerId: provider.providerId,
+            available: false,
+            status: "web_provider_unsupported_provider",
+            message: "Unsupported web search provider '${provider.providerId}'."
+        ))
     }
 
     private func webFetchInternal(url: String, extractMode: Option<String>, maxChars: Option<Int64>): String {
