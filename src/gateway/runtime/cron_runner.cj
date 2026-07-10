@@ -910,15 +910,15 @@ public class CronRunner {
                     case None => ()
                 }
             }
-            let jobRequest = cronBuildSessionRequestWithPrompt(j, startedAtMs, effectivePrompt)
-            let options = cronBuildSessionExecutionOptions(j)
-            let turnContextOverride = Some(
-                cronTurnContextWithExecutionOptions(
-                    gatewayResolveSessionContextWithAgentRoute(jobRequest).turnContext,
-                    options
-                )
-            )
             if (!skipAgent) {
+                let jobRequest = cronBuildSessionRequestWithPrompt(j, startedAtMs, effectivePrompt)
+                let options = cronBuildSessionExecutionOptions(j)
+                let turnContextOverride = Some(
+                    cronTurnContextWithExecutionOptions(
+                        gatewayResolveSessionContextWithAgentRoute(jobRequest).turnContext,
+                        options
+                    )
+                )
                 let jobBridge = gatewayBridgeForSessionRequest(CliSettingManager.readGatewaySettings(), jobRequest)
                 while (attempt < maxAttempts) {
                     try {
