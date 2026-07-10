@@ -2,6 +2,8 @@ package metis.core.surface_tests
 
 import metis.core.*
 
+import std.collection.ArrayList
+import std.time.*
 import std.unittest.testmacro.*
 import stdx.encoding.json.{JsonBool, JsonObject}
 
@@ -69,5 +71,46 @@ public class GatewayToolRuntimeContextTest {
         @Expect(context.toolExecAllowlist.size, 2)
         @Expect(context.toolExecAllowlist[0], "curl")
         @Expect(context.toolExecAllowlist[1], "python3 -m")
+    }
+
+    @TestCase
+    public func runtimeContextStacksStayIsolatedAcrossConcurrentThreads(): Unit {
+        let futures = ArrayList<Future<String>>()
+        var worker: Int64 = 0
+        while (worker < 8) {
+            let workerId = worker
+            futures.add(spawn {
+                gatewayWithToolRuntimeContext(
+                    GatewayToolRuntimeContext(
+                        "cron",
+                        cronJobId: "ctx-${workerId}",
+                        toolExecMode: "allowlist",
+                        toolExecAllowlist: ["cmd-${workerId}"]
+                    ),
+                    { =>
+                        var ok = true
+                        var observed = ""
+                        var i: Int64 = 0
+                        while (i < 20) {
+                            let current = gatewayCurrentToolRuntimeContext().getOrThrow()
+                            observed = current.cronJobId + "/" + if (current.toolExecAllowlist.isEmpty()) { "" } else { current.toolExecAllowlist[0] }
+                            if (current.cronJobId != "ctx-${workerId}" || current.toolExecAllowlist.size != 1 || current.toolExecAllowlist[0] != "cmd-${workerId}") {
+                                ok = false
+                                break
+                            }
+                            sleep(Duration.millisecond * 1)
+                            i += 1
+                        }
+                        if (ok) { "ok-${workerId}" } else { "bad-${workerId}:${observed}" }
+                    }
+                )
+            })
+            worker += 1
+        }
+
+        for (future in futures) {
+            @Expect(future.get().startsWith("ok-"), true)
+        }
+        @Expect(gatewayCurrentToolRuntimeContext().isNone(), true)
     }
 }

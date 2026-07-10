@@ -502,13 +502,13 @@ public func resolveRuntimeToolPolicyFromRoot(
 }
 
 private let runtimeToolInvocationPolicyContextLock = Mutex()
-private let runtimeToolInvocationPolicyContextByThread = HashMap<String, ArrayList<RuntimeToolInvocationPolicyContext>>()
+private let runtimeToolInvocationPolicyContextByThread = HashMap<Int64, ArrayList<RuntimeToolInvocationPolicyContext>>()
 
-private func runtimeToolInvocationPolicyThreadKey(): String {
-    Thread.currentThread.name.trimAscii()
+private func runtimeToolInvocationPolicyThreadKey(): Int64 {
+    Thread.currentThread.id
 }
 
-private func runtimeToolInvocationPolicyStack(threadKey: String): ArrayList<RuntimeToolInvocationPolicyContext> {
+private func runtimeToolInvocationPolicyStack(threadKey: Int64): ArrayList<RuntimeToolInvocationPolicyContext> {
     match (runtimeToolInvocationPolicyContextByThread.get(threadKey)) {
         case Some(existing) => existing
         case None =>

@@ -116,13 +116,13 @@ public class GatewayToolRuntimeContext {
 }
 
 private let gatewayToolRuntimeContextLock = Mutex()
-private let gatewayToolRuntimeContextByThread = HashMap<String, ArrayList<GatewayToolRuntimeContext>>()
+private let gatewayToolRuntimeContextByThread = HashMap<Int64, ArrayList<GatewayToolRuntimeContext>>()
 
-private func gatewayToolRuntimeThreadKey(): String {
-    Thread.currentThread.name.trimAscii()
+private func gatewayToolRuntimeThreadKey(): Int64 {
+    Thread.currentThread.id
 }
 
-private func gatewayToolRuntimeContextStack(threadKey: String): ArrayList<GatewayToolRuntimeContext> {
+private func gatewayToolRuntimeContextStack(threadKey: Int64): ArrayList<GatewayToolRuntimeContext> {
     match (gatewayToolRuntimeContextByThread.get(threadKey)) {
         case Some(existing) => existing
         case None =>
