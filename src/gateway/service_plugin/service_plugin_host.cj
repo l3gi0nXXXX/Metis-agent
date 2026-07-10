@@ -670,6 +670,10 @@ private class ServicePluginLineBuffer {
         }
     }
 
+    public func isClosed(): Bool {
+        synchronized(this.lock) { this.closed }
+    }
+
     public func close(error!: String = ""): Unit {
         synchronized(this.lock) {
             this.closed = true
@@ -716,6 +720,10 @@ private class ServicePluginStdioProcess {
 
     public func readStdoutLine(timeoutMs: Int64): Option<String> {
         this.stdoutBuffer.readLine(timeoutMs)
+    }
+
+    public func stdoutClosed(): Bool {
+        this.stdoutBuffer.isClosed()
     }
 
     public func stderrSummary(): String {
@@ -2303,13 +2311,19 @@ private func servicePluginEventPump(record: ServicePluginRuntimeRecord, process:
     var noiseLineCount: Int64 = 0
     var noiseBytes: Int64 = 0
     var idlePolls: Int64 = 0
+    var exitDrainPolls: Int64 = 0
     let noiseSamples = ArrayList<String>()
     while (true) {
-        let line = match (process.readStdoutLine(1000)) {
+        let readTimeoutMs: Int64 = if (exitDrainPolls > 0) { 50 } else { 1000 }
+        let line = match (process.readStdoutLine(readTimeoutMs)) {
             case Some(value) => value
             case None =>
                 if (process.process.isAlive()) {
                     idlePolls++
+                    exitDrainPolls = 0
+                } else if (!process.stdoutClosed() && exitDrainPolls < 20) {
+                    exitDrainPolls++
+                    continue
                 } else {
                     idlePolls = 3600
                 }
