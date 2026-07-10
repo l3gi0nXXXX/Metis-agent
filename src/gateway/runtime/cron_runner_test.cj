@@ -380,6 +380,12 @@ public class CronRunnerTest {
                 scriptMode: "noAgent"
             )
             cronSave(storePath, [job])
+            let driftHome = CliConfig.dotDir.join("drift-home").toString()
+            Directory.create(driftHome, recursive: true)
+            setVariable("METIS_HOME", driftHome)
+            CliConfig.invalidatePathCache()
+            MetisConfigManager.invalidate()
+            CliSettingManager.invalidate()
             let calls = JsonObject()
             debugSetCronRunnerReplyForTest(Some({ _job: CronJob, _request: GatewaySessionRequest =>
                 calls.put("agent", JsonString("called"))

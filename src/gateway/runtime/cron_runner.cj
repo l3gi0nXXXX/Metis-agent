@@ -619,6 +619,10 @@ public class CronRunner {
         "## Script Output\n${scriptOutput}\n\n## Cron Prompt\n${prompt}"
     }
 
+    private func cronDotDirFromStorePath(): Path {
+        this.storePath.parent.parent
+    }
+
     private func deliveryFailureMessage(kind: String, raw: String): String {
         let trimmed = gatewayLogRedactText(raw).trimAscii()
         if (trimmed.isEmpty()) {
@@ -858,7 +862,7 @@ public class CronRunner {
             var skipSuccessDelivery = false
             let scriptMode = cronNormalizeScriptMode(j.scriptMode)
             if (scriptMode != "none") {
-                let scriptResult = runCronJobScriptForJob(CliConfig.dotDir, j)
+                let scriptResult = runCronJobScriptForJob(this.cronDotDirFromStorePath(), j)
                 if (!scriptResult.ok) {
                     let afterRun = epochMs()
                     status = "error"
