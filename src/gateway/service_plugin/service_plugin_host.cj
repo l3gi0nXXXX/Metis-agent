@@ -2,6 +2,7 @@ package metis.gateway.service_plugin
 
 import metis.core.metisSafeUtf8Prefix
 import metis.core.config.{CliConfig, MetisProcessEnvironmentLock}
+import metis.gateway.logging.{MetisLogEvent, metisCreateSubsystemLogger}
 import std.collection.{ArrayList, HashMap, HashSet}
 import std.convert.Parsable
 import std.fs.{Directory, File, Path, exists, remove}
@@ -10,7 +11,7 @@ import std.env.{getProcessId, getVariable, getVariables, setVariable}
 import std.process.*
 import std.sync.*
 import std.time.*
-import stdx.encoding.json.{JsonObject, JsonValue}
+import stdx.encoding.json.{JsonObject, JsonString, JsonValue}
 import stdx.net.http.*
 
 public class ServicePluginConfigRef {
@@ -951,6 +952,112 @@ private var servicePluginActiveProcesses = HashMap<String, ServicePluginStdioPro
 private var servicePluginResponseQueues = HashMap<String, ServicePluginResponseQueue>()
 private let servicePluginProcessLock = Mutex()
 private let servicePluginRuntimeRecordLock = Mutex()
+private let servicePluginHostLogger = metisCreateSubsystemLogger("gateway/service-plugin/host")
+
+private func servicePluginSafeDiagnosticText(text: String): String {
+    redactServicePayload(text.trimAscii()).text
+}
+
+private func servicePluginSafePathDiagnostic(path: String): String {
+    let trimmed = path.trimAscii()
+    if (trimmed.isEmpty()) {
+        return "absent"
+    }
+    servicePluginSafeDiagnosticText(trimmed)
+}
+
+private func servicePluginBinaryMtimeDiagnostic(command: String): String {
+    let cmd = command.trimAscii()
+    if (cmd.isEmpty() || !exists(Path(cmd))) {
+        return "unavailable"
+    }
+    try {
+        let darwin = executeWithOutput("stat", ["-f", "%m", cmd])
+        if (darwin[0] == 0) {
+            return String.fromUtf8(darwin[1]).trimAscii()
+        }
+    } catch (_: Exception) {
+        ()
+    }
+    try {
+        let linux = executeWithOutput("stat", ["-c", "%Y", cmd])
+        if (linux[0] == 0) {
+            return String.fromUtf8(linux[1]).trimAscii()
+        }
+    } catch (_: Exception) {
+        ()
+    }
+    "unavailable"
+}
+
+private func servicePluginStartDiagnosticMeta(record: ServicePluginRuntimeRecord, pid: Int64, status: String, diagnostic!: String = ""): JsonObject {
+    let configRef = record.registration.configRef
+    let meta = JsonObject()
+    meta.put("serviceId", JsonString(record.registration.manifest.pluginId))
+    meta.put("status", JsonString(status.trimAscii()))
+    meta.put("entryCommand", JsonString(servicePluginSafePathDiagnostic(record.registration.manifest.entryCommand)))
+    meta.put("workingDirectory", JsonString(servicePluginSafePathDiagnostic(servicePluginEffectiveWorkingDirectory(configRef))))
+    meta.put("pid", JsonString("${pid}"))
+    meta.put("manifestPath", JsonString(servicePluginSafePathDiagnostic(configRef.manifestPath)))
+    meta.put("configRef", JsonString(configRef.redacted()))
+    meta.put("binaryMtime", JsonString(servicePluginBinaryMtimeDiagnostic(record.registration.manifest.entryCommand)))
+    if (!diagnostic.trimAscii().isEmpty()) {
+        meta.put("diagnostic", JsonString(servicePluginSafeDiagnosticText(diagnostic)))
+    }
+    meta
+}
+
+private func logServicePluginProcessStart(record: ServicePluginRuntimeRecord, pid: Int64): Unit {
+    servicePluginHostLogger.info(
+        MetisLogEvent.loggingRaw,
+        "service_plugin.process.start",
+        meta: servicePluginStartDiagnosticMeta(record, pid, "started")
+    )
+}
+
+private func logServicePluginProcessStartFailed(record: ServicePluginRuntimeRecord, diagnostic: String): Unit {
+    servicePluginHostLogger.warn(
+        MetisLogEvent.loggingRaw,
+        "service_plugin.process.start_failed",
+        meta: servicePluginStartDiagnosticMeta(record, 0, "process_start_failed", diagnostic: diagnostic)
+    )
+}
+
+private func cleanupServicePluginActiveProcessLocked(serviceId: String, reason: String, diagnostic!: String = ""): Unit {
+    let sid = serviceId.trimAscii()
+    let normalizedReason = if (reason.trimAscii().isEmpty()) { "stale_active_process" } else { reason.trimAscii() }
+    let safeDiagnostic = servicePluginSafeDiagnosticText(if (diagnostic.trimAscii().isEmpty()) { normalizedReason } else { diagnostic })
+    let hadActive = servicePluginActiveProcesses.contains(sid)
+    let hadQueue = servicePluginResponseQueues.contains(sid)
+    var stopStatus = ""
+    match (servicePluginResponseQueues.get(sid)) {
+        case Some(queue) => queue.close(status: normalizedReason, diagnostic: safeDiagnostic)
+        case None => ()
+    }
+    match (servicePluginActiveProcesses.get(sid)) {
+        case Some(process) =>
+            if (process.process.isAlive()) {
+                stopStatus = process.stop().status
+            } else {
+                stopStatus = "already_exited"
+            }
+        case None => ()
+    }
+    if (hadActive) { servicePluginActiveProcesses.remove(sid) }
+    if (hadQueue) { servicePluginResponseQueues.remove(sid) }
+    if (hadActive || hadQueue) {
+        let meta = JsonObject()
+        meta.put("serviceId", JsonString(sid))
+        meta.put("reason", JsonString(normalizedReason))
+        meta.put("hadActiveProcess", JsonString("${hadActive}"))
+        meta.put("hadResponseQueue", JsonString("${hadQueue}"))
+        if (!stopStatus.isEmpty()) {
+            meta.put("stopStatus", JsonString(stopStatus))
+        }
+        meta.put("diagnostic", JsonString(safeDiagnostic))
+        servicePluginHostLogger.warn(MetisLogEvent.loggingRaw, "service_plugin.active_process.cleanup", meta: meta)
+    }
+}
 
 private func readExpectedServiceFrame(process: ServicePluginStdioProcess, policy: ServicePluginStdoutReadPolicy): ServicePluginStdoutReadResult {
     var noiseLineCount: Int64 = 0
@@ -1072,6 +1179,43 @@ public func setServicePluginPortOwnerProbeForTest(
     probe: Option<(Int64, Int64) -> Bool>
 ): Unit {
     servicePluginPortOwnerProbeForTest = probe
+}
+
+public func closeServicePluginResponseQueueForTest(serviceId: String, status!: String = "test_closed"): Bool {
+    synchronized(servicePluginProcessLock) {
+        match (servicePluginResponseQueues.get(serviceId.trimAscii())) {
+            case Some(queue) =>
+                queue.close(status: status, diagnostic: status)
+                true
+            case None => false
+        }
+    }
+}
+
+public func dropServicePluginResponseQueueForTest(serviceId: String): Bool {
+    synchronized(servicePluginProcessLock) {
+        let sid = serviceId.trimAscii()
+        if (!servicePluginResponseQueues.contains(sid)) {
+            return false
+        }
+        servicePluginResponseQueues.remove(sid)
+        true
+    }
+}
+
+public func dropServicePluginActiveProcessForTest(serviceId: String, stopProcess!: Bool = true): Bool {
+    synchronized(servicePluginProcessLock) {
+        let sid = serviceId.trimAscii()
+        match (servicePluginActiveProcesses.get(sid)) {
+            case Some(process) =>
+                servicePluginActiveProcesses.remove(sid)
+                if (stopProcess) {
+                    let _ = process.stop()
+                }
+                true
+            case None => false
+        }
+    }
 }
 
 public func resetServicePluginHostForTest(): Unit {
@@ -1755,8 +1899,7 @@ private func recoverServicePlugin(record: ServicePluginRuntimeRecord, reason: St
     if (reason == "process_exited") {
         servicePluginStopSupervisorWorker(serviceId)
         synchronized(servicePluginProcessLock) {
-            if (servicePluginActiveProcesses.contains(serviceId)) { servicePluginActiveProcesses.remove(serviceId) }
-            if (servicePluginResponseQueues.contains(serviceId)) { servicePluginResponseQueues.remove(serviceId) }
+            cleanupServicePluginActiveProcessLocked(serviceId, "process_exited", diagnostic: "supervisor recovery process_exited")
         }
         record.pid = 0
         record.status = "stopped"
@@ -1806,11 +1949,36 @@ private func recoverServicePlugin(record: ServicePluginRuntimeRecord, reason: St
     }
     record.supervisorRestartCount++
     record.supervisorLastRestartAtMs = nowMs
-    record.status = "degraded"
-    record.degradedReason = reason
-    record.supervisorLastDegradedReason = reason
-    record.lastError = "supervisor_restarted reason=${reason}"
-    true
+    match (servicePluginReadLease(Path(servicePluginLeasePath(record)))) {
+        case Some(lease) =>
+            if (lease.bindHost.isEmpty() || lease.port <= 0) {
+                record.status = "degraded"
+                record.degradedReason = "restart_healthz_failed"
+                record.supervisorLastDegradedReason = "restart_healthz_failed"
+                record.lastError = "restart_healthz_failed reason=${reason} listener_endpoint_missing leaseState=${lease.state} bindHost=${lease.bindHost} port=${lease.port}"
+                return false
+            }
+            let healthz = servicePluginHealthzProbe("http://${lease.bindHost}:${lease.port}/healthz", config.healthTimeoutMs)
+            if (!healthz.ok) {
+                record.status = "degraded"
+                record.degradedReason = "restart_healthz_failed"
+                record.supervisorLastDegradedReason = "restart_healthz_failed"
+                record.lastError = "restart_healthz_failed reason=${reason} ${servicePluginSafeDiagnosticText(healthz.diagnostic)} leaseState=${lease.state} bindHost=${lease.bindHost} port=${lease.port}"
+                return false
+            }
+            record.status = "running"
+            record.degradedReason = ""
+            record.supervisorLastDegradedReason = ""
+            record.supervisorFailureCount = 0
+            record.lastError = "recovery_success reason=${reason} healthz_status=${healthz.statusCode} port=${lease.port}"
+            true
+        case None =>
+            record.status = "degraded"
+            record.degradedReason = "restart_healthz_failed"
+            record.supervisorLastDegradedReason = "restart_healthz_failed"
+            record.lastError = "restart_healthz_failed reason=${reason} lease_missing"
+            false
+    }
 }
 
 private func servicePluginRunSupervisorTick(serviceId: String, nowMs: Int64, allowRecover!: Bool = true): ServicePluginSupervisorTickResult {
@@ -1843,6 +2011,42 @@ public func runServicePluginSupervisorTickForTest(serviceId: String, nowMs!: Int
     servicePluginRunSupervisorTick(serviceId, nowMs, allowRecover: true)
 }
 
+private func logServicePluginSupervisorTick(serviceId: String, tick: ServicePluginSupervisorTickResult): Unit {
+    let meta = JsonObject()
+    meta.put("serviceId", JsonString(serviceId.trimAscii()))
+    meta.put("status", JsonString(tick.status))
+    meta.put("classification", JsonString(tick.classification.status))
+    meta.put("reason", JsonString(tick.classification.reason))
+    meta.put("recovered", JsonString("${tick.recovered}"))
+    servicePluginHostLogger.info(MetisLogEvent.loggingRaw, "service_plugin.supervisor.tick", meta: meta)
+}
+
+private func servicePluginRunSupervisorWorkerTick(serviceId: String, nowMs: Int64): Unit {
+    let sid = serviceId.trimAscii()
+    try {
+        let tick = servicePluginRunSupervisorTick(sid, nowMs, allowRecover: true)
+        logServicePluginSupervisorTick(sid, tick)
+    } catch (e: Exception) {
+        let safeError = servicePluginSafeDiagnosticText(e.message)
+        match (servicePluginRegistry.get(sid)) {
+            case Some(record) =>
+                record.status = "degraded"
+                record.degradedReason = "supervisor_exception"
+                record.supervisorLastDegradedReason = "supervisor_exception"
+                record.lastError = safeError
+            case None => ()
+        }
+        let meta = JsonObject()
+        meta.put("serviceId", JsonString(sid))
+        meta.put("error", JsonString(safeError))
+        servicePluginHostLogger.error(MetisLogEvent.loggingRaw, "service_plugin.supervisor.exception", meta: meta)
+    }
+}
+
+public func runServicePluginSupervisorWorkerTickForTest(serviceId: String, nowMs!: Int64 = servicePluginNowMs()): Unit {
+    servicePluginRunSupervisorWorkerTick(serviceId, nowMs)
+}
+
 private func servicePluginStartSupervisorWorker(record: ServicePluginRuntimeRecord): Unit {
     if (!servicePluginSupervisorConfig.enabled) {
         return
@@ -1868,7 +2072,7 @@ private func servicePluginStartSupervisorWorker(record: ServicePluginRuntimeReco
             if (flag.stopped()) {
                 return
             }
-            let _ = servicePluginRunSupervisorTick(serviceId, servicePluginNowMs(), allowRecover: true)
+            servicePluginRunSupervisorWorkerTick(serviceId, servicePluginNowMs())
         }
     }
 }
@@ -1990,7 +2194,17 @@ private func ensureServicePluginStdioProcess(record: ServicePluginRuntimeRecord,
     let serviceId = record.registration.manifest.pluginId
     synchronized(servicePluginProcessLock) {
         if (servicePluginActiveProcesses.contains(serviceId) && servicePluginResponseQueues.contains(serviceId)) {
-            return ServicePluginProcessEnsureResult(true, "running", process: Some(servicePluginActiveProcesses[serviceId]), queue: Some(servicePluginResponseQueues[serviceId]))
+            let activeProcess = servicePluginActiveProcesses[serviceId]
+            let activeQueue = servicePluginResponseQueues[serviceId]
+            if (activeProcess.process.isAlive() && !activeQueue.isClosed()) {
+                return ServicePluginProcessEnsureResult(true, "running", process: Some(activeProcess), queue: Some(activeQueue))
+            }
+            let reason = if (!activeProcess.process.isAlive()) { "process_exited" } else { "stdio_closed" }
+            cleanupServicePluginActiveProcessLocked(serviceId, reason, diagnostic: "ensure stale active process reason=${reason}")
+        } else if (servicePluginActiveProcesses.contains(serviceId)) {
+            cleanupServicePluginActiveProcessLocked(serviceId, "stdio_closed", diagnostic: "ensure stale active process without response queue")
+        } else if (servicePluginResponseQueues.contains(serviceId)) {
+            cleanupServicePluginActiveProcessLocked(serviceId, "stdio_closed", diagnostic: "ensure stale response queue without active process")
         }
         if (record.registration.manifest.entryCommand.isEmpty()) {
             record.status = "degraded"
@@ -2028,11 +2242,13 @@ private func ensureServicePluginStdioProcess(record: ServicePluginRuntimeRecord,
                 environment: Some(servicePluginProcessEnvironment(record))
             )
             record.pid = proc.pid
+            logServicePluginProcessStart(record, proc.pid)
             ServicePluginStdioProcess(proc)
         } catch (e: Exception) {
             record.status = "degraded"
             record.degradedReason = "process_start_failed"
             record.lastError = redactServicePayload(e.message).text
+            logServicePluginProcessStartFailed(record, e.message)
             return ServicePluginProcessEnsureResult(false, "process_start_failed", diagnostic: record.lastError)
         }
         let initRead = readExpectedServiceFrame(process, ServicePluginStdoutReadPolicy(startupTimeoutMs, serviceId, "initialize"))
@@ -2092,17 +2308,19 @@ private func servicePluginEventPump(record: ServicePluginRuntimeRecord, process:
         let line = match (process.readStdoutLine(1000)) {
             case Some(value) => value
             case None =>
-                idlePolls++
+                if (process.process.isAlive()) {
+                    idlePolls++
+                } else {
+                    idlePolls = 3600
+                }
                 if (idlePolls < 3600) {
                     continue
                 }
                 record.status = "degraded"
                 record.degradedReason = "process_exited"
                 record.lastError = servicePluginProcessError("service plugin process stdout closed", process)
-                queue.close(status: "process_exited", diagnostic: record.lastError)
                 synchronized(servicePluginProcessLock) {
-                    if (servicePluginActiveProcesses.contains(serviceId)) { servicePluginActiveProcesses.remove(serviceId) }
-                    if (servicePluginResponseQueues.contains(serviceId)) { servicePluginResponseQueues.remove(serviceId) }
+                    cleanupServicePluginActiveProcessLocked(serviceId, "process_exited", diagnostic: record.lastError)
                 }
                 return
         }
@@ -2116,8 +2334,9 @@ private func servicePluginEventPump(record: ServicePluginRuntimeRecord, process:
                 record.status = "degraded"
                 record.degradedReason = "stdout_protocol_violation"
                 record.lastError = servicePluginStdoutNoiseDiagnostic("stdout_protocol_violation", noiseLineCount, noiseBytes, noiseSamples)
-                queue.close(status: "stdout_protocol_violation", diagnostic: record.lastError)
-                process.stop()
+                synchronized(servicePluginProcessLock) {
+                    cleanupServicePluginActiveProcessLocked(serviceId, "stdout_protocol_violation", diagnostic: record.lastError)
+                }
                 return
             }
             continue
@@ -2131,15 +2350,17 @@ private func servicePluginEventPump(record: ServicePluginRuntimeRecord, process:
             if (decoded.errorKind == "frame_too_large") {
                 record.status = "degraded"
                 record.degradedReason = "frame_too_large"
-                queue.close(status: "frame_too_large", diagnostic: "frame_too_large ${hashRawPayload(trimmed)}")
-                process.stop()
+                synchronized(servicePluginProcessLock) {
+                    cleanupServicePluginActiveProcessLocked(serviceId, "frame_too_large", diagnostic: "frame_too_large ${hashRawPayload(trimmed)}")
+                }
                 return
             }
             if (servicePluginStdoutNoiseExceeded(noiseLineCount, noiseBytes, ServicePluginStdoutReadPolicy(1000, serviceId, "eventPump"))) {
                 record.status = "degraded"
                 record.degradedReason = "frame_decode_failed"
-                queue.close(status: "frame_decode_failed", diagnostic: record.lastError)
-                process.stop()
+                synchronized(servicePluginProcessLock) {
+                    cleanupServicePluginActiveProcessLocked(serviceId, "frame_decode_failed", diagnostic: record.lastError)
+                }
                 return
             }
             continue

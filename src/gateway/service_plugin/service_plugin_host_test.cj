@@ -1,8 +1,9 @@
 package metis.gateway.service_plugin
 
+import metis.gateway.logging.gatewayLoggingResetForTest
 import std.collection.ArrayList
 import std.convert.Parsable
-import std.env.getProcessId
+import std.env.{getProcessId, getVariable, setVariable}
 import std.fs.{Directory, File, Path, exists, remove}
 import std.sync.Mutex
 import std.time.*
@@ -239,6 +240,33 @@ public class ServicePluginHostTest {
         }
     }
 
+    private func waitForSnapshotReason(serviceId: String, reason: String, timeoutMillis!: Int64 = 2000): Bool {
+        var waited: Int64 = 0
+        while (waited < timeoutMillis) {
+            match (getServicePluginSnapshot(serviceId)) {
+                case Some(snapshot) =>
+                    if (snapshot.degradedReason == reason || snapshot.lastError.contains(reason)) {
+                        return true
+                    }
+                case None => ()
+            }
+            sleep(Duration.millisecond * 25)
+            waited += 25
+        }
+        match (getServicePluginSnapshot(serviceId)) {
+            case Some(snapshot) => snapshot.degradedReason == reason || snapshot.lastError.contains(reason)
+            case None => false
+        }
+    }
+
+    private func readCounterFile(path: Path): Int64 {
+        try { Int64.parse(String.fromUtf8(File.readFrom(path)).trimAscii()) } catch (_: Exception) { 0 }
+    }
+
+    private func readTextFile(path: Path): String {
+        try { String.fromUtf8(File.readFrom(path)) } catch (_: Exception) { "" }
+    }
+
     private func gitCodeLeaseScript(port: Int64, includeEndpoint!: Bool = true, stopUpdatesLease!: Bool = true, keepAlive!: Bool = true): String {
         let endpoint = if (includeEndpoint) { ",\"bindHost\":\"127.0.0.1\",\"port\":${port}" } else { "" }
         var script = "printf '%s\\n' '${this.gitCodeInitLine()}'; printf '{\"state\":\"running\",\"status\":\"running\",\"pluginId\":\"gitcode-monitor\",\"sessionId\":\"%s\",\"pid\":%s,\"parentPid\":%s${endpoint},\"startedAtMs\":1000,\"lastHeartbeatMs\":1000}\\n' \"$METIS_SERVICE_PLUGIN_SESSION_ID\" \"$$\" \"$METIS_SERVICE_PLUGIN_PARENT_PID\" > \"$METIS_SERVICE_PLUGIN_LEASE_PATH\""
@@ -251,6 +279,52 @@ public class ServicePluginHostTest {
         } else {
             script += "; trap '' TERM; while true; do read -t 1 ignored || true; done"
         }
+        script
+    }
+
+    private func gitCodeCountingLeaseScript(
+        counterPath: Path,
+        port: Int64,
+        includeEndpoint!: Bool = true,
+        writeLease!: Bool = true,
+        stopUpdatesLease!: Bool = true,
+        keepAlive!: Bool = true,
+        firstLaunchNoise!: Bool = false
+    ): String {
+        let endpoint = if (includeEndpoint) { ",\"bindHost\":\"127.0.0.1\",\"port\":${port}" } else { "" }
+        let runningLease = "printf '{\"state\":\"running\",\"status\":\"running\",\"pluginId\":\"gitcode-monitor\",\"sessionId\":\"%s\",\"pid\":%s,\"parentPid\":%s${endpoint},\"startedAtMs\":1000,\"lastHeartbeatMs\":1000}\\n' \"$METIS_SERVICE_PLUGIN_SESSION_ID\" \"$$\" \"$METIS_SERVICE_PLUGIN_PARENT_PID\" > \"$METIS_SERVICE_PLUGIN_LEASE_PATH\""
+        let stoppedLease = "printf '{\"state\":\"stopped\",\"status\":\"stopped\",\"pluginId\":\"gitcode-monitor\",\"sessionId\":\"%s\",\"pid\":%s,\"parentPid\":%s${endpoint},\"startedAtMs\":1000,\"lastHeartbeatMs\":1000}\\n' \"$METIS_SERVICE_PLUGIN_SESSION_ID\" \"$$\" \"$METIS_SERVICE_PLUGIN_PARENT_PID\" > \"$METIS_SERVICE_PLUGIN_LEASE_PATH\""
+        var script = "count_file='${counterPath.toString()}'; count=$(cat \"$count_file\" 2>/dev/null || printf 0); count=$((count + 1)); printf '%s' \"$count\" > \"$count_file\"; printf '%s\\n' '${this.gitCodeInitLine()}'; "
+        if (writeLease) {
+            script += "${runningLease}; "
+        }
+        if (firstLaunchNoise) {
+            script += "if [ \"$count\" = \"1\" ]; then for i in 1 2 3 4 5 6 7 8 9 10; do printf 'WARN noisy stdout %s Authorization: Bearer secret-value\\n' \"$i\"; done; exit 0; fi; "
+        }
+        if (!keepAlive) {
+            return script + "exit 0"
+        }
+        if (stopUpdatesLease && writeLease) {
+            script += "metis_stop_lease() { ${stoppedLease}; }; trap 'metis_stop_lease; exit 0' TERM HUP INT; while read line; do metis_stop_lease; exit 0; done"
+        } else {
+            script += "trap '' TERM; while true; do read -t 1 ignored || true; done"
+        }
+        script
+    }
+
+    private func gitCodeCountingRestartLeaseScript(counterPath: Path, firstPort: Int64, restartPort: Int64, restartWritesLease!: Bool = true): String {
+        let firstEndpoint = ",\"bindHost\":\"127.0.0.1\",\"port\":${firstPort}"
+        let restartEndpoint = ",\"bindHost\":\"127.0.0.1\",\"port\":${restartPort}"
+        let firstRunningLease = "printf '{\"state\":\"running\",\"status\":\"running\",\"pluginId\":\"gitcode-monitor\",\"sessionId\":\"%s\",\"pid\":%s,\"parentPid\":%s${firstEndpoint},\"startedAtMs\":1000,\"lastHeartbeatMs\":1000}\\n' \"$METIS_SERVICE_PLUGIN_SESSION_ID\" \"$$\" \"$METIS_SERVICE_PLUGIN_PARENT_PID\" > \"$METIS_SERVICE_PLUGIN_LEASE_PATH\""
+        let restartRunningLease = "printf '{\"state\":\"running\",\"status\":\"running\",\"pluginId\":\"gitcode-monitor\",\"sessionId\":\"%s\",\"pid\":%s,\"parentPid\":%s${restartEndpoint},\"startedAtMs\":1000,\"lastHeartbeatMs\":1000}\\n' \"$METIS_SERVICE_PLUGIN_SESSION_ID\" \"$$\" \"$METIS_SERVICE_PLUGIN_PARENT_PID\" > \"$METIS_SERVICE_PLUGIN_LEASE_PATH\""
+        let stoppedLease = "printf '{\"state\":\"stopped\",\"status\":\"stopped\",\"pluginId\":\"gitcode-monitor\",\"sessionId\":\"%s\",\"pid\":%s,\"parentPid\":%s${firstEndpoint},\"startedAtMs\":1000,\"lastHeartbeatMs\":1000}\\n' \"$METIS_SERVICE_PLUGIN_SESSION_ID\" \"$$\" \"$METIS_SERVICE_PLUGIN_PARENT_PID\" > \"$METIS_SERVICE_PLUGIN_LEASE_PATH\""
+        var script = "count_file='${counterPath.toString()}'; count=$(cat \"$count_file\" 2>/dev/null || printf 0); count=$((count + 1)); printf '%s' \"$count\" > \"$count_file\"; printf '%s\\n' '${this.gitCodeInitLine()}'; "
+        if (restartWritesLease) {
+            script += "if [ \"$count\" = \"1\" ]; then ${firstRunningLease}; else ${restartRunningLease}; fi; "
+        } else {
+            script += "if [ \"$count\" = \"1\" ]; then ${firstRunningLease}; fi; "
+        }
+        script += "metis_stop_lease() { ${stoppedLease}; }; trap 'metis_stop_lease; exit 0' TERM HUP INT; while read line; do metis_stop_lease; exit 0; done"
         script
     }
 
@@ -648,10 +722,11 @@ public class ServicePluginHostTest {
             try {
                 let started = ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000)
                 @Expect(started.ok, true)
-                sleep(Duration.millisecond * 100)
-                let tick = runServicePluginSupervisorTickForTest("gitcode-monitor", nowMs: 2000)
-                @Expect(tick.probe.pidAlive, false)
-                @Expect(tick.classification.reason, "process_exited")
+                @Expect(this.waitForSnapshotReason("gitcode-monitor", "process_exited", timeoutMillis: 1000), true)
+                let probe = probeServicePluginHealth("gitcode-monitor", nowMs: 2000)
+                @Expect(probe.pidAlive, false)
+                let classification = classifyServicePluginHealth(probe, previousFailures: 0, config: ServicePluginSupervisorConfig(enabled: true, intervalMs: 1000, healthTimeoutMs: 10, failureThreshold: 1, restartCooldownMs: 1000))
+                @Expect(classification.reason, "process_exited")
                 @Expect(synchronized(callLock) { Int64(healthzCalls.size) }, 0)
             } finally {
                 setServicePluginHealthzProbeForTest(None)
@@ -798,6 +873,375 @@ public class ServicePluginHostTest {
             } finally {
                 setServicePluginHealthzProbeForTest(None)
                 resetServicePluginHostForTest()
+            }
+        })
+    }
+
+    @TestCase
+    public func tT0U2T4U1EnsureReplacesDeadActiveProcess(): Unit {
+        // T0-U2 Metis-side baseline, T4-U1.
+        withServicePluginHostTestHome("service-plugin-t4-dead-active", { home: Path =>
+            let counterPath = home.join("launch-count.txt")
+            this.registerGitCodeStdioScript(this.gitCodeCountingLeaseScript(counterPath, 18185, keepAlive: false))
+            try {
+                let started = ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000)
+                @Expect(started.ok, true)
+                @Expect(this.waitForSnapshotReason("gitcode-monitor", "process_exited", timeoutMillis: 1500), true)
+
+                let restarted = ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000)
+                @Expect(restarted.ok, true)
+                @Expect(this.readCounterFile(counterPath), 2)
+                match (getServicePluginSnapshot("gitcode-monitor")) {
+                    case Some(snapshot) =>
+                        @Expect(snapshot.status, "running")
+                        @Expect(snapshot.pid > 0, true)
+                    case None => @Expect(true, false)
+                }
+            } finally {
+                resetServicePluginHostForTest()
+            }
+        })
+    }
+
+    @TestCase
+    public func tT4U1EnsureReplacesQueueOnlyAndProcessOnlyStaleState(): Unit {
+        // T4-U1 queue-only stale and process-only stale coverage.
+        withServicePluginHostTestHome("service-plugin-t4-queue-only", { home: Path =>
+            let counterPath = home.join("queue-only-count.txt")
+            this.registerGitCodeStdioScript(this.gitCodeCountingLeaseScript(counterPath, 18186))
+            try {
+                let started = ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000)
+                @Expect(started.ok, true)
+                @Expect(dropServicePluginActiveProcessForTest("gitcode-monitor", stopProcess: true), true)
+
+                let restarted = ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000)
+                @Expect(restarted.ok, true)
+                @Expect(this.readCounterFile(counterPath), 2)
+            } finally {
+                resetServicePluginHostForTest()
+            }
+        })
+
+        withServicePluginHostTestHome("service-plugin-t4-process-only", { home: Path =>
+            let counterPath = home.join("process-only-count.txt")
+            this.registerGitCodeStdioScript(this.gitCodeCountingLeaseScript(counterPath, 18187))
+            try {
+                let started = ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000)
+                @Expect(started.ok, true)
+                @Expect(dropServicePluginResponseQueueForTest("gitcode-monitor"), true)
+
+                let restarted = ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000)
+                @Expect(restarted.ok, true)
+                @Expect(this.readCounterFile(counterPath), 2)
+            } finally {
+                resetServicePluginHostForTest()
+            }
+        })
+    }
+
+    @TestCase
+    public func tT4U1EnsureReplacesClosedResponseQueue(): Unit {
+        // T4-U1 closed queue coverage.
+        withServicePluginHostTestHome("service-plugin-t4-closed-queue", { home: Path =>
+            let counterPath = home.join("closed-queue-count.txt")
+            this.registerGitCodeStdioScript(this.gitCodeCountingLeaseScript(counterPath, 18188))
+            try {
+                let started = ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000)
+                @Expect(started.ok, true)
+                @Expect(closeServicePluginResponseQueueForTest("gitcode-monitor", status: "test_closed"), true)
+
+                let restarted = ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000)
+                @Expect(restarted.ok, true)
+                @Expect(this.readCounterFile(counterPath), 2)
+            } finally {
+                resetServicePluginHostForTest()
+            }
+        })
+    }
+
+    @TestCase
+    public func tT4U2EventPumpClosesImmediatelyWhenProcessExits(): Unit {
+        // T4-U2.
+        withServicePluginHostTestHome("service-plugin-t4-event-pump-dead", { _home: Path =>
+            this.registerGitCodeStdioScript(this.gitCodeLeaseScript(18189, keepAlive: false))
+            try {
+                let started = ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000)
+                @Expect(started.ok, true)
+                @Expect(this.waitForSnapshotReason("gitcode-monitor", "process_exited", timeoutMillis: 1500), true)
+                match (getServicePluginSnapshot("gitcode-monitor")) {
+                    case Some(snapshot) =>
+                        @Expect(snapshot.status, "degraded")
+                        @Expect(snapshot.degradedReason, "process_exited")
+                    case None => @Expect(true, false)
+                }
+            } finally {
+                resetServicePluginHostForTest()
+            }
+        })
+    }
+
+    @TestCase
+    public func tT4U3T4P1SupervisorRecoveryRequiresRestartHealthzSuccess(): Unit {
+        // T4-U3, T4-P1.
+        withServicePluginHostTestHome("service-plugin-t4-recover-healthz-success", { home: Path =>
+            let counterPath = home.join("healthz-success-count.txt")
+            let callLock = Mutex()
+            let healthzCalls = ArrayList<String>()
+            this.registerGitCodeStdioScript(this.gitCodeCountingLeaseScript(counterPath, 18190))
+            setServicePluginSupervisorConfigForTest(ServicePluginSupervisorConfig(enabled: true, intervalMs: 1000, healthTimeoutMs: 10, failureThreshold: 1, restartCooldownMs: 1000))
+            setServicePluginHealthzProbeForTest(Some({ url: String, _timeoutMs: Int64 =>
+                let callCount = synchronized(callLock) {
+                    healthzCalls.add(url)
+                    Int64(healthzCalls.size)
+                }
+                if (callCount == 1) {
+                    return ServicePluginHealthzProbeResult(false, statusCode: 0, durationMs: 10, diagnostic: "healthz_timeout")
+                }
+                ServicePluginHealthzProbeResult(true, statusCode: 200, durationMs: 1, diagnostic: "healthz_status=200")
+            }))
+            try {
+                let started = ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000)
+                @Expect(started.ok, true)
+                @Expect(this.waitForGitCodeLease(home), true)
+                let tick = runServicePluginSupervisorTickForTest("gitcode-monitor", nowMs: 2000)
+                @Expect(tick.recovered, true)
+                @Expect(this.readCounterFile(counterPath), 2)
+                @Expect(synchronized(callLock) { Int64(healthzCalls.size) }, 2)
+                match (getServicePluginSnapshot("gitcode-monitor")) {
+                    case Some(snapshot) =>
+                        @Expect(snapshot.status, "running")
+                        @Expect(snapshot.supervisorFailureCount, 0)
+                        @Expect(snapshot.supervisorRestartCount, 1)
+                        @Expect(snapshot.lastError.contains("recovery_success"), true)
+                    case None => @Expect(true, false)
+                }
+            } finally {
+                setServicePluginHealthzProbeForTest(None)
+                resetServicePluginHostForTest()
+            }
+        })
+    }
+
+    @TestCase
+    public func tT4N1SupervisorRecoveryStaysDegradedWhenRestartHealthzFails(): Unit {
+        // T4-N1.
+        withServicePluginHostTestHome("service-plugin-t4-recover-healthz-failed", { home: Path =>
+            let counterPath = home.join("healthz-failed-count.txt")
+            let callLock = Mutex()
+            let healthzCalls = ArrayList<String>()
+            this.registerGitCodeStdioScript(this.gitCodeCountingLeaseScript(counterPath, 18191))
+            setServicePluginSupervisorConfigForTest(ServicePluginSupervisorConfig(enabled: true, intervalMs: 1000, healthTimeoutMs: 10, failureThreshold: 1, restartCooldownMs: 1000))
+            setServicePluginHealthzProbeForTest(Some({ url: String, _timeoutMs: Int64 =>
+                synchronized(callLock) { healthzCalls.add(url) }
+                ServicePluginHealthzProbeResult(false, statusCode: 0, durationMs: 10, diagnostic: "healthz_timeout")
+            }))
+            try {
+                let started = ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000)
+                @Expect(started.ok, true)
+                @Expect(this.waitForGitCodeLease(home), true)
+                let tick = runServicePluginSupervisorTickForTest("gitcode-monitor", nowMs: 2000)
+                @Expect(tick.recovered, false)
+                @Expect(this.readCounterFile(counterPath), 2)
+                @Expect(synchronized(callLock) { Int64(healthzCalls.size) }, 2)
+                match (getServicePluginSnapshot("gitcode-monitor")) {
+                    case Some(snapshot) =>
+                        @Expect(snapshot.status, "degraded")
+                        @Expect(snapshot.degradedReason, "restart_healthz_failed")
+                        @Expect(snapshot.lastError.contains("restart_healthz_failed"), true)
+                    case None => @Expect(true, false)
+                }
+            } finally {
+                setServicePluginHealthzProbeForTest(None)
+                resetServicePluginHostForTest()
+            }
+        })
+    }
+
+    @TestCase
+    public func tT4B1RestartMissingLeaseOrPortZeroDoesNotReportRunning(): Unit {
+        // T4-B1.
+        withServicePluginHostTestHome("service-plugin-t4-recover-missing-lease", { home: Path =>
+            let counterPath = home.join("missing-lease-count.txt")
+            this.registerGitCodeStdioScript(this.gitCodeCountingRestartLeaseScript(counterPath, 18192, 18192, restartWritesLease: false))
+            setServicePluginSupervisorConfigForTest(ServicePluginSupervisorConfig(enabled: true, intervalMs: 1000, healthTimeoutMs: 10, failureThreshold: 1, restartCooldownMs: 1000))
+            setServicePluginHealthzProbeForTest(Some({ _url: String, _timeoutMs: Int64 =>
+                ServicePluginHealthzProbeResult(false, statusCode: 0, durationMs: 10, diagnostic: "healthz_timeout")
+            }))
+            try {
+                let started = ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000)
+                @Expect(started.ok, true)
+                @Expect(this.waitForGitCodeLease(home), true)
+                let tick = runServicePluginSupervisorTickForTest("gitcode-monitor", nowMs: 2000)
+                @Expect(tick.recovered, false)
+                match (getServicePluginSnapshot("gitcode-monitor")) {
+                    case Some(snapshot) =>
+                        @Expect(snapshot.status, "degraded")
+                        @Expect(snapshot.degradedReason, "restart_healthz_failed")
+                        @Expect(snapshot.lastError.contains("lease_missing"), true)
+                    case None => @Expect(true, false)
+                }
+            } finally {
+                setServicePluginHealthzProbeForTest(None)
+                resetServicePluginHostForTest()
+            }
+        })
+
+        withServicePluginHostTestHome("service-plugin-t4-recover-port-zero", { home: Path =>
+            let counterPath = home.join("port-zero-count.txt")
+            this.registerGitCodeStdioScript(this.gitCodeCountingRestartLeaseScript(counterPath, 18193, 0))
+            setServicePluginSupervisorConfigForTest(ServicePluginSupervisorConfig(enabled: true, intervalMs: 1000, healthTimeoutMs: 10, failureThreshold: 1, restartCooldownMs: 1000))
+            setServicePluginHealthzProbeForTest(Some({ _url: String, _timeoutMs: Int64 =>
+                ServicePluginHealthzProbeResult(false, statusCode: 0, durationMs: 10, diagnostic: "healthz_timeout")
+            }))
+            try {
+                let started = ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000)
+                @Expect(started.ok, true)
+                @Expect(this.waitForGitCodeLease(home), true)
+                let tick = runServicePluginSupervisorTickForTest("gitcode-monitor", nowMs: 2000)
+                @Expect(tick.recovered, false)
+                match (getServicePluginSnapshot("gitcode-monitor")) {
+                    case Some(snapshot) =>
+                        @Expect(snapshot.status, "degraded")
+                        @Expect(snapshot.degradedReason, "restart_healthz_failed")
+                        @Expect(snapshot.lastError.contains("port=0"), true)
+                    case None => @Expect(true, false)
+                }
+            } finally {
+                setServicePluginHealthzProbeForTest(None)
+                resetServicePluginHostForTest()
+            }
+        })
+    }
+
+    @TestCase
+    public func tT5P1T5N1ProcessStartDiagnosticIsLoggedAndRedacted(): Unit {
+        // T5-P1, T5-N1.
+        withServicePluginHostTestHome("service-plugin-t5-start-diagnostic", { home: Path =>
+            let oldLogLevel = getVariable("METIS_LOG_LEVEL")
+            let oldLogFile = getVariable("METIS_LOG_FILE")
+            let oldConsoleLevel = getVariable("METIS_CONSOLE_LEVEL")
+            let logFile = home.join("logs").join("service-plugin-start.log")
+            try {
+                setVariable("METIS_LOG_LEVEL", "debug")
+                setVariable("METIS_LOG_FILE", logFile.toString())
+                setVariable("METIS_CONSOLE_LEVEL", "silent")
+                gatewayLoggingResetForTest()
+                resetServicePluginHostForTest()
+
+                let script = "printf '%s\\n' '${this.gitCodeInitLine()}'; read ignored || true"
+                let okRegistration = registerServicePlugin(ServicePluginRegistration(
+                    this.gitCodeStdioManifestFromScript(script),
+                    configRef: ServicePluginConfigRef(secretRef: "gcm-token", manifestPath: home.join("metis.service-plugin.json").toString())
+                ))
+                @Expect(okRegistration.ok, true)
+                let started = ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000)
+                @Expect(started.ok, true)
+
+                let okLog = this.readTextFile(logFile)
+                @Expect(okLog.contains("service_plugin.process.start"), true)
+                @Expect(okLog.contains("entryCommand"), true)
+                @Expect(okLog.contains("workingDirectory"), true)
+                @Expect(okLog.contains("manifestPath"), true)
+                @Expect(okLog.contains("configRef"), true)
+                @Expect(okLog.contains("pid"), true)
+                @Expect(okLog.contains("binaryMtime"), true)
+                @Expect(okLog.contains("gcm-token"), false)
+
+                resetServicePluginHostForTest()
+                let badCaps = ArrayList<ServiceCapabilityRecord>()
+                badCaps.add(ServiceCapabilityRecord("gitcode.event.accepted", "event"))
+                let badManifest = ServicePluginManifest(
+                    schema: METIS_SERVICE_PLUGIN_SCHEMA,
+                    pluginId: "gitcode-monitor",
+                    displayName: "GitCode Monitor",
+                    kind: "service",
+                    protocolVersion: "1.0",
+                    entryCommand: home.join("missing-plugin-binary").toString(),
+                    hasConfigSchema: true,
+                    capabilityDeclarations: badCaps
+                )
+                let badRegistration = registerServicePlugin(ServicePluginRegistration(
+                    badManifest,
+                    configRef: ServicePluginConfigRef(secretRef: "gcm-token", manifestPath: home.join("missing.service-plugin.json").toString())
+                ))
+                @Expect(badRegistration.ok, true)
+                let failed = ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000)
+                @Expect(failed.ok, false)
+                @Expect(failed.status, "process_start_failed")
+                let failedLog = this.readTextFile(logFile)
+                @Expect(failedLog.contains("process_start_failed"), true)
+                @Expect(failedLog.contains("missing-plugin-binary"), true)
+                @Expect(failedLog.contains("gcm-token"), false)
+            } finally {
+                resetServicePluginHostForTest()
+                match (oldLogLevel) {
+                    case Some(value) => setVariable("METIS_LOG_LEVEL", value)
+                    case None => setVariable("METIS_LOG_LEVEL", "")
+                }
+                match (oldLogFile) {
+                    case Some(value) => setVariable("METIS_LOG_FILE", value)
+                    case None => setVariable("METIS_LOG_FILE", "")
+                }
+                match (oldConsoleLevel) {
+                    case Some(value) => setVariable("METIS_CONSOLE_LEVEL", value)
+                    case None => setVariable("METIS_CONSOLE_LEVEL", "")
+                }
+                gatewayLoggingResetForTest()
+            }
+        })
+    }
+
+    @TestCase
+    public func tT5N1SupervisorWorkerLogsTickAndCatchesException(): Unit {
+        // T5-N1 supervisor exception coverage.
+        withServicePluginHostTestHome("service-plugin-t5-supervisor-exception", { home: Path =>
+            let oldLogLevel = getVariable("METIS_LOG_LEVEL")
+            let oldLogFile = getVariable("METIS_LOG_FILE")
+            let oldConsoleLevel = getVariable("METIS_CONSOLE_LEVEL")
+            let logFile = home.join("logs").join("service-plugin-supervisor.log")
+            try {
+                setVariable("METIS_LOG_LEVEL", "debug")
+                setVariable("METIS_LOG_FILE", logFile.toString())
+                setVariable("METIS_CONSOLE_LEVEL", "silent")
+                gatewayLoggingResetForTest()
+
+                this.registerGitCodeStdioScript(this.gitCodeLeaseScript(18194))
+                setServicePluginSupervisorConfigForTest(ServicePluginSupervisorConfig(enabled: true, intervalMs: 1000, healthTimeoutMs: 10, failureThreshold: 1, restartCooldownMs: 1000))
+                setServicePluginHealthzProbeForTest(Some({ _url: String, _timeoutMs: Int64 =>
+                    throw Exception("healthz boom Authorization: Bearer secret-value /Users/private/path")
+                }))
+                let started = ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000)
+                @Expect(started.ok, true)
+                runServicePluginSupervisorWorkerTickForTest("gitcode-monitor", nowMs: 2000)
+
+                match (getServicePluginSnapshot("gitcode-monitor")) {
+                    case Some(snapshot) =>
+                        @Expect(snapshot.status, "degraded")
+                        @Expect(snapshot.degradedReason, "supervisor_exception")
+                        @Expect(snapshot.lastError.contains("secret-value"), false)
+                        @Expect(snapshot.lastError.contains("/Users/private"), false)
+                    case None => @Expect(true, false)
+                }
+                let log = this.readTextFile(logFile)
+                @Expect(log.contains("service_plugin.supervisor.exception"), true)
+                @Expect(log.contains("secret-value"), false)
+                @Expect(log.contains("/Users/private"), false)
+            } finally {
+                setServicePluginHealthzProbeForTest(None)
+                resetServicePluginHostForTest()
+                match (oldLogLevel) {
+                    case Some(value) => setVariable("METIS_LOG_LEVEL", value)
+                    case None => setVariable("METIS_LOG_LEVEL", "")
+                }
+                match (oldLogFile) {
+                    case Some(value) => setVariable("METIS_LOG_FILE", value)
+                    case None => setVariable("METIS_LOG_FILE", "")
+                }
+                match (oldConsoleLevel) {
+                    case Some(value) => setVariable("METIS_CONSOLE_LEVEL", value)
+                    case None => setVariable("METIS_CONSOLE_LEVEL", "")
+                }
+                gatewayLoggingResetForTest()
             }
         })
     }
