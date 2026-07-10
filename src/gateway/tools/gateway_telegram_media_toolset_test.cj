@@ -1,7 +1,7 @@
 package metis.gateway.tools
 
 import metis.core.{GatewayMediaDiagnosticSink, GatewayMediaVideoHttpResult, GatewayToolRuntimeContext, MediaDiagnosticEvent, gatewayWithToolRuntimeContext, resetGatewayMediaDiagnosticSinkForTest, setGatewayMediaDiagnosticSinkForRuntime, setGatewayMediaPdfRuntimeForTest, setGatewayMediaVideoHttpRunnerForTest}
-import metis.core.config.{CliConfig, CliSettingManager, GatewayUserSettings, MetisConfigManager}
+import metis.core.config.{CliConfig, CliSettingManager, GatewayUserSettings, MetisConfigManager, MetisProcessEnvironmentLock}
 import magic.core.message.Message
 import magic.core.model.{AsyncChatResponse, ChatModel, ChatRequest, ChatResponse}
 import magic.jsonable.*
@@ -181,26 +181,28 @@ private func gatewayMediaToolDiagFind(sink: GatewayMediaToolDiagnosticCaptureSin
 @Test
 public class GatewayTelegramMediaToolsetTest {
     private func withTelegramMediaToolsetConfigHome<T>(block: () -> T): T {
-        let testHome = "/tmp/metis-telegram-media-toolset-config-${DateTime.now().toUnixTimeStamp().toMilliseconds()}"
-        try { remove(Path(testHome), recursive: true) } catch (_e: Exception) { () }
-        Directory.create(testHome, recursive: true)
-        let oldHome = getVariable("METIS_HOME")
-        setVariable("METIS_HOME", testHome)
-        CliConfig.invalidatePathCache()
-        MetisConfigManager.invalidate()
-        CliSettingManager.invalidate()
-        try {
-            MetisConfigManager.initializeIfMissing()
-            return block()
-        } finally {
-            match (oldHome) {
-                case Some(value) => setVariable("METIS_HOME", value)
-                case None => setVariable("METIS_HOME", "")
-            }
+        synchronized(MetisProcessEnvironmentLock) {
+            let testHome = "/tmp/metis-telegram-media-toolset-config-${DateTime.now().toUnixTimeStamp().toNanoseconds()}"
+            try { remove(Path(testHome), recursive: true) } catch (_e: Exception) { () }
+            Directory.create(testHome, recursive: true)
+            let oldHome = getVariable("METIS_HOME")
+            setVariable("METIS_HOME", testHome)
             CliConfig.invalidatePathCache()
             MetisConfigManager.invalidate()
             CliSettingManager.invalidate()
-            try { remove(Path(testHome), recursive: true) } catch (_e: Exception) { () }
+            try {
+                MetisConfigManager.initializeIfMissing()
+                return block()
+            } finally {
+                match (oldHome) {
+                    case Some(value) => setVariable("METIS_HOME", value)
+                    case None => setVariable("METIS_HOME", "")
+                }
+                CliConfig.invalidatePathCache()
+                MetisConfigManager.invalidate()
+                CliSettingManager.invalidate()
+                try { remove(Path(testHome), recursive: true) } catch (_e: Exception) { () }
+            }
         }
     }
 
