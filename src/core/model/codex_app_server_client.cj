@@ -584,6 +584,12 @@ private func codexAppServerTerminateProcessTree(proc: SubProcess, rootPid: Int64
             }
         }
     }
+    let _ = codexAppServerWaitPidsGone(descendants, 1000)
+    let survivors = codexAppServerAlivePids(descendants)
+    for (pid in survivors) {
+        codexAppServerSignalPid(pid, "-KILL")
+    }
+    let _ = codexAppServerWaitPidsGone(survivors, 1000)
 }
 
 private func codexAppServerWaitProcessExit(proc: SubProcess, timeoutMs: Int64): Bool {
@@ -653,6 +659,31 @@ private func codexAppServerPidListContains(items: ArrayList<Int64>, pid: Int64):
         }
     }
     false
+}
+
+private func codexAppServerAlivePids(pids: Array<Int64>): Array<Int64> {
+    let out = ArrayList<Int64>()
+    for (pid in pids) {
+        if (codexAppServerPidAlive(pid)) {
+            out.add(pid)
+        }
+    }
+    out.toArray()
+}
+
+private func codexAppServerWaitPidsGone(pids: Array<Int64>, timeoutMs: Int64): Bool {
+    if (pids.isEmpty()) {
+        return true
+    }
+    let effective = if (timeoutMs > 0) { timeoutMs } else { 250 }
+    let started = DateTime.now().toUnixTimeStamp().toMilliseconds()
+    while (DateTime.now().toUnixTimeStamp().toMilliseconds() - started < effective) {
+        if (codexAppServerAlivePids(pids).isEmpty()) {
+            return true
+        }
+        sleep(Duration.millisecond * 25)
+    }
+    codexAppServerAlivePids(pids).isEmpty()
 }
 
 private func codexAppServerSignalPid(pid: Int64, signal: String): Unit {
