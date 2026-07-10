@@ -194,6 +194,7 @@ to separate code failures from package-level test-runner resource pressure. In t
 random package-level exit 9 after `cjpm clean` was resolved by lowering the test process heap in
 `[profile.test.env]` from `128MB` to `64MB`; `jobs` must not be added to `[profile.test]`, because
 the Cangjie unittest runtime treats it as an unknown runtime option.
+Historical lesson: a full-suite pass with `cjpm test -j 1` proves package-level serial execution is clean, but it does not prove bare `cjpm test` is clean, because `-j 1` limits package-level concurrency while `[profile.test].parallel` only controls unittest workers inside each package.
 
 ## Code Style
 
