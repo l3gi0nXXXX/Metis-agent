@@ -76,6 +76,18 @@ public class ServicePluginHostTest {
         script
     }
 
+    private func stdioScriptWithInvokeBatches(initLine: String, invokeBatches: Array<Array<String>>): String {
+        var script = "printf '%s\\n' '${initLine}'"
+        for (batch in invokeBatches) {
+            script += "; read ignored"
+            for (line in batch) {
+                script += "; printf '%s\\n' '${line}'"
+            }
+        }
+        script += "; read ignored || true"
+        script
+    }
+
     private func stdioInvokeResponseLine(payload: String, serviceId!: String = "stdio-service", capabilityId!: String = "stdio.monitor.status", correlationId!: String = "corr-stdio-service-1-stdio.monitor.status"): String {
         "{\"type\":\"response\",\"frameId\":\"invoke-1\",\"serviceId\":\"${serviceId}\",\"method\":\"invokeCapability\",\"capabilityId\":\"${capabilityId}\",\"correlationId\":\"${correlationId}\",\"payload\":${payload}}"
     }
@@ -1495,32 +1507,25 @@ public class ServicePluginHostTest {
     public func stdioInvokeRejectsWrongRequestIdentity(): Unit {
         let initLine = "{\"type\":\"response\",\"frameId\":\"init-1\",\"serviceId\":\"stdio-service\",\"method\":\"initialize\",\"payload\":{\"ok\":true,\"status\":\"ready\"}}"
         let wrongService = this.stdioInvokeResponseLine("{\"ok\":true,\"status\":\"ok\"}", serviceId: "other-service")
-        this.registerStdioScript(this.stdioScriptWithInvokeLines(initLine, [wrongService]))
-        try {
-            let result = invokeRegisteredCapability(CapabilityInvokeRequest("stdio.monitor.status", payload: "{}"))
-            @Expect(result.ok, false)
-            @Expect(result.status, "unexpected_frame")
-        } finally {
-            resetServicePluginHostForTest()
-        }
-
         let wrongCapability = this.stdioInvokeResponseLine("{\"ok\":true,\"status\":\"ok\"}", capabilityId: "stdio.monitor.other")
-        this.registerStdioScript(this.stdioScriptWithInvokeLines(initLine, [wrongCapability]))
-        try {
-            let result = invokeRegisteredCapability(CapabilityInvokeRequest("stdio.monitor.status", payload: "{}"))
-            @Expect(result.ok, false)
-            @Expect(result.status, "unexpected_frame")
-        } finally {
-            resetServicePluginHostForTest()
-        }
-
         let wrongCorrelation = this.stdioInvokeResponseLine("{\"ok\":true,\"status\":\"ok\"}", correlationId: "corr-other")
         let correctResponse = this.stdioInvokeResponseLine("{\"ok\":true,\"status\":\"ok\"}")
-        this.registerStdioScript(this.stdioScriptWithInvokeLines(initLine, [wrongCorrelation, correctResponse]))
+        this.registerStdioScript(this.stdioScriptWithInvokeBatches(
+            initLine,
+            [[wrongService], [wrongCapability], [wrongCorrelation, correctResponse]]
+        ))
         try {
-            let result = invokeRegisteredCapability(CapabilityInvokeRequest("stdio.monitor.status", payload: "{}"))
-            @Expect(result.ok, true)
-            @Expect(result.status, "ok")
+            let wrongServiceResult = invokeRegisteredCapability(CapabilityInvokeRequest("stdio.monitor.status", payload: "{}"))
+            @Expect(wrongServiceResult.ok, false)
+            @Expect(wrongServiceResult.status, "unexpected_frame")
+
+            let wrongCapabilityResult = invokeRegisteredCapability(CapabilityInvokeRequest("stdio.monitor.status", payload: "{}"))
+            @Expect(wrongCapabilityResult.ok, false)
+            @Expect(wrongCapabilityResult.status, "unexpected_frame")
+
+            let correlatedResult = invokeRegisteredCapability(CapabilityInvokeRequest("stdio.monitor.status", payload: "{}"))
+            @Expect(correlatedResult.ok, true)
+            @Expect(correlatedResult.status, "ok")
         } finally {
             resetServicePluginHostForTest()
         }
