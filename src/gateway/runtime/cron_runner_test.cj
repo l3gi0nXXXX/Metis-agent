@@ -27,8 +27,10 @@ import metis.gateway.model.{ChannelPolicyConfig, InboundMessage, OutboundMessage
 import metis.gateway.session.{GatewayIngressSource, GatewaySessionRequest, GatewayTurnContext, gatewayIngressSourceLabel}
 
 import std.collection.HashMap
+import std.core.Duration
 import std.env.{getVariable, setVariable}
 import std.fs.{Directory, File, Path, remove}
+import std.sync.{Condition, Mutex}
 import std.time.DateTime
 import std.unittest.testmacro.*
 import stdx.encoding.json.{JsonObject, JsonString}
@@ -155,6 +157,71 @@ private func cronRunnerRepeatedText(text: String, count: Int64): String {
     out.toString()
 }
 
+private func awaitCronConditionForTest(
+    lock: Mutex,
+    condition: Condition,
+    predicate: () -> Bool,
+    timeoutMs: Int64
+): Bool {
+    let deadline = DateTime.now().toUnixTimeStamp().toMilliseconds() + timeoutMs
+    synchronized(lock) {
+        while (!predicate()) {
+            let remaining = deadline - DateTime.now().toUnixTimeStamp().toMilliseconds()
+            if (remaining <= 0) {
+                return false
+            }
+            let _ = condition.wait(timeout: Duration.millisecond * remaining)
+        }
+        true
+    }
+}
+
+private class ControllableCronReply {
+    private let lock = Mutex()
+    private var condition: Condition
+    private var started: Bool = false
+    private var released: Bool = false
+    private var completed: Bool = false
+    private let answer: String
+
+    public init(answer: String) {
+        synchronized(this.lock) {
+            this.condition = this.lock.condition()
+        }
+        this.answer = answer
+    }
+
+    public func reply(): String {
+        synchronized(this.lock) {
+            this.started = true
+            this.condition.notifyAll()
+            while (!this.released) {
+                this.condition.wait()
+            }
+            this.completed = true
+            this.condition.notifyAll()
+        }
+        this.answer
+    }
+
+    public func awaitStarted(timeoutMs: Int64): Bool {
+        awaitCronConditionForTest(this.lock, this.condition, { => this.started }, timeoutMs)
+    }
+
+    public func release(): Unit {
+        synchronized(this.lock) {
+            this.released = true
+            this.condition.notifyAll()
+        }
+    }
+
+    public func isCompleted(): Bool {
+        synchronized(this.lock) {
+            this.completed
+        }
+    }
+}
+
 private func cronRunnerInstallFakeTavilyProvider(): Unit {
     setVariable("TAVILY_API_KEY", "fake-tavily-key")
     setGatewayWebProviderResolverForTest(Some({ _capability: String =>
@@ -196,6 +263,230 @@ private func cronRunnerFakeDuckDuckGoWebBrief(): String {
 
 @Test
 public class CronRunnerTest {
+    @TestCase
+    public func m0u1FinalizeStateMachinePreservesRecurringAndOneShotContracts(): Unit {
+        withCronRunnerTestHome({ storePath: Path =>
+            let recurringSuccess = CronJob(
+                "m0-recurring-success",
+                "success",
+                CronSchedule.every(60000),
+                state: CronJobState(nextRunAtMs: 1)
+            )
+            let recurringError = CronJob(
+                "m0-recurring-error",
+                "error",
+                CronSchedule.every(60000),
+                state: CronJobState(nextRunAtMs: 1)
+            )
+            let oneShotSuccess = CronJob(
+                "m0-at-success",
+                "success",
+                CronSchedule.at(1),
+                state: CronJobState(nextRunAtMs: 1)
+            )
+            let oneShotError = CronJob(
+                "m0-at-error",
+                "error",
+                CronSchedule.at(1),
+                state: CronJobState(nextRunAtMs: 1)
+            )
+            cronSave(storePath, [recurringSuccess, recurringError, oneShotSuccess, oneShotError])
+            debugSetCronRunnerReplyForTest(Some({ job: CronJob, _request: GatewaySessionRequest =>
+                if (job.prompt == "error") {
+                    throw Exception("permanent baseline failure")
+                }
+                "baseline success"
+            }))
+
+            for (jobId in ["m0-recurring-success", "m0-recurring-error", "m0-at-success", "m0-at-error"]) {
+                let result = CronRunner.runJobOnceFromStore(None<GatewayService>, storePath, jobId, true)
+                @Expect(result.get("ok").getOrThrow().asBool().getValue(), true)
+                @Expect(result.get("ran").getOrThrow().asBool().getValue(), true)
+            }
+
+            let jobs = cronLoadOrEmpty(storePath)
+            let byId = HashMap<String, CronJob>()
+            for (job in jobs) {
+                byId[job.id] = job
+            }
+            let recurringOk = byId.get("m0-recurring-success").getOrThrow()
+            @Expect(recurringOk.enabled, true)
+            @Expect(recurringOk.state.lastStatus, "success")
+            @Expect(recurringOk.state.consecutiveErrors, 0)
+            @Expect(recurringOk.state.runningAtMs, 0)
+            @Expect(recurringOk.state.nextRunAtMs > recurringOk.state.lastRunAtMs, true)
+
+            let recurringFailed = byId.get("m0-recurring-error").getOrThrow()
+            @Expect(recurringFailed.enabled, true)
+            @Expect(recurringFailed.state.lastStatus, "error")
+            @Expect(recurringFailed.state.consecutiveErrors, 1)
+            @Expect(recurringFailed.state.runningAtMs, 0)
+            @Expect(recurringFailed.state.nextRunAtMs > recurringFailed.state.lastRunAtMs, true)
+
+            let atOk = byId.get("m0-at-success").getOrThrow()
+            @Expect(atOk.enabled, false)
+            @Expect(atOk.state.lastStatus, "success")
+            @Expect(atOk.state.nextRunAtMs, 0)
+            @Expect(atOk.state.runningAtMs, 0)
+
+            let atFailed = byId.get("m0-at-error").getOrThrow()
+            @Expect(atFailed.enabled, false)
+            @Expect(atFailed.state.lastStatus, "error")
+            @Expect(atFailed.state.consecutiveErrors, 1)
+            @Expect(atFailed.state.nextRunAtMs, 0)
+            @Expect(atFailed.state.runningAtMs, 0)
+        })
+    }
+
+    @TestCase
+    public func m0b1CorruptUtf8AndMalformedJsonStayInsideTemporaryCronFiles(): Unit {
+        withCronRunnerTestHome({ storePath: Path =>
+            Directory.create(storePath.parent, recursive: true)
+            File.writeTo(storePath, Array<Byte>(4, { i => if (i == 1) { 40 } else { 195 } }))
+            @Expect(cronLoadOrEmpty(storePath).size, 0)
+
+            File.writeTo(storePath, "{\"version\":1,\"jobs\":[".toArray())
+            @Expect(cronLoadOrEmpty(storePath).size, 0)
+
+            let recovery = CronJob(
+                "m0-recovery-中文-🙂",
+                "恢复任务🙂",
+                CronSchedule.every(60000),
+                state: CronJobState(nextRunAtMs: 1)
+            )
+            cronSave(storePath, [recovery])
+            debugSetCronRunnerReplyForTest(Some({ _job: CronJob, _request: GatewaySessionRequest =>
+                "恢复成功🙂"
+            }))
+            let result = CronRunner.runJobOnceFromStore(None<GatewayService>, storePath, recovery.id, true)
+            @Expect(result.get("ok").getOrThrow().asBool().getValue(), true)
+            @Expect(cronLoadOrEmpty(storePath)[0].state.lastStatus, "success")
+
+            let runLogPath = cronRunLogPathFromStore(storePath, recovery.id)
+            File.writeTo(runLogPath, Array<Byte>(4, { i => if (i == 2) { 40 } else { 195 } }))
+            let invalidUtf8Runs = readCronRunLogEntriesForJob(storePath, recovery.id, limit: 10)
+            @Expect(invalidUtf8Runs.get("total").getOrThrow().asInt().getValue(), 0)
+
+            File.writeTo(runLogPath, "{\"status\":\"ok\"\nnot-json\n".toArray())
+            let malformedRuns = readCronRunLogEntriesForJob(storePath, recovery.id, limit: 10)
+            @Expect(malformedRuns.get("total").getOrThrow().asInt().getValue(), 0)
+        })
+    }
+
+    @TestCase
+    public func m0p1DueTickBlocksUntilControlledUtf8ReplyThenDeliversOnce(): Unit {
+        withCronRunnerTestHome({ storePath: Path =>
+            let answer = cronRunnerRepeatedText("仓颉社区🙂", 1200)
+            let controlled = ControllableCronReply(answer)
+            let job = CronJob(
+                "m0-controlled-due",
+                "生成社区通知",
+                CronSchedule.every(60000),
+                state: CronJobState(nextRunAtMs: 1),
+                deliveryChannel: "feishu",
+                deliveryTo: "fake-chat",
+                deliveryMode: "announce",
+                deliveryAccountId: "fake-tenant"
+            )
+            cronSave(storePath, [job])
+            debugSetCronRunnerReplyForTest(Some({ _job: CronJob, _request: GatewaySessionRequest =>
+                controlled.reply()
+            }))
+            let adapter = CronRunnerTestChannelAdapter("feishu", messageId: "fake-message")
+            let service = cronRunnerTestGateway(adapter, "feishu", "fake-tenant")
+            let runner = CronRunner(gatewayOpt: Some(service), storePath: storePath, cronEnabled: true)
+
+            let tickFuture = spawn {
+                runner.tick(nowOverride: Some<Int64>(2000))
+            }
+            @Expect(controlled.awaitStarted(2000), true)
+            @Expect(controlled.isCompleted(), false)
+            @Expect(adapter.sendCount, 0)
+
+            controlled.release()
+            tickFuture.get()
+
+            @Expect(controlled.isCompleted(), true)
+            @Expect(adapter.sendCount, 1)
+            @Expect(adapter.lastText.contains("仓颉社区🙂"), true)
+            @Expect(adapter.lastText.size > 4000, true)
+            let jobs = cronLoadOrEmpty(storePath)
+            @Expect(jobs[0].state.lastStatus, "success")
+            let runs = readCronRunLogEntriesForJob(storePath, job.id, limit: 10)
+            @Expect(runs.get("total").getOrThrow().asInt().getValue(), 1)
+            let row = runs.get("entries").getOrThrow().asArray()[0].asObject()
+            @Expect(row.get("status").getOrThrow().asString().getValue(), "ok")
+            @Expect(row.get("deliveryStatus").getOrThrow().asString().getValue(), "delivered")
+            @Expect(row.get("summary").getOrThrow().asString().getValue(), answer)
+        })
+    }
+
+    @TestCase
+    public func m0n1DeliveryAndRunLogFailuresPreserveHistoricalIsolation(): Unit {
+        withCronRunnerTestHome({ storePath: Path =>
+            let strict = CronJob(
+                "m0-strict",
+                "strict",
+                CronSchedule.every(60000),
+                state: CronJobState(nextRunAtMs: 1),
+                deliveryChannel: "feishu",
+                deliveryTo: "fake-chat",
+                deliveryMode: "announce",
+                deliveryAccountId: "fake-tenant"
+            )
+            let bestEffort = CronJob(
+                "m0-best-effort",
+                "best-effort",
+                CronSchedule.every(60000),
+                state: CronJobState(nextRunAtMs: 1),
+                deliveryChannel: "feishu",
+                deliveryTo: "fake-chat",
+                deliveryMode: "announce",
+                deliveryAccountId: "fake-tenant",
+                bestEffortDeliver: true
+            )
+            let logFailure = cronRunnerTestJob("m0-log-failure")
+            cronSave(storePath, [strict, bestEffort, logFailure])
+            debugSetCronRunnerReplyForTest(Some({ _job: CronJob, _request: GatewaySessionRequest =>
+                "业务结果🙂"
+            }))
+            let adapter = CronRunnerTestChannelAdapter(
+                "feishu",
+                failSend: true,
+                failMessage: "send failed Authorization: Bearer secret-m0 token=private-m0"
+            )
+            let service = cronRunnerTestGateway(adapter, "feishu", "fake-tenant")
+
+            let _strictResult = CronRunner.runJobOnceFromStore(Some(service), storePath, strict.id, true)
+            let _bestEffortResult = CronRunner.runJobOnceFromStore(Some(service), storePath, bestEffort.id, true)
+            debugSetCronRunnerRunLogAppendForTest(Some({ =>
+                throw Exception("run-log-unavailable")
+            }))
+            let _logResult = CronRunner.runJobOnceFromStore(Some(service), storePath, logFailure.id, true)
+
+            let jobs = cronLoadOrEmpty(storePath)
+            let byId = HashMap<String, CronJob>()
+            for (job in jobs) {
+                byId[job.id] = job
+            }
+            let strictAfter = byId.get(strict.id).getOrThrow()
+            @Expect(strictAfter.state.lastStatus, "error")
+            @Expect(strictAfter.state.lastError.contains("secret-m0"), false)
+            @Expect(strictAfter.state.lastError.contains("private-m0"), false)
+            @Expect(strictAfter.state.lastError.contains("redacted"), true)
+
+            let bestEffortAfter = byId.get(bestEffort.id).getOrThrow()
+            @Expect(bestEffortAfter.state.lastStatus, "success")
+            @Expect(bestEffortAfter.state.lastError, "")
+
+            let logFailureAfter = byId.get(logFailure.id).getOrThrow()
+            @Expect(logFailureAfter.state.lastStatus, "success")
+            @Expect(logFailureAfter.state.lastError, "")
+            let logFailureRuns = readCronRunLogEntriesForJob(storePath, logFailure.id, limit: 10)
+            @Expect(logFailureRuns.get("total").getOrThrow().asInt().getValue(), 0)
+        })
+    }
+
     @TestCase
     public func cronBuildSessionRequestPreservesUnifiedIngressSemantics(): Unit {
         let job = CronJob(
