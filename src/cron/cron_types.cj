@@ -92,6 +92,12 @@ public class CronJobState {
     public var scheduleErrorCount: Int64
     /** 上次发出失败告警的时间（毫秒），用于 cooldown。 */
     public var lastFailureAlertAtMs: Int64
+    /** 当前持久化 reservation 的执行标识；空串表示没有已保留执行。 */
+    public var executionId: String
+    /** 当前 execution 开始时间（毫秒）；旧 store 缺失时为 0。 */
+    public var executionStartedAtMs: Int64
+    /** 当前 execution 最近心跳时间（毫秒）；旧 store 缺失时为 0。 */
+    public var executionHeartbeatAtMs: Int64
 
     public init(
         nextRunAtMs!: Int64 = 0,
@@ -101,7 +107,10 @@ public class CronJobState {
         consecutiveErrors!: Int64 = 0,
         runningAtMs!: Int64 = 0,
         scheduleErrorCount!: Int64 = 0,
-        lastFailureAlertAtMs!: Int64 = 0
+        lastFailureAlertAtMs!: Int64 = 0,
+        executionId!: String = "",
+        executionStartedAtMs!: Int64 = 0,
+        executionHeartbeatAtMs!: Int64 = 0
     ) {
         this.nextRunAtMs = nextRunAtMs
         this.lastRunAtMs = lastRunAtMs
@@ -111,6 +120,9 @@ public class CronJobState {
         this.runningAtMs = runningAtMs
         this.scheduleErrorCount = scheduleErrorCount
         this.lastFailureAlertAtMs = lastFailureAlertAtMs
+        this.executionId = executionId
+        this.executionStartedAtMs = executionStartedAtMs
+        this.executionHeartbeatAtMs = executionHeartbeatAtMs
     }
 }
 
