@@ -61,7 +61,10 @@ public func cronCloneJobForExecution(job: CronJob): CronJob {
         consecutiveErrors: job.state.consecutiveErrors,
         runningAtMs: job.state.runningAtMs,
         scheduleErrorCount: job.state.scheduleErrorCount,
-        lastFailureAlertAtMs: job.state.lastFailureAlertAtMs
+        lastFailureAlertAtMs: job.state.lastFailureAlertAtMs,
+        executionId: job.state.executionId,
+        executionStartedAtMs: job.state.executionStartedAtMs,
+        executionHeartbeatAtMs: job.state.executionHeartbeatAtMs
     )
     let schedule = if (job.schedule.kind == "every") {
         CronSchedule.every(job.schedule.everyMs, anchorMs: job.schedule.anchorMs)
