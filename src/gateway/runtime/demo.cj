@@ -150,8 +150,10 @@ public func runGatewayService(verbose!: Bool = false): Unit {
     gatewayServeTimingLog("rpc-server-started", startMs)
     let cronRunner = CronRunner(
         gatewayOpt: Some(gateway),
-        cronEnabled: user.cronEnabled
+        cronEnabled: user.cronEnabled,
+        maxConcurrentRuns: user.cronMaxConcurrentRuns
     )
+    cronRunner.start()
     registerGatewayCronRunHookForRunner(cronRunner)
     try {
         if (generatedAuthToken) {
@@ -266,6 +268,7 @@ public func runGatewayService(verbose!: Bool = false): Unit {
             sleep(Duration.millisecond * 200)
         }
     } finally {
+        cronRunner.stopAccepting()
         MetisConfigManager.setWriteRootNotificationHook(None<MetisConfigWriteNotificationListener>)
         try {
             gateway.stop()

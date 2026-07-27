@@ -142,7 +142,8 @@ public func gatewayCronExecuteJobOnce(jobId: String, force: Bool): JsonObject {
         cronStorePath(CliConfig.dotDir),
         jobId,
         force,
-        cronEnabled: user.cronEnabled
+        cronEnabled: user.cronEnabled,
+        maxConcurrentRuns: user.cronMaxConcurrentRuns
     )
     try {
         gw.stop()

@@ -650,6 +650,8 @@ public struct GatewayUserSettings {
     public var enabled: Bool = true
     /** 为 false 时网关内 `CronRunner` 不调度、不触发任务。 */
     public var cronEnabled: Bool = true
+    /** Cron worker 并发数；启动时钳制到 1..32，热更新需重启 Gateway 生效。 */
+    public var cronMaxConcurrentRuns: Int64 = 1
     /**
      * `gateway:cron:run:*` 单次运行转录保留小时数；<=0 关闭清扫。
      */

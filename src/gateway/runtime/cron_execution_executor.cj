@@ -17,19 +17,60 @@ public struct CronExecutionId {
     ) {}
 }
 
+public class CronExecutionArtifact {
+    public var status: String
+    public var error: String
+    public var answer: String
+    public var deliveryStatus: String
+    public var deliveryError: String
+    public var diagnosticCode: String
+    public var diagnosticMessage: String
+    public var endedAtMs: Int64
+
+    public init(
+        status!: String = "success",
+        error!: String = "",
+        answer!: String = "",
+        deliveryStatus!: String = "not-requested",
+        deliveryError!: String = "",
+        diagnosticCode!: String = "",
+        diagnosticMessage!: String = "",
+        endedAtMs!: Int64 = 0
+    ) {
+        this.status = status
+        this.error = error
+        this.answer = answer
+        this.deliveryStatus = deliveryStatus
+        this.deliveryError = deliveryError
+        this.diagnosticCode = diagnosticCode
+        this.diagnosticMessage = diagnosticMessage
+        this.endedAtMs = endedAtMs
+    }
+}
+
 /** 已取得 executor slot、等待立即启动的执行快照。 */
 public class CronExecutionTask {
     public let executionId: CronExecutionId
     public let job: CronJob
-    private let runTask: (CronJob) -> Unit
+    public let absoluteDeadlineMs: Int64
+    public let idleTimeoutMs: Int64
+    private let runTask: (CronJob) -> CronExecutionArtifact
 
-    public init(executionId: CronExecutionId, job: CronJob, runTask: (CronJob) -> Unit) {
+    public init(
+        executionId: CronExecutionId,
+        job: CronJob,
+        runTask: (CronJob) -> CronExecutionArtifact,
+        absoluteDeadlineMs!: Int64 = 0,
+        idleTimeoutMs!: Int64 = 0
+    ) {
         this.executionId = executionId
         this.job = job
         this.runTask = runTask
+        this.absoluteDeadlineMs = absoluteDeadlineMs
+        this.idleTimeoutMs = idleTimeoutMs
     }
 
-    public func run(): Unit {
+    public func run(): CronExecutionArtifact {
         this.runTask(this.job)
     }
 }
@@ -39,11 +80,24 @@ public class CronExecutionResult {
     public let executionId: CronExecutionId
     public let job: CronJob
     public let error: String
+    public let startedAtMs: Int64
+    public let endedAtMs: Int64
+    public let artifact: CronExecutionArtifact
 
-    public init(executionId: CronExecutionId, job: CronJob, error!: String = "") {
+    public init(
+        executionId: CronExecutionId,
+        job: CronJob,
+        error!: String = "",
+        startedAtMs!: Int64 = 0,
+        endedAtMs!: Int64 = 0,
+        artifact!: CronExecutionArtifact = CronExecutionArtifact()
+    ) {
         this.executionId = executionId
         this.job = job
         this.error = error
+        this.startedAtMs = startedAtMs
+        this.endedAtMs = endedAtMs
+        this.artifact = artifact
     }
 
     public func succeeded(): Bool {
@@ -184,13 +238,21 @@ public class CronExecutionExecutor {
         }
         spawn {
             var error = ""
+            var artifact = CronExecutionArtifact()
             try {
-                task.run()
+                artifact = task.run()
             } catch (e: Exception) {
                 error = e.message
             } finally {
                 synchronized(this.stateLock) {
-                    this.completed.add(CronExecutionResult(task.executionId, task.job, error: error))
+                    this.completed.add(CronExecutionResult(
+                        task.executionId,
+                        task.job,
+                        error: error,
+                        startedAtMs: task.executionId.startedAtMs,
+                        endedAtMs: artifact.endedAtMs,
+                        artifact: artifact
+                    ))
                     this.active -= 1
                 }
             }
@@ -209,6 +271,12 @@ public class CronExecutionExecutor {
     public func activeCount(): Int64 {
         synchronized(this.stateLock) {
             this.active
+        }
+    }
+
+    public func completedCount(): Int64 {
+        synchronized(this.stateLock) {
+            this.completed.size
         }
     }
 
