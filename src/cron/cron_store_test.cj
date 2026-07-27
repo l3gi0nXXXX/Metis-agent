@@ -312,3 +312,194 @@ public class CronStorePermissionAndCorruptionTest {
         })
     }
 }
+
+@Test
+public class CronExecutionJournalSchemaTest {
+    /** M1-B2: scheduler cursor uses the same stable `(nextRunAtMs, jobId)` ordering as due-job selection. */
+    @TestCase
+    public func schedulerCursorIsDeterministicallyComparable(): Unit {
+        @Expect(
+            cronCompareSchedulerCursor(
+                CronSchedulerCursor(nextRunAtMs: 100, jobId: "z"),
+                CronSchedulerCursor(nextRunAtMs: 101, jobId: "a")
+            ),
+            -1
+        )
+        @Expect(
+            cronCompareSchedulerCursor(
+                CronSchedulerCursor(nextRunAtMs: 100, jobId: "a"),
+                CronSchedulerCursor(nextRunAtMs: 100, jobId: "b")
+            ),
+            -1
+        )
+        @Expect(
+            cronCompareSchedulerCursor(
+                CronSchedulerCursor(nextRunAtMs: 100, jobId: "a"),
+                CronSchedulerCursor(nextRunAtMs: 100, jobId: "a")
+            ),
+            0
+        )
+    }
+
+    /** M1-N2/M2-B2: rejected and repeated journal transitions never partially mutate durable state. */
+    @TestCase
+    public func journalTransitionIsMonotonicAtomicAndIdempotent(): Unit {
+        let entry = CronExecutionJournalEntry(
+            "exec-1",
+            "job-1",
+            phase: "executing",
+            reservedAtMs: 10,
+            updatedAtMs: 20
+        )
+        @Expect(entry.transition("executing", 30), false)
+        @Expect(entry.phase, "executing")
+        @Expect(entry.updatedAtMs, 20)
+
+        var rejected = false
+        try {
+            entry.transition("reserved", 40)
+        } catch (_: Exception) {
+            rejected = true
+        }
+        @Expect(rejected, true)
+        @Expect(entry.phase, "executing")
+        @Expect(entry.updatedAtMs, 20)
+
+        @Expect(entry.transition("result_committed", 50), true)
+        @Expect(entry.phase, "result_committed")
+        @Expect(entry.updatedAtMs, 50)
+    }
+
+    /** M2-B2: legacy schema defaults reservation/journal fields without losing the old job. */
+    @TestCase
+    public func legacyStoreDefaultsExecutionFieldsAndEmptyJournal(): Unit {
+        withCronStoreTestPath({ storePath =>
+            Directory.create(storePath.parent, recursive: true)
+            File.writeTo(
+                storePath,
+                ("{\"version\":1,\"jobs\":[{\"id\":\"legacy\",\"prompt\":\"hello\"," +
+                    "\"schedule\":{\"kind\":\"every\",\"everyMs\":60000}," +
+                    "\"state\":{\"nextRunAtMs\":123}}]}").toArray()
+            )
+
+            let store = cronLoadStoreOrEmpty(storePath)
+            @Expect(store.jobs.size, 1)
+            @Expect(store.jobs[0].state.executionId, "")
+            @Expect(store.jobs[0].state.executionStartedAtMs, 0)
+            @Expect(store.jobs[0].state.executionHeartbeatAtMs, 0)
+            @Expect(store.scheduler.fairnessCursor.jobId, "")
+            @Expect(store.journal.size, 0)
+        })
+    }
+
+    /** M2-B2/REV-03/REV-04: jobs, cursor, journal marker and all receipt states share one snapshot. */
+    @TestCase
+    public func envelopeRoundTripPersistsJournalCursorAndDeliveryReceipts(): Unit {
+        withCronStoreTestPath({ storePath =>
+            let job = cronStoreTestJob("durable")
+            job.state.executionId = "exec-durable"
+            job.state.executionStartedAtMs = 100
+            job.state.executionHeartbeatAtMs = 110
+            let statuses = ["not_started", "in_flight", "succeeded", "failed", "unknown"]
+            let receipts = ArrayList<CronDeliveryReceipt>()
+            var index: Int64 = 0
+            for (status in statuses) {
+                receipts.add(
+                    CronDeliveryReceipt(
+                        "target-${index}",
+                        status: status,
+                        updatedAtMs: 200 + index,
+                        errorCode: if (status == "failed") { "send_failed" } else { "" }
+                    )
+                )
+                index += 1
+            }
+            let journal = CronExecutionJournalEntry(
+                "exec-durable",
+                "durable",
+                phase: "result_committed",
+                reservedAtMs: 100,
+                updatedAtMs: 200,
+                businessOutcomeHash: "sha256:result",
+                runLogRecorded: true,
+                deliveryReceipts: receipts.toArray()
+            )
+            cronSaveStoreAtomic(
+                storePath,
+                CronStoreEnvelope(
+                    jobs: [job],
+                    scheduler: CronSchedulerMetadata(
+                        fairnessCursor: CronSchedulerCursor(nextRunAtMs: 123, jobId: "durable")
+                    ),
+                    journal: [journal]
+                )
+            )
+
+            let loaded = cronLoadStoreOrEmpty(storePath)
+            @Expect(loaded.jobs[0].state.executionId, "exec-durable")
+            @Expect(loaded.jobs[0].state.executionStartedAtMs, 100)
+            @Expect(loaded.jobs[0].state.executionHeartbeatAtMs, 110)
+            @Expect(loaded.scheduler.fairnessCursor.nextRunAtMs, 123)
+            @Expect(loaded.scheduler.fairnessCursor.jobId, "durable")
+            @Expect(loaded.journal.size, 1)
+            @Expect(loaded.journal[0].phase, "result_committed")
+            @Expect(loaded.journal[0].businessOutcomeHash, "sha256:result")
+            @Expect(loaded.journal[0].runLogRecorded, true)
+            @Expect(loaded.journal[0].deliveryReceipts.size, 5)
+            index = 0
+            for (status in statuses) {
+                @Expect(loaded.journal[0].deliveryReceipts[index].status, status)
+                index += 1
+            }
+
+            let journalJson = JsonValue.fromStr(String.fromUtf8(File.readFrom(storePath)))
+                .asObject()
+                .get("executionJournal")
+                .getOrThrow()
+                .toJsonString()
+            @Expect(journalJson.contains("hello cron"), false)
+            @Expect(journalJson.contains("token"), false)
+            @Expect(journalJson.contains("payload"), false)
+        })
+    }
+
+    /** M2-B2: legacy cronSave callers preserve scheduler/journal and unknown root metadata. */
+    @TestCase
+    public func ordinaryCronSavePreservesEnvelopeMetadataAndUnknownFields(): Unit {
+        withCronStoreTestPath({ storePath =>
+            Directory.create(storePath.parent, recursive: true)
+            File.writeTo(
+                storePath,
+                ("{\"version\":1,\"futureMetadata\":{\"owner\":\"future\"}," +
+                    "\"scheduler\":{\"fairnessCursor\":{\"nextRunAtMs\":9,\"jobId\":\"old\"}," +
+                    "\"futureSchedulerField\":\"keep\"}," +
+                    "\"executionJournal\":[{\"executionId\":\"exec-old\",\"jobId\":\"old\"," +
+                    "\"phase\":\"reserved\",\"reservedAtMs\":1,\"updatedAtMs\":1," +
+                    "\"businessOutcomeHash\":\"\",\"runLogRecorded\":false,\"deliveryReceipts\":[]}]," +
+                    "\"jobs\":[]}").toArray()
+            )
+
+            cronSave(storePath, [cronStoreTestJob("new-job")])
+
+            let root = JsonValue.fromStr(String.fromUtf8(File.readFrom(storePath))).asObject()
+            @Expect(
+                root.get("futureMetadata").getOrThrow().asObject()
+                    .get("owner").getOrThrow().asString().getValue(),
+                "future"
+            )
+            let loaded = cronLoadStoreOrEmpty(storePath)
+            @Expect(loaded.jobs.size, 1)
+            @Expect(loaded.scheduler.fairnessCursor.jobId, "old")
+            @Expect(loaded.journal.size, 1)
+            @Expect(loaded.journal[0].executionId, "exec-old")
+
+            cronSaveStoreAtomic(storePath, loaded)
+            let afterEnvelopeSave = JsonValue.fromStr(String.fromUtf8(File.readFrom(storePath))).asObject()
+            @Expect(
+                afterEnvelopeSave.get("scheduler").getOrThrow().asObject()
+                    .get("futureSchedulerField").getOrThrow().asString().getValue(),
+                "keep"
+            )
+        })
+    }
+}

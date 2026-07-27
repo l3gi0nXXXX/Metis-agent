@@ -92,7 +92,10 @@ private func parseState(obj: JsonObject): CronJobState {
         consecutiveErrors: readI64(obj, "consecutiveErrors", default: 0),
         runningAtMs: readI64(obj, "runningAtMs", default: 0),
         scheduleErrorCount: readI64(obj, "scheduleErrorCount", default: 0),
-        lastFailureAlertAtMs: readI64(obj, "lastFailureAlertAtMs", default: 0)
+        lastFailureAlertAtMs: readI64(obj, "lastFailureAlertAtMs", default: 0),
+        executionId: readStr(obj, "executionId", default: ""),
+        executionStartedAtMs: readI64(obj, "executionStartedAtMs", default: 0),
+        executionHeartbeatAtMs: readI64(obj, "executionHeartbeatAtMs", default: 0)
     )
 }
 
@@ -169,24 +172,31 @@ public func cronStorePath(dotDir: Path): Path {
     dotDir.join(STORE_DIR).join(FILE_NAME)
 }
 
-public func cronLoadOrEmpty(path: Path): Array<CronJob> {
+private func cronReadStoreRoot(path: Path, reportErrors!: Bool = true): JsonObject {
     if (!exists(path)) {
-        return Array<CronJob>()
+        return JsonObject()
     }
     let text = try {
         String.fromUtf8(File.readFrom(path))
     } catch (_: Exception) {
-        LogUtils.error("CronStore: invalid_response_encoding")
-        return Array<CronJob>()
+        if (reportErrors) {
+            LogUtils.error("CronStore: invalid_response_encoding")
+        }
+        return JsonObject()
     }
-    let root = try {
+    try {
         JsonValue.fromStr(text).asObject()
     } catch (_: Exception) {
-        LogUtils.error("CronStore: malformed_json")
-        return Array<CronJob>()
+        if (reportErrors) {
+            LogUtils.error("CronStore: malformed_json")
+        }
+        JsonObject()
     }
+}
+
+private func cronParseJobs(root: JsonObject): Array<CronJob> {
     let ver = readI64(root, "version", default: 0)
-    if (ver != STORE_VERSION) {
+    if (ver != 0 && ver != STORE_VERSION) {
         LogUtils.info("CronStore: version mismatch (got ${ver}, expect ${STORE_VERSION}), still trying to parse jobs")
     }
     let list = ArrayList<CronJob>()
@@ -210,6 +220,27 @@ public func cronLoadOrEmpty(path: Path): Array<CronJob> {
         case None => ()
     }
     list.toArray()
+}
+
+public func cronLoadStoreOrEmpty(path: Path): CronStoreEnvelope {
+    let root = cronReadStoreRoot(path)
+    let scheduler = match (root.get("scheduler")) {
+        case Some(value) => try {
+            cronSchedulerMetadataFromJson(value.asObject())
+        } catch (_: Exception) {
+            CronSchedulerMetadata()
+        }
+        case None => CronSchedulerMetadata()
+    }
+    let journal = match (root.get("executionJournal")) {
+        case Some(value) => cronExecutionJournalFromJson(value)
+        case None => Array<CronExecutionJournalEntry>()
+    }
+    CronStoreEnvelope(jobs: cronParseJobs(root), scheduler: scheduler, journal: journal)
+}
+
+public func cronLoadOrEmpty(path: Path): Array<CronJob> {
+    cronLoadStoreOrEmpty(path).jobs
 }
 
 public func cronEnsureCronDirPermissions(dir: Path): Unit {
@@ -280,6 +311,9 @@ private func stateToJson(st: CronJobState): JsonObject {
     o.put("runningAtMs", JsonInt(st.runningAtMs))
     o.put("scheduleErrorCount", JsonInt(st.scheduleErrorCount))
     o.put("lastFailureAlertAtMs", JsonInt(st.lastFailureAlertAtMs))
+    o.put("executionId", JsonString(st.executionId))
+    o.put("executionStartedAtMs", JsonInt(st.executionStartedAtMs))
+    o.put("executionHeartbeatAtMs", JsonInt(st.executionHeartbeatAtMs))
     o
 }
 
@@ -330,15 +364,13 @@ private func jobToJson(j: CronJob): JsonObject {
     o
 }
 
-private func buildStoreJsonBytes(jobs: Array<CronJob>): Array<UInt8> {
-    let root = JsonObject()
+private func cronPutJobs(root: JsonObject, jobs: Array<CronJob>): Unit {
     root.put("version", JsonInt(STORE_VERSION))
     let arr = ArrayList<JsonValue>()
     for (j in jobs) {
         arr.add(jobToJson(j))
     }
     root.put("jobs", JsonArray(arr))
-    root.toJsonString().toArray()
 }
 
 /** 持久化任务列表；与参考实现一致采用临时文件 + 备份 + 替换。 */
@@ -351,39 +383,66 @@ public func cronSave(path: Path, jobs: Array<CronJob>): Unit {
  */
 public func cronSaveAtomic(path: Path, jobs: Array<CronJob>): Unit {
     synchronized(cronStoreWriteLock) {
-        let parent = path.parent
-        cronEnsureCronDirPermissions(parent)
-        let nextText = JsonValue.fromStr(String.fromUtf8(buildStoreJsonBytes(jobs))).toJsonString()
-        let bytes = nextText.toArray()
-        let stamp = DateTime.now().toUnixTimeStamp().toNanoseconds()
-        let tmp = parent.join("${FILE_NAME}.${stamp}.tmp")
+        // 普通命令只替换 jobs；保留 scheduler、journal 以及未来版本的未知根字段。
+        let root = cronReadStoreRoot(path, reportErrors: false)
+        cronPutJobs(root, jobs)
+        cronWriteStoreAtomicLocked(path, root)
+    }
+}
+
+/** jobs、scheduler metadata 与 execution journal 在同一个原子 store snapshot 中提交。 */
+public func cronSaveStoreAtomic(path: Path, store: CronStoreEnvelope): Unit {
+    synchronized(cronStoreWriteLock) {
+        // 保留未来版本加入的未知根字段，避免旧命令重写 store 时将其擦除。
+        let root = cronReadStoreRoot(path, reportErrors: false)
+        cronPutJobs(root, store.jobs)
+        let scheduler = match (root.get("scheduler")) {
+            case Some(value) => try { value.asObject() } catch (_: Exception) { JsonObject() }
+            case None => JsonObject()
+        }
+        scheduler.put(
+            "fairnessCursor",
+            cronSchedulerMetadataToJson(store.scheduler).get("fairnessCursor").getOrThrow()
+        )
+        root.put("scheduler", scheduler)
+        root.put("executionJournal", cronExecutionJournalToJson(store.journal))
+        cronWriteStoreAtomicLocked(path, root)
+    }
+}
+
+private func cronWriteStoreAtomicLocked(path: Path, root: JsonObject): Unit {
+    let parent = path.parent
+    cronEnsureCronDirPermissions(parent)
+    let nextText = root.toJsonString()
+    let bytes = nextText.toArray()
+    let stamp = DateTime.now().toUnixTimeStamp().toNanoseconds()
+    let tmp = parent.join("${FILE_NAME}.${stamp}.tmp")
+    try {
+        remove(tmp)
+    } catch (_: Exception) {
+        ()
+    }
+    File.writeTo(tmp, bytes)
+    cronEnsureCronFilePermissions(tmp)
+    let bak = parent.join("${FILE_NAME}.bak")
+    if (cronStoreContentChanged(path, nextText)) {
         try {
-            remove(tmp)
+            copy(path, to: bak, overwrite: true)
+            cronEnsureCronFilePermissions(bak)
+        } catch (_: Exception) {
+            LogUtils.error("CronStore: backup_failed")
+        }
+    }
+    try {
+        cronReplaceStoreFile(tmp, path)
+        cronEnsureCronFilePermissions(path)
+    } finally {
+        try {
+            if (exists(tmp)) {
+                remove(tmp)
+            }
         } catch (_: Exception) {
             ()
-        }
-        File.writeTo(tmp, bytes)
-        cronEnsureCronFilePermissions(tmp)
-        let bak = parent.join("${FILE_NAME}.bak")
-        if (cronStoreContentChanged(path, nextText)) {
-            try {
-                copy(path, to: bak, overwrite: true)
-                cronEnsureCronFilePermissions(bak)
-            } catch (_: Exception) {
-                LogUtils.error("CronStore: backup_failed")
-            }
-        }
-        try {
-            cronReplaceStoreFile(tmp, path)
-            cronEnsureCronFilePermissions(path)
-        } finally {
-            try {
-                if (exists(tmp)) {
-                    remove(tmp)
-                }
-            } catch (_: Exception) {
-                ()
-            }
         }
     }
 }
