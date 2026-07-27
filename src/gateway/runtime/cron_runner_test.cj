@@ -15,6 +15,7 @@ import metis.cron.{
     CronWebhookHttpRequest,
     CronWebhookHttpResponse,
     cronLoadOrEmpty,
+    cronLoadStoreOrEmpty,
     cronScriptsDir,
     cronRunLogPathFromStore,
     cronSave,
@@ -23,10 +24,10 @@ import metis.cron.{
     setCronWebhookHttpRunnerForTest
 }
 import metis.gateway.core.{ChannelAdapter, GatewayRouter, GatewayService, setGatewayAgentBridgeReplyRunnerForTest}
-import metis.gateway.model.{ChannelPolicyConfig, InboundMessage, OutboundMessage, SendResult}
+import metis.gateway.model.{ChannelPolicyConfig, ChannelType, ChatType, InboundMessage, OutboundMessage, SendResult}
 import metis.gateway.session.{GatewayIngressSource, GatewaySessionRequest, GatewayTurnContext, gatewayIngressSourceLabel}
 
-import std.collection.HashMap
+import std.collection.{ArrayList, HashMap}
 import std.core.Duration
 import std.env.{getVariable, setVariable}
 import std.fs.{Directory, File, Path, remove}
@@ -53,6 +54,9 @@ private func withCronRunnerTestHome<T>(block: (Path) -> T): T {
             debugSetCronRunnerReplyForTest(None<(CronJob, GatewaySessionRequest) -> String>)
             debugSetCronRunnerBeforeExecuteForTest(None<(CronJob) -> Unit>)
             debugSetCronRunnerRunLogAppendForTest(None<() -> Unit>)
+            debugSetCronRunnerReservePersistForTest(None<() -> Unit>)
+            debugSetCronRunnerSubmitForTest(None<() -> Unit>)
+            debugSetCronRunnerDeliveryForTest(None<() -> Unit>)
             setGatewayAgentBridgeReplyRunnerForTest(None<(String, String, String, String, Bool, Option<(String) -> Unit>) -> String>)
             setGatewayWebProviderResolverForTest(None<(String) -> GatewayWebProviderResolution>)
             setDuckDuckGoSearchHttpRunnerForTest(None<(DuckDuckGoSearchHttpRequest) -> DuckDuckGoSearchHttpResponse>)
@@ -94,6 +98,8 @@ private class CronRunnerTestChannelAdapter <: ChannelAdapter {
     public var lastAccountId: String = ""
     public var lastPeerId: String = ""
     public var lastText: String = ""
+    private let inbound = ArrayList<InboundMessage>()
+    private let sentTexts = ArrayList<String>()
 
     public init(
         adapterName: String,
@@ -116,7 +122,27 @@ private class CronRunnerTestChannelAdapter <: ChannelAdapter {
     public func stop(): Unit {}
 
     public func pullInbound(): Array<InboundMessage> {
-        []
+        let out = this.inbound.toArray()
+        this.inbound.clear()
+        out
+    }
+
+    public func queueInbound(text: String): Unit {
+        let channel = if (this.adapterName == "telegram") {
+            ChannelType.Telegram
+        } else {
+            ChannelType.Feishu
+        }
+        this.inbound.add(InboundMessage(
+            channel,
+            "${this.adapterName}-message-${this.inbound.size}",
+            "${this.adapterName}-peer",
+            "${this.adapterName}-sender",
+            ChatType.Direct,
+            text,
+            true,
+            DateTime.now()
+        ))
     }
 
     public func send(message: OutboundMessage): SendResult {
@@ -140,6 +166,16 @@ private class CronRunnerTestChannelAdapter <: ChannelAdapter {
         this.lastAccountId = message.accountId
         this.lastPeerId = message.peerId
         this.lastText = message.text
+        this.sentTexts.add(message.text)
+    }
+
+    public func sentContains(text: String): Bool {
+        for (value in this.sentTexts) {
+            if (value == text) {
+                return true
+            }
+        }
+        false
     }
 }
 
@@ -218,6 +254,34 @@ private class ControllableCronReply {
     public func isCompleted(): Bool {
         synchronized(this.lock) {
             this.completed
+        }
+    }
+}
+
+private class CronRunnerOneShotFault {
+    private var injected = false
+
+    public func failOnce(message: String): Unit {
+        if (!this.injected) {
+            this.injected = true
+            throw Exception(message)
+        }
+    }
+}
+
+private class CronRunnerPersistCounter {
+    private let lock = Mutex()
+    private var value: Int64 = 0
+
+    public func increment(): Unit {
+        synchronized(this.lock) {
+            this.value += 1
+        }
+    }
+
+    public func count(): Int64 {
+        synchronized(this.lock) {
+            this.value
         }
     }
 }
@@ -374,7 +438,7 @@ public class CronRunnerTest {
     }
 
     @TestCase
-    public func m0p1DueTickBlocksUntilControlledUtf8ReplyThenDeliversOnce(): Unit {
+    public func m0p1DueTickReturnsBeforeControlledUtf8ReplyThenDeliversOnce(): Unit {
         withCronRunnerTestHome({ storePath: Path =>
             let answer = cronRunnerRepeatedText("仓颉社区🙂", 1200)
             let controlled = ControllableCronReply(answer)
@@ -402,9 +466,11 @@ public class CronRunnerTest {
             @Expect(controlled.awaitStarted(2000), true)
             @Expect(controlled.isCompleted(), false)
             @Expect(adapter.sendCount, 0)
+            tickFuture.get()
 
             controlled.release()
-            tickFuture.get()
+            @Expect(runner.waitUntilIdle(), true)
+            runner.tick()
 
             @Expect(controlled.isCompleted(), true)
             @Expect(adapter.sendCount, 1)
@@ -634,6 +700,8 @@ public class CronRunnerTest {
 
             let runner = CronRunner(gatewayOpt: None<GatewayService>, storePath: storePath, cronEnabled: true)
             runner.tick(nowOverride: Some<Int64>(2000))
+            @Expect(runner.waitUntilIdle(), true)
+            runner.tick()
             let result = runner.runJobManual("shared-runner", true)
             @Expect(result.get("ok").getOrThrow().asBool().getValue(), true)
             @Expect(result.get("ran").getOrThrow().asBool().getValue(), true)
@@ -796,6 +864,338 @@ public class CronRunnerTest {
             @Expect(row.get("status").getOrThrow().asString().getValue(), "error")
             @Expect(row.get("diagnosticCode").getOrThrow().asString().getValue(), "cron_script_unsupported_extension")
             @Expect(row.get("summary").getOrThrow().asString().getValue().contains("cron_script_unsupported_extension"), true)
+        })
+    }
+
+    @TestCase
+    public func m1B2P2FullSlotDoesNotReserveSiblingAndCursorEventuallyDispatchesIt(): Unit {
+        withCronRunnerTestHome({ storePath: Path =>
+            let blocked = ControllableCronReply("first done")
+            let jobs = ArrayList<CronJob>()
+            jobs.add(CronJob(
+                "a-first",
+                "hello cron",
+                CronSchedule.at(1),
+                state: CronJobState(nextRunAtMs: 1)
+            ))
+            for (id in [
+                "b-sibling", "c-sibling", "d-sibling", "e-sibling", "f-sibling",
+                "g-sibling", "h-sibling", "i-sibling", "j-sibling", "k-sibling"
+            ]) {
+                jobs.add(CronJob(
+                    id,
+                    "hello cron",
+                    CronSchedule.at(1),
+                    state: CronJobState(nextRunAtMs: 1)
+                ))
+            }
+            cronSave(storePath, jobs.toArray())
+            let persistCount = CronRunnerPersistCounter()
+            debugSetCronRunnerReservePersistForTest(Some({ => persistCount.increment() }))
+            debugSetCronRunnerReplyForTest(Some({ job: CronJob, _request: GatewaySessionRequest =>
+                if (job.id == "a-first") { blocked.reply() } else { "second done" }
+            }))
+            let runner = CronRunner(
+                gatewayOpt: None<GatewayService>,
+                storePath: storePath,
+                cronEnabled: true,
+                maxConcurrentRuns: 1
+            )
+            runner.tick(nowOverride: Some<Int64>(2000))
+            @Expect(blocked.awaitStarted(2000), true)
+            var repeated: Int64 = 0
+            while (repeated < 100) {
+                runner.tick(nowOverride: Some<Int64>(2000))
+                repeated += 1
+            }
+            let whileFull = cronLoadOrEmpty(storePath)
+            @Expect(whileFull[0].state.executionId.isEmpty(), false)
+            for (idx in 1..whileFull.size) {
+                @Expect(whileFull[idx].state.executionId, "")
+            }
+            @Expect(persistCount.count(), 1)
+
+            blocked.release()
+            let dispatchNow = DateTime.now().toUnixTimeStamp().toMilliseconds() + 60000
+            var completed: Int64 = 0
+            while (completed < 11) {
+                @Expect(runner.waitUntilIdle(), true)
+                runner.tick(nowOverride: Some<Int64>(dispatchNow))
+                completed += 1
+            }
+            let after = cronLoadOrEmpty(storePath)
+            @Expect(persistCount.count(), 11)
+            for (job in after) {
+                @Expect(job.state.lastStatus, "success")
+                @Expect(job.state.executionId, "")
+            }
+        })
+    }
+
+    @TestCase
+    public func m1P1BlockingCronDoesNotStarveFeishuOrTelegramProcessOnce(): Unit {
+        withCronRunnerTestHome({ storePath: Path =>
+            let blocked = ControllableCronReply("cron completed")
+            cronSave(storePath, [cronRunnerTestJob("m1-p1-blocked")])
+            debugSetCronRunnerReplyForTest(Some({ _job: CronJob, _request: GatewaySessionRequest =>
+                blocked.reply()
+            }))
+            setGatewayAgentBridgeReplyRunnerForTest(Some({
+                _sessionKey: String,
+                prompt: String,
+                channelName: String,
+                _agentId: String,
+                _streamingEnabled: Bool,
+                _streamChunkHook: Option<(String) -> Unit> =>
+                    "${channelName} reply: ${prompt}"
+            }))
+
+            let feishu = CronRunnerTestChannelAdapter("feishu")
+            let telegram = CronRunnerTestChannelAdapter("telegram")
+            let service = GatewayService(GatewayRouter(HashMap<String, ChannelPolicyConfig>()))
+            service.registerAdapter(feishu, channelId: "feishu", accountId: "tenant-p1")
+            service.registerAdapter(telegram, channelId: "telegram", accountId: "telegram-p1")
+            service.start()
+            try {
+                let runner = CronRunner(
+                    gatewayOpt: Some(service),
+                    storePath: storePath,
+                    cronEnabled: true
+                )
+                runner.tick(nowOverride: Some<Int64>(2000))
+                @Expect(blocked.awaitStarted(2000), true)
+                @Expect(blocked.isCompleted(), false)
+
+                feishu.queueInbound("飞书消息🙂")
+                telegram.queueInbound("Telegram message")
+                service.processOnce()
+
+                @Expect(feishu.sendCount, 1)
+                @Expect(feishu.lastText, "feishu reply: 飞书消息🙂")
+                @Expect(telegram.sendCount >= 1, true)
+                @Expect(telegram.sentContains("telegram reply: Telegram message"), true)
+                @Expect(blocked.isCompleted(), false)
+
+                blocked.release()
+                @Expect(runner.waitUntilIdle(), true)
+                runner.tick()
+                @Expect(cronLoadOrEmpty(storePath)[0].state.lastStatus, "success")
+            } finally {
+                blocked.release()
+                service.stop()
+            }
+        })
+    }
+
+    @TestCase
+    public func m1N2ReservePersistFailureReleasesPermitAndDispatchesSibling(): Unit {
+        withCronRunnerTestHome({ storePath: Path =>
+            cronSave(storePath, [
+                cronRunnerTestJob("a-reserve-fails"),
+                cronRunnerTestJob("b-reserve-sibling")
+            ])
+            let fault = CronRunnerOneShotFault()
+            debugSetCronRunnerReservePersistForTest(Some({ =>
+                fault.failOnce("fake reserve persist failure")
+            }))
+            debugSetCronRunnerReplyForTest(Some({ _job: CronJob, _request: GatewaySessionRequest =>
+                "sibling completed"
+            }))
+            let runner = CronRunner(storePath: storePath, maxConcurrentRuns: 1)
+
+            runner.tick(nowOverride: Some<Int64>(2000))
+            let reserved = cronLoadStoreOrEmpty(storePath)
+            @Expect(reserved.jobs[0].state.executionId, "")
+            @Expect(reserved.jobs[1].state.executionId.isEmpty(), false)
+            @Expect(reserved.journal.size, 1)
+            @Expect(reserved.journal[0].jobId, "b-reserve-sibling")
+
+            @Expect(runner.waitUntilIdle(), true)
+            runner.stopAccepting()
+            runner.tick()
+            let after = cronLoadStoreOrEmpty(storePath)
+            @Expect(runner.activeExecutionCount(), 0)
+            @Expect(after.jobs[0].state.executionId, "")
+            @Expect(after.jobs[1].state.executionId, "")
+            @Expect(after.jobs[1].state.lastStatus, "success")
+            for (entry in after.journal) {
+                @Expect(entry.jobId == "a-reserve-fails", false)
+            }
+        })
+    }
+
+    @TestCase
+    public func m1N2SubmitFailureRollsBackReservationAndDispatchesSibling(): Unit {
+        withCronRunnerTestHome({ storePath: Path =>
+            cronSave(storePath, [
+                cronRunnerTestJob("a-submit-fails"),
+                cronRunnerTestJob("b-submit-sibling")
+            ])
+            let fault = CronRunnerOneShotFault()
+            debugSetCronRunnerSubmitForTest(Some({ =>
+                fault.failOnce("fake submit failure")
+            }))
+            debugSetCronRunnerReplyForTest(Some({ _job: CronJob, _request: GatewaySessionRequest =>
+                "sibling completed"
+            }))
+            let runner = CronRunner(storePath: storePath, maxConcurrentRuns: 1)
+
+            runner.tick(nowOverride: Some<Int64>(2000))
+            let reserved = cronLoadStoreOrEmpty(storePath)
+            @Expect(reserved.jobs[0].state.executionId, "")
+            @Expect(reserved.jobs[1].state.executionId.isEmpty(), false)
+            @Expect(reserved.journal.size, 1)
+            @Expect(reserved.journal[0].jobId, "b-submit-sibling")
+
+            @Expect(runner.waitUntilIdle(), true)
+            runner.stopAccepting()
+            runner.tick()
+            let after = cronLoadStoreOrEmpty(storePath)
+            @Expect(runner.activeExecutionCount(), 0)
+            @Expect(after.jobs[0].state.executionId, "")
+            @Expect(after.jobs[1].state.executionId, "")
+            @Expect(after.jobs[1].state.lastStatus, "success")
+            for (entry in after.journal) {
+                @Expect(entry.jobId == "a-submit-fails", false)
+            }
+        })
+    }
+
+    @TestCase
+    public func m1ScheduledStrictDeliveryFailureMergesErrorWhileBestEffortStaysSuccess(): Unit {
+        withCronRunnerTestHome({ storePath: Path =>
+            let strict = CronJob(
+                "a-strict-scheduled",
+                "strict",
+                CronSchedule.every(60000),
+                state: CronJobState(nextRunAtMs: 1),
+                deliveryChannel: "feishu",
+                deliveryTo: "fake-chat",
+                deliveryMode: "announce",
+                deliveryAccountId: "fake-tenant"
+            )
+            let bestEffort = CronJob(
+                "b-best-effort-scheduled",
+                "best effort",
+                CronSchedule.every(60000),
+                state: CronJobState(nextRunAtMs: 1),
+                deliveryChannel: "feishu",
+                deliveryTo: "fake-chat",
+                deliveryMode: "announce",
+                deliveryAccountId: "fake-tenant",
+                bestEffortDeliver: true
+            )
+            cronSave(storePath, [strict, bestEffort])
+            debugSetCronRunnerReplyForTest(Some({ _job: CronJob, _request: GatewaySessionRequest =>
+                "business success"
+            }))
+            let adapter = CronRunnerTestChannelAdapter("feishu", failSend: true)
+            let service = cronRunnerTestGateway(adapter, "feishu", "fake-tenant")
+            let runner = CronRunner(gatewayOpt: Some(service), storePath: storePath)
+
+            runner.tick(nowOverride: Some<Int64>(2000))
+            @Expect(runner.waitUntilIdle(), true)
+            runner.tick()
+            @Expect(runner.waitUntilIdle(), true)
+            runner.stopAccepting()
+            runner.tick()
+
+            let byId = HashMap<String, CronJob>()
+            for (job in cronLoadOrEmpty(storePath)) {
+                byId[job.id] = job
+            }
+            let strictAfter = byId.get(strict.id).getOrThrow()
+            @Expect(strictAfter.state.lastStatus, "error")
+            @Expect(strictAfter.state.lastError.contains("announce delivery failed"), true)
+            let bestEffortAfter = byId.get(bestEffort.id).getOrThrow()
+            @Expect(bestEffortAfter.state.lastStatus, "success")
+            @Expect(bestEffortAfter.state.lastError, "")
+
+            let strictRun = readCronRunLogEntriesForJob(storePath, strict.id, limit: 10)
+                .get("entries").getOrThrow().asArray()[0].asObject()
+            @Expect(strictRun.get("status").getOrThrow().asString().getValue(), "error")
+            @Expect(strictRun.get("deliveryStatus").getOrThrow().asString().getValue(), "not-delivered")
+            let bestRun = readCronRunLogEntriesForJob(storePath, bestEffort.id, limit: 10)
+                .get("entries").getOrThrow().asArray()[0].asObject()
+            @Expect(bestRun.get("status").getOrThrow().asString().getValue(), "ok")
+            @Expect(bestRun.get("deliveryStatus").getOrThrow().asString().getValue(), "not-delivered")
+        })
+    }
+
+    @TestCase
+    public func m1RunLogAppendFailureKeepsJournalRetryableAndUnlogged(): Unit {
+        withCronRunnerTestHome({ storePath: Path =>
+            let job = cronRunnerTestJob("m1-runlog-retryable")
+            cronSave(storePath, [job])
+            debugSetCronRunnerReplyForTest(Some({ _job: CronJob, _request: GatewaySessionRequest =>
+                "business success"
+            }))
+            debugSetCronRunnerRunLogAppendForTest(Some({ =>
+                throw Exception("run-log-temporarily-unavailable")
+            }))
+            let runner = CronRunner(storePath: storePath)
+
+            runner.tick(nowOverride: Some<Int64>(2000))
+            @Expect(runner.waitUntilIdle(), true)
+            runner.stopAccepting()
+            runner.tick()
+
+            let envelope = cronLoadStoreOrEmpty(storePath)
+            @Expect(envelope.jobs[0].state.lastStatus, "success")
+            @Expect(envelope.journal.size, 1)
+            @Expect(envelope.journal[0].runLogRecorded, false)
+            @Expect(envelope.journal[0].phase, "delivery_settled")
+            @Expect(
+                readCronRunLogEntriesForJob(storePath, job.id, limit: 10)
+                    .get("total").getOrThrow().asInt().getValue(),
+                0
+            )
+        })
+    }
+
+    @TestCase
+    public func m1DeliveryExceptionStillSettlesReceiptAndAppendsRunLog(): Unit {
+        withCronRunnerTestHome({ storePath: Path =>
+            let job = CronJob(
+                "m1-delivery-throws",
+                "delivery throws",
+                CronSchedule.every(60000),
+                state: CronJobState(nextRunAtMs: 1),
+                deliveryChannel: "feishu",
+                deliveryTo: "fake-chat",
+                deliveryMode: "announce",
+                deliveryAccountId: "fake-tenant",
+                bestEffortDeliver: true
+            )
+            cronSave(storePath, [job])
+            debugSetCronRunnerReplyForTest(Some({ _job: CronJob, _request: GatewaySessionRequest =>
+                "business success"
+            }))
+            debugSetCronRunnerDeliveryForTest(Some({ =>
+                throw Exception("unexpected delivery exception")
+            }))
+            let runner = CronRunner(storePath: storePath)
+
+            runner.tick(nowOverride: Some<Int64>(2000))
+            @Expect(runner.waitUntilIdle(), true)
+            runner.stopAccepting()
+            runner.tick()
+
+            let envelope = cronLoadStoreOrEmpty(storePath)
+            @Expect(envelope.jobs[0].state.lastStatus, "success")
+            @Expect(envelope.journal[0].phase, "logged")
+            @Expect(envelope.journal[0].runLogRecorded, true)
+            @Expect(envelope.journal[0].deliveryReceipts[0].status, "failed")
+            let runs = readCronRunLogEntriesForJob(storePath, job.id, limit: 10)
+            @Expect(runs.get("total").getOrThrow().asInt().getValue(), 1)
+            let row = runs.get("entries").getOrThrow().asArray()[0].asObject()
+            @Expect(row.get("status").getOrThrow().asString().getValue(), "ok")
+            @Expect(row.get("deliveryStatus").getOrThrow().asString().getValue(), "not-delivered")
+            @Expect(
+                row.get("deliveryError").getOrThrow().asString().getValue()
+                    .contains("unexpected delivery exception"),
+                true
+            )
         })
     }
 
@@ -1243,6 +1643,8 @@ public class CronRunnerDeliveryTest {
             let runner = CronRunner(gatewayOpt: Some(service), storePath: storePath, cronEnabled: true)
 
             runner.tick(nowOverride: Some<Int64>(2000))
+            @Expect(runner.waitUntilIdle(), true)
+            runner.tick()
 
             @Expect(adapter.sendCount, 1)
             @Expect(adapter.lastText.contains("Fake News A"), true)

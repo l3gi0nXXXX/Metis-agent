@@ -29,7 +29,10 @@ private func cronExecutorTestTask(id: String, runTask: (CronJob) -> Unit): CronE
     CronExecutionTask(
         CronExecutionId(id, 1, 2),
         cronExecutorTestJob(id),
-        runTask
+        { job =>
+            runTask(job)
+            CronExecutionArtifact()
+        }
     )
 }
 
@@ -107,12 +110,16 @@ public class CronExecutionExecutorTest {
         @Expect(failed[0].error, "fake worker failure")
 
         @Expect(executor.tryAcquireSlot(), true)
-        @Expect(executor.releaseSlot(), true)
-        @Expect(executor.activeCount(), 0)
+        @Expect(executor.submitReserved(cronExecutorTestTask("sibling", { _job => () })), true)
+        @Expect(awaitCronExecutorTest({ => executor.activeCount() == 0 }), true)
+        let sibling = executor.drainCompleted()
+        @Expect(sibling.size, 1)
+        @Expect(sibling[0].executionId.jobId, "sibling")
+        @Expect(sibling[0].succeeded(), true)
     }
 
     @TestCase
-    public func noSlotDoesNotCreatePendingTaskAndStopRejectsNewWork(): Unit {
+    public func m1N2NoSlotDoesNotCreatePendingTaskAndStopRejectsNewWork(): Unit {
         let executor = CronExecutionExecutor(maxConcurrentRuns: 1)
         let invoked = AtomicBool(false)
         executor.start()
