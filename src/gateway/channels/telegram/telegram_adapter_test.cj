@@ -1760,7 +1760,11 @@ public class TelegramAdapterTest {
                 if (request.context.startsWith("deleteWebhook:") || request.context == "getUpdates") {
                     return TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":[]}", outcome: "ok")
                 }
-                TelegramTransportResponse(false, error: "Operation timed out", outcome: "timeout")
+                TelegramTransportResponse(
+                    false,
+                    error: "Operation timed out，网络超时 🚧 token=123456:SECRET",
+                    outcome: "timeout"
+                )
             }))
             let notRunning = TelegramAdapter(config: TelegramConfig(enabled: true, botToken: "123456:SECRET"))
             let notRunningResult = notRunning.send(
@@ -1773,7 +1777,15 @@ public class TelegramAdapterTest {
                     @Expect(reason.contains("123456:SECRET"), false)
             }
 
-            let adapter = TelegramAdapter(config: TelegramConfig(enabled: true, botToken: "123456:SECRET"))
+            // This case verifies send diagnostics only. Native-command startup runs asynchronously
+            // and has its own diagnostics tests, so keep it from racing on lastSendError here.
+            let adapter = TelegramAdapter(
+                config: TelegramConfig(
+                    enabled: true,
+                    botToken: "123456:SECRET",
+                    commandsNative: "off"
+                )
+            )
             telegramStartAdapterForTest(adapter)
             let result = adapter.send(
                 OutboundMessage(ChannelType.Telegram, "user:8734062810", "hello")
@@ -1783,9 +1795,11 @@ public class TelegramAdapterTest {
                 case SendResult.Success => @Expect(false, true)
                 case SendResult.Failed(reason) =>
                     @Expect(reason.contains("Operation timed out"), true)
+                    @Expect(reason.contains("网络超时 🚧"), true)
                     @Expect(reason.contains("123456:SECRET"), false)
             }
             @Expect(adapter.debugLastSendErrorForTest().contains("Operation timed out"), true)
+            @Expect(adapter.debugLastSendErrorForTest().contains("网络超时 🚧"), true)
             @Expect(adapter.debugLastSendErrorForTest().contains("123456:SECRET"), false)
         } finally {
             setTelegramTransportRunnerForTest(None)
