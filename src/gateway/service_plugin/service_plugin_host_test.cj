@@ -324,7 +324,13 @@ public class ServicePluginHostTest {
         script
     }
 
-    private func gitCodeCountingRestartLeaseScript(counterPath: Path, firstPort: Int64, restartPort: Int64, restartWritesLease!: Bool = true): String {
+    private func gitCodeCountingRestartLeaseScript(
+        counterPath: Path,
+        firstPort: Int64,
+        restartPort: Int64,
+        restartWritesLease!: Bool = true,
+        delayRestartLease!: Bool = false
+    ): String {
         let firstEndpoint = ",\"bindHost\":\"127.0.0.1\",\"port\":${firstPort}"
         let restartEndpoint = ",\"bindHost\":\"127.0.0.1\",\"port\":${restartPort}"
         let firstRunningLease = "printf '{\"state\":\"running\",\"status\":\"running\",\"pluginId\":\"gitcode-monitor\",\"sessionId\":\"%s\",\"pid\":%s,\"parentPid\":%s${firstEndpoint},\"startedAtMs\":1000,\"lastHeartbeatMs\":1000}\\n' \"$METIS_SERVICE_PLUGIN_SESSION_ID\" \"$$\" \"$METIS_SERVICE_PLUGIN_PARENT_PID\" > \"$METIS_SERVICE_PLUGIN_LEASE_PATH\""
@@ -332,7 +338,8 @@ public class ServicePluginHostTest {
         let stoppedLease = "printf '{\"state\":\"stopped\",\"status\":\"stopped\",\"pluginId\":\"gitcode-monitor\",\"sessionId\":\"%s\",\"pid\":%s,\"parentPid\":%s${firstEndpoint},\"startedAtMs\":1000,\"lastHeartbeatMs\":1000}\\n' \"$METIS_SERVICE_PLUGIN_SESSION_ID\" \"$$\" \"$METIS_SERVICE_PLUGIN_PARENT_PID\" > \"$METIS_SERVICE_PLUGIN_LEASE_PATH\""
         var script = "count_file='${counterPath.toString()}'; count=$(cat \"$count_file\" 2>/dev/null || printf 0); count=$((count + 1)); printf '%s' \"$count\" > \"$count_file\"; printf '%s\\n' '${this.gitCodeInitLine()}'; "
         if (restartWritesLease) {
-            script += "if [ \"$count\" = \"1\" ]; then ${firstRunningLease}; else ${restartRunningLease}; fi; "
+            let restartDelay = if (delayRestartLease) { "sleep 0.15; " } else { "" }
+            script += "if [ \"$count\" = \"1\" ]; then ${firstRunningLease}; else ${restartDelay}${restartRunningLease}; fi; "
         } else {
             script += "if [ \"$count\" = \"1\" ]; then ${firstRunningLease}; fi; "
         }
@@ -1100,7 +1107,7 @@ public class ServicePluginHostTest {
 
         withServicePluginHostTestHome("service-plugin-t4-recover-port-zero", { home: Path =>
             let counterPath = home.join("port-zero-count.txt")
-            this.registerGitCodeStdioScript(this.gitCodeCountingRestartLeaseScript(counterPath, 18193, 0))
+            this.registerGitCodeStdioScript(this.gitCodeCountingRestartLeaseScript(counterPath, 18193, 0, delayRestartLease: true))
             setServicePluginSupervisorConfigForTest(ServicePluginSupervisorConfig(enabled: true, intervalMs: 1000, healthTimeoutMs: 10, failureThreshold: 1, restartCooldownMs: 1000))
             setServicePluginHealthzProbeForTest(Some({ _url: String, _timeoutMs: Int64 =>
                 ServicePluginHealthzProbeResult(false, statusCode: 0, durationMs: 10, diagnostic: "healthz_timeout")
@@ -1111,6 +1118,7 @@ public class ServicePluginHostTest {
                 @Expect(this.waitForGitCodeLease(home), true)
                 let tick = runServicePluginSupervisorTickForTest("gitcode-monitor", nowMs: 2000)
                 @Expect(tick.recovered, false)
+                @Expect(this.readCounterFile(counterPath), 2)
                 match (getServicePluginSnapshot("gitcode-monitor")) {
                     case Some(snapshot) =>
                         @Expect(snapshot.status, "degraded")
