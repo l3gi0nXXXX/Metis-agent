@@ -262,14 +262,28 @@ private func cronWebhookNativePost(request: CronWebhookHttpRequest): CronWebhook
 }
 
 /** Cron 成功/失败 webhook 投递（JSON POST）。 */
-public func postCronWebhookJson(url: String, body: JsonObject, timeoutMs!: Int64 = 30_000): Bool {
+public func postCronWebhookJson(
+    url: String,
+    body: JsonObject,
+    timeoutMs!: Int64 = 30_000,
+    remainingMs!: Int64 = Int64.Max,
+    cancellationCheck!: () -> Unit = { => () }
+): Bool {
+    try {
+        cancellationCheck()
+    } catch (_: Exception) {
+        return false
+    }
+    if (remainingMs <= 0) {
+        return false
+    }
     let decision = validateCronWebhookUrl(url)
     if (!decision.ok) {
         LogUtils.info("CronWebhook: rejected url=${decision.redactedUrl} errorKind=${decision.errorKind}")
         return false
     }
     let started = DateTime.now().toUnixTimeStamp().toMilliseconds()
-    let effectiveTimeout = cronWebhookTimeoutMs(timeoutMs)
+    let effectiveTimeout = min(cronWebhookTimeoutMs(timeoutMs), remainingMs)
     let request = CronWebhookHttpRequest(decision.normalizedUrl, body, effectiveTimeout, true)
     try {
         let runnerOpt = synchronized(cronWebhookRunnerLock) {
@@ -278,6 +292,11 @@ public func postCronWebhookJson(url: String, body: JsonObject, timeoutMs!: Int64
         let response = match (runnerOpt) {
             case Some(runner) => runner(request)
             case None => cronWebhookNativePost(request)
+        }
+        try {
+            cancellationCheck()
+        } catch (_: Exception) {
+            return false
         }
         let ended = DateTime.now().toUnixTimeStamp().toMilliseconds()
         if (response.ok) {

@@ -151,7 +151,10 @@ public func runGatewayService(verbose!: Bool = false): Unit {
     let cronRunner = CronRunner(
         gatewayOpt: Some(gateway),
         cronEnabled: user.cronEnabled,
-        maxConcurrentRuns: user.cronMaxConcurrentRuns
+        maxConcurrentRuns: user.cronMaxConcurrentRuns,
+        cronDefaultTimeoutMs: user.cronDefaultTimeoutMs,
+        cronSafetyTimeoutMs: user.cronSafetyTimeoutMs,
+        cronIdleTimeoutMs: user.cronIdleTimeoutMs
     )
     cronRunner.start()
     registerGatewayCronRunHookForRunner(cronRunner)

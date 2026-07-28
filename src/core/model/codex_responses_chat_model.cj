@@ -90,20 +90,23 @@ public class CodexResponsesChatModel <: ChatModel {
 
     private func normalizeRequest(request: ChatRequest): CodexResponsesNormalized {
         let payload = this.buildPayload(request)
+        let executionTimeoutMs = currentModelExecutionRemainingMs()
         if (this.usesCodexStreamingBackend) {
             return this.client.streamResponses(
                 this.baseUrl,
                 this.accessToken,
                 payload,
                 extraHeaders: codexResponsesExtraHeaders(this.sessionId),
-                model: this.name
+                model: this.name,
+                timeoutMs: executionTimeoutMs
             )
         }
         let response = this.client.postResponses(
             this.baseUrl,
             this.accessToken,
             payload,
-            extraHeaders: codexResponsesExtraHeaders(this.sessionId)
+            extraHeaders: codexResponsesExtraHeaders(this.sessionId),
+            timeoutMs: executionTimeoutMs
         )
         let normalized = codexNormalizeResponses(
             response,
@@ -170,12 +173,14 @@ public class CodexResponsesChatModel <: ChatModel {
 
     override public func asyncCreate(request: ChatRequest): AsyncChatResponse {
         let payload = this.buildPayload(request)
+        let executionTimeoutMs = currentModelExecutionRemainingMs()
         let _normalized = this.client.streamResponses(
             this.baseUrl,
             this.accessToken,
             payload,
             extraHeaders: codexResponsesExtraHeaders(this.sessionId),
-            model: this.name
+            model: this.name,
+            timeoutMs: executionTimeoutMs
         )
         throw CodexResponsesException("async_response_factory_unavailable", "Codex Responses stream normalized successfully, but Magic AsyncChatResponse has no public constructor in the Metis module")
     }

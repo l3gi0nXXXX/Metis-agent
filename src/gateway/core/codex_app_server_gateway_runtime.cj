@@ -20,6 +20,7 @@ public class GatewayCodexAppServerTurnRequest {
     public let systemPrompt: String
     public let modelInput: String
     public let turnContext: Option<GatewayTurnContext>
+    public let executionControl: Option<GatewayExecutionControl>
 
     public init(
         sessionKey: String,
@@ -29,7 +30,8 @@ public class GatewayCodexAppServerTurnRequest {
         modelName: String,
         systemPrompt: String,
         modelInput: String,
-        turnContext!: Option<GatewayTurnContext> = None<GatewayTurnContext>
+        turnContext!: Option<GatewayTurnContext> = None<GatewayTurnContext>,
+        executionControl!: Option<GatewayExecutionControl> = None<GatewayExecutionControl>
     ) {
         this.sessionKey = sessionKey.trimAscii()
         this.workspaceDir = workspaceDir.trimAscii()
@@ -39,6 +41,7 @@ public class GatewayCodexAppServerTurnRequest {
         this.systemPrompt = systemPrompt
         this.modelInput = modelInput
         this.turnContext = turnContext
+        this.executionControl = executionControl
     }
 }
 
@@ -145,6 +148,10 @@ public func gatewayCodexAppServerUsageInt(usage: Option<JsonObject>, key: String
 }
 
 public func gatewayRunCodexAppServerTurn(request: GatewayCodexAppServerTurnRequest): GatewayCodexAppServerRuntimeResult {
+    match (request.executionControl) {
+        case Some(control) => control.throwIfCancelled()
+        case None => ()
+    }
     match (gatewayCodexAppServerRunnerForTest) {
         case Some(runner) => return runner(request)
         case None => ()
@@ -158,10 +165,21 @@ public func gatewayRunCodexAppServerTurn(request: GatewayCodexAppServerTurnReque
     let client = CodexAppServerClient(cwd: Some(workspace))
     let session = CodexAppServerSession(client)
     try {
+        let timeoutMs = match (request.executionControl) {
+            case Some(control) => control.remainingMs()
+            case None => 600000
+        }
         let turn = session.runTurn(
             workspace,
-            gatewayBuildCodexAppServerInput(request.systemPrompt, request.modelInput)
+            gatewayBuildCodexAppServerInput(request.systemPrompt, request.modelInput),
+            timeoutMs: timeoutMs
         )
+        match (request.executionControl) {
+            case Some(control) =>
+                control.throwIfCancelled()
+                control.heartbeat()
+            case None => ()
+        }
         if (!turn.error.isEmpty()) {
             throw Exception(turn.error)
         }

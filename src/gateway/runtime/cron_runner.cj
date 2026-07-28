@@ -24,6 +24,7 @@ import metis.cron.{
     CronSchedulerCursor,
     CronStoreEnvelope,
     CronDeliveryResolved,
+    CronDeliveryIntentArtifact,
     CronFailureResolved,
     appendCronRunLog,
     buildCronWebhookFailureBody,
@@ -42,6 +43,9 @@ import metis.cron.{
     isTransientCronError,
     cronErrorBackoffMs,
     postCronWebhookJson,
+    saveCronDeliveryIntentArtifact,
+    loadCronDeliveryIntentArtifact,
+    deleteCronDeliveryIntentArtifact,
     cronEffectiveAnnounceChannel,
     resolveCronDeliveryPlan,
     resolveCronFailurePlan,
@@ -223,6 +227,7 @@ private var cronRunnerRunLogAppendForTest: Option<() -> Unit> = None<() -> Unit>
 private var cronRunnerReservePersistForTest: Option<() -> Unit> = None<() -> Unit>
 private var cronRunnerSubmitForTest: Option<() -> Unit> = None<() -> Unit>
 private var cronRunnerDeliveryForTest: Option<() -> Unit> = None<() -> Unit>
+private var cronRunnerDeliveryStageForTest: Option<(String) -> Unit> = None<(String) -> Unit>
 private var cronRunnerCommitForTest: Option<(String) -> Unit> = None<(String) -> Unit>
 
 public func debugSetCronRunnerReplyForTest(hook: Option<(CronJob, GatewaySessionRequest) -> String>): Unit {
@@ -258,6 +263,12 @@ public func debugSetCronRunnerSubmitForTest(hook: Option<() -> Unit>): Unit {
 public func debugSetCronRunnerDeliveryForTest(hook: Option<() -> Unit>): Unit {
     synchronized(cronRunnerTestHookLock) {
         cronRunnerDeliveryForTest = hook
+    }
+}
+
+public func debugSetCronRunnerDeliveryStageForTest(hook: Option<(String) -> Unit>): Unit {
+    synchronized(cronRunnerTestHookLock) {
+        cronRunnerDeliveryStageForTest = hook
     }
 }
 
@@ -301,6 +312,10 @@ private func cronRunnerDeliveryHookForTest(): Option<() -> Unit> {
     }
 }
 
+private func cronRunnerDeliveryStageHookForTest(): Option<(String) -> Unit> {
+    synchronized(cronRunnerTestHookLock) { cronRunnerDeliveryStageForTest }
+}
+
 private func cronRunnerCommitHookForTest(): Option<(String) -> Unit> {
     synchronized(cronRunnerTestHookLock) { cronRunnerCommitForTest }
 }
@@ -320,6 +335,9 @@ public class CronRunner {
     private var nextCronArmAtMs: Int64 = 0
     private let cronReaper: GatewayCronSessionReaperState = GatewayCronSessionReaperState()
     private let executionExecutor: CronExecutionExecutor
+    private let cronDefaultTimeoutMs: Int64
+    private let cronSafetyTimeoutMs: Int64
+    private let cronIdleTimeoutMs: Int64
     private let pendingTimerJobIds = ArrayList<String>()
     private let manualCompletionLock = Mutex()
     private let manualCompletions = HashMap<String, JsonObject>()
@@ -330,12 +348,18 @@ public class CronRunner {
         gatewayOpt!: Option<GatewayService> = None,
         storePath!: Path = cronStorePath(CliConfig.dotDir),
         cronEnabled!: Bool = true,
-        maxConcurrentRuns!: Int64 = 1
+        maxConcurrentRuns!: Int64 = 1,
+        cronDefaultTimeoutMs!: Int64 = CRON_DEFAULT_TIMEOUT_MS,
+        cronSafetyTimeoutMs!: Int64 = CRON_SAFETY_TIMEOUT_MS,
+        cronIdleTimeoutMs!: Int64 = CRON_IDLE_TIMEOUT_MS
     ) {
         this.gatewayOpt = gatewayOpt
         this.storePath = storePath
         this.cronEnabled = cronEnabled
         this.executionExecutor = CronExecutionExecutor(maxConcurrentRuns: maxConcurrentRuns)
+        this.cronDefaultTimeoutMs = cronDefaultTimeoutMs
+        this.cronSafetyTimeoutMs = cronSafetyTimeoutMs
+        this.cronIdleTimeoutMs = max(0, cronIdleTimeoutMs)
         this.jobs = ArrayList<CronJob>()
         for (j in cronLoadOrEmpty(storePath)) {
             this.jobs.add(j)
@@ -535,6 +559,7 @@ public class CronRunner {
         request: GatewaySessionRequest,
         prompt: String,
         options: CronSessionExecutionOptions,
+        executionControl: CronExecutionControl,
         turnContextOverride: Option<GatewayTurnContext>
     ): String {
         let startedAt = epochMs()
@@ -560,12 +585,12 @@ public class CronRunner {
                     this.logCronWebOutcome(j, result, epochMs() - startedAt)
                     return result
                 case None =>
-                    let answer = cronBridgeReply(bridge, request, prompt, options, turnContextOverride: turnContextOverride)
+                    let answer = cronBridgeReply(bridge, request, prompt, options, executionControl, turnContextOverride: turnContextOverride)
                     this.logCronWebOutcome(j, answer, epochMs() - startedAt)
                     return answer
             }
         }
-        let answer = cronBridgeReply(bridge, request, prompt, options, turnContextOverride: turnContextOverride)
+        let answer = cronBridgeReply(bridge, request, prompt, options, executionControl, turnContextOverride: turnContextOverride)
         this.logCronWebOutcome(j, answer, epochMs() - startedAt)
         answer
     }
@@ -765,8 +790,13 @@ public class CronRunner {
         j: CronJob,
         dplan: CronDeliveryResolved,
         answer: String,
-        startedAtMs: Int64
+        startedAtMs: Int64,
+        executionControl!: Option<CronExecutionControl> = None<CronExecutionControl>
     ): (String, String) {
+        match (executionControl) {
+            case Some(control) => control.throwIfCancelled()
+            case None => ()
+        }
         let dm = dplan.mode.trimAscii().toAsciiLower()
         if (dm == "announce") {
             let dc = cronEffectiveAnnounceChannel(dplan.channel, j.deliveryChannel)
@@ -782,6 +812,12 @@ public class CronRunner {
                         answer
                     }
                     let messageId = gw.sendTextToPeerDetailed(dc, dt, body, accountId: dplan.accountId)
+                    match (executionControl) {
+                        case Some(control) =>
+                            control.throwIfCancelled()
+                            control.heartbeat()
+                        case None => ()
+                    }
                     return (if (messageId.trimAscii().isEmpty()) { "unknown" } else { "delivered" }, "")
                 } catch (sendError: Exception) {
                     this.markDeliveryFailure(j, dc, dplan.accountId, dt, "not-delivered", "send_failed", sendError.message)
@@ -800,7 +836,17 @@ public class CronRunner {
                 startedAtMs,
                 j.sessionTarget
             )
-            if (postCronWebhookJson(url, body, timeoutMs: cronWebhookTimeoutMs(j.timeoutMs))) {
+            let delivered = match (executionControl) {
+                case Some(control) => postCronWebhookJson(
+                    url,
+                    body,
+                    timeoutMs: cronWebhookTimeoutMs(j.timeoutMs),
+                    remainingMs: control.remainingMs(),
+                    cancellationCheck: { => control.throwIfCancelled() }
+                )
+                case None => postCronWebhookJson(url, body, timeoutMs: cronWebhookTimeoutMs(j.timeoutMs))
+            }
+            if (delivered) {
                 return ("delivered", "")
             }
             this.markDeliveryFailure(j, "webhook", dplan.accountId, url, "not-delivered", "webhook_failed", "webhook post returned false")
@@ -925,6 +971,7 @@ public class CronRunner {
         j: CronJob,
         wallNowMs: Int64,
         startedAtMs: Int64,
+        executionControl!: Option<CronExecutionControl> = None<CronExecutionControl>,
         deferSideEffects!: Bool = false
     ): CronExecutionArtifact {
         let dplan = resolveCronDeliveryPlan(j)
@@ -937,8 +984,22 @@ public class CronRunner {
         var diagnosticMessage = ""
         var attempt: Int64 = 0
         let maxAttempts = max(1, j.maxRetries + 1)
+        let control = match (executionControl) {
+            case Some(existing) => existing
+            case None =>
+                let deadline = resolveCronExecutionDeadline(
+                    j,
+                    j.scriptMode,
+                    startedAtMs,
+                    defaultTimeoutMs: this.cronDefaultTimeoutMs,
+                    safetyTimeoutMs: this.cronSafetyTimeoutMs,
+                    idleTimeoutMs: this.cronIdleTimeoutMs
+                )
+                CronExecutionControl(deadline.absoluteDeadlineMs, idleTimeoutMs: deadline.idleTimeoutMs)
+        }
 
         try {
+            control.throwIfCancelled()
             let promptScan = scanCronPromptAssembled(j.prompt)
             if (!promptScan.ok) {
                 let afterRun = epochMs()
@@ -974,7 +1035,14 @@ public class CronRunner {
             var skipSuccessDelivery = false
             let scriptMode = cronNormalizeScriptMode(j.scriptMode)
             if (scriptMode != "none") {
-                let scriptResult = runCronJobScriptForJob(this.cronDotDirFromStorePath(), j)
+                let scriptResult = runCronJobScriptForJob(
+                    this.cronDotDirFromStorePath(),
+                    j,
+                    remainingMs: control.remainingMs(),
+                    cancellationCheck: { => control.throwIfCancelled() }
+                )
+                control.throwIfCancelled()
+                control.heartbeat()
                 if (!scriptResult.ok) {
                     let afterRun = epochMs()
                     status = "error"
@@ -1037,8 +1105,10 @@ public class CronRunner {
                 )
                 let jobBridge = gatewayBridgeForSessionRequest(CliSettingManager.readGatewaySettings(), jobRequest)
                 while (attempt < maxAttempts) {
+                    control.throwIfCancelled()
                     try {
-                        answer = this.executeJobReply(j, jobBridge, jobRequest, effectivePrompt, options, turnContextOverride)
+                        answer = this.executeJobReply(j, jobBridge, jobRequest, effectivePrompt, options, control, turnContextOverride)
+                        control.throwIfCancelled()
                         status = "success"
                         errMsg = ""
                         break
@@ -1059,14 +1129,22 @@ public class CronRunner {
                         if (attempt + 1 >= maxAttempts) {
                             break
                         }
-                        sleep(Duration.millisecond * backoffDelayMs(j, attempt))
+                        let backoff = min(backoffDelayMs(j, attempt), control.remainingMs())
+                        var waited: Int64 = 0
+                        while (waited < backoff) {
+                            control.throwIfCancelled()
+                            let slice = min(25, backoff - waited)
+                            sleep(Duration.millisecond * slice)
+                            waited += slice
+                        }
                     }
                     attempt += 1
                 }
             }
 
             if (!deferSideEffects && status == "success" && dplan.requested && !skipSuccessDelivery) {
-                let deliveryResult = this.sendSuccessDelivery(j, dplan, answer, startedAtMs)
+                control.throwIfCancelled()
+                let deliveryResult = this.sendSuccessDelivery(j, dplan, answer, startedAtMs, executionControl: Some(control))
                 deliveryStatus = deliveryResult[0]
                 deliveryError = deliveryResult[1]
                 if (deliveryStatus == "not-delivered" && !dplan.bestEffortDeliver) {
@@ -1203,13 +1281,19 @@ public class CronRunner {
         jobId: String,
         force: Bool,
         cronEnabled!: Bool = true,
-        maxConcurrentRuns!: Int64 = 1
+        maxConcurrentRuns!: Int64 = 1,
+        cronDefaultTimeoutMs!: Int64 = CRON_DEFAULT_TIMEOUT_MS,
+        cronSafetyTimeoutMs!: Int64 = CRON_SAFETY_TIMEOUT_MS,
+        cronIdleTimeoutMs!: Int64 = CRON_IDLE_TIMEOUT_MS
     ): JsonObject {
         let runner = CronRunner(
             gatewayOpt: gatewayOpt,
             storePath: storePath,
             cronEnabled: cronEnabled,
-            maxConcurrentRuns: maxConcurrentRuns
+            maxConcurrentRuns: maxConcurrentRuns,
+            cronDefaultTimeoutMs: cronDefaultTimeoutMs,
+            cronSafetyTimeoutMs: cronSafetyTimeoutMs,
+            cronIdleTimeoutMs: cronIdleTimeoutMs
         )
         runner.runJobManual(jobId, force)
     }
@@ -1280,6 +1364,21 @@ public class CronRunner {
     }
 
     private func commitExecutionResult(result: CronExecutionResult): Unit {
+        if (result.executionControl.isCancelled()) {
+            let reason = result.executionControl.reason()
+            result.artifact.status = if (reason == "timed_out" || reason == "idle_timeout") { "timeout" } else { "cancelled" }
+            result.artifact.error = reason
+            result.artifact.answer = ""
+            result.artifact.deliveryStatus = "not-requested"
+            result.artifact.deliveryError = ""
+            this.finalizeError(
+                result.job,
+                result.executionId.startedAtMs,
+                if (result.artifact.endedAtMs > 0) { result.artifact.endedAtMs } else { epochMs() },
+                reason
+            )
+            result.job.state.lastStatus = result.artifact.status
+        }
         match (cronRunnerCommitHookForTest()) {
             case Some(hook) => hook("before-result-commit")
             case None => ()
@@ -1332,14 +1431,46 @@ public class CronRunner {
         for (entry in envelope.journal) {
             if (entry.executionId == identity) {
                 let dplan = resolveCronDeliveryPlan(result.job)
-                if (dplan.requested && !result.artifact.answer.isEmpty() && entry.deliveryReceipts.isEmpty()) {
-                    entry.deliveryReceipts = [
-                        CronDeliveryReceipt(
-                            dplan.channel,
-                            status: "not_started",
-                            updatedAtMs: epochMs()
+                if (
+                    result.artifact.status == "success" &&
+                    dplan.requested &&
+                    !result.artifact.answer.isEmpty() &&
+                    entry.deliveryReceipts.isEmpty()
+                ) {
+                    try {
+                        entry.deliveryArtifactRef = saveCronDeliveryIntentArtifact(
+                            this.storePath,
+                            CronDeliveryIntentArtifact(
+                                identity,
+                                result.job.id,
+                                result.artifact.answer,
+                                dplan.mode,
+                                dplan.channel,
+                                dplan.to,
+                                dplan.accountId,
+                                result.executionId.startedAtMs,
+                                dplan.bestEffortDeliver
+                            )
                         )
-                    ]
+                        entry.deliveryReceipts = [
+                            CronDeliveryReceipt(
+                                dplan.channel,
+                                status: "not_started",
+                                updatedAtMs: epochMs()
+                            )
+                        ]
+                    } catch (_: Exception) {
+                        // 业务终态已经完成；敏感/不可持久化payload不得让业务回滚或无限重试。
+                        entry.deliveryArtifactRef = ""
+                        entry.deliveryReceipts = [
+                            CronDeliveryReceipt(
+                                dplan.channel,
+                                status: "unknown",
+                                updatedAtMs: epochMs(),
+                                errorCode: "artifact_redacted"
+                            )
+                        ]
+                    }
                 }
                 let _ = entry.transition("delivery_pending", epochMs())
             }
@@ -1447,7 +1578,22 @@ public class CronRunner {
         let dplan = resolveCronDeliveryPlan(result.job)
         var deliveryStatus = artifact.deliveryStatus
         var deliveryError = artifact.deliveryError
-        if (artifact.status == "success" && dplan.requested && !artifact.answer.isEmpty()) {
+        var durableDeliveryAllowed = true
+        var deliveryMayHaveSucceeded = false
+        let committedEnvelope = cronLoadStoreOrEmpty(this.storePath)
+        for (entry in committedEnvelope.journal) {
+            if (entry.executionId == identity) {
+                for (receipt in entry.deliveryReceipts) {
+                    if (receipt.status == "unknown" && receipt.errorCode == "artifact_redacted") {
+                        durableDeliveryAllowed = false
+                        deliveryStatus = "unknown"
+                        deliveryError = "artifact_redacted"
+                    }
+                }
+            }
+        }
+        if (artifact.status == "success" && dplan.requested && !artifact.answer.isEmpty() && durableDeliveryAllowed) {
+            result.executionControl.throwIfCancelled()
             synchronized(this.tickLock) {
                 let envelope = cronLoadStoreOrEmpty(this.storePath)
                 for (entry in envelope.journal) {
@@ -1469,12 +1615,24 @@ public class CronRunner {
                     result.job,
                     dplan,
                     artifact.answer,
-                    result.executionId.startedAtMs
+                    result.executionId.startedAtMs,
+                    executionControl: Some(result.executionControl)
                 )
                 deliveryStatus = delivered[0]
                 deliveryError = delivered[1]
+                deliveryMayHaveSucceeded = deliveryStatus == "delivered"
+                result.executionControl.throwIfCancelled()
+                result.executionControl.heartbeat()
+                match (cronRunnerDeliveryStageHookForTest()) {
+                    case Some(hook) => hook("send-returned")
+                    case None => ()
+                }
             } catch (deliveryException: Exception) {
-                deliveryStatus = "not-delivered"
+                deliveryStatus = if (deliveryMayHaveSucceeded || result.executionControl.isCancelled()) {
+                    "unknown"
+                } else {
+                    "not-delivered"
+                }
                 deliveryError = this.deliveryFailureMessage(dplan.mode, deliveryException.message)
                 this.markDeliveryFailure(
                     result.job,
@@ -1524,6 +1682,7 @@ public class CronRunner {
             artifact.error = deliveryError
         }
         let logOutcome = this.appendTerminalRunLogIdempotent(result)
+        var settledArtifactRef = ""
         synchronized(this.tickLock) {
             let envelope = cronLoadStoreOrEmpty(this.storePath)
             if (
@@ -1534,10 +1693,26 @@ public class CronRunner {
             }
             for (entry in envelope.journal) {
                 if (entry.executionId == identity) {
+                    settledArtifactRef = entry.deliveryArtifactRef
                     for (receipt in entry.deliveryReceipts) {
-                        receipt.status = if (deliveryStatus == "delivered") { "succeeded" } else { "failed" }
+                        receipt.status = if (deliveryStatus == "delivered") {
+                            "succeeded"
+                        } else if (deliveryStatus == "unknown") {
+                            "unknown"
+                        } else {
+                            "failed"
+                        }
                         receipt.updatedAtMs = epochMs()
-                        receipt.errorCode = if (deliveryError.isEmpty()) { "" } else { "delivery_failed" }
+                        receipt.errorCode = if (
+                            receipt.status == "unknown" &&
+                            deliveryError == "artifact_redacted"
+                        ) {
+                            "artifact_redacted"
+                        } else if (deliveryError.isEmpty()) {
+                            ""
+                        } else {
+                            "delivery_failed"
+                        }
                     }
                     if (logOutcome == "appended") {
                         entry.runLogRecorded = true
@@ -1554,6 +1729,13 @@ public class CronRunner {
             for (job in envelope.jobs) {
                 this.jobs.add(job)
             }
+        }
+        match (cronRunnerDeliveryStageHookForTest()) {
+            case Some(hook) => hook("receipt-persisted")
+            case None => ()
+        }
+        if (!settledArtifactRef.isEmpty()) {
+            let _ = deleteCronDeliveryIntentArtifact(this.storePath, settledArtifactRef)
         }
     }
 
@@ -1613,6 +1795,104 @@ public class CronRunner {
         }
         if (changed) {
             cronSaveStoreAtomic(this.storePath, envelope)
+        }
+    }
+
+    /** 重启只重试 durable not_started；遗留 in_flight 一律转 unknown，禁止双发。 */
+    private func recoverPendingDeliveryIntents(): Unit {
+        let envelope = cronLoadStoreOrEmpty(this.storePath)
+        let pending = ArrayList<(String, String, String)>()
+        var changed = false
+        for (entry in envelope.journal) {
+            for (receipt in entry.deliveryReceipts) {
+                if (receipt.status == "in_flight") {
+                    receipt.status = "unknown"
+                    receipt.errorCode = "delivery_outcome_unknown"
+                    receipt.updatedAtMs = epochMs()
+                    changed = true
+                } else if (receipt.status == "not_started" && !entry.deliveryArtifactRef.isEmpty()) {
+                    pending.add((entry.executionId, entry.deliveryArtifactRef, receipt.targetId))
+                }
+            }
+        }
+        if (changed) {
+            cronSaveStoreAtomic(this.storePath, envelope)
+        }
+        for (item in pending) {
+            let identity = item[0]
+            let artifactRef = item[1]
+            let loaded = loadCronDeliveryIntentArtifact(this.storePath, artifactRef, expectedExecutionId: identity)
+            if (!loaded.ok) {
+                let broken = cronLoadStoreOrEmpty(this.storePath)
+                for (entry in broken.journal) {
+                    if (entry.executionId == identity) {
+                        for (receipt in entry.deliveryReceipts) {
+                            if (receipt.status == "not_started") {
+                                receipt.status = "failed"
+                                receipt.errorCode = loaded.status
+                                receipt.updatedAtMs = epochMs()
+                            }
+                        }
+                    }
+                }
+                cronSaveStoreAtomic(this.storePath, broken)
+                continue
+            }
+            let artifact = loaded.artifact.getOrThrow()
+            var jobOpt: Option<CronJob> = None<CronJob>
+            for (job in cronLoadOrEmpty(this.storePath)) {
+                if (job.id == artifact.jobId) { jobOpt = Some(job) }
+            }
+            if (jobOpt.isNone()) {
+                continue
+            }
+            let inFlight = cronLoadStoreOrEmpty(this.storePath)
+            var claimed = false
+            for (entry in inFlight.journal) {
+                if (entry.executionId == identity) {
+                    for (receipt in entry.deliveryReceipts) {
+                        if (receipt.status == "not_started") {
+                            receipt.status = "in_flight"
+                            receipt.updatedAtMs = epochMs()
+                            claimed = true
+                        }
+                    }
+                }
+            }
+            if (!claimed) { continue }
+            cronSaveStoreAtomic(this.storePath, inFlight)
+            match (cronRunnerDeliveryHookForTest()) {
+                case Some(hook) => hook()
+                case None => ()
+            }
+            let plan = CronDeliveryResolved(
+                mode: artifact.mode,
+                requested: true,
+                channel: artifact.channel,
+                to: artifact.to,
+                accountId: artifact.accountId,
+                bestEffortDeliver: artifact.bestEffortDeliver
+            )
+            let delivered = this.sendSuccessDelivery(
+                jobOpt.getOrThrow(),
+                plan,
+                artifact.answer,
+                artifact.startedAtMs
+            )
+            let settled = cronLoadStoreOrEmpty(this.storePath)
+            for (entry in settled.journal) {
+                if (entry.executionId == identity) {
+                    for (receipt in entry.deliveryReceipts) {
+                        if (receipt.status == "in_flight") {
+                            receipt.status = if (delivered[0] == "delivered") { "succeeded" } else { "failed" }
+                            receipt.errorCode = if (delivered[1].isEmpty()) { "" } else { "delivery_failed" }
+                            receipt.updatedAtMs = epochMs()
+                        }
+                    }
+                }
+            }
+            cronSaveStoreAtomic(this.storePath, settled)
+            let _ = deleteCronDeliveryIntentArtifact(this.storePath, artifactRef)
         }
     }
 
@@ -1683,6 +1963,7 @@ public class CronRunner {
         if (!this.started) {
             this.start()
         }
+        this.recoverPendingDeliveryIntents()
         if (!this.executionExecutor.tryAcquireSlot()) {
             return CronExecutionReservation("deferred")
         }
@@ -1749,12 +2030,33 @@ public class CronRunner {
                         } else {
                             job.sessionTarget.trimAscii()
                         }
+                        let deadline = resolveCronExecutionDeadline(
+                            snapshot,
+                            snapshot.scriptMode,
+                            startedAtMs,
+                            defaultTimeoutMs: this.cronDefaultTimeoutMs,
+                            safetyTimeoutMs: this.cronSafetyTimeoutMs,
+                            idleTimeoutMs: this.cronIdleTimeoutMs
+                        )
+                        let control = CronExecutionControl(
+                            deadline.absoluteDeadlineMs,
+                            idleTimeoutMs: deadline.idleTimeoutMs
+                        )
                         let task = CronExecutionTask(
                             id,
                             snapshot,
                             { executionJob =>
-                                this.fireSingleJob(executionJob, now, startedAtMs, deferSideEffects: true)
+                                this.fireSingleJob(
+                                    executionJob,
+                                    now,
+                                    startedAtMs,
+                                    executionControl: control,
+                                    deferSideEffects: true
+                                )
                             },
+                            absoluteDeadlineMs: deadline.absoluteDeadlineMs,
+                            idleTimeoutMs: deadline.idleTimeoutMs,
+                            executionControl: Some(control),
                             serialKey: serialKey,
                             globalResource: !job.scriptPath.trimAscii().isEmpty()
                         )
@@ -1838,6 +2140,9 @@ public class CronRunner {
         if (!this.started) {
             this.start()
         }
+        // durable delivery recovery runs before the scheduler arm gate; disabled
+        // schedulers must still settle restart state without re-running jobs.
+        this.recoverPendingDeliveryIntents()
         // Completion 必须先于 arm gate 收割，否则长 arm 会延迟终态持久化。
         let completed = this.executionExecutor.drainCompleted()
         let pendingCompleted = ArrayList<CronExecutionResult>()

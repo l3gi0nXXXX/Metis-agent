@@ -159,13 +159,24 @@ public class CodexResponsesHttpClient {
             body = JsonValue.fromStr(payload.toJsonString()).asObject()
             body.put("stream", JsonBool(true))
         }
+        let configuredTimeoutMs = if (timeoutMs > 0) {
+            timeoutMs
+        } else {
+            this.transportConfig.timeoutMs
+        }
+        let executionRemainingMs = currentModelExecutionRemainingMs()
+        let effectiveTimeoutMs = if (executionRemainingMs > 0) {
+            min(configuredTimeoutMs, executionRemainingMs)
+        } else {
+            configuredTimeoutMs
+        }
         return CodexResponsesHttpRequest(
             "POST",
             "${codexTrimResponsesBaseUrl(baseUrl)}/responses",
             headers,
             body,
             stream: stream,
-            timeoutMs: timeoutMs
+            timeoutMs: effectiveTimeoutMs
         )
     }
 

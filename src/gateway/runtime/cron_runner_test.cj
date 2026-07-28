@@ -11,6 +11,8 @@ import metis.gateway.tools.{
 import metis.cron.{
     CronJob,
     CronExecutionJournalEntry,
+    CronDeliveryReceipt,
+    CronDeliveryIntentArtifact,
     CronStoreEnvelope,
     CronJobState,
     CronSchedule,
@@ -19,6 +21,7 @@ import metis.cron.{
     appendCronRunLog,
     cronLoadOrEmpty,
     cronLoadStoreOrEmpty,
+    saveCronDeliveryIntentArtifact,
     cronScriptsDir,
     cronRunLogPathFromStore,
     cronSave,
@@ -38,7 +41,7 @@ import std.fs.{Directory, File, Path, remove}
 import std.sync.{AtomicBool, Condition, Mutex}
 import std.time.DateTime
 import std.unittest.testmacro.*
-import stdx.encoding.json.{JsonObject, JsonString}
+import stdx.encoding.json.{JsonInt, JsonObject, JsonString}
 
 private func withCronRunnerTestHome<T>(block: (Path) -> T): T {
     synchronized(MetisProcessEnvironmentLock) {
@@ -196,6 +199,47 @@ public class CronRunnerManualIdentityTest {
     }
 
     @TestCase
+    public func m3B1N1AgentLateSuccessAtDeadlineCannotDeliverOrOverwriteTimeout(): Unit {
+        withCronRunnerTestHome({ storePath: Path =>
+            let job = cronRunnerTestJob("agent-late-timeout")
+            job.timeoutMs = 1
+            job.deliveryMode = "webhook"
+            job.deliveryTo = "https://example.com/hook"
+            cronSave(storePath, [job])
+            debugSetCronRunnerReplyForTest(Some({ _job, _request =>
+                sleep(Duration.millisecond * 25)
+                "late-success-中文🙂"
+            }))
+            let sends = JsonObject()
+            sends.put("count", JsonInt(0))
+            setCronWebhookHttpRunnerForTest(Some({ _request: CronWebhookHttpRequest =>
+                let count = sends.get("count").getOrThrow().asInt().getValue()
+                sends.put("count", JsonInt(count + 1))
+                CronWebhookHttpResponse(true, statusCode: 200)
+            }))
+            try {
+                let runner = CronRunner(storePath: storePath)
+                let accepted = runner.enqueueJobManual(job.id, true)
+                @Expect(accepted.get("enqueued").getOrThrow().asBool().getValue(), true)
+                @Expect(runner.waitUntilIdle(timeoutMs: 2000), true)
+                runner.tick()
+                runner.tick()
+            } finally {
+                setCronWebhookHttpRunnerForTest(None<(CronWebhookHttpRequest) -> CronWebhookHttpResponse>)
+            }
+            @Expect(sends.get("count").getOrThrow().asInt().getValue(), 0)
+            let after = cronLoadStoreOrEmpty(storePath)
+            @Expect(after.jobs[0].state.lastStatus, "timeout")
+            @Expect(after.journal[0].deliveryArtifactRef, "")
+            let runs = readCronRunLogEntriesForJob(storePath, job.id)
+            @Expect(runs.get("total").getOrThrow().asInt().getValue(), 1)
+            let row = runs.get("entries").getOrThrow().asArray()[0].asObject()
+            @Expect(row.get("status").getOrThrow().asString().getValue(), "timeout")
+            @Expect(row.toJsonString().contains("late-success"), false)
+        })
+    }
+
+    @TestCase
     public func m2B2RunLogExecutionIdMakesCrashReplayIdempotent(): Unit {
         withCronRunnerTestHome({ storePath =>
             appendCronRunLog(storePath, "journal-job", "success", 1, 2, summary: "中文😀", executionId: "run-唯一-😀")
@@ -235,6 +279,156 @@ public class CronRunnerManualIdentityTest {
                 @Expect(envelope.journal[0].phase, "logged")
                 @Expect(envelope.journal[0].runLogRecorded, true)
                 @Expect(readCronRunLogEntriesForJob(storePath, job.id).get("total").getOrThrow().asInt().getValue(), 1)
+            })
+        }
+    }
+
+    @TestCase
+    public func m3B2N3RecoveryRetriesOnlyNotStartedAndTurnsInFlightUnknown(): Unit {
+        withCronRunnerTestHome({ storePath =>
+            let job = cronRunnerTestJob("delivery-recover")
+            job.deliveryMode = "webhook"
+            job.deliveryTo = "https://example.com/hook"
+            job.state.lastStatus = "success"
+            cronSave(storePath, [job])
+            let notStartedId = "delivery-recover:1:100"
+            let inFlightId = "delivery-recover:2:200"
+            let ref = saveCronDeliveryIntentArtifact(
+                storePath,
+                CronDeliveryIntentArtifact(
+                    notStartedId,
+                    job.id,
+                    "恢复投递中文🙂",
+                    "webhook",
+                    "",
+                    "https://example.com/hook",
+                    "",
+                    100,
+                    false
+                )
+            )
+            cronSaveStoreAtomic(storePath, CronStoreEnvelope(
+                jobs: [job],
+                journal: [
+                    CronExecutionJournalEntry(
+                        notStartedId,
+                        job.id,
+                        phase: "delivery_pending",
+                        reservedAtMs: 100,
+                        updatedAtMs: 100,
+                        deliveryReceipts: [CronDeliveryReceipt("webhook", status: "not_started")],
+                        deliveryArtifactRef: ref
+                    ),
+                    CronExecutionJournalEntry(
+                        inFlightId,
+                        job.id,
+                        phase: "delivery_pending",
+                        reservedAtMs: 200,
+                        updatedAtMs: 200,
+                        deliveryReceipts: [CronDeliveryReceipt("webhook", status: "in_flight")]
+                    )
+                ]
+            ))
+            let calls = JsonObject()
+            calls.put("count", JsonInt(0))
+            debugSetCronRunnerDeliveryForTest(Some({ =>
+                let count = calls.get("count").getOrThrow().asInt().getValue()
+                calls.put("count", JsonInt(count + 1))
+            }))
+            setCronWebhookHttpRunnerForTest(Some({ _request: CronWebhookHttpRequest =>
+                CronWebhookHttpResponse(true, statusCode: 200)
+            }))
+            try {
+                CronRunner(storePath: storePath, cronEnabled: false).tick()
+                CronRunner(storePath: storePath, cronEnabled: false).tick()
+            } finally {
+                debugSetCronRunnerDeliveryForTest(None<() -> Unit>)
+                setCronWebhookHttpRunnerForTest(None<(CronWebhookHttpRequest) -> CronWebhookHttpResponse>)
+            }
+            @Expect(calls.get("count").getOrThrow().asInt().getValue(), 1)
+            let after = cronLoadStoreOrEmpty(storePath)
+            @Expect(after.journal[0].deliveryReceipts[0].status, "succeeded")
+            @Expect(after.journal[1].deliveryReceipts[0].status, "unknown")
+        })
+    }
+
+    @TestCase
+    public func m3N3SensitiveArtifactKeepsBusinessSuccessAndNeverSendsOrRetries(): Unit {
+        withCronRunnerTestHome({ storePath =>
+            let job = cronRunnerTestJob("sensitive-delivery")
+            job.deliveryMode = "webhook"
+            job.deliveryTo = "https://example.com/hook"
+            cronSave(storePath, [job])
+            debugSetCronRunnerReplyForTest(Some({ _job, _request =>
+                "Authorization: Bearer secret-value"
+            }))
+            let calls = JsonObject()
+            calls.put("count", JsonInt(0))
+            debugSetCronRunnerDeliveryForTest(Some({ =>
+                let count = calls.get("count").getOrThrow().asInt().getValue()
+                calls.put("count", JsonInt(count + 1))
+            }))
+            try {
+                let runner = CronRunner(storePath: storePath)
+                let accepted = runner.enqueueJobManual(job.id, true)
+                @Expect(accepted.get("enqueued").getOrThrow().asBool().getValue(), true)
+                @Expect(runner.waitUntilIdle(timeoutMs: 2000), true)
+                runner.tick()
+                runner.tick()
+            } finally {
+                debugSetCronRunnerDeliveryForTest(None<() -> Unit>)
+            }
+            @Expect(calls.get("count").getOrThrow().asInt().getValue(), 0)
+            let after = cronLoadStoreOrEmpty(storePath)
+            @Expect(after.jobs[0].state.lastStatus, "success")
+            @Expect(after.journal[0].deliveryReceipts[0].status, "unknown")
+            @Expect(after.journal[0].deliveryReceipts[0].errorCode, "artifact_redacted")
+            @Expect(after.journal[0].deliveryArtifactRef, "")
+        })
+    }
+
+    @TestCase
+    public func m3B2SendReturnedAndReceiptPersistedCrashPointsNeverDoubleSend(): Unit {
+        for (crashPoint in ["send-returned", "receipt-persisted"]) {
+            withCronRunnerTestHome({ storePath =>
+                let job = cronRunnerTestJob("delivery-${crashPoint}")
+                job.deliveryMode = "webhook"
+                job.deliveryTo = "https://example.com/hook"
+                cronSave(storePath, [job])
+                debugSetCronRunnerReplyForTest(Some({ _job, _request => "正常投递🙂" }))
+                let calls = JsonObject()
+                calls.put("count", JsonInt(0))
+                setCronWebhookHttpRunnerForTest(Some({ _request: CronWebhookHttpRequest =>
+                    let count = calls.get("count").getOrThrow().asInt().getValue()
+                    calls.put("count", JsonInt(count + 1))
+                    CronWebhookHttpResponse(true, statusCode: 200)
+                }))
+                let crashed = AtomicBool(false)
+                debugSetCronRunnerDeliveryStageForTest(Some({ stage =>
+                    if (stage == crashPoint && !crashed.load()) {
+                        crashed.store(true)
+                        throw Exception("simulated-${stage}")
+                    }
+                }))
+                try {
+                    let first = CronRunner(storePath: storePath)
+                    let _ = first.enqueueJobManual(job.id, true)
+                    @Expect(first.waitUntilIdle(timeoutMs: 2000), true)
+                    first.tick()
+                    debugSetCronRunnerDeliveryStageForTest(None<(String) -> Unit>)
+                    CronRunner(storePath: storePath, cronEnabled: false).tick()
+                    CronRunner(storePath: storePath, cronEnabled: false).tick()
+                } finally {
+                    debugSetCronRunnerDeliveryStageForTest(None<(String) -> Unit>)
+                    setCronWebhookHttpRunnerForTest(None<(CronWebhookHttpRequest) -> CronWebhookHttpResponse>)
+                }
+                @Expect(crashed.load(), true)
+                @Expect(calls.get("count").getOrThrow().asInt().getValue(), 1)
+                let status = cronLoadStoreOrEmpty(storePath).journal[0].deliveryReceipts[0].status
+                @Expect(
+                    status,
+                    if (crashPoint == "send-returned") { "unknown" } else { "succeeded" }
+                )
             })
         }
     }
@@ -1821,7 +2015,9 @@ public class CronRunnerDeliveryTest {
             @Expect(jobs[0].state.lastStatus, "success")
             let runs = readCronRunLogEntriesForJob(storePath, "m5-shell-web-boundary", limit: 10)
             let row = runs.get("entries").getOrThrow().asArray()[0].asObject()
-            @Expect(row.get("deliveryStatus").getOrThrow().asString().getValue(), "not-delivered")
+            // M3-N3: 诊断正文包含凭据形态时必须在 adapter 调用前隔离。
+            @Expect(adapter.sendCount, 0)
+            @Expect(row.get("deliveryStatus").getOrThrow().asString().getValue(), "unknown")
             @Expect(row.get("diagnosticCode").getOrThrow().asString().getValue(), "cron_tool_exec_blocked")
             @Expect(row.get("diagnosticMessage").getOrThrow().asString().getValue().contains("cron_tool_exec_blocked"), true)
             let deliveryError = row.get("deliveryError").getOrThrow().asString().getValue()
@@ -2176,7 +2372,7 @@ public class CronRunnerWebhookDeliveryTest {
             let captured = JsonObject()
             setCronWebhookHttpRunnerForTest(Some({ request: CronWebhookHttpRequest =>
                 captured.put("url", JsonString(request.url))
-                captured.put("timeoutMs", JsonString("${request.timeoutMs}"))
+                captured.put("timeoutMs", JsonInt(request.timeoutMs))
                 captured.put("verifyTls", JsonString("${request.verifyTls}"))
                 captured.put("jobId", request.body.get("jobId").getOrThrow())
                 captured.put("summary", request.body.get("summary").getOrThrow())
@@ -2187,7 +2383,9 @@ public class CronRunnerWebhookDeliveryTest {
             @Expect(result.get("ok").getOrThrow().asBool().getValue(), true)
             @Expect(result.get("ran").getOrThrow().asBool().getValue(), true)
             @Expect(captured.get("url").getOrThrow().asString().getValue(), "https://example.com/cron-hook?token=secret")
-            @Expect(captured.get("timeoutMs").getOrThrow().asString().getValue(), "2500")
+            let actualTimeoutMs = captured.get("timeoutMs").getOrThrow().asInt().getValue()
+            @Expect(actualTimeoutMs > 0, true)
+            @Expect(actualTimeoutMs <= 2500, true)
             @Expect(captured.get("verifyTls").getOrThrow().asString().getValue(), "true")
             @Expect(captured.get("jobId").getOrThrow().asString().getValue(), "webhook-delivery")
             @Expect(captured.get("summary").getOrThrow().asString().getValue(), "webhook answer")

@@ -11,6 +11,11 @@ private func cronExecutorTestJob(id: String): CronJob {
     CronJob(id, "test", CronSchedule.every(60000))
 }
 
+private class CronExecutorFakeClock {
+    public var now: Int64
+    public init(now: Int64) { this.now = now }
+}
+
 private func awaitCronExecutorTest(
     predicate: () -> Bool,
     timeoutMs!: Int64 = 2000
@@ -47,6 +52,99 @@ private func cronExecutorTestTask(
 
 @Test
 public class CronExecutionExecutorTest {
+    @TestCase
+    public func m3U1RemainingHeartbeatAndFirstCancelReasonAreStable(): Unit {
+        let clock = CronExecutorFakeClock(1000)
+        let control = CronExecutionControl(2000, idleTimeoutMs: 200, nowMs: { => clock.now })
+        @Expect(control.remainingMs(), 1000)
+        clock.now = 1100
+        control.heartbeat()
+        clock.now = 1250
+        @Expect(control.isCancelled(), false)
+        clock.now = 1300
+        @Expect(control.isCancelled(), true)
+        @Expect(control.reason(), "idle_timeout")
+        @Expect(control.cancel("later_cancel"), false)
+        @Expect(control.reason(), "idle_timeout")
+        @Expect(control.remainingMs(), 0)
+    }
+
+    @TestCase
+    public func m3B1CompletionAtWallDeadlineProducesSingleTimeout(): Unit {
+        let clock = CronExecutorFakeClock(100)
+        let control = CronExecutionControl(101, nowMs: { => clock.now })
+        @Expect(control.remainingMs(), 1)
+        clock.now = 101
+        @Expect(control.isCancelled(), true)
+        @Expect(control.reason(), "timed_out")
+        @Expect(control.cancel("second"), false)
+    }
+
+    @TestCase
+    public func m3P1ValidProgressHeartbeatsMayOutliveIdleAndFinishBeforeWall(): Unit {
+        let clock = CronExecutorFakeClock(0)
+        let control = CronExecutionControl(1000, idleTimeoutMs: 100, nowMs: { => clock.now })
+        for (step in [90, 180, 270, 360, 450]) {
+            clock.now = step
+            control.heartbeat()
+            @Expect(control.isCancelled(), false)
+        }
+        clock.now = 500
+        control.throwIfCancelled()
+        @Expect(control.remainingMs(), 500)
+        @Expect(control.reason(), "")
+    }
+
+    @TestCase
+    public func m3B3TimeoutZeroKeepsSafetyAndIdleZeroOnlyDisablesIdle(): Unit {
+        let zero = cronExecutorTestJob("zero")
+        zero.timeoutMs = 0
+        let resolved = resolveCronExecutionDeadline(
+            zero,
+            "agent",
+            100,
+            safetyTimeoutMs: 5000,
+            idleTimeoutMs: 0
+        )
+        @Expect(resolved.userWallTimeoutMs, 0)
+        @Expect(resolved.absoluteDeadlineMs, 5100)
+        @Expect(resolved.idleTimeoutMs, 0)
+
+        zero.timeoutMs = 2501
+        let explicit = resolveCronExecutionDeadline(
+            zero,
+            "noAgent",
+            100,
+            safetyTimeoutMs: 5000,
+            idleTimeoutMs: 3000
+        )
+        @Expect(explicit.absoluteDeadlineMs, 2601)
+        @Expect(explicit.idleTimeoutMs, 2501)
+
+        let clamped = resolveCronExecutionDeadline(
+            zero,
+            "script",
+            0,
+            defaultTimeoutMs: -1,
+            safetyTimeoutMs: CRON_TIMEOUT_HARD_LIMIT_MS + 99,
+            idleTimeoutMs: CRON_TIMEOUT_HARD_LIMIT_MS + 100
+        )
+        @Expect(clamped.safetyTimeoutMs, CRON_TIMEOUT_HARD_LIMIT_MS)
+        @Expect(clamped.absoluteDeadlineMs, 2501)
+        @Expect(clamped.idleTimeoutMs, 2501)
+    }
+
+    @TestCase
+    public func m3N5ProviderCancellationMatrixHasNoEmptyAdapterOrLateFenceGap(): Unit {
+        let rows = cronCancellationProviderMatrix()
+        @Expect(rows.size, 6)
+        for (row in rows) {
+            @Expect(row.provider.trimAscii().isEmpty(), false)
+            @Expect(row.mechanism.trimAscii().isEmpty(), false)
+            @Expect(row.lateFence, true)
+        }
+    }
+
     @TestCase
     public func m2B3SharedSessionAndGlobalResourceSerializeWhileIndependentTaskRuns(): Unit {
         let executor = CronExecutionExecutor(maxConcurrentRuns: 3)

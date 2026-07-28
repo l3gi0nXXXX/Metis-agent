@@ -565,7 +565,8 @@ public func gatewayExecuteSessionRequestTurn(
     streamHook!: Option<(GatewaySessionContext, String) -> Unit> = None<(GatewaySessionContext, String) -> Unit>,
     streamingEnabled!: Bool = false,
     lifecycleHook!: Option<(String) -> Unit> = None<(String) -> Unit>,
-    turnContextOverride!: Option<GatewayTurnContext> = None<GatewayTurnContext>
+    turnContextOverride!: Option<GatewayTurnContext> = None<GatewayTurnContext>,
+    executionControl!: Option<GatewayExecutionControl> = None<GatewayExecutionControl>
 ): GatewayResolvedSessionTurnResult {
     let resolvedContext = gatewayResolveSessionContextWithAgentRoute(request)
     let context = match (turnContextOverride) {
@@ -605,7 +606,19 @@ public func gatewayExecuteSessionRequestTurn(
         toolExecMode: request.toolExecMode,
         toolExecAllowlist: request.toolExecAllowlist,
         lifecycleHook: lifecycleHook,
-        gatewayCallHook: gatewaySessionTurnGatewayCallHookFromDeliverHook(deliverHook)
+        gatewayCallHook: gatewaySessionTurnGatewayCallHookFromDeliverHook(deliverHook),
+        remainingMsHook: match (executionControl) {
+            case Some(control) => Some<() -> Int64>({ => control.remainingMs() })
+            case None => None<() -> Int64>
+        },
+        heartbeatHook: match (executionControl) {
+            case Some(control) => Some<() -> Unit>({ => control.heartbeat() })
+            case None => None<() -> Unit>
+        },
+        cancellationCheckHook: match (executionControl) {
+            case Some(control) => Some<() -> Unit>({ => control.throwIfCancelled() })
+            case None => None<() -> Unit>
+        }
     )
     let mediaPrompt = gatewayBuildMediaContextPrompt(request.mediaContext)
     if (!mediaPrompt.trimAscii().isEmpty()) {
@@ -646,6 +659,7 @@ public func gatewayExecuteSessionRequestTurn(
         streamHook: streamHook,
         streamingEnabled: streamingEnabled,
         lifecycleHook: lifecycleHook
+        , executionControl: executionControl
     )
     GatewayResolvedSessionTurnResult(context, execution)
 }
@@ -664,7 +678,8 @@ public func gatewayExecuteSessionRequestTurnForUser(
     transcriptHook!: Option<(GatewaySessionContext, Int64, String, String) -> Unit> = None<(GatewaySessionContext, Int64, String, String) -> Unit>,
     streamHook!: Option<(GatewaySessionContext, String) -> Unit> = None<(GatewaySessionContext, String) -> Unit>,
     lifecycleHook!: Option<(String) -> Unit> = None<(String) -> Unit>,
-    turnContextOverride!: Option<GatewayTurnContext> = None<GatewayTurnContext>
+    turnContextOverride!: Option<GatewayTurnContext> = None<GatewayTurnContext>,
+    executionControl!: Option<GatewayExecutionControl> = None<GatewayExecutionControl>
 ): GatewayResolvedSessionTurnResult {
     let bridge = gatewayBridgeForSessionRequest(user, request)
     let context = gatewayResolveSessionContextWithAgentRoute(request)
@@ -683,6 +698,7 @@ public func gatewayExecuteSessionRequestTurnForUser(
         streamHook: streamHook,
         streamingEnabled: gatewayStreamingEnabledForUserChannel(user, context.channelName),
         lifecycleHook: lifecycleHook,
-        turnContextOverride: turnContextOverride
+        turnContextOverride: turnContextOverride,
+        executionControl: executionControl
     )
 }

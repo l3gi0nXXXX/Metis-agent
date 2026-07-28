@@ -8,8 +8,7 @@ import magic.jsonable.TypeSchema
 import magic.prelude.*
 
 import metis.core.{GatewayToolRuntimeContext, RuntimeToolInvocationPolicyContext, gatewayCurrentToolRuntimeContext, gatewayMainRuntimeRequiredToolNames, gatewayNotifyCurrentToolRuntimeStatus, gatewayWithToolRuntimeContext, metisSafeRuneEllipsis, resolveGatewayProviderHttpRoute, resolveGatewayProviderHttpTransportConfig, resolveRuntimeToolPolicyFromRoot, runtimePopToolInvocationPolicyContext, runtimePushToolInvocationPolicyContext, runtimeToolInvocationAllowedFromRoot, runtimeToolNamesContain, runtimeToolNamesContainAll}
-import metis.core.model.CliModelManager
-import metis.core.model.ModelTokenLimits
+import metis.core.model.{CliModelManager, ModelTokenLimits, popModelExecutionRemainingMs, pushModelExecutionRemainingMs}
 import metis.core.config.{CliConfig, CliModelRuntimeStateManager, CliSettingManager, GatewayUserSettings, MetisConfigManager}
 import metis.core.prompting.{MetisBootstrapBudgetResult, MetisSystemPromptParams, MetisSystemPromptBuilder, MetisWorkspaceBootstrap}
 import metis.core.skills.SkillsPrompt
@@ -553,6 +552,13 @@ private class GatewayLifecycleToolWrapper <: Tool {
     }
 
     override public func invoke(args: HashMap<String, JsonValue>): ToolResponse {
+        match (this.capturedRuntimeContext) {
+            case Some(context) => match (context.cancellationCheckHook) {
+                case Some(check) => check()
+                case None => ()
+            }
+            case None => ()
+        }
         gatewayNotifyCurrentToolRuntimeStatus("tool")
         let decision = runtimeToolInvocationAllowedFromRoot(
             this.policyRoot,
@@ -567,16 +573,74 @@ private class GatewayLifecycleToolWrapper <: Tool {
                 isError: true
             )
         }
-        match (this.capturedRuntimeContext) {
+        let response = match (this.capturedRuntimeContext) {
             case Some(context) =>
                 gatewayWithToolRuntimeContext(context, { => this.inner.invoke(args) })
             case None => this.inner.invoke(args)
         }
+        match (this.capturedRuntimeContext) {
+            case Some(context) =>
+                match (context.cancellationCheckHook) {
+                    case Some(check) => check()
+                    case None => ()
+                }
+                match (context.heartbeatHook) {
+                    case Some(heartbeat) => heartbeat()
+                    case None => ()
+                }
+            case None => ()
+        }
+        response
     }
 
     override public func toJsonValue(): JsonValue {
         this.inner.toJsonValue()
     }
+}
+
+/**
+ * 第三方 ChatModel 没有统一 cancel API；用绝对剩余预算限制调用方等待，
+ * 同时由 Responses/tool adapters 消费同一 transport/process deadline。
+ */
+private func gatewayRunModelWithExecutionControl<T>(
+    executionControl: Option<GatewayExecutionControl>,
+    block: () -> T
+): T {
+    match (executionControl) {
+        case None => return block()
+        case Some(control) =>
+            control.throwIfCancelled()
+            let remaining = control.remainingMs()
+            if (remaining <= 0) {
+                control.throwIfCancelled()
+            }
+            let future = spawn {
+                pushModelExecutionRemainingMs({ => control.remainingMs() })
+                try {
+                    block()
+                } finally {
+                    popModelExecutionRemainingMs()
+                }
+            }
+            let watchdog = spawn {
+                sleep(Duration.millisecond * remaining)
+                future.cancel()
+            }
+            try {
+                let value = future.get()
+                watchdog.cancel()
+                control.throwIfCancelled()
+                return value
+            } catch (e: Exception) {
+                try { watchdog.cancel() } catch (_: Exception) { () }
+                control.throwIfCancelled()
+                throw e
+            }
+    }
+}
+
+public func debugGatewayRunModelWithoutExecutionControlForTest<T>(block: () -> T): T {
+    gatewayRunModelWithExecutionControl(None<GatewayExecutionControl>, block)
 }
 
 func gatewayLifecycleWrappedTools(
@@ -646,8 +710,13 @@ private func gatewayApplyToolPolicy(
         provider: provider
     )
     let keep = ArrayList<Tool>()
+    let cronHeadless = match (capturedRuntimeContext) {
+        case Some(context) => !context.cronJobId.isEmpty()
+        case None => false
+    }
     for (tool in agent.toolManager.tools) {
-        if (runtimeToolNamesContain(report.visibleTools, tool.name)) {
+        let cronDenied = cronHeadless && gatewayCronHeadlessToolDenied(tool.name)
+        if (runtimeToolNamesContain(report.visibleTools, tool.name) && !cronDenied) {
             keep.add(tool)
         }
     }
@@ -661,6 +730,18 @@ private func gatewayApplyToolPolicy(
         capturedRuntimeContext: capturedRuntimeContext
     ))
     report.deniedTools
+}
+
+/** Cron headless profile禁止递归调度、Gateway生命周期、外发消息和交互/子任务等待。 */
+public func gatewayCronHeadlessToolDenied(toolName: String): Bool {
+    let normalized = toolName.trimAscii().toAsciiLower()
+    normalized == "cron" ||
+        normalized == "gateway" ||
+        normalized == "message" ||
+        normalized == "clarify" ||
+        normalized == "sessions_spawn" ||
+        normalized == "sessions_batch_delegate" ||
+        normalized == "process"
 }
 
 public func gatewayDefaultChatRuntimeHasUnifiedCoreTools(): Bool {
@@ -983,9 +1064,14 @@ public class AgentBridge {
         extraSystemPrompt!: String = "",
         streamingEnabled!: Bool = false,
         streamChunkHook!: Option<(String) -> Unit> = None<(String) -> Unit>,
-        turnContext!: Option<GatewayTurnContext> = None<GatewayTurnContext>
+        turnContext!: Option<GatewayTurnContext> = None<GatewayTurnContext>,
+        executionControl!: Option<GatewayExecutionControl> = None<GatewayExecutionControl>
     ): String {
         synchronized(this.replyLock) {
+            match (executionControl) {
+                case Some(control) => control.throwIfCancelled()
+                case None => ()
+            }
             let effectiveAgentId = gatewayTurnEffectiveAgentId(agentId, turnContext)
             gatewayLogEventInfo(
                 "gateway/agent",
@@ -1198,6 +1284,10 @@ public class AgentBridge {
                 note: "history=${history.size}, modelInputChars=${modelInput.size}, models=${allModels.size}"
             )
             for ((idx, currModel) in enumerate(allModels)) {
+                match (executionControl) {
+                    case Some(control) => control.throwIfCancelled()
+                    case None => ()
+                }
                 var attemptPromptChars: Int64 = 0
                 try {
                     let revertSkillEnv = match (enabledSelectedSkillNameOpt) {
@@ -1301,8 +1391,16 @@ public class AgentBridge {
                         agentId: effectiveAgentId,
                         provider: currModel.fullName
                     ))
+                    match (executionControl) {
+                        case Some(control) => pushModelExecutionRemainingMs({ => control.remainingMs() })
+                        case None => ()
+                    }
                     try {
                             if (codexAppServerGate.enabled) {
+                                match (executionControl) {
+                                    case Some(control) => control.throwIfCancelled()
+                                    case None => ()
+                                }
                                 let codexResult = gatewayRunCodexAppServerTurn(GatewayCodexAppServerTurnRequest(
                                     conversationKey,
                                     gatewayTurnWorkspacePath(turnContext).toString(),
@@ -1311,7 +1409,8 @@ public class AgentBridge {
                                     currModel.fullName,
                                     builtPrompt,
                                     modelInput,
-                                    turnContext: turnContext
+                                    turnContext: turnContext,
+                                    executionControl: executionControl
                                 ))
                                 answer = codexResult.finalText
                                 codexAppServerPromptTokens = codexResult.promptTokens
@@ -1323,10 +1422,19 @@ public class AgentBridge {
                                     meta: codexResult.metadata
                                 )
                             } else if (streamingEnabled) {
-                                let response = agent.asyncChat(modelInput)
+                                let response = gatewayRunModelWithExecutionControl(
+                                    executionControl,
+                                    { => agent.asyncChat(modelInput) }
+                                )
                                 var lastChunkContent = ""
                                 try {
                                     for (_chunk in response) {
+                                        match (executionControl) {
+                                            case Some(control) =>
+                                                control.throwIfCancelled()
+                                                control.heartbeat()
+                                            case None => ()
+                                        }
                                         let currentContent = response.content
                                         if (currentContent == lastChunkContent) {
                                             continue
@@ -1352,12 +1460,23 @@ public class AgentBridge {
                                         throw Exception(if (answer.trimAscii().isEmpty()) { "gateway async response failed" } else { answer })
                                 }
                             } else {
-                                answer = agent.chat(modelInput)
+                                answer = gatewayRunModelWithExecutionControl(
+                                    executionControl,
+                                    { => agent.chat(modelInput) }
+                                )
                             }
                     } finally {
+                        match (executionControl) {
+                            case Some(_) => popModelExecutionRemainingMs()
+                            case None => ()
+                        }
                         runtimePopToolInvocationPolicyContext()
                     }
                     let usagePair = gatewayFinishUsageCapture()
+                    match (executionControl) {
+                        case Some(control) => control.throwIfCancelled()
+                        case None => ()
+                    }
                     successfulPromptTokens = if (codexAppServerPromptTokens >= 0) { codexAppServerPromptTokens } else { usagePair[0] }
                     successfulCompletionTokens = if (codexAppServerCompletionTokens >= 0) { codexAppServerCompletionTokens } else { usagePair[1] }
                     successfulModelName = currModel.fullName
@@ -1412,6 +1531,13 @@ public class AgentBridge {
                         error: errorSummary
                     )
                     lastEx = Some(e)
+                    match (executionControl) {
+                        case Some(control) =>
+                            if (control.isCancelled()) {
+                                throw e
+                            }
+                        case None => ()
+                    }
                     let isChannelBoundFirst = match (channelBoundModelOpt) {
                         case Some(boundModel) =>
                             idx == 0 && !boundModel.trimAscii().isEmpty() &&
@@ -1477,6 +1603,10 @@ public class AgentBridge {
                 }
             }
             let replyGuard = normalizeGatewayAssistantFinalReply(answer)
+            match (executionControl) {
+                case Some(control) => control.throwIfCancelled()
+                case None => ()
+            }
             let guardedAnswer = if (replyGuard.ok) {
                 replyGuard.text
             } else {

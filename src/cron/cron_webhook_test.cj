@@ -70,6 +70,33 @@ public class CronWebhookPostTest {
             setCronWebhookHttpRunnerForTest(None<(CronWebhookHttpRequest) -> CronWebhookHttpResponse>)
         }
     }
+
+    @TestCase
+    public func m3N1WebhookDeadlineAndCancellationPreventLateSend(): Unit {
+        let captured = JsonObject()
+        setCronWebhookHttpRunnerForTest(Some({ request: CronWebhookHttpRequest =>
+            captured.put("called", JsonBool(true))
+            captured.put("timeoutMs", JsonInt(request.timeoutMs))
+            CronWebhookHttpResponse(true, statusCode: 200)
+        }))
+        try {
+            @Expect(postCronWebhookJson(
+                "https://example.com/hook",
+                cronWebhookTestBody(),
+                remainingMs: 0
+            ), false)
+            @Expect(captured.get("called").isNone(), true)
+            @Expect(postCronWebhookJson(
+                "https://example.com/hook",
+                cronWebhookTestBody(),
+                timeoutMs: 5000,
+                remainingMs: 17
+            ), true)
+            @Expect(captured.get("timeoutMs").getOrThrow().asInt().getValue(), 17)
+        } finally {
+            setCronWebhookHttpRunnerForTest(None<(CronWebhookHttpRequest) -> CronWebhookHttpResponse>)
+        }
+    }
 }
 
 @Test
