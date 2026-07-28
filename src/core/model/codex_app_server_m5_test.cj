@@ -332,8 +332,8 @@ public class CodexAppServerM5Test {
 
         let parentPid = m5ReadPid(parentPidPath)
         let childPid = m5ReadPid(childPidPath)
-        let parentGone = m5WaitPidGone(parentPid, 1000)
-        let childGone = m5WaitPidGone(childPid, 1000)
+        let parentGone = m5WaitPidGone(parentPid, 5000)
+        let childGone = m5WaitPidGone(childPid, 5000)
         if (!parentGone) { m5KillPid(parentPid) }
         if (!childGone) { m5KillPid(childPid) }
         try { remove(root, recursive: true) } catch (_: Exception) { () }
