@@ -1604,6 +1604,25 @@ private func servicePluginReadLease(path: Path): ?ServicePluginLeaseSnapshot {
     }
 }
 
+private func servicePluginReadRestartLease(record: ServicePluginRuntimeRecord, timeoutMs: Int64): ?ServicePluginLeaseSnapshot {
+    let path = Path(servicePluginLeasePath(record))
+    let boundedTimeoutMs = max(0, min(1000, timeoutMs))
+    var waitedMs: Int64 = 0
+    while (waitedMs <= boundedTimeoutMs) {
+        match (servicePluginReadLease(path)) {
+            case Some(lease) => return Some(lease)
+            case None => ()
+        }
+        if (waitedMs >= boundedTimeoutMs) {
+            break
+        }
+        let pollMs = min(10, boundedTimeoutMs - waitedMs)
+        sleep(Duration.millisecond * pollMs)
+        waitedMs += pollMs
+    }
+    None<ServicePluginLeaseSnapshot>
+}
+
 private func servicePluginLeaseString(root: JsonObject, key: String, fallback!: String = ""): String {
     match (root.get(key)) {
         case Some(value) => try { value.asString().getValue().trimAscii() } catch (_: Exception) { fallback }
@@ -1957,7 +1976,10 @@ private func recoverServicePlugin(record: ServicePluginRuntimeRecord, reason: St
     }
     record.supervisorRestartCount++
     record.supervisorLastRestartAtMs = nowMs
-    match (servicePluginReadLease(Path(servicePluginLeasePath(record)))) {
+    // The initialize frame and lease file travel over independent channels.
+    // A child may flush initialize immediately before atomically publishing its
+    // new lease, especially under full-suite scheduler pressure.
+    match (servicePluginReadRestartLease(record, max(250, config.healthTimeoutMs * 10))) {
         case Some(lease) =>
             if (lease.bindHost.isEmpty() || lease.port <= 0) {
                 record.status = "degraded"
