@@ -2,7 +2,8 @@ package metis.gateway.runtime
 
 import metis.cron.{CronJob, CronJobState, CronSchedule}
 
-import std.collection.ArrayList
+import std.collection.{ArrayList, HashSet}
+import std.core.Duration
 import std.sync.Mutex
 
 /** Cron 并发配置的安全上限；非法非正值回退为单 worker。 */
@@ -54,24 +55,39 @@ public class CronExecutionTask {
     public let job: CronJob
     public let absoluteDeadlineMs: Int64
     public let idleTimeoutMs: Int64
+    /** 共享 AgentBridge/session 的任务使用相同 key，避免 transcript/tool runtime 竞争。 */
+    public let serialKey: String
+    /** 修改进程级 env/workdir 的任务进入全局 lane。 */
+    public let globalResource: Bool
     private let runTask: (CronJob) -> CronExecutionArtifact
+    private let cleanupTask: () -> Unit
 
     public init(
         executionId: CronExecutionId,
         job: CronJob,
         runTask: (CronJob) -> CronExecutionArtifact,
         absoluteDeadlineMs!: Int64 = 0,
-        idleTimeoutMs!: Int64 = 0
+        idleTimeoutMs!: Int64 = 0,
+        serialKey!: String = "",
+        globalResource!: Bool = false,
+        cleanupTask!: () -> Unit = { => () }
     ) {
         this.executionId = executionId
         this.job = job
         this.runTask = runTask
         this.absoluteDeadlineMs = absoluteDeadlineMs
         this.idleTimeoutMs = idleTimeoutMs
+        this.serialKey = serialKey.trimAscii()
+        this.globalResource = globalResource
+        this.cleanupTask = cleanupTask
     }
 
     public func run(): CronExecutionArtifact {
-        this.runTask(this.job)
+        try {
+            this.runTask(this.job)
+        } finally {
+            this.cleanupTask()
+        }
     }
 }
 
@@ -190,6 +206,8 @@ public class CronExecutionExecutor {
     private var accepting: Bool = false
     private var active: Int64 = 0
     private var reserved: Int64 = 0
+    private let activeSerialKeys = HashSet<String>()
+    private var globalResourceActive: Bool = false
 
     public init(maxConcurrentRuns!: Int64 = 1) {
         this.maxConcurrentRuns = if (maxConcurrentRuns <= 0) {
@@ -239,12 +257,41 @@ public class CronExecutionExecutor {
         spawn {
             var error = ""
             var artifact = CronExecutionArtifact()
+            var laneAcquired = false
             try {
+                while (!laneAcquired) {
+                    laneAcquired = synchronized(this.stateLock) {
+                        let serialBusy = !task.serialKey.isEmpty() && this.activeSerialKeys.contains(task.serialKey)
+                        let globalBusy = task.globalResource && this.globalResourceActive
+                        if (!serialBusy && !globalBusy) {
+                            if (!task.serialKey.isEmpty()) {
+                                this.activeSerialKeys.add(task.serialKey)
+                            }
+                            if (task.globalResource) {
+                                this.globalResourceActive = true
+                            }
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    if (!laneAcquired) {
+                        sleep(Duration.millisecond)
+                    }
+                }
                 artifact = task.run()
             } catch (e: Exception) {
                 error = e.message
             } finally {
                 synchronized(this.stateLock) {
+                    if (laneAcquired) {
+                        if (!task.serialKey.isEmpty()) {
+                            this.activeSerialKeys.remove(task.serialKey)
+                        }
+                        if (task.globalResource) {
+                            this.globalResourceActive = false
+                        }
+                    }
                     this.completed.add(CronExecutionResult(
                         task.executionId,
                         task.job,

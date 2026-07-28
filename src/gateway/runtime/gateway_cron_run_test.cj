@@ -18,8 +18,10 @@ import metis.gateway.session.GatewaySessionRequest
 import metis.gateway.tools.GatewayCronToolset
 
 import std.collection.HashMap
+import std.core.Duration
 import std.env.{getVariable, setVariable}
 import std.fs.{Directory, Path, remove}
+import std.sync.AtomicBool
 import std.time.DateTime
 import std.unittest.testmacro.*
 import stdx.encoding.json.{JsonBool, JsonObject, JsonString, JsonValue}
@@ -290,6 +292,39 @@ public class GatewayCronRunExecutorTest {
 @Test
 public class GatewayCronRunLiveEntrypointsTest {
     @TestCase
+    public func m2P2SyncRunKeepsHistoricPayloadAndEnqueueReturnsRunIdQuickly(): Unit {
+        withGatewayCronRunTestHome({ storePath =>
+            cronSave(storePath, [cronRunTestJob("m2-entry")])
+            let release = AtomicBool(false)
+            debugSetCronRunnerReplyForTest(Some({ _job, _request =>
+                while (!release.load()) { sleep(Duration.millisecond * 2) }
+                "entry-ok"
+            }))
+            let runner = CronRunner(storePath: storePath, maxConcurrentRuns: 2)
+            registerGatewayCronRunHookForRunner(runner)
+            let began = DateTime.now().toUnixTimeStamp().toMilliseconds()
+            let enqueued = executeGatewayCronCommand(["cron", "enqueue", "--job-id", "m2-entry"])
+            let elapsed = DateTime.now().toUnixTimeStamp().toMilliseconds() - began
+            @Expect(enqueued[1], 0)
+            @Expect(enqueued[0].contains("Enqueued: true"), true)
+            @Expect(enqueued[0].contains("Run ID:"), true)
+            @Expect(enqueued[0].contains("\"ok\""), false)
+            @Expect(elapsed < 250, true)
+            let duplicate = executeGatewayCronCommand(["cron", "enqueue", "--job-id", "m2-entry"])
+            @Expect(duplicate[0].contains("already-running"), true)
+            release.store(true)
+            @Expect(runner.waitUntilIdle(timeoutMs: 2000), true)
+            runner.tick()
+
+            let sync = executeGatewayCronCommand(["cron", "run", "--job-id", "m2-entry"])
+            @Expect(sync[1], 0)
+            @Expect(sync[0].contains("Ran: true"), true)
+            @Expect(sync[0].contains("Enqueued:"), false)
+            @Expect(sync[0].contains("\"result\""), false)
+        })
+    }
+
+    @TestCase
     public func m4U1RegisteredRunnerHookExecutesCapturedRunnerViaCronCommand(): Unit {
         withGatewayCronRunTestHome({ storePath: Path =>
             let customStore = Path(storePath.toString() + ".custom")
@@ -328,7 +363,7 @@ public class GatewayCronRunLiveEntrypointsTest {
     }
 
     @TestCase
-    public func m4P1LiveRunNowEntrypointsUseRegisteredRunnerAndDeliver(): Unit {
+    public func m2P1LiveRunNowEntrypointsUseRegisteredRunnerAndDeliver(): Unit {
         withGatewayCronRunTestHome({ storePath: Path =>
             cronSave(storePath, [cronRunTestJob("live-job", deliveryChannel: "telegram", deliveryTo: "chat-1")])
             let reply = CronRunTestCallState()
@@ -346,12 +381,21 @@ public class GatewayCronRunLiveEntrypointsTest {
 
             let control = runCronJobNow("live-job")
             @Expect(control[0], true)
+            @Expect(control[1].contains("Enqueued: true"), true)
+            @Expect(runner.waitUntilIdle(timeoutMs: 2000), true)
+            runner.tick()
 
             let dashboard = dashboardRunCronJobNow("live-job")
             @Expect(dashboard[0], true)
+            @Expect(dashboard[1].contains("Enqueued: true"), true)
+            @Expect(runner.waitUntilIdle(timeoutMs: 2000), true)
+            runner.tick()
 
             let dashboardApi = gatewayDashboardRunCronJobNow("live-job")
             @Expect(dashboardApi[0], true)
+            @Expect(dashboardApi[1].contains("Enqueued: true"), true)
+            @Expect(runner.waitUntilIdle(timeoutMs: 2000), true)
+            runner.tick()
 
             let params = JsonObject()
             params.put("jobId", JsonString("live-job"))

@@ -86,7 +86,8 @@ public func appendCronRunLog(
     deliveryStatus!: String = "not-requested",
     deliveryError!: String = "",
     diagnosticCode!: String = "",
-    diagnosticMessage!: String = ""
+    diagnosticMessage!: String = "",
+    executionId!: String = ""
 ): Unit {
     synchronized(cronRunLogAppendLock) {
         let safeJobId = validateCronRunLogJobId(jobId)
@@ -95,10 +96,26 @@ public func appendCronRunLog(
             Directory.create(dir, recursive: true)
         }
         let p = cronRunLogPathFromStore(storePath, safeJobId)
+        // store 与 jsonl 无法跨文件事务；稳定 executionId 使 append 后、marker 前崩溃可安全重放。
+        if (!executionId.trimAscii().isEmpty() && exists(p)) {
+            for (existing in readCronRunLogLines(p)) {
+                try {
+                    let obj = JsonValue.fromStr(existing).asObject()
+                    match (obj.get("executionId")) {
+                        case Some(v: JsonString) =>
+                            if (v.getValue() == executionId) { return }
+                        case _ => ()
+                    }
+                } catch (_: Exception) {
+                    ()
+                }
+            }
+        }
         let durationMs = if (endedAtMs >= startedAtMs) { endedAtMs - startedAtMs } else { 0 }
         let line = "{" +
             "\"ts\":${endedAtMs}," +
             "\"jobId\":\"${jsonEscape(safeJobId)}\"," +
+            "\"executionId\":\"${jsonEscape(executionId)}\"," +
             "\"action\":\"finished\"," +
             "\"status\":\"${jsonEscape(status)}\"," +
             "\"summary\":\"${jsonEscape(summary)}\"," +
@@ -183,6 +200,7 @@ public func readCronRunLogEntriesForJob(
         let row = JsonObject()
         row.put("ts", JsonInt(runLogReadI64(raw, "ts", default: runLogReadI64(raw, "endedAtMs"))))
         row.put("jobId", JsonString(runLogReadStr(raw, "jobId")))
+        row.put("executionId", JsonString(runLogReadStr(raw, "executionId")))
         row.put("action", JsonString(runLogReadStr(raw, "action", default: "finished")))
         let st = runLogReadStr(raw, "status")
         row.put("status", JsonString(if (st == "success") { "ok" } else { st }))

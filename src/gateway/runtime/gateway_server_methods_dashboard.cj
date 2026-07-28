@@ -615,7 +615,7 @@ func dashboardRunCronJobNow(jobId: String): (Bool, String) {
     if (!found) {
         return (false, "未找到任务 id=${jobId}")
     }
-    gatewayCronRunOnceOutcomeViaRegisteredHook(jobId, true)
+    gatewayCronEnqueueOnceOutcomeViaRegisteredHook(jobId, true)
 }
 
 private func dashboardPickLast(items: Array<String>, n: Int64): Array<String> {

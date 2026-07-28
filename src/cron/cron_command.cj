@@ -112,7 +112,7 @@ public func executeGatewayCronCommand(sub: Array<String>): (String, Int64) {
     if (cmd == "update") {
         return cronCmdUpdate(path, sub)
     }
-    if (cmd == "run") {
+    if (cmd == "run" || cmd == "enqueue") {
         synchronized(gatewayCronRunHookLock) {
             match (gatewayCronRunHook) {
                 case Some(f) => return f(sub)
@@ -174,6 +174,7 @@ private func cronHelpText(): String {
         "  gateway cron update --job-id <jobId> --enabled true|false\n" +
         "  gateway cron update --job-id <jobId> --message <new-prompt...>\n" +
         "  gateway cron run --job-id <jobId>\n" +
+        "  gateway cron enqueue --job-id <jobId>\n" +
         "  gateway cron runs [--job-id <jobId>]\n" +
         "  gateway cron wake [--job-id <jobId>] [--mode now|next-heartbeat]\n" +
         "  gateway cron status | list [--all] | path | remove <jobId> | remove --id <jobId>\n" +

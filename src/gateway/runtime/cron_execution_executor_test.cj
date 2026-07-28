@@ -25,19 +25,80 @@ private func awaitCronExecutorTest(
     predicate()
 }
 
-private func cronExecutorTestTask(id: String, runTask: (CronJob) -> Unit): CronExecutionTask {
+private func cronExecutorTestTask(
+    id: String,
+    runTask: (CronJob) -> Unit,
+    serialKey!: String = "",
+    globalResource!: Bool = false,
+    cleanupTask!: () -> Unit = { => () }
+): CronExecutionTask {
     CronExecutionTask(
         CronExecutionId(id, 1, 2),
         cronExecutorTestJob(id),
         { job =>
             runTask(job)
             CronExecutionArtifact()
-        }
+        },
+        serialKey: serialKey,
+        globalResource: globalResource,
+        cleanupTask: cleanupTask
     )
 }
 
 @Test
 public class CronExecutionExecutorTest {
+    @TestCase
+    public func m2B3SharedSessionAndGlobalResourceSerializeWhileIndependentTaskRuns(): Unit {
+        let executor = CronExecutionExecutor(maxConcurrentRuns: 3)
+        let releaseShared = AtomicBool(false)
+        let sharedEntered = AtomicBool(false)
+        let sameSessionEntered = AtomicBool(false)
+        let independentEntered = AtomicBool(false)
+        executor.start()
+        @Expect(executor.tryAcquireSlot(), true)
+        @Expect(executor.submitReserved(cronExecutorTestTask("shared-a", { _job =>
+            sharedEntered.store(true)
+            while (!releaseShared.load()) { sleep(Duration.millisecond * 2) }
+        }, serialKey: "会话-😀")), true)
+        @Expect(awaitCronExecutorTest({ => sharedEntered.load() }), true)
+        @Expect(executor.tryAcquireSlot(), true)
+        @Expect(executor.submitReserved(cronExecutorTestTask("shared-b", { _job =>
+            sameSessionEntered.store(true)
+        }, serialKey: "会话-😀")), true)
+        @Expect(executor.tryAcquireSlot(), true)
+        @Expect(executor.submitReserved(cronExecutorTestTask("independent", { _job =>
+            independentEntered.store(true)
+        }, serialKey: "other")), true)
+        @Expect(awaitCronExecutorTest({ => independentEntered.load() }), true)
+        @Expect(sameSessionEntered.load(), false)
+        releaseShared.store(true)
+        @Expect(awaitCronExecutorTest({ => sameSessionEntered.load() }), true)
+        @Expect(awaitCronExecutorTest({ => executor.activeCount() == 0 }), true)
+    }
+
+    @TestCase
+    public func m2B3GlobalResourceFailureAlwaysRunsScopedRestore(): Unit {
+        let executor = CronExecutionExecutor(maxConcurrentRuns: 2)
+        let restoredEnv = AtomicBool(false)
+        let restoredWorkdir = AtomicBool(false)
+        executor.start()
+        @Expect(executor.tryAcquireSlot(), true)
+        @Expect(executor.submitReserved(cronExecutorTestTask(
+            "global-failure",
+            { _job => throw Exception("fake env/workdir failure") },
+            serialKey: "global-session",
+            globalResource: true,
+            cleanupTask: { =>
+                restoredEnv.store(true)
+                restoredWorkdir.store(true)
+            }
+        )), true)
+        @Expect(awaitCronExecutorTest({ => executor.activeCount() == 0 }), true)
+        @Expect(restoredEnv.load(), true)
+        @Expect(restoredWorkdir.load(), true)
+        @Expect(executor.drainCompleted()[0].succeeded(), false)
+    }
+
     @TestCase
     public func m1U1BlockingWorkerDoesNotBlockSubmitterAndKeepsSingleActive(): Unit {
         let executor = CronExecutionExecutor(maxConcurrentRuns: 1)

@@ -62,6 +62,7 @@ public class GatewayCronToolset {
             normalized == "enable" ||
             normalized == "disable" ||
             normalized == "run" ||
+            normalized == "enqueue" ||
             normalized == "runs" ||
             normalized == "wake"
         ) {
@@ -144,7 +145,7 @@ public class GatewayCronToolset {
     }
 
     @tool[
-        description: "Operate gateway cron jobs through the unified Gateway cron backend. Supported actions: help, path, status, list, add, update, remove, enable, disable, run, runs, wake.",
+        description: "Operate gateway cron jobs through the unified Gateway cron backend. Supported actions: help, path, status, list, add, update, remove, enable, disable, run, enqueue, runs, wake.",
         parameters: {
             action: "Cron action.",
             id: "Optional cron job id.",
@@ -420,9 +421,9 @@ public class GatewayCronToolset {
                     }
                 case None => ()
             }
-        } else if (act == "remove" || act == "enable" || act == "disable" || act == "run" || act == "runs" || act == "wake") {
+        } else if (act == "remove" || act == "enable" || act == "disable" || act == "run" || act == "enqueue" || act == "runs" || act == "wake") {
             let resolvedId = match (id) { case Some(v) => v.trimAscii() case None => "" }
-            if ((act == "remove" || act == "enable" || act == "disable" || act == "run" || act == "runs" || act == "wake") && resolvedId.isEmpty()) {
+            if ((act == "remove" || act == "enable" || act == "disable" || act == "run" || act == "enqueue" || act == "runs" || act == "wake") && resolvedId.isEmpty()) {
                 let err = JsonObject()
                 err.put("ok", false.toJsonValue())
                 err.put("action", JsonString(act))
@@ -435,7 +436,7 @@ public class GatewayCronToolset {
             args.add(act)
             args.add("--job-id")
             args.add(resolvedId)
-            if (act == "run") {
+            if (act == "run" || act == "enqueue") {
                 if (dueOnly ?? false) {
                     args.add("--due")
                 }
