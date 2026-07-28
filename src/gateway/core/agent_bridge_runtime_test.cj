@@ -15,6 +15,7 @@ import metis.gateway.session.{GatewayIngressSource, GatewaySessionRequest, Gatew
 import std.collection.{ArrayList, HashMap}
 import std.env.{getVariable, setVariable}
 import std.fs.{Directory, File, Path, exists, remove}
+import std.sync.AtomicBool
 import std.time.DateTime
 import std.unittest.testmacro.*
 import stdx.encoding.json.{JsonArray, JsonInt, JsonObject, JsonString, JsonValue}
@@ -394,6 +395,41 @@ private func agentBridgeRuntimeWrappedProbeForContext(context: GatewayToolRuntim
 
 @Test
 public class AgentBridgeRuntimeTest {
+    @TestCase
+    public func m3U2N2CoreCancellationDependencyStaysNeutralAndNoneKeepsOrdinaryCalls(): Unit {
+        let propagationFiles = [
+            "src/gateway/core/agent_bridge.cj",
+            "src/gateway/core/gateway_session_executor.cj",
+            "src/gateway/core/gateway_session_turn_runner.cj",
+            "src/gateway/core/codex_app_server_gateway_runtime.cj"
+        ]
+        for (relative in propagationFiles) {
+            let source = String.fromUtf8(File.readFrom(Path(relative)))
+            @Expect(source.contains("GatewayExecutionControl"), true)
+            @Expect(source.contains("CronExecutionControl"), false)
+            @Expect(source.contains("import metis.gateway.runtime"), false)
+        }
+        let called = AtomicBool(false)
+        let result = debugGatewayRunModelWithoutExecutionControlForTest(
+            { =>
+                called.store(true)
+                "ordinary-none-中文🙂"
+            }
+        )
+        @Expect(called.load(), true)
+        @Expect(result, "ordinary-none-中文🙂")
+    }
+
+    @TestCase
+    public func m3N4CronHeadlessProfileDeniesRecursiveInteractiveAndLifecycleTools(): Unit {
+        for (name in ["cron", "gateway", "message", "clarify", "sessions_spawn", "sessions_batch_delegate", "process"]) {
+            @Expect(gatewayCronHeadlessToolDenied(name), true)
+        }
+        for (name in ["web_search", "memory_search", "shellExecute"]) {
+            @Expect(gatewayCronHeadlessToolDenied(name), false)
+        }
+    }
+
     @TestCase
     public func gatewaySkillSelectionUserNoticeStaysSilentWhenNoSkillMatches(): Unit {
         @Expect(gatewaySkillSelectionUserNotice(true, None<String>), "")

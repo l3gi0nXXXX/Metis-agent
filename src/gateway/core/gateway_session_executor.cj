@@ -460,10 +460,45 @@ private func gatewayReplyWithTimeout(
     prompt: String,
     extraSystemPrompt: String,
     timeoutSeconds: Int64,
+    executionControl!: Option<GatewayExecutionControl> = None<GatewayExecutionControl>,
     toolRuntimeContext!: Option<GatewayToolRuntimeContext> = None<GatewayToolRuntimeContext>,
     streamingEnabled!: Bool = false,
     streamChunkHook!: Option<(String) -> Unit> = None<(String) -> Unit>
 ): String {
+    match (executionControl) {
+        case Some(control) => control.throwIfCancelled()
+        case None => ()
+    }
+    if (executionControl.isSome()) {
+        return match (toolRuntimeContext) {
+            case Some(runtimeContext) =>
+                gatewayWithToolRuntimeContext(runtimeContext, { =>
+                    bridge.reply(
+                        context.sessionKey,
+                        prompt,
+                        channelName: context.channelName,
+                        agentId: context.agentId,
+                        extraSystemPrompt: extraSystemPrompt,
+                        streamingEnabled: streamingEnabled,
+                        streamChunkHook: streamChunkHook,
+                        turnContext: Some(context.turnContext),
+                        executionControl: executionControl
+                    )
+                })
+            case None =>
+                bridge.reply(
+                    context.sessionKey,
+                    prompt,
+                    channelName: context.channelName,
+                    agentId: context.agentId,
+                    extraSystemPrompt: extraSystemPrompt,
+                    streamingEnabled: streamingEnabled,
+                    streamChunkHook: streamChunkHook,
+                    turnContext: Some(context.turnContext),
+                    executionControl: executionControl
+                )
+        }
+    }
     if (timeoutSeconds <= 0) {
         return match (toolRuntimeContext) {
             case Some(runtimeContext) =>
@@ -555,6 +590,7 @@ public func gatewayExecuteSessionTurn(
     streamHook!: Option<(GatewaySessionContext, String) -> Unit> = None<(GatewaySessionContext, String) -> Unit>,
     streamingEnabled!: Bool = false,
     lifecycleHook!: Option<(String) -> Unit> = None<(String) -> Unit>
+    , executionControl!: Option<GatewayExecutionControl> = None<GatewayExecutionControl>
 ): GatewaySessionExecutionResult {
     let effectiveReplyToMessageId = match (context.deliveryTarget) {
         case Some(target) =>
@@ -595,9 +631,16 @@ public func gatewayExecuteSessionTurn(
             prompt,
             extraSystemPrompt,
             timeoutSeconds,
+            executionControl: executionControl,
             toolRuntimeContext: toolRuntimeContext,
             streamingEnabled: streamingEnabled,
             streamChunkHook: Some({ currentText =>
+            match (executionControl) {
+                case Some(control) =>
+                    control.throwIfCancelled()
+                    control.heartbeat()
+                case None => ()
+            }
             let visibleText = gatewayVisiblePartialDeliveryText(context.channelName, currentText)
             let normalized = visibleText.trimAscii()
             match (streamHook) {
@@ -725,6 +768,10 @@ public func gatewayExecuteSessionTurn(
             })
         )
     } catch (ex: Exception) {
+        match (executionControl) {
+            case Some(control) => control.throwIfCancelled()
+            case None => ()
+        }
         let fallbackText = gatewayMediaFailureFallbackText(toolRuntimeContext)
         if (deliver && !fallbackText.isEmpty()) {
             match (context.deliveryTarget) {
@@ -752,10 +799,21 @@ public func gatewayExecuteSessionTurn(
         throw ex
     }
     match (transcriptHook) {
+        case Some(_) => match (executionControl) {
+            case Some(control) => control.throwIfCancelled()
+            case None => ()
+        }
+        case None => ()
+    }
+    match (transcriptHook) {
         case Some(notify) => notify(context, 2, "turn", "assistant")
         case None => ()
     }
     if (!deliver) {
+        match (executionControl) {
+            case Some(control) => control.throwIfCancelled()
+            case None => ()
+        }
         return GatewaySessionExecutionResult(answer)
     }
     match (context.deliveryTarget) {

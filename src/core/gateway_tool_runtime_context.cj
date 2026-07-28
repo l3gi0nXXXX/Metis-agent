@@ -32,6 +32,9 @@ public class GatewayToolRuntimeContext {
     public let toolExecAllowlist: Array<String>
     public let lifecycleHook: Option<(String) -> Unit>
     public let gatewayCallHook: Option<(String, JsonObject) -> JsonObject>
+    public let remainingMsHook: Option<() -> Int64>
+    public let heartbeatHook: Option<() -> Unit>
+    public let cancellationCheckHook: Option<() -> Unit>
     private var visibleReplyDelivered: Bool = false
 
     public init(
@@ -53,7 +56,10 @@ public class GatewayToolRuntimeContext {
         toolExecMode!: String = "",
         toolExecAllowlist!: Array<String> = [],
         lifecycleHook!: Option<(String) -> Unit> = None<(String) -> Unit>,
-        gatewayCallHook!: Option<(String, JsonObject) -> JsonObject> = None<(String, JsonObject) -> JsonObject>
+        gatewayCallHook!: Option<(String, JsonObject) -> JsonObject> = None<(String, JsonObject) -> JsonObject>,
+        remainingMsHook!: Option<() -> Int64> = None<() -> Int64>,
+        heartbeatHook!: Option<() -> Unit> = None<() -> Unit>,
+        cancellationCheckHook!: Option<() -> Unit> = None<() -> Unit>
     ) {
         this.sourceLabel = sourceLabel.trimAscii().toAsciiLower()
         this.channelName = channelName.trimAscii().toAsciiLower()
@@ -88,6 +94,9 @@ public class GatewayToolRuntimeContext {
         this.toolExecAllowlist = normalizedAllowlist.toArray()
         this.lifecycleHook = lifecycleHook
         this.gatewayCallHook = gatewayCallHook
+        this.remainingMsHook = remainingMsHook
+        this.heartbeatHook = heartbeatHook
+        this.cancellationCheckHook = cancellationCheckHook
     }
 
     public func notifyLifecycleStatus(status: String): Unit {
@@ -165,6 +174,36 @@ public func gatewayCurrentToolRuntimeContext(): Option<GatewayToolRuntimeContext
                 }
             case None => None<GatewayToolRuntimeContext>
         }
+    }
+}
+
+public func gatewayCurrentToolRemainingMs(defaultMs!: Int64 = 0): Int64 {
+    match (gatewayCurrentToolRuntimeContext()) {
+        case Some(context) => match (context.remainingMsHook) {
+            case Some(read) => read()
+            case None => defaultMs
+        }
+        case None => defaultMs
+    }
+}
+
+public func gatewayCheckCurrentToolCancellation(): Unit {
+    match (gatewayCurrentToolRuntimeContext()) {
+        case Some(context) => match (context.cancellationCheckHook) {
+            case Some(check) => check()
+            case None => ()
+        }
+        case None => ()
+    }
+}
+
+public func gatewayHeartbeatCurrentToolExecution(): Unit {
+    match (gatewayCurrentToolRuntimeContext()) {
+        case Some(context) => match (context.heartbeatHook) {
+            case Some(heartbeat) => heartbeat()
+            case None => ()
+        }
+        case None => ()
     }
 }
 

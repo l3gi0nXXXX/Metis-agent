@@ -116,6 +116,7 @@ public class CronExecutionJournalEntry {
     /** 可恢复的 run-log marker；true 表示该 execution 的终态行已确认写入。 */
     public var runLogRecorded: Bool
     public var deliveryReceipts: Array<CronDeliveryReceipt>
+    public var deliveryArtifactRef: String
 
     public init(
         executionId: String,
@@ -125,7 +126,8 @@ public class CronExecutionJournalEntry {
         updatedAtMs!: Int64 = 0,
         businessOutcomeHash!: String = "",
         runLogRecorded!: Bool = false,
-        deliveryReceipts!: Array<CronDeliveryReceipt> = []
+        deliveryReceipts!: Array<CronDeliveryReceipt> = [],
+        deliveryArtifactRef!: String = ""
     ) {
         if (executionId.trimAscii().isEmpty() || jobId.trimAscii().isEmpty()) {
             throw Exception("cron journal identity must not be empty")
@@ -141,6 +143,7 @@ public class CronExecutionJournalEntry {
         this.businessOutcomeHash = businessOutcomeHash
         this.runLogRecorded = runLogRecorded
         this.deliveryReceipts = deliveryReceipts
+        this.deliveryArtifactRef = deliveryArtifactRef
     }
 
     /**
@@ -240,7 +243,8 @@ public func cronExecutionJournalFromJson(value: JsonValue): Array<CronExecutionJ
                             case Some(v) => try { v.asBool().getValue() } catch (_: Exception) { false }
                             case None => false
                         },
-                        deliveryReceipts: receipts.toArray()
+                        deliveryReceipts: receipts.toArray(),
+                        deliveryArtifactRef: cronJournalReadStr(obj, "deliveryArtifactRef")
                     )
                 )
             } catch (_: Exception) {
@@ -274,6 +278,7 @@ public func cronExecutionJournalToJson(entries: Array<CronExecutionJournalEntry>
             receipts.add(receiptRow)
         }
         row.put("deliveryReceipts", JsonArray(receipts))
+        row.put("deliveryArtifactRef", JsonString(entry.deliveryArtifactRef))
         rows.add(row)
     }
     JsonArray(rows)

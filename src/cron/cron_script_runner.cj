@@ -152,7 +152,26 @@ private func cronScriptError(status: String, errorCode: String, message: String)
     CronScriptRunResult(false, status: status, errorCode: errorCode, message: message)
 }
 
-public func runCronJobScriptForJob(dotDir: Path, job: CronJob): CronScriptRunResult {
+public func runCronJobScriptForJob(
+    dotDir: Path,
+    job: CronJob,
+    remainingMs!: Int64 = CRON_SCRIPT_TIMEOUT_MS,
+    cancellationCheck!: () -> Unit = { => () }
+): CronScriptRunResult {
+    try {
+        cancellationCheck()
+    } catch (e: Exception) {
+        return cronScriptError("cancelled", "cron_script_cancelled", e.message)
+    }
+    if (remainingMs <= 0) {
+        return CronScriptRunResult(
+            false,
+            status: "timeout",
+            errorCode: "cron_script_timeout",
+            timedOut: true,
+            message: "cron script deadline reached before launch"
+        )
+    }
     let resolved = resolveCronScriptPath(dotDir, job.scriptPath)
     if (!resolved.ok) {
         return cronScriptError(resolved.status, resolved.errorCode, resolved.message)
@@ -183,10 +202,12 @@ public func runCronJobScriptForJob(dotDir: Path, job: CronJob): CronScriptRunRes
         let stderrFuture = spawn {
             cronScriptReadPipe(StringReader<InputStream>(process.stdErrPipe), "stderr")
         }
+        let effectiveTimeoutMs = min(CRON_SCRIPT_TIMEOUT_MS, remainingMs)
         let exitCode = try {
-            process.wait(timeout: Duration.millisecond * CRON_SCRIPT_TIMEOUT_MS)
+            process.wait(timeout: Duration.millisecond * effectiveTimeoutMs)
         } catch (_: TimeoutException) {
             try { process.terminate(force: true) } catch (_: Exception) { () }
+            try { let _ = process.wait(timeout: Duration.second) } catch (_: Exception) { () }
             try { stdoutFuture.get() } catch (_: Exception) { () }
             try { stderrFuture.get() } catch (_: Exception) { () }
             return CronScriptRunResult(
@@ -194,8 +215,13 @@ public func runCronJobScriptForJob(dotDir: Path, job: CronJob): CronScriptRunRes
                 status: "timeout",
                 errorCode: "cron_script_timeout",
                 timedOut: true,
-                message: "cron script timed out after ${CRON_SCRIPT_TIMEOUT_MS}ms"
+                message: "cron script timed out after ${effectiveTimeoutMs}ms"
             )
+        }
+        try {
+            cancellationCheck()
+        } catch (e: Exception) {
+            return cronScriptError("cancelled", "cron_script_cancelled", e.message)
         }
         let stdout = try { stdoutFuture.get() } catch (e: Exception) {
             CronScriptReadResult(false, status: "invalid_response_encoding", diagnostic: e.message)

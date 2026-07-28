@@ -168,6 +168,34 @@ private func m2ResetHttpCapture(): Unit {
 @Test
 public class CodexResponsesAdapterTest {
     @TestCase
+    public func m3N5ResponsesUsesCronRemainingTransportDeadlineAndClearsThreadScope(): Unit {
+        let captured = JsonObject()
+        setCodexResponsesHttpRunnerForTest(Some({ request: CodexResponsesHttpRequest =>
+            captured.put("timeoutMs", JsonInt(request.timeoutMs))
+            CodexResponsesHttpResult(200, body: "{\"status\":\"completed\",\"output\":[]}")
+        }))
+        try {
+            pushModelExecutionRemainingMs({ => 37 })
+            let payload = JsonObject()
+            payload.put("model", JsonString("gpt-test"))
+            payload.put("instructions", JsonString("return a test response"))
+            let input = JsonArray()
+            input.add(m2MessageItem("test input"))
+            payload.put("input", input)
+            let _ = CodexResponsesHttpClient().postResponses(
+                "https://api.openai.com/v1",
+                "test-token",
+                payload
+            )
+            @Expect(captured.get("timeoutMs").getOrThrow().asInt().getValue(), 37)
+        } finally {
+            popModelExecutionRemainingMs()
+            setCodexResponsesHttpRunnerForTest(None<CodexResponsesHttpRunner>)
+        }
+        @Expect(currentModelExecutionRemainingMs(), 0)
+    }
+
+    @TestCase
     public func m2U1PayloadBuilderMapsMessagesImagesToolsAndUnknownTools(): Unit {
         let request = ChatRequest(
             [

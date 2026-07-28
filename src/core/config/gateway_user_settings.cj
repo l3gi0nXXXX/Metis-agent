@@ -652,6 +652,14 @@ public struct GatewayUserSettings {
     public var cronEnabled: Bool = true
     /** Cron worker 并发数；启动时钳制到 1..32，热更新需重启 Gateway 生效。 */
     public var cronMaxConcurrentRuns: Int64 = 1
+    /** Cron agent 默认墙钟上限；job.timeoutMs=0 时仅采用 safety ceiling。 */
+    public var cronDefaultTimeoutMs: Int64 = 10 * 60 * 1000
+    /** Cron 不可关闭的平台安全上限。 */
+    public var cronSafetyTimeoutMs: Int64 = 30 * 60 * 1000
+    /** Cron 无有效 model/tool/script/webhook 进展的 idle 上限；0 表示关闭 idle。 */
+    public var cronIdleTimeoutMs: Int64 = 2 * 60 * 1000
+    /** Gateway shutdown 等待 Cron 收敛的上限（M4 消费）。 */
+    public var cronShutdownDrainTimeoutMs: Int64 = 30 * 1000
     /**
      * `gateway:cron:run:*` 单次运行转录保留小时数；<=0 关闭清扫。
      */

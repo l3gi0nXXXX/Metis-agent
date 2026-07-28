@@ -151,7 +151,10 @@ public func gatewayCronExecuteJobOnce(jobId: String, force: Bool): JsonObject {
         jobId,
         force,
         cronEnabled: user.cronEnabled,
-        maxConcurrentRuns: user.cronMaxConcurrentRuns
+        maxConcurrentRuns: user.cronMaxConcurrentRuns,
+        cronDefaultTimeoutMs: user.cronDefaultTimeoutMs,
+        cronSafetyTimeoutMs: user.cronSafetyTimeoutMs,
+        cronIdleTimeoutMs: user.cronIdleTimeoutMs
     )
     try {
         gw.stop()

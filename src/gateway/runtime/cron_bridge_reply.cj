@@ -1,6 +1,6 @@
 package metis.gateway.runtime
 
-import metis.gateway.core.{AgentBridge, gatewayExecuteSessionRequestTurn}
+import metis.gateway.core.{AgentBridge, GatewayExecutionControl, gatewayExecuteSessionRequestTurn}
 import metis.gateway.session.{GatewaySessionRequest, GatewayTurnContext}
 import magic.prelude.*
 
@@ -19,47 +19,19 @@ public func cronBridgeReply(
     request: GatewaySessionRequest,
     prompt: String,
     options: CronSessionExecutionOptions,
+    executionControl: GatewayExecutionControl,
     turnContextOverride!: Option<GatewayTurnContext> = None<GatewayTurnContext>
 ): String {
-    let timeoutMs = options.timeoutMs
-    if (timeoutMs <= 0) {
-        return gatewayExecuteSessionRequestTurn(
-            bridge,
-            request,
-            prompt,
-            timeoutSeconds: options.timeoutSeconds,
-            bestEffortDeliver: options.bestEffortDeliver,
-            turnContextOverride: turnContextOverride
-        ).execution.answer
-    }
-    let deadline = cronBridgeEpochMs() + timeoutMs
-    let fut = spawn {
-        gatewayExecuteSessionRequestTurn(
-            bridge,
-            request,
-            prompt,
-            timeoutSeconds: options.timeoutSeconds,
-            bestEffortDeliver: options.bestEffortDeliver,
-            turnContextOverride: turnContextOverride
-        ).execution.answer
-    }
-    let watchdog = spawn {
-        sleep(Duration.millisecond * timeoutMs)
-        fut.cancel()
-    }
-    try {
-        let out = fut.get()
-        watchdog.cancel()
-        return out
-    } catch (e: Exception) {
-        try {
-            watchdog.cancel()
-        } catch (_: Exception) {
-            ()
-        }
-        if (cronBridgeEpochMs() >= deadline - 50) {
-            throw Exception("cron timeout after ${timeoutMs}ms")
-        }
-        throw e
-    }
+    executionControl.throwIfCancelled()
+    let out = gatewayExecuteSessionRequestTurn(
+        bridge,
+        request,
+        prompt,
+        timeoutSeconds: options.timeoutSeconds,
+        bestEffortDeliver: options.bestEffortDeliver,
+        turnContextOverride: turnContextOverride,
+        executionControl: Some<GatewayExecutionControl>(executionControl)
+    ).execution.answer
+    executionControl.throwIfCancelled()
+    out
 }

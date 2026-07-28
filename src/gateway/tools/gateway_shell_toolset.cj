@@ -3,9 +3,9 @@ package metis.gateway.tools
 import magic.dsl.{tool, toolset}
 import magic.prelude.*
 
-import metis.core.resolveCurrentCronShellExecutionDecision
+import metis.core.{gatewayCheckCurrentToolCancellation, gatewayCurrentToolRemainingMs, gatewayHeartbeatCurrentToolExecution, resolveCurrentCronShellExecutionDecision}
 import metis.io.{InputUtils, PrintUtils, Confirmation}
-import metis.utils.{ShellUtils, ShellTimeoutException}
+import metis.utils.{SHELL_INVALID_RESPONSE_ENCODING_DIAGNOSTIC, SHELL_INVALID_RESPONSE_ENCODING_EXIT_CODE, ShellUtils, ShellTimeoutException}
 
 import std.fs.Path
 
@@ -29,6 +29,7 @@ private func gatewayShellPrintToolResult(text: String, emitToolResult: Bool): Un
 }
 
 private func gatewayShellExecuteInternal(path: String, command: String, description: Option<String>, interactive: Option<Bool>, emitToolResult: Bool): String {
+    gatewayCheckCurrentToolCancellation()
     let cronDecision = resolveCurrentCronShellExecutionDecision(command)
     if (cronDecision.applies) {
         if (!cronDecision.approved) {
@@ -58,12 +59,26 @@ private func gatewayShellExecuteInternal(path: String, command: String, descript
             }
         }
 
-        let (exitCode, stdout, stderr) = ShellUtils.execute(
-            [command],
-            workDir: Path(path),
-            timeout: Duration.second * 180,
-            usePowerShellOnWindows: true
+        let remainingMs = gatewayCurrentToolRemainingMs(defaultMs: 180000)
+        if (remainingMs <= 0) {
+            return "Command execution cancelled: execution deadline reached"
+        }
+        let effectiveTimeoutMs = min(180000, remainingMs)
+        let (exitCode, stdout, stderr) = ShellUtils.executeWithDeadline(
+            command,
+            effectiveTimeoutMs,
+            workDir: Some(Path(path))
         )
+        gatewayCheckCurrentToolCancellation()
+        gatewayHeartbeatCurrentToolExecution()
+        if (exitCode == 124) {
+            gatewayShellPrintToolResult("Timeout", emitToolResult)
+            return "Command execution timeout after ${effectiveTimeoutMs}ms"
+        }
+        if (exitCode == SHELL_INVALID_RESPONSE_ENCODING_EXIT_CODE) {
+            gatewayShellPrintToolResult(SHELL_INVALID_RESPONSE_ENCODING_DIAGNOSTIC, emitToolResult)
+            return "Command execution failed: ${SHELL_INVALID_RESPONSE_ENCODING_DIAGNOSTIC}"
+        }
         if (exitCode == 0) {
             let outString = stdout.trimAscii()
             gatewayShellPrintToolResult(outString, emitToolResult)

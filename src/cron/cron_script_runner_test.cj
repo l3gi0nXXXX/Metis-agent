@@ -104,4 +104,38 @@ public class CronScriptRunnerTest {
         @Expect(result.ok, false)
         @Expect(result.status, "invalid_response_encoding")
     }
+
+    @TestCase
+    public func m3N1ScriptDeadlineTerminatesChildAndRejectsLateOutput(): Unit {
+        withCronScriptRunnerTestRoot({ root =>
+            let script = cronScriptsDir(root).join("slow.sh")
+            File.writeTo(script, "sleep 2\nprintf 'late-success-中文🙂'\n".toArray())
+            let result = runCronJobScriptForJob(
+                root,
+                cronScriptRunnerJob("slow.sh"),
+                remainingMs: 20
+            )
+            @Expect(result.ok, false)
+            @Expect(result.timedOut, true)
+            @Expect(result.errorCode, "cron_script_timeout")
+            @Expect(result.output.contains("late-success"), false)
+        })
+    }
+
+    @TestCase
+    public func m3N1ScriptCancellationBeforeLaunchCreatesNoProcess(): Unit {
+        withCronScriptRunnerTestRoot({ root =>
+            let marker = cronScriptsDir(root).join("marker")
+            let script = cronScriptsDir(root).join("cancel.sh")
+            File.writeTo(script, "printf x > marker\n".toArray())
+            let result = runCronJobScriptForJob(
+                root,
+                cronScriptRunnerJob("cancel.sh"),
+                cancellationCheck: { => throw Exception("cancelled-by-test") }
+            )
+            @Expect(result.ok, false)
+            @Expect(result.errorCode, "cron_script_cancelled")
+            @Expect(exists(marker), false)
+        })
+    }
 }
