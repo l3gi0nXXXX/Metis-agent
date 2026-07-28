@@ -85,7 +85,7 @@ public func handleGatewayCronFamily(method: String, request: GatewayRpcRequest):
         return Some(gatewayCronRpcResultResponse(method, pair[0], pair[1]))
     }
 
-    if (m == "cron.run") {
+    if (m == "cron.run" || m == "cron.enqueue") {
         let jobId = if (gatewayCronRpcString(p, "jobId").trimAscii().isEmpty()) {
             gatewayCronRpcString(p, "id").trimAscii()
         } else {
@@ -94,7 +94,11 @@ public func handleGatewayCronFamily(method: String, request: GatewayRpcRequest):
         if (jobId.isEmpty()) {
             return Some(GatewayRpcResponse(false, method, error: "jobId is empty"))
         }
-        let pair = gatewayCronRunOnceOutcomeViaRegisteredHook(jobId, true)
+        let pair = if (m == "cron.enqueue") {
+            gatewayCronEnqueueOnceOutcomeViaRegisteredHook(jobId, true)
+        } else {
+            gatewayCronRunOnceOutcomeViaRegisteredHook(jobId, true)
+        }
         return Some(gatewayCronRpcResultResponse(method, pair[1], if (pair[0]) { 0 } else { 1 }))
     }
 

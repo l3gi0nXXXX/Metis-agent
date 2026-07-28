@@ -82,7 +82,8 @@ private func cronRunResultExitCode(obj: JsonObject): Int64 {
             }
         case None => false
     }
-    if (ok && ran) {
+    let enqueued = gatewayCronRunJsonBool(obj, "enqueued")
+    if (ok && (ran || enqueued)) {
         return 0
     }
     1
@@ -104,13 +105,20 @@ private func gatewayCronRunJsonBool(obj: JsonObject, key: String, defaultValue!:
     }
 }
 
-private func gatewayCronRunResultForHuman(jobId: String, jo: JsonObject): String {
+public func gatewayCronRunResultForHuman(jobId: String, jo: JsonObject): String {
     let ok = gatewayCronRunJsonBool(jo, "ok")
     let lines = ArrayList<String>()
     lines.add(if (ok) { "Cron run" } else { "Cron run failed" })
     lines.add("Job: ${jobId}")
     if (ok) {
-        lines.add("Ran: ${gatewayCronRunJsonBool(jo, "ran")}")
+        let enqueued = gatewayCronRunJsonBool(jo, "enqueued")
+        if (enqueued) {
+            lines.add("Enqueued: true")
+            let runId = gatewayCronRunJsonString(jo, "runId")
+            if (!runId.isEmpty()) { lines.add("Run ID: ${runId}") }
+        } else {
+            lines.add("Ran: ${gatewayCronRunJsonBool(jo, "ran")}")
+        }
         let reason = gatewayCronRunJsonString(jo, "reason")
         if (!reason.isEmpty()) { lines.add("Reason: ${reason}") }
     } else {
@@ -205,6 +213,17 @@ public func gatewayCronRunOnceOutcomeViaRegisteredHook(jobId: String, force: Boo
     (pair[1] == 0, pair[0])
 }
 
+public func gatewayCronEnqueueOnceOutcomeViaRegisteredHook(jobId: String, force: Bool): (Bool, String) {
+    let args = ArrayList<String>()
+    args.add("cron")
+    args.add("enqueue")
+    args.add("--job-id")
+    args.add(jobId)
+    if (!force) { args.add("--due") }
+    let pair = executeGatewayCronCommand(args.toArray())
+    (pair[1] == 0, pair[0])
+}
+
 public func gatewayCronRunWithExecutor(sub: Array<String>, executor: (String, Bool) -> JsonObject): (String, Int64) {
     let (jobIdOpt, dueOnly) = gatewayParseCronRunJobIdAndDue(sub)
     let json = gatewayCronRunWantsJson(sub)
@@ -228,8 +247,13 @@ public func gatewayCronRunWithExecutor(sub: Array<String>, executor: (String, Bo
 
 public func registerGatewayCronRunHookForRunner(runner: CronRunner): Unit {
     registerGatewayCronRunUnified({ sub: Array<String> =>
+        let asyncMode = sub.size > 1 && sub[1].trimAscii().toAsciiLower() == "enqueue"
         gatewayCronRunWithExecutor(sub, { jobId: String, force: Bool =>
-            runner.runJobManual(jobId, force)
+            if (asyncMode) {
+                runner.enqueueJobManual(jobId, force)
+            } else {
+                runner.runJobManual(jobId, force)
+            }
         })
     })
 }

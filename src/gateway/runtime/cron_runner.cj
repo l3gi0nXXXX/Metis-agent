@@ -108,6 +108,19 @@ public struct CronSessionExecutionOptions {
     }
 }
 
+/** reserve 的结构化结果；只有 status=reserved 时 task 非空且占有一个 executor permit。 */
+public class CronExecutionReservation {
+    public let status: String
+    public let executionId: String
+    public let task: Option<CronExecutionTask>
+
+    public init(status: String, executionId!: String = "", task!: Option<CronExecutionTask> = None<CronExecutionTask>) {
+        this.status = status
+        this.executionId = executionId
+        this.task = task
+    }
+}
+
 private func cronTimeoutSecondsFromMs(timeoutMs: Int64): Int64 {
     if (timeoutMs <= 0) {
         return 0
@@ -210,6 +223,7 @@ private var cronRunnerRunLogAppendForTest: Option<() -> Unit> = None<() -> Unit>
 private var cronRunnerReservePersistForTest: Option<() -> Unit> = None<() -> Unit>
 private var cronRunnerSubmitForTest: Option<() -> Unit> = None<() -> Unit>
 private var cronRunnerDeliveryForTest: Option<() -> Unit> = None<() -> Unit>
+private var cronRunnerCommitForTest: Option<(String) -> Unit> = None<(String) -> Unit>
 
 public func debugSetCronRunnerReplyForTest(hook: Option<(CronJob, GatewaySessionRequest) -> String>): Unit {
     synchronized(cronRunnerTestHookLock) {
@@ -245,6 +259,10 @@ public func debugSetCronRunnerDeliveryForTest(hook: Option<() -> Unit>): Unit {
     synchronized(cronRunnerTestHookLock) {
         cronRunnerDeliveryForTest = hook
     }
+}
+
+public func debugSetCronRunnerCommitForTest(hook: Option<(String) -> Unit>): Unit {
+    synchronized(cronRunnerTestHookLock) { cronRunnerCommitForTest = hook }
 }
 
 private func cronRunnerReplyHookForTest(): Option<(CronJob, GatewaySessionRequest) -> String> {
@@ -283,6 +301,10 @@ private func cronRunnerDeliveryHookForTest(): Option<() -> Unit> {
     }
 }
 
+private func cronRunnerCommitHookForTest(): Option<(String) -> Unit> {
+    synchronized(cronRunnerTestHookLock) { cronRunnerCommitForTest }
+}
+
 /**
  * 网关进程内定时任务执行器：提供锁、启动错峰、running 标记、错误退避等核心语义。
  */
@@ -298,6 +320,10 @@ public class CronRunner {
     private var nextCronArmAtMs: Int64 = 0
     private let cronReaper: GatewayCronSessionReaperState = GatewayCronSessionReaperState()
     private let executionExecutor: CronExecutionExecutor
+    private let pendingTimerJobIds = ArrayList<String>()
+    private let manualCompletionLock = Mutex()
+    private let manualCompletions = HashMap<String, JsonObject>()
+    private let completionRetry = ArrayList<CronExecutionResult>()
     private var started: Bool = false
 
     public init(
@@ -602,7 +628,8 @@ public class CronRunner {
         deliveryStatus: String,
         deliveryError: String,
         diagnosticCode!: String = "",
-        diagnosticMessage!: String = ""
+        diagnosticMessage!: String = "",
+        executionId!: String = ""
     ): Bool {
         try {
             match (cronRunnerRunLogAppendHookForTest()) {
@@ -625,7 +652,8 @@ public class CronRunner {
                 deliveryStatus: deliveryStatus,
                 deliveryError: deliveryError,
                 diagnosticCode: diagnosticCode,
-                diagnosticMessage: diagnosticMessage
+                diagnosticMessage: diagnosticMessage,
+                executionId: executionId
             )
             true
         } catch (logError: Exception) {
@@ -1125,71 +1153,48 @@ public class CronRunner {
     /**
      * 手动执行一次（对齐当前 `cron.run` force/due 语义）：从磁盘加载、可选到期检查、执行并持久化。
      */
-    public func runJobManual(jobId: String, force: Bool): JsonObject {
-        let out = JsonObject()
-        synchronized(this.tickLock) {
-            this.reloadJobsFromDisk()
-            var now = epochMs()
-            let _cleared = this.clearStuckRunningMarkers(now)
-            if (_cleared) {
-                this.persist()
-                this.reloadJobsFromDisk()
+    public func runJobManual(jobId: String, force: Bool, waitTimeoutMs!: Int64 = 30000): JsonObject {
+        let accepted = this.enqueueJobManual(jobId, force)
+        let enqueued = match (accepted.get("enqueued")) {
+            case Some(v: JsonBool) => v.getValue()
+            case _ => false
+        }
+        if (!enqueued) {
+            let out = JsonObject()
+            let reason = match (accepted.get("reason")) {
+                case Some(v: JsonString) => v.getValue()
+                case _ => "deferred"
             }
-            now = epochMs()
-            var target: Option<CronJob> = None<CronJob>
-            for (x in this.jobs) {
-                if (x.id == jobId) {
-                    target = Some(x)
-                }
+            let compatible = reason == "already-running" || reason == "not-due"
+            out.put("ok", JsonBool(compatible))
+            out.put("ran", JsonBool(false))
+            out.put("reason", JsonString(reason))
+            match (accepted.get("error")) {
+                case Some(v) => out.put("error", v)
+                case None => ()
             }
-            match (target) {
-                case None =>
-                    out.put("ok", JsonBool(false))
-                    out.put("error", JsonString("unknown job id"))
-                    return out
-                case Some(j) =>
-                    if (!j.enabled) {
-                        out.put("ok", JsonBool(false))
-                        out.put("error", JsonString("job disabled"))
-                        return out
-                    }
-                    if (this.jobExecutionInFlight(j, now)) {
-                        out.put("ok", JsonBool(true))
-                        out.put("ran", JsonBool(false))
-                        out.put("reason", JsonString("already-running"))
-                        return out
-                    }
-                    if (!force && !isCronDue(j.state, now, j.schedule)) {
-                        out.put("ok", JsonBool(true))
-                        out.put("ran", JsonBool(false))
-                        out.put("reason", JsonString("not-due"))
-                        return out
-                    }
-                    let startedAtMs = epochMs()
-                    let wallNow = now
-                    this.lastFireWallMs[j.id] = wallNow
-                    j.state.runningAtMs = startedAtMs
-                    let _ = this.fireSingleJob(j, wallNow, startedAtMs, deferSideEffects: false)
-                    if (j.deleteAfterRun && j.state.lastStatus.trimAscii().toAsciiLower() == "success") {
-                        let filtered = ArrayList<CronJob>()
-                        for (x in this.jobs) {
-                            if (x.id != jobId) {
-                                filtered.add(x)
-                            }
-                        }
-                        this.jobs.clear()
-                        for (x in filtered) {
-                            this.jobs.add(x)
-                        }
-                    }
-                    this.persist()
-                    out.put("ok", JsonBool(true))
-                    out.put("ran", JsonBool(true))
-                    out.put("jobId", JsonString(jobId))
-                    return out
+            return out
+        }
+        let runId = match (accepted.get("runId")) {
+            case Some(v: JsonString) => v.getValue()
+            case _ => ""
+        }
+        let began = epochMs()
+        // 等待发生在 tickLock 外；waiter 超时不取消已提交 execution。
+        let boundedWaitMs = if (waitTimeoutMs > 0) { waitTimeoutMs } else { 1 }
+        while (epochMs() - began < boundedWaitMs) {
+            this.harvestCompletionsWithoutScheduling()
+            match (synchronized(this.manualCompletionLock) { this.manualCompletions.remove(runId) }) {
+                case Some(result) => return result
+                case None => sleep(Duration.millisecond * 5)
             }
         }
-        out
+        let timeout = JsonObject()
+        timeout.put("ok", JsonBool(false))
+        timeout.put("ran", JsonBool(false))
+        timeout.put("runId", JsonString(runId))
+        timeout.put("error", JsonString("cron run wait timed out"))
+        timeout
     }
 
     public static func runJobOnceFromStore(
@@ -1275,6 +1280,10 @@ public class CronRunner {
     }
 
     private func commitExecutionResult(result: CronExecutionResult): Unit {
+        match (cronRunnerCommitHookForTest()) {
+            case Some(hook) => hook("before-result-commit")
+            case None => ()
+        }
         let envelope = cronLoadStoreOrEmpty(this.storePath)
         var matched = false
         let identity = this.executionIdText(result.executionId)
@@ -1291,6 +1300,13 @@ public class CronRunner {
                     current.state.runningAtMs = 0
                     current.state.scheduleErrorCount = result.job.state.scheduleErrorCount
                     current.state.lastFailureAlertAtMs = result.job.state.lastFailureAlertAtMs
+                    // one-shot 的终态 disable 属于 runtime state；仅在配置版本未被并发编辑时合并。
+                    if (
+                        current.schedule.kind.trimAscii().toAsciiLower() == "at" &&
+                        current.updatedAtMs == result.job.updatedAtMs
+                    ) {
+                        current.enabled = result.job.enabled
+                    }
                 } else {
                     this.finalizeError(current, result.executionId.startedAtMs, epochMs(), result.error)
                 }
@@ -1316,7 +1332,7 @@ public class CronRunner {
         for (entry in envelope.journal) {
             if (entry.executionId == identity) {
                 let dplan = resolveCronDeliveryPlan(result.job)
-                if (dplan.requested && entry.deliveryReceipts.isEmpty()) {
+                if (dplan.requested && !result.artifact.answer.isEmpty() && entry.deliveryReceipts.isEmpty()) {
                     entry.deliveryReceipts = [
                         CronDeliveryReceipt(
                             dplan.channel,
@@ -1330,17 +1346,24 @@ public class CronRunner {
         }
         envelope.jobs = out.toArray()
         cronSaveStoreAtomic(this.storePath, envelope)
+        match (cronRunnerCommitHookForTest()) {
+            case Some(hook) => hook("after-result-commit")
+            case None => ()
+        }
         this.jobs.clear()
         for (job in envelope.jobs) {
             this.jobs.add(job)
         }
     }
 
-    private func drainAndCommitCompleted(results: Array<CronExecutionResult>): Unit {
+    private func drainAndCommitCompleted(results: Array<CronExecutionResult>): Array<CronExecutionResult> {
+        let committed = ArrayList<CronExecutionResult>()
         for (result in results) {
             try {
                 this.commitExecutionResult(result)
+                committed.add(result)
             } catch (e: Exception) {
+                this.completionRetry.add(result)
                 gatewayLogEventError(
                     "gateway/cron",
                     "cron.failed",
@@ -1352,6 +1375,7 @@ public class CronRunner {
                 )
             }
         }
+        committed.toArray()
     }
 
     /** 业务状态提交后、tickLock 外执行投递与 run-log，再以短锁推进 durable marker。 */
@@ -1374,7 +1398,8 @@ public class CronRunner {
             artifact.deliveryStatus,
             artifact.deliveryError,
             diagnosticCode: artifact.diagnosticCode,
-            diagnosticMessage: artifact.diagnosticMessage
+            diagnosticMessage: artifact.diagnosticMessage,
+            executionId: identity
         )
         if (appended) { "appended" } else { "failed" }
     }
@@ -1422,7 +1447,7 @@ public class CronRunner {
         let dplan = resolveCronDeliveryPlan(result.job)
         var deliveryStatus = artifact.deliveryStatus
         var deliveryError = artifact.deliveryError
-        if (artifact.status == "success" && dplan.requested) {
+        if (artifact.status == "success" && dplan.requested && !artifact.answer.isEmpty()) {
             synchronized(this.tickLock) {
                 let envelope = cronLoadStoreOrEmpty(this.storePath)
                 for (entry in envelope.journal) {
@@ -1460,6 +1485,36 @@ public class CronRunner {
                     "delivery_exception",
                     deliveryException.message
                 )
+            }
+        }
+        if (artifact.status != "success") {
+            match (resolveCronFailurePlan(result.job, dplan)) {
+                case Some(fplan) =>
+                    let alertAtMs = epochMs()
+                    if (
+                        this.shouldSendFailureAlert(result.job, fplan, alertAtMs) &&
+                        this.sendFailureAlert(
+                            result.job,
+                            fplan,
+                            artifact.error,
+                            result.executionId.startedAtMs
+                        )
+                    ) {
+                        result.job.state.lastFailureAlertAtMs = alertAtMs
+                        synchronized(this.tickLock) {
+                            let alertEnvelope = cronLoadStoreOrEmpty(this.storePath)
+                            for (current in alertEnvelope.jobs) {
+                                if (
+                                    current.id == result.executionId.jobId &&
+                                    current.state.lastRunAtMs == result.job.state.lastRunAtMs
+                                ) {
+                                    current.state.lastFailureAlertAtMs = alertAtMs
+                                }
+                            }
+                            cronSaveStoreAtomic(this.storePath, alertEnvelope)
+                        }
+                    }
+                case None => ()
             }
         }
         artifact.deliveryStatus = deliveryStatus
@@ -1522,8 +1577,261 @@ public class CronRunner {
         cronSaveStoreAtomic(this.storePath, current)
     }
 
+    /** 恢复 business state 已提交但 run-log marker 未提交的内部 crash seam。 */
+    private func recoverDurableRunLogMarkers(): Unit {
+        let envelope = cronLoadStoreOrEmpty(this.storePath)
+        var changed = false
+        for (entry in envelope.journal) {
+            if (entry.runLogRecorded || entry.phase == "reserved" || entry.phase == "executing") {
+                continue
+            }
+            var jobOpt: Option<CronJob> = None<CronJob>
+            for (job in envelope.jobs) {
+                if (job.id == entry.jobId) { jobOpt = Some(job) }
+            }
+            match (jobOpt) {
+                case None => ()
+                case Some(job) =>
+                    let ended = if (entry.updatedAtMs > 0) { entry.updatedAtMs } else { epochMs() }
+                    let status = if (job.state.lastStatus.isEmpty()) { "error" } else { job.state.lastStatus }
+                    if (this.appendRunLogIsolated(
+                        job,
+                        status,
+                        entry.reservedAtMs,
+                        ended,
+                        job.state.lastError,
+                        "",
+                        "unknown",
+                        "",
+                        executionId: entry.executionId
+                    )) {
+                        entry.runLogRecorded = true
+                        let _ = entry.transition("logged", epochMs())
+                        changed = true
+                    }
+            }
+        }
+        if (changed) {
+            cronSaveStoreAtomic(this.storePath, envelope)
+        }
+    }
+
     public func activeExecutionCount(): Int64 {
         this.executionExecutor.activeCount()
+    }
+
+    private func resultObjectForExecution(result: CronExecutionResult): JsonObject {
+        let out = JsonObject()
+        out.put("ok", JsonBool(true))
+        out.put("ran", JsonBool(true))
+        out.put("jobId", JsonString(result.executionId.jobId))
+        out.put("runId", JsonString(this.executionIdText(result.executionId)))
+        if (!result.artifact.diagnosticCode.isEmpty()) {
+            out.put("diagnosticCode", JsonString(result.artifact.diagnosticCode))
+            out.put("diagnosticMessage", JsonString(result.artifact.diagnosticMessage))
+        }
+        out
+    }
+
+    private func cacheManualCompletion(result: CronExecutionResult): Unit {
+        synchronized(this.manualCompletionLock) {
+            this.manualCompletions[this.executionIdText(result.executionId)] = this.resultObjectForExecution(result)
+        }
+    }
+
+    /** 同步 waiter 只收割 completion，不运行 timer 扫描，避免 `cron.run` 触发无关到期任务。 */
+    private func harvestCompletionsWithoutScheduling(): Unit {
+        let pending = ArrayList<CronExecutionResult>()
+        for (result in this.completionRetry) { pending.add(result) }
+        this.completionRetry.clear()
+        for (result in this.executionExecutor.drainCompleted()) { pending.add(result) }
+        if (pending.isEmpty()) {
+            return
+        }
+        let committed = synchronized(this.tickLock) {
+            this.recoverDurableRunLogMarkers()
+            this.drainAndCommitCompleted(pending.toArray())
+        }
+        for (result in committed) {
+            try {
+                this.settleCompletionSideEffects(result)
+                this.cacheManualCompletion(result)
+            } catch (e: Exception) {
+                gatewayLogEventError(
+                    "gateway/cron",
+                    "cron.run_log_failed",
+                    "cron manual completion side effects failed",
+                    meta: gatewayLogMeta()
+                        .string("jobId", result.executionId.jobId)
+                        .rawString("error", e.message)
+                        .object()
+                )
+            }
+        }
+    }
+
+    /**
+     * 所有 timer/manual/RPC 入口共享的 reservation。
+     * permit 在写 store 前取得；任何校验失败都释放 permit，因此不会留下假 running。
+     */
+    public func reserveExecution(
+        jobId: String,
+        trigger: String,
+        force: Bool,
+        dueOnly: Bool
+    ): CronExecutionReservation {
+        if (!this.started) {
+            this.start()
+        }
+        if (!this.executionExecutor.tryAcquireSlot()) {
+            return CronExecutionReservation("deferred")
+        }
+        synchronized(this.tickLock) {
+            try {
+                let envelope = cronLoadStoreOrEmpty(this.storePath)
+                var target: Option<CronJob> = None<CronJob>
+                for (job in envelope.jobs) {
+                    if (job.id == jobId) {
+                        target = Some(job)
+                    }
+                }
+                match (target) {
+                    case None =>
+                        let _ = this.executionExecutor.releaseSlot()
+                        return CronExecutionReservation("not-found")
+                    case Some(job) =>
+                        let now = epochMs()
+                        if (!job.enabled) {
+                            let _ = this.executionExecutor.releaseSlot()
+                            return CronExecutionReservation("disabled")
+                        }
+                        if (this.jobExecutionInFlight(job, now) || !job.state.executionId.isEmpty()) {
+                            let _ = this.executionExecutor.releaseSlot()
+                            return CronExecutionReservation("already-running", executionId: job.state.executionId)
+                        }
+                        if (dueOnly && !force && !isCronDue(job.state, now, job.schedule)) {
+                            let _ = this.executionExecutor.releaseSlot()
+                            return CronExecutionReservation("not-due")
+                        }
+                        let startedAtMs = now
+                        let scheduledAtMs = if (job.state.nextRunAtMs > 0) { job.state.nextRunAtMs } else { now }
+                        let id = CronExecutionId(job.id, scheduledAtMs, startedAtMs)
+                        let identity = this.executionIdText(id)
+                        job.state.runningAtMs = startedAtMs
+                        job.state.executionId = identity
+                        job.state.executionStartedAtMs = startedAtMs
+                        job.state.executionHeartbeatAtMs = startedAtMs
+                        envelope.scheduler.fairnessCursor = CronSchedulerCursor(
+                            nextRunAtMs: scheduledAtMs,
+                            jobId: job.id
+                        )
+                        let entries = ArrayList<CronExecutionJournalEntry>()
+                        for (entry in envelope.journal) {
+                            entries.add(entry)
+                        }
+                        entries.add(CronExecutionJournalEntry(
+                            identity,
+                            job.id,
+                            phase: "reserved",
+                            reservedAtMs: startedAtMs,
+                            updatedAtMs: startedAtMs
+                        ))
+                        envelope.journal = entries.toArray()
+                        match (cronRunnerReservePersistHookForTest()) {
+                            case Some(hook) => hook()
+                            case None => ()
+                        }
+                        cronSaveStoreAtomic(this.storePath, envelope)
+                        this.reloadJobsFromDisk()
+                        let snapshot = cronCloneJobForExecution(job)
+                        let serialKey = if (!job.sessionKey.trimAscii().isEmpty()) {
+                            job.sessionKey.trimAscii()
+                        } else {
+                            job.sessionTarget.trimAscii()
+                        }
+                        let task = CronExecutionTask(
+                            id,
+                            snapshot,
+                            { executionJob =>
+                                this.fireSingleJob(executionJob, now, startedAtMs, deferSideEffects: true)
+                            },
+                            serialKey: serialKey,
+                            globalResource: !job.scriptPath.trimAscii().isEmpty()
+                        )
+                        gatewayLogEventInfo(
+                            "gateway/cron",
+                            "cron.started",
+                            "cron execution reserved",
+                            meta: gatewayLogMeta()
+                                .string("jobId", job.id)
+                                .string("trigger", trigger)
+                                .object()
+                        )
+                        return CronExecutionReservation("reserved", executionId: identity, task: Some(task))
+                }
+            } catch (e: Exception) {
+                let _ = this.executionExecutor.releaseSlot()
+                gatewayLogEventError(
+                    "gateway/cron",
+                    "cron.failed",
+                    "cron execution reservation failed",
+                    meta: gatewayLogMeta().string("jobId", jobId).rawString("error", e.message).object()
+                )
+                CronExecutionReservation("reservation-failed")
+            }
+        }
+    }
+
+    /** 提交已持久化 reservation；拒绝时 compare-and-clear 本 execution。 */
+    public func submitReservedExecution(reservation: CronExecutionReservation): String {
+        if (reservation.status != "reserved") {
+            return reservation.status
+        }
+        match (reservation.task) {
+            case None => "deferred"
+            case Some(task) =>
+                try {
+                    match (cronRunnerSubmitHookForTest()) {
+                        case Some(hook) => hook()
+                        case None => ()
+                    }
+                    if (this.executionExecutor.submitReserved(task)) {
+                        return "submitted"
+                    }
+                } catch (_: Exception) {
+                    ()
+                }
+                let _ = this.executionExecutor.releaseSlot()
+                synchronized(this.tickLock) {
+                    this.rollbackReservation(task.executionId.jobId, reservation.executionId)
+                    this.reloadJobsFromDisk()
+                }
+                "submit-failed"
+        }
+    }
+
+    /** 异步手工触发：只返回接受状态和 runId。 */
+    public func enqueueJobManual(jobId: String, force: Bool): JsonObject {
+        let reservation = this.reserveExecution(jobId, "manual", force, !force)
+        let submit = this.submitReservedExecution(reservation)
+        let out = JsonObject()
+        let accepted = submit == "submitted"
+        let publicReason = if (submit == "reservation-failed" || submit == "submit-failed") {
+            "deferred"
+        } else {
+            submit
+        }
+        out.put("ok", JsonBool(accepted || submit == "already-running" || submit == "not-due"))
+        out.put("enqueued", JsonBool(accepted))
+        if (!reservation.executionId.isEmpty()) {
+            out.put("runId", JsonString(reservation.executionId))
+        }
+        if (!accepted) {
+            out.put("reason", JsonString(publicReason))
+            if (publicReason == "not-found") { out.put("error", JsonString("unknown job id")) }
+            if (publicReason == "disabled") { out.put("error", JsonString("job disabled")) }
+        }
+        out
     }
 
     public func tick(nowOverride!: Option<Int64> = None): Unit {
@@ -1532,20 +1840,27 @@ public class CronRunner {
         }
         // Completion 必须先于 arm gate 收割，否则长 arm 会延迟终态持久化。
         let completed = this.executionExecutor.drainCompleted()
+        let pendingCompleted = ArrayList<CronExecutionResult>()
+        for (result in this.completionRetry) { pendingCompleted.add(result) }
+        this.completionRetry.clear()
+        for (result in completed) { pendingCompleted.add(result) }
+        let allCompleted = pendingCompleted.toArray()
         let nowPeek = match (nowOverride) {
             case Some(t) => t
             case None => epochMs()
         }
-        if (completed.isEmpty() && this.cronEnabled && nowPeek < this.nextCronArmAtMs) {
+        if (allCompleted.isEmpty() && this.cronEnabled && nowPeek < this.nextCronArmAtMs) {
             return
         }
+        var committed = Array<CronExecutionResult>()
         synchronized(this.tickLock) {
-            this.drainAndCommitCompleted(completed)
+            this.recoverDurableRunLogMarkers()
+            committed = this.drainAndCommitCompleted(allCompleted)
             let nowGate = match (nowOverride) {
                 case Some(t) => t
                 case None => epochMs()
             }
-            if (completed.isEmpty() && this.cronEnabled && nowGate < this.nextCronArmAtMs) {
+            if (allCompleted.isEmpty() && this.cronEnabled && nowGate < this.nextCronArmAtMs) {
                 return
             }
             this.tickInner(nowOverride)
@@ -1556,9 +1871,20 @@ public class CronRunner {
                 this.nextCronArmAtMs = after + MAX_TIMER_DELAY_MS
             }
         }
-        for (result in completed) {
+        // tickInner 仅在短锁内确定公平顺序；实际 timer reserve/submit 复用手工入口的唯一实现。
+        let timerIds = this.pendingTimerJobIds.toArray()
+        this.pendingTimerJobIds.clear()
+        for (jobId in timerIds) {
+            let reservation = this.reserveExecution(jobId, "timer", false, true)
+            let submitted = this.submitReservedExecution(reservation)
+            if (submitted == "deferred") {
+                break
+            }
+        }
+        for (result in committed) {
             try {
                 this.settleCompletionSideEffects(result)
+                this.cacheManualCompletion(result)
             } catch (e: Exception) {
                 gatewayLogEventError(
                     "gateway/cron",
@@ -1650,7 +1976,7 @@ public class CronRunner {
             },
             stable: true
         )
-        var envelope = cronLoadStoreOrEmpty(this.storePath)
+        let envelope = cronLoadStoreOrEmpty(this.storePath)
         var cursorIndex: Int64 = -1
         var idx: Int64 = 0
         for (j in ordered) {
@@ -1663,114 +1989,13 @@ public class CronRunner {
             }
             idx += 1
         }
+        this.pendingTimerJobIds.clear()
         var offset: Int64 = 0
         while (offset < ordered.size) {
             let pos = (cursorIndex + 1 + offset) % ordered.size
             let j = ordered[pos]
             offset += 1
-            // permit-before-reserve：满槽时不得写 store。
-            if (!this.executionExecutor.tryAcquireSlot()) {
-                break
-            }
-
-            let startedAtMs = epochMs()
-            let scheduledAtMs = j.state.nextRunAtMs
-            let executionId = CronExecutionId(j.id, scheduledAtMs, startedAtMs)
-            let identity = this.executionIdText(executionId)
-            let conv = cronExecutionConversationKey(j, startedAtMs)
-            gatewayLogEventInfo(
-                "gateway/cron",
-                "cron.started",
-                "cron job firing",
-                meta: gatewayLogMeta()
-                    .string("jobId", j.id)
-                    .identityHash("conversationHash", conv)
-                    .object()
-            )
-            this.lastFireWallMs[j.id] = now
-
-            j.state.runningAtMs = startedAtMs
-            j.state.executionId = identity
-            j.state.executionStartedAtMs = startedAtMs
-            j.state.executionHeartbeatAtMs = startedAtMs
-            envelope.scheduler.fairnessCursor = CronSchedulerCursor(
-                nextRunAtMs: scheduledAtMs,
-                jobId: j.id
-            )
-            let nextJournal = ArrayList<CronExecutionJournalEntry>()
-            for (entry in envelope.journal) {
-                nextJournal.add(entry)
-            }
-            nextJournal.add(
-                CronExecutionJournalEntry(
-                    identity,
-                    j.id,
-                    phase: "reserved",
-                    reservedAtMs: startedAtMs,
-                    updatedAtMs: startedAtMs
-                )
-            )
-            envelope.journal = nextJournal.toArray()
-            // envelope 中使用 runner 当前 runtime state，但保留磁盘配置字段。
-            for (diskJob in envelope.jobs) {
-                if (diskJob.id == j.id) {
-                    diskJob.state.runningAtMs = startedAtMs
-                    diskJob.state.executionId = identity
-                    diskJob.state.executionStartedAtMs = startedAtMs
-                    diskJob.state.executionHeartbeatAtMs = startedAtMs
-                }
-            }
-            try {
-                match (cronRunnerReservePersistHookForTest()) {
-                    case Some(hook) => hook()
-                    case None => ()
-                }
-                cronSaveStoreAtomic(this.storePath, envelope)
-                let snapshot = cronCloneJobForExecution(j)
-                let task = CronExecutionTask(executionId, snapshot, { job =>
-                    this.fireSingleJob(job, now, startedAtMs, deferSideEffects: true)
-                })
-                match (cronRunnerSubmitHookForTest()) {
-                    case Some(hook) => hook()
-                    case None => ()
-                }
-                if (!this.executionExecutor.submitReserved(task)) {
-                    let _ = this.executionExecutor.releaseSlot()
-                    j.state.runningAtMs = 0
-                    j.state.executionId = ""
-                    j.state.executionStartedAtMs = 0
-                    j.state.executionHeartbeatAtMs = 0
-                    this.rollbackReservation(j.id, identity)
-                    envelope = cronLoadStoreOrEmpty(this.storePath)
-                    gatewayLogEventWarn(
-                        "gateway/cron",
-                        "cron.skipped",
-                        "cron executor rejected reserved task",
-                        meta: gatewayLogMeta().string("jobId", j.id).object()
-                    )
-                }
-            } catch (e: Exception) {
-                let _ = this.executionExecutor.releaseSlot()
-                j.state.runningAtMs = 0
-                j.state.executionId = ""
-                j.state.executionStartedAtMs = 0
-                j.state.executionHeartbeatAtMs = 0
-                try {
-                    this.rollbackReservation(j.id, identity)
-                } catch (_: Exception) {
-                    ()
-                }
-                envelope = cronLoadStoreOrEmpty(this.storePath)
-                gatewayLogEventError(
-                    "gateway/cron",
-                    "cron.failed",
-                    "cron reservation or submit failed",
-                    meta: gatewayLogMeta()
-                        .string("jobId", j.id)
-                        .rawString("error", e.message)
-                        .object()
-                )
-            }
+            this.pendingTimerJobIds.add(j.id)
         }
     }
 }

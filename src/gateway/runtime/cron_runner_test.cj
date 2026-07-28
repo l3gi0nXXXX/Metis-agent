@@ -10,15 +10,19 @@ import metis.gateway.tools.{
 }
 import metis.cron.{
     CronJob,
+    CronExecutionJournalEntry,
+    CronStoreEnvelope,
     CronJobState,
     CronSchedule,
     CronWebhookHttpRequest,
     CronWebhookHttpResponse,
+    appendCronRunLog,
     cronLoadOrEmpty,
     cronLoadStoreOrEmpty,
     cronScriptsDir,
     cronRunLogPathFromStore,
     cronSave,
+    cronSaveStoreAtomic,
     cronStorePath,
     readCronRunLogEntriesForJob,
     setCronWebhookHttpRunnerForTest
@@ -31,7 +35,7 @@ import std.collection.{ArrayList, HashMap}
 import std.core.Duration
 import std.env.{getVariable, setVariable}
 import std.fs.{Directory, File, Path, remove}
-import std.sync.{Condition, Mutex}
+import std.sync.{AtomicBool, Condition, Mutex}
 import std.time.DateTime
 import std.unittest.testmacro.*
 import stdx.encoding.json.{JsonObject, JsonString}
@@ -57,6 +61,7 @@ private func withCronRunnerTestHome<T>(block: (Path) -> T): T {
             debugSetCronRunnerReservePersistForTest(None<() -> Unit>)
             debugSetCronRunnerSubmitForTest(None<() -> Unit>)
             debugSetCronRunnerDeliveryForTest(None<() -> Unit>)
+            debugSetCronRunnerCommitForTest(None<(String) -> Unit>)
             setGatewayAgentBridgeReplyRunnerForTest(None<(String, String, String, String, Bool, Option<(String) -> Unit>) -> String>)
             setGatewayWebProviderResolverForTest(None<(String) -> GatewayWebProviderResolution>)
             setDuckDuckGoSearchHttpRunnerForTest(None<(DuckDuckGoSearchHttpRequest) -> DuckDuckGoSearchHttpResponse>)
@@ -75,6 +80,218 @@ private func withCronRunnerTestHome<T>(block: (Path) -> T): T {
             CliSettingManager.invalidate()
             try { remove(Path(home), recursive: true) } catch (_: Exception) { () }
         }
+    }
+}
+
+@Test
+public class CronRunnerManualIdentityTest {
+    @TestCase
+    public func m2U1TimerAndManualReservationShareExecutionIdentity(): Unit {
+        withCronRunnerTestHome({ storePath =>
+            cronSave(storePath, [cronRunnerTestJob("race-中文-😀")])
+            let release = AtomicBool(false)
+            let calls = AtomicBool(false)
+            debugSetCronRunnerReplyForTest(Some({ _job, _request =>
+                calls.store(true)
+                while (!release.load()) { sleep(Duration.millisecond * 2) }
+                "完成-😀"
+            }))
+            let runner = CronRunner(storePath: storePath, maxConcurrentRuns: 2)
+            let first = runner.reserveExecution("race-中文-😀", "timer", true, false)
+            @Expect(first.status, "reserved")
+            @Expect(runner.submitReservedExecution(first), "submitted")
+            let competing = runner.reserveExecution("race-中文-😀", "manual", true, false)
+            @Expect(competing.status, "already-running")
+            @Expect(competing.executionId, first.executionId)
+            release.store(true)
+            @Expect(runner.waitUntilIdle(timeoutMs: 2000), true)
+            runner.tick()
+            @Expect(calls.load(), true)
+            @Expect(readCronRunLogEntriesForJob(storePath, "race-中文-😀").get("total").getOrThrow().asInt().getValue(), 1)
+        })
+    }
+
+    @TestCase
+    public func m2N1ReservationRejectsWithoutLeakingRunningState(): Unit {
+        withCronRunnerTestHome({ storePath =>
+            let disabled = cronRunnerTestJob("disabled")
+            disabled.enabled = false
+            let future = cronRunnerTestJob("future")
+            future.state.nextRunAtMs = DateTime.now().toUnixTimeStamp().toMilliseconds() + 60000
+            let active = cronRunnerTestJob("active")
+            cronSave(storePath, [disabled, future, active])
+            let runner = CronRunner(storePath: storePath, maxConcurrentRuns: 1)
+            @Expect(runner.reserveExecution("missing", "manual", true, false).status, "not-found")
+            @Expect(runner.reserveExecution("disabled", "manual", true, false).status, "disabled")
+            @Expect(runner.reserveExecution("future", "manual", false, true).status, "not-due")
+            for (job in cronLoadOrEmpty(storePath)) {
+                @Expect(job.state.runningAtMs, 0)
+                @Expect(job.state.executionId, "")
+            }
+            let release = AtomicBool(false)
+            debugSetCronRunnerReplyForTest(Some({ _job, _request =>
+                while (!release.load()) { sleep(Duration.millisecond * 2) }
+                "done"
+            }))
+            let occupied = runner.reserveExecution("active", "manual", true, false)
+            @Expect(runner.submitReservedExecution(occupied), "submitted")
+            @Expect(runner.reserveExecution("future", "manual", true, false).status, "deferred")
+            let stillFuture = cronLoadOrEmpty(storePath)[1]
+            @Expect(stillFuture.state.runningAtMs, 0)
+            @Expect(stillFuture.state.executionId, "")
+            release.store(true)
+            @Expect(runner.waitUntilIdle(timeoutMs: 2000), true)
+            runner.tick()
+        })
+    }
+
+    @TestCase
+    public func m2B1CompletionDoesNotRecreateRemovedJob(): Unit {
+        withCronRunnerTestHome({ storePath =>
+            cronSave(storePath, [cronRunnerTestJob("removed-while-running")])
+            let release = AtomicBool(false)
+            debugSetCronRunnerReplyForTest(Some({ _job, _request =>
+                while (!release.load()) { sleep(Duration.millisecond * 2) }
+                "late"
+            }))
+            let runner = CronRunner(storePath: storePath)
+            let reservation = runner.reserveExecution("removed-while-running", "manual", true, false)
+            @Expect(runner.submitReservedExecution(reservation), "submitted")
+            cronSave(storePath, Array<CronJob>())
+            release.store(true)
+            @Expect(runner.waitUntilIdle(timeoutMs: 2000), true)
+            runner.tick()
+            @Expect(cronLoadOrEmpty(storePath).size, 0)
+        })
+    }
+
+    @TestCase
+    public func m2B1CompletionPreservesConcurrentEditAndDisable(): Unit {
+        withCronRunnerTestHome({ storePath =>
+            cronSave(storePath, [cronRunnerTestJob("edited-while-running")])
+            let release = AtomicBool(false)
+            debugSetCronRunnerReplyForTest(Some({ _job, _request =>
+                while (!release.load()) { sleep(Duration.millisecond * 2) }
+                "late"
+            }))
+            let runner = CronRunner(storePath: storePath)
+            let reservation = runner.reserveExecution("edited-while-running", "manual", true, false)
+            @Expect(runner.submitReservedExecution(reservation), "submitted")
+            let edited = cronLoadOrEmpty(storePath)[0]
+            edited.prompt = "编辑后的中文😀"
+            edited.deliveryChannel = "feishu"
+            edited.deliveryTo = "oc_edited"
+            edited.enabled = false
+            cronSave(storePath, [edited])
+            release.store(true)
+            @Expect(runner.waitUntilIdle(timeoutMs: 2000), true)
+            runner.tick()
+            let after = cronLoadOrEmpty(storePath)[0]
+            @Expect(after.prompt, "编辑后的中文😀")
+            @Expect(after.deliveryChannel, "feishu")
+            @Expect(after.deliveryTo, "oc_edited")
+            @Expect(after.enabled, false)
+            @Expect(after.state.executionId, "")
+        })
+    }
+
+    @TestCase
+    public func m2B2RunLogExecutionIdMakesCrashReplayIdempotent(): Unit {
+        withCronRunnerTestHome({ storePath =>
+            appendCronRunLog(storePath, "journal-job", "success", 1, 2, summary: "中文😀", executionId: "run-唯一-😀")
+            // 模拟 jsonl append 成功但 journal marker 尚未落盘，恢复会重放同一 append。
+            appendCronRunLog(storePath, "journal-job", "success", 1, 2, summary: "中文😀", executionId: "run-唯一-😀")
+            let runs = readCronRunLogEntriesForJob(storePath, "journal-job")
+            @Expect(runs.get("total").getOrThrow().asInt().getValue(), 1)
+            let row = runs.get("entries").getOrThrow().asArray()[0].asObject()
+            @Expect(row.get("executionId").getOrThrow().asString().getValue(), "run-唯一-😀")
+        })
+    }
+
+    @TestCase
+    public func m2B2RecoveryAtEveryCommittedCrashPointIsIdempotentAcrossTwoRestarts(): Unit {
+        for (phase in ["result_committed", "delivery_pending", "delivery_settled"]) {
+            withCronRunnerTestHome({ storePath =>
+                let job = cronRunnerTestJob("recover-${phase}")
+                job.state.lastStatus = "success"
+                job.state.lastRunAtMs = 100
+                cronSaveStoreAtomic(
+                    storePath,
+                    CronStoreEnvelope(
+                        jobs: [job],
+                        journal: [CronExecutionJournalEntry(
+                            "recover-${phase}:1:100",
+                            job.id,
+                            phase: phase,
+                            reservedAtMs: 100,
+                            updatedAtMs: 200
+                        )]
+                    )
+                )
+                // 两次新 runner 等价于 crash 后连续恢复两次。
+                CronRunner(storePath: storePath, cronEnabled: false).tick()
+                CronRunner(storePath: storePath, cronEnabled: false).tick()
+                let envelope = cronLoadStoreOrEmpty(storePath)
+                @Expect(envelope.journal[0].phase, "logged")
+                @Expect(envelope.journal[0].runLogRecorded, true)
+                @Expect(readCronRunLogEntriesForJob(storePath, job.id).get("total").getOrThrow().asInt().getValue(), 1)
+            })
+        }
+    }
+
+    @TestCase
+    public func m2B2ResultCommitFailpointsRetryWithoutDuplicateTerminal(): Unit {
+        for (point in ["before-result-commit", "after-result-commit"]) {
+            withCronRunnerTestHome({ storePath =>
+                cronSave(storePath, [cronRunnerTestJob("commit-${point}")])
+                debugSetCronRunnerReplyForTest(Some({ _job, _request => "business-once" }))
+                let failed = AtomicBool(false)
+                debugSetCronRunnerCommitForTest(Some({ actual =>
+                    if (actual == point && !failed.load()) {
+                        failed.store(true)
+                        throw Exception("simulated crash ${point}")
+                    }
+                }))
+                let runner = CronRunner(storePath: storePath)
+                let accepted = runner.enqueueJobManual("commit-${point}", true)
+                @Expect(accepted.get("enqueued").getOrThrow().asBool().getValue(), true)
+                @Expect(runner.waitUntilIdle(timeoutMs: 2000), true)
+                runner.tick()
+                debugSetCronRunnerCommitForTest(None<(String) -> Unit>)
+                runner.tick()
+                runner.tick()
+                @Expect(failed.load(), true)
+                @Expect(cronLoadOrEmpty(storePath)[0].state.lastStatus, "success")
+                @Expect(readCronRunLogEntriesForJob(storePath, "commit-${point}").get("total").getOrThrow().asInt().getValue(), 1)
+            })
+        }
+    }
+
+    @TestCase
+    public func m2N3WaiterTimeoutDoesNotCancelExecutionOrLeakLock(): Unit {
+        withCronRunnerTestHome({ storePath =>
+            cronSave(storePath, [cronRunnerTestJob("waiter-timeout")])
+            let release = AtomicBool(false)
+            debugSetCronRunnerReplyForTest(Some({ _job, _request =>
+                while (!release.load()) { sleep(Duration.millisecond * 2) }
+                "eventual"
+            }))
+            let runner = CronRunner(storePath: storePath, maxConcurrentRuns: 2)
+            let timedOut = runner.runJobManual("waiter-timeout", true, waitTimeoutMs: 20)
+            @Expect(timedOut.get("ok").getOrThrow().asBool().getValue(), false)
+            @Expect(timedOut.get("error").getOrThrow().asString().getValue().contains("timed out"), true)
+            let duplicate = runner.enqueueJobManual("waiter-timeout", true)
+            @Expect(duplicate.get("reason").getOrThrow().asString().getValue(), "already-running")
+            release.store(true)
+            @Expect(runner.waitUntilIdle(timeoutMs: 2000), true)
+            runner.tick()
+            @Expect(readCronRunLogEntriesForJob(storePath, "waiter-timeout").get("total").getOrThrow().asInt().getValue(), 1)
+            // 锁未泄漏：终态后可再次 reserve。
+            let again = runner.enqueueJobManual("waiter-timeout", true)
+            @Expect(again.get("enqueued").getOrThrow().asBool().getValue(), true)
+            @Expect(runner.waitUntilIdle(timeoutMs: 2000), true)
+            runner.tick()
+        })
     }
 }
 
