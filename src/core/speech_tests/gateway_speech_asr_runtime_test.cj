@@ -104,7 +104,7 @@ public class GatewaySpeechAsrRuntimeTest {
         let root = asrTestTempRoot("stdout")
         let audio = root.join("voice.ogg")
         File.writeTo(audio, "fake-audio".toArray())
-        let provider = asrTestProvider(["sh", "-c", "printf 'stdout transcript'"])
+        let provider = asrTestProvider(["printf", "%s", "stdout transcript"])
         let result = gatewaySpeechAsrTranscribeAudioPath(asrTestConfig("local", provider), audio.toString(), "audio/ogg", outputRoot: root, maxBytes: 8192)
 
         @Expect(asrTestBool(result, "ok"), true)
