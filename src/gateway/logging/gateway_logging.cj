@@ -85,6 +85,16 @@ public class MetisLogEvent {
     public static const cronDisabled: String = "cron.disabled"
     public static const cronSkipped: String = "cron.skipped"
     public static const cronPromptBlocked: String = "cron.prompt_blocked"
+    public static const cronQueued: String = "cron.queued"
+    public static const cronCompleted: String = "cron.completed"
+    public static const cronTimedOut: String = "cron.timed_out"
+    public static const cronCancelled: String = "cron.cancelled"
+    public static const cronDeferred: String = "cron.deferred"
+    public static const cronStaleResult: String = "cron.stale_result"
+    public static const cronQueueSaturated: String = "cron.queue_saturated"
+    public static const cronDrainStarted: String = "cron.drain_started"
+    public static const cronDrainCompleted: String = "cron.drain_completed"
+    public static const cronDrainTimedOut: String = "cron.drain_timed_out"
     public static const processMemory: String = "process.memory"
     public static const chatTurnPublished: String = "chat_turn.published"
     public static const rpcRequestSlow: String = "rpc.request.slow"
@@ -110,6 +120,8 @@ public class MetisLogEvent {
             toolInvoked, toolFailed, skillMatched, skillSkipped,
             sessionReadFailed, sessionWriteFailed, sessionMigrationFailed, sessionReaped,
             cronScheduled, cronStarted, cronSucceeded, cronFailed, cronDisabled, cronSkipped, cronPromptBlocked,
+            cronQueued, cronCompleted, cronTimedOut, cronCancelled, cronDeferred, cronStaleResult,
+            cronQueueSaturated, cronDrainStarted, cronDrainCompleted, cronDrainTimedOut,
             processMemory, chatTurnPublished, rpcRequestSlow, rpcRequestFailed, rpcSlow, rpcFailed, loggingRaw,
             loggingFileSizeCap
         ]
@@ -393,6 +405,12 @@ public func gatewayLogRedactText(text: String): String {
         "(https?://[^\\s:/@]+:)[^\\s/@]+(@)",
         { md => "${md.matchString(1)}${LOG_REDACTED_MARKER}${md.matchString(2)}" }
     )
+    // 运行诊断不得泄漏本机用户目录；只保留平台根前缀供排障分类。
+    out = gatewayLogRegexReplace(
+        out,
+        "(/Users/|/home/)[^\\s\"']+",
+        "[redacted-path]"
+    )
     for (pattern in settings.redactPatterns) {
         let p = pattern.trimAscii()
         if (!p.isEmpty()) {
@@ -488,7 +506,14 @@ private func gatewayLoggingWriteSizeCapWarning(settings: GatewayResolvedLoggingS
     row.put("message", JsonString("log file size cap reached; suppressing further file log writes"))
     row.put("file", JsonString(settings.file))
     row.put("maxFileBytes", JsonInt(settings.maxFileBytes))
-    _ = gatewayLoggingAppendFile(path, row.toJsonString() + "\n")
+    _ = gatewayLoggingAppendFile(path, gatewayLoggingJsonLine(row))
+}
+
+// stdx JsonObject.toJsonString() uses pretty-printed JSON. Log files are JSONL,
+// so remove only serializer-inserted physical line breaks; escaped newlines in
+// string values remain "\\n" and therefore preserve their JSON meaning.
+private func gatewayLoggingJsonLine(row: JsonObject): String {
+    row.toJsonString().replace("\r", "").replace("\n", "") + "\n"
 }
 
 private func gatewayLoggingLevelEnabled(level: String, configured: String): Bool {
@@ -602,7 +627,7 @@ public class MetisSubsystemLogger {
                     case None => ()
                 }
             }
-            let line = row.toJsonString() + "\n"
+            let line = gatewayLoggingJsonLine(row)
             let lineSize = Int64(line.toArray().size)
             let nextSize = gatewayLoggingCachedFileSize(path) + lineSize
             if (settings.maxFileBytes > 0 && nextSize > settings.maxFileBytes) {
