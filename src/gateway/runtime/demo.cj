@@ -271,7 +271,8 @@ public func runGatewayService(verbose!: Bool = false): Unit {
             sleep(Duration.millisecond * 200)
         }
     } finally {
-        cronRunner.stopAccepting()
+        // Cron 清理仍可能需要 channel/session；必须在 Gateway teardown 前完成有界取消与收割。
+        let _ = cronRunner.stop(reason: "gateway_shutdown", drainTimeoutMs: 5000)
         MetisConfigManager.setWriteRootNotificationHook(None<MetisConfigWriteNotificationListener>)
         try {
             gateway.stop()

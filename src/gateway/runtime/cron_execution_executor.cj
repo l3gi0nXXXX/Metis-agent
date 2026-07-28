@@ -300,6 +300,47 @@ public class CronExecutionResult {
     }
 }
 
+/** Executor 生命周期快照。executionIds 仅供进程内 fencing，不得直接写用户日志。 */
+public class CronExecutionLifecycleSnapshot {
+    public let accepting: Bool
+    public let activeCount: Int64
+    public let reservedCount: Int64
+    public let executionIds: Array<String>
+
+    public init(accepting: Bool, activeCount: Int64, reservedCount: Int64, executionIds: Array<String>) {
+        this.accepting = accepting
+        this.activeCount = activeCount
+        this.reservedCount = reservedCount
+        this.executionIds = executionIds
+    }
+}
+
+public class CronExecutionDrainResult {
+    public let drained: Bool
+    public let timedOut: Bool
+    public let activeExecutionIds: Array<String>
+
+    public init(drained: Bool, activeExecutionIds: Array<String>) {
+        this.drained = drained
+        this.timedOut = !drained
+        this.activeExecutionIds = activeExecutionIds
+    }
+}
+
+private class CronExecutionActiveHandle {
+    public let executionId: String
+    public let control: CronExecutionControl
+
+    public init(executionId: String, control: CronExecutionControl) {
+        this.executionId = executionId
+        this.control = control
+    }
+}
+
+private func cronExecutorIdentity(id: CronExecutionId): String {
+    "${id.jobId}:${id.scheduledAtMs}:${id.startedAtMs}"
+}
+
 /** 为 worker 创建与 store 中可变对象完全分离的任务快照。 */
 public func cronCloneJobForExecution(job: CronJob): CronJob {
     let state = CronJobState(
@@ -385,6 +426,7 @@ public class CronExecutionExecutor {
     private var accepting: Bool = false
     private var active: Int64 = 0
     private var reserved: Int64 = 0
+    private let activeHandles = ArrayList<CronExecutionActiveHandle>()
     private let activeSerialKeys = HashSet<String>()
     private var globalResourceActive: Bool = false
 
@@ -432,6 +474,10 @@ public class CronExecutionExecutor {
                 return false
             }
             this.reserved -= 1
+            this.activeHandles.add(CronExecutionActiveHandle(
+                cronExecutorIdentity(task.executionId),
+                task.executionControl
+            ))
         }
         spawn {
             var error = ""
@@ -480,6 +526,17 @@ public class CronExecutionExecutor {
                         artifact: artifact,
                         executionControl: Some(task.executionControl)
                     ))
+                    let retained = ArrayList<CronExecutionActiveHandle>()
+                    let identity = cronExecutorIdentity(task.executionId)
+                    for (handle in this.activeHandles) {
+                        if (handle.executionId != identity) {
+                            retained.add(handle)
+                        }
+                    }
+                    this.activeHandles.clear()
+                    for (handle in retained) {
+                        this.activeHandles.add(handle)
+                    }
                     this.active -= 1
                 }
             }
@@ -507,9 +564,55 @@ public class CronExecutionExecutor {
         }
     }
 
-    public func stopAccepting(): Unit {
+    public func lifecycleSnapshot(): CronExecutionLifecycleSnapshot {
+        synchronized(this.stateLock) {
+            let ids = ArrayList<String>()
+            for (handle in this.activeHandles) {
+                ids.add(handle.executionId)
+            }
+            CronExecutionLifecycleSnapshot(this.accepting, this.active, this.reserved, ids.toArray())
+        }
+    }
+
+    /** 幂等停止接单，并返回停止瞬间的 active/queued 快照。 */
+    public func stopAccepting(): CronExecutionLifecycleSnapshot {
         synchronized(this.stateLock) {
             this.accepting = false
+            let ids = ArrayList<String>()
+            for (handle in this.activeHandles) {
+                ids.add(handle.executionId)
+            }
+            CronExecutionLifecycleSnapshot(false, this.active, this.reserved, ids.toArray())
         }
+    }
+
+    /** 协作取消所有已提交 execution；handle 只由 worker finally 移除。 */
+    public func cancelAll(reason!: String = "gateway_shutdown"): CronExecutionLifecycleSnapshot {
+        synchronized(this.stateLock) {
+            this.accepting = false
+            // reserved 尚未产生 worker，停止时可直接撤销 permit；对应 store reservation
+            // 由 CronRunner 的 compare-and-fence 归一，不能让 awaitDrain 永久等待不存在的 handle。
+            if (this.reserved > 0) {
+                this.active -= this.reserved
+                this.reserved = 0
+            }
+            let ids = ArrayList<String>()
+            for (handle in this.activeHandles) {
+                let _ = handle.control.cancel(reason)
+                ids.add(handle.executionId)
+            }
+            CronExecutionLifecycleSnapshot(false, this.active, this.reserved, ids.toArray())
+        }
+    }
+
+    /** 不持有 CronRunner.tickLock 的有界 drain。 */
+    public func awaitDrain(timeoutMs: Int64): CronExecutionDrainResult {
+        let began = cronExecutionNowMs()
+        let bounded = max(0, timeoutMs)
+        while (this.activeCount() > 0 && cronExecutionNowMs() - began < bounded) {
+            sleep(Duration.millisecond * 5)
+        }
+        let snapshot = this.lifecycleSnapshot()
+        CronExecutionDrainResult(snapshot.activeCount == 0, snapshot.executionIds)
     }
 }

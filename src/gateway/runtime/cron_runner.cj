@@ -87,6 +87,22 @@ private let MAX_SCHEDULE_ERRORS: Int64 = 3
 /** 单次 arm sleep 的最大时长。 */
 private let MAX_TIMER_DELAY_MS: Int64 = 60_000
 
+/** M4 生命周期日志契约；测试据此验证 JSONL 事件矩阵和字段白名单。 */
+public func cronLifecycleLogEventNames(): Array<String> {
+    [
+        "cron.queued", "cron.started", "cron.completed", "cron.timed_out",
+        "cron.cancelled", "cron.deferred", "cron.stale_result", "cron.queue_saturated",
+        "cron.drain_started", "cron.drain_completed", "cron.drain_timed_out"
+    ]
+}
+
+public func cronLifecycleLogAllowedMetaFields(): Array<String> {
+    [
+        "jobId", "executionHash", "status", "durationMs", "timeoutMs",
+        "queueCount", "activeCount", "errorKind"
+    ]
+}
+
 public struct CronSessionExecutionOptions {
     public let modelOverride: String
     public let thinkingLevel: String
@@ -323,6 +339,18 @@ private func cronRunnerCommitHookForTest(): Option<(String) -> Unit> {
 /**
  * 网关进程内定时任务执行器：提供锁、启动错峰、running 标记、错误退避等核心语义。
  */
+public class CronRunnerStopResult {
+    public let drained: Bool
+    public let timedOut: Bool
+    public let activeCount: Int64
+
+    public init(drained: Bool, activeCount: Int64) {
+        this.drained = drained
+        this.timedOut = !drained
+        this.activeCount = activeCount
+    }
+}
+
 public class CronRunner {
     private let gatewayOpt: Option<GatewayService>
     private let storePath: Path
@@ -370,6 +398,7 @@ public class CronRunner {
     public func start(): Unit {
         synchronized(this.tickLock) {
             if (!this.started) {
+                this.recoverInterruptedExecutions()
                 this.executionExecutor.start()
                 this.started = true
             }
@@ -377,7 +406,51 @@ public class CronRunner {
     }
 
     public func stopAccepting(): Unit {
-        this.executionExecutor.stopAccepting()
+        let _ = this.executionExecutor.stopAccepting()
+    }
+
+    /**
+     * 固定 shutdown 顺序：停止接单、协作取消、有界 drain、短锁收割并 fence 迟到结果。
+     * 通道和 Gateway 必须在该函数返回后再 teardown。
+     */
+    public func stop(reason!: String = "gateway_shutdown", drainTimeoutMs!: Int64 = 5000): CronRunnerStopResult {
+        let initial = this.executionExecutor.stopAccepting()
+        gatewayLogEventInfo(
+            "gateway/cron",
+            "cron.drain_started",
+            "cron executor drain started",
+            meta: gatewayLogMeta().int("activeCount", initial.activeCount).int("timeoutMs", drainTimeoutMs).object()
+        )
+        let _ = this.executionExecutor.cancelAll(reason: reason)
+        let drained = this.executionExecutor.awaitDrain(drainTimeoutMs)
+        let completed = this.executionExecutor.drainCompleted()
+        var committed = Array<CronExecutionResult>()
+        synchronized(this.tickLock) {
+            committed = this.drainAndCommitCompleted(completed)
+            this.fenceUnresolvedExecutions(reason)
+            this.reloadJobsFromDisk()
+        }
+        for (result in committed) {
+            try {
+                this.settleCompletionSideEffects(result)
+                this.cacheManualCompletion(result)
+            } catch (e: Exception) {
+                gatewayLogEventError(
+                    "gateway/cron",
+                    "cron.run_log_failed",
+                    "cron shutdown completion side effects failed",
+                    meta: gatewayLogMeta().string("jobId", result.executionId.jobId).rawString("error", e.message).object()
+                )
+            }
+        }
+        let event = if (drained.drained) { "cron.drain_completed" } else { "cron.drain_timed_out" }
+        gatewayLogEventInfo(
+            "gateway/cron",
+            event,
+            if (drained.drained) { "cron executor drain completed" } else { "cron executor drain timed out" },
+            meta: gatewayLogMeta().int("activeCount", drained.activeExecutionIds.size).object()
+        )
+        CronRunnerStopResult(drained.drained, drained.activeExecutionIds.size)
     }
 
     /** 测试/同步兼容入口使用显式条件等待，不持有 tickLock。 */
@@ -421,10 +494,16 @@ public class CronRunner {
     }
 
     private func clearStuckRunningMarkers(now: Int64): Bool {
+        let active = this.executionExecutor.lifecycleSnapshot().executionIds
         var changed = false
         for (j in this.jobs) {
             let r = j.state.runningAtMs
-            if (r > 0 && now - r > STUCK_RUN_MS) {
+            var owned = false
+            for (identity in active) {
+                if (identity == j.state.executionId) { owned = true }
+            }
+            let heartbeat = if (j.state.executionHeartbeatAtMs > 0) { j.state.executionHeartbeatAtMs } else { r }
+            if (r > 0 && !owned && now - heartbeat > STUCK_RUN_MS) {
                 gatewayLogEventInfo(
                     "gateway/cron",
                     "cron.skipped",
@@ -432,6 +511,9 @@ public class CronRunner {
                     meta: gatewayLogMeta().string("jobId", j.id).int("runningAtMs", r).object()
                 )
                 j.state.runningAtMs = 0
+                j.state.executionId = ""
+                j.state.executionStartedAtMs = 0
+                j.state.executionHeartbeatAtMs = 0
                 changed = true
             }
         }
@@ -443,10 +525,101 @@ public class CronRunner {
         if (r <= 0) {
             return false
         }
-        if (now - r > STUCK_RUN_MS) {
+        let heartbeat = if (j.state.executionHeartbeatAtMs > 0) { j.state.executionHeartbeatAtMs } else { r }
+        if (now - heartbeat > STUCK_RUN_MS) {
             return false
         }
         true
+    }
+
+    /** 将 active registry 的 heartbeat 以 compare-by-executionId 方式合并到 store。 */
+    private func heartbeatActiveExecutions(now: Int64): Unit {
+        let active = this.executionExecutor.lifecycleSnapshot().executionIds
+        if (active.isEmpty()) { return }
+        let envelope = cronLoadStoreOrEmpty(this.storePath)
+        var changed = false
+        for (job in envelope.jobs) {
+            for (identity in active) {
+                if (job.state.executionId == identity && job.state.executionHeartbeatAtMs < now) {
+                    job.state.executionHeartbeatAtMs = now
+                    changed = true
+                }
+            }
+        }
+        if (changed) {
+            cronSaveStoreAtomic(this.storePath, envelope)
+        }
+    }
+
+    /**
+     * 启动恢复不重跑已 claim execution。recurring 推进到 backoff 后的下一次，
+     * one-shot 直接形成 interrupted 终态；run-log 由 durable marker 补偿。
+     */
+    private func recoverInterruptedExecutions(): Unit {
+        let envelope = cronLoadStoreOrEmpty(this.storePath)
+        var changed = false
+        let now = epochMs()
+        for (entry in envelope.journal) {
+            if (entry.phase != "reserved" && entry.phase != "executing") { continue }
+            for (job in envelope.jobs) {
+                if (job.id != entry.jobId || job.state.executionId != entry.executionId) { continue }
+                job.state.runningAtMs = 0
+                job.state.executionId = ""
+                job.state.executionStartedAtMs = 0
+                job.state.executionHeartbeatAtMs = 0
+                job.state.lastRunAtMs = entry.reservedAtMs
+                job.state.lastStatus = "interrupted"
+                job.state.lastError = "interrupted_on_restart"
+                job.state.consecutiveErrors += 1
+                if (job.schedule.kind.trimAscii().toAsciiLower() == "at") {
+                    job.enabled = false
+                    job.state.nextRunAtMs = 0
+                } else {
+                    match (computeJobNextRun(job, now)) {
+                        case Some(next) => job.state.nextRunAtMs = max(next, now + cronErrorBackoffMs(job.state.consecutiveErrors))
+                        case None => job.state.nextRunAtMs = now + cronErrorBackoffMs(job.state.consecutiveErrors)
+                    }
+                }
+                entry.terminalKind = "interrupted"
+                let _ = entry.transition("result_committed", now)
+                changed = true
+            }
+        }
+        if (changed) {
+            cronSaveStoreAtomic(this.storePath, envelope)
+        }
+    }
+
+    /** drain timeout 后清 owner marker，确保任何迟到 completion 都无法 compare-and-commit。 */
+    private func fenceUnresolvedExecutions(reason: String): Unit {
+        let envelope = cronLoadStoreOrEmpty(this.storePath)
+        var changed = false
+        let now = epochMs()
+        for (job in envelope.jobs) {
+            if (job.state.executionId.isEmpty()) { continue }
+            let identity = job.state.executionId
+            job.state.runningAtMs = 0
+            job.state.executionId = ""
+            job.state.executionStartedAtMs = 0
+            job.state.executionHeartbeatAtMs = 0
+            job.state.lastRunAtMs = now
+            job.state.lastStatus = "interrupted"
+            job.state.lastError = if (reason.trimAscii().isEmpty()) { "gateway_shutdown" } else { reason.trimAscii() }
+            if (job.schedule.kind.trimAscii().toAsciiLower() == "at") {
+                job.enabled = false
+                job.state.nextRunAtMs = 0
+            }
+            for (entry in envelope.journal) {
+                if (entry.executionId == identity && (entry.phase == "reserved" || entry.phase == "executing")) {
+                    entry.terminalKind = "interrupted"
+                    let _ = entry.transition("result_committed", now)
+                }
+            }
+            changed = true
+        }
+        if (changed) {
+            cronSaveStoreAtomic(this.storePath, envelope)
+        }
     }
 
     /**
@@ -1422,7 +1595,7 @@ public class CronRunner {
         if (!matched) {
             gatewayLogEventWarn(
                 "gateway/cron",
-                "cron.skipped",
+                "cron.stale_result",
                 "ignored stale cron completion",
                 meta: gatewayLogMeta().string("jobId", result.executionId.jobId).object()
             )
@@ -1485,6 +1658,30 @@ public class CronRunner {
         for (job in envelope.jobs) {
             this.jobs.add(job)
         }
+        let terminalEvent = if (result.artifact.status == "timeout") {
+            "cron.timed_out"
+        } else if (result.artifact.status == "cancelled") {
+            "cron.cancelled"
+        } else {
+            "cron.completed"
+        }
+        gatewayLogEventInfo(
+            "gateway/cron",
+            terminalEvent,
+            "cron execution reached terminal state",
+            meta: gatewayLogMeta()
+                .string("jobId", result.executionId.jobId)
+                .string("status", result.artifact.status)
+                .int(
+                    "durationMs",
+                    if (result.artifact.endedAtMs >= result.executionId.startedAtMs) {
+                        result.artifact.endedAtMs - result.executionId.startedAtMs
+                    } else {
+                        0
+                    }
+                )
+                .object()
+        )
     }
 
     private func drainAndCommitCompleted(results: Array<CronExecutionResult>): Array<CronExecutionResult> {
@@ -1965,6 +2162,15 @@ public class CronRunner {
         }
         this.recoverPendingDeliveryIntents()
         if (!this.executionExecutor.tryAcquireSlot()) {
+            gatewayLogEventInfo(
+                "gateway/cron",
+                "cron.queue_saturated",
+                "cron execution deferred because all bounded slots are active",
+                meta: gatewayLogMeta()
+                    .string("jobId", jobId)
+                    .int("activeCount", this.executionExecutor.activeCount())
+                    .object()
+            )
             return CronExecutionReservation("deferred")
         }
         synchronized(this.tickLock) {
@@ -2046,6 +2252,12 @@ public class CronRunner {
                             id,
                             snapshot,
                             { executionJob =>
+                                gatewayLogEventInfo(
+                                    "gateway/cron",
+                                    "cron.started",
+                                    "cron worker started",
+                                    meta: gatewayLogMeta().string("jobId", executionJob.id).object()
+                                )
                                 this.fireSingleJob(
                                     executionJob,
                                     now,
@@ -2062,11 +2274,10 @@ public class CronRunner {
                         )
                         gatewayLogEventInfo(
                             "gateway/cron",
-                            "cron.started",
-                            "cron execution reserved",
+                            "cron.queued",
+                            "cron execution reserved and queued",
                             meta: gatewayLogMeta()
                                 .string("jobId", job.id)
-                                .string("trigger", trigger)
                                 .object()
                         )
                         return CronExecutionReservation("reserved", executionId: identity, task: Some(task))
@@ -2108,6 +2319,12 @@ public class CronRunner {
                     this.rollbackReservation(task.executionId.jobId, reservation.executionId)
                     this.reloadJobsFromDisk()
                 }
+                gatewayLogEventWarn(
+                    "gateway/cron",
+                    "cron.deferred",
+                    "cron reserved execution could not be submitted",
+                    meta: gatewayLogMeta().string("jobId", task.executionId.jobId).object()
+                )
                 "submit-failed"
         }
     }
@@ -2229,6 +2446,8 @@ public class CronRunner {
             case Some(t) => t
             case None => epochMs()
         }
+        this.reloadJobsFromDisk()
+        this.heartbeatActiveExecutions(now)
         this.reloadJobsFromDisk()
         var preChanged = this.clearStuckRunningMarkers(now)
         if (this.applyStartupMissedJobStaggerIfNeeded(now)) {

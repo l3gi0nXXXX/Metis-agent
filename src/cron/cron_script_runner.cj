@@ -203,20 +203,42 @@ public func runCronJobScriptForJob(
             cronScriptReadPipe(StringReader<InputStream>(process.stdErrPipe), "stderr")
         }
         let effectiveTimeoutMs = min(CRON_SCRIPT_TIMEOUT_MS, remainingMs)
-        let exitCode = try {
-            process.wait(timeout: Duration.millisecond * effectiveTimeoutMs)
-        } catch (_: TimeoutException) {
-            try { process.terminate(force: true) } catch (_: Exception) { () }
-            try { let _ = process.wait(timeout: Duration.second) } catch (_: Exception) { () }
-            try { stdoutFuture.get() } catch (_: Exception) { () }
-            try { stderrFuture.get() } catch (_: Exception) { () }
-            return CronScriptRunResult(
-                false,
-                status: "timeout",
-                errorCode: "cron_script_timeout",
-                timedOut: true,
-                message: "cron script timed out after ${effectiveTimeoutMs}ms"
-            )
+        let beganAtMs = DateTime.now().toUnixTimeStamp().toMilliseconds()
+        var exitCode: Int64 = 0
+        var exited = false
+        while (!exited) {
+            try {
+                exitCode = process.wait(timeout: Duration.millisecond * min(25, effectiveTimeoutMs))
+                exited = true
+            } catch (_: TimeoutException) {
+                try {
+                    cancellationCheck()
+                } catch (cancelled: Exception) {
+                    try { process.terminate(force: true) } catch (_: Exception) { () }
+                    try { let _ = process.wait(timeout: Duration.second) } catch (_: Exception) { () }
+                    try { stdoutFuture.get() } catch (_: Exception) { () }
+                    try { stderrFuture.get() } catch (_: Exception) { () }
+                    return CronScriptRunResult(
+                        false,
+                        status: "cancelled",
+                        errorCode: "cron_script_cancelled",
+                        message: cancelled.message
+                    )
+                }
+                if (DateTime.now().toUnixTimeStamp().toMilliseconds() - beganAtMs >= effectiveTimeoutMs) {
+                    try { process.terminate(force: true) } catch (_: Exception) { () }
+                    try { let _ = process.wait(timeout: Duration.second) } catch (_: Exception) { () }
+                    try { stdoutFuture.get() } catch (_: Exception) { () }
+                    try { stderrFuture.get() } catch (_: Exception) { () }
+                    return CronScriptRunResult(
+                        false,
+                        status: "timeout",
+                        errorCode: "cron_script_timeout",
+                        timedOut: true,
+                        message: "cron script timed out after ${effectiveTimeoutMs}ms"
+                    )
+                }
+            }
         }
         try {
             cancellationCheck()

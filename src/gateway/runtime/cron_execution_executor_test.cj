@@ -53,6 +53,86 @@ private func cronExecutorTestTask(
 @Test
 public class CronExecutionExecutorTest {
     @TestCase
+    public func m4U1StopCancelAndDrainOwnTwoActiveContexts(): Unit {
+        let executor = CronExecutionExecutor(maxConcurrentRuns: 2)
+        let exited = AtomicBool(false)
+        let controlA = CronExecutionControl(Int64.Max)
+        let controlB = CronExecutionControl(Int64.Max)
+        executor.start()
+        for (pair in [("shutdown-a", controlA), ("shutdown-b", controlB)]) {
+            @Expect(executor.tryAcquireSlot(), true)
+            let task = CronExecutionTask(
+                CronExecutionId(pair[0], 1, 2),
+                cronExecutorTestJob(pair[0]),
+                { _job =>
+                    while (!pair[1].isCancelled()) { sleep(Duration.millisecond * 2) }
+                    exited.store(true)
+                    CronExecutionArtifact(status: "cancelled")
+                },
+                executionControl: Some(pair[1])
+            )
+            @Expect(executor.submitReserved(task), true)
+        }
+        @Expect(awaitCronExecutorTest({ => executor.activeCount() == 2 }), true)
+        let stopped = executor.stopAccepting()
+        @Expect(stopped.activeCount, 2)
+        @Expect(executor.tryAcquireSlot(), false)
+        let cancelled = executor.cancelAll()
+        @Expect(cancelled.executionIds.size, 2)
+        let drain = executor.awaitDrain(2000)
+        @Expect(drain.drained, true)
+        @Expect(drain.timedOut, false)
+        @Expect(exited.load(), true)
+        @Expect(executor.activeCount(), 0)
+    }
+
+    @TestCase
+    public func m4B1NonCooperativeWorkerMakesDrainTimeoutWithoutFakeActiveZero(): Unit {
+        let executor = CronExecutionExecutor()
+        let release = AtomicBool(false)
+        executor.start()
+        @Expect(executor.tryAcquireSlot(), true)
+        @Expect(executor.submitReserved(cronExecutorTestTask("noncooperative", { _job =>
+            while (!release.load()) { sleep(Duration.millisecond * 2) }
+        })), true)
+        @Expect(awaitCronExecutorTest({ => executor.activeCount() == 1 }), true)
+        let _ = executor.cancelAll()
+        let drain = executor.awaitDrain(10)
+        @Expect(drain.drained, false)
+        @Expect(drain.timedOut, true)
+        @Expect(drain.activeExecutionIds.size, 1)
+        @Expect(executor.activeCount(), 1)
+        release.store(true)
+        @Expect(executor.awaitDrain(2000).drained, true)
+    }
+
+    @TestCase
+    public func m4P1CooperativeCancelRunsFakeChildCleanupAndLeavesNoPidOrActiveHandle(): Unit {
+        let executor = CronExecutionExecutor()
+        let fakeChildPid = CronExecutorFakeClock(4242)
+        let control = CronExecutionControl(Int64.Max)
+        executor.start()
+        @Expect(executor.tryAcquireSlot(), true)
+        @Expect(executor.submitReserved(CronExecutionTask(
+            CronExecutionId("fake-child-中文-😀", 1, 2),
+            cronExecutorTestJob("fake-child-中文-😀"),
+            { _job =>
+                while (!control.isCancelled()) { sleep(Duration.millisecond * 2) }
+                CronExecutionArtifact(status: "cancelled")
+            },
+            executionControl: Some(control),
+            cleanupTask: { => fakeChildPid.now = 0 }
+        )), true)
+        @Expect(awaitCronExecutorTest({ => executor.activeCount() == 1 }), true)
+        let _ = executor.stopAccepting()
+        let _ = executor.cancelAll(reason: "gateway_shutdown")
+        let drain = executor.awaitDrain(2000)
+        @Expect(drain.drained, true)
+        @Expect(fakeChildPid.now, 0)
+        @Expect(executor.activeCount(), 0)
+    }
+
+    @TestCase
     public func m3U1RemainingHeartbeatAndFirstCancelReasonAreStable(): Unit {
         let clock = CronExecutorFakeClock(1000)
         let control = CronExecutionControl(2000, idleTimeoutMs: 200, nowMs: { => clock.now })

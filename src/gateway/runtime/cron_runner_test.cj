@@ -30,18 +30,27 @@ import metis.cron.{
     readCronRunLogEntriesForJob,
     setCronWebhookHttpRunnerForTest
 }
-import metis.gateway.core.{ChannelAdapter, GatewayRouter, GatewayService, setGatewayAgentBridgeReplyRunnerForTest}
+import metis.gateway.core.{
+    ChannelAdapter,
+    GatewayRouter,
+    GatewayService,
+    gatewayLogEventInfo,
+    gatewayLogMeta,
+    setGatewayAgentBridgeReplyRunnerForTest
+}
+import metis.gateway.logging.gatewayLoggingResetForTest
 import metis.gateway.model.{ChannelPolicyConfig, ChannelType, ChatType, InboundMessage, OutboundMessage, SendResult}
 import metis.gateway.session.{GatewayIngressSource, GatewaySessionRequest, GatewayTurnContext, gatewayIngressSourceLabel}
 
 import std.collection.{ArrayList, HashMap}
 import std.core.Duration
 import std.env.{getVariable, setVariable}
-import std.fs.{Directory, File, Path, remove}
+import std.fs.{Directory, File, Path, exists, remove}
+import std.process.launch
 import std.sync.{AtomicBool, Condition, Mutex}
 import std.time.DateTime
 import std.unittest.testmacro.*
-import stdx.encoding.json.{JsonInt, JsonObject, JsonString}
+import stdx.encoding.json.{JsonInt, JsonObject, JsonString, JsonValue}
 
 private func withCronRunnerTestHome<T>(block: (Path) -> T): T {
     synchronized(MetisProcessEnvironmentLock) {
@@ -88,6 +97,301 @@ private func withCronRunnerTestHome<T>(block: (Path) -> T): T {
 
 @Test
 public class CronRunnerManualIdentityTest {
+    @TestCase
+    public func m4N1StartupRecoveryNeverBlindlyReplaysClaimedOneShotAndBacksOffRecurring(): Unit {
+        withCronRunnerTestHome({ storePath =>
+            let one = cronRunnerTestJob("recover-one")
+            one.schedule = CronSchedule.at(100)
+            one.state.runningAtMs = 100
+            one.state.executionId = "recover-one:100:100"
+            one.state.executionHeartbeatAtMs = 100
+            let recurring = cronRunnerTestJob("recover-recurring")
+            recurring.state.runningAtMs = 100
+            recurring.state.executionId = "recover-recurring:100:100"
+            recurring.state.executionHeartbeatAtMs = 100
+            cronSaveStoreAtomic(storePath, CronStoreEnvelope(
+                jobs: [one, recurring],
+                journal: [
+                    CronExecutionJournalEntry("recover-one:100:100", one.id, phase: "reserved", reservedAtMs: 100),
+                    CronExecutionJournalEntry("recover-recurring:100:100", recurring.id, phase: "executing", reservedAtMs: 100)
+                ]
+            ))
+            let runner = CronRunner(storePath: storePath, cronEnabled: false)
+            runner.start()
+            let after = cronLoadStoreOrEmpty(storePath)
+            @Expect(after.jobs[0].enabled, false)
+            @Expect(after.jobs[0].state.nextRunAtMs, 0)
+            @Expect(after.jobs[0].state.lastStatus, "interrupted")
+            @Expect(after.jobs[1].enabled, true)
+            @Expect(after.jobs[1].state.nextRunAtMs > DateTime.now().toUnixTimeStamp().toMilliseconds(), true)
+            @Expect(after.journal[0].terminalKind, "interrupted")
+            @Expect(after.journal[1].terminalKind, "interrupted")
+        })
+    }
+
+    @TestCase
+    public func m4B1RunnerStopFencesLateNonCooperativeCompletion(): Unit {
+        withCronRunnerTestHome({ storePath =>
+            cronSave(storePath, [cronRunnerTestJob("m4-late-fence")])
+            let release = AtomicBool(false)
+            let entered = AtomicBool(false)
+            debugSetCronRunnerBeforeExecuteForTest(Some({ _job =>
+                entered.store(true)
+                while (!release.load()) { sleep(Duration.millisecond * 2) }
+            }))
+            debugSetCronRunnerReplyForTest(Some({ _job, _request => "late-success-must-not-commit" }))
+            let runner = CronRunner(storePath: storePath)
+            @Expect(runner.enqueueJobManual("m4-late-fence", true).get("enqueued").getOrThrow().asBool().getValue(), true)
+            let began = DateTime.now().toUnixTimeStamp().toMilliseconds()
+            while (!entered.load() && DateTime.now().toUnixTimeStamp().toMilliseconds() - began < 2000) {
+                sleep(Duration.millisecond * 2)
+            }
+            @Expect(entered.load(), true)
+            let stopped = runner.stop(drainTimeoutMs: 10)
+            @Expect(stopped.timedOut, true)
+            @Expect(stopped.activeCount, 1)
+            let fenced = cronLoadOrEmpty(storePath)[0]
+            @Expect(fenced.state.lastStatus, "interrupted")
+            @Expect(fenced.state.executionId, "")
+            release.store(true)
+            @Expect(runner.waitUntilIdle(timeoutMs: 2000), true)
+            runner.tick()
+            let after = cronLoadOrEmpty(storePath)[0]
+            @Expect(after.state.lastStatus, "interrupted")
+            @Expect(after.state.executionId, "")
+            let runs = readCronRunLogEntriesForJob(storePath, "m4-late-fence")
+            @Expect(runs.get("total").getOrThrow().asInt().getValue(), 1)
+            @Expect(
+                runs.get("entries").getOrThrow().asArray()[0].asObject().get("status").getOrThrow().asString().getValue(),
+                "interrupted"
+            )
+        })
+    }
+
+    @TestCase
+    public func m4P1RunnerStopTerminatesRealTempScriptChildPidWithoutLateMarker(): Unit {
+        withCronRunnerTestHome({ storePath: Path =>
+            let scripts = cronScriptsDir(CliConfig.dotDir)
+            Directory.create(scripts, recursive: true)
+            let pidFile = scripts.join("m4-child.pid")
+            let lateFile = scripts.join("m4-late-marker")
+            File.writeTo(
+                scripts.join("m4-child.sh"),
+                "printf '%s' $$ > '${pidFile.toString()}'\nsleep 30\nprintf late > '${lateFile.toString()}'\n".toArray()
+            )
+            let job = cronRunnerTestJob("m4-real-child")
+            job.scriptPath = "m4-child.sh"
+            job.scriptMode = "noAgent"
+            job.timeoutMs = 60000
+            cronSave(storePath, [job])
+            let runner = CronRunner(storePath: storePath)
+            @Expect(runner.enqueueJobManual(job.id, true).get("enqueued").getOrThrow().asBool().getValue(), true)
+            let began = DateTime.now().toUnixTimeStamp().toMilliseconds()
+            while (!exists(pidFile) && DateTime.now().toUnixTimeStamp().toMilliseconds() - began < 2000) {
+                sleep(Duration.millisecond * 5)
+            }
+            @Expect(exists(pidFile), true)
+            let childPid = String.fromUtf8(File.readFrom(pidFile)).trimAscii()
+            @Expect(childPid.isEmpty(), false)
+            let stopped = runner.stop(drainTimeoutMs: 2000)
+            @Expect(stopped.drained, true)
+            @Expect(stopped.activeCount, 0)
+            let probe = launch("/bin/sh", ["-c", "kill -0 ${childPid} >/dev/null 2>&1"])
+            @Expect(probe.wait(), 1)
+            @Expect(exists(lateFile), false)
+            @Expect(runner.activeExecutionCount(), 0)
+        })
+    }
+
+    @TestCase
+    public func m4B2EveryJournalPhaseRecoversMonotonicallyAcrossTwoRestarts(): Unit {
+        for (phase in ["reserved", "executing", "result_committed", "delivery_pending", "delivery_settled", "logged"]) {
+            withCronRunnerTestHome({ storePath =>
+                let job = cronRunnerTestJob("m4-phase-${phase}")
+                job.state.lastStatus = if (phase == "reserved" || phase == "executing") { "" } else { "success" }
+                if (phase == "reserved" || phase == "executing") {
+                    job.state.runningAtMs = 100
+                    job.state.executionId = "${job.id}:100:100"
+                    job.state.executionHeartbeatAtMs = 100
+                }
+                if (phase == "logged") {
+                    appendCronRunLog(
+                        storePath,
+                        job.id,
+                        "success",
+                        100,
+                        200,
+                        executionId: "${job.id}:100:100"
+                    )
+                }
+                cronSaveStoreAtomic(storePath, CronStoreEnvelope(
+                    jobs: [job],
+                    journal: [CronExecutionJournalEntry(
+                        "${job.id}:100:100",
+                        job.id,
+                        phase: phase,
+                        reservedAtMs: 100,
+                        updatedAtMs: 200,
+                        runLogRecorded: phase == "logged"
+                    )]
+                ))
+                CronRunner(storePath: storePath, cronEnabled: false).tick()
+                CronRunner(storePath: storePath, cronEnabled: false).tick()
+                let after = cronLoadStoreOrEmpty(storePath)
+                @Expect(after.journal[0].phase, "logged")
+                @Expect(after.journal[0].runLogRecorded, true)
+                @Expect(readCronRunLogEntriesForJob(storePath, job.id).get("total").getOrThrow().asInt().getValue(), 1)
+            })
+        }
+    }
+
+    @TestCase
+    public func m4P2ResultCommittedRunLogCompensationWritesExactlyOnce(): Unit {
+        withCronRunnerTestHome({ storePath =>
+            let job = cronRunnerTestJob("m4-runlog-compensate")
+            job.state.lastStatus = "success"
+            cronSaveStoreAtomic(storePath, CronStoreEnvelope(
+                jobs: [job],
+                journal: [CronExecutionJournalEntry(
+                    "m4-runlog-compensate:1:2", job.id,
+                    phase: "result_committed", reservedAtMs: 1, updatedAtMs: 2
+                )]
+            ))
+            CronRunner(storePath: storePath, cronEnabled: false).tick()
+            @Expect(readCronRunLogEntriesForJob(storePath, job.id).get("total").getOrThrow().asInt().getValue(), 1)
+            CronRunner(storePath: storePath, cronEnabled: false).tick()
+            @Expect(readCronRunLogEntriesForJob(storePath, job.id).get("total").getOrThrow().asInt().getValue(), 1)
+            @Expect(cronLoadStoreOrEmpty(storePath).journal[0].phase, "logged")
+        })
+    }
+
+    @TestCase
+    public func m4N2RunLogFailureKeepsBusinessTerminalAndRemainsRecoverable(): Unit {
+        withCronRunnerTestHome({ storePath =>
+            let job = cronRunnerTestJob("m4-runlog-failure")
+            job.state.lastStatus = "success"
+            cronSaveStoreAtomic(storePath, CronStoreEnvelope(
+                jobs: [job],
+                journal: [CronExecutionJournalEntry(
+                    "m4-runlog-failure:1:2", job.id,
+                    phase: "result_committed", reservedAtMs: 1, updatedAtMs: 2
+                )]
+            ))
+            debugSetCronRunnerRunLogAppendForTest(Some({ => throw Exception("Authorization: Bearer hidden") }))
+            CronRunner(storePath: storePath, cronEnabled: false).tick()
+            let failed = cronLoadStoreOrEmpty(storePath)
+            @Expect(failed.jobs[0].state.lastStatus, "success")
+            @Expect(failed.journal[0].runLogRecorded, false)
+            debugSetCronRunnerRunLogAppendForTest(None<() -> Unit>)
+            CronRunner(storePath: storePath, cronEnabled: false).tick()
+            @Expect(cronLoadStoreOrEmpty(storePath).journal[0].runLogRecorded, true)
+        })
+    }
+
+    @TestCase
+    public func m4N3UnknownDeliveryNeverResendsAndHumanStatusIsNotRawJson(): Unit {
+        withCronRunnerTestHome({ storePath =>
+            let job = cronRunnerTestJob("m4-delivery-unknown")
+            cronSaveStoreAtomic(storePath, CronStoreEnvelope(
+                jobs: [job],
+                journal: [
+                    CronExecutionJournalEntry(
+                        "m4-flight", job.id, phase: "delivery_pending",
+                        deliveryReceipts: [CronDeliveryReceipt("feishu", status: "in_flight")]
+                    ),
+                    CronExecutionJournalEntry(
+                        "m4-unknown", job.id, phase: "delivery_pending",
+                        deliveryReceipts: [CronDeliveryReceipt("telegram", status: "unknown")]
+                    )
+                ]
+            ))
+            let sends = JsonObject()
+            sends.put("count", JsonInt(0))
+            debugSetCronRunnerDeliveryForTest(Some({ =>
+                sends.put("count", JsonInt(sends.get("count").getOrThrow().asInt().getValue() + 1))
+            }))
+            CronRunner(storePath: storePath, cronEnabled: false).tick()
+            @Expect(sends.get("count").getOrThrow().asInt().getValue(), 0)
+            let after = cronLoadStoreOrEmpty(storePath)
+            @Expect(after.journal[0].deliveryReceipts[0].status, "unknown")
+            @Expect(after.journal[1].deliveryReceipts[0].status, "unknown")
+            let rendered = gatewayFormatCommandOutput(
+                "{\"ok\":true,\"method\":\"cron.status\",\"result\":{\"running\":0,\"delivery\":\"unknown\"}}"
+            )
+            @Expect(rendered.startsWith("{"), false)
+            @Expect(rendered.contains("\"delivery\""), false)
+        })
+    }
+
+    @TestCase
+    public func m4LoggingMatrixIsJsonlRedactedRuneSafeAndMetaAllowlisted(): Unit {
+        withCronRunnerTestHome({ storePath: Path =>
+            let logPath = storePath.parent.join("m4-cron-events.jsonl")
+            let oldLevel = getVariable("METIS_LOG_LEVEL")
+            let oldFile = getVariable("METIS_LOG_FILE")
+            try {
+                setVariable("METIS_LOG_LEVEL", "info")
+                setVariable("METIS_LOG_FILE", logPath.toString())
+                gatewayLoggingResetForTest()
+                let secret = "Authorization: Bearer sk-or-v1-secret /Users/private/secret " +
+                    "中文😀中文😀中文😀中文😀"
+                for (event in cronLifecycleLogEventNames()) {
+                    gatewayLogEventInfo(
+                        "gateway/cron",
+                        event,
+                        "cron lifecycle event",
+                        meta: gatewayLogMeta()
+                            .string("jobId", "任务-😀")
+                            .string("executionHash", "hash-only")
+                            .string("status", "cancelled")
+                            .int("durationMs", 1)
+                            .int("timeoutMs", 2)
+                            .int("queueCount", 0)
+                            .int("activeCount", 0)
+                            .rawString("errorKind", secret)
+                            .object()
+                    )
+                }
+                let text = String.fromUtf8(File.readFrom(logPath))
+                @Expect(text.contains("sk-or-v1-secret"), false)
+                @Expect(text.contains("/Users/private/secret"), false)
+                @Expect(text.contains("中文"), true)
+                let seen = ArrayList<String>()
+                for (line in text.split("\n")) {
+                    let trimmed = line.trimAscii()
+                    if (trimmed.isEmpty()) { continue }
+                    let row = JsonValue.fromStr(trimmed).asObject()
+                    @Expect(row.get("subsystem").getOrThrow().asString().getValue(), "gateway/cron")
+                    let event = row.get("event").getOrThrow().asString().getValue()
+                    @Expect(cronLifecycleLogEventNames().contains(event), true)
+                    seen.add(event)
+                    for (key in row.getFields().keys()) {
+                        let baseField = key == "time" || key == "level" || key == "subsystem" ||
+                            key == "event" || key == "message"
+                        @Expect(baseField || cronLifecycleLogAllowedMetaFields().contains(key), true)
+                    }
+                }
+                @Expect(seen.size, cronLifecycleLogEventNames().size)
+                for (event in cronLifecycleLogEventNames()) {
+                    @Expect(seen.contains(event), true)
+                }
+                for (field in cronLifecycleLogAllowedMetaFields()) {
+                    @Expect(text.contains("\"${field}\":"), true)
+                }
+            } finally {
+                match (oldLevel) {
+                    case Some(value) => setVariable("METIS_LOG_LEVEL", value)
+                    case None => setVariable("METIS_LOG_LEVEL", "")
+                }
+                match (oldFile) {
+                    case Some(value) => setVariable("METIS_LOG_FILE", value)
+                    case None => setVariable("METIS_LOG_FILE", "")
+                }
+                gatewayLoggingResetForTest()
+            }
+        })
+    }
+
     @TestCase
     public func m2U1TimerAndManualReservationShareExecutionIdentity(): Unit {
         withCronRunnerTestHome({ storePath =>

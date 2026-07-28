@@ -113,6 +113,8 @@ public class CronExecutionJournalEntry {
     public var updatedAtMs: Int64
     /** 只允许保存摘要 hash/稳定标识，禁止保存 prompt、token、路径或 payload。 */
     public var businessOutcomeHash: String
+    /** 不含错误正文的稳定终态分类，例如 success/error/interrupted。 */
+    public var terminalKind: String
     /** 可恢复的 run-log marker；true 表示该 execution 的终态行已确认写入。 */
     public var runLogRecorded: Bool
     public var deliveryReceipts: Array<CronDeliveryReceipt>
@@ -125,6 +127,7 @@ public class CronExecutionJournalEntry {
         reservedAtMs!: Int64 = 0,
         updatedAtMs!: Int64 = 0,
         businessOutcomeHash!: String = "",
+        terminalKind!: String = "",
         runLogRecorded!: Bool = false,
         deliveryReceipts!: Array<CronDeliveryReceipt> = [],
         deliveryArtifactRef!: String = ""
@@ -141,6 +144,7 @@ public class CronExecutionJournalEntry {
         this.reservedAtMs = reservedAtMs
         this.updatedAtMs = updatedAtMs
         this.businessOutcomeHash = businessOutcomeHash
+        this.terminalKind = terminalKind
         this.runLogRecorded = runLogRecorded
         this.deliveryReceipts = deliveryReceipts
         this.deliveryArtifactRef = deliveryArtifactRef
@@ -239,6 +243,7 @@ public func cronExecutionJournalFromJson(value: JsonValue): Array<CronExecutionJ
                         reservedAtMs: cronJournalReadI64(obj, "reservedAtMs"),
                         updatedAtMs: cronJournalReadI64(obj, "updatedAtMs"),
                         businessOutcomeHash: cronJournalReadStr(obj, "businessOutcomeHash"),
+                        terminalKind: cronJournalReadStr(obj, "terminalKind"),
                         runLogRecorded: match (obj.get("runLogRecorded")) {
                             case Some(v) => try { v.asBool().getValue() } catch (_: Exception) { false }
                             case None => false
@@ -267,6 +272,7 @@ public func cronExecutionJournalToJson(entries: Array<CronExecutionJournalEntry>
         row.put("reservedAtMs", JsonInt(entry.reservedAtMs))
         row.put("updatedAtMs", JsonInt(entry.updatedAtMs))
         row.put("businessOutcomeHash", JsonString(entry.businessOutcomeHash))
+        row.put("terminalKind", JsonString(entry.terminalKind))
         row.put("runLogRecorded", JsonBool(entry.runLogRecorded))
         let receipts = ArrayList<JsonValue>()
         for (receipt in entry.deliveryReceipts) {
