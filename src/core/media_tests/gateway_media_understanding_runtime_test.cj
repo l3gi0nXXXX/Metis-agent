@@ -126,7 +126,7 @@ private class GatewayImageRuntimeProviderErrorFakeModel <: ChatModel {
 private func mediaAsrTestProvider(text: String): JsonObject {
     let provider = JsonObject()
     provider.put("kind", JsonString("command"))
-    provider.put("command", JsonArray([JsonString("sh"), JsonString("-c"), JsonString("printf '${text}'")]))
+    provider.put("command", JsonArray([JsonString("printf"), JsonString("%s"), JsonString(text)]))
     return provider
 }
 
@@ -183,6 +183,19 @@ private func mediaAsrInt(obj: JsonObject, key: String): Int64 {
 
 @Test
 public class GatewayMediaUnderstandingRuntimeTest {
+    @BeforeAll
+    public func installCommandProviderFake(): Unit {
+        setGatewaySpeechAsrCommandRunnerForTest(Some({ command: Array<String>, _timeoutMs: Int64 =>
+            let transcript = if (command.size >= 3) { command[2] } else { "" }
+            (0, transcript, "")
+        }))
+    }
+
+    @AfterAll
+    public func clearCommandProviderFake(): Unit {
+        setGatewaySpeechAsrCommandRunnerForTest(None<(Array<String>, Int64) -> (Int64, String, String)>)
+    }
+
     @TestCase
     public func recordTranscriptStaysAheadOfConfiguredAsrProvider(): Unit {
         let root = mediaAsrTestTempRoot("record")

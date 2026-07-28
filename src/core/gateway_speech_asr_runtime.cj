@@ -40,9 +40,15 @@ private class SpeechAsrOpenAICompatibleException <: Exception {
 
 private var speechAsrOpenAICompatibleRunnerOverride: Option<(JsonObject) -> GatewaySpeechAsrOpenAICompatibleHttpResult> =
     None<(JsonObject) -> GatewaySpeechAsrOpenAICompatibleHttpResult>
+private var speechAsrCommandRunnerOverride: Option<(Array<String>, Int64) -> (Int64, String, String)> =
+    None<(Array<String>, Int64) -> (Int64, String, String)>
 
 public func setGatewaySpeechAsrOpenAICompatibleRunnerForTest(runner: Option<(JsonObject) -> GatewaySpeechAsrOpenAICompatibleHttpResult>): Unit {
     speechAsrOpenAICompatibleRunnerOverride = runner
+}
+
+public func setGatewaySpeechAsrCommandRunnerForTest(runner: Option<(Array<String>, Int64) -> (Int64, String, String)>): Unit {
+    speechAsrCommandRunnerOverride = runner
 }
 
 private func speechAsrNowMs(): Int64 {
@@ -484,7 +490,10 @@ public func gatewaySpeechAsrTranscribeAudioPath(config: JsonObject, path: String
     }
     let timeoutMs = max(1, speechAsrInt(providerConfig, "timeoutMs", speechAsrInt(config, "timeoutMs", 60000)))
     try {
-        let (exitCode, stdout, _stderr) = ShellUtils.execute(command, timeout: Some(Duration.millisecond * timeoutMs), withWrap: false)
+        let (exitCode, stdout, _stderr) = match (speechAsrCommandRunnerOverride) {
+            case Some(runner) => runner(command, timeoutMs)
+            case None => ShellUtils.execute(command, timeout: Some(Duration.millisecond * timeoutMs), withWrap: false)
+        }
         if (exitCode != 0) {
             let out = speechAsrResult("provider_error", ok: false, message: "Configured ASR provider command failed.")
             out.put("provider", JsonString(provider))
