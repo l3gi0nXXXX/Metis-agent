@@ -114,6 +114,69 @@ public class CronExecutionExecutorC0ContractTest {
 @Test
 public class CronExecutionExecutorTest {
     @TestCase
+    public func c2P01DifferentSerialKeysUseBoundedParallelSlotsWithoutBlockingSubmitter(): Unit {
+        let executor = CronExecutionExecutor(maxConcurrentRuns: 2)
+        let release = AtomicBool(false)
+        let firstEntered = AtomicBool(false)
+        let secondEntered = AtomicBool(false)
+        executor.start()
+
+        @Expect(executor.tryAcquireSlot(), true)
+        @Expect(executor.submitReserved(cronExecutorTestTask("c2-parallel-a", { _job =>
+            firstEntered.store(true)
+            while (!release.load()) { sleep(Duration.millisecond * 2) }
+        }, serialKey: "session-a")), true)
+        @Expect(executor.tryAcquireSlot(), true)
+        @Expect(executor.submitReserved(cronExecutorTestTask("c2-parallel-b", { _job =>
+            secondEntered.store(true)
+            while (!release.load()) { sleep(Duration.millisecond * 2) }
+        }, serialKey: "session-b")), true)
+
+        @Expect(awaitCronExecutorTest({ => firstEntered.load() && secondEntered.load() }), true)
+        @Expect(executor.activeCount(), 2)
+        @Expect(executor.tryAcquireSlot(), false)
+        release.store(true)
+        @Expect(awaitCronExecutorTest({ => executor.activeCount() == 0 }), true)
+        @Expect(executor.drainCompleted().size, 2)
+    }
+
+    @TestCase
+    public func c2N01SameSerialKeyNeverOverlapsAndDoesNotDuplicateCompletion(): Unit {
+        let executor = CronExecutionExecutor(maxConcurrentRuns: 2)
+        let releaseFirst = AtomicBool(false)
+        let firstEntered = AtomicBool(false)
+        let secondEntered = AtomicBool(false)
+        executor.start()
+
+        @Expect(executor.tryAcquireSlot(), true)
+        @Expect(executor.submitReserved(cronExecutorTestTask("c2-serial-a", { _job =>
+            firstEntered.store(true)
+            while (!releaseFirst.load()) { sleep(Duration.millisecond * 2) }
+        }, serialKey: "shared-session")), true)
+        @Expect(awaitCronExecutorTest({ => firstEntered.load() }), true)
+        @Expect(executor.tryAcquireSlot(), true)
+        @Expect(executor.submitReserved(cronExecutorTestTask("c2-serial-b", { _job =>
+            secondEntered.store(true)
+        }, serialKey: "shared-session")), true)
+
+        sleep(Duration.millisecond * 20)
+        @Expect(secondEntered.load(), false)
+        releaseFirst.store(true)
+        @Expect(awaitCronExecutorTest({ => secondEntered.load() }), true)
+        @Expect(awaitCronExecutorTest({ => executor.activeCount() == 0 }), true)
+        let completed = executor.drainCompleted()
+        @Expect(completed.size, 2)
+        @Expect(executor.drainCompleted().size, 0)
+    }
+
+    @TestCase
+    public func c2B01ConfiguredSlotsClampAtOneAndHardLimitThirtyTwo(): Unit {
+        @Expect(CronExecutionExecutor(maxConcurrentRuns: 0).configuredMaxConcurrentRuns(), 1)
+        @Expect(CronExecutionExecutor(maxConcurrentRuns: 32).configuredMaxConcurrentRuns(), 32)
+        @Expect(CronExecutionExecutor(maxConcurrentRuns: 33).configuredMaxConcurrentRuns(), 32)
+    }
+
+    @TestCase
     public func m4U1StopCancelAndDrainOwnTwoActiveContexts(): Unit {
         let executor = CronExecutionExecutor(maxConcurrentRuns: 2)
         let exited = AtomicBool(false)
@@ -379,6 +442,7 @@ public class CronExecutionExecutorTest {
     public func m1B1ConcurrencyLimitClampsInvalidAndOversizedValues(): Unit {
         for (configured in [0, -7]) {
             let executor = CronExecutionExecutor(maxConcurrentRuns: configured)
+            @Expect(executor.configuredMaxConcurrentRuns(), 1)
             executor.start()
             @Expect(executor.tryAcquireSlot(), true)
             @Expect(executor.tryAcquireSlot(), false)
@@ -390,6 +454,7 @@ public class CronExecutionExecutorTest {
         let capped = CronExecutionExecutor(
             maxConcurrentRuns: CRON_MAX_CONCURRENT_RUNS_HARD_LIMIT + 100
         )
+        @Expect(capped.configuredMaxConcurrentRuns(), CRON_MAX_CONCURRENT_RUNS_HARD_LIMIT)
         capped.start()
         var acquired: Int64 = 0
         while (capped.tryAcquireSlot()) {

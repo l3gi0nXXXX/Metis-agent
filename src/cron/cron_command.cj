@@ -505,6 +505,10 @@ private func cronCmdStatus(path: Path): (String, Int64) {
     out.add("Store: ${path.toString()}")
     out.add("Jobs: ${jobs.size}")
     out.add("Next wake: ${nextWakeAtMsText}")
+    cronAppendConflictDiagnosticsHuman(out, detectCronScheduleConflicts(
+        jobs,
+        DateTime.now().toUnixTimeStamp().toMilliseconds()
+    ))
     (String.join(out.toArray(), delimiter: "\n"), 0)
 }
 
@@ -524,7 +528,48 @@ private func cronCmdStatusJson(path: Path): (String, Int64) {
     out.put("storePath", JsonString(path.toString()))
     out.put("jobs", JsonInt(jobs.size))
     out.put("nextWakeAtMs", if (nextWakeAtMs > 0) { JsonInt(nextWakeAtMs) } else { JsonValue.fromStr("null") })
+    out.put("diagnostics", cronConflictDiagnosticsJson(detectCronScheduleConflicts(
+        jobs,
+        DateTime.now().toUnixTimeStamp().toMilliseconds()
+    )))
     (out.toJsonString(), 0)
+}
+
+private func cronConflictDiagnosticsJson(conflicts: Array<CronScheduleConflict>): JsonArray {
+    let rows = JsonArray([])
+    for (conflict in conflicts) {
+        let row = JsonObject()
+        row.put("code", JsonString("cron_schedule_conflict"))
+        row.put("severity", JsonString("warning"))
+        row.put("reason", JsonString(conflict.reason))
+        let ids = JsonArray([])
+        for (id in conflict.jobIds) {
+            ids.add(JsonString(id))
+        }
+        row.put("jobIds", ids)
+        row.put("nextRunAtMs", JsonInt(conflict.nextRunAtMs))
+        row.put("windowMs", JsonInt(conflict.windowMs))
+        row.put("recommendation", JsonString("Configure an explicit --stagger window; schedules were not changed."))
+        rows.add(row)
+    }
+    rows
+}
+
+private func cronAppendConflictDiagnosticsHuman(
+    lines: ArrayList<String>,
+    conflicts: Array<CronScheduleConflict>
+): Unit {
+    if (conflicts.isEmpty()) {
+        return
+    }
+    lines.add("")
+    lines.add("Schedule warnings:")
+    for (conflict in conflicts) {
+        lines.add(
+            "- ${String.join(conflict.jobIds, delimiter: ", ")}: ${conflict.reason}; " +
+            "configure an explicit --stagger window (schedule unchanged)."
+        )
+    }
 }
 
 private func cronJobToJson(j: CronJob): JsonObject {
@@ -777,6 +822,10 @@ private func cronCmdList(path: Path, sub: Array<String>): (String, Int64) {
         )
         idx += 1
     }
+    cronAppendConflictDiagnosticsHuman(lines, detectCronScheduleConflicts(
+        all.toArray(),
+        nowMs
+    ))
     (String.join(lines.toArray(), delimiter: "\n"), 0)
 }
 
@@ -798,6 +847,10 @@ private func cronCmdListJson(all: Array<CronJob>, offset: Int64, limit: Int64): 
     out.put("limit", JsonInt(lim))
     out.put("hasMore", JsonBool(end < total))
     out.put("nextOffset", if (end < total) { JsonInt(end) } else { JsonValue.fromStr("null") })
+    out.put("diagnostics", cronConflictDiagnosticsJson(detectCronScheduleConflicts(
+        all,
+        DateTime.now().toUnixTimeStamp().toMilliseconds()
+    )))
     (out.toJsonString(), 0)
 }
 

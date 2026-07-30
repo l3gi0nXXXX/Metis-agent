@@ -5,7 +5,7 @@ import metis.cron.*
 import metis.core.config.{CliConfig, CliSettingManager, GatewayUserSettings, MetisConfigManager, MetisProcessEnvironmentLock}
 
 import std.env.{getVariable, setVariable}
-import std.fs.{Directory, Path, remove}
+import std.fs.{Directory, File, Path, remove}
 import std.time.DateTime
 import std.unittest.testmacro.*
 import stdx.encoding.json.JsonValue
@@ -141,6 +141,46 @@ public class CronCommandC0ContractTest {
 
 @Test
 public class CronCommandTest {
+    @TestCase
+    public func c2U01ListAndStatusExposeReadonlyConflictDiagnostics(): Unit {
+        withCronCommandTestHome({ =>
+            let storePath = cronStorePath(CliConfig.dotDir)
+            let atMs = DateTime.now().toUnixTimeStamp().toMilliseconds() + 3_600_000
+            cronSave(storePath, [
+                CronJob(
+                    "daily-a", "重任务A", CronSchedule.at(atMs),
+                    sessionTarget: "session:a",
+                    deliveryChannel: "feishu",
+                    deliveryTo: "default"
+                ),
+                CronJob(
+                    "daily-b", "重任务B", CronSchedule.at(atMs),
+                    sessionTarget: "session:b",
+                    deliveryChannel: "feishu",
+                    deliveryTo: "default"
+                )
+            ])
+            let before = File.readFrom(storePath)
+
+            let (humanList, listCode) = executeGatewayCronCommand(["cron", "list"])
+            @Expect(listCode, 0)
+            @Expect(humanList.startsWith("{"), false)
+            @Expect(humanList.contains("Schedule warnings:"), true)
+            @Expect(humanList.contains("daily-a, daily-b"), true)
+            @Expect(humanList.contains("--stagger"), true)
+
+            let (statusJson, statusCode) = executeGatewayCronCommand(["cron", "status", "--json"])
+            @Expect(statusCode, 0)
+            let diagnostics = JsonValue.fromStr(statusJson).asObject()
+                .get("diagnostics").getOrThrow().asArray()
+            @Expect(diagnostics.size(), 1)
+            let row = diagnostics[0].asObject()
+            @Expect(row.get("code").getOrThrow().asString().getValue(), "cron_schedule_conflict")
+            @Expect(row.get("reason").getOrThrow().asString().getValue(), "same_delivery_target")
+            @Expect(File.readFrom(storePath), before)
+        })
+    }
+
     @TestCase
     public func cronStatusDefaultsToHumanTextAndJsonIsExplicit(): Unit {
         withCronCommandTestHome({ =>

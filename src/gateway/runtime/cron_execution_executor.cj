@@ -585,6 +585,11 @@ public class CronExecutionExecutor {
         }
     }
 
+    /** 只读暴露实际生效的并发上限，供状态诊断与边界测试使用。 */
+    public func configuredMaxConcurrentRuns(): Int64 {
+        this.maxConcurrentRuns
+    }
+
     public func completedCount(): Int64 {
         synchronized(this.stateLock) {
             this.completed.size

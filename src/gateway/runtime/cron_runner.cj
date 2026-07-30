@@ -30,6 +30,7 @@ import metis.cron.{
     buildCronWebhookFailureBody,
     buildCronWebhookSuccessBody,
     computeJobNextRun,
+    cronConflictSerialKey,
     cronPromptScanMeta,
     cronExecutionConversationKey,
     cronShouldRouteThroughDreaming,
@@ -2231,11 +2232,7 @@ public class CronRunner {
                         cronSaveStoreAtomic(this.storePath, envelope)
                         this.reloadJobsFromDisk()
                         let snapshot = cronCloneJobForExecution(job)
-                        let serialKey = if (!job.sessionKey.trimAscii().isEmpty()) {
-                            job.sessionKey.trimAscii()
-                        } else {
-                            job.sessionTarget.trimAscii()
-                        }
+                        let serialKey = cronConflictSerialKey(job)
                         let deadline = resolveCronExecutionDeadline(
                             snapshot,
                             snapshot.scriptMode,
