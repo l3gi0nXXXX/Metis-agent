@@ -411,14 +411,16 @@ public class GatewayControlUiWsTest {
 
     @TestCase
     public func channelsHealthCompatResponseExposesTelegramNativeHealthView(): Unit {
-        let cfg = buildGatewayConfigFromUserSettings(CliSettingManager.readGatewaySettings())
-        let response = gatewayControlUiWsCompatResponse("channels.health", JsonObject(), cfg)
-        @Expect(response.isSome(), true)
-        let result = response.getOrThrow().result.asObject()
-        let telegram = result.get("telegram").getOrThrow().asObject()
-        @Expect(telegram.get("healthSnapshot").isSome(), true)
-        @Expect(telegram.get("supports").isSome(), true)
-        @Expect(telegram.get("actions").isSome(), true)
+        withGatewayControlUiWsTestHome {
+            let cfg = buildGatewayConfigFromUserSettings(CliSettingManager.readGatewaySettings())
+            let response = gatewayControlUiWsCompatResponse("channels.health", JsonObject(), cfg)
+            @Expect(response.isSome(), true)
+            let result = response.getOrThrow().result.asObject()
+            let telegram = result.get("telegram").getOrThrow().asObject()
+            @Expect(telegram.get("healthSnapshot").isSome(), true)
+            @Expect(telegram.get("supports").isSome(), true)
+            @Expect(telegram.get("actions").isSome(), true)
+        }
     }
 
     @TestCase
