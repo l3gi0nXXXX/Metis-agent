@@ -342,6 +342,53 @@ private func resetAgentBridgePhase1FakeModels(): Unit {
     agentBridgePhase1FallbackCalls = 0
 }
 
+// C0 contract fixture: later recovery tests can drive exact model results without
+// accessing a provider or interpreting the result as a production outcome.
+private class AgentBridgeC0FakeModel {
+    private let results: Array<String>
+    private var cursor: Int64 = 0
+    public var callCount: Int64 = 0
+
+    public init(results: Array<String>) {
+        this.results = results
+    }
+
+    public func nextResult(): String {
+        this.callCount += 1
+        if (this.cursor >= Int64(this.results.size)) {
+            throw Exception("c0_fake_model_exhausted")
+        }
+        let result = this.results[this.cursor]
+        this.cursor += 1
+        if (result == "__c0_fake_model_throw__") {
+            throw Exception("c0_fake_model_failure")
+        }
+        result
+    }
+}
+
+private class AgentBridgeC0FakeTool {
+    public var callCount: Int64 = 0
+
+    public func invoke(): String {
+        this.callCount += 1
+        "fake_tool_result"
+    }
+}
+
+private func agentBridgeC0ClassifyRawResult(text: String): String {
+    if (text.isEmpty()) {
+        return "empty"
+    }
+    if (text == "[\"web_fetch\"]") {
+        return "tool_name_array"
+    }
+    if (text.contains("<tool_call>")) {
+        return "blocked_xml"
+    }
+    "text"
+}
+
 private class AgentBridgeRuntimeContextProbeTool <: Tool {
     public prop name: String {
         get() { "agent_bridge_context_probe" }
@@ -391,6 +438,43 @@ private func agentBridgeRuntimeWrappedProbeForContext(context: GatewayToolRuntim
         )
     })
     wrapped[0]
+}
+
+@Test
+public class AgentBridgeC0ContractTest {
+    @TestCase
+    public func c0U01FakeModelAndToolPreserveRawResultClassesAndUtf8(): Unit {
+        let model = AgentBridgeC0FakeModel([
+            "正常中文😀",
+            "",
+            "[\"web_fetch\"]",
+            "<tool_call>web_fetch</tool_call>",
+            "__c0_fake_model_throw__",
+            "异常后正常文本🙂"
+        ])
+        let tool = AgentBridgeC0FakeTool()
+
+        let normal = model.nextResult()
+        let empty = model.nextResult()
+        let toolArray = model.nextResult()
+        let blockedXml = model.nextResult()
+        @Expect(agentBridgeC0ClassifyRawResult(normal), "text")
+        @Expect(agentBridgeC0ClassifyRawResult(empty), "empty")
+        @Expect(agentBridgeC0ClassifyRawResult(toolArray), "tool_name_array")
+        @Expect(agentBridgeC0ClassifyRawResult(blockedXml), "blocked_xml")
+        @Expect(String.fromUtf8(normal.toArray()), "正常中文😀")
+        var error = ""
+        try {
+            let _ = model.nextResult()
+        } catch (e: Exception) {
+            error = e.message
+        }
+        @Expect(error, "c0_fake_model_failure")
+        @Expect(model.nextResult(), "异常后正常文本🙂")
+        @Expect(tool.invoke(), "fake_tool_result")
+        @Expect(model.callCount, 6)
+        @Expect(tool.callCount, 1)
+    }
 }
 
 @Test

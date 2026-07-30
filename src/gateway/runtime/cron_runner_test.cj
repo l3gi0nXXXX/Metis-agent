@@ -804,6 +804,49 @@ private func cronRunnerTestJob(id: String): CronJob {
     )
 }
 
+// C0 keeps this fixture test-only until the production typed outcome contract
+// is introduced by C4/C5.
+private class CronRunnerC0OutcomeFixture {
+    public let status: String
+    public let text: String
+    public var attempts: Int64 = 0
+    public var successDeliveries: Int64 = 0
+    public var failureAlerts: Int64 = 0
+    public var runLogStatus: String = ""
+
+    public init(status: String, text!: String = "") {
+        this.status = status
+        this.text = text
+    }
+
+    public func recordAttempt(): Unit { this.attempts += 1 }
+    public func recordSuccessDelivery(): Unit { this.successDeliveries += 1 }
+    public func recordFailureAlert(): Unit { this.failureAlerts += 1 }
+    public func recordRunLog(status: String): Unit { this.runLogStatus = status }
+}
+
+@Test
+public class CronRunnerC0ContractTest {
+    @TestCase
+    public func c0U01TypedOutcomeFixtureKeepsStatusAndSideEffectCountersIndependent(): Unit {
+        let incomplete = CronRunnerC0OutcomeFixture(
+            "incomplete_tool_protocol",
+            text: "[\"web_fetch\"]"
+        )
+        incomplete.recordAttempt()
+        incomplete.recordAttempt()
+        incomplete.recordFailureAlert()
+        incomplete.recordRunLog("error")
+
+        @Expect(incomplete.status, "incomplete_tool_protocol")
+        @Expect(incomplete.text, "[\"web_fetch\"]")
+        @Expect(incomplete.attempts, 2)
+        @Expect(incomplete.successDeliveries, 0)
+        @Expect(incomplete.failureAlerts, 1)
+        @Expect(incomplete.runLogStatus, "error")
+    }
+}
+
 private class CronRunnerTestChannelAdapter <: ChannelAdapter {
     private let adapterName: String
     private let messageId: String

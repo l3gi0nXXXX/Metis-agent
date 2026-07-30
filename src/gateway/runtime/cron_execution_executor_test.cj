@@ -2,6 +2,7 @@ package metis.gateway.runtime
 
 import metis.cron.{CronJob, CronSchedule}
 
+import std.collection.ArrayList
 import std.sync.AtomicBool
 import std.time.*
 import std.unittest.*
@@ -14,6 +15,38 @@ private func cronExecutorTestJob(id: String): CronJob {
 private class CronExecutorFakeClock {
     public var now: Int64
     public init(now: Int64) { this.now = now }
+}
+
+private class CronExecutorC0ActivityRecorder {
+    public let heartbeatAtMs = ArrayList<Int64>()
+    public var absoluteDeadlineMs: Int64
+    public var idleDeadlineMs: Int64
+    public var cancelReason: String = ""
+
+    public init(absoluteDeadlineMs: Int64, idleDeadlineMs: Int64) {
+        this.absoluteDeadlineMs = absoluteDeadlineMs
+        this.idleDeadlineMs = idleDeadlineMs
+    }
+
+    public func heartbeat(nowMs: Int64, idleTimeoutMs: Int64): Bool {
+        if (!this.classify(nowMs).isEmpty()) {
+            return false
+        }
+        this.heartbeatAtMs.add(nowMs)
+        this.idleDeadlineMs = nowMs + idleTimeoutMs
+        true
+    }
+
+    public func classify(nowMs: Int64): String {
+        if (nowMs >= this.absoluteDeadlineMs) {
+            this.cancelReason = "safety_deadline_exceeded"
+        } else if (nowMs >= this.idleDeadlineMs) {
+            this.cancelReason = "idle_timeout"
+        } else {
+            this.cancelReason = ""
+        }
+        this.cancelReason
+    }
 }
 
 private func awaitCronExecutorTest(
@@ -48,6 +81,34 @@ private func cronExecutorTestTask(
         globalResource: globalResource,
         cleanupTask: cleanupTask
     )
+}
+
+@Test
+public class CronExecutionExecutorC0ContractTest {
+    @TestCase
+    public func c0B01FakeClockRecordsStableIdleAndAbsoluteDeadlineBoundaries(): Unit {
+        for (_ in 0..100) {
+            let recorder = CronExecutorC0ActivityRecorder(2000, 1200)
+            @Expect(recorder.classify(1199), "")
+            @Expect(recorder.heartbeat(1199, 200), true)
+            @Expect(recorder.classify(1398), "")
+            @Expect(recorder.classify(1399), "idle_timeout")
+            @Expect(recorder.heartbeat(1399, 200), false)
+            @Expect(recorder.idleDeadlineMs, 1399)
+            @Expect(recorder.heartbeatAtMs.size, 1)
+
+            let idleExpired = CronExecutorC0ActivityRecorder(2000, 1200)
+            @Expect(idleExpired.classify(1200), "idle_timeout")
+            @Expect(idleExpired.heartbeat(1200, 200), false)
+            @Expect(idleExpired.idleDeadlineMs, 1200)
+
+            @Expect(recorder.classify(2000), "safety_deadline_exceeded")
+            @Expect(recorder.heartbeat(2000, 200), false)
+            @Expect(recorder.absoluteDeadlineMs, 2000)
+            @Expect(recorder.heartbeatAtMs.size, 1)
+            @Expect(recorder.heartbeatAtMs[0], 1199)
+        }
+    }
 }
 
 @Test

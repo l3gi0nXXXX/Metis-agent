@@ -57,6 +57,88 @@ private func repeatCronCommandText(text: String, count: Int64): String {
     out.toString()
 }
 
+private func cronCommandC0FixtureJobs(): Array<CronJob> {
+    [
+        CronJob(
+            "morning-feishu",
+            "中文简报😀",
+            CronSchedule.at(1_000),
+            sessionTarget: "session:morning",
+            deliveryMode: "announce",
+            deliveryChannel: "feishu",
+            deliveryTo: "chat-morning"
+        ),
+        CronJob(
+            "noon-telegram",
+            "sports summary",
+            CronSchedule.at(1_801_000),
+            sessionTarget: "session:noon",
+            deliveryMode: "announce",
+            deliveryChannel: "telegram",
+            deliveryTo: "chat-noon"
+        )
+    ]
+}
+
+private func cronCommandC0DecodeFixture(bytes: Array<UInt8>): String {
+    let text = try {
+        String.fromUtf8(bytes)
+    } catch (_: Exception) {
+        return "invalid_response_encoding"
+    }
+    let root = try {
+        JsonValue.fromStr(text).asObject()
+    } catch (_: Exception) {
+        return "malformed_json"
+    }
+    let id = try {
+        root.get("id").getOrThrow().asString().getValue().trimAscii()
+    } catch (_: Exception) {
+        return "validation_error"
+    }
+    if (id.isEmpty()) {
+        return "validation_error"
+    }
+    "ok"
+}
+
+@Test
+public class CronCommandC0ContractTest {
+    @TestCase
+    public func c0P01TemporaryCronStoreBuilderPreservesJobsWithoutConflictPrediction(): Unit {
+        withCronCommandTestHome({ =>
+            let storePath = cronStorePath(CliConfig.dotDir)
+            let fixture = cronCommandC0FixtureJobs()
+            cronSave(storePath, fixture)
+            let loaded = cronLoadOrEmpty(storePath)
+
+            @Expect(loaded.size, 2)
+            @Expect(loaded[0].id, "morning-feishu")
+            @Expect(loaded[0].prompt, "中文简报😀")
+            @Expect(loaded[0].schedule.atMs, 1_000)
+            @Expect(loaded[0].sessionTarget, "session:morning")
+            @Expect(loaded[0].deliveryChannel, "feishu")
+            @Expect(loaded[0].deliveryTo, "chat-morning")
+            @Expect(loaded[1].id, "noon-telegram")
+            @Expect(loaded[1].schedule.atMs, 1_801_000)
+            @Expect(loaded[1].sessionTarget, "session:noon")
+            @Expect(loaded[1].deliveryChannel, "telegram")
+            @Expect(loaded[1].deliveryTo, "chat-noon")
+        })
+    }
+
+    @TestCase
+    public func c0N01FixtureRejectsMalformedJsonInvalidUtf8AndMissingId(): Unit {
+        @Expect(cronCommandC0DecodeFixture("{".toArray()), "malformed_json")
+        @Expect(
+            cronCommandC0DecodeFixture([0xffu8, 0xfeu8, 0xfdu8]),
+            "invalid_response_encoding"
+        )
+        @Expect(cronCommandC0DecodeFixture("{\"name\":\"中文😀\"}".toArray()), "validation_error")
+        @Expect(cronCommandC0DecodeFixture("{\"id\":\"fixture-ok\"}".toArray()), "ok")
+    }
+}
+
 @Test
 public class CronCommandTest {
     @TestCase
