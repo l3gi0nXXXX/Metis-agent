@@ -1543,6 +1543,115 @@ public class AgentBridgeRuntimeTest {
     }
 
     @TestCase
+    public func c3N01AgentBridgeReplyGuardUsesOnlyTurnAuthorizedToolNames(): Unit {
+        withAgentBridgeTempHome("metis-c3-turn-authorized-tool-names", { home: Path =>
+            writeAgentBridgeCodexAppServerAgentConfig(home)
+            let originalGateway = CliSettingManager.setting.gateway
+            var updatedGateway = originalGateway
+            updatedGateway.tools.allow = []
+            updatedGateway.tools.deny = ["web"]
+            CliSettingManager.setting.gateway = updatedGateway
+            let context = gatewayResolveSessionContext(
+                GatewaySessionRequest(
+                    GatewayIngressSource.Channel("telegram"),
+                    channelName: "telegram",
+                    sessionHint: "main",
+                    agentId: "codex",
+                    text: "status"
+                )
+            )
+            setGatewayCodexAppServerRunnerForTest(Some({ request: GatewayCodexAppServerTurnRequest =>
+                GatewayCodexAppServerRuntimeResult(
+                    "[\"web_fetch\"]",
+                    threadId: "thread-c3-denied",
+                    turnId: "turn-c3-denied",
+                    completed: true,
+                    metadata: gatewayCodexAppServerRuntimeMetadata(
+                        request.modelName,
+                        request.channelName,
+                        request.sessionKey,
+                        threadId: "thread-c3-denied",
+                        turnId: "turn-c3-denied",
+                        completed: true
+                    )
+                )
+            }))
+            try {
+                let store = GatewaySessionStore(home.join("sessions"), enabled: true, agentId: "codex")
+                let bridge = AgentBridge(sessionStore: store)
+                let reply = bridge.reply(
+                    context.sessionKey,
+                    "status",
+                    channelName: "telegram",
+                    agentId: "codex",
+                    turnContext: Some(context.turnContext)
+                )
+
+                @Expect(reply, "[\"web_fetch\"]")
+                let history = bridge.getHistory(context.sessionKey)
+                @Expect(history[history.size - 1], "assistant: [\"web_fetch\"]")
+            } finally {
+                CliSettingManager.setting.gateway = originalGateway
+                setGatewayCodexAppServerRunnerForTest(None<(GatewayCodexAppServerTurnRequest) -> GatewayCodexAppServerRuntimeResult>)
+            }
+        })
+    }
+
+    @TestCase
+    public func c3U01AgentBridgeBlocksAuthorizedToolNameArrayBeforeSessionHistory(): Unit {
+        withAgentBridgeTempHome("metis-c3-authorized-tool-name-array", { home: Path =>
+            writeAgentBridgeCodexAppServerAgentConfig(home)
+            let context = gatewayResolveSessionContext(
+                GatewaySessionRequest(
+                    GatewayIngressSource.Channel("telegram"),
+                    channelName: "telegram",
+                    sessionHint: "main",
+                    agentId: "codex",
+                    text: "status"
+                )
+            )
+            setGatewayCodexAppServerRunnerForTest(Some({ request: GatewayCodexAppServerTurnRequest =>
+                GatewayCodexAppServerRuntimeResult(
+                    "[\"web_fetch\"]",
+                    threadId: "thread-c3-allowed",
+                    turnId: "turn-c3-allowed",
+                    completed: true,
+                    metadata: gatewayCodexAppServerRuntimeMetadata(
+                        request.modelName,
+                        request.channelName,
+                        request.sessionKey,
+                        threadId: "thread-c3-allowed",
+                        turnId: "turn-c3-allowed",
+                        completed: true
+                    )
+                )
+            }))
+            try {
+                let store = GatewaySessionStore(home.join("sessions"), enabled: true, agentId: "codex")
+                let bridge = AgentBridge(sessionStore: store)
+                let reply = bridge.reply(
+                    context.sessionKey,
+                    "status",
+                    channelName: "telegram",
+                    agentId: "codex",
+                    turnContext: Some(context.turnContext)
+                )
+
+                @Expect(reply.contains("工具调用协议"), true)
+                @Expect(reply.contains("web_fetch"), false)
+                let history = bridge.getHistory(context.sessionKey)
+                @Expect(history[history.size - 1].contains("工具调用协议"), true)
+                @Expect(history[history.size - 1].contains("web_fetch"), false)
+                let transcript = String.fromUtf8(File.readFrom(store.transcriptPath(context.sessionKey)))
+                @Expect(transcript.contains("工具调用协议"), true)
+                @Expect(transcript.contains("web_fetch"), false)
+            } finally {
+                setGatewayCodexAppServerRunnerForTest(None<(GatewayCodexAppServerTurnRequest) -> GatewayCodexAppServerRuntimeResult>)
+            }
+        })
+    }
+
+    @TestCase
     public func agentBridgeBlocksTerminalEnvelopeContainingToolMarkerBeforeSessionHistory(): Unit {
         withAgentBridgeTempHome("metis-m2-terminal-marker", { home: Path =>
             writeAgentBridgeCodexAppServerAgentConfig(home)

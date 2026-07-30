@@ -1285,6 +1285,7 @@ public class AgentBridge {
             var successfulModelName = ""
             var successfulPromptTokens: Int64 = -1
             var successfulCompletionTokens: Int64 = -1
+            var successfulRegisteredToolNames: Array<String> = []
             let availableSkillsMeta = if (skillsEnabled) {
                 SkillsPrompt.buildAvailableSkillsMetadataForPrompt(agentId: effectiveAgentId)
             } else {
@@ -1353,6 +1354,7 @@ public class AgentBridge {
                     let invocationPolicyInventory = MetisSystemPromptBuilder.collectToolNames(agent.toolManager.tools)
                     let restrictedTools = gatewayApplyToolPolicy(agent, gatewayUser, agentId: effectiveAgentId,
                         provider: currModel.fullName, turnContext: turnContext)
+                    let registeredToolNames = MetisSystemPromptBuilder.collectToolNames(agent.toolManager.tools)
                     agent.model = currModel
                     let promptBuild = buildGatewaySystemPrompt(
                         agent,
@@ -1533,6 +1535,7 @@ public class AgentBridge {
                     successfulPromptTokens = if (codexAppServerPromptTokens >= 0) { codexAppServerPromptTokens } else { usagePair[0] }
                     successfulCompletionTokens = if (codexAppServerCompletionTokens >= 0) { codexAppServerCompletionTokens } else { usagePair[1] }
                     successfulModelName = currModel.fullName
+                    successfulRegisteredToolNames = registeredToolNames
                     let modelCallFinishedAtMs = DateTime.now().toUnixTimeStamp().toMilliseconds()
                     gatewayLogReplyMemory(
                         "after-agent-chat",
@@ -1655,7 +1658,10 @@ public class AgentBridge {
                     "模型调用失败：空响应"
                 }
             }
-            let replyGuard = normalizeGatewayAssistantFinalReply(answer)
+            let replyGuard = normalizeGatewayAssistantFinalReply(
+                answer,
+                registeredToolNames: successfulRegisteredToolNames
+            )
             match (executionControl) {
                 case Some(control) => control.throwIfCancelled()
                 case None => ()

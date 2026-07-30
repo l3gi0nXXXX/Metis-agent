@@ -42,7 +42,10 @@ public class GatewayAssistantReplyGuardResult {
     }
 }
 
-public func normalizeGatewayAssistantFinalReply(raw: String): GatewayAssistantReplyGuardResult {
+public func normalizeGatewayAssistantFinalReply(
+    raw: String,
+    registeredToolNames!: Array<String> = []
+): GatewayAssistantReplyGuardResult {
     let trimmed = raw.trimAscii()
     if (trimmed.isEmpty()) {
         return GatewayAssistantReplyGuardResult(false, status: "empty", text: "", blocked: true, needsRepair: false, diagnostic: "assistant reply is empty", diagnosticHash: gatewayAssistantReplyDiagnosticHash(raw))
@@ -65,7 +68,7 @@ public func normalizeGatewayAssistantFinalReply(raw: String): GatewayAssistantRe
         return GatewayAssistantReplyGuardResult(false, status: "tool_xml_blocked", text: "", blocked: true, needsRepair: true, diagnostic: "assistant reply contained only tool XML", diagnosticHash: gatewayAssistantReplyDiagnosticHash(raw))
     }
 
-    let detection = detectToolProtocolJson(trimmed)
+    let detection = detectToolProtocolJson(trimmed, registeredToolNames: registeredToolNames)
     if (detection.detected) {
         return GatewayAssistantReplyGuardResult(false, status: detection.status, text: "", blocked: true, needsRepair: true, diagnostic: "assistant reply is tool protocol", diagnosticHash: gatewayAssistantReplyDiagnosticHash(raw))
     }
@@ -144,7 +147,10 @@ public func extractTerminalAnswerEnvelope(raw: String, depth!: Int64): ?String {
     }
 }
 
-public func detectToolProtocolJson(raw: String): GatewayToolProtocolDetection {
+public func detectToolProtocolJson(
+    raw: String,
+    registeredToolNames!: Array<String> = []
+): GatewayToolProtocolDetection {
     let trimmed = raw.trimAscii()
     let value = gatewayAssistantReplyParseFullJson(trimmed)
     if (value.isNone()) {
@@ -158,6 +164,9 @@ public func detectToolProtocolJson(raw: String): GatewayToolProtocolDetection {
             root.asArray()
         } catch (_: Exception) {
             return GatewayToolProtocolDetection(false)
+        }
+        if (gatewayAssistantReplyArrayIsRegisteredToolNameProtocol(arr, registeredToolNames)) {
+            return GatewayToolProtocolDetection(true, status: "tool_name_array_protocol")
         }
         if (gatewayAssistantReplyArrayHasToolShape(arr)) {
             return GatewayToolProtocolDetection(true, status: "tool_protocol_json")
@@ -296,6 +305,38 @@ private func gatewayAssistantReplyArrayHasToolShape(arr: JsonArray): Bool {
         }
     }
     false
+}
+
+private func gatewayAssistantReplyArrayIsRegisteredToolNameProtocol(
+    arr: JsonArray,
+    registeredToolNames: Array<String>
+): Bool {
+    if (arr.getItems().isEmpty() || registeredToolNames.isEmpty()) {
+        return false
+    }
+    var matched = false
+    for (item in arr.getItems()) {
+        let name = try {
+            item.asString().getValue().trimAscii().toAsciiLower()
+        } catch (_: Exception) {
+            return false
+        }
+        if (name.isEmpty()) {
+            continue
+        }
+        var registered = false
+        for (toolName in registeredToolNames) {
+            if (toolName.trimAscii().toAsciiLower() == name) {
+                registered = true
+                break
+            }
+        }
+        if (!registered) {
+            return false
+        }
+        matched = true
+    }
+    matched
 }
 
 private func gatewayAssistantReplyValueHasToolShape(value: JsonValue): Bool {

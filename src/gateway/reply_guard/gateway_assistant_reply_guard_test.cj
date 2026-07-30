@@ -77,6 +77,104 @@ public class GatewayAssistantReplyGuardTest {
     }
 
     @TestCase
+    public func c3U01RegisteredToolNameArraysAreBlockedWithoutProtocolLeak(): Unit {
+        for (raw in ["[\"web_fetch\"]", "[\"web_fetch\",\"read_file\"]"]) {
+            let result = normalizeGatewayAssistantFinalReply(
+                raw,
+                registeredToolNames: ["web_fetch", "read_file"]
+            )
+
+            @Expect(result.ok, false)
+            @Expect(result.status, "tool_name_array_protocol")
+            @Expect(result.blocked, true)
+            @Expect(result.needsRepair, true)
+            @Expect(result.text, "")
+            @Expect(result.diagnostic.contains("web_fetch"), false)
+            @Expect(result.diagnosticHash.startsWith("reply-"), true)
+        }
+    }
+
+    @TestCase
+    public func c3B01RegisteredToolNameArrayBoundaryRulesAreExactAndUtf8Safe(): Unit {
+        let registry = ["web_fetch", "read_file"]
+        for (raw in [
+            "[]",
+            "[\"\"]",
+            "[\"unknown_tool\"]",
+            "[\"web_fetch\", \"unknown_tool\"]",
+            "[\"web_fetch\", 1]",
+            "[[\"web_fetch\"]]",
+            "[\"web_fetch 使用说明\"]",
+            "[\"足球\",\"篮球\"]",
+            "[\"中文🙂web_fetch\"]",
+            "[\"web_fetch\""
+        ]) {
+            let result = normalizeGatewayAssistantFinalReply(raw, registeredToolNames: registry)
+            @Expect(result.ok, true)
+            @Expect(result.text, raw)
+        }
+
+        for (raw in [
+            "[\"web_fetch\",\"web_fetch\"]",
+            "[\" WEB_FETCH \",\"read_file\"]",
+            "[\"web_fetch\",\"\"]"
+        ]) {
+            let result = normalizeGatewayAssistantFinalReply(raw, registeredToolNames: registry)
+            @Expect(result.ok, false)
+            @Expect(result.status, "tool_name_array_protocol")
+            @Expect(result.text, "")
+        }
+
+        let longUtf8 = this.repeatText("中文🙂", 256)
+        let longResult = normalizeGatewayAssistantFinalReply(
+            "[\"${longUtf8}\"]",
+            registeredToolNames: registry
+        )
+        @Expect(longResult.ok, true)
+        @Expect(longResult.text, "[\"${longUtf8}\"]")
+        @Expect(longResult.text.toRuneArray().size, "[\"${longUtf8}\"]".toRuneArray().size)
+    }
+
+    @TestCase
+    public func c3P01OrdinaryStringArraysAndNaturalLanguageRemainVisible(): Unit {
+        for (raw in [
+            "[\"足球\",\"篮球\"]",
+            "[\"web_fetch 使用说明\"]",
+            "[\"unknown_tool\"]",
+            "这是一段正常的中文总结🙂"
+        ]) {
+            let result = normalizeGatewayAssistantFinalReply(
+                raw,
+                registeredToolNames: ["web_fetch", "read_file"]
+            )
+            @Expect(result.ok, true)
+            @Expect(result.blocked, false)
+            @Expect(result.text, raw)
+        }
+    }
+
+    @TestCase
+    public func c3N01UnregisteredToolNamesAreNotInferredFromGlobalInventory(): Unit {
+        let denied = normalizeGatewayAssistantFinalReply(
+            "[\"shellExecute\"]",
+            registeredToolNames: ["web_fetch"]
+        )
+        @Expect(denied.ok, true)
+        @Expect(denied.text, "[\"shellExecute\"]")
+
+        let deliveryWithoutRegistry = normalizeGatewayAssistantVisibleTextForDelivery("[\"web_fetch\"]")
+        @Expect(deliveryWithoutRegistry.ok, true)
+        @Expect(deliveryWithoutRegistry.text, "[\"web_fetch\"]")
+
+        let allowed = normalizeGatewayAssistantFinalReply(
+            "[\"web_fetch\"]",
+            registeredToolNames: ["web_fetch"]
+        )
+        @Expect(allowed.ok, false)
+        @Expect(allowed.status, "tool_name_array_protocol")
+    }
+
+    @TestCase
     public func harmonyToolLeakIsBlocked(): Unit {
         let result = normalizeGatewayAssistantFinalReply("assistant to=functions.exec_command {\"cmd\":\"date\"}")
 
