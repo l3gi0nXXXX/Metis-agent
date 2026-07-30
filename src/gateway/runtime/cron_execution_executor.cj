@@ -77,6 +77,19 @@ public class CronExecutionControl <: GatewayExecutionControl {
         }
     }
 
+    public func activitySnapshot(): CronExecutionActivitySnapshot {
+        synchronized(this.stateLock) {
+            let now = this.nowMs()
+            this.refreshTimeoutLocked(now)
+            CronExecutionActivitySnapshot(
+                this.absoluteDeadlineMs,
+                if (this.idleTimeoutMs > 0) { this.lastActivityAtMs + this.idleTimeoutMs } else { 0 },
+                this.lastActivityAtMs,
+                this.cancelReason
+            )
+        }
+    }
+
     public func cancel(reason: String): Bool {
         synchronized(this.stateLock) {
             if (!this.cancelReason.isEmpty()) {
@@ -103,6 +116,20 @@ public class CronExecutionControl <: GatewayExecutionControl {
         if (!current.isEmpty()) {
             throw GatewayExecutionCancelledException(current)
         }
+    }
+}
+
+public struct CronExecutionActivitySnapshot {
+    public let absoluteDeadlineMs: Int64
+    public let idleDeadlineMs: Int64
+    public let lastActivityAtMs: Int64
+    public let cancelReason: String
+
+    public init(absoluteDeadlineMs: Int64, idleDeadlineMs: Int64, lastActivityAtMs: Int64, cancelReason: String) {
+        this.absoluteDeadlineMs = absoluteDeadlineMs
+        this.idleDeadlineMs = idleDeadlineMs
+        this.lastActivityAtMs = lastActivityAtMs
+        this.cancelReason = cancelReason
     }
 }
 

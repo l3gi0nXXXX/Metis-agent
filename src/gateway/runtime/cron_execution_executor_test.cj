@@ -200,6 +200,11 @@ public class CronExecutionExecutorTest {
         @Expect(control.remainingMs(), 1000)
         clock.now = 1100
         control.heartbeat()
+        let active = control.activitySnapshot()
+        @Expect(active.absoluteDeadlineMs, 2000)
+        @Expect(active.idleDeadlineMs, 1300)
+        @Expect(active.lastActivityAtMs, 1100)
+        @Expect(active.cancelReason, "")
         clock.now = 1250
         @Expect(control.isCancelled(), false)
         clock.now = 1300
@@ -208,6 +213,9 @@ public class CronExecutionExecutorTest {
         @Expect(control.cancel("later_cancel"), false)
         @Expect(control.reason(), "idle_timeout")
         @Expect(control.remainingMs(), 0)
+        let expired = control.activitySnapshot()
+        @Expect(expired.cancelReason, "idle_timeout")
+        @Expect(expired.lastActivityAtMs, 1100)
     }
 
     @TestCase
@@ -219,6 +227,9 @@ public class CronExecutionExecutorTest {
         @Expect(control.isCancelled(), true)
         @Expect(control.reason(), "timed_out")
         @Expect(control.cancel("second"), false)
+        control.heartbeat()
+        @Expect(control.activitySnapshot().lastActivityAtMs, 100)
+        @Expect(control.activitySnapshot().cancelReason, "timed_out")
     }
 
     @TestCase

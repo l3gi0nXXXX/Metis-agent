@@ -388,6 +388,7 @@ private func gatewayToolAuthorized(
 
 private var gatewayAgentBridgeReplyRunnerForTest: Option<(String, String, String, String, Bool, Option<(String) -> Unit>) -> String> =
     None<(String, String, String, String, Bool, Option<(String) -> Unit>) -> String>
+private var gatewayAgentBridgeStreamingSnapshotsForTest: Option<Array<String>> = None<Array<String>>
 
 public interface GatewayGitCodeMcpRuntimeAdapter {
     func invoke(toolName: String, args: JsonObject): JsonObject
@@ -503,6 +504,10 @@ public func setGatewayAgentBridgeReplyRunnerForTest(
     gatewayAgentBridgeReplyRunnerForTest = runner
 }
 
+public func setGatewayAgentBridgeStreamingSnapshotsForTest(snapshots: Option<Array<String>>): Unit {
+    gatewayAgentBridgeStreamingSnapshotsForTest = snapshots
+}
+
 private class GatewayLifecycleToolWrapper <: Tool {
     private let inner: Tool
     private let policyRoot: JsonObject
@@ -573,6 +578,14 @@ private class GatewayLifecycleToolWrapper <: Tool {
                 isError: true
             )
         }
+        match (this.capturedRuntimeContext) {
+            case Some(context) =>
+                match (context.heartbeatHook) {
+                    case Some(heartbeat) => heartbeat()
+                    case None => ()
+                }
+            case None => ()
+        }
         let response = match (this.capturedRuntimeContext) {
             case Some(context) =>
                 gatewayWithToolRuntimeContext(context, { => this.inner.invoke(args) })
@@ -641,6 +654,46 @@ private func gatewayRunModelWithExecutionControl<T>(
 
 public func debugGatewayRunModelWithoutExecutionControlForTest<T>(block: () -> T): T {
     gatewayRunModelWithExecutionControl(None<GatewayExecutionControl>, block)
+}
+
+private class GatewayStreamActivityTracker {
+    private let executionControl: Option<GatewayExecutionControl>
+    private let streamChunkHook: Option<(String) -> Unit>
+    private let modelCallStartedAtMs: Int64
+    public var firstTokenMs: Int64 = -1
+    public var lastContent: String = ""
+
+    public init(
+        executionControl: Option<GatewayExecutionControl>,
+        streamChunkHook: Option<(String) -> Unit>,
+        modelCallStartedAtMs: Int64
+    ) {
+        this.executionControl = executionControl
+        this.streamChunkHook = streamChunkHook
+        this.modelCallStartedAtMs = modelCallStartedAtMs
+    }
+
+    public func accept(currentContent: String): Unit {
+        match (this.executionControl) {
+            case Some(control) => control.throwIfCancelled()
+            case None => ()
+        }
+        if (currentContent.isEmpty() || currentContent == this.lastContent) {
+            return
+        }
+        match (this.executionControl) {
+            case Some(control) => control.heartbeat()
+            case None => ()
+        }
+        if (this.firstTokenMs < 0) {
+            this.firstTokenMs = DateTime.now().toUnixTimeStamp().toMilliseconds() - this.modelCallStartedAtMs
+        }
+        this.lastContent = currentContent
+        match (this.streamChunkHook) {
+            case Some(notify) => notify(currentContent)
+            case None => ()
+        }
+    }
 }
 
 func gatewayLifecycleWrappedTools(
@@ -1422,48 +1475,48 @@ public class AgentBridge {
                                     meta: codexResult.metadata
                                 )
                             } else if (streamingEnabled) {
-                                let response = gatewayRunModelWithExecutionControl(
+                                let streamActivity = GatewayStreamActivityTracker(
                                     executionControl,
-                                    { => agent.asyncChat(modelInput) }
+                                    streamChunkHook,
+                                    modelCallStartedAtMs
                                 )
-                                var lastChunkContent = ""
-                                try {
-                                    for (_chunk in response) {
-                                        match (executionControl) {
-                                            case Some(control) =>
-                                                control.throwIfCancelled()
-                                                control.heartbeat()
-                                            case None => ()
+                                match (gatewayAgentBridgeStreamingSnapshotsForTest) {
+                                    case Some(snapshots) =>
+                                        for (snapshot in snapshots) {
+                                            streamActivity.accept(snapshot)
                                         }
-                                        let currentContent = response.content
-                                        if (currentContent == lastChunkContent) {
-                                            continue
+                                        answer = streamActivity.lastContent
+                                    case None =>
+                                        let response = gatewayRunModelWithExecutionControl(
+                                            executionControl,
+                                            { => agent.asyncChat(modelInput) }
+                                        )
+                                        try {
+                                            for (_chunk in response) {
+                                                streamActivity.accept(response.content)
+                                            }
+                                        } catch (_streamEx: Exception) {
+                                            ()
                                         }
-                                        if (firstTokenMs < 0) {
-                                            firstTokenMs = DateTime.now().toUnixTimeStamp().toMilliseconds() - modelCallStartedAtMs
+                                        answer = response.content
+                                        match (response.status) {
+                                            case AgentResponseStatus.Success => ()
+                                            case AgentResponseStatus.Cancelled =>
+                                                throw Exception(if (answer.trimAscii().isEmpty()) { "gateway async response cancelled" } else { answer })
+                                            case AgentResponseStatus.Failed =>
+                                                throw Exception(if (answer.trimAscii().isEmpty()) { "gateway async response failed" } else { answer })
                                         }
-                                        lastChunkContent = currentContent
-                                        match (streamChunkHook) {
-                                            case Some(notify) => notify(currentContent)
-                                            case None => ()
-                                        }
-                                    }
-                                } catch (_streamEx: Exception) {
-                                    ()
                                 }
-                                answer = response.content
-                                match (response.status) {
-                                    case AgentResponseStatus.Success => ()
-                                    case AgentResponseStatus.Cancelled =>
-                                        throw Exception(if (answer.trimAscii().isEmpty()) { "gateway async response cancelled" } else { answer })
-                                    case AgentResponseStatus.Failed =>
-                                        throw Exception(if (answer.trimAscii().isEmpty()) { "gateway async response failed" } else { answer })
-                                }
+                                firstTokenMs = streamActivity.firstTokenMs
                             } else {
                                 answer = gatewayRunModelWithExecutionControl(
                                     executionControl,
                                     { => agent.chat(modelInput) }
                                 )
+                                match (executionControl) {
+                                    case Some(control) => control.heartbeat()
+                                    case None => ()
+                                }
                             }
                     } finally {
                         match (executionControl) {

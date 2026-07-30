@@ -153,7 +153,15 @@ public func gatewayRunCodexAppServerTurn(request: GatewayCodexAppServerTurnReque
         case None => ()
     }
     match (gatewayCodexAppServerRunnerForTest) {
-        case Some(runner) => return runner(request)
+        case Some(runner) =>
+            let result = runner(request)
+            match (request.executionControl) {
+                case Some(control) =>
+                    control.throwIfCancelled()
+                    control.heartbeat()
+                case None => ()
+            }
+            return result
         case None => ()
     }
 

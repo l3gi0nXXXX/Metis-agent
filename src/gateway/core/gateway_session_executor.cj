@@ -636,9 +636,7 @@ public func gatewayExecuteSessionTurn(
             streamingEnabled: streamingEnabled,
             streamChunkHook: Some({ currentText =>
             match (executionControl) {
-                case Some(control) =>
-                    control.throwIfCancelled()
-                    control.heartbeat()
+                case Some(control) => control.throwIfCancelled()
                 case None => ()
             }
             let visibleText = gatewayVisiblePartialDeliveryText(context.channelName, currentText)

@@ -20,6 +20,26 @@ import std.time.DateTime
 import std.unittest.testmacro.*
 import stdx.encoding.json.{JsonArray, JsonInt, JsonObject, JsonString, JsonValue}
 
+private class AgentBridgeActivityControl <: GatewayExecutionControl {
+    public var heartbeats: Int64 = 0
+    public var checks: Int64 = 0
+    public var cancelled: Bool = false
+
+    public func remainingMs(): Int64 { if (this.cancelled) { 0 } else { 60000 } }
+    public func heartbeat(): Unit {
+        if (!this.cancelled) {
+            this.heartbeats += 1
+        }
+    }
+    public func isCancelled(): Bool { this.cancelled }
+    public func throwIfCancelled(): Unit {
+        this.checks += 1
+        if (this.cancelled) {
+            throw GatewayExecutionCancelledException("test_cancelled")
+        }
+    }
+}
+
 private func withAgentBridgeTempHome<T>(label: String, block: (Path) -> T): T {
     synchronized(MetisProcessEnvironmentLock) {
         let home = Path("/tmp/${label}-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
@@ -122,7 +142,12 @@ private func writeAgentBridgeCodexResponsesAgentConfig(home: Path): Unit {
     CliSettingManager.invalidate()
 }
 
-private func writeAgentBridgePhase1FallbackAgentConfig(home: Path, primary: String, fallbacks: Array<String>): Unit {
+private func writeAgentBridgePhase1FallbackAgentConfig(
+    home: Path,
+    primary: String,
+    fallbacks: Array<String>,
+    appServer!: Bool = true
+): Unit {
     let root = JsonObject()
     let agents = JsonObject()
     let defaults = JsonObject()
@@ -140,7 +165,9 @@ private func writeAgentBridgePhase1FallbackAgentConfig(home: Path, primary: Stri
         fallbackItems.add(JsonString(fallback))
     }
     model.put("fallbacks", fallbackItems)
-    model.put("openaiRuntime", JsonString("codex_app_server"))
+    if (appServer) {
+        model.put("openaiRuntime", JsonString("codex_app_server"))
+    }
     entry.put("model", model)
     list.add(entry)
     agents.put("list", list)
@@ -540,6 +567,7 @@ public class AgentBridgeRuntimeTest {
 
     @TestCase
     public func gatewayLifecycleToolWrapperPropagatesCapturedCronRuntimeContext(): Unit {
+        let activity = AgentBridgeActivityControl()
         let wrapped = agentBridgeRuntimeWrappedProbeForContext(
             GatewayToolRuntimeContext(
                 "cron",
@@ -547,7 +575,9 @@ public class AgentBridgeRuntimeTest {
                 sessionKey: "cron:writer:manual",
                 cronJobId: "ut-p3-01",
                 toolExecMode: "allowlist",
-                toolExecAllowlist: ["curl", "python3"]
+                toolExecAllowlist: ["curl", "python3"],
+                heartbeatHook: Some<() -> Unit>({ => activity.heartbeat() }),
+                cancellationCheckHook: Some<() -> Unit>({ => activity.throwIfCancelled() })
             )
         )
 
@@ -561,6 +591,116 @@ public class AgentBridgeRuntimeTest {
         @Expect(agentBridgeJsonString(summary, "cronJobId"), "ut-p3-01")
         @Expect(agentBridgeJsonString(summary, "toolExecMode"), "allowlist")
         @Expect(summary.get("allowlistSize").getOrThrow().asInt().getValue(), 2)
+        @Expect(activity.heartbeats, 2)
+        @Expect(activity.checks, 2)
+    }
+
+    @TestCase
+    public func c1P01CodexAppServerFakeResultEmitsOneActivityHeartbeat(): Unit {
+        let activity = AgentBridgeActivityControl()
+        setGatewayCodexAppServerRunnerForTest(Some({ _request: GatewayCodexAppServerTurnRequest =>
+            GatewayCodexAppServerRuntimeResult(
+                "完成中文😀",
+                threadId: "thread-c1",
+                turnId: "turn-c1",
+                completed: true
+            )
+        }))
+        try {
+            let result = gatewayRunCodexAppServerTurn(GatewayCodexAppServerTurnRequest(
+                "session-c1",
+                "/tmp",
+                "cron",
+                "writer",
+                "openai-codex:test",
+                "system",
+                "input",
+                executionControl: Some<GatewayExecutionControl>(activity)
+            ))
+            @Expect(result.finalText, "完成中文😀")
+            @Expect(activity.heartbeats, 1)
+            @Expect(activity.checks, 2)
+        } finally {
+            setGatewayCodexAppServerRunnerForTest(None<(GatewayCodexAppServerTurnRequest) -> GatewayCodexAppServerRuntimeResult>)
+        }
+    }
+
+    @TestCase
+    public func c1N01CancelledCodexAppServerResultCannotReviveActivity(): Unit {
+        let activity = AgentBridgeActivityControl()
+        setGatewayCodexAppServerRunnerForTest(Some({ _request: GatewayCodexAppServerTurnRequest =>
+            activity.cancelled = true
+            GatewayCodexAppServerRuntimeResult("late-result", completed: true)
+        }))
+        var error = ""
+        try {
+            let _ = gatewayRunCodexAppServerTurn(GatewayCodexAppServerTurnRequest(
+                "session-c1-late",
+                "/tmp",
+                "cron",
+                "writer",
+                "openai-codex:test",
+                "system",
+                "input",
+                executionControl: Some<GatewayExecutionControl>(activity)
+            ))
+        } catch (e: Exception) {
+            error = e.message
+        } finally {
+            setGatewayCodexAppServerRunnerForTest(None<(GatewayCodexAppServerTurnRequest) -> GatewayCodexAppServerRuntimeResult>)
+        }
+        @Expect(error, "test_cancelled")
+        @Expect(activity.heartbeats, 0)
+    }
+
+    @TestCase
+    public func c1P01AgentBridgeStreamingLoopHeartbeatsOnlyChangedNonEmptySnapshots(): Unit {
+        withAgentBridgeTempHome("metis-c1-stream-activity", { home: Path =>
+            let suffix = DateTime.now().toUnixTimeStamp().toMilliseconds().toString()
+            let modelName = "metis-test-c1-stream-${suffix}"
+            ModelManager.registerChatModel(modelName, { => AgentBridgePhase1FallbackModel() })
+            writeAgentBridgePhase1FallbackAgentConfig(home, modelName, [], appServer: false)
+            let context = gatewayResolveSessionContext(
+                GatewaySessionRequest(
+                    GatewayIngressSource.DashboardRpc,
+                    sessionHint: "main",
+                    agentId: "phase1"
+                )
+            )
+            let activity = AgentBridgeActivityControl()
+            let streamed = ArrayList<String>()
+            setGatewayAgentBridgeStreamingSnapshotsForTest(Some([
+                "",
+                "",
+                "第一段中文😀",
+                "第一段中文😀",
+                "第一段中文😀第二段",
+                "第一段中文😀第二段",
+                "第一段中文😀第二段完成"
+            ]))
+            try {
+                let bridge = AgentBridge(sessionStore: GatewaySessionStore(home.join("sessions"), enabled: true, agentId: "phase1"))
+                let reply = bridge.reply(
+                    context.sessionKey,
+                    "stream activity",
+                    channelName: "dashboard",
+                    agentId: "phase1",
+                    streamingEnabled: true,
+                    streamChunkHook: Some({ text: String => streamed.add(text) }),
+                    turnContext: Some(context.turnContext),
+                    executionControl: Some<GatewayExecutionControl>(activity)
+                )
+                @Expect(reply, "第一段中文😀第二段完成")
+                @Expect(activity.heartbeats, 3)
+                @Expect(streamed.toArray(), [
+                    "第一段中文😀",
+                    "第一段中文😀第二段",
+                    "第一段中文😀第二段完成"
+                ])
+            } finally {
+                setGatewayAgentBridgeStreamingSnapshotsForTest(None<Array<String>>)
+            }
+        })
     }
 
     @TestCase
