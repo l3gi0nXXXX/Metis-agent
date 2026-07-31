@@ -271,7 +271,20 @@ public class GatewayCronNonblockingE2eTest {
         withCronM5E2eHome({ storePath: Path =>
             cronSave(storePath, [cronM5Job("edited"), cronM5Job("removed")])
             let release = AtomicBool(false)
-            debugSetCronRunnerReplyForTest(Some({ _job, _request =>
+            let editedEntered = AtomicBool(false)
+            let removedEntered = AtomicBool(false)
+            let editedCommitted = AtomicBool(false)
+            debugSetCronRunnerCommitForTest(Some({ phase =>
+                if (phase == "after-result-commit") {
+                    editedCommitted.store(true)
+                }
+            }))
+            debugSetCronRunnerReplyForTest(Some({ job, _request =>
+                if (job.id == "edited") {
+                    editedEntered.store(true)
+                } else if (job.id == "removed") {
+                    removedEntered.store(true)
+                }
                 while (!release.load()) { sleep(Duration.millisecond * 2) }
                 "finished"
             }))
@@ -280,19 +293,43 @@ public class GatewayCronNonblockingE2eTest {
             let removeReservation = runner.reserveExecution("removed", "manual", true, false)
             @Expect(runner.submitReservedExecution(editReservation), "submitted")
             @Expect(runner.submitReservedExecution(removeReservation), "submitted")
-            let edited = cronLoadOrEmpty(storePath)[0]
-            edited.prompt = "并发编辑中文🙂"
-            edited.enabled = false
-            cronSave(storePath, [edited])
+            @Expect(cronM5Await({ => editedEntered.load() && removedEntered.load() }), true)
+            var editedJob = None<CronJob>
+            for (job in cronLoadOrEmpty(storePath)) {
+                if (job.id == "edited") {
+                    editedJob = Some(job)
+                }
+            }
+            @Expect(editedJob.isSome(), true)
+            match (editedJob) {
+                case Some(job) =>
+                    job.prompt = "并发编辑中文🙂"
+                    job.enabled = false
+                    cronSave(storePath, [job])
+                case None => ()
+            }
             release.store(true)
             @Expect(runner.waitUntilIdle(), true)
-            runner.tick()
+            @Expect(cronM5Await({ =>
+                runner.tick()
+                editedCommitted.load()
+            }), true)
             let after = cronLoadOrEmpty(storePath)
             @Expect(after.size, 1)
-            @Expect(after[0].id, "edited")
-            @Expect(after[0].prompt, "并发编辑中文🙂")
-            @Expect(after[0].enabled, false)
-            @Expect(after[0].state.lastStatus, "success")
+            var afterEdited = None<CronJob>
+            for (job in after) {
+                if (job.id == "edited") {
+                    afterEdited = Some(job)
+                }
+            }
+            @Expect(afterEdited.isSome(), true)
+            match (afterEdited) {
+                case Some(job) =>
+                    @Expect(job.prompt, "并发编辑中文🙂")
+                    @Expect(job.enabled, false)
+                    @Expect(job.state.lastStatus, "success")
+                case None => ()
+            }
             let human = gatewayFormatCommandOutput(
                 "{\"ok\":true,\"method\":\"cron.status\",\"result\":{\"running\":0,\"delivery\":\"unknown\"}}"
             )
