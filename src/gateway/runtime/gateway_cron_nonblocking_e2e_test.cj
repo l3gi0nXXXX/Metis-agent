@@ -14,8 +14,10 @@ import metis.cron.{
 }
 import metis.gateway.core.{
     ChannelAdapter,
+    GatewayAgentReplyOutcome,
     GatewayRouter,
     GatewayService,
+    gatewayRunFinalAnswerCorrection,
     gatewayCronHeadlessToolDenied,
     setGatewayAgentBridgeReplyRunnerForTest
 }
@@ -26,7 +28,7 @@ import std.collection.{ArrayList, HashMap}
 import std.core.Duration
 import std.env.{getVariable, setVariable}
 import std.fs.{Directory, File, Path, remove}
-import std.sync.{AtomicBool, Mutex}
+import std.sync.{AtomicBool, AtomicInt64, Mutex}
 import std.time.DateTime
 import std.unittest.testmacro.*
 
@@ -48,6 +50,7 @@ private func withCronM5E2eHome<T>(body: (Path) -> T): T {
             return body(cronStorePath(CliConfig.dotDir))
         } finally {
             debugSetCronRunnerReplyForTest(None<(CronJob, GatewaySessionRequest) -> String>)
+            debugSetCronRunnerOutcomeForTest(None<(CronJob, GatewaySessionRequest) -> GatewayAgentReplyOutcome>)
             debugSetCronRunnerBeforeExecuteForTest(None<(CronJob) -> Unit>)
             debugSetCronRunnerDeliveryStageForTest(None<(String) -> Unit>)
             debugSetCronRunnerDeliveryForTest(None<() -> Unit>)
@@ -69,13 +72,15 @@ private func withCronM5E2eHome<T>(body: (Path) -> T): T {
 
 private class CronM5E2eAdapter <: ChannelAdapter {
     private let adapterName: String
+    private let failSend: Bool
     private let inbound = ArrayList<InboundMessage>()
     private let sent = ArrayList<String>()
     public var started: Bool = false
     public var stopped: Bool = false
 
-    public init(adapterName: String) {
+    public init(adapterName: String, failSend!: Bool = false) {
         this.adapterName = adapterName
+        this.failSend = failSend
     }
 
     public prop name: String {
@@ -107,11 +112,13 @@ private class CronM5E2eAdapter <: ChannelAdapter {
 
     public func send(message: OutboundMessage): SendResult {
         this.sent.add(message.text)
+        if (this.failSend) { return SendResult.Failed("fake isolated delivery failure") }
         SendResult.Success
     }
 
     public func sendWithMessageId(message: OutboundMessage): String {
         this.sent.add(message.text)
+        if (this.failSend) { throw Exception("fake isolated delivery failure") }
         "${this.adapterName}-sent-${this.sent.size}"
     }
 
@@ -180,6 +187,10 @@ public class GatewayCronNonblockingE2eTest {
             let entered = AtomicBool(false)
             debugSetCronRunnerReplyForTest(Some({ _job, _request =>
                 entered.store(true)
+                // 三个有效 stream/activity 周期；期间保持 worker 活跃而不占用 poll 线程。
+                for (_ in 0..3) {
+                    sleep(Duration.millisecond * 5)
+                }
                 while (!release.load()) { sleep(Duration.millisecond * 2) }
                 "cron-finished"
             }))
@@ -190,11 +201,12 @@ public class GatewayCronNonblockingE2eTest {
             let feishu = CronM5E2eAdapter("feishu")
             let telegram = CronM5E2eAdapter("telegram")
             let gateway = cronM5Service(feishu, telegram)
-            let runner = CronRunner(gatewayOpt: Some(gateway), storePath: storePath, maxConcurrentRuns: 1)
+            let runner = CronRunner(gatewayOpt: Some(gateway), storePath: storePath, maxConcurrentRuns: 2)
             gateway.start()
             try {
                 runner.tick(nowOverride: Some<Int64>(2000))
                 @Expect(cronM5Await({ => entered.load() }), true)
+                @Expect(runner.activeExecutionCount() <= 2, true)
                 for (idx in 0..4) {
                     feishu.enqueue("飞书-${idx}-中文🙂")
                     telegram.enqueue("telegram-${idx}-🙂")
@@ -211,6 +223,7 @@ public class GatewayCronNonblockingE2eTest {
                 @Expect(telegram.hasText("telegram-3-🙂"), true)
                 release.store(true)
                 @Expect(runner.waitUntilIdle(), true)
+                @Expect(runner.activeExecutionCount(), 0)
                 runner.tick()
                 @Expect(cronLoadOrEmpty(storePath)[0].state.lastStatus, "success")
             } finally {
@@ -229,6 +242,21 @@ public class GatewayCronNonblockingE2eTest {
             let sameB = cronM5Job("same-b", sessionTarget: "session:shared")
             let independent = cronM5Job("independent", sessionTarget: "isolated")
             cronSave(storePath, [sameA, sameB, independent])
+            let beforeReadonly = File.readFrom(storePath)
+            let listed = executeGatewayCronCommand(["cron", "list"])
+            let status = executeGatewayCronCommand(["cron", "status"])
+            @Expect(listed[1], 0)
+            @Expect(status[1], 0)
+            @Expect(listed[0].contains("same-a"), true)
+            let afterReadonly = File.readFrom(storePath)
+            @Expect(afterReadonly.size, beforeReadonly.size)
+            var readonlySame = afterReadonly.size == beforeReadonly.size
+            if (readonlySame) {
+                for (idx in 0..beforeReadonly.size) {
+                    if (beforeReadonly[idx] != afterReadonly[idx]) { readonlySame = false }
+                }
+            }
+            @Expect(readonlySame, true)
             let releaseA = AtomicBool(false)
             let enteredA = AtomicBool(false)
             let enteredB = AtomicBool(false)
@@ -586,6 +614,120 @@ public class GatewayCronNonblockingE2eTest {
             }
             @Expect(feishu.stopped, true)
             @Expect(telegram.stopped, true)
+        })
+    }
+
+    /** C6-E2E-03：修正后的 typed outcome 是唯一可投递正文，协议形状不进入投递和 run-log。 */
+    @TestCase
+    public func c6E2e03CorrectedTypedOutcomeDeliversChineseSummaryOnceWithoutProtocolLeak(): Unit {
+        withCronM5E2eHome({ storePath: Path =>
+            let job = cronM5Job(
+                "c6-e2e-03",
+                deliveryChannel: "feishu",
+                deliveryTo: "sports-chat"
+            )
+            job.deliveryAccountId = "m5-feishu"
+            cronSave(storePath, [job])
+            let modelAttempts = AtomicInt64(0)
+            let observedToolExecutions = AtomicInt64(0)
+            debugSetCronRunnerOutcomeForTest(Some({ _job, _request =>
+                // 模拟已经完成的一次 web tool，不允许 correction 重放它。
+                observedToolExecutions.fetchAdd(1)
+                modelAttempts.fetchAdd(1)
+                gatewayRunFinalAnswerCorrection(
+                    "[\"web_fetch\"]",
+                    ["web_fetch"],
+                    { correctionPrompt =>
+                        @Expect(correctionPrompt.contains("禁止调用任何工具"), true)
+                        modelAttempts.fetchAdd(1)
+                        "今日体育摘要：中国队获胜🙂"
+                    },
+                    toolExecutionObserved: true,
+                    existingContext: "web_fetch 已完成：体育赛果"
+                )
+            }))
+            let feishu = CronM5E2eAdapter("feishu")
+            let telegram = CronM5E2eAdapter("telegram")
+            let gateway = cronM5Service(feishu, telegram)
+            let _ = CronRunner.runJobOnceFromStore(Some(gateway), storePath, job.id, true)
+            @Expect(modelAttempts.load(), 2)
+            @Expect(observedToolExecutions.load(), 1)
+            @Expect(feishu.sendCount(), 1)
+            @Expect(feishu.hasText("今日体育摘要：中国队获胜🙂"), true)
+            @Expect(feishu.hasText("[\"web_fetch\"]"), false)
+            @Expect(telegram.sendCount(), 0)
+            let jobs = cronLoadOrEmpty(storePath)
+            @Expect(jobs.size, 1)
+            for (stored in jobs) {
+                if (stored.id == job.id) { @Expect(stored.state.lastStatus, "success") }
+            }
+            let rows = readCronRunLogEntriesForJob(storePath, job.id)
+                .get("entries").getOrThrow().asArray()
+            @Expect(rows.size(), 1)
+            if (rows.size() == 1) {
+                let row = rows[0].asObject()
+                @Expect(row.get("status").getOrThrow().asString().getValue(), "ok")
+                @Expect(row.get("summary").getOrThrow().asString().getValue().contains("[\"web_fetch\"]"), false)
+            }
+        })
+    }
+
+    /** C6-E2E-04：两次协议形状均失败；失败告警按通道隔离且不会产生成功投递。 */
+    @TestCase
+    public func c6E2e04RepeatedProtocolFailureNeverFalseSucceedsAndIsolatesAlertChannels(): Unit {
+        withCronM5E2eHome({ storePath: Path =>
+            let feishuJob = cronM5Job("c6-e2e-04-feishu")
+            feishuJob.maxRetries = 1
+            feishuJob.failureDestMode = "announce"
+            feishuJob.failureChannel = "feishu"
+            feishuJob.failureTo = "failure-feishu"
+            feishuJob.failureAccountId = "m5-feishu"
+            let telegramJob = cronM5Job("c6-e2e-04-telegram")
+            telegramJob.maxRetries = 1
+            telegramJob.failureDestMode = "announce"
+            telegramJob.failureChannel = "telegram"
+            telegramJob.failureTo = "failure-telegram"
+            telegramJob.failureAccountId = "m5-telegram"
+            cronSave(storePath, [feishuJob, telegramJob])
+            let attempts = AtomicInt64(0)
+            let toolExecutions = AtomicInt64(0)
+            debugSetCronRunnerOutcomeForTest(Some({ _job, _request =>
+                attempts.fetchAdd(1)
+                GatewayAgentReplyOutcome(
+                    "incomplete_tool_protocol",
+                    diagnosticCode: "incomplete_tool_protocol",
+                    modelAttempts: 2,
+                    toolExecutionObserved: toolExecutions.load() > 0
+                )
+            }))
+            let feishu = CronM5E2eAdapter("feishu", failSend: true)
+            let telegram = CronM5E2eAdapter("telegram")
+            let gateway = cronM5Service(feishu, telegram)
+            let _ = CronRunner.runJobOnceFromStore(Some(gateway), storePath, feishuJob.id, true)
+            let _ = CronRunner.runJobOnceFromStore(Some(gateway), storePath, telegramJob.id, true)
+            @Expect(attempts.load(), 4)
+            @Expect(toolExecutions.load(), 0)
+            // Gateway 对失败 adapter 依次尝试 message-id 与 direct fallback；两次均失败，
+            // 不代表产生了两条用户可见告警。
+            @Expect(feishu.sendCount(), 2)
+            @Expect(telegram.sendCount(), 1)
+            @Expect(feishu.hasText("[\"web_fetch\"]"), false)
+            @Expect(telegram.hasText("[\"web_fetch\"]"), false)
+            for (job in cronLoadOrEmpty(storePath)) {
+                @Expect(job.state.lastStatus, "error")
+                @Expect(job.state.lastError.contains("incomplete_tool_protocol"), true)
+            }
+            for (id in [feishuJob.id, telegramJob.id]) {
+                let rows = readCronRunLogEntriesForJob(storePath, id)
+                    .get("entries").getOrThrow().asArray()
+                @Expect(rows.size(), 1)
+                if (rows.size() == 1) {
+                    let row = rows[0].asObject()
+                    @Expect(row.get("status").getOrThrow().asString().getValue(), "error")
+                    @Expect(row.get("diagnosticCode").getOrThrow().asString().getValue(), "incomplete_tool_protocol")
+                    @Expect(row.get("summary").getOrThrow().asString().getValue().contains("[\"web_fetch\"]"), false)
+                }
+            }
         })
     }
 }
