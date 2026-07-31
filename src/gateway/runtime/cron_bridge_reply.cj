@@ -1,6 +1,11 @@
 package metis.gateway.runtime
 
-import metis.gateway.core.{AgentBridge, GatewayExecutionControl, gatewayExecuteSessionRequestTurn}
+import metis.gateway.core.{
+    AgentBridge,
+    GatewayAgentReplyOutcome,
+    GatewayExecutionControl,
+    gatewayExecuteSessionRequestTurn
+}
 import metis.gateway.session.{GatewaySessionRequest, GatewayTurnContext}
 import magic.prelude.*
 
@@ -21,9 +26,9 @@ public func cronBridgeReply(
     options: CronSessionExecutionOptions,
     executionControl: GatewayExecutionControl,
     turnContextOverride!: Option<GatewayTurnContext> = None<GatewayTurnContext>
-): String {
+): GatewayAgentReplyOutcome {
     executionControl.throwIfCancelled()
-    let out = gatewayExecuteSessionRequestTurn(
+    let execution = gatewayExecuteSessionRequestTurn(
         bridge,
         request,
         prompt,
@@ -31,7 +36,13 @@ public func cronBridgeReply(
         bestEffortDeliver: options.bestEffortDeliver,
         turnContextOverride: turnContextOverride,
         executionControl: Some<GatewayExecutionControl>(executionControl)
-    ).execution.answer
+    ).execution
     executionControl.throwIfCancelled()
-    out
+    GatewayAgentReplyOutcome(
+        execution.finalStatus,
+        text: execution.answer,
+        diagnosticCode: execution.diagnosticCode,
+        recoverable: execution.finalStatus == "recoverable_tool_protocol",
+        explicitSilent: execution.finalStatus == "explicit_silent"
+    )
 }

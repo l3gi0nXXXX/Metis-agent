@@ -5,6 +5,7 @@ import metis.core.memory.DreamingPhaseRuntime
 import metis.core.{cronShellExecutionBlockedDiagnosticFromText, metisSafeRuneEllipsis}
 import metis.gateway.core.{
     AgentBridge,
+    GatewayAgentReplyOutcome,
     GatewayCronSessionReaperState,
     GatewayService,
     gatewayBridgeForSessionRequest,
@@ -239,6 +240,8 @@ private func backoffDelayMs(job: CronJob, attempt: Int64): Int64 {
 private let cronRunnerTestHookLock = Mutex()
 private var cronRunnerReplyForTest: Option<(CronJob, GatewaySessionRequest) -> String> =
     None<(CronJob, GatewaySessionRequest) -> String>
+private var cronRunnerOutcomeForTest: Option<(CronJob, GatewaySessionRequest) -> GatewayAgentReplyOutcome> =
+    None<(CronJob, GatewaySessionRequest) -> GatewayAgentReplyOutcome>
 private var cronRunnerBeforeExecuteForTest: Option<(CronJob) -> Unit> = None<(CronJob) -> Unit>
 private var cronRunnerRunLogAppendForTest: Option<() -> Unit> = None<() -> Unit>
 private var cronRunnerReservePersistForTest: Option<() -> Unit> = None<() -> Unit>
@@ -250,6 +253,14 @@ private var cronRunnerCommitForTest: Option<(String) -> Unit> = None<(String) ->
 public func debugSetCronRunnerReplyForTest(hook: Option<(CronJob, GatewaySessionRequest) -> String>): Unit {
     synchronized(cronRunnerTestHookLock) {
         cronRunnerReplyForTest = hook
+    }
+}
+
+public func debugSetCronRunnerOutcomeForTest(
+    hook: Option<(CronJob, GatewaySessionRequest) -> GatewayAgentReplyOutcome>
+): Unit {
+    synchronized(cronRunnerTestHookLock) {
+        cronRunnerOutcomeForTest = hook
     }
 }
 
@@ -296,6 +307,12 @@ public func debugSetCronRunnerCommitForTest(hook: Option<(String) -> Unit>): Uni
 private func cronRunnerReplyHookForTest(): Option<(CronJob, GatewaySessionRequest) -> String> {
     synchronized(cronRunnerTestHookLock) {
         cronRunnerReplyForTest
+    }
+}
+
+private func cronRunnerOutcomeHookForTest(): Option<(CronJob, GatewaySessionRequest) -> GatewayAgentReplyOutcome> {
+    synchronized(cronRunnerTestHookLock) {
+        cronRunnerOutcomeForTest
     }
 }
 
@@ -735,13 +752,21 @@ public class CronRunner {
         options: CronSessionExecutionOptions,
         executionControl: CronExecutionControl,
         turnContextOverride: Option<GatewayTurnContext>
-    ): String {
+    ): GatewayAgentReplyOutcome {
         let startedAt = epochMs()
+        match (cronRunnerOutcomeHookForTest()) {
+            case Some(hook) =>
+                let outcome = hook(j, request)
+                this.logCronWebOutcome(j, outcome, epochMs() - startedAt)
+                return outcome
+            case None => ()
+        }
         match (cronRunnerReplyHookForTest()) {
             case Some(hook) =>
                 let answer = hook(j, request)
-                this.logCronWebOutcome(j, answer, epochMs() - startedAt)
-                return answer
+                let outcome = GatewayAgentReplyOutcome("valid_text", text: answer)
+                this.logCronWebOutcome(j, outcome, epochMs() - startedAt)
+                return outcome
             case None => ()
         }
         if (cronShouldRouteThroughDreaming(j)) {
@@ -756,8 +781,13 @@ public class CronRunner {
                             .string("systemEvent", j.systemEvent)
                             .object()
                     )
-                    this.logCronWebOutcome(j, result, epochMs() - startedAt)
-                    return result
+                    let outcome = if (result.trimAscii().isEmpty()) {
+                        GatewayAgentReplyOutcome("explicit_silent", explicitSilent: true)
+                    } else {
+                        GatewayAgentReplyOutcome("valid_text", text: result)
+                    }
+                    this.logCronWebOutcome(j, outcome, epochMs() - startedAt)
+                    return outcome
                 case None =>
                     let answer = cronBridgeReply(bridge, request, prompt, options, executionControl, turnContextOverride: turnContextOverride)
                     this.logCronWebOutcome(j, answer, epochMs() - startedAt)
@@ -777,7 +807,22 @@ public class CronRunner {
         metisSafeRuneEllipsis(gatewayLogRedactText(parts[1].split("\n", 2)[0].trimAscii()), 80)
     }
 
-    private func logCronWebOutcome(j: CronJob, answer: String, durationMs: Int64): Unit {
+    private func logCronWebOutcome(j: CronJob, outcome: GatewayAgentReplyOutcome, durationMs: Int64): Unit {
+        if (outcome.status != "valid_text") {
+            gatewayLogEventWarn(
+                "gateway/cron",
+                "cron.failed",
+                "cron agent returned non-success outcome",
+                meta: gatewayLogMeta()
+                    .string("jobId", j.id)
+                    .string("status", outcome.status)
+                    .string("diagnosticCode", outcome.diagnosticCode)
+                    .int("durationMs", if (durationMs >= 0) { durationMs } else { 0 })
+                    .object()
+            )
+            return
+        }
+        let answer = outcome.text
         let providerId = this.cronWebProviderIdFromAnswer(answer)
         let safeDurationMs = if (durationMs >= 0) { durationMs } else { 0 }
         match (cronWebDiagnosticFromText(answer)) {
@@ -815,6 +860,48 @@ public class CronRunner {
                     }
                 }
         }
+    }
+
+    /** Cron owns success policy; it consumes typed state without parsing provider-private protocol. */
+    private func cronValidateAgentOutcome(
+        outcome: GatewayAgentReplyOutcome,
+        deliveryRequested: Bool
+    ): String {
+        if (outcome.status == "valid_text" && !outcome.text.trimAscii().isEmpty()) {
+            return outcome.text
+        }
+        if (outcome.status == "explicit_silent" && outcome.explicitSilent && !deliveryRequested) {
+            return ""
+        }
+        let code = if (!outcome.diagnosticCode.isEmpty()) {
+            outcome.diagnosticCode
+        } else if (outcome.status == "valid_text") {
+            "empty"
+        } else {
+            outcome.status
+        }
+        throw Exception("cron_agent_outcome_invalid:${code}")
+    }
+
+    private func cronAgentDiagnosticFromError(raw: String): String {
+        let prefix = "cron_agent_outcome_invalid:"
+        if (!raw.startsWith(prefix)) { return "" }
+        let parts = raw.split(prefix, 2)
+        if (parts.size < 2) { return "" }
+        parts[1].trimAscii()
+    }
+
+    private func cronArtifactAllowsSuccess(artifact: CronExecutionArtifact, deliveryRequested: Bool): Bool {
+        if (artifact.status != "success") { return false }
+        if (artifact.agentOutcomeStatus.isEmpty()) {
+            return true
+        }
+        if (artifact.agentOutcomeStatus == "valid_text") {
+            return !artifact.answer.trimAscii().isEmpty()
+        }
+        artifact.agentOutcomeStatus == "explicit_silent" &&
+            artifact.agentExplicitSilent &&
+            !deliveryRequested
     }
 
     private func appendRunLogIsolated(
@@ -1156,6 +1243,8 @@ public class CronRunner {
         var deliveryError = ""
         var diagnosticCode = ""
         var diagnosticMessage = ""
+        var agentOutcomeStatus = ""
+        var agentExplicitSilent = false
         var attempt: Int64 = 0
         let maxAttempts = max(1, j.maxRetries + 1)
         let control = match (executionControl) {
@@ -1281,7 +1370,13 @@ public class CronRunner {
                 while (attempt < maxAttempts) {
                     control.throwIfCancelled()
                     try {
-                        answer = this.executeJobReply(j, jobBridge, jobRequest, effectivePrompt, options, control, turnContextOverride)
+                        let outcome = this.executeJobReply(
+                            j, jobBridge, jobRequest, effectivePrompt, options, control, turnContextOverride
+                        )
+                        agentOutcomeStatus = outcome.status
+                        agentExplicitSilent = outcome.explicitSilent
+                        diagnosticCode = outcome.diagnosticCode
+                        answer = this.cronValidateAgentOutcome(outcome, dplan.requested)
                         control.throwIfCancelled()
                         status = "success"
                         errMsg = ""
@@ -1289,6 +1384,12 @@ public class CronRunner {
                     } catch (e: Exception) {
                         status = "error"
                         errMsg = e.message
+                        let outcomeDiagnostic = this.cronAgentDiagnosticFromError(e.message)
+                        if (!outcomeDiagnostic.isEmpty()) {
+                            diagnosticCode = outcomeDiagnostic
+                            diagnosticMessage = "cron agent outcome did not satisfy success policy"
+                            answer = ""
+                        }
                         gatewayLogEventError(
                             "gateway/cron",
                             "cron.failed",
@@ -1318,6 +1419,9 @@ public class CronRunner {
 
             if (!deferSideEffects && status == "success" && dplan.requested && !skipSuccessDelivery) {
                 control.throwIfCancelled()
+                if (agentOutcomeStatus != "valid_text" || answer.trimAscii().isEmpty()) {
+                    throw Exception("cron_agent_outcome_invalid:${if (diagnosticCode.isEmpty()) { "empty" } else { diagnosticCode }}")
+                }
                 let deliveryResult = this.sendSuccessDelivery(j, dplan, answer, startedAtMs, executionControl: Some(control))
                 deliveryStatus = deliveryResult[0]
                 deliveryError = deliveryResult[1]
@@ -1362,6 +1466,8 @@ public class CronRunner {
                 deliveryStatus: deliveryStatus, deliveryError: deliveryError,
                 diagnosticCode: if (diagnosticCode.isEmpty()) { this.cronDerivedRunDiagnosticCode(answer, errMsg) } else { diagnosticCode },
                 diagnosticMessage: if (diagnosticMessage.isEmpty()) { this.cronDerivedRunDiagnosticMessage(answer, errMsg) } else { diagnosticMessage },
+                agentOutcomeStatus: agentOutcomeStatus,
+                agentExplicitSilent: agentExplicitSilent,
                 endedAtMs: afterRun
             )
         } catch (fatal: Exception) {
@@ -1397,6 +1503,8 @@ public class CronRunner {
                 deliveryStatus: deliveryStatus, deliveryError: deliveryError,
                 diagnosticCode: this.cronDerivedRunDiagnosticCode(answer, errMsg),
                 diagnosticMessage: this.cronDerivedRunDiagnosticMessage(answer, errMsg),
+                agentOutcomeStatus: agentOutcomeStatus,
+                agentExplicitSilent: agentExplicitSilent,
                 endedAtMs: afterRun
             )
         }
@@ -1537,7 +1645,31 @@ public class CronRunner {
         "${id.jobId}:${id.scheduledAtMs}:${id.startedAtMs}"
     }
 
-    private func commitExecutionResult(result: CronExecutionResult): Unit {
+    private func commitExecutionResult(result: CronExecutionResult): Bool {
+        let resultDeliveryPlan = resolveCronDeliveryPlan(result.job)
+        if (
+            result.artifact.status == "success" &&
+            !this.cronArtifactAllowsSuccess(result.artifact, resultDeliveryPlan.requested)
+        ) {
+            let code = if (!result.artifact.diagnosticCode.isEmpty()) {
+                result.artifact.diagnosticCode
+            } else if (!result.artifact.agentOutcomeStatus.isEmpty()) {
+                result.artifact.agentOutcomeStatus
+            } else {
+                "empty"
+            }
+            result.artifact.status = "error"
+            result.artifact.answer = ""
+            result.artifact.diagnosticCode = code
+            result.artifact.diagnosticMessage = "cron agent outcome did not satisfy success policy"
+            result.artifact.error = "cron_agent_outcome_invalid:${code}"
+            this.finalizeError(
+                result.job,
+                result.executionId.startedAtMs,
+                if (result.artifact.endedAtMs > 0) { result.artifact.endedAtMs } else { epochMs() },
+                result.artifact.error
+            )
+        }
         if (result.executionControl.isCancelled()) {
             let reason = result.executionControl.reason()
             result.artifact.status = if (reason == "timed_out" || reason == "idle_timeout") { "timeout" } else { "cancelled" }
@@ -1600,13 +1732,13 @@ public class CronRunner {
                 "ignored stale cron completion",
                 meta: gatewayLogMeta().string("jobId", result.executionId.jobId).object()
             )
-            return
+            return false
         }
         for (entry in envelope.journal) {
             if (entry.executionId == identity) {
                 let dplan = resolveCronDeliveryPlan(result.job)
                 if (
-                    result.artifact.status == "success" &&
+                    this.cronArtifactAllowsSuccess(result.artifact, dplan.requested) &&
                     dplan.requested &&
                     !result.artifact.answer.isEmpty() &&
                     entry.deliveryReceipts.isEmpty()
@@ -1683,14 +1815,16 @@ public class CronRunner {
                 )
                 .object()
         )
+        true
     }
 
     private func drainAndCommitCompleted(results: Array<CronExecutionResult>): Array<CronExecutionResult> {
         let committed = ArrayList<CronExecutionResult>()
         for (result in results) {
             try {
-                this.commitExecutionResult(result)
-                committed.add(result)
+                if (this.commitExecutionResult(result)) {
+                    committed.add(result)
+                }
             } catch (e: Exception) {
                 this.completionRetry.add(result)
                 gatewayLogEventError(
@@ -1774,13 +1908,32 @@ public class CronRunner {
         let artifact = result.artifact
         let identity = this.executionIdText(result.executionId)
         let dplan = resolveCronDeliveryPlan(result.job)
+        let typedSuccess = this.cronArtifactAllowsSuccess(artifact, dplan.requested)
+        if (artifact.status == "success" && !typedSuccess) {
+            artifact.status = "error"
+            artifact.answer = ""
+            artifact.diagnosticCode = if (artifact.diagnosticCode.isEmpty()) {
+                if (artifact.agentOutcomeStatus.isEmpty()) { "empty" } else { artifact.agentOutcomeStatus }
+            } else {
+                artifact.diagnosticCode
+            }
+            artifact.diagnosticMessage = "cron agent outcome did not satisfy success policy"
+            artifact.error = "cron_agent_outcome_invalid:${artifact.diagnosticCode}"
+        }
         var deliveryStatus = artifact.deliveryStatus
         var deliveryError = artifact.deliveryError
         var durableDeliveryAllowed = true
         var deliveryMayHaveSucceeded = false
         let committedEnvelope = cronLoadStoreOrEmpty(this.storePath)
+        var journalMatched = false
+        var firstSideEffectSettlement = false
         for (entry in committedEnvelope.journal) {
             if (entry.executionId == identity) {
+                journalMatched = true
+                firstSideEffectSettlement = entry.phase == "delivery_pending"
+                if (entry.phase == "logged" && entry.runLogRecorded) {
+                    return
+                }
                 for (receipt in entry.deliveryReceipts) {
                     if (receipt.status == "unknown" && receipt.errorCode == "artifact_redacted") {
                         durableDeliveryAllowed = false
@@ -1790,7 +1943,16 @@ public class CronRunner {
                 }
             }
         }
-        if (artifact.status == "success" && dplan.requested && !artifact.answer.isEmpty() && durableDeliveryAllowed) {
+        if (!journalMatched) {
+            return
+        }
+        if (
+            firstSideEffectSettlement &&
+            typedSuccess &&
+            dplan.requested &&
+            !artifact.answer.isEmpty() &&
+            durableDeliveryAllowed
+        ) {
             result.executionControl.throwIfCancelled()
             synchronized(this.tickLock) {
                 let envelope = cronLoadStoreOrEmpty(this.storePath)
@@ -1843,7 +2005,7 @@ public class CronRunner {
                 )
             }
         }
-        if (artifact.status != "success") {
+        if (firstSideEffectSettlement && artifact.status != "success") {
             match (resolveCronFailurePlan(result.job, dplan)) {
                 case Some(fplan) =>
                     let alertAtMs = epochMs()

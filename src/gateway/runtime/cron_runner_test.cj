@@ -32,6 +32,7 @@ import metis.cron.{
 }
 import metis.gateway.core.{
     ChannelAdapter,
+    GatewayAgentReplyOutcome,
     GatewayRouter,
     GatewayService,
     gatewayLogEventInfo,
@@ -47,7 +48,7 @@ import std.core.Duration
 import std.env.{getVariable, setVariable}
 import std.fs.{Directory, File, Path, exists, remove}
 import std.process.launch
-import std.sync.{AtomicBool, Condition, Mutex}
+import std.sync.{AtomicBool, AtomicInt64, Condition, Mutex}
 import std.time.DateTime
 import std.unittest.testmacro.*
 import stdx.encoding.json.{JsonInt, JsonObject, JsonString, JsonValue}
@@ -68,11 +69,13 @@ private func withCronRunnerTestHome<T>(block: (Path) -> T): T {
             return block(cronStorePath(CliConfig.dotDir))
         } finally {
             debugSetCronRunnerReplyForTest(None<(CronJob, GatewaySessionRequest) -> String>)
+            debugSetCronRunnerOutcomeForTest(None<(CronJob, GatewaySessionRequest) -> GatewayAgentReplyOutcome>)
             debugSetCronRunnerBeforeExecuteForTest(None<(CronJob) -> Unit>)
             debugSetCronRunnerRunLogAppendForTest(None<() -> Unit>)
             debugSetCronRunnerReservePersistForTest(None<() -> Unit>)
             debugSetCronRunnerSubmitForTest(None<() -> Unit>)
             debugSetCronRunnerDeliveryForTest(None<() -> Unit>)
+            debugSetCronRunnerDeliveryStageForTest(None<(String) -> Unit>)
             debugSetCronRunnerCommitForTest(None<(String) -> Unit>)
             setGatewayAgentBridgeReplyRunnerForTest(None<(String, String, String, String, Bool, Option<(String) -> Unit>) -> String>)
             setGatewayWebProviderResolverForTest(None<(String) -> GatewayWebProviderResolution>)
@@ -1590,7 +1593,9 @@ public class CronRunnerTest {
             let runs = readCronRunLogEntriesForJob(storePath, "script-empty", limit: 10)
             let row = runs.get("entries").getOrThrow().asArray()[0].asObject()
             @Expect(row.get("status").getOrThrow().asString().getValue(), "ok")
-            @Expect(row.get("summary").getOrThrow().asString().getValue(), "")
+            let summary = row.get("summary").getOrThrow().asString().getValue()
+            @Expect(summary.contains("[\"web_fetch\"]"), false)
+            @Expect(summary.contains("模型返回了工具调用协议"), false)
             @Expect(row.get("deliveryStatus").getOrThrow().asString().getValue(), "not-requested")
         })
     }
@@ -2692,6 +2697,229 @@ public class CronRunnerDeliveryTest {
             @Expect(adapter.sendCount, 1)
             let afterThird = cronLoadOrEmpty(storePath)[0]
             @Expect(afterThird.state.consecutiveErrors, 3)
+        })
+    }
+}
+
+@Test
+public class CronRunnerTypedOutcomeGateTest {
+    @TestCase
+    public func c5U01BlockedOutcomeRetriesAndNeverUsesProtocolAsSuccessBody(): Unit {
+        withCronRunnerTestHome({ storePath: Path =>
+            let job = cronRunnerTestJob("c5-u-01")
+            job.maxRetries = 1
+            job.failureDestMode = "announce"
+            job.failureChannel = "feishu"
+            job.failureTo = "failure-chat"
+            job.failureAccountId = "default"
+            cronSave(storePath, [job])
+            let attempts = AtomicInt64(0)
+            debugSetCronRunnerOutcomeForTest(Some({ _job, _request =>
+                attempts.fetchAdd(1)
+                GatewayAgentReplyOutcome(
+                    "incomplete_tool_protocol",
+                    diagnosticCode: "incomplete_tool_protocol"
+                )
+            }))
+            let adapter = CronRunnerTestChannelAdapter("feishu")
+            let service = cronRunnerTestGateway(adapter, "feishu", "default")
+            let _ = CronRunner.runJobOnceFromStore(Some(service), storePath, job.id, true)
+            @Expect(attempts.load(), 2)
+            @Expect(adapter.sendCount, 1)
+            @Expect(adapter.lastText.contains("[\"web_fetch\"]"), false)
+            let after = cronLoadOrEmpty(storePath)[0]
+            @Expect(after.state.lastStatus, "error")
+            @Expect(after.state.lastError.contains("incomplete_tool_protocol"), true)
+            @Expect(after.state.lastError.contains("[\"web_fetch\"]"), false)
+            let row = readCronRunLogEntriesForJob(storePath, job.id)
+                .get("entries").getOrThrow().asArray()[0].asObject()
+            @Expect(row.get("status").getOrThrow().asString().getValue(), "error")
+            @Expect(row.get("diagnosticCode").getOrThrow().asString().getValue(), "incomplete_tool_protocol")
+            let summary = row.get("summary").getOrThrow().asString().getValue()
+            @Expect(summary.contains("[\"web_fetch\"]"), false)
+            @Expect(summary.contains("模型返回了工具调用协议"), false)
+        })
+    }
+
+    @TestCase
+    public func c5B01EmptySilentCancellationAndBestEffortStayInsideTypedGate(): Unit {
+        // valid_text with an empty body is never success.
+        withCronRunnerTestHome({ storePath: Path =>
+            let job = cronRunnerTestJob("c5-b-empty")
+            cronSave(storePath, [job])
+            debugSetCronRunnerOutcomeForTest(Some({ _job, _request =>
+                GatewayAgentReplyOutcome("valid_text", text: "")
+            }))
+            let _ = CronRunner.runJobOnceFromStore(None<GatewayService>, storePath, job.id, true)
+            @Expect(cronLoadOrEmpty(storePath)[0].state.lastStatus, "error")
+        })
+        // Explicit silent is allowed only when no visible delivery was requested.
+        withCronRunnerTestHome({ storePath: Path =>
+            let silent = cronRunnerTestJob("c5-b-silent")
+            cronSave(storePath, [silent])
+            debugSetCronRunnerOutcomeForTest(Some({ _job, _request =>
+                GatewayAgentReplyOutcome("explicit_silent", explicitSilent: true)
+            }))
+            let _ = CronRunner.runJobOnceFromStore(None<GatewayService>, storePath, silent.id, true)
+            @Expect(cronLoadOrEmpty(storePath)[0].state.lastStatus, "success")
+        })
+        withCronRunnerTestHome({ storePath: Path =>
+            let requested = cronRunnerTestJob("c5-b-silent-requested")
+            requested.deliveryMode = "announce"
+            requested.deliveryChannel = "feishu"
+            requested.deliveryTo = "chat-1"
+            cronSave(storePath, [requested])
+            debugSetCronRunnerOutcomeForTest(Some({ _job, _request =>
+                GatewayAgentReplyOutcome("explicit_silent", explicitSilent: true)
+            }))
+            let adapter = CronRunnerTestChannelAdapter("feishu")
+            let service = cronRunnerTestGateway(adapter, "feishu", "default")
+            let _ = CronRunner.runJobOnceFromStore(Some(service), storePath, requested.id, true)
+            @Expect(cronLoadOrEmpty(storePath)[0].state.lastStatus, "error")
+            @Expect(adapter.sendCount, 0)
+        })
+        // Deadline becomes cancelled after the outcome but before any delivery side effect.
+        withCronRunnerTestHome({ storePath: Path =>
+            let timed = cronRunnerTestJob("c5-b-cancel")
+            timed.timeoutMs = 10
+            timed.deliveryMode = "announce"
+            timed.deliveryChannel = "feishu"
+            timed.deliveryTo = "chat-1"
+            cronSave(storePath, [timed])
+            debugSetCronRunnerOutcomeForTest(Some({ _job, _request =>
+                sleep(Duration.millisecond * 20)
+                GatewayAgentReplyOutcome("valid_text", text: "不应投递🙂")
+            }))
+            let adapter = CronRunnerTestChannelAdapter("feishu")
+            let service = cronRunnerTestGateway(adapter, "feishu", "default")
+            let _ = CronRunner.runJobOnceFromStore(Some(service), storePath, timed.id, true)
+            @Expect(adapter.sendCount, 0)
+            @Expect(cronLoadOrEmpty(storePath)[0].state.lastStatus, "timeout")
+        })
+        // Best-effort changes delivery failure semantics, never typed outcome semantics.
+        withCronRunnerTestHome({ storePath: Path =>
+            let best = cronRunnerTestJob("c5-b-best-effort")
+            best.deliveryMode = "announce"
+            best.deliveryChannel = "feishu"
+            best.deliveryTo = "chat-1"
+            best.bestEffortDeliver = true
+            cronSave(storePath, [best])
+            debugSetCronRunnerOutcomeForTest(Some({ _job, _request =>
+                GatewayAgentReplyOutcome("incomplete", diagnosticCode: "terminal_answer_empty")
+            }))
+            let adapter = CronRunnerTestChannelAdapter("feishu", failSend: true)
+            let service = cronRunnerTestGateway(adapter, "feishu", "default")
+            let _ = CronRunner.runJobOnceFromStore(Some(service), storePath, best.id, true)
+            @Expect(cronLoadOrEmpty(storePath)[0].state.lastStatus, "error")
+            @Expect(adapter.sendCount, 0)
+        })
+    }
+
+    @TestCase
+    public func c5P01SecondValidChineseOutcomeDeliversToFeishuExactlyOnce(): Unit {
+        withCronRunnerTestHome({ storePath: Path =>
+            let job = cronRunnerTestJob("c5-p-01")
+            job.maxRetries = 1
+            job.deliveryMode = "announce"
+            job.deliveryChannel = "feishu"
+            job.deliveryTo = "chat-1"
+            job.deliveryAccountId = "tenant-a"
+            cronSave(storePath, [job])
+            let attempts = AtomicInt64(0)
+            debugSetCronRunnerOutcomeForTest(Some({ _job, _request =>
+                if (attempts.fetchAdd(1) == 0) {
+                    GatewayAgentReplyOutcome("incomplete", diagnosticCode: "terminal_answer_empty")
+                } else {
+                    GatewayAgentReplyOutcome("valid_text", text: "今日体育摘要🙂")
+                }
+            }))
+            let adapter = CronRunnerTestChannelAdapter("feishu")
+            let service = cronRunnerTestGateway(adapter, "feishu", "tenant-a")
+            let _ = CronRunner.runJobOnceFromStore(Some(service), storePath, job.id, true)
+            @Expect(attempts.load(), 2)
+            @Expect(adapter.sendCount, 1)
+            @Expect(adapter.lastText.contains("今日体育摘要🙂"), true)
+            @Expect(cronLoadOrEmpty(storePath)[0].state.lastStatus, "success")
+            let row = readCronRunLogEntriesForJob(storePath, job.id)
+                .get("entries").getOrThrow().asArray()[0].asObject()
+            @Expect(row.get("status").getOrThrow().asString().getValue(), "ok")
+        })
+    }
+
+    @TestCase
+    public func c5N01AllBlockedCompletionSettlesErrorSideEffectsAtMostOnce(): Unit {
+        withCronRunnerTestHome({ storePath: Path =>
+            let job = cronRunnerTestJob("c5-n-01")
+            job.maxRetries = 1
+            job.deliveryMode = "announce"
+            job.deliveryChannel = "feishu"
+            job.deliveryTo = "chat-1"
+            job.failureDestMode = "announce"
+            job.failureChannel = "feishu"
+            job.failureTo = "failure-chat"
+            cronSave(storePath, [job])
+            debugSetCronRunnerOutcomeForTest(Some({ _job, _request =>
+                GatewayAgentReplyOutcome("recoverable_tool_protocol", diagnosticCode: "tool_protocol", recoverable: true)
+            }))
+            let commits = AtomicInt64(0)
+            debugSetCronRunnerCommitForTest(Some({ stage =>
+                if (stage == "after-result-commit") { commits.fetchAdd(1) }
+            }))
+            let adapter = CronRunnerTestChannelAdapter("feishu")
+            let service = cronRunnerTestGateway(adapter, "feishu", "default")
+            let runner = CronRunner(gatewayOpt: Some(service), storePath: storePath)
+            let _ = runner.enqueueJobManual(job.id, true)
+            @Expect(runner.waitUntilIdle(timeoutMs: 2000), true)
+            runner.tick()
+            runner.tick()
+            runner.tick()
+            @Expect(adapter.sendCount, 1)
+            @Expect(adapter.lastText.contains("[cron-failure:"), true)
+            @Expect(adapter.lastText.contains("迟到结果不得投递"), false)
+            @Expect(commits.load(), 1)
+            @Expect(readCronRunLogEntriesForJob(storePath, job.id)
+                .get("total").getOrThrow().asInt().getValue(), 1)
+            let after = cronLoadStoreOrEmpty(storePath)
+            @Expect(after.jobs[0].state.lastStatus, "error")
+            @Expect(after.journal[0].runLogRecorded, true)
+        })
+        // A completion that arrives after shutdown fencing is stale and cannot settle again.
+        withCronRunnerTestHome({ storePath: Path =>
+            let job = cronRunnerTestJob("c5-n-late")
+            job.deliveryMode = "announce"
+            job.deliveryChannel = "feishu"
+            job.deliveryTo = "chat-1"
+            cronSave(storePath, [job])
+            let entered = AtomicBool(false)
+            let release = AtomicBool(false)
+            debugSetCronRunnerOutcomeForTest(Some({ _job, _request =>
+                entered.store(true)
+                while (!release.load()) { sleep(Duration.millisecond * 2) }
+                GatewayAgentReplyOutcome("valid_text", text: "迟到结果不得投递")
+            }))
+            let commits = AtomicInt64(0)
+            debugSetCronRunnerCommitForTest(Some({ stage =>
+                if (stage == "after-result-commit") { commits.fetchAdd(1) }
+            }))
+            let adapter = CronRunnerTestChannelAdapter("feishu")
+            let service = cronRunnerTestGateway(adapter, "feishu", "default")
+            let runner = CronRunner(gatewayOpt: Some(service), storePath: storePath)
+            let _ = runner.enqueueJobManual(job.id, true)
+            let began = DateTime.now().toUnixTimeStamp().toMilliseconds()
+            while (!entered.load() && DateTime.now().toUnixTimeStamp().toMilliseconds() - began < 2000) {
+                sleep(Duration.millisecond * 2)
+            }
+            @Expect(entered.load(), true)
+            @Expect(runner.stop(drainTimeoutMs: 10).timedOut, true)
+            release.store(true)
+            @Expect(runner.waitUntilIdle(timeoutMs: 2000), true)
+            runner.tick()
+            runner.tick()
+            @Expect(commits.load(), 0)
+            @Expect(adapter.sendCount, 0)
+            @Expect(cronLoadOrEmpty(storePath)[0].state.lastStatus, "interrupted")
+            @Expect(readCronRunLogEntriesForJob(storePath, job.id)
+                .get("total").getOrThrow().asInt().getValue(), 1)
         })
     }
 }

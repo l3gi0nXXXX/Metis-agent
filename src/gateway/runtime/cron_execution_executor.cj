@@ -220,6 +220,9 @@ public class CronExecutionArtifact {
     public var deliveryError: String
     public var diagnosticCode: String
     public var diagnosticMessage: String
+    /** AgentBridge typed finalization snapshot; empty for script-only jobs. */
+    public var agentOutcomeStatus: String
+    public var agentExplicitSilent: Bool
     public var endedAtMs: Int64
 
     public init(
@@ -230,6 +233,8 @@ public class CronExecutionArtifact {
         deliveryError!: String = "",
         diagnosticCode!: String = "",
         diagnosticMessage!: String = "",
+        agentOutcomeStatus!: String = "",
+        agentExplicitSilent!: Bool = false,
         endedAtMs!: Int64 = 0
     ) {
         this.status = status
@@ -239,6 +244,8 @@ public class CronExecutionArtifact {
         this.deliveryError = deliveryError
         this.diagnosticCode = diagnosticCode
         this.diagnosticMessage = diagnosticMessage
+        this.agentOutcomeStatus = agentOutcomeStatus
+        this.agentExplicitSilent = agentExplicitSilent
         this.endedAtMs = endedAtMs
     }
 }
