@@ -1173,7 +1173,16 @@ public class AgentBridge {
         if (outcome.explicitSilent) {
             return "<SILENT_REPLY>"
         }
-        safeFallbackTextForBlockedAssistantReply(outcome.diagnosticCode)
+        let fallback = safeFallbackTextForBlockedAssistantReply(outcome.diagnosticCode)
+        synchronized(this.replyLock) {
+            if (!this.historyByConversation.contains(conversationKey)) {
+                this.historyByConversation[conversationKey] = this.sessionStore.loadHistoryLines(conversationKey)
+            }
+            let history = this.historyByConversation.get(conversationKey).getOrThrow()
+            history.add("assistant: ${fallback}")
+            this.sessionStore.appendAssistant(conversationKey, fallback)
+        }
+        fallback
     }
 
     public func replyWithOutcome(

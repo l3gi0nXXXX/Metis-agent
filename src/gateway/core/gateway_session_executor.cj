@@ -3,7 +3,7 @@ package metis.gateway.core
 import metis.core.{GatewayToolRuntimeContext, gatewaySpeechResolveDeliveryPrefs, gatewaySpeechResolveTtsConfig, gatewaySpeechTtsSynthesize, gatewayWithToolRuntimeContext}
 import metis.core.renderGatewayEditText
 import metis.core.config.{CliConfig, CliSettingManager}
-import metis.gateway.reply_guard.{normalizeGatewayAssistantVisibleTextForDelivery, stripAssistantToolXmlBlocks}
+import metis.gateway.reply_guard.{normalizeGatewayAssistantVisibleTextForDelivery, safeFallbackTextForBlockedAssistantReply, stripAssistantToolXmlBlocks}
 import metis.gateway.session.GatewaySessionContext
 
 import std.core.Duration
@@ -834,19 +834,99 @@ public func gatewayExecuteSessionTurn(
         }
         return GatewaySessionExecutionResult(answer, finalStatus: finalStatus, diagnosticCode: diagnosticCode)
     }
-    if (finalStatus != "valid_text") {
-        let deliveredByTool = finalStatus == "explicit_silent" && match (toolRuntimeContext) {
+    if (finalStatus != "valid_text" && finalStatus != "explicit_silent") {
+        let compatibilityText = { =>
+            let mediaFallback = gatewayMediaFailureFallbackText(toolRuntimeContext)
+            if (!mediaFallback.isEmpty()) {
+                mediaFallback
+            } else {
+                safeFallbackTextForBlockedAssistantReply(diagnosticCode)
+            }
+        }()
+        match (context.deliveryTarget) {
+            case Some(target) =>
+                match (deliverHook) {
+                    case Some(send) =>
+                        try {
+                            let messageId = send(
+                                target.channelName,
+                                target.accountId,
+                                target.peerId,
+                                compatibilityText,
+                                effectiveReplyToMessageId,
+                                effectiveReplyInThread
+                            )
+                            gatewayNotifySessionLifecycle(lifecycleHook, "done")
+                            return GatewaySessionExecutionResult(
+                                compatibilityText,
+                                finalStatus: finalStatus,
+                                diagnosticCode: diagnosticCode,
+                                delivered: true,
+                                deliveryStatus: if (gatewayMediaFailureFallbackText(toolRuntimeContext).isEmpty()) { "delivered-compatibility-fallback" } else { "delivered-fallback" },
+                                deliveryMessageId: messageId
+                            )
+                        } catch (ex: Exception) {
+                            if (!bestEffortDeliver) {
+                                throw ex
+                            }
+                            return GatewaySessionExecutionResult(
+                                compatibilityText,
+                                finalStatus: finalStatus,
+                                diagnosticCode: diagnosticCode,
+                                delivered: false,
+                                deliveryStatus: "best-effort-failed",
+                                deliveryError: ex.message
+                            )
+                        }
+                    case None => ()
+                }
+            case None => ()
+        }
+        gatewayNotifySessionLifecycle(lifecycleHook, "error")
+        return GatewaySessionExecutionResult(
+            compatibilityText,
+            finalStatus: finalStatus,
+            diagnosticCode: diagnosticCode,
+            delivered: false,
+            deliveryStatus: "not-delivered-final-outcome"
+        )
+    }
+    if (finalStatus == "explicit_silent" && !gatewayMediaFailureFallbackText(toolRuntimeContext).isEmpty()) {
+        let mediaFallback = gatewayMediaFailureFallbackText(toolRuntimeContext)
+        match (context.deliveryTarget) {
+            case Some(target) =>
+                match (deliverHook) {
+                    case Some(send) =>
+                        let messageId = send(target.channelName, target.accountId, target.peerId, mediaFallback, effectiveReplyToMessageId, effectiveReplyInThread)
+                        gatewayNotifySessionLifecycle(lifecycleHook, "done")
+                        return GatewaySessionExecutionResult(
+                            mediaFallback,
+                            finalStatus: finalStatus,
+                            diagnosticCode: diagnosticCode,
+                            delivered: true,
+                            deliveryStatus: "delivered-fallback",
+                            deliveryMessageId: messageId
+                        )
+                    case None => ()
+                }
+            case None => ()
+        }
+    }
+    if (finalStatus == "explicit_silent") {
+        let deliveredByTool = match (toolRuntimeContext) {
             case Some(runtimeContext) => runtimeContext.hasVisibleReplyDelivered()
             case None => false
         }
-        gatewayNotifySessionLifecycle(lifecycleHook, if (deliveredByTool) { "done" } else { "error" })
-        return GatewaySessionExecutionResult(
-            answer,
-            finalStatus: finalStatus,
-            diagnosticCode: diagnosticCode,
-            delivered: deliveredByTool,
-            deliveryStatus: if (deliveredByTool) { "delivered-by-tool" } else { "not-delivered-final-outcome" }
-        )
+        if (deliveredByTool) {
+            gatewayNotifySessionLifecycle(lifecycleHook, "done")
+            return GatewaySessionExecutionResult(
+                answer,
+                finalStatus: finalStatus,
+                diagnosticCode: diagnosticCode,
+                delivered: true,
+                deliveryStatus: "delivered-by-tool"
+            )
+        }
     }
     match (context.deliveryTarget) {
         case Some(target) =>

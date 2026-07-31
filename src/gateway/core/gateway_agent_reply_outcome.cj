@@ -102,7 +102,11 @@ public func gatewayRunFinalAnswerCorrection(
         return first
     }
     let correctionContext = if (existingContext.isEmpty()) { initialRaw } else { existingContext }
-    let correctedRaw = correctionRunner(gatewayBuildFinalAnswerCorrectionPrompt(correctionContext))
+    let correctedRaw = try {
+        correctionRunner(gatewayBuildFinalAnswerCorrectionPrompt(correctionContext))
+    } catch (_: Exception) {
+        ""
+    }
     let correctedGuard = normalizeGatewayAssistantFinalReply(correctedRaw, registeredToolNames: registeredToolNames)
     let corrected = gatewayFinalOutcomeFromGuard(
         correctedGuard,
