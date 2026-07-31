@@ -26,7 +26,7 @@ import std.sync.Mutex
 import std.time.*
 import stdx.encoding.json.{JsonArray, JsonObject, JsonString, JsonValue}
 import magic.model.ModelManager
-import magic.core.model.ChatModel
+import magic.core.model.{ChatModel, ChatRequest}
 
 @agent[
     model: CliModelManager.model,
@@ -389,6 +389,8 @@ private func gatewayToolAuthorized(
 private var gatewayAgentBridgeReplyRunnerForTest: Option<(String, String, String, String, Bool, Option<(String) -> Unit>) -> String> =
     None<(String, String, String, String, Bool, Option<(String) -> Unit>) -> String>
 private var gatewayAgentBridgeStreamingSnapshotsForTest: Option<Array<String>> = None<Array<String>>
+private var gatewayAgentBridgeFinalReplySequenceForTest: Option<(Array<String>, Array<String>, Bool)> =
+    None<(Array<String>, Array<String>, Bool)>
 
 public interface GatewayGitCodeMcpRuntimeAdapter {
     func invoke(toolName: String, args: JsonObject): JsonObject
@@ -508,6 +510,12 @@ public func setGatewayAgentBridgeStreamingSnapshotsForTest(snapshots: Option<Arr
     gatewayAgentBridgeStreamingSnapshotsForTest = snapshots
 }
 
+public func setGatewayAgentBridgeFinalReplySequenceForTest(
+    sequence: Option<(Array<String>, Array<String>, Bool)>
+): Unit {
+    gatewayAgentBridgeFinalReplySequenceForTest = sequence
+}
+
 private class GatewayLifecycleToolWrapper <: Tool {
     private let inner: Tool
     private let policyRoot: JsonObject
@@ -515,6 +523,7 @@ private class GatewayLifecycleToolWrapper <: Tool {
     private let agentId: String
     private let provider: String
     private let capturedRuntimeContext: Option<GatewayToolRuntimeContext>
+    private let executionTracker: Option<GatewayToolExecutionTracker>
 
     public init(
         inner: Tool,
@@ -522,7 +531,8 @@ private class GatewayLifecycleToolWrapper <: Tool {
         inventory!: Array<String> = [],
         agentId!: String = "",
         provider!: String = "",
-        capturedRuntimeContext!: Option<GatewayToolRuntimeContext> = None<GatewayToolRuntimeContext>
+        capturedRuntimeContext!: Option<GatewayToolRuntimeContext> = None<GatewayToolRuntimeContext>,
+        executionTracker!: Option<GatewayToolExecutionTracker> = None<GatewayToolExecutionTracker>
     ) {
         this.inner = inner
         this.policyRoot = policyRoot
@@ -530,6 +540,7 @@ private class GatewayLifecycleToolWrapper <: Tool {
         this.agentId = agentId.trimAscii()
         this.provider = provider.trimAscii()
         this.capturedRuntimeContext = capturedRuntimeContext
+        this.executionTracker = executionTracker
     }
 
     public prop name: String {
@@ -578,6 +589,10 @@ private class GatewayLifecycleToolWrapper <: Tool {
                 isError: true
             )
         }
+        match (this.executionTracker) {
+            case Some(tracker) => tracker.observed = true
+            case None => ()
+        }
         match (this.capturedRuntimeContext) {
             case Some(context) =>
                 match (context.heartbeatHook) {
@@ -590,6 +605,10 @@ private class GatewayLifecycleToolWrapper <: Tool {
             case Some(context) =>
                 gatewayWithToolRuntimeContext(context, { => this.inner.invoke(args) })
             case None => this.inner.invoke(args)
+        }
+        match (this.executionTracker) {
+            case Some(tracker) => tracker.recordResult(this.inner.name, response.content)
+            case None => ()
         }
         match (this.capturedRuntimeContext) {
             case Some(context) =>
@@ -608,6 +627,19 @@ private class GatewayLifecycleToolWrapper <: Tool {
 
     override public func toJsonValue(): JsonValue {
         this.inner.toJsonValue()
+    }
+}
+
+class GatewayToolExecutionTracker {
+    public var observed: Bool = false
+    private let results = ArrayList<String>()
+
+    public func recordResult(toolName: String, content: String): Unit {
+        this.results.add("${toolName}: ${metisSafeRuneEllipsis(content, 8000)}")
+    }
+
+    public func correctionContext(): String {
+        String.join(this.results.toArray(), delimiter: "\n\n")
     }
 }
 
@@ -702,7 +734,8 @@ func gatewayLifecycleWrappedTools(
     inventory!: Array<String> = [],
     agentId!: String = "",
     provider!: String = "",
-    capturedRuntimeContext!: Option<GatewayToolRuntimeContext> = None<GatewayToolRuntimeContext>
+    capturedRuntimeContext!: Option<GatewayToolRuntimeContext> = None<GatewayToolRuntimeContext>,
+    executionTracker!: Option<GatewayToolExecutionTracker> = None<GatewayToolExecutionTracker>
 ): ArrayList<Tool> {
     let wrapped = ArrayList<Tool>()
     for (tool in tools) {
@@ -712,7 +745,8 @@ func gatewayLifecycleWrappedTools(
             inventory: inventory,
             agentId: agentId,
             provider: provider,
-            capturedRuntimeContext: capturedRuntimeContext
+            capturedRuntimeContext: capturedRuntimeContext,
+            executionTracker: executionTracker
         ))
     }
     wrapped
@@ -751,7 +785,8 @@ private func gatewayApplyToolPolicy(
     user: GatewayUserSettings,
     agentId!: String = "",
     provider!: String = "",
-    turnContext!: Option<GatewayTurnContext> = None<GatewayTurnContext>
+    turnContext!: Option<GatewayTurnContext> = None<GatewayTurnContext>,
+    executionTracker!: Option<GatewayToolExecutionTracker> = None<GatewayToolExecutionTracker>
 ): Array<String> {
     let inventory = MetisSystemPromptBuilder.collectToolNames(agent.toolManager.tools)
     let policyRoot = gatewayRuntimePolicyRootForTurn(user, turnContext)
@@ -780,7 +815,8 @@ private func gatewayApplyToolPolicy(
         inventory: inventory,
         agentId: agentId,
         provider: provider,
-        capturedRuntimeContext: capturedRuntimeContext
+        capturedRuntimeContext: capturedRuntimeContext,
+        executionTracker: executionTracker
     ))
     report.deniedTools
 }
@@ -1120,6 +1156,37 @@ public class AgentBridge {
         turnContext!: Option<GatewayTurnContext> = None<GatewayTurnContext>,
         executionControl!: Option<GatewayExecutionControl> = None<GatewayExecutionControl>
     ): String {
+        let outcome = this.replyWithOutcome(
+            conversationKey,
+            prompt,
+            channelName: channelName,
+            agentId: agentId,
+            extraSystemPrompt: extraSystemPrompt,
+            streamingEnabled: streamingEnabled,
+            streamChunkHook: streamChunkHook,
+            turnContext: turnContext,
+            executionControl: executionControl
+        )
+        if (outcome.status == "valid_text") {
+            return outcome.text
+        }
+        if (outcome.explicitSilent) {
+            return "<SILENT_REPLY>"
+        }
+        safeFallbackTextForBlockedAssistantReply(outcome.diagnosticCode)
+    }
+
+    public func replyWithOutcome(
+        conversationKey: String,
+        prompt: String,
+        channelName!: String = "",
+        agentId!: String = "",
+        extraSystemPrompt!: String = "",
+        streamingEnabled!: Bool = false,
+        streamChunkHook!: Option<(String) -> Unit> = None<(String) -> Unit>,
+        turnContext!: Option<GatewayTurnContext> = None<GatewayTurnContext>,
+        executionControl!: Option<GatewayExecutionControl> = None<GatewayExecutionControl>
+    ): GatewayAgentReplyOutcome {
         synchronized(this.replyLock) {
             match (executionControl) {
                 case Some(control) => control.throwIfCancelled()
@@ -1139,7 +1206,9 @@ public class AgentBridge {
                     .object()
             )
             match (gatewayAgentBridgeReplyRunnerForTest) {
-                case Some(runner) => return runner(conversationKey, prompt, channelName, effectiveAgentId, streamingEnabled, streamChunkHook)
+                case Some(runner) =>
+                    let raw = runner(conversationKey, prompt, channelName, effectiveAgentId, streamingEnabled, streamChunkHook)
+                    return gatewayFinalOutcomeFromGuard(normalizeGatewayAssistantFinalReply(raw), raw)
                 case None => ()
             }
             // Unknown slash command should be handled deterministically and must not pollute session history.
@@ -1149,25 +1218,25 @@ public class AgentBridge {
                 if (lowCron == "/cron" || lowCron.startsWith("/cron ")) {
                     let parts = parseSlashCronLine(trimmedPrompt)
                     let (msg, _) = executeGatewayCronCommand(parts)
-                    return msg
+                    return GatewayAgentReplyOutcome("valid_text", text: msg)
                 }
                 if (trimmedPrompt == "/subagents" || trimmedPrompt.startsWith("/subagents ")) {
                     match (gatewayHandleSubagentsCommandLine(trimmedPrompt)) {
-                        case Some(out) => return out
+                        case Some(out) => return GatewayAgentReplyOutcome("valid_text", text: out)
                         case None => ()
                     }
                 }
                 match (gatewayHandleCodexRuntimeCommandLine(trimmedPrompt, conversationKey, turnContext: turnContext)) {
-                    case Some(out) => return out
+                    case Some(out) => return GatewayAgentReplyOutcome("valid_text", text: out)
                     case None => ()
                 }
                 match (gatewayHandleNativeCommandLine(trimmedPrompt)) {
-                    case Some(out) => return out
+                    case Some(out) => return GatewayAgentReplyOutcome("valid_text", text: out)
                     case None => ()
                 }
                 if (trimmedPrompt.startsWith("/skills ")) {
                     if (let Some(out) <- tryHandleSkillsCommand(trimmedPrompt)) {
-                        return out
+                        return GatewayAgentReplyOutcome("valid_text", text: out)
                     }
                 }
                 let forcedSkillCheck = parseForcedSkillFromSlash(trimmedPrompt, agentId: effectiveAgentId,
@@ -1185,7 +1254,7 @@ public class AgentBridge {
                             .string("reason", "unknown_slash_command")
                             .object()
                     )
-                    return "这不是一个有效的命令。可用 /cron 管理定时任务，/subagents 管理后台 subagent，或使用 /skills list 查看可用技能，或使用 /<skillName> 参数（例如 /weather 上海）。"
+                    return GatewayAgentReplyOutcome("valid_text", text: "这不是一个有效的命令。可用 /cron 管理定时任务，/subagents 管理后台 subagent，或使用 /skills list 查看可用技能，或使用 /<skillName> 参数（例如 /weather 上海）。")
                 }
             }
             if (!this.historyByConversation.contains(conversationKey)) {
@@ -1195,6 +1264,24 @@ public class AgentBridge {
             let history = this.historyByConversation.get(conversationKey).getOrThrow()
             history.add("user: ${prompt}")
             this.sessionStore.appendUser(conversationKey, prompt)
+            match (gatewayAgentBridgeFinalReplySequenceForTest) {
+                case Some(fixture) =>
+                    let replies = fixture[0]
+                    let initial = if (replies.size > 0) { replies[0] } else { "" }
+                    let corrected = if (replies.size > 1) { replies[1] } else { "" }
+                    let outcome = gatewayRunFinalAnswerCorrection(
+                        initial,
+                        fixture[1],
+                        { _correctionPrompt: String => corrected },
+                        toolExecutionObserved: fixture[2]
+                    )
+                    if (outcome.status == "valid_text") {
+                        history.add("assistant: ${outcome.text}")
+                        this.sessionStore.appendAssistant(conversationKey, outcome.text)
+                    }
+                    return outcome
+                case None => ()
+            }
 
             var effectivePrompt = prompt
             // Skill-driven model selection:
@@ -1286,6 +1373,8 @@ public class AgentBridge {
             var successfulPromptTokens: Int64 = -1
             var successfulCompletionTokens: Int64 = -1
             var successfulRegisteredToolNames: Array<String> = []
+            var successfulModel: Option<ChatModel> = None<ChatModel>
+            let toolExecutionTracker = GatewayToolExecutionTracker()
             let availableSkillsMeta = if (skillsEnabled) {
                 SkillsPrompt.buildAvailableSkillsMetadataForPrompt(agentId: effectiveAgentId)
             } else {
@@ -1353,7 +1442,8 @@ public class AgentBridge {
                     let invocationPolicyRoot = gatewayRuntimePolicyRootForTurn(gatewayUser, turnContext)
                     let invocationPolicyInventory = MetisSystemPromptBuilder.collectToolNames(agent.toolManager.tools)
                     let restrictedTools = gatewayApplyToolPolicy(agent, gatewayUser, agentId: effectiveAgentId,
-                        provider: currModel.fullName, turnContext: turnContext)
+                        provider: currModel.fullName, turnContext: turnContext,
+                        executionTracker: Some(toolExecutionTracker))
                     let registeredToolNames = MetisSystemPromptBuilder.collectToolNames(agent.toolManager.tools)
                     agent.model = currModel
                     let promptBuild = buildGatewaySystemPrompt(
@@ -1535,6 +1625,7 @@ public class AgentBridge {
                     successfulPromptTokens = if (codexAppServerPromptTokens >= 0) { codexAppServerPromptTokens } else { usagePair[0] }
                     successfulCompletionTokens = if (codexAppServerCompletionTokens >= 0) { codexAppServerCompletionTokens } else { usagePair[1] }
                     successfulModelName = currModel.fullName
+                    successfulModel = Some(currModel)
                     successfulRegisteredToolNames = registeredToolNames
                     let modelCallFinishedAtMs = DateTime.now().toUnixTimeStamp().toMilliseconds()
                     gatewayLogReplyMemory(
@@ -1651,48 +1742,46 @@ public class AgentBridge {
                 }
             }
 
-            if (answer.trimAscii().isEmpty()) {
-                answer = if (let Some(ex) <- lastEx) {
-                    "模型调用失败：${ex.message}"
-                } else {
-                    "模型调用失败：空响应"
-                }
-            }
-            let replyGuard = normalizeGatewayAssistantFinalReply(
-                answer,
-                registeredToolNames: successfulRegisteredToolNames
-            )
             match (executionControl) {
                 case Some(control) => control.throwIfCancelled()
                 case None => ()
             }
-            let guardedAnswer = if (replyGuard.ok) {
-                replyGuard.text
-            } else {
-                safeFallbackTextForBlockedAssistantReply(replyGuard.status)
-            }
-            let trimmed = guardedAnswer.trimAscii()
-            let reply = if (trimmed.isEmpty()) {
-                "（模型未返回有效正文：请确认网关窗口已打印「使用模型」与 metis.json 中配置一致；若缺少提供商密钥或 Base URL，请直接写入 ~/.metis/metis.json。若用推理模型请使用已合并 reasoning 的 CangjieMagic 并重新编译。）"
-            } else {
-                guardedAnswer
-            }
-            history.add("assistant: ${reply}")
-            this.sessionStore.appendAssistant(
-                conversationKey,
-                reply,
-                modelName: successfulModelName,
-                promptTokens: successfulPromptTokens,
-                completionTokens: successfulCompletionTokens
+            let correctionModel = successfulModel
+            let outcome = gatewayRunFinalAnswerCorrection(
+                answer,
+                successfulRegisteredToolNames,
+                { correctionPrompt: String =>
+                    match (correctionModel) {
+                        case Some(model) =>
+                            let response = gatewayRunModelWithExecutionControl(
+                                executionControl,
+                                { => model.create(ChatRequest(correctionPrompt)) }
+                            )
+                            response.message.content
+                        case None => ""
+                    }
+                },
+                toolExecutionObserved: toolExecutionTracker.observed,
+                existingContext: "${modelInput}\n\n已完成工具结果：\n${toolExecutionTracker.correctionContext()}\n\n模型首次输出：\n${answer}"
             )
+            if (outcome.status == "valid_text") {
+                history.add("assistant: ${outcome.text}")
+                this.sessionStore.appendAssistant(
+                    conversationKey,
+                    outcome.text,
+                    modelName: successfulModelName,
+                    promptTokens: successfulPromptTokens,
+                    completionTokens: successfulCompletionTokens
+                )
+            }
             gatewayLogReplyMemory(
                 "reply-finished",
                 conversationKey,
                 channelName,
                 agentId: effectiveAgentId,
-                note: "history=${history.size}, replyChars=${reply.size}, replyGuardStatus=${replyGuard.status}, replyGuardBlocked=${replyGuard.blocked}, diagnosticHash=${replyGuard.diagnosticHash}"
+                note: "history=${history.size}, replyChars=${outcome.text.size}, finalStatus=${outcome.status}, diagnosticCode=${outcome.diagnosticCode}, modelAttempts=${outcome.modelAttempts}"
             )
-            return reply
+            return outcome
         }
     }
 

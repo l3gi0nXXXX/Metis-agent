@@ -14,6 +14,8 @@ import stdx.encoding.json.{JsonArray, JsonBool, JsonInt, JsonObject, JsonString,
 
 public class GatewaySessionExecutionResult {
     public let answer: String
+    public let finalStatus: String
+    public let diagnosticCode: String
     public let delivered: Bool
     public let deliveryStatus: String
     public let deliveryError: String
@@ -21,12 +23,16 @@ public class GatewaySessionExecutionResult {
 
     public init(
         answer: String,
+        finalStatus!: String = "valid_text",
+        diagnosticCode!: String = "",
         delivered!: Bool = false,
         deliveryStatus!: String = "not-requested",
         deliveryError!: String = "",
         deliveryMessageId!: String = ""
     ) {
         this.answer = answer
+        this.finalStatus = finalStatus.trimAscii()
+        this.diagnosticCode = diagnosticCode.trimAscii()
         this.delivered = delivered
         this.deliveryStatus = deliveryStatus.trimAscii()
         this.deliveryError = deliveryError
@@ -464,7 +470,7 @@ private func gatewayReplyWithTimeout(
     toolRuntimeContext!: Option<GatewayToolRuntimeContext> = None<GatewayToolRuntimeContext>,
     streamingEnabled!: Bool = false,
     streamChunkHook!: Option<(String) -> Unit> = None<(String) -> Unit>
-): String {
+): GatewayAgentReplyOutcome {
     match (executionControl) {
         case Some(control) => control.throwIfCancelled()
         case None => ()
@@ -473,7 +479,7 @@ private func gatewayReplyWithTimeout(
         return match (toolRuntimeContext) {
             case Some(runtimeContext) =>
                 gatewayWithToolRuntimeContext(runtimeContext, { =>
-                    bridge.reply(
+                    bridge.replyWithOutcome(
                         context.sessionKey,
                         prompt,
                         channelName: context.channelName,
@@ -486,7 +492,7 @@ private func gatewayReplyWithTimeout(
                     )
                 })
             case None =>
-                bridge.reply(
+                bridge.replyWithOutcome(
                     context.sessionKey,
                     prompt,
                     channelName: context.channelName,
@@ -503,7 +509,7 @@ private func gatewayReplyWithTimeout(
         return match (toolRuntimeContext) {
             case Some(runtimeContext) =>
                 gatewayWithToolRuntimeContext(runtimeContext, { =>
-                    bridge.reply(
+                    bridge.replyWithOutcome(
                         context.sessionKey,
                         prompt,
                         channelName: context.channelName,
@@ -515,7 +521,7 @@ private func gatewayReplyWithTimeout(
                     )
                 })
             case None =>
-                bridge.reply(
+                bridge.replyWithOutcome(
                     context.sessionKey,
                     prompt,
                     channelName: context.channelName,
@@ -532,7 +538,7 @@ private func gatewayReplyWithTimeout(
         match (toolRuntimeContext) {
             case Some(runtimeContext) =>
                 gatewayWithToolRuntimeContext(runtimeContext, { =>
-                    bridge.reply(
+                    bridge.replyWithOutcome(
                         context.sessionKey,
                         prompt,
                         channelName: context.channelName,
@@ -544,7 +550,7 @@ private func gatewayReplyWithTimeout(
                     )
                 })
             case None =>
-                bridge.reply(
+                bridge.replyWithOutcome(
                     context.sessionKey,
                     prompt,
                     channelName: context.channelName,
@@ -590,7 +596,8 @@ public func gatewayExecuteSessionTurn(
     streamHook!: Option<(GatewaySessionContext, String) -> Unit> = None<(GatewaySessionContext, String) -> Unit>,
     streamingEnabled!: Bool = false,
     lifecycleHook!: Option<(String) -> Unit> = None<(String) -> Unit>
-    , executionControl!: Option<GatewayExecutionControl> = None<GatewayExecutionControl>
+    , executionControl!: Option<GatewayExecutionControl> = None<GatewayExecutionControl>,
+    finalRenderHook!: Option<(String) -> String> = None<(String) -> String>
 ): GatewaySessionExecutionResult {
     let effectiveReplyToMessageId = match (context.deliveryTarget) {
         case Some(target) =>
@@ -624,8 +631,10 @@ public func gatewayExecuteSessionTurn(
     let reasoningLaneEnabled = gatewayReasoningLaneEnabled(bridge, context)
     gatewayNotifySessionLifecycle(lifecycleHook, "thinking")
     var answer = ""
+    var finalStatus = "failed"
+    var diagnosticCode = ""
     try {
-        answer = gatewayReplyWithTimeout(
+        let replyOutcome = gatewayReplyWithTimeout(
             bridge,
             context,
             prompt,
@@ -765,6 +774,15 @@ public func gatewayExecuteSessionTurn(
             }
             })
         )
+        finalStatus = replyOutcome.status
+        diagnosticCode = replyOutcome.diagnosticCode
+        answer = if (replyOutcome.status == "valid_text") {
+            replyOutcome.text
+        } else if (replyOutcome.explicitSilent) {
+            "<SILENT_REPLY>"
+        } else {
+            ""
+        }
     } catch (ex: Exception) {
         match (executionControl) {
             case Some(control) => control.throwIfCancelled()
@@ -781,6 +799,8 @@ public func gatewayExecuteSessionTurn(
                                 gatewayNotifySessionLifecycle(lifecycleHook, "done")
                                 return GatewaySessionExecutionResult(
                                     fallbackText,
+                                    finalStatus: "failed",
+                                    diagnosticCode: "model_execution_failed",
                                     delivered: true,
                                     deliveryStatus: "delivered-fallback",
                                     deliveryMessageId: sentMessageId
@@ -812,7 +832,21 @@ public func gatewayExecuteSessionTurn(
             case Some(control) => control.throwIfCancelled()
             case None => ()
         }
-        return GatewaySessionExecutionResult(answer)
+        return GatewaySessionExecutionResult(answer, finalStatus: finalStatus, diagnosticCode: diagnosticCode)
+    }
+    if (finalStatus != "valid_text") {
+        let deliveredByTool = finalStatus == "explicit_silent" && match (toolRuntimeContext) {
+            case Some(runtimeContext) => runtimeContext.hasVisibleReplyDelivered()
+            case None => false
+        }
+        gatewayNotifySessionLifecycle(lifecycleHook, if (deliveredByTool) { "done" } else { "error" })
+        return GatewaySessionExecutionResult(
+            answer,
+            finalStatus: finalStatus,
+            diagnosticCode: diagnosticCode,
+            delivered: deliveredByTool,
+            deliveryStatus: if (deliveredByTool) { "delivered-by-tool" } else { "not-delivered-final-outcome" }
+        )
     }
     match (context.deliveryTarget) {
         case Some(target) =>
@@ -826,10 +860,14 @@ public func gatewayExecuteSessionTurn(
                             toolRuntimeContext
                         )
                         let fallbackText = gatewayMediaFailureFallbackText(toolRuntimeContext)
-                        let deliveryText = if (!fallbackText.isEmpty() && gatewayShouldUseMediaFailureFallback(visibleAnswer, toolRuntimeContext)) {
+                        let unrenderedDeliveryText = if (!fallbackText.isEmpty() && gatewayShouldUseMediaFailureFallback(visibleAnswer, toolRuntimeContext)) {
                             fallbackText
                         } else {
                             visibleAnswer
+                        }
+                        let deliveryText = match (finalRenderHook) {
+                            case Some(render) => render(unrenderedDeliveryText)
+                            case None => unrenderedDeliveryText
                         }
                         match (toolRuntimeContext) {
                             case Some(runtimeContext) =>
@@ -837,6 +875,8 @@ public func gatewayExecuteSessionTurn(
                                     gatewayNotifySessionLifecycle(lifecycleHook, "done")
                                     return GatewaySessionExecutionResult(
                                         answer,
+                                        finalStatus: finalStatus,
+                                        diagnosticCode: diagnosticCode,
                                         delivered: true,
                                         deliveryStatus: "delivered-by-tool"
                                     )
@@ -868,6 +908,8 @@ public func gatewayExecuteSessionTurn(
                                     gatewayNotifySessionLifecycle(lifecycleHook, "done")
                                     return GatewaySessionExecutionResult(
                                         answer,
+                                        finalStatus: finalStatus,
+                                        diagnosticCode: diagnosticCode,
                                         delivered: true,
                                         deliveryStatus: "delivered",
                                         deliveryMessageId: fallbackMessageId
@@ -887,6 +929,8 @@ public func gatewayExecuteSessionTurn(
                             gatewayNotifySessionLifecycle(lifecycleHook, "done")
                             return GatewaySessionExecutionResult(
                                 answer,
+                                finalStatus: finalStatus,
+                                diagnosticCode: diagnosticCode,
                                 delivered: true,
                                 deliveryStatus: "delivered",
                                 deliveryMessageId: streamingState.messageId
@@ -896,6 +940,8 @@ public func gatewayExecuteSessionTurn(
                         gatewayNotifySessionLifecycle(lifecycleHook, "done")
                         return GatewaySessionExecutionResult(
                             answer,
+                            finalStatus: finalStatus,
+                            diagnosticCode: diagnosticCode,
                             delivered: true,
                             deliveryStatus: "delivered",
                             deliveryMessageId: sentMessageId
@@ -905,6 +951,8 @@ public func gatewayExecuteSessionTurn(
                         if (bestEffortDeliver) {
                             return GatewaySessionExecutionResult(
                                 answer,
+                                finalStatus: finalStatus,
+                                diagnosticCode: diagnosticCode,
                                 delivered: false,
                                 deliveryStatus: "best-effort-failed",
                                 deliveryError: ex.message
@@ -916,6 +964,8 @@ public func gatewayExecuteSessionTurn(
                     if (bestEffortDeliver) {
                         return GatewaySessionExecutionResult(
                             answer,
+                            finalStatus: finalStatus,
+                            diagnosticCode: diagnosticCode,
                             delivered: false,
                             deliveryStatus: "best-effort-delivery-hook-missing",
                             deliveryError: "delivery hook is unavailable"
@@ -927,6 +977,8 @@ public func gatewayExecuteSessionTurn(
             if (bestEffortDeliver) {
                 return GatewaySessionExecutionResult(
                     answer,
+                    finalStatus: finalStatus,
+                    diagnosticCode: diagnosticCode,
                     delivered: false,
                     deliveryStatus: "best-effort-missing-target",
                     deliveryError: "reply target could not be resolved"
