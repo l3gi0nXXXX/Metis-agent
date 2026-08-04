@@ -1,8 +1,9 @@
 package metis.gateway.tools
 
+import magic.core.tool.Tool
 import metis.core.{GatewayToolRuntimeContext, gatewayWithToolRuntimeContext}
 
-import std.collection.ArrayList
+import std.collection.{ArrayList, HashMap}
 import std.fs.{Directory, File, Path, exists, remove}
 import std.time.DateTime
 import std.unittest.testmacro.*
@@ -581,6 +582,203 @@ public class GatewayFeishuMediaToolsetTest {
         @Expect(missingJson.get("ok").getOrThrow().asBool().getValue(), false)
         @Expect(missingJson.get("status").getOrThrow().asString().getValue(), "not_configured")
         @Expect(missingJson.get("identity").getOrThrow().asString().getValue(), "bot")
+    }
+
+    /// Find a macro-generated Tool by name on the media toolset's `tools` property.
+    private func findMediaTool(name: String): Tool {
+        for (tool in GatewayFeishuMediaToolset().tools) {
+            if (tool.name == name) {
+                return tool
+            }
+        }
+        throw Exception("media toolset tool not found: ${name}")
+    }
+
+    /// Build a Feishu media context that routes fetches to the historical OAPI path,
+    /// so the injected fake resource client observes the resolved resource type.
+    private func historicalMediaContext(root: String): JsonObject {
+        let media = JsonObject()
+        media.put("channel", JsonString("feishu"))
+        media.put("accountId", JsonString("tenant-a"))
+        let policy = JsonObject()
+        policy.put("cacheRoot", JsonString(root))
+        let context = JsonObject()
+        context.put("feishuHistoricalResource", policy)
+        media.put("context", context)
+        media
+    }
+
+    /// Invoke the macro-generated feishu_im_user_fetch_resource Tool through Tool.invoke
+    /// inside a runtime context, returning the raw ToolResponse content string.
+    private func invokeFetchResourceTool(root: String, args: HashMap<String, JsonValue>): String {
+        let tool = this.findMediaTool("feishu_im_user_fetch_resource")
+        gatewayWithToolRuntimeContext(
+            GatewayToolRuntimeContext("feishu", channelName: "feishu", sessionKey: "feishu:chat:1", mediaContext: this.historicalMediaContext(root)),
+            { => tool.invoke(args).content }
+        )
+    }
+
+    // T1-U1 / T1-U2: the generated schema must expose resource_type (a legal property
+    // key) and must not retain the backtick-escaped legacy `type` parameter name.
+    @TestCase
+    public func feishuFetchResourceSchemaUsesResourceType(): Unit {
+        let schema = this.findMediaTool("feishu_im_user_fetch_resource").toJsonValue().asObject()
+        let parameters = schema.get("parameters").getOrThrow().asObject()
+        let properties = parameters.get("properties").getOrThrow().asObject()
+        // T1-U1: property key set is exactly {message_id, file_key, resource_type}.
+        @Expect(properties.getFields().size, 3)
+        @Expect(properties.getFields().contains("message_id"), true)
+        @Expect(properties.getFields().contains("file_key"), true)
+        @Expect(properties.getFields().contains("resource_type"), true)
+        // T1-U2: structured key-by-key negatives; neither the backticked nor the bare
+        // legacy parameter name may appear as a property key.
+        @Expect(properties.getFields().contains("`type`"), false)
+        @Expect(properties.getFields().contains("type"), false)
+        // T1-U1: required is exactly [message_id, file_key].
+        let required = parameters.get("required").getOrThrow().asArray().getItems()
+        let requiredNames = ArrayList<String>()
+        for (item in required) {
+            requiredNames.add(item.asString().getValue())
+        }
+        @Expect(requiredNames.size, 2)
+        @Expect(requiredNames.contains("message_id"), true)
+        @Expect(requiredNames.contains("file_key"), true)
+        // T1-U2: optional resource_type must not be required; old names stay out too.
+        @Expect(requiredNames.contains("resource_type"), false)
+        @Expect(requiredNames.contains("type"), false)
+        @Expect(requiredNames.contains("`type`"), false)
+    }
+
+    // T1-U3: Tool.invoke dispatches the resource_type argument (explicit and default)
+    // through the macro-generated execFn into the helper and fake client.
+    @TestCase
+    public func feishuFetchResourceGeneratedToolInvokesResourceType(): Unit {
+        let root = "/tmp/metis-feishu-tool-invoke-${DateTime.now().toUnixTimeStamp().toMilliseconds()}"
+        try { remove(Path(root), recursive: true) } catch (_e: Exception) { () }
+        try {
+            // Explicit resource_type:"image" reaches the fake client unchanged.
+            let explicitClient = FeishuMediaToolsetFakeResourceClient()
+            setGatewayFeishuHistoricalResourceClientForTest(Some<FeishuOapiResourceClient>(explicitClient))
+            let explicitArgs = HashMap<String, JsonValue>()
+            explicitArgs.add("message_id", JsonString("om_history"))
+            explicitArgs.add("file_key", JsonString("img_history"))
+            explicitArgs.add("resource_type", JsonString("image"))
+            let explicitOut = this.invokeFetchResourceTool(root, explicitArgs)
+            let explicitJson = JsonValue.fromStr(explicitOut).asObject()
+            @Expect(explicitClient.captured[3], "image")
+            @Expect(explicitJson.get("status").getOrThrow().asString().getValue(), "ok")
+            // Omitted resource_type falls back to the pre-rename default "file".
+            let defaultClient = FeishuMediaToolsetFakeResourceClient()
+            setGatewayFeishuHistoricalResourceClientForTest(Some<FeishuOapiResourceClient>(defaultClient))
+            let defaultArgs = HashMap<String, JsonValue>()
+            defaultArgs.add("message_id", JsonString("om_history"))
+            defaultArgs.add("file_key", JsonString("img_history"))
+            let defaultOut = this.invokeFetchResourceTool(root, defaultArgs)
+            let defaultJson = JsonValue.fromStr(defaultOut).asObject()
+            @Expect(defaultClient.captured[3], "file")
+            @Expect(defaultJson.get("ok").getOrThrow().asBool().getValue(), true)
+        } finally {
+            setGatewayFeishuHistoricalResourceClientForTest(None<FeishuOapiResourceClient>)
+            try { remove(Path(root), recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    // T1-B1: boundary values through Tool.invoke — omitted -> "file", "image" -> "image",
+    // empty string -> passed through as "" (current pass-through semantics).
+    @TestCase
+    public func feishuFetchResourceGeneratedToolBoundaryResourceTypes(): Unit {
+        let root = "/tmp/metis-feishu-tool-boundary-${DateTime.now().toUnixTimeStamp().toMilliseconds()}"
+        try { remove(Path(root), recursive: true) } catch (_e: Exception) { () }
+        try {
+            // Omitted optional argument -> default "file".
+            let omittedClient = FeishuMediaToolsetFakeResourceClient()
+            setGatewayFeishuHistoricalResourceClientForTest(Some<FeishuOapiResourceClient>(omittedClient))
+            let omittedArgs = HashMap<String, JsonValue>()
+            omittedArgs.add("message_id", JsonString("om_history"))
+            omittedArgs.add("file_key", JsonString("img_history"))
+            this.invokeFetchResourceTool(root, omittedArgs)
+            @Expect(omittedClient.captured[3], "file")
+            // Explicit "image" -> "image".
+            let imageClient = FeishuMediaToolsetFakeResourceClient()
+            setGatewayFeishuHistoricalResourceClientForTest(Some<FeishuOapiResourceClient>(imageClient))
+            let imageArgs = HashMap<String, JsonValue>()
+            imageArgs.add("message_id", JsonString("om_history"))
+            imageArgs.add("file_key", JsonString("img_history"))
+            imageArgs.add("resource_type", JsonString("image"))
+            this.invokeFetchResourceTool(root, imageArgs)
+            @Expect(imageClient.captured[3], "image")
+            // Explicit empty string -> "" is passed through, not replaced by default.
+            let emptyClient = FeishuMediaToolsetFakeResourceClient()
+            setGatewayFeishuHistoricalResourceClientForTest(Some<FeishuOapiResourceClient>(emptyClient))
+            let emptyArgs = HashMap<String, JsonValue>()
+            emptyArgs.add("message_id", JsonString("om_history"))
+            emptyArgs.add("file_key", JsonString("img_history"))
+            emptyArgs.add("resource_type", JsonString(""))
+            this.invokeFetchResourceTool(root, emptyArgs)
+            @Expect(emptyClient.captured[3], "")
+        } finally {
+            setGatewayFeishuHistoricalResourceClientForTest(None<FeishuOapiResourceClient>)
+            try { remove(Path(root), recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    // T1-N1: two independent negative scenarios — unknown file key yields a structured
+    // not_found result; an unknown resource_type is passed through as-is.
+    @TestCase
+    public func feishuFetchResourceGeneratedToolNegativeScenarios(): Unit {
+        let root = "/tmp/metis-feishu-tool-negative-${DateTime.now().toUnixTimeStamp().toMilliseconds()}"
+        try { remove(Path(root), recursive: true) } catch (_e: Exception) { () }
+        try {
+            // Scenario 1: file_key "missing" -> fake client returns not_found by fileKey.
+            let missingClient = FeishuMediaToolsetFakeResourceClient()
+            setGatewayFeishuHistoricalResourceClientForTest(Some<FeishuOapiResourceClient>(missingClient))
+            let missingArgs = HashMap<String, JsonValue>()
+            missingArgs.add("message_id", JsonString("om_history"))
+            missingArgs.add("file_key", JsonString("missing"))
+            missingArgs.add("resource_type", JsonString("image"))
+            let missingOut = this.invokeFetchResourceTool(root, missingArgs)
+            let missingJson = JsonValue.fromStr(missingOut).asObject()
+            @Expect(missingJson.get("ok").getOrThrow().asBool().getValue(), false)
+            @Expect(missingJson.get("status").getOrThrow().asString().getValue(), "not_found")
+            // Scenario 2: unknown resource_type "weird" is passed through untouched.
+            let weirdClient = FeishuMediaToolsetFakeResourceClient()
+            setGatewayFeishuHistoricalResourceClientForTest(Some<FeishuOapiResourceClient>(weirdClient))
+            let weirdArgs = HashMap<String, JsonValue>()
+            weirdArgs.add("message_id", JsonString("om_history"))
+            weirdArgs.add("file_key", JsonString("img_history"))
+            weirdArgs.add("resource_type", JsonString("weird"))
+            this.invokeFetchResourceTool(root, weirdArgs)
+            @Expect(weirdClient.captured[3], "weird")
+        } finally {
+            setGatewayFeishuHistoricalResourceClientForTest(None<FeishuOapiResourceClient>)
+            try { remove(Path(root), recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+
+    // T1-N2: legacy keys "type" / "`type`" are ignored by the generated execFn, which
+    // only looks up the new parameter name; the missing optional falls back to "file".
+    @TestCase
+    public func feishuFetchResourceGeneratedToolIgnoresLegacyTypeKey(): Unit {
+        let root = "/tmp/metis-feishu-tool-legacy-${DateTime.now().toUnixTimeStamp().toMilliseconds()}"
+        try { remove(Path(root), recursive: true) } catch (_e: Exception) { () }
+        let client = FeishuMediaToolsetFakeResourceClient()
+        setGatewayFeishuHistoricalResourceClientForTest(Some<FeishuOapiResourceClient>(client))
+        try {
+            let args = HashMap<String, JsonValue>()
+            args.add("message_id", JsonString("om_history"))
+            args.add("file_key", JsonString("img_history"))
+            // Only the legacy keys are supplied; resource_type itself is absent.
+            args.add("type", JsonString("image"))
+            args.add("`type`", JsonString("image"))
+            let out = this.invokeFetchResourceTool(root, args)
+            let json = JsonValue.fromStr(out).asObject()
+            // The legacy keys must not be picked up; the default "file" wins.
+            @Expect(client.captured[3], "file")
+            @Expect(json.get("ok").getOrThrow().asBool().getValue(), true)
+        } finally {
+            setGatewayFeishuHistoricalResourceClientForTest(None<FeishuOapiResourceClient>)
+            try { remove(Path(root), recursive: true) } catch (_e: Exception) { () }
+        }
     }
 
     @TestCase

@@ -823,12 +823,15 @@ public class GatewayFeishuMediaToolset {
         out.toJsonString()
     }
 
+    // resource_type is a plain identifier on purpose: the previous backtick-escaped
+    // `type` keyword leaked literal backticks into the generated tool JSON schema and
+    // was rejected upstream by the property-key pattern ^[a-zA-Z0-9_.-]{1,64}$.
     @tool[
-        description: "Fetch a Feishu IM message resource from the current turn context. Parameters are message_id, file_key, and type. Use type=image for image resources and type=file for file/audio/video resources. This returns the staged local file path when the Feishu channel already downloaded the resource; otherwise it returns a structured permission or download diagnostic."
+        description: "Fetch a Feishu IM message resource from the current turn context. Parameters are message_id, file_key, and resource_type. Use resource_type=image for image resources and resource_type=file for file/audio/video resources. This returns the staged local file path when the Feishu channel already downloaded the resource; otherwise it returns a structured permission or download diagnostic."
     ]
-    public func feishu_im_user_fetch_resource(message_id: String, file_key: String, `type`: Option<String>): String {
+    public func feishu_im_user_fetch_resource(message_id: String, file_key: String, resource_type: Option<String>): String {
         PrintUtils.printTool("feishu_im_user_fetch_resource", shortMessage: "current")
-        feishuMediaToolFetchResource(message_id, file_key, `type` ?? "file")
+        feishuMediaToolFetchResource(message_id, file_key, resource_type ?? "file")
     }
 
     @tool[
