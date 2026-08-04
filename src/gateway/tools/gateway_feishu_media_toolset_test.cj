@@ -584,6 +584,54 @@ public class GatewayFeishuMediaToolsetTest {
         @Expect(missingJson.get("identity").getOrThrow().asString().getValue(), "bot")
     }
 
+    /// Count occurrences of a tool name inside a collected name list.
+    private func countName(names: ArrayList<String>, target: String): Int64 {
+        var count: Int64 = 0
+        for (name in names) {
+            if (name == target) {
+                count += 1
+            }
+        }
+        count
+    }
+
+    // T2-U1 / T2-B1 (media side): the shadowed media-side feishu_im_bot_image tool is
+    // removed while every remaining media tool stays registered exactly once.
+    @TestCase
+    public func feishuMediaToolsetHasNoBotImageTool(): Unit {
+        let names = ArrayList<String>()
+        for (tool in GatewayFeishuMediaToolset().tools) {
+            names.add(tool.name)
+        }
+        @Expect(names.contains("feishu_im_bot_image"), false)
+        @Expect(this.countName(names, "feishu_im_bot_image"), 0)
+        @Expect(names.contains("feishu_media_list"), true)
+        @Expect(this.countName(names, "feishu_media_list"), 1)
+        @Expect(names.contains("feishu_im_user_fetch_resource"), true)
+        @Expect(this.countName(names, "feishu_im_user_fetch_resource"), 1)
+        @Expect(names.contains("feishu_media_send"), true)
+        @Expect(this.countName(names, "feishu_media_send"), 1)
+    }
+
+    // T2-R1: the staged bot-image capability survives the removal of the shadowed
+    // @tool wrapper — the debug entry still serves current-turn staged records with
+    // the same structured payload, and historical bot fetch still reports
+    // not_configured. Runs entirely on the in-memory fake media context.
+    @TestCase
+    public func feishuBotImageStagedCapabilityPreservedAfterToolRemoval(): Unit {
+        let toolset = GatewayFeishuMediaToolset()
+        let current = gatewayWithToolRuntimeContext(
+            GatewayToolRuntimeContext("feishu", channelName: "feishu", sessionKey: "feishu:chat:1", mediaContext: this.mediaContext()),
+            { => toolset.debugFeishuBotImageForTest("om_1", "img_1", Some("image")) }
+        )
+        let json = JsonValue.fromStr(current).asObject()
+        @Expect(json.get("ok").getOrThrow().asBool().getValue(), true)
+        @Expect(json.get("status").getOrThrow().asString().getValue(), "ok")
+        @Expect(json.get("identity").getOrThrow().asString().getValue(), "bot")
+        @Expect(json.get("content_type").getOrThrow().asString().getValue(), "image/png")
+        @Expect(json.get("saved_path").getOrThrow().asString().getValue().contains("diagram.png"), true)
+    }
+
     /// Find a macro-generated Tool by name on the media toolset's `tools` property.
     private func findMediaTool(name: String): Tool {
         for (tool in GatewayFeishuMediaToolset().tools) {

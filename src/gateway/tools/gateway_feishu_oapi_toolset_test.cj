@@ -1,5 +1,6 @@
 package metis.gateway.tools
 
+import magic.core.tool.Tool
 import metis.core.config.{CliConfig, CliSettingManager, GatewayUserSettings, MetisConfigManager, MetisProcessEnvironmentLock}
 
 import std.collection.{ArrayList, HashMap}
@@ -1696,5 +1697,79 @@ public class GatewayFeishuOapiToolsetTest {
         @Expect(scopes.contains("im:message"), true)
         @Expect(scopes.contains("contact:user:search"), true)
         @Expect(second.get("merged").getOrThrow().asBool().getValue(), true)
+    }
+
+    /// Count occurrences of a tool name inside a collected name list.
+    private func countToolName(names: ArrayList<String>, target: String): Int64 {
+        var count: Int64 = 0
+        for (name in names) {
+            if (name == target) {
+                count += 1
+            }
+        }
+        count
+    }
+
+    /// Collect the macro-generated tool names of a toolset's `tools` property.
+    private func collectToolNames(tools: Array<Tool>): ArrayList<String> {
+        let names = ArrayList<String>()
+        for (tool in tools) {
+            names.add(tool.name)
+        }
+        names
+    }
+
+    // T2-U2 / T2-B1 (OAPI side): the OAPI toolset stays the single owner of the
+    // feishu_im_bot_image tool name and its schema shape must not drift because of
+    // the media-side duplicate removal.
+    @TestCase
+    public func feishuOapiBotImageSchemaStable(): Unit {
+        let toolset = GatewayFeishuOapiToolset()
+        // T2-B1: the OAPI toolset carries exactly one feishu_im_bot_image tool.
+        let names = this.collectToolNames(toolset.tools)
+        @Expect(this.countToolName(names, "feishu_im_bot_image"), 1)
+        var botImage = Option<Tool>.None
+        for (tool in toolset.tools) {
+            if (tool.name == "feishu_im_bot_image") {
+                botImage = Some(tool)
+            }
+        }
+        let schema = botImage.getOrThrow().toJsonValue().asObject()
+        let parameters = schema.get("parameters").getOrThrow().asObject()
+        // T2-U2: the property key set is exactly {action, params_json, account_id}.
+        let properties = parameters.get("properties").getOrThrow().asObject()
+        @Expect(properties.getFields().size, 3)
+        @Expect(properties.getFields().contains("action"), true)
+        @Expect(properties.getFields().contains("params_json"), true)
+        @Expect(properties.getFields().contains("account_id"), true)
+        // required contains action; the optional envelope parameters stay optional.
+        let required = parameters.get("required").getOrThrow().asArray().getItems()
+        let requiredNames = ArrayList<String>()
+        for (item in required) {
+            requiredNames.add(item.asString().getValue())
+        }
+        @Expect(requiredNames.contains("action"), true)
+        @Expect(requiredNames.contains("params_json"), false)
+        @Expect(requiredNames.contains("account_id"), false)
+    }
+
+    // T2-N1: after removing the shadowed media-side duplicate, the media and OAPI
+    // Feishu toolsets share no tool name, so SimpleToolManager can no longer
+    // silently override one toolset's tool with the other's.
+    @TestCase
+    public func feishuToolsetsNoDuplicateNames(): Unit {
+        let merged = this.collectToolNames(GatewayFeishuMediaToolset().tools)
+        for (name in this.collectToolNames(GatewayFeishuOapiToolset().tools)) {
+            merged.add(name)
+        }
+        let duplicates = ArrayList<String>()
+        let seen = HashMap<String, Bool>()
+        for (name in merged) {
+            if (seen.contains(name) && !duplicates.contains(name)) {
+                duplicates.add(name)
+            }
+            seen.add(name, true)
+        }
+        @Expect(duplicates.size, 0)
     }
 }

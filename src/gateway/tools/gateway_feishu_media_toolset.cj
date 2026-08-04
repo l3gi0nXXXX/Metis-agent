@@ -834,13 +834,11 @@ public class GatewayFeishuMediaToolset {
         feishuMediaToolFetchResource(message_id, file_key, resource_type ?? "file")
     }
 
-    @tool[
-        description: "Fetch a Feishu IM bot image resource from the current turn context. Current-turn staged media returns a local path. Historical bot-identity resource fetch returns a structured not_configured diagnostic until tenant-token OAPI wiring is attached."
-    ]
-    public func feishu_im_bot_image(message_id: String, file_key: String, `type`: Option<String>): String {
-        PrintUtils.printTool("feishu_im_bot_image", shortMessage: "current")
-        feishuMediaToolFetchBotImage(message_id, file_key, `type` ?? "image")
-    }
+    // Note: the media-side feishu_im_bot_image @tool was removed on purpose. It was
+    // always shadowed by the OAPI toolset tool of the same name (SimpleToolManager
+    // registers by name and the OAPI toolset registers later), so it never reached
+    // the model. The staged bot-image capability itself is kept via
+    // feishuMediaToolFetchBotImage and debugFeishuBotImageForTest above.
 
     @tool[
         description: "Send a Feishu media payload through the current Gateway channels.send runtime. pathOrUrl is a local path or URL, kind can be photo, document, audio, voice, video, or video-note, and caption is optional."
