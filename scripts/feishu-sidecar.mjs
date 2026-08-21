@@ -24,10 +24,19 @@ const PROJECT_ROOT = path.dirname(SCRIPT_DIR);
 const DEFAULT_RUNTIME_ROOT = path.join(PROJECT_ROOT, "tools", "feishu-sidecar");
 const WITHDRAWN_REPLY_ERROR_CODES = new Set([230011, 231003]);
 const SENSITIVE_ARG = /^(?:--)?(?:app[-_]?secret|verification[-_]?token|encrypt[-_]?key)$/i;
+const DEFAULT_OPERATION_TIMEOUT_MS = 30_000;
+const MAX_ACTIVE_OPERATIONS = 64;
+const MAX_ACTIVE_OPERATIONS_PER_ACCOUNT = 16;
+const ORPHAN_RECYCLE_THRESHOLD = 8;
+const CLOSE_DRAIN_TIMEOUT_MS = 500;
 
 let state = {
   closing: false,
   accounts: new Map(),
+  protocolPending: new Map(),
+  activeSdkOperations: new Map(),
+  activeSdkOperationsByAccount: new Map(),
+  recycleRequiredEmitted: false,
 };
 const accountContext = new AsyncLocalStorage();
 
@@ -324,10 +333,11 @@ function websocketStatusMeta() {
 
 async function initialize(frame, options = {}) {
   const legacy = options.legacy === true;
+  const operation = options.operation;
   const phase = legacy ? "init" : "initAccount";
   const accountId = normalizeAccountId(frame.accountId);
   if (state.accounts.has(accountId)) {
-    emitError(accountId, {
+    emitInitError(operation, accountId, {
       phase,
       status: legacy ? "already_initialized" : "conflict",
       message: `Feishu sidecar account ${accountId} is already initialized`,
@@ -341,7 +351,7 @@ async function initialize(frame, options = {}) {
   const mode = String(frame.mode ?? "websocket").trim().toLowerCase();
   const apiMode = mode === "api" || mode === "rest" || mode === "request";
   if (!frame.appId || !frame.appSecret) {
-    emitError(account, { phase, status: "invalid_init", message: "Feishu init requires appId and appSecret" });
+    emitInitError(operation, account, { phase, status: "invalid_init", message: "Feishu init requires appId and appSecret" });
     state.accounts.delete(accountId);
     if (legacy) {
       exitSoon(1);
@@ -434,7 +444,7 @@ async function initialize(frame, options = {}) {
         emitDiagnostic("info", "api.start", "Feishu REST API client ready", {
           status: "ok",
         });
-        emitProtocol({
+        emitInitProtocol(operation, {
           type: "ready",
           accountId,
           transport: "api",
@@ -443,6 +453,9 @@ async function initialize(frame, options = {}) {
           proxy: proxy.summary,
           domain: String(frame.domain ?? "feishu"),
         });
+        if (operation?.timedOut) {
+          await closeAccountState(account, "late_init", { remove: true, emitClosed: false });
+        }
         return;
       }
       account.eventDispatcher = new sdk.EventDispatcher({
@@ -470,7 +483,7 @@ async function initialize(frame, options = {}) {
         status: "ok",
         ...websocketStatusMeta(),
       });
-      emitProtocol({
+      emitInitProtocol(operation, {
         type: "ready",
         accountId,
         transport: "websocket",
@@ -479,10 +492,13 @@ async function initialize(frame, options = {}) {
         proxy: proxy.summary,
         domain: String(frame.domain ?? "feishu"),
       });
+      if (operation?.timedOut) {
+        await closeAccountState(account, "late_init", { remove: true, emitClosed: false });
+      }
     } catch (error) {
       account.lastError = error;
       if (error?.phase === "dependency.preflight") {
-        emitError(account, {
+        emitInitError(operation, account, {
           phase: "dependency.preflight",
           status: error.status ?? "missing_dependency",
           message: error.message,
@@ -496,12 +512,16 @@ async function initialize(frame, options = {}) {
         return;
       }
       const status = error?.status ?? "start_failed";
-      emitError(account, {
+      emitInitError(operation, account, {
         phase: "websocket.start",
         status,
         message: error?.message ?? String(error),
       });
-      await closeSidecar(status);
+      if (operation?.timedOut) {
+        await closeAccountState(account, status, { remove: true, emitClosed: false });
+      } else {
+        await closeSidecar(status);
+      }
       state.accounts.delete(accountId);
       if (legacy) {
         exitSoon(1);
@@ -1524,11 +1544,13 @@ async function closeAccountState(account, reason = "stop", options = {}) {
       prefix: PREFIX,
     });
   }
-  emitProtocol({
-    type: "closed",
-    accountId: account.accountId,
-    reason,
-  });
+  if (options.emitClosed !== false) {
+    emitProtocol({
+      type: "closed",
+      accountId: account.accountId,
+      reason,
+    });
+  }
   if (options.remove) {
     state.accounts.delete(account.accountId);
   }
@@ -1547,8 +1569,256 @@ async function closeAllAccounts(reason = "stop") {
     return;
   }
   state.closing = true;
+  await drainOperations(CLOSE_DRAIN_TIMEOUT_MS);
   for (const account of [...state.accounts.values()]) {
     await withAccount(account, () => closeAccountState(account, reason));
+  }
+}
+
+function operationKey(accountId, requestId) {
+  return JSON.stringify([normalizeAccountId(accountId), String(requestId ?? "")]);
+}
+
+function emitInitProtocol(operation, frame) {
+  if (operation) {
+    settleOperation(operation, frame);
+  } else {
+    emitProtocol(frame);
+  }
+}
+
+function emitInitError(operation, accountOrId, params) {
+  const frame = {
+    type: "error",
+    accountId: accountIdOf(accountOrId),
+    phase: params.phase,
+    status: params.status ?? "error",
+    errorKind: params.errorKind,
+    requestId: params.requestId,
+    message: String(params.message ?? "Feishu sidecar error"),
+    ...(params.httpStatus !== undefined ? { httpStatus: params.httpStatus } : {}),
+    ...(params.feishuCode !== undefined ? { feishuCode: params.feishuCode } : {}),
+    ...(params.feishuMsgClass ? { feishuMsgClass: params.feishuMsgClass } : {}),
+    ...(params.runtimeRoot ? { runtimeRoot: params.runtimeRoot } : {}),
+    ...(params.missingPackage ? { missingPackage: params.missingPackage } : {}),
+  };
+  emitInitProtocol(operation, frame);
+}
+
+function operationTimeoutMs(frame) {
+  const configured = Number(frame?.operationTimeoutMs ?? frame?.requestTimeoutMs ?? DEFAULT_OPERATION_TIMEOUT_MS);
+  return Number.isFinite(configured) && configured > 0 ? Math.floor(configured) : DEFAULT_OPERATION_TIMEOUT_MS;
+}
+
+function reserveOperation(accountId, requestId, kind = "request") {
+  const normalizedAccountId = normalizeAccountId(accountId);
+  const normalizedRequestId = String(requestId ?? (kind === "init" ? "init" : ""));
+  const key = operationKey(normalizedAccountId, normalizedRequestId);
+  const accountActive = state.activeSdkOperationsByAccount.get(normalizedAccountId) ?? 0;
+  if (state.activeSdkOperations.has(key) || state.protocolPending.has(key)) {
+    return { ok: false, status: "duplicate_request", key, accountId: normalizedAccountId, requestId: normalizedRequestId };
+  }
+  if (state.activeSdkOperations.size >= MAX_ACTIVE_OPERATIONS || accountActive >= MAX_ACTIVE_OPERATIONS_PER_ACCOUNT) {
+    return { ok: false, status: "sidecar_busy", key, accountId: normalizedAccountId, requestId: normalizedRequestId };
+  }
+  const operation = {
+    ok: true,
+    key,
+    kind,
+    accountId: normalizedAccountId,
+    requestId: normalizedRequestId,
+    protocolSettled: false,
+    sdkSettled: false,
+    timedOut: false,
+  };
+  state.protocolPending.set(key, operation);
+  state.activeSdkOperations.set(key, operation);
+  state.activeSdkOperationsByAccount.set(normalizedAccountId, accountActive + 1);
+  return operation;
+}
+
+function releaseProtocolPending(operation) {
+  if (!operation || operation.protocolSettled) {
+    return false;
+  }
+  operation.protocolSettled = true;
+  state.protocolPending.delete(operation.key);
+  return true;
+}
+
+function releaseSdkOperation(operation) {
+  if (!operation || operation.sdkSettled) {
+    return;
+  }
+  operation.sdkSettled = true;
+  state.activeSdkOperations.delete(operation.key);
+  const remaining = Math.max(0, (state.activeSdkOperationsByAccount.get(operation.accountId) ?? 1) - 1);
+  if (remaining === 0) {
+    state.activeSdkOperationsByAccount.delete(operation.accountId);
+  } else {
+    state.activeSdkOperationsByAccount.set(operation.accountId, remaining);
+  }
+}
+
+function settleOperation(operation, frame) {
+  if (!releaseProtocolPending(operation)) {
+    emitLateResultDropped(operation);
+    return false;
+  }
+  if (frame) {
+    emitProtocol(frame);
+  }
+  return true;
+}
+
+function emitLateResultDropped(operation) {
+  emitDiagnostic(operation.accountId, "warn", "operation.late_result", "Dropped late Feishu sidecar operation result", {
+    status: "late_result_dropped",
+    operationKind: operation.kind,
+  });
+}
+
+function emitRecycleRequired() {
+  if (state.recycleRequiredEmitted) {
+    return;
+  }
+  const orphaned = [...state.activeSdkOperations.values()].filter((operation) => operation.timedOut).length;
+  if (orphaned < ORPHAN_RECYCLE_THRESHOLD) {
+    return;
+  }
+  state.recycleRequiredEmitted = true;
+  emitDiagnostic("default", "warn", "operation.lifecycle", "Feishu sidecar recycle required after timed-out SDK operations", {
+    status: "recycle_required",
+    orphanedOperations: orphaned,
+  });
+}
+
+async function runWithOperationDeadline(operation, timeoutMs, sdkOperation, reportLateResult = true) {
+  let timer;
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(() => resolve({ timedOut: true }), timeoutMs);
+  });
+  const sdkPromise = Promise.resolve().then(sdkOperation);
+  if (reportLateResult) {
+    sdkPromise.then(
+      () => { if (operation.timedOut) emitLateResultDropped(operation); },
+      () => { if (operation.timedOut) emitLateResultDropped(operation); },
+    );
+  }
+  sdkPromise.catch(() => {}).finally(() => releaseSdkOperation(operation));
+  const outcome = await Promise.race([
+    sdkPromise.then((value) => ({ value }), (error) => ({ error })),
+    timeout,
+  ]);
+  clearTimeout(timer);
+  if (outcome.timedOut) {
+    operation.timedOut = true;
+    settleOperation(operation, {
+      type: "error",
+      accountId: operation.accountId,
+      phase: operation.kind,
+      status: operation.kind === "init" ? "ready_timeout" : "request_timeout",
+      requestId: operation.kind === "request" ? operation.requestId : undefined,
+      message: `Feishu sidecar ${operation.kind} operation timed out`,
+    });
+    emitRecycleRequired();
+    return { timedOut: true };
+  }
+  return outcome;
+}
+
+async function dispatchInitAccount(frame, options = {}) {
+  const accountId = normalizeAccountId(frame.accountId);
+  const operation = reserveOperation(accountId, "init", "init");
+  if (!operation.ok) {
+    emitError(accountId, {
+      phase: frame.type === "init" ? "init" : "initAccount",
+      status: operation.status,
+      message: "Feishu sidecar operation capacity is exhausted",
+    });
+    return;
+  }
+  const outcome = await runWithOperationDeadline(
+    operation,
+    operationTimeoutMs(frame),
+    () => initialize(frame, { ...options, operation }),
+    false,
+  );
+  if (!outcome.timedOut) {
+    releaseProtocolPending(operation);
+  }
+}
+
+async function dispatchRequest(frame) {
+  const accountId = resolveFrameAccountId(frame);
+  const account = state.accounts.get(accountId);
+  if (!account) {
+    emitError(accountId, {
+      phase: frame.type,
+      status: "unknown_account",
+      requestId: frame.requestId,
+      message: `Unknown Feishu sidecar account: ${accountId}`,
+    });
+    return;
+  }
+  const operation = reserveOperation(accountId, frame.requestId, "request");
+  if (!operation.ok) {
+    emitError(accountId, {
+      phase: frame.type,
+      status: operation.status,
+      requestId: frame.requestId,
+      message: operation.status === "sidecar_busy" ? "Feishu sidecar operation capacity is exhausted" : "Duplicate Feishu sidecar request",
+    });
+    return;
+  }
+  const outcome = await runWithOperationDeadline(operation, operationTimeoutMs(frame), () =>
+    withAccount(account, () => dispatchSend(frame)),
+  );
+  if (outcome.timedOut) {
+    return;
+  }
+  if (outcome.error) {
+    const error = outcome.error;
+    const httpStatus = apiHttpStatus(error);
+    const feishuCode = apiFeishuCode(error);
+    settleOperation(operation, {
+      type: "error",
+      accountId,
+      phase: `send.${frame.action ?? "unknown"}`,
+      status: "api_error",
+      errorKind: classifyApiError(error),
+      requestId: frame.requestId,
+      message: error?.message ?? String(error),
+      ...(httpStatus !== undefined ? { httpStatus } : {}),
+      ...(feishuCode !== undefined ? { feishuCode } : {}),
+      feishuMsgClass: feishuMsgClass(error),
+    });
+    return;
+  }
+  settleOperation(operation, {
+    type: "sendResult",
+    accountId,
+    requestId: frame.requestId,
+    action: frame.action,
+    ok: true,
+    ...outcome.value,
+  });
+}
+
+async function drainOperations(deadlineMs) {
+  const deadline = Date.now() + Math.max(0, deadlineMs);
+  while (state.activeSdkOperations.size > 0 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  for (const operation of [...state.protocolPending.values()]) {
+    settleOperation(operation, {
+      type: "error",
+      accountId: operation.accountId,
+      phase: "close",
+      status: "closed",
+      requestId: operation.kind === "request" ? operation.requestId : undefined,
+      message: "Feishu sidecar closed before operation completed",
+    });
   }
 }
 
@@ -1559,10 +1829,10 @@ async function handleFrame(frame) {
   }
   switch (frame.type) {
     case "init":
-      await initialize(frame, { legacy: true });
+      void dispatchInitAccount(frame, { legacy: true });
       return;
     case "initAccount":
-      await initialize(frame);
+      void dispatchInitAccount(frame);
       return;
     case "send":
     case "request":
@@ -1578,7 +1848,7 @@ async function handleFrame(frame) {
           });
           return;
         }
-        await withAccount(account, () => handleSend(frame));
+        void dispatchRequest(frame);
       }
       return;
     case "closeAccount":

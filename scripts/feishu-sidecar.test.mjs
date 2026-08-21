@@ -177,6 +177,15 @@ function writeFakeSdk(root, options = {}) {
       }
       function nextResponse(defaultValue) {
         const entry = responseQueue.length > 0 ? responseQueue.shift() : undefined;
+        if (entry?.never === true) {
+          return new Promise(() => {});
+        }
+        if (Number.isFinite(entry?.delayMs) && entry.delayMs >= 0) {
+          return new Promise((resolve) => setTimeout(
+            () => resolve(materializeResponse(entry.value ?? defaultValue)),
+            entry.delayMs,
+          ));
+        }
         if (entry?.throw) {
           const error = new Error(entry.throw.message || "fake sdk error");
           if (entry.throw.code !== undefined) error.code = entry.throw.code;
@@ -576,6 +585,206 @@ test("two initAccount frames create two independent accounts", async () => {
 
     const result = await proc.close();
     assert.equal(result.status, 0, result.stderr);
+  } finally {
+    await proc?.close?.();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("P2-U1/P2-P1 interleaved multi-account requests stay correlated while stdin keeps moving", async () => {
+  const root = createTempRoot();
+  const { sdkPath, callsPath } = writeFakeSdk(root);
+  let proc;
+  try {
+    proc = spawnSidecar({
+      sdkPath,
+      callsPath,
+      behavior: {
+        responses: [
+          { delayMs: 80, value: { code: 0, data: { message_id: "om_slow" } } },
+          { code: 0, data: { message_id: "om_fast" } },
+        ],
+      },
+    });
+    for (let index = 0; index < 5; index += 1) {
+      proc.writeFrame(baseInit({ type: "initAccount", accountId: `acct-${index}`, appId: `app-${index}` }));
+    }
+    for (let index = 0; index < 5; index += 1) {
+      await proc.waitForFrame((frame) => frame.type === "ready" && frame.accountId === `acct-${index}`);
+    }
+
+    proc.writeFrame({ type: "request", accountId: "acct-0", requestId: "same-id", action: "sendText", to: "oc_slow", text: "慢🙂" });
+    proc.writeFrame({ type: "request", accountId: "acct-1", requestId: "same-id", action: "sendText", to: "oc_fast", text: "快🚀" });
+    const fast = await proc.waitForFrame((frame) => frame.type === "sendResult" && frame.accountId === "acct-1" && frame.requestId === "same-id", 50);
+    assert.equal(fast.messageId, "om_fast");
+    const slow = await proc.waitForFrame((frame) => frame.type === "sendResult" && frame.accountId === "acct-0" && frame.requestId === "same-id", 500);
+    assert.equal(slow.messageId, "om_slow");
+    assert.equal(proc.frames.filter((frame) => frame.type === "sendResult" && frame.requestId === "same-id").length, 2);
+  } finally {
+    await proc?.close?.();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("P2-P1 five accounts complete 100 API operations and inbound during a slow operation", async () => {
+  const root = createTempRoot();
+  const responses = Array.from({ length: 100 }, (_, index) => ({
+    ...(index === 0 ? { delayMs: 80, value: { code: 0, data: { message_id: "om_0" } } } : { code: 0, data: { message_id: `om_${index}` } }),
+  }));
+  const { sdkPath, callsPath } = writeFakeSdk(root);
+  let proc;
+  try {
+    proc = spawnSidecar({
+      sdkPath,
+      callsPath,
+      behavior: {
+        responses,
+        events: [{
+          delayMs: 20,
+          type: "im.message.receive_v1",
+          payload: {
+            event_id: "event-during-slow",
+            sender: { sender_id: { open_id: "ou_sender" }, sender_type: "user" },
+            message: { message_id: "om_inbound", chat_id: "oc_chat", chat_type: "group", message_type: "text", content: JSON.stringify({ text: "入站🙂" }) },
+          },
+        }],
+      },
+    });
+    for (let index = 0; index < 5; index += 1) {
+      proc.writeFrame(baseInit({ type: "initAccount", accountId: `bulk-${index}`, appId: `bulk-app-${index}` }));
+    }
+    for (let index = 0; index < 5; index += 1) {
+      await proc.waitForFrame((frame) => frame.type === "ready" && frame.accountId === `bulk-${index}`);
+    }
+    for (let batch = 0; batch < 10; batch += 1) {
+      for (let offset = 0; offset < 10; offset += 1) {
+        const index = batch * 10 + offset;
+        proc.writeFrame({
+          type: "request",
+          accountId: `bulk-${index % 5}`,
+          requestId: `bulk-request-${index}`,
+          action: "sendText",
+          to: `oc_${index}`,
+          text: `消息-${index}-🚀`,
+        });
+      }
+      await proc.waitForFrame((frame) => frame.type === "sendResult" && frame.requestId === `bulk-request-${batch * 10 + 9}`, 1000);
+    }
+    const inbound = await proc.waitForFrame((frame) => frame.type === "inbound" && frame.event?.message?.message_id === "om_inbound", 200);
+    assert.equal(inbound.accountId.startsWith("bulk-"), true);
+    await proc.waitForFrame((frame) => frame.type === "sendResult" && frame.requestId === "bulk-request-0", 1000);
+    const results = proc.frames.filter((frame) => frame.type === "sendResult" && String(frame.requestId).startsWith("bulk-request-"));
+    assert.equal(results.length, 100);
+    assert.equal(new Set(results.map((frame) => `${frame.accountId}:${frame.requestId}`)).size, 100);
+    assert.equal(callsOf(callsPath, "Client").length, 5);
+  } finally {
+    await proc?.close?.();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("P2-B1 request deadline settles once and drops the late SDK result", async () => {
+  const root = createTempRoot();
+  const { sdkPath, callsPath } = writeFakeSdk(root);
+  let proc;
+  try {
+    proc = spawnSidecar({
+      sdkPath,
+      callsPath,
+      behavior: { responses: [{ delayMs: 80, value: { code: 0, data: { message_id: "om_too_late" } } }] },
+    });
+    proc.writeFrame(baseInit({ type: "initAccount", accountId: "deadline", appId: "deadline-app" }));
+    await proc.waitForFrame((frame) => frame.type === "ready" && frame.accountId === "deadline");
+    proc.writeFrame({
+      type: "request",
+      accountId: "deadline",
+      requestId: "deadline-request",
+      action: "sendText",
+      to: "oc_deadline",
+      text: "超时🙂",
+      operationTimeoutMs: 10,
+    });
+    const timeout = await proc.waitForFrame((frame) => frame.type === "error" && frame.requestId === "deadline-request");
+    assert.equal(timeout.status, "request_timeout");
+    const late = await proc.waitForFrame(
+      (frame) => frame.type === "diagnostic" && frame.status === "late_result_dropped" && frame.accountId === "deadline",
+      500,
+    );
+    assert.equal(late.accountId, "deadline");
+    assert.equal(proc.frames.some((frame) => frame.type === "sendResult" && frame.requestId === "deadline-request"), false);
+    assert.equal(proc.frames.filter((frame) => frame.type === "error" && frame.requestId === "deadline-request").length, 1);
+  } finally {
+    await proc?.close?.();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("P2-B1 init deadline drops a late ready terminal frame", async () => {
+  const root = createTempRoot();
+  const { sdkPath, callsPath } = writeFakeSdk(root);
+  let proc;
+  try {
+    proc = spawnSidecar({ sdkPath, callsPath, behavior: { readyDelayMs: 80 } });
+    proc.writeFrame(baseInit({
+      type: "initAccount",
+      accountId: "late-ready",
+      appId: "late-ready-app",
+      readyTimeoutMs: 200,
+      operationTimeoutMs: 10,
+    }));
+    const timeout = await proc.waitForFrame((frame) => frame.type === "error" && frame.accountId === "late-ready");
+    assert.equal(timeout.status, "ready_timeout");
+    await proc.waitForFrame(
+      (frame) => frame.type === "diagnostic" && frame.accountId === "late-ready" && frame.status === "late_result_dropped",
+      500,
+    );
+    assert.equal(proc.frames.some((frame) => frame.type === "ready" && frame.accountId === "late-ready"), false);
+    assert.equal(proc.frames.filter((frame) => frame.type === "error" && frame.accountId === "late-ready").length, 1);
+    proc.writeFrame(baseInit({
+      type: "initAccount",
+      accountId: "late-ready",
+      appId: "late-ready-app-retry",
+      readyTimeoutMs: 200,
+    }));
+    const retryReady = await proc.waitForFrame((frame) => frame.type === "ready" && frame.accountId === "late-ready", 500);
+    assert.equal(retryReady.transport, "websocket");
+    assert.equal(proc.frames.some((frame) => frame.type === "error" && frame.accountId === "late-ready" && frame.status === "conflict"), false);
+  } finally {
+    await proc?.close?.();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("P2-N1 timed-out SDK orphans remain quota-bound and request one recycle", async () => {
+  const root = createTempRoot();
+  const { sdkPath, callsPath } = writeFakeSdk(root);
+  let proc;
+  try {
+    proc = spawnSidecar({ sdkPath, callsPath, behavior: { responses: Array.from({ length: 16 }, () => ({ never: true })) } });
+    proc.writeFrame(baseInit({ type: "initAccount", accountId: "orphan", appId: "orphan-app" }));
+    await proc.waitForFrame((frame) => frame.type === "ready" && frame.accountId === "orphan");
+    for (let index = 0; index < 16; index += 1) {
+      proc.writeFrame({
+        type: "request",
+        accountId: "orphan",
+        requestId: `hung-${index}`,
+        action: "sendText",
+        to: "oc_orphan",
+        text: "永久挂起",
+        operationTimeoutMs: 10,
+      });
+    }
+    for (let index = 0; index < 16; index += 1) {
+      await proc.waitForFrame((frame) => frame.type === "error" && frame.requestId === `hung-${index}` && frame.status === "request_timeout");
+    }
+    proc.writeFrame({ type: "request", accountId: "orphan", requestId: "over-limit", action: "sendText", to: "oc", text: "busy" });
+    const busy = await proc.waitForFrame((frame) => frame.type === "error" && frame.requestId === "over-limit");
+    assert.equal(busy.status, "sidecar_busy");
+    assert.equal(proc.frames.filter((frame) => frame.type === "diagnostic" && frame.status === "recycle_required").length, 1);
+    assert.equal(proc.frames.some((frame) => frame.type === "sendResult" && String(frame.requestId).startsWith("hung-")), false);
+    for (const secret of Object.values(secretValues)) {
+      assert.equal(`${proc.stdoutLines.join("\n")}${proc.stderrLines.join("\n")}`.includes(secret), false);
+    }
   } finally {
     await proc?.close?.();
     fs.rmSync(root, { recursive: true, force: true });

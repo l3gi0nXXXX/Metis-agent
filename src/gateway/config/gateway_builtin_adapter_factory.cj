@@ -8,8 +8,8 @@ import metis.gateway.channels.feishu.{
     FeishuNativeLongConnectTransport,
     FeishuNoopApiClient,
     FeishuSidecarApiClient,
-    FeishuSidecarProcessRequestRunner,
     FeishuSidecarRequestAccount,
+    FeishuSidecarSupervisorRequestRunner,
     FeishuSidecarStdioRunner,
     FeishuSidecarSupervisorRegistry,
     FeishuSidecarSupervisorTransport,
@@ -95,10 +95,13 @@ private func gatewayFeishuLongConnectTransportForConfig(
     FeishuNativeLongConnectTransport()
 }
 
-private func gatewayFeishuApiClientForConfig(config: FeishuConfig): FeishuApiClient {
+private func gatewayFeishuApiClientForConfig(
+    config: FeishuConfig,
+    supervisorRegistry: FeishuSidecarSupervisorRegistry
+): FeishuApiClient {
     if (config.receiveMode == "long_connect" && config.transportMode == "sidecar") {
         return FeishuSidecarApiClient(
-            runner: FeishuSidecarProcessRequestRunner(
+            runner: FeishuSidecarSupervisorRequestRunner(
                 account: FeishuSidecarRequestAccount(
                     accountId: config.accountId,
                     appId: config.appId,
@@ -106,7 +109,8 @@ private func gatewayFeishuApiClientForConfig(config: FeishuConfig): FeishuApiCli
                     domain: config.domain,
                     verificationToken: config.verificationToken,
                     encryptKey: config.encryptKey
-                )
+                ),
+                registry: supervisorRegistry
             )
         )
     }
@@ -119,11 +123,18 @@ public func gatewayFeishuAdapterForConfig(
     supervisorRegistry!: Option<FeishuSidecarSupervisorRegistry> = None<FeishuSidecarSupervisorRegistry>
 ): FeishuAdapter {
     let resolved = gatewayFeishuResolveAccount(config, accountId)
+    let effectiveRegistry = match (supervisorRegistry) {
+        case Some(registry) => registry
+        case None => FeishuSidecarSupervisorRegistry(
+            runner: FeishuSidecarStdioRunner(),
+            options: FeishuSidecarTransportOptions(startBackgroundReader: true)
+        )
+    }
     FeishuAdapter(
         config: config,
         accountId: resolved.accountId,
-        apiClient: gatewayFeishuApiClientForConfig(resolved.config),
-        longConnectTransport: gatewayFeishuLongConnectTransportForConfig(resolved.config, supervisorRegistry: supervisorRegistry)
+        apiClient: gatewayFeishuApiClientForConfig(resolved.config, effectiveRegistry),
+        longConnectTransport: gatewayFeishuLongConnectTransportForConfig(resolved.config, supervisorRegistry: Some(effectiveRegistry))
     )
 }
 

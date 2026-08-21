@@ -1,6 +1,8 @@
 package metis.gateway.channels.feishu
 
 import metis.core.config.CliConfig
+import metis.gateway.process.gatewayStdioBroker
+import metis.process.{ManagedStdioBrokerClient, ManagedStdioOwnerSpec}
 
 import std.collection.{ArrayList, HashMap}
 import std.env.getVariables
@@ -274,10 +276,22 @@ public class FeishuSidecarLineBuffer {
     }
 }
 
+private let feishuSidecarOwnerIdLock = Mutex()
+private var feishuSidecarOwnerIdSequence: Int64 = 0
+
+private func feishuSidecarNextOwnerId(): String {
+    synchronized(feishuSidecarOwnerIdLock) {
+        feishuSidecarOwnerIdSequence += 1
+        "feishu-sidecar-${DateTime.now().toUnixTimeStamp().toMilliseconds()}-${feishuSidecarOwnerIdSequence}"
+    }
+}
+
 public class FeishuSidecarStdioProcess <: FeishuSidecarProtocolProcess {
-    private let process: SubProcess
-    private let writer: StringWriter<OutputStream>
+    private let broker: ManagedStdioBrokerClient
+    private let ownerId: String
+    private let processPid: Int64
     private let stateLock = Mutex()
+    private let terminalCondition: Condition
     private let stdoutBuffer = FeishuSidecarLineBuffer(
         name: "stdout",
         maxLines: FEISHU_SIDECAR_STDIO_MAX_QUEUED_LINES,
@@ -291,27 +305,28 @@ public class FeishuSidecarStdioProcess <: FeishuSidecarProtocolProcess {
         maxSummaryLines: FEISHU_SIDECAR_STDIO_SUMMARY_LINES
     )
     private var closed = false
+    private var terminalCode: Option<Int64> = None<Int64>
+    private var pumpFuture: Option<Future<Unit>> = None<Future<Unit>>
 
-    public init(process: SubProcess) {
-        this.process = process
-        this.writer = StringWriter(process.stdInPipe)
-        let stdoutReader = StringReader<InputStream>(process.stdOutPipe)
-        let stderrReader = StringReader<InputStream>(process.stdErrPipe)
-        spawn {
-            this.readPipeLines(stdoutReader, this.stdoutBuffer)
+    public init(broker: ManagedStdioBrokerClient, ownerId: String, processPid: Int64) {
+        this.broker = broker
+        this.ownerId = ownerId
+        this.processPid = processPid
+        synchronized(this.stateLock) {
+            this.terminalCondition = this.stateLock.condition()
         }
-        spawn {
-            this.readPipeLines(stderrReader, this.stderrBuffer)
-        }
+        this.pumpFuture = Some(spawn { this.pumpBrokerEvents() })
     }
 
     public func pid(): Int64 {
-        0
+        this.processPid
     }
 
     public func writeLine(line: String): Unit {
-        this.writer.writeln(line)
-        this.writer.flush()
+        let result = this.broker.writeOwnerLine(this.ownerId, line)
+        if (!result.ok) {
+            throw Exception("Feishu sidecar broker write failed: ${result.status}")
+        }
     }
 
     public func readLine(timeoutMs: Int64): Option<String> {
@@ -319,22 +334,27 @@ public class FeishuSidecarStdioProcess <: FeishuSidecarProtocolProcess {
     }
 
     public func isAlive(): Bool {
-        !this.isClosed() && this.process.isAlive()
+        !this.isClosed()
     }
 
     public func wait(timeoutMs: Int64): Option<Int64> {
-        try {
-            let result = this.process.wait(timeout: Some(Duration.millisecond * if (timeoutMs > 0) { timeoutMs } else { 500 }))
-            this.closeBuffers("")
-            Some(result)
-        } catch (_: Exception) {
-            None<Int64>
+        let deadline = DateTime.now().toUnixTimeStamp().toMilliseconds() + max(1, timeoutMs)
+        let result = synchronized(this.stateLock) {
+            while (this.terminalCode.isNone()) {
+                let remaining = deadline - DateTime.now().toUnixTimeStamp().toMilliseconds()
+                if (remaining <= 0) { return None<Int64> }
+                let _ = this.terminalCondition.wait(timeout: Duration.millisecond * remaining)
+            }
+            this.terminalCode
         }
+        if (result.isSome()) { this.joinPump(500) }
+        result
     }
 
-    public func terminate(force: Bool): Unit {
-        this.closeBuffers("terminated")
-        try { this.process.terminate(force: force) } catch (_: Exception) { () }
+    public func terminate(_force: Bool): Unit {
+        let result = this.broker.stopOwner(this.ownerId, timeoutMs: 1000)
+        this.recordTerminal(if (result.ok) { 0 } else { -1 }, if (result.ok) { "terminated" } else { result.status })
+        this.joinPump(500)
     }
 
     public func stdoutSummary(): String {
@@ -345,35 +365,47 @@ public class FeishuSidecarStdioProcess <: FeishuSidecarProtocolProcess {
         this.stderrBuffer.summary()
     }
 
-    private func readPipeLines(reader: StringReader<InputStream>, buffer: FeishuSidecarLineBuffer): Unit {
-        while (!this.isClosed()) {
-            let line = try {
-                reader.readln()
-            } catch (e: Exception) {
-                buffer.close(error: "read failed: ${e.message}")
-                return
-            }
-            match (line) {
-                case Some(value) => buffer.appendLine(value)
-                case None =>
-                    buffer.close()
-                    return
-            }
-        }
-    }
-
-    private func closeBuffers(reason: String): Unit {
+    private func recordTerminal(exitCode: Int64, reason: String): Unit {
         synchronized(this.stateLock) {
+            if (this.terminalCode.isSome()) { return }
             this.closed = true
+            this.terminalCode = Some(exitCode)
+            this.terminalCondition.notifyAll()
         }
-        this.stdoutBuffer.close(error: reason)
-        this.stderrBuffer.close(error: reason)
+        this.stdoutBuffer.close(error: feishuSidecarTransportRedactSensitiveText(reason))
+        this.stderrBuffer.close(error: feishuSidecarTransportRedactSensitiveText(reason))
     }
 
     private func isClosed(): Bool {
         synchronized(this.stateLock) {
             this.closed
         }
+    }
+
+    private func pumpBrokerEvents(): Unit {
+        while (!this.isClosed()) {
+            match (this.broker.readOwnerLine(this.ownerId, timeoutMs: 100)) {
+                case Some(event) =>
+                    if (event.eventType == "owner.stdout") {
+                        this.stdoutBuffer.appendLine(event.text)
+                    } else if (event.eventType == "owner.stderr") {
+                        this.stderrBuffer.appendLine(event.text)
+                    } else if (event.eventType == "owner.exit") {
+                        this.recordTerminal(event.exitCode, "")
+                    } else if (event.eventType == "owner.error" || event.eventType == "owner.timeout") {
+                        this.recordTerminal(-1, event.status)
+                    }
+                case None => ()
+            }
+        }
+    }
+
+    private func joinPump(timeoutMs: Int64): Unit {
+        match (synchronized(this.stateLock) { this.pumpFuture }) {
+            case Some(future) => try { future.get(Duration.millisecond * max(1, timeoutMs)) } catch (_: Exception) { () }
+            case None => ()
+        }
+        synchronized(this.stateLock) { this.pumpFuture = None<Future<Unit>> }
     }
 }
 
@@ -385,16 +417,23 @@ public class FeishuSidecarStdioRunner <: FeishuSidecarProtocolRunner {
             return FeishuSidecarProtocolStartResult.Failed("not_configured: Feishu sidecar command and args are required")
         }
         try {
-            let process = launch(
+            let broker = gatewayStdioBroker()
+            let ownerId = feishuSidecarNextOwnerId()
+            let started = broker.startOwner(ManagedStdioOwnerSpec(
+                ownerId,
                 spec.command,
-                spec.args,
-                stdIn: ProcessRedirect.Pipe,
-                stdOut: ProcessRedirect.Pipe,
-                stdErr: ProcessRedirect.Pipe,
-                workingDirectory: spec.workingDirectory.map({ value => Path(value) }),
-                environment: Some(feishuSidecarProcessEnvironment(spec.env))
-            )
-            FeishuSidecarProtocolStartResult.Started(FeishuSidecarStdioProcess(process))
+                args: spec.args,
+                workingDirectory: spec.workingDirectory,
+                environment: spec.env,
+                stdinMode: "line",
+                outputMode: "line",
+                maxLineBytes: FEISHU_SIDECAR_STDIO_MAX_LINE_CHARS * 4,
+                maxBufferedBytes: 4194304
+            ))
+            if (!started.ok) {
+                return FeishuSidecarProtocolStartResult.Failed("launch_failed: ${started.status}")
+            }
+            FeishuSidecarProtocolStartResult.Started(FeishuSidecarStdioProcess(broker, ownerId, started.pid))
         } catch (e: Exception) {
             FeishuSidecarProtocolStartResult.Failed("launch_failed: ${e.message}")
         }
@@ -1003,15 +1042,32 @@ private class FeishuSidecarSupervisorAccountState {
     }
 }
 
+private class FeishuSidecarPendingRequest {
+    let accountId: String
+    let requestId: String
+    let condition: Condition
+    var result: Option<JsonObject> = None<JsonObject>
+    var settled = false
+
+    init(accountId: String, requestId: String, condition: Condition) {
+        this.accountId = accountId
+        this.requestId = requestId
+        this.condition = condition
+    }
+}
+
 public class FeishuSidecarSupervisorRegistry {
     private let lock = Mutex()
     private let runner: FeishuSidecarProtocolRunner
     private let options: FeishuSidecarTransportOptions
     private let accounts = HashMap<String, FeishuSidecarSupervisorAccountState>()
+    private let accountSpecs = HashMap<String, FeishuLongConnectStartSpec>()
+    private let pendingRequests = HashMap<String, FeishuSidecarPendingRequest>()
     private var process: Option<FeishuSidecarProtocolProcess> = None
     private var generation: Int64 = 0
     private var processStartCount: Int64 = 0
     private var registryLastError = ""
+    private var recycleInProgress = false
 
     public init(
         runner!: FeishuSidecarProtocolRunner = FeishuSidecarNotConfiguredRunner(),
@@ -1024,6 +1080,7 @@ public class FeishuSidecarSupervisorRegistry {
     public func startAccount(spec: FeishuLongConnectStartSpec, eventHandler: (JsonObject) -> Unit): FeishuLongConnectStartResult {
         let accountId = this.normalizeAccountId(spec.accountId)
         let state = this.registerAccount(accountId, eventHandler)
+        synchronized(this.lock) { this.accountSpecs[accountId] = spec }
         match (this.ensureProcess()) {
             case FeishuSidecarProtocolStartResult.Failed(reason) =>
                 let status = if (reason.contains("not_configured")) { "not_configured" } else { "launch_failed" }
@@ -1065,6 +1122,7 @@ public class FeishuSidecarSupervisorRegistry {
                 state = Some(this.accounts[normalized])
                 this.accounts.remove(normalized)
             }
+            this.accountSpecs.remove(normalized)
             proc = this.process
             shouldStopProcess = this.accounts.isEmpty()
             if (shouldStopProcess) {
@@ -1075,6 +1133,7 @@ public class FeishuSidecarSupervisorRegistry {
         if (let Some(s) <- state) {
             s.markStopped()
         }
+        this.failPendingRequestsForAccount(normalized, "closed")
         if (let Some(p) <- proc) {
             try {
                 p.writeLine(this.compactJsonLine(this.closeAccountFrame(normalized).toJsonString()))
@@ -1131,6 +1190,92 @@ public class FeishuSidecarSupervisorRegistry {
             ()
         }
         this.recordUnexpectedExitIfNeeded()
+    }
+
+    public func debugPendingRequestCountForTest(): Int64 {
+        synchronized(this.lock) { this.pendingRequests.size }
+    }
+
+    public func requestAccount(accountId: String, requestId: String, frame: JsonObject, timeoutMs: Int64): JsonObject {
+        let normalizedAccountId = this.normalizeAccountId(accountId)
+        let normalizedRequestId = requestId.trimAscii()
+        if (normalizedRequestId.isEmpty()) {
+            return this.requestFailureFrame(normalizedAccountId, normalizedRequestId, "invalid_request", "Feishu sidecar requestId is required")
+        }
+        let key = this.pendingRequestKey(normalizedAccountId, normalizedRequestId)
+        let pending = synchronized(this.lock) {
+            if (this.pendingRequests.contains(key)) {
+                None<FeishuSidecarPendingRequest>
+            } else {
+                let value = FeishuSidecarPendingRequest(normalizedAccountId, normalizedRequestId, this.lock.condition())
+                this.pendingRequests[key] = value
+                Some(value)
+            }
+        }
+        if (pending.isNone()) {
+            return this.requestFailureFrame(normalizedAccountId, normalizedRequestId, "duplicate_request", "Duplicate Feishu sidecar request")
+        }
+        let processResult = this.ensureProcess()
+        let proc = match (processResult) {
+            case FeishuSidecarProtocolStartResult.Started(value) => value
+            case FeishuSidecarProtocolStartResult.Failed(reason) =>
+                synchronized(this.lock) { this.pendingRequests.remove(key) }
+                return this.requestFailureFrame(normalizedAccountId, normalizedRequestId, "launch_failed", feishuSidecarTransportRedactSensitiveText(reason))
+        }
+        try {
+            proc.writeLine(this.compactJsonLine(frame.toJsonString()))
+        } catch (e: Exception) {
+            synchronized(this.lock) { this.pendingRequests.remove(key) }
+            return this.requestFailureFrame(normalizedAccountId, normalizedRequestId, "write_failed", feishuSidecarTransportRedactSensitiveText(e.message))
+        }
+        let deadline = DateTime.now().toUnixTimeStamp().toMilliseconds() + max(1, timeoutMs)
+        synchronized(this.lock) {
+            let value = pending.getOrThrow()
+            while (!value.settled) {
+                let remaining = deadline - DateTime.now().toUnixTimeStamp().toMilliseconds()
+                if (remaining <= 0) {
+                    this.pendingRequests.remove(key)
+                    return this.requestFailureFrame(normalizedAccountId, normalizedRequestId, "request_timeout", "Feishu sidecar API request timeout")
+                }
+                let _ = value.condition.wait(timeout: Duration.millisecond * remaining)
+            }
+            this.pendingRequests.remove(key)
+            match (value.result) {
+                case Some(result) => result
+                case None => this.requestFailureFrame(normalizedAccountId, normalizedRequestId, "request_failed", "Feishu sidecar request failed")
+            }
+        }
+    }
+
+    public func completePendingRequest(frame: JsonObject): Bool {
+        let accountId = this.normalizeAccountId(this.readString(frame, "accountId"))
+        let requestId = this.readString(frame, "requestId")
+        if (requestId.isEmpty()) { return false }
+        let key = this.pendingRequestKey(accountId, requestId)
+        synchronized(this.lock) {
+            match (this.pendingRequests.get(key)) {
+                case Some(pending) =>
+                    if (pending.settled) { return false }
+                    pending.result = Some(frame)
+                    pending.settled = true
+                    pending.condition.notifyAll()
+                    true
+                case None => false
+            }
+        }
+    }
+
+    public func failPendingRequests(reason: String): Unit {
+        let safeReason = feishuSidecarTransportRedactSensitiveText(reason)
+        synchronized(this.lock) {
+            for ((_, pending) in this.pendingRequests) {
+                if (!pending.settled) {
+                    pending.result = Some(this.requestFailureFrame(pending.accountId, pending.requestId, "unexpected_exit", safeReason))
+                    pending.settled = true
+                    pending.condition.notifyAll()
+                }
+            }
+        }
     }
 
     private func registerAccount(accountId: String, eventHandler: (JsonObject) -> Unit): FeishuSidecarSupervisorAccountState {
@@ -1254,6 +1399,18 @@ public class FeishuSidecarSupervisorRegistry {
         }
         let frameType = this.readString(frame, "type")
         let accountId = this.normalizeAccountId(this.readString(frame, "accountId"))
+        if ((frameType == "sendResult" || frameType == "error") && !this.readString(frame, "requestId").isEmpty()) {
+            if (!this.completePendingRequest(frame)) {
+                if (let Some(state) <- this.accountState(accountId)) {
+                    state.recordDiagnostic("warn", "request.late_result", "late_result_dropped", "Dropped late Feishu sidecar request result")
+                }
+            }
+            return true
+        }
+        if (frameType == "diagnostic" && this.readString(frame, "status") == "recycle_required") {
+            this.recycleProcess()
+            return true
+        }
         if (accountId.isEmpty()) {
             this.registryLastError = "sidecar frame missing accountId"
             return true
@@ -1338,6 +1495,7 @@ public class FeishuSidecarSupervisorRegistry {
             this.process = None<FeishuSidecarProtocolProcess>
             this.generation += 1
         }
+        this.failPendingRequests(message)
         if (let Some(p) <- proc) {
             if (p.isAlive()) {
                 p.terminate(true)
@@ -1357,6 +1515,74 @@ public class FeishuSidecarSupervisorRegistry {
             } else {
                 None<FeishuSidecarSupervisorAccountState>
             }
+        }
+    }
+
+    private func pendingRequestKey(accountId: String, requestId: String): String {
+        "${accountId.toArray().size}:${accountId}${requestId}"
+    }
+
+    private func requestFailureFrame(accountId: String, requestId: String, status: String, message: String): JsonObject {
+        let out = JsonObject()
+        out.put("type", JsonString("error"))
+        out.put("accountId", JsonString(accountId))
+        out.put("requestId", JsonString(requestId))
+        out.put("status", JsonString(status))
+        out.put("message", JsonString(feishuSidecarTransportRedactSensitiveText(message)))
+        out
+    }
+
+    private func failPendingRequestsForAccount(accountId: String, reason: String): Unit {
+        synchronized(this.lock) {
+            for ((_, pending) in this.pendingRequests) {
+                if (pending.accountId == accountId && !pending.settled) {
+                    pending.result = Some(this.requestFailureFrame(accountId, pending.requestId, "closed", reason))
+                    pending.settled = true
+                    pending.condition.notifyAll()
+                }
+            }
+        }
+    }
+
+    private func recycleProcess(): Unit {
+        let restartRows = ArrayList<(FeishuLongConnectStartSpec, FeishuSidecarSupervisorAccountState)>()
+        var previous: Option<FeishuSidecarProtocolProcess> = None<FeishuSidecarProtocolProcess>
+        synchronized(this.lock) {
+            if (this.recycleInProgress) { return }
+            this.recycleInProgress = true
+            previous = this.process
+            this.process = None<FeishuSidecarProtocolProcess>
+            this.generation += 1
+            for ((accountId, spec) in this.accountSpecs) {
+                if (this.accounts.contains(accountId)) {
+                    restartRows.add((spec, this.accounts[accountId]))
+                }
+            }
+        }
+        this.failPendingRequests("Feishu sidecar recycled after timed-out SDK operations")
+        if (let Some(proc) <- previous) {
+            proc.terminate(true)
+        }
+        match (this.ensureProcess()) {
+            case FeishuSidecarProtocolStartResult.Failed(reason) =>
+                synchronized(this.lock) { this.recycleInProgress = false }
+                this.markAllAccountsFailed("process", "recycle_failed", feishuSidecarTransportRedactSensitiveText(reason))
+            case FeishuSidecarProtocolStartResult.Started(proc) =>
+                for ((spec, state) in restartRows) {
+                    let handler = match (state.handlerSnapshot()) {
+                        case Some(value) => value
+                        case None => { _root: JsonObject => () }
+                    }
+                    state.beginStart(proc.pid(), handler)
+                    try {
+                        proc.writeLine(this.compactJsonLine(this.initAccountFrame(spec, this.normalizeAccountId(spec.accountId)).toJsonString()))
+                    } catch (e: Exception) {
+                        let error = feishuSidecarTransportRedactSensitiveText(e.message)
+                        state.markFailure("write_failed", error)
+                        state.recordDiagnostic("error", "recycle", "write_failed", error)
+                    }
+                }
+                synchronized(this.lock) { this.recycleInProgress = false }
         }
     }
 
@@ -1587,10 +1813,11 @@ private func feishuSidecarProcessEnvironment(overrides: Array<(String, String)>)
 
 private func feishuSidecarSummarizeText(raw: String): String {
     let text = raw.trimAscii()
-    if (text.size <= 512) {
+    let runes = text.toRuneArray()
+    if (runes.size <= 512) {
         return text
     }
-    "${text[0..512]}..."
+    "${String(runes[0..512])}..."
 }
 
 private func feishuSidecarTransportRedactSensitiveText(raw: String): String {

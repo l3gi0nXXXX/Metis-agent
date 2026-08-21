@@ -1,8 +1,9 @@
 package metis.gateway.channels.feishu
 
 import std.collection.ArrayList
+import std.core.Duration
 import std.unittest.testmacro.*
-import stdx.encoding.json.{JsonArray, JsonBool, JsonInt, JsonObject, JsonString}
+import stdx.encoding.json.{JsonArray, JsonBool, JsonInt, JsonObject, JsonString, JsonValue}
 
 private class FeishuSidecarApiClientFakeRunner <: FeishuSidecarRequestRunner {
     public let requests = ArrayList<JsonObject>()
@@ -171,6 +172,60 @@ private func sidecarTestBool(obj: JsonObject, key: String): Bool {
 
 @Test
 public class FeishuSidecarApiClientTest {
+    @TestCase
+    public func supervisorRunnerReusesRegistryAndPreservesOperationResultContract(): Unit {
+        let process = FeishuSidecarApiProcessFakeProcess(stdout: [
+            "{\"type\":\"ready\",\"accountId\":\"tenant-a\",\"transport\":\"websocket\"}"
+        ])
+        let registry = FeishuSidecarSupervisorRegistry(
+            runner: FeishuSidecarApiProcessFakeRunner(process),
+            options: FeishuSidecarTransportOptions(
+                command: "node",
+                args: ["scripts/feishu-sidecar.mjs"],
+                readyTimeoutMs: 10,
+                readTimeoutMs: 1,
+                stopTimeoutMs: 1,
+                startBackgroundReader: false
+            )
+        )
+        let startSpec = FeishuLongConnectStartSpec(
+            accountId: "tenant-a",
+            appId: "cli_app",
+            appSecret: "secret-app",
+            domain: "https://open.feishu.cn",
+            verificationToken: "secret-verification",
+            encryptKey: "secret-encrypt"
+        )
+        @Expect(registry.startAccount(startSpec, { _root => () }).ok, true)
+        let runner = FeishuSidecarSupervisorRequestRunner(
+            account: FeishuSidecarRequestAccount(accountId: "tenant-a", appId: "cli_app", appSecret: "secret-app"),
+            registry: registry,
+            options: FeishuSidecarRequestRunnerOptions(requestTimeoutMs: 500)
+        )
+        let params = JsonObject()
+        params.put("receiveId", JsonString("oc_chat"))
+        params.put("text", JsonString("你好🙂"))
+        let request = JsonObject()
+        request.put("operation", JsonString("message.create"))
+        request.put("accountId", JsonString("tenant-a"))
+        request.put("params", params)
+        let result = spawn { runner.run(request) }
+        while (registry.debugPendingRequestCountForTest() < 1) { sleep(Duration.millisecond) }
+        let requestId = sidecarTestString(JsonValue.fromStr(process.stdinLines[1]).asObject(), "requestId")
+        process.stdoutLines.add("{\"type\":\"sendResult\",\"accountId\":\"tenant-a\",\"requestId\":\"${requestId}\",\"ok\":true,\"messageId\":\"om_shared\"}")
+        registry.debugDrainAvailableForTest()
+
+        let response = result.get(Duration.second)
+        @Expect(sidecarTestBool(response, "ok"), true)
+        @Expect(sidecarTestString(response, "status"), "ok")
+        @Expect(sidecarTestString(response, "messageId"), "om_shared")
+        @Expect(process.stdinLines[1].contains("\"operationTimeoutMs\":500"), true)
+        @Expect(process.stdinLines[1].contains("\"action\":\"sendText\""), true)
+        @Expect(process.stdinLines[1].contains("你好🙂"), true)
+        @Expect(registry.debugProcessStartCountForTest(), 1)
+        registry.stopAccount("tenant-a")
+    }
+
     @TestCase
     public func processRunnerInitializesSidecarAndMapsApiFramesWithoutSecretsInArgv(): Unit {
         let process = FeishuSidecarApiProcessFakeProcess(stdout: [
