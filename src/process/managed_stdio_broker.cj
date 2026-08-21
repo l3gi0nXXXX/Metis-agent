@@ -1231,18 +1231,26 @@ public class ManagedStdioBrokerClient {
                         state.condition.notifyAll()
                     } else if (frameType == "owner.error" || frameType == "owner.timeout") {
                         state.status = managedStdioJsonString(obj, "status")
-                        let _ = this.routeOwnerEventLocked(state, ManagedStdioEvent(frameType, ownerId: ownerId, status: state.status), 0)
                         state.settled = true
-                        if ((state.subscriberFailed || state.subscriptionRejected || (state.capacityFailed && state.terminalDelivered)) && state.dispatchPending == 0 && state.events.isEmpty()) {
+                        if (state.subscriberFailed && state.dispatchPending == 0) {
                             this.owners.remove(ownerId)
+                        } else {
+                            let _ = this.routeOwnerEventLocked(state, ManagedStdioEvent(frameType, ownerId: ownerId, status: state.status), 0)
+                            if ((state.subscriptionRejected || (state.capacityFailed && state.terminalDelivered)) && state.dispatchPending == 0 && state.events.isEmpty()) {
+                                this.owners.remove(ownerId)
+                            }
                         }
                         state.condition.notifyAll()
                     } else if (frameType == "owner.exit") {
                         state.status = "exited"
-                        let _ = this.routeOwnerEventLocked(state, ManagedStdioEvent(frameType, ownerId: ownerId, exitCode: managedStdioJsonInt(obj, "exitCode", -1)), 0)
                         state.settled = true
-                        if ((state.subscriberFailed || state.subscriptionRejected || (state.capacityFailed && state.terminalDelivered)) && state.dispatchPending == 0 && state.events.isEmpty()) {
+                        if (state.subscriberFailed && state.dispatchPending == 0) {
                             this.owners.remove(ownerId)
+                        } else {
+                            let _ = this.routeOwnerEventLocked(state, ManagedStdioEvent(frameType, ownerId: ownerId, exitCode: managedStdioJsonInt(obj, "exitCode", -1)), 0)
+                            if ((state.subscriptionRejected || (state.capacityFailed && state.terminalDelivered)) && state.dispatchPending == 0 && state.events.isEmpty()) {
+                                this.owners.remove(ownerId)
+                            }
                         }
                         state.condition.notifyAll()
                     }

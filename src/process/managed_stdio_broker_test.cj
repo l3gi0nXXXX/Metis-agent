@@ -296,6 +296,19 @@ public class ManagedStdioBrokerTest {
             @Expect(managedStdioWaitUntil(3000, { => healthySubscriber.terminalCount() == 1 }), true)
             @Expect(healthySubscriber.containsText("healthy-中文🙂"), true)
             @Expect(client.debugSnapshotForTest().dispatcherCount, 1)
+            @Expect(managedStdioWaitUntil(3000, { => client.debugSnapshotForTest().ownerCount == 0 }), true)
+
+            let reused = client.startOwner(ManagedStdioOwnerSpec(
+                "throwing-subscriber", "node",
+                args: ["-e", "console.log('reused-after-subscriber-failure-中文🙂')"],
+                stdinMode: "closed", deadlineMs: 2000
+            ))
+            @Expect(reused.ok, true)
+            let reusedSubscriber = ManagedStdioTestSubscriber()
+            @Expect(client.subscribeOwner("throwing-subscriber", reused.generation, reusedSubscriber).ok, true)
+            @Expect(managedStdioWaitUntil(3000, { => reusedSubscriber.terminalCount() == 1 }), true)
+            @Expect(reusedSubscriber.containsText("reused-after-subscriber-failure-中文🙂"), true)
+            @Expect(managedStdioWaitUntil(2000, { => client.debugSnapshotForTest().ownerCount == 0 }), true)
         } finally {
             let _ = client.close(timeoutMs: 3000)
         }
