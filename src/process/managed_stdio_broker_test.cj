@@ -3,7 +3,7 @@ package metis.process
 import std.collection.ArrayList
 import std.env.{getVariable, setVariable}
 import std.fs.{File, Path, exists, remove}
-import std.sync.Mutex
+import std.sync.*
 import std.time.DateTime
 import std.unittest.testmacro.*
 
@@ -60,6 +60,110 @@ private class ManagedStdioTestSubscriber <: ManagedStdioOwnerSubscriber {
             false
         }
     }
+
+    func regularCount(): Int64 {
+        synchronized(this.lock) {
+            var count: Int64 = 0
+            for (event in this.events) {
+                if (event.eventType == "owner.stdout" || event.eventType == "owner.stderr") { count += 1 }
+            }
+            count
+        }
+    }
+
+    func terminalStatus(): String {
+        synchronized(this.lock) {
+            for (event in this.events) {
+                if (event.eventType == "owner.exit" || event.eventType == "owner.error" || event.eventType == "owner.timeout") { return event.status }
+            }
+            ""
+        }
+    }
+}
+
+private class ManagedStdioBlockingSubscriber <: ManagedStdioOwnerSubscriber {
+    private let lock = Mutex()
+    private var condition: Condition
+    private let events = ArrayList<ManagedStdioEvent>()
+    private var entered: Bool = false
+    private var released: Bool = false
+    private var reenterSingleton: Bool = false
+    private var singletonReentered: Bool = false
+
+    init(reenterSingleton!: Bool = false) {
+        synchronized(this.lock) { this.condition = this.lock.condition() }
+        this.reenterSingleton = reenterSingleton
+    }
+
+    public func onManagedStdioEvent(event: ManagedStdioEvent): Unit {
+        var shouldReenter = false
+        synchronized(this.lock) {
+            this.events.add(event)
+            if (!this.entered && (event.eventType == "owner.stdout" || event.eventType == "owner.stderr")) {
+                this.entered = true
+                this.condition.notifyAll()
+                while (!this.released) { this.condition.wait() }
+                shouldReenter = this.reenterSingleton
+            }
+        }
+        if (shouldReenter) {
+            let _ = managedStdioBroker().debugSnapshotForTest()
+            synchronized(this.lock) {
+                this.singletonReentered = true
+                this.condition.notifyAll()
+            }
+        }
+    }
+
+    func awaitEntered(timeoutMs: Int64): Bool {
+        let deadline = managedStdioTestNowMs() + timeoutMs
+        synchronized(this.lock) {
+            while (!this.entered) {
+                let remaining = deadline - managedStdioTestNowMs()
+                if (remaining <= 0) { return false }
+                let _ = this.condition.wait(timeout: Duration.millisecond * remaining)
+            }
+            true
+        }
+    }
+
+    func release(): Unit {
+        synchronized(this.lock) {
+            this.released = true
+            this.condition.notifyAll()
+        }
+    }
+
+    func terminalCount(): Int64 {
+        synchronized(this.lock) {
+            var count: Int64 = 0
+            for (event in this.events) {
+                if (event.eventType == "owner.exit" || event.eventType == "owner.error" || event.eventType == "owner.timeout") { count += 1 }
+            }
+            count
+        }
+    }
+
+    func terminalStatus(): String {
+        synchronized(this.lock) {
+            for (event in this.events) {
+                if (event.eventType == "owner.exit" || event.eventType == "owner.error" || event.eventType == "owner.timeout") { return event.status }
+            }
+            ""
+        }
+    }
+
+    func regularCount(): Int64 {
+        synchronized(this.lock) {
+            var count: Int64 = 0
+            for (event in this.events) {
+                if (event.eventType == "owner.stdout" || event.eventType == "owner.stderr") { count += 1 }
+            }
+            count
+        }
+    }
+
+    func didReenterSingleton(): Bool { synchronized(this.lock) { this.singletonReentered } }
 }
 
 private class ManagedStdioThrowingSubscriber <: ManagedStdioOwnerSubscriber {
@@ -90,6 +194,13 @@ private func managedStdioWaitUntil(timeoutMs: Int64, predicate: () -> Bool): Boo
 
 private func managedStdioTestReadUtf8(path: Path): String {
     try { String.fromUtf8(File.readFrom(path)) } catch (_: Exception) { "invalid_response_encoding" }
+}
+
+private func managedStdioJoinFuture<T>(future: Option<Future<T>>, timeoutMs: Int64): Unit {
+    match (future) {
+        case Some(value) => try { let _ = value.get(Duration.millisecond * timeoutMs) } catch (_: Exception) { () }
+        case None => ()
+    }
 }
 
 @Test
@@ -187,6 +298,186 @@ public class ManagedStdioBrokerTest {
             @Expect(client.debugSnapshotForTest().dispatcherCount, 1)
         } finally {
             let _ = client.close(timeoutMs: 3000)
+        }
+    }
+
+    @TestCase
+    public func p3B3SubscriptionReservesTerminalAtLimitAndIsolatesCapacityFailure(): Unit {
+        for (lineCount in [2, 3, 4]) {
+            let client = ManagedStdioBrokerClient(ownerHardLimit: 2, ownerQueueLimit: 4, dispatchQueueLimit: 8)
+            let blocked = ManagedStdioBlockingSubscriber()
+            try {
+                let started = client.startOwner(ManagedStdioOwnerSpec(
+                    "capacity-${lineCount}", "node",
+                    args: ["-e", "setTimeout(()=>{for(let i=0;i<${lineCount};i++)console.log('line-'+i);setInterval(()=>{},1000)},100)"],
+                    stdinMode: "closed", deadlineMs: 5000
+                ))
+                @Expect(started.ok, true)
+                @Expect(client.subscribeOwner("capacity-${lineCount}", started.generation, blocked).ok, true)
+                @Expect(blocked.awaitEntered(2000), true)
+                sleep(Duration.millisecond * 150)
+                if (lineCount == 4) {
+                    let healthy = client.startOwner(ManagedStdioOwnerSpec(
+                        "capacity-healthy", "node", args: ["-e", "console.log('healthy-owner-中文🙂')"],
+                        stdinMode: "closed", deadlineMs: 2000
+                    ))
+                    let healthySubscriber = ManagedStdioTestSubscriber()
+                    @Expect(healthy.ok, true)
+                    @Expect(client.subscribeOwner("capacity-healthy", healthy.generation, healthySubscriber).ok, true)
+                    blocked.release()
+                    @Expect(managedStdioWaitUntil(4000, { => blocked.terminalCount() == 1 }), true)
+                    @Expect(blocked.regularCount(), 3)
+                    @Expect(blocked.terminalStatus(), "subscriber_capacity_exceeded")
+                    @Expect(managedStdioWaitUntil(4000, { => healthySubscriber.terminalCount() == 1 }), true)
+                    @Expect(healthySubscriber.containsText("healthy-owner-中文🙂"), true)
+                    @Expect(managedStdioWaitUntil(2000, { => client.debugSnapshotForTest().ownerCount == 0 }), true)
+                } else {
+                    blocked.release()
+                    @Expect(client.stopOwner(
+                        "capacity-${lineCount}", timeoutMs: 2000, expectedGeneration: Some(started.generation)
+                    ).ok, true)
+                    @Expect(managedStdioWaitUntil(3000, { => blocked.terminalCount() == 1 }), true)
+                    @Expect(blocked.regularCount(), Int64(lineCount))
+                    @Expect(blocked.terminalStatus() == "subscriber_capacity_exceeded", false)
+                }
+                @Expect(blocked.terminalCount(), 1)
+            } finally {
+                blocked.release()
+                let _ = client.close(timeoutMs: 3000)
+            }
+        }
+    }
+
+    @TestCase
+    public func p3B3SubscriptionMigrationCapacityFailureIsAtomicAndReapsOnlyRejectedOwner(): Unit {
+        let client = ManagedStdioBrokerClient(ownerHardLimit: 2, ownerQueueLimit: 4, dispatchQueueLimit: 3)
+        let occupied = ManagedStdioBlockingSubscriber()
+        try {
+            let first = client.startOwner(ManagedStdioOwnerSpec(
+                "migration-occupied", "node",
+                args: ["-e", "setTimeout(()=>{console.log('occupy');setInterval(()=>{},1000)},100)"],
+                stdinMode: "closed", deadlineMs: 5000
+            ))
+            @Expect(first.ok, true)
+            @Expect(client.subscribeOwner("migration-occupied", first.generation, occupied).ok, true)
+            @Expect(occupied.awaitEntered(2000), true)
+            let rejected = client.startOwner(ManagedStdioOwnerSpec(
+                "migration-rejected", "node",
+                args: ["-e", "console.log('queued-before-migration');setInterval(()=>{},1000)"],
+                stdinMode: "closed", deadlineMs: 5000
+            ))
+            @Expect(rejected.ok, true)
+            sleep(Duration.millisecond * 150)
+            let rejectedSubscriber = ManagedStdioTestSubscriber()
+            let firstAttempt = client.subscribeOwner("migration-rejected", rejected.generation, rejectedSubscriber)
+            @Expect(firstAttempt.ok, false)
+            @Expect(firstAttempt.status, "subscriber_capacity_exceeded")
+            @Expect(rejectedSubscriber.regularCount(), 0)
+            @Expect(rejectedSubscriber.terminalCount(), 0)
+            @Expect(managedStdioWaitUntil(3000, { => client.debugSnapshotForTest().ownerCount == 1 }), true)
+            occupied.release()
+            @Expect(client.stopOwner(
+                "migration-occupied", timeoutMs: 2000, expectedGeneration: Some(first.generation)
+            ).ok, true)
+            @Expect(managedStdioWaitUntil(3000, { => occupied.terminalCount() == 1 }), true)
+            @Expect(managedStdioWaitUntil(2000, { => client.debugSnapshotForTest().ownerCount == 0 }), true)
+            let healthy = client.startOwner(ManagedStdioOwnerSpec(
+                "migration-healthy", "node", args: ["-e", "console.log('after-rejection-中文🙂')"],
+                stdinMode: "closed", deadlineMs: 2000
+            ))
+            let healthySubscriber = ManagedStdioTestSubscriber()
+            @Expect(healthy.ok, true)
+            @Expect(client.subscribeOwner("migration-healthy", healthy.generation, healthySubscriber).ok, true)
+            @Expect(managedStdioWaitUntil(3000, { => healthySubscriber.terminalCount() == 1 }), true)
+            @Expect(healthySubscriber.containsText("after-rejection-中文🙂"), true)
+        } finally {
+            occupied.release()
+            let _ = client.close(timeoutMs: 3000)
+        }
+    }
+
+    @TestCase
+    public func p3B3WaitingPollConflictsWithSubscribeAndUnsubscribeHandlesInflightCallback(): Unit {
+        let client = ManagedStdioBrokerClient()
+        var pollFuture = None<Future<Option<ManagedStdioEvent>>>
+        let blocked = ManagedStdioBlockingSubscriber()
+        try {
+            let polling = client.startOwner(ManagedStdioOwnerSpec(
+                "poll-subscribe-race", "node", args: ["-e", "setTimeout(()=>console.log('late-poll'),500)"],
+                stdinMode: "closed", deadlineMs: 2000
+            ))
+            @Expect(polling.ok, true)
+            pollFuture = Some(spawn { client.readOwnerLine("poll-subscribe-race", timeoutMs: 1500) })
+            sleep(Duration.millisecond * 100)
+            @Expect(client.subscribeOwner(
+                "poll-subscribe-race", polling.generation, ManagedStdioTestSubscriber()
+            ).status, "owner_delivery_conflict")
+            let inflight = client.startOwner(ManagedStdioOwnerSpec(
+                "unsubscribe-inflight", "node",
+                args: ["-e", "setTimeout(()=>{console.log('inflight');setInterval(()=>{},1000)},100)"],
+                stdinMode: "closed", deadlineMs: 5000
+            ))
+            @Expect(inflight.ok, true)
+            @Expect(client.subscribeOwner("unsubscribe-inflight", inflight.generation, blocked).ok, true)
+            @Expect(blocked.awaitEntered(2000), true)
+            @Expect(client.unsubscribeOwner("unsubscribe-inflight", inflight.generation).status, "unsubscribed")
+            blocked.release()
+            @Expect(client.stopOwner(
+                "unsubscribe-inflight", timeoutMs: 2000, expectedGeneration: Some(inflight.generation)
+            ).ok, true)
+            let terminal = client.readOwnerLine("unsubscribe-inflight", timeoutMs: 1000)
+            @Expect(terminal.isSome(), true)
+            @Expect(terminal.getOrThrow().eventType == "owner.exit" || terminal.getOrThrow().eventType == "owner.error", true)
+            @Expect(client.readOwnerLine("unsubscribe-inflight", timeoutMs: 0).isNone(), true)
+        } finally {
+            blocked.release()
+            managedStdioJoinFuture(pollFuture, 2500)
+            let _ = client.close(timeoutMs: 3000)
+        }
+    }
+
+    @TestCase
+    public func p3N3SingletonResetAllowsCallbackReentryAndRejectsCompetingReset(): Unit {
+        let _ = resetManagedStdioBrokerForTest(timeoutMs: 2000)
+        let old = managedStdioBroker()
+        let blocked = ManagedStdioBlockingSubscriber(reenterSingleton: true)
+        var resetFuture = None<Future<ManagedStdioOperationResult>>
+        try {
+            let started = old.startOwner(ManagedStdioOwnerSpec(
+                "reset-reentry", "node",
+                args: ["-e", "setTimeout(()=>{console.log('reset');setInterval(()=>{},1000)},100)"],
+                stdinMode: "closed", deadlineMs: 5000
+            ))
+            @Expect(started.ok, true)
+            @Expect(old.subscribeOwner("reset-reentry", started.generation, blocked).ok, true)
+            @Expect(blocked.awaitEntered(2000), true)
+            resetFuture = Some(spawn { resetManagedStdioBrokerForTest(timeoutMs: 3000) })
+            @Expect(managedStdioWaitUntil(1000, { => managedStdioBrokerResetInProgressForTest() }), true)
+            let competingReset = resetManagedStdioBrokerForTest(timeoutMs: 10)
+            @Expect(competingReset.ok, false)
+            @Expect(competingReset.status, "reset_in_progress")
+            blocked.release()
+            @Expect(managedStdioWaitUntil(2000, { => blocked.didReenterSingleton() }), true)
+            match (resetFuture) {
+                case Some(value) => @Expect(value.get(Duration.second * 4).ok, true)
+                case None => @Expect(false, true)
+            }
+            resetFuture = None<Future<ManagedStdioOperationResult>>
+            let oldSnapshot = old.debugSnapshotForTest()
+            @Expect(oldSnapshot.readerCount, 0)
+            @Expect(oldSnapshot.dispatcherCount, 0)
+            let replacement = managedStdioBroker()
+            @Expect(replacement.ensureBrokerRunning(timeoutMs: 2000).ok, true)
+            let replacementSnapshot = replacement.debugSnapshotForTest()
+            @Expect(replacementSnapshot.readerCount, 1)
+            @Expect(replacementSnapshot.dispatcherCount, 0)
+            let sameReplacement = managedStdioBroker().debugSnapshotForTest()
+            @Expect(sameReplacement.generation, replacementSnapshot.generation)
+            @Expect(sameReplacement.brokerPid, replacementSnapshot.brokerPid)
+        } finally {
+            blocked.release()
+            managedStdioJoinFuture(resetFuture, 4000)
+            let _ = resetManagedStdioBrokerForTest(timeoutMs: 3000)
         }
     }
 
@@ -352,7 +643,7 @@ public class ManagedStdioBrokerTest {
             @Expect(managedStdioWaitUntil(3000, {
                 =>
                 match (client.readOwnerLine("limit-1", timeoutMs: 50)) {
-                    case Some(event) => event.status == "buffer_capacity_exceeded"
+                    case Some(event) => event.status == "subscriber_capacity_exceeded"
                     case None => false
                 }
             }), true)
@@ -375,7 +666,7 @@ public class ManagedStdioBrokerTest {
                 =>
                 match (byteBounded.readOwnerLine("byte-limit", timeoutMs: 50)) {
                     case Some(event) =>
-                        if (event.status == "buffer_capacity_exceeded") { sawByteOverflow.value = true }
+                        if (event.status == "subscriber_capacity_exceeded") { sawByteOverflow.value = true }
                     case None => ()
                 }
                 sawByteOverflow.value

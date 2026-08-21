@@ -67,6 +67,13 @@ private func withAgentBridgeTempHome<T>(label: String, block: (Path) -> T): T {
     }
 }
 
+private func agentBridgeJoinFuture<T>(future: Option<Future<T>>, timeoutMs: Int64): Unit {
+    match (future) {
+        case Some(value) => try { let _ = value.get(Duration.millisecond * timeoutMs) } catch (_: Exception) { () }
+        case None => ()
+    }
+}
+
 private func agentBridgeAgentEntry(id: String, workspace: Path, agentDir: Path, modelRef: String): JsonObject {
     let entry = JsonObject()
     entry.put("id", JsonString(id))
@@ -713,6 +720,8 @@ public class AgentBridgeRuntimeTest {
             setVariable("METIS_CODEX_FAKE_INCLUDE_THREAD_IN_ANSWER", "1")
             setGatewayCodexAppServerRunnerForTest(None<(GatewayCodexAppServerTurnRequest) -> GatewayCodexAppServerRuntimeResult>)
             let baseline = managedStdioBroker().debugSnapshotForTest()
+            var firstFuture = None<Future<String>>
+            var secondFuture = None<Future<String>>
             try {
                 let firstContext = gatewayResolveSessionContext(GatewaySessionRequest(
                     GatewayIngressSource.Channel("telegram"),
@@ -734,7 +743,7 @@ public class AgentBridgeRuntimeTest {
                 let secondStore = GatewaySessionStore(home.join("sessions-b"), enabled: true, agentId: "codex-b")
                 let firstBridge = AgentBridge(sessionStore: firstStore)
                 let secondBridge = AgentBridge(sessionStore: secondStore)
-                let firstFuture = spawn {
+                firstFuture = Some(spawn {
                     try {
                         firstBridge.reply(
                             firstContext.sessionKey,
@@ -744,8 +753,8 @@ public class AgentBridgeRuntimeTest {
                             turnContext: Some(firstContext.turnContext)
                         )
                     } catch (_: Exception) { "p3_first_error" }
-                }
-                let secondFuture = spawn {
+                })
+                secondFuture = Some(spawn {
                     try {
                         secondBridge.reply(
                             secondContext.sessionKey,
@@ -755,9 +764,9 @@ public class AgentBridgeRuntimeTest {
                             turnContext: Some(secondContext.turnContext)
                         )
                     } catch (_: Exception) { "p3_second_error" }
-                }
-                let first = firstFuture.get(Duration.second * 10)
-                let second = secondFuture.get(Duration.second * 10)
+                })
+                let first = firstFuture.getOrThrow().get(Duration.second * 10)
+                let second = secondFuture.getOrThrow().get(Duration.second * 10)
                 let after = managedStdioBroker().debugSnapshotForTest()
 
                 @Expect(first, "answer-codex-a-中文🙂 thread=thread-codex-a")
@@ -783,6 +792,8 @@ public class AgentBridgeRuntimeTest {
                 @Expect(after.dispatcherCount, 1)
                 @Expect(after.ownerCount, baseline.ownerCount)
             } finally {
+                agentBridgeJoinFuture(firstFuture, 10000)
+                agentBridgeJoinFuture(secondFuture, 10000)
                 setGatewayCodexAppServerRunnerForTest(None<(GatewayCodexAppServerTurnRequest) -> GatewayCodexAppServerRuntimeResult>)
                 let _ = resetManagedStdioBrokerForTest(timeoutMs: 3000)
                 match (oldPath) {

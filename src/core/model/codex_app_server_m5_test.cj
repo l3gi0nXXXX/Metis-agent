@@ -366,13 +366,15 @@ public class CodexAppServerM5Test {
         var snapshot = managedStdioBroker().debugSnapshotForTest()
         var firstDiagnostics = ""
         var secondDiagnostics = ""
+        var firstFuture = None<Future<JsonObject>>
+        var secondFuture = None<Future<JsonObject>>
         try {
             first.start()
             second.start()
-            let firstFuture = spawn { first.request("initialize", JsonObject(), 3000) }
-            let secondFuture = spawn { second.request("initialize", JsonObject(), 3000) }
-            firstResult = firstFuture.get(Duration.second * 5)
-            secondResult = secondFuture.get(Duration.second * 5)
+            firstFuture = Some(spawn { first.request("initialize", JsonObject(), 3000) })
+            secondFuture = Some(spawn { second.request("initialize", JsonObject(), 3000) })
+            firstResult = firstFuture.getOrThrow().get(Duration.second * 5)
+            secondResult = secondFuture.getOrThrow().get(Duration.second * 5)
             firstRequest = first.takeServerRequest(1000).getOrThrow()
             secondRequest = second.takeServerRequest(1000).getOrThrow()
             firstNotification = first.takeNotification(1000).getOrThrow()
@@ -381,6 +383,8 @@ public class CodexAppServerM5Test {
             firstDiagnostics = first.diagnostics().toString()
             secondDiagnostics = second.diagnostics().toString()
         } finally {
+            m5JoinFuture(firstFuture, 5000)
+            m5JoinFuture(secondFuture, 5000)
             first.close()
             second.close()
         }
@@ -474,21 +478,27 @@ public class CodexAppServerM5Test {
         )
         var afterError = ""
         var alongsideResult = JsonObject()
+        var afterFuture = None<Future<String>>
+        var alongsideFuture = None<Future<JsonObject>>
+        var firstClose = None<Future<Unit>>
+        var secondClose = None<Future<Unit>>
         try {
-            let afterFuture = spawn {
+            afterFuture = Some(spawn {
                 try {
                     let _ = afterDeadline.request("initialize", JsonObject(), 30)
                     "unexpected_success"
                 } catch (e: Exception) { e.message }
-            }
-            let alongsideFuture = spawn { alongside.request("initialize", JsonObject(), 3000) }
-            afterError = afterFuture.get(Duration.second * 5)
-            alongsideResult = alongsideFuture.get(Duration.second * 5)
+            })
+            alongsideFuture = Some(spawn { alongside.request("initialize", JsonObject(), 3000) })
+            afterError = afterFuture.getOrThrow().get(Duration.second * 5)
+            alongsideResult = alongsideFuture.getOrThrow().get(Duration.second * 5)
         } finally {
-            let firstClose = spawn { afterDeadline.close() }
-            let secondClose = spawn { afterDeadline.close() }
-            firstClose.get(Duration.second * 2)
-            secondClose.get(Duration.second * 2)
+            m5JoinFuture(afterFuture, 5000)
+            m5JoinFuture(alongsideFuture, 5000)
+            firstClose = Some(spawn { afterDeadline.close() })
+            secondClose = Some(spawn { afterDeadline.close() })
+            m5JoinFuture(firstClose, 2000)
+            m5JoinFuture(secondClose, 2000)
             alongside.close()
         }
         sleep(Duration.millisecond * 250)
@@ -556,17 +566,21 @@ public class CodexAppServerM5Test {
         var first = CodexAppServerTurnResult()
         var second = CodexAppServerTurnResult()
         var snapshot = managedStdioBroker().debugSnapshotForTest()
+        var firstFuture = None<Future<CodexAppServerTurnResult>>
+        var secondFuture = None<Future<CodexAppServerTurnResult>>
         try {
-            let firstFuture = spawn {
+            firstFuture = Some(spawn {
                 CodexAppServerSession(firstClient).runTurn("/tmp/session-a", "first 中文🙂", timeoutMs: 5000)
-            }
-            let secondFuture = spawn {
+            })
+            secondFuture = Some(spawn {
                 CodexAppServerSession(secondClient).runTurn("/tmp/session-b", "second 中文🙂", timeoutMs: 5000)
-            }
-            first = firstFuture.get(Duration.second * 8)
-            second = secondFuture.get(Duration.second * 8)
+            })
+            first = firstFuture.getOrThrow().get(Duration.second * 8)
+            second = secondFuture.getOrThrow().get(Duration.second * 8)
             snapshot = managedStdioBroker().debugSnapshotForTest()
         } finally {
+            m5JoinFuture(firstFuture, 8000)
+            m5JoinFuture(secondFuture, 8000)
             firstClient.close()
             secondClient.close()
         }
@@ -619,30 +633,34 @@ public class CodexAppServerM5Test {
         var result = JsonObject()
         var before = managedStdioBroker().debugSnapshotForTest()
         var after = before
+        var hangingRequest = None<Future<String>>
+        var recoveryFuture = None<Future<JsonObject>>
         try {
             hanging.start()
             filesReady = m5WaitPathsExist([parentPidPath, childPidPath], 3000)
             parentPid = m5ReadPid(parentPidPath)
             childPid = m5ReadPid(childPidPath)
-            let hangingRequest = spawn {
+            hangingRequest = Some(spawn {
                 try {
                     let _ = hanging.request("initialize", JsonObject(), 5000)
                     "unexpected_success"
                 } catch (e: Exception) { e.message }
-            }
+            })
             sleep(Duration.millisecond * 50)
             before = managedStdioBroker().debugSnapshotForTest()
             let _ = executeWithOutput("kill", ["-KILL", "${before.brokerPid}"])
-            let recoveryFuture = spawn {
+            recoveryFuture = Some(spawn {
                 sleep(Duration.millisecond * 50)
                 recovered.request("initialize", JsonObject(), 4000)
-            }
-            hangingError = hangingRequest.get(Duration.second * 6)
-            result = recoveryFuture.get(Duration.second * 6)
+            })
+            hangingError = hangingRequest.getOrThrow().get(Duration.second * 6)
+            result = recoveryFuture.getOrThrow().get(Duration.second * 6)
             parentGone = m5WaitPidGone(parentPid, 5000)
             childGone = m5WaitPidGone(childPid, 5000)
             after = managedStdioBroker().debugSnapshotForTest()
         } finally {
+            m5JoinFuture(hangingRequest, 6000)
+            m5JoinFuture(recoveryFuture, 6000)
             hanging.close()
             recovered.close()
             if (!m5WaitPidGone(parentPid, 200)) { m5KillPid(parentPid) }
@@ -672,6 +690,13 @@ private func m5TempRoot(label: String): Path {
     }
     Directory.create(root, recursive: true)
     root
+}
+
+private func m5JoinFuture<T>(future: Option<Future<T>>, timeoutMs: Int64): Unit {
+    match (future) {
+        case Some(value) => try { let _ = value.get(Duration.millisecond * timeoutMs) } catch (_: Exception) { () }
+        case None => ()
+    }
 }
 
 private func m5FakeCodexScript(): String {
