@@ -6,6 +6,7 @@ import std.collection.ArrayList
 import std.convert.Parsable
 import std.env.{getProcessId, getVariable, setVariable}
 import std.fs.{Directory, File, Path, exists, remove}
+import std.process.*
 import std.sync.Mutex
 import std.time.*
 import std.unittest.testmacro.*
@@ -278,6 +279,24 @@ public class ServicePluginHostTest {
 
     private func readTextFile(path: Path): String {
         try { String.fromUtf8(File.readFrom(path)) } catch (_: Exception) { "" }
+    }
+
+    private func waitForPidGone(pid: Int64, timeoutMillis!: Int64 = 3000): Bool {
+        var waited: Int64 = 0
+        while (waited < timeoutMillis) {
+            let (exitCode, _, _) = executeWithOutput("kill", ["-0", "${pid}"])
+            if (exitCode != 0) { return true }
+            sleep(Duration.millisecond * 25)
+            waited += 25
+        }
+        let (exitCode, _, _) = executeWithOutput("kill", ["-0", "${pid}"])
+        exitCode != 0
+    }
+
+    private func processGroupId(pid: Int64): Int64 {
+        let (exitCode, stdout, _) = executeWithOutput("ps", ["-o", "pgid=", "-p", "${pid}"])
+        if (exitCode != 0) { return 0 }
+        try { Int64.parse(String.fromUtf8(stdout).trimAscii()) } catch (_: Exception) { 0 }
     }
 
     private func gitCodeLeaseScript(port: Int64, includeEndpoint!: Bool = true, stopUpdatesLease!: Bool = true, keepAlive!: Bool = true): String {
@@ -1753,6 +1772,113 @@ public class ServicePluginHostTest {
                 let _ = stopServicePlugin("slow-service", reason: "p3-n1-finally", timeoutMillis: 1000)
                 let _ = stopServicePlugin("fast-service", reason: "p3-n1-finally", timeoutMillis: 1000)
                 resetServicePluginHostForTest()
+            }
+        })
+    }
+
+    @TestCase
+    public func p3N1SlowInitGracefulStopLatePumpAndDescendantAreOwnerScoped(): Unit {
+        withServicePluginHostTestHome("p3-n1-owner-scoped-lifecycle", { home: Path =>
+            let markerPath = home.join("graceful.marker")
+            let releasePath = home.join("release-old-pump")
+            let rootPidPath = home.join("root.pid")
+            let childPidPath = home.join("child.pid")
+            let oldMarker = getVariable("METIS_STDIO_FIXTURE_MARKER_PATH")
+            let oldRelease = getVariable("METIS_STDIO_FIXTURE_RELEASE_PATH")
+            let oldRootPid = getVariable("METIS_STDIO_FIXTURE_ROOT_PID_PATH")
+            let oldChildPid = getVariable("METIS_STDIO_FIXTURE_CHILD_PID_PATH")
+            setVariable("METIS_STDIO_FIXTURE_MARKER_PATH", markerPath.toString())
+            setVariable("METIS_STDIO_FIXTURE_RELEASE_PATH", releasePath.toString())
+            setVariable("METIS_STDIO_FIXTURE_ROOT_PID_PATH", rootPidPath.toString())
+            setVariable("METIS_STDIO_FIXTURE_CHILD_PID_PATH", childPidPath.toString())
+            var detachedOldPid: Int64 = 0
+            var treeRootPid: Int64 = 0
+            var treeChildPid: Int64 = 0
+            try {
+                this.registerBrokerServiceFixture("slow-init", pluginId: "slow-init-service", capabilityId: "slow-init.monitor.status")
+                this.registerBrokerServiceFixture("gcm", pluginId: "fast-service", capabilityId: "fast.monitor.status", resetHost: false)
+                let slowStarted = spawn { ensureRegisteredServicePluginStarted("slow-init-service", startupTimeoutMs: 2000) }
+                sleep(Duration.millisecond * 75)
+                let fastStartedAt = DateTime.now().toUnixTimeStamp().toMilliseconds()
+                let fastStarted = ensureRegisteredServicePluginStarted("fast-service", startupTimeoutMs: 2000)
+                let fastElapsed = DateTime.now().toUnixTimeStamp().toMilliseconds() - fastStartedAt
+                @Expect(fastStarted.ok, true)
+                @Expect(fastElapsed < 600, true)
+                @Expect(probeServicePluginHealth("fast-service").healthzOk, true)
+                @Expect(stopServicePlugin("fast-service", reason: "p3-n1-fast", timeoutMillis: 1500).ok, true)
+                @Expect(slowStarted.get().ok, true)
+                @Expect(stopServicePlugin("slow-init-service", reason: "p3-n1-slow", timeoutMillis: 1500).ok, true)
+
+                resetServicePluginHostForTest()
+                this.registerBrokerServiceFixture("delayed-graceful-stop", pluginId: "graceful-service", capabilityId: "graceful.monitor.status")
+                @Expect(ensureRegisteredServicePluginStarted("graceful-service", startupTimeoutMs: 1000).ok, true)
+                let graceful = stopServicePlugin("graceful-service", reason: "p3-n1-graceful", timeoutMillis: 1500)
+                @Expect(graceful.ok, true)
+                @Expect(graceful.diagnostic.contains("stop_status=graceful_exited"), true)
+                @Expect(this.waitForFile(markerPath), true)
+                @Expect(this.readTextFile(markerPath).contains("graceful"), true)
+                @Expect(this.readTextFile(markerPath).contains("term"), false)
+
+                resetServicePluginHostForTest()
+                this.registerBrokerServiceFixture("latch-event", pluginId: "latch-service", capabilityId: "latch.monitor.status")
+                @Expect(ensureRegisteredServicePluginStarted("latch-service", startupTimeoutMs: 1000).ok, true)
+                detachedOldPid = match (getServicePluginSnapshot("latch-service")) {
+                    case Some(snapshot) => snapshot.pid
+                    case None => Int64(0)
+                }
+                @Expect(dropServicePluginActiveProcessForTest("latch-service", stopProcess: false), true)
+                resetServicePluginHostForTest()
+                this.registerBrokerServiceFixture("noise-0", pluginId: "latch-service", capabilityId: "latch.monitor.status")
+                @Expect(ensureRegisteredServicePluginStarted("latch-service", startupTimeoutMs: 1000).ok, true)
+                let replacementPid = match (getServicePluginSnapshot("latch-service")) {
+                    case Some(snapshot) => snapshot.pid
+                    case None => Int64(0)
+                }
+                File.writeTo(releasePath, "release".toArray())
+                @Expect(this.waitForPidGone(detachedOldPid), true)
+                sleep(Duration.millisecond * 100)
+                match (getServicePluginSnapshot("latch-service")) {
+                    case Some(snapshot) =>
+                        @Expect(snapshot.status, "running")
+                        @Expect(snapshot.pid, replacementPid)
+                    case None => @Expect(true, false)
+                }
+                @Expect(invokeRegisteredCapability(CapabilityInvokeRequest("latch.monitor.status", payload: "{}")).ok, true)
+                @Expect(stopServicePlugin("latch-service", reason: "p3-n1-replacement", timeoutMillis: 1500).ok, true)
+                @Expect(managedStdioBroker().snapshot().ownerCount, 0)
+
+                resetServicePluginHostForTest()
+                this.registerBrokerServiceFixture("ignore-term-tree", pluginId: "tree-service", capabilityId: "tree.monitor.status")
+                @Expect(ensureRegisteredServicePluginStarted("tree-service", startupTimeoutMs: 1000).ok, true)
+                @Expect(this.waitForFile(rootPidPath), true)
+                @Expect(this.waitForFile(childPidPath), true)
+                treeRootPid = this.readCounterFile(rootPidPath)
+                treeChildPid = this.readCounterFile(childPidPath)
+                @Expect(treeRootPid > 0, true)
+                @Expect(treeChildPid > 0, true)
+                @Expect(this.processGroupId(treeRootPid), treeRootPid)
+                @Expect(this.processGroupId(treeChildPid), treeRootPid)
+                let treeStopped = stopServicePlugin("tree-service", reason: "p3-n1-tree", timeoutMillis: 2500)
+                @Expect(treeStopped.ok, true)
+                @Expect(this.waitForPidGone(treeRootPid), true)
+                @Expect(this.waitForPidGone(treeChildPid), true)
+                @Expect(managedStdioBroker().snapshot().ownerCount, 0)
+            } finally {
+                if (!exists(releasePath)) { try { File.writeTo(releasePath, "release".toArray()) } catch (_: Exception) { () } }
+                let _ = stopServicePlugin("stdio-service", reason: "p3-n1-finally", timeoutMillis: 500)
+                let _ = stopServicePlugin("graceful-service", reason: "p3-n1-finally", timeoutMillis: 500)
+                let _ = stopServicePlugin("latch-service", reason: "p3-n1-finally", timeoutMillis: 500)
+                let _ = stopServicePlugin("tree-service", reason: "p3-n1-finally", timeoutMillis: 500)
+                let _ = stopServicePlugin("slow-init-service", reason: "p3-n1-finally", timeoutMillis: 500)
+                let _ = stopServicePlugin("fast-service", reason: "p3-n1-finally", timeoutMillis: 500)
+                if (detachedOldPid > 0) { let _ = executeWithOutput("kill", ["-KILL", "${detachedOldPid}"]) }
+                if (treeRootPid > 0) { let _ = executeWithOutput("kill", ["-KILL", "-${treeRootPid}"]) }
+                if (treeChildPid > 0) { let _ = executeWithOutput("kill", ["-KILL", "${treeChildPid}"]) }
+                resetServicePluginHostForTest()
+                match (oldMarker) { case Some(value) => setVariable("METIS_STDIO_FIXTURE_MARKER_PATH", value) case None => setVariable("METIS_STDIO_FIXTURE_MARKER_PATH", "") }
+                match (oldRelease) { case Some(value) => setVariable("METIS_STDIO_FIXTURE_RELEASE_PATH", value) case None => setVariable("METIS_STDIO_FIXTURE_RELEASE_PATH", "") }
+                match (oldRootPid) { case Some(value) => setVariable("METIS_STDIO_FIXTURE_ROOT_PID_PATH", value) case None => setVariable("METIS_STDIO_FIXTURE_ROOT_PID_PATH", "") }
+                match (oldChildPid) { case Some(value) => setVariable("METIS_STDIO_FIXTURE_CHILD_PID_PATH", value) case None => setVariable("METIS_STDIO_FIXTURE_CHILD_PID_PATH", "") }
             }
         })
     }

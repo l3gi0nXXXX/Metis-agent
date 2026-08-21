@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 
 import http from 'node:http';
-import { writeFileSync } from 'node:fs';
+import { existsSync, writeFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
 import readline from 'node:readline';
 
 const mode = process.argv[2] ?? 'gcm';
@@ -11,6 +12,10 @@ const serviceId = process.env.METIS_SERVICE_PLUGIN_ID || 'stdio-service';
 const sessionId = process.env.METIS_SERVICE_PLUGIN_SESSION_ID || `${serviceId}-fixture`;
 const leasePath = process.env.METIS_SERVICE_PLUGIN_LEASE_PATH || '';
 const parentPid = Number(process.env.METIS_SERVICE_PLUGIN_PARENT_PID || 0);
+const markerPath = process.env.METIS_STDIO_FIXTURE_MARKER_PATH || '';
+const releasePath = process.env.METIS_STDIO_FIXTURE_RELEASE_PATH || '';
+const rootPidPath = process.env.METIS_STDIO_FIXTURE_ROOT_PID_PATH || '';
+const childPidPath = process.env.METIS_STDIO_FIXTURE_CHILD_PID_PATH || '';
 
 function frame(value) {
   process.stdout.write(`${JSON.stringify(value)}\n`);
@@ -34,7 +39,7 @@ function writeLease(state, port = 0) {
 
 let server;
 function shutdownFixture() {
-  if (mode === 'ignore-term') return;
+  if (mode === 'ignore-term' || mode === 'ignore-term-tree') return;
   const port = server?.address()?.port ?? 0;
   writeLease('stopped', port);
   server?.close(() => process.exit(0));
@@ -58,18 +63,40 @@ if (gcmMode) {
   }
   initFrame();
 } else {
-  initFrame();
+  if (mode === 'slow-init') setTimeout(initFrame, 800);
+  else initFrame();
   if (mode === 'exit-after-init') setTimeout(() => process.exit(0), 5);
   if (mode === 'exit-after-delay') setTimeout(() => process.exit(0), 500);
+  if (mode === 'delayed-graceful-stop') writeLease('running');
+  if (mode === 'latch-event') {
+    const latch = setInterval(() => {
+      if (!releasePath || !existsSync(releasePath)) return;
+      clearInterval(latch);
+      for (let index = 0; index < 9; index += 1) process.stdout.write(`WARN released old owner ${index}\n`);
+      setTimeout(() => process.exit(0), 20);
+    }, 10);
+  }
 }
 
-if (mode === 'ignore-term') {
+if (mode === 'ignore-term' || mode === 'ignore-term-tree') {
   process.on('SIGTERM', () => {});
   process.on('SIGHUP', () => {});
   setInterval(() => {}, 1000).unref();
 } else {
-  process.once('SIGTERM', shutdownFixture);
+  process.once('SIGTERM', () => {
+    if (mode === 'delayed-graceful-stop' && markerPath) writeFileSync(markerPath, 'term\n');
+    shutdownFixture();
+  });
   process.once('SIGHUP', shutdownFixture);
+}
+
+if (mode === 'ignore-term-tree') {
+  if (rootPidPath) writeFileSync(rootPidPath, `${process.pid}\n`);
+  const child = spawn(process.execPath, ['-e', "process.on('SIGTERM',()=>{});process.on('SIGHUP',()=>{});setInterval(()=>{},1000)"], {
+    detached: false,
+    stdio: 'ignore',
+  });
+  if (childPidPath) writeFileSync(childPidPath, `${child.pid}\n`);
 }
 
 const input = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
@@ -84,7 +111,7 @@ input.on('line', (line) => {
   if (mode === 'crash') {
     process.exit(7);
   }
-  if (mode === 'ignore-term') return;
+  if (mode === 'ignore-term' || mode === 'ignore-term-tree') return;
   if (mode === 'malformed') {
     for (let index = 0; index < 9; index += 1) {
       process.stdout.write(`{malformed-json-${index}\n`);
@@ -97,6 +124,14 @@ input.on('line', (line) => {
     }
   }
   if (request.method === 'stop') {
+    if (mode === 'delayed-graceful-stop') {
+      setTimeout(() => {
+        if (markerPath) writeFileSync(markerPath, 'graceful\n');
+        writeLease('stopped');
+        process.exit(0);
+      }, 150);
+      return;
+    }
     shutdownFixture();
     return;
   }

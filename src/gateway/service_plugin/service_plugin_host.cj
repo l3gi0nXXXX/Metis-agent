@@ -741,6 +741,17 @@ private class ServicePluginBrokerProcessState {
 
     public func terminal(): String { synchronized(this.lock) { this.terminalStatus } }
 
+    public func waitTerminal(timeoutMs: Int64): Bool {
+        synchronized(this.lock) {
+            if (!this.terminalStatus.isEmpty()) { return true }
+            let _ = this.condition.waitUntil(
+                { => !this.terminalStatus.isEmpty() },
+                timeout: Duration.millisecond * max(1, timeoutMs)
+            )
+            !this.terminalStatus.isEmpty()
+        }
+    }
+
     public func stopReaders(timeoutMs: Int64): Unit {
         synchronized(this.lock) {
             this.stopping = true
@@ -771,15 +782,17 @@ private class ServicePluginStdioProcess {
     public let process: ServicePluginBrokerProcessHandle
     public let generation: Int64
     public let ownerId: String
+    public let claimToken: Int64
     private let broker: ManagedStdioBrokerClient
     private let state = ServicePluginBrokerProcessState()
     private let stdoutBuffer = ServicePluginLineBuffer()
     private let stderrBuffer = ServicePluginLineBuffer()
 
-    public init(broker: ManagedStdioBrokerClient, ownerId: String, generation: Int64, pid: Int64) {
+    public init(broker: ManagedStdioBrokerClient, ownerId: String, generation: Int64, pid: Int64, claimToken!: Int64 = 0) {
         this.broker = broker
         this.ownerId = ownerId
         this.generation = generation
+        this.claimToken = claimToken
         this.process = ServicePluginBrokerProcessHandle(pid, this.state)
     }
 
@@ -827,17 +840,36 @@ private class ServicePluginStdioProcess {
 
     public func terminalStatus(): String { this.state.terminal() }
 
+    public func waitTerminal(timeoutMs: Int64): Bool { this.state.waitTerminal(timeoutMs) }
+
+    public func stopReaders(timeoutMs: Int64): Unit {
+        this.state.stopReaders(timeoutMs)
+        this.stdoutBuffer.close(error: this.state.terminal())
+        this.stderrBuffer.close(error: this.state.terminal())
+    }
+
     public func stop(timeoutMs!: Int64 = 500): ServicePluginProcessStopResult {
         let effective = if (timeoutMs > 0) { timeoutMs } else { 500 }
-        this.state.stopReaders(min(effective, 1100))
-        let stopped = this.broker.stopOwner(this.ownerId, timeoutMs: effective)
+        let deadlineMs = DateTime.now().toUnixTimeStamp().toMilliseconds() + effective
+        this.state.stopReaders(min(50, max(1, effective / 4)))
+        let remaining = max(0, deadlineMs - DateTime.now().toUnixTimeStamp().toMilliseconds())
+        if (remaining <= 0) {
+            this.state.cacheTerminal("stop_timeout")
+            this.stdoutBuffer.close()
+            this.stderrBuffer.close()
+            return ServicePluginProcessStopResult(false, "still_alive")
+        }
+        let stopped = this.broker.stopOwner(this.ownerId, timeoutMs: remaining)
         let cached = this.state.terminal()
         if (cached.isEmpty()) {
             this.state.cacheTerminal(if (stopped.ok) { "stopped" } else { stopped.status })
         }
         this.stdoutBuffer.close()
         this.stderrBuffer.close()
-        ServicePluginProcessStopResult(stopped.ok, if (stopped.ok) { "terminated" } else { "still_alive" })
+        ServicePluginProcessStopResult(
+            stopped.ok,
+            if (stopped.ok) { "terminated" } else { "still_alive" }
+        )
     }
 
     private func readLines(event: ManagedStdioEvent): Option<String> {
@@ -862,6 +894,56 @@ private class ServicePluginStdioProcess {
         this.stdoutBuffer.close(error: status)
         this.stderrBuffer.close(error: status)
         None<String>
+    }
+}
+
+private class ServicePluginStartClaim {
+    public let token: Int64
+    public let ownerId: String
+    public let instanceId: String
+    public var process: Option<ServicePluginStdioProcess> = None<ServicePluginStdioProcess>
+
+    public init(token: Int64, ownerId: String, instanceId: String) {
+        this.token = token
+        this.ownerId = ownerId
+        this.instanceId = instanceId
+    }
+}
+
+private class ServicePluginEventPumpGate {
+    private let lock = Mutex()
+    private let condition: Condition
+    private var opened = false
+
+    public init() { synchronized(this.lock) { this.condition = this.lock.condition() } }
+
+    public func open(): Unit {
+        synchronized(this.lock) {
+            this.opened = true
+            this.condition.notifyAll()
+        }
+    }
+
+    public func waitOpen(): Unit {
+        synchronized(this.lock) {
+            let _ = this.condition.waitUntil({ => this.opened }, timeout: Duration.second * 5)
+        }
+    }
+}
+
+private class ServicePluginDetachedOwner {
+    public let process: Option<ServicePluginStdioProcess>
+    public let queue: Option<ServicePluginResponseQueue>
+    public let pump: Option<Future<Unit>>
+
+    public init(
+        process!: Option<ServicePluginStdioProcess> = None<ServicePluginStdioProcess>,
+        queue!: Option<ServicePluginResponseQueue> = None<ServicePluginResponseQueue>,
+        pump!: Option<Future<Unit>> = None<Future<Unit>>
+    ) {
+        this.process = process
+        this.queue = queue
+        this.pump = pump
     }
 }
 
@@ -1037,7 +1119,10 @@ private class ServicePluginProcessEnsureResult {
 
 private var servicePluginActiveProcesses = HashMap<String, ServicePluginStdioProcess>()
 private var servicePluginResponseQueues = HashMap<String, ServicePluginResponseQueue>()
+private var servicePluginEventPumps = HashMap<String, Future<Unit>>()
+private var servicePluginStartClaims = HashMap<String, ServicePluginStartClaim>()
 private var servicePluginBrokerOwnerSequence: Int64 = 0
+private var servicePluginStartClaimSequence: Int64 = 0
 private let servicePluginProcessLock = Mutex()
 private let servicePluginRuntimeRecordLock = Mutex()
 private let servicePluginHostLogger = metisCreateSubsystemLogger("gateway/service-plugin/host")
@@ -1111,54 +1196,97 @@ private func logServicePluginProcessStartFailed(record: ServicePluginRuntimeReco
     )
 }
 
-private func cleanupServicePluginActiveProcessLocked(serviceId: String, reason: String, diagnostic!: String = ""): Unit {
+private func servicePluginOwnerMatchesLocked(
+    serviceId: String,
+    ownerId: String,
+    generation: Int64,
+    claimToken!: Int64 = 0
+): Bool {
+    let sid = serviceId.trimAscii()
+    match (servicePluginActiveProcesses.get(sid)) {
+        case Some(current) =>
+            if (current.ownerId != ownerId || current.generation != generation || (claimToken > 0 && current.claimToken != claimToken)) { return false }
+        case None => return false
+    }
+    true
+}
+
+private func detachServicePluginOwnerLocked(
+    serviceId: String,
+    ownerId!: String = "",
+    generation!: Int64 = 0,
+    claimToken!: Int64 = 0
+): ServicePluginDetachedOwner {
+    let sid = serviceId.trimAscii()
+    var process = None<ServicePluginStdioProcess>
+    var queue = None<ServicePluginResponseQueue>
+    var pump = None<Future<Unit>>
+    match (servicePluginActiveProcesses.get(sid)) {
+        case Some(current) =>
+            if ((!ownerId.isEmpty() && current.ownerId != ownerId) ||
+                (generation > 0 && current.generation != generation) ||
+                (claimToken > 0 && current.claimToken != claimToken)) {
+                return ServicePluginDetachedOwner()
+            }
+            process = Some(current)
+            servicePluginActiveProcesses.remove(sid)
+        case None => ()
+    }
+    match (servicePluginResponseQueues.get(sid)) {
+        case Some(current) =>
+            queue = Some(current)
+            servicePluginResponseQueues.remove(sid)
+        case None => ()
+    }
+    match (servicePluginEventPumps.get(sid)) {
+        case Some(current) =>
+            pump = Some(current)
+            servicePluginEventPumps.remove(sid)
+        case None => ()
+    }
+    ServicePluginDetachedOwner(process: process, queue: queue, pump: pump)
+}
+
+private func cleanupDetachedServicePluginOwner(
+    serviceId: String,
+    detached: ServicePluginDetachedOwner,
+    reason: String,
+    diagnostic!: String = "",
+    timeoutMs!: Int64 = 1000,
+    joinPump!: Bool = true,
+    stopProcess!: Bool = true
+): Unit {
     let sid = serviceId.trimAscii()
     let normalizedReason = if (reason.trimAscii().isEmpty()) { "stale_active_process" } else { reason.trimAscii() }
     let safeDiagnostic = servicePluginSafeDiagnosticText(if (diagnostic.trimAscii().isEmpty()) { normalizedReason } else { diagnostic })
-    let hadActive = servicePluginActiveProcesses.contains(sid)
-    let hadQueue = servicePluginResponseQueues.contains(sid)
-    var stopStatus = ""
-    match (servicePluginResponseQueues.get(sid)) {
+    match (detached.queue) {
         case Some(queue) => queue.close(status: normalizedReason, diagnostic: safeDiagnostic)
         case None => ()
     }
-    match (servicePluginActiveProcesses.get(sid)) {
-        case Some(process) =>
-            if (process.process.isAlive()) {
-                stopStatus = process.stop().status
-            } else {
-                stopStatus = "already_exited"
-            }
-        case None => ()
+    var stopStatus = ""
+    if (stopProcess) {
+        match (detached.process) {
+            case Some(process) => stopStatus = process.stop(timeoutMs: max(1, timeoutMs)).status
+            case None => ()
+        }
     }
-    if (hadActive) { servicePluginActiveProcesses.remove(sid) }
-    if (hadQueue) { servicePluginResponseQueues.remove(sid) }
-    if (hadActive || hadQueue) {
+    if (joinPump) {
+        match (detached.pump) {
+            case Some(future) => try { future.get(Duration.millisecond * max(1, timeoutMs)) } catch (_: Exception) { () }
+            case None => ()
+        }
+    }
+    if (detached.process.isSome() || detached.queue.isSome() || detached.pump.isSome()) {
         let meta = JsonObject()
         meta.put("serviceId", JsonString(sid))
         meta.put("reason", JsonString(normalizedReason))
-        meta.put("hadActiveProcess", JsonString("${hadActive}"))
-        meta.put("hadResponseQueue", JsonString("${hadQueue}"))
+        meta.put("hadActiveProcess", JsonString("${detached.process.isSome()}"))
+        meta.put("hadResponseQueue", JsonString("${detached.queue.isSome()}"))
         if (!stopStatus.isEmpty()) {
             meta.put("stopStatus", JsonString(stopStatus))
         }
         meta.put("diagnostic", JsonString(safeDiagnostic))
         servicePluginHostLogger.warn(MetisLogEvent.loggingRaw, "service_plugin.active_process.cleanup", meta: meta)
-    }
-}
-
-private func cleanupServicePluginActiveProcessForOwnerLocked(
-    serviceId: String,
-    ownerId: String,
-    reason: String,
-    diagnostic!: String = ""
-): Unit {
-    match (servicePluginActiveProcesses.get(serviceId.trimAscii())) {
-        case Some(current) =>
-            if (current.ownerId == ownerId) {
-                cleanupServicePluginActiveProcessLocked(serviceId, reason, diagnostic: diagnostic)
-            }
-        case None => ()
     }
 }
 
@@ -1309,18 +1437,22 @@ public func dropServicePluginResponseQueueForTest(serviceId: String): Bool {
 }
 
 public func dropServicePluginActiveProcessForTest(serviceId: String, stopProcess!: Bool = true): Bool {
-    synchronized(servicePluginProcessLock) {
+    let detached = synchronized(servicePluginProcessLock) {
         let sid = serviceId.trimAscii()
         match (servicePluginActiveProcesses.get(sid)) {
-            case Some(process) =>
-                servicePluginActiveProcesses.remove(sid)
-                if (stopProcess) {
-                    let _ = process.stop()
-                }
-                true
-            case None => false
+            case Some(process) => detachServicePluginOwnerLocked(sid, ownerId: process.ownerId, generation: process.generation, claimToken: process.claimToken)
+            case None => ServicePluginDetachedOwner()
         }
     }
+    let found = detached.process.isSome()
+    cleanupDetachedServicePluginOwner(
+        serviceId,
+        detached,
+        "test_drop",
+        stopProcess: stopProcess,
+        joinPump: stopProcess
+    )
+    found
 }
 
 public func resetServicePluginHostForTest(): Unit {
@@ -2022,9 +2154,30 @@ private func recoverServicePlugin(record: ServicePluginRuntimeRecord, reason: St
 
     if (reason == "process_exited") {
         servicePluginStopSupervisorWorker(serviceId)
-        synchronized(servicePluginProcessLock) {
-            cleanupServicePluginActiveProcessLocked(serviceId, "process_exited", diagnostic: "supervisor recovery process_exited")
+        let recoveryOwner = synchronized(servicePluginProcessLock) {
+            match (servicePluginActiveProcesses.get(serviceId)) {
+                case Some(process) =>
+                    if (process.process.isAlive()) {
+                        (ServicePluginDetachedOwner(), true)
+                    } else {
+                        (detachServicePluginOwnerLocked(
+                            serviceId,
+                            ownerId: process.ownerId,
+                            generation: process.generation,
+                            claimToken: process.claimToken
+                        ), false)
+                    }
+                case None => (ServicePluginDetachedOwner(), false)
+            }
         }
+        if (recoveryOwner[1]) { return true }
+        let detached = recoveryOwner[0]
+        cleanupDetachedServicePluginOwner(
+            serviceId,
+            detached,
+            "process_exited",
+            diagnostic: "supervisor recovery process_exited"
+        )
         record.pid = 0
         record.status = "stopped"
     } else {
@@ -2278,6 +2431,17 @@ private func servicePluginLeaseStopDiagnostic(record: ServicePluginRuntimeRecord
     }
 }
 
+private func servicePluginLeaseStopped(record: ServicePluginRuntimeRecord): Bool {
+    match (servicePluginReadLease(Path(servicePluginLeasePath(record)))) {
+        case Some(lease) => record.pid > 0 && lease.pid == record.pid && lease.state == "stopped" && !servicePluginPidAlive(lease.pid)
+        case None => false
+    }
+}
+
+private func servicePluginDeadlineRemaining(deadlineMs: Int64): Int64 {
+    max(0, deadlineMs - servicePluginNowMs())
+}
+
 private func servicePluginProcessEnvironment(record: ServicePluginRuntimeRecord): HashMap<String, String> {
     let env = HashMap<String, String>()
     for ((key, value) in getVariables()) {
@@ -2292,15 +2456,32 @@ private func servicePluginProcessEnvironment(record: ServicePluginRuntimeRecord)
 }
 
 private func stopAllActiveServicePluginProcesses(): Unit {
+    let detached = ArrayList<(String, ServicePluginDetachedOwner)>()
+    let pending = ArrayList<(String, ServicePluginStdioProcess)>()
     synchronized(servicePluginProcessLock) {
-        for ((_, process) in servicePluginActiveProcesses) {
-            process.stop()
+        for ((serviceId, process) in servicePluginActiveProcesses) {
+            detached.add((serviceId, ServicePluginDetachedOwner(
+                process: Some(process),
+                queue: servicePluginResponseQueues.get(serviceId),
+                pump: servicePluginEventPumps.get(serviceId)
+            )))
         }
-        for ((_, queue) in servicePluginResponseQueues) {
-            queue.close(status: "stopped", diagnostic: "service plugin host reset")
+        for ((serviceId, claim) in servicePluginStartClaims) {
+            match (claim.process) {
+                case Some(process) => pending.add((serviceId, process))
+                case None => ()
+            }
         }
         servicePluginActiveProcesses = HashMap<String, ServicePluginStdioProcess>()
         servicePluginResponseQueues = HashMap<String, ServicePluginResponseQueue>()
+        servicePluginEventPumps = HashMap<String, Future<Unit>>()
+        servicePluginStartClaims = HashMap<String, ServicePluginStartClaim>()
+    }
+    for ((serviceId, owner) in detached) {
+        cleanupDetachedServicePluginOwner(serviceId, owner, "stopped", diagnostic: "service plugin host reset")
+    }
+    for ((_, process) in pending) {
+        let _ = process.stop()
     }
 }
 
@@ -2317,131 +2498,198 @@ public func shutdownServicePluginHost(reason!: String = "shutdown", timeoutMilli
     stopAllServicePluginSupervisors()
 }
 
+private func servicePluginStartClaimMatchesLocked(serviceId: String, claim: ServicePluginStartClaim): Bool {
+    match (servicePluginStartClaims.get(serviceId.trimAscii())) {
+        case Some(current) => current.token == claim.token && current.ownerId == claim.ownerId && current.instanceId == claim.instanceId
+        case None => false
+    }
+}
+
+private func failServicePluginStartClaim(
+    record: ServicePluginRuntimeRecord,
+    claim: ServicePluginStartClaim,
+    status: String,
+    diagnostic: String,
+    process!: Option<ServicePluginStdioProcess> = None<ServicePluginStdioProcess>
+): ServicePluginProcessEnsureResult {
+    let serviceId = record.registration.manifest.pluginId
+    let safeDiagnostic = servicePluginSafeDiagnosticText(diagnostic)
+    synchronized(servicePluginProcessLock) {
+        if (servicePluginStartClaimMatchesLocked(serviceId, claim)) {
+            servicePluginStartClaims.remove(serviceId)
+            if (record.instanceId == claim.instanceId && record.status != "stopping") {
+                record.status = "degraded"
+                record.degradedReason = status
+                record.lastError = safeDiagnostic
+                record.pid = 0
+            }
+        }
+    }
+    match (process) {
+        case Some(value) => let _ = value.stop()
+        case None => ()
+    }
+    ServicePluginProcessEnsureResult(false, status, diagnostic: safeDiagnostic)
+}
+
 private func ensureServicePluginStdioProcess(record: ServicePluginRuntimeRecord, startupTimeoutMs!: Int64 = 10000): ServicePluginProcessEnsureResult {
     let serviceId = record.registration.manifest.pluginId
+    if (record.registration.manifest.entryCommand.isEmpty()) {
+        record.status = "degraded"
+        record.degradedReason = "missing_entry_command"
+        record.lastError = record.degradedReason
+        return ServicePluginProcessEnsureResult(false, "missing_entry_command", diagnostic: record.lastError)
+    }
+    let cwd = servicePluginEffectiveWorkingDirectory(record.registration.configRef)
+    if (!cwd.isEmpty() && !exists(Path(cwd))) {
+        record.status = "degraded"
+        record.degradedReason = "cwd_missing"
+        record.lastError = "service plugin working directory missing: ${redactServicePayload(cwd).text}"
+        return ServicePluginProcessEnsureResult(false, "cwd_missing", diagnostic: record.lastError)
+    }
+
+    var stale = ServicePluginDetachedOwner()
+    var early = None<ServicePluginProcessEnsureResult>
+    var claim = ServicePluginStartClaim(0, "", "")
     synchronized(servicePluginProcessLock) {
         if (record.status == "stopping") {
-            record.degradedReason = "stopping"
-            return ServicePluginProcessEnsureResult(false, "stopping", diagnostic: "service plugin stop in progress")
-        }
-        if (servicePluginActiveProcesses.contains(serviceId) && servicePluginResponseQueues.contains(serviceId)) {
+            early = Some(ServicePluginProcessEnsureResult(false, "stopping", diagnostic: "service plugin stop in progress"))
+        } else if (servicePluginStartClaims.contains(serviceId)) {
+            early = Some(ServicePluginProcessEnsureResult(false, "starting", diagnostic: "service plugin start in progress"))
+        } else if (servicePluginActiveProcesses.contains(serviceId) && servicePluginResponseQueues.contains(serviceId)) {
             let activeProcess = servicePluginActiveProcesses[serviceId]
             let activeQueue = servicePluginResponseQueues[serviceId]
             if (activeProcess.process.isAlive() && !activeQueue.isClosed()) {
-                return ServicePluginProcessEnsureResult(true, "running", process: Some(activeProcess), queue: Some(activeQueue))
+                early = Some(ServicePluginProcessEnsureResult(true, "running", process: Some(activeProcess), queue: Some(activeQueue)))
+            } else {
+                stale = detachServicePluginOwnerLocked(serviceId, ownerId: activeProcess.ownerId, generation: activeProcess.generation, claimToken: activeProcess.claimToken)
             }
-            let reason = if (!activeProcess.process.isAlive()) { "process_exited" } else { "stdio_closed" }
-            cleanupServicePluginActiveProcessLocked(serviceId, reason, diagnostic: "ensure stale active process reason=${reason}")
-        } else if (servicePluginActiveProcesses.contains(serviceId)) {
-            cleanupServicePluginActiveProcessLocked(serviceId, "stdio_closed", diagnostic: "ensure stale active process without response queue")
-        } else if (servicePluginResponseQueues.contains(serviceId)) {
-            cleanupServicePluginActiveProcessLocked(serviceId, "stdio_closed", diagnostic: "ensure stale response queue without active process")
+        } else if (servicePluginActiveProcesses.contains(serviceId) || servicePluginResponseQueues.contains(serviceId)) {
+            stale = detachServicePluginOwnerLocked(serviceId)
         }
-        if (record.registration.manifest.entryCommand.isEmpty()) {
-            record.status = "degraded"
-            record.degradedReason = "missing_entry_command"
-            record.lastError = record.degradedReason
-            return ServicePluginProcessEnsureResult(false, "missing_entry_command", diagnostic: record.lastError)
-        }
-        let cwd = servicePluginEffectiveWorkingDirectory(record.registration.configRef)
-        if (!cwd.isEmpty() && !exists(Path(cwd))) {
-            record.status = "degraded"
-            record.degradedReason = "cwd_missing"
-            record.lastError = "service plugin working directory missing: ${redactServicePayload(cwd).text}"
-            return ServicePluginProcessEnsureResult(false, "cwd_missing", diagnostic: record.lastError)
-        }
-        match (servicePluginBlockingLeaseBeforeStart(serviceId)) {
-            case Some(block) =>
-                record.status = "degraded"
-                record.degradedReason = block.status
-                record.lastError = block.diagnostic
-                return ServicePluginProcessEnsureResult(false, block.status, diagnostic: record.lastError)
-            case None => ()
-        }
-        record.instanceSeq++
-        record.instanceId = "${serviceId}-${record.instanceSeq}"
-        try { Directory.create(servicePluginRuntimeLeaseDir(serviceId), recursive: true) } catch (_: Exception) { () }
-        let args = servicePluginArgsWithConfigRef(record.registration.manifest.entryArgs, record.registration.configRef.configPath)
-        let process = try {
-            let ownerEnvironment = ArrayList<(String, String)>()
-            for ((key, value) in servicePluginProcessEnvironment(record)) {
-                ownerEnvironment.add((key, value))
-            }
+        if (early.isNone()) {
+            record.instanceSeq++
+            record.instanceId = "${serviceId}-${record.instanceSeq}"
+            servicePluginStartClaimSequence++
             servicePluginBrokerOwnerSequence++
             let ownerId = "service-plugin:${serviceId}:${record.instanceId}:${servicePluginBrokerOwnerSequence}"
-            let started = gatewayStdioBroker().startOwner(ManagedStdioOwnerSpec(
-                ownerId,
-                record.registration.manifest.entryCommand,
-                args: args,
-                workingDirectory: if (cwd.isEmpty()) { None<String> } else { Some(cwd) },
-                environment: ownerEnvironment.toArray(),
-                stdinMode: "line",
-                outputMode: "line"
-            ), timeoutMs: startupTimeoutMs)
-            if (!started.ok) {
-                throw Exception("service plugin broker owner start failed: ${started.status}")
-            }
-            let proc = ServicePluginStdioProcess(
-                gatewayStdioBroker(),
-                ownerId,
-                started.generation,
-                started.pid
-            )
-            record.pid = started.pid
-            logServicePluginProcessStart(record, started.pid)
-            proc
-        } catch (e: Exception) {
-            record.status = "degraded"
-            record.degradedReason = "process_start_failed"
-            record.lastError = redactServicePayload(e.message).text
-            logServicePluginProcessStartFailed(record, e.message)
-            return ServicePluginProcessEnsureResult(false, "process_start_failed", diagnostic: record.lastError)
+            claim = ServicePluginStartClaim(servicePluginStartClaimSequence, ownerId, record.instanceId)
+            servicePluginStartClaims[serviceId] = claim
+            record.status = "starting"
+            record.degradedReason = ""
+            record.lastError = ""
         }
-        let initRead = readExpectedServiceFrame(process, ServicePluginStdoutReadPolicy(startupTimeoutMs, serviceId, "initialize"))
-        if (!initRead.ok) {
-            record.status = "degraded"
-            record.degradedReason = if (initRead.status == "timeout") { "initialize_timeout" } else { initRead.status }
-            record.lastError = if (initRead.status == "timeout") {
-                servicePluginProcessError("service plugin initialize timeout", process)
-            } else {
-                initRead.diagnostic
-            }
-            process.stop()
-            return ServicePluginProcessEnsureResult(false, record.degradedReason, diagnostic: record.lastError)
-        }
-        let initPayloadValidation = validateServicePluginPayloadObject(initRead.frame.payload)
-        if (!initPayloadValidation.ok) {
-            record.status = "degraded"
-            record.degradedReason = "payload_invalid"
-            record.lastError = redactServicePayload(initPayloadValidation.diagnostic).text
-            process.stop()
-            return ServicePluginProcessEnsureResult(false, "payload_invalid", diagnostic: record.lastError)
-        }
-        let initPayloadStatus = parseServicePluginPayloadStatus(initRead.frame.payload)
-        if (!initPayloadStatus.parsed || !initPayloadStatus.okPresent || !initPayloadStatus.ok) {
-            record.status = "degraded"
-            record.degradedReason = "initialize_failed"
-            record.lastError = if (!initPayloadStatus.diagnostic.isEmpty()) {
-                redactServicePayload(initPayloadStatus.diagnostic).text
-            } else if (!initPayloadStatus.status.isEmpty() && initPayloadStatus.status != "ok" && initPayloadStatus.status != "invalid_payload") {
-                "initialize rejected: ${redactServicePayload(initPayloadStatus.status).text}"
-            } else {
-                "initialize payload missing boolean ok"
-            }
-            process.stop()
-            return ServicePluginProcessEnsureResult(false, record.degradedReason, diagnostic: record.lastError)
-        }
-
-        let queue = ServicePluginResponseQueue()
-        servicePluginActiveProcesses[serviceId] = process
-        servicePluginResponseQueues[serviceId] = queue
-        record.status = "running"
-        record.degradedReason = ""
-        record.lastError = ""
-        spawn { servicePluginEventPump(record, process, queue) }
-        servicePluginStartSupervisorWorker(record)
-        ServicePluginProcessEnsureResult(true, "running", process: Some(process), queue: Some(queue))
     }
+    match (early) {
+        case Some(result) => return result
+        case None => ()
+    }
+    cleanupDetachedServicePluginOwner(serviceId, stale, "stdio_closed", diagnostic: "ensure stale active process")
+
+    match (servicePluginBlockingLeaseBeforeStart(serviceId)) {
+        case Some(block) => return failServicePluginStartClaim(record, claim, block.status, block.diagnostic)
+        case None => ()
+    }
+    try { Directory.create(servicePluginRuntimeLeaseDir(serviceId), recursive: true) } catch (_: Exception) { () }
+    let args = servicePluginArgsWithConfigRef(record.registration.manifest.entryArgs, record.registration.configRef.configPath)
+    let ownerEnvironment = ArrayList<(String, String)>()
+    for ((key, value) in servicePluginProcessEnvironment(record)) { ownerEnvironment.add((key, value)) }
+
+    let started = try {
+        gatewayStdioBroker().startOwner(ManagedStdioOwnerSpec(
+            claim.ownerId,
+            record.registration.manifest.entryCommand,
+            args: args,
+            workingDirectory: if (cwd.isEmpty()) { None<String> } else { Some(cwd) },
+            environment: ownerEnvironment.toArray(),
+            stdinMode: "line",
+            outputMode: "line"
+        ), timeoutMs: startupTimeoutMs)
+    } catch (e: Exception) {
+        logServicePluginProcessStartFailed(record, e.message)
+        return failServicePluginStartClaim(record, claim, "process_start_failed", e.message)
+    }
+    if (!started.ok) {
+        logServicePluginProcessStartFailed(record, started.status)
+        return failServicePluginStartClaim(record, claim, "process_start_failed", "service plugin broker owner start failed: ${started.status}")
+    }
+    let process = ServicePluginStdioProcess(
+        gatewayStdioBroker(),
+        claim.ownerId,
+        started.generation,
+        started.pid,
+        claimToken: claim.token
+    )
+    let attached = synchronized(servicePluginProcessLock) {
+        if (servicePluginStartClaimMatchesLocked(serviceId, claim) && record.status != "stopping") {
+            claim.process = Some(process)
+            record.pid = started.pid
+            true
+        } else {
+            false
+        }
+    }
+    if (!attached) {
+        let _ = process.stop()
+        return ServicePluginProcessEnsureResult(false, "stopping", diagnostic: "service plugin start cancelled")
+    }
+    logServicePluginProcessStart(record, started.pid)
+
+    let initRead = readExpectedServiceFrame(process, ServicePluginStdoutReadPolicy(startupTimeoutMs, serviceId, "initialize"))
+    if (!initRead.ok) {
+        let status = if (initRead.status == "timeout") { "initialize_timeout" } else { initRead.status }
+        let diagnostic = if (initRead.status == "timeout") {
+            servicePluginProcessError("service plugin initialize timeout", process)
+        } else {
+            initRead.diagnostic
+        }
+        return failServicePluginStartClaim(record, claim, status, diagnostic, process: Some(process))
+    }
+    let initPayloadValidation = validateServicePluginPayloadObject(initRead.frame.payload)
+    if (!initPayloadValidation.ok) {
+        return failServicePluginStartClaim(record, claim, "payload_invalid", initPayloadValidation.diagnostic, process: Some(process))
+    }
+    let initPayloadStatus = parseServicePluginPayloadStatus(initRead.frame.payload)
+    if (!initPayloadStatus.parsed || !initPayloadStatus.okPresent || !initPayloadStatus.ok) {
+        let diagnostic = if (!initPayloadStatus.diagnostic.isEmpty()) {
+            initPayloadStatus.diagnostic
+        } else if (!initPayloadStatus.status.isEmpty() && initPayloadStatus.status != "ok" && initPayloadStatus.status != "invalid_payload") {
+            "initialize rejected: ${initPayloadStatus.status}"
+        } else {
+            "initialize payload missing boolean ok"
+        }
+        return failServicePluginStartClaim(record, claim, "initialize_failed", diagnostic, process: Some(process))
+    }
+
+    let queue = ServicePluginResponseQueue()
+    let gate = ServicePluginEventPumpGate()
+    let pump = spawn {
+        gate.waitOpen()
+        servicePluginEventPump(record, process, queue)
+    }
+    let published = synchronized(servicePluginProcessLock) {
+        if (servicePluginStartClaimMatchesLocked(serviceId, claim) && record.status != "stopping") {
+            servicePluginStartClaims.remove(serviceId)
+            servicePluginActiveProcesses[serviceId] = process
+            servicePluginResponseQueues[serviceId] = queue
+            servicePluginEventPumps[serviceId] = pump
+            record.status = "running"
+            record.degradedReason = ""
+            record.lastError = ""
+            true
+        } else {
+            false
+        }
+    }
+    gate.open()
+    if (!published) {
+        queue.close(status: "stopped", diagnostic: "service plugin start cancelled")
+        let _ = process.stop()
+        try { pump.get(Duration.second) } catch (_: Exception) { () }
+        return ServicePluginProcessEnsureResult(false, "stopping", diagnostic: "service plugin start cancelled")
+    }
+    servicePluginStartSupervisorWorker(record)
+    ServicePluginProcessEnsureResult(true, "running", process: Some(process), queue: Some(queue))
 }
 
 private func servicePluginEventPump(record: ServicePluginRuntimeRecord, process: ServicePluginStdioProcess, queue: ServicePluginResponseQueue): Unit {
@@ -2452,6 +2700,18 @@ private func servicePluginEventPump(record: ServicePluginRuntimeRecord, process:
     var exitDrainPolls: Int64 = 0
     let noiseSamples = ArrayList<String>()
     while (true) {
+        let current = synchronized(servicePluginProcessLock) {
+            servicePluginOwnerMatchesLocked(
+                serviceId,
+                process.ownerId,
+                process.generation,
+                claimToken: process.claimToken
+            )
+        }
+        if (!current) {
+            servicePluginDrainDetachedOwner(process)
+            return
+        }
         let readTimeoutMs: Int64 = if (exitDrainPolls > 0) { 50 } else { 1000 }
         let line = match (process.readStdoutLine(readTimeoutMs)) {
             case Some(value) => value
@@ -2468,17 +2728,30 @@ private func servicePluginEventPump(record: ServicePluginRuntimeRecord, process:
                 if (idlePolls < 3600) {
                     continue
                 }
-                if (record.status == "stopping") {
-                    queue.close(status: "stopped", diagnostic: "service plugin stop in progress")
-                    return
-                }
-                record.status = "degraded"
                 let terminal = process.terminalStatus()
-                record.degradedReason = if (terminal.isEmpty()) { "process_exited" } else { terminal }
-                record.lastError = servicePluginProcessError("service plugin process stdout closed", process)
+                let degradedReason = if (terminal.isEmpty()) { "process_exited" } else { terminal }
+                let diagnostic = servicePluginProcessError("service plugin process stdout closed", process)
+                var detached = ServicePluginDetachedOwner()
+                var stopping = false
                 synchronized(servicePluginProcessLock) {
-                    cleanupServicePluginActiveProcessForOwnerLocked(serviceId, process.ownerId, record.degradedReason, diagnostic: record.lastError)
+                    if (servicePluginOwnerMatchesLocked(serviceId, process.ownerId, process.generation, claimToken: process.claimToken)) {
+                        stopping = record.status == "stopping"
+                        if (!stopping) {
+                            record.status = "degraded"
+                            record.degradedReason = degradedReason
+                            record.lastError = diagnostic
+                            detached = detachServicePluginOwnerLocked(serviceId, ownerId: process.ownerId, generation: process.generation, claimToken: process.claimToken)
+                        }
+                    }
                 }
+                if (stopping) { return }
+                cleanupDetachedServicePluginOwner(
+                    serviceId,
+                    detached,
+                    degradedReason,
+                    diagnostic: diagnostic,
+                    joinPump: false
+                )
                 return
         }
         idlePolls = 0
@@ -2488,12 +2761,17 @@ private func servicePluginEventPump(record: ServicePluginRuntimeRecord, process:
             noiseLineCount = noise[0]
             noiseBytes = noise[1]
             if (servicePluginStdoutNoiseExceeded(noiseLineCount, noiseBytes, ServicePluginStdoutReadPolicy(1000, serviceId, "eventPump"))) {
-                record.status = "degraded"
-                record.degradedReason = "stdout_protocol_violation"
-                record.lastError = servicePluginStdoutNoiseDiagnostic("stdout_protocol_violation", noiseLineCount, noiseBytes, noiseSamples)
+                let diagnostic = servicePluginStdoutNoiseDiagnostic("stdout_protocol_violation", noiseLineCount, noiseBytes, noiseSamples)
+                var detached = ServicePluginDetachedOwner()
                 synchronized(servicePluginProcessLock) {
-                    cleanupServicePluginActiveProcessForOwnerLocked(serviceId, process.ownerId, "stdout_protocol_violation", diagnostic: record.lastError)
+                    if (servicePluginOwnerMatchesLocked(serviceId, process.ownerId, process.generation, claimToken: process.claimToken)) {
+                        record.status = "degraded"
+                        record.degradedReason = "stdout_protocol_violation"
+                        record.lastError = diagnostic
+                        detached = detachServicePluginOwnerLocked(serviceId, ownerId: process.ownerId, generation: process.generation, claimToken: process.claimToken)
+                    }
                 }
+                cleanupDetachedServicePluginOwner(serviceId, detached, "stdout_protocol_violation", diagnostic: diagnostic, joinPump: false)
                 return
             }
             continue
@@ -2503,44 +2781,69 @@ private func servicePluginEventPump(record: ServicePluginRuntimeRecord, process:
             let noise = servicePluginRecordStdoutNoise(trimmed, noiseLineCount, noiseBytes, noiseSamples)
             noiseLineCount = noise[0]
             noiseBytes = noise[1]
-            record.lastError = servicePluginStdoutNoiseDiagnostic(decoded.errorKind, noiseLineCount, noiseBytes, noiseSamples)
+            let diagnostic = servicePluginStdoutNoiseDiagnostic(decoded.errorKind, noiseLineCount, noiseBytes, noiseSamples)
             if (decoded.errorKind == "frame_too_large") {
-                record.status = "degraded"
-                record.degradedReason = "frame_too_large"
+                var detached = ServicePluginDetachedOwner()
                 synchronized(servicePluginProcessLock) {
-                    cleanupServicePluginActiveProcessForOwnerLocked(serviceId, process.ownerId, "frame_too_large", diagnostic: "frame_too_large ${hashRawPayload(trimmed)}")
+                    if (servicePluginOwnerMatchesLocked(serviceId, process.ownerId, process.generation, claimToken: process.claimToken)) {
+                        record.status = "degraded"
+                        record.degradedReason = "frame_too_large"
+                        record.lastError = diagnostic
+                        detached = detachServicePluginOwnerLocked(serviceId, ownerId: process.ownerId, generation: process.generation, claimToken: process.claimToken)
+                    }
                 }
+                cleanupDetachedServicePluginOwner(serviceId, detached, "frame_too_large", diagnostic: "frame_too_large ${hashRawPayload(trimmed)}", joinPump: false)
                 return
             }
             if (servicePluginStdoutNoiseExceeded(noiseLineCount, noiseBytes, ServicePluginStdoutReadPolicy(1000, serviceId, "eventPump"))) {
-                record.status = "degraded"
-                record.degradedReason = "frame_decode_failed"
+                var detached = ServicePluginDetachedOwner()
                 synchronized(servicePluginProcessLock) {
-                    cleanupServicePluginActiveProcessForOwnerLocked(serviceId, process.ownerId, "frame_decode_failed", diagnostic: record.lastError)
+                    if (servicePluginOwnerMatchesLocked(serviceId, process.ownerId, process.generation, claimToken: process.claimToken)) {
+                        record.status = "degraded"
+                        record.degradedReason = "frame_decode_failed"
+                        record.lastError = diagnostic
+                        detached = detachServicePluginOwnerLocked(serviceId, ownerId: process.ownerId, generation: process.generation, claimToken: process.claimToken)
+                    }
                 }
+                cleanupDetachedServicePluginOwner(serviceId, detached, "frame_decode_failed", diagnostic: diagnostic, joinPump: false)
                 return
             }
             continue
         }
         let frame = decoded.frame
         if (frame.frameType == "response") {
-            queue.append(frame)
+            synchronized(servicePluginProcessLock) {
+                if (servicePluginOwnerMatchesLocked(serviceId, process.ownerId, process.generation, claimToken: process.claimToken)) {
+                    queue.append(frame)
+                }
+            }
             continue
         }
         if (frame.frameType == "heartbeat" || frame.method == "heartbeat") {
-            let _ = handleServiceHeartbeat(frame)
+            let currentHeartbeat = synchronized(servicePluginProcessLock) {
+                servicePluginOwnerMatchesLocked(serviceId, process.ownerId, process.generation, claimToken: process.claimToken)
+            }
+            if (currentHeartbeat) { let _ = handleServiceHeartbeat(frame) }
             continue
         }
         if (frame.frameType == "event") {
-            synchronized(servicePluginRuntimeRecordLock) {
-                record.eventFrames.add(frame)
+            let currentEvent = synchronized(servicePluginProcessLock) {
+                if (servicePluginOwnerMatchesLocked(serviceId, process.ownerId, process.generation, claimToken: process.claimToken)) {
+                    synchronized(servicePluginRuntimeRecordLock) { record.eventFrames.add(frame) }
+                    true
+                } else {
+                    false
+                }
             }
+            if (!currentEvent) { return }
             let handled = handleServiceCapabilityEvent(ServiceCapabilityEvent(frame.serviceId, frame.capabilityId, payload: frame.payload))
             if (handled.ok) {
-                servicePluginScheduleEventDispatch(record, frame)
+                servicePluginScheduleEventDispatch(record, frame, process)
             } else {
-                synchronized(servicePluginRuntimeRecordLock) {
-                    record.lastError = redactServicePayload(handled.diagnostic).text
+                synchronized(servicePluginProcessLock) {
+                    if (servicePluginOwnerMatchesLocked(serviceId, process.ownerId, process.generation, claimToken: process.claimToken)) {
+                        synchronized(servicePluginRuntimeRecordLock) { record.lastError = redactServicePayload(handled.diagnostic).text }
+                    }
                 }
             }
             continue
@@ -2551,10 +2854,33 @@ private func servicePluginEventPump(record: ServicePluginRuntimeRecord, process:
     }
 }
 
-private func servicePluginScheduleEventDispatch(record: ServicePluginRuntimeRecord, frame: ServiceFrame): Unit {
+private func servicePluginDrainDetachedOwner(process: ServicePluginStdioProcess, timeoutMs!: Int64 = 1000): Unit {
+    let deadlineMs = servicePluginNowMs() + max(1, timeoutMs)
+    let stopReserveMs = min(500, max(100, timeoutMs / 2))
+    while (servicePluginDeadlineRemaining(deadlineMs) > stopReserveMs) {
+        let remaining = servicePluginDeadlineRemaining(deadlineMs) - stopReserveMs
+        let _ = process.readStdoutLine(min(50, max(1, remaining)))
+        if (!process.terminalStatus().isEmpty()) { return }
+    }
+    let remaining = servicePluginDeadlineRemaining(deadlineMs)
+    if (remaining > 0 && process.terminalStatus().isEmpty()) {
+        let _ = process.stop(timeoutMs: remaining)
+    }
+}
+
+private func servicePluginScheduleEventDispatch(record: ServicePluginRuntimeRecord, frame: ServiceFrame, process: ServicePluginStdioProcess): Unit {
     spawn {
         let dispatch = dispatchServicePluginEvent(frame)
-        servicePluginRecordRuntimeDispatchLocked(record, frame, dispatch)
+        synchronized(servicePluginProcessLock) {
+            if (servicePluginOwnerMatchesLocked(
+                record.registration.manifest.pluginId,
+                process.ownerId,
+                process.generation,
+                claimToken: process.claimToken
+            )) {
+                servicePluginRecordRuntimeDispatchLocked(record, frame, dispatch)
+            }
+        }
     }
 }
 
@@ -2643,7 +2969,7 @@ public func ensureRegisteredServicePluginStarted(serviceId: String, startupTimeo
             ServiceStartResult(
                 ensured.ok,
                 sid,
-                if (ensured.ok) { "running" } else { record.degradedReason },
+                if (ensured.ok) { "running" } else if (!ensured.status.isEmpty()) { ensured.status } else { record.degradedReason },
                 instanceId: record.instanceId,
                 diagnostic: ensured.diagnostic
             )
@@ -2661,23 +2987,22 @@ public func stopServicePlugin(serviceId: String, reason!: String = "", timeoutMi
                 record.degradedReason = "stop timeout"
                 return ServiceStopResult(false, sid, "degraded", diagnostic: record.degradedReason)
             }
-            var detachedProcess = None<ServicePluginStdioProcess>
-            var detachedQueue = None<ServicePluginResponseQueue>
+            let deadlineMs = servicePluginNowMs() + min(timeoutMillis, 30000)
+            var selectedProcess = None<ServicePluginStdioProcess>
+            var pendingProcess = None<ServicePluginStdioProcess>
             var stopClaimed = false
             synchronized(servicePluginProcessLock) {
                 if (record.status != "stopping") {
                     stopClaimed = true
                     record.status = "stopping"
                     match (servicePluginActiveProcesses.get(sid)) {
-                        case Some(process) =>
-                            detachedProcess = Some(process)
-                            servicePluginActiveProcesses.remove(sid)
+                        case Some(process) => selectedProcess = Some(process)
                         case None => ()
                     }
-                    match (servicePluginResponseQueues.get(sid)) {
-                        case Some(queue) =>
-                            detachedQueue = Some(queue)
-                            servicePluginResponseQueues.remove(sid)
+                    match (servicePluginStartClaims.get(sid)) {
+                        case Some(claim) =>
+                            pendingProcess = claim.process
+                            servicePluginStartClaims.remove(sid)
                         case None => ()
                     }
                 }
@@ -2685,35 +3010,88 @@ public func stopServicePlugin(serviceId: String, reason!: String = "", timeoutMi
             if (!stopClaimed) {
                 return ServiceStopResult(false, sid, "stopping", diagnostic: "service plugin stop already in progress")
             }
-            match (detachedQueue) {
-                case Some(queue) => queue.close(status: "stopped", diagnostic: "service plugin stopped: ${reason.trimAscii()}")
+            var stopStatus = "graceful_exited"
+            var stopOk = true
+            match (pendingProcess) {
+                case Some(process) =>
+                    let remaining = servicePluginDeadlineRemaining(deadlineMs)
+                    let stopped = if (remaining > 0) { process.stop(timeoutMs: remaining) } else { ServicePluginProcessStopResult(false, "still_alive") }
+                    stopStatus = stopped.status
+                    stopOk = stopped.ok
                 case None => ()
             }
-            match (detachedProcess) {
+            match (selectedProcess) {
                 case Some(process) =>
                     try {
                         process.writeLine(encodeServiceFrame(ServiceFrame("request", "stop-${record.instanceId}", sid, method: "stop", correlationId: "stop-${record.instanceId}", payload: "{}")).trimAscii())
                     } catch (_: Exception) {
                         ()
                     }
-                    let stop = process.stop(timeoutMs: min(timeoutMillis, 30000))
-                    let stopDiagnostic = "stop_status=${stop.status}"
-                    if (!stop.ok) {
-                        record.lastError = if (record.lastError.isEmpty()) {
-                            "${stopDiagnostic} ${servicePluginProcessError("service plugin stop forced", process)}"
-                        } else {
-                            "${record.lastError} ${stopDiagnostic}"
+                    let reserveMs = min(1000, max(100, timeoutMillis / 4))
+                    while (servicePluginDeadlineRemaining(deadlineMs) > reserveMs) {
+                        let waitMs = min(50, servicePluginDeadlineRemaining(deadlineMs) - reserveMs)
+                        let terminal = process.waitTerminal(max(1, waitMs))
+                        if (terminal && servicePluginLeaseStopped(record)) {
+                            stopStatus = "graceful_exited"
+                            break
                         }
-                    } else if (record.lastError.isEmpty()) {
-                        record.lastError = stopDiagnostic
+                        if (terminal) { sleep(Duration.millisecond * min(10, max(1, waitMs))) }
+                    }
+                    if (stopStatus != "graceful_exited" || !servicePluginLeaseStopped(record)) {
+                        let remaining = servicePluginDeadlineRemaining(deadlineMs)
+                        let forced = if (remaining > 0) {
+                            process.stop(timeoutMs: remaining)
+                        } else {
+                            ServicePluginProcessStopResult(false, "still_alive")
+                        }
+                        stopOk = forced.ok
+                        stopStatus = forced.status
+                        if (!forced.ok && !servicePluginPidAlive(record.pid)) {
+                            stopOk = true
+                            stopStatus = "force_terminated"
+                        }
                     }
                 case None => ()
             }
+            let detached = synchronized(servicePluginProcessLock) {
+                match (selectedProcess) {
+                    case Some(process) => detachServicePluginOwnerLocked(sid, ownerId: process.ownerId, generation: process.generation, claimToken: process.claimToken)
+                    case None =>
+                        if (servicePluginActiveProcesses.contains(sid)) {
+                            ServicePluginDetachedOwner()
+                        } else {
+                            detachServicePluginOwnerLocked(sid)
+                        }
+                }
+            }
+            match (detached.queue) {
+                case Some(queue) => queue.close(status: "stopped", diagnostic: "service plugin stopped: ${reason.trimAscii()}")
+                case None => ()
+            }
+            match (detached.process) {
+                case Some(process) => process.stopReaders(min(100, max(1, servicePluginDeadlineRemaining(deadlineMs))))
+                case None => ()
+            }
+            match (detached.pump) {
+                case Some(pump) =>
+                    let remaining = servicePluginDeadlineRemaining(deadlineMs)
+                    if (remaining > 0) { try { pump.get(Duration.millisecond * remaining) } catch (_: Exception) { () } }
+                case None => ()
+            }
+            let stopDiagnostic = "stop_status=${stopStatus}"
+            if (!stopOk) {
+                record.lastError = match (selectedProcess) {
+                    case Some(process) => "${stopDiagnostic} ${servicePluginProcessError("service plugin stop forced", process)}"
+                    case None => stopDiagnostic
+                }
+            } else {
+                record.lastError = stopDiagnostic
+            }
             let leaseDiagnostic = servicePluginLeaseStopDiagnostic(record)
             let cleanLease = !leaseDiagnostic.startsWith("lease_not_stopped_after_stop")
-            if (!cleanLease) {
+            if (!cleanLease || !stopOk) {
                 record.status = "degraded"
-                record.degradedReason = "lease_not_stopped_after_stop"
+                record.degradedReason = if (!cleanLease) { "lease_not_stopped_after_stop" } else { "stop timeout" }
                 record.stateFlushed = false
                 if (!record.lastError.isEmpty()) {
                     record.lastError = "${record.lastError} ${leaseDiagnostic}"
