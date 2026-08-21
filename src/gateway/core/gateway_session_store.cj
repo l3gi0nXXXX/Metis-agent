@@ -5,13 +5,17 @@ import magic.jsonable.*
 import metis.core.config.{CliConfig, GatewayUserSettings}
 import metis.gateway.session.{GatewayDeliveryTarget, GatewayIngressSource, GatewaySessionRequest, gatewaySessionRequestFromRpcParams}
 
-import std.collection.ArrayList
+import std.collection.{ArrayList, HashSet}
 import std.convert.*
 import std.fs.{Path, File, Directory, FileInfo, exists, remove, OpenMode, FSException, copy}
 import std.sort.sort
+import std.sync.Mutex
 import std.time.DateTime
 
 import stdx.encoding.json.{JsonObject, JsonString, JsonValue}
+
+private let gatewaySessionDirectoryReadLock = Mutex()
+private let gatewayMigratedSessionRoots = HashSet<String>()
 
 private func gatewayEmptySessionStringArray(): Array<String> {
     let out = ArrayList<String>()
@@ -336,23 +340,25 @@ public class GatewaySessionStore {
         if (!exists(this.root)) {
             return out.toArray()
         }
-        try {
-            for (entry in Directory.readFrom(this.root)) {
-                if (!entry.isRegular()) {
-                    continue
+        synchronized(gatewaySessionDirectoryReadLock) {
+            try {
+                for (entry in Directory.readFrom(this.root)) {
+                    if (!entry.isRegular()) {
+                        continue
+                    }
+                    let name = entry.name
+                    if (name == "sessions.json" || !name.endsWith(".jsonl")) {
+                        continue
+                    }
+                    let p = this.root.join(name)
+                    match (readMetaSessionKey(p)) {
+                        case Some(k) => out.add(k)
+                        case None => ()
+                    }
                 }
-                let name = entry.name
-                if (name == "sessions.json" || !name.endsWith(".jsonl")) {
-                    continue
-                }
-                let p = this.root.join(name)
-                match (readMetaSessionKey(p)) {
-                    case Some(k) => out.add(k)
-                    case None => ()
-                }
+            } catch (_e: Exception) {
+                ()
             }
-        } catch (_e: Exception) {
-            ()
         }
         out.toArray()
     }
@@ -1048,27 +1054,29 @@ private func gatewayListPersistedAgentIdsInternal(defaultAgentId: String): Array
     if (!exists(agentsRoot)) {
         return out.toArray()
     }
-    try {
-        for (entry in Directory.readFrom(agentsRoot)) {
-            if (!entry.isDirectory()) {
-                continue
-            }
-            let agentId = gatewaySanitizeAgentId(entry.name)
-            var present = false
-            for (existing in seen) {
-                if (existing == agentId) {
-                    present = true
-                    break
+    synchronized(gatewaySessionDirectoryReadLock) {
+        try {
+            for (entry in Directory.readFrom(agentsRoot)) {
+                if (!entry.isDirectory()) {
+                    continue
                 }
+                let agentId = gatewaySanitizeAgentId(entry.name)
+                var present = false
+                for (existing in seen) {
+                    if (existing == agentId) {
+                        present = true
+                        break
+                    }
+                }
+                if (present) {
+                    continue
+                }
+                out.add(agentId)
+                seen.add(agentId)
             }
-            if (present) {
-                continue
-            }
-            out.add(agentId)
-            seen.add(agentId)
+        } catch (_: Exception) {
+            ()
         }
-    } catch (_: Exception) {
-        ()
     }
     out.toArray()
 }
@@ -1332,7 +1340,7 @@ public func gatewayFindSessionCatalogRowForUser(
 /**
  * 若新目录尚无 `.jsonl` 转录，则从旧版 `gateway-sessions` 目录复制（不删除旧数据）。
  */
-public func gatewayMigrateLegacyGatewaySessionsIfNeeded(newRoot: Path): Unit {
+private func gatewayMigrateLegacyGatewaySessionsIfNeededLocked(newRoot: Path): Unit {
     var newHasJsonl = false
     if (exists(newRoot)) {
         try {
@@ -1383,6 +1391,17 @@ public func gatewayMigrateLegacyGatewaySessionsIfNeeded(newRoot: Path): Unit {
     }
 }
 
+public func gatewayMigrateLegacyGatewaySessionsIfNeeded(newRoot: Path): Unit {
+    synchronized(gatewaySessionDirectoryReadLock) {
+        let rootKey = newRoot.toString()
+        if (gatewayMigratedSessionRoots.contains(rootKey) && exists(newRoot)) {
+            return
+        }
+        gatewayMigrateLegacyGatewaySessionsIfNeededLocked(newRoot)
+        gatewayMigratedSessionRoots.add(rootKey)
+    }
+}
+
 /**
  * 按当前网关用户配置构造会话存储（含迁移、`sessions.json` 维护）。
  */
@@ -1412,6 +1431,11 @@ public func gatewaySessionStoreForUserWithAgentId(user: GatewayUserSettings, age
 
 public func gatewaySessionStoreForResolvedRequest(user: GatewayUserSettings, request: GatewaySessionRequest): GatewaySessionStore {
     let context = gatewayResolveSessionContextWithAgentRoute(request)
+    match (request.source) {
+        case GatewayIngressSource.Cron =>
+            return gatewaySessionStoreForUserWithAgentId(user, context.agentId)
+        case _ => ()
+    }
     match (gatewayFindSessionLocationForUser(user, context.sessionKey)) {
         case Some(location) => gatewaySessionStoreForUserWithAgentId(user, location.agentId)
         case None => gatewaySessionStoreForUserWithAgentId(user, context.agentId)

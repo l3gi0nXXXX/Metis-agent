@@ -1,15 +1,98 @@
 package metis.gateway.core
 
-import metis.core.config.GatewayUserSettings
-import metis.gateway.session.{GatewayDeliveryTarget, GatewayIngressSource, gatewaySessionRequestFromRpcParams}
+import metis.core.config.{
+    CliConfig,
+    CliSettingManager,
+    GatewayUserSettings,
+    MetisConfigManager,
+    MetisProcessEnvironmentLock
+}
+import metis.gateway.session.{
+    GatewayDeliveryTarget,
+    GatewayIngressSource,
+    GatewaySessionRequest,
+    gatewaySessionRequestFromRpcParams
+}
 
 import magic.jsonable.*
-import std.fs.File
+import std.collection.ArrayList
+import std.env.{getVariable, setVariable}
+import std.fs.{Directory, File, Path, exists, remove}
+import std.time.DateTime
 import std.unittest.testmacro.*
 import stdx.encoding.json.{JsonArray, JsonObject, JsonString}
 
 @Test
 public class GatewaySessionStoreRuntimeTest {
+    @TestCase
+    public func concurrentLegacySessionMigrationSerializesDirectoryWalks(): Unit {
+        synchronized(MetisProcessEnvironmentLock) {
+            let oldHome = getVariable("METIS_HOME")
+            let home = Path("/tmp/metis-session-migration-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
+            try { remove(home, recursive: true) } catch (_: Exception) { () }
+            Directory.create(home, recursive: true)
+            setVariable("METIS_HOME", home.toString())
+            CliConfig.invalidatePathCache()
+            MetisConfigManager.invalidate()
+            CliSettingManager.invalidate()
+            try {
+                let root = home.join("agents").join("main").join("sessions")
+                let futures = ArrayList<Future<Unit>>()
+                for (_ in 0..8) {
+                    futures.add(spawn { gatewayMigrateLegacyGatewaySessionsIfNeeded(root) })
+                }
+                for (future in futures) {
+                    future.get()
+                }
+                @Expect(exists(root), true)
+
+                let store = GatewaySessionStore(root, enabled: true, agentId: "main")
+                store.appendUser("agent:main:concurrent-migration", "中文🙂")
+                let user = GatewayUserSettings()
+                let listings = ArrayList<Future<Int64>>()
+                for (_ in 0..8) {
+                    listings.add(spawn { gatewayListSessionLocationsForUser(user).size })
+                }
+                for (listing in listings) {
+                    @Expect(listing.get() > 0, true)
+                }
+
+                let cronStores = ArrayList<Future<String>>()
+                for (idx in 0..8) {
+                    let jobId = "job-${idx}"
+                    cronStores.add(spawn {
+                        gatewaySessionStoreForResolvedRequest(
+                            user,
+                            GatewaySessionRequest(
+                                GatewayIngressSource.Cron,
+                                channelName: "cron",
+                                sessionHint: "cron:${jobId}",
+                                agentId: "main",
+                                cronJobId: jobId
+                            )
+                        ).sessionsRoot().toString()
+                    })
+                }
+                for (cronStore in cronStores) {
+                    @Expect(cronStore.get(), root.toString())
+                }
+
+                remove(root, recursive: true)
+                gatewayMigrateLegacyGatewaySessionsIfNeeded(root)
+                @Expect(exists(root), true)
+            } finally {
+                match (oldHome) {
+                    case Some(value) => setVariable("METIS_HOME", value)
+                    case None => setVariable("METIS_HOME", "")
+                }
+                CliConfig.invalidatePathCache()
+                MetisConfigManager.invalidate()
+                CliSettingManager.invalidate()
+                try { remove(home, recursive: true) } catch (_: Exception) { () }
+            }
+        }
+    }
+
     @TestCase
     public func listSessionLocationsAggregatesAcrossAgentRoots(): Unit {
         let user = GatewayUserSettings()
