@@ -29,6 +29,9 @@ private var gatewayManagedProcesses = HashMap<String, String>()
 private var gatewayManagedOwnerSequence: Int64 = 0
 private var gatewayManagedLaunchSequence: Int64 = 0
 private var gatewayManagedCancelTimeoutsForTest: Option<(Int64, Int64)> = None<(Int64, Int64)>
+private var gatewayManagedRegistrationLatchForTest: Option<GatewayManagedRegistrationLatch> = None<GatewayManagedRegistrationLatch>
+private let gatewayManagedRegistrationLatchLockForTest = Mutex()
+private var gatewayManagedWorkspaceCleanupFailureForTest: Bool = false
 private var gatewayManagedSessionsGatewayCallRunnerOverride: Option<(String, JsonObject) -> JsonObject> = None<(String, JsonObject) -> JsonObject>
 private var gatewayManagedSubagentCommandSpecOverride: Option<(String, String, String, String, String, String) -> (String, Array<String>, Path)> = None<(String, String, String, String, String, String) -> (String, Array<String>, Path)>
 
@@ -79,7 +82,23 @@ private class GatewayManagedStartGate {
     public func open(): Unit { synchronized(this.lock) { this.opened = true; this.condition.notifyAll() } }
 }
 
+private class GatewayManagedRegistrationLatch {
+    private let lock = Mutex()
+    private var condition: Condition
+    private var entered: Bool = false
+    private var released: Bool = false
+    private var sessionKey: String = ""
+    private var runId: String = ""
+    private var launchId: Int64 = 0
+    public init() { synchronized(this.lock) { this.condition = this.lock.condition() } }
+    public func arriveAndWait(sessionKey: String, runId: String, launchId: Int64): Unit { synchronized(this.lock) { this.sessionKey = sessionKey; this.runId = runId; this.launchId = launchId; this.entered = true; this.condition.notifyAll(); while (!this.released) { let _ = this.condition.wait() } } }
+    public func waitEntered(timeoutMs: Int64): Bool { synchronized(this.lock) { if (!this.entered) { let _ = this.condition.waitUntil({ => this.entered }, timeout: Duration.millisecond * max(1, timeoutMs)) }; this.entered } }
+    public func identity(): (String, String, Int64) { synchronized(this.lock) { (this.sessionKey, this.runId, this.launchId) } }
+    public func release(): Unit { synchronized(this.lock) { this.released = true; this.condition.notifyAll() } }
+}
+
 private class GatewayManagedRunHandle {
+    public let persistenceLock = Mutex()
     public let runId: String
     public let launchId: Int64
     public let workspaceSpec: Option<GatewayManagedWorkspaceSpec>
@@ -88,6 +107,8 @@ private class GatewayManagedRunHandle {
     public var future: Option<Future<Unit>> = None<Future<Unit>>
     public var cancelRequested: Bool = false
     public var terminalPublished: Bool = false
+    public var cleanupPending: Bool = false
+    public var pendingOutcome: Option<GatewayManagedTerminalOutcome> = None<GatewayManagedTerminalOutcome>
     public init(runId: String, launchId: Int64, workspaceSpec: Option<GatewayManagedWorkspaceSpec>) {
         this.runId = runId; this.launchId = launchId; this.workspaceSpec = workspaceSpec
     }
@@ -118,6 +139,41 @@ public class GatewayManagedSessionsToolset {
 
     public func debugSetManagedCancelTimeoutsForTest(timeouts: Option<(Int64, Int64)>): Unit {
         synchronized(gatewayManagedSessionLock) { gatewayManagedCancelTimeoutsForTest = timeouts }
+    }
+
+    public func debugSetManagedWorkspaceCleanupFailureForTest(enabled: Bool): Unit {
+        synchronized(gatewayManagedSessionLock) { gatewayManagedWorkspaceCleanupFailureForTest = enabled }
+    }
+
+    public func debugArmManagedRegistrationLatchForTest(): Unit {
+        synchronized(gatewayManagedRegistrationLatchLockForTest) { gatewayManagedRegistrationLatchForTest = Some(GatewayManagedRegistrationLatch()) }
+    }
+
+    public func debugWaitManagedRegistrationLatchForTest(timeoutMs: Int64): Bool {
+        let latch = synchronized(gatewayManagedRegistrationLatchLockForTest) { gatewayManagedRegistrationLatchForTest }
+        match (latch) { case Some(value) => value.waitEntered(timeoutMs) case None => false }
+    }
+
+    public func debugManagedRegistrationIdentityForTest(): (String, String, Int64) {
+        let latch = synchronized(gatewayManagedRegistrationLatchLockForTest) { gatewayManagedRegistrationLatchForTest }
+        match (latch) { case Some(value) => value.identity() case None => ("", "", 0) }
+    }
+
+    public func debugReleaseManagedRegistrationLatchForTest(): Unit {
+        let latch = synchronized(gatewayManagedRegistrationLatchLockForTest) { gatewayManagedRegistrationLatchForTest }
+        match (latch) { case Some(value) => value.release() case None => () }
+        synchronized(gatewayManagedRegistrationLatchLockForTest) { gatewayManagedRegistrationLatchForTest = None<GatewayManagedRegistrationLatch> }
+    }
+
+    public func debugManagedLaunchIdForTest(sessionKey: String): Int64 {
+        synchronized(gatewayManagedSessionLock) {
+            match (gatewayManagedFutures.get(sessionKey)) { case Some(handle) => handle.launchId case None => 0 }
+        }
+    }
+
+    public func debugFinalizeStaleManagedRunForTest(sessionKey: String, runId: String, launchId: Int64): Bool {
+        let stale = GatewayManagedRunHandle(runId, launchId, None<GatewayManagedWorkspaceSpec>)
+        this.finalizeManagedRun(sessionKey, stale, GatewayManagedTerminalOutcome("failed", error: "stale worker"))
     }
 
     private func gwStore(): MemorySessionTranscriptStore {
@@ -282,7 +338,11 @@ public class GatewayManagedSessionsToolset {
         if (!started.ok) {
             return GatewayManagedBrokerRunResult(false, started.status)
         }
-        this.setManagedProcess(sessionKey, handle, ownerId, started.generation)
+        if (!this.setManagedProcess(sessionKey, handle, ownerId, started.generation)) {
+            if (broker.snapshot().generation == started.generation) { let _ = broker.stopOwner(ownerId, timeoutMs: 1000) }
+            this.clearManagedProcess(sessionKey, handle, ownerId)
+            return GatewayManagedBrokerRunResult(false, "cancelled")
+        }
         try {
             this.collectManagedOwner(broker, ownerId)
         } finally {
@@ -506,6 +566,9 @@ public class GatewayManagedSessionsToolset {
     private func cleanupManagedWorkspace(spec: GatewayManagedWorkspaceSpec): GatewayManagedWorkspaceCleanupResult {
         if (spec.isolationMode != "worktree" || spec.cleanupMode != "delete" || spec.worktreePath.trimAscii().isEmpty()) {
             return GatewayManagedWorkspaceCleanupResult(true)
+        }
+        if (synchronized(gatewayManagedSessionLock) { gatewayManagedWorkspaceCleanupFailureForTest }) {
+            return GatewayManagedWorkspaceCleanupResult(false, diagnostic: "managed worktree cleanup test failure")
         }
         if (!this.managedWorktreeFallbackIsSafe(spec)) { return GatewayManagedWorkspaceCleanupResult(false, diagnostic: "managed worktree cleanup refused unsafe path") }
         var removeFailed = false
@@ -1089,8 +1152,9 @@ public class GatewayManagedSessionsToolset {
 
     private func tryQueueManagedRun(sessionKey: String, agentId: String): Bool {
         let queued = synchronized(gatewayManagedSessionLock) {
+            if (gatewayManagedFutures.contains(sessionKey)) { return false }
             if (let Some(state) <- gatewayManagedStates.get(sessionKey)) {
-                if (state == "queued" || state == "running") {
+                if (state == "queued" || state == "running" || state == "cancelling" || state == "cleanup_pending") {
                     return false
                 }
             }
@@ -1362,17 +1426,33 @@ public class GatewayManagedSessionsToolset {
         current.runId == expected.runId && current.launchId == expected.launchId
     }
 
-    private func registerManagedFuture(sessionKey: String, handle: GatewayManagedRunHandle, future: Future<Unit>): Unit {
-        synchronized(gatewayManagedSessionLock) { handle.future = Some(future); gatewayManagedFutures.add(sessionKey, handle) }
+    private func registerManagedFutureAndOpen(sessionKey: String, handle: GatewayManagedRunHandle, future: Future<Unit>, gate: GatewayManagedStartGate): Bool {
+        let registrationLatch = synchronized(gatewayManagedRegistrationLatchLockForTest) { gatewayManagedRegistrationLatchForTest }
+        synchronized(gatewayManagedSessionLock) {
+            let state = gatewayManagedStates.get(sessionKey) ?? ""
+            if (gatewayManagedFutures.contains(sessionKey) || state != "queued") {
+                gate.open()
+                return false
+            }
+            handle.future = Some(future)
+            gatewayManagedFutures.add(sessionKey, handle)
+            match (registrationLatch) {
+                case Some(latch) => latch.arriveAndWait(sessionKey, handle.runId, handle.launchId)
+                case None => ()
+            }
+            gate.open()
+            true
+        }
     }
 
-    private func setManagedProcess(sessionKey: String, handle: GatewayManagedRunHandle, ownerId: String, ownerGeneration: Int64): Unit {
+    private func setManagedProcess(sessionKey: String, handle: GatewayManagedRunHandle, ownerId: String, ownerGeneration: Int64): Bool {
         synchronized(gatewayManagedSessionLock) {
             match (gatewayManagedFutures.get(sessionKey)) {
                 case Some(current) => if (this.managedHandleMatches(current, handle)) {
                     current.ownerId = ownerId; current.ownerGeneration = ownerGeneration; gatewayManagedProcesses.add(sessionKey, ownerId)
-                }
-                case None => ()
+                    !current.cancelRequested
+                } else { false }
+                case None => false
             }
         }
     }
@@ -1399,39 +1479,84 @@ public class GatewayManagedSessionsToolset {
     }
 
     private func setManagedRunning(sessionKey: String, handle: GatewayManagedRunHandle): Bool {
-        var updated = false
-        synchronized(gatewayManagedSessionLock) {
-            match (gatewayManagedFutures.get(sessionKey)) {
-                case Some(current) => if (this.managedHandleMatches(current, handle)) {
-                    gatewayManagedStates.add(sessionKey, "running")
-                    updated = true
+        synchronized(handle.persistenceLock) {
+            var updated = false
+            synchronized(gatewayManagedSessionLock) {
+                match (gatewayManagedFutures.get(sessionKey)) {
+                    case Some(current) => if (this.managedHandleMatches(current, handle) && !current.cancelRequested) {
+                        gatewayManagedStates.add(sessionKey, "running")
+                        updated = true
+                    }
+                    case None => ()
                 }
-                case None => ()
+            }
+            if (updated) {
+                let _ = gatewaySubagentMarkRunState(this.gwStore().sessionsRoot(), sessionKey, "running")
             }
         }
-        if (updated) { let _ = gatewaySubagentMarkRunState(this.gwStore().sessionsRoot(), sessionKey, "running") }
-        updated
+        synchronized(gatewayManagedSessionLock) {
+            match (gatewayManagedFutures.get(sessionKey)) {
+                case Some(current) => this.managedHandleMatches(current, handle) && !current.cancelRequested
+                case None => false
+            }
+        }
+    }
+
+    private func retainManagedCleanupPending(sessionKey: String, handle: GatewayManagedRunHandle, outcome: GatewayManagedTerminalOutcome, diagnostic: String): GatewayManagedWorkspaceCleanupResult {
+        synchronized(handle.persistenceLock) {
+            let eligible = synchronized(gatewayManagedSessionLock) {
+                match (gatewayManagedFutures.get(sessionKey)) {
+                    case Some(current) => this.managedHandleMatches(current, handle) && !current.terminalPublished
+                    case None => false
+                }
+            }
+            if (!eligible) { return GatewayManagedWorkspaceCleanupResult(false, diagnostic: "managed cleanup handle identity changed") }
+            let cleanupError = "workspace cleanup pending: ${this.managedDiagnostic(diagnostic)}"
+            let observableError = if (outcome.error.isEmpty()) { cleanupError } else { "${outcome.error}; ${cleanupError}" }
+            // The run store only persists its stable status vocabulary. Persist the diagnostic first,
+            // then publish cleanup_pending so observers never see the state without its degraded detail.
+            let persisted = gatewaySubagentMarkRunState(this.gwStore().sessionsRoot(), sessionKey, "running", resultSummary: outcome.resultSummary, error: observableError, exitCode: outcome.exitCode, outputPath: outcome.outputPath)
+            if (!persisted) { return GatewayManagedWorkspaceCleanupResult(false, diagnostic: "managed cleanup pending diagnostic persistence failed") }
+            let published = synchronized(gatewayManagedSessionLock) {
+                match (gatewayManagedFutures.get(sessionKey)) {
+                    case Some(current) => if (this.managedHandleMatches(current, handle) && !current.terminalPublished) {
+                        current.cleanupPending = true
+                        current.pendingOutcome = Some(outcome)
+                        gatewayManagedStates.add(sessionKey, "cleanup_pending")
+                        true
+                    } else { false }
+                    case None => false
+                }
+            }
+            if (published) { GatewayManagedWorkspaceCleanupResult(true) } else { GatewayManagedWorkspaceCleanupResult(false, diagnostic: "managed cleanup handle identity changed after diagnostic persistence") }
+        }
     }
 
     private func finalizeManagedRun(sessionKey: String, handle: GatewayManagedRunHandle, outcome: GatewayManagedTerminalOutcome): Bool {
-        var cancellationWins = false
         var published = false
-        synchronized(gatewayManagedSessionLock) {
-            match (gatewayManagedFutures.get(sessionKey)) {
-                case Some(current) => if (this.managedHandleMatches(current, handle) && !current.terminalPublished) {
-                    current.terminalPublished = true; cancellationWins = current.cancelRequested; gatewayManagedFutures.remove(sessionKey)
-                    match (gatewayManagedProcesses.get(sessionKey)) { case Some(owner) => if (owner == current.ownerId || current.ownerId.isEmpty()) { gatewayManagedProcesses.remove(sessionKey) } case None => () }
-                    gatewayManagedStates.add(sessionKey, if (cancellationWins) { "cancelled" } else { outcome.status })
-                    published = true
+        synchronized(handle.persistenceLock) {
+            let cancellationWins = synchronized(gatewayManagedSessionLock) {
+                match (gatewayManagedFutures.get(sessionKey)) {
+                    case Some(current) => if (this.managedHandleMatches(current, handle) && !current.terminalPublished) { current.cancelRequested } else { return false }
+                    case None => return false
                 }
-                case None => ()
+            }
+            let effective = if (cancellationWins) { GatewayManagedTerminalOutcome("cancelled", error: "cancelled", outputPath: outcome.outputPath) } else { outcome }
+            let _ = gatewaySubagentMarkRunState(this.gwStore().sessionsRoot(), sessionKey, effective.status, resultSummary: effective.resultSummary, error: effective.error, exitCode: effective.exitCode, outputPath: effective.outputPath)
+            synchronized(gatewayManagedSessionLock) {
+                match (gatewayManagedFutures.get(sessionKey)) {
+                    case Some(current) => if (this.managedHandleMatches(current, handle) && !current.terminalPublished) {
+                        current.terminalPublished = true; gatewayManagedFutures.remove(sessionKey)
+                        match (gatewayManagedProcesses.get(sessionKey)) { case Some(owner) => if (owner == current.ownerId || current.ownerId.isEmpty()) { gatewayManagedProcesses.remove(sessionKey) } case None => () }
+                        gatewayManagedStates.add(sessionKey, effective.status)
+                        published = true
+                    }
+                    case None => ()
+                }
             }
         }
-        if (!published) { return false }
-        let effective = if (cancellationWins) { GatewayManagedTerminalOutcome("cancelled", error: "cancelled", outputPath: outcome.outputPath) } else { outcome }
-        let _ = gatewaySubagentMarkRunState(this.gwStore().sessionsRoot(), sessionKey, effective.status, resultSummary: effective.resultSummary, error: effective.error, exitCode: effective.exitCode, outputPath: effective.outputPath)
-        this.deliverManagedTerminalNotice(sessionKey)
-        true
+        if (published) { this.deliverManagedTerminalNotice(sessionKey) }
+        published
     }
 
     private func forgetManagedSession(sessionKey: String): Unit {
@@ -1665,31 +1790,58 @@ public class GatewayManagedSessionsToolset {
 
     private func cancelManagedSession(sessionKey: String): Bool {
         let cancelTimeouts = synchronized(gatewayManagedSessionLock) { gatewayManagedCancelTimeoutsForTest } ?? (1500, 1500)
-        let selected = synchronized(gatewayManagedSessionLock) {
-            let handle = gatewayManagedFutures.get(sessionKey)
-            match (handle) { case Some(current) => current.cancelRequested = true case None => () }
-            let ownerId = match (handle) { case Some(current) => current.ownerId case None => "" }
-            if (handle.isSome()) { gatewayManagedStates.add(sessionKey, "cancelling") }
-            (ownerId, handle)
+        let candidate = synchronized(gatewayManagedSessionLock) { gatewayManagedFutures.get(sessionKey) }
+        if (candidate.isNone()) { return false }
+        let handle = candidate.getOrThrow()
+        var selectedOwnerId = ""
+        var selectedPriorState = ""
+        var selected = false
+        synchronized(handle.persistenceLock) {
+            selected = synchronized(gatewayManagedSessionLock) {
+                match (gatewayManagedFutures.get(sessionKey)) {
+                    case Some(current) => if (this.managedHandleMatches(current, handle) && !current.terminalPublished) {
+                        current.cancelRequested = true
+                        selectedOwnerId = current.ownerId
+                        selectedPriorState = gatewayManagedStates.get(sessionKey) ?? ""
+                        gatewayManagedStates.add(sessionKey, "cancelling")
+                        true
+                    } else { false }
+                    case None => false
+                }
+            }
+            if (selected) {
+                let _ = gatewaySubagentMarkRunState(
+                    this.gwStore().sessionsRoot(),
+                    sessionKey,
+                    if (selectedPriorState == "queued") { "queued" } else { "running" },
+                    error: "cancellation pending"
+                )
+            }
         }
-        if (selected[1].isNone()) { return false }
-        let handle = selected[1].getOrThrow()
+        if (!selected) { return false }
         let broker = gatewayStdioBroker()
-        if (!selected[0].isEmpty() && broker.snapshot().generation == handle.ownerGeneration) {
-            let _ = broker.stopOwner(selected[0], timeoutMs: cancelTimeouts[0])
+        if (!selectedOwnerId.isEmpty() && broker.snapshot().generation == handle.ownerGeneration) {
+            let _ = broker.stopOwner(selectedOwnerId, timeoutMs: cancelTimeouts[0])
         }
         var joined = false
         match (handle.future) {
             case Some(future) =>
                 joined = try { future.get(Duration.millisecond * cancelTimeouts[1]); true } catch (_: Exception) { false }
                 if (!joined) {
-                    try { future.cancel() } catch (_: Exception) { () }
                     joined = try { future.get(Duration.millisecond * cancelTimeouts[1]); true } catch (_: Exception) { false }
                 }
             case None => joined = true
         }
-        if (joined) {
-            match (handle.workspaceSpec) { case Some(ws) => let _ = this.cleanupManagedWorkspace(ws) case None => () }
+        if (joined && handle.cleanupPending) {
+            var cleanup = GatewayManagedWorkspaceCleanupResult(true)
+            match (handle.workspaceSpec) { case Some(ws) => cleanup = this.cleanupManagedWorkspace(ws) case None => () }
+            let pending = handle.pendingOutcome ?? GatewayManagedTerminalOutcome("cancelled", error: "cancelled")
+            if (cleanup.ok) {
+                let _ = this.finalizeManagedRun(sessionKey, handle, pending)
+            } else {
+                let retained = this.retainManagedCleanupPending(sessionKey, handle, pending, cleanup.diagnostic)
+                if (!retained.ok) { this.gwStore().appendTranscriptEntry(sessionKey, "system", retained.diagnostic) }
+            }
         }
         if (!joined) {
             this.gwStore().appendTranscriptEntry(sessionKey, "system", "managed run cancellation is still draining after bounded join")
@@ -1804,14 +1956,16 @@ public class GatewayManagedSessionsToolset {
         let startGate = GatewayManagedStartGate()
         let future = spawn {
             startGate.awaitOpen()
-            if (!this.setManagedRunning(sessionKey, handle)) { return }
-            st.appendTranscriptEntry(
-                sessionKey,
-                "system",
-                "acp started: harness=${resolvedHarness}, mode=${effectiveMode}, sandbox=${effectiveSandbox}, sessionPersistence=${effectiveSessionPersistence}"
-            )
             var outcome = GatewayManagedTerminalOutcome("failed", error: "acp failed", exitCode: 1, outputPath: st.transcriptPath(sessionKey).toString())
             try {
+                if (!this.setManagedRunning(sessionKey, handle)) {
+                    outcome = GatewayManagedTerminalOutcome("cancelled", error: "cancelled before start", outputPath: st.transcriptPath(sessionKey).toString())
+                } else {
+                    st.appendTranscriptEntry(
+                        sessionKey,
+                        "system",
+                        "acp started: harness=${resolvedHarness}, mode=${effectiveMode}, sandbox=${effectiveSandbox}, sessionPersistence=${effectiveSessionPersistence}"
+                    )
                 let result = this.runManagedSessionCommand(
                     sessionKey,
                     handle,
@@ -1848,6 +2002,7 @@ public class GatewayManagedSessionsToolset {
                     st.appendTranscriptEntry(sessionKey, "system", failure)
                     outcome = GatewayManagedTerminalOutcome("failed", error: failure, exitCode: result.exitCode, outputPath: outputPath)
                 }
+                }
             } catch (e: Exception) {
                 let outputPath = st.transcriptPath(sessionKey).toString()
                 if (Thread.currentThread.hasPendingCancellation || this.managedCancellationRequested(sessionKey, handle)) {
@@ -1862,9 +2017,7 @@ public class GatewayManagedSessionsToolset {
                 if (this.finalizeManagedRun(sessionKey, handle, outcome)) { this.maybeDeleteManagedSessionAfterRun(sessionKey) }
             }
         }
-        this.registerManagedFuture(sessionKey, handle, future)
-        startGate.open()
-        true
+        this.registerManagedFutureAndOpen(sessionKey, handle, future, startGate)
     }
 
     private func launchManagedSubagentRun(
@@ -1921,10 +2074,12 @@ public class GatewayManagedSessionsToolset {
         let startGate = GatewayManagedStartGate()
         let future = spawn {
             startGate.awaitOpen()
-            if (!this.setManagedRunning(sessionKey, handle)) { return }
-            st.appendTranscriptEntry(sessionKey, "system", "subagent started: agentId=${resolvedAgentId}, source=${resolvedSpec.source}")
             var outcome = GatewayManagedTerminalOutcome("failed", error: "subagent failed", exitCode: 1, outputPath: st.transcriptPath(sessionKey).toString())
             try {
+                if (!this.setManagedRunning(sessionKey, handle)) {
+                    outcome = GatewayManagedTerminalOutcome("cancelled", error: "cancelled before start", outputPath: st.transcriptPath(sessionKey).toString())
+                } else {
+                    st.appendTranscriptEntry(sessionKey, "system", "subagent started: agentId=${resolvedAgentId}, source=${resolvedSpec.source}")
                 let result = this.runManagedSessionCommand(
                     sessionKey,
                     handle,
@@ -1958,6 +2113,7 @@ public class GatewayManagedSessionsToolset {
                         outcome = GatewayManagedTerminalOutcome("failed", error: failure, exitCode: result.exitCode, outputPath: outputPath)
                     }
                 }
+                }
             } catch (e: Exception) {
                 let outputPath = st.transcriptPath(sessionKey).toString()
                 if (Thread.currentThread.hasPendingCancellation || this.managedCancellationRequested(sessionKey, handle)) {
@@ -1974,13 +2130,14 @@ public class GatewayManagedSessionsToolset {
                     case Some(ws) => cleanup = this.cleanupManagedWorkspace(ws)
                     case None => ()
                 }
-                if (!cleanup.ok && outcome.status == "succeeded") { outcome = GatewayManagedTerminalOutcome("failed", error: "subagent workspace cleanup failed: ${this.managedDiagnostic(cleanup.diagnostic)}", exitCode: 1, outputPath: outcome.outputPath) }
-                if (this.finalizeManagedRun(sessionKey, handle, outcome)) { this.maybeDeleteManagedSessionAfterRun(sessionKey) }
+                if (!cleanup.ok) {
+                    let pending = GatewayManagedTerminalOutcome(outcome.status, resultSummary: outcome.resultSummary, error: if (outcome.error.isEmpty()) { "subagent workspace cleanup failed: ${this.managedDiagnostic(cleanup.diagnostic)}" } else { "${outcome.error}; workspace cleanup failed: ${this.managedDiagnostic(cleanup.diagnostic)}" }, exitCode: outcome.exitCode, outputPath: outcome.outputPath)
+                    let retained = this.retainManagedCleanupPending(sessionKey, handle, pending, cleanup.diagnostic)
+                    if (!retained.ok) { st.appendTranscriptEntry(sessionKey, "system", retained.diagnostic) }
+                } else if (this.finalizeManagedRun(sessionKey, handle, outcome)) { this.maybeDeleteManagedSessionAfterRun(sessionKey) }
             }
         }
-        this.registerManagedFuture(sessionKey, handle, future)
-        startGate.open()
-        true
+        this.registerManagedFutureAndOpen(sessionKey, handle, future, startGate)
     }
 
     private func launchManagedSessionTurn(sessionKey: String, task: String): Bool {

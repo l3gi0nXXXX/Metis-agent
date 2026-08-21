@@ -421,4 +421,37 @@ public class OpenClawCompatHostTest {
         }
         @Expect(gatewayStdioBroker().snapshot().ownerCount, 0)
     }
+
+    @TestCase
+    public func brokerStdioTransportGenerationSwitchMakesOldTransportInert(): Unit {
+        let runner = OpenClawCompatStdioProcessRunner()
+        let script = CliConfig.cwd.join("scripts").join("gateway-stdio-p3b-fake-child.mjs").toString()
+        match (runner.start(OpenClawCompatHostLaunchSpec("node", script, [], 500))) {
+            case OpenClawCompatHostStartResult.Started(oldTransport) =>
+                let oldClient = OpenClawCompatHostClient(oldTransport, defaultTimeoutMs: 500)
+                @Expect(oldClient.request("test.echo").ok, true)
+                gatewayStdioBroker().debugKillBrokerForTest()
+                let stoppedDeadline = DateTime.now().toUnixTimeStamp().toMilliseconds() + 2000
+                var stoppedSnapshot = gatewayStdioBroker().snapshot()
+                while ((stoppedSnapshot.running || stoppedSnapshot.responsive) && DateTime.now().toUnixTimeStamp().toMilliseconds() < stoppedDeadline) {
+                    sleep(Duration.millisecond * 20)
+                    stoppedSnapshot = gatewayStdioBroker().snapshot()
+                }
+                @Expect(stoppedSnapshot.running, false)
+                @Expect(stoppedSnapshot.responsive, false)
+                @Expect(oldClient.isAlive(), false)
+                match (runner.start(OpenClawCompatHostLaunchSpec("node", script, [], 500))) {
+                    case OpenClawCompatHostStartResult.Started(newTransport) =>
+                        let newClient = OpenClawCompatHostClient(newTransport, defaultTimeoutMs: 500)
+                        @Expect(newClient.request("test.echo").ok, true)
+                        oldTransport.close()
+                        @Expect(newClient.isAlive(), true)
+                        @Expect(newClient.request("test.echo").ok, true)
+                        newTransport.close()
+                    case OpenClawCompatHostStartResult.Failed(reason) => @Expect(reason, "")
+                }
+            case OpenClawCompatHostStartResult.Failed(reason) => @Expect(reason, "")
+        }
+        @Expect(gatewayStdioBroker().snapshot().ownerCount, 0)
+    }
 }
