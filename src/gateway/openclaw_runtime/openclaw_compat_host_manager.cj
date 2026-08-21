@@ -1,12 +1,14 @@
 package metis.gateway.openclaw_runtime
 
 import metis.core.config.GatewayUserSettings
+import metis.gateway.process.gatewayStdioBroker
+import metis.process.{ManagedStdioBrokerClient, ManagedStdioOwnerSpec}
 import magic.jsonable.*
 import std.collection.ArrayList
 import std.convert.Parsable
 import std.core.Duration
-import std.io.*
-import std.process.*
+import std.sync.{Condition, Mutex}
+import std.time.DateTime
 import stdx.encoding.json.{JsonArray, JsonObject, JsonString, JsonValue}
 
 public class OpenClawCompatHostConfig {
@@ -45,16 +47,37 @@ public interface OpenClawCompatHostProcessRunner {
     func start(spec: OpenClawCompatHostLaunchSpec): OpenClawCompatHostStartResult
 }
 
-private class OpenClawCompatStdioHostTransport <: OpenClawCompatHostTransport {
-    private let process: SubProcess
-    private let reader: StringReader<InputStream>
-    private let writer: StringWriter<OutputStream>
-    private var closed: Bool = false
+private let openClawCompatOwnerLock = Mutex()
+private var openClawCompatOwnerSequence: Int64 = 0
+private let OPENCLAW_COMPAT_RESPONSE_QUEUE_LIMIT: Int64 = 256
+private let OPENCLAW_COMPAT_RESPONSE_BYTES_LIMIT: Int64 = 4 * 1024 * 1024
 
-    public init(process: SubProcess) {
-        this.process = process
-        this.reader = StringReader<InputStream>(process.stdOutPipe)
-        this.writer = StringWriter<OutputStream>(process.stdInPipe)
+private func nextOpenClawCompatOwnerId(): String {
+    synchronized(openClawCompatOwnerLock) {
+        openClawCompatOwnerSequence += 1
+        "openclaw-compat-${openClawCompatOwnerSequence}"
+    }
+}
+
+private class OpenClawCompatStdioHostTransport <: OpenClawCompatHostTransport {
+    private let broker: ManagedStdioBrokerClient
+    private let ownerId: String
+    private let stateLock = Mutex()
+    private let requestLock = Mutex()
+    private var condition: Condition
+    private let stdoutLines = ArrayList<String>()
+    private var stdoutQueuedBytes: Int64 = 0
+    private var eventPump: Option<Future<Unit>> = None<Future<Unit>>
+    private var closed: Bool = false
+    private var lastReadStatus: String = ""
+
+    public init(broker: ManagedStdioBrokerClient, ownerId: String) {
+        this.broker = broker
+        this.ownerId = ownerId
+        synchronized(this.stateLock) {
+            this.condition = this.stateLock.condition()
+        }
+        this.eventPump = Some(spawn { this.pumpOwnerEvents() })
     }
 
     private func compactJsonLine(raw: String): String {
@@ -85,66 +108,140 @@ private class OpenClawCompatStdioHostTransport <: OpenClawCompatHostTransport {
         out.toString()
     }
 
+    private func pumpOwnerEvents(): Unit {
+        while (true) {
+            if (synchronized(this.stateLock) { this.closed }) {
+                return
+            }
+            match (this.broker.readOwnerLine(this.ownerId, timeoutMs: 250)) {
+                case Some(event) =>
+                    if (event.eventType == "owner.stdout") {
+                        let overflow = synchronized(this.stateLock) {
+                            let bytes = event.text.toArray().size
+                            if (this.stdoutLines.size >= OPENCLAW_COMPAT_RESPONSE_QUEUE_LIMIT || this.stdoutQueuedBytes + bytes > OPENCLAW_COMPAT_RESPONSE_BYTES_LIMIT) {
+                                this.closed = true
+                                this.lastReadStatus = "buffer_capacity_exceeded"
+                                this.condition.notifyAll()
+                                true
+                            } else {
+                                this.stdoutLines.add(event.text)
+                                this.stdoutQueuedBytes += bytes
+                                this.condition.notifyAll()
+                                false
+                            }
+                        }
+                        if (overflow) {
+                            let _ = this.broker.stopOwner(this.ownerId, timeoutMs: 1000)
+                            return
+                        }
+                    } else if (event.eventType == "owner.exit" || event.eventType == "owner.error" || event.eventType == "owner.timeout") {
+                        synchronized(this.stateLock) {
+                            this.closed = true
+                            this.lastReadStatus = if (!event.status.isEmpty()) { event.status } else if (event.eventType == "owner.timeout") { "timed_out" } else { "owner_exited" }
+                            this.condition.notifyAll()
+                        }
+                        return
+                    }
+                    // stderr is continuously drained and intentionally excluded from protocol replies.
+                case None =>
+                    let snapshot = this.broker.snapshot()
+                    if (!snapshot.running || !snapshot.responsive) {
+                        synchronized(this.stateLock) {
+                            this.closed = true
+                            this.lastReadStatus = snapshot.status
+                            this.condition.notifyAll()
+                        }
+                        return
+                    }
+            }
+        }
+    }
+
     private func readLine(timeoutMs: Int64): Option<String> {
         let effectiveTimeoutMs = if (timeoutMs > 0) { timeoutMs } else { 10000 }
-        let fut = spawn {
-            try { this.reader.readln() } catch (_: Exception) { None<String> }
-        }
-        let watchdog = spawn {
-            sleep(Duration.millisecond * effectiveTimeoutMs)
-            fut.cancel()
-        }
-        try {
-            let line = fut.get()
-            watchdog.cancel()
-            return line
-        } catch (_: Exception) {
-            try { watchdog.cancel() } catch (_e: Exception) { () }
-            return None<String>
+        let deadline = DateTime.now().toUnixTimeStamp().toMilliseconds() + effectiveTimeoutMs
+        synchronized(this.stateLock) {
+            while (this.stdoutLines.isEmpty() && !this.closed) {
+                let remaining = deadline - DateTime.now().toUnixTimeStamp().toMilliseconds()
+                if (remaining <= 0) {
+                    return None<String>
+                }
+                let _ = this.condition.wait(timeout: Duration.millisecond * remaining)
+            }
+            if (!this.stdoutLines.isEmpty()) {
+                let value = this.stdoutLines.remove(at: 0)
+                this.stdoutQueuedBytes -= value.toArray().size
+                return Some(value)
+            }
+            None<String>
         }
     }
 
     public func send(frame: JsonObject, timeoutMs!: Int64): OpenClawCompatHostTransportResult {
-        if (this.closed) {
-            return OpenClawCompatHostTransportResult.Failure("OpenClaw compatibility host transport is closed")
-        }
-        try {
-            this.writer.writeln(this.compactJsonLine(frame.toJsonString()))
-            this.writer.flush()
-        } catch (e: Exception) {
-            this.closed = true
-            return OpenClawCompatHostTransportResult.Failure("OpenClaw compatibility host write failed: ${e.message}")
-        }
-        match (this.readLine(timeoutMs)) {
-            case Some(line) =>
-                let trimmed = line.trimAscii()
-                if (trimmed.isEmpty()) {
-                    return OpenClawCompatHostTransportResult.Failure("OpenClaw compatibility host returned an empty frame")
+        synchronized(this.requestLock) {
+            if (synchronized(this.stateLock) { this.closed }) {
+                return OpenClawCompatHostTransportResult.Failure("OpenClaw compatibility host transport is closed")
+            }
+            let written = this.broker.writeOwnerLine(this.ownerId, this.compactJsonLine(frame.toJsonString()))
+            if (!written.ok) {
+                synchronized(this.stateLock) { this.closed = true }
+                let _ = this.broker.stopOwner(this.ownerId, timeoutMs: 1000)
+                return OpenClawCompatHostTransportResult.Failure("OpenClaw compatibility host write failed: ${written.status}")
+            }
+            match (this.readLine(timeoutMs)) {
+                case Some(line) =>
+                    let trimmed = line.trimAscii()
+                    if (trimmed.isEmpty()) {
+                        return OpenClawCompatHostTransportResult.Failure("OpenClaw compatibility host returned an empty frame")
+                    }
+                    try {
+                        return OpenClawCompatHostTransportResult.Response(JsonValue.fromStr(trimmed).asObject())
+                    } catch (_: Exception) {
+                        return OpenClawCompatHostTransportResult.Failure("OpenClaw compatibility host returned invalid json: malformed_json")
+                    }
+                case None =>
+                    let terminalStatus = synchronized(this.stateLock) { this.lastReadStatus }
+                    synchronized(this.stateLock) { this.closed = true }
+                    let _ = this.broker.stopOwner(this.ownerId, timeoutMs: 1000)
+                    if (!terminalStatus.isEmpty() && terminalStatus != "timed_out") {
+                        OpenClawCompatHostTransportResult.Failure("OpenClaw compatibility host read failed: ${terminalStatus}")
+                    } else {
+                        OpenClawCompatHostTransportResult.Timeout
+                    }
                 }
-                try {
-                    return OpenClawCompatHostTransportResult.Response(JsonValue.fromStr(trimmed).asObject())
-                } catch (e: Exception) {
-                    return OpenClawCompatHostTransportResult.Failure("OpenClaw compatibility host returned invalid json: ${e.message}")
-                }
-            case None =>
-                OpenClawCompatHostTransportResult.Timeout
         }
     }
 
     public func close(): Unit {
-        if (this.closed) {
-            return
+        let shouldStop = synchronized(this.stateLock) {
+            if (this.closed) {
+                false
+            } else {
+                this.closed = true
+                true
+            }
         }
-        this.closed = true
-        try {
-            let _ = this.process.wait(timeout: Some(Duration.millisecond * 250))
-        } catch (_: Exception) {
-            try { this.process.terminate(force: true) } catch (_e: Exception) { () }
+        if (shouldStop) {
+            let _ = this.broker.stopOwner(this.ownerId, timeoutMs: 1000)
+        }
+        let pump = synchronized(this.stateLock) {
+            let value = this.eventPump
+            this.eventPump = None<Future<Unit>>
+            value
+        }
+        match (pump) {
+            case Some(future) =>
+                try { let _ = future.get(Duration.second) } catch (_: Exception) { try { future.cancel() } catch (_: Exception) { () } }
+            case None => ()
         }
     }
 
     public func isAlive(): Bool {
-        !this.closed && this.process.isAlive()
+        if (synchronized(this.stateLock) { this.closed }) {
+            return false
+        }
+        let snapshot = this.broker.snapshot()
+        snapshot.running && snapshot.responsive
     }
 }
 
@@ -157,18 +254,22 @@ public class OpenClawCompatStdioProcessRunner <: OpenClawCompatHostProcessRunner
         if (command.isEmpty() || script.isEmpty()) {
             return OpenClawCompatHostStartResult.Failed("nodeCommand and hostScript are required")
         }
-        try {
-            let process = launch(
-                command,
-                [script],
-                stdIn: ProcessRedirect.Pipe,
-                stdOut: ProcessRedirect.Pipe,
-                stdErr: ProcessRedirect.Pipe
-            )
-            OpenClawCompatHostStartResult.Started(OpenClawCompatStdioHostTransport(process))
-        } catch (e: Exception) {
-            OpenClawCompatHostStartResult.Failed(e.message)
+        let broker = gatewayStdioBroker()
+        let ownerId = nextOpenClawCompatOwnerId()
+        let started = broker.startOwner(ManagedStdioOwnerSpec(
+            ownerId,
+            command,
+            args: [script],
+            stdinMode: "line",
+            outputMode: "line",
+            maxLineBytes: 1024 * 1024,
+            maxBufferedBytes: 4 * 1024 * 1024,
+            maxTotalOutputBytes: 0
+        ))
+        if (!started.ok) {
+            return OpenClawCompatHostStartResult.Failed(started.status)
         }
+        OpenClawCompatHostStartResult.Started(OpenClawCompatStdioHostTransport(broker, ownerId))
     }
 }
 

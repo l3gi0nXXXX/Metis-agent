@@ -3,6 +3,7 @@ package metis.gateway.tools
 import metis.core.{GatewayToolRuntimeContext, gatewayClearSubagentNoticeDeliveryHook, gatewayRegisterSubagentNoticeDeliveryHook, gatewaySubagentCreateRunRecord, gatewaySubagentMarkRunSucceeded, gatewaySubagentResolveAgent, gatewaySubagentResolveRunRecord, gatewaySubagentRunRecordString, gatewaySubagentWriteRunRecord, gatewayWithToolRuntimeContext}
 import metis.core.config.{CliConfig, CliSettingManager, MetisConfigManager, MetisProcessEnvironmentLock}
 import metis.core.memory.memorySessionStoreForGatewayUser
+import metis.gateway.process.gatewayStdioBroker
 import metis.utils.ShellUtils
 
 import std.env.{getVariable, setVariable}
@@ -66,6 +67,74 @@ private func managedSubagentsInt(obj: JsonObject, key: String): Int64 {
         case Some(v) => try { v.asInt().getValue() } catch (_: Exception) { 0 }
         case None => 0
     }
+}
+
+private func managedSubagentsWaitForTerminal(toolset: GatewayManagedSessionsToolset, runId: String, timeoutMs!: Int64 = 5000): JsonObject {
+    let deadline = DateTime.now().toUnixTimeStamp().toMilliseconds() + timeoutMs
+    var last = JsonObject()
+    while (DateTime.now().toUnixTimeStamp().toMilliseconds() < deadline) {
+        last = managedSubagentsJson(toolset.subagentsForTest(managedSubagentsSome("status"), managedSubagentsSome(runId), None<String>, None<Int64>))
+        let run = match (last.get("run")) {
+            case Some(value) => try { value.asObject() } catch (_: Exception) { JsonObject() }
+            case None => JsonObject()
+        }
+        let status = managedSubagentsString(run, "status")
+        if (status == "succeeded" || status == "failed" || status == "timed_out" || status == "cancelled") {
+            return last
+        }
+        sleep(Duration.millisecond * 20)
+    }
+    last
+}
+
+private func managedSubagentsSpawnFakeAcp(
+    toolset: GatewayManagedSessionsToolset,
+    mode: String,
+    timeoutSeconds!: Int64 = 5
+): JsonObject {
+    managedSubagentsJson(toolset.sessionsSpawnForCommand(
+        "fixture-task",
+        Some("broker-fixture"),
+        Some("acp"),
+        Some("cmd:node scripts/gateway-stdio-p3b-fake-child.mjs ${mode}"),
+        None<String>,
+        None<String>,
+        None<String>,
+        None<String>,
+        Some(timeoutSeconds),
+        None<Int64>,
+        None<String>,
+        None<String>,
+        None<Bool>,
+        None<String>,
+        None<String>,
+        None<String>,
+        None<String>
+    ))
+}
+
+private func managedSubagentsWaitPidGone(pid: String, timeoutMs!: Int64 = 3000): Bool {
+    let deadline = DateTime.now().toUnixTimeStamp().toMilliseconds() + timeoutMs
+    while (DateTime.now().toUnixTimeStamp().toMilliseconds() < deadline) {
+        let (exitCode, _, _) = ShellUtils.execute(["/bin/kill", "-0", pid], withWrap: false)
+        if (exitCode != 0) {
+            return true
+        }
+        sleep(Duration.millisecond * 20)
+    }
+    let (exitCode, _, _) = ShellUtils.execute(["/bin/kill", "-0", pid], withWrap: false)
+    exitCode != 0
+}
+
+private func managedSubagentsWaitForWorktreeCleanup(worktreePath: String, timeoutMs!: Int64 = 3000): Bool {
+    let deadline = DateTime.now().toUnixTimeStamp().toMilliseconds() + timeoutMs
+    while (DateTime.now().toUnixTimeStamp().toMilliseconds() < deadline) {
+        if (!exists(Path(worktreePath)) && gatewayStdioBroker().snapshot().ownerCount == 0) {
+            return true
+        }
+        sleep(Duration.millisecond * 20)
+    }
+    !exists(Path(worktreePath)) && gatewayStdioBroker().snapshot().ownerCount == 0
 }
 
 private func createManagedSubagentsCustomAgentFixture(id: String, background: Bool): Path {
@@ -137,6 +206,18 @@ private func createManagedSubagentsGitRepo(name: String): Path {
     @Expect(managedSubagentsRunGit(repo, ["add", "README.md"]), true)
     @Expect(managedSubagentsRunGit(repo, ["commit", "-m", "init"]), true)
     repo
+}
+
+private func installManagedSubagentsWorktreeStderrBurstHook(repo: Path): Path {
+    let hook = repo.join(".git").join("hooks").join("post-checkout")
+    let marker = repo.join(".git").join("p3b-worktree-hook-ran")
+    File.writeTo(
+        hook,
+        "#!/bin/sh\nnode -e 'const fs=require(\"node:fs\");process.stderr.write(\"w\".repeat(60000));fs.writeFileSync(process.argv[1],\"ran\")' '${marker.toString()}'\n".toArray()
+    )
+    let (exitCode, _, _) = ShellUtils.execute(["/bin/chmod", "+x", hook.toString()], withWrap: false)
+    @Expect(exitCode, 0)
+    marker
 }
 
 private func appendManagedSubagentsBindingSnapshot(
@@ -1316,6 +1397,235 @@ public class GatewayManagedSessionsToolsetTest {
                 @Expect(managedSubagentsString(children[2].asObject(), "status"), "deferred")
                 @Expect(batch.get("runIds").getOrThrow().asArray().size(), 2)
             }
+        }
+    }
+
+    @TestCase
+    public func managedAcpBrokerPreservesUnicodeNoTailAndRedactsStderr(): Unit {
+        withManagedSessionsToolsetTestHome("/tmp/metis-managed-broker-unicode") {
+            let toolset = GatewayManagedSessionsToolset()
+            gatewayWithToolRuntimeContext(GatewayToolRuntimeContext("cli", sessionKey: "cli:managed-broker-unicode")) {
+                let spawned = managedSubagentsSpawnFakeAcp(toolset, "managed-success")
+                @Expect(managedSubagentsString(spawned, "status"), "accepted")
+                let runId = managedSubagentsString(spawned, "runId")
+                let terminal = managedSubagentsWaitForTerminal(toolset, runId)
+                let run = terminal.get("run").getOrThrow().asObject()
+                @Expect(managedSubagentsString(run, "status"), "succeeded")
+                let logs = managedSubagentsJson(toolset.subagentsForTest(managedSubagentsSome("logs"), managedSubagentsSome(runId), None<String>, None<Int64>))
+                let text = managedSubagentsString(logs, "logs")
+                @Expect(text.contains("仓颉输出🙂"), true)
+                @Expect(text.contains("second-line-without-tail"), true)
+                @Expect(text.contains("diagnostic 中文🙂"), true)
+                @Expect(text.contains("test-secret-token-value"), false)
+
+                let secret = managedSubagentsSpawnFakeAcp(toolset, "managed-secret")
+                let secretRunId = managedSubagentsString(secret, "runId")
+                let secretTerminal = managedSubagentsWaitForTerminal(toolset, secretRunId)
+                @Expect(managedSubagentsString(secretTerminal.get("run").getOrThrow().asObject(), "status"), "succeeded")
+                let secretLogs = managedSubagentsJson(toolset.subagentsForTest(managedSubagentsSome("logs"), managedSubagentsSome(secretRunId), None<String>, None<Int64>))
+                let secretText = managedSubagentsString(secretLogs, "logs")
+                @Expect(secretText.contains("[REDACTED]"), true)
+                @Expect(secretText.contains("test-secret-token-value"), false)
+
+                let privatePath = managedSubagentsSpawnFakeAcp(toolset, "managed-private-path")
+                let privatePathRunId = managedSubagentsString(privatePath, "runId")
+                let privatePathTerminal = managedSubagentsWaitForTerminal(toolset, privatePathRunId)
+                @Expect(managedSubagentsString(privatePathTerminal.get("run").getOrThrow().asObject(), "status"), "succeeded")
+                let privatePathLogs = managedSubagentsJson(toolset.subagentsForTest(managedSubagentsSome("logs"), managedSubagentsSome(privatePathRunId), None<String>, None<Int64>))
+                let privatePathText = managedSubagentsString(privatePathLogs, "logs")
+                @Expect(privatePathText.contains("[REDACTED_LOCAL_PATH]"), true)
+                @Expect(privatePathText.contains("/Users/example/private-workspace"), false)
+
+                let burst = managedSubagentsSpawnFakeAcp(toolset, "managed-stderr-burst")
+                let burstRunId = managedSubagentsString(burst, "runId")
+                let burstTerminal = managedSubagentsWaitForTerminal(toolset, burstRunId)
+                @Expect(managedSubagentsString(burstTerminal.get("run").getOrThrow().asObject(), "status"), "succeeded")
+                let burstLogs = managedSubagentsJson(toolset.subagentsForTest(managedSubagentsSome("logs"), managedSubagentsSome(burstRunId), None<String>, None<Int64>))
+                @Expect(managedSubagentsString(burstLogs, "logs").contains("...[TRUNCATED]"), true)
+                @Expect(gatewayStdioBroker().snapshot().ownerCount, 0)
+            }
+        }
+    }
+
+    @TestCase
+    public func managedAcpBrokerEnforcesExactOutputBoundaryAndInvalidUtf8Isolation(): Unit {
+        withManagedSessionsToolsetTestHome("/tmp/metis-managed-broker-boundary") {
+            let toolset = GatewayManagedSessionsToolset()
+            gatewayWithToolRuntimeContext(GatewayToolRuntimeContext("cli", sessionKey: "cli:managed-broker-boundary")) {
+                let below = managedSubagentsSpawnFakeAcp(toolset, "managed-below-limit")
+                let belowTerminal = managedSubagentsWaitForTerminal(toolset, managedSubagentsString(below, "runId"))
+                let belowRun = belowTerminal.get("run").getOrThrow().asObject()
+                @Expect(managedSubagentsString(belowRun, "status"), "succeeded")
+                @Expect(managedSubagentsString(belowRun, "resultSummary").size, 65535)
+
+                let exact = managedSubagentsSpawnFakeAcp(toolset, "managed-exact-limit")
+                let exactTerminal = managedSubagentsWaitForTerminal(toolset, managedSubagentsString(exact, "runId"))
+                let exactRun = exactTerminal.get("run").getOrThrow().asObject()
+                @Expect(managedSubagentsString(exactRun, "status"), "succeeded")
+                @Expect(managedSubagentsString(exactRun, "resultSummary").size, 65536)
+
+                let overflow = managedSubagentsSpawnFakeAcp(toolset, "managed-overflow")
+                let overflowTerminal = managedSubagentsWaitForTerminal(toolset, managedSubagentsString(overflow, "runId"))
+                let overflowRun = overflowTerminal.get("run").getOrThrow().asObject()
+                @Expect(managedSubagentsString(overflowRun, "status"), "failed")
+                @Expect(managedSubagentsString(overflowRun, "error").contains("output_limit_exceeded"), true)
+
+                let invalid = managedSubagentsSpawnFakeAcp(toolset, "managed-invalid-utf8")
+                let invalidTerminal = managedSubagentsWaitForTerminal(toolset, managedSubagentsString(invalid, "runId"))
+                let invalidRun = invalidTerminal.get("run").getOrThrow().asObject()
+                @Expect(managedSubagentsString(invalidRun, "status"), "failed")
+                @Expect(managedSubagentsString(invalidRun, "error").contains("invalid_response_encoding"), true)
+
+                let recovered = managedSubagentsSpawnFakeAcp(toolset, "managed-empty")
+                let recoveredTerminal = managedSubagentsWaitForTerminal(toolset, managedSubagentsString(recovered, "runId"))
+                @Expect(managedSubagentsString(recoveredTerminal.get("run").getOrThrow().asObject(), "status"), "succeeded")
+                @Expect(gatewayStdioBroker().snapshot().ownerCount, 0)
+            }
+        }
+    }
+
+    @TestCase
+    public func managedAcpBrokerTimeoutAndKillOnlyStopTargetOwner(): Unit {
+        withManagedSessionsToolsetTestHome("/tmp/metis-managed-broker-timeout-kill") {
+            let toolset = GatewayManagedSessionsToolset()
+            gatewayWithToolRuntimeContext(GatewayToolRuntimeContext("cli", sessionKey: "cli:managed-broker-timeout-kill")) {
+                let hanging = managedSubagentsSpawnFakeAcp(toolset, "managed-hang", timeoutSeconds: 1)
+                let success = managedSubagentsSpawnFakeAcp(toolset, "managed-success")
+                let successTerminal = managedSubagentsWaitForTerminal(toolset, managedSubagentsString(success, "runId"))
+                @Expect(managedSubagentsString(successTerminal.get("run").getOrThrow().asObject(), "status"), "succeeded")
+                let hangingTerminal = managedSubagentsWaitForTerminal(toolset, managedSubagentsString(hanging, "runId"), timeoutMs: 5000)
+                @Expect(managedSubagentsString(hangingTerminal.get("run").getOrThrow().asObject(), "status"), "timed_out")
+
+                let killTarget = managedSubagentsSpawnFakeAcp(toolset, "managed-hang", timeoutSeconds: 20)
+                let killRunId = managedSubagentsString(killTarget, "runId")
+                sleep(Duration.millisecond * 100)
+                let killed = managedSubagentsJson(toolset.subagentsForTest(managedSubagentsSome("kill"), managedSubagentsSome(killRunId), None<String>, None<Int64>))
+                @Expect(managedSubagentsString(killed, "status"), "cancelled")
+                let killedTerminal = managedSubagentsWaitForTerminal(toolset, killRunId)
+                @Expect(managedSubagentsString(killedTerminal.get("run").getOrThrow().asObject(), "status"), "cancelled")
+                @Expect(gatewayStdioBroker().snapshot().ownerCount, 0)
+            }
+        }
+    }
+
+    @TestCase
+    public func managedSubagentBrokerRunsFakeChildAndCleansWorktreeOnSuccessAndCancel(): Unit {
+        withManagedSessionsToolsetTestHome("/tmp/metis-managed-broker-subagent") {
+            createManagedSubagentsCustomAgentFixture("broker-subagent", true)
+            let repo = createManagedSubagentsGitRepo("broker-subagent-repo")
+            let worktreeHookMarker = installManagedSubagentsWorktreeStderrBurstHook(repo)
+            var settings = CliSettingManager.readGatewaySettings()
+            settings.subagents.allowCustomAgents = true
+            let _ = MetisConfigManager.setGatewaySettings(settings)
+            CliSettingManager.invalidate()
+            let toolset = GatewayManagedSessionsToolset()
+            let fixture = CliConfig.cwd.join("scripts").join("gateway-stdio-p3b-fake-child.mjs").toString()
+            let pidFile = CliConfig.dotDir.join("managed-subagent-hang.pids")
+            toolset.debugSetManagedSubagentCommandSpecForTest(Some<(String, String, String, String, String, String) -> (String, Array<String>, Path)>(
+                { _sessionKey, _agentId, _task, cwdHint, _agentDir, _modelHint =>
+                    ("node", [fixture, "managed-success"], Path(cwdHint))
+                }
+            ))
+            try {
+                gatewayWithToolRuntimeContext(GatewayToolRuntimeContext("cli", sessionKey: "cli:managed-broker-subagent")) {
+                    let spawned = managedSubagentsJson(toolset.sessionsSpawnForCommand(
+                        "fixture-task",
+                        Some("broker-subagent"),
+                        Some("subagent"),
+                        Some("broker-subagent"),
+                        None<String>,
+                        None<String>,
+                        None<String>,
+                        Some(repo.toString()),
+                        Some(5),
+                        None<Int64>,
+                        None<String>,
+                        Some("worktree"),
+                        None<Bool>,
+                        None<String>,
+                        Some("delete"),
+                        None<String>,
+                        None<String>
+                    ))
+                    let worktreePath = managedSubagentsString(spawned, "worktreePath")
+                    let terminal = managedSubagentsWaitForTerminal(toolset, managedSubagentsString(spawned, "runId"))
+                    @Expect(managedSubagentsString(terminal.get("run").getOrThrow().asObject(), "status"), "succeeded")
+                    @Expect(exists(worktreeHookMarker), true)
+                    @Expect(managedSubagentsWaitForWorktreeCleanup(worktreePath), true)
+                    @Expect(exists(Path(worktreePath)), false)
+                    @Expect(gatewayStdioBroker().snapshot().ownerCount, 0)
+                }
+
+                toolset.debugSetManagedSubagentCommandSpecForTest(Some<(String, String, String, String, String, String) -> (String, Array<String>, Path)>(
+                    { _sessionKey, _agentId, _task, cwdHint, _agentDir, _modelHint =>
+                        ("node", [fixture, "managed-hang", pidFile.toString()], Path(cwdHint))
+                    }
+                ))
+                gatewayWithToolRuntimeContext(GatewayToolRuntimeContext("cli", sessionKey: "cli:managed-broker-subagent-cancel")) {
+                    let spawned = managedSubagentsJson(toolset.sessionsSpawnForCommand(
+                        "fixture-task",
+                        Some("broker-subagent-cancel"),
+                        Some("subagent"),
+                        Some("broker-subagent"),
+                        None<String>, None<String>, None<String>, Some(repo.toString()), Some(20), None<Int64>,
+                        None<String>, Some("cwd"), None<Bool>, None<String>, None<String>, None<String>, None<String>
+                    ))
+                    let runId = managedSubagentsString(spawned, "runId")
+                    let pidDeadline = DateTime.now().toUnixTimeStamp().toMilliseconds() + 2000
+                    while (!exists(pidFile) && DateTime.now().toUnixTimeStamp().toMilliseconds() < pidDeadline) {
+                        sleep(Duration.millisecond * 20)
+                    }
+                    @Expect(exists(pidFile), true)
+                    let killed = managedSubagentsJson(toolset.subagentsForTest(managedSubagentsSome("kill"), managedSubagentsSome(runId), None<String>, None<Int64>))
+                    @Expect(managedSubagentsString(killed, "status"), "cancelled")
+                    let terminal = managedSubagentsWaitForTerminal(toolset, runId)
+                    @Expect(managedSubagentsString(terminal.get("run").getOrThrow().asObject(), "status"), "cancelled")
+                    for (pid in String.fromUtf8(File.readFrom(pidFile)).split("\n")) {
+                        let value = pid.trimAscii()
+                        if (!value.isEmpty()) {
+                            @Expect(managedSubagentsWaitPidGone(value), true)
+                        }
+                    }
+                    @Expect(gatewayStdioBroker().snapshot().ownerCount, 0)
+                }
+            } finally {
+                toolset.debugSetManagedSubagentCommandSpecForTest(None<(String, String, String, String, String, String) -> (String, Array<String>, Path)>)
+                try { remove(pidFile) } catch (_: Exception) { () }
+            }
+        }
+    }
+
+    @TestCase
+    public func managedAcpBrokerSigkillReapsOwnerTreeAndRecoversGeneration(): Unit {
+        withManagedSessionsToolsetTestHome("/tmp/metis-managed-broker-sigkill") {
+            let toolset = GatewayManagedSessionsToolset()
+            let pidFile = CliConfig.dotDir.join("managed-broker-sigkill.pids")
+            gatewayWithToolRuntimeContext(GatewayToolRuntimeContext("cli", sessionKey: "cli:managed-broker-sigkill")) {
+                let hanging = managedSubagentsSpawnFakeAcp(toolset, "managed-hang ${pidFile.toString()}", timeoutSeconds: 20)
+                let runId = managedSubagentsString(hanging, "runId")
+                let pidDeadline = DateTime.now().toUnixTimeStamp().toMilliseconds() + 2000
+                while (!exists(pidFile) && DateTime.now().toUnixTimeStamp().toMilliseconds() < pidDeadline) {
+                    sleep(Duration.millisecond * 20)
+                }
+                @Expect(exists(pidFile), true)
+                gatewayStdioBroker().debugKillBrokerForTest()
+                let terminal = managedSubagentsWaitForTerminal(toolset, runId, timeoutMs: 7000)
+                let failedRun = terminal.get("run").getOrThrow().asObject()
+                @Expect(managedSubagentsString(failedRun, "status"), "failed")
+                @Expect(managedSubagentsString(failedRun, "error").contains("broker_exited"), true)
+                for (pid in String.fromUtf8(File.readFrom(pidFile)).split("\n")) {
+                    let value = pid.trimAscii()
+                    if (!value.isEmpty()) {
+                        @Expect(managedSubagentsWaitPidGone(value), true)
+                    }
+                }
+
+                let recovered = managedSubagentsSpawnFakeAcp(toolset, "managed-empty")
+                let recoveredTerminal = managedSubagentsWaitForTerminal(toolset, managedSubagentsString(recovered, "runId"))
+                @Expect(managedSubagentsString(recoveredTerminal.get("run").getOrThrow().asObject(), "status"), "succeeded")
+                @Expect(gatewayStdioBroker().snapshot().ownerCount, 0)
+            }
+            try { remove(pidFile) } catch (_: Exception) { () }
         }
     }
 }
