@@ -1,16 +1,26 @@
 package metis.core.model
 
+import metis.process.{ManagedStdioEvent, ManagedStdioOwnerSpec, managedStdioBroker}
+
 import std.collection.{ArrayList, HashMap}
 import std.convert.Parsable
-import std.fs.Path
-import std.io.*
-import std.process.*
 import std.sync.*
 import std.time.*
 import stdx.encoding.json.{JsonInt, JsonObject, JsonString, JsonValue}
 
 private const CODEX_APP_SERVER_TIMEOUT_DIAGNOSTIC_GRACE_MS: Int64 = 3000
-private const CODEX_APP_SERVER_READER_DEAD_EMPTY_READ_LIMIT: Int64 = 30
+private const CODEX_APP_SERVER_EVENT_POLL_MS: Int64 = 50
+private const CODEX_APP_SERVER_EVENT_JOIN_MS: Int64 = 1000
+
+private let codexAppServerOwnerIdLock = Mutex()
+private var codexAppServerOwnerIdSequence: Int64 = 0
+
+private func codexAppServerNextOwnerId(): String {
+    synchronized(codexAppServerOwnerIdLock) {
+        codexAppServerOwnerIdSequence += 1
+        "codex-app-server-${DateTime.now().toUnixTimeStamp().toMilliseconds()}-${codexAppServerOwnerIdSequence}"
+    }
+}
 
 public class CodexAppServerProtocolException <: Exception {
     public let code: Int64
@@ -57,10 +67,13 @@ public class CodexAppServerClient <: CodexAppServerTransport {
     private let serverRequests = CodexAppServerJsonQueue()
     private let notifications = CodexAppServerJsonQueue()
     private let diagnosticsBuffer = CodexAppServerStringRing(32)
-    private var process: Option<SubProcess> = None<SubProcess>
-    private var writer: Option<StringWriter<OutputStream>> = None<StringWriter<OutputStream>>
-    private var stdoutFuture: Option<Future<Unit>> = None<Future<Unit>>
-    private var stderrFuture: Option<Future<Unit>> = None<Future<Unit>>
+    private let ownerId = codexAppServerNextOwnerId()
+    private var ownerGeneration: Int64 = 0
+    private var ownerPid: Int64 = 0
+    private var eventFuture: Option<Future<Unit>> = None<Future<Unit>>
+    private var ownerRunning = false
+    private var ownerTerminal = false
+    private var closing = false
     private var nextId: Int64 = 1
     private let lock = Mutex()
 
@@ -78,33 +91,37 @@ public class CodexAppServerClient <: CodexAppServerTransport {
 
     public func start(): Unit {
         synchronized(this.lock) {
-            match (this.process) {
-                case Some(proc) =>
-                    if (proc.isAlive()) {
-                        return
-                    }
-                case None => ()
+            if (this.ownerRunning && !this.ownerTerminal && !this.closing) {
+                return
+            }
+            if (this.closing || this.ownerTerminal || this.eventFuture.isSome()) {
+                throw CodexAppServerProtocolException("codex app-server client is closed", code: -32003)
             }
             let spec = codexAppServerBuildLaunchSpec(codexBin: this.codexBin, extraArgs: this.extraArgs)
-            let proc = try {
-                launch(
-                    spec.command,
-                    spec.args,
-                    stdIn: ProcessRedirect.Pipe,
-                    stdOut: ProcessRedirect.Pipe,
-                    stdErr: ProcessRedirect.Pipe,
-                    workingDirectory: this.cwd.map({ value => Path(value) }),
-                    environment: Some(this.env)
-                )
-            } catch (e: Exception) {
-                throw CodexAppServerProtocolException("Failed to start codex app-server: ${codexAppServerRedactDiagnostic(e.message)}", code: -32000)
+            let environment = ArrayList<(String, String)>()
+            for ((key, value) in this.env) {
+                environment.add((key, value))
             }
-            this.process = Some(proc)
-            this.writer = Some(StringWriter(proc.stdInPipe))
-            let stdoutReader = StringReader<InputStream>(proc.stdOutPipe)
-            let stderrReader = StringReader<InputStream>(proc.stdErrPipe)
-            this.stdoutFuture = Some(spawn { this.readStdout(stdoutReader) })
-            this.stderrFuture = Some(spawn { this.readStderr(stderrReader) })
+            let started = managedStdioBroker().startOwner(
+                ManagedStdioOwnerSpec(
+                    this.ownerId,
+                    spec.command,
+                    args: spec.args,
+                    workingDirectory: this.cwd,
+                    environment: environment.toArray(),
+                    stdinMode: "line",
+                    outputMode: "line"
+                )
+            )
+            if (!started.ok) {
+                throw CodexAppServerProtocolException("Failed to start codex app-server: ${codexAppServerRedactDiagnostic(started.status)}", code: -32000)
+            }
+            this.ownerGeneration = started.generation
+            this.ownerPid = started.pid
+            this.ownerRunning = true
+            this.ownerTerminal = false
+            let generation = started.generation
+            this.eventFuture = Some(spawn { this.pumpOwnerEvents(generation) })
         }
     }
 
@@ -184,10 +201,7 @@ public class CodexAppServerClient <: CodexAppServerTransport {
 
     public func isAlive(): Bool {
         synchronized(this.lock) {
-            match (this.process) {
-                case Some(proc) => proc.isAlive()
-                case None => false
-            }
+            this.ownerRunning && !this.ownerTerminal && !this.closing
         }
     }
 
@@ -220,33 +234,40 @@ public class CodexAppServerClient <: CodexAppServerTransport {
     }
 
     private func closeInternal(diagnosticTailMs: Int64): Unit {
-        var processToStop = None<SubProcess>
-        var rootPid: Int64 = 0
-        var stdoutToCancel = None<Future<Unit>>
-        var stderrToCancel = None<Future<Unit>>
+        var shouldStop = false
+        var eventToJoin = None<Future<Unit>>
         synchronized(this.lock) {
-            match (this.process) {
-                case Some(proc) =>
-                    processToStop = Some(proc)
-                    rootPid = proc.pid
-                case None => ()
-            }
-            this.writer = None<StringWriter<OutputStream>>
-            stdoutToCancel = this.stdoutFuture
-            stderrToCancel = this.stderrFuture
+            if (this.closing && this.eventFuture.isNone()) { return }
+            this.closing = true
+            shouldStop = this.ownerRunning && !this.ownerTerminal
+            eventToJoin = this.eventFuture
         }
-        match (processToStop) {
-            case Some(proc) => codexAppServerTerminateProcessTree(proc, rootPid)
-            case None => ()
+        if (shouldStop) {
+            let stopped = managedStdioBroker().stopOwner(this.ownerId, timeoutMs: max(1000, diagnosticTailMs))
+            if (!stopped.ok) {
+                this.diagnosticsBuffer.append(stopped.status)
+            }
         }
         this.waitForReaderDiagnosticTail(diagnosticTailMs)
         synchronized(this.lock) {
-            this.process = None<SubProcess>
-            this.stdoutFuture = None<Future<Unit>>
-            this.stderrFuture = None<Future<Unit>>
+            this.ownerRunning = false
+            this.ownerTerminal = true
+            this.ownerPid = 0
         }
-        try { stdoutToCancel?.cancel() } catch (_: Exception) { () }
-        try { stderrToCancel?.cancel() } catch (_: Exception) { () }
+        var eventJoined = false
+        match (eventToJoin) {
+            case Some(future) =>
+                try {
+                    future.get(Duration.millisecond * CODEX_APP_SERVER_EVENT_JOIN_MS)
+                    eventJoined = true
+                } catch (_: Exception) { () }
+            case None => eventJoined = true
+        }
+        synchronized(this.lock) {
+            if (eventJoined) {
+                this.eventFuture = None<Future<Unit>>
+            }
+        }
         this.responses.close()
         this.serverRequests.close()
         this.notifications.close()
@@ -275,49 +296,30 @@ public class CodexAppServerClient <: CodexAppServerTransport {
     }
 
     private func send(obj: JsonObject): Unit {
-        let frame = codexAppServerFrame(obj)
-        synchronized(this.lock) {
-            match (this.writer) {
-                case Some(w) =>
-                    try {
-                        w.write(frame)
-                        w.flush()
-                    } catch (e: Exception) {
-                        throw CodexAppServerProtocolException("Failed to write codex app-server stdin: ${codexAppServerRedactDiagnostic(e.message)}", code: -32002)
-                    }
-                case None =>
-                    throw CodexAppServerProtocolException("codex app-server is not started", code: -32003)
+        let generation = synchronized(this.lock) {
+            if (!this.ownerRunning || this.ownerTerminal || this.closing) {
+                throw CodexAppServerProtocolException("codex app-server is not started", code: -32003)
             }
+            this.ownerGeneration
+        }
+        let written = managedStdioBroker().writeOwnerLine(this.ownerId, codexAppServerFrame(obj).trimAscii())
+        if (!written.ok || written.generation != generation) {
+            throw CodexAppServerProtocolException(
+                "Failed to write codex app-server stdin: ${codexAppServerRedactDiagnostic(written.status)}",
+                code: -32002
+            )
         }
     }
 
-    private func readStdout(reader: StringReader<InputStream>): Unit {
-        var deadEmptyReads: Int64 = 0
+    private func pumpOwnerEvents(generation: Int64): Unit {
         while (true) {
-            if (Thread.currentThread.hasPendingCancellation) {
-                break
+            let shouldExit = synchronized(this.lock) {
+                this.ownerGeneration != generation || this.ownerTerminal
             }
-            let line = try { reader.readln() ?? "" } catch (_: Exception) { "" }
-            if (line.isEmpty()) {
-                if (!this.isAlive()) {
-                    deadEmptyReads += 1
-                    if (deadEmptyReads >= CODEX_APP_SERVER_READER_DEAD_EMPTY_READ_LIMIT) {
-                        break
-                    }
-                } else {
-                    deadEmptyReads = 0
-                }
-                sleep(Duration.millisecond * 10)
-                continue
-            }
-            deadEmptyReads = 0
-            let parsed = codexAppServerParseStdoutLine(line)
-            match (parsed.kind) {
-                case "response" => this.responses.append(parsed.message)
-                case "server_request" => this.serverRequests.append(parsed.message)
-                case "notification" => this.notifications.append(parsed.message)
-                case "diagnostic" => this.diagnosticsBuffer.append(parsed.diagnostic)
-                case _ => ()
+            if (shouldExit) { break }
+            match (managedStdioBroker().readOwnerLine(this.ownerId, timeoutMs: CODEX_APP_SERVER_EVENT_POLL_MS)) {
+                case Some(event) => if (this.handleOwnerEvent(event, generation)) { break }
+                case None => ()
             }
         }
         this.responses.close()
@@ -325,29 +327,48 @@ public class CodexAppServerClient <: CodexAppServerTransport {
         this.notifications.close()
     }
 
-    private func readStderr(reader: StringReader<InputStream>): Unit {
-        var deadEmptyReads: Int64 = 0
-        while (true) {
-            if (Thread.currentThread.hasPendingCancellation) {
-                break
+    private func handleOwnerEvent(event: ManagedStdioEvent, generation: Int64): Bool {
+        if (event.eventType == "owner.stdout") {
+            let parsed = codexAppServerParseStdoutLine(event.text)
+            match (parsed.kind) {
+                case "response" => this.responses.append(parsed.message)
+                case "server_request" => this.serverRequests.append(parsed.message)
+                case "notification" => this.notifications.append(parsed.message)
+                case "diagnostic" => this.diagnosticsBuffer.append(parsed.diagnostic)
+                case _ => ()
             }
-            let line = try { reader.readln() ?? "" } catch (_: Exception) { "" }
-            if (line.isEmpty()) {
-                if (!this.isAlive()) {
-                    deadEmptyReads += 1
-                    if (deadEmptyReads >= CODEX_APP_SERVER_READER_DEAD_EMPTY_READ_LIMIT) {
-                        break
-                    }
-                } else {
-                    deadEmptyReads = 0
-                }
-                sleep(Duration.millisecond * 10)
-                continue
+            return false
+        }
+        if (event.eventType == "owner.stderr") {
+            this.diagnosticsBuffer.append(codexAppServerRedactTransportDiagnostic(event.text))
+            return false
+        }
+        if (event.eventType == "owner.error" || event.eventType == "owner.timeout") {
+            this.diagnosticsBuffer.append(if (event.status.isEmpty()) { "codex_app_server_transport_error" } else { event.status })
+        }
+        synchronized(this.lock) {
+            if (this.ownerGeneration == generation) {
+                this.ownerRunning = false
+                this.ownerTerminal = true
+                this.ownerPid = 0
             }
-            deadEmptyReads = 0
-            this.diagnosticsBuffer.append(codexAppServerRedactDiagnostic(line))
+        }
+        true
+    }
+}
+
+private func codexAppServerRedactTransportDiagnostic(raw: String): String {
+    let redacted = codexAppServerRedactDiagnostic(raw)
+    let out = ArrayList<String>()
+    for (part in redacted.split(" ")) {
+        let lower = part.toAsciiLower()
+        if (lower.contains("/users/") || lower.contains("/home/") || lower.contains("/private/") || lower.contains("c:\\users\\")) {
+            out.add("[redacted-path]")
+        } else {
+            out.add(part)
         }
     }
+    String.join(out.toArray(), delimiter: " ")
 }
 
 public func codexAppServerFrame(obj: JsonObject): String {
@@ -390,12 +411,15 @@ public func codexAppServerParseStdoutLine(line: String): CodexAppServerParsedLin
     let value = try {
         JsonValue.fromStr(trimmed)
     } catch (_: Exception) {
-        return CodexAppServerParsedLine("diagnostic", diagnostic: codexAppServerRedactDiagnostic(trimmed))
+        return CodexAppServerParsedLine(
+            "diagnostic",
+            diagnostic: if (trimmed.startsWith("{") || trimmed.startsWith("[")) { "malformed_json" } else { codexAppServerRedactDiagnostic(trimmed) }
+        )
     }
     let obj = try {
         value.asObject()
     } catch (_: Exception) {
-        return CodexAppServerParsedLine("diagnostic", diagnostic: codexAppServerRedactDiagnostic(trimmed))
+        return CodexAppServerParsedLine("diagnostic", diagnostic: "malformed_json")
     }
     if (obj.containsKey("id") && (obj.containsKey("result") || obj.containsKey("error"))) {
         return CodexAppServerParsedLine("response", message: obj)
@@ -563,148 +587,4 @@ private func codexAppServerJoinDiagnostics(diagnostics: Array<String>): String {
         return ""
     }
     String.join(parts.toArray(), delimiter: " | ")
-}
-
-private func codexAppServerTerminateProcessTree(proc: SubProcess, rootPid: Int64): Unit {
-    let descendants = codexAppServerCollectDescendantPids(rootPid)
-    for (pid in descendants) {
-        codexAppServerSignalPid(pid, "-TERM")
-    }
-    try { proc.terminate(force: false) } catch (_: Exception) { () }
-    if (!codexAppServerWaitProcessExit(proc, 250)) {
-        for (pid in descendants) {
-            codexAppServerSignalPid(pid, "-KILL")
-        }
-        try { proc.terminate(force: true) } catch (_: Exception) { () }
-        let _ = codexAppServerWaitProcessExit(proc, 250)
-    } else {
-        for (pid in descendants) {
-            if (codexAppServerPidAlive(pid)) {
-                codexAppServerSignalPid(pid, "-KILL")
-            }
-        }
-    }
-    let _ = codexAppServerWaitPidsGone(descendants, 1000)
-    let survivors = codexAppServerAlivePids(descendants)
-    for (pid in survivors) {
-        codexAppServerSignalPid(pid, "-KILL")
-    }
-    let _ = codexAppServerWaitPidsGone(survivors, 1000)
-}
-
-private func codexAppServerWaitProcessExit(proc: SubProcess, timeoutMs: Int64): Bool {
-    let effective = if (timeoutMs > 0) { timeoutMs } else { 250 }
-    try {
-        let _ = proc.wait(timeout: Some(Duration.millisecond * effective))
-        return true
-    } catch (_: Exception) {
-        return !proc.isAlive()
-    }
-}
-
-private func codexAppServerCollectDescendantPids(rootPid: Int64): Array<Int64> {
-    let out = ArrayList<Int64>()
-    codexAppServerCollectDescendantPidsInto(rootPid, out, 0)
-    out.toArray()
-}
-
-private func codexAppServerCollectDescendantPidsInto(pid: Int64, out: ArrayList<Int64>, depth: Int64): Unit {
-    if (pid <= 0 || depth >= 8) {
-        return
-    }
-    for (child in codexAppServerChildPids(pid)) {
-        if (child <= 0 || codexAppServerPidListContains(out, child)) {
-            continue
-        }
-        out.add(child)
-        codexAppServerCollectDescendantPidsInto(child, out, depth + 1)
-    }
-}
-
-private func codexAppServerChildPids(pid: Int64): Array<Int64> {
-    if (pid <= 0) {
-        return []
-    }
-    let (exitCode, stdoutBytes, _) = try {
-        executeWithOutput("pgrep", ["-P", "${pid}"])
-    } catch (_: Exception) {
-        return []
-    }
-    if (exitCode != 0) {
-        return []
-    }
-    let out = ArrayList<Int64>()
-    let text = try { String.fromUtf8(stdoutBytes) } catch (_: Exception) { "" }
-    for (line in text.split("\n")) {
-        let trimmed = line.trimAscii()
-        if (trimmed.isEmpty()) {
-            continue
-        }
-        try {
-            let child = Int64.parse(trimmed)
-            if (child > 0) {
-                out.add(child)
-            }
-        } catch (_: Exception) {
-            ()
-        }
-    }
-    out.toArray()
-}
-
-private func codexAppServerPidListContains(items: ArrayList<Int64>, pid: Int64): Bool {
-    for (item in items) {
-        if (item == pid) {
-            return true
-        }
-    }
-    false
-}
-
-private func codexAppServerAlivePids(pids: Array<Int64>): Array<Int64> {
-    let out = ArrayList<Int64>()
-    for (pid in pids) {
-        if (codexAppServerPidAlive(pid)) {
-            out.add(pid)
-        }
-    }
-    out.toArray()
-}
-
-private func codexAppServerWaitPidsGone(pids: Array<Int64>, timeoutMs: Int64): Bool {
-    if (pids.isEmpty()) {
-        return true
-    }
-    let effective = if (timeoutMs > 0) { timeoutMs } else { 250 }
-    let started = DateTime.now().toUnixTimeStamp().toMilliseconds()
-    while (DateTime.now().toUnixTimeStamp().toMilliseconds() - started < effective) {
-        if (codexAppServerAlivePids(pids).isEmpty()) {
-            return true
-        }
-        sleep(Duration.millisecond * 25)
-    }
-    codexAppServerAlivePids(pids).isEmpty()
-}
-
-private func codexAppServerSignalPid(pid: Int64, signal: String): Unit {
-    if (pid <= 0) {
-        return
-    }
-    try {
-        let _ = executeWithOutput("kill", [signal, "${pid}"])
-    } catch (_: Exception) {
-        ()
-    }
-}
-
-private func codexAppServerPidAlive(pid: Int64): Bool {
-    if (pid <= 0) {
-        return false
-    }
-    let (exitCode, _, _) = try {
-        executeWithOutput("kill", ["-0", "${pid}"])
-    } catch (_: Exception) {
-        return false
-    }
-    exitCode == 0
 }

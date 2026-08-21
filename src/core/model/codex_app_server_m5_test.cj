@@ -1,5 +1,7 @@
 package metis.core.model
 
+import metis.process.managedStdioBroker
+
 import std.collection.{ArrayList, HashMap}
 import std.convert.Parsable
 import std.fs.{Directory, File, Path, exists, remove}
@@ -343,6 +345,239 @@ public class CodexAppServerM5Test {
         @Expect(parentGone, true)
         @Expect(childGone, true)
     }
+
+    @TestCase
+    public func p3U3BrokerRoutesInterleavedCodexFramesWithoutCrossOwnerLeakage(): Unit {
+        let script = m5FakeCodexScript()
+        let first = CodexAppServerClient(
+            codexBin: script,
+            env: m5FakeCodexEnvironment("session", "first")
+        )
+        let second = CodexAppServerClient(
+            codexBin: script,
+            env: m5FakeCodexEnvironment("session", "second")
+        )
+        first.start()
+        second.start()
+        let firstFuture = spawn { first.request("initialize", JsonObject(), 3000) }
+        let secondFuture = spawn { second.request("initialize", JsonObject(), 3000) }
+        let firstResult = firstFuture.get(Duration.second * 5)
+        let secondResult = secondFuture.get(Duration.second * 5)
+        let firstRequest = first.takeServerRequest(1000).getOrThrow()
+        let secondRequest = second.takeServerRequest(1000).getOrThrow()
+        let firstNotification = first.takeNotification(1000).getOrThrow()
+        let secondNotification = second.takeNotification(1000).getOrThrow()
+        let snapshot = managedStdioBroker().debugSnapshotForTest()
+        let firstDiagnostics = first.diagnostics().toString()
+        let secondDiagnostics = second.diagnostics().toString()
+        first.close()
+        second.close()
+
+        @Expect(m5JsonString(firstResult, "label"), "first")
+        @Expect(m5JsonString(secondResult, "label"), "second")
+        @Expect(firstResult.toJsonString().contains("second"), false)
+        @Expect(secondResult.toJsonString().contains("first"), false)
+        @Expect(m5JsonInt(firstRequest, "id"), 9000)
+        @Expect(m5JsonInt(secondRequest, "id"), 9000)
+        @Expect(m5JsonString(m5JsonObject(firstNotification, "params"), "label"), "first")
+        @Expect(m5JsonString(m5JsonObject(secondNotification, "params"), "label"), "second")
+        @Expect(snapshot.readerCount, 1)
+        @Expect(snapshot.ownerCount >= 2, true)
+        @Expect(firstDiagnostics.contains("secret-codex-token"), false)
+        @Expect(secondDiagnostics.contains("secret-codex-token"), false)
+        @Expect(firstDiagnostics.contains("/Users/"), false)
+        @Expect(firstDiagnostics.contains("/private/"), false)
+        @Expect(firstDiagnostics.toAsciiLower().contains("c:\\users\\"), false)
+        @Expect(firstDiagnostics.contains("中文🙂"), true)
+    }
+
+    @TestCase
+    public func p3B3Utf8MalformedTimeoutAndDiagnosticsAreStableAndRedacted(): Unit {
+        let unicode = codexAppServerParseStdoutLine("{\"id\":3,\"result\":{\"text\":\"中文🙂\"}}")
+        let malformed = codexAppServerParseStdoutLine("{not-json 中文🙂")
+        let longText = m5RepeatedText(r'x', 256)
+        let oversizedSecret = "access_token=secret-codex-token " + longText
+        let redacted = codexAppServerRedactDiagnostic(oversizedSecret)
+
+        let invalid = CodexAppServerClient(
+            codexBin: m5FakeCodexScript(),
+            env: m5FakeCodexEnvironment("invalid-utf8", "invalid")
+        )
+        var invalidError = ""
+        try {
+            let _ = invalid.request("initialize", JsonObject(), 100)
+        } catch (e: Exception) {
+            invalidError = e.message
+        }
+        let invalidDiagnostics = invalid.diagnostics().toString()
+        invalid.close()
+
+        let tooLong = CodexAppServerClient(
+            codexBin: m5FakeCodexScript(),
+            env: m5FakeCodexEnvironment("long-line", "long")
+        )
+        var tooLongError = ""
+        try {
+            let _ = tooLong.request("initialize", JsonObject(), 100)
+        } catch (e: Exception) {
+            tooLongError = e.message
+        }
+        let tooLongDiagnostics = tooLong.diagnostics().toString()
+        tooLong.close()
+
+        let malformedClient = CodexAppServerClient(
+            codexBin: m5FakeCodexScript(),
+            env: m5FakeCodexEnvironment("malformed-json", "malformed")
+        )
+        var malformedError = ""
+        try {
+            let _ = malformedClient.request("initialize", JsonObject(), 100)
+        } catch (e: Exception) {
+            malformedError = e.message
+        }
+        malformedClient.close()
+
+        let beforeDeadline = CodexAppServerClient(
+            codexBin: m5FakeCodexScript(),
+            env: m5FakeCodexEnvironment("delayed-response", "before", delayMs: Some<Int64>(20))
+        )
+        let beforeResult = beforeDeadline.request("initialize", JsonObject(), 500)
+        beforeDeadline.close()
+
+        let afterDeadline = CodexAppServerClient(
+            codexBin: m5FakeCodexScript(),
+            env: m5FakeCodexEnvironment("delayed-response", "after", delayMs: Some<Int64>(200))
+        )
+        var afterError = ""
+        try {
+            let _ = afterDeadline.request("initialize", JsonObject(), 30)
+        } catch (e: Exception) {
+            afterError = e.message
+        }
+        afterDeadline.close()
+
+        let timeout = CodexAppServerClient(
+            codexBin: m5FakeCodexScript(),
+            env: m5FakeCodexEnvironment("no-response", "timeout")
+        )
+        var timeoutError = ""
+        try {
+            let _ = timeout.request("initialize", JsonObject(), 80)
+        } catch (e: Exception) {
+            timeoutError = e.message
+        }
+        timeout.close()
+
+        @Expect(unicode.kind, "response")
+        @Expect(unicode.message.toJsonString().contains("中文🙂"), true)
+        @Expect(malformed.kind, "diagnostic")
+        @Expect(malformed.diagnostic, "malformed_json")
+        @Expect(redacted.contains("secret-codex-token"), false)
+        @Expect(redacted.contains(m5RepeatedText(r'x', 128)), false)
+        @Expect(invalidError.contains("invalid_response_encoding") || invalidDiagnostics.contains("invalid_response_encoding"), true)
+        @Expect(invalidError.contains("secret-codex-token"), false)
+        @Expect(tooLongError.contains("line_too_large") || tooLongDiagnostics.contains("line_too_large"), true)
+        @Expect(tooLongDiagnostics.contains(m5RepeatedText(r'中', 32)), false)
+        @Expect(malformedError.contains("malformed_json"), true)
+        @Expect(m5JsonString(beforeResult, "label"), "before")
+        @Expect(afterError.contains("initialize"), true)
+        @Expect(timeoutError.contains("initialize"), true)
+        @Expect(timeoutError.contains("secret-codex-token"), false)
+    }
+
+    @TestCase
+    public func p3P3RealBrokerConcurrentSessionsPreserveAnswersAndUsage(): Unit {
+        let firstClient = CodexAppServerClient(
+            codexBin: m5FakeCodexScript(),
+            env: m5FakeCodexEnvironment("session", "session-a")
+        )
+        let secondClient = CodexAppServerClient(
+            codexBin: m5FakeCodexScript(),
+            env: m5FakeCodexEnvironment("session", "session-b")
+        )
+        let firstFuture = spawn {
+            CodexAppServerSession(firstClient).runTurn("/tmp/session-a", "first 中文🙂", timeoutMs: 5000)
+        }
+        let secondFuture = spawn {
+            CodexAppServerSession(secondClient).runTurn("/tmp/session-b", "second 中文🙂", timeoutMs: 5000)
+        }
+        let first = firstFuture.get(Duration.second * 8)
+        let second = secondFuture.get(Duration.second * 8)
+        let snapshot = managedStdioBroker().debugSnapshotForTest()
+        firstClient.close()
+        secondClient.close()
+
+        @Expect(first.completed, true)
+        @Expect(second.completed, true)
+        @Expect(first.finalText, "answer-session-a-中文🙂")
+        @Expect(second.finalText, "answer-session-b-中文🙂")
+        @Expect(first.threadId, "thread-session-a")
+        @Expect(second.threadId, "thread-session-b")
+        @Expect(m5JsonInt(first.usage.getOrThrow(), "promptTokens"), 12)
+        @Expect(m5JsonInt(first.usage.getOrThrow(), "outputTokens"), 7)
+        @Expect(m5JsonInt(second.usage.getOrThrow(), "promptTokens"), 12)
+        @Expect(m5JsonInt(second.usage.getOrThrow(), "outputTokens"), 7)
+        @Expect(snapshot.readerCount, 1)
+        @Expect(snapshot.ownerCount >= 2, true)
+    }
+
+    @TestCase
+    public func p3N3BrokerKillReapsCodexTreeAndNextGenerationRecovers(): Unit {
+        let root = m5TempRoot("broker-kill-tree")
+        let parentPidPath = root.join("parent.pid")
+        let childPidPath = root.join("child.pid")
+        let hanging = CodexAppServerClient(
+            codexBin: m5FakeCodexScript(),
+            env: m5FakeCodexEnvironment(
+                "hang-tree",
+                "hanging",
+                parentPidPath: Some(parentPidPath.toString()),
+                childPidPath: Some(childPidPath.toString())
+            )
+        )
+        hanging.start()
+        let filesReady = m5WaitPathsExist([parentPidPath, childPidPath], 3000)
+        let parentPid = m5ReadPid(parentPidPath)
+        let childPid = m5ReadPid(childPidPath)
+        let hangingRequest = spawn {
+            try {
+                let _ = hanging.request("initialize", JsonObject(), 5000)
+                "unexpected_success"
+            } catch (e: Exception) {
+                e.message
+            }
+        }
+        sleep(Duration.millisecond * 50)
+        let before = managedStdioBroker().debugSnapshotForTest()
+        let _ = executeWithOutput("kill", ["-KILL", "${before.brokerPid}"])
+        let hangingError = hangingRequest.get(Duration.second * 5)
+        let parentGone = m5WaitPidGone(parentPid, 5000)
+        let childGone = m5WaitPidGone(childPid, 5000)
+        hanging.close()
+
+        let recovered = CodexAppServerClient(
+            codexBin: m5FakeCodexScript(),
+            env: m5FakeCodexEnvironment("session", "recovered")
+        )
+        let result = recovered.request("initialize", JsonObject(), 3000)
+        let after = managedStdioBroker().debugSnapshotForTest()
+        recovered.close()
+        if (!parentGone) { m5KillPid(parentPid) }
+        if (!childGone) { m5KillPid(childPid) }
+        try { remove(root, recursive: true) } catch (_: Exception) { () }
+
+        @Expect(filesReady, true)
+        @Expect(parentGone, true)
+        @Expect(childGone, true)
+        @Expect(hangingError.contains("broker_exited"), true)
+        @Expect(hangingError.contains("secret-codex-token"), false)
+        @Expect(hangingError.contains("/Users/"), false)
+        @Expect(hangingError.contains("/private/"), false)
+        @Expect(hangingError.toAsciiLower().contains("c:\\users\\"), false)
+        @Expect(m5JsonString(result, "label"), "recovered")
+        @Expect(after.generation > before.generation, true)
+        @Expect(after.readerCount, 1)
+    }
 }
 
 private func m5TempRoot(label: String): Path {
@@ -352,6 +587,54 @@ private func m5TempRoot(label: String): Path {
     }
     Directory.create(root, recursive: true)
     root
+}
+
+private func m5FakeCodexScript(): String {
+    Path("scripts").join("gateway-stdio-fake-codex-app-server.mjs").toString()
+}
+
+private func m5FakeCodexEnvironment(
+    mode: String,
+    label: String,
+    parentPidPath!: Option<String> = None<String>,
+    childPidPath!: Option<String> = None<String>,
+    delayMs!: Option<Int64> = None<Int64>
+): HashMap<String, String> {
+    let env = codexAppServerCurrentEnvironment()
+    env["METIS_CODEX_FAKE_MODE"] = mode
+    env["METIS_CODEX_FAKE_LABEL"] = label
+    match (parentPidPath) {
+        case Some(value) => env["METIS_CODEX_FAKE_PID_FILE"] = value
+        case None => ()
+    }
+    match (childPidPath) {
+        case Some(value) => env["METIS_CODEX_FAKE_CHILD_PID_FILE"] = value
+        case None => ()
+    }
+    match (delayMs) {
+        case Some(value) => env["METIS_CODEX_FAKE_DELAY_MS"] = "${value}"
+        case None => ()
+    }
+    env
+}
+
+private func m5WaitPathsExist(paths: Array<Path>, timeoutMs: Int64): Bool {
+    let started = DateTime.now().toUnixTimeStamp().toMilliseconds()
+    while (DateTime.now().toUnixTimeStamp().toMilliseconds() - started < timeoutMs) {
+        var allExist = true
+        for (path in paths) {
+            if (!exists(path)) { allExist = false }
+        }
+        if (allExist) { return true }
+        sleep(Duration.millisecond * 20)
+    }
+    false
+}
+
+private func m5RepeatedText(value: Rune, count: Int64): String {
+    let out = StringBuilder()
+    for (_ in 0..count) { out.append(value) }
+    out.toString()
 }
 
 private func m5ReadPid(path: Path): Int64 {

@@ -11,12 +11,14 @@ import metis.core.{GatewayToolRuntimeContext, gatewayCurrentToolRuntimeContext, 
 import metis.core.model.{CodexResponsesHttpRequest, CodexResponsesHttpResult, CodexResponsesHttpRunner, setCodexResponsesHttpRunnerForTest}
 import metis.gateway.logging.{gatewayLoggingCaptureConsoleForTest, gatewayLoggingCapturedConsoleForTest, gatewayLoggingResetForTest}
 import metis.gateway.session.{GatewayIngressSource, GatewaySessionRequest, GatewayTurnContext, gatewayResolveSessionContext}
+import metis.process.managedStdioBroker
 
 import std.collection.{ArrayList, HashMap}
 import std.env.{getVariable, setVariable}
 import std.fs.{Directory, File, Path, exists, remove}
+import std.process.executeWithOutput
 import std.sync.AtomicBool
-import std.time.DateTime
+import std.time.*
 import std.unittest.testmacro.*
 import stdx.encoding.json.{JsonArray, JsonInt, JsonObject, JsonString, JsonValue}
 
@@ -651,6 +653,74 @@ public class AgentBridgeRuntimeTest {
         }
         @Expect(error, "test_cancelled")
         @Expect(activity.heartbeats, 0)
+    }
+
+    @TestCase
+    public func p3P3FormalGatewayCodexTurnsRemainSessionIsolatedOnSharedBroker(): Unit {
+        withAgentBridgeTempHome("metis-p3-codex-gateway", { home: Path =>
+            let binDir = home.join("bin")
+            let firstWorkspace = home.join("workspaces").join("session-a")
+            let secondWorkspace = home.join("workspaces").join("session-b")
+            Directory.create(binDir, recursive: true)
+            Directory.create(firstWorkspace, recursive: true)
+            Directory.create(secondWorkspace, recursive: true)
+            let fakeCodex = binDir.join("codex")
+            File.writeTo(fakeCodex, File.readFrom(Path("scripts").join("gateway-stdio-fake-codex-app-server.mjs")))
+            let (chmodCode, _, _) = executeWithOutput("chmod", ["+x", fakeCodex.toString()])
+            @Expect(chmodCode, 0)
+
+            let oldPath = getVariable("PATH")
+            let oldMode = getVariable("METIS_CODEX_FAKE_MODE")
+            let oldLabel = getVariable("METIS_CODEX_FAKE_LABEL")
+            let inheritedPath = oldPath ?? ""
+            setVariable("PATH", "${binDir.toString()}:${inheritedPath}")
+            setVariable("METIS_CODEX_FAKE_MODE", "session")
+            setVariable("METIS_CODEX_FAKE_LABEL", "gateway")
+            setGatewayCodexAppServerRunnerForTest(None<(GatewayCodexAppServerTurnRequest) -> GatewayCodexAppServerRuntimeResult>)
+            let baseline = managedStdioBroker().debugSnapshotForTest()
+            try {
+                let firstFuture = spawn {
+                    gatewayRunCodexAppServerTurn(GatewayCodexAppServerTurnRequest(
+                        "session-a", firstWorkspace.toString(), "telegram", "writer", "openai-codex:test", "system-a", "input-a 中文🙂"
+                    ))
+                }
+                let secondFuture = spawn {
+                    gatewayRunCodexAppServerTurn(GatewayCodexAppServerTurnRequest(
+                        "session-b", secondWorkspace.toString(), "feishu", "writer", "openai-codex:test", "system-b", "input-b 中文🙂"
+                    ))
+                }
+                let first = firstFuture.get(Duration.second * 10)
+                let second = secondFuture.get(Duration.second * 10)
+                let after = managedStdioBroker().debugSnapshotForTest()
+
+                @Expect(first.finalText, "answer-session-a-中文🙂")
+                @Expect(second.finalText, "answer-session-b-中文🙂")
+                @Expect(first.threadId, "thread-session-a")
+                @Expect(second.threadId, "thread-session-b")
+                @Expect(first.promptTokens, 12)
+                @Expect(first.completionTokens, 7)
+                @Expect(second.promptTokens, 12)
+                @Expect(second.completionTokens, 7)
+                @Expect(first.completed, true)
+                @Expect(second.completed, true)
+                @Expect(after.readerCount, 1)
+                @Expect(after.ownerCount, baseline.ownerCount)
+            } finally {
+                setGatewayCodexAppServerRunnerForTest(None<(GatewayCodexAppServerTurnRequest) -> GatewayCodexAppServerRuntimeResult>)
+                match (oldPath) {
+                    case Some(value) => setVariable("PATH", value)
+                    case None => setVariable("PATH", "")
+                }
+                match (oldMode) {
+                    case Some(value) => setVariable("METIS_CODEX_FAKE_MODE", value)
+                    case None => setVariable("METIS_CODEX_FAKE_MODE", "")
+                }
+                match (oldLabel) {
+                    case Some(value) => setVariable("METIS_CODEX_FAKE_LABEL", value)
+                    case None => setVariable("METIS_CODEX_FAKE_LABEL", "")
+                }
+            }
+        })
     }
 
     @TestCase
