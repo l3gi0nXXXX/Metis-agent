@@ -1,6 +1,6 @@
 package metis.core.model
 
-import metis.process.{ManagedStdioEvent, ManagedStdioOwnerSpec, managedStdioBroker}
+import metis.process.{ManagedStdioEvent, ManagedStdioOwnerSpec, ManagedStdioOwnerSubscriber, managedStdioBroker}
 
 import std.collection.{ArrayList, HashMap}
 import std.convert.Parsable
@@ -9,8 +9,6 @@ import std.time.*
 import stdx.encoding.json.{JsonInt, JsonObject, JsonString, JsonValue}
 
 private const CODEX_APP_SERVER_TIMEOUT_DIAGNOSTIC_GRACE_MS: Int64 = 3000
-private const CODEX_APP_SERVER_EVENT_POLL_MS: Int64 = 50
-private const CODEX_APP_SERVER_EVENT_JOIN_MS: Int64 = 1000
 
 private let codexAppServerOwnerIdLock = Mutex()
 private var codexAppServerOwnerIdSequence: Int64 = 0
@@ -58,7 +56,7 @@ public interface CodexAppServerTransport {
     func close(): Unit
 }
 
-public class CodexAppServerClient <: CodexAppServerTransport {
+public class CodexAppServerClient <: CodexAppServerTransport & ManagedStdioOwnerSubscriber {
     private let codexBin: String
     private let extraArgs: Array<String>
     private let env: HashMap<String, String>
@@ -70,12 +68,12 @@ public class CodexAppServerClient <: CodexAppServerTransport {
     private let ownerId = codexAppServerNextOwnerId()
     private var ownerGeneration: Int64 = 0
     private var ownerPid: Int64 = 0
-    private var eventFuture: Option<Future<Unit>> = None<Future<Unit>>
     private var ownerRunning = false
     private var ownerTerminal = false
-    private var closing = false
+    private var lifecycle = "new"
     private var nextId: Int64 = 1
     private let lock = Mutex()
+    private let closeCondition: Condition
 
     public init(
         codexBin!: String = "codex",
@@ -87,14 +85,15 @@ public class CodexAppServerClient <: CodexAppServerTransport {
         this.extraArgs = extraArgs
         this.env = env
         this.cwd = cwd
+        synchronized(this.lock) { this.closeCondition = this.lock.condition() }
     }
 
     public func start(): Unit {
         synchronized(this.lock) {
-            if (this.ownerRunning && !this.ownerTerminal && !this.closing) {
+            if (this.ownerRunning && !this.ownerTerminal && this.lifecycle == "running") {
                 return
             }
-            if (this.closing || this.ownerTerminal || this.eventFuture.isSome()) {
+            if (this.lifecycle != "new") {
                 throw CodexAppServerProtocolException("codex app-server client is closed", code: -32003)
             }
             let spec = codexAppServerBuildLaunchSpec(codexBin: this.codexBin, extraArgs: this.extraArgs)
@@ -120,8 +119,18 @@ public class CodexAppServerClient <: CodexAppServerTransport {
             this.ownerPid = started.pid
             this.ownerRunning = true
             this.ownerTerminal = false
-            let generation = started.generation
-            this.eventFuture = Some(spawn { this.pumpOwnerEvents(generation) })
+            this.lifecycle = "running"
+            let subscribed = managedStdioBroker().subscribeOwner(this.ownerId, started.generation, this)
+            if (!subscribed.ok) {
+                this.ownerRunning = false
+                this.ownerTerminal = true
+                this.lifecycle = "closed"
+                let _ = managedStdioBroker().stopOwner(
+                    this.ownerId,
+                    expectedGeneration: Some(started.generation)
+                )
+                throw CodexAppServerProtocolException("Failed to subscribe codex app-server: ${subscribed.status}", code: -32000)
+            }
         }
     }
 
@@ -201,7 +210,7 @@ public class CodexAppServerClient <: CodexAppServerTransport {
 
     public func isAlive(): Bool {
         synchronized(this.lock) {
-            this.ownerRunning && !this.ownerTerminal && !this.closing
+            this.ownerRunning && !this.ownerTerminal && this.lifecycle == "running"
         }
     }
 
@@ -235,38 +244,42 @@ public class CodexAppServerClient <: CodexAppServerTransport {
 
     private func closeInternal(diagnosticTailMs: Int64): Unit {
         var shouldStop = false
-        var eventToJoin = None<Future<Unit>>
+        var generation: Int64 = 0
+        var waitForCloser = false
         synchronized(this.lock) {
-            if (this.closing && this.eventFuture.isNone()) { return }
-            this.closing = true
+            if (this.lifecycle == "closed") { return }
+            if (this.lifecycle == "closing") {
+                waitForCloser = true
+            } else {
+                this.lifecycle = "closing"
+            }
+            if (waitForCloser) {
+                while (this.lifecycle != "closed") {
+                    let _ = this.closeCondition.wait(timeout: Duration.millisecond * 100)
+                }
+                return
+            }
             shouldStop = this.ownerRunning && !this.ownerTerminal
-            eventToJoin = this.eventFuture
+            generation = this.ownerGeneration
         }
         if (shouldStop) {
-            let stopped = managedStdioBroker().stopOwner(this.ownerId, timeoutMs: max(1000, diagnosticTailMs))
+            let stopped = managedStdioBroker().stopOwner(
+                this.ownerId,
+                timeoutMs: max(1000, diagnosticTailMs),
+                expectedGeneration: Some(generation)
+            )
             if (!stopped.ok) {
                 this.diagnosticsBuffer.append(stopped.status)
             }
         }
         this.waitForReaderDiagnosticTail(diagnosticTailMs)
+        let _ = managedStdioBroker().unsubscribeOwner(this.ownerId, generation)
         synchronized(this.lock) {
             this.ownerRunning = false
             this.ownerTerminal = true
             this.ownerPid = 0
-        }
-        var eventJoined = false
-        match (eventToJoin) {
-            case Some(future) =>
-                try {
-                    future.get(Duration.millisecond * CODEX_APP_SERVER_EVENT_JOIN_MS)
-                    eventJoined = true
-                } catch (_: Exception) { () }
-            case None => eventJoined = true
-        }
-        synchronized(this.lock) {
-            if (eventJoined) {
-                this.eventFuture = None<Future<Unit>>
-            }
+            this.lifecycle = "closed"
+            this.closeCondition.notifyAll()
         }
         this.responses.close()
         this.serverRequests.close()
@@ -297,7 +310,7 @@ public class CodexAppServerClient <: CodexAppServerTransport {
 
     private func send(obj: JsonObject): Unit {
         let generation = synchronized(this.lock) {
-            if (!this.ownerRunning || this.ownerTerminal || this.closing) {
+            if (!this.ownerRunning || this.ownerTerminal || this.lifecycle != "running") {
                 throw CodexAppServerProtocolException("codex app-server is not started", code: -32003)
             }
             this.ownerGeneration
@@ -311,20 +324,14 @@ public class CodexAppServerClient <: CodexAppServerTransport {
         }
     }
 
-    private func pumpOwnerEvents(generation: Int64): Unit {
-        while (true) {
-            let shouldExit = synchronized(this.lock) {
-                this.ownerGeneration != generation || this.ownerTerminal
-            }
-            if (shouldExit) { break }
-            match (managedStdioBroker().readOwnerLine(this.ownerId, timeoutMs: CODEX_APP_SERVER_EVENT_POLL_MS)) {
-                case Some(event) => if (this.handleOwnerEvent(event, generation)) { break }
-                case None => ()
-            }
+    public func onManagedStdioEvent(event: ManagedStdioEvent): Unit {
+        let generation = synchronized(this.lock) { this.ownerGeneration }
+        let terminal = this.handleOwnerEvent(event, generation)
+        if (terminal) {
+            this.responses.close()
+            this.serverRequests.close()
+            this.notifications.close()
         }
-        this.responses.close()
-        this.serverRequests.close()
-        this.notifications.close()
     }
 
     private func handleOwnerEvent(event: ManagedStdioEvent, generation: Int64): Bool {
@@ -347,7 +354,7 @@ public class CodexAppServerClient <: CodexAppServerTransport {
             this.diagnosticsBuffer.append(if (event.status.isEmpty()) { "codex_app_server_transport_error" } else { event.status })
         }
         synchronized(this.lock) {
-            if (this.ownerGeneration == generation) {
+            if (this.ownerGeneration == generation && !this.ownerTerminal) {
                 this.ownerRunning = false
                 this.ownerTerminal = true
                 this.ownerPid = 0

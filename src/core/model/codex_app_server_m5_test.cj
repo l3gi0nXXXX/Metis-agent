@@ -357,21 +357,33 @@ public class CodexAppServerM5Test {
             codexBin: script,
             env: m5FakeCodexEnvironment("session", "second")
         )
-        first.start()
-        second.start()
-        let firstFuture = spawn { first.request("initialize", JsonObject(), 3000) }
-        let secondFuture = spawn { second.request("initialize", JsonObject(), 3000) }
-        let firstResult = firstFuture.get(Duration.second * 5)
-        let secondResult = secondFuture.get(Duration.second * 5)
-        let firstRequest = first.takeServerRequest(1000).getOrThrow()
-        let secondRequest = second.takeServerRequest(1000).getOrThrow()
-        let firstNotification = first.takeNotification(1000).getOrThrow()
-        let secondNotification = second.takeNotification(1000).getOrThrow()
-        let snapshot = managedStdioBroker().debugSnapshotForTest()
-        let firstDiagnostics = first.diagnostics().toString()
-        let secondDiagnostics = second.diagnostics().toString()
-        first.close()
-        second.close()
+        var firstResult = JsonObject()
+        var secondResult = JsonObject()
+        var firstRequest = JsonObject()
+        var secondRequest = JsonObject()
+        var firstNotification = JsonObject()
+        var secondNotification = JsonObject()
+        var snapshot = managedStdioBroker().debugSnapshotForTest()
+        var firstDiagnostics = ""
+        var secondDiagnostics = ""
+        try {
+            first.start()
+            second.start()
+            let firstFuture = spawn { first.request("initialize", JsonObject(), 3000) }
+            let secondFuture = spawn { second.request("initialize", JsonObject(), 3000) }
+            firstResult = firstFuture.get(Duration.second * 5)
+            secondResult = secondFuture.get(Duration.second * 5)
+            firstRequest = first.takeServerRequest(1000).getOrThrow()
+            secondRequest = second.takeServerRequest(1000).getOrThrow()
+            firstNotification = first.takeNotification(1000).getOrThrow()
+            secondNotification = second.takeNotification(1000).getOrThrow()
+            snapshot = managedStdioBroker().debugSnapshotForTest()
+            firstDiagnostics = first.diagnostics().toString()
+            secondDiagnostics = second.diagnostics().toString()
+        } finally {
+            first.close()
+            second.close()
+        }
 
         @Expect(m5JsonString(firstResult, "label"), "first")
         @Expect(m5JsonString(secondResult, "label"), "second")
@@ -382,6 +394,7 @@ public class CodexAppServerM5Test {
         @Expect(m5JsonString(m5JsonObject(firstNotification, "params"), "label"), "first")
         @Expect(m5JsonString(m5JsonObject(secondNotification, "params"), "label"), "second")
         @Expect(snapshot.readerCount, 1)
+        @Expect(snapshot.dispatcherCount, 1)
         @Expect(snapshot.ownerCount >= 2, true)
         @Expect(firstDiagnostics.contains("secret-codex-token"), false)
         @Expect(secondDiagnostics.contains("secret-codex-token"), false)
@@ -408,9 +421,10 @@ public class CodexAppServerM5Test {
             let _ = invalid.request("initialize", JsonObject(), 100)
         } catch (e: Exception) {
             invalidError = e.message
+        } finally {
+            invalid.close()
         }
         let invalidDiagnostics = invalid.diagnostics().toString()
-        invalid.close()
 
         let tooLong = CodexAppServerClient(
             codexBin: m5FakeCodexScript(),
@@ -421,9 +435,10 @@ public class CodexAppServerM5Test {
             let _ = tooLong.request("initialize", JsonObject(), 100)
         } catch (e: Exception) {
             tooLongError = e.message
+        } finally {
+            tooLong.close()
         }
         let tooLongDiagnostics = tooLong.diagnostics().toString()
-        tooLong.close()
 
         let malformedClient = CodexAppServerClient(
             codexBin: m5FakeCodexScript(),
@@ -434,27 +449,51 @@ public class CodexAppServerM5Test {
             let _ = malformedClient.request("initialize", JsonObject(), 100)
         } catch (e: Exception) {
             malformedError = e.message
+        } finally {
+            malformedClient.close()
         }
-        malformedClient.close()
 
         let beforeDeadline = CodexAppServerClient(
             codexBin: m5FakeCodexScript(),
             env: m5FakeCodexEnvironment("delayed-response", "before", delayMs: Some<Int64>(20))
         )
-        let beforeResult = beforeDeadline.request("initialize", JsonObject(), 500)
-        beforeDeadline.close()
+        var beforeResult = JsonObject()
+        try {
+            beforeResult = beforeDeadline.request("initialize", JsonObject(), 500)
+        } finally {
+            beforeDeadline.close()
+        }
 
         let afterDeadline = CodexAppServerClient(
             codexBin: m5FakeCodexScript(),
             env: m5FakeCodexEnvironment("delayed-response", "after", delayMs: Some<Int64>(200))
         )
+        let alongside = CodexAppServerClient(
+            codexBin: m5FakeCodexScript(),
+            env: m5FakeCodexEnvironment("session", "alongside")
+        )
         var afterError = ""
+        var alongsideResult = JsonObject()
         try {
-            let _ = afterDeadline.request("initialize", JsonObject(), 30)
-        } catch (e: Exception) {
-            afterError = e.message
+            let afterFuture = spawn {
+                try {
+                    let _ = afterDeadline.request("initialize", JsonObject(), 30)
+                    "unexpected_success"
+                } catch (e: Exception) { e.message }
+            }
+            let alongsideFuture = spawn { alongside.request("initialize", JsonObject(), 3000) }
+            afterError = afterFuture.get(Duration.second * 5)
+            alongsideResult = alongsideFuture.get(Duration.second * 5)
+        } finally {
+            let firstClose = spawn { afterDeadline.close() }
+            let secondClose = spawn { afterDeadline.close() }
+            firstClose.get(Duration.second * 2)
+            secondClose.get(Duration.second * 2)
+            alongside.close()
         }
-        afterDeadline.close()
+        sleep(Duration.millisecond * 250)
+        var lateRequestError = ""
+        try { let _ = afterDeadline.request("initialize", JsonObject(), 100) } catch (e: Exception) { lateRequestError = e.message }
 
         let timeout = CodexAppServerClient(
             codexBin: m5FakeCodexScript(),
@@ -465,8 +504,21 @@ public class CodexAppServerM5Test {
             let _ = timeout.request("initialize", JsonObject(), 80)
         } catch (e: Exception) {
             timeoutError = e.message
+        } finally {
+            timeout.close()
         }
-        timeout.close()
+
+        let stderrBurst = CodexAppServerClient(
+            codexBin: m5FakeCodexScript(),
+            env: m5FakeCodexEnvironment("stderr-burst", "burst")
+        )
+        var burstResult = JsonObject()
+        try {
+            burstResult = stderrBurst.request("initialize", JsonObject(), 3000)
+        } finally {
+            stderrBurst.close()
+        }
+        let burstDiagnostics = stderrBurst.diagnostics().toString()
 
         @Expect(unicode.kind, "response")
         @Expect(unicode.message.toJsonString().contains("中文🙂"), true)
@@ -481,8 +533,14 @@ public class CodexAppServerM5Test {
         @Expect(malformedError.contains("malformed_json"), true)
         @Expect(m5JsonString(beforeResult, "label"), "before")
         @Expect(afterError.contains("initialize"), true)
+        @Expect(m5JsonString(alongsideResult, "label"), "alongside")
+        @Expect(lateRequestError.contains("closed"), true)
         @Expect(timeoutError.contains("initialize"), true)
         @Expect(timeoutError.contains("secret-codex-token"), false)
+        @Expect(m5JsonString(burstResult, "label"), "burst")
+        @Expect(burstDiagnostics.contains("中文🙂"), true)
+        @Expect(burstDiagnostics.contains("secret-codex-token"), false)
+        @Expect(burstDiagnostics.contains("/Users/"), false)
     }
 
     @TestCase
@@ -495,17 +553,23 @@ public class CodexAppServerM5Test {
             codexBin: m5FakeCodexScript(),
             env: m5FakeCodexEnvironment("session", "session-b")
         )
-        let firstFuture = spawn {
-            CodexAppServerSession(firstClient).runTurn("/tmp/session-a", "first 中文🙂", timeoutMs: 5000)
+        var first = CodexAppServerTurnResult()
+        var second = CodexAppServerTurnResult()
+        var snapshot = managedStdioBroker().debugSnapshotForTest()
+        try {
+            let firstFuture = spawn {
+                CodexAppServerSession(firstClient).runTurn("/tmp/session-a", "first 中文🙂", timeoutMs: 5000)
+            }
+            let secondFuture = spawn {
+                CodexAppServerSession(secondClient).runTurn("/tmp/session-b", "second 中文🙂", timeoutMs: 5000)
+            }
+            first = firstFuture.get(Duration.second * 8)
+            second = secondFuture.get(Duration.second * 8)
+            snapshot = managedStdioBroker().debugSnapshotForTest()
+        } finally {
+            firstClient.close()
+            secondClient.close()
         }
-        let secondFuture = spawn {
-            CodexAppServerSession(secondClient).runTurn("/tmp/session-b", "second 中文🙂", timeoutMs: 5000)
-        }
-        let first = firstFuture.get(Duration.second * 8)
-        let second = secondFuture.get(Duration.second * 8)
-        let snapshot = managedStdioBroker().debugSnapshotForTest()
-        firstClient.close()
-        secondClient.close()
 
         @Expect(first.completed, true)
         @Expect(second.completed, true)
@@ -514,10 +578,17 @@ public class CodexAppServerM5Test {
         @Expect(first.threadId, "thread-session-a")
         @Expect(second.threadId, "thread-session-b")
         @Expect(m5JsonInt(first.usage.getOrThrow(), "promptTokens"), 12)
+        @Expect(m5JsonInt(first.usage.getOrThrow(), "cachedInputTokens"), 3)
         @Expect(m5JsonInt(first.usage.getOrThrow(), "outputTokens"), 7)
+        @Expect(m5JsonInt(first.usage.getOrThrow(), "cacheWriteTokens"), 0)
+        @Expect(m5JsonString(first.usage.getOrThrow(), "billingMode"), "subscription_included")
         @Expect(m5JsonInt(second.usage.getOrThrow(), "promptTokens"), 12)
+        @Expect(m5JsonInt(second.usage.getOrThrow(), "cachedInputTokens"), 3)
         @Expect(m5JsonInt(second.usage.getOrThrow(), "outputTokens"), 7)
+        @Expect(m5JsonInt(second.usage.getOrThrow(), "cacheWriteTokens"), 0)
+        @Expect(m5JsonString(second.usage.getOrThrow(), "billingMode"), "subscription_included")
         @Expect(snapshot.readerCount, 1)
+        @Expect(snapshot.dispatcherCount, 1)
         @Expect(snapshot.ownerCount >= 2, true)
     }
 
@@ -535,36 +606,49 @@ public class CodexAppServerM5Test {
                 childPidPath: Some(childPidPath.toString())
             )
         )
-        hanging.start()
-        let filesReady = m5WaitPathsExist([parentPidPath, childPidPath], 3000)
-        let parentPid = m5ReadPid(parentPidPath)
-        let childPid = m5ReadPid(childPidPath)
-        let hangingRequest = spawn {
-            try {
-                let _ = hanging.request("initialize", JsonObject(), 5000)
-                "unexpected_success"
-            } catch (e: Exception) {
-                e.message
-            }
-        }
-        sleep(Duration.millisecond * 50)
-        let before = managedStdioBroker().debugSnapshotForTest()
-        let _ = executeWithOutput("kill", ["-KILL", "${before.brokerPid}"])
-        let hangingError = hangingRequest.get(Duration.second * 5)
-        let parentGone = m5WaitPidGone(parentPid, 5000)
-        let childGone = m5WaitPidGone(childPid, 5000)
-        hanging.close()
-
         let recovered = CodexAppServerClient(
             codexBin: m5FakeCodexScript(),
             env: m5FakeCodexEnvironment("session", "recovered")
         )
-        let result = recovered.request("initialize", JsonObject(), 3000)
-        let after = managedStdioBroker().debugSnapshotForTest()
-        recovered.close()
-        if (!parentGone) { m5KillPid(parentPid) }
-        if (!childGone) { m5KillPid(childPid) }
-        try { remove(root, recursive: true) } catch (_: Exception) { () }
+        var filesReady = false
+        var parentPid: Int64 = 0
+        var childPid: Int64 = 0
+        var parentGone = false
+        var childGone = false
+        var hangingError = ""
+        var result = JsonObject()
+        var before = managedStdioBroker().debugSnapshotForTest()
+        var after = before
+        try {
+            hanging.start()
+            filesReady = m5WaitPathsExist([parentPidPath, childPidPath], 3000)
+            parentPid = m5ReadPid(parentPidPath)
+            childPid = m5ReadPid(childPidPath)
+            let hangingRequest = spawn {
+                try {
+                    let _ = hanging.request("initialize", JsonObject(), 5000)
+                    "unexpected_success"
+                } catch (e: Exception) { e.message }
+            }
+            sleep(Duration.millisecond * 50)
+            before = managedStdioBroker().debugSnapshotForTest()
+            let _ = executeWithOutput("kill", ["-KILL", "${before.brokerPid}"])
+            let recoveryFuture = spawn {
+                sleep(Duration.millisecond * 50)
+                recovered.request("initialize", JsonObject(), 4000)
+            }
+            hangingError = hangingRequest.get(Duration.second * 6)
+            result = recoveryFuture.get(Duration.second * 6)
+            parentGone = m5WaitPidGone(parentPid, 5000)
+            childGone = m5WaitPidGone(childPid, 5000)
+            after = managedStdioBroker().debugSnapshotForTest()
+        } finally {
+            hanging.close()
+            recovered.close()
+            if (!m5WaitPidGone(parentPid, 200)) { m5KillPid(parentPid) }
+            if (!m5WaitPidGone(childPid, 200)) { m5KillPid(childPid) }
+            try { remove(root, recursive: true) } catch (_: Exception) { () }
+        }
 
         @Expect(filesReady, true)
         @Expect(parentGone, true)
@@ -577,6 +661,7 @@ public class CodexAppServerM5Test {
         @Expect(m5JsonString(result, "label"), "recovered")
         @Expect(after.generation > before.generation, true)
         @Expect(after.readerCount, 1)
+        @Expect(after.dispatcherCount, 1)
     }
 }
 

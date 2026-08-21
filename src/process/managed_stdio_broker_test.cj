@@ -3,6 +3,7 @@ package metis.process
 import std.collection.ArrayList
 import std.env.{getVariable, setVariable}
 import std.fs.{File, Path, exists, remove}
+import std.sync.Mutex
 import std.time.DateTime
 import std.unittest.testmacro.*
 
@@ -33,6 +34,47 @@ private class ManagedStdioTestInt64Box {
     init(value!: Int64 = 0) { this.value = value }
 }
 
+private class ManagedStdioTestSubscriber <: ManagedStdioOwnerSubscriber {
+    private let lock = Mutex()
+    private let events = ArrayList<ManagedStdioEvent>()
+
+    public func onManagedStdioEvent(event: ManagedStdioEvent): Unit {
+        synchronized(this.lock) { this.events.add(event) }
+    }
+
+    func terminalCount(): Int64 {
+        synchronized(this.lock) {
+            var count: Int64 = 0
+            for (event in this.events) {
+                if (event.eventType == "owner.exit" || event.eventType == "owner.error" || event.eventType == "owner.timeout") { count += 1 }
+            }
+            count
+        }
+    }
+
+    func containsText(text: String): Bool {
+        synchronized(this.lock) {
+            for (event in this.events) {
+                if (event.text == text) { return true }
+            }
+            false
+        }
+    }
+}
+
+private class ManagedStdioThrowingSubscriber <: ManagedStdioOwnerSubscriber {
+    public func onManagedStdioEvent(_event: ManagedStdioEvent): Unit {
+        throw Exception("subscriber test failure must stay isolated")
+    }
+}
+
+private func managedStdioSubscribersSettled(subscribers: ArrayList<ManagedStdioTestSubscriber>): Bool {
+    for (subscriber in subscribers) {
+        if (subscriber.terminalCount() != 1) { return false }
+    }
+    true
+}
+
 private func managedStdioTestNowMs(): Int64 {
     DateTime.now().toUnixTimeStamp().toMilliseconds()
 }
@@ -52,6 +94,120 @@ private func managedStdioTestReadUtf8(path: Path): String {
 
 @Test
 public class ManagedStdioBrokerTest {
+    @TestCase
+    public func p3U3OwnerSubscriptionsUseOneDispatcherForTwoAndThirtyTwoClients(): Unit {
+        for (count in [2, 32]) {
+            let client = ManagedStdioBrokerClient()
+            let subscribers = ArrayList<ManagedStdioTestSubscriber>()
+            try {
+                for (index in 0..count) {
+                    let ownerId = "subscription-${count}-${index}"
+                    let started = client.startOwner(ManagedStdioOwnerSpec(
+                        ownerId,
+                        "node",
+                        args: ["-e", "console.log('event-${index}-中文🙂')"],
+                        stdinMode: "closed",
+                        deadlineMs: 2000
+                    ))
+                    @Expect(started.ok, true)
+                    let subscriber = ManagedStdioTestSubscriber()
+                    subscribers.add(subscriber)
+                    @Expect(client.subscribeOwner(ownerId, started.generation, subscriber).status, "subscribed")
+                }
+                @Expect(managedStdioWaitUntil(8000, { => managedStdioSubscribersSettled(subscribers) }), true)
+                for (index in 0..count) {
+                    @Expect(subscribers[index].containsText("event-${index}-中文🙂"), true)
+                    @Expect(subscribers[index].terminalCount(), 1)
+                }
+                let snapshot = client.debugSnapshotForTest()
+                @Expect(snapshot.readerCount, 1)
+                @Expect(snapshot.dispatcherCount, 1)
+                @Expect(snapshot.ownerCount, 0)
+            } finally {
+                let _ = client.close(timeoutMs: 3000)
+            }
+        }
+    }
+
+    @TestCase
+    public func p3B3SubscriptionAtomicallyAdoptsQueuedEventsAndRejectsMixedReaders(): Unit {
+        let client = ManagedStdioBrokerClient()
+        try {
+            let started = client.startOwner(ManagedStdioOwnerSpec(
+                "atomic-subscription",
+                "node",
+                args: ["-e", "console.log('queued-before-subscribe-中文🙂');setTimeout(()=>{},500)"],
+                stdinMode: "closed",
+                deadlineMs: 2000
+            ))
+            @Expect(started.ok, true)
+            sleep(Duration.millisecond * 100)
+            let subscriber = ManagedStdioTestSubscriber()
+            @Expect(client.subscribeOwner("atomic-subscription", started.generation, subscriber).ok, true)
+            @Expect(
+                client.stopOwner(
+                    "atomic-subscription",
+                    timeoutMs: 10,
+                    expectedGeneration: Some(started.generation + 1)
+                ).status,
+                "stale_generation"
+            )
+            let conflict = client.readOwnerLine("atomic-subscription", timeoutMs: 0)
+            @Expect(conflict.isSome(), true)
+            @Expect(conflict.getOrThrow().status, "owner_delivery_conflict")
+            @Expect(managedStdioWaitUntil(3000, { => subscriber.terminalCount() == 1 }), true)
+            @Expect(subscriber.containsText("queued-before-subscribe-中文🙂"), true)
+            @Expect(subscriber.terminalCount(), 1)
+        } finally {
+            let _ = client.close(timeoutMs: 2000)
+        }
+    }
+
+    @TestCase
+    public func p3N3SubscriberFailureDoesNotKillDispatcherOrAnotherOwner(): Unit {
+        let client = ManagedStdioBrokerClient()
+        try {
+            let failed = client.startOwner(ManagedStdioOwnerSpec(
+                "throwing-subscriber", "node",
+                args: ["-e", "console.log('throw');setInterval(()=>{},1000)"],
+                stdinMode: "closed", deadlineMs: 5000
+            ))
+            let healthy = client.startOwner(ManagedStdioOwnerSpec(
+                "healthy-subscriber", "node",
+                args: ["-e", "console.log('healthy-中文🙂')"],
+                stdinMode: "closed", deadlineMs: 2000
+            ))
+            @Expect(failed.ok, true)
+            @Expect(healthy.ok, true)
+            @Expect(client.subscribeOwner("throwing-subscriber", failed.generation, ManagedStdioThrowingSubscriber()).ok, true)
+            let healthySubscriber = ManagedStdioTestSubscriber()
+            @Expect(client.subscribeOwner("healthy-subscriber", healthy.generation, healthySubscriber).ok, true)
+            @Expect(managedStdioWaitUntil(3000, { => healthySubscriber.terminalCount() == 1 }), true)
+            @Expect(healthySubscriber.containsText("healthy-中文🙂"), true)
+            @Expect(client.debugSnapshotForTest().dispatcherCount, 1)
+        } finally {
+            let _ = client.close(timeoutMs: 3000)
+        }
+    }
+
+    @TestCase
+    public func p3N3SingletonResetClosesBeforeReplacingTestBroker(): Unit {
+        let oldNode = getVariable("METIS_STDIO_BROKER_NODE_COMMAND")
+        try {
+            @Expect(resetManagedStdioBrokerForTest(timeoutMs: 2000).ok, true)
+            setVariable("METIS_STDIO_BROKER_NODE_COMMAND", "/missing/metis-node-for-reset-test")
+            let unavailable = managedStdioBroker().ensureBrokerRunning(timeoutMs: 100)
+            @Expect(unavailable.ok, false)
+            @Expect(unavailable.status, "broker_unavailable")
+        } finally {
+            let _ = resetManagedStdioBrokerForTest(timeoutMs: 2000)
+            match (oldNode) {
+                case Some(value) => setVariable("METIS_STDIO_BROKER_NODE_COMMAND", value)
+                case None => setVariable("METIS_STDIO_BROKER_NODE_COMMAND", "")
+            }
+        }
+    }
+
     @TestCase
     public func p1U1OwnerSpecAndPlatformCommandsPreserveNeutralContract(): Unit {
         let valid = ManagedStdioOwnerSpec(

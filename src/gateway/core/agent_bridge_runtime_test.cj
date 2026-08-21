@@ -6,12 +6,12 @@ import magic.core.model.{AsyncChatResponse, ChatModel, ChatRequest, ChatResponse
 import magic.core.tool.*
 import magic.jsonable.TypeSchema
 import magic.model.ModelManager
-import metis.core.config.{CliConfig, CliSettingManager, MetisConfigManager, MetisProcessEnvironmentLock, OpenAICodexOAuthProfile, writeOpenAICodexOAuthProfile}
+import metis.core.config.{CliConfig, CliModelRuntimeStateManager, CliSettingManager, MetisConfigManager, MetisProcessEnvironmentLock, OpenAICodexOAuthProfile, writeOpenAICodexOAuthProfile}
 import metis.core.{GatewayToolRuntimeContext, gatewayCurrentToolRuntimeContext, gatewayToolRuntimeContextDebugSummary, gatewayWithToolRuntimeContext}
 import metis.core.model.{CodexResponsesHttpRequest, CodexResponsesHttpResult, CodexResponsesHttpRunner, setCodexResponsesHttpRunnerForTest}
 import metis.gateway.logging.{gatewayLoggingCaptureConsoleForTest, gatewayLoggingCapturedConsoleForTest, gatewayLoggingResetForTest}
 import metis.gateway.session.{GatewayIngressSource, GatewaySessionRequest, GatewayTurnContext, gatewayResolveSessionContext}
-import metis.process.managedStdioBroker
+import metis.process.{managedStdioBroker, resetManagedStdioBrokerForTest}
 
 import std.collection.{ArrayList, HashMap}
 import std.env.{getVariable, setVariable}
@@ -112,6 +112,33 @@ private func writeAgentBridgeCodexAppServerAgentConfig(home: Path): Unit {
     model.put("openaiRuntime", JsonString("codex_app_server"))
     entry.put("model", model)
     list.add(entry)
+    agents.put("list", list)
+    root.put("agents", agents)
+    File.writeTo(MetisConfigManager.configPath(), root.toJsonString().toArray())
+    CliConfig.invalidatePathCache()
+    MetisConfigManager.invalidate()
+    CliSettingManager.invalidate()
+}
+
+private func writeAgentBridgeParallelCodexAppServerAgentConfig(home: Path): Unit {
+    let root = JsonObject()
+    let agents = JsonObject()
+    let defaults = JsonObject()
+    defaults.put("workspace", JsonString(home.join("workspaces").toString()))
+    agents.put("defaults", defaults)
+    let list = JsonArray([])
+    for (id in ["codex-a", "codex-b"]) {
+        let entry = agentBridgeAgentEntry(
+            id,
+            home.join("workspaces").join(id),
+            home.join("agents").join(id).join("agent"),
+            "openai-codex:gpt-5.5"
+        )
+        let model = entry.get("model").getOrThrow().asObject()
+        model.put("fallbacks", JsonArray([]))
+        model.put("openaiRuntime", JsonString("codex_app_server"))
+        list.add(entry)
+    }
     agents.put("list", list)
     root.put("agents", agents)
     File.writeTo(MetisConfigManager.configPath(), root.toJsonString().toArray())
@@ -658,12 +685,15 @@ public class AgentBridgeRuntimeTest {
     @TestCase
     public func p3P3FormalGatewayCodexTurnsRemainSessionIsolatedOnSharedBroker(): Unit {
         withAgentBridgeTempHome("metis-p3-codex-gateway", { home: Path =>
+            writeAgentBridgeParallelCodexAppServerAgentConfig(home)
             let binDir = home.join("bin")
-            let firstWorkspace = home.join("workspaces").join("session-a")
-            let secondWorkspace = home.join("workspaces").join("session-b")
             Directory.create(binDir, recursive: true)
-            Directory.create(firstWorkspace, recursive: true)
-            Directory.create(secondWorkspace, recursive: true)
+            // Runtime state materialization is not the subject of this test;
+            // create independent agent roots before concurrent replies.
+            Directory.create(home.join("agents").join("codex-a").join("agent"), recursive: true)
+            Directory.create(home.join("agents").join("codex-b").join("agent"), recursive: true)
+            Directory.create(home.join("workspaces").join("codex-a"), recursive: true)
+            Directory.create(home.join("workspaces").join("codex-b"), recursive: true)
             let fakeCodex = binDir.join("codex")
             File.writeTo(fakeCodex, File.readFrom(Path("scripts").join("gateway-stdio-fake-codex-app-server.mjs")))
             let (chmodCode, _, _) = executeWithOutput("chmod", ["+x", fakeCodex.toString()])
@@ -672,41 +702,89 @@ public class AgentBridgeRuntimeTest {
             let oldPath = getVariable("PATH")
             let oldMode = getVariable("METIS_CODEX_FAKE_MODE")
             let oldLabel = getVariable("METIS_CODEX_FAKE_LABEL")
+            let oldThreadLog = getVariable("METIS_CODEX_FAKE_THREAD_LOG")
+            let oldIncludeThread = getVariable("METIS_CODEX_FAKE_INCLUDE_THREAD_IN_ANSWER")
+            let threadLog = home.join("threads.log")
             let inheritedPath = oldPath ?? ""
             setVariable("PATH", "${binDir.toString()}:${inheritedPath}")
             setVariable("METIS_CODEX_FAKE_MODE", "session")
             setVariable("METIS_CODEX_FAKE_LABEL", "gateway")
+            setVariable("METIS_CODEX_FAKE_THREAD_LOG", threadLog.toString())
+            setVariable("METIS_CODEX_FAKE_INCLUDE_THREAD_IN_ANSWER", "1")
             setGatewayCodexAppServerRunnerForTest(None<(GatewayCodexAppServerTurnRequest) -> GatewayCodexAppServerRuntimeResult>)
             let baseline = managedStdioBroker().debugSnapshotForTest()
             try {
+                let firstContext = gatewayResolveSessionContext(GatewaySessionRequest(
+                    GatewayIngressSource.Channel("telegram"),
+                    sessionHint: "session-a",
+                    agentId: "codex-a"
+                ))
+                let secondContext = gatewayResolveSessionContext(GatewaySessionRequest(
+                    GatewayIngressSource.Channel("feishu"),
+                    sessionHint: "session-b",
+                    agentId: "codex-b"
+                ))
+                let _ = CliModelRuntimeStateManager.ensureAgentRuntimeStateForScope(
+                    Path(firstContext.turnContext.agentDir), firstContext.turnContext.agentScope
+                )
+                let _ = CliModelRuntimeStateManager.ensureAgentRuntimeStateForScope(
+                    Path(secondContext.turnContext.agentDir), secondContext.turnContext.agentScope
+                )
+                let firstStore = GatewaySessionStore(home.join("sessions-a"), enabled: true, agentId: "codex-a")
+                let secondStore = GatewaySessionStore(home.join("sessions-b"), enabled: true, agentId: "codex-b")
+                let firstBridge = AgentBridge(sessionStore: firstStore)
+                let secondBridge = AgentBridge(sessionStore: secondStore)
                 let firstFuture = spawn {
-                    gatewayRunCodexAppServerTurn(GatewayCodexAppServerTurnRequest(
-                        "session-a", firstWorkspace.toString(), "telegram", "writer", "openai-codex:test", "system-a", "input-a 中文🙂"
-                    ))
+                    try {
+                        firstBridge.reply(
+                            firstContext.sessionKey,
+                            "input-a 中文🙂",
+                            channelName: "telegram",
+                            agentId: "codex-a",
+                            turnContext: Some(firstContext.turnContext)
+                        )
+                    } catch (_: Exception) { "p3_first_error" }
                 }
                 let secondFuture = spawn {
-                    gatewayRunCodexAppServerTurn(GatewayCodexAppServerTurnRequest(
-                        "session-b", secondWorkspace.toString(), "feishu", "writer", "openai-codex:test", "system-b", "input-b 中文🙂"
-                    ))
+                    try {
+                        secondBridge.reply(
+                            secondContext.sessionKey,
+                            "input-b 中文🙂",
+                            channelName: "feishu",
+                            agentId: "codex-b",
+                            turnContext: Some(secondContext.turnContext)
+                        )
+                    } catch (_: Exception) { "p3_second_error" }
                 }
                 let first = firstFuture.get(Duration.second * 10)
                 let second = secondFuture.get(Duration.second * 10)
                 let after = managedStdioBroker().debugSnapshotForTest()
 
-                @Expect(first.finalText, "answer-session-a-中文🙂")
-                @Expect(second.finalText, "answer-session-b-中文🙂")
-                @Expect(first.threadId, "thread-session-a")
-                @Expect(second.threadId, "thread-session-b")
-                @Expect(first.promptTokens, 12)
-                @Expect(first.completionTokens, 7)
-                @Expect(second.promptTokens, 12)
-                @Expect(second.completionTokens, 7)
-                @Expect(first.completed, true)
-                @Expect(second.completed, true)
+                @Expect(first, "answer-codex-a-中文🙂 thread=thread-codex-a")
+                @Expect(second, "answer-codex-b-中文🙂 thread=thread-codex-b")
+                let firstTranscript = String.fromUtf8(File.readFrom(firstStore.transcriptPath(firstContext.sessionKey)))
+                let secondTranscript = String.fromUtf8(File.readFrom(secondStore.transcriptPath(secondContext.sessionKey)))
+                let firstCompact = firstTranscript.replace(" ", "").replace("\n", "").replace("\r", "").replace("\t", "")
+                let secondCompact = secondTranscript.replace(" ", "").replace("\n", "").replace("\r", "").replace("\t", "")
+                let threadLogText = String.fromUtf8(File.readFrom(threadLog))
+                @Expect(threadLogText.contains("thread-codex-a"), true)
+                @Expect(threadLogText.contains("thread-codex-b"), true)
+                @Expect(firstCompact.contains("\"input\":12"), true)
+                @Expect(firstCompact.contains("\"output\":7"), true)
+                @Expect(secondCompact.contains("\"input\":12"), true)
+                @Expect(secondCompact.contains("\"output\":7"), true)
+                @Expect(firstTranscript.contains("thread-codex-a"), true)
+                @Expect(secondTranscript.contains("thread-codex-b"), true)
+                @Expect(firstTranscript.contains("thread-codex-b"), false)
+                @Expect(secondTranscript.contains("thread-codex-a"), false)
+                @Expect(firstTranscript.contains("answer-codex-b"), false)
+                @Expect(secondTranscript.contains("answer-codex-a"), false)
                 @Expect(after.readerCount, 1)
+                @Expect(after.dispatcherCount, 1)
                 @Expect(after.ownerCount, baseline.ownerCount)
             } finally {
                 setGatewayCodexAppServerRunnerForTest(None<(GatewayCodexAppServerTurnRequest) -> GatewayCodexAppServerRuntimeResult>)
+                let _ = resetManagedStdioBrokerForTest(timeoutMs: 3000)
                 match (oldPath) {
                     case Some(value) => setVariable("PATH", value)
                     case None => setVariable("PATH", "")
@@ -718,6 +796,14 @@ public class AgentBridgeRuntimeTest {
                 match (oldLabel) {
                     case Some(value) => setVariable("METIS_CODEX_FAKE_LABEL", value)
                     case None => setVariable("METIS_CODEX_FAKE_LABEL", "")
+                }
+                match (oldThreadLog) {
+                    case Some(value) => setVariable("METIS_CODEX_FAKE_THREAD_LOG", value)
+                    case None => setVariable("METIS_CODEX_FAKE_THREAD_LOG", "")
+                }
+                match (oldIncludeThread) {
+                    case Some(value) => setVariable("METIS_CODEX_FAKE_INCLUDE_THREAD_IN_ANSWER", value)
+                    case None => setVariable("METIS_CODEX_FAKE_INCLUDE_THREAD_IN_ANSWER", "")
                 }
             }
         })

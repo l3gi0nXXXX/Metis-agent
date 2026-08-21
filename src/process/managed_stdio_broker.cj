@@ -14,6 +14,8 @@ private let MANAGED_STDIO_OWNER_QUEUE_LIMIT: Int64 = 4096
 private let MANAGED_STDIO_BROKER_START_TIMEOUT_MS: Int64 = 3000
 private let MANAGED_STDIO_BROKER_PING_TIMEOUT_MS: Int64 = 500
 private let MANAGED_STDIO_REAP_GRACE_MS: Int64 = 300
+private let MANAGED_STDIO_DISPATCH_QUEUE_LIMIT: Int64 = 16384
+private let MANAGED_STDIO_DISPATCH_BYTES_LIMIT: Int64 = 16777216
 
 private func managedStdioHasControl(value: String): Bool {
     for (rune in value.runes()) {
@@ -215,6 +217,12 @@ public class ManagedStdioEvent {
     }
 }
 
+// Subscribers must return promptly and may only enqueue the event into bounded
+// in-memory state. The broker always invokes this callback without broker locks.
+public interface ManagedStdioOwnerSubscriber {
+    func onManagedStdioEvent(event: ManagedStdioEvent): Unit
+}
+
 public class ManagedStdioOperationResult {
     public let ok: Bool
     public let status: String
@@ -239,8 +247,9 @@ public class ManagedStdioBrokerSnapshot {
     public let brokerPid: Int64
     public let ownerCount: Int64
     public let readerCount: Int64
+    public let dispatcherCount: Int64
 
-    public init(running: Bool, responsive: Bool, status: String, generation: Int64, brokerPid: Int64, ownerCount: Int64, readerCount: Int64) {
+    public init(running: Bool, responsive: Bool, status: String, generation: Int64, brokerPid: Int64, ownerCount: Int64, readerCount: Int64, dispatcherCount!: Int64 = 0) {
         this.running = running
         this.responsive = responsive
         this.status = status
@@ -248,6 +257,7 @@ public class ManagedStdioBrokerSnapshot {
         this.brokerPid = brokerPid
         this.ownerCount = ownerCount
         this.readerCount = readerCount
+        this.dispatcherCount = dispatcherCount
     }
 }
 
@@ -341,10 +351,31 @@ private class ManagedStdioOwnerState {
     var lastStopRequestId: String = ""
     var maxBufferedBytes: Int64 = 1
     var queuedBytes: Int64 = 0
+    var subscriber: Option<ManagedStdioOwnerSubscriber> = None<ManagedStdioOwnerSubscriber>
+    var readModeClaimed: Bool = false
+    var dispatchPending: Int64 = 0
+    var terminalQueued: Bool = false
+    var subscriberFailed: Bool = false
     init(ownerId: String, generation: Int64, condition: Condition) {
         this.ownerId = ownerId
         this.generation = generation
         this.condition = condition
+    }
+}
+
+private class ManagedStdioDispatchItem {
+    let ownerId: String
+    let generation: Int64
+    let event: ManagedStdioEvent
+    let eventBytes: Int64
+    let subscriber: ManagedStdioOwnerSubscriber
+
+    init(ownerId: String, generation: Int64, event: ManagedStdioEvent, eventBytes: Int64, subscriber: ManagedStdioOwnerSubscriber) {
+        this.ownerId = ownerId
+        this.generation = generation
+        this.event = event
+        this.eventBytes = eventBytes
+        this.subscriber = subscriber
     }
 }
 
@@ -362,6 +393,11 @@ public class ManagedStdioBrokerClient {
     private var process: Option<SubProcess> = None<SubProcess>
     private var writer: Option<StringWriter<OutputStream>> = None<StringWriter<OutputStream>>
     private var readerFuture: Option<Future<Unit>> = None<Future<Unit>>
+    private var dispatchFuture: Option<Future<Unit>> = None<Future<Unit>>
+    private let dispatchItems = ArrayList<ManagedStdioDispatchItem>()
+    private var dispatchBytes: Int64 = 0
+    private var dispatcherCount: Int64 = 0
+    private var dispatchClosing: Bool = false
     private var owners = HashMap<String, ManagedStdioOwnerState>()
     private var generation: Int64 = 0
     private var brokerPid: Int64 = 0
@@ -536,7 +572,7 @@ public class ManagedStdioBrokerClient {
         let owner: Option<ManagedStdioOwnerState> = synchronized(this.lock) {
             match (this.owners.get(spec.ownerId)) {
                 case Some(previous) =>
-                    if (previous.settled && previous.events.isEmpty()) { this.owners.remove(spec.ownerId) }
+                    if (previous.settled && previous.events.isEmpty() && previous.dispatchPending == 0) { this.owners.remove(spec.ownerId) }
                 case None => ()
             }
             if (this.owners.contains(spec.ownerId) || this.activeOwnerCountLocked() >= this.ownerHardLimit) {
@@ -656,6 +692,178 @@ public class ManagedStdioBrokerClient {
         }
     }
 
+    private func isTerminalEvent(event: ManagedStdioEvent): Bool {
+        event.eventType == "owner.exit" || event.eventType == "owner.error" || event.eventType == "owner.timeout"
+    }
+
+    // Caller holds lock. The item continues to count against the owner budget
+    // until the callback returns or the item is discarded.
+    private func enqueueDispatchLocked(state: ManagedStdioOwnerState, event: ManagedStdioEvent, eventBytes: Int64): Bool {
+        match (state.subscriber) {
+            case None => false
+            case Some(subscriber) =>
+                if (this.dispatchItems.size >= MANAGED_STDIO_DISPATCH_QUEUE_LIMIT || this.dispatchBytes + eventBytes > MANAGED_STDIO_DISPATCH_BYTES_LIMIT) {
+                    state.status = "dispatch_capacity_exceeded"
+                    state.subscriber = None<ManagedStdioOwnerSubscriber>
+                    state.subscriberFailed = true
+                    state.condition.notifyAll()
+                    return false
+                }
+                if (this.isTerminalEvent(event)) {
+                    if (state.terminalQueued) { return true }
+                    state.terminalQueued = true
+                }
+                this.dispatchItems.add(ManagedStdioDispatchItem(state.ownerId, state.generation, event, eventBytes, subscriber))
+                this.dispatchBytes += eventBytes
+                state.dispatchPending += 1
+                this.condition.notifyAll()
+                true
+        }
+    }
+
+    public func subscribeOwner(
+        ownerId: String,
+        expectedGeneration: Int64,
+        subscriber: ManagedStdioOwnerSubscriber
+    ): ManagedStdioOperationResult {
+        synchronized(this.lock) {
+            match (this.owners.get(ownerId)) {
+                case None => ManagedStdioOperationResult(false, "owner_not_found", generation: this.generation)
+                case Some(state) =>
+                    if (state.generation != expectedGeneration) {
+                        return ManagedStdioOperationResult(false, "stale_generation", generation: state.generation)
+                    }
+                    if (state.readModeClaimed || state.subscriber.isSome()) {
+                        return ManagedStdioOperationResult(false, "owner_delivery_conflict", generation: state.generation)
+                    }
+                    state.subscriber = Some(subscriber)
+                    var accepted = true
+                    while (!state.events.isEmpty() && accepted) {
+                        let event = state.events.remove(at: 0)
+                        let eventBytes = state.eventBytes.remove(at: 0)
+                        accepted = this.enqueueDispatchLocked(state, event, eventBytes)
+                    }
+                    if (!accepted) {
+                        var index: Int64 = this.dispatchItems.size - 1
+                        while (index >= 0) {
+                            let item = this.dispatchItems[index]
+                            if (item.ownerId == ownerId && item.generation == expectedGeneration) {
+                                this.dispatchItems.remove(at: index)
+                                this.dispatchBytes -= item.eventBytes
+                                state.queuedBytes -= item.eventBytes
+                                state.dispatchPending -= 1
+                            }
+                            index -= 1
+                        }
+                        while (!state.events.isEmpty()) {
+                            state.events.remove(at: 0)
+                            state.queuedBytes -= state.eventBytes.remove(at: 0)
+                        }
+                        return ManagedStdioOperationResult(false, "dispatch_capacity_exceeded", generation: state.generation)
+                    }
+                    if (this.dispatchFuture.isNone()) {
+                        this.dispatchClosing = false
+                        this.dispatcherCount = 1
+                        this.dispatchFuture = Some(spawn { this.dispatchOwnerEvents() })
+                    }
+                    ManagedStdioOperationResult(true, "subscribed", generation: state.generation, pid: state.pid, pgid: state.pgid)
+            }
+        }
+    }
+
+    public func unsubscribeOwner(ownerId: String, expectedGeneration: Int64): ManagedStdioOperationResult {
+        synchronized(this.lock) {
+            match (this.owners.get(ownerId)) {
+                case None => ManagedStdioOperationResult(true, "already_unsubscribed", generation: this.generation)
+                case Some(state) =>
+                    if (state.generation != expectedGeneration) {
+                        return ManagedStdioOperationResult(false, "stale_generation", generation: state.generation)
+                    }
+                    state.subscriber = None<ManagedStdioOwnerSubscriber>
+                    var index: Int64 = this.dispatchItems.size - 1
+                    while (index >= 0) {
+                        let item = this.dispatchItems[index]
+                        if (item.ownerId == ownerId && item.generation == expectedGeneration) {
+                            this.dispatchItems.remove(at: index)
+                            this.dispatchBytes -= item.eventBytes
+                            state.queuedBytes -= item.eventBytes
+                            state.dispatchPending -= 1
+                        }
+                        index -= 1
+                    }
+                    if (state.settled && state.dispatchPending == 0 && state.events.isEmpty()) { this.owners.remove(ownerId) }
+                    state.condition.notifyAll()
+                    ManagedStdioOperationResult(true, "unsubscribed", generation: state.generation)
+            }
+        }
+    }
+
+    private func dispatchOwnerEvents(): Unit {
+        while (true) {
+            let item = synchronized(this.lock) {
+                while (this.dispatchItems.isEmpty() && !this.dispatchClosing) {
+                    let _ = this.condition.wait(timeout: Duration.millisecond * 100)
+                }
+                if (this.dispatchItems.isEmpty()) {
+                    None<ManagedStdioDispatchItem>
+                } else {
+                    let value = this.dispatchItems.remove(at: 0)
+                    this.dispatchBytes -= value.eventBytes
+                    Some(value)
+                }
+            }
+            match (item) {
+                case None => break
+                case Some(value) =>
+                    var delivered = true
+                    try { value.subscriber.onManagedStdioEvent(value.event) } catch (_: Exception) { delivered = false }
+                    var stopFailedSubscriber = false
+                    synchronized(this.lock) {
+                        match (this.owners.get(value.ownerId)) {
+                            case Some(state) =>
+                                if (state.generation == value.generation) {
+                                    state.queuedBytes -= value.eventBytes
+                                    state.dispatchPending -= 1
+                                    if (!delivered) {
+                                        state.status = "subscriber_failed"
+                                        state.subscriber = None<ManagedStdioOwnerSubscriber>
+                                        state.subscriberFailed = true
+                                        var index: Int64 = this.dispatchItems.size - 1
+                                        while (index >= 0) {
+                                            let queued = this.dispatchItems[index]
+                                            if (queued.ownerId == value.ownerId && queued.generation == value.generation) {
+                                                this.dispatchItems.remove(at: index)
+                                                this.dispatchBytes -= queued.eventBytes
+                                                state.queuedBytes -= queued.eventBytes
+                                                state.dispatchPending -= 1
+                                            }
+                                            index -= 1
+                                        }
+                                        stopFailedSubscriber = !state.settled
+                                    } else if (this.isTerminalEvent(value.event)) {
+                                        state.subscriber = None<ManagedStdioOwnerSubscriber>
+                                    }
+                                    if (state.settled && state.dispatchPending == 0 && state.events.isEmpty()) { this.owners.remove(value.ownerId) }
+                                    state.condition.notifyAll()
+                                }
+                            case None => ()
+                        }
+                    }
+                    if (stopFailedSubscriber) {
+                        let stop = JsonObject()
+                        stop.put("type", JsonString("owner.stop"))
+                        stop.put("ownerId", JsonString(value.ownerId))
+                        stop.put("reason", JsonString("subscriber_failed"))
+                        let _ = this.writeFrameForGeneration(stop, value.generation)
+                    }
+            }
+        }
+        synchronized(this.lock) {
+            this.dispatcherCount = 0
+            this.condition.notifyAll()
+        }
+    }
+
     public func readOwnerLine(ownerId: String, timeoutMs!: Int64 = 0): Option<ManagedStdioEvent> {
         let deadline = this.nowMs() + max(0, timeoutMs)
         synchronized(this.lock) {
@@ -665,14 +873,20 @@ public class ManagedStdioBrokerClient {
                 match (this.owners.get(ownerId)) {
                     case None => done = true
                     case Some(state) =>
-                        if (!state.events.isEmpty()) {
+                        if (state.subscriber.isSome()) {
+                            result = Some(ManagedStdioEvent("owner.error", ownerId: ownerId, status: "owner_delivery_conflict"))
+                            done = true
+                        } else if (!state.events.isEmpty()) {
+                            state.readModeClaimed = true
                             result = Some(state.events.remove(at: 0))
                             state.queuedBytes -= state.eventBytes.remove(at: 0)
                             if (state.events.isEmpty() && state.settled) { this.owners.remove(ownerId) }
                             done = true
                         } else if (state.settled || timeoutMs <= 0) {
+                            state.readModeClaimed = true
                             done = true
                         } else {
+                            state.readModeClaimed = true
                             let remaining = deadline - this.nowMs()
                             if (remaining <= 0) {
                                 done = true
@@ -686,11 +900,26 @@ public class ManagedStdioBrokerClient {
         }
     }
 
-    public func stopOwner(ownerId: String, timeoutMs!: Int64 = 1000): ManagedStdioOperationResult {
+    public func stopOwner(
+        ownerId: String,
+        timeoutMs!: Int64 = 1000,
+        expectedGeneration!: Option<Int64> = None<Int64>
+    ): ManagedStdioOperationResult {
         let state = synchronized(this.lock) { this.owners.get(ownerId) }
         match (state) {
-            case None => return ManagedStdioOperationResult(true, "already_stopped", generation: this.generation)
-            case Some(_) => ()
+            case None =>
+                match (expectedGeneration) {
+                    case Some(value) =>
+                        if (value != this.generation) { return ManagedStdioOperationResult(false, "stale_generation", generation: this.generation) }
+                    case None => ()
+                }
+                return ManagedStdioOperationResult(true, "already_stopped", generation: this.generation)
+            case Some(value) =>
+                match (expectedGeneration) {
+                    case Some(expected) =>
+                        if (value.generation != expected) { return ManagedStdioOperationResult(false, "stale_generation", generation: value.generation) }
+                    case None => ()
+                }
         }
         let frame = JsonObject()
         frame.put("type", JsonString("owner.stop"))
@@ -715,7 +944,7 @@ public class ManagedStdioBrokerClient {
                     case Some(value) =>
                         if (value.settled) {
                             let acked = value.lastStopRequestId == stopRequestId
-                            this.owners.remove(ownerId)
+                            if (value.subscriber.isNone() && value.dispatchPending == 0 && value.events.isEmpty()) { this.owners.remove(ownerId) }
                             result = ManagedStdioOperationResult(acked, if (acked) { "stopped" } else { "protocol_error" }, generation: value.generation)
                             done = true
                             continue
@@ -816,6 +1045,26 @@ public class ManagedStdioBrokerClient {
         }
     }
 
+    // Caller holds lock.
+    private func routeOwnerEventLocked(state: ManagedStdioOwnerState, event: ManagedStdioEvent, eventBytes: Int64): Bool {
+        if (state.subscriberFailed) { return true }
+        if (state.events.size + state.dispatchPending >= this.ownerQueueLimit || state.queuedBytes + eventBytes > state.maxBufferedBytes) {
+            state.status = "buffer_capacity_exceeded"
+            return false
+        }
+        state.queuedBytes += eventBytes
+        if (state.subscriber.isSome()) {
+            if (!this.enqueueDispatchLocked(state, event, eventBytes)) {
+                state.queuedBytes -= eventBytes
+                return false
+            }
+        } else {
+            state.events.add(event)
+            state.eventBytes.add(eventBytes)
+        }
+        true
+    }
+
     private func handleBrokerFrame(raw: String, readerGeneration: Int64): Unit {
         let obj = try { JsonValue.fromStr(raw).asObject() } catch (_: Exception) {
             this.handleBrokerExit(readerGeneration, "malformed_json")
@@ -867,40 +1116,35 @@ public class ManagedStdioBrokerClient {
                     } else if (frameType == "owner.stdout" || frameType == "owner.stderr") {
                         let text = managedStdioJsonString(obj, "text")
                         let textBytes = text.toArray().size
-                        if (state.events.size >= this.ownerQueueLimit || state.queuedBytes + textBytes > state.maxBufferedBytes) {
-                            state.status = "buffer_capacity_exceeded"
+                        if (!this.routeOwnerEventLocked(state, ManagedStdioEvent(
+                            frameType,
+                            ownerId: ownerId,
+                            text: text,
+                            sequence: managedStdioJsonInt(obj, "seq", 0),
+                            finalChunk: managedStdioJsonBool(obj, "final")
+                        ), textBytes)) {
                             stopForCapacity = true
-                        } else {
-                            state.events.add(ManagedStdioEvent(
-                                frameType,
-                                ownerId: ownerId,
-                                text: text,
-                                sequence: managedStdioJsonInt(obj, "seq", 0),
-                                finalChunk: managedStdioJsonBool(obj, "final")
-                            ))
-                            state.eventBytes.add(textBytes)
-                            state.queuedBytes += textBytes
                         }
                         state.condition.notifyAll()
                     } else if (frameType == "owner.error" || frameType == "owner.timeout") {
                         state.status = managedStdioJsonString(obj, "status")
-                        while (state.events.size >= this.ownerQueueLimit) {
+                        while (state.events.size + state.dispatchPending >= this.ownerQueueLimit && !state.events.isEmpty()) {
                             state.events.remove(at: 0)
                             state.queuedBytes -= state.eventBytes.remove(at: 0)
                         }
-                        state.events.add(ManagedStdioEvent(frameType, ownerId: ownerId, status: state.status))
-                        state.eventBytes.add(0)
+                        let _ = this.routeOwnerEventLocked(state, ManagedStdioEvent(frameType, ownerId: ownerId, status: state.status), 0)
                         state.settled = true
+                        if (state.subscriberFailed && state.dispatchPending == 0) { this.owners.remove(ownerId) }
                         state.condition.notifyAll()
                     } else if (frameType == "owner.exit") {
                         state.status = "exited"
-                        while (state.events.size >= this.ownerQueueLimit) {
+                        while (state.events.size + state.dispatchPending >= this.ownerQueueLimit && !state.events.isEmpty()) {
                             state.events.remove(at: 0)
                             state.queuedBytes -= state.eventBytes.remove(at: 0)
                         }
-                        state.events.add(ManagedStdioEvent(frameType, ownerId: ownerId, exitCode: managedStdioJsonInt(obj, "exitCode", -1)))
-                        state.eventBytes.add(0)
+                        let _ = this.routeOwnerEventLocked(state, ManagedStdioEvent(frameType, ownerId: ownerId, exitCode: managedStdioJsonInt(obj, "exitCode", -1)), 0)
                         state.settled = true
+                        if (state.subscriberFailed && state.dispatchPending == 0) { this.owners.remove(ownerId) }
                         state.condition.notifyAll()
                     }
             }
@@ -931,8 +1175,7 @@ public class ManagedStdioBrokerClient {
                 if (state.generation == readerGeneration && !state.settled) {
                     if (state.pid > 0) { reap.add((state.pid, state.pgid)) }
                     state.status = reason
-                    state.events.add(ManagedStdioEvent("owner.error", ownerId: state.ownerId, status: reason))
-                    state.eventBytes.add(0)
+                    let _ = this.routeOwnerEventLocked(state, ManagedStdioEvent("owner.error", ownerId: state.ownerId, status: reason), 0)
                     state.settled = true
                     state.condition.notifyAll()
                 }
@@ -971,7 +1214,9 @@ public class ManagedStdioBrokerClient {
 
     public func close(timeoutMs!: Int64 = 2000): ManagedStdioOperationResult {
         let snapshot = this.snapshot()
-        let fullyStopped = synchronized(this.lock) { this.process.isNone() && this.readerFuture.isNone() && this.readerCount == 0 }
+        let fullyStopped = synchronized(this.lock) {
+            this.process.isNone() && this.readerFuture.isNone() && this.readerCount == 0 && this.dispatchFuture.isNone()
+        }
         if (fullyStopped) {
             return ManagedStdioOperationResult(true, "already_stopped", generation: snapshot.generation)
         }
@@ -995,7 +1240,16 @@ public class ManagedStdioBrokerClient {
             case Some(future) => try { future.get(Duration.millisecond * max(1, timeoutMs)); true } catch (_: Exception) { false }
             case None => synchronized(this.lock) { this.readerCount == 0 }
         }
-        if (readerJoined) {
+        let dispatcher = synchronized(this.lock) {
+            this.dispatchClosing = true
+            this.condition.notifyAll()
+            this.dispatchFuture
+        }
+        let dispatcherJoined = match (dispatcher) {
+            case Some(future) => try { future.get(Duration.millisecond * max(1, timeoutMs)); true } catch (_: Exception) { false }
+            case None => true
+        }
+        if (readerJoined && dispatcherJoined) {
             synchronized(this.lock) {
                 this.process = None<SubProcess>
                 this.writer = None<StringWriter<OutputStream>>
@@ -1003,6 +1257,11 @@ public class ManagedStdioBrokerClient {
                 this.helloReceived = false
                 this.brokerPid = 0
                 this.readerCount = 0
+                this.dispatchFuture = None<Future<Unit>>
+                this.dispatchItems.clear()
+                this.dispatchBytes = 0
+                this.dispatcherCount = 0
+                this.dispatchClosing = false
                 this.status = "stopped"
                 this.owners.clear()
                 this.closing = false
@@ -1013,7 +1272,8 @@ public class ManagedStdioBrokerClient {
                 this.closing = false
             }
         }
-        ManagedStdioOperationResult(readerJoined, if (readerJoined) { "stopped" } else { "broker_shutdown_timeout" }, generation: snapshot.generation)
+        let joined = readerJoined && dispatcherJoined
+        ManagedStdioOperationResult(joined, if (joined) { "stopped" } else { "broker_shutdown_timeout" }, generation: snapshot.generation)
     }
 
     public func debugKillBrokerForTest(): Unit {
@@ -1038,7 +1298,8 @@ public class ManagedStdioBrokerClient {
                 this.generation,
                 this.brokerPid,
                 this.activeOwnerCountLocked(),
-                this.readerCount
+                this.readerCount,
+                dispatcherCount: this.dispatcherCount
             )
         }
     }
@@ -1066,6 +1327,20 @@ public func shutdownManagedStdioBroker(timeoutMs!: Int64 = 2000): ManagedStdioOp
     match (client) {
         case Some(value) => value.close(timeoutMs: timeoutMs)
         case None => ManagedStdioOperationResult(true, "already_stopped")
+    }
+}
+
+// Test-only singleton reset. Holding the singleton lock through close prevents
+// concurrent callers from observing or creating a replacement before teardown.
+public func resetManagedStdioBrokerForTest(timeoutMs!: Int64 = 2000): ManagedStdioOperationResult {
+    synchronized(managedStdioSingletonLock) {
+        match (managedStdioSingleton) {
+            case Some(value) =>
+                let result = value.close(timeoutMs: timeoutMs)
+                if (result.ok) { managedStdioSingleton = None<ManagedStdioBrokerClient> }
+                result
+            case None => ManagedStdioOperationResult(true, "already_stopped")
+        }
     }
 }
 

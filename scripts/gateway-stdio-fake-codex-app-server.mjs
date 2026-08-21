@@ -11,6 +11,8 @@ const label = process.env.METIS_CODEX_FAKE_LABEL ?? "fake";
 let runtimeLabel = label;
 const pidFile = process.env.METIS_CODEX_FAKE_PID_FILE;
 const childPidFile = process.env.METIS_CODEX_FAKE_CHILD_PID_FILE;
+const threadLogFile = process.env.METIS_CODEX_FAKE_THREAD_LOG;
+const includeThreadInAnswer = process.env.METIS_CODEX_FAKE_INCLUDE_THREAD_IN_ANSWER === "1";
 
 if (pidFile) await import("node:fs/promises").then(({ writeFile }) => writeFile(pidFile, `${process.pid}\n`));
 
@@ -43,7 +45,7 @@ if (mode === "hang-tree") {
     setTimeout(() => process.stdout.write(bytes.subarray(splitAt), afterWrite), 2);
   };
 
-  createInterface({ input: process.stdin, crlfDelay: Infinity }).on("line", (line) => {
+  createInterface({ input: process.stdin, crlfDelay: Infinity }).on("line", async (line) => {
     let request;
     try { request = JSON.parse(line); }
     catch { process.stderr.write("malformed_json\n"); return; }
@@ -52,6 +54,11 @@ if (mode === "hang-tree") {
     if (mode === "no-response") return;
     if (request.method === "initialize") {
       process.stderr.write(`diagnostic ${label} 中文🙂 access_token=secret-codex-token path=/Users/fake/private error(/private/tmp/fake) json={cwd:C:\\Users\\fake\\repo}\n`);
+      if (mode === "stderr-burst") {
+        for (let index = 0; index < 64; index += 1) {
+          process.stderr.write(`burst-${index}-中文🙂 token=secret-codex-token path=/Users/fake/private\n`);
+        }
+      }
       send({ id: 9000, method: "permissions/request", params: {} });
       const respond = () => send({ id: request.id, result: { label, text: "中文🙂" } });
       sendChunked({ method: "fake/notification", params: { label, text: "中文🙂" } }, () => {
@@ -65,6 +72,9 @@ if (mode === "hang-tree") {
     }
     if (request.method === "thread/start") {
       runtimeLabel = basename(request.params?.cwd ?? "") || label;
+      if (threadLogFile) {
+        await import("node:fs/promises").then(({ appendFile }) => appendFile(threadLogFile, `thread-${runtimeLabel}\n`));
+      }
       send({ id: request.id, result: { thread: { id: `thread-${runtimeLabel}` } } });
       return;
     }
@@ -73,7 +83,10 @@ if (mode === "hang-tree") {
       send({ method: "thread/tokenUsage/updated", params: { tokenUsage: { last: {
         inputTokens: 12, cachedInputTokens: 3, outputTokens: 7, reasoningTokens: 2, totalTokens: 19,
       } } } });
-      send({ method: "item/completed", params: { item: { type: "agentMessage", text: `answer-${runtimeLabel}-中文🙂` } } });
+      const answer = includeThreadInAnswer
+        ? `answer-${runtimeLabel}-中文🙂 thread=thread-${runtimeLabel}`
+        : `answer-${runtimeLabel}-中文🙂`;
+      send({ method: "item/completed", params: { item: { type: "agentMessage", text: answer } } });
       send({ method: "turn/completed", params: {} });
       return;
     }
