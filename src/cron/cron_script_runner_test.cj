@@ -1,6 +1,13 @@
 package metis.cron
 
-import std.fs.{Directory, File, Path, exists, remove}
+import metis.process.{managedStdioBroker, resetManagedStdioBrokerForTest}
+import metis.utils.ShellUtils
+
+import std.collection.ArrayList
+import std.convert.Parsable
+import std.core.Duration
+import std.fs.{Directory, File, Path, canonicalize, exists, remove}
+import std.sync.AtomicBool
 import std.time.DateTime
 import std.unittest.testmacro.*
 
@@ -33,6 +40,59 @@ private func cronScriptRunnerRepeated(text: String, count: Int64): String {
         i += 1
     }
     out.toString()
+}
+
+private func cronScriptRunnerFixturePath(): String {
+    let path = Path("scripts").join("gateway-stdio-fake-cron-child.mjs")
+    try { canonicalize(path).toString() } catch (_: Exception) { path.toString() }
+}
+
+private func cronScriptRunnerWriteFixture(root: Path, name: String, mode: String, args!: Array<String> = []): Unit {
+    let renderedArgs = if (args.isEmpty()) { "" } else { " " + String.join(args, delimiter: " ") }
+    File.writeTo(
+        cronScriptsDir(root).join(name),
+        "exec node '${cronScriptRunnerFixturePath()}' '${mode}'${renderedArgs}\n".toArray()
+    )
+}
+
+private func cronScriptRunnerWaitUntil(predicate: () -> Bool, timeoutMs!: Int64 = 3000): Bool {
+    let deadline = DateTime.now().toUnixTimeStamp().toMilliseconds() + timeoutMs
+    while (!predicate() && DateTime.now().toUnixTimeStamp().toMilliseconds() < deadline) {
+        sleep(Duration.millisecond * 5)
+    }
+    predicate()
+}
+
+private func cronScriptRunnerPidValues(path: Path): Array<Int64> {
+    let values = ArrayList<Int64>()
+    let raw = try { String.fromUtf8(File.readFrom(path)) } catch (_: Exception) { return values.toArray() }
+    for (line in raw.split("\n")) {
+        for (part in line.split(",")) {
+            let pieces = part.split("=", 2)
+            if (pieces.size == 2 && (pieces[0] == "root" || pieces[0] == "child")) {
+                try { values.add(Int64.parse(pieces[1].trimAscii())) } catch (_: Exception) { () }
+            }
+        }
+    }
+    values.toArray()
+}
+
+private func cronScriptRunnerPidGone(pid: Int64): Bool {
+    if (pid <= 0) { return false }
+    let probe = ShellUtils.execute(["/bin/sh", "-c", "kill -0 ${pid} >/dev/null 2>&1"], withWrap: false, logFailures: false)
+    probe[0] != 0
+}
+
+private func cronScriptRunnerPgid(pid: Int64): Int64 {
+    if (pid <= 0) { return 0 }
+    let probe = ShellUtils.execute(["ps", "-o", "pgid=", "-p", "${pid}"], withWrap: false, logFailures: false)
+    try { Int64.parse(probe[1].trimAscii()) } catch (_: Exception) { 0 }
+}
+
+private func cronScriptRunnerPgidGone(pgid: Int64): Bool {
+    if (pgid <= 0) { return false }
+    let probe = ShellUtils.execute(["/bin/sh", "-c", "kill -0 -- -${pgid} >/dev/null 2>&1"], withWrap: false, logFailures: false)
+    probe[0] != 0
 }
 
 @Test
@@ -136,6 +196,255 @@ public class CronScriptRunnerTest {
             @Expect(result.ok, false)
             @Expect(result.errorCode, "cron_script_cancelled")
             @Expect(exists(marker), false)
+        })
+    }
+
+    @TestCase
+    public func p3U4BrokerPreservesSuccessNonzeroUnicodeDualStreamAndEncodingContracts(): Unit {
+        withCronScriptRunnerTestRoot({ root =>
+            cronScriptRunnerWriteFixture(root, "success.sh", "success")
+            let success = runCronJobScriptForJob(root, cronScriptRunnerJob("success.sh"))
+            @Expect(success.ok, true)
+            @Expect(success.output, "cron-stdout-中文🙂")
+            @Expect(success.stderr, "cron-stderr-中文🙂")
+            @Expect(success.exitCode, 0)
+            @Expect(success.status, "ok")
+            @Expect(success.errorCode, "")
+            @Expect(success.timedOut, false)
+            @Expect(success.empty, false)
+            @Expect(success.message, "")
+
+            cronScriptRunnerWriteFixture(root, "nonzero.sh", "nonzero", args: ["7"])
+            let failed = runCronJobScriptForJob(root, cronScriptRunnerJob("nonzero.sh"))
+            @Expect(failed.ok, false)
+            @Expect(failed.status, "exit_nonzero")
+            @Expect(failed.errorCode, "cron_script_exit_nonzero")
+            @Expect(failed.exitCode, 7)
+            @Expect(failed.stderr.contains("cron-failure-中文🙂"), true)
+            @Expect(failed.output, "")
+            @Expect(failed.timedOut, false)
+            @Expect(failed.empty, true)
+            @Expect(failed.message.contains("cron-failure-中文🙂"), true)
+
+            cronScriptRunnerWriteFixture(root, "burst.sh", "dual-burst", args: ["64"])
+            let burst = runCronJobScriptForJob(root, cronScriptRunnerJob("burst.sh"))
+            @Expect(burst.ok, true)
+            @Expect(burst.output.contains("out-0-中文🙂"), true)
+            @Expect(burst.output.contains("out-63-中文🙂"), true)
+            @Expect(burst.stderr.contains("err-0-中文🙂"), true)
+            @Expect(burst.stderr.contains("err-63-中文🙂"), true)
+            @Expect(burst.status, "ok")
+            @Expect(burst.errorCode, "")
+            @Expect(burst.exitCode, 0)
+            @Expect(burst.timedOut, false)
+            @Expect(burst.empty, false)
+            @Expect(burst.message, "")
+
+            cronScriptRunnerWriteFixture(root, "invalid.sh", "invalid-utf8")
+            let invalid = runCronJobScriptForJob(root, cronScriptRunnerJob("invalid.sh"))
+            @Expect(invalid.ok, false)
+            @Expect(invalid.status, "invalid_response_encoding")
+            @Expect(invalid.errorCode, "invalid_response_encoding")
+            @Expect(invalid.message.contains("invalid utf8"), true)
+            @Expect(invalid.output, "")
+            @Expect(invalid.stderr, "")
+            @Expect(invalid.exitCode, 0)
+            @Expect(invalid.timedOut, false)
+            @Expect(invalid.empty, true)
+
+            cronScriptRunnerWriteFixture(root, "sensitive.sh", "sensitive")
+            let sensitive = runCronJobScriptForJob(root, cronScriptRunnerJob("sensitive.sh"))
+            @Expect(sensitive.ok, true)
+            @Expect(sensitive.status, "ok")
+            @Expect(sensitive.errorCode, "")
+            @Expect(sensitive.output.contains("cron-secret-value"), false)
+            @Expect(sensitive.output.contains("private-cron-user"), false)
+            @Expect(sensitive.output.contains("中文🙂"), true)
+            @Expect(sensitive.stderr.contains("cron-secret-authorization-value"), false)
+            @Expect(sensitive.exitCode, 0)
+            @Expect(sensitive.timedOut, false)
+            @Expect(sensitive.empty, false)
+            @Expect(sensitive.message, "")
+            @Expect(managedStdioBroker().snapshot().ownerCount, 0)
+        })
+    }
+
+    @TestCase
+    public func p3B4BrokerEnforcesExactCapacityAndRunsThirtyTwoCronOwners(): Unit {
+        withCronScriptRunnerTestRoot({ root =>
+            let limit = cronScriptOutputMaxBytesForTest()
+            cronScriptRunnerWriteFixture(root, "exact.sh", "bytes", args: ["${limit}"])
+            cronScriptRunnerWriteFixture(root, "overflow.sh", "bytes", args: ["${limit + 1}"])
+            let exact = runCronJobScriptForJob(root, cronScriptRunnerJob("exact.sh"))
+            @Expect(exact.ok, true)
+            @Expect(exact.status, "ok")
+            @Expect(exact.errorCode, "")
+            @Expect(exact.output.endsWith("..."), true)
+            @Expect(exact.stderr, "")
+            @Expect(exact.exitCode, 0)
+            @Expect(exact.timedOut, false)
+            @Expect(exact.empty, false)
+            @Expect(exact.message, "")
+            let overflow = runCronJobScriptForJob(root, cronScriptRunnerJob("overflow.sh"))
+            @Expect(overflow.ok, false)
+            @Expect(overflow.status, "output_limit")
+            @Expect(overflow.errorCode, "cron_script_output_too_large")
+            @Expect(overflow.output.endsWith("..."), true)
+            @Expect(overflow.stderr, "")
+            @Expect(overflow.exitCode, 0)
+            @Expect(overflow.timedOut, false)
+            @Expect(overflow.empty, false)
+            @Expect(overflow.message.contains("output_too_large"), true)
+
+            let futures = ArrayList<Future<CronScriptRunResult>>()
+            try {
+                for (index in 0..32) {
+                    let tag = "tag-${index}-end"
+                    File.writeTo(
+                        cronScriptsDir(root).join("parallel-${index}.sh"),
+                        "exec node '${cronScriptRunnerFixturePath()}' 'dual-burst' 8 '${tag}'\n".toArray()
+                    )
+                }
+                for (index in 0..32) {
+                    futures.add(spawn {
+                        runCronJobScriptForJob(root, cronScriptRunnerJob("parallel-${index}.sh"))
+                    })
+                }
+                var passed: Int64 = 0
+                var index: Int64 = 0
+                for (future in futures) {
+                    let result = future.get(Duration.second * 10)
+                    let ownTag = "tag-${index}-end"
+                    let neighbourTag = "tag-${(index + 1) % 32}-end"
+                    @Expect(result.ok, true)
+                    @Expect(result.status, "ok")
+                    @Expect(result.errorCode, "")
+                    @Expect(result.output.contains("${ownTag}-out-0-中文🙂"), true)
+                    @Expect(result.output.contains("${ownTag}-out-7-中文🙂"), true)
+                    @Expect(result.stderr.contains("${ownTag}-err-0-中文🙂"), true)
+                    @Expect(result.stderr.contains("${ownTag}-err-7-中文🙂"), true)
+                    @Expect(result.output.contains(neighbourTag), false)
+                    @Expect(result.stderr.contains(neighbourTag), false)
+                    @Expect(result.exitCode, 0)
+                    @Expect(result.timedOut, false)
+                    @Expect(result.empty, false)
+                    @Expect(result.message, "")
+                    passed += 1
+                    index += 1
+                }
+                @Expect(passed, 32)
+                @Expect(managedStdioBroker().snapshot().readerCount, 1)
+                @Expect(managedStdioBroker().snapshot().ownerCount, 0)
+            } finally {
+                for (future in futures) { try { let _ = future.get(Duration.second * 10) } catch (_: Exception) { () } }
+                if (managedStdioBroker().snapshot().ownerCount != 0) { let _ = resetManagedStdioBrokerForTest(timeoutMs: 3000) }
+            }
+        })
+    }
+
+    @TestCase
+    public func p3N4TimeoutCancelInheritedPipesAndBrokerGenerationAreBounded(): Unit {
+        withCronScriptRunnerTestRoot({ root =>
+            var timedFuture = None<Future<CronScriptRunResult>>
+            var cancelFuture = None<Future<CronScriptRunResult>>
+            var killedFuture = None<Future<CronScriptRunResult>>
+            var healthyFuture = None<Future<CronScriptRunResult>>
+            try {
+                let pidFile = cronScriptsDir(root).join("tree.pids")
+                cronScriptRunnerWriteFixture(root, "tree.sh", "hang-tree", args: ["'${pidFile.toString()}'"])
+                timedFuture = Some(spawn {
+                    runCronJobScriptForJob(root, cronScriptRunnerJob("tree.sh"), remainingMs: 500)
+                })
+                @Expect(cronScriptRunnerWaitUntil({ => cronScriptRunnerPidValues(pidFile).size == 2 }), true)
+                let pids = cronScriptRunnerPidValues(pidFile)
+                @Expect(pids.size, 2)
+                let rootPgid = cronScriptRunnerPgid(pids[0])
+                @Expect(rootPgid > 0, true)
+                @Expect(cronScriptRunnerPgid(pids[1]), rootPgid)
+                let timed = timedFuture.getOrThrow().get(Duration.second * 5)
+                @Expect(timed.ok, false)
+                @Expect(timed.status, "timeout")
+                @Expect(timed.errorCode, "cron_script_timeout")
+                @Expect(timed.output, "")
+                @Expect(timed.stderr, "")
+                @Expect(timed.exitCode, 0)
+                @Expect(timed.timedOut, true)
+                @Expect(timed.empty, true)
+                for (pid in pids) { @Expect(cronScriptRunnerWaitUntil({ => cronScriptRunnerPidGone(pid) }), true) }
+                @Expect(cronScriptRunnerWaitUntil({ => cronScriptRunnerPgidGone(rootPgid) }), true)
+                @Expect(managedStdioBroker().snapshot().ownerCount, 0)
+
+                let cancelPidFile = cronScriptsDir(root).join("cancel-tree.pids")
+                cronScriptRunnerWriteFixture(root, "cancel-tree.sh", "hang-tree", args: ["'${cancelPidFile.toString()}'"])
+                let cancel = AtomicBool(false)
+                cancelFuture = Some(spawn {
+                    runCronJobScriptForJob(
+                        root,
+                        cronScriptRunnerJob("cancel-tree.sh"),
+                        remainingMs: 5000,
+                        cancellationCheck: { => if (cancel.load()) { throw Exception("cancelled-中文🙂") } }
+                    )
+                })
+                @Expect(cronScriptRunnerWaitUntil({ => cronScriptRunnerPidValues(cancelPidFile).size == 2 }), true)
+                let cancelPids = cronScriptRunnerPidValues(cancelPidFile)
+                let cancelPgid = cronScriptRunnerPgid(cancelPids[0])
+                cancel.store(true)
+                let cancelled = cancelFuture.getOrThrow().get(Duration.second * 5)
+                @Expect(cancelled.ok, false)
+                @Expect(cancelled.status, "cancelled")
+                @Expect(cancelled.errorCode, "cron_script_cancelled")
+                @Expect(cancelled.output, "")
+                @Expect(cancelled.stderr, "")
+                @Expect(cancelled.exitCode, 0)
+                @Expect(cancelled.timedOut, false)
+                @Expect(cancelled.empty, true)
+                @Expect(cancelled.message.contains("cancelled-中文🙂"), true)
+                for (pid in cancelPids) { @Expect(cronScriptRunnerWaitUntil({ => cronScriptRunnerPidGone(pid) }), true) }
+                @Expect(cronScriptRunnerWaitUntil({ => cronScriptRunnerPgidGone(cancelPgid) }), true)
+                @Expect(managedStdioBroker().snapshot().ownerCount, 0)
+
+                let killPidFile = cronScriptsDir(root).join("broker-kill-tree.pids")
+                let lateMarker = cronScriptsDir(root).join("broker-kill-late-marker")
+                cronScriptRunnerWriteFixture(root, "broker-kill.sh", "hang-tree", args: ["'${killPidFile.toString()}'", "'${lateMarker.toString()}'"])
+                cronScriptRunnerWriteFixture(root, "broker-healthy.sh", "success")
+                let oldGeneration = managedStdioBroker().snapshot().generation
+                killedFuture = Some(spawn {
+                    runCronJobScriptForJob(root, cronScriptRunnerJob("broker-kill.sh"), remainingMs: 5000)
+                })
+                healthyFuture = Some(spawn {
+                    runCronJobScriptForJob(root, cronScriptRunnerJob("broker-healthy.sh"), remainingMs: 5000)
+                })
+                @Expect(cronScriptRunnerWaitUntil({ => cronScriptRunnerPidValues(killPidFile).size == 2 }), true)
+                let healthy = healthyFuture.getOrThrow().get(Duration.second * 5)
+                @Expect(healthy.ok, true)
+                @Expect(healthy.output.contains("cron-stdout-中文🙂"), true)
+                let killPids = cronScriptRunnerPidValues(killPidFile)
+                let killPgid = cronScriptRunnerPgid(killPids[0])
+                managedStdioBroker().debugKillBrokerForTest()
+                let killed = killedFuture.getOrThrow().get(Duration.second * 5)
+                @Expect(killed.ok, false)
+                @Expect(killed.status, "failed")
+                @Expect(killed.errorCode, "cron_script_failed")
+                @Expect(killed.message.contains("broker_exited"), true)
+                @Expect(killed.output, "")
+                @Expect(killed.stderr, "")
+                @Expect(killed.exitCode, 0)
+                @Expect(killed.timedOut, false)
+                @Expect(killed.empty, true)
+                for (pid in killPids) { @Expect(cronScriptRunnerWaitUntil({ => cronScriptRunnerPidGone(pid) }), true) }
+                @Expect(cronScriptRunnerWaitUntil({ => cronScriptRunnerPgidGone(killPgid) }), true)
+                @Expect(exists(lateMarker), false)
+                cronScriptRunnerWriteFixture(root, "recovered.sh", "success")
+                let recovered = runCronJobScriptForJob(root, cronScriptRunnerJob("recovered.sh"))
+                @Expect(recovered.ok, true)
+                @Expect(managedStdioBroker().snapshot().generation > oldGeneration, true)
+                @Expect(managedStdioBroker().snapshot().ownerCount, 0)
+            } finally {
+                for (future in [timedFuture, cancelFuture, killedFuture, healthyFuture]) {
+                    match (future) { case Some(value) => try { let _ = value.get(Duration.second * 5) } catch (_: Exception) { () } case None => () }
+                }
+                let _ = resetManagedStdioBrokerForTest(timeoutMs: 3000)
+            }
         })
     }
 }

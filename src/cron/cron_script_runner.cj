@@ -1,15 +1,18 @@
 package metis.cron
 
-import metis.core.{metisDecodeUtf8Bytes, metisSafeRuneEllipsis}
-import metis.gateway.logging.gatewayLogRedactText
+import metis.core.{metisDecodeUtf8Bytes, metisRedactSensitiveText, metisSafeRuneEllipsis}
+import metis.process.{ManagedStdioOwnerSpec, managedStdioBroker}
 
 import std.fs.{Path, exists}
-import std.io.{InputStream, StringReader}
-import std.process.*
+import std.sync.Mutex
 import std.time.*
 
 private let CRON_SCRIPT_TIMEOUT_MS: Int64 = 30000
 private let CRON_SCRIPT_OUTPUT_MAX_RUNES: Int64 = 16000
+private let CRON_SCRIPT_STDERR_MAX_RUNES: Int64 = 4000
+private let CRON_SCRIPT_OUTPUT_MAX_BYTES: Int64 = 65536
+private let cronScriptOwnerLock = Mutex()
+private var cronScriptOwnerSequence: Int64 = 0
 
 public class CronScriptPathResult {
     public let ok: Bool
@@ -131,25 +134,63 @@ public func cronScriptDecodeBytesForTest(bytes: Array<Byte>): CronScriptReadResu
 }
 
 public func cronScriptSanitizeOutputForTest(text: String, maxRunes!: Int64 = CRON_SCRIPT_OUTPUT_MAX_RUNES): String {
-    let cleaned = gatewayLogRedactText(text).replace("\u{0000}", "").replace("\r", " ")
+    let cleaned = metisRedactSensitiveText(text).replace("\u{0000}", "").replace("\r", " ")
     metisSafeRuneEllipsis(cleaned, maxRunes)
 }
 
-private func cronScriptReadPipe(reader: StringReader<InputStream>, label: String): CronScriptReadResult {
-    try {
-        CronScriptReadResult(true, text: reader.readToEnd())
-    } catch (e: Exception) {
-        let diagnostic = if (e.message.trimAscii().isEmpty()) {
-            "${label}: invalid utf8 byte sequence"
-        } else {
-            "${label}: ${e.message}"
-        }
-        CronScriptReadResult(false, status: "invalid_response_encoding", diagnostic: diagnostic)
+public func cronScriptOutputMaxBytesForTest(): Int64 {
+    CRON_SCRIPT_OUTPUT_MAX_BYTES
+}
+
+private func nextCronScriptOwnerId(): String {
+    synchronized(cronScriptOwnerLock) {
+        cronScriptOwnerSequence += 1
+        "cron-script-${cronScriptOwnerSequence}"
     }
 }
 
 private func cronScriptError(status: String, errorCode: String, message: String): CronScriptRunResult {
-    CronScriptRunResult(false, status: status, errorCode: errorCode, message: message)
+    CronScriptRunResult(
+        false,
+        status: status,
+        errorCode: errorCode,
+        message: cronScriptSanitizeOutputForTest(message, maxRunes: CRON_SCRIPT_STDERR_MAX_RUNES)
+    )
+}
+
+private func cronScriptStopAndDrain(ownerId: String, generation: Int64, timeoutMs: Int64): Unit {
+    let broker = managedStdioBroker()
+    let _ = broker.stopOwner(ownerId, timeoutMs: max(1, timeoutMs), expectedGeneration: Some(generation))
+    while (broker.readOwnerLine(ownerId, timeoutMs: 0).isSome()) { () }
+}
+
+private func cronScriptTerminalError(
+    status: String,
+    output: String,
+    stderr: String
+): CronScriptRunResult {
+    let out = cronScriptSanitizeOutputForTest(output)
+    let err = cronScriptSanitizeOutputForTest(stderr, maxRunes: CRON_SCRIPT_STDERR_MAX_RUNES)
+    if (status == "invalid_response_encoding") {
+        return CronScriptRunResult(
+            false,
+            status: status,
+            errorCode: "invalid_response_encoding",
+            output: out,
+            stderr: err,
+            message: "cron script output contained invalid utf8"
+        )
+    }
+    let capacity = status == "output_too_large" || status == "buffer_capacity_exceeded" ||
+        status == "subscriber_capacity_exceeded" || status == "line_too_large"
+    CronScriptRunResult(
+        false,
+        status: if (capacity) { "output_limit" } else { "failed" },
+        errorCode: if (capacity) { "cron_script_output_too_large" } else { "cron_script_failed" },
+        output: out,
+        stderr: err,
+        message: "cron script process failed: ${cronScriptSanitizeOutputForTest(status, maxRunes: 80)}"
+    )
 }
 
 public func runCronJobScriptForJob(
@@ -188,101 +229,100 @@ public func runCronJobScriptForJob(
         return cronScriptError("not_found", "cron_script_not_found", "cron script file does not exist")
     }
 
+    let effectiveTimeoutMs = min(CRON_SCRIPT_TIMEOUT_MS, remainingMs)
+    let deadlineMs = DateTime.now().toUnixTimeStamp().toMilliseconds() + effectiveTimeoutMs
+    let ownerId = nextCronScriptOwnerId()
+    let broker = managedStdioBroker()
+    let started = broker.startOwner(ManagedStdioOwnerSpec(
+        ownerId,
+        "/bin/bash",
+        args: [scriptPath.toString()],
+        workingDirectory: Some(cronScriptsDir(dotDir).toString()),
+        stdinMode: "closed",
+        outputMode: "stream",
+        deadlineMs: effectiveTimeoutMs,
+        maxLineBytes: CRON_SCRIPT_OUTPUT_MAX_BYTES,
+        maxBufferedBytes: CRON_SCRIPT_OUTPUT_MAX_BYTES,
+        maxTotalOutputBytes: CRON_SCRIPT_OUTPUT_MAX_BYTES
+    ), timeoutMs: min(3000, effectiveTimeoutMs))
+    if (!started.ok) {
+        if (started.status == "start_timeout" || DateTime.now().toUnixTimeStamp().toMilliseconds() >= deadlineMs) {
+            return CronScriptRunResult(
+                false,
+                status: "timeout",
+                errorCode: "cron_script_timeout",
+                timedOut: true,
+                message: "cron script timed out after ${effectiveTimeoutMs}ms"
+            )
+        }
+        return cronScriptError("failed", "cron_script_failed", "cron script process failed: ${started.status}")
+    }
+    let stdout = StringBuilder()
+    let stderr = StringBuilder()
     try {
-        let process = launch(
-            "/bin/bash",
-            [scriptPath.toString()],
-            stdOut: ProcessRedirect.Pipe,
-            stdErr: ProcessRedirect.Pipe,
-            workingDirectory: Some(cronScriptsDir(dotDir))
-        )
-        let stdoutFuture = spawn {
-            cronScriptReadPipe(StringReader<InputStream>(process.stdOutPipe), "stdout")
-        }
-        let stderrFuture = spawn {
-            cronScriptReadPipe(StringReader<InputStream>(process.stdErrPipe), "stderr")
-        }
-        let effectiveTimeoutMs = min(CRON_SCRIPT_TIMEOUT_MS, remainingMs)
-        let beganAtMs = DateTime.now().toUnixTimeStamp().toMilliseconds()
-        var exitCode: Int64 = 0
-        var exited = false
-        while (!exited) {
+        var completed = None<CronScriptRunResult>
+        while (completed.isNone()) {
             try {
-                exitCode = process.wait(timeout: Duration.millisecond * min(25, effectiveTimeoutMs))
-                exited = true
-            } catch (_: TimeoutException) {
-                try {
-                    cancellationCheck()
-                } catch (cancelled: Exception) {
-                    try { process.terminate(force: true) } catch (_: Exception) { () }
-                    try { let _ = process.wait(timeout: Duration.second) } catch (_: Exception) { () }
-                    try { stdoutFuture.get() } catch (_: Exception) { () }
-                    try { stderrFuture.get() } catch (_: Exception) { () }
-                    return CronScriptRunResult(
-                        false,
-                        status: "cancelled",
-                        errorCode: "cron_script_cancelled",
-                        message: cancelled.message
-                    )
-                }
-                if (DateTime.now().toUnixTimeStamp().toMilliseconds() - beganAtMs >= effectiveTimeoutMs) {
-                    try { process.terminate(force: true) } catch (_: Exception) { () }
-                    try { let _ = process.wait(timeout: Duration.second) } catch (_: Exception) { () }
-                    try { stdoutFuture.get() } catch (_: Exception) { () }
-                    try { stderrFuture.get() } catch (_: Exception) { () }
-                    return CronScriptRunResult(
-                        false,
-                        status: "timeout",
-                        errorCode: "cron_script_timeout",
-                        timedOut: true,
-                        message: "cron script timed out after ${effectiveTimeoutMs}ms"
-                    )
-                }
+                cancellationCheck()
+            } catch (cancelled: Exception) {
+                cronScriptStopAndDrain(ownerId, started.generation, 1000)
+                completed = Some(cronScriptError("cancelled", "cron_script_cancelled", cancelled.message))
+                continue
+            }
+            let remaining = deadlineMs - DateTime.now().toUnixTimeStamp().toMilliseconds()
+            if (remaining <= 0) {
+                cronScriptStopAndDrain(ownerId, started.generation, 1000)
+                completed = Some(CronScriptRunResult(
+                    false,
+                    status: "timeout",
+                    errorCode: "cron_script_timeout",
+                    timedOut: true,
+                    message: "cron script timed out after ${effectiveTimeoutMs}ms"
+                ))
+                continue
+            }
+            match (broker.readOwnerLine(ownerId, timeoutMs: min(25, remaining))) {
+                case Some(event) =>
+                    if (event.eventType == "owner.stdout") {
+                        stdout.append(event.text)
+                    } else if (event.eventType == "owner.stderr") {
+                        stderr.append(event.text)
+                    } else if (event.eventType == "owner.timeout") {
+                        completed = Some(CronScriptRunResult(
+                            false,
+                            status: "timeout",
+                            errorCode: "cron_script_timeout",
+                            output: cronScriptSanitizeOutputForTest(stdout.toString()),
+                            stderr: cronScriptSanitizeOutputForTest(stderr.toString(), maxRunes: CRON_SCRIPT_STDERR_MAX_RUNES),
+                            timedOut: true,
+                            message: "cron script timed out after ${effectiveTimeoutMs}ms"
+                        ))
+                    } else if (event.eventType == "owner.error") {
+                        completed = Some(cronScriptTerminalError(event.status, stdout.toString(), stderr.toString()))
+                    } else if (event.eventType == "owner.exit") {
+                        let out = cronScriptSanitizeOutputForTest(stdout.toString())
+                        let err = cronScriptSanitizeOutputForTest(stderr.toString(), maxRunes: CRON_SCRIPT_STDERR_MAX_RUNES)
+                        if (event.exitCode != 0) {
+                            completed = Some(CronScriptRunResult(
+                                false,
+                                status: "exit_nonzero",
+                                errorCode: "cron_script_exit_nonzero",
+                                output: out,
+                                stderr: err,
+                                exitCode: event.exitCode,
+                                message: if (err.trimAscii().isEmpty()) { "cron script exited with code ${event.exitCode}" } else { err }
+                            ))
+                        } else {
+                            completed = Some(CronScriptRunResult(true, output: out, stderr: err, exitCode: event.exitCode))
+                        }
+                    }
+                case None => ()
             }
         }
-        try {
-            cancellationCheck()
-        } catch (e: Exception) {
-            return cronScriptError("cancelled", "cron_script_cancelled", e.message)
-        }
-        let stdout = try { stdoutFuture.get() } catch (e: Exception) {
-            CronScriptReadResult(false, status: "invalid_response_encoding", diagnostic: e.message)
-        }
-        let stderr = try { stderrFuture.get() } catch (e: Exception) {
-            CronScriptReadResult(false, status: "invalid_response_encoding", diagnostic: e.message)
-        }
-        if (!stdout.ok) {
-            return CronScriptRunResult(
-                false,
-                status: stdout.status,
-                errorCode: "invalid_response_encoding",
-                message: stdout.diagnostic
-            )
-        }
-        if (!stderr.ok) {
-            return CronScriptRunResult(
-                false,
-                status: stderr.status,
-                errorCode: "invalid_response_encoding",
-                output: cronScriptSanitizeOutputForTest(stdout.text),
-                message: stderr.diagnostic
-            )
-        }
-        let out = cronScriptSanitizeOutputForTest(stdout.text)
-        let err = cronScriptSanitizeOutputForTest(stderr.text, maxRunes: 4000)
-        if (exitCode != 0) {
-            return CronScriptRunResult(
-                false,
-                status: "exit_nonzero",
-                errorCode: "cron_script_exit_nonzero",
-                output: out,
-                stderr: err,
-                exitCode: exitCode,
-                message: if (err.trimAscii().isEmpty()) { "cron script exited with code ${exitCode}" } else { err }
-            )
-        }
-        CronScriptRunResult(true, output: out, stderr: err, exitCode: exitCode)
+        completed.getOrThrow()
     } catch (e: Exception) {
         cronScriptError("failed", "cron_script_failed", e.message)
+    } finally {
+        cronScriptStopAndDrain(ownerId, started.generation, 1000)
     }
 }
