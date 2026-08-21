@@ -15,6 +15,7 @@ private class FeishuSidecarFakeProcess <: FeishuSidecarProtocolProcess {
     public var waitResult: Option<Int64> = Some(0)
     public var waitCalls: Int64 = 0
     public var terminateCalls: Int64 = 0
+    public var readCalls: Int64 = 0
     private let processPid: Int64
 
     public init(pid!: Int64 = 9010, stdout!: Array<String> = []) {
@@ -36,6 +37,7 @@ private class FeishuSidecarFakeProcess <: FeishuSidecarProtocolProcess {
 
     public func readLine(_timeoutMs: Int64): Option<String> {
         synchronized(this.lock) {
+            this.readCalls += 1
             if (this.stdoutLines.isEmpty()) {
                 return None<String>
             }
@@ -86,6 +88,10 @@ private class FeishuSidecarFakeProcess <: FeishuSidecarProtocolProcess {
             this.alive = false
         }
     }
+
+    public func modelsBlockingPipeReader(): Bool {
+        false
+    }
 }
 
 private class FeishuSidecarFakeRunner <: FeishuSidecarProtocolRunner {
@@ -105,6 +111,10 @@ private class FeishuSidecarFakeRunner <: FeishuSidecarProtocolRunner {
             return FeishuSidecarProtocolStartResult.Failed(this.failWith)
         }
         FeishuSidecarProtocolStartResult.Started(this.process)
+    }
+
+    public func modelsBlockingPipeReader(): Bool {
+        this.process.modelsBlockingPipeReader()
     }
 }
 
@@ -175,6 +185,16 @@ public class FeishuSidecarTransportTest {
         @Expect(buffer.readLine(30000).getOrThrow(), "queued-line")
         @Expect(buffer.readLine(1).isNone(), true)
         @Expect(buffer.droppedCount(), 0)
+    }
+
+    @TestCase
+    public func blockingReaderShapeIsNotAcceptedAsLivenessProof(): Unit {
+        let process = FeishuSidecarFakeProcess(stdout: [])
+        let runner = FeishuSidecarFakeRunner(process)
+
+        @Expect(process.readLine(30000).isNone(), true)
+        @Expect(process.readCalls, 1)
+        @Expect(runner.modelsBlockingPipeReader(), false)
     }
 
     @TestCase
