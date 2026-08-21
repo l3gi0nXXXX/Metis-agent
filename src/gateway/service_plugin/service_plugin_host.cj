@@ -3,6 +3,8 @@ package metis.gateway.service_plugin
 import metis.core.metisSafeUtf8Prefix
 import metis.core.config.{CliConfig, MetisProcessEnvironmentLock}
 import metis.gateway.logging.{MetisLogEvent, metisCreateSubsystemLogger}
+import metis.gateway.process.gatewayStdioBroker
+import metis.process.{ManagedStdioBrokerClient, ManagedStdioEvent, ManagedStdioOwnerSpec}
 import std.collection.{ArrayList, HashMap, HashSet}
 import std.convert.Parsable
 import std.fs.{Directory, File, Path, exists, remove}
@@ -698,28 +700,117 @@ private class ServicePluginLineBuffer {
     }
 }
 
+private class ServicePluginBrokerProcessState {
+    private let lock = Mutex()
+    private let condition: Condition
+    private var alive = true
+    private var stopping = false
+    private var activeReaders: Int64 = 0
+    private var terminalStatus = ""
+
+    public init() {
+        synchronized(this.lock) { this.condition = this.lock.condition() }
+    }
+
+    public func isAlive(): Bool { synchronized(this.lock) { this.alive && !this.stopping } }
+
+    public func beginRead(): Bool {
+        synchronized(this.lock) {
+            if (this.stopping) { return false }
+            this.activeReaders++
+            true
+        }
+    }
+
+    public func endRead(): Unit {
+        synchronized(this.lock) {
+            this.activeReaders = max(0, this.activeReaders - 1)
+            this.condition.notifyAll()
+        }
+    }
+
+    public func shouldStop(): Bool { synchronized(this.lock) { this.stopping } }
+
+    public func cacheTerminal(status: String): Unit {
+        synchronized(this.lock) {
+            this.alive = false
+            if (this.terminalStatus.isEmpty()) { this.terminalStatus = status.trimAscii() }
+            this.condition.notifyAll()
+        }
+    }
+
+    public func terminal(): String { synchronized(this.lock) { this.terminalStatus } }
+
+    public func stopReaders(timeoutMs: Int64): Unit {
+        synchronized(this.lock) {
+            this.stopping = true
+            this.alive = false
+            if (this.activeReaders > 0) {
+                let _ = this.condition.waitUntil(
+                    { => this.activeReaders == 0 },
+                    timeout: Duration.millisecond * max(1, timeoutMs)
+                )
+            }
+        }
+    }
+}
+
+private class ServicePluginBrokerProcessHandle {
+    public let pid: Int64
+    private let state: ServicePluginBrokerProcessState
+
+    public init(pid: Int64, state: ServicePluginBrokerProcessState) {
+        this.pid = pid
+        this.state = state
+    }
+
+    public func isAlive(): Bool { this.state.isAlive() }
+}
+
 private class ServicePluginStdioProcess {
-    public let process: SubProcess
-    private let writer: StringWriter<OutputStream>
+    public let process: ServicePluginBrokerProcessHandle
+    public let generation: Int64
+    public let ownerId: String
+    private let broker: ManagedStdioBrokerClient
+    private let state = ServicePluginBrokerProcessState()
     private let stdoutBuffer = ServicePluginLineBuffer()
     private let stderrBuffer = ServicePluginLineBuffer()
 
-    public init(process: SubProcess) {
-        this.process = process
-        this.writer = StringWriter(process.stdInPipe)
-        let stdoutReader = StringReader<InputStream>(process.stdOutPipe)
-        let stderrReader = StringReader<InputStream>(process.stdErrPipe)
-        spawn { this.readLines(stdoutReader, this.stdoutBuffer) }
-        spawn { this.readLines(stderrReader, this.stderrBuffer) }
+    public init(broker: ManagedStdioBrokerClient, ownerId: String, generation: Int64, pid: Int64) {
+        this.broker = broker
+        this.ownerId = ownerId
+        this.generation = generation
+        this.process = ServicePluginBrokerProcessHandle(pid, this.state)
     }
 
     public func writeLine(line: String): Unit {
-        this.writer.writeln(line)
-        this.writer.flush()
+        let written = this.broker.writeOwnerLine(this.ownerId, line)
+        if (!written.ok) {
+            throw Exception("service plugin broker write failed: ${written.status}")
+        }
     }
 
     public func readStdoutLine(timeoutMs: Int64): Option<String> {
-        this.stdoutBuffer.readLine(timeoutMs)
+        if (!this.state.beginRead()) { return None<String> }
+        try {
+            let deadline = DateTime.now().toUnixTimeStamp().toMilliseconds() + max(1, timeoutMs)
+            while (!this.state.shouldStop()) {
+                let remaining = deadline - DateTime.now().toUnixTimeStamp().toMilliseconds()
+                if (remaining <= 0) { return None<String> }
+                match (this.broker.readOwnerLine(this.ownerId, timeoutMs: remaining)) {
+                    case Some(event) =>
+                        match (this.readLines(event)) {
+                            case Some(line) => return Some(line)
+                            case None =>
+                                if (!this.state.terminal().isEmpty()) { return None<String> }
+                        }
+                    case None => return None<String>
+                }
+            }
+            None<String>
+        } finally {
+            this.state.endRead()
+        }
     }
 
     public func stdoutClosed(): Bool {
@@ -734,55 +825,43 @@ private class ServicePluginStdioProcess {
         redactServicePayload(this.stdoutBuffer.summary()).text
     }
 
+    public func terminalStatus(): String { this.state.terminal() }
+
     public func stop(timeoutMs!: Int64 = 500): ServicePluginProcessStopResult {
         let effective = if (timeoutMs > 0) { timeoutMs } else { 500 }
-        try {
-            let _ = this.process.wait(timeout: Some(Duration.millisecond * effective))
-            this.stdoutBuffer.close()
-            this.stderrBuffer.close()
-            return ServicePluginProcessStopResult(true, "graceful_exited")
-        } catch (_waitBeforeTerminate: Exception) {
-            ()
+        this.state.stopReaders(min(effective, 1100))
+        let stopped = this.broker.stopOwner(this.ownerId, timeoutMs: effective)
+        let cached = this.state.terminal()
+        if (cached.isEmpty()) {
+            this.state.cacheTerminal(if (stopped.ok) { "stopped" } else { stopped.status })
         }
-        try { this.process.terminate(force: false) } catch (_: Exception) { () }
-        try {
-            let _ = this.process.wait(timeout: Some(Duration.millisecond * effective))
-            this.stdoutBuffer.close()
-            this.stderrBuffer.close()
-            return ServicePluginProcessStopResult(true, "terminated")
-        } catch (_waitAfterTerminate: Exception) {
-            try { this.process.terminate(force: true) } catch (_inner: Exception) { () }
-        }
-        sleep(Duration.millisecond * 25)
         this.stdoutBuffer.close()
         this.stderrBuffer.close()
-        if (this.process.isAlive()) {
-            return ServicePluginProcessStopResult(false, "still_alive")
-        }
-        ServicePluginProcessStopResult(true, "force_terminated")
+        ServicePluginProcessStopResult(stopped.ok, if (stopped.ok) { "terminated" } else { "still_alive" })
     }
 
-    private func readLines(reader: StringReader<InputStream>, buffer: ServicePluginLineBuffer): Unit {
-        while (true) {
-            let line = try {
-                reader.readln()
-            } catch (e: Exception) {
-                buffer.close(error: "read failed: ${e.message}")
-                return
-            }
-            match (line) {
-                case Some(value) =>
-                    try {
-                        buffer.appendLine(value)
-                    } catch (e: Exception) {
-                        buffer.close(error: "line buffer append failed: ${e.message}")
-                        return
-                    }
-                case None =>
-                    buffer.close()
-                    return
-            }
+    private func readLines(event: ManagedStdioEvent): Option<String> {
+        if (event.eventType == "owner.stdout") {
+            this.stdoutBuffer.appendLine(event.text)
+            return this.stdoutBuffer.readLine(1)
         }
+        if (event.eventType == "owner.stderr") {
+            this.stderrBuffer.appendLine(event.text)
+            return None<String>
+        }
+        if (event.eventType == "owner.exit") {
+            this.state.cacheTerminal("process_exited")
+        } else if (event.eventType == "owner.timeout") {
+            this.state.cacheTerminal(if (event.status.isEmpty()) { "timed_out" } else { event.status })
+        } else if (event.eventType == "owner.error") {
+            this.state.cacheTerminal(if (event.status.isEmpty()) { "process_error" } else { event.status })
+        } else {
+            this.state.cacheTerminal("broker_protocol_error")
+        }
+        let status = this.state.terminal()
+        this.stdoutBuffer.close(error: status)
+        this.stderrBuffer.close(error: status)
+        None<String>
     }
 }
 
@@ -958,6 +1037,7 @@ private class ServicePluginProcessEnsureResult {
 
 private var servicePluginActiveProcesses = HashMap<String, ServicePluginStdioProcess>()
 private var servicePluginResponseQueues = HashMap<String, ServicePluginResponseQueue>()
+private var servicePluginBrokerOwnerSequence: Int64 = 0
 private let servicePluginProcessLock = Mutex()
 private let servicePluginRuntimeRecordLock = Mutex()
 private let servicePluginHostLogger = metisCreateSubsystemLogger("gateway/service-plugin/host")
@@ -1067,6 +1147,21 @@ private func cleanupServicePluginActiveProcessLocked(serviceId: String, reason: 
     }
 }
 
+private func cleanupServicePluginActiveProcessForOwnerLocked(
+    serviceId: String,
+    ownerId: String,
+    reason: String,
+    diagnostic!: String = ""
+): Unit {
+    match (servicePluginActiveProcesses.get(serviceId.trimAscii())) {
+        case Some(current) =>
+            if (current.ownerId == ownerId) {
+                cleanupServicePluginActiveProcessLocked(serviceId, reason, diagnostic: diagnostic)
+            }
+        case None => ()
+    }
+}
+
 private func readExpectedServiceFrame(process: ServicePluginStdioProcess, policy: ServicePluginStdoutReadPolicy): ServicePluginStdoutReadResult {
     var noiseLineCount: Int64 = 0
     var emptyLineCount: Int64 = 0
@@ -1077,7 +1172,9 @@ private func readExpectedServiceFrame(process: ServicePluginStdioProcess, policy
         let line = match (process.readStdoutLine(policy.timeoutMs)) {
             case Some(value) => value
             case None =>
-                return ServicePluginStdoutReadResult(false, status: "timeout", diagnostic: servicePluginStdoutNoiseDiagnostic("timeout", noiseLineCount, noiseBytes, noiseSamples))
+                let terminal = process.terminalStatus()
+                let status = if (terminal.isEmpty()) { "timeout" } else { terminal }
+                return ServicePluginStdoutReadResult(false, status: status, diagnostic: servicePluginStdoutNoiseDiagnostic(status, noiseLineCount, noiseBytes, noiseSamples))
         }
         let trimmed = line.trimAscii()
         if (trimmed.isEmpty()) {
@@ -2223,6 +2320,10 @@ public func shutdownServicePluginHost(reason!: String = "shutdown", timeoutMilli
 private func ensureServicePluginStdioProcess(record: ServicePluginRuntimeRecord, startupTimeoutMs!: Int64 = 10000): ServicePluginProcessEnsureResult {
     let serviceId = record.registration.manifest.pluginId
     synchronized(servicePluginProcessLock) {
+        if (record.status == "stopping") {
+            record.degradedReason = "stopping"
+            return ServicePluginProcessEnsureResult(false, "stopping", diagnostic: "service plugin stop in progress")
+        }
         if (servicePluginActiveProcesses.contains(serviceId) && servicePluginResponseQueues.contains(serviceId)) {
             let activeProcess = servicePluginActiveProcesses[serviceId]
             let activeQueue = servicePluginResponseQueues[serviceId]
@@ -2262,18 +2363,33 @@ private func ensureServicePluginStdioProcess(record: ServicePluginRuntimeRecord,
         try { Directory.create(servicePluginRuntimeLeaseDir(serviceId), recursive: true) } catch (_: Exception) { () }
         let args = servicePluginArgsWithConfigRef(record.registration.manifest.entryArgs, record.registration.configRef.configPath)
         let process = try {
-            let proc = launch(
+            let ownerEnvironment = ArrayList<(String, String)>()
+            for ((key, value) in servicePluginProcessEnvironment(record)) {
+                ownerEnvironment.add((key, value))
+            }
+            servicePluginBrokerOwnerSequence++
+            let ownerId = "service-plugin:${serviceId}:${record.instanceId}:${servicePluginBrokerOwnerSequence}"
+            let started = gatewayStdioBroker().startOwner(ManagedStdioOwnerSpec(
+                ownerId,
                 record.registration.manifest.entryCommand,
-                args,
-                stdIn: ProcessRedirect.Pipe,
-                stdOut: ProcessRedirect.Pipe,
-                stdErr: ProcessRedirect.Pipe,
-                workingDirectory: if (cwd.isEmpty()) { None<Path> } else { Some(Path(cwd)) },
-                environment: Some(servicePluginProcessEnvironment(record))
+                args: args,
+                workingDirectory: if (cwd.isEmpty()) { None<String> } else { Some(cwd) },
+                environment: ownerEnvironment.toArray(),
+                stdinMode: "line",
+                outputMode: "line"
+            ), timeoutMs: startupTimeoutMs)
+            if (!started.ok) {
+                throw Exception("service plugin broker owner start failed: ${started.status}")
+            }
+            let proc = ServicePluginStdioProcess(
+                gatewayStdioBroker(),
+                ownerId,
+                started.generation,
+                started.pid
             )
-            record.pid = proc.pid
-            logServicePluginProcessStart(record, proc.pid)
-            ServicePluginStdioProcess(proc)
+            record.pid = started.pid
+            logServicePluginProcessStart(record, started.pid)
+            proc
         } catch (e: Exception) {
             record.status = "degraded"
             record.degradedReason = "process_start_failed"
@@ -2352,11 +2468,16 @@ private func servicePluginEventPump(record: ServicePluginRuntimeRecord, process:
                 if (idlePolls < 3600) {
                     continue
                 }
+                if (record.status == "stopping") {
+                    queue.close(status: "stopped", diagnostic: "service plugin stop in progress")
+                    return
+                }
                 record.status = "degraded"
-                record.degradedReason = "process_exited"
+                let terminal = process.terminalStatus()
+                record.degradedReason = if (terminal.isEmpty()) { "process_exited" } else { terminal }
                 record.lastError = servicePluginProcessError("service plugin process stdout closed", process)
                 synchronized(servicePluginProcessLock) {
-                    cleanupServicePluginActiveProcessLocked(serviceId, "process_exited", diagnostic: record.lastError)
+                    cleanupServicePluginActiveProcessForOwnerLocked(serviceId, process.ownerId, record.degradedReason, diagnostic: record.lastError)
                 }
                 return
         }
@@ -2371,7 +2492,7 @@ private func servicePluginEventPump(record: ServicePluginRuntimeRecord, process:
                 record.degradedReason = "stdout_protocol_violation"
                 record.lastError = servicePluginStdoutNoiseDiagnostic("stdout_protocol_violation", noiseLineCount, noiseBytes, noiseSamples)
                 synchronized(servicePluginProcessLock) {
-                    cleanupServicePluginActiveProcessLocked(serviceId, "stdout_protocol_violation", diagnostic: record.lastError)
+                    cleanupServicePluginActiveProcessForOwnerLocked(serviceId, process.ownerId, "stdout_protocol_violation", diagnostic: record.lastError)
                 }
                 return
             }
@@ -2387,7 +2508,7 @@ private func servicePluginEventPump(record: ServicePluginRuntimeRecord, process:
                 record.status = "degraded"
                 record.degradedReason = "frame_too_large"
                 synchronized(servicePluginProcessLock) {
-                    cleanupServicePluginActiveProcessLocked(serviceId, "frame_too_large", diagnostic: "frame_too_large ${hashRawPayload(trimmed)}")
+                    cleanupServicePluginActiveProcessForOwnerLocked(serviceId, process.ownerId, "frame_too_large", diagnostic: "frame_too_large ${hashRawPayload(trimmed)}")
                 }
                 return
             }
@@ -2395,7 +2516,7 @@ private func servicePluginEventPump(record: ServicePluginRuntimeRecord, process:
                 record.status = "degraded"
                 record.degradedReason = "frame_decode_failed"
                 synchronized(servicePluginProcessLock) {
-                    cleanupServicePluginActiveProcessLocked(serviceId, "frame_decode_failed", diagnostic: record.lastError)
+                    cleanupServicePluginActiveProcessForOwnerLocked(serviceId, process.ownerId, "frame_decode_failed", diagnostic: record.lastError)
                 }
                 return
             }
@@ -2533,42 +2654,60 @@ public func ensureRegisteredServicePluginStarted(serviceId: String, startupTimeo
 public func stopServicePlugin(serviceId: String, reason!: String = "", timeoutMillis!: Int64 = 30000): ServiceStopResult {
     match (servicePluginRegistry.get(serviceId.trimAscii())) {
         case Some(record) =>
-            servicePluginStopSupervisorWorker(serviceId.trimAscii())
+            let sid = serviceId.trimAscii()
+            servicePluginStopSupervisorWorker(sid)
             if (timeoutMillis <= 0) {
                 record.status = "degraded"
                 record.degradedReason = "stop timeout"
-                return ServiceStopResult(false, serviceId.trimAscii(), "degraded", diagnostic: record.degradedReason)
+                return ServiceStopResult(false, sid, "degraded", diagnostic: record.degradedReason)
             }
+            var detachedProcess = None<ServicePluginStdioProcess>
+            var detachedQueue = None<ServicePluginResponseQueue>
+            var stopClaimed = false
             synchronized(servicePluginProcessLock) {
-                match (servicePluginActiveProcesses.get(serviceId.trimAscii())) {
-                    case Some(process) =>
-                        try {
-                            process.writeLine(encodeServiceFrame(ServiceFrame("request", "stop-${record.instanceId}", serviceId.trimAscii(), method: "stop", correlationId: "stop-${record.instanceId}", payload: "{}")).trimAscii())
-                        } catch (_: Exception) {
-                            ()
-                        }
-                        let stop = process.stop(timeoutMs: min(timeoutMillis, 30000))
-                        if (stop.status != "still_alive") {
-                            servicePluginActiveProcesses.remove(serviceId.trimAscii())
-                        }
-                        let stopDiagnostic = "stop_status=${stop.status}"
-                        if (!stop.ok) {
-                            record.lastError = if (record.lastError.isEmpty()) {
-                                "${stopDiagnostic} ${servicePluginProcessError("service plugin stop forced", process)}"
-                            } else {
-                                "${record.lastError} ${stopDiagnostic}"
-                            }
-                        } else if (record.lastError.isEmpty()) {
-                            record.lastError = stopDiagnostic
-                        }
-                    case None => ()
+                if (record.status != "stopping") {
+                    stopClaimed = true
+                    record.status = "stopping"
+                    match (servicePluginActiveProcesses.get(sid)) {
+                        case Some(process) =>
+                            detachedProcess = Some(process)
+                            servicePluginActiveProcesses.remove(sid)
+                        case None => ()
+                    }
+                    match (servicePluginResponseQueues.get(sid)) {
+                        case Some(queue) =>
+                            detachedQueue = Some(queue)
+                            servicePluginResponseQueues.remove(sid)
+                        case None => ()
+                    }
                 }
-                match (servicePluginResponseQueues.get(serviceId.trimAscii())) {
-                    case Some(queue) =>
-                        queue.close(status: "stopped", diagnostic: "service plugin stopped: ${reason.trimAscii()}")
-                        servicePluginResponseQueues.remove(serviceId.trimAscii())
-                    case None => ()
-                }
+            }
+            if (!stopClaimed) {
+                return ServiceStopResult(false, sid, "stopping", diagnostic: "service plugin stop already in progress")
+            }
+            match (detachedQueue) {
+                case Some(queue) => queue.close(status: "stopped", diagnostic: "service plugin stopped: ${reason.trimAscii()}")
+                case None => ()
+            }
+            match (detachedProcess) {
+                case Some(process) =>
+                    try {
+                        process.writeLine(encodeServiceFrame(ServiceFrame("request", "stop-${record.instanceId}", sid, method: "stop", correlationId: "stop-${record.instanceId}", payload: "{}")).trimAscii())
+                    } catch (_: Exception) {
+                        ()
+                    }
+                    let stop = process.stop(timeoutMs: min(timeoutMillis, 30000))
+                    let stopDiagnostic = "stop_status=${stop.status}"
+                    if (!stop.ok) {
+                        record.lastError = if (record.lastError.isEmpty()) {
+                            "${stopDiagnostic} ${servicePluginProcessError("service plugin stop forced", process)}"
+                        } else {
+                            "${record.lastError} ${stopDiagnostic}"
+                        }
+                    } else if (record.lastError.isEmpty()) {
+                        record.lastError = stopDiagnostic
+                    }
+                case None => ()
             }
             let leaseDiagnostic = servicePluginLeaseStopDiagnostic(record)
             let cleanLease = !leaseDiagnostic.startsWith("lease_not_stopped_after_stop")
@@ -2584,7 +2723,7 @@ public func stopServicePlugin(serviceId: String, reason!: String = "", timeoutMi
                 if (!servicePluginPidAlive(record.pid)) {
                     record.pid = 0
                 }
-                return ServiceStopResult(false, serviceId.trimAscii(), "degraded", stateFlushed: false, diagnostic: record.lastError)
+                return ServiceStopResult(false, sid, "degraded", stateFlushed: false, diagnostic: record.lastError)
             }
             record.status = "stopped"
             record.degradedReason = reason.trimAscii()
@@ -2592,7 +2731,7 @@ public func stopServicePlugin(serviceId: String, reason!: String = "", timeoutMi
             record.pid = 0
             let diagnostic = if (record.lastError.isEmpty()) { leaseDiagnostic } else { "${record.lastError} ${leaseDiagnostic}" }
             record.lastError = diagnostic
-            ServiceStopResult(true, serviceId.trimAscii(), "stopped", stateFlushed: true, diagnostic: diagnostic)
+            ServiceStopResult(true, sid, "stopped", stateFlushed: true, diagnostic: diagnostic)
         case None => ServiceStopResult(false, serviceId.trimAscii(), "missing", diagnostic: "service plugin is not registered")
     }
 }

@@ -1,6 +1,7 @@
 package metis.gateway.service_plugin
 
 import metis.gateway.logging.gatewayLoggingResetForTest
+import metis.process.{ManagedStdioOwnerSpec, managedStdioBroker, managedStdioResolveBrokerScriptPath}
 import std.collection.ArrayList
 import std.convert.Parsable
 import std.env.{getProcessId, getVariable, setVariable}
@@ -374,6 +375,35 @@ public class ServicePluginHostTest {
         @Expect(result.ok, true)
     }
 
+    private func brokerServiceFixturePath(): String {
+        Path(managedStdioResolveBrokerScriptPath()).parent.join("gateway-stdio-hanging-service.mjs").toString()
+    }
+
+    private func registerBrokerServiceFixture(
+        mode: String,
+        pluginId!: String = "stdio-service",
+        capabilityId!: String = "stdio.monitor.status",
+        resetHost!: Bool = true
+    ): Unit {
+        if (resetHost) { resetServicePluginHostForTest() }
+        let caps = ArrayList<ServiceCapabilityRecord>()
+        caps.add(ServiceCapabilityRecord(capabilityId, "controlAction"))
+        if (mode.startsWith("gcm")) { caps.add(ServiceCapabilityRecord("stdio.event.accepted", "event")) }
+        let manifest = ServicePluginManifest(
+            schema: METIS_SERVICE_PLUGIN_SCHEMA,
+            pluginId: pluginId,
+            displayName: "Broker Stdio Service",
+            kind: "service",
+            protocolVersion: "1.0",
+            entryCommand: "node",
+            entryArgs: [this.brokerServiceFixturePath(), mode],
+            hasConfigSchema: true,
+            capabilityDeclarations: caps
+        )
+        let result = registerServicePlugin(ServicePluginRegistration(manifest))
+        @Expect(result.ok, true)
+    }
+
     private func repeatText(text: String, count: Int64): String {
         var out = ""
         for (_ in 0..count) {
@@ -544,6 +574,7 @@ public class ServicePluginHostTest {
             } finally {
                 resetServicePluginHostForTest()
             }
+
         })
     }
 
@@ -1456,6 +1487,274 @@ public class ServicePluginHostTest {
         } finally {
             resetServicePluginHostForTest()
         }
+    }
+
+    @TestCase
+    public func p3U1BrokerSeparatesPluginStdoutFramesFromStderrBurst(): Unit {
+        withServicePluginHostTestHome("p3-u1-broker-stream-classification", { _home: Path =>
+            let stderrBurstLines: Int64 = 16
+            @Expect(stderrBurstLines > 8, true)
+            this.registerBrokerServiceFixture("gcm-stderr-burst-${stderrBurstLines}")
+            try {
+                let result = invokeRegisteredCapability(CapabilityInvokeRequest("stdio.monitor.status", payload: "{}"))
+                @Expect(result.ok, true)
+                @Expect(result.status, "ok")
+                @Expect(result.payload.contains("中文🙂"), true)
+                let event = readServiceEventFrame("stdio-service")
+                @Expect(event.ok, true)
+                @Expect(event.frame.capabilityId, "stdio.event.accepted")
+                @Expect(event.frame.payload.contains("事件中文🙂"), true)
+                match (getServicePluginSnapshot("stdio-service")) {
+                    case Some(snapshot) =>
+                        @Expect(snapshot.status, "running")
+                        @Expect(snapshot.degradedReason, "")
+                    case None => @Expect(true, false)
+                }
+            } finally {
+                let _ = stopServicePlugin("stdio-service", reason: "p3-u1")
+                resetServicePluginHostForTest()
+            }
+        })
+    }
+
+    @TestCase
+    public func p3B1NoiseBoundaryAndHealthBurstKeepOwnerScoped(): Unit {
+        withServicePluginHostTestHome("p3-b1-noise-boundary", { home: Path =>
+            this.registerBrokerServiceFixture("noise-8")
+            try {
+                let atBudget = invokeRegisteredCapability(CapabilityInvokeRequest("stdio.monitor.status", payload: "{}"))
+                @Expect(atBudget.ok, true)
+                @Expect(atBudget.status, "ok")
+            } finally {
+                let _ = stopServicePlugin("stdio-service", reason: "p3-b1-at-budget")
+                resetServicePluginHostForTest()
+            }
+
+            this.registerBrokerServiceFixture("noise-9")
+            try {
+                let overBudget = invokeRegisteredCapability(CapabilityInvokeRequest("stdio.monitor.status", payload: "{}"))
+                @Expect(overBudget.ok, false)
+                @Expect(overBudget.status, "stdout_protocol_violation")
+                @Expect(overBudget.diagnostic.contains("Authorization"), false)
+                @Expect(overBudget.diagnostic.contains("/Users/"), false)
+                @Expect(overBudget.diagnostic.contains("payload-"), true)
+            } finally {
+                resetServicePluginHostForTest()
+            }
+
+            this.registerBrokerServiceFixture(
+                "gcm",
+                pluginId: "health-service",
+                capabilityId: "health.monitor.status"
+            )
+            try {
+                let started = ensureRegisteredServicePluginStarted("health-service", startupTimeoutMs: 3000)
+                @Expect(started.ok, true)
+                let healthLease = home.join("service-plugin").join("runtime").join("health-service").join("health-service-1.lease.json")
+                @Expect(this.waitForFile(healthLease, timeoutMillis: 2000), true)
+                let pid = match (getServicePluginSnapshot("health-service")) {
+                    case Some(snapshot) => snapshot.pid
+                    case None => Int64(0)
+                }
+                for (_ in 0..16) {
+                    @Expect(probeServicePluginHealth("health-service").healthzOk, true)
+                }
+                match (getServicePluginSnapshot("health-service")) {
+                    case Some(snapshot) =>
+                        @Expect(snapshot.pid, pid)
+                        @Expect(snapshot.status, "running")
+                    case None => @Expect(true, false)
+                }
+            } finally {
+                let _ = stopServicePlugin("health-service", reason: "p3-b1-health-burst")
+                resetServicePluginHostForTest()
+            }
+        })
+    }
+
+    @TestCase
+    public func p3P1FakeGcmHealthEventResponseKeepsPidAndLease(): Unit {
+        withServicePluginHostTestHome("p3-p1-fake-gcm", { home: Path =>
+            this.registerBrokerServiceFixture("gcm")
+            try {
+                let started = ensureRegisteredServicePluginStarted("stdio-service", startupTimeoutMs: 3000)
+                @Expect(started.ok, true)
+                let leasePath = home.join("service-plugin").join("runtime").join("stdio-service").join("stdio-service-1.lease.json")
+                @Expect(this.waitForFile(leasePath, timeoutMillis: 2000), true)
+                let initialPid = match (getServicePluginSnapshot("stdio-service")) {
+                    case Some(snapshot) => snapshot.pid
+                    case None => Int64(0)
+                }
+                @Expect(initialPid > 0, true)
+                for (_ in 0..100) {
+                    let health = probeServicePluginHealth("stdio-service")
+                    @Expect(health.pidAlive, true)
+                    @Expect(health.stdioAlive, true)
+                    @Expect(health.healthzOk, true)
+                }
+                match (getServicePluginSnapshot("stdio-service")) {
+                    case Some(snapshot) => @Expect(snapshot.pid, initialPid)
+                    case None => @Expect(true, false)
+                }
+                let invoked = invokeRegisteredCapability(CapabilityInvokeRequest("stdio.monitor.status", payload: "{}"))
+                @Expect(invoked.ok, true)
+                @Expect(readServiceEventFrame("stdio-service").ok, true)
+                let stopped = stopServicePlugin("stdio-service", reason: "p3-p1")
+                @Expect(stopped.ok, true)
+                @Expect(this.readTextFile(leasePath).contains("\"state\":\"stopped\""), true)
+                @Expect(managedStdioBroker().snapshot().ownerCount, 0)
+            } finally {
+                resetServicePluginHostForTest()
+            }
+        })
+    }
+
+    @TestCase
+    public func p3N1MalformedEncodingCrashAndIgnoringTermStayBounded(): Unit {
+        withServicePluginHostTestHome("p3-n1-terminal-failures", { _home: Path =>
+            this.registerBrokerServiceFixture("malformed")
+            try {
+                let malformed = invokeRegisteredCapability(CapabilityInvokeRequest("stdio.monitor.status", payload: "{}"))
+                @Expect(malformed.ok, false)
+                @Expect(malformed.status, "frame_decode_failed")
+            } finally {
+                resetServicePluginHostForTest()
+            }
+
+            this.registerBrokerServiceFixture("invalid-utf8")
+            let sentinelId = "p3-n1-sentinel-${DateTime.now().toUnixTimeStamp().toNanoseconds()}"
+            let sentinel = managedStdioBroker().startOwner(ManagedStdioOwnerSpec(
+                sentinelId,
+                "node",
+                args: ["-e", "process.stdout.write('other-owner-ok\\n')"],
+                stdinMode: "closed",
+                outputMode: "line",
+                deadlineMs: 2000
+            ))
+            @Expect(sentinel.ok, true)
+            try {
+                let invalid = invokeRegisteredCapability(CapabilityInvokeRequest("stdio.monitor.status", payload: "{}"))
+                @Expect(invalid.ok, false)
+                @Expect(invalid.status, "invalid_response_encoding")
+                var sentinelOutput = ""
+                var sentinelDone = false
+                while (!sentinelDone) {
+                    match (managedStdioBroker().readOwnerLine(sentinelId, timeoutMs: 2000)) {
+                        case Some(event) =>
+                            if (event.eventType == "owner.stdout") { sentinelOutput = event.text }
+                            if (event.eventType == "owner.exit" || event.eventType == "owner.error" || event.eventType == "owner.timeout") {
+                                sentinelDone = true
+                            }
+                        case None => sentinelDone = true
+                    }
+                }
+                @Expect(sentinelOutput, "other-owner-ok")
+            } finally {
+                let _ = managedStdioBroker().stopOwner(sentinelId)
+                resetServicePluginHostForTest()
+            }
+
+            this.registerBrokerServiceFixture("crash")
+            try {
+                let crashed = invokeRegisteredCapability(CapabilityInvokeRequest("stdio.monitor.status", payload: "{}"))
+                @Expect(crashed.ok, false)
+                @Expect(crashed.status, "process_exited")
+            } finally {
+                resetServicePluginHostForTest()
+            }
+
+            this.registerBrokerServiceFixture("ignore-term")
+            try {
+                let started = ensureRegisteredServicePluginStarted("stdio-service", startupTimeoutMs: 3000)
+                @Expect(started.ok, true)
+                let startedAt = DateTime.now().toUnixTimeStamp().toMilliseconds()
+                let stopped = stopServicePlugin("stdio-service", reason: "p3-n1", timeoutMillis: 2500)
+                let elapsed = DateTime.now().toUnixTimeStamp().toMilliseconds() - startedAt
+                @Expect(stopped.ok, true)
+                @Expect(elapsed < 3000, true)
+                @Expect(managedStdioBroker().snapshot().ownerCount, 0)
+                match (getServicePluginSnapshot("stdio-service")) {
+                    case Some(snapshot) => @Expect(snapshot.pid, 0)
+                    case None => @Expect(true, false)
+                }
+            } finally {
+                resetServicePluginHostForTest()
+            }
+
+            for (_ in 0..12) {
+                this.registerBrokerServiceFixture("exit-after-init")
+                try {
+                    let started = ensureRegisteredServicePluginStarted("stdio-service", startupTimeoutMs: 1000)
+                    @Expect(started.ok, true)
+                    @Expect(started.diagnostic.contains("duplicate_owner"), false)
+                    @Expect(this.waitForSnapshotReason("stdio-service", "process_exited", timeoutMillis: 1000), true)
+                } finally {
+                    resetServicePluginHostForTest()
+                }
+            }
+
+            this.registerBrokerServiceFixture("exit-after-delay")
+            @Expect(ensureRegisteredServicePluginStarted("stdio-service", startupTimeoutMs: 1000).ok, true)
+            @Expect(dropServicePluginActiveProcessForTest("stdio-service", stopProcess: false), true)
+            resetServicePluginHostForTest()
+            this.registerBrokerServiceFixture("noise-0")
+            try {
+                @Expect(ensureRegisteredServicePluginStarted("stdio-service", startupTimeoutMs: 1000).ok, true)
+                let replacementPid = match (getServicePluginSnapshot("stdio-service")) {
+                    case Some(snapshot) => snapshot.pid
+                    case None => Int64(0)
+                }
+                sleep(Duration.millisecond * 700)
+                @Expect(probeServicePluginHealth("stdio-service").pidAlive, true)
+                match (getServicePluginSnapshot("stdio-service")) {
+                    case Some(snapshot) => @Expect(snapshot.pid, replacementPid)
+                    case None => @Expect(true, false)
+                }
+                let replacementInvoke = invokeRegisteredCapability(CapabilityInvokeRequest("stdio.monitor.status", payload: "{}"))
+                @Expect(replacementInvoke.ok, true)
+            } finally {
+                let _ = stopServicePlugin("stdio-service", reason: "p3-n1-late-pump")
+                resetServicePluginHostForTest()
+            }
+
+            this.registerBrokerServiceFixture(
+                "ignore-term",
+                pluginId: "slow-service",
+                capabilityId: "slow.monitor.status"
+            )
+            this.registerBrokerServiceFixture(
+                "noise-0",
+                pluginId: "fast-service",
+                capabilityId: "fast.monitor.status",
+                resetHost: false
+            )
+            try {
+                @Expect(ensureRegisteredServicePluginStarted("slow-service", startupTimeoutMs: 3000).ok, true)
+                @Expect(ensureRegisteredServicePluginStarted("fast-service", startupTimeoutMs: 3000).ok, true)
+                let slowCompletions = ArrayList<String>()
+                let slowCompletionLock = Mutex()
+                let slowStop = spawn {
+                    let result = stopServicePlugin("slow-service", reason: "p3-n1-slow", timeoutMillis: 2500)
+                    synchronized(slowCompletionLock) { slowCompletions.add(result.status) }
+                    result
+                }
+                sleep(Duration.millisecond * 50)
+                @Expect(synchronized(slowCompletionLock) { slowCompletions.size }, 0)
+                let slowRestartAttempt = ensureRegisteredServicePluginStarted("slow-service", startupTimeoutMs: 500)
+                @Expect(slowRestartAttempt.ok, false)
+                @Expect(slowRestartAttempt.status, "stopping")
+                let fastStop = stopServicePlugin("fast-service", reason: "p3-n1-fast", timeoutMillis: 1000)
+                @Expect(fastStop.ok, true)
+                @Expect(synchronized(slowCompletionLock) { slowCompletions.size }, 0)
+                @Expect(slowStop.get().ok, true)
+                @Expect(synchronized(slowCompletionLock) { slowCompletions.size }, 1)
+                @Expect(managedStdioBroker().snapshot().ownerCount, 0)
+            } finally {
+                let _ = stopServicePlugin("slow-service", reason: "p3-n1-finally", timeoutMillis: 1000)
+                let _ = stopServicePlugin("fast-service", reason: "p3-n1-finally", timeoutMillis: 1000)
+                resetServicePluginHostForTest()
+            }
+        })
     }
 
     @TestCase
