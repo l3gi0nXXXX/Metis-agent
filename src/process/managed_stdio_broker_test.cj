@@ -1,21 +1,36 @@
 package metis.process
 
 import std.collection.ArrayList
+import std.env.{getVariable, setVariable}
 import std.fs.{File, Path, exists, remove}
 import std.time.DateTime
 import std.unittest.testmacro.*
 
 private class RecordingManagedStdioPlatformRunner <: ManagedStdioPlatformRunner {
     let calls = ArrayList<String>()
-    var alive = true
+    private let delegate = ManagedStdioDefaultPlatformRunner()
 
     public func terminateTree(pid: Int64, pgid: Int64, force: Bool): Bool {
         this.calls.add("${pid}:${pgid}:${if (force) { "force" } else { "term" }}")
-        if (force) { this.alive = false }
-        true
+        this.delegate.terminateTree(pid, pgid, force)
     }
 
-    public func treeAlive(_pid: Int64, _pgid: Int64): Bool { this.alive }
+    public func treeAlive(pid: Int64, pgid: Int64): Bool { this.delegate.treeAlive(pid, pgid) }
+}
+
+private class ManagedStdioTestBoolBox {
+    var value: Bool
+    init(value!: Bool = false) { this.value = value }
+}
+
+private class ManagedStdioTestStringBox {
+    var value: String
+    init(value!: String = "") { this.value = value }
+}
+
+private class ManagedStdioTestInt64Box {
+    var value: Int64
+    init(value!: Int64 = 0) { this.value = value }
 }
 
 private func managedStdioTestNowMs(): Int64 {
@@ -61,12 +76,40 @@ public class ManagedStdioBrokerTest {
         @Expect(windowsTerm, "taskkill")
         @Expect(windowsTermArgs, ["/PID", "51", "/T"])
         @Expect(windowsKillArgs, ["/PID", "51", "/T", "/F"])
+        @Expect(managedStdioOwnerIdentitySafeForReap("windows", 51, 0), true)
+        @Expect(managedStdioOwnerIdentitySafeForReap("posix", 51, 51), true)
+        @Expect(managedStdioOwnerIdentitySafeForReap("posix", 51, 52), false)
+        @Expect(managedStdioOwnerIdentitySafeForReap("posix", 1, 1), false)
         let guardedPosix = ManagedStdioDefaultPlatformRunner(platform: "posix")
         @Expect(guardedPosix.terminateTree(41001, 41002, false), false)
         @Expect(guardedPosix.treeAlive(41001, 41002), false)
         let resolvedBroker = Path(managedStdioResolveBrokerScriptPath())
         @Expect(resolvedBroker.isAbsolute(), true)
         @Expect(exists(resolvedBroker), true)
+        let oldRoot = getVariable("METIS_CJPM_ROOT")
+        let oldScript = getVariable("METIS_STDIO_BROKER_SCRIPT")
+        try {
+            setVariable("METIS_STDIO_BROKER_SCRIPT", "")
+            setVariable("METIS_CJPM_ROOT", resolvedBroker.parent.parent.toString())
+            @Expect(
+                managedStdioResolveBrokerScriptPath(startDirectory: Path("/tmp/metis-stdio-outside-repository")),
+                resolvedBroker.toString()
+            )
+            setVariable("METIS_CJPM_ROOT", "")
+            @Expect(
+                managedStdioResolveBrokerScriptPath(startDirectory: Path("/tmp/metis-stdio-outside-repository")),
+                ""
+            )
+        } finally {
+            match (oldRoot) {
+                case Some(value) => setVariable("METIS_CJPM_ROOT", value)
+                case None => setVariable("METIS_CJPM_ROOT", "")
+            }
+            match (oldScript) {
+                case Some(value) => setVariable("METIS_STDIO_BROKER_SCRIPT", value)
+                case None => setVariable("METIS_STDIO_BROKER_SCRIPT", "")
+            }
+        }
     }
 
     @TestCase
@@ -85,16 +128,16 @@ public class ManagedStdioBrokerTest {
             @Expect(start.pid > 0, true)
             @Expect(start.pgid > 0, true)
             let texts = ArrayList<String>()
-            var sawExit = false
+            let sawExit = ManagedStdioTestBoolBox()
             let completed = managedStdioWaitUntil(4000, {
                 =>
                 match (client.readOwnerLine("unicode-owner", timeoutMs: 50)) {
                     case Some(event) =>
                         if (event.eventType == "owner.stdout") { texts.add(event.text) }
-                        if (event.eventType == "owner.exit") { sawExit = true }
+                        if (event.eventType == "owner.exit") { sawExit.value = true }
                     case None => ()
                 }
-                sawExit
+                sawExit.value
             })
             @Expect(completed, true)
             @Expect(texts.toArray(), ["中文🙂", "尾巴🚀"])
@@ -111,17 +154,17 @@ public class ManagedStdioBrokerTest {
             ))
             @Expect(echo.ok, true)
             @Expect(client.writeOwnerLine("write-owner", "你好🙂").status, "written")
-            var echoed = ""
+            let echoed = ManagedStdioTestStringBox()
             @Expect(managedStdioWaitUntil(3000, {
                 =>
                 match (client.readOwnerLine("write-owner", timeoutMs: 50)) {
                     case Some(event) =>
-                        if (event.eventType == "owner.stdout") { echoed = event.text }
+                        if (event.eventType == "owner.stdout") { echoed.value = event.text }
                         event.eventType == "owner.exit"
                     case None => false
                 }
             }), true)
-            @Expect(echoed, "你好🙂")
+            @Expect(echoed.value, "你好🙂")
         } finally {
             let _ = client.close(timeoutMs: 2000)
         }
@@ -171,15 +214,15 @@ public class ManagedStdioBrokerTest {
             ))
             @Expect(started.ok, true)
             sleep(Duration.millisecond * 200)
-            var sawByteOverflow = false
+            let sawByteOverflow = ManagedStdioTestBoolBox()
             @Expect(managedStdioWaitUntil(3000, {
                 =>
                 match (byteBounded.readOwnerLine("byte-limit", timeoutMs: 50)) {
                     case Some(event) =>
-                        if (event.status == "buffer_capacity_exceeded") { sawByteOverflow = true }
+                        if (event.status == "buffer_capacity_exceeded") { sawByteOverflow.value = true }
                     case None => ()
                 }
-                sawByteOverflow
+                sawByteOverflow.value
             }), true)
         } finally {
             let _ = byteBounded.close(timeoutMs: 3000)
@@ -191,7 +234,7 @@ public class ManagedStdioBrokerTest {
         let client = ManagedStdioBrokerClient()
         let runner = ManagedStdioDefaultPlatformRunner()
         let replayMarker = Path("/tmp/metis-stdio-no-replay-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
-        var oldPgid: Int64 = 0
+        let oldPgid = ManagedStdioTestInt64Box()
         try {
             for (index in 0..3) {
                 let script = if (index == 0) {
@@ -207,7 +250,7 @@ public class ManagedStdioBrokerTest {
                     deadlineMs: 10000
                 ))
                 @Expect(started.ok, true)
-                if (index == 0) { oldPgid = started.pgid }
+                if (index == 0) { oldPgid.value = started.pgid }
             }
             @Expect(client.writeOwnerLine("old-0", "side-effect-once").status, "written")
             @Expect(managedStdioWaitUntil(1000, { => exists(replayMarker) }), true)
@@ -215,7 +258,7 @@ public class ManagedStdioBrokerTest {
             let oldGeneration = client.debugSnapshotForTest().generation
             client.debugKillBrokerForTest()
             @Expect(managedStdioWaitUntil(4000, { => !client.debugSnapshotForTest().running }), true)
-            @Expect(managedStdioWaitUntil(3000, { => !runner.treeAlive(oldPgid, oldPgid) }), true)
+            @Expect(managedStdioWaitUntil(3000, { => !runner.treeAlive(oldPgid.value, oldPgid.value) }), true)
             for (index in 0..3) {
                 let event = client.readOwnerLine("old-${index}", timeoutMs: 100)
                 @Expect(event.isSome(), true)
@@ -230,17 +273,17 @@ public class ManagedStdioBrokerTest {
             ))
             @Expect(next.ok, true)
             @Expect(next.generation, oldGeneration + 1)
-            var output = ""
+            let output = ManagedStdioTestStringBox()
             @Expect(managedStdioWaitUntil(3000, {
                 =>
                 match (client.readOwnerLine("new-owner", timeoutMs: 50)) {
                     case Some(event) =>
-                        if (event.eventType == "owner.stdout") { output = event.text }
+                        if (event.eventType == "owner.stdout") { output.value = event.text }
                         event.eventType == "owner.exit"
                     case None => false
                 }
             }), true)
-            @Expect(output, "new-generation")
+            @Expect(output.value, "new-generation")
             sleep(Duration.millisecond * 200)
             @Expect(managedStdioTestReadUtf8(replayMarker), "x")
         } finally {
@@ -269,6 +312,7 @@ public class ManagedStdioBrokerTest {
             @Expect(recording.calls.size >= 2, true)
             @Expect(recording.calls[0], "${started.pid}:${started.pgid}:term")
             @Expect(recording.calls[1], "${started.pid}:${started.pgid}:force")
+            @Expect(managedStdioWaitUntil(2000, { => !recording.treeAlive(started.pid, started.pgid) }), true)
         } finally {
             let _ = client.close(timeoutMs: 500)
         }
@@ -284,6 +328,7 @@ public class ManagedStdioBrokerTest {
             @Expect(timedOutStart.ok, false)
             @Expect(timedOutStart.status, "start_timeout")
             @Expect(managedStdioTestNowMs() - startedAt < 1000, true)
+            @Expect(startHung.snapshot().ownerCount, 0)
         } finally {
             let _ = startHung.close(timeoutMs: 500)
         }

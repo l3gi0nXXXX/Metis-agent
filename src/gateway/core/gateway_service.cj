@@ -6,6 +6,7 @@ import metis.core.model.{CodexResponsesException, findModelCapabilityCatalogEntr
 import metis.core.skills.SkillsPrompt
 import metis.gateway.model.*
 import metis.gateway.process.shutdownGatewayStdioBroker
+import metis.process.ManagedStdioOperationResult
 import metis.gateway.security.gatewayPairingAccountStore
 import metis.gateway.service_plugin.{CapabilityCaller, CapabilityInvokeRequest, CapabilityInvokeResult, ServicePluginAcceptedGitCodeEvent, ServicePluginDeliveryTarget, ServicePluginEventDeliveryResult, ServicePluginGeneratedReplyResult, ServicePluginPendingJob, buildServicePluginImBindingRules, invokeRegisteredCapability, matchServicePluginImBinding, parseServicePluginJobAcceptedPayload, redactServicePayload, renderServicePluginJobSnapshotMessage, servicePluginGeneratedReplyResultFromAgentAnswer, servicePluginPendingJobStore, registerConfiguredServicePlugins, servicePluginConfiguredStatusForUser, servicePluginWebhookDispatchStatsJson, setServicePluginEventDelivery, setServicePluginGeneratedReplyHandler, setServicePluginWebhookGeneratedReplyHandler, setServicePluginWebhookSubscribersProvider, shutdownServicePluginHost, validateServicePluginGeneratedDraft}
 import metis.gateway.session.{GatewayIngressSource, GatewaySessionContext, GatewaySessionRequest, gatewayResolveSessionContext, gatewaySessionRequestFromInbound}
@@ -18,7 +19,7 @@ import std.fs.{Directory, File, Path, copy, exists, remove}
 import std.time.DateTime
 import stdx.encoding.json.{JsonArray, JsonBool, JsonObject, JsonString, JsonValue}
 
-func gatewayServiceStopOwnersThenBroker(stopOwners: () -> Unit, stopBroker: () -> metis.process.ManagedStdioOperationResult): Unit {
+func gatewayServiceStopOwnersThenBroker(stopOwners: () -> Unit, stopBroker: () -> ManagedStdioOperationResult): Unit {
     try {
         stopOwners()
     } finally {

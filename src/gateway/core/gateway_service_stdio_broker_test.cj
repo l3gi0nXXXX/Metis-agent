@@ -10,6 +10,10 @@ import std.fs.{Directory, Path, remove}
 import std.time.DateTime
 import std.unittest.testmacro.*
 
+private class GatewayServiceStdioTestBoolBox {
+    var value = false
+}
+
 private func withGatewayStdioBrokerTestHome<T>(block: () -> T): T {
     synchronized(MetisProcessEnvironmentLock) {
         let home = Path("/tmp/metis-gateway-stdio-stop-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
@@ -60,13 +64,13 @@ public class GatewayServiceStdioBrokerTest {
 
     @TestCase
     public func p1N3OwnerStopFailureStillRunsBrokerFinally(): Unit {
-        var brokerCalled = false
+        let brokerCalled = GatewayServiceStdioTestBoolBox()
         var caught = false
         try {
             gatewayServiceStopOwnersThenBroker(
                 { => throw Exception("injected-owner-stop-failure") },
                 { =>
-                    brokerCalled = true
+                    brokerCalled.value = true
                     ManagedStdioOperationResult(true, "stopped")
                 }
             )
@@ -74,6 +78,6 @@ public class GatewayServiceStdioBrokerTest {
             caught = true
         }
         @Expect(caught, true)
-        @Expect(brokerCalled, true)
+        @Expect(brokerCalled.value, true)
     }
 }
