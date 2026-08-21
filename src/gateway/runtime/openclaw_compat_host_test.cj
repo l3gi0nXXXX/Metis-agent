@@ -5,6 +5,9 @@ import metis.gateway.process.gatewayStdioBroker
 import metis.core.config.{CliConfig, GatewayUserSettings}
 import magic.jsonable.*
 import std.collection.ArrayList
+import std.core.Duration
+import std.fs.{File, Path, exists, remove}
+import std.time.DateTime
 import std.unittest.testmacro.*
 import stdx.encoding.json.{JsonArray, JsonObject, JsonString}
 
@@ -354,6 +357,7 @@ public class OpenClawCompatHostTest {
     public func brokerStdioTransportKeepsUnicodeResponseAndIsolatesTimeout(): Unit {
         let runner = OpenClawCompatStdioProcessRunner()
         let script = CliConfig.cwd.join("scripts").join("gateway-stdio-p3b-fake-child.mjs").toString()
+        let lateWriteMarker = Path("/tmp/metis-openclaw-late-write-${DateTime.now().toUnixTimeStamp().toNanoseconds()}.txt")
         match (runner.start(OpenClawCompatHostLaunchSpec("node", script, [], 500))) {
             case OpenClawCompatHostStartResult.Started(transport) =>
                 let client = OpenClawCompatHostClient(transport, defaultTimeoutMs: 500)
@@ -364,15 +368,23 @@ public class OpenClawCompatHostTest {
                 @Expect(afterStderrBurst.ok, true)
                 @Expect(openClawCompatJstr(afterStderrBurst.result, "text"), "仓颉🙂")
 
-                let timedOut = client.request("test.timeout", timeoutMs: 75)
+                let timeoutParams = JsonObject()
+                timeoutParams.put("lateWriteMarker", JsonString(lateWriteMarker.toString()))
+                let timedOut = client.request("test.timeout", params: timeoutParams, timeoutMs: 75)
                 @Expect(timedOut.status, "timeout")
                 @Expect(client.isAlive(), false)
+                let markerDeadline = DateTime.now().toUnixTimeStamp().toMilliseconds() + 2000
+                while (!exists(lateWriteMarker) && DateTime.now().toUnixTimeStamp().toMilliseconds() < markerDeadline) { sleep(Duration.millisecond * 20) }
+                @Expect(exists(lateWriteMarker), true)
+                let markerText = try { String.fromUtf8(File.readFrom(lateWriteMarker)).trimAscii() } catch (_: Exception) { "invalid_response_encoding" }
+                @Expect(markerText, "late-write-attempted")
                 let afterTimeout = client.request("test.echo", timeoutMs: 75)
                 @Expect(afterTimeout.status, "error")
                 transport.close()
                 @Expect(gatewayStdioBroker().snapshot().ownerCount, 0)
             case OpenClawCompatHostStartResult.Failed(_) => @Expect(false, true)
         }
+        try { remove(lateWriteMarker) } catch (_: Exception) { () }
     }
 
     @TestCase

@@ -62,18 +62,21 @@ private func nextOpenClawCompatOwnerId(): String {
 private class OpenClawCompatStdioHostTransport <: OpenClawCompatHostTransport {
     private let broker: ManagedStdioBrokerClient
     private let ownerId: String
+    private let ownerGeneration: Int64
     private let stateLock = Mutex()
     private let requestLock = Mutex()
     private var condition: Condition
     private let stdoutLines = ArrayList<String>()
     private var stdoutQueuedBytes: Int64 = 0
     private var eventPump: Option<Future<Unit>> = None<Future<Unit>>
+    private var pumpExited: Bool = false
     private var closed: Bool = false
     private var lastReadStatus: String = ""
 
-    public init(broker: ManagedStdioBrokerClient, ownerId: String) {
+    public init(broker: ManagedStdioBrokerClient, ownerId: String, ownerGeneration: Int64) {
         this.broker = broker
         this.ownerId = ownerId
+        this.ownerGeneration = ownerGeneration
         synchronized(this.stateLock) {
             this.condition = this.stateLock.condition()
         }
@@ -109,29 +112,37 @@ private class OpenClawCompatStdioHostTransport <: OpenClawCompatHostTransport {
     }
 
     private func pumpOwnerEvents(): Unit {
-        while (true) {
+        try { while (true) {
             if (synchronized(this.stateLock) { this.closed }) {
                 return
             }
             match (this.broker.readOwnerLine(this.ownerId, timeoutMs: 250)) {
                 case Some(event) =>
                     if (event.eventType == "owner.stdout") {
+                        var capacityExceeded = false
                         let overflow = synchronized(this.stateLock) {
-                            let bytes = event.text.toArray().size
-                            if (this.stdoutLines.size >= OPENCLAW_COMPAT_RESPONSE_QUEUE_LIMIT || this.stdoutQueuedBytes + bytes > OPENCLAW_COMPAT_RESPONSE_BYTES_LIMIT) {
-                                this.closed = true
-                                this.lastReadStatus = "buffer_capacity_exceeded"
-                                this.condition.notifyAll()
+                            if (this.closed) {
                                 true
                             } else {
-                                this.stdoutLines.add(event.text)
-                                this.stdoutQueuedBytes += bytes
-                                this.condition.notifyAll()
-                                false
+                                let bytes = event.text.toArray().size
+                                if (this.stdoutLines.size >= OPENCLAW_COMPAT_RESPONSE_QUEUE_LIMIT || this.stdoutQueuedBytes + bytes > OPENCLAW_COMPAT_RESPONSE_BYTES_LIMIT) {
+                                    capacityExceeded = true
+                                    this.closed = true
+                                    this.lastReadStatus = "buffer_capacity_exceeded"
+                                    this.condition.notifyAll()
+                                    true
+                                } else {
+                                    this.stdoutLines.add(event.text)
+                                    this.stdoutQueuedBytes += bytes
+                                    this.condition.notifyAll()
+                                    false
+                                }
                             }
                         }
                         if (overflow) {
-                            let _ = this.broker.stopOwner(this.ownerId, timeoutMs: 1000)
+                            if (capacityExceeded) {
+                                let _ = this.broker.stopOwner(this.ownerId, timeoutMs: 1000)
+                            }
                             return
                         }
                     } else if (event.eventType == "owner.exit" || event.eventType == "owner.error" || event.eventType == "owner.timeout") {
@@ -145,7 +156,7 @@ private class OpenClawCompatStdioHostTransport <: OpenClawCompatHostTransport {
                     // stderr is continuously drained and intentionally excluded from protocol replies.
                 case None =>
                     let snapshot = this.broker.snapshot()
-                    if (!snapshot.running || !snapshot.responsive) {
+                    if (snapshot.generation != this.ownerGeneration || !snapshot.running || !snapshot.responsive) {
                         synchronized(this.stateLock) {
                             this.closed = true
                             this.lastReadStatus = snapshot.status
@@ -154,7 +165,7 @@ private class OpenClawCompatStdioHostTransport <: OpenClawCompatHostTransport {
                         return
                     }
             }
-        }
+        } } finally { synchronized(this.stateLock) { this.pumpExited = true; this.condition.notifyAll() } }
     }
 
     private func readLine(timeoutMs: Int64): Option<String> {
@@ -184,7 +195,7 @@ private class OpenClawCompatStdioHostTransport <: OpenClawCompatHostTransport {
             }
             let written = this.broker.writeOwnerLine(this.ownerId, this.compactJsonLine(frame.toJsonString()))
             if (!written.ok) {
-                synchronized(this.stateLock) { this.closed = true }
+                synchronized(this.stateLock) { this.closed = true; this.lastReadStatus = written.status; this.condition.notifyAll() }
                 let _ = this.broker.stopOwner(this.ownerId, timeoutMs: 1000)
                 return OpenClawCompatHostTransportResult.Failure("OpenClaw compatibility host write failed: ${written.status}")
             }
@@ -201,7 +212,7 @@ private class OpenClawCompatStdioHostTransport <: OpenClawCompatHostTransport {
                     }
                 case None =>
                     let terminalStatus = synchronized(this.stateLock) { this.lastReadStatus }
-                    synchronized(this.stateLock) { this.closed = true }
+                    synchronized(this.stateLock) { this.closed = true; this.condition.notifyAll() }
                     let _ = this.broker.stopOwner(this.ownerId, timeoutMs: 1000)
                     if (!terminalStatus.isEmpty() && terminalStatus != "timed_out") {
                         OpenClawCompatHostTransportResult.Failure("OpenClaw compatibility host read failed: ${terminalStatus}")
@@ -213,35 +224,30 @@ private class OpenClawCompatStdioHostTransport <: OpenClawCompatHostTransport {
     }
 
     public func close(): Unit {
-        let shouldStop = synchronized(this.stateLock) {
-            if (this.closed) {
-                false
-            } else {
-                this.closed = true
-                true
-            }
-        }
-        if (shouldStop) {
+        synchronized(this.stateLock) { this.closed = true; this.condition.notifyAll() }
+        if (this.broker.snapshot().generation == this.ownerGeneration) {
             let _ = this.broker.stopOwner(this.ownerId, timeoutMs: 1000)
         }
-        let pump = synchronized(this.stateLock) {
-            let value = this.eventPump
-            this.eventPump = None<Future<Unit>>
-            value
-        }
+        let pump = synchronized(this.stateLock) { this.eventPump }
         match (pump) {
             case Some(future) =>
-                try { let _ = future.get(Duration.second) } catch (_: Exception) { try { future.cancel() } catch (_: Exception) { () } }
+                var joined = try { let _ = future.get(Duration.second); true } catch (_: Exception) { false }
+                if (!joined) {
+                    try { future.cancel() } catch (_: Exception) { () }
+                    if (this.broker.snapshot().generation == this.ownerGeneration) { let _ = this.broker.stopOwner(this.ownerId, timeoutMs: 1000) }
+                    joined = try { let _ = future.get(Duration.second); true } catch (_: Exception) { false }
+                }
+                if (joined || synchronized(this.stateLock) { this.pumpExited }) { synchronized(this.stateLock) { this.eventPump = None<Future<Unit>> } }
             case None => ()
         }
     }
 
     public func isAlive(): Bool {
-        if (synchronized(this.stateLock) { this.closed }) {
+        if (synchronized(this.stateLock) { this.closed || this.pumpExited }) {
             return false
         }
         let snapshot = this.broker.snapshot()
-        snapshot.running && snapshot.responsive
+        snapshot.generation == this.ownerGeneration && snapshot.running && snapshot.responsive
     }
 }
 
@@ -269,7 +275,7 @@ public class OpenClawCompatStdioProcessRunner <: OpenClawCompatHostProcessRunner
         if (!started.ok) {
             return OpenClawCompatHostStartResult.Failed(started.status)
         }
-        OpenClawCompatHostStartResult.Started(OpenClawCompatStdioHostTransport(broker, ownerId))
+        OpenClawCompatHostStartResult.Started(OpenClawCompatStdioHostTransport(broker, ownerId, started.generation))
     }
 }
 

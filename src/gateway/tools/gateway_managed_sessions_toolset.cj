@@ -13,9 +13,10 @@ import metis.process.{ManagedStdioBrokerClient, ManagedStdioOwnerSpec}
 
 import std.collection.{ArrayList, HashMap}
 import std.convert.Parsable
-import std.fs.{Directory, File, OpenMode, Path, exists, remove, rename}
+import std.core.Duration
+import std.fs.{Directory, File, OpenMode, Path, canonicalize, exists, remove, rename}
 import std.process.executeWithOutput
-import std.sync.Mutex
+import std.sync.{Condition, Mutex}
 import std.time.DateTime
 
 import stdx.encoding.json.{JsonArray, JsonBool, JsonInt, JsonObject, JsonString, JsonValue}
@@ -23,9 +24,11 @@ import stdx.encoding.json.{JsonArray, JsonBool, JsonInt, JsonObject, JsonString,
 private let gatewayManagedSessionLock = Mutex()
 private var gatewayManagedAgentIds = HashMap<String, String>()
 private var gatewayManagedStates = HashMap<String, String>()
-private var gatewayManagedFutures = HashMap<String, Future<Unit>>()
+private var gatewayManagedFutures = HashMap<String, GatewayManagedRunHandle>()
 private var gatewayManagedProcesses = HashMap<String, String>()
 private var gatewayManagedOwnerSequence: Int64 = 0
+private var gatewayManagedLaunchSequence: Int64 = 0
+private var gatewayManagedCancelTimeoutsForTest: Option<(Int64, Int64)> = None<(Int64, Int64)>
 private var gatewayManagedSessionsGatewayCallRunnerOverride: Option<(String, JsonObject) -> JsonObject> = None<(String, JsonObject) -> JsonObject>
 private var gatewayManagedSubagentCommandSpecOverride: Option<(String, String, String, String, String, String) -> (String, Array<String>, Path)> = None<(String, String, String, String, String, String) -> (String, Array<String>, Path)>
 
@@ -53,11 +56,52 @@ private class GatewayManagedWorkspaceSpec {
     public var isolationMode: String = "shared"
     public var cwd: String = ""
     public var worktreePath: String = ""
+    public var worktreeSourcePath: String = ""
     public var sandbox: String = "inherit"
     public var cleanupMode: String = "keep"
     public var error: String = ""
 
     public init() {}
+}
+
+private class GatewayManagedWorkspaceCleanupResult {
+    public let ok: Bool
+    public let diagnostic: String
+    public init(ok: Bool, diagnostic!: String = "") { this.ok = ok; this.diagnostic = diagnostic }
+}
+
+private class GatewayManagedStartGate {
+    private let lock = Mutex()
+    private var condition: Condition
+    private var opened: Bool = false
+    public init() { synchronized(this.lock) { this.condition = this.lock.condition() } }
+    public func awaitOpen(): Unit { synchronized(this.lock) { while (!this.opened) { let _ = this.condition.wait() } } }
+    public func open(): Unit { synchronized(this.lock) { this.opened = true; this.condition.notifyAll() } }
+}
+
+private class GatewayManagedRunHandle {
+    public let runId: String
+    public let launchId: Int64
+    public let workspaceSpec: Option<GatewayManagedWorkspaceSpec>
+    public var ownerId: String = ""
+    public var ownerGeneration: Int64 = 0
+    public var future: Option<Future<Unit>> = None<Future<Unit>>
+    public var cancelRequested: Bool = false
+    public var terminalPublished: Bool = false
+    public init(runId: String, launchId: Int64, workspaceSpec: Option<GatewayManagedWorkspaceSpec>) {
+        this.runId = runId; this.launchId = launchId; this.workspaceSpec = workspaceSpec
+    }
+}
+
+private class GatewayManagedTerminalOutcome {
+    public let status: String
+    public let resultSummary: String
+    public let error: String
+    public let exitCode: Int64
+    public let outputPath: String
+    public init(status: String, resultSummary!: String = "", error!: String = "", exitCode!: Int64 = 0, outputPath!: String = "") {
+        this.status = status; this.resultSummary = resultSummary; this.error = error; this.exitCode = exitCode; this.outputPath = outputPath
+    }
 }
 
 @toolset
@@ -72,6 +116,10 @@ public class GatewayManagedSessionsToolset {
         gatewayManagedSubagentCommandSpecOverride = runner
     }
 
+    public func debugSetManagedCancelTimeoutsForTest(timeouts: Option<(Int64, Int64)>): Unit {
+        synchronized(gatewayManagedSessionLock) { gatewayManagedCancelTimeoutsForTest = timeouts }
+    }
+
     private func gwStore(): MemorySessionTranscriptStore {
         memorySessionStoreForGatewayUser(CliSettingManager.readGatewaySettings())
     }
@@ -80,6 +128,19 @@ public class GatewayManagedSessionsToolset {
         synchronized(gatewayManagedSessionLock) {
             gatewayManagedOwnerSequence += 1
             "managed-${kind}-${gatewayManagedOwnerSequence}"
+        }
+    }
+
+    private func nextManagedLaunchId(): Int64 {
+        synchronized(gatewayManagedSessionLock) { gatewayManagedLaunchSequence += 1; gatewayManagedLaunchSequence }
+    }
+
+    private func managedRunId(sessionKey: String): String {
+        match (gatewaySubagentFindRunBySessionKey(this.gwStore().sessionsRoot(), sessionKey)) {
+            case Some(record) =>
+                let runId = gatewaySubagentRunRecordString(record, "runId")
+                if (runId.isEmpty()) { sessionKey } else { runId }
+            case None => sessionKey
         }
     }
 
@@ -197,6 +258,7 @@ public class GatewayManagedSessionsToolset {
 
     private func runManagedSessionCommand(
         sessionKey: String,
+        handle: GatewayManagedRunHandle,
         kind: String,
         command: String,
         args: Array<String>,
@@ -220,12 +282,12 @@ public class GatewayManagedSessionsToolset {
         if (!started.ok) {
             return GatewayManagedBrokerRunResult(false, started.status)
         }
-        this.setManagedProcess(sessionKey, ownerId)
+        this.setManagedProcess(sessionKey, handle, ownerId, started.generation)
         try {
             this.collectManagedOwner(broker, ownerId)
         } finally {
             let _ = broker.stopOwner(ownerId, timeoutMs: 1000)
-            this.clearManagedProcess(sessionKey, ownerId)
+            this.clearManagedProcess(sessionKey, handle, ownerId)
         }
     }
 
@@ -404,6 +466,7 @@ public class GatewayManagedSessionsToolset {
             spec.error = "worktree source path does not exist: ${source.toString()}"
             return spec
         }
+        spec.worktreeSourcePath = source.toString()
         let created = this.createManagedWorktree(sessionKey, source)
         if (!created[0]) {
             spec.ok = false
@@ -416,24 +479,58 @@ public class GatewayManagedSessionsToolset {
         spec
     }
 
-    private func cleanupManagedWorkspace(spec: GatewayManagedWorkspaceSpec): Unit {
-        if (spec.isolationMode != "worktree" || spec.cleanupMode != "delete" || spec.worktreePath.trimAscii().isEmpty()) {
-            return
+    private func managedWorktreeFallbackIsSafe(spec: GatewayManagedWorkspaceSpec): Bool {
+        if (spec.worktreePath.trimAscii().isEmpty() || spec.worktreeSourcePath.trimAscii().isEmpty()) { return false }
+        try {
+            let managedRoot = canonicalize(CliConfig.dotDir.join("subagents").join("worktrees")).toString()
+            let sourceRoot = canonicalize(Path(spec.worktreeSourcePath)).toString()
+            let candidatePath = Path(spec.worktreePath)
+            let candidate = if (exists(candidatePath)) { canonicalize(candidatePath).toString() } else { candidatePath.normalize().toString() }
+            canonicalize(candidatePath.parent).toString() == managedRoot && candidate != sourceRoot
+        } catch (_: Exception) { false }
+    }
+
+    private func managedWorktreeStillRegistered(spec: GatewayManagedWorkspaceSpec): (Bool, String) {
+        let listed = this.runManagedBrokerCommand("worktree-list", "git", ["-C", spec.worktreeSourcePath, "worktree", "list", "--porcelain"], Path(spec.worktreeSourcePath), 60000)
+        if (!listed.ok) { return (true, "git worktree list failed: status=${listed.status}; exitCode=${listed.exitCode}") }
+        let target = Path(spec.worktreePath).normalize().toString()
+        for (line in listed.stdout.split("\n")) {
+            let trimmed = line.trimAscii()
+            if (trimmed.startsWith("worktree ") && Path(trimmed.removePrefix("worktree ").trimAscii()).normalize().toString() == target) {
+                return (true, "worktree remains registered")
+            }
         }
+        (false, "")
+    }
+
+    private func cleanupManagedWorkspace(spec: GatewayManagedWorkspaceSpec): GatewayManagedWorkspaceCleanupResult {
+        if (spec.isolationMode != "worktree" || spec.cleanupMode != "delete" || spec.worktreePath.trimAscii().isEmpty()) {
+            return GatewayManagedWorkspaceCleanupResult(true)
+        }
+        if (!this.managedWorktreeFallbackIsSafe(spec)) { return GatewayManagedWorkspaceCleanupResult(false, diagnostic: "managed worktree cleanup refused unsafe path") }
+        var removeFailed = false
         try {
             let result = this.runManagedBrokerCommand(
                 "worktree-remove",
                 "git",
-                ["worktree", "remove", "--force", spec.worktreePath],
-                CliConfig.cwd,
+                ["-C", spec.worktreeSourcePath, "worktree", "remove", "--force", spec.worktreePath],
+                Path(spec.worktreeSourcePath),
                 60000
             )
-            if (!result.ok && exists(Path(spec.worktreePath))) {
-                try { remove(Path(spec.worktreePath), recursive: true) } catch (_inner: Exception) { () }
+            removeFailed = !result.ok
+        } catch (_: Exception) { removeFailed = true }
+        if (removeFailed) {
+            if (exists(Path(spec.worktreePath))) {
+                try { remove(Path(spec.worktreePath), recursive: true) } catch (e: Exception) {
+                    return GatewayManagedWorkspaceCleanupResult(false, diagnostic: "managed worktree directory removal failed: ${this.managedDiagnostic(e.message)}")
+                }
             }
-        } catch (_: Exception) {
-            try { remove(Path(spec.worktreePath), recursive: true) } catch (_inner: Exception) { () }
+            let pruned = this.runManagedBrokerCommand("worktree-prune", "git", ["-C", spec.worktreeSourcePath, "worktree", "prune"], Path(spec.worktreeSourcePath), 60000)
+            if (!pruned.ok) { return GatewayManagedWorkspaceCleanupResult(false, diagnostic: "git worktree prune failed: status=${pruned.status}; exitCode=${pruned.exitCode}") }
         }
+        let registered = this.managedWorktreeStillRegistered(spec)
+        if (exists(Path(spec.worktreePath)) || registered[0]) { return GatewayManagedWorkspaceCleanupResult(false, diagnostic: registered[1]) }
+        GatewayManagedWorkspaceCleanupResult(true)
     }
 
     private func supportsRealManagedSubagent(agentId: String): Bool {
@@ -1261,31 +1358,80 @@ public class GatewayManagedSessionsToolset {
         this.gwStore().formatHistoryAsText(parent, maxEntries)
     }
 
-    private func setManagedFuture(sessionKey: String, future: Future<Unit>): Unit {
-        synchronized(gatewayManagedSessionLock) {
-            gatewayManagedFutures.add(sessionKey, future)
-        }
+    private func managedHandleMatches(current: GatewayManagedRunHandle, expected: GatewayManagedRunHandle): Bool {
+        current.runId == expected.runId && current.launchId == expected.launchId
     }
 
-    private func clearManagedFuture(sessionKey: String): Unit {
-        synchronized(gatewayManagedSessionLock) {
-            gatewayManagedFutures.remove(sessionKey)
-        }
+    private func registerManagedFuture(sessionKey: String, handle: GatewayManagedRunHandle, future: Future<Unit>): Unit {
+        synchronized(gatewayManagedSessionLock) { handle.future = Some(future); gatewayManagedFutures.add(sessionKey, handle) }
     }
 
-    private func setManagedProcess(sessionKey: String, ownerId: String): Unit {
+    private func setManagedProcess(sessionKey: String, handle: GatewayManagedRunHandle, ownerId: String, ownerGeneration: Int64): Unit {
         synchronized(gatewayManagedSessionLock) {
-            gatewayManagedProcesses.add(sessionKey, ownerId)
-        }
-    }
-
-    private func clearManagedProcess(sessionKey: String, ownerId: String): Unit {
-        synchronized(gatewayManagedSessionLock) {
-            match (gatewayManagedProcesses.get(sessionKey)) {
-                case Some(current) => if (current == ownerId) { gatewayManagedProcesses.remove(sessionKey) }
+            match (gatewayManagedFutures.get(sessionKey)) {
+                case Some(current) => if (this.managedHandleMatches(current, handle)) {
+                    current.ownerId = ownerId; current.ownerGeneration = ownerGeneration; gatewayManagedProcesses.add(sessionKey, ownerId)
+                }
                 case None => ()
             }
         }
+    }
+
+    private func clearManagedProcess(sessionKey: String, handle: GatewayManagedRunHandle, ownerId: String): Unit {
+        synchronized(gatewayManagedSessionLock) {
+            match (gatewayManagedFutures.get(sessionKey)) {
+                case Some(current) => if (this.managedHandleMatches(current, handle) && current.ownerId == ownerId) {
+                    current.ownerId = ""
+                    match (gatewayManagedProcesses.get(sessionKey)) { case Some(value) => if (value == ownerId) { gatewayManagedProcesses.remove(sessionKey) } case None => () }
+                }
+                case None => ()
+            }
+        }
+    }
+
+    private func managedCancellationRequested(sessionKey: String, handle: GatewayManagedRunHandle): Bool {
+        synchronized(gatewayManagedSessionLock) {
+            match (gatewayManagedFutures.get(sessionKey)) {
+                case Some(current) => this.managedHandleMatches(current, handle) && current.cancelRequested
+                case None => handle.cancelRequested
+            }
+        }
+    }
+
+    private func setManagedRunning(sessionKey: String, handle: GatewayManagedRunHandle): Bool {
+        var updated = false
+        synchronized(gatewayManagedSessionLock) {
+            match (gatewayManagedFutures.get(sessionKey)) {
+                case Some(current) => if (this.managedHandleMatches(current, handle)) {
+                    gatewayManagedStates.add(sessionKey, "running")
+                    updated = true
+                }
+                case None => ()
+            }
+        }
+        if (updated) { let _ = gatewaySubagentMarkRunState(this.gwStore().sessionsRoot(), sessionKey, "running") }
+        updated
+    }
+
+    private func finalizeManagedRun(sessionKey: String, handle: GatewayManagedRunHandle, outcome: GatewayManagedTerminalOutcome): Bool {
+        var cancellationWins = false
+        var published = false
+        synchronized(gatewayManagedSessionLock) {
+            match (gatewayManagedFutures.get(sessionKey)) {
+                case Some(current) => if (this.managedHandleMatches(current, handle) && !current.terminalPublished) {
+                    current.terminalPublished = true; cancellationWins = current.cancelRequested; gatewayManagedFutures.remove(sessionKey)
+                    match (gatewayManagedProcesses.get(sessionKey)) { case Some(owner) => if (owner == current.ownerId || current.ownerId.isEmpty()) { gatewayManagedProcesses.remove(sessionKey) } case None => () }
+                    gatewayManagedStates.add(sessionKey, if (cancellationWins) { "cancelled" } else { outcome.status })
+                    published = true
+                }
+                case None => ()
+            }
+        }
+        if (!published) { return false }
+        let effective = if (cancellationWins) { GatewayManagedTerminalOutcome("cancelled", error: "cancelled", outputPath: outcome.outputPath) } else { outcome }
+        let _ = gatewaySubagentMarkRunState(this.gwStore().sessionsRoot(), sessionKey, effective.status, resultSummary: effective.resultSummary, error: effective.error, exitCode: effective.exitCode, outputPath: effective.outputPath)
+        this.deliverManagedTerminalNotice(sessionKey)
+        true
     }
 
     private func forgetManagedSession(sessionKey: String): Unit {
@@ -1518,33 +1664,37 @@ public class GatewayManagedSessionsToolset {
     }
 
     private func cancelManagedSession(sessionKey: String): Bool {
+        let cancelTimeouts = synchronized(gatewayManagedSessionLock) { gatewayManagedCancelTimeoutsForTest } ?? (1500, 1500)
         let selected = synchronized(gatewayManagedSessionLock) {
-            let ownerId = match (gatewayManagedProcesses.get(sessionKey)) {
-                case Some(value) => value
-                case None => ""
-            }
-            let future = gatewayManagedFutures.get(sessionKey)
-            if (!ownerId.isEmpty() || future.isSome()) {
-                gatewayManagedStates.add(sessionKey, "cancelling")
-            }
-            (ownerId, future)
+            let handle = gatewayManagedFutures.get(sessionKey)
+            match (handle) { case Some(current) => current.cancelRequested = true case None => () }
+            let ownerId = match (handle) { case Some(current) => current.ownerId case None => "" }
+            if (handle.isSome()) { gatewayManagedStates.add(sessionKey, "cancelling") }
+            (ownerId, handle)
         }
-        var cancelled = false
-        match (selected[1]) {
+        if (selected[1].isNone()) { return false }
+        let handle = selected[1].getOrThrow()
+        let broker = gatewayStdioBroker()
+        if (!selected[0].isEmpty() && broker.snapshot().generation == handle.ownerGeneration) {
+            let _ = broker.stopOwner(selected[0], timeoutMs: cancelTimeouts[0])
+        }
+        var joined = false
+        match (handle.future) {
             case Some(future) =>
-                try { future.cancel() } catch (_: Exception) { () }
-                cancelled = true
-            case None => ()
+                joined = try { future.get(Duration.millisecond * cancelTimeouts[1]); true } catch (_: Exception) { false }
+                if (!joined) {
+                    try { future.cancel() } catch (_: Exception) { () }
+                    joined = try { future.get(Duration.millisecond * cancelTimeouts[1]); true } catch (_: Exception) { false }
+                }
+            case None => joined = true
         }
-        if (!selected[0].isEmpty()) {
-            let stopped = gatewayStdioBroker().stopOwner(selected[0], timeoutMs: 1500)
-            cancelled = cancelled || stopped.ok || stopped.status == "already_stopped"
+        if (joined) {
+            match (handle.workspaceSpec) { case Some(ws) => let _ = this.cleanupManagedWorkspace(ws) case None => () }
         }
-        if (cancelled) {
-            let reason = if (!selected[0].isEmpty()) { "process terminated" } else { "cancel requested" }
-            let _ = gatewaySubagentMarkRunCancelled(this.gwStore().sessionsRoot(), sessionKey, reason: reason)
+        if (!joined) {
+            this.gwStore().appendTranscriptEntry(sessionKey, "system", "managed run cancellation is still draining after bounded join")
         }
-        cancelled
+        true
     }
 
     private func stringListContains(values: ArrayList<String>, target: String): Bool {
@@ -1590,13 +1740,15 @@ public class GatewayManagedSessionsToolset {
                 let snapshot = this.managedKillSnapshot(childSessionKey)
                 this.markManagedSessionKillRequested(childSessionKey, target)
                 let cancelRequested = this.cancelManagedSession(childSessionKey)
+                let cleanupPending = cancelRequested && this.managedHasLiveFuture(childSessionKey)
                 let reason = "cascade cancelled by parent ${parentRunId}"
-                let _ = gatewaySubagentMarkRunCancelled(this.gwStore().sessionsRoot(), childRunId, reason: reason)
+                if (!cancelRequested) { let _ = gatewaySubagentMarkRunCancelled(this.gwStore().sessionsRoot(), childRunId, reason: reason) }
                 let row = JsonObject()
                 row.put("runId", JsonString(childRunId))
                 row.put("sessionKey", JsonString(childSessionKey))
                 row.put("parentSessionKey", JsonString(currentParent))
                 row.put("cancelRequested", cancelRequested.toJsonValue())
+                row.put("cleanupPending", cleanupPending.toJsonValue())
                 row.put("hadLiveFuture", (snapshot[1]).toJsonValue())
                 row.put("hadLiveProcess", (snapshot[2]).toJsonValue())
                 gatewaySubagentPutEffectiveState(row, effective)
@@ -1648,16 +1800,21 @@ public class GatewayManagedSessionsToolset {
             "system",
             "acp dispatch accepted: harness=${resolvedHarness}, mode=${effectiveMode}, sandbox=${effectiveSandbox}, sessionPersistence=${effectiveSessionPersistence}"
         )
+        let handle = GatewayManagedRunHandle(this.managedRunId(sessionKey), this.nextManagedLaunchId(), None<GatewayManagedWorkspaceSpec>)
+        let startGate = GatewayManagedStartGate()
         let future = spawn {
-            this.setManagedState(sessionKey, "running")
+            startGate.awaitOpen()
+            if (!this.setManagedRunning(sessionKey, handle)) { return }
             st.appendTranscriptEntry(
                 sessionKey,
                 "system",
                 "acp started: harness=${resolvedHarness}, mode=${effectiveMode}, sandbox=${effectiveSandbox}, sessionPersistence=${effectiveSessionPersistence}"
             )
+            var outcome = GatewayManagedTerminalOutcome("failed", error: "acp failed", exitCode: 1, outputPath: st.transcriptPath(sessionKey).toString())
             try {
                 let result = this.runManagedSessionCommand(
                     sessionKey,
+                    handle,
                     "acp",
                     if (withWrap) { "sh" } else { command[0] },
                     if (withWrap) { ["-c", String.join(command, delimiter: " ")] } else { if (command.size > 1) { command[1..] } else { [] } },
@@ -1675,13 +1832,13 @@ public class GatewayManagedSessionsToolset {
                 let outputPath = st.transcriptPath(sessionKey).toString()
                 if (result.status == "timed_out") {
                     st.appendTranscriptEntry(sessionKey, "system", "acp timed out: harness=${resolvedHarness} timeoutSeconds=${runTimeoutSeconds}")
-                    this.setManagedState(sessionKey, "timed_out", error: "subagent timed out after ${runTimeoutSeconds}s", exitCode: -1, outputPath: outputPath)
-                } else if (Thread.currentThread.hasPendingCancellation) {
+                    outcome = GatewayManagedTerminalOutcome("timed_out", error: "subagent timed out after ${runTimeoutSeconds}s", exitCode: -1, outputPath: outputPath)
+                } else if (Thread.currentThread.hasPendingCancellation || this.managedCancellationRequested(sessionKey, handle)) {
                     st.appendTranscriptEntry(sessionKey, "system", "acp cancelled")
-                    this.setManagedState(sessionKey, "cancelled", error: "cancelled", outputPath: outputPath)
+                    outcome = GatewayManagedTerminalOutcome("cancelled", error: "cancelled", outputPath: outputPath)
                 } else if (result.ok && result.exitCode == 0) {
                     st.appendTranscriptEntry(sessionKey, "system", "acp completed: harness=${resolvedHarness} exitCode=${result.exitCode}")
-                    this.setManagedState(sessionKey, "succeeded", resultSummary: if (stdout.trimAscii().isEmpty()) { "acp completed" } else { stdout.trimAscii() }, exitCode: result.exitCode, outputPath: outputPath)
+                    outcome = GatewayManagedTerminalOutcome("succeeded", resultSummary: if (stdout.trimAscii().isEmpty()) { "acp completed" } else { stdout.trimAscii() }, exitCode: result.exitCode, outputPath: outputPath)
                 } else {
                     let failure = if (result.status == "exited") {
                         "acp failed: harness=${resolvedHarness} exitCode=${result.exitCode}"
@@ -1689,24 +1846,24 @@ public class GatewayManagedSessionsToolset {
                         "acp failed: harness=${resolvedHarness} status=${result.status} exitCode=${result.exitCode}"
                     }
                     st.appendTranscriptEntry(sessionKey, "system", failure)
-                    this.setManagedState(sessionKey, "failed", error: failure, exitCode: result.exitCode, outputPath: outputPath)
+                    outcome = GatewayManagedTerminalOutcome("failed", error: failure, exitCode: result.exitCode, outputPath: outputPath)
                 }
             } catch (e: Exception) {
                 let outputPath = st.transcriptPath(sessionKey).toString()
-                if (Thread.currentThread.hasPendingCancellation) {
+                if (Thread.currentThread.hasPendingCancellation || this.managedCancellationRequested(sessionKey, handle)) {
                     st.appendTranscriptEntry(sessionKey, "system", "acp cancelled")
-                    this.setManagedState(sessionKey, "cancelled", error: "cancelled", outputPath: outputPath)
+                    outcome = GatewayManagedTerminalOutcome("cancelled", error: "cancelled", outputPath: outputPath)
                 } else {
                     let diagnostic = this.managedDiagnostic(e.message)
                     st.appendTranscriptEntry(sessionKey, "system", "acp failed: ${diagnostic}")
-                    this.setManagedState(sessionKey, "failed", error: "acp failed: ${diagnostic}", exitCode: 1, outputPath: outputPath)
+                    outcome = GatewayManagedTerminalOutcome("failed", error: "acp failed: ${diagnostic}", exitCode: 1, outputPath: outputPath)
                 }
             } finally {
-                this.clearManagedFuture(sessionKey)
-                this.maybeDeleteManagedSessionAfterRun(sessionKey)
+                if (this.finalizeManagedRun(sessionKey, handle, outcome)) { this.maybeDeleteManagedSessionAfterRun(sessionKey) }
             }
         }
-        this.setManagedFuture(sessionKey, future)
+        this.registerManagedFuture(sessionKey, handle, future)
+        startGate.open()
         true
     }
 
@@ -1760,12 +1917,17 @@ public class GatewayManagedSessionsToolset {
         let workDir = spec[2]
         let st = this.gwStore()
         st.appendTranscriptEntry(sessionKey, "system", "subagent dispatch accepted: agentId=${resolvedAgentId}, source=${resolvedSpec.source}")
+        let handle = GatewayManagedRunHandle(this.managedRunId(sessionKey), this.nextManagedLaunchId(), workspaceSpec)
+        let startGate = GatewayManagedStartGate()
         let future = spawn {
-            this.setManagedState(sessionKey, "running")
+            startGate.awaitOpen()
+            if (!this.setManagedRunning(sessionKey, handle)) { return }
             st.appendTranscriptEntry(sessionKey, "system", "subagent started: agentId=${resolvedAgentId}, source=${resolvedSpec.source}")
+            var outcome = GatewayManagedTerminalOutcome("failed", error: "subagent failed", exitCode: 1, outputPath: st.transcriptPath(sessionKey).toString())
             try {
                 let result = this.runManagedSessionCommand(
                     sessionKey,
+                    handle,
                     "subagent",
                     command,
                     args,
@@ -1777,53 +1939,47 @@ public class GatewayManagedSessionsToolset {
                 let outputPath = st.transcriptPath(sessionKey).toString()
                 if (result.status == "timed_out") {
                     st.appendTranscriptEntry(sessionKey, "system", "subagent timed out: agentId=${resolvedAgentId} timeoutSeconds=${runTimeoutSeconds}")
-                    this.setManagedState(sessionKey, "timed_out", error: "subagent timed out after ${runTimeoutSeconds}s", exitCode: -1, outputPath: outputPath)
-                    return
-                }
-                if (Thread.currentThread.hasPendingCancellation) {
+                    outcome = GatewayManagedTerminalOutcome("timed_out", error: "subagent timed out after ${runTimeoutSeconds}s", exitCode: -1, outputPath: outputPath)
+                } else if (Thread.currentThread.hasPendingCancellation || this.managedCancellationRequested(sessionKey, handle)) {
                     st.appendTranscriptEntry(sessionKey, "system", "subagent cancelled")
-                    this.setManagedState(sessionKey, "cancelled", error: "cancelled", outputPath: outputPath)
-                    return
-                }
-                if (!stderr.isEmpty()) {
-                    st.appendTranscriptEntry(sessionKey, "system", "subagent stderr: ${stderr}")
-                }
-                if (result.ok && result.exitCode == 0 && !content.isEmpty()) {
-                    st.appendTranscriptEntry(sessionKey, "assistant", content)
-                    st.appendTranscriptEntry(sessionKey, "system", "subagent completed: agentId=${resolvedAgentId}")
-                    this.setManagedState(sessionKey, "succeeded", resultSummary: content, exitCode: result.exitCode, outputPath: outputPath)
-                } else if (result.ok && result.exitCode == 0) {
-                    st.appendTranscriptEntry(sessionKey, "system", "subagent completed with empty response")
-                    this.setManagedState(sessionKey, "succeeded", resultSummary: "subagent completed with empty response", exitCode: result.exitCode, outputPath: outputPath)
+                    outcome = GatewayManagedTerminalOutcome("cancelled", error: "cancelled", outputPath: outputPath)
                 } else {
-                    let failure = if (result.status == "exited") {
-                        "subagent failed: agentId=${resolvedAgentId} exitCode=${result.exitCode}"
+                    if (!stderr.isEmpty()) { st.appendTranscriptEntry(sessionKey, "system", "subagent stderr: ${stderr}") }
+                    if (result.ok && result.exitCode == 0 && !content.isEmpty()) {
+                        st.appendTranscriptEntry(sessionKey, "assistant", content)
+                        st.appendTranscriptEntry(sessionKey, "system", "subagent completed: agentId=${resolvedAgentId}")
+                        outcome = GatewayManagedTerminalOutcome("succeeded", resultSummary: content, exitCode: result.exitCode, outputPath: outputPath)
+                    } else if (result.ok && result.exitCode == 0) {
+                        st.appendTranscriptEntry(sessionKey, "system", "subagent completed with empty response")
+                        outcome = GatewayManagedTerminalOutcome("succeeded", resultSummary: "subagent completed with empty response", exitCode: result.exitCode, outputPath: outputPath)
                     } else {
-                        "subagent failed: agentId=${resolvedAgentId} status=${result.status} exitCode=${result.exitCode}"
+                        let failure = if (result.status == "exited") { "subagent failed: agentId=${resolvedAgentId} exitCode=${result.exitCode}" } else { "subagent failed: agentId=${resolvedAgentId} status=${result.status} exitCode=${result.exitCode}" }
+                        st.appendTranscriptEntry(sessionKey, "system", failure)
+                        outcome = GatewayManagedTerminalOutcome("failed", error: failure, exitCode: result.exitCode, outputPath: outputPath)
                     }
-                    st.appendTranscriptEntry(sessionKey, "system", failure)
-                    this.setManagedState(sessionKey, "failed", error: failure, exitCode: result.exitCode, outputPath: outputPath)
                 }
             } catch (e: Exception) {
                 let outputPath = st.transcriptPath(sessionKey).toString()
-                if (Thread.currentThread.hasPendingCancellation) {
+                if (Thread.currentThread.hasPendingCancellation || this.managedCancellationRequested(sessionKey, handle)) {
                     st.appendTranscriptEntry(sessionKey, "system", "subagent cancelled")
-                    this.setManagedState(sessionKey, "cancelled", error: "cancelled", outputPath: outputPath)
+                    outcome = GatewayManagedTerminalOutcome("cancelled", error: "cancelled", outputPath: outputPath)
                 } else {
                     let diagnostic = this.managedDiagnostic(e.message)
                     st.appendTranscriptEntry(sessionKey, "system", "subagent failed: ${diagnostic}")
-                    this.setManagedState(sessionKey, "failed", error: "subagent failed: ${diagnostic}", exitCode: 1, outputPath: outputPath)
+                    outcome = GatewayManagedTerminalOutcome("failed", error: "subagent failed: ${diagnostic}", exitCode: 1, outputPath: outputPath)
                 }
             } finally {
+                var cleanup = GatewayManagedWorkspaceCleanupResult(true)
                 match (workspaceSpec) {
-                    case Some(ws) => this.cleanupManagedWorkspace(ws)
+                    case Some(ws) => cleanup = this.cleanupManagedWorkspace(ws)
                     case None => ()
                 }
-                this.clearManagedFuture(sessionKey)
-                this.maybeDeleteManagedSessionAfterRun(sessionKey)
+                if (!cleanup.ok && outcome.status == "succeeded") { outcome = GatewayManagedTerminalOutcome("failed", error: "subagent workspace cleanup failed: ${this.managedDiagnostic(cleanup.diagnostic)}", exitCode: 1, outputPath: outcome.outputPath) }
+                if (this.finalizeManagedRun(sessionKey, handle, outcome)) { this.maybeDeleteManagedSessionAfterRun(sessionKey) }
             }
         }
-        this.setManagedFuture(sessionKey, future)
+        this.registerManagedFuture(sessionKey, handle, future)
+        startGate.open()
         true
     }
 
@@ -2791,14 +2947,15 @@ public class GatewayManagedSessionsToolset {
         if (act == "kill") {
             let killed = this.cancelManagedSession(resolved)
             if (killed) {
-                this.setManagedState(resolved, "cancelled")
                 this.gwStore().appendTranscriptEntry(resolved, "system", "process killed via process(action=kill)")
             }
             let result = JsonObject()
             result.put("ok", JsonBool(killed))
             result.put("action", JsonString("kill"))
             result.put("sessionKey", JsonString(resolved))
-            result.put("status", JsonString(if (killed) { "killed" } else { "not-running" }))
+            let cleanupPending = killed && this.managedHasLiveFuture(resolved)
+            result.put("status", JsonString(if (cleanupPending) { "cancelling" } else if (killed) { "killed" } else { "not-running" }))
+            result.put("cleanupPending", cleanupPending.toJsonValue())
             result.put("state", JsonString(this.managedState(resolved)))
             let out = result.toJsonString()
             PrintUtils.printToolResult(out)
@@ -3200,6 +3357,7 @@ public class GatewayManagedSessionsToolset {
                     let hadProcess = snapshot[2]
                     this.markManagedSessionKillRequested(sessionKey, "all")
                     let cancelRequested = this.cancelManagedSession(sessionKey)
+                    let cleanupPending = cancelRequested && this.managedHasLiveFuture(sessionKey)
                     if (!cancelRequested && !hadFuture && !hadProcess) {
                         this.setManagedState(sessionKey, "cancelled", error: "cancel requested")
                     }
@@ -3211,6 +3369,7 @@ public class GatewayManagedSessionsToolset {
                     row.put("hadLiveFuture", hadFuture.toJsonValue())
                     row.put("hadLiveProcess", hadProcess.toJsonValue())
                     row.put("cancelRequested", cancelRequested.toJsonValue())
+                    row.put("cleanupPending", cleanupPending.toJsonValue())
                     row.put("cascadeCancelled", cascaded)
                     gatewaySubagentPutEffectiveState(row, effective)
                     killed.add(row)
@@ -3272,7 +3431,7 @@ public class GatewayManagedSessionsToolset {
                 if (!cancelRequested && !hadFuture && !hadProcess) {
                     this.setManagedState(resolved, "cancelled", error: "cancel requested")
                 }
-                resultStatus = "cancelled"
+                resultStatus = if (cancelRequested && this.managedHasLiveFuture(resolved)) { "cancelling" } else { "cancelled" }
             }
             let cascadeCancelled = if (!effective.isTerminal) {
                 this.cascadeCancelChildRuns(resolved, gatewaySubagentRunRecordString(record, "runId"), tgt)
@@ -3291,6 +3450,7 @@ public class GatewayManagedSessionsToolset {
             result.put("hadLiveFuture", hadFuture.toJsonValue())
             result.put("hadLiveProcess", hadProcess.toJsonValue())
             result.put("cancelRequested", cancelRequested.toJsonValue())
+            result.put("cleanupPending", (cancelRequested && this.managedHasLiveFuture(resolved)).toJsonValue())
             result.put("cascadeCancelled", cascadeCancelled)
             result.put("deleted", JsonBool(false))
             gatewaySubagentPutEffectiveState(result, effective)

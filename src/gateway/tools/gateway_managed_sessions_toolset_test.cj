@@ -69,6 +69,10 @@ private func managedSubagentsInt(obj: JsonObject, key: String): Int64 {
     }
 }
 
+private func managedSubagentsBool(obj: JsonObject, key: String): Bool {
+    match (obj.get(key)) { case Some(v) => try { v.asBool().getValue() } catch (_: Exception) { false } case None => false }
+}
+
 private func managedSubagentsWaitForTerminal(toolset: GatewayManagedSessionsToolset, runId: String, timeoutMs!: Int64 = 5000): JsonObject {
     let deadline = DateTime.now().toUnixTimeStamp().toMilliseconds() + timeoutMs
     var last = JsonObject()
@@ -124,17 +128,6 @@ private func managedSubagentsWaitPidGone(pid: String, timeoutMs!: Int64 = 3000):
     }
     let (exitCode, _, _) = ShellUtils.execute(["/bin/kill", "-0", pid], withWrap: false)
     exitCode != 0
-}
-
-private func managedSubagentsWaitForWorktreeCleanup(worktreePath: String, timeoutMs!: Int64 = 3000): Bool {
-    let deadline = DateTime.now().toUnixTimeStamp().toMilliseconds() + timeoutMs
-    while (DateTime.now().toUnixTimeStamp().toMilliseconds() < deadline) {
-        if (!exists(Path(worktreePath)) && gatewayStdioBroker().snapshot().ownerCount == 0) {
-            return true
-        }
-        sleep(Duration.millisecond * 20)
-    }
-    !exists(Path(worktreePath)) && gatewayStdioBroker().snapshot().ownerCount == 0
 }
 
 private func createManagedSubagentsCustomAgentFixture(id: String, background: Bool): Path {
@@ -194,6 +187,17 @@ private func managedSubagentsRunGit(repo: Path, args: Array<String>): Bool {
     }
     let result = ShellUtils.execute(command.toArray(), timeout: Some(Duration.second * 30), workDir: Some(repo), withWrap: false)
     result[0] == 0
+}
+
+private func managedSubagentsWorktreeRegistered(repo: Path, worktreePath: String): Bool {
+    let result = ShellUtils.execute(["git", "worktree", "list", "--porcelain"], timeout: Some(Duration.second * 30), workDir: Some(repo), withWrap: false)
+    if (result[0] != 0) { return true }
+    let target = Path(worktreePath).normalize().toString()
+    for (line in result[1].split("\n")) {
+        let trimmed = line.trimAscii()
+        if (trimmed.startsWith("worktree ") && Path(trimmed.removePrefix("worktree ").trimAscii()).normalize().toString() == target) { return true }
+    }
+    false
 }
 
 private func createManagedSubagentsGitRepo(name: String): Path {
@@ -1411,6 +1415,7 @@ public class GatewayManagedSessionsToolsetTest {
                 let terminal = managedSubagentsWaitForTerminal(toolset, runId)
                 let run = terminal.get("run").getOrThrow().asObject()
                 @Expect(managedSubagentsString(run, "status"), "succeeded")
+                @Expect(managedSubagentsBool(run, "hasLiveFuture"), false)
                 let logs = managedSubagentsJson(toolset.subagentsForTest(managedSubagentsSome("logs"), managedSubagentsSome(runId), None<String>, None<Int64>))
                 let text = managedSubagentsString(logs, "logs")
                 @Expect(text.contains("仓颉输出🙂"), true)
@@ -1478,7 +1483,9 @@ public class GatewayManagedSessionsToolsetTest {
 
                 let recovered = managedSubagentsSpawnFakeAcp(toolset, "managed-empty")
                 let recoveredTerminal = managedSubagentsWaitForTerminal(toolset, managedSubagentsString(recovered, "runId"))
-                @Expect(managedSubagentsString(recoveredTerminal.get("run").getOrThrow().asObject(), "status"), "succeeded")
+                let recoveredRun = recoveredTerminal.get("run").getOrThrow().asObject()
+                @Expect(managedSubagentsString(recoveredRun, "status"), "succeeded")
+                @Expect(managedSubagentsBool(recoveredRun, "hasLiveFuture"), false)
                 @Expect(gatewayStdioBroker().snapshot().ownerCount, 0)
             }
         }
@@ -1523,7 +1530,7 @@ public class GatewayManagedSessionsToolsetTest {
             let pidFile = CliConfig.dotDir.join("managed-subagent-hang.pids")
             toolset.debugSetManagedSubagentCommandSpecForTest(Some<(String, String, String, String, String, String) -> (String, Array<String>, Path)>(
                 { _sessionKey, _agentId, _task, cwdHint, _agentDir, _modelHint =>
-                    ("node", [fixture, "managed-success"], Path(cwdHint))
+                    ("node", [fixture, "managed-success-remove-worktree"], Path(cwdHint))
                 }
             ))
             try {
@@ -1549,10 +1556,12 @@ public class GatewayManagedSessionsToolsetTest {
                     ))
                     let worktreePath = managedSubagentsString(spawned, "worktreePath")
                     let terminal = managedSubagentsWaitForTerminal(toolset, managedSubagentsString(spawned, "runId"))
-                    @Expect(managedSubagentsString(terminal.get("run").getOrThrow().asObject(), "status"), "succeeded")
+                    let terminalRun = terminal.get("run").getOrThrow().asObject()
+                    @Expect(managedSubagentsString(terminalRun, "status"), "succeeded")
+                    @Expect(managedSubagentsBool(terminalRun, "hasLiveFuture"), false)
                     @Expect(exists(worktreeHookMarker), true)
-                    @Expect(managedSubagentsWaitForWorktreeCleanup(worktreePath), true)
                     @Expect(exists(Path(worktreePath)), false)
+                    @Expect(managedSubagentsWorktreeRegistered(repo, worktreePath), false)
                     @Expect(gatewayStdioBroker().snapshot().ownerCount, 0)
                 }
 
@@ -1568,18 +1577,26 @@ public class GatewayManagedSessionsToolsetTest {
                         Some("subagent"),
                         Some("broker-subagent"),
                         None<String>, None<String>, None<String>, Some(repo.toString()), Some(20), None<Int64>,
-                        None<String>, Some("cwd"), None<Bool>, None<String>, None<String>, None<String>, None<String>
+                        None<String>, Some("worktree"), None<Bool>, None<String>, Some("delete"), None<String>, None<String>
                     ))
                     let runId = managedSubagentsString(spawned, "runId")
+                    let cancelWorktreePath = managedSubagentsString(spawned, "worktreePath")
                     let pidDeadline = DateTime.now().toUnixTimeStamp().toMilliseconds() + 2000
                     while (!exists(pidFile) && DateTime.now().toUnixTimeStamp().toMilliseconds() < pidDeadline) {
                         sleep(Duration.millisecond * 20)
                     }
                     @Expect(exists(pidFile), true)
+                    toolset.debugSetManagedCancelTimeoutsForTest(Some<(Int64, Int64)>((1, 1)))
                     let killed = managedSubagentsJson(toolset.subagentsForTest(managedSubagentsSome("kill"), managedSubagentsSome(runId), None<String>, None<Int64>))
-                    @Expect(managedSubagentsString(killed, "status"), "cancelled")
+                    @Expect(managedSubagentsString(killed, "status"), "cancelling")
+                    @Expect(managedSubagentsBool(killed, "cleanupPending"), true)
+                    toolset.debugSetManagedCancelTimeoutsForTest(None<(Int64, Int64)>)
                     let terminal = managedSubagentsWaitForTerminal(toolset, runId)
-                    @Expect(managedSubagentsString(terminal.get("run").getOrThrow().asObject(), "status"), "cancelled")
+                    let terminalRun = terminal.get("run").getOrThrow().asObject()
+                    @Expect(managedSubagentsString(terminalRun, "status"), "cancelled")
+                    @Expect(managedSubagentsBool(terminalRun, "hasLiveFuture"), false)
+                    @Expect(exists(Path(cancelWorktreePath)), false)
+                    @Expect(managedSubagentsWorktreeRegistered(repo, cancelWorktreePath), false)
                     for (pid in String.fromUtf8(File.readFrom(pidFile)).split("\n")) {
                         let value = pid.trimAscii()
                         if (!value.isEmpty()) {
@@ -1590,6 +1607,7 @@ public class GatewayManagedSessionsToolsetTest {
                 }
             } finally {
                 toolset.debugSetManagedSubagentCommandSpecForTest(None<(String, String, String, String, String, String) -> (String, Array<String>, Path)>)
+                toolset.debugSetManagedCancelTimeoutsForTest(None<(Int64, Int64)>)
                 try { remove(pidFile) } catch (_: Exception) { () }
             }
         }

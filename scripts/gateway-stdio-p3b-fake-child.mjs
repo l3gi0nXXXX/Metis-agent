@@ -13,13 +13,14 @@ async function writeStream(stream, bytes) {
   });
 }
 
-if (mode === "managed-success") {
+if (mode === "managed-success" || mode === "managed-success-remove-worktree") {
   const unicodeOutput = Buffer.from("仓颉输出🙂\nsecond-line-without-tail");
   const emojiStart = Buffer.from("仓颉输出").length;
   await writeStream(process.stdout, unicodeOutput.subarray(0, emojiStart + 2));
   await new Promise((resolve) => setTimeout(resolve, 10));
   await writeStream(process.stdout, unicodeOutput.subarray(emojiStart + 2));
   await writeStream(process.stderr, "diagnostic 中文🙂\n");
+  if (mode === "managed-success-remove-worktree") { fs.rmSync(process.cwd(), { recursive: true, force: true }); }
   process.exit(0);
 }
 
@@ -85,6 +86,12 @@ if (mode === "managed-hang") {
       return;
     }
     if (frame.method === "test.timeout") {
+      process.on("SIGTERM", () => {});
+      const marker = frame.params?.lateWriteMarker;
+      setTimeout(() => {
+        if (typeof marker === "string" && marker.length > 0) fs.writeFileSync(marker, "late-write-attempted\n");
+        process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id: frame.id, result: { text: "late-response", ok: true } })}\n`);
+      }, 120);
       return;
     }
     if (frame.method === "test.exit") {
