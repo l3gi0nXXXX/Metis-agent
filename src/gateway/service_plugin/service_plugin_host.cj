@@ -791,6 +791,8 @@ private class ServicePluginStdioProcess {
     private let dispatchCondition: Condition
     private var dispatchFenced = false
     private var acceptedDispatches: Int64 = 0
+    private var dispatchFutureSequence: Int64 = 0
+    private let dispatchFutures = HashMap<Int64, Future<Unit>>()
 
     public init(broker: ManagedStdioBrokerClient, ownerId: String, generation: Int64, pid: Int64, claimToken!: Int64 = 0) {
         this.broker = broker
@@ -804,8 +806,26 @@ private class ServicePluginStdioProcess {
     public func acceptDispatch(): Bool { synchronized(this.dispatchLock) { if (this.dispatchFenced) { false } else { this.acceptedDispatches++; true } } }
     public func dispatchAllowed(): Bool { synchronized(this.dispatchLock) { !this.dispatchFenced } }
     public func finishDispatch(): Unit { synchronized(this.dispatchLock) { this.acceptedDispatches = max(0, this.acceptedDispatches - 1); this.dispatchCondition.notifyAll() } }
+    public func nextDispatchFutureToken(): Int64 { synchronized(this.dispatchLock) { this.dispatchFutureSequence++; this.dispatchFutureSequence } }
+    public func registerDispatchFuture(token: Int64, future: Future<Unit>): Unit { synchronized(this.dispatchLock) { this.dispatchFutures[token] = future } }
+    public func finishDispatchFuture(token: Int64): Unit { synchronized(this.dispatchLock) { this.dispatchFutures.remove(token); this.acceptedDispatches = max(0, this.acceptedDispatches - 1); this.dispatchCondition.notifyAll() } }
     public func fenceDispatch(): Unit { synchronized(this.dispatchLock) { this.dispatchFenced = true; this.dispatchCondition.notifyAll() } }
     public func waitDispatches(timeoutMs: Int64): Bool { synchronized(this.dispatchLock) { if (this.acceptedDispatches == 0) { return true }; let _ = this.dispatchCondition.waitUntil({ => this.acceptedDispatches == 0 }, timeout: Duration.millisecond * max(1, timeoutMs)); this.acceptedDispatches == 0 } }
+    public func cancelDispatches(timeoutMs: Int64): Bool {
+        let futures = synchronized(this.dispatchLock) {
+            let rows = ArrayList<Future<Unit>>()
+            for ((_, future) in this.dispatchFutures) { rows.add(future) }
+            rows
+        }
+        for (future in futures) { try { future.cancel() } catch (_: Exception) { () } }
+        let deadlineMs = servicePluginNowMs() + max(1, timeoutMs)
+        for (future in futures) {
+            let remaining = servicePluginDeadlineRemaining(deadlineMs)
+            if (remaining <= 0) { break }
+            try { let _ = future.get(Duration.millisecond * remaining) } catch (_: Exception) { () }
+        }
+        synchronized(this.dispatchLock) { this.acceptedDispatches == 0 }
+    }
 
     public func writeLine(line: String): Unit {
         let written = this.broker.writeOwnerLine(this.ownerId, line)
@@ -1148,8 +1168,11 @@ private var servicePluginStartClaims = HashMap<String, ServicePluginStartClaim>(
 private var servicePluginBrokerOwnerSequence: Int64 = 0
 private var servicePluginStartClaimSequence: Int64 = 0
 private var servicePluginStartPhaseHookForTest: Option<(String, String) -> Unit> = None<(String, String) -> Unit>
+private var servicePluginBeforeEventDispatchHookForTest: Option<(String) -> Unit> = None<(String) -> Unit>
+private var servicePluginHostShuttingDown = false
 
 public func setServicePluginStartPhaseHookForTest(hook: Option<(String, String) -> Unit>): Unit { servicePluginStartPhaseHookForTest = hook }
+public func setServicePluginBeforeEventDispatchHookForTest(hook: Option<(String) -> Unit>): Unit { servicePluginBeforeEventDispatchHookForTest = hook }
 
 private func servicePluginRunStartPhaseHook(serviceId: String, phase: String): Unit { match (servicePluginStartPhaseHookForTest) { case Some(hook) => hook(serviceId, phase) case None => () } }
 private let servicePluginProcessLock = Mutex()
@@ -1288,26 +1311,50 @@ private func cleanupDetachedServicePluginOwner(
     let sid = serviceId.trimAscii()
     let normalizedReason = if (reason.trimAscii().isEmpty()) { "stale_active_process" } else { reason.trimAscii() }
     let safeDiagnostic = servicePluginSafeDiagnosticText(if (diagnostic.trimAscii().isEmpty()) { normalizedReason } else { diagnostic })
-    let deadlineMs = servicePluginNowMs() + max(1, timeoutMs)
+    let effectiveTimeoutMs = max(1, timeoutMs)
+    let deadlineMs = servicePluginNowMs() + effectiveTimeoutMs
+    let stopReserveMs = if (stopProcess) { max(1, effectiveTimeoutMs / 2) } else { Int64(0) }
+    var dispatchStatus = "not_started"
     match (detached.process) {
         case Some(process) =>
             process.fenceDispatch()
-            let remaining = servicePluginDeadlineRemaining(deadlineMs)
-            if (remaining > 0) { let _ = process.waitDispatches(remaining) }
+            let dispatchBudget = max(0, servicePluginDeadlineRemaining(deadlineMs) - stopReserveMs)
+            let waitBudget = if (dispatchBudget > 1) { max(1, dispatchBudget / 2) } else { dispatchBudget }
+            let drained = waitBudget > 0 && process.waitDispatches(waitBudget)
+            if (drained) {
+                dispatchStatus = "drained"
+            } else {
+                let cancelBudget = max(0, servicePluginDeadlineRemaining(deadlineMs) - stopReserveMs)
+                let cancelled = if (cancelBudget > 0) { process.cancelDispatches(cancelBudget) } else { false }
+                dispatchStatus = if (cancelled) { "cancelled" } else { "dispatch_pending" }
+            }
         case None => ()
+    }
+    var stopStatus = ""
+    var stoppedPid: Int64 = 0
+    var stoppedPidGone = false
+    if (stopProcess) {
+        match (detached.process) {
+            case Some(process) =>
+                stoppedPid = process.process.pid
+                let remaining = servicePluginDeadlineRemaining(deadlineMs)
+                let stopped = process.stop(timeoutMs: max(1, remaining))
+                stopStatus = stopped.status
+                stoppedPidGone = stopped.ok || !servicePluginPidAlive(stoppedPid)
+            case None => ()
+        }
+    }
+    if (stoppedPid > 0 && stoppedPidGone) {
+        synchronized(servicePluginProcessLock) {
+            match (servicePluginRegistry.get(sid)) {
+                case Some(record) => if (record.pid == stoppedPid && !servicePluginActiveProcesses.contains(sid)) { record.pid = 0 }
+                case None => ()
+            }
+        }
     }
     match (detached.queue) {
         case Some(queue) => queue.close(status: normalizedReason, diagnostic: safeDiagnostic)
         case None => ()
-    }
-    var stopStatus = ""
-    if (stopProcess) {
-        match (detached.process) {
-            case Some(process) =>
-                let remaining = servicePluginDeadlineRemaining(deadlineMs)
-                stopStatus = if (remaining > 0) { process.stop(timeoutMs: remaining).status } else { "still_alive" }
-            case None => ()
-        }
     }
     if (joinPump) {
         match (detached.pump) {
@@ -1323,6 +1370,7 @@ private func cleanupDetachedServicePluginOwner(
         meta.put("reason", JsonString(normalizedReason))
         meta.put("hadActiveProcess", JsonString("${detached.process.isSome()}"))
         meta.put("hadResponseQueue", JsonString("${detached.queue.isSome()}"))
+        meta.put("dispatchStatus", JsonString(dispatchStatus))
         if (!stopStatus.isEmpty()) {
             meta.put("stopStatus", JsonString(stopStatus))
         }
@@ -1507,6 +1555,8 @@ public func resetServicePluginHostForTest(): Unit {
     servicePluginSupervisorAutoStartForTest = true
     servicePluginSupervisorConfig = ServicePluginSupervisorConfig()
     servicePluginStartPhaseHookForTest = None<(String, String) -> Unit>
+    servicePluginBeforeEventDispatchHookForTest = None<(String) -> Unit>
+    synchronized(servicePluginProcessLock) { servicePluginHostShuttingDown = false }
 }
 
 public func withServicePluginHostTestHome<T>(label: String, block: (Path) -> T): T {
@@ -2529,16 +2579,65 @@ private func stopAllActiveServicePluginProcesses(): Unit {
 }
 
 public func shutdownServicePluginHost(reason!: String = "shutdown", timeoutMillis!: Int64 = 30000): Unit {
-    let ids = ArrayList<String>()
+    let deadlineMs = servicePluginNowMs() + max(1, min(timeoutMillis, 30000))
+    let activeIds = ArrayList<String>()
+    let claims = ArrayList<(String, ServicePluginStartClaim)>()
     synchronized(servicePluginProcessLock) {
-        for ((serviceId, _) in servicePluginActiveProcesses) {
-            ids.add(serviceId)
+        servicePluginHostShuttingDown = true
+        for ((serviceId, claim) in servicePluginStartClaims) {
+            claim.cancel()
+            claims.add((serviceId, claim))
+            match (servicePluginRegistry.get(serviceId)) {
+                case Some(record) => record.status = "stopping"
+                case None => ()
+            }
+        }
+        for ((serviceId, process) in servicePluginActiveProcesses) {
+            process.fenceDispatch()
+            activeIds.add(serviceId)
         }
     }
-    for (serviceId in ids) {
-        let _ = stopServicePlugin(serviceId, reason: reason, timeoutMillis: timeoutMillis)
-    }
     stopAllServicePluginSupervisors()
+    for ((serviceId, _) in claims) { servicePluginRunStartPhaseHook(serviceId, "claim_cancelled") }
+    for ((serviceId, claim) in claims) {
+        let remaining = servicePluginDeadlineRemaining(deadlineMs)
+        if (remaining > 0) { let _ = claim.waitSettled(remaining) }
+        synchronized(servicePluginProcessLock) {
+            if (!servicePluginStartClaims.contains(serviceId) && !servicePluginActiveProcesses.contains(serviceId)) {
+                match (servicePluginRegistry.get(serviceId)) {
+                    case Some(record) =>
+                        record.pid = 0
+                        record.status = "stopped"
+                        record.stateFlushed = true
+                    case None => ()
+                }
+            }
+        }
+    }
+    for (serviceId in activeIds) {
+        let remaining = servicePluginDeadlineRemaining(deadlineMs)
+        if (remaining > 0) { let _ = stopServicePlugin(serviceId, reason: reason, timeoutMillis: remaining) }
+    }
+    let leftovers = ArrayList<(String, ServicePluginDetachedOwner)>()
+    synchronized(servicePluginProcessLock) {
+        let ids = ArrayList<String>()
+        for ((serviceId, _) in servicePluginActiveProcesses) { ids.add(serviceId) }
+        for (serviceId in ids) {
+            let detached = detachServicePluginOwnerLocked(serviceId)
+            if (detached.process.isSome() || detached.queue.isSome() || detached.pump.isSome()) {
+                leftovers.add((serviceId, detached))
+            }
+        }
+    }
+    for ((serviceId, detached) in leftovers) {
+        cleanupDetachedServicePluginOwner(
+            serviceId,
+            detached,
+            "stopped",
+            diagnostic: "service plugin host shutdown",
+            timeoutMs: max(1, servicePluginDeadlineRemaining(deadlineMs))
+        )
+    }
 }
 
 private func servicePluginStartClaimMatchesLocked(serviceId: String, claim: ServicePluginStartClaim): Bool {
@@ -2597,7 +2696,9 @@ private func ensureServicePluginStdioProcess(record: ServicePluginRuntimeRecord,
     var follower = None<ServicePluginStartClaim>
     var claim = ServicePluginStartClaim(0, "", "")
     synchronized(servicePluginProcessLock) {
-        if (record.status == "stopping") {
+        if (servicePluginHostShuttingDown) {
+            early = Some(ServicePluginProcessEnsureResult(false, "stopping", diagnostic: "service plugin host is shutting down"))
+        } else if (record.status == "stopping") {
             early = Some(ServicePluginProcessEnsureResult(false, "stopping", diagnostic: "service plugin stop in progress"))
         } else if (servicePluginStartClaims.contains(serviceId)) {
             follower = servicePluginStartClaims.get(serviceId)
@@ -2950,8 +3051,15 @@ private func servicePluginDrainDetachedOwner(process: ServicePluginStdioProcess,
 }
 
 private func servicePluginScheduleEventDispatch(record: ServicePluginRuntimeRecord, frame: ServiceFrame, process: ServicePluginStdioProcess): Unit {
-    spawn {
+    let gate = ServicePluginEventPumpGate()
+    let token = process.nextDispatchFutureToken()
+    let future = spawn {
+        gate.waitOpen()
         try {
+            match (servicePluginBeforeEventDispatchHookForTest) {
+                case Some(hook) => hook(record.registration.manifest.pluginId)
+                case None => ()
+            }
             let allowed = synchronized(servicePluginProcessLock) {
                 servicePluginOwnerMatchesLocked(record.registration.manifest.pluginId, process.ownerId, process.generation, claimToken: process.claimToken) && process.dispatchAllowed()
             }
@@ -2968,9 +3076,11 @@ private func servicePluginScheduleEventDispatch(record: ServicePluginRuntimeReco
                 }
             }
         } finally {
-            process.finishDispatch()
+            process.finishDispatchFuture(token)
         }
     }
+    process.registerDispatchFuture(token, future)
+    gate.open()
 }
 
 private func servicePluginRecordRuntimeDispatchLocked(record: ServicePluginRuntimeRecord, frame: ServiceFrame, dispatch: ServicePluginEventDispatchResult): Unit {

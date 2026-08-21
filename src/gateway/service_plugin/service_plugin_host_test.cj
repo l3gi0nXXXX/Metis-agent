@@ -164,6 +164,12 @@ public class ServicePluginHostTest {
         "printf '%s\\n' '${initLine}'; printf '%s\\n' '${eventLine}'; ${this.gitCodeWritebackResponderScript(responseLine, includeUnrelatedFrames: includeUnrelatedFrames)}"
     }
 
+    private func gitCodeWritebackThenNoiseScript(): String {
+        let initLine = this.gitCodeInitLine()
+        let eventLine = this.gitCodeAcceptedEventLine(eventId: "gitcode:Cangjie/community:issue:cleanup-fence")
+        "printf '%s\\n' '${initLine}'; printf '%s\\n' '${eventLine}'; while [ ! -f \"$METIS_STDIO_FIXTURE_MARKER_PATH\" ]; do sleep 0.01; done; for i in 1 2 3 4 5 6 7 8 9; do printf 'WARN cleanup noise %s\\n' \"$i\"; done; trap '' TERM HUP; while true; do sleep 1; done"
+    }
+
     private func gitCodeMaintainerEmailWritebackScript(): String {
         let initLine = this.gitCodeInitLine()
         let eventLine = this.gitCodeAcceptedEventLine(eventId: "gitcode:Cangjie/community:issue:maintainer-email")
@@ -1895,6 +1901,111 @@ public class ServicePluginHostTest {
                 match (starter) { case Some(future) => try { let _ = future.get(Duration.second * 3) } catch (_: Exception) { try { future.cancel() } catch (_: Exception) { () } } case None => () }
                 match (stopper) { case Some(future) => try { let _ = future.get(Duration.second * 3) } catch (_: Exception) { try { future.cancel() } catch (_: Exception) { () } } case None => () }
                 match (follower) { case Some(future) => try { let _ = future.get(Duration.second * 3) } catch (_: Exception) { try { future.cancel() } catch (_: Exception) { () } } case None => () }
+                resetServicePluginGeneratedReplyStateForTest()
+                resetServicePluginHostForTest()
+            }
+        })
+    }
+
+    @TestCase
+    public func p3N1CleanupDeadlineAndHostShutdownGateAreBounded(): Unit {
+        withServicePluginHostTestHome("p3-n1-cleanup-shutdown-gate", { home: Path =>
+            let marker = home.join("dispatch.marker")
+            let release = home.join("dispatch.release")
+            let cancelled = home.join("claim.cancelled")
+            let deliveryLock = Mutex()
+            let deliveries = ArrayList<String>()
+            var starter = None<Future<ServiceStartResult>>
+            var shutdown = None<Future<Unit>>
+            var cleanupPid: Int64 = 0
+            let oldFixtureMarker = getVariable("METIS_STDIO_FIXTURE_MARKER_PATH")
+            setVariable("METIS_STDIO_FIXTURE_MARKER_PATH", marker.toString())
+            try {
+                this.registerGitCodeStdioScript(this.gitCodeWritebackThenNoiseScript())
+                setServicePluginBeforeEventDispatchHookForTest(Some({ _serviceId: String =>
+                    File.writeTo(marker, "dispatch".toArray())
+                    while (!exists(release)) { sleep(Duration.millisecond * 10) }
+                }))
+                setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent =>
+                    let rows = ArrayList<ServicePluginDeliveryTarget>()
+                    rows.add(ServicePluginDeliveryTarget("telegram", "acct", "peer"))
+                    rows
+                }))
+                setServicePluginWebhookGeneratedReplyHandlerForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent, _target: ServicePluginDeliveryTarget =>
+                    ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "must not deliver late")
+                }))
+                setServicePluginEventDeliveryForTest(Some({ _target: ServicePluginDeliveryTarget, text: String =>
+                    synchronized(deliveryLock) { deliveries.add(text) }
+                    ServicePluginEventDeliveryResult(true, "sent")
+                }))
+                @Expect(ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000).ok, true)
+                cleanupPid = match (getServicePluginSnapshot("gitcode-monitor")) { case Some(snapshot) => snapshot.pid case None => Int64(0) }
+                @Expect(cleanupPid > 0, true)
+                @Expect(this.waitForFile(marker, timeoutMillis: 3000), true)
+                @Expect(this.waitForSnapshotReason("gitcode-monitor", "stdout_protocol_violation", timeoutMillis: 3000), true)
+                let ownerDeadline = DateTime.now().toUnixTimeStamp().toMilliseconds() + 3000
+                while (managedStdioBroker().snapshot().ownerCount > 0 && DateTime.now().toUnixTimeStamp().toMilliseconds() < ownerDeadline) {
+                    sleep(Duration.millisecond * 20)
+                }
+                @Expect(managedStdioBroker().snapshot().ownerCount, 0)
+                @Expect(this.waitForPidGone(cleanupPid), true)
+                match (getServicePluginSnapshot("gitcode-monitor")) {
+                    case Some(snapshot) => @Expect(snapshot.pid, 0)
+                    case None => @Expect(true, false)
+                }
+                File.writeTo(release, "release".toArray())
+                sleep(Duration.millisecond * 100)
+                @Expect(synchronized(deliveryLock) { deliveries.size }, 0)
+
+                setServicePluginBeforeEventDispatchHookForTest(None<(String) -> Unit>)
+                setServicePluginWebhookSubscribersProviderForTest(None<(ServicePluginAcceptedGitCodeEvent) -> ArrayList<ServicePluginDeliveryTarget>>)
+                setServicePluginWebhookGeneratedReplyHandlerForTest(None<(ServicePluginAcceptedGitCodeEvent, ServicePluginDeliveryTarget) -> ServicePluginGeneratedReplyResult>)
+                setServicePluginEventDeliveryForTest(None)
+                resetServicePluginGeneratedReplyStateForTest()
+                resetServicePluginHostForTest()
+
+                for (phase in ["before_start", "after_attach"]) {
+                    try { remove(marker) } catch (_: Exception) { () }
+                    try { remove(release) } catch (_: Exception) { () }
+                    try { remove(cancelled) } catch (_: Exception) { () }
+                    this.registerBrokerServiceFixture("noise-0", pluginId: "shutdown-${phase}", capabilityId: "shutdown-${phase}.monitor.status")
+                    setServicePluginStartPhaseHookForTest(Some({ _serviceId: String, current: String =>
+                        if (current == phase) {
+                            File.writeTo(marker, current.toArray())
+                            while (!exists(release)) { sleep(Duration.millisecond * 10) }
+                        } else if (current == "claim_cancelled") {
+                            File.writeTo(cancelled, current.toArray())
+                        }
+                    }))
+                    starter = Some(spawn { ensureRegisteredServicePluginStarted("shutdown-${phase}", startupTimeoutMs: 3000) })
+                    @Expect(this.waitForFile(marker), true)
+                    shutdown = Some(spawn { shutdownServicePluginHost(reason: "p3-n1-shutdown", timeoutMillis: 2500) })
+                    @Expect(this.waitForFile(cancelled), true)
+                    File.writeTo(release, "release".toArray())
+                    @Expect(starter.getOrThrow().get().status, "stopping")
+                    let _ = shutdown.getOrThrow().get()
+                    starter = None<Future<ServiceStartResult>>
+                    shutdown = None<Future<Unit>>
+                    @Expect(managedStdioBroker().snapshot().ownerCount, 0)
+                    match (getServicePluginSnapshot("shutdown-${phase}")) {
+                        case Some(snapshot) => @Expect(snapshot.pid, 0)
+                        case None => @Expect(true, false)
+                    }
+                    @Expect(ensureRegisteredServicePluginStarted("shutdown-${phase}", startupTimeoutMs: 500).status, "stopping")
+                    @Expect(managedStdioBroker().snapshot().ownerCount, 0)
+                    setServicePluginStartPhaseHookForTest(None<(String, String) -> Unit>)
+                    resetServicePluginHostForTest()
+                }
+            } finally {
+                if (!exists(release)) { try { File.writeTo(release, "release".toArray()) } catch (_: Exception) { () } }
+                setServicePluginBeforeEventDispatchHookForTest(None<(String) -> Unit>)
+                setServicePluginStartPhaseHookForTest(None<(String, String) -> Unit>)
+                setServicePluginWebhookSubscribersProviderForTest(None<(ServicePluginAcceptedGitCodeEvent) -> ArrayList<ServicePluginDeliveryTarget>>)
+                setServicePluginWebhookGeneratedReplyHandlerForTest(None<(ServicePluginAcceptedGitCodeEvent, ServicePluginDeliveryTarget) -> ServicePluginGeneratedReplyResult>)
+                setServicePluginEventDeliveryForTest(None)
+                match (starter) { case Some(future) => try { let _ = future.get(Duration.second * 3) } catch (_: Exception) { try { future.cancel() } catch (_: Exception) { () } } case None => () }
+                match (shutdown) { case Some(future) => try { let _ = future.get(Duration.second * 3) } catch (_: Exception) { try { future.cancel() } catch (_: Exception) { () } } case None => () }
+                match (oldFixtureMarker) { case Some(value) => setVariable("METIS_STDIO_FIXTURE_MARKER_PATH", value) case None => setVariable("METIS_STDIO_FIXTURE_MARKER_PATH", "") }
                 resetServicePluginGeneratedReplyStateForTest()
                 resetServicePluginHostForTest()
             }
