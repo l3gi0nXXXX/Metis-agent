@@ -1,6 +1,6 @@
 package metis.gateway.tools
 
-import metis.core.{GatewayToolRuntimeContext, gatewayClearSubagentNoticeDeliveryHook, gatewayRegisterSubagentNoticeDeliveryHook, gatewaySubagentCreateRunRecord, gatewaySubagentMarkRunSucceeded, gatewaySubagentResolveAgent, gatewaySubagentResolveRunRecord, gatewaySubagentRunRecordString, gatewaySubagentWriteRunRecord, gatewayWithToolRuntimeContext}
+import metis.core.{GatewayToolRuntimeContext, gatewayClearSubagentNoticeDeliveryHook, gatewayRegisterSubagentNoticeDeliveryHook, gatewaySubagentCreateRunRecord, gatewaySubagentMarkRunSucceeded, gatewaySubagentResolveAgent, gatewaySubagentResolveRunRecord, gatewaySubagentRunRecordString, gatewaySubagentRunStatusIsTerminal, gatewaySubagentWriteRunRecord, gatewayWithToolRuntimeContext}
 import metis.core.config.{CliConfig, CliSettingManager, MetisConfigManager, MetisProcessEnvironmentLock}
 import metis.core.memory.memorySessionStoreForGatewayUser
 import metis.gateway.process.gatewayStdioBroker
@@ -1779,6 +1779,115 @@ public class GatewayManagedSessionsToolsetTest {
                 @Expect(gatewayStdioBroker().snapshot().ownerCount, 0)
             } finally {
                 toolset.debugSetManagedWorkspaceCleanupFailureForTest(false)
+                toolset.debugSetManagedSubagentCommandSpecForTest(None<(String, String, String, String, String, String) -> (String, Array<String>, Path)>)
+            }
+        }
+    }
+
+    @TestCase
+    public func managedRunPersistenceFailureRetainsHandleAndRetriesUniqueTerminal(): Unit {
+        withManagedSessionsToolsetTestHome("/tmp/metis-managed-persistence-pending") {
+            createManagedSubagentsCustomAgentFixture("persistence-pending", true)
+            let repo = createManagedSubagentsGitRepo("persistence-pending-repo")
+            var settings = CliSettingManager.readGatewaySettings()
+            settings.subagents.allowCustomAgents = true
+            let _ = MetisConfigManager.setGatewaySettings(settings)
+            CliSettingManager.invalidate()
+            let toolset = GatewayManagedSessionsToolset()
+            let fixture = CliConfig.cwd.join("scripts").join("gateway-stdio-p3b-fake-child.mjs").toString()
+            toolset.debugSetManagedSubagentCommandSpecForTest(Some<(String, String, String, String, String, String) -> (String, Array<String>, Path)>(
+                { _sessionKey, _agentId, _task, cwdHint, _agentDir, _modelHint =>
+                    ("node", [fixture, "managed-success"], Path(cwdHint))
+                }
+            ))
+            try {
+                gatewayWithToolRuntimeContext(GatewayToolRuntimeContext("cli", sessionKey: "cli:managed-persistence-pending")) {
+                    toolset.debugArmManagedRegistrationLatchForTest()
+                    let launchFuture = spawn {
+                        gatewayWithToolRuntimeContext(GatewayToolRuntimeContext("cli", sessionKey: "cli:managed-persistence-pending")) {
+                            managedSubagentsJson(toolset.sessionsSpawnForCommand(
+                                "persist-terminal", Some("persistence-terminal"), Some("subagent"), Some("persistence-pending"),
+                                None<String>, None<String>, None<String>, Some(repo.toString()), Some(5), None<Int64>,
+                                None<String>, Some("shared"), None<Bool>, None<String>, Some("keep"), None<String>, None<String>
+                            ))
+                        }
+                    }
+                    @Expect(toolset.debugWaitManagedRegistrationLatchForTest(2000), true)
+                    toolset.debugSetManagedRunPersistenceFailureForTest(true)
+                    toolset.debugReleaseManagedRegistrationLatchForTest()
+                    let spawned = launchFuture.get(Duration.second * 5)
+                    let runId = managedSubagentsString(spawned, "runId")
+                    let sessionKey = managedSubagentsString(spawned, "sessionKey")
+                    let launchId = toolset.debugManagedLaunchIdForTest(sessionKey)
+                    let pendingDeadline = DateTime.now().toUnixTimeStamp().toMilliseconds() + 5000
+                    var pending = JsonObject()
+                    while (DateTime.now().toUnixTimeStamp().toMilliseconds() < pendingDeadline) {
+                        pending = managedSubagentsJson(toolset.subagentsForTest(managedSubagentsSome("status"), managedSubagentsSome(runId), None<String>, None<Int64>))
+                        if (managedSubagentsString(pending, "state") == "persistence_pending") { break }
+                        sleep(Duration.millisecond * 20)
+                    }
+                    let pendingRun = pending.get("run").getOrThrow().asObject()
+                    @Expect(managedSubagentsString(pending, "state"), "persistence_pending")
+                    @Expect(gatewaySubagentRunStatusIsTerminal(managedSubagentsString(pendingRun, "status")), false)
+                    @Expect(managedSubagentsBool(pending, "hasLiveFuture"), true)
+                    let busy = managedSubagentsJson(toolset.subagentsForTest(managedSubagentsSome("send"), managedSubagentsSome(runId), managedSubagentsSome("must remain busy"), None<Int64>))
+                    @Expect(managedSubagentsString(busy, "status"), "busy")
+                    @Expect(toolset.debugManagedLaunchIdForTest(sessionKey), launchId)
+                    toolset.debugSetManagedRunPersistenceFailureForTest(false)
+                    let terminal = managedSubagentsJson(toolset.subagentsForTest(managedSubagentsSome("status"), managedSubagentsSome(runId), None<String>, None<Int64>))
+                    @Expect(managedSubagentsString(terminal.get("run").getOrThrow().asObject(), "status"), "succeeded")
+                    @Expect(managedSubagentsString(terminal, "state"), "succeeded")
+                    @Expect(managedSubagentsBool(terminal, "hasLiveFuture"), false)
+                    let terminalAgain = managedSubagentsJson(toolset.subagentsForTest(managedSubagentsSome("status"), managedSubagentsSome(runId), None<String>, None<Int64>))
+                    @Expect(managedSubagentsString(terminalAgain.get("run").getOrThrow().asObject(), "status"), "succeeded")
+
+                    toolset.debugSetManagedWorkspaceCleanupFailureForTest(true)
+                    toolset.debugArmManagedRegistrationLatchForTest()
+                    let cleanupLaunchFuture = spawn {
+                        gatewayWithToolRuntimeContext(GatewayToolRuntimeContext("cli", sessionKey: "cli:managed-persistence-pending")) {
+                            managedSubagentsJson(toolset.sessionsSpawnForCommand(
+                                "persist-cleanup", Some("persistence-cleanup"), Some("subagent"), Some("persistence-pending"),
+                                None<String>, None<String>, None<String>, Some(repo.toString()), Some(5), None<Int64>,
+                                None<String>, Some("worktree"), None<Bool>, None<String>, Some("delete"), None<String>, None<String>
+                            ))
+                        }
+                    }
+                    @Expect(toolset.debugWaitManagedRegistrationLatchForTest(2000), true)
+                    toolset.debugSetManagedRunPersistenceFailureForTest(true)
+                    toolset.debugReleaseManagedRegistrationLatchForTest()
+                    let cleanupSpawned = cleanupLaunchFuture.get(Duration.second * 5)
+                    let cleanupRunId = managedSubagentsString(cleanupSpawned, "runId")
+                    let cleanupSessionKey = managedSubagentsString(cleanupSpawned, "sessionKey")
+                    let worktreePath = managedSubagentsString(cleanupSpawned, "worktreePath")
+                    let cleanupLaunchId = toolset.debugManagedLaunchIdForTest(cleanupSessionKey)
+                    let cleanupPendingDeadline = DateTime.now().toUnixTimeStamp().toMilliseconds() + 5000
+                    var cleanupPending = JsonObject()
+                    while (DateTime.now().toUnixTimeStamp().toMilliseconds() < cleanupPendingDeadline) {
+                        cleanupPending = managedSubagentsJson(toolset.subagentsForTest(managedSubagentsSome("status"), managedSubagentsSome(cleanupRunId), None<String>, None<Int64>))
+                        if (managedSubagentsString(cleanupPending, "state") == "persistence_pending") { break }
+                        sleep(Duration.millisecond * 20)
+                    }
+                    @Expect(managedSubagentsString(cleanupPending, "state"), "persistence_pending")
+                    @Expect(gatewaySubagentRunStatusIsTerminal(managedSubagentsString(cleanupPending.get("run").getOrThrow().asObject(), "status")), false)
+                    @Expect(managedSubagentsBool(cleanupPending, "hasLiveFuture"), true)
+                    @Expect(exists(Path(worktreePath)), true)
+                    @Expect(managedSubagentsWorktreeRegistered(repo, worktreePath), true)
+                    let cleanupBusy = managedSubagentsJson(toolset.subagentsForTest(managedSubagentsSome("steer"), managedSubagentsSome(cleanupRunId), managedSubagentsSome("must remain busy"), None<Int64>))
+                    @Expect(managedSubagentsString(cleanupBusy, "status"), "busy")
+                    @Expect(toolset.debugManagedLaunchIdForTest(cleanupSessionKey), cleanupLaunchId)
+                    toolset.debugSetManagedWorkspaceCleanupFailureForTest(false)
+                    toolset.debugSetManagedRunPersistenceFailureForTest(false)
+                    let cleanupTerminal = managedSubagentsJson(toolset.subagentsForTest(managedSubagentsSome("status"), managedSubagentsSome(cleanupRunId), None<String>, None<Int64>))
+                    @Expect(managedSubagentsString(cleanupTerminal.get("run").getOrThrow().asObject(), "status"), "succeeded")
+                    @Expect(managedSubagentsBool(cleanupTerminal, "hasLiveFuture"), false)
+                    @Expect(exists(Path(worktreePath)), false)
+                    @Expect(managedSubagentsWorktreeRegistered(repo, worktreePath), false)
+                }
+                @Expect(gatewayStdioBroker().snapshot().ownerCount, 0)
+            } finally {
+                toolset.debugReleaseManagedRegistrationLatchForTest()
+                toolset.debugSetManagedWorkspaceCleanupFailureForTest(false)
+                toolset.debugSetManagedRunPersistenceFailureForTest(false)
                 toolset.debugSetManagedSubagentCommandSpecForTest(None<(String, String, String, String, String, String) -> (String, Array<String>, Path)>)
             }
         }

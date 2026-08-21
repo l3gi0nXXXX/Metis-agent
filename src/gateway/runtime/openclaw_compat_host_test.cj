@@ -454,4 +454,25 @@ public class OpenClawCompatHostTest {
         }
         @Expect(gatewayStdioBroker().snapshot().ownerCount, 0)
     }
+
+    @TestCase
+    public func brokerStdioTransportCloseJoinsNaturallyAfterFirstTimeout(): Unit {
+        let runner = OpenClawCompatStdioProcessRunner()
+        let script = CliConfig.cwd.join("scripts").join("gateway-stdio-p3b-fake-child.mjs").toString()
+        debugSetOpenClawCompatCloseTimingForTest(Some<(Int64, Int64, Int64)>((1, 2500, 1500)))
+        try {
+            match (runner.start(OpenClawCompatHostLaunchSpec("node", script, [], 500))) {
+                case OpenClawCompatHostStartResult.Started(transport) =>
+                    let client = OpenClawCompatHostClient(transport, defaultTimeoutMs: 500)
+                    @Expect(client.request("test.echo").ok, true)
+                    transport.close()
+                    @Expect(debugOpenClawCompatFirstJoinTimeoutsForTest(), 1)
+                    @Expect(client.isAlive(), false)
+                case OpenClawCompatHostStartResult.Failed(reason) => @Expect(reason, "")
+            }
+            @Expect(gatewayStdioBroker().snapshot().ownerCount, 0)
+        } finally {
+            debugSetOpenClawCompatCloseTimingForTest(None<(Int64, Int64, Int64)>)
+        }
+    }
 }

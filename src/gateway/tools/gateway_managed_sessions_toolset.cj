@@ -32,6 +32,8 @@ private var gatewayManagedCancelTimeoutsForTest: Option<(Int64, Int64)> = None<(
 private var gatewayManagedRegistrationLatchForTest: Option<GatewayManagedRegistrationLatch> = None<GatewayManagedRegistrationLatch>
 private let gatewayManagedRegistrationLatchLockForTest = Mutex()
 private var gatewayManagedWorkspaceCleanupFailureForTest: Bool = false
+private var gatewayManagedRunPersistenceFailureForTest: Bool = false
+private let gatewayManagedRunPersistenceFailureLockForTest = Mutex()
 private var gatewayManagedSessionsGatewayCallRunnerOverride: Option<(String, JsonObject) -> JsonObject> = None<(String, JsonObject) -> JsonObject>
 private var gatewayManagedSubagentCommandSpecOverride: Option<(String, String, String, String, String, String) -> (String, Array<String>, Path)> = None<(String, String, String, String, String, String) -> (String, Array<String>, Path)>
 
@@ -108,6 +110,7 @@ private class GatewayManagedRunHandle {
     public var cancelRequested: Bool = false
     public var terminalPublished: Bool = false
     public var cleanupPending: Bool = false
+    public var persistencePending: Bool = false
     public var pendingOutcome: Option<GatewayManagedTerminalOutcome> = None<GatewayManagedTerminalOutcome>
     public init(runId: String, launchId: Int64, workspaceSpec: Option<GatewayManagedWorkspaceSpec>) {
         this.runId = runId; this.launchId = launchId; this.workspaceSpec = workspaceSpec
@@ -143,6 +146,10 @@ public class GatewayManagedSessionsToolset {
 
     public func debugSetManagedWorkspaceCleanupFailureForTest(enabled: Bool): Unit {
         synchronized(gatewayManagedSessionLock) { gatewayManagedWorkspaceCleanupFailureForTest = enabled }
+    }
+
+    public func debugSetManagedRunPersistenceFailureForTest(enabled: Bool): Unit {
+        synchronized(gatewayManagedRunPersistenceFailureLockForTest) { gatewayManagedRunPersistenceFailureForTest = enabled }
     }
 
     public func debugArmManagedRegistrationLatchForTest(): Unit {
@@ -1154,7 +1161,7 @@ public class GatewayManagedSessionsToolset {
         let queued = synchronized(gatewayManagedSessionLock) {
             if (gatewayManagedFutures.contains(sessionKey)) { return false }
             if (let Some(state) <- gatewayManagedStates.get(sessionKey)) {
-                if (state == "queued" || state == "running" || state == "cancelling" || state == "cleanup_pending") {
+                if (state == "queued" || state == "running" || state == "cancelling" || state == "cleanup_pending" || state == "persistence_pending") {
                     return false
                 }
             }
@@ -1426,6 +1433,21 @@ public class GatewayManagedSessionsToolset {
         current.runId == expected.runId && current.launchId == expected.launchId
     }
 
+    private func persistManagedPendingOutcome(sessionKey: String, outcome: GatewayManagedTerminalOutcome): Bool {
+        if (synchronized(gatewayManagedRunPersistenceFailureLockForTest) { gatewayManagedRunPersistenceFailureForTest }) {
+            return false
+        }
+        gatewaySubagentMarkRunState(
+            this.gwStore().sessionsRoot(),
+            sessionKey,
+            outcome.status,
+            resultSummary: outcome.resultSummary,
+            error: outcome.error,
+            exitCode: outcome.exitCode,
+            outputPath: outcome.outputPath
+        )
+    }
+
     private func registerManagedFutureAndOpen(sessionKey: String, handle: GatewayManagedRunHandle, future: Future<Unit>, gate: GatewayManagedStartGate): Bool {
         let registrationLatch = synchronized(gatewayManagedRegistrationLatchLockForTest) { gatewayManagedRegistrationLatchForTest }
         synchronized(gatewayManagedSessionLock) {
@@ -1515,12 +1537,27 @@ public class GatewayManagedSessionsToolset {
             let observableError = if (outcome.error.isEmpty()) { cleanupError } else { "${outcome.error}; ${cleanupError}" }
             // The run store only persists its stable status vocabulary. Persist the diagnostic first,
             // then publish cleanup_pending so observers never see the state without its degraded detail.
-            let persisted = gatewaySubagentMarkRunState(this.gwStore().sessionsRoot(), sessionKey, "running", resultSummary: outcome.resultSummary, error: observableError, exitCode: outcome.exitCode, outputPath: outcome.outputPath)
-            if (!persisted) { return GatewayManagedWorkspaceCleanupResult(false, diagnostic: "managed cleanup pending diagnostic persistence failed") }
+            let pending = GatewayManagedTerminalOutcome("running", resultSummary: outcome.resultSummary, error: observableError, exitCode: outcome.exitCode, outputPath: outcome.outputPath)
+            let persisted = this.persistManagedPendingOutcome(sessionKey, pending)
+            if (!persisted) {
+                synchronized(gatewayManagedSessionLock) {
+                    match (gatewayManagedFutures.get(sessionKey)) {
+                        case Some(current) => if (this.managedHandleMatches(current, handle) && !current.terminalPublished) {
+                            current.cleanupPending = true
+                            current.persistencePending = true
+                            current.pendingOutcome = Some(outcome)
+                            gatewayManagedStates.add(sessionKey, "persistence_pending")
+                        }
+                        case None => ()
+                    }
+                }
+                return GatewayManagedWorkspaceCleanupResult(false, diagnostic: "managed cleanup pending diagnostic persistence failed")
+            }
             let published = synchronized(gatewayManagedSessionLock) {
                 match (gatewayManagedFutures.get(sessionKey)) {
                     case Some(current) => if (this.managedHandleMatches(current, handle) && !current.terminalPublished) {
                         current.cleanupPending = true
+                        current.persistencePending = false
                         current.pendingOutcome = Some(outcome)
                         gatewayManagedStates.add(sessionKey, "cleanup_pending")
                         true
@@ -1542,7 +1579,19 @@ public class GatewayManagedSessionsToolset {
                 }
             }
             let effective = if (cancellationWins) { GatewayManagedTerminalOutcome("cancelled", error: "cancelled", outputPath: outcome.outputPath) } else { outcome }
-            let _ = gatewaySubagentMarkRunState(this.gwStore().sessionsRoot(), sessionKey, effective.status, resultSummary: effective.resultSummary, error: effective.error, exitCode: effective.exitCode, outputPath: effective.outputPath)
+            if (!this.persistManagedPendingOutcome(sessionKey, effective)) {
+                synchronized(gatewayManagedSessionLock) {
+                    match (gatewayManagedFutures.get(sessionKey)) {
+                        case Some(current) => if (this.managedHandleMatches(current, handle) && !current.terminalPublished) {
+                            current.persistencePending = true
+                            current.pendingOutcome = Some(effective)
+                            gatewayManagedStates.add(sessionKey, "persistence_pending")
+                        }
+                        case None => ()
+                    }
+                }
+                return false
+            }
             synchronized(gatewayManagedSessionLock) {
                 match (gatewayManagedFutures.get(sessionKey)) {
                     case Some(current) => if (this.managedHandleMatches(current, handle) && !current.terminalPublished) {
@@ -1557,6 +1606,38 @@ public class GatewayManagedSessionsToolset {
         }
         if (published) { this.deliverManagedTerminalNotice(sessionKey) }
         published
+    }
+
+    private func retryManagedPending(sessionKey: String): Bool {
+        let candidate = synchronized(gatewayManagedSessionLock) { gatewayManagedFutures.get(sessionKey) }
+        if (candidate.isNone()) { return false }
+        let handle = candidate.getOrThrow()
+        let pending = synchronized(gatewayManagedSessionLock) {
+            match (gatewayManagedFutures.get(sessionKey)) {
+                case Some(current) => if (this.managedHandleMatches(current, handle) && !current.terminalPublished && (current.cleanupPending || current.persistencePending)) {
+                    (current.cleanupPending, current.pendingOutcome)
+                } else { (false, None<GatewayManagedTerminalOutcome>) }
+                case None => (false, None<GatewayManagedTerminalOutcome>)
+            }
+        }
+        if (pending[1].isNone()) { return false }
+        let outcome = pending[1].getOrThrow()
+        if (pending[0]) {
+            var cleanup = GatewayManagedWorkspaceCleanupResult(true)
+            match (handle.workspaceSpec) { case Some(ws) => cleanup = this.cleanupManagedWorkspace(ws) case None => () }
+            if (!cleanup.ok) {
+                let retained = this.retainManagedCleanupPending(sessionKey, handle, outcome, cleanup.diagnostic)
+                if (!retained.ok) { this.gwStore().appendTranscriptEntry(sessionKey, "system", retained.diagnostic) }
+                return false
+            }
+            synchronized(gatewayManagedSessionLock) {
+                match (gatewayManagedFutures.get(sessionKey)) {
+                    case Some(current) => if (this.managedHandleMatches(current, handle)) { current.cleanupPending = false }
+                    case None => ()
+                }
+            }
+        }
+        this.finalizeManagedRun(sessionKey, handle, outcome)
     }
 
     private func forgetManagedSession(sessionKey: String): Unit {
@@ -1832,16 +1913,8 @@ public class GatewayManagedSessionsToolset {
                 }
             case None => joined = true
         }
-        if (joined && handle.cleanupPending) {
-            var cleanup = GatewayManagedWorkspaceCleanupResult(true)
-            match (handle.workspaceSpec) { case Some(ws) => cleanup = this.cleanupManagedWorkspace(ws) case None => () }
-            let pending = handle.pendingOutcome ?? GatewayManagedTerminalOutcome("cancelled", error: "cancelled")
-            if (cleanup.ok) {
-                let _ = this.finalizeManagedRun(sessionKey, handle, pending)
-            } else {
-                let retained = this.retainManagedCleanupPending(sessionKey, handle, pending, cleanup.diagnostic)
-                if (!retained.ok) { this.gwStore().appendTranscriptEntry(sessionKey, "system", retained.diagnostic) }
-            }
+        if (joined) {
+            let _ = this.retryManagedPending(sessionKey)
         }
         if (!joined) {
             this.gwStore().appendTranscriptEntry(sessionKey, "system", "managed run cancellation is still draining after bounded join")
@@ -3304,20 +3377,22 @@ public class GatewayManagedSessionsToolset {
                 gatewaySubagentPutEffectiveState(result, effective)
                 return result.toJsonString()
             }
-            let effective = this.managedEffectiveState(record)
+            let _ = this.retryManagedPending(resolved)
+            let refreshedRecord = this.resolveManagedRunForControl(tgt) ?? record
+            let effective = this.managedEffectiveState(refreshedRecord)
             let result = JsonObject()
             result.put("ok", JsonBool(true))
             result.put("status", JsonString("ok"))
             result.put("action", JsonString(act))
-            result.put("run", record)
-            result.put("runId", JsonString(gatewaySubagentRunRecordString(record, "runId")))
+            result.put("run", refreshedRecord)
+            result.put("runId", JsonString(gatewaySubagentRunRecordString(refreshedRecord, "runId")))
             result.put("sessionKey", JsonString(resolved))
             result.put("runtime", JsonString(this.managedRuntime(resolved)))
             result.put("agentId", JsonString(this.managedAgentId(resolved)))
             result.put("state", JsonString(this.managedState(resolved)))
             result.put("hasLiveFuture", JsonBool(this.managedHasLiveFuture(resolved)))
             result.put("hasLiveProcess", JsonBool(this.managedHasLiveProcess(resolved)))
-            result.put("transcriptPath", JsonString(this.managedRecordTranscriptPath(record, resolved)))
+            result.put("transcriptPath", JsonString(this.managedRecordTranscriptPath(refreshedRecord, resolved)))
             gatewaySubagentPutEffectiveState(result, effective)
             return result.toJsonString()
         }

@@ -49,6 +49,8 @@ public interface OpenClawCompatHostProcessRunner {
 
 private let openClawCompatOwnerLock = Mutex()
 private var openClawCompatOwnerSequence: Int64 = 0
+private var openClawCompatCloseTimingForTest: Option<(Int64, Int64, Int64)> = None<(Int64, Int64, Int64)>
+private var openClawCompatFirstJoinTimeoutsForTest: Int64 = 0
 private let OPENCLAW_COMPAT_RESPONSE_QUEUE_LIMIT: Int64 = 256
 private let OPENCLAW_COMPAT_RESPONSE_BYTES_LIMIT: Int64 = 4 * 1024 * 1024
 
@@ -57,6 +59,17 @@ private func nextOpenClawCompatOwnerId(): String {
         openClawCompatOwnerSequence += 1
         "openclaw-compat-${openClawCompatOwnerSequence}"
     }
+}
+
+public func debugSetOpenClawCompatCloseTimingForTest(timing: Option<(Int64, Int64, Int64)>): Unit {
+    synchronized(openClawCompatOwnerLock) {
+        openClawCompatCloseTimingForTest = timing
+        openClawCompatFirstJoinTimeoutsForTest = 0
+    }
+}
+
+public func debugOpenClawCompatFirstJoinTimeoutsForTest(): Int64 {
+    synchronized(openClawCompatOwnerLock) { openClawCompatFirstJoinTimeoutsForTest }
 }
 
 private class OpenClawCompatStdioHostTransport <: OpenClawCompatHostTransport {
@@ -165,7 +178,13 @@ private class OpenClawCompatStdioHostTransport <: OpenClawCompatHostTransport {
                         return
                     }
             }
-        } } finally { synchronized(this.stateLock) { this.pumpExited = true; this.condition.notifyAll() } }
+        } } finally {
+            let exitDelayMs = synchronized(openClawCompatOwnerLock) {
+                match (openClawCompatCloseTimingForTest) { case Some(timing) => timing[2] case None => 0 }
+            }
+            if (exitDelayMs > 0) { sleep(Duration.millisecond * exitDelayMs) }
+            synchronized(this.stateLock) { this.pumpExited = true; this.condition.notifyAll() }
+        }
     }
 
     private func readLine(timeoutMs: Int64): Option<String> {
@@ -228,14 +247,17 @@ private class OpenClawCompatStdioHostTransport <: OpenClawCompatHostTransport {
         if (this.broker.snapshot().generation == this.ownerGeneration) {
             let _ = this.broker.stopOwner(this.ownerId, timeoutMs: 1000)
         }
+        let joinTimeouts = synchronized(openClawCompatOwnerLock) {
+            match (openClawCompatCloseTimingForTest) { case Some(timing) => (timing[0], timing[1]) case None => (1000, 1000) }
+        }
         let pump = synchronized(this.stateLock) { this.eventPump }
         match (pump) {
             case Some(future) =>
-                var joined = try { let _ = future.get(Duration.second); true } catch (_: Exception) { false }
+                var joined = try { let _ = future.get(Duration.millisecond * joinTimeouts[0]); true } catch (_: Exception) { false }
                 if (!joined) {
-                    try { future.cancel() } catch (_: Exception) { () }
+                    synchronized(openClawCompatOwnerLock) { openClawCompatFirstJoinTimeoutsForTest += 1 }
                     if (this.broker.snapshot().generation == this.ownerGeneration) { let _ = this.broker.stopOwner(this.ownerId, timeoutMs: 1000) }
-                    joined = try { let _ = future.get(Duration.second); true } catch (_: Exception) { false }
+                    joined = try { let _ = future.get(Duration.millisecond * joinTimeouts[1]); true } catch (_: Exception) { false }
                 }
                 if (joined || synchronized(this.stateLock) { this.pumpExited }) { synchronized(this.stateLock) { this.eventPump = None<Future<Unit>> } }
             case None => ()
