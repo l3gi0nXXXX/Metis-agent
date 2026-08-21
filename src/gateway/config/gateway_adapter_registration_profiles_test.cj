@@ -96,7 +96,7 @@ public class GatewayAdapterRegistrationProfilesTest {
 
         let sidecarAdapter = gatewayFeishuAdapterForConfig(buildGatewayConfigFromUserSettings(user).feishu, "default")
         @Expect(sidecarAdapter.debugFeishuTransportModeForTest(), "sidecar")
-        @Expect(sidecarAdapter.debugFeishuLongConnectTransportKindForTest(), "sidecar")
+        @Expect(sidecarAdapter.debugFeishuLongConnectTransportKindForTest(), "sidecar-supervisor")
         @Expect(sidecarAdapter.debugFeishuApiClientKindForTest(), "sidecar")
 
         user.feishu.transportMode = "native-legacy"
