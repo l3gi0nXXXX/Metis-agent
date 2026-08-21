@@ -803,6 +803,26 @@ public class ServicePluginEventDispatcherTest {
     }
 
     @TestCase
+    public func dispatchEpochGuardCancelsBeforeIrreversibleDelivery(): Unit {
+        let messages = ArrayList<String>()
+        setServicePluginEventDeliveryForTest(Some({ _target: ServicePluginDeliveryTarget, text: String =>
+            messages.add(text)
+            ServicePluginEventDeliveryResult(true, "sent")
+        }))
+        try {
+            let store = this.storeWithRunningJob(jobId: "epoch-guard-job")
+            let completed = ServiceFrame("event", "epoch-guard-event", "gitcode-monitor", method: "emitCapabilityEvent", capabilityId: "gitcode.monitor.scan_completed", payload: "{\"ok\":true,\"status\":\"completed\",\"jobId\":\"epoch-guard-job\",\"accepted\":1,\"ignored\":0,\"emitted\":1,\"durationMs\":1,\"stateSaved\":true}")
+            let result = dispatchServicePluginEvent(completed, store: store, dispatchAllowed: { => false })
+            @Expect(result.ok, false)
+            @Expect(result.status, "dispatch_cancelled")
+            @Expect(messages.size, 0)
+            @Expect((store.findByJobId("epoch-guard-job") ?? ServicePluginPendingJob()).status, "running")
+        } finally {
+            setServicePluginEventDeliveryForTest(None)
+        }
+    }
+
+    @TestCase
     public func dispatchRejectsUnknownInvalidAndProgressDoesNotDeliver(): Unit {
         let messages = ArrayList<String>()
         setServicePluginEventDeliveryForTest(Some({ _target: ServicePluginDeliveryTarget, text: String =>

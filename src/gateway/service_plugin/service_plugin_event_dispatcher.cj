@@ -351,7 +351,8 @@ public func servicePluginWebhookDispatchStatsJson(): JsonObject {
 
 public func dispatchServicePluginEvent(
     frame: ServiceFrame,
-    store!: ServicePluginPendingJobStore = servicePluginPendingJobStore()
+    store!: ServicePluginPendingJobStore = servicePluginPendingJobStore(),
+    dispatchAllowed!: () -> Bool = { => true }
 ): ServicePluginEventDispatchResult {
     if (frame.frameType != "event") {
         return servicePluginDispatchResult(frame, false, "unexpected_frame", diagnostic: "expected event frame")
@@ -363,7 +364,7 @@ public func dispatchServicePluginEvent(
         return servicePluginDispatchResult(frame, false, "service_orphan_draining", diagnostic: "service plugin is draining after orphan_detected")
     }
     if (frame.capabilityId == "gitcode.event.accepted") {
-        return recordGitCodeAcceptedEventForFutureReply(frame, store: store)
+        return recordGitCodeAcceptedEventForFutureReply(frame, store: store, dispatchAllowed: dispatchAllowed)
     }
     if (frame.capabilityId == "gitcode.monitor.orphan_detected") {
         return recordGitCodeMonitorOrphanDetected(frame)
@@ -381,6 +382,7 @@ public func dispatchServicePluginEvent(
         return servicePluginDispatchResult(frame, false, "service_mismatch", diagnostic: "job belongs to another service")
     }
     if (event.status == "progress") {
+        if (!dispatchAllowed()) { return servicePluginDispatchResult(frame, false, "dispatch_cancelled") }
         store.markRunning(event.jobId, stage: event.stage)
         return servicePluginDispatchResult(frame, true, "progress_recorded")
     }
@@ -392,6 +394,7 @@ public func dispatchServicePluginEvent(
     if (!replySummary.isEmpty() && event.status == "completed") {
         text += "\n\n${replySummary}"
     }
+    if (!dispatchAllowed()) { return servicePluginDispatchResult(frame, false, "dispatch_cancelled") }
     let delivery = match (servicePluginEventDeliveryForTest) {
         case Some(sender) => sender(job.deliveryTarget, text)
         case None => ServicePluginEventDeliveryResult(false, "delivery_unconfigured", diagnostic: "service plugin event delivery is not configured")
@@ -431,7 +434,8 @@ private func recordGitCodeMonitorOrphanDetected(frame: ServiceFrame): ServicePlu
 
 private func recordGitCodeAcceptedEventForFutureReply(
     frame: ServiceFrame,
-    store!: ServicePluginPendingJobStore = servicePluginPendingJobStore()
+    store!: ServicePluginPendingJobStore = servicePluginPendingJobStore(),
+    dispatchAllowed!: () -> Bool = { => true }
 ): ServicePluginEventDispatchResult {
     let root = match (servicePluginAcceptedEventPayloadRoot(frame.payload)) {
         case Some(obj) => obj
@@ -451,7 +455,7 @@ private func recordGitCodeAcceptedEventForFutureReply(
         case Some(row) => row
         case None =>
             if (event.jobId.startsWith("webhook-")) {
-                return dispatchGitCodeWebhookAcceptedEvent(frame, event)
+                return dispatchGitCodeWebhookAcceptedEvent(frame, event, dispatchAllowed: dispatchAllowed)
             }
             return servicePluginDispatchResult(frame, false, "orphan_event", diagnostic: "pending job not found for gitcode.event.accepted", eventId: event.eventId)
     }
@@ -459,15 +463,19 @@ private func recordGitCodeAcceptedEventForFutureReply(
     if (servicePluginGeneratedReplyKeys.contains(key)) {
         return servicePluginDispatchResult(frame, true, "duplicate_event", eventId: event.eventId)
     }
+    if (!dispatchAllowed()) { return servicePluginDispatchResult(frame, false, "dispatch_cancelled", eventId: event.eventId) }
     servicePluginGeneratedReplyKeys.add(key)
     store.markRunning(event.jobId, stage: "event_accepted")
+    if (!dispatchAllowed()) { return servicePluginDispatchResult(frame, false, "dispatch_cancelled", eventId: event.eventId) }
     let rawGenerated = match (servicePluginGeneratedReplyHandlerForTest) {
         case Some(handler) => handler(job, event)
         case None => ServicePluginGeneratedReplyResult(false, status: "handler_unconfigured", diagnostic: "generated reply handler is not configured", needsHumanReview: true)
     }
     let generated = normalizeServicePluginGeneratedReplyResult(rawGenerated)
-    let writeback = servicePluginApplyGeneratedReplyWriteback(event, generated)
+    let writeback = servicePluginApplyGeneratedReplyWriteback(event, generated, dispatchAllowed: dispatchAllowed)
+    if (writeback.status == "dispatch_cancelled") { return servicePluginDispatchResult(frame, false, "dispatch_cancelled", eventId: event.eventId) }
     let text = renderServicePluginGeneratedReplyNotification(event, generated, writeback: writeback)
+    if (!dispatchAllowed()) { return servicePluginDispatchResult(frame, false, "dispatch_cancelled", eventId: event.eventId) }
     let delivery = match (servicePluginEventDeliveryForTest) {
         case Some(sender) => sender(job.deliveryTarget, text)
         case None => ServicePluginEventDeliveryResult(false, "delivery_unconfigured", diagnostic: "service plugin event delivery is not configured")
@@ -482,7 +490,11 @@ private func recordGitCodeAcceptedEventForFutureReply(
     servicePluginDispatchResult(frame, true, "generated_reply_delivered", eventId: event.eventId, targetCount: 1, deliverySuccess: 1)
 }
 
-public func dispatchGitCodeWebhookAcceptedEvent(frame: ServiceFrame, event: ServicePluginAcceptedGitCodeEvent): ServicePluginEventDispatchResult {
+public func dispatchGitCodeWebhookAcceptedEvent(
+    frame: ServiceFrame,
+    event: ServicePluginAcceptedGitCodeEvent,
+    dispatchAllowed!: () -> Bool = { => true }
+): ServicePluginEventDispatchResult {
     let key = servicePluginAcceptedEventDedupeKey(event)
     if (servicePluginWebhookDispatchKeys.contains(key)) {
         let result = servicePluginDispatchResult(frame, true, "duplicate_event", eventId: event.eventId)
@@ -503,6 +515,7 @@ public func dispatchGitCodeWebhookAcceptedEvent(frame: ServiceFrame, event: Serv
         servicePluginRecordWebhookDispatchResult(result)
         return result
     }
+    if (!dispatchAllowed()) { return servicePluginDispatchResult(frame, false, "dispatch_cancelled", eventId: event.eventId) }
     servicePluginWebhookDispatchKeys.add(key)
     var success: Int64 = 0
     var failed: Int64 = 0
@@ -510,14 +523,19 @@ public func dispatchGitCodeWebhookAcceptedEvent(frame: ServiceFrame, event: Serv
     var feishu: Int64 = 0
     let failures = ArrayList<String>()
     let primary = targets[0]
+    if (!dispatchAllowed()) { return servicePluginDispatchResult(frame, false, "dispatch_cancelled", eventId: event.eventId) }
     let rawGenerated = match (servicePluginWebhookGeneratedReplyHandlerForTest) {
         case Some(handler) => handler(event, primary)
         case None => ServicePluginGeneratedReplyResult(false, status: "handler_unconfigured", diagnostic: "generated reply handler is not configured", needsHumanReview: true)
     }
     let generated = normalizeServicePluginGeneratedReplyResult(rawGenerated)
-    let writeback = servicePluginApplyGeneratedReplyWriteback(event, generated)
+    let writeback = servicePluginApplyGeneratedReplyWriteback(event, generated, dispatchAllowed: dispatchAllowed)
+    if (writeback.status == "dispatch_cancelled") { return servicePluginDispatchResult(frame, false, "dispatch_cancelled", eventId: event.eventId) }
     let text = renderServicePluginGeneratedReplyNotification(event, generated, writeback: writeback)
     for (target in targets) {
+        if (!dispatchAllowed()) {
+            return servicePluginDispatchResult(frame, success > 0, "dispatch_cancelled", eventId: event.eventId, targetCount: targets.size, deliverySuccess: success, deliveryFailed: failed, failureDetails: failures.toArray(), telegram: telegram, feishu: feishu)
+        }
         let delivery = servicePluginDeliverWebhookTarget(target, text)
         if (delivery.ok) {
             success++
@@ -820,11 +838,16 @@ private func servicePluginValidateAcceptedReviewContract(event: ServicePluginAcc
     }
 }
 
-private func servicePluginApplyGeneratedReplyWriteback(event: ServicePluginAcceptedGitCodeEvent, result: ServicePluginGeneratedReplyResult): ServicePluginWritebackApplyState {
+private func servicePluginApplyGeneratedReplyWriteback(
+    event: ServicePluginAcceptedGitCodeEvent,
+    result: ServicePluginGeneratedReplyResult,
+    dispatchAllowed!: () -> Bool = { => true }
+): ServicePluginWritebackApplyState {
     let safeResult = normalizeServicePluginGeneratedReplyResult(result)
     if (!safeResult.ok || safeResult.needsHumanReview || safeResult.draft.trimAscii().isEmpty()) {
         return ServicePluginWritebackApplyState()
     }
+    if (!dispatchAllowed()) { return ServicePluginWritebackApplyState(ok: false, status: "dispatch_cancelled") }
     let payload = servicePluginGeneratedReplyWritebackPayload(event, safeResult)
     let applied = invokeGitCodeWritebackApplyResult("gitcode-monitor", payload, SERVICE_PLUGIN_GITCODE_WRITEBACK_APPLY_TIMEOUT_MS)
     servicePluginParseWritebackApplyResult(applied)

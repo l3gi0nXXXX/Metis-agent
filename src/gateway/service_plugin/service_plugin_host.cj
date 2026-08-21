@@ -811,6 +811,7 @@ private class ServicePluginStdioProcess {
     public func finishDispatchFuture(token: Int64): Unit { synchronized(this.dispatchLock) { this.dispatchFutures.remove(token); this.acceptedDispatches = max(0, this.acceptedDispatches - 1); this.dispatchCondition.notifyAll() } }
     public func fenceDispatch(): Unit { synchronized(this.dispatchLock) { this.dispatchFenced = true; this.dispatchCondition.notifyAll() } }
     public func waitDispatches(timeoutMs: Int64): Bool { synchronized(this.dispatchLock) { if (this.acceptedDispatches == 0) { return true }; let _ = this.dispatchCondition.waitUntil({ => this.acceptedDispatches == 0 }, timeout: Duration.millisecond * max(1, timeoutMs)); this.acceptedDispatches == 0 } }
+    public func dispatchesSettled(): Bool { synchronized(this.dispatchLock) { this.acceptedDispatches == 0 } }
     public func cancelDispatches(timeoutMs: Int64): Bool {
         let futures = synchronized(this.dispatchLock) {
             let rows = ArrayList<Future<Unit>>()
@@ -975,6 +976,19 @@ private class ServicePluginEventPumpGate {
     }
 }
 
+private class ServicePluginDispatchGuardHookGate {
+    private let lock = Mutex()
+    private var pending = true
+
+    public func take(): Bool {
+        synchronized(this.lock) {
+            if (!this.pending) { return false }
+            this.pending = false
+            true
+        }
+    }
+}
+
 private class ServicePluginDetachedOwner {
     public let process: Option<ServicePluginStdioProcess>
     public let queue: Option<ServicePluginResponseQueue>
@@ -988,6 +1002,32 @@ private class ServicePluginDetachedOwner {
         this.process = process
         this.queue = queue
         this.pump = pump
+    }
+}
+
+private class ServicePluginCleanupPendingSlot {
+    public let serviceId: String
+    public let detached: ServicePluginDetachedOwner
+    public let ownerId: String
+    public let generation: Int64
+    public let claimToken: Int64
+    public let stopStatus: String
+    public let diagnostic: String
+    public let finalStatus: String
+    public let finalReason: String
+    public let stateFlushed: Bool
+
+    public init(serviceId: String, detached: ServicePluginDetachedOwner, process: ServicePluginStdioProcess, stopStatus: String, diagnostic: String, finalStatus: String, finalReason: String, stateFlushed: Bool) {
+        this.serviceId = serviceId.trimAscii()
+        this.detached = detached
+        this.ownerId = process.ownerId
+        this.generation = process.generation
+        this.claimToken = process.claimToken
+        this.stopStatus = stopStatus.trimAscii()
+        this.diagnostic = diagnostic.trimAscii()
+        this.finalStatus = finalStatus.trimAscii()
+        this.finalReason = finalReason.trimAscii()
+        this.stateFlushed = stateFlushed
     }
 }
 
@@ -1165,6 +1205,7 @@ private var servicePluginActiveProcesses = HashMap<String, ServicePluginStdioPro
 private var servicePluginResponseQueues = HashMap<String, ServicePluginResponseQueue>()
 private var servicePluginEventPumps = HashMap<String, Future<Unit>>()
 private var servicePluginStartClaims = HashMap<String, ServicePluginStartClaim>()
+private var servicePluginCleanupPendingOwners = HashMap<String, ServicePluginCleanupPendingSlot>()
 private var servicePluginBrokerOwnerSequence: Int64 = 0
 private var servicePluginStartClaimSequence: Int64 = 0
 private var servicePluginStartPhaseHookForTest: Option<(String, String) -> Unit> = None<(String, String) -> Unit>
@@ -1178,6 +1219,9 @@ private func servicePluginRunStartPhaseHook(serviceId: String, phase: String): U
 private let servicePluginProcessLock = Mutex()
 private let servicePluginRuntimeRecordLock = Mutex()
 private let servicePluginHostLogger = metisCreateSubsystemLogger("gateway/service-plugin/host")
+
+public func servicePluginCleanupPendingCountForTest(): Int64 { synchronized(servicePluginProcessLock) { Int64(servicePluginCleanupPendingOwners.size) } }
+public func servicePluginSupervisorWorkerCountForTest(): Int64 { synchronized(servicePluginSupervisorLock) { Int64(servicePluginSupervisorWorkers.size) } }
 
 private func servicePluginSafeDiagnosticText(text: String): String {
     redactServicePayload(text.trimAscii()).text
@@ -1299,6 +1343,78 @@ private func detachServicePluginOwnerLocked(
     ServicePluginDetachedOwner(process: process, queue: queue, pump: pump)
 }
 
+private func servicePluginHasCleanupPendingLocked(serviceId: String): Bool {
+    let sid = serviceId.trimAscii()
+    for ((_, slot) in servicePluginCleanupPendingOwners) {
+        if (slot.serviceId == sid) { return true }
+    }
+    false
+}
+
+private func servicePluginFinalizeCleanupPending(serviceId: String, process: ServicePluginStdioProcess): Bool {
+    if (!process.dispatchesSettled()) { return false }
+    synchronized(servicePluginProcessLock) {
+        match (servicePluginCleanupPendingOwners.get(process.ownerId)) {
+            case Some(slot) =>
+                if (slot.serviceId != serviceId.trimAscii() || slot.generation != process.generation || slot.claimToken != process.claimToken) { return false }
+                servicePluginCleanupPendingOwners.remove(process.ownerId)
+                if (!servicePluginActiveProcesses.contains(slot.serviceId) && !servicePluginStartClaims.contains(slot.serviceId)) {
+                    match (servicePluginRegistry.get(slot.serviceId)) {
+                        case Some(record) =>
+                            if (record.pid == process.process.pid || record.pid == 0) {
+                                record.pid = 0
+                                record.status = slot.finalStatus
+                                record.degradedReason = slot.finalReason
+                                record.stateFlushed = slot.stateFlushed
+                                record.lastError = "${slot.diagnostic} cleanup_finalized"
+                            }
+                        case None => ()
+                    }
+                }
+                true
+            case None => false
+        }
+    }
+}
+
+private func servicePluginPublishCleanupPending(
+    serviceId: String,
+    detached: ServicePluginDetachedOwner,
+    process: ServicePluginStdioProcess,
+    stopStatus: String,
+    diagnostic: String,
+    finalStatus!: String = "stopped",
+    finalReason!: String = "",
+    stateFlushed!: Bool = true
+): Unit {
+    let sid = serviceId.trimAscii()
+    let safeDiagnostic = servicePluginSafeDiagnosticText(diagnostic)
+    synchronized(servicePluginProcessLock) {
+        servicePluginCleanupPendingOwners[process.ownerId] = ServicePluginCleanupPendingSlot(sid, detached, process, stopStatus, safeDiagnostic, finalStatus, finalReason, stateFlushed)
+        match (servicePluginRegistry.get(sid)) {
+            case Some(record) =>
+                if (!servicePluginActiveProcesses.contains(sid)) {
+                    record.status = "cleanup_pending"
+                    record.degradedReason = "cleanup_pending"
+                    record.stateFlushed = false
+                    record.lastError = safeDiagnostic
+                }
+            case None => ()
+        }
+    }
+    let _ = servicePluginFinalizeCleanupPending(sid, process)
+}
+
+private func servicePluginDrainDispatchForStop(process: ServicePluginStdioProcess, deadlineMs: Int64, stopReserveMs: Int64): String {
+    process.fenceDispatch()
+    let dispatchBudget = max(0, servicePluginDeadlineRemaining(deadlineMs) - max(1, stopReserveMs))
+    let waitBudget = if (dispatchBudget > 1) { max(1, dispatchBudget / 2) } else { dispatchBudget }
+    if (waitBudget > 0 && process.waitDispatches(waitBudget)) { return "drained" }
+    let cancelBudget = max(0, servicePluginDeadlineRemaining(deadlineMs) - max(1, stopReserveMs))
+    if (cancelBudget > 0 && process.cancelDispatches(cancelBudget)) { return "cancelled" }
+    "dispatch_pending"
+}
+
 private func cleanupDetachedServicePluginOwner(
     serviceId: String,
     detached: ServicePluginDetachedOwner,
@@ -1317,17 +1433,7 @@ private func cleanupDetachedServicePluginOwner(
     var dispatchStatus = "not_started"
     match (detached.process) {
         case Some(process) =>
-            process.fenceDispatch()
-            let dispatchBudget = max(0, servicePluginDeadlineRemaining(deadlineMs) - stopReserveMs)
-            let waitBudget = if (dispatchBudget > 1) { max(1, dispatchBudget / 2) } else { dispatchBudget }
-            let drained = waitBudget > 0 && process.waitDispatches(waitBudget)
-            if (drained) {
-                dispatchStatus = "drained"
-            } else {
-                let cancelBudget = max(0, servicePluginDeadlineRemaining(deadlineMs) - stopReserveMs)
-                let cancelled = if (cancelBudget > 0) { process.cancelDispatches(cancelBudget) } else { false }
-                dispatchStatus = if (cancelled) { "cancelled" } else { "dispatch_pending" }
-            }
+            dispatchStatus = servicePluginDrainDispatchForStop(process, deadlineMs, stopReserveMs)
         case None => ()
     }
     var stopStatus = ""
@@ -1355,6 +1461,12 @@ private func cleanupDetachedServicePluginOwner(
     match (detached.queue) {
         case Some(queue) => queue.close(status: normalizedReason, diagnostic: safeDiagnostic)
         case None => ()
+    }
+    if (dispatchStatus == "dispatch_pending") {
+        match (detached.process) {
+            case Some(process) => servicePluginPublishCleanupPending(sid, detached, process, stopStatus, "${safeDiagnostic} dispatch_status=dispatch_pending cleanup_pending", finalStatus: "degraded", finalReason: normalizedReason, stateFlushed: false)
+            case None => ()
+        }
     }
     if (joinPump) {
         match (detached.pump) {
@@ -2427,6 +2539,7 @@ private func servicePluginStartSupervisorWorker(record: ServicePluginRuntimeReco
         return
     }
     let serviceId = record.registration.manifest.pluginId
+    if (synchronized(servicePluginProcessLock) { servicePluginHostShuttingDown || servicePluginHasCleanupPendingLocked(serviceId) }) { return }
     let flag = ServicePluginSupervisorStopFlag()
     synchronized(servicePluginSupervisorLock) {
         match (servicePluginSupervisorWorkers.get(serviceId)) {
@@ -2698,6 +2811,8 @@ private func ensureServicePluginStdioProcess(record: ServicePluginRuntimeRecord,
     synchronized(servicePluginProcessLock) {
         if (servicePluginHostShuttingDown) {
             early = Some(ServicePluginProcessEnsureResult(false, "stopping", diagnostic: "service plugin host is shutting down"))
+        } else if (servicePluginHasCleanupPendingLocked(serviceId)) {
+            early = Some(ServicePluginProcessEnsureResult(false, "cleanup_pending", diagnostic: "service plugin owner cleanup is pending"))
         } else if (record.status == "stopping") {
             early = Some(ServicePluginProcessEnsureResult(false, "stopping", diagnostic: "service plugin stop in progress"))
         } else if (servicePluginStartClaims.contains(serviceId)) {
@@ -3056,15 +3171,23 @@ private func servicePluginScheduleEventDispatch(record: ServicePluginRuntimeReco
     let future = spawn {
         gate.waitOpen()
         try {
-            match (servicePluginBeforeEventDispatchHookForTest) {
-                case Some(hook) => hook(record.registration.manifest.pluginId)
-                case None => ()
+            let hookGate = ServicePluginDispatchGuardHookGate()
+            let dispatchAllowed = { =>
+                let allowedBeforeHook = synchronized(servicePluginProcessLock) {
+                    servicePluginOwnerMatchesLocked(record.registration.manifest.pluginId, process.ownerId, process.generation, claimToken: process.claimToken) && process.dispatchAllowed()
+                }
+                if (!allowedBeforeHook) { return false }
+                if (hookGate.take()) {
+                    match (servicePluginBeforeEventDispatchHookForTest) {
+                        case Some(hook) => hook(record.registration.manifest.pluginId)
+                        case None => ()
+                    }
+                }
+                synchronized(servicePluginProcessLock) {
+                    servicePluginOwnerMatchesLocked(record.registration.manifest.pluginId, process.ownerId, process.generation, claimToken: process.claimToken) && process.dispatchAllowed()
+                }
             }
-            let allowed = synchronized(servicePluginProcessLock) {
-                servicePluginOwnerMatchesLocked(record.registration.manifest.pluginId, process.ownerId, process.generation, claimToken: process.claimToken) && process.dispatchAllowed()
-            }
-            if (!allowed) { return }
-            let dispatch = dispatchServicePluginEvent(frame)
+            let dispatch = dispatchServicePluginEvent(frame, dispatchAllowed: dispatchAllowed)
             synchronized(servicePluginProcessLock) {
                 if (servicePluginOwnerMatchesLocked(
                     record.registration.manifest.pluginId,
@@ -3077,6 +3200,7 @@ private func servicePluginScheduleEventDispatch(record: ServicePluginRuntimeReco
             }
         } finally {
             process.finishDispatchFuture(token)
+            let _ = servicePluginFinalizeCleanupPending(record.registration.manifest.pluginId, process)
         }
     }
     process.registerDispatchFuture(token, future)
@@ -3124,33 +3248,42 @@ public func recordServicePluginRuntimeDispatchForTest(serviceId: String, frame: 
 public func startServicePlugin(serviceId: String, context!: ServiceStartContext = ServiceStartContext()): ServiceStartResult {
     match (servicePluginRegistry.get(serviceId.trimAscii())) {
         case Some(record) =>
-            if (!record.registration.enabled) {
-                record.status = "disabled"
-                record.degradedReason = "plugin disabled"
-                return ServiceStartResult(false, serviceId.trimAscii(), "disabled", diagnostic: record.degradedReason)
-            }
-            if (record.registration.manifest.entryCommand.isEmpty()) {
-                record.status = "degraded"
-                record.degradedReason = "missing entry command"
-                record.lastError = record.degradedReason
-                return ServiceStartResult(false, serviceId.trimAscii(), "degraded", diagnostic: record.degradedReason)
-            }
+            let sid = serviceId.trimAscii()
             let cwd = servicePluginEffectiveWorkingDirectory(record.registration.configRef)
-            if (!cwd.isEmpty() && !exists(Path(cwd))) {
-                record.status = "degraded"
-                record.degradedReason = "cwd_missing"
-                record.lastError = "service plugin working directory missing"
-                return ServiceStartResult(false, serviceId.trimAscii(), "degraded", diagnostic: record.lastError)
+            let cwdMissing = !cwd.isEmpty() && !exists(Path(cwd))
+            let started = synchronized(servicePluginProcessLock) {
+                if (servicePluginHostShuttingDown) {
+                    ServiceStartResult(false, sid, "stopping", instanceId: record.instanceId, diagnostic: "service plugin host is shutting down")
+                } else if (servicePluginHasCleanupPendingLocked(sid)) {
+                    ServiceStartResult(false, sid, "cleanup_pending", instanceId: record.instanceId, diagnostic: "service plugin owner cleanup is pending")
+                } else if (!record.registration.enabled) {
+                    record.status = "disabled"
+                    record.degradedReason = "plugin disabled"
+                    ServiceStartResult(false, sid, "disabled", diagnostic: record.degradedReason)
+                } else if (record.registration.manifest.entryCommand.isEmpty()) {
+                    record.status = "degraded"
+                    record.degradedReason = "missing entry command"
+                    record.lastError = record.degradedReason
+                    ServiceStartResult(false, sid, "degraded", diagnostic: record.degradedReason)
+                } else if (cwdMissing) {
+                    record.status = "degraded"
+                    record.degradedReason = "cwd_missing"
+                    record.lastError = "service plugin working directory missing"
+                    ServiceStartResult(false, sid, "degraded", diagnostic: record.lastError)
+                } else {
+                    record.instanceSeq++
+                    record.instanceId = "${sid}-${record.instanceSeq}"
+                    record.status = "registered"
+                    record.degradedReason = ""
+                    record.lastError = ""
+                    record.lastHeartbeatAtMillis = context.nowMillis
+                    record.stateFlushed = false
+                    ServiceStartResult(true, sid, record.status, instanceId: record.instanceId)
+                }
             }
-            record.instanceSeq++
-            record.instanceId = "${serviceId.trimAscii()}-${record.instanceSeq}"
-            record.status = "registered"
-            record.degradedReason = ""
-            record.lastError = ""
-            record.lastHeartbeatAtMillis = context.nowMillis
-            record.stateFlushed = false
+            if (!started.ok) { return started }
             servicePluginStartSupervisorWorker(record)
-            ServiceStartResult(true, serviceId.trimAscii(), record.status, instanceId: record.instanceId)
+            started
         case None => ServiceStartResult(false, serviceId.trimAscii(), "missing", diagnostic: "service plugin is not registered")
     }
 }
@@ -3188,11 +3321,14 @@ public func stopServicePlugin(serviceId: String, reason!: String = "", timeoutMi
             }
             let effectiveTimeoutMillis = min(timeoutMillis, 30000)
             let deadlineMs = servicePluginNowMs() + effectiveTimeoutMillis
+            let stopReserveMs = max(1, effectiveTimeoutMillis / 2)
             var selectedProcess = None<ServicePluginStdioProcess>
             var pendingClaim = None<ServicePluginStartClaim>
             var stopClaimed = false
             synchronized(servicePluginProcessLock) {
-                if (record.status != "stopping") {
+                if (servicePluginHasCleanupPendingLocked(sid)) {
+                    ()
+                } else if (record.status != "stopping") {
                     stopClaimed = true
                     record.status = "stopping"
                     match (servicePluginActiveProcesses.get(sid)) {
@@ -3210,7 +3346,8 @@ public func stopServicePlugin(serviceId: String, reason!: String = "", timeoutMi
                 }
             }
             if (!stopClaimed) {
-                return ServiceStopResult(false, sid, "stopping", diagnostic: "service plugin stop already in progress")
+                let status = synchronized(servicePluginProcessLock) { if (servicePluginHasCleanupPendingLocked(sid)) { "cleanup_pending" } else { "stopping" } }
+                return ServiceStopResult(false, sid, status, diagnostic: if (status == "cleanup_pending") { "service plugin owner cleanup is pending" } else { "service plugin stop already in progress" })
             }
             match (pendingClaim) {
                 case Some(_) => servicePluginRunStartPhaseHook(sid, "claim_cancelled")
@@ -3220,8 +3357,8 @@ public func stopServicePlugin(serviceId: String, reason!: String = "", timeoutMi
             var stopOk = true
             match (pendingClaim) {
                 case Some(claim) =>
-                    let remaining = servicePluginDeadlineRemaining(deadlineMs)
-                    if (remaining <= 0 || !claim.waitSettled(max(1, remaining))) {
+                    let claimBudget = max(0, servicePluginDeadlineRemaining(deadlineMs) - stopReserveMs)
+                    if (claimBudget <= 0 || !claim.waitSettled(claimBudget)) {
                         stopStatus = "still_alive"
                         stopOk = false
                     }
@@ -3236,14 +3373,10 @@ public func stopServicePlugin(serviceId: String, reason!: String = "", timeoutMi
                 }
                 match (selectedProcess) { case Some(process) => process.fenceDispatch() case None => () }
             }
+            var dispatchStatus = "not_started"
             match (selectedProcess) {
                 case Some(process) =>
-                    let remaining = servicePluginDeadlineRemaining(deadlineMs)
-                    if (remaining <= 0 || !process.waitDispatches(max(1, remaining))) { stopOk = false; stopStatus = "still_alive" }
-                case None => ()
-            }
-            match (selectedProcess) {
-                case Some(process) =>
+                    dispatchStatus = servicePluginDrainDispatchForStop(process, deadlineMs, stopReserveMs)
                     if (servicePluginDeadlineRemaining(deadlineMs) > 0) {
                         try {
                             process.writeLine(encodeServiceFrame(ServiceFrame("request", "stop-${record.instanceId}", sid, method: "stop", correlationId: "stop-${record.instanceId}", payload: "{}")).trimAscii())
@@ -3251,9 +3384,9 @@ public func stopServicePlugin(serviceId: String, reason!: String = "", timeoutMi
                             ()
                         }
                     }
-                    let reserveMs = max(1, effectiveTimeoutMillis / 2)
-                    while (servicePluginDeadlineRemaining(deadlineMs) > reserveMs) {
-                        let waitMs = min(50, servicePluginDeadlineRemaining(deadlineMs) - reserveMs)
+                    let forceReserveMs = max(1, stopReserveMs / 2)
+                    while (servicePluginDeadlineRemaining(deadlineMs) > forceReserveMs) {
+                        let waitMs = min(50, servicePluginDeadlineRemaining(deadlineMs) - forceReserveMs)
                         let terminal = process.waitTerminal(max(1, waitMs))
                         if (terminal && servicePluginLeaseStopped(record)) {
                             stopStatus = "graceful_exited"
@@ -3261,19 +3394,14 @@ public func stopServicePlugin(serviceId: String, reason!: String = "", timeoutMi
                         }
                         if (terminal) { sleep(Duration.millisecond * min(10, max(1, waitMs))) }
                     }
-                    if (stopStatus != "graceful_exited" || !servicePluginLeaseStopped(record)) {
-                        let remaining = servicePluginDeadlineRemaining(deadlineMs)
-                        let forced = if (remaining > 0) {
-                            process.stop(timeoutMs: remaining)
-                        } else {
-                            ServicePluginProcessStopResult(false, "still_alive")
-                        }
-                        stopOk = forced.ok
-                        stopStatus = forced.status
-                        if (!forced.ok && !servicePluginPidAlive(record.pid)) {
-                            stopOk = true
-                            stopStatus = "force_terminated"
-                        }
+                    let graceful = stopStatus == "graceful_exited" && servicePluginLeaseStopped(record)
+                    let remaining = servicePluginDeadlineRemaining(deadlineMs)
+                    let forced = if (remaining > 0) { process.stop(timeoutMs: remaining) } else { ServicePluginProcessStopResult(false, "still_alive") }
+                    stopOk = forced.ok
+                    stopStatus = if (graceful && forced.ok) { "graceful_exited" } else { forced.status }
+                    if (!forced.ok && !servicePluginPidAlive(record.pid)) {
+                        stopOk = true
+                        stopStatus = if (graceful) { "graceful_exited" } else { "force_terminated" }
                     }
                 case None => ()
             }
@@ -3296,13 +3424,7 @@ public func stopServicePlugin(serviceId: String, reason!: String = "", timeoutMi
                 case Some(process) => process.stopReaders(min(100, max(1, servicePluginDeadlineRemaining(deadlineMs))))
                 case None => ()
             }
-            match (detached.pump) {
-                case Some(pump) =>
-                    let remaining = servicePluginDeadlineRemaining(deadlineMs)
-                    if (remaining > 0) { try { pump.get(Duration.millisecond * remaining) } catch (_: Exception) { () } }
-                case None => ()
-            }
-            let stopDiagnostic = "stop_status=${stopStatus}"
+            let stopDiagnostic = "stop_status=${stopStatus} dispatch_status=${dispatchStatus}"
             if (!stopOk) {
                 record.lastError = match (selectedProcess) {
                     case Some(process) => "${stopDiagnostic} ${servicePluginProcessError("service plugin stop forced", process)}"
@@ -3313,6 +3435,30 @@ public func stopServicePlugin(serviceId: String, reason!: String = "", timeoutMi
             }
             let leaseDiagnostic = servicePluginLeaseStopDiagnostic(record)
             let cleanLease = !leaseDiagnostic.startsWith("lease_not_stopped_after_stop") && !leaseDiagnostic.startsWith("lease_identity_mismatch_after_stop")
+            if (dispatchStatus == "dispatch_pending") {
+                match (selectedProcess) {
+                    case Some(process) =>
+                        if (stopOk || !servicePluginPidAlive(process.process.pid)) { record.pid = 0 }
+                        servicePluginPublishCleanupPending(
+                            sid,
+                            detached,
+                            process,
+                            stopStatus,
+                            "${stopDiagnostic} ${leaseDiagnostic} cleanup_pending",
+                            finalStatus: if (cleanLease && stopOk) { "stopped" } else { "degraded" },
+                            finalReason: if (!cleanLease) { "lease_not_stopped_after_stop" } else if (!stopOk) { "stop timeout" } else { reason.trimAscii() },
+                            stateFlushed: cleanLease && stopOk
+                        )
+                    case None => ()
+                }
+                return ServiceStopResult(false, sid, "cleanup_pending", stateFlushed: false, diagnostic: "${stopDiagnostic} ${leaseDiagnostic} cleanup_pending")
+            }
+            match (detached.pump) {
+                case Some(pump) =>
+                    let remaining = servicePluginDeadlineRemaining(deadlineMs)
+                    if (remaining > 0) { try { pump.get(Duration.millisecond * remaining) } catch (_: Exception) { () } }
+                case None => ()
+            }
             if (!cleanLease || !stopOk) {
                 record.status = "degraded"
                 record.degradedReason = if (!cleanLease) { "lease_not_stopped_after_stop" } else { "stop timeout" }
@@ -3341,6 +3487,14 @@ public func stopServicePlugin(serviceId: String, reason!: String = "", timeoutMi
 public func restartServicePlugin(serviceId: String, reason!: String = ""): ServiceRestartResult {
     match (servicePluginRegistry.get(serviceId.trimAscii())) {
         case Some(record) =>
+            let blocked = synchronized(servicePluginProcessLock) {
+                if (servicePluginHostShuttingDown) { "stopping" }
+                else if (servicePluginHasCleanupPendingLocked(serviceId)) { "cleanup_pending" }
+                else { "" }
+            }
+            if (!blocked.isEmpty()) {
+                return ServiceRestartResult(false, serviceId.trimAscii(), blocked, previousInstanceId: record.instanceId, diagnostic: if (blocked == "stopping") { "service plugin host is shutting down" } else { "service plugin owner cleanup is pending" })
+            }
             let previous = record.instanceId
             let stopped = stopServicePlugin(serviceId, reason: reason)
             if (!stopped.ok) {
