@@ -170,6 +170,12 @@ public class ServicePluginHostTest {
         "printf '%s\\n' '${initLine}'; printf '%s\\n' '${eventLine}'; while [ ! -f \"$METIS_STDIO_FIXTURE_MARKER_PATH\" ]; do sleep 0.01; done; for i in 1 2 3 4 5 6 7 8 9; do printf 'WARN cleanup noise %s\\n' \"$i\"; done; trap '' TERM HUP; while true; do sleep 1; done"
     }
 
+    private func gitCodeIgnoringTermDispatchScript(): String {
+        let initLine = this.gitCodeInitLine()
+        let eventLine = this.gitCodeAcceptedEventLine(eventId: "gitcode:Cangjie/community:issue:cleanup-retry")
+        "printf '%s\n' '${initLine}'; printf '%s\n' '${eventLine}'; trap '' TERM HUP; while true; do sleep 1; done"
+    }
+
     private func gitCodeMaintainerEmailWritebackScript(): String {
         let initLine = this.gitCodeInitLine()
         let eventLine = this.gitCodeAcceptedEventLine(eventId: "gitcode:Cangjie/community:issue:maintainer-email")
@@ -1970,7 +1976,7 @@ public class ServicePluginHostTest {
 
                 try { remove(marker) } catch (_: Exception) { () }
                 try { remove(release) } catch (_: Exception) { () }
-                this.registerGitCodeStdioScript(this.gitCodeReentrantWritebackScript())
+                this.registerGitCodeStdioScript(this.gitCodeIgnoringTermDispatchScript())
                 setServicePluginBeforeEventDispatchHookForTest(Some({ _serviceId: String =>
                     File.writeTo(marker, "dispatch".toArray())
                     while (!exists(release)) { sleep(Duration.millisecond * 10) }
@@ -1989,22 +1995,32 @@ public class ServicePluginHostTest {
                 }))
                 @Expect(ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000).ok, true)
                 let explicitPid = match (getServicePluginSnapshot("gitcode-monitor")) { case Some(snapshot) => snapshot.pid case None => Int64(0) }
+                let explicitPgid = this.processGroupId(explicitPid)
+                @Expect(explicitPgid > 0, true)
                 @Expect(this.waitForFile(marker, timeoutMillis: 3000), true)
-                let explicitStop = stopServicePlugin("gitcode-monitor", reason: "p3-n1-explicit-cleanup", timeoutMillis: 800)
+                let explicitStop = stopServicePlugin("gitcode-monitor", reason: "p3-n1-explicit-cleanup", timeoutMillis: 1)
                 @Expect(explicitStop.ok, false)
                 @Expect(explicitStop.status, "cleanup_pending")
                 @Expect(explicitStop.diagnostic.contains("dispatch_status=dispatch_pending"), true)
                 @Expect(servicePluginCleanupPendingCountForTest(), 1)
-                @Expect(managedStdioBroker().snapshot().ownerCount, 0)
-                @Expect(this.waitForPidGone(explicitPid), true)
+                @Expect(managedStdioBroker().snapshot().ownerCount, 1)
+                let (initialPendingPidExit, _, _) = executeWithOutput("kill", ["-0", "${explicitPid}"])
+                @Expect(initialPendingPidExit, 0)
                 @Expect(ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 500).status, "cleanup_pending")
                 File.writeTo(release, "release".toArray())
-                let explicitCleanupDeadline = DateTime.now().toUnixTimeStamp().toMilliseconds() + 2000
-                while (servicePluginCleanupPendingCountForTest() > 0 && DateTime.now().toUnixTimeStamp().toMilliseconds() < explicitCleanupDeadline) {
-                    sleep(Duration.millisecond * 20)
-                }
-                @Expect(servicePluginCleanupPendingCountForTest(), 0)
+                sleep(Duration.millisecond * 100)
+                @Expect(servicePluginCleanupPendingCountForTest(), 1)
+                @Expect(managedStdioBroker().snapshot().ownerCount, 1)
+                let (pendingPidExit, _, _) = executeWithOutput("kill", ["-0", "${explicitPid}"])
+                @Expect(pendingPidExit, 0)
                 @Expect(synchronized(deliveryLock) { deliveries.size }, 0)
+                let cleanupRetry = stopServicePlugin("gitcode-monitor", reason: "p3-n1-cleanup-retry", timeoutMillis: 2500)
+                @Expect(cleanupRetry.ok, true)
+                @Expect(cleanupRetry.status, "stopped")
+                @Expect(servicePluginCleanupPendingCountForTest(), 0)
+                @Expect(managedStdioBroker().snapshot().ownerCount, 0)
+                @Expect(this.waitForPidGone(explicitPid), true)
+                @Expect(this.processGroupId(explicitPid), 0)
                 match (getServicePluginSnapshot("gitcode-monitor")) {
                     case Some(snapshot) => @Expect(snapshot.status, "stopped")
                     case None => @Expect(true, false)
@@ -2015,6 +2031,31 @@ public class ServicePluginHostTest {
                 setServicePluginWebhookGeneratedReplyHandlerForTest(None<(ServicePluginAcceptedGitCodeEvent, ServicePluginDeliveryTarget) -> ServicePluginGeneratedReplyResult>)
                 setServicePluginEventDeliveryForTest(None)
                 resetServicePluginGeneratedReplyStateForTest()
+                resetServicePluginHostForTest()
+
+                try { remove(marker) } catch (_: Exception) { () }
+                try { remove(release) } catch (_: Exception) { () }
+                this.registerBrokerServiceFixture("noise-0", pluginId: "shutdown-supervisor", capabilityId: "shutdown-supervisor.monitor.status")
+                setServicePluginBeforeSupervisorRegisterHookForTest(Some({ _serviceId: String =>
+                    File.writeTo(marker, "before-supervisor-register".toArray())
+                    while (!exists(release)) { sleep(Duration.millisecond * 10) }
+                }))
+                starter = Some(spawn { startServicePlugin("shutdown-supervisor") })
+                @Expect(this.waitForFile(marker), true)
+                shutdownServicePluginHost(reason: "p3-n1-supervisor-linearization", timeoutMillis: 1000)
+                @Expect(servicePluginSupervisorWorkerCountForTest(), 0)
+                match (getServicePluginSnapshot("shutdown-supervisor")) {
+                    case Some(snapshot) => @Expect(snapshot.status, "stopped")
+                    case None => @Expect(true, false)
+                }
+                File.writeTo(release, "release".toArray())
+                @Expect(starter.getOrThrow().get().status, "stopping")
+                starter = None<Future<ServiceStartResult>>
+                @Expect(startServicePlugin("shutdown-supervisor").status, "stopping")
+                @Expect(restartServicePlugin("shutdown-supervisor", reason: "shutdown-gate").status, "stopping")
+                @Expect(ensureRegisteredServicePluginStarted("shutdown-supervisor", startupTimeoutMs: 500).status, "stopping")
+                @Expect(servicePluginSupervisorWorkerCountForTest(), 0)
+                setServicePluginBeforeSupervisorRegisterHookForTest(None<(String) -> Unit>)
                 resetServicePluginHostForTest()
 
                 for (phase in ["before_start", "after_attach"]) {
@@ -2056,6 +2097,7 @@ public class ServicePluginHostTest {
             } finally {
                 if (!exists(release)) { try { File.writeTo(release, "release".toArray()) } catch (_: Exception) { () } }
                 setServicePluginBeforeEventDispatchHookForTest(None<(String) -> Unit>)
+                setServicePluginBeforeSupervisorRegisterHookForTest(None<(String) -> Unit>)
                 setServicePluginStartPhaseHookForTest(None<(String, String) -> Unit>)
                 setServicePluginWebhookSubscribersProviderForTest(None<(ServicePluginAcceptedGitCodeEvent) -> ArrayList<ServicePluginDeliveryTarget>>)
                 setServicePluginWebhookGeneratedReplyHandlerForTest(None<(ServicePluginAcceptedGitCodeEvent, ServicePluginDeliveryTarget) -> ServicePluginGeneratedReplyResult>)
