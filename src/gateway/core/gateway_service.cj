@@ -5,6 +5,8 @@ import metis.core.config.{CliConfig, CliSettingManager, GatewayUserSettings, Met
 import metis.core.model.{CodexResponsesException, findModelCapabilityCatalogEntry, modelCapabilityCatalogEntriesForProvider}
 import metis.core.skills.SkillsPrompt
 import metis.gateway.model.*
+import metis.gateway.process.shutdownGatewayStdioBroker
+import metis.process.ManagedStdioOperationResult
 import metis.gateway.security.gatewayPairingAccountStore
 import metis.gateway.service_plugin.{CapabilityCaller, CapabilityInvokeRequest, CapabilityInvokeResult, ServicePluginAcceptedGitCodeEvent, ServicePluginDeliveryTarget, ServicePluginEventDeliveryResult, ServicePluginGeneratedReplyResult, ServicePluginPendingJob, buildServicePluginImBindingRules, invokeRegisteredCapability, matchServicePluginImBinding, parseServicePluginJobAcceptedPayload, redactServicePayload, renderServicePluginJobSnapshotMessage, servicePluginGeneratedReplyResultFromAgentAnswer, servicePluginPendingJobStore, registerConfiguredServicePlugins, servicePluginConfiguredStatusForUser, servicePluginWebhookDispatchStatsJson, setServicePluginEventDelivery, setServicePluginGeneratedReplyHandler, setServicePluginWebhookGeneratedReplyHandler, setServicePluginWebhookSubscribersProvider, shutdownServicePluginHost, validateServicePluginGeneratedDraft}
 import metis.gateway.session.{GatewayIngressSource, GatewaySessionContext, GatewaySessionRequest, gatewayResolveSessionContext, gatewaySessionRequestFromInbound}
@@ -16,6 +18,27 @@ import std.convert.Parsable
 import std.fs.{Directory, File, Path, copy, exists, remove}
 import std.time.DateTime
 import stdx.encoding.json.{JsonArray, JsonBool, JsonObject, JsonString, JsonValue}
+
+func gatewayServiceStopOwnersThenBroker(stopOwners: () -> Unit, stopBroker: () -> ManagedStdioOperationResult): Unit {
+    try {
+        stopOwners()
+    } finally {
+        let brokerResult = stopBroker()
+        if (!brokerResult.ok) {
+            gatewayLogEventError(
+                "gateway/service",
+                "gateway.stdio_broker.stop.failed",
+                "gateway stdio broker shutdown did not settle within its deadline",
+                meta: gatewayLogMeta()
+                    .string("phase", "stop")
+                    .string("step", "shutdownGatewayStdioBroker")
+                    .string("status", brokerResult.status)
+                    .int("generation", brokerResult.generation)
+                    .object()
+            )
+        }
+    }
+}
 
 /**
  * GatewayService（P0）：
@@ -191,12 +214,17 @@ public class GatewayService {
      * 停止所有渠道。
      */
     public func stop(): Unit {
-        let user = CliSettingManager.readGatewaySettings()
-        let _ = gatewayOpenClawCompatHostStop(user)
-        let _ = gatewayOpenClawPluginSidecarStop(user)
-        shutdownServicePluginHost(reason: "gateway-shutdown")
-        // Gateway process shutdown should not persist a user-level manual stop.
-        this.channelManager.stopChannels(reason: "shutdown", manualStop: false)
+        gatewayServiceStopOwnersThenBroker({ =>
+            let user = CliSettingManager.readGatewaySettings()
+            let _ = gatewayOpenClawCompatHostStop(user)
+            let _ = gatewayOpenClawPluginSidecarStop(user)
+            shutdownServicePluginHost(reason: "gateway-shutdown")
+            // Gateway process shutdown should not persist a user-level manual stop.
+            this.channelManager.stopChannels(reason: "shutdown", manualStop: false)
+        }, { =>
+            // The broker is the final process-I/O owner. This cleanup must run even when an earlier owner stop throws.
+            shutdownGatewayStdioBroker(timeoutMs: 2000)
+        })
     }
 
     /**
