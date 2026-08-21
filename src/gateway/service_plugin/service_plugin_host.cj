@@ -787,6 +787,10 @@ private class ServicePluginStdioProcess {
     private let state = ServicePluginBrokerProcessState()
     private let stdoutBuffer = ServicePluginLineBuffer()
     private let stderrBuffer = ServicePluginLineBuffer()
+    private let dispatchLock = Mutex()
+    private let dispatchCondition: Condition
+    private var dispatchFenced = false
+    private var acceptedDispatches: Int64 = 0
 
     public init(broker: ManagedStdioBrokerClient, ownerId: String, generation: Int64, pid: Int64, claimToken!: Int64 = 0) {
         this.broker = broker
@@ -794,7 +798,14 @@ private class ServicePluginStdioProcess {
         this.generation = generation
         this.claimToken = claimToken
         this.process = ServicePluginBrokerProcessHandle(pid, this.state)
+        synchronized(this.dispatchLock) { this.dispatchCondition = this.dispatchLock.condition() }
     }
+
+    public func acceptDispatch(): Bool { synchronized(this.dispatchLock) { if (this.dispatchFenced) { false } else { this.acceptedDispatches++; true } } }
+    public func dispatchAllowed(): Bool { synchronized(this.dispatchLock) { !this.dispatchFenced } }
+    public func finishDispatch(): Unit { synchronized(this.dispatchLock) { this.acceptedDispatches = max(0, this.acceptedDispatches - 1); this.dispatchCondition.notifyAll() } }
+    public func fenceDispatch(): Unit { synchronized(this.dispatchLock) { this.dispatchFenced = true; this.dispatchCondition.notifyAll() } }
+    public func waitDispatches(timeoutMs: Int64): Bool { synchronized(this.dispatchLock) { if (this.acceptedDispatches == 0) { return true }; let _ = this.dispatchCondition.waitUntil({ => this.acceptedDispatches == 0 }, timeout: Duration.millisecond * max(1, timeoutMs)); this.acceptedDispatches == 0 } }
 
     public func writeLine(line: String): Unit {
         let written = this.broker.writeOwnerLine(this.ownerId, line)
@@ -868,7 +879,7 @@ private class ServicePluginStdioProcess {
         this.stderrBuffer.close()
         ServicePluginProcessStopResult(
             stopped.ok,
-            if (stopped.ok) { "terminated" } else { "still_alive" }
+            if (!stopped.ok) { "still_alive" } else if (stopped.status == "already_stopped") { "terminated" } else { "force_terminated" }
         )
     }
 
@@ -901,13 +912,26 @@ private class ServicePluginStartClaim {
     public let token: Int64
     public let ownerId: String
     public let instanceId: String
-    public var process: Option<ServicePluginStdioProcess> = None<ServicePluginStdioProcess>
+    private let lock = Mutex()
+    private let condition: Condition
+    private var state = "registered"
+    private var cancelRequested = false
+    private var resultStatus = ""
+    private var resultDiagnostic = ""
 
     public init(token: Int64, ownerId: String, instanceId: String) {
         this.token = token
         this.ownerId = ownerId
         this.instanceId = instanceId
+        synchronized(this.lock) { this.condition = this.lock.condition() }
     }
+
+    public func transition(next: String): Bool { synchronized(this.lock) { if (this.cancelRequested || this.state == "settled") { false } else { this.state = next; true } } }
+    public func cancel(): Unit { synchronized(this.lock) { this.cancelRequested = true; this.condition.notifyAll() } }
+    public func cancelled(): Bool { synchronized(this.lock) { this.cancelRequested } }
+    public func settle(status: String, diagnostic: String): Unit { synchronized(this.lock) { this.state = "settled"; this.resultStatus = status; this.resultDiagnostic = diagnostic; this.condition.notifyAll() } }
+    public func waitSettled(timeoutMs: Int64): Bool { synchronized(this.lock) { if (this.state == "settled") { return true }; let _ = this.condition.waitUntil({ => this.state == "settled" }, timeout: Duration.millisecond * max(1, timeoutMs)); this.state == "settled" } }
+    public func outcome(): (String, String) { synchronized(this.lock) { (this.resultStatus, this.resultDiagnostic) } }
 }
 
 private class ServicePluginEventPumpGate {
@@ -1123,6 +1147,11 @@ private var servicePluginEventPumps = HashMap<String, Future<Unit>>()
 private var servicePluginStartClaims = HashMap<String, ServicePluginStartClaim>()
 private var servicePluginBrokerOwnerSequence: Int64 = 0
 private var servicePluginStartClaimSequence: Int64 = 0
+private var servicePluginStartPhaseHookForTest: Option<(String, String) -> Unit> = None<(String, String) -> Unit>
+
+public func setServicePluginStartPhaseHookForTest(hook: Option<(String, String) -> Unit>): Unit { servicePluginStartPhaseHookForTest = hook }
+
+private func servicePluginRunStartPhaseHook(serviceId: String, phase: String): Unit { match (servicePluginStartPhaseHookForTest) { case Some(hook) => hook(serviceId, phase) case None => () } }
 private let servicePluginProcessLock = Mutex()
 private let servicePluginRuntimeRecordLock = Mutex()
 private let servicePluginHostLogger = metisCreateSubsystemLogger("gateway/service-plugin/host")
@@ -1259,6 +1288,14 @@ private func cleanupDetachedServicePluginOwner(
     let sid = serviceId.trimAscii()
     let normalizedReason = if (reason.trimAscii().isEmpty()) { "stale_active_process" } else { reason.trimAscii() }
     let safeDiagnostic = servicePluginSafeDiagnosticText(if (diagnostic.trimAscii().isEmpty()) { normalizedReason } else { diagnostic })
+    let deadlineMs = servicePluginNowMs() + max(1, timeoutMs)
+    match (detached.process) {
+        case Some(process) =>
+            process.fenceDispatch()
+            let remaining = servicePluginDeadlineRemaining(deadlineMs)
+            if (remaining > 0) { let _ = process.waitDispatches(remaining) }
+        case None => ()
+    }
     match (detached.queue) {
         case Some(queue) => queue.close(status: normalizedReason, diagnostic: safeDiagnostic)
         case None => ()
@@ -1266,13 +1303,17 @@ private func cleanupDetachedServicePluginOwner(
     var stopStatus = ""
     if (stopProcess) {
         match (detached.process) {
-            case Some(process) => stopStatus = process.stop(timeoutMs: max(1, timeoutMs)).status
+            case Some(process) =>
+                let remaining = servicePluginDeadlineRemaining(deadlineMs)
+                stopStatus = if (remaining > 0) { process.stop(timeoutMs: remaining).status } else { "still_alive" }
             case None => ()
         }
     }
     if (joinPump) {
         match (detached.pump) {
-            case Some(future) => try { future.get(Duration.millisecond * max(1, timeoutMs)) } catch (_: Exception) { () }
+            case Some(future) =>
+                let remaining = servicePluginDeadlineRemaining(deadlineMs)
+                if (remaining > 0) { try { future.get(Duration.millisecond * remaining) } catch (_: Exception) { () } }
             case None => ()
         }
     }
@@ -1465,6 +1506,7 @@ public func resetServicePluginHostForTest(): Unit {
     servicePluginPortOwnerProbeForTest = None<(Int64, Int64) -> Bool>
     servicePluginSupervisorAutoStartForTest = true
     servicePluginSupervisorConfig = ServicePluginSupervisorConfig()
+    servicePluginStartPhaseHookForTest = None<(String, String) -> Unit>
 }
 
 public func withServicePluginHostTestHome<T>(label: String, block: (Path) -> T): T {
@@ -2423,6 +2465,9 @@ private func servicePluginLeaseStopDiagnostic(record: ServicePluginRuntimeRecord
     match (servicePluginReadLease(leasePath)) {
         case Some(lease) =>
             let pidAlive = servicePluginPidAlive(lease.pid)
+            if (lease.sessionId != record.instanceId || lease.pid != record.pid) {
+                return "lease_identity_mismatch_after_stop expectedSessionId=${record.instanceId} expectedPid=${record.pid} actualSessionId=${lease.sessionId} actualPid=${lease.pid}"
+            }
             if (lease.state != "stopped" || pidAlive) {
                 return "lease_not_stopped_after_stop state=${lease.state} pid=${lease.pid} parentPid=${lease.parentPid} pidAlive=${pidAlive} port=${lease.port}"
             }
@@ -2457,7 +2502,7 @@ private func servicePluginProcessEnvironment(record: ServicePluginRuntimeRecord)
 
 private func stopAllActiveServicePluginProcesses(): Unit {
     let detached = ArrayList<(String, ServicePluginDetachedOwner)>()
-    let pending = ArrayList<(String, ServicePluginStdioProcess)>()
+    let pending = ArrayList<ServicePluginStartClaim>()
     synchronized(servicePluginProcessLock) {
         for ((serviceId, process) in servicePluginActiveProcesses) {
             detached.add((serviceId, ServicePluginDetachedOwner(
@@ -2467,10 +2512,8 @@ private func stopAllActiveServicePluginProcesses(): Unit {
             )))
         }
         for ((serviceId, claim) in servicePluginStartClaims) {
-            match (claim.process) {
-                case Some(process) => pending.add((serviceId, process))
-                case None => ()
-            }
+            claim.cancel()
+            pending.add(claim)
         }
         servicePluginActiveProcesses = HashMap<String, ServicePluginStdioProcess>()
         servicePluginResponseQueues = HashMap<String, ServicePluginResponseQueue>()
@@ -2480,8 +2523,8 @@ private func stopAllActiveServicePluginProcesses(): Unit {
     for ((serviceId, owner) in detached) {
         cleanupDetachedServicePluginOwner(serviceId, owner, "stopped", diagnostic: "service plugin host reset")
     }
-    for ((_, process) in pending) {
-        let _ = process.stop()
+    for (claim in pending) {
+        let _ = claim.waitSettled(2000)
     }
 }
 
@@ -2514,6 +2557,10 @@ private func failServicePluginStartClaim(
 ): ServicePluginProcessEnsureResult {
     let serviceId = record.registration.manifest.pluginId
     let safeDiagnostic = servicePluginSafeDiagnosticText(diagnostic)
+    match (process) {
+        case Some(value) => let _ = value.stop()
+        case None => ()
+    }
     synchronized(servicePluginProcessLock) {
         if (servicePluginStartClaimMatchesLocked(serviceId, claim)) {
             servicePluginStartClaims.remove(serviceId)
@@ -2525,10 +2572,7 @@ private func failServicePluginStartClaim(
             }
         }
     }
-    match (process) {
-        case Some(value) => let _ = value.stop()
-        case None => ()
-    }
+    claim.settle(status, safeDiagnostic)
     ServicePluginProcessEnsureResult(false, status, diagnostic: safeDiagnostic)
 }
 
@@ -2550,12 +2594,13 @@ private func ensureServicePluginStdioProcess(record: ServicePluginRuntimeRecord,
 
     var stale = ServicePluginDetachedOwner()
     var early = None<ServicePluginProcessEnsureResult>
+    var follower = None<ServicePluginStartClaim>
     var claim = ServicePluginStartClaim(0, "", "")
     synchronized(servicePluginProcessLock) {
         if (record.status == "stopping") {
             early = Some(ServicePluginProcessEnsureResult(false, "stopping", diagnostic: "service plugin stop in progress"))
         } else if (servicePluginStartClaims.contains(serviceId)) {
-            early = Some(ServicePluginProcessEnsureResult(false, "starting", diagnostic: "service plugin start in progress"))
+            follower = servicePluginStartClaims.get(serviceId)
         } else if (servicePluginActiveProcesses.contains(serviceId) && servicePluginResponseQueues.contains(serviceId)) {
             let activeProcess = servicePluginActiveProcesses[serviceId]
             let activeQueue = servicePluginResponseQueues[serviceId]
@@ -2567,7 +2612,7 @@ private func ensureServicePluginStdioProcess(record: ServicePluginRuntimeRecord,
         } else if (servicePluginActiveProcesses.contains(serviceId) || servicePluginResponseQueues.contains(serviceId)) {
             stale = detachServicePluginOwnerLocked(serviceId)
         }
-        if (early.isNone()) {
+        if (early.isNone() && follower.isNone()) {
             record.instanceSeq++
             record.instanceId = "${serviceId}-${record.instanceSeq}"
             servicePluginStartClaimSequence++
@@ -2584,6 +2629,28 @@ private func ensureServicePluginStdioProcess(record: ServicePluginRuntimeRecord,
         case Some(result) => return result
         case None => ()
     }
+    match (follower) {
+        case Some(existingClaim) =>
+            servicePluginRunStartPhaseHook(serviceId, "follower_waiting")
+            if (!existingClaim.waitSettled(max(1, startupTimeoutMs))) {
+                return ServicePluginProcessEnsureResult(false, "initialize_timeout", diagnostic: "service plugin concurrent start wait timed out")
+            }
+            let outcome = existingClaim.outcome()
+            if (outcome[0] == "published") {
+                return synchronized(servicePluginProcessLock) {
+                    match (servicePluginActiveProcesses.get(serviceId)) {
+                        case Some(active) =>
+                            match (servicePluginResponseQueues.get(serviceId)) {
+                                case Some(activeQueue) => ServicePluginProcessEnsureResult(true, "running", process: Some(active), queue: Some(activeQueue))
+                                case None => ServicePluginProcessEnsureResult(false, if (record.status == "stopping" || record.status == "stopped") { "stopping" } else { "stdio_closed" }, diagnostic: "published service plugin response queue missing")
+                            }
+                        case None => ServicePluginProcessEnsureResult(false, if (record.status == "stopping" || record.status == "stopped") { "stopping" } else { "stdio_closed" }, diagnostic: "published service plugin owner missing")
+                    }
+                }
+            }
+            return ServicePluginProcessEnsureResult(false, outcome[0], diagnostic: outcome[1])
+        case None => ()
+    }
     cleanupDetachedServicePluginOwner(serviceId, stale, "stdio_closed", diagnostic: "ensure stale active process")
 
     match (servicePluginBlockingLeaseBeforeStart(serviceId)) {
@@ -2595,6 +2662,9 @@ private func ensureServicePluginStdioProcess(record: ServicePluginRuntimeRecord,
     let ownerEnvironment = ArrayList<(String, String)>()
     for ((key, value) in servicePluginProcessEnvironment(record)) { ownerEnvironment.add((key, value)) }
 
+    if (!claim.transition("launching")) { return failServicePluginStartClaim(record, claim, "stopping", "service plugin start cancelled") }
+    servicePluginRunStartPhaseHook(serviceId, "before_start")
+    if (claim.cancelled()) { return failServicePluginStartClaim(record, claim, "stopping", "service plugin start cancelled") }
     let started = try {
         gatewayStdioBroker().startOwner(ManagedStdioOwnerSpec(
             claim.ownerId,
@@ -2620,9 +2690,9 @@ private func ensureServicePluginStdioProcess(record: ServicePluginRuntimeRecord,
         started.pid,
         claimToken: claim.token
     )
+    if (claim.cancelled()) { return failServicePluginStartClaim(record, claim, "stopping", "service plugin start cancelled", process: Some(process)) }
     let attached = synchronized(servicePluginProcessLock) {
         if (servicePluginStartClaimMatchesLocked(serviceId, claim) && record.status != "stopping") {
-            claim.process = Some(process)
             record.pid = started.pid
             true
         } else {
@@ -2630,11 +2700,14 @@ private func ensureServicePluginStdioProcess(record: ServicePluginRuntimeRecord,
         }
     }
     if (!attached) {
-        let _ = process.stop()
-        return ServicePluginProcessEnsureResult(false, "stopping", diagnostic: "service plugin start cancelled")
+        return failServicePluginStartClaim(record, claim, "stopping", "service plugin start cancelled", process: Some(process))
     }
     logServicePluginProcessStart(record, started.pid)
+    let _ = claim.transition("attached")
+    servicePluginRunStartPhaseHook(serviceId, "after_attach")
+    if (claim.cancelled()) { return failServicePluginStartClaim(record, claim, "stopping", "service plugin start cancelled", process: Some(process)) }
 
+    let _ = claim.transition("initializing")
     let initRead = readExpectedServiceFrame(process, ServicePluginStdoutReadPolicy(startupTimeoutMs, serviceId, "initialize"))
     if (!initRead.ok) {
         let status = if (initRead.status == "timeout") { "initialize_timeout" } else { initRead.status }
@@ -2662,13 +2735,14 @@ private func ensureServicePluginStdioProcess(record: ServicePluginRuntimeRecord,
     }
 
     let queue = ServicePluginResponseQueue()
+    servicePluginRunStartPhaseHook(serviceId, "before_publish")
     let gate = ServicePluginEventPumpGate()
     let pump = spawn {
         gate.waitOpen()
         servicePluginEventPump(record, process, queue)
     }
     let published = synchronized(servicePluginProcessLock) {
-        if (servicePluginStartClaimMatchesLocked(serviceId, claim) && record.status != "stopping") {
+        if (servicePluginStartClaimMatchesLocked(serviceId, claim) && record.status != "stopping" && !claim.cancelled()) {
             servicePluginStartClaims.remove(serviceId)
             servicePluginActiveProcesses[serviceId] = process
             servicePluginResponseQueues[serviceId] = queue
@@ -2676,6 +2750,7 @@ private func ensureServicePluginStdioProcess(record: ServicePluginRuntimeRecord,
             record.status = "running"
             record.degradedReason = ""
             record.lastError = ""
+            let _ = claim.transition("published")
             true
         } else {
             false
@@ -2686,8 +2761,13 @@ private func ensureServicePluginStdioProcess(record: ServicePluginRuntimeRecord,
         queue.close(status: "stopped", diagnostic: "service plugin start cancelled")
         let _ = process.stop()
         try { pump.get(Duration.second) } catch (_: Exception) { () }
+        synchronized(servicePluginProcessLock) {
+            if (servicePluginStartClaimMatchesLocked(serviceId, claim)) { servicePluginStartClaims.remove(serviceId) }
+        }
+        claim.settle("stopping", "service plugin start cancelled")
         return ServicePluginProcessEnsureResult(false, "stopping", diagnostic: "service plugin start cancelled")
     }
+    claim.settle("published", "")
     servicePluginStartSupervisorWorker(record)
     ServicePluginProcessEnsureResult(true, "running", process: Some(process), queue: Some(queue))
 }
@@ -2828,7 +2908,7 @@ private func servicePluginEventPump(record: ServicePluginRuntimeRecord, process:
         }
         if (frame.frameType == "event") {
             let currentEvent = synchronized(servicePluginProcessLock) {
-                if (servicePluginOwnerMatchesLocked(serviceId, process.ownerId, process.generation, claimToken: process.claimToken)) {
+                if (servicePluginOwnerMatchesLocked(serviceId, process.ownerId, process.generation, claimToken: process.claimToken) && process.acceptDispatch()) {
                     synchronized(servicePluginRuntimeRecordLock) { record.eventFrames.add(frame) }
                     true
                 } else {
@@ -2845,6 +2925,7 @@ private func servicePluginEventPump(record: ServicePluginRuntimeRecord, process:
                         synchronized(servicePluginRuntimeRecordLock) { record.lastError = redactServicePayload(handled.diagnostic).text }
                     }
                 }
+                process.finishDispatch()
             }
             continue
         }
@@ -2870,16 +2951,24 @@ private func servicePluginDrainDetachedOwner(process: ServicePluginStdioProcess,
 
 private func servicePluginScheduleEventDispatch(record: ServicePluginRuntimeRecord, frame: ServiceFrame, process: ServicePluginStdioProcess): Unit {
     spawn {
-        let dispatch = dispatchServicePluginEvent(frame)
-        synchronized(servicePluginProcessLock) {
-            if (servicePluginOwnerMatchesLocked(
-                record.registration.manifest.pluginId,
-                process.ownerId,
-                process.generation,
-                claimToken: process.claimToken
-            )) {
-                servicePluginRecordRuntimeDispatchLocked(record, frame, dispatch)
+        try {
+            let allowed = synchronized(servicePluginProcessLock) {
+                servicePluginOwnerMatchesLocked(record.registration.manifest.pluginId, process.ownerId, process.generation, claimToken: process.claimToken) && process.dispatchAllowed()
             }
+            if (!allowed) { return }
+            let dispatch = dispatchServicePluginEvent(frame)
+            synchronized(servicePluginProcessLock) {
+                if (servicePluginOwnerMatchesLocked(
+                    record.registration.manifest.pluginId,
+                    process.ownerId,
+                    process.generation,
+                    claimToken: process.claimToken
+                )) {
+                    servicePluginRecordRuntimeDispatchLocked(record, frame, dispatch)
+                }
+            }
+        } finally {
+            process.finishDispatch()
         }
     }
 }
@@ -2987,22 +3076,25 @@ public func stopServicePlugin(serviceId: String, reason!: String = "", timeoutMi
                 record.degradedReason = "stop timeout"
                 return ServiceStopResult(false, sid, "degraded", diagnostic: record.degradedReason)
             }
-            let deadlineMs = servicePluginNowMs() + min(timeoutMillis, 30000)
+            let effectiveTimeoutMillis = min(timeoutMillis, 30000)
+            let deadlineMs = servicePluginNowMs() + effectiveTimeoutMillis
             var selectedProcess = None<ServicePluginStdioProcess>
-            var pendingProcess = None<ServicePluginStdioProcess>
+            var pendingClaim = None<ServicePluginStartClaim>
             var stopClaimed = false
             synchronized(servicePluginProcessLock) {
                 if (record.status != "stopping") {
                     stopClaimed = true
                     record.status = "stopping"
                     match (servicePluginActiveProcesses.get(sid)) {
-                        case Some(process) => selectedProcess = Some(process)
+                        case Some(process) =>
+                            process.fenceDispatch()
+                            selectedProcess = Some(process)
                         case None => ()
                     }
                     match (servicePluginStartClaims.get(sid)) {
                         case Some(claim) =>
-                            pendingProcess = claim.process
-                            servicePluginStartClaims.remove(sid)
+                            claim.cancel()
+                            pendingClaim = Some(claim)
                         case None => ()
                     }
                 }
@@ -3010,24 +3102,46 @@ public func stopServicePlugin(serviceId: String, reason!: String = "", timeoutMi
             if (!stopClaimed) {
                 return ServiceStopResult(false, sid, "stopping", diagnostic: "service plugin stop already in progress")
             }
+            match (pendingClaim) {
+                case Some(_) => servicePluginRunStartPhaseHook(sid, "claim_cancelled")
+                case None => ()
+            }
             var stopStatus = "graceful_exited"
             var stopOk = true
-            match (pendingProcess) {
+            match (pendingClaim) {
+                case Some(claim) =>
+                    let remaining = servicePluginDeadlineRemaining(deadlineMs)
+                    if (remaining <= 0 || !claim.waitSettled(max(1, remaining))) {
+                        stopStatus = "still_alive"
+                        stopOk = false
+                    }
+                case None => ()
+            }
+            if (stopOk && selectedProcess.isNone()) {
+                selectedProcess = synchronized(servicePluginProcessLock) {
+                    match (servicePluginActiveProcesses.get(sid)) {
+                        case Some(process) => Some(process)
+                        case None => None<ServicePluginStdioProcess>
+                    }
+                }
+                match (selectedProcess) { case Some(process) => process.fenceDispatch() case None => () }
+            }
+            match (selectedProcess) {
                 case Some(process) =>
                     let remaining = servicePluginDeadlineRemaining(deadlineMs)
-                    let stopped = if (remaining > 0) { process.stop(timeoutMs: remaining) } else { ServicePluginProcessStopResult(false, "still_alive") }
-                    stopStatus = stopped.status
-                    stopOk = stopped.ok
+                    if (remaining <= 0 || !process.waitDispatches(max(1, remaining))) { stopOk = false; stopStatus = "still_alive" }
                 case None => ()
             }
             match (selectedProcess) {
                 case Some(process) =>
-                    try {
-                        process.writeLine(encodeServiceFrame(ServiceFrame("request", "stop-${record.instanceId}", sid, method: "stop", correlationId: "stop-${record.instanceId}", payload: "{}")).trimAscii())
-                    } catch (_: Exception) {
-                        ()
+                    if (servicePluginDeadlineRemaining(deadlineMs) > 0) {
+                        try {
+                            process.writeLine(encodeServiceFrame(ServiceFrame("request", "stop-${record.instanceId}", sid, method: "stop", correlationId: "stop-${record.instanceId}", payload: "{}")).trimAscii())
+                        } catch (_: Exception) {
+                            ()
+                        }
                     }
-                    let reserveMs = min(1000, max(100, timeoutMillis / 4))
+                    let reserveMs = max(1, effectiveTimeoutMillis / 2)
                     while (servicePluginDeadlineRemaining(deadlineMs) > reserveMs) {
                         let waitMs = min(50, servicePluginDeadlineRemaining(deadlineMs) - reserveMs)
                         let terminal = process.waitTerminal(max(1, waitMs))
@@ -3088,7 +3202,7 @@ public func stopServicePlugin(serviceId: String, reason!: String = "", timeoutMi
                 record.lastError = stopDiagnostic
             }
             let leaseDiagnostic = servicePluginLeaseStopDiagnostic(record)
-            let cleanLease = !leaseDiagnostic.startsWith("lease_not_stopped_after_stop")
+            let cleanLease = !leaseDiagnostic.startsWith("lease_not_stopped_after_stop") && !leaseDiagnostic.startsWith("lease_identity_mismatch_after_stop")
             if (!cleanLease || !stopOk) {
                 record.status = "degraded"
                 record.degradedReason = if (!cleanLease) { "lease_not_stopped_after_stop" } else { "stop timeout" }

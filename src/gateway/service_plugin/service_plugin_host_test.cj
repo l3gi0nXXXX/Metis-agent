@@ -1682,17 +1682,23 @@ public class ServicePluginHostTest {
                 resetServicePluginHostForTest()
             }
 
-            this.registerBrokerServiceFixture("ignore-term")
+            this.registerBrokerServiceFixture(
+                "ignore-term",
+                pluginId: "ignore-term-service",
+                capabilityId: "ignore-term.monitor.status"
+            )
             try {
-                let started = ensureRegisteredServicePluginStarted("stdio-service", startupTimeoutMs: 3000)
+                let started = ensureRegisteredServicePluginStarted("ignore-term-service", startupTimeoutMs: 3000)
                 @Expect(started.ok, true)
                 let startedAt = DateTime.now().toUnixTimeStamp().toMilliseconds()
-                let stopped = stopServicePlugin("stdio-service", reason: "p3-n1", timeoutMillis: 2500)
+                let stopped = stopServicePlugin("ignore-term-service", reason: "p3-n1", timeoutMillis: 2500)
                 let elapsed = DateTime.now().toUnixTimeStamp().toMilliseconds() - startedAt
+                @Expect(stopped.diagnostic.contains("stop_status=force_terminated"), true)
+                @Expect(stopped.diagnostic.contains("lease_missing_after_stop"), true)
                 @Expect(stopped.ok, true)
                 @Expect(elapsed < 3000, true)
                 @Expect(managedStdioBroker().snapshot().ownerCount, 0)
-                match (getServicePluginSnapshot("stdio-service")) {
+                match (getServicePluginSnapshot("ignore-term-service")) {
                     case Some(snapshot) => @Expect(snapshot.pid, 0)
                     case None => @Expect(true, false)
                 }
@@ -1771,6 +1777,125 @@ public class ServicePluginHostTest {
             } finally {
                 let _ = stopServicePlugin("slow-service", reason: "p3-n1-finally", timeoutMillis: 1000)
                 let _ = stopServicePlugin("fast-service", reason: "p3-n1-finally", timeoutMillis: 1000)
+                resetServicePluginHostForTest()
+            }
+        })
+    }
+
+    @TestCase
+    public func p3N1StartClaimFollowersLeaseAndDispatchAreFenced(): Unit {
+        withServicePluginHostTestHome("p3-n1-claim-fences", { home: Path =>
+            let marker = home.join("claim.marker")
+            let release = home.join("claim.release")
+            let cancelledMarker = home.join("claim.cancelled")
+            let followerMarker = home.join("claim.follower")
+            var starter = None<Future<ServiceStartResult>>
+            var stopper = None<Future<ServiceStopResult>>
+            var follower = None<Future<ServiceStartResult>>
+            try {
+                for (phase in ["before_start", "after_attach"]) {
+                    try { remove(marker) } catch (_: Exception) { () }
+                    try { remove(release) } catch (_: Exception) { () }
+                    try { remove(cancelledMarker) } catch (_: Exception) { () }
+                    this.registerBrokerServiceFixture("noise-0")
+                    setServicePluginStartPhaseHookForTest(Some({ _serviceId: String, current: String =>
+                        if (current == phase) {
+                            File.writeTo(marker, current.toArray())
+                            while (!exists(release)) { sleep(Duration.millisecond * 10) }
+                        } else if (current == "claim_cancelled") {
+                            File.writeTo(cancelledMarker, current.toArray())
+                        }
+                    }))
+                    starter = Some(spawn { ensureRegisteredServicePluginStarted("stdio-service", startupTimeoutMs: 3000) })
+                    @Expect(this.waitForFile(marker), true)
+                    stopper = Some(spawn { stopServicePlugin("stdio-service", reason: "claim-${phase}", timeoutMillis: 2500) })
+                    @Expect(this.waitForFile(cancelledMarker), true)
+                    File.writeTo(release, "release".toArray())
+                    @Expect(starter.getOrThrow().get().status, "stopping")
+                    @Expect(stopper.getOrThrow().get().ok, true)
+                    @Expect(managedStdioBroker().snapshot().ownerCount, 0)
+                    starter = None<Future<ServiceStartResult>>
+                    stopper = None<Future<ServiceStopResult>>
+                    setServicePluginStartPhaseHookForTest(None<(String, String) -> Unit>)
+                    resetServicePluginHostForTest()
+                }
+
+                try { remove(marker) } catch (_: Exception) { () }
+                try { remove(release) } catch (_: Exception) { () }
+                try { remove(followerMarker) } catch (_: Exception) { () }
+                this.registerBrokerServiceFixture("noise-0")
+                setServicePluginStartPhaseHookForTest(Some({ _serviceId: String, phase: String =>
+                    if (phase == "before_publish") {
+                        File.writeTo(marker, phase.toArray())
+                        while (!exists(release)) { sleep(Duration.millisecond * 10) }
+                    } else if (phase == "follower_waiting") {
+                        File.writeTo(followerMarker, phase.toArray())
+                    }
+                }))
+                starter = Some(spawn { ensureRegisteredServicePluginStarted("stdio-service", startupTimeoutMs: 3000) })
+                @Expect(this.waitForFile(marker), true)
+                follower = Some(spawn { ensureRegisteredServicePluginStarted("stdio-service", startupTimeoutMs: 3000) })
+                @Expect(this.waitForFile(followerMarker), true)
+                File.writeTo(release, "release".toArray())
+                @Expect(starter.getOrThrow().get().ok, true)
+                @Expect(follower.getOrThrow().get().ok, true)
+                starter = None<Future<ServiceStartResult>>
+                follower = None<Future<ServiceStartResult>>
+                setServicePluginStartPhaseHookForTest(None<(String, String) -> Unit>)
+                @Expect(stopServicePlugin("stdio-service", reason: "follower", timeoutMillis: 1500).ok, true)
+
+                resetServicePluginHostForTest()
+                this.registerBrokerServiceFixture("ignore-term")
+                @Expect(ensureRegisteredServicePluginStarted("stdio-service", startupTimeoutMs: 1000).ok, true)
+                let currentPid = match (getServicePluginSnapshot("stdio-service")) { case Some(snapshot) => snapshot.pid case None => Int64(0) }
+                let leaseDir = home.join("service-plugin").join("runtime").join("stdio-service")
+                if (!exists(leaseDir)) { Directory.create(leaseDir, recursive: true) }
+                File.writeTo(leaseDir.join("stdio-service-1.lease.json"), ("{\"state\":\"stopped\",\"status\":\"stopped\",\"pluginId\":\"stdio-service\",\"sessionId\":\"stdio-service-1\",\"pid\":${currentPid + 100000},\"parentPid\":0}").toArray())
+                let mismatch = stopServicePlugin("stdio-service", reason: "wrong-pid", timeoutMillis: 2500)
+                @Expect(mismatch.ok, false)
+                @Expect(mismatch.diagnostic.contains("lease_identity_mismatch_after_stop"), true)
+                @Expect(mismatch.diagnostic.contains("stop_status=force_terminated"), true)
+
+                resetServicePluginHostForTest()
+                try { remove(marker) } catch (_: Exception) { () }
+                try { remove(release) } catch (_: Exception) { () }
+                this.registerGitCodeStdioScript(this.gitCodeReentrantWritebackScript())
+                let deliveryLock = Mutex()
+                let deliveries = ArrayList<String>()
+                setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent =>
+                    let rows = ArrayList<ServicePluginDeliveryTarget>()
+                    rows.add(ServicePluginDeliveryTarget("telegram", "acct", "peer"))
+                    rows
+                }))
+                setServicePluginWebhookGeneratedReplyHandlerForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent, _target: ServicePluginDeliveryTarget =>
+                    ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "dispatch fence")
+                }))
+                setServicePluginEventDeliveryForTest(Some({ _target: ServicePluginDeliveryTarget, text: String =>
+                    File.writeTo(marker, "dispatch".toArray())
+                    while (!exists(release)) { sleep(Duration.millisecond * 10) }
+                    synchronized(deliveryLock) { deliveries.add(text) }
+                    ServicePluginEventDeliveryResult(true, "sent")
+                }))
+                @Expect(ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000).ok, true)
+                @Expect(this.waitForFile(marker, timeoutMillis: 3000), true)
+                stopper = Some(spawn { stopServicePlugin("gitcode-monitor", reason: "dispatch-fence", timeoutMillis: 2500) })
+                sleep(Duration.millisecond * 75)
+                @Expect(synchronized(deliveryLock) { deliveries.size }, 0)
+                File.writeTo(release, "release".toArray())
+                @Expect(stopper.getOrThrow().get().ok, true)
+                stopper = None<Future<ServiceStopResult>>
+                sleep(Duration.millisecond * 100)
+                @Expect(synchronized(deliveryLock) { deliveries.size }, 1)
+            } finally {
+                if (!exists(release)) { try { File.writeTo(release, "release".toArray()) } catch (_: Exception) { () } }
+                setServicePluginStartPhaseHookForTest(None<(String, String) -> Unit>)
+                setServicePluginWebhookSubscribersProviderForTest(None<(ServicePluginAcceptedGitCodeEvent) -> ArrayList<ServicePluginDeliveryTarget>>)
+                setServicePluginWebhookGeneratedReplyHandlerForTest(None<(ServicePluginAcceptedGitCodeEvent, ServicePluginDeliveryTarget) -> ServicePluginGeneratedReplyResult>)
+                setServicePluginEventDeliveryForTest(None)
+                match (starter) { case Some(future) => try { let _ = future.get(Duration.second * 3) } catch (_: Exception) { try { future.cancel() } catch (_: Exception) { () } } case None => () }
+                match (stopper) { case Some(future) => try { let _ = future.get(Duration.second * 3) } catch (_: Exception) { try { future.cancel() } catch (_: Exception) { () } } case None => () }
+                match (follower) { case Some(future) => try { let _ = future.get(Duration.second * 3) } catch (_: Exception) { try { future.cancel() } catch (_: Exception) { () } } case None => () }
+                resetServicePluginGeneratedReplyStateForTest()
                 resetServicePluginHostForTest()
             }
         })
