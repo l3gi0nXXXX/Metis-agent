@@ -1,6 +1,7 @@
 package metis.gateway.channels.feishu
 
 import std.collection.ArrayList
+import std.sync.Mutex
 import std.time.*
 import stdx.encoding.base64.toBase64String
 import stdx.encoding.json.{JsonArray, JsonBool, JsonInt, JsonObject, JsonString, JsonValue}
@@ -324,6 +325,139 @@ public class FeishuSidecarProcessRequestRunner <: FeishuSidecarRequestRunner {
 
     private func nowMs(): Int64 {
         DateTime.now().toUnixTimeStamp().toMilliseconds()
+    }
+}
+
+private let feishuSidecarSupervisorRequestIdLock = Mutex()
+private var feishuSidecarSupervisorRequestIdSequence: Int64 = 0
+
+private func feishuSidecarNextSupervisorRequestId(): String {
+    synchronized(feishuSidecarSupervisorRequestIdLock) {
+        feishuSidecarSupervisorRequestIdSequence += 1
+        "metis-feishu-api-${DateTime.now().toUnixTimeStamp().toMilliseconds()}-${feishuSidecarSupervisorRequestIdSequence}"
+    }
+}
+
+public class FeishuSidecarSupervisorRequestRunner <: FeishuSidecarRequestRunner {
+    private let account: FeishuSidecarRequestAccount
+    private let registry: FeishuSidecarSupervisorRegistry
+    private let options: FeishuSidecarRequestRunnerOptions
+
+    public init(
+        account!: FeishuSidecarRequestAccount,
+        registry!: FeishuSidecarSupervisorRegistry,
+        options!: FeishuSidecarRequestRunnerOptions = FeishuSidecarRequestRunnerOptions()
+    ) {
+        this.account = account
+        this.registry = registry
+        this.options = options
+    }
+
+    public func run(request: JsonObject): JsonObject {
+        if (this.account.appId.isEmpty() || this.account.appSecret.isEmpty()) {
+            return feishuSidecarProcessFailure("not_configured", "Feishu sidecar API requires appId and appSecret.")
+        }
+        let accountId = gatewayFeishuNormalizeAccountId(feishuSidecarJsonString(request, "accountId", fallback: this.account.accountId))
+        let requestId = feishuSidecarNextSupervisorRequestId()
+        let frame = this.requestFrame(request, accountId, requestId)
+        let response = this.registry.requestAccount(accountId, requestId, frame, this.options.requestTimeoutMs)
+        this.normalizeResponse(response)
+    }
+
+    private func requestFrame(request: JsonObject, accountId: String, requestId: String): JsonObject {
+        let operation = feishuSidecarJsonString(request, "operation")
+        let params = match (request.get("params")) {
+            case Some(v) => try { v.asObject() } catch (_e: Exception) { JsonObject() }
+            case None => JsonObject()
+        }
+        let out = JsonObject()
+        out.put("type", JsonString("request"))
+        out.put("requestId", JsonString(requestId))
+        out.put("accountId", JsonString(accountId))
+        out.put("action", JsonString(this.sidecarAction(operation)))
+        out.put("operationTimeoutMs", JsonInt(this.options.requestTimeoutMs))
+        this.copyFields(params, out)
+        this.applyOperationMapping(operation, params, out)
+        out
+    }
+
+    private func sidecarAction(operation: String): String {
+        match (operation.trimAscii()) {
+            case "message.create" | "message.reply" => "sendText"
+            case "card.create" | "card.reply" => "sendCard"
+            case "card.patch" => "patchCard"
+            case "media.upload" => "uploadMedia"
+            case "message.send_media" | "message.reply_media" => "sendMedia"
+            case "reaction.add" => "addReaction"
+            case "reaction.remove" => "removeReaction"
+            case "reaction.list" => "reaction.list"
+            case "message.delete" => "deleteMessage"
+            case "message.fetch" => "message.fetch"
+            case "message.list_merge_forward" => "message.list_merge_forward"
+            case "resource.download" => "downloadResource"
+            case "chat.thread_capable" => "chat.thread_capable"
+            case _ => operation.trimAscii()
+        }
+    }
+
+    private func applyOperationMapping(operation: String, params: JsonObject, out: JsonObject): Unit {
+        let receiveId = feishuSidecarJsonString(params, "receiveId")
+        if (!receiveId.isEmpty()) { out.put("to", JsonString(receiveId)) }
+        let messageId = feishuSidecarJsonString(params, "messageId")
+        if (!messageId.isEmpty()) { out.put("messageId", JsonString(messageId)) }
+        if (operation == "media.upload") {
+            let bytesBase64 = feishuSidecarJsonString(params, "bytesBase64")
+            if (!bytesBase64.isEmpty()) { out.put("contentBase64", JsonString(bytesBase64)) }
+        }
+        if (operation == "message.send_media" || operation == "message.reply_media") {
+            let messageType = feishuSidecarJsonString(params, "messageType").toAsciiLower()
+            let mediaKey = feishuSidecarJsonString(params, "mediaKey")
+            if (messageType == "image") {
+                out.put("mediaType", JsonString("image"))
+                out.put("imageKey", JsonString(mediaKey))
+            } else {
+                out.put("mediaType", JsonString(if (messageType == "audio") { "audio" } else if (messageType == "media") { "video" } else { messageType }))
+                out.put("fileKey", JsonString(mediaKey))
+            }
+        }
+        if (operation == "reaction.add" || operation == "reaction.remove") {
+            let reactionType = feishuSidecarJsonString(params, "reactionType")
+            if (!reactionType.isEmpty()) {
+                out.put("emojiType", JsonString(reactionType))
+                if (operation == "reaction.remove") { out.put("reactionId", JsonString(reactionType)) }
+            }
+        }
+        if (operation == "resource.download") {
+            let resourceType = feishuSidecarJsonString(params, "resourceType").toAsciiLower()
+            let fileKey = feishuSidecarJsonString(params, "fileKey")
+            if (resourceType == "image") { out.put("imageKey", JsonString(fileKey)) } else { out.put("fileKey", JsonString(fileKey)) }
+        }
+    }
+
+    private func normalizeResponse(frame: JsonObject): JsonObject {
+        let frameType = feishuSidecarJsonString(frame, "type")
+        if (frameType == "sendResult") {
+            let out = JsonObject()
+            out.put("ok", JsonBool(true))
+            out.put("status", JsonString("ok"))
+            this.copyFields(frame, out, skipProtocol: true)
+            let contentBase64 = feishuSidecarJsonString(frame, "contentBase64")
+            if (!contentBase64.isEmpty() && out.get("bytesBase64").isNone()) { out.put("bytesBase64", JsonString(contentBase64)) }
+            return out
+        }
+        let status = feishuSidecarFirstString(frame, ["errorKind", "status"], fallback: "api_error")
+        let message = feishuSidecarFirstString(frame, ["message", "error", "detail"], fallback: status)
+        feishuSidecarProcessFailure(status, feishuSidecarRedactSensitiveText(message))
+    }
+
+    private func copyFields(source: JsonObject, target: JsonObject, skipProtocol!: Bool = false): Unit {
+        for (key in source.getFields().keys()) {
+            if (skipProtocol && (key == "type" || key == "requestId" || key == "action" || key == "accountId")) { continue }
+            match (source.get(key)) {
+                case Some(v) => target.put(key, v)
+                case None => ()
+            }
+        }
     }
 }
 

@@ -96,12 +96,19 @@ private class FeishuSidecarFakeProcess <: FeishuSidecarProtocolProcess {
 
 private class FeishuSidecarFakeRunner <: FeishuSidecarProtocolRunner {
     public let process: FeishuSidecarFakeProcess
+    private let processes = ArrayList<FeishuSidecarFakeProcess>()
+    private var processCursor: Int64 = 0
     public var lastLaunch: FeishuSidecarLaunchSpec = FeishuSidecarLaunchSpec(command: "", args: [])
     public var startCount: Int64 = 0
     public var failWith: String = ""
 
     public init(process: FeishuSidecarFakeProcess) {
         this.process = process
+        this.processes.add(process)
+    }
+
+    public func enqueueProcess(process: FeishuSidecarFakeProcess): Unit {
+        this.processes.add(process)
     }
 
     public func start(spec: FeishuSidecarLaunchSpec): FeishuSidecarProtocolStartResult {
@@ -110,7 +117,14 @@ private class FeishuSidecarFakeRunner <: FeishuSidecarProtocolRunner {
         if (!this.failWith.trimAscii().isEmpty()) {
             return FeishuSidecarProtocolStartResult.Failed(this.failWith)
         }
-        FeishuSidecarProtocolStartResult.Started(this.process)
+        let selected = if (this.processCursor < this.processes.size) {
+            let value = this.processes[this.processCursor]
+            this.processCursor += 1
+            value
+        } else {
+            this.process
+        }
+        FeishuSidecarProtocolStartResult.Started(selected)
     }
 
     public func modelsBlockingPipeReader(): Bool {
@@ -165,6 +179,14 @@ public class FeishuSidecarTransportTest {
         "read ignored; printf '%s\\n' 'line-after-timeouts'; sleep 0.2"
     }
 
+    private func unicodeLineScript(): String {
+        "read ignored; printf '%s\\n' '中文🙂🚀'; sleep 0.1"
+    }
+
+    private func invalidUtf8LineScript(): String {
+        "read ignored; printf '\\377\\n'; sleep 0.1"
+    }
+
     private func stderrBurstScript(): String {
         "for i in {0..129}; do printf 'stderr-line-%s\\n' \"$i\" >&2; done; sleep 0.8"
     }
@@ -211,6 +233,21 @@ public class FeishuSidecarTransportTest {
     }
 
     @TestCase
+    public func brokerBackedStdioPreservesUnicodeAndContainsInvalidUtf8(): Unit {
+        let unicode = this.startStdioScript(this.unicodeLineScript())
+        unicode.writeLine("go")
+        @Expect(unicode.readLine(1000).getOrThrow(), "中文🙂🚀")
+        unicode.terminate(true)
+
+        let invalid = this.startStdioScript(this.invalidUtf8LineScript())
+        invalid.writeLine("go")
+        @Expect(invalid.readLine(300).isNone(), true)
+        @Expect(invalid.wait(1000).getOrThrow(), -1)
+        @Expect(invalid.stderrSummary().contains("invalid_response_encoding"), true)
+        invalid.terminate(true)
+    }
+
+    @TestCase
     public func stderrReaderUsesBoundedRingBuffer(): Unit {
         let process = this.startStdioScript(this.stderrBurstScript())
         sleep(Duration.millisecond * 300)
@@ -221,6 +258,28 @@ public class FeishuSidecarTransportTest {
         @Expect(summary.contains("stderr-line-0"), false)
         @Expect(Int64(summary.size) < 4096, true)
         process.terminate(true)
+    }
+
+    @TestCase
+    public func diagnosticSummaryTruncatesAtRuneBoundary(): Unit {
+        var asciiPrefix = ""
+        for (_ in 0..510) {
+            asciiPrefix += "a"
+        }
+        let boundary = "${asciiPrefix}中🙂"
+        let exact = FeishuSidecarLineBuffer(name: "stderr", maxLines: 1, maxLineChars: 2048)
+        exact.appendLine(boundary)
+
+        @Expect(exact.summary(), boundary)
+        @Expect(exact.summary().toRuneArray().size, 512)
+
+        let over = FeishuSidecarLineBuffer(name: "stderr", maxLines: 1, maxLineChars: 2048)
+        over.appendLine("${boundary}🚀")
+        let truncated = over.summary()
+
+        @Expect(truncated, "${boundary}...")
+        @Expect(truncated.toRuneArray().size, 515)
+        @Expect(truncated.contains("🚀"), false)
     }
 
     @TestCase
@@ -643,5 +702,122 @@ public class FeishuSidecarTransportTest {
         transportB.stop()
         @Expect(process.waitCalls, 1)
         @Expect(process.stdinLines[3].contains("\"accountId\":\"tenant-b\""), true)
+    }
+
+    @TestCase
+    public func p2U1SupervisorCorrelatesInterleavedSameRequestIdsByAccount(): Unit {
+        let process = FeishuSidecarFakeProcess(stdout: [
+            "{\"type\":\"ready\",\"accountId\":\"tenant-a\",\"transport\":\"websocket\"}",
+            "{\"type\":\"ready\",\"accountId\":\"tenant-b\",\"transport\":\"websocket\"}"
+        ])
+        let registry = FeishuSidecarSupervisorRegistry(runner: FeishuSidecarFakeRunner(process), options: this.options())
+        @Expect(registry.startAccount(this.specFor("tenant-a"), { _root => () }).ok, true)
+        @Expect(registry.startAccount(this.specFor("tenant-b"), { _root => () }).ok, true)
+        let frameA = JsonObject()
+        frameA.put("type", JsonString("request"))
+        frameA.put("accountId", JsonString("tenant-a"))
+        frameA.put("requestId", JsonString("same-id"))
+        let frameB = JsonObject()
+        frameB.put("type", JsonString("request"))
+        frameB.put("accountId", JsonString("tenant-b"))
+        frameB.put("requestId", JsonString("same-id"))
+        let resultA = spawn { registry.requestAccount("tenant-a", "same-id", frameA, 500) }
+        let resultB = spawn { registry.requestAccount("tenant-b", "same-id", frameB, 500) }
+        while (registry.debugPendingRequestCountForTest() < 2) { sleep(Duration.millisecond) }
+        process.push("{\"type\":\"sendResult\",\"accountId\":\"tenant-b\",\"requestId\":\"same-id\",\"ok\":true,\"messageId\":\"om_b\"}")
+        process.push("{\"type\":\"sendResult\",\"accountId\":\"tenant-a\",\"requestId\":\"same-id\",\"ok\":true,\"messageId\":\"om_a\"}")
+        registry.debugDrainAvailableForTest()
+
+        @Expect(resultA.get(Duration.second).get("messageId").getOrThrow().asString().getValue(), "om_a")
+        @Expect(resultB.get(Duration.second).get("messageId").getOrThrow().asString().getValue(), "om_b")
+        @Expect(registry.debugPendingRequestCountForTest(), 0)
+        @Expect(registry.debugProcessStartCountForTest(), 1)
+    }
+
+    @TestCase
+    public func p2B1StoppingAccountFailsOnlyItsPendingRequest(): Unit {
+        let process = FeishuSidecarFakeProcess(stdout: [
+            "{\"type\":\"ready\",\"accountId\":\"tenant-a\",\"transport\":\"websocket\"}",
+            "{\"type\":\"ready\",\"accountId\":\"tenant-b\",\"transport\":\"websocket\"}"
+        ])
+        let registry = FeishuSidecarSupervisorRegistry(runner: FeishuSidecarFakeRunner(process), options: this.options())
+        @Expect(registry.startAccount(this.specFor("tenant-a"), { _root => () }).ok, true)
+        @Expect(registry.startAccount(this.specFor("tenant-b"), { _root => () }).ok, true)
+        let frame = JsonObject()
+        frame.put("type", JsonString("request"))
+        frame.put("accountId", JsonString("tenant-a"))
+        frame.put("requestId", JsonString("pending-stop"))
+        let result = spawn { registry.requestAccount("tenant-a", "pending-stop", frame, 500) }
+        while (registry.debugPendingRequestCountForTest() < 1) { sleep(Duration.millisecond) }
+
+        registry.stopAccount("tenant-a")
+
+        @Expect(result.get(Duration.second).get("status").getOrThrow().asString().getValue(), "closed")
+        @Expect(registry.debugPendingRequestCountForTest(), 0)
+        @Expect(process.waitCalls, 0)
+        registry.stopAccount("tenant-b")
+    }
+
+    @TestCase
+    public func p2B1LateResponseAfterDeadlineDoesNotPoisonAccountHealth(): Unit {
+        let process = FeishuSidecarFakeProcess(stdout: [
+            "{\"type\":\"ready\",\"accountId\":\"tenant-a\",\"transport\":\"websocket\"}"
+        ])
+        let registry = FeishuSidecarSupervisorRegistry(runner: FeishuSidecarFakeRunner(process), options: this.options())
+        @Expect(registry.startAccount(this.specFor("tenant-a"), { _root => () }).ok, true)
+        let request = JsonObject()
+        request.put("type", JsonString("request"))
+        request.put("accountId", JsonString("tenant-a"))
+        request.put("requestId", JsonString("deadline-race"))
+
+        let timeout = registry.requestAccount("tenant-a", "deadline-race", request, 2)
+        @Expect(timeout.get("status").getOrThrow().asString().getValue(), "request_timeout")
+        process.push("{\"type\":\"error\",\"accountId\":\"tenant-a\",\"requestId\":\"deadline-race\",\"status\":\"api_error\",\"message\":\"late secret-app\"}")
+        registry.debugDrainAvailableForTest()
+
+        let health = registry.healthSnapshot("tenant-a")
+        @Expect(health.ready, true)
+        @Expect(health.connected, true)
+        @Expect(health.lastError, "")
+        let diagnostics = registry.diagnosticsSnapshot("tenant-a")
+        @Expect(diagnostics[diagnostics.size - 1].status, "late_result_dropped")
+        @Expect(diagnostics[diagnostics.size - 1].message.contains("secret-app"), false)
+        registry.stopAccount("tenant-a")
+    }
+
+    @TestCase
+    public func p2N1RecycleStartsOnceReinitializesAccountsAndDoesNotReplayRequests(): Unit {
+        let first = FeishuSidecarFakeProcess(stdout: [
+            "{\"type\":\"ready\",\"accountId\":\"tenant-a\",\"transport\":\"websocket\"}"
+        ])
+        let second = FeishuSidecarFakeProcess()
+        let runner = FeishuSidecarFakeRunner(first)
+        runner.enqueueProcess(second)
+        let registry = FeishuSidecarSupervisorRegistry(runner: runner, options: this.options())
+        @Expect(registry.startAccount(this.specFor("tenant-a"), { _root => () }).ok, true)
+        first.push("{\"type\":\"diagnostic\",\"accountId\":\"tenant-a\",\"phase\":\"operation.lifecycle\",\"status\":\"recycle_required\",\"message\":\"orphan threshold\"}")
+
+        registry.debugDrainAvailableForTest()
+
+        @Expect(registry.debugProcessStartCountForTest(), 2)
+        @Expect(first.terminateCalls, 1)
+        @Expect(second.stdinLines.size, 1)
+        @Expect(second.stdinLines[0].contains("\"type\":\"initAccount\""), true)
+        @Expect(second.stdinLines[0].contains("\"accountId\":\"tenant-a\""), true)
+        second.push("{\"type\":\"ready\",\"accountId\":\"tenant-a\",\"transport\":\"websocket\"}")
+        registry.debugDrainAvailableForTest()
+        let request = JsonObject()
+        request.put("type", JsonString("request"))
+        request.put("accountId", JsonString("tenant-a"))
+        request.put("requestId", JsonString("after-recycle"))
+        let result = spawn { registry.requestAccount("tenant-a", "after-recycle", request, 500) }
+        while (registry.debugPendingRequestCountForTest() < 1) { sleep(Duration.millisecond) }
+        second.push("{\"type\":\"sendResult\",\"accountId\":\"tenant-a\",\"requestId\":\"after-recycle\",\"ok\":true,\"messageId\":\"om_recovered\"}")
+        registry.debugDrainAvailableForTest()
+
+        @Expect(result.get(Duration.second).get("messageId").getOrThrow().asString().getValue(), "om_recovered")
+        @Expect(first.stdinLines.size, 1)
+        @Expect(second.stdinLines.size, 2)
+        registry.stopAccount("tenant-a")
     }
 }
