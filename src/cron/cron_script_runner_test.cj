@@ -1,13 +1,13 @@
 package metis.cron
 
-import metis.process.{managedStdioBroker, resetManagedStdioBrokerForTest}
+import metis.process.{ManagedStdioOperationResult, managedStdioBroker, resetManagedStdioBrokerForTest}
 import metis.utils.ShellUtils
 
 import std.collection.ArrayList
 import std.convert.Parsable
 import std.core.Duration
 import std.fs.{Directory, File, Path, canonicalize, exists, remove}
-import std.sync.AtomicBool
+import std.sync.{AtomicBool, AtomicInt64}
 import std.time.DateTime
 import std.unittest.testmacro.*
 
@@ -349,6 +349,8 @@ public class CronScriptRunnerTest {
             var cancelFuture = None<Future<CronScriptRunResult>>
             var killedFuture = None<Future<CronScriptRunResult>>
             var healthyFuture = None<Future<CronScriptRunResult>>
+            var cleanupFuture = None<Future<CronScriptRunResult>>
+            var cleanupHealthyFuture = None<Future<CronScriptRunResult>>
             try {
                 let pidFile = cronScriptsDir(root).join("tree.pids")
                 cronScriptRunnerWriteFixture(root, "tree.sh", "hang-tree", args: ["'${pidFile.toString()}'"])
@@ -439,8 +441,70 @@ public class CronScriptRunnerTest {
                 @Expect(recovered.ok, true)
                 @Expect(managedStdioBroker().snapshot().generation > oldGeneration, true)
                 @Expect(managedStdioBroker().snapshot().ownerCount, 0)
+
+                let cleanupReady = cronScriptsDir(root).join("cleanup-healthy.ready")
+                let cleanupRelease = cronScriptsDir(root).join("cleanup-healthy.release")
+                let cleanupPidFile = cronScriptsDir(root).join("cleanup-failure-tree.pids")
+                cronScriptRunnerWriteFixture(
+                    root,
+                    "cleanup-healthy.sh",
+                    "wait-release",
+                    args: ["'${cleanupReady.toString()}'", "'${cleanupRelease.toString()}'"]
+                )
+                cronScriptRunnerWriteFixture(
+                    root,
+                    "cleanup-failure.sh",
+                    "hang-tree",
+                    args: ["'${cleanupPidFile.toString()}'"]
+                )
+                let cleanupCancel = AtomicBool(false)
+                let cleanupStopBudgetMs = AtomicInt64(0)
+                cleanupHealthyFuture = Some(spawn {
+                    runCronJobScriptForJob(root, cronScriptRunnerJob("cleanup-healthy.sh"), remainingMs: 5000)
+                })
+                @Expect(cronScriptRunnerWaitUntil({ => exists(cleanupReady) }), true)
+                setCronScriptStopRunnerForTest(Some({ _ownerId, generation, timeoutMs =>
+                    cleanupStopBudgetMs.store(timeoutMs)
+                    ManagedStdioOperationResult(false, "stop_timeout", generation: generation)
+                }))
+                cleanupFuture = Some(spawn {
+                    runCronJobScriptForJob(
+                        root,
+                        cronScriptRunnerJob("cleanup-failure.sh"),
+                        remainingMs: 600,
+                        cancellationCheck: { => if (cleanupCancel.load()) { throw Exception("cancel-cleanup") } }
+                    )
+                })
+                @Expect(cronScriptRunnerWaitUntil({ => cronScriptRunnerPidValues(cleanupPidFile).size == 2 }), true)
+                let cleanupPids = cronScriptRunnerPidValues(cleanupPidFile)
+                let cleanupPgid = cronScriptRunnerPgid(cleanupPids[0])
+                @Expect(cronScriptRunnerPgid(cleanupPids[1]), cleanupPgid)
+                cleanupCancel.store(true)
+                let cleanupFailed = cleanupFuture.getOrThrow().get(Duration.second * 3)
+                @Expect(cleanupFailed.ok, false)
+                @Expect(cleanupFailed.status, "cleanup_failed")
+                @Expect(cleanupFailed.errorCode, "cron_script_cleanup_failed")
+                @Expect(cleanupFailed.output, "")
+                @Expect(cleanupFailed.stderr, "")
+                @Expect(cleanupFailed.exitCode, 0)
+                @Expect(cleanupFailed.timedOut, false)
+                @Expect(cleanupFailed.empty, true)
+                @Expect(cleanupFailed.message.contains("stop_timeout"), true)
+                @Expect(cleanupStopBudgetMs.load() >= 4250, true)
+                @Expect(cleanupStopBudgetMs.load() <= 5000, true)
+                @Expect(managedStdioBroker().snapshot().ownerCount >= 1, true)
+                setCronScriptStopRunnerForTest(None<(String, Int64, Int64) -> ManagedStdioOperationResult>)
+                File.writeTo(cleanupRelease, "release".toArray())
+                let cleanupHealthy = cleanupHealthyFuture.getOrThrow().get(Duration.second * 3)
+                @Expect(cleanupHealthy.ok, true)
+                @Expect(cleanupHealthy.output.contains("released-中文🙂"), true)
+                for (pid in cleanupPids) { @Expect(cronScriptRunnerWaitUntil({ => cronScriptRunnerPidGone(pid) }), true) }
+                @Expect(cronScriptRunnerWaitUntil({ => cronScriptRunnerPgidGone(cleanupPgid) }), true)
+                @Expect(cronScriptRunnerWaitUntil({ => managedStdioBroker().snapshot().ownerCount == 0 }), true)
             } finally {
-                for (future in [timedFuture, cancelFuture, killedFuture, healthyFuture]) {
+                setCronScriptStopRunnerForTest(None<(String, Int64, Int64) -> ManagedStdioOperationResult>)
+                try { File.writeTo(cronScriptsDir(root).join("cleanup-healthy.release"), "release".toArray()) } catch (_: Exception) { () }
+                for (future in [timedFuture, cancelFuture, killedFuture, healthyFuture, cleanupFuture, cleanupHealthyFuture]) {
                     match (future) { case Some(value) => try { let _ = value.get(Duration.second * 5) } catch (_: Exception) { () } case None => () }
                 }
                 let _ = resetManagedStdioBrokerForTest(timeoutMs: 3000)

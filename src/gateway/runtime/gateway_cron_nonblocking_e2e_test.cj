@@ -144,6 +144,14 @@ private class CronM5E2eAdapter <: ChannelAdapter {
         }
         count
     }
+
+    public func countExactText(expected: String): Int64 {
+        var count: Int64 = 0
+        for (text in this.sent) {
+            if (text == expected) { count += 1 }
+        }
+        count
+    }
 }
 
 private func cronM5Service(feishu: CronM5E2eAdapter, telegram: CronM5E2eAdapter): GatewayService {
@@ -217,10 +225,19 @@ private func cronP3FetchHealthz(url: String): CronP3HealthProbeResult {
     }
 }
 
-private func cronP3AwaitHealthz(url: String): Bool {
+private func cronP3AwaitHealthz(url: String, expectedPort: Int64): Bool {
     cronM5Await({ =>
         let result = cronP3FetchHealthz(url)
-        result.status >= 200 && result.status < 300
+        if (result.status < 200 || result.status >= 300) {
+            false
+        } else {
+            try {
+                let body = JsonValue.fromStr(result.body).asObject()
+                body.get("ok").getOrThrow().asBool().getValue() &&
+                    body.get("status").getOrThrow().asString().getValue() == "live" &&
+                    body.get("gateway").getOrThrow().asObject().get("port").getOrThrow().asInt().getValue() == expectedPort
+            } catch (_: Exception) { false }
+        }
     })
 }
 
@@ -799,7 +816,7 @@ public class GatewayCronNonblockingE2eTest {
     }
 
     @TestCase
-    public func p3P4ConcurrentBrokerCronScriptsKeepGatewayPollAndHealthResponsive(): Unit {
+    public func p3P4SerialGatewayScriptHandoffKeepsPollAndRealHealthResponsive(): Unit {
         withCronM5E2eHome({ storePath: Path =>
             let scripts = cronScriptsDir(CliConfig.dotDir)
             Directory.create(scripts, recursive: true)
@@ -812,21 +829,21 @@ public class GatewayCronNonblockingE2eTest {
                 scripts.join("p3-p4-a.sh"),
                 "exec node '${fixture}' 'wait-release' '${readyA.toString()}' '${releaseA.toString()}'\n".toArray()
             )
+            File.writeTo(
+                scripts.join("p3-p4-b.sh"),
+                "exec node '${fixture}' 'wait-release' '${readyB.toString()}' '${releaseB.toString()}'\n".toArray()
+            )
             let jobA = cronM5Job("p3-p4-a", sessionTarget: "session:p3-p4-a")
             jobA.scriptPath = "p3-p4-a.sh"
             jobA.scriptMode = "noAgent"
             let jobB = cronM5Job("p3-p4-b", sessionTarget: "session:p3-p4-b")
+            jobB.scriptPath = "p3-p4-b.sh"
+            jobB.scriptMode = "noAgent"
             cronSave(storePath, [jobA, jobB])
 
             setGatewayAgentBridgeReplyRunnerForTest(Some({
                 _sessionKey, prompt, channel, _agentId, _streaming, _hook =>
-                    if (prompt.contains("p3-p4-b")) {
-                        File.writeTo(readyB, "ready".toArray())
-                        while (!exists(releaseB)) { sleep(Duration.millisecond * 2) }
-                        "cron-agent-released-中文🙂"
-                    } else {
-                        "${channel}-reply:${prompt}"
-                    }
+                    "${channel}-reply:${prompt}"
             }))
             let feishu = CronM5E2eAdapter("feishu")
             let telegram = CronM5E2eAdapter("telegram")
@@ -848,7 +865,7 @@ public class GatewayCronNonblockingE2eTest {
                     let candidateCfg = buildGatewayConfigFromUserSettings(healthSettings)
                     let candidateUrl = "http://127.0.0.1:${candidate}/healthz"
                     GatewayHttpSurface.startIfNeeded(candidateCfg)
-                    if (cronP3AwaitHealthz(candidateUrl)) {
+                    if (cronP3AwaitHealthz(candidateUrl, candidate)) {
                         healthPort = candidate
                         healthUrl = candidateUrl
                         break
@@ -863,13 +880,16 @@ public class GatewayCronNonblockingE2eTest {
                 @Expect(reservedB.status, "reserved")
                 @Expect(runner.submitReservedExecution(reservedA), "submitted")
                 @Expect(runner.submitReservedExecution(reservedB), "submitted")
-                @Expect(cronM5Await({ => exists(readyA) && exists(readyB) }), true)
+                @Expect(cronM5Await({ => exists(readyA) }), true)
+                @Expect(exists(readyB), false)
                 @Expect(cronM5Await({ => runner.activeExecutionCount() == 2 }), true)
                 @Expect(managedStdioBroker().snapshot().ownerCount, 1)
                 let brokerPid = managedStdioBroker().snapshot().brokerPid
-                for (index in 0..8) {
-                    feishu.enqueue("飞书-p3-p4-${index}-中文🙂")
-                    telegram.enqueue("telegram-p3-p4-${index}-🙂")
+                for (index in 0..4) {
+                    let feishuText = "飞书-p3-p4-${index}-中文🙂"
+                    let telegramText = "telegram-p3-p4-${index}-🙂"
+                    feishu.enqueue(feishuText)
+                    telegram.enqueue(telegramText)
                     let beganAtMs = DateTime.now().toUnixTimeStamp().toMilliseconds()
                     gateway.processOnce()
                     let response = cronP3FetchHealthz(healthUrl)
@@ -886,11 +906,50 @@ public class GatewayCronNonblockingE2eTest {
                     )
                     @Expect(brokerHealth.ok, true)
                     @Expect(managedStdioBroker().snapshot().brokerPid, brokerPid)
+                    @Expect(feishu.countExactText("feishu-reply:${feishuText}"), 1)
+                    @Expect(telegram.countExactText("telegram-reply:${telegramText}"), 1)
+                }
+                File.writeTo(releaseA, "release".toArray())
+                @Expect(cronM5Await({ => exists(readyB) }), true)
+                let pidA = try { String.fromUtf8(File.readFrom(readyA)).trimAscii() } catch (_: Exception) { "" }
+                let pidB = try { String.fromUtf8(File.readFrom(readyB)).trimAscii() } catch (_: Exception) { "" }
+                @Expect(pidA.isEmpty(), false)
+                @Expect(pidB.isEmpty(), false)
+                @Expect(pidB == pidA, false)
+                @Expect(managedStdioBroker().snapshot().ownerCount, 1)
+                @Expect(managedStdioBroker().snapshot().brokerPid, brokerPid)
+                for (index in 4..8) {
+                    let feishuText = "飞书-p3-p4-${index}-中文🙂"
+                    let telegramText = "telegram-p3-p4-${index}-🙂"
+                    feishu.enqueue(feishuText)
+                    telegram.enqueue(telegramText)
+                    let beganAtMs = DateTime.now().toUnixTimeStamp().toMilliseconds()
+                    gateway.processOnce()
+                    let response = cronP3FetchHealthz(healthUrl)
+                    let healthz = JsonValue.fromStr(response.body).asObject()
+                    let brokerHealth = managedStdioBroker().probeBroker(timeoutMs: 500)
+                    @Expect(DateTime.now().toUnixTimeStamp().toMilliseconds() - beganAtMs < 1000, true)
+                    @Expect(response.status >= 200 && response.status < 300, true)
+                    @Expect(healthz.get("ok").getOrThrow().asBool().getValue(), true)
+                    @Expect(healthz.get("status").getOrThrow().asString().getValue(), "live")
+                    @Expect(
+                        healthz.get("gateway").getOrThrow().asObject().get("port").getOrThrow().asInt().getValue(),
+                        healthPort
+                    )
+                    @Expect(brokerHealth.ok, true)
+                    @Expect(managedStdioBroker().snapshot().brokerPid, brokerPid)
+                    @Expect(feishu.countExactText("feishu-reply:${feishuText}"), 1)
+                    @Expect(telegram.countExactText("telegram-reply:${telegramText}"), 1)
                 }
                 @Expect(feishu.sendCount(), 8)
+                @Expect(feishu.countText("telegram-reply:"), 0)
+                @Expect(telegram.countText("feishu-reply:"), 0)
                 @Expect(telegram.countText("telegram-reply:telegram-p3-p4-"), 8)
+                for (index in 0..8) {
+                    @Expect(feishu.countExactText("feishu-reply:飞书-p3-p4-${index}-中文🙂"), 1)
+                    @Expect(telegram.countExactText("telegram-reply:telegram-p3-p4-${index}-🙂"), 1)
+                }
                 @Expect(managedStdioBroker().snapshot().readerCount, 1)
-                File.writeTo(releaseA, "release".toArray())
                 File.writeTo(releaseB, "release".toArray())
                 @Expect(runner.waitUntilIdle(timeoutMs: 5000), true)
                 runner.tick()

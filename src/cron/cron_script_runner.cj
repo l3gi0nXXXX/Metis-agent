@@ -1,7 +1,7 @@
 package metis.cron
 
 import metis.core.{metisDecodeUtf8Bytes, metisRedactSensitiveText, metisSafeRuneEllipsis}
-import metis.process.{ManagedStdioOwnerSpec, managedStdioBroker}
+import metis.process.{ManagedStdioOperationResult, ManagedStdioOwnerSpec, managedStdioBroker}
 
 import std.fs.{Path, exists}
 import std.sync.Mutex
@@ -11,8 +11,11 @@ private let CRON_SCRIPT_TIMEOUT_MS: Int64 = 30000
 private let CRON_SCRIPT_OUTPUT_MAX_RUNES: Int64 = 16000
 private let CRON_SCRIPT_STDERR_MAX_RUNES: Int64 = 4000
 private let CRON_SCRIPT_OUTPUT_MAX_BYTES: Int64 = 65536
+private let CRON_SCRIPT_CLEANUP_TIMEOUT_MS: Int64 = 5000
 private let cronScriptOwnerLock = Mutex()
 private var cronScriptOwnerSequence: Int64 = 0
+private let cronScriptStopRunnerLock = Mutex()
+private var cronScriptStopRunnerForTest = None<(String, Int64, Int64) -> ManagedStdioOperationResult>
 
 public class CronScriptPathResult {
     public let ok: Bool
@@ -74,6 +77,16 @@ public class CronScriptRunResult {
         this.timedOut = timedOut
         this.empty = output.trimAscii().isEmpty()
         this.message = message.trimAscii()
+    }
+}
+
+private class CronScriptCleanupResult {
+    let ok: Bool
+    let status: String
+
+    init(ok: Bool, status: String) {
+        this.ok = ok
+        this.status = status.trimAscii()
     }
 }
 
@@ -158,10 +171,49 @@ private func cronScriptError(status: String, errorCode: String, message: String)
     )
 }
 
-private func cronScriptStopAndDrain(ownerId: String, generation: Int64, timeoutMs: Int64): Unit {
+public func setCronScriptStopRunnerForTest(
+    runner: Option<(String, Int64, Int64) -> ManagedStdioOperationResult>
+): Unit {
+    synchronized(cronScriptStopRunnerLock) { cronScriptStopRunnerForTest = runner }
+}
+
+private func cronScriptStopOwner(ownerId: String, generation: Int64, timeoutMs: Int64): ManagedStdioOperationResult {
+    let override = synchronized(cronScriptStopRunnerLock) { cronScriptStopRunnerForTest }
+    match (override) {
+        case Some(runner) => runner(ownerId, generation, timeoutMs)
+        case None => managedStdioBroker().stopOwner(ownerId, timeoutMs: timeoutMs, expectedGeneration: Some(generation))
+    }
+}
+
+private func cronScriptStopAndDrain(ownerId: String, generation: Int64, timeoutMs: Int64): CronScriptCleanupResult {
     let broker = managedStdioBroker()
-    let _ = broker.stopOwner(ownerId, timeoutMs: max(1, timeoutMs), expectedGeneration: Some(generation))
-    while (broker.readOwnerLine(ownerId, timeoutMs: 0).isSome()) { () }
+    let deadlineMs = DateTime.now().toUnixTimeStamp().toMilliseconds() + max(1, timeoutMs)
+    let stopped = try {
+        cronScriptStopOwner(ownerId, generation, max(1, deadlineMs - DateTime.now().toUnixTimeStamp().toMilliseconds()))
+    } catch (e: Exception) {
+        return CronScriptCleanupResult(false, if (e.message.trimAscii().isEmpty()) { "stop_failed" } else { e.message })
+    }
+    while (DateTime.now().toUnixTimeStamp().toMilliseconds() < deadlineMs) {
+        let remaining = deadlineMs - DateTime.now().toUnixTimeStamp().toMilliseconds()
+        if (broker.readOwnerLine(ownerId, timeoutMs: min(25, remaining)).isNone()) { break }
+    }
+    CronScriptCleanupResult(stopped.ok, if (stopped.status.trimAscii().isEmpty()) { "stop_failed" } else { stopped.status })
+}
+
+private func cronScriptCleanupFailure(
+    result: CronScriptRunResult,
+    cleanup: CronScriptCleanupResult
+): CronScriptRunResult {
+    CronScriptRunResult(
+        false,
+        status: "cleanup_failed",
+        errorCode: "cron_script_cleanup_failed",
+        output: result.output,
+        stderr: result.stderr,
+        exitCode: result.exitCode,
+        timedOut: result.timedOut,
+        message: "cron script cleanup failed: ${cronScriptSanitizeOutputForTest(cleanup.status, maxRunes: 80)}"
+    )
 }
 
 private func cronScriptTerminalError(
@@ -259,19 +311,17 @@ public func runCronJobScriptForJob(
     }
     let stdout = StringBuilder()
     let stderr = StringBuilder()
-    try {
+    let result = try {
         var completed = None<CronScriptRunResult>
         while (completed.isNone()) {
             try {
                 cancellationCheck()
             } catch (cancelled: Exception) {
-                cronScriptStopAndDrain(ownerId, started.generation, 1000)
                 completed = Some(cronScriptError("cancelled", "cron_script_cancelled", cancelled.message))
                 continue
             }
             let remaining = deadlineMs - DateTime.now().toUnixTimeStamp().toMilliseconds()
             if (remaining <= 0) {
-                cronScriptStopAndDrain(ownerId, started.generation, 1000)
                 completed = Some(CronScriptRunResult(
                     false,
                     status: "timeout",
@@ -322,7 +372,7 @@ public func runCronJobScriptForJob(
         completed.getOrThrow()
     } catch (e: Exception) {
         cronScriptError("failed", "cron_script_failed", e.message)
-    } finally {
-        cronScriptStopAndDrain(ownerId, started.generation, 1000)
     }
+    let cleanup = cronScriptStopAndDrain(ownerId, started.generation, CRON_SCRIPT_CLEANUP_TIMEOUT_MS)
+    if (cleanup.ok) { result } else { cronScriptCleanupFailure(result, cleanup) }
 }
