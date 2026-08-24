@@ -2,12 +2,13 @@ package metis.gateway.logging
 
 import magic.config.Config
 
+import metis.core.metisRedactSensitiveText
 import metis.core.config.{CliConfig, CliSettingManager, GatewayLoggingUserSettings}
 
 import std.collection.ArrayList
 import std.env.getVariable
 import std.fs.{Directory, File, FileInfo, Path, exists}
-import std.regex.{MatchData, Regex, RegexFlag}
+import std.regex.{Regex, RegexFlag}
 import std.time.DateTime
 import stdx.encoding.json.{JsonArray, JsonBool, JsonFloat, JsonInt, JsonObject, JsonString, JsonValue}
 
@@ -292,23 +293,6 @@ private func gatewayLogRegexReplace(text: String, pattern: String, replacement: 
     }
 }
 
-private func gatewayLogRegexReplaceMatch(text: String, pattern: String, replacement: (MatchData) -> String): String {
-    try {
-        let builder = StringBuilder()
-        var prev = 0
-        for (md in Regex(pattern, [RegexFlag.IgnoreCase]).findAll(text, group: true)) {
-            let pos = md.matchPosition()
-            builder.append(text[prev..pos.start])
-            builder.append(replacement(md))
-            prev = pos.end
-        }
-        builder.append(text[prev..])
-        builder.toString()
-    } catch (_: Exception) {
-        text
-    }
-}
-
 private func gatewayLoggingTimestamp(): String {
     DateTime.now().toString()
 }
@@ -342,75 +326,11 @@ public func gatewayLogTruncateText(text: String, limit!: Int64 = LOG_META_STRING
 }
 
 public func gatewayLogRedactText(text: String): String {
-    var out = text
     let settings = gatewayLoggingResolveSettings()
     if (!settings.redactSensitive) {
-        return out
+        return text
     }
-    out = gatewayLogRegexReplaceMatch(
-        out,
-        "(\\b[A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD)\\b\\s*[=:]\\s*[\"']?)[^\\s\"'\\\\]+([\"']?)",
-        { md => "${md.matchString(1)}${LOG_REDACTED_MARKER}${md.matchString(2)}" }
-    )
-    out = gatewayLogRegexReplaceMatch(
-        out,
-        "(\"(?:apiKey|token|secret|password|passwd|accessToken|refreshToken)\"\\s*:\\s*\")[^\"]+(\")",
-        { md => "${md.matchString(1)}${LOG_REDACTED_MARKER}${md.matchString(2)}" }
-    )
-    out = gatewayLogRegexReplaceMatch(
-        out,
-        "(--(?:api[-_]?key|token|secret|password|passwd)\\s+[\"']?)[^\\s\"']+([\"']?)",
-        { md => "${md.matchString(1)}${LOG_REDACTED_MARKER}${md.matchString(2)}" }
-    )
-    out = gatewayLogRegexReplaceMatch(
-        out,
-        "(Authorization\\s*[:=]\\s*Bearer\\s+)[A-Za-z0-9._\\-+=]+",
-        { md => "${md.matchString(1)}${LOG_REDACTED_MARKER}" }
-    )
-    out = gatewayLogRegexReplaceMatch(
-        out,
-        "(Authorization\\s*[:=]\\s*)[^\\s,;\\}\\]]+",
-        { md => "${md.matchString(1)}${LOG_REDACTED_MARKER}" }
-    )
-    out = gatewayLogRegexReplaceMatch(
-        out,
-        "(\\bBearer\\s+)[A-Za-z0-9._\\-+=]{18,}\\b",
-        { md => "${md.matchString(1)}${LOG_REDACTED_MARKER}" }
-    )
-    out = gatewayLogRegexReplaceMatch(
-        out,
-        "(-----BEGIN [A-Z ]*PRIVATE KEY-----)[\\s\\S]+?(-----END [A-Z ]*PRIVATE KEY-----)",
-        { md => "${md.matchString(1)}\n${LOG_REDACTED_MARKER}\n${md.matchString(2)}" }
-    )
-    out = gatewayLogRegexReplace(out, "\\bsk-[A-Za-z0-9_-]{8,}\\b", LOG_REDACTED_MARKER)
-    out = gatewayLogRegexReplace(out, "\\bghp_[A-Za-z0-9]{20,}\\b", LOG_REDACTED_MARKER)
-    out = gatewayLogRegexReplace(out, "\\bgithub_pat_[A-Za-z0-9_]{20,}\\b", LOG_REDACTED_MARKER)
-    out = gatewayLogRegexReplace(out, "\\bxox[baprs]-[A-Za-z0-9-]{10,}\\b", LOG_REDACTED_MARKER)
-    out = gatewayLogRegexReplace(out, "\\bxapp-[A-Za-z0-9-]{10,}\\b", LOG_REDACTED_MARKER)
-    out = gatewayLogRegexReplace(out, "\\bgsk_[A-Za-z0-9_-]{10,}\\b", LOG_REDACTED_MARKER)
-    out = gatewayLogRegexReplace(out, "\\bAIza[0-9A-Za-z\\-_]{20,}\\b", LOG_REDACTED_MARKER)
-    out = gatewayLogRegexReplace(out, "\\bpplx-[A-Za-z0-9_-]{10,}\\b", LOG_REDACTED_MARKER)
-    out = gatewayLogRegexReplace(out, "\\bnpm_[A-Za-z0-9]{10,}\\b", LOG_REDACTED_MARKER)
-    out = gatewayLogRegexReplace(out, "\\bbot[0-9]{6,}:[A-Za-z0-9_-]{20,}\\b", "bot${LOG_REDACTED_MARKER}")
-    out = gatewayLogRegexReplace(out, "\\b[0-9]{6,}:[A-Za-z0-9_-]{20,}\\b", LOG_REDACTED_MARKER)
-    out = gatewayLogRegexReplace(out, "\\b[0-9]{5,}:[A-Za-z0-9_-]{6,}\\b", LOG_REDACTED_MARKER)
-    out = gatewayLogRegexReplace(out, "app[_-]?secret[_a-zA-Z0-9-]*", LOG_REDACTED_MARKER)
-    out = gatewayLogRegexReplaceMatch(
-        out,
-        "(api[_-]?key\\s*[:=]\\s*)[^\\s,;\\}\\]]+",
-        { md => "${md.matchString(1)}${LOG_REDACTED_MARKER}" }
-    )
-    out = gatewayLogRegexReplaceMatch(
-        out,
-        "(https?://[^\\s:/@]+:)[^\\s/@]+(@)",
-        { md => "${md.matchString(1)}${LOG_REDACTED_MARKER}${md.matchString(2)}" }
-    )
-    // 运行诊断不得泄漏本机用户目录；只保留平台根前缀供排障分类。
-    out = gatewayLogRegexReplace(
-        out,
-        "(/Users/|/home/)[^\\s\"']+",
-        "[redacted-path]"
-    )
+    var out = metisRedactSensitiveText(text, marker: LOG_REDACTED_MARKER)
     for (pattern in settings.redactPatterns) {
         let p = pattern.trimAscii()
         if (!p.isEmpty()) {

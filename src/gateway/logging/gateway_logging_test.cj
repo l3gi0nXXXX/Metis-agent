@@ -179,6 +179,38 @@ public class GatewayLoggingTest {
     }
 
     @TestCase
+    public func redactionWrapperPreservesDisableAndCustomPatternSettings(): Unit {
+        let oldHome = getVariable("METIS_HOME")
+        let home = loggingTestHome("redaction-wrapper-settings")
+        try {
+            loggingTestReset(home)
+            File.writeTo(
+                home.join("metis.json"),
+                "{\"gateway\":{\"logging\":{\"redactSensitive\":false}}}".toArray()
+            )
+            CliSettingManager.invalidate()
+            gatewayLoggingResetForTest()
+            @Expect(gatewayLogRedactText("TOKEN=visible-while-disabled"), "TOKEN=visible-while-disabled")
+
+            File.writeTo(
+                home.join("metis.json"),
+                "{\"gateway\":{\"logging\":{\"redactSensitive\":true,\"redactPatterns\":[\"tenant-[0-9]+\"]}}}".toArray()
+            )
+            CliSettingManager.invalidate()
+            gatewayLoggingResetForTest()
+            let redacted = gatewayLogRedactText("中文🙂 tenant-123 TOKEN=hidden-value")
+            @Expect(redacted.contains("中文🙂"), true)
+            @Expect(redacted.contains("tenant-123"), false)
+            @Expect(redacted.contains("hidden-value"), false)
+        } finally {
+            loggingTestRestoreEnv("METIS_HOME", oldHome)
+            CliConfig.invalidatePathCache()
+            CliSettingManager.invalidate()
+            gatewayLoggingResetForTest()
+        }
+    }
+
+    @TestCase
     public func loggerRedactsSupportedSensitiveInputsWithoutRealHome(): Unit {
         let oldHome = getVariable("METIS_HOME")
         let oldLevel = getVariable("METIS_LOG_LEVEL")

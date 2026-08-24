@@ -1,6 +1,7 @@
 package metis.gateway.runtime
 
 import metis.core.config.{CliConfig, CliSettingManager, MetisConfigManager, MetisProcessEnvironmentLock}
+import metis.gateway.config.buildGatewayConfigFromUserSettings
 import metis.cron.{
     CronJob,
     CronJobState,
@@ -8,6 +9,7 @@ import metis.cron.{
     cronLoadOrEmpty,
     cronSave,
     cronScriptDecodeBytesForTest,
+    cronScriptsDir,
     cronStorePath,
     executeGatewayCronCommand,
     readCronRunLogEntriesForJob
@@ -23,14 +25,18 @@ import metis.gateway.core.{
 }
 import metis.gateway.model.{ChannelPolicyConfig, ChannelType, ChatType, InboundMessage, OutboundMessage, SendResult}
 import metis.gateway.session.GatewaySessionRequest
+import metis.process.{managedStdioBroker, resetManagedStdioBrokerForTest}
 
 import std.collection.{ArrayList, HashMap}
 import std.core.Duration
 import std.env.{getVariable, setVariable}
-import std.fs.{Directory, File, Path, remove}
+import std.fs.{Directory, File, Path, exists, remove}
+import std.net.*
 import std.sync.{AtomicBool, AtomicInt64, Mutex}
 import std.time.DateTime
 import std.unittest.testmacro.*
+import stdx.encoding.json.JsonValue
+import stdx.net.http.*
 
 /**
  * M5 的跨模块门禁使用真实 GatewayService/processOnce、CronRunner、session reply hook
@@ -138,6 +144,14 @@ private class CronM5E2eAdapter <: ChannelAdapter {
         }
         count
     }
+
+    public func countExactText(expected: String): Int64 {
+        var count: Int64 = 0
+        for (text in this.sent) {
+            if (text == expected) { count += 1 }
+        }
+        count
+    }
 }
 
 private func cronM5Service(feishu: CronM5E2eAdapter, telegram: CronM5E2eAdapter): GatewayService {
@@ -174,6 +188,71 @@ private func cronM5Await(predicate: () -> Bool, timeoutMs!: Int64 = 3000): Bool 
         sleep(Duration.millisecond * 2)
     }
     predicate()
+}
+
+private class CronP3HealthProbeResult {
+    let status: Int64
+    let body: String
+
+    init(status: Int64, body: String) {
+        this.status = status
+        this.body = body
+    }
+}
+
+private func cronP3ReadHealthBody(response: HttpResponse): String {
+    let out = ArrayList<Byte>()
+    let buffer = Array<Byte>(1024, repeat: 0)
+    while (out.size <= 64 * 1024) {
+        let count = response.body.read(buffer)
+        if (count <= 0) { break }
+        out.add(all: buffer[..count])
+    }
+    try { String.fromUtf8(out.toArray()) } catch (_: Exception) { "invalid_response_encoding" }
+}
+
+private func cronP3FetchHealthz(url: String): CronP3HealthProbeResult {
+    let builder = ClientBuilder()
+    builder.readTimeout(Duration.millisecond * 500)
+    let client = builder.build()
+    try {
+        let response = client.send(HttpRequestBuilder().url(url).get().build())
+        CronP3HealthProbeResult(Int64(response.status), cronP3ReadHealthBody(response))
+    } catch (_: Exception) {
+        CronP3HealthProbeResult(0, "")
+    } finally {
+        client.close()
+    }
+}
+
+private func cronP3AwaitHealthz(url: String, expectedPort: Int64): Bool {
+    cronM5Await({ =>
+        let result = cronP3FetchHealthz(url)
+        if (result.status < 200 || result.status >= 300) {
+            false
+        } else {
+            try {
+                let body = JsonValue.fromStr(result.body).asObject()
+                body.get("ok").getOrThrow().asBool().getValue() &&
+                    body.get("status").getOrThrow().asString().getValue() == "live" &&
+                    body.get("gateway").getOrThrow().asObject().get("port").getOrThrow().asInt().getValue() == expectedPort
+            } catch (_: Exception) { false }
+        }
+    })
+}
+
+private func cronP3TemporaryHealthPort(): Int64 {
+    var attempts: Int64 = 0
+    while (attempts < 8) {
+        attempts += 1
+        try (socket = TcpServerSocket(bindAt: 0u16)) {
+            socket.bind()
+            let port = (socket.localAddress as IPSocketAddress)?.port ?? 0u16
+            let value = Int64(port)
+            if (value > 0 && value != 18788 && value != 60271) { return value }
+        }
+    }
+    0
 }
 
 @Test
@@ -731,6 +810,165 @@ public class GatewayCronNonblockingE2eTest {
                     @Expect(row.get("status").getOrThrow().asString().getValue(), "error")
                     @Expect(row.get("diagnosticCode").getOrThrow().asString().getValue(), "incomplete_tool_protocol")
                     @Expect(row.get("summary").getOrThrow().asString().getValue().contains("[\"web_fetch\"]"), false)
+                }
+            }
+        })
+    }
+
+    @TestCase
+    public func p3P4SerialGatewayScriptHandoffKeepsPollAndRealHealthResponsive(): Unit {
+        withCronM5E2eHome({ storePath: Path =>
+            let scripts = cronScriptsDir(CliConfig.dotDir)
+            Directory.create(scripts, recursive: true)
+            let fixture = CliConfig.cwd.join("scripts").join("gateway-stdio-fake-cron-child.mjs").toString()
+            let readyA = scripts.join("p3-p4-a.ready")
+            let readyB = scripts.join("p3-p4-b.ready")
+            let releaseA = scripts.join("p3-p4-a.release")
+            let releaseB = scripts.join("p3-p4-b.release")
+            File.writeTo(
+                scripts.join("p3-p4-a.sh"),
+                "exec node '${fixture}' 'wait-release' '${readyA.toString()}' '${releaseA.toString()}'\n".toArray()
+            )
+            File.writeTo(
+                scripts.join("p3-p4-b.sh"),
+                "exec node '${fixture}' 'wait-release' '${readyB.toString()}' '${releaseB.toString()}'\n".toArray()
+            )
+            let jobA = cronM5Job("p3-p4-a", sessionTarget: "session:p3-p4-a")
+            jobA.scriptPath = "p3-p4-a.sh"
+            jobA.scriptMode = "noAgent"
+            let jobB = cronM5Job("p3-p4-b", sessionTarget: "session:p3-p4-b")
+            jobB.scriptPath = "p3-p4-b.sh"
+            jobB.scriptMode = "noAgent"
+            cronSave(storePath, [jobA, jobB])
+
+            setGatewayAgentBridgeReplyRunnerForTest(Some({
+                _sessionKey, prompt, channel, _agentId, _streaming, _hook =>
+                    "${channel}-reply:${prompt}"
+            }))
+            let feishu = CronM5E2eAdapter("feishu")
+            let telegram = CronM5E2eAdapter("telegram")
+            let gateway = cronM5Service(feishu, telegram)
+            let runner = CronRunner(gatewayOpt: Some(gateway), storePath: storePath, maxConcurrentRuns: 2)
+            var healthSettings = CliSettingManager.readGatewaySettings()
+            healthSettings.bind = "loopback"
+            healthSettings.customBindHost = ""
+            healthSettings.http.endpoints.chatCompletions.enabled = true
+            var healthUrl = ""
+            var healthPort: Int64 = 0
+            GatewayHttpSurface.stopIfRunning()
+            try {
+                gateway.start()
+                for (_attempt in 0..5) {
+                    let candidate = cronP3TemporaryHealthPort()
+                    if (candidate <= 0) { continue }
+                    healthSettings.port = candidate
+                    let candidateCfg = buildGatewayConfigFromUserSettings(healthSettings)
+                    let candidateUrl = "http://127.0.0.1:${candidate}/healthz"
+                    GatewayHttpSurface.startIfNeeded(candidateCfg)
+                    if (cronP3AwaitHealthz(candidateUrl, candidate)) {
+                        healthPort = candidate
+                        healthUrl = candidateUrl
+                        break
+                    }
+                    GatewayHttpSurface.stopIfRunning()
+                }
+                @Expect(healthPort > 0, true)
+                if (healthPort <= 0) { throw Exception("P3-P4 could not start isolated health surface") }
+                let reservedA = runner.reserveExecution(jobA.id, "manual", true, false)
+                let reservedB = runner.reserveExecution(jobB.id, "manual", true, false)
+                @Expect(reservedA.status, "reserved")
+                @Expect(reservedB.status, "reserved")
+                @Expect(runner.submitReservedExecution(reservedA), "submitted")
+                @Expect(runner.submitReservedExecution(reservedB), "submitted")
+                @Expect(cronM5Await({ => exists(readyA) != exists(readyB) }), true)
+                let firstIsA = exists(readyA)
+                let firstReady = if (firstIsA) { readyA } else { readyB }
+                let secondReady = if (firstIsA) { readyB } else { readyA }
+                let firstRelease = if (firstIsA) { releaseA } else { releaseB }
+                let secondRelease = if (firstIsA) { releaseB } else { releaseA }
+                @Expect(exists(firstReady), true)
+                @Expect(exists(secondReady), false)
+                @Expect(cronM5Await({ => runner.activeExecutionCount() == 2 }), true)
+                @Expect(managedStdioBroker().snapshot().ownerCount, 1)
+                let brokerPid = managedStdioBroker().snapshot().brokerPid
+                for (index in 0..4) {
+                    let feishuText = "飞书-p3-p4-${index}-中文🙂"
+                    let telegramText = "telegram-p3-p4-${index}-🙂"
+                    feishu.enqueue(feishuText)
+                    telegram.enqueue(telegramText)
+                    let beganAtMs = DateTime.now().toUnixTimeStamp().toMilliseconds()
+                    gateway.processOnce()
+                    let response = cronP3FetchHealthz(healthUrl)
+                    let healthz = JsonValue.fromStr(response.body).asObject()
+                    let brokerHealth = managedStdioBroker().probeBroker(timeoutMs: 500)
+                    @Expect(DateTime.now().toUnixTimeStamp().toMilliseconds() - beganAtMs < 1000, true)
+                    @Expect(response.status >= 200 && response.status < 300, true)
+                    @Expect(healthz.get("ok").getOrThrow().asBool().getValue(), true)
+                    @Expect(healthz.get("status").getOrThrow().asString().getValue(), "live")
+                    @Expect(healthz.get("gateway").isSome(), true)
+                    @Expect(
+                        healthz.get("gateway").getOrThrow().asObject().get("port").getOrThrow().asInt().getValue(),
+                        healthPort
+                    )
+                    @Expect(brokerHealth.ok, true)
+                    @Expect(managedStdioBroker().snapshot().brokerPid, brokerPid)
+                    @Expect(feishu.countExactText("feishu-reply:${feishuText}"), 1)
+                    @Expect(telegram.countExactText("telegram-reply:${telegramText}"), 1)
+                }
+                let firstPid = try { String.fromUtf8(File.readFrom(firstReady)).trimAscii() } catch (_: Exception) { "" }
+                File.writeTo(firstRelease, "release".toArray())
+                @Expect(cronM5Await({ => exists(secondReady) }), true)
+                let secondPid = try { String.fromUtf8(File.readFrom(secondReady)).trimAscii() } catch (_: Exception) { "" }
+                @Expect(firstPid.isEmpty(), false)
+                @Expect(secondPid.isEmpty(), false)
+                @Expect(secondPid == firstPid, false)
+                @Expect(managedStdioBroker().snapshot().ownerCount, 1)
+                @Expect(managedStdioBroker().snapshot().brokerPid, brokerPid)
+                for (index in 4..8) {
+                    let feishuText = "飞书-p3-p4-${index}-中文🙂"
+                    let telegramText = "telegram-p3-p4-${index}-🙂"
+                    feishu.enqueue(feishuText)
+                    telegram.enqueue(telegramText)
+                    let beganAtMs = DateTime.now().toUnixTimeStamp().toMilliseconds()
+                    gateway.processOnce()
+                    let response = cronP3FetchHealthz(healthUrl)
+                    let healthz = JsonValue.fromStr(response.body).asObject()
+                    let brokerHealth = managedStdioBroker().probeBroker(timeoutMs: 500)
+                    @Expect(DateTime.now().toUnixTimeStamp().toMilliseconds() - beganAtMs < 1000, true)
+                    @Expect(response.status >= 200 && response.status < 300, true)
+                    @Expect(healthz.get("ok").getOrThrow().asBool().getValue(), true)
+                    @Expect(healthz.get("status").getOrThrow().asString().getValue(), "live")
+                    @Expect(
+                        healthz.get("gateway").getOrThrow().asObject().get("port").getOrThrow().asInt().getValue(),
+                        healthPort
+                    )
+                    @Expect(brokerHealth.ok, true)
+                    @Expect(managedStdioBroker().snapshot().brokerPid, brokerPid)
+                    @Expect(feishu.countExactText("feishu-reply:${feishuText}"), 1)
+                    @Expect(telegram.countExactText("telegram-reply:${telegramText}"), 1)
+                }
+                @Expect(feishu.sendCount(), 8)
+                @Expect(feishu.countText("telegram-reply:"), 0)
+                @Expect(telegram.countText("feishu-reply:"), 0)
+                @Expect(telegram.countText("telegram-reply:telegram-p3-p4-"), 8)
+                for (index in 0..8) {
+                    @Expect(feishu.countExactText("feishu-reply:飞书-p3-p4-${index}-中文🙂"), 1)
+                    @Expect(telegram.countExactText("telegram-reply:telegram-p3-p4-${index}-🙂"), 1)
+                }
+                @Expect(managedStdioBroker().snapshot().readerCount, 1)
+                File.writeTo(secondRelease, "release".toArray())
+                @Expect(runner.waitUntilIdle(timeoutMs: 5000), true)
+                runner.tick()
+                @Expect(managedStdioBroker().snapshot().ownerCount, 0)
+                for (job in cronLoadOrEmpty(storePath)) { @Expect(job.state.lastStatus, "success") }
+            } finally {
+                try { File.writeTo(releaseA, "release".toArray()) } catch (_: Exception) { () }
+                try { File.writeTo(releaseB, "release".toArray()) } catch (_: Exception) { () }
+                try { let _ = runner.stop(drainTimeoutMs: 3000) } catch (_: Exception) { () }
+                try { gateway.stop() } catch (_: Exception) { () }
+                GatewayHttpSurface.stopIfRunning()
+                if (managedStdioBroker().snapshot().ownerCount != 0) {
+                    let _ = resetManagedStdioBrokerForTest(timeoutMs: 3000)
                 }
             }
         })

@@ -52,4 +52,21 @@ public class TextSafetyTest {
         @Expect(decoded.text, "")
         @Expect(decoded.diagnostic.toAsciiLower().contains("invalid"), true)
     }
+
+    @TestCase
+    public func sensitiveTextRedactionKeepsUnicodeAndHidesFixedSecretsPathsAndLongInput(): Unit {
+        let secret = "cron-secret-abcdefghijklmnopqrstuvwxyz"
+        let input =
+            "中文🙂 Authorization: Bearer ${secret} TOKEN=${secret} " +
+            "https://user:${secret}@example.invalid /Users/private-user/metis/file " +
+            this.repeatText("超长🙂", 2000)
+        let redacted = metisRedactSensitiveText(input)
+        @Expect(redacted.contains("中文🙂"), true)
+        @Expect(redacted.contains(secret), false)
+        @Expect(redacted.contains("private-user"), false)
+        @Expect(redacted.contains("[redacted]"), true)
+        @Expect(redacted.contains("[redacted-path]"), true)
+        @Expect(redacted.contains("超长🙂"), true)
+        @Expect(String.fromUtf8(redacted.toArray()), redacted)
+    }
 }
