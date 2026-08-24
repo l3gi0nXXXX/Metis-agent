@@ -880,8 +880,14 @@ public class GatewayCronNonblockingE2eTest {
                 @Expect(reservedB.status, "reserved")
                 @Expect(runner.submitReservedExecution(reservedA), "submitted")
                 @Expect(runner.submitReservedExecution(reservedB), "submitted")
-                @Expect(cronM5Await({ => exists(readyA) }), true)
-                @Expect(exists(readyB), false)
+                @Expect(cronM5Await({ => exists(readyA) != exists(readyB) }), true)
+                let firstIsA = exists(readyA)
+                let firstReady = if (firstIsA) { readyA } else { readyB }
+                let secondReady = if (firstIsA) { readyB } else { readyA }
+                let firstRelease = if (firstIsA) { releaseA } else { releaseB }
+                let secondRelease = if (firstIsA) { releaseB } else { releaseA }
+                @Expect(exists(firstReady), true)
+                @Expect(exists(secondReady), false)
                 @Expect(cronM5Await({ => runner.activeExecutionCount() == 2 }), true)
                 @Expect(managedStdioBroker().snapshot().ownerCount, 1)
                 let brokerPid = managedStdioBroker().snapshot().brokerPid
@@ -909,13 +915,13 @@ public class GatewayCronNonblockingE2eTest {
                     @Expect(feishu.countExactText("feishu-reply:${feishuText}"), 1)
                     @Expect(telegram.countExactText("telegram-reply:${telegramText}"), 1)
                 }
-                File.writeTo(releaseA, "release".toArray())
-                @Expect(cronM5Await({ => exists(readyB) }), true)
-                let pidA = try { String.fromUtf8(File.readFrom(readyA)).trimAscii() } catch (_: Exception) { "" }
-                let pidB = try { String.fromUtf8(File.readFrom(readyB)).trimAscii() } catch (_: Exception) { "" }
-                @Expect(pidA.isEmpty(), false)
-                @Expect(pidB.isEmpty(), false)
-                @Expect(pidB == pidA, false)
+                let firstPid = try { String.fromUtf8(File.readFrom(firstReady)).trimAscii() } catch (_: Exception) { "" }
+                File.writeTo(firstRelease, "release".toArray())
+                @Expect(cronM5Await({ => exists(secondReady) }), true)
+                let secondPid = try { String.fromUtf8(File.readFrom(secondReady)).trimAscii() } catch (_: Exception) { "" }
+                @Expect(firstPid.isEmpty(), false)
+                @Expect(secondPid.isEmpty(), false)
+                @Expect(secondPid == firstPid, false)
                 @Expect(managedStdioBroker().snapshot().ownerCount, 1)
                 @Expect(managedStdioBroker().snapshot().brokerPid, brokerPid)
                 for (index in 4..8) {
@@ -950,7 +956,7 @@ public class GatewayCronNonblockingE2eTest {
                     @Expect(telegram.countExactText("telegram-reply:telegram-p3-p4-${index}-🙂"), 1)
                 }
                 @Expect(managedStdioBroker().snapshot().readerCount, 1)
-                File.writeTo(releaseB, "release".toArray())
+                File.writeTo(secondRelease, "release".toArray())
                 @Expect(runner.waitUntilIdle(timeoutMs: 5000), true)
                 runner.tick()
                 @Expect(managedStdioBroker().snapshot().ownerCount, 0)
