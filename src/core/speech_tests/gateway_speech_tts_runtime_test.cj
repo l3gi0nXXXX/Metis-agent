@@ -1,13 +1,14 @@
 package metis.core.speech_tests
 
 import metis.core.*
+import metis.process.managedStdioResolveBrokerScriptPath
 
 import magic.jsonable.*
 
 import std.collection.ArrayList
 import std.convert.*
 import std.env.{getVariable, setVariable}
-import std.fs.{Directory, File, Path, exists}
+import std.fs.{Directory, File, Path, exists, remove}
 import std.time.*
 import std.unittest.*
 import stdx.encoding.json.{JsonArray, JsonBool, JsonInt, JsonObject, JsonString}
@@ -16,6 +17,10 @@ private func ttsTestTempRoot(label: String): Path {
     let root = Path("/tmp/metis-speech-tts-runtime-${label}-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
     Directory.create(root, recursive: true)
     root
+}
+
+private func ttsTestFakeCommandPath(): String {
+    Path(managedStdioResolveBrokerScriptPath()).parent.join("gateway-stdio-fake-command-child.mjs").toString()
 }
 
 private func ttsTestProvider(command: Array<String>, outputExtension!: String = "ogg", timeoutMs!: Int64 = 3000): JsonObject {
@@ -160,6 +165,26 @@ public class GatewaySpeechTtsRuntimeTest {
         @Expect(ttsTestString(result, "providerKind"), "command")
         @Expect(ttsTestString(result, "payloadKind"), "audio")
         @Expect(String.fromUtf8(File.readFrom(audioPath)), "hello-command")
+    }
+
+    @TestCase
+    public func p3P5TtsDefaultCommandRunnerUsesFormalTimedShellPath(): Unit {
+        let root = ttsTestTempRoot("p3-shell-command")
+        try {
+            let provider = ttsTestProvider([
+                "node", ttsTestFakeCommandPath(), "tts-output", "{text}", "{output}"
+            ])
+            let result = gatewaySpeechTtsSynthesize(
+                ttsTestConfig("local", provider), ttsTestPrefs(false), ttsTestState(), "中文🙂tts", outputRoot: root
+            )
+            let audioPath = Path(ttsTestString(result, "audioPath"))
+
+            @Expect(ttsTestBool(result, "ok"), true)
+            @Expect(ttsTestString(result, "providerKind"), "command")
+            @Expect(String.fromUtf8(File.readFrom(audioPath)), "中文🙂tts")
+        } finally {
+            try { remove(root, recursive: true) } catch (_: Exception) { () }
+        }
     }
 
     @TestCase

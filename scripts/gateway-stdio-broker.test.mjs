@@ -324,6 +324,23 @@ test('P1-N3 test hang is gated and broker stdin has an exact raw byte cap', asyn
   assert.equal(production.hung, undefined);
   assert.equal(output.frames().at(-1).status, 'unsupported_frame');
 
+  const testOutput = new CollectingWritable();
+  const hangChild = fakeChild(46_000);
+  const testBroker = new StdioBroker({
+    generation: 8, output: testOutput, testMode: true, treeRunner: fakeTreeRunner(), spawnFn: () => hangChild,
+  });
+  testBroker.handle(validStart('hang-owner', { requestId: 'hang-owner-start', deadlineMs: 20 }));
+  await new Promise((resolve) => setImmediate(resolve));
+  testBroker.handle({ type: 'broker.test-hang', requestId: 'hang-8-1' });
+  await new Promise((resolve) => setImmediate(resolve));
+  const hangAck = testOutput.frames().find((frame) => frame.type === 'broker.test-hung');
+  assert.equal(hangAck.generation, 8);
+  assert.equal(hangAck.requestId, 'hang-8-1');
+  assert.equal(testBroker.hung, true);
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  assert.equal(testOutput.frames().some((frame) => frame.type === 'owner.timeout'), false);
+  hangChild.emit('close', 0, null);
+
   const input = new PassThrough();
   const cappedOutput = new CollectingWritable();
   const { runBroker } = await import('./metis-stdio-broker.mjs');

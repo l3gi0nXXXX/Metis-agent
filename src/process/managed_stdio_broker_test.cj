@@ -34,6 +34,44 @@ private class ManagedStdioTestInt64Box {
     init(value!: Int64 = 0) { this.value = value }
 }
 
+private class ManagedStdioTestGate {
+    private let lock = Mutex()
+    private var condition: Condition
+    private var entered: Bool = false
+    private var released: Bool = false
+
+    init() {
+        synchronized(this.lock) { this.condition = this.lock.condition() }
+    }
+
+    func enterAndWait(): Unit {
+        synchronized(this.lock) {
+            this.entered = true
+            this.condition.notifyAll()
+            while (!this.released) { this.condition.wait() }
+        }
+    }
+
+    func awaitEntered(timeoutMs: Int64): Bool {
+        let deadline = managedStdioTestNowMs() + timeoutMs
+        synchronized(this.lock) {
+            while (!this.entered) {
+                let remaining = deadline - managedStdioTestNowMs()
+                if (remaining <= 0) { return false }
+                let _ = this.condition.wait(timeout: Duration.millisecond * remaining)
+            }
+            true
+        }
+    }
+
+    func release(): Unit {
+        synchronized(this.lock) {
+            this.released = true
+            this.condition.notifyAll()
+        }
+    }
+}
+
 private class ManagedStdioTestSubscriber <: ManagedStdioOwnerSubscriber {
     private let lock = Mutex()
     private let events = ArrayList<ManagedStdioEvent>()
@@ -805,5 +843,84 @@ public class ManagedStdioBrokerTest {
         let closeStarted = managedStdioTestNowMs()
         @Expect(missing.close(timeoutMs: 100).ok, true)
         @Expect(managedStdioTestNowMs() - closeStarted < 1000, true)
+    }
+
+    @TestCase
+    public func p3N5GenerationBoundProbeNeverTouchesConcurrentReplacement(): Unit {
+        let recording = RecordingManagedStdioPlatformRunner()
+        let client = ManagedStdioBrokerClient(platformRunner: recording, brokerTestMode: true)
+        let gate = ManagedStdioTestGate()
+        var delayedProbe = None<Future<ManagedStdioOperationResult>>
+        try {
+            let old = client.startOwner(ManagedStdioOwnerSpec(
+                "generation-probe-old",
+                "node",
+                args: ["-e", "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"],
+                stdinMode: "closed",
+                deadlineMs: 10000
+            ))
+            @Expect(old.ok, true)
+            @Expect(client.debugHangBrokerForTest(), true)
+            delayedProbe = Some(spawn {
+                gate.enterAndWait()
+                client.probeBrokerForGeneration(old.generation, timeoutMs: 80)
+            })
+            @Expect(gate.awaitEntered(2000), true)
+
+            client.debugKillBrokerForTest()
+            @Expect(managedStdioWaitUntil(3000, { => !client.debugSnapshotForTest().running }), true)
+            @Expect(managedStdioWaitUntil(2000, {
+                =>
+                match (client.readOwnerLine("generation-probe-old", timeoutMs: 50)) {
+                    case Some(event) => event.eventType == "owner.error"
+                    case None => false
+                }
+            }), true)
+            @Expect(client.readOwnerLine("generation-probe-old", timeoutMs: 0).isNone(), true)
+
+            let replacement = client.startOwner(ManagedStdioOwnerSpec(
+                "generation-probe-replacement",
+                "node",
+                args: ["-e", "setInterval(()=>{},1000)"],
+                stdinMode: "closed",
+                deadlineMs: 10000
+            ))
+            @Expect(replacement.ok, true)
+            @Expect(replacement.generation > old.generation, true)
+            let beforeStaleProbe = client.debugSnapshotForTest()
+            let terminationCallsBefore = recording.calls.size
+
+            gate.release()
+            let stale = delayedProbe.getOrThrow().get(Duration.second * 2)
+            delayedProbe = None<Future<ManagedStdioOperationResult>>
+            @Expect(stale.ok, false)
+            @Expect(stale.status, "stale_generation")
+            @Expect(stale.generation, replacement.generation)
+            let afterStaleProbe = client.debugSnapshotForTest()
+            @Expect(afterStaleProbe.generation, beforeStaleProbe.generation)
+            @Expect(afterStaleProbe.brokerPid, beforeStaleProbe.brokerPid)
+            @Expect(afterStaleProbe.running, true)
+            @Expect(afterStaleProbe.responsive, true)
+            @Expect(afterStaleProbe.ownerCount, 1)
+            @Expect(recording.calls.size, terminationCallsBefore)
+
+            @Expect(client.stopOwner(
+                "generation-probe-replacement",
+                timeoutMs: 2000,
+                expectedGeneration: Some(replacement.generation)
+            ).ok, true)
+            @Expect(managedStdioWaitUntil(2000, {
+                =>
+                match (client.readOwnerLine("generation-probe-replacement", timeoutMs: 50)) {
+                    case Some(event) => event.eventType == "owner.exit" || event.eventType == "owner.error"
+                    case None => false
+                }
+            }), true)
+            @Expect(client.readOwnerLine("generation-probe-replacement", timeoutMs: 0).isNone(), true)
+        } finally {
+            gate.release()
+            managedStdioJoinFuture(delayedProbe, 2000)
+            let _ = client.close(timeoutMs: 3000)
+        }
     }
 }

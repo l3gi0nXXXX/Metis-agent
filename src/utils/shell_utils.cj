@@ -1,13 +1,11 @@
 package metis.utils
 
 import magic.log.LogUtils
-
+import metis.process.{ManagedStdioBrokerClient, ManagedStdioOwnerSpec, managedStdioBroker}
 import std.process.*
-import std.fs.{File, Path, remove}
-import std.collection.ArrayList
+import std.fs.Path
 import std.time.*
 import std.sync.*
-import std.io.*
 
 // Timeout exception for shell command execution
 public class ShellTimeoutException <: Exception {
@@ -19,8 +17,190 @@ public class ShellTimeoutException <: Exception {
 public let SHELL_INVALID_RESPONSE_ENCODING_EXIT_CODE: Int64 = 125
 public let SHELL_INVALID_RESPONSE_ENCODING_DIAGNOSTIC: String = "invalid_response_encoding"
 public let SHELL_PROCESS_TREE_DEGRADED_DIAGNOSTIC: String = "process_tree_termination_degraded"
+public let SHELL_BROKER_CLEANUP_FAILED_DIAGNOSTIC: String = "broker_cleanup_failed"
+public let SHELL_CAPTURE_OUTPUT_LIMIT_BYTES: Int64 = 4 * 1024 * 1024
+private let shellBrokerOwnerLock = Mutex()
+private var shellBrokerOwnerSequence: Int64 = 0
+private var shellBrokerProviderForTest: Option<() -> ManagedStdioBrokerClient> = None<() -> ManagedStdioBrokerClient>
+
+private class ShellBrokerCaptureResult {
+    public let status: String
+    public let exitCode: Int64
+    public let stdout: String
+    public let stderr: String
+
+    public init(status: String, exitCode!: Int64 = 1, stdout!: String = "", stderr!: String = "") {
+        this.status = status
+        this.exitCode = exitCode
+        this.stdout = stdout
+        this.stderr = stderr
+    }
+}
+
+private func nextShellBrokerOwnerId(): String {
+    synchronized(shellBrokerOwnerLock) {
+        shellBrokerOwnerSequence += 1
+        "shell-command-${shellBrokerOwnerSequence}"
+    }
+}
+
+private func shellBrokerClient(): ManagedStdioBrokerClient {
+    let provider = synchronized(shellBrokerOwnerLock) {
+        shellBrokerProviderForTest
+    }
+    match (provider) {
+        case Some(value) => value()
+        case None => managedStdioBroker()
+    }
+}
+
+public func debugSetShellBrokerProviderForTest(provider: Option<() -> ManagedStdioBrokerClient>): Unit {
+    synchronized(shellBrokerOwnerLock) {
+        shellBrokerProviderForTest = provider
+    }
+}
 
 public class ShellUtils {
+    private static func durationMilliseconds(timeout: Duration): Int64 {
+        let nanos = timeout.toNanoseconds()
+        max(1, nanos / 1000000 + if (nanos % 1000000 == 0) {
+            0
+        } else {
+            1
+        })
+    }
+
+    private static func executeCapturedWithBroker(
+        cmd: String,
+        cmdArgs: Array<String>,
+        timeoutMs: Int64,
+        workDir: Option<Path>
+    ): ShellBrokerCaptureResult {
+        let broker = shellBrokerClient()
+        let ownerId = nextShellBrokerOwnerId()
+        let started = broker.startOwner(
+            ManagedStdioOwnerSpec(
+                ownerId,
+                cmd,
+                args: cmdArgs,
+                workingDirectory: match (workDir) {
+                    case Some(value) => Some(value.toString())
+                    case None => None<String>
+                },
+                stdinMode: "closed",
+                outputMode: "stream",
+                deadlineMs: max(1, timeoutMs),
+                maxLineBytes: SHELL_CAPTURE_OUTPUT_LIMIT_BYTES,
+                maxBufferedBytes: SHELL_CAPTURE_OUTPUT_LIMIT_BYTES,
+                maxTotalOutputBytes: SHELL_CAPTURE_OUTPUT_LIMIT_BYTES
+            )
+        )
+        if (!started.ok) {
+            return ShellBrokerCaptureResult(started.status, stderr: started.status)
+        }
+        let stdout = StringBuilder()
+        let stderr = StringBuilder()
+        // Total bound: command deadline + 3s broker TERM/KILL collection grace,
+        // followed by at most 1.5s stop and 1.5s terminal/event drain.
+        let collectionDeadline = DateTime.now().toUnixTimeStamp().toMilliseconds() + max(1, timeoutMs) + 3000
+        var terminalConsumed = false
+        var loopDone = false
+        var cleanupComplete = false
+        var outcome = ShellBrokerCaptureResult(
+            "timed_out", exitCode: 124, stdout: stdout.toString(), stderr: stderr.toString())
+        try {
+            while (!loopDone && DateTime.now().toUnixTimeStamp().toMilliseconds() < collectionDeadline) {
+                match (broker.readOwnerLine(ownerId, timeoutMs: 250)) {
+                    case Some(event) =>
+                        if (event.eventType == "owner.stdout") {
+                            stdout.append(event.text)
+                        } else if (event.eventType == "owner.stderr") {
+                            stderr.append(event.text)
+                        } else if (event.eventType == "owner.exit") {
+                            terminalConsumed = true
+                            loopDone = true
+                            outcome = ShellBrokerCaptureResult("exited", exitCode: event.exitCode,
+                                stdout: stdout.toString(), stderr: stderr.toString())
+                        } else if (event.eventType == "owner.timeout") {
+                            terminalConsumed = true
+                            loopDone = true
+                            outcome = ShellBrokerCaptureResult("timed_out", exitCode: 124, stdout: stdout.toString(),
+                                stderr: stderr.toString())
+                        } else if (event.eventType == "owner.error") {
+                            terminalConsumed = true
+                            loopDone = true
+                            let diagnostic = if (event.status.isEmpty()) {
+                                "broker_error"
+                            } else {
+                                event.status
+                            }
+                            outcome = ShellBrokerCaptureResult(diagnostic, stdout: stdout.toString(), stderr: diagnostic)
+                        }
+                    case None =>
+                        let snapshot = broker.snapshot()
+                        if (snapshot.generation != started.generation || !snapshot.running || !snapshot.responsive) {
+                            loopDone = true
+                            outcome = ShellBrokerCaptureResult("broker_unavailable", stdout: stdout.toString(),
+                                stderr: "broker_unavailable")
+                        }
+                }
+            }
+            if (!loopDone) {
+                outcome = ShellBrokerCaptureResult(
+                    "timed_out", exitCode: 124, stdout: stdout.toString(), stderr: stderr.toString())
+            }
+        } finally {
+            // Stop and drain each receive a separate 1.5s cleanup budget. Draining the unique,
+            // never-reused owner is required to remove its settled broker record.
+            let stopped = broker.stopOwner(ownerId, timeoutMs: 1500, expectedGeneration: Some(started.generation))
+            let drainDeadline = DateTime.now().toUnixTimeStamp().toMilliseconds() + 1500
+            var terminalDrained = terminalConsumed || stopped.status == "already_stopped"
+            while (!terminalDrained && DateTime.now().toUnixTimeStamp().toMilliseconds() < drainDeadline) {
+                match (broker.readOwnerLine(ownerId, timeoutMs: 100)) {
+                    case Some(event) => terminalDrained = event.eventType == "owner.exit" || event.eventType ==
+                        "owner.timeout" || event.eventType == "owner.error"
+                    case None =>
+                        let snapshot = broker.snapshot()
+                        terminalDrained = stopped.ok || snapshot.generation != started.generation || !snapshot.running
+                }
+            }
+            if (!terminalDrained) {
+                let snapshot = broker.snapshot()
+                terminalDrained = snapshot.generation != started.generation || !snapshot.running
+            }
+            cleanupComplete = terminalDrained
+        }
+        if (!cleanupComplete) {
+            // A missing terminal after the owner stop budget means the broker may no
+            // longer be servicing this generation. Probe only the generation that
+            // launched this owner. The broker's existing unresponsive path reaps
+            // every process tree from that failed generation; a concurrently started
+            // replacement generation is never stopped here.
+            let stalled = broker.snapshot()
+            if (stalled.generation == started.generation && stalled.running) {
+                let _ = broker.probeBrokerForGeneration(started.generation, timeoutMs: 500)
+            }
+            let recoveryDeadline = DateTime.now().toUnixTimeStamp().toMilliseconds() + 1500
+            var oldRecordRemoved = false
+            while (!oldRecordRemoved &&
+                DateTime.now().toUnixTimeStamp().toMilliseconds() < recoveryDeadline) {
+                match (broker.readOwnerLine(ownerId, timeoutMs: 100)) {
+                    case Some(_) => ()
+                    case None => oldRecordRemoved = true
+                }
+            }
+            let recovered = broker.snapshot()
+            cleanupComplete = oldRecordRemoved &&
+                (recovered.generation != started.generation || !recovered.running)
+            return ShellBrokerCaptureResult(
+                SHELL_BROKER_CLEANUP_FAILED_DIAGNOSTIC,
+                stdout: outcome.stdout,
+                stderr: SHELL_BROKER_CLEANUP_FAILED_DIAGNOSTIC
+            )
+        }
+        outcome
+    }
+
     private static func buildCommandArgs(command: Array<String>, withWrap: Bool, usePowerShellOnWindows: Bool): (String, Array<String>) {
         if (!withWrap) {
             let args: Array<String> = if (command.size > 1) { command[1..] } else { [] }
@@ -73,73 +253,24 @@ public class ShellUtils {
             case Some(_) => ()
         }
 
-        let process = launch(
-            cmd,
-            cmdArgs,
-            stdOut: ProcessRedirect.Pipe,
-            stdErr: ProcessRedirect.Pipe,
-            workingDirectory: workDir
-        )
-
-        let stdoutFuture = spawn {
-            let reader = StringReader(process.stdOutPipe)
-            try {
-                return reader.readToEnd()
-            } catch (e: Exception) {
-                LogUtils.debug("[ShellUtils] Failed to read stdout: ${e}")
-                return ""
-            }
-        }
-        let stderrFuture = spawn {
-            let reader = StringReader(process.stdErrPipe)
-            try {
-                return reader.readToEnd()
-            } catch (e: Exception) {
-                LogUtils.debug("[ShellUtils] Failed to read stderr: ${e}")
-                return ""
-            }
-        }
-
-        try {
-            let exitCode = process.wait(timeout: timeout)
-            let stdout = try {
-                stdoutFuture.get()
-            } catch (e: Exception) {
-                LogUtils.debug("[ShellUtils] Failed to collect stdout: ${e}")
-                ""
-            }
-            let stderr = try {
-                stderrFuture.get()
-            } catch (e: Exception) {
-                LogUtils.debug("[ShellUtils] Failed to collect stderr: ${e}")
-                ""
-            }
-
-            if (exitCode != 0 && logFailures) {
-                LogUtils.error("Shell command execution failed: ${exitCode}")
-                LogUtils.error("  ${cmd} ${String.join(cmdArgs, delimiter: ' ')}")
-            }
-            return (exitCode, stdout, stderr)
-        } catch(ex: TimeoutException) {
-            try {
-                process.terminate(force: true)
-            } catch (terminateErr: Exception) {
-                LogUtils.debug("[ShellUtils] Failed to terminate process after timeout: ${terminateErr}")
-            }
-            // Ensure pipe readers exit before bubbling up
-            try { stdoutFuture.get() } catch (_: Exception) { }
-            try { stderrFuture.get() } catch (_: Exception) { }
+        let result = executeCapturedWithBroker(cmd, cmdArgs, durationMilliseconds(timeout.getOrThrow()), workDir)
+        if (result.status == "timed_out") {
             throw ShellTimeoutException("Shell command execution timed out")
         }
+        if (result.status == SHELL_INVALID_RESPONSE_ENCODING_DIAGNOSTIC) {
+            return (SHELL_INVALID_RESPONSE_ENCODING_EXIT_CODE, "", SHELL_INVALID_RESPONSE_ENCODING_DIAGNOSTIC)
+        }
+        if (result.exitCode != 0 && logFailures) {
+            LogUtils.error("Shell command execution failed: ${result.exitCode}")
+        }
+        (result.exitCode, result.stdout, result.stderr)
     }
 
     /**
      * Execute a non-interactive shell command with a millisecond deadline.
      *
-     * `Process.terminate` only terminates the wrapper shell. A command such as
-     * `sleep 30` can otherwise keep inherited pipes open and make output readers
-     * wait until the child exits naturally. On Unix this wrapper recursively
-     * terminates descendants before returning the conventional timeout code 124.
+     * The managed stdio broker owns the command process group, drains both
+     * output streams, and reaps descendants before returning timeout code 124.
      */
     public static func executeWithDeadline(
         command: String,
@@ -157,78 +288,30 @@ public class ShellUtils {
                 logFailures: false
             )
         }
-        let seconds = "${effective / 1000}.${(effective % 1000).toString().padStart(3, padding: "0")}"
-        let nonce = "${DateTime.now().toUnixTimeStamp().toNanoseconds()}-${Thread.currentThread.id}"
-        let stdoutPath = Path("/tmp/metis-shell-deadline-${nonce}.out")
-        let stderrPath = Path("/tmp/metis-shell-deadline-${nonce}.err")
-        let wrapper = """
-kill_tree() {
-  child_pids=$("$5" -P "$1" 2>/dev/null)
-  kill -TERM "$1" 2>/dev/null || true
-  for child_pid in $child_pids; do
-    kill_tree "$child_pid"
-  done
-  kill -KILL "$1" 2>/dev/null || true
-}
-umask 077
-/bin/sh -c "$1" >>"$3" 2>>"$4" &
-command_pid=$!
-if [ -x "$5" ]; then
-  ( sleep "$2"; kill_tree "$command_pid" ) </dev/null >/dev/null 2>&1 &
-else
-  printf '%s\n' 'process_tree_termination_degraded' >>"$4"
-  ( sleep "$2"; kill -TERM "$command_pid" 2>/dev/null || true; kill -KILL "$command_pid" 2>/dev/null || true ) </dev/null >/dev/null 2>&1 &
-fi
-watchdog_pid=$!
-wait "$command_pid"
-status=$?
-kill "$watchdog_pid" 2>/dev/null || true
-wait "$watchdog_pid" 2>/dev/null || true
-if [ "$status" -ge 128 ]; then
-  exit 124
-fi
-exit "$status"
-"""
-        try {
-            let result = execute(
-                [
-                    "/bin/sh", "-c", wrapper, "metis-deadline", command, seconds,
-                    stdoutPath.toString(), stderrPath.toString(), pgrepPath
-                ],
-                timeout: Some(Duration.millisecond * (effective + 500)),
-                workDir: workDir,
-                withWrap: false,
-                logFailures: false
-            )
-            var invalidEncoding = false
-            let stdout = try {
-                String.fromUtf8(File.readFrom(stdoutPath))
-            } catch (_: Exception) {
-                invalidEncoding = true
-                ""
-            }
-            let stderr = try {
-                String.fromUtf8(File.readFrom(stderrPath))
-            } catch (_: Exception) {
-                invalidEncoding = true
-                ""
-            }
-            if (invalidEncoding) {
-                LogUtils.debug("[ShellUtils] shell output decode failed: invalid_response_encoding")
-                return (
-                    SHELL_INVALID_RESPONSE_ENCODING_EXIT_CODE,
-                    "",
-                    SHELL_INVALID_RESPONSE_ENCODING_DIAGNOSTIC
-                )
-            }
-            if (stderr.contains(SHELL_PROCESS_TREE_DEGRADED_DIAGNOSTIC)) {
-                LogUtils.debug("[ShellUtils] process tree termination degraded: pgrep unavailable")
-            }
-            return (result[0], stdout, stderr)
-        } finally {
-            try { remove(stdoutPath) } catch (_: Exception) { () }
-            try { remove(stderrPath) } catch (_: Exception) { () }
+        let result = executeCapturedWithBroker("/bin/sh", ["-c", command], effective, workDir)
+        if (result.status == SHELL_INVALID_RESPONSE_ENCODING_DIAGNOSTIC) {
+            LogUtils.debug("[ShellUtils] shell output decode failed: invalid_response_encoding")
+            return (SHELL_INVALID_RESPONSE_ENCODING_EXIT_CODE, "", SHELL_INVALID_RESPONSE_ENCODING_DIAGNOSTIC)
         }
+        var stderr = result.stderr
+        let pgrepExecutable = try {
+            executeWithOutput("/bin/test", ["-x", pgrepPath])[0] == 0
+        } catch (_: Exception) {
+            false
+        }
+        if (!pgrepExecutable) {
+            stderr = if (stderr.isEmpty()) {
+                SHELL_PROCESS_TREE_DEGRADED_DIAGNOSTIC
+            } else {
+                "${stderr}\n${SHELL_PROCESS_TREE_DEGRADED_DIAGNOSTIC}"
+            }
+            LogUtils.debug("[ShellUtils] process tree termination degraded: compatibility pgrep path unavailable")
+        }
+        (if (result.status == "timed_out") {
+                124
+            } else {
+                result.exitCode
+            }, result.stdout, stderr)
     }
 
     /**

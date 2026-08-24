@@ -415,6 +415,7 @@ public class ManagedStdioBrokerClient {
     private var brokerPid: Int64 = 0
     private var helloReceived: Bool = false
     private var lastPongId: String = ""
+    private var lastTestHangId: String = ""
     private var status: String = "stopped"
     private var readerCount: Int64 = 0
     private var requestSequence: Int64 = 0
@@ -1064,37 +1065,91 @@ public class ManagedStdioBrokerClient {
     public func probeBroker(timeoutMs!: Int64 = MANAGED_STDIO_BROKER_PING_TIMEOUT_MS): ManagedStdioOperationResult {
         let ready = this.ensureBrokerRunning(timeoutMs: timeoutMs)
         if (!ready.ok) { return ready }
-        let requestId = synchronized(this.lock) {
-            this.requestSequence += 1
-            "ping-${this.generation}-${this.requestSequence}"
+        this.probeBrokerForGeneration(ready.generation, timeoutMs: timeoutMs)
+    }
+
+    public func probeBrokerForGeneration(
+        expectedGeneration: Int64,
+        timeoutMs!: Int64 = MANAGED_STDIO_BROKER_PING_TIMEOUT_MS
+    ): ManagedStdioOperationResult {
+        let selected = synchronized(this.lock) {
+            if (this.generation != expectedGeneration) {
+                ("", ManagedStdioOperationResult(
+                    false, "stale_generation", generation: this.generation, pid: this.brokerPid))
+            } else {
+                let available = match (this.process) {
+                    case Some(proc) => proc.isAlive() && this.helloReceived && !this.closing
+                    case None => false
+                }
+                if (!available) {
+                    ("", ManagedStdioOperationResult(
+                        false, "broker_exited", generation: expectedGeneration, pid: this.brokerPid))
+                } else {
+                    this.requestSequence += 1
+                    let requestId = "ping-${expectedGeneration}-${this.requestSequence}"
+                    (requestId, ManagedStdioOperationResult(
+                        true, "ready", generation: expectedGeneration, pid: this.brokerPid))
+                }
+            }
         }
+        if (selected[0].isEmpty()) {
+            if (selected[1].status == "broker_exited") {
+                this.handleBrokerExit(expectedGeneration, "broker_exited")
+            }
+            return selected[1]
+        }
+        let requestId = selected[0]
         let frame = JsonObject()
         frame.put("type", JsonString("broker.ping"))
         frame.put("requestId", JsonString(requestId))
-        if (!this.writeFrame(frame)) { return ManagedStdioOperationResult(false, "broker_exited", generation: ready.generation) }
+        if (!this.writeFrameForGeneration(frame, expectedGeneration)) {
+            let current = this.snapshot()
+            if (current.generation != expectedGeneration) {
+                return ManagedStdioOperationResult(
+                    false, "stale_generation", generation: current.generation, pid: current.brokerPid)
+            }
+            this.handleBrokerExit(expectedGeneration, "broker_exited")
+            return ManagedStdioOperationResult(false, "broker_exited", generation: expectedGeneration)
+        }
         let deadline = this.nowMs() + max(1, timeoutMs)
         let result = synchronized(this.lock) {
-            var outcome = ManagedStdioOperationResult(true, "ready", generation: this.generation, pid: this.brokerPid)
+            var outcome = ManagedStdioOperationResult(
+                true, "ready", generation: expectedGeneration, pid: this.brokerPid)
             var done = false
             while (!done && this.lastPongId != requestId) {
-                let remaining = deadline - this.nowMs()
-                if (remaining <= 0) {
+                if (this.generation != expectedGeneration) {
+                    outcome = ManagedStdioOperationResult(
+                        false, "stale_generation", generation: this.generation, pid: this.brokerPid)
+                    done = true
+                } else if (deadline - this.nowMs() <= 0) {
                     this.status = "broker_unresponsive"
-                    outcome = ManagedStdioOperationResult(false, "broker_unresponsive", generation: this.generation, pid: this.brokerPid)
+                    outcome = ManagedStdioOperationResult(
+                        false, "broker_unresponsive", generation: expectedGeneration, pid: this.brokerPid)
                     done = true
                 } else {
-                    let _ = this.condition.wait(timeout: Duration.millisecond * remaining)
+                    let _ = this.condition.wait(timeout: Duration.millisecond * (deadline - this.nowMs()))
                 }
             }
             outcome
         }
         if (!result.ok && result.status == "broker_unresponsive") {
-            let proc = synchronized(this.lock) { this.process }
-            match (proc) {
+            let selectedProcess = synchronized(this.lock) {
+                if (this.generation == expectedGeneration) {
+                    (true, this.process)
+                } else {
+                    (false, None<SubProcess>)
+                }
+            }
+            if (!selectedProcess[0]) {
+                let current = this.snapshot()
+                return ManagedStdioOperationResult(
+                    false, "stale_generation", generation: current.generation, pid: current.brokerPid)
+            }
+            match (selectedProcess[1]) {
                 case Some(value) => try { value.terminate(force: true) } catch (_: Exception) { () }
                 case None => ()
             }
-            this.handleBrokerExit(result.generation, "broker_unresponsive")
+            this.handleBrokerExit(expectedGeneration, "broker_unresponsive")
         }
         result
     }
@@ -1191,6 +1246,15 @@ public class ManagedStdioBrokerClient {
                 if (this.generation == readerGeneration) {
                     this.lastPongId = managedStdioJsonString(obj, "requestId")
                     this.status = "ready"
+                    this.condition.notifyAll()
+                }
+            }
+            return
+        }
+        if (frameType == "broker.test-hung") {
+            synchronized(this.lock) {
+                if (this.generation == readerGeneration) {
+                    this.lastTestHangId = managedStdioJsonString(obj, "requestId")
                     this.condition.notifyAll()
                 }
             }
@@ -1392,10 +1456,29 @@ public class ManagedStdioBrokerClient {
         }
     }
 
-    public func debugHangBrokerForTest(): Bool {
+    public func debugHangBrokerForTest(timeoutMs!: Int64 = 1000): Bool {
+        let selected = synchronized(this.lock) {
+            if (!this.brokerTestMode || this.process.isNone() || !this.helloReceived || this.closing) {
+                ("", this.generation)
+            } else {
+                this.requestSequence += 1
+                ("test-hang-${this.generation}-${this.requestSequence}", this.generation)
+            }
+        }
+        if (selected[0].isEmpty()) { return false }
         let frame = JsonObject()
         frame.put("type", JsonString("broker.test-hang"))
-        this.writeFrame(frame)
+        frame.put("requestId", JsonString(selected[0]))
+        if (!this.writeFrameForGeneration(frame, selected[1])) { return false }
+        let deadline = this.nowMs() + max(1, timeoutMs)
+        synchronized(this.lock) {
+            while (this.generation == selected[1] && this.lastTestHangId != selected[0]) {
+                let remaining = deadline - this.nowMs()
+                if (remaining <= 0) { return false }
+                let _ = this.condition.wait(timeout: Duration.millisecond * remaining)
+            }
+            this.generation == selected[1] && this.lastTestHangId == selected[0]
+        }
     }
 
     public func snapshot(): ManagedStdioBrokerSnapshot {

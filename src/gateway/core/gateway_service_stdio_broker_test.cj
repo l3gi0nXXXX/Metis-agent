@@ -3,7 +3,7 @@ package metis.gateway.core
 import metis.core.config.{CliConfig, CliSettingManager, MetisConfigManager, MetisProcessEnvironmentLock}
 import metis.gateway.model.ChannelPolicyConfig
 import metis.gateway.process.{gatewayStdioBrokerReady, gatewayStdioBrokerSnapshot}
-import metis.process.ManagedStdioOperationResult
+import metis.process.{ManagedStdioOperationResult, resetManagedStdioBrokerForTest}
 import std.collection.HashMap
 import std.env.{getVariable, setVariable}
 import std.fs.{Directory, Path, remove}
@@ -36,6 +36,7 @@ private func withGatewayStdioBrokerTestHome<T>(block: () -> T): T {
                 case Some(value) => setVariable("METIS_STDIO_BROKER_NODE_COMMAND", value)
                 case None => setVariable("METIS_STDIO_BROKER_NODE_COMMAND", "")
             }
+            let _ = resetManagedStdioBrokerForTest(timeoutMs: 3000)
             CliConfig.invalidatePathCache()
             MetisConfigManager.invalidate()
             CliSettingManager.invalidate()

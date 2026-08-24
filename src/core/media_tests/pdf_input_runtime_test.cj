@@ -1,6 +1,7 @@
 package metis.core.media_tests
 
 import metis.core.*
+import metis.process.managedStdioResolveBrokerScriptPath
 
 import std.collection.ArrayList
 import std.fs.{Directory, File, Path, remove}
@@ -15,6 +16,10 @@ private func pdfInputTestTempRoot(label: String): Path {
 
 private func pdfInputTestBytes(): Array<Byte> {
     "%PDF-1.7\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n".toArray()
+}
+
+private func pdfInputFakeCommandPath(): String {
+    Path(managedStdioResolveBrokerScriptPath()).parent.join("gateway-stdio-fake-command-child.mjs").toString()
 }
 
 private func pdfInputTestExpectThrowsContains(run: () -> Unit, expected: String): Unit {
@@ -195,6 +200,24 @@ public class PdfInputRuntimeTest {
         } finally {
             setPdfExtractorBridgeRunnerForTest(None<(PdfExtractorBridgeRequest) -> PdfExtractorProcessResult>)
         }
+    }
+
+    @TestCase
+    public func p3P5PdfExtractorDefaultRunnerUsesFormalTimedShellPath(): Unit {
+        let result = extractPdfWithNodeBridge(
+            "/tmp/p3-shell-fake.pdf",
+            pageNumbers: [1],
+            timeoutMs: 2000,
+            helperPath: pdfInputFakeCommandPath(),
+            nodeCommand: "node"
+        )
+
+        @Expect(result.ok, true)
+        @Expect(result.status, "ok")
+        @Expect(result.text, "中文🙂pdf")
+        @Expect(result.pageCount, 1)
+        @Expect(result.selectedPages.size, 1)
+        @Expect(result.selectedPages[0], 1)
     }
 
     @TestCase

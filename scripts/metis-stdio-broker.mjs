@@ -342,7 +342,15 @@ export class StdioBroker {
     } else if (frame.type === 'broker.close') {
       this.closeBroker();
     } else if (frame.type === 'broker.test-hang') {
-      if (this.testMode) this.hung = true;
+      if (this.testMode && safeRequestId(frame.requestId)) {
+        this.frame('broker.test-hung', { requestId: frame.requestId }, () => {
+          for (const owner of this.owners.values()) {
+            if (owner.timer) clearTimeout(owner.timer);
+            owner.timer = null;
+          }
+          this.hung = true;
+        });
+      } else if (this.testMode) this.diagnostic('invalid_control_frame');
       else this.diagnostic('unsupported_frame', frame.requestId);
     } else {
       this.diagnostic('unsupported_frame', frame.requestId);

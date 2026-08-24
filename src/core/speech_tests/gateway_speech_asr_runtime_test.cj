@@ -1,9 +1,10 @@
 package metis.core.speech_tests
 
 import metis.core.*
+import metis.process.managedStdioResolveBrokerScriptPath
 
 import std.collection.ArrayList
-import std.fs.{Directory, File, Path}
+import std.fs.{Directory, File, Path, remove}
 import std.env.{getVariable, setVariable}
 import std.time.*
 import std.unittest.*
@@ -13,6 +14,10 @@ private func asrTestTempRoot(label: String): Path {
     let root = Path("/tmp/metis-speech-asr-runtime-${label}-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
     Directory.create(root, recursive: true)
     root
+}
+
+private func asrTestFakeCommandPath(): String {
+    Path(managedStdioResolveBrokerScriptPath()).parent.join("gateway-stdio-fake-command-child.mjs").toString()
 }
 
 private func asrTestProvider(command: Array<String>, timeoutMs!: Int64 = 3000): JsonObject {
@@ -111,6 +116,27 @@ public class GatewaySpeechAsrRuntimeTest {
         @Expect(asrTestString(result, "status"), "ok")
         @Expect(asrTestString(result, "transcript"), "stdout transcript")
         @Expect(asrTestString(result, "providerKind"), "command")
+    }
+
+    @TestCase
+    public func p3P5AsrDefaultCommandRunnerUsesFormalTimedShellPath(): Unit {
+        let root = asrTestTempRoot("p3-shell-command")
+        try {
+            let audio = root.join("voice.ogg")
+            File.writeTo(audio, "fake-audio".toArray())
+            let provider = asrTestProvider([
+                "node", asrTestFakeCommandPath(), "exit", "0", "中文🙂asr", ""
+            ])
+            let result = gatewaySpeechAsrTranscribeAudioPath(
+                asrTestConfig("local", provider), audio.toString(), "audio/ogg", outputRoot: root, maxBytes: 8192
+            )
+
+            @Expect(asrTestBool(result, "ok"), true)
+            @Expect(asrTestString(result, "transcript"), "中文🙂asr")
+            @Expect(asrTestString(result, "providerKind"), "command")
+        } finally {
+            try { remove(root, recursive: true) } catch (_: Exception) { () }
+        }
     }
 
     @TestCase

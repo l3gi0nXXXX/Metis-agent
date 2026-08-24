@@ -115,6 +115,27 @@ public class GatewayShellToolsetCronPolicyTest {
     }
 
     @TestCase
+    public func p3N5DeadlineShellReportsDegradedTreeTerminationWhenPgrepIsNotExecutable(): Unit {
+        let fakePgrep = Path(
+            "/tmp/metis-shell-non-executable-pgrep-${DateTime.now().toUnixTimeStamp().toNanoseconds()}"
+        )
+        try {
+            File.writeTo(fakePgrep, "not executable".toArray())
+            let result = ShellUtils.executeWithDeadline(
+                "printf ok",
+                1000,
+                pgrepPath: fakePgrep.toString()
+            )
+            @Expect(result[0], 0)
+            @Expect(result[1], "ok")
+            @Expect(result[2].contains(SHELL_PROCESS_TREE_DEGRADED_DIAGNOSTIC), true)
+            @Expect(result[2].contains(fakePgrep.toString()), false)
+        } finally {
+            try { remove(fakePgrep) } catch (_: Exception) { () }
+        }
+    }
+
+    @TestCase
     public func cronAllowlistCurlShellToolExecutesWithoutInteractiveConfirmation(): Unit {
         let out = gatewayWithToolRuntimeContext(
             GatewayToolRuntimeContext(

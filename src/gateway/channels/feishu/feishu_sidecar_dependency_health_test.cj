@@ -158,6 +158,26 @@ public class FeishuSidecarDependencyHealthTest {
     }
 
     @TestCase
+    public func p3P5DefaultDependencyProbeUsesFormalTimedShellPath(): Unit {
+        let root = feishuHealthTestTempRoot("default-command-probe")
+        try {
+            feishuHealthCreateProject(root)
+            let runtimeRoot = root.join("tools").join("feishu-sidecar")
+            feishuHealthCreateRuntimePackage(runtimeRoot)
+            feishuHealthCreateFakeNodeModules(runtimeRoot)
+
+            let health = feishuSidecarDependencyHealth(projectRoot: root, runtimeRoot: runtimeRoot)
+
+            @Expect(health.status, "ready")
+            @Expect(health.ready, true)
+            @Expect(health.nodeVersion.isEmpty(), false)
+            @Expect(health.npmVersion.isEmpty(), false)
+        } finally {
+            try { remove(root, recursive: true) } catch (_: Exception) { () }
+        }
+    }
+
+    @TestCase
     public func readmeDocumentsSidecarDependencyInstallWithoutNativeNoNodeClaim(): Unit {
         @Expect(exists(Path("README.md")), true)
         let readme = String.fromUtf8(File.readFrom(Path("README.md")))
