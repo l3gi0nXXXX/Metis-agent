@@ -47,6 +47,35 @@ private class ServicePluginTestGate {
             this.condition.notifyAll()
         }
     }
+
+    func signal(): Unit {
+        synchronized(this.lock) {
+            this.entered = true
+            this.condition.notifyAll()
+        }
+    }
+}
+
+private class ServicePluginTestOnce {
+    private let lock = Mutex()
+    private var pending = true
+
+    func take(): Bool {
+        synchronized(this.lock) {
+            if (!this.pending) { return false }
+            this.pending = false
+            true
+        }
+    }
+}
+
+private class ServicePluginTestCounter {
+    private let lock = Mutex()
+    private var value: Int64 = 0
+
+    func increment(): Unit { synchronized(this.lock) { this.value++ } }
+
+    func get(): Int64 { synchronized(this.lock) { this.value } }
 }
 
 @Test
@@ -287,18 +316,19 @@ public class ServicePluginHostTest {
 
     private func settleServiceOwnerCleanup(serviceId: String, timeoutMillis!: Int64 = 2000): (Bool, String, Bool, Bool) {
         var retryStatus = "not_needed"
-        let retryNeeded = servicePluginCleanupPendingCountForTest() > 0
-        if (retryNeeded) {
-            let retried = stopServicePlugin(serviceId, reason: "test_cleanup_retry", timeoutMillis: timeoutMillis)
-            retryStatus = retried.status
-        }
         let deadline = DateTime.now().toUnixTimeStamp().toMilliseconds() + timeoutMillis
+        var retryNeeded = false
         while (DateTime.now().toUnixTimeStamp().toMilliseconds() < deadline) {
             let pidCleared = match (getServicePluginSnapshot(serviceId)) {
                 case Some(snapshot) => snapshot.pid == 0
                 case None => true
             }
             if (pidCleared && managedStdioBroker().snapshot().ownerCount == 0) { return (retryNeeded, retryStatus, true, true) }
+            if (!retryNeeded && servicePluginCleanupPendingCountForTest() > 0) {
+                retryNeeded = true
+                let remaining = max(1, deadline - DateTime.now().toUnixTimeStamp().toMilliseconds())
+                retryStatus = stopServicePlugin(serviceId, reason: "test_cleanup_retry", timeoutMillis: remaining).status
+            }
             sleep(Duration.millisecond * 10)
         }
         let pidCleared = match (getServicePluginSnapshot(serviceId)) {
@@ -488,7 +518,8 @@ public class ServicePluginHostTest {
         mode: String,
         pluginId!: String = "stdio-service",
         capabilityId!: String = "stdio.monitor.status",
-        resetHost!: Bool = true
+        resetHost!: Bool = true,
+        enabled!: Bool = true
     ): Unit {
         if (resetHost) { resetServicePluginHostForTest() }
         let caps = ArrayList<ServiceCapabilityRecord>()
@@ -510,7 +541,7 @@ public class ServicePluginHostTest {
             hasConfigSchema: true,
             capabilityDeclarations: caps
         )
-        let result = registerServicePlugin(ServicePluginRegistration(manifest))
+        let result = registerServicePlugin(ServicePluginRegistration(manifest, enabled: enabled))
         @Expect(result.ok, true)
     }
 
@@ -1811,61 +1842,84 @@ public class ServicePluginHostTest {
     @TestCase
     public func s3B1DispatchPastReserveIsCleanupPendingUntilExactRetry(): Unit {
         withServicePluginHostTestHome("s3-b1-dispatch-reserve", { home: Path =>
-            let stopFrameMarker = home.join("stop-frame.marker")
-            let dispatchGate = ServicePluginTestGate()
             let oldStopFrameMarker = getVariable("METIS_STDIO_FIXTURE_STOP_FRAME_MARKER_PATH")
-            setVariable("METIS_STDIO_FIXTURE_STOP_FRAME_MARKER_PATH", stopFrameMarker.toString())
+            var activeGate = None<ServicePluginTestGate>
             try {
-                // timeout=200ms reserves 100ms for owner reap. These assertions
-                // pin the exact remaining-reserve boundary without wall-clock jitter.
                 @Expect(servicePluginDispatchBudgetForTest(99, 100), 0)
                 @Expect(servicePluginDispatchBudgetForTest(100, 100), 0)
                 @Expect(servicePluginDispatchBudgetForTest(101, 100), 1)
-                this.registerBrokerServiceFixture(
-                    "gcm-stderr-burst-16",
-                    pluginId: "gitcode-monitor",
-                    capabilityId: "gitcode.monitor.status"
-                )
-                setServicePluginBeforeEventDispatchHookForTest(Some({ _serviceId: String =>
-                    dispatchGate.enterAndWait()
-                }))
-                setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent =>
-                    let rows = ArrayList<ServicePluginDeliveryTarget>()
-                    rows.add(ServicePluginDeliveryTarget("feishu", "s3-account", "s3-peer"))
-                    rows
-                }))
-                setServicePluginWebhookGeneratedReplyHandlerForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent, _target: ServicePluginDeliveryTarget =>
-                    ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "边界中文🙂")
-                }))
-                setServicePluginEventDeliveryForTest(Some({ _target: ServicePluginDeliveryTarget, _text: String =>
-                    ServicePluginEventDeliveryResult(true, "sent")
-                }))
-                @Expect(invokeRegisteredCapability(CapabilityInvokeRequest("gitcode.monitor.status", payload: "{}")).ok, true)
-                @Expect(dispatchGate.awaitEntered(2000), true)
-
-                setServicePluginDispatchRemainingForTest(Some({ => Int64(99) }))
-                let pending = stopServicePlugin("gitcode-monitor", reason: "边界中文🙂", timeoutMillis: 200)
-                @Expect(this.waitForFile(stopFrameMarker, timeoutMillis: 100), true)
-                @Expect(pending.ok, false)
-                @Expect(pending.status, "cleanup_pending")
-                @Expect(pending.ingressStopStatus, "sent")
-                @Expect(pending.dispatchStatus, "dispatch_pending")
-                @Expect(servicePluginCleanupPendingCountForTest(), 1)
-
-                setServicePluginDispatchRemainingForTest(None<() -> Int64>)
-                dispatchGate.release()
-                let settledDeadline = DateTime.now().toUnixTimeStamp().toMilliseconds() + 2000
-                while (servicePluginCleanupPendingCountForTest() > 0 && DateTime.now().toUnixTimeStamp().toMilliseconds() < settledDeadline) {
-                    sleep(Duration.millisecond * 10)
+                for (remaining in [Int64(99), Int64(100), Int64(101)]) {
+                    let stopFrameMarker = home.join("stop-frame-${remaining}.marker")
+                    let dispatchGate = ServicePluginTestGate()
+                    let settledGate = ServicePluginTestGate()
+                    activeGate = Some(dispatchGate)
+                    setVariable("METIS_STDIO_FIXTURE_STOP_FRAME_MARKER_PATH", stopFrameMarker.toString())
+                    this.registerBrokerServiceFixture(
+                        "gcm-stderr-burst-16",
+                        pluginId: "gitcode-monitor",
+                        capabilityId: "gitcode.monitor.status"
+                    )
+                    setServicePluginBeforeEventDispatchHookForTest(Some({ _serviceId: String => dispatchGate.enterAndWait() }))
+                    setServicePluginDispatchSettledHookForTest(Some({ => settledGate.signal() }))
+                    setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent =>
+                        let rows = ArrayList<ServicePluginDeliveryTarget>()
+                        rows.add(ServicePluginDeliveryTarget("feishu", "s3-account", "s3-peer"))
+                        rows
+                    }))
+                    setServicePluginWebhookGeneratedReplyHandlerForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent, _target: ServicePluginDeliveryTarget =>
+                        ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "边界中文🙂")
+                    }))
+                    setServicePluginEventDeliveryForTest(Some({ _target: ServicePluginDeliveryTarget, _text: String =>
+                        ServicePluginEventDeliveryResult(true, "sent")
+                    }))
+                    @Expect(invokeRegisteredCapability(CapabilityInvokeRequest("gitcode.monitor.status", payload: "{}")).ok, true)
+                    @Expect(dispatchGate.awaitEntered(2000), true)
+                    setServicePluginDispatchRemainingForTest(Some({ => remaining }))
+                    if (remaining == 101) {
+                        setServicePluginBeforeDispatchWaitForTest(Some({ waitMs: Int64 =>
+                            @Expect(waitMs, 1)
+                            dispatchGate.release()
+                            @Expect(settledGate.awaitEntered(1000), true)
+                        }))
+                    }
+                    let stopped = stopServicePlugin("gitcode-monitor", reason: "边界中文🙂", timeoutMillis: 200)
+                    @Expect(this.waitForFile(stopFrameMarker, timeoutMillis: 100), true)
+                    @Expect(stopped.ingressStopStatus, "sent")
+                    if (remaining <= 100) {
+                        @Expect(stopped.ok, false)
+                        @Expect(stopped.status, "cleanup_pending")
+                        @Expect(stopped.dispatchStatus, "dispatch_pending")
+                        @Expect(servicePluginCleanupPendingCountForTest(), 1)
+                        dispatchGate.release()
+                        @Expect(settledGate.awaitEntered(2000), true)
+                        setServicePluginDispatchRemainingForTest(None<() -> Int64>)
+                        let retried = stopServicePlugin("gitcode-monitor", reason: "边界重试", timeoutMillis: 2000)
+                        @Expect(retried.ok, true)
+                        @Expect(retried.status, "stopped")
+                        @Expect(retried.leaseStatus, "stopped")
+                        @Expect(retried.portStatus, "released")
+                    } else {
+                        @Expect(stopped.ok, true)
+                        @Expect(stopped.status, "stopped")
+                        @Expect(stopped.dispatchStatus, "drained")
+                    }
+                    @Expect(servicePluginCleanupPendingCountForTest(), 0)
+                    @Expect(managedStdioBroker().snapshot().ownerCount, 0)
+                    activeGate = None<ServicePluginTestGate>
+                    setServicePluginDispatchRemainingForTest(None<() -> Int64>)
+                    setServicePluginBeforeDispatchWaitForTest(None<(Int64) -> Unit>)
+                    setServicePluginDispatchSettledHookForTest(None<() -> Unit>)
+                    setServicePluginBeforeEventDispatchHookForTest(None<(String) -> Unit>)
+                    setServicePluginWebhookSubscribersProviderForTest(None<(ServicePluginAcceptedGitCodeEvent) -> ArrayList<ServicePluginDeliveryTarget>>)
+                    setServicePluginWebhookGeneratedReplyHandlerForTest(None<(ServicePluginAcceptedGitCodeEvent, ServicePluginDeliveryTarget) -> ServicePluginGeneratedReplyResult>)
+                    setServicePluginEventDeliveryForTest(None)
+                    resetServicePluginHostForTest()
                 }
-                let retried = stopServicePlugin("gitcode-monitor", reason: "边界重试", timeoutMillis: 2000)
-                @Expect(retried.ok, true)
-                @Expect(retried.status, "stopped")
-                @Expect(servicePluginCleanupPendingCountForTest(), 0)
-                @Expect(managedStdioBroker().snapshot().ownerCount, 0)
             } finally {
-                dispatchGate.release()
+                match (activeGate) { case Some(gate) => gate.release() case None => () }
                 setServicePluginDispatchRemainingForTest(None<() -> Int64>)
+                setServicePluginBeforeDispatchWaitForTest(None<(Int64) -> Unit>)
+                setServicePluginDispatchSettledHookForTest(None<() -> Unit>)
                 setServicePluginBeforeEventDispatchHookForTest(None<(String) -> Unit>)
                 setServicePluginWebhookSubscribersProviderForTest(None<(ServicePluginAcceptedGitCodeEvent) -> ArrayList<ServicePluginDeliveryTarget>>)
                 setServicePluginWebhookGeneratedReplyHandlerForTest(None<(ServicePluginAcceptedGitCodeEvent, ServicePluginDeliveryTarget) -> ServicePluginGeneratedReplyResult>)
@@ -1954,15 +2008,203 @@ public class ServicePluginHostTest {
                 @Expect(servicePluginCleanupPendingCountForTest(), 1)
 
                 setServicePluginPortReleaseCommandForTest(Some({ _port: Int64, _pid: Int64, _timeoutMs: Int64 =>
+                    (Int64(125), "", "")
+                }))
+                let invalidEncoding = stopServicePlugin("gitcode-monitor", reason: "listener-invalid-encoding", timeoutMillis: 2000)
+                @Expect(invalidEncoding.ok, false)
+                @Expect(invalidEncoding.status, "cleanup_pending")
+                @Expect(invalidEncoding.leaseStatus, "stopped")
+                @Expect(invalidEncoding.portStatus, "invalid_response_encoding")
+
+                setServicePluginPortReleaseCommandForTest(Some({ _port: Int64, _pid: Int64, _timeoutMs: Int64 =>
+                    (Int64(127), "", "probe unavailable")
+                }))
+                let unavailable = stopServicePlugin("gitcode-monitor", reason: "listener-probe-unavailable", timeoutMillis: 2000)
+                @Expect(unavailable.ok, false)
+                @Expect(unavailable.status, "cleanup_pending")
+                @Expect(unavailable.leaseStatus, "stopped")
+                @Expect(unavailable.portStatus, "port_probe_unavailable")
+
+                setServicePluginPortReleaseCommandForTest(Some({ _port: Int64, _pid: Int64, _timeoutMs: Int64 =>
                     (Int64(1), "", "")
                 }))
                 let retried = stopServicePlugin("gitcode-monitor", reason: "listener-released", timeoutMillis: 2000)
                 @Expect(retried.ok, true)
                 @Expect(retried.status, "stopped")
+                @Expect(retried.ingressStopStatus, "sent")
+                @Expect(retried.dispatchStatus, "drained")
+                @Expect(
+                    retried.ownerStopStatus == "terminated" || retried.ownerStopStatus == "force_terminated" ||
+                    retried.ownerStopStatus == "already_stopped",
+                    true
+                )
+                @Expect(retried.leaseStatus, "stopped")
+                @Expect(retried.portStatus, "released")
                 @Expect(servicePluginCleanupPendingCountForTest(), 0)
                 @Expect(managedStdioBroker().snapshot().ownerCount, 0)
             } finally {
                 setServicePluginPortReleaseCommandForTest(None<(Int64, Int64, Int64) -> (Int64, String, String)>)
+                resetServicePluginHostForTest()
+            }
+        })
+    }
+
+    @TestCase
+    public func s3N1LateCleanupFinalizerCannotOverwriteReplacementIdentity(): Unit {
+        withServicePluginHostTestHome("s3-n1-finalize-identity", { home: Path =>
+            let finalizeGate = ServicePluginTestGate()
+            let firstFinalize = ServicePluginTestOnce()
+            let finalizeEntries = ServicePluginTestCounter()
+            var lateRetry = None<Future<ServiceStopResult>>
+            var concurrentRetry = None<Future<ServiceStopResult>>
+            this.registerBrokerServiceFixture(
+                "gcm",
+                pluginId: "gitcode-monitor",
+                capabilityId: "gitcode.monitor.status"
+            )
+            try {
+                @Expect(ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 3000).ok, true)
+                @Expect(this.waitForGitCodeLease(home, timeoutMillis: 2000), true)
+                setServicePluginPortReleaseCommandForTest(Some({ _port: Int64, _pid: Int64, _timeoutMs: Int64 =>
+                    (Int64(124), "", "probe timeout")
+                }))
+                let pending = stopServicePlugin("gitcode-monitor", reason: "old-owner", timeoutMillis: 2000)
+                @Expect(pending.status, "cleanup_pending")
+                let oldIdentity = servicePluginCleanupPendingIdentityForTest("gitcode-monitor").getOrThrow()
+
+                setServicePluginPortReleaseCommandForTest(Some({ _port: Int64, _pid: Int64, _timeoutMs: Int64 =>
+                    (Int64(1), "", "")
+                }))
+                setServicePluginCleanupFinalizeHookForTest(Some({ _serviceId: String, _cleanupToken: Int64 =>
+                    finalizeEntries.increment()
+                    if (firstFinalize.take()) { finalizeGate.enterAndWait() }
+                }))
+                lateRetry = Some(spawn { stopServicePlugin("gitcode-monitor", reason: "late-old", timeoutMillis: 3000) })
+                @Expect(finalizeGate.awaitEntered(2000), true)
+                concurrentRetry = Some(spawn { stopServicePlugin("gitcode-monitor", reason: "current-old", timeoutMillis: 3000) })
+                finalizeGate.release()
+                let finalized = concurrentRetry.getOrThrow().get(Duration.second * 4)
+                concurrentRetry = None<Future<ServiceStopResult>>
+                @Expect(finalized.ok, true)
+                @Expect(finalized.leaseStatus, "stopped")
+                @Expect(finalized.portStatus, "released")
+                let late = lateRetry.getOrThrow().get(Duration.second * 4)
+                lateRetry = None<Future<ServiceStopResult>>
+                @Expect(late.ok, true)
+                @Expect(finalizeEntries.get(), 1)
+                let replacement = ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 3000)
+                @Expect(replacement.ok, true)
+                let replacementIdentity = servicePluginActiveIdentityForTest("gitcode-monitor").getOrThrow()
+                let replacementPid = getServicePluginSnapshot("gitcode-monitor").getOrThrow().pid
+                @Expect(replacementIdentity[0] == oldIdentity[0], false)
+                @Expect(replacementIdentity[1] >= oldIdentity[1], true)
+                @Expect(replacementIdentity[2] == oldIdentity[2], false)
+                @Expect(replacementPid > 0, true)
+
+                @Expect(servicePluginActiveIdentityForTest("gitcode-monitor").getOrThrow()[0], replacementIdentity[0])
+                @Expect(getServicePluginSnapshot("gitcode-monitor").getOrThrow().pid, replacementPid)
+                @Expect(invokeRegisteredCapability(CapabilityInvokeRequest("gitcode.monitor.status", payload: "{}")).ok, true)
+                @Expect(stopServicePlugin("gitcode-monitor", reason: "replacement-cleanup", timeoutMillis: 3000).ok, true)
+                @Expect(managedStdioBroker().snapshot().ownerCount, 0)
+            } finally {
+                finalizeGate.release()
+                setServicePluginCleanupFinalizeHookForTest(None<(String, Int64) -> Unit>)
+                setServicePluginPortReleaseCommandForTest(None<(Int64, Int64, Int64) -> (Int64, String, String)>)
+                match (lateRetry) {
+                    case Some(future) => try { let _ = future.get(Duration.second * 4) } catch (_: Exception) { () }
+                    case None => ()
+                }
+                match (concurrentRetry) {
+                    case Some(future) => try { let _ = future.get(Duration.second * 4) } catch (_: Exception) { () }
+                    case None => ()
+                }
+                let _ = stopServicePlugin("gitcode-monitor", reason: "test-finally", timeoutMillis: 2000)
+                resetServicePluginHostForTest()
+            }
+        })
+    }
+
+    @TestCase
+    public func s3N1BoundedPidProbeAndMixedShutdownKeepTruthfulStatuses(): Unit {
+        withServicePluginHostTestHome("s3-n1-bounded-probe-shutdown", { home: Path =>
+            this.registerBrokerServiceFixture(
+                "gcm",
+                pluginId: "gitcode-monitor",
+                capabilityId: "gitcode.monitor.status"
+            )
+            try {
+                @Expect(ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 3000).ok, true)
+                @Expect(this.waitForGitCodeLease(home, timeoutMillis: 2000), true)
+                setServicePluginPidProbeCommandForTest(Some({ _pid: Int64, timeoutMs: Int64 =>
+                    @Expect(timeoutMs > 0 && timeoutMs <= 2000, true)
+                    (Int64(124), "", "pid probe timeout")
+                }))
+                let pending = stopServicePlugin("gitcode-monitor", reason: "pid-probe-timeout", timeoutMillis: 2000)
+                @Expect(pending.ok, false)
+                @Expect(pending.status, "cleanup_pending")
+                @Expect(pending.leaseStatus, "stopped")
+                @Expect(pending.portStatus, "released")
+                setServicePluginPidProbeCommandForTest(None<(Int64, Int64) -> (Int64, String, String)>)
+                let retried = stopServicePlugin("gitcode-monitor", reason: "pid-probe-recovered", timeoutMillis: 2000)
+                @Expect(retried.ok, true)
+                @Expect(retried.leaseStatus, "stopped")
+                @Expect(retried.portStatus, "released")
+
+                resetServicePluginHostForTest()
+                this.registerBrokerServiceFixture(
+                    "noise-0",
+                    pluginId: "disabled-service",
+                    capabilityId: "disabled.monitor.status",
+                    enabled: false
+                )
+                this.registerBrokerServiceFixture(
+                    "noise-0",
+                    pluginId: "degraded-service",
+                    capabilityId: "degraded.monitor.status",
+                    resetHost: false
+                )
+                this.registerBrokerServiceFixture(
+                    "gcm",
+                    pluginId: "running-service",
+                    capabilityId: "running.monitor.status",
+                    resetHost: false
+                )
+                markServicePluginDegraded("degraded-service", "test_degraded")
+                @Expect(ensureRegisteredServicePluginStarted("running-service", startupTimeoutMs: 3000).ok, true)
+                let shutdown = shutdownServicePluginHost(reason: "mixed-registry", timeoutMillis: 3000)
+                @Expect(shutdown.ok, true)
+                @Expect(shutdown.status, "stopped")
+                @Expect(shutdown.results.size, 3)
+                var sawDisabled = false
+                var sawDegraded = false
+                var sawRunning = false
+                for (result in shutdown.results) {
+                    if (result.serviceId == "disabled-service") {
+                        sawDisabled = true
+                        @Expect(result.ok, true)
+                        @Expect(result.status, "not_applicable")
+                        @Expect(result.ownerStopStatus, "not_applicable")
+                        @Expect(result.leaseStatus, "not_applicable")
+                        @Expect(result.portStatus, "not_applicable")
+                    } else if (result.serviceId == "degraded-service") {
+                        sawDegraded = true
+                        @Expect(result.ok, true)
+                        @Expect(result.status, "not_applicable")
+                        @Expect(result.ownerStopStatus, "not_applicable")
+                        @Expect(result.leaseStatus, "not_applicable")
+                        @Expect(result.portStatus, "not_applicable")
+                    } else if (result.serviceId == "running-service") {
+                        sawRunning = true
+                        @Expect(result.ok, true)
+                        @Expect(result.status, "stopped")
+                        @Expect(result.leaseStatus, "stopped")
+                        @Expect(result.portStatus, "released")
+                    }
+                }
+                @Expect(sawDisabled && sawDegraded && sawRunning, true)
+                @Expect(managedStdioBroker().snapshot().ownerCount, 0)
+            } finally {
+                setServicePluginPidProbeCommandForTest(None<(Int64, Int64) -> (Int64, String, String)>)
                 resetServicePluginHostForTest()
             }
         })
