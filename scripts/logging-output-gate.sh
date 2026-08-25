@@ -149,6 +149,7 @@ check_file_allowlist \
   "src/gateway/runtime/gateway_external_console.cj" \
   "src/gateway/runtime/demo.cj" \
   "src/gateway/runtime/gateway_cron_cli.cj" \
+  "src/gateway/runtime/gateway_canvas_cli.cj" \
   "src/gateway/runtime/gateway_cli_human_output.cj"
 
 check_file_allowlist \
@@ -162,7 +163,8 @@ check_file_allowlist \
   "Gateway direct toJsonString output" \
   "$direct_json_scan" \
   "$TMP_DIR/direct-json.allowed" \
-  "src/gateway/runtime/gateway_cli.cj"
+  "src/gateway/runtime/gateway_cli.cj" \
+  "src/gateway/runtime/gateway_canvas_cli.cj"
 
 check_file_allowlist \
   "JS stdout protocol/report" \
@@ -175,19 +177,23 @@ check_file_allowlist \
   "scripts/openclaw-compat-real-plugin-smoke.mjs" \
   "scripts/openclaw-compat-security-policy.mjs" \
   "scripts/openclaw-plugin-inventory.mjs" \
-  "scripts/openclaw-plugin-sidecar.mjs"
+  "scripts/openclaw-plugin-sidecar.mjs" \
+  "scripts/gateway-stdio-*"
 
 check_file_allowlist \
   "JS stderr diagnostics" \
   "$sidecar_stderr_scan" \
   "$TMP_DIR/sidecar-stderr.allowed" \
-  "scripts/lib/metis-sidecar-logger.mjs"
+  "scripts/lib/metis-sidecar-logger.mjs" \
+  "scripts/metis-stdio-broker.mjs" \
+  "scripts/gateway-stdio-*"
 
 check_file_allowlist \
   "JS console usage" \
   "$sidecar_console_scan" \
   "$TMP_DIR/sidecar-console.allowed" \
   "scripts/lib/metis-sidecar-logger.mjs" \
+  "scripts/control-ui-static-acceptance.mjs" \
   "scripts/openclaw-compat-ci-gate.mjs" \
   "scripts/openclaw-compat-security-policy.mjs" \
   "scripts/openclaw-plugin-inventory.mjs"
