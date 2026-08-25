@@ -1896,6 +1896,15 @@ public class ServicePluginHostTest {
                         let retried = stopServicePlugin("gitcode-monitor", reason: "边界重试", timeoutMillis: 2000)
                         @Expect(retried.ok, true)
                         @Expect(retried.status, "stopped")
+                        @Expect(retried.ingressStopStatus, "sent")
+                        @Expect(retried.dispatchStatus, "drained")
+                        @Expect(
+                            retried.ownerStopStatus == "graceful_exited" ||
+                            retried.ownerStopStatus == "terminated" ||
+                            retried.ownerStopStatus == "force_terminated" ||
+                            retried.ownerStopStatus == "already_stopped",
+                            true
+                        )
                         @Expect(retried.leaseStatus, "stopped")
                         @Expect(retried.portStatus, "released")
                     } else {
@@ -2223,6 +2232,8 @@ public class ServicePluginHostTest {
                         sawDisabled = true
                         @Expect(result.ok, true)
                         @Expect(result.status, "not_applicable")
+                        @Expect(result.ingressStopStatus, "not_applicable")
+                        @Expect(result.dispatchStatus, "not_applicable")
                         @Expect(result.ownerStopStatus, "not_applicable")
                         @Expect(result.leaseStatus, "not_applicable")
                         @Expect(result.portStatus, "not_applicable")
@@ -2230,6 +2241,8 @@ public class ServicePluginHostTest {
                         sawDegraded = true
                         @Expect(result.ok, true)
                         @Expect(result.status, "not_applicable")
+                        @Expect(result.ingressStopStatus, "not_applicable")
+                        @Expect(result.dispatchStatus, "not_applicable")
                         @Expect(result.ownerStopStatus, "not_applicable")
                         @Expect(result.leaseStatus, "not_applicable")
                         @Expect(result.portStatus, "not_applicable")
@@ -2237,6 +2250,15 @@ public class ServicePluginHostTest {
                         sawRunning = true
                         @Expect(result.ok, true)
                         @Expect(result.status, "stopped")
+                        @Expect(result.ingressStopStatus, "sent")
+                        @Expect(result.dispatchStatus, "drained")
+                        @Expect(
+                            result.ownerStopStatus == "graceful_exited" ||
+                            result.ownerStopStatus == "terminated" ||
+                            result.ownerStopStatus == "force_terminated" ||
+                            result.ownerStopStatus == "already_stopped",
+                            true
+                        )
                         @Expect(result.leaseStatus, "stopped")
                         @Expect(result.portStatus, "released")
                     }
