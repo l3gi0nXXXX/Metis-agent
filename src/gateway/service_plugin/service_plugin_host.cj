@@ -1594,7 +1594,9 @@ private func servicePluginFinalizeCleanupPending(
             case Some(hook) => hook(expectedSlot.serviceId, expectedSlot.cleanupToken)
             case None => ()
         }
-        let stopped = process.stop(timeoutMs: max(1, min(timeoutMs / 2, servicePluginDeadlineRemaining(deadlineMs))))
+        let remaining = servicePluginDeadlineRemaining(deadlineMs)
+        let terminalReserve = min(100, max(0, remaining - 1))
+        let stopped = process.stop(timeoutMs: max(1, remaining - terminalReserve))
         let cleanupRecord = synchronized(servicePluginProcessLock) { servicePluginRegistry.get(serviceId.trimAscii()) }
         let terminalState = match (cleanupRecord) {
             case Some(record) => servicePluginStopTerminalState(
