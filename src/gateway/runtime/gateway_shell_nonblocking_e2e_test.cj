@@ -610,7 +610,7 @@ public class GatewayShellNonblockingE2eTest {
                 toolset.debugSetManagedSubagentCommandSpecForTest(
                     None<(String, String, String, String, String, String) -> (String, Array<String>, Path)>)
                 GatewayHttpSurface.stopIfRunning()
-                try { gateway.stop() } catch (_: Exception) { () }
+                try { let _ = gateway.stop() } catch (_: Exception) { () }
                 let ownersCleared = gatewayShellE2eAwait({ => managedStdioBroker().snapshot().ownerCount == 0 })
                 let reset = resetManagedStdioBrokerForTest(timeoutMs: 3000)
                 match (oldPath) { case Some(value) => setVariable("PATH", value) case None => setVariable("PATH", "") }

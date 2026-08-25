@@ -204,11 +204,27 @@ public class GatewayServer {
     }
 
     public func stopServer(reason!: String = "shutdown"): Unit {
-        synchronized(gatewayServerLock) {
+        let _ = this.stopServerDetailed(reason: reason)
+    }
+
+    public func stopServerDetailed(reason!: String = "shutdown"): GatewaySurfaceStopResult {
+        let snapshot = synchronized(gatewayServerLock) {
+            let wasStarted = gatewayServerStarted
             gatewayServerStarted = false
             gatewayServerActiveRequests = 0
             gatewayServerLastError = reason
-            persistSnapshotLockedWithOptions(this.options, force: true)
+            gatewayServerSnapshotDirty = true
+            (wasStarted, buildSnapshotLockedWithOptions(this.options).toJsonString())
+        }
+        try {
+            File.writeTo(CliConfig.dotDir.join("gateway-rpc-state.json"), snapshot[1].toArray())
+            synchronized(gatewayServerLock) {
+                gatewayServerLastPersistAtMs = gatewayServerNowMs()
+                gatewayServerSnapshotDirty = false
+            }
+            GatewaySurfaceStopResult(true, if (snapshot[0]) { "stopped" } else { "already_stopped" })
+        } catch (_: Exception) {
+            GatewaySurfaceStopResult(false, "persistence_failed")
         }
     }
 

@@ -8,7 +8,7 @@ import metis.gateway.model.*
 import metis.gateway.process.{gatewayStdioBrokerSnapshot, shutdownGatewayStdioBroker}
 import metis.process.ManagedStdioOperationResult
 import metis.gateway.security.gatewayPairingAccountStore
-import metis.gateway.service_plugin.{CapabilityCaller, CapabilityInvokeRequest, CapabilityInvokeResult, ServicePluginAcceptedGitCodeEvent, ServicePluginDeliveryTarget, ServicePluginEventDeliveryResult, ServicePluginGeneratedReplyResult, ServicePluginPendingJob, buildServicePluginImBindingRules, invokeRegisteredCapability, matchServicePluginImBinding, parseServicePluginJobAcceptedPayload, redactServicePayload, renderServicePluginJobSnapshotMessage, servicePluginGeneratedReplyResultFromAgentAnswer, servicePluginPendingJobStore, registerConfiguredServicePlugins, servicePluginConfiguredStatusForUser, servicePluginWebhookDispatchStatsJson, setServicePluginEventDelivery, setServicePluginGeneratedReplyHandler, setServicePluginWebhookGeneratedReplyHandler, setServicePluginWebhookSubscribersProvider, shutdownServicePluginHost, validateServicePluginGeneratedDraft}
+import metis.gateway.service_plugin.{CapabilityCaller, CapabilityInvokeRequest, CapabilityInvokeResult, ServicePluginAcceptedGitCodeEvent, ServicePluginDeliveryTarget, ServicePluginEventDeliveryResult, ServicePluginGeneratedReplyResult, ServicePluginHostShutdownResult, ServicePluginPendingJob, ServiceStopResult, buildServicePluginImBindingRules, invokeRegisteredCapability, matchServicePluginImBinding, parseServicePluginJobAcceptedPayload, redactServicePayload, renderServicePluginJobSnapshotMessage, servicePluginGeneratedReplyResultFromAgentAnswer, servicePluginPendingJobStore, registerConfiguredServicePlugins, servicePluginConfiguredStatusForUser, servicePluginWebhookDispatchStatsJson, setServicePluginEventDelivery, setServicePluginGeneratedReplyHandler, setServicePluginWebhookGeneratedReplyHandler, setServicePluginWebhookSubscribersProvider, shutdownServicePluginHost, validateServicePluginGeneratedDraft}
 import metis.gateway.session.{GatewayIngressSource, GatewaySessionContext, GatewaySessionRequest, gatewayResolveSessionContext, gatewaySessionRequestFromInbound}
 import metis.gateway.tools.{gatewayCkbAdminCommand, gatewayHandleNativeCommandLine, gatewayHandleSubagentsCommandLine, gatewayRenderCkbAdminCommandResult}
 import metis.gateway.gitcode_plugin.{GatewayCommandContext, GitCodePromptTemplate, GitCodePromptTemplateSet, GitCodeReviewPromptPlan, GitCodeReviewRuntimeConfig, buildGitCodeAsyncScanPayload, buildGitCodeDeadLetterInspectPayload, buildGitCodeDeadLetterListPayload, buildGitCodeEventReconcilePayload, buildGitCodeHookReconcilePayload, buildGitCodeReplyPromptForServicePluginEvent, buildGitCodeSubscriptionTarget, buildGitCodeWebhookCancelPayload, buildGitCodeWebhookReplayPayload, buildGitCodeWebhookStatusPayload, defaultGitCodePromptTemplateSet, defaultGitCodeReviewRuntimeConfig, formatGitCodeSubscribeResult, gitCodeSubscriptionStatusJson, gitCodeSubscriptionStoreSnapshotForDispatcher, handleGitCodeKnowledgeQueryCommand, loadGitCodePromptTemplates, loadGitCodeSubscriptionStore, parseGeneratedReplyModelOutput, parseGitCodeCommand, parseGitCodeDeliveryArgs, parseGitCodeHookReconcileArgs, parseGitCodeReconcileOnceArgs, parseGitCodeReviewRuntimeConfig, parseGitCodeScanOnceArgs, removeGitCodeSubscription, renderGeneratedReplyDraft, renderGitCodeDeadLetterInspectResult, renderGitCodeDeadLetterListResult, renderGitCodeEventReconcileResult, renderGitCodeHookReconcileResult, renderGitCodeWebhookCancelResult, renderGitCodeWebhookReplayResult, renderGitCodeWebhookStatusResult, saveGitCodeSubscription, setGitCodeSubscriptionStore}
@@ -21,11 +21,157 @@ import std.sync.Mutex
 import std.time.DateTime
 import stdx.encoding.json.{JsonArray, JsonBool, JsonObject, JsonString, JsonValue}
 
-func gatewayServiceStopOwnersThenBroker(stopOwners: () -> Unit, stopBroker: () -> ManagedStdioOperationResult): Unit {
+public class GatewayStopResult {
+    public let ok: Bool
+    public let status: String
+    public let inboundStatus: String
+    public let ownersStatus: String
+    public let compatStatus: String
+    public let sidecarStatus: String
+    public let servicePluginStatus: String
+    public let servicePluginIngressStatus: String
+    public let servicePluginDispatchStatus: String
+    public let servicePluginOwnerStatus: String
+    public let servicePluginLeaseStatus: String
+    public let servicePluginPortStatus: String
+    public let servicePluginPendingCount: Int64
+    public let channelsStatus: String
+    public let brokerStatus: String
+    public let diagnostic: String
+
+    public init(
+        ok: Bool,
+        status: String,
+        inboundStatus!: String = "not_checked",
+        ownersStatus!: String = "not_checked",
+        compatStatus!: String = "not_checked",
+        sidecarStatus!: String = "not_checked",
+        servicePluginStatus!: String = "not_checked",
+        servicePluginIngressStatus!: String = "not_checked",
+        servicePluginDispatchStatus!: String = "not_checked",
+        servicePluginOwnerStatus!: String = "not_checked",
+        servicePluginLeaseStatus!: String = "not_checked",
+        servicePluginPortStatus!: String = "not_checked",
+        servicePluginPendingCount!: Int64 = 0,
+        channelsStatus!: String = "not_checked",
+        brokerStatus!: String = "not_checked",
+        diagnostic!: String = ""
+    ) {
+        this.ok = ok
+        this.status = status.trimAscii()
+        this.inboundStatus = inboundStatus.trimAscii()
+        this.ownersStatus = ownersStatus.trimAscii()
+        this.compatStatus = compatStatus.trimAscii()
+        this.sidecarStatus = sidecarStatus.trimAscii()
+        this.servicePluginStatus = servicePluginStatus.trimAscii()
+        this.servicePluginIngressStatus = servicePluginIngressStatus.trimAscii()
+        this.servicePluginDispatchStatus = servicePluginDispatchStatus.trimAscii()
+        this.servicePluginOwnerStatus = servicePluginOwnerStatus.trimAscii()
+        this.servicePluginLeaseStatus = servicePluginLeaseStatus.trimAscii()
+        this.servicePluginPortStatus = servicePluginPortStatus.trimAscii()
+        this.servicePluginPendingCount = max(0, servicePluginPendingCount)
+        this.channelsStatus = channelsStatus.trimAscii()
+        this.brokerStatus = brokerStatus.trimAscii()
+        this.diagnostic = diagnostic.trimAscii()
+    }
+}
+
+private func gatewayServicePluginPhaseTerminal(phase: String, status: String): Bool {
+    let normalized = status.trimAscii()
+    match (phase) {
+        case "ingress" => normalized == "sent" || normalized == "not_applicable"
+        case "dispatch" => normalized == "drained" || normalized == "cancelled" || normalized == "not_applicable"
+        case "owner" => normalized == "graceful_exited" || normalized == "terminated" ||
+            normalized == "force_terminated" || normalized == "already_stopped" || normalized == "not_applicable"
+        case "lease" => normalized == "stopped" || normalized == "not_applicable"
+        case "port" => normalized == "released" || normalized == "not_applicable"
+        case _ => false
+    }
+}
+
+private func gatewayServicePluginAggregatePhase(results: ArrayList<ServiceStopResult>, phase: String): String {
+    if (results.isEmpty()) { return "not_applicable" }
+    var first = ""
+    var same = true
+    var terminal = true
+    for (result in results) {
+        let value = match (phase) {
+            case "ingress" => result.ingressStopStatus
+            case "dispatch" => result.dispatchStatus
+            case "owner" => result.ownerStopStatus
+            case "lease" => result.leaseStatus
+            case "port" => result.portStatus
+            case _ => "not_checked"
+        }
+        if (first.isEmpty()) { first = value } else if (first != value) { same = false }
+        if (!gatewayServicePluginPhaseTerminal(phase, value)) { terminal = false }
+    }
+    if (!terminal) { return "cleanup_pending" }
+    if (same) { first } else { "terminal" }
+}
+
+func gatewayServiceStopJsonStatus(value: JsonObject): (Bool, String) {
+    let ok = match (value.get("ok")) {
+        case Some(item) => try { item.asBool().getValue() } catch (_: Exception) { false }
+        case None => false
+    }
+    let statusValue = match (value.get("status")) {
+        case Some(item) => Some(item)
+        case None => value.get("state")
+    }
+    let status = match (statusValue) {
+        case Some(item) => try { item.asString().getValue().trimAscii() } catch (_: Exception) { "invalid_result" }
+        case None => if (ok) { "stopped" } else { "missing_status" }
+    }
+    let normalizedStatus = if (status.isEmpty()) { "missing_status" } else { status }
+    let terminalOk = ok || normalizedStatus == "disabled" || normalizedStatus == "already_stopped" ||
+        normalizedStatus == "not_applicable"
+    (terminalOk, normalizedStatus)
+}
+
+func gatewayServiceStopOwnersThenBroker(
+    stopOwners: () -> ServicePluginHostShutdownResult,
+    stopChannels: () -> GatewayChannelStopSummary,
+    stopBroker: () -> ManagedStdioOperationResult
+): GatewayStopResult {
+    var ownersOk = false
+    var ownersStatus = "owners_failed"
+    var servicePluginIngressStatus = "not_checked"
+    var servicePluginDispatchStatus = "not_checked"
+    var servicePluginOwnerStatus = "not_checked"
+    var servicePluginLeaseStatus = "not_checked"
+    var servicePluginPortStatus = "not_checked"
+    var servicePluginPendingCount: Int64 = 0
+    var channelsOk = false
+    var channelsStatus = "channels_failed"
+    var brokerOk = false
+    var brokerStatus = "broker_failed"
     try {
-        stopOwners()
-    } finally {
+        let owners = stopOwners()
+        ownersOk = owners.ok
+        ownersStatus = owners.status
+        servicePluginIngressStatus = gatewayServicePluginAggregatePhase(owners.results, "ingress")
+        servicePluginDispatchStatus = gatewayServicePluginAggregatePhase(owners.results, "dispatch")
+        servicePluginOwnerStatus = gatewayServicePluginAggregatePhase(owners.results, "owner")
+        servicePluginLeaseStatus = gatewayServicePluginAggregatePhase(owners.results, "lease")
+        servicePluginPortStatus = gatewayServicePluginAggregatePhase(owners.results, "port")
+        for (result in owners.results) {
+            if (!result.ok) { servicePluginPendingCount += 1 }
+        }
+    } catch (_: Exception) {
+        ownersStatus = "owners_failed"
+    }
+    try {
+        let channels = stopChannels()
+        channelsOk = channels.ok
+        channelsStatus = channels.status
+    } catch (_: Exception) {
+        channelsStatus = "channels_failed"
+    }
+    try {
         let brokerResult = stopBroker()
+        brokerOk = brokerResult.ok
+        brokerStatus = brokerResult.status
         if (!brokerResult.ok) {
             gatewayLogEventError(
                 "gateway/service",
@@ -39,7 +185,25 @@ func gatewayServiceStopOwnersThenBroker(stopOwners: () -> Unit, stopBroker: () -
                     .object()
             )
         }
+    } catch (_: Exception) {
+        brokerStatus = "broker_failed"
     }
+    let ok = ownersOk && channelsOk && brokerOk
+    GatewayStopResult(
+        ok,
+        if (ok) { "stopped" } else { "cleanup_pending" },
+        ownersStatus: ownersStatus,
+        servicePluginStatus: ownersStatus,
+        servicePluginIngressStatus: servicePluginIngressStatus,
+        servicePluginDispatchStatus: servicePluginDispatchStatus,
+        servicePluginOwnerStatus: servicePluginOwnerStatus,
+        servicePluginLeaseStatus: servicePluginLeaseStatus,
+        servicePluginPortStatus: servicePluginPortStatus,
+        servicePluginPendingCount: servicePluginPendingCount,
+        channelsStatus: channelsStatus,
+        brokerStatus: brokerStatus,
+        diagnostic: "owners=${ownersStatus} channels=${channelsStatus} broker=${brokerStatus}"
+    )
 }
 
 private func gatewayInboundFallbackOrderingKey(message: InboundMessage, accountId: String): String {
@@ -239,7 +403,7 @@ public class GatewayService {
     /**
      * 停止所有渠道。
      */
-    public func stop(): Unit {
+    public func stop(): GatewayStopResult {
         let inboundStop = this.inboundDispatcher.stop(timeoutMs: 3000)
         if (!inboundStop.ok) {
             gatewayLogEventError(
@@ -254,17 +418,69 @@ public class GatewayService {
                     .object()
             )
         }
-        gatewayServiceStopOwnersThenBroker({ =>
-            let user = CliSettingManager.readGatewaySettings()
-            let _ = gatewayOpenClawCompatHostStop(user)
-            let _ = gatewayOpenClawPluginSidecarStop(user)
+        let compat = try {
+            gatewayServiceStopJsonStatus(gatewayOpenClawCompatHostStop(CliSettingManager.readGatewaySettings()))
+        } catch (_: Exception) {
+            (false, "stop_failed")
+        }
+        let sidecar = try {
+            gatewayServiceStopJsonStatus(gatewayOpenClawPluginSidecarStop(CliSettingManager.readGatewaySettings()))
+        } catch (_: Exception) {
+            (false, "stop_failed")
+        }
+        let stopped = gatewayServiceStopOwnersThenBroker({ =>
             shutdownServicePluginHost(reason: "gateway-shutdown")
+        }, { =>
             // Gateway process shutdown should not persist a user-level manual stop.
-            this.channelManager.stopChannels(reason: "shutdown", manualStop: false)
+            this.channelManager.stopChannelsDetailed(reason: "shutdown", manualStop: false)
         }, { =>
             // The broker is the final process-I/O owner. This cleanup must run even when an earlier owner stop throws.
             shutdownGatewayStdioBroker(timeoutMs: 2000)
         })
+        let ownersOk = compat[0] && sidecar[0] && stopped.ok
+        let ownersStatus = if (ownersOk) { "stopped" } else { "cleanup_pending" }
+        let ok = inboundStop.ok && compat[0] && sidecar[0] && stopped.ok
+        let result = GatewayStopResult(
+            ok,
+            if (ok) { "stopped" } else { "cleanup_pending" },
+            inboundStatus: inboundStop.status,
+            ownersStatus: ownersStatus,
+            compatStatus: compat[1],
+            sidecarStatus: sidecar[1],
+            servicePluginStatus: stopped.servicePluginStatus,
+            servicePluginIngressStatus: stopped.servicePluginIngressStatus,
+            servicePluginDispatchStatus: stopped.servicePluginDispatchStatus,
+            servicePluginOwnerStatus: stopped.servicePluginOwnerStatus,
+            servicePluginLeaseStatus: stopped.servicePluginLeaseStatus,
+            servicePluginPortStatus: stopped.servicePluginPortStatus,
+            servicePluginPendingCount: stopped.servicePluginPendingCount,
+            channelsStatus: stopped.channelsStatus,
+            brokerStatus: stopped.brokerStatus,
+            diagnostic: "inbound=${inboundStop.status} compat=${compat[1]} sidecar=${sidecar[1]} ${stopped.diagnostic}"
+        )
+        let meta = gatewayLogMeta()
+            .string("phase", "stop")
+            .string("status", result.status)
+            .string("inboundStatus", result.inboundStatus)
+            .string("ownersStatus", result.ownersStatus)
+            .string("compatStatus", result.compatStatus)
+            .string("sidecarStatus", result.sidecarStatus)
+            .string("servicePluginStatus", result.servicePluginStatus)
+            .string("servicePluginIngressStatus", result.servicePluginIngressStatus)
+            .string("servicePluginDispatchStatus", result.servicePluginDispatchStatus)
+            .string("servicePluginOwnerStatus", result.servicePluginOwnerStatus)
+            .string("servicePluginLeaseStatus", result.servicePluginLeaseStatus)
+            .string("servicePluginPortStatus", result.servicePluginPortStatus)
+            .int("servicePluginPendingCount", result.servicePluginPendingCount)
+            .string("channelsStatus", result.channelsStatus)
+            .string("brokerStatus", result.brokerStatus)
+            .object()
+        if (result.ok) {
+            gatewayLogEventInfo("gateway/service", "gateway.stopped", "gateway service stopped", meta: meta)
+        } else {
+            gatewayLogEventError("gateway/service", "gateway.stop.cleanup_pending", "gateway service stop has pending cleanup", meta: meta)
+        }
+        result
     }
 
     /**

@@ -11,6 +11,22 @@ import std.time.DateTime
 import std.core.Duration
 import stdx.encoding.json.{JsonArray, JsonBool, JsonInt, JsonObject, JsonString, JsonValue}
 
+public class GatewayChannelStopSummary {
+    public let ok: Bool
+    public let status: String
+    public let total: Int64
+    public let stopped: Int64
+    public let failed: Int64
+
+    public init(ok: Bool, status: String, total!: Int64 = 0, stopped!: Int64 = 0, failed!: Int64 = 0) {
+        this.ok = ok
+        this.status = status.trimAscii()
+        this.total = total
+        this.stopped = stopped
+        this.failed = failed
+    }
+}
+
 public func gatewayCanonicalChannelAccountId(channelId: String, rawAccountId: String): String {
     let channel = channelId.trimAscii().toAsciiLower()
     let raw = rawAccountId.trimAscii()
@@ -1322,10 +1338,12 @@ public class GatewayChannelManager {
         result
     }
 
-    public func stopChannels(reason!: String = "manual-stop", manualStop!: Bool = true): Unit {
+    public func stopChannelsDetailed(reason!: String = "manual-stop", manualStop!: Bool = true): GatewayChannelStopSummary {
         if (!this.started) {
-            return
+            return GatewayChannelStopSummary(true, "not_applicable")
         }
+        var stopped: Int64 = 0
+        var failed: Int64 = 0
         for (entry in this.adapters) {
             try {
                 entry.adapter.stop()
@@ -1347,7 +1365,9 @@ public class GatewayChannelManager {
                         .rawString("reason", reason)
                         .object()
                 )
+                stopped++
             } catch (e: Exception) {
+                failed++
                 this.updateLiveAccount(entry.channelId, entry.accountId, { state =>
                     state.running = false
                     state.connected = false
@@ -1370,6 +1390,17 @@ public class GatewayChannelManager {
             }
         }
         this.started = false
+        GatewayChannelStopSummary(
+            failed == 0,
+            if (failed == 0) { "stopped" } else { "stop_failed" },
+            total: stopped + failed,
+            stopped: stopped,
+            failed: failed
+        )
+    }
+
+    public func stopChannels(reason!: String = "manual-stop", manualStop!: Bool = true): Unit {
+        let _ = this.stopChannelsDetailed(reason: reason, manualStop: manualStop)
     }
 
     public func stopChannel(channelId: String, accountId!: String = "", reason!: String = "manual-stop", manualStop!: Bool = true): JsonObject {

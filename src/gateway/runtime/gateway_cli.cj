@@ -19,11 +19,43 @@ import std.collection.ArrayList
 import std.env.{getVariable, setVariable}
 import std.fs.{Path, exists}
 import std.process.executeWithOutput
-import std.time.DateTime
+import std.time.{DateTime, MonoTime}
+import std.core.Duration
 import stdx.encoding.json.{JsonArray, JsonObject, JsonString, JsonValue}
 
 private let GATEWAY_PREFIX: String = "gateway "
 private let gatewayCliLogger = metisCreateSubsystemLogger("gateway/runtime")
+private var gatewayStopOutputForTest: Option<(String) -> Unit> = None<(String) -> Unit>
+
+public func setGatewayStopOutputForTest(output: Option<(String) -> Unit>): Unit {
+    gatewayStopOutputForTest = output
+}
+
+private func gatewayStopPrintLine(line: String): Unit {
+    match (gatewayStopOutputForTest) {
+        case Some(output) => output(line)
+        case None => PrintUtils.printLine(line)
+    }
+}
+
+public func gatewayStopDiscoverWithinDeadline(
+    deadline: MonoTime,
+    discover: (MonoTime) -> GatewayServeListenerDiscoveryResult
+): GatewayServeListenerDiscoveryResult {
+    discover(deadline)
+}
+
+public func gatewayStopTargetsWithinDeadline(
+    pids: Array<Int64>,
+    deadline: MonoTime,
+    terminate: (Int64, MonoTime) -> GatewayServeTerminationResult
+): Array<(Int64, GatewayServeTerminationResult)> {
+    let results = ArrayList<(Int64, GatewayServeTerminationResult)>()
+    for (pid in pids) {
+        results.add((pid, terminate(pid, deadline)))
+    }
+    results.toArray()
+}
 
 public func gatewayCliShouldPrintRuntimeRequiredHint(error: String): Bool {
     let normalized = error.trimAscii().toAsciiLower()
@@ -1287,14 +1319,29 @@ private func applyRuntimeForGatewayServe(): Unit {
 
 private func runGatewayStopSubcommand(): Int64 {
     let startMs = gatewayCliNowMs()
+    let deadline = MonoTime.now() + Duration.millisecond * GATEWAY_SERVE_GRACEFUL_SHUTDOWN_TIMEOUT_MS
     gatewayCliTimingLog("stop", "enter", startMs)
     let lockPath = gatewayServeLockPath()
-    let listenerPids = gatewayFindVerifiedListenerPidsOnPort()
+    let discovery = gatewayStopDiscoverWithinDeadline(
+        deadline,
+        { stopDeadline => gatewayFindVerifiedListenerPidsOnPortUntil(stopDeadline) }
+    )
+    let listenerPids = discovery.pids
     let lockPid = gatewayPeekServeLockPid()
-    let stopPids = gatewayResolveStopTargetPids(listenerPids, lockPid: lockPid)
+    let stopPids: Array<Int64> = match (lockPid) {
+        case Some(pid) =>
+            if (listenerPids.isEmpty() || listenerPids.contains(pid)) { [pid] } else { [] }
+        case None => []
+    }
     if (!exists(lockPath) && stopPids.isEmpty()) {
+        let pending = gatewayPendingServeCompletionStatus()
+        if (!discovery.conclusive || pending == "cleanup_pending" || pending == "malformed" || pending == "invalid_response_encoding" || !listenerPids.isEmpty()) {
+            gatewayStopPrintLine(gatewayStopOutcomeHumanText("cleanup_pending"))
+            gatewayCliTimingLog("stop", "cleanup-pending-no-lock", startMs)
+            return 1
+        }
         gatewayRuntimeMarkStoppedFromCli(reason: "stopped")
-        PrintUtils.printLine("[网关] 未发现 ~/.metis/gateway-serve.lock，可能没有正在运行的 gateway serve。")
+        gatewayStopPrintLine("[网关] 未发现 ~/.metis/gateway-serve.lock，可能没有正在运行的 gateway serve。")
         gatewayCliTimingLog("stop", "no-lock", startMs)
         return 0
     }
@@ -1314,8 +1361,8 @@ private func runGatewayStopSubcommand(): Int64 {
                     }
                 }
                 if (!matched) {
-                    PrintUtils.printLine(
-                        "[网关] 检测到锁文件 PID=${pid} 与真实 listener PID=${listenerPidText} 不一致，将以 listener 为准。"
+                    gatewayStopPrintLine(
+                        "[网关] 锁文件与 listener 进程身份不一致；为避免误杀，已拒绝停止。"
                     )
                 }
             case None => ()
@@ -1323,37 +1370,43 @@ private func runGatewayStopSubcommand(): Int64 {
     }
     for (pid in stopPids) {
         if (pid == me) {
-            PrintUtils.printLine("[网关] 当前进程即为 gateway serve，请在本窗口按 Ctrl+C 退出；勿在同一进程执行 gateway stop。")
+            gatewayStopPrintLine("[网关] 当前进程即为 gateway serve，请在本窗口按 Ctrl+C 退出；勿在同一进程执行 gateway stop。")
             gatewayCliTimingLog("stop", "self-process", startMs)
             return 1
         }
     }
     if (stopPids.isEmpty()) {
-        gatewayReleaseServeLockQuiet()
-        gatewayRuntimeMarkStoppedFromCli(reason: "stopped")
-        PrintUtils.printLine("[网关] 已移除无 PID 的旧版锁。若仍有网关 CMD 窗口，请手动关闭。")
-        gatewayCliTimingLog("stop", "legacy-lock-cleared", startMs)
-        return 0
+        gatewayStopPrintLine(gatewayStopOutcomeHumanText("stale_identity"))
+        gatewayCliTimingLog("stop", "identity-unavailable", startMs)
+        return 1
     }
     let stopPidText = String.join(
         stopPids |> map({p => p.toString()}) |> collectArray,
         delimiter: ","
     )
-    PrintUtils.printLine("[网关] 正在停止 gateway serve（PID=${stopPidText}）…")
+    gatewayStopPrintLine("[网关] 正在停止 gateway serve（PID=${stopPidText}）…")
     gatewayCliTimingLog("stop", "terminate-begin", startMs)
     let failed = ArrayList<Int64>()
-    for (pid in stopPids) {
-        if (!gatewayServePidIsAlive(pid)) {
-            continue
-        }
-        if (!gatewayTryTerminateServeProcess(pid)) {
+    var forced = false
+    var failureStatus = "cleanup_pending"
+    let stopResults = gatewayStopTargetsWithinDeadline(
+        stopPids,
+        deadline,
+        { pid, stopDeadline => gatewayTryTerminateServeProcessUntil(pid, stopDeadline) }
+    )
+    for (entry in stopResults) {
+        let pid = entry[0]
+        let stopped = entry[1]
+        if (!stopped.ok) {
             failed.add(pid)
+            failureStatus = stopped.status
+        } else if (stopped.status == "force_terminated") {
+            forced = true
         }
     }
     if (failed.isEmpty()) {
-        gatewayReleaseServeLockQuiet()
         gatewayRuntimeMarkStoppedFromCli(reason: "stopped")
-        PrintUtils.printLine("[网关] 已停止。")
+        gatewayStopPrintLine(gatewayStopOutcomeHumanText(if (forced) { "force_terminated" } else { "graceful" }))
         gatewayCliTimingLog("stop", "terminate-done", startMs)
         return 0
     }
@@ -1361,9 +1414,18 @@ private func runGatewayStopSubcommand(): Int64 {
         failed.toArray() |> map({p => p.toString()}) |> collectArray,
         delimiter: ","
     )
-    PrintUtils.printLine("[网关] 未能结束进程 PID=${failedPidText}，请手动关闭对应终端窗口或在任务管理器中结束进程。")
+    gatewayStopPrintLine("${gatewayStopOutcomeHumanText(failureStatus)} PID=${failedPidText}")
     gatewayCliTimingLog("stop", "terminate-failed", startMs)
     return 1
+}
+
+public func gatewayStopOutcomeHumanText(status: String): String {
+    match (status.trimAscii()) {
+        case "graceful" => "[网关] 已正常停止。"
+        case "force_terminated" => "[网关] 已强制停止。"
+        case "stale_identity" => "[网关] 停止目标身份已变化，未向替代进程发送强制信号。"
+        case _ => "[网关] 主进程已退出但子进程清理未完成。"
+    }
 }
 
 /** 与命令行 `gateway stop` 相同逻辑；供 `/Metis` 菜单等调用（依赖当前已初始化的 CliConfig）。 */
