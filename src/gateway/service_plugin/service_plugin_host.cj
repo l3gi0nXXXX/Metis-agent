@@ -658,6 +658,10 @@ private var servicePluginPortReleaseCommandForTest: Option<(Int64, Int64, Int64)
     None<(Int64, Int64, Int64) -> (Int64, String, String)>
 private var servicePluginPidProbeCommandForTest: Option<(Int64, Int64) -> (Int64, String, String)> =
     None<(Int64, Int64) -> (Int64, String, String)>
+private let servicePluginMonotonicOrigin = MonoTime.now()
+private var servicePluginMonotonicNowForTest: Option<() -> Int64> = None<() -> Int64>
+private let servicePluginDeadlineClockLock = Mutex()
+private var servicePluginLastDeadlineNowMs: Int64 = 0
 private var servicePluginDispatchRemainingForTest: Option<() -> Int64> = None<() -> Int64>
 private var servicePluginBeforeDispatchWaitForTest: Option<(Int64) -> Unit> = None<(Int64) -> Unit>
 private var servicePluginDispatchSettledHookForTest: Option<() -> Unit> = None<() -> Unit>
@@ -873,7 +877,7 @@ private class ServicePluginStdioProcess {
             rows
         }
         for (future in futures) { try { future.cancel() } catch (_: Exception) { () } }
-        let deadlineMs = servicePluginNowMs() + max(1, timeoutMs)
+        let deadlineMs = servicePluginDeadlineNowMs() + max(1, timeoutMs)
         for (future in futures) {
             let remaining = servicePluginDeadlineRemaining(deadlineMs)
             if (remaining <= 0) { break }
@@ -897,9 +901,9 @@ private class ServicePluginStdioProcess {
     public func readStdoutLine(timeoutMs: Int64): Option<String> {
         if (!this.state.beginRead()) { return None<String> }
         try {
-            let deadline = DateTime.now().toUnixTimeStamp().toMilliseconds() + max(1, timeoutMs)
+            let deadline = servicePluginDeadlineNowMs() + max(1, timeoutMs)
             while (!this.state.shouldStop()) {
-                let remaining = deadline - DateTime.now().toUnixTimeStamp().toMilliseconds()
+                let remaining = deadline - servicePluginDeadlineNowMs()
                 if (remaining <= 0) { return None<String> }
                 match (this.broker.readOwnerLine(this.ownerId, timeoutMs: remaining)) {
                     case Some(event) =>
@@ -941,9 +945,9 @@ private class ServicePluginStdioProcess {
 
     public func stop(timeoutMs!: Int64 = 500): ServicePluginProcessStopResult {
         let effective = if (timeoutMs > 0) { timeoutMs } else { 500 }
-        let deadlineMs = DateTime.now().toUnixTimeStamp().toMilliseconds() + effective
+        let deadlineMs = servicePluginDeadlineNowMs() + effective
         this.state.stopReaders(min(50, max(1, effective / 4)))
-        let remaining = max(0, deadlineMs - DateTime.now().toUnixTimeStamp().toMilliseconds())
+        let remaining = max(0, deadlineMs - servicePluginDeadlineNowMs())
         if (remaining <= 0) {
             this.state.cacheTerminal("stop_timeout")
             this.stdoutBuffer.close()
@@ -957,7 +961,7 @@ private class ServicePluginStdioProcess {
         )
         var drained = this.state.readersSettled()
         while (drained) {
-            let drainRemaining = max(0, deadlineMs - DateTime.now().toUnixTimeStamp().toMilliseconds())
+            let drainRemaining = max(0, deadlineMs - servicePluginDeadlineNowMs())
             if (drainRemaining <= 0) {
                 drained = false
                 break
@@ -1086,13 +1090,25 @@ private class ServicePluginDetachedOwner {
 
 private class ServicePluginCleanupFinalizeResult {
     public let finalized: Bool
+    public let ingressStopStatus: String
+    public let dispatchStatus: String
     public let ownerStopStatus: String
     public let leaseStatus: String
     public let portStatus: String
     public let diagnostic: String
 
-    public init(finalized: Bool, ownerStopStatus: String, leaseStatus: String, portStatus: String, diagnostic: String) {
+    public init(
+        finalized: Bool,
+        ingressStopStatus: String,
+        dispatchStatus: String,
+        ownerStopStatus: String,
+        leaseStatus: String,
+        portStatus: String,
+        diagnostic: String
+    ) {
         this.finalized = finalized
+        this.ingressStopStatus = ingressStopStatus.trimAscii()
+        this.dispatchStatus = dispatchStatus.trimAscii()
         this.ownerStopStatus = ownerStopStatus.trimAscii()
         this.leaseStatus = leaseStatus.trimAscii()
         this.portStatus = portStatus.trimAscii()
@@ -1112,7 +1128,7 @@ private class ServicePluginCleanupPendingSlot {
     public let finalReason: String
     public let stateFlushed: Bool
     public let ingressStopStatus: String
-    public let dispatchStatus: String
+    public var dispatchStatus: String
     public var ownerStopStatus: String
     public var leaseStatus: String
     public var portStatus: String
@@ -1122,7 +1138,15 @@ private class ServicePluginCleanupPendingSlot {
     private let finalizeCondition: Condition
     private var finalizeInProgress = false
     private var finalizeCompleted = false
-    private var finalizeResult = ServicePluginCleanupFinalizeResult(false, "not_started", "not_checked", "not_checked", "cleanup_not_started")
+    private var finalizeResult = ServicePluginCleanupFinalizeResult(
+        false,
+        "not_started",
+        "not_started",
+        "not_started",
+        "not_checked",
+        "not_checked",
+        "cleanup_not_started"
+    )
 
     public init(
         serviceId: String,
@@ -1162,7 +1186,7 @@ private class ServicePluginCleanupPendingSlot {
     public func claimFinalize(deadlineMs: Int64): (Bool, Option<ServicePluginCleanupFinalizeResult>) {
         synchronized(this.finalizeLock) {
             while (this.finalizeInProgress && !this.finalizeCompleted) {
-                let remaining = max(0, deadlineMs - servicePluginNowMs())
+                let remaining = max(0, deadlineMs - servicePluginDeadlineNowMs())
                 if (remaining <= 0) { return (false, None<ServicePluginCleanupFinalizeResult>) }
                 let _ = this.finalizeCondition.wait(timeout: Duration.millisecond * remaining)
             }
@@ -1511,9 +1535,17 @@ private func servicePluginFinalizeCleanupPending(
     timeoutMs!: Int64 = 1
 ): ServicePluginCleanupFinalizeResult {
     if (!process.dispatchesSettled()) {
-        return ServicePluginCleanupFinalizeResult(false, "not_started", "not_checked", "not_checked", "dispatch_pending")
+        return ServicePluginCleanupFinalizeResult(
+            false,
+            "not_started",
+            "dispatch_pending",
+            "not_started",
+            "not_checked",
+            "not_checked",
+            "dispatch_pending"
+        )
     }
-    let deadlineMs = servicePluginNowMs() + max(1, timeoutMs)
+    let deadlineMs = servicePluginDeadlineNowMs() + max(1, timeoutMs)
     let candidate = synchronized(servicePluginProcessLock) {
         match (servicePluginCleanupPendingOwners.get(process.ownerId)) {
             case Some(slot) =>
@@ -1522,17 +1554,41 @@ private func servicePluginFinalizeCleanupPending(
         }
     }
     if (candidate.isNone()) {
-        return ServicePluginCleanupFinalizeResult(false, "not_started", "not_checked", "not_checked", "cleanup_identity_missing")
+        return ServicePluginCleanupFinalizeResult(
+            false,
+            "not_started",
+            "not_started",
+            "not_started",
+            "not_checked",
+            "not_checked",
+            "cleanup_identity_missing"
+        )
     }
     let expectedSlot = candidate.getOrThrow()
     let claim = expectedSlot.claimFinalize(deadlineMs)
     if (!claim[0]) {
         return match (claim[1]) {
             case Some(result) => result
-            case None => ServicePluginCleanupFinalizeResult(false, expectedSlot.ownerStopStatus, expectedSlot.leaseStatus, expectedSlot.portStatus, "cleanup_finalize_wait_timeout")
+            case None => ServicePluginCleanupFinalizeResult(
+                false,
+                expectedSlot.ingressStopStatus,
+                expectedSlot.dispatchStatus,
+                expectedSlot.ownerStopStatus,
+                expectedSlot.leaseStatus,
+                expectedSlot.portStatus,
+                "cleanup_finalize_wait_timeout"
+            )
         }
     }
-    var result = ServicePluginCleanupFinalizeResult(false, expectedSlot.ownerStopStatus, expectedSlot.leaseStatus, expectedSlot.portStatus, "cleanup_finalize_failed")
+    var result = ServicePluginCleanupFinalizeResult(
+        false,
+        expectedSlot.ingressStopStatus,
+        expectedSlot.dispatchStatus,
+        expectedSlot.ownerStopStatus,
+        expectedSlot.leaseStatus,
+        expectedSlot.portStatus,
+        "cleanup_finalize_failed"
+    )
     try {
         match (servicePluginCleanupFinalizeHookForTest) {
             case Some(hook) => hook(expectedSlot.serviceId, expectedSlot.cleanupToken)
@@ -1557,6 +1613,7 @@ private func servicePluginFinalizeCleanupPending(
                         false
                     } else {
                         slot.ownerStopStatus = stopped.status
+                        slot.dispatchStatus = if (process.dispatchesSettled()) { "drained" } else { "dispatch_pending" }
                         slot.leaseStatus = terminalState.leaseStatus
                         slot.portStatus = terminalState.portStatus
                         slot.terminalDiagnostic = terminalState.diagnostic
@@ -1588,6 +1645,8 @@ private func servicePluginFinalizeCleanupPending(
         }
         result = ServicePluginCleanupFinalizeResult(
             finalized,
+            expectedSlot.ingressStopStatus,
+            expectedSlot.dispatchStatus,
             stopped.status,
             terminalState.leaseStatus,
             terminalState.portStatus,
@@ -1720,7 +1779,7 @@ private func cleanupDetachedServicePluginOwner(
     let normalizedReason = if (reason.trimAscii().isEmpty()) { "stale_active_process" } else { reason.trimAscii() }
     let safeDiagnostic = servicePluginSafeDiagnosticText(if (diagnostic.trimAscii().isEmpty()) { normalizedReason } else { diagnostic })
     let effectiveTimeoutMs = max(1, timeoutMs)
-    let deadlineMs = servicePluginNowMs() + effectiveTimeoutMs
+    let deadlineMs = servicePluginDeadlineNowMs() + effectiveTimeoutMs
     let stopReserveMs = if (stopProcess) { max(1, effectiveTimeoutMs / 2) } else { Int64(0) }
     var dispatchStatus = "not_started"
     var ingressStopStatus = "not_started"
@@ -1748,7 +1807,7 @@ private func cleanupDetachedServicePluginOwner(
                     }
                     let observeBudget = min(500, max(0, servicePluginDeadlineRemaining(deadlineMs) - stopReserveMs) / 2)
                     if (observeBudget > 0) {
-                        servicePluginObserveIngressStop(sid, process, servicePluginNowMs() + observeBudget)
+                        servicePluginObserveIngressStop(sid, process, servicePluginDeadlineNowMs() + observeBudget)
                     }
                 }
                 if (ingressBudget <= 0) { ingressStopStatus = "deadline_exhausted" }
@@ -1985,6 +2044,33 @@ public func setServicePluginPidProbeCommandForTest(
     servicePluginPidProbeCommandForTest = probe
 }
 
+public func setServicePluginMonotonicNowForTest(probe: Option<() -> Int64>): Unit {
+    synchronized(servicePluginDeadlineClockLock) {
+        servicePluginMonotonicNowForTest = probe
+        servicePluginLastDeadlineNowMs = 0
+    }
+}
+
+public func servicePluginPidProbeStatusForTest(pid: Int64, timeoutMs: Int64): String {
+    servicePluginProbePid(
+        pid,
+        ServicePluginProbeDeadline(servicePluginDeadlineNowMs() + max(1, timeoutMs))
+    ).status
+}
+
+public func servicePluginPortProbeStatusForTest(port: Int64, pid: Int64, timeoutMs: Int64): String {
+    servicePluginPortReleaseState(
+        port,
+        pid,
+        ServicePluginProbeDeadline(servicePluginDeadlineNowMs() + max(1, timeoutMs))
+    ).status
+}
+
+public func servicePluginDeadlineRemainingForTest(timeoutMs: Int64): (Int64, Int64) {
+    let deadline = ServicePluginProbeDeadline(servicePluginDeadlineNowMs() + max(1, timeoutMs))
+    (deadline.remaining(), deadline.remaining())
+}
+
 public func setServicePluginDispatchRemainingForTest(probe: Option<() -> Int64>): Unit {
     servicePluginDispatchRemainingForTest = probe
 }
@@ -2095,6 +2181,10 @@ public func resetServicePluginHostForTest(): Unit {
     servicePluginPortOwnerProbeForTest = None<(Int64, Int64) -> Bool>
     servicePluginPortReleaseCommandForTest = None<(Int64, Int64, Int64) -> (Int64, String, String)>
     servicePluginPidProbeCommandForTest = None<(Int64, Int64) -> (Int64, String, String)>
+    synchronized(servicePluginDeadlineClockLock) {
+        servicePluginMonotonicNowForTest = None<() -> Int64>
+        servicePluginLastDeadlineNowMs = 0
+    }
     servicePluginDispatchRemainingForTest = None<() -> Int64>
     servicePluginBeforeDispatchWaitForTest = None<(Int64) -> Unit>
     servicePluginDispatchSettledHookForTest = None<() -> Unit>
@@ -2517,7 +2607,7 @@ private class ServicePluginProbeDeadline {
     }
 
     public func remaining(): Int64 {
-        max(0, this.deadlineMs - servicePluginNowMs())
+        max(0, this.deadlineMs - servicePluginDeadlineNowMs())
     }
 }
 
@@ -2549,14 +2639,23 @@ private func servicePluginProbePid(
             case Some(probe) => probe(pid, timeoutMs)
             case None => ShellUtils.executeWithDeadline("kill -0 ${pid}", timeoutMs)
         }
-        let exitCode = result[0]
-        if (exitCode == 0) { return ServicePluginPidProbeState(true, true, "alive") }
-        if (exitCode == 1) { return ServicePluginPidProbeState(true, false, "gone") }
+        let (exitCode, stdout, stderr) = result
+        let stdoutText = stdout.trimAscii()
+        let stderrText = stderr.trimAscii()
+        if (exitCode == 0 && stderrText.isEmpty()) { return ServicePluginPidProbeState(true, true, "alive") }
         if (exitCode == 124) { return ServicePluginPidProbeState(false, false, "pid_probe_timeout", diagnostic: "pid_probe_timeout") }
         if (exitCode == SHELL_INVALID_RESPONSE_ENCODING_EXIT_CODE) {
             return ServicePluginPidProbeState(false, false, "invalid_response_encoding", diagnostic: "pid_probe_invalid_response_encoding")
         }
-        ServicePluginPidProbeState(false, false, "pid_probe_unavailable", diagnostic: "pid_probe_unavailable exitCode=${exitCode}")
+        let explicitGone = exitCode == 1 && stdoutText.isEmpty() &&
+            (stderrText.contains("No such process") || stderrText.contains("no such process") || stderrText.contains("ESRCH"))
+        if (explicitGone) { return ServicePluginPidProbeState(true, false, "gone") }
+        let status = if (stderrText.contains("Operation not permitted") || stderrText.contains("EPERM")) {
+            "pid_probe_permission_denied"
+        } else {
+            "pid_probe_unavailable"
+        }
+        ServicePluginPidProbeState(false, false, status, diagnostic: status)
     } catch (_: Exception) {
         ServicePluginPidProbeState(false, false, "pid_probe_unavailable", diagnostic: "pid_probe_unavailable")
     }
@@ -2594,12 +2693,14 @@ private func servicePluginPortReleaseState(port: Int64, pid: Int64, deadline: Se
                 timeoutMs
             )
         }
-        let (exitCode, stdout, _) = result
+        let (exitCode, stdout, stderr) = result
+        let stderrText = stderr.trimAscii()
         if (exitCode == 124) { return ServicePluginPortReleaseState(false, "port_probe_timeout", conclusive: false) }
         if (exitCode == SHELL_INVALID_RESPONSE_ENCODING_EXIT_CODE) {
             return ServicePluginPortReleaseState(false, "invalid_response_encoding", conclusive: false)
         }
-        if (exitCode == 1) { return ServicePluginPortReleaseState(true, "released") }
+        if (exitCode == 1 && stderrText.isEmpty()) { return ServicePluginPortReleaseState(true, "released") }
+        if (!stderrText.isEmpty()) { return ServicePluginPortReleaseState(false, "port_probe_unavailable", conclusive: false) }
         if (exitCode != 0) { return ServicePluginPortReleaseState(false, "port_probe_unavailable", conclusive: false) }
         for (line in stdout.split("\n")) {
             if (line.trimAscii().startsWith("p")) {
@@ -2614,6 +2715,17 @@ private func servicePluginPortReleaseState(port: Int64, pid: Int64, deadline: Se
 
 private func servicePluginNowMs(): Int64 {
     DateTime.now().toUnixTimeStamp().toMilliseconds()
+}
+
+private func servicePluginDeadlineNowMs(): Int64 {
+    synchronized(servicePluginDeadlineClockLock) {
+        let observed = match (servicePluginMonotonicNowForTest) {
+            case Some(probe) => probe()
+            case None => (MonoTime.now() - servicePluginMonotonicOrigin).toMilliseconds()
+        }
+        servicePluginLastDeadlineNowMs = max(servicePluginLastDeadlineNowMs, observed)
+        servicePluginLastDeadlineNowMs
+    }
 }
 
 private func servicePluginReadHttpBytes(response: HttpResponse): Array<Byte> {
@@ -2852,7 +2964,7 @@ private func recoverServicePlugin(record: ServicePluginRuntimeRecord, reason: St
     let serviceId = record.registration.manifest.pluginId
     let config = servicePluginSupervisorConfig
     let recoveryDeadline = ServicePluginProbeDeadline(
-        servicePluginNowMs() + servicePluginSupervisorStopTimeoutMs(config)
+        servicePluginDeadlineNowMs() + servicePluginSupervisorStopTimeoutMs(config)
     )
     if (record.supervisorLastRestartAtMs > 0 && nowMs - record.supervisorLastRestartAtMs < config.restartCooldownMs) {
         record.lastError = serviceJoinStrings([record.lastError, "restart_cooldown reason=${reason}"], " ")
@@ -3247,7 +3359,7 @@ private func servicePluginLeaseStopDiagnostic(record: ServicePluginRuntimeRecord
     servicePluginStopTerminalState(
         record,
         record.pid,
-        ServicePluginProbeDeadline(servicePluginNowMs() + 1000)
+        ServicePluginProbeDeadline(servicePluginDeadlineNowMs() + 1000)
     ).diagnostic
 }
 
@@ -3257,12 +3369,12 @@ private func servicePluginLeaseStopped(record: ServicePluginRuntimeRecord, deadl
 }
 
 private func servicePluginDeadlineRemaining(deadlineMs: Int64): Int64 {
-    max(0, deadlineMs - servicePluginNowMs())
+    max(0, deadlineMs - servicePluginDeadlineNowMs())
 }
 
 private func servicePluginPreForceProbeDeadline(deadlineMs: Int64): ServicePluginProbeDeadline {
     let remaining = servicePluginDeadlineRemaining(deadlineMs)
-    ServicePluginProbeDeadline(servicePluginNowMs() + min(25, remaining))
+    ServicePluginProbeDeadline(servicePluginDeadlineNowMs() + min(25, remaining))
 }
 
 private func servicePluginTerminalWithPreForceEvidence(
@@ -3320,7 +3432,7 @@ private func stopAllActiveServicePluginProcesses(): Unit {
 }
 
 public func shutdownServicePluginHost(reason!: String = "shutdown", timeoutMillis!: Int64 = 30000): ServicePluginHostShutdownResult {
-    let deadlineMs = servicePluginNowMs() + max(1, min(timeoutMillis, 30000))
+    let deadlineMs = servicePluginDeadlineNowMs() + max(1, min(timeoutMillis, 30000))
     let activeIds = ArrayList<String>()
     let stopResults = HashMap<String, ServiceStopResult>()
     let cleanupFinalizeResults = HashMap<String, ServicePluginCleanupFinalizeResult>()
@@ -3421,10 +3533,13 @@ public func shutdownServicePluginHost(reason!: String = "shutdown", timeoutMilli
                     let recovered = !result.ok && record.status == "stopped" && !servicePluginHasCleanupPendingLocked(serviceId)
                     if (recovered) {
                         let finalized = cleanupFinalizeResults.get(serviceId)
+                        let ingressStatus = match (finalized) { case Some(value) => value.ingressStopStatus case None => result.ingressStopStatus }
+                        let dispatchStatus = match (finalized) { case Some(value) => value.dispatchStatus case None => result.dispatchStatus }
                         let ownerStatus = match (finalized) { case Some(value) => value.ownerStopStatus case None => result.ownerStopStatus }
                         let leaseStatus = match (finalized) { case Some(value) => value.leaseStatus case None => result.leaseStatus }
                         let portStatus = match (finalized) { case Some(value) => value.portStatus case None => result.portStatus }
-                        let terminalFields = (ownerStatus == "graceful_exited" || ownerStatus == "terminated" || ownerStatus == "force_terminated" || ownerStatus == "already_stopped") &&
+                        let terminalFields = (dispatchStatus == "drained" || dispatchStatus == "cancelled" || dispatchStatus == "not_applicable") &&
+                            (ownerStatus == "graceful_exited" || ownerStatus == "terminated" || ownerStatus == "force_terminated" || ownerStatus == "already_stopped") &&
                             (leaseStatus == "stopped" || leaseStatus == "not_applicable") &&
                             (portStatus == "released" || portStatus == "not_applicable")
                         results.add(ServiceStopResult(
@@ -3433,8 +3548,8 @@ public func shutdownServicePluginHost(reason!: String = "shutdown", timeoutMilli
                             if (terminalFields) { "stopped" } else { "cleanup_pending" },
                             stateFlushed: terminalFields && record.stateFlushed,
                             diagnostic: "${result.diagnostic} cleanup_finalized",
-                            ingressStopStatus: result.ingressStopStatus,
-                            dispatchStatus: result.dispatchStatus,
+                            ingressStopStatus: ingressStatus,
+                            dispatchStatus: dispatchStatus,
                             ownerStopStatus: ownerStatus,
                             leaseStatus: leaseStatus,
                             portStatus: portStatus
@@ -3586,7 +3701,7 @@ private func ensureServicePluginStdioProcess(record: ServicePluginRuntimeRecord,
     }
     cleanupDetachedServicePluginOwner(serviceId, stale, "stdio_closed", diagnostic: "ensure stale active process")
 
-    match (servicePluginBlockingLeaseBeforeStart(serviceId, servicePluginNowMs() + max(1, startupTimeoutMs))) {
+    match (servicePluginBlockingLeaseBeforeStart(serviceId, servicePluginDeadlineNowMs() + max(1, startupTimeoutMs))) {
         case Some(block) => return failServicePluginStartClaim(record, claim, block.status, block.diagnostic)
         case None => ()
     }
@@ -3871,7 +3986,7 @@ private func servicePluginEventPump(record: ServicePluginRuntimeRecord, process:
 }
 
 private func servicePluginDrainDetachedOwner(process: ServicePluginStdioProcess, timeoutMs!: Int64 = 1000): Unit {
-    let deadlineMs = servicePluginNowMs() + max(1, timeoutMs)
+    let deadlineMs = servicePluginDeadlineNowMs() + max(1, timeoutMs)
     let stopReserveMs = min(500, max(100, timeoutMs / 2))
     while (servicePluginDeadlineRemaining(deadlineMs) > stopReserveMs) {
         let remaining = servicePluginDeadlineRemaining(deadlineMs) - stopReserveMs
@@ -4069,8 +4184,8 @@ public func stopServicePlugin(serviceId: String, reason!: String = "", timeoutMi
                                         "cleanup_pending",
                                         stateFlushed: false,
                                         diagnostic: "cleanup finalized but service identity changed",
-                                        ingressStopStatus: slot.ingressStopStatus,
-                                        dispatchStatus: slot.dispatchStatus,
+                                        ingressStopStatus: finalized.ingressStopStatus,
+                                        dispatchStatus: finalized.dispatchStatus,
                                         ownerStopStatus: finalized.ownerStopStatus,
                                         leaseStatus: finalized.leaseStatus,
                                         portStatus: finalized.portStatus
@@ -4082,8 +4197,8 @@ public func stopServicePlugin(serviceId: String, reason!: String = "", timeoutMi
                                     "stopped",
                                     stateFlushed: true,
                                     diagnostic: "${slot.diagnostic} cleanup_retry_stop_status=${finalized.ownerStopStatus} ${finalized.diagnostic} cleanup_finalized",
-                                    ingressStopStatus: slot.ingressStopStatus,
-                                    dispatchStatus: slot.dispatchStatus,
+                                    ingressStopStatus: finalized.ingressStopStatus,
+                                    dispatchStatus: finalized.dispatchStatus,
                                     ownerStopStatus: finalized.ownerStopStatus,
                                     leaseStatus: finalized.leaseStatus,
                                     portStatus: finalized.portStatus
@@ -4105,7 +4220,7 @@ public func stopServicePlugin(serviceId: String, reason!: String = "", timeoutMi
                     )
                 case None => ()
             }
-            let deadlineMs = servicePluginNowMs() + effectiveTimeoutMillis
+            let deadlineMs = servicePluginDeadlineNowMs() + effectiveTimeoutMillis
             let terminalDeadline = ServicePluginProbeDeadline(deadlineMs)
             let stopReserveMs = max(1, effectiveTimeoutMillis / 2)
             var selectedProcess = None<ServicePluginStdioProcess>
@@ -4180,7 +4295,7 @@ public func stopServicePlugin(serviceId: String, reason!: String = "", timeoutMi
                     }
                     let observeBudget = min(500, max(0, servicePluginDeadlineRemaining(deadlineMs) - stopReserveMs) / 2)
                     if (ingressStopStatus == "sent" && observeBudget > 0) {
-                        servicePluginObserveIngressStop(sid, process, servicePluginNowMs() + observeBudget)
+                        servicePluginObserveIngressStop(sid, process, servicePluginDeadlineNowMs() + observeBudget)
                     }
                     dispatchStatus = servicePluginDrainDispatchForStop(process, deadlineMs, stopReserveMs)
                     let forceReserveMs = max(1, stopReserveMs / 2)

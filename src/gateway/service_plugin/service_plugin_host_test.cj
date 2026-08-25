@@ -2127,6 +2127,45 @@ public class ServicePluginHostTest {
     @TestCase
     public func s3N1BoundedPidProbeAndMixedShutdownKeepTruthfulStatuses(): Unit {
         withServicePluginHostTestHome("s3-n1-bounded-probe-shutdown", { home: Path =>
+            setServicePluginPidProbeCommandForTest(Some({ _pid: Int64, _timeoutMs: Int64 =>
+                (Int64(1), "", "")
+            }))
+            @Expect(servicePluginPidProbeStatusForTest(123, 100), "pid_probe_unavailable")
+            setServicePluginPidProbeCommandForTest(Some({ _pid: Int64, _timeoutMs: Int64 =>
+                (Int64(1), "", "kill: Operation not permitted")
+            }))
+            @Expect(servicePluginPidProbeStatusForTest(123, 100), "pid_probe_permission_denied")
+            setServicePluginPidProbeCommandForTest(Some({ _pid: Int64, _timeoutMs: Int64 =>
+                (Int64(125), "", "")
+            }))
+            @Expect(servicePluginPidProbeStatusForTest(123, 100), "invalid_response_encoding")
+            setServicePluginPidProbeCommandForTest(Some({ _pid: Int64, _timeoutMs: Int64 =>
+                (Int64(127), "", "command unavailable")
+            }))
+            @Expect(servicePluginPidProbeStatusForTest(123, 100), "pid_probe_unavailable")
+            setServicePluginPidProbeCommandForTest(Some({ _pid: Int64, _timeoutMs: Int64 =>
+                (Int64(1), "", "kill: No such process")
+            }))
+            @Expect(servicePluginPidProbeStatusForTest(123, 100), "gone")
+            setServicePluginPortReleaseCommandForTest(Some({ _port: Int64, _pid: Int64, _timeoutMs: Int64 =>
+                (Int64(1), "", "lsof failed")
+            }))
+            @Expect(servicePluginPortProbeStatusForTest(19081, 123, 100), "port_probe_unavailable")
+            setServicePluginPortReleaseCommandForTest(Some({ _port: Int64, _pid: Int64, _timeoutMs: Int64 =>
+                (Int64(1), "", "")
+            }))
+            @Expect(servicePluginPortProbeStatusForTest(19081, 123, 100), "released")
+            let clockCalls = ServicePluginTestCounter()
+            setServicePluginMonotonicNowForTest(Some({ =>
+                clockCalls.increment()
+                if (clockCalls.get() == 1) { Int64(100) } else if (clockCalls.get() == 2) { Int64(120) } else { Int64(90) }
+            }))
+            let monotonicRemaining = servicePluginDeadlineRemainingForTest(100)
+            @Expect(monotonicRemaining[0], 80)
+            @Expect(monotonicRemaining[1], 80)
+            setServicePluginMonotonicNowForTest(None<() -> Int64>)
+            setServicePluginPidProbeCommandForTest(None<(Int64, Int64) -> (Int64, String, String)>)
+            setServicePluginPortReleaseCommandForTest(None<(Int64, Int64, Int64) -> (Int64, String, String)>)
             this.registerBrokerServiceFixture(
                 "gcm",
                 pluginId: "gitcode-monitor",
@@ -2147,6 +2186,7 @@ public class ServicePluginHostTest {
                 setServicePluginPidProbeCommandForTest(None<(Int64, Int64) -> (Int64, String, String)>)
                 let retried = stopServicePlugin("gitcode-monitor", reason: "pid-probe-recovered", timeoutMillis: 2000)
                 @Expect(retried.ok, true)
+                @Expect(retried.dispatchStatus, "drained")
                 @Expect(retried.leaseStatus, "stopped")
                 @Expect(retried.portStatus, "released")
 
@@ -2204,7 +2244,87 @@ public class ServicePluginHostTest {
                 @Expect(sawDisabled && sawDegraded && sawRunning, true)
                 @Expect(managedStdioBroker().snapshot().ownerCount, 0)
             } finally {
+                setServicePluginMonotonicNowForTest(None<() -> Int64>)
                 setServicePluginPidProbeCommandForTest(None<(Int64, Int64) -> (Int64, String, String)>)
+                setServicePluginPortReleaseCommandForTest(None<(Int64, Int64, Int64) -> (Int64, String, String)>)
+                resetServicePluginHostForTest()
+            }
+        })
+    }
+
+    @TestCase
+    public func s3N1UnknownPreForceAndExpiredPostProbeStayCleanupPending(): Unit {
+        withServicePluginHostTestHome("s3-n1-preforce-unknown", { home: Path =>
+            let expireClock = ServicePluginTestCounter()
+            let pidProbeCalls = ServicePluginTestCounter()
+            let portProbeCalls = ServicePluginTestCounter()
+            let clockOrigin = MonoTime.now()
+            this.registerBrokerServiceFixture(
+                "ignore-term",
+                pluginId: "gitcode-monitor",
+                capabilityId: "gitcode.monitor.status"
+            )
+            try {
+                @Expect(ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 3000).ok, true)
+                let pid = getServicePluginSnapshot("gitcode-monitor").getOrThrow().pid
+                @Expect(pid > 0, true)
+                setServicePluginBeforeDispatchWaitForTest(Some({ _waitMs: Int64 =>
+                    let leasePath = home.join("service-plugin").join("runtime").join("gitcode-monitor").join("gitcode-monitor-1.lease.json")
+                    File.writeTo(
+                        leasePath,
+                        ("{\"state\":\"running\",\"status\":\"running\",\"pluginId\":\"gitcode-monitor\",\"sessionId\":\"wrong-generation\",\"pid\":${pid},\"parentPid\":${getProcessId()},\"bindHost\":\"127.0.0.1\",\"port\":19081}").toArray()
+                    )
+                }))
+                setServicePluginPidProbeCommandForTest(Some({ _pid: Int64, _timeoutMs: Int64 =>
+                    pidProbeCalls.increment()
+                    if (pidProbeCalls.get() == 2) { expireClock.increment() }
+                    (Int64(127), "", "command unavailable")
+                }))
+                setServicePluginPortReleaseCommandForTest(Some({ _port: Int64, _pid: Int64, _timeoutMs: Int64 =>
+                    portProbeCalls.increment()
+                    (Int64(127), "", "command unavailable")
+                }))
+                setServicePluginMonotonicNowForTest(Some({ =>
+                    if (expireClock.get() > 0) {
+                        Int64(10000)
+                    } else {
+                        (MonoTime.now() - clockOrigin).toMilliseconds()
+                    }
+                }))
+
+                let pending = stopServicePlugin("gitcode-monitor", reason: "preforce-unknown", timeoutMillis: 1000)
+                @Expect(pending.ok, false)
+                @Expect(pending.status, "cleanup_pending")
+                @Expect(pending.leaseStatus, "identity_mismatch")
+                @Expect(pending.portStatus, "not_checked")
+                // ingress observation, pre-force evidence, then the bounded 1 ms auto-finalizer retry.
+                @Expect(pidProbeCalls.get(), 3)
+                @Expect(portProbeCalls.get(), 0)
+                @Expect(servicePluginCleanupPendingCountForTest(), 1)
+
+                setServicePluginMonotonicNowForTest(None<() -> Int64>)
+                setServicePluginBeforeDispatchWaitForTest(None<(Int64) -> Unit>)
+                setServicePluginPidProbeCommandForTest(None<(Int64, Int64) -> (Int64, String, String)>)
+                setServicePluginPortReleaseCommandForTest(None<(Int64, Int64, Int64) -> (Int64, String, String)>)
+                let leasePath = home.join("service-plugin").join("runtime").join("gitcode-monitor").join("gitcode-monitor-1.lease.json")
+                File.writeTo(
+                    leasePath,
+                    ("{\"state\":\"stopped\",\"status\":\"stopped\",\"pluginId\":\"gitcode-monitor\",\"sessionId\":\"gitcode-monitor-1\",\"pid\":${pid},\"parentPid\":${getProcessId()},\"bindHost\":\"127.0.0.1\",\"port\":19081}").toArray()
+                )
+                let retried = stopServicePlugin("gitcode-monitor", reason: "preforce-retry", timeoutMillis: 3000)
+                @Expect(retried.ok, true)
+                @Expect(retried.status, "stopped")
+                @Expect(retried.dispatchStatus, "drained")
+                @Expect(retried.leaseStatus, "stopped")
+                @Expect(retried.portStatus, "released")
+                @Expect(servicePluginCleanupPendingCountForTest(), 0)
+                @Expect(managedStdioBroker().snapshot().ownerCount, 0)
+            } finally {
+                setServicePluginMonotonicNowForTest(None<() -> Int64>)
+                setServicePluginBeforeDispatchWaitForTest(None<(Int64) -> Unit>)
+                setServicePluginPidProbeCommandForTest(None<(Int64, Int64) -> (Int64, String, String)>)
+                setServicePluginPortReleaseCommandForTest(None<(Int64, Int64, Int64) -> (Int64, String, String)>)
+                let _ = stopServicePlugin("gitcode-monitor", reason: "test-finally", timeoutMillis: 2000)
                 resetServicePluginHostForTest()
             }
         })
