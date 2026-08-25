@@ -1462,6 +1462,7 @@ public class ServicePluginHostTest {
                 ServicePluginHealthzProbeResult(false, statusCode: 0, durationMs: 10, diagnostic: "healthz_timeout")
             }))
             setServicePluginPortOwnerProbeForTest(Some({ _port: Int64, _pid: Int64 => true }))
+            setServicePluginSupervisorAutoStartForTest(false)
             try {
                 let started = ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000)
                 @Expect(started.ok, true)
@@ -1473,15 +1474,18 @@ public class ServicePluginHostTest {
                 let tick = runServicePluginSupervisorTickForTest("gitcode-monitor", nowMs: 2000)
                 @Expect(tick.classification.shouldRecover, true)
                 @Expect(tick.recovered, false)
+                @Expect(tick.diagnostic.contains("port_release_timeout"), true)
+                @Expect(tick.diagnostic.contains("portOwnerAlive=true"), true)
                 match (getServicePluginSnapshot("gitcode-monitor")) {
                     case Some(snapshot) =>
                         @Expect(snapshot.pid, firstPid)
                         @Expect(snapshot.supervisorRestartCount, 0)
-                        @Expect(snapshot.lastError.contains("port_release_timeout"), true)
-                        @Expect(snapshot.lastError.contains("portOwnerAlive=true"), true)
+                        @Expect(snapshot.status, "degraded")
+                        @Expect(snapshot.degradedReason, "healthz_timeout")
                     case None => @Expect(true, false)
                 }
             } finally {
+                setServicePluginSupervisorAutoStartForTest(true)
                 setServicePluginHealthzProbeForTest(None)
                 setServicePluginPortOwnerProbeForTest(None)
                 resetServicePluginHostForTest()
