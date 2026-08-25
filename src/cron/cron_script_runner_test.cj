@@ -176,6 +176,7 @@ public class CronScriptRunnerTest {
                 remainingMs: 20
             )
             @Expect(result.ok, false)
+            @Expect(result.message, "cron script timed out after 20ms")
             @Expect(result.timedOut, true)
             @Expect(result.errorCode, "cron_script_timeout")
             @Expect(result.output.contains("late-success"), false)
@@ -504,10 +505,23 @@ public class CronScriptRunnerTest {
             } finally {
                 setCronScriptStopRunnerForTest(None<(String, Int64, Int64) -> ManagedStdioOperationResult>)
                 try { File.writeTo(cronScriptsDir(root).join("cleanup-healthy.release"), "release".toArray()) } catch (_: Exception) { () }
+                var futuresSettled = true
                 for (future in [timedFuture, cancelFuture, killedFuture, healthyFuture, cleanupFuture, cleanupHealthyFuture]) {
-                    match (future) { case Some(value) => try { let _ = value.get(Duration.second * 5) } catch (_: Exception) { () } case None => () }
+                    match (future) {
+                        case Some(value) => try { let _ = value.get(Duration.second * 5) } catch (_: Exception) { futuresSettled = false }
+                        case None => ()
+                    }
                 }
-                let _ = resetManagedStdioBrokerForTest(timeoutMs: 3000)
+                @Expect(futuresSettled, true)
+                var resetResult = resetManagedStdioBrokerForTest(timeoutMs: 3000)
+                if (!resetResult.ok && resetResult.status == "broker_shutdown_timeout") {
+                    resetResult = resetManagedStdioBrokerForTest(timeoutMs: 3000)
+                }
+                @Expect(resetResult.ok, true)
+                let resetSnapshot = managedStdioBroker().snapshot()
+                @Expect(resetSnapshot.ownerCount, 0)
+                @Expect(resetSnapshot.brokerPid, 0)
+                @Expect(resetSnapshot.readerCount, 0)
             }
         })
     }
