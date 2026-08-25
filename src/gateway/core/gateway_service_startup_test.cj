@@ -213,7 +213,7 @@ public class GatewayServiceStartupTest {
 
             service.start()
             healthy.queue("")
-            service.processOnce()
+            service.processOnceAndAwaitForTest()
 
             @Expect(slow.startCount, 1)
             @Expect(slow.stopCount, 1)

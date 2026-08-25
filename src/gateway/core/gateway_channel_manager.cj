@@ -1513,6 +1513,19 @@ public class GatewayChannelManager {
         }
     }
 
+    public func markInboundRejected(channelId: String, accountId: String, errorKind: String): Unit {
+        let _ = gatewayChannelRuntimeMarkInboundRejected(channelId, accountId: accountId, errorKind: errorKind)
+    }
+
+    public func markInboundFailure(channelId: String, accountId: String, error: String): Unit {
+        this.updateLiveAccount(channelId, accountId, { state =>
+            state.running = true
+            state.connected = true
+            state.lastError = error.trimAscii()
+        })
+        let _ = gatewayChannelRuntimeMarkInboundFailure(channelId, accountId: accountId, error: error)
+    }
+
     public func sendToAdapterName(adapterName: String, outbound: OutboundMessage): GatewayChannelSendResult {
         let normalized = adapterName.trimAscii()
         let rawAccountId = outbound.accountId.trimAscii()
@@ -1635,6 +1648,34 @@ public class GatewayChannelManager {
                     )
                 }
                 return this.emptyMessageIdResult(normalized, rawAccountId, requiredAccountId)
+            } catch (e: GatewayChannelSendTimeoutException) {
+                let safeReason = gatewaySanitizeChannelDiagnostic(e.message)
+                this.updateLiveAccount(entry.channelId, entry.accountId, { state =>
+                    state.lastError = safeReason
+                })
+                gatewayChannelRuntimeMarkSend(entry.channelId, accountId: entry.accountId, success: false, detail: safeReason)
+                gatewayLogEventError(
+                    "gateway/channel/${entry.channelId}",
+                    "channel.failed",
+                    "channel direct send timed out",
+                    meta: gatewayLogMeta()
+                        .string("channel", entry.channelId)
+                        .string("accountId", entry.accountId)
+                        .string("phase", "send")
+                        .string("status", "failed")
+                        .identityHash("peerHash", outbound.peerId)
+                        .int("textLen", Int64(outbound.text.size))
+                        .string("errorKind", "send_timeout")
+                        .rawString("error", safeReason)
+                        .object()
+                )
+                return GatewayChannelSendResult(
+                    false,
+                    lastReason: "direct adapter send timed out for channel='${normalized}' rawAccountId='${rawAccountId}' canonicalAccountId='${requiredAccountId}': ${safeReason}",
+                    reasonKind: "send_timeout",
+                    rawAccountId: rawAccountId,
+                    canonicalAccountId: requiredAccountId
+                )
             } catch (e: Exception) {
                 let safeReason = gatewaySanitizeChannelDiagnostic(e.message)
                 this.updateLiveAccount(entry.channelId, entry.accountId, { state =>

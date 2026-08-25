@@ -108,6 +108,12 @@ public class GatewayTelegramThreadBindingManagerTest {
             var user = GatewayUserSettings()
             @Expect(gatewayTelegramThreadBindingSessionHintForMessage(user, message, "default"), "")
             user.telegram.threadBindings.enabled = true
+            let peek = gatewayTelegramThreadBindingPeekForMessage(user, message, "default")
+            @Expect(peek.sessionKey, "agent:main:explicit:telegram-user")
+            @Expect(peek.accountId, "default")
+            @Expect(peek.conversationId, "user:8734062810")
+            let beforeTouch = gatewayTelegramThreadBindingResolve("telegram", "default", "user:8734062810")
+            @Expect(beforeTouch.get("updatedAtMs").getOrThrow().toJsonString(), "1000")
             @Expect(gatewayTelegramThreadBindingSessionHintForMessage(user, message, "default"), "agent:main:explicit:telegram-user")
         }
     }

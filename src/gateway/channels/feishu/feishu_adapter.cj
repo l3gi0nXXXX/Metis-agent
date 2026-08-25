@@ -2,7 +2,7 @@ package metis.gateway.channels.feishu
 
 import metis.core.{MediaDiagnosticEvent, emitGatewayMediaDiagnostic, mediaDiagnosticMergeMeta, mediaDiagnosticPathMeta, parseGatewayAudioParts, parseGatewayDocumentParts, parseGatewayEditText, parseGatewayPhotoParts, parseGatewayReactionRemove, parseGatewayReactionStatus, parseGatewayReactionToken, parseGatewayVideoParts, parseGatewayVoiceParts}
 import metis.core.config.CliConfig
-import metis.gateway.core.{ChannelAdapter, gatewayLogIdentityHash}
+import metis.gateway.core.{ChannelAdapter, GatewayChannelSendTimeoutException, gatewayLogIdentityHash}
 import metis.gateway.logging.{MetisLogEvent, metisCreateSubsystemLogger}
 import metis.gateway.model.*
 import metis.gateway.model.FeishuConfig
@@ -1355,7 +1355,11 @@ public class FeishuAdapter <: ChannelAdapter {
             this.logSendFailure(message, this.outboundAccountId(message), "feishu adapter is not running")
             return SendResult.Failed("feishu adapter is not running")
         }
-        let sentMessageId = this.sendWithMessageId(message)
+        let sentMessageId = try {
+            this.sendWithMessageId(message)
+        } catch (e: GatewayChannelSendTimeoutException) {
+            return SendResult.Failed(e.message)
+        }
         if (!sentMessageId.trimAscii().isEmpty()) {
             return SendResult.Success
         }
@@ -6154,6 +6158,10 @@ public class FeishuAdapter <: ChannelAdapter {
             return (true, injected.messageId)
         }
         if (injected.status != "not_configured") {
+            if (injected.status == "request_timeout") {
+                this.lastSendError = "request_timeout"
+                throw GatewayChannelSendTimeoutException("request_timeout")
+            }
             this.lastSendError = if (injected.error.isEmpty()) { injected.status } else { injected.error }
             return (false, "")
         }

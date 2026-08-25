@@ -304,9 +304,14 @@ private func withGatewayFeishuNativeTestHome<T>(label: String, root: JsonObject,
     }
 }
 
-private func gatewayFeishuNativeService(adapter: GatewayFeishuNativeTestAdapter, enableGroup!: Bool = true, accountId!: String = "default"): GatewayService {
+private func gatewayFeishuNativeService(
+    adapter: GatewayFeishuNativeTestAdapter,
+    enableDirect!: Bool = true,
+    enableGroup!: Bool = true,
+    accountId!: String = "default"
+): GatewayService {
     let policies = HashMap<String, ChannelPolicyConfig>()
-    policies["feishu"] = ChannelPolicyConfig(enableDirect: true, enableGroup: enableGroup, requireMentionInGroup: true)
+    policies["feishu"] = ChannelPolicyConfig(enableDirect: enableDirect, enableGroup: enableGroup, requireMentionInGroup: true)
     let service = GatewayService(GatewayRouter(policies))
     service.registerAdapter(adapter, channelId: "feishu", accountId: accountId)
     service
@@ -353,6 +358,28 @@ private func gatewayFeishuNativeGitcodePluginSettings(accountId: String, manifes
 @Test
 public class GatewayServiceFeishuNativeTest {
     @TestCase
+    public func p4U1RejectedRouteStillExecutesFeishuNativeCommandFirst(): Unit {
+        withGatewayFeishuNativeTestHome("p4-native-before-route", gatewayFeishuNativeTestRoot(), { =>
+            let adapter = GatewayFeishuNativeTestAdapter(accountId: "feishu-gitcode-monitor")
+            let service = gatewayFeishuNativeService(
+                adapter,
+                enableDirect: false,
+                enableGroup: false,
+                accountId: "feishu-gitcode-monitor"
+            )
+            service.start()
+            try {
+                adapter.queueDirect("/feishu help")
+                service.processOnceAndAwaitForTest()
+                @Expect(adapter.sentCount(), 1)
+                @Expect(adapter.sentText(0).contains("/feishu_diagnose"), true)
+            } finally {
+                service.stop()
+            }
+        })
+    }
+
+    @TestCase
     public func feishuGitcodeCommandDispatchesBeforeAgentRoute(): Unit {
         withGatewayFeishuNativeTestHome("gitcode-dispatch", gatewayFeishuNativeTestRoot(), { =>
             var user = CliSettingManager.readGatewaySettings()
@@ -369,7 +396,7 @@ public class GatewayServiceFeishuNativeTest {
                 }))
 
                 adapter.queueDirect("/gitcode status")
-                service.processOnce()
+                service.processOnceAndAwaitForTest()
 
                 @Expect(adapter.sentCount(), 1)
                 @Expect(adapter.sentText(0).contains("GitCode status:"), true)
@@ -399,7 +426,7 @@ public class GatewayServiceFeishuNativeTest {
                 }))
 
                 adapter.queueDirect("/gitcode webhook status")
-                service.processOnce()
+                service.processOnceAndAwaitForTest()
 
                 @Expect(adapter.sentCount(), 1)
                 let text = adapter.sentText(0)
@@ -447,9 +474,9 @@ public class GatewayServiceFeishuNativeTest {
                 }))
 
                 adapter.queueDirect("/gitcode scan once")
-                service.processOnce()
+                service.processOnceAndAwaitForTest()
                 adapter.queueDirect("/gitcode scan once --max-repos 2 --max-items 20")
-                service.processOnce()
+                service.processOnceAndAwaitForTest()
 
                 @Expect(adapter.sentCount(), 2)
                 @Expect(adapter.sentText(0).contains("GitCode webhook-first reconcile 已启动"), true)
@@ -494,7 +521,7 @@ public class GatewayServiceFeishuNativeTest {
                 }))
 
                 adapter.queueDirect("/gitcode scan once --timeout-ms 1000")
-                service.processOnce()
+                service.processOnceAndAwaitForTest()
 
                 @Expect(adapter.sentCount(), 1)
                 @Expect(adapter.sentText(0).contains("--timeout-ms is not supported for webhook-first reconcile"), true)
@@ -529,9 +556,9 @@ public class GatewayServiceFeishuNativeTest {
                 }))
 
                 adapter.queueDirect("/gitcode status")
-                service.processOnce()
+                service.processOnceAndAwaitForTest()
                 adapter.queueDirect("/gitcode scan once")
-                service.processOnce()
+                service.processOnceAndAwaitForTest()
 
                 @Expect(adapter.sentCount(), 2)
                 let statusText = adapter.sentText(0)
@@ -574,19 +601,19 @@ public class GatewayServiceFeishuNativeTest {
                     CapabilityInvokeResult(false, "stdout_protocol_violation", serviceId: "gitcode-monitor", capabilityId: request.capabilityId, diagnostic: "{\"ok\":false,\"status\":\"stdout_protocol_violation\",\"diagnostic\":\"Authorization: Bearer secret /Users/name/private\"}")
                 }))
                 adapter.queueDirect("/gitcode scan once --max-repos 1")
-                service.processOnce()
+                service.processOnceAndAwaitForTest()
 
                 setServicePluginCapabilityInvokerForTest(Some({ _registration: ServicePluginRegistration, request: CapabilityInvokeRequest =>
                     CapabilityInvokeResult(false, "unexpected_frame", serviceId: "gitcode-monitor", capabilityId: request.capabilityId, diagnostic: "{\"ok\":false,\"status\":\"unexpected_frame\",\"diagnostic\":\"Authorization: Bearer secret /Users/name/private\"}")
                 }))
                 adapter.queueDirect("/gitcode scan once --max-repos 2")
-                service.processOnce()
+                service.processOnceAndAwaitForTest()
 
                 setServicePluginCapabilityInvokerForTest(Some({ _registration: ServicePluginRegistration, request: CapabilityInvokeRequest =>
                     CapabilityInvokeResult(false, "payload_invalid", serviceId: "gitcode-monitor", capabilityId: request.capabilityId, diagnostic: "{\"ok\":false,\"status\":\"payload_invalid\",\"diagnostic\":\"Authorization: Bearer secret /Users/name/private\"}")
                 }))
                 adapter.queueDirect("/gitcode scan once --max-repos 3")
-                service.processOnce()
+                service.processOnceAndAwaitForTest()
 
                 @Expect(adapter.sentCount(), 3)
                 @Expect(adapter.sentText(0), "GitCode reconcile failed: service plugin wrote invalid data to stdout before the response.")
@@ -626,7 +653,7 @@ public class GatewayServiceFeishuNativeTest {
             service.start()
             try {
                 adapter.queueDirect("/gitcode status")
-                service.processOnce()
+                service.processOnceAndAwaitForTest()
 
                 @Expect(adapter.sentCount(), 1)
                 @Expect(adapter.sentText(0).contains("degraded"), true)
@@ -646,7 +673,7 @@ public class GatewayServiceFeishuNativeTest {
             service.start()
             try {
                 adapter.queueGroup("/feishu start")
-                service.processOnce()
+                service.processOnceAndAwaitForTest()
                 @Expect(adapter.sentCount(), 1)
                 @Expect(adapter.sentText(0).contains("Metis Feishu start"), true)
                 @Expect(adapter.sentText(0).contains("accountId: default"), true)
@@ -673,7 +700,7 @@ public class GatewayServiceFeishuNativeTest {
             service.start()
             try {
                 adapter.queueGroup("/feishu start")
-                service.processOnce()
+                service.processOnceAndAwaitForTest()
                 let reply = adapter.sentText(0)
                 @Expect(adapter.sentCount(), 1)
                 @Expect(reply.contains("connection: configured"), true)
@@ -697,7 +724,7 @@ public class GatewayServiceFeishuNativeTest {
             service.start()
             try {
                 adapter.queueDirect("/feishu doctor")
-                service.processOnce()
+                service.processOnceAndAwaitForTest()
                 let reply = adapter.sentText(0)
                 @Expect(adapter.sentCount(), 1)
                 @Expect(reply.contains("Metis Feishu doctor"), true)
@@ -719,8 +746,8 @@ public class GatewayServiceFeishuNativeTest {
             try {
                 adapter.queueDirect("/feishu_diagnose")
                 adapter.queueDirect("/feishu help")
-                service.processOnce()
-                service.processOnce()
+                service.processOnceAndAwaitForTest()
+                service.processOnceAndAwaitForTest()
                 @Expect(adapter.sentCount(), 2)
 
                 let diagnose = adapter.sentText(0)
@@ -748,7 +775,7 @@ public class GatewayServiceFeishuNativeTest {
             service.start()
             try {
                 adapter.queueDirect("/feishu doctor")
-                service.processOnce()
+                service.processOnceAndAwaitForTest()
                 let reply = adapter.sentText(0)
                 @Expect(reply.contains("helper typing: not-advertised"), true)
                 @Expect(reply.contains("helper forward: not-advertised"), true)
@@ -774,9 +801,9 @@ public class GatewayServiceFeishuNativeTest {
                 adapter.queueDirect("/feishu start")
                 adapter.queueDirect("/feishu doctor")
                 adapter.queueDirect("/feishu info --all")
-                service.processOnce()
-                service.processOnce()
-                service.processOnce()
+                service.processOnceAndAwaitForTest()
+                service.processOnceAndAwaitForTest()
+                service.processOnceAndAwaitForTest()
                 @Expect(adapter.sentCount(), 3)
                 let all = adapter.sentText(0) + "\n" + adapter.sentText(1) + "\n" + adapter.sentText(2)
                 @Expect(all.contains("dmPolicy: pairing"), true)
@@ -805,7 +832,7 @@ public class GatewayServiceFeishuNativeTest {
             service.start()
             try {
                 adapter.queueDirect("/feishu doctor")
-                service.processOnce()
+                service.processOnceAndAwaitForTest()
                 let reply = adapter.sentText(0)
                 @Expect(reply.contains("dmPolicy: open"), true)
                 @Expect(reply.contains("warning: dmPolicy=open allows any Feishu DM user"), true)
@@ -835,7 +862,7 @@ public class GatewayServiceFeishuNativeTest {
             service.start()
             try {
                 adapter.queueDirect("/feishu doctor")
-                service.processOnce()
+                service.processOnceAndAwaitForTest()
                 let reply = adapter.sentText(0)
                 @Expect(adapter.sentCount(), 1)
                 @Expect(reply.contains("credentials: configured"), true)
@@ -890,9 +917,9 @@ public class GatewayServiceFeishuNativeTest {
                 adapter.queueDirect("/feishu start")
                 adapter.queueDirect("/feishu doctor")
                 adapter.queueDirect("/feishu auth")
-                service.processOnce()
-                service.processOnce()
-                service.processOnce()
+                service.processOnceAndAwaitForTest()
+                service.processOnceAndAwaitForTest()
+                service.processOnceAndAwaitForTest()
                 @Expect(adapter.sentCount(), 3)
                 let start = adapter.sentText(0)
                 let doctor = adapter.sentText(1)
@@ -940,7 +967,7 @@ public class GatewayServiceFeishuNativeTest {
             service.start()
             try {
                 adapter.queueDirect("/feishu auth")
-                service.processOnce()
+                service.processOnceAndAwaitForTest()
                 let reply = adapter.sentText(0)
                 @Expect(adapter.sentCount(), 1)
                 @Expect(reply.contains("Metis Feishu auth"), true)
@@ -976,7 +1003,7 @@ public class GatewayServiceFeishuNativeTest {
             service.start()
             try {
                 adapter.queueDirect("/feishu auth")
-                service.processOnce()
+                service.processOnceAndAwaitForTest()
                 let reply = adapter.sentText(0)
                 @Expect(adapter.sentCount(), 1)
                 @Expect(reply.contains("OAuth/user authorization: pending"), true)
@@ -1016,7 +1043,7 @@ public class GatewayServiceFeishuNativeTest {
             service.start()
             try {
                 adapter.queueDirect("/feishu auth")
-                service.processOnce()
+                service.processOnceAndAwaitForTest()
                 let reply = adapter.sentText(0)
                 @Expect(adapter.sentCount(), 1)
                 @Expect(reply.contains("accountId: tenant-a"), true)
@@ -1050,7 +1077,7 @@ public class GatewayServiceFeishuNativeTest {
             service.start()
             try {
                 adapter.queueDirect("/feishu auth")
-                service.processOnce()
+                service.processOnceAndAwaitForTest()
                 let reply = adapter.sentText(0)
                 @Expect(adapter.sentCount(), 1)
                 @Expect(reply.contains("Metis Feishu auth"), true)
@@ -1085,7 +1112,7 @@ public class GatewayServiceFeishuNativeTest {
             service.start()
             try {
                 adapter.queueDirect("hello")
-                service.processOnce()
+                service.processOnceAndAwaitForTest()
 
                 @Expect(adapter.sentCount(), 3)
                 @Expect(adapter.sentText(0), "[reaction]\ntoken=Typing\nrender=Typing")
@@ -1117,7 +1144,7 @@ public class GatewayServiceFeishuNativeTest {
             service.start()
             try {
                 adapter.queueDirect("hello")
-                service.processOnce()
+                service.processOnceAndAwaitForTest()
 
                 @Expect(adapter.sentCount(), 2)
                 @Expect(adapter.sentText(0), "[reaction]\ntoken=Typing\nrender=Typing")
@@ -1137,7 +1164,7 @@ public class GatewayServiceFeishuNativeTest {
             service.start()
             try {
                 adapter.queueDirect("/feishu doctor")
-                service.processOnce()
+                service.processOnceAndAwaitForTest()
 
                 @Expect(adapter.sentCount(), 1)
                 @Expect(adapter.sentText(0).contains("[reaction]"), false)
@@ -1163,7 +1190,7 @@ public class GatewayServiceFeishuNativeTest {
             service.start()
             try {
                 adapter.queueDirect("hello")
-                service.processOnce()
+                service.processOnceAndAwaitForTest()
 
                 @Expect(adapter.sentCount(), 3)
                 @Expect(adapter.sentText(0), "[reaction]\ntoken=Typing\nrender=Typing")
@@ -1194,7 +1221,7 @@ public class GatewayServiceFeishuNativeTest {
             service.start()
             try {
                 adapter.queueDirect("hello")
-                service.processOnce()
+                service.processOnceAndAwaitForTest()
 
                 @Expect(adapter.sentCount(), 1)
                 @Expect(adapter.sentText(0), "模型服务本轮返回空响应，未能完成回复。请稍后重试或切换模型。")
@@ -1228,7 +1255,7 @@ public class GatewayServiceFeishuNativeTest {
             service.start()
             try {
                 adapter.queueDirect("hello")
-                service.processOnce()
+                service.processOnceAndAwaitForTest()
 
                 @Expect(adapter.sentCount(), 0)
                 let store = gatewaySessionStoreForUser(CliSettingManager.readGatewaySettings())
@@ -1261,7 +1288,7 @@ public class GatewayServiceFeishuNativeTest {
             service.start()
             try {
                 adapter.queueDirect("hello")
-                service.processOnce()
+                service.processOnceAndAwaitForTest()
 
                 @Expect(adapter.sentCount(), 1)
                 @Expect(adapter.sentText(0), "normal feishu answer")
@@ -1292,7 +1319,7 @@ public class GatewayServiceFeishuNativeTest {
             service.start()
             try {
                 adapter.queueDirectWithRoute("hello team", gatewayFeishuNativeBroadcastMediaContext())
-                service.processOnce()
+                service.processOnceAndAwaitForTest()
                 @Expect(adapter.sentCount(), 2)
                 @Expect(capturedAgents.size, 2)
                 @Expect(capturedAgents.contains("writer"), true)

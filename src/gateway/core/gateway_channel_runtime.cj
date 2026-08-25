@@ -7,9 +7,12 @@ import metis.core.config.CliConfig
 import std.collection.{ArrayList, HashSet}
 import std.convert.Parsable
 import std.fs.{File, Path, exists}
+import std.sync.Mutex
 import std.time.DateTime
 
 import stdx.encoding.json.{JsonArray, JsonObject, JsonString, JsonValue}
+
+private let gatewayChannelRuntimeStateLock = Mutex()
 
 public func gatewayChannelRuntimeStatePath(): String {
     CliConfig.dotDir.join("gateway-channel-runtime-state.json").toString()
@@ -31,6 +34,10 @@ private func gatewayChannelRuntimeWriteState(root: JsonObject): Unit {
     let now = DateTime.now().toUnixTimeStamp().toMilliseconds()
     root.put("updatedAtMs", now.toJsonValue())
     File.writeTo(Path(gatewayChannelRuntimeStatePath()), root.toJsonString().toArray())
+}
+
+private func gatewayChannelRuntimeReadLocked<T>(reader: (JsonObject) -> T): T {
+    synchronized(gatewayChannelRuntimeStateLock) { reader(gatewayChannelRuntimeReadState()) }
 }
 
 private func gatewayChannelRuntimeReadBootstrap(root: JsonObject): JsonObject {
@@ -205,6 +212,7 @@ private func channelRuntimeCloneRow(row: JsonObject): JsonObject {
     out.put("failureCount", channelRuntimeReadInt(row, "failureCount", 0).toJsonValue())
     out.put("pullCount", channelRuntimeReadInt(row, "pullCount", 0).toJsonValue())
     out.put("inboundCount", channelRuntimeReadInt(row, "inboundCount", 0).toJsonValue())
+    out.put("inboundRejectedCount", channelRuntimeReadInt(row, "inboundRejectedCount", 0).toJsonValue())
     out.put("sendSuccessCount", channelRuntimeReadInt(row, "sendSuccessCount", 0).toJsonValue())
     out.put("sendFailureCount", channelRuntimeReadInt(row, "sendFailureCount", 0).toJsonValue())
     out.put("registeredAtMs", channelRuntimeReadInt(row, "registeredAtMs", 0).toJsonValue())
@@ -212,6 +220,7 @@ private func channelRuntimeCloneRow(row: JsonObject): JsonObject {
     out.put("lastStopAtMs", channelRuntimeReadInt(row, "lastStopAtMs", 0).toJsonValue())
     out.put("lastPullAtMs", channelRuntimeReadInt(row, "lastPullAtMs", 0).toJsonValue())
     out.put("lastEventAtMs", channelRuntimeReadInt(row, "lastEventAtMs", 0).toJsonValue())
+    out.put("lastRejectedAtMs", channelRuntimeReadInt(row, "lastRejectedAtMs", 0).toJsonValue())
     out.put("lastSendAtMs", channelRuntimeReadInt(row, "lastSendAtMs", 0).toJsonValue())
     out.put("lastError", JsonString(channelRuntimeRedactSecretText(channelRuntimeReadString(row, "lastError", ""))))
     out.put("errorKind", JsonString(channelRuntimeReadString(row, "errorKind", "")))
@@ -245,36 +254,38 @@ private func channelRuntimeUpsertAccount(
     accountId: String,
     updater: (JsonObject) -> JsonObject
 ): JsonObject {
-    let root = gatewayChannelRuntimeReadState()
-    let existing = channelRuntimeReadAccounts(root)
-    let next = JsonArray([])
-    let normalizedChannel = channelId.trimAscii().toAsciiLower()
-    let normalizedAccount = gatewayCanonicalChannelAccountId(normalizedChannel, accountId)
-    var found = false
-    var updated = JsonObject()
-    for (i in 0..existing.size()) {
-        let row = try { existing[i].asObject() } catch (_e: Exception) { JsonObject() }
-        let rowChannel = channelRuntimeReadString(row, "channelId", "").trimAscii().toAsciiLower()
-        let rowAccount = gatewayCanonicalChannelAccountId(rowChannel, channelRuntimeReadString(row, "accountId", ""))
-        if (rowChannel == normalizedChannel && rowAccount == normalizedAccount) {
-            found = true
-            updated = updater(row)
+    synchronized(gatewayChannelRuntimeStateLock) {
+        let root = gatewayChannelRuntimeReadState()
+        let existing = channelRuntimeReadAccounts(root)
+        let next = JsonArray([])
+        let normalizedChannel = channelId.trimAscii().toAsciiLower()
+        let normalizedAccount = gatewayCanonicalChannelAccountId(normalizedChannel, accountId)
+        var found = false
+        var updated = JsonObject()
+        for (i in 0..existing.size()) {
+            let row = try { existing[i].asObject() } catch (_e: Exception) { JsonObject() }
+            let rowChannel = channelRuntimeReadString(row, "channelId", "").trimAscii().toAsciiLower()
+            let rowAccount = gatewayCanonicalChannelAccountId(rowChannel, channelRuntimeReadString(row, "accountId", ""))
+            if (rowChannel == normalizedChannel && rowAccount == normalizedAccount) {
+                found = true
+                updated = updater(row)
+                updated.put("channelId", JsonString(normalizedChannel))
+                updated.put("accountId", JsonString(normalizedAccount))
+                next.add(updated)
+            } else {
+                next.add(row)
+            }
+        }
+        if (!found) {
+            updated = updater(JsonObject())
             updated.put("channelId", JsonString(normalizedChannel))
             updated.put("accountId", JsonString(normalizedAccount))
             next.add(updated)
-        } else {
-            next.add(row)
         }
+        root.put("accounts", next)
+        gatewayChannelRuntimeWriteState(root)
+        updated
     }
-    if (!found) {
-        updated = updater(JsonObject())
-        updated.put("channelId", JsonString(normalizedChannel))
-        updated.put("accountId", JsonString(normalizedAccount))
-        next.add(updated)
-    }
-    root.put("accounts", next)
-    gatewayChannelRuntimeWriteState(root)
-    updated
 }
 
 public func gatewayChannelRuntimeRegisterAccount(
@@ -320,6 +331,7 @@ public func gatewayChannelRuntimeRegisterAccount(
         out.put("failureCount", row.get("failureCount") ?? 0.toJsonValue())
         out.put("pullCount", row.get("pullCount") ?? 0.toJsonValue())
         out.put("inboundCount", row.get("inboundCount") ?? 0.toJsonValue())
+        out.put("inboundRejectedCount", row.get("inboundRejectedCount") ?? 0.toJsonValue())
         out.put("sendSuccessCount", row.get("sendSuccessCount") ?? 0.toJsonValue())
         out.put("sendFailureCount", row.get("sendFailureCount") ?? 0.toJsonValue())
         out.put("registeredAtMs", row.get("registeredAtMs") ?? now.toJsonValue())
@@ -327,6 +339,7 @@ public func gatewayChannelRuntimeRegisterAccount(
         out.put("lastStopAtMs", row.get("lastStopAtMs") ?? 0.toJsonValue())
         out.put("lastPullAtMs", row.get("lastPullAtMs") ?? 0.toJsonValue())
         out.put("lastEventAtMs", row.get("lastEventAtMs") ?? 0.toJsonValue())
+        out.put("lastRejectedAtMs", row.get("lastRejectedAtMs") ?? 0.toJsonValue())
         out.put("lastSendAtMs", row.get("lastSendAtMs") ?? 0.toJsonValue())
         out.put("lastError", row.get("lastError") ?? JsonString(""))
         out.put("errorKind", row.get("errorKind") ?? JsonString(""))
@@ -433,6 +446,7 @@ private func gatewayChannelRuntimeNewBaseAccountRow(
     base.put("failureCount", 0.toJsonValue())
     base.put("pullCount", 0.toJsonValue())
     base.put("inboundCount", 0.toJsonValue())
+    base.put("inboundRejectedCount", 0.toJsonValue())
     base.put("sendSuccessCount", 0.toJsonValue())
     base.put("sendFailureCount", 0.toJsonValue())
     base.put("registeredAtMs", now.toJsonValue())
@@ -440,6 +454,7 @@ private func gatewayChannelRuntimeNewBaseAccountRow(
     base.put("lastStopAtMs", 0.toJsonValue())
     base.put("lastPullAtMs", 0.toJsonValue())
     base.put("lastEventAtMs", 0.toJsonValue())
+    base.put("lastRejectedAtMs", 0.toJsonValue())
     base.put("lastSendAtMs", 0.toJsonValue())
     base.put("lastError", JsonString(""))
     base.put("errorKind", JsonString(""))
@@ -463,6 +478,7 @@ private func gatewayChannelRuntimeNewBaseAccountRow(
 }
 
 public func gatewayChannelRuntimePrimeAccounts(entries: JsonArray): Int64 {
+    synchronized(gatewayChannelRuntimeStateLock) {
     if (entries.size() == 0) {
         return 0
     }
@@ -494,6 +510,7 @@ public func gatewayChannelRuntimePrimeAccounts(entries: JsonArray): Int64 {
     root.put("accounts", next)
     gatewayChannelRuntimeWriteState(root)
     primedCount
+    }
 }
 
 public func gatewayChannelRuntimeMarkBootstrap(
@@ -504,6 +521,7 @@ public func gatewayChannelRuntimeMarkBootstrap(
     configuredBindingCount!: Int64 = 0,
     primedBindingCount!: Int64 = 0
 ): JsonObject {
+    synchronized(gatewayChannelRuntimeStateLock) {
     let root = gatewayChannelRuntimeReadState()
     let bootstrap = JsonObject()
     let now = gatewayChannelRuntimeNowMs()
@@ -518,10 +536,11 @@ public func gatewayChannelRuntimeMarkBootstrap(
     root.put("bootstrap", bootstrap)
     gatewayChannelRuntimeWriteState(root)
     bootstrap
+    }
 }
 
 public func gatewayChannelRuntimeBootstrapSummary(): JsonObject {
-    gatewayChannelRuntimeReadBootstrap(gatewayChannelRuntimeReadState())
+    gatewayChannelRuntimeReadLocked({ root => gatewayChannelRuntimeReadBootstrap(root) })
 }
 
 public func gatewayChannelRuntimeMarkStarting(channelId: String, accountId!: String = "default"): JsonObject {
@@ -662,6 +681,24 @@ public func gatewayChannelRuntimeMarkInboundFailure(
     })
 }
 
+public func gatewayChannelRuntimeMarkInboundRejected(
+    channelId: String,
+    accountId!: String = "default",
+    errorKind!: String = "inbound_queue_full"
+): JsonObject {
+    channelRuntimeUpsertAccount(channelId, accountId, { row =>
+        let out = channelRuntimeCloneRow(row)
+        let now = gatewayChannelRuntimeNowMs()
+        let history = match (row.get("history")) { case Some(v) => try { v.asArray() } catch (_e: Exception) { JsonArray([]) } case None => JsonArray([]) }
+        out.put("inboundRejectedCount", (channelRuntimeReadInt(row, "inboundRejectedCount", 0) + 1).toJsonValue())
+        out.put("lastRejectedAtMs", now.toJsonValue())
+        out.put("lastError", JsonString(errorKind.trimAscii()))
+        out.put("errorKind", JsonString(errorKind.trimAscii()))
+        out.put("history", channelRuntimeAppendHistory(history, "inbound-rejected", errorKind))
+        out
+    })
+}
+
 public func gatewayChannelRuntimeMarkPull(channelId: String, accountId!: String = "default", inboundCount!: Int64 = 0): JsonObject {
     channelRuntimeUpsertAccount(channelId, accountId, { row =>
         let out = channelRuntimeCloneRow(row)
@@ -743,33 +780,37 @@ public func gatewayChannelRuntimeCanStart(channelId: String, accountId!: String 
 }
 
 public func gatewayChannelRuntimeSnapshot(): JsonObject {
-    gatewayChannelRuntimeReadState()
+    gatewayChannelRuntimeReadLocked({ root => root })
 }
 
 public func gatewayChannelRuntimeAccountsJson(channelId: String): JsonArray {
-    let out = JsonArray([])
-    let normalized = channelId.trimAscii().toAsciiLower()
-    let accounts = channelRuntimeReadAccounts(gatewayChannelRuntimeReadState())
-    for (i in 0..accounts.size()) {
-        let row = try { accounts[i].asObject() } catch (_e: Exception) { JsonObject() }
-        if (channelRuntimeReadString(row, "channelId", "") == normalized) {
-            out.add(row)
+    gatewayChannelRuntimeReadLocked({ root =>
+        let out = JsonArray([])
+        let normalized = channelId.trimAscii().toAsciiLower()
+        let accounts = channelRuntimeReadAccounts(root)
+        for (i in 0..accounts.size()) {
+            let row = try { accounts[i].asObject() } catch (_e: Exception) { JsonObject() }
+            if (channelRuntimeReadString(row, "channelId", "") == normalized) {
+                out.add(row)
+            }
         }
-    }
-    out
+        out
+    })
 }
 
 public func gatewayPluginRuntimeAccountsJson(pluginId: String): JsonArray {
-    let out = JsonArray([])
-    let normalized = pluginId.trimAscii().toAsciiLower()
-    let accounts = channelRuntimeReadAccounts(gatewayChannelRuntimeReadState())
-    for (i in 0..accounts.size()) {
-        let row = try { accounts[i].asObject() } catch (_e: Exception) { JsonObject() }
-        if (channelRuntimeReadString(row, "pluginId", "") == normalized) {
-            out.add(row)
+    gatewayChannelRuntimeReadLocked({ root =>
+        let out = JsonArray([])
+        let normalized = pluginId.trimAscii().toAsciiLower()
+        let accounts = channelRuntimeReadAccounts(root)
+        for (i in 0..accounts.size()) {
+            let row = try { accounts[i].asObject() } catch (_e: Exception) { JsonObject() }
+            if (channelRuntimeReadString(row, "pluginId", "") == normalized) {
+                out.add(row)
+            }
         }
-    }
-    out
+        out
+    })
 }
 
 public func gatewayChannelRuntimeDefaultAccountId(channelId: String): JsonValue {

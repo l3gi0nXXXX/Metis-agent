@@ -280,7 +280,7 @@ public func sidecarTextInboundReachesGatewaySessionAndFeishuReplySend(): Unit {
         let service = feishuBotE2eService(adapter)
 
         service.start()
-        service.processOnce()
+        service.processOnceAndAwaitForTest()
         service.stop()
 
         @Expect(transport.startCount == 1)
@@ -319,7 +319,7 @@ public func duplicateSidecarInboundDoesNotSendDuplicateReply(): Unit {
         let service = feishuBotE2eService(adapter)
 
         service.start()
-        service.processOnce()
+        service.processOnceAndAwaitForTest()
         service.stop()
 
         @Expect(agentRuns.size == 1)
@@ -350,7 +350,7 @@ public func groupGateBlocksAgentAndSendWhenChatIsNotAllowed(): Unit {
         let service = feishuBotE2eService(adapter)
 
         service.start()
-        service.processOnce()
+        service.processOnceAndAwaitForTest()
         service.stop()
 
         @Expect(agentRuns.size == 0)
@@ -389,7 +389,7 @@ public func sidecarTextInboundEmptyModelResponseUsesFallbackAndRepliesCronDelive
 
         service.start()
         try {
-            service.processOnce()
+            service.processOnceAndAwaitForTest()
         } finally {
             service.stop()
         }
@@ -427,7 +427,7 @@ public func sidecarTextInboundEmptyModelResponseWithoutFallbackSendsVisibleDiagn
 
         service.start()
         try {
-            service.processOnce()
+            service.processOnceAndAwaitForTest()
         } finally {
             service.stop()
         }

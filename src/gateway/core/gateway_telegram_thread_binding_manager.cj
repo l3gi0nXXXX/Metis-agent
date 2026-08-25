@@ -6,19 +6,24 @@ import metis.gateway.model.{InboundMessage, channelToString}
 import magic.jsonable.*
 import std.convert.Parsable
 import std.fs.{Directory, File, Path, exists}
+import std.sync.Mutex
 import std.time.DateTime
 import stdx.encoding.json.{JsonArray, JsonBool, JsonObject, JsonString, JsonValue}
 
 private var gatewayTelegramThreadBindingRootOverride: Option<Path> = None<Path>
+private let gatewayTelegramThreadBindingRootLock = Mutex()
+private let gatewayTelegramThreadBindingStateLock = Mutex()
 
 public func setGatewayTelegramThreadBindingRootForTest(root: Option<Path>): Unit {
-    gatewayTelegramThreadBindingRootOverride = root
+    synchronized(gatewayTelegramThreadBindingRootLock) { gatewayTelegramThreadBindingRootOverride = root }
 }
 
 private func gatewayTelegramThreadBindingRoot(): Path {
-    match (gatewayTelegramThreadBindingRootOverride) {
-        case Some(root) => root
-        case None => CliConfig.dotDir.join("gateway-telegram")
+    synchronized(gatewayTelegramThreadBindingRootLock) {
+        match (gatewayTelegramThreadBindingRootOverride) {
+            case Some(root) => root
+            case None => CliConfig.dotDir.join("gateway-telegram")
+        }
     }
 }
 
@@ -82,6 +87,7 @@ private func gatewayTelegramThreadBindingExpired(row: JsonObject, nowMs: Int64):
 }
 
 public func gatewayTelegramThreadBindingExpire(nowMs!: Int64 = gatewayTelegramThreadBindingNowMs()): JsonObject {
+    synchronized(gatewayTelegramThreadBindingStateLock) {
     let rows = gatewayTelegramThreadBindingLoad()
     let kept = JsonArray([])
     var expired: Int64 = 0
@@ -99,6 +105,7 @@ public func gatewayTelegramThreadBindingExpire(nowMs!: Int64 = gatewayTelegramTh
     out.put("expired", expired.toJsonValue())
     out.put("remaining", kept.size().toJsonValue())
     return out
+    }
 }
 
 public func gatewayTelegramThreadBindingBind(
@@ -112,6 +119,7 @@ public func gatewayTelegramThreadBindingBind(
     ttlMs!: Int64 = 0,
     nowMs!: Int64 = gatewayTelegramThreadBindingNowMs()
 ): JsonObject {
+    synchronized(gatewayTelegramThreadBindingStateLock) {
     let normalizedChannel = channel.trimAscii().toAsciiLower()
     let normalizedAccount = accountId.trimAscii()
     let normalizedConversation = conversationId.trimAscii()
@@ -154,9 +162,10 @@ public func gatewayTelegramThreadBindingBind(
     result.put("status", JsonString("bound"))
     result.put("binding", record)
     return result
+    }
 }
 
-public func gatewayTelegramThreadBindingList(nowMs!: Int64 = gatewayTelegramThreadBindingNowMs()): JsonArray {
+private func gatewayTelegramThreadBindingListUnlocked(nowMs: Int64): JsonArray {
     let rows = gatewayTelegramThreadBindingLoad()
     let out = JsonArray([])
     for (i in 0..rows.size()) {
@@ -168,6 +177,10 @@ public func gatewayTelegramThreadBindingList(nowMs!: Int64 = gatewayTelegramThre
     return out
 }
 
+public func gatewayTelegramThreadBindingList(nowMs!: Int64 = gatewayTelegramThreadBindingNowMs()): JsonArray {
+    synchronized(gatewayTelegramThreadBindingStateLock) { gatewayTelegramThreadBindingListUnlocked(nowMs) }
+}
+
 public func gatewayTelegramThreadBindingResolve(
     channel: String,
     accountId: String,
@@ -175,11 +188,12 @@ public func gatewayTelegramThreadBindingResolve(
     parentConversationId!: String = "",
     nowMs!: Int64 = gatewayTelegramThreadBindingNowMs()
 ): JsonObject {
+    synchronized(gatewayTelegramThreadBindingStateLock) {
     let normalizedChannel = channel.trimAscii().toAsciiLower()
     let normalizedAccount = accountId.trimAscii()
     let normalizedConversation = conversationId.trimAscii()
     let normalizedParent = parentConversationId.trimAscii()
-    let rows = gatewayTelegramThreadBindingList(nowMs: nowMs)
+    let rows = gatewayTelegramThreadBindingListUnlocked(nowMs)
     var parentMatch = JsonObject()
     for (i in 0..rows.size()) {
         let row = try { rows[i].asObject() } catch (_e: Exception) { JsonObject() }
@@ -200,6 +214,7 @@ public func gatewayTelegramThreadBindingResolve(
         }
     }
     parentMatch
+    }
 }
 
 public func gatewayTelegramThreadBindingTouch(
@@ -208,6 +223,7 @@ public func gatewayTelegramThreadBindingTouch(
     conversationId: String,
     nowMs!: Int64 = gatewayTelegramThreadBindingNowMs()
 ): JsonObject {
+    synchronized(gatewayTelegramThreadBindingStateLock) {
     let rows = gatewayTelegramThreadBindingLoad()
     let key = gatewayTelegramThreadBindingKey(channel, accountId, conversationId)
     let out = JsonArray([])
@@ -230,6 +246,7 @@ public func gatewayTelegramThreadBindingTouch(
         result.put("binding", touched)
     }
     return result
+    }
 }
 
 public func gatewayTelegramThreadBindingUnbind(
@@ -238,6 +255,7 @@ public func gatewayTelegramThreadBindingUnbind(
     conversationId: String,
     nowMs!: Int64 = gatewayTelegramThreadBindingNowMs()
 ): JsonObject {
+    synchronized(gatewayTelegramThreadBindingStateLock) {
     let rows = gatewayTelegramThreadBindingLoad()
     let key = gatewayTelegramThreadBindingKey(channel, accountId, conversationId)
     let out = JsonArray([])
@@ -259,6 +277,7 @@ public func gatewayTelegramThreadBindingUnbind(
     result.put("status", JsonString(if (removed > 0) { "unbound" } else { "not_found" }))
     result.put("removed", removed.toJsonValue())
     return result
+    }
 }
 
 private func gatewayTelegramParentConversationId(peerId: String, conversationId: String): String {
@@ -282,17 +301,30 @@ public func gatewayTelegramConversationIdForMessage(message: InboundMessage): St
     message.peerId.trimAscii()
 }
 
-public func gatewayTelegramThreadBindingSessionHintForMessage(
+public class GatewayTelegramThreadBindingHint {
+    public let sessionKey: String
+    public let accountId: String
+    public let conversationId: String
+
+    public init(sessionKey!: String = "", accountId!: String = "", conversationId!: String = "") {
+        this.sessionKey = sessionKey.trimAscii()
+        this.accountId = accountId.trimAscii()
+        this.conversationId = conversationId.trimAscii()
+    }
+}
+
+/** Resolves a binding without updating its persisted timestamp. */
+public func gatewayTelegramThreadBindingPeekForMessage(
     user: GatewayUserSettings,
     message: InboundMessage,
     accountId: String
-): String {
+): GatewayTelegramThreadBindingHint {
     if (!user.telegram.threadBindings.enabled || channelToString(message.channel) != "telegram") {
-        return ""
+        return GatewayTelegramThreadBindingHint()
     }
     let conversationId = gatewayTelegramConversationIdForMessage(message)
     if (conversationId.isEmpty()) {
-        return ""
+        return GatewayTelegramThreadBindingHint()
     }
     let parentConversationId = gatewayTelegramParentConversationId(message.peerId, conversationId)
     let binding = gatewayTelegramThreadBindingResolve(
@@ -301,9 +333,21 @@ public func gatewayTelegramThreadBindingSessionHintForMessage(
         conversationId,
         parentConversationId: parentConversationId
     )
-    let sessionKey = gatewayTelegramThreadBindingString(binding, "sessionKey")
-    if (!sessionKey.isEmpty()) {
-        let _ = gatewayTelegramThreadBindingTouch("telegram", gatewayTelegramThreadBindingString(binding, "accountId"), gatewayTelegramThreadBindingString(binding, "conversationId"))
+    GatewayTelegramThreadBindingHint(
+        sessionKey: gatewayTelegramThreadBindingString(binding, "sessionKey"),
+        accountId: gatewayTelegramThreadBindingString(binding, "accountId"),
+        conversationId: gatewayTelegramThreadBindingString(binding, "conversationId")
+    )
+}
+
+public func gatewayTelegramThreadBindingSessionHintForMessage(
+    user: GatewayUserSettings,
+    message: InboundMessage,
+    accountId: String
+): String {
+    let hint = gatewayTelegramThreadBindingPeekForMessage(user, message, accountId)
+    if (!hint.sessionKey.isEmpty()) {
+        let _ = gatewayTelegramThreadBindingTouch("telegram", hint.accountId, hint.conversationId)
     }
-    sessionKey
+    hint.sessionKey
 }

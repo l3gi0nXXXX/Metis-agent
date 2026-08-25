@@ -291,7 +291,7 @@ public class GatewayCronNonblockingE2eTest {
                     telegram.enqueue("telegram-${idx}-🙂")
                 }
                 let began = DateTime.now().toUnixTimeStamp().toMilliseconds()
-                gateway.processOnce()
+                gateway.processOnceAndAwaitForTest()
                 let elapsed = DateTime.now().toUnixTimeStamp().toMilliseconds() - began
                 @Expect(elapsed < 1000, true)
                 @Expect(feishu.sendCount(), 4)
@@ -684,7 +684,7 @@ public class GatewayCronNonblockingE2eTest {
             try {
                 feishu.enqueue("创建定时任务：禁止递归 cron/clarify")
                 telegram.enqueue("create cron; reject gateway/message")
-                gateway.processOnce()
+                gateway.processOnceAndAwaitForTest()
                 @Expect(feishu.sendCount(), 1)
                 @Expect(telegram.countText("telegram:created-cron:"), 1)
                 @Expect(feishu.hasText("created-cron"), true)
@@ -897,7 +897,7 @@ public class GatewayCronNonblockingE2eTest {
                     feishu.enqueue(feishuText)
                     telegram.enqueue(telegramText)
                     let beganAtMs = DateTime.now().toUnixTimeStamp().toMilliseconds()
-                    gateway.processOnce()
+                    gateway.processOnceAndAwaitForTest()
                     let response = cronP3FetchHealthz(healthUrl)
                     let healthz = JsonValue.fromStr(response.body).asObject()
                     let brokerHealth = managedStdioBroker().probeBroker(timeoutMs: 500)
@@ -930,7 +930,7 @@ public class GatewayCronNonblockingE2eTest {
                     feishu.enqueue(feishuText)
                     telegram.enqueue(telegramText)
                     let beganAtMs = DateTime.now().toUnixTimeStamp().toMilliseconds()
-                    gateway.processOnce()
+                    gateway.processOnceAndAwaitForTest()
                     let response = cronP3FetchHealthz(healthUrl)
                     let healthz = JsonValue.fromStr(response.body).asObject()
                     let brokerHealth = managedStdioBroker().probeBroker(timeoutMs: 500)

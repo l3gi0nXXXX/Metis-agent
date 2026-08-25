@@ -3,6 +3,7 @@ package metis.gateway.core
 import metis.core.config.GatewayUserSettings
 
 import std.collection.HashMap
+import std.sync.Mutex
 import std.convert.Parsable
 import stdx.encoding.json.{JsonObject, JsonValue}
 
@@ -138,6 +139,7 @@ public func gatewayTelegramErrorCooldownMsForTarget(user: GatewayUserSettings, p
 }
 
 public class GatewayTelegramErrorPolicyState {
+    private let lock = Mutex()
     private let lastErrorReplyAtMsByKey = HashMap<String, Int64>()
 
     public init() {}
@@ -158,15 +160,17 @@ public class GatewayTelegramErrorPolicyState {
         }
         let key = "${peerId.trimAscii()}|${threadId.trimAscii()}|${errorKey.trimAscii()}"
         let cooldownMs = gatewayTelegramErrorCooldownMsForTarget(user, peerId, threadId)
-        match (this.lastErrorReplyAtMsByKey.get(key)) {
-            case Some(lastAt) =>
-                if (nowMs - lastAt < cooldownMs) {
-                    return false
-                }
-            case None => ()
+        synchronized(this.lock) {
+            match (this.lastErrorReplyAtMsByKey.get(key)) {
+                case Some(lastAt) =>
+                    if (nowMs - lastAt < cooldownMs) {
+                        return false
+                    }
+                case None => ()
+            }
+            this.lastErrorReplyAtMsByKey[key] = nowMs
+            true
         }
-        this.lastErrorReplyAtMsByKey[key] = nowMs
-        true
     }
 }
 

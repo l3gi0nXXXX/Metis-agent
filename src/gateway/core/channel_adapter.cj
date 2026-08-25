@@ -2,6 +2,10 @@ package metis.gateway.core
 
 import metis.gateway.model.{InboundMessage, OutboundMessage, SendResult}
 
+public class GatewayChannelSendTimeoutException <: Exception {
+    public init(message: String) { super(message) }
+}
+
 /**
  * 渠道适配器统一接口。
  * 所有渠道（飞书、QQ、钉钉等）都应实现该接口，确保 Gateway 核心可复用。

@@ -14,8 +14,10 @@ import metis.gateway.tools.{gatewayCkbAdminCommand, gatewayHandleNativeCommandLi
 import metis.gateway.gitcode_plugin.{GatewayCommandContext, GitCodePromptTemplate, GitCodePromptTemplateSet, GitCodeReviewPromptPlan, GitCodeReviewRuntimeConfig, buildGitCodeAsyncScanPayload, buildGitCodeDeadLetterInspectPayload, buildGitCodeDeadLetterListPayload, buildGitCodeEventReconcilePayload, buildGitCodeHookReconcilePayload, buildGitCodeReplyPromptForServicePluginEvent, buildGitCodeSubscriptionTarget, buildGitCodeWebhookCancelPayload, buildGitCodeWebhookReplayPayload, buildGitCodeWebhookStatusPayload, defaultGitCodePromptTemplateSet, defaultGitCodeReviewRuntimeConfig, formatGitCodeSubscribeResult, gitCodeSubscriptionStatusJson, gitCodeSubscriptionStoreSnapshotForDispatcher, handleGitCodeKnowledgeQueryCommand, loadGitCodePromptTemplates, loadGitCodeSubscriptionStore, parseGeneratedReplyModelOutput, parseGitCodeCommand, parseGitCodeDeliveryArgs, parseGitCodeHookReconcileArgs, parseGitCodeReconcileOnceArgs, parseGitCodeReviewRuntimeConfig, parseGitCodeScanOnceArgs, removeGitCodeSubscription, renderGeneratedReplyDraft, renderGitCodeDeadLetterInspectResult, renderGitCodeDeadLetterListResult, renderGitCodeEventReconcileResult, renderGitCodeHookReconcileResult, renderGitCodeWebhookCancelResult, renderGitCodeWebhookReplayResult, renderGitCodeWebhookStatusResult, saveGitCodeSubscription, setGitCodeSubscriptionStore}
 import magic.jsonable.*
 import std.collection.{ArrayList, HashSet}
+import std.core.Duration
 import std.convert.Parsable
 import std.fs.{Directory, File, Path, copy, exists, remove}
+import std.sync.Mutex
 import std.time.DateTime
 import stdx.encoding.json.{JsonArray, JsonBool, JsonObject, JsonString, JsonValue}
 
@@ -40,6 +42,12 @@ func gatewayServiceStopOwnersThenBroker(stopOwners: () -> Unit, stopBroker: () -
     }
 }
 
+private func gatewayInboundFallbackOrderingKey(message: InboundMessage, accountId: String): String {
+    let conversation = (message.conversationId ?? "").trimAscii()
+    let peer = if (!conversation.isEmpty()) { conversation } else { message.peerId.trimAscii() }
+    "${channelToString(message.channel)}|${accountId.trimAscii()}|${peer}"
+}
+
 /**
  * GatewayService（P0）：
  * 将渠道消息处理链路串起来。
@@ -54,6 +62,8 @@ public class GatewayService {
     private let router: GatewayRouter
     private let channelManager: GatewayChannelManager
     private let transcriptPublisher: Option<(GatewaySessionContext, Int64, String, String) -> Unit>
+    private let inboundDispatcher: GatewayInboundDispatcher
+    private let sharedStateLock = Mutex()
     private let telegramAutoTopicLabelAttempts = HashSet<String>()
     private let consumedTelegramPluginCallbackIds = HashSet<String>()
     private let telegramErrorPolicyState = GatewayTelegramErrorPolicyState()
@@ -66,11 +76,14 @@ public class GatewayService {
     public init(
         router: GatewayRouter,
         transcriptPublisher!: Option<(GatewaySessionContext, Int64, String, String) -> Unit> = None<(GatewaySessionContext, Int64, String, String) -> Unit>,
-        channelStartupAccountTimeoutMs!: Int64 = 3000
+        channelStartupAccountTimeoutMs!: Int64 = 3000,
+        inboundMaxActive!: Int64 = 8,
+        inboundMaxQueued!: Int64 = 128
     ) {
         this.router = router
         this.channelManager = GatewayChannelManager(startupAccountTimeoutMs: channelStartupAccountTimeoutMs)
         this.transcriptPublisher = transcriptPublisher
+        this.inboundDispatcher = GatewayInboundDispatcher(maxActive: inboundMaxActive, maxQueued: inboundMaxQueued)
     }
 
     private func startNowMs(): Int64 {
@@ -214,6 +227,20 @@ public class GatewayService {
      * 停止所有渠道。
      */
     public func stop(): Unit {
+        let inboundStop = this.inboundDispatcher.stop(timeoutMs: 3000)
+        if (!inboundStop.ok) {
+            gatewayLogEventError(
+                "gateway/service",
+                "gateway.inbound.stop.failed",
+                "gateway inbound dispatcher did not drain within its deadline",
+                meta: gatewayLogMeta()
+                    .string("phase", "stop")
+                    .string("status", inboundStop.status)
+                    .int("active", inboundStop.active)
+                    .int("queued", inboundStop.queued)
+                    .object()
+            )
+        }
         gatewayServiceStopOwnersThenBroker({ =>
             let user = CliSettingManager.readGatewaySettings()
             let _ = gatewayOpenClawCompatHostStop(user)
@@ -232,7 +259,62 @@ public class GatewayService {
      * P0 用单次循环更容易调试与测试；外层可按需定时调用。
      */
     public func processOnce(): Unit {
-        this.channelManager.processOnce({ message, accountId => this.handleInbound(message, accountId) })
+        this.channelManager.processOnce({ message, accountId =>
+            let prepared = this.prepareInbound(message, accountId)
+            let queued = this.inboundDispatcher.enqueue(prepared, { item, control =>
+                try {
+                    this.executePreparedInbound(item, control)
+                } catch (e: Exception) {
+                    let channelId = channelToString(item.message.channel)
+                    this.channelManager.markInboundFailure(channelId, item.effectiveAccountId, e.message)
+                    gatewayLogEventError(
+                        "gateway/channel/${channelId}",
+                        "inbound.failed",
+                        "gateway inbound execution failed",
+                        meta: gatewayLogMeta()
+                            .string("channel", channelId)
+                            .string("accountId", item.effectiveAccountId)
+                            .string("messageId", item.message.messageId)
+                            .string("orderKey", item.orderKey)
+                            .string("errorKind", "inbound_failed")
+                            .rawString("error", e.message)
+                            .object()
+                    )
+                }
+            })
+            if (!queued.ok) {
+                let channelId = channelToString(message.channel)
+                this.channelManager.markInboundRejected(channelId, prepared.effectiveAccountId, queued.status)
+                gatewayLogEventError(
+                    "gateway/channel/${channelId}",
+                    "inbound.queue.rejected",
+                    "gateway inbound queue rejected message",
+                    meta: gatewayLogMeta()
+                        .string("channel", channelId)
+                        .string("accountId", prepared.effectiveAccountId)
+                        .string("messageId", message.messageId)
+                        .string("orderKey", prepared.orderKey)
+                        .string("errorKind", queued.status)
+                        .object()
+                )
+            }
+        })
+    }
+
+    public func awaitInboundIdleForTest(timeoutMs!: Int64 = 3000): Bool {
+        let deadline = this.startNowMs() + max(1, timeoutMs)
+        while (this.startNowMs() < deadline) {
+            if (this.inboundDispatcher.activeCount() == 0 && this.inboundDispatcher.queuedCount() == 0) {
+                return true
+            }
+            sleep(Duration.millisecond)
+        }
+        this.inboundDispatcher.activeCount() == 0 && this.inboundDispatcher.queuedCount() == 0
+    }
+
+    public func processOnceAndAwaitForTest(timeoutMs!: Int64 = 3000): Bool {
+        this.processOnce()
+        this.awaitInboundIdleForTest(timeoutMs: timeoutMs)
     }
 
     private func executeInboundSessionTurn(
@@ -242,6 +324,7 @@ public class GatewayService {
         message: InboundMessage,
         effectiveAccountId: String,
         telegramAutoVoiceReply: Bool,
+        control: GatewayInboundExecutionControl,
         bestEffortDeliver!: Bool = false
     ): GatewayResolvedSessionTurnResult {
         gatewayExecuteSessionRequestTurnForUser(
@@ -253,6 +336,7 @@ public class GatewayService {
             replyToMessageId: this.telegramReplyTargetOrMessageId(message),
             replyInThread: message.replyInThread,
             deliverHook: Some({ channelName, deliveryAccountId, peerId, text, replyToMessageId, replyInThread =>
+                if (control.isCancelled()) { return "" }
                 let (effectiveReplyToMessageId, effectiveReplyInThread, degraded, policyReason) =
                     gatewayApplyOutboundChannelPolicy(user, channelName, replyToMessageId, replyInThread)
                 if (degraded) {
@@ -303,11 +387,15 @@ public class GatewayService {
             transcriptHook: this.transcriptPublisher,
             lifecycleHook: if (channelToString(message.channel) == "telegram") {
                 Some({ status: String =>
-                    this.maybeSendTelegramLifecycleSignal(user, message, effectiveAccountId, status)
+                    if (!control.isCancelled()) {
+                        this.maybeSendTelegramLifecycleSignal(user, message, effectiveAccountId, status)
+                    }
                 })
             } else if (channelToString(message.channel) == "feishu" && request.deliver) {
                 Some({ status: String =>
-                    this.maybeSendFeishuAckLifecycleSignal(user, message, effectiveAccountId, status)
+                    if (!control.isCancelled()) {
+                        this.maybeSendFeishuAckLifecycleSignal(user, message, effectiveAccountId, status)
+                    }
                 })
             } else {
                 None<(String) -> Unit>
@@ -391,7 +479,7 @@ public class GatewayService {
         }
     }
 
-    private func handleInbound(message: InboundMessage, accountId: String): Unit {
+    public func prepareInbound(message: InboundMessage, accountId: String): GatewayPreparedInbound {
         let effectiveAccountId = if (!message.accountId.trimAscii().isEmpty()) {
             message.accountId.trimAscii()
         } else {
@@ -424,10 +512,48 @@ public class GatewayService {
                 .object()
         )
         let user = CliSettingManager.readGatewaySettings()
+        let decision = this.router.route(message)
+        var conversationKey = match (decision.conversationKey) { case Some(value) => value case None => "" }
+        var bindingAccountId = ""
+        var bindingConversationId = ""
+        if (decision.accepted && channelToString(message.channel) == "telegram") {
+            let hint = gatewayTelegramThreadBindingPeekForMessage(user, message, effectiveAccountId)
+            if (!hint.sessionKey.isEmpty()) {
+                conversationKey = hint.sessionKey
+                bindingAccountId = hint.accountId
+                bindingConversationId = hint.conversationId
+            }
+        }
+        let orderKey = if (!conversationKey.trimAscii().isEmpty()) {
+            conversationKey.trimAscii()
+        } else {
+            gatewayInboundFallbackOrderingKey(message, effectiveAccountId)
+        }
+        GatewayPreparedInbound(
+            message,
+            effectiveAccountId,
+            user,
+            decision,
+            conversationKey,
+            orderKey,
+            bindingAccountId: bindingAccountId,
+            bindingConversationId: bindingConversationId
+        )
+    }
+
+    private func executePreparedInbound(
+        prepared: GatewayPreparedInbound,
+        control: GatewayInboundExecutionControl
+    ): Unit {
+        if (control.isCancelled()) { return }
+        let message = prepared.message
+        let effectiveAccountId = prepared.effectiveAccountId
+        let user = prepared.user
+        let decision = prepared.decision
+        let conversationKey = prepared.conversationKey
         if (channelToString(message.channel) == "feishu" && this.handleFeishuNativeCommand(message, effectiveAccountId, user)) {
             return
         }
-        let decision = this.router.route(message)
         gatewayLogEventInfo(
             "gateway/message",
             "message.routed",
@@ -444,28 +570,24 @@ public class GatewayService {
             // P0: 被拒绝消息直接忽略。后续可补审计日志与指标上报。
             return
         }
-
-        var conversationKey = decision.conversationKey.getOrThrow()
+        if (control.isCancelled()) { return }
         let telegramAutoVoiceReply = channelToString(message.channel) == "telegram" &&
             this.telegramShouldUseVoiceReply(user, message)
         let sessionUser = this.telegramSessionUserForAutoVoiceReply(user, telegramAutoVoiceReply)
-        if (channelToString(message.channel) == "telegram") {
-            let bindingSession = gatewayTelegramThreadBindingSessionHintForMessage(user, message, effectiveAccountId)
-            if (!bindingSession.trimAscii().isEmpty()) {
-                conversationKey = bindingSession.trimAscii()
-                gatewayLogEventInfo(
-                    "gateway/message",
-                    "message.routed",
-                    "telegram thread binding selected session",
-                    meta: gatewayLogMeta()
-                        .string("channel", "telegram")
-                        .string("accountId", effectiveAccountId)
-                        .identityHash("peerHash", message.peerId)
-                        .string("sessionKey", conversationKey)
-                        .string("matchedBy", "thread_binding")
-                        .object()
-                )
-            }
+        if (!prepared.bindingConversationId.isEmpty()) {
+            let _ = gatewayTelegramThreadBindingTouch("telegram", prepared.bindingAccountId, prepared.bindingConversationId)
+            gatewayLogEventInfo(
+                "gateway/message",
+                "message.routed",
+                "telegram thread binding selected session",
+                meta: gatewayLogMeta()
+                    .string("channel", "telegram")
+                    .string("accountId", effectiveAccountId)
+                    .identityHash("peerHash", message.peerId)
+                    .string("sessionKey", conversationKey)
+                    .string("matchedBy", "thread_binding")
+                    .object()
+            )
         }
         if (channelToString(message.channel) == "telegram" && message.text.trimAscii().startsWith("[telegram-approval]")) {
             let result = gatewayResolveTelegramApprovalCallback(message.text, user)
@@ -490,6 +612,7 @@ public class GatewayService {
         if (channelToString(message.channel) == "telegram" && this.handleTelegramNativeCommand(message, effectiveAccountId, user, conversationKey)) {
             return
         }
+        if (control.isCancelled()) { return }
         let routeRoot = match (MetisConfigManager.rawConfig()) {
             case Some(root) => root
             case None => JsonObject()
@@ -521,6 +644,9 @@ public class GatewayService {
             )
             let broadcastConversationKey = conversationKey
             let results = gatewayRunAgentTeamBroadcastPlan(broadcastPlan, { broadcastTurn: GatewayAgentTeamBroadcastTurn =>
+                if (control.isCancelled()) {
+                    throw Exception("inbound_cancelled")
+                }
                 let turn =
                     this.executeInboundSessionTurn(
                         user,
@@ -529,6 +655,7 @@ public class GatewayService {
                         message,
                         effectiveAccountId,
                         telegramAutoVoiceReply,
+                        control,
                         bestEffortDeliver: true
                     )
                 this.logInboundTurnOutcome(broadcastConversationKey, message, turn)
@@ -561,9 +688,11 @@ public class GatewayService {
             }
             return
         }
+        if (control.isCancelled()) { return }
         let turn = try {
-            this.executeInboundSessionTurn(user, sessionUser, request, message, effectiveAccountId, telegramAutoVoiceReply)
+            this.executeInboundSessionTurn(user, sessionUser, request, message, effectiveAccountId, telegramAutoVoiceReply, control)
         } catch (e: Exception) {
+            if (control.isCancelled()) { return }
             if (channelToString(message.channel) == "telegram") {
                 this.handleTelegramInboundExecutionError(user, message, effectiveAccountId, e)
                 return
@@ -2077,10 +2206,17 @@ public class GatewayService {
             return
         }
         let key = "${accountId}|${message.peerId}|${threadId}"
-        if (this.telegramAutoTopicLabelAttempts.contains(key)) {
+        let alreadyAttempted = synchronized(this.sharedStateLock) {
+            if (this.telegramAutoTopicLabelAttempts.contains(key)) {
+                true
+            } else {
+                this.telegramAutoTopicLabelAttempts.add(key)
+                false
+            }
+        }
+        if (alreadyAttempted) {
             return
         }
-        this.telegramAutoTopicLabelAttempts.add(key)
         let title = gatewayTelegramDeterministicAutoTopicLabel(message.text)
         try {
             let _ = this.sendTextToPeerDetailed(
@@ -4204,7 +4340,19 @@ public class GatewayService {
             return true
         }
         let callbackId = this.telegramNativeField(message.text, "id").trimAscii()
-        if (!callbackId.isEmpty() && this.consumedTelegramPluginCallbackIds.contains(callbackId)) {
+        let duplicateCallback = if (callbackId.isEmpty()) {
+            false
+        } else {
+            synchronized(this.sharedStateLock) {
+                if (this.consumedTelegramPluginCallbackIds.contains(callbackId)) {
+                    true
+                } else {
+                    this.consumedTelegramPluginCallbackIds.add(callbackId)
+                    false
+                }
+            }
+        }
+        if (duplicateCallback) {
             this.sendTextToPeerDetailed(
                 "telegram",
                 message.peerId,
@@ -4230,6 +4378,9 @@ public class GatewayService {
         let method = if (data.startsWith("plugin-approval:")) { "approval.dispatch" } else { "interactive.dispatch" }
         let result = gatewayOpenClawPluginSidecarInvoke(user, method, payload)
         if (!this.telegramJsonBool(result, "matched", false)) {
+            if (!callbackId.isEmpty()) {
+                synchronized(this.sharedStateLock) { this.consumedTelegramPluginCallbackIds.remove(callbackId) }
+            }
             let reason = this.telegramJsonString(result, "reason", "OpenClaw plugin sidecar handler not found")
             this.sendTextToPeerDetailed(
                 "telegram",
@@ -4240,9 +4391,6 @@ public class GatewayService {
                 accountId: accountId
             )
             return true
-        }
-        if (!callbackId.isEmpty()) {
-            this.consumedTelegramPluginCallbackIds.add(callbackId)
         }
         this.deliverTelegramPluginSidecarResult(message, accountId, user, result, fallbackAction: "telegram_callback")
     }
@@ -5396,6 +5544,36 @@ public class GatewayService {
                     .object()
             )
             return directSend.messageId
+        }
+        if (directSend.reasonKind == "send_timeout") {
+            let _ = gatewayOpenClawPluginSidecarApplyMessageSentHook(
+                user,
+                nm,
+                accountId,
+                peerId,
+                effectiveText,
+                "",
+                false,
+                directSend.lastReason,
+                durationMs: this.startNowMs() - sendStartedAtMs
+            )
+            gatewayLogEventError(
+                "gateway/message",
+                "message.send.failed",
+                "outbound message send timed out",
+                meta: gatewayLogMeta()
+                    .string("channel", nm)
+                    .string("accountId", canonicalAccountId)
+                    .string("rawAccountId", accountId)
+                    .identityHash("peerHash", peerId)
+                    .int("textLen", Int64(effectiveText.size))
+                    .string("status", "failed")
+                    .string("errorKind", "send_timeout")
+                    .rawString("error", directSend.lastReason)
+                    .int("durationMs", this.startNowMs() - sendStartedAtMs)
+                    .object()
+            )
+            throw Exception("send failed for channel='${nm}' reasonKind=send_timeout lastReason=${directSend.lastReason}")
         }
         let send = this.channelManager.sendToAdapterName(nm, outbound)
         if (send.delivered) {

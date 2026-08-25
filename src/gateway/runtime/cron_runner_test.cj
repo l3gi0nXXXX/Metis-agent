@@ -1731,7 +1731,7 @@ public class CronRunnerTest {
 
                 feishu.queueInbound("飞书消息🙂")
                 telegram.queueInbound("Telegram message")
-                service.processOnce()
+                service.processOnceAndAwaitForTest()
 
                 @Expect(feishu.sendCount, 1)
                 @Expect(feishu.lastText, "feishu reply: 飞书消息🙂")

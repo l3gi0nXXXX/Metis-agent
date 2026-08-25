@@ -292,6 +292,24 @@ private func gatewayRuntimeTestInt(obj: JsonObject, key: String): Int64 {
 @Test
 public class GatewayChannelRuntimeTest {
     @TestCase
+    public func p4B1InboundQueueRejectionIsPersistedWithoutCountingSuccess(): Unit {
+        withGatewayChannelRuntimeTestHome {
+            let _ = gatewayChannelRuntimeMarkPull("feishu", accountId: "p4-account", inboundCount: 1)
+            let _ = gatewayChannelRuntimeMarkInboundRejected(
+                "feishu",
+                accountId: "p4-account",
+                errorKind: "inbound_queue_full"
+            )
+            let accounts = gatewayChannelRuntimeAccountsJson("feishu")
+            let row = accounts[0].asObject()
+            @Expect(gatewayRuntimeTestInt(row, "inboundCount"), 1)
+            @Expect(gatewayRuntimeTestInt(row, "inboundRejectedCount"), 1)
+            @Expect(gatewayRuntimeTestInt(row, "lastRejectedAtMs") > 0, true)
+            @Expect(gatewayRuntimeTestString(row, "errorKind"), "inbound_queue_full")
+        }
+    }
+
+    @TestCase
     public func channelManagerLogsAccountStartSummariesWithoutInfoTimingNoise(): Unit {
         withGatewayChannelRuntimeTestHome {
             withGatewayChannelRuntimeLogCapture("start-info", "info", { path =>

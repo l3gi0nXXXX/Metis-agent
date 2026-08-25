@@ -1,7 +1,7 @@
 package metis.gateway.channels.feishu
 
 import metis.core.renderGatewayEditText
-import metis.gateway.core.{gatewayPolicyFilteredChatToolNamesForTurnContext, gatewayPolicyFilteredSystemPromptForTurnContext, gatewayResolveSessionContextWithAgentRoute}
+import metis.gateway.core.{GatewayChannelSendTimeoutException, gatewayPolicyFilteredChatToolNamesForTurnContext, gatewayPolicyFilteredSystemPromptForTurnContext, gatewayResolveSessionContextWithAgentRoute}
 import metis.gateway.model.{ChannelPolicyConfig, ChannelType, FeishuConfig, FeishuMediaConfig, InboundMessage, OutboundMessage}
 import metis.gateway.session.gatewaySessionRequestFromInbound
 import std.collection.ArrayList
@@ -11,6 +11,14 @@ import std.sync.Mutex
 import std.time.DateTime
 import std.unittest.testmacro.*
 import stdx.encoding.json.{JsonArray, JsonBool, JsonInt, JsonObject, JsonString, JsonValue}
+
+private class FeishuP4ReadyLongConnectTransport <: FeishuLongConnectTransport {
+    public func start(_spec: FeishuLongConnectStartSpec, _eventHandler: (JsonObject) -> Unit): FeishuLongConnectStartResult {
+        FeishuLongConnectStartResult(ok: true, status: "ready")
+    }
+
+    public func stop(): Unit {}
+}
 
 class FeishuQueueProbe {
     private let lock = Mutex()
@@ -54,6 +62,25 @@ class FeishuQueueProbe {
 
 @Test
 public class FeishuAdapterTest {
+    @TestCase
+    public func p4N1StructuredRequestTimeoutRemainsTypedAtAdapterBoundary(): Unit {
+        let client = FeishuFakeApiClient()
+        client.failNextTextSend("request_timeout", error: "Authorization: Bearer p4-feishu-secret 中文🙂")
+        let adapter = FeishuAdapter(
+            config: FeishuConfig(enabled: true, appId: "p4-app", appSecret: "p4-secret", streaming: "text"),
+            apiClient: client,
+            longConnectTransport: FeishuP4ReadyLongConnectTransport()
+        )
+        adapter.start()
+        try {
+            let _ = adapter.sendWithMessageId(OutboundMessage(ChannelType.Feishu, "oc_p4", "timeout 中文🙂"))
+            @Expect(true, false)
+        } catch (e: GatewayChannelSendTimeoutException) {
+            @Expect(e.message, "request_timeout")
+            @Expect(e.message.contains("p4-feishu-secret"), false)
+        }
+    }
+
     private func jsonObjectField(obj: JsonObject, key: String): JsonObject {
         try {
             obj.get(key).getOrThrow().asObject()

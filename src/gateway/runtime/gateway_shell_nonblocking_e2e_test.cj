@@ -18,6 +18,7 @@ import std.env.{getVariable, setVariable}
 import std.fs.{Directory, File, Path, exists, remove}
 import std.net.*
 import std.process.executeWithOutput
+import std.sync.{AtomicBool, Mutex}
 import std.time.DateTime
 import std.unittest.testmacro.*
 import stdx.encoding.json.{JsonArray, JsonObject, JsonString, JsonValue}
@@ -60,8 +61,10 @@ private func withGatewayShellE2eHome<T>(body: () -> T): T {
 
 private class GatewayShellE2eAdapter <: ChannelAdapter {
     private let adapterName: String
+    private let lock = Mutex()
     private let inbound = ArrayList<InboundMessage>()
     private let sent = ArrayList<String>()
+    private var pulls: Int64 = 0
 
     init(adapterName: String) {
         this.adapterName = adapterName
@@ -76,9 +79,12 @@ private class GatewayShellE2eAdapter <: ChannelAdapter {
     public func stop(): Unit {}
 
     public func pullInbound(): Array<InboundMessage> {
-        let messages = this.inbound.toArray()
-        this.inbound.clear()
-        messages
+        synchronized(this.lock) {
+            this.pulls += 1
+            let messages = this.inbound.toArray()
+            this.inbound.clear()
+            messages
+        }
     }
 
     public func enqueue(index: Int64): Unit {
@@ -87,9 +93,8 @@ private class GatewayShellE2eAdapter <: ChannelAdapter {
         } else {
             ChannelType.Feishu
         }
-        this
-            .inbound
-            .add(
+        synchronized(this.lock) {
+            this.inbound.add(
                 InboundMessage(
                     channel,
                     "${this.adapterName}-${index}",
@@ -101,26 +106,35 @@ private class GatewayShellE2eAdapter <: ChannelAdapter {
                     DateTime.now()
                 )
             )
+        }
     }
 
     public func send(message: OutboundMessage): SendResult {
-        this.sent.add(message.text)
+        synchronized(this.lock) { this.sent.add(message.text) }
         SendResult.Success
     }
 
     public func sendWithMessageId(message: OutboundMessage): String {
-        this.sent.add(message.text)
-        "${this.adapterName}-sent-${this.sent.size}"
+        synchronized(this.lock) {
+            this.sent.add(message.text)
+            "${this.adapterName}-sent-${this.sent.size}"
+        }
     }
 
     public func countExact(expected: String): Int64 {
-        var count: Int64 = 0
-        for (text in this.sent) {
-            if (text == expected) {
-                count += 1
+        synchronized(this.lock) {
+            var count: Int64 = 0
+            for (text in this.sent) {
+                if (text == expected) {
+                    count += 1
+                }
             }
+            count
         }
-        count
+    }
+
+    public func pullCount(): Int64 {
+        synchronized(this.lock) { this.pulls }
     }
 }
 
@@ -329,6 +343,79 @@ private func gatewayP3IntegrationSettleManaged(toolset: GatewayManagedSessionsTo
 @Test
 public class GatewayShellNonblockingE2eTest {
     @TestCase
+    public func p4P1BlockedFeishuTurnKeepsTelegramPollAndRealHealthzResponsive(): Unit {
+        withGatewayShellE2eHome({ =>
+            let feishu = GatewayShellE2eAdapter("feishu")
+            let telegram = GatewayShellE2eAdapter("telegram")
+            let gateway = gatewayShellE2eService(feishu, telegram)
+            let feishuStarted = AtomicBool(false)
+            let releaseFeishu = AtomicBool(false)
+            var healthUrl = ""
+            var healthPort: Int64 = 0
+            setGatewayAgentBridgeReplyRunnerForTest(Some({
+                _sessionKey, prompt, channel, _agentId, _streaming, _hook =>
+                if (channel == "feishu") {
+                    feishuStarted.store(true)
+                    while (!releaseFeishu.load()) { sleep(Duration.millisecond) }
+                }
+                "${channel}-reply:${prompt}"
+            }))
+            GatewayHttpSurface.stopIfRunning()
+            gateway.start()
+            try {
+                for (_ in 0..5) {
+                    let candidate = gatewayShellTemporaryHealthPort()
+                    if (candidate <= 0) { continue }
+                    var user = GatewayUserSettings()
+                    user.port = candidate
+                    user.bind = "loopback"
+                    user.customBindHost = ""
+                    user.auth.mode = "none"
+                    user.http.endpoints.chatCompletions.enabled = true
+                    GatewayHttpSurface.startIfNeeded(buildGatewayConfigFromUserSettings(user))
+                    let candidateUrl = "http://127.0.0.1:${candidate}/healthz"
+                    if (gatewayShellE2eAwait({ => gatewayShellHealthMatchesPort(candidateUrl, candidate) })) {
+                        healthPort = candidate
+                        healthUrl = candidateUrl
+                        break
+                    }
+                    GatewayHttpSurface.stopIfRunning()
+                }
+                @Expect(healthPort > 0, true)
+                if (healthPort <= 0) { throw Exception("P4 isolated health surface unavailable") }
+
+                feishu.enqueue(0)
+                gateway.processOnce()
+                @Expect(gatewayShellE2eAwait({ => feishuStarted.load() }), true)
+
+                for (index in 0..4) {
+                    let startedAt = DateTime.now().toUnixTimeStamp().toMilliseconds()
+                    telegram.enqueue(index)
+                    gateway.processOnce()
+                    let reply = "telegram-reply:telegram-shell-${index}-中文🙂"
+                    @Expect(gatewayShellE2eAwait({ => telegram.countExact(reply) == 1 }, timeoutMs: 500), true)
+                    @Expect(gatewayShellHealthMatchesPort(healthUrl, healthPort), true)
+                    @Expect(DateTime.now().toUnixTimeStamp().toMilliseconds() - startedAt < 500, true)
+                    @Expect(feishu.countExact("feishu-reply:feishu-shell-0-中文🙂"), 0)
+                }
+                @Expect(feishu.pullCount() >= 5, true)
+                @Expect(telegram.pullCount() >= 5, true)
+
+                releaseFeishu.store(true)
+                @Expect(gateway.awaitInboundIdleForTest(timeoutMs: 2000), true)
+                @Expect(feishu.countExact("feishu-reply:feishu-shell-0-中文🙂"), 1)
+                for (index in 0..4) {
+                    @Expect(telegram.countExact("telegram-reply:telegram-shell-${index}-中文🙂"), 1)
+                }
+            } finally {
+                releaseFeishu.store(true)
+                GatewayHttpSurface.stopIfRunning()
+                gateway.stop()
+            }
+        })
+    }
+
+    @TestCase
     public func p3IP2P3FormalChildrenOverlapDoubleImPollAndRealHealthz(): Unit {
         withGatewayShellE2eHome({ =>
             let home = CliConfig.dotDir
@@ -468,7 +555,7 @@ public class GatewayShellNonblockingE2eTest {
                 for (index in 0..4) {
                     feishu.enqueue(index)
                     telegram.enqueue(index)
-                    gateway.processOnce()
+                    gateway.processOnceAndAwaitForTest()
                     let response = gatewayShellFetchHealthz(healthUrl)
                     @Expect(response.status, 200)
                     @Expect(gatewayShellHealthMatchesPort(healthUrl, healthPort), true)
@@ -606,7 +693,7 @@ public class GatewayShellNonblockingE2eTest {
                         feishu.enqueue(index)
                         telegram.enqueue(index)
                         let startedAt = DateTime.now().toUnixTimeStamp().toMilliseconds()
-                        gateway.processOnce()
+                        gateway.processOnceAndAwaitForTest()
                         let response = gatewayShellFetchHealthz(healthUrl)
                         let elapsed = DateTime.now().toUnixTimeStamp().toMilliseconds() - startedAt
                         let health = JsonValue.fromStr(response.body).asObject()

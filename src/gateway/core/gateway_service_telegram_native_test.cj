@@ -137,6 +137,37 @@ private class GatewayTelegramFailingSendAdapter <: ChannelAdapter {
     }
 }
 
+private class GatewayTelegramTimeoutSendAdapter <: ChannelAdapter {
+    private var directCalls: Int64 = 0
+    private var fallbackCalls: Int64 = 0
+
+    public prop name: String {
+        get() { "telegram" }
+    }
+
+    public func start(): Unit {}
+
+    public func stop(): Unit {}
+
+    public func pullInbound(): Array<InboundMessage> {
+        []
+    }
+
+    public func send(_message: OutboundMessage): SendResult {
+        this.fallbackCalls += 1
+        SendResult.Failed("fallback must not run")
+    }
+
+    public func sendWithMessageId(_message: OutboundMessage): String {
+        this.directCalls += 1
+        throw GatewayChannelSendTimeoutException("request_timeout Authorization: Bearer p4-timeout-secret 中文🙂")
+    }
+
+    public func directCallCount(): Int64 { this.directCalls }
+
+    public func fallbackCallCount(): Int64 { this.fallbackCalls }
+}
+
 private class GatewayTelegramSidecarMethodRecorder {
     private let methods = ArrayList<String>()
 
@@ -500,10 +531,89 @@ public class GatewayServiceTelegramSendDiagnosticsTest {
             }
         }
     }
+
+    @TestCase
+    public func p4N1SendTimeoutIsClassifiedAndDoesNotFallbackResend(): Unit {
+        withGatewayTelegramNativeTestHome {
+            var user = GatewayUserSettings()
+            user.telegram.enabled = true
+            user.telegram.allowFrom = ["*"]
+            CliSettingManager.writeGatewaySettings(user)
+
+            let policies = HashMap<String, ChannelPolicyConfig>()
+            policies["telegram"] = ChannelPolicyConfig(enableDirect: true, allowFrom: ["*"])
+            let adapter = GatewayTelegramTimeoutSendAdapter()
+            let sibling = GatewayTelegramNativeTestAdapter()
+            let service = GatewayService(GatewayRouter(policies))
+            service.registerAdapter(adapter, channelId: "telegram", accountId: "telegram:default")
+            service.registerAdapter(sibling, channelId: "telegram", accountId: "telegram:work")
+
+            try {
+                let _ = service.sendTextToPeerDetailed("telegram", "8734062810", "hello 中文🙂", accountId: "default")
+                @Expect(true, false)
+            } catch (e: Exception) {
+                @Expect(e.message.contains("reasonKind=send_timeout"), true)
+                @Expect(e.message.contains("[redacted sensitive error]"), true)
+                @Expect(e.message.contains("p4-timeout-secret"), false)
+            }
+            @Expect(adapter.directCallCount(), 1)
+            @Expect(adapter.fallbackCallCount(), 0)
+            @Expect(
+                service.sendTextToPeerDetailed("telegram", "8734062811", "sibling 中文🙂", accountId: "work").isEmpty(),
+                false
+            )
+            @Expect(sibling.sentCount(), 1)
+        }
+    }
 }
 
 @Test
 public class GatewayServiceTelegramNativeTest {
+    @TestCase
+    public func p4U1PrepareInboundFreezesTelegramBindingWithoutTouchingIt(): Unit {
+        withGatewayTelegramNativeTestHome {
+            let bindingRoot = CliConfig.dotDir.join("p4-bindings")
+            setGatewayTelegramThreadBindingRootForTest(Some(bindingRoot))
+            try {
+                var user = GatewayUserSettings()
+                user.telegram.enabled = true
+                user.telegram.allowFrom = ["*"]
+                user.telegram.threadBindings.enabled = true
+                CliSettingManager.writeGatewaySettings(user)
+                let boundAt = DateTime.now().toUnixTimeStamp().toMilliseconds()
+                let _ = gatewayTelegramThreadBindingBind(
+                    "telegram",
+                    "default",
+                    "user:8734062810",
+                    "agent:main:p4-bound",
+                    nowMs: boundAt
+                )
+                let service = gatewayTelegramNativeService(GatewayTelegramNativeTestAdapter())
+                let message = InboundMessage(
+                    ChannelType.Telegram,
+                    "p4-prepare",
+                    "8734062810",
+                    "8734062810",
+                    ChatType.Direct,
+                    "准备消息 中文🙂",
+                    false,
+                    DateTime.now(),
+                    conversationId: Some("user:8734062810"),
+                    accountId: "default"
+                )
+                let prepared = service.prepareInbound(message, "default")
+                @Expect(prepared.conversationKey, "agent:main:p4-bound")
+                @Expect(prepared.orderKey, "agent:main:p4-bound")
+                @Expect(prepared.bindingAccountId, "default")
+                @Expect(prepared.bindingConversationId, "user:8734062810")
+                let stored = gatewayTelegramThreadBindingResolve("telegram", "default", "user:8734062810")
+                @Expect(stored.get("updatedAtMs").getOrThrow().toJsonString(), boundAt.toString())
+            } finally {
+                setGatewayTelegramThreadBindingRootForTest(None<Path>)
+            }
+        }
+    }
+
     @TestCase
     public func nonDefaultTelegramAccountReplyUsesSameAccount(): Unit {
         withGatewayTelegramNativeTestHome {
@@ -521,7 +631,7 @@ public class GatewayServiceTelegramNativeTest {
 
                 service.start()
                 adapter.queue("hello")
-                service.processOnce()
+                service.processOnceAndAwaitForTest()
 
                 var found = false
                 for (i in 0..adapter.sentCount()) {
@@ -559,7 +669,7 @@ public class GatewayServiceTelegramNativeTest {
 
                 service.start()
                 adapter.queue("/gitcode status")
-                service.processOnce()
+                service.processOnceAndAwaitForTest()
 
                 @Expect(adapter.sentCount(), 1)
                 @Expect(adapter.sentText(0).contains("GitCode status:"), true)
@@ -619,19 +729,19 @@ public class GatewayServiceTelegramNativeTest {
 
                 service.start()
                 adapter.queue("/gitcode webhook status")
-                service.processOnce()
+                service.processOnceAndAwaitForTest()
                 adapter.queue("/gitcode webhook dead-letter list")
-                service.processOnce()
+                service.processOnceAndAwaitForTest()
                 adapter.queue("/gitcode webhook dead-letter inspect d1")
-                service.processOnce()
+                service.processOnceAndAwaitForTest()
                 adapter.queue("/gitcode webhook replay d1")
-                service.processOnce()
+                service.processOnceAndAwaitForTest()
                 adapter.queue("/gitcode webhook cancel d2")
-                service.processOnce()
+                service.processOnceAndAwaitForTest()
                 adapter.queue("/gitcode reconcile hooks --apply")
-                service.processOnce()
+                service.processOnceAndAwaitForTest()
                 adapter.queue("/gitcode reconcile once --lookback-hours 3 --max-repos 1 --max-items 2")
-                service.processOnce()
+                service.processOnceAndAwaitForTest()
 
                 @Expect(capabilityIds.toArray(), [
                     "gitcode.webhook.status",
@@ -701,9 +811,9 @@ public class GatewayServiceTelegramNativeTest {
 
                 service.start()
                 adapter.queue("/gitcode scan once")
-                service.processOnce()
+                service.processOnceAndAwaitForTest()
                 adapter.queue("/gitcode scan once --max-repos 2 --max-items 20")
-                service.processOnce()
+                service.processOnceAndAwaitForTest()
 
                 @Expect(adapter.sentCount(), 2)
                 @Expect(adapter.sentText(0).contains("GitCode webhook-first reconcile 已启动"), true)
@@ -754,7 +864,7 @@ public class GatewayServiceTelegramNativeTest {
 
                 service.start()
                 adapter.queue("/gitcode scan once --timeout-ms 1000")
-                service.processOnce()
+                service.processOnceAndAwaitForTest()
 
                 @Expect(adapter.sentCount(), 1)
                 @Expect(adapter.sentText(0).contains("--timeout-ms is not supported for webhook-first reconcile"), true)
@@ -795,9 +905,9 @@ public class GatewayServiceTelegramNativeTest {
 
                 service.start()
                 adapter.queue("/gitcode status")
-                service.processOnce()
+                service.processOnceAndAwaitForTest()
                 adapter.queue("/gitcode scan once")
-                service.processOnce()
+                service.processOnceAndAwaitForTest()
 
                 @Expect(adapter.sentCount(), 2)
                 let statusText = adapter.sentText(0)
@@ -846,19 +956,19 @@ public class GatewayServiceTelegramNativeTest {
                 }))
                 service.start()
                 adapter.queue("/gitcode scan once --max-repos 1")
-                service.processOnce()
+                service.processOnceAndAwaitForTest()
 
                 setServicePluginCapabilityInvokerForTest(Some({ _registration: ServicePluginRegistration, request: CapabilityInvokeRequest =>
                     CapabilityInvokeResult(false, "unexpected_frame", serviceId: "gitcode-monitor", capabilityId: request.capabilityId, diagnostic: "{\"ok\":false,\"status\":\"unexpected_frame\",\"diagnostic\":\"Authorization: Bearer secret /Users/name/private\"}")
                 }))
                 adapter.queue("/gitcode scan once --max-repos 2")
-                service.processOnce()
+                service.processOnceAndAwaitForTest()
 
                 setServicePluginCapabilityInvokerForTest(Some({ _registration: ServicePluginRegistration, request: CapabilityInvokeRequest =>
                     CapabilityInvokeResult(false, "payload_invalid", serviceId: "gitcode-monitor", capabilityId: request.capabilityId, diagnostic: "{\"ok\":false,\"status\":\"payload_invalid\",\"diagnostic\":\"Authorization: Bearer secret /Users/name/private\"}")
                 }))
                 adapter.queue("/gitcode scan once --max-repos 3")
-                service.processOnce()
+                service.processOnceAndAwaitForTest()
 
                 @Expect(adapter.sentCount(), 3)
                 @Expect(adapter.sentText(0), "GitCode reconcile failed: service plugin wrote invalid data to stdout before the response.")
@@ -900,7 +1010,7 @@ public class GatewayServiceTelegramNativeTest {
 
                 service.start()
                 adapter.queue("hello")
-                service.processOnce()
+                service.processOnceAndAwaitForTest()
 
                 var found = false
                 for (i in 0..adapter.sentCount()) {
@@ -935,7 +1045,7 @@ public class GatewayServiceTelegramNativeTest {
                     let service = gatewayTelegramNativeService(adapter)
                     service.start()
                     adapter.queue("secret message body")
-                    service.processOnce()
+                    service.processOnceAndAwaitForTest()
 
                     let log = gatewayTelegramNativeReadLog(path)
                     var foundAnswer = false
@@ -973,7 +1083,7 @@ public class GatewayServiceTelegramNativeTest {
             let service = gatewayTelegramNativeService(adapter)
             service.start()
             adapter.queueSystemEvent("[telegram-reaction]\nmessageId=101\nemoji=👍\nby=8734062810")
-            service.processOnce()
+            service.processOnceAndAwaitForTest()
 
             @Expect(adapter.sentCount(), 0)
             let store = gatewaySessionStoreForUser(user)
@@ -997,7 +1107,7 @@ public class GatewayServiceTelegramNativeTest {
             let service = gatewayTelegramNativeService(adapter)
             service.start()
             adapter.queue("/models")
-            service.processOnce()
+            service.processOnceAndAwaitForTest()
 
             let text = adapter.sentText(0)
             @Expect(text.contains("[inline-keyboard]"), true)
@@ -1022,7 +1132,7 @@ public class GatewayServiceTelegramNativeTest {
             service.start()
             adapter.queue("/models help")
             adapter.queue("/models status")
-            service.processOnce()
+            service.processOnceAndAwaitForTest()
 
             @Expect(adapter.sentText(0).contains("Usage: /models [status|help|<provider>|<page>]"), true)
             @Expect(adapter.sentText(0).contains("  /models status"), true)
@@ -1052,7 +1162,7 @@ public class GatewayServiceTelegramNativeTest {
             let service = gatewayTelegramNativeService(adapter)
             service.start()
             adapter.queue("[telegram-callback]\nid=cb-page\nmessageId=1\ndata=models:page:1\nby=8734062810")
-            service.processOnce()
+            service.processOnceAndAwaitForTest()
 
             let text = adapter.sentText(0)
             @Expect(text.contains("[inline-keyboard]"), true)
@@ -1077,7 +1187,7 @@ public class GatewayServiceTelegramNativeTest {
             let service = gatewayTelegramNativeService(adapter)
             service.start()
             adapter.queue("/models qwen")
-            service.processOnce()
+            service.processOnceAndAwaitForTest()
 
             let text = adapter.sentText(0)
             @Expect(text.contains("Models (qwen)"), true)
@@ -1101,7 +1211,7 @@ public class GatewayServiceTelegramNativeTest {
             let service = gatewayTelegramNativeService(adapter)
             service.start()
             adapter.queue("[telegram-callback]\nid=cb-1\nmessageId=1\ndata=models:set:qwen:qwen3.5-plus\nby=8734062810")
-            service.processOnce()
+            service.processOnceAndAwaitForTest()
 
             @Expect(adapter.sentText(0).contains("Telegram session model switched to qwen/qwen3.5-plus"), true)
             let updated = CliSettingManager.readGatewaySettings()
@@ -1122,7 +1232,7 @@ public class GatewayServiceTelegramNativeTest {
             let service = gatewayTelegramNativeService(adapter)
             service.start()
             adapter.queue("[telegram-callback]\nid=cb-setidx\nmessageId=1\ndata=models:setidx:qwen:1:0\nby=8734062810")
-            service.processOnce()
+            service.processOnceAndAwaitForTest()
 
             @Expect(adapter.sentText(0).contains("Telegram session model switched to qwen/qwen3.5-plus"), true)
             let updated = CliSettingManager.readGatewaySettings()
@@ -1142,7 +1252,7 @@ public class GatewayServiceTelegramNativeTest {
             let service = gatewayTelegramNativeService(adapter)
             service.start()
             adapter.queue("/model qwen/qwen3.6-plus")
-            service.processOnce()
+            service.processOnceAndAwaitForTest()
 
             @Expect(adapter.sentText(0).contains("Telegram session model switched to qwen/qwen3.6-plus"), true)
             let updated = CliSettingManager.readGatewaySettings()
@@ -1163,7 +1273,7 @@ public class GatewayServiceTelegramNativeTest {
             let service = gatewayTelegramNativeService(adapter)
             service.start()
             adapter.queue("[telegram-callback]\nid=cb-configwrites\nmessageId=1\ndata=models:set:qwen:qwen3.5-plus\nby=8734062810")
-            service.processOnce()
+            service.processOnceAndAwaitForTest()
 
             @Expect(adapter.sentText(0).contains("configWrites is disabled"), true)
             let updated = CliSettingManager.readGatewaySettings()
@@ -1183,7 +1293,7 @@ public class GatewayServiceTelegramNativeTest {
             let service = gatewayTelegramNativeService(adapter)
             service.start()
             adapter.queue("[telegram-callback]\nid=cb-2\nmessageId=1\ndata=models:set:openai:gpt-5.4\nby=123", sender: "123")
-            service.processOnce()
+            service.processOnceAndAwaitForTest()
 
             @Expect(adapter.sentText(0).contains("Model switch denied"), true)
             let updated = CliSettingManager.readGatewaySettings()
@@ -1204,7 +1314,7 @@ public class GatewayServiceTelegramNativeTest {
             let service = gatewayTelegramNativeService(adapter)
             service.start()
             adapter.queue("[telegram-callback]\nid=cb-unknown\nmessageId=1\nactionType=unknown\ndata=unknown:action\nby=8734062810")
-            service.processOnce()
+            service.processOnceAndAwaitForTest()
 
             let text = adapter.sentText(0)
             @Expect(text.contains("\"action\":\"telegram_callback\""), true)
@@ -1225,7 +1335,7 @@ public class GatewayServiceTelegramNativeTest {
             let service = gatewayTelegramNativeService(adapter)
             service.start()
             adapter.queue("[telegram-callback]\nid=cb-plugin\nmessageId=1\nactionType=plugin-not-applicable\ndata=plugin:demo:run\nby=8734062810")
-            service.processOnce()
+            service.processOnceAndAwaitForTest()
 
             let text = adapter.sentText(0)
             @Expect(text.contains("\"status\":\"not_applicable\""), true)
@@ -1271,7 +1381,7 @@ public class GatewayServiceTelegramNativeTest {
             let service = gatewayTelegramNativeService(adapter)
             service.start()
             adapter.queue("[telegram-callback]\nid=cb-plugin\nmessageId=77\nactionType=plugin-not-applicable\ndata=plugin:demo:run\nby=8734062810")
-            service.processOnce()
+            service.processOnceAndAwaitForTest()
 
             @Expect(adapter.sentText(0), "plugin handled")
         }
@@ -1299,7 +1409,7 @@ public class GatewayServiceTelegramNativeTest {
             let service = gatewayTelegramNativeService(adapter)
             service.start()
             adapter.queue("[telegram-callback]\nid=cb-missing\nmessageId=77\nactionType=plugin-not-applicable\ndata=plugin:missing:run\nby=8734062810")
-            service.processOnce()
+            service.processOnceAndAwaitForTest()
 
             @Expect(adapter.sentText(0).contains("\"status\":\"not_found\""), true)
             @Expect(adapter.sentText(0).contains("handler_not_found"), true)
@@ -1340,7 +1450,7 @@ public class GatewayServiceTelegramNativeTest {
             service.start()
             adapter.queue("[telegram-callback]\nid=cb-dup\nmessageId=77\nactionType=plugin-not-applicable\ndata=plugin:demo:run\nby=8734062810")
             adapter.queue("[telegram-callback]\nid=cb-dup\nmessageId=77\nactionType=plugin-not-applicable\ndata=plugin:demo:run\nby=8734062810")
-            service.processOnce()
+            service.processOnceAndAwaitForTest()
 
             @Expect(recorder.count("interactive.dispatch"), 1)
             @Expect(adapter.sentText(0), "plugin handled")
@@ -1383,7 +1493,7 @@ public class GatewayServiceTelegramNativeTest {
             let service = gatewayTelegramNativeService(adapter)
             service.start()
             adapter.queue("[telegram-callback]\nid=cb-approval\nmessageId=77\nactionType=plugin-approval\ndata=plugin-approval:demo:allow:approval-1\nby=8734062810")
-            service.processOnce()
+            service.processOnceAndAwaitForTest()
 
             @Expect(adapter.sentText(0), "approval handled")
         }
@@ -1441,7 +1551,7 @@ public class GatewayServiceTelegramNativeTest {
             let service = gatewayTelegramNativeService(adapter)
             service.start()
             adapter.queue("/plugin_demo now")
-            service.processOnce()
+            service.processOnceAndAwaitForTest()
 
             @Expect(adapter.sentText(0), "hooked:Running /plugin_demo...")
             @Expect(adapter.sentText(1), "[edit]\ncommand handled")
@@ -1496,7 +1606,7 @@ public class GatewayServiceTelegramNativeTest {
             let service = gatewayTelegramNativeService(adapter)
             service.start()
             adapter.queue("[telegram-callback]\nid=cb-intents\nmessageId=77\nactionType=plugin-not-applicable\ndata=plugin:demo:run\nby=8734062810")
-            service.processOnce()
+            service.processOnceAndAwaitForTest()
 
             @Expect(adapter.sentText(0), "[edit]\nedited")
             @Expect(adapter.sentText(1).contains("[edit-buttons]"), true)
@@ -1549,7 +1659,7 @@ public class GatewayServiceTelegramNativeTest {
             let service = gatewayTelegramNativeService(adapter)
             service.start()
             adapter.queue("/plugin_tool")
-            service.processOnce()
+            service.processOnceAndAwaitForTest()
 
             let text = adapter.sentText(1)
             @Expect(text.contains("\"status\":\"unsupported\""), true)
@@ -1656,7 +1766,7 @@ public class GatewayServiceTelegramNativeTest {
                 let service = gatewayTelegramNativeService(adapter)
                 service.start()
                 adapter.queue("[telegram-callback]\nid=cb-imperative\nmessageId=77\nactionType=plugin-not-applicable\ndata=plugin:demo:run\nby=8734062810")
-                service.processOnce()
+                service.processOnceAndAwaitForTest()
 
                 @Expect(adapter.sentText(0).contains("[inline-keyboard]"), true)
                 @Expect(adapter.sentText(0).contains("reply:telegram:direct:8734062810"), true)
@@ -1670,7 +1780,7 @@ public class GatewayServiceTelegramNativeTest {
                 @Expect(binding.get("sessionKey").getOrThrow().asString().getValue(), "agent:main:explicit:demo")
 
                 adapter.queue("[telegram-callback]\nid=cb-detach\nmessageId=77\nactionType=plugin-not-applicable\ndata=plugin:demo:detach\nby=8734062810")
-                service.processOnce()
+                service.processOnceAndAwaitForTest()
                 @Expect(gatewayTelegramThreadBindingResolve("telegram", "default", "8734062810").size(), 0)
             } finally {
                 setGatewayTelegramThreadBindingRootForTest(None)
@@ -1898,7 +2008,7 @@ public class GatewayServiceTelegramNativeTest {
             adapter.queue("/subagents help")
             adapter.queue("/sessions list")
             adapter.queue("/approvals")
-            service.processOnce()
+            service.processOnceAndAwaitForTest()
 
             @Expect(adapter.sentText(0).contains("Metis Telegram commands"), true)
             @Expect(adapter.sentText(0).startsWith("{"), false)
@@ -1922,7 +2032,7 @@ public class GatewayServiceTelegramNativeTest {
             let service = gatewayTelegramNativeService(adapter)
             service.start()
             adapter.queue("/subagents list active")
-            service.processOnce()
+            service.processOnceAndAwaitForTest()
 
             let text = adapter.sentText(0)
             @Expect(text.startsWith("{"), false)
@@ -1958,7 +2068,7 @@ public class GatewayServiceTelegramNativeTest {
             let service = gatewayTelegramNativeService(adapter)
             service.start()
             adapter.queue("/subagents spawn phase-native-telegram \"inspect unicode 任务\"")
-            service.processOnce()
+            service.processOnceAndAwaitForTest()
 
             let text = adapter.sentText(0)
             @Expect(text.startsWith("{"), false)
@@ -1987,7 +2097,7 @@ public class GatewayServiceTelegramNativeTest {
             let service = gatewayTelegramNativeService(adapter)
             service.start()
             adapter.queue("/subagents 以沁园春为词牌写一首词，主题是关于vibe coding。")
-            service.processOnce()
+            service.processOnceAndAwaitForTest()
 
             let text = adapter.sentText(0)
             @Expect(text.startsWith("{"), false)
@@ -2009,7 +2119,7 @@ public class GatewayServiceTelegramNativeTest {
             let service = gatewayTelegramNativeService(adapter)
             service.start()
             adapter.queue("/help@metis_fake_bot\n[entities]\n- bot_command: /help@metis_fake_bot")
-            service.processOnce()
+            service.processOnceAndAwaitForTest()
 
             @Expect(adapter.sentText(0).contains("Metis Telegram commands"), true)
             @Expect(adapter.sentText(0).startsWith("{"), false)
@@ -2035,7 +2145,7 @@ public class GatewayServiceTelegramNativeTest {
             adapter.queue("/compact summarize older turns")
             adapter.queue("/btw quick side question")
             adapter.queue("/whoami")
-            service.processOnce()
+            service.processOnceAndAwaitForTest()
 
             @Expect(adapter.sentText(0).contains("Metis Telegram command catalog"), true)
             @Expect(adapter.sentText(0).contains("/acp [not_applicable"), true)
@@ -2075,7 +2185,7 @@ public class GatewayServiceTelegramNativeTest {
             for (entry in catalog) {
                 adapter.queue(this.safeTelegramNativeCommandInput(entry.command))
             }
-            service.processOnce()
+            service.processOnceAndAwaitForTest()
 
             @Expect(adapter.sentCount(), Int64(catalog.size))
             for (i in 0..catalog.size) {
@@ -2098,7 +2208,7 @@ public class GatewayServiceTelegramNativeTest {
             let service = gatewayTelegramNativeService(adapter)
             service.start()
             adapter.queue("/tools")
-            service.processOnce()
+            service.processOnceAndAwaitForTest()
 
             @Expect(adapter.sentText(0).contains("Telegram tools"), true)
             @Expect(adapter.sentText(0).contains("gateway_sessions"), true)
@@ -2157,7 +2267,7 @@ public class GatewayServiceTelegramNativeTest {
             let service = gatewayTelegramNativeService(adapter)
             service.start()
             adapter.queue("/focus agent:main:explicit:review")
-            service.processOnce()
+            service.processOnceAndAwaitForTest()
             @Expect(adapter.sentText(0).contains("Telegram thread binding: focus"), true)
             @Expect(adapter.sentText(0).contains("agent:main:explicit:review"), true)
 
@@ -2165,12 +2275,12 @@ public class GatewayServiceTelegramNativeTest {
             @Expect(resolved.get("sessionKey").getOrThrow().asString().getValue(), "agent:main:explicit:review")
 
             adapter.queue("/agents")
-            service.processOnce()
+            service.processOnceAndAwaitForTest()
             @Expect(adapter.sentText(1).contains("Telegram thread binding: agents"), true)
             @Expect(adapter.sentText(1).contains("agent:main:explicit:review"), true)
 
             adapter.queue("/unfocus")
-            service.processOnce()
+            service.processOnceAndAwaitForTest()
             @Expect(adapter.sentText(2).contains("Telegram thread binding: unfocus"), true)
             @Expect(gatewayTelegramThreadBindingResolve("telegram", "default", "8734062810").size(), 0)
         }
@@ -2189,11 +2299,11 @@ public class GatewayServiceTelegramNativeTest {
             let service = gatewayTelegramNativeService(adapter)
             service.start()
             adapter.queue("/agents team")
-            service.processOnce()
+            service.processOnceAndAwaitForTest()
             adapter.queue("/agents status")
-            service.processOnce()
+            service.processOnceAndAwaitForTest()
             adapter.queue("/agents switch @writer")
-            service.processOnce()
+            service.processOnceAndAwaitForTest()
 
             @Expect(adapter.sentText(0).contains("Telegram thread binding: team"), true)
             @Expect(adapter.sentText(0).contains("/agents switch <alias>"), true)
@@ -2235,7 +2345,7 @@ public class GatewayServiceTelegramNativeTest {
             let service = gatewayTelegramNativeService(adapter)
             service.start()
             adapter.queue("/commands")
-            service.processOnce()
+            service.processOnceAndAwaitForTest()
 
             @Expect(adapter.sentText(0).contains("Metis Telegram command catalog"), true)
             @Expect(adapter.sentText(0).contains("/bash"), true)
@@ -2264,7 +2374,7 @@ public class GatewayServiceTelegramNativeTest {
             adapter.queue("/allowlist list")
             adapter.queue("[telegram-callback]\nid=cb-think\nmessageId=9\ndata=cmd:think:high\nby=8734062810")
             service.sendTextToPeerDetailed("telegram", "8734062810", "[subagent-notice]\nrunId=test-run\nstatus=done", accountId: "default")
-            service.processOnce()
+            service.processOnceAndAwaitForTest()
 
             @Expect(adapter.sentText(1).contains("Telegram status"), true)
             @Expect(adapter.sentText(1).contains("Token Status"), true)
@@ -2292,7 +2402,7 @@ public class GatewayServiceTelegramNativeTest {
             for (command in ["/tasks", "/context", "/usage status", "/plugins list", "/mcp show", "/config show", "/debug show", "/export-session"]) {
                 adapter.queue(command)
             }
-            service.processOnce()
+            service.processOnceAndAwaitForTest()
 
             @Expect(adapter.sentText(0).contains("Telegram tasks"), true)
             @Expect(adapter.sentText(1).contains("Telegram context"), true)
@@ -2323,7 +2433,7 @@ public class GatewayServiceTelegramNativeTest {
             service.start()
             adapter.queue("/export_session alias-smoke.html")
             adapter.queue("/export-session canonical-smoke.html")
-            service.processOnce()
+            service.processOnceAndAwaitForTest()
 
             @Expect(adapter.sentText(0).contains("Telegram session export"), true)
             @Expect(adapter.sentText(0).contains("alias-smoke.html"), true)
@@ -2351,7 +2461,7 @@ public class GatewayServiceTelegramNativeTest {
             adapter.queue("/send off")
             adapter.queue("/new")
             adapter.queue("/compact")
-            service.processOnce()
+            service.processOnceAndAwaitForTest()
 
             @Expect(adapter.sentText(0).contains("Status: ok"), true)
             @Expect(adapter.sentText(4).contains("Status: ok"), true)
@@ -2379,7 +2489,7 @@ public class GatewayServiceTelegramNativeTest {
             service.start()
             adapter.queue("/bash echo should-not-run", sender: "123")
             adapter.queue("/config set gateway.telegram.defaultTo user:1", sender: "123")
-            service.processOnce()
+            service.processOnceAndAwaitForTest()
 
             @Expect(adapter.sentText(0).contains("Status: rejected"), true)
             @Expect(adapter.sentText(1).contains("Status: rejected"), true)
@@ -2401,7 +2511,7 @@ public class GatewayServiceTelegramNativeTest {
             service.start()
             adapter.queue("/think")
             adapter.queue("[telegram-callback]\nid=cb-think\nmessageId=9\ndata=cmd:think:high\nby=8734062810")
-            service.processOnce()
+            service.processOnceAndAwaitForTest()
 
             @Expect(adapter.sentText(0).contains("[inline-keyboard]"), true)
             @Expect(adapter.sentText(0).contains("callback:cmd:think:high"), true)
@@ -2427,7 +2537,7 @@ public class GatewayServiceTelegramNativeTest {
             service.start()
             adapter.queue("/allowlist list all")
             adapter.queue("/allowlist add dm 12345")
-            service.processOnce()
+            service.processOnceAndAwaitForTest()
 
             @Expect(adapter.sentText(0).contains("Telegram allowlist"), true)
             @Expect(adapter.sentText(0).contains("tg:8734062810"), true)
@@ -2457,7 +2567,7 @@ public class GatewayServiceTelegramNativeTest {
             adapter.queue("/sessions preview telegram:direct:8734062810")
             adapter.queue("/bash echo pending")
             adapter.queue("/approvals")
-            service.processOnce()
+            service.processOnceAndAwaitForTest()
 
             @Expect(adapter.sentText(0).contains("Gateway sessions"), true)
             @Expect(adapter.sentText(0).contains("telegram:direct:8734062810"), true)
@@ -2488,7 +2598,7 @@ public class GatewayServiceTelegramNativeTest {
             ]) {
                 adapter.queue(command)
             }
-            service.processOnce()
+            service.processOnceAndAwaitForTest()
 
             for (i in 0..4) {
                 @Expect(adapter.sentText(i).contains("Status: approval_required"), true)
@@ -2519,7 +2629,7 @@ public class GatewayServiceTelegramNativeTest {
             adapter.queue("/bash echo should-not-run")
             adapter.queue("/restart")
             adapter.queue("/stop")
-            service.processOnce()
+            service.processOnceAndAwaitForTest()
 
             @Expect(adapter.sentText(0).contains("telegram.bash.exec"), true)
             @Expect(adapter.sentText(1).contains("telegram.gateway.restart"), true)
@@ -2547,7 +2657,7 @@ public class GatewayServiceTelegramNativeTest {
             service.start()
             adapter.queueGroup("/bash echo allowed", sender: "222")
             adapter.queueGroup("/bash echo denied", sender: "333")
-            service.processOnce()
+            service.processOnceAndAwaitForTest()
 
             @Expect(adapter.sentText(0).contains("Status: approval_required"), true)
             @Expect(adapter.sentText(0).contains("Pending action: telegram.bash.exec"), true)
@@ -2557,7 +2667,7 @@ public class GatewayServiceTelegramNativeTest {
             disabled.telegram.commands.useAccessGroups = false
             CliSettingManager.writeGatewaySettings(disabled)
             adapter.queueGroup("/bash echo old-auth", sender: "222")
-            service.processOnce()
+            service.processOnceAndAwaitForTest()
             @Expect(adapter.sentText(2).contains("Status: rejected"), true)
         }
     }
@@ -2581,7 +2691,7 @@ public class GatewayServiceTelegramNativeTest {
             adapter.queue("/deploy prod")
             adapter.queue("/custom_backup archive one")
             adapter.queue("/noop prod")
-            service.processOnce()
+            service.processOnceAndAwaitForTest()
 
             @Expect(adapter.sentText(0), "deploying prod")
             @Expect(adapter.sentText(1), "backup archive one")
@@ -2608,7 +2718,7 @@ public class GatewayServiceTelegramNativeTest {
                 let service = gatewayTelegramNativeService(adapter)
                 service.start()
                 adapter.queue("/skill weather Shanghai")
-                service.processOnce()
+                service.processOnceAndAwaitForTest()
 
                 @Expect(adapter.sentText(0), "fake telegram native session answer")
                 let store = gatewaySessionStoreForUser(CliSettingManager.readGatewaySettings())
@@ -2635,7 +2745,7 @@ public class GatewayServiceTelegramNativeTest {
             service.start()
             adapter.queue("/skill list")
             adapter.queue("/btw what is the side answer?")
-            service.processOnce()
+            service.processOnceAndAwaitForTest()
 
             @Expect(adapter.sentText(0).contains("Telegram command: /skill"), true)
             @Expect(adapter.sentText(0).startsWith("{"), false)
@@ -2662,7 +2772,7 @@ public class GatewayServiceTelegramNativeTest {
             adapter.queue("/tts audio hello")
             adapter.queue("/tts provider missing-provider")
             adapter.queue("/tts audio hello")
-            service.processOnce()
+            service.processOnceAndAwaitForTest()
 
             @Expect(adapter.sentText(0).contains("Gateway TTS"), true)
             @Expect(adapter.sentText(0).contains("Status: not_configured"), true)
@@ -2697,7 +2807,7 @@ public class GatewayServiceTelegramNativeTest {
             service.start()
             adapter.queue("/tts status")
             adapter.queue("/tts audio hello-command-provider")
-            service.processOnce()
+            service.processOnceAndAwaitForTest()
 
             @Expect(adapter.sentText(0).contains("Status: ok"), true)
             @Expect(adapter.sentText(0).contains("Provider: command"), true)
@@ -2743,7 +2853,7 @@ public class GatewayServiceTelegramNativeTest {
             service.start()
             adapter.queue("/tts status")
             adapter.queue("/tts audio hello-shared-override")
-            service.processOnce()
+            service.processOnceAndAwaitForTest()
 
             @Expect(adapter.sentText(0).contains("Gateway TTS"), true)
             @Expect(adapter.sentText(0).contains("Provider: telegram"), true)
@@ -2777,7 +2887,7 @@ public class GatewayServiceTelegramNativeTest {
             service.start()
             adapter.queue("/tts status")
             adapter.queue("/tts audio hello-shared")
-            service.processOnce()
+            service.processOnceAndAwaitForTest()
 
             @Expect(adapter.sentText(0).contains("Provider: shared"), true)
             @Expect(adapter.sentText(1).startsWith("[audio]"), true)
@@ -2814,7 +2924,7 @@ public class GatewayServiceTelegramNativeTest {
                 service.start()
                 adapter.queue("/tts status")
                 adapter.queue("/tts audio 你好，这是 Metis 的 Qwen TTS 测试")
-                service.processOnce()
+                service.processOnceAndAwaitForTest()
 
                 @Expect(adapter.sentText(0).contains("Status: ok"), true)
                 @Expect(adapter.sentText(0).contains("Provider: dashscope"), true)
@@ -2850,7 +2960,7 @@ public class GatewayServiceTelegramNativeTest {
                 let service = gatewayTelegramNativeService(adapter)
                 service.start()
                 adapter.queue("[voice]\nfileId=file-1\nmimeType=audio/ogg\n[media-context]\nchannel=telegram\naccountId=default\npeerId=user:8734062810\nmessageId=900\nmediaKind=voice\ntranscript=语音测试\nunderstandingStatus=ok")
-                service.processOnce()
+                service.processOnceAndAwaitForTest()
 
                 var foundVoice = false
                 var foundPlainAnswer = false
@@ -2902,7 +3012,7 @@ public class GatewayServiceTelegramNativeTest {
                 let service = gatewayTelegramNativeService(adapter)
                 service.start()
                 adapter.queue("[voice]\nfileId=file-1\nmimeType=audio/ogg\n[media-context]\nchannel=telegram\naccountId=default\npeerId=user:8734062810\nmessageId=903\nmediaKind=voice\ntranscript=语音测试\nunderstandingStatus=ok")
-                service.processOnce()
+                service.processOnceAndAwaitForTest()
 
                 var foundVoice = false
                 var foundPlainAnswer = false
@@ -2951,7 +3061,7 @@ public class GatewayServiceTelegramNativeTest {
                 let service = gatewayTelegramNativeService(adapter)
                 service.start()
                 adapter.queue("[voice]\nfileId=file-1\nmimeType=audio/ogg\n[media-context]\nchannel=telegram\naccountId=default\npeerId=user:8734062810\nmessageId=902\nmediaKind=voice\ntranscript=语音测试\nunderstandingStatus=ok")
-                service.processOnce()
+                service.processOnceAndAwaitForTest()
 
                 var foundVoice = false
                 var foundSilentText = false
@@ -2993,7 +3103,7 @@ public class GatewayServiceTelegramNativeTest {
                 let service = gatewayTelegramNativeService(adapter)
                 service.start()
                 adapter.queue("发一条语音信息给我，随便说点什么。")
-                service.processOnce()
+                service.processOnceAndAwaitForTest()
 
                 var foundVoice = false
                 var foundPlainAnswer = false
@@ -3035,7 +3145,7 @@ public class GatewayServiceTelegramNativeTest {
                 let service = gatewayTelegramNativeService(adapter)
                 service.start()
                 adapter.queue("[voice]\nfileId=file-1\nmimeType=audio/ogg\n[media-context]\nchannel=telegram\naccountId=default\npeerId=user:8734062810\nmessageId=901\nmediaKind=voice\ntranscript=语音测试\nunderstandingStatus=ok")
-                service.processOnce()
+                service.processOnceAndAwaitForTest()
 
                 var foundPlainAnswer = false
                 for (i in 0..adapter.sentCount()) {
