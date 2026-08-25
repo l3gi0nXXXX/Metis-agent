@@ -4,15 +4,52 @@ import magic.jsonable.*
 
 import metis.core.config.GatewayUserSettings
 import metis.gateway.config.gatewayBuiltinAdapterRegistrationProfiles
-import metis.gateway.core.gatewayChannelRuntimeSnapshot
+import metis.gateway.core.{gatewayChannelRuntimeSnapshot, gatewayLogEventInfo, gatewayLogEventWarn, gatewayLogMeta}
 import metis.gateway.model.GatewayConfig
+import metis.gateway.logging.MetisLogEvent
 
 import std.collection.{HashMap, HashSet}
 import std.convert.Parsable
+import std.sync.Mutex
 import stdx.encoding.json.{JsonArray, JsonObject, JsonString, JsonValue}
 
 private func gatewayRuntimeJsonObject(value: JsonValue): JsonObject {
     try { value.asObject() } catch (_e: Exception) { JsonObject() }
+}
+
+private let gatewayRuntimeOperationalLogLock = Mutex()
+private var gatewayRuntimeLastOperationalReason: String = ""
+
+private func gatewayRuntimeLogOperationalTransition(reason: String, operational: JsonObject): Unit {
+    var changed = false
+    let previous = synchronized(gatewayRuntimeOperationalLogLock) {
+        let old = gatewayRuntimeLastOperationalReason
+        if (old != reason) {
+            gatewayRuntimeLastOperationalReason = reason
+            changed = true
+        }
+        old
+    }
+    if (!changed) { return }
+    let broker = gatewayRuntimeOperationalBroker(operational)
+    let meta = gatewayLogMeta()
+        .string("reason", reason)
+        .int("pollLagMs", gatewayRuntimeInt(operational, "pollLagMs"))
+        .int("inboundQueueDepth", gatewayRuntimeInt(operational, "inboundQueueDepth"))
+        .int("brokerGeneration", gatewayRuntimeInt(broker, "generation", defaultValue: gatewayRuntimeInt(operational, "brokerGeneration")))
+        .int("brokerOwnerCount", gatewayRuntimeInt(broker, "ownerCount", defaultValue: gatewayRuntimeInt(operational, "brokerOwnerCount")))
+        .object()
+    if (reason == "poll_stale") {
+        gatewayLogEventWarn("gateway/readiness", MetisLogEvent.gatewayPollStale, "gateway poll loop is stale", meta: meta)
+    } else if (reason == "broker_unresponsive") {
+        gatewayLogEventWarn("gateway/readiness", MetisLogEvent.stdioBrokerUnresponsive, "stdio broker is unresponsive", meta: meta)
+    } else if (reason == "broker_dead") {
+        gatewayLogEventWarn("gateway/readiness", MetisLogEvent.stdioBrokerDead, "stdio broker is not running", meta: meta)
+    } else if (reason == "broker_unavailable") {
+        gatewayLogEventWarn("gateway/readiness", MetisLogEvent.stdioBrokerUnavailable, "stdio broker is unavailable", meta: meta)
+    } else if (reason.isEmpty() && !previous.isEmpty()) {
+        gatewayLogEventInfo("gateway/readiness", MetisLogEvent.gatewayPollRecovered, "gateway operational readiness recovered", meta: meta)
+    }
 }
 
 private func gatewayRuntimeJsonArray(value: JsonValue): JsonArray {
@@ -315,10 +352,57 @@ private func gatewayRuntimeReadinessReason(status: String, user: GatewayUserSett
     "http-disabled"
 }
 
+private func gatewayRuntimeOperationalBroker(operational: JsonObject): JsonObject {
+    match (operational.get("broker")) {
+        case Some(v) => try { v.asObject() } catch (_e: Exception) { JsonObject() }
+        case None => operational
+    }
+}
+
+private func gatewayRuntimeOperationalReason(operational: JsonObject): String {
+    let broker = gatewayRuntimeOperationalBroker(operational)
+    let brokerStatus = gatewayRuntimeString(broker, "status", defaultValue: gatewayRuntimeString(operational, "brokerStatus"))
+    let brokerAlive = gatewayRuntimeBool(broker, "running", defaultValue: gatewayRuntimeBool(operational, "brokerAlive"))
+    let brokerResponsive = gatewayRuntimeBool(broker, "responsive", defaultValue: gatewayRuntimeBool(operational, "brokerResponsive"))
+    if (brokerStatus == "broker_unavailable") {
+        return "broker_unavailable"
+    }
+    if (brokerStatus == "broker_unresponsive") {
+        return "broker_unresponsive"
+    }
+    if (!brokerAlive) {
+        return "broker_dead"
+    }
+    if (!brokerResponsive) {
+        return "broker_unresponsive"
+    }
+    let queueDepth = gatewayRuntimeInt(operational, "inboundQueueDepth")
+    let queueCapacity = gatewayRuntimeInt(operational, "inboundQueueCapacity", defaultValue: 128)
+    if (queueCapacity > 0 && queueDepth >= queueCapacity) {
+        return "inbound_queue_full"
+    }
+    if (gatewayRuntimeInt(operational, "pollLagMs") > 5000) {
+        return "poll_stale"
+    }
+    ""
+}
+
+private func gatewayRuntimeOperationalWithPoll(operational: JsonObject): JsonObject {
+    let runtime = gatewayRuntimeSnapshot()
+    for (key in ["lastPollAtMs", "pollLagMs"]) {
+        match (runtime.get(key)) {
+            case Some(value) => operational.put(key, value)
+            case None => ()
+        }
+    }
+    operational
+}
+
 public func gatewayBuildRuntimeReadinessSnapshot(
     cfg: GatewayConfig,
     user: GatewayUserSettings,
-    channelRuntime!: JsonObject = gatewayChannelRuntimeSnapshot()
+    channelRuntime!: JsonObject = gatewayChannelRuntimeSnapshot(),
+    operational!: Option<JsonObject> = None<JsonObject>
 ): JsonObject {
     let endpointReady = gatewayHttpAnyEndpointEnabled(cfg)
     let hasEnabledChannel = gatewayHasAnyEnabledChannel(user)
@@ -340,14 +424,37 @@ public func gatewayBuildRuntimeReadinessSnapshot(
     }
     let notStartedCount = gatewayRuntimeInt(drift, "notStartedConfiguredCount")
     let staleCount = gatewayRuntimeInt(drift, "staleRunningCount")
-    let status = gatewayRuntimeReadinessStatus(endpointReady, user, hasEnabledChannel, failedCount, startingCount, backoffCount, notStartedCount, staleCount)
+    let baseStatus = gatewayRuntimeReadinessStatus(endpointReady, user, hasEnabledChannel, failedCount, startingCount, backoffCount, notStartedCount, staleCount)
+    let activeOperational = match (operational) {
+        case Some(value) => Some(value)
+        case None =>
+            match (gatewayActiveOperationalSnapshot()) {
+                case Some(value) => Some(gatewayRuntimeOperationalWithPoll(value))
+                case None =>
+                    let persisted = gatewayRuntimeSnapshot()
+                    if (gatewayRuntimeInt(persisted, "lastPollAtMs") > 0) { Some(persisted) } else { None<JsonObject> }
+            }
+    }
+    let operationalReason = match (activeOperational) {
+        case Some(value) => gatewayRuntimeOperationalReason(value)
+        case None => ""
+    }
+    match (activeOperational) {
+        case Some(value) => gatewayRuntimeLogOperationalTransition(operationalReason, value)
+        case None => ()
+    }
+    let status = if (baseStatus == "ready" && !operationalReason.isEmpty()) { "degraded" } else { baseStatus }
     let ready = status == "ready"
     let out = JsonObject()
     out.put("ready", ready.toJsonValue())
     out.put("ok", ready.toJsonValue())
     out.put("status", JsonString(status))
     out.put("degraded", (status == "degraded").toJsonValue())
-    out.put("reason", JsonString(gatewayRuntimeReadinessReason(status, user, hasEnabledChannel)))
+    out.put("reason", JsonString(if (!operationalReason.isEmpty() && baseStatus == "ready") {
+        operationalReason
+    } else {
+        gatewayRuntimeReadinessReason(status, user, hasEnabledChannel)
+    }))
     out.put("masterEnabled", user.enabled.toJsonValue())
     out.put("hasEnabledChannel", hasEnabledChannel.toJsonValue())
     out.put("endpointReady", endpointReady.toJsonValue())
@@ -358,5 +465,9 @@ public func gatewayBuildRuntimeReadinessSnapshot(
     out.put("notStartedConfiguredCount", notStartedCount.toJsonValue())
     out.put("accounts", problems)
     out.put("runtimeConfigDrift", drift)
+    match (activeOperational) {
+        case Some(value) => out.put("operational", value)
+        case None => ()
+    }
     return out
 }

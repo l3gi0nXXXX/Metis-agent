@@ -258,6 +258,7 @@ public func runGatewayService(verbose!: Bool = false): Unit {
         var heartbeatTick: Int64 = 0
         while (true) {
             gateway.processOnce()
+            gatewayRuntimeMarkPollCompleted(gateway.operationalSnapshot())
             configReloader.pollOnce()
             cronRunner.tick()
             heartbeatTick += 1

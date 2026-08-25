@@ -3,11 +3,16 @@ package metis.gateway.runtime
 import metis.core.config.{CliConfig, CliSettingManager, GatewayUserSettings, MetisConfigManager, MetisProcessEnvironmentLock}
 import metis.gateway.config.buildGatewayConfigFromUserSettings
 import metis.gateway.core.{gatewayChannelRuntimeMarkFailure, gatewayChannelRuntimeMarkRunning, gatewayChannelRuntimeMarkStarting, gatewayChannelRuntimeRegisterAccount}
+import metis.gateway.logging.{gatewayLoggingCaptureConsoleForTest, gatewayLoggingCapturedConsoleForTest, gatewayLoggingResetForTest}
+import metis.process.{ManagedStdioBrokerClient, ManagedStdioBrokerSnapshot, ManagedStdioOwnerSpec}
 
 import std.env.{getVariable, setVariable}
+import std.convert.Parsable
 import std.fs.{Directory, Path, remove}
+import std.process.executeWithOutput
+import std.time.*
 import std.unittest.testmacro.*
-import stdx.encoding.json.{JsonArray, JsonObject, JsonValue}
+import stdx.encoding.json.{JsonArray, JsonBool, JsonInt, JsonObject, JsonString, JsonValue}
 
 private func gatewayStatusTestUser(): GatewayUserSettings {
     var user = GatewayUserSettings()
@@ -66,13 +71,241 @@ private func statusTestString(obj: JsonObject, key: String): String {
     }
 }
 
+private func statusTestInt(obj: JsonObject, key: String): Int64 {
+    match (obj.get(key)) {
+        case Some(v) => try { Int64.parse(v.toJsonString()) } catch (_: Exception) { 0 }
+        case None => 0
+    }
+}
+
 private func gatewayStatusPersistUser(user: GatewayUserSettings): Unit {
     let _ = MetisConfigManager.setGatewaySettings(user)
     CliSettingManager.invalidate()
 }
 
+private func gatewayStatusOperational(
+    alive: Bool,
+    responsive: Bool,
+    status: String,
+    pollLagMs!: Int64 = 0,
+    queueDepth!: Int64 = 0,
+    queueCapacity!: Int64 = 128
+): JsonObject {
+    let broker = JsonObject()
+    broker.put("running", JsonBool(alive))
+    broker.put("responsive", JsonBool(responsive))
+    broker.put("status", JsonString(status))
+    broker.put("generation", JsonInt(1))
+    broker.put("ownerCount", JsonInt(0))
+    let out = JsonObject()
+    out.put("broker", broker)
+    out.put("pollLagMs", JsonInt(pollLagMs))
+    out.put("inboundQueueDepth", JsonInt(queueDepth))
+    out.put("inboundQueueCapacity", JsonInt(queueCapacity))
+    out
+}
+
+private func gatewayStatusOperationalFromBroker(snapshot: ManagedStdioBrokerSnapshot): JsonObject {
+    let broker = JsonObject()
+    broker.put("running", JsonBool(snapshot.running))
+    broker.put("responsive", JsonBool(snapshot.responsive))
+    broker.put("status", JsonString(snapshot.status))
+    broker.put("generation", JsonInt(snapshot.generation))
+    broker.put("ownerCount", JsonInt(snapshot.ownerCount))
+    let out = JsonObject()
+    out.put("broker", broker)
+    out.put("pollLagMs", JsonInt(0))
+    out.put("inboundQueueDepth", JsonInt(0))
+    out.put("inboundQueueCapacity", JsonInt(128))
+    out
+}
+
+private func gatewayStatusPidGone(pid: Int64): Bool {
+    if (pid <= 0) { return true }
+    let (exitCode, _, _) = executeWithOutput("/bin/kill", ["-0", "${pid}"])
+    exitCode != 0
+}
+
+private func gatewayStatusPgidGone(pgid: Int64): Bool {
+    if (pgid <= 0) { return true }
+    let (exitCode, _, _) = executeWithOutput("/bin/kill", ["-0", "--", "-${pgid}"])
+    exitCode != 0
+}
+
+private func gatewayStatusWaitForGone(pid: Int64, pgid: Int64, timeoutMs!: Int64 = 3000): Bool {
+    let deadline = DateTime.now().toUnixTimeStamp().toMilliseconds() + timeoutMs
+    while (DateTime.now().toUnixTimeStamp().toMilliseconds() < deadline) {
+        if (gatewayStatusPidGone(pid) && gatewayStatusPgidGone(pgid)) { return true }
+        sleep(Duration.millisecond * 20)
+    }
+    gatewayStatusPidGone(pid) && gatewayStatusPgidGone(pgid)
+}
+
 @Test
 public class GatewayServerMethodsStatusTest {
+    @TestCase
+    public func p5P1BrokerUnresponsiveReadinessAndGenerationRecoveryAreExact(): Unit {
+        withGatewayStatusTestSettings<Unit>("p5-broker-recovery", { =>
+            let user = gatewayStatusTestUser()
+            gatewayStatusPersistUser(user)
+            let cfg = buildGatewayConfigFromUserSettings(user)
+            let _ = gatewayChannelRuntimeRegisterAccount("telegram", accountId: "default")
+            let _ = gatewayChannelRuntimeMarkRunning("telegram", accountId: "default")
+            let client = ManagedStdioBrokerClient(brokerTestMode: true)
+            try {
+                let old = client.startOwner(ManagedStdioOwnerSpec(
+                    "p5-readiness-old",
+                    "node",
+                    args: ["-e", "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"],
+                    stdinMode: "closed",
+                    deadlineMs: 10000
+                ))
+                @Expect(old.ok, true)
+                let initiallyReady = gatewayBuildRuntimeReadinessSnapshot(
+                    cfg,
+                    user,
+                    operational: Some(gatewayStatusOperationalFromBroker(client.snapshot()))
+                )
+                @Expect(statusTestString(initiallyReady, "status"), "ready")
+
+                @Expect(client.debugHangBrokerForTest(), true)
+                let probe = client.probeBrokerForGeneration(old.generation, timeoutMs: 80)
+                @Expect(probe.ok, false)
+                @Expect(probe.status, "broker_unresponsive")
+                let degraded = gatewayBuildRuntimeReadinessSnapshot(
+                    cfg,
+                    user,
+                    operational: Some(gatewayStatusOperationalFromBroker(client.snapshot()))
+                )
+                @Expect(statusTestString(degraded, "status"), "degraded")
+                @Expect(statusTestString(degraded, "reason"), "broker_unresponsive")
+                @Expect(gatewayStatusWaitForGone(old.pid, old.pgid), true)
+                @Expect(client.snapshot().ownerCount, 0)
+
+                let replacement = client.startOwner(ManagedStdioOwnerSpec(
+                    "p5-readiness-replacement",
+                    "node",
+                    args: ["-e", "console.log('恢复中文🙂')"],
+                    stdinMode: "closed",
+                    deadlineMs: 2000
+                ))
+                @Expect(replacement.ok, true)
+                @Expect(replacement.generation > old.generation, true)
+                var output = ""
+                var terminal = false
+                let deadline = DateTime.now().toUnixTimeStamp().toMilliseconds() + 3000
+                while (!terminal && DateTime.now().toUnixTimeStamp().toMilliseconds() < deadline) {
+                    match (client.readOwnerLine("p5-readiness-replacement", timeoutMs: 50)) {
+                        case Some(event) =>
+                            if (event.eventType == "owner.stdout") { output = event.text }
+                            if (event.eventType == "owner.exit" || event.eventType == "owner.error") { terminal = true }
+                        case None => ()
+                    }
+                }
+                @Expect(terminal, true)
+                @Expect(output, "恢复中文🙂")
+                let recovered = gatewayBuildRuntimeReadinessSnapshot(
+                    cfg,
+                    user,
+                    operational: Some(gatewayStatusOperationalFromBroker(client.snapshot()))
+                )
+                @Expect(statusTestString(recovered, "status"), "ready")
+                @Expect(statusTestString(recovered, "reason"), "ok")
+            } finally {
+                let closed = client.close(timeoutMs: 3000)
+                @Expect(closed.ok, true)
+            }
+        })
+    }
+
+    @TestCase
+    public func p5N1OperationalTransitionLogsAreStableAndDoNotEchoDiagnostics(): Unit {
+        withGatewayStatusTestSettings<Unit>("p5-operational-logs", { =>
+            let user = gatewayStatusTestUser()
+            gatewayStatusPersistUser(user)
+            let cfg = buildGatewayConfigFromUserSettings(user)
+            let _ = gatewayChannelRuntimeRegisterAccount("telegram", accountId: "default")
+            let _ = gatewayChannelRuntimeMarkRunning("telegram", accountId: "default")
+            let secret = "Authorization: Bearer secret-never-visible 中文🙂 /Users/private/never-visible " + "长" * 300
+            let failed = gatewayStatusOperational(true, false, secret)
+            failed.put("diagnostic", JsonString(secret))
+
+            gatewayLoggingResetForTest()
+            gatewayLoggingCaptureConsoleForTest()
+            let _ = gatewayBuildRuntimeReadinessSnapshot(cfg, user, operational: Some(failed))
+            let _ = gatewayBuildRuntimeReadinessSnapshot(
+                cfg,
+                user,
+                operational: Some(gatewayStatusOperational(true, true, "ready"))
+            )
+            var rendered = ""
+            for (line in gatewayLoggingCapturedConsoleForTest()) { rendered += line + "\n" }
+            @Expect(rendered.contains("event=stdio.broker.unresponsive"), true)
+            @Expect(rendered.contains("event=gateway.poll.recovered"), true)
+            @Expect(rendered.contains("secret-never-visible"), false)
+            @Expect(rendered.contains("/Users/private/never-visible"), false)
+            gatewayLoggingResetForTest()
+        })
+    }
+
+    @TestCase
+    public func p5U1PollCompletionUpdatesMemoryAndHeartbeatFields(): Unit {
+        withGatewayStatusTestSettings<Unit>("p5-poll-snapshot", { =>
+            gatewayRuntimeMarkStarting()
+            try {
+                let operational = gatewayStatusOperational(true, true, "ready", queueDepth: 7)
+                gatewayRuntimeMarkPollCompleted(operational)
+                let snapshot = gatewayRuntimeSnapshot()
+                @Expect(statusTestInt(snapshot, "lastPollAtMs") > 0, true)
+                @Expect(statusTestInt(snapshot, "pollLagMs") >= 0, true)
+                @Expect(snapshot.get("brokerAlive").getOrThrow().asBool().getValue(), true)
+                @Expect(snapshot.get("brokerResponsive").getOrThrow().asBool().getValue(), true)
+                @Expect(statusTestInt(snapshot, "brokerGeneration"), 1)
+                @Expect(statusTestInt(snapshot, "brokerOwnerCount"), 0)
+                @Expect(statusTestInt(snapshot, "inboundQueueDepth"), 7)
+            } finally {
+                gatewayRuntimeMarkStopped(reason: "test-complete")
+            }
+        })
+    }
+
+    @TestCase
+    public func p5U1ReadinessDistinguishesBrokerPollAndQueueFailures(): Unit {
+        withGatewayStatusTestSettings<Unit>("p5-operational", { =>
+            let user = gatewayStatusTestUser()
+            gatewayStatusPersistUser(user)
+            let cfg = buildGatewayConfigFromUserSettings(user)
+            let _ = gatewayChannelRuntimeRegisterAccount("telegram", accountId: "default")
+            let _ = gatewayChannelRuntimeMarkRunning("telegram", accountId: "default")
+
+            let healthy = gatewayBuildRuntimeReadinessSnapshot(
+                cfg,
+                user,
+                operational: Some(gatewayStatusOperational(true, true, "ready", pollLagMs: 5000, queueDepth: 127))
+            )
+            @Expect(statusTestString(healthy, "status"), "ready")
+            @Expect(statusTestString(healthy, "reason"), "ok")
+
+            let cases = [
+                (gatewayStatusOperational(true, false, "broker_unresponsive"), "broker_unresponsive"),
+                (gatewayStatusOperational(false, false, "broker_exited"), "broker_dead"),
+                (gatewayStatusOperational(false, false, "broker_unavailable"), "broker_unavailable"),
+                (gatewayStatusOperational(true, true, "ready", pollLagMs: 5001), "poll_stale"),
+                (gatewayStatusOperational(true, true, "ready", queueDepth: 128), "inbound_queue_full")
+            ]
+            for ((operational, expectedReason) in cases) {
+                let readiness = gatewayBuildRuntimeReadinessSnapshot(cfg, user, operational: Some(operational))
+                @Expect(statusTestString(readiness, "status"), "degraded")
+                @Expect(statusTestString(readiness, "reason"), expectedReason)
+                @Expect(readiness.get("ready").getOrThrow().asBool().getValue(), false)
+            }
+
+            let health = JsonValue.fromStr(gatewayHttpHealthProbeJson(cfg)).asObject()
+            @Expect(statusTestString(health, "status"), "live")
+            @Expect(health.get("ok").getOrThrow().asBool().getValue(), true)
+        })
+    }
+
     @TestCase
     public func healthAndReadinessExposeSharedInspectContext(): Unit {
         let health = handleGatewayStatusFamily("health", GatewayUserSettings()).getOrThrow()

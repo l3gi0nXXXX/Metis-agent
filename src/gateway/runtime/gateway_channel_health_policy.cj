@@ -32,8 +32,30 @@ private func gatewayHealthBindingString(obj: JsonObject, key: String, defaultVal
     }
 }
 
-public func gatewayChannelHealthPolicy(user: GatewayUserSettings, channelId: String, status: JsonObject): JsonObject {
-    let now = DateTime.now().toUnixTimeStamp().toMilliseconds()
+private func gatewayChannelPollStale(account: JsonObject, nowMs: Int64, thresholdMs: Int64): Bool {
+    if (!gatewayHealthBindingBool(account, "running") || thresholdMs <= 0) {
+        return false
+    }
+    let lastPullAtMs = gatewayHealthBindingCount(account, "lastPullAtMs")
+    let referenceAtMs = if (lastPullAtMs > 0) {
+        lastPullAtMs
+    } else {
+        gatewayHealthBindingCount(account, "lastStartAtMs")
+    }
+    if (referenceAtMs <= 0) {
+        return false
+    }
+    let ageMs = max(0, nowMs - referenceAtMs)
+    ageMs > thresholdMs
+}
+
+public func gatewayChannelHealthPolicy(
+    user: GatewayUserSettings,
+    channelId: String,
+    status: JsonObject,
+    nowMs!: Int64 = -1
+): JsonObject {
+    let now = if (nowMs >= 0) { nowMs } else { DateTime.now().toUnixTimeStamp().toMilliseconds() }
     let staleThresholdMs = user.channelStaleEventThresholdMinutes * 60 * 1000
     let runtime = match (status.get("runtime")) {
         case Some(v) => try { v.asObject() } catch (_e: Exception) { JsonObject() }
@@ -59,6 +81,9 @@ public func gatewayChannelHealthPolicy(user: GatewayUserSettings, channelId: Str
             primed = true
         }
         if (lastEventAtMs > 0 && staleThresholdMs > 0 && now - lastEventAtMs > staleThresholdMs) {
+            stale = true
+        }
+        if (gatewayChannelPollStale(account, now, staleThresholdMs)) {
             stale = true
         }
     }

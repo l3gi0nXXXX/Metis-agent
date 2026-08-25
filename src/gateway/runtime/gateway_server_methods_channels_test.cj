@@ -285,6 +285,48 @@ private func withGatewayChannelsTestHome<T>(block: () -> T): T {
 @Test
 public class GatewayServerMethodsChannelsTest {
     @TestCase
+    public func p5B1ChannelPollStalenessHonorsGraceBoundaryAndClockRollback(): Unit {
+        var user = GatewayUserSettings()
+        user.channelStaleEventThresholdMinutes = 1
+        let now: Int64 = 100000
+
+        for ((lastStartAtMs, lastPullAtMs, expectedState) in [
+            (40000, 0, "healthy"),
+            (39999, 0, "stale"),
+            (1000, 40000, "healthy"),
+            (1000, 39999, "stale"),
+            (110000, 0, "healthy"),
+            (1000, 110000, "healthy")
+        ]) {
+            let account = JsonObject()
+            account.put("running", true.toJsonValue())
+            account.put("bindingState", JsonString("primed"))
+            account.put("lastStartAtMs", lastStartAtMs.toJsonValue())
+            account.put("lastPullAtMs", lastPullAtMs.toJsonValue())
+            account.put("lastEventAtMs", 0.toJsonValue())
+            let accounts = JsonArray([])
+            accounts.add(account)
+            let runtime = JsonObject()
+            runtime.put("running", 1.toJsonValue())
+            runtime.put("accounts", accounts)
+            let status = JsonObject()
+            status.put("enabled", true.toJsonValue())
+            status.put("configured", true.toJsonValue())
+            status.put("runtime", runtime)
+
+            let policy = gatewayChannelHealthPolicy(user, "telegram", status, nowMs: now)
+            @Expect(channelsTestString(policy, "healthState"), expectedState)
+            let actions = policy.get("actions").getOrThrow().asArray()
+            if (expectedState == "stale") {
+                @Expect(actions.size(), 1)
+                @Expect(channelsTestString(actions[0].asObject(), "action"), "probe-channel")
+            } else {
+                @Expect(actions.size(), 0)
+            }
+        }
+    }
+
+    @TestCase
     public func channelsStartUsesActiveNativeGatewayServiceForTelegramAccount(): Unit {
         withGatewayChannelsTestHome {
             let adapter = GatewayChannelsLifecycleFakeAdapter("telegram")

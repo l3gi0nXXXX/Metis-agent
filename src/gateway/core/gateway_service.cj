@@ -5,7 +5,7 @@ import metis.core.config.{CliConfig, CliSettingManager, GatewayUserSettings, Met
 import metis.core.model.{CodexResponsesException, findModelCapabilityCatalogEntry, modelCapabilityCatalogEntriesForProvider}
 import metis.core.skills.SkillsPrompt
 import metis.gateway.model.*
-import metis.gateway.process.shutdownGatewayStdioBroker
+import metis.gateway.process.{gatewayStdioBrokerSnapshot, shutdownGatewayStdioBroker}
 import metis.process.ManagedStdioOperationResult
 import metis.gateway.security.gatewayPairingAccountStore
 import metis.gateway.service_plugin.{CapabilityCaller, CapabilityInvokeRequest, CapabilityInvokeResult, ServicePluginAcceptedGitCodeEvent, ServicePluginDeliveryTarget, ServicePluginEventDeliveryResult, ServicePluginGeneratedReplyResult, ServicePluginPendingJob, buildServicePluginImBindingRules, invokeRegisteredCapability, matchServicePluginImBinding, parseServicePluginJobAcceptedPayload, redactServicePayload, renderServicePluginJobSnapshotMessage, servicePluginGeneratedReplyResultFromAgentAnswer, servicePluginPendingJobStore, registerConfiguredServicePlugins, servicePluginConfiguredStatusForUser, servicePluginWebhookDispatchStatsJson, setServicePluginEventDelivery, setServicePluginGeneratedReplyHandler, setServicePluginWebhookGeneratedReplyHandler, setServicePluginWebhookSubscribersProvider, shutdownServicePluginHost, validateServicePluginGeneratedDraft}
@@ -132,6 +132,19 @@ public class GatewayService {
     /** 提供给 control-ui / gateway RPC 的 live channel runtime snapshot。 */
     public func liveChannelSnapshot(): JsonObject {
         this.channelManager.liveSnapshotJson()
+    }
+
+    /** Live poll/readiness state; callers must not infer broker health from the Gateway PID. */
+    public func operationalSnapshot(): JsonObject {
+        let broker = gatewayStdioBrokerSnapshot()
+        let out = JsonObject()
+        out.put("inboundAccepting", this.inboundDispatcher.isAccepting().toJsonValue())
+        out.put("inboundActiveCount", this.inboundDispatcher.activeCount().toJsonValue())
+        out.put("inboundQueueDepth", this.inboundDispatcher.queuedCount().toJsonValue())
+        out.put("inboundQueueCapacity", this.inboundDispatcher.queueCapacity().toJsonValue())
+        out.put("broker", broker)
+        out.put("channels", this.channelManager.liveSnapshotJson())
+        out
     }
 
     /** Start registered adapters for one native channel, optionally scoped to one account. */

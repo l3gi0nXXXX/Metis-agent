@@ -228,5 +228,7 @@ public class GatewayInboundDispatcher {
 
     public func queuedCount(): Int64 { synchronized(this.lock) { Int64(this.queued.size) } }
 
+    public func queueCapacity(): Int64 { this.maxQueued }
+
     public func isAccepting(): Bool { synchronized(this.lock) { this.accepting } }
 }
