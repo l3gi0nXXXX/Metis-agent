@@ -674,7 +674,12 @@ public class ManagedStdioBrokerClient {
         }
     }
 
-    public func writeOwnerLine(ownerId: String, line: String): ManagedStdioOperationResult {
+    public func writeOwnerLine(
+        ownerId: String,
+        line: String,
+        timeoutMs!: Int64 = 1000,
+        expectedGeneration!: Option<Int64> = None<Int64>
+    ): ManagedStdioOperationResult {
         if (line.contains("\u{0}") || line.contains("\r") || line.contains("\n")) {
             return ManagedStdioOperationResult(false, "invalid_owner_write")
         }
@@ -682,6 +687,13 @@ public class ManagedStdioBrokerClient {
         match (state) {
             case None => ManagedStdioOperationResult(false, "owner_not_found", generation: this.generation)
             case Some(value) =>
+                match (expectedGeneration) {
+                    case Some(expected) =>
+                        if (value.generation != expected) {
+                            return ManagedStdioOperationResult(false, "stale_generation", generation: value.generation, pid: value.pid, pgid: value.pgid)
+                        }
+                    case None => ()
+                }
                 let requestId = synchronized(this.lock) {
                     this.requestSequence += 1
                     "write-${value.generation}-${this.requestSequence}"
@@ -694,7 +706,7 @@ public class ManagedStdioBrokerClient {
                 if (!this.writeFrameForGeneration(frame, value.generation)) {
                     return ManagedStdioOperationResult(false, "broker_exited", generation: value.generation, pid: value.pid, pgid: value.pgid)
                 }
-                let deadline = this.nowMs() + 1000
+                let deadline = this.nowMs() + max(1, timeoutMs)
                 synchronized(this.lock) {
                     while (value.lastWriteRequestId != requestId && !value.settled) {
                         let remaining = deadline - this.nowMs()

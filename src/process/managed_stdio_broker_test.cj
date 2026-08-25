@@ -791,6 +791,61 @@ public class ManagedStdioBrokerTest {
     }
 
     @TestCase
+    public func s3N1GenerationBoundOwnerWriteRejectsReplacementAndHonorsTimeout(): Unit {
+        let client = ManagedStdioBrokerClient(brokerTestMode: true)
+        let marker = Path("/tmp/metis-stdio-stale-write-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
+        try {
+            let old = client.startOwner(ManagedStdioOwnerSpec(
+                "s3-write-owner",
+                "node",
+                args: ["-e", "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"],
+                stdinMode: "closed",
+                deadlineMs: 10000
+            ))
+            @Expect(old.ok, true)
+            client.debugKillBrokerForTest()
+            @Expect(managedStdioWaitUntil(4000, { => !client.debugSnapshotForTest().running }), true)
+            let _ = client.readOwnerLine("s3-write-owner", timeoutMs: 100)
+
+            let replacement = client.startOwner(ManagedStdioOwnerSpec(
+                "s3-write-owner",
+                "node",
+                args: ["-e", "process.stdin.once('data',()=>require('fs').writeFileSync('${marker.toString()}','written'));setInterval(()=>{},1000)"],
+                stdinMode: "line",
+                deadlineMs: 10000
+            ))
+            @Expect(replacement.ok, true)
+            @Expect(replacement.generation > old.generation, true)
+            let stale = client.writeOwnerLine(
+                "s3-write-owner",
+                "must-not-write",
+                timeoutMs: 25,
+                expectedGeneration: Some(old.generation)
+            )
+            @Expect(stale.ok, false)
+            @Expect(stale.status, "stale_generation")
+            sleep(Duration.millisecond * 50)
+            @Expect(exists(marker), false)
+
+            @Expect(client.debugHangBrokerForTest(), true)
+            let startedAt = DateTime.now().toUnixTimeStamp().toMilliseconds()
+            let timed = client.writeOwnerLine(
+                "s3-write-owner",
+                "bounded",
+                timeoutMs: 25,
+                expectedGeneration: Some(replacement.generation)
+            )
+            let elapsed = DateTime.now().toUnixTimeStamp().toMilliseconds() - startedAt
+            @Expect(timed.ok, false)
+            @Expect(timed.status, "broker_unresponsive")
+            @Expect(elapsed < 500, true)
+        } finally {
+            let _ = client.close(timeoutMs: 3000)
+            try { remove(marker) } catch (_: Exception) { () }
+        }
+    }
+
+    @TestCase
     public func p1N3HungProtocolEmergencyReapsAndNodeMissingIsStable(): Unit {
         let recording = RecordingManagedStdioPlatformRunner()
         let client = ManagedStdioBrokerClient(platformRunner: recording, brokerTestMode: true)

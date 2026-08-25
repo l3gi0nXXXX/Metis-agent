@@ -14,18 +14,20 @@ const leasePath = process.env.METIS_SERVICE_PLUGIN_LEASE_PATH || '';
 const parentPid = Number(process.env.METIS_SERVICE_PLUGIN_PARENT_PID || 0);
 const markerPath = process.env.METIS_STDIO_FIXTURE_MARKER_PATH || '';
 const releasePath = process.env.METIS_STDIO_FIXTURE_RELEASE_PATH || '';
+const stopFrameMarkerPath = process.env.METIS_STDIO_FIXTURE_STOP_FRAME_MARKER_PATH || '';
+const portClosedMarkerPath = process.env.METIS_STDIO_FIXTURE_PORT_CLOSED_MARKER_PATH || '';
 const rootPidPath = process.env.METIS_STDIO_FIXTURE_ROOT_PID_PATH || '';
 const childPidPath = process.env.METIS_STDIO_FIXTURE_CHILD_PID_PATH || '';
 
-function frame(value) {
-  process.stdout.write(`${JSON.stringify(value)}\n`);
+function frame(value, onWritten) {
+  process.stdout.write(`${JSON.stringify(value)}\n`, onWritten);
 }
 
-function initFrame() {
+function initFrame(onWritten) {
   frame({
     type: 'response', frameId: 'init-1', serviceId, method: 'initialize',
     payload: { ok: true, status: 'ready' },
-  });
+  }, onWritten);
 }
 
 function writeLease(state, port = 0) {
@@ -42,8 +44,14 @@ function shutdownFixture() {
   if (mode === 'ignore-term' || mode === 'ignore-term-tree') return;
   const port = server?.address()?.port ?? 0;
   writeLease('stopped', port);
-  server?.close(() => process.exit(0));
-  if (!server) process.exit(0);
+  server?.close(() => {
+    if (portClosedMarkerPath) writeFileSync(portClosedMarkerPath, 'closed\n');
+    process.exit(0);
+  });
+  if (!server) {
+    if (portClosedMarkerPath) writeFileSync(portClosedMarkerPath, 'closed\n');
+    process.exit(0);
+  }
 }
 
 if (gcmMode) {
@@ -64,8 +72,18 @@ if (gcmMode) {
   initFrame();
 } else {
   if (mode === 'slow-init') setTimeout(initFrame, 800);
-  else initFrame();
-  if (mode === 'exit-after-init') setTimeout(() => process.exit(0), 5);
+  else if (mode === 'exit-after-init') {
+    initFrame(() => {
+      writeLease('running');
+      if (markerPath) writeFileSync(markerPath, 'ready\n');
+      const releaseTimer = setInterval(() => {
+        if (!releasePath || !existsSync(releasePath)) return;
+        clearInterval(releaseTimer);
+        writeLease('stopped');
+        process.exit(0);
+      }, 1);
+    });
+  } else initFrame();
   if (mode === 'exit-after-delay') setTimeout(() => process.exit(0), 500);
   if (mode === 'delayed-graceful-stop') writeLease('running');
   if (mode === 'latch-event') {
@@ -124,6 +142,12 @@ input.on('line', (line) => {
     }
   }
   if (request.method === 'stop') {
+    if (stopFrameMarkerPath) {
+      writeFileSync(stopFrameMarkerPath, JSON.stringify({
+        correlationId: request.correlationId ?? '',
+        serviceId: request.serviceId ?? '',
+      }));
+    }
     if (mode === 'delayed-graceful-stop') {
       setTimeout(() => {
         if (markerPath) writeFileSync(markerPath, 'graceful\n');
@@ -136,10 +160,17 @@ input.on('line', (line) => {
     return;
   }
   if (gcmMode) {
+    const gitCodeEvent = serviceId === 'gitcode-monitor';
     frame({
       type: 'event', frameId: `event-${Date.now()}`, serviceId,
-      method: 'emitCapabilityEvent', capabilityId: 'stdio.event.accepted',
-      payload: { ok: true, status: 'accepted', text: '事件中文🙂' },
+      method: 'emitCapabilityEvent',
+      capabilityId: gitCodeEvent ? 'gitcode.event.accepted' : 'stdio.event.accepted',
+      payload: gitCodeEvent ? {
+        jobId: 'webhook-s3-job', eventId: 's3-event', repo: 'Cangjie/community',
+        kind: 'issue', number: '3', title: '停止中文🙂',
+        url: 'https://gitcode.com/Cangjie/community/issues/3',
+        author: 'fixture-user', content: 'dispatch blocker',
+      } : { ok: true, status: 'accepted', text: '事件中文🙂' },
     });
   }
   frame({
