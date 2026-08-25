@@ -976,22 +976,33 @@ public class GatewayCanvasHostRuntime {
     }
 
     public static func stopIfRunning(): Unit {
-        synchronized(lock) {
+        let _ = GatewayCanvasHostRuntime.stopDetailed(MonoTime.now() + Duration.second * 2)
+    }
+
+    public static func stopDetailed(deadline: MonoTime): GatewaySurfaceStopResult {
+        let detached = synchronized(lock) {
             GatewayCanvasHostRuntime.stopLiveReloadPollerLocked()
-            if (let Some(s) <- server) {
-                try {
-                    s.close()
-                } catch (_: Exception) {
-                    ()
-                }
-            }
+            let value = (server, started, Int64(listenPort))
             started = false
             server = None
             rootPath = ""
             canonicalRoutes = JsonArray([])
             registeredRoutes = JsonArray([])
             lastErrorKind = ""
+            value
         }
+        if (!detached[1] && detached[0].isNone()) {
+            return GatewaySurfaceStopResult(true, "already_stopped")
+        }
+        try {
+            match (detached[0]) {
+                case Some(s) => s.close()
+                case None => ()
+            }
+        } catch (_: Exception) {
+            return GatewaySurfaceStopResult(false, "close_failed", portStatus: "not_checked")
+        }
+        gatewayServePortReleasedUntil(detached[2], deadline)
     }
 
     public static func snapshot(cfg: GatewayConfig): JsonObject {

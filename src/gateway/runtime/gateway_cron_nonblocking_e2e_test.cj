@@ -965,7 +965,7 @@ public class GatewayCronNonblockingE2eTest {
                 try { File.writeTo(releaseA, "release".toArray()) } catch (_: Exception) { () }
                 try { File.writeTo(releaseB, "release".toArray()) } catch (_: Exception) { () }
                 try { let _ = runner.stop(drainTimeoutMs: 3000) } catch (_: Exception) { () }
-                try { gateway.stop() } catch (_: Exception) { () }
+                try { let _ = gateway.stop() } catch (_: Exception) { () }
                 GatewayHttpSurface.stopIfRunning()
                 if (managedStdioBroker().snapshot().ownerCount != 0) {
                     let _ = resetManagedStdioBrokerForTest(timeoutMs: 3000)

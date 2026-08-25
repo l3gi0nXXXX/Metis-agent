@@ -34,6 +34,7 @@ private func gatewayProcessPidArrayContains(pids: Array<Int64>, pid: Int64): Boo
 
 private func gatewayProcessIdentityStatus(
     lockPid: Option<Int64>,
+    lockProbeConclusive: Bool,
     lockAlive: Bool,
     listenerPids: Array<Int64>,
     pidMismatch: Bool
@@ -46,6 +47,7 @@ private func gatewayProcessIdentityStatus(
     }
     match (lockPid) {
         case Some(_) =>
+            if (!lockProbeConclusive) { return "cleanup_pending" }
             if (lockAlive) {
                 return "lock-only"
             }
@@ -72,10 +74,11 @@ public func gatewayProcessIdentitySnapshotForConfig(user: GatewayUserSettings, c
     let lockPid = gatewayPeekServeLockPid()
     let listenerPids = gatewayFindVerifiedListenerPidsOnPort(port: cfg.port)
     let effectivePids = gatewayResolveStopTargetPids(listenerPids, lockPid: lockPid)
-    let lockAlive = match (lockPid) {
-        case Some(pid) => gatewayServePidIsAlive(pid)
-        case None => false
+    let lockProbe = match (lockPid) {
+        case Some(pid) => gatewayServePidProbe(pid, 500)
+        case None => GatewayServePidProbeResult(true, false, "not_applicable")
     }
+    let lockAlive = lockProbe.conclusive && lockProbe.alive
     var pidMismatch = false
     match (lockPid) {
         case Some(pid) =>
@@ -86,7 +89,7 @@ public func gatewayProcessIdentitySnapshotForConfig(user: GatewayUserSettings, c
     }
     let runtime = gatewayRuntimeSnapshot()
     let http = GatewayHttpSurface.snapshot(cfg)
-    let status = gatewayProcessIdentityStatus(lockPid, lockAlive, listenerPids, pidMismatch)
+    let status = gatewayProcessIdentityStatus(lockPid, lockProbe.conclusive, lockAlive, listenerPids, pidMismatch)
 
     let out = JsonObject()
     out.put("schema", JsonString(GATEWAY_PROCESS_IDENTITY_SCHEMA))
@@ -98,6 +101,7 @@ public func gatewayProcessIdentitySnapshotForConfig(user: GatewayUserSettings, c
         case None => out.put("lockPid", 0.toJsonValue())
     }
     out.put("lockAlive", lockAlive.toJsonValue())
+    out.put("lockPidStatus", JsonString(lockProbe.status))
     out.put("listenerPresent", (listenerPids.size > 0).toJsonValue())
     out.put("listenerPids", gatewayProcessPidArrayJson(listenerPids))
     out.put("effectivePids", gatewayProcessPidArrayJson(effectivePids))

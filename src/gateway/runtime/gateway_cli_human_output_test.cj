@@ -159,6 +159,22 @@ private func gatewayHumanQqChannelGetRaw(): String {
 @Test
 public class GatewayCliHumanOutputTest {
     @TestCase
+    public func s4P1AndN1StopOutcomesAreHumanReadableWithoutRawJson(): Unit {
+        let graceful = gatewayStopOutcomeHumanText("graceful")
+        let forced = gatewayStopOutcomeHumanText("force_terminated")
+        let pending = gatewayStopOutcomeHumanText("cleanup_pending")
+        let stale = gatewayStopOutcomeHumanText("stale_identity")
+        @Expect(graceful.contains("已正常停止"), true)
+        @Expect(forced.contains("已强制停止"), true)
+        @Expect(pending.contains("主进程已退出但子进程清理未完成"), true)
+        @Expect(stale.contains("替代进程"), true)
+        for (text in [graceful, forced, pending, stale]) {
+            @Expect(text.contains("\"ok\""), false)
+            @Expect(text.contains("{"), false)
+        }
+    }
+
+    @TestCase
     public func formatsSubagentsListWithoutRawJson(): Unit {
         let raw = "{\"ok\":true,\"status\":\"ok\",\"action\":\"list\",\"filter\":\"active\",\"total\":1,\"activeCount\":1,\"terminalCount\":0,\"staleCount\":0,\"recordedCount\":0,\"sessions\":[{\"runId\":\"subrun_1\",\"sessionKey\":\"session-a\",\"agentId\":\"reviewer\",\"runtime\":\"subagent\",\"effectiveState\":\"running\",\"noticeStatus\":\"none\"}]}"
         let out = gatewayFormatCommandOutput(raw)

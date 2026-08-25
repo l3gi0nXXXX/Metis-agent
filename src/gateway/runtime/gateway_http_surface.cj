@@ -17,7 +17,8 @@ import metis.gateway.session.{GatewayIngressSource, gatewayBuildChatSendRpcParam
 import std.collection.ArrayList
 import std.convert.Parsable
 import std.sync.Mutex
-import std.time.DateTime
+import std.time.{DateTime, MonoTime}
+import std.core.Duration
 import stdx.encoding.base64.toBase64String
 import stdx.encoding.json.{JsonArray, JsonObject, JsonString, JsonValue}
 import stdx.net.http.*
@@ -145,17 +146,28 @@ public class GatewayHttpSurface {
     }
 
     public static func stopIfRunning(): Unit {
-        synchronized(lock) {
-            if (let Some(s) <- server) {
-                try {
-                    s.close()
-                } catch (_e: Exception) {
-                    ()
-                }
-            }
+        let _ = GatewayHttpSurface.stopDetailed(MonoTime.now() + Duration.second * 2)
+    }
+
+    public static func stopDetailed(deadline: MonoTime): GatewaySurfaceStopResult {
+        let detached = synchronized(lock) {
+            let value = (server, started, Int64(listenPort))
             started = false
             server = None
+            value
         }
+        if (!detached[1] && detached[0].isNone()) {
+            return GatewaySurfaceStopResult(true, "already_stopped")
+        }
+        try {
+            match (detached[0]) {
+                case Some(s) => s.close()
+                case None => ()
+            }
+        } catch (_: Exception) {
+            return GatewaySurfaceStopResult(false, "close_failed", portStatus: "not_checked")
+        }
+        gatewayServePortReleasedUntil(detached[2], deadline)
     }
 }
 
