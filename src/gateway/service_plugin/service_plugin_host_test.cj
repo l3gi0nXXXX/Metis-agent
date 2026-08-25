@@ -1,7 +1,7 @@
 package metis.gateway.service_plugin
 
 import metis.gateway.logging.gatewayLoggingResetForTest
-import metis.process.{ManagedStdioOwnerSpec, managedStdioBroker, managedStdioResolveBrokerScriptPath}
+import metis.process.{ManagedStdioOwnerSpec, managedStdioBroker, managedStdioResolveBrokerScriptPath, resetManagedStdioBrokerForTest}
 import std.collection.ArrayList
 import std.convert.Parsable
 import std.env.{getProcessId, getVariable, setVariable}
@@ -80,6 +80,19 @@ private class ServicePluginTestCounter {
 
 @Test
 public class ServicePluginHostTest {
+    private func withIsolatedServicePluginHostTestHome<T>(label: String, block: (Path) -> T): T {
+        resetServicePluginHostForTest()
+        @Expect(resetManagedStdioBrokerForTest(timeoutMs: 2000).ok, true)
+        withServicePluginHostTestHome(label, { home: Path =>
+            try {
+                block(home)
+            } finally {
+                resetServicePluginHostForTest()
+                @Expect(resetManagedStdioBrokerForTest(timeoutMs: 2000).ok, true)
+            }
+        })
+    }
+
     private func sampleManifest(): ServicePluginManifest {
         let caps = ArrayList<ServiceCapabilityRecord>()
         caps.add(ServiceCapabilityRecord("sample.monitor.status", "controlAction"))
@@ -668,7 +681,7 @@ public class ServicePluginHostTest {
     @TestCase
     public func tP5MetisEnvInjectionForGitCodeMonitorStartupPrerequisites(): Unit {
         // T-P5 Metis-side env injection coverage.
-        withServicePluginHostTestHome("service-plugin-p5-gcm-env", { _home: Path =>
+        withIsolatedServicePluginHostTestHome("service-plugin-p5-gcm-env", { _home: Path =>
             let capturePath = Path("/tmp/metis-gcm-service-plugin-env-${DateTime.now().toUnixTimeStamp().toNanoseconds()}.txt")
             try { remove(capturePath, recursive: true) } catch (_: Exception) { () }
             let initLine = this.gitCodeInitLine()
@@ -694,7 +707,7 @@ public class ServicePluginHostTest {
     @TestCase
     public func tP4N001StartupFailsFastWhenRunningLeaseOwnerIsAlive(): Unit {
         // METIS-ORPHAN-U-001, T-P4-N-001, T-P7-E2E-006 Metis-side prerequisite.
-        withServicePluginHostTestHome("service-plugin-p4-stale-running-lease", { home: Path =>
+        withIsolatedServicePluginHostTestHome("service-plugin-p4-stale-running-lease", { home: Path =>
             let launchMarker = home.join("gcm-launch-marker.txt")
             let _ = this.writeGitCodeLease(home, "gitcode-monitor-old", "running", getProcessId())
             let script = "printf started > '${launchMarker.toString()}'; printf '%s\\n' '${this.gitCodeInitLine()}'; read ignored || true"
@@ -722,7 +735,7 @@ public class ServicePluginHostTest {
     @TestCase
     public func metisOrphanB001StartupFailsFastWhenOrphanLeaseOwnerIsAlive(): Unit {
         // METIS-ORPHAN-B-001.
-        withServicePluginHostTestHome("service-plugin-orphan-live-lease", { home: Path =>
+        withIsolatedServicePluginHostTestHome("service-plugin-orphan-live-lease", { home: Path =>
             let launchMarker = home.join("gcm-launch-marker.txt")
             let _ = this.writeGitCodeLeaseWithDetails(home, "gitcode-monitor-orphan", "orphan_detected", getProcessId(), parentPid: getProcessId(), port: 18080)
             let script = "printf started > '${launchMarker.toString()}'; printf '%s\\n' '${this.gitCodeInitLine()}'; read ignored || true"
@@ -751,7 +764,7 @@ public class ServicePluginHostTest {
     @TestCase
     public func metisOrphanB002OrphanLeaseWithMissingPidDoesNotBlockStart(): Unit {
         // METIS-ORPHAN-B-002.
-        withServicePluginHostTestHome("service-plugin-orphan-missing-pid", { home: Path =>
+        withIsolatedServicePluginHostTestHome("service-plugin-orphan-missing-pid", { home: Path =>
             let launchMarker = home.join("gcm-launch-marker.txt")
             let _ = this.writeGitCodeLeaseWithDetails(home, "gitcode-monitor-orphan", "orphan_detected", 0, parentPid: getProcessId(), port: 18080)
             let script = "printf started > '${launchMarker.toString()}'; printf '%s\\n' '${this.gitCodeInitLine()}'; read ignored || true"
@@ -771,7 +784,7 @@ public class ServicePluginHostTest {
     @TestCase
     public func tP4P001StoppedOldLeaseDoesNotBlockNewGitCodeMonitorStart(): Unit {
         // T-P4-P-001, T-P7-E2E-006 Metis-side restart prerequisite.
-        withServicePluginHostTestHome("service-plugin-p4-stopped-old-lease", { home: Path =>
+        withIsolatedServicePluginHostTestHome("service-plugin-p4-stopped-old-lease", { home: Path =>
             let launchMarker = home.join("gcm-launch-marker.txt")
             let _ = this.writeGitCodeLease(home, "gitcode-monitor-old", "stopped", getProcessId())
             let script = "printf started > '${launchMarker.toString()}'; printf '%s\\n' '${this.gitCodeInitLine()}'; read ignored || true"
@@ -796,7 +809,7 @@ public class ServicePluginHostTest {
     @TestCase
     public func tP4U001GracefulStopReportsExitedAndVerifiesStoppedLease(): Unit {
         // T-P4-U-001.
-        withServicePluginHostTestHome("service-plugin-p4-graceful-stop", { _home: Path =>
+        withIsolatedServicePluginHostTestHome("service-plugin-p4-graceful-stop", { _home: Path =>
             let script = "printf '%s\\n' '${this.gitCodeInitLine()}'; while read line; do printf '{\"state\":\"stopped\",\"status\":\"stopped\",\"pluginId\":\"gitcode-monitor\",\"sessionId\":\"%s\",\"pid\":%s,\"parentPid\":%s}\\n' \"$METIS_SERVICE_PLUGIN_SESSION_ID\" \"$$\" \"$METIS_SERVICE_PLUGIN_PARENT_PID\" > \"$METIS_SERVICE_PLUGIN_LEASE_PATH\"; exit 0; done"
             this.registerGitCodeStdioScript(script)
             try {
@@ -823,7 +836,7 @@ public class ServicePluginHostTest {
     @TestCase
     public func tP4B001ForcedStopKeepsDiagnosticWhenLeaseNotStopped(): Unit {
         // METIS-ORPHAN-P-002, T-P4-B-001.
-        withServicePluginHostTestHome("service-plugin-p4-forced-stop-lease", { _home: Path =>
+        withIsolatedServicePluginHostTestHome("service-plugin-p4-forced-stop-lease", { _home: Path =>
             let script = "printf '%s\\n' '${this.gitCodeInitLine()}'; printf '{\"state\":\"running\",\"status\":\"running\",\"pluginId\":\"gitcode-monitor\",\"sessionId\":\"%s\",\"pid\":%s,\"parentPid\":%s,\"bindHost\":\"127.0.0.1\",\"port\":18080}\\n' \"$METIS_SERVICE_PLUGIN_SESSION_ID\" \"$$\" \"$METIS_SERVICE_PLUGIN_PARENT_PID\" > \"$METIS_SERVICE_PLUGIN_LEASE_PATH\"; trap '' TERM; while true; do read -t 1 ignored || true; done"
             this.registerGitCodeStdioScript(script)
             try {
@@ -902,7 +915,7 @@ public class ServicePluginHostTest {
     @TestCase
     public func tP3U003ProcessDeadShortCircuitsHealthzProbe(): Unit {
         // T-P3-U-003.
-        withServicePluginHostTestHome("service-plugin-p3-process-dead", { _home: Path =>
+        withIsolatedServicePluginHostTestHome("service-plugin-p3-process-dead", { _home: Path =>
             this.registerGitCodeStdioScript(this.gitCodeLeaseScript(18180, keepAlive: false))
             let callLock = Mutex()
             let healthzCalls = ArrayList<Int64>()
@@ -930,7 +943,7 @@ public class ServicePluginHostTest {
     @TestCase
     public func tP3B001MissingLeaseOrListenerEndpointIsDiagnosticOnly(): Unit {
         // T-P3-B-001.
-        withServicePluginHostTestHome("service-plugin-p3-missing-lease", { _home: Path =>
+        withIsolatedServicePluginHostTestHome("service-plugin-p3-missing-lease", { _home: Path =>
             let noLeaseScript = "printf '%s\\n' '${this.gitCodeInitLine()}'; while read line; do exit 0; done"
             this.registerGitCodeStdioScript(noLeaseScript)
             setServicePluginSupervisorConfigForTest(ServicePluginSupervisorConfig(enabled: true, intervalMs: 1000, healthTimeoutMs: 10, failureThreshold: 1, restartCooldownMs: 1000))
@@ -947,7 +960,7 @@ public class ServicePluginHostTest {
             }
         })
 
-        withServicePluginHostTestHome("service-plugin-p3-missing-endpoint", { home: Path =>
+        withIsolatedServicePluginHostTestHome("service-plugin-p3-missing-endpoint", { home: Path =>
             this.registerGitCodeStdioScript(this.gitCodeLeaseScript(0, includeEndpoint: false))
             setServicePluginSupervisorConfigForTest(ServicePluginSupervisorConfig(enabled: true, intervalMs: 1000, healthTimeoutMs: 10, failureThreshold: 1, restartCooldownMs: 1000))
             try {
@@ -968,7 +981,7 @@ public class ServicePluginHostTest {
     @TestCase
     public func tP3B002SingleTimeoutThenHealthyClearsFailureWithoutRestart(): Unit {
         // T-P3-B-002.
-        withServicePluginHostTestHome("service-plugin-p3-timeout-recovers", { home: Path =>
+        withIsolatedServicePluginHostTestHome("service-plugin-p3-timeout-recovers", { home: Path =>
             this.registerGitCodeStdioScript(this.gitCodeLeaseScript(18181))
             let callLock = Mutex()
             let healthzCalls = ArrayList<Int64>()
@@ -1008,7 +1021,7 @@ public class ServicePluginHostTest {
     @TestCase
     public func tP3P001HealthyFakeServiceKeepsFiveMinuteProbeHealthy(): Unit {
         // T-P3-P-001.
-        withServicePluginHostTestHome("service-plugin-p3-five-minute-healthy", { home: Path =>
+        withIsolatedServicePluginHostTestHome("service-plugin-p3-five-minute-healthy", { home: Path =>
             this.registerGitCodeStdioScript(this.gitCodeLeaseScript(18182))
             setServicePluginSupervisorConfigForTest(ServicePluginSupervisorConfig(enabled: true, intervalMs: 1000, healthTimeoutMs: 10, failureThreshold: 2, restartCooldownMs: 1000))
             setServicePluginHealthzProbeForTest(Some({ _url: String, _timeoutMs: Int64 =>
@@ -1037,7 +1050,7 @@ public class ServicePluginHostTest {
     @TestCase
     public func tP3N001PersistentHealthzTimeoutMarksDegradedAndRestartsBounded(): Unit {
         // T-P3-N-001.
-        withServicePluginHostTestHome("service-plugin-p3-persistent-timeout", { home: Path =>
+        withIsolatedServicePluginHostTestHome("service-plugin-p3-persistent-timeout", { home: Path =>
             this.registerGitCodeStdioScript(this.gitCodeLeaseScript(18183))
             setServicePluginSupervisorConfigForTest(ServicePluginSupervisorConfig(enabled: true, intervalMs: 1000, healthTimeoutMs: 10, failureThreshold: 2, restartCooldownMs: 60000))
             setServicePluginHealthzProbeForTest(Some({ _url: String, _timeoutMs: Int64 =>
@@ -1072,7 +1085,7 @@ public class ServicePluginHostTest {
     @TestCase
     public func tT0U2T4U1EnsureReplacesDeadActiveProcess(): Unit {
         // T0-U2 Metis-side baseline, T4-U1.
-        withServicePluginHostTestHome("service-plugin-t4-dead-active", { home: Path =>
+        withIsolatedServicePluginHostTestHome("service-plugin-t4-dead-active", { home: Path =>
             let counterPath = home.join("launch-count.txt")
             this.registerGitCodeStdioScript(this.gitCodeCountingLeaseScript(counterPath, 18185, keepAlive: false))
             try {
@@ -1098,7 +1111,7 @@ public class ServicePluginHostTest {
     @TestCase
     public func tT4U1EnsureReplacesQueueOnlyAndProcessOnlyStaleState(): Unit {
         // T4-U1 queue-only stale and process-only stale coverage.
-        withServicePluginHostTestHome("service-plugin-t4-queue-only", { home: Path =>
+        withIsolatedServicePluginHostTestHome("service-plugin-t4-queue-only", { home: Path =>
             let counterPath = home.join("queue-only-count.txt")
             this.registerGitCodeStdioScript(this.gitCodeCountingLeaseScript(counterPath, 18186))
             try {
@@ -1114,7 +1127,7 @@ public class ServicePluginHostTest {
             }
         })
 
-        withServicePluginHostTestHome("service-plugin-t4-process-only", { home: Path =>
+        withIsolatedServicePluginHostTestHome("service-plugin-t4-process-only", { home: Path =>
             let counterPath = home.join("process-only-count.txt")
             this.registerGitCodeStdioScript(this.gitCodeCountingLeaseScript(counterPath, 18187))
             try {
@@ -1134,7 +1147,7 @@ public class ServicePluginHostTest {
     @TestCase
     public func tT4U1EnsureReplacesClosedResponseQueue(): Unit {
         // T4-U1 closed queue coverage.
-        withServicePluginHostTestHome("service-plugin-t4-closed-queue", { home: Path =>
+        withIsolatedServicePluginHostTestHome("service-plugin-t4-closed-queue", { home: Path =>
             let counterPath = home.join("closed-queue-count.txt")
             this.registerGitCodeStdioScript(this.gitCodeCountingLeaseScript(counterPath, 18188))
             try {
@@ -1154,7 +1167,7 @@ public class ServicePluginHostTest {
     @TestCase
     public func tT4U2EventPumpClosesImmediatelyWhenProcessExits(): Unit {
         // T4-U2.
-        withServicePluginHostTestHome("service-plugin-t4-event-pump-dead", { _home: Path =>
+        withIsolatedServicePluginHostTestHome("service-plugin-t4-event-pump-dead", { _home: Path =>
             this.registerGitCodeStdioScript(this.gitCodeLeaseScript(18189, keepAlive: false))
             try {
                 let started = ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000)
@@ -1175,7 +1188,7 @@ public class ServicePluginHostTest {
     @TestCase
     public func tT4U3T4P1SupervisorRecoveryRequiresRestartHealthzSuccess(): Unit {
         // T4-U3, T4-P1.
-        withServicePluginHostTestHome("service-plugin-t4-recover-healthz-success", { home: Path =>
+        withIsolatedServicePluginHostTestHome("service-plugin-t4-recover-healthz-success", { home: Path =>
             let counterPath = home.join("healthz-success-count.txt")
             let callLock = Mutex()
             let healthzCalls = ArrayList<String>()
@@ -1217,7 +1230,7 @@ public class ServicePluginHostTest {
     @TestCase
     public func tT4N1SupervisorRecoveryStaysDegradedWhenRestartHealthzFails(): Unit {
         // T4-N1.
-        withServicePluginHostTestHome("service-plugin-t4-recover-healthz-failed", { home: Path =>
+        withIsolatedServicePluginHostTestHome("service-plugin-t4-recover-healthz-failed", { home: Path =>
             let counterPath = home.join("healthz-failed-count.txt")
             let callLock = Mutex()
             let healthzCalls = ArrayList<String>()
@@ -1252,7 +1265,7 @@ public class ServicePluginHostTest {
     @TestCase
     public func tT4B1RestartMissingLeaseOrPortZeroDoesNotReportRunning(): Unit {
         // T4-B1.
-        withServicePluginHostTestHome("service-plugin-t4-recover-missing-lease", { home: Path =>
+        withIsolatedServicePluginHostTestHome("service-plugin-t4-recover-missing-lease", { home: Path =>
             let counterPath = home.join("missing-lease-count.txt")
             this.registerGitCodeStdioScript(this.gitCodeCountingRestartLeaseScript(counterPath, 18192, 18192, restartWritesLease: false))
             setServicePluginSupervisorConfigForTest(ServicePluginSupervisorConfig(enabled: true, intervalMs: 1000, healthTimeoutMs: 10, failureThreshold: 1, restartCooldownMs: 1000))
@@ -1278,7 +1291,7 @@ public class ServicePluginHostTest {
             }
         })
 
-        withServicePluginHostTestHome("service-plugin-t4-recover-port-zero", { home: Path =>
+        withIsolatedServicePluginHostTestHome("service-plugin-t4-recover-port-zero", { home: Path =>
             let counterPath = home.join("port-zero-count.txt")
             this.registerGitCodeStdioScript(this.gitCodeCountingRestartLeaseScript(counterPath, 18193, 0, delayRestartLease: true))
             setServicePluginSupervisorConfigForTest(ServicePluginSupervisorConfig(enabled: true, intervalMs: 1000, healthTimeoutMs: 10, failureThreshold: 1, restartCooldownMs: 1000))
@@ -1309,7 +1322,7 @@ public class ServicePluginHostTest {
     @TestCase
     public func tT5P1T5N1ProcessStartDiagnosticIsLoggedAndRedacted(): Unit {
         // T5-P1, T5-N1.
-        withServicePluginHostTestHome("service-plugin-t5-start-diagnostic", { home: Path =>
+        withIsolatedServicePluginHostTestHome("service-plugin-t5-start-diagnostic", { home: Path =>
             let oldLogLevel = getVariable("METIS_LOG_LEVEL")
             let oldLogFile = getVariable("METIS_LOG_FILE")
             let oldConsoleLevel = getVariable("METIS_CONSOLE_LEVEL")
@@ -1387,7 +1400,7 @@ public class ServicePluginHostTest {
     @TestCase
     public func tT5N1SupervisorWorkerLogsTickAndCatchesException(): Unit {
         // T5-N1 supervisor exception coverage.
-        withServicePluginHostTestHome("service-plugin-t5-supervisor-exception", { home: Path =>
+        withIsolatedServicePluginHostTestHome("service-plugin-t5-supervisor-exception", { home: Path =>
             let oldLogLevel = getVariable("METIS_LOG_LEVEL")
             let oldLogFile = getVariable("METIS_LOG_FILE")
             let oldConsoleLevel = getVariable("METIS_CONSOLE_LEVEL")
@@ -1442,7 +1455,7 @@ public class ServicePluginHostTest {
     @TestCase
     public func tP3N002PortReleaseTimeoutBlocksSecondPluginStart(): Unit {
         // T-P3-N-002.
-        withServicePluginHostTestHome("service-plugin-p3-port-owned", { home: Path =>
+        withIsolatedServicePluginHostTestHome("service-plugin-p3-port-owned", { home: Path =>
             this.registerGitCodeStdioScript(this.gitCodeLeaseScript(18184, stopUpdatesLease: false))
             setServicePluginSupervisorConfigForTest(ServicePluginSupervisorConfig(enabled: true, intervalMs: 1000, healthTimeoutMs: 10, failureThreshold: 1, restartCooldownMs: 1000))
             setServicePluginHealthzProbeForTest(Some({ _url: String, _timeoutMs: Int64 =>
@@ -1633,7 +1646,7 @@ public class ServicePluginHostTest {
 
     @TestCase
     public func p3U1BrokerSeparatesPluginStdoutFramesFromStderrBurst(): Unit {
-        withServicePluginHostTestHome("p3-u1-broker-stream-classification", { _home: Path =>
+        withIsolatedServicePluginHostTestHome("p3-u1-broker-stream-classification", { _home: Path =>
             let stderrBurstLines: Int64 = 16
             @Expect(stderrBurstLines > 8, true)
             this.registerBrokerServiceFixture("gcm-stderr-burst-${stderrBurstLines}")
@@ -1661,7 +1674,7 @@ public class ServicePluginHostTest {
 
     @TestCase
     public func p3B1NoiseBoundaryAndHealthBurstKeepOwnerScoped(): Unit {
-        withServicePluginHostTestHome("p3-b1-noise-boundary", { home: Path =>
+        withIsolatedServicePluginHostTestHome("p3-b1-noise-boundary", { home: Path =>
             this.registerBrokerServiceFixture("noise-8")
             try {
                 let atBudget = invokeRegisteredCapability(CapabilityInvokeRequest("stdio.monitor.status", payload: "{}"))
@@ -1716,7 +1729,7 @@ public class ServicePluginHostTest {
 
     @TestCase
     public func p3P1FakeGcmHealthEventResponseKeepsPidAndLease(): Unit {
-        withServicePluginHostTestHome("p3-p1-fake-gcm", { home: Path =>
+        withIsolatedServicePluginHostTestHome("p3-p1-fake-gcm", { home: Path =>
             this.registerBrokerServiceFixture("gcm")
             try {
                 let started = ensureRegisteredServicePluginStarted("stdio-service", startupTimeoutMs: 3000)
@@ -1753,7 +1766,7 @@ public class ServicePluginHostTest {
 
     @TestCase
     public func s3U1StopFrameAndListenerClosePrecedeBlockedDispatchRelease(): Unit {
-        withServicePluginHostTestHome("s3-u1-ingress-before-dispatch", { home: Path =>
+        withIsolatedServicePluginHostTestHome("s3-u1-ingress-before-dispatch", { home: Path =>
             let dispatchMarker = home.join("dispatch-entered.marker")
             let dispatchRelease = home.join("dispatch.release")
             let stopFrameMarker = home.join("stop-frame.marker")
@@ -1841,7 +1854,7 @@ public class ServicePluginHostTest {
 
     @TestCase
     public func s3B1DispatchPastReserveIsCleanupPendingUntilExactRetry(): Unit {
-        withServicePluginHostTestHome("s3-b1-dispatch-reserve", { home: Path =>
+        withIsolatedServicePluginHostTestHome("s3-b1-dispatch-reserve", { home: Path =>
             let oldStopFrameMarker = getVariable("METIS_STDIO_FIXTURE_STOP_FRAME_MARKER_PATH")
             var activeGate = None<ServicePluginTestGate>
             try {
@@ -1944,7 +1957,7 @@ public class ServicePluginHostTest {
 
     @TestCase
     public func s3P1GracefulStopRequiresIngressOwnerLeaseAndPortRelease(): Unit {
-        withServicePluginHostTestHome("s3-p1-terminal-contract", { home: Path =>
+        withIsolatedServicePluginHostTestHome("s3-p1-terminal-contract", { home: Path =>
             this.registerBrokerServiceFixture(
                 "gcm-stderr-burst-16",
                 pluginId: "gitcode-monitor",
@@ -1986,7 +1999,7 @@ public class ServicePluginHostTest {
 
     @TestCase
     public func s3N1PortReleaseFailureStaysRetryableAndNeverReportsStopped(): Unit {
-        withServicePluginHostTestHome("s3-n1-port-retry", { home: Path =>
+        withIsolatedServicePluginHostTestHome("s3-n1-port-retry", { home: Path =>
             let probeTimeouts = ArrayList<Int64>()
             this.registerBrokerServiceFixture(
                 "gcm",
@@ -2060,7 +2073,7 @@ public class ServicePluginHostTest {
 
     @TestCase
     public func s3N1LateCleanupFinalizerCannotOverwriteReplacementIdentity(): Unit {
-        withServicePluginHostTestHome("s3-n1-finalize-identity", { home: Path =>
+        withIsolatedServicePluginHostTestHome("s3-n1-finalize-identity", { home: Path =>
             let finalizeGate = ServicePluginTestGate()
             let firstFinalize = ServicePluginTestOnce()
             let finalizeEntries = ServicePluginTestCounter()
@@ -2135,7 +2148,7 @@ public class ServicePluginHostTest {
 
     @TestCase
     public func s3N1BoundedPidProbeAndMixedShutdownKeepTruthfulStatuses(): Unit {
-        withServicePluginHostTestHome("s3-n1-bounded-probe-shutdown", { home: Path =>
+        withIsolatedServicePluginHostTestHome("s3-n1-bounded-probe-shutdown", { home: Path =>
             setServicePluginPidProbeCommandForTest(Some({ _pid: Int64, _timeoutMs: Int64 =>
                 (Int64(1), "", "")
             }))
@@ -2276,7 +2289,7 @@ public class ServicePluginHostTest {
 
     @TestCase
     public func s3N1UnknownPreForceAndExpiredPostProbeStayCleanupPending(): Unit {
-        withServicePluginHostTestHome("s3-n1-preforce-unknown", { home: Path =>
+        withIsolatedServicePluginHostTestHome("s3-n1-preforce-unknown", { home: Path =>
             let expireClock = ServicePluginTestCounter()
             let pidProbeCalls = ServicePluginTestCounter()
             let portProbeCalls = ServicePluginTestCounter()
@@ -2354,7 +2367,7 @@ public class ServicePluginHostTest {
 
     @TestCase
     public func p3N1MalformedEncodingCrashAndIgnoringTermStayBounded(): Unit {
-        withServicePluginHostTestHome("p3-n1-terminal-failures", { home: Path =>
+        withIsolatedServicePluginHostTestHome("p3-n1-terminal-failures", { home: Path =>
             let oldMarker = getVariable("METIS_STDIO_FIXTURE_MARKER_PATH")
             let oldRelease = getVariable("METIS_STDIO_FIXTURE_RELEASE_PATH")
             try {
@@ -2548,7 +2561,7 @@ public class ServicePluginHostTest {
 
     @TestCase
     public func p3N1StartClaimFollowersLeaseAndDispatchAreFenced(): Unit {
-        withServicePluginHostTestHome("p3-n1-claim-fences", { home: Path =>
+        withIsolatedServicePluginHostTestHome("p3-n1-claim-fences", { home: Path =>
             let marker = home.join("claim.marker")
             let release = home.join("claim.release")
             let cancelledMarker = home.join("claim.cancelled")
@@ -2667,12 +2680,13 @@ public class ServicePluginHostTest {
 
     @TestCase
     public func p3N1CleanupDeadlineAndHostShutdownGateAreBounded(): Unit {
-        withServicePluginHostTestHome("p3-n1-cleanup-shutdown-gate", { home: Path =>
+        withIsolatedServicePluginHostTestHome("p3-n1-cleanup-shutdown-gate", { home: Path =>
             let marker = home.join("dispatch.marker")
             let release = home.join("dispatch.release")
             let cancelled = home.join("claim.cancelled")
             let deliveryLock = Mutex()
             let deliveries = ArrayList<String>()
+            let dispatchSettledGate = ServicePluginTestGate()
             var starter = None<Future<ServiceStartResult>>
             var shutdown = None<Future<ServicePluginHostShutdownResult>>
             var cleanupPid: Int64 = 0
@@ -2707,6 +2721,12 @@ public class ServicePluginHostTest {
                 }
                 @Expect(managedStdioBroker().snapshot().ownerCount, 0)
                 @Expect(this.waitForPidGone(cleanupPid), true)
+                let cleanupPublishStarted = MonoTime.now()
+                while (servicePluginCleanupPendingCountForTest() == 0 &&
+                    (MonoTime.now() - cleanupPublishStarted).toMilliseconds() < 2000) {
+                    sleep(Duration.millisecond * 20)
+                }
+                @Expect(servicePluginCleanupPendingCountForTest(), 1)
                 match (getServicePluginSnapshot("gitcode-monitor")) {
                     case Some(snapshot) =>
                         @Expect(snapshot.status, "cleanup_pending")
@@ -2751,6 +2771,7 @@ public class ServicePluginHostTest {
                     synchronized(deliveryLock) { deliveries.add(text) }
                     ServicePluginEventDeliveryResult(true, "sent")
                 }))
+                setServicePluginDispatchSettledHookForTest(Some({ => dispatchSettledGate.enterAndWait() }))
                 @Expect(ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000).ok, true)
                 let explicitPid = match (getServicePluginSnapshot("gitcode-monitor")) { case Some(snapshot) => snapshot.pid case None => Int64(0) }
                 let explicitPgid = this.processGroupId(explicitPid)
@@ -2766,13 +2787,10 @@ public class ServicePluginHostTest {
                 @Expect(initialPendingPidExit, 0)
                 @Expect(ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 500).status, "cleanup_pending")
                 File.writeTo(release, "release".toArray())
-                sleep(Duration.millisecond * 100)
-                @Expect(servicePluginCleanupPendingCountForTest(), 1)
-                @Expect(managedStdioBroker().snapshot().ownerCount, 1)
-                let (pendingPidExit, _, _) = executeWithOutput("kill", ["-0", "${explicitPid}"])
-                @Expect(pendingPidExit, 0)
+                @Expect(dispatchSettledGate.awaitEntered(2000), true)
                 @Expect(synchronized(deliveryLock) { deliveries.size }, 0)
                 let cleanupRetry = stopServicePlugin("gitcode-monitor", reason: "p3-n1-cleanup-retry", timeoutMillis: 2500)
+                dispatchSettledGate.release()
                 @Expect(cleanupRetry.ok, true)
                 @Expect(cleanupRetry.status, "stopped")
                 @Expect(servicePluginCleanupPendingCountForTest(), 0)
@@ -2788,6 +2806,7 @@ public class ServicePluginHostTest {
                 setServicePluginWebhookSubscribersProviderForTest(None<(ServicePluginAcceptedGitCodeEvent) -> ArrayList<ServicePluginDeliveryTarget>>)
                 setServicePluginWebhookGeneratedReplyHandlerForTest(None<(ServicePluginAcceptedGitCodeEvent, ServicePluginDeliveryTarget) -> ServicePluginGeneratedReplyResult>)
                 setServicePluginEventDeliveryForTest(None)
+                setServicePluginDispatchSettledHookForTest(None<() -> Unit>)
                 resetServicePluginGeneratedReplyStateForTest()
                 resetServicePluginHostForTest()
 
@@ -2854,7 +2873,9 @@ public class ServicePluginHostTest {
                 }
             } finally {
                 if (!exists(release)) { try { File.writeTo(release, "release".toArray()) } catch (_: Exception) { () } }
+                dispatchSettledGate.release()
                 setServicePluginBeforeEventDispatchHookForTest(None<(String) -> Unit>)
+                setServicePluginDispatchSettledHookForTest(None<() -> Unit>)
                 setServicePluginBeforeSupervisorRegisterHookForTest(None<(String) -> Unit>)
                 setServicePluginStartPhaseHookForTest(None<(String, String) -> Unit>)
                 setServicePluginWebhookSubscribersProviderForTest(None<(ServicePluginAcceptedGitCodeEvent) -> ArrayList<ServicePluginDeliveryTarget>>)
@@ -2871,7 +2892,7 @@ public class ServicePluginHostTest {
 
     @TestCase
     public func p3N1SlowInitGracefulStopLatePumpAndDescendantAreOwnerScoped(): Unit {
-        withServicePluginHostTestHome("p3-n1-owner-scoped-lifecycle", { home: Path =>
+        withIsolatedServicePluginHostTestHome("p3-n1-owner-scoped-lifecycle", { home: Path =>
             let markerPath = home.join("graceful.marker")
             let releasePath = home.join("release-old-pump")
             let rootPidPath = home.join("root.pid")
@@ -3060,7 +3081,7 @@ public class ServicePluginHostTest {
     @TestCase
     public func tRoot001AsyncEventPumpAllowsSamePluginWritebackResponse(): Unit {
         // T-ROOT-001, T-ASYNC-001, T-E2E-SP-001 (Metis half-chain)
-        withServicePluginHostTestHome("service-plugin-root-async-writeback", { _home: Path =>
+        withIsolatedServicePluginHostTestHome("service-plugin-root-async-writeback", { _home: Path =>
             this.registerGitCodeStdioScript(this.gitCodeReentrantWritebackScript())
             let messages = ArrayList<String>()
             let lock = Mutex()
@@ -3097,7 +3118,7 @@ public class ServicePluginHostTest {
     @TestCase
     public func tMaintainerEmailT5E2EPos002HostFakeGcmResponseRendersReadableStatus(): Unit {
         // T5-E2E-POS-002.
-        withServicePluginHostTestHome("service-plugin-maintainer-email-writeback", { _home: Path =>
+        withIsolatedServicePluginHostTestHome("service-plugin-maintainer-email-writeback", { _home: Path =>
             this.registerGitCodeStdioScript(this.gitCodeMaintainerEmailWritebackScript())
             let messages = ArrayList<String>()
             let lock = Mutex()
@@ -3139,7 +3160,7 @@ public class ServicePluginHostTest {
     @TestCase
     public func tRoot002AsyncWritebackIgnoresUnrelatedHeartbeatAndResponseFrames(): Unit {
         // T-ROOT-002, T-ASYNC-002, T-ASYNC-005
-        withServicePluginHostTestHome("service-plugin-root-async-unrelated", { _home: Path =>
+        withIsolatedServicePluginHostTestHome("service-plugin-root-async-unrelated", { _home: Path =>
             this.registerGitCodeStdioScript(this.gitCodeReentrantWritebackScript(includeUnrelatedFrames: true))
             let messages = ArrayList<String>()
             let lock = Mutex()
@@ -3179,7 +3200,7 @@ public class ServicePluginHostTest {
     @TestCase
     public func tAsync005PumpContinuesHeartbeatWhileWritebackWaits(): Unit {
         // T-ASYNC-003, T-ASYNC-005, T-E2E-SP-007
-        withServicePluginHostTestHome("service-plugin-root-async-timeout", { _home: Path =>
+        withIsolatedServicePluginHostTestHome("service-plugin-root-async-timeout", { _home: Path =>
             this.registerGitCodeStdioScript(this.gitCodeNoWritebackResponseScript())
             setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent =>
                 let rows = ArrayList<ServicePluginDeliveryTarget>()
