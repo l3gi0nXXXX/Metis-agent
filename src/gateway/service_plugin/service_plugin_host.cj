@@ -2022,6 +2022,10 @@ public func setServicePluginSupervisorConfigForTest(config: ServicePluginSupervi
     servicePluginSupervisorConfig = config
 }
 
+public func setServicePluginSupervisorAutoStartForTest(enabled: Bool): Unit {
+    servicePluginSupervisorAutoStartForTest = enabled
+}
+
 public func setServicePluginHealthzProbeForTest(
     probe: Option<(String, Int64) -> ServicePluginHealthzProbeResult>
 ): Unit {
