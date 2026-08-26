@@ -152,6 +152,21 @@ public class ServicePluginContractTest {
         @Expect(secret.text.contains("secret"), false)
         @Expect(secret.text.contains("/Users/name"), false)
         @Expect(secret.rawHash.startsWith("payload-"), true)
+        let temporaryConfig = "/tmp/metis-s5-private-中文🙂/config.json"
+        let temporaryQueue = "webhookQueueDir=/tmp/metis-s5-private-中文🙂/queue"
+        let privateTemporary = "/private/tmp/metis-s5-private-中文🙂/config.json"
+        let windowsPath = "C:\\Users\\name\\private-中文🙂\\config.json"
+        for (localPath in [temporaryConfig, temporaryQueue, privateTemporary, "/Users/name/private-中文🙂/config.json", windowsPath]) {
+            let redacted = redactServicePayload(localPath)
+            @Expect(redacted.text, "[REDACTED_LOCAL_PATH]")
+            @Expect(redacted.text.contains(localPath), false)
+        }
+        let publicUrl = "https://example.invalid/tmp/public-中文🙂"
+        let ordinaryText = "temporary tmp/cache marker 中文🙂"
+        @Expect(redactServicePayload(publicUrl).text, publicUrl)
+        @Expect(redactServicePayload(ordinaryText).text, ordinaryText)
+        let temporaryManifest = parseServicePluginManifest("{\"schema\":\"metis.servicePlugin.v1\",\"pluginId\":\"sample\",\"kind\":\"service\",\"protocolVersion\":\"1.0\",\"entry\":{\"command\":\"/tmp/metis-s5-private-中文🙂/plugin\"},\"configSchema\":{},\"capabilityDeclarations\":[{\"capabilityId\":\"sample.status\",\"kind\":\"controlAction\"}]}")
+        @Expect(temporaryManifest.ok, true)
         let unicode = redactServicePayload("仓颉abcdef", policy: RedactionPolicy(maxPayloadBytes: 2))
         @Expect(unicode.truncated, true)
         @Expect(unicode.text.contains("仓颉"), true)

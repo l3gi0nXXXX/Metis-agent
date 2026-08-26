@@ -584,7 +584,7 @@ public class RedactedPayload {
 public func redactServicePayload(payload: String, policy!: RedactionPolicy = RedactionPolicy()): RedactedPayload {
     let hash = hashRawPayload(payload)
     var text = if (servicePayloadContainsSecret(payload)) { "[REDACTED]" } else { payload }
-    if (serviceContainsLocalPath(payload)) {
+    if (serviceContainsLocalPath(payload) || serviceContainsTemporaryLocalPath(payload)) {
         text = "[REDACTED_LOCAL_PATH]"
     }
     let truncated = serviceRuneSize(text) > policy.maxPayloadBytes
@@ -760,6 +760,34 @@ private func servicePayloadContainsSecret(text: String): Bool {
         lower.contains("\"password\"") ||
         lower.contains("appsecret") ||
         serviceContainsLocalPath(text)
+}
+
+private func serviceLocalPathBoundary(rune: Rune): Bool {
+    rune == r' ' || rune == r'\t' || rune == r'\n' || rune == r'\r' ||
+        rune == r'"' || rune == r'\'' || rune == r'=' || rune == r':' ||
+        rune == r'(' || rune == r'[' || rune == r'{' || rune == r','
+}
+
+private func serviceContainsBoundedLocalPath(text: String, prefix: String): Bool {
+    let textRunes = text.toRuneArray()
+    let prefixRunes = prefix.toRuneArray()
+    if (prefixRunes.size == 0 || textRunes.size < prefixRunes.size) { return false }
+    for (start in 0..=(textRunes.size - prefixRunes.size)) {
+        var matches = true
+        for (offset in 0..prefixRunes.size) {
+            if (textRunes[start + offset] != prefixRunes[offset]) {
+                matches = false
+                break
+            }
+        }
+        if (matches && (start == 0 || serviceLocalPathBoundary(textRunes[start - 1]))) { return true }
+    }
+    false
+}
+
+private func serviceContainsTemporaryLocalPath(text: String): Bool {
+    serviceContainsBoundedLocalPath(text, "/tmp/") ||
+        serviceContainsBoundedLocalPath(text, "/private/tmp/")
 }
 
 private func serviceContainsLocalPath(text: String): Bool {

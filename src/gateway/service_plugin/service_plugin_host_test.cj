@@ -1352,6 +1352,8 @@ public class ServicePluginHostTest {
                 @Expect(okLog.contains("pid"), true)
                 @Expect(okLog.contains("binaryMtime"), true)
                 @Expect(okLog.contains("gcm-token"), false)
+                @Expect(okLog.contains(home.toString()), false)
+                @Expect(okLog.contains("[REDACTED_LOCAL_PATH]"), true)
 
                 resetServicePluginHostForTest()
                 let badCaps = ArrayList<ServiceCapabilityRecord>()
@@ -1376,8 +1378,10 @@ public class ServicePluginHostTest {
                 @Expect(failed.status, "process_start_failed")
                 let failedLog = this.readTextFile(logFile)
                 @Expect(failedLog.contains("process_start_failed"), true)
-                @Expect(failedLog.contains("missing-plugin-binary"), true)
+                @Expect(failedLog.contains("missing-plugin-binary"), false)
                 @Expect(failedLog.contains("gcm-token"), false)
+                @Expect(failedLog.contains(home.toString()), false)
+                @Expect(failedLog.contains("[REDACTED_LOCAL_PATH]"), true)
             } finally {
                 resetServicePluginHostForTest()
                 match (oldLogLevel) {
