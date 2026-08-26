@@ -644,7 +644,7 @@ private func gatewayS5ConfigureFormalGateway(
     webhookPort: Int64,
     dependencyPort: Int64,
     binary: Path
-): (Path, Path, Path) {
+): (Path, Path, Path, Path) {
     let manifestPath = home.join("gcm-s5.manifest.json")
     let configPath = home.join("gcm-s5.config.json")
     let statePath = home.join("gcm-s5.state.json")
@@ -687,7 +687,7 @@ private func gatewayS5ConfigureFormalGateway(
     let _ = MetisConfigManager.setProviderApiKey("openai", "fake-s5-openai-key")
     let _ = MetisConfigManager.setProviderBaseUrl("openai", "http://127.0.0.1:${dependencyPort}/v1")
     CliSettingManager.invalidate()
-    (statePath, queuePath, manifestPath)
+    (statePath, queuePath, manifestPath, configPath)
 }
 
 private func gatewayS5PostWebhook(port: Int64, deliveryId: String): Int64 {
@@ -1959,13 +1959,16 @@ public class GatewayServeLockLogicTest {
                 @Expect(exists(oldLogPath), true)
                 let oldLog = try { String.fromUtf8(File.readFrom(oldLogPath)) } catch (_: Exception) { "" }
                 @Expect(oldLog.isEmpty(), false)
-                for (sensitive in [
-                    oldHome.toString(), proxy.toString(), configured[1].toString(), configured[2].toString(),
-                    "fake-s5-openai-key", "fake-s5-gitcode-token", "fake-s5-webhook-token", "123456:FAKE-S5",
-                    "object_kind", "cangjie/compiler", "S5 正式链路 中文🙂"
+                for ((label, sensitive) in [
+                    ("home", oldHome.toString()), ("queue", configured[1].toString()),
+                    ("manifest", configured[2].toString()), ("config", configured[3].toString()),
+                    ("proxy", proxy.toString()), ("openai_key", "fake-s5-openai-key"),
+                    ("gitcode_token", "fake-s5-gitcode-token"), ("webhook_token", "fake-s5-webhook-token"),
+                    ("telegram_token", "123456:FAKE-S5"), ("object_kind", "object_kind"),
+                    ("repository", "cangjie/compiler"), ("payload_text", "S5 正式链路 中文🙂")
                 ]) {
-                    @Expect(oldOutput.contains(sensitive), false)
-                    @Expect(oldLog.contains(sensitive), false)
+                    @Expect(if (oldOutput.contains(sensitive)) { "output_leak:${label}" } else { "output_clean:${label}" }, "output_clean:${label}")
+                    @Expect(if (oldLog.contains(sensitive)) { "log_leak:${label}" } else { "log_clean:${label}" }, "log_clean:${label}")
                 }
                 let oldCompletionPath = oldHome.join("gateway-serve.stop-complete")
                 @Expect(exists(oldCompletionPath), false)
