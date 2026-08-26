@@ -1,6 +1,6 @@
 package metis.gateway.runtime
 
-import metis.core.config.{CliConfig, CliSettingManager, GatewayServicePluginUserSettings, MetisConfigManager, MetisProcessEnvironmentLock}
+import metis.core.config.{CliConfig, CliSettingManager, GatewayServicePluginUserSettings, MetisConfigManager, MetisProcessEnvironmentLock, cliProviderApiKeyEnvAliases, cliProviderBaseUrlEnvAliases}
 import metis.gateway.process.gatewayStdioBrokerSnapshot
 import metis.gateway.service_plugin.loadServicePluginManifest
 import metis.gateway.core.GatewayStopResult
@@ -398,6 +398,69 @@ private class GatewayServeStopLiveOwnerProof {
     }
 }
 
+private class GatewayS5P1Capture {
+    var brokerPid: Int64 = 0
+    var gcmPid: Int64 = 0
+    var gcmPgid: Int64 = 0
+    var leasePath = Path("")
+    var leaseDirExists: Bool = false
+    var leaseFileCount: Int64 = 0
+    var leaseUtf8: Bool = false
+    var leaseJson: Bool = false
+    var leaseIdentityMatches: Bool = false
+    var leasePidMatches: Bool = false
+    var leasePortMatches: Bool = false
+    var leaseRunning: Bool = false
+    var leaseStopped: Bool = false
+
+    func refreshLease(home: Path, expectedPid: Int64, expectedParentPid: Int64, expectedPort: Int64): Unit {
+        let dir = home.join("service-plugin").join("runtime").join("gitcode-monitor")
+        this.leaseDirExists = exists(dir)
+        this.leaseFileCount = 0
+        this.leaseUtf8 = false
+        this.leaseJson = false
+        this.leaseIdentityMatches = false
+        this.leasePidMatches = false
+        this.leasePortMatches = false
+        this.leaseRunning = false
+        this.leaseStopped = false
+        if (this.leaseDirExists) {
+            try {
+                for (entry in Directory.readFrom(dir)) {
+                    if (entry.isRegular() && entry.name.endsWith(".lease.json")) { this.leaseFileCount++ }
+                }
+            } catch (_: Exception) { () }
+        }
+        this.leasePath = gatewayS5FindLease(home)
+        if (this.leasePath.toString().isEmpty()) { return }
+        let text = try {
+            let decoded = String.fromUtf8(File.readFrom(this.leasePath))
+            this.leaseUtf8 = true
+            decoded
+        } catch (_: Exception) {
+            return
+        }
+        let root = try {
+            let decoded = JsonValue.fromStr(text).asObject()
+            this.leaseJson = true
+            decoded
+        } catch (_: Exception) {
+            return
+        }
+        let pluginId = try { root.get("pluginId").getOrThrow().asString().getValue() } catch (_: Exception) { "" }
+        let sessionId = try { root.get("sessionId").getOrThrow().asString().getValue() } catch (_: Exception) { "" }
+        let parentPid = try { root.get("parentPid").getOrThrow().asInt().getValue() } catch (_: Exception) { 0 }
+        let pid = try { root.get("pid").getOrThrow().asInt().getValue() } catch (_: Exception) { 0 }
+        let port = try { root.get("port").getOrThrow().asInt().getValue() } catch (_: Exception) { 0 }
+        let state = try { root.get("state").getOrThrow().asString().getValue() } catch (_: Exception) { "" }
+        this.leaseIdentityMatches = pluginId == "gitcode-monitor" && !sessionId.isEmpty() && parentPid == expectedParentPid
+        this.leasePidMatches = pid == expectedPid
+        this.leasePortMatches = port == expectedPort
+        this.leaseRunning = state == "running"
+        this.leaseStopped = state == "stopped"
+    }
+}
+
 private func gatewayServeStopConfigureFormalFixture(
     home: Path,
     gatewayPort: Int64,
@@ -427,6 +490,279 @@ private func gatewayServeStopConfigureFormalFixture(
     let _ = MetisConfigManager.setGatewaySettings(settings)
     CliSettingManager.invalidate()
     fixture
+}
+
+private class GatewayS5DependencyProcess {
+    let process: SubProcess
+    let port: Int64
+    let eventsPath: Path
+
+    init(process: SubProcess, port: Int64, eventsPath: Path) {
+        this.process = process
+        this.port = port
+        this.eventsPath = eventsPath
+    }
+}
+
+private func gatewayS5GcmRoot(): Path {
+    Path(getVariable("METIS_S5_GCM_ROOT").getOrDefault { "" }.trimAscii())
+}
+
+private func gatewayS5GcmBinary(): Path {
+    gatewayS5GcmRoot().join("target").join("release").join("bin").join("gitcodemonitor")
+}
+
+private func gatewayS5StartDependencies(
+    home: Path,
+    script: Path,
+    replyMarker!: String = "s5-p1-exact-once",
+    processorEntered!: Option<Path> = None<Path>,
+    processorRelease!: Option<Path> = None<Path>
+): GatewayS5DependencyProcess {
+    let readyPath = home.join("s5-dependencies.ready.json")
+    let eventsPath = home.join("s5-dependencies.events.jsonl")
+    let args = ArrayList<String>()
+    args.add("node")
+    args.add(script.toString())
+    args.add(readyPath.toString())
+    args.add(eventsPath.toString())
+    args.add(replyMarker)
+    match ((processorEntered, processorRelease)) {
+        case (Some(entered), Some(release)) =>
+            args.add(entered.toString())
+            args.add(release.toString())
+        case _ => ()
+    }
+    let process = launch(
+        "/usr/bin/env",
+        args.toArray(),
+        stdIn: ProcessRedirect.Discard,
+        stdOut: ProcessRedirect.Discard,
+        stdErr: ProcessRedirect.Discard
+    )
+    let ready = gatewayServeStopWaitUntil(5000, { => exists(readyPath) })
+    let port = if (ready) {
+        try {
+            JsonValue.fromStr(String.fromUtf8(File.readFrom(readyPath))).asObject()
+                .get("port").getOrThrow().asInt().getValue()
+        } catch (_: Exception) {
+            0
+        }
+    } else {
+        0
+    }
+    GatewayS5DependencyProcess(process, port, eventsPath)
+}
+
+private func gatewayS5StopDependencies(dependencies: Option<GatewayS5DependencyProcess>): Bool {
+    match (dependencies) {
+        case Some(value) =>
+            if (value.process.isAlive()) {
+                try { value.process.terminate(force: false) } catch (_: Exception) { () }
+            }
+            try {
+                let _ = value.process.wait(timeout: Some(Duration.second * 2))
+                true
+            } catch (_: Exception) {
+                if (value.process.isAlive()) {
+                    try { value.process.terminate(force: true) } catch (_: Exception) { () }
+                }
+                try {
+                    let _ = value.process.wait(timeout: Some(Duration.second * 2))
+                    true
+                } catch (_: Exception) {
+                    false
+                }
+            }
+        case None => true
+    }
+}
+
+private func gatewayS5WriteGcmManifest(path: Path, binary: Path): Unit {
+    File.writeTo(
+        path,
+        ("{" +
+            "\"schema\":\"metis.servicePlugin.v1\",\"pluginId\":\"gitcode-monitor\",\"displayName\":\"GitCode Monitor S5\"," +
+            "\"kind\":\"service\",\"protocolVersion\":\"1.0\"," +
+            "\"entry\":{\"command\":\"${binary.toString()}\",\"args\":[\"plugin-stdio\"]}," +
+            "\"configSchema\":{\"type\":\"object\"}," +
+            "\"capabilityDeclarations\":[" +
+                "{\"capabilityId\":\"gitcode.monitor.status\",\"kind\":\"controlAction\"}," +
+                "{\"capabilityId\":\"gitcode.event.accepted\",\"kind\":\"event\"}," +
+                "{\"capabilityId\":\"gitcode.writeback.apply_result\",\"kind\":\"controlAction\"}" +
+            "]}").toArray()
+    )
+}
+
+private func gatewayS5WriteBlockedGcmManifest(path: Path, wrapper: Path, binary: Path): Unit {
+    File.writeTo(
+        path,
+        ("{" +
+            "\"schema\":\"metis.servicePlugin.v1\",\"pluginId\":\"gitcode-monitor\",\"displayName\":\"GitCode Monitor S5 N1\"," +
+            "\"kind\":\"service\",\"protocolVersion\":\"1.0\"," +
+            "\"entry\":{\"command\":\"${wrapper.toString()}\",\"args\":[\"${binary.toString()}\",\"plugin-stdio\"]}," +
+            "\"configSchema\":{\"type\":\"object\"}," +
+            "\"capabilityDeclarations\":[" +
+                "{\"capabilityId\":\"gitcode.monitor.status\",\"kind\":\"controlAction\"}," +
+                "{\"capabilityId\":\"gitcode.event.accepted\",\"kind\":\"event\"}," +
+                "{\"capabilityId\":\"gitcode.writeback.apply_result\",\"kind\":\"controlAction\"}" +
+            "]}").toArray()
+    )
+}
+
+private func gatewayS5WriteGcmConfig(
+    path: Path,
+    statePath: Path,
+    queuePath: Path,
+    webhookPort: Int64,
+    dependencyPort: Int64
+): Unit {
+    File.writeTo(
+        path,
+        ("{" +
+            "\"monitor\":{\"fullScanIntervalMinutes\":10,\"dryRun\":true,\"statePath\":\"${statePath.toString()}\"}," +
+            "\"gitcode\":{\"baseUrl\":\"http://127.0.0.1:${dependencyPort}/api/v5\",\"token\":\"fake-s5-gitcode-token\",\"webhook\":{" +
+                "\"enabled\":true,\"bindHost\":\"127.0.0.1\",\"port\":${webhookPort},\"queueDir\":\"${queuePath.toString()}\"," +
+                "\"processor\":{\"enabled\":true,\"maxBatchSize\":4}," +
+                "\"endpoints\":[{\"id\":\"main\",\"path\":\"/webhooks/gitcode/main\",\"token\":\"fake-s5-webhook-token\",\"allowedEvents\":[\"Issue Hook\"]}]" +
+            "}}}").toArray()
+    )
+}
+
+private func gatewayS5WriteSubscription(home: Path): Unit {
+    let path = home.join("service-plugin").join("gitcode").join("subscriptions.jsonl")
+    Directory.create(path.parent, recursive: true)
+    File.writeTo(
+        path,
+        "{\"channel\":\"telegram\",\"accountId\":\"default\",\"peerId\":\"8734062810\",\"threadId\":\"\",\"rawEvents\":true,\"generatedReplies\":true,\"active\":true}\n".toArray()
+    )
+}
+
+private func gatewayS5ConfigureFormalGateway(
+    home: Path,
+    gatewayPort: Int64,
+    webhookPort: Int64,
+    dependencyPort: Int64,
+    binary: Path
+): (Path, Path, Path) {
+    let manifestPath = home.join("gcm-s5.manifest.json")
+    let configPath = home.join("gcm-s5.config.json")
+    let statePath = home.join("gcm-s5.state.json")
+    let queuePath = home.join("gcm-s5.queue")
+    gatewayS5WriteGcmManifest(manifestPath, binary)
+    gatewayS5WriteGcmConfig(configPath, statePath, queuePath, webhookPort, dependencyPort)
+    gatewayS5WriteSubscription(home)
+
+    var settings = CliSettingManager.readGatewaySettings()
+    settings.enabled = true
+    settings.port = gatewayPort
+    settings.cronEnabled = false
+    settings.logging.file = home.join("s5-gateway.log").toString()
+    settings.logging.level = "info"
+    var telegram = settings.telegram
+    telegram.enabled = true
+    telegram.botToken = "123456:FAKE-S5"
+    telegram.dmPolicy = "open"
+    telegram.allowFrom = ["*"]
+    telegram.apiRoot = "http://127.0.0.1:${dependencyPort}"
+    telegram.timeoutSeconds = 1
+    telegram.commandsNative = "off"
+    var network = telegram.network
+    network.dangerouslyAllowPrivateNetwork = true
+    telegram.network = network
+    settings.telegram = telegram
+    settings.feishu.enabled = false
+    settings.qq.enabled = false
+    settings.channelModels["telegram"] = "openai:gpt-5.4"
+    var plugin = GatewayServicePluginUserSettings()
+    plugin.pluginId = "gitcode-monitor"
+    plugin.enabled = true
+    plugin.autostart = true
+    plugin.startupTimeoutMs = 10000
+    plugin.manifestPath = manifestPath.toString()
+    plugin.configRef = configPath.toString()
+    settings.servicePlugins = [plugin]
+    let _ = MetisConfigManager.setGatewaySettings(settings)
+    let _ = MetisConfigManager.setPrimaryModelRef("openai:gpt-5.4")
+    let _ = MetisConfigManager.setProviderApiKey("openai", "fake-s5-openai-key")
+    let _ = MetisConfigManager.setProviderBaseUrl("openai", "http://127.0.0.1:${dependencyPort}/v1")
+    CliSettingManager.invalidate()
+    (statePath, queuePath, manifestPath)
+}
+
+private func gatewayS5PostWebhook(port: Int64, deliveryId: String): Int64 {
+    let body = "{" +
+        "\"object_kind\":\"issue\",\"project\":{\"path_with_namespace\":\"cangjie/compiler\"}," +
+        "\"object_attributes\":{\"iid\":7001,\"action\":\"open\",\"title\":\"S5 正式链路 中文🙂 ${deliveryId}\",\"description\":\"cross project\",\"url\":\"https://gitcode.com/cangjie/compiler/issues/7001\"}," +
+        "\"user\":{\"name\":\"alice\",\"username\":\"alice\"}}"
+    let builder = ClientBuilder()
+    builder.readTimeout(Duration.second)
+    let client = builder.build()
+    try {
+        let response = client.send(
+            HttpRequestBuilder()
+                .url("http://127.0.0.1:${port}/webhooks/gitcode/main")
+                .post()
+                .header("content-type", "application/json")
+                .header("x-gitcode-token", "fake-s5-webhook-token")
+                .header("x-gitcode-event", "Issue Hook")
+                .header("x-gitcode-delivery", deliveryId)
+                .body(body)
+                .build()
+        )
+        Int64(response.status)
+    } catch (_: Exception) {
+        0
+    } finally {
+        client.close()
+    }
+}
+
+private func gatewayS5EventCount(path: Path, kind: String): Int64 {
+    if (!exists(path)) { return 0 }
+    let text = try { String.fromUtf8(File.readFrom(path)) } catch (_: Exception) { return -1 }
+    var count: Int64 = 0
+    for (line in text.split("\n")) {
+        if (line.contains("\"kind\":\"${kind}\"")) { count++ }
+    }
+    count
+}
+
+private func gatewayS5EventCount(path: Path, kind: String, fragment: String): Int64 {
+    if (!exists(path)) { return 0 }
+    let text = try { String.fromUtf8(File.readFrom(path)) } catch (_: Exception) { return -1 }
+    var count: Int64 = 0
+    for (line in text.split("\n")) {
+        if (line.contains("\"kind\":\"${kind}\"") && line.contains(fragment)) { count++ }
+    }
+    count
+}
+
+private func gatewayS5FileContains(path: Path, fragment: String): Bool {
+    if (path.toString().isEmpty()) { return false }
+    if (!exists(path)) { return false }
+    try { String.fromUtf8(File.readFrom(path)).contains(fragment) } catch (_: Exception) { false }
+}
+
+private func gatewayS5JsonInt(path: Path, key: String): Int64 {
+    if (!exists(path)) { return 0 }
+    try {
+        JsonValue.fromStr(String.fromUtf8(File.readFrom(path))).asObject()
+            .get(key).getOrThrow().asInt().getValue()
+    } catch (_: Exception) {
+        0
+    }
+}
+
+private func gatewayS5FindLease(home: Path): Path {
+    let dir = home.join("service-plugin").join("runtime").join("gitcode-monitor")
+    if (!exists(dir)) { return Path("") }
+    try {
+        for (entry in Directory.readFrom(dir)) {
+            if (entry.isRegular() && entry.name.endsWith(".lease.json")) { return entry.path }
+        }
+    } catch (_: Exception) { () }
+    Path("")
 }
 
 private class GatewayServeStopPolicyScenario {
@@ -1154,6 +1490,690 @@ public class GatewayServeLockLogicTest {
                 @Expect(groupGone, true)
                 @Expect(brokerTerminalStatus, "gone")
                 @Expect(fixtureTerminalStatus, "gone")
+            }
+        }
+    }
+
+    @TestCase
+    public func s5P1FormalGatewayGcmWebhookDeliversExactlyOnceAndStopsAllResources(): Unit {
+        synchronized(MetisProcessEnvironmentLock) {
+            let home = Path("/tmp/metis-s5-p1-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
+            let gatewayPort = gatewayServeStopTemporaryPort()
+            let webhookPort = gatewayServeStopTemporaryPort()
+            @Expect(gatewayPort > 0 && webhookPort > 0 && gatewayPort != webhookPort, true)
+            let oldHome = getVariable("METIS_HOME")
+            let oldRoot = getVariable("METIS_CJPM_ROOT")
+            let openaiApiKeyAliases = cliProviderApiKeyEnvAliases("openai")
+            let openaiBaseUrlAliases = cliProviderBaseUrlEnvAliases("openai")
+            let oldProviderEnv = ArrayList<(String, Option<String>)>()
+            for (key in openaiApiKeyAliases) {
+                oldProviderEnv.add((key, getVariable(key)))
+            }
+            for (key in openaiBaseUrlAliases) {
+                oldProviderEnv.add((key, getVariable(key)))
+            }
+            let oldPrimaryModel = CliConfig._model
+            let oldFallbackModels = CliConfig.fallbackModels
+            let oldImageModel = CliConfig._imageModel
+            let oldImageFallbackModels = CliConfig.imageFallbackModels
+            let oldPdfModel = CliConfig._pdfModel
+            let oldPdfFallbackModels = CliConfig.pdfFallbackModels
+            let oldPdfMaxBytesMb = CliConfig.pdfMaxBytesMb
+            let oldPdfMaxPages = CliConfig.pdfMaxPages
+            let oldFastModel = CliConfig._fastModel
+            let oldTemperature = CliConfig.temperature
+            let oldDefaultModelInputLimit = CliConfig.defaultModelInputLimit
+            let oldDefaultModelOutputLimit = CliConfig.defaultModelOutputLimit
+            let oldWorkspaceDirOverride = CliConfig.workspaceDirOverride
+            let brokerScript = Path(managedStdioResolveBrokerScriptPath())
+            let project = brokerScript.parent.parent
+            let metisBinary = project.join("target").join("release").join("bin").join("metis")
+            let gcmBinarySource = gatewayS5GcmBinary()
+            let gcmBinary = home.join("gitcodemonitor")
+            let dependencyScript = brokerScript.parent.join("metis-s5-loopback-dependencies.mjs")
+            var dependencies = None<GatewayS5DependencyProcess>
+            var gatewayProcess = None<SubProcess>
+            var gatewayIdentity = None<GatewayServeIdentity>
+            var gatewayPid: Int64 = 0
+            var brokerPid: Int64 = 0
+            var gcmPid: Int64 = 0
+            var gcmPgid: Int64 = 0
+            var leasePath = Path("")
+            var brokerCaptured = false
+            var gcmCaptured = false
+            var gatewaySettled = false
+            var brokerGone = false
+            var gcmGone = false
+            var gcmGroupGone = false
+            var dependenciesSettled = false
+            let output = ArrayList<String>()
+            try {
+                Directory.create(home, recursive: true)
+                setVariable("METIS_HOME", home.toString())
+                setVariable("METIS_CJPM_ROOT", project.toString())
+                CliConfig.invalidatePathCache()
+                MetisConfigManager.invalidate()
+                CliSettingManager.invalidate()
+                @Expect(exists(metisBinary), true)
+                @Expect(exists(gcmBinarySource), true)
+                @Expect(exists(dependencyScript), true)
+                let copied = executeWithOutput("/bin/cp", [gcmBinarySource.toString(), gcmBinary.toString()])
+                @Expect(copied[0], 0)
+                @Expect(exists(gcmBinary), true)
+
+                dependencies = Some(gatewayS5StartDependencies(
+                    home, dependencyScript, replyMarker: "s5-p1-exact-once"
+                ))
+                let dependencyPort = dependencies.getOrThrow().port
+                @Expect(dependencyPort > 0, true)
+                @Expect(gatewayServeStopPortListening(dependencyPort), true)
+                @Expect(openaiApiKeyAliases.isEmpty(), false)
+                @Expect(openaiBaseUrlAliases.isEmpty(), false)
+                for (key in openaiApiKeyAliases) { setVariable(key, "fake-s5-openai-key") }
+                for (key in openaiBaseUrlAliases) {
+                    setVariable(key, "http://127.0.0.1:${dependencyPort}/v1")
+                }
+                let configured = gatewayS5ConfigureFormalGateway(
+                    home,
+                    gatewayPort,
+                    webhookPort,
+                    dependencyPort,
+                    gcmBinary
+                )
+                let statePath = configured[0]
+                let queuePath = configured[1]
+                let manifestPath = configured[2]
+                let loaded = loadServicePluginManifest(manifestPath.toString())
+                @Expect(loaded.ok, true)
+                @Expect(loaded.status, "accepted")
+
+                let launched = launch(
+                    metisBinary.toString(),
+                    ["gateway", "run"],
+                    stdIn: ProcessRedirect.Discard,
+                    stdOut: ProcessRedirect.Discard,
+                    stdErr: ProcessRedirect.Discard
+                )
+                gatewayPid = launched.pid
+                gatewayProcess = Some(launched)
+                gatewayIdentity = gatewayServeStopCaptureOwnedIdentity(home, gatewayPid, metisBinary, 5000)
+                @Expect(gatewayIdentity.isSome(), true)
+
+                let processCapture = GatewayS5P1Capture()
+                let stableGatewayPid = gatewayPid
+                let brokerReady = gatewayServeStopWaitUntil(15000, { =>
+                    processCapture.brokerPid = gatewayServeStopChildPid(stableGatewayPid, brokerScript.toString())
+                    processCapture.brokerPid > 0 &&
+                        gatewayServeStopCommandContains(processCapture.brokerPid, brokerScript.toString()) &&
+                        gatewayServeStopParentPid(processCapture.brokerPid) == stableGatewayPid
+                })
+                @Expect(brokerReady, true)
+                brokerPid = processCapture.brokerPid
+                brokerCaptured = brokerReady
+                let gcmReady = gatewayServeStopWaitUntil(15000, { =>
+                    processCapture.gcmPid = gatewayServeStopChildPid(processCapture.brokerPid, gcmBinary.toString())
+                    processCapture.gcmPgid = gatewayServeStopProcessGroup(processCapture.gcmPid)
+                    processCapture.gcmPid > 0 && processCapture.gcmPgid > 0 &&
+                        gatewayServeStopCommandContains(processCapture.gcmPid, gcmBinary.toString()) &&
+                        gatewayServeStopParentPid(processCapture.gcmPid) == processCapture.brokerPid
+                })
+                @Expect(gcmReady, true)
+                gcmPid = processCapture.gcmPid
+                gcmPgid = processCapture.gcmPgid
+                gcmCaptured = gcmReady
+                let liveOwner = GatewayServeStopLiveOwnerProof()
+                let readyzUrl = "http://127.0.0.1:${gatewayPort}/readyz"
+                let expectedGcmPid = gcmPid
+                let expectedGatewayPid = stableGatewayPid
+                @Expect(gatewayServeStopWaitUntil(15000, { =>
+                    liveOwner.refresh(readyzUrl)
+                    processCapture.refreshLease(home, expectedGcmPid, expectedGatewayPid, webhookPort)
+                    liveOwner.httpStatus == 200 && liveOwner.running && liveOwner.ownerCount >= 1 &&
+                        gatewayServeStopPortListening(gatewayPort) && gatewayServeStopPortListening(webhookPort) &&
+                        processCapture.leaseIdentityMatches && processCapture.leasePidMatches &&
+                        processCapture.leasePortMatches && processCapture.leaseRunning
+                }), true)
+                leasePath = processCapture.leasePath
+                @Expect(liveOwner.httpStatus, 200)
+                @Expect(liveOwner.running, true)
+                @Expect(liveOwner.ownerCount >= 1, true)
+                @Expect(gatewayServeStopPortListening(gatewayPort), true)
+                @Expect(gatewayServeStopPortListening(webhookPort), true)
+                @Expect(processCapture.leaseDirExists, true)
+                @Expect(processCapture.leaseFileCount, 1)
+                @Expect(processCapture.leaseUtf8, true)
+                @Expect(processCapture.leaseJson, true)
+                @Expect(processCapture.leaseIdentityMatches, true)
+                @Expect(processCapture.leasePidMatches, true)
+                @Expect(processCapture.leasePortMatches, true)
+                @Expect(processCapture.leaseRunning, true)
+
+                let deliveryId = "s5-p1-exact-once"
+                let eventId = "gitcode:cangjie/compiler:issue:7001"
+                let stableDependencies = dependencies.getOrThrow()
+                let first = gatewayS5PostWebhook(webhookPort, deliveryId)
+                let duplicate = gatewayS5PostWebhook(webhookPort, deliveryId)
+                @Expect(first >= 200 && first < 300, true)
+                @Expect(duplicate >= 200 && duplicate < 300, true)
+                @Expect(gatewayServeStopWaitUntil(15000, { =>
+                    gatewayS5EventCount(stableDependencies.eventsPath, "telegram_send", deliveryId) == 1 &&
+                        gatewayS5EventCount(stableDependencies.eventsPath, "model_response") == 1 &&
+                        gatewayS5FileContains(statePath, eventId)
+                }), true)
+                @Expect(gatewayS5EventCount(dependencies.getOrThrow().eventsPath, "telegram_send", deliveryId), 1)
+                @Expect(gatewayS5EventCount(dependencies.getOrThrow().eventsPath, "model_response"), 1)
+                @Expect(gatewayS5EventCount(dependencies.getOrThrow().eventsPath, "model_response", "\"stream\":false"), 1)
+                @Expect(gatewayS5EventCount(dependencies.getOrThrow().eventsPath, "model_response", "\"responseMode\":\"json\""), 1)
+                @Expect(gatewayS5FileContains(stableDependencies.eventsPath, "S5 本地模型回复 中文🙂 s5-p1-exact-once"), true)
+                @Expect(gatewayS5FileContains(stableDependencies.eventsPath, "_answer_"), false)
+                @Expect(gatewayS5FileContains(stableDependencies.eventsPath, "<answer>"), false)
+                @Expect(gatewayS5FileContains(stableDependencies.eventsPath, "taskKind"), false)
+                @Expect(gatewayS5FileContains(stableDependencies.eventsPath, "replyBody"), false)
+                @Expect(exists(queuePath), true)
+                @Expect(gatewayS5FileContains(queuePath.join("processed").join("${deliveryId}.json"), deliveryId), true)
+                @Expect(gatewayS5FileContains(statePath, eventId), true)
+
+                let lockText = String.fromUtf8(File.readFrom(home.join("gateway-serve.lock")))
+                let stopIdentity = gatewayParseServeIdentity(lockText).getOrThrow()
+                @Expect(stopIdentity.pid, gatewayPid)
+                @Expect(gatewayIdentity.getOrThrow().matches(stopIdentity), true)
+                setGatewayStopOutputForTest(Some({ line => output.add(line) }))
+                let exitCode = gatewayExecuteStopServe()
+                let outputText = String.join(output.toArray(), delimiter: "\n")
+                @Expect(exitCode, 0)
+                @Expect(outputText.contains("已正常停止"), true)
+                @Expect(outputText.contains("\"ok\""), false)
+                @Expect(outputText.contains("\"result\""), false)
+
+                let completionPath = home.join("gateway-serve.stop-complete")
+                @Expect(exists(completionPath), true)
+                let completion = String.fromUtf8(File.readFrom(completionPath))
+                @Expect(gatewayParseServeIdentity(completion).getOrThrow().matches(stopIdentity), true)
+                @Expect(gatewayServeStopCompletionField(completion, "status"), "graceful")
+                @Expect(gatewayServeStopCompletionField(completion, "fullTerminal"), "1")
+                @Expect(gatewayServeStopCompletionField(completion, "servicePluginIngressStatus"), "sent")
+                @Expect(gatewayServeStopCompletionField(completion, "servicePluginDispatchStatus"), "drained")
+                @Expect(gatewayServeStopCompletionField(completion, "servicePluginOwnerStatus"), "graceful_exited")
+                @Expect(gatewayServeStopCompletionField(completion, "servicePluginLeaseStatus"), "stopped")
+                @Expect(gatewayServeStopCompletionField(completion, "servicePluginPortStatus"), "released")
+                @Expect(gatewayServeStopCompletionField(completion, "servicePluginPendingCount"), "0")
+                @Expect(gatewayServeStopCompletionField(completion, "channelsStatus"), "stopped")
+                @Expect(gatewayServeStopCompletionField(completion, "brokerStatus"), "stopped")
+
+                gatewaySettled = gatewayServeStopReapCompletedOwnedProcess(gatewayProcess)
+                @Expect(gatewaySettled, true)
+                if (gatewaySettled) { gatewayProcess = None<SubProcess> }
+                let capturedBrokerPid = brokerPid
+                let capturedGcmPid = gcmPid
+                let capturedGcmPgid = gcmPgid
+                brokerGone = gatewayServeStopWaitUntil(5000, { => !gatewayServeStopPidAlive(capturedBrokerPid) })
+                gcmGone = gatewayServeStopWaitUntil(5000, { => !gatewayServeStopPidAlive(capturedGcmPid) })
+                gcmGroupGone = gatewayServeStopWaitUntil(5000, { =>
+                    executeWithOutput("/usr/bin/pgrep", ["-g", "${capturedGcmPgid}"])[0] != 0
+                })
+                @Expect(brokerGone, true)
+                @Expect(gcmGone, true)
+                @Expect(gcmGroupGone, true)
+                @Expect(gatewayServeStopPortListening(gatewayPort), false)
+                @Expect(gatewayServeStopPortListening(webhookPort), false)
+                processCapture.refreshLease(home, expectedGcmPid, expectedGatewayPid, webhookPort)
+                @Expect(processCapture.leaseIdentityMatches, true)
+                @Expect(processCapture.leasePidMatches, true)
+                @Expect(processCapture.leasePortMatches, true)
+                @Expect(processCapture.leaseStopped, true)
+                @Expect(gatewayServeStopRuntimeOwnerCount(home.join("gateway-runtime-state.json")), 0)
+            } finally {
+                setGatewayStopOutputForTest(None<(String) -> Unit>)
+                if (gatewayIdentity.isSome()) {
+                    try { gatewayServeStopReapOwnedGateway(gatewayIdentity, metisBinary, home) } catch (_: Exception) { () }
+                }
+                try { gatewayServeStopReapOwnedHandle(gatewayProcess, metisBinary) } catch (_: Exception) { () }
+                if (!gatewaySettled) {
+                    gatewaySettled = try { gatewayServeStopWaitOwnedProcess(gatewayProcess) } catch (_: Exception) { false }
+                }
+                let capturedBrokerPid = brokerPid
+                let capturedGcmPid = gcmPid
+                let capturedGcmPgid = gcmPgid
+                if (!brokerGone) {
+                    brokerGone = brokerCaptured && gatewayServeStopWaitUntil(3000, { => !gatewayServeStopPidAlive(capturedBrokerPid) })
+                }
+                if (!gcmGone) {
+                    gcmGone = gcmCaptured && gatewayServeStopWaitUntil(3000, { => !gatewayServeStopPidAlive(capturedGcmPid) })
+                }
+                if (!gcmGroupGone) {
+                    gcmGroupGone = gcmCaptured && gatewayServeStopWaitUntil(3000, { =>
+                        executeWithOutput("/usr/bin/pgrep", ["-g", "${capturedGcmPgid}"])[0] != 0
+                    })
+                }
+                dependenciesSettled = gatewayS5StopDependencies(dependencies)
+                try { let _ = resetManagedStdioBrokerForTest(timeoutMs: 3000) } catch (_: Exception) { () }
+                match (oldHome) {
+                    case Some(value) => setVariable("METIS_HOME", value)
+                    case None => setVariable("METIS_HOME", "")
+                }
+                match (oldRoot) {
+                    case Some(value) => setVariable("METIS_CJPM_ROOT", value)
+                    case None => setVariable("METIS_CJPM_ROOT", "")
+                }
+                for ((key, value) in oldProviderEnv) {
+                    match (value) {
+                        case Some(previous) => setVariable(key, previous)
+                        case None => setVariable(key, "")
+                    }
+                }
+                CliConfig._model = oldPrimaryModel
+                CliConfig.fallbackModels = oldFallbackModels
+                CliConfig._imageModel = oldImageModel
+                CliConfig.imageFallbackModels = oldImageFallbackModels
+                CliConfig._pdfModel = oldPdfModel
+                CliConfig.pdfFallbackModels = oldPdfFallbackModels
+                CliConfig.pdfMaxBytesMb = oldPdfMaxBytesMb
+                CliConfig.pdfMaxPages = oldPdfMaxPages
+                CliConfig._fastModel = oldFastModel
+                CliConfig.temperature = oldTemperature
+                CliConfig.defaultModelInputLimit = oldDefaultModelInputLimit
+                CliConfig.defaultModelOutputLimit = oldDefaultModelOutputLimit
+                CliConfig.workspaceDirOverride = oldWorkspaceDirOverride
+                CliConfig.invalidatePathCache()
+                MetisConfigManager.invalidate()
+                CliSettingManager.invalidate()
+                try { remove(home, recursive: true) } catch (_: Exception) { () }
+                @Expect(gatewaySettled, true)
+                @Expect(brokerGone, true)
+                @Expect(gcmGone, true)
+                @Expect(gcmGroupGone, true)
+                @Expect(dependenciesSettled, true)
+            }
+        }
+    }
+
+    @TestCase
+    public func s5N1FormalGatewayWriterFailureReapsOldGenerationAndReplacementNeverReplays(): Unit {
+        synchronized(MetisProcessEnvironmentLock) {
+            let suffix = DateTime.now().toUnixTimeStamp().toNanoseconds()
+            let oldHome = Path("/tmp/metis-s5-n1-old-${suffix}")
+            let replacementHome = Path("/tmp/metis-s5-n1-new-${suffix}")
+            let previousHome = getVariable("METIS_HOME")
+            let previousRoot = getVariable("METIS_CJPM_ROOT")
+            let environmentKeys = [
+                "METIS_STDIO_BROKER_NODE_COMMAND", "METIS_S5_BROKER_PROXY_READY",
+                "METIS_S5_BROKER_PROXY_FAIL", "METIS_S5_BROKER_PROXY_WRITER_CLOSED",
+                "METIS_S5_BROKER_PROXY_CLEANUP", "GCM_S5_READY_PATH",
+                "GCM_S5_STOP_SEEN_PATH", "GCM_S5_CHILD_DYLD_LIBRARY_PATH"
+            ]
+            let previousEnvironment = ArrayList<(String, Option<String>)>()
+            for (key in environmentKeys) { previousEnvironment.add((key, getVariable(key))) }
+            let providerEnvironment = ArrayList<(String, Option<String>)>()
+            let apiKeyAliases = cliProviderApiKeyEnvAliases("openai")
+            let baseUrlAliases = cliProviderBaseUrlEnvAliases("openai")
+            for (key in apiKeyAliases) { providerEnvironment.add((key, getVariable(key))) }
+            for (key in baseUrlAliases) { providerEnvironment.add((key, getVariable(key))) }
+            let brokerScript = Path(managedStdioResolveBrokerScriptPath())
+            let project = brokerScript.parent.parent
+            let metisBinary = project.join("target").join("release").join("bin").join("metis")
+            let dependencyScript = brokerScript.parent.join("metis-s5-loopback-dependencies.mjs")
+            let proxySource = brokerScript.parent.join("metis-s5-broker-writer-failure-proxy.mjs")
+            let gcmRoot = gatewayS5GcmRoot()
+            let gcmSource = gatewayS5GcmBinary()
+            let wrapperSource = gcmRoot.join("test").join("fixtures").join("gcm-s5-blocked-wrapper.mjs")
+            var oldDependencies = None<GatewayS5DependencyProcess>
+            var replacementDependencies = None<GatewayS5DependencyProcess>
+            var oldProcess = None<SubProcess>
+            var replacementProcess = None<SubProcess>
+            var oldIdentity = None<GatewayServeIdentity>
+            var replacementIdentity = None<GatewayServeIdentity>
+            var oldGatewaySettled = false
+            var oldGatewayGone = false
+            var oldProxyGone = false
+            var oldGatewayFinalSettled = false
+            var oldGatewayFinalGone = false
+            var oldProxyFinalGone = false
+            var replacementGatewaySettled = false
+            var oldBrokerGone = false
+            var oldGroupGone = false
+            var replacementBrokerGone = false
+            var replacementGcmGone = false
+            var replacementGroupGone = false
+            var oldGatewayPid: Int64 = 0
+            var oldProxyPid: Int64 = 0
+            var oldBrokerPid: Int64 = 0
+            var oldWrapperPid: Int64 = 0
+            var oldGcmPid: Int64 = 0
+            var oldDescendantPid: Int64 = 0
+            var oldPgid: Int64 = 0
+            var replacementGatewayPid: Int64 = 0
+            var replacementBrokerPid: Int64 = 0
+            var replacementGcmPid: Int64 = 0
+            var replacementPgid: Int64 = 0
+            var oldBusinessTruth = false
+            var replacementBusinessTruth = false
+            let output = ArrayList<String>()
+            try {
+                Directory.create(oldHome, recursive: true)
+                Directory.create(replacementHome, recursive: true)
+                @Expect(exists(metisBinary), true)
+                @Expect(exists(gcmSource), true)
+                @Expect(exists(wrapperSource), true)
+                @Expect(exists(proxySource), true)
+                let oldGcm = oldHome.join("gitcodemonitor")
+                let oldWrapper = oldHome.join("gcm-s5-blocked-wrapper.mjs")
+                let proxy = oldHome.join("metis-s5-broker-writer-failure-proxy.mjs")
+                for ((source, destination) in [(gcmSource, oldGcm), (wrapperSource, oldWrapper), (proxySource, proxy)]) {
+                    @Expect(executeWithOutput("/bin/cp", [source.toString(), destination.toString()])[0], 0)
+                    @Expect(executeWithOutput("/bin/chmod", ["700", destination.toString()])[0], 0)
+                }
+                let oldGatewayPort = gatewayServeStopTemporaryPort()
+                let oldWebhookPort = gatewayServeStopTemporaryPort()
+                @Expect(oldGatewayPort > 0 && oldWebhookPort > 0 && oldGatewayPort != oldWebhookPort, true)
+                let processorEntered = oldHome.join("processor.entered")
+                let processorRelease = oldHome.join("processor.release")
+                let wrapperReady = oldHome.join("wrapper.ready.json")
+                let stopSeen = oldHome.join("wrapper.stop-seen")
+                let proxyReady = oldHome.join("broker-proxy.ready.json")
+                let proxyFail = oldHome.join("broker-proxy.fail")
+                let writerClosed = oldHome.join("broker-proxy.writer-closed")
+                let proxyCleanup = oldHome.join("broker-proxy.cleanup")
+
+                setVariable("METIS_HOME", oldHome.toString())
+                setVariable("METIS_CJPM_ROOT", project.toString())
+                setVariable("METIS_STDIO_BROKER_NODE_COMMAND", proxy.toString())
+                setVariable("METIS_S5_BROKER_PROXY_READY", proxyReady.toString())
+                setVariable("METIS_S5_BROKER_PROXY_FAIL", proxyFail.toString())
+                setVariable("METIS_S5_BROKER_PROXY_WRITER_CLOSED", writerClosed.toString())
+                setVariable("METIS_S5_BROKER_PROXY_CLEANUP", proxyCleanup.toString())
+                setVariable("GCM_S5_READY_PATH", wrapperReady.toString())
+                setVariable("GCM_S5_STOP_SEEN_PATH", stopSeen.toString())
+                setVariable("GCM_S5_CHILD_DYLD_LIBRARY_PATH", getVariable("DYLD_LIBRARY_PATH").getOrDefault { "" })
+                CliConfig.invalidatePathCache()
+                MetisConfigManager.invalidate()
+                CliSettingManager.invalidate()
+                oldDependencies = Some(gatewayS5StartDependencies(
+                    oldHome,
+                    dependencyScript,
+                    processorEntered: Some(processorEntered),
+                    processorRelease: Some(processorRelease)
+                ))
+                let oldDependencyPort = oldDependencies.getOrThrow().port
+                @Expect(oldDependencyPort > 0, true)
+                for (key in apiKeyAliases) { setVariable(key, "fake-s5-openai-key") }
+                for (key in baseUrlAliases) { setVariable(key, "http://127.0.0.1:${oldDependencyPort}/v1") }
+                let configured = gatewayS5ConfigureFormalGateway(
+                    oldHome, oldGatewayPort, oldWebhookPort, oldDependencyPort, oldGcm
+                )
+                gatewayS5WriteBlockedGcmManifest(configured[2], oldWrapper, oldGcm)
+                @Expect(loadServicePluginManifest(configured[2].toString()).ok, true)
+                let launchedOld = launch(
+                    metisBinary.toString(), ["gateway", "run"],
+                    stdIn: ProcessRedirect.Discard, stdOut: ProcessRedirect.Discard, stdErr: ProcessRedirect.Discard
+                )
+                oldGatewayPid = launchedOld.pid
+                oldProcess = Some(launchedOld)
+                oldIdentity = gatewayServeStopCaptureOwnedIdentity(oldHome, oldGatewayPid, metisBinary, 5000)
+                @Expect(oldIdentity.isSome(), true)
+                @Expect(gatewayServeStopWaitUntil(15000, { =>
+                    exists(proxyReady) && exists(wrapperReady) && gatewayServeStopPortListening(oldGatewayPort) &&
+                        gatewayServeStopPortListening(oldWebhookPort)
+                }), true)
+                oldBrokerPid = gatewayS5JsonInt(proxyReady, "brokerPid")
+                oldProxyPid = gatewayS5JsonInt(proxyReady, "wrapperPid")
+                oldWrapperPid = gatewayS5JsonInt(wrapperReady, "wrapperPid")
+                oldGcmPid = gatewayS5JsonInt(wrapperReady, "gcmPid")
+                oldDescendantPid = gatewayS5JsonInt(wrapperReady, "descendantPid")
+                oldPgid = gatewayS5JsonInt(wrapperReady, "pgid")
+                @Expect(oldProxyPid > 1 && gatewayServeStopParentPid(oldProxyPid) == oldGatewayPid, true)
+                @Expect(gatewayServeStopCommandContains(oldProxyPid, proxy.toString()), true)
+                @Expect(oldBrokerPid > 1 && gatewayServeStopParentPid(oldBrokerPid) == oldProxyPid, true)
+                @Expect(gatewayServeStopCommandContains(oldBrokerPid, brokerScript.toString()), true)
+                @Expect(oldWrapperPid > 1 && oldGcmPid > 1 && oldDescendantPid > 1 && oldPgid > 1, true)
+                @Expect(gatewayServeStopProcessGroup(oldWrapperPid), oldPgid)
+                @Expect(gatewayServeStopProcessGroup(oldGcmPid), oldPgid)
+                @Expect(gatewayServeStopProcessGroup(oldDescendantPid), oldPgid)
+                let oldOwnerProof = GatewayServeStopLiveOwnerProof()
+                let oldReadyz = "http://127.0.0.1:${oldGatewayPort}/readyz"
+                @Expect(gatewayServeStopWaitUntil(15000, { =>
+                    oldOwnerProof.refresh(oldReadyz)
+                    oldOwnerProof.httpStatus == 200 && oldOwnerProof.running && oldOwnerProof.ownerCount >= 1
+                }), true)
+                let oldDelivery = "s5-n1-old"
+                let oldWebhookStatus = gatewayS5PostWebhook(oldWebhookPort, oldDelivery)
+                @Expect(oldWebhookStatus >= 200 && oldWebhookStatus < 300, true)
+                @Expect(gatewayServeStopWaitUntil(10000, { => exists(processorEntered) }), true)
+                File.writeTo(proxyFail, "fail\n".toArray())
+                @Expect(gatewayServeStopWaitUntil(5000, { => exists(writerClosed) }), true)
+                for ((key, value) in previousEnvironment) {
+                    match (value) {
+                        case Some(previous) => setVariable(key, previous)
+                        case None => setVariable(key, "")
+                    }
+                }
+                setGatewayStopOutputForTest(Some({ line => output.add(line) }))
+                let stopStarted = MonoTime.now()
+                let oldStopExit = gatewayExecuteStopServe()
+                let stopElapsedMs = (MonoTime.now() - stopStarted).toMilliseconds()
+                let oldOutput = String.join(output.toArray(), delimiter: "\n")
+                @Expect(oldStopExit, 1)
+                @Expect(stopElapsedMs <= GATEWAY_SERVE_GRACEFUL_SHUTDOWN_TIMEOUT_MS + 5000, true)
+                @Expect(oldOutput.contains("子进程清理未完成"), true)
+                @Expect(oldOutput.contains("\"ok\""), false)
+                let oldLogPath = oldHome.join("s5-gateway.log")
+                @Expect(exists(oldLogPath), true)
+                let oldLog = try { String.fromUtf8(File.readFrom(oldLogPath)) } catch (_: Exception) { "" }
+                @Expect(oldLog.isEmpty(), false)
+                for (sensitive in [
+                    oldHome.toString(), proxy.toString(), configured[1].toString(), configured[2].toString(),
+                    "fake-s5-openai-key", "fake-s5-gitcode-token", "fake-s5-webhook-token", "123456:FAKE-S5",
+                    "object_kind", "cangjie/compiler", "S5 正式链路 中文🙂"
+                ]) {
+                    @Expect(oldOutput.contains(sensitive), false)
+                    @Expect(oldLog.contains(sensitive), false)
+                }
+                let oldCompletionPath = oldHome.join("gateway-serve.stop-complete")
+                @Expect(exists(oldCompletionPath), false)
+                @Expect(exists(writerClosed), true)
+                @Expect(exists(stopSeen), false)
+                @Expect(gatewayS5EventCount(oldDependencies.getOrThrow().eventsPath, "telegram_send", oldDelivery), 0)
+                let stableOldBrokerPid = oldBrokerPid
+                let stableOldGatewayPid = oldGatewayPid
+                let stableOldProxyPid = oldProxyPid
+                let stableOldPgid = oldPgid
+                oldGatewaySettled = gatewayServeStopReapCompletedOwnedProcess(oldProcess)
+                @Expect(oldGatewaySettled, true)
+                if (oldGatewaySettled) { oldProcess = None<SubProcess> }
+                oldGatewayGone = gatewayServeStopWaitUntil(5000, { => !gatewayServeStopPidAlive(stableOldGatewayPid) })
+                oldProxyGone = gatewayServeStopWaitUntil(5000, { => !gatewayServeStopPidAlive(stableOldProxyPid) })
+                oldBrokerGone = gatewayServeStopWaitUntil(10000, { => !gatewayServeStopPidAlive(stableOldBrokerPid) })
+                oldGroupGone = gatewayServeStopWaitUntil(10000, { => gatewayServeStopGroupGone(stableOldPgid) })
+                @Expect(oldGatewayGone, true)
+                @Expect(oldProxyGone, true)
+                @Expect(oldBrokerGone, true)
+                @Expect(oldGroupGone, true)
+                @Expect(gatewayServeStopPortListening(oldGatewayPort), false)
+                @Expect(gatewayServeStopPortListening(oldWebhookPort), false)
+                @Expect(gatewayServeStopRuntimeOwnerCount(oldHome.join("gateway-runtime-state.json")), 0)
+                oldBusinessTruth = true
+
+                setGatewayStopOutputForTest(None<(String) -> Unit>)
+                output.clear()
+                setVariable("METIS_STDIO_BROKER_NODE_COMMAND", "")
+                for (key in ["METIS_S5_BROKER_PROXY_READY", "METIS_S5_BROKER_PROXY_FAIL",
+                    "METIS_S5_BROKER_PROXY_WRITER_CLOSED", "METIS_S5_BROKER_PROXY_CLEANUP",
+                    "GCM_S5_READY_PATH", "GCM_S5_STOP_SEEN_PATH", "GCM_S5_CHILD_DYLD_LIBRARY_PATH"]) {
+                    setVariable(key, "")
+                }
+                let replacementGcm = replacementHome.join("gitcodemonitor")
+                @Expect(executeWithOutput("/bin/cp", [gcmSource.toString(), replacementGcm.toString()])[0], 0)
+                @Expect(executeWithOutput("/bin/chmod", ["700", replacementGcm.toString()])[0], 0)
+                let replacementGatewayPort = gatewayServeStopTemporaryPort()
+                let replacementWebhookPort = gatewayServeStopTemporaryPort()
+                setVariable("METIS_HOME", replacementHome.toString())
+                CliConfig.invalidatePathCache()
+                MetisConfigManager.invalidate()
+                CliSettingManager.invalidate()
+                replacementDependencies = Some(gatewayS5StartDependencies(
+                    replacementHome, dependencyScript, replyMarker: "s5-n1-replacement"
+                ))
+                let replacementDependencyPort = replacementDependencies.getOrThrow().port
+                for (key in apiKeyAliases) { setVariable(key, "fake-s5-openai-key") }
+                for (key in baseUrlAliases) { setVariable(key, "http://127.0.0.1:${replacementDependencyPort}/v1") }
+                let replacementConfigured = gatewayS5ConfigureFormalGateway(
+                    replacementHome, replacementGatewayPort, replacementWebhookPort,
+                    replacementDependencyPort, replacementGcm
+                )
+                let launchedReplacement = launch(
+                    metisBinary.toString(), ["gateway", "run"],
+                    stdIn: ProcessRedirect.Discard, stdOut: ProcessRedirect.Discard, stdErr: ProcessRedirect.Discard
+                )
+                replacementGatewayPid = launchedReplacement.pid
+                replacementProcess = Some(launchedReplacement)
+                replacementIdentity = gatewayServeStopCaptureOwnedIdentity(
+                    replacementHome, replacementGatewayPid, metisBinary, 5000
+                )
+                @Expect(replacementIdentity.isSome(), true)
+                let replacementCapture = GatewayS5P1Capture()
+                let replacementOwnerProof = GatewayServeStopLiveOwnerProof()
+                let replacementReadyz = "http://127.0.0.1:${replacementGatewayPort}/readyz"
+                let stableReplacementGatewayPid = replacementGatewayPid
+                @Expect(gatewayServeStopWaitUntil(15000, { =>
+                    replacementCapture.brokerPid = gatewayServeStopChildPid(stableReplacementGatewayPid, brokerScript.toString())
+                    replacementCapture.gcmPid = gatewayServeStopChildPid(replacementCapture.brokerPid, replacementGcm.toString())
+                    replacementCapture.gcmPgid = gatewayServeStopProcessGroup(replacementCapture.gcmPid)
+                    replacementOwnerProof.refresh(replacementReadyz)
+                    replacementCapture.brokerPid > 1 && replacementCapture.gcmPid > 1 &&
+                        replacementCapture.gcmPgid > 1 && gatewayServeStopPortListening(replacementGatewayPort) &&
+                        gatewayServeStopPortListening(replacementWebhookPort) && replacementOwnerProof.httpStatus == 200 &&
+                        replacementOwnerProof.running && replacementOwnerProof.ownerCount >= 1
+                }), true)
+                replacementBrokerPid = replacementCapture.brokerPid
+                replacementGcmPid = replacementCapture.gcmPid
+                replacementPgid = replacementCapture.gcmPgid
+                @Expect(replacementBrokerPid != oldBrokerPid, true)
+                @Expect(replacementGcmPid != oldGcmPid, true)
+                @Expect(gatewayS5FileContains(replacementConfigured[0], oldDelivery), false)
+                let replacementDelivery = "s5-n1-replacement"
+                let replacementProcessedPath = replacementConfigured[1].join("processed")
+                    .join("${replacementDelivery}.json")
+                let replacementEventsPath = replacementDependencies.getOrThrow().eventsPath
+                let replacementWebhookStatus = gatewayS5PostWebhook(replacementWebhookPort, replacementDelivery)
+                @Expect(replacementWebhookStatus >= 200 && replacementWebhookStatus < 300, true)
+                @Expect(gatewayServeStopWaitUntil(15000, { =>
+                    gatewayS5FileContains(
+                        replacementProcessedPath,
+                        replacementDelivery
+                    ) && gatewayS5EventCount(replacementEventsPath, "model_response") == 1 &&
+                        gatewayS5EventCount(replacementEventsPath, "telegram_send", replacementDelivery) == 1
+                }), true)
+                @Expect(gatewayS5FileContains(replacementConfigured[0], oldDelivery), false)
+                @Expect(gatewayS5EventCount(replacementDependencies.getOrThrow().eventsPath, "telegram_send", oldDelivery), 0)
+                @Expect(gatewayS5EventCount(replacementDependencies.getOrThrow().eventsPath, "model_response"), 1)
+                @Expect(gatewayS5EventCount(
+                    replacementDependencies.getOrThrow().eventsPath, "telegram_send", replacementDelivery
+                ), 1)
+                @Expect(gatewayS5FileContains(
+                    replacementDependencies.getOrThrow().eventsPath,
+                    "S5 本地模型回复 中文🙂 ${replacementDelivery}"
+                ), true)
+                @Expect(gatewayS5FileContains(replacementDependencies.getOrThrow().eventsPath, "_answer_"), false)
+                @Expect(gatewayS5FileContains(replacementDependencies.getOrThrow().eventsPath, "<answer>"), false)
+                @Expect(gatewayS5FileContains(replacementDependencies.getOrThrow().eventsPath, "taskKind"), false)
+                @Expect(gatewayS5FileContains(replacementDependencies.getOrThrow().eventsPath, "replyBody"), false)
+                setGatewayStopOutputForTest(Some({ line => output.add(line) }))
+                let replacementExit = gatewayExecuteStopServe()
+                @Expect(replacementExit, 0)
+                @Expect(String.join(output.toArray(), delimiter: "\n").contains("已正常停止"), true)
+                let replacementCompletionPath = replacementHome.join("gateway-serve.stop-complete")
+                let replacementCompletion = try {
+                    String.fromUtf8(File.readFrom(replacementCompletionPath))
+                } catch (_: Exception) {
+                    ""
+                }
+                @Expect(gatewayServeStopCompletionField(replacementCompletion, "status"), "graceful")
+                @Expect(gatewayServeStopCompletionField(replacementCompletion, "fullTerminal"), "1")
+                replacementBusinessTruth = true
+            } finally {
+                setGatewayStopOutputForTest(None<(String) -> Unit>)
+                if (!exists(oldHome.join("processor.release"))) {
+                    try { File.writeTo(oldHome.join("processor.release"), "release\n".toArray()) } catch (_: Exception) { () }
+                }
+                if (!exists(oldHome.join("broker-proxy.cleanup"))) {
+                    try { File.writeTo(oldHome.join("broker-proxy.cleanup"), "cleanup\n".toArray()) } catch (_: Exception) { () }
+                }
+                if (replacementIdentity.isSome()) {
+                    try { gatewayServeStopReapOwnedGateway(replacementIdentity, metisBinary, replacementHome) } catch (_: Exception) { () }
+                }
+                try { gatewayServeStopReapOwnedHandle(replacementProcess, metisBinary) } catch (_: Exception) { () }
+                replacementGatewaySettled = try { gatewayServeStopWaitOwnedProcess(replacementProcess) } catch (_: Exception) { false }
+                if (oldIdentity.isSome()) {
+                    try { gatewayServeStopReapOwnedGateway(oldIdentity, metisBinary, oldHome) } catch (_: Exception) { () }
+                }
+                try { gatewayServeStopReapOwnedHandle(oldProcess, metisBinary) } catch (_: Exception) { () }
+                oldGatewayFinalSettled = if (oldGatewaySettled) {
+                    true
+                } else {
+                    try { gatewayServeStopWaitOwnedProcess(oldProcess) } catch (_: Exception) { false }
+                }
+                let stableReplacementBrokerPid = replacementBrokerPid
+                let stableReplacementGcmPid = replacementGcmPid
+                let stableReplacementPgid = replacementPgid
+                let stableOldGatewayPid = oldGatewayPid
+                let stableOldProxyPid = oldProxyPid
+                oldGatewayFinalGone = oldGatewayPid > 1 && gatewayServeStopWaitUntil(5000, { =>
+                    !gatewayServeStopPidAlive(stableOldGatewayPid)
+                })
+                oldProxyFinalGone = oldProxyPid > 1 && gatewayServeStopWaitUntil(5000, { =>
+                    !gatewayServeStopPidAlive(stableOldProxyPid)
+                })
+                replacementBrokerGone = replacementBrokerPid > 1 && gatewayServeStopWaitUntil(5000, { =>
+                    !gatewayServeStopPidAlive(stableReplacementBrokerPid)
+                })
+                replacementGcmGone = replacementGcmPid > 1 && gatewayServeStopWaitUntil(5000, { =>
+                    !gatewayServeStopPidAlive(stableReplacementGcmPid)
+                })
+                replacementGroupGone = replacementPgid > 1 && gatewayServeStopWaitUntil(5000, { =>
+                    gatewayServeStopGroupGone(stableReplacementPgid)
+                })
+                let oldDependenciesSettled = gatewayS5StopDependencies(oldDependencies)
+                let replacementDependenciesSettled = gatewayS5StopDependencies(replacementDependencies)
+                for ((key, value) in previousEnvironment) {
+                    match (value) {
+                        case Some(previous) => setVariable(key, previous)
+                        case None => setVariable(key, "")
+                    }
+                }
+                for ((key, value) in providerEnvironment) {
+                    match (value) {
+                        case Some(previous) => setVariable(key, previous)
+                        case None => setVariable(key, "")
+                    }
+                }
+                match (previousHome) {
+                    case Some(value) => setVariable("METIS_HOME", value)
+                    case None => setVariable("METIS_HOME", "")
+                }
+                match (previousRoot) {
+                    case Some(value) => setVariable("METIS_CJPM_ROOT", value)
+                    case None => setVariable("METIS_CJPM_ROOT", "")
+                }
+                CliConfig.invalidatePathCache()
+                MetisConfigManager.invalidate()
+                CliSettingManager.invalidate()
+                try { remove(oldHome, recursive: true) } catch (_: Exception) { () }
+                try { remove(replacementHome, recursive: true) } catch (_: Exception) { () }
+                @Expect(oldBusinessTruth, true)
+                @Expect(replacementBusinessTruth, true)
+                @Expect(oldGatewaySettled, true)
+                @Expect(oldGatewayGone, true)
+                @Expect(oldProxyGone, true)
+                @Expect(oldGatewayFinalSettled, true)
+                @Expect(oldGatewayFinalGone, true)
+                @Expect(oldProxyFinalGone, true)
+                @Expect(replacementGatewaySettled, true)
+                @Expect(oldBrokerGone, true)
+                @Expect(oldGroupGone, true)
+                @Expect(replacementBrokerGone, true)
+                @Expect(replacementGcmGone, true)
+                @Expect(replacementGroupGone, true)
+                @Expect(oldDependenciesSettled, true)
+                @Expect(replacementDependenciesSettled, true)
             }
         }
     }
