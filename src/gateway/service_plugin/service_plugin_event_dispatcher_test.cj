@@ -1,7 +1,57 @@
 package metis.gateway.service_plugin
 import std.collection.ArrayList
+import std.fs.{Directory, Path, exists, remove}
+import std.sync.{Condition, Mutex}
+import std.time.*
 import std.unittest.testmacro.*
-import stdx.encoding.json.{JsonObject, JsonValue}
+import stdx.encoding.json.{JsonInt, JsonObject, JsonString, JsonValue}
+
+private class ServicePluginReceiptConcurrencyProbe {
+    private let lock = Mutex()
+    private var condition: Condition
+    private var active: Int64 = 0
+    private var maxActive: Int64 = 0
+    private var overlapReached = false
+    private var timedOut = false
+
+    init() { synchronized(this.lock) { this.condition = this.lock.condition() } }
+
+    func overlap(): Unit {
+        synchronized(this.lock) {
+            this.active++
+            if (this.active > this.maxActive) { this.maxActive = this.active }
+            if (this.active >= 2) {
+                this.overlapReached = true
+                this.condition.notifyAll()
+            } else if (!this.condition.waitUntil({ => this.overlapReached }, timeout: Duration.second * 3)) {
+                this.timedOut = true
+            }
+            this.active--
+            this.condition.notifyAll()
+        }
+    }
+
+    func maximum(): Int64 { synchronized(this.lock) { this.maxActive } }
+    func didTimeOut(): Bool { synchronized(this.lock) { this.timedOut } }
+}
+
+private class ServicePluginDedupeClaimGate {
+    private let lock = Mutex()
+    private var condition: Condition
+    private var entered = false
+    private var released = false
+
+    init() { synchronized(this.lock) { this.condition = this.lock.condition() } }
+    func enterAndWait(): Unit {
+        synchronized(this.lock) {
+            this.entered = true
+            this.condition.notifyAll()
+            let _ = this.condition.waitUntil({ => this.released }, timeout: Duration.second * 3)
+        }
+    }
+    func awaitEntered(): Bool { synchronized(this.lock) { this.condition.waitUntil({ => this.entered }, timeout: Duration.second) } }
+    func release(): Unit { synchronized(this.lock) { this.released = true; this.condition.notifyAll() } }
+}
 
 @Test
 public class ServicePluginEventDispatcherTest {
@@ -41,6 +91,20 @@ public class ServicePluginEventDispatcherTest {
 
     private func acceptedFrame(jobId!: String = "webhook-d1", eventId!: String = "gitcode:cangjie/community:pr:71", repo!: String = "cangjie/community", kind!: String = "pr", number!: String = "71", url!: String = "https://gitcode.com/cangjie/community/pulls/71", title!: String = "修复 xxx", content!: String = "please review"): ServiceFrame {
         ServiceFrame("event", "accepted-${eventId}", "gitcode-monitor", method: "emitCapabilityEvent", capabilityId: "gitcode.event.accepted", payload: "{\"jobId\":\"${jobId}\",\"eventId\":\"${eventId}\",\"repo\":\"${repo}\",\"kind\":\"${kind}\",\"number\":\"${number}\",\"title\":\"${title}\",\"url\":\"${url}\",\"content\":\"${content}\"}")
+    }
+
+    private func acceptedV2Frame(deliveryId: String, eventId: String, attemptToken: String): ServiceFrame {
+        let legacy = this.acceptedFrame(jobId: "webhook-${deliveryId}", eventId: eventId)
+        let root = JsonValue.fromStr(legacy.payload).asObject()
+        root.put("deliveryId", JsonString(deliveryId))
+        root.put("attemptToken", JsonString(attemptToken))
+        ServiceFrame("event", "accepted-${attemptToken}", "gitcode-monitor", method: "emitCapabilityEvent", capabilityId: "gitcode.event.accepted", correlationId: attemptToken, payload: root.toJsonString())
+    }
+
+    private func receiptPath(label: String): Path {
+        let root = Path("/tmp").join("metis-dispatch-receipt-${label}-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
+        Directory.create(root, recursive: true)
+        root
     }
 
     private func acceptedContractFrame(jobId!: String = "webhook-d1", eventId!: String = "gitcode:Cangjie/cangjie_tools:issue:123"): ServiceFrame {
@@ -173,6 +237,7 @@ public class ServicePluginEventDispatcherTest {
         setServicePluginWebhookGeneratedReplyHandlerForTest(None<(ServicePluginAcceptedGitCodeEvent, ServicePluginDeliveryTarget) -> ServicePluginGeneratedReplyResult>)
         setServicePluginWebhookSubscribersProviderForTest(None<(ServicePluginAcceptedGitCodeEvent) -> ArrayList<ServicePluginDeliveryTarget>>)
         resetServicePluginGeneratedReplyStateForTest()
+        resetServicePluginWebhookReceiptStoreForTest()
         resetServicePluginHostForTest()
     }
 
@@ -518,6 +583,318 @@ public class ServicePluginEventDispatcherTest {
             @Expect(messages.size, 2)
         } finally {
             this.resetDispatcherHooks()
+        }
+    }
+
+    @TestCase
+    public func hS5N101CompletedReceiptReplacementReturnsDuplicateWithZeroSideEffects(): Unit {
+        this.resetDispatcherHooks()
+        this.registerGitCodeWritebackPlugin()
+        let path = this.receiptPath("replacement")
+        let effects = ArrayList<String>()
+        setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent =>
+            this.targetRows([this.target(channel: "telegram"), this.target(channel: "feishu")])
+        }))
+        setServicePluginWebhookGeneratedReplyHandlerForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent, _target: ServicePluginDeliveryTarget =>
+            effects.add("model")
+            ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "draft")
+        }))
+        setServicePluginCapabilityInvokerForTest(Some({ _registration: ServicePluginRegistration, _request: CapabilityInvokeRequest =>
+            effects.add("writeback")
+            CapabilityInvokeResult(true, "ok", serviceId: "gitcode-monitor", capabilityId: "gitcode.review.writeback", payload: "{\"status\":\"posted\",\"posted\":true}")
+        }))
+        setServicePluginEventDeliveryForTest(Some({ target: ServicePluginDeliveryTarget, _text: String =>
+            effects.add(target.channel)
+            ServicePluginEventDeliveryResult(true, "sent")
+        }))
+        try {
+            let eventId = "gitcode:cangjie/community:pr:receipt-1"
+            let first = dispatchServicePluginEvent(this.acceptedV2Frame("delivery-1", eventId, "attempt-1"), store: ServicePluginPendingJobStore(), receiptStore: Some(ServicePluginWebhookReceiptStore(path.toString())))
+            @Expect(first.status, "generated_reply_delivered")
+            @Expect(effects.size, 4)
+            let sameEventDifferentDelivery = dispatchServicePluginEvent(this.acceptedV2Frame("delivery-2", eventId, "attempt-other-delivery"), store: ServicePluginPendingJobStore(), receiptStore: Some(ServicePluginWebhookReceiptStore(path.toString())))
+            @Expect(sameEventDifferentDelivery.status, "duplicate_event")
+            @Expect(ServicePluginWebhookReceiptStore(path.toString()).state("gitcode-monitor", "delivery-2", eventId), "completed_unconfirmed")
+            @Expect(effects.size, 4)
+            resetServicePluginGeneratedReplyStateForTest()
+            let replacement = dispatchServicePluginEvent(this.acceptedV2Frame("delivery-1", eventId, "attempt-2"), store: ServicePluginPendingJobStore(), receiptStore: Some(ServicePluginWebhookReceiptStore(path.toString())))
+            @Expect(replacement.status, "duplicate_event")
+            @Expect(effects.size, 4)
+        } finally {
+            this.resetDispatcherHooks()
+            remove(path, recursive: true)
+        }
+    }
+
+    @TestCase
+    public func hS5N103InflightCorruptAndPartialV2RetryWithoutSideEffects(): Unit {
+        this.resetDispatcherHooks()
+        let path = this.receiptPath("retry")
+        let effects = ArrayList<String>()
+        setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent => this.targetRows([this.target()]) }))
+        setServicePluginWebhookGeneratedReplyHandlerForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent, _target: ServicePluginDeliveryTarget => effects.add("model"); ServicePluginGeneratedReplyResult(true) }))
+        setServicePluginEventDeliveryForTest(Some({ _target: ServicePluginDeliveryTarget, _text: String => effects.add("delivery"); ServicePluginEventDeliveryResult(true, "sent") }))
+        try {
+            let eventId = "gitcode:cangjie/community:pr:receipt-retry"
+            let store = ServicePluginWebhookReceiptStore(path.toString())
+            @Expect(store.reserve("gitcode-monitor", "delivery-retry", eventId).status, "reserved")
+            let inflight = dispatchServicePluginEvent(this.acceptedV2Frame("delivery-retry", eventId, "attempt-2"), receiptStore: Some(ServicePluginWebhookReceiptStore(path.toString())))
+            @Expect(inflight.status, "dispatch_retry")
+            let partialBase = this.acceptedFrame(jobId: "webhook-delivery-partial", eventId: eventId)
+            let partialRoot = JsonValue.fromStr(partialBase.payload).asObject()
+            partialRoot.put("deliveryId", JsonString("delivery-partial"))
+            let partial = ServiceFrame("event", "partial", "gitcode-monitor", method: "emitCapabilityEvent", capabilityId: "gitcode.event.accepted", correlationId: "attempt-partial", payload: partialRoot.toJsonString())
+            @Expect(dispatchServicePluginEvent(partial, receiptStore: Some(store)).status, "dispatch_retry")
+            @Expect(effects.size, 0)
+
+            let preCancelCalls = ArrayList<Int64>()
+            preCancelCalls.add(0)
+            let preCancel = dispatchServicePluginEvent(
+                this.acceptedV2Frame("delivery-pre-cancel", "event-pre-cancel", "attempt-pre-cancel"),
+                receiptStore: Some(store),
+                dispatchAllowed: { => preCancelCalls[0]++; preCancelCalls[0] == 1 }
+            )
+            @Expect(preCancel.status, "dispatch_cancelled")
+            @Expect(store.state("gitcode-monitor", "delivery-pre-cancel", "event-pre-cancel"), "missing")
+            let retried = dispatchServicePluginEvent(
+                this.acceptedV2Frame("delivery-pre-cancel", "event-pre-cancel", "attempt-pre-cancel"),
+                receiptStore: Some(store)
+            )
+            @Expect(retried.status, "generated_reply_degraded_delivered")
+            @Expect(effects.size, 2)
+            @Expect(store.state("gitcode-monitor", "delivery-pre-cancel", "event-pre-cancel"), "completed_unconfirmed")
+            effects.clear()
+
+            let sideEffectsStarted = ArrayList<Bool>()
+            sideEffectsStarted.add(false)
+            setServicePluginWebhookGeneratedReplyHandlerForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent, _target: ServicePluginDeliveryTarget =>
+                effects.add("post-start-model")
+                sideEffectsStarted[0] = true
+                ServicePluginGeneratedReplyResult(true, draft: "draft")
+            }))
+            let postCancel = dispatchServicePluginEvent(
+                this.acceptedV2Frame("delivery-post-cancel", "event-post-cancel", "attempt-post-cancel"),
+                receiptStore: Some(store),
+                dispatchAllowed: { => !sideEffectsStarted[0] }
+            )
+            @Expect(postCancel.status, "dispatch_retry")
+            @Expect(store.state("gitcode-monitor", "delivery-post-cancel", "event-post-cancel"), "in_flight")
+            @Expect(effects.size, 1)
+        } finally {
+            this.resetDispatcherHooks()
+            remove(path, recursive: true)
+        }
+    }
+
+    @TestCase
+    public func hS5N104DistinctReceiptsStayBoundedAndDispatcherAllowsTwoActiveHandlers(): Unit {
+        this.resetDispatcherHooks()
+        let path = this.receiptPath("concurrency")
+        let store = ServicePluginWebhookReceiptStore(path.toString(), maxReceipts: 2)
+        let probe = ServicePluginReceiptConcurrencyProbe()
+        setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent => this.targetRows([this.target()]) }))
+        setServicePluginWebhookGeneratedReplyHandlerForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent, _target: ServicePluginDeliveryTarget => probe.overlap(); ServicePluginGeneratedReplyResult(true, draft: "draft") }))
+        setServicePluginEventDeliveryForTest(Some({ _target: ServicePluginDeliveryTarget, _text: String => ServicePluginEventDeliveryResult(true, "sent") }))
+        try {
+            let first = spawn { dispatchServicePluginEvent(this.acceptedV2Frame("overlap-1", "overlap-event-1", "overlap-attempt-1"), receiptStore: Some(store)) }
+            let second = spawn { dispatchServicePluginEvent(this.acceptedV2Frame("overlap-2", "overlap-event-2", "overlap-attempt-2"), receiptStore: Some(store)) }
+            @Expect(first.get().status, "generated_reply_degraded_delivered")
+            @Expect(second.get().status, "generated_reply_degraded_delivered")
+            @Expect(probe.maximum(), 2)
+            @Expect(probe.didTimeOut(), false)
+            @Expect(store.state("gitcode-monitor", "overlap-1", "overlap-event-1"), "completed_unconfirmed")
+            @Expect(store.state("gitcode-monitor", "overlap-2", "overlap-event-2"), "completed_unconfirmed")
+            @Expect(store.receiptCountForTest(), 2)
+            @Expect(store.reserve("gitcode-monitor", "overlap-3", "overlap-event-3", attemptToken: "overlap-attempt-3").status, "store_full")
+            let statsJson = JsonValue.fromStr(servicePluginWebhookDispatchStatsJson().toJsonString()).asObject()
+            @Expect(statsJson.get("total").getOrThrow().asInt().getValue(), 2)
+            let statsRows = servicePluginWebhookDispatchStatsSnapshot()
+            var overlap1: Int64 = 0
+            var overlap2: Int64 = 0
+            var unexpected: Int64 = 0
+            for (stat in statsRows) {
+                if (stat.eventId == "overlap-event-1" && stat.status == "generated_reply_degraded_delivered") {
+                    overlap1++
+                } else if (stat.eventId == "overlap-event-2" && stat.status == "generated_reply_degraded_delivered") {
+                    overlap2++
+                } else {
+                    unexpected++
+                }
+            }
+            @Expect(statsRows.size, 2)
+            @Expect(overlap1, 1)
+            @Expect(overlap2, 1)
+            @Expect(unexpected, 0)
+        } finally {
+            this.resetDispatcherHooks()
+            remove(path, recursive: true)
+        }
+    }
+
+    @TestCase
+    public func c09SameEventDifferentDeliveryConcurrentClaimsOneBusinessEffect(): Unit {
+        this.resetDispatcherHooks()
+        let path = this.receiptPath("c09-same-event")
+        let storeA = ServicePluginWebhookReceiptStore(path.toString())
+        let storeB = ServicePluginWebhookReceiptStore(path.toString())
+        let effectLock = Mutex()
+        let effectCount = ArrayList<Int64>()
+        let ownerGate = ServicePluginDedupeClaimGate()
+        effectCount.add(0)
+        setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent => this.targetRows([this.target()]) }))
+        setServicePluginWebhookGeneratedReplyHandlerForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent, _target: ServicePluginDeliveryTarget =>
+            synchronized(effectLock) { effectCount[0]++ }
+            ownerGate.enterAndWait()
+            ServicePluginGeneratedReplyResult(true, draft: "draft")
+        }))
+        setServicePluginEventDeliveryForTest(Some({ _target: ServicePluginDeliveryTarget, _text: String => ServicePluginEventDeliveryResult(true, "sent") }))
+        try {
+            let eventId = "gitcode:cangjie/community:pr:c09-same-event"
+            let firstFrame = this.acceptedV2Frame("delivery-a", eventId, "attempt-a")
+            let secondFrame = this.acceptedV2Frame("delivery-b", eventId, "attempt-b")
+            let first = spawn { dispatchServicePluginEvent(firstFrame, receiptStore: Some(storeA)) }
+            @Expect(ownerGate.awaitEntered(), true)
+            let secondResult = dispatchServicePluginEvent(secondFrame, receiptStore: Some(storeB))
+            @Expect(secondResult.status, "dispatch_retry")
+            ownerGate.release()
+            let firstResult = first.get()
+            let statuses = [firstResult.status, secondResult.status]
+            var delivered: Int64 = 0
+            var retry: Int64 = 0
+            for (status in statuses) {
+                if (status == "generated_reply_degraded_delivered") { delivered++ }
+                if (status == "dispatch_retry") { retry++ }
+            }
+            @Expect(delivered, 1)
+            @Expect(retry, 1)
+            let retried = if (firstResult.status == "dispatch_retry") {
+                dispatchServicePluginEvent(firstFrame, receiptStore: Some(storeA))
+            } else {
+                dispatchServicePluginEvent(secondFrame, receiptStore: Some(storeB))
+            }
+            @Expect(retried.status, "duplicate_event")
+            @Expect(synchronized(effectLock) { effectCount[0] }, 1)
+            @Expect(storeA.state("gitcode-monitor", "delivery-a", eventId), "completed_unconfirmed")
+            @Expect(storeB.state("gitcode-monitor", "delivery-b", eventId), "completed_unconfirmed")
+        } finally {
+            ownerGate.release()
+            this.resetDispatcherHooks()
+            remove(path, recursive: true)
+        }
+    }
+
+    @TestCase
+    public func c09ActiveClaimRetriesUntilCancelledOrCompletedOwnerSettles(): Unit {
+        for (ownerOutcome in ["cancel", "complete"]) {
+            this.resetDispatcherHooks()
+            let path = this.receiptPath("c09-active-${ownerOutcome}")
+            let store = ServicePluginWebhookReceiptStore(path.toString())
+            let gate = ServicePluginDedupeClaimGate()
+            let effectsLock = Mutex()
+            let effects = ArrayList<Int64>()
+            effects.add(0)
+            setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent => this.targetRows([this.target()]) }))
+            setServicePluginEventDeliveryForTest(Some({ _target: ServicePluginDeliveryTarget, _text: String => ServicePluginEventDeliveryResult(true, "sent") }))
+            setServicePluginWebhookGeneratedReplyHandlerForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent, _target: ServicePluginDeliveryTarget =>
+                synchronized(effectsLock) { effects[0]++ }
+                if (ownerOutcome == "complete") { gate.enterAndWait() }
+                ServicePluginGeneratedReplyResult(true, draft: "draft")
+            }))
+            try {
+                let eventId = "gitcode:cangjie/community:pr:c09-active-${ownerOutcome}"
+                let firstFrame = this.acceptedV2Frame("delivery-owner-${ownerOutcome}", eventId, "attempt-owner-${ownerOutcome}")
+                let secondFrame = this.acceptedV2Frame("delivery-waiter-${ownerOutcome}", eventId, "attempt-waiter-${ownerOutcome}")
+                let first = if (ownerOutcome == "cancel") {
+                    let allowedCalls = ArrayList<Int64>()
+                    allowedCalls.add(0)
+                    spawn {
+                        dispatchServicePluginEvent(firstFrame, receiptStore: Some(store), dispatchAllowed: { =>
+                            allowedCalls[0]++
+                            if (allowedCalls[0] == 2) { gate.enterAndWait(); false } else { true }
+                        })
+                    }
+                } else {
+                    spawn { dispatchServicePluginEvent(firstFrame, receiptStore: Some(store)) }
+                }
+                @Expect(gate.awaitEntered(), true)
+                let whileActive = dispatchServicePluginEvent(secondFrame, receiptStore: Some(store))
+                @Expect(whileActive.status, "dispatch_retry")
+                @Expect(store.state("gitcode-monitor", "delivery-waiter-${ownerOutcome}", eventId), "missing")
+                gate.release()
+                let owner = first.get()
+                if (ownerOutcome == "cancel") {
+                    @Expect(owner.status, "dispatch_cancelled")
+                    let retry = dispatchServicePluginEvent(secondFrame, receiptStore: Some(store))
+                    @Expect(retry.status, "generated_reply_degraded_delivered")
+                } else {
+                    @Expect(owner.status, "generated_reply_degraded_delivered")
+                    let retry = dispatchServicePluginEvent(secondFrame, receiptStore: Some(store))
+                    @Expect(retry.status, "duplicate_event")
+                }
+                @Expect(synchronized(effectsLock) { effects[0] }, 1)
+                @Expect(store.state("gitcode-monitor", "delivery-waiter-${ownerOutcome}", eventId), "completed_unconfirmed")
+            } finally {
+                gate.release()
+                this.resetDispatcherHooks()
+                remove(path, recursive: true)
+            }
+        }
+    }
+
+    @TestCase
+    public func c10LegacyRecentDedupeIsBoundedAndPreEffectCancelCanRetry(): Unit {
+        this.resetDispatcherHooks()
+        setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent => ArrayList<ServicePluginDeliveryTarget>() }))
+        try {
+            for (index in 0..4100) {
+                let frame = this.acceptedFrame(eventId: "legacy-bounded-${index}")
+                @Expect(dispatchServicePluginEvent(frame).status, "no_subscribers")
+            }
+            let sizes = servicePluginEventDedupeSizesForTest()
+            @Expect(sizes[2], 0)
+            @Expect(sizes[3], 4096)
+
+            let store = this.storeWithRunningJob(jobId: "job-cancel-retry")
+            let frame = this.acceptedFrame(jobId: "job-cancel-retry", eventId: "pending-cancel-retry")
+            let calls = ArrayList<Int64>()
+            calls.add(0)
+            let cancelled = dispatchServicePluginEvent(frame, store: store, dispatchAllowed: { => calls[0]++; calls[0] == 1 })
+            @Expect(cancelled.status, "dispatch_cancelled")
+            setServicePluginGeneratedReplyHandlerForTest(Some({ _job: ServicePluginPendingJob, _event: ServicePluginAcceptedGitCodeEvent => ServicePluginGeneratedReplyResult(true, draft: "retry") }))
+            setServicePluginEventDeliveryForTest(Some({ _target: ServicePluginDeliveryTarget, _text: String => ServicePluginEventDeliveryResult(true, "sent") }))
+            @Expect(dispatchServicePluginEvent(frame, store: store).status, "generated_reply_degraded_delivered")
+            let after = servicePluginEventDedupeSizesForTest()
+            @Expect(after[0], 0)
+            @Expect(after[1] <= 4096, true)
+        } finally { this.resetDispatcherHooks() }
+    }
+
+    @TestCase
+    public func hS5N106LegacyKeepsContractAndPartialV2Retries(): Unit {
+        this.resetDispatcherHooks()
+        let path = this.receiptPath("legacy")
+        setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent => ArrayList<ServicePluginDeliveryTarget>() }))
+        try {
+            @Expect(dispatchServicePluginEvent(this.acceptedFrame(), receiptStore: Some(ServicePluginWebhookReceiptStore(path.toString()))).status, "no_subscribers")
+            @Expect(ServicePluginWebhookReceiptStore(path.toString()).receiptCountForTest(), 0)
+            for (variant in ["delivery-empty", "delivery-null", "delivery-number", "attempt-empty", "attempt-null", "attempt-number"]) {
+                let partial = this.acceptedV2Frame("delivery-partial", "partial-event", "attempt-partial")
+                let root = JsonValue.fromStr(partial.payload).asObject()
+                match (variant) {
+                    case "delivery-empty" => root.put("deliveryId", JsonString(""))
+                    case "delivery-null" => root.put("deliveryId", JsonValue.fromStr("null"))
+                    case "delivery-number" => root.put("deliveryId", JsonInt(7))
+                    case "attempt-empty" => root.put("attemptToken", JsonString(""))
+                    case "attempt-null" => root.put("attemptToken", JsonValue.fromStr("null"))
+                    case _ => root.put("attemptToken", JsonInt(7))
+                }
+                let invalid = ServiceFrame("event", "partial-${variant}", "gitcode-monitor", method: "emitCapabilityEvent", capabilityId: "gitcode.event.accepted", correlationId: "attempt-partial", payload: root.toJsonString())
+                @Expect(dispatchServicePluginEvent(invalid, receiptStore: Some(ServicePluginWebhookReceiptStore(path.toString()))).status, "dispatch_retry")
+            }
+            @Expect(ServicePluginWebhookReceiptStore(path.toString()).receiptCountForTest(), 0)
+        } finally {
+            this.resetDispatcherHooks()
+            remove(path, recursive: true)
         }
     }
 

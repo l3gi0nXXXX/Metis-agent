@@ -1053,6 +1053,9 @@ private class ServicePluginStdioProcess {
             }
         }
     }
+    public func recordCompletionConfirmed(): Unit {
+        synchronized(this.dispatchLock) { this.completionAcks++ }
+    }
     public func dispatchCountsForTest(): (String, Int64, Int64, Int64) {
         synchronized(this.dispatchLock) {
             (this.ownerId, this.generation, this.acceptedDispatches, Int64(this.dispatchFutures.size))
@@ -1665,6 +1668,9 @@ private class ServicePluginResponseQueue {
     private let lock = Mutex()
     private let condition: Condition
     private let responses = ArrayList<ServiceFrame>()
+    private let activeCorrelations = HashSet<String>()
+    private let expiredCorrelations = HashSet<String>()
+    private let expiredCorrelationOrder = ArrayList<String>()
     private var closed = false
     private var closeStatus = "process_exited"
     private var closeDiagnostic = ""
@@ -1680,6 +1686,18 @@ private class ServicePluginResponseQueue {
             if (this.closed) {
                 return
             }
+            if (this.expiredCorrelations.contains(frame.correlationId)) {
+                this.expiredCorrelations.remove(frame.correlationId)
+                for (index in 0..this.expiredCorrelationOrder.size) {
+                    if (this.expiredCorrelationOrder[index] == frame.correlationId) {
+                        this.expiredCorrelationOrder.remove(at: index)
+                        break
+                    }
+                }
+                return
+            }
+            if (!this.activeCorrelations.contains(frame.correlationId)) { return }
+            if (this.responses.size >= 128) { return }
             this.responses.add(frame)
             this.condition.notifyAll()
         }
@@ -1700,6 +1718,41 @@ private class ServicePluginResponseQueue {
         synchronized(this.lock) { this.closed }
     }
 
+    public func registerCorrelation(correlationId: String): Bool {
+        let corr = correlationId.trimAscii()
+        if (corr.isEmpty()) { return false }
+        synchronized(this.lock) {
+            if (this.closed || this.activeCorrelations.contains(corr)) { return false }
+            this.activeCorrelations.add(corr)
+            true
+        }
+    }
+
+    public func cancelCorrelation(correlationId: String, status!: String = "cancelled"): Unit {
+        synchronized(this.lock) {
+            let corr = correlationId.trimAscii()
+            this.activeCorrelations.remove(corr)
+            this.removeResponseLocked(corr)
+            this.rememberExpiredLocked(corr)
+            if (!status.trimAscii().isEmpty()) { this.closeDiagnostic = status.trimAscii() }
+            this.condition.notifyAll()
+        }
+    }
+
+    public func cancelCorrelationsWithPrefix(prefix: String): Int64 {
+        synchronized(this.lock) {
+            let cancelled = ArrayList<String>()
+            for (corr in this.activeCorrelations) { if (corr.startsWith(prefix)) { cancelled.add(corr) } }
+            for (corr in cancelled) {
+                this.activeCorrelations.remove(corr)
+                this.removeResponseLocked(corr)
+                this.rememberExpiredLocked(corr)
+            }
+            if (cancelled.size > 0) { this.condition.notifyAll() }
+            Int64(cancelled.size)
+        }
+    }
+
     public func readResponse(
         correlationId: String,
         expectedServiceId: String,
@@ -1710,7 +1763,7 @@ private class ServicePluginResponseQueue {
         let corr = correlationId.trimAscii()
         let effective = if (timeoutMs > 0) { timeoutMs } else { 30000 }
         synchronized(this.lock) {
-            let _ = this.condition.waitUntil({ => this.closed || this.findResponseIndex(corr) >= 0 }, timeout: Duration.millisecond * effective)
+            let _ = this.condition.waitUntil({ => this.closed || !this.activeCorrelations.contains(corr) || this.findResponseIndex(corr) >= 0 }, timeout: Duration.millisecond * effective)
             let responseIndex = this.findResponseIndex(corr)
             if (responseIndex >= 0) {
                 let frame = this.responses[responseIndex]
@@ -1723,15 +1776,46 @@ private class ServicePluginResponseQueue {
                     expectedCorrelationId: corr
                 )
                 if (!validation.ok) {
+                    this.activeCorrelations.remove(corr)
+                    this.rememberExpiredLocked(corr)
                     return ServicePluginStdoutReadResult(false, frame: frame, status: validation.status, diagnostic: validation.diagnostic)
                 }
+                this.activeCorrelations.remove(corr)
+                this.rememberExpiredLocked(corr)
                 return ServicePluginStdoutReadResult(true, frame: frame)
             }
+            if (!this.activeCorrelations.contains(corr)) {
+                return ServicePluginStdoutReadResult(false, status: "cancelled", diagnostic: "response wait cancelled")
+            }
             if (this.closed) {
+                this.activeCorrelations.remove(corr)
                 return ServicePluginStdoutReadResult(false, status: if (this.closeStatus.isEmpty()) { "process_exited" } else { this.closeStatus }, diagnostic: this.closeDiagnostic)
             }
+            this.activeCorrelations.remove(corr)
+            this.rememberExpiredLocked(corr)
             ServicePluginStdoutReadResult(false, status: "timeout", diagnostic: "timeout waiting for response correlationId=${corr}")
         }
+    }
+
+    public func pendingCountForTest(): Int64 { synchronized(this.lock) { Int64(this.responses.size) } }
+    public func activeCountForTest(): Int64 { synchronized(this.lock) { Int64(this.activeCorrelations.size) } }
+
+    private func removeResponseLocked(correlationId: String): Unit {
+        var idx: Int64 = this.responses.size - 1
+        while (idx >= 0) {
+            if (this.responses[idx].correlationId == correlationId) { this.responses.remove(at: idx) }
+            idx--
+        }
+    }
+
+    private func rememberExpiredLocked(correlationId: String): Unit {
+        if (this.expiredCorrelations.contains(correlationId)) { return }
+        if (this.expiredCorrelationOrder.size >= 128) {
+            let oldest = this.expiredCorrelationOrder.remove(at: 0)
+            this.expiredCorrelations.remove(oldest)
+        }
+        this.expiredCorrelationOrder.add(correlationId)
+        this.expiredCorrelations.add(correlationId)
     }
 
     private func findResponseIndex(correlationId: String): Int64 {
@@ -1744,6 +1828,42 @@ private class ServicePluginResponseQueue {
         }
         -1
     }
+}
+
+public func servicePluginResponseQueueExpiryProofForTest(): (String, Int64, String, Int64, Int64) {
+    let timeoutQueue = ServicePluginResponseQueue()
+    for (index in 0..1000) {
+        timeoutQueue.append(ServiceFrame(
+            "response", "unsolicited-${index}", "gitcode-monitor", method: "emitCapabilityEvent",
+            capabilityId: "gitcode.event.accepted", correlationId: "wrong-${index}", payload: "{}"
+        ))
+    }
+    var timedOut = ServicePluginStdoutReadResult(false, status: "missing")
+    for (index in 0..129) {
+        let corr = "corr-timeout-${index}"
+        let _ = timeoutQueue.registerCorrelation(corr)
+        timedOut = timeoutQueue.readResponse(corr, "gitcode-monitor", "emitCapabilityEvent", "gitcode.event.accepted", 1)
+    }
+    var index: Int64 = 128
+    while (index >= 0) {
+        timeoutQueue.append(ServiceFrame(
+            "response", "late-${index}", "gitcode-monitor", method: "emitCapabilityEvent",
+            capabilityId: "gitcode.event.accepted", correlationId: "corr-timeout-${index}", payload: "{}"
+        ))
+        index--
+    }
+    let mismatchQueue = ServicePluginResponseQueue()
+    let _ = mismatchQueue.registerCorrelation("corr-wrong")
+    mismatchQueue.append(ServiceFrame(
+        "response", "wrong", "wrong-service", method: "emitCapabilityEvent",
+        capabilityId: "gitcode.event.accepted", correlationId: "corr-wrong", payload: "{}"
+    ))
+    let mismatched = mismatchQueue.readResponse("corr-wrong", "gitcode-monitor", "emitCapabilityEvent", "gitcode.event.accepted", 1)
+    mismatchQueue.append(ServiceFrame(
+        "response", "late-right", "gitcode-monitor", method: "emitCapabilityEvent",
+        capabilityId: "gitcode.event.accepted", correlationId: "corr-wrong", payload: "{}"
+    ))
+    (timedOut.status, timeoutQueue.pendingCountForTest(), mismatched.status, mismatchQueue.pendingCountForTest(), timeoutQueue.activeCountForTest() + mismatchQueue.activeCountForTest())
 }
 
 private class ServicePluginProcessEnsureResult {
@@ -1782,6 +1902,7 @@ private var servicePluginDispatchLaunchHookForTest: Option<(String) -> Unit> = N
 private var servicePluginDispatchRegisterHookForTest: Option<(String) -> Unit> = None<(String) -> Unit>
 private var servicePluginDispatchWorkerSettledHookForTest: Option<(String) -> Unit> = None<(String) -> Unit>
 private var servicePluginEventAckWrittenHookForTest: Option<(String, String, String, ServicePluginDispatchSchedulerSnapshotForTest) -> Unit> = None<(String, String, String, ServicePluginDispatchSchedulerSnapshotForTest) -> Unit>
+private var servicePluginBeforeCompletionAckHookForTest: Option<(String) -> Bool> = None<(String) -> Bool>
 private var servicePluginDispatchDiagnosticHookForTest: Option<(String, String, ServicePluginDispatchSnapshot) -> Unit> = None<(String, String, ServicePluginDispatchSnapshot) -> Unit>
 private var servicePluginBeforeSupervisorRegisterHookForTest: Option<(String) -> Unit> = None<(String) -> Unit>
 private var servicePluginHostShuttingDown = false
@@ -1792,6 +1913,7 @@ public func setServicePluginDispatchLaunchHookForTest(hook: Option<(String) -> U
 public func setServicePluginDispatchRegisterHookForTest(hook: Option<(String) -> Unit>): Unit { servicePluginDispatchRegisterHookForTest = hook }
 public func setServicePluginDispatchWorkerSettledHookForTest(hook: Option<(String) -> Unit>): Unit { servicePluginDispatchWorkerSettledHookForTest = hook }
 public func setServicePluginEventAckWrittenHookForTest(hook: Option<(String, String, String, ServicePluginDispatchSchedulerSnapshotForTest) -> Unit>): Unit { servicePluginEventAckWrittenHookForTest = hook }
+public func setServicePluginBeforeCompletionAckHookForTest(hook: Option<(String) -> Bool>): Unit { servicePluginBeforeCompletionAckHookForTest = hook }
 public func setServicePluginDispatchDiagnosticHookForTest(hook: Option<(String, String, ServicePluginDispatchSnapshot) -> Unit>): Unit { servicePluginDispatchDiagnosticHookForTest = hook }
 public func setServicePluginBeforeSupervisorRegisterHookForTest(hook: Option<(String) -> Unit>): Unit { servicePluginBeforeSupervisorRegisterHookForTest = hook }
 
@@ -1835,6 +1957,14 @@ public func servicePluginDispatchSchedulerSnapshotForTest(serviceId: String): Op
         match (servicePluginActiveProcesses.get(serviceId.trimAscii())) {
             case Some(process) => Some(process.dispatchSchedulerSnapshotForTest())
             case None => None<ServicePluginDispatchSchedulerSnapshotForTest>
+        }
+    }
+}
+public func servicePluginResponseQueueCountsForTest(serviceId: String): Option<(Int64, Int64)> {
+    synchronized(servicePluginProcessLock) {
+        match (servicePluginResponseQueues.get(serviceId.trimAscii())) {
+            case Some(queue) => Some((queue.activeCountForTest(), queue.pendingCountForTest()))
+            case None => None<(Int64, Int64)>
         }
     }
 }
@@ -2641,6 +2771,7 @@ public func resetServicePluginHostForTest(): Unit {
     servicePluginDispatchRegisterHookForTest = None<(String) -> Unit>
     servicePluginDispatchWorkerSettledHookForTest = None<(String) -> Unit>
     servicePluginEventAckWrittenHookForTest = None<(String, String, String, ServicePluginDispatchSchedulerSnapshotForTest) -> Unit>
+    servicePluginBeforeCompletionAckHookForTest = None<(String) -> Bool>
     servicePluginDispatchDiagnosticHookForTest = None<(String, String, ServicePluginDispatchSnapshot) -> Unit>
     servicePluginBeforeSupervisorRegisterHookForTest = None<(String) -> Unit>
     synchronized(servicePluginProcessLock) { servicePluginHostShuttingDown = false }
@@ -2823,7 +2954,13 @@ private func servicePluginInvokeViaStdioProcess(record: ServicePluginRuntimeReco
             correlationId: correlationId,
             payload: request.payload
         )
-        process.writeLine(encodeServiceFrame(invokeFrame).trimAscii())
+        if (!queue.registerCorrelation(correlationId)) {
+            return CapabilityInvokeResult(false, "stdio_closed", serviceId: serviceId, capabilityId: request.capabilityId, diagnostic: "service plugin response correlation unavailable")
+        }
+        try { process.writeLine(encodeServiceFrame(invokeFrame).trimAscii()) } catch (e: Exception) {
+            queue.cancelCorrelation(correlationId, status: "write_failed")
+            throw e
+        }
         let responseRead = queue.readResponse(
             correlationId,
             serviceId,
@@ -3546,6 +3683,7 @@ private func servicePluginRunSupervisorTick(serviceId: String, nowMs: Int64, all
             let probe = probeServicePluginHealth(record, nowMs: nowMs)
             let classification = classifyServicePluginHealth(probe, previousFailures: record.supervisorFailureCount, config: servicePluginSupervisorConfig)
             servicePluginSupervisorRecordProbe(record, probe, classification, nowMs)
+            servicePluginFlushUnconfirmedForService(sid)
             var recovered = false
             if (allowRecover && classification.shouldRecover) {
                 recovered = recoverServicePlugin(record, classification.reason, nowMs: nowMs)
@@ -4272,6 +4410,7 @@ private func ensureServicePluginStdioProcess(record: ServicePluginRuntimeRecord,
     if (!servicePluginStartSupervisorWorker(record)) {
         return ServicePluginProcessEnsureResult(false, "stopping", diagnostic: "service plugin host is shutting down")
     }
+    servicePluginFlushUnconfirmedReceipts(record, process, queue)
     ServicePluginProcessEnsureResult(true, "running", process: Some(process), queue: Some(queue))
 }
 
@@ -4525,6 +4664,142 @@ private func servicePluginWriteEventAck(task: ServicePluginDispatchTask, phase: 
     } catch (_: Exception) { false }
 }
 
+private func servicePluginCompletionConfirmationPayloadValid(
+    payload: String,
+    receipt: ServicePluginWebhookReceipt
+): Bool {
+    try {
+        let root = JsonValue.fromStr(payload).asObject()
+        let ok = root.get("ok").getOrThrow().asBool().getValue()
+        let status = root.get("status").getOrThrow().asString().getValue().trimAscii()
+        let protocolVersion = root.get("protocolVersion").getOrThrow().asString().getValue().trimAscii()
+        let deliveryId = root.get("deliveryId").getOrThrow().asString().getValue().trimAscii()
+        let eventId = root.get("eventId").getOrThrow().asString().getValue().trimAscii()
+        let attemptToken = root.get("attemptToken").getOrThrow().asString().getValue().trimAscii()
+        ok && (status == "host_completed" || status == "already_completed") &&
+            protocolVersion == METIS_SERVICE_PLUGIN_PROTOCOL_VERSION &&
+            deliveryId == receipt.deliveryId && eventId == receipt.eventId && attemptToken == receipt.attemptToken
+    } catch (_: Exception) { false }
+}
+
+private func servicePluginConfirmCompletedReceipt(
+    record: ServicePluginRuntimeRecord,
+    process: ServicePluginStdioProcess,
+    queue: ServicePluginResponseQueue,
+    receipt: ServicePluginWebhookReceipt,
+    frameId: String,
+    timeoutMs!: Int64 = 3000,
+    requireDispatchAllowed!: Bool = false
+): Bool {
+    let allowed = match (servicePluginBeforeCompletionAckHookForTest) {
+        case Some(hook) => hook(frameId)
+        case None => true
+    }
+    if (!allowed) { return false }
+    let current = synchronized(servicePluginProcessLock) {
+        servicePluginOwnerMatchesLocked(record.registration.manifest.pluginId, process.ownerId, process.generation, claimToken: process.claimToken)
+    }
+    if (!current || (requireDispatchAllowed && !process.dispatchAllowed())) { return false }
+    let sequence = process.nextInvokeSequence()
+    let correlationId = "event-confirm-${process.ownerId}-${process.generation}-${sequence}"
+    let ack = ServiceEventAck(
+        METIS_SERVICE_PLUGIN_PROTOCOL_VERSION,
+        receipt.deliveryId,
+        receipt.eventId,
+        receipt.attemptToken,
+        "completion",
+        "completed"
+    )
+    let request = ServiceFrame(
+        "request",
+        "event-confirm-${process.generation}-${sequence}",
+        record.registration.manifest.pluginId,
+        method: "emitCapabilityEvent",
+        capabilityId: "gitcode.event.accepted",
+        correlationId: correlationId,
+        payload: encodeServiceEventAckPayload(ack)
+    )
+    if (!queue.registerCorrelation(correlationId)) { return false }
+    if (requireDispatchAllowed && !process.dispatchAllowed()) {
+        queue.cancelCorrelation(correlationId, status: "dispatch_fenced")
+        return false
+    }
+    try {
+        process.writeLine(encodeServiceFrame(request).trimAscii())
+    } catch (_: Exception) {
+        queue.cancelCorrelation(correlationId, status: "write_failed")
+        return false
+    }
+    let response = queue.readResponse(
+        correlationId,
+        record.registration.manifest.pluginId,
+        "emitCapabilityEvent",
+        "gitcode.event.accepted",
+        max(1, timeoutMs)
+    )
+    if (!response.ok || !servicePluginCompletionConfirmationPayloadValid(response.frame.payload, receipt)) { return false }
+    let removed = servicePluginWebhookReceiptStore().confirmAndRemove(
+        receipt.serviceId,
+        receipt.deliveryId,
+        receipt.eventId,
+        receipt.attemptToken
+    )
+    if (removed.status != "confirmed") { return false }
+    process.recordCompletionConfirmed()
+    match (servicePluginEventAckWrittenHookForTest) {
+        case Some(hook) => hook(frameId, "completion", "completed", process.dispatchSchedulerSnapshotForTest())
+        case None => ()
+    }
+    true
+}
+
+private func servicePluginFlushUnconfirmedReceipts(
+    record: ServicePluginRuntimeRecord,
+    process: ServicePluginStdioProcess,
+    queue: ServicePluginResponseQueue,
+    limit!: Int64 = 4
+): Int64 {
+    let listed = servicePluginWebhookReceiptStore().listUnconfirmed(limit: limit)
+    if (!listed.ok) { return 0 }
+    var confirmed: Int64 = 0
+    for (receipt in listed.receipts) {
+        if (receipt.serviceId != record.registration.manifest.pluginId) { continue }
+        if (servicePluginConfirmCompletedReceipt(record, process, queue, receipt, "outbox-${receipt.eventId}", timeoutMs: 500)) { confirmed++ }
+    }
+    confirmed
+}
+
+private func servicePluginFlushUnconfirmedForService(serviceId: String): Int64 {
+    var record = None<ServicePluginRuntimeRecord>
+    var process = None<ServicePluginStdioProcess>
+    var queue = None<ServicePluginResponseQueue>
+    synchronized(servicePluginProcessLock) {
+        match (servicePluginRegistry.get(serviceId)) { case Some(value) => record = Some(value) case None => () }
+        match (servicePluginActiveProcesses.get(serviceId)) { case Some(value) => process = Some(value) case None => () }
+        match (servicePluginResponseQueues.get(serviceId)) { case Some(value) => queue = Some(value) case None => () }
+    }
+    if (record.isNone() || process.isNone() || queue.isNone()) { return 0 }
+    servicePluginFlushUnconfirmedReceipts(record.getOrThrow(), process.getOrThrow(), queue.getOrThrow())
+}
+
+private func servicePluginCancelCompletionWaits(serviceId: String): Int64 {
+    var queue = None<ServicePluginResponseQueue>
+    synchronized(servicePluginProcessLock) {
+        match (servicePluginResponseQueues.get(serviceId.trimAscii())) {
+            case Some(value) => queue = Some(value)
+            case None => ()
+        }
+    }
+    match (queue) {
+        case Some(value) => value.cancelCorrelationsWithPrefix("event-confirm-")
+        case None => Int64(0)
+    }
+}
+
+public func flushServicePluginUnconfirmedReceiptsForTest(serviceId: String): Int64 {
+    servicePluginFlushUnconfirmedForService(serviceId.trimAscii())
+}
+
 private func servicePluginWriteFencedEventAcks(tasks: ArrayList<ServicePluginDispatchTask>, process: ServicePluginStdioProcess): Unit {
     servicePluginFlushDispatchDiagnostics(process)
     for (task in tasks) { let _ = servicePluginWriteEventAck(task, "admission", "cancelled", process) }
@@ -4569,14 +4844,35 @@ private func servicePluginLaunchEventDispatchTask(task: ServicePluginDispatchTas
                     claimToken: process.claimToken
                 )) {
                     servicePluginRecordRuntimeDispatchLocked(task.record, task.frame, dispatch)
-                    completed = dispatch.status != "dispatch_cancelled"
+                    completed = dispatch.status != "dispatch_cancelled" && dispatch.status != "dispatch_retry"
                 }
             }
             if (!completed) { let _ = servicePluginWriteEventAck(task, "admission", "retry", process) }
             } catch (_: Exception) {
                 let _ = servicePluginWriteEventAck(task, "admission", "retry", process)
             } finally {
-                if (completed) { let _ = servicePluginWriteEventAck(task, "completion", "completed", process) }
+                if (completed && task.ackable()) {
+                    let receipt = ServicePluginWebhookReceipt(
+                        task.record.registration.manifest.pluginId,
+                        task.deliveryId,
+                        task.eventId,
+                        task.attemptToken,
+                        "completed_unconfirmed"
+                    )
+                    var queue = None<ServicePluginResponseQueue>
+                    synchronized(servicePluginProcessLock) {
+                        if (servicePluginOwnerMatchesLocked(task.record.registration.manifest.pluginId, process.ownerId, process.generation, claimToken: process.claimToken)) {
+                            match (servicePluginResponseQueues.get(task.record.registration.manifest.pluginId)) {
+                                case Some(value) => queue = Some(value)
+                                case None => ()
+                            }
+                        }
+                    }
+                    match (queue) {
+                        case Some(value) => let _ = servicePluginConfirmCompletedReceipt(task.record, process, value, receipt, task.frame.frameId, requireDispatchAllowed: true)
+                        case None => ()
+                    }
+                }
                 let next = process.finishDispatchFuture(token)
                 servicePluginFlushDispatchDiagnostics(process)
                 match (next) { case Some(queued) => servicePluginLaunchEventDispatchTask(queued, process) case None => () }
@@ -4810,6 +5106,7 @@ public func stopServicePlugin(serviceId: String, reason!: String = "", timeoutMi
                     }
                 }
             }
+            let _ = servicePluginCancelCompletionWaits(sid)
             match (selectedProcess) { case Some(process) => servicePluginWriteFencedEventAcks(fencedTasks, process) case None => () }
             if (!stopClaimed) {
                 let status = synchronized(servicePluginProcessLock) { if (servicePluginHasCleanupPendingLocked(sid)) { "cleanup_pending" } else { "stopping" } }
@@ -4837,6 +5134,7 @@ public func stopServicePlugin(serviceId: String, reason!: String = "", timeoutMi
                         case None => None<ServicePluginStdioProcess>
                     }
                 }
+                let _ = servicePluginCancelCompletionWaits(sid)
                 match (selectedProcess) { case Some(process) => servicePluginWriteFencedEventAcks(process.fenceDispatch(), process) case None => () }
             }
             var dispatchStatus = "not_started"

@@ -1,6 +1,7 @@
 package metis.gateway.service_plugin
 
 import std.collection.{ArrayList, HashMap, HashSet}
+import std.sync.Mutex
 import stdx.encoding.json.{JsonBool, JsonInt, JsonObject, JsonString, JsonValue}
 
 private const SERVICE_PLUGIN_GITCODE_REVIEW_CONTRACT_VERSION: String = "gcm-metis-gitcode-review-v1"
@@ -199,9 +200,51 @@ private var servicePluginWebhookGeneratedReplyHandlerForTest: Option<(ServicePlu
     None<(ServicePluginAcceptedGitCodeEvent, ServicePluginDeliveryTarget) -> ServicePluginGeneratedReplyResult>
 private var servicePluginWebhookSubscribersProviderForTest: Option<(ServicePluginAcceptedGitCodeEvent) -> ArrayList<ServicePluginDeliveryTarget>> =
     None<(ServicePluginAcceptedGitCodeEvent) -> ArrayList<ServicePluginDeliveryTarget>>
-private let servicePluginGeneratedReplyKeys = HashSet<String>()
+private const SERVICE_PLUGIN_EVENT_DEDUPE_RECENT_LIMIT: Int64 = 4096
+
+private class ServicePluginBoundedEventDedupe {
+    private let lock = Mutex()
+    private let active = HashSet<String>()
+    private let completed = HashSet<String>()
+    private let completedOrder = ArrayList<String>()
+
+    func claim(key: String): String {
+        synchronized(this.lock) {
+            if (this.active.contains(key)) { return "active" }
+            if (this.completed.contains(key)) { return "completed" }
+            this.active.add(key)
+            "claimed"
+        }
+    }
+
+    func cancel(key: String): Unit { synchronized(this.lock) { this.active.remove(key) } }
+
+    func finish(key: String, remember: Bool): Unit {
+        synchronized(this.lock) {
+            this.active.remove(key)
+            if (!remember || this.completed.contains(key)) { return }
+            if (this.completedOrder.size >= SERVICE_PLUGIN_EVENT_DEDUPE_RECENT_LIMIT) {
+                let oldest = this.completedOrder.remove(at: 0)
+                this.completed.remove(oldest)
+            }
+            this.completed.add(key)
+            this.completedOrder.add(key)
+        }
+    }
+
+    func reset(): Unit {
+        synchronized(this.lock) { this.active.clear(); this.completed.clear(); this.completedOrder.clear() }
+    }
+
+    func sizesForTest(): (Int64, Int64) {
+        synchronized(this.lock) { (Int64(this.active.size), Int64(this.completed.size)) }
+    }
+}
+
+private let servicePluginGeneratedReplyDedupe = ServicePluginBoundedEventDedupe()
 private let servicePluginGeneratedReplyStatsByJob = HashMap<String, ServicePluginGeneratedReplyStats>()
-private let servicePluginWebhookDispatchKeys = HashSet<String>()
+private let servicePluginWebhookDispatchDedupe = ServicePluginBoundedEventDedupe()
+private let servicePluginDispatchStatsLock = Mutex()
 
 public class ServicePluginWebhookDispatchStat {
     public let eventId: String
@@ -293,16 +336,26 @@ public func setServicePluginWebhookSubscribersProviderForTest(
 }
 
 public func resetServicePluginGeneratedReplyStateForTest(): Unit {
-    servicePluginGeneratedReplyKeys.clear()
-    servicePluginGeneratedReplyStatsByJob.clear()
-    servicePluginWebhookDispatchKeys.clear()
-    servicePluginWebhookDispatchStats.clear()
+    servicePluginGeneratedReplyDedupe.reset()
+    servicePluginWebhookDispatchDedupe.reset()
+    synchronized(servicePluginDispatchStatsLock) {
+        servicePluginGeneratedReplyStatsByJob.clear()
+        servicePluginWebhookDispatchStats.clear()
+    }
+}
+
+public func servicePluginEventDedupeSizesForTest(): (Int64, Int64, Int64, Int64) {
+    let generated = servicePluginGeneratedReplyDedupe.sizesForTest()
+    let webhook = servicePluginWebhookDispatchDedupe.sizesForTest()
+    (generated[0], generated[1], webhook[0], webhook[1])
 }
 
 public func servicePluginWebhookDispatchStatsSnapshot(): ArrayList<ServicePluginWebhookDispatchStat> {
     let out = ArrayList<ServicePluginWebhookDispatchStat>()
-    for (stat in servicePluginWebhookDispatchStats) {
-        out.add(stat)
+    synchronized(servicePluginDispatchStatsLock) {
+        for (stat in servicePluginWebhookDispatchStats) {
+            out.add(stat)
+        }
     }
     out
 }
@@ -312,6 +365,7 @@ public func recordServicePluginWebhookDispatchStatForTest(stat: ServicePluginWeb
 }
 
 public func servicePluginWebhookDispatchStatsJson(): JsonObject {
+    let statsRows = servicePluginWebhookDispatchStatsSnapshot()
     let root = JsonObject()
     var noSubscribers: Int64 = 0
     var success: Int64 = 0
@@ -321,7 +375,7 @@ public func servicePluginWebhookDispatchStatsJson(): JsonObject {
     var latestEventIdHash = ""
     var latestTelegram: Int64 = 0
     var latestFeishu: Int64 = 0
-    for (stat in servicePluginWebhookDispatchStats) {
+    for (stat in statsRows) {
         if (stat.noSubscriberCount > 0 || stat.status == "no_subscribers") {
             noSubscribers++
         } else if (stat.status == "generated_reply_partially_delivered") {
@@ -337,7 +391,7 @@ public func servicePluginWebhookDispatchStatsJson(): JsonObject {
         latestTelegram = stat.telegram
         latestFeishu = stat.feishu
     }
-    root.put("total", JsonInt(servicePluginWebhookDispatchStats.size))
+    root.put("total", JsonInt(statsRows.size))
     root.put("noSubscribers", JsonInt(noSubscribers))
     root.put("success", JsonInt(success))
     root.put("partialFailed", JsonInt(partialFailed))
@@ -352,6 +406,7 @@ public func servicePluginWebhookDispatchStatsJson(): JsonObject {
 public func dispatchServicePluginEvent(
     frame: ServiceFrame,
     store!: ServicePluginPendingJobStore = servicePluginPendingJobStore(),
+    receiptStore!: Option<ServicePluginWebhookReceiptStore> = None<ServicePluginWebhookReceiptStore>,
     dispatchAllowed!: () -> Bool = { => true }
 ): ServicePluginEventDispatchResult {
     if (frame.frameType != "event") {
@@ -364,7 +419,7 @@ public func dispatchServicePluginEvent(
         return servicePluginDispatchResult(frame, false, "service_orphan_draining", diagnostic: "service plugin is draining after orphan_detected")
     }
     if (frame.capabilityId == "gitcode.event.accepted") {
-        return recordGitCodeAcceptedEventForFutureReply(frame, store: store, dispatchAllowed: dispatchAllowed)
+        return recordGitCodeAcceptedEventForFutureReply(frame, store: store, receiptStore: receiptStore, dispatchAllowed: dispatchAllowed)
     }
     if (frame.capabilityId == "gitcode.monitor.orphan_detected") {
         return recordGitCodeMonitorOrphanDetected(frame)
@@ -435,6 +490,7 @@ private func recordGitCodeMonitorOrphanDetected(frame: ServiceFrame): ServicePlu
 private func recordGitCodeAcceptedEventForFutureReply(
     frame: ServiceFrame,
     store!: ServicePluginPendingJobStore = servicePluginPendingJobStore(),
+    receiptStore!: Option<ServicePluginWebhookReceiptStore> = None<ServicePluginWebhookReceiptStore>,
     dispatchAllowed!: () -> Bool = { => true }
 ): ServicePluginEventDispatchResult {
     let root = match (servicePluginAcceptedEventPayloadRoot(frame.payload)) {
@@ -455,32 +511,49 @@ private func recordGitCodeAcceptedEventForFutureReply(
         case Some(row) => row
         case None =>
             if (event.jobId.startsWith("webhook-")) {
-                return dispatchGitCodeWebhookAcceptedEvent(frame, event, dispatchAllowed: dispatchAllowed)
+                return dispatchGitCodeWebhookAcceptedEvent(frame, event, receiptStore: receiptStore, dispatchAllowed: dispatchAllowed)
             }
             return servicePluginDispatchResult(frame, false, "orphan_event", diagnostic: "pending job not found for gitcode.event.accepted", eventId: event.eventId)
     }
     let key = "${event.jobId}:${event.eventId}"
-    if (servicePluginGeneratedReplyKeys.contains(key)) {
+    if (servicePluginGeneratedReplyDedupe.claim(key) != "claimed") {
         return servicePluginDispatchResult(frame, true, "duplicate_event", eventId: event.eventId)
     }
-    if (!dispatchAllowed()) { return servicePluginDispatchResult(frame, false, "dispatch_cancelled", eventId: event.eventId) }
-    servicePluginGeneratedReplyKeys.add(key)
+    if (!dispatchAllowed()) {
+        servicePluginGeneratedReplyDedupe.cancel(key)
+        return servicePluginDispatchResult(frame, false, "dispatch_cancelled", eventId: event.eventId)
+    }
     store.markRunning(event.jobId, stage: "event_accepted")
-    if (!dispatchAllowed()) { return servicePluginDispatchResult(frame, false, "dispatch_cancelled", eventId: event.eventId) }
-    let rawGenerated = match (servicePluginGeneratedReplyHandlerForTest) {
-        case Some(handler) => handler(job, event)
-        case None => ServicePluginGeneratedReplyResult(false, status: "handler_unconfigured", diagnostic: "generated reply handler is not configured", needsHumanReview: true)
+    if (!dispatchAllowed()) {
+        servicePluginGeneratedReplyDedupe.cancel(key)
+        return servicePluginDispatchResult(frame, false, "dispatch_cancelled", eventId: event.eventId)
+    }
+    let rawGenerated = try {
+        match (servicePluginGeneratedReplyHandlerForTest) {
+            case Some(handler) => handler(job, event)
+            case None => ServicePluginGeneratedReplyResult(false, status: "handler_unconfigured", diagnostic: "generated reply handler is not configured", needsHumanReview: true)
+        }
+    } catch (e: Exception) {
+        servicePluginGeneratedReplyDedupe.finish(key, true)
+        throw e
     }
     let generated = normalizeServicePluginGeneratedReplyResult(rawGenerated)
     let writeback = servicePluginApplyGeneratedReplyWriteback(event, generated, dispatchAllowed: dispatchAllowed)
-    if (writeback.status == "dispatch_cancelled") { return servicePluginDispatchResult(frame, false, "dispatch_cancelled", eventId: event.eventId) }
+    if (writeback.status == "dispatch_cancelled") {
+        servicePluginGeneratedReplyDedupe.finish(key, true)
+        return servicePluginDispatchResult(frame, false, "dispatch_cancelled", eventId: event.eventId)
+    }
     let text = renderServicePluginGeneratedReplyNotification(event, generated, writeback: writeback)
-    if (!dispatchAllowed()) { return servicePluginDispatchResult(frame, false, "dispatch_cancelled", eventId: event.eventId) }
+    if (!dispatchAllowed()) {
+        servicePluginGeneratedReplyDedupe.finish(key, true)
+        return servicePluginDispatchResult(frame, false, "dispatch_cancelled", eventId: event.eventId)
+    }
     let delivery = match (servicePluginEventDeliveryForTest) {
         case Some(sender) => sender(job.deliveryTarget, text)
         case None => ServicePluginEventDeliveryResult(false, "delivery_unconfigured", diagnostic: "service plugin event delivery is not configured")
     }
     servicePluginRecordGeneratedReplyStats(event.jobId, generated, delivery)
+    servicePluginGeneratedReplyDedupe.finish(key, true)
     if (!delivery.ok) {
         return servicePluginDispatchResult(frame, false, "generated_reply_delivery_failed", diagnostic: redactServicePayload(delivery.diagnostic).text, eventId: event.eventId, targetCount: 1, deliveryFailed: 1)
     }
@@ -493,17 +566,46 @@ private func recordGitCodeAcceptedEventForFutureReply(
 public func dispatchGitCodeWebhookAcceptedEvent(
     frame: ServiceFrame,
     event: ServicePluginAcceptedGitCodeEvent,
+    receiptStore!: Option<ServicePluginWebhookReceiptStore> = None<ServicePluginWebhookReceiptStore>,
     dispatchAllowed!: () -> Bool = { => true }
 ): ServicePluginEventDispatchResult {
+    let receiptIdentity = servicePluginWebhookReceiptIdentity(frame, event)
+    if (receiptIdentity[0] && !receiptIdentity[1]) {
+        return servicePluginDispatchResult(frame, false, "dispatch_retry", eventId: event.eventId)
+    }
+    if (!dispatchAllowed()) { return servicePluginDispatchResult(frame, false, "dispatch_cancelled", eventId: event.eventId) }
+    if (receiptIdentity[0]) {
+        let durableStore = match (receiptStore) { case Some(value) => value case None => servicePluginWebhookReceiptStore() }
+        let reserve = durableStore.reserve(frame.serviceId, receiptIdentity[2], event.eventId, attemptToken: receiptIdentity[3])
+        if (reserve.status == "completed_unconfirmed") {
+            let result = servicePluginDispatchResult(frame, true, "duplicate_event", eventId: event.eventId)
+            servicePluginRecordWebhookDispatchResult(result)
+            return result
+        }
+        if (reserve.status != "reserved") {
+            return servicePluginDispatchResult(frame, false, "dispatch_retry", eventId: event.eventId)
+        }
+    }
     let key = servicePluginAcceptedEventDedupeKey(event)
-    if (servicePluginWebhookDispatchKeys.contains(key)) {
-        let result = servicePluginDispatchResult(frame, true, "duplicate_event", eventId: event.eventId)
+    let claim = servicePluginWebhookDispatchDedupe.claim(key)
+    if (claim == "active" && receiptIdentity[0]) {
+        let abandoned = servicePluginAbandonWebhookReceipt(frame, event, receiptStore, receiptIdentity)
+        return servicePluginDispatchResult(frame, false, "dispatch_retry", diagnostic: abandoned.diagnostic, eventId: event.eventId)
+    }
+    if (claim != "claimed") {
+        let result = servicePluginFinalizeWebhookReceipt(frame, event, receiptStore, receiptIdentity,
+            servicePluginDispatchResult(frame, true, "duplicate_event", eventId: event.eventId))
         servicePluginRecordWebhookDispatchResult(result)
         return result
     }
-    let targets = resolveGitCodeWebhookSubscribers(event)
+    let targets = try {
+        resolveGitCodeWebhookSubscribers(event)
+    } catch (_: Exception) {
+        servicePluginWebhookDispatchDedupe.cancel(key)
+        return servicePluginAbandonWebhookReceipt(frame, event, receiptStore, receiptIdentity)
+    }
     if (targets.size == 0) {
-        let result = servicePluginDispatchResult(
+        let result = servicePluginFinalizeWebhookReceipt(frame, event, receiptStore, receiptIdentity, servicePluginDispatchResult(
             frame,
             true,
             "no_subscribers",
@@ -511,30 +613,47 @@ public func dispatchGitCodeWebhookAcceptedEvent(
             eventId: event.eventId,
             targetCount: 0,
             noSubscriberCount: 1
-        )
+        ))
+        servicePluginWebhookDispatchDedupe.finish(key, true)
         servicePluginRecordWebhookDispatchResult(result)
         return result
     }
-    if (!dispatchAllowed()) { return servicePluginDispatchResult(frame, false, "dispatch_cancelled", eventId: event.eventId) }
-    servicePluginWebhookDispatchKeys.add(key)
+    if (!dispatchAllowed()) {
+        servicePluginWebhookDispatchDedupe.cancel(key)
+        return servicePluginAbandonWebhookReceipt(frame, event, receiptStore, receiptIdentity)
+    }
     var success: Int64 = 0
     var failed: Int64 = 0
     var telegram: Int64 = 0
     var feishu: Int64 = 0
     let failures = ArrayList<String>()
     let primary = targets[0]
-    if (!dispatchAllowed()) { return servicePluginDispatchResult(frame, false, "dispatch_cancelled", eventId: event.eventId) }
-    let rawGenerated = match (servicePluginWebhookGeneratedReplyHandlerForTest) {
-        case Some(handler) => handler(event, primary)
-        case None => ServicePluginGeneratedReplyResult(false, status: "handler_unconfigured", diagnostic: "generated reply handler is not configured", needsHumanReview: true)
+    var sideEffectsStarted = false
+    if (!dispatchAllowed()) {
+        servicePluginWebhookDispatchDedupe.cancel(key)
+        return servicePluginAbandonWebhookReceipt(frame, event, receiptStore, receiptIdentity)
+    }
+    sideEffectsStarted = true
+    let rawGenerated = try {
+        match (servicePluginWebhookGeneratedReplyHandlerForTest) {
+            case Some(handler) => handler(event, primary)
+            case None => ServicePluginGeneratedReplyResult(false, status: "handler_unconfigured", diagnostic: "generated reply handler is not configured", needsHumanReview: true)
+        }
+    } catch (e: Exception) {
+        servicePluginWebhookDispatchDedupe.finish(key, true)
+        throw e
     }
     let generated = normalizeServicePluginGeneratedReplyResult(rawGenerated)
     let writeback = servicePluginApplyGeneratedReplyWriteback(event, generated, dispatchAllowed: dispatchAllowed)
-    if (writeback.status == "dispatch_cancelled") { return servicePluginDispatchResult(frame, false, "dispatch_cancelled", eventId: event.eventId) }
+    if (writeback.status == "dispatch_cancelled") {
+        servicePluginWebhookDispatchDedupe.finish(key, true)
+        return servicePluginDispatchResult(frame, false, if (sideEffectsStarted && receiptIdentity[0]) { "dispatch_retry" } else { "dispatch_cancelled" }, eventId: event.eventId)
+    }
     let text = renderServicePluginGeneratedReplyNotification(event, generated, writeback: writeback)
     for (target in targets) {
         if (!dispatchAllowed()) {
-            return servicePluginDispatchResult(frame, success > 0, "dispatch_cancelled", eventId: event.eventId, targetCount: targets.size, deliverySuccess: success, deliveryFailed: failed, failureDetails: failures.toArray(), telegram: telegram, feishu: feishu)
+            servicePluginWebhookDispatchDedupe.finish(key, true)
+            return servicePluginDispatchResult(frame, false, if (sideEffectsStarted && receiptIdentity[0]) { "dispatch_retry" } else { "dispatch_cancelled" }, eventId: event.eventId, targetCount: targets.size, deliverySuccess: success, deliveryFailed: failed, failureDetails: failures.toArray(), telegram: telegram, feishu: feishu)
         }
         let delivery = servicePluginDeliverWebhookTarget(target, text)
         if (delivery.ok) {
@@ -561,7 +680,7 @@ public func dispatchGitCodeWebhookAcceptedEvent(
     } else {
         "generated_reply_delivery_failed"
     }
-    let result = servicePluginDispatchResult(
+    let result = servicePluginFinalizeWebhookReceipt(frame, event, receiptStore, receiptIdentity, servicePluginDispatchResult(
         frame,
         success > 0 || status == "generated_reply_degraded_delivered",
         status,
@@ -573,9 +692,55 @@ public func dispatchGitCodeWebhookAcceptedEvent(
         failureDetails: failures.toArray(),
         telegram: telegram,
         feishu: feishu
-    )
+    ))
+    servicePluginWebhookDispatchDedupe.finish(key, true)
     servicePluginRecordWebhookDispatchResult(result)
     result
+}
+
+private func servicePluginWebhookReceiptIdentity(
+    frame: ServiceFrame,
+    event: ServicePluginAcceptedGitCodeEvent
+): (Bool, Bool, String, String) {
+    let root = try { JsonValue.fromStr(frame.payload).asObject() } catch (_: Exception) { return (false, false, "", "") }
+    let deliveryPresent = root.get("deliveryId").isSome()
+    let attemptPresent = root.get("attemptToken").isSome()
+    if (!deliveryPresent && !attemptPresent) { return (false, true, "", "") }
+    let deliveryId = try { root.get("deliveryId").getOrThrow().asString().getValue().trimAscii() } catch (_: Exception) { "" }
+    let attemptToken = try { root.get("attemptToken").getOrThrow().asString().getValue().trimAscii() } catch (_: Exception) { "" }
+    let valid = deliveryPresent && attemptPresent && !deliveryId.isEmpty() && deliveryId.size <= 4096 &&
+        !attemptToken.isEmpty() && attemptToken.size <= 4096 && attemptToken == frame.correlationId.trimAscii() &&
+        !event.eventId.isEmpty() && event.eventId.size <= 4096
+    (true, valid, deliveryId, attemptToken)
+}
+
+private func servicePluginFinalizeWebhookReceipt(
+    frame: ServiceFrame,
+    event: ServicePluginAcceptedGitCodeEvent,
+    receiptStore: Option<ServicePluginWebhookReceiptStore>,
+    identity: (Bool, Bool, String, String),
+    result: ServicePluginEventDispatchResult
+): ServicePluginEventDispatchResult {
+    if (!identity[0]) { return result }
+    let durableStore = match (receiptStore) { case Some(value) => value case None => servicePluginWebhookReceiptStore() }
+    if (durableStore.complete(frame.serviceId, identity[2], event.eventId, attemptToken: identity[3]).status != "completed_unconfirmed") {
+        return servicePluginDispatchResult(frame, false, "dispatch_retry", eventId: event.eventId)
+    }
+    result
+}
+
+private func servicePluginAbandonWebhookReceipt(
+    frame: ServiceFrame,
+    event: ServicePluginAcceptedGitCodeEvent,
+    receiptStore: Option<ServicePluginWebhookReceiptStore>,
+    identity: (Bool, Bool, String, String)
+): ServicePluginEventDispatchResult {
+    if (!identity[0]) { return servicePluginDispatchResult(frame, false, "dispatch_cancelled", eventId: event.eventId) }
+    let durableStore = match (receiptStore) { case Some(value) => value case None => servicePluginWebhookReceiptStore() }
+    if (durableStore.abandonReserved(frame.serviceId, identity[2], event.eventId).status != "abandoned") {
+        return servicePluginDispatchResult(frame, false, "dispatch_retry", eventId: event.eventId)
+    }
+    servicePluginDispatchResult(frame, false, "dispatch_cancelled", eventId: event.eventId)
 }
 
 public func resolveGitCodeWebhookSubscribers(event: ServicePluginAcceptedGitCodeEvent): ArrayList<ServicePluginDeliveryTarget> {
@@ -668,31 +833,35 @@ private func servicePluginGeneratedReplyNotificationFallback(event: ServicePlugi
 }
 
 private func servicePluginGeneratedReplySummaryForJob(jobId: String): String {
-    match (servicePluginGeneratedReplyStatsByJob.get(jobId.trimAscii())) {
-        case Some(stats) =>
-            if (stats.draftsGenerated == 0 && stats.draftsFailed == 0 && stats.notificationsSent == 0 && stats.notificationsFailed == 0) {
-                return ""
-            }
-            return "回复草稿状态:\n已生成草稿 ${stats.draftsGenerated} 条，生成失败 ${stats.draftsFailed} 条，通知成功 ${stats.notificationsSent} 条，通知失败 ${stats.notificationsFailed} 条。"
-        case None => ""
+    synchronized(servicePluginDispatchStatsLock) {
+        match (servicePluginGeneratedReplyStatsByJob.get(jobId.trimAscii())) {
+            case Some(stats) =>
+                if (stats.draftsGenerated == 0 && stats.draftsFailed == 0 && stats.notificationsSent == 0 && stats.notificationsFailed == 0) {
+                    return ""
+                }
+                return "回复草稿状态:\n已生成草稿 ${stats.draftsGenerated} 条，生成失败 ${stats.draftsFailed} 条，通知成功 ${stats.notificationsSent} 条，通知失败 ${stats.notificationsFailed} 条。"
+            case None => ""
+        }
     }
 }
 
 private func servicePluginRecordGeneratedReplyStats(jobId: String, result: ServicePluginGeneratedReplyResult, delivery: ServicePluginEventDeliveryResult): Unit {
     let key = jobId.trimAscii()
-    if (!servicePluginGeneratedReplyStatsByJob.contains(key)) {
-        servicePluginGeneratedReplyStatsByJob[key] = ServicePluginGeneratedReplyStats()
-    }
-    let stats = servicePluginGeneratedReplyStatsByJob[key]
-    if (result.ok) {
-        stats.draftsGenerated++
-    } else {
-        stats.draftsFailed++
-    }
-    if (delivery.ok) {
-        stats.notificationsSent++
-    } else {
-        stats.notificationsFailed++
+    synchronized(servicePluginDispatchStatsLock) {
+        if (!servicePluginGeneratedReplyStatsByJob.contains(key)) {
+            servicePluginGeneratedReplyStatsByJob[key] = ServicePluginGeneratedReplyStats()
+        }
+        let stats = servicePluginGeneratedReplyStatsByJob[key]
+        if (result.ok) {
+            stats.draftsGenerated++
+        } else {
+            stats.draftsFailed++
+        }
+        if (delivery.ok) {
+            stats.notificationsSent++
+        } else {
+            stats.notificationsFailed++
+        }
     }
 }
 
@@ -754,9 +923,11 @@ private func servicePluginRecordWebhookDispatchResult(result: ServicePluginEvent
 }
 
 private func servicePluginRecordWebhookDispatchStat(stat: ServicePluginWebhookDispatchStat): Unit {
-    servicePluginWebhookDispatchStats.add(stat)
-    while (servicePluginWebhookDispatchStats.size > 50) {
-        servicePluginWebhookDispatchStats.remove(at: 0)
+    synchronized(servicePluginDispatchStatsLock) {
+        servicePluginWebhookDispatchStats.add(stat)
+        while (servicePluginWebhookDispatchStats.size > 50) {
+            servicePluginWebhookDispatchStats.remove(at: 0)
+        }
     }
 }
 

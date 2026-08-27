@@ -1,8 +1,14 @@
 package metis.gateway.service_plugin
 
+import metis.core.config.MetisPaths
 import std.collection.{ArrayList, HashMap}
 import std.convert.Parsable
-import std.fs.{File, Path, exists}
+import std.fs.{Directory, File, FileInfo, Path, canonicalize, exists, remove, rename}
+import std.posix.chmod
+import std.sync.*
+import std.time.DateTime
+import stdx.crypto.digest.SHA256
+import stdx.encoding.json.{JsonInt, JsonObject, JsonString, JsonValue}
 
 public class ServicePluginPendingJob {
     public let jobId: String
@@ -206,6 +212,337 @@ public func servicePluginPendingJobStore(): ServicePluginPendingJobStore {
 
 public func resetServicePluginPendingJobStoreForTest(): Unit {
     defaultServicePluginPendingJobStore = ServicePluginPendingJobStore()
+}
+
+public class ServicePluginWebhookReceiptDecision {
+    public let status: String
+
+    public init(status: String) {
+        this.status = status.trimAscii()
+    }
+}
+
+private class ServicePluginWebhookReceiptIdentity {
+    let serviceId: String
+    let deliveryId: String
+    let eventId: String
+
+    init(serviceId: String, deliveryId: String, eventId: String) {
+        this.serviceId = serviceId
+        this.deliveryId = deliveryId
+        this.eventId = eventId
+    }
+}
+
+public class ServicePluginWebhookReceipt {
+    public let serviceId: String
+    public let deliveryId: String
+    public let eventId: String
+    public let attemptToken: String
+    public let state: String
+
+    public init(serviceId: String, deliveryId: String, eventId: String, attemptToken: String, state: String) {
+        this.serviceId = serviceId
+        this.deliveryId = deliveryId
+        this.eventId = eventId
+        this.attemptToken = attemptToken
+        this.state = state
+    }
+}
+
+public class ServicePluginWebhookReceiptListResult {
+    public let ok: Bool
+    public let status: String
+    public let receipts: ArrayList<ServicePluginWebhookReceipt>
+
+    public init(ok: Bool, status: String, receipts!: ArrayList<ServicePluginWebhookReceipt> = ArrayList<ServicePluginWebhookReceipt>()) {
+        this.ok = ok
+        this.status = status
+        this.receipts = receipts
+    }
+}
+
+private class ServicePluginWebhookReceiptRootGuard {
+    let lock = Mutex()
+    init() {}
+}
+
+private let servicePluginWebhookReceiptRootGuardRegistryLock = Mutex()
+private let servicePluginWebhookReceiptRootGuards = HashMap<String, ServicePluginWebhookReceiptRootGuard>()
+
+private func servicePluginWebhookReceiptRootGuard(path: Path): ServicePluginWebhookReceiptRootGuard {
+    // The Gateway serve lock permits one active process per METIS_HOME; this
+    // registry supplies the remaining same-process, multi-Store exclusion.
+    // The cross-process premise is covered by GatewayServeLockLogicTest.
+    let key = try {
+        if (!exists(path)) { Directory.create(path, recursive: true) }
+        canonicalize(path).toString()
+    } catch (_: Exception) {
+        path.normalize().toString()
+    }
+    synchronized(servicePluginWebhookReceiptRootGuardRegistryLock) {
+        match (servicePluginWebhookReceiptRootGuards.get(key)) {
+            case Some(value) => value
+            case None =>
+                let value = ServicePluginWebhookReceiptRootGuard()
+                servicePluginWebhookReceiptRootGuards[key] = value
+                value
+        }
+    }
+}
+
+private const SERVICE_PLUGIN_WEBHOOK_RECEIPT_LIMIT: Int64 = 4096
+
+public class ServicePluginWebhookReceiptStore {
+    private let root: Path
+    private let guard: ServicePluginWebhookReceiptRootGuard
+    private let persistHook: Option<(String) -> Bool>
+    private let maxReceipts: Int64
+
+    public init(
+        path: String,
+        persistHook!: Option<(String) -> Bool> = None<(String) -> Bool>,
+        maxReceipts!: Int64 = SERVICE_PLUGIN_WEBHOOK_RECEIPT_LIMIT
+    ) {
+        this.root = Path(path)
+        this.guard = servicePluginWebhookReceiptRootGuard(this.root)
+        this.persistHook = persistHook
+        this.maxReceipts = max(1, maxReceipts)
+    }
+
+    public func reserve(serviceId: String, deliveryId: String, eventId: String, attemptToken!: String = "legacy-test-attempt"): ServicePluginWebhookReceiptDecision {
+        if (!servicePluginWebhookReceiptIdentityValid(serviceId, deliveryId, eventId) || !servicePluginWebhookReceiptTokenValid(attemptToken)) {
+            return ServicePluginWebhookReceiptDecision("store_unavailable")
+        }
+        synchronized(this.guard.lock) {
+            let identity = ServicePluginWebhookReceiptIdentity(serviceId, deliveryId, eventId)
+            let current = this.readLocked(identity)
+            if (current.state == "completed_unconfirmed") {
+                if (current.attemptToken != attemptToken && !this.persistLocked(identity, "completed_unconfirmed", attemptToken)) {
+                    return ServicePluginWebhookReceiptDecision("store_unavailable")
+                }
+                return ServicePluginWebhookReceiptDecision("completed_unconfirmed")
+            }
+            if (current.state == "in_flight" || current.state == "store_unavailable") {
+                return ServicePluginWebhookReceiptDecision(current.state)
+            }
+            if (this.receiptCountLocked() >= this.maxReceipts) {
+                return ServicePluginWebhookReceiptDecision("store_full")
+            }
+            if (!this.persistLocked(identity, "in_flight", attemptToken)) { return ServicePluginWebhookReceiptDecision("store_unavailable") }
+            ServicePluginWebhookReceiptDecision("reserved")
+        }
+    }
+
+    public func complete(serviceId: String, deliveryId: String, eventId: String, attemptToken!: String = "legacy-test-attempt"): ServicePluginWebhookReceiptDecision {
+        if (!servicePluginWebhookReceiptIdentityValid(serviceId, deliveryId, eventId) || !servicePluginWebhookReceiptTokenValid(attemptToken)) {
+            return ServicePluginWebhookReceiptDecision("store_unavailable")
+        }
+        synchronized(this.guard.lock) {
+            let identity = ServicePluginWebhookReceiptIdentity(serviceId, deliveryId, eventId)
+            let current = this.readLocked(identity)
+            if (current.state == "completed_unconfirmed" && current.attemptToken == attemptToken) {
+                return ServicePluginWebhookReceiptDecision("completed_unconfirmed")
+            }
+            if (current.state != "in_flight" || current.attemptToken != attemptToken) {
+                return ServicePluginWebhookReceiptDecision("store_unavailable")
+            }
+            if (!this.persistLocked(identity, "completed_unconfirmed", attemptToken)) { return ServicePluginWebhookReceiptDecision("store_unavailable") }
+            ServicePluginWebhookReceiptDecision("completed_unconfirmed")
+        }
+    }
+
+    public func confirmAndRemove(serviceId: String, deliveryId: String, eventId: String, attemptToken: String): ServicePluginWebhookReceiptDecision {
+        if (!servicePluginWebhookReceiptIdentityValid(serviceId, deliveryId, eventId) || !servicePluginWebhookReceiptTokenValid(attemptToken)) {
+            return ServicePluginWebhookReceiptDecision("store_unavailable")
+        }
+        synchronized(this.guard.lock) {
+            let identity = ServicePluginWebhookReceiptIdentity(serviceId, deliveryId, eventId)
+            let current = this.readLocked(identity)
+            if (current.state != "completed_unconfirmed" || current.attemptToken != attemptToken) {
+                return ServicePluginWebhookReceiptDecision("confirmation_mismatch")
+            }
+            if (!this.persistPhaseAllowed("remove")) { return ServicePluginWebhookReceiptDecision("store_unavailable") }
+            try {
+                remove(this.receiptPath(identity))
+                ServicePluginWebhookReceiptDecision("confirmed")
+            } catch (_: Exception) { ServicePluginWebhookReceiptDecision("store_unavailable") }
+        }
+    }
+
+    public func abandonReserved(serviceId: String, deliveryId: String, eventId: String): ServicePluginWebhookReceiptDecision {
+        if (!servicePluginWebhookReceiptIdentityValid(serviceId, deliveryId, eventId)) {
+            return ServicePluginWebhookReceiptDecision("store_unavailable")
+        }
+        synchronized(this.guard.lock) {
+            let identity = ServicePluginWebhookReceiptIdentity(serviceId, deliveryId, eventId)
+            if (this.readLocked(identity).state != "in_flight") { return ServicePluginWebhookReceiptDecision("store_unavailable") }
+            if (!this.persistPhaseAllowed("remove")) { return ServicePluginWebhookReceiptDecision("store_unavailable") }
+            try {
+                remove(this.receiptPath(identity))
+                ServicePluginWebhookReceiptDecision("abandoned")
+            } catch (_: Exception) {
+                ServicePluginWebhookReceiptDecision("store_unavailable")
+            }
+        }
+    }
+
+    public func state(serviceId: String, deliveryId: String, eventId: String): String {
+        if (!servicePluginWebhookReceiptIdentityValid(serviceId, deliveryId, eventId)) { return "store_unavailable" }
+        synchronized(this.guard.lock) {
+            this.readLocked(ServicePluginWebhookReceiptIdentity(serviceId, deliveryId, eventId)).state
+        }
+    }
+
+    public func listUnconfirmed(limit!: Int64 = 8): ServicePluginWebhookReceiptListResult {
+        let out = ArrayList<ServicePluginWebhookReceipt>()
+        synchronized(this.guard.lock) {
+            if (!exists(this.root)) { return ServicePluginWebhookReceiptListResult(true, "ok", receipts: out) }
+            let unavailable = ArrayList<Bool>()
+            unavailable.add(false)
+            Directory.walk(this.root) { info: FileInfo =>
+                if (!info.isRegular() || !info.path.toString().endsWith(".json")) { return true }
+                let row = this.readPathLocked(info.path)
+                if (row.state == "store_unavailable") {
+                    unavailable[0] = true
+                    return false
+                }
+                if (row.state == "completed_unconfirmed") { out.add(row) }
+                out.size < max(1, limit)
+            }
+            if (unavailable[0]) { ServicePluginWebhookReceiptListResult(false, "store_unavailable") }
+            else { ServicePluginWebhookReceiptListResult(true, "ok", receipts: out) }
+        }
+    }
+
+    public func receiptCountForTest(): Int64 { synchronized(this.guard.lock) { this.receiptCountLocked() } }
+
+    public func receiptPathForTest(serviceId: String, deliveryId: String, eventId: String): Path {
+        this.receiptPath(ServicePluginWebhookReceiptIdentity(serviceId, deliveryId, eventId))
+    }
+
+    private func readLocked(identity: ServicePluginWebhookReceiptIdentity): ServicePluginWebhookReceipt {
+        let path = this.receiptPath(identity)
+        if (!exists(path)) { return ServicePluginWebhookReceipt(identity.serviceId, identity.deliveryId, identity.eventId, "", "missing") }
+        let row = this.readPathLocked(path)
+        if (row.serviceId != identity.serviceId || row.deliveryId != identity.deliveryId || row.eventId != identity.eventId) {
+            return ServicePluginWebhookReceipt(identity.serviceId, identity.deliveryId, identity.eventId, "", "store_unavailable")
+        }
+        row
+    }
+
+    private func readPathLocked(path: Path): ServicePluginWebhookReceipt {
+        let unavailable = ServicePluginWebhookReceipt("", "", "", "", "store_unavailable")
+        let raw = try { String.fromUtf8(File.readFrom(path)) } catch (_: Exception) { return unavailable }
+        try {
+            let json = JsonValue.fromStr(raw).asObject()
+            let version = json.get("version").getOrThrow().asInt().getValue()
+            let serviceId = json.get("serviceId").getOrThrow().asString().getValue().trimAscii()
+            let deliveryId = json.get("deliveryId").getOrThrow().asString().getValue().trimAscii()
+            let eventId = json.get("eventId").getOrThrow().asString().getValue().trimAscii()
+            let attemptToken = json.get("attemptToken").getOrThrow().asString().getValue().trimAscii()
+            let state = json.get("state").getOrThrow().asString().getValue().trimAscii()
+            if (version != 2 || !servicePluginWebhookReceiptIdentityValid(serviceId, deliveryId, eventId) ||
+                !servicePluginWebhookReceiptTokenValid(attemptToken) || !(state == "in_flight" || state == "completed_unconfirmed")) {
+                return unavailable
+            }
+            ServicePluginWebhookReceipt(serviceId, deliveryId, eventId, attemptToken, state)
+        } catch (_: Exception) {
+            unavailable
+        }
+    }
+
+    private func persistLocked(identity: ServicePluginWebhookReceiptIdentity, state: String, attemptToken: String): Bool {
+        let target = this.receiptPath(identity)
+        let tmp = this.root.join(".${target.toString().hashCode()}.${DateTime.now().toUnixTimeStamp().toNanoseconds()}.tmp")
+        try {
+            if (!exists(this.root)) { Directory.create(this.root, recursive: true) }
+            chmod(this.root.toString(), UInt32(0o700))
+            if (!this.persistPhaseAllowed("temp")) { throw Exception("receipt temp rejected") }
+            let root = JsonObject()
+            root.put("version", JsonInt(2))
+            root.put("serviceId", JsonString(identity.serviceId))
+            root.put("deliveryId", JsonString(identity.deliveryId))
+            root.put("eventId", JsonString(identity.eventId))
+            root.put("attemptToken", JsonString(attemptToken))
+            root.put("state", JsonString(state))
+            if (!this.persistPhaseAllowed("write")) { throw Exception("receipt write rejected") }
+            File.writeTo(tmp, root.toJsonString().toArray())
+            chmod(tmp.toString(), UInt32(0o600))
+            if (!this.persistPhaseAllowed("rename")) { throw Exception("receipt rename rejected") }
+            rename(tmp, to: target, overwrite: true)
+            chmod(target.toString(), UInt32(0o600))
+            true
+        } catch (_: Exception) {
+            try { if (exists(tmp)) { remove(tmp) } } catch (_: Exception) { () }
+            false
+        }
+    }
+
+    private func persistPhaseAllowed(phase: String): Bool {
+        match (this.persistHook) {
+            case Some(hook) => hook(phase)
+            case None => true
+        }
+    }
+
+    private func receiptCountLocked(): Int64 {
+        if (!exists(this.root)) { return 0 }
+        let count = ArrayList<Int64>()
+        count.add(0)
+        Directory.walk(this.root) { info: FileInfo =>
+            if (info.isRegular() && info.path.toString().endsWith(".json")) { count[0]++ }
+            true
+        }
+        count[0]
+    }
+
+    private func receiptPath(identity: ServicePluginWebhookReceiptIdentity): Path {
+        this.root.join("${servicePluginWebhookReceiptHash(identity)}.json")
+    }
+}
+
+private let servicePluginWebhookReceiptStoreLock = Mutex()
+private var defaultServicePluginWebhookReceiptStore: Option<ServicePluginWebhookReceiptStore> = None<ServicePluginWebhookReceiptStore>
+private var defaultServicePluginWebhookReceiptStorePath: String = ""
+
+public func servicePluginWebhookReceiptStore(): ServicePluginWebhookReceiptStore {
+    let path = MetisPaths.homeRoot().join("service-plugin").join("webhook-receipts").toString()
+    synchronized(servicePluginWebhookReceiptStoreLock) {
+        if (path != defaultServicePluginWebhookReceiptStorePath || defaultServicePluginWebhookReceiptStore.isNone()) {
+            defaultServicePluginWebhookReceiptStore = Some(ServicePluginWebhookReceiptStore(path))
+            defaultServicePluginWebhookReceiptStorePath = path
+        }
+        defaultServicePluginWebhookReceiptStore.getOrThrow()
+    }
+}
+
+public func resetServicePluginWebhookReceiptStoreForTest(): Unit {
+    synchronized(servicePluginWebhookReceiptStoreLock) {
+        defaultServicePluginWebhookReceiptStore = None<ServicePluginWebhookReceiptStore>
+        defaultServicePluginWebhookReceiptStorePath = ""
+    }
+}
+
+private func servicePluginWebhookReceiptIdentityValid(serviceId: String, deliveryId: String, eventId: String): Bool {
+    !serviceId.isEmpty() && serviceId.size <= 4096 && !deliveryId.isEmpty() && deliveryId.size <= 4096 &&
+        !eventId.isEmpty() && eventId.size <= 4096
+}
+
+private func servicePluginWebhookReceiptTokenValid(attemptToken: String): Bool {
+    !attemptToken.isEmpty() && attemptToken.size <= 4096
+}
+
+private func servicePluginWebhookReceiptHash(identity: ServicePluginWebhookReceiptIdentity): String {
+    let sha = SHA256()
+    sha.write("${identity.serviceId.size}:${identity.serviceId}${identity.deliveryId.size}:${identity.deliveryId}${identity.eventId.size}:${identity.eventId}".toArray())
+    let out = StringBuilder()
+    let digits = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "a", "b", "c", "d", "e", "f"]
+    for (byte in sha.finish()) {
+        out.append(digits[Int64(byte >> 4)])
+        out.append(digits[Int64(byte & 0x0f)])
+    }
+    out.toString()
 }
 
 private func servicePluginJobTerminal(status: String): Bool {
