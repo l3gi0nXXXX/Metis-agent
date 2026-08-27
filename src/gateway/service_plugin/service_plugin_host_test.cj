@@ -10,6 +10,7 @@ import std.process.*
 import std.sync.*
 import std.time.*
 import std.unittest.testmacro.*
+import stdx.encoding.json.{JsonObject, JsonString}
 
 private class ServicePluginTestGate {
     private let lock = Mutex()
@@ -2924,6 +2925,229 @@ public class ServicePluginHostTest {
                 setServicePluginEventDeliveryForTest(None)
                 match (oldMarker) { case Some(value) => setVariable("METIS_STDIO_FIXTURE_MARKER_PATH", value) case None => setVariable("METIS_STDIO_FIXTURE_MARKER_PATH", "") }
                 match (oldWriteback) { case Some(value) => setVariable("METIS_STDIO_FIXTURE_WRITEBACK_MARKER_PATH", value) case None => setVariable("METIS_STDIO_FIXTURE_WRITEBACK_MARKER_PATH", "") }
+            }
+        })
+    }
+
+    @TestCase
+    public func s3ObservabilityU1SnapshotTracksFiveAcceptedEventsAndRedactsDiagnostics(): Unit {
+        withIsolatedServicePluginHostTestHome("s3-observability-u1", { home: Path =>
+            let eventIds = this.gitCodeBurstEventIds("s3-observability-u1-中文🙂", 5)
+            let ackMarker = home.join("acks.marker")
+            let oldMarker = getVariable("METIS_STDIO_FIXTURE_MARKER_PATH")
+            let probe = ServicePluginBurstProbe()
+            setVariable("METIS_STDIO_FIXTURE_MARKER_PATH", ackMarker.toString())
+            try {
+                this.registerGitCodeStdioScript(this.gitCodeAckBurstScript(eventIds))
+                setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent =>
+                    let rows = ArrayList<ServicePluginDeliveryTarget>()
+                    rows.add(ServicePluginDeliveryTarget("telegram", "s3", "peer"))
+                    rows
+                }))
+                setServicePluginWebhookGeneratedReplyHandlerForTest(Some({ event: ServicePluginAcceptedGitCodeEvent, _target: ServicePluginDeliveryTarget =>
+                    probe.enterAndWait(event.eventId)
+                    ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: event.eventId)
+                }))
+                setServicePluginEventDeliveryForTest(Some({ _target: ServicePluginDeliveryTarget, _text: String =>
+                    ServicePluginEventDeliveryResult(true, "sent")
+                }))
+
+                @Expect(ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000).ok, true)
+                let scheduler = this.waitForDispatchScheduler("gitcode-monitor", { row: ServicePluginDispatchSchedulerSnapshotForTest =>
+                    row.active == 2 && row.queued == 3 && row.accepted == 5 && row.futures == 2
+                }).getOrThrow()
+                @Expect(this.waitForAckMarkerCount(ackMarker, "admission", "accepted", 5), true)
+                let snapshot = getServicePluginSnapshot("gitcode-monitor").getOrThrow()
+                @Expect(snapshot.dispatch.active, 2)
+                @Expect(snapshot.dispatch.queued, 3)
+                @Expect(snapshot.dispatch.highWater, 3)
+                @Expect(snapshot.dispatch.queueFull, 0)
+                @Expect(snapshot.dispatch.admissionAccepted, 5)
+                @Expect(snapshot.dispatch.admissionRetried, 0)
+                @Expect(snapshot.dispatch.completionAck, 0)
+                @Expect(snapshot.dispatch.fenced, false)
+                @Expect(snapshot.retainedEventFrames, 5)
+                @Expect(snapshot.eventFrameEvictions, 0)
+                @Expect(scheduler.active, snapshot.dispatch.active)
+                @Expect(scheduler.queued, snapshot.dispatch.queued)
+
+                let diagnostic = renderServicePluginDiagnostics(ServicePluginSnapshot(
+                    snapshot.serviceId,
+                    snapshot.displayName,
+                    snapshot.status,
+                    lastError: "token=s3-fake-secret /tmp/s3-fake-path 中文🙂",
+                    dispatch: snapshot.dispatch,
+                    retainedEventFrames: snapshot.retainedEventFrames,
+                    eventFrameEvictions: snapshot.eventFrameEvictions
+                ))
+                @Expect(diagnostic.contains("s3-fake-secret"), false)
+                @Expect(diagnostic.contains("/tmp/s3-fake-path"), false)
+                @Expect(diagnostic.contains("dispatchActive=2"), true)
+                @Expect(diagnostic.contains("dispatchQueued=3"), true)
+            } finally {
+                probe.release(16)
+                setServicePluginWebhookSubscribersProviderForTest(None<(ServicePluginAcceptedGitCodeEvent) -> ArrayList<ServicePluginDeliveryTarget>>)
+                setServicePluginWebhookGeneratedReplyHandlerForTest(None<(ServicePluginAcceptedGitCodeEvent, ServicePluginDeliveryTarget) -> ServicePluginGeneratedReplyResult>)
+                setServicePluginEventDeliveryForTest(None)
+                match (oldMarker) { case Some(value) => setVariable("METIS_STDIO_FIXTURE_MARKER_PATH", value) case None => setVariable("METIS_STDIO_FIXTURE_MARKER_PATH", "") }
+            }
+        })
+    }
+
+    @TestCase
+    public func s3ObservabilityB1RetainsLatestOneHundredTwentyEightUnicodeFrames(): Unit {
+        let _ = registerSample()
+        var text = "中文🙂"
+        let baseRoot = JsonObject()
+        baseRoot.put("text", JsonString(text))
+        let basePayload = baseRoot.toJsonString()
+        for (_ in 0..(ServiceFrameLimits().maxPayloadBytes - basePayload.size)) {
+            text += "x"
+        }
+        let payloadRoot = JsonObject()
+        payloadRoot.put("text", JsonString(text))
+        let payload = payloadRoot.toJsonString()
+        @Expect(payload.size, ServiceFrameLimits().maxPayloadBytes)
+        let overLimitRoot = JsonObject()
+        overLimitRoot.put("text", JsonString(text + "x"))
+        @Expect(overLimitRoot.toJsonString().size > ServiceFrameLimits().maxPayloadBytes, true)
+        for (index in 1..=129) {
+            enqueueServiceEventFrameForTest(ServiceFrame(
+                "event",
+                "s3-retained-${index}",
+                "sample-service",
+                capabilityId: "sample.event.accepted",
+                payload: payload
+            ))
+        }
+        let full = getServicePluginSnapshot("sample-service").getOrThrow()
+        @Expect(full.retainedEventFrames, 128)
+        @Expect(full.eventFrameEvictions, 1)
+        for (index in 2..=129) {
+            let read = readServiceEventFrame("sample-service")
+            @Expect(read.ok, true)
+            @Expect(read.frame.frameId, "s3-retained-${index}")
+            @Expect(read.frame.payload, payload)
+        }
+        @Expect(readServiceEventFrame("sample-service").status, "timeout")
+        let drained = getServicePluginSnapshot("sample-service").getOrThrow()
+        @Expect(drained.retainedEventFrames, 0)
+        @Expect(drained.eventFrameEvictions, 1)
+    }
+
+    @TestCase
+    public func s3ObservabilityP1QueueFullRetryDrainEmitsOnlyStateTransitions(): Unit {
+        withIsolatedServicePluginHostTestHome("s3-observability-p1", { home: Path =>
+            let eventIds = this.gitCodeBurstEventIds("s3-observability-p1-中文🙂", 140)
+            let ackMarker = home.join("acks.marker")
+            let oldMarker = getVariable("METIS_STDIO_FIXTURE_MARKER_PATH")
+            let probe = ServicePluginBurstProbe()
+            let diagnosticStates = ServicePluginEventLedger()
+            setVariable("METIS_STDIO_FIXTURE_MARKER_PATH", ackMarker.toString())
+            try {
+                this.registerGitCodeStdioScript(this.gitCodeAckBurstScript(eventIds, retryLastOnQueueFull: true))
+                setServicePluginDispatchDiagnosticHookForTest(Some({ serviceId: String, state: String, _snapshot: ServicePluginDispatchSnapshot =>
+                    if (serviceId == "gitcode-monitor") { diagnosticStates.record(state) }
+                }))
+                setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent =>
+                    let rows = ArrayList<ServicePluginDeliveryTarget>()
+                    rows.add(ServicePluginDeliveryTarget("telegram", "s3", "peer"))
+                    rows
+                }))
+                setServicePluginWebhookGeneratedReplyHandlerForTest(Some({ event: ServicePluginAcceptedGitCodeEvent, _target: ServicePluginDeliveryTarget =>
+                    probe.enterAndWait(event.eventId)
+                    ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: event.eventId)
+                }))
+                setServicePluginEventDeliveryForTest(Some({ _target: ServicePluginDeliveryTarget, _text: String =>
+                    ServicePluginEventDeliveryResult(true, "sent")
+                }))
+
+                @Expect(ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000).ok, true)
+                let saturated = this.waitForDispatchScheduler("gitcode-monitor", { row: ServicePluginDispatchSchedulerSnapshotForTest =>
+                    row.active == 2 && row.queued == 128 && row.queueFull >= 10
+                }, timeoutMillis: 5000).getOrThrow()
+                @Expect(saturated.queueHighWatermark, 128)
+                @Expect(this.waitForAckMarkerCount(ackMarker, "admission", "queue_full", 10), true)
+                let queueFullAcks = this.ackMarkerCounts(ackMarker, "admission", "queue_full")
+                @Expect(queueFullAcks[0], 10)
+                @Expect(queueFullAcks[1], 0)
+                let full = getServicePluginSnapshot("gitcode-monitor").getOrThrow()
+                @Expect(full.dispatch.highWater, 128)
+                @Expect(full.dispatch.queueFull, 10)
+                @Expect(full.dispatch.admissionAccepted, 130)
+                @Expect(full.dispatch.admissionRetried, 10)
+
+                probe.release(256)
+                @Expect(this.waitForDispatchScheduler("gitcode-monitor", { row: ServicePluginDispatchSchedulerSnapshotForTest => row.settled }, timeoutMillis: 15000).isSome(), true)
+                let drained = getServicePluginSnapshot("gitcode-monitor").getOrThrow()
+                @Expect(drained.dispatch.active, 0)
+                @Expect(drained.dispatch.queued, 0)
+                @Expect(drained.dispatch.highWater, 128)
+                @Expect(drained.dispatch.queueFull, 10)
+                @Expect(drained.dispatch.admissionAccepted, 131)
+                @Expect(drained.dispatch.admissionRetried, 10)
+                @Expect(drained.dispatch.completionAck, 131)
+                @Expect(diagnosticStates.countFor("high_water_entered"), 1)
+                @Expect(diagnosticStates.countFor("high_water_exited"), 1)
+                @Expect(diagnosticStates.countFor("queue_full_entered"), 1)
+                @Expect(diagnosticStates.countFor("queue_full_exited"), 1)
+                @Expect(diagnosticStates.totalCount(), 4)
+            } finally {
+                probe.release(256)
+                setServicePluginDispatchDiagnosticHookForTest(None<(String, String, ServicePluginDispatchSnapshot) -> Unit>)
+                setServicePluginWebhookSubscribersProviderForTest(None<(ServicePluginAcceptedGitCodeEvent) -> ArrayList<ServicePluginDeliveryTarget>>)
+                setServicePluginWebhookGeneratedReplyHandlerForTest(None<(ServicePluginAcceptedGitCodeEvent, ServicePluginDeliveryTarget) -> ServicePluginGeneratedReplyResult>)
+                setServicePluginEventDeliveryForTest(None)
+                match (oldMarker) { case Some(value) => setVariable("METIS_STDIO_FIXTURE_MARKER_PATH", value) case None => setVariable("METIS_STDIO_FIXTURE_MARKER_PATH", "") }
+            }
+        })
+    }
+
+    @TestCase
+    public func s3ObservabilityN1InvalidUtf8AndSensitivePayloadStayIsolated(): Unit {
+        withIsolatedServicePluginHostTestHome("s3-observability-n1", { _home: Path =>
+            this.registerBrokerServiceFixture("invalid-utf8")
+            var payload = "token=s3-fake-secret /tmp/s3-fake-path 中文🙂"
+            while (payload.size < ServiceFrameLimits().maxPayloadBytes) { payload += "x" }
+            enqueueServiceEventFrameForTest(ServiceFrame(
+                "event",
+                "s3-sensitive-frame",
+                "stdio-service",
+                capabilityId: "stdio.event.accepted",
+                payload: payload
+            ))
+            let diagnostic = renderServicePluginDiagnostics(getServicePluginSnapshot("stdio-service").getOrThrow())
+            @Expect(diagnostic.contains("s3-fake-secret"), false)
+            @Expect(diagnostic.contains("/tmp/s3-fake-path"), false)
+            @Expect(diagnostic.contains(payload), false)
+
+            let sentinelId = "s3-observability-sentinel-${DateTime.now().toUnixTimeStamp().toNanoseconds()}"
+            let sentinel = managedStdioBroker().startOwner(ManagedStdioOwnerSpec(
+                sentinelId,
+                "node",
+                args: ["-e", "process.stdout.write('s3-healthy-owner\\n')"],
+                stdinMode: "closed",
+                outputMode: "line",
+                deadlineMs: 2000
+            ))
+            @Expect(sentinel.ok, true)
+            try {
+                let invalid = invokeRegisteredCapability(CapabilityInvokeRequest("stdio.monitor.status", payload: "{}"))
+                @Expect(invalid.ok, false)
+                @Expect(invalid.status, "invalid_response_encoding")
+                var sentinelOutput = ""
+                var sentinelDone = false
+                while (!sentinelDone) {
+                    match (managedStdioBroker().readOwnerLine(sentinelId, timeoutMs: 2000)) {
+                        case Some(event) =>
+                            if (event.eventType == "owner.stdout") { sentinelOutput = event.text }
+                            if (event.eventType == "owner.exit" || event.eventType == "owner.error" || event.eventType == "owner.timeout") { sentinelDone = true }
+                        case None => sentinelDone = true
+                    }
+                }
+                @Expect(sentinelOutput, "s3-healthy-owner")
+            } finally {
+                let _ = managedStdioBroker().stopOwner(sentinelId)
             }
         })
     }
