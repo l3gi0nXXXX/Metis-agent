@@ -867,6 +867,71 @@ private class GatewayS5StrictLedger {
     func valid(): Bool { this.invalidRows == 0 && this.unknownRows == 0 }
 }
 
+private func gatewayS5DropMarkerProof(path: Path, expectedStatus: String, expectedDeliveryId: String): (Bool, Int64, String, Int64, String, String) {
+    if (!exists(path)) { return (false, 0, "", 0, "", "") }
+    try {
+        let root = JsonValue.fromStr(String.fromUtf8(File.readFrom(path))).asObject()
+        let sequence = root.get("sequence").getOrThrow().asInt().getValue()
+        let status = root.get("status").getOrThrow().asString().getValue()
+        let generation = root.get("generation").getOrThrow().asInt().getValue()
+        let ownerId = root.get("ownerId").getOrThrow().asString().getValue()
+        let requestId = root.get("requestId").getOrThrow().asString().getValue()
+        let deliveryId = root.get("deliveryId").getOrThrow().asString().getValue()
+        let attemptToken = root.get("attemptToken").getOrThrow().asString().getValue()
+        (
+            sequence > 0 && status == expectedStatus && generation > 0 && !ownerId.isEmpty() &&
+                !requestId.isEmpty() && deliveryId == expectedDeliveryId && !attemptToken.isEmpty(),
+            sequence,
+            attemptToken,
+            generation,
+            ownerId,
+            requestId
+        )
+    } catch (_: Exception) {
+        (false, 0, "", 0, "", "")
+    }
+}
+
+private func gatewayS5QueueDeliveryProof(path: Path, expectedDeliveryId: String): (Bool, String, String, String) {
+    if (!exists(path)) { return (false, "", "", "") }
+    try {
+        let root = JsonValue.fromStr(String.fromUtf8(File.readFrom(path))).asObject()
+        let deliveryId = root.get("deliveryId").getOrThrow().asString().getValue()
+        let status = root.get("status").getOrThrow().asString().getValue()
+        let admissionState = root.get("admissionState").getOrThrow().asString().getValue()
+        let admissionToken = root.get("admissionToken").getOrThrow().asString().getValue()
+        (deliveryId == expectedDeliveryId && !admissionToken.isEmpty(), status, admissionState, admissionToken)
+    } catch (_: Exception) {
+        (false, "", "", "")
+    }
+}
+
+private func gatewayS5ReceiptProof(rootPath: Path, expectedDeliveryId: String): (Bool, Int64, String, String, String) {
+    if (!exists(rootPath)) { return (false, 0, "", "", "") }
+    var count: Int64 = 0
+    var valid = false
+    var eventId = ""
+    var attemptToken = ""
+    var state = ""
+    try {
+        for (entry in Directory.readFrom(rootPath)) {
+            if (!entry.isRegular() || !entry.name.endsWith(".json")) { continue }
+            count++
+            let receipt = JsonValue.fromStr(String.fromUtf8(File.readFrom(entry.path))).asObject()
+            let serviceId = receipt.get("serviceId").getOrThrow().asString().getValue()
+            let deliveryId = receipt.get("deliveryId").getOrThrow().asString().getValue()
+            eventId = receipt.get("eventId").getOrThrow().asString().getValue()
+            attemptToken = receipt.get("attemptToken").getOrThrow().asString().getValue()
+            state = receipt.get("state").getOrThrow().asString().getValue()
+            valid = serviceId == "gitcode-monitor" && deliveryId == expectedDeliveryId &&
+                !eventId.isEmpty() && !attemptToken.isEmpty() && !state.isEmpty()
+        }
+    } catch (_: Exception) {
+        return (false, count, "", "", "")
+    }
+    (valid && count == 1, count, eventId, attemptToken, state)
+}
+
 private func gatewayS5FindLease(home: Path): Path {
     let dir = home.join("service-plugin").join("runtime").join("gitcode-monitor")
     if (!exists(dir)) { return Path("") }
@@ -2240,6 +2305,466 @@ public class GatewayServeLockLogicTest {
     }
 
     @TestCase
+    public func s5N1FormalDroppedCompletionRecoversSameDeliveryWithoutRepeatingEffects(): Unit {
+        synchronized(MetisProcessEnvironmentLock) {
+            let home = Path("/tmp/metis-s5-n1-dropped-completion-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
+            let gatewayPort = gatewayServeStopTemporaryPort()
+            let webhookPort = gatewayServeStopTemporaryPort()
+            @Expect(gatewayPort > 0 && webhookPort > 0 && gatewayPort != webhookPort, true)
+            let oldHome = getVariable("METIS_HOME")
+            let oldRoot = getVariable("METIS_CJPM_ROOT")
+            let proxyEnvironmentKeys = [
+                "METIS_STDIO_BROKER_NODE_COMMAND", "METIS_S5_BROKER_PROXY_READY",
+                "METIS_S5_BROKER_PROXY_FAIL", "METIS_S5_BROKER_PROXY_WRITER_CLOSED",
+                "METIS_S5_BROKER_PROXY_CLEANUP", "METIS_S5_BROKER_PROXY_DROP_DELIVERY_ID",
+                "METIS_S5_BROKER_PROXY_ADMISSION_SEEN", "METIS_S5_BROKER_PROXY_COMPLETION_DROPPED"
+            ]
+            let oldProxyEnvironment = ArrayList<(String, Option<String>)>()
+            for (key in proxyEnvironmentKeys) { oldProxyEnvironment.add((key, getVariable(key))) }
+            let apiKeyAliases = cliProviderApiKeyEnvAliases("openai")
+            let baseUrlAliases = cliProviderBaseUrlEnvAliases("openai")
+            let oldProviderEnvironment = ArrayList<(String, Option<String>)>()
+            for (key in apiKeyAliases) { oldProviderEnvironment.add((key, getVariable(key))) }
+            for (key in baseUrlAliases) { oldProviderEnvironment.add((key, getVariable(key))) }
+            let oldPrimaryModel = CliConfig._model
+            let oldFallbackModels = CliConfig.fallbackModels
+            let oldImageModel = CliConfig._imageModel
+            let oldImageFallbackModels = CliConfig.imageFallbackModels
+            let oldPdfModel = CliConfig._pdfModel
+            let oldPdfFallbackModels = CliConfig.pdfFallbackModels
+            let oldPdfMaxBytesMb = CliConfig.pdfMaxBytesMb
+            let oldPdfMaxPages = CliConfig.pdfMaxPages
+            let oldFastModel = CliConfig._fastModel
+            let oldTemperature = CliConfig.temperature
+            let oldDefaultModelInputLimit = CliConfig.defaultModelInputLimit
+            let oldDefaultModelOutputLimit = CliConfig.defaultModelOutputLimit
+            let oldWorkspaceDirOverride = CliConfig.workspaceDirOverride
+            let brokerScript = Path(managedStdioResolveBrokerScriptPath())
+            let project = brokerScript.parent.parent
+            let metisBinary = project.join("target").join("release").join("bin").join("metis")
+            let dependencyScript = brokerScript.parent.join("metis-s5-loopback-dependencies.mjs")
+            let proxySource = brokerScript.parent.join("metis-s5-broker-writer-failure-proxy.mjs")
+            let gcmSource = gatewayS5GcmBinary()
+            let gcmBinary = home.join("gitcodemonitor")
+            let proxy = home.join("metis-s5-broker-writer-failure-proxy.mjs")
+            let proxyReady = home.join("broker-proxy.ready.json")
+            let admissionSeen = home.join("admission-seen.json")
+            let completionDropped = home.join("completion-dropped.json")
+            let deliveryId = "s5-p1-9101-end"
+            let iid: Int64 = 9101
+            let expectedDeliveries = HashSet<String>()
+            expectedDeliveries.add(deliveryId)
+            let expectedWritebacks = HashMap<String, String>()
+            expectedWritebacks["${iid}"] = deliveryId
+            var dependencies = None<GatewayS5DependencyProcess>
+            var feishuDependencies = None<GatewayS5DependencyProcess>
+            var oldGatewayProcess = None<SubProcess>
+            var replacementGatewayProcess = None<SubProcess>
+            var oldGatewayIdentity = None<GatewayServeIdentity>
+            var replacementGatewayIdentity = None<GatewayServeIdentity>
+            let stopOutput = ArrayList<String>()
+            try {
+                Directory.create(home, recursive: true)
+                @Expect(exists(metisBinary), true)
+                @Expect(exists(gcmSource), true)
+                @Expect(exists(proxySource), true)
+                @Expect(exists(dependencyScript), true)
+                @Expect(executeWithOutput("/bin/cp", [gcmSource.toString(), gcmBinary.toString()])[0], 0)
+                @Expect(executeWithOutput("/bin/cp", [proxySource.toString(), proxy.toString()])[0], 0)
+                @Expect(executeWithOutput("/bin/chmod", ["700", gcmBinary.toString()])[0], 0)
+                @Expect(executeWithOutput("/bin/chmod", ["700", proxy.toString()])[0], 0)
+                setVariable("METIS_HOME", home.toString())
+                setVariable("METIS_CJPM_ROOT", project.toString())
+                setVariable("METIS_STDIO_BROKER_NODE_COMMAND", proxy.toString())
+                setVariable("METIS_S5_BROKER_PROXY_READY", proxyReady.toString())
+                setVariable("METIS_S5_BROKER_PROXY_FAIL", "")
+                setVariable("METIS_S5_BROKER_PROXY_WRITER_CLOSED", "")
+                setVariable("METIS_S5_BROKER_PROXY_CLEANUP", "")
+                setVariable("METIS_S5_BROKER_PROXY_DROP_DELIVERY_ID", deliveryId)
+                setVariable("METIS_S5_BROKER_PROXY_ADMISSION_SEEN", admissionSeen.toString())
+                setVariable("METIS_S5_BROKER_PROXY_COMPLETION_DROPPED", completionDropped.toString())
+                CliConfig.invalidatePathCache()
+                MetisConfigManager.invalidate()
+                CliSettingManager.invalidate()
+
+                dependencies = Some(gatewayS5StartDependencies(home, dependencyScript, replyMarker: "s5-n1-dropped-completion"))
+                let feishuHome = home.join("feishu-loopback")
+                Directory.create(feishuHome, recursive: true)
+                feishuDependencies = Some(gatewayS5StartDependencies(feishuHome, dependencyScript))
+                let stableDependencies = dependencies.getOrThrow()
+                let stableFeishuDependencies = feishuDependencies.getOrThrow()
+                @Expect(stableDependencies.port > 0 && stableFeishuDependencies.port > 0, true)
+                @Expect(stableDependencies.port != stableFeishuDependencies.port, true)
+                for (key in apiKeyAliases) { setVariable(key, "fake-s5-openai-key") }
+                for (key in baseUrlAliases) { setVariable(key, "http://127.0.0.1:${stableDependencies.port}/v1") }
+                let configured = gatewayS5ConfigureFormalGateway(
+                    home, gatewayPort, webhookPort, stableDependencies.port, gcmBinary,
+                    liveWriteback: true, includeFeishu: true, feishuPort: stableFeishuDependencies.port
+                )
+                let queuePath = configured[1]
+                let manifestPath = configured[2]
+                gatewayS5WriteGcmManifest(manifestPath, gcmBinary)
+                @Expect(loadServicePluginManifest(manifestPath.toString()).ok, true)
+
+                let launchedOld = launch(
+                    metisBinary.toString(), ["gateway", "run"],
+                    stdIn: ProcessRedirect.Discard, stdOut: ProcessRedirect.Discard, stdErr: ProcessRedirect.Discard
+                )
+                oldGatewayProcess = Some(launchedOld)
+                let oldGatewayPid = launchedOld.pid
+                oldGatewayIdentity = gatewayServeStopCaptureOwnedIdentity(home, oldGatewayPid, metisBinary, 5000)
+                @Expect(oldGatewayIdentity.isSome(), true)
+                if (oldGatewayIdentity.isNone()) { return }
+                let oldCapture = GatewayS5P1Capture()
+                let stableOldGatewayPid = oldGatewayPid
+                let oldOwner = GatewayServeStopLiveOwnerProof()
+                let readyzUrl = "http://127.0.0.1:${gatewayPort}/readyz"
+                let oldReady = gatewayServeStopWaitUntil(15000, { =>
+                    oldOwner.refresh(readyzUrl)
+                    exists(proxyReady) && gatewayS5JsonInt(proxyReady, "generation") > 0 &&
+                        gatewayS5JsonInt(proxyReady, "ownerPid") > 1 && oldOwner.httpStatus == 200 &&
+                        oldOwner.running && oldOwner.ownerCount >= 1 && gatewayServeStopPortListening(webhookPort)
+                })
+                @Expect(oldReady, true)
+                if (!oldReady) { return }
+                let oldProxyPid = gatewayS5JsonInt(proxyReady, "wrapperPid")
+                let oldBrokerPid = gatewayS5JsonInt(proxyReady, "brokerPid")
+                let oldHelloBrokerPid = gatewayS5JsonInt(proxyReady, "helloBrokerPid")
+                let oldBrokerGeneration = gatewayS5JsonInt(proxyReady, "generation")
+                let oldGcmPid = gatewayS5JsonInt(proxyReady, "ownerPid")
+                let oldGcmPgid = gatewayServeStopProcessGroup(oldGcmPid)
+                oldCapture.brokerPid = oldBrokerPid
+                oldCapture.gcmPid = oldGcmPid
+                oldCapture.gcmPgid = oldGcmPgid
+                @Expect(oldProxyPid > 1 && oldBrokerPid > 1 && oldGcmPid > 1 && oldGcmPgid > 1, true)
+                @Expect(oldHelloBrokerPid, oldBrokerPid)
+                @Expect(oldBrokerGeneration > 0, true)
+                @Expect(gatewayServeStopParentPid(oldProxyPid), oldGatewayPid)
+                @Expect(gatewayServeStopParentPid(oldBrokerPid), oldProxyPid)
+                @Expect(gatewayServeStopParentPid(oldGcmPid), oldBrokerPid)
+                @Expect(gatewayServeStopProcessGroup(oldGcmPid), oldGcmPgid)
+                let oldLeaseReady = gatewayServeStopWaitUntil(5000, { =>
+                    oldCapture.refreshLease(home, oldGcmPid, oldGatewayPid, webhookPort)
+                    oldCapture.leaseDirExists && oldCapture.leaseFileCount == 1 && oldCapture.leaseUtf8 &&
+                        oldCapture.leaseJson && oldCapture.leaseIdentityMatches && oldCapture.leasePidMatches &&
+                        oldCapture.leasePortMatches && oldCapture.leaseRunning
+                })
+                @Expect(oldLeaseReady, true)
+                @Expect(oldCapture.leaseDirExists, true)
+                @Expect(oldCapture.leaseFileCount, 1)
+                @Expect(oldCapture.leaseUtf8, true)
+                @Expect(oldCapture.leaseJson, true)
+                @Expect(oldCapture.leaseIdentityMatches, true)
+                @Expect(oldCapture.leasePidMatches, true)
+                @Expect(oldCapture.leasePortMatches, true)
+                @Expect(oldCapture.leaseRunning, true)
+                if (!oldLeaseReady) { return }
+
+                let posted = gatewayS5PostWebhook(webhookPort, deliveryId, iid: iid)
+                @Expect(posted >= 200 && posted < 300, true)
+                let dropMarkersReady = gatewayServeStopWaitUntil(20000, { =>
+                    gatewayS5DropMarkerProof(admissionSeen, "broker_written", deliveryId)[0] &&
+                        gatewayS5DropMarkerProof(completionDropped, "owner_written_synthesized", deliveryId)[0]
+                })
+                @Expect(dropMarkersReady, true)
+                if (!dropMarkersReady) { return }
+                let admissionMarker = gatewayS5DropMarkerProof(admissionSeen, "broker_written", deliveryId)
+                let completionMarker = gatewayS5DropMarkerProof(completionDropped, "owner_written_synthesized", deliveryId)
+                @Expect(admissionMarker[0], true)
+                @Expect(admissionMarker[1], 1)
+                @Expect(completionMarker[0], true)
+                @Expect(completionMarker[1], 2)
+                @Expect(completionMarker[2] == admissionMarker[2], true)
+                @Expect(admissionMarker[3], oldBrokerGeneration)
+                @Expect(completionMarker[3], oldBrokerGeneration)
+                @Expect(admissionMarker[4].isEmpty(), false)
+                @Expect(completionMarker[4], admissionMarker[4])
+                @Expect(admissionMarker[5].isEmpty(), false)
+                @Expect(completionMarker[5].isEmpty(), false)
+                @Expect(completionMarker[5] == admissionMarker[5], false)
+                oldOwner.refresh(readyzUrl)
+                @Expect(oldOwner.httpStatus == 200 && oldOwner.running && oldOwner.ownerCount >= 1, true)
+                let oldAttemptToken = admissionMarker[2]
+                let awaitingPath = queuePath.join("awaiting-host").join("${deliveryId}.json")
+                let receiptRoot = home.join("service-plugin").join("webhook-receipts")
+                let receiptReady = gatewayServeStopWaitUntil(10000, { =>
+                    let queueProof = gatewayS5QueueDeliveryProof(awaitingPath, deliveryId)
+                    let receiptProof = gatewayS5ReceiptProof(receiptRoot, deliveryId)
+                    queueProof[0] && queueProof[1] == "awaiting-host" && queueProof[2] == "admitted" &&
+                        queueProof[3] == oldAttemptToken && receiptProof[0] &&
+                        receiptProof[3] == oldAttemptToken && receiptProof[4] == "completed_unconfirmed"
+                })
+                @Expect(receiptReady, true)
+                if (!receiptReady) { return }
+                let oldEffectsReady = gatewayServeStopWaitUntil(10000, { =>
+                    let mainLedger = GatewayS5StrictLedger(stableDependencies.eventsPath, expectedDeliveries, expectedWritebacks)
+                    let feishuLedger = GatewayS5StrictLedger(stableFeishuDependencies.eventsPath, expectedDeliveries, expectedWritebacks)
+                    mainLedger.valid() && feishuLedger.valid() &&
+                        mainLedger.exactOnce("model_response", expectedDeliveries) &&
+                        mainLedger.exactWritebacks(expectedWritebacks, expectedDeliveries) &&
+                        mainLedger.exactOnce("telegram_send", expectedDeliveries) &&
+                        feishuLedger.exactOnce("feishu_send", expectedDeliveries)
+                })
+                @Expect(oldEffectsReady, true)
+                if (!oldEffectsReady) { return }
+
+                setGatewayStopOutputForTest(Some({ line => stopOutput.add(line) }))
+                let oldStopExit = gatewayExecuteStopServe()
+                setGatewayStopOutputForTest(None<(String) -> Unit>)
+                @Expect(oldStopExit, 0)
+                let oldCompletionPath = home.join("gateway-serve.stop-complete")
+                let oldCompletion = try { String.fromUtf8(File.readFrom(oldCompletionPath)) } catch (_: Exception) { "" }
+                @Expect(gatewayServeStopCompletionField(oldCompletion, "status"), "graceful")
+                @Expect(gatewayServeStopCompletionField(oldCompletion, "fullTerminal"), "1")
+                @Expect(gatewayServeStopCompletionField(oldCompletion, "servicePluginDispatchStatus"), "drained")
+                @Expect(gatewayServeStopCompletionField(oldCompletion, "servicePluginOwnerStatus"), "graceful_exited")
+                @Expect(gatewayServeStopCompletionField(oldCompletion, "servicePluginLeaseStatus"), "stopped")
+                @Expect(gatewayServeStopCompletionField(oldCompletion, "servicePluginPortStatus"), "released")
+                @Expect(gatewayServeStopCompletionField(oldCompletion, "servicePluginPendingCount"), "0")
+                @Expect(gatewayServeStopCompletionField(oldCompletion, "channelsStatus"), "stopped")
+                @Expect(gatewayServeStopCompletionField(oldCompletion, "brokerStatus"), "stopped")
+                let oldStopTerminal = oldStopExit == 0 &&
+                    gatewayServeStopCompletionField(oldCompletion, "status") == "graceful" &&
+                    gatewayServeStopCompletionField(oldCompletion, "fullTerminal") == "1"
+                if (!oldStopTerminal) { return }
+                @Expect(gatewayServeStopReapCompletedOwnedProcess(oldGatewayProcess), true)
+                oldGatewayProcess = None<SubProcess>
+                @Expect(gatewayServeStopWaitUntil(5000, { => !gatewayServeStopPidAlive(stableOldGatewayPid) }), true)
+                @Expect(gatewayServeStopWaitUntil(5000, { => !gatewayServeStopPidAlive(oldProxyPid) }), true)
+                @Expect(gatewayServeStopWaitUntil(5000, { => !gatewayServeStopPidAlive(oldBrokerPid) }), true)
+                @Expect(gatewayServeStopWaitUntil(5000, { => gatewayServeStopGroupGone(oldGcmPgid) }), true)
+                @Expect(gatewayServeStopPortListening(gatewayPort), false)
+                @Expect(gatewayServeStopPortListening(webhookPort), false)
+                oldCapture.refreshLease(home, oldGcmPid, oldGatewayPid, webhookPort)
+                @Expect(oldCapture.leaseStopped, true)
+                @Expect(gatewayServeStopRuntimeOwnerCount(home.join("gateway-runtime-state.json")), 0)
+                let pendingPath = queuePath.join("pending").join("${deliveryId}.json")
+                @Expect(gatewayServeStopWaitUntil(5000, { =>
+                    let pending = gatewayS5QueueDeliveryProof(pendingPath, deliveryId)
+                    pending[0] && pending[1] == "pending" && pending[2] == "recovered" && pending[3] == oldAttemptToken
+                }), true)
+                let retainedReceipt = gatewayS5ReceiptProof(receiptRoot, deliveryId)
+                @Expect(retainedReceipt[0], true)
+                @Expect(retainedReceipt[3] == oldAttemptToken, true)
+                @Expect(retainedReceipt[4], "completed_unconfirmed")
+
+                stopOutput.clear()
+                for (key in proxyEnvironmentKeys) { setVariable(key, "") }
+                CliSettingManager.invalidate()
+                let launchedReplacement = launch(
+                    metisBinary.toString(), ["gateway", "run"],
+                    stdIn: ProcessRedirect.Discard, stdOut: ProcessRedirect.Discard, stdErr: ProcessRedirect.Discard
+                )
+                replacementGatewayProcess = Some(launchedReplacement)
+                let replacementGatewayPid = launchedReplacement.pid
+                replacementGatewayIdentity = gatewayServeStopCaptureOwnedIdentity(home, replacementGatewayPid, metisBinary, 5000)
+                @Expect(replacementGatewayIdentity.isSome(), true)
+                if (replacementGatewayIdentity.isNone()) { return }
+                @Expect(oldGatewayIdentity.getOrThrow().matches(replacementGatewayIdentity.getOrThrow()), false)
+                let replacementCapture = GatewayS5P1Capture()
+                let replacementOwner = GatewayServeStopLiveOwnerProof()
+                let stableReplacementGatewayPid = replacementGatewayPid
+                let replacementReady = gatewayServeStopWaitUntil(15000, { =>
+                    replacementCapture.brokerPid = gatewayServeStopChildPid(stableReplacementGatewayPid, brokerScript.toString())
+                    replacementCapture.gcmPid = gatewayServeStopChildPid(replacementCapture.brokerPid, gcmBinary.toString())
+                    replacementCapture.gcmPgid = gatewayServeStopProcessGroup(replacementCapture.gcmPid)
+                    replacementOwner.refresh(readyzUrl)
+                    replacementCapture.brokerPid > 1 && replacementCapture.gcmPid > 1 && replacementCapture.gcmPgid > 1 &&
+                        replacementOwner.httpStatus == 200 && replacementOwner.running && replacementOwner.ownerCount >= 1 &&
+                        gatewayServeStopPortListening(webhookPort)
+                })
+                @Expect(replacementReady, true)
+                if (!replacementReady) { return }
+                let replacementBrokerPid = replacementCapture.brokerPid
+                let replacementGcmPid = replacementCapture.gcmPid
+                let replacementGcmPgid = replacementCapture.gcmPgid
+                @Expect(replacementGatewayPid != oldGatewayPid, true)
+                @Expect(replacementBrokerPid != oldBrokerPid, true)
+                @Expect(replacementGcmPid != oldGcmPid, true)
+                let replacementLeaseReady = gatewayServeStopWaitUntil(5000, { =>
+                    replacementCapture.refreshLease(home, replacementGcmPid, replacementGatewayPid, webhookPort)
+                    replacementCapture.leaseDirExists && replacementCapture.leaseFileCount == 1 &&
+                        replacementCapture.leaseUtf8 && replacementCapture.leaseJson &&
+                        replacementCapture.leaseIdentityMatches && replacementCapture.leasePidMatches &&
+                        replacementCapture.leasePortMatches && replacementCapture.leaseRunning
+                })
+                @Expect(replacementLeaseReady, true)
+                @Expect(replacementCapture.leaseDirExists, true)
+                @Expect(replacementCapture.leaseFileCount, 1)
+                @Expect(replacementCapture.leaseUtf8, true)
+                @Expect(replacementCapture.leaseJson, true)
+                @Expect(replacementCapture.leaseIdentityMatches, true)
+                @Expect(replacementCapture.leasePidMatches, true)
+                @Expect(replacementCapture.leasePortMatches, true)
+                @Expect(replacementCapture.leaseRunning, true)
+                if (!replacementLeaseReady) { return }
+                let processedPath = queuePath.join("processed").join("${deliveryId}.json")
+                let replacementObservations = HashSet<String>()
+                let replacementProcessed = gatewayServeStopWaitUntil(30000, { =>
+                    let processed = gatewayS5QueueDeliveryProof(processedPath, deliveryId)
+                    let awaiting = gatewayS5QueueDeliveryProof(awaitingPath, deliveryId)
+                    if (awaiting[0] && awaiting[3] != oldAttemptToken) { replacementObservations.add("awaiting") }
+                    if (processed[0] && processed[3] != oldAttemptToken) { replacementObservations.add("processed") }
+                    let mainLedger = GatewayS5StrictLedger(stableDependencies.eventsPath, expectedDeliveries, expectedWritebacks)
+                    let feishuLedger = GatewayS5StrictLedger(stableFeishuDependencies.eventsPath, expectedDeliveries, expectedWritebacks)
+                    processed[0] && processed[1] == "processed" && processed[2] == "completed" &&
+                        processed[3] != oldAttemptToken && gatewayS5RegularFileCount(queuePath.join("pending")) == 0 &&
+                        gatewayS5RegularFileCount(queuePath.join("awaiting-host")) == 0 &&
+                        gatewayS5RegularFileCount(receiptRoot) == 0 && mainLedger.valid() && feishuLedger.valid() &&
+                        mainLedger.exactOnce("model_response", expectedDeliveries) &&
+                        mainLedger.exactWritebacks(expectedWritebacks, expectedDeliveries) &&
+                        mainLedger.exactOnce("telegram_send", expectedDeliveries) &&
+                        feishuLedger.exactOnce("feishu_send", expectedDeliveries)
+                })
+                let replacementProcessedProof = gatewayS5QueueDeliveryProof(processedPath, deliveryId)
+                let replacementAwaitingProof = gatewayS5QueueDeliveryProof(awaitingPath, deliveryId)
+                let replacementReceiptProof = gatewayS5ReceiptProof(receiptRoot, deliveryId)
+                let replacementPendingCount = gatewayS5RegularFileCount(queuePath.join("pending"))
+                let replacementProcessingCount = gatewayS5RegularFileCount(queuePath.join("processing"))
+                let replacementAwaitingCount = gatewayS5RegularFileCount(queuePath.join("awaiting-host"))
+                let replacementProcessedCount = gatewayS5RegularFileCount(queuePath.join("processed"))
+                let replacementMainLedger = GatewayS5StrictLedger(
+                    stableDependencies.eventsPath, expectedDeliveries, expectedWritebacks
+                )
+                let replacementFeishuLedger = GatewayS5StrictLedger(
+                    stableFeishuDependencies.eventsPath, expectedDeliveries, expectedWritebacks
+                )
+                replacementOwner.refresh(readyzUrl)
+                replacementCapture.refreshLease(home, replacementGcmPid, replacementGatewayPid, webhookPort)
+                let replacementSchedulerSettled = replacementPendingCount == 0 && replacementProcessingCount == 0 &&
+                    replacementAwaitingCount == 0 && replacementProcessedCount == 1 && replacementReceiptProof[1] == 0
+                let replacementReceiptTokenMatchesQueue = if (!replacementReceiptProof[0]) {
+                    replacementReceiptProof[1] == 0
+                } else if (replacementAwaitingProof[0]) {
+                    replacementReceiptProof[3] == replacementAwaitingProof[3]
+                } else if (replacementProcessedProof[0]) {
+                    replacementReceiptProof[3] == replacementProcessedProof[3]
+                } else {
+                    false
+                }
+                @Expect(replacementObservations.contains("awaiting") || replacementObservations.contains("processed"), true)
+                @Expect(replacementProcessedProof[0], true)
+                @Expect(replacementProcessedProof[1], "processed")
+                @Expect(replacementProcessedProof[2], "completed")
+                @Expect(replacementProcessedProof[3] == oldAttemptToken, false)
+                @Expect(replacementPendingCount, 0)
+                @Expect(replacementProcessingCount, 0)
+                @Expect(replacementAwaitingCount, 0)
+                @Expect(replacementProcessedCount, 1)
+                @Expect(replacementReceiptProof[1], 0)
+                @Expect(replacementReceiptProof[4].isEmpty(), true)
+                @Expect(replacementReceiptTokenMatchesQueue, true)
+                @Expect(replacementMainLedger.valid(), true)
+                @Expect(replacementFeishuLedger.valid(), true)
+                @Expect(replacementMainLedger.exactOnce("model_response", expectedDeliveries), true)
+                @Expect(replacementMainLedger.exactWritebacks(expectedWritebacks, expectedDeliveries), true)
+                @Expect(replacementMainLedger.exactOnce("telegram_send", expectedDeliveries), true)
+                @Expect(replacementFeishuLedger.exactOnce("feishu_send", expectedDeliveries), true)
+                @Expect(replacementReady, true)
+                @Expect(replacementOwner.httpStatus == 200 && replacementOwner.running && replacementOwner.ownerCount >= 1, true)
+                @Expect(replacementCapture.leaseIdentityMatches, true)
+                @Expect(replacementCapture.leasePidMatches, true)
+                @Expect(replacementCapture.leasePortMatches, true)
+                @Expect(replacementCapture.leaseRunning, true)
+                @Expect(replacementSchedulerSettled, true)
+                @Expect(replacementProcessed, true)
+                if (!replacementProcessed) { return }
+                let processed = gatewayS5QueueDeliveryProof(processedPath, deliveryId)
+                @Expect(processed[0], true)
+                @Expect(processed[1], "processed")
+                @Expect(processed[2], "completed")
+                @Expect(processed[3] == oldAttemptToken, false)
+                @Expect(gatewayS5RegularFileCount(queuePath.join("processed")), 1)
+                @Expect(gatewayS5RegularFileCount(queuePath.join("pending")), 0)
+                @Expect(gatewayS5RegularFileCount(queuePath.join("awaiting-host")), 0)
+                @Expect(gatewayS5RegularFileCount(receiptRoot), 0)
+                let finalMainLedger = GatewayS5StrictLedger(stableDependencies.eventsPath, expectedDeliveries, expectedWritebacks)
+                let finalFeishuLedger = GatewayS5StrictLedger(stableFeishuDependencies.eventsPath, expectedDeliveries, expectedWritebacks)
+                @Expect(finalMainLedger.valid(), true)
+                @Expect(finalFeishuLedger.valid(), true)
+                @Expect(finalMainLedger.exactOnce("model_response", expectedDeliveries), true)
+                @Expect(finalMainLedger.exactWritebacks(expectedWritebacks, expectedDeliveries), true)
+                @Expect(finalMainLedger.exactOnce("telegram_send", expectedDeliveries), true)
+                @Expect(finalFeishuLedger.exactOnce("feishu_send", expectedDeliveries), true)
+                @Expect(gatewayS5DropMarkerProof(admissionSeen, "broker_written", deliveryId)[2] == oldAttemptToken, true)
+                @Expect(gatewayS5DropMarkerProof(completionDropped, "owner_written_synthesized", deliveryId)[2] == oldAttemptToken, true)
+
+                setGatewayStopOutputForTest(Some({ line => stopOutput.add(line) }))
+                let replacementStopExit = gatewayExecuteStopServe()
+                setGatewayStopOutputForTest(None<(String) -> Unit>)
+                @Expect(replacementStopExit, 0)
+                let replacementCompletionPath = home.join("gateway-serve.stop-complete")
+                let replacementCompletion = try { String.fromUtf8(File.readFrom(replacementCompletionPath)) } catch (_: Exception) { "" }
+                @Expect(gatewayServeStopCompletionField(replacementCompletion, "status"), "graceful")
+                @Expect(gatewayServeStopCompletionField(replacementCompletion, "fullTerminal"), "1")
+                @Expect(gatewayServeStopCompletionField(replacementCompletion, "servicePluginDispatchStatus"), "drained")
+                @Expect(gatewayServeStopCompletionField(replacementCompletion, "servicePluginOwnerStatus"), "graceful_exited")
+                @Expect(gatewayServeStopCompletionField(replacementCompletion, "servicePluginLeaseStatus"), "stopped")
+                @Expect(gatewayServeStopCompletionField(replacementCompletion, "servicePluginPortStatus"), "released")
+                @Expect(gatewayServeStopCompletionField(replacementCompletion, "servicePluginPendingCount"), "0")
+                @Expect(gatewayServeStopCompletionField(replacementCompletion, "channelsStatus"), "stopped")
+                @Expect(gatewayServeStopCompletionField(replacementCompletion, "brokerStatus"), "stopped")
+                let replacementStopTerminal = replacementStopExit == 0 &&
+                    gatewayServeStopCompletionField(replacementCompletion, "status") == "graceful" &&
+                    gatewayServeStopCompletionField(replacementCompletion, "fullTerminal") == "1"
+                if (!replacementStopTerminal) { return }
+                @Expect(gatewayServeStopReapCompletedOwnedProcess(replacementGatewayProcess), true)
+                replacementGatewayProcess = None<SubProcess>
+                @Expect(gatewayServeStopWaitUntil(5000, { => !gatewayServeStopPidAlive(stableReplacementGatewayPid) }), true)
+                @Expect(gatewayServeStopWaitUntil(5000, { => !gatewayServeStopPidAlive(replacementBrokerPid) }), true)
+                @Expect(gatewayServeStopWaitUntil(5000, { => gatewayServeStopGroupGone(replacementGcmPgid) }), true)
+                @Expect(gatewayServeStopPortListening(gatewayPort), false)
+                @Expect(gatewayServeStopPortListening(webhookPort), false)
+                replacementCapture.refreshLease(home, replacementGcmPid, replacementGatewayPid, webhookPort)
+                @Expect(replacementCapture.leaseStopped, true)
+                @Expect(gatewayServeStopRuntimeOwnerCount(home.join("gateway-runtime-state.json")), 0)
+                @Expect(gatewayS5StopDependencies(dependencies), true)
+                @Expect(gatewayS5StopDependencies(feishuDependencies), true)
+                @Expect(gatewayServeStopPortListening(stableDependencies.port), false)
+                @Expect(gatewayServeStopPortListening(stableFeishuDependencies.port), false)
+            } finally {
+                setGatewayStopOutputForTest(None<(String) -> Unit>)
+                if (replacementGatewayIdentity.isSome()) {
+                    try { gatewayServeStopReapOwnedGateway(replacementGatewayIdentity, metisBinary, home) } catch (_: Exception) { () }
+                }
+                try { gatewayServeStopReapOwnedHandle(replacementGatewayProcess, metisBinary) } catch (_: Exception) { () }
+                if (oldGatewayIdentity.isSome()) {
+                    try { gatewayServeStopReapOwnedGateway(oldGatewayIdentity, metisBinary, home) } catch (_: Exception) { () }
+                }
+                try { gatewayServeStopReapOwnedHandle(oldGatewayProcess, metisBinary) } catch (_: Exception) { () }
+                let _ = gatewayS5StopDependencies(dependencies)
+                let _ = gatewayS5StopDependencies(feishuDependencies)
+                try { let _ = resetManagedStdioBrokerForTest(timeoutMs: 3000) } catch (_: Exception) { () }
+                match (oldHome) { case Some(value) => setVariable("METIS_HOME", value) case None => setVariable("METIS_HOME", "") }
+                match (oldRoot) { case Some(value) => setVariable("METIS_CJPM_ROOT", value) case None => setVariable("METIS_CJPM_ROOT", "") }
+                for ((key, value) in oldProxyEnvironment) {
+                    match (value) { case Some(previous) => setVariable(key, previous) case None => setVariable(key, "") }
+                }
+                for ((key, value) in oldProviderEnvironment) {
+                    match (value) { case Some(previous) => setVariable(key, previous) case None => setVariable(key, "") }
+                }
+                CliConfig._model = oldPrimaryModel
+                CliConfig.fallbackModels = oldFallbackModels
+                CliConfig._imageModel = oldImageModel
+                CliConfig.imageFallbackModels = oldImageFallbackModels
+                CliConfig._pdfModel = oldPdfModel
+                CliConfig.pdfFallbackModels = oldPdfFallbackModels
+                CliConfig.pdfMaxBytesMb = oldPdfMaxBytesMb
+                CliConfig.pdfMaxPages = oldPdfMaxPages
+                CliConfig._fastModel = oldFastModel
+                CliConfig.temperature = oldTemperature
+                CliConfig.defaultModelInputLimit = oldDefaultModelInputLimit
+                CliConfig.defaultModelOutputLimit = oldDefaultModelOutputLimit
+                CliConfig.workspaceDirOverride = oldWorkspaceDirOverride
+                CliConfig.invalidatePathCache()
+                MetisConfigManager.invalidate()
+                CliSettingManager.invalidate()
+                try { remove(home, recursive: true) } catch (_: Exception) { () }
+            }
+        }
+    }
+
+    @TestCase
     public func s5N1FormalGatewayWriterFailureReapsOldGenerationAndReplacementNeverReplays(): Unit {
         synchronized(MetisProcessEnvironmentLock) {
             let suffix = DateTime.now().toUnixTimeStamp().toNanoseconds()
@@ -2250,7 +2775,8 @@ public class GatewayServeLockLogicTest {
             let environmentKeys = [
                 "METIS_STDIO_BROKER_NODE_COMMAND", "METIS_S5_BROKER_PROXY_READY",
                 "METIS_S5_BROKER_PROXY_FAIL", "METIS_S5_BROKER_PROXY_WRITER_CLOSED",
-                "METIS_S5_BROKER_PROXY_CLEANUP", "GCM_S5_READY_PATH",
+                "METIS_S5_BROKER_PROXY_CLEANUP", "METIS_S5_BROKER_PROXY_DROP_DELIVERY_ID",
+                "METIS_S5_BROKER_PROXY_ADMISSION_SEEN", "METIS_S5_BROKER_PROXY_COMPLETION_DROPPED", "GCM_S5_READY_PATH",
                 "GCM_S5_STOP_SEEN_PATH", "GCM_S5_CHILD_DYLD_LIBRARY_PATH"
             ]
             let previousEnvironment = ArrayList<(String, Option<String>)>()
@@ -2333,6 +2859,9 @@ public class GatewayServeLockLogicTest {
                 setVariable("METIS_S5_BROKER_PROXY_FAIL", proxyFail.toString())
                 setVariable("METIS_S5_BROKER_PROXY_WRITER_CLOSED", writerClosed.toString())
                 setVariable("METIS_S5_BROKER_PROXY_CLEANUP", proxyCleanup.toString())
+                setVariable("METIS_S5_BROKER_PROXY_DROP_DELIVERY_ID", "")
+                setVariable("METIS_S5_BROKER_PROXY_ADMISSION_SEEN", "")
+                setVariable("METIS_S5_BROKER_PROXY_COMPLETION_DROPPED", "")
                 setVariable("GCM_S5_READY_PATH", wrapperReady.toString())
                 setVariable("GCM_S5_STOP_SEEN_PATH", stopSeen.toString())
                 setVariable("GCM_S5_CHILD_DYLD_LIBRARY_PATH", getVariable("DYLD_LIBRARY_PATH").getOrDefault { "" })
@@ -2452,6 +2981,8 @@ public class GatewayServeLockLogicTest {
                 setVariable("METIS_STDIO_BROKER_NODE_COMMAND", "")
                 for (key in ["METIS_S5_BROKER_PROXY_READY", "METIS_S5_BROKER_PROXY_FAIL",
                     "METIS_S5_BROKER_PROXY_WRITER_CLOSED", "METIS_S5_BROKER_PROXY_CLEANUP",
+                    "METIS_S5_BROKER_PROXY_DROP_DELIVERY_ID", "METIS_S5_BROKER_PROXY_ADMISSION_SEEN",
+                    "METIS_S5_BROKER_PROXY_COMPLETION_DROPPED",
                     "GCM_S5_READY_PATH", "GCM_S5_STOP_SEEN_PATH", "GCM_S5_CHILD_DYLD_LIBRARY_PATH"]) {
                     setVariable(key, "")
                 }
