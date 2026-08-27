@@ -826,6 +826,83 @@ private class ServicePluginBrokerProcessHandle {
     public func isAlive(): Bool { this.state.isAlive() }
 }
 
+private const SERVICE_PLUGIN_DISPATCH_MAX_ACTIVE: Int64 = 2
+private const SERVICE_PLUGIN_DISPATCH_MAX_QUEUED: Int64 = 128
+
+private func servicePluginAckJsonString(root: JsonObject, key: String): String {
+    match (root.get(key)) {
+        case Some(value) => try { value.asString().getValue().trimAscii() } catch (_: Exception) { "" }
+        case None => ""
+    }
+}
+
+private class ServicePluginDispatchTask {
+    let record: ServicePluginRuntimeRecord
+    let frame: ServiceFrame
+    let deliveryId: String
+    let eventId: String
+    let attemptToken: String
+    let deliveryIdPresent: Bool
+    let attemptTokenPresent: Bool
+    let identityValid: Bool
+    var admissionSequence: Int64 = 0
+    var dequeueSequence: Int64 = 0
+    var admissionConfirmed: Bool = false
+    var reservationKind: String = "none"
+    var reservationState: String = "new"
+
+    init(record: ServicePluginRuntimeRecord, frame: ServiceFrame) {
+        this.record = record
+        this.frame = frame
+        let root = try { JsonValue.fromStr(frame.payload).asObject() } catch (_: Exception) { JsonObject() }
+        this.deliveryId = servicePluginAckJsonString(root, "deliveryId")
+        this.eventId = servicePluginAckJsonString(root, "eventId")
+        this.attemptToken = servicePluginAckJsonString(root, "attemptToken")
+        this.deliveryIdPresent = root.get("deliveryId").isSome()
+        this.attemptTokenPresent = root.get("attemptToken").isSome()
+        this.identityValid = this.deliveryId.size > 0 && this.deliveryId.size <= 4096 &&
+            this.eventId.size > 0 && this.eventId.size <= 4096 && this.attemptToken.size > 0 &&
+            this.attemptToken.size <= 4096 && this.attemptToken == frame.correlationId.trimAscii()
+    }
+
+    func ackable(): Bool {
+        this.identityValid && this.frame.frameType == "event" && this.frame.method == "emitCapabilityEvent" &&
+            this.frame.capabilityId == "gitcode.event.accepted" &&
+            this.frame.serviceId == this.record.registration.manifest.pluginId
+    }
+
+    func hasAckIdentity(): Bool { this.deliveryIdPresent || this.attemptTokenPresent }
+}
+
+public class ServicePluginDispatchSchedulerSnapshotForTest {
+    public let ownerId: String
+    public let generation: Int64
+    public let active: Int64
+    public let queued: Int64
+    public let accepted: Int64
+    public let futures: Int64
+    public let queueHighWatermark: Int64
+    public let queueFull: Int64
+    public let cancelled: Int64
+    public let accepting: Bool
+    public let settled: Bool
+
+    public init(ownerId: String, generation: Int64, active: Int64, queued: Int64, accepted: Int64, futures: Int64,
+        queueHighWatermark: Int64, queueFull: Int64, cancelled: Int64, accepting: Bool, settled: Bool) {
+        this.ownerId = ownerId
+        this.generation = generation
+        this.active = active
+        this.queued = queued
+        this.accepted = accepted
+        this.futures = futures
+        this.queueHighWatermark = queueHighWatermark
+        this.queueFull = queueFull
+        this.cancelled = cancelled
+        this.accepting = accepting
+        this.settled = settled
+    }
+}
+
 private class ServicePluginStdioProcess {
     public let process: ServicePluginBrokerProcessHandle
     public let generation: Int64
@@ -839,8 +916,16 @@ private class ServicePluginStdioProcess {
     private let dispatchCondition: Condition
     private var dispatchFenced = false
     private var acceptedDispatches: Int64 = 0
+    private var activeDispatches: Int64 = 0
     private var dispatchFutureSequence: Int64 = 0
+    private var dispatchAdmissionSequence: Int64 = 0
+    private var dispatchDequeueSequence: Int64 = 0
+    private var invokeSequence: Int64 = 0
     private let dispatchFutures = HashMap<Int64, Future<Unit>>()
+    private let dispatchQueue = ArrayList<ServicePluginDispatchTask>()
+    private var dispatchQueueHighWatermark: Int64 = 0
+    private var dispatchQueueFull: Int64 = 0
+    private var cancelledDispatches: Int64 = 0
 
     public init(broker: ManagedStdioBrokerClient, ownerId: String, generation: Int64, pid: Int64, claimToken!: Int64 = 0) {
         this.broker = broker
@@ -851,25 +936,188 @@ private class ServicePluginStdioProcess {
         synchronized(this.dispatchLock) { this.dispatchCondition = this.dispatchLock.condition() }
     }
 
-    public func acceptDispatch(): Bool { synchronized(this.dispatchLock) { if (this.dispatchFenced) { false } else { this.acceptedDispatches++; true } } }
     public func dispatchAllowed(): Bool { synchronized(this.dispatchLock) { !this.dispatchFenced } }
-    public func finishDispatch(): Unit { synchronized(this.dispatchLock) { this.acceptedDispatches = max(0, this.acceptedDispatches - 1); this.dispatchCondition.notifyAll() } }
-    public func nextDispatchFutureToken(): Int64 { synchronized(this.dispatchLock) { this.dispatchFutureSequence++; this.dispatchFutureSequence } }
-    public func registerDispatchFuture(token: Int64, future: Future<Unit>): Unit { synchronized(this.dispatchLock) { this.dispatchFutures[token] = future } }
-    public func finishDispatchFuture(token: Int64): Unit {
+    public func dispatchCountsForTest(): (String, Int64, Int64, Int64) {
         synchronized(this.dispatchLock) {
-            this.dispatchFutures.remove(token)
-            this.acceptedDispatches = max(0, this.acceptedDispatches - 1)
-            this.dispatchCondition.notifyAll()
-        }
-        match (servicePluginDispatchSettledHookForTest) {
-            case Some(hook) => hook()
-            case None => ()
+            (this.ownerId, this.generation, this.acceptedDispatches, Int64(this.dispatchFutures.size))
         }
     }
-    public func fenceDispatch(): Unit { synchronized(this.dispatchLock) { this.dispatchFenced = true; this.dispatchCondition.notifyAll() } }
-    public func waitDispatches(timeoutMs: Int64): Bool { synchronized(this.dispatchLock) { if (this.acceptedDispatches == 0) { return true }; let _ = this.dispatchCondition.waitUntil({ => this.acceptedDispatches == 0 }, timeout: Duration.millisecond * max(1, timeoutMs)); this.acceptedDispatches == 0 } }
-    public func dispatchesSettled(): Bool { synchronized(this.dispatchLock) { this.acceptedDispatches == 0 } }
+    public func dispatchSchedulerSnapshotForTest(): ServicePluginDispatchSchedulerSnapshotForTest {
+        synchronized(this.dispatchLock) {
+            ServicePluginDispatchSchedulerSnapshotForTest(
+                this.ownerId, this.generation, this.activeDispatches, Int64(this.dispatchQueue.size),
+                this.acceptedDispatches, Int64(this.dispatchFutures.size), this.dispatchQueueHighWatermark,
+                this.dispatchQueueFull, this.cancelledDispatches, !this.dispatchFenced,
+                this.activeDispatches == 0 && this.dispatchQueue.size == 0 && this.dispatchFutures.size == 0 && this.acceptedDispatches == 0
+            )
+        }
+    }
+    public func trySubmitDispatch(task: ServicePluginDispatchTask): String {
+        synchronized(this.dispatchLock) {
+            if (this.dispatchFenced) { task.reservationState = "cancelled"; return "cancelled" }
+            this.dispatchAdmissionSequence++
+            task.admissionSequence = this.dispatchAdmissionSequence
+            if (this.activeDispatches < SERVICE_PLUGIN_DISPATCH_MAX_ACTIVE) {
+                task.reservationKind = "active"
+                task.reservationState = "reserved"
+                this.activeDispatches++
+                this.acceptedDispatches++
+                return "started"
+            }
+            if (Int64(this.dispatchQueue.size) < SERVICE_PLUGIN_DISPATCH_MAX_QUEUED) {
+                task.reservationKind = "queued"
+                task.reservationState = "reserved"
+                this.dispatchQueue.add(task)
+                this.acceptedDispatches++
+                this.dispatchQueueHighWatermark = max(this.dispatchQueueHighWatermark, Int64(this.dispatchQueue.size))
+                return "queued"
+            }
+            this.dispatchQueueFull++
+            "queue_full"
+        }
+    }
+    public func nextInvokeSequence(): Int64 { synchronized(this.dispatchLock) { this.invokeSequence++; this.invokeSequence } }
+    public func confirmAdmission(task: ServicePluginDispatchTask): String {
+        synchronized(this.dispatchLock) {
+            if (task.reservationState == "fenced") { return "cancelled_acknowledged" }
+            if (task.reservationState != "reserved") { return "cancelled" }
+            if (this.dispatchFenced) {
+                if (task.reservationKind == "active") {
+                    this.activeDispatches = max(0, this.activeDispatches - 1)
+                    this.acceptedDispatches = max(0, this.acceptedDispatches - 1)
+                } else if (task.reservationKind == "queued") {
+                    for (index in 0..this.dispatchQueue.size) {
+                        if (this.dispatchQueue[index].admissionSequence == task.admissionSequence) {
+                            this.dispatchQueue.remove(at: index)
+                            this.acceptedDispatches = max(0, this.acceptedDispatches - 1)
+                            break
+                        }
+                    }
+                }
+                task.reservationState = "cancelled"
+                this.dispatchCondition.notifyAll()
+                return "cancelled"
+            }
+            task.admissionConfirmed = true
+            task.reservationState = "confirmed"
+            if (task.reservationKind == "active") { return "started" }
+            for (index in 0..this.dispatchQueue.size) {
+                if (this.dispatchQueue[index].admissionSequence == task.admissionSequence) {
+                    if (index == 0 && this.activeDispatches < SERVICE_PLUGIN_DISPATCH_MAX_ACTIVE) {
+                        let queued = this.dispatchQueue.remove(at: index)
+                        queued.reservationKind = "active"
+                        this.activeDispatches++
+                        this.dispatchDequeueSequence++
+                        queued.dequeueSequence = this.dispatchDequeueSequence
+                        return "started"
+                    }
+                    return "queued"
+                }
+            }
+            task.reservationState = "cancelled"
+            this.acceptedDispatches = max(0, this.acceptedDispatches - 1)
+            this.dispatchCondition.notifyAll()
+            "cancelled"
+        }
+    }
+    public func nextDispatchFutureToken(): Int64 { synchronized(this.dispatchLock) { this.dispatchFutureSequence++; this.dispatchFutureSequence } }
+    public func registerDispatchFuture(token: Int64, future: Future<Unit>): Unit { synchronized(this.dispatchLock) { this.dispatchFutures[token] = future } }
+    public func rollbackDispatchLaunch(): Option<ServicePluginDispatchTask> {
+        var next = None<ServicePluginDispatchTask>
+        synchronized(this.dispatchLock) {
+            this.activeDispatches = max(0, this.activeDispatches - 1)
+            this.acceptedDispatches = max(0, this.acceptedDispatches - 1)
+            if (!this.dispatchFenced && this.dispatchQueue.size > 0 && this.dispatchQueue[0].admissionConfirmed) {
+                let task = this.dispatchQueue.remove(at: 0)
+                task.reservationKind = "active"
+                this.activeDispatches++
+                this.dispatchDequeueSequence++
+                task.dequeueSequence = this.dispatchDequeueSequence
+                next = Some(task)
+            }
+            this.dispatchCondition.notifyAll()
+        }
+        next
+    }
+    public func rollbackAdmittedTask(task: ServicePluginDispatchTask): Option<ServicePluginDispatchTask> {
+        var next = None<ServicePluginDispatchTask>
+        synchronized(this.dispatchLock) {
+            if (task.reservationState != "reserved") { return next }
+            var queuedIndex: Int64 = -1
+            if (task.reservationKind == "queued") {
+                for (index in 0..this.dispatchQueue.size) {
+                    if (this.dispatchQueue[index].admissionSequence == task.admissionSequence) { queuedIndex = Int64(index); break }
+                }
+            }
+            if (queuedIndex >= 0) {
+                this.dispatchQueue.remove(at: queuedIndex)
+                this.acceptedDispatches = max(0, this.acceptedDispatches - 1)
+            } else if (task.reservationKind == "active") {
+                this.activeDispatches = max(0, this.activeDispatches - 1)
+                this.acceptedDispatches = max(0, this.acceptedDispatches - 1)
+                if (!this.dispatchFenced && this.dispatchQueue.size > 0 && this.dispatchQueue[0].admissionConfirmed) {
+                    let queued = this.dispatchQueue.remove(at: 0)
+                    queued.reservationKind = "active"
+                    this.activeDispatches++
+                    this.dispatchDequeueSequence++
+                    queued.dequeueSequence = this.dispatchDequeueSequence
+                    next = Some(queued)
+                }
+            }
+            task.reservationState = "rolled_back"
+            this.dispatchCondition.notifyAll()
+        }
+        next
+    }
+    public func finishDispatchFuture(token: Int64): Option<ServicePluginDispatchTask> {
+        var next = None<ServicePluginDispatchTask>
+        var settled = false
+        synchronized(this.dispatchLock) {
+            this.dispatchFutures.remove(token)
+            this.activeDispatches = max(0, this.activeDispatches - 1)
+            this.acceptedDispatches = max(0, this.acceptedDispatches - 1)
+            if (!this.dispatchFenced && this.dispatchQueue.size > 0 && this.dispatchQueue[0].admissionConfirmed) {
+                let task = this.dispatchQueue.remove(at: 0)
+                task.reservationKind = "active"
+                this.activeDispatches++
+                this.dispatchDequeueSequence++
+                task.dequeueSequence = this.dispatchDequeueSequence
+                next = Some(task)
+            }
+            settled = this.activeDispatches == 0 && this.dispatchQueue.size == 0 && this.dispatchFutures.size == 0 && this.acceptedDispatches == 0
+            this.dispatchCondition.notifyAll()
+        }
+        if (settled) {
+            match (servicePluginDispatchSettledHookForTest) { case Some(hook) => hook() case None => () }
+        }
+        next
+    }
+    public func fenceDispatch(): ArrayList<ServicePluginDispatchTask> {
+        synchronized(this.dispatchLock) {
+            this.dispatchFenced = true
+            let cancelled = ArrayList<ServicePluginDispatchTask>()
+            for (task in this.dispatchQueue) {
+                task.reservationState = "fenced"
+                cancelled.add(task)
+            }
+            this.cancelledDispatches += Int64(cancelled.size)
+            this.acceptedDispatches = max(0, this.acceptedDispatches - Int64(cancelled.size))
+            this.dispatchQueue.clear()
+            this.dispatchCondition.notifyAll()
+            cancelled
+        }
+    }
+    public func waitDispatches(timeoutMs: Int64): Bool {
+        synchronized(this.dispatchLock) {
+            if (this.acceptedDispatches == 0 && this.activeDispatches == 0 && this.dispatchQueue.size == 0 && this.dispatchFutures.size == 0) { return true }
+            let _ = this.dispatchCondition.waitUntil(
+                { => this.acceptedDispatches == 0 && this.activeDispatches == 0 && this.dispatchQueue.size == 0 && this.dispatchFutures.size == 0 },
+                timeout: Duration.millisecond * max(1, timeoutMs)
+            )
+            this.acceptedDispatches == 0 && this.activeDispatches == 0 && this.dispatchQueue.size == 0 && this.dispatchFutures.size == 0
+        }
+    }
+    public func dispatchesSettled(): Bool { synchronized(this.dispatchLock) { this.acceptedDispatches == 0 && this.activeDispatches == 0 && this.dispatchQueue.size == 0 && this.dispatchFutures.size == 0 } }
     public func cancelDispatches(timeoutMs: Int64): Bool {
         let futures = synchronized(this.dispatchLock) {
             let rows = ArrayList<Future<Unit>>()
@@ -883,7 +1131,7 @@ private class ServicePluginStdioProcess {
             if (remaining <= 0) { break }
             try { let _ = future.get(Duration.millisecond * remaining) } catch (_: Exception) { () }
         }
-        synchronized(this.dispatchLock) { this.acceptedDispatches == 0 }
+        synchronized(this.dispatchLock) { this.acceptedDispatches == 0 && this.activeDispatches == 0 && this.dispatchQueue.size == 0 && this.dispatchFutures.size == 0 }
     }
 
     public func writeLine(line: String, timeoutMs!: Int64 = 1000): Unit {
@@ -1042,6 +1290,8 @@ private class ServicePluginEventPumpGate {
     private let lock = Mutex()
     private let condition: Condition
     private var opened = false
+    private var cancelled = false
+    private var workerSettled = false
 
     public init() { synchronized(this.lock) { this.condition = this.lock.condition() } }
 
@@ -1052,11 +1302,22 @@ private class ServicePluginEventPumpGate {
         }
     }
 
-    public func waitOpen(): Unit {
+    public func cancel(): Unit {
         synchronized(this.lock) {
-            let _ = this.condition.waitUntil({ => this.opened }, timeout: Duration.second * 5)
+            this.cancelled = true
+            this.condition.notifyAll()
         }
     }
+
+    public func waitOpen(): Bool {
+        synchronized(this.lock) {
+            while (!this.opened && !this.cancelled) { this.condition.wait() }
+            this.opened && !this.cancelled
+        }
+    }
+
+    public func markWorkerSettled(): Unit { synchronized(this.lock) { this.workerSettled = true; this.condition.notifyAll() } }
+    public func waitWorkerSettled(): Unit { synchronized(this.lock) { while (!this.workerSettled) { this.condition.wait() } } }
 }
 
 private class ServicePluginDispatchGuardHookGate {
@@ -1386,11 +1647,19 @@ private var servicePluginStartClaimSequence: Int64 = 0
 private var servicePluginCleanupTokenSequence: Int64 = 0
 private var servicePluginStartPhaseHookForTest: Option<(String, String) -> Unit> = None<(String, String) -> Unit>
 private var servicePluginBeforeEventDispatchHookForTest: Option<(String) -> Unit> = None<(String) -> Unit>
+private var servicePluginDispatchLaunchHookForTest: Option<(String) -> Unit> = None<(String) -> Unit>
+private var servicePluginDispatchRegisterHookForTest: Option<(String) -> Unit> = None<(String) -> Unit>
+private var servicePluginDispatchWorkerSettledHookForTest: Option<(String) -> Unit> = None<(String) -> Unit>
+private var servicePluginEventAckWrittenHookForTest: Option<(String, String, String, ServicePluginDispatchSchedulerSnapshotForTest) -> Unit> = None<(String, String, String, ServicePluginDispatchSchedulerSnapshotForTest) -> Unit>
 private var servicePluginBeforeSupervisorRegisterHookForTest: Option<(String) -> Unit> = None<(String) -> Unit>
 private var servicePluginHostShuttingDown = false
 
 public func setServicePluginStartPhaseHookForTest(hook: Option<(String, String) -> Unit>): Unit { servicePluginStartPhaseHookForTest = hook }
 public func setServicePluginBeforeEventDispatchHookForTest(hook: Option<(String) -> Unit>): Unit { servicePluginBeforeEventDispatchHookForTest = hook }
+public func setServicePluginDispatchLaunchHookForTest(hook: Option<(String) -> Unit>): Unit { servicePluginDispatchLaunchHookForTest = hook }
+public func setServicePluginDispatchRegisterHookForTest(hook: Option<(String) -> Unit>): Unit { servicePluginDispatchRegisterHookForTest = hook }
+public func setServicePluginDispatchWorkerSettledHookForTest(hook: Option<(String) -> Unit>): Unit { servicePluginDispatchWorkerSettledHookForTest = hook }
+public func setServicePluginEventAckWrittenHookForTest(hook: Option<(String, String, String, ServicePluginDispatchSchedulerSnapshotForTest) -> Unit>): Unit { servicePluginEventAckWrittenHookForTest = hook }
 public func setServicePluginBeforeSupervisorRegisterHookForTest(hook: Option<(String) -> Unit>): Unit { servicePluginBeforeSupervisorRegisterHookForTest = hook }
 
 private func servicePluginRunStartPhaseHook(serviceId: String, phase: String): Unit { match (servicePluginStartPhaseHookForTest) { case Some(hook) => hook(serviceId, phase) case None => () } }
@@ -1400,6 +1669,22 @@ private let servicePluginHostLogger = metisCreateSubsystemLogger("gateway/servic
 
 public func servicePluginCleanupPendingCountForTest(): Int64 { synchronized(servicePluginProcessLock) { Int64(servicePluginCleanupPendingOwners.size) } }
 public func servicePluginSupervisorWorkerCountForTest(): Int64 { synchronized(servicePluginSupervisorLock) { Int64(servicePluginSupervisorWorkers.size) } }
+public func servicePluginDispatchCountsForTest(serviceId: String): Option<(String, Int64, Int64, Int64)> {
+    synchronized(servicePluginProcessLock) {
+        match (servicePluginActiveProcesses.get(serviceId.trimAscii())) {
+            case Some(process) => Some(process.dispatchCountsForTest())
+            case None => None<(String, Int64, Int64, Int64)>
+        }
+    }
+}
+public func servicePluginDispatchSchedulerSnapshotForTest(serviceId: String): Option<ServicePluginDispatchSchedulerSnapshotForTest> {
+    synchronized(servicePluginProcessLock) {
+        match (servicePluginActiveProcesses.get(serviceId.trimAscii())) {
+            case Some(process) => Some(process.dispatchSchedulerSnapshotForTest())
+            case None => None<ServicePluginDispatchSchedulerSnapshotForTest>
+        }
+    }
+}
 
 private func servicePluginSafeDiagnosticText(text: String): String {
     redactServicePayload(text.trimAscii()).text
@@ -1716,7 +2001,7 @@ private func servicePluginCleanupPendingForServiceLocked(serviceId: String): Opt
 }
 
 private func servicePluginDrainDispatchForStop(process: ServicePluginStdioProcess, deadlineMs: Int64, stopReserveMs: Int64): String {
-    process.fenceDispatch()
+    servicePluginWriteFencedEventAcks(process.fenceDispatch(), process)
     let remaining = servicePluginDispatchRemaining(deadlineMs)
     let dispatchBudget = servicePluginDispatchBudget(remaining, stopReserveMs)
     let waitBudget = if (dispatchBudget > 1) { max(1, dispatchBudget / 2) } else { dispatchBudget }
@@ -1787,7 +2072,7 @@ private func cleanupDetachedServicePluginOwner(
     var ingressStopStatus = "not_started"
     match (detached.process) {
         case Some(process) =>
-            process.fenceDispatch()
+            servicePluginWriteFencedEventAcks(process.fenceDispatch(), process)
             if (stopProcess) {
                 let ingressBudget = max(0, servicePluginDeadlineRemaining(deadlineMs) - stopReserveMs)
                 if (ingressBudget > 0) {
@@ -2167,7 +2452,7 @@ public func resetServicePluginHostForTest(): Unit {
         }
         match (slot.detached.process) {
             case Some(process) =>
-                process.fenceDispatch()
+                servicePluginWriteFencedEventAcks(process.fenceDispatch(), process)
                 let _ = process.stop(timeoutMs: 1000)
                 process.stopReaders(100)
             case None => ()
@@ -2199,6 +2484,10 @@ public func resetServicePluginHostForTest(): Unit {
     servicePluginSupervisorConfig = ServicePluginSupervisorConfig()
     servicePluginStartPhaseHookForTest = None<(String, String) -> Unit>
     servicePluginBeforeEventDispatchHookForTest = None<(String) -> Unit>
+    servicePluginDispatchLaunchHookForTest = None<(String) -> Unit>
+    servicePluginDispatchRegisterHookForTest = None<(String) -> Unit>
+    servicePluginDispatchWorkerSettledHookForTest = None<(String) -> Unit>
+    servicePluginEventAckWrittenHookForTest = None<(String, String, String, ServicePluginDispatchSchedulerSnapshotForTest) -> Unit>
     servicePluginBeforeSupervisorRegisterHookForTest = None<(String) -> Unit>
     synchronized(servicePluginProcessLock) { servicePluginHostShuttingDown = false }
 }
@@ -2369,10 +2658,11 @@ private func servicePluginInvokeViaStdioProcess(record: ServicePluginRuntimeReco
         case None => return CapabilityInvokeResult(false, "process_start_failed", serviceId: serviceId, capabilityId: request.capabilityId, diagnostic: "service plugin response queue missing after start")
     }
     try {
-        let correlationId = "corr-${record.instanceId}-${request.capabilityId}"
+        let invokeSequence = process.nextInvokeSequence()
+        let correlationId = "corr-${process.ownerId}-${process.generation}-${invokeSequence}-${request.capabilityId}"
         let invokeFrame = ServiceFrame(
             "request",
-            "invoke-${record.instanceId}",
+            "invoke-${process.generation}-${invokeSequence}",
             serviceId,
             method: "invokeCapability",
             capabilityId: request.capabilityId,
@@ -3444,6 +3734,7 @@ public func shutdownServicePluginHost(reason!: String = "shutdown", timeoutMilli
     let cleanupFinalizeResults = HashMap<String, ServicePluginCleanupFinalizeResult>()
     let claims = ArrayList<(String, ServicePluginStartClaim)>()
     let supervisorFlags = ArrayList<ServicePluginSupervisorStopFlag>()
+    let fencedDispatches = ArrayList<(ServicePluginStdioProcess, ArrayList<ServicePluginDispatchTask>)>()
     synchronized(servicePluginProcessLock) {
         servicePluginHostShuttingDown = true
         for ((serviceId, claim) in servicePluginStartClaims) {
@@ -3455,7 +3746,7 @@ public func shutdownServicePluginHost(reason!: String = "shutdown", timeoutMilli
             }
         }
         for ((serviceId, process) in servicePluginActiveProcesses) {
-            process.fenceDispatch()
+            fencedDispatches.add((process, process.fenceDispatch()))
             activeIds.add(serviceId)
         }
         synchronized(servicePluginSupervisorLock) {
@@ -3470,6 +3761,7 @@ public func shutdownServicePluginHost(reason!: String = "shutdown", timeoutMilli
             }
         }
     }
+    for ((process, tasks) in fencedDispatches) { servicePluginWriteFencedEventAcks(tasks, process) }
     for (flag in supervisorFlags) { flag.stop() }
     for ((serviceId, _) in claims) { servicePluginRunStartPhaseHook(serviceId, "claim_cancelled") }
     for ((serviceId, claim) in claims) {
@@ -3963,25 +4255,67 @@ private func servicePluginEventPump(record: ServicePluginRuntimeRecord, process:
             continue
         }
         if (frame.frameType == "event") {
-            let currentEvent = synchronized(servicePluginProcessLock) {
-                if (servicePluginOwnerMatchesLocked(serviceId, process.ownerId, process.generation, claimToken: process.claimToken) && process.acceptDispatch()) {
-                    synchronized(servicePluginRuntimeRecordLock) { record.eventFrames.add(frame) }
-                    true
-                } else {
-                    false
-                }
+            let task = ServicePluginDispatchTask(record, frame)
+            let hasAckIdentity = task.hasAckIdentity()
+            if (hasAckIdentity && !task.ackable()) {
+                synchronized(servicePluginRuntimeRecordLock) { record.lastError = "invalid_event_ack_identity" }
+                continue
             }
-            if (!currentEvent) { return }
             let handled = handleServiceCapabilityEvent(ServiceCapabilityEvent(frame.serviceId, frame.capabilityId, payload: frame.payload))
-            if (handled.ok) {
-                servicePluginScheduleEventDispatch(record, frame, process)
-            } else {
-                synchronized(servicePluginProcessLock) {
-                    if (servicePluginOwnerMatchesLocked(serviceId, process.ownerId, process.generation, claimToken: process.claimToken)) {
-                        synchronized(servicePluginRuntimeRecordLock) { record.lastError = redactServicePayload(handled.diagnostic).text }
+            if (!handled.ok) {
+                synchronized(servicePluginRuntimeRecordLock) { record.lastError = redactServicePayload(handled.diagnostic).text }
+                if (task.ackable()) { servicePluginWriteEventAck(task, "admission", "retry", process) }
+                continue
+            }
+            let currentEvent = synchronized(servicePluginProcessLock) {
+                if (servicePluginOwnerMatchesLocked(serviceId, process.ownerId, process.generation, claimToken: process.claimToken)) {
+                    process.trySubmitDispatch(task)
+                } else { "cancelled" }
+            }
+            match (currentEvent) {
+                case "started" =>
+                    synchronized(servicePluginRuntimeRecordLock) { record.eventFrames.add(frame) }
+                    if (servicePluginWriteEventAck(task, "admission", "accepted", process)) {
+                        let confirmed = process.confirmAdmission(task)
+                        if (confirmed == "started") {
+                            servicePluginLaunchEventDispatchTask(task, process)
+                        } else if (confirmed == "cancelled") {
+                            let _ = servicePluginWriteEventAck(task, "admission", "cancelled", process)
+                        }
+                    } else {
+                        let next = process.rollbackAdmittedTask(task)
+                        match (next) { case Some(queued) => servicePluginLaunchEventDispatchTask(queued, process) case None => () }
                     }
-                }
-                process.finishDispatch()
+                case "queued" =>
+                    synchronized(servicePluginRuntimeRecordLock) { record.eventFrames.add(frame) }
+                    if (servicePluginWriteEventAck(task, "admission", "accepted", process)) {
+                        let confirmed = process.confirmAdmission(task)
+                        if (confirmed == "started") {
+                            servicePluginLaunchEventDispatchTask(task, process)
+                        } else if (confirmed == "cancelled") {
+                            let _ = servicePluginWriteEventAck(task, "admission", "cancelled", process)
+                        }
+                    } else { let _ = process.rollbackAdmittedTask(task) }
+                case "queue_full" =>
+                    if (task.ackable()) {
+                        let _ = servicePluginWriteEventAck(task, "admission", "queue_full", process)
+                    } else {
+                        servicePluginWriteFencedEventAcks(process.fenceDispatch(), process)
+                        var detached = ServicePluginDetachedOwner()
+                        synchronized(servicePluginProcessLock) {
+                            if (servicePluginOwnerMatchesLocked(serviceId, process.ownerId, process.generation, claimToken: process.claimToken)) {
+                                synchronized(servicePluginRuntimeRecordLock) {
+                                    record.status = "degraded"
+                                    record.degradedReason = "dispatch_queue_full_unrecoverable"
+                                    record.lastError = "dispatch_queue_full_unrecoverable"
+                                }
+                                detached = detachServicePluginOwnerLocked(serviceId, ownerId: process.ownerId, generation: process.generation, claimToken: process.claimToken)
+                            }
+                        }
+                        cleanupDetachedServicePluginOwner(serviceId, detached, "dispatch_queue_full_unrecoverable", diagnostic: "dispatch_queue_full_unrecoverable", joinPump: false)
+                        return
+                    }
+                case _ => let _ = servicePluginWriteEventAck(task, "admission", "cancelled", process)
             }
             continue
         }
@@ -4005,46 +4339,103 @@ private func servicePluginDrainDetachedOwner(process: ServicePluginStdioProcess,
     }
 }
 
-private func servicePluginScheduleEventDispatch(record: ServicePluginRuntimeRecord, frame: ServiceFrame, process: ServicePluginStdioProcess): Unit {
+private func servicePluginWriteEventAck(task: ServicePluginDispatchTask, phase: String, status: String, process: ServicePluginStdioProcess): Bool {
+    if (!task.ackable()) { return true }
+    let current = synchronized(servicePluginProcessLock) {
+        servicePluginOwnerMatchesLocked(task.record.registration.manifest.pluginId, process.ownerId, process.generation, claimToken: process.claimToken)
+    }
+    if (!current) { return false }
+    let ack = ServiceEventAck(METIS_SERVICE_PLUGIN_PROTOCOL_VERSION, task.deliveryId, task.eventId, task.attemptToken, phase, status)
+    let frame = ServiceFrame(
+        "response", "event-ack-${process.generation}-${task.admissionSequence}-${phase}",
+        task.record.registration.manifest.pluginId, method: "emitCapabilityEvent",
+        capabilityId: "gitcode.event.accepted", correlationId: task.attemptToken,
+        payload: encodeServiceEventAckPayload(ack)
+    )
+    try {
+        process.writeLine(encodeServiceFrame(frame).trimAscii())
+        match (servicePluginEventAckWrittenHookForTest) {
+            case Some(hook) => hook(task.frame.frameId, phase, status, process.dispatchSchedulerSnapshotForTest())
+            case None => ()
+        }
+        true
+    } catch (_: Exception) { false }
+}
+
+private func servicePluginWriteFencedEventAcks(tasks: ArrayList<ServicePluginDispatchTask>, process: ServicePluginStdioProcess): Unit {
+    for (task in tasks) { let _ = servicePluginWriteEventAck(task, "admission", "cancelled", process) }
+}
+
+private func servicePluginLaunchEventDispatchTask(task: ServicePluginDispatchTask, process: ServicePluginStdioProcess): Unit {
     let gate = ServicePluginEventPumpGate()
     let token = process.nextDispatchFutureToken()
-    let future = spawn {
-        gate.waitOpen()
-        try {
+    var launched = None<Future<Unit>>
+    try {
+        match (servicePluginDispatchLaunchHookForTest) { case Some(hook) => hook(task.frame.frameId) case None => () }
+        let future = spawn {
+            if (!gate.waitOpen()) {
+                gate.markWorkerSettled()
+                match (servicePluginDispatchWorkerSettledHookForTest) { case Some(hook) => hook(task.frame.frameId) case None => () }
+                return
+            }
+            var completed = false
+            try {
             let hookGate = ServicePluginDispatchGuardHookGate()
             let dispatchAllowed = { =>
                 let allowedBeforeHook = synchronized(servicePluginProcessLock) {
-                    servicePluginOwnerMatchesLocked(record.registration.manifest.pluginId, process.ownerId, process.generation, claimToken: process.claimToken) && process.dispatchAllowed()
+                    servicePluginOwnerMatchesLocked(task.record.registration.manifest.pluginId, process.ownerId, process.generation, claimToken: process.claimToken) && process.dispatchAllowed()
                 }
                 if (!allowedBeforeHook) { return false }
                 if (hookGate.take()) {
                     match (servicePluginBeforeEventDispatchHookForTest) {
-                        case Some(hook) => hook(record.registration.manifest.pluginId)
+                        case Some(hook) => hook(task.record.registration.manifest.pluginId)
                         case None => ()
                     }
                 }
                 synchronized(servicePluginProcessLock) {
-                    servicePluginOwnerMatchesLocked(record.registration.manifest.pluginId, process.ownerId, process.generation, claimToken: process.claimToken) && process.dispatchAllowed()
+                    servicePluginOwnerMatchesLocked(task.record.registration.manifest.pluginId, process.ownerId, process.generation, claimToken: process.claimToken) && process.dispatchAllowed()
                 }
             }
-            let dispatch = dispatchServicePluginEvent(frame, dispatchAllowed: dispatchAllowed)
+            let dispatch = dispatchServicePluginEvent(task.frame, dispatchAllowed: dispatchAllowed)
             synchronized(servicePluginProcessLock) {
                 if (servicePluginOwnerMatchesLocked(
-                    record.registration.manifest.pluginId,
+                    task.record.registration.manifest.pluginId,
                     process.ownerId,
                     process.generation,
                     claimToken: process.claimToken
                 )) {
-                    servicePluginRecordRuntimeDispatchLocked(record, frame, dispatch)
+                    servicePluginRecordRuntimeDispatchLocked(task.record, task.frame, dispatch)
+                    completed = dispatch.status != "dispatch_cancelled"
                 }
             }
-        } finally {
-            process.finishDispatchFuture(token)
-            let _ = servicePluginFinalizeCleanupPending(record.registration.manifest.pluginId, process, timeoutMs: 1000)
+            if (!completed) { let _ = servicePluginWriteEventAck(task, "admission", "retry", process) }
+            } catch (_: Exception) {
+                let _ = servicePluginWriteEventAck(task, "admission", "retry", process)
+            } finally {
+                if (completed) { let _ = servicePluginWriteEventAck(task, "completion", "completed", process) }
+                let next = process.finishDispatchFuture(token)
+                match (next) { case Some(queued) => servicePluginLaunchEventDispatchTask(queued, process) case None => () }
+                let _ = servicePluginFinalizeCleanupPending(task.record.registration.manifest.pluginId, process, timeoutMs: 1000)
+                gate.markWorkerSettled()
+                match (servicePluginDispatchWorkerSettledHookForTest) { case Some(hook) => hook(task.frame.frameId) case None => () }
+            }
         }
+        launched = Some(future)
+        match (servicePluginDispatchRegisterHookForTest) { case Some(hook) => hook(task.frame.frameId) case None => () }
+        process.registerDispatchFuture(token, future)
+        gate.open()
+    } catch (_: Exception) {
+        match (launched) {
+            case Some(future) =>
+                gate.cancel()
+                gate.waitWorkerSettled()
+                try { let _ = future.get(Duration.second) } catch (_: Exception) { () }
+            case None => ()
+        }
+        let next = process.rollbackDispatchLaunch()
+        let _ = servicePluginWriteEventAck(task, "admission", "retry", process)
+        match (next) { case Some(queued) => servicePluginLaunchEventDispatchTask(queued, process) case None => () }
     }
-    process.registerDispatchFuture(token, future)
-    gate.open()
 }
 
 private func servicePluginRecordRuntimeDispatchLocked(record: ServicePluginRuntimeRecord, frame: ServiceFrame, dispatch: ServicePluginEventDispatchResult): Unit {
@@ -4230,6 +4621,7 @@ public func stopServicePlugin(serviceId: String, reason!: String = "", timeoutMi
             let terminalDeadline = ServicePluginProbeDeadline(deadlineMs)
             let stopReserveMs = max(1, effectiveTimeoutMillis / 2)
             var selectedProcess = None<ServicePluginStdioProcess>
+            var fencedTasks = ArrayList<ServicePluginDispatchTask>()
             var pendingClaim = None<ServicePluginStartClaim>
             var stopClaimed = false
             synchronized(servicePluginProcessLock) {
@@ -4240,7 +4632,7 @@ public func stopServicePlugin(serviceId: String, reason!: String = "", timeoutMi
                     record.status = "stopping"
                     match (servicePluginActiveProcesses.get(sid)) {
                         case Some(process) =>
-                            process.fenceDispatch()
+                            fencedTasks = process.fenceDispatch()
                             selectedProcess = Some(process)
                         case None => ()
                     }
@@ -4252,6 +4644,7 @@ public func stopServicePlugin(serviceId: String, reason!: String = "", timeoutMi
                     }
                 }
             }
+            match (selectedProcess) { case Some(process) => servicePluginWriteFencedEventAcks(fencedTasks, process) case None => () }
             if (!stopClaimed) {
                 let status = synchronized(servicePluginProcessLock) { if (servicePluginHasCleanupPendingLocked(sid)) { "cleanup_pending" } else { "stopping" } }
                 return ServiceStopResult(false, sid, status, diagnostic: if (status == "cleanup_pending") { "service plugin owner cleanup is pending" } else { "service plugin stop already in progress" })
@@ -4278,7 +4671,7 @@ public func stopServicePlugin(serviceId: String, reason!: String = "", timeoutMi
                         case None => None<ServicePluginStdioProcess>
                     }
                 }
-                match (selectedProcess) { case Some(process) => process.fenceDispatch() case None => () }
+                match (selectedProcess) { case Some(process) => servicePluginWriteFencedEventAcks(process.fenceDispatch(), process) case None => () }
             }
             var dispatchStatus = "not_started"
             var ingressStopStatus = "not_started"

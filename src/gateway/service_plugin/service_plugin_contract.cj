@@ -125,6 +125,74 @@ public class ServicePluginPayloadStatus {
     }
 }
 
+public class ServiceEventAck {
+    public let protocolVersion: String
+    public let deliveryId: String
+    public let eventId: String
+    public let attemptToken: String
+    public let phase: String
+    public let status: String
+
+    public init(protocolVersion: String, deliveryId: String, eventId: String, attemptToken: String, phase: String, status: String) {
+        this.protocolVersion = protocolVersion.trimAscii()
+        this.deliveryId = deliveryId.trimAscii()
+        this.eventId = eventId.trimAscii()
+        this.attemptToken = attemptToken.trimAscii()
+        this.phase = phase.trimAscii()
+        this.status = status.trimAscii()
+    }
+}
+
+public class ServiceEventAckParseResult {
+    public let ok: Bool
+    public let status: String
+    public let ack: ServiceEventAck
+
+    public init(ok: Bool, status!: String = "ok", ack!: ServiceEventAck = ServiceEventAck("", "", "", "", "", "")) {
+        this.ok = ok
+        this.status = status
+        this.ack = ack
+    }
+}
+
+private func serviceEventAckStatusAllowed(phase: String, status: String): Bool {
+    (phase == "admission" && (status == "accepted" || status == "queue_full" || status == "cancelled" || status == "retry")) ||
+        (phase == "completion" && status == "completed")
+}
+
+public func parseServiceEventAckPayload(payload: String): ServiceEventAckParseResult {
+    let root = try { JsonValue.fromStr(payload.trimAscii()).asObject() } catch (_: Exception) {
+        return ServiceEventAckParseResult(false, status: "ack_invalid_json")
+    }
+    let ack = ServiceEventAck(
+        serviceJsonString(root, "protocolVersion"), serviceJsonString(root, "deliveryId"),
+        serviceJsonString(root, "eventId"), serviceJsonString(root, "attemptToken"),
+        serviceJsonString(root, "phase"), serviceJsonString(root, "status")
+    )
+    for (field in [ack.protocolVersion, ack.deliveryId, ack.eventId, ack.attemptToken, ack.phase, ack.status]) {
+        if (field.isEmpty()) { return ServiceEventAckParseResult(false, status: "ack_missing_field") }
+    }
+    if (ack.deliveryId.size > 4096 || ack.eventId.size > 4096 || ack.attemptToken.size > 4096 ||
+        ack.protocolVersion.size > 32 || ack.phase.size > 32 || ack.status.size > 32) {
+        return ServiceEventAckParseResult(false, status: "ack_field_too_large")
+    }
+    if (ack.protocolVersion != METIS_SERVICE_PLUGIN_PROTOCOL_VERSION) { return ServiceEventAckParseResult(false, status: "ack_protocol_mismatch") }
+    if (ack.phase != "admission" && ack.phase != "completion") { return ServiceEventAckParseResult(false, status: "ack_unknown_phase") }
+    if (!serviceEventAckStatusAllowed(ack.phase, ack.status)) { return ServiceEventAckParseResult(false, status: "ack_unknown_status") }
+    ServiceEventAckParseResult(true, ack: ack)
+}
+
+public func encodeServiceEventAckPayload(ack: ServiceEventAck): String {
+    let root = JsonObject()
+    root.put("protocolVersion", JsonString(ack.protocolVersion))
+    root.put("deliveryId", JsonString(ack.deliveryId))
+    root.put("eventId", JsonString(ack.eventId))
+    root.put("attemptToken", JsonString(ack.attemptToken))
+    root.put("phase", JsonString(ack.phase))
+    root.put("status", JsonString(ack.status))
+    serviceCompactFrameJson(root.toJsonString())
+}
+
 public func parseServicePluginPayloadStatus(payload: String): ServicePluginPayloadStatus {
     let raw = payload.trimAscii()
     if (raw.isEmpty()) {

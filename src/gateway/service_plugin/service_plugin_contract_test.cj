@@ -307,4 +307,45 @@ public class ServicePluginContractTest {
         @Expect(tooLarge.reason, "payload_too_large")
         @Expect(tooLarge.payloadHash.startsWith("payload-"), true)
     }
+
+    @TestCase
+    public func s1aU1EventAckRoundTripsUnicodeAdmissionAndCompletion(): Unit {
+        for (ack in [
+            ServiceEventAck("1.0", "delivery-中文🙂", "event-中文🙂", "attempt-中文🙂", "admission", "accepted"),
+            ServiceEventAck("1.0", "delivery-中文🙂", "event-中文🙂", "attempt-中文🙂", "completion", "completed")
+        ]) {
+            let parsed = parseServiceEventAckPayload(encodeServiceEventAckPayload(ack))
+            @Expect(parsed.ok, true)
+            @Expect(parsed.ack.deliveryId, ack.deliveryId)
+            @Expect(parsed.ack.eventId, ack.eventId)
+            @Expect(parsed.ack.attemptToken, ack.attemptToken)
+            @Expect(parsed.ack.phase, ack.phase)
+            @Expect(parsed.ack.status, ack.status)
+        }
+    }
+
+    @TestCase
+    public func s1aB1EventAckAcceptsFieldBoundaryAndRejectsOversize(): Unit {
+        let maxId = this.repeatText("x", 4096)
+        @Expect(parseServiceEventAckPayload(encodeServiceEventAckPayload(ServiceEventAck("1.0", maxId, maxId, maxId, "admission", "accepted"))).ok, true)
+        let tooLarge = parseServiceEventAckPayload(encodeServiceEventAckPayload(ServiceEventAck("1.0", this.repeatText("x", 4097), "event", "attempt", "admission", "accepted")))
+        @Expect(tooLarge.ok, false)
+        @Expect(tooLarge.status, "ack_field_too_large")
+    }
+
+    @TestCase
+    public func s1aP1EventAckSupportsEveryAllowedPhaseStatusPair(): Unit {
+        for ((phase, status) in [("admission", "accepted"), ("admission", "queue_full"), ("admission", "cancelled"), ("admission", "retry"), ("completion", "completed")]) {
+            @Expect(parseServiceEventAckPayload(encodeServiceEventAckPayload(ServiceEventAck("1.0", "delivery", "event", "attempt", phase, status))).ok, true)
+        }
+    }
+
+    @TestCase
+    public func s1aN1EventAckRejectsMalformedMissingAndUnknownValues(): Unit {
+        @Expect(parseServiceEventAckPayload("{").status, "ack_invalid_json")
+        @Expect(parseServiceEventAckPayload("{}").status, "ack_missing_field")
+        @Expect(parseServiceEventAckPayload(encodeServiceEventAckPayload(ServiceEventAck("2.0", "delivery", "event", "attempt", "admission", "accepted"))).status, "ack_protocol_mismatch")
+        @Expect(parseServiceEventAckPayload(encodeServiceEventAckPayload(ServiceEventAck("1.0", "delivery", "event", "attempt", "unknown", "accepted"))).status, "ack_unknown_phase")
+        @Expect(parseServiceEventAckPayload(encodeServiceEventAckPayload(ServiceEventAck("1.0", "delivery", "event", "attempt", "completion", "retry"))).status, "ack_unknown_status")
+    }
 }
