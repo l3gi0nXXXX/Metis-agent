@@ -3,6 +3,7 @@ package metis.core.prompting
 import std.collection.ArrayList
 import std.fs.{Path, File, Directory, FileInfo, exists, canonicalize, remove, rename}
 import std.io.*
+import std.sync.{Condition, Mutex}
 import std.time.DateTime
 
 private const AGENTS_FILENAME = "AGENTS.md"
@@ -14,6 +15,11 @@ private const HEARTBEAT_FILENAME = "HEARTBEAT.md"
 private const BOOTSTRAP_FILENAME = "BOOTSTRAP.md"
 private const MEMORY_FILENAME = "MEMORY.md"
 private const MEMORY_ALT_FILENAME = "memory.md"
+private const WORKSPACE_BOOTSTRAP_CACHE_MAX_ENTRIES: Int64 = 8
+private const BOOTSTRAP_LOAD_FAILURE_WARNING_PREFIX = "workspace bootstrap load failed:"
+private const INVALID_BOOTSTRAP_ENCODING = "invalid_bootstrap_encoding"
+private const UNREADABLE_BOOTSTRAP_FILE = "unreadable_bootstrap_file"
+private const BOOTSTRAP_LOAD_FAILED = "bootstrap_load_failed"
 
 // BOOTSTRAP.md is an explicit, user-created setup-state file: load it in full prompt mode
 // when present, but do not auto-create it as durable workspace memory for every agent.
@@ -370,7 +376,33 @@ private func buildMissingContextFile(path: Path): MetisContextFile {
 }
 
 private func loadContextFile(path: Path): MetisContextFile {
-    MetisContextFile(canonicalPathString(path), readTextFile(path))
+    let bytes = try {
+        File.readFrom(path)
+    } catch (_: Exception) {
+        return MetisContextFile(
+            canonicalPathString(path),
+            "[INVALID] Workspace context file ${path.fileName}: ${UNREADABLE_BOOTSTRAP_FILE}"
+        )
+    }
+    let content = try {
+        String.fromUtf8(bytes)
+    } catch (_: Exception) {
+        return MetisContextFile(
+            canonicalPathString(path),
+            "[INVALID] Workspace context file ${path.fileName}: ${INVALID_BOOTSTRAP_ENCODING}"
+        )
+    }
+    MetisContextFile(canonicalPathString(path), content)
+}
+
+private func bootstrapContextFileLoadFailure(file: MetisContextFile): String {
+    if (file.content.contains(INVALID_BOOTSTRAP_ENCODING)) {
+        return INVALID_BOOTSTRAP_ENCODING
+    }
+    if (file.content.contains(UNREADABLE_BOOTSTRAP_FILE)) {
+        return UNREADABLE_BOOTSTRAP_FILE
+    }
+    ""
 }
 
 private func shouldIncludeInMinimalMode(fileName: String): Bool {
@@ -386,60 +418,427 @@ private func shouldSkipInCompactImMode(fileName: String): Bool {
     fileName == USER_FILENAME || fileName == HEARTBEAT_FILENAME || fileName == BOOTSTRAP_FILENAME
 }
 
+private func workspaceBootstrapFileIdentity(path: Path): String {
+    if (!exists(path)) {
+        return "${path.fileName}:missing"
+    }
+    try {
+        let info = FileInfo(path)
+        let modified = info.lastModificationTime.toUnixTimeStamp().toNanoseconds()
+        "${path.fileName}:present:${info.size}:${modified}"
+    } catch (_: Exception) {
+        "${path.fileName}:present:identity_unavailable"
+    }
+}
+
+private func workspaceBootstrapCacheKey(
+    workspaceDir: Path,
+    promptMode: PromptMode,
+    runtimeChannel: String
+): String {
+    let normalizedChannel = runtimeChannel.trimAscii().toAsciiLower()
+    let minimalMode = match (promptMode) {
+        case PromptMode.MinimalMode => true
+        case _ => false
+    }
+    let compactImMode = shouldUseCompactImBootstrap(normalizedChannel)
+    let identities = ArrayList<String>()
+    let baseNames = [
+        AGENTS_FILENAME,
+        SOUL_FILENAME,
+        TOOLS_FILENAME,
+        IDENTITY_FILENAME,
+        USER_FILENAME,
+        HEARTBEAT_FILENAME
+    ]
+    for (name in baseNames) {
+        if (minimalMode && !shouldIncludeInMinimalMode(name)) {
+            continue
+        }
+        if (!minimalMode && compactImMode && shouldSkipInCompactImMode(name)) {
+            continue
+        }
+        identities.add(workspaceBootstrapFileIdentity(workspaceDir.join(name)))
+    }
+    if (!minimalMode) {
+        if (!compactImMode) {
+            identities.add(workspaceBootstrapFileIdentity(workspaceDir.join(BOOTSTRAP_FILENAME)))
+        }
+        // Both spellings affect which memory file wins and therefore both belong to the identity.
+        identities.add(workspaceBootstrapFileIdentity(workspaceDir.join(MEMORY_FILENAME)))
+        identities.add(workspaceBootstrapFileIdentity(workspaceDir.join(MEMORY_ALT_FILENAME)))
+    }
+    let modeKey = match (promptMode) {
+        case PromptMode.FullMode => "full"
+        case PromptMode.MinimalMode => "minimal"
+        case PromptMode.NoneMode => "none"
+    }
+    let parts = ArrayList<String>()
+    parts.add(canonicalPathString(workspaceDir))
+    parts.add(modeKey)
+    parts.add(normalizedChannel)
+    for (identity in identities) {
+        parts.add(identity)
+    }
+    let encoded = ArrayList<String>()
+    for (part in parts) {
+        encoded.add("${part.size}:${part}")
+    }
+    String.join(encoded.toArray(), delimiter: "|")
+}
+
+private func cloneMetisBootstrapBudgetResult(source: MetisBootstrapBudgetResult): MetisBootstrapBudgetResult {
+    let result = MetisBootstrapBudgetResult()
+    let files = ArrayList<MetisContextFile>()
+    for (file in source.files) {
+        files.add(MetisContextFile(file.path, file.content))
+    }
+    let warnings = ArrayList<String>()
+    for (warning in source.warnings) {
+        warnings.add(warning)
+    }
+    result.files = files.toArray()
+    result.warnings = warnings.toArray()
+    result.totalChars = source.totalChars
+    result.originalTotalChars = source.originalTotalChars
+    result.truncatedFiles = source.truncatedFiles
+    result.missingFiles = source.missingFiles
+    result.skippedFiles = source.skippedFiles
+    result
+}
+
+private func workspaceBootstrapResultIsCacheable(result: MetisBootstrapBudgetResult): Bool {
+    for (warning in result.warnings) {
+        if (warning.startsWith(BOOTSTRAP_LOAD_FAILURE_WARNING_PREFIX)) {
+            return false
+        }
+    }
+    true
+}
+
+private func workspaceBootstrapLoadFailureResult(reason: String): MetisBootstrapBudgetResult {
+    let content = "[INVALID] Workspace bootstrap unavailable: ${reason}"
+    let result = MetisBootstrapBudgetResult()
+    result.files = [MetisContextFile("workspace-bootstrap", content)]
+    result.warnings = ["${BOOTSTRAP_LOAD_FAILURE_WARNING_PREFIX} ${reason}"]
+    result.totalChars = content.size
+    result.originalTotalChars = content.size
+    result
+}
+
+private class MetisWorkspaceBootstrapCacheEntry {
+    let key: String
+    let result: MetisBootstrapBudgetResult
+    var lastUsed: Int64
+
+    init(key: String, result: MetisBootstrapBudgetResult, lastUsed: Int64) {
+        this.key = key
+        this.result = result
+        this.lastUsed = lastUsed
+    }
+}
+
+private class MetisWorkspaceBootstrapFlight {
+    let key: String
+    let epoch: Int64
+    let token: Int64
+    var loading: Bool = true
+    var result: Option<MetisBootstrapBudgetResult> = None
+
+    init(key: String, epoch: Int64, token: Int64) {
+        this.key = key
+        this.epoch = epoch
+        this.token = token
+    }
+}
+
+public class MetisWorkspaceBootstrapCacheStats {
+    public var loads: Int64 = 0
+    public var hits: Int64 = 0
+    public var waits: Int64 = 0
+    public var evictions: Int64 = 0
+    public var completedEntries: Int64 = 0
+    public var inFlight: Int64 = 0
+    public init() {}
+}
+
+private class MetisWorkspaceBootstrapCache {
+    private let lock = Mutex()
+    private var condition: Condition
+    private let entries = ArrayList<MetisWorkspaceBootstrapCacheEntry>()
+    private let flights = ArrayList<MetisWorkspaceBootstrapFlight>()
+    private var sequence: Int64 = 0
+    private var epoch: Int64 = 0
+    private var flightSequence: Int64 = 0
+    private var loads: Int64 = 0
+    private var hits: Int64 = 0
+    private var waits: Int64 = 0
+    private var evictions: Int64 = 0
+    private var beforeLoadHook: Option<(String) -> Unit> = None
+
+    init() {
+        synchronized(this.lock) {
+            this.condition = this.lock.condition()
+        }
+    }
+
+    private func nextSequenceLocked(): Int64 {
+        this.sequence += 1
+        this.sequence
+    }
+
+    private func removeFlightLocked(flight: MetisWorkspaceBootstrapFlight): Unit {
+        for (i in 0..this.flights.size) {
+            if (this.flights[i].token == flight.token) {
+                let _ = this.flights.remove(at: i)
+                return
+            }
+        }
+    }
+
+    private func ownsFlightLocked(flight: MetisWorkspaceBootstrapFlight): Bool {
+        if (flight.epoch != this.epoch) {
+            return false
+        }
+        for (current in this.flights) {
+            if (current.token == flight.token) {
+                return true
+            }
+        }
+        false
+    }
+
+    private func addCompletedLocked(key: String, result: MetisBootstrapBudgetResult): Unit {
+        if (Int64(this.entries.size) >= WORKSPACE_BOOTSTRAP_CACHE_MAX_ENTRIES) {
+            var oldestIndex: Int64 = 0
+            var oldestSequence = this.entries[0].lastUsed
+            for (i in 1..this.entries.size) {
+                if (this.entries[i].lastUsed < oldestSequence) {
+                    oldestIndex = Int64(i)
+                    oldestSequence = this.entries[i].lastUsed
+                }
+            }
+            let _ = this.entries.remove(at: oldestIndex)
+            this.evictions += 1
+        }
+        this.entries.add(
+            MetisWorkspaceBootstrapCacheEntry(
+                key,
+                cloneMetisBootstrapBudgetResult(result),
+                this.nextSequenceLocked()
+            )
+        )
+    }
+
+    func getOrLoad(key: String, load: () -> MetisBootstrapBudgetResult): MetisBootstrapBudgetResult {
+        var ownedFlight = None<MetisWorkspaceBootstrapFlight>
+        var hook = None<(String) -> Unit>
+        synchronized(this.lock) {
+            for (entry in this.entries) {
+                if (entry.key == key) {
+                    entry.lastUsed = this.nextSequenceLocked()
+                    this.hits += 1
+                    return cloneMetisBootstrapBudgetResult(entry.result)
+                }
+            }
+            for (flight in this.flights) {
+                if (flight.key == key) {
+                    this.waits += 1
+                    while (flight.loading) {
+                        this.condition.wait()
+                    }
+                    return match (flight.result) {
+                        case Some(result) => cloneMetisBootstrapBudgetResult(result)
+                        case None => workspaceBootstrapLoadFailureResult(BOOTSTRAP_LOAD_FAILED)
+                    }
+                }
+            }
+            this.flightSequence += 1
+            let flight = MetisWorkspaceBootstrapFlight(key, this.epoch, this.flightSequence)
+            this.flights.add(flight)
+            this.loads += 1
+            ownedFlight = Some(flight)
+            hook = this.beforeLoadHook
+        }
+
+        let loaded = try {
+            match (hook) {
+                case Some(callback) => callback(key)
+                case None => ()
+            }
+            load()
+        } catch (_: Exception) {
+            workspaceBootstrapLoadFailureResult(BOOTSTRAP_LOAD_FAILED)
+        }
+        synchronized(this.lock) {
+            match (ownedFlight) {
+                case Some(flight) =>
+                    if (this.ownsFlightLocked(flight)) {
+                        flight.result = Some(cloneMetisBootstrapBudgetResult(loaded))
+                        flight.loading = false
+                        this.removeFlightLocked(flight)
+                        if (workspaceBootstrapResultIsCacheable(loaded)) {
+                            this.addCompletedLocked(key, loaded)
+                        }
+                    }
+                case None => ()
+            }
+            this.condition.notifyAll()
+        }
+        cloneMetisBootstrapBudgetResult(loaded)
+    }
+
+    func reset(): Unit {
+        synchronized(this.lock) {
+            this.epoch += 1
+            this.entries.clear()
+            for (flight in this.flights) {
+                flight.result = Some(workspaceBootstrapLoadFailureResult(BOOTSTRAP_LOAD_FAILED))
+                flight.loading = false
+            }
+            this.flights.clear()
+            this.sequence = 0
+            this.loads = 0
+            this.hits = 0
+            this.waits = 0
+            this.evictions = 0
+            this.beforeLoadHook = None
+            this.condition.notifyAll()
+        }
+    }
+
+    func setBeforeLoadHook(hook: Option<(String) -> Unit>): Unit {
+        synchronized(this.lock) {
+            this.beforeLoadHook = hook
+        }
+    }
+
+    func stats(): MetisWorkspaceBootstrapCacheStats {
+        synchronized(this.lock) {
+            let result = MetisWorkspaceBootstrapCacheStats()
+            result.loads = this.loads
+            result.hits = this.hits
+            result.waits = this.waits
+            result.evictions = this.evictions
+            result.completedEntries = Int64(this.entries.size)
+            result.inFlight = Int64(this.flights.size)
+            result
+        }
+    }
+}
+
+private let metisWorkspaceBootstrapCache = MetisWorkspaceBootstrapCache()
+
+public func resetMetisWorkspaceBootstrapCacheForTest(): Unit {
+    metisWorkspaceBootstrapCache.reset()
+}
+
+public func setMetisWorkspaceBootstrapBeforeLoadHookForTest(hook: Option<(String) -> Unit>): Unit {
+    metisWorkspaceBootstrapCache.setBeforeLoadHook(hook)
+}
+
+public func metisWorkspaceBootstrapCacheStatsForTest(): MetisWorkspaceBootstrapCacheStats {
+    metisWorkspaceBootstrapCache.stats()
+}
+
+public func metisWorkspaceBootstrapCacheKeyForTest(
+    workspaceDir: Path,
+    promptMode!: PromptMode = PromptMode.FullMode,
+    runtimeChannel!: String = ""
+): String {
+    workspaceBootstrapCacheKey(workspaceDir, promptMode, runtimeChannel)
+}
+
+private func addLoadedContextFile(
+    files: ArrayList<MetisContextFile>,
+    loadFailures: ArrayList<String>,
+    path: Path
+): Unit {
+    let file = loadContextFile(path)
+    let failure = bootstrapContextFileLoadFailure(file)
+    if (!failure.isEmpty()) {
+        loadFailures.add(failure)
+    }
+    files.add(file)
+}
+
+private func resolveContextFilesDetailedUncached(
+    workspaceDir: Path,
+    promptMode: PromptMode,
+    runtimeChannel: String
+): MetisBootstrapBudgetResult {
+    let files = ArrayList<MetisContextFile>()
+    let loadFailures = ArrayList<String>()
+    let minimalMode = match (promptMode) {
+        case PromptMode.MinimalMode => true
+        case _ => false
+    }
+    let compactImMode = shouldUseCompactImBootstrap(runtimeChannel)
+    let baseNames = [
+        AGENTS_FILENAME,
+        SOUL_FILENAME,
+        TOOLS_FILENAME,
+        IDENTITY_FILENAME,
+        USER_FILENAME,
+        HEARTBEAT_FILENAME
+    ]
+
+    for (name in baseNames) {
+        if (minimalMode && !shouldIncludeInMinimalMode(name)) {
+            continue
+        }
+        if (!minimalMode && compactImMode && shouldSkipInCompactImMode(name)) {
+            continue
+        }
+        let path = workspaceDir.join(name)
+        if (exists(path)) {
+            addLoadedContextFile(files, loadFailures, path)
+        } else {
+            files.add(buildMissingContextFile(path))
+        }
+    }
+
+    if (!minimalMode) {
+        let bootstrapPath = workspaceDir.join(BOOTSTRAP_FILENAME)
+        if (!compactImMode && exists(bootstrapPath)) {
+            addLoadedContextFile(files, loadFailures, bootstrapPath)
+        }
+
+        let memoryPath = workspaceDir.join(MEMORY_FILENAME)
+        let memoryAltPath = workspaceDir.join(MEMORY_ALT_FILENAME)
+        if (exists(memoryPath)) {
+            addLoadedContextFile(files, loadFailures, memoryPath)
+        } else if (exists(memoryAltPath)) {
+            addLoadedContextFile(files, loadFailures, memoryAltPath)
+        } else {
+            files.add(buildMissingContextFile(memoryPath))
+        }
+    }
+
+    let result = MetisBootstrapBudget.buildContextFiles(files.toArray())
+    if (!loadFailures.isEmpty()) {
+        let warnings = ArrayList<String>()
+        for (warning in result.warnings) {
+            warnings.add(warning)
+        }
+        for (failure in loadFailures) {
+            warnings.add("${BOOTSTRAP_LOAD_FAILURE_WARNING_PREFIX} ${failure}")
+        }
+        result.warnings = warnings.toArray()
+    }
+    result
+}
+
 public class MetisWorkspaceBootstrap {
     public static func resolveContextFilesDetailed(
         workspaceDir: Path,
         promptMode!: PromptMode = PromptMode.FullMode,
         runtimeChannel!: String = ""
     ): MetisBootstrapBudgetResult {
-        let files = ArrayList<MetisContextFile>()
-        let minimalMode = match (promptMode) {
-            case PromptMode.MinimalMode => true
-            case _ => false
-        }
-        let compactImMode = shouldUseCompactImBootstrap(runtimeChannel)
-        let baseNames = [
-            AGENTS_FILENAME,
-            SOUL_FILENAME,
-            TOOLS_FILENAME,
-            IDENTITY_FILENAME,
-            USER_FILENAME,
-            HEARTBEAT_FILENAME
-        ]
-
-        for (name in baseNames) {
-            if (minimalMode && !shouldIncludeInMinimalMode(name)) {
-                continue
-            }
-            if (!minimalMode && compactImMode && shouldSkipInCompactImMode(name)) {
-                continue
-            }
-            let path = workspaceDir.join(name)
-            if (exists(path)) {
-                files.add(loadContextFile(path))
-            } else {
-                files.add(buildMissingContextFile(path))
-            }
-        }
-
-        if (!minimalMode) {
-            let bootstrapPath = workspaceDir.join(BOOTSTRAP_FILENAME)
-            if (!compactImMode && exists(bootstrapPath)) {
-                files.add(loadContextFile(bootstrapPath))
-            }
-
-            let memoryPath = workspaceDir.join(MEMORY_FILENAME)
-            let memoryAltPath = workspaceDir.join(MEMORY_ALT_FILENAME)
-            if (exists(memoryPath)) {
-                files.add(loadContextFile(memoryPath))
-            } else if (exists(memoryAltPath)) {
-                files.add(loadContextFile(memoryAltPath))
-            } else {
-                files.add(buildMissingContextFile(memoryPath))
-            }
-        }
-
-        MetisBootstrapBudget.buildContextFiles(files.toArray())
+        let key = workspaceBootstrapCacheKey(workspaceDir, promptMode, runtimeChannel)
+        metisWorkspaceBootstrapCache.getOrLoad(key, { =>
+            resolveContextFilesDetailedUncached(workspaceDir, promptMode, runtimeChannel)
+        })
     }
 
     public static func resolveContextFiles(

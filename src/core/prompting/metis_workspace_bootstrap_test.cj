@@ -2,7 +2,11 @@ package metis.core.prompting
 
 import metis.utils.ShellUtils
 
+import std.collection.ArrayList
+import std.core.Duration
 import std.fs.{Directory, File, OpenMode, Path, exists, remove}
+import std.sync.{Condition, Mutex}
+import std.time.{DateTime, MonoTime}
 import std.unittest.testmacro.*
 
 private func repeatWorkspaceText(text: String, count: Int64): String {
@@ -37,9 +41,338 @@ private func bootstrapStateHasName(files: Array<MetisAgentWorkspaceBootstrapFile
     false
 }
 
+private func writeWorkspaceBootstrapCacheFixture(root: Path, memory: String): Unit {
+    Directory.create(root, recursive: true)
+    File.writeTo(root.join("AGENTS.md"), "# Agents 中文🙂\n".toArray())
+    File.writeTo(root.join("SOUL.md"), "# Soul\n".toArray())
+    File.writeTo(root.join("TOOLS.md"), "# Tools\n".toArray())
+    File.writeTo(root.join("IDENTITY.md"), "# Identity\n".toArray())
+    File.writeTo(root.join("USER.md"), "# User\n".toArray())
+    File.writeTo(root.join("HEARTBEAT.md"), "# Heartbeat\n".toArray())
+    File.writeTo(root.join("MEMORY.md"), memory.toArray())
+}
+
+private func workspaceBootstrapResultSignature(result: MetisBootstrapBudgetResult): String {
+    let parts = ArrayList<String>()
+    for (file in result.files) {
+        parts.add("FILE=${file.path}\n${file.content}")
+    }
+    for (warning in result.warnings) {
+        parts.add("WARNING=${warning}")
+    }
+    parts.add(
+        "TOTAL=${result.totalChars}:${result.originalTotalChars}:${result.truncatedFiles}:${result.missingFiles}:${result.skippedFiles}"
+    )
+    String.join(parts.toArray(), delimiter: "\n--\n")
+}
+
+private func workspaceBootstrapPathOrder(result: MetisBootstrapBudgetResult): String {
+    let paths = ArrayList<String>()
+    for (file in result.files) {
+        paths.add(file.path)
+    }
+    String.join(paths.toArray(), delimiter: "|")
+}
+
+private func workspaceBootstrapContains(result: MetisBootstrapBudgetResult, text: String): Bool {
+    for (file in result.files) {
+        if (file.content.contains(text)) {
+            return true
+        }
+    }
+    false
+}
+
+private func workspaceBootstrapMemoryContent(result: MetisBootstrapBudgetResult): String {
+    for (file in result.files) {
+        if (file.path.endsWith("MEMORY.md") || file.path.endsWith("memory.md")) {
+            return file.content
+        }
+    }
+    ""
+}
+
+private func workspaceBootstrapHasWarning(result: MetisBootstrapBudgetResult, text: String): Bool {
+    for (warning in result.warnings) {
+        if (warning.contains(text)) {
+            return true
+        }
+    }
+    false
+}
+
+private class WorkspaceBootstrapLoadGate {
+    private let lock = Mutex()
+    private var condition: Condition
+    private var released: Bool = false
+
+    init() {
+        synchronized(this.lock) {
+            this.condition = this.lock.condition()
+        }
+    }
+
+    func waitForRelease(): Unit {
+        synchronized(this.lock) {
+            while (!this.released) {
+                this.condition.wait()
+            }
+        }
+    }
+
+    func release(): Unit {
+        synchronized(this.lock) {
+            this.released = true
+            this.condition.notifyAll()
+        }
+    }
+}
+
+private func waitForWorkspaceBootstrapWaiters(expected: Int64): Bool {
+    let deadline = MonoTime.now() + Duration.second * 5
+    while (MonoTime.now() < deadline) {
+        if (metisWorkspaceBootstrapCacheStatsForTest().waits >= expected) {
+            return true
+        }
+        sleep(Duration.millisecond * 5)
+    }
+    false
+}
+
+private func waitForWorkspaceBootstrapInFlight(expected: Int64): Bool {
+    let deadline = MonoTime.now() + Duration.second * 5
+    while (MonoTime.now() < deadline) {
+        if (metisWorkspaceBootstrapCacheStatsForTest().inFlight == expected) {
+            return true
+        }
+        sleep(Duration.millisecond * 5)
+    }
+    false
+}
+
 @Test
 public class MetisWorkspaceBootstrapTest {
-    /*
+    @TestCase
+    public func s4U1BootstrapCacheReturnsDefensiveByteIdenticalResult(): Unit {
+        let root = Path("/tmp/metis-bootstrap-cache-s4-u1-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
+        try {
+            resetMetisWorkspaceBootstrapCacheForTest()
+            writeWorkspaceBootstrapCacheFixture(root, "# Memory\n中文记忆🙂\n")
+
+            let first = MetisWorkspaceBootstrap.resolveContextFilesDetailed(root)
+            let expected = workspaceBootstrapResultSignature(first)
+            first.files[0].content = "caller mutation"
+            first.warnings = ["caller mutation"]
+            let second = MetisWorkspaceBootstrap.resolveContextFilesDetailed(root)
+            let stats = metisWorkspaceBootstrapCacheStatsForTest()
+
+            @Expect(workspaceBootstrapResultSignature(second), expected)
+            @Expect(stats.loads, 1)
+            @Expect(stats.hits, 1)
+            @Expect(stats.completedEntries, 1)
+        } finally {
+            resetMetisWorkspaceBootstrapCacheForTest()
+            cleanupWorkspaceBootstrapTestDir(root)
+        }
+    }
+
+    @TestCase
+    public func s4B1ConcurrentLoadsSingleFlightAndLruIsBounded(): Unit {
+        let stamp = DateTime.now().toUnixTimeStamp().toNanoseconds()
+        let root = Path("/tmp/metis-bootstrap-cache-s4-b1-${stamp}")
+        let extraRoots = ArrayList<Path>()
+        let gate = WorkspaceBootstrapLoadGate()
+        try {
+            resetMetisWorkspaceBootstrapCacheForTest()
+            writeWorkspaceBootstrapCacheFixture(root, repeatWorkspaceText("# 记忆-index🙂\n正文🙂\n", 24000))
+            setMetisWorkspaceBootstrapBeforeLoadHookForTest(Some({key: String =>
+                if (key.contains("metis-bootstrap-cache-s4-b1-${stamp}")) {
+                    gate.waitForRelease()
+                }
+            }))
+            let futures = ArrayList<Future<MetisBootstrapBudgetResult>>()
+            for (_ in 0..16) {
+                futures.add(spawn { MetisWorkspaceBootstrap.resolveContextFilesDetailed(root) })
+            }
+            @Expect(waitForWorkspaceBootstrapWaiters(15), true)
+            gate.release()
+            var expected = ""
+            for (i in 0..futures.size) {
+                let result = futures[i].get(Duration.second * 5)
+                @Expect(result.totalChars <= DEFAULT_BOOTSTRAP_TOTAL_MAX_CHARS, true)
+                let memory = workspaceBootstrapMemoryContent(result)
+                @Expect(memory.size <= DEFAULT_BOOTSTRAP_MAX_CHARS, true)
+                @Expect(String.fromUtf8(memory.toArray()), memory)
+                if (i == 0) {
+                    expected = workspaceBootstrapResultSignature(result)
+                } else {
+                    @Expect(workspaceBootstrapResultSignature(result), expected)
+                }
+            }
+            setMetisWorkspaceBootstrapBeforeLoadHookForTest(None)
+            let singleFlightStats = metisWorkspaceBootstrapCacheStatsForTest()
+            @Expect(singleFlightStats.loads, 1)
+            @Expect(singleFlightStats.waits, 15)
+            @Expect(singleFlightStats.completedEntries, 1)
+
+            for (i in 0..8) {
+                let extra = Path("/tmp/metis-bootstrap-cache-s4-b1-extra-${stamp}-${i}")
+                extraRoots.add(extra)
+                writeWorkspaceBootstrapCacheFixture(extra, "# Memory ${i}\n")
+                let result = MetisWorkspaceBootstrap.resolveContextFilesDetailed(extra)
+                @Expect(result.totalChars <= DEFAULT_BOOTSTRAP_TOTAL_MAX_CHARS, true)
+            }
+            let boundedStats = metisWorkspaceBootstrapCacheStatsForTest()
+            @Expect(boundedStats.loads, 9)
+            @Expect(boundedStats.completedEntries, 8)
+            @Expect(boundedStats.evictions, 1)
+            @Expect(boundedStats.inFlight, 0)
+        } finally {
+            gate.release()
+            setMetisWorkspaceBootstrapBeforeLoadHookForTest(None)
+            resetMetisWorkspaceBootstrapCacheForTest()
+            cleanupWorkspaceBootstrapTestDir(root)
+            for (extra in extraRoots) {
+                cleanupWorkspaceBootstrapTestDir(extra)
+            }
+        }
+    }
+
+    @TestCase
+    public func s4P1FileIdentityChangeInvalidatesCache(): Unit {
+        let root = Path("/tmp/metis-bootstrap-cache-s4-p1-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
+        try {
+            resetMetisWorkspaceBootstrapCacheForTest()
+            writeWorkspaceBootstrapCacheFixture(root, "# Memory\nold-cache-marker\n")
+            let first = MetisWorkspaceBootstrap.resolveContextFilesDetailed(root)
+            let firstOrder = workspaceBootstrapPathOrder(first)
+
+            File.writeTo(root.join("MEMORY.md"), "# Memory\nnew-cache-marker-with-different-size🙂\n".toArray())
+            let second = MetisWorkspaceBootstrap.resolveContextFilesDetailed(root)
+            let stats = metisWorkspaceBootstrapCacheStatsForTest()
+
+            @Expect(workspaceBootstrapContains(second, "new-cache-marker-with-different-size🙂"), true)
+            @Expect(workspaceBootstrapContains(second, "old-cache-marker"), false)
+            @Expect(workspaceBootstrapPathOrder(second), firstOrder)
+            @Expect(stats.loads, 2)
+            @Expect(stats.hits, 0)
+
+            let collisionPrefix = "/tmp/metis-bootstrap-key-collision-${DateTime.now().toUnixTimeStamp().toNanoseconds()}"
+            let keyA = metisWorkspaceBootstrapCacheKeyForTest(
+                Path("${collisionPrefix}|full|b"),
+                runtimeChannel: "c"
+            )
+            let keyB = metisWorkspaceBootstrapCacheKeyForTest(
+                Path(collisionPrefix),
+                runtimeChannel: "b|full|c"
+            )
+            @Expect(keyA == keyB, false)
+        } finally {
+            resetMetisWorkspaceBootstrapCacheForTest()
+            cleanupWorkspaceBootstrapTestDir(root)
+        }
+    }
+
+    @TestCase
+    public func s4N1InvalidUtf8AndLoaderFailureSettleWithoutCaching(): Unit {
+        let stamp = DateTime.now().toUnixTimeStamp().toNanoseconds()
+        let root = Path("/tmp/metis-bootstrap-cache-s4-n1-${stamp}")
+        let failureGate = WorkspaceBootstrapLoadGate()
+        let oldGate = WorkspaceBootstrapLoadGate()
+        let newGate = WorkspaceBootstrapLoadGate()
+        try {
+            resetMetisWorkspaceBootstrapCacheForTest()
+            writeWorkspaceBootstrapCacheFixture(root, "# Memory\nvalid\n")
+            File.writeTo(root.join("MEMORY.md"), Array<Byte>(2, {i => if (i == 0) { 195 } else { 40 }}))
+            let invalid = MetisWorkspaceBootstrap.resolveContextFilesDetailed(root)
+            let invalidStats = metisWorkspaceBootstrapCacheStatsForTest()
+            @Expect(workspaceBootstrapContains(invalid, "invalid_bootstrap_encoding"), true)
+            @Expect(workspaceBootstrapHasWarning(invalid, "invalid_bootstrap_encoding"), true)
+            @Expect(invalidStats.completedEntries, 0)
+
+            remove(root.join("MEMORY.md"))
+            Directory.create(root.join("MEMORY.md"))
+            let unreadable = MetisWorkspaceBootstrap.resolveContextFilesDetailed(root)
+            @Expect(workspaceBootstrapContains(unreadable, "unreadable_bootstrap_file"), true)
+            @Expect(workspaceBootstrapHasWarning(unreadable, "unreadable_bootstrap_file"), true)
+            @Expect(metisWorkspaceBootstrapCacheStatsForTest().completedEntries, 0)
+
+            remove(root.join("MEMORY.md"), recursive: true)
+            File.writeTo(root.join("MEMORY.md"), "# Memory\nrepaired中文🙂\n".toArray())
+            let repaired = MetisWorkspaceBootstrap.resolveContextFilesDetailed(root)
+            @Expect(workspaceBootstrapContains(repaired, "repaired中文🙂"), true)
+            @Expect(metisWorkspaceBootstrapCacheStatsForTest().completedEntries, 1)
+
+            resetMetisWorkspaceBootstrapCacheForTest()
+            setMetisWorkspaceBootstrapBeforeLoadHookForTest(Some({key: String =>
+                if (key.contains("metis-bootstrap-cache-s4-n1-${stamp}")) {
+                    failureGate.waitForRelease()
+                    throw Exception("forced loader failure")
+                }
+            }))
+            let futures = ArrayList<Future<MetisBootstrapBudgetResult>>()
+            for (_ in 0..9) {
+                futures.add(spawn { MetisWorkspaceBootstrap.resolveContextFilesDetailed(root) })
+            }
+            @Expect(waitForWorkspaceBootstrapWaiters(8), true)
+            failureGate.release()
+            for (future in futures) {
+                let failed = future.get(Duration.second * 5)
+                @Expect(workspaceBootstrapContains(failed, "bootstrap_load_failed"), true)
+                @Expect(workspaceBootstrapHasWarning(failed, "bootstrap_load_failed"), true)
+            }
+            let failedStats = metisWorkspaceBootstrapCacheStatsForTest()
+            @Expect(failedStats.loads, 1)
+            @Expect(failedStats.waits, 8)
+            @Expect(failedStats.completedEntries, 0)
+            @Expect(failedStats.inFlight, 0)
+
+            setMetisWorkspaceBootstrapBeforeLoadHookForTest(None)
+            let recovered = MetisWorkspaceBootstrap.resolveContextFilesDetailed(root)
+            @Expect(workspaceBootstrapContains(recovered, "repaired中文🙂"), true)
+            @Expect(metisWorkspaceBootstrapCacheStatsForTest().completedEntries, 1)
+
+            resetMetisWorkspaceBootstrapCacheForTest()
+            setMetisWorkspaceBootstrapBeforeLoadHookForTest(Some({key: String =>
+                if (key.contains("metis-bootstrap-cache-s4-n1-${stamp}")) {
+                    oldGate.waitForRelease()
+                }
+            }))
+            let oldOwner = spawn { MetisWorkspaceBootstrap.resolveContextFilesDetailed(root) }
+            @Expect(waitForWorkspaceBootstrapInFlight(1), true)
+            let oldWaiter = spawn { MetisWorkspaceBootstrap.resolveContextFilesDetailed(root) }
+            @Expect(waitForWorkspaceBootstrapWaiters(1), true)
+
+            resetMetisWorkspaceBootstrapCacheForTest()
+            setMetisWorkspaceBootstrapBeforeLoadHookForTest(Some({key: String =>
+                if (key.contains("metis-bootstrap-cache-s4-n1-${stamp}")) {
+                    newGate.waitForRelease()
+                }
+            }))
+            let newOwner = spawn { MetisWorkspaceBootstrap.resolveContextFilesDetailed(root) }
+            @Expect(waitForWorkspaceBootstrapInFlight(1), true)
+            oldGate.release()
+            let _ = oldOwner.get(Duration.second * 5)
+            @Expect(metisWorkspaceBootstrapCacheStatsForTest().inFlight, 1)
+            @Expect(metisWorkspaceBootstrapCacheStatsForTest().completedEntries, 0)
+
+            let resetWaiter = oldWaiter.get(Duration.second * 5)
+            @Expect(workspaceBootstrapContains(resetWaiter, "bootstrap_load_failed"), true)
+            newGate.release()
+            let afterReset = newOwner.get(Duration.second * 5)
+            @Expect(workspaceBootstrapContains(afterReset, "repaired中文🙂"), true)
+            @Expect(metisWorkspaceBootstrapCacheStatsForTest().completedEntries, 1)
+            @Expect(metisWorkspaceBootstrapCacheStatsForTest().inFlight, 0)
+        } finally {
+            failureGate.release()
+            oldGate.release()
+            newGate.release()
+            setMetisWorkspaceBootstrapBeforeLoadHookForTest(None)
+            resetMetisWorkspaceBootstrapCacheForTest()
+            cleanupWorkspaceBootstrapTestDir(root)
+        }
+    }
+
     @TestCase
     public func resolveContextFilesTruncatesLargeMemoryFileUsingBootstrapBudget(): Unit {
         let root = Path("/tmp/metis-workspace-bootstrap-large-memory")
@@ -62,9 +395,8 @@ public class MetisWorkspaceBootstrapTest {
             for (file in files) {
                 if (file.path.endsWith("/MEMORY.md") || file.path.endsWith("\\MEMORY.md") || file.path.endsWith("MEMORY.md")) {
                     foundMemory = true
-                    @Expect(file.content.contains("[...truncated, read MEMORY.md for full content...]"), true)
-                    @Expect(file.content.contains("truncated MEMORY.md"), true)
-                    @Expect(file.content.size <= DEFAULT_BOOTSTRAP_TOTAL_MAX_CHARS, true)
+                    @Expect(file.content.contains("memory bootstrap compressed"), true)
+                    @Expect(file.content.size <= DEFAULT_BOOTSTRAP_MAX_CHARS, true)
                 }
             }
             @Expect(foundMemory, true)
@@ -75,7 +407,6 @@ public class MetisWorkspaceBootstrapTest {
             cleanupWorkspaceBootstrapTestDir(root)
         }
     }
-    */
 
     @TestCase
     public func resolveContextFilesPreservesMissingPlaceholderForAbsentMemory(): Unit {

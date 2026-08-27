@@ -38,6 +38,43 @@ private func normalizeBootstrapContent(content: String): String {
     content.replace("\r\n", "\n").replace("\r", "\n")
 }
 
+private func bootstrapUtf8PrefixWithinBytes(content: String, maxBytes: Int64): String {
+    let budget = max(0, maxBytes)
+    let out = StringBuilder()
+    var used: Int64 = 0
+    for (rune in content.toRuneArray()) {
+        let piece = String([rune])
+        if (used + piece.size > budget) {
+            break
+        }
+        out.append(piece)
+        used += piece.size
+    }
+    out.toString()
+}
+
+private func bootstrapUtf8SuffixWithinBytes(content: String, maxBytes: Int64): String {
+    let budget = max(0, maxBytes)
+    let runes = content.toRuneArray()
+    var start = Int64(runes.size)
+    var used: Int64 = 0
+    var index = Int64(runes.size) - 1
+    while (index >= 0) {
+        let piece = String([runes[index]])
+        if (used + piece.size > budget) {
+            break
+        }
+        used += piece.size
+        start = index
+        index -= 1
+    }
+    let out = StringBuilder()
+    for (i in start..runes.size) {
+        out.append(runes[i])
+    }
+    out.toString()
+}
+
 private func bootstrapFileLabel(path: String): String {
     let normalized = path.replace("\\", "/").trimAscii()
     if (normalized.isEmpty()) {
@@ -132,9 +169,8 @@ private func trimMemoryContent(content: String, path: String, maxChars: Int64): 
 
     let headChars = min(normalized.size, max(MEMORY_MIN_HEAD_CHARS, effectiveMax * 9 / 20))
     let tailChars = min(max(0, normalized.size - headChars), max(MEMORY_MIN_TAIL_CHARS, effectiveMax * 3 / 20))
-    let head = normalized[0..headChars]
-    let tailStart = max(0, normalized.size - tailChars)
-    let tail = normalized[tailStart..normalized.size]
+    let head = bootstrapUtf8PrefixWithinBytes(normalized, headChars)
+    let tail = bootstrapUtf8SuffixWithinBytes(normalized, tailChars)
     let marker =
         "\n[...memory bootstrap compressed: kept head, key index, and tail from ${bootstrapFileLabel(path)}; read the source file for full details...]\n"
     let reservedChars = head.size + marker.size + tail.size + 2
@@ -164,9 +200,9 @@ public class MetisBootstrapBudget {
             return content
         }
         if (safeBudget <= 1) {
-            return content[0..safeBudget]
+            return bootstrapUtf8PrefixWithinBytes(content, safeBudget)
         }
-        content[0..safeBudget - 1] + "…"
+        bootstrapUtf8PrefixWithinBytes(content, safeBudget - 1) + "…"
     }
 
     public static func trimContent(content: String, path!: String = "", maxChars!: Int64 = DEFAULT_BOOTSTRAP_MAX_CHARS): MetisBootstrapTrimResult {
@@ -188,9 +224,8 @@ public class MetisBootstrapBudget {
         let safeHeadChars = min(headChars, normalized.size)
         let safeTailBudget = max(0, normalized.size - safeHeadChars)
         let safeTailChars = min(tailChars, safeTailBudget)
-        let head = normalized[0..safeHeadChars]
-        let tailStart = max(0, normalized.size - safeTailChars)
-        let tail = normalized[tailStart..normalized.size]
+        let head = bootstrapUtf8PrefixWithinBytes(normalized, safeHeadChars)
+        let tail = bootstrapUtf8SuffixWithinBytes(normalized, safeTailChars)
         let fileName = bootstrapFileLabel(path)
         let marker = "\n[...truncated, read ${fileName} for full content...]\n…(truncated ${fileName}: kept ${safeHeadChars}+${safeTailChars} chars of ${normalized.size})…\n"
         result.content = head + marker + tail

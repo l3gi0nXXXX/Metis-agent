@@ -59,23 +59,57 @@ public class MetisBootstrapBudgetTest {
         @Expect(MetisBootstrapBudget.clampToBudget("abc", 8), "abc")
     }
 
-    /*
+    @TestCase
+    public func clampToBudgetStopsAtChineseAndEmojiUtf8Boundaries(): Unit {
+        let clipped = MetisBootstrapBudget.clampToBudget("A中文🙂Z", 9)
+        @Expect(clipped, "A中文…")
+        @Expect(String.fromUtf8(clipped.toArray()), clipped)
+    }
+
+    @TestCase
+    public func trimContentKeepsUnicodeHeadAndTailWithinByteBudget(): Unit {
+        let content = repeatText("前缀中文🙂body-", 300) + "结尾🙂"
+        let result = MetisBootstrapBudget.trimContent(content, path: "AGENTS.md", maxChars: 2000)
+        @Expect(result.truncated, true)
+        @Expect(result.content.contains("[...truncated, read AGENTS.md for full content...]"), true)
+        @Expect(result.content.endsWith("结尾🙂"), true)
+        @Expect(result.content.size <= 2000, true)
+        @Expect(String.fromUtf8(result.content.toArray()), result.content)
+    }
+
+    @TestCase
+    public func trimMemoryContentKeepsUnicodeHeadAndTailWithinByteBudget(): Unit {
+        let content =
+            "# 中文目标🙂\n" +
+            "- 保留索引🙂\n" +
+            repeatText("正文中文🙂tail-", 400) +
+            "最终尾部🙂"
+        let result = MetisBootstrapBudget.trimContent(content, path: "MEMORY.md", maxChars: 1800)
+        @Expect(result.truncated, true)
+        @Expect(result.content.contains("memory bootstrap compressed"), true)
+        @Expect(result.content.contains("中文目标🙂"), true)
+        @Expect(result.content.endsWith("最终尾部🙂"), true)
+        @Expect(result.content.size <= 1800, true)
+        @Expect(String.fromUtf8(result.content.toArray()), result.content)
+    }
+
     @TestCase
     public func buildContextFilesRespectsTotalBudgetAndCarriesWarnings(): Unit {
         let files = [
             MetisContextFile("agents.md", repeatText("a", 120)),
             MetisContextFile("memory.md", repeatText("b", 120))
         ]
-        let result = MetisBootstrapBudget.buildContextFiles(files, maxChars: 80, totalMaxChars: 160)
+        let result = MetisBootstrapBudget.buildContextFiles(files, maxChars: 80, totalMaxChars: 300)
         @Expect(result.files.size, 2)
-        @Expect(result.totalChars <= 160, true)
-        @Expect(result.files[0].content.size <= 80, true)
-        @Expect(result.files[1].content.size <= 80, true)
+        @Expect(result.totalChars <= 300, true)
+        @Expect(result.files[0].content.isEmpty(), false)
+        @Expect(result.files[1].content.isEmpty(), false)
         @Expect(result.warnings.size >= 2, true)
         @Expect(result.warnings[0].contains("agents.md"), true)
         @Expect(result.warnings[1].contains("memory.md"), true)
     }
 
+    /*
     @TestCase
     public func buildContextFilesStopsWhenRemainingBudgetFallsBelowFileThreshold(): Unit {
         let files = [
