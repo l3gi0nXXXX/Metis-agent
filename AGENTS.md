@@ -196,6 +196,48 @@ random package-level exit 9 after `cjpm clean` was resolved by lowering the test
 the Cangjie unittest runtime treats it as an unknown runtime option.
 Historical lesson: a full-suite pass with `cjpm test -j 1` proves package-level serial execution is clean, but it does not prove bare `cjpm test` is clean, because `-j 1` limits package-level concurrency while `[profile.test].parallel` only controls unittest workers inside each package.
 
+## Metis/GCM staged planning and delivery
+
+For Metis/GCM staged planning, implementation from an approved plan, worktree or subagent
+coordination, `cjpm` test selection, integration, or main-branch delivery, use the
+`$metis-gcm-staged-delivery` skill. If the skill is unavailable, follow this section directly and
+report that the skill was not loaded.
+
+A plan-only request is a hard mutation barrier. Inspect source, logs, configuration, and tests
+read-only; write the source-backed staged plan to Obsidian; do not modify code, tests, fixtures, or
+project configuration until the user explicitly approves implementation.
+
+Every implementation stage must define exact file/function scope and approved Test IDs. Every
+subagent must receive both the implementation scope and the complete Test-ID contract, including
+inputs, expected outputs, and pass criteria. A subagent delivery is incomplete until it reports the
+actual result for every assigned Test ID. Do not force parallel work when stages, files, global
+state, ports, test packages, or architecture boundaries overlap.
+
+Record every worktree before edits begin: repository, absolute path, branch, base commit, stage,
+owner, file/function whitelist, and Test IDs. Do not bypass `.gitignore`, use `git add -f`, hide
+untracked files, or change Metis/GCM framework boundaries to simplify delivery.
+
+Use tiered tests:
+
+- During iteration, run static checks and the exact approved Test IDs.
+- At stage completion, run the affected complete package(s).
+- After integration, run cross-stage tests, formal E2E tests, and architecture scanners.
+- Before pushing main, run a fresh clean, build, and complete root test from local main.
+
+Do not run the root full test after every worktree edit. When it has not run, report
+`ROOT_FULL_NOT_RUN`; never describe exact or package tests as full regression coverage. Report
+compile failures, package exit 9, OOM, timeouts, and assertion failures as distinct outcomes.
+
+Integrate verified task commits into a local integration branch before local main. Do not push an
+unverified combination to `origin/main`. After integration is green, integrate into local main and
+run the root gate. Commit each verification fix atomically and rerun the relevant exact/package
+tests followed by the root gate. Push main only when the required final gate is green.
+
+After a successful push, fetch and verify that local main, origin/main, and the remote main ref are
+identical. Immediately remove completed worktrees and temporary branches after their commits are
+recoverable from main/remote, then verify no task-owned process, port, test home, marker, audit log,
+or worktree entry remains. Finish by asking the user to perform the documented manual validation.
+
 ## Code Style
 
 You must write readable code, e.g., adding clear and concise comments.
