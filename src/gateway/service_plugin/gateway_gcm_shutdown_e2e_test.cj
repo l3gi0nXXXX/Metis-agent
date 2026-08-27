@@ -317,6 +317,42 @@ private class S5DeliveryLog {
     }
 }
 
+private class S5GeneratedReplyGate {
+    private let lock = Mutex()
+    private var condition: Condition
+    private var entered: Int64 = 0
+    private var active: Int64 = 0
+    private var maxActive: Int64 = 0
+    private var released = false
+
+    init() {
+        synchronized(this.lock) { this.condition = this.lock.condition() }
+    }
+
+    func enterAndWait(): Unit {
+        synchronized(this.lock) {
+            this.entered++
+            this.active++
+            this.maxActive = max(this.maxActive, this.active)
+            this.condition.notifyAll()
+            while (!this.released) { this.condition.wait() }
+            this.active--
+            this.condition.notifyAll()
+        }
+    }
+
+    func release(): Unit {
+        synchronized(this.lock) {
+            this.released = true
+            this.condition.notifyAll()
+        }
+    }
+
+    func snapshot(): (Int64, Int64, Int64) {
+        synchronized(this.lock) { (this.entered, this.active, this.maxActive) }
+    }
+}
+
 @Test
 public class GatewayGcmShutdownE2eTest {
     @TestCase
@@ -363,7 +399,7 @@ public class GatewayGcmShutdownE2eTest {
         @Expect(pipeBoundaryText.contains("pass 4"), true)
         @Expect(pipeBoundaryText.contains("fail 0"), true)
         @Expect(architectureBoundary[0], 0)
-        @Expect(architectureBoundaryText.contains("pass 4"), true)
+        @Expect(architectureBoundaryText.contains("pass 9"), true)
         @Expect(architectureBoundaryText.contains("fail 0"), true)
     }
 
@@ -537,6 +573,177 @@ public class GatewayGcmShutdownE2eTest {
                 @Expect(activePortReleased, true)
                 @Expect(ownerGone, true)
                 @Expect(allSettled, true)
+                gatewayLoggingResetForTest()
+            }
+        })
+        let ownedHome = ownedHomes[0]
+        @Expect(s5RemoveOwnedTempHome(ownedHome), true)
+        @Expect(exists(ownedHome), false)
+    }
+
+    @TestCase
+    public func s5B1Formal140WebhookBurstStaysBoundedAndHealthy(): Unit {
+        resetServicePluginHostForTest()
+        @Expect(resetManagedStdioBrokerForTest(timeoutMs: 3000).ok, true)
+        let ownedHomes = ArrayList<Path>()
+        withServicePluginHostTestHome("s5-b1-formal-gcm-140-burst", { home: Path =>
+            ownedHomes.add(home)
+            let binary = s5GcmBinary()
+            let configPath = home.join("gcm-s5-config.json")
+            let statePath = home.join("gcm-s5-state.json")
+            let queuePath = home.join("gcm-s5-queue")
+            let gate = S5GeneratedReplyGate()
+            var dependencies = None<SubProcess>
+            var gcmPid: Int64 = 0
+            var gcmPgid: Int64 = 0
+            var gcmPort: Int64 = 0
+            var leasePath = Path("")
+            var formallyStopped = false
+            try {
+                @Expect(binary.toString().isEmpty(), false)
+                @Expect(exists(binary), true)
+                let startedDependencies = s5StartDependencies(home)
+                dependencies = Some(startedDependencies[0])
+                let dependencyPort = startedDependencies[1]
+                @Expect(dependencyPort > 0, true)
+                @Expect(s5Get("http://127.0.0.1:${dependencyPort}/healthz").status, 200)
+
+                gcmPort = s5TemporaryPort()
+                @Expect(gcmPort > 0 && gcmPort != dependencyPort, true)
+                s5WriteGcmConfig(configPath, statePath, queuePath, gcmPort, dependencyPort)
+                let registered = registerServicePlugin(ServicePluginRegistration(
+                    s5GcmManifest(binary),
+                    configRef: ServicePluginConfigRef(
+                        configPath: configPath.toString(),
+                        workingDirectory: binary.parent.toString()
+                    )
+                ))
+                @Expect(registered.ok, true)
+                setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent =>
+                    let rows = ArrayList<ServicePluginDeliveryTarget>()
+                    rows.add(ServicePluginDeliveryTarget("telegram", "s5-b1", "peer"))
+                    rows
+                }))
+                setServicePluginWebhookGeneratedReplyHandlerForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent, _target: ServicePluginDeliveryTarget =>
+                    gate.enterAndWait()
+                    ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "S5 bounded reply 中文🙂")
+                }))
+                setServicePluginEventDeliveryForTest(Some({ _target: ServicePluginDeliveryTarget, _text: String =>
+                    ServicePluginEventDeliveryResult(true, "sent")
+                }))
+
+                @Expect(ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 5000).ok, true)
+                let initial = getServicePluginSnapshot("gitcode-monitor").getOrThrow()
+                gcmPid = initial.pid
+                gcmPgid = s5ProcessGroupId(gcmPid)
+                @Expect(gcmPid > 1 && gcmPgid > 1, true)
+                leasePath = home.join("service-plugin").join("runtime").join("gitcode-monitor")
+                    .join("${initial.instanceId}.lease.json")
+                let stableLeasePath = leasePath
+                let stableGcmPid = gcmPid
+                let stableGcmPgid = gcmPgid
+                let stableGcmPort = gcmPort
+                let ownerReady = s5WaitUntil(5000, { =>
+                    exists(stableLeasePath) && s5LeaseString(stableLeasePath, "state") == "running" &&
+                        s5LeaseInt(stableLeasePath, "pid") == stableGcmPid &&
+                        s5LeaseInt(stableLeasePath, "port") == stableGcmPort &&
+                        s5Get("http://127.0.0.1:${stableGcmPort}/healthz").status == 200
+                })
+                @Expect(ownerReady, true)
+                let brokerBefore = managedStdioBroker().snapshot()
+                @Expect(brokerBefore.ownerCount, 1)
+
+                for (index in 0..140) {
+                    let deliveryId = "s5-b1-${"${index}".padStart(4, padding: "0")}-end"
+                    let posted = s5PostWebhook(gcmPort, deliveryId, 6000 + index)
+                    @Expect(posted.status >= 200 && posted.status < 300, true)
+                }
+                @Expect(s5WaitUntil(15000, { =>
+                    match (servicePluginDispatchSchedulerSnapshotForTest("gitcode-monitor")) {
+                        case Some(row) => row.active == 2 && row.queued == 128 && row.accepted == 130 &&
+                            row.futures == 2 && row.queueHighWatermark == 128 && row.queueFull >= 10
+                        case None => false
+                    }
+                }), true)
+                let saturatedScheduler = servicePluginDispatchSchedulerSnapshotForTest("gitcode-monitor").getOrThrow()
+                let saturated = getServicePluginSnapshot("gitcode-monitor").getOrThrow()
+                @Expect(saturatedScheduler.active, 2)
+                @Expect(saturatedScheduler.queued, 128)
+                @Expect(saturatedScheduler.futures, 2)
+                @Expect(saturatedScheduler.queueHighWatermark, 128)
+                @Expect(saturatedScheduler.queueFull >= 10, true)
+                @Expect(saturated.dispatch.active, 2)
+                @Expect(saturated.dispatch.queued, 128)
+                @Expect(saturated.dispatch.highWater, 128)
+                @Expect(saturated.dispatch.queueFull >= 10, true)
+                @Expect(saturated.dispatch.admissionRetried >= 10, true)
+                @Expect(gate.snapshot()[1], 2)
+                @Expect(gate.snapshot()[2], 2)
+
+                for (_ in 0..8) {
+                    let current = getServicePluginSnapshot("gitcode-monitor").getOrThrow()
+                    @Expect(current.pid, gcmPid)
+                    @Expect(s5ProcessGroupId(current.pid), gcmPgid)
+                    @Expect(s5LeaseString(leasePath, "state"), "running")
+                    @Expect(s5LeaseInt(leasePath, "pid"), gcmPid)
+                    @Expect(s5Get("http://127.0.0.1:${gcmPort}/healthz").status, 200)
+                    let broker = managedStdioBroker().snapshot()
+                    @Expect(broker.ownerCount, 1)
+                    @Expect(broker.generation, brokerBefore.generation)
+                }
+
+                gate.release()
+                let allRetriesCompleted = s5WaitUntil(30000, { =>
+                    gate.snapshot()[0] == 140 && match (getServicePluginSnapshot("gitcode-monitor")) {
+                        case Some(snapshot) => snapshot.dispatch.completionAck == 140
+                        case None => false
+                    }
+                })
+                @Expect(allRetriesCompleted, true)
+                let schedulerSettled = s5WaitUntil(30000, { =>
+                    match (servicePluginDispatchSchedulerSnapshotForTest("gitcode-monitor")) {
+                        case Some(row) => row.settled
+                        case None => false
+                    }
+                })
+                @Expect(schedulerSettled, true)
+                let drained = getServicePluginSnapshot("gitcode-monitor").getOrThrow()
+                @Expect(drained.dispatch.active, 0)
+                @Expect(drained.dispatch.queued, 0)
+                @Expect(drained.dispatch.highWater, 128)
+                @Expect(drained.dispatch.queueFull >= 10, true)
+                @Expect(drained.dispatch.admissionRetried >= 10, true)
+                @Expect(drained.dispatch.completionAck, 140)
+                @Expect(gate.snapshot()[0], 140)
+                @Expect(gate.snapshot()[1], 0)
+                @Expect(gate.snapshot()[2], 2)
+
+                let stopped = stopServicePlugin("gitcode-monitor", reason: "s5-b1-140-complete", timeoutMillis: 5000)
+                @Expect(stopped.ok, true)
+                @Expect(stopped.status, "stopped")
+                @Expect(stopped.ingressStopStatus, "sent")
+                @Expect(stopped.dispatchStatus, "drained")
+                @Expect(stopped.leaseStatus, "stopped")
+                @Expect(stopped.portStatus, "released")
+                formallyStopped = true
+                let pidGone = s5WaitUntil(5000, { => s5PidGone(stableGcmPid) })
+                let groupGone = s5WaitUntil(5000, { => s5GroupGone(stableGcmPgid) })
+                let portReleased = s5WaitUntil(5000, { => s5CanBindPort(stableGcmPort) })
+                @Expect(pidGone, true)
+                @Expect(groupGone, true)
+                @Expect(portReleased, true)
+                @Expect(s5LeaseString(leasePath, "state"), "stopped")
+                @Expect(managedStdioBroker().snapshot().ownerCount, 0)
+            } finally {
+                gate.release()
+                setServicePluginWebhookSubscribersProviderForTest(None<(ServicePluginAcceptedGitCodeEvent) -> ArrayList<ServicePluginDeliveryTarget>>)
+                setServicePluginWebhookGeneratedReplyHandlerForTest(None<(ServicePluginAcceptedGitCodeEvent, ServicePluginDeliveryTarget) -> ServicePluginGeneratedReplyResult>)
+                setServicePluginEventDeliveryForTest(None)
+                resetServicePluginGeneratedReplyStateForTest()
+                if (!formallyStopped) { let _ = stopServicePlugin("gitcode-monitor", reason: "s5-b1-cleanup", timeoutMillis: 5000) }
+                resetServicePluginHostForTest()
+                @Expect(resetManagedStdioBrokerForTest(timeoutMs: 3000).ok, true)
+                @Expect(s5StopOwnedProcess(dependencies), true)
                 gatewayLoggingResetForTest()
             }
         })
