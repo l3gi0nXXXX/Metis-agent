@@ -867,6 +867,53 @@ private class GatewayS5StrictLedger {
     func valid(): Bool { this.invalidRows == 0 && this.unknownRows == 0 }
 }
 
+private class GatewayS5ProxyReadySnapshot {
+    let wrapperPid: Int64
+    let brokerPid: Int64
+    let helloPid: Int64
+    let generation: Int64
+    let ownerPid: Int64
+    let ownerId: String
+
+    init(wrapperPid: Int64, brokerPid: Int64, helloPid: Int64, generation: Int64, ownerPid: Int64, ownerId: String) {
+        this.wrapperPid = wrapperPid
+        this.brokerPid = brokerPid
+        this.helloPid = helloPid
+        this.generation = generation
+        this.ownerPid = ownerPid
+        this.ownerId = ownerId
+    }
+
+    func sameOwner(other: GatewayS5ProxyReadySnapshot): Bool {
+        this.brokerPid == other.brokerPid && this.generation == other.generation &&
+            this.ownerPid == other.ownerPid && this.ownerId == other.ownerId
+    }
+}
+
+private func gatewayS5ProxyReadySnapshot(path: Path): Option<GatewayS5ProxyReadySnapshot> {
+    if (!exists(path)) { return None<GatewayS5ProxyReadySnapshot> }
+    try {
+        let root = JsonValue.fromStr(String.fromUtf8(File.readFrom(path))).asObject()
+        let wrapperPid = root.get("wrapperPid").getOrThrow().asInt().getValue()
+        let brokerPid = root.get("brokerPid").getOrThrow().asInt().getValue()
+        let helloPid = root.get("helloBrokerPid").getOrThrow().asInt().getValue()
+        let generation = root.get("generation").getOrThrow().asInt().getValue()
+        let ownerPid = root.get("gcmOwnerPid").getOrThrow().asInt().getValue()
+        let ownerId = root.get("gcmOwnerId").getOrThrow().asString().getValue()
+        let ownerStartSeq = root.get("gcmOwnerStartSeq").getOrThrow().asInt().getValue()
+        let ownerInitializeSeq = root.get("gcmOwnerInitializeSeq").getOrThrow().asInt().getValue()
+        if (wrapperPid <= 1 || brokerPid <= 1 || helloPid <= 1 || generation <= 0 || ownerPid <= 1 ||
+            ownerStartSeq <= 0 || ownerInitializeSeq <= ownerStartSeq ||
+            ownerId.isEmpty() || ownerId.size > 4096 || ownerId.contains("\u{0000}") ||
+            ownerId.contains("\r") || ownerId.contains("\n")) {
+            return None<GatewayS5ProxyReadySnapshot>
+        }
+        Some(GatewayS5ProxyReadySnapshot(wrapperPid, brokerPid, helloPid, generation, ownerPid, ownerId))
+    } catch (_: Exception) {
+        None<GatewayS5ProxyReadySnapshot>
+    }
+}
+
 private func gatewayS5DropMarkerProof(path: Path, expectedStatus: String, expectedDeliveryId: String): (Bool, Int64, String, Int64, String, String) {
     if (!exists(path)) { return (false, 0, "", 0, "", "") }
     try {
@@ -2419,19 +2466,41 @@ public class GatewayServeLockLogicTest {
                 let stableOldGatewayPid = oldGatewayPid
                 let oldOwner = GatewayServeStopLiveOwnerProof()
                 let readyzUrl = "http://127.0.0.1:${gatewayPort}/readyz"
+                let stableOldProxyReady = ArrayList<GatewayS5ProxyReadySnapshot>()
                 let oldReady = gatewayServeStopWaitUntil(15000, { =>
+                    let first = gatewayS5ProxyReadySnapshot(proxyReady)
+                    if (first.isNone()) { return false }
+                    let candidate = first.getOrThrow()
+                    let candidatePgid = gatewayServeStopProcessGroup(candidate.ownerPid)
+                    if (candidate.helloPid != candidate.brokerPid || !gatewayServeStopPidAlive(candidate.ownerPid) ||
+                        gatewayServeStopParentPid(candidate.ownerPid) != candidate.brokerPid || candidatePgid <= 1) {
+                        return false
+                    }
+                    oldCapture.refreshLease(home, candidate.ownerPid, oldGatewayPid, webhookPort)
                     oldOwner.refresh(readyzUrl)
-                    exists(proxyReady) && gatewayS5JsonInt(proxyReady, "generation") > 0 &&
-                        gatewayS5JsonInt(proxyReady, "ownerPid") > 1 && oldOwner.httpStatus == 200 &&
-                        oldOwner.running && oldOwner.ownerCount >= 1 && gatewayServeStopPortListening(webhookPort)
+                    if (!oldCapture.leaseDirExists || oldCapture.leaseFileCount != 1 ||
+                        !oldCapture.leaseUtf8 || !oldCapture.leaseJson || !oldCapture.leaseIdentityMatches ||
+                        !oldCapture.leasePidMatches || !oldCapture.leasePortMatches || !oldCapture.leaseRunning ||
+                        oldOwner.httpStatus != 200 || !oldOwner.running || oldOwner.ownerCount < 1 ||
+                        !gatewayServeStopPortListening(webhookPort)) {
+                        return false
+                    }
+                    let second = gatewayS5ProxyReadySnapshot(proxyReady)
+                    if (second.isNone() || !candidate.sameOwner(second.getOrThrow())) { return false }
+                    stableOldProxyReady.clear()
+                    stableOldProxyReady.add(candidate)
+                    true
                 })
                 @Expect(oldReady, true)
                 if (!oldReady) { return }
-                let oldProxyPid = gatewayS5JsonInt(proxyReady, "wrapperPid")
-                let oldBrokerPid = gatewayS5JsonInt(proxyReady, "brokerPid")
-                let oldHelloBrokerPid = gatewayS5JsonInt(proxyReady, "helloBrokerPid")
-                let oldBrokerGeneration = gatewayS5JsonInt(proxyReady, "generation")
-                let oldGcmPid = gatewayS5JsonInt(proxyReady, "ownerPid")
+                @Expect(stableOldProxyReady.size, 1)
+                if (stableOldProxyReady.size != 1) { return }
+                let frozenOldProxyReady = stableOldProxyReady[0]
+                let oldProxyPid = frozenOldProxyReady.wrapperPid
+                let oldBrokerPid = frozenOldProxyReady.brokerPid
+                let oldHelloBrokerPid = frozenOldProxyReady.helloPid
+                let oldBrokerGeneration = frozenOldProxyReady.generation
+                let oldGcmPid = frozenOldProxyReady.ownerPid
                 let oldGcmPgid = gatewayServeStopProcessGroup(oldGcmPid)
                 oldCapture.brokerPid = oldBrokerPid
                 oldCapture.gcmPid = oldGcmPid
@@ -2460,6 +2529,15 @@ public class GatewayServeLockLogicTest {
                 @Expect(oldCapture.leaseRunning, true)
                 if (!oldLeaseReady) { return }
 
+                let beforePostProxyReady = gatewayS5ProxyReadySnapshot(proxyReady)
+                oldCapture.refreshLease(home, oldGcmPid, oldGatewayPid, webhookPort)
+                let oldOwnerStableBeforePost = beforePostProxyReady.isSome() &&
+                    frozenOldProxyReady.sameOwner(beforePostProxyReady.getOrThrow()) &&
+                    gatewayServeStopPidAlive(oldGcmPid) && gatewayServeStopParentPid(oldGcmPid) == oldBrokerPid &&
+                    gatewayServeStopProcessGroup(oldGcmPid) == oldGcmPgid && oldCapture.leaseIdentityMatches &&
+                    oldCapture.leasePidMatches && oldCapture.leasePortMatches && oldCapture.leaseRunning
+                @Expect(oldOwnerStableBeforePost, true)
+                if (!oldOwnerStableBeforePost) { return }
                 let posted = gatewayS5PostWebhook(webhookPort, deliveryId, iid: iid)
                 @Expect(posted >= 200 && posted < 300, true)
                 let dropMarkersReady = gatewayServeStopWaitUntil(20000, { =>
@@ -2482,6 +2560,16 @@ public class GatewayServeLockLogicTest {
                 @Expect(admissionMarker[5].isEmpty(), false)
                 @Expect(completionMarker[5].isEmpty(), false)
                 @Expect(completionMarker[5] == admissionMarker[5], false)
+                let afterMarkersProxyReady = gatewayS5ProxyReadySnapshot(proxyReady)
+                oldCapture.refreshLease(home, oldGcmPid, oldGatewayPid, webhookPort)
+                let oldOwnerStableAfterMarkers = afterMarkersProxyReady.isSome() &&
+                    frozenOldProxyReady.sameOwner(afterMarkersProxyReady.getOrThrow()) &&
+                    admissionMarker[4] == frozenOldProxyReady.ownerId &&
+                    completionMarker[4] == frozenOldProxyReady.ownerId && gatewayServeStopPidAlive(oldGcmPid) &&
+                    gatewayServeStopParentPid(oldGcmPid) == oldBrokerPid && oldCapture.leaseIdentityMatches &&
+                    oldCapture.leasePidMatches && oldCapture.leasePortMatches && oldCapture.leaseRunning
+                @Expect(oldOwnerStableAfterMarkers, true)
+                if (!oldOwnerStableAfterMarkers) { return }
                 oldOwner.refresh(readyzUrl)
                 @Expect(oldOwner.httpStatus == 200 && oldOwner.running && oldOwner.ownerCount >= 1, true)
                 let oldAttemptToken = admissionMarker[2]

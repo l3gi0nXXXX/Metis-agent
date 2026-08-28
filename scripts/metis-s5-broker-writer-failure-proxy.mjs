@@ -52,6 +52,12 @@ let brokerGeneration = 0;
 let brokerHelloPid = 0;
 let ownerPid = 0;
 let ownerId = '';
+let gcmOwnerPid = 0;
+let gcmOwnerId = '';
+let gcmOwnerStartSeq = 0;
+let gcmOwnerInitializeSeq = 0;
+let lifecycleSequence = 0;
+const ownerLifecycles = new Map();
 let boundAttemptToken = '';
 let boundEventId = '';
 let boundOwnerId = '';
@@ -72,7 +78,25 @@ function publishReady() {
     helloBrokerPid: brokerHelloPid,
     ownerPid,
     ownerId,
+    gcmOwnerPid,
+    gcmOwnerId,
+    gcmOwnerStartSeq,
+    gcmOwnerInitializeSeq,
   }));
+}
+
+function nextLifecycleSequence() {
+  lifecycleSequence += 1;
+  return lifecycleSequence;
+}
+
+function rememberOwnerStart(frame) {
+  if (ownerLifecycles.size >= 32) ownerLifecycles.delete(ownerLifecycles.keys().next().value);
+  ownerLifecycles.set(frame.ownerId, {
+    startSeq: nextLifecycleSequence(),
+    pid: 0,
+    initializeSeq: 0,
+  });
 }
 
 function finishOutputIfReady() {
@@ -126,6 +150,7 @@ function durableAckFromOwnerWrite(frame) {
     Array.isArray(frame) ||
     frame.type !== 'owner.write' ||
     !safeProtocolString(frame.ownerId) ||
+    !safeProtocolString(frame.ownerIncarnation) ||
     !safeProtocolString(frame.requestId) ||
     !safeProtocolString(frame.line)
   ) {
@@ -165,7 +190,7 @@ function durableAckFromOwnerWrite(frame) {
       payload.status === 'accepted' &&
       serviceFrame.correlationId === payload.attemptToken
     ) {
-      return { phase: 'admission', ownerId: frame.ownerId, requestId: frame.requestId, eventId: payload.eventId, attemptToken: payload.attemptToken };
+      return { phase: 'admission', ownerId: frame.ownerId, ownerIncarnation: frame.ownerIncarnation, requestId: frame.requestId, eventId: payload.eventId, attemptToken: payload.attemptToken };
     }
     if (
       serviceFrame.type === 'request' &&
@@ -173,12 +198,34 @@ function durableAckFromOwnerWrite(frame) {
       payload.status === 'completed' &&
       serviceFrame.correlationId !== payload.attemptToken
     ) {
-      return { phase: 'completion', ownerId: frame.ownerId, requestId: frame.requestId, eventId: payload.eventId, attemptToken: payload.attemptToken };
+      return { phase: 'completion', ownerId: frame.ownerId, ownerIncarnation: frame.ownerIncarnation, requestId: frame.requestId, eventId: payload.eventId, attemptToken: payload.attemptToken };
     }
     return null;
   } catch {
     return null;
   }
+}
+
+function isInitializeOwnerOutput(frame) {
+  if (
+    frame === null || typeof frame !== 'object' || Array.isArray(frame) ||
+    frame.type !== 'owner.stdout' || !safeProtocolString(frame.ownerId) ||
+    !safeProtocolString(frame.text)
+  ) return false;
+  try {
+    const inner = JSON.parse(frame.text);
+    return inner !== null && typeof inner === 'object' && !Array.isArray(inner) &&
+      inner.type === 'response' && inner.serviceId === 'gitcode-monitor' && inner.method === 'initialize';
+  } catch {
+    return false;
+  }
+}
+
+function ownerStartLifecycle(frame) {
+  if (!(frame !== null && typeof frame === 'object' && !Array.isArray(frame) &&
+    frame.type === 'owner.start' && safeProtocolString(frame.ownerId) &&
+    safeProtocolString(frame.requestId))) return null;
+  return frame;
 }
 
 function writeAckMarker(path, status, ack) {
@@ -198,8 +245,10 @@ function writeAckMarker(path, status, ack) {
 function forwardInputLine(lineWithNewline) {
   const line = lineWithNewline.subarray(0, lineWithNewline.length - 1);
   const frame = parseJsonLine(line);
+  const ownerStart = ownerStartLifecycle(frame);
   const ack = durableAckFromOwnerWrite(frame);
-  if (ack?.phase === 'admission' && boundAttemptToken.length === 0 && pendingAdmission === null) {
+  if (ack?.phase === 'admission' && ack.ownerId === gcmOwnerId &&
+      boundAttemptToken.length === 0 && pendingAdmission === null) {
     pendingAdmission = ack;
   }
   if (
@@ -218,17 +267,25 @@ function forwardInputLine(lineWithNewline) {
       type: 'owner.written',
       generation: brokerGeneration,
       ownerId: ack.ownerId,
+      ownerIncarnation: ack.ownerIncarnation,
       requestId: ack.requestId,
     })}\n`, 'utf8'), () => {
       writeAckMarker(completionDroppedPath, 'owner_written_synthesized', ack);
     });
     return;
   }
-  if (!writerClosed && !broker.stdin.destroyed) broker.stdin.write(lineWithNewline);
+  if (!writerClosed && !broker.stdin.destroyed) {
+    broker.stdin.write(lineWithNewline);
+    if (ownerStart !== null) {
+      rememberOwnerStart(frame);
+      publishReady();
+    }
+  }
 }
 
 function observeBrokerLine(lineWithNewline) {
   const frame = parseJsonLine(lineWithNewline.subarray(0, lineWithNewline.length - 1));
+  const initializeOutput = isInitializeOwnerOutput(frame);
   if (frame !== null && typeof frame === 'object' && !Array.isArray(frame)) {
     if (frame.type === 'broker.hello') {
       const generation = Number(frame.generation ?? 0);
@@ -249,15 +306,29 @@ function observeBrokerLine(lineWithNewline) {
     } else if (frame.type === 'owner.started') {
       const pid = Number(frame.pid ?? 0);
       if (typeof frame.ownerId === 'string' && frame.ownerId.length > 0 && Number.isSafeInteger(pid) && pid > 0) {
-        ownerId = frame.ownerId;
-        ownerPid = pid;
+        const lifecycle = ownerLifecycles.get(frame.ownerId);
+        if (lifecycle !== undefined) lifecycle.pid = pid;
         publishReady();
       }
+    } else if (frame.type === 'owner.exit' || frame.type === 'owner.error' || frame.type === 'owner.timeout') {
+      if (typeof frame.ownerId !== 'string' || frame.ownerId !== gcmOwnerId) {
+        if (typeof frame.ownerId === 'string') ownerLifecycles.delete(frame.ownerId);
+        publishReady();
+        enqueueOutput(lineWithNewline);
+        return;
+      }
+      if (typeof frame.ownerId === 'string') ownerLifecycles.delete(frame.ownerId);
+      gcmOwnerPid = 0;
+      gcmOwnerId = '';
+      ownerPid = 0;
+      ownerId = '';
+      publishReady();
     } else if (
       pendingAdmission !== null &&
       frame.type === 'owner.written' &&
       frame.generation === brokerGeneration &&
       frame.ownerId === pendingAdmission.ownerId &&
+      frame.ownerIncarnation === pendingAdmission.ownerIncarnation &&
       frame.requestId === pendingAdmission.requestId
     ) {
       boundAttemptToken = pendingAdmission.attemptToken;
@@ -268,6 +339,19 @@ function observeBrokerLine(lineWithNewline) {
     }
   }
   enqueueOutput(lineWithNewline);
+  if (initializeOutput) {
+    const lifecycle = ownerLifecycles.get(frame.ownerId);
+    if (lifecycle !== undefined && lifecycle.pid > 1) {
+      if (lifecycle.initializeSeq === 0) lifecycle.initializeSeq = nextLifecycleSequence();
+      gcmOwnerId = frame.ownerId;
+      gcmOwnerPid = lifecycle.pid;
+      gcmOwnerStartSeq = lifecycle.startSeq;
+      gcmOwnerInitializeSeq = lifecycle.initializeSeq;
+      ownerId = gcmOwnerId;
+      ownerPid = gcmOwnerPid;
+    }
+    publishReady();
+  }
 }
 
 function drainLines(pending, consume) {
@@ -302,6 +386,7 @@ process.stdin.on('end', () => {
   inputPending = Buffer.alloc(0);
   if (!broker.stdin.destroyed) broker.stdin.end();
 });
+process.stdin.on('error', () => {});
 
 publishReady();
 
