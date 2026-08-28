@@ -416,6 +416,7 @@ public class ManagedStdioBrokerClient {
     private var helloReceived: Bool = false
     private var lastPongId: String = ""
     private var lastTestHangId: String = ""
+    private var stopAckThenTerminalForTest: Option<(String, String)> = None<(String, String)>
     private var status: String = "stopped"
     private var readerCount: Int64 = 0
     private var requestSequence: Int64 = 0
@@ -1111,6 +1112,25 @@ public class ManagedStdioBrokerClient {
         }
         frame.put("requestId", JsonString(stopRequestId))
         if (!this.writeFrameForGeneration(frame, stateValue.generation)) { this.handleBrokerExit(stateValue.generation, "broker_exited") }
+        synchronized(this.lock) {
+            match (this.stopAckThenTerminalForTest) {
+                case Some(injected) =>
+                    if (injected[0] == ownerId) {
+                        this.stopAckThenTerminalForTest = None<(String, String)>
+                        match (this.owners.get(ownerId)) {
+                            case Some(value) =>
+                                if (value.generation == stateValue.generation) {
+                                    value.lastStopRequestId = stopRequestId
+                                    value.status = injected[1]
+                                    value.settled = true
+                                    value.condition.notifyAll()
+                                }
+                            case None => ()
+                        }
+                    }
+                case None => ()
+            }
+        }
         let deadline = this.nowMs() + max(1, timeoutMs)
         synchronized(this.lock) {
             var result = ManagedStdioOperationResult(false, "stop_timeout", generation: this.generation)
@@ -1123,8 +1143,15 @@ public class ManagedStdioBrokerClient {
                     case Some(value) =>
                         if (value.settled) {
                             let acked = value.lastStopRequestId == stopRequestId
+                            let unsafeTerminal = value.status == "broker_exited" ||
+                                value.status == "broker_unresponsive" || value.status == "malformed_json" ||
+                                value.status == "invalid_response_encoding"
                             if (value.subscriber.isNone() && value.dispatchPending == 0 && value.events.isEmpty()) { this.owners.remove(ownerId) }
-                            result = ManagedStdioOperationResult(acked, if (acked) { "stopped" } else { "protocol_error" }, generation: value.generation)
+                            result = ManagedStdioOperationResult(
+                                !unsafeTerminal,
+                                if (unsafeTerminal) { value.status } else if (acked) { "stopped" } else { "already_stopped" },
+                                generation: value.generation
+                            )
                             done = true
                             continue
                         }
@@ -1535,6 +1562,19 @@ public class ManagedStdioBrokerClient {
         match (synchronized(this.lock) { this.process }) {
             case Some(value) => try { value.terminate(force: true) } catch (_: Exception) { () }
             case None => ()
+        }
+    }
+
+    public func debugInjectStopAckThenTerminalForTest(ownerId: String, status: String): Bool {
+        let normalizedStatus = status.trimAscii()
+        if (normalizedStatus != "broker_exited" && normalizedStatus != "broker_unresponsive" &&
+            normalizedStatus != "malformed_json" && normalizedStatus != "invalid_response_encoding") {
+            return false
+        }
+        synchronized(this.lock) {
+            if (!this.brokerTestMode || !this.owners.contains(ownerId)) { return false }
+            this.stopAckThenTerminalForTest = Some((ownerId, normalizedStatus))
+            true
         }
     }
 

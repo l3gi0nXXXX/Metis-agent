@@ -127,17 +127,22 @@ private class ManagedStdioBlockingSubscriber <: ManagedStdioOwnerSubscriber {
     private var released: Bool = false
     private var reenterSingleton: Bool = false
     private var singletonReentered: Bool = false
+    private var blockTerminal: Bool = false
 
-    init(reenterSingleton!: Bool = false) {
+    init(reenterSingleton!: Bool = false, blockTerminal!: Bool = false) {
         synchronized(this.lock) { this.condition = this.lock.condition() }
         this.reenterSingleton = reenterSingleton
+        this.blockTerminal = blockTerminal
     }
 
     public func onManagedStdioEvent(event: ManagedStdioEvent): Unit {
         var shouldReenter = false
         synchronized(this.lock) {
             this.events.add(event)
-            if (!this.entered && (event.eventType == "owner.stdout" || event.eventType == "owner.stderr")) {
+            let terminal = event.eventType == "owner.exit" || event.eventType == "owner.error" ||
+                event.eventType == "owner.timeout"
+            if (!this.entered && (event.eventType == "owner.stdout" || event.eventType == "owner.stderr" ||
+                (this.blockTerminal && terminal))) {
                 this.entered = true
                 this.condition.notifyAll()
                 while (!this.released) { this.condition.wait() }
@@ -382,6 +387,13 @@ public class ManagedStdioBrokerTest {
             @Expect(result.ok, false)
             @Expect(result.status, "broker_exited")
             @Expect(client.pendingWriteCountForTest("write-correlation-n2"), 0)
+            let stopped = client.stopOwner(
+                "write-correlation-n2",
+                timeoutMs: 500,
+                expectedGeneration: Some(started.generation)
+            )
+            @Expect(stopped.ok, false)
+            @Expect(stopped.status, "broker_exited")
         } finally {
             let _ = client.close(timeoutMs: 500)
         }
@@ -576,6 +588,74 @@ public class ManagedStdioBrokerTest {
             @Expect(managedStdioWaitUntil(3000, { => reusedSubscriber.terminalCount() == 1 }), true)
             @Expect(reusedSubscriber.containsText("reused-after-subscriber-failure-中文🙂"), true)
             @Expect(managedStdioWaitUntil(2000, { => client.debugSnapshotForTest().ownerCount == 0 }), true)
+        } finally {
+            let _ = client.close(timeoutMs: 3000)
+        }
+    }
+
+    @TestCase
+    public func t4N1SettledSameGenerationStopIsIdempotent(): Unit {
+        let recording = RecordingManagedStdioPlatformRunner()
+        let client = ManagedStdioBrokerClient(platformRunner: recording)
+        let blocked = ManagedStdioBlockingSubscriber(blockTerminal: true)
+        try {
+            let started = client.startOwner(ManagedStdioOwnerSpec(
+                "settled-idempotent-stop",
+                "node",
+                args: ["-e", "process.exit(0)"],
+                stdinMode: "closed",
+                deadlineMs: 2000
+            ))
+            @Expect(started.ok, true)
+            @Expect(client.subscribeOwner(
+                "settled-idempotent-stop",
+                started.generation,
+                blocked
+            ).ok, true)
+            @Expect(blocked.awaitEntered(2000), true)
+            @Expect(managedStdioWaitUntil(2000, { => !recording.treeAlive(started.pid, started.pgid) }), true)
+
+            let stopped = client.stopOwner(
+                "settled-idempotent-stop",
+                timeoutMs: 1000,
+                expectedGeneration: Some(started.generation)
+            )
+            @Expect(stopped.ok, true)
+            @Expect(stopped.status, "already_stopped")
+            @Expect(stopped.generation, started.generation)
+        } finally {
+            blocked.release()
+            @Expect(managedStdioWaitUntil(2000, { => blocked.terminalCount() == 1 }), true)
+            @Expect(managedStdioWaitUntil(2000, { => client.debugSnapshotForTest().ownerCount == 0 }), true)
+            let _ = client.close(timeoutMs: 3000)
+        }
+    }
+
+    @TestCase
+    public func t4N2AcknowledgedStopCannotHideUnsafeBrokerTerminal(): Unit {
+        let client = ManagedStdioBrokerClient(brokerTestMode: true)
+        try {
+            let started = client.startOwner(ManagedStdioOwnerSpec(
+                "ack-then-broker-exit",
+                "node",
+                args: ["-e", "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"],
+                stdinMode: "closed",
+                deadlineMs: 10000
+            ))
+            @Expect(started.ok, true)
+            @Expect(client.debugInjectStopAckThenTerminalForTest(
+                "ack-then-broker-exit",
+                "broker_exited"
+            ), true)
+
+            let stopped = client.stopOwner(
+                "ack-then-broker-exit",
+                timeoutMs: 1000,
+                expectedGeneration: Some(started.generation)
+            )
+            @Expect(stopped.ok, false)
+            @Expect(stopped.status, "broker_exited")
+            @Expect(stopped.generation, started.generation)
         } finally {
             let _ = client.close(timeoutMs: 3000)
         }
