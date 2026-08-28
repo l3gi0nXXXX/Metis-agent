@@ -22,8 +22,42 @@ import std.time.DateTime
 import std.unittest.testmacro.*
 import stdx.encoding.json.{JsonArray, JsonObject, JsonString}
 
+private var gatewaySessionStoreRuntimePreviousHome = None<String>
+private var gatewaySessionStoreRuntimeTestHome = ""
+
 @Test
 public class GatewaySessionStoreRuntimeTest {
+    @BeforeAll
+    public func isolateGatewaySessionStoreRuntimeHome(): Unit {
+        synchronized(MetisProcessEnvironmentLock) {
+            gatewaySessionStoreRuntimePreviousHome = getVariable("METIS_HOME")
+            gatewaySessionStoreRuntimeTestHome = "/tmp/metis-session-store-runtime-${DateTime.now().toUnixTimeStamp().toNanoseconds()}"
+            let home = Path(gatewaySessionStoreRuntimeTestHome)
+            try { remove(home, recursive: true) } catch (_: Exception) { () }
+            Directory.create(home, recursive: true)
+            setVariable("METIS_HOME", gatewaySessionStoreRuntimeTestHome)
+            CliConfig.invalidatePathCache()
+            MetisConfigManager.invalidate()
+            CliSettingManager.invalidate()
+        }
+    }
+
+    @AfterAll
+    public func restoreGatewaySessionStoreRuntimeHome(): Unit {
+        synchronized(MetisProcessEnvironmentLock) {
+            match (gatewaySessionStoreRuntimePreviousHome) {
+                case Some(value) => setVariable("METIS_HOME", value)
+                case None => setVariable("METIS_HOME", "")
+            }
+            CliConfig.invalidatePathCache()
+            MetisConfigManager.invalidate()
+            CliSettingManager.invalidate()
+            if (!gatewaySessionStoreRuntimeTestHome.isEmpty()) {
+                try { remove(Path(gatewaySessionStoreRuntimeTestHome), recursive: true) } catch (_: Exception) { () }
+            }
+        }
+    }
+
     @TestCase
     public func concurrentLegacySessionMigrationSerializesDirectoryWalks(): Unit {
         synchronized(MetisProcessEnvironmentLock) {

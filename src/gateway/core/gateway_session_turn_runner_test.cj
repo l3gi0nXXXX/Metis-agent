@@ -1555,20 +1555,34 @@ public class GatewaySessionTurnRunnerTest {
 
     @TestCase
     public func executeSessionRequestTurnForUserBuildsBridgeFromResolvedRequest(): Unit {
-        let turn = gatewayExecuteSessionRequestTurnForUser(
-            GatewayUserSettings(),
-            GatewaySessionRequest(
-                GatewayIngressSource.Cli,
-                channelName: "cli",
-                sessionHint: "agent:general:main",
-                agentId: ""
-            ),
-            "/unknown"
-        )
-        @Expect(turn.context.channelName, "cli")
-        @Expect(turn.context.sessionKey, "agent:general:main")
-        @Expect(turn.context.agentId, "general")
-        @Expect(turn.execution.answer.contains("这不是一个有效的命令"), true)
+        synchronized(MetisProcessEnvironmentLock) {
+            let home = gatewaySessionTurnTtsTestHome("resolved-request")
+            let oldHome = getVariable("METIS_HOME")
+            try { remove(Path(home), recursive: true) } catch (_: Exception) { () }
+            Directory.create(Path(home), recursive: true)
+            setVariable("METIS_HOME", home)
+            CliConfig.invalidatePathCache()
+            MetisConfigManager.invalidate()
+            CliSettingManager.invalidate()
+            try {
+                let turn = gatewayExecuteSessionRequestTurnForUser(
+                    GatewayUserSettings(),
+                    GatewaySessionRequest(
+                        GatewayIngressSource.Cli,
+                        channelName: "cli",
+                        sessionHint: "agent:general:main",
+                        agentId: ""
+                    ),
+                    "/unknown"
+                )
+                @Expect(turn.context.channelName, "cli")
+                @Expect(turn.context.sessionKey, "agent:general:main")
+                @Expect(turn.context.agentId, "general")
+                @Expect(turn.execution.answer.contains("这不是一个有效的命令"), true)
+            } finally {
+                gatewaySessionTurnResetEnv(oldHome, home)
+            }
+        }
     }
 
     @TestCase
