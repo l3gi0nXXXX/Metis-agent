@@ -370,16 +370,18 @@ public class GatewayControlUiWsTest {
 
     @TestCase
     public func channelsRuntimeCompatResponseExposesTelegramNativeRuntimeView(): Unit {
-        let cfg = buildGatewayConfigFromUserSettings(CliSettingManager.readGatewaySettings())
-        let params = JsonObject()
-        params.put("channelId", JsonString("telegram"))
-        let response = gatewayControlUiWsCompatResponse("channels.runtime", params, cfg)
-        @Expect(response.isSome(), true)
-        let result = response.getOrThrow().result.asObject()
-        let telegram = result.get("telegram").getOrThrow().asObject()
-        @Expect(telegram.get("allowedUpdates").isSome(), true)
-        @Expect(telegram.get("registrationPayload").isSome(), true)
-        @Expect(telegram.get("healthSnapshot").isSome(), true)
+        withGatewayControlUiWsTestHome {
+            let cfg = buildGatewayConfigFromUserSettings(CliSettingManager.readGatewaySettings())
+            let params = JsonObject()
+            params.put("channelId", JsonString("telegram"))
+            let response = gatewayControlUiWsCompatResponse("channels.runtime", params, cfg)
+            @Expect(response.isSome(), true)
+            let result = response.getOrThrow().result.asObject()
+            let telegram = result.get("telegram").getOrThrow().asObject()
+            @Expect(telegram.get("allowedUpdates").isSome(), true)
+            @Expect(telegram.get("registrationPayload").isSome(), true)
+            @Expect(telegram.get("healthSnapshot").isSome(), true)
+        }
     }
 
     @TestCase
