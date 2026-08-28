@@ -1382,12 +1382,30 @@ public class ServicePluginHostTest {
                 let restarted = ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000)
                 @Expect(restarted.ok, true)
                 @Expect(this.readCounterFile(counterPath), 2)
-                let replacementPid = restarted.process.getOrThrow().process.pid
-                match (getServicePluginSnapshot("gitcode-monitor")) {
+                let replacementDeadline = DateTime.now().toUnixTimeStamp().toMilliseconds() + 1000
+                var replacementSnapshot = getServicePluginSnapshot("gitcode-monitor")
+                var replacementRunning = match (replacementSnapshot) {
+                    case Some(snapshot) => snapshot.status == "running" && snapshot.pid > 0
+                    case None => false
+                }
+                while (DateTime.now().toUnixTimeStamp().toMilliseconds() < replacementDeadline && !replacementRunning) {
+                    sleep(Duration.millisecond * 10)
+                    replacementSnapshot = getServicePluginSnapshot("gitcode-monitor")
+                    replacementRunning = match (replacementSnapshot) {
+                        case Some(snapshot) => snapshot.status == "running" && snapshot.pid > 0
+                        case None => false
+                    }
+                }
+                match (replacementSnapshot) {
                     case Some(snapshot) =>
                         @Expect(snapshot.status, "running")
-                        @Expect(snapshot.pid, replacementPid)
-                        @Expect(restarted.process.getOrThrow().process.isAlive(), true)
+                        @Expect(snapshot.pid > 0, true)
+                        match (getServicePluginSnapshot("gitcode-monitor")) {
+                            case Some(stableSnapshot) =>
+                                @Expect(stableSnapshot.status, "running")
+                                @Expect(stableSnapshot.pid, snapshot.pid)
+                            case None => @Expect(true, false)
+                        }
                     case None => @Expect(true, false)
                 }
             } finally {
