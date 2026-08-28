@@ -104,13 +104,18 @@ public class GatewayServeCompletionResult {
     public let servicePluginPendingCount: Int64
     public let channelsStatus: String
     public let brokerStatus: String
+    public let httpStatus: String
+    public let canvasStatus: String
+    public let gatewayServerStatus: String
 
     public init(found: Bool, status!: String = "missing", fullTerminal!: Bool = false,
         inboundStatus!: String = "not_checked", compatStatus!: String = "not_checked", sidecarStatus!: String = "not_checked",
         servicePluginIngressStatus!: String = "not_checked", servicePluginDispatchStatus!: String = "not_checked",
         servicePluginOwnerStatus!: String = "not_checked", servicePluginLeaseStatus!: String = "not_checked",
         servicePluginPortStatus!: String = "not_checked", servicePluginPendingCount!: Int64 = 0,
-        channelsStatus!: String = "not_checked", brokerStatus!: String = "not_checked") {
+        channelsStatus!: String = "not_checked", brokerStatus!: String = "not_checked",
+        httpStatus!: String = "not_checked", canvasStatus!: String = "not_checked",
+        gatewayServerStatus!: String = "not_checked") {
         this.found = found
         this.status = status.trimAscii()
         this.fullTerminal = fullTerminal
@@ -125,6 +130,19 @@ public class GatewayServeCompletionResult {
         this.servicePluginPendingCount = max(0, servicePluginPendingCount)
         this.channelsStatus = channelsStatus.trimAscii()
         this.brokerStatus = brokerStatus.trimAscii()
+        this.httpStatus = httpStatus.trimAscii()
+        this.canvasStatus = canvasStatus.trimAscii()
+        this.gatewayServerStatus = gatewayServerStatus.trimAscii()
+    }
+}
+
+public class GatewayServeCompletionReconcileResult {
+    public let ok: Bool
+    public let status: String
+
+    public init(ok: Bool, status: String) {
+        this.ok = ok
+        this.status = status.trimAscii()
     }
 }
 
@@ -483,40 +501,124 @@ private func gatewayRemoveServeStopRequest(expected: GatewayServeIdentity): Bool
     }
 }
 
+private func gatewayParseServeCompletion(text: String, identity: GatewayServeIdentity): GatewayServeCompletionResult {
+    match (gatewayParseServeIdentity(text)) {
+        case Some(found) =>
+            if (!found.matches(identity)) { return GatewayServeCompletionResult(false, status: "identity_mismatch") }
+            let status = gatewayServePayloadField(text, "status")
+            if (status == "graceful" || status == "cleanup_pending") {
+                let pending = try { Int64.parse(gatewayServePayloadField(text, "servicePluginPendingCount")) } catch (_: Exception) { -1 }
+                if (pending < 0) { return GatewayServeCompletionResult(false, status: "malformed") }
+                let fullTerminal = gatewayServePayloadField(text, "fullTerminal") == "1" && pending == 0
+                return GatewayServeCompletionResult(
+                    true,
+                    status: status,
+                    fullTerminal: fullTerminal,
+                    inboundStatus: gatewayServePayloadField(text, "inboundStatus"),
+                    compatStatus: gatewayServePayloadField(text, "compatStatus"),
+                    sidecarStatus: gatewayServePayloadField(text, "sidecarStatus"),
+                    servicePluginIngressStatus: gatewayServePayloadField(text, "servicePluginIngressStatus"),
+                    servicePluginDispatchStatus: gatewayServePayloadField(text, "servicePluginDispatchStatus"),
+                    servicePluginOwnerStatus: gatewayServePayloadField(text, "servicePluginOwnerStatus"),
+                    servicePluginLeaseStatus: gatewayServePayloadField(text, "servicePluginLeaseStatus"),
+                    servicePluginPortStatus: gatewayServePayloadField(text, "servicePluginPortStatus"),
+                    servicePluginPendingCount: pending,
+                    channelsStatus: gatewayServePayloadField(text, "channelsStatus"),
+                    brokerStatus: gatewayServePayloadField(text, "brokerStatus"),
+                    httpStatus: gatewayServePayloadField(text, "httpStatus"),
+                    canvasStatus: gatewayServePayloadField(text, "canvasStatus"),
+                    gatewayServerStatus: gatewayServePayloadField(text, "gatewayServerStatus")
+                )
+            }
+            GatewayServeCompletionResult(false, status: "malformed")
+        case None => GatewayServeCompletionResult(false, status: "malformed")
+    }
+}
+
 private func gatewayReadServeCompletion(identity: GatewayServeIdentity): GatewayServeCompletionResult {
     let path = gatewayServeCompletionPath()
     if (!exists(path)) { return GatewayServeCompletionResult(false) }
     match (gatewayReadLockText(path)) {
-        case Some(text) =>
-            match (gatewayParseServeIdentity(text)) {
-                case Some(found) =>
-                    if (!found.matches(identity)) { return GatewayServeCompletionResult(false, status: "identity_mismatch") }
-                    let status = gatewayServePayloadField(text, "status")
-                    if (status == "graceful" || status == "cleanup_pending") {
-                        let pending = try { Int64.parse(gatewayServePayloadField(text, "servicePluginPendingCount")) } catch (_: Exception) { -1 }
-                        let fullTerminal = gatewayServePayloadField(text, "fullTerminal") == "1" && pending == 0
-                        return GatewayServeCompletionResult(
-                            true,
-                            status: status,
-                            fullTerminal: fullTerminal,
-                            inboundStatus: gatewayServePayloadField(text, "inboundStatus"),
-                            compatStatus: gatewayServePayloadField(text, "compatStatus"),
-                            sidecarStatus: gatewayServePayloadField(text, "sidecarStatus"),
-                            servicePluginIngressStatus: gatewayServePayloadField(text, "servicePluginIngressStatus"),
-                            servicePluginDispatchStatus: gatewayServePayloadField(text, "servicePluginDispatchStatus"),
-                            servicePluginOwnerStatus: gatewayServePayloadField(text, "servicePluginOwnerStatus"),
-                            servicePluginLeaseStatus: gatewayServePayloadField(text, "servicePluginLeaseStatus"),
-                            servicePluginPortStatus: gatewayServePayloadField(text, "servicePluginPortStatus"),
-                            servicePluginPendingCount: max(0, pending),
-                            channelsStatus: gatewayServePayloadField(text, "channelsStatus"),
-                            brokerStatus: gatewayServePayloadField(text, "brokerStatus")
-                        )
-                    }
-                    GatewayServeCompletionResult(false, status: "malformed")
-                case None => GatewayServeCompletionResult(false, status: "malformed")
-            }
+        case Some(text) => gatewayParseServeCompletion(text, identity)
         case None => GatewayServeCompletionResult(false, status: "invalid_response_encoding")
     }
+}
+
+private func gatewayStatusIn(status: String, allowed: Array<String>): Bool {
+    allowed.contains(status.trimAscii())
+}
+
+private func gatewayServeCompletionHasTerminalExternalResources(result: GatewayServeCompletionResult): Bool {
+    result.found && result.status == "cleanup_pending" &&
+        gatewayStatusIn(result.inboundStatus, ["stopped", "not_applicable"]) &&
+        gatewayStatusIn(result.compatStatus, ["stopped", "not_applicable"]) &&
+        gatewayStatusIn(result.sidecarStatus, ["stopped", "already_stopped", "disabled", "not_applicable"]) &&
+        gatewayStatusIn(result.servicePluginIngressStatus, ["sent", "stopped", "not_applicable"]) &&
+        gatewayStatusIn(result.servicePluginDispatchStatus, ["cleanup_pending", "drained", "stopped", "not_applicable"]) &&
+        gatewayStatusIn(result.servicePluginOwnerStatus, ["stopped", "already_stopped", "terminated", "force_terminated", "not_applicable"]) &&
+        gatewayStatusIn(result.servicePluginLeaseStatus, ["stopped", "not_applicable"]) &&
+        gatewayStatusIn(result.servicePluginPortStatus, ["released", "not_applicable"]) &&
+        gatewayStatusIn(result.channelsStatus, ["stopped", "not_applicable"]) &&
+        gatewayStatusIn(result.brokerStatus, ["stopped", "not_applicable"]) &&
+        gatewayStatusIn(result.httpStatus, ["stopped", "already_stopped", "not_applicable"]) &&
+        gatewayStatusIn(result.canvasStatus, ["stopped", "already_stopped", "not_applicable"]) &&
+        gatewayStatusIn(result.gatewayServerStatus, ["stopped", "already_stopped", "not_applicable"])
+}
+
+/**
+ * 仅清理 identity-bound、原进程已确定死亡且所有外部资源均终止的历史 completion。
+ * durable pending 业务状态不在此文件中，不会被删除。
+ */
+private func gatewayEvaluateHistoricalServeCompletion(removeMarker: Bool): GatewayServeCompletionReconcileResult {
+    if (removeMarker) {
+        let active = synchronized(gatewayServeIdentityLock) { gatewayActiveServeIdentity }
+        let ownsLock = match ((active, gatewayReadServeIdentity())) {
+            case (Some(expected), Some(current)) => expected.matches(current)
+            case _ => false
+        }
+        if (!ownsLock) { return GatewayServeCompletionReconcileResult(false, "lock_not_owned") }
+    }
+    let path = gatewayServeCompletionPath()
+    if (!exists(path)) { return GatewayServeCompletionReconcileResult(false, "missing") }
+    let original = match (gatewayReadLockText(path)) {
+        case Some(text) => text
+        case None => return GatewayServeCompletionReconcileResult(false, "invalid_response_encoding")
+    }
+    let identity = match (gatewayParseServeIdentity(original)) {
+        case Some(value) => value
+        case None => return GatewayServeCompletionReconcileResult(false, "malformed")
+    }
+    let completion = gatewayParseServeCompletion(original, identity)
+    if (!gatewayServeCompletionHasTerminalExternalResources(completion)) {
+        return GatewayServeCompletionReconcileResult(false, if (completion.found) { "resources_not_terminal" } else { completion.status })
+    }
+    let instance = match (identity.processIdentity) {
+        case Some(value) => value
+        case None => return GatewayServeCompletionReconcileResult(false, "identity_unsupported")
+    }
+    let probe = probeProcessInstance(instance, MonoTime.now() + Duration.millisecond * 500)
+    if (!probe.conclusive) { return GatewayServeCompletionReconcileResult(false, probe.status) }
+    if (probe.alive) { return GatewayServeCompletionReconcileResult(false, "identity_alive") }
+    if (!removeMarker) { return GatewayServeCompletionReconcileResult(true, "recoverable") }
+    try {
+        let current = match (gatewayReadLockText(path)) {
+            case Some(text) => text
+            case None => return GatewayServeCompletionReconcileResult(false, "invalid_response_encoding")
+        }
+        if (current != original) { return GatewayServeCompletionReconcileResult(false, "identity_changed") }
+        remove(path)
+        GatewayServeCompletionReconcileResult(true, "reconciled")
+    } catch (_: Exception) {
+        GatewayServeCompletionReconcileResult(false, "remove_failed")
+    }
+}
+
+public func gatewayHistoricalServeCompletionRecoveryStatus(): GatewayServeCompletionReconcileResult {
+    gatewayEvaluateHistoricalServeCompletion(false)
+}
+
+public func gatewayReconcileHistoricalServeCompletion(): GatewayServeCompletionReconcileResult {
+    gatewayEvaluateHistoricalServeCompletion(true)
 }
 
 public func gatewayPendingServeCompletionStatus(): String {
@@ -919,8 +1021,9 @@ public func gatewayAcquireServeLockForRunningProcess(): Bool {
         match (gatewayReadLockText(completionPath)) {
             case Some(text) =>
                 let status = gatewayServePayloadField(text, "status")
-                if (status == "cleanup_pending") { return false }
-                if (status != "graceful") { return false }
+                if (status != "cleanup_pending" && status != "graceful") {
+                    return false
+                }
             case None => return false
         }
     }
@@ -957,14 +1060,19 @@ public func gatewayAcquireServeLockForRunningProcess(): Bool {
         if (exists(completionPath)) {
             match (gatewayReadLockText(completionPath)) {
                 case Some(text) =>
-                    match (gatewayParseServeIdentity(text)) {
-                        case Some(completed) =>
-                            if (completed.matches(identity) && gatewayServePayloadField(text, "status") == "graceful") {
-                                try { remove(completionPath) } catch (_: Exception) { () }
-                            }
-                        case None => ()
+                    let status = gatewayServePayloadField(text, "status")
+                    if (status == "cleanup_pending") {
+                        if (!gatewayReconcileHistoricalServeCompletion().ok) {
+                            gatewayReleaseServeLockQuiet()
+                            return false
+                        }
+                    } else if (status != "graceful") {
+                        gatewayReleaseServeLockQuiet()
+                        return false
                     }
-                case None => ()
+                case None =>
+                    gatewayReleaseServeLockQuiet()
+                    return false
             }
         }
         atExit({ =>

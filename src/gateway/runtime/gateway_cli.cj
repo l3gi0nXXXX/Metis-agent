@@ -1334,7 +1334,11 @@ private func runGatewayStopSubcommand(): Int64 {
         case None => []
     }
     if (!exists(lockPath) && stopPids.isEmpty()) {
-        let pending = gatewayPendingServeCompletionStatus()
+        var pending = gatewayPendingServeCompletionStatus()
+        if (discovery.conclusive && listenerPids.isEmpty() && pending == "cleanup_pending" &&
+            gatewayHistoricalServeCompletionRecoveryStatus().ok) {
+            pending = "recoverable"
+        }
         if (!discovery.conclusive || pending == "cleanup_pending" || pending == "malformed" || pending == "invalid_response_encoding" || !listenerPids.isEmpty()) {
             gatewayStopPrintLine(gatewayStopOutcomeHumanText("cleanup_pending"))
             gatewayCliTimingLog("stop", "cleanup-pending-no-lock", startMs)

@@ -4,7 +4,7 @@ import metis.core.config.{CliConfig, CliSettingManager, GatewayServicePluginUser
 import metis.gateway.process.gatewayStdioBrokerSnapshot
 import metis.gateway.service_plugin.loadServicePluginManifest
 import metis.gateway.core.GatewayStopResult
-import metis.process.{currentProcessInstanceIdentity, managedStdioResolveBrokerScriptPath, probeProcessInstance, processInstanceKillSignal, processInstanceTermSignal, resetManagedStdioBrokerForTest, signalProcessInstance}
+import metis.process.{ProcessInstanceIdentity, currentProcessInstanceIdentity, managedStdioResolveBrokerScriptPath, probeProcessInstance, processInstanceKillSignal, processInstanceTermSignal, resetManagedStdioBrokerForTest, signalProcessInstance}
 import std.collection.{ArrayList, HashMap, HashSet}
 import std.convert.Parsable
 import std.core.Duration
@@ -36,6 +36,41 @@ private func gatewayServeStopWaitUntil(timeoutMs: Int64, predicate: () -> Bool):
         sleep(Duration.millisecond * 20)
     }
     predicate()
+}
+
+private func gatewayServeStaleProcessIdentity(current: ProcessInstanceIdentity): ProcessInstanceIdentity {
+    ProcessInstanceIdentity(
+        current.platform,
+        current.pid,
+        value0: current.value0,
+        value1: current.value1,
+        value2: current.value2,
+        value3: current.value3,
+        value4: current.value4,
+        value5: current.value5,
+        value6: current.value6,
+        value7: current.value7,
+        value8: current.value8,
+        value9: current.value9 + 1
+    )
+}
+
+private func gatewayServeHistoricalCleanupResult(leaseStatus!: String = "stopped"): GatewayStopResult {
+    GatewayStopResult(
+        false,
+        "cleanup_pending",
+        inboundStatus: "stopped",
+        compatStatus: "stopped",
+        sidecarStatus: "disabled",
+        servicePluginIngressStatus: "sent",
+        servicePluginDispatchStatus: "cleanup_pending",
+        servicePluginOwnerStatus: "force_terminated",
+        servicePluginLeaseStatus: leaseStatus,
+        servicePluginPortStatus: "released",
+        servicePluginPendingCount: 1,
+        channelsStatus: "stopped",
+        brokerStatus: "stopped"
+    )
 }
 
 private func gatewayServeStopPidAlive(pid: Int64): Bool {
@@ -1308,6 +1343,156 @@ public class GatewayServeLockLogicTest {
                 @Expect(request.isSome(), true)
                 @Expect(request.getOrThrow().nonce, "中文-🔒")
             case None => ()
+        }
+    }
+
+    @TestCase
+    public func s5U1StaleCleanupMarkerWithTerminalResourcesCanBeReconciled(): Unit {
+        synchronized(MetisProcessEnvironmentLock) {
+            let home = Path("/tmp/metis-s5-stale-cleanup-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
+            let oldHome = getVariable("METIS_HOME")
+            try {
+                Directory.create(home, recursive: true)
+                setVariable("METIS_HOME", home.toString())
+                CliConfig.invalidatePathCache()
+                let current = currentProcessInstanceIdentity().getOrThrow()
+                let stale = gatewayServeStaleProcessIdentity(current)
+                let identity = GatewayServeIdentity(
+                    stale.pid,
+                    DateTime.now().toUnixTimeStamp().toMilliseconds(),
+                    "历史-cleanup-🙂",
+                    processIdentity: Some(stale)
+                )
+                @Expect(
+                    gatewayWriteServeCompletionMarker(
+                        identity,
+                        gatewayServeHistoricalCleanupResult(),
+                        httpStatus: "stopped",
+                        canvasStatus: "already_stopped",
+                        gatewayServerStatus: "stopped"
+                    ),
+                    true
+                )
+                let marker = home.join("gateway-serve.stop-complete")
+                @Expect(exists(marker), true)
+                let recoverable = gatewayHistoricalServeCompletionRecoveryStatus()
+                @Expect(recoverable.ok, true)
+                @Expect(recoverable.status, "recoverable")
+                @Expect(exists(marker), true)
+                let withoutLock = gatewayReconcileHistoricalServeCompletion()
+                @Expect(withoutLock.ok, false)
+                @Expect(withoutLock.status, "lock_not_owned")
+                @Expect(exists(marker), true)
+                @Expect(gatewayAcquireServeLockForRunningProcess(), true)
+                @Expect(exists(marker), false)
+                gatewayReleaseServeLockQuiet()
+
+                @Expect(
+                    gatewayWriteServeCompletionMarker(
+                        identity,
+                        gatewayServeHistoricalCleanupResult(),
+                        httpStatus: "stopped",
+                        canvasStatus: "already_stopped",
+                        gatewayServerStatus: "stopped"
+                    ),
+                    true
+                )
+                let output = ArrayList<String>()
+                setGatewayStopOutputForTest(Some({ line => output.add(line) }))
+                @Expect(gatewayExecuteStopServe(), 0)
+                setGatewayStopOutputForTest(None<(String) -> Unit>)
+                @Expect(exists(marker), true)
+                @Expect(String.join(output.toArray(), delimiter: "\n").contains("未发现"), true)
+                @Expect(gatewayAcquireServeLockForRunningProcess(), true)
+                @Expect(exists(marker), false)
+                gatewayReleaseServeLockQuiet()
+            } finally {
+                setGatewayStopOutputForTest(None<(String) -> Unit>)
+                gatewayReleaseServeLockQuiet()
+                match (oldHome) {
+                    case Some(value) => setVariable("METIS_HOME", value)
+                    case None => setVariable("METIS_HOME", "")
+                }
+                CliConfig.invalidatePathCache()
+                try { remove(home, recursive: true) } catch (_: Exception) { () }
+            }
+        }
+    }
+
+    @TestCase
+    public func s5N1CleanupMarkerReconciliationFailsClosed(): Unit {
+        synchronized(MetisProcessEnvironmentLock) {
+            let home = Path("/tmp/metis-s5-unsafe-cleanup-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
+            let oldHome = getVariable("METIS_HOME")
+            try {
+                Directory.create(home, recursive: true)
+                setVariable("METIS_HOME", home.toString())
+                CliConfig.invalidatePathCache()
+                let current = currentProcessInstanceIdentity().getOrThrow()
+                let aliveIdentity = GatewayServeIdentity(
+                    current.pid,
+                    DateTime.now().toUnixTimeStamp().toMilliseconds(),
+                    "alive-🙂",
+                    processIdentity: Some(current)
+                )
+                @Expect(
+                    gatewayWriteServeCompletionMarker(
+                        aliveIdentity,
+                        gatewayServeHistoricalCleanupResult(),
+                        httpStatus: "stopped",
+                        canvasStatus: "already_stopped",
+                        gatewayServerStatus: "stopped"
+                    ),
+                    true
+                )
+                let marker = home.join("gateway-serve.stop-complete")
+                let alive = gatewayHistoricalServeCompletionRecoveryStatus()
+                @Expect(alive.ok, false)
+                @Expect(alive.status, "identity_alive")
+                @Expect(exists(marker), true)
+                @Expect(gatewayAcquireServeLockForRunningProcess(), false)
+
+                remove(marker)
+                let stale = gatewayServeStaleProcessIdentity(current)
+                let staleIdentity = GatewayServeIdentity(
+                    stale.pid,
+                    DateTime.now().toUnixTimeStamp().toMilliseconds(),
+                    "unsafe-🙂",
+                    processIdentity: Some(stale)
+                )
+                @Expect(
+                    gatewayWriteServeCompletionMarker(
+                        staleIdentity,
+                        gatewayServeHistoricalCleanupResult(leaseStatus: "cleanup_pending"),
+                        httpStatus: "stopped",
+                        canvasStatus: "already_stopped",
+                        gatewayServerStatus: "stopped"
+                    ),
+                    true
+                )
+                let nonTerminal = gatewayHistoricalServeCompletionRecoveryStatus()
+                @Expect(nonTerminal.ok, false)
+                @Expect(nonTerminal.status, "resources_not_terminal")
+                @Expect(exists(marker), true)
+                @Expect(gatewayExecuteStopServe(), 1)
+                @Expect(exists(marker), true)
+
+                remove(marker)
+                File.writeTo(marker, [0xffu8, 0xfeu8, 0xfdu8])
+                let invalid = gatewayHistoricalServeCompletionRecoveryStatus()
+                @Expect(invalid.ok, false)
+                @Expect(invalid.status, "invalid_response_encoding")
+                @Expect(exists(marker), true)
+            } finally {
+                setGatewayStopOutputForTest(None<(String) -> Unit>)
+                gatewayReleaseServeLockQuiet()
+                match (oldHome) {
+                    case Some(value) => setVariable("METIS_HOME", value)
+                    case None => setVariable("METIS_HOME", "")
+                }
+                CliConfig.invalidatePathCache()
+                try { remove(home, recursive: true) } catch (_: Exception) { () }
+            }
         }
     }
 
