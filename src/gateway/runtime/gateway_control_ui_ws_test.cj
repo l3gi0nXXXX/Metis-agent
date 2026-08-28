@@ -427,25 +427,27 @@ public class GatewayControlUiWsTest {
 
     @TestCase
     public func channelsAuditCompatResponseExposesTelegramUnifiedAuditView(): Unit {
-        let cfg = buildGatewayConfigFromUserSettings(CliSettingManager.readGatewaySettings())
-        let params = JsonObject()
-        params.put("channelId", JsonString("telegram"))
-        let response = gatewayControlUiWsCompatResponse("channels.audit", params, cfg)
-        @Expect(response.isSome(), true)
-        let result = response.getOrThrow().result.asObject()
-        let audit = result.get("audit").getOrThrow().asObject()
-        @Expect(gatewayControlUiWsTestString(audit, "kind"), "gateway-channels-audit")
-        let summary = audit.get("summary").getOrThrow().asObject()
-        @Expect(gatewayControlUiWsTestString(summary, "phase"), "T12")
-        let closure = summary.get("closure").getOrThrow().asObject()
-        @Expect(closure.get("telegramThreadBindingVisibleInControlUiWsSessions").getOrThrow().asBool().getValue(), true)
-        @Expect(closure.get("telegramMediaRuntimeVisible").getOrThrow().asBool().getValue(), true)
-        let consumers = summary.get("consumers").getOrThrow().asObject()
-        @Expect(consumers.get("controlUiSessionsWs").getOrThrow().asBool().getValue(), true)
-        let runtime = audit.get("runtime").getOrThrow().asObject()
-        let telegram = runtime.get("telegram").getOrThrow().asObject()
-        @Expect(telegram.get("registrationPayload").isSome(), true)
-        @Expect(telegram.get("healthSnapshot").isSome(), true)
+        withGatewayControlUiWsTestHome {
+            let cfg = buildGatewayConfigFromUserSettings(CliSettingManager.readGatewaySettings())
+            let params = JsonObject()
+            params.put("channelId", JsonString("telegram"))
+            let response = gatewayControlUiWsCompatResponse("channels.audit", params, cfg)
+            @Expect(response.isSome(), true)
+            let result = response.getOrThrow().result.asObject()
+            let audit = result.get("audit").getOrThrow().asObject()
+            @Expect(gatewayControlUiWsTestString(audit, "kind"), "gateway-channels-audit")
+            let summary = audit.get("summary").getOrThrow().asObject()
+            @Expect(gatewayControlUiWsTestString(summary, "phase"), "T12")
+            let closure = summary.get("closure").getOrThrow().asObject()
+            @Expect(closure.get("telegramThreadBindingVisibleInControlUiWsSessions").getOrThrow().asBool().getValue(), true)
+            @Expect(closure.get("telegramMediaRuntimeVisible").getOrThrow().asBool().getValue(), true)
+            let consumers = summary.get("consumers").getOrThrow().asObject()
+            @Expect(consumers.get("controlUiSessionsWs").getOrThrow().asBool().getValue(), true)
+            let runtime = audit.get("runtime").getOrThrow().asObject()
+            let telegram = runtime.get("telegram").getOrThrow().asObject()
+            @Expect(telegram.get("registrationPayload").isSome(), true)
+            @Expect(telegram.get("healthSnapshot").isSome(), true)
+        }
     }
 
     @TestCase
