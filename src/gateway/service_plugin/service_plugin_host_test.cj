@@ -732,7 +732,8 @@ public class ServicePluginHostTest {
         writeLease!: Bool = true,
         stopUpdatesLease!: Bool = true,
         keepAlive!: Bool = true,
-        firstLaunchNoise!: Bool = false
+        firstLaunchNoise!: Bool = false,
+        firstLaunchExit!: Bool = false
     ): String {
         let endpoint = if (includeEndpoint) { ",\"bindHost\":\"127.0.0.1\",\"port\":${port}" } else { "" }
         let runningLease = "printf '{\"state\":\"running\",\"status\":\"running\",\"pluginId\":\"gitcode-monitor\",\"sessionId\":\"%s\",\"pid\":%s,\"parentPid\":%s${endpoint},\"startedAtMs\":1000,\"lastHeartbeatMs\":1000}\\n' \"$METIS_SERVICE_PLUGIN_SESSION_ID\" \"$$\" \"$METIS_SERVICE_PLUGIN_PARENT_PID\" > \"$METIS_SERVICE_PLUGIN_LEASE_PATH\""
@@ -743,6 +744,9 @@ public class ServicePluginHostTest {
         }
         if (firstLaunchNoise) {
             script += "if [ \"$count\" = \"1\" ]; then for i in 1 2 3 4 5 6 7 8 9 10; do printf 'WARN noisy stdout %s Authorization: Bearer secret-value\\n' \"$i\"; done; exit 0; fi; "
+        }
+        if (firstLaunchExit) {
+            script += "if [ \"$count\" = \"1\" ]; then exit 0; fi; "
         }
         if (!keepAlive) {
             return script + "exit 0"
@@ -1369,7 +1373,7 @@ public class ServicePluginHostTest {
         // T0-U2 Metis-side baseline, T4-U1.
         withIsolatedServicePluginHostTestHome("service-plugin-t4-dead-active", { home: Path =>
             let counterPath = home.join("launch-count.txt")
-            this.registerGitCodeStdioScript(this.gitCodeCountingLeaseScript(counterPath, 18185, keepAlive: false))
+            this.registerGitCodeStdioScript(this.gitCodeCountingLeaseScript(counterPath, 18185, firstLaunchExit: true))
             try {
                 let started = ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000)
                 @Expect(started.ok, true)
@@ -1378,14 +1382,18 @@ public class ServicePluginHostTest {
                 let restarted = ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000)
                 @Expect(restarted.ok, true)
                 @Expect(this.readCounterFile(counterPath), 2)
+                let replacementPid = restarted.process.getOrThrow().process.pid
                 match (getServicePluginSnapshot("gitcode-monitor")) {
                     case Some(snapshot) =>
                         @Expect(snapshot.status, "running")
-                        @Expect(snapshot.pid > 0, true)
+                        @Expect(snapshot.pid, replacementPid)
+                        @Expect(restarted.process.getOrThrow().process.isAlive(), true)
                     case None => @Expect(true, false)
                 }
             } finally {
                 resetServicePluginHostForTest()
+                @Expect(managedStdioBroker().snapshot().ownerCount, 0)
+                @Expect(servicePluginCleanupPendingCountForTest(), 0)
             }
         })
     }
