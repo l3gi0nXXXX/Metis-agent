@@ -2,7 +2,7 @@ package metis.gateway.service_plugin
 
 import metis.process.{managedStdioBroker, managedStdioResolveBrokerScriptPath, resetManagedStdioBrokerForTest}
 import metis.gateway.logging.gatewayLoggingResetForTest
-import std.collection.ArrayList
+import std.collection.{ArrayList, HashSet}
 import std.convert.Parsable
 import std.core.Duration
 import std.env.{getVariable, setVariable}
@@ -315,6 +315,102 @@ private class S5DeliveryLog {
             count
         }
     }
+}
+
+private class S5GcmQueueProof {
+    let pending: Int64
+    let processing: Int64
+    let awaiting: Int64
+    let processed: Int64
+    let deadLetter: Int64
+    let cancelled: Int64
+    let unique: Int64
+    let attemptOne: Int64
+    let invalid: Int64
+
+    init(pending: Int64, processing: Int64, awaiting: Int64, processed: Int64,
+        deadLetter: Int64, cancelled: Int64, unique: Int64, attemptOne: Int64, invalid: Int64) {
+        this.pending = pending
+        this.processing = processing
+        this.awaiting = awaiting
+        this.processed = processed
+        this.deadLetter = deadLetter
+        this.cancelled = cancelled
+        this.unique = unique
+        this.attemptOne = attemptOne
+        this.invalid = invalid
+    }
+}
+
+private func s5GcmQueueProof(queuePath: Path, expected: HashSet<String>): S5GcmQueueProof {
+    var pending: Int64 = 0
+    var processing: Int64 = 0
+    var awaiting: Int64 = 0
+    var processed: Int64 = 0
+    var deadLetter: Int64 = 0
+    var cancelled: Int64 = 0
+    var attemptOne: Int64 = 0
+    var invalid: Int64 = 0
+    let seen = HashSet<String>()
+    for (status in ["pending", "processing", "awaiting-host", "processed", "dead-letter", "cancelled"]) {
+        let directory = queuePath.join(status)
+        if (!exists(directory)) { continue }
+        try {
+            for (entry in Directory.readFrom(directory)) {
+                if (!entry.isRegular()) { continue }
+                match (status) {
+                    case "pending" => pending++
+                    case "processing" => processing++
+                    case "awaiting-host" => awaiting++
+                    case "processed" => processed++
+                    case "dead-letter" => deadLetter++
+                    case "cancelled" => cancelled++
+                    case _ => ()
+                }
+                if (!entry.name.endsWith(".json")) {
+                    invalid++
+                    continue
+                }
+                try {
+                    let root = JsonValue.fromStr(String.fromUtf8(File.readFrom(entry.path))).asObject()
+                    let deliveryId = root.get("deliveryId").getOrThrow().asString().getValue()
+                    let storedStatus = root.get("status").getOrThrow().asString().getValue()
+                    let admissionAttempt = root.get("admissionAttempt").getOrThrow().asInt().getValue()
+                    let admissionState = root.get("admissionState").getOrThrow().asString().getValue()
+                    let hostEventId = root.get("hostEventId").getOrThrow().asString().getValue()
+                    let admissionToken = root.get("admissionToken").getOrThrow().asString().getValue()
+                    let processedEventId = root.get("processedEventId").getOrThrow().asString().getValue()
+                    let identityValid = expected.contains(deliveryId) && entry.name == "${deliveryId}.json" &&
+                        !seen.contains(deliveryId)
+                    let stateValid = admissionAttempt > 0 && match (status) {
+                        case "pending" => storedStatus == "pending" && admissionState == "retry" &&
+                            !hostEventId.isEmpty() && !admissionToken.isEmpty() && processedEventId.isEmpty()
+                        case "processing" => storedStatus == "processing"
+                        case "awaiting-host" => storedStatus == "awaiting-host" && admissionState == "admitted" &&
+                            !hostEventId.isEmpty() && !admissionToken.isEmpty() && processedEventId.isEmpty()
+                        case "processed" => storedStatus == "processed" && admissionState == "completed" &&
+                            !hostEventId.isEmpty() && !admissionToken.isEmpty() && processedEventId == hostEventId
+                        case "dead-letter" => storedStatus == "dead-letter"
+                        case "cancelled" => storedStatus == "cancelled"
+                        case _ => false
+                    }
+                    if (!identityValid || !stateValid) {
+                        invalid++
+                        continue
+                    }
+                    seen.add(deliveryId)
+                    if (admissionAttempt == 1) { attemptOne++ }
+                } catch (_: Exception) {
+                    invalid++
+                }
+            }
+        } catch (_: Exception) {
+            invalid++
+        }
+    }
+    S5GcmQueueProof(
+        pending, processing, awaiting, processed, deadLetter, cancelled, Int64(seen.size), attemptOne, invalid
+    )
 }
 
 private class S5GeneratedReplyGate {
@@ -653,18 +749,35 @@ public class GatewayGcmShutdownE2eTest {
                 let brokerBefore = managedStdioBroker().snapshot()
                 @Expect(brokerBefore.ownerCount, 1)
 
+                let expectedDeliveries = HashSet<String>()
                 for (index in 0..140) {
                     let deliveryId = "s5-b1-${"${index}".padStart(4, padding: "0")}-end"
+                    expectedDeliveries.add(deliveryId)
                     let posted = s5PostWebhook(gcmPort, deliveryId, 6000 + index)
                     @Expect(posted.status >= 200 && posted.status < 300, true)
                 }
+                @Expect(expectedDeliveries.size, 140)
                 @Expect(s5WaitUntil(15000, { =>
+                    let queue = s5GcmQueueProof(queuePath, expectedDeliveries)
                     match (servicePluginDispatchSchedulerSnapshotForTest("gitcode-monitor")) {
                         case Some(row) => row.active == 2 && row.queued == 128 && row.accepted == 130 &&
-                            row.futures == 2 && row.queueHighWatermark == 128 && row.queueFull >= 10
+                            row.futures == 2 && row.queueHighWatermark == 128 && row.queueFull >= 10 &&
+                            queue.awaiting == 130 && queue.pending == 10 && queue.processing == 0 &&
+                            queue.processed == 0 && queue.deadLetter == 0 && queue.cancelled == 0 &&
+                            queue.unique == 140 && queue.attemptOne == 140 && queue.invalid == 0
                         case None => false
                     }
                 }), true)
+                let saturatedQueue = s5GcmQueueProof(queuePath, expectedDeliveries)
+                @Expect(saturatedQueue.awaiting, 130)
+                @Expect(saturatedQueue.pending, 10)
+                @Expect(saturatedQueue.processing, 0)
+                @Expect(saturatedQueue.processed, 0)
+                @Expect(saturatedQueue.deadLetter, 0)
+                @Expect(saturatedQueue.cancelled, 0)
+                @Expect(saturatedQueue.unique, 140)
+                @Expect(saturatedQueue.attemptOne, 140)
+                @Expect(saturatedQueue.invalid, 0)
                 let saturatedScheduler = servicePluginDispatchSchedulerSnapshotForTest("gitcode-monitor").getOrThrow()
                 let saturated = getServicePluginSnapshot("gitcode-monitor").getOrThrow()
                 @Expect(saturatedScheduler.active, 2)
@@ -693,20 +806,28 @@ public class GatewayGcmShutdownE2eTest {
                 }
 
                 gate.release()
-                let allRetriesCompleted = s5WaitUntil(30000, { =>
-                    gate.snapshot()[0] == 140 && match (getServicePluginSnapshot("gitcode-monitor")) {
-                        case Some(snapshot) => snapshot.dispatch.completionAck == 140
-                        case None => false
+                let allRetriesCompleted = s5WaitUntil(60000, { =>
+                    let queue = s5GcmQueueProof(queuePath, expectedDeliveries)
+                    gate.snapshot()[0] == 140 && queue.pending == 0 && queue.processing == 0 &&
+                        queue.awaiting == 0 && queue.processed == 140 && queue.deadLetter == 0 &&
+                        queue.cancelled == 0 && queue.unique == 140 && queue.invalid == 0 &&
+                        match ((getServicePluginSnapshot("gitcode-monitor"),
+                            servicePluginDispatchSchedulerSnapshotForTest("gitcode-monitor"))) {
+                        case (Some(snapshot), Some(scheduler)) =>
+                            snapshot.dispatch.completionAck == 140 && scheduler.settled
+                        case _ => false
                     }
                 })
                 @Expect(allRetriesCompleted, true)
-                let schedulerSettled = s5WaitUntil(30000, { =>
-                    match (servicePluginDispatchSchedulerSnapshotForTest("gitcode-monitor")) {
-                        case Some(row) => row.settled
-                        case None => false
-                    }
-                })
-                @Expect(schedulerSettled, true)
+                let drainedQueue = s5GcmQueueProof(queuePath, expectedDeliveries)
+                @Expect(drainedQueue.pending, 0)
+                @Expect(drainedQueue.processing, 0)
+                @Expect(drainedQueue.awaiting, 0)
+                @Expect(drainedQueue.processed, 140)
+                @Expect(drainedQueue.deadLetter, 0)
+                @Expect(drainedQueue.cancelled, 0)
+                @Expect(drainedQueue.unique, 140)
+                @Expect(drainedQueue.invalid, 0)
                 let drained = getServicePluginSnapshot("gitcode-monitor").getOrThrow()
                 @Expect(drained.dispatch.active, 0)
                 @Expect(drained.dispatch.queued, 0)
