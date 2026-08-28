@@ -286,11 +286,11 @@ test('P1-B1 two streams share the raw total cap and line writes reject CRLF', as
     children.push(child);
     return child;
   }});
-  broker.handle(validStart('shared-total', { stdinMode: 'line', deadlineMs: 0, maxTotalOutputBytes: 5 }));
+  broker.handle(validStart('shared-total', { requestId: 'shared-start', stdinMode: 'line', deadlineMs: 0, maxTotalOutputBytes: 5 }));
   await new Promise((resolve) => setImmediate(resolve));
   children[0].stdout.write('123');
   children[0].stderr.write('456');
-  broker.handle({ type: 'owner.write', ownerId: 'shared-total', requestId: 'bad-line', line: 'x\ny' });
+  broker.handle({ type: 'owner.write', ownerId: 'shared-total', ownerIncarnation: 'shared-start', requestId: 'bad-line', line: 'x\ny' });
   await new Promise((resolve) => setImmediate(resolve));
   children[0].emit('close', null, 'SIGTERM');
   const frames = output.frames();
@@ -306,7 +306,7 @@ test('P1-U1 start/write/stop acknowledgements correlate requestId and started wa
   broker.handle(validStart('acks', { requestId: 'start-1', stdinMode: 'line', deadlineMs: 0 }));
   assert.equal(output.frames().some((frame) => frame.type === 'owner.started'), false);
   await new Promise((resolve) => setImmediate(resolve));
-  broker.handle({ type: 'owner.write', ownerId: 'acks', requestId: 'write-1', line: 'hello' });
+  broker.handle({ type: 'owner.write', ownerId: 'acks', ownerIncarnation: 'start-1', requestId: 'write-1', line: 'hello' });
   await new Promise((resolve) => setImmediate(resolve));
   broker.handle({ type: 'owner.stop', ownerId: 'acks', requestId: 'stop-1', reason: 'secret-path-must-not-echo' });
   assert.equal(output.frames().find((frame) => frame.type === 'owner.started').requestId, 'start-1');
@@ -315,6 +315,49 @@ test('P1-U1 start/write/stop acknowledgements correlate requestId and started wa
   assert.equal(output.frames().find((frame) => frame.type === 'owner.stopping').reason, 'stopped');
   assert.equal(output.text.includes('secret-path-must-not-echo'), false);
   child.emit('close', null, 'SIGTERM');
+});
+
+test('write incarnation rejects a stopped owner write after same-id replacement', async () => {
+  const output = new CollectingWritable();
+  const children = [];
+  const broker = new StdioBroker({ output, treeRunner: fakeTreeRunner(), spawnFn: () => {
+    const child = fakeChild(45_100 + children.length);
+    children.push(child);
+    return child;
+  }});
+  broker.handle(validStart('reused', { requestId: 'start-old', stdinMode: 'line', deadlineMs: 0 }));
+  await new Promise((resolve) => setImmediate(resolve));
+  let finishOldWrite;
+  children[0].stdin.write = (_chunk, callback) => {
+    finishOldWrite = callback;
+    return true;
+  };
+  broker.handle({
+    type: 'owner.write', ownerId: 'reused', ownerIncarnation: 'start-old', requestId: 'write-late', line: 'old-pending',
+  });
+  broker.handle({ type: 'owner.stop', ownerId: 'reused', requestId: 'stop-old', reason: 'stopped' });
+  children[0].emit('close', 0, null);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  broker.handle(validStart('reused', { requestId: 'start-new', stdinMode: 'line', deadlineMs: 0 }));
+  await new Promise((resolve) => setImmediate(resolve));
+  broker.handle({
+    type: 'owner.write', ownerId: 'reused', ownerIncarnation: 'start-old', requestId: 'write-old', line: 'must-not-arrive',
+  });
+  broker.handle({
+    type: 'owner.write', ownerId: 'reused', ownerIncarnation: 'start-new', requestId: 'write-new', line: 'new-only',
+  });
+  finishOldWrite(null);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const frames = output.frames();
+  assert.equal(frames.find((frame) => frame.requestId === 'write-old').status, 'stale_owner_incarnation');
+  assert.equal(frames.find((frame) => frame.requestId === 'write-old').ownerIncarnation, 'start-old');
+  assert.equal(frames.find((frame) => frame.requestId === 'write-new').type, 'owner.written');
+  assert.equal(frames.find((frame) => frame.requestId === 'write-late').ownerIncarnation, 'start-old');
+  assert.equal(children[0].stdin.readableLength, 0);
+  assert.equal(children[1].stdin.read().toString(), 'new-only\n');
+  children[1].emit('close', 0, null);
 });
 
 test('P1-N3 test hang is gated and broker stdin has an exact raw byte cap', async () => {

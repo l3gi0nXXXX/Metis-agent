@@ -17,6 +17,7 @@ private let MANAGED_STDIO_REAP_GRACE_MS: Int64 = 300
 private let MANAGED_STDIO_DISPATCH_QUEUE_LIMIT: Int64 = 16384
 private let MANAGED_STDIO_DISPATCH_BYTES_LIMIT: Int64 = 16777216
 private let MANAGED_STDIO_TERMINAL_BYTES_PER_OWNER: Int64 = 256
+private let MANAGED_STDIO_PENDING_WRITE_LIMIT: Int64 = 256
 
 private func managedStdioHasControl(value: String): Bool {
     for (rune in value.runes()) {
@@ -346,8 +347,7 @@ private class ManagedStdioOwnerState {
     var pid: Int64 = 0
     var pgid: Int64 = 0
     var settled: Bool = false
-    var lastWriteRequestId: String = ""
-    var lastWriteStatus: String = ""
+    let pendingWriteStatuses = HashMap<String, String>()
     var startRequestId: String = ""
     var lastStopRequestId: String = ""
     var maxBufferedBytes: Int64 = 1
@@ -680,6 +680,7 @@ public class ManagedStdioBrokerClient {
         timeoutMs!: Int64 = 1000,
         expectedGeneration!: Option<Int64> = None<Int64>
     ): ManagedStdioOperationResult {
+        let deadline = this.nowMs() + max(1, timeoutMs)
         if (line.contains("\u{0}") || line.contains("\r") || line.contains("\n")) {
             return ManagedStdioOperationResult(false, "invalid_owner_write")
         }
@@ -695,30 +696,96 @@ public class ManagedStdioBrokerClient {
                     case None => ()
                 }
                 let requestId = synchronized(this.lock) {
-                    this.requestSequence += 1
-                    "write-${value.generation}-${this.requestSequence}"
-                }
-                let frame = JsonObject()
-                frame.put("type", JsonString("owner.write"))
-                frame.put("ownerId", JsonString(ownerId))
-                frame.put("line", JsonString(line))
-                frame.put("requestId", JsonString(requestId))
-                if (!this.writeFrameForGeneration(frame, value.generation)) {
-                    return ManagedStdioOperationResult(false, "broker_exited", generation: value.generation, pid: value.pid, pgid: value.pgid)
-                }
-                let deadline = this.nowMs() + max(1, timeoutMs)
-                synchronized(this.lock) {
-                    while (value.lastWriteRequestId != requestId && !value.settled) {
-                        let remaining = deadline - this.nowMs()
-                        if (remaining <= 0) {
-                            return ManagedStdioOperationResult(false, "broker_unresponsive", generation: value.generation, pid: value.pid, pgid: value.pgid)
-                        }
-                        let _ = value.condition.wait(timeout: Duration.millisecond * remaining)
+                    if (value.pendingWriteStatuses.size >= MANAGED_STDIO_PENDING_WRITE_LIMIT) {
+                        ""
+                    } else {
+                        this.requestSequence += 1
+                        let current = "write-${value.generation}-${this.requestSequence}"
+                        value.pendingWriteStatuses[current] = "pending"
+                        current
                     }
-                    let status = if (value.lastWriteRequestId == requestId) { value.lastWriteStatus } else { value.status }
-                    ManagedStdioOperationResult(status == "written", status, generation: value.generation, pid: value.pid, pgid: value.pgid)
+                }
+                if (requestId.isEmpty()) {
+                    return ManagedStdioOperationResult(false, "broker_write_capacity_exceeded", generation: value.generation, pid: value.pid, pgid: value.pgid)
+                }
+                try {
+                    let frame = JsonObject()
+                    frame.put("type", JsonString("owner.write"))
+                    frame.put("ownerId", JsonString(ownerId))
+                    frame.put("ownerIncarnation", JsonString(value.startRequestId))
+                    frame.put("line", JsonString(line))
+                    frame.put("requestId", JsonString(requestId))
+                    if (!this.writeFrameForGeneration(frame, value.generation)) {
+                        return ManagedStdioOperationResult(false, "broker_exited", generation: value.generation, pid: value.pid, pgid: value.pgid)
+                    }
+                    synchronized(this.lock) {
+                        while (value.pendingWriteStatuses.get(requestId) == Some("pending") && !value.settled) {
+                            let remaining = deadline - this.nowMs()
+                            if (remaining <= 0) {
+                                return ManagedStdioOperationResult(false, "broker_unresponsive", generation: value.generation, pid: value.pid, pgid: value.pgid)
+                            }
+                            let _ = value.condition.wait(timeout: Duration.millisecond * remaining)
+                        }
+                        let status = if (value.settled && value.pendingWriteStatuses.get(requestId) == Some("pending")) {
+                            value.status
+                        } else {
+                            match (value.pendingWriteStatuses.get(requestId)) {
+                                case Some(current) => current
+                                case None => value.status
+                            }
+                        }
+                        ManagedStdioOperationResult(status == "written", status, generation: value.generation, pid: value.pid, pgid: value.pgid)
+                    }
+                } finally {
+                    synchronized(this.lock) { value.pendingWriteStatuses.remove(requestId) }
                 }
         }
+    }
+
+    public func pendingWriteCountForTest(ownerId: String): Int64 {
+        synchronized(this.lock) {
+            match (this.owners.get(ownerId)) {
+                case Some(state) => state.pendingWriteStatuses.size
+                case None => 0
+            }
+        }
+    }
+
+    public func firstPendingWriteRequestIdForTest(ownerId: String): String {
+        synchronized(this.lock) {
+            match (this.owners.get(ownerId)) {
+                case Some(state) =>
+                    for ((requestId, _) in state.pendingWriteStatuses) { return requestId }
+                    ""
+                case None => ""
+            }
+        }
+    }
+
+    public func ownerIncarnationForTest(ownerId: String): String {
+        synchronized(this.lock) {
+            match (this.owners.get(ownerId)) {
+                case Some(state) => state.startRequestId
+                case None => ""
+            }
+        }
+    }
+
+    public func injectOwnerWrittenForTest(
+        ownerId: String,
+        requestId: String,
+        ownerIncarnation: Option<String>
+    ): Unit {
+        let frame = JsonObject()
+        frame.put("type", JsonString("owner.written"))
+        frame.put("generation", JsonInt(synchronized(this.lock) { this.generation }))
+        frame.put("ownerId", JsonString(ownerId))
+        frame.put("requestId", JsonString(requestId))
+        match (ownerIncarnation) {
+            case Some(value) => frame.put("ownerIncarnation", JsonString(value))
+            case None => ()
+        }
+        this.handleBrokerFrame(frame.toJsonString(), synchronized(this.lock) { this.generation })
     }
 
     private func isTerminalEvent(event: ManagedStdioEvent): Bool {
@@ -1289,9 +1356,12 @@ public class ManagedStdioBrokerClient {
                         state.lastStopRequestId = managedStdioJsonString(obj, "requestId")
                         state.condition.notifyAll()
                     } else if (frameType == "owner.written" || frameType == "owner.write-rejected") {
-                        state.lastWriteRequestId = managedStdioJsonString(obj, "requestId")
-                        state.lastWriteStatus = if (frameType == "owner.written") { "written" } else { managedStdioJsonString(obj, "status") }
-                        state.condition.notifyAll()
+                        let requestId = managedStdioJsonString(obj, "requestId")
+                        if (managedStdioJsonString(obj, "ownerIncarnation") == state.startRequestId &&
+                            state.pendingWriteStatuses.contains(requestId)) {
+                            state.pendingWriteStatuses[requestId] = if (frameType == "owner.written") { "written" } else { managedStdioJsonString(obj, "status") }
+                            state.condition.notifyAll()
+                        }
                     } else if (frameType == "owner.stdout" || frameType == "owner.stderr") {
                         let text = managedStdioJsonString(obj, "text")
                         let textBytes = text.toArray().size

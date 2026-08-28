@@ -441,19 +441,31 @@ export class StdioBroker {
 
   writeOwner(frame) {
     const owner = this.owners.get(frame.ownerId);
-    const validControl = safeIdentifier(frame.ownerId) && safeRequestId(frame.requestId);
+    const validControl = safeIdentifier(frame.ownerId) && safeRequestId(frame.requestId) &&
+      safeIdentifier(frame.ownerIncarnation);
     const requestId = validControl ? (frame.requestId ?? '') : '';
+    const ownerIncarnation = validControl ? frame.ownerIncarnation : '';
+    if (validControl && owner && frame.ownerIncarnation !== owner.requestId) {
+      this.frame('owner.write-rejected', {
+        ownerId: frame.ownerId, ownerIncarnation, requestId, status: 'stale_owner_incarnation',
+      });
+      return;
+    }
     if (!validControl || !owner || owner.settled || !owner.spawned || typeof frame.line !== 'string' || /[\0\r\n]/u.test(frame.line)) {
-      this.frame('owner.write-rejected', { ownerId: validControl ? frame.ownerId : '', requestId, status: 'owner_not_writable' });
+      this.frame('owner.write-rejected', {
+        ownerId: validControl ? frame.ownerId : '', ownerIncarnation, requestId, status: 'owner_not_writable',
+      });
       return;
     }
     const encoded = `${frame.line}\n`;
     const bytes = Buffer.byteLength(encoded);
     if (owner.stdinQueuedBytes + bytes > owner.maxBufferedBytes) {
-      this.frame('owner.write-rejected', { ownerId: owner.id, requestId, status: 'stdin_backpressure_exceeded' });
+      this.frame('owner.write-rejected', {
+        ownerId: owner.id, ownerIncarnation: owner.requestId, requestId, status: 'stdin_backpressure_exceeded',
+      });
       return;
     }
-    owner.stdinQueue.push({ encoded, bytes, requestId });
+    owner.stdinQueue.push({ encoded, bytes, requestId, ownerIncarnation: owner.requestId });
     owner.stdinQueuedBytes += bytes;
     this.pumpOwnerStdin(owner);
   }
@@ -468,7 +480,9 @@ export class StdioBroker {
         owner.stdinQueue.shift();
         owner.stdinQueuedBytes -= item.bytes;
         if (error) this.failOwner(owner, 'stdin_write_failed');
-        else this.frame('owner.written', { ownerId: owner.id, requestId: item.requestId });
+        else this.frame('owner.written', {
+          ownerId: owner.id, ownerIncarnation: item.ownerIncarnation, requestId: item.requestId,
+        });
         this.pumpOwnerStdin(owner);
       });
     } catch {

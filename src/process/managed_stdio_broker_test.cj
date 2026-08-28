@@ -244,6 +244,235 @@ private func managedStdioJoinFuture<T>(future: Option<Future<T>>, timeoutMs: Int
 @Test
 public class ManagedStdioBrokerTest {
     @TestCase
+    public func writeCorrelationU1TwoConcurrentWritesReceiveOwnAcknowledgements(): Unit {
+        let client = ManagedStdioBrokerClient()
+        try {
+            let started = client.startOwner(ManagedStdioOwnerSpec(
+                "write-correlation-u1", "node",
+                args: ["-e", "process.stdin.on('data',()=>{});setInterval(()=>{},1000)"],
+                stdinMode: "line", deadlineMs: 10000
+            ))
+            @Expect(started.ok, true)
+            let first = spawn {
+                client.writeOwnerLine(
+                    "write-correlation-u1", "first", timeoutMs: 2000,
+                    expectedGeneration: Some(started.generation)
+                )
+            }
+            let second = spawn {
+                client.writeOwnerLine(
+                    "write-correlation-u1", "second", timeoutMs: 2000,
+                    expectedGeneration: Some(started.generation)
+                )
+            }
+            let firstResult = first.get(Duration.second * 3)
+            let secondResult = second.get(Duration.second * 3)
+            @Expect(firstResult.ok, true)
+            @Expect(firstResult.status, "written")
+            @Expect(secondResult.ok, true)
+            @Expect(secondResult.status, "written")
+        } finally {
+            let _ = client.close(timeoutMs: 3000)
+        }
+    }
+
+    @TestCase
+    public func writeCorrelationB1HungAcknowledgementsKeepIndependentEntryDeadlines(): Unit {
+        let client = ManagedStdioBrokerClient(brokerTestMode: true)
+        try {
+            let started = client.startOwner(ManagedStdioOwnerSpec(
+                "write-correlation-b1", "node",
+                args: ["-e", "process.stdin.on('data',()=>{});setInterval(()=>{},1000)"],
+                stdinMode: "line", deadlineMs: 10000
+            ))
+            @Expect(started.ok, true)
+            @Expect(client.debugHangBrokerForTest(), true)
+            let begin = managedStdioTestNowMs()
+            let first = spawn {
+                client.writeOwnerLine(
+                    "write-correlation-b1", "first", timeoutMs: 300,
+                    expectedGeneration: Some(started.generation)
+                )
+            }
+            let second = spawn {
+                client.writeOwnerLine(
+                    "write-correlation-b1", "second", timeoutMs: 300,
+                    expectedGeneration: Some(started.generation)
+                )
+            }
+            let firstResult = first.get(Duration.second * 2)
+            let secondResult = second.get(Duration.second * 2)
+            let elapsed = managedStdioTestNowMs() - begin
+            @Expect(firstResult.ok, false)
+            @Expect(firstResult.status, "broker_unresponsive")
+            @Expect(secondResult.ok, false)
+            @Expect(secondResult.status, "broker_unresponsive")
+            @Expect(elapsed < 500, true)
+            @Expect(client.pendingWriteCountForTest("write-correlation-b1"), 0)
+        } finally {
+            let _ = client.close(timeoutMs: 500)
+        }
+    }
+
+    @TestCase
+    public func writeCorrelationN1PendingCapacityAndAbsoluteDeadlinesStayBounded(): Unit {
+        let client = ManagedStdioBrokerClient(brokerTestMode: true)
+        let futures = ArrayList<Future<ManagedStdioOperationResult>>()
+        try {
+            let started = client.startOwner(ManagedStdioOwnerSpec(
+                "write-correlation-n1", "node",
+                args: ["-e", "process.stdin.on('data',()=>{});setInterval(()=>{},1000)"],
+                stdinMode: "line", deadlineMs: 10000
+            ))
+            @Expect(started.ok, true)
+            @Expect(client.debugHangBrokerForTest(), true)
+            for (index in 0..256) {
+                let writeIndex = index
+                futures.add(spawn {
+                    client.writeOwnerLine(
+                        "write-correlation-n1", "line-${writeIndex}", timeoutMs: 5000,
+                        expectedGeneration: Some(started.generation)
+                    )
+                })
+            }
+            @Expect(managedStdioWaitUntil(3000, {
+                => client.pendingWriteCountForTest("write-correlation-n1") == 256
+            }), true)
+            let overflow = client.writeOwnerLine(
+                "write-correlation-n1", "overflow", timeoutMs: 5000,
+                expectedGeneration: Some(started.generation)
+            )
+            @Expect(overflow.ok, false)
+            @Expect(overflow.status, "broker_write_capacity_exceeded")
+            @Expect(client.pendingWriteCountForTest("write-correlation-n1"), 256)
+            for (future in futures) { try { future.cancel() } catch (_: Exception) { () } }
+            let cleanupStarted = managedStdioTestNowMs()
+            @Expect(managedStdioWaitUntil(6500, {
+                => client.pendingWriteCountForTest("write-correlation-n1") == 0
+            }), true)
+            @Expect(managedStdioTestNowMs() - cleanupStarted < 7000, true)
+        } finally {
+            for (future in futures) { try { future.cancel() } catch (_: Exception) { () } }
+            let _ = client.close(timeoutMs: 500)
+        }
+    }
+
+    @TestCase
+    public func writeCorrelationN2OwnerTerminationWithoutWriteAckCleansPending(): Unit {
+        let client = ManagedStdioBrokerClient(brokerTestMode: true)
+        try {
+            let started = client.startOwner(ManagedStdioOwnerSpec(
+                "write-correlation-n2", "node",
+                args: ["-e", "process.stdin.on('data',()=>{});setInterval(()=>{},1000)"],
+                stdinMode: "line", deadlineMs: 10000
+            ))
+            @Expect(started.ok, true)
+            @Expect(client.debugHangBrokerForTest(), true)
+            let pending = spawn {
+                client.writeOwnerLine(
+                    "write-correlation-n2", "pending", timeoutMs: 5000,
+                    expectedGeneration: Some(started.generation)
+                )
+            }
+            @Expect(managedStdioWaitUntil(2000, {
+                => client.pendingWriteCountForTest("write-correlation-n2") == 1
+            }), true)
+            client.debugKillBrokerForTest()
+            let result = pending.get(Duration.second * 3)
+            @Expect(result.ok, false)
+            @Expect(result.status, "broker_exited")
+            @Expect(client.pendingWriteCountForTest("write-correlation-n2"), 0)
+        } finally {
+            let _ = client.close(timeoutMs: 500)
+        }
+    }
+
+    @TestCase
+    public func writeCorrelationN3MissingAndWrongIncarnationCannotSettlePendingWrite(): Unit {
+        let client = ManagedStdioBrokerClient(brokerTestMode: true)
+        var pending = None<Future<ManagedStdioOperationResult>>
+        try {
+            let started = client.startOwner(ManagedStdioOwnerSpec(
+                "write-correlation-n3", "node",
+                args: ["-e", "process.stdin.on('data',()=>{});setInterval(()=>{},1000)"],
+                stdinMode: "line", deadlineMs: 10000
+            ))
+            @Expect(started.ok, true)
+            @Expect(client.debugHangBrokerForTest(), true)
+            pending = Some(spawn {
+                client.writeOwnerLine(
+                    "write-correlation-n3", "pending", timeoutMs: 3000,
+                    expectedGeneration: Some(started.generation)
+                )
+            })
+            @Expect(managedStdioWaitUntil(2000, {
+                => client.pendingWriteCountForTest("write-correlation-n3") == 1
+            }), true)
+            let requestId = client.firstPendingWriteRequestIdForTest("write-correlation-n3")
+            let incarnation = client.ownerIncarnationForTest("write-correlation-n3")
+            @Expect(requestId.isEmpty(), false)
+            @Expect(incarnation.isEmpty(), false)
+
+            client.injectOwnerWrittenForTest("write-correlation-n3", requestId, None<String>)
+            @Expect(client.pendingWriteCountForTest("write-correlation-n3"), 1)
+            client.injectOwnerWrittenForTest("write-correlation-n3", requestId, Some("wrong-incarnation"))
+            @Expect(client.pendingWriteCountForTest("write-correlation-n3"), 1)
+            client.injectOwnerWrittenForTest("write-correlation-n3", requestId, Some(incarnation))
+            let result = pending.getOrThrow().get(Duration.second * 2)
+            pending = None<Future<ManagedStdioOperationResult>>
+            @Expect(result.ok, true)
+            @Expect(result.status, "written")
+            @Expect(client.pendingWriteCountForTest("write-correlation-n3"), 0)
+        } finally {
+            match (pending) {
+                case Some(future) => try { future.cancel() } catch (_: Exception) { () }
+                case None => ()
+            }
+            let _ = client.close(timeoutMs: 500)
+        }
+    }
+
+    @TestCase
+    public func writeCorrelationP1SixtyFourConcurrentWritesReceiveOwnAcknowledgements(): Unit {
+        let client = ManagedStdioBrokerClient()
+        let futures = ArrayList<Future<ManagedStdioOperationResult>>()
+        try {
+            let started = client.startOwner(ManagedStdioOwnerSpec(
+                "write-correlation-p1", "node",
+                args: [
+                    "-e",
+                    "let n=0;require('readline').createInterface({input:process.stdin}).on('line',()=>{n++;if(n===64)console.log('received:64')});setInterval(()=>{},1000)"
+                ],
+                stdinMode: "line", outputMode: "line", deadlineMs: 10000
+            ))
+            @Expect(started.ok, true)
+            for (index in 0..64) {
+                let writeIndex = index
+                futures.add(spawn {
+                    client.writeOwnerLine(
+                        "write-correlation-p1", "line-${writeIndex}", timeoutMs: 2000,
+                        expectedGeneration: Some(started.generation)
+                    )
+                })
+            }
+            for (future in futures) {
+                let result = future.get(Duration.second * 10)
+                @Expect(result.ok, true)
+                @Expect(result.status, "written")
+            }
+            @Expect(managedStdioWaitUntil(3000, {
+                =>
+                match (client.readOwnerLine("write-correlation-p1", timeoutMs: 50)) {
+                    case Some(event) => event.eventType == "owner.stdout" && event.text == "received:64"
+                    case None => false
+                }
+            }), true)
+        } finally {
+            let _ = client.close(timeoutMs: 3000)
+        }
+    }
+
+    @TestCase
     public func p3U3OwnerSubscriptionsUseOneDispatcherForTwoAndThirtyTwoClients(): Unit {
         for (count in [2, 32]) {
             let client = ManagedStdioBrokerClient()
