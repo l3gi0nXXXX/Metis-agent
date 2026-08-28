@@ -99,6 +99,91 @@ private class GatewayManagedRegistrationLatch {
     public func release(): Unit { synchronized(this.lock) { this.released = true; this.condition.notifyAll() } }
 }
 
+private class GatewayManagedWorkerLifecycleForTest {
+    private let lock = Mutex()
+    private var condition: Condition
+    private var active = HashMap<Int64, Bool>()
+    private var holdBeforeSettle: Bool = false
+    private var heldBeforeSettle: Int64 = 0
+    private var settledWaiters: Int64 = 0
+
+    public init() { synchronized(this.lock) { this.condition = this.lock.condition() } }
+
+    public func register(launchId: Int64): Unit {
+        synchronized(this.lock) {
+            this.active.add(launchId, true)
+            this.condition.notifyAll()
+        }
+    }
+
+    public func settle(launchId: Int64): Unit {
+        synchronized(this.lock) {
+            if (!this.active.contains(launchId)) {
+                return
+            }
+            if (this.holdBeforeSettle) {
+                this.heldBeforeSettle += 1
+                this.condition.notifyAll()
+                while (this.holdBeforeSettle) {
+                    let _ = this.condition.wait()
+                }
+                this.heldBeforeSettle -= 1
+            }
+            this.active.remove(launchId)
+            this.condition.notifyAll()
+        }
+    }
+
+    public func waitForSettled(timeoutMs: Int64): Bool {
+        synchronized(this.lock) {
+            if (!this.active.isEmpty()) {
+                this.settledWaiters += 1
+                this.condition.notifyAll()
+                try {
+                    let _ = this.condition.waitUntil({ => this.active.isEmpty() }, timeout: Duration.millisecond * max(1, timeoutMs))
+                } finally {
+                    this.settledWaiters -= 1
+                    this.condition.notifyAll()
+                }
+            }
+            this.active.isEmpty()
+        }
+    }
+
+    public func waitForSettledWaiter(timeoutMs: Int64): Bool {
+        synchronized(this.lock) {
+            if (this.settledWaiters == 0) {
+                let _ = this.condition.waitUntil({ => this.settledWaiters > 0 }, timeout: Duration.millisecond * max(1, timeoutMs))
+            }
+            this.settledWaiters > 0
+        }
+    }
+
+    public func count(): Int64 { synchronized(this.lock) { Int64(this.active.size) } }
+
+    public func armHoldBeforeSettle(): Unit {
+        synchronized(this.lock) { this.holdBeforeSettle = true }
+    }
+
+    public func waitHeldBeforeSettle(timeoutMs: Int64): Bool {
+        synchronized(this.lock) {
+            if (this.heldBeforeSettle == 0) {
+                let _ = this.condition.waitUntil({ => this.heldBeforeSettle > 0 }, timeout: Duration.millisecond * max(1, timeoutMs))
+            }
+            this.heldBeforeSettle > 0
+        }
+    }
+
+    public func releaseHoldBeforeSettle(): Unit {
+        synchronized(this.lock) {
+            this.holdBeforeSettle = false
+            this.condition.notifyAll()
+        }
+    }
+}
+
+private let gatewayManagedWorkerLifecycleForTest = GatewayManagedWorkerLifecycleForTest()
+
 private class GatewayManagedRunHandle {
     public let persistenceLock = Mutex()
     public let runId: String
@@ -181,6 +266,30 @@ public class GatewayManagedSessionsToolset {
     public func debugFinalizeStaleManagedRunForTest(sessionKey: String, runId: String, launchId: Int64): Bool {
         let stale = GatewayManagedRunHandle(runId, launchId, None<GatewayManagedWorkspaceSpec>)
         this.finalizeManagedRun(sessionKey, stale, GatewayManagedTerminalOutcome("failed", error: "stale worker"))
+    }
+
+    public func debugWaitManagedWorkersSettledForTest(timeoutMs: Int64): Bool {
+        gatewayManagedWorkerLifecycleForTest.waitForSettled(timeoutMs)
+    }
+
+    public func debugManagedWorkerCountForTest(): Int64 {
+        gatewayManagedWorkerLifecycleForTest.count()
+    }
+
+    public func debugWaitManagedWorkerDrainWaiterForTest(timeoutMs: Int64): Bool {
+        gatewayManagedWorkerLifecycleForTest.waitForSettledWaiter(timeoutMs)
+    }
+
+    public func debugArmManagedWorkerSettleHoldForTest(): Unit {
+        gatewayManagedWorkerLifecycleForTest.armHoldBeforeSettle()
+    }
+
+    public func debugWaitManagedWorkerSettleHoldForTest(timeoutMs: Int64): Bool {
+        gatewayManagedWorkerLifecycleForTest.waitHeldBeforeSettle(timeoutMs)
+    }
+
+    public func debugReleaseManagedWorkerSettleHoldForTest(): Unit {
+        gatewayManagedWorkerLifecycleForTest.releaseHoldBeforeSettle()
     }
 
     private func gwStore(): MemorySessionTranscriptStore {
@@ -1451,6 +1560,7 @@ public class GatewayManagedSessionsToolset {
     private func registerManagedFutureAndOpen(sessionKey: String, handle: GatewayManagedRunHandle, future: Future<Unit>, gate: GatewayManagedStartGate): Bool {
         let registrationLatch = synchronized(gatewayManagedRegistrationLatchLockForTest) { gatewayManagedRegistrationLatchForTest }
         synchronized(gatewayManagedSessionLock) {
+            gatewayManagedWorkerLifecycleForTest.register(handle.launchId)
             let state = gatewayManagedStates.get(sessionKey) ?? ""
             if (gatewayManagedFutures.contains(sessionKey) || state != "queued") {
                 gate.open()
@@ -2087,7 +2197,11 @@ public class GatewayManagedSessionsToolset {
                     outcome = GatewayManagedTerminalOutcome("failed", error: "acp failed: ${diagnostic}", exitCode: 1, outputPath: outputPath)
                 }
             } finally {
-                if (this.finalizeManagedRun(sessionKey, handle, outcome)) { this.maybeDeleteManagedSessionAfterRun(sessionKey) }
+                try {
+                    if (this.finalizeManagedRun(sessionKey, handle, outcome)) { this.maybeDeleteManagedSessionAfterRun(sessionKey) }
+                } finally {
+                    gatewayManagedWorkerLifecycleForTest.settle(handle.launchId)
+                }
             }
         }
         this.registerManagedFutureAndOpen(sessionKey, handle, future, startGate)
@@ -2198,16 +2312,20 @@ public class GatewayManagedSessionsToolset {
                     outcome = GatewayManagedTerminalOutcome("failed", error: "subagent failed: ${diagnostic}", exitCode: 1, outputPath: outputPath)
                 }
             } finally {
-                var cleanup = GatewayManagedWorkspaceCleanupResult(true)
-                match (workspaceSpec) {
-                    case Some(ws) => cleanup = this.cleanupManagedWorkspace(ws)
-                    case None => ()
+                try {
+                    var cleanup = GatewayManagedWorkspaceCleanupResult(true)
+                    match (workspaceSpec) {
+                        case Some(ws) => cleanup = this.cleanupManagedWorkspace(ws)
+                        case None => ()
+                    }
+                    if (!cleanup.ok) {
+                        let pending = GatewayManagedTerminalOutcome(outcome.status, resultSummary: outcome.resultSummary, error: if (outcome.error.isEmpty()) { "subagent workspace cleanup failed: ${this.managedDiagnostic(cleanup.diagnostic)}" } else { "${outcome.error}; workspace cleanup failed: ${this.managedDiagnostic(cleanup.diagnostic)}" }, exitCode: outcome.exitCode, outputPath: outcome.outputPath)
+                        let retained = this.retainManagedCleanupPending(sessionKey, handle, pending, cleanup.diagnostic)
+                        if (!retained.ok) { st.appendTranscriptEntry(sessionKey, "system", retained.diagnostic) }
+                    } else if (this.finalizeManagedRun(sessionKey, handle, outcome)) { this.maybeDeleteManagedSessionAfterRun(sessionKey) }
+                } finally {
+                    gatewayManagedWorkerLifecycleForTest.settle(handle.launchId)
                 }
-                if (!cleanup.ok) {
-                    let pending = GatewayManagedTerminalOutcome(outcome.status, resultSummary: outcome.resultSummary, error: if (outcome.error.isEmpty()) { "subagent workspace cleanup failed: ${this.managedDiagnostic(cleanup.diagnostic)}" } else { "${outcome.error}; workspace cleanup failed: ${this.managedDiagnostic(cleanup.diagnostic)}" }, exitCode: outcome.exitCode, outputPath: outcome.outputPath)
-                    let retained = this.retainManagedCleanupPending(sessionKey, handle, pending, cleanup.diagnostic)
-                    if (!retained.ok) { st.appendTranscriptEntry(sessionKey, "system", retained.diagnostic) }
-                } else if (this.finalizeManagedRun(sessionKey, handle, outcome)) { this.maybeDeleteManagedSessionAfterRun(sessionKey) }
             }
         }
         this.registerManagedFutureAndOpen(sessionKey, handle, future, startGate)

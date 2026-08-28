@@ -14,9 +14,8 @@ import std.time.DateTime
 import std.unittest.testmacro.*
 import stdx.encoding.json.{JsonArray, JsonBool, JsonInt, JsonObject, JsonString, JsonValue}
 
-private func withManagedSessionsToolsetTestHome<T>(home: String, block: () -> T): T {
+private func withManagedSessionsToolsetResolvedTestHome<T>(actualHome: String, workerSettleTimeoutMs: Int64, block: () -> T): T {
     synchronized(MetisProcessEnvironmentLock) {
-        let actualHome = "${home}-${DateTime.now().toUnixTimeStamp().toNanoseconds()}"
         try {
             remove(Path(actualHome), recursive: true)
         } catch (_: Exception) {
@@ -31,6 +30,7 @@ private func withManagedSessionsToolsetTestHome<T>(home: String, block: () -> T)
         try {
             return block()
         } finally {
+            let workersSettled = GatewayManagedSessionsToolset().debugWaitManagedWorkersSettledForTest(workerSettleTimeoutMs)
             match (oldHome) {
                 case Some(value) => setVariable("METIS_HOME", value)
                 case None => setVariable("METIS_HOME", "")
@@ -38,13 +38,25 @@ private func withManagedSessionsToolsetTestHome<T>(home: String, block: () -> T)
             CliConfig.invalidatePathCache()
             MetisConfigManager.invalidate()
             CliSettingManager.invalidate()
-            try {
-                remove(Path(actualHome), recursive: true)
-            } catch (_: Exception) {
-                ()
+            if (workersSettled) {
+                try {
+                    remove(Path(actualHome), recursive: true)
+                } catch (_: Exception) {
+                    ()
+                }
+            } else {
+                throw Exception("managed_test_workers_not_settled")
             }
         }
     }
+}
+
+private func withManagedSessionsToolsetTestHome<T>(home: String, block: () -> T): T {
+    withManagedSessionsToolsetResolvedTestHome(
+        "${home}-${DateTime.now().toUnixTimeStamp().toNanoseconds()}",
+        5000,
+        block
+    )
 }
 
 private func managedSubagentsJson(raw: String): JsonObject {
@@ -1492,6 +1504,67 @@ public class GatewayManagedSessionsToolsetTest {
                 @Expect(managedSubagentsString(recoveredRun, "status"), "succeeded")
                 @Expect(managedSubagentsBool(recoveredRun, "hasLiveFuture"), false)
                 @Expect(gatewayStdioBroker().snapshot().ownerCount, 0)
+            }
+        }
+    }
+
+    @TestCase
+    public func managedTestHomeWaitsForPostTerminalWorkerSettlementBeforeDelete(): Unit {
+        let isolated = withManagedSessionsToolsetTestHome("/tmp/metis-managed-worker-settlement") {
+            let toolset = GatewayManagedSessionsToolset()
+            let currentDotDir = CliConfig.dotDir
+            toolset.debugArmManagedWorkerSettleHoldForTest()
+            let releaser = spawn {
+                var helperWaiting = false
+                try {
+                    helperWaiting = toolset.debugWaitManagedWorkerDrainWaiterForTest(2000)
+                } finally {
+                    toolset.debugReleaseManagedWorkerSettleHoldForTest()
+                }
+                helperWaiting
+            }
+            gatewayWithToolRuntimeContext(GatewayToolRuntimeContext("cli", sessionKey: "cli:managed-worker-settlement")) {
+                let spawned = managedSubagentsSpawnFakeAcp(toolset, "managed-success")
+                let terminal = managedSubagentsWaitForTerminal(toolset, managedSubagentsString(spawned, "runId"))
+                @Expect(managedSubagentsString(terminal.get("run").getOrThrow().asObject(), "status"), "succeeded")
+                @Expect(toolset.debugWaitManagedWorkerSettleHoldForTest(2000), true)
+                @Expect(toolset.debugManagedWorkerCountForTest(), 1)
+                @Expect(exists(currentDotDir), true)
+                (currentDotDir, releaser)
+            }
+        }
+        @Expect(isolated[1].get(Duration.second * 2), true)
+        @Expect(exists(isolated[0]), false)
+
+        let toolset = GatewayManagedSessionsToolset()
+        let priorDotDir = CliConfig.dotDir
+        let retainedHome = "/tmp/metis-managed-worker-settlement-timeout-${DateTime.now().toUnixTimeStamp().toNanoseconds()}"
+        var failure = ""
+        toolset.debugArmManagedWorkerSettleHoldForTest()
+        try {
+            withManagedSessionsToolsetResolvedTestHome(retainedHome, 25) {
+                gatewayWithToolRuntimeContext(GatewayToolRuntimeContext("cli", sessionKey: "cli:managed-worker-settlement-timeout")) {
+                    let spawned = managedSubagentsSpawnFakeAcp(toolset, "managed-success")
+                    let terminal = managedSubagentsWaitForTerminal(toolset, managedSubagentsString(spawned, "runId"))
+                    @Expect(managedSubagentsString(terminal.get("run").getOrThrow().asObject(), "status"), "succeeded")
+                    @Expect(toolset.debugWaitManagedWorkerSettleHoldForTest(2000), true)
+                    @Expect(toolset.debugManagedWorkerCountForTest(), 1)
+                }
+            }
+        } catch (e: Exception) {
+            failure = e.message
+        }
+        try {
+            @Expect(failure, "managed_test_workers_not_settled")
+            @Expect(CliConfig.dotDir.toString(), priorDotDir.toString())
+            @Expect(exists(Path(retainedHome)), true)
+        } finally {
+            toolset.debugReleaseManagedWorkerSettleHoldForTest()
+            @Expect(toolset.debugWaitManagedWorkersSettledForTest(2000), true)
+            try {
+                remove(Path(retainedHome), recursive: true)
+            } catch (_: Exception) {
+                ()
             }
         }
     }
