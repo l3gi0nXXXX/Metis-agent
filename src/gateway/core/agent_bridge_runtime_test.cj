@@ -9,7 +9,7 @@ import magic.model.ModelManager
 import metis.core.config.{CliConfig, CliModelRuntimeStateManager, CliSettingManager, MetisConfigManager, MetisProcessEnvironmentLock, OpenAICodexOAuthProfile, writeOpenAICodexOAuthProfile}
 import metis.core.{GatewayToolRuntimeContext, gatewayCurrentToolRuntimeContext, gatewayToolRuntimeContextDebugSummary, gatewayWithToolRuntimeContext}
 import metis.core.model.{CodexResponsesHttpRequest, CodexResponsesHttpResult, CodexResponsesHttpRunner, setCodexResponsesHttpRunnerForTest}
-import metis.gateway.logging.{gatewayLoggingCaptureConsoleForTest, gatewayLoggingCapturedConsoleForTest, gatewayLoggingResetForTest}
+import metis.gateway.logging.{gatewayLoggingCaptureConsoleForTest, gatewayLoggingCapturedConsoleForTest, gatewayLoggingCurrentLogFile, gatewayLoggingResetForTest}
 import metis.gateway.session.{GatewayIngressSource, GatewaySessionRequest, GatewayTurnContext, gatewayResolveSessionContext}
 import metis.process.{managedStdioBroker, resetManagedStdioBrokerForTest}
 
@@ -439,6 +439,49 @@ private class AgentBridgeC0FakeTool {
     }
 }
 
+private class AgentBridgeMemoryRssProbe {
+    private var value: Int64 = 1000
+    private var callCount: Int64 = 0
+
+    public init() {}
+
+    public func next(): Int64 {
+        this.callCount += 1
+        this.value += 10
+        this.value
+    }
+
+    public func calls(): Int64 { this.callCount }
+}
+
+private func agentBridgeMemoryRows(path: String): Array<JsonObject> {
+    let rows = ArrayList<JsonObject>()
+    let raw = try {
+        String.fromUtf8(File.readFrom(Path(path)))
+    } catch (_: Exception) {
+        ""
+    }
+    for (line in raw.split("\n")) {
+        let trimmed = line.trimAscii()
+        if (!trimmed.isEmpty()) {
+            try {
+                let row = JsonValue.fromStr(trimmed).asObject()
+                if (agentBridgeJsonString(row, "event") == "process.memory") {
+                    rows.add(row)
+                }
+            } catch (_: Exception) {
+                ()
+            }
+        }
+    }
+    rows.toArray()
+}
+
+private func agentBridgeMemorySeparateFrameworkLog(home: Path): Unit {
+    let _ = gatewayLoggingCurrentLogFile()
+    Config.logFile = home.join("logs").join("framework-memory-test.log").toString()
+}
+
 private func agentBridgeC0ClassifyRawResult(text: String): String {
     if (text.isEmpty()) {
         return "empty"
@@ -542,6 +585,153 @@ public class AgentBridgeC0ContractTest {
 
 @Test
 public class AgentBridgeRuntimeTest {
+    @TestCase
+    public func s1U1ModelTurnEmitsOrderedMemoryStagesWithStableDelta(): Unit {
+        withAgentBridgeTempHome("metis-s1-memory-u1", { home: Path =>
+            let modelName = "metis-test-s1-u1-${DateTime.now().toUnixTimeStamp().toNanoseconds()}"
+            ModelManager.registerChatModel(modelName, { => AgentBridgePhase1FallbackModel() })
+            writeAgentBridgePhase1FallbackAgentConfig(home, modelName, [], appServer: false)
+            let context = gatewayResolveSessionContext(GatewaySessionRequest(
+                GatewayIngressSource.DashboardRpc,
+                sessionHint: "memory-u1",
+                agentId: "phase1"
+            ))
+            withAgentBridgeRuntimeLogCapture(home, "memory-u1", { logPath: String =>
+                let probe = AgentBridgeMemoryRssProbe()
+                resetGatewayMemoryObservationForTest()
+                setGatewayProcessRssProviderForTest(Some({ => probe.next() }))
+                agentBridgeMemorySeparateFrameworkLog(home)
+                try {
+                    let bridge = AgentBridge(sessionStore: GatewaySessionStore(home.join("sessions"), enabled: true, agentId: "phase1"))
+                    @Expect(bridge.reply(context.sessionKey, "hello", channelName: "dashboard", agentId: "phase1",
+                        turnContext: Some(context.turnContext)), "phase1 fallback answer")
+                    let stages = ArrayList<String>()
+                    for (row in agentBridgeMemoryRows(logPath)) {
+                        stages.add(agentBridgeJsonString(row, "stage"))
+                        @Expect(row.get("rssKb").getOrThrow().asInt().getValue() >= 0, true)
+                        @Expect(row.get("rssDeltaKb").getOrThrow().asInt().getValue() >= 0, true)
+                    }
+                    @Expect(stages.toArray(), [
+                        "turn_enter", "history_loaded", "model_input_built", "system_prompt_built",
+                        "model_returned", "final_correction_ready", "session_persisted", "turn_exit", "turn_summary"
+                    ])
+                    @Expect(probe.calls(), 8)
+                    @Expect(String.join(gatewayLoggingCapturedConsoleForTest(), delimiter: "\n").contains("process.memory"), false)
+                } finally {
+                    resetGatewayMemoryObservationForTest()
+                }
+            })
+        })
+    }
+
+    @TestCase
+    public func s1B1UnicodeAndLongPayloadRemainOutOfMemoryRows(): Unit {
+        withAgentBridgeTempHome("metis-s1-memory-b1", { home: Path =>
+            let modelName = "metis-test-s1-b1-${DateTime.now().toUnixTimeStamp().toNanoseconds()}"
+            ModelManager.registerChatModel(modelName, { => AgentBridgePhase1FallbackModel() })
+            writeAgentBridgePhase1FallbackAgentConfig(home, modelName, [], appServer: false)
+            let context = gatewayResolveSessionContext(GatewaySessionRequest(
+                GatewayIngressSource.DashboardRpc, sessionHint: "memory-b1", agentId: "phase1"
+            ))
+            withAgentBridgeRuntimeLogCapture(home, "memory-b1", { logPath: String =>
+                resetGatewayMemoryObservationForTest()
+                setGatewayProcessRssProviderForTest(Some({ => 2048 }))
+                agentBridgeMemorySeparateFrameworkLog(home)
+                try {
+                    let secretText = "中文🙂-memory-payload-must-not-leak-" + "x" * 20000
+                    let bridge = AgentBridge(sessionStore: GatewaySessionStore(home.join("sessions"), enabled: true, agentId: "phase1"))
+                    @Expect(bridge.reply(context.sessionKey, secretText, channelName: "dashboard", agentId: "phase1",
+                        turnContext: Some(context.turnContext)), "phase1 fallback answer")
+                    let rows = agentBridgeMemoryRows(logPath)
+                    @Expect(rows.size, 9)
+                    let memoryJson = String.join(rows.map({ row: JsonObject => row.toJsonString() }), delimiter: "\n")
+                    @Expect(memoryJson.contains("中文"), false)
+                    @Expect(memoryJson.contains("🙂"), false)
+                    @Expect(memoryJson.contains("memory-payload-must-not-leak"), false)
+                } finally {
+                    resetGatewayMemoryObservationForTest()
+                }
+            })
+        })
+    }
+
+    @TestCase
+    public func s1P1SecondTurnReportsLargerPersistedTranscript(): Unit {
+        withAgentBridgeTempHome("metis-s1-memory-p1", { home: Path =>
+            let modelName = "metis-test-s1-p1-${DateTime.now().toUnixTimeStamp().toNanoseconds()}"
+            ModelManager.registerChatModel(modelName, { => AgentBridgePhase1FallbackModel() })
+            writeAgentBridgePhase1FallbackAgentConfig(home, modelName, [], appServer: false)
+            let context = gatewayResolveSessionContext(GatewaySessionRequest(
+                GatewayIngressSource.DashboardRpc, sessionHint: "memory-p1", agentId: "phase1"
+            ))
+            withAgentBridgeRuntimeLogCapture(home, "memory-p1", { logPath: String =>
+                resetGatewayMemoryObservationForTest()
+                setGatewayProcessRssProviderForTest(Some({ => 4096 }))
+                agentBridgeMemorySeparateFrameworkLog(home)
+                try {
+                    let bridge = AgentBridge(sessionStore: GatewaySessionStore(home.join("sessions"), enabled: true, agentId: "phase1"))
+                    let _ = bridge.reply(context.sessionKey, "first", channelName: "dashboard", agentId: "phase1",
+                        turnContext: Some(context.turnContext))
+                    let _ = bridge.reply(context.sessionKey, "second 中文🙂", channelName: "dashboard", agentId: "phase1",
+                        turnContext: Some(context.turnContext))
+                    let persisted = ArrayList<Int64>()
+                    for (row in agentBridgeMemoryRows(logPath)) {
+                        if (agentBridgeJsonString(row, "stage") == "session_persisted") {
+                            persisted.add(row.get("transcriptBytes").getOrThrow().asInt().getValue())
+                        }
+                    }
+                    @Expect(persisted.size, 2)
+                    @Expect(persisted[1] > persisted[0], true)
+                } finally {
+                    resetGatewayMemoryObservationForTest()
+                }
+            })
+        })
+    }
+
+    @TestCase
+    public func s1N1SlashBypassHasNoRowsAndModelFailureHasStableTerminal(): Unit {
+        withAgentBridgeTempHome("metis-s1-memory-n1", { home: Path =>
+            writeAgentBridgePhase1FallbackAgentConfig(home, "openai-codex:gpt-5.5", [])
+            let context = gatewayResolveSessionContext(GatewaySessionRequest(
+                GatewayIngressSource.DashboardRpc, sessionHint: "memory-n1", agentId: "phase1"
+            ))
+            withAgentBridgeRuntimeLogCapture(home, "memory-n1", { logPath: String =>
+                resetGatewayMemoryObservationForTest()
+                setGatewayProcessRssProviderForTest(Some({ => 8192 }))
+                agentBridgeMemorySeparateFrameworkLog(home)
+                let bridge = AgentBridge(sessionStore: GatewaySessionStore(home.join("sessions"), enabled: true, agentId: "phase1"))
+                setGatewayCodexAppServerRunnerForTest(Some({ _request: GatewayCodexAppServerTurnRequest =>
+                    throw Exception("Authorization: Bearer failure-secret-must-not-leak")
+                }))
+                try {
+                    let slash = bridge.replyWithOutcome(context.sessionKey, "/definitely_unknown", channelName: "dashboard",
+                        agentId: "phase1", turnContext: Some(context.turnContext))
+                    @Expect(slash.status, "valid_text")
+                    @Expect(agentBridgeMemoryRows(logPath).size, 0)
+                    var failed = false
+                    try {
+                        let _ = bridge.replyWithOutcome(context.sessionKey, "fail", channelName: "dashboard",
+                            agentId: "phase1", turnContext: Some(context.turnContext))
+                    } catch (_: Exception) {
+                        failed = true
+                    }
+                    @Expect(failed, true)
+                    let rows = agentBridgeMemoryRows(logPath)
+                    @Expect(agentBridgeJsonString(rows[rows.size - 1], "stage"), "turn_summary")
+                    @Expect(agentBridgeJsonString(rows[rows.size - 1], "status"), "failed")
+                    @Expect(agentBridgeJsonString(rows[rows.size - 1], "errorKind"), "model_failed")
+                    let memoryJson = String.join(rows.map({ row: JsonObject => row.toJsonString() }), delimiter: "\n")
+                    @Expect(memoryJson.contains("failure-secret-must-not-leak"), false)
+                    @Expect(memoryJson.contains("Authorization"), false)
+                } finally {
+                    setGatewayCodexAppServerRunnerForTest(None<(GatewayCodexAppServerTurnRequest) -> GatewayCodexAppServerRuntimeResult>)
+                    resetGatewayMemoryObservationForTest()
+                }
+            })
+        })
+    }
+
     @TestCase
     public func m3U2N2CoreCancellationDependencyStaysNeutralAndNoneKeepsOrdinaryCalls(): Unit {
         let propagationFiles = [

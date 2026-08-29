@@ -59,6 +59,27 @@ public class GatewaySessionStoreRuntimeTest {
     }
 
     @TestCase
+    public func s1P1MemoryFootprintStatsTranscriptAndIndexWithoutDecodingContents(): Unit {
+        let root = Path(gatewaySessionStoreRuntimeTestHome).join("memory-footprint")
+        let store = GatewaySessionStore(root, enabled: true, agentId: "main")
+        let sessionKey = "agent:main:memory-footprint"
+        store.appendUser(sessionKey, "中文🙂")
+        store.appendAssistant(sessionKey, "answer")
+        File.writeTo(root.join("sessions.json"), "{}".toArray())
+        let first = store.memoryFootprint(sessionKey)
+        @Expect(first.transcriptBytes > 0, true)
+        @Expect(first.sessionsIndexBytes > 0, true)
+
+        let malformed: Array<UInt8> = [0xFF, 0xFE, 0x80]
+        File.writeTo(store.transcriptPath(sessionKey), malformed)
+        let malformedFootprint = store.memoryFootprint(sessionKey)
+        @Expect(malformedFootprint.transcriptBytes, 3)
+        @Expect(malformedFootprint.sessionsIndexBytes, first.sessionsIndexBytes)
+        let missing = store.memoryFootprint("agent:main:missing")
+        @Expect(missing.transcriptBytes, -1)
+    }
+
+    @TestCase
     public func concurrentLegacySessionMigrationSerializesDirectoryWalks(): Unit {
         synchronized(MetisProcessEnvironmentLock) {
             let oldHome = getVariable("METIS_HOME")

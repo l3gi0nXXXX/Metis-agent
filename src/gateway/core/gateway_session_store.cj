@@ -45,6 +45,16 @@ private func gatewaySessionProviderFromModelName(modelName: String): String {
  *
  * 首次使用新目录时，若为空则从旧版 gateway-sessions 目录复制全部 .jsonl 转录（不删除旧目录）。
  */
+public class GatewaySessionMemoryFootprint {
+    public let transcriptBytes: Int64
+    public let sessionsIndexBytes: Int64
+
+    public init(transcriptBytes: Int64, sessionsIndexBytes: Int64) {
+        this.transcriptBytes = transcriptBytes
+        this.sessionsIndexBytes = sessionsIndexBytes
+    }
+}
+
 public class GatewaySessionStore {
     private let root: Path
     private let enabled: Bool
@@ -86,6 +96,23 @@ public class GatewaySessionStore {
 
     public func transcriptPath(sessionKey: String): Path {
         this.root.join("${fileStemForSessionKey(sessionKey)}.jsonl")
+    }
+
+    /** Only stats the current transcript and sessions index; it never reads their contents. */
+    public func memoryFootprint(sessionKey: String): GatewaySessionMemoryFootprint {
+        let transcript = this.transcriptPath(sessionKey)
+        let index = this.root.join("sessions.json")
+        let transcriptBytes = try {
+            if (exists(transcript) && FileInfo(transcript).isRegular()) { FileInfo(transcript).size } else { -1 }
+        } catch (_: Exception) {
+            -1
+        }
+        let sessionsIndexBytes = try {
+            if (exists(index) && FileInfo(index).isRegular()) { FileInfo(index).size } else { -1 }
+        } catch (_: Exception) {
+            -1
+        }
+        GatewaySessionMemoryFootprint(transcriptBytes, sessionsIndexBytes)
     }
 
     /**

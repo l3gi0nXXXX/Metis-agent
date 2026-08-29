@@ -19,7 +19,7 @@ public class GatewayMemoryObservation {
     public let sessionHash: String
     public let channel: String
     public let agentId: String
-    public let model: String
+    public var model: String
     public let startedAtMs: Int64
 
     private let stateLock = Mutex()

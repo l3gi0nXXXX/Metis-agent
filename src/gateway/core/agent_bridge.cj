@@ -991,30 +991,13 @@ public func gatewayDebugModelOrderForTurnContext(turnContext: GatewayTurnContext
 }
 
 private func gatewayLogReplyMemory(
+    observation: GatewayMemoryObservation,
     stage: String,
-    conversationKey: String,
-    channelName: String,
-    agentId!: String = "",
-    modelName!: String = "",
-    note!: String = ""
-): Unit {
-    let pid = gatewayProcessCurrentPid()
-    let rssKb = gatewayProcessResidentSetKb()
-    gatewayLogEventDebug(
-        "gateway/agent",
-        "process.memory",
-        "gateway reply memory snapshot",
-        meta: gatewayLogMeta()
-            .string("stage", stage)
-            .int("pid", pid)
-            .int("rssKb", rssKb)
-            .string("channel", channelName.trimAscii().toAsciiLower())
-            .string("agentId", agentId)
-            .string("sessionKey", conversationKey)
-            .string("model", modelName)
-            .rawString("note", note)
-            .object()
-    )
+    meta!: JsonObject = JsonObject(),
+    status!: String = "entered",
+    errorKind!: String = "none"
+): Bool {
+    gatewayObserveMemoryStage(observation, stage, meta: meta, status: status, errorKind: errorKind)
 }
 
 private func gatewayModelProviderName(modelName: String): String {
@@ -1266,11 +1249,46 @@ public class AgentBridge {
                     return GatewayAgentReplyOutcome("valid_text", text: "这不是一个有效的命令。可用 /cron 管理定时任务，/subagents 管理后台 subagent，或使用 /skills list 查看可用技能，或使用 /<skillName> 参数（例如 /weather 上海）。")
                 }
             }
+            let memoryObservation = gatewayBeginMemoryObservation(
+                gatewayLogIdentityHash(conversationKey),
+                channel: channelName,
+                agentId: effectiveAgentId
+            )
+            var memoryStatus = "failed"
+            var memoryErrorKind = "unknown"
+            try {
+            let _ = gatewayLogReplyMemory(
+                memoryObservation,
+                "turn_enter",
+                meta: gatewayLogMeta().int("promptChars", Int64(prompt.size)).object()
+            )
             if (!this.historyByConversation.contains(conversationKey)) {
                 let loaded = this.sessionStore.loadHistoryLines(conversationKey)
                 this.historyByConversation[conversationKey] = loaded
             }
             let history = this.historyByConversation.get(conversationKey).getOrThrow()
+            var historyChars: Int64 = -1
+            if (memoryObservation.sampled) {
+                historyChars = 0
+                for (line in history) {
+                    historyChars += Int64(line.size)
+                }
+            }
+            let loadedFootprint = if (memoryObservation.sampled) {
+                this.sessionStore.memoryFootprint(conversationKey)
+            } else {
+                GatewaySessionMemoryFootprint(-1, -1)
+            }
+            let _ = gatewayLogReplyMemory(
+                memoryObservation,
+                "history_loaded",
+                meta: gatewayLogMeta()
+                    .int("historyMessages", Int64(history.size))
+                    .int("historyChars", historyChars)
+                    .int("transcriptBytes", loadedFootprint.transcriptBytes)
+                    .int("sessionsIndexBytes", loadedFootprint.sessionsIndexBytes)
+                    .object()
+            )
             history.add("user: ${prompt}")
             this.sessionStore.appendUser(conversationKey, prompt)
             match (gatewayAgentBridgeFinalReplySequenceForTest) {
@@ -1288,6 +1306,8 @@ public class AgentBridge {
                         history.add("assistant: ${outcome.text}")
                         this.sessionStore.appendAssistant(conversationKey, outcome.text)
                     }
+                    memoryStatus = "success"
+                    memoryErrorKind = "none"
                     return outcome
                 case None => ()
             }
@@ -1428,12 +1448,14 @@ public class AgentBridge {
                 availableSkillsMeta
             )
             let gatewayUser = CliSettingManager.readGatewaySettings()
-            gatewayLogReplyMemory(
-                "before-model-loop",
-                conversationKey,
-                channelName,
-                agentId: effectiveAgentId,
-                note: "history=${history.size}, modelInputChars=${modelInput.size}, models=${allModels.size}"
+            let _ = gatewayLogReplyMemory(
+                memoryObservation,
+                "model_input_built",
+                meta: gatewayLogMeta()
+                    .int("historyMessages", Int64(history.size))
+                    .int("modelInputChars", Int64(modelInput.size))
+                    .int("modelCount", Int64(allModels.size))
+                    .object()
             )
             for ((idx, currModel) in enumerate(allModels)) {
                 match (executionControl) {
@@ -1455,6 +1477,7 @@ public class AgentBridge {
                         executionTracker: Some(toolExecutionTracker))
                     let registeredToolNames = MetisSystemPromptBuilder.collectToolNames(agent.toolManager.tools)
                     agent.model = currModel
+                    memoryObservation.model = currModel.fullName
                     let promptBuild = buildGatewaySystemPrompt(
                         agent,
                         channelName,
@@ -1467,6 +1490,18 @@ public class AgentBridge {
                     attemptPromptChars = Int64(builtPrompt.size)
                     let bootstrap = promptBuild[1]
                     agent.systemPrompt = builtPrompt
+                    let _ = gatewayLogReplyMemory(
+                        memoryObservation,
+                        "system_prompt_built",
+                        meta: gatewayLogMeta()
+                            .string("model", currModel.fullName)
+                            .int("attempt", Int64(idx + 1))
+                            .int("systemPromptChars", Int64(builtPrompt.size))
+                            .int("registeredTools", Int64(registeredToolNames.size))
+                            .int("bootstrapFiles", Int64(bootstrap.files.size))
+                            .int("bootstrapChars", bootstrap.totalChars)
+                            .object()
+                    )
                     let restrictedSummary = String.join(restrictedTools, delimiter: ",")
                     gatewayLogEventInfo(
                         "gateway/agent",
@@ -1505,14 +1540,6 @@ public class AgentBridge {
                     }
                     let modelCallStartedAtMs = DateTime.now().toUnixTimeStamp().toMilliseconds()
                     let localPreCallMs = modelCallStartedAtMs - preCallStartedAtMs
-                    gatewayLogReplyMemory(
-                        "before-agent-chat",
-                        conversationKey,
-                        channelName,
-                        agentId: effectiveAgentId,
-                        modelName: currModel.fullName,
-                        note: "attempt=${idx + 1}, promptChars=${builtPrompt.size}"
-                    )
                     var firstTokenMs: Int64 = -1
                     var codexAppServerPromptTokens: Int64 = -1
                     var codexAppServerCompletionTokens: Int64 = -1
@@ -1637,13 +1664,16 @@ public class AgentBridge {
                     successfulModel = Some(currModel)
                     successfulRegisteredToolNames = registeredToolNames
                     let modelCallFinishedAtMs = DateTime.now().toUnixTimeStamp().toMilliseconds()
-                    gatewayLogReplyMemory(
-                        "after-agent-chat",
-                        conversationKey,
-                        channelName,
-                        agentId: effectiveAgentId,
-                        modelName: currModel.fullName,
-                        note: "attempt=${idx + 1}, answerChars=${answer.size}"
+                    let _ = gatewayLogReplyMemory(
+                        memoryObservation,
+                        "model_returned",
+                        meta: gatewayLogMeta()
+                            .string("model", currModel.fullName)
+                            .int("attempt", Int64(idx + 1))
+                            .int("answerChars", Int64(answer.size))
+                            .int("promptTokens", successfulPromptTokens)
+                            .int("completionTokens", successfulCompletionTokens)
+                            .object()
                     )
                     gatewayLogModelTiming(
                         channelName,
@@ -1668,14 +1698,6 @@ public class AgentBridge {
                     gatewayFinishUsageCapture()
                     let modelCallFailedAtMs = DateTime.now().toUnixTimeStamp().toMilliseconds()
                     let errorSummary = gatewayAgentBridgeModelErrorSummary(e)
-                    gatewayLogReplyMemory(
-                        "agent-chat-exception",
-                        conversationKey,
-                        channelName,
-                        agentId: effectiveAgentId,
-                        modelName: currModel.fullName,
-                        note: "attempt=${idx + 1}, error=${errorSummary}"
-                    )
                     gatewayLogModelTiming(
                         channelName,
                         currModel.fullName,
@@ -1756,6 +1778,17 @@ public class AgentBridge {
                 case None => ()
             }
             let correctionModel = successfulModel
+            let correctionToolContext = toolExecutionTracker.correctionContext()
+            let correctionContextChars = Int64(modelInput.size) + Int64(correctionToolContext.size) + Int64(answer.size)
+            let _ = gatewayLogReplyMemory(
+                memoryObservation,
+                "final_correction_ready",
+                meta: gatewayLogMeta()
+                    .int("answerChars", Int64(answer.size))
+                    .int("correctionContextChars", correctionContextChars)
+                    .int("registeredTools", Int64(successfulRegisteredToolNames.size))
+                    .object()
+            )
             let outcome = gatewayRunFinalAnswerCorrection(
                 answer,
                 successfulRegisteredToolNames,
@@ -1771,7 +1804,7 @@ public class AgentBridge {
                     }
                 },
                 toolExecutionObserved: toolExecutionTracker.observed,
-                existingContext: "${modelInput}\n\n已完成工具结果：\n${toolExecutionTracker.correctionContext()}\n\n模型首次输出：\n${answer}"
+                existingContext: "${modelInput}\n\n已完成工具结果：\n${correctionToolContext}\n\n模型首次输出：\n${answer}"
             )
             if (outcome.status == "valid_text") {
                 history.add("assistant: ${outcome.text}")
@@ -1783,14 +1816,40 @@ public class AgentBridge {
                     completionTokens: successfulCompletionTokens
                 )
             }
-            gatewayLogReplyMemory(
-                "reply-finished",
-                conversationKey,
-                channelName,
-                agentId: effectiveAgentId,
-                note: "history=${history.size}, replyChars=${outcome.text.size}, finalStatus=${outcome.status}, diagnosticCode=${outcome.diagnosticCode}, modelAttempts=${outcome.modelAttempts}"
+            let persistedFootprint = if (memoryObservation.sampled) {
+                this.sessionStore.memoryFootprint(conversationKey)
+            } else {
+                GatewaySessionMemoryFootprint(-1, -1)
+            }
+            let _ = gatewayLogReplyMemory(
+                memoryObservation,
+                "session_persisted",
+                meta: gatewayLogMeta()
+                    .int("historyMessages", Int64(history.size))
+                    .int("replyChars", Int64(outcome.text.size))
+                    .int("transcriptBytes", persistedFootprint.transcriptBytes)
+                    .int("sessionsIndexBytes", persistedFootprint.sessionsIndexBytes)
+                    .string("replyStatus", outcome.status)
+                    .int("modelAttempts", outcome.modelAttempts)
+                    .object()
             )
+            memoryStatus = "success"
+            memoryErrorKind = "none"
             return outcome
+            } catch (e: Exception) {
+                memoryStatus = match (executionControl) {
+                    case Some(control) => if (control.isCancelled()) { "cancelled" } else { "failed" }
+                    case None => "failed"
+                }
+                memoryErrorKind = if (memoryStatus == "cancelled") { "cancelled" } else { "model_failed" }
+                throw e
+            } finally {
+                let _ = gatewayFinishMemoryObservation(
+                    memoryObservation,
+                    status: memoryStatus,
+                    errorKind: memoryErrorKind
+                )
+            }
         }
     }
 
