@@ -10,6 +10,9 @@ public class GatewayAgentReplyOutcome {
     public let explicitSilent: Bool
     public let modelAttempts: Int64
     public let toolExecutionObserved: Bool
+    public var memoryTurnSequence: Int64 = -1
+    public var memorySampled: Bool = false
+    public var memoryBaselineRssKb: Int64 = -1
 
     public init(
         status: String,

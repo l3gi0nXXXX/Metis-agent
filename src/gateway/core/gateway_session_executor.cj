@@ -20,6 +20,9 @@ public class GatewaySessionExecutionResult {
     public let deliveryStatus: String
     public let deliveryError: String
     public let deliveryMessageId: String
+    public let memoryTurnSequence: Int64
+    public let memorySampled: Bool
+    public let memoryBaselineRssKb: Int64
 
     public init(
         answer: String,
@@ -28,7 +31,10 @@ public class GatewaySessionExecutionResult {
         delivered!: Bool = false,
         deliveryStatus!: String = "not-requested",
         deliveryError!: String = "",
-        deliveryMessageId!: String = ""
+        deliveryMessageId!: String = "",
+        memoryTurnSequence!: Int64 = -1,
+        memorySampled!: Bool = false,
+        memoryBaselineRssKb!: Int64 = -1
     ) {
         this.answer = answer
         this.finalStatus = finalStatus.trimAscii()
@@ -37,6 +43,9 @@ public class GatewaySessionExecutionResult {
         this.deliveryStatus = deliveryStatus.trimAscii()
         this.deliveryError = deliveryError
         this.deliveryMessageId = deliveryMessageId.trimAscii()
+        this.memoryTurnSequence = memoryTurnSequence
+        this.memorySampled = memorySampled
+        this.memoryBaselineRssKb = memoryBaselineRssKb
     }
 }
 
@@ -633,6 +642,9 @@ public func gatewayExecuteSessionTurn(
     var answer = ""
     var finalStatus = "failed"
     var diagnosticCode = ""
+    var memoryTurnSequence: Int64 = -1
+    var memorySampled = false
+    var memoryBaselineRssKb: Int64 = -1
     try {
         let replyOutcome = gatewayReplyWithTimeout(
             bridge,
@@ -776,6 +788,9 @@ public func gatewayExecuteSessionTurn(
         )
         finalStatus = replyOutcome.status
         diagnosticCode = replyOutcome.diagnosticCode
+        memoryTurnSequence = replyOutcome.memoryTurnSequence
+        memorySampled = replyOutcome.memorySampled
+        memoryBaselineRssKb = replyOutcome.memoryBaselineRssKb
         answer = if (replyOutcome.status == "valid_text") {
             replyOutcome.text
         } else if (replyOutcome.explicitSilent) {
@@ -832,7 +847,14 @@ public func gatewayExecuteSessionTurn(
             case Some(control) => control.throwIfCancelled()
             case None => ()
         }
-        return GatewaySessionExecutionResult(answer, finalStatus: finalStatus, diagnosticCode: diagnosticCode)
+        return GatewaySessionExecutionResult(
+            answer,
+            finalStatus: finalStatus,
+            diagnosticCode: diagnosticCode,
+            memoryTurnSequence: memoryTurnSequence,
+            memorySampled: memorySampled,
+            memoryBaselineRssKb: memoryBaselineRssKb
+        )
     }
     if (finalStatus != "valid_text" && finalStatus != "explicit_silent") {
         let compatibilityText = { =>

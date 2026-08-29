@@ -946,6 +946,26 @@ public class ServicePluginDispatchSchedulerSnapshotForTest {
     }
 }
 
+public class ServicePluginDispatchMemorySnapshot {
+    public let active: Int64
+    public let queued: Int64
+    public let accepted: Int64
+    public let futures: Int64
+    public let highWater: Int64
+    public let queueFull: Int64
+    public let fenced: Bool
+
+    public init(active: Int64, queued: Int64, accepted: Int64, futures: Int64, highWater: Int64, queueFull: Int64, fenced: Bool) {
+        this.active = active
+        this.queued = queued
+        this.accepted = accepted
+        this.futures = futures
+        this.highWater = highWater
+        this.queueFull = queueFull
+        this.fenced = fenced
+    }
+}
+
 private class ServicePluginStdioProcess {
     public let serviceId: String
     public let process: ServicePluginBrokerProcessHandle
@@ -1068,6 +1088,19 @@ private class ServicePluginStdioProcess {
                 this.acceptedDispatches, Int64(this.dispatchFutures.size), this.dispatchQueueHighWatermark,
                 this.dispatchQueueFull, this.cancelledDispatches, !this.dispatchFenced,
                 this.activeDispatches == 0 && this.dispatchQueue.size == 0 && this.dispatchFutures.size == 0 && this.acceptedDispatches == 0
+            )
+        }
+    }
+    public func memoryDiagnosticSnapshot(): ServicePluginDispatchMemorySnapshot {
+        synchronized(this.dispatchLock) {
+            ServicePluginDispatchMemorySnapshot(
+                this.activeDispatches,
+                Int64(this.dispatchQueue.size),
+                this.acceptedDispatches,
+                Int64(this.dispatchFutures.size),
+                this.dispatchQueueHighWatermark,
+                this.dispatchQueueFull,
+                this.dispatchFenced
             )
         }
     }
@@ -1958,6 +1991,15 @@ public func servicePluginDispatchSchedulerSnapshotForTest(serviceId: String): Op
             case Some(process) => Some(process.dispatchSchedulerSnapshotForTest())
             case None => None<ServicePluginDispatchSchedulerSnapshotForTest>
         }
+    }
+}
+public func servicePluginDispatchMemorySnapshot(serviceId: String): Option<ServicePluginDispatchMemorySnapshot> {
+    let process = synchronized(servicePluginProcessLock) {
+        servicePluginActiveProcesses.get(serviceId.trimAscii())
+    }
+    match (process) {
+        case Some(value) => Some(value.memoryDiagnosticSnapshot())
+        case None => None<ServicePluginDispatchMemorySnapshot>
     }
 }
 public func servicePluginResponseQueueCountsForTest(serviceId: String): Option<(Int64, Int64)> {

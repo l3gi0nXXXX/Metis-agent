@@ -2456,6 +2456,80 @@ public class ServicePluginHostTest {
     }
 
     @TestCase
+    public func s2U1MemorySnapshotMatchesActiveAndQueuedSchedulerScalars(): Unit {
+        withIsolatedServicePluginHostTestHome("s2-u1-memory-snapshot", { home: Path =>
+            let eventIds = this.gitCodeBurstEventIds("s2-u1", 32)
+            let ackMarker = home.join("acks.marker")
+            let oldMarker = getVariable("METIS_STDIO_FIXTURE_MARKER_PATH")
+            let probe = ServicePluginBurstProbe()
+            setVariable("METIS_STDIO_FIXTURE_MARKER_PATH", ackMarker.toString())
+            try {
+                this.registerGitCodeStdioScript(this.gitCodeAckBurstScript(eventIds))
+                setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent =>
+                    let rows = ArrayList<ServicePluginDeliveryTarget>(); rows.add(ServicePluginDeliveryTarget("telegram", "s2", "peer")); rows
+                }))
+                setServicePluginWebhookGeneratedReplyHandlerForTest(Some({ event: ServicePluginAcceptedGitCodeEvent, _target: ServicePluginDeliveryTarget =>
+                    probe.enterAndWait(event.eventId); ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: event.eventId)
+                }))
+                setServicePluginEventDeliveryForTest(Some({ _target: ServicePluginDeliveryTarget, _text: String => ServicePluginEventDeliveryResult(true, "sent") }))
+                @Expect(ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000).ok, true)
+                @Expect(probe.awaitEntered(2, 3000), true)
+                let scheduler = this.waitForDispatchScheduler("gitcode-monitor", { row: ServicePluginDispatchSchedulerSnapshotForTest =>
+                    row.active == 2 && row.queued == 30 && row.accepted == 32 && row.futures == 2
+                }).getOrThrow()
+                let memory = servicePluginDispatchMemorySnapshot("gitcode-monitor").getOrThrow()
+                @Expect(memory.active, scheduler.active)
+                @Expect(memory.queued, scheduler.queued)
+                @Expect(memory.accepted, scheduler.accepted)
+                @Expect(memory.futures, scheduler.futures)
+                @Expect(memory.highWater, scheduler.queueHighWatermark)
+                @Expect(memory.queueFull, scheduler.queueFull)
+                @Expect(memory.fenced, !scheduler.accepting)
+            } finally {
+                probe.release(64)
+                setServicePluginWebhookSubscribersProviderForTest(None<(ServicePluginAcceptedGitCodeEvent) -> ArrayList<ServicePluginDeliveryTarget>>)
+                setServicePluginWebhookGeneratedReplyHandlerForTest(None<(ServicePluginAcceptedGitCodeEvent, ServicePluginDeliveryTarget) -> ServicePluginGeneratedReplyResult>)
+                setServicePluginEventDeliveryForTest(None)
+                match (oldMarker) { case Some(value) => setVariable("METIS_STDIO_FIXTURE_MARKER_PATH", value) case None => setVariable("METIS_STDIO_FIXTURE_MARKER_PATH", "") }
+            }
+        })
+    }
+
+    @TestCase
+    public func s2B1ConcurrentMemorySnapshotsStayBoundedWhileWorkersAreHeld(): Unit {
+        withIsolatedServicePluginHostTestHome("s2-b1-memory-snapshot", { home: Path =>
+            let eventIds = this.gitCodeBurstEventIds("s2-b1", 4)
+            let oldMarker = getVariable("METIS_STDIO_FIXTURE_MARKER_PATH")
+            let probe = ServicePluginBurstProbe()
+            setVariable("METIS_STDIO_FIXTURE_MARKER_PATH", home.join("acks.marker").toString())
+            try {
+                this.registerGitCodeStdioScript(this.gitCodeAckBurstScript(eventIds))
+                setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent =>
+                    let rows = ArrayList<ServicePluginDeliveryTarget>(); rows.add(ServicePluginDeliveryTarget("telegram", "s2", "peer")); rows
+                }))
+                setServicePluginWebhookGeneratedReplyHandlerForTest(Some({ event: ServicePluginAcceptedGitCodeEvent, _target: ServicePluginDeliveryTarget =>
+                    probe.enterAndWait(event.eventId); ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: event.eventId)
+                }))
+                setServicePluginEventDeliveryForTest(Some({ _target: ServicePluginDeliveryTarget, _text: String => ServicePluginEventDeliveryResult(true, "sent") }))
+                @Expect(ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000).ok, true)
+                @Expect(probe.awaitEntered(2, 3000), true)
+                for (_ in 0..100) {
+                    let row = servicePluginDispatchMemorySnapshot("gitcode-monitor").getOrThrow()
+                    @Expect(row.active <= 2, true)
+                    @Expect(row.queued <= 128, true)
+                    @Expect(row.futures <= 2, true)
+                }
+            } finally {
+                probe.release(16)
+                setServicePluginWebhookSubscribersProviderForTest(None<(ServicePluginAcceptedGitCodeEvent) -> ArrayList<ServicePluginDeliveryTarget>>)
+                setServicePluginWebhookGeneratedReplyHandlerForTest(None<(ServicePluginAcceptedGitCodeEvent, ServicePluginDeliveryTarget) -> ServicePluginGeneratedReplyResult>)
+                setServicePluginEventDeliveryForTest(None)
+                match (oldMarker) { case Some(value) => setVariable("METIS_STDIO_FIXTURE_MARKER_PATH", value) case None => setVariable("METIS_STDIO_FIXTURE_MARKER_PATH", "") }
+            }
+        })
+    }
+
+    @TestCase
     public func s1cB1QueueFullAcksAndRetryContinuesPump(): Unit {
         withIsolatedServicePluginHostTestHome("s1c-b1-queue-full", { home: Path =>
             let eventIds = this.gitCodeBurstEventIds("s1c-b1-中文🙂", 131)

@@ -1000,6 +1000,17 @@ private func gatewayLogReplyMemory(
     gatewayObserveMemoryStage(observation, stage, meta: meta, status: status, errorKind: errorKind)
 }
 
+private func gatewayAttachMemoryObservation(
+    outcome: GatewayAgentReplyOutcome,
+    observation: GatewayMemoryObservation
+): GatewayAgentReplyOutcome {
+    let memory = observation.memorySnapshot()
+    outcome.memoryTurnSequence = observation.turnSequence
+    outcome.memorySampled = observation.sampled
+    outcome.memoryBaselineRssKb = memory[0]
+    outcome
+}
+
 private func gatewayModelProviderName(modelName: String): String {
     let normalized = modelName.trimAscii()
     if (normalized.isEmpty()) {
@@ -1308,7 +1319,7 @@ public class AgentBridge {
                     }
                     memoryStatus = "success"
                     memoryErrorKind = "none"
-                    return outcome
+                    return gatewayAttachMemoryObservation(outcome, memoryObservation)
                 case None => ()
             }
 
@@ -1835,7 +1846,7 @@ public class AgentBridge {
             )
             memoryStatus = "success"
             memoryErrorKind = "none"
-            return outcome
+            return gatewayAttachMemoryObservation(outcome, memoryObservation)
             } catch (e: Exception) {
                 memoryStatus = match (executionControl) {
                     case Some(control) => if (control.isCancelled()) { "cancelled" } else { "failed" }

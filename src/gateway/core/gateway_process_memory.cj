@@ -309,6 +309,51 @@ public func gatewayFinishMemoryObservation(
     true
 }
 
+public func gatewayLogServicePluginTurnReleased(
+    turnSequence: Int64,
+    sampled: Bool,
+    baselineRssKb: Int64,
+    sessionHash: String,
+    meta!: JsonObject = JsonObject(),
+    status!: String = "success",
+    errorKind!: String = "none"
+): Bool {
+    if (!sampled || turnSequence <= 0) {
+        return false
+    }
+    let rssKb = gatewayProcessResidentSetKb()
+    let counters = gatewayMemoryObservationCounters()
+    let row = gatewayLogMeta()
+    for (key in meta.getFields().keys()) {
+        match (meta.get(key)) {
+            case Some(value) => row.value(key, value)
+            case None => ()
+        }
+    }
+    row.string("stage", "service_plugin_turn_released")
+        .int("turnSequence", turnSequence)
+        .bool("sampled", true)
+        .int("rssKb", rssKb)
+        .int("rssDeltaKb", if (rssKb >= 0 && baselineRssKb >= 0) { rssKb - baselineRssKb } else { -1 })
+        .int("peakRssKb", -1)
+        .int("elapsedMs", -1)
+        .int("activeTurns", counters[1])
+        .int("completedTurns", counters[2])
+        .string("sessionHash", sessionHash.trimAscii())
+        .string("channel", "gitcode")
+        .string("agentId", "")
+        .string("model", "")
+        .string("status", gatewayMemoryObservationStatus(status))
+        .string("errorKind", gatewayMemoryObservationErrorKind(errorKind))
+    gatewayLogEventDebugFileOnly(
+        "gateway/service-plugin",
+        "process.memory",
+        "service plugin model turn released",
+        meta: row.object()
+    )
+    true
+}
+
 @When[os == "Windows"]
 foreign {
     func GetCurrentProcessId(): UInt32

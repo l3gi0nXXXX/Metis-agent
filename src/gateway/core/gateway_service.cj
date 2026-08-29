@@ -8,7 +8,7 @@ import metis.gateway.model.*
 import metis.gateway.process.{gatewayStdioBrokerSnapshot, shutdownGatewayStdioBroker}
 import metis.process.ManagedStdioOperationResult
 import metis.gateway.security.gatewayPairingAccountStore
-import metis.gateway.service_plugin.{CapabilityCaller, CapabilityInvokeRequest, CapabilityInvokeResult, ServicePluginAcceptedGitCodeEvent, ServicePluginDeliveryTarget, ServicePluginEventDeliveryResult, ServicePluginGeneratedReplyResult, ServicePluginHostShutdownResult, ServicePluginPendingJob, ServiceStopResult, buildServicePluginImBindingRules, invokeRegisteredCapability, matchServicePluginImBinding, parseServicePluginJobAcceptedPayload, redactServicePayload, renderServicePluginJobSnapshotMessage, servicePluginGeneratedReplyResultFromAgentAnswer, servicePluginPendingJobStore, registerConfiguredServicePlugins, servicePluginConfiguredStatusForUser, servicePluginWebhookDispatchStatsJson, setServicePluginEventDelivery, setServicePluginGeneratedReplyHandler, setServicePluginWebhookGeneratedReplyHandler, setServicePluginWebhookSubscribersProvider, shutdownServicePluginHost, validateServicePluginGeneratedDraft}
+import metis.gateway.service_plugin.{CapabilityCaller, CapabilityInvokeRequest, CapabilityInvokeResult, ServicePluginAcceptedGitCodeEvent, ServicePluginDeliveryTarget, ServicePluginEventDeliveryResult, ServicePluginGeneratedReplyResult, ServicePluginHostShutdownResult, ServicePluginPendingJob, ServiceStopResult, buildServicePluginImBindingRules, invokeRegisteredCapability, matchServicePluginImBinding, parseServicePluginJobAcceptedPayload, redactServicePayload, renderServicePluginJobSnapshotMessage, servicePluginDispatchMemorySnapshot, servicePluginGeneratedReplyResultFromAgentAnswer, servicePluginPendingJobStore, registerConfiguredServicePlugins, servicePluginConfiguredStatusForUser, servicePluginWebhookDispatchStatsJson, setServicePluginEventDelivery, setServicePluginGeneratedReplyHandler, setServicePluginWebhookGeneratedReplyHandler, setServicePluginWebhookSubscribersProvider, shutdownServicePluginHost, validateServicePluginGeneratedDraft}
 import metis.gateway.session.{GatewayIngressSource, GatewaySessionContext, GatewaySessionRequest, gatewayResolveSessionContext, gatewaySessionRequestFromInbound}
 import metis.gateway.tools.{gatewayCkbAdminCommand, gatewayHandleNativeCommandLine, gatewayHandleSubagentsCommandLine, gatewayRenderCkbAdminCommandResult}
 import metis.gateway.gitcode_plugin.{GatewayCommandContext, GitCodePromptTemplate, GitCodePromptTemplateSet, GitCodeReviewPromptPlan, GitCodeReviewRuntimeConfig, buildGitCodeAsyncScanPayload, buildGitCodeDeadLetterInspectPayload, buildGitCodeDeadLetterListPayload, buildGitCodeEventReconcilePayload, buildGitCodeHookReconcilePayload, buildGitCodeReplyPromptForServicePluginEvent, buildGitCodeSubscriptionTarget, buildGitCodeWebhookCancelPayload, buildGitCodeWebhookReplayPayload, buildGitCodeWebhookStatusPayload, defaultGitCodePromptTemplateSet, defaultGitCodeReviewRuntimeConfig, formatGitCodeSubscribeResult, gitCodeSubscriptionStatusJson, gitCodeSubscriptionStoreSnapshotForDispatcher, handleGitCodeKnowledgeQueryCommand, loadGitCodePromptTemplates, loadGitCodeSubscriptionStore, parseGeneratedReplyModelOutput, parseGitCodeCommand, parseGitCodeDeliveryArgs, parseGitCodeHookReconcileArgs, parseGitCodeReconcileOnceArgs, parseGitCodeReviewRuntimeConfig, parseGitCodeScanOnceArgs, removeGitCodeSubscription, renderGeneratedReplyDraft, renderGitCodeDeadLetterInspectResult, renderGitCodeDeadLetterListResult, renderGitCodeEventReconcileResult, renderGitCodeHookReconcileResult, renderGitCodeWebhookCancelResult, renderGitCodeWebhookReplayResult, renderGitCodeWebhookStatusResult, saveGitCodeSubscription, setGitCodeSubscriptionStore}
@@ -1494,7 +1494,9 @@ public class GatewayService {
         } catch (e: Exception) {
             return ServicePluginGeneratedReplyResult(false, status: "llm_degraded", diagnostic: "Agent Runtime failed: ${e.message}", needsHumanReview: true)
         }
-        this.servicePluginGeneratedReplyResultFromGitCodeAnswer(turn.execution.answer, promptPlan)
+        let result = this.servicePluginGeneratedReplyResultFromGitCodeAnswer(turn.execution.answer, promptPlan)
+        this.servicePluginLogReleasedModelTurn(turn, result, Int64(prompt.size))
+        result
     }
 
     private func servicePluginGenerateGitCodeWebhookReplyDraft(
@@ -1531,7 +1533,48 @@ public class GatewayService {
         } catch (e: Exception) {
             return ServicePluginGeneratedReplyResult(false, status: "llm_degraded", diagnostic: "Agent Runtime failed: ${e.message}", needsHumanReview: true)
         }
-        this.servicePluginGeneratedReplyResultFromGitCodeAnswer(turn.execution.answer, promptPlan)
+        let result = this.servicePluginGeneratedReplyResultFromGitCodeAnswer(turn.execution.answer, promptPlan)
+        this.servicePluginLogReleasedModelTurn(turn, result, Int64(prompt.size))
+        result
+    }
+
+    private func servicePluginLogReleasedModelTurn(
+        turn: GatewayResolvedSessionTurnResult,
+        result: ServicePluginGeneratedReplyResult,
+        promptChars: Int64
+    ): Unit {
+        let snapshot = servicePluginDispatchMemorySnapshot("gitcode-monitor")
+        let meta = gatewayLogMeta()
+            .int("promptChars", promptChars)
+            .string("resultStatus", result.status)
+            .bool("resultOk", result.ok)
+        match (snapshot) {
+            case Some(value) =>
+                meta.int("dispatchActive", value.active)
+                    .int("dispatchQueued", value.queued)
+                    .int("dispatchAccepted", value.accepted)
+                    .int("dispatchFutures", value.futures)
+                    .int("dispatchHighWater", value.highWater)
+                    .int("dispatchQueueFull", value.queueFull)
+                    .bool("dispatchFenced", value.fenced)
+            case None =>
+                meta.int("dispatchActive", -1)
+                    .int("dispatchQueued", -1)
+                    .int("dispatchAccepted", -1)
+                    .int("dispatchFutures", -1)
+                    .int("dispatchHighWater", -1)
+                    .int("dispatchQueueFull", -1)
+                    .bool("dispatchFenced", true)
+        }
+        let _ = gatewayLogServicePluginTurnReleased(
+            turn.execution.memoryTurnSequence,
+            turn.execution.memorySampled,
+            turn.execution.memoryBaselineRssKb,
+            gatewayLogIdentityHash(turn.context.sessionKey),
+            meta: meta.object(),
+            status: if (result.ok) { "success" } else { "failed" },
+            errorKind: if (result.ok) { "none" } else { "model_failed" }
+        )
     }
 
     private func servicePluginGeneratedReplyResultFromCodexFailure(e: CodexResponsesException): ServicePluginGeneratedReplyResult {
