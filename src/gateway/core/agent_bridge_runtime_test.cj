@@ -17,7 +17,7 @@ import std.collection.{ArrayList, HashMap}
 import std.env.{getVariable, setVariable}
 import std.fs.{Directory, File, Path, exists, remove}
 import std.process.executeWithOutput
-import std.sync.AtomicBool
+import std.sync.{AtomicBool, Condition, Mutex}
 import std.time.*
 import std.unittest.testmacro.*
 import stdx.encoding.json.{JsonArray, JsonInt, JsonObject, JsonString, JsonValue}
@@ -400,6 +400,57 @@ private class AgentBridgePhase1FallbackModel <: ChatModel {
     }
 }
 
+private class AgentBridgeS4RssOverlapProbe {
+    private let lock = Mutex()
+    private var condition: Condition
+    private var entered: Int64 = 0
+    private var active: Int64 = 0
+    private var maxActive: Int64 = 0
+    private var released: Bool = false
+    private var value: Int64 = 1000
+
+    public init() {
+        synchronized(this.lock) { this.condition = this.lock.condition() }
+    }
+
+    public func next(): Int64 {
+        synchronized(this.lock) {
+            this.value += 10
+            if (this.entered < 2) {
+                this.entered++
+                this.active++
+                this.maxActive = max(this.maxActive, this.active)
+                this.condition.notifyAll()
+                while (!this.released) { this.condition.wait() }
+                this.active--
+                this.condition.notifyAll()
+            }
+            this.value
+        }
+    }
+
+    public func release(): Unit {
+        synchronized(this.lock) {
+            this.released = true
+            this.condition.notifyAll()
+        }
+    }
+
+    public func awaitEntered(expected: Int64, timeoutMs: Int64): Bool {
+        let deadline = DateTime.now().toUnixTimeStamp().toMilliseconds() + timeoutMs
+        synchronized(this.lock) {
+            while (this.entered < expected) {
+                let remaining = deadline - DateTime.now().toUnixTimeStamp().toMilliseconds()
+                if (remaining <= 0) { return false }
+                let _ = this.condition.wait(timeout: Duration.millisecond * remaining)
+            }
+            true
+        }
+    }
+
+    public func peak(): Int64 { synchronized(this.lock) { this.maxActive } }
+}
+
 private func resetAgentBridgePhase1FakeModels(): Unit {
     agentBridgePhase1PrimaryCalls = 0
     agentBridgePhase1FallbackCalls = 0
@@ -480,6 +531,185 @@ private func agentBridgeMemoryRows(path: String): Array<JsonObject> {
 private func agentBridgeMemorySeparateFrameworkLog(home: Path): Unit {
     let _ = gatewayLoggingCurrentLogFile()
     Config.logFile = home.join("logs").join("framework-memory-test.log").toString()
+}
+
+private func agentBridgeWriteS4Evidence(label: String, analysis: GatewayMemoryAnalysisForTest): Unit {
+    match (getVariable("METIS_MEMORY_S4_EVIDENCE_DIR")) {
+        case Some(raw) =>
+            let normalized = raw.trimAscii()
+            if (!normalized.isEmpty()) {
+                let dir = Path(normalized)
+                if (!exists(dir)) { Directory.create(dir, recursive: true) }
+                let row = JsonObject()
+                row.put("experiment", JsonString(label))
+                row.put("status", JsonString(analysis.status))
+                row.put("sampledTurns", JsonInt(analysis.sampledTurns))
+                row.put("enterRssSlopeKbPerTurn", JsonInt(analysis.enterRssSlopeKbPerTurn))
+                row.put("lateEnterRssSlopeKbPerTurn", JsonInt(analysis.lateEnterRssSlopeKbPerTurn))
+                row.put("providerDeltaKb", JsonInt(analysis.providerDeltaKb))
+                row.put("correctionDeltaKb", JsonInt(analysis.correctionDeltaKb))
+                row.put("persistDeltaKb", JsonInt(analysis.persistDeltaKb))
+                row.put("releaseDeltaKb", JsonInt(analysis.releaseDeltaKb))
+                row.put("settledFloorKb", JsonInt(analysis.settledFloorKb))
+                File.writeTo(dir.join("${label}.json"), row.toJsonString().toArray())
+            }
+        case None => ()
+    }
+}
+
+private func agentBridgeWaitForS4ExternalSampler(): Unit {
+    match (getVariable("METIS_MEMORY_S4_SAMPLER_READY")) {
+        case Some(raw) =>
+            let normalized = raw.trimAscii()
+            if (!normalized.isEmpty()) {
+                let marker = Path(normalized)
+                let deadline = DateTime.now().toUnixTimeStamp().toMilliseconds() + 5000
+                while (!exists(marker) && DateTime.now().toUnixTimeStamp().toMilliseconds() < deadline) {
+                    sleep(Duration.millisecond * 20)
+                }
+                @Expect(exists(marker), true)
+            }
+        case None => ()
+    }
+}
+
+private func agentBridgeRunS4HundredTurnExperiment(
+    home: Path,
+    label: String,
+    extraSystemPrompt: String,
+    sameSession: Bool,
+    externalRssOnly!: Bool = false
+): GatewayMemoryAnalysisForTest {
+    let modelName = "metis-test-${label}-${DateTime.now().toUnixTimeStamp().toNanoseconds()}"
+    ModelManager.registerChatModel(modelName, { => AgentBridgePhase1FallbackModel() })
+    writeAgentBridgePhase1FallbackAgentConfig(home, modelName, [], appServer: false)
+    withAgentBridgeRuntimeLogCapture(home, label, { logPath: String =>
+        resetGatewayMemoryObservationForTest()
+        setGatewayProcessRssProviderForTest(if (externalRssOnly) {
+            Some<() -> Int64>({ => 4096 })
+        } else {
+            None<() -> Int64>
+        })
+        agentBridgeMemorySeparateFrameworkLog(home)
+        try {
+            let bridge = AgentBridge(sessionStore: GatewaySessionStore(home.join("sessions"), enabled: true, agentId: "phase1"))
+            for (i in 1..=100) {
+                let context = gatewayResolveSessionContext(GatewaySessionRequest(
+                    GatewayIngressSource.DashboardRpc,
+                    sessionHint: if (sameSession) { "${label}-shared" } else { "${label}-${i}" },
+                    agentId: "phase1"
+                ))
+                let outcome = bridge.replyWithOutcome(
+                    context.sessionKey,
+                    "fixed-input-${i}",
+                    channelName: "gitcode",
+                    agentId: "phase1",
+                    extraSystemPrompt: extraSystemPrompt,
+                    turnContext: Some(context.turnContext)
+                )
+                @Expect(outcome.status, "valid_text")
+                @Expect(outcome.modelAttempts, 1)
+                let _ = gatewayLogServicePluginTurnReleased(
+                    outcome.memoryTurnSequence,
+                    outcome.memorySampled,
+                    outcome.memoryBaselineRssKb,
+                    gatewayLogIdentityHash(context.sessionKey),
+                    meta: gatewayLogMeta().int("dispatchActive", 0).int("dispatchQueued", 0).object()
+                )
+            }
+            let analysis = gatewayMemoryAnalyzeRowsForTest(agentBridgeMemoryRows(logPath))
+            agentBridgeWriteS4Evidence(label, analysis)
+            analysis
+        } finally {
+            resetGatewayMemoryObservationForTest()
+        }
+    })
+}
+
+private func agentBridgeLogS4Released(outcome: GatewayAgentReplyOutcome, sessionKey: String): Unit {
+    let _ = gatewayLogServicePluginTurnReleased(
+        outcome.memoryTurnSequence,
+        outcome.memorySampled,
+        outcome.memoryBaselineRssKb,
+        gatewayLogIdentityHash(sessionKey),
+        meta: gatewayLogMeta().int("dispatchActive", 0).int("dispatchQueued", 0).object()
+    )
+}
+
+private func agentBridgeRunS4ConcurrencyExperiment(
+    home: Path,
+    label: String,
+    parallel: Bool
+): (GatewayMemoryAnalysisForTest, Int64) {
+    let overlap = AgentBridgeS4RssOverlapProbe()
+    let serialRss = AgentBridgeMemoryRssProbe()
+    let modelName = "metis-test-${label}-${DateTime.now().toUnixTimeStamp().toNanoseconds()}"
+    ModelManager.registerChatModel(modelName, { => AgentBridgePhase1FallbackModel() })
+    writeAgentBridgePhase1FallbackAgentConfig(home, modelName, [], appServer: false)
+    let captureHome = home.join(label)
+    Directory.create(captureHome, recursive: true)
+    let analysis = withAgentBridgeRuntimeLogCapture(captureHome, label, { logPath: String =>
+        resetGatewayMemoryObservationForTest()
+        setGatewayProcessRssProviderForTest(if (parallel) {
+            Some<() -> Int64>({ => overlap.next() })
+        } else {
+            Some<() -> Int64>({ => serialRss.next() })
+        })
+        agentBridgeMemorySeparateFrameworkLog(captureHome)
+        try {
+            if (parallel) {
+                let firstBridge = AgentBridge(sessionStore: GatewaySessionStore(home.join("sessions-a"), enabled: true, agentId: "phase1"))
+                let secondBridge = AgentBridge(sessionStore: GatewaySessionStore(home.join("sessions-b"), enabled: true, agentId: "phase1"))
+                for (i in 1..=10) {
+                    let firstContext = gatewayResolveSessionContext(GatewaySessionRequest(
+                        GatewayIngressSource.DashboardRpc, sessionHint: "${label}-a-${i}", agentId: "phase1"
+                    ))
+                    let secondContext = gatewayResolveSessionContext(GatewaySessionRequest(
+                        GatewayIngressSource.DashboardRpc, sessionHint: "${label}-b-${i}", agentId: "phase1"
+                    ))
+                    let first = spawn {
+                        firstBridge.replyWithOutcome(
+                            firstContext.sessionKey, "parallel-a-${i}", channelName: "gitcode", agentId: "phase1",
+                            turnContext: Some(firstContext.turnContext)
+                        )
+                    }
+                    let second = spawn {
+                        secondBridge.replyWithOutcome(
+                            secondContext.sessionKey, "parallel-b-${i}", channelName: "gitcode", agentId: "phase1",
+                            turnContext: Some(secondContext.turnContext)
+                        )
+                    }
+                    if (i == 1) {
+                        @Expect(overlap.awaitEntered(2, 5000), true)
+                        overlap.release()
+                    }
+                    let firstOutcome = first.get(Duration.second * 10)
+                    let secondOutcome = second.get(Duration.second * 10)
+                    agentBridgeLogS4Released(firstOutcome, firstContext.sessionKey)
+                    agentBridgeLogS4Released(secondOutcome, secondContext.sessionKey)
+                }
+            } else {
+                let bridge = AgentBridge(sessionStore: GatewaySessionStore(home.join("sessions-serial"), enabled: true, agentId: "phase1"))
+                for (i in 1..=20) {
+                    let context = gatewayResolveSessionContext(GatewaySessionRequest(
+                        GatewayIngressSource.DashboardRpc, sessionHint: "${label}-${i}", agentId: "phase1"
+                    ))
+                    let outcome = bridge.replyWithOutcome(
+                        context.sessionKey, "serial-${i}", channelName: "gitcode", agentId: "phase1",
+                        turnContext: Some(context.turnContext)
+                    )
+                    agentBridgeLogS4Released(outcome, context.sessionKey)
+                }
+            }
+            let result = gatewayMemoryAnalyzeRowsForTest(agentBridgeMemoryRows(logPath))
+            agentBridgeWriteS4Evidence(label, result)
+            result
+        } finally {
+            overlap.release()
+            resetGatewayMemoryObservationForTest()
+        }
+    })
+    (analysis, if (parallel) { overlap.peak() } else { 1 })
 }
 
 private func agentBridgeC0ClassifyRawResult(text: String): String {
@@ -729,6 +959,64 @@ public class AgentBridgeRuntimeTest {
                     resetGatewayMemoryObservationForTest()
                 }
             })
+        })
+    }
+
+    @TestCase
+    public func s4P1R1HundredUniqueSessionsWithSmallPromptProduceCompleteEvidence(): Unit {
+        withAgentBridgeTempHome("metis-memory-s4-r1", { home: Path =>
+            let analysis = agentBridgeRunS4HundredTurnExperiment(home, "r1-unique-small", "", false)
+            @Expect(analysis.status, "complete")
+            @Expect(analysis.sampledTurns, 23)
+            @Expect(analysis.settledFloorKb >= 0, true)
+        })
+    }
+
+    @TestCase
+    public func s4P1R2HundredUniqueSessionsWithLargePromptProduceCompleteEvidence(): Unit {
+        withAgentBridgeTempHome("metis-memory-s4-r2", { home: Path =>
+            let analysis = agentBridgeRunS4HundredTurnExperiment(home, "r2-unique-large", "系" * 35900, false)
+            @Expect(analysis.status, "complete")
+            @Expect(analysis.sampledTurns, 23)
+            @Expect(analysis.settledFloorKb >= 0, true)
+        })
+    }
+
+    @TestCase
+    public func s4P1R3HundredTurnsInOneSessionProduceCompleteEvidence(): Unit {
+        withAgentBridgeTempHome("metis-memory-s4-r3", { home: Path =>
+            let analysis = agentBridgeRunS4HundredTurnExperiment(home, "r3-shared-small", "", true)
+            @Expect(analysis.status, "complete")
+            @Expect(analysis.sampledTurns, 23)
+            @Expect(analysis.settledFloorKb >= 0, true)
+        })
+    }
+
+    @TestCase
+    public func s4P1R5SyntheticInternalRssAllowsIndependentExternalSampling(): Unit {
+        withAgentBridgeTempHome("metis-memory-s4-r5", { home: Path =>
+            agentBridgeWaitForS4ExternalSampler()
+            let analysis = agentBridgeRunS4HundredTurnExperiment(
+                home, "r5-external-small", "", false, externalRssOnly: true
+            )
+            @Expect(analysis.status, "complete")
+            @Expect(analysis.sampledTurns, 23)
+            @Expect(analysis.enterRssSlopeKbPerTurn, 0)
+            @Expect(analysis.settledFloorKb, 4096)
+        })
+    }
+
+    @TestCase
+    public func s4P1R4TwoActiveTurnsExposeOverlapWithoutChangingCompletionTruth(): Unit {
+        withAgentBridgeTempHome("metis-memory-s4-r4", { home: Path =>
+            let serial = agentBridgeRunS4ConcurrencyExperiment(home, "r4-serial", false)
+            let parallel = agentBridgeRunS4ConcurrencyExperiment(home, "r4-parallel", true)
+            @Expect(serial[0].status, "complete")
+            @Expect(parallel[0].status, "complete")
+            @Expect(serial[0].sampledTurns, 7)
+            @Expect(parallel[0].sampledTurns, 7)
+            @Expect(serial[1], 1)
+            @Expect(parallel[1], 2)
         })
     }
 

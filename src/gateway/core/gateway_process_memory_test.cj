@@ -3,7 +3,7 @@ package metis.gateway.core
 import metis.core.config.{CliConfig, CliSettingManager}
 import metis.gateway.logging.gatewayLoggingResetForTest
 
-import std.collection.{ArrayList, HashSet}
+import std.collection.{ArrayList, HashMap, HashSet}
 import std.env.{getVariable, setVariable}
 import std.fs.{Directory, File, Path, exists, remove}
 import std.sync.Mutex
@@ -48,6 +48,193 @@ private class GatewayMemoryFailingRssProbe {
     public func calls(): Int64 {
         synchronized(this.lock) { this.callCount }
     }
+}
+
+public class GatewayMemoryAnalysisForTest {
+    public let status: String
+    public let sampledTurns: Int64
+    public let enterRssSlopeKbPerTurn: Int64
+    public let lateEnterRssSlopeKbPerTurn: Int64
+    public let providerDeltaKb: Int64
+    public let correctionDeltaKb: Int64
+    public let persistDeltaKb: Int64
+    public let releaseDeltaKb: Int64
+    public let settledFloorKb: Int64
+
+    public init(
+        status: String,
+        sampledTurns: Int64,
+        enterRssSlopeKbPerTurn: Int64,
+        lateEnterRssSlopeKbPerTurn: Int64,
+        providerDeltaKb: Int64,
+        correctionDeltaKb: Int64,
+        persistDeltaKb: Int64,
+        releaseDeltaKb: Int64,
+        settledFloorKb: Int64
+    ) {
+        this.status = status
+        this.sampledTurns = sampledTurns
+        this.enterRssSlopeKbPerTurn = enterRssSlopeKbPerTurn
+        this.lateEnterRssSlopeKbPerTurn = lateEnterRssSlopeKbPerTurn
+        this.providerDeltaKb = providerDeltaKb
+        this.correctionDeltaKb = correctionDeltaKb
+        this.persistDeltaKb = persistDeltaKb
+        this.releaseDeltaKb = releaseDeltaKb
+        this.settledFloorKb = settledFloorKb
+    }
+}
+
+public func gatewayMemoryApplyExternalThresholdForTest(
+    samples: Array<JsonObject>,
+    thresholdKb: Int64,
+    formalStop: () -> Bool
+): String {
+    var previousSequence: Int64 = 0
+    for (sample in samples) {
+        try {
+            let sequence = sample.get("sampleSequence").getOrThrow().asInt().getValue()
+            let rssKb = sample.get("rssKb").getOrThrow().asInt().getValue()
+            if (sequence <= previousSequence || rssKb < 0) { return "evidence_incomplete" }
+            previousSequence = sequence
+            if (rssKb >= thresholdKb) {
+                return if (formalStop()) { "formal_stop_completed" } else { "formal_stop_failed" }
+            }
+        } catch (_: Exception) {
+            return "evidence_incomplete"
+        }
+    }
+    "threshold_not_reached"
+}
+
+public func gatewayMemoryHistoricalClassificationForTest(events: Array<String>): String {
+    var oomIndex: Int64 = -1
+    var shutdownIndex: Int64 = -1
+    var brokerFailureIndex: Int64 = -1
+    for (i in 0..events.size) {
+        let event = events[i].trimAscii()
+        if (event == "out_of_memory" && oomIndex < 0) { oomIndex = Int64(i) }
+        if (event == "gateway_shutdown_started" && shutdownIndex < 0) { shutdownIndex = Int64(i) }
+        if (event == "stdio_broker_writer_failed" && brokerFailureIndex < 0) { brokerFailureIndex = Int64(i) }
+    }
+    if (oomIndex < 0 || shutdownIndex < 0 || brokerFailureIndex < 0) { return "evidence_incomplete" }
+    if (oomIndex < shutdownIndex && shutdownIndex < brokerFailureIndex) { return "oom_precedes_cleanup_failure" }
+    "ordering_inconsistent"
+}
+
+private func gatewayMemoryAnalysisKey(sequence: Int64, stage: String): String {
+    "${sequence}:${stage.trimAscii()}"
+}
+
+public func gatewayMemoryAnalyzeRowsForTest(rows: Array<JsonObject>): GatewayMemoryAnalysisForTest {
+    let values = HashMap<String, Int64>()
+    let sequences = HashSet<Int64>()
+    var invalid = false
+    var firstSequence: Int64 = -1
+    var lastSequence: Int64 = -1
+    var firstEnter: Int64 = -1
+    var lastEnter: Int64 = -1
+    var settledFloor: Int64 = -1
+    for (row in rows) {
+        try {
+            let sequence = row.get("turnSequence").getOrThrow().asInt().getValue()
+            let stage = row.get("stage").getOrThrow().asString().getValue()
+            let rss = row.get("rssKb").getOrThrow().asInt().getValue()
+            if (stage == "turn_summary") { continue }
+            if (sequence <= 0 || stage.isEmpty() || rss < 0) {
+                invalid = true
+                continue
+            }
+            values[gatewayMemoryAnalysisKey(sequence, stage)] = rss
+            sequences.add(sequence)
+            if (stage == "turn_enter") {
+                if (firstSequence < 0 || sequence < firstSequence) {
+                    firstSequence = sequence
+                    firstEnter = rss
+                }
+                if (lastSequence < 0 || sequence > lastSequence) {
+                    lastSequence = sequence
+                    lastEnter = rss
+                }
+            }
+            if (stage == "service_plugin_turn_released" && row.get("activeTurns").getOrThrow().asInt().getValue() == 0) {
+                if (sequence >= lastSequence) { settledFloor = rss }
+            }
+        } catch (_: Exception) {
+            invalid = true
+        }
+    }
+    var providerTotal: Int64 = 0
+    var correctionTotal: Int64 = 0
+    var persistTotal: Int64 = 0
+    var releaseTotal: Int64 = 0
+    var completeTurns: Int64 = 0
+    for (sequence in sequences) {
+        let system = values.get(gatewayMemoryAnalysisKey(sequence, "system_prompt_built"))
+        let returned = values.get(gatewayMemoryAnalysisKey(sequence, "model_returned"))
+        let corrected = values.get(gatewayMemoryAnalysisKey(sequence, "final_correction_ready"))
+        let persisted = values.get(gatewayMemoryAnalysisKey(sequence, "session_persisted"))
+        let exited = values.get(gatewayMemoryAnalysisKey(sequence, "turn_exit"))
+        let released = values.get(gatewayMemoryAnalysisKey(sequence, "service_plugin_turn_released"))
+        match ((system, returned, corrected, persisted, exited, released)) {
+            case (Some(a), Some(b), Some(c), Some(d), Some(e), Some(f)) =>
+                providerTotal += b - a
+                correctionTotal += c - b
+                persistTotal += d - c
+                releaseTotal += f - e
+                completeTurns++
+            case _ => invalid = true
+        }
+    }
+    if (invalid || completeTurns == 0 || firstSequence <= 0 || lastSequence <= firstSequence || settledFloor < 0) {
+        return GatewayMemoryAnalysisForTest("evidence_incomplete", completeTurns, -1, -1, -1, -1, -1, -1, settledFloor)
+    }
+    let midpoint = firstSequence + (lastSequence - firstSequence) / 2
+    var lateFirstSequence: Int64 = -1
+    var lateLastSequence: Int64 = -1
+    var lateFirstEnter: Int64 = -1
+    var lateLastEnter: Int64 = -1
+    for (sequence in sequences) {
+        if (sequence < midpoint) { continue }
+        match (values.get(gatewayMemoryAnalysisKey(sequence, "turn_enter"))) {
+            case Some(rss) =>
+                if (lateFirstSequence < 0 || sequence < lateFirstSequence) {
+                    lateFirstSequence = sequence
+                    lateFirstEnter = rss
+                }
+                if (lateLastSequence < 0 || sequence > lateLastSequence) {
+                    lateLastSequence = sequence
+                    lateLastEnter = rss
+                }
+            case None => ()
+        }
+    }
+    let fullSlope = (lastEnter - firstEnter) / (lastSequence - firstSequence)
+    let lateSlope = if (lateFirstSequence >= 0 && lateLastSequence > lateFirstSequence) {
+        (lateLastEnter - lateFirstEnter) / (lateLastSequence - lateFirstSequence)
+    } else {
+        fullSlope
+    }
+    GatewayMemoryAnalysisForTest(
+        "complete",
+        completeTurns,
+        fullSlope,
+        lateSlope,
+        providerTotal / completeTurns,
+        correctionTotal / completeTurns,
+        persistTotal / completeTurns,
+        releaseTotal / completeTurns,
+        settledFloor
+    )
+}
+
+private func gatewayMemorySyntheticRow(sequence: Int64, stage: String, rssKb: Int64, activeTurns!: Int64 = 1): JsonObject {
+    gatewayLogMeta()
+        .string("event", "process.memory")
+        .int("turnSequence", sequence)
+        .string("stage", stage)
+        .int("rssKb", rssKb)
+        .int("activeTurns", activeTurns)
+        .object()
 }
 
 private func gatewayMemoryTestRestoreEnv(name: String, oldValue: Option<String>): Unit {
@@ -440,5 +627,101 @@ public class GatewayProcessMemoryTest {
         } finally {
             gatewayMemoryTestCleanup(home, oldHome, oldFile, oldLevel, oldConsoleLevel)
         }
+    }
+
+    @TestCase
+    public func s4U1SyntheticRowsProduceExactStageDeltasAndSlope(): Unit {
+        let rows = ArrayList<JsonObject>()
+        for (row in [
+            gatewayMemorySyntheticRow(1, "turn_enter", 100),
+            gatewayMemorySyntheticRow(1, "system_prompt_built", 120),
+            gatewayMemorySyntheticRow(1, "model_returned", 150),
+            gatewayMemorySyntheticRow(1, "final_correction_ready", 160),
+            gatewayMemorySyntheticRow(1, "session_persisted", 170),
+            gatewayMemorySyntheticRow(1, "turn_exit", 175, activeTurns: 1),
+            gatewayMemorySyntheticRow(1, "service_plugin_turn_released", 180, activeTurns: 0),
+            gatewayMemorySyntheticRow(2, "turn_enter", 110),
+            gatewayMemorySyntheticRow(2, "system_prompt_built", 130),
+            gatewayMemorySyntheticRow(2, "model_returned", 160),
+            gatewayMemorySyntheticRow(2, "final_correction_ready", 170),
+            gatewayMemorySyntheticRow(2, "session_persisted", 185),
+            gatewayMemorySyntheticRow(2, "turn_exit", 190, activeTurns: 1),
+            gatewayMemorySyntheticRow(2, "service_plugin_turn_released", 200, activeTurns: 0)
+        ]) { rows.add(row) }
+        let analysis = gatewayMemoryAnalyzeRowsForTest(rows.toArray())
+        @Expect(analysis.status, "complete")
+        @Expect(analysis.sampledTurns, 2)
+        @Expect(analysis.enterRssSlopeKbPerTurn, 10)
+        @Expect(analysis.lateEnterRssSlopeKbPerTurn, 10)
+        @Expect(analysis.providerDeltaKb, 30)
+        @Expect(analysis.correctionDeltaKb, 10)
+        @Expect(analysis.persistDeltaKb, 12)
+        @Expect(analysis.releaseDeltaKb, 7)
+        @Expect(analysis.settledFloorKb, 200)
+    }
+
+    @TestCase
+    public func s4N1MissingStageAndInvalidRssDowngradeToIncompleteEvidence(): Unit {
+        let missingRelease = [
+            gatewayMemorySyntheticRow(1, "turn_enter", 100),
+            gatewayMemorySyntheticRow(1, "system_prompt_built", 120),
+            gatewayMemorySyntheticRow(1, "model_returned", 150),
+            gatewayMemorySyntheticRow(1, "final_correction_ready", 160),
+            gatewayMemorySyntheticRow(1, "session_persisted", 170),
+            gatewayMemorySyntheticRow(1, "turn_exit", 175)
+        ]
+        let missing = gatewayMemoryAnalyzeRowsForTest(missingRelease)
+        @Expect(missing.status, "evidence_incomplete")
+        @Expect(missing.enterRssSlopeKbPerTurn, -1)
+        @Expect(missing.lateEnterRssSlopeKbPerTurn, -1)
+
+        let invalidRss = [
+            gatewayMemorySyntheticRow(1, "turn_enter", -1),
+            gatewayMemorySyntheticRow(1, "service_plugin_turn_released", -1, activeTurns: 0)
+        ]
+        let invalid = gatewayMemoryAnalyzeRowsForTest(invalidRss)
+        @Expect(invalid.status, "evidence_incomplete")
+        @Expect(invalid.providerDeltaKb, -1)
+        @Expect(invalid.settledFloorKb, -1)
+    }
+
+    @TestCase
+    public func s4B1ExternalSamplerThresholdRequestsFormalStopExactlyOnce(): Unit {
+        let samples = [
+            gatewayLogMeta().int("sampleSequence", 1).int("rssKb", 120000).object(),
+            gatewayLogMeta().int("sampleSequence", 2).int("rssKb", 180000).object(),
+            gatewayLogMeta().int("sampleSequence", 3).int("rssKb", 260000).object()
+        ]
+        let stopCalls = ArrayList<Bool>()
+        let result = gatewayMemoryApplyExternalThresholdForTest(samples, 200000, { =>
+            stopCalls.add(true)
+            true
+        })
+        @Expect(result, "formal_stop_completed")
+        @Expect(stopCalls.size, 1)
+
+        let interrupted = gatewayMemoryApplyExternalThresholdForTest([
+            gatewayLogMeta().int("sampleSequence", 1).int("rssKb", 100000).object(),
+            gatewayLogMeta().int("sampleSequence", 1).int("rssKb", 110000).object()
+        ], 200000, { => true })
+        @Expect(interrupted, "evidence_incomplete")
+    }
+
+    @TestCase
+    public func hS401OomPrecedesShutdownAndBrokerWriterFailure(): Unit {
+        @Expect(gatewayMemoryHistoricalClassificationForTest([
+            "out_of_memory",
+            "gateway_shutdown_started",
+            "stdio_broker_writer_failed"
+        ]), "oom_precedes_cleanup_failure")
+        @Expect(gatewayMemoryHistoricalClassificationForTest([
+            "gateway_shutdown_started",
+            "stdio_broker_writer_failed"
+        ]), "evidence_incomplete")
+        @Expect(gatewayMemoryHistoricalClassificationForTest([
+            "stdio_broker_writer_failed",
+            "out_of_memory",
+            "gateway_shutdown_started"
+        ]), "ordering_inconsistent")
     }
 }
