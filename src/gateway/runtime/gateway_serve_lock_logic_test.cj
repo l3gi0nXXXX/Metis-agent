@@ -2068,7 +2068,8 @@ public class GatewayServeLockLogicTest {
                 @Expect(gatewayServeStopWaitUntil(15000, { =>
                     gatewayS5EventCount(stableDependencies.eventsPath, "telegram_send", deliveryId) == 1 &&
                         gatewayS5EventCount(stableDependencies.eventsPath, "model_response") == 1 &&
-                        gatewayS5FileContains(statePath, eventId)
+                        gatewayS5FileContains(statePath, eventId) &&
+                        gatewayS5FileContains(queuePath.join("processed").join("${deliveryId}.json"), deliveryId)
                 }), true)
                 @Expect(gatewayS5EventCount(dependencies.getOrThrow().eventsPath, "telegram_send", deliveryId), 1)
                 @Expect(gatewayS5EventCount(dependencies.getOrThrow().eventsPath, "model_response"), 1)
