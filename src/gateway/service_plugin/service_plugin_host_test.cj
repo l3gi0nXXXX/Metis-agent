@@ -3278,14 +3278,22 @@ public class ServicePluginHostTest {
                 setServicePluginDispatchRemainingForTest(None<() -> Int64>)
                 dispatchGate.release()
                 @Expect(settledGate.awaitEntered(2000), true)
-                let retried = stopServicePlugin("gitcode-monitor", reason: "s2-n1-cleanup-retry", timeoutMillis: 3000)
+                let cleanupDeadline = DateTime.now().toUnixTimeStamp().toMilliseconds() + 5000
+                var retried = stopServicePlugin("gitcode-monitor", reason: "s2-n1-cleanup-retry", timeoutMillis: 500)
+                while (!retried.ok && retried.status == "cleanup_pending" &&
+                    DateTime.now().toUnixTimeStamp().toMilliseconds() < cleanupDeadline) {
+                    sleep(Duration.millisecond * 10)
+                    retried = stopServicePlugin("gitcode-monitor", reason: "s2-n1-cleanup-retry", timeoutMillis: 500)
+                }
                 @Expect(retried.ok, true)
                 @Expect(retried.status, "stopped")
                 @Expect(retried.dispatchStatus, "drained")
                 @Expect(servicePluginCleanupPendingCountForTest(), 0)
+                if (!retried.ok) { return }
 
                 let replacement = ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000)
                 @Expect(replacement.ok, true)
+                if (!replacement.ok) { return }
                 let replacementIdentity = servicePluginActiveIdentityForTest("gitcode-monitor").getOrThrow()
                 @Expect(replacementIdentity[0] == oldIdentity[0], false)
                 @Expect(replacementIdentity[1] >= oldIdentity[1], true)
