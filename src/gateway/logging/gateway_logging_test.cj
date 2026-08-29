@@ -6,7 +6,7 @@ import metis.core.{MediaDiagnosticEvent, emitGatewayMediaDiagnostic, mediaDiagno
 import metis.core.config.{CliConfig, CliSettingManager}
 
 import std.env.{getVariable, setVariable}
-import std.fs.{Directory, File, Path, exists}
+import std.fs.{Directory, File, Path, exists, remove}
 import std.regex.Regex
 import std.time.DateTime
 import std.unittest.testmacro.*
@@ -413,6 +413,64 @@ public class GatewayLoggingTest {
             CliConfig.invalidatePathCache()
             CliSettingManager.invalidate()
             gatewayLoggingResetForTest()
+        }
+    }
+
+    @TestCase
+    public func s0P1FileOnlyDebugAndInfoKeepJsonlWithoutConsoleOutput(): Unit {
+        let oldHome = getVariable("METIS_HOME")
+        let oldFile = getVariable("METIS_LOG_FILE")
+        let oldConsoleLevel = getVariable("METIS_CONSOLE_LEVEL")
+        let oldLevel = getVariable("METIS_LOG_LEVEL")
+        let home = loggingTestHome("memory-file-only")
+        let file = home.join("logs").join("memory.log").toString()
+        try {
+            loggingTestReset(home)
+            setVariable("METIS_LOG_FILE", file)
+            setVariable("METIS_LOG_LEVEL", "debug")
+            setVariable("METIS_CONSOLE_LEVEL", "debug")
+            gatewayLoggingResetForTest()
+            gatewayLoggingCaptureConsoleForTest()
+            let logger = metisCreateSubsystemLogger("gateway/model")
+            let debugMeta = JsonObject()
+            debugMeta.put("stage", JsonString("turn_enter"))
+            debugMeta.put("rssKb", JsonInt(1000))
+            logger.debugFileOnly(MetisLogEvent.processMemory, "gateway model memory stage", meta: debugMeta)
+            let infoMeta = JsonObject()
+            infoMeta.put("stage", JsonString("turn_summary"))
+            infoMeta.put("durationMs", JsonInt(8))
+            logger.infoFileOnly(MetisLogEvent.processMemory, "gateway model memory summary", meta: infoMeta)
+
+            @Expect(gatewayLoggingCapturedConsoleForTest().size, 0)
+            let raw = try {
+                String.fromUtf8(File.readFrom(Path(file)))
+            } catch (_: Exception) {
+                ""
+            }
+            let lines = raw.trimAscii().split("\n")
+            @Expect(lines.size, 2)
+            for (line in lines) {
+                let row = JsonValue.fromStr(line).asObject()
+                @Expect(row.get("time").isSome(), true)
+                @Expect(row.get("level").isSome(), true)
+                @Expect(row.get("subsystem").getOrThrow().asString().getValue(), "gateway/model")
+                @Expect(row.get("event").getOrThrow().asString().getValue(), MetisLogEvent.processMemory)
+                @Expect(row.get("message").isSome(), true)
+                @Expect(row.get("stage").isSome(), true)
+                @Expect(row.get("fields").isNone(), true)
+            }
+            @Expect(JsonValue.fromStr(lines[0]).asObject().get("level").getOrThrow().asString().getValue(), "debug")
+            @Expect(JsonValue.fromStr(lines[1]).asObject().get("level").getOrThrow().asString().getValue(), "info")
+            @Expect(gatewayLogEventIsKnown(MetisLogEvent.processMemory), true)
+        } finally {
+            loggingTestRestoreEnv("METIS_HOME", oldHome)
+            loggingTestRestoreEnv("METIS_LOG_FILE", oldFile)
+            loggingTestRestoreEnv("METIS_CONSOLE_LEVEL", oldConsoleLevel)
+            loggingTestRestoreEnv("METIS_LOG_LEVEL", oldLevel)
+            CliConfig.invalidatePathCache()
+            CliSettingManager.invalidate()
+            gatewayLoggingResetForTest()
+            try { remove(home, recursive: true) } catch (_: Exception) { () }
         }
     }
 

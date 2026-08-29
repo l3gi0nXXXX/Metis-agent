@@ -487,8 +487,16 @@ public class MetisSubsystemLogger {
         this.log("debug", event, message, meta: meta, consoleMessage: consoleMessage)
     }
 
+    public func debugFileOnly(event: String, message: String, meta!: JsonObject = JsonObject()): Unit {
+        this.log("debug", event, message, meta: meta, writeConsole: false)
+    }
+
     public func info(event: String, message: String, meta!: JsonObject = JsonObject(), consoleMessage!: String = ""): Unit {
         this.log("info", event, message, meta: meta, consoleMessage: consoleMessage)
+    }
+
+    public func infoFileOnly(event: String, message: String, meta!: JsonObject = JsonObject()): Unit {
+        this.log("info", event, message, meta: meta, writeConsole: false)
     }
 
     public func warn(event: String, message: String, meta!: JsonObject = JsonObject(), consoleMessage!: String = ""): Unit {
@@ -517,7 +525,8 @@ public class MetisSubsystemLogger {
         message: String,
         meta!: JsonObject = JsonObject(),
         consoleMessage!: String = "",
-        raw!: Bool = false
+        raw!: Bool = false,
+        writeConsole!: Bool = true
     ): Unit {
         let settings = gatewayLoggingResolveSettings()
         let safeMessage = gatewayLogSanitizeString(message, LOG_MESSAGE_LIMIT)
@@ -530,7 +539,7 @@ public class MetisSubsystemLogger {
         if (gatewayLoggingLevelEnabled(level, settings.level)) {
             this.writeFile(settings, level, event, safeMessage, safeMeta)
         }
-        if (gatewayLoggingLevelEnabled(level, settings.consoleLevel)) {
+        if (writeConsole && gatewayLoggingLevelEnabled(level, settings.consoleLevel)) {
             this.writeConsole(settings, level, event, safeConsoleMessage, safeMeta, raw: raw)
         }
     }
