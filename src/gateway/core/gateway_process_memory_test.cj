@@ -3,9 +3,9 @@ package metis.gateway.core
 import metis.core.config.{CliConfig, CliSettingManager}
 import metis.gateway.logging.gatewayLoggingResetForTest
 
-import std.collection.ArrayList
+import std.collection.{ArrayList, HashSet}
 import std.env.{getVariable, setVariable}
-import std.fs.{Directory, File, Path, remove}
+import std.fs.{Directory, File, Path, exists, remove}
 import std.sync.Mutex
 import std.time.DateTime
 import std.unittest.testmacro.*
@@ -304,6 +304,139 @@ public class GatewayProcessMemoryTest {
                 @Expect(row.get("turnSequence").getOrThrow().asInt().getValue() == 4, false)
             }
             let _ = gatewayFinishMemoryObservation(observation)
+        } finally {
+            gatewayMemoryTestCleanup(home, oldHome, oldFile, oldLevel, oldConsoleLevel)
+        }
+    }
+
+    @TestCase
+    public func s3U1HundredFakeTurnsKeepSamplingAndLogVolumeBounded(): Unit {
+        let oldHome = getVariable("METIS_HOME")
+        let oldFile = getVariable("METIS_LOG_FILE")
+        let oldLevel = getVariable("METIS_LOG_LEVEL")
+        let oldConsoleLevel = getVariable("METIS_CONSOLE_LEVEL")
+        let home = gatewayMemoryTestHome("s3-u1")
+        let file = home.join("memory.log")
+        let probe = GatewayMemoryRssProbe([4096])
+        try {
+            gatewayMemoryTestSetup(home, file)
+            setGatewayProcessRssProviderForTest(Some({ => probe.next() }))
+            for (i in 1..=100) {
+                let observation = gatewayBeginMemoryObservation("session-hash-${i}", channel: "gitcode", model: "fake")
+                let _ = gatewayObserveMemoryStage(observation, "turn_enter")
+                let _ = gatewayObserveMemoryStage(observation, "history_loaded")
+                let _ = gatewayObserveMemoryStage(observation, "model_input_built")
+                let _ = gatewayObserveMemoryStage(observation, "system_prompt_built")
+                let _ = gatewayObserveMemoryStage(observation, "model_returned")
+                let _ = gatewayObserveMemoryStage(observation, "final_correction_ready")
+                let _ = gatewayObserveMemoryStage(observation, "session_persisted")
+                let baseline = observation.memorySnapshot()[0]
+                let _ = gatewayFinishMemoryObservation(observation)
+                let _ = gatewayLogServicePluginTurnReleased(
+                    observation.turnSequence,
+                    observation.sampled,
+                    baseline,
+                    observation.sessionHash,
+                    meta: gatewayLogMeta().int("dispatchActive", 0).int("dispatchQueued", 0).object()
+                )
+            }
+            let rows = gatewayMemoryTestRows(file)
+            var debugRows: Int64 = 0
+            var infoRows: Int64 = 0
+            let sampledSequences = HashSet<Int64>()
+            for (row in rows) {
+                if (row.get("level").getOrThrow().asString().getValue() == "debug") {
+                    debugRows += 1
+                } else if (row.get("level").getOrThrow().asString().getValue() == "info") {
+                    infoRows += 1
+                }
+                sampledSequences.add(row.get("turnSequence").getOrThrow().asInt().getValue())
+            }
+            @Expect(sampledSequences.size, 23)
+            @Expect(debugRows, 23 * 9)
+            @Expect(infoRows, 23)
+            @Expect(rows.size, 23 * 10)
+            @Expect(probe.calls(), 207)
+            let counters = gatewayMemoryObservationCountersForTest()
+            @Expect(counters[0], 100)
+            @Expect(counters[1], 0)
+            @Expect(counters[2], 100)
+        } finally {
+            gatewayMemoryTestCleanup(home, oldHome, oldFile, oldLevel, oldConsoleLevel)
+        }
+    }
+
+    @TestCase
+    public func s3B1OverlappingTurnsRemainCorrelatedWhenCompletionIsReversed(): Unit {
+        let oldHome = getVariable("METIS_HOME")
+        let oldFile = getVariable("METIS_LOG_FILE")
+        let oldLevel = getVariable("METIS_LOG_LEVEL")
+        let oldConsoleLevel = getVariable("METIS_CONSOLE_LEVEL")
+        let home = gatewayMemoryTestHome("s3-b1")
+        let file = home.join("memory.log")
+        try {
+            gatewayMemoryTestSetup(home, file)
+            setGatewayProcessRssProviderForTest(Some({ => 8192 }))
+            let first = gatewayBeginMemoryObservation("session-first", channel: "gitcode", model: "stream")
+            let second = gatewayBeginMemoryObservation("session-second", channel: "gitcode", model: "ordinary")
+            let _ = gatewayObserveMemoryStage(first, "turn_enter")
+            let _ = gatewayObserveMemoryStage(second, "turn_enter")
+            let _ = gatewayFinishMemoryObservation(second)
+            let _ = gatewayFinishMemoryObservation(first)
+            var peakActive: Int64 = 0
+            var firstRows: Int64 = 0
+            var secondRows: Int64 = 0
+            for (row in gatewayMemoryTestRows(file)) {
+                let active = row.get("activeTurns").getOrThrow().asInt().getValue()
+                if (active > peakActive) { peakActive = active }
+                let sequence = row.get("turnSequence").getOrThrow().asInt().getValue()
+                let sessionHash = row.get("sessionHash").getOrThrow().asString().getValue()
+                if (sequence == first.turnSequence) {
+                    firstRows += 1
+                    @Expect(sessionHash, "session-first")
+                } else if (sequence == second.turnSequence) {
+                    secondRows += 1
+                    @Expect(sessionHash, "session-second")
+                } else {
+                    @Expect(false, true)
+                }
+            }
+            @Expect(first.turnSequence != second.turnSequence, true)
+            @Expect(peakActive, 2)
+            @Expect(firstRows, 3)
+            @Expect(secondRows, 3)
+            let counters = gatewayMemoryObservationCountersForTest()
+            @Expect(counters[1], 0)
+            @Expect(counters[2], 2)
+        } finally {
+            gatewayMemoryTestCleanup(home, oldHome, oldFile, oldLevel, oldConsoleLevel)
+        }
+    }
+
+    @TestCase
+    public func s3N1LoggerAndRssFailuresDoNotChangeTurnTruth(): Unit {
+        let oldHome = getVariable("METIS_HOME")
+        let oldFile = getVariable("METIS_LOG_FILE")
+        let oldLevel = getVariable("METIS_LOG_LEVEL")
+        let oldConsoleLevel = getVariable("METIS_CONSOLE_LEVEL")
+        let home = gatewayMemoryTestHome("s3-n1")
+        let probe = GatewayMemoryFailingRssProbe()
+        try {
+            gatewayMemoryTestSetup(home, home)
+            setGatewayProcessRssProviderForTest(Some({ => probe.next() }))
+            let observation = gatewayBeginMemoryObservation("safe-session-hash", channel: "gitcode", model: "fake")
+            @Expect(gatewayObserveMemoryStage(
+                observation,
+                "turn_enter",
+                meta: gatewayLogMeta().int("promptChars", 9).object()
+            ), true)
+            @Expect(gatewayFinishMemoryObservation(observation, status: "failed", errorKind: "model_failed"), true)
+            @Expect(probe.calls(), 2)
+            let counters = gatewayMemoryObservationCountersForTest()
+            @Expect(counters[0], 1)
+            @Expect(counters[1], 0)
+            @Expect(counters[2], 1)
+            @Expect(exists(home), true)
         } finally {
             gatewayMemoryTestCleanup(home, oldHome, oldFile, oldLevel, oldConsoleLevel)
         }

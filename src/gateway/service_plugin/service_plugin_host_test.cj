@@ -2822,6 +2822,60 @@ public class ServicePluginHostTest {
     }
 
     @TestCase
+    public func s3MemoryP1HundredUniqueGitCodeEventsDrainExactlyOnce(): Unit {
+        withIsolatedServicePluginHostTestHome("s3-memory-p1-hundred", { home: Path =>
+            let eventIds = this.gitCodeBurstEventIds("s3-memory-p1", 100)
+            let ackMarker = home.join("acks.marker")
+            let writebackMarker = home.join("writebacks.marker")
+            let oldMarker = getVariable("METIS_STDIO_FIXTURE_MARKER_PATH")
+            let oldWriteback = getVariable("METIS_STDIO_FIXTURE_WRITEBACK_MARKER_PATH")
+            let models = ServicePluginEventLedger()
+            let deliveries = ServicePluginEventLedger()
+            setVariable("METIS_STDIO_FIXTURE_MARKER_PATH", ackMarker.toString())
+            setVariable("METIS_STDIO_FIXTURE_WRITEBACK_MARKER_PATH", writebackMarker.toString())
+            try {
+                this.registerGitCodeStdioScript(this.gitCodeAckBurstScript(eventIds))
+                setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent =>
+                    let rows = ArrayList<ServicePluginDeliveryTarget>()
+                    rows.add(ServicePluginDeliveryTarget("telegram", "s3-memory", "peer"))
+                    rows
+                }))
+                setServicePluginWebhookGeneratedReplyHandlerForTest(Some({ event: ServicePluginAcceptedGitCodeEvent, _target: ServicePluginDeliveryTarget =>
+                    models.record(event.eventId)
+                    ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: event.eventId)
+                }))
+                setServicePluginEventDeliveryForTest(Some({ _target: ServicePluginDeliveryTarget, text: String =>
+                    deliveries.recordMatching(text, eventIds)
+                    ServicePluginEventDeliveryResult(true, "sent")
+                }))
+                @Expect(ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000).ok, true)
+                @Expect(deliveries.awaitTotal(100, 15000), true)
+                @Expect(this.waitForAckMarkerCount(ackMarker, "completion", "completed", 100, timeoutMillis: 10000), true)
+                @Expect(this.ackMarkerCounts(ackMarker, "completion", "completed")[1], 0)
+                @Expect(this.waitForDispatchCounts("gitcode-monitor", 0, 0, timeoutMillis: 5000), true)
+                let memory = servicePluginDispatchMemorySnapshot("gitcode-monitor").getOrThrow()
+                @Expect(memory.active, 0)
+                @Expect(memory.queued, 0)
+                @Expect(memory.futures, 0)
+                @Expect(memory.accepted, 0)
+                @Expect(memory.highWater <= 128, true)
+                @Expect(memory.queueFull, 0)
+                for (eventId in eventIds) {
+                    @Expect(models.countFor(eventId), 1)
+                    @Expect(deliveries.countFor(eventId), 1)
+                    @Expect(this.textFileCount(writebackMarker, eventId), 1)
+                }
+            } finally {
+                setServicePluginWebhookSubscribersProviderForTest(None<(ServicePluginAcceptedGitCodeEvent) -> ArrayList<ServicePluginDeliveryTarget>>)
+                setServicePluginWebhookGeneratedReplyHandlerForTest(None<(ServicePluginAcceptedGitCodeEvent, ServicePluginDeliveryTarget) -> ServicePluginGeneratedReplyResult>)
+                setServicePluginEventDeliveryForTest(None)
+                match (oldMarker) { case Some(value) => setVariable("METIS_STDIO_FIXTURE_MARKER_PATH", value) case None => setVariable("METIS_STDIO_FIXTURE_MARKER_PATH", "") }
+                match (oldWriteback) { case Some(value) => setVariable("METIS_STDIO_FIXTURE_WRITEBACK_MARKER_PATH", value) case None => setVariable("METIS_STDIO_FIXTURE_WRITEBACK_MARKER_PATH", "") }
+            }
+        })
+    }
+
+    @TestCase
     public func s1cN1LaunchAndRegisterFailuresRollbackWithoutFutureLeak(): Unit {
         for (phase in ["launch", "register"]) {
             withIsolatedServicePluginHostTestHome("s1c-n1-${phase}", { home: Path =>
