@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 
 import { spawn } from "node:child_process";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { TextDecoder } from "node:util";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -10,6 +12,70 @@ const DEFAULT_MAX_BUFFERED_BYTES = 4 * 1024 * 1024;
 const DEFAULT_TERM_GRACE_MS = 250;
 const DEFAULT_WRITER_QUEUE_BYTES = 8 * 1024 * 1024;
 const DEFAULT_BROKER_INPUT_BYTES = 1024 * 1024;
+const DIAGNOSTIC_IDENTITY_LIMIT = 16;
+const DIAGNOSTIC_FILE_PATTERN = /^broker-g[1-9][0-9]*-p[1-9][0-9]*\.json$/u;
+const DIAGNOSTIC_TEMP_PATTERN = /^broker-g[1-9][0-9]*-p[1-9][0-9]*\.json\.tmp-[1-9][0-9]*$/u;
+const DIAGNOSTIC_SLOT_PATTERN = /^\.identity-slot-(?:[0-9]|1[0-5])$/u;
+
+function diagnosticDirectoryState(path) {
+  let slotCount = 0;
+  let identityCount = 0;
+  try {
+    for (const entry of readdirSync(path, { withFileTypes: true })) {
+      if (entry.isDirectory() && DIAGNOSTIC_SLOT_PATTERN.test(entry.name)) {
+        slotCount += 1;
+        continue;
+      }
+      if (entry.isFile() && DIAGNOSTIC_TEMP_PATTERN.test(entry.name)) continue;
+      if (entry.isFile() && entry.name === 'overflow.json') {
+        const text = new TextDecoder('utf-8', { fatal: true }).decode(readFileSync(join(path, entry.name)));
+        const value = JSON.parse(text);
+        if (value?.protocolVersion === '1.0' && value.overflow === true &&
+            value.capacity === DIAGNOSTIC_IDENTITY_LIMIT) continue;
+        return { unsafe: true, slotCount, identityCount };
+      }
+      if (entry.isFile() && DIAGNOSTIC_FILE_PATTERN.test(entry.name)) {
+        const text = new TextDecoder('utf-8', { fatal: true }).decode(readFileSync(join(path, entry.name)));
+        const value = JSON.parse(text);
+        if (value?.protocolVersion === '1.0' && Number.isSafeInteger(value.generation) && value.generation > 0 &&
+            Number.isSafeInteger(value.brokerPid) && value.brokerPid > 1 &&
+            entry.name === `broker-g${value.generation}-p${value.brokerPid}.json`) {
+          identityCount += 1;
+          continue;
+        }
+      }
+      return { unsafe: true, slotCount, identityCount };
+    }
+    return { unsafe: false, slotCount, identityCount };
+  } catch {
+    return { unsafe: true, slotCount, identityCount };
+  }
+}
+
+function brokerFramePhase(frame) {
+  if (frame?.type === 'broker.closed') return 'broker_closed';
+  if (['owner.exit', 'owner.error', 'owner.timeout'].includes(frame?.type)) return 'owner_terminal';
+  return 'other';
+}
+
+function ownerDiagnosticClass(frame) {
+  if (typeof frame?.ownerId === 'string' && frame.ownerId.startsWith('service-plugin:')) return 'service_plugin';
+  if (frame?.command === '/bin/sh' && Array.isArray(frame.args) && frame.args.length === 2 &&
+      frame.args[0] === '-c' && /^kill -0 [1-9][0-9]*$/u.test(frame.args[1])) return 'pid_probe';
+  if (frame?.command === '/bin/sh' && Array.isArray(frame.args) && frame.args.length === 2 &&
+      frame.args[0] === '-c' && (
+        /^lsof -nP -iTCP:[1-9][0-9]* -sTCP:LISTEN -Fp$/u.test(frame.args[1]) ||
+        /^lsof -nP -iTCP:[1-9][0-9]* -sTCP:LISTEN -t$/u.test(frame.args[1])
+      )) {
+    return 'lsof_probe';
+  }
+  if (frame?.command === 'lsof' && Array.isArray(frame.args) && frame.args.length === 4 &&
+      frame.args[0] === '-nP' && /^-iTCP:[1-9][0-9]*$/u.test(frame.args[1]) &&
+      frame.args[2] === '-sTCP:LISTEN' && (frame.args[3] === '-Fp' || frame.args[3] === '-t')) {
+    return 'lsof_probe';
+  }
+  return 'other';
+}
 
 function integer(value, fallback, { minimum = 0 } = {}) {
   if (value === undefined) return fallback;
@@ -90,28 +156,29 @@ export function terminationCommandsForPlatform(platform, pid, force = false) {
 }
 
 export class BrokerWriter {
-  constructor(output, { maxQueuedBytes = DEFAULT_WRITER_QUEUE_BYTES, onOverflow = () => {} } = {}) {
+  constructor(output, { maxQueuedBytes = DEFAULT_WRITER_QUEUE_BYTES, onFailure = () => {} } = {}) {
     this.output = output;
     this.queue = [];
     this.queuedBytes = 0;
     this.maxQueuedBytes = maxQueuedBytes;
-    this.onOverflow = onOverflow;
+    this.onFailure = onFailure;
     this.writing = false;
     this.pendingWrites = 0;
+    this.inflightPhases = new Map();
     this.closed = false;
     this.idleCallbacks = [];
-    output.once?.('error', () => this.fail());
+    output.once?.('error', () => this.fail('output_error', this.singleInflightPhase()));
   }
 
-  write(frame, onWritten = () => {}) {
+  write(frame, onWritten = () => {}, framePhase = 'other') {
     if (this.closed) return false;
     const encoded = `${JSON.stringify(frame)}\n`;
     const bytes = Buffer.byteLength(encoded);
     if (this.queuedBytes + bytes > this.maxQueuedBytes) {
-      this.fail();
+      this.fail('queue_capacity', framePhase);
       return false;
     }
-    this.queue.push({ encoded, onWritten });
+    this.queue.push({ encoded, onWritten, framePhase });
     this.queuedBytes += bytes;
     this.flush();
     return true;
@@ -125,10 +192,12 @@ export class BrokerWriter {
       this.queuedBytes -= Buffer.byteLength(chunk);
       let accepted = false;
       this.pendingWrites += 1;
+      this.inflightPhases.set(item.framePhase, (this.inflightPhases.get(item.framePhase) ?? 0) + 1);
       try {
         accepted = this.output.write(chunk, (error) => {
           this.pendingWrites = Math.max(0, this.pendingWrites - 1);
-          if (error) this.fail();
+          this.releaseInflightPhase(item.framePhase);
+          if (error) this.fail('callback_error', item.framePhase);
           else {
             item.onWritten();
             this.notifyIdle();
@@ -136,7 +205,8 @@ export class BrokerWriter {
         });
       } catch {
         this.pendingWrites = Math.max(0, this.pendingWrites - 1);
-        this.fail();
+        this.releaseInflightPhase(item.framePhase);
+        this.fail('write_exception', item.framePhase);
         return;
       }
       if (!accepted) {
@@ -162,13 +232,23 @@ export class BrokerWriter {
     for (const callback of callbacks) callback();
   }
 
-  fail() {
+  releaseInflightPhase(phase) {
+    const remaining = (this.inflightPhases.get(phase) ?? 1) - 1;
+    if (remaining <= 0) this.inflightPhases.delete(phase);
+    else this.inflightPhases.set(phase, remaining);
+  }
+
+  singleInflightPhase() {
+    return this.inflightPhases.size === 1 ? [...this.inflightPhases.keys()][0] : 'other';
+  }
+
+  fail(kind, framePhase = 'other') {
     if (this.closed) return;
     this.closed = true;
     this.queue.length = 0;
     this.queuedBytes = 0;
     this.idleCallbacks.length = 0;
-    this.onOverflow();
+    this.onFailure(kind, ['owner_terminal', 'broker_closed', 'other'].includes(framePhase) ? framePhase : 'other');
   }
 
   close() {
@@ -279,32 +359,130 @@ export class StdioBroker {
     treeKillerSpawnFn = spawn, hardLimit = OWNER_HARD_LIMIT, termGraceMs = DEFAULT_TERM_GRACE_MS,
     treeRunner,
     testMode = process.env.METIS_STDIO_BROKER_TEST_MODE === '1',
-    exit = (code) => { setImmediate(() => process.exit(code)); } } = {}) {
+    exit = (code) => process.exit(code),
+    parentPidProvider = () => process.ppid,
+    diagnosticMarkerDirectory = testMode ? process.env.METIS_STDIO_BROKER_DIAGNOSTIC_MARKER ?? '' : '' } = {}) {
     this.generation = generation;
     this.platform = platform;
-    this.writer = new BrokerWriter(output, { onOverflow: () => this.abortForWriterFailure() });
+    this.writer = new BrokerWriter(output, { onFailure: (kind, phase) => this.abortForWriterFailure(kind, phase) });
     this.spawnFn = spawnFn;
     this.treeKillerSpawnFn = treeKillerSpawnFn;
     this.treeRunner = treeRunner;
     this.hardLimit = Math.max(1, Math.min(OWNER_HARD_LIMIT, hardLimit));
     this.termGraceMs = termGraceMs;
     this.exit = exit;
+    this.parentPidProvider = parentPidProvider;
+    this.startParentPid = (() => {
+      try {
+        const value = this.parentPidProvider();
+        return Number.isSafeInteger(value) && value >= 1 ? value : 1;
+      } catch { return 1; }
+    })();
     this.owners = new Map();
     this.closing = false;
+    this.closeFinished = false;
+    this.closeAckCallbackSeen = false;
+    this.closeEntryCount = 0;
+    this.brokerClosedCallbackCount = 0;
+    this.ownerTerminalCount = 0;
+    this.ownerStartCounts = { service_plugin: 0, pid_probe: 0, lsof_probe: 0, other: 0 };
+    this.ownerTerminalCounts = { service_plugin: 0, pid_probe: 0, lsof_probe: 0, other: 0 };
+    this.brokerClosedEnqueuedCount = 0;
+    this.exitScheduledCount = 0;
+    this.lastExitScheduledCode = -1;
+    this.pendingExitCode = -1;
+    this.exitDispatchPending = false;
+    this.exitCommitted = false;
+    this.diagnosticSequence = 0;
+    this.diagnosticEvents = [];
+    this.writerFailureKind = '';
+    this.writerFailurePhase = '';
     this.testMode = testMode;
+    this.diagnosticMarkerDirectory = this.testMode && typeof diagnosticMarkerDirectory === 'string' &&
+      diagnosticMarkerDirectory.length > 0 && diagnosticMarkerDirectory.length <= 4096 &&
+      !/[\0\r\n]/u.test(diagnosticMarkerDirectory) ? diagnosticMarkerDirectory : '';
+    this.diagnosticMarkerPath = this.diagnosticMarkerDirectory ?
+      join(this.diagnosticMarkerDirectory, `broker-g${this.generation}-p${process.pid}.json`) : '';
+    this.diagnosticOverflow = false;
+    this.diagnosticSlotClaimed = false;
+    this.diagnosticEvent('broker_started');
   }
 
   frame(type, fields = {}, onWritten = () => {}) {
-    this.writer.write({ type, generation: this.generation, ...fields }, onWritten);
+    const value = { type, generation: this.generation, ...fields };
+    return this.writer.write(value, onWritten, brokerFramePhase(value));
   }
 
   diagnostic(status, requestId) {
     this.frame('broker.diagnostic', { status, ...(requestId ? { requestId } : {}) });
   }
 
-  abortForWriterFailure() {
+  diagnosticEvent(event) {
+    if (!this.diagnosticMarkerPath) return;
+    this.diagnosticSequence += 1;
+    this.diagnosticEvents.push({ sequence: this.diagnosticSequence, event });
+    if (this.diagnosticEvents.length > 16) this.diagnosticEvents.splice(1, 1);
+    const observedParentPid = (() => {
+      try {
+        const value = this.parentPidProvider();
+        return Number.isSafeInteger(value) && value >= 1 ? value : 1;
+      } catch { return 1; }
+    })();
+    const value = {
+      protocolVersion: '1.0', generation: this.generation, brokerPid: process.pid,
+      startParentPid: this.startParentPid, observedParentPid,
+      sequence: this.diagnosticSequence, events: this.diagnosticEvents,
+      closeEntryCount: this.closeEntryCount,
+      closeEntryOwnerCount: this.closeEntryOwnerCount ?? -1,
+      ownerTerminalCount: this.ownerTerminalCount, closeAckCallbackSeen: this.closeAckCallbackSeen,
+      ownerStartCounts: this.ownerStartCounts, ownerTerminalCounts: this.ownerTerminalCounts,
+      brokerClosedEnqueuedCount: this.brokerClosedEnqueuedCount,
+      brokerClosedCallbackCount: this.brokerClosedCallbackCount,
+      writerFailureKind: this.writerFailureKind, writerFailurePhase: this.writerFailurePhase,
+      exitScheduledCount: this.exitScheduledCount, lastExitScheduledCode: this.lastExitScheduledCode,
+      closing: this.closing, closeFinished: this.closeFinished, ownerCount: this.owners.size,
+    };
+    const temporary = `${this.diagnosticMarkerPath}.tmp-${process.pid}`;
+    try {
+      if (!this.diagnosticSlotClaimed) {
+        const state = diagnosticDirectoryState(this.diagnosticMarkerDirectory);
+        if (state.unsafe || state.slotCount !== state.identityCount ||
+            state.identityCount > DIAGNOSTIC_IDENTITY_LIMIT || existsSync(this.diagnosticMarkerPath)) {
+          this.diagnosticOverflow = true;
+        } else {
+          for (let slot = 0; slot < DIAGNOSTIC_IDENTITY_LIMIT; slot += 1) {
+            try {
+              mkdirSync(join(this.diagnosticMarkerDirectory, `.identity-slot-${slot}`), { mode: 0o700 });
+              this.diagnosticSlotClaimed = true;
+              break;
+            } catch { /* another broker retained this evidence slot */ }
+          }
+          if (!this.diagnosticSlotClaimed) this.diagnosticOverflow = true;
+        }
+      }
+      if (this.diagnosticOverflow) {
+        const overflowPath = join(this.diagnosticMarkerDirectory, 'overflow.json');
+        const overflowTemporary = `${overflowPath}.tmp-${process.pid}`;
+        writeFileSync(overflowTemporary, `${JSON.stringify({
+          protocolVersion: '1.0', overflow: true, capacity: DIAGNOSTIC_IDENTITY_LIMIT,
+          generation: this.generation, brokerPid: process.pid,
+          startParentPid: this.startParentPid, observedParentPid,
+        })}\n`, { mode: 0o600 });
+        renameSync(overflowTemporary, overflowPath);
+        return;
+      }
+      writeFileSync(temporary, `${JSON.stringify(value)}\n`, { mode: 0o600 });
+      renameSync(temporary, this.diagnosticMarkerPath);
+    } catch { /* test-only diagnostics are non-fatal */ }
+  }
+
+  abortForWriterFailure(kind, framePhase = 'other') {
     if (this.writerFailed) return;
     this.writerFailed = true;
+    this.writerFailureKind = ['output_error', 'callback_error', 'queue_capacity', 'write_exception'].includes(kind)
+      ? kind : 'write_exception';
+    this.writerFailurePhase = ['owner_terminal', 'broker_closed', 'other'].includes(framePhase) ? framePhase : 'other';
+    this.diagnosticEvent('writer_failure');
     for (const owner of [...this.owners.values()]) this.signalTree(owner, true);
     try { process.stderr.write('metis stdio broker protocol writer failed\n'); } catch { /* unavailable */ }
     this.waitForAllTreesGoneThenExit(70);
@@ -313,12 +491,31 @@ export class StdioBroker {
   waitForAllTreesGoneThenExit(code, attempt = 0) {
     const live = [...this.owners.values()].filter((owner) => this.treeAlive(owner));
     if (live.length === 0 || attempt >= 160) {
-      this.exit(code);
+      this.scheduleExit(code);
       return;
     }
     for (const owner of live) this.signalTree(owner, true);
     const timer = setTimeout(() => this.waitForAllTreesGoneThenExit(code, attempt + 1), 25);
     timer.unref?.();
+  }
+
+  scheduleExit(code) {
+    if (this.exitCommitted) return;
+    if (this.pendingExitCode < 0 || (this.pendingExitCode === 0 && code !== 0)) {
+      this.pendingExitCode = code;
+    }
+    if (this.exitDispatchPending) return;
+    this.exitDispatchPending = true;
+    setImmediate(() => {
+      if (this.exitCommitted) return;
+      this.exitDispatchPending = false;
+      this.exitCommitted = true;
+      const selected = this.pendingExitCode;
+      this.exitScheduledCount += 1;
+      this.lastExitScheduledCode = selected;
+      this.diagnosticEvent('exit_scheduled');
+      this.exit(selected);
+    });
   }
 
   handle(frame) {
@@ -385,6 +582,7 @@ export class StdioBroker {
         stdinQueuedBytes: 0,
         stdinWriting: false,
         outputBudget: { bytes: 0, max: integer(frame.maxBufferedBytes, DEFAULT_MAX_BUFFERED_BYTES, { minimum: 1 }) },
+        diagnosticClass: ownerDiagnosticClass(frame),
       };
       const makeFramer = (stream) => new StrictStreamFramer({
         mode: frame.outputMode ?? 'line',
@@ -397,6 +595,8 @@ export class StdioBroker {
       owner.stdout = makeFramer('stdout');
       owner.stderr = makeFramer('stderr');
       this.owners.set(owner.id, owner);
+      this.ownerStartCounts[owner.diagnosticClass] += 1;
+      this.diagnosticEvent('owner_started');
       child.stdout.on('data', (chunk) => this.consume(owner, owner.stdout, chunk));
       child.stderr.on('data', (chunk) => this.consume(owner, owner.stderr, chunk));
       child.once('error', () => this.failOwner(owner, 'spawn_failed'));
@@ -582,7 +782,7 @@ export class StdioBroker {
     if (attempt >= 160) {
       // Let the Cangjie client observe broker EOF and perform its independent cached-PGID reap.
       try { process.stderr.write('metis stdio broker owner reap failed\n'); } catch { /* unavailable */ }
-      this.exit(71);
+      this.scheduleExit(71);
       return;
     }
     if (attempt % 10 === 0) this.signalTree(owner, true);
@@ -603,6 +803,9 @@ export class StdioBroker {
     owner.stdinQueue.length = 0;
     owner.stdinQueuedBytes = 0;
     this.owners.delete(owner.id);
+    this.ownerTerminalCount += 1;
+    this.ownerTerminalCounts[owner.diagnosticClass] += 1;
+    this.diagnosticEvent('owner_terminal');
     this.frame(type, { ownerId: owner.id, ...fields });
     if (this.closing && this.owners.size === 0) this.finishClose();
   }
@@ -610,13 +813,24 @@ export class StdioBroker {
   closeBroker() {
     if (this.closing) return;
     this.closing = true;
+    this.closeEntryCount += 1;
+    this.closeEntryOwnerCount = this.owners.size;
+    this.diagnosticEvent('close_entered');
     for (const owner of [...this.owners.values()]) this.terminateOwner(owner, 'broker_closed');
     if (this.owners.size === 0) this.finishClose();
   }
 
   finishClose() {
-    this.frame('broker.closed', { ownerCount: 0 });
-    this.writer.whenDrained(() => this.exit(0));
+    if (this.closeFinished) return;
+    this.closeFinished = true;
+    this.brokerClosedEnqueuedCount += 1;
+    this.diagnosticEvent('broker_closed_enqueued');
+    this.frame('broker.closed', { ownerCount: 0 }, () => {
+      this.closeAckCallbackSeen = true;
+      this.brokerClosedCallbackCount += 1;
+      this.diagnosticEvent('broker_closed_callback');
+      this.writer.whenDrained(() => this.scheduleExit(0));
+    });
   }
 }
 

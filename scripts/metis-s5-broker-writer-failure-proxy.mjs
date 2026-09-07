@@ -9,14 +9,19 @@ const readyPath = process.env.METIS_S5_BROKER_PROXY_READY ?? '';
 const failPath = process.env.METIS_S5_BROKER_PROXY_FAIL ?? '';
 const closedPath = process.env.METIS_S5_BROKER_PROXY_WRITER_CLOSED ?? '';
 const cleanupPath = process.env.METIS_S5_BROKER_PROXY_CLEANUP ?? '';
+const holdEnteredPath = process.env.METIS_S5_BROKER_PROXY_HOLD_ENTERED ?? '';
+const holdReleasePath = process.env.METIS_S5_BROKER_PROXY_HOLD_RELEASE ?? '';
+const holdReleasedPath = process.env.METIS_S5_BROKER_PROXY_HOLD_RELEASED ?? '';
 const dropDeliveryId = process.env.METIS_S5_BROKER_PROXY_DROP_DELIVERY_ID ?? '';
 const admissionSeenPath = process.env.METIS_S5_BROKER_PROXY_ADMISSION_SEEN ?? '';
 const completionDroppedPath = process.env.METIS_S5_BROKER_PROXY_COMPLETION_DROPPED ?? '';
 const expectedGeneration = Number.parseInt(process.env.METIS_STDIO_BROKER_GENERATION ?? '', 10);
 const writerInputs = [failPath, closedPath, cleanupPath];
 const dropInputs = [dropDeliveryId, admissionSeenPath, completionDroppedPath];
+const holdInputs = [holdEnteredPath, holdReleasePath, holdReleasedPath];
 const writerMode = writerInputs.some((value) => value.length > 0);
 const dropMode = dropInputs.some((value) => value.length > 0);
+const holdMode = holdInputs.some((value) => value.length > 0);
 
 function writeAtomic(path, value) {
   if (!path) return;
@@ -35,6 +40,9 @@ if (
   !readyPath ||
   (!writerMode && !dropMode) ||
   (writerMode && !writerInputs.every((value) => value.length > 0)) ||
+  (holdMode && !holdInputs.every((value) => value.length > 0)) ||
+  (writerMode && dropMode) ||
+  (holdMode && (!writerMode || dropMode)) ||
   (dropMode && (!dropInputs.every((value) => value.length > 0) || !Number.isSafeInteger(expectedGeneration) || expectedGeneration <= 0))
 ) {
   invalidContract();
@@ -67,6 +75,11 @@ let markerSequence = 0;
 const outputQueue = [];
 let outputWriting = false;
 let outputEndRequested = false;
+let proxyExitCode = 0;
+let proxyExitCommitted = false;
+let brokerExitObserved = false;
+let holdEntered = false;
+let holdReleased = false;
 const fatalUtf8Decoder = new TextDecoder('utf-8', { fatal: true });
 
 function publishReady() {
@@ -100,8 +113,14 @@ function rememberOwnerStart(frame) {
 }
 
 function finishOutputIfReady() {
-  if (outputEndRequested && !outputWriting && outputQueue.length === 0 && !process.stdout.destroyed) {
-    process.stdout.end();
+  if (outputEndRequested && !outputWriting && outputQueue.length === 0) {
+    const commitExit = () => {
+      if (proxyExitCommitted) return;
+      proxyExitCommitted = true;
+      process.exit(proxyExitCode);
+    };
+    if (process.stdout.destroyed) commitExit();
+    else process.stdout.end(commitExit);
   }
 }
 
@@ -117,6 +136,7 @@ function flushOutput() {
     outputWriting = false;
     if (error) {
       outputQueue.length = 0;
+      finishOutputIfReady();
       return;
     }
     try { next.onWritten(); } catch { /* The marker assertion reports an injection failure. */ }
@@ -400,17 +420,33 @@ const watcher = setInterval(() => {
   if (writerMode && existsSync(cleanupPath) && broker.exitCode === null && broker.signalCode === null) {
     broker.kill('SIGKILL');
   }
+  if (holdMode && holdEntered && !holdReleased &&
+      (existsSync(holdReleasePath) || (writerMode && existsSync(cleanupPath)))) {
+    holdReleased = true;
+    writeAtomic(holdReleasedPath, 'hold_released\n');
+    clearInterval(watcher);
+    outputEndRequested = true;
+    finishOutputIfReady();
+  }
 }, 5);
 
 broker.on('exit', (code, signal) => {
-  if (settled) return;
-  settled = true;
-  clearInterval(watcher);
+  if (brokerExitObserved) return;
+  brokerExitObserved = true;
   if (brokerOutputPending.length > 0) enqueueOutput(brokerOutputPending);
   brokerOutputPending = Buffer.alloc(0);
+  process.stdin.removeAllListeners();
+  process.stdin.destroy();
+  proxyExitCode = Number.isInteger(code) ? code : signal ? 1 : 0;
+  if (holdMode) {
+    holdEntered = true;
+    writeAtomic(holdEnteredPath, 'hold_entered\n');
+    return;
+  }
+  settled = true;
+  clearInterval(watcher);
   outputEndRequested = true;
   finishOutputIfReady();
-  process.exitCode = Number.isInteger(code) ? code : signal ? 1 : 0;
 });
 
 process.on('SIGTERM', () => {

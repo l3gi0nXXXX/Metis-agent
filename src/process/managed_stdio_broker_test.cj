@@ -246,8 +246,228 @@ private func managedStdioJoinFuture<T>(future: Option<Future<T>>, timeoutMs: Int
     }
 }
 
+private func managedStdioBrokerFullySettled(client: ManagedStdioBrokerClient, timeoutMs: Int64): Bool {
+    managedStdioWaitUntil(timeoutMs, { =>
+        let snapshot = client.snapshot()
+        !snapshot.running && snapshot.brokerPid == 0 && snapshot.ownerCount == 0 &&
+            snapshot.readerCount == 0 && snapshot.dispatcherCount == 0
+    })
+}
+
+private func managedStdioWriteCloseFixture(path: Path, mode: String, markerPath!: String = ""): Unit {
+    File.writeTo(path, (
+        "import{appendFileSync}from'node:fs';\n" +
+        "const generation=Number(process.env.METIS_STDIO_BROKER_GENERATION||1);\n" +
+        "const mode='${mode}';\n" +
+        "const markerPath='${markerPath}';\n" +
+        "process.stdout.write(JSON.stringify({type:'broker.hello',generation,pid:process.pid,ownerLimit:256})+'\\n');\n" +
+        "let pending='';\n" +
+        "process.stdin.setEncoding('utf8');\n" +
+        "process.stdin.on('data',(chunk)=>{pending+=chunk;for(;;){const at=pending.indexOf('\\n');" +
+        "if(at<0)break;const line=pending.slice(0,at);pending=pending.slice(at+1);let frame;" +
+        "try{frame=JSON.parse(line);}catch{continue;}if(frame.type!=='broker.close')continue;" +
+        "if(markerPath)appendFileSync(markerPath,'1');" +
+        "if(mode==='eof'){process.exit(0);}else if(mode==='nonzero'){" +
+        "process.stdout.write(JSON.stringify({type:'broker.closed',generation,ownerCount:0})+'\\n',()=>process.exit(70));" +
+        "}else if(mode==='invalid'){process.stdout.write(JSON.stringify({type:'broker.closed',generation,ownerCount:0})+'\\n'," +
+        "()=>process.stdout.write(Buffer.from([0xc3,0x28]),()=>process.exit(0)));}}});\n" +
+        "setInterval(()=>{},1000);\n"
+    ).toArray())
+}
+
 @Test
 public class ManagedStdioBrokerTest {
+    @TestCase
+    public func hbBrB1CloseFailuresRemainFailClosedAfterCleanup(): Unit {
+        let suffix = DateTime.now().toUnixTimeStamp().toNanoseconds()
+        let eofScript = Path("/tmp/metis-hb-br-eof-${suffix}.mjs")
+        let timeoutScript = Path("/tmp/metis-hb-br-timeout-${suffix}.mjs")
+        let nonzeroScript = Path("/tmp/metis-hb-br-nonzero-${suffix}.mjs")
+        let invalidScript = Path("/tmp/metis-hb-br-invalid-${suffix}.mjs")
+        managedStdioWriteCloseFixture(eofScript, "eof")
+        managedStdioWriteCloseFixture(timeoutScript, "timeout")
+        managedStdioWriteCloseFixture(nonzeroScript, "nonzero")
+        managedStdioWriteCloseFixture(invalidScript, "invalid")
+        try {
+            let writeFailure = ManagedStdioBrokerClient(brokerTestMode: true)
+            @Expect(writeFailure.ensureBrokerRunning(timeoutMs: 1000).ok, true)
+            @Expect(writeFailure.debugDropBrokerWriterForCloseTest(), true)
+            let writeFailed = writeFailure.close(timeoutMs: 1000)
+            @Expect(writeFailed.ok, false)
+            @Expect(writeFailed.status, "broker_close_write_failed")
+            @Expect(managedStdioBrokerFullySettled(writeFailure, 2000), true)
+            @Expect(writeFailure.close(timeoutMs: 100).status, "broker_close_write_failed")
+            let writeSnapshot = writeFailure.snapshot()
+            @Expect(writeSnapshot.running, false)
+            @Expect(writeSnapshot.brokerPid, 0)
+            @Expect(writeSnapshot.ownerCount, 0)
+            @Expect(writeSnapshot.readerCount, 0)
+            @Expect(writeSnapshot.dispatcherCount, 0)
+
+            let eof = ManagedStdioBrokerClient(brokerScriptPath: eofScript.toString())
+            @Expect(eof.ensureBrokerRunning(timeoutMs: 1000).ok, true)
+            let eofResult = eof.close(timeoutMs: 1000)
+            @Expect(eofResult.ok, false)
+            @Expect(eofResult.status, "broker_close_eof_before_ack")
+            @Expect(managedStdioBrokerFullySettled(eof, 2000), true)
+            @Expect(eof.close(timeoutMs: 100).status, "broker_close_eof_before_ack")
+            let eofSnapshot = eof.snapshot()
+            @Expect(eofSnapshot.brokerPid, 0)
+            @Expect(eofSnapshot.ownerCount, 0)
+            @Expect(eofSnapshot.readerCount, 0)
+            @Expect(eofSnapshot.dispatcherCount, 0)
+
+            let timed = ManagedStdioBrokerClient(brokerScriptPath: timeoutScript.toString())
+            @Expect(timed.ensureBrokerRunning(timeoutMs: 1000).ok, true)
+            let timeoutResult = timed.close(timeoutMs: 100)
+            @Expect(timeoutResult.ok, false)
+            @Expect(timeoutResult.status, "broker_close_ack_timeout")
+            @Expect(managedStdioBrokerFullySettled(timed, 2000), true)
+            @Expect(timed.close(timeoutMs: 100).status, "broker_close_ack_timeout")
+            let timeoutSnapshot = timed.snapshot()
+            @Expect(timeoutSnapshot.brokerPid, 0)
+            @Expect(timeoutSnapshot.ownerCount, 0)
+            @Expect(timeoutSnapshot.readerCount, 0)
+            @Expect(timeoutSnapshot.dispatcherCount, 0)
+
+            let nonzero = ManagedStdioBrokerClient(brokerScriptPath: nonzeroScript.toString())
+            let nonzeroStarted = nonzero.ensureBrokerRunning(timeoutMs: 1000)
+            @Expect(nonzeroStarted.ok, true)
+            let nonzeroResult = nonzero.close(timeoutMs: 1000)
+            @Expect(nonzeroResult.ok, false)
+            @Expect(nonzeroResult.status, "broker_close_exit_nonzero")
+            @Expect(nonzeroResult.generation, nonzeroStarted.generation)
+            @Expect(managedStdioBrokerFullySettled(nonzero, 2000), true)
+            @Expect(nonzero.close(timeoutMs: 100).status, "broker_close_exit_nonzero")
+            let nonzeroSnapshot = nonzero.snapshot()
+            @Expect(nonzeroSnapshot.running, false)
+            @Expect(nonzeroSnapshot.brokerPid, 0)
+            @Expect(nonzeroSnapshot.ownerCount, 0)
+            @Expect(nonzeroSnapshot.readerCount, 0)
+            @Expect(nonzeroSnapshot.dispatcherCount, 0)
+
+            let invalid = ManagedStdioBrokerClient(brokerScriptPath: invalidScript.toString())
+            @Expect(invalid.ensureBrokerRunning(timeoutMs: 1000).ok, true)
+            let invalidResult = invalid.close(timeoutMs: 1000)
+            @Expect(invalidResult.ok, false)
+            @Expect(invalidResult.status, "broker_close_invalid_response_encoding")
+            @Expect(managedStdioBrokerFullySettled(invalid, 2000), true)
+            @Expect(invalid.close(timeoutMs: 100).status, "broker_close_invalid_response_encoding")
+        } finally {
+            try { remove(eofScript) } catch (_: Exception) { () }
+            try { remove(timeoutScript) } catch (_: Exception) { () }
+            try { remove(nonzeroScript) } catch (_: Exception) { () }
+            try { remove(invalidScript) } catch (_: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func hbBrP1RealBrokerClosesThirtyTwoTimesWithAcknowledgedDrain(): Unit {
+        let suffix = DateTime.now().toUnixTimeStamp().toNanoseconds()
+        let wrapper = Path("/tmp/metis-hb-br-wrapper-${suffix}.sh")
+        let stderrPath = Path("/tmp/metis-hb-br-stderr-${suffix}.log")
+        let brokerScript = managedStdioResolveBrokerScriptPath()
+        File.writeTo(wrapper, ("#!/bin/sh\nexec node '${brokerScript}' 2>>'${stderrPath.toString()}'\n").toArray())
+        try {
+            for (_ in 0..32) {
+                let client = ManagedStdioBrokerClient(
+                    nodeCommand: "/bin/sh", brokerScriptPath: wrapper.toString())
+                let started = client.ensureBrokerRunning(timeoutMs: 2000)
+                @Expect(started.ok, true)
+                let closed = client.close(timeoutMs: 2000)
+                @Expect(closed.ok, true)
+                @Expect(closed.status, "stopped")
+                @Expect(closed.generation, started.generation)
+                let snapshot = client.snapshot()
+                @Expect(snapshot.running, false)
+                @Expect(snapshot.brokerPid, 0)
+                @Expect(snapshot.ownerCount, 0)
+                @Expect(snapshot.readerCount, 0)
+                @Expect(snapshot.dispatcherCount, 0)
+            }
+            @Expect(managedStdioTestReadUtf8(stderrPath), "")
+        } finally {
+            try { remove(wrapper) } catch (_: Exception) { () }
+            try { remove(stderrPath) } catch (_: Exception) { () }
+        }
+    }
+
+    @TestCase
+    public func hHbBr01HungCloseDeadlineAndForcedReapRemainBounded(): Unit {
+        let client = ManagedStdioBrokerClient(brokerTestMode: true)
+        let suffix = DateTime.now().toUnixTimeStamp().toNanoseconds()
+        let concurrentScript = Path("/tmp/metis-hb-br-concurrent-${suffix}.mjs")
+        let closeMarker = Path("/tmp/metis-hb-br-concurrent-${suffix}.marker")
+        managedStdioWriteCloseFixture(concurrentScript, "timeout", markerPath: closeMarker.toString())
+        let concurrent = ManagedStdioBrokerClient(
+            brokerScriptPath: concurrentScript.toString(), brokerTestMode: true)
+        try {
+            let ready = client.ensureBrokerRunning(timeoutMs: 1000)
+            @Expect(ready.ok, true)
+            @Expect(client.debugHangBrokerForTest(timeoutMs: 1000), true)
+            let startedAt = managedStdioTestNowMs()
+            let result = client.close(timeoutMs: 100)
+            let elapsed = managedStdioTestNowMs() - startedAt
+            @Expect(result.ok, false)
+            @Expect(result.status, "broker_close_ack_timeout")
+            @Expect(result.generation, ready.generation)
+            @Expect(elapsed < 500, true)
+            @Expect(managedStdioBrokerFullySettled(client, 2000), true)
+            let snapshot = client.snapshot()
+            @Expect(snapshot.running, false)
+            @Expect(snapshot.brokerPid, 0)
+            @Expect(snapshot.ownerCount, 0)
+            @Expect(snapshot.readerCount, 0)
+            @Expect(snapshot.dispatcherCount, 0)
+            let repeated = client.close(timeoutMs: 100)
+            @Expect(repeated.ok, false)
+            @Expect(repeated.status, "broker_close_ack_timeout")
+            @Expect(repeated.generation, ready.generation)
+
+            let concurrentReady = concurrent.ensureBrokerRunning(timeoutMs: 1000)
+            @Expect(concurrentReady.ok, true)
+            @Expect(concurrent.debugHoldCloseReaderSettleForTest(), true)
+            let firstClose = spawn { concurrent.close(timeoutMs: 500) }
+            @Expect(managedStdioWaitUntil(1000, { => concurrent.closeInProgressForTest() }), true)
+            let secondStartedAt = managedStdioTestNowMs()
+            let secondResult = concurrent.close(timeoutMs: 20)
+            let secondElapsed = managedStdioTestNowMs() - secondStartedAt
+            @Expect(secondResult.ok, false)
+            @Expect(secondResult.status, "broker_close_in_progress")
+            @Expect(secondResult.generation, concurrentReady.generation)
+            @Expect(secondElapsed < 100, true)
+            @Expect(managedStdioWaitUntil(2000, { => concurrent.closeReaderSettleHeldForTest() }), true)
+            let firstResult = firstClose.get(Duration.second * 2)
+            @Expect(firstResult.ok, false)
+            @Expect(firstResult.status, "broker_close_ack_timeout")
+            @Expect(managedStdioTestReadUtf8(closeMarker), "1")
+            let fencedGeneration = concurrent.snapshot().generation
+            let fencedReady = concurrent.ensureBrokerRunning(timeoutMs: 20)
+            @Expect(fencedReady.ok, false)
+            @Expect(fencedReady.status, "broker_unavailable")
+            @Expect(fencedReady.generation, fencedGeneration)
+            let fencedStart = concurrent.startOwner(ManagedStdioOwnerSpec(
+                "hb-br-fenced", "node", args: ["-e", "setInterval(()=>{},1000)"], deadlineMs: 1000),
+                timeoutMs: 20)
+            @Expect(fencedStart.ok, false)
+            @Expect(fencedStart.status, "broker_unavailable")
+            @Expect(fencedStart.generation, fencedGeneration)
+            concurrent.debugReleaseCloseReaderSettleForTest()
+            @Expect(managedStdioWaitUntil(2000, { => !concurrent.closeInProgressForTest() }), true)
+            @Expect(managedStdioBrokerFullySettled(concurrent, 2000), true)
+            let retained = concurrent.close(timeoutMs: 100)
+            @Expect(retained.ok, false)
+            @Expect(retained.status, firstResult.status)
+            @Expect(retained.generation, firstResult.generation)
+        } finally {
+            concurrent.debugReleaseCloseReaderSettleForTest()
+            let _ = client.close(timeoutMs: 100)
+            let _ = concurrent.close(timeoutMs: 100)
+            try { remove(concurrentScript) } catch (_: Exception) { () }
+            try { remove(closeMarker) } catch (_: Exception) { () }
+        }
+    }
+
     @TestCase
     public func writeCorrelationU1TwoConcurrentWritesReceiveOwnAcknowledgements(): Unit {
         let client = ManagedStdioBrokerClient()

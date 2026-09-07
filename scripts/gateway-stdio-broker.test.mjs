@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { EventEmitter, once } from 'node:events';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { PassThrough, Writable } from 'node:stream';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
@@ -16,6 +19,7 @@ import {
 } from './metis-stdio-broker.mjs';
 
 const brokerPath = fileURLToPath(new URL('./metis-stdio-broker.mjs', import.meta.url));
+const s5ProxyPath = fileURLToPath(new URL('./metis-s5-broker-writer-failure-proxy.mjs', import.meta.url));
 
 function validStart(ownerId = 'owner-1', extra = {}) {
   return {
@@ -62,10 +66,15 @@ class CollectingWritable extends Writable {
   }
 }
 
-function startBrokerProcess() {
+function startBrokerProcess({ diagnosticDirectory = '' } = {}) {
   return spawn(process.execPath, [brokerPath], {
     stdio: ['pipe', 'pipe', 'pipe'],
-    env: { ...process.env, METIS_STDIO_BROKER_GENERATION: '17', METIS_STDIO_BROKER_TEST_MODE: '1' },
+    env: {
+      ...process.env,
+      METIS_STDIO_BROKER_GENERATION: '17',
+      METIS_STDIO_BROKER_TEST_MODE: '1',
+      ...(diagnosticDirectory ? { METIS_STDIO_BROKER_DIAGNOSTIC_MARKER: diagnosticDirectory } : {}),
+    },
   });
 }
 
@@ -95,6 +104,201 @@ async function waitFor(predicate, timeoutMs = 4_000) {
   }
   throw new Error('test timeout');
 }
+
+async function waitForChildExit(child, timeoutMs = 4_000) {
+  if (child.exitCode !== null || child.signalCode !== null) return [child.exitCode, child.signalCode];
+  let timer;
+  try {
+    return await Promise.race([
+      once(child, 'exit'),
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('child exit timeout')), timeoutMs); }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function reapTestChild(child) {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  child.kill('SIGKILL');
+  try { await waitForChildExit(child, 2_000); } catch { /* assertion reports the original failure */ }
+}
+
+async function expectInvalidProxyContract(child, label) {
+  let stdout = '';
+  let stderr = '';
+  child.stdout.setEncoding('utf8');
+  child.stderr.setEncoding('utf8');
+  child.stdout.on('data', (chunk) => { stdout += chunk; });
+  child.stderr.on('data', (chunk) => { stderr += chunk; });
+  const stdoutEnded = once(child.stdout, 'end');
+  const childClosed = once(child, 'close');
+  assert.deepEqual(await waitForChildExit(child), [64, null], label);
+  let closeTimer;
+  try {
+    await Promise.race([
+      Promise.all([stdoutEnded, childClosed]),
+      new Promise((_, reject) => {
+        closeTimer = setTimeout(() => reject(new Error('invalid proxy output drain timeout')), 4_000);
+      }),
+    ]);
+  } finally {
+    if (closeTimer) clearTimeout(closeTimer);
+  }
+  assert.equal(stdout, '', label);
+  assert.equal(stderr, 'broker_proxy_invalid_contract\n', label);
+}
+
+test('HB-BR-P3 proxy forwards broker.closed and exits after serialized stdout drain', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'metis-s5-proxy-close-'));
+  const ready = join(root, 'ready.json');
+  const fail = join(root, 'fail');
+  const closed = join(root, 'closed');
+  const cleanup = join(root, 'cleanup');
+  const child = spawn(process.execPath, [s5ProxyPath, brokerPath], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: {
+      ...process.env,
+      METIS_STDIO_BROKER_GENERATION: '23',
+      METIS_S5_BROKER_PROXY_READY: ready,
+      METIS_S5_BROKER_PROXY_FAIL: fail,
+      METIS_S5_BROKER_PROXY_WRITER_CLOSED: closed,
+      METIS_S5_BROKER_PROXY_CLEANUP: cleanup,
+    },
+  });
+  const frames = frameCollector(child);
+  let stderr = '';
+  child.stderr.setEncoding('utf8');
+  child.stderr.on('data', (chunk) => { stderr += chunk; });
+  try {
+    await waitFor(() => frames.some((frame) => frame.type === 'broker.hello'));
+    const stdoutEnded = once(child.stdout, 'end');
+    const childClosed = once(child, 'close');
+    child.stdin.write(`${JSON.stringify({ type: 'broker.close' })}\n`);
+    const exit = await waitForChildExit(child, 4_000);
+    let closeTimer;
+    try {
+      await Promise.race([
+        Promise.all([stdoutEnded, childClosed]),
+        new Promise((_, reject) => {
+          closeTimer = setTimeout(() => reject(new Error('proxy output drain timeout')), 4_000);
+        }),
+      ]);
+    } finally {
+      if (closeTimer) clearTimeout(closeTimer);
+    }
+    assert.deepEqual(exit, [0, null]);
+    assert.equal(frames.filter((frame) => frame.type === 'broker.closed').length, 1);
+    assert.equal(stderr, '');
+  } finally {
+    await reapTestChild(child);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('H-HB-FIXTURE-01 proxy hold is opt-in, complete, and releases exactly once', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'metis-s5-proxy-hold-'));
+  const innerBroker = join(root, 'inner-broker.mjs');
+  writeFileSync(innerBroker, `
+process.stdout.write(JSON.stringify({type:'broker.hello',generation:29,pid:process.pid})+'\\n');
+process.stdin.resume();
+process.stdin.on('close',()=>{process.stdout.write(JSON.stringify({type:'broker.closed',generation:29})+'\\n',()=>process.exit(1));});
+`);
+  const writerEnvironment = (prefix) => ({
+    METIS_STDIO_BROKER_GENERATION: '29',
+    METIS_S5_BROKER_PROXY_READY: join(root, `${prefix}.ready.json`),
+    METIS_S5_BROKER_PROXY_FAIL: join(root, `${prefix}.fail`),
+    METIS_S5_BROKER_PROXY_WRITER_CLOSED: join(root, `${prefix}.closed`),
+    METIS_S5_BROKER_PROXY_CLEANUP: join(root, `${prefix}.cleanup`),
+  });
+  const children = [];
+  try {
+    const defaultChild = spawn(process.execPath, [s5ProxyPath, innerBroker], {
+      stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, ...writerEnvironment('default') },
+    });
+    children.push(defaultChild);
+    const defaultFrames = frameCollector(defaultChild);
+    await waitFor(() => defaultFrames.some((frame) => frame.type === 'broker.hello'));
+    writeFileSync(join(root, 'default.fail'), 'fail\n');
+    await waitFor(() => existsSync(join(root, 'default.closed')));
+    assert.deepEqual(await waitForChildExit(defaultChild), [1, null]);
+    assert.equal(defaultFrames.filter((frame) => frame.type === 'broker.closed').length, 1);
+
+    const invalidChild = spawn(process.execPath, [s5ProxyPath, innerBroker], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: {
+        ...process.env, ...writerEnvironment('invalid'),
+        METIS_S5_BROKER_PROXY_HOLD_ENTERED: join(root, 'invalid.entered'),
+      },
+    });
+    children.push(invalidChild);
+    await expectInvalidProxyContract(invalidChild, 'partial-hold');
+
+    for (const [name, extra] of [
+      ['hold-only', {
+        METIS_S5_BROKER_PROXY_READY: join(root, 'hold-only.ready'),
+        METIS_S5_BROKER_PROXY_HOLD_ENTERED: join(root, 'hold-only.entered'),
+        METIS_S5_BROKER_PROXY_HOLD_RELEASE: join(root, 'hold-only.release'),
+        METIS_S5_BROKER_PROXY_HOLD_RELEASED: join(root, 'hold-only.released'),
+      }],
+      ['hold-drop', {
+        ...writerEnvironment('hold-drop'),
+        METIS_S5_BROKER_PROXY_HOLD_ENTERED: join(root, 'hold-drop.entered'),
+        METIS_S5_BROKER_PROXY_HOLD_RELEASE: join(root, 'hold-drop.release'),
+        METIS_S5_BROKER_PROXY_HOLD_RELEASED: join(root, 'hold-drop.released'),
+        METIS_S5_BROKER_PROXY_DROP_DELIVERY_ID: 'delivery',
+        METIS_S5_BROKER_PROXY_ADMISSION_SEEN: join(root, 'hold-drop.admission'),
+        METIS_S5_BROKER_PROXY_COMPLETION_DROPPED: join(root, 'hold-drop.completion'),
+      }],
+      ['writer-drop', {
+        ...writerEnvironment('writer-drop'),
+        METIS_S5_BROKER_PROXY_DROP_DELIVERY_ID: 'delivery',
+        METIS_S5_BROKER_PROXY_ADMISSION_SEEN: join(root, 'writer-drop.admission'),
+        METIS_S5_BROKER_PROXY_COMPLETION_DROPPED: join(root, 'writer-drop.completion'),
+      }],
+    ]) {
+      const child = spawn(process.execPath, [s5ProxyPath, innerBroker], {
+        stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, ...extra },
+      });
+      children.push(child);
+      await expectInvalidProxyContract(child, name);
+      assert.equal(existsSync(extra.METIS_S5_BROKER_PROXY_READY), false, name);
+      if (name === 'writer-drop') {
+        assert.equal(existsSync(extra.METIS_S5_BROKER_PROXY_ADMISSION_SEEN), false);
+        assert.equal(existsSync(extra.METIS_S5_BROKER_PROXY_COMPLETION_DROPPED), false);
+      }
+    }
+
+    const holdEntered = join(root, 'hold.entered');
+    const holdRelease = join(root, 'hold.release');
+    const holdReleased = join(root, 'hold.released');
+    const heldChild = spawn(process.execPath, [s5ProxyPath, innerBroker], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: {
+        ...process.env, ...writerEnvironment('held'),
+        METIS_S5_BROKER_PROXY_HOLD_ENTERED: holdEntered,
+        METIS_S5_BROKER_PROXY_HOLD_RELEASE: holdRelease,
+        METIS_S5_BROKER_PROXY_HOLD_RELEASED: holdReleased,
+      },
+    });
+    children.push(heldChild);
+    const heldFrames = frameCollector(heldChild);
+    await waitFor(() => heldFrames.some((frame) => frame.type === 'broker.hello'));
+    writeFileSync(join(root, 'held.fail'), 'fail\n');
+    await waitFor(() => existsSync(join(root, 'held.closed')));
+    await waitFor(() => existsSync(holdEntered));
+    assert.equal(heldChild.exitCode, null);
+    writeFileSync(holdRelease, 'release\n');
+    await waitFor(() => existsSync(holdReleased));
+    assert.deepEqual(await waitForChildExit(heldChild), [1, null]);
+    assert.equal(readFileSync(holdEntered, 'utf8'), 'hold_entered\n');
+    assert.equal(readFileSync(holdReleased, 'utf8'), 'hold_released\n');
+    assert.equal(heldFrames.filter((frame) => frame.type === 'broker.closed').length, 1);
+  } finally {
+    for (const child of children) await reapTestChild(child);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test('P1-U1 routes interleaved owner streams and settles once', async () => {
   const output = new CollectingWritable();
@@ -162,6 +366,321 @@ test('P1-B1 preserves UTF-8 across chunks, empty lines, trailing text, and rejec
   assert.throws(() => streamOverflow.push(Buffer.from('6')), /buffer_capacity_exceeded/);
 });
 
+test('HB-BR-U1 broker close waits for the final stdout callback and drain exactly once', async () => {
+  const output = new EventEmitter();
+  const writes = [];
+  output.write = (chunk, callback) => {
+    writes.push({ chunk: chunk.toString(), callback });
+    return false;
+  };
+  const exits = [];
+  const broker = new StdioBroker({ output, generation: 31, exit: (code) => exits.push(code) });
+
+  broker.closeBroker();
+  broker.closeBroker();
+  assert.equal(writes.length, 1);
+  assert.equal(JSON.parse(writes[0].chunk).type, 'broker.closed');
+  assert.deepEqual(exits, []);
+
+  writes[0].callback(null);
+  assert.deepEqual(exits, []);
+  output.emit('drain');
+  assert.deepEqual(exits, []);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(exits, [0]);
+  broker.closeBroker();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(exits, [0]);
+  assert.equal(writes.filter((item) => JSON.parse(item.chunk).type === 'broker.closed').length, 1);
+});
+
+test('HB-BR-N1 final stdout failure is fatal exactly once and never exits zero', async () => {
+  const output = new EventEmitter();
+  const writes = [];
+  output.write = (chunk, callback) => {
+    writes.push({ chunk: chunk.toString(), callback });
+    return true;
+  };
+  const exits = [];
+  const diagnostics = [];
+  const originalWrite = process.stderr.write;
+  process.stderr.write = (chunk, ..._args) => {
+    diagnostics.push(String(chunk));
+    return true;
+  };
+  try {
+    const broker = new StdioBroker({ output, generation: 32, exit: (code) => exits.push(code) });
+    broker.closeBroker();
+    assert.equal(writes.length, 1);
+    writes[0].callback(new Error('synthetic output failure'));
+    output.emit('error', new Error('duplicate synthetic output failure'));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(exits, [70]);
+    assert.equal(diagnostics.filter((line) => line === 'metis stdio broker protocol writer failed\n').length, 1);
+    assert.equal(writes.filter((item) => JSON.parse(item.chunk).type === 'broker.closed').length, 1);
+  } finally {
+    process.stderr.write = originalWrite;
+  }
+});
+
+test('HB-BR-N2 classifies bounded writer failures and the post-close callback race', async () => {
+  const observed = [];
+  const outputError = new EventEmitter();
+  outputError.write = () => true;
+  new BrokerWriter(outputError, { onFailure: (kind) => observed.push(kind) });
+  outputError.emit('error', new Error('synthetic'));
+
+  const callbackError = new EventEmitter();
+  let callback;
+  callbackError.write = (_chunk, value) => { callback = value; return true; };
+  const callbackWriter = new BrokerWriter(callbackError, { onFailure: (kind) => observed.push(kind) });
+  callbackWriter.write({ type: 'callback' });
+  callback(new Error('synthetic'));
+
+  const blocked = new EventEmitter();
+  blocked.write = () => false;
+  const bounded = new BrokerWriter(blocked, { maxQueuedBytes: 64, onFailure: (kind) => observed.push(kind) });
+  bounded.write({ type: 'one' });
+  bounded.write({ type: 'two', text: 'x'.repeat(128) });
+
+  const throwing = new EventEmitter();
+  throwing.write = () => { throw new Error('synthetic'); };
+  const throwingWriter = new BrokerWriter(throwing, { onFailure: (kind) => observed.push(kind) });
+  throwingWriter.write({ type: 'throw' });
+  assert.deepEqual(observed, ['output_error', 'callback_error', 'queue_capacity', 'write_exception']);
+
+  const root = mkdtempSync(join(tmpdir(), 'metis-hb-br-n2-'));
+  try {
+    const raceOutput = new EventEmitter();
+    const writes = [];
+    raceOutput.write = (chunk, written) => { writes.push({ chunk: String(chunk), written }); return true; };
+    const exits = [];
+    const broker = new StdioBroker({
+      output: raceOutput, generation: 41, testMode: true, diagnosticMarkerDirectory: root,
+      exit: (code) => exits.push(code),
+    });
+    broker.closeBroker();
+    writes[0].written(null);
+    raceOutput.emit('error', new Error('synthetic post-callback failure'));
+    await new Promise((resolve) => setImmediate(resolve));
+    const markerPath = join(root, `broker-g41-p${process.pid}.json`);
+    const marker = JSON.parse(readFileSync(markerPath, 'utf8'));
+    assert.deepEqual(exits, [70]);
+    assert.equal(marker.writerFailureKind, 'output_error');
+    assert.equal(marker.writerFailurePhase, 'other');
+    assert.equal(marker.closeAckCallbackSeen, true);
+    assert.equal(marker.closeEntryOwnerCount, 0);
+    assert.equal(marker.ownerCount, 0);
+    assert.equal(marker.exitScheduledCount, 1);
+    assert.equal(marker.lastExitScheduledCode, 70);
+    assert.equal(marker.events.filter((event) => event.event === 'exit_scheduled').length, 1);
+    assert.equal(statSync(markerPath).mode & 0o777, 0o600);
+
+    const failureBeforeLateSuccess = [];
+    const firstFailure = new StdioBroker({
+      output: new EventEmitter(), exit: (code) => failureBeforeLateSuccess.push(code),
+    });
+    firstFailure.scheduleExit(70);
+    firstFailure.scheduleExit(0);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(failureBeforeLateSuccess, [70]);
+    assert.equal(firstFailure.exitScheduledCount, 1);
+    assert.equal(firstFailure.lastExitScheduledCode, 70);
+
+    const forcedBeforeLateSuccess = [];
+    const forced = new StdioBroker({
+      output: new EventEmitter(), exit: (code) => forcedBeforeLateSuccess.push(code),
+    });
+    forced.scheduleExit(71);
+    forced.scheduleExit(0);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(forcedBeforeLateSuccess, [71]);
+    assert.equal(forced.exitScheduledCount, 1);
+    assert.equal(forced.lastExitScheduledCode, 71);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('HB-BR-D1 retains two broker generations as private bounded UTF-8-safe evidence', () => {
+  const root = mkdtempSync(join(tmpdir(), 'metis-hb-br-d1-'));
+  try {
+    const output = new CollectingWritable();
+    let diagnosticPid = 41_000;
+    const first = new StdioBroker({
+      output, generation: 51, testMode: true, diagnosticMarkerDirectory: root, exit: () => {},
+      spawnFn: () => fakeChild(diagnosticPid++), treeRunner: fakeTreeRunner(),
+    });
+    const second = new StdioBroker({
+      output: new CollectingWritable(), generation: 52, testMode: true,
+      diagnosticMarkerDirectory: root, exit: () => {},
+    });
+    first.handle({ type: 'unsupported', text: '中文🙂', authorization: 'private-secret' });
+    first.handle(validStart('service-plugin:test:instance:1', { command: '/bin/true', args: [], deadlineMs: 0 }));
+    first.handle(validStart('pid-probe', { command: '/bin/sh', args: ['-c', 'kill -0 24626'], deadlineMs: 0 }));
+    first.handle(validStart('lsof-probe', {
+      command: '/bin/sh', args: ['-c', 'lsof -nP -iTCP:24626 -sTCP:LISTEN -Fp'], deadlineMs: 0,
+    }));
+    first.handle(validStart('other-probe', { deadlineMs: 0 }));
+    second.closeBroker();
+    const files = readdirSync(root).filter((name) => name.startsWith('broker-g')).sort();
+    assert.deepEqual(files, [`broker-g51-p${process.pid}.json`, `broker-g52-p${process.pid}.json`]);
+    const markers = files.map((name) => {
+      const path = join(root, name);
+      assert.equal(statSync(path).mode & 0o777, 0o600);
+      const raw = readFileSync(path, 'utf8');
+      assert.equal(raw.includes('中文'), false);
+      assert.equal(raw.includes('🙂'), false);
+      assert.equal(raw.includes('private-secret'), false);
+      return JSON.parse(raw);
+    });
+    assert.deepEqual(markers.map((marker) => marker.generation), [51, 52]);
+    assert.equal(markers.every((marker) => marker.events[0].event === 'broker_started'), true);
+    assert.equal(markers.every((marker) => marker.startParentPid === process.ppid), true);
+    assert.equal(markers.every((marker) => marker.observedParentPid === process.ppid), true);
+    assert.deepEqual(markers[0].ownerStartCounts, {
+      service_plugin: 1, pid_probe: 1, lsof_probe: 1, other: 1,
+    });
+    for (let generation = 53; generation <= 67; generation += 1) {
+      new StdioBroker({
+        output: new CollectingWritable(), generation, testMode: true,
+        diagnosticMarkerDirectory: root, exit: () => {},
+      });
+    }
+    assert.equal(readdirSync(root).filter((name) => name.startsWith('broker-g')).length, 16);
+    const overflowPath = join(root, 'overflow.json');
+    const overflow = JSON.parse(readFileSync(overflowPath, 'utf8'));
+    assert.deepEqual({ overflow: overflow.overflow, capacity: overflow.capacity }, { overflow: true, capacity: 16 });
+    assert.equal(statSync(overflowPath).mode & 0o777, 0o600);
+
+    for (const [label, prepare] of [
+      ['non-json', (path) => writeFileSync(join(path, 'unexpected.txt'), 'x')],
+      ['invalid-utf8', (path) => writeFileSync(join(path, 'broker-g1-p2.json'), Buffer.from([0xff]))],
+      ['symlink', (path) => symlinkSync(root, join(path, 'unexpected-link'))],
+      ['orphan-slot', (path) => mkdirSync(join(path, '.identity-slot-0'))],
+      ['corrupt-overflow', (path) => writeFileSync(join(path, 'overflow.json'), '{')],
+      ['invalid-overflow-utf8', (path) => writeFileSync(join(path, 'overflow.json'), Buffer.from([0xff]))],
+    ]) {
+      const unsafe = join(root, label);
+      mkdirSync(unsafe);
+      prepare(unsafe);
+      new StdioBroker({
+        output: new CollectingWritable(), generation: 70, testMode: true,
+        diagnosticMarkerDirectory: unsafe, exit: () => {},
+      });
+      assert.equal(JSON.parse(readFileSync(join(unsafe, 'overflow.json'), 'utf8')).overflow, true);
+      assert.equal(readdirSync(unsafe).some((name) => name.startsWith('broker-g70-')), false);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('HB-BR-D2 reparented broker evidence remains schema-valid and preserves its start parent', () => {
+  const root = mkdtempSync(join(tmpdir(), 'metis-hb-br-d2-'));
+  try {
+    let parentPid = 24626;
+    const broker = new StdioBroker({
+      output: new CollectingWritable(), generation: 61, testMode: true,
+      diagnosticMarkerDirectory: root, parentPidProvider: () => parentPid, exit: () => {},
+    });
+    parentPid = 1;
+    broker.closeBroker();
+    const marker = JSON.parse(readFileSync(join(root, `broker-g61-p${process.pid}.json`), 'utf8'));
+    assert.equal(marker.startParentPid, 24626);
+    assert.equal(marker.observedParentPid, 1);
+    assert.equal(marker.events[0].event, 'broker_started');
+    assert.equal(marker.protocolVersion, '1.0');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('HB-BR-N3 classifies the direct shutdown lsof owner without hiding it as other', () => {
+  const root = mkdtempSync(join(tmpdir(), 'metis-hb-br-n3-'));
+  try {
+    const broker = new StdioBroker({
+      output: new CollectingWritable(), generation: 62, testMode: true,
+      diagnosticMarkerDirectory: root, exit: () => {},
+      spawnFn: () => fakeChild(41_100), treeRunner: fakeTreeRunner(),
+    });
+    broker.handle(validStart('shell-command-1', {
+      command: 'lsof', args: ['-nP', '-iTCP:24626', '-sTCP:LISTEN', '-t'], deadlineMs: 0,
+    }));
+    const marker = JSON.parse(readFileSync(join(root, `broker-g62-p${process.pid}.json`), 'utf8'));
+    assert.deepEqual(marker.ownerStartCounts, {
+      service_plugin: 0, pid_probe: 0, lsof_probe: 1, other: 0,
+    });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('HB-BR-B2 broker close settles an ignore-term owner before its acknowledgement', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'metis-hb-br-b2-'));
+  const child = startBrokerProcess({ diagnosticDirectory: root });
+  try {
+    const frames = frameCollector(child);
+    let stderr = '';
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    await waitFor(() => frames.find((frame) => frame.type === 'broker.hello'));
+    child.stdin.write(`${JSON.stringify(validStart('hb-br-b2', {
+      args: ['-e', "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"], deadlineMs: 0,
+    }))}\n`);
+    await waitFor(() => frames.find((frame) => frame.type === 'owner.started' && frame.ownerId === 'hb-br-b2'));
+    child.stdin.write(`${JSON.stringify({ type: 'broker.close' })}\n`);
+    const terminal = await waitFor(() => frames.find((frame) =>
+      ['owner.exit', 'owner.error', 'owner.timeout'].includes(frame.type) && frame.ownerId === 'hb-br-b2'));
+    const closed = await waitFor(() => frames.find((frame) => frame.type === 'broker.closed'));
+    const [code] = await waitForChildExit(child);
+    assert.equal(terminal.type, 'owner.exit');
+    assert.equal(closed.ownerCount, 0);
+    assert.equal(code, 0);
+    assert.equal(stderr, '');
+    const marker = JSON.parse(readFileSync(join(root, `broker-g17-p${child.pid}.json`), 'utf8'));
+    assert.equal(marker.ownerStartCounts.other, 1);
+    assert.equal(marker.ownerTerminalCounts.other, 1);
+    assert.equal(marker.closeEntryOwnerCount, 1);
+    assert.equal(marker.brokerClosedEnqueuedCount, 1);
+    assert.equal(marker.brokerClosedCallbackCount, 1);
+    assert.equal(marker.lastExitScheduledCode, 0);
+  } finally {
+    await reapTestChild(child);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('HB-BR-P2 terminal owner is removed before acknowledged two-second broker close', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'metis-hb-br-p2-'));
+  const child = startBrokerProcess({ diagnosticDirectory: root });
+  try {
+    const frames = frameCollector(child);
+    let stderr = '';
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    await waitFor(() => frames.find((frame) => frame.type === 'broker.hello'));
+    child.stdin.write(`${JSON.stringify(validStart('hb-br-p2'))}\n`);
+    await waitFor(() => frames.find((frame) => frame.type === 'owner.exit' && frame.ownerId === 'hb-br-p2'));
+    child.stdin.write(`${JSON.stringify({ type: 'broker.close' })}\n`);
+    const closed = await waitFor(() => frames.find((frame) => frame.type === 'broker.closed'), 2_000);
+    const [code] = await waitForChildExit(child);
+    assert.equal(closed.ownerCount, 0);
+    assert.equal(code, 0);
+    assert.equal(stderr, '');
+    const marker = JSON.parse(readFileSync(join(root, `broker-g17-p${child.pid}.json`), 'utf8'));
+    assert.equal(marker.ownerStartCounts.other, 1);
+    assert.equal(marker.ownerTerminalCounts.other, 1);
+    assert.equal(marker.closeEntryOwnerCount, 0);
+    assert.equal(marker.brokerClosedEnqueuedCount, 1);
+    assert.equal(marker.brokerClosedCallbackCount, 1);
+    assert.equal(marker.lastExitScheduledCode, 0);
+  } finally {
+    await reapTestChild(child);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('P1-B1 validates owner specs, hard limit 255/256/257, and writer drain backpressure', () => {
   assert.equal(validateStartFrame(validStart()), true);
   for (const patch of [{ command: '' }, { command: 'x\0y' }, { args: ['x\0y'] }, { requestId: 'bad\nrequest' },
@@ -193,7 +712,7 @@ test('P1-B1 validates owner specs, hard limit 255/256/257, and writer drain back
   let overflowed = 0;
   const blocked = new EventEmitter();
   blocked.write = () => false;
-  const bounded = new BrokerWriter(blocked, { maxQueuedBytes: 20, onOverflow: () => { overflowed += 1; } });
+  const bounded = new BrokerWriter(blocked, { maxQueuedBytes: 20, onFailure: () => { overflowed += 1; } });
   assert.equal(bounded.write({ x: '1234' }), true);
   assert.equal(bounded.write({ x: '5678' }), true);
   assert.equal(bounded.write({ x: 'overflow' }), false);

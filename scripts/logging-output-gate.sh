@@ -79,6 +79,18 @@ check_file_allowlist() {
   fi
 }
 
+check_fixed_source_count() {
+  title="$1"
+  file="$2"
+  needle="$3"
+  expected="$4"
+  count=$(rg -o -F "$needle" "$file" 2>/dev/null | wc -l | tr -d ' ')
+  echo "${title}: expected=${expected} actual=${count}"
+  if [ "$count" -ne "$expected" ]; then
+    failures=$((failures + 1))
+  fi
+}
+
 cd "$ROOT_DIR" || exit 2
 
 logutils_scan="$TMP_DIR/logutils.txt"
@@ -178,7 +190,9 @@ check_file_allowlist \
   "scripts/openclaw-compat-security-policy.mjs" \
   "scripts/openclaw-plugin-inventory.mjs" \
   "scripts/openclaw-plugin-sidecar.mjs" \
-  "scripts/gateway-stdio-*"
+  "scripts/gateway-stdio-*" \
+  "scripts/metis-gateway-stop-fake-service-plugin.mjs" \
+  "scripts/metis-s5-broker-writer-failure-proxy.mjs"
 
 check_file_allowlist \
   "JS stderr diagnostics" \
@@ -186,7 +200,34 @@ check_file_allowlist \
   "$TMP_DIR/sidecar-stderr.allowed" \
   "scripts/lib/metis-sidecar-logger.mjs" \
   "scripts/metis-stdio-broker.mjs" \
-  "scripts/gateway-stdio-*"
+  "scripts/gateway-stdio-*" \
+  "scripts/metis-s5-broker-writer-failure-proxy.mjs"
+
+check_fixed_source_count \
+  "Gateway stop fixture stdout write count" \
+  "scripts/metis-gateway-stop-fake-service-plugin.mjs" \
+  "process.stdout.write" \
+  1
+check_fixed_source_count \
+  "S5 writer proxy stdout write count" \
+  "scripts/metis-s5-broker-writer-failure-proxy.mjs" \
+  "process.stdout.write" \
+  1
+check_fixed_source_count \
+  "S5 writer proxy stdout queue shape" \
+  "scripts/metis-s5-broker-writer-failure-proxy.mjs" \
+  "process.stdout.write(next.bytes, (error) => {" \
+  1
+check_fixed_source_count \
+  "S5 writer proxy stderr write count" \
+  "scripts/metis-s5-broker-writer-failure-proxy.mjs" \
+  "process.stderr.write" \
+  1
+check_fixed_source_count \
+  "S5 writer proxy stderr fixed diagnostic" \
+  "scripts/metis-s5-broker-writer-failure-proxy.mjs" \
+  "process.stderr.write('broker_proxy_invalid_contract\\n');" \
+  1
 
 check_file_allowlist \
   "JS console usage" \

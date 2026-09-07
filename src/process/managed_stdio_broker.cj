@@ -422,6 +422,12 @@ public class ManagedStdioBrokerClient {
     private var requestSequence: Int64 = 0
     private var closing: Bool = false
     private var exitHandledGeneration: Int64 = 0
+    private var brokerClosedGeneration: Int64 = 0
+    private var brokerExitObservedGeneration: Int64 = 0
+    private var brokerExitReason: String = ""
+    private var closeFailureStatus: String = ""
+    private var holdCloseReaderSettleForTest: Bool = false
+    private var closeReaderSettleIsHeldForTest: Bool = false
 
     public init(
         nodeCommand!: String = "node",
@@ -456,6 +462,28 @@ public class ManagedStdioBrokerClient {
             if (!state.settled) { count += 1 }
         }
         count
+    }
+
+    // Caller holds lock. A failed close remains fenced until the same broker
+    // generation's process and both client workers have reached terminal state.
+    private func tryFinalizeFailedCloseLocked(closeGeneration: Int64, closeStatus: String): Unit {
+        if (this.generation != closeGeneration || !this.closing || closeStatus.isEmpty() ||
+            this.closeFailureStatus != closeStatus || this.process.isSome() ||
+            this.readerCount != 0 || this.dispatcherCount != 0) { return }
+        this.writer = None<StringWriter<OutputStream>>
+        this.readerFuture = None<Future<Unit>>
+        this.dispatchFuture = None<Future<Unit>>
+        this.dispatchItems.clear()
+        this.dispatchBytes = 0
+        this.dispatchRegularCount = 0
+        this.dispatchRegularBytes = 0
+        this.dispatchClosing = false
+        this.helloReceived = false
+        this.brokerPid = 0
+        this.owners.clear()
+        this.status = this.closeFailureStatus
+        this.closing = false
+        this.condition.notifyAll()
     }
 
     public func ensureBrokerRunning(timeoutMs!: Int64 = MANAGED_STDIO_BROKER_START_TIMEOUT_MS): ManagedStdioOperationResult {
@@ -521,6 +549,10 @@ public class ManagedStdioBrokerClient {
                     case None => ()
                 }
                 this.generation += 1
+                this.brokerClosedGeneration = 0
+                this.brokerExitObservedGeneration = 0
+                this.brokerExitReason = ""
+                this.closeFailureStatus = ""
                 this.helloReceived = false
                 this.brokerPid = 0
                 this.status = "starting"
@@ -898,7 +930,8 @@ public class ManagedStdioBrokerClient {
                             if (this.dispatchFuture.isNone()) {
                                 this.dispatchClosing = false
                                 this.dispatcherCount = 1
-                                this.dispatchFuture = Some(spawn { this.dispatchOwnerEvents() })
+                                let dispatcherGeneration = state.generation
+                                this.dispatchFuture = Some(spawn { this.dispatchOwnerEvents(dispatcherGeneration) })
                             }
                             (ManagedStdioOperationResult(true, "subscribed", generation: state.generation, pid: state.pid, pgid: state.pgid), false)
                         }
@@ -961,7 +994,7 @@ public class ManagedStdioBrokerClient {
         }
     }
 
-    private func dispatchOwnerEvents(): Unit {
+    private func dispatchOwnerEvents(dispatcherGeneration: Int64): Unit {
         while (true) {
             let item = synchronized(this.lock) {
                 while (this.dispatchItems.isEmpty() && !this.dispatchClosing) {
@@ -1034,6 +1067,7 @@ public class ManagedStdioBrokerClient {
         }
         synchronized(this.lock) {
             this.dispatcherCount = 0
+            this.tryFinalizeFailedCloseLocked(dispatcherGeneration, this.closeFailureStatus)
             this.condition.notifyAll()
         }
     }
@@ -1300,6 +1334,7 @@ public class ManagedStdioBrokerClient {
         synchronized(this.lock) {
             if (this.generation == readerGeneration && this.readerCount > 0) {
                 this.readerCount = 0
+                this.tryFinalizeFailedCloseLocked(readerGeneration, this.closeFailureStatus)
                 this.condition.notifyAll()
             }
         }
@@ -1361,6 +1396,16 @@ public class ManagedStdioBrokerClient {
             synchronized(this.lock) {
                 if (this.generation == readerGeneration) {
                     this.lastTestHangId = managedStdioJsonString(obj, "requestId")
+                    this.condition.notifyAll()
+                }
+            }
+            return
+        }
+        if (frameType == "broker.closed") {
+            synchronized(this.lock) {
+                if (this.generation == readerGeneration && this.closing &&
+                    managedStdioJsonInt(obj, "ownerCount", -1) == 0) {
+                    this.brokerClosedGeneration = readerGeneration
                     this.condition.notifyAll()
                 }
             }
@@ -1445,7 +1490,9 @@ public class ManagedStdioBrokerClient {
             if (readerGeneration != this.generation) { return }
             if (this.exitHandledGeneration == readerGeneration) { return }
             this.exitHandledGeneration = readerGeneration
-            brokerProcess = this.process
+            this.brokerExitObservedGeneration = readerGeneration
+            this.brokerExitReason = reason
+            if (!this.closing) { brokerProcess = this.process }
             this.process = None<SubProcess>
             this.writer = None<StringWriter<OutputStream>>
             this.helloReceived = false
@@ -1468,7 +1515,17 @@ public class ManagedStdioBrokerClient {
                 try { let _ = value.wait(timeout: Some(Duration.second)) } catch (_: Exception) { () }
             case None => ()
         }
-        this.emergencyReapGeneration(reap.toArray())
+        if (!reap.isEmpty()) { this.emergencyReapGeneration(reap.toArray()) }
+        synchronized(this.lock) {
+            if (this.brokerTestMode && readerGeneration == this.generation && this.closing &&
+                this.holdCloseReaderSettleForTest) {
+                this.closeReaderSettleIsHeldForTest = true
+                this.condition.notifyAll()
+                while (this.holdCloseReaderSettleForTest) { let _ = this.condition.wait() }
+                this.closeReaderSettleIsHeldForTest = false
+                this.condition.notifyAll()
+            }
+        }
     }
 
     private func emergencyReapGeneration(ids: Array<(Int64, Int64)>): Unit {
@@ -1493,31 +1550,88 @@ public class ManagedStdioBrokerClient {
     }
 
     public func close(timeoutMs!: Int64 = 2000): ManagedStdioOperationResult {
-        let snapshot = this.snapshot()
-        let fullyStopped = synchronized(this.lock) {
-            this.process.isNone() && this.readerFuture.isNone() && this.readerCount == 0 && this.dispatchFuture.isNone()
+        let deadline = this.nowMs() + max(1, timeoutMs)
+        let claim = synchronized(this.lock) {
+            if (!this.closeFailureStatus.isEmpty()) {
+                (this.closeFailureStatus, this.generation, this.process)
+            } else if (this.closing) {
+                ("broker_close_in_progress", this.generation, this.process)
+            } else if (this.process.isNone() && this.readerFuture.isNone() && this.readerCount == 0 &&
+                this.dispatchFuture.isNone()) {
+                ("already_stopped", this.generation, this.process)
+            } else {
+                this.closing = true
+                this.brokerClosedGeneration = 0
+                ("", this.generation, this.process)
+            }
         }
-        if (fullyStopped) {
-            return ManagedStdioOperationResult(true, "already_stopped", generation: snapshot.generation)
+        if (!claim[0].isEmpty()) {
+            return ManagedStdioOperationResult(
+                claim[0] == "already_stopped", claim[0], generation: claim[1])
         }
-        synchronized(this.lock) { this.closing = true }
+        let closeGeneration = claim[1]
+        let proc = claim[2]
+        var closeStatus = "stopped"
         let frame = JsonObject()
         frame.put("type", JsonString("broker.close"))
-        let _ = this.writeFrame(frame)
-        let proc = synchronized(this.lock) { this.process }
+        let closeWritten = this.writeFrameForGeneration(frame, closeGeneration)
+        if (!closeWritten) {
+            closeStatus = "broker_close_write_failed"
+        } else {
+            let acknowledged = synchronized(this.lock) {
+                while (this.brokerClosedGeneration != closeGeneration &&
+                    this.brokerExitObservedGeneration != closeGeneration) {
+                    let remaining = deadline - this.nowMs()
+                    if (remaining <= 0) { break }
+                    let _ = this.condition.wait(timeout: Duration.millisecond * remaining)
+                }
+                this.brokerClosedGeneration == closeGeneration
+            }
+            if (!acknowledged) {
+                closeStatus = synchronized(this.lock) {
+                    if (this.brokerExitObservedGeneration == closeGeneration) {
+                        "broker_close_eof_before_ack"
+                    } else {
+                        "broker_close_ack_timeout"
+                    }
+                }
+            }
+        }
+        var exitCode: Int64 = -1
+        var exitObserved = false
         match (proc) {
             case Some(value) =>
-                try {
-                    let _ = value.wait(timeout: Some(Duration.millisecond * max(1, timeoutMs)))
-                } catch (_: Exception) {
+                if (closeStatus != "stopped" && value.isAlive()) {
                     try { value.terminate(force: true) } catch (_: Exception) { () }
-                    try { let _ = value.wait(timeout: Some(Duration.second)) } catch (_: Exception) { () }
                 }
-            case None => ()
+                let remaining = deadline - this.nowMs()
+                if (remaining > 0) {
+                    try {
+                        exitCode = value.wait(timeout: Some(Duration.millisecond * remaining))
+                        exitObserved = true
+                    } catch (_: Exception) {
+                        try { value.terminate(force: true) } catch (_: Exception) { () }
+                        if (closeStatus == "stopped") { closeStatus = "broker_close_exit_timeout" }
+                    }
+                } else {
+                    try { value.terminate(force: true) } catch (_: Exception) { () }
+                    if (closeStatus == "stopped") { closeStatus = "broker_close_exit_timeout" }
+                }
+            case None =>
+                if (closeStatus == "stopped") { closeStatus = "broker_close_process_missing" }
+        }
+        if (closeStatus == "stopped" && (!exitObserved || exitCode != 0)) {
+            closeStatus = "broker_close_exit_nonzero"
         }
         let reader = synchronized(this.lock) { this.readerFuture }
         let readerJoined = match (reader) {
-            case Some(future) => try { future.get(Duration.millisecond * max(1, timeoutMs)); true } catch (_: Exception) { false }
+            case Some(future) =>
+                let remaining = deadline - this.nowMs()
+                if (remaining > 0) {
+                    try { future.get(Duration.millisecond * remaining); true } catch (_: Exception) { false }
+                } else {
+                    synchronized(this.lock) { this.readerCount == 0 }
+                }
             case None => synchronized(this.lock) { this.readerCount == 0 }
         }
         let dispatcher = synchronized(this.lock) {
@@ -1526,8 +1640,25 @@ public class ManagedStdioBrokerClient {
             this.dispatchFuture
         }
         let dispatcherJoined = match (dispatcher) {
-            case Some(future) => try { future.get(Duration.millisecond * max(1, timeoutMs)); true } catch (_: Exception) { false }
+            case Some(future) =>
+                let remaining = deadline - this.nowMs()
+                if (remaining > 0) {
+                    try { future.get(Duration.millisecond * remaining); true } catch (_: Exception) { false }
+                } else {
+                    synchronized(this.lock) { this.dispatcherCount == 0 }
+                }
             case None => true
+        }
+        if (closeStatus == "stopped" && (!readerJoined || !dispatcherJoined)) {
+            closeStatus = "broker_shutdown_timeout"
+        }
+        let exitReason = synchronized(this.lock) { this.brokerExitReason }
+        if (closeStatus == "stopped" && exitReason != "broker_exited") {
+            closeStatus = if (exitReason == "invalid_response_encoding") {
+                "broker_close_invalid_response_encoding"
+            } else {
+                "broker_close_eof_before_ack"
+            }
         }
         if (readerJoined && dispatcherJoined) {
             synchronized(this.lock) {
@@ -1544,18 +1675,49 @@ public class ManagedStdioBrokerClient {
                 this.dispatchRegularBytes = 0
                 this.dispatcherCount = 0
                 this.dispatchClosing = false
-                this.status = "stopped"
+                this.status = closeStatus
                 this.owners.clear()
                 this.closing = false
+                this.closeFailureStatus = if (closeStatus == "stopped") { "" } else { closeStatus }
             }
         } else {
             synchronized(this.lock) {
-                this.status = "broker_shutdown_timeout"
-                this.closing = false
+                this.status = closeStatus
+                this.closeFailureStatus = closeStatus
+                this.tryFinalizeFailedCloseLocked(closeGeneration, closeStatus)
             }
         }
-        let joined = readerJoined && dispatcherJoined
-        ManagedStdioOperationResult(joined, if (joined) { "stopped" } else { "broker_shutdown_timeout" }, generation: snapshot.generation)
+        ManagedStdioOperationResult(
+            closeStatus == "stopped", closeStatus, generation: closeGeneration)
+    }
+
+    public func debugDropBrokerWriterForCloseTest(): Bool {
+        synchronized(this.lock) {
+            if (!this.brokerTestMode || this.process.isNone()) { return false }
+            this.writer = None<StringWriter<OutputStream>>
+            true
+        }
+    }
+
+    public func closeInProgressForTest(): Bool { synchronized(this.lock) { this.closing } }
+
+    public func debugHoldCloseReaderSettleForTest(): Bool {
+        synchronized(this.lock) {
+            if (!this.brokerTestMode || this.closing) { return false }
+            this.holdCloseReaderSettleForTest = true
+            true
+        }
+    }
+
+    public func closeReaderSettleHeldForTest(): Bool {
+        synchronized(this.lock) { this.closeReaderSettleIsHeldForTest }
+    }
+
+    public func debugReleaseCloseReaderSettleForTest(): Unit {
+        synchronized(this.lock) {
+            this.holdCloseReaderSettleForTest = false
+            this.condition.notifyAll()
+        }
     }
 
     public func debugKillBrokerForTest(): Unit {
