@@ -132,7 +132,8 @@ func gatewayServiceStopJsonStatus(value: JsonObject): (Bool, String) {
 func gatewayServiceStopOwnersThenBroker(
     stopOwners: () -> ServicePluginHostShutdownResult,
     stopChannels: () -> GatewayChannelStopSummary,
-    stopBroker: () -> ManagedStdioOperationResult
+    stopBroker: () -> ManagedStdioOperationResult,
+    shutdownObserver!: Option<(String) -> Unit> = None<(String) -> Unit>
 ): GatewayStopResult {
     var ownersOk = false
     var ownersStatus = "owners_failed"
@@ -146,6 +147,7 @@ func gatewayServiceStopOwnersThenBroker(
     var channelsStatus = "channels_failed"
     var brokerOk = false
     var brokerStatus = "broker_failed"
+    gatewayServiceNotifyShutdownObserver(shutdownObserver, "owners_enter")
     try {
         let owners = stopOwners()
         ownersOk = owners.ok
@@ -161,6 +163,8 @@ func gatewayServiceStopOwnersThenBroker(
     } catch (_: Exception) {
         ownersStatus = "owners_failed"
     }
+    gatewayServiceNotifyShutdownObserver(shutdownObserver, "owners_done")
+    gatewayServiceNotifyShutdownObserver(shutdownObserver, "channels_enter")
     try {
         let channels = stopChannels()
         channelsOk = channels.ok
@@ -168,6 +172,8 @@ func gatewayServiceStopOwnersThenBroker(
     } catch (_: Exception) {
         channelsStatus = "channels_failed"
     }
+    gatewayServiceNotifyShutdownObserver(shutdownObserver, "channels_done")
+    gatewayServiceNotifyShutdownObserver(shutdownObserver, "broker_enter")
     try {
         let brokerResult = stopBroker()
         brokerOk = brokerResult.ok
@@ -188,6 +194,7 @@ func gatewayServiceStopOwnersThenBroker(
     } catch (_: Exception) {
         brokerStatus = "broker_failed"
     }
+    gatewayServiceNotifyShutdownObserver(shutdownObserver, "broker_done")
     let ok = ownersOk && channelsOk && brokerOk
     GatewayStopResult(
         ok,
@@ -204,6 +211,16 @@ func gatewayServiceStopOwnersThenBroker(
         brokerStatus: brokerStatus,
         diagnostic: "owners=${ownersStatus} channels=${channelsStatus} broker=${brokerStatus}"
     )
+}
+
+private func gatewayServiceNotifyShutdownObserver(observer: Option<(String) -> Unit>, phase: String): Unit {
+    let allowed = phase == "owners_enter" || phase == "owners_done" || phase == "channels_enter" ||
+        phase == "channels_done" || phase == "broker_enter" || phase == "broker_done"
+    if (!allowed) { return }
+    match (observer) {
+        case Some(value) => try { value(phase) } catch (_: Exception) { () }
+        case None => ()
+    }
 }
 
 private func gatewayInboundFallbackOrderingKey(message: InboundMessage, accountId: String): String {
@@ -403,7 +420,7 @@ public class GatewayService {
     /**
      * 停止所有渠道。
      */
-    public func stop(): GatewayStopResult {
+    public func stop(shutdownObserver!: Option<(String) -> Unit> = None<(String) -> Unit>): GatewayStopResult {
         let inboundStop = this.inboundDispatcher.stop(timeoutMs: 3000)
         if (!inboundStop.ok) {
             gatewayLogEventError(
@@ -436,7 +453,7 @@ public class GatewayService {
         }, { =>
             // The broker is the final process-I/O owner. This cleanup must run even when an earlier owner stop throws.
             shutdownGatewayStdioBroker(timeoutMs: 2000)
-        })
+        }, shutdownObserver: shutdownObserver)
         let ownersOk = compat[0] && sidecar[0] && stopped.ok
         let ownersStatus = if (ownersOk) { "stopped" } else { "cleanup_pending" }
         let ok = inboundStop.ok && compat[0] && sidecar[0] && stopped.ok

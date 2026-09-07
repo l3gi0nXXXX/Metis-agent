@@ -3,7 +3,7 @@ package metis.gateway.runtime
 import magic.jsonable.*
 
 import metis.core.gatewaySubagentResolveAgent
-import metis.core.config.{CliConfig, CliModelRuntimeStateManager, CliSettingManager, MetisConfigManager, MetisProcessEnvironmentLock}
+import metis.core.config.{CliConfig, CliModelRuntimeStateManager, CliSettingManager, MetisConfigManager, MetisProcessEnvironmentLock, cliProviderApiKeyEnvAliases}
 import metis.gateway.core.{GatewayAgentRouteInput, GatewayResolvedSessionTurnResult, GatewaySessionExecutionResult, gatewayAgentTeamBroadcastAggregateJson, gatewayResolveAgentRoute, gatewayResolveAgentTeamBroadcastPlan, gatewayResolveSessionContextWithAgentRoute}
 import metis.gateway.session.{GatewayIngressSource, GatewaySessionRequest}
 
@@ -213,7 +213,7 @@ private func agentsTestClean(path: Path): Unit {
     }
 }
 
-private func withAgentsTempHome<T>(label: String, block: (Path) -> T): T {
+private func withAgentsTempHome<T>(label: String, block: (Path) -> T, clearOpenAiEnv!: Bool = false): T {
     synchronized(MetisProcessEnvironmentLock) {
         let home = Path("/tmp/${label}")
         try {
@@ -223,6 +223,13 @@ private func withAgentsTempHome<T>(label: String, block: (Path) -> T): T {
         }
         Directory.create(home, recursive: true)
         let oldHome = getVariable("METIS_HOME")
+        let oldOpenAiEnv = ArrayList<(String, Option<String>)>()
+        if (clearOpenAiEnv) {
+            for (key in cliProviderApiKeyEnvAliases("openai")) {
+                oldOpenAiEnv.add((key, getVariable(key)))
+                setVariable(key, "")
+            }
+        }
         setVariable("METIS_HOME", home.toString())
         CliConfig.invalidatePathCache()
         MetisConfigManager.invalidate()
@@ -230,6 +237,12 @@ private func withAgentsTempHome<T>(label: String, block: (Path) -> T): T {
         try {
             return block(home)
         } finally {
+            for ((key, value) in oldOpenAiEnv) {
+                match (value) {
+                    case Some(previous) => setVariable(key, previous)
+                    case None => setVariable(key, "")
+                }
+            }
             match (oldHome) {
                 case Some(value) => setVariable("METIS_HOME", value)
                 case None => setVariable("METIS_HOME", "")
@@ -2518,7 +2531,7 @@ public class GatewayServerMethodsAgentsTest {
             @Expect(exists(userWorkspace.join("USER.md")), true)
             @Expect(exists(home.join("agents").join("team-reviewer").join("agent").join("AGENT.md")), true)
             @Expect(exists(home.join("workspaces").join("team-reviewer").join("SOUL.md")), true)
-        })
+        }, clearOpenAiEnv: true)
     }
 
     @TestCase

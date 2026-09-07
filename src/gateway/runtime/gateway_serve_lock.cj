@@ -3,15 +3,17 @@ package metis.gateway.runtime
 import metis.core.config.{CliConfig, CliSettingManager}
 import metis.gateway.core.GatewayStopResult
 import metis.process.{ProcessInstanceIdentity, currentProcessInstanceIdentity, parseProcessInstanceIdentity, probeProcessInstance, processInstanceKillSignal, processInstanceTermSignal, publishExclusiveUtf8File, signalProcessInstance}
-import metis.utils.{InfoUtils, SHELL_INVALID_RESPONSE_ENCODING_EXIT_CODE, ShellUtils}
+import metis.utils.{InfoUtils, SHELL_INVALID_RESPONSE_ENCODING_EXIT_CODE, ShellTimeoutException, ShellUtils}
 
 import std.collection.{ArrayList, HashSet}
 import std.convert.Parsable
-import std.env.atExit
+import std.env.{atExit, getVariable}
 import std.fs.{Path, File, FileInfo, exists, remove, rename}
+import std.posix.chmod
 import std.sync.*
 import std.time.{DateTime, MonoTime}
 import std.core.Duration
+import stdx.encoding.json.{JsonInt, JsonObject, JsonString, JsonValue}
 
 private let LOCK_FILE: String = "gateway-serve.lock"
 private let COMPLETION_FILE: String = "gateway-serve.stop-complete"
@@ -29,6 +31,16 @@ private let GATEWAY_STOP_KILL_WAIT_TOTAL: Duration = Duration.millisecond * 500
 private let GATEWAY_STOP_KILL_WAIT_STEP: Duration = Duration.millisecond * 50
 private let gatewayServeMonotonicOrigin = MonoTime.now()
 private let gatewayServeIdentityLock = Mutex()
+private let gatewayServePortProbeLock = Mutex()
+private var gatewayServePortProbeForTest: Option<(Int64, Int64) -> (Int64, String, String)> =
+    None<(Int64, Int64) -> (Int64, String, String)>
+
+/** Test-only synchronous probe seam. None preserves the production ShellUtils path. */
+public func setGatewayServePortProbeForTest(
+    probe: Option<(Int64, Int64) -> (Int64, String, String)>
+): Unit {
+    synchronized(gatewayServePortProbeLock) { gatewayServePortProbeForTest = probe }
+}
 
 public class GatewayServeIdentity {
     public let pid: Int64
@@ -307,11 +319,18 @@ public func gatewayFindVerifiedListenerPidsOnPortUntil(deadline: MonoTime, port!
     }
     let initialRemaining = (deadline - MonoTime.now()).toMilliseconds()
     if (initialRemaining <= 0) { return GatewayServeListenerDiscoveryResult(false, [], "listener_discovery_timeout") }
-    let (ec, out, _) = ShellUtils.execute(
-        ["lsof", "-nP", "-iTCP:${port}", "-sTCP:LISTEN", "-t"],
-        withWrap: false,
-        timeout: Some(Duration.millisecond * initialRemaining)
-    )
+    let execution = try {
+        ShellUtils.execute(
+            ["lsof", "-nP", "-iTCP:${port}", "-sTCP:LISTEN", "-t"],
+            withWrap: false,
+            timeout: Some(Duration.millisecond * initialRemaining)
+        )
+    } catch (_: ShellTimeoutException) {
+        return GatewayServeListenerDiscoveryResult(false, [], "listener_discovery_timeout")
+    } catch (_: Exception) {
+        return GatewayServeListenerDiscoveryResult(false, [], "listener_discovery_failed")
+    }
+    let (ec, out, _) = execution
     if (ec != 0) {
         return if (ec == 1) {
             GatewayServeListenerDiscoveryResult(true, [], "no_listener")
@@ -327,12 +346,18 @@ public func gatewayFindVerifiedListenerPidsOnPortUntil(deadline: MonoTime, port!
     for (pid in gatewayParsePidListText(out)) {
         let remaining = (deadline - MonoTime.now()).toMilliseconds()
         if (remaining <= 0) { return GatewayServeListenerDiscoveryResult(false, result.toArray(), "listener_discovery_timeout") }
-        match (gatewayReadProcessCommand(pid, remaining)) {
-            case Some(command) =>
-                if (gatewayLooksLikeServeCommand(command)) {
-                    result.add(pid)
-                }
-            case None => return GatewayServeListenerDiscoveryResult(false, result.toArray(), "listener_identity_unavailable")
+        try {
+            match (gatewayReadProcessCommand(pid, remaining)) {
+                case Some(command) =>
+                    if (gatewayLooksLikeServeCommand(command)) {
+                        result.add(pid)
+                    }
+                case None => return GatewayServeListenerDiscoveryResult(false, result.toArray(), "listener_identity_unavailable")
+            }
+        } catch (_: ShellTimeoutException) {
+            return GatewayServeListenerDiscoveryResult(false, result.toArray(), "listener_discovery_timeout")
+        } catch (_: Exception) {
+            return GatewayServeListenerDiscoveryResult(false, result.toArray(), "listener_discovery_failed")
         }
     }
     GatewayServeListenerDiscoveryResult(true, result.toArray(), if (result.isEmpty()) { "no_listener" } else { "listeners_verified" })
@@ -409,6 +434,74 @@ private func gatewayAtomicWrite(path: Path, text: String): Bool {
     }
 }
 
+private func gatewayShutdownPhaseSequence(phase: String): Int64 {
+    if (phase == "stop_request_observed") { return 1 }
+    if (phase == "canvas_done") { return 2 }
+    if (phase == "http_close_enter") { return 3 }
+    if (phase == "http_close_returned") { return 4 }
+    if (phase == "http_probe_done") { return 5 }
+    if (phase == "gateway_stop_enter") { return 6 }
+    if (phase == "owners_enter") { return 7 }
+    if (phase == "owners_done") { return 8 }
+    if (phase == "channels_enter") { return 9 }
+    if (phase == "channels_done") { return 10 }
+    if (phase == "broker_enter") { return 11 }
+    if (phase == "broker_done") { return 12 }
+    if (phase == "gateway_stop_returned") { return 13 }
+    if (phase == "completion_written") { return 14 }
+    0
+}
+
+/** Test-only shutdown ordering proof. Empty or partial environment is a zero-behaviour no-op. */
+public func gatewayPublishShutdownPhaseForTest(identity: GatewayServeIdentity, phase: String): Bool {
+    let markerBase = getVariable("METIS_TEST_GATEWAY_SHUTDOWN_PHASE_MARKER").getOrDefault { "" }.trimAscii()
+    let testNonce = getVariable("METIS_TEST_GATEWAY_SHUTDOWN_PHASE_NONCE").getOrDefault { "" }.trimAscii()
+    let sequence = gatewayShutdownPhaseSequence(phase.trimAscii())
+    if (markerBase.isEmpty() || testNonce.isEmpty() || sequence <= 0) { return false }
+    let processIdentity = match (identity.processIdentity) {
+        case Some(value) => value.serialize()
+        case None => return false
+    }
+    if (sequence > 1) {
+        let previous = Path("${markerBase}.${sequence - 1}.json")
+        let previousMatches = try {
+            let value = JsonValue.fromStr(String.fromUtf8(File.readFrom(previous))).asObject()
+            value.get("schema").getOrThrow().asString().getValue() == "metis.gateway.shutdownPhase.v1" &&
+                value.get("sequence").getOrThrow().asInt().getValue() == sequence - 1 &&
+                value.get("pid").getOrThrow().asInt().getValue() == identity.pid &&
+                value.get("startedAtMs").getOrThrow().asInt().getValue() == identity.startedAtMs &&
+                value.get("nonce").getOrThrow().asString().getValue() == identity.nonce &&
+                value.get("processIdentity").getOrThrow().asString().getValue() == processIdentity &&
+                value.get("testNonce").getOrThrow().asString().getValue() == testNonce
+        } catch (_: Exception) {
+            false
+        }
+        if (!previousMatches) { return false }
+    }
+    let marker = Path("${markerBase}.${sequence}.json")
+    let temporary = Path("${marker.toString()}.tmp-${gatewayCurrentProcessId()}-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
+    try {
+        let root = JsonObject()
+        root.put("schema", JsonString("metis.gateway.shutdownPhase.v1"))
+        root.put("phase", JsonString(phase.trimAscii()))
+        root.put("sequence", JsonInt(sequence))
+        root.put("pid", JsonInt(identity.pid))
+        root.put("startedAtMs", JsonInt(identity.startedAtMs))
+        root.put("nonce", JsonString(identity.nonce))
+        root.put("processIdentity", JsonString(processIdentity))
+        root.put("testNonce", JsonString(testNonce))
+        root.put("observedMonotonicMs", JsonInt(gatewayServeNowMonotonicMs()))
+        File.writeTo(temporary, root.toJsonString().toArray())
+        chmod(temporary.toString(), UInt32(0o600))
+        rename(temporary, to: marker, overwrite: true)
+        chmod(marker.toString(), UInt32(0o600))
+        true
+    } catch (_: Exception) {
+        try { if (exists(temporary)) { remove(temporary) } } catch (_: Exception) { () }
+        false
+    }
+}
+
 private func gatewayReadLockText(p: Path): Option<String> {
     try {
         Some(String.fromUtf8(File.readFrom(p)))
@@ -475,7 +568,10 @@ public func gatewayServeStopRequested(identity: GatewayServeIdentity): Bool {
     match (gatewayReadLockText(path)) {
         case Some(text) =>
             match (gatewayParseServeStopRequestIdentity(text)) {
-                case Some(requested) => requested.matches(identity)
+                case Some(requested) =>
+                    let matched = requested.matches(identity)
+                    if (matched) { let _ = gatewayPublishShutdownPhaseForTest(identity, "stop_request_observed") }
+                    matched
                 case None => false
             }
         case None => false
@@ -677,13 +773,27 @@ public func gatewayWriteServeCompletionMarker(identity: GatewayServeIdentity, re
 
 public func gatewayServePortReleasedUntil(port: Int64, deadline: MonoTime): GatewaySurfaceStopResult {
     if (port <= 0) { return GatewaySurfaceStopResult(true, "not_applicable") }
-    while (MonoTime.now() < deadline) {
-        let remaining = (deadline - MonoTime.now()).toMilliseconds()
-        let (exitCode, _, stderr) = ShellUtils.execute(
-            ["lsof", "-nP", "-iTCP:${port}", "-sTCP:LISTEN", "-t"],
-            withWrap: false,
-            timeout: Some(Duration.millisecond * max(1, remaining))
-        )
+    let localDeadline = MonoTime.now() + Duration.second * 2
+    let effectiveDeadline = if (deadline < localDeadline) { deadline } else { localDeadline }
+    while (MonoTime.now() < effectiveDeadline) {
+        let remaining = (effectiveDeadline - MonoTime.now()).toMilliseconds()
+        let probeBudget = min(Int64(500), max(Int64(1), remaining))
+        let testProbe = synchronized(gatewayServePortProbeLock) { gatewayServePortProbeForTest }
+        let result = try {
+            match (testProbe) {
+                case Some(probe) => probe(port, probeBudget)
+                case None => ShellUtils.execute(
+                    ["lsof", "-nP", "-iTCP:${port}", "-sTCP:LISTEN", "-t"],
+                    withWrap: false,
+                    timeout: Some(Duration.millisecond * probeBudget)
+                )
+            }
+        } catch (_: ShellTimeoutException) {
+            return GatewaySurfaceStopResult(false, "cleanup_pending", portStatus: "port_probe_timeout")
+        } catch (_: Exception) {
+            return GatewaySurfaceStopResult(false, "cleanup_pending", portStatus: "port_probe_failed")
+        }
+        let (exitCode, _, stderr) = result
         if (exitCode == 1 && stderr.trimAscii().isEmpty()) {
             return GatewaySurfaceStopResult(true, "stopped", portStatus: "released")
         }
@@ -700,7 +810,11 @@ public func gatewayServePortReleasedUntil(port: Int64, deadline: MonoTime): Gate
  * 若锁内 PID 已退出，会删除陈旧锁文件并返回 false。
  */
 public func gatewayAnotherServeInstanceSeemsRunning(): Bool {
-    if (gatewayFindVerifiedListenerPidsOnPort().size > 0) {
+    let listeners = gatewayFindVerifiedListenerPidsOnPortDetailed()
+    if (listeners.pids.size > 0) {
+        return true
+    }
+    if (!listeners.conclusive) {
         return true
     }
     let p = gatewayServeLockPath()

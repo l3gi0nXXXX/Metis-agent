@@ -1,17 +1,18 @@
 package metis.gateway.runtime
 
 import metis.core.config.{CliConfig, CliSettingManager, GatewayServicePluginUserSettings, MetisConfigManager, MetisProcessEnvironmentLock, cliProviderApiKeyEnvAliases, cliProviderBaseUrlEnvAliases}
-import metis.gateway.process.gatewayStdioBrokerSnapshot
+import metis.gateway.process.{gatewayStdioBrokerReady, gatewayStdioBrokerSnapshot}
 import metis.gateway.service_plugin.loadServicePluginManifest
 import metis.gateway.core.GatewayStopResult
-import metis.process.{ProcessInstanceIdentity, currentProcessInstanceIdentity, managedStdioResolveBrokerScriptPath, probeProcessInstance, processInstanceKillSignal, processInstanceTermSignal, resetManagedStdioBrokerForTest, signalProcessInstance}
+import metis.process.{ProcessInstanceIdentity, currentProcessInstanceIdentity, managedStdioBroker, managedStdioResolveBrokerScriptPath, probeProcessInstance, processInstanceKillSignal, processInstanceTermSignal, resetManagedStdioBrokerForTest, signalProcessInstance}
 import std.collection.{ArrayList, HashMap, HashSet}
 import std.convert.Parsable
 import std.core.Duration
-import std.env.{getVariable, setVariable}
+import std.env.{getProcessId, getVariable, setVariable}
 import std.fs.{Directory, File, Path, exists, remove}
 import std.net.*
 import std.process.{ProcessRedirect, SubProcess, executeWithOutput, launch}
+import std.sync.AtomicInt64
 import std.time.{DateTime, MonoTime}
 import std.unittest.testmacro.*
 import stdx.encoding.json.JsonValue
@@ -169,6 +170,112 @@ private func gatewayServeStopCaptureOwnedIdentity(
         sleep(Duration.millisecond * 20)
     }
     None<GatewayServeIdentity>
+}
+
+private class GatewayHeartbeatCommandProbeResult {
+    let status: String
+
+    init(status: String) {
+        this.status = status
+    }
+}
+
+private func gatewayHeartbeatProbeGatewayCommand(pid: Int64, expectedBinary: Path): GatewayHeartbeatCommandProbeResult {
+    if (pid <= 1) { return GatewayHeartbeatCommandProbeResult("unavailable") }
+    let result = executeWithOutput("/bin/ps", ["-o", "command=", "-p", "${pid}"])
+    if (result[0] != 0) { return GatewayHeartbeatCommandProbeResult("unavailable") }
+    let command = try {
+        String.fromUtf8(result[1]).trimAscii()
+    } catch (_: Exception) {
+        return GatewayHeartbeatCommandProbeResult("unavailable")
+    }
+    if (command.isEmpty()) { return GatewayHeartbeatCommandProbeResult("unavailable") }
+    if (command.contains(expectedBinary.toString()) && command.contains("gateway run")) {
+        GatewayHeartbeatCommandProbeResult("match")
+    } else {
+        GatewayHeartbeatCommandProbeResult("mismatch")
+    }
+}
+
+private class GatewayHeartbeatIdentityCaptureResult {
+    let identity: Option<GatewayServeIdentity>
+    let status: String
+    let attempts: Int64
+    let unavailableCount: Int64
+    let lockSeen: Bool
+
+    init(
+        identity: Option<GatewayServeIdentity>,
+        status: String,
+        attempts: Int64,
+        unavailableCount: Int64,
+        lockSeen: Bool
+    ) {
+        this.identity = identity
+        this.status = status
+        this.attempts = attempts
+        this.unavailableCount = unavailableCount
+        this.lockSeen = lockSeen
+    }
+}
+
+private func gatewayHeartbeatCaptureOwnedIdentityDetailed(
+    home: Path,
+    process: SubProcess,
+    expectedBinary: Path,
+    timeoutMs: Int64
+): GatewayHeartbeatIdentityCaptureResult {
+    let deadline = MonoTime.now() + Duration.millisecond * max(1, timeoutMs)
+    var attempts: Int64 = 0
+    var unavailableCount: Int64 = 0
+    var lockSeen = false
+    var sawInvalidLock = false
+    while (MonoTime.now() < deadline) {
+        attempts += 1
+        if (!process.isAlive()) {
+            return GatewayHeartbeatIdentityCaptureResult(
+                None<GatewayServeIdentity>, "process_exited", attempts, unavailableCount, lockSeen)
+        }
+        let lockPath = home.join("gateway-serve.lock")
+        if (exists(lockPath)) {
+            lockSeen = true
+            let identity = try {
+                gatewayParseServeIdentity(String.fromUtf8(File.readFrom(lockPath)))
+            } catch (_: Exception) {
+                None<GatewayServeIdentity>
+            }
+            match (identity) {
+                case Some(value) =>
+                    if (value.pid != process.pid || !value.processIdentity.isSome()) {
+                        return GatewayHeartbeatIdentityCaptureResult(
+                            None<GatewayServeIdentity>, "identity_mismatch", attempts, unavailableCount, lockSeen)
+                    }
+                    let alive = probeProcessInstance(value.processIdentity.getOrThrow(), deadline)
+                    if (alive.conclusive && !alive.alive) {
+                        return GatewayHeartbeatIdentityCaptureResult(
+                            None<GatewayServeIdentity>, "process_exited", attempts, unavailableCount, lockSeen)
+                    }
+                    if (alive.conclusive && alive.alive) {
+                        let command = gatewayHeartbeatProbeGatewayCommand(process.pid, expectedBinary)
+                        if (command.status == "unavailable") { unavailableCount += 1 }
+                        if (command.status == "match") {
+                            return GatewayHeartbeatIdentityCaptureResult(
+                                Some(value), "captured", attempts, unavailableCount, lockSeen)
+                        }
+                        if (command.status == "mismatch") {
+                            return GatewayHeartbeatIdentityCaptureResult(
+                                None<GatewayServeIdentity>, "command_mismatch", attempts, unavailableCount, lockSeen)
+                        }
+                    }
+                case None =>
+                    sawInvalidLock = true
+            }
+        }
+        sleep(Duration.millisecond * 20)
+    }
+    GatewayHeartbeatIdentityCaptureResult(
+        None<GatewayServeIdentity>, if (sawInvalidLock) { "lock_invalid" } else { "capture_timeout" },
+        attempts, unavailableCount, lockSeen)
 }
 
 private class GatewayServeStopResourceCapture {
@@ -394,6 +501,29 @@ private func gatewayServeStopRuntimeOwnerCount(path: Path): Int64 {
     }
 }
 
+private func gatewayHeartbeatRuntimeInt(path: Path, key: String): Int64 {
+    if (!exists(path)) { return 0 }
+    try {
+        JsonValue.fromStr(String.fromUtf8(File.readFrom(path))).asObject()
+            .get(key).getOrThrow().asInt().getValue()
+    } catch (_: Exception) {
+        0
+    }
+}
+
+private func gatewayHeartbeatHttpStatus(url: String): Int64 {
+    let builder = ClientBuilder()
+    builder.readTimeout(Duration.millisecond * 500)
+    let client = builder.build()
+    try {
+        Int64(client.send(HttpRequestBuilder().url(url).get().build()).status)
+    } catch (_: Exception) {
+        0
+    } finally {
+        client.close()
+    }
+}
+
 private class GatewayServeStopLiveOwnerProof {
     var httpStatus: Int64 = 0
     var running: Bool = false
@@ -545,6 +675,25 @@ private func gatewayS5GcmRoot(): Path {
 
 private func gatewayS5GcmBinary(): Path {
     gatewayS5GcmRoot().join("target").join("release").join("bin").join("gitcodemonitor")
+}
+
+private func gatewayFormalMetisBinary(project: Path): Option<Path> {
+    let configured = getVariable("METIS_TEST_BIN").getOrDefault { "" }.trimAscii()
+    if (configured.isEmpty()) {
+        return Some(project.join("target").join("release").join("bin").join("metis"))
+    }
+    let candidate = Path(configured)
+    if (!candidate.isAbsolute() || !exists(candidate)) { return None<Path> }
+    try {
+        for (entry in Directory.readFrom(candidate.parent)) {
+            if (entry.path.toString() == candidate.toString()) {
+                return if (entry.isRegular()) { Some(candidate) } else { None<Path> }
+            }
+        }
+    } catch (_: Exception) {
+        return None<Path>
+    }
+    None<Path>
 }
 
 private func gatewayS5StartDependencies(
@@ -817,6 +966,260 @@ private func gatewayS5JsonInt(path: Path, key: String): Int64 {
     } catch (_: Exception) {
         0
     }
+}
+
+private func gatewayS5JsonString(path: Path, key: String): String {
+    if (!exists(path)) { return "" }
+    try {
+        JsonValue.fromStr(String.fromUtf8(File.readFrom(path))).asObject()
+            .get(key).getOrThrow().asString().getValue()
+    } catch (_: Exception) {
+        ""
+    }
+}
+
+private class GatewayHeartbeatBrokerDiagnostic {
+    var valid: Bool = false
+    var parseStatus: String = "missing"
+    var generation: Int64 = 0
+    var brokerPid: Int64 = 0
+    var startParentPid: Int64 = 0
+    var observedParentPid: Int64 = 0
+    var sequence: Int64 = 0
+    var closeEntryCount: Int64 = 0
+    var closeEntryOwnerCount: Int64 = -1
+    var ownerTerminalCount: Int64 = 0
+    var ownerStartCount: Int64 = 0
+    var classifiedOwnerTerminalCount: Int64 = 0
+    var servicePluginStarts: Int64 = 0
+    var pidProbeStarts: Int64 = 0
+    var lsofProbeStarts: Int64 = 0
+    var otherStarts: Int64 = 0
+    var servicePluginTerminals: Int64 = 0
+    var pidProbeTerminals: Int64 = 0
+    var lsofProbeTerminals: Int64 = 0
+    var otherTerminals: Int64 = 0
+    var brokerClosedCallbackCount: Int64 = 0
+    var brokerClosedEnqueuedCount: Int64 = 0
+    var closeAckCallbackSeen: Bool = false
+    var writerFailureKind: String = ""
+    var writerFailurePhase: String = ""
+    var ownerCount: Int64 = -1
+    var exitScheduledCount: Int64 = 0
+    var lastExitScheduledCode: Int64 = -1
+    var firstEventBrokerStarted: Bool = false
+    var filenameMatches: Bool = false
+
+    init(path: Path, fileName!: String = "") {
+        if (!exists(path)) { return }
+        let text = try {
+            String.fromUtf8(File.readFrom(path))
+        } catch (_: Exception) {
+            this.parseStatus = "invalid_utf8"
+            return
+        }
+        let root = try {
+            JsonValue.fromStr(text).asObject()
+        } catch (_: Exception) {
+            this.parseStatus = "malformed_json"
+            return
+        }
+        try {
+            if (root.get("protocolVersion").getOrThrow().asString().getValue() != "1.0") {
+                this.parseStatus = "protocol_mismatch"
+                return
+            }
+            this.generation = root.get("generation").getOrThrow().asInt().getValue()
+            this.brokerPid = root.get("brokerPid").getOrThrow().asInt().getValue()
+            this.startParentPid = root.get("startParentPid").getOrThrow().asInt().getValue()
+            this.observedParentPid = root.get("observedParentPid").getOrThrow().asInt().getValue()
+            this.sequence = root.get("sequence").getOrThrow().asInt().getValue()
+            this.closeEntryCount = root.get("closeEntryCount").getOrThrow().asInt().getValue()
+            this.closeEntryOwnerCount = root.get("closeEntryOwnerCount").getOrThrow().asInt().getValue()
+            this.ownerTerminalCount = root.get("ownerTerminalCount").getOrThrow().asInt().getValue()
+            let ownerStarts = root.get("ownerStartCounts").getOrThrow().asObject()
+            let ownerTerminals = root.get("ownerTerminalCounts").getOrThrow().asObject()
+            this.servicePluginStarts = ownerStarts.get("service_plugin").getOrThrow().asInt().getValue()
+            this.pidProbeStarts = ownerStarts.get("pid_probe").getOrThrow().asInt().getValue()
+            this.lsofProbeStarts = ownerStarts.get("lsof_probe").getOrThrow().asInt().getValue()
+            this.otherStarts = ownerStarts.get("other").getOrThrow().asInt().getValue()
+            this.servicePluginTerminals = ownerTerminals.get("service_plugin").getOrThrow().asInt().getValue()
+            this.pidProbeTerminals = ownerTerminals.get("pid_probe").getOrThrow().asInt().getValue()
+            this.lsofProbeTerminals = ownerTerminals.get("lsof_probe").getOrThrow().asInt().getValue()
+            this.otherTerminals = ownerTerminals.get("other").getOrThrow().asInt().getValue()
+            this.ownerStartCount = this.servicePluginStarts + this.pidProbeStarts +
+                this.lsofProbeStarts + this.otherStarts
+            this.classifiedOwnerTerminalCount = this.servicePluginTerminals + this.pidProbeTerminals +
+                this.lsofProbeTerminals + this.otherTerminals
+            this.brokerClosedCallbackCount = root.get("brokerClosedCallbackCount").getOrThrow().asInt().getValue()
+            this.brokerClosedEnqueuedCount = root.get("brokerClosedEnqueuedCount").getOrThrow().asInt().getValue()
+            this.closeAckCallbackSeen = root.get("closeAckCallbackSeen").getOrThrow().asBool().getValue()
+            this.writerFailureKind = root.get("writerFailureKind").getOrThrow().asString().getValue()
+            this.writerFailurePhase = root.get("writerFailurePhase").getOrThrow().asString().getValue()
+            this.ownerCount = root.get("ownerCount").getOrThrow().asInt().getValue()
+            this.exitScheduledCount = root.get("exitScheduledCount").getOrThrow().asInt().getValue()
+            this.lastExitScheduledCode = root.get("lastExitScheduledCode").getOrThrow().asInt().getValue()
+            let events = root.get("events").getOrThrow().asArray()
+            if (events.size() > 0) {
+                this.firstEventBrokerStarted = events[0].asObject().get("event").getOrThrow()
+                    .asString().getValue() == "broker_started"
+            }
+            let kindValid = this.writerFailureKind.isEmpty() || this.writerFailureKind == "output_error" ||
+                this.writerFailureKind == "callback_error" || this.writerFailureKind == "queue_capacity" ||
+                this.writerFailureKind == "write_exception"
+            let phaseValid = this.writerFailurePhase.isEmpty() || this.writerFailurePhase == "broker_closed" ||
+                this.writerFailurePhase == "owner_terminal" || this.writerFailurePhase == "other"
+            this.valid = this.generation > 0 && this.brokerPid > 1 && this.startParentPid > 1 &&
+                this.observedParentPid >= 1 &&
+                this.sequence > 0 && this.firstEventBrokerStarted && kindValid && phaseValid &&
+                this.classifiedOwnerTerminalCount == this.ownerTerminalCount
+            this.parseStatus = if (this.valid) { "schema_valid" } else { "invalid_field" }
+            this.filenameMatches = fileName == "broker-g${this.generation}-p${this.brokerPid}.json"
+        } catch (_: Exception) {
+            this.valid = false
+            this.parseStatus = "invalid_field"
+        }
+    }
+
+    func parentStatus(expectedParentPid: Int64): String {
+        if (!this.valid || this.startParentPid != expectedParentPid) { return "unexpected_parent" }
+        if (this.observedParentPid == expectedParentPid) { return "original_parent" }
+        if (this.observedParentPid == 1) { return "reparented" }
+        "unexpected_parent"
+    }
+
+    func safeSummary(role: String, expectedParentPid: Int64): String {
+        "role=${role} parse=${this.parseStatus} filename=${this.filenameMatches} " +
+            "first=${this.firstEventBrokerStarted} parent=${this.parentStatus(expectedParentPid)} " +
+            "generation=${this.generation} sequence=${this.sequence} " +
+            "starts=${this.servicePluginStarts}/${this.pidProbeStarts}/${this.lsofProbeStarts}/${this.otherStarts} " +
+            "terminals=${this.servicePluginTerminals}/${this.pidProbeTerminals}/${this.lsofProbeTerminals}/${this.otherTerminals} " +
+            "terminalMatch=${this.classifiedOwnerTerminalCount == this.ownerTerminalCount} " +
+            "close=${this.closeEntryCount}/${this.closeEntryOwnerCount} " +
+            "closed=${this.brokerClosedEnqueuedCount}/${this.brokerClosedCallbackCount}/${this.closeAckCallbackSeen} " +
+            "failure=${this.writerFailureKind}/${this.writerFailurePhase} ownerCount=${this.ownerCount} " +
+            "exit=${this.exitScheduledCount}/${this.lastExitScheduledCode}"
+    }
+}
+
+private func gatewayHeartbeatBrokerDiagnostics(path: Path): ArrayList<GatewayHeartbeatBrokerDiagnostic> {
+    let values = ArrayList<GatewayHeartbeatBrokerDiagnostic>()
+    if (!exists(path)) { return values }
+    try {
+        for (entry in Directory.readFrom(path)) {
+            if (!entry.isRegular() || !entry.name.startsWith("broker-g") || !entry.name.endsWith(".json")) {
+                continue
+            }
+            values.add(GatewayHeartbeatBrokerDiagnostic(entry.path, fileName: entry.name))
+        }
+    } catch (_: Exception) {
+        values.clear()
+    }
+    values
+}
+
+private func gatewayHeartbeatBrokerDiagnosticOverflow(path: Path): Bool {
+    let overflow = path.join("overflow.json")
+    if (!exists(overflow)) { return false }
+    try {
+        let root = JsonValue.fromStr(String.fromUtf8(File.readFrom(overflow))).asObject()
+        root.get("overflow").getOrThrow().asBool().getValue() &&
+            root.get("capacity").getOrThrow().asInt().getValue() == 16
+    } catch (_: Exception) {
+        false
+    }
+}
+
+private class GatewayHeartbeatBrokerDirectoryProof {
+    var status: String = "missing"
+    var identityCount: Int64 = 0
+    var slotCount: Int64 = 0
+    var tempCount: Int64 = 0
+    var overflow: Bool = false
+
+    init(path: Path) {
+        if (!exists(path)) { return }
+        var invalidEntry = false
+        var invalidMarker = false
+        try {
+            for (entry in Directory.readFrom(path)) {
+                if (entry.isDirectory()) {
+                    var slotValid = false
+                    for (slot in 0..16) {
+                        if (entry.name == ".identity-slot-${slot}") { slotValid = true }
+                    }
+                    if (!slotValid) { invalidEntry = true } else { this.slotCount++ }
+                    continue
+                }
+                if (!entry.isRegular()) {
+                    invalidEntry = true
+                    continue
+                }
+                if (entry.name == "overflow.json") {
+                    if (gatewayHeartbeatBrokerDiagnosticOverflow(path)) {
+                        this.overflow = true
+                    } else {
+                        invalidEntry = true
+                    }
+                    continue
+                }
+                if (entry.name.startsWith("broker-g") && entry.name.contains(".json.tmp-")) {
+                    this.tempCount++
+                    continue
+                }
+                if (!entry.name.startsWith("broker-g") || !entry.name.endsWith(".json")) {
+                    invalidEntry = true
+                    continue
+                }
+                this.identityCount++
+                let value = GatewayHeartbeatBrokerDiagnostic(entry.path, fileName: entry.name)
+                if (!value.valid || !value.filenameMatches) {
+                    invalidMarker = true
+                }
+            }
+            this.status = if (invalidEntry) {
+                "invalid_entry"
+            } else if (invalidMarker) {
+                "marker_invalid"
+            } else if (this.identityCount > 16) {
+                "identity_limit_exceeded"
+            } else if (this.overflow) {
+                "overflow"
+            } else if (this.tempCount > 0) {
+                "temp_present"
+            } else if (this.slotCount != this.identityCount) {
+                "slot_identity_mismatch"
+            } else {
+                "valid"
+            }
+        } catch (_: Exception) {
+            this.status = "scan_failed"
+        }
+    }
+
+    func safeSummary(phase: String): String {
+        "phase=${phase} status=${this.status} identities=${this.identityCount} slots=${this.slotCount} " +
+            "temps=${this.tempCount} overflow=${this.overflow}"
+    }
+}
+
+private func gatewayHeartbeatBrokerDiagnosticForPid(
+    path: Path,
+    expectedPid: Int64
+): Option<GatewayHeartbeatBrokerDiagnostic> {
+    for (value in gatewayHeartbeatBrokerDiagnostics(path)) {
+        if (value.valid && value.brokerPid == expectedPid) { return Some(value) }
+    }
+    None<GatewayHeartbeatBrokerDiagnostic>
+}
+
+private func gatewayHeartbeatBrokerPidsGone(path: Path): Bool {
+    let values = gatewayHeartbeatBrokerDiagnostics(path)
+    if (values.isEmpty()) { return false }
+    for (value in values) {
+        if (value.brokerPid <= 1 || gatewayServeStopPidAlive(value.brokerPid)) { return false }
+    }
+    true
 }
 
 private func gatewayS5RegularFileCount(path: Path): Int64 {
@@ -1103,8 +1506,580 @@ private class GatewayStopDeadlineTestClock {
     var elapsedMs: Int64 = 0
 }
 
+private func gatewayHeartbeatProbeExecutable(path: Path, body: String): Unit {
+    File.writeTo(path, ("#!/bin/sh\n" + body + "\n").toArray())
+    @Expect(executeWithOutput("/bin/chmod", ["700", path.toString()])[0], 0)
+}
+
+private func gatewayHeartbeatBrokerIsFullyStopped(): Bool {
+    let snapshot = managedStdioBroker().snapshot()
+    @Expect(snapshot.running, false)
+    @Expect(snapshot.brokerPid, 0)
+    @Expect(snapshot.ownerCount, 0)
+    @Expect(snapshot.readerCount, 0)
+    @Expect(snapshot.dispatcherCount, 0)
+    !snapshot.running && snapshot.brokerPid == 0 && snapshot.ownerCount == 0 &&
+        snapshot.readerCount == 0 && snapshot.dispatcherCount == 0
+}
+
+private func withGatewayHeartbeatProbeEnvironment(name: String, block: (Path, Path) -> Unit): Unit {
+    synchronized(MetisProcessEnvironmentLock) {
+        let root = Path("/tmp/metis-heartbeat-probe-${name}-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
+        let bin = root.join("bin")
+        Directory.create(bin, recursive: true)
+        let oldHome = getVariable("METIS_HOME")
+        let oldPath = getVariable("PATH")
+        let inheritedPath = match (oldPath) { case Some(value) => value case None => "/usr/bin:/bin" }
+        setVariable("METIS_HOME", root.toString())
+        setVariable("PATH", "${bin.toString()}:${inheritedPath}")
+        CliConfig.invalidatePathCache()
+        MetisConfigManager.invalidate()
+        CliSettingManager.invalidate()
+        try {
+            setGatewayServePortProbeForTest(None<(Int64, Int64) -> (Int64, String, String)>)
+            let initialReset = resetManagedStdioBrokerForTest()
+            @Expect(initialReset.ok, true)
+            let initialStopped = gatewayHeartbeatBrokerIsFullyStopped()
+            if (!initialReset.ok || !initialStopped) { return }
+            block(root, bin)
+        } finally {
+            setGatewayServePortProbeForTest(None<(Int64, Int64) -> (Int64, String, String)>)
+            gatewayReleaseServeLockQuiet()
+            let finalReset = resetManagedStdioBrokerForTest()
+            @Expect(finalReset.ok, true)
+            let _ = gatewayHeartbeatBrokerIsFullyStopped()
+            match (oldHome) { case Some(value) => setVariable("METIS_HOME", value) case None => setVariable("METIS_HOME", "") }
+            match (oldPath) { case Some(value) => setVariable("PATH", value) case None => setVariable("PATH", "") }
+            CliConfig.invalidatePathCache()
+            MetisConfigManager.invalidate()
+            CliSettingManager.invalidate()
+            try { remove(root, recursive: true) } catch (_: Exception) { () }
+        }
+    }
+}
+
+private func gatewayShutdownPhaseNegativeProof(root: Path, identity: GatewayServeIdentity): Unit {
+    let previousMarker = getVariable("METIS_TEST_GATEWAY_SHUTDOWN_PHASE_MARKER")
+    let previousNonce = getVariable("METIS_TEST_GATEWAY_SHUTDOWN_PHASE_NONCE")
+    let phaseBase = root.join("shutdown-phase")
+    try {
+        setVariable("METIS_TEST_GATEWAY_SHUTDOWN_PHASE_MARKER", "")
+        setVariable("METIS_TEST_GATEWAY_SHUTDOWN_PHASE_NONCE", "")
+        @Expect(gatewayPublishShutdownPhaseForTest(identity, "stop_request_observed"), false)
+        @Expect(exists(Path("${phaseBase.toString()}.1.json")), false)
+        let invalidParent = root.join("invalid-parent")
+        File.writeTo(invalidParent, "file\n".toArray())
+        setVariable("METIS_TEST_GATEWAY_SHUTDOWN_PHASE_MARKER", invalidParent.join("phase").toString())
+        setVariable("METIS_TEST_GATEWAY_SHUTDOWN_PHASE_NONCE", "hb-br-n5-invalid")
+        @Expect(gatewayPublishShutdownPhaseForTest(identity, "stop_request_observed"), false)
+    } finally {
+        match (previousMarker) {
+            case Some(value) => setVariable("METIS_TEST_GATEWAY_SHUTDOWN_PHASE_MARKER", value)
+            case None => setVariable("METIS_TEST_GATEWAY_SHUTDOWN_PHASE_MARKER", "")
+        }
+        match (previousNonce) {
+            case Some(value) => setVariable("METIS_TEST_GATEWAY_SHUTDOWN_PHASE_NONCE", value)
+            case None => setVariable("METIS_TEST_GATEWAY_SHUTDOWN_PHASE_NONCE", "")
+        }
+    }
+}
+
 @Test
 public class GatewayServeLockLogicTest {
+    @TestCase
+    public func hbBrU8FormalMetisBinaryOverrideIsStrictAndDefaultsToProjectTarget(): Unit {
+        synchronized(MetisProcessEnvironmentLock) {
+            let root = Path("/tmp/metis-hb-formal-bin-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
+            let project = root.join("project")
+            let binary = root.join("metis")
+            let previous = getVariable("METIS_TEST_BIN")
+            try {
+                Directory.create(root, recursive: true)
+                File.writeTo(binary, "fixture".toArray())
+
+                setVariable("METIS_TEST_BIN", "")
+                let defaultValue = gatewayFormalMetisBinary(project)
+                @Expect(defaultValue.isSome(), true)
+                if (defaultValue.isNone()) { return }
+                @Expect(defaultValue.getOrThrow().toString(), project.join("target").join("release").join("bin").join("metis").toString())
+
+                setVariable("METIS_TEST_BIN", binary.toString())
+                let validValue = gatewayFormalMetisBinary(project)
+                @Expect(validValue.isSome(), true)
+                if (validValue.isSome()) {
+                    @Expect(validValue.getOrThrow().toString(), binary.toString())
+                }
+
+                setVariable("METIS_TEST_BIN", "relative/metis")
+                @Expect(gatewayFormalMetisBinary(project).isNone(), true)
+                setVariable("METIS_TEST_BIN", root.join("missing").toString())
+                @Expect(gatewayFormalMetisBinary(project).isNone(), true)
+            } finally {
+                match (previous) {
+                    case Some(value) => setVariable("METIS_TEST_BIN", value)
+                    case None => setVariable("METIS_TEST_BIN", "")
+                }
+                try { remove(root, recursive: true) } catch (_: Exception) { () }
+            }
+        }
+    }
+
+    @TestCase
+    public func hbBrU3ShutdownStopsProcessIoBeforeClosingBroker(): Unit {
+        let project = Path(managedStdioResolveBrokerScriptPath()).parent.parent
+        let source = try {
+            String.fromUtf8(File.readFrom(project.join("src").join("gateway").join("runtime").join("demo.cj")))
+        } catch (_: Exception) {
+            ""
+        }
+        @Expect(source.isEmpty(), false)
+        if (source.isEmpty()) { return }
+        let memoryStop = source.indexOf("MemoryRuntime.stopActiveMaintenance()")
+        let canvasStop = source.indexOf("GatewayCanvasHostRuntime.stopDetailed(shutdownDeadline)")
+        let httpStop = source.indexOf(
+            "GatewayHttpSurface.stopDetailed(shutdownDeadline, shutdownIdentity: serveIdentity)"
+        )
+        let serverStop = source.indexOf("GatewayServer.defaultServer().stopServerDetailed(reason: \"gateway-serve-shutdown\")")
+        let gatewayStop = source.indexOf("let gatewayStop = try {")
+        @Expect(memoryStop.isSome(), true)
+        @Expect(canvasStop.isSome(), true)
+        @Expect(httpStop.isSome(), true)
+        @Expect(serverStop.isSome(), true)
+        @Expect(gatewayStop.isSome(), true)
+        if (!memoryStop.isSome() || !canvasStop.isSome() || !httpStop.isSome() ||
+            !serverStop.isSome() || !gatewayStop.isSome()) { return }
+        let brokerBoundary = gatewayStop.getOrThrow()
+        @Expect(memoryStop.getOrThrow() < brokerBoundary, true)
+        @Expect(canvasStop.getOrThrow() < brokerBoundary, true)
+        @Expect(httpStop.getOrThrow() < brokerBoundary, true)
+        @Expect(serverStop.getOrThrow() < brokerBoundary, true)
+    }
+
+    @TestCase
+    public func hbBrN6ShutdownPhaseMarkersPreserveSurfaceOrderAndIdentity(): Unit {
+        withGatewayHeartbeatProbeEnvironment("hb-br-n6-phase", {root, _bin =>
+            let instance = currentProcessInstanceIdentity()
+            @Expect(instance.isSome(), true)
+            if (instance.isNone()) { return }
+            let identity = GatewayServeIdentity(
+                Int64(getProcessId()),
+                DateTime.now().toUnixTimeStamp().toMilliseconds(),
+                "hb-br-n6-phase",
+                processIdentity: instance
+            )
+            let markerBase = root.join("shutdown-phase")
+            let previousMarker = getVariable("METIS_TEST_GATEWAY_SHUTDOWN_PHASE_MARKER")
+            let previousNonce = getVariable("METIS_TEST_GATEWAY_SHUTDOWN_PHASE_NONCE")
+            setVariable("METIS_TEST_GATEWAY_SHUTDOWN_PHASE_MARKER", markerBase.toString())
+            setVariable("METIS_TEST_GATEWAY_SHUTDOWN_PHASE_NONCE", "hb-br-n6-nonce")
+            try {
+                @Expect(gatewayPublishShutdownPhaseForTest(identity, "canvas_done"), false)
+                for ((sequence, phase) in [
+                    (Int64(1), "stop_request_observed"),
+                    (Int64(2), "canvas_done"),
+                    (Int64(3), "http_close_enter"),
+                    (Int64(4), "http_close_returned"),
+                    (Int64(5), "http_probe_done"),
+                    (Int64(6), "gateway_stop_enter"),
+                    (Int64(7), "owners_enter"),
+                    (Int64(8), "owners_done"),
+                    (Int64(9), "channels_enter"),
+                    (Int64(10), "channels_done"),
+                    (Int64(11), "broker_enter"),
+                    (Int64(12), "broker_done"),
+                    (Int64(13), "gateway_stop_returned"),
+                    (Int64(14), "completion_written")
+                ]) {
+                    @Expect(gatewayPublishShutdownPhaseForTest(identity, phase), true)
+                    let markerPath = Path("${markerBase.toString()}.${sequence}.json")
+                    let markerProof = try {
+                        let marker = JsonValue.fromStr(String.fromUtf8(File.readFrom(markerPath))).asObject()
+                        (marker.get("phase").getOrThrow().asString().getValue() == phase &&
+                            marker.get("sequence").getOrThrow().asInt().getValue() == sequence &&
+                            marker.get("pid").getOrThrow().asInt().getValue() == identity.pid &&
+                            marker.get("startedAtMs").getOrThrow().asInt().getValue() == identity.startedAtMs &&
+                            marker.get("nonce").getOrThrow().asString().getValue() == identity.nonce &&
+                            marker.get("processIdentity").getOrThrow().asString().getValue() ==
+                                identity.processIdentity.getOrThrow().serialize() &&
+                            marker.get("testNonce").getOrThrow().asString().getValue() == "hb-br-n6-nonce",
+                            marker.get("observedMonotonicMs").getOrThrow().asInt().getValue())
+                    } catch (_: Exception) {
+                        (false, Int64(-1))
+                    }
+                    @Expect(markerProof[0], true)
+                    @Expect(markerProof[1] >= 0, true)
+                    if (sequence > 1) {
+                        let previousObserved = try {
+                            let previousMarker = JsonValue.fromStr(String.fromUtf8(File.readFrom(
+                                Path("${markerBase.toString()}.${sequence - 1}.json")
+                            ))).asObject()
+                            previousMarker.get("observedMonotonicMs").getOrThrow().asInt().getValue()
+                        } catch (_: Exception) {
+                            Int64(-1)
+                        }
+                        @Expect(previousObserved >= 0, true)
+                        @Expect(markerProof[1] >= previousObserved, true)
+                    }
+                    let mode = executeWithOutput("/usr/bin/stat", ["-f", "%Lp", markerPath.toString()])
+                    @Expect(mode[0], 0)
+                    let modeText = try { String.fromUtf8(mode[1]).trimAscii() } catch (_: Exception) { "" }
+                    @Expect(modeText, "600")
+                }
+
+                let project = Path(managedStdioResolveBrokerScriptPath()).parent.parent
+                let demo = try {
+                    String.fromUtf8(File.readFrom(
+                        project.join("src").join("gateway").join("runtime").join("demo.cj")
+                    ))
+                } catch (_: Exception) {
+                    ""
+                }
+                let http = try {
+                    String.fromUtf8(File.readFrom(
+                        project.join("src").join("gateway").join("runtime").join("gateway_http_surface.cj")
+                    ))
+                } catch (_: Exception) {
+                    ""
+                }
+                @Expect(!demo.isEmpty() && !http.isEmpty(), true)
+                if (demo.isEmpty() || http.isEmpty()) { return }
+                let canvasStop = demo.indexOf("GatewayCanvasHostRuntime.stopDetailed(shutdownDeadline)")
+                let canvasDone = demo.indexOf("gatewayPublishShutdownPhaseForTest(identity, \"canvas_done\")")
+                let httpStop = demo.indexOf("GatewayHttpSurface.stopDetailed(shutdownDeadline, shutdownIdentity: serveIdentity)")
+                let gatewayStop = demo.indexOf("gatewayPublishShutdownPhaseForTest(identity, \"gateway_stop_enter\")")
+                let observerCall = demo.indexOf("gateway.stop(shutdownObserver: shutdownObserver)")
+                let gatewayReturned = demo.indexOf("gatewayPublishShutdownPhaseForTest(identity, \"gateway_stop_returned\")")
+                @Expect(canvasStop.isSome() && canvasDone.isSome() && httpStop.isSome() && gatewayStop.isSome() &&
+                    observerCall.isSome() && gatewayReturned.isSome(), true)
+                if (!canvasStop.isSome() || !canvasDone.isSome() || !httpStop.isSome() || !gatewayStop.isSome() ||
+                    !observerCall.isSome() || !gatewayReturned.isSome()) { return }
+                @Expect(canvasStop.getOrThrow() < canvasDone.getOrThrow(), true)
+                @Expect(canvasDone.getOrThrow() < httpStop.getOrThrow(), true)
+                @Expect(httpStop.getOrThrow() < gatewayStop.getOrThrow(), true)
+                @Expect(gatewayStop.getOrThrow() < observerCall.getOrThrow(), true)
+                @Expect(observerCall.getOrThrow() < gatewayReturned.getOrThrow(), true)
+
+                let closeEnter = http.indexOf("gatewayPublishShutdownPhaseForTest(identity, \"http_close_enter\")")
+                let closeCall = http.indexOf("case Some(s) => s.close()")
+                let probeCall = http.indexOf("gatewayServePortReleasedUntil(detached[2], deadline)")
+                @Expect(closeEnter.isSome() && closeCall.isSome() && probeCall.isSome(), true)
+                if (!closeEnter.isSome() || !closeCall.isSome() || !probeCall.isSome()) { return }
+                let closeReturned = http.indexOf(
+                    "gatewayPublishShutdownPhaseForTest(identity, \"http_close_returned\")",
+                    closeCall.getOrThrow()
+                )
+                let probeDone = http.indexOf(
+                    "gatewayPublishShutdownPhaseForTest(identity, \"http_probe_done\")",
+                    probeCall.getOrThrow()
+                )
+                @Expect(closeEnter.isSome() && closeCall.isSome() && closeReturned.isSome() && probeCall.isSome() && probeDone.isSome(), true)
+                if (!closeEnter.isSome() || !closeCall.isSome() || !closeReturned.isSome() || !probeCall.isSome() || !probeDone.isSome()) { return }
+                @Expect(closeEnter.getOrThrow() < closeCall.getOrThrow(), true)
+                @Expect(closeCall.getOrThrow() < closeReturned.getOrThrow(), true)
+                @Expect(closeReturned.getOrThrow() < probeCall.getOrThrow(), true)
+                @Expect(probeCall.getOrThrow() < probeDone.getOrThrow(), true)
+            } finally {
+                match (previousMarker) {
+                    case Some(value) => setVariable("METIS_TEST_GATEWAY_SHUTDOWN_PHASE_MARKER", value)
+                    case None => setVariable("METIS_TEST_GATEWAY_SHUTDOWN_PHASE_MARKER", "")
+                }
+                match (previousNonce) {
+                    case Some(value) => setVariable("METIS_TEST_GATEWAY_SHUTDOWN_PHASE_NONCE", value)
+                    case None => setVariable("METIS_TEST_GATEWAY_SHUTDOWN_PHASE_NONCE", "")
+                }
+            }
+        })
+    }
+
+    @TestCase
+    public func hbBrD2ClassifiesOriginalReparentedAndUnexpectedBrokerParents(): Unit {
+        let root = Path("/tmp/metis-hb-br-d2-cj-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
+        try {
+            Directory.create(root, recursive: true)
+            for ((observedParentPid, expectedStatus) in [
+                (Int64(24626), "original_parent"),
+                (Int64(1), "reparented"),
+                (Int64(31313), "unexpected_parent")
+            ]) {
+                let fileName = "broker-g7-p27182.json"
+                let path = root.join(fileName)
+                File.writeTo(
+                    path,
+                    ("{\"protocolVersion\":\"1.0\",\"generation\":7,\"brokerPid\":27182," +
+                        "\"startParentPid\":24626,\"observedParentPid\":${observedParentPid},\"sequence\":1," +
+                        "\"events\":[{\"sequence\":1,\"event\":\"broker_started\"}]," +
+                        "\"closeEntryCount\":0,\"closeEntryOwnerCount\":-1,\"ownerTerminalCount\":0," +
+                        "\"ownerStartCounts\":{\"service_plugin\":0,\"pid_probe\":0,\"lsof_probe\":0,\"other\":0}," +
+                        "\"ownerTerminalCounts\":{\"service_plugin\":0,\"pid_probe\":0,\"lsof_probe\":0,\"other\":0}," +
+                        "\"brokerClosedEnqueuedCount\":0,\"brokerClosedCallbackCount\":0," +
+                        "\"closeAckCallbackSeen\":false,\"writerFailureKind\":\"\",\"writerFailurePhase\":\"\"," +
+                        "\"ownerCount\":0,\"exitScheduledCount\":0,\"lastExitScheduledCode\":-1," +
+                        "\"closing\":false,\"closeFinished\":false}\n").toArray()
+                )
+                let value = GatewayHeartbeatBrokerDiagnostic(path, fileName: fileName)
+                @Expect(value.valid, true)
+                @Expect(value.parseStatus, "schema_valid")
+                @Expect(value.filenameMatches, true)
+                @Expect(value.parentStatus(24626), expectedStatus)
+            }
+        } finally {
+            try { remove(root, recursive: true) } catch (_: Exception) { () }
+            @Expect(exists(root), false)
+        }
+    }
+
+    @TestCase
+    public func hbBrD3ClassifiesTemporaryEvidenceAndStaleSlotMismatch(): Unit {
+        let root = Path("/tmp/metis-hb-br-d3-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
+        let temporaryRoot = root.join("temporary")
+        let staleSlotRoot = root.join("stale-slot")
+        try {
+            Directory.create(temporaryRoot, recursive: true)
+            File.writeTo(temporaryRoot.join("broker-g1-p2.json.tmp-2"), "{}".toArray())
+            let temporary = GatewayHeartbeatBrokerDirectoryProof(temporaryRoot)
+            @Expect(temporary.status, "temp_present")
+            @Expect(temporary.identityCount, 0)
+            @Expect(temporary.slotCount, 0)
+            @Expect(temporary.tempCount, 1)
+            @Expect(temporary.overflow, false)
+
+            Directory.create(staleSlotRoot.join(".identity-slot-0"), recursive: true)
+            let staleSlot = GatewayHeartbeatBrokerDirectoryProof(staleSlotRoot)
+            @Expect(staleSlot.status, "slot_identity_mismatch")
+            @Expect(staleSlot.identityCount, 0)
+            @Expect(staleSlot.slotCount, 1)
+            @Expect(staleSlot.tempCount, 0)
+            @Expect(staleSlot.overflow, false)
+        } finally {
+            try { remove(root, recursive: true) } catch (_: Exception) { () }
+            @Expect(exists(root), false)
+        }
+    }
+
+    @TestCase
+    public func s1U1ListenerDiscoveryTimeoutIsStableAndNonThrowing(): Unit {
+        withGatewayHeartbeatProbeEnvironment("s1-u1", {_root, bin =>
+            gatewayHeartbeatProbeExecutable(bin.join("lsof"), "sleep 1\nprintf '24626\\n'")
+            let result = gatewayFindVerifiedListenerPidsOnPortDetailed(port: 49101, timeoutMs: 30)
+            @Expect(result.conclusive, false)
+            @Expect(result.pids.size, 0)
+            @Expect(result.status, "listener_discovery_timeout")
+        })
+    }
+
+    @TestCase
+    public func s1B1ExpiredDiscoveryDeadlineDoesNotStartShellOrBroker(): Unit {
+        withGatewayHeartbeatProbeEnvironment("s1-b1", {root, bin =>
+            let marker = root.join("lsof-called")
+            gatewayHeartbeatProbeExecutable(bin.join("lsof"), "printf called > '${marker.toString()}'\nexit 1")
+            let before = gatewayStdioBrokerSnapshot()
+            let result = gatewayFindVerifiedListenerPidsOnPortUntil(
+                MonoTime.now() - Duration.millisecond,
+                port: 49102
+            )
+            let after = gatewayStdioBrokerSnapshot()
+            @Expect(result.conclusive, false)
+            @Expect(result.status, "listener_discovery_timeout")
+            @Expect(exists(marker), false)
+            @Expect(
+                after.get("running").getOrThrow().asBool().getValue(),
+                before.get("running").getOrThrow().asBool().getValue()
+            )
+            @Expect(
+                after.get("ownerCount").getOrThrow().asInt().getValue(),
+                before.get("ownerCount").getOrThrow().asInt().getValue()
+            )
+        })
+    }
+
+    @TestCase
+    public func s1P1NoListenerExitIsConclusive(): Unit {
+        withGatewayHeartbeatProbeEnvironment("s1-p1", {_root, bin =>
+            gatewayHeartbeatProbeExecutable(bin.join("lsof"), "exit 1")
+            let result = gatewayFindVerifiedListenerPidsOnPortDetailed(port: 49103, timeoutMs: 800)
+            @Expect(result.conclusive, true)
+            @Expect(result.pids.size, 0)
+            @Expect(result.status, "no_listener")
+        })
+    }
+
+    @TestCase
+    public func s1N1ListenerDiscoveryFailureIsStableAndRedacted(): Unit {
+        withGatewayHeartbeatProbeEnvironment("s1-n1", {_root, bin =>
+            gatewayHeartbeatProbeExecutable(bin.join("lsof"), "printf 'private-detail' >&2\nexit 2")
+            let result = gatewayFindVerifiedListenerPidsOnPortDetailed(port: 49104, timeoutMs: 800)
+            @Expect(result.conclusive, false)
+            @Expect(result.pids.size, 0)
+            @Expect(result.status, "listener_discovery_failed")
+            @Expect(result.status.contains("private-detail"), false)
+        })
+    }
+
+    @TestCase
+    public func s1N2InconclusiveListenerProbePreservesLiveLockTruth(): Unit {
+        withGatewayHeartbeatProbeEnvironment("s1-n2", {_root, bin =>
+            gatewayHeartbeatProbeExecutable(bin.join("lsof"), "exit 1")
+            @Expect(gatewayAcquireServeLockForRunningProcess(), true)
+            gatewayHeartbeatProbeExecutable(bin.join("lsof"), "sleep 1\nexit 1")
+            @Expect(gatewayAnotherServeInstanceSeemsRunning(), true)
+            @Expect(exists(gatewayServeLockPath()), true)
+        })
+    }
+
+    @TestCase
+    public func hbBrN5SurfacePortProbeCapsHangingLsofAndFailsClosed(): Unit {
+        withGatewayHeartbeatProbeEnvironment("hb-br-n5-surface", {root, bin =>
+            let marker = root.join("lsof-called")
+            let brokerLauncher = bin.join("node-with-isolated-path")
+            let brokerPath = getVariable("PATH").getOrDefault { "" }.trimAscii()
+            let oldNodeCommand = getVariable("METIS_STDIO_BROKER_NODE_COMMAND")
+            let oldBrokerPathCarrier = getVariable("METIS_TEST_N5_BROKER_PATH")
+            @Expect(brokerPath.isEmpty(), false)
+            if (brokerPath.isEmpty()) { return }
+            gatewayHeartbeatProbeExecutable(
+                bin.join("lsof"),
+                "printf called > '${marker.toString()}'\nsleep 2\nexit 1"
+            )
+            gatewayHeartbeatProbeExecutable(
+                brokerLauncher,
+                "export PATH=\"$METIS_TEST_N5_BROKER_PATH\"\nunset METIS_TEST_N5_BROKER_PATH\nexec node \"$@\""
+            )
+            try {
+                setVariable("METIS_TEST_N5_BROKER_PATH", brokerPath)
+                setVariable("METIS_STDIO_BROKER_NODE_COMMAND", brokerLauncher.toString())
+                let setupReset = resetManagedStdioBrokerForTest(timeoutMs: 3000)
+                @Expect(setupReset.ok, true)
+                let setupStopped = gatewayHeartbeatBrokerIsFullyStopped()
+                if (!setupReset.ok || !setupStopped) { return }
+                let brokerReady = gatewayStdioBrokerReady(timeoutMs: 3000)
+                @Expect(brokerReady.ok, true)
+                @Expect(brokerReady.status, "ready")
+                @Expect(brokerReady.generation > 0, true)
+                @Expect(brokerReady.pid > 1, true)
+                if (!brokerReady.ok || brokerReady.status != "ready" ||
+                    brokerReady.generation <= 0 || brokerReady.pid <= 1) { return }
+                let readySnapshot = managedStdioBroker().snapshot()
+                @Expect(readySnapshot.running, true)
+                @Expect(readySnapshot.responsive, true)
+                @Expect(readySnapshot.generation, brokerReady.generation)
+                @Expect(readySnapshot.brokerPid, brokerReady.pid)
+                let started = MonoTime.now()
+                let result = gatewayServePortReleasedUntil(49107, MonoTime.now() + Duration.second * 5)
+                let elapsedMs = (MonoTime.now() - started).toMilliseconds()
+                @Expect(exists(marker), true)
+                @Expect(result.ok, false)
+                @Expect(result.status, "cleanup_pending")
+                @Expect(result.portStatus, "port_probe_timeout")
+                @Expect(elapsedMs < 1000, true)
+                let instance = currentProcessInstanceIdentity()
+                @Expect(instance.isSome(), true)
+                if (instance.isNone()) { return }
+                let identity = GatewayServeIdentity(
+                    Int64(getProcessId()),
+                    DateTime.now().toUnixTimeStamp().toMilliseconds(),
+                    "hb-br-n5-surface",
+                    processIdentity: instance
+                )
+                gatewayShutdownPhaseNegativeProof(root, identity)
+                @Expect(gatewayWriteServeCompletionMarker(
+                    identity,
+                    GatewayStopResult(false, "cleanup_pending"),
+                    httpStatus: result.status
+                ), true)
+                let completion = try {
+                    String.fromUtf8(File.readFrom(root.join("gateway-serve.stop-complete")))
+                } catch (_: Exception) {
+                    ""
+                }
+                @Expect(gatewayServeStopCompletionField(completion, "status"), "cleanup_pending")
+            } finally {
+                let finalReset = resetManagedStdioBrokerForTest(timeoutMs: 3000)
+                @Expect(finalReset.ok, true)
+                let _ = gatewayHeartbeatBrokerIsFullyStopped()
+                match (oldNodeCommand) {
+                    case Some(value) => setVariable("METIS_STDIO_BROKER_NODE_COMMAND", value)
+                    case None => setVariable("METIS_STDIO_BROKER_NODE_COMMAND", "")
+                }
+                match (oldBrokerPathCarrier) {
+                    case Some(value) => setVariable("METIS_TEST_N5_BROKER_PATH", value)
+                    case None => setVariable("METIS_TEST_N5_BROKER_PATH", "")
+                }
+            }
+        })
+    }
+
+    @TestCase
+    public func hbBrB3SurfacePortReleaseHasLocalTotalBudget(): Unit {
+        withGatewayHeartbeatProbeEnvironment("hb-br-b3-surface", {_root, _bin =>
+            let callCount = AtomicInt64(0)
+            try {
+                setGatewayServePortProbeForTest(Some({_port: Int64, _budgetMs: Int64 =>
+                    callCount.fetchAdd(1)
+                    (Int64(0), "", "")
+                }))
+                let started = MonoTime.now()
+                let result = gatewayServePortReleasedUntil(49108, MonoTime.now() + Duration.second * 60)
+                let elapsedMs = (MonoTime.now() - started).toMilliseconds()
+                @Expect(callCount.load() > 1, true)
+                @Expect(elapsedMs < 3000, true)
+                @Expect(result.ok, false)
+                @Expect(result.status, "cleanup_pending")
+                @Expect(result.portStatus, "port_release_timeout")
+            } finally {
+                setGatewayServePortProbeForTest(None<(Int64, Int64) -> (Int64, String, String)>)
+            }
+        })
+    }
+
+    @TestCase
+    public func hbBrU4SurfacePortReleaseStillObservesReleasedListener(): Unit {
+        withGatewayHeartbeatProbeEnvironment("hb-br-u4-surface", {_root, _bin =>
+            let callCount = AtomicInt64(0)
+            try {
+                setGatewayServePortProbeForTest(Some({_port: Int64, _budgetMs: Int64 =>
+                    let previousCallCount = callCount.fetchAdd(1)
+                    if (previousCallCount == 0) { (Int64(0), "", "") } else { (Int64(1), "", "") }
+                }))
+                let result = gatewayServePortReleasedUntil(49109, MonoTime.now() + Duration.second * 60)
+                @Expect(callCount.load(), 2)
+                @Expect(result.ok, true)
+                @Expect(result.status, "stopped")
+                @Expect(result.portStatus, "released")
+            } finally {
+                setGatewayServePortProbeForTest(None<(Int64, Int64) -> (Int64, String, String)>)
+            }
+        })
+    }
+
+    @TestCase
+    public func hS1U1VerifiedListenerPidsRemainHistoricalTruth(): Unit {
+        withGatewayHeartbeatProbeEnvironment("h-s1-u1", {root, bin =>
+            let lsofMarker = root.join("lsof-called")
+            let psMarker = root.join("ps-called")
+            gatewayHeartbeatProbeExecutable(bin.join("lsof"), "printf called > '${lsofMarker.toString()}'\nprintf '24626\\n'")
+            gatewayHeartbeatProbeExecutable(bin.join("ps"), "printf called > '${psMarker.toString()}'\nprintf 'metis gateway serve\\n'")
+            let result = gatewayFindVerifiedListenerPidsOnPortDetailed(port: 49105, timeoutMs: 3000)
+            @Expect(result.conclusive, true)
+            @Expect(result.status, "listeners_verified")
+            @Expect(result.pids.size, 1)
+            @Expect(exists(lsofMarker), true)
+            @Expect(exists(psMarker), true)
+            if (result.pids.size != 1) { return }
+            @Expect(result.pids[0], 24626)
+        })
+    }
+
+    @TestCase
+    public func hS1N1InvalidUtf8ListenerOutputIsStable(): Unit {
+        withGatewayHeartbeatProbeEnvironment("h-s1-n1", {_root, bin =>
+            gatewayHeartbeatProbeExecutable(bin.join("lsof"), "printf '\\377\\376\\375'")
+            let result = gatewayFindVerifiedListenerPidsOnPortDetailed(port: 49106, timeoutMs: 800)
+            @Expect(result.conclusive, false)
+            @Expect(result.pids.size, 0)
+            @Expect(result.status, "invalid_response_encoding")
+        })
+    }
+
     @TestCase
     public func parsePidListTextDeduplicatesAndSkipsInvalidRows(): Unit {
         let pids = gatewayParsePidListText("24626\n\nabc\n39668\n24626\n")
@@ -1350,11 +2325,29 @@ public class GatewayServeLockLogicTest {
     public func s5U1StaleCleanupMarkerWithTerminalResourcesCanBeReconciled(): Unit {
         synchronized(MetisProcessEnvironmentLock) {
             let home = Path("/tmp/metis-s5-stale-cleanup-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
+            let port = gatewayServeStopTemporaryPort()
             let oldHome = getVariable("METIS_HOME")
+            let oldPath = getVariable("PATH")
             try {
+                @Expect(port > 0, true)
                 Directory.create(home, recursive: true)
                 setVariable("METIS_HOME", home.toString())
+                let bin = home.join("bin")
+                Directory.create(bin, recursive: true)
+                gatewayHeartbeatProbeExecutable(bin.join("lsof"), "exit 1")
+                let inheritedPath = match (oldPath) { case Some(value) => value case None => "/usr/bin:/bin" }
+                setVariable("PATH", "${bin.toString()}:${inheritedPath}")
                 CliConfig.invalidatePathCache()
+                MetisConfigManager.invalidate()
+                CliSettingManager.invalidate()
+                var settings = CliSettingManager.readGatewaySettings()
+                settings.port = port
+                let persistedSettings = MetisConfigManager.setGatewaySettings(settings)
+                @Expect(persistedSettings.port, port)
+                CliSettingManager.invalidate()
+                let initialReset = resetManagedStdioBrokerForTest(timeoutMs: 3000)
+                @Expect(initialReset.ok, true)
+                if (!initialReset.ok) { return }
                 let current = currentProcessInstanceIdentity().getOrThrow()
                 let stale = gatewayServeStaleProcessIdentity(current)
                 let identity = GatewayServeIdentity(
@@ -1409,11 +2402,21 @@ public class GatewayServeLockLogicTest {
             } finally {
                 setGatewayStopOutputForTest(None<(String) -> Unit>)
                 gatewayReleaseServeLockQuiet()
+                let finalReset = resetManagedStdioBrokerForTest(timeoutMs: 3000)
+                @Expect(finalReset.ok, true)
+                let broker = gatewayStdioBrokerSnapshot()
+                @Expect(broker.get("running").getOrThrow().asBool().getValue(), false)
+                @Expect(broker.get("brokerPid").getOrThrow().asInt().getValue(), 0)
+                @Expect(broker.get("ownerCount").getOrThrow().asInt().getValue(), 0)
+                @Expect(broker.get("readerCount").getOrThrow().asInt().getValue(), 0)
                 match (oldHome) {
                     case Some(value) => setVariable("METIS_HOME", value)
                     case None => setVariable("METIS_HOME", "")
                 }
+                match (oldPath) { case Some(value) => setVariable("PATH", value) case None => setVariable("PATH", "") }
                 CliConfig.invalidatePathCache()
+                MetisConfigManager.invalidate()
+                CliSettingManager.invalidate()
                 try { remove(home, recursive: true) } catch (_: Exception) { () }
             }
         }
@@ -1552,7 +2555,10 @@ public class GatewayServeLockLogicTest {
             let oldRoot = getVariable("METIS_CJPM_ROOT")
             let brokerScript = Path(managedStdioResolveBrokerScriptPath())
             let project = brokerScript.parent.parent
-            let binary = project.join("target").join("release").join("bin").join("metis")
+            let binaryValue = gatewayFormalMetisBinary(project)
+            @Expect(binaryValue.isSome(), true)
+            if (binaryValue.isNone()) { return }
+            let binary = binaryValue.getOrThrow()
             var gatewayProcess: Option<SubProcess> = None<SubProcess>
             var gatewayIdentity: Option<GatewayServeIdentity> = None<GatewayServeIdentity>
             var gatewayPid: Int64 = 0
@@ -1905,6 +2911,348 @@ public class GatewayServeLockLogicTest {
     }
 
     @TestCase
+    public func heartbeatE2eHb01TwoGenerationsSurviveProbeTimeoutAndStopTerminal(): Unit {
+        synchronized(MetisProcessEnvironmentLock) {
+            let home = Path("/tmp/metis-heartbeat-e2e-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
+            let gatewayPort = gatewayServeStopTemporaryPort()
+            let webhookPort = gatewayServeStopTemporaryPort()
+            @Expect(gatewayPort > 0 && webhookPort > 0 && gatewayPort != webhookPort, true)
+            let oldHome = getVariable("METIS_HOME")
+            let oldRoot = getVariable("METIS_CJPM_ROOT")
+            let oldPath = getVariable("PATH")
+            let oldTestDyld = getVariable("METIS_TEST_GATEWAY_DYLD_LIBRARY_PATH")
+            let oldBrokerDiagnostic = getVariable("METIS_TEST_GATEWAY_BROKER_DIAGNOSTIC_MARKER")
+            let brokerScript = Path(managedStdioResolveBrokerScriptPath())
+            let project = brokerScript.parent.parent
+            let metisBinaryValue = gatewayFormalMetisBinary(project)
+            @Expect(metisBinaryValue.isSome(), true)
+            if (metisBinaryValue.isNone()) { return }
+            let metisBinary = metisBinaryValue.getOrThrow()
+            let gcmSource = gatewayS5GcmBinary()
+            let gcmBinary = home.join("gitcodemonitor")
+            let dependencyScript = brokerScript.parent.join("metis-s5-loopback-dependencies.mjs")
+            let faultMarker = home.join("listener-timeout.enabled")
+            let lsofCalled = home.join("listener-timeout.called")
+            let bin = home.join("bin")
+            let launchWrapper = home.join("gateway-run-with-stderr.sh")
+            var dependencies = None<GatewayS5DependencyProcess>
+            var gatewayProcess = None<SubProcess>
+            var gatewayIdentity = None<GatewayServeIdentity>
+            var gatewayPid: Int64 = 0
+            var brokerPid: Int64 = 0
+            var gcmPid: Int64 = 0
+            var gcmPgid: Int64 = 0
+            var firstGatewayPid: Int64 = 0
+            var firstIdentity = None<GatewayServeIdentity>
+            var businessEntered = false
+            var allTerminal = false
+            try {
+                let parentSetupReset = resetManagedStdioBrokerForTest(timeoutMs: 3000)
+                @Expect(parentSetupReset.ok, true)
+                let parentSetupStopped = gatewayHeartbeatBrokerIsFullyStopped()
+                if (!parentSetupReset.ok || !parentSetupStopped) { return }
+                Directory.create(bin, recursive: true)
+                setVariable("METIS_HOME", home.toString())
+                setVariable("METIS_CJPM_ROOT", project.toString())
+                let inheritedPath = match (oldPath) { case Some(value) => value case None => "/usr/bin:/bin" }
+                File.writeTo(
+                    bin.join("lsof"),
+                    ("#!/bin/sh\nif [ -f '${faultMarker.toString()}' ]; then\n" +
+                        "  printf called > '${lsofCalled.toString()}'\n  sleep 1\n  exit 1\nfi\n" +
+                        "exec /usr/sbin/lsof \"$@\"\n").toArray()
+                )
+                @Expect(executeWithOutput("/bin/chmod", ["700", bin.join("lsof").toString()])[0], 0)
+                File.writeTo(
+                    launchWrapper,
+                    ("#!/bin/sh\nexport DYLD_LIBRARY_PATH=\"$METIS_TEST_GATEWAY_DYLD_LIBRARY_PATH\"\n" +
+                        "export METIS_STDIO_BROKER_TEST_MODE=1\n" +
+                        "export METIS_STDIO_BROKER_DIAGNOSTIC_MARKER=\"$METIS_TEST_GATEWAY_BROKER_DIAGNOSTIC_MARKER\"\n" +
+                        "unset METIS_TEST_GATEWAY_DYLD_LIBRARY_PATH METIS_TEST_GATEWAY_BROKER_DIAGNOSTIC_MARKER\n" +
+                        "exec \"$1\" gateway run 2>\"$2\"\n").toArray()
+                )
+                @Expect(executeWithOutput("/bin/chmod", ["700", launchWrapper.toString()])[0], 0)
+                setVariable("PATH", "${bin.toString()}:${inheritedPath}")
+                let taskDyld = getVariable("DYLD_LIBRARY_PATH").getOrDefault { "" }.trimAscii()
+                @Expect(taskDyld.isEmpty(), false)
+                if (taskDyld.isEmpty()) { return }
+                setVariable("METIS_TEST_GATEWAY_DYLD_LIBRARY_PATH", taskDyld)
+                CliConfig.invalidatePathCache()
+                MetisConfigManager.invalidate()
+                CliSettingManager.invalidate()
+                @Expect(exists(metisBinary), true)
+                @Expect(exists(gcmSource), true)
+                @Expect(exists(dependencyScript), true)
+                @Expect(executeWithOutput("/bin/cp", [gcmSource.toString(), gcmBinary.toString()])[0], 0)
+                @Expect(executeWithOutput("/bin/chmod", ["700", gcmBinary.toString()])[0], 0)
+                dependencies = Some(gatewayS5StartDependencies(home, dependencyScript, replyMarker: "heartbeat-e2e"))
+                let dependencyPort = dependencies.getOrThrow().port
+                @Expect(dependencyPort > 0, true)
+                let configured = gatewayS5ConfigureFormalGateway(
+                    home,
+                    gatewayPort,
+                    webhookPort,
+                    dependencyPort,
+                    gcmBinary
+                )
+                @Expect(exists(configured[2]), true)
+
+                for (generation in 0..2) {
+                    if (generation > 0) {
+                        try { remove(home.join("gateway-serve.stop-complete")) } catch (_: Exception) { () }
+                    }
+                    let stderrPath = home.join("gateway-${generation}.stderr.log")
+                    let brokerDiagnosticPath = home.join("gateway-${generation}.broker-diagnostics")
+                    Directory.create(brokerDiagnosticPath, recursive: true)
+                    setVariable("METIS_TEST_GATEWAY_BROKER_DIAGNOSTIC_MARKER", brokerDiagnosticPath.toString())
+                    let launched = launch(
+                        launchWrapper.toString(),
+                        [metisBinary.toString(), stderrPath.toString()],
+                        stdIn: ProcessRedirect.Discard,
+                        stdOut: ProcessRedirect.Discard,
+                        stdErr: ProcessRedirect.Discard
+                    )
+                    setVariable("METIS_TEST_GATEWAY_BROKER_DIAGNOSTIC_MARKER", "")
+                    gatewayPid = launched.pid
+                    gatewayProcess = Some(launched)
+                    let capturedIdentity = gatewayHeartbeatCaptureOwnedIdentityDetailed(
+                        home, launched, metisBinary, 15000)
+                    @Expect(capturedIdentity.status, "captured")
+                    @Expect(capturedIdentity.attempts > 0, true)
+                    if (capturedIdentity.status != "captured") { return }
+                    @Expect(capturedIdentity.identity.isSome(), true)
+                    if (!capturedIdentity.identity.isSome()) { return }
+                    gatewayIdentity = capturedIdentity.identity
+                    businessEntered = true
+                    let currentIdentity = gatewayIdentity.getOrThrow()
+                    if (generation == 0) {
+                        firstGatewayPid = gatewayPid
+                        firstIdentity = Some(currentIdentity)
+                    } else {
+                        @Expect(gatewayPid != firstGatewayPid, true)
+                        @Expect(firstIdentity.isSome(), true)
+                        if (!firstIdentity.isSome()) { return }
+                        @Expect(firstIdentity.getOrThrow().matches(currentIdentity), false)
+                    }
+
+                    let stableGatewayPid = gatewayPid
+                    let processCapture = GatewayS5P1Capture()
+                    @Expect(gatewayServeStopWaitUntil(15000, { =>
+                        processCapture.brokerPid = gatewayServeStopChildPid(stableGatewayPid, brokerScript.toString())
+                        processCapture.brokerPid > 0 &&
+                            gatewayServeStopParentPid(processCapture.brokerPid) == stableGatewayPid
+                    }), true)
+                    brokerPid = processCapture.brokerPid
+                    let stableBrokerPid = brokerPid
+                    @Expect(gatewayServeStopWaitUntil(5000, { =>
+                        gatewayHeartbeatBrokerDiagnosticForPid(brokerDiagnosticPath, stableBrokerPid).isSome()
+                    }), true)
+                    let preStopBrokerDirectory = GatewayHeartbeatBrokerDirectoryProof(brokerDiagnosticPath)
+                    println("HB-BR-DIAGNOSTIC ${preStopBrokerDirectory.safeSummary("pre_stop")}")
+                    @Expect(preStopBrokerDirectory.status, "valid")
+                    @Expect(preStopBrokerDirectory.identityCount, 1)
+                    @Expect(preStopBrokerDirectory.slotCount, 1)
+                    @Expect(preStopBrokerDirectory.tempCount, 0)
+                    @Expect(preStopBrokerDirectory.overflow, false)
+                    let preStopBrokerMarker = gatewayHeartbeatBrokerDiagnosticForPid(
+                        brokerDiagnosticPath,
+                        stableBrokerPid
+                    )
+                    @Expect(preStopBrokerMarker.isSome(), true)
+                    if (!preStopBrokerMarker.isSome()) { return }
+                    @Expect(preStopBrokerMarker.getOrThrow().parseStatus, "schema_valid")
+                    @Expect(preStopBrokerMarker.getOrThrow().parentStatus(stableGatewayPid), "original_parent")
+                    @Expect(gatewayServeStopWaitUntil(15000, { =>
+                        processCapture.gcmPid = gatewayServeStopChildPid(stableBrokerPid, gcmBinary.toString())
+                        processCapture.gcmPgid = gatewayServeStopProcessGroup(processCapture.gcmPid)
+                        processCapture.gcmPid > 0 && processCapture.gcmPgid > 0 &&
+                            gatewayServeStopParentPid(processCapture.gcmPid) == stableBrokerPid
+                    }), true)
+                    gcmPid = processCapture.gcmPid
+                    gcmPgid = processCapture.gcmPgid
+                    let readyzUrl = "http://127.0.0.1:${gatewayPort}/readyz"
+                    let liveOwner = GatewayServeStopLiveOwnerProof()
+                    let stableGcmPid = gcmPid
+                    @Expect(gatewayServeStopWaitUntil(15000, { =>
+                        liveOwner.refresh(readyzUrl)
+                        processCapture.refreshLease(home, stableGcmPid, stableGatewayPid, webhookPort)
+                        liveOwner.httpStatus == 200 && liveOwner.running && liveOwner.ownerCount == 1 &&
+                            processCapture.leaseIdentityMatches && processCapture.leasePidMatches &&
+                            processCapture.leasePortMatches && processCapture.leaseRunning
+                    }), true)
+
+                    let runtimePath = home.join("gateway-runtime-state.json")
+                    let initialHeartbeat = gatewayHeartbeatRuntimeInt(runtimePath, "updatedAtMs")
+                    let firstHeartbeat = ArrayList<Int64>()
+                    @Expect(gatewayServeStopWaitUntil(15000, { =>
+                        let value = gatewayHeartbeatRuntimeInt(runtimePath, "updatedAtMs")
+                        if (value > initialHeartbeat) {
+                            firstHeartbeat.clear()
+                            firstHeartbeat.add(value)
+                            true
+                        } else { false }
+                    }), true)
+                    @Expect(firstHeartbeat.size, 1)
+                    if (firstHeartbeat.size != 1) { return }
+                    let firstHeartbeatValue = firstHeartbeat[0]
+                    @Expect(gatewayServeStopWaitUntil(15000, { =>
+                        gatewayHeartbeatRuntimeInt(runtimePath, "updatedAtMs") > firstHeartbeatValue
+                    }), true)
+
+                    if (generation == 0) {
+                        for (_ in 0..40) {
+                            @Expect(gatewayHeartbeatHttpStatus("http://127.0.0.1:${webhookPort}/healthz"), 200)
+                            @Expect(gatewayServeStopPidAlive(stableGcmPid), true)
+                        }
+                        let beforeFaultHeartbeat = gatewayHeartbeatRuntimeInt(runtimePath, "updatedAtMs")
+                        File.writeTo(faultMarker, "enabled".toArray())
+                        @Expect(gatewayServeStopWaitUntil(15000, { =>
+                            gatewayHeartbeatRuntimeInt(runtimePath, "updatedAtMs") > beforeFaultHeartbeat
+                        }), true)
+                        liveOwner.refresh(readyzUrl)
+                        @Expect(exists(lsofCalled), false)
+                        @Expect(liveOwner.httpStatus, 200)
+                        @Expect(liveOwner.running, true)
+                        @Expect(gatewayServeStopPidAlive(stableGatewayPid), true)
+                        @Expect(gatewayServeStopPidAlive(stableGcmPid), true)
+                        let timeout = gatewayFindVerifiedListenerPidsOnPortDetailed(port: gatewayPort, timeoutMs: 30)
+                        @Expect(timeout.conclusive, false)
+                        @Expect(timeout.status, "listener_discovery_timeout")
+                        @Expect(exists(lsofCalled), true)
+                        liveOwner.refresh(readyzUrl)
+                        @Expect(liveOwner.httpStatus, 200)
+                        @Expect(liveOwner.running, true)
+                        @Expect(gatewayServeStopPidAlive(stableGatewayPid), true)
+                        @Expect(gatewayServeStopPidAlive(stableGcmPid), true)
+                        try { remove(faultMarker) } catch (_: Exception) { () }
+                    }
+
+                    let preStopStderr = try {
+                        String.fromUtf8(File.readFrom(stderrPath))
+                    } catch (_: Exception) {
+                        ""
+                    }
+                    @Expect(preStopStderr.contains("metis stdio broker protocol writer failed"), false)
+
+                    let lockText = try { String.fromUtf8(File.readFrom(home.join("gateway-serve.lock"))) } catch (_: Exception) { "" }
+                    let stopIdentity = gatewayParseServeIdentity(lockText)
+                    @Expect(stopIdentity.isSome(), true)
+                    if (!stopIdentity.isSome()) { return }
+                    @Expect(stopIdentity.getOrThrow().matches(currentIdentity), true)
+                    @Expect(gatewayExecuteStopServe(), 0)
+                    let completionPath = home.join("gateway-serve.stop-complete")
+                    @Expect(exists(completionPath), true)
+                    let completion = try { String.fromUtf8(File.readFrom(completionPath)) } catch (_: Exception) { "" }
+                    @Expect(gatewayServeStopCompletionField(completion, "status"), "graceful")
+                    @Expect(gatewayServeStopCompletionField(completion, "fullTerminal"), "1")
+                    @Expect(gatewayServeStopCompletionField(completion, "brokerStatus"), "stopped")
+                    @Expect(gatewayServeStopCompletionField(completion, "servicePluginOwnerStatus"), "graceful_exited")
+                    @Expect(gatewayServeStopCompletionField(completion, "servicePluginPortStatus"), "released")
+                    @Expect(gatewayServeStopReapCompletedOwnedProcess(gatewayProcess), true)
+                    gatewayProcess = None<SubProcess>
+                    @Expect(gatewayServeStopWaitUntil(5000, { => !gatewayServeStopPidAlive(stableGatewayPid) }), true)
+                    @Expect(gatewayServeStopWaitUntil(5000, { => !gatewayServeStopPidAlive(stableBrokerPid) }), true)
+                    @Expect(gatewayServeStopWaitUntil(5000, { =>
+                        gatewayHeartbeatBrokerPidsGone(brokerDiagnosticPath)
+                    }), true)
+                    @Expect(gatewayServeStopWaitUntil(5000, { => !gatewayServeStopPidAlive(stableGcmPid) }), true)
+                    let stableGcmPgid = gcmPgid
+                    @Expect(gatewayServeStopWaitUntil(5000, { => gatewayServeStopGroupGone(stableGcmPgid) }), true)
+                    @Expect(gatewayServeStopPortListening(gatewayPort), false)
+                    @Expect(gatewayServeStopPortListening(webhookPort), false)
+                    processCapture.refreshLease(home, stableGcmPid, stableGatewayPid, webhookPort)
+                    @Expect(processCapture.leaseStopped, true)
+                    @Expect(gatewayServeStopRuntimeOwnerCount(runtimePath), 0)
+                    let diagnostic = try {
+                        String.fromUtf8(File.readFrom(home.join("s5-gateway.log")))
+                    } catch (_: Exception) {
+                        ""
+                    }
+                    @Expect(diagnostic.contains("writer_failure"), false)
+                    @Expect(diagnostic.contains("broker_write_failed"), false)
+                    let terminalStderr = try {
+                        String.fromUtf8(File.readFrom(stderrPath))
+                    } catch (_: Exception) {
+                        ""
+                    }
+                    let brokerDiagnostics = gatewayHeartbeatBrokerDiagnostics(brokerDiagnosticPath)
+                    let terminalBrokerDirectory = GatewayHeartbeatBrokerDirectoryProof(brokerDiagnosticPath)
+                    println("HB-BR-DIAGNOSTIC ${terminalBrokerDirectory.safeSummary("terminal")}")
+                    @Expect(terminalBrokerDirectory.status, "valid")
+                    @Expect(terminalBrokerDirectory.identityCount <= 16, true)
+                    @Expect(terminalBrokerDirectory.slotCount, terminalBrokerDirectory.identityCount)
+                    @Expect(terminalBrokerDirectory.tempCount, 0)
+                    @Expect(terminalBrokerDirectory.overflow, false)
+                    for (value in brokerDiagnostics) {
+                        let role = if (value.brokerPid == stableBrokerPid) { "frozen" } else { "replacement" }
+                        println("HB-BR-MARKER ${value.safeSummary(role, stableGatewayPid)}")
+                        @Expect(value.parseStatus, "schema_valid")
+                        @Expect(value.filenameMatches, true)
+                        @Expect(value.parentStatus(stableGatewayPid), "original_parent")
+                    }
+                    let brokerDiagnosticMatch = gatewayHeartbeatBrokerDiagnosticForPid(
+                        brokerDiagnosticPath,
+                        stableBrokerPid
+                    )
+                    @Expect(brokerDiagnosticMatch.isSome(), true)
+                    if (!brokerDiagnosticMatch.isSome()) { return }
+                    let brokerDiagnostic = brokerDiagnosticMatch.getOrThrow()
+                    @Expect(brokerDiagnostic.valid, true)
+                    @Expect(brokerDiagnostic.brokerPid == stableBrokerPid, true)
+                    @Expect(brokerDiagnostic.startParentPid == stableGatewayPid, true)
+                    @Expect(brokerDiagnostics.size, 1)
+                    @Expect(brokerDiagnostic.closeEntryCount, 1)
+                    @Expect(brokerDiagnostic.closeEntryOwnerCount, 0)
+                    @Expect(brokerDiagnostic.ownerTerminalCount >= 1, true)
+                    @Expect(brokerDiagnostic.brokerClosedCallbackCount, 1)
+                    @Expect(brokerDiagnostic.brokerClosedEnqueuedCount, 1)
+                    @Expect(brokerDiagnostic.closeAckCallbackSeen, true)
+                    @Expect(brokerDiagnostic.writerFailureKind, "")
+                    @Expect(brokerDiagnostic.writerFailurePhase, "")
+                    @Expect(brokerDiagnostic.otherStarts, 0)
+                    @Expect(brokerDiagnostic.otherTerminals, 0)
+                    @Expect(brokerDiagnostic.ownerCount, 0)
+                    @Expect(brokerDiagnostic.exitScheduledCount, 1)
+                    @Expect(brokerDiagnostic.lastExitScheduledCode, 0)
+                    @Expect(terminalStderr.contains("metis stdio broker protocol writer failed"), false)
+                    gatewayIdentity = None<GatewayServeIdentity>
+                    gatewayPid = 0
+                    brokerPid = 0
+                    gcmPid = 0
+                    gcmPgid = 0
+                }
+                allTerminal = true
+            } finally {
+                if (gatewayIdentity.isSome()) {
+                    try { gatewayServeStopReapOwnedGateway(gatewayIdentity, metisBinary, home) } catch (_: Exception) { () }
+                }
+                try { gatewayServeStopReapOwnedHandle(gatewayProcess, metisBinary) } catch (_: Exception) { () }
+                let dependenciesStopped = gatewayS5StopDependencies(dependencies)
+                let parentFinalReset = resetManagedStdioBrokerForTest(timeoutMs: 3000)
+                @Expect(parentFinalReset.ok, true)
+                let _ = gatewayHeartbeatBrokerIsFullyStopped()
+                match (oldHome) { case Some(value) => setVariable("METIS_HOME", value) case None => setVariable("METIS_HOME", "") }
+                match (oldRoot) { case Some(value) => setVariable("METIS_CJPM_ROOT", value) case None => setVariable("METIS_CJPM_ROOT", "") }
+                match (oldPath) { case Some(value) => setVariable("PATH", value) case None => setVariable("PATH", "") }
+                match (oldTestDyld) {
+                    case Some(value) => setVariable("METIS_TEST_GATEWAY_DYLD_LIBRARY_PATH", value)
+                    case None => setVariable("METIS_TEST_GATEWAY_DYLD_LIBRARY_PATH", "")
+                }
+                match (oldBrokerDiagnostic) {
+                    case Some(value) => setVariable("METIS_TEST_GATEWAY_BROKER_DIAGNOSTIC_MARKER", value)
+                    case None => setVariable("METIS_TEST_GATEWAY_BROKER_DIAGNOSTIC_MARKER", "")
+                }
+                CliConfig.invalidatePathCache()
+                MetisConfigManager.invalidate()
+                CliSettingManager.invalidate()
+                try { remove(home, recursive: true) } catch (_: Exception) { () }
+                @Expect(dependenciesStopped, true)
+                if (businessEntered) { @Expect(allTerminal, true) }
+                @Expect(exists(home), false)
+            }
+        }
+    }
+
+    @TestCase
     public func s5P1FormalGatewayGcmWebhookDeliversExactlyOnceAndStopsAllResources(): Unit {
         synchronized(MetisProcessEnvironmentLock) {
             let home = Path("/tmp/metis-s5-p1-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
@@ -1937,7 +3285,10 @@ public class GatewayServeLockLogicTest {
             let oldWorkspaceDirOverride = CliConfig.workspaceDirOverride
             let brokerScript = Path(managedStdioResolveBrokerScriptPath())
             let project = brokerScript.parent.parent
-            let metisBinary = project.join("target").join("release").join("bin").join("metis")
+            let metisBinaryValue = gatewayFormalMetisBinary(project)
+            @Expect(metisBinaryValue.isSome(), true)
+            if (metisBinaryValue.isNone()) { return }
+            let metisBinary = metisBinaryValue.getOrThrow()
             let gcmBinarySource = gatewayS5GcmBinary()
             let gcmBinary = home.join("gitcodemonitor")
             let dependencyScript = brokerScript.parent.join("metis-s5-loopback-dependencies.mjs")
@@ -2227,7 +3578,10 @@ public class GatewayServeLockLogicTest {
             let oldWorkspaceDirOverride = CliConfig.workspaceDirOverride
             let brokerScript = Path(managedStdioResolveBrokerScriptPath())
             let project = brokerScript.parent.parent
-            let metisBinary = project.join("target").join("release").join("bin").join("metis")
+            let metisBinaryValue = gatewayFormalMetisBinary(project)
+            @Expect(metisBinaryValue.isSome(), true)
+            if (metisBinaryValue.isNone()) { return }
+            let metisBinary = metisBinaryValue.getOrThrow()
             let gcmBinarySource = gatewayS5GcmBinary()
             let gcmBinary = home.join("gitcodemonitor")
             let dependencyScript = brokerScript.parent.join("metis-s5-loopback-dependencies.mjs")
@@ -2574,7 +3928,10 @@ public class GatewayServeLockLogicTest {
             let oldWorkspaceDirOverride = CliConfig.workspaceDirOverride
             let brokerScript = Path(managedStdioResolveBrokerScriptPath())
             let project = brokerScript.parent.parent
-            let metisBinary = project.join("target").join("release").join("bin").join("metis")
+            let metisBinaryValue = gatewayFormalMetisBinary(project)
+            @Expect(metisBinaryValue.isSome(), true)
+            if (metisBinaryValue.isNone()) { return }
+            let metisBinary = metisBinaryValue.getOrThrow()
             let dependencyScript = brokerScript.parent.join("metis-s5-loopback-dependencies.mjs")
             let proxySource = brokerScript.parent.join("metis-s5-broker-writer-failure-proxy.mjs")
             let gcmSource = gatewayS5GcmBinary()
@@ -3050,7 +4407,14 @@ public class GatewayServeLockLogicTest {
                 "METIS_STDIO_BROKER_NODE_COMMAND", "METIS_S5_BROKER_PROXY_READY",
                 "METIS_S5_BROKER_PROXY_FAIL", "METIS_S5_BROKER_PROXY_WRITER_CLOSED",
                 "METIS_S5_BROKER_PROXY_CLEANUP", "METIS_S5_BROKER_PROXY_DROP_DELIVERY_ID",
-                "METIS_S5_BROKER_PROXY_ADMISSION_SEEN", "METIS_S5_BROKER_PROXY_COMPLETION_DROPPED", "GCM_S5_READY_PATH",
+                "METIS_S5_BROKER_PROXY_ADMISSION_SEEN", "METIS_S5_BROKER_PROXY_COMPLETION_DROPPED",
+                "METIS_S5_BROKER_PROXY_HOLD_ENTERED", "METIS_S5_BROKER_PROXY_HOLD_RELEASE",
+                "METIS_S5_BROKER_PROXY_HOLD_RELEASED", "METIS_STDIO_BROKER_TEST_MODE",
+                "METIS_STDIO_BROKER_DIAGNOSTIC_MARKER", "METIS_TEST_SERVICE_PLUGIN_DISPATCH_FENCED_MARKER",
+                "METIS_TEST_SERVICE_PLUGIN_DISPATCH_FENCED_SERVICE_ID",
+                "METIS_TEST_SERVICE_PLUGIN_DISPATCH_FENCED_NONCE",
+                "METIS_TEST_GATEWAY_SHUTDOWN_PHASE_MARKER", "METIS_TEST_GATEWAY_SHUTDOWN_PHASE_NONCE",
+                "GCM_S5_READY_PATH",
                 "GCM_S5_STOP_SEEN_PATH", "GCM_S5_CHILD_DYLD_LIBRARY_PATH"
             ]
             let previousEnvironment = ArrayList<(String, Option<String>)>()
@@ -3062,7 +4426,10 @@ public class GatewayServeLockLogicTest {
             for (key in baseUrlAliases) { providerEnvironment.add((key, getVariable(key))) }
             let brokerScript = Path(managedStdioResolveBrokerScriptPath())
             let project = brokerScript.parent.parent
-            let metisBinary = project.join("target").join("release").join("bin").join("metis")
+            let metisBinaryValue = gatewayFormalMetisBinary(project)
+            @Expect(metisBinaryValue.isSome(), true)
+            if (metisBinaryValue.isNone()) { return }
+            let metisBinary = metisBinaryValue.getOrThrow()
             let dependencyScript = brokerScript.parent.join("metis-s5-loopback-dependencies.mjs")
             let proxySource = brokerScript.parent.join("metis-s5-broker-writer-failure-proxy.mjs")
             let gcmRoot = gatewayS5GcmRoot()
@@ -3072,11 +4439,15 @@ public class GatewayServeLockLogicTest {
             var replacementDependencies = None<GatewayS5DependencyProcess>
             var oldProcess = None<SubProcess>
             var replacementProcess = None<SubProcess>
+            var holdReleaser = None<Future<Bool>>
             var oldIdentity = None<GatewayServeIdentity>
             var replacementIdentity = None<GatewayServeIdentity>
             var oldGatewaySettled = false
             var oldGatewayGone = false
             var oldProxyGone = false
+            var oldWrapperGone = false
+            var oldGcmGone = false
+            var oldDescendantGone = false
             var oldGatewayFinalSettled = false
             var oldGatewayFinalGone = false
             var oldProxyFinalGone = false
@@ -3097,10 +4468,16 @@ public class GatewayServeLockLogicTest {
             var replacementBrokerPid: Int64 = 0
             var replacementGcmPid: Int64 = 0
             var replacementPgid: Int64 = 0
+            var parentBrokerGeneration: Int64 = 0
+            var parentBrokerPid: Int64 = 0
             var oldBusinessTruth = false
             var replacementBusinessTruth = false
+            var parentBrokerDiagnosticTruth = false
             let output = ArrayList<String>()
             try {
+                let parentSetupReset = resetManagedStdioBrokerForTest(timeoutMs: 3000)
+                @Expect(parentSetupReset.ok, true)
+                if (!parentSetupReset.ok) { return }
                 Directory.create(oldHome, recursive: true)
                 Directory.create(replacementHome, recursive: true)
                 @Expect(exists(metisBinary), true)
@@ -3125,6 +4502,17 @@ public class GatewayServeLockLogicTest {
                 let proxyFail = oldHome.join("broker-proxy.fail")
                 let writerClosed = oldHome.join("broker-proxy.writer-closed")
                 let proxyCleanup = oldHome.join("broker-proxy.cleanup")
+                let holdEntered = oldHome.join("broker-proxy.hold-entered")
+                let holdRelease = oldHome.join("broker-proxy.hold-release")
+                let holdReleased = oldHome.join("broker-proxy.hold-released")
+                let parentBrokerDiagnosticPath = oldHome.join("parent-broker-diagnostic")
+                let dispatchFencedMarker = oldHome.join("service-plugin.dispatch-fenced.json")
+                let dispatchFencedNonce = "s5-n1-fence-${suffix}"
+                let shutdownPhaseMarker = oldHome.join("gateway-shutdown-phase")
+                let shutdownPhaseNonce = "s5-n1-shutdown-${suffix}"
+                let oldLockPath = oldHome.join("gateway-serve.lock")
+                let oldStopRequestPath = oldHome.join("gateway-serve.stop-request")
+                let oldCompletionPath = oldHome.join("gateway-serve.stop-complete")
 
                 setVariable("METIS_HOME", oldHome.toString())
                 setVariable("METIS_CJPM_ROOT", project.toString())
@@ -3133,6 +4521,14 @@ public class GatewayServeLockLogicTest {
                 setVariable("METIS_S5_BROKER_PROXY_FAIL", proxyFail.toString())
                 setVariable("METIS_S5_BROKER_PROXY_WRITER_CLOSED", writerClosed.toString())
                 setVariable("METIS_S5_BROKER_PROXY_CLEANUP", proxyCleanup.toString())
+                setVariable("METIS_S5_BROKER_PROXY_HOLD_ENTERED", holdEntered.toString())
+                setVariable("METIS_S5_BROKER_PROXY_HOLD_RELEASE", holdRelease.toString())
+                setVariable("METIS_S5_BROKER_PROXY_HOLD_RELEASED", holdReleased.toString())
+                setVariable("METIS_TEST_SERVICE_PLUGIN_DISPATCH_FENCED_MARKER", dispatchFencedMarker.toString())
+                setVariable("METIS_TEST_SERVICE_PLUGIN_DISPATCH_FENCED_SERVICE_ID", "gitcode-monitor")
+                setVariable("METIS_TEST_SERVICE_PLUGIN_DISPATCH_FENCED_NONCE", dispatchFencedNonce)
+                setVariable("METIS_TEST_GATEWAY_SHUTDOWN_PHASE_MARKER", shutdownPhaseMarker.toString())
+                setVariable("METIS_TEST_GATEWAY_SHUTDOWN_PHASE_NONCE", shutdownPhaseNonce)
                 setVariable("METIS_S5_BROKER_PROXY_DROP_DELIVERY_ID", "")
                 setVariable("METIS_S5_BROKER_PROXY_ADMISSION_SEEN", "")
                 setVariable("METIS_S5_BROKER_PROXY_COMPLETION_DROPPED", "")
@@ -3157,6 +4553,12 @@ public class GatewayServeLockLogicTest {
                 )
                 gatewayS5WriteBlockedGcmManifest(configured[2], oldWrapper, oldGcm)
                 @Expect(loadServicePluginManifest(configured[2].toString()).ok, true)
+                CliConfig.invalidatePathCache()
+                MetisConfigManager.invalidate()
+                CliSettingManager.invalidate()
+                @Expect(exists(oldLockPath), false)
+                @Expect(exists(oldStopRequestPath), false)
+                @Expect(exists(oldCompletionPath), false)
                 let launchedOld = launch(
                     metisBinary.toString(), ["gateway", "run"],
                     stdIn: ProcessRedirect.Discard, stdOut: ProcessRedirect.Discard, stdErr: ProcessRedirect.Discard
@@ -3165,11 +4567,18 @@ public class GatewayServeLockLogicTest {
                 oldProcess = Some(launchedOld)
                 oldIdentity = gatewayServeStopCaptureOwnedIdentity(oldHome, oldGatewayPid, metisBinary, 5000)
                 @Expect(oldIdentity.isSome(), true)
+                if (oldIdentity.isNone()) { return }
                 @Expect(gatewayServeStopWaitUntil(15000, { =>
                     exists(proxyReady) && exists(wrapperReady) && gatewayServeStopPortListening(oldGatewayPort) &&
                         gatewayServeStopPortListening(oldWebhookPort)
                 }), true)
                 oldBrokerPid = gatewayS5JsonInt(proxyReady, "brokerPid")
+                @Expect(gatewayServeStopWaitUntil(5000, { =>
+                    !gatewayS5JsonString(proxyReady, "gcmOwnerId").isEmpty() &&
+                        gatewayS5JsonInt(proxyReady, "generation") > 0
+                }), true)
+                let oldServiceOwnerId = gatewayS5JsonString(proxyReady, "gcmOwnerId")
+                let oldServiceGeneration = gatewayS5JsonInt(proxyReady, "generation")
                 oldProxyPid = gatewayS5JsonInt(proxyReady, "wrapperPid")
                 oldWrapperPid = gatewayS5JsonInt(wrapperReady, "wrapperPid")
                 oldGcmPid = gatewayS5JsonInt(wrapperReady, "gcmPid")
@@ -3178,6 +4587,8 @@ public class GatewayServeLockLogicTest {
                 @Expect(oldProxyPid > 1 && gatewayServeStopParentPid(oldProxyPid) == oldGatewayPid, true)
                 @Expect(gatewayServeStopCommandContains(oldProxyPid, proxy.toString()), true)
                 @Expect(oldBrokerPid > 1 && gatewayServeStopParentPid(oldBrokerPid) == oldProxyPid, true)
+                @Expect(oldServiceOwnerId.isEmpty(), false)
+                @Expect(oldServiceGeneration > 0, true)
                 @Expect(gatewayServeStopCommandContains(oldBrokerPid, brokerScript.toString()), true)
                 @Expect(oldWrapperPid > 1 && oldGcmPid > 1 && oldDescendantPid > 1 && oldPgid > 1, true)
                 @Expect(gatewayServeStopProcessGroup(oldWrapperPid), oldPgid)
@@ -3195,19 +4606,128 @@ public class GatewayServeLockLogicTest {
                 @Expect(gatewayServeStopWaitUntil(10000, { => exists(processorEntered) }), true)
                 File.writeTo(proxyFail, "fail\n".toArray())
                 @Expect(gatewayServeStopWaitUntil(5000, { => exists(writerClosed) }), true)
+                @Expect(gatewayServeStopWaitUntil(5000, { => exists(holdEntered) }), true)
                 for ((key, value) in previousEnvironment) {
                     match (value) {
                         case Some(previous) => setVariable(key, previous)
                         case None => setVariable(key, "")
                     }
                 }
+                setVariable("METIS_STDIO_BROKER_NODE_COMMAND", "")
+                Directory.create(parentBrokerDiagnosticPath, recursive: true)
+                let freshParentBrokerDirectory = GatewayHeartbeatBrokerDirectoryProof(parentBrokerDiagnosticPath)
+                @Expect(freshParentBrokerDirectory.status, "valid")
+                @Expect(freshParentBrokerDirectory.identityCount, 0)
+                @Expect(freshParentBrokerDirectory.slotCount, 0)
+                @Expect(freshParentBrokerDirectory.tempCount, 0)
+                @Expect(freshParentBrokerDirectory.overflow, false)
+                if (freshParentBrokerDirectory.status != "valid" ||
+                    freshParentBrokerDirectory.identityCount != 0 || freshParentBrokerDirectory.slotCount != 0 ||
+                    freshParentBrokerDirectory.tempCount != 0 || freshParentBrokerDirectory.overflow) {
+                    return
+                }
+                setVariable("METIS_STDIO_BROKER_TEST_MODE", "1")
+                setVariable("METIS_STDIO_BROKER_DIAGNOSTIC_MARKER", parentBrokerDiagnosticPath.toString())
+                let parentBrokerReady = gatewayStdioBrokerReady(timeoutMs: 5000)
+                @Expect(parentBrokerReady.ok, true)
+                @Expect(parentBrokerReady.status, "ready")
+                @Expect(parentBrokerReady.generation > 0, true)
+                @Expect(parentBrokerReady.pid > 0, true)
+                let parentBrokerBeforeStop = managedStdioBroker().snapshot()
+                parentBrokerGeneration = parentBrokerBeforeStop.generation
+                parentBrokerPid = parentBrokerBeforeStop.brokerPid
+                @Expect(parentBrokerBeforeStop.running, true)
+                @Expect(parentBrokerBeforeStop.responsive, true)
+                @Expect(parentBrokerBeforeStop.status, "ready")
+                @Expect(parentBrokerBeforeStop.generation, parentBrokerReady.generation)
+                @Expect(parentBrokerBeforeStop.brokerPid, parentBrokerReady.pid)
+                @Expect(parentBrokerBeforeStop.ownerCount, 0)
+                let stableParentBrokerGeneration = parentBrokerBeforeStop.generation
+                let stableParentBrokerPid = parentBrokerBeforeStop.brokerPid
+                let parentBrokerMarkerReady = gatewayServeStopWaitUntil(5000, { =>
+                    let directory = GatewayHeartbeatBrokerDirectoryProof(parentBrokerDiagnosticPath)
+                    let marker = gatewayHeartbeatBrokerDiagnosticForPid(
+                        parentBrokerDiagnosticPath,
+                        stableParentBrokerPid
+                    )
+                    directory.status == "valid" && directory.identityCount == 1 && directory.slotCount == 1 &&
+                        directory.tempCount == 0 && !directory.overflow && match (marker) {
+                            case Some(value) => value.valid && value.filenameMatches && value.firstEventBrokerStarted &&
+                                value.generation == stableParentBrokerGeneration && value.brokerPid == stableParentBrokerPid
+                            case None => false
+                        }
+                })
+                @Expect(parentBrokerMarkerReady, true)
+                if (!parentBrokerReady.ok || parentBrokerReady.status != "ready" ||
+                    parentBrokerReady.generation <= 0 || parentBrokerReady.pid <= 0 ||
+                    !parentBrokerBeforeStop.running || !parentBrokerBeforeStop.responsive ||
+                    parentBrokerBeforeStop.status != "ready" || parentBrokerBeforeStop.ownerCount != 0 ||
+                    !parentBrokerMarkerReady) {
+                    return
+                }
                 setGatewayStopOutputForTest(Some({ line => output.add(line) }))
+                let expectedOldIdentity = oldIdentity.getOrThrow()
+                let expectedStopRequestPath = oldStopRequestPath
+                let expectedHoldRelease = holdRelease
+                let expectedHoldReleased = holdReleased
+                let expectedProcessorRelease = processorRelease
+                let expectedFencedMarker = dispatchFencedMarker
+                let expectedFencedNonce = dispatchFencedNonce
+                let expectedServiceOwnerId = oldServiceOwnerId
+                let expectedServiceGeneration = oldServiceGeneration
+                holdReleaser = Some(spawn {
+                    let requestReady = gatewayServeStopWaitUntil(15000, { =>
+                        try {
+                            gatewayParseServeStopRequestIdentity(
+                                String.fromUtf8(File.readFrom(expectedStopRequestPath))
+                            ).getOrThrow().matches(expectedOldIdentity)
+                        } catch (_: Exception) {
+                            false
+                        }
+                    })
+                    if (!requestReady) { return false }
+                    let fencedReady = gatewayServeStopWaitUntil(15000, { =>
+                        try {
+                            let marker = JsonValue.fromStr(
+                                String.fromUtf8(File.readFrom(expectedFencedMarker))
+                            ).asObject()
+                            marker.get("schema").getOrThrow().asString().getValue() ==
+                                "metis.servicePlugin.dispatchFenced.v1" &&
+                                marker.get("serviceId").getOrThrow().asString().getValue() == "gitcode-monitor" &&
+                                marker.get("ownerId").getOrThrow().asString().getValue() == expectedServiceOwnerId &&
+                                marker.get("generation").getOrThrow().asInt().getValue() == expectedServiceGeneration &&
+                                marker.get("testNonce").getOrThrow().asString().getValue() == expectedFencedNonce &&
+                                marker.get("fenced").getOrThrow().asBool().getValue()
+                        } catch (_: Exception) {
+                            false
+                        }
+                    })
+                    if (!fencedReady) { return false }
+                    try { File.writeTo(expectedProcessorRelease, "release\n".toArray()) } catch (_: Exception) { return false }
+                    try { File.writeTo(expectedHoldRelease, "release\n".toArray()) } catch (_: Exception) { return false }
+                    gatewayServeStopWaitUntil(5000, { => exists(expectedHoldReleased) })
+                })
                 let stopStarted = MonoTime.now()
                 let oldStopExit = gatewayExecuteStopServe()
                 let stopElapsedMs = (MonoTime.now() - stopStarted).toMilliseconds()
+                let holdReleasedOk = try {
+                    holdReleaser.getOrThrow().get(Duration.second * 25)
+                } catch (_: Exception) {
+                    false
+                }
+                holdReleaser = None<Future<Bool>>
                 let oldOutput = String.join(output.toArray(), delimiter: "\n")
                 @Expect(oldStopExit, 1)
-                @Expect(stopElapsedMs <= GATEWAY_SERVE_GRACEFUL_SHUTDOWN_TIMEOUT_MS + 5000, true)
+                @Expect(holdReleasedOk, true)
+                @Expect(exists(holdReleased), true)
+                @Expect(stopElapsedMs < 55000, true)
+                let parentBrokerAfterStop = managedStdioBroker().snapshot()
+                @Expect(parentBrokerAfterStop.running, true)
+                @Expect(parentBrokerAfterStop.responsive, true)
+                @Expect(parentBrokerAfterStop.status, "ready")
+                @Expect(parentBrokerAfterStop.generation, parentBrokerBeforeStop.generation)
+                @Expect(parentBrokerAfterStop.brokerPid, parentBrokerBeforeStop.brokerPid)
+                @Expect(parentBrokerAfterStop.ownerCount, 0)
                 @Expect(oldOutput.contains("子进程清理未完成"), true)
                 @Expect(oldOutput.contains("\"ok\""), false)
                 let oldLogPath = oldHome.join("s5-gateway.log")
@@ -3225,11 +4745,15 @@ public class GatewayServeLockLogicTest {
                     @Expect(if (oldOutput.contains(sensitive)) { "output_leak:${label}" } else { "output_clean:${label}" }, "output_clean:${label}")
                     @Expect(if (oldLog.contains(sensitive)) { "log_leak:${label}" } else { "log_clean:${label}" }, "log_clean:${label}")
                 }
-                let oldCompletionPath = oldHome.join("gateway-serve.stop-complete")
-                @Expect(exists(oldCompletionPath), false)
+                @Expect(oldIdentity.isSome(), true)
+                if (oldIdentity.isNone()) { return }
                 @Expect(exists(writerClosed), true)
                 @Expect(exists(stopSeen), false)
+                @Expect(exists(dispatchFencedMarker), true)
+                @Expect(gatewayS5EventCount(oldDependencies.getOrThrow().eventsPath, "model_response", oldDelivery), 0)
+                @Expect(gatewayS5EventCount(oldDependencies.getOrThrow().eventsPath, "gitcode_writeback", oldDelivery), 0)
                 @Expect(gatewayS5EventCount(oldDependencies.getOrThrow().eventsPath, "telegram_send", oldDelivery), 0)
+                @Expect(gatewayS5EventCount(oldDependencies.getOrThrow().eventsPath, "feishu_send", oldDelivery), 0)
                 let stableOldBrokerPid = oldBrokerPid
                 let stableOldGatewayPid = oldGatewayPid
                 let stableOldProxyPid = oldProxyPid
@@ -3240,14 +4764,110 @@ public class GatewayServeLockLogicTest {
                 oldGatewayGone = gatewayServeStopWaitUntil(5000, { => !gatewayServeStopPidAlive(stableOldGatewayPid) })
                 oldProxyGone = gatewayServeStopWaitUntil(5000, { => !gatewayServeStopPidAlive(stableOldProxyPid) })
                 oldBrokerGone = gatewayServeStopWaitUntil(10000, { => !gatewayServeStopPidAlive(stableOldBrokerPid) })
+                let stableOldWrapperPid = oldWrapperPid
+                let stableOldGcmPid = oldGcmPid
+                let stableOldDescendantPid = oldDescendantPid
+                oldWrapperGone = gatewayServeStopWaitUntil(10000, { => !gatewayServeStopPidAlive(stableOldWrapperPid) })
+                oldGcmGone = gatewayServeStopWaitUntil(10000, { => !gatewayServeStopPidAlive(stableOldGcmPid) })
+                oldDescendantGone = gatewayServeStopWaitUntil(10000, { => !gatewayServeStopPidAlive(stableOldDescendantPid) })
                 oldGroupGone = gatewayServeStopWaitUntil(10000, { => gatewayServeStopGroupGone(stableOldPgid) })
                 @Expect(oldGatewayGone, true)
                 @Expect(oldProxyGone, true)
                 @Expect(oldBrokerGone, true)
+                @Expect(oldWrapperGone, true)
+                @Expect(oldGcmGone, true)
+                @Expect(oldDescendantGone, true)
                 @Expect(oldGroupGone, true)
                 @Expect(gatewayServeStopPortListening(oldGatewayPort), false)
                 @Expect(gatewayServeStopPortListening(oldWebhookPort), false)
                 @Expect(gatewayServeStopRuntimeOwnerCount(oldHome.join("gateway-runtime-state.json")), 0)
+                var firstPhaseObservedMs: Int64 = -1
+                var previousPhaseObservedMs: Int64 = -1
+                var httpCloseReturnedObservedMs: Int64 = -1
+                var httpProbeDoneObservedMs: Int64 = -1
+                for ((sequence, phase) in [
+                    (Int64(1), "stop_request_observed"),
+                    (Int64(2), "canvas_done"),
+                    (Int64(3), "http_close_enter"),
+                    (Int64(4), "http_close_returned"),
+                    (Int64(5), "http_probe_done"),
+                    (Int64(6), "gateway_stop_enter"),
+                    (Int64(7), "owners_enter"),
+                    (Int64(8), "owners_done"),
+                    (Int64(9), "channels_enter"),
+                    (Int64(10), "channels_done"),
+                    (Int64(11), "broker_enter"),
+                    (Int64(12), "broker_done"),
+                    (Int64(13), "gateway_stop_returned"),
+                    (Int64(14), "completion_written")
+                ]) {
+                    let phasePath = Path("${shutdownPhaseMarker.toString()}.${sequence}.json")
+                    let phaseProof = try {
+                        let phaseValue = JsonValue.fromStr(String.fromUtf8(File.readFrom(phasePath))).asObject()
+                        (phaseValue.get("schema").getOrThrow().asString().getValue() ==
+                            "metis.gateway.shutdownPhase.v1" &&
+                            phaseValue.get("phase").getOrThrow().asString().getValue() == phase &&
+                            phaseValue.get("sequence").getOrThrow().asInt().getValue() == sequence &&
+                            phaseValue.get("pid").getOrThrow().asInt().getValue() == expectedOldIdentity.pid &&
+                            phaseValue.get("startedAtMs").getOrThrow().asInt().getValue() ==
+                                expectedOldIdentity.startedAtMs &&
+                            phaseValue.get("nonce").getOrThrow().asString().getValue() == expectedOldIdentity.nonce &&
+                            phaseValue.get("processIdentity").getOrThrow().asString().getValue() ==
+                                expectedOldIdentity.processIdentity.getOrThrow().serialize() &&
+                            phaseValue.get("testNonce").getOrThrow().asString().getValue() == shutdownPhaseNonce,
+                            phaseValue.get("observedMonotonicMs").getOrThrow().asInt().getValue())
+                    } catch (_: Exception) {
+                        (false, Int64(-1))
+                    }
+                    @Expect(phaseProof[0], true)
+                    @Expect(phaseProof[1] >= 0, true)
+                    if (sequence == 1) { firstPhaseObservedMs = phaseProof[1] }
+                    if (sequence == 4) { httpCloseReturnedObservedMs = phaseProof[1] }
+                    if (sequence == 5) { httpProbeDoneObservedMs = phaseProof[1] }
+                    if (previousPhaseObservedMs >= 0) { @Expect(phaseProof[1] >= previousPhaseObservedMs, true) }
+                    let relativeElapsedMs = if (firstPhaseObservedMs >= 0 && phaseProof[1] >= firstPhaseObservedMs) {
+                        phaseProof[1] - firstPhaseObservedMs
+                    } else {
+                        Int64(-1)
+                    }
+                    println("HB-BR-SHUTDOWN phase=${phase} elapsedMs=${relativeElapsedMs}")
+                    previousPhaseObservedMs = phaseProof[1]
+                    let phaseMode = executeWithOutput("/usr/bin/stat", ["-f", "%Lp", phasePath.toString()])
+                    @Expect(phaseMode[0], 0)
+                    let phaseModeText = try { String.fromUtf8(phaseMode[1]).trimAscii() } catch (_: Exception) { "" }
+                    @Expect(phaseModeText, "600")
+                }
+                let httpProbeElapsedMs = if (httpCloseReturnedObservedMs >= 0 &&
+                    httpProbeDoneObservedMs >= httpCloseReturnedObservedMs) {
+                    httpProbeDoneObservedMs - httpCloseReturnedObservedMs
+                } else {
+                    Int64(-1)
+                }
+                @Expect(httpProbeElapsedMs >= 0, true)
+                @Expect(httpProbeElapsedMs <= 3000, true)
+                let oldCompletionExists = exists(oldCompletionPath)
+                @Expect(oldCompletionExists, true)
+                if (!oldCompletionExists) { return }
+                let oldCompletion = try {
+                    String.fromUtf8(File.readFrom(oldCompletionPath))
+                } catch (_: Exception) {
+                    ""
+                }
+                @Expect(gatewayParseServeIdentity(oldCompletion).getOrThrow().matches(oldIdentity.getOrThrow()), true)
+                @Expect(gatewayServeStopCompletionField(oldCompletion, "status"), "cleanup_pending")
+                @Expect(gatewayServeStopCompletionField(oldCompletion, "fullTerminal"), "0")
+                @Expect(gatewayServeStopCompletionField(oldCompletion, "servicePluginDispatchStatus"), "cleanup_pending")
+                @Expect(gatewayServeStopCompletionField(oldCompletion, "servicePluginOwnerStatus"), "cleanup_pending")
+                @Expect(gatewayServeStopCompletionField(oldCompletion, "servicePluginLeaseStatus"), "cleanup_pending")
+                @Expect(gatewayServeStopCompletionField(oldCompletion, "servicePluginPendingCount"), "1")
+                @Expect(gatewayServeStopCompletionField(oldCompletion, "channelsStatus"), "stopped")
+                @Expect(gatewayServeStopCompletionField(oldCompletion, "brokerStatus"), "broker_close_write_failed")
+                let historical = gatewayHistoricalServeCompletionRecoveryStatus()
+                @Expect(historical.ok, false)
+                @Expect(historical.status, "resources_not_terminal")
+                @Expect(gatewayPendingServeCompletionStatus(), "cleanup_pending")
+                @Expect(exists(oldLockPath), false)
+                @Expect(exists(oldStopRequestPath), false)
                 oldBusinessTruth = true
 
                 setGatewayStopOutputForTest(None<(String) -> Unit>)
@@ -3256,7 +4876,13 @@ public class GatewayServeLockLogicTest {
                 for (key in ["METIS_S5_BROKER_PROXY_READY", "METIS_S5_BROKER_PROXY_FAIL",
                     "METIS_S5_BROKER_PROXY_WRITER_CLOSED", "METIS_S5_BROKER_PROXY_CLEANUP",
                     "METIS_S5_BROKER_PROXY_DROP_DELIVERY_ID", "METIS_S5_BROKER_PROXY_ADMISSION_SEEN",
-                    "METIS_S5_BROKER_PROXY_COMPLETION_DROPPED",
+                    "METIS_S5_BROKER_PROXY_COMPLETION_DROPPED", "METIS_S5_BROKER_PROXY_HOLD_ENTERED",
+                    "METIS_S5_BROKER_PROXY_HOLD_RELEASE", "METIS_S5_BROKER_PROXY_HOLD_RELEASED",
+                    "METIS_STDIO_BROKER_TEST_MODE", "METIS_STDIO_BROKER_DIAGNOSTIC_MARKER",
+                    "METIS_TEST_SERVICE_PLUGIN_DISPATCH_FENCED_MARKER",
+                    "METIS_TEST_SERVICE_PLUGIN_DISPATCH_FENCED_SERVICE_ID",
+                    "METIS_TEST_SERVICE_PLUGIN_DISPATCH_FENCED_NONCE",
+                    "METIS_TEST_GATEWAY_SHUTDOWN_PHASE_MARKER", "METIS_TEST_GATEWAY_SHUTDOWN_PHASE_NONCE",
                     "GCM_S5_READY_PATH", "GCM_S5_STOP_SEEN_PATH", "GCM_S5_CHILD_DYLD_LIBRARY_PATH"]) {
                     setVariable(key, "")
                 }
@@ -3351,6 +4977,13 @@ public class GatewayServeLockLogicTest {
                 replacementBusinessTruth = true
             } finally {
                 setGatewayStopOutputForTest(None<(String) -> Unit>)
+                try { File.writeTo(oldHome.join("processor.release"), "release\n".toArray()) } catch (_: Exception) { () }
+                try { File.writeTo(oldHome.join("broker-proxy.hold-release"), "release\n".toArray()) } catch (_: Exception) { () }
+                match (holdReleaser) {
+                    case Some(value) => try { let _ = value.get(Duration.second * 35) } catch (_: Exception) { () }
+                    case None => ()
+                }
+                holdReleaser = None<Future<Bool>>
                 if (!exists(oldHome.join("processor.release"))) {
                     try { File.writeTo(oldHome.join("processor.release"), "release\n".toArray()) } catch (_: Exception) { () }
                 }
@@ -3393,6 +5026,56 @@ public class GatewayServeLockLogicTest {
                 })
                 let oldDependenciesSettled = gatewayS5StopDependencies(oldDependencies)
                 let replacementDependenciesSettled = gatewayS5StopDependencies(replacementDependencies)
+                let parentFinalReset = resetManagedStdioBrokerForTest(timeoutMs: 3000)
+                let parentFinalBroker = managedStdioBroker().snapshot()
+                let parentBrokerDirectory = GatewayHeartbeatBrokerDirectoryProof(
+                    oldHome.join("parent-broker-diagnostic")
+                )
+                let parentBrokerDiagnostics = gatewayHeartbeatBrokerDiagnostics(
+                    oldHome.join("parent-broker-diagnostic")
+                )
+                @Expect(parentFinalReset.status, "stopped")
+                @Expect(parentBrokerDirectory.status, "valid")
+                @Expect(parentBrokerDirectory.identityCount, 1)
+                @Expect(parentBrokerDirectory.slotCount, 1)
+                @Expect(parentBrokerDirectory.tempCount, 0)
+                @Expect(parentBrokerDirectory.overflow, false)
+                @Expect(parentBrokerDiagnostics.size, 1)
+                if (parentBrokerDirectory.status == "valid" && parentBrokerDirectory.identityCount == 1 &&
+                    parentBrokerDirectory.slotCount == 1 && parentBrokerDirectory.tempCount == 0 &&
+                    parentBrokerDiagnostics.size == 1) {
+                    let diagnostic = parentBrokerDiagnostics[0]
+                    let parentTestPid = Int64(getProcessId())
+                    println("HB-BR-PARENT ${diagnostic.safeSummary("parent", parentTestPid)}")
+                    @Expect(diagnostic.valid, true)
+                    @Expect(diagnostic.parseStatus, "schema_valid")
+                    @Expect(diagnostic.filenameMatches, true)
+                    @Expect(diagnostic.firstEventBrokerStarted, true)
+                    @Expect(diagnostic.parentStatus(parentTestPid), "original_parent")
+                    @Expect(diagnostic.closeEntryCount, 1)
+                    @Expect(diagnostic.closeEntryOwnerCount, 0)
+                    @Expect(diagnostic.brokerClosedEnqueuedCount, 1)
+                    @Expect(diagnostic.brokerClosedCallbackCount, 1)
+                    @Expect(diagnostic.closeAckCallbackSeen, true)
+                    @Expect(diagnostic.classifiedOwnerTerminalCount, diagnostic.ownerTerminalCount)
+                    @Expect(diagnostic.ownerCount, 0)
+                    @Expect(diagnostic.generation, parentBrokerGeneration)
+                    @Expect(diagnostic.brokerPid, parentBrokerPid)
+                    @Expect(diagnostic.writerFailureKind, "")
+                    @Expect(diagnostic.writerFailurePhase, "")
+                    @Expect(diagnostic.exitScheduledCount, 1)
+                    @Expect(diagnostic.lastExitScheduledCode, 0)
+                    parentBrokerDiagnosticTruth = diagnostic.valid && diagnostic.filenameMatches &&
+                        diagnostic.parentStatus(parentTestPid) == "original_parent" &&
+                        diagnostic.closeEntryCount == 1 && diagnostic.closeEntryOwnerCount == 0 &&
+                        diagnostic.brokerClosedEnqueuedCount == 1 && diagnostic.brokerClosedCallbackCount == 1 &&
+                        diagnostic.closeAckCallbackSeen &&
+                        diagnostic.classifiedOwnerTerminalCount == diagnostic.ownerTerminalCount &&
+                        diagnostic.ownerCount == 0 && diagnostic.exitScheduledCount == 1 &&
+                        diagnostic.lastExitScheduledCode == 0 && diagnostic.generation == parentBrokerGeneration &&
+                        diagnostic.brokerPid == parentBrokerPid && diagnostic.writerFailureKind.isEmpty() &&
+                        diagnostic.writerFailurePhase.isEmpty()
+                }
                 for ((key, value) in previousEnvironment) {
                     match (value) {
                         case Some(previous) => setVariable(key, previous)
@@ -3423,6 +5106,9 @@ public class GatewayServeLockLogicTest {
                 @Expect(oldGatewaySettled, true)
                 @Expect(oldGatewayGone, true)
                 @Expect(oldProxyGone, true)
+                @Expect(oldWrapperGone, true)
+                @Expect(oldGcmGone, true)
+                @Expect(oldDescendantGone, true)
                 @Expect(oldGatewayFinalSettled, true)
                 @Expect(oldGatewayFinalGone, true)
                 @Expect(oldProxyFinalGone, true)
@@ -3434,6 +5120,13 @@ public class GatewayServeLockLogicTest {
                 @Expect(replacementGroupGone, true)
                 @Expect(oldDependenciesSettled, true)
                 @Expect(replacementDependenciesSettled, true)
+                @Expect(parentFinalReset.ok, true)
+                @Expect(parentFinalBroker.running, false)
+                @Expect(parentBrokerDiagnosticTruth, true)
+                @Expect(parentFinalBroker.brokerPid, 0)
+                @Expect(parentFinalBroker.ownerCount, 0)
+                @Expect(parentFinalBroker.readerCount, 0)
+                @Expect(parentFinalBroker.dispatcherCount, 0)
             }
         }
     }
@@ -3448,7 +5141,10 @@ public class GatewayServeLockLogicTest {
             let oldRoot = getVariable("METIS_CJPM_ROOT")
             let brokerScript = Path(managedStdioResolveBrokerScriptPath())
             let project = brokerScript.parent.parent
-            let binary = project.join("target").join("release").join("bin").join("metis")
+            let binaryValue = gatewayFormalMetisBinary(project)
+            @Expect(binaryValue.isSome(), true)
+            if (binaryValue.isNone()) { return }
+            let binary = binaryValue.getOrThrow()
             var ignoreProcess: Option<SubProcess> = None<SubProcess>
             var oldProcess: Option<SubProcess> = None<SubProcess>
             var replacementProcess: Option<SubProcess> = None<SubProcess>

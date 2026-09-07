@@ -9,7 +9,7 @@ import metis.gateway.protocol.{GatewayClientInfo, GatewayConnectParams, GatewayP
 
 import magic.jsonable.*
 import std.env.{getVariable, setVariable}
-import std.fs.{Directory, Path, remove}
+import std.fs.{Directory, FileInfo, Path, exists, remove}
 import std.fs.File
 import std.time.DateTime
 import stdx.encoding.json.{JsonArray, JsonBool, JsonObject, JsonString}
@@ -517,39 +517,60 @@ public class GatewayControlUiWsTest {
 
     @TestCase
     public func invalidatePayloadPrefersResponseDeliveryProjection(): Unit {
-        let user = GatewayUserSettings()
-        let store = gatewaySessionStoreForUserWithAgentId(user, "general")
-        let sessionKey = "agent:general:invalidate-delivery-test"
-        store.deleteSession(sessionKey)
-        store.appendAssistant(sessionKey, "hello")
+        let realStore = gatewaySessionStoreForUserWithAgentId(GatewayUserSettings(), "general")
+        let realIndex = realStore.sessionsRoot().join("sessions.json")
+        let realIndexExisted = exists(realIndex)
+        let realIndexSize = try { FileInfo(realIndex).size } catch (_: Exception) { -1 }
+        let realIndexModifiedAt = try {
+            FileInfo(realIndex).lastModificationTime.toUnixTimeStamp().toMilliseconds()
+        } catch (_: Exception) {
+            -1
+        }
+        withGatewayControlUiWsTestHome {
+            let user = GatewayUserSettings()
+            let store = gatewaySessionStoreForUserWithAgentId(user, "general")
+            @Expect(store.sessionsRoot().toString() == realStore.sessionsRoot().toString(), false)
+            let sessionKey = "agent:general:invalidate-delivery-test"
+            try {
+                store.deleteSession(sessionKey)
+                store.appendAssistant(sessionKey, "hello")
 
-        let params = JsonObject()
-        params.put("session", JsonString(sessionKey))
-        params.put("replyChannel", JsonString("qq"))
-        params.put("replyTo", JsonString("10001"))
+                let params = JsonObject()
+                params.put("session", JsonString(sessionKey))
+                params.put("replyChannel", JsonString("qq"))
+                params.put("replyTo", JsonString("10001"))
 
-        let result = JsonObject()
-        result.put("session", JsonString(sessionKey))
-        let responseDelivery = JsonObject()
-        responseDelivery.put("replyChannel", JsonString("feishu"))
-        responseDelivery.put("replyTo", JsonString("chat-2"))
-        responseDelivery.put("replyToMessageId", JsonString("msg-2"))
-        result.put("delivery", responseDelivery)
-        let responseBinding = JsonObject()
-        responseBinding.put("conversationId", JsonString("chat-2"))
-        responseBinding.put("threadId", JsonString("thread-2"))
-        result.put("binding", responseBinding)
-        let response = GatewayProtocolResponse(true, "dashboard.chat.send", result: result)
+                let result = JsonObject()
+                result.put("session", JsonString(sessionKey))
+                let responseDelivery = JsonObject()
+                responseDelivery.put("replyChannel", JsonString("feishu"))
+                responseDelivery.put("replyTo", JsonString("chat-2"))
+                responseDelivery.put("replyToMessageId", JsonString("msg-2"))
+                result.put("delivery", responseDelivery)
+                let responseBinding = JsonObject()
+                responseBinding.put("conversationId", JsonString("chat-2"))
+                responseBinding.put("threadId", JsonString("thread-2"))
+                result.put("binding", responseBinding)
+                let response = GatewayProtocolResponse(true, "dashboard.chat.send", result: result)
 
-        let payload = gatewayControlUiWsInvalidatePayload("dashboard.chat.send", params, response: Some(response))
-        let delivery = payload.get("delivery").getOrThrow().asObject()
-        @Expect(gatewayControlUiWsTestString(delivery, "replyChannel"), "feishu")
-        @Expect(gatewayControlUiWsTestString(delivery, "replyToMessageId"), "msg-2")
-        let binding = payload.get("binding").getOrThrow().asObject()
-        @Expect(gatewayControlUiWsTestString(binding, "conversationId"), "chat-2")
-        @Expect(gatewayControlUiWsTestString(binding, "threadId"), "thread-2")
-
-        store.deleteSession(sessionKey)
+                let payload = gatewayControlUiWsInvalidatePayload(
+                    "dashboard.chat.send", params, response: Some(response))
+                let delivery = payload.get("delivery").getOrThrow().asObject()
+                @Expect(gatewayControlUiWsTestString(delivery, "replyChannel"), "feishu")
+                @Expect(gatewayControlUiWsTestString(delivery, "replyToMessageId"), "msg-2")
+                let binding = payload.get("binding").getOrThrow().asObject()
+                @Expect(gatewayControlUiWsTestString(binding, "conversationId"), "chat-2")
+                @Expect(gatewayControlUiWsTestString(binding, "threadId"), "thread-2")
+            } finally {
+                store.deleteSession(sessionKey)
+            }
+        }
+        @Expect(exists(realIndex), realIndexExisted)
+        @Expect(try { FileInfo(realIndex).size } catch (_: Exception) { -1 }, realIndexSize)
+        @Expect(
+            try { FileInfo(realIndex).lastModificationTime.toUnixTimeStamp().toMilliseconds() } catch (_: Exception) { -1 },
+            realIndexModifiedAt
+        )
     }
 
     @TestCase

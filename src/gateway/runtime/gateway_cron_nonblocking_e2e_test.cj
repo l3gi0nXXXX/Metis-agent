@@ -965,11 +965,28 @@ public class GatewayCronNonblockingE2eTest {
                 try { File.writeTo(releaseA, "release".toArray()) } catch (_: Exception) { () }
                 try { File.writeTo(releaseB, "release".toArray()) } catch (_: Exception) { () }
                 try { let _ = runner.stop(drainTimeoutMs: 3000) } catch (_: Exception) { () }
-                try { let _ = gateway.stop() } catch (_: Exception) { () }
-                GatewayHttpSurface.stopIfRunning()
-                if (managedStdioBroker().snapshot().ownerCount != 0) {
-                    let _ = resetManagedStdioBrokerForTest(timeoutMs: 3000)
+                var gatewayStopOk = false
+                var gatewayBrokerStatus = "stop_failed"
+                try {
+                    let stopped = gateway.stop()
+                    gatewayStopOk = stopped.ok
+                    gatewayBrokerStatus = stopped.brokerStatus
+                } catch (_: Exception) {
+                    ()
                 }
+                GatewayHttpSurface.stopIfRunning()
+                let ownersClearedBeforeReset = managedStdioBroker().snapshot().ownerCount == 0
+                let reset = resetManagedStdioBrokerForTest(timeoutMs: 3000)
+                let afterReset = managedStdioBroker().snapshot()
+                @Expect(gatewayStopOk, true)
+                @Expect(gatewayBrokerStatus, "stopped")
+                @Expect(ownersClearedBeforeReset, true)
+                @Expect(reset.ok, true)
+                @Expect(afterReset.running, false)
+                @Expect(afterReset.brokerPid, 0)
+                @Expect(afterReset.ownerCount, 0)
+                @Expect(afterReset.readerCount, 0)
+                @Expect(afterReset.dispatcherCount, 0)
             }
         })
     }

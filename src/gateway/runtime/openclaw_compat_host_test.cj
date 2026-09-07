@@ -2,6 +2,7 @@ package metis.gateway.runtime
 
 import metis.gateway.openclaw_runtime.*
 import metis.gateway.process.gatewayStdioBroker
+import metis.process.resetManagedStdioBrokerForTest
 import metis.core.config.{CliConfig, GatewayUserSettings}
 import magic.jsonable.*
 import std.collection.ArrayList
@@ -10,6 +11,30 @@ import std.fs.{File, Path, exists, remove}
 import std.time.DateTime
 import std.unittest.testmacro.*
 import stdx.encoding.json.{JsonArray, JsonObject, JsonString}
+
+private func withOpenClawCompatRealBrokerTest(body: () -> Bool): Unit {
+    var setupOk = false
+    var businessTruth = false
+    try {
+        let initialReset = resetManagedStdioBrokerForTest(timeoutMs: 3000)
+        setupOk = initialReset.ok
+        @Expect(setupOk, true)
+        if (!setupOk) { return }
+        businessTruth = body()
+    } finally {
+        let ownersClearedBeforeReset = gatewayStdioBroker().snapshot().ownerCount == 0
+        let reset = resetManagedStdioBrokerForTest(timeoutMs: 3000)
+        let afterReset = gatewayStdioBroker().snapshot()
+        @Expect(!setupOk || businessTruth, true)
+        @Expect(ownersClearedBeforeReset, true)
+        @Expect(reset.ok, true)
+        @Expect(afterReset.running, false)
+        @Expect(afterReset.brokerPid, 0)
+        @Expect(afterReset.ownerCount, 0)
+        @Expect(afterReset.readerCount, 0)
+        @Expect(afterReset.dispatcherCount, 0)
+    }
+}
 
 private class FakeOpenClawCompatHostTransport <: OpenClawCompatHostTransport {
     public let frames = ArrayList<JsonObject>()
@@ -336,143 +361,180 @@ public class OpenClawCompatHostTest {
 
     @TestCase
     public func realStdioRunnerLoadsNodeHostAndSyncsRegisteredCapabilities(): Unit {
-        let manager = OpenClawCompatHostManager(
-            openClawCompatHostConfigFromGatewaySettings(openClawCompatRealRuntimeSettings()),
-            runner: OpenClawCompatStdioProcessRunner()
-        )
+        withOpenClawCompatRealBrokerTest({ =>
+            let manager = OpenClawCompatHostManager(
+                openClawCompatHostConfigFromGatewaySettings(openClawCompatRealRuntimeSettings()),
+                runner: OpenClawCompatStdioProcessRunner()
+            )
 
-        let status = manager.start()
-        let bridge = manager.gatewayRegistryBridge()
-        let stopped = manager.stop()
+            let status = manager.start()
+            let bridge = manager.gatewayRegistryBridge()
+            let stopped = manager.stop()
 
-        @Expect(status.ok, true)
-        @Expect(status.state, "running")
-        @Expect(bridge.channelCount(), 1)
-        @Expect(bridge.toolCount(), 1)
-        @Expect(bridge.httpRouteCount(), 1)
-        @Expect(stopped.state, "stopped")
+            @Expect(status.ok, true)
+            @Expect(status.state, "running")
+            @Expect(bridge.channelCount(), 1)
+            @Expect(bridge.toolCount(), 1)
+            @Expect(bridge.httpRouteCount(), 1)
+            @Expect(stopped.state, "stopped")
+            status.ok && status.state == "running" && bridge.channelCount() == 1 && bridge.toolCount() == 1 &&
+                bridge.httpRouteCount() == 1 && stopped.state == "stopped"
+        })
     }
 
     @TestCase
     public func brokerStdioTransportKeepsUnicodeResponseAndIsolatesTimeout(): Unit {
-        let runner = OpenClawCompatStdioProcessRunner()
-        let script = CliConfig.cwd.join("scripts").join("gateway-stdio-p3b-fake-child.mjs").toString()
-        let lateWriteMarker = Path("/tmp/metis-openclaw-late-write-${DateTime.now().toUnixTimeStamp().toNanoseconds()}.txt")
-        match (runner.start(OpenClawCompatHostLaunchSpec("node", script, [], 500))) {
-            case OpenClawCompatHostStartResult.Started(transport) =>
-                let client = OpenClawCompatHostClient(transport, defaultTimeoutMs: 500)
-                let succeeded = client.request("test.echo")
-                @Expect(succeeded.ok, true)
-                @Expect(openClawCompatJstr(succeeded.result, "text"), "仓颉🙂")
-                let afterStderrBurst = client.request("test.stderr-burst")
-                @Expect(afterStderrBurst.ok, true)
-                @Expect(openClawCompatJstr(afterStderrBurst.result, "text"), "仓颉🙂")
+        withOpenClawCompatRealBrokerTest({ =>
+            let runner = OpenClawCompatStdioProcessRunner()
+            let script = CliConfig.cwd.join("scripts").join("gateway-stdio-p3b-fake-child.mjs").toString()
+            let lateWriteMarker = Path("/tmp/metis-openclaw-late-write-${DateTime.now().toUnixTimeStamp().toNanoseconds()}.txt")
+            var truth = false
+            try {
+                match (runner.start(OpenClawCompatHostLaunchSpec("node", script, [], 500))) {
+                    case OpenClawCompatHostStartResult.Started(transport) =>
+                        let client = OpenClawCompatHostClient(transport, defaultTimeoutMs: 500)
+                        let succeeded = client.request("test.echo")
+                        @Expect(succeeded.ok, true)
+                        @Expect(openClawCompatJstr(succeeded.result, "text"), "仓颉🙂")
+                        let afterStderrBurst = client.request("test.stderr-burst")
+                        @Expect(afterStderrBurst.ok, true)
+                        @Expect(openClawCompatJstr(afterStderrBurst.result, "text"), "仓颉🙂")
 
-                let timeoutParams = JsonObject()
-                timeoutParams.put("lateWriteMarker", JsonString(lateWriteMarker.toString()))
-                let timedOut = client.request("test.timeout", params: timeoutParams, timeoutMs: 75)
-                @Expect(timedOut.status, "timeout")
-                @Expect(client.isAlive(), false)
-                let markerDeadline = DateTime.now().toUnixTimeStamp().toMilliseconds() + 2000
-                while (!exists(lateWriteMarker) && DateTime.now().toUnixTimeStamp().toMilliseconds() < markerDeadline) { sleep(Duration.millisecond * 20) }
-                @Expect(exists(lateWriteMarker), true)
-                let markerText = try { String.fromUtf8(File.readFrom(lateWriteMarker)).trimAscii() } catch (_: Exception) { "invalid_response_encoding" }
-                @Expect(markerText, "late-write-attempted")
-                let afterTimeout = client.request("test.echo", timeoutMs: 75)
-                @Expect(afterTimeout.status, "error")
-                transport.close()
-                @Expect(gatewayStdioBroker().snapshot().ownerCount, 0)
-            case OpenClawCompatHostStartResult.Failed(_) => @Expect(false, true)
-        }
-        try { remove(lateWriteMarker) } catch (_: Exception) { () }
+                        let timeoutParams = JsonObject()
+                        timeoutParams.put("lateWriteMarker", JsonString(lateWriteMarker.toString()))
+                        let timedOut = client.request("test.timeout", params: timeoutParams, timeoutMs: 75)
+                        @Expect(timedOut.status, "timeout")
+                        @Expect(client.isAlive(), false)
+                        let markerDeadline = DateTime.now().toUnixTimeStamp().toMilliseconds() + 2000
+                        while (!exists(lateWriteMarker) && DateTime.now().toUnixTimeStamp().toMilliseconds() < markerDeadline) { sleep(Duration.millisecond * 20) }
+                        @Expect(exists(lateWriteMarker), true)
+                        let markerText = try { String.fromUtf8(File.readFrom(lateWriteMarker)).trimAscii() } catch (_: Exception) { "invalid_response_encoding" }
+                        @Expect(markerText, "late-write-attempted")
+                        let afterTimeout = client.request("test.echo", timeoutMs: 75)
+                        @Expect(afterTimeout.status, "error")
+                        transport.close()
+                        truth = succeeded.ok && openClawCompatJstr(succeeded.result, "text") == "仓颉🙂" &&
+                            afterStderrBurst.ok && openClawCompatJstr(afterStderrBurst.result, "text") == "仓颉🙂" &&
+                            timedOut.status == "timeout" && !client.isAlive() && markerText == "late-write-attempted" &&
+                            afterTimeout.status == "error"
+                    case OpenClawCompatHostStartResult.Failed(_) => @Expect(false, true)
+                }
+            } finally {
+                try { remove(lateWriteMarker) } catch (_: Exception) { () }
+            }
+            truth
+        })
     }
 
     @TestCase
     public func brokerStdioTransportClassifiesMalformedAndInvalidUtf8WithoutLeak(): Unit {
-        let runner = OpenClawCompatStdioProcessRunner()
-        let script = CliConfig.cwd.join("scripts").join("gateway-stdio-p3b-fake-child.mjs").toString()
-        match (runner.start(OpenClawCompatHostLaunchSpec("node", script, [], 500))) {
-            case OpenClawCompatHostStartResult.Started(transport) =>
-                let client = OpenClawCompatHostClient(transport, defaultTimeoutMs: 500)
-                let malformed = client.request("test.invalid")
-                @Expect(malformed.ok, false)
-                @Expect(malformed.errorMessage.contains("malformed_json"), true)
-                transport.close()
-            case OpenClawCompatHostStartResult.Failed(_) => @Expect(false, true)
-        }
-        match (runner.start(OpenClawCompatHostLaunchSpec("node", script, [], 500))) {
-            case OpenClawCompatHostStartResult.Started(transport) =>
-                let client = OpenClawCompatHostClient(transport, defaultTimeoutMs: 500)
-                let invalid = client.request("test.invalid-utf8")
-                @Expect(invalid.ok, false)
-                @Expect(invalid.errorMessage.contains("invalid_response_encoding"), true)
-                transport.close()
-            case OpenClawCompatHostStartResult.Failed(_) => @Expect(false, true)
-        }
-        match (runner.start(OpenClawCompatHostLaunchSpec("node", script, [], 500))) {
-            case OpenClawCompatHostStartResult.Started(transport) =>
-                let client = OpenClawCompatHostClient(transport, defaultTimeoutMs: 500)
-                let exited = client.request("test.exit")
-                @Expect(exited.ok, false)
-                @Expect(exited.errorMessage.contains("owner_exited"), true)
-                @Expect(client.isAlive(), false)
-                transport.close()
-            case OpenClawCompatHostStartResult.Failed(_) => @Expect(false, true)
-        }
-        @Expect(gatewayStdioBroker().snapshot().ownerCount, 0)
+        withOpenClawCompatRealBrokerTest({ =>
+            let runner = OpenClawCompatStdioProcessRunner()
+            let script = CliConfig.cwd.join("scripts").join("gateway-stdio-p3b-fake-child.mjs").toString()
+            var malformedTruth = false
+            var invalidTruth = false
+            var exitTruth = false
+            match (runner.start(OpenClawCompatHostLaunchSpec("node", script, [], 500))) {
+                case OpenClawCompatHostStartResult.Started(transport) =>
+                    let client = OpenClawCompatHostClient(transport, defaultTimeoutMs: 500)
+                    let malformed = client.request("test.invalid")
+                    @Expect(malformed.ok, false)
+                    @Expect(malformed.errorMessage.contains("malformed_json"), true)
+                    transport.close()
+                    malformedTruth = !malformed.ok && malformed.errorMessage.contains("malformed_json")
+                case OpenClawCompatHostStartResult.Failed(_) => @Expect(false, true)
+            }
+            match (runner.start(OpenClawCompatHostLaunchSpec("node", script, [], 500))) {
+                case OpenClawCompatHostStartResult.Started(transport) =>
+                    let client = OpenClawCompatHostClient(transport, defaultTimeoutMs: 500)
+                    let invalid = client.request("test.invalid-utf8")
+                    @Expect(invalid.ok, false)
+                    @Expect(invalid.errorMessage.contains("invalid_response_encoding"), true)
+                    transport.close()
+                    invalidTruth = !invalid.ok && invalid.errorMessage.contains("invalid_response_encoding")
+                case OpenClawCompatHostStartResult.Failed(_) => @Expect(false, true)
+            }
+            match (runner.start(OpenClawCompatHostLaunchSpec("node", script, [], 500))) {
+                case OpenClawCompatHostStartResult.Started(transport) =>
+                    let client = OpenClawCompatHostClient(transport, defaultTimeoutMs: 500)
+                    let exited = client.request("test.exit")
+                    @Expect(exited.ok, false)
+                    @Expect(exited.errorMessage.contains("owner_exited"), true)
+                    @Expect(client.isAlive(), false)
+                    transport.close()
+                    exitTruth = !exited.ok && exited.errorMessage.contains("owner_exited") && !client.isAlive()
+                case OpenClawCompatHostStartResult.Failed(_) => @Expect(false, true)
+            }
+            malformedTruth && invalidTruth && exitTruth
+        })
     }
 
     @TestCase
     public func brokerStdioTransportGenerationSwitchMakesOldTransportInert(): Unit {
-        let runner = OpenClawCompatStdioProcessRunner()
-        let script = CliConfig.cwd.join("scripts").join("gateway-stdio-p3b-fake-child.mjs").toString()
-        match (runner.start(OpenClawCompatHostLaunchSpec("node", script, [], 500))) {
-            case OpenClawCompatHostStartResult.Started(oldTransport) =>
-                let oldClient = OpenClawCompatHostClient(oldTransport, defaultTimeoutMs: 500)
-                @Expect(oldClient.request("test.echo").ok, true)
-                gatewayStdioBroker().debugKillBrokerForTest()
-                let stoppedDeadline = DateTime.now().toUnixTimeStamp().toMilliseconds() + 2000
-                var stoppedSnapshot = gatewayStdioBroker().snapshot()
-                while ((stoppedSnapshot.running || stoppedSnapshot.responsive) && DateTime.now().toUnixTimeStamp().toMilliseconds() < stoppedDeadline) {
-                    sleep(Duration.millisecond * 20)
-                    stoppedSnapshot = gatewayStdioBroker().snapshot()
-                }
-                @Expect(stoppedSnapshot.running, false)
-                @Expect(stoppedSnapshot.responsive, false)
-                @Expect(oldClient.isAlive(), false)
-                match (runner.start(OpenClawCompatHostLaunchSpec("node", script, [], 500))) {
-                    case OpenClawCompatHostStartResult.Started(newTransport) =>
-                        let newClient = OpenClawCompatHostClient(newTransport, defaultTimeoutMs: 500)
-                        @Expect(newClient.request("test.echo").ok, true)
-                        oldTransport.close()
-                        @Expect(newClient.isAlive(), true)
-                        @Expect(newClient.request("test.echo").ok, true)
-                        newTransport.close()
-                    case OpenClawCompatHostStartResult.Failed(reason) => @Expect(reason, "")
-                }
-            case OpenClawCompatHostStartResult.Failed(reason) => @Expect(reason, "")
-        }
-        @Expect(gatewayStdioBroker().snapshot().ownerCount, 0)
+        withOpenClawCompatRealBrokerTest({ =>
+            let runner = OpenClawCompatStdioProcessRunner()
+            let script = CliConfig.cwd.join("scripts").join("gateway-stdio-p3b-fake-child.mjs").toString()
+            var truth = false
+            match (runner.start(OpenClawCompatHostLaunchSpec("node", script, [], 500))) {
+                case OpenClawCompatHostStartResult.Started(oldTransport) =>
+                    let oldClient = OpenClawCompatHostClient(oldTransport, defaultTimeoutMs: 500)
+                    let oldEcho = oldClient.request("test.echo")
+                    @Expect(oldEcho.ok, true)
+                    gatewayStdioBroker().debugKillBrokerForTest()
+                    let stoppedDeadline = DateTime.now().toUnixTimeStamp().toMilliseconds() + 2000
+                    var stoppedSnapshot = gatewayStdioBroker().snapshot()
+                    while ((stoppedSnapshot.running || stoppedSnapshot.responsive) && DateTime.now().toUnixTimeStamp().toMilliseconds() < stoppedDeadline) {
+                        sleep(Duration.millisecond * 20)
+                        stoppedSnapshot = gatewayStdioBroker().snapshot()
+                    }
+                    @Expect(stoppedSnapshot.running, false)
+                    @Expect(stoppedSnapshot.responsive, false)
+                    @Expect(oldClient.isAlive(), false)
+                    match (runner.start(OpenClawCompatHostLaunchSpec("node", script, [], 500))) {
+                        case OpenClawCompatHostStartResult.Started(newTransport) =>
+                            let newClient = OpenClawCompatHostClient(newTransport, defaultTimeoutMs: 500)
+                            let firstNewEcho = newClient.request("test.echo")
+                            @Expect(firstNewEcho.ok, true)
+                            oldTransport.close()
+                            let newAlive = newClient.isAlive()
+                            @Expect(newAlive, true)
+                            let secondNewEcho = newClient.request("test.echo")
+                            @Expect(secondNewEcho.ok, true)
+                            newTransport.close()
+                            truth = oldEcho.ok && !stoppedSnapshot.running && !stoppedSnapshot.responsive &&
+                                !oldClient.isAlive() && firstNewEcho.ok && newAlive && secondNewEcho.ok
+                        case OpenClawCompatHostStartResult.Failed(reason) => @Expect(reason, "")
+                    }
+                case OpenClawCompatHostStartResult.Failed(reason) => @Expect(reason, "")
+            }
+            truth
+        })
     }
 
     @TestCase
     public func brokerStdioTransportCloseJoinsNaturallyAfterFirstTimeout(): Unit {
-        let runner = OpenClawCompatStdioProcessRunner()
-        let script = CliConfig.cwd.join("scripts").join("gateway-stdio-p3b-fake-child.mjs").toString()
-        debugSetOpenClawCompatCloseTimingForTest(Some<(Int64, Int64, Int64)>((1, 2500, 1500)))
-        try {
-            match (runner.start(OpenClawCompatHostLaunchSpec("node", script, [], 500))) {
-                case OpenClawCompatHostStartResult.Started(transport) =>
-                    let client = OpenClawCompatHostClient(transport, defaultTimeoutMs: 500)
-                    @Expect(client.request("test.echo").ok, true)
-                    transport.close()
-                    @Expect(debugOpenClawCompatFirstJoinTimeoutsForTest(), 1)
-                    @Expect(client.isAlive(), false)
-                case OpenClawCompatHostStartResult.Failed(reason) => @Expect(reason, "")
+        withOpenClawCompatRealBrokerTest({ =>
+            let runner = OpenClawCompatStdioProcessRunner()
+            let script = CliConfig.cwd.join("scripts").join("gateway-stdio-p3b-fake-child.mjs").toString()
+            debugSetOpenClawCompatCloseTimingForTest(Some<(Int64, Int64, Int64)>((1, 2500, 1500)))
+            var truth = false
+            try {
+                match (runner.start(OpenClawCompatHostLaunchSpec("node", script, [], 500))) {
+                    case OpenClawCompatHostStartResult.Started(transport) =>
+                        let client = OpenClawCompatHostClient(transport, defaultTimeoutMs: 500)
+                        let echo = client.request("test.echo")
+                        @Expect(echo.ok, true)
+                        transport.close()
+                        let firstJoinTimeouts = debugOpenClawCompatFirstJoinTimeoutsForTest()
+                        @Expect(firstJoinTimeouts, 1)
+                        @Expect(client.isAlive(), false)
+                        truth = echo.ok && firstJoinTimeouts == 1 && !client.isAlive()
+                    case OpenClawCompatHostStartResult.Failed(reason) => @Expect(reason, "")
+                }
+            } finally {
+                debugSetOpenClawCompatCloseTimingForTest(None<(Int64, Int64, Int64)>)
             }
-            @Expect(gatewayStdioBroker().snapshot().ownerCount, 0)
-        } finally {
-            debugSetOpenClawCompatCloseTimingForTest(None<(Int64, Int64, Int64)>)
-        }
+            truth
+        })
     }
 }

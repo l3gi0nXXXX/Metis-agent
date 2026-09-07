@@ -3,10 +3,11 @@ package metis.gateway.runtime
 import magic.jsonable.*
 
 import metis.core.config.CliConfig
+import metis.gateway.logging.{MetisLogEvent, metisCreateSubsystemLogger}
 import metis.gateway.process.{gatewayStdioBrokerReady, gatewayStdioBrokerSnapshot}
 
 import std.convert.Parsable
-import std.fs.{File, exists, Path}
+import std.fs.{File, exists, Path, remove, rename}
 import std.sync.Mutex
 import std.time.DateTime
 import stdx.encoding.json.{JsonObject, JsonString, JsonValue}
@@ -24,21 +25,82 @@ private var gatewayRuntimeBrokerStatus: String = ""
 private var gatewayRuntimeBrokerGeneration: Int64 = 0
 private var gatewayRuntimeBrokerOwnerCount: Int64 = 0
 private var gatewayRuntimeInboundQueueDepth: Int64 = 0
+private var gatewayRuntimePersistFailureActive: Bool = false
+private let gatewayRuntimeLogger = metisCreateSubsystemLogger("gateway/runtime")
+
+private class GatewayRuntimePersistResult {
+    let ok: Bool
+    let status: String
+
+    init(ok: Bool, status: String) {
+        this.ok = ok
+        this.status = status
+    }
+}
 
 private func gatewayRuntimeNowMs(): Int64 {
     DateTime.now().toUnixTimeStamp().toMilliseconds()
 }
 
-private func gatewayRuntimePersist(): Unit {
+private func gatewayRuntimePersist(phase: String, serveLockPresent: Bool): GatewayRuntimePersistResult {
     let root = JsonObject()
     root.put("running", gatewayRuntimeRunning.toJsonValue())
     root.put("status", JsonString(gatewayRuntimeStatus))
     root.put("reason", JsonString(gatewayRuntimeReason))
     root.put("startedAtMs", gatewayRuntimeStartedAtMs.toJsonValue())
     root.put("updatedAtMs", gatewayRuntimeUpdatedAtMs.toJsonValue())
-    root.put("serveLockPresent", gatewayAnotherServeInstanceSeemsRunning().toJsonValue())
+    root.put("serveLockPresent", serveLockPresent.toJsonValue())
     gatewayRuntimeAppendOperational(root, gatewayRuntimeNowMs(), forceMemory: true)
-    File.writeTo(gatewayRuntimeStatePath(), root.toJsonString().toArray())
+    let path = gatewayRuntimeStatePath()
+    let temp = Path("${path.toString()}.tmp-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
+    try {
+        File.writeTo(temp, root.toJsonString().toArray())
+        rename(temp, to: path, overwrite: true)
+        GatewayRuntimePersistResult(true, "persisted")
+    } catch (_: Exception) {
+        try { if (exists(temp)) { remove(temp) } } catch (_: Exception) { () }
+        GatewayRuntimePersistResult(false, "runtime_state_write_failed")
+    }
+}
+
+private func gatewayRuntimeRecordPersistOutcome(phase: String, result: GatewayRuntimePersistResult): Unit {
+    let transition = synchronized(gatewayRuntimeOperationalLock) {
+        if (!result.ok && !gatewayRuntimePersistFailureActive) {
+            gatewayRuntimePersistFailureActive = true
+            1
+        } else if (result.ok && gatewayRuntimePersistFailureActive) {
+            gatewayRuntimePersistFailureActive = false
+            2
+        } else {
+            0
+        }
+    }
+    if (transition == 0) { return }
+    let meta = JsonObject()
+    meta.put("phase", JsonString(phase))
+    meta.put("status", JsonString(result.status))
+    meta.put("failureActive", (!result.ok).toJsonValue())
+    try {
+        if (transition == 1) {
+            gatewayRuntimeLogger.warn(
+                MetisLogEvent.gatewayRuntimeStatePersistFailed,
+                "gateway runtime state persistence failed",
+                meta: meta
+            )
+        } else {
+            gatewayRuntimeLogger.info(
+                MetisLogEvent.gatewayRuntimeStatePersistRecovered,
+                "gateway runtime state persistence recovered",
+                meta: meta
+            )
+        }
+    } catch (_: Exception) {
+        ()
+    }
+}
+
+private func gatewayRuntimePersistAndRecord(phase: String, serveLockPresent: Bool): Unit {
+    gatewayRuntimeRecordPersistOutcome(phase, gatewayRuntimePersist(phase, serveLockPresent))
 }
 
 private func gatewayRuntimeSnapshotBool(root: JsonObject, key: String): Bool {
@@ -126,7 +188,7 @@ public func gatewayRuntimeMarkStarting(): Unit {
     gatewayRuntimeRunning = false
     gatewayRuntimeStatus = "starting"
     gatewayRuntimeReason = ""
-    gatewayRuntimePersist()
+    gatewayRuntimePersistAndRecord("starting", true)
 }
 
 public func gatewayRuntimeMarkRunning(): Unit {
@@ -138,7 +200,7 @@ public func gatewayRuntimeMarkRunning(): Unit {
     gatewayRuntimeRunning = true
     gatewayRuntimeStatus = "running"
     gatewayRuntimeReason = ""
-    gatewayRuntimePersist()
+    gatewayRuntimePersistAndRecord("running", true)
 }
 
 public func gatewayRuntimeHeartbeat(): Unit {
@@ -155,7 +217,7 @@ public func gatewayRuntimeHeartbeat(): Unit {
     if (gatewayRuntimeStatus.trimAscii().isEmpty()) {
         gatewayRuntimeStatus = if (gatewayRuntimeRunning) { "running" } else { "stopped" }
     }
-    gatewayRuntimePersist()
+    gatewayRuntimePersistAndRecord("heartbeat", true)
 }
 
 public func gatewayRuntimeMarkStopped(reason!: String = "stopped"): Unit {
@@ -164,7 +226,7 @@ public func gatewayRuntimeMarkStopped(reason!: String = "stopped"): Unit {
     gatewayRuntimeRunning = false
     gatewayRuntimeStatus = "stopped"
     gatewayRuntimeReason = reason.trimAscii()
-    gatewayRuntimePersist()
+    gatewayRuntimePersistAndRecord("stopped", false)
 }
 
 public func gatewayRuntimeMarkStoppedFromCli(reason!: String = "stopped"): Unit {
@@ -187,7 +249,7 @@ public func gatewayRuntimeMarkStoppedFromCli(reason!: String = "stopped"): Unit 
     gatewayRuntimeRunning = false
     gatewayRuntimeStatus = "stopped"
     gatewayRuntimeReason = reason.trimAscii()
-    gatewayRuntimePersist()
+    gatewayRuntimePersistAndRecord("cli_stopped", false)
 }
 
 public func gatewayRuntimeSnapshot(): JsonObject {
@@ -207,7 +269,7 @@ public func gatewayRuntimeSnapshot(): JsonObject {
     root.put("reason", JsonString(gatewayRuntimeReason))
     root.put("startedAtMs", gatewayRuntimeStartedAtMs.toJsonValue())
     root.put("updatedAtMs", gatewayRuntimeUpdatedAtMs.toJsonValue())
-    root.put("serveLockPresent", gatewayAnotherServeInstanceSeemsRunning().toJsonValue())
+    root.put("serveLockPresent", exists(gatewayServeLockPath()).toJsonValue())
     gatewayRuntimeAppendOperational(root, gatewayRuntimeNowMs(), forceMemory: true)
     root
 }

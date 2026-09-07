@@ -229,6 +229,79 @@ public class ServicePluginHostTest {
         )
     }
 
+    @TestCase
+    public func hbBrN4DispatchFencedMarkerIsStrictOrderedAndFailureIsolated(): Unit {
+        let markerKey = "METIS_TEST_SERVICE_PLUGIN_DISPATCH_FENCED_MARKER"
+        let serviceKey = "METIS_TEST_SERVICE_PLUGIN_DISPATCH_FENCED_SERVICE_ID"
+        let nonceKey = "METIS_TEST_SERVICE_PLUGIN_DISPATCH_FENCED_NONCE"
+        let previous = [(markerKey, getVariable(markerKey)), (serviceKey, getVariable(serviceKey)),
+            (nonceKey, getVariable(nonceKey))]
+        try {
+            this.withIsolatedServicePluginHostTestHome("hb-br-n4-default", { home: Path =>
+                let marker = home.join("dispatch-fenced.json")
+                setVariable(markerKey, "")
+                setVariable(serviceKey, "")
+                setVariable(nonceKey, "")
+                this.registerStdio("{}")
+                @Expect(ensureRegisteredServicePluginStarted("stdio-service", startupTimeoutMs: 1000).ok, true)
+                let stopped = shutdownServicePluginHost(reason: "hb-br-n4-default", timeoutMillis: 3000)
+                @Expect(stopped.ok, true)
+                @Expect(exists(marker), false)
+            })
+            this.withIsolatedServicePluginHostTestHome("hb-br-n4-marker", { home: Path =>
+                let marker = home.join("dispatch-fenced.json")
+                let nonce = "hb-br-n4-marker"
+                let counter = home.join("launch-count.txt")
+                setVariable(markerKey, marker.toString())
+                setVariable(serviceKey, "gitcode-monitor")
+                setVariable(nonceKey, nonce)
+                this.registerGitCodeStdioScript(this.gitCodeCountingLeaseScript(counter, 18184))
+                @Expect(ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000).ok, true)
+                let identity = servicePluginActiveIdentityForTest("gitcode-monitor")
+                @Expect(identity.isSome(), true)
+                @Expect(dropServicePluginActiveProcessForTest("gitcode-monitor", stopProcess: true), true)
+                @Expect(this.waitForFile(marker, timeoutMillis: 3000), true)
+                @Expect(servicePluginActiveIdentityForTest("gitcode-monitor").isNone(), true)
+                let stopped = shutdownServicePluginHost(reason: "hb-br-n4-marker", timeoutMillis: 3000)
+                @Expect(stopped.ok, true)
+                @Expect(exists(marker), true)
+                let root = try {
+                    JsonValue.fromStr(String.fromUtf8(File.readFrom(marker))).asObject()
+                } catch (_: Exception) {
+                    JsonObject()
+                }
+                @Expect(root.get("schema").getOrThrow().asString().getValue(), "metis.servicePlugin.dispatchFenced.v1")
+                @Expect(root.get("serviceId").getOrThrow().asString().getValue(), "gitcode-monitor")
+                @Expect(root.get("ownerId").getOrThrow().asString().getValue(), identity.getOrThrow()[0])
+                @Expect(root.get("generation").getOrThrow().asInt().getValue(), identity.getOrThrow()[1])
+                @Expect(root.get("testNonce").getOrThrow().asString().getValue(), nonce)
+                @Expect(root.get("fenced").getOrThrow().asBool().getValue(), true)
+                let modeResult = executeWithOutput("/usr/bin/stat", ["-f", "%Lp", marker.toString()])
+                let markerMode = try { String.fromUtf8(modeResult[1]).trimAscii() } catch (_: Exception) { "" }
+                @Expect(modeResult[0], 0)
+                @Expect(markerMode, "600")
+            })
+            this.withIsolatedServicePluginHostTestHome("hb-br-n4-invalid", { home: Path =>
+                let parentFile = home.join("regular-file")
+                File.writeTo(parentFile, "x".toArray())
+                setVariable(markerKey, parentFile.join("dispatch-fenced.json").toString())
+                setVariable(serviceKey, "stdio-service")
+                setVariable(nonceKey, "hb-br-n4-invalid")
+                this.registerStdio("{}")
+                @Expect(ensureRegisteredServicePluginStarted("stdio-service", startupTimeoutMs: 1000).ok, true)
+                let stopped = shutdownServicePluginHost(reason: "hb-br-n4-invalid", timeoutMillis: 3000)
+                @Expect(stopped.ok, true)
+            })
+        } finally {
+            for ((key, value) in previous) {
+                match (value) {
+                    case Some(text) => setVariable(key, text)
+                    case None => setVariable(key, "")
+                }
+            }
+        }
+    }
+
     private func registerSample(grants!: Array<String> = ["host.agent.invoke", "host.audit.append"]): ServicePluginRegistrationResult {
         resetServicePluginHostForTest()
         registerServicePlugin(ServicePluginRegistration(
@@ -4086,6 +4159,24 @@ public class ServicePluginHostTest {
                 setServicePluginPidProbeCommandForTest(None<(Int64, Int64) -> (Int64, String, String)>)
                 setServicePluginPortReleaseCommandForTest(None<(Int64, Int64, Int64) -> (Int64, String, String)>)
                 resetServicePluginHostForTest()
+            }
+        })
+    }
+
+    @TestCase
+    public func hbBrN5ServicePluginPortProbeCapsSingleExternalCall(): Unit {
+        withIsolatedServicePluginHostTestHome("hb-br-n5-port-budget", { _home: Path =>
+            let calls = ServicePluginTestCounter()
+            setServicePluginPortReleaseCommandForTest(Some({ _port: Int64, _pid: Int64, timeoutMs: Int64 =>
+                calls.increment()
+                @Expect(timeoutMs, 500)
+                (Int64(124), "", "")
+            }))
+            try {
+                @Expect(servicePluginPortProbeStatusForTest(19082, 124, 5000), "port_probe_timeout")
+                @Expect(calls.get(), 1)
+            } finally {
+                setServicePluginPortReleaseCommandForTest(None<(Int64, Int64, Int64) -> (Int64, String, String)>)
             }
         })
     }

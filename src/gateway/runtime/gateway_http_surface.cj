@@ -149,14 +149,27 @@ public class GatewayHttpSurface {
         let _ = GatewayHttpSurface.stopDetailed(MonoTime.now() + Duration.second * 2)
     }
 
-    public static func stopDetailed(deadline: MonoTime): GatewaySurfaceStopResult {
+    public static func stopDetailed(
+        deadline: MonoTime,
+        shutdownIdentity!: Option<GatewayServeIdentity> = None<GatewayServeIdentity>
+    ): GatewaySurfaceStopResult {
         let detached = synchronized(lock) {
             let value = (server, started, Int64(listenPort))
             started = false
             server = None
             value
         }
+        match (shutdownIdentity) {
+            case Some(identity) => let _ = gatewayPublishShutdownPhaseForTest(identity, "http_close_enter")
+            case None => ()
+        }
         if (!detached[1] && detached[0].isNone()) {
+            match (shutdownIdentity) {
+                case Some(identity) =>
+                    let _ = gatewayPublishShutdownPhaseForTest(identity, "http_close_returned")
+                    let _ = gatewayPublishShutdownPhaseForTest(identity, "http_probe_done")
+                case None => ()
+            }
             return GatewaySurfaceStopResult(true, "already_stopped")
         }
         try {
@@ -167,7 +180,16 @@ public class GatewayHttpSurface {
         } catch (_: Exception) {
             return GatewaySurfaceStopResult(false, "close_failed", portStatus: "not_checked")
         }
-        gatewayServePortReleasedUntil(detached[2], deadline)
+        match (shutdownIdentity) {
+            case Some(identity) => let _ = gatewayPublishShutdownPhaseForTest(identity, "http_close_returned")
+            case None => ()
+        }
+        let result = gatewayServePortReleasedUntil(detached[2], deadline)
+        match (shutdownIdentity) {
+            case Some(identity) => let _ = gatewayPublishShutdownPhaseForTest(identity, "http_probe_done")
+            case None => ()
+        }
+        result
     }
 }
 

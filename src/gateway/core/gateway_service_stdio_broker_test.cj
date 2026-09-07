@@ -17,6 +17,13 @@ private class GatewayServiceStdioTestBoolBox {
     var value = false
 }
 
+private class GatewayServiceStopObserverProof {
+    let phases = ArrayList<String>()
+    var ownersCalled = false
+    var channelsCalled = false
+    var brokerCalled = false
+}
+
 private func withGatewayStdioBrokerTestHome<T>(block: () -> T): T {
     synchronized(MetisProcessEnvironmentLock) {
         let home = Path("/tmp/metis-gateway-stdio-stop-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
@@ -50,6 +57,43 @@ private func withGatewayStdioBrokerTestHome<T>(block: () -> T): T {
 
 @Test
 public class GatewayServiceStdioBrokerTest {
+    @TestCase
+    public func hbBrN7StopObserverReportsOrderedBoundariesAndIsFailureIsolated(): Unit {
+        let expectedPhases = "owners_enter,owners_done,channels_enter,channels_done,broker_enter,broker_done"
+        for (failure in ["none", "owners", "channels", "broker", "observer"]) {
+            let proof = GatewayServiceStopObserverProof()
+            let result = gatewayServiceStopOwnersThenBroker(
+                { =>
+                    proof.ownersCalled = true
+                    if (failure == "owners") { throw Exception("injected-owner-stop-failure") }
+                    ServicePluginHostShutdownResult(true, "stopped", ArrayList<ServiceStopResult>())
+                },
+                { =>
+                    proof.channelsCalled = true
+                    if (failure == "channels") { throw Exception("injected-channel-stop-failure") }
+                    GatewayChannelStopSummary(true, "stopped")
+                },
+                { =>
+                    proof.brokerCalled = true
+                    if (failure == "broker") { throw Exception("injected-broker-stop-failure") }
+                    ManagedStdioOperationResult(true, "stopped")
+                },
+                shutdownObserver: Some<(String) -> Unit>({ phase: String =>
+                    proof.phases.add(phase)
+                    if (failure == "observer") { throw Exception("injected-observer-failure") }
+                })
+            )
+            @Expect(String.join(proof.phases.toArray(), delimiter: ","), expectedPhases)
+            @Expect(proof.ownersCalled, true)
+            @Expect(proof.channelsCalled, true)
+            @Expect(proof.brokerCalled, true)
+            @Expect(result.ok, failure == "none" || failure == "observer")
+            @Expect(result.ownersStatus, if (failure == "owners") { "owners_failed" } else { "stopped" })
+            @Expect(result.channelsStatus, if (failure == "channels") { "channels_failed" } else { "stopped" })
+            @Expect(result.brokerStatus, if (failure == "broker") { "broker_failed" } else { "stopped" })
+        }
+    }
+
     @TestCase
     public func s4U1DisabledAndAlreadyStoppedOwnersAreTerminalButErrorsRemainFailures(): Unit {
         for (field in ["status", "state"]) {

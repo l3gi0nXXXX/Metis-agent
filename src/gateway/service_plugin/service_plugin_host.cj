@@ -8,13 +8,14 @@ import metis.process.{ManagedStdioBrokerClient, ManagedStdioEvent, ManagedStdioO
 import metis.utils.{SHELL_INVALID_RESPONSE_ENCODING_EXIT_CODE, ShellUtils}
 import std.collection.{ArrayList, HashMap, HashSet}
 import std.convert.Parsable
-import std.fs.{Directory, File, Path, exists, remove}
+import std.fs.{Directory, File, Path, exists, remove, rename}
 import std.io.*
 import std.env.{getProcessId, getVariable, getVariables, setVariable}
 import std.process.*
+import std.posix.chmod
 import std.sync.*
 import std.time.*
-import stdx.encoding.json.{JsonObject, JsonString, JsonValue}
+import stdx.encoding.json.{JsonBool, JsonInt, JsonObject, JsonString, JsonValue}
 import stdx.net.http.*
 
 public class ServicePluginConfigRef {
@@ -2325,6 +2326,33 @@ private func servicePluginCleanupPendingForServiceLocked(serviceId: String): Opt
     None<ServicePluginCleanupPendingSlot>
 }
 
+private func servicePluginPublishDispatchFencedMarkerForTest(process: ServicePluginStdioProcess): Unit {
+    let markerText = getVariable("METIS_TEST_SERVICE_PLUGIN_DISPATCH_FENCED_MARKER").getOrDefault { "" }.trimAscii()
+    let expectedServiceId = getVariable("METIS_TEST_SERVICE_PLUGIN_DISPATCH_FENCED_SERVICE_ID")
+        .getOrDefault { "" }.trimAscii()
+    let nonce = getVariable("METIS_TEST_SERVICE_PLUGIN_DISPATCH_FENCED_NONCE").getOrDefault { "" }.trimAscii()
+    if (markerText.isEmpty() || expectedServiceId.isEmpty() || nonce.isEmpty() || process.serviceId != expectedServiceId) {
+        return
+    }
+    let marker = Path(markerText)
+    let temporary = Path("${markerText}.tmp-${getProcessId()}")
+    try {
+        let root = JsonObject()
+        root.put("schema", JsonString("metis.servicePlugin.dispatchFenced.v1"))
+        root.put("serviceId", JsonString(process.serviceId))
+        root.put("ownerId", JsonString(process.ownerId))
+        root.put("generation", JsonInt(process.generation))
+        root.put("testNonce", JsonString(nonce))
+        root.put("fenced", JsonBool(true))
+        File.writeTo(temporary, root.toJsonString().toArray())
+        chmod(temporary.toString(), UInt32(0o600))
+        rename(temporary, to: marker, overwrite: true)
+        chmod(marker.toString(), UInt32(0o600))
+    } catch (_: Exception) {
+        try { if (exists(temporary)) { remove(temporary) } } catch (_: Exception) { () }
+    }
+}
+
 private func servicePluginDrainDispatchForStop(process: ServicePluginStdioProcess, deadlineMs: Int64, stopReserveMs: Int64): String {
     servicePluginWriteFencedEventAcks(process.fenceDispatch(), process)
     let remaining = servicePluginDispatchRemaining(deadlineMs)
@@ -2397,7 +2425,9 @@ private func cleanupDetachedServicePluginOwner(
     var ingressStopStatus = "not_started"
     match (detached.process) {
         case Some(process) =>
-            servicePluginWriteFencedEventAcks(process.fenceDispatch(), process)
+            let fencedTasks = process.fenceDispatch()
+            servicePluginPublishDispatchFencedMarkerForTest(process)
+            servicePluginWriteFencedEventAcks(fencedTasks, process)
             if (stopProcess) {
                 let ingressBudget = max(0, servicePluginDeadlineRemaining(deadlineMs) - stopReserveMs)
                 if (ingressBudget > 0) {
@@ -3304,8 +3334,9 @@ private class ServicePluginPortReleaseState {
 
 private func servicePluginPortReleaseState(port: Int64, pid: Int64, deadline: ServicePluginProbeDeadline): ServicePluginPortReleaseState {
     if (port <= 0) { return ServicePluginPortReleaseState(true, "not_applicable") }
-    let timeoutMs = deadline.remaining()
-    if (timeoutMs <= 0) { return ServicePluginPortReleaseState(false, "port_probe_timeout", conclusive: false) }
+    let remainingMs = deadline.remaining()
+    if (remainingMs <= 0) { return ServicePluginPortReleaseState(false, "port_probe_timeout", conclusive: false) }
+    let timeoutMs = min(Int64(500), remainingMs)
     match (servicePluginPortOwnerProbeForTest) {
         case Some(probe) =>
             if (probe(port, pid)) {
@@ -4095,6 +4126,7 @@ public func shutdownServicePluginHost(reason!: String = "shutdown", timeoutMilli
             }
         }
     }
+    for ((process, _) in fencedDispatches) { servicePluginPublishDispatchFencedMarkerForTest(process) }
     for ((process, tasks) in fencedDispatches) { servicePluginWriteFencedEventAcks(tasks, process) }
     for (flag in supervisorFlags) { flag.stop() }
     for ((serviceId, _) in claims) { servicePluginRunStartPhaseHook(serviceId, "claim_cancelled") }

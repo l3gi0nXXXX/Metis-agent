@@ -29,6 +29,8 @@ public class MetisLogEvent {
     public static const gatewayStopped: String = "gateway.stopped"
     public static const gatewayPollStale: String = "gateway.poll.stale"
     public static const gatewayPollRecovered: String = "gateway.poll.recovered"
+    public static const gatewayRuntimeStatePersistFailed: String = "gateway.runtime_state.persist_failed"
+    public static const gatewayRuntimeStatePersistRecovered: String = "gateway.runtime_state.persist_recovered"
     public static const stdioBrokerUnresponsive: String = "stdio.broker.unresponsive"
     public static const stdioBrokerDead: String = "stdio.broker.dead"
     public static const stdioBrokerUnavailable: String = "stdio.broker.unavailable"
@@ -113,6 +115,7 @@ public class MetisLogEvent {
     public static func all(): Array<String> {
         [
             gatewayStarting, gatewayReady, gatewayShutdown, gatewayStopped, gatewayPollStale, gatewayPollRecovered,
+            gatewayRuntimeStatePersistFailed, gatewayRuntimeStatePersistRecovered,
             stdioBrokerUnresponsive, stdioBrokerDead, stdioBrokerUnavailable, channelRegistered, channelStarting,
             channelStarted, channelFailed, channelStopped, channelTiming, channelStartupSummary,
             channelPull, channelSend, messageInbound, messageInboundPreview, messageRouted,

@@ -42,6 +42,12 @@ private func loggingTestOccurrenceCount(text: String, needle: String): Int64 {
 @Test
 public class GatewayLoggingTest {
     @TestCase
+    public func s3U2RuntimePersistenceTransitionEventsStayInDictionary(): Unit {
+        @Expect(gatewayLogEventIsKnown(MetisLogEvent.gatewayRuntimeStatePersistFailed), true)
+        @Expect(gatewayLogEventIsKnown(MetisLogEvent.gatewayRuntimeStatePersistRecovered), true)
+    }
+
+    @TestCase
     public func resolveSettingsUsesStableCurrentFileAndEnvOverrides(): Unit {
         let oldHome = getVariable("METIS_HOME")
         let oldLevel = getVariable("METIS_LOG_LEVEL")

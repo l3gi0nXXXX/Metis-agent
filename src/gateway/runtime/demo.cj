@@ -281,22 +281,18 @@ public func runGatewayService(verbose!: Bool = false): Unit {
         // Cron 清理仍可能需要 channel/session；必须在 Gateway teardown 前完成有界取消与收割。
         let _ = cronRunner.stop(reason: "gateway_shutdown", drainTimeoutMs: 5000)
         MetisConfigManager.setWriteRootNotificationHook(None<MetisConfigWriteNotificationListener>)
-        let gatewayStop = try {
-            gateway.stop()
-        } catch (_: Exception) {
-            GatewayStopResult(false, "cleanup_pending", diagnostic: "gateway_stop_exception")
-        }
-        gatewayClearActiveService()
-        gatewayClearSubagentNoticeDeliveryHook()
-        gatewayClearSubagentNoticeEventHook()
-        gatewayResetSubagentNoticeEventPublisherRegistration()
+        MemoryRuntime.stopActiveMaintenance()
         let canvasStop = try {
             GatewayCanvasHostRuntime.stopDetailed(shutdownDeadline)
         } catch (_: Exception) {
             GatewaySurfaceStopResult(false, "close_failed")
         }
+        match (serveIdentity) {
+            case Some(identity) => let _ = gatewayPublishShutdownPhaseForTest(identity, "canvas_done")
+            case None => ()
+        }
         let httpStop = try {
-            GatewayHttpSurface.stopDetailed(shutdownDeadline)
+            GatewayHttpSurface.stopDetailed(shutdownDeadline, shutdownIdentity: serveIdentity)
         } catch (_: Exception) {
             GatewaySurfaceStopResult(false, "close_failed")
         }
@@ -305,18 +301,42 @@ public func runGatewayService(verbose!: Bool = false): Unit {
         } catch (_: Exception) {
             GatewaySurfaceStopResult(false, "persistence_failed")
         }
+        match (serveIdentity) {
+            case Some(identity) => let _ = gatewayPublishShutdownPhaseForTest(identity, "gateway_stop_enter")
+            case None => ()
+        }
+        let gatewayStop = try {
+            let shutdownObserver = match (serveIdentity) {
+                case Some(identity) => Some<(String) -> Unit>({ phase: String =>
+                    let _ = gatewayPublishShutdownPhaseForTest(identity, phase)
+                })
+                case None => None<(String) -> Unit>
+            }
+            let result = gateway.stop(shutdownObserver: shutdownObserver)
+            match (serveIdentity) {
+                case Some(identity) => let _ = gatewayPublishShutdownPhaseForTest(identity, "gateway_stop_returned")
+                case None => ()
+            }
+            result
+        } catch (_: Exception) {
+            GatewayStopResult(false, "cleanup_pending", diagnostic: "gateway_stop_exception")
+        }
+        gatewayClearActiveService()
+        gatewayClearSubagentNoticeDeliveryHook()
+        gatewayClearSubagentNoticeEventHook()
+        gatewayResetSubagentNoticeEventPublisherRegistration()
         gatewayPlatformMarkStopped(gatewayCfg)
-        MemoryRuntime.stopActiveMaintenance()
         gatewayRuntimeMarkStopped(reason: if (gatewayStop.ok) { "shutdown" } else { "cleanup_pending" })
         match (serveIdentity) {
             case Some(identity) =>
-                let _ = gatewayWriteServeCompletionMarker(
+                let completionWritten = gatewayWriteServeCompletionMarker(
                     identity,
                     gatewayStop,
                     httpStatus: httpStop.status,
                     canvasStatus: canvasStop.status,
                     gatewayServerStatus: gatewayServerStop.status
                 )
+                if (completionWritten) { let _ = gatewayPublishShutdownPhaseForTest(identity, "completion_written") }
                 let _ = gatewayReleaseServeLockForIdentity(identity)
             case None => gatewayReleaseServeLockQuiet()
         }

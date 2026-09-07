@@ -731,26 +731,33 @@ public class GatewayShellNonblockingE2eTest {
                 } finally {
                     try { File.writeTo(releasePath, "release".toArray()) } catch (_: Exception) { () }
                     GatewayHttpSurface.stopIfRunning()
+                    var gatewayStopOk = false
+                    var gatewayBrokerStatus = "stop_failed"
                     try {
-                        gateway.stop()
+                        let stopped = gateway.stop()
+                        gatewayStopOk = stopped.ok
+                        gatewayBrokerStatus = stopped.brokerStatus
                     } catch (_: Exception) {
                         ()
                     }
-                    var loadsSettled = gatewayShellJoinLoads(loads, 5000)
-                    var ownersCleared = gatewayShellE2eAwait({ =>
+                    let loadsSettledBeforeReset = gatewayShellJoinLoads(loads, 5000)
+                    let ownersClearedBeforeReset = gatewayShellE2eAwait({ =>
                         managedStdioBroker().snapshot().ownerCount == 0
                     })
-                    if (!loadsSettled || !ownersCleared) {
-                        let _ = resetManagedStdioBrokerForTest(timeoutMs: 3000)
-                        loadsSettled = gatewayShellJoinLoads(loads, 5000)
-                        ownersCleared = gatewayShellE2eAwait({ =>
-                            managedStdioBroker().snapshot().ownerCount == 0
-                        })
-                    }
+                    let reset = resetManagedStdioBrokerForTest(timeoutMs: 3000)
+                    let afterReset = managedStdioBroker().snapshot()
                     try { remove(readyPath) } catch (_: Exception) { () }
                     try { remove(releasePath) } catch (_: Exception) { () }
-                    @Expect(loadsSettled, true)
-                    @Expect(ownersCleared, true)
+                    @Expect(gatewayStopOk, true)
+                    @Expect(gatewayBrokerStatus, "stopped")
+                    @Expect(loadsSettledBeforeReset, true)
+                    @Expect(ownersClearedBeforeReset, true)
+                    @Expect(reset.ok, true)
+                    @Expect(afterReset.running, false)
+                    @Expect(afterReset.brokerPid, 0)
+                    @Expect(afterReset.ownerCount, 0)
+                    @Expect(afterReset.readerCount, 0)
+                    @Expect(afterReset.dispatcherCount, 0)
                 }
             }
         )

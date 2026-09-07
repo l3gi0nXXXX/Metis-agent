@@ -3,12 +3,14 @@ package metis.gateway.runtime
 import metis.core.config.{CliConfig, CliSettingManager, GatewayUserSettings, MetisConfigManager, MetisProcessEnvironmentLock}
 import metis.gateway.config.buildGatewayConfigFromUserSettings
 import metis.gateway.core.{gatewayChannelRuntimeMarkFailure, gatewayChannelRuntimeMarkRunning, gatewayChannelRuntimeMarkStarting, gatewayChannelRuntimeRegisterAccount}
-import metis.gateway.logging.{gatewayLoggingCaptureConsoleForTest, gatewayLoggingCapturedConsoleForTest, gatewayLoggingResetForTest}
+import metis.gateway.logging.{gatewayLoggingCaptureConsoleForTest, gatewayLoggingCapturedConsoleForTest, gatewayLoggingResetForTest, gatewayLoggingResolveSettings}
+import metis.gateway.process.{gatewayStdioBrokerReady, gatewayStdioBrokerSnapshot}
 import metis.process.{ManagedStdioBrokerClient, ManagedStdioBrokerSnapshot, ManagedStdioOwnerSpec}
+import metis.process.resetManagedStdioBrokerForTest
 
 import std.env.{getVariable, setVariable}
 import std.convert.Parsable
-import std.fs.{Directory, Path, remove}
+import std.fs.{Directory, File, Path, exists, remove}
 import std.process.executeWithOutput
 import std.time.*
 import std.unittest.testmacro.*
@@ -39,6 +41,7 @@ private func withGatewayStatusTestSettings<T>(name: String, block: () -> T): T {
         try {
             block()
         } finally {
+            let _ = executeWithOutput("/bin/chmod", ["700", testHome])
             match (oldHome) {
                 case Some(value) => setVariable("METIS_HOME", value)
                 case None => setVariable("METIS_HOME", "")
@@ -141,8 +144,370 @@ private func gatewayStatusWaitForGone(pid: Int64, pgid: Int64, timeoutMs!: Int64
     gatewayStatusPidGone(pid) && gatewayStatusPgidGone(pgid)
 }
 
+private func gatewayHeartbeatStatusLogCount(lines: Array<String>, event: String): Int64 {
+    var count: Int64 = 0
+    for (line in lines) {
+        if (line.contains(event)) { count += 1 }
+    }
+    count
+}
+
+private func gatewayHeartbeatStatusInstallLsofMarker(marker: Path): Option<String> {
+    let oldPath = getVariable("PATH")
+    let bin = marker.parent.join("bin")
+    Directory.create(bin, recursive: true)
+    File.writeTo(
+        bin.join("lsof"),
+        ("#!/bin/sh\nprintf called > '${marker.toString()}'\nexit 1\n").toArray()
+    )
+    @Expect(executeWithOutput("/bin/chmod", ["700", bin.join("lsof").toString()])[0], 0)
+    let inherited = match (oldPath) { case Some(value) => value case None => "/usr/bin:/bin" }
+    setVariable("PATH", "${bin.toString()}:${inherited}")
+    oldPath
+}
+
+private func gatewayHeartbeatStatusRestorePath(oldPath: Option<String>): Unit {
+    match (oldPath) { case Some(value) => setVariable("PATH", value) case None => setVariable("PATH", "") }
+}
+
+private func gatewayHeartbeatStatusMakePersistFail(): Unit {
+    let state = gatewayRuntimeStatePath()
+    try { remove(state, recursive: true) } catch (_: Exception) { () }
+    @Expect(executeWithOutput("/bin/chmod", ["500", CliConfig.dotDir.toString()])[0], 0)
+}
+
+private func gatewayHeartbeatStatusRepairPersist(): Unit {
+    @Expect(executeWithOutput("/bin/chmod", ["700", CliConfig.dotDir.toString()])[0], 0)
+    try { remove(gatewayRuntimeStatePath(), recursive: true) } catch (_: Exception) { () }
+}
+
 @Test
 public class GatewayServerMethodsStatusTest {
+    @TestCase
+    public func s2U1RuntimePersistenceDoesNotInvokeListenerDiscovery(): Unit {
+        withGatewayStatusTestSettings<Unit>("s2-u1-pure-persist", { =>
+            let marker = CliConfig.dotDir.join("lsof-called")
+            let oldPath = gatewayHeartbeatStatusInstallLsofMarker(marker)
+            try {
+                gatewayRuntimeMarkStarting()
+                gatewayRuntimeMarkRunning()
+                gatewayRuntimeHeartbeat()
+                gatewayRuntimeMarkStopped(reason: "done")
+                @Expect(exists(marker), false)
+            } finally {
+                let _ = resetManagedStdioBrokerForTest(timeoutMs: 3000)
+                gatewayHeartbeatStatusRestorePath(oldPath)
+            }
+        })
+    }
+
+    @TestCase
+    public func s2B1MissingOrCorruptSnapshotUsesPureLockFileFallback(): Unit {
+        withGatewayStatusTestSettings<Unit>("s2-b1-fallback", { =>
+            let marker = CliConfig.dotDir.join("lsof-called")
+            let oldPath = gatewayHeartbeatStatusInstallLsofMarker(marker)
+            try {
+                gatewayRuntimeMarkStarting()
+                try { remove(gatewayRuntimeStatePath()) } catch (_: Exception) { () }
+                File.writeTo(gatewayServeLockPath(), "test-lock".toArray())
+                let missing = gatewayRuntimeSnapshot()
+                @Expect(missing.get("serveLockPresent").getOrThrow().asBool().getValue(), true)
+                File.writeTo(gatewayRuntimeStatePath(), "{malformed".toArray())
+                let malformed = gatewayRuntimeSnapshot()
+                @Expect(malformed.get("serveLockPresent").getOrThrow().asBool().getValue(), true)
+                File.writeTo(gatewayRuntimeStatePath(), [UInt8(0xff), UInt8(0xfe)])
+                let invalidUtf8 = gatewayRuntimeSnapshot()
+                @Expect(invalidUtf8.get("serveLockPresent").getOrThrow().asBool().getValue(), true)
+                @Expect(exists(marker), false)
+                @Expect(
+                    gatewayStdioBrokerSnapshot().get("ownerCount").getOrThrow().asInt().getValue(),
+                    0
+                )
+            } finally {
+                gatewayHeartbeatStatusRestorePath(oldPath)
+            }
+        })
+    }
+
+    @TestCase
+    public func s2P1RuntimePhaseSequencePersistsExplicitServeLockTruth(): Unit {
+        withGatewayStatusTestSettings<Unit>("s2-p1-phases", { =>
+            gatewayRuntimeMarkStarting()
+            @Expect(gatewayRuntimeSnapshot().get("serveLockPresent").getOrThrow().asBool().getValue(), true)
+            gatewayRuntimeMarkRunning()
+            @Expect(gatewayRuntimeSnapshot().get("serveLockPresent").getOrThrow().asBool().getValue(), true)
+            gatewayRuntimeHeartbeat()
+            @Expect(gatewayRuntimeSnapshot().get("serveLockPresent").getOrThrow().asBool().getValue(), true)
+            gatewayRuntimeMarkStopped(reason: "done")
+            @Expect(gatewayRuntimeSnapshot().get("serveLockPresent").getOrThrow().asBool().getValue(), false)
+            let _ = resetManagedStdioBrokerForTest(timeoutMs: 3000)
+        })
+    }
+
+    @TestCase
+    public func s2N1StoppedRuntimePersistenceDoesNotResurrectBroker(): Unit {
+        withGatewayStatusTestSettings<Unit>("s2-n1-no-resurrection", { =>
+            gatewayRuntimeMarkStarting()
+            gatewayRuntimeHeartbeat()
+            let _ = resetManagedStdioBrokerForTest(timeoutMs: 3000)
+            let stopped = gatewayStdioBrokerSnapshot()
+            @Expect(stopped.get("running").getOrThrow().asBool().getValue(), false)
+            @Expect(stopped.get("brokerPid").getOrThrow().asInt().getValue(), 0)
+            @Expect(stopped.get("readerCount").getOrThrow().asInt().getValue(), 0)
+            @Expect(stopped.get("ownerCount").getOrThrow().asInt().getValue(), 0)
+            gatewayRuntimeMarkStopped(reason: "done")
+            let after = gatewayStdioBrokerSnapshot()
+            @Expect(after.get("running").getOrThrow().asBool().getValue(), false)
+            @Expect(
+                after.get("generation").getOrThrow().asInt().getValue(),
+                stopped.get("generation").getOrThrow().asInt().getValue()
+            )
+            @Expect(
+                after.get("brokerPid").getOrThrow().asInt().getValue(),
+                stopped.get("brokerPid").getOrThrow().asInt().getValue()
+            )
+            @Expect(
+                after.get("readerCount").getOrThrow().asInt().getValue(),
+                stopped.get("readerCount").getOrThrow().asInt().getValue()
+            )
+            @Expect(after.get("ownerCount").getOrThrow().asInt().getValue(), 0)
+        })
+    }
+
+    @TestCase
+    public func hbS4B1HundredHeartbeatsIgnoreHangingLsofAndKeepBrokerGeneration(): Unit {
+        withGatewayStatusTestSettings<Unit>("hb-s4-b1-heartbeat-lsof", { =>
+            let marker = CliConfig.dotDir.join("lsof-called")
+            let oldPath = getVariable("PATH")
+            let bin = CliConfig.dotDir.join("bin")
+            Directory.create(bin, recursive: true)
+            File.writeTo(
+                bin.join("lsof"),
+                ("#!/bin/sh\nprintf called > '${marker.toString()}'\nsleep 1\nprintf '24626\\n'\n").toArray()
+            )
+            @Expect(executeWithOutput("/bin/chmod", ["700", bin.join("lsof").toString()])[0], 0)
+            let inherited = match (oldPath) { case Some(value) => value case None => "/usr/bin:/bin" }
+            setVariable("PATH", "${bin.toString()}:${inherited}")
+            gatewayLoggingResetForTest()
+            gatewayLoggingCaptureConsoleForTest()
+            try {
+                let setupReset = resetManagedStdioBrokerForTest(timeoutMs: 3000)
+                @Expect(setupReset.ok, true)
+                if (!setupReset.ok) { return }
+                gatewayRuntimeMarkStarting()
+                gatewayRuntimeHeartbeat()
+                let ready = gatewayStdioBrokerReady(timeoutMs: 5000)
+                @Expect(ready.ok, true)
+                @Expect(ready.status, "ready")
+                @Expect(ready.generation > 0, true)
+                @Expect(ready.pid > 0, true)
+                if (!ready.ok || ready.status != "ready" || ready.generation <= 0 || ready.pid <= 0) {
+                    return
+                }
+                let before = gatewayStdioBrokerSnapshot()
+                @Expect(before.get("running").getOrThrow().asBool().getValue(), true)
+                @Expect(before.get("responsive").getOrThrow().asBool().getValue(), true)
+                @Expect(before.get("status").getOrThrow().asString().getValue(), "ready")
+                @Expect(before.get("generation").getOrThrow().asInt().getValue(), ready.generation)
+                @Expect(before.get("brokerPid").getOrThrow().asInt().getValue(), ready.pid)
+                let discovery = gatewayFindVerifiedListenerPidsOnPortDetailed(port: 49141, timeoutMs: 800)
+                @Expect(discovery.conclusive, false)
+                @Expect(discovery.status, "listener_discovery_timeout")
+                @Expect(exists(marker), true)
+                try { remove(marker) } catch (_: Exception) { () }
+
+                for (_ in 0..100) {
+                    gatewayRuntimeMarkPollCompleted(gatewayStatusOperational(true, true, "ready"))
+                    gatewayRuntimeHeartbeat()
+                    @Expect(statusTestInt(gatewayRuntimeSnapshot(), "lastPollAtMs") > 0, true)
+                }
+                let after = gatewayStdioBrokerSnapshot()
+                @Expect(exists(marker), false)
+                @Expect(
+                    after.get("generation").getOrThrow().asInt().getValue(),
+                    before.get("generation").getOrThrow().asInt().getValue()
+                )
+                @Expect(
+                    after.get("brokerPid").getOrThrow().asInt().getValue(),
+                    before.get("brokerPid").getOrThrow().asInt().getValue()
+                )
+                @Expect(after.get("ownerCount").getOrThrow().asInt().getValue(), 0)
+                @Expect(gatewayHeartbeatStatusLogCount(gatewayLoggingCapturedConsoleForTest(), "gateway.runtime_state.persist_failed"), 0)
+
+                let stopReset = resetManagedStdioBrokerForTest(timeoutMs: 3000)
+                @Expect(stopReset.ok, true)
+                let stopped = gatewayStdioBrokerSnapshot()
+                @Expect(stopped.get("running").getOrThrow().asBool().getValue(), false)
+                @Expect(stopped.get("brokerPid").getOrThrow().asInt().getValue(), 0)
+                @Expect(stopped.get("ownerCount").getOrThrow().asInt().getValue(), 0)
+                @Expect(stopped.get("readerCount").getOrThrow().asInt().getValue(), 0)
+                gatewayRuntimeMarkStopped(reason: "hb-s4-b1-complete")
+                let terminal = gatewayStdioBrokerSnapshot()
+                @Expect(terminal.get("running").getOrThrow().asBool().getValue(), false)
+                @Expect(terminal.get("brokerPid").getOrThrow().asInt().getValue(), 0)
+                @Expect(terminal.get("ownerCount").getOrThrow().asInt().getValue(), 0)
+                @Expect(terminal.get("readerCount").getOrThrow().asInt().getValue(), 0)
+                @Expect(
+                    terminal.get("generation").getOrThrow().asInt().getValue(),
+                    stopped.get("generation").getOrThrow().asInt().getValue()
+                )
+            } finally {
+                let finalReset = resetManagedStdioBrokerForTest(timeoutMs: 3000)
+                @Expect(finalReset.ok, true)
+                let finalBroker = gatewayStdioBrokerSnapshot()
+                @Expect(finalBroker.get("running").getOrThrow().asBool().getValue(), false)
+                @Expect(finalBroker.get("brokerPid").getOrThrow().asInt().getValue(), 0)
+                @Expect(finalBroker.get("ownerCount").getOrThrow().asInt().getValue(), 0)
+                @Expect(finalBroker.get("readerCount").getOrThrow().asInt().getValue(), 0)
+                gatewayLoggingResetForTest()
+                gatewayHeartbeatStatusRestorePath(oldPath)
+            }
+        })
+    }
+
+    @TestCase
+    public func s3U1HeartbeatPersistenceFailureIsNonFatalAndLaterTickContinues(): Unit {
+        withGatewayStatusTestSettings<Unit>("s3-u1-nonfatal", { =>
+            gatewayRuntimeMarkStarting()
+            gatewayHeartbeatStatusMakePersistFail()
+            gatewayRuntimeHeartbeat()
+            gatewayRuntimeHeartbeat()
+            gatewayHeartbeatStatusRepairPersist()
+            gatewayRuntimeHeartbeat()
+            @Expect(exists(gatewayRuntimeStatePath()), true)
+            let _ = resetManagedStdioBrokerForTest(timeoutMs: 3000)
+        })
+    }
+
+    @TestCase
+    public func s3B1RepeatedPersistenceFailuresEmitOneTransition(): Unit {
+        withGatewayStatusTestSettings<Unit>("s3-b1-bounded", { =>
+            gatewayRuntimeMarkStarting()
+            let oldLogFile = getVariable("METIS_LOG_FILE")
+            let logFile = CliConfig.dotDir.parent.join("metis-heartbeat-s3-b1-${DateTime.now().toUnixTimeStamp().toNanoseconds()}.log")
+            setVariable("METIS_LOG_FILE", logFile.toString())
+            gatewayLoggingResetForTest()
+            gatewayLoggingCaptureConsoleForTest()
+            let _ = gatewayLoggingResolveSettings()
+            try {
+                gatewayHeartbeatStatusMakePersistFail()
+                for (_ in 0..100) { gatewayRuntimeMarkRunning() }
+                gatewayHeartbeatStatusRepairPersist()
+                gatewayRuntimeMarkRunning()
+                let lines = gatewayLoggingCapturedConsoleForTest()
+                @Expect(gatewayHeartbeatStatusLogCount(lines, "gateway.runtime_state.persist_failed"), 1)
+                @Expect(gatewayHeartbeatStatusLogCount(lines, "gateway.runtime_state.persist_recovered"), 1)
+            } finally {
+                match (oldLogFile) { case Some(value) => setVariable("METIS_LOG_FILE", value) case None => setVariable("METIS_LOG_FILE", "") }
+                gatewayLoggingResetForTest()
+                try { remove(logFile) } catch (_: Exception) { () }
+            }
+        })
+    }
+
+    @TestCase
+    public func s3P1PersistenceRecoveryIsLoggedOnceAndWritesValidState(): Unit {
+        withGatewayStatusTestSettings<Unit>("s3-p1-recovery", { =>
+            gatewayRuntimeMarkStarting()
+            let oldLogFile = getVariable("METIS_LOG_FILE")
+            let logFile = CliConfig.dotDir.parent.join("metis-heartbeat-s3-p1-${DateTime.now().toUnixTimeStamp().toNanoseconds()}.log")
+            setVariable("METIS_LOG_FILE", logFile.toString())
+            gatewayLoggingResetForTest()
+            gatewayLoggingCaptureConsoleForTest()
+            let _ = gatewayLoggingResolveSettings()
+            try {
+                gatewayHeartbeatStatusMakePersistFail()
+                gatewayRuntimeHeartbeat()
+                gatewayHeartbeatStatusRepairPersist()
+                gatewayRuntimeHeartbeat()
+                let lines = gatewayLoggingCapturedConsoleForTest()
+                @Expect(gatewayHeartbeatStatusLogCount(lines, "gateway.runtime_state.persist_failed"), 1)
+                @Expect(gatewayHeartbeatStatusLogCount(lines, "gateway.runtime_state.persist_recovered"), 1)
+                let state = JsonValue.fromStr(String.fromUtf8(File.readFrom(gatewayRuntimeStatePath()))).asObject()
+                @Expect(statusTestString(state, "status"), "starting")
+            } finally {
+                let _ = resetManagedStdioBrokerForTest(timeoutMs: 3000)
+                match (oldLogFile) { case Some(value) => setVariable("METIS_LOG_FILE", value) case None => setVariable("METIS_LOG_FILE", "") }
+                gatewayLoggingResetForTest()
+                try { remove(logFile) } catch (_: Exception) { () }
+            }
+        })
+    }
+
+    @TestCase
+    public func s3N1PersistenceDiagnosticsDoNotEchoReasonOrPath(): Unit {
+        withGatewayStatusTestSettings<Unit>("s3-n1-redaction", { =>
+            gatewayRuntimeMarkStarting()
+            let oldLogFile = getVariable("METIS_LOG_FILE")
+            let logFile = CliConfig.dotDir.parent.join("metis-heartbeat-s3-n1-${DateTime.now().toUnixTimeStamp().toNanoseconds()}.log")
+            setVariable("METIS_LOG_FILE", logFile.toString())
+            gatewayLoggingResetForTest()
+            gatewayLoggingCaptureConsoleForTest()
+            let _ = gatewayLoggingResolveSettings()
+            try {
+                gatewayHeartbeatStatusMakePersistFail()
+                let secret = "Authorization: Bearer synthetic-secret 中文🙂 /Users/private/synthetic-path"
+                gatewayRuntimeMarkStopped(reason: secret)
+                gatewayHeartbeatStatusRepairPersist()
+                gatewayRuntimeMarkStopped(reason: "recovered")
+                var rendered = ""
+                for (line in gatewayLoggingCapturedConsoleForTest()) { rendered += line + "\n" }
+                @Expect(rendered.contains("synthetic-secret"), false)
+                @Expect(rendered.contains("/Users/private/synthetic-path"), false)
+                @Expect(rendered.contains("gateway.runtime_state.persist_failed"), true)
+                @Expect(rendered.contains("gateway.runtime_state.persist_recovered"), true)
+            } finally {
+                match (oldLogFile) { case Some(value) => setVariable("METIS_LOG_FILE", value) case None => setVariable("METIS_LOG_FILE", "") }
+                gatewayLoggingResetForTest()
+                try { remove(logFile) } catch (_: Exception) { () }
+            }
+        })
+    }
+
+    @TestCase
+    public func s3N2PersistenceAndLoggerSinkFailuresRemainNonFatal(): Unit {
+        withGatewayStatusTestSettings<Unit>("s3-n2-logger-failure", { =>
+            let oldLogFile = getVariable("METIS_LOG_FILE")
+            let oldConsole = getVariable("METIS_CONSOLE_LEVEL")
+            let blockedParent = CliConfig.dotDir.join("blocked-log-parent")
+            File.writeTo(blockedParent, "regular-file".toArray())
+            setVariable("METIS_LOG_FILE", blockedParent.join("gateway.log").toString())
+            setVariable("METIS_CONSOLE_LEVEL", "silent")
+            gatewayLoggingResetForTest()
+            try {
+                gatewayRuntimeMarkStarting()
+                gatewayHeartbeatStatusMakePersistFail()
+                gatewayRuntimeMarkRunning()
+                gatewayRuntimeHeartbeat()
+                gatewayRuntimeHeartbeat()
+                gatewayHeartbeatStatusRepairPersist()
+                gatewayRuntimeHeartbeat()
+                @Expect(exists(gatewayRuntimeStatePath()), true)
+            } finally {
+                let _ = resetManagedStdioBrokerForTest(timeoutMs: 3000)
+                match (oldLogFile) { case Some(value) => setVariable("METIS_LOG_FILE", value) case None => setVariable("METIS_LOG_FILE", "") }
+                match (oldConsole) { case Some(value) => setVariable("METIS_CONSOLE_LEVEL", value) case None => setVariable("METIS_CONSOLE_LEVEL", "") }
+                gatewayLoggingResetForTest()
+            }
+        })
+    }
+
+    @TestCase
+    public func hS3U1HealthyHeartbeatKeepsHistoricalFieldsWithoutFailureLog(): Unit {
+        withGatewayStatusTestSettings<Unit>("h-s3-u1-healthy", { =>
+            gatewayRuntimeMarkStarting()
+            gatewayLoggingResetForTest()
+            gatewayLoggingCaptureConsoleForTest()
+            gatewayRuntimeHeartbeat()
+            let snapshot = gatewayRuntimeSnapshot()
+            @Expect(statusTestString(snapshot, "status"), "starting")
+            @Expect(snapshot.get("serveLockPresent").getOrThrow().asBool().getValue(), true)
+            @Expect(gatewayHeartbeatStatusLogCount(gatewayLoggingCapturedConsoleForTest(), "gateway.runtime_state.persist_failed"), 0)
+            let _ = resetManagedStdioBrokerForTest(timeoutMs: 3000)
+            gatewayLoggingResetForTest()
+        })
+    }
+
     @TestCase
     public func p5P1BrokerUnresponsiveReadinessAndGenerationRecoveryAreExact(): Unit {
         withGatewayStatusTestSettings<Unit>("p5-broker-recovery", { =>
@@ -265,6 +630,43 @@ public class GatewayServerMethodsStatusTest {
                 @Expect(statusTestInt(snapshot, "inboundQueueDepth"), 7)
             } finally {
                 gatewayRuntimeMarkStopped(reason: "test-complete")
+            }
+        })
+    }
+
+    @TestCase
+    public func hbHS2U1StatusRpcPreservesRuntimeFields(): Unit {
+        withGatewayStatusTestSettings<Unit>("hb-h-s2-u1-status-runtime", { =>
+            let oldPath = gatewayHeartbeatStatusInstallLsofMarker(CliConfig.dotDir.join("lsof-called"))
+            gatewayRuntimeMarkStarting()
+            try {
+                gatewayRuntimeMarkRunning()
+                gatewayRuntimeMarkPollCompleted(
+                    gatewayStatusOperational(true, true, "ready", pollLagMs: 7, queueDepth: 9)
+                )
+                let status = buildGatewayRpcStatusJson(GatewayUserSettings())
+                let runtime = statusTestObject(status, "runtime")
+                @Expect(runtime.get("running").getOrThrow().asBool().getValue(), true)
+                @Expect(runtime.get("status").getOrThrow().asString().getValue(), "running")
+                @Expect(runtime.get("reason").getOrThrow().asString().getValue(), "")
+                @Expect(runtime.get("startedAtMs").getOrThrow().asInt().getValue() > 0, true)
+                @Expect(
+                    runtime.get("updatedAtMs").getOrThrow().asInt().getValue() >=
+                        runtime.get("startedAtMs").getOrThrow().asInt().getValue(),
+                    true
+                )
+                @Expect(runtime.get("serveLockPresent").getOrThrow().asBool().getValue(), true)
+                @Expect(runtime.get("pollLagMs").getOrThrow().asInt().getValue() >= 0, true)
+                @Expect(runtime.get("brokerAlive").getOrThrow().asBool().getValue(), true)
+                @Expect(runtime.get("brokerResponsive").getOrThrow().asBool().getValue(), true)
+                @Expect(runtime.get("brokerStatus").getOrThrow().asString().getValue(), "ready")
+                @Expect(runtime.get("brokerGeneration").getOrThrow().asInt().getValue(), 1)
+                @Expect(runtime.get("brokerOwnerCount").getOrThrow().asInt().getValue(), 0)
+                @Expect(runtime.get("inboundQueueDepth").getOrThrow().asInt().getValue(), 9)
+                @Expect(runtime.get("lastPollAtMs").getOrThrow().asInt().getValue() > 0, true)
+            } finally {
+                gatewayRuntimeMarkStopped(reason: "hb-h-s2-u1-complete")
+                gatewayHeartbeatStatusRestorePath(oldPath)
             }
         })
     }
