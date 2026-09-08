@@ -6,7 +6,7 @@ import metis.gateway.core.{gatewaySessionStoreForSessionKey, gatewaySessionStore
 import magic.jsonable.*
 import std.env.{getVariable, setVariable}
 import std.collection.*
-import std.fs.{Directory, File, Path, remove}
+import std.fs.{Directory, File, Path, exists, remove}
 import std.unittest.testmacro.*
 import stdx.encoding.json.{JsonArray, JsonObject, JsonString}
 
@@ -73,11 +73,13 @@ private func previewEntryFor(rows: JsonArray, key: String): JsonObject {
 
 private func withGatewaySessionsTestHome<T>(block: () -> T): T {
     let testHome = "/tmp/metis-gateway-sessions-test-home"
+    @Expect(testHome, "/tmp/metis-gateway-sessions-test-home")
     try {
         remove(Path(testHome), recursive: true)
     } catch (_: Exception) {
         ()
     }
+    @Expect(exists(Path(testHome)), false)
     Directory.create(testHome, recursive: true)
     let oldHome = getVariable("METIS_HOME")
     setVariable("METIS_HOME", testHome)
@@ -94,6 +96,12 @@ private func withGatewaySessionsTestHome<T>(block: () -> T): T {
         CliConfig.invalidatePathCache()
         MetisConfigManager.invalidate()
         CliSettingManager.invalidate()
+        try {
+            remove(Path(testHome), recursive: true)
+        } catch (_: Exception) {
+            ()
+        }
+        @Expect(exists(Path(testHome)), false)
     }
 }
 

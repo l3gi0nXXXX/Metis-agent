@@ -1,11 +1,17 @@
 package metis.gateway.runtime
 
+import magic.config.Config
+
 import metis.core.config.{CliConfig, CliSettingManager, GatewayUserSettings, MetisConfigManager, MetisProcessEnvironmentLock}
 import metis.gateway.core.{gatewayChannelRuntimeMarkFailure, gatewayChannelRuntimeMarkStarting, gatewayChannelRuntimeRegisterAccount}
 import metis.gateway.config.buildGatewayConfigFromUserSettings
+import metis.gateway.logging.gatewayLoggingResetForTest
 
 import std.env.{getVariable, setVariable}
-import std.fs.{Directory, Path, remove}
+import std.core.Duration
+import std.fs.{Directory, Path, exists, remove}
+import std.sync.AtomicInt64
+import std.time.MonoTime
 import std.unittest.testmacro.*
 import stdx.encoding.json.JsonValue
 
@@ -22,13 +28,16 @@ private func gatewayHttpSurfaceTestResult(raw: String): JsonValue {
 private func withGatewayHttpSurfaceTestSettings<T>(block: () -> T): T {
     synchronized(MetisProcessEnvironmentLock) {
         let testHome = "/tmp/metis-gateway-http-surface-test-home"
+        @Expect(testHome, "/tmp/metis-gateway-http-surface-test-home")
         try {
             remove(Path(testHome), recursive: true)
         } catch (_: Exception) {
             ()
         }
+        @Expect(exists(Path(testHome)), false)
         Directory.create(testHome, recursive: true)
         let oldHome = getVariable("METIS_HOME")
+        let oldMagicLogFile = Config.logFile
         setVariable("METIS_HOME", testHome)
         CliConfig.invalidatePathCache()
         MetisConfigManager.invalidate()
@@ -45,6 +54,15 @@ private func withGatewayHttpSurfaceTestSettings<T>(block: () -> T): T {
             CliConfig.invalidatePathCache()
             MetisConfigManager.invalidate()
             CliSettingManager.invalidate()
+            gatewayLoggingResetForTest()
+            Config.logFile = oldMagicLogFile
+            @Expect(Config.logFile, oldMagicLogFile)
+            try {
+                remove(Path(testHome), recursive: true)
+            } catch (_: Exception) {
+                ()
+            }
+            @Expect(exists(Path(testHome)), false)
         }
     }
 }
@@ -318,67 +336,89 @@ public class GatewayHttpSurfaceTest {
     @TestCase
     public func mcpHttpStartAndStatusForwardExistingPlatformMethods(): Unit {
         withGatewayHttpSurfaceTestSettings<Unit>({ =>
-            let readinessResponse = gatewayHandleMcpRequest(
-                gatewayHttpSurfaceTestUser(),
-                "{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"tools/call\",\"params\":{\"name\":\"gateway.readiness\",\"arguments\":{}}}"
-            )
-            @Expect(readinessResponse.contains("\"readiness\""), true)
-            @Expect(readinessResponse.contains("\"surfaces\""), true)
+            let expectedPort = buildGatewayConfigFromUserSettings(gatewayHttpSurfaceTestUser()).port
+            let portProbeCalls = AtomicInt64(0)
+            try {
+                let readinessResponse = gatewayHandleMcpRequest(
+                    gatewayHttpSurfaceTestUser(),
+                    "{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"tools/call\",\"params\":{\"name\":\"gateway.readiness\",\"arguments\":{}}}"
+                )
+                @Expect(readinessResponse.contains("\"readiness\""), true)
+                @Expect(readinessResponse.contains("\"surfaces\""), true)
 
-            let configGetResponse = gatewayHandleMcpRequest(
-                gatewayHttpSurfaceTestUser(),
-                "{\"jsonrpc\":\"2.0\",\"id\":12,\"method\":\"tools/call\",\"params\":{\"name\":\"gateway.config.get\",\"arguments\":{\"path\":\"gateway.enabled\"}}}"
-            )
-            let configGet = gatewayHttpSurfaceTestResult(configGetResponse).asObject()
-            @Expect(configGet.get("path").getOrThrow().asString().getValue(), "gateway.enabled")
-            @Expect(configGet.get("value").isSome(), true)
+                let configGetResponse = gatewayHandleMcpRequest(
+                    gatewayHttpSurfaceTestUser(),
+                    "{\"jsonrpc\":\"2.0\",\"id\":12,\"method\":\"tools/call\",\"params\":{\"name\":\"gateway.config.get\",\"arguments\":{\"path\":\"gateway.enabled\"}}}"
+                )
+                let configGet = gatewayHttpSurfaceTestResult(configGetResponse).asObject()
+                @Expect(configGet.get("path").getOrThrow().asString().getValue(), "gateway.enabled")
+                @Expect(configGet.get("value").isSome(), true)
 
-            let schemaLookupResponse = gatewayHandleMcpRequest(
-                gatewayHttpSurfaceTestUser(),
-                "{\"jsonrpc\":\"2.0\",\"id\":13,\"method\":\"tools/call\",\"params\":{\"name\":\"gateway.config.schema.lookup\",\"arguments\":{\"path\":\"gateway\"}}}"
-            )
-            @Expect(schemaLookupResponse.contains("\"schema\""), true)
+                let schemaLookupResponse = gatewayHandleMcpRequest(
+                    gatewayHttpSurfaceTestUser(),
+                    "{\"jsonrpc\":\"2.0\",\"id\":13,\"method\":\"tools/call\",\"params\":{\"name\":\"gateway.config.schema.lookup\",\"arguments\":{\"path\":\"gateway\"}}}"
+                )
+                @Expect(schemaLookupResponse.contains("\"schema\""), true)
 
-            let webchatStatusResponse = gatewayHandleMcpRequest(
-                gatewayHttpSurfaceTestUser(),
-                "{\"jsonrpc\":\"2.0\",\"id\":14,\"method\":\"tools/call\",\"params\":{\"name\":\"gateway.webchat.status\",\"arguments\":{}}}"
-            )
-            @Expect(webchatStatusResponse.contains("\"webchat\""), true)
+                let webchatStatusResponse = gatewayHandleMcpRequest(
+                    gatewayHttpSurfaceTestUser(),
+                    "{\"jsonrpc\":\"2.0\",\"id\":14,\"method\":\"tools/call\",\"params\":{\"name\":\"gateway.webchat.status\",\"arguments\":{}}}"
+                )
+                @Expect(webchatStatusResponse.contains("\"webchat\""), true)
 
-            let webchatStartResponse = gatewayHandleMcpRequest(
-                gatewayHttpSurfaceTestUser(),
-                "{\"jsonrpc\":\"2.0\",\"id\":15,\"method\":\"tools/call\",\"params\":{\"name\":\"gateway.webchat.start\",\"arguments\":{}}}"
-            )
-            let webchatStart = gatewayHttpSurfaceTestResult(webchatStartResponse).asObject()
-            @Expect(webchatStart.get("started").getOrThrow().asBool().getValue(), true)
-            @Expect(webchatStart.get("webchat").isSome(), true)
+                let webchatStartResponse = gatewayHandleMcpRequest(
+                    gatewayHttpSurfaceTestUser(),
+                    "{\"jsonrpc\":\"2.0\",\"id\":15,\"method\":\"tools/call\",\"params\":{\"name\":\"gateway.webchat.start\",\"arguments\":{}}}"
+                )
+                let webchatStart = gatewayHttpSurfaceTestResult(webchatStartResponse).asObject()
+                @Expect(webchatStart.get("started").getOrThrow().asBool().getValue(), true)
+                @Expect(webchatStart.get("webchat").isSome(), true)
 
-            let startResponse = gatewayHandleMcpRequest(
-                gatewayHttpSurfaceTestUser(),
-                "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"gateway.http.start\",\"arguments\":{}}}"
-            )
-            let start = gatewayHttpSurfaceTestResult(startResponse).asObject()
-            @Expect(start.get("started").getOrThrow().asBool().getValue(), true)
-            @Expect(start.get("http").isSome(), true)
+                let startResponse = gatewayHandleMcpRequest(
+                    gatewayHttpSurfaceTestUser(),
+                    "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"gateway.http.start\",\"arguments\":{}}}"
+                )
+                let start = gatewayHttpSurfaceTestResult(startResponse).asObject()
+                @Expect(start.get("started").getOrThrow().asBool().getValue(), true)
+                @Expect(start.get("http").isSome(), true)
 
-            let statusResponse = gatewayHandleMcpRequest(
-                gatewayHttpSurfaceTestUser(),
-                "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"gateway.http.status\",\"arguments\":{}}}"
-            )
-            @Expect(statusResponse.contains("\"http\""), true)
-            @Expect(statusResponse.contains("\"probePaths\""), true)
+                let statusResponse = gatewayHandleMcpRequest(
+                    gatewayHttpSurfaceTestUser(),
+                    "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"gateway.http.status\",\"arguments\":{}}}"
+                )
+                @Expect(statusResponse.contains("\"http\""), true)
+                @Expect(statusResponse.contains("\"probePaths\""), true)
 
-            let channelsAuditResponse = gatewayHandleMcpRequest(
-                gatewayHttpSurfaceTestUser(),
-                "{\"jsonrpc\":\"2.0\",\"id\":16,\"method\":\"tools/call\",\"params\":{\"name\":\"gateway.channels.audit\",\"arguments\":{\"channelId\":\"telegram\"}}}"
-            )
-            @Expect(channelsAuditResponse.contains("\"gateway-channels-audit\""), true)
-            @Expect(channelsAuditResponse.contains("\"T12\""), true)
-            let channelsAudit = gatewayHttpSurfaceTestResult(channelsAuditResponse).asObject()
-            let summary = channelsAudit.get("summary").getOrThrow().asObject()
-            let consumers = summary.get("consumers").getOrThrow().asObject()
-            @Expect(consumers.get("mcpOverHttp").getOrThrow().asBool().getValue(), true)
-            @Expect(channelsAuditResponse.contains("\"telegramThreadBindingVisibleInControlUiWsSessions\""), true)
+                let channelsAuditResponse = gatewayHandleMcpRequest(
+                    gatewayHttpSurfaceTestUser(),
+                    "{\"jsonrpc\":\"2.0\",\"id\":16,\"method\":\"tools/call\",\"params\":{\"name\":\"gateway.channels.audit\",\"arguments\":{\"channelId\":\"telegram\"}}}"
+                )
+                @Expect(channelsAuditResponse.contains("\"gateway-channels-audit\""), true)
+                @Expect(channelsAuditResponse.contains("\"T12\""), true)
+                let channelsAudit = gatewayHttpSurfaceTestResult(channelsAuditResponse).asObject()
+                let summary = channelsAudit.get("summary").getOrThrow().asObject()
+                let consumers = summary.get("consumers").getOrThrow().asObject()
+                @Expect(consumers.get("mcpOverHttp").getOrThrow().asBool().getValue(), true)
+                @Expect(channelsAuditResponse.contains("\"telegramThreadBindingVisibleInControlUiWsSessions\""), true)
+                @Expect(GatewayHttpSurface.isRunning(), true)
+            } finally {
+                setGatewayServePortProbeForTest(Some({port: Int64, budgetMs: Int64 =>
+                    portProbeCalls.fetchAdd(1)
+                    @Expect(port, expectedPort)
+                    @Expect(budgetMs > 0 && budgetMs <= 500, true)
+                    (1, "", "")
+                }))
+                try {
+                    let stopResult = GatewayHttpSurface.stopDetailed(MonoTime.now() + Duration.second * 2)
+                    @Expect(stopResult.ok, true)
+                    @Expect(stopResult.status, "stopped")
+                    @Expect(stopResult.portStatus, "released")
+                    @Expect(GatewayHttpSurface.isRunning(), false)
+                    @Expect(portProbeCalls.load() > 0, true)
+                } finally {
+                    setGatewayServePortProbeForTest(None<(Int64, Int64) -> (Int64, String, String)>)
+                }
+            }
         })
     }
 }

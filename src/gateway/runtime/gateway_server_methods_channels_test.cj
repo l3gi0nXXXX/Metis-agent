@@ -262,11 +262,13 @@ private class GatewayChannelsFeishuAuthFakeHttpClient <: FeishuAuthHttpClient {
 
 private func withGatewayChannelsTestHome<T>(block: () -> T): T {
     let testHome = "/tmp/metis-gateway-channels-test-home"
+    @Expect(testHome, "/tmp/metis-gateway-channels-test-home")
     try {
         remove(Path(testHome), recursive: true)
     } catch (_: Exception) {
         ()
     }
+    @Expect(exists(Path(testHome)), false)
     Directory.create(testHome, recursive: true)
     let oldHome = getVariable("METIS_HOME")
     setVariable("METIS_HOME", testHome)
@@ -279,6 +281,12 @@ private func withGatewayChannelsTestHome<T>(block: () -> T): T {
             case None => setVariable("METIS_HOME", "")
         }
         CliConfig.invalidatePathCache()
+        try {
+            remove(Path(testHome), recursive: true)
+        } catch (_: Exception) {
+            ()
+        }
+        @Expect(exists(Path(testHome)), false)
     }
 }
 

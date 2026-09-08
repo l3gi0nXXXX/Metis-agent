@@ -29,11 +29,13 @@ private func wsConcatLines(lines: Array<String>): String {
 
 private func withGatewayControlUiWsTestHome<T>(block: () -> T): T {
     let testHome = "/tmp/metis-gateway-control-ui-ws-test-home"
+    @Expect(testHome, "/tmp/metis-gateway-control-ui-ws-test-home")
     try {
         remove(Path(testHome), recursive: true)
     } catch (_: Exception) {
         ()
     }
+    @Expect(exists(Path(testHome)), false)
     Directory.create(testHome, recursive: true)
     let oldHome = getVariable("METIS_HOME")
     setVariable("METIS_HOME", testHome)
@@ -50,6 +52,12 @@ private func withGatewayControlUiWsTestHome<T>(block: () -> T): T {
         CliConfig.invalidatePathCache()
         MetisConfigManager.invalidate()
         CliSettingManager.invalidate()
+        try {
+            remove(Path(testHome), recursive: true)
+        } catch (_: Exception) {
+            ()
+        }
+        @Expect(exists(Path(testHome)), false)
     }
 }
 

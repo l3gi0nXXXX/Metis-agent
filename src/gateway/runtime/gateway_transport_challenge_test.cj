@@ -5,7 +5,7 @@ import metis.gateway.protocol.{GatewayClientInfo, GatewayConnectParams, GatewayP
 
 import std.env.{getVariable, setVariable}
 import std.convert.Parsable
-import std.fs.{Directory, Path, remove}
+import std.fs.{Directory, Path, exists, remove}
 import std.unittest.testmacro.*
 import stdx.encoding.json.{JsonObject, JsonString}
 
@@ -25,11 +25,13 @@ private func gatewayTransportChallengeTestUser(): GatewayUserSettings {
 
 private func withGatewayTransportChallengeSettings<T>(block: () -> T): T {
     synchronized(MetisProcessEnvironmentLock) {
+        @Expect(gatewayTransportChallengeTestHome, "/tmp/metis-gateway-transport-challenge-test-home")
         try {
             remove(Path(gatewayTransportChallengeTestHome), recursive: true)
         } catch (_: Exception) {
             ()
         }
+        @Expect(exists(Path(gatewayTransportChallengeTestHome)), false)
         Directory.create(gatewayTransportChallengeTestHome, recursive: true)
         let oldHome = getVariable("METIS_HOME")
         setVariable("METIS_HOME", gatewayTransportChallengeTestHome)
@@ -49,6 +51,12 @@ private func withGatewayTransportChallengeSettings<T>(block: () -> T): T {
             CliConfig.invalidatePathCache()
             MetisConfigManager.invalidate()
             CliSettingManager.invalidate()
+            try {
+                remove(Path(gatewayTransportChallengeTestHome), recursive: true)
+            } catch (_: Exception) {
+                ()
+            }
+            @Expect(exists(Path(gatewayTransportChallengeTestHome)), false)
         }
     }
 }

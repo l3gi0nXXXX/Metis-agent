@@ -1,5 +1,7 @@
 package metis.gateway.runtime
 
+import magic.config.Config
+
 import metis.core.config.{CliConfig, CliSettingManager, GatewayUserSettings, MetisConfigManager, MetisProcessEnvironmentLock}
 import metis.gateway.config.buildGatewayConfigFromUserSettings
 import metis.gateway.core.{gatewayChannelRuntimeMarkFailure, gatewayChannelRuntimeMarkRunning, gatewayChannelRuntimeMarkStarting, gatewayChannelRuntimeRegisterAccount}
@@ -26,14 +28,45 @@ private func gatewayStatusTestUser(): GatewayUserSettings {
 
 private func withGatewayStatusTestSettings<T>(name: String, block: () -> T): T {
     synchronized(MetisProcessEnvironmentLock) {
+        let approvedName =
+            name == "s2-u1-pure-persist" ||
+            name == "s2-b1-fallback" ||
+            name == "s2-p1-phases" ||
+            name == "s2-n1-no-resurrection" ||
+            name == "hb-s4-b1-heartbeat-lsof" ||
+            name == "s3-u1-nonfatal" ||
+            name == "s3-b1-bounded" ||
+            name == "s3-p1-recovery" ||
+            name == "s3-n1-redaction" ||
+            name == "s3-n2-logger-failure" ||
+            name == "h-s3-u1-healthy" ||
+            name == "p5-broker-recovery" ||
+            name == "p5-operational-logs" ||
+            name == "p5-poll-snapshot" ||
+            name == "hb-h-s2-u1-status-runtime" ||
+            name == "p5-operational" ||
+            name == "failed-runtime" ||
+            name == "starting-runtime" ||
+            name == "disabled-runtime" ||
+            name == "redacted-runtime" ||
+            name == "runtime-config-drift" ||
+            name == "runtime-config-actions" ||
+            name == "doctor-runtime" ||
+            name == "human-cli"
+        @Expect(approvedName, true)
+        if (!approvedName) {
+            throw Exception("unapproved_gateway_status_test_home")
+        }
         let testHome = "/tmp/metis-gateway-status-test-${name}"
         try {
             remove(Path(testHome), recursive: true)
         } catch (_: Exception) {
             ()
         }
+        @Expect(exists(Path(testHome)), false)
         Directory.create(testHome, recursive: true)
         let oldHome = getVariable("METIS_HOME")
+        let oldMagicLogFile = Config.logFile
         setVariable("METIS_HOME", testHome)
         CliConfig.invalidatePathCache()
         MetisConfigManager.invalidate()
@@ -49,6 +82,15 @@ private func withGatewayStatusTestSettings<T>(name: String, block: () -> T): T {
             CliConfig.invalidatePathCache()
             MetisConfigManager.invalidate()
             CliSettingManager.invalidate()
+            gatewayLoggingResetForTest()
+            Config.logFile = oldMagicLogFile
+            @Expect(Config.logFile, oldMagicLogFile)
+            try {
+                remove(Path(testHome), recursive: true)
+            } catch (_: Exception) {
+                ()
+            }
+            @Expect(exists(Path(testHome)), false)
         }
     }
 }

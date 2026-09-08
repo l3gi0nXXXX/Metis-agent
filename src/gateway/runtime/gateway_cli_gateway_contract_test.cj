@@ -3,7 +3,7 @@ package metis.gateway.runtime
 import metis.core.config.{CliSettingManager, MetisConfigManager}
 
 import std.env.{getVariable, setVariable}
-import std.fs.{Directory, Path, remove}
+import std.fs.{Directory, Path, exists, remove}
 import std.unittest.testmacro.*
 
 private func gatewayCliContractRestoreEnv(name: String, oldValue: Option<String>): Unit {
@@ -14,12 +14,21 @@ private func gatewayCliContractRestoreEnv(name: String, oldValue: Option<String>
 }
 
 private func withGatewayCliContractTestHome<T>(label: String, block: () -> T): T {
+    let approvedLabel =
+        label == "metis-gateway-cli-contract-default-serve" ||
+        label == "metis-gateway-cli-contract-explicit-local" ||
+        label == "metis-gateway-cli-contract-remote-url"
+    @Expect(approvedLabel, true)
+    if (!approvedLabel) {
+        throw Exception("unapproved_gateway_cli_contract_test_home")
+    }
     let testHome = "/tmp/${label}"
     try {
         remove(Path(testHome), recursive: true)
     } catch (_: Exception) {
         ()
     }
+    @Expect(exists(Path(testHome)), false)
     Directory.create(testHome, recursive: true)
     let oldHome = getVariable("METIS_HOME")
     let oldMode = getVariable("METIS_GATEWAY_CLI_MODE")
@@ -34,6 +43,12 @@ private func withGatewayCliContractTestHome<T>(label: String, block: () -> T): T
         gatewayCliContractRestoreEnv("METIS_GATEWAY_CLI_MODE", oldMode)
         MetisConfigManager.invalidate()
         CliSettingManager.invalidate()
+        try {
+            remove(Path(testHome), recursive: true)
+        } catch (_: Exception) {
+            ()
+        }
+        @Expect(exists(Path(testHome)), false)
     }
 }
 
