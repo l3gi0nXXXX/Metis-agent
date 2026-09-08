@@ -125,6 +125,7 @@ public func runGatewayP1DemoWithFeishuWebhook(): Unit {
 public func runGatewayService(verbose!: Bool = false): Unit {
     let startMs = gatewayServeNowMs()
     let heartbeatPollCadence = gatewayHeartbeatPollCadenceForTest()
+    gatewayLogProcessMemory("serve:startup_begin")
     gatewayServeLogger.info(MetisLogEvent.gatewayStarting, "Gateway serve starting")
     gatewayServeTimingLog("enter", startMs)
     let persistedUser = CliSettingManager.readGatewaySettings()
@@ -233,8 +234,11 @@ public func runGatewayService(verbose!: Bool = false): Unit {
         gatewayPlatformMarkRunning(gatewayCfg)
         gatewayServeLogger.debug(MetisLogEvent.loggingRaw, "Gateway.serve: calling gateway.start()")
         gatewayServeTimingLog("gateway-start-begin", startMs)
+        gatewayLogProcessMemory("serve:gateway_start_before")
         gateway.start()
+        gatewayLogProcessMemory("serve:gateway_start_after")
         gatewayRuntimeMarkRunning()
+        gatewayLogProcessMemory("serve:ready")
         gatewayServeLogger.info(MetisLogEvent.gatewayReady, "Gateway serve ready")
         gatewayShellPrintLines(gatewayShellReadySummaryLines(
             CliConfig.model,
@@ -294,6 +298,7 @@ public func runGatewayService(verbose!: Bool = false): Unit {
             sleep(Duration.millisecond * 200)
         }
     } finally {
+        gatewayLogProcessMemory("serve:stop_begin")
         let shutdownDeadline = MonoTime.now() + Duration.millisecond * GATEWAY_SERVE_GRACEFUL_SHUTDOWN_TIMEOUT_MS
         // Cron 清理仍可能需要 channel/session；必须在 Gateway teardown 前完成有界取消与收割。
         let _ = cronRunner.stop(reason: "gateway_shutdown", drainTimeoutMs: 5000)

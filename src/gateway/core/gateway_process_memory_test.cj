@@ -1,7 +1,7 @@
 package metis.gateway.core
 
 import metis.core.config.{CliConfig, CliSettingManager}
-import metis.gateway.logging.gatewayLoggingResetForTest
+import metis.gateway.logging.{gatewayLoggingCaptureConsoleForTest, gatewayLoggingCapturedConsoleForTest, gatewayLoggingResetForTest}
 
 import std.collection.{ArrayList, HashMap, HashSet}
 import std.env.{getVariable, setVariable}
@@ -47,6 +47,67 @@ private class GatewayMemoryFailingRssProbe {
 
     public func calls(): Int64 {
         synchronized(this.lock) { this.callCount }
+    }
+}
+
+private class GatewayMemoryManagedHeapProbe {
+    private let lock = Mutex()
+    private let maxValues: Array<Int64>
+    private let usedValues: Array<Int64>
+    private var index: Int64 = 0
+
+    public init(maxValues: Array<Int64>, usedValues: Array<Int64>) {
+        this.maxValues = maxValues
+        this.usedValues = usedValues
+    }
+
+    public func next(): (Int64, Int64) {
+        synchronized(this.lock) {
+            let current = this.index
+            this.index += 1
+            let maxIndex = if (current >= 0 && current < this.maxValues.size) { current } else { this.maxValues.size - 1 }
+            let usedIndex = if (current >= 0 && current < this.usedValues.size) { current } else { this.usedValues.size - 1 }
+            (this.maxValues[maxIndex], this.usedValues[usedIndex])
+        }
+    }
+
+    public func calls(): Int64 {
+        synchronized(this.lock) { this.index }
+    }
+}
+
+private class GatewayMemoryPhysicalProbe {
+    private let lock = Mutex()
+    private let values: Array<Int64>
+    private var index: Int64 = 0
+
+    public init(values: Array<Int64>) {
+        this.values = values
+    }
+
+    public func next(): Int64 {
+        synchronized(this.lock) {
+            let current = this.index
+            this.index += 1
+            let valueIndex = if (current >= 0 && current < this.values.size) { current } else { this.values.size - 1 }
+            this.values[valueIndex]
+        }
+    }
+
+    public func calls(): Int64 {
+        synchronized(this.lock) { this.index }
+    }
+}
+
+private class GatewayMemoryFailingManagedHeapProbe {
+    public func next(): (Int64, Int64) {
+        throw Exception("synthetic managed heap failure Authorization: Bearer must-not-leak")
+    }
+}
+
+private class GatewayMemoryFailingPhysicalProbe {
+    public func next(): Int64 {
+        throw Exception("synthetic physical failure /private/must-not-leak")
     }
 }
 
@@ -302,6 +363,155 @@ private func gatewayMemoryTestCleanup(
 @Test
 public class GatewayProcessMemoryTest {
     @TestCase
+    public func oomS0U1ManagedHeapAndPhysicalSnapshotsRecordIndependentDeltas(): Unit {
+        let oldHome = getVariable("METIS_HOME")
+        let oldFile = getVariable("METIS_LOG_FILE")
+        let oldLevel = getVariable("METIS_LOG_LEVEL")
+        let oldConsoleLevel = getVariable("METIS_CONSOLE_LEVEL")
+        let home = gatewayMemoryTestHome("oom-s0-u1")
+        let file = home.join("memory.log")
+        let managed = GatewayMemoryManagedHeapProbe(
+            [2147483648, 2147483648, 2147483648],
+            [536870912, 805306368, 1073741824]
+        )
+        let physical = GatewayMemoryPhysicalProbe([805306368, 1073741824, 1342177280])
+        try {
+            gatewayMemoryTestSetup(home, file)
+            setGatewayProcessRssProviderForTest(Some({ => 4096 }))
+            setGatewayManagedHeapProviderForTest(Some({ => managed.next() }))
+            setGatewayProcessPhysicalProviderForTest(Some({ => physical.next() }))
+            let observation = gatewayBeginMemoryObservation("session-hash", channel: "gitcode")
+            @Expect(gatewayObserveMemoryStage(observation, "turn_enter"), true)
+            @Expect(gatewayObserveMemoryStage(observation, "history_loaded"), true)
+            let rows = gatewayMemoryTestRows(file)
+            @Expect(rows.size, 2)
+            @Expect(rows[0].get("maxHeapBytes").getOrThrow().asInt().getValue(), 2147483648)
+            @Expect(rows[0].get("managedHeapUsedBytes").getOrThrow().asInt().getValue(), 536870912)
+            @Expect(rows[0].get("managedHeapAvailableBytes").getOrThrow().asInt().getValue(), 1610612736)
+            @Expect(rows[0].get("managedHeapUsedPercent").getOrThrow().asInt().getValue(), 25)
+            @Expect(rows[0].get("managedHeapStatus").getOrThrow().asString().getValue(), "ok")
+            @Expect(rows[0].get("managedHeapDeltaBytes").getOrThrow().asInt().getValue(), 0)
+            @Expect(rows[0].get("processPhysicalBytes").getOrThrow().asInt().getValue(), 805306368)
+            @Expect(rows[0].get("processPhysicalStatus").getOrThrow().asString().getValue(), "ok")
+            @Expect(rows[0].get("processPhysicalDeltaBytes").getOrThrow().asInt().getValue(), 0)
+            @Expect(rows[1].get("managedHeapUsedBytes").getOrThrow().asInt().getValue(), 805306368)
+            @Expect(rows[1].get("managedHeapDeltaBytes").getOrThrow().asInt().getValue(), 268435456)
+            @Expect(rows[1].get("processPhysicalDeltaBytes").getOrThrow().asInt().getValue(), 268435456)
+            @Expect(gatewayFinishMemoryObservation(observation), true)
+            @Expect(managed.calls(), 4)
+            @Expect(physical.calls(), 4)
+        } finally {
+            gatewayMemoryTestCleanup(home, oldHome, oldFile, oldLevel, oldConsoleLevel)
+        }
+    }
+
+    @TestCase
+    public func oomS0B1PhysicalMayExceedMaxWithoutChangingManagedTruth(): Unit {
+        resetGatewayMemoryObservationForTest()
+        try {
+            setGatewayManagedHeapProviderForTest(Some({ => (2147483648, 2147483648) }))
+            setGatewayProcessPhysicalProviderForTest(Some({ => 3221225472 }))
+            let full = gatewayRuntimeHeapSnapshot()
+            @Expect(full.managedHeapStatus, "ok")
+            @Expect(full.managedHeapAvailableBytes, 0)
+            @Expect(full.managedHeapUsedPercent, 100)
+            @Expect(full.processPhysicalStatus, "ok")
+            @Expect(full.processPhysicalBytes, 3221225472)
+
+            setGatewayManagedHeapProviderForTest(Some({ => (9223372036854775807, 9223372036854775807) }))
+            let maxBoundary = gatewayRuntimeHeapSnapshot()
+            @Expect(maxBoundary.managedHeapStatus, "ok")
+            @Expect(maxBoundary.managedHeapAvailableBytes, 0)
+            @Expect(maxBoundary.managedHeapUsedPercent, 100)
+
+            setGatewayManagedHeapProviderForTest(Some({ => (1024, 1025) }))
+            let invalid = gatewayRuntimeHeapSnapshot()
+            @Expect(invalid.managedHeapStatus, "unavailable")
+            @Expect(invalid.maxHeapBytes, -1)
+            @Expect(invalid.managedHeapUsedBytes, -1)
+            @Expect(invalid.managedHeapAvailableBytes, -1)
+            @Expect(invalid.processPhysicalStatus, "ok")
+            @Expect(invalid.processPhysicalBytes, 3221225472)
+        } finally {
+            resetGatewayMemoryObservationForTest()
+        }
+    }
+
+    @TestCase
+    public func oomS0N1ManagedAndPhysicalProviderFailuresStayIndependentAndRedacted(): Unit {
+        let oldHome = getVariable("METIS_HOME")
+        let oldFile = getVariable("METIS_LOG_FILE")
+        let oldLevel = getVariable("METIS_LOG_LEVEL")
+        let oldConsoleLevel = getVariable("METIS_CONSOLE_LEVEL")
+        let home = gatewayMemoryTestHome("oom-s0-n1")
+        let file = home.join("memory.log")
+        try {
+            gatewayMemoryTestSetup(home, file)
+            let failingManaged = GatewayMemoryFailingManagedHeapProbe()
+            setGatewayManagedHeapProviderForTest(Some({ => failingManaged.next() }))
+            setGatewayProcessPhysicalProviderForTest(Some({ => 4096 }))
+            let managedUnavailable = gatewayRuntimeHeapSnapshot()
+            @Expect(managedUnavailable.managedHeapStatus, "unavailable")
+            @Expect(managedUnavailable.processPhysicalStatus, "ok")
+
+            let failingPhysical = GatewayMemoryFailingPhysicalProbe()
+            setGatewayManagedHeapProviderForTest(Some({ => (8192, 2048) }))
+            setGatewayProcessPhysicalProviderForTest(Some({ => failingPhysical.next() }))
+            let physicalUnavailable = gatewayRuntimeHeapSnapshot()
+            @Expect(physicalUnavailable.managedHeapStatus, "ok")
+            @Expect(physicalUnavailable.managedHeapAvailableBytes, 6144)
+            @Expect(physicalUnavailable.processPhysicalStatus, "unavailable")
+
+            let observation = gatewayBeginMemoryObservation("redacted-session")
+            @Expect(gatewayObserveMemoryStage(observation, "turn_enter"), true)
+            @Expect(gatewayFinishMemoryObservation(observation), true)
+            let raw = try { String.fromUtf8(File.readFrom(file)) } catch (_: Exception) { "" }
+            @Expect(raw.contains("must-not-leak"), false)
+            @Expect(raw.contains("Authorization"), false)
+            @Expect(raw.contains("/private/"), false)
+        } finally {
+            gatewayMemoryTestCleanup(home, oldHome, oldFile, oldLevel, oldConsoleLevel)
+        }
+    }
+
+    @TestCase
+    public func oomS0H1RuntimeHeapLifecycleRowsStayFileOnly(): Unit {
+        let oldHome = getVariable("METIS_HOME")
+        let oldFile = getVariable("METIS_LOG_FILE")
+        let oldLevel = getVariable("METIS_LOG_LEVEL")
+        let oldConsoleLevel = getVariable("METIS_CONSOLE_LEVEL")
+        let home = gatewayMemoryTestHome("oom-s0-h1")
+        let file = home.join("memory.log")
+        try {
+            gatewayMemoryTestSetup(home, file)
+            setVariable("METIS_CONSOLE_LEVEL", "debug")
+            gatewayLoggingResetForTest()
+            gatewayLoggingCaptureConsoleForTest()
+            setGatewayProcessRssProviderForTest(Some({ => 4096 }))
+            setGatewayManagedHeapProviderForTest(Some({ => (2147483648, 536870912) }))
+            setGatewayProcessPhysicalProviderForTest(Some({ => 805306368 }))
+            for (scope in [
+                "serve:startup_begin",
+                "serve:gateway_start_before",
+                "serve:gateway_start_after",
+                "serve:ready",
+                "serve:stop_begin"
+            ]) {
+                gatewayLogProcessMemory(scope)
+            }
+            @Expect(gatewayLoggingCapturedConsoleForTest().size, 0)
+            let rows = gatewayMemoryTestRows(file)
+            @Expect(rows.size, 5)
+            for (i in 0..rows.size) {
+                @Expect(rows[i].get("managedHeapStatus").getOrThrow().asString().getValue(), "ok")
+                @Expect(rows[i].get("processPhysicalStatus").getOrThrow().asString().getValue(), "ok")
+            }
+        } finally {
+            gatewayMemoryTestCleanup(home, oldHome, oldFile, oldLevel, oldConsoleLevel)
+        }
+    }
+
+    @TestCase
     public func s0U1ObservationRecordsRssDeltaAndStableSequence(): Unit {
         let oldHome = getVariable("METIS_HOME")
         let oldFile = getVariable("METIS_LOG_FILE")
@@ -505,9 +715,13 @@ public class GatewayProcessMemoryTest {
         let home = gatewayMemoryTestHome("s3-u1")
         let file = home.join("memory.log")
         let probe = GatewayMemoryRssProbe([4096])
+        let managed = GatewayMemoryManagedHeapProbe([2147483648], [536870912])
+        let physical = GatewayMemoryPhysicalProbe([805306368])
         try {
             gatewayMemoryTestSetup(home, file)
             setGatewayProcessRssProviderForTest(Some({ => probe.next() }))
+            setGatewayManagedHeapProviderForTest(Some({ => managed.next() }))
+            setGatewayProcessPhysicalProviderForTest(Some({ => physical.next() }))
             for (i in 1..=100) {
                 let observation = gatewayBeginMemoryObservation("session-hash-${i}", channel: "gitcode", model: "fake")
                 let _ = gatewayObserveMemoryStage(observation, "turn_enter")
@@ -537,6 +751,8 @@ public class GatewayProcessMemoryTest {
                 } else if (row.get("level").getOrThrow().asString().getValue() == "info") {
                     infoRows += 1
                 }
+                @Expect(row.get("managedHeapStatus").getOrThrow().asString().getValue(), "ok")
+                @Expect(row.get("processPhysicalStatus").getOrThrow().asString().getValue(), "ok")
                 sampledSequences.add(row.get("turnSequence").getOrThrow().asInt().getValue())
             }
             @Expect(sampledSequences.size, 23)
@@ -544,6 +760,8 @@ public class GatewayProcessMemoryTest {
             @Expect(infoRows, 23)
             @Expect(rows.size, 23 * 10)
             @Expect(probe.calls(), 207)
+            @Expect(managed.calls(), 23 * 10)
+            @Expect(physical.calls(), 23 * 10)
             let counters = gatewayMemoryObservationCountersForTest()
             @Expect(counters[0], 100)
             @Expect(counters[1], 0)

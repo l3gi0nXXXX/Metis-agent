@@ -2,6 +2,7 @@ package metis.gateway.core
 
 import std.convert.Parsable
 import std.process.executeWithOutput
+import std.runtime.{getAllocatedHeapSize, getMaxHeapSize, getUsedHeapSize}
 import std.sync.Mutex
 import std.time.MonoTime
 import stdx.encoding.json.{JsonInt, JsonObject}
@@ -12,6 +13,36 @@ private var gatewayMemoryObservationNextSequence: Int64 = 0
 private var gatewayMemoryObservationActiveTurns: Int64 = 0
 private var gatewayMemoryObservationCompletedTurns: Int64 = 0
 private var gatewayProcessRssProviderForTest: Option<() -> Int64> = None<() -> Int64>
+private var gatewayManagedHeapProviderForTest: Option<() -> (Int64, Int64)> = None<() -> (Int64, Int64)>
+private var gatewayProcessPhysicalProviderForTest: Option<() -> Int64> = None<() -> Int64>
+
+public class GatewayRuntimeHeapSnapshot {
+    public let maxHeapBytes: Int64
+    public let managedHeapUsedBytes: Int64
+    public let managedHeapAvailableBytes: Int64
+    public let managedHeapUsedPercent: Int64
+    public let managedHeapStatus: String
+    public let processPhysicalBytes: Int64
+    public let processPhysicalStatus: String
+
+    public init(
+        maxHeapBytes: Int64,
+        managedHeapUsedBytes: Int64,
+        managedHeapAvailableBytes: Int64,
+        managedHeapUsedPercent: Int64,
+        managedHeapStatus: String,
+        processPhysicalBytes: Int64,
+        processPhysicalStatus: String
+    ) {
+        this.maxHeapBytes = maxHeapBytes
+        this.managedHeapUsedBytes = managedHeapUsedBytes
+        this.managedHeapAvailableBytes = managedHeapAvailableBytes
+        this.managedHeapUsedPercent = managedHeapUsedPercent
+        this.managedHeapStatus = managedHeapStatus
+        this.processPhysicalBytes = processPhysicalBytes
+        this.processPhysicalStatus = processPhysicalStatus
+    }
+}
 
 public class GatewayMemoryObservation {
     public let turnSequence: Int64
@@ -26,6 +57,8 @@ public class GatewayMemoryObservation {
     private var baselineRssKb: Int64 = -1
     private var peakRssKb: Int64 = -1
     private var lastRssKb: Int64 = -1
+    private var baselineManagedHeapUsedBytes: Int64 = -1
+    private var baselineProcessPhysicalBytes: Int64 = -1
     private var finished: Bool = false
 
     public init(
@@ -65,6 +98,26 @@ public class GatewayMemoryObservation {
     public func memorySnapshot(): (Int64, Int64, Int64) {
         synchronized(this.stateLock) {
             (this.baselineRssKb, this.peakRssKb, this.lastRssKb)
+        }
+    }
+
+    public func recordHeap(snapshot: GatewayRuntimeHeapSnapshot): (Int64, Int64) {
+        synchronized(this.stateLock) {
+            var managedDelta: Int64 = -1
+            var physicalDelta: Int64 = -1
+            if (snapshot.managedHeapStatus == "ok") {
+                if (this.baselineManagedHeapUsedBytes < 0) {
+                    this.baselineManagedHeapUsedBytes = snapshot.managedHeapUsedBytes
+                }
+                managedDelta = snapshot.managedHeapUsedBytes - this.baselineManagedHeapUsedBytes
+            }
+            if (snapshot.processPhysicalStatus == "ok") {
+                if (this.baselineProcessPhysicalBytes < 0) {
+                    this.baselineProcessPhysicalBytes = snapshot.processPhysicalBytes
+                }
+                physicalDelta = snapshot.processPhysicalBytes - this.baselineProcessPhysicalBytes
+            }
+            (managedDelta, physicalDelta)
         }
     }
 
@@ -122,6 +175,9 @@ private func gatewayMemoryObservationMeta(
     rssKb: Int64,
     rssDeltaKb: Int64,
     peakRssKb: Int64,
+    heap: GatewayRuntimeHeapSnapshot,
+    managedHeapDeltaBytes: Int64,
+    processPhysicalDeltaBytes: Int64,
     activeTurns: Int64,
     completedTurns: Int64,
     status: String,
@@ -141,6 +197,15 @@ private func gatewayMemoryObservationMeta(
         .int("rssKb", rssKb)
         .int("rssDeltaKb", rssDeltaKb)
         .int("peakRssKb", peakRssKb)
+        .int("maxHeapBytes", heap.maxHeapBytes)
+        .int("managedHeapUsedBytes", heap.managedHeapUsedBytes)
+        .int("managedHeapAvailableBytes", heap.managedHeapAvailableBytes)
+        .int("managedHeapUsedPercent", heap.managedHeapUsedPercent)
+        .string("managedHeapStatus", heap.managedHeapStatus)
+        .int("managedHeapDeltaBytes", managedHeapDeltaBytes)
+        .int("processPhysicalBytes", heap.processPhysicalBytes)
+        .string("processPhysicalStatus", heap.processPhysicalStatus)
+        .int("processPhysicalDeltaBytes", processPhysicalDeltaBytes)
         .int("elapsedMs", gatewayMemoryObservationNowMs() - observation.startedAtMs)
         .int("activeTurns", activeTurns)
         .int("completedTurns", completedTurns)
@@ -159,12 +224,75 @@ public func setGatewayProcessRssProviderForTest(provider: Option<() -> Int64>): 
     }
 }
 
+public func setGatewayManagedHeapProviderForTest(provider: Option<() -> (Int64, Int64)>): Unit {
+    synchronized(gatewayMemoryObservationStateLock) {
+        gatewayManagedHeapProviderForTest = provider
+    }
+}
+
+public func setGatewayProcessPhysicalProviderForTest(provider: Option<() -> Int64>): Unit {
+    synchronized(gatewayMemoryObservationStateLock) {
+        gatewayProcessPhysicalProviderForTest = provider
+    }
+}
+
+public func gatewayRuntimeHeapSnapshot(): GatewayRuntimeHeapSnapshot {
+    let providers = synchronized(gatewayMemoryObservationStateLock) {
+        (gatewayManagedHeapProviderForTest, gatewayProcessPhysicalProviderForTest)
+    }
+    var maxHeapBytes: Int64 = -1
+    var managedHeapUsedBytes: Int64 = -1
+    var managedHeapAvailableBytes: Int64 = -1
+    var managedHeapUsedPercent: Int64 = -1
+    var managedHeapStatus = "unavailable"
+    try {
+        let managed = match (providers[0]) {
+            case Some(provider) => provider()
+            case None => (getMaxHeapSize(), getAllocatedHeapSize())
+        }
+        if (managed[0] > 0 && managed[1] >= 0 && managed[1] <= managed[0]) {
+            maxHeapBytes = managed[0]
+            managedHeapUsedBytes = managed[1]
+            managedHeapAvailableBytes = managed[0] - managed[1]
+            managedHeapUsedPercent = Int64(Float64(managed[1]) * 100.0 / Float64(managed[0]))
+            managedHeapStatus = "ok"
+        }
+    } catch (_: Exception) {
+        ()
+    }
+    var processPhysicalBytes: Int64 = -1
+    var processPhysicalStatus = "unavailable"
+    try {
+        let physical = match (providers[1]) {
+            case Some(provider) => provider()
+            case None => getUsedHeapSize()
+        }
+        if (physical >= 0) {
+            processPhysicalBytes = physical
+            processPhysicalStatus = "ok"
+        }
+    } catch (_: Exception) {
+        ()
+    }
+    GatewayRuntimeHeapSnapshot(
+        maxHeapBytes,
+        managedHeapUsedBytes,
+        managedHeapAvailableBytes,
+        managedHeapUsedPercent,
+        managedHeapStatus,
+        processPhysicalBytes,
+        processPhysicalStatus
+    )
+}
+
 public func resetGatewayMemoryObservationForTest(): Unit {
     synchronized(gatewayMemoryObservationStateLock) {
         gatewayMemoryObservationNextSequence = 0
         gatewayMemoryObservationActiveTurns = 0
         gatewayMemoryObservationCompletedTurns = 0
         gatewayProcessRssProviderForTest = None<() -> Int64>
+        gatewayManagedHeapProviderForTest = None<() -> (Int64, Int64)>
+        gatewayProcessPhysicalProviderForTest = None<() -> Int64>
     }
 }
 
@@ -222,6 +350,8 @@ private func gatewayObserveMemoryStageInternal(
     }
     let rssKb = gatewayProcessResidentSetKb()
     let rss = observation.recordRss(rssKb)
+    let heap = gatewayRuntimeHeapSnapshot()
+    let heapDelta = observation.recordHeap(heap)
     let counters = gatewayMemoryObservationCounters()
     let subsystem = if (normalizedStage == "service_plugin_turn_released") {
         "gateway/service-plugin"
@@ -238,6 +368,9 @@ private func gatewayObserveMemoryStageInternal(
             rssKb,
             rss[1],
             rss[2],
+            heap,
+            heapDelta[0],
+            heapDelta[1],
             counters[1],
             counters[2],
             status,
@@ -286,12 +419,17 @@ public func gatewayFinishMemoryObservation(
     }
     if (observation.sampled || forceFailureTerminal) {
         let rss = observation.memorySnapshot()
+        let heap = gatewayRuntimeHeapSnapshot()
+        let heapDelta = observation.recordHeap(heap)
         let summary = gatewayMemoryObservationMeta(
             observation,
             "turn_summary",
             rss[2],
             if (rss[2] >= 0 && rss[0] >= 0) { rss[2] - rss[0] } else { -1 },
             rss[1],
+            heap,
+            heapDelta[0],
+            heapDelta[1],
             counters[0],
             counters[1],
             status,
@@ -322,6 +460,7 @@ public func gatewayLogServicePluginTurnReleased(
         return false
     }
     let rssKb = gatewayProcessResidentSetKb()
+    let heap = gatewayRuntimeHeapSnapshot()
     let counters = gatewayMemoryObservationCounters()
     let row = gatewayLogMeta()
     for (key in meta.getFields().keys()) {
@@ -336,6 +475,15 @@ public func gatewayLogServicePluginTurnReleased(
         .int("rssKb", rssKb)
         .int("rssDeltaKb", if (rssKb >= 0 && baselineRssKb >= 0) { rssKb - baselineRssKb } else { -1 })
         .int("peakRssKb", -1)
+        .int("maxHeapBytes", heap.maxHeapBytes)
+        .int("managedHeapUsedBytes", heap.managedHeapUsedBytes)
+        .int("managedHeapAvailableBytes", heap.managedHeapAvailableBytes)
+        .int("managedHeapUsedPercent", heap.managedHeapUsedPercent)
+        .string("managedHeapStatus", heap.managedHeapStatus)
+        .int("managedHeapDeltaBytes", -1)
+        .int("processPhysicalBytes", heap.processPhysicalBytes)
+        .string("processPhysicalStatus", heap.processPhysicalStatus)
+        .int("processPhysicalDeltaBytes", -1)
         .int("elapsedMs", -1)
         .int("activeTurns", counters[1])
         .int("completedTurns", counters[2])
@@ -413,7 +561,8 @@ public func gatewayProcessResidentSetKb(): Int64 {
 public func gatewayLogProcessMemory(scope: String, note!: String = ""): Unit {
     let pid = gatewayProcessCurrentPid()
     let rssKb = gatewayProcessResidentSetKb()
-    gatewayLogEventInfo(
+    let heap = gatewayRuntimeHeapSnapshot()
+    gatewayLogEventInfoFileOnly(
         "gateway/runtime",
         "process.memory",
         "gateway process memory snapshot",
@@ -421,6 +570,15 @@ public func gatewayLogProcessMemory(scope: String, note!: String = ""): Unit {
             .string("scope", scope)
             .int("pid", pid)
             .int("rssKb", rssKb)
+            .int("maxHeapBytes", heap.maxHeapBytes)
+            .int("managedHeapUsedBytes", heap.managedHeapUsedBytes)
+            .int("managedHeapAvailableBytes", heap.managedHeapAvailableBytes)
+            .int("managedHeapUsedPercent", heap.managedHeapUsedPercent)
+            .string("managedHeapStatus", heap.managedHeapStatus)
+            .int("managedHeapDeltaBytes", -1)
+            .int("processPhysicalBytes", heap.processPhysicalBytes)
+            .string("processPhysicalStatus", heap.processPhysicalStatus)
+            .int("processPhysicalDeltaBytes", -1)
             .rawString("note", note.trimAscii())
             .object()
     )

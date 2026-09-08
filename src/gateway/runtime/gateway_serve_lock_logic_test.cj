@@ -1703,6 +1703,38 @@ public class GatewayServeLockLogicTest {
     }
 
     @TestCase
+    public func oomS0H1RuntimeHeapLifecycleScopesAreOrdered(): Unit {
+        let project = Path(managedStdioResolveBrokerScriptPath()).parent.parent
+        let source = try {
+            String.fromUtf8(File.readFrom(project.join("src").join("gateway").join("runtime").join("demo.cj")))
+        } catch (_: Exception) {
+            ""
+        }
+        @Expect(source.isEmpty(), false)
+        if (source.isEmpty()) { return }
+        let startup = source.indexOf("gatewayLogProcessMemory(\"serve:startup_begin\")")
+        let before = source.indexOf("gatewayLogProcessMemory(\"serve:gateway_start_before\")")
+        let startCall = source.indexOf("        gateway.start()\n        gatewayLogProcessMemory(\"serve:gateway_start_after\")")
+        let after = source.indexOf("gatewayLogProcessMemory(\"serve:gateway_start_after\")")
+        let ready = source.indexOf("gatewayLogProcessMemory(\"serve:ready\")")
+        let stop = source.indexOf("gatewayLogProcessMemory(\"serve:stop_begin\")")
+        @Expect(startup.isSome(), true)
+        @Expect(before.isSome(), true)
+        @Expect(startCall.isSome(), true)
+        @Expect(after.isSome(), true)
+        @Expect(ready.isSome(), true)
+        @Expect(stop.isSome(), true)
+        if (startup.isNone() || before.isNone() || startCall.isNone() || after.isNone() || ready.isNone() || stop.isNone()) {
+            return
+        }
+        @Expect(startup.getOrThrow() < before.getOrThrow(), true)
+        @Expect(before.getOrThrow() < startCall.getOrThrow(), true)
+        @Expect(startCall.getOrThrow() < after.getOrThrow(), true)
+        @Expect(after.getOrThrow() < ready.getOrThrow(), true)
+        @Expect(ready.getOrThrow() < stop.getOrThrow(), true)
+    }
+
+    @TestCase
     public func hbBrN6ShutdownPhaseMarkersPreserveSurfaceOrderAndIdentity(): Unit {
         withGatewayHeartbeatProbeEnvironment("hb-br-n6-phase", {root, _bin =>
             let instance = currentProcessInstanceIdentity()
