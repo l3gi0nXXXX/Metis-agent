@@ -1483,8 +1483,11 @@ public class ServicePluginHostTest {
                 }
             } finally {
                 resetServicePluginHostForTest()
-                @Expect(managedStdioBroker().snapshot().ownerCount, 0)
+                let settled = this.settleServiceOwnerCleanup("gitcode-monitor", timeoutMillis: 3000)
+                @Expect(settled[2], true)
+                @Expect(settled[3], true)
                 @Expect(servicePluginCleanupPendingCountForTest(), 0)
+                @Expect(managedStdioBroker().snapshot().ownerCount, 0)
             }
         })
     }

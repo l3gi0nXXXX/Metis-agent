@@ -600,10 +600,29 @@ public class GatewayControlUiWsTest {
 
     @TestCase
     public func sessionStoreFallsBackToUnifiedAgentResolution(): Unit {
-        let user = GatewayUserSettings()
-        let store = gatewayControlUiWsStoreForSessionKey("agent:general:main")
-        let generalStore = gatewaySessionStoreForUserWithAgentId(user, "general")
-        @Expect(store.sessionsRoot().toString(), generalStore.sessionsRoot().toString())
+        let realStore = gatewaySessionStoreForUserWithAgentId(GatewayUserSettings(), "general")
+        let realRoot = realStore.sessionsRoot().toString()
+        let realIndex = realStore.sessionsRoot().join("sessions.json")
+        let realIndexExisted = exists(realIndex)
+        let realIndexSize = try { FileInfo(realIndex).size } catch (_: Exception) { -1 }
+        let realIndexModifiedAt = try {
+            FileInfo(realIndex).lastModificationTime.toUnixTimeStamp().toMilliseconds()
+        } catch (_: Exception) {
+            -1
+        }
+        withGatewayControlUiWsTestHome {
+            let user = GatewayUserSettings()
+            let store = gatewayControlUiWsStoreForSessionKey("agent:general:main")
+            let generalStore = gatewaySessionStoreForUserWithAgentId(user, "general")
+            @Expect(store.sessionsRoot().toString(), generalStore.sessionsRoot().toString())
+            @Expect(store.sessionsRoot().toString() == realRoot, false)
+        }
+        @Expect(exists(realIndex), realIndexExisted)
+        @Expect(try { FileInfo(realIndex).size } catch (_: Exception) { -1 }, realIndexSize)
+        @Expect(
+            try { FileInfo(realIndex).lastModificationTime.toUnixTimeStamp().toMilliseconds() } catch (_: Exception) { -1 },
+            realIndexModifiedAt
+        )
     }
 
     @TestCase
