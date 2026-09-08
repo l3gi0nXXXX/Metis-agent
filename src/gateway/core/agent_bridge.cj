@@ -1087,10 +1087,16 @@ private func gatewayLogModelTiming(
 private func buildGatewayModelInput(
     history: Array<String>,
     latestUserPrompt: String,
-    availableSkillsMeta: String
+    availableSkillsMeta: String,
+    historyEndExclusive!: Int64 = -1,
+    maxHistoryEntries!: Int64 = 12
 ): String {
-    let maxHistory = 12
-    let start = max(0, history.size - maxHistory)
+    let end = if (historyEndExclusive < 0) {
+        Int64(history.size)
+    } else {
+        max(0, min(historyEndExclusive, Int64(history.size)))
+    }
+    let start = max(0, end - max(0, maxHistoryEntries))
     let sb = StringBuilder()
     let skMeta = availableSkillsMeta.trimAscii()
     if (!skMeta.isEmpty()) {
@@ -1099,7 +1105,7 @@ private func buildGatewayModelInput(
         sb.append("\n</skills>\n")
     }
     sb.append("<history>\n")
-    for (i in start..history.size) {
+    for (i in start..end) {
         let line = history[i].trimAscii()
         if (!line.isEmpty()) {
             sb.append(line)
@@ -1113,6 +1119,41 @@ private func buildGatewayModelInput(
         sb.append("\nUse <skills> only to decide whether to read the listed SKILL.md path. Do not invent unlisted skill paths.")
     }
     sb.toString()
+}
+
+private const GATEWAY_AGENT_RESIDENT_HISTORY_MAX_ENTRIES: Int64 = 12
+private const GATEWAY_AGENT_RESIDENT_HISTORY_MAX_BYTES: Int64 = 512 * 1024
+
+private func gatewayAgentResidentHistoryBytes(history: ArrayList<String>): Int64 {
+    var total: Int64 = 0
+    for (line in history) {
+        total += Int64(line.size)
+    }
+    total
+}
+
+private func gatewayAgentRetainHistoryLine(history: ArrayList<String>, line: String): Bool {
+    let lineBytes = Int64(line.size)
+    if (lineBytes > GATEWAY_AGENT_RESIDENT_HISTORY_MAX_BYTES) {
+        return false
+    }
+    var retainedBytes = gatewayAgentResidentHistoryBytes(history)
+    while (!history.isEmpty() &&
+        (Int64(history.size) >= GATEWAY_AGENT_RESIDENT_HISTORY_MAX_ENTRIES ||
+            retainedBytes + lineBytes > GATEWAY_AGENT_RESIDENT_HISTORY_MAX_BYTES)) {
+        let removed = history.remove(at: 0)
+        retainedBytes = max(0, retainedBytes - Int64(removed.size))
+    }
+    history.add(line)
+    true
+}
+
+private func gatewayAgentRecentHistory(store: GatewaySessionStore, conversationKey: String): ArrayList<String> {
+    let history = ArrayList<String>()
+    for (line in store.loadRecentHistoryLines(conversationKey, GATEWAY_AGENT_RESIDENT_HISTORY_MAX_ENTRIES).lines) {
+        let _ = gatewayAgentRetainHistoryLine(history, line)
+    }
+    history
 }
 
 /**
@@ -1170,10 +1211,10 @@ public class AgentBridge {
         let fallback = safeFallbackTextForBlockedAssistantReply(outcome.diagnosticCode)
         synchronized(this.replyLock) {
             if (!this.historyByConversation.contains(conversationKey)) {
-                this.historyByConversation[conversationKey] = this.sessionStore.loadHistoryLines(conversationKey)
+                this.historyByConversation[conversationKey] = gatewayAgentRecentHistory(this.sessionStore, conversationKey)
             }
             let history = this.historyByConversation.get(conversationKey).getOrThrow()
-            history.add("assistant: ${fallback}")
+            let _ = gatewayAgentRetainHistoryLine(history, "assistant: ${fallback}")
             this.sessionStore.appendAssistant(conversationKey, fallback)
         }
         fallback
@@ -1274,8 +1315,7 @@ public class AgentBridge {
                 meta: gatewayLogMeta().int("promptChars", Int64(prompt.size)).object()
             )
             if (!this.historyByConversation.contains(conversationKey)) {
-                let loaded = this.sessionStore.loadHistoryLines(conversationKey)
-                this.historyByConversation[conversationKey] = loaded
+                this.historyByConversation[conversationKey] = gatewayAgentRecentHistory(this.sessionStore, conversationKey)
             }
             let history = this.historyByConversation.get(conversationKey).getOrThrow()
             var historyChars: Int64 = -1
@@ -1300,7 +1340,7 @@ public class AgentBridge {
                     .int("sessionsIndexBytes", loadedFootprint.sessionsIndexBytes)
                     .object()
             )
-            history.add("user: ${prompt}")
+            let currentUserResident = gatewayAgentRetainHistoryLine(history, "user: ${prompt}")
             this.sessionStore.appendUser(conversationKey, prompt)
             match (gatewayAgentBridgeFinalReplySequenceForTest) {
                 case Some(fixture) =>
@@ -1314,7 +1354,7 @@ public class AgentBridge {
                         toolExecutionObserved: fixture[2]
                     )
                     if (outcome.status == "valid_text") {
-                        history.add("assistant: ${outcome.text}")
+                        let _ = gatewayAgentRetainHistoryLine(history, "assistant: ${outcome.text}")
                         this.sessionStore.appendAssistant(conversationKey, outcome.text)
                     }
                     memoryStatus = "success"
@@ -1453,10 +1493,13 @@ public class AgentBridge {
             )
             let preCallStartedAtMs = DateTime.now().toUnixTimeStamp().toMilliseconds()
 
+            let currentUserEntries: Int64 = if (currentUserResident) { 1 } else { 0 }
             let modelInput = this.buildModelInput(
                 history.toArray(),
                 effectivePrompt,
-                availableSkillsMeta
+                availableSkillsMeta,
+                historyEndExclusive: Int64(history.size) - currentUserEntries,
+                maxHistoryEntries: 11
             )
             let gatewayUser = CliSettingManager.readGatewaySettings()
             let _ = gatewayLogReplyMemory(
@@ -1818,7 +1861,7 @@ public class AgentBridge {
                 existingContext: "${modelInput}\n\n已完成工具结果：\n${correctionToolContext}\n\n模型首次输出：\n${answer}"
             )
             if (outcome.status == "valid_text") {
-                history.add("assistant: ${outcome.text}")
+                let _ = gatewayAgentRetainHistoryLine(history, "assistant: ${outcome.text}")
                 this.sessionStore.appendAssistant(
                     conversationKey,
                     outcome.text,
@@ -1869,10 +1912,22 @@ public class AgentBridge {
      */
     public func getHistory(conversationKey: String): Array<String> {
         synchronized(this.replyLock) {
+            if (this.sessionStore.isEnabled()) {
+                return this.sessionStore.loadHistoryLines(conversationKey).toArray()
+            }
             if (let Some(history) <- this.historyByConversation.get(conversationKey)) {
                 return history.toArray()
             }
-            return this.sessionStore.loadHistoryLines(conversationKey).toArray()
+            []
+        }
+    }
+
+    func residentHistoryTruthForTest(conversationKey: String): (Int64, Int64, Array<String>) {
+        synchronized(this.replyLock) {
+            match (this.historyByConversation.get(conversationKey)) {
+                case Some(history) => (Int64(history.size), gatewayAgentResidentHistoryBytes(history), history.toArray())
+                case None => (0, 0, [])
+            }
         }
     }
 
@@ -1883,9 +1938,17 @@ public class AgentBridge {
     private func buildModelInput(
         history: Array<String>,
         latestUserPrompt: String,
-        availableSkillsMeta: String
+        availableSkillsMeta: String,
+        historyEndExclusive!: Int64 = -1,
+        maxHistoryEntries!: Int64 = 12
     ): String {
-        buildGatewayModelInput(history, latestUserPrompt, availableSkillsMeta)
+        buildGatewayModelInput(
+            history,
+            latestUserPrompt,
+            availableSkillsMeta,
+            historyEndExclusive: historyEndExclusive,
+            maxHistoryEntries: maxHistoryEntries
+        )
     }
 
     private func resolveChannelBoundModelName(channelName: String, sessionKey!: String = ""): Option<String> {

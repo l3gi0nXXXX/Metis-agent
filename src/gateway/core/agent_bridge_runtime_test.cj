@@ -15,7 +15,7 @@ import metis.process.{managedStdioBroker, resetManagedStdioBrokerForTest}
 
 import std.collection.{ArrayList, HashMap}
 import std.env.{getVariable, setVariable}
-import std.fs.{Directory, File, Path, exists, remove}
+import std.fs.{Directory, File, OpenMode, Path, exists, remove}
 import std.process.executeWithOutput
 import std.sync.{AtomicBool, Condition, Mutex}
 import std.time.*
@@ -329,6 +329,39 @@ private class AgentBridgeCodexAppServerCapture {
     public var input: String = ""
 
     public init() {}
+}
+
+private class AgentBridgeA2ModelInputCapture {
+    public let inputs = ArrayList<String>()
+    public init() {}
+}
+
+private func agentBridgeA2HistoryRecord(role: String, text: String): String {
+    let row = JsonObject()
+    row.put("role", JsonString(role))
+    row.put("text", JsonString(text))
+    row.toJsonString() + "\n"
+}
+
+private func agentBridgeA2WriteHistory(path: Path, count: Int64, repeatedText!: String = ""): Unit {
+    try (file = File(path, OpenMode.Write)) {
+        for (index in 0..count) {
+            let text = if (repeatedText.isEmpty()) { "seed-${index}" } else { repeatedText }
+            file.write(agentBridgeA2HistoryRecord(if (index % 2 == 0) { "user" } else { "assistant" }, text).toArray())
+        }
+    }
+}
+
+private func agentBridgeA2RuntimeResult(text: String): GatewayCodexAppServerRuntimeResult {
+    GatewayCodexAppServerRuntimeResult(text, completed: true)
+}
+
+private func agentBridgeA2ResidentBytes(lines: Array<String>): Int64 {
+    var total: Int64 = 0
+    for (line in lines) {
+        total += Int64(line.size)
+    }
+    total
 }
 
 private class AgentBridgeCodexResponsesCapture {
@@ -815,6 +848,193 @@ public class AgentBridgeC0ContractTest {
 
 @Test
 public class AgentBridgeRuntimeTest {
+    @TestCase
+    public func s2A2U1InitialTenThousandHistoryUsesRecentResidentAndFullDiskHistory(): Unit {
+        withAgentBridgeTempHome("metis-s2-a2-u1", { home: Path =>
+            writeAgentBridgeCodexAppServerAgentConfig(home)
+            let context = gatewayResolveSessionContext(GatewaySessionRequest(
+                GatewayIngressSource.DashboardRpc, sessionHint: "s2-a2-u1", agentId: "codex"
+            ))
+            let store = GatewaySessionStore(home.join("sessions"), enabled: true, agentId: "codex")
+            Directory.create(store.sessionsRoot(), recursive: true)
+            agentBridgeA2WriteHistory(store.transcriptPath(context.sessionKey), 10000)
+            let capture = AgentBridgeA2ModelInputCapture()
+            setGatewayCodexAppServerRunnerForTest(Some({ request: GatewayCodexAppServerTurnRequest =>
+                capture.inputs.add(request.modelInput)
+                agentBridgeA2RuntimeResult("a2 regular answer")
+            }))
+            try {
+                let bridge = AgentBridge(sessionStore: store)
+                let outcome = bridge.replyWithOutcome(
+                    context.sessionKey,
+                    "a2-current-中文🙂",
+                    channelName: "dashboard",
+                    agentId: "codex",
+                    turnContext: Some(context.turnContext)
+                )
+                @Expect(outcome.status, "valid_text")
+                @Expect(capture.inputs.size, 1)
+                let modelInput = capture.inputs[0]
+                @Expect(modelInput.contains("seed-9988"), false)
+                @Expect(modelInput.contains("seed-9989"), true)
+                @Expect(modelInput.contains("seed-9999"), true)
+                @Expect(modelInput.split("a2-current-中文🙂").size, 2)
+                let resident = bridge.residentHistoryTruthForTest(context.sessionKey)
+                @Expect(resident[0], 12)
+                @Expect(resident[1], agentBridgeA2ResidentBytes(resident[2]))
+                @Expect(resident[1] <= 512 * 1024, true)
+                @Expect(resident[2][0], "user: seed-9990")
+                @Expect(resident[2][10], "user: a2-current-中文🙂")
+                @Expect(resident[2][11], "assistant: a2 regular answer")
+                let full = bridge.getHistory(context.sessionKey)
+                @Expect(full.size, 10002)
+                @Expect(full[0], "user: seed-0")
+                @Expect(full[10001], "assistant: a2 regular answer")
+            } finally {
+                setGatewayCodexAppServerRunnerForTest(None<(GatewayCodexAppServerTurnRequest) -> GatewayCodexAppServerRuntimeResult>)
+            }
+        })
+    }
+
+    @TestCase
+    public func s2A2B1RepeatedCurrentTextUsesAppendPositionAndDisabledHistoryStaysBounded(): Unit {
+        withAgentBridgeTempHome("metis-s2-a2-b1", { home: Path =>
+            writeAgentBridgeCodexAppServerAgentConfig(home)
+            let context = gatewayResolveSessionContext(GatewaySessionRequest(
+                GatewayIngressSource.DashboardRpc, sessionHint: "s2-a2-b1", agentId: "codex"
+            ))
+            let store = GatewaySessionStore(home.join("sessions"), enabled: true, agentId: "codex")
+            Directory.create(store.sessionsRoot(), recursive: true)
+            agentBridgeA2WriteHistory(store.transcriptPath(context.sessionKey), 12, repeatedText: "重复中文🙂")
+            let capture = AgentBridgeA2ModelInputCapture()
+            setGatewayCodexAppServerRunnerForTest(Some({ request: GatewayCodexAppServerTurnRequest =>
+                capture.inputs.add(request.modelInput)
+                agentBridgeA2RuntimeResult("boundary answer")
+            }))
+            try {
+                let bridge = AgentBridge(sessionStore: store)
+                @Expect(bridge.reply(context.sessionKey, "重复中文🙂", channelName: "dashboard", agentId: "codex",
+                    turnContext: Some(context.turnContext)), "boundary answer")
+                @Expect(capture.inputs.size, 1)
+                @Expect(capture.inputs[0].split("重复中文🙂").size, 13)
+                let enabledResident = bridge.residentHistoryTruthForTest(context.sessionKey)
+                @Expect(enabledResident[0], 12)
+                @Expect(enabledResident[1] <= 512 * 1024, true)
+                @Expect(bridge.getHistory(context.sessionKey).size, 14)
+            } finally {
+                setGatewayCodexAppServerRunnerForTest(None<(GatewayCodexAppServerTurnRequest) -> GatewayCodexAppServerRuntimeResult>)
+            }
+
+            let disabledKey = "agent:main:s2-a2-disabled"
+            let disabledBridge = AgentBridge(sessionStore: GatewaySessionStore(home.join("disabled"), enabled: false))
+            setGatewayAgentBridgeFinalReplySequenceForTest(Some((["fixture-answer"], [], false)))
+            try {
+                for (index in 0..8) {
+                    let outcome = disabledBridge.replyWithOutcome(disabledKey, "disabled-${index}-🙂")
+                    @Expect(outcome.status, "valid_text")
+                    let truth = disabledBridge.residentHistoryTruthForTest(disabledKey)
+                    @Expect(truth[0], min((index + 1) * 2, 12))
+                    @Expect(truth[1], agentBridgeA2ResidentBytes(truth[2]))
+                    @Expect(truth[1] <= 512 * 1024, true)
+                    @Expect(disabledBridge.getHistory(disabledKey), truth[2])
+                }
+            } finally {
+                setGatewayAgentBridgeFinalReplySequenceForTest(None<(Array<String>, Array<String>, Bool)>)
+            }
+        })
+    }
+
+    @TestCase
+    public func s2A2P1HugeUtf8EntriesPersistButNeverBecomeResident(): Unit {
+        withAgentBridgeTempHome("metis-s2-a2-p1", { home: Path =>
+            let key = "agent:main:s2-a2-p1"
+            let store = GatewaySessionStore(home.join("sessions"), enabled: true)
+            let bridge = AgentBridge(sessionStore: store)
+            let hugeUser = "用户🙂" + ("🙂" * 140000)
+            let hugeAssistant = "回复🙂" + ("🙂" * 140000)
+            @Expect(Int64("user: ${hugeUser}".size) > 512 * 1024, true)
+            @Expect(Int64("assistant: ${hugeAssistant}".size) > 512 * 1024, true)
+            setGatewayAgentBridgeFinalReplySequenceForTest(Some(([hugeAssistant], [], false)))
+            try {
+                let outcome = bridge.replyWithOutcome(key, hugeUser)
+                @Expect(outcome.status, "valid_text")
+                let resident = bridge.residentHistoryTruthForTest(key)
+                @Expect(resident[0], 0)
+                @Expect(resident[1], 0)
+                @Expect(resident[2], [])
+                let full = bridge.getHistory(key)
+                @Expect(full.size, 2)
+                @Expect(full[0], "user: ${hugeUser}")
+                @Expect(full[1], "assistant: ${hugeAssistant}")
+            } finally {
+                setGatewayAgentBridgeFinalReplySequenceForTest(None<(Array<String>, Array<String>, Bool)>)
+            }
+        })
+    }
+
+    @TestCase
+    public func s2A2N1MalformedFallbackAndThrowPathsKeepResidentTruthBounded(): Unit {
+        withAgentBridgeTempHome("metis-s2-a2-n1", { home: Path =>
+            writeAgentBridgeCodexAppServerAgentConfig(home)
+            let context = gatewayResolveSessionContext(GatewaySessionRequest(
+                GatewayIngressSource.DashboardRpc, sessionHint: "s2-a2-n1", agentId: "codex"
+            ))
+            let store = GatewaySessionStore(home.join("sessions"), enabled: true, agentId: "codex")
+            Directory.create(store.sessionsRoot(), recursive: true)
+            let transcript = store.transcriptPath(context.sessionKey)
+            try (file = File(transcript, OpenMode.Write)) {
+                file.write(agentBridgeA2HistoryRecord("system", "safe-system🙂").toArray())
+                file.write("{not-json}\n".toArray())
+                file.write("{\"role\":\"user\",\"text\":\"".toArray())
+                let invalidUtf8: Array<UInt8> = [0xFF]
+                file.write(invalidUtf8)
+                file.write("\"}\n".toArray())
+                file.write(agentBridgeA2HistoryRecord("custom", "x" * (256 * 1024 + 32)).toArray())
+                file.write(agentBridgeA2HistoryRecord("assistant", "safe-tail🙂").toArray())
+            }
+            let capture = AgentBridgeA2ModelInputCapture()
+            setGatewayCodexAppServerRunnerForTest(Some({ request: GatewayCodexAppServerTurnRequest =>
+                capture.inputs.add(request.modelInput)
+                throw Exception("a2-model-failure")
+            }))
+            let bridge = AgentBridge(sessionStore: store)
+            try {
+                var threw = false
+                try {
+                    let _ = bridge.replyWithOutcome(context.sessionKey, "throw-current🙂", channelName: "dashboard",
+                        agentId: "codex", turnContext: Some(context.turnContext))
+                } catch (_: Exception) {
+                    threw = true
+                }
+                @Expect(threw, true)
+                @Expect(capture.inputs.size, 1)
+                @Expect(capture.inputs[0].contains("safe-system🙂"), true)
+                @Expect(capture.inputs[0].contains("safe-tail🙂"), true)
+                @Expect(capture.inputs[0].contains("not-json"), false)
+                let throwTruth = bridge.residentHistoryTruthForTest(context.sessionKey)
+                @Expect(throwTruth[0], 3)
+                @Expect(throwTruth[1], agentBridgeA2ResidentBytes(throwTruth[2]))
+                @Expect(throwTruth[1] <= 512 * 1024, true)
+            } finally {
+                setGatewayCodexAppServerRunnerForTest(None<(GatewayCodexAppServerTurnRequest) -> GatewayCodexAppServerRuntimeResult>)
+            }
+
+            setGatewayAgentBridgeFinalReplySequenceForTest(Some(([""], [], false)))
+            try {
+                let fallback = bridge.reply(context.sessionKey, "fallback-current🙂")
+                @Expect(fallback.isEmpty(), false)
+                let fallbackTruth = bridge.residentHistoryTruthForTest(context.sessionKey)
+                @Expect(fallbackTruth[0], 5)
+                @Expect(fallbackTruth[1], agentBridgeA2ResidentBytes(fallbackTruth[2]))
+                @Expect(fallbackTruth[1] <= 512 * 1024, true)
+                @Expect(fallbackTruth[2][fallbackTruth[2].size - 2], "user: fallback-current🙂")
+                @Expect(fallbackTruth[2][fallbackTruth[2].size - 1], "assistant: ${fallback}")
+            } finally {
+                setGatewayAgentBridgeFinalReplySequenceForTest(None<(Array<String>, Array<String>, Bool)>)
+            }
+        })
+    }
+
     @TestCase
     public func s1U1ModelTurnEmitsOrderedMemoryStagesWithStableDelta(): Unit {
         withAgentBridgeTempHome("metis-s1-memory-u1", { home: Path =>
