@@ -25,6 +25,9 @@
   rawinput = { path="./ffi/" }
   signature_extractor = { path = "./ffi/" }
 
+[profile.run.env]
+  cjHeapSize = { value = "2GB", splice-type = "absent" }
+
 [target.x86_64-unknown-linux-gnu.bin-dependencies]
   path-option = ["${MAGIC_PATH}/libs/cangjie-stdx-linux-x64-1.0.0.1/linux_x86_64_llvm/dynamic/stdx"]
 

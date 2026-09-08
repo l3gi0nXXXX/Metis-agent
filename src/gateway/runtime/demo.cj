@@ -4,17 +4,98 @@ import metis.core.{gatewayClearSubagentNoticeDeliveryHook, gatewayClearSubagentN
 import metis.core.config.{CliConfig, CliSettingManager, MetisConfigManager, MetisConfigWriteNotificationListener}
 import metis.gateway.config.buildGatewayConfigFromUserSettings
 import metis.gateway.gatewayPrepareStartupAuth
-import metis.gateway.core.{GatewayStopResult, gatewayLogProcessMemory}
+import metis.gateway.core.{GatewayStopResult, gatewayLogMeta, gatewayLogProcessMemory, gatewayRuntimeHeapSnapshot}
 import metis.gateway.logging.{MetisLogEvent, gatewayLoggingCurrentLogFile, metisCreateSubsystemLogger}
 import metis.core.memory.{DreamingPhaseRuntime, MemoryRuntime}
 import metis.io.PrintUtils
 import metis.gateway.model.ChatType
+import metis.utils.InfoUtils
 import std.env.{getVariable, setVariable}
 import std.time.*
 import stdx.encoding.json.JsonObject
 
 private let gatewayServeLogger = metisCreateSubsystemLogger("gateway/runtime")
 private let gatewayHeartbeatCadenceTestNonce = "heartbeat-e2e-v1"
+private const GATEWAY_RECOMMENDED_MIN_HEAP_BYTES: Int64 = 1073741824
+private const GATEWAY_RUNTIME_MIN_HEAP_BYTES: Int64 = 4194304
+
+public class GatewayRuntimeHeapPolicyResult {
+    public let ok: Bool
+    public let configured: Bool
+    public let expectedBytes: Int64
+    public let status: String
+
+    public init(ok: Bool, configured: Bool, expectedBytes: Int64, status: String) {
+        this.ok = ok
+        this.configured = configured
+        this.expectedBytes = expectedBytes
+        this.status = status
+    }
+}
+
+private func gatewayRuntimeHeapDigitValue(value: Rune): Int64 {
+    match (value) {
+        case r'0' => 0
+        case r'1' => 1
+        case r'2' => 2
+        case r'3' => 3
+        case r'4' => 4
+        case r'5' => 5
+        case r'6' => 6
+        case r'7' => 7
+        case r'8' => 8
+        case r'9' => 9
+        case _ => -1
+    }
+}
+
+/** Parses the documented integer KB/MB/GB subset without retaining or logging the raw value. */
+public func gatewayValidateRuntimeHeapPolicy(raw: Option<String>, actualMaxHeapBytes: Int64,
+                                             platform: String): GatewayRuntimeHeapPolicyResult {
+    if (platform != "macos" && platform != "linux") {
+        return GatewayRuntimeHeapPolicyResult(false, raw.isSome(), -1, "unsupported_platform")
+    }
+    let configured = match (raw) {
+        case Some(value) => value
+        case None => return GatewayRuntimeHeapPolicyResult(true, false, -1, "unset")
+    }
+    let runes = configured.toAsciiLower().toRuneArray()
+    if (runes.size < 3) {
+        return GatewayRuntimeHeapPolicyResult(false, true, -1, "invalid_syntax")
+    }
+    let suffixStart = runes.size - 2
+    let factor: Int64 = if (runes[suffixStart] == r'k' && runes[suffixStart + 1] == r'b') {
+        1024
+    } else if (runes[suffixStart] == r'm' && runes[suffixStart + 1] == r'b') {
+        1048576
+    } else if (runes[suffixStart] == r'g' && runes[suffixStart + 1] == r'b') {
+        1073741824
+    } else {
+        return GatewayRuntimeHeapPolicyResult(false, true, -1, "invalid_syntax")
+    }
+    var amount: Int64 = 0
+    for (i in 0..suffixStart) {
+        let digit = gatewayRuntimeHeapDigitValue(runes[i])
+        if (digit < 0) {
+            return GatewayRuntimeHeapPolicyResult(false, true, -1, "invalid_syntax")
+        }
+        if (amount > (Int64.Max - digit) / 10) {
+            return GatewayRuntimeHeapPolicyResult(false, true, -1, "overflow")
+        }
+        amount = amount * 10 + digit
+    }
+    if (amount > Int64.Max / factor) {
+        return GatewayRuntimeHeapPolicyResult(false, true, -1, "overflow")
+    }
+    let expectedBytes = amount * factor
+    if (expectedBytes < GATEWAY_RUNTIME_MIN_HEAP_BYTES) {
+        return GatewayRuntimeHeapPolicyResult(false, true, expectedBytes, "below_runtime_minimum")
+    }
+    if (actualMaxHeapBytes != expectedBytes) {
+        return GatewayRuntimeHeapPolicyResult(false, true, expectedBytes, "effective_mismatch")
+    }
+    GatewayRuntimeHeapPolicyResult(true, true, expectedBytes, "ok")
+}
 
 public func gatewayHeartbeatPollCadenceForTest(): Int64 {
     let mode = getVariable("METIS_TEST_GATEWAY_HEARTBEAT_CADENCE_MODE").getOrDefault { "" }.trimAscii()
@@ -122,10 +203,35 @@ public func runGatewayP1DemoWithFeishuWebhook(): Unit {
  * 常驻模式：启动网关并循环处理消息。
  * 配置来自 `~/.metis/metis.json` 的 `gateway` 与可选环境变量；总开关为 `gateway.enabled`。
  */
-public func runGatewayService(verbose!: Bool = false): Unit {
+public func runGatewayService(verbose!: Bool = false): Int64 {
     let startMs = gatewayServeNowMs()
+    let startupHeap = gatewayRuntimeHeapSnapshot()
+    let heapPolicy = gatewayValidateRuntimeHeapPolicy(getVariable("cjHeapSize"), startupHeap.maxHeapBytes, InfoUtils.os)
+    if (!heapPolicy.ok) {
+        gatewayServeLogger.error(
+            MetisLogEvent.processMemory,
+            "gateway runtime heap configuration is invalid",
+            meta: gatewayLogMeta()
+                .string("status", "runtime_heap_configuration_invalid")
+                .string("reason", heapPolicy.status)
+                .int("actualMaxHeapBytes", startupHeap.maxHeapBytes)
+                .object()
+        )
+        return 1
+    }
     let heartbeatPollCadence = gatewayHeartbeatPollCadenceForTest()
     gatewayLogProcessMemory("serve:startup_begin")
+    if (startupHeap.managedHeapStatus == "ok" && startupHeap.maxHeapBytes < GATEWAY_RECOMMENDED_MIN_HEAP_BYTES) {
+        gatewayServeLogger.warn(
+            MetisLogEvent.processMemory,
+            "gateway runtime heap is below the recommended minimum",
+            meta: gatewayLogMeta()
+                .string("status", "runtime_heap_below_recommended")
+                .int("maxHeapBytes", startupHeap.maxHeapBytes)
+                .int("recommendedMinHeapBytes", GATEWAY_RECOMMENDED_MIN_HEAP_BYTES)
+                .object()
+        )
+    }
     gatewayServeLogger.info(MetisLogEvent.gatewayStarting, "Gateway serve starting")
     gatewayServeTimingLog("enter", startMs)
     let persistedUser = CliSettingManager.readGatewaySettings()
@@ -137,14 +243,14 @@ public func runGatewayService(verbose!: Bool = false): Unit {
         gatewayServeLogger.warn(MetisLogEvent.gatewayShutdown, "Gateway serve aborted because gateway.enabled=false")
         gatewayServeTimingLog("disabled", startMs)
         gatewayShellPrintLines(["网关总开关已关闭（metis.json 中 gateway.enabled=false）。执行：metis gateway master on"])
-        return
+        return 0
     }
     if (!gatewayAcquireServeLockForRunningProcess()) {
         gatewayRuntimeMarkStopped(reason: "lock-not-acquired")
         gatewayServeLogger.error(MetisLogEvent.gatewayShutdown, "Gateway serve aborted because serve lock was not acquired")
         gatewayServeTimingLog("lock-failed", startMs)
         gatewayShellPrintLines(["[网关] 无法启动：检测到已有网关实例在运行，或锁文件 ~/.metis/gateway-serve.lock 仍有效。请先关闭旧网关窗口后再试。"])
-        return
+        return 0
     }
     gatewayRuntimeMarkStarting()
     gatewayServeLogger.debug(MetisLogEvent.loggingRaw, "Gateway.serve: serve lock acquired, building gateway service")
@@ -368,9 +474,10 @@ public func runGatewayService(verbose!: Bool = false): Unit {
             gatewayServeLogger.error(MetisLogEvent.gatewayShutdown, "Gateway serve stopped with cleanup pending")
         }
     }
+    0
 }
 
 /** 兼容旧参数 `--gateway-feishu-webhook`，行为与 `magic-cli gateway serve` 一致。 */
-public func runFeishuWebhookGatewayService(): Unit {
+public func runFeishuWebhookGatewayService(): Int64 {
     runGatewayService()
 }

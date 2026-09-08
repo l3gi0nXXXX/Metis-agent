@@ -60,8 +60,7 @@ private func cliRunProgramDemos(): Option<Int64> {
         return Some(CLI_EXIT_OK)
     }
     if (CliConfig.gatewayFeishuWebhook) {
-        runFeishuWebhookGatewayService()
-        return Some(CLI_EXIT_OK)
+        return Some(runFeishuWebhookGatewayService())
     }
     None
 }

@@ -625,9 +625,9 @@ private func gatewayRunForeground(flowName!: String = "run", verbose!: Bool = fa
         controlUiUrl,
         verbose: verbose
     ))
-    runGatewayService(verbose: verbose)
+    let exitCode = runGatewayService(verbose: verbose)
     gatewayCliTimingLog(flowName, "exit", startMs)
-    0
+    exitCode
 }
 
 private func gatewayPrintHealth(): Unit {
