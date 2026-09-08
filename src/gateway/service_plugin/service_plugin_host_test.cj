@@ -1849,7 +1849,6 @@ public class ServicePluginHostTest {
             setServicePluginHealthzProbeForTest(Some({ _url: String, _timeoutMs: Int64 =>
                 ServicePluginHealthzProbeResult(false, statusCode: 0, durationMs: 10, diagnostic: "healthz_timeout")
             }))
-            setServicePluginPortOwnerProbeForTest(Some({ _port: Int64, _pid: Int64 => true }))
             setServicePluginSupervisorAutoStartForTest(false)
             try {
                 let started = ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000)
@@ -1859,11 +1858,31 @@ public class ServicePluginHostTest {
                     case Some(snapshot) => snapshot.pid
                     case None => 0
                 }
+                let firstPgid = this.processGroupId(firstPid)
+                @Expect(firstPid > 1, true)
+                @Expect(firstPgid > 0, true)
+                if (firstPid <= 1 || firstPgid <= 0) { return }
+                let pidProbeCalls = ServicePluginTestCounter()
+                let portOwnerProbeCalls = ServicePluginTestCounter()
+                setServicePluginPidProbeCommandForTest(Some({ pid: Int64, timeoutMs: Int64 =>
+                    pidProbeCalls.increment()
+                    @Expect(pid, firstPid)
+                    @Expect(timeoutMs > 0 && timeoutMs <= 1000, true)
+                    (Int64(1), "", "kill: No such process")
+                }))
+                setServicePluginPortOwnerProbeForTest(Some({ port: Int64, pid: Int64 =>
+                    portOwnerProbeCalls.increment()
+                    @Expect(port, 18184)
+                    @Expect(pid, firstPid)
+                    true
+                }))
                 let tick = runServicePluginSupervisorTickForTest("gitcode-monitor", nowMs: 2000)
                 @Expect(tick.classification.shouldRecover, true)
                 @Expect(tick.recovered, false)
                 @Expect(tick.diagnostic.contains("port_release_timeout"), true)
                 @Expect(tick.diagnostic.contains("portOwnerAlive=true"), true)
+                @Expect(pidProbeCalls.get() > 0, true)
+                @Expect(portOwnerProbeCalls.get() > 0, true)
                 match (getServicePluginSnapshot("gitcode-monitor")) {
                     case Some(snapshot) =>
                         @Expect(snapshot.pid, firstPid)
@@ -1872,11 +1891,28 @@ public class ServicePluginHostTest {
                         @Expect(snapshot.degradedReason, "healthz_timeout")
                     case None => @Expect(true, false)
                 }
+                @Expect(this.waitForPidGone(firstPid), true)
+                @Expect(this.waitForProcessGroupGone(firstPgid), true)
+                @Expect(servicePluginActiveIdentityForTest("gitcode-monitor").isNone(), true)
+                @Expect(managedStdioBroker().snapshot().ownerCount, 0)
+                @Expect(servicePluginDispatchCountsForTest("gitcode-monitor").isNone(), true)
             } finally {
                 setServicePluginSupervisorAutoStartForTest(true)
                 setServicePluginHealthzProbeForTest(None)
-                setServicePluginPortOwnerProbeForTest(None)
-                resetServicePluginHostForTest()
+                try {
+                    resetServicePluginHostForTest()
+                } finally {
+                    setServicePluginPidProbeCommandForTest(None<(Int64, Int64) -> (Int64, String, String)>)
+                    setServicePluginPortOwnerProbeForTest(None)
+                    let brokerReset = resetManagedStdioBrokerForTest(timeoutMs: 3000)
+                    @Expect(brokerReset.ok, true)
+                    let brokerSnapshot = managedStdioBroker().snapshot()
+                    @Expect(brokerSnapshot.running, false)
+                    @Expect(brokerSnapshot.brokerPid, 0)
+                    @Expect(brokerSnapshot.ownerCount, 0)
+                    @Expect(brokerSnapshot.readerCount, 0)
+                    @Expect(brokerSnapshot.dispatcherCount, 0)
+                }
             }
         })
     }
@@ -2409,6 +2445,29 @@ public class ServicePluginHostTest {
                 }))
                 @Expect(invokeRegisteredCapability(CapabilityInvokeRequest("gitcode.monitor.status", payload: "{}")).ok, true)
                 @Expect(gracefulGate.awaitEntered(2000), true)
+                let gracefulIdentity = servicePluginActiveIdentityForTest("gitcode-monitor")
+                @Expect(gracefulIdentity.isSome(), true)
+                if (gracefulIdentity.isNone()) { return }
+                let gracefulPid = getServicePluginSnapshot("gitcode-monitor").getOrThrow().pid
+                let gracefulPgid = this.processGroupId(gracefulPid)
+                @Expect(gracefulPid > 1, true)
+                @Expect(gracefulPgid > 0, true)
+                if (gracefulPid <= 1 || gracefulPgid <= 0) { return }
+                let gracefulPidProbeCalls = ServicePluginTestCounter()
+                let gracefulPortProbeCalls = ServicePluginTestCounter()
+                setServicePluginPidProbeCommandForTest(Some({ pid: Int64, timeoutMs: Int64 =>
+                    gracefulPidProbeCalls.increment()
+                    @Expect(pid, gracefulPid)
+                    @Expect(timeoutMs > 0 && timeoutMs <= 2500, true)
+                    (Int64(1), "", "kill: No such process")
+                }))
+                setServicePluginPortReleaseCommandForTest(Some({ port: Int64, pid: Int64, timeoutMs: Int64 =>
+                    gracefulPortProbeCalls.increment()
+                    @Expect(port > 0, true)
+                    @Expect(pid, gracefulPid)
+                    @Expect(timeoutMs > 0 && timeoutMs <= 500, true)
+                    (Int64(1), "", "")
+                }))
                 stopper = Some(spawn { stopServicePlugin("gitcode-monitor", reason: "s0 graceful 中文🙂", timeoutMillis: 2500) })
                 sleep(Duration.millisecond * 50)
                 gracefulGate.release()
@@ -2421,7 +2480,12 @@ public class ServicePluginHostTest {
                 @Expect(graceful.ownerStopStatus, "graceful_exited")
                 @Expect(graceful.leaseStatus, "stopped")
                 @Expect(graceful.portStatus, "released")
+                @Expect(gracefulPidProbeCalls.get() > 0, true)
+                @Expect(gracefulPortProbeCalls.get() > 0, true)
+                @Expect(this.waitForPidGone(gracefulPid), true)
+                @Expect(this.waitForProcessGroupGone(gracefulPgid), true)
                 @Expect(servicePluginCleanupPendingCountForTest(), 0)
+                @Expect(servicePluginActiveIdentityForTest("gitcode-monitor").isNone(), true)
                 @Expect(managedStdioBroker().snapshot().ownerCount, 0)
                 @Expect(servicePluginDispatchCountsForTest("gitcode-monitor").isNone(), true)
 
@@ -2454,6 +2518,29 @@ public class ServicePluginHostTest {
                 }))
                 @Expect(invokeRegisteredCapability(CapabilityInvokeRequest("gitcode.monitor.status", payload: "{}")).ok, true)
                 @Expect(pendingGate.awaitEntered(2000), true)
+                let pendingIdentity = servicePluginActiveIdentityForTest("gitcode-monitor")
+                @Expect(pendingIdentity.isSome(), true)
+                if (pendingIdentity.isNone()) { return }
+                let pendingPid = getServicePluginSnapshot("gitcode-monitor").getOrThrow().pid
+                let pendingPgid = this.processGroupId(pendingPid)
+                @Expect(pendingPid > 1, true)
+                @Expect(pendingPgid > 0, true)
+                if (pendingPid <= 1 || pendingPgid <= 0) { return }
+                let pendingPidProbeCalls = ServicePluginTestCounter()
+                let pendingPortProbeCalls = ServicePluginTestCounter()
+                setServicePluginPidProbeCommandForTest(Some({ pid: Int64, timeoutMs: Int64 =>
+                    pendingPidProbeCalls.increment()
+                    @Expect(pid, pendingPid)
+                    @Expect(timeoutMs > 0 && timeoutMs <= 2500, true)
+                    (Int64(1), "", "kill: No such process")
+                }))
+                setServicePluginPortReleaseCommandForTest(Some({ port: Int64, pid: Int64, timeoutMs: Int64 =>
+                    pendingPortProbeCalls.increment()
+                    @Expect(port > 0, true)
+                    @Expect(pid, pendingPid)
+                    @Expect(timeoutMs > 0 && timeoutMs <= 500, true)
+                    (Int64(1), "", "")
+                }))
                 setServicePluginDispatchRemainingForTest(Some({ => Int64(99) }))
                 let pending = stopServicePlugin("gitcode-monitor", reason: "s0 pending 中文🙂", timeoutMillis: 200)
                 @Expect(pending.ok, false)
@@ -2464,7 +2551,18 @@ public class ServicePluginHostTest {
                 @Expect(pending.ownerStopStatus, "graceful_exited")
                 @Expect(pending.leaseStatus, "stopped")
                 @Expect(pending.portStatus, "released")
+                @Expect(pendingPidProbeCalls.get() > 0, true)
+                @Expect(pendingPortProbeCalls.get() > 0, true)
                 @Expect(servicePluginCleanupPendingCountForTest(), 1)
+                let cleanupIdentity = servicePluginCleanupPendingIdentityForTest("gitcode-monitor")
+                @Expect(cleanupIdentity.isSome(), true)
+                if (cleanupIdentity.isNone()) { return }
+                @Expect(cleanupIdentity.getOrThrow()[0], pendingIdentity.getOrThrow()[0])
+                @Expect(cleanupIdentity.getOrThrow()[1], pendingIdentity.getOrThrow()[1])
+                @Expect(cleanupIdentity.getOrThrow()[2], pendingIdentity.getOrThrow()[2])
+                @Expect(servicePluginActiveIdentityForTest("gitcode-monitor").isNone(), true)
+                @Expect(this.waitForPidGone(pendingPid), true)
+                @Expect(this.waitForProcessGroupGone(pendingPgid), true)
 
                 pendingGate.release()
                 @Expect(pendingSettledGate.awaitEntered(2000), true)
@@ -2477,11 +2575,15 @@ public class ServicePluginHostTest {
                 @Expect(retried.leaseStatus, "stopped")
                 @Expect(retried.portStatus, "released")
                 @Expect(servicePluginCleanupPendingCountForTest(), 0)
+                @Expect(servicePluginCleanupPendingIdentityForTest("gitcode-monitor").isNone(), true)
+                @Expect(servicePluginActiveIdentityForTest("gitcode-monitor").isNone(), true)
                 @Expect(managedStdioBroker().snapshot().ownerCount, 0)
                 @Expect(servicePluginDispatchCountsForTest("gitcode-monitor").isNone(), true)
                 activeGate = None<ServicePluginTestGate>
             } finally {
                 match (activeGate) { case Some(gate) => gate.release() case None => () }
+                setServicePluginPidProbeCommandForTest(None<(Int64, Int64) -> (Int64, String, String)>)
+                setServicePluginPortReleaseCommandForTest(None<(Int64, Int64, Int64) -> (Int64, String, String)>)
                 setServicePluginDispatchRemainingForTest(None<() -> Int64>)
                 setServicePluginDispatchSettledHookForTest(None<() -> Unit>)
                 setServicePluginBeforeEventDispatchHookForTest(None<(String) -> Unit>)
@@ -2493,6 +2595,15 @@ public class ServicePluginHostTest {
                     case None => ()
                 }
                 resetServicePluginGeneratedReplyStateForTest()
+                resetServicePluginHostForTest()
+                let brokerReset = resetManagedStdioBrokerForTest(timeoutMs: 3000)
+                @Expect(brokerReset.ok, true)
+                let brokerSnapshot = managedStdioBroker().snapshot()
+                @Expect(brokerSnapshot.running, false)
+                @Expect(brokerSnapshot.brokerPid, 0)
+                @Expect(brokerSnapshot.ownerCount, 0)
+                @Expect(brokerSnapshot.readerCount, 0)
+                @Expect(brokerSnapshot.dispatcherCount, 0)
             }
         })
     }
