@@ -17,13 +17,60 @@ import metis.gateway.session.{
 import magic.jsonable.*
 import std.collection.ArrayList
 import std.env.{getVariable, setVariable}
-import std.fs.{Directory, File, Path, exists, remove}
+import std.fs.{Directory, File, FileInfo, OpenMode, Path, exists, remove}
 import std.time.DateTime
 import std.unittest.testmacro.*
 import stdx.encoding.json.{JsonArray, JsonObject, JsonString}
 
 private var gatewaySessionStoreRuntimePreviousHome = None<String>
 private var gatewaySessionStoreRuntimeTestHome = ""
+
+private func s2A1HistoryRecord(role: String, text: String): String {
+    let row = JsonObject()
+    row.put("role", JsonString(role))
+    row.put("text", JsonString(text))
+    row.toJsonString() + "\n"
+}
+
+private func s2A1WriteHistoryRecords(path: Path, count: Int64, textPrefix!: String = "entry-"): Unit {
+    try (file = File(path, OpenMode.Write)) {
+        for (index in 0..count) {
+            file.write(s2A1HistoryRecord(if (index % 2 == 0) { "user" } else { "assistant" }, "${textPrefix}${index}").toArray())
+        }
+    }
+}
+
+private func s2A1AppendBytes(path: Path, bytes: Array<Byte>): Unit {
+    try (file = File(path, OpenMode.Append)) {
+        file.write(bytes)
+    }
+}
+
+private func s2A1HistoryRecordAtEncodedSize(role: String, encodedBytes: Int64): String {
+    let emptyRecord = s2A1HistoryRecord(role, "")
+    let emptyEncodedBytes = Int64(emptyRecord.size) - 1
+    if (encodedBytes < emptyEncodedBytes) {
+        throw IllegalArgumentException("encoded history record target is too small")
+    }
+    let record = s2A1HistoryRecord(role, "x" * (encodedBytes - emptyEncodedBytes))
+    if (Int64(record.size) - 1 != encodedBytes) {
+        throw IllegalStateException("encoded history record target mismatch")
+    }
+    record
+}
+
+private func s2A1HistoryRecordAtLineSize(role: String, lineBytes: Int64): String {
+    let prefix = "${role}: "
+    if (lineBytes < Int64(prefix.size)) {
+        throw IllegalArgumentException("history line target is too small")
+    }
+    s2A1HistoryRecord(role, "x" * (lineBytes - Int64(prefix.size)))
+}
+
+private func s2A1HistoryLineAtSize(role: String, lineBytes: Int64): String {
+    let prefix = "${role}: "
+    prefix + ("x" * (lineBytes - Int64(prefix.size)))
+}
 
 @Test
 public class GatewaySessionStoreRuntimeTest {
@@ -77,6 +124,184 @@ public class GatewaySessionStoreRuntimeTest {
         @Expect(malformedFootprint.sessionsIndexBytes, first.sessionsIndexBytes)
         let missing = store.memoryFootprint("agent:main:missing")
         @Expect(missing.transcriptBytes, -1)
+    }
+
+    @TestCase
+    public func s2A1U1RecentLoaderRetainsLastTwelveFromTenThousandRecords(): Unit {
+        let root = Path(gatewaySessionStoreRuntimeTestHome).join("s2-a1-u1")
+        Directory.create(root, recursive: true)
+        let store = GatewaySessionStore(root, enabled: true, agentId: "main")
+        let sessionKey = "agent:main:s2-a1-u1"
+        s2A1WriteHistoryRecords(store.transcriptPath(sessionKey), 10000)
+
+        let result = store.loadRecentHistoryLines(sessionKey, 12)
+        let full = store.loadHistoryLines(sessionKey)
+        @Expect(result.lines.size, 12)
+        @Expect(result.lines[0], "user: entry-9988")
+        @Expect(result.lines[11], "assistant: entry-9999")
+        @Expect(result.validHistoryRecords, 10000)
+        @Expect(result.droppedHistoryRecords, 9988)
+        @Expect(result.totalScannedBytes, FileInfo(store.transcriptPath(sessionKey)).size)
+        @Expect(result.retainedPayloadBytes <= 512 * 1024, true)
+        @Expect(result.maxRetainedPayloadBytes <= 512 * 1024, true)
+        @Expect(result.maxReadCallBytes > 0, true)
+        @Expect(result.maxReadCallBytes <= 64 * 1024, true)
+        @Expect(result.maxBufferedRecordBytes > 0, true)
+        @Expect(result.maxBufferedRecordBytes <= 256 * 1024, true)
+        @Expect(result.oversizeRecords, 0)
+        @Expect(result.malformedRecords, 0)
+        @Expect(result.invalidEncodingRecords, 0)
+        @Expect(full.size, 10000)
+        for (index in 0..12) {
+            @Expect(result.lines[index], full[full.size - 12 + index])
+        }
+    }
+
+    @TestCase
+    public func s2A1B1RecentLoaderPreservesEntryAndFormattedMultilineBoundaries(): Unit {
+        let root = Path(gatewaySessionStoreRuntimeTestHome).join("s2-a1-b1")
+        Directory.create(root, recursive: true)
+        let store = GatewaySessionStore(root, enabled: true, agentId: "main")
+        for (count in [0, 1, 12, 13]) {
+            let sessionKey = "agent:main:s2-a1-b1-${count}"
+            s2A1WriteHistoryRecords(store.transcriptPath(sessionKey), count, textPrefix: "b-")
+            let result = store.loadRecentHistoryLines(sessionKey, 12)
+            @Expect(result.lines.size, min(count, 12))
+            @Expect(result.droppedHistoryRecords, max(0, count - 12))
+        }
+
+        let multilineKey = "agent:main:s2-a1-b1-multiline"
+        let multiline = """
+{
+  "role": "user",
+  "text": "多行中文🙂"
+}
+{"role":"assistant","text":"尾记录"}
+"""
+        File.writeTo(store.transcriptPath(multilineKey), multiline.toArray())
+        let multilineResult = store.loadRecentHistoryLines(multilineKey, 12)
+        @Expect(multilineResult.lines, ["user: 多行中文🙂", "assistant: 尾记录"])
+        @Expect(multilineResult.malformedRecords, 0)
+        @Expect(multilineResult.unclosedRecords, 0)
+
+        let roleKey = "agent:main:s2-a1-b1-role-compatibility"
+        try (file = File(store.transcriptPath(roleKey), OpenMode.Write)) {
+            file.write(s2A1HistoryRecord("system", "系统中文🙂").toArray())
+            file.write(s2A1HistoryRecord("custom-tool", "工具结果🙂").toArray())
+        }
+        let roleResult = store.loadRecentHistoryLines(roleKey, 12)
+        let fullRoleLines = store.loadHistoryLines(roleKey)
+        @Expect(roleResult.lines, ["system: 系统中文🙂", "custom-tool: 工具结果🙂"])
+        @Expect(roleResult.lines, fullRoleLines.toArray())
+
+        let recordBoundaryKey = "agent:main:s2-a1-b1-record-boundary"
+        let exactRecord = s2A1HistoryRecordAtEncodedSize("system", 256 * 1024)
+        let oversizeRecord = s2A1HistoryRecordAtEncodedSize("custom-tool", 256 * 1024 + 1)
+        let boundaryTail = s2A1HistoryRecord("assistant", "boundary-tail")
+        try (file = File(store.transcriptPath(recordBoundaryKey), OpenMode.Write)) {
+            file.write(exactRecord.toArray())
+            file.write(oversizeRecord.toArray())
+            file.write(boundaryTail.toArray())
+        }
+        let recordBoundary = store.loadRecentHistoryLines(recordBoundaryKey, 12)
+        let exactRecordTextBytes = 256 * 1024 - (Int64(s2A1HistoryRecord("system", "").size) - 1)
+        let exactRecordLine = "system: " + ("x" * exactRecordTextBytes)
+        @Expect(Int64(exactRecord.size) - 1, 256 * 1024)
+        @Expect(Int64(oversizeRecord.size) - 1, 256 * 1024 + 1)
+        @Expect(recordBoundary.lines, [exactRecordLine, "assistant: boundary-tail"])
+        @Expect(recordBoundary.validHistoryRecords, 2)
+        @Expect(recordBoundary.oversizeRecords, 1)
+        @Expect(recordBoundary.maxBufferedRecordBytes, 256 * 1024)
+    }
+
+    @TestCase
+    public func s2A1P1RecentLoaderBoundsChunkRecordAndAggregatePayload(): Unit {
+        let root = Path(gatewaySessionStoreRuntimeTestHome).join("s2-a1-p1")
+        Directory.create(root, recursive: true)
+        let store = GatewaySessionStore(root, enabled: true, agentId: "main")
+        let exactKey = "agent:main:s2-a1-p1-exact"
+        let exactRecords = [
+            s2A1HistoryRecordAtLineSize("first", 174762),
+            s2A1HistoryRecordAtLineSize("second", 174762),
+            s2A1HistoryRecordAtLineSize("third", 174764)
+        ]
+        try (file = File(store.transcriptPath(exactKey), OpenMode.Write)) {
+            for (record in exactRecords) {
+                file.write(record.toArray())
+            }
+        }
+        let exact = store.loadRecentHistoryLines(exactKey, 12)
+        let exactExpected = [
+            s2A1HistoryLineAtSize("first", 174762),
+            s2A1HistoryLineAtSize("second", 174762),
+            s2A1HistoryLineAtSize("third", 174764)
+        ]
+        @Expect(exact.lines, exactExpected)
+        @Expect(exact.validHistoryRecords, 3)
+        @Expect(exact.droppedHistoryRecords, 0)
+        @Expect(exact.retainedPayloadBytes, 512 * 1024)
+        @Expect(exact.maxRetainedPayloadBytes, 512 * 1024)
+        @Expect(exact.maxReadCallBytes > 0, true)
+        @Expect(exact.maxReadCallBytes <= 64 * 1024, true)
+        @Expect(exact.maxBufferedRecordBytes > 0, true)
+        @Expect(exact.maxBufferedRecordBytes <= 256 * 1024, true)
+
+        let overflowKey = "agent:main:s2-a1-p1-overflow"
+        let overflowRecords = [
+            s2A1HistoryRecordAtLineSize("first", 174762),
+            s2A1HistoryRecordAtLineSize("second", 174762),
+            s2A1HistoryRecordAtLineSize("third", 174762),
+            s2A1HistoryRecord("x", "")
+        ]
+        try (file = File(store.transcriptPath(overflowKey), OpenMode.Write)) {
+            for (record in overflowRecords) {
+                file.write(record.toArray())
+            }
+        }
+        let overflow = store.loadRecentHistoryLines(overflowKey, 12)
+        let overflowExpected = [
+            s2A1HistoryLineAtSize("second", 174762),
+            s2A1HistoryLineAtSize("third", 174762),
+            "x: "
+        ]
+        @Expect(174762 * 3 + Int64("x: ".size), 512 * 1024 + 1)
+        @Expect(overflow.lines, overflowExpected)
+        @Expect(overflow.validHistoryRecords, 4)
+        @Expect(overflow.droppedHistoryRecords, 1)
+        @Expect(overflow.retainedPayloadBytes, 174762 * 2 + Int64("x: ".size))
+        @Expect(overflow.maxRetainedPayloadBytes, 174762 * 3)
+    }
+
+    @TestCase
+    public func s2A1N1RecentLoaderIsolatesInvalidOversizeMalformedAndUnclosedRecords(): Unit {
+        let root = Path(gatewaySessionStoreRuntimeTestHome).join("s2-a1-n1")
+        Directory.create(root, recursive: true)
+        let store = GatewaySessionStore(root, enabled: true, agentId: "main")
+        let sessionKey = "agent:main:s2-a1-n1"
+        let path = store.transcriptPath(sessionKey)
+        File.writeTo(path, s2A1HistoryRecord("user", "安全开始中文🙂").toArray())
+
+        let invalid = ArrayList<Byte>()
+        invalid.add(all: "{\"role\":\"user\",\"text\":\"".toArray())
+        invalid.add(0xFF)
+        invalid.add(all: "\"}\n".toArray())
+        s2A1AppendBytes(path, invalid.toArray())
+        s2A1AppendBytes(path, "{not-json}\n".toArray())
+        s2A1AppendBytes(path, s2A1HistoryRecord("assistant", "x" * (256 * 1024 + 32)).toArray())
+        s2A1AppendBytes(path, s2A1HistoryRecord("assistant", "oversize后安全🙂").toArray())
+        s2A1AppendBytes(path, "{\"role\":\"user\",\"text\":\"未闭合🙂\"".toArray())
+
+        let result = store.loadRecentHistoryLines(sessionKey, 12)
+        @Expect(result.lines, ["user: 安全开始中文🙂", "assistant: oversize后安全🙂"])
+        @Expect(result.invalidEncodingRecords, 1)
+        @Expect(result.oversizeRecords, 1)
+        @Expect(result.unclosedRecords, 1)
+        @Expect(result.malformedRecords, 2)
+        @Expect(result.maxBufferedRecordBytes <= 256 * 1024, true)
+        @Expect(result.maxReadCallBytes <= 64 * 1024, true)
+        let retainedText = String.join(result.lines, delimiter: "\n")
+        @Expect(retainedText.contains("not-json"), false)
+        @Expect(retainedText.contains("未闭合"), false)
     }
 
     @TestCase

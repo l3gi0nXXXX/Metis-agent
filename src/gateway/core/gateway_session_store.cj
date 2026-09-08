@@ -55,6 +55,212 @@ public class GatewaySessionMemoryFootprint {
     }
 }
 
+private const GATEWAY_RECENT_HISTORY_READ_CHUNK_BYTES: Int64 = 64 * 1024
+private const GATEWAY_RECENT_HISTORY_MAX_RECORD_BYTES: Int64 = 256 * 1024
+private const GATEWAY_RECENT_HISTORY_MAX_PAYLOAD_BYTES: Int64 = 512 * 1024
+private const GATEWAY_RECENT_HISTORY_MAX_ENTRIES: Int64 = 12
+
+public class GatewayRecentHistoryLoadResult {
+    public var lines: Array<String> = []
+    public var totalScannedBytes: Int64 = 0
+    public var maxReadCallBytes: Int64 = 0
+    public var maxBufferedRecordBytes: Int64 = 0
+    public var retainedPayloadBytes: Int64 = 0
+    public var maxRetainedPayloadBytes: Int64 = 0
+    public var validHistoryRecords: Int64 = 0
+    public var droppedHistoryRecords: Int64 = 0
+    public var oversizeRecords: Int64 = 0
+    public var malformedRecords: Int64 = 0
+    public var invalidEncodingRecords: Int64 = 0
+    public var unclosedRecords: Int64 = 0
+    public var readFailed: Bool = false
+    public init() {}
+}
+
+private func gatewayRecentHistoryLineFromRecord(recordText: String): Option<String> {
+    let object = try {
+        JsonValue.fromStr(recordText).asObject()
+    } catch (_: Exception) {
+        return None
+    }
+    match (object.get("kind")) {
+        case Some(value) =>
+            try {
+                if (value.asString().getValue() == "meta") {
+                    return Some("")
+                }
+            } catch (_: Exception) {
+                return None
+            }
+        case None => ()
+    }
+    let role = try {
+        object.get("role").getOrThrow().asString().getValue()
+    } catch (_: Exception) {
+        return Some("")
+    }
+    let text = try {
+        object.get("text").getOrThrow().asString().getValue()
+    } catch (_: Exception) {
+        return None
+    }
+    Some("${role}: ${text}")
+}
+
+private class GatewayRecentHistoryFramer {
+    private let entryLimit: Int64
+    private let entries = ArrayList<String>()
+    private let record = ArrayList<Byte>()
+    private var retainedBytes: Int64 = 0
+    private var depth: Int64 = 0
+    private var inString: Bool = false
+    private var escaped: Bool = false
+    private var discardingOversize: Bool = false
+    private var outsideGarbage: Bool = false
+    private let truth = GatewayRecentHistoryLoadResult()
+
+    public init(maxEntries: Int64) {
+        this.entryLimit = max(0, min(maxEntries, GATEWAY_RECENT_HISTORY_MAX_ENTRIES))
+    }
+
+    public func noteRead(size: Int64): Unit {
+        this.truth.maxReadCallBytes = max(this.truth.maxReadCallBytes, size)
+    }
+
+    public func accept(byte: Byte): Unit {
+        this.truth.totalScannedBytes += 1
+        if (this.depth == 0) {
+            if (this.outsideGarbage) {
+                if (byte == b'\n') {
+                    this.truth.malformedRecords += 1
+                    this.outsideGarbage = false
+                }
+                return
+            }
+            if (byte == b' ' || byte == b'\t' || byte == b'\r' || byte == b'\n') {
+                return
+            }
+            if (byte != b'{') {
+                this.outsideGarbage = true
+                return
+            }
+            this.depth = 1
+            this.inString = false
+            this.escaped = false
+            this.discardingOversize = false
+            this.record.clear()
+            this.appendRecordByte(byte)
+            return
+        }
+
+        this.appendRecordByte(byte)
+        if (this.inString) {
+            if (this.escaped) {
+                this.escaped = false
+            } else if (byte == b'\\') {
+                this.escaped = true
+            } else if (byte == b'"') {
+                this.inString = false
+            }
+            return
+        }
+        if (byte == b'"') {
+            this.inString = true
+            return
+        }
+        if (byte == b'{') {
+            this.depth += 1
+            return
+        }
+        if (byte != b'}') {
+            return
+        }
+        this.depth -= 1
+        if (this.depth == 0) {
+            this.finishRecord()
+        }
+    }
+
+    private func appendRecordByte(byte: Byte): Unit {
+        if (this.discardingOversize) {
+            return
+        }
+        if (Int64(this.record.size) >= GATEWAY_RECENT_HISTORY_MAX_RECORD_BYTES) {
+            this.discardingOversize = true
+            this.truth.oversizeRecords += 1
+            this.record.clear()
+            return
+        }
+        this.record.add(byte)
+        this.truth.maxBufferedRecordBytes = max(this.truth.maxBufferedRecordBytes, Int64(this.record.size))
+    }
+
+    private func finishRecord(): Unit {
+        if (!this.discardingOversize) {
+            let decoded = try {
+                Some(String.fromUtf8(this.record.toArray()))
+            } catch (_: Exception) {
+                this.truth.invalidEncodingRecords += 1
+                None<String>
+            }
+            if (let Some(text) <- decoded) {
+                match (gatewayRecentHistoryLineFromRecord(text)) {
+                    case Some(line) =>
+                        if (!line.isEmpty()) {
+                            this.appendHistoryLine(line)
+                        }
+                    case None => this.truth.malformedRecords += 1
+                }
+            }
+        }
+        this.record.clear()
+        this.depth = 0
+        this.inString = false
+        this.escaped = false
+        this.discardingOversize = false
+    }
+
+    private func appendHistoryLine(line: String): Unit {
+        this.truth.validHistoryRecords += 1
+        let lineBytes = Int64(line.size)
+        if (this.entryLimit <= 0 || lineBytes > GATEWAY_RECENT_HISTORY_MAX_PAYLOAD_BYTES) {
+            this.truth.droppedHistoryRecords += 1
+            return
+        }
+        while (!this.entries.isEmpty() &&
+            (Int64(this.entries.size) >= this.entryLimit ||
+                this.retainedBytes + lineBytes > GATEWAY_RECENT_HISTORY_MAX_PAYLOAD_BYTES)) {
+            let removed = this.entries.remove(at: 0)
+            this.retainedBytes = max(0, this.retainedBytes - Int64(removed.size))
+            this.truth.droppedHistoryRecords += 1
+        }
+        this.entries.add(line)
+        this.retainedBytes += lineBytes
+        this.truth.maxRetainedPayloadBytes = max(this.truth.maxRetainedPayloadBytes, this.retainedBytes)
+    }
+
+    public func finish(): GatewayRecentHistoryLoadResult {
+        if (this.depth > 0) {
+            this.truth.unclosedRecords += 1
+            this.truth.malformedRecords += 1
+        } else if (this.outsideGarbage) {
+            this.truth.malformedRecords += 1
+        }
+        this.truth.lines = this.entries.toArray()
+        this.truth.retainedPayloadBytes = this.retainedBytes
+        this.truth
+    }
+
+    public func failRead(): GatewayRecentHistoryLoadResult {
+        this.truth.readFailed = true
+        this.entries.clear()
+        this.retainedBytes = 0
+        this.truth.lines = []
+        this.truth.retainedPayloadBytes = 0
+        this.truth
+    }
+}
+
 public class GatewaySessionStore {
     private let root: Path
     private let enabled: Bool
@@ -139,6 +345,34 @@ public class GatewaySessionStore {
             ()
         }
         out
+    }
+
+    /**
+     * 为模型路径流式加载最近历史。完整历史/debug调用方继续使用 `loadHistoryLines`。
+     */
+    public func loadRecentHistoryLines(sessionKey: String, maxEntries: Int64): GatewayRecentHistoryLoadResult {
+        let framer = GatewayRecentHistoryFramer(maxEntries)
+        if (!this.enabled || maxEntries <= 0) {
+            return framer.finish()
+        }
+        let path = this.transcriptPath(sessionKey)
+        if (!exists(path)) {
+            return framer.finish()
+        }
+        try (file = File(path, OpenMode.Read)) {
+            let buffer = Array<Byte>(GATEWAY_RECENT_HISTORY_READ_CHUNK_BYTES, repeat: 0)
+            var readSize = file.read(buffer)
+            while (readSize > 0) {
+                framer.noteRead(readSize)
+                for (index in 0..readSize) {
+                    framer.accept(buffer[index])
+                }
+                readSize = file.read(buffer)
+            }
+        } catch (_: Exception) {
+            return framer.failRead()
+        }
+        framer.finish()
     }
 
     /**
