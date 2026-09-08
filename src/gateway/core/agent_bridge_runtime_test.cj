@@ -221,7 +221,9 @@ private func withAgentBridgeRuntimeLogCapture<T>(home: Path, name: String, block
     let oldMetisFile = getVariable("METIS_LOG_FILE")
     let oldMetisConsoleLevel = getVariable("METIS_CONSOLE_LEVEL")
     let path = home.join("logs").join("agent-bridge-phase1-${name}.log").toString()
-    Directory.create(Path(path).parent, recursive: true)
+    if (!exists(Path(path).parent)) {
+        Directory.create(Path(path).parent, recursive: true)
+    }
     try { remove(Path(path), recursive: true) } catch (_: Exception) { () }
     Config.logLevel = "debug"
     Config.logFile = path
@@ -290,6 +292,14 @@ private func agentBridgeJsonBool(obj: JsonObject, key: String): Bool {
         case None => ()
     }
     false
+}
+
+private func agentBridgeJsonInt(obj: JsonObject, key: String): Int64 {
+    match (obj.get(key)) {
+        case Some(value) => try { return value.asInt().getValue() } catch (_: Exception) { () }
+        case None => ()
+    }
+    -1
 }
 
 private func agentBridgeToolRequiredContains(schema: JsonValue, paramName: String): Bool {
@@ -431,6 +441,81 @@ private class AgentBridgePhase1FallbackModel <: ChatModel {
     public func asyncCreate(_request: ChatRequest): AsyncChatResponse {
         throw Exception("async not used in phase1 agent bridge tests")
     }
+}
+
+private class AgentBridgeC2SequenceModel <: ChatModel {
+    private let results: Array<String>
+    private var cursor: Int64 = 0
+    private var _maxTokens: Option<Int64> = None
+
+    public init(results: Array<String>) {
+        this.results = results
+    }
+
+    public prop provider: String { get() { "fake" } }
+    public prop name: String { get() { "agent-bridge-c2-sequence" } }
+    public prop contextLength: Int64 { get() { 131072 } }
+    public mut prop maxTokens: Option<Int64> {
+        get() { this._maxTokens }
+        set(value) { this._maxTokens = value }
+    }
+
+    public func create(_request: ChatRequest): ChatResponse {
+        if (this.cursor >= Int64(this.results.size)) {
+            throw Exception("s2_c2_model_exhausted")
+        }
+        let result = this.results[this.cursor]
+        this.cursor += 1
+        ChatResponse(this.fullName, Message.assistant(result))
+    }
+
+    public func asyncCreate(_request: ChatRequest): AsyncChatResponse {
+        throw Exception("async not used in S2-C2 tests")
+    }
+
+    public func calls(): Int64 { this.cursor }
+}
+
+private class AgentBridgeC2PromptAwareModel <: ChatModel {
+    private let mainAnswer: String
+    private let correctionAnswer: String
+    private var mainCompletedCount: Int64 = 0
+    private var correctionCompletedCount: Int64 = 0
+    private var _maxTokens: Option<Int64> = None
+
+    public init(mainAnswer: String, correctionAnswer: String) {
+        this.mainAnswer = mainAnswer
+        this.correctionAnswer = correctionAnswer
+    }
+
+    public prop provider: String { get() { "fake" } }
+    public prop name: String { get() { "agent-bridge-c2-prompt-aware" } }
+    public prop contextLength: Int64 { get() { 131072 } }
+    public mut prop maxTokens: Option<Int64> {
+        get() { this._maxTokens }
+        set(value) { this._maxTokens = value }
+    }
+
+    public func create(request: ChatRequest): ChatResponse {
+        let isCorrection = request.messageList.size == 1 &&
+            request.messageList[0].content.startsWith(
+                "只根据本轮对话中已经存在的上下文和已完成的工具结果，输出给用户的最终正文。")
+        let response = ChatResponse(this.fullName,
+            Message.assistant(if (isCorrection) { this.correctionAnswer } else { this.mainAnswer }))
+        if (isCorrection) {
+            this.correctionCompletedCount += 1
+        } else {
+            this.mainCompletedCount += 1
+        }
+        response
+    }
+
+    public func asyncCreate(_request: ChatRequest): AsyncChatResponse {
+        throw Exception("async not used in S2-C2 tests")
+    }
+
+    public func mainCompleted(): Int64 { this.mainCompletedCount }
+    public func correctionCompleted(): Int64 { this.correctionCompletedCount }
 }
 
 private class AgentBridgeS4RssOverlapProbe {
@@ -914,6 +999,255 @@ public class AgentBridgeC0ContractTest {
 
 @Test
 public class AgentBridgeRuntimeTest {
+    @TestCase
+    public func s2C2U1PostModelAnswerFixtureIsIdentityBoundAndOneShot(): Unit {
+        clearGatewayAgentBridgePostModelAnswerForTest()
+        try {
+            @Expect(takeGatewayAgentBridgePostModelAnswerForTest("missing").isNone(), true)
+            setGatewayAgentBridgePostModelAnswerForTest("expected-session", "functions._answer_")
+            @Expect(takeGatewayAgentBridgePostModelAnswerForTest("wrong-session").isNone(), true)
+            @Expect(takeGatewayAgentBridgePostModelAnswerForTest("expected-session").getOrThrow(),
+                "functions._answer_")
+            @Expect(takeGatewayAgentBridgePostModelAnswerForTest("expected-session").isNone(), true)
+        } finally {
+            clearGatewayAgentBridgePostModelAnswerForTest()
+        }
+    }
+
+    @TestCase
+    public func s2C2B1BoundedCorrectionContextUsesExactUtf8ComponentBudgets(): Unit {
+        let contextBudget = Int64(64 * 1024 - gatewayBuildFinalAnswerCorrectionPrompt("").size)
+        let tracker = GatewayToolExecutionTracker()
+        for (index in 0..100) {
+            tracker.recordResult("tool-${index}", "结果🙂" + ("t" * 9000))
+        }
+        @Expect(tracker.correctionContextCallsForTest(), 0)
+        let normal = gatewayRunFinalAnswerCorrection(
+            "normal",
+            ["web_fetch"],
+            { _prompt: String => "must-not-run" },
+            existingContextBuilder: Some({ _budget: Int64 => tracker.correctionContext() })
+        )
+        @Expect(normal.status, "valid_text")
+        @Expect(tracker.correctionContextCallsForTest(), 0)
+        let recovered = gatewayRunFinalAnswerCorrection(
+            "[\"web_fetch\"]",
+            ["web_fetch"],
+            { _prompt: String => "corrected" },
+            existingContextBuilder: Some({ _budget: Int64 => tracker.correctionContext() })
+        )
+        @Expect(recovered.status, "valid_text")
+        @Expect(tracker.correctionContextCallsForTest(), 1)
+        let bounded = gatewayBuildBoundedFinalCorrectionContext(
+            ("discarded-model-head-" + ("模🙂" * 30000) + ("m" * 16027) + "retained-model-tail"),
+            "t" * 40000,
+            "a" * 20000,
+            contextBudget
+        )
+        @Expect(bounded.answerBytes, 16 * 1024)
+        @Expect(bounded.toolContextBytes, 32 * 1024)
+        @Expect(bounded.modelInputBytes, 16027)
+        @Expect(Int64(bounded.text.size), 65230)
+        @Expect(bounded.text.contains("discarded-model-head"), false)
+        @Expect(bounded.text.contains("retained-model-tail"), true)
+        @Expect(bounded.text.contains("�"), false)
+
+        let unicodeBoundary = gatewayBuildBoundedFinalCorrectionContext(
+            ("discarded-model-head-" + ("模🙂" * 30000) + "retained-model-tail"),
+            "t" * 40000,
+            "a" * 20000,
+            contextBudget
+        )
+        @Expect(unicodeBoundary.answerBytes, 16 * 1024)
+        @Expect(unicodeBoundary.toolContextBytes, 32 * 1024)
+        @Expect(unicodeBoundary.modelInputBytes, 16025)
+        @Expect(Int64(unicodeBoundary.text.size), 65228)
+        @Expect(gatewayBuildFinalAnswerCorrectionPrompt(unicodeBoundary.text).size, 65534)
+        @Expect(unicodeBoundary.text.contains("discarded-model-head"), false)
+        @Expect(unicodeBoundary.text.contains("retained-model-tail"), true)
+        @Expect(unicodeBoundary.text.contains("�"), false)
+
+        let unused = gatewayBuildBoundedFinalCorrectionContext(
+            "m" * contextBudget,
+            "tool: short",
+            "answer-short",
+            contextBudget
+        )
+        @Expect(unused.answerBytes, Int64("answer-short".size))
+        @Expect(unused.toolContextBytes, Int64("tool: short".size))
+        @Expect(unused.modelInputBytes > bounded.modelInputBytes, true)
+        @Expect(Int64(unused.text.size), contextBudget)
+
+        let exactPrompt = gatewayBuildFinalAnswerCorrectionPrompt(bounded.text)
+        @Expect(exactPrompt.size, 64 * 1024)
+        let plusOne = gatewayBuildBoundedFinalCorrectionContext(
+            "q" * (contextBudget + 1), "", "", contextBudget
+        )
+        @Expect(gatewayBuildFinalAnswerCorrectionPrompt(plusOne.text).size, 64 * 1024)
+    }
+
+    @TestCase
+    public func s2C2P1CorrectionContextIsLazyAndMemoryStageIsOrderedOnce(): Unit {
+        withAgentBridgeTempHome("metis-s2-c2-p1", { home: Path =>
+            let normalModel = AgentBridgeC2SequenceModel(["normal-answer"])
+            let normalName = "metis-test-s2-c2-normal-${DateTime.now().toUnixTimeStamp().toNanoseconds()}"
+            ModelManager.registerChatModel(normalName, { => normalModel })
+            writeAgentBridgePhase1FallbackAgentConfig(home, normalName, [], appServer: false)
+            let normalContext = gatewayResolveSessionContext(GatewaySessionRequest(
+                GatewayIngressSource.DashboardRpc, sessionHint: "s2-c2-normal", agentId: "phase1"
+            ))
+            withAgentBridgeRuntimeLogCapture(home, "s2-c2-normal", { logPath: String =>
+                resetGatewayMemoryObservationForTest()
+                setGatewayProcessRssProviderForTest(Some({ => 4096 }))
+                agentBridgeMemorySeparateFrameworkLog(home)
+                try {
+                    let bridge = AgentBridge(sessionStore: GatewaySessionStore(home.join("sessions"), enabled: true,
+                        agentId: "phase1"))
+                    let outcome = bridge.replyWithOutcome(normalContext.sessionKey, "normal 中文🙂",
+                        channelName: "dashboard", agentId: "phase1", turnContext: Some(normalContext.turnContext))
+                    @Expect(outcome.status, "valid_text")
+                    @Expect(outcome.modelAttempts, 1)
+                    @Expect(normalModel.calls(), 1)
+                    let rows = agentBridgeMemoryRows(logPath)
+                    var modelIndex: Int64 = -1
+                    var correctionIndex: Int64 = -1
+                    var persistIndex: Int64 = -1
+                    var correctionCount: Int64 = 0
+                    for (index in 0..Int64(rows.size)) {
+                        let stage = agentBridgeJsonString(rows[index], "stage")
+                        if (stage == "model_returned") { modelIndex = index }
+                        if (stage == "final_correction_ready") {
+                            correctionIndex = index
+                            correctionCount += 1
+                            @Expect(agentBridgeJsonString(rows[index], "status"), "success")
+                            @Expect(agentBridgeJsonString(rows[index], "correctionStatus"), "not_required")
+                            @Expect(agentBridgeJsonBool(rows[index], "builderInvoked"), false)
+                            @Expect(agentBridgeJsonInt(rows[index], "contextBytes"), 0)
+                        }
+                        if (stage == "session_persisted") { persistIndex = index }
+                    }
+                    @Expect(correctionCount, 1)
+                    @Expect(modelIndex < correctionIndex && correctionIndex < persistIndex, true)
+                } finally {
+                    resetGatewayMemoryObservationForTest()
+                }
+            })
+
+            let recoverableModel = AgentBridgeC2PromptAwareModel(
+                "{\"name\":\"_answer_\",\"arguments\":{\"result\":\"normalized-main-answer\"}}",
+                "corrected-answer")
+            let recoverableName = "metis-test-s2-c2-recoverable-${DateTime.now().toUnixTimeStamp().toNanoseconds()}"
+            ModelManager.registerChatModel(recoverableName, { => recoverableModel })
+            writeAgentBridgePhase1FallbackAgentConfig(home, recoverableName, [], appServer: false)
+            let recoverableContext = gatewayResolveSessionContext(GatewaySessionRequest(
+                GatewayIngressSource.DashboardRpc, sessionHint: "s2-c2-recoverable", agentId: "phase1"
+            ))
+            withAgentBridgeRuntimeLogCapture(home, "s2-c2-recoverable", { logPath: String =>
+                resetGatewayMemoryObservationForTest()
+                setGatewayProcessRssProviderForTest(Some({ => 4096 }))
+                agentBridgeMemorySeparateFrameworkLog(home)
+                setGatewayAgentBridgePostModelAnswerForTest(recoverableContext.sessionKey, "functions._answer_")
+                try {
+                    let bridge = AgentBridge(sessionStore: GatewaySessionStore(home.join("sessions"), enabled: true,
+                        agentId: "phase1"))
+                    let outcome = bridge.replyWithOutcome(recoverableContext.sessionKey, "recover 中文🙂",
+                        channelName: "dashboard", agentId: "phase1", turnContext: Some(recoverableContext.turnContext))
+                    @Expect(outcome.status, "valid_text")
+                    @Expect(outcome.text, "corrected-answer")
+                    @Expect(outcome.modelAttempts, 2)
+                    @Expect(outcome.toolExecutionObserved, false)
+                    @Expect(recoverableModel.mainCompleted(), 1)
+                    @Expect(recoverableModel.correctionCompleted(), 1)
+                    let rows = agentBridgeMemoryRows(logPath)
+                    var modelIndex: Int64 = -1
+                    var correctionIndex: Int64 = -1
+                    var persistIndex: Int64 = -1
+                    var correctionCount: Int64 = 0
+                    for (index in 0..Int64(rows.size)) {
+                        let stage = agentBridgeJsonString(rows[index], "stage")
+                        if (stage == "model_returned") { modelIndex = index }
+                        if (stage == "final_correction_ready") {
+                            correctionIndex = index
+                            correctionCount += 1
+                            @Expect(agentBridgeJsonString(rows[index], "status"), "success")
+                            @Expect(agentBridgeJsonString(rows[index], "correctionStatus"), "ready")
+                            @Expect(agentBridgeJsonBool(rows[index], "builderInvoked"), true)
+                            @Expect(agentBridgeJsonInt(rows[index], "contextBytes") > 0, true)
+                            @Expect(agentBridgeJsonInt(rows[index], "contextBytes") <=
+                                64 * 1024 - Int64(gatewayBuildFinalAnswerCorrectionPrompt("").size), true)
+                        }
+                        if (stage == "session_persisted") { persistIndex = index }
+                    }
+                    @Expect(correctionCount, 1)
+                    @Expect(modelIndex < correctionIndex && correctionIndex < persistIndex, true)
+                } finally {
+                    clearGatewayAgentBridgePostModelAnswerForTest()
+                    resetGatewayMemoryObservationForTest()
+                }
+            })
+        })
+    }
+
+    @TestCase
+    public func s2C2N1BuilderFailureSkipsSecondModelAndKeepsTypedTerminalTruth(): Unit {
+        withAgentBridgeTempHome("metis-s2-c2-n1", { home: Path =>
+            let model = AgentBridgeC2PromptAwareModel(
+                "{\"name\":\"_answer_\",\"arguments\":{\"result\":\"normalized-main-answer\"}}",
+                "must-not-run")
+            let modelName = "metis-test-s2-c2-builder-failure-${DateTime.now().toUnixTimeStamp().toNanoseconds()}"
+            ModelManager.registerChatModel(modelName, { => model })
+            writeAgentBridgePhase1FallbackAgentConfig(home, modelName, [], appServer: false)
+            let context = gatewayResolveSessionContext(GatewaySessionRequest(
+                GatewayIngressSource.DashboardRpc, sessionHint: "s2-c2-builder-failure", agentId: "phase1"
+            ))
+            withAgentBridgeRuntimeLogCapture(home, "s2-c2-builder-failure", { logPath: String =>
+                resetGatewayMemoryObservationForTest()
+                setGatewayProcessRssProviderForTest(Some({ => 4096 }))
+                agentBridgeMemorySeparateFrameworkLog(home)
+                setGatewayAgentBridgeFinalCorrectionBuilderFailureForTest(true)
+                setGatewayAgentBridgePostModelAnswerForTest(context.sessionKey, "functions._answer_")
+                try {
+                    let bridge = AgentBridge(sessionStore: GatewaySessionStore(home.join("sessions"), enabled: true,
+                        agentId: "phase1"))
+                    let outcome = bridge.replyWithOutcome(context.sessionKey, "builder fail 中文🙂",
+                        channelName: "dashboard", agentId: "phase1", turnContext: Some(context.turnContext))
+                    @Expect(outcome.status, "incomplete_tool_protocol")
+                    @Expect(outcome.text, "")
+                    @Expect(outcome.diagnosticCode, "assistant_tool_marker")
+                    @Expect(outcome.modelAttempts, 1)
+                    @Expect(outcome.toolExecutionObserved, false)
+                    @Expect(model.mainCompleted(), 1)
+                    @Expect(model.correctionCompleted(), 0)
+                    @Expect(bridge.getHistory(context.sessionKey).size, 1)
+                    let rows = agentBridgeMemoryRows(logPath)
+                    var correctionCount: Int64 = 0
+                    var modelIndex: Int64 = -1
+                    var correctionIndex: Int64 = -1
+                    var persistIndex: Int64 = -1
+                    for (index in 0..Int64(rows.size)) {
+                        let row = rows[index]
+                        if (agentBridgeJsonString(row, "stage") == "model_returned") { modelIndex = index }
+                        if (agentBridgeJsonString(row, "stage") == "final_correction_ready") {
+                            correctionIndex = index
+                            correctionCount += 1
+                            @Expect(agentBridgeJsonString(row, "status"), "success")
+                            @Expect(agentBridgeJsonString(row, "correctionStatus"), "builder_failed")
+                            @Expect(agentBridgeJsonBool(row, "builderInvoked"), true)
+                            @Expect(agentBridgeJsonInt(row, "contextBytes"), 0)
+                        }
+                        if (agentBridgeJsonString(row, "stage") == "session_persisted") { persistIndex = index }
+                    }
+                    @Expect(correctionCount, 1)
+                    @Expect(modelIndex < correctionIndex && correctionIndex < persistIndex, true)
+                } finally {
+                    clearGatewayAgentBridgePostModelAnswerForTest()
+                    setGatewayAgentBridgeFinalCorrectionBuilderFailureForTest(false)
+                    resetGatewayMemoryObservationForTest()
+                }
+            })
+        })
+    }
+
     @TestCase
     public func s2C1U1TrackerKeepsLatestSixteenWithExactScalarTruth(): Unit {
         let tracker = GatewayToolExecutionTracker()

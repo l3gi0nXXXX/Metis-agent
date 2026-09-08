@@ -391,6 +391,9 @@ private var gatewayAgentBridgeReplyRunnerForTest: Option<(String, String, String
 private var gatewayAgentBridgeStreamingSnapshotsForTest: Option<Array<String>> = None<Array<String>>
 private var gatewayAgentBridgeFinalReplySequenceForTest: Option<(Array<String>, Array<String>, Bool)> =
     None<(Array<String>, Array<String>, Bool)>
+private var gatewayAgentBridgeFinalCorrectionBuilderFailureForTest: Bool = false
+private let gatewayAgentBridgePostModelAnswerMutexForTest = Mutex()
+private var gatewayAgentBridgePostModelAnswerForTest: Option<(String, String)> = None<(String, String)>
 
 public interface GatewayGitCodeMcpRuntimeAdapter {
     func invoke(toolName: String, args: JsonObject): JsonObject
@@ -514,6 +517,37 @@ public func setGatewayAgentBridgeFinalReplySequenceForTest(
     sequence: Option<(Array<String>, Array<String>, Bool)>
 ): Unit {
     gatewayAgentBridgeFinalReplySequenceForTest = sequence
+}
+
+func setGatewayAgentBridgeFinalCorrectionBuilderFailureForTest(enabled: Bool): Unit {
+    gatewayAgentBridgeFinalCorrectionBuilderFailureForTest = enabled
+}
+
+func setGatewayAgentBridgePostModelAnswerForTest(sessionKey: String, raw: String): Unit {
+    synchronized(gatewayAgentBridgePostModelAnswerMutexForTest) {
+        gatewayAgentBridgePostModelAnswerForTest = Some((sessionKey, raw))
+    }
+}
+
+func takeGatewayAgentBridgePostModelAnswerForTest(sessionKey: String): Option<String> {
+    synchronized(gatewayAgentBridgePostModelAnswerMutexForTest) {
+        match (gatewayAgentBridgePostModelAnswerForTest) {
+            case Some(fixture) =>
+                if (fixture[0] == sessionKey) {
+                    gatewayAgentBridgePostModelAnswerForTest = None<(String, String)>
+                    Some(fixture[1])
+                } else {
+                    None<String>
+                }
+            case None => None<String>
+        }
+    }
+}
+
+func clearGatewayAgentBridgePostModelAnswerForTest(): Unit {
+    synchronized(gatewayAgentBridgePostModelAnswerMutexForTest) {
+        gatewayAgentBridgePostModelAnswerForTest = None<(String, String)>
+    }
 }
 
 private class GatewayLifecycleToolWrapper <: Tool {
@@ -679,6 +713,7 @@ class GatewayToolExecutionTracker {
     private var droppedResultCount: Int64 = 0
     private var omittedBytes: Int64 = 0
     private var failNextRecord: Bool = false
+    private var correctionContextCalls: Int64 = 0
 
     private func omissionMarker(): String {
         if (this.omittedBytes <= 0) {
@@ -749,6 +784,7 @@ class GatewayToolExecutionTracker {
     }
 
     public func correctionContext(): String {
+        this.correctionContextCalls = gatewayToolTrackerSaturatingAdd(this.correctionContextCalls, 1)
         let out = StringBuilder()
         var hasPrevious = false
         let marker = this.omissionMarker()
@@ -779,6 +815,113 @@ class GatewayToolExecutionTracker {
             this.omittedBytes
         )
     }
+
+    func correctionContextCallsForTest(): Int64 {
+        this.correctionContextCalls
+    }
+}
+
+private const GATEWAY_FINAL_CORRECTION_ANSWER_MAX_BYTES: Int64 = 16 * 1024
+private const GATEWAY_FINAL_CORRECTION_TOOL_MAX_BYTES: Int64 = 32 * 1024
+private const GATEWAY_FINAL_CORRECTION_TOOL_SECTION = "\n\n已完成工具结果：\n"
+private const GATEWAY_FINAL_CORRECTION_ANSWER_SECTION = "\n\n模型首次输出：\n"
+
+class GatewayBoundedFinalCorrectionContext {
+    let text: String
+    let modelInputBytes: Int64
+    let toolContextBytes: Int64
+    let answerBytes: Int64
+
+    init(text: String, modelInputBytes: Int64, toolContextBytes: Int64, answerBytes: Int64) {
+        this.text = text
+        this.modelInputBytes = modelInputBytes
+        this.toolContextBytes = toolContextBytes
+        this.answerBytes = answerBytes
+    }
+}
+
+private class GatewayFinalCorrectionReadyState {
+    var published: Bool = false
+    init() {}
+}
+
+private func gatewayAgentFinalCorrectionUtf8Prefix(value: String, maxBytes: Int64): String {
+    let out = StringBuilder()
+    let _ = gatewayToolTrackerAppendUtf8(out, value, 0, max(0, maxBytes))
+    out.toString()
+}
+
+private func gatewayAgentFinalCorrectionUtf8Suffix(value: String, maxBytes: Int64): String {
+    let budget = max(0, maxBytes)
+    if (budget == 0) {
+        return ""
+    }
+    let runes = Array<Rune>(budget, repeat: r'\0')
+    let runeBytes = Array<Int64>(budget, repeat: 0)
+    var head: Int64 = 0
+    var count: Int64 = 0
+    var used: Int64 = 0
+    for (rune in value.runes()) {
+        let pieceBytes = Int64(String([rune]).size)
+        if (pieceBytes > budget) {
+            head = 0
+            count = 0
+            used = 0
+            continue
+        }
+        while (count > 0 && used + pieceBytes > budget) {
+            used -= runeBytes[head]
+            head = (head + 1) % budget
+            count -= 1
+        }
+        let tail = (head + count) % budget
+        runes[tail] = rune
+        runeBytes[tail] = pieceBytes
+        count += 1
+        used += pieceBytes
+    }
+    let out = StringBuilder()
+    for (offset in 0..count) {
+        out.append(runes[(head + offset) % budget])
+    }
+    out.toString()
+}
+
+func gatewayBuildBoundedFinalCorrectionContext(
+    modelInput: String,
+    toolContext: String,
+    answer: String,
+    contextBudget: Int64
+): GatewayBoundedFinalCorrectionContext {
+    let sectionBytes = Int64(GATEWAY_FINAL_CORRECTION_TOOL_SECTION.size) +
+        Int64(GATEWAY_FINAL_CORRECTION_ANSWER_SECTION.size)
+    let payloadBudget = max(0, contextBudget - sectionBytes)
+    let boundedAnswer = gatewayAgentFinalCorrectionUtf8Prefix(
+        answer,
+        min(GATEWAY_FINAL_CORRECTION_ANSWER_MAX_BYTES, payloadBudget)
+    )
+    let answerBytes = Int64(boundedAnswer.size)
+    let boundedToolContext = gatewayAgentFinalCorrectionUtf8Prefix(
+        toolContext,
+        min(GATEWAY_FINAL_CORRECTION_TOOL_MAX_BYTES, max(0, payloadBudget - answerBytes))
+    )
+    let toolContextBytes = Int64(boundedToolContext.size)
+    let boundedModelInput = gatewayAgentFinalCorrectionUtf8Suffix(
+        modelInput,
+        max(0, payloadBudget - answerBytes - toolContextBytes)
+    )
+    let out = StringBuilder()
+    out.append(boundedModelInput)
+    out.append(GATEWAY_FINAL_CORRECTION_TOOL_SECTION)
+    out.append(boundedToolContext)
+    out.append(GATEWAY_FINAL_CORRECTION_ANSWER_SECTION)
+    out.append(boundedAnswer)
+    GatewayBoundedFinalCorrectionContext(
+        out.toString(),
+        Int64(boundedModelInput.size),
+        toolContextBytes,
+        answerBytes
+    )
 }
 
 /**
@@ -1850,6 +1993,9 @@ public class AgentBridge {
                         case Some(control) => control.throwIfCancelled()
                         case None => ()
                     }
+                    if (let Some(raw) <- takeGatewayAgentBridgePostModelAnswerForTest(conversationKey)) {
+                        answer = raw
+                    }
                     successfulPromptTokens = if (codexAppServerPromptTokens >= 0) { codexAppServerPromptTokens } else { usagePair[0] }
                     successfulCompletionTokens = if (codexAppServerCompletionTokens >= 0) { codexAppServerCompletionTokens } else { usagePair[1] }
                     successfulModelName = currModel.fullName
@@ -1970,20 +2116,33 @@ public class AgentBridge {
                 case None => ()
             }
             let correctionModel = successfulModel
-            let correctionToolContext = toolExecutionTracker.correctionContext()
-            let correctionContextChars = Int64(modelInput.size) + Int64(correctionToolContext.size) + Int64(answer.size)
-            let _ = gatewayLogReplyMemory(
-                memoryObservation,
-                "final_correction_ready",
-                meta: gatewayLogMeta()
-                    .int("answerChars", Int64(answer.size))
-                    .int("correctionContextChars", correctionContextChars)
-                    .int("registeredTools", Int64(successfulRegisteredToolNames.size))
-                    .object()
-            )
+            let correctionAnswer = answer
+            let correctionRegisteredToolNames = successfulRegisteredToolNames
+            let finalCorrectionReadyState = GatewayFinalCorrectionReadyState()
+            let publishFinalCorrectionReady = {
+                status: String,
+                builderInvoked: Bool,
+                contextBytes: Int64 =>
+                if (!finalCorrectionReadyState.published) {
+                    finalCorrectionReadyState.published = true
+                    let _ = gatewayLogReplyMemory(
+                        memoryObservation,
+                        "final_correction_ready",
+                        meta: gatewayLogMeta()
+                            .string("correctionStatus", status)
+                            .bool("builderInvoked", builderInvoked)
+                            .int("contextBytes", contextBytes)
+                            .int("answerChars", Int64(correctionAnswer.size))
+                            .int("correctionContextChars", contextBytes)
+                            .int("registeredTools", Int64(correctionRegisteredToolNames.size))
+                            .object(),
+                        status: "success"
+                    )
+                }
+            }
             let outcome = gatewayRunFinalAnswerCorrection(
-                answer,
-                successfulRegisteredToolNames,
+                correctionAnswer,
+                correctionRegisteredToolNames,
                 { correctionPrompt: String =>
                     match (correctionModel) {
                         case Some(model) =>
@@ -1996,8 +2155,26 @@ public class AgentBridge {
                     }
                 },
                 toolExecutionObserved: toolExecutionTracker.observed,
-                existingContext: "${modelInput}\n\n已完成工具结果：\n${correctionToolContext}\n\n模型首次输出：\n${answer}"
+                existingContextBuilder: Some({ contextBudget: Int64 =>
+                    try {
+                        if (gatewayAgentBridgeFinalCorrectionBuilderFailureForTest) {
+                            throw Exception("gateway_final_correction_builder_test_failure")
+                        }
+                        let bounded = gatewayBuildBoundedFinalCorrectionContext(
+                            modelInput,
+                            toolExecutionTracker.correctionContext(),
+                            correctionAnswer,
+                            contextBudget
+                        )
+                        publishFinalCorrectionReady("ready", true, Int64(bounded.text.size))
+                        bounded.text
+                    } catch (e: Exception) {
+                        publishFinalCorrectionReady("builder_failed", true, 0)
+                        throw e
+                    }
+                })
             )
+            publishFinalCorrectionReady("not_required", false, 0)
             if (outcome.status == "valid_text") {
                 let _ = gatewayAgentRetainHistoryLine(history, "assistant: ${outcome.text}")
                 this.sessionStore.appendAssistant(

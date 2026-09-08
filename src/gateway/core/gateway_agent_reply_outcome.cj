@@ -88,12 +88,39 @@ ${existingContext}
 """
 }
 
+private const GATEWAY_FINAL_CORRECTION_PROMPT_MAX_BYTES: Int64 = 64 * 1024
+
+private func gatewayFinalCorrectionUtf8Prefix(value: String, maxBytes: Int64): String {
+    let budget = max(0, maxBytes)
+    let out = StringBuilder()
+    var used: Int64 = 0
+    for (rune in value.runes()) {
+        let piece = String([rune])
+        let pieceBytes = Int64(piece.size)
+        if (pieceBytes > budget - used) {
+            break
+        }
+        out.append(piece)
+        used += pieceBytes
+    }
+    out.toString()
+}
+
+private func gatewayFinalCorrectionContextBudgetBytes(): Int64 {
+    max(
+        0,
+        GATEWAY_FINAL_CORRECTION_PROMPT_MAX_BYTES -
+            Int64(gatewayBuildFinalAnswerCorrectionPrompt("").size)
+    )
+}
+
 public func gatewayRunFinalAnswerCorrection(
     initialRaw: String,
     registeredToolNames: Array<String>,
     correctionRunner: (String) -> String,
     toolExecutionObserved!: Bool = false,
-    existingContext!: String = ""
+    existingContext!: String = "",
+    existingContextBuilder!: Option<(Int64) -> String> = None<(Int64) -> String>
 ): GatewayAgentReplyOutcome {
     let firstGuard = normalizeGatewayAssistantFinalReply(initialRaw, registeredToolNames: registeredToolNames)
     let first = gatewayFinalOutcomeFromGuard(
@@ -104,7 +131,24 @@ public func gatewayRunFinalAnswerCorrection(
     if (!first.recoverable) {
         return first
     }
-    let correctionContext = if (existingContext.isEmpty()) { initialRaw } else { existingContext }
+    let contextBudget = gatewayFinalCorrectionContextBudgetBytes()
+    let correctionContext = match (existingContextBuilder) {
+        case Some(builder) =>
+            try {
+                gatewayFinalCorrectionUtf8Prefix(builder(contextBudget), contextBudget)
+            } catch (_: Exception) {
+                return GatewayAgentReplyOutcome(
+                    "incomplete_tool_protocol",
+                    diagnosticCode: first.diagnosticCode,
+                    modelAttempts: 1,
+                    toolExecutionObserved: toolExecutionObserved
+                )
+            }
+        case None => gatewayFinalCorrectionUtf8Prefix(
+            if (existingContext.isEmpty()) { initialRaw } else { existingContext },
+            contextBudget
+        )
+    }
     let correctedRaw = try {
         correctionRunner(gatewayBuildFinalAnswerCorrectionPrompt(correctionContext))
     } catch (_: Exception) {
