@@ -1,7 +1,7 @@
 package metis.core.prompting
 
 import std.collection.ArrayList
-import std.fs.{Path, File, Directory, FileInfo, exists, canonicalize, remove, rename}
+import std.fs.{Path, File, Directory, FileInfo, OpenMode, exists, canonicalize, remove, rename}
 import std.io.*
 import std.sync.{Condition, Mutex}
 import std.time.DateTime
@@ -17,7 +17,6 @@ private const MEMORY_FILENAME = "MEMORY.md"
 private const MEMORY_ALT_FILENAME = "memory.md"
 private const WORKSPACE_BOOTSTRAP_CACHE_MAX_ENTRIES: Int64 = 8
 private const BOOTSTRAP_LOAD_FAILURE_WARNING_PREFIX = "workspace bootstrap load failed:"
-private const INVALID_BOOTSTRAP_ENCODING = "invalid_bootstrap_encoding"
 private const UNREADABLE_BOOTSTRAP_FILE = "unreadable_bootstrap_file"
 private const BOOTSTRAP_LOAD_FAILED = "bootstrap_load_failed"
 
@@ -370,39 +369,42 @@ public func validateMetisIdentityAvatar(workspaceDir: Path, avatar: String): Met
     result
 }
 
-private func buildMissingContextFile(path: Path): MetisContextFile {
+private func buildMissingContextFile(path: Path): MetisBoundedBootstrapSource {
     let displayPath = canonicalPathString(path)
-    MetisContextFile(displayPath, "[MISSING] Expected at: ${displayPath}")
+    let content = "[MISSING] Expected at: ${displayPath}"
+    MetisBoundedBootstrapSource(displayPath, content, normalizedOriginalBytes: content.size)
 }
 
-private func loadContextFile(path: Path): MetisContextFile {
-    let bytes = try {
-        File.readFrom(path)
-    } catch (_: Exception) {
-        return MetisContextFile(
-            canonicalPathString(path),
-            "[INVALID] Workspace context file ${path.fileName}: ${UNREADABLE_BOOTSTRAP_FILE}"
-        )
+private func bootstrapFailureSource(path: Path, reason: String, source!: Option<MetisBoundedBootstrapSource> = None): MetisBoundedBootstrapSource {
+    let displayPath = canonicalPathString(path)
+    let content = "[INVALID] Workspace context file ${path.fileName}: ${reason}"
+    match (source) {
+        case Some(truth) => MetisBoundedBootstrapSource(displayPath, content, failure: reason,
+            totalScannedBytes: truth.totalScannedBytes, maxReadCallBytes: truth.maxReadCallBytes,
+            maxRetainedPayloadBytes: truth.maxRetainedPayloadBytes)
+        case None => MetisBoundedBootstrapSource(displayPath, content, failure: reason)
     }
-    let content = try {
-        String.fromUtf8(bytes)
-    } catch (_: Exception) {
-        return MetisContextFile(
-            canonicalPathString(path),
-            "[INVALID] Workspace context file ${path.fileName}: ${INVALID_BOOTSTRAP_ENCODING}"
-        )
-    }
-    MetisContextFile(canonicalPathString(path), content)
 }
 
-private func bootstrapContextFileLoadFailure(file: MetisContextFile): String {
-    if (file.content.contains(INVALID_BOOTSTRAP_ENCODING)) {
-        return INVALID_BOOTSTRAP_ENCODING
+func loadContextFile(path: Path): MetisBoundedBootstrapSource {
+    if (metisPathIsSymlink(path)) {
+        return bootstrapFailureSource(path, UNREADABLE_BOOTSTRAP_FILE)
     }
-    if (file.content.contains(UNREADABLE_BOOTSTRAP_FILE)) {
-        return UNREADABLE_BOOTSTRAP_FILE
+    try {
+        if (!FileInfo(path).isRegular()) {
+            return bootstrapFailureSource(path, UNREADABLE_BOOTSTRAP_FILE)
+        }
+        var source = bootstrapFailureSource(path, UNREADABLE_BOOTSTRAP_FILE)
+        try (file = File(path, OpenMode.Read)) {
+            source = metisScanBoundedBootstrapSource(canonicalPathString(path), {buffer: Array<Byte> =>
+                file.read(buffer)
+            })
+        }
+        if (source.failure.isEmpty()) { return source }
+        return bootstrapFailureSource(path, source.failure, source: Some(source))
+    } catch (_: Exception) {
+        return bootstrapFailureSource(path, UNREADABLE_BOOTSTRAP_FILE)
     }
-    ""
 }
 
 private func shouldIncludeInMinimalMode(fileName: String): Bool {
@@ -750,16 +752,10 @@ public func metisWorkspaceBootstrapCacheKeyForTest(
 }
 
 private func addLoadedContextFile(
-    files: ArrayList<MetisContextFile>,
-    loadFailures: ArrayList<String>,
+    files: ArrayList<MetisBoundedBootstrapSource>,
     path: Path
 ): Unit {
-    let file = loadContextFile(path)
-    let failure = bootstrapContextFileLoadFailure(file)
-    if (!failure.isEmpty()) {
-        loadFailures.add(failure)
-    }
-    files.add(file)
+    files.add(loadContextFile(path))
 }
 
 private func resolveContextFilesDetailedUncached(
@@ -767,8 +763,7 @@ private func resolveContextFilesDetailedUncached(
     promptMode: PromptMode,
     runtimeChannel: String
 ): MetisBootstrapBudgetResult {
-    let files = ArrayList<MetisContextFile>()
-    let loadFailures = ArrayList<String>()
+    let files = ArrayList<MetisBoundedBootstrapSource>()
     let minimalMode = match (promptMode) {
         case PromptMode.MinimalMode => true
         case _ => false
@@ -792,7 +787,7 @@ private func resolveContextFilesDetailedUncached(
         }
         let path = workspaceDir.join(name)
         if (exists(path)) {
-            addLoadedContextFile(files, loadFailures, path)
+            addLoadedContextFile(files, path)
         } else {
             files.add(buildMissingContextFile(path))
         }
@@ -801,32 +796,21 @@ private func resolveContextFilesDetailedUncached(
     if (!minimalMode) {
         let bootstrapPath = workspaceDir.join(BOOTSTRAP_FILENAME)
         if (!compactImMode && exists(bootstrapPath)) {
-            addLoadedContextFile(files, loadFailures, bootstrapPath)
+            addLoadedContextFile(files, bootstrapPath)
         }
 
         let memoryPath = workspaceDir.join(MEMORY_FILENAME)
         let memoryAltPath = workspaceDir.join(MEMORY_ALT_FILENAME)
         if (exists(memoryPath)) {
-            addLoadedContextFile(files, loadFailures, memoryPath)
+            addLoadedContextFile(files, memoryPath)
         } else if (exists(memoryAltPath)) {
-            addLoadedContextFile(files, loadFailures, memoryAltPath)
+            addLoadedContextFile(files, memoryAltPath)
         } else {
             files.add(buildMissingContextFile(memoryPath))
         }
     }
 
-    let result = MetisBootstrapBudget.buildContextFiles(files.toArray())
-    if (!loadFailures.isEmpty()) {
-        let warnings = ArrayList<String>()
-        for (warning in result.warnings) {
-            warnings.add(warning)
-        }
-        for (failure in loadFailures) {
-            warnings.add("${BOOTSTRAP_LOAD_FAILURE_WARNING_PREFIX} ${failure}")
-        }
-        result.warnings = warnings.toArray()
-    }
-    result
+    MetisBootstrapBudget.buildBoundedContextFiles(files.toArray())
 }
 
 public class MetisWorkspaceBootstrap {

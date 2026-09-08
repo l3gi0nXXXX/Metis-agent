@@ -153,6 +153,43 @@ private func waitForWorkspaceBootstrapInFlight(expected: Int64): Bool {
 @Test
 public class MetisWorkspaceBootstrapTest {
     @TestCase
+    public func s2B1N1FailedBoundedSourceIsNotCachedAndRepairIsReread(): Unit {
+        let root = Path("/tmp/metis-s2-b1-workspace-n1")
+        try {
+            resetMetisWorkspaceBootstrapCacheForTest()
+            cleanupWorkspaceBootstrapTestDir(root)
+            writeWorkspaceBootstrapCacheFixture(root, "# Memory\nvalid-before-failure\n")
+            File.writeTo(root.join("MEMORY.md"), [0xe4u8, 0xb8u8])
+
+            let invalid = MetisWorkspaceBootstrap.resolveContextFilesDetailed(root)
+            @Expect(workspaceBootstrapContains(invalid, "invalid_bootstrap_encoding"), true)
+            @Expect(workspaceBootstrapContains(invalid, "valid-before-failure"), false)
+            @Expect(workspaceBootstrapHasWarning(invalid, "invalid_bootstrap_encoding"), true)
+            @Expect(metisWorkspaceBootstrapCacheStatsForTest().completedEntries, 0)
+
+            remove(root.join("MEMORY.md"))
+            File.writeTo(root.join("symlink-target.md"), "must-not-load".toArray())
+            let (linkCode, _, _) = ShellUtils.execute(
+                ["ln", "-s", root.join("symlink-target.md").toString(), root.join("MEMORY.md").toString()],
+                withWrap: false
+            )
+            @Expect(linkCode, 0)
+            let symlink = loadContextFile(root.join("MEMORY.md"))
+            @Expect(symlink.failure, "unreadable_bootstrap_file")
+            @Expect(symlink.content.contains("must-not-load"), false)
+            remove(root.join("MEMORY.md"))
+            File.writeTo(root.join("MEMORY.md"), "# Memory\nrepaired中文🙂\n".toArray())
+            let repaired = MetisWorkspaceBootstrap.resolveContextFilesDetailed(root)
+            @Expect(workspaceBootstrapContains(repaired, "repaired中文🙂"), true)
+            @Expect(workspaceBootstrapHasWarning(repaired, "invalid_bootstrap_encoding"), false)
+            @Expect(metisWorkspaceBootstrapCacheStatsForTest().completedEntries, 1)
+        } finally {
+            resetMetisWorkspaceBootstrapCacheForTest()
+            cleanupWorkspaceBootstrapTestDir(root)
+        }
+    }
+
+    @TestCase
     public func s4U1BootstrapCacheReturnsDefensiveByteIdenticalResult(): Unit {
         let root = Path("/tmp/metis-bootstrap-cache-s4-u1-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
         try {
