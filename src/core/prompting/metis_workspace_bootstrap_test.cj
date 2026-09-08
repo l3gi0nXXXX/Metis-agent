@@ -4,7 +4,7 @@ import metis.utils.ShellUtils
 
 import std.collection.ArrayList
 import std.core.Duration
-import std.fs.{Directory, File, OpenMode, Path, exists, remove}
+import std.fs.{Directory, File, FileInfo, OpenMode, Path, exists, remove}
 import std.sync.{Condition, Mutex}
 import std.time.{DateTime, MonoTime}
 import std.unittest.testmacro.*
@@ -128,6 +128,14 @@ private class WorkspaceBootstrapLoadGate {
     }
 }
 
+private class S2I1BootstrapObserverTruth {
+    var calls: Int64 = 0
+    var totalScannedBytes: Int64 = 0
+    var normalizedOriginalBytes: Int64 = 0
+    var maxReadCallBytes: Int64 = 0
+    var maxRetainedPayloadBytes: Int64 = 0
+}
+
 private func waitForWorkspaceBootstrapWaiters(expected: Int64): Bool {
     let deadline = MonoTime.now() + Duration.second * 5
     while (MonoTime.now() < deadline) {
@@ -152,6 +160,65 @@ private func waitForWorkspaceBootstrapInFlight(expected: Int64): Bool {
 
 @Test
 public class MetisWorkspaceBootstrapTest {
+    @TestCase
+    public func s2I1U1BoundedObserverIsIdentityBoundAndFailureIsolated(): Unit {
+        let stamp = DateTime.now().toUnixTimeStamp().toNanoseconds()
+        let root = Path("/tmp/metis-s2-i1-bootstrap-observer-${stamp}")
+        let target = root.join("MEMORY.md")
+        let wrong = root.join("AGENTS.md")
+        let truth = S2I1BootstrapObserverTruth()
+        try {
+            Directory.create(root, recursive: true)
+            File.writeTo(target, "# Memory\nIMPORTANT 中文🙂\n".toArray())
+            File.writeTo(wrong, "# Agents\nwrong identity\n".toArray())
+            clearMetisWorkspaceBootstrapBoundedObserverForTest()
+            let defaultResult = loadContextFile(wrong)
+            @Expect(defaultResult.failure, "")
+            @Expect(truth.calls, 0)
+            setMetisWorkspaceBootstrapBoundedObserverForTest(target, {
+                totalScannedBytes: Int64,
+                normalizedOriginalBytes: Int64,
+                maxReadCallBytes: Int64,
+                maxRetainedPayloadBytes: Int64 =>
+                truth.calls += 1
+                truth.totalScannedBytes = totalScannedBytes
+                truth.normalizedOriginalBytes = normalizedOriginalBytes
+                truth.maxReadCallBytes = maxReadCallBytes
+                truth.maxRetainedPayloadBytes = maxRetainedPayloadBytes
+            })
+            let wrongResult = loadContextFile(wrong)
+            @Expect(wrongResult.failure, "")
+            @Expect(truth.calls, 0)
+            let targetResult = loadContextFile(target)
+            @Expect(targetResult.failure, "")
+            @Expect(truth.calls, 1)
+            @Expect(truth.totalScannedBytes, FileInfo(target).size)
+            @Expect(truth.normalizedOriginalBytes, FileInfo(target).size)
+            @Expect(truth.maxReadCallBytes > 0 && truth.maxReadCallBytes <= 64 * 1024, true)
+            @Expect(truth.maxRetainedPayloadBytes > 0 && truth.maxRetainedPayloadBytes <= 48 * 1024, true)
+            let second = loadContextFile(target)
+            @Expect(second.failure, "")
+            @Expect(truth.calls, 1)
+
+            setMetisWorkspaceBootstrapBoundedObserverForTest(target, {
+                _total: Int64, _normalized: Int64, _read: Int64, _retained: Int64 =>
+                truth.calls += 1
+                throw Exception("s2_i1_observer_failure")
+            })
+            let isolated = loadContextFile(target)
+            @Expect(isolated.failure, "")
+            @Expect(isolated.content, targetResult.content)
+            @Expect(truth.calls, 2)
+            let afterThrow = loadContextFile(target)
+            @Expect(afterThrow.failure, "")
+            @Expect(truth.calls, 2)
+        } finally {
+            clearMetisWorkspaceBootstrapBoundedObserverForTest()
+            resetMetisWorkspaceBootstrapCacheForTest()
+            cleanupWorkspaceBootstrapTestDir(root)
+        }
+    }
+
     @TestCase
     public func s2B1N1FailedBoundedSourceIsNotCachedAndRepairIsReread(): Unit {
         let root = Path("/tmp/metis-s2-b1-workspace-n1")

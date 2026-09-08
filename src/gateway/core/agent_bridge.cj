@@ -821,6 +821,55 @@ class GatewayToolExecutionTracker {
     }
 }
 
+private let gatewayAgentBridgeTrackerFixtureMutexForTest = Mutex()
+private var gatewayAgentBridgeTrackerFixtureForTest:
+    Option<(String, (GatewayToolExecutionTracker) -> Unit)> =
+        None<(String, (GatewayToolExecutionTracker) -> Unit)>
+
+func setGatewayAgentBridgeTrackerFixtureForTest(
+    sessionKey: String,
+    fixture: (GatewayToolExecutionTracker) -> Unit
+): Unit {
+    synchronized(gatewayAgentBridgeTrackerFixtureMutexForTest) {
+        gatewayAgentBridgeTrackerFixtureForTest = Some((sessionKey, fixture))
+    }
+}
+
+func clearGatewayAgentBridgeTrackerFixtureForTest(): Unit {
+    synchronized(gatewayAgentBridgeTrackerFixtureMutexForTest) {
+        gatewayAgentBridgeTrackerFixtureForTest =
+            None<(String, (GatewayToolExecutionTracker) -> Unit)>
+    }
+}
+
+private func takeGatewayAgentBridgeTrackerFixtureForTest(
+    sessionKey: String
+): Option<(GatewayToolExecutionTracker) -> Unit> {
+    synchronized(gatewayAgentBridgeTrackerFixtureMutexForTest) {
+        match (gatewayAgentBridgeTrackerFixtureForTest) {
+            case Some(fixture) =>
+                if (fixture[0] == sessionKey) {
+                    gatewayAgentBridgeTrackerFixtureForTest =
+                        None<(String, (GatewayToolExecutionTracker) -> Unit)>
+                    Some(fixture[1])
+                } else {
+                    None<(GatewayToolExecutionTracker) -> Unit>
+                }
+            case None => None<(GatewayToolExecutionTracker) -> Unit>
+        }
+    }
+}
+
+func runGatewayAgentBridgeTrackerFixtureForTest(
+    sessionKey: String,
+    tracker: GatewayToolExecutionTracker
+): Unit {
+    match (takeGatewayAgentBridgeTrackerFixtureForTest(sessionKey)) {
+        case Some(fixture) => try { fixture(tracker) } catch (_: Exception) { () }
+        case None => ()
+    }
+}
+
 private const GATEWAY_FINAL_CORRECTION_ANSWER_MAX_BYTES: Int64 = 16 * 1024
 private const GATEWAY_FINAL_CORRECTION_TOOL_MAX_BYTES: Int64 = 32 * 1024
 private const GATEWAY_FINAL_CORRECTION_TOOL_SECTION = "\n\n已完成工具结果：\n"
@@ -1993,6 +2042,7 @@ public class AgentBridge {
                         case Some(control) => control.throwIfCancelled()
                         case None => ()
                     }
+                    runGatewayAgentBridgeTrackerFixtureForTest(conversationKey, toolExecutionTracker)
                     if (let Some(raw) <- takeGatewayAgentBridgePostModelAnswerForTest(conversationKey)) {
                         answer = raw
                     }

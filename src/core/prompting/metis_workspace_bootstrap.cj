@@ -20,6 +20,11 @@ private const BOOTSTRAP_LOAD_FAILURE_WARNING_PREFIX = "workspace bootstrap load 
 private const UNREADABLE_BOOTSTRAP_FILE = "unreadable_bootstrap_file"
 private const BOOTSTRAP_LOAD_FAILED = "bootstrap_load_failed"
 
+private let metisWorkspaceBootstrapBoundedObserverMutexForTest = Mutex()
+private var metisWorkspaceBootstrapBoundedObserverForTest:
+    Option<(String, (Int64, Int64, Int64, Int64) -> Unit)> =
+        None<(String, (Int64, Int64, Int64, Int64) -> Unit)>
+
 // BOOTSTRAP.md is an explicit, user-created setup-state file: load it in full prompt mode
 // when present, but do not auto-create it as durable workspace memory for every agent.
 public const METIS_WORKSPACE_BOOTSTRAP_AUTOCREATES_BOOTSTRAP_FILE: Bool = false
@@ -386,6 +391,45 @@ private func bootstrapFailureSource(path: Path, reason: String, source!: Option<
     }
 }
 
+private func takeMetisWorkspaceBootstrapBoundedObserverForTest(
+    path: Path
+): Option<(Int64, Int64, Int64, Int64) -> Unit> {
+    let target = canonicalPathString(path)
+    synchronized(metisWorkspaceBootstrapBoundedObserverMutexForTest) {
+        match (metisWorkspaceBootstrapBoundedObserverForTest) {
+            case Some(fixture) =>
+                if (fixture[0] == target) {
+                    metisWorkspaceBootstrapBoundedObserverForTest =
+                        None<(String, (Int64, Int64, Int64, Int64) -> Unit)>
+                    Some(fixture[1])
+                } else {
+                    None<(Int64, Int64, Int64, Int64) -> Unit>
+                }
+            case None => None<(Int64, Int64, Int64, Int64) -> Unit>
+        }
+    }
+}
+
+private func observeMetisWorkspaceBootstrapBoundedSourceForTest(
+    path: Path,
+    source: MetisBoundedBootstrapSource
+): Unit {
+    match (takeMetisWorkspaceBootstrapBoundedObserverForTest(path)) {
+        case Some(observer) =>
+            try {
+                observer(
+                    source.totalScannedBytes,
+                    source.normalizedOriginalBytes,
+                    source.maxReadCallBytes,
+                    source.maxRetainedPayloadBytes
+                )
+            } catch (_: Exception) {
+                ()
+            }
+        case None => ()
+    }
+}
+
 func loadContextFile(path: Path): MetisBoundedBootstrapSource {
     if (metisPathIsSymlink(path)) {
         return bootstrapFailureSource(path, UNREADABLE_BOOTSTRAP_FILE)
@@ -400,6 +444,7 @@ func loadContextFile(path: Path): MetisBoundedBootstrapSource {
                 file.read(buffer)
             })
         }
+        observeMetisWorkspaceBootstrapBoundedSourceForTest(path, source)
         if (source.failure.isEmpty()) { return source }
         return bootstrapFailureSource(path, source.failure, source: Some(source))
     } catch (_: Exception) {
@@ -737,6 +782,22 @@ public func resetMetisWorkspaceBootstrapCacheForTest(): Unit {
 
 public func setMetisWorkspaceBootstrapBeforeLoadHookForTest(hook: Option<(String) -> Unit>): Unit {
     metisWorkspaceBootstrapCache.setBeforeLoadHook(hook)
+}
+
+public func setMetisWorkspaceBootstrapBoundedObserverForTest(
+    target: Path,
+    observer: (Int64, Int64, Int64, Int64) -> Unit
+): Unit {
+    synchronized(metisWorkspaceBootstrapBoundedObserverMutexForTest) {
+        metisWorkspaceBootstrapBoundedObserverForTest = Some((canonicalPathString(target), observer))
+    }
+}
+
+public func clearMetisWorkspaceBootstrapBoundedObserverForTest(): Unit {
+    synchronized(metisWorkspaceBootstrapBoundedObserverMutexForTest) {
+        metisWorkspaceBootstrapBoundedObserverForTest =
+            None<(String, (Int64, Int64, Int64, Int64) -> Unit)>
+    }
 }
 
 public func metisWorkspaceBootstrapCacheStatsForTest(): MetisWorkspaceBootstrapCacheStats {

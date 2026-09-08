@@ -9,13 +9,14 @@ import magic.model.ModelManager
 import metis.core.config.{CliConfig, CliModelRuntimeStateManager, CliSettingManager, MetisConfigManager, MetisProcessEnvironmentLock, OpenAICodexOAuthProfile, writeOpenAICodexOAuthProfile}
 import metis.core.{GatewayToolRuntimeContext, gatewayCurrentToolRuntimeContext, gatewayToolRuntimeContextDebugSummary, gatewayWithToolRuntimeContext}
 import metis.core.model.{CodexResponsesHttpRequest, CodexResponsesHttpResult, CodexResponsesHttpRunner, setCodexResponsesHttpRunnerForTest}
+import metis.core.prompting.{clearMetisWorkspaceBootstrapBoundedObserverForTest, resetMetisWorkspaceBootstrapCacheForTest, setMetisWorkspaceBootstrapBoundedObserverForTest}
 import metis.gateway.logging.{gatewayLoggingCaptureConsoleForTest, gatewayLoggingCapturedConsoleForTest, gatewayLoggingCurrentLogFile, gatewayLoggingResetForTest}
 import metis.gateway.session.{GatewayIngressSource, GatewaySessionRequest, GatewayTurnContext, gatewayResolveSessionContext}
 import metis.process.{managedStdioBroker, resetManagedStdioBrokerForTest}
 
 import std.collection.{ArrayList, HashMap}
 import std.env.{getVariable, setVariable}
-import std.fs.{Directory, File, OpenMode, Path, exists, remove}
+import std.fs.{Directory, File, FileInfo, OpenMode, Path, exists, remove}
 import std.process.executeWithOutput
 import std.sync.{AtomicBool, Condition, Mutex}
 import std.time.*
@@ -481,6 +482,12 @@ private class AgentBridgeC2PromptAwareModel <: ChatModel {
     private let correctionAnswer: String
     private var mainCompletedCount: Int64 = 0
     private var correctionCompletedCount: Int64 = 0
+    private var correctionPromptBytes: Int64 = 0
+    private var mainHasMemoryIndex: Bool = false
+    private var mainHasRecentTail: Bool = false
+    private var mainHasOldHead: Bool = false
+    private var mainCurrentCount: Int64 = 0
+    private var correctionHasOmissionMarker: Bool = false
     private var _maxTokens: Option<Int64> = None
 
     public init(mainAnswer: String, correctionAnswer: String) {
@@ -503,8 +510,17 @@ private class AgentBridgeC2PromptAwareModel <: ChatModel {
         let response = ChatResponse(this.fullName,
             Message.assistant(if (isCorrection) { this.correctionAnswer } else { this.mainAnswer }))
         if (isCorrection) {
+            this.correctionPromptBytes = Int64(request.messageList[0].content.size)
+            this.correctionHasOmissionMarker = request.messageList[0].content.contains(
+                "[tool-results-omitted droppedResultCount=97 omittedBytes=794724]")
             this.correctionCompletedCount += 1
         } else {
+            for (message in request.messageList) {
+                this.mainHasMemoryIndex = this.mainHasMemoryIndex || message.content.contains("## Memory Index")
+                this.mainHasRecentTail = this.mainHasRecentTail || message.content.contains("seed-9999")
+                this.mainHasOldHead = this.mainHasOldHead || message.content.contains("seed-0")
+                this.mainCurrentCount += Int64(message.content.split("S2-I1 current 中文🙂").size - 1)
+            }
             this.mainCompletedCount += 1
         }
         response
@@ -516,6 +532,12 @@ private class AgentBridgeC2PromptAwareModel <: ChatModel {
 
     public func mainCompleted(): Int64 { this.mainCompletedCount }
     public func correctionCompleted(): Int64 { this.correctionCompletedCount }
+    public func correctionPromptBytesForTest(): Int64 { this.correctionPromptBytes }
+    public func mainHasMemoryIndexForTest(): Bool { this.mainHasMemoryIndex }
+    public func mainHasRecentTailForTest(): Bool { this.mainHasRecentTail }
+    public func mainHasOldHeadForTest(): Bool { this.mainHasOldHead }
+    public func mainCurrentCountForTest(): Int64 { this.mainCurrentCount }
+    public func correctionHasOmissionMarkerForTest(): Bool { this.correctionHasOmissionMarker }
 }
 
 private class AgentBridgeS4RssOverlapProbe {
@@ -947,6 +969,41 @@ private func agentBridgeC1OmissionMarker(droppedResultCount: Int64, omittedBytes
     "[tool-results-omitted droppedResultCount=${droppedResultCount} omittedBytes=${omittedBytes}]"
 }
 
+private class AgentBridgeS2I1Truth {
+    var bootstrapCalls: Int64 = 0
+    var bootstrapScannedBytes: Int64 = 0
+    var bootstrapNormalizedBytes: Int64 = 0
+    var bootstrapMaxReadBytes: Int64 = 0
+    var bootstrapMaxRetainedBytes: Int64 = 0
+    var fixtureCalls: Int64 = 0
+    var sideEffectCalls: Int64 = 0
+    var trackerEntries: Int64 = 0
+    var trackerRetainedBytes: Int64 = 0
+    var trackerAggregateBytes: Int64 = 0
+    var trackerDropped: Int64 = 0
+    var trackerOmittedBytes: Int64 = 0
+}
+
+private func agentBridgeS2I1WriteTenMiB(path: Path): Unit {
+    Directory.create(path.parent, recursive: true)
+    let chunk = Array<Byte>(64 * 1024, repeat: 97)
+    chunk[0] = 73
+    chunk[1] = 77
+    chunk[2] = 80
+    chunk[3] = 79
+    chunk[4] = 82
+    chunk[5] = 84
+    chunk[6] = 65
+    chunk[7] = 78
+    chunk[8] = 84
+    chunk[9] = 10
+    try (file = File(path, OpenMode.Write)) {
+        for (_ in 0..160) {
+            file.write(chunk)
+        }
+    }
+}
+
 private func agentBridgeRuntimeWrappedProbeForContext(context: GatewayToolRuntimeContext): Tool {
     let tools = ArrayList<Tool>()
     tools.add(AgentBridgeRuntimeContextProbeTool())
@@ -999,6 +1056,171 @@ public class AgentBridgeC0ContractTest {
 
 @Test
 public class AgentBridgeRuntimeTest {
+    @TestCase
+    public func s2I1U1TrackerFixtureIsIdentityBoundOneShotAndFailureIsolated(): Unit {
+        let tracker = GatewayToolExecutionTracker()
+        let truth = AgentBridgeS2I1Truth()
+        clearGatewayAgentBridgeTrackerFixtureForTest()
+        try {
+            runGatewayAgentBridgeTrackerFixtureForTest("default", tracker)
+            @Expect(truth.fixtureCalls, 0)
+            setGatewayAgentBridgeTrackerFixtureForTest("expected-session", { actual: GatewayToolExecutionTracker =>
+                truth.fixtureCalls += 1
+                actual.recordResult("identity", "中文🙂")
+            })
+            runGatewayAgentBridgeTrackerFixtureForTest("wrong-session", tracker)
+            @Expect(truth.fixtureCalls, 0)
+            @Expect(tracker.truthForTest()[0], 0)
+            runGatewayAgentBridgeTrackerFixtureForTest("expected-session", tracker)
+            @Expect(truth.fixtureCalls, 1)
+            @Expect(tracker.truthForTest()[0], 1)
+            runGatewayAgentBridgeTrackerFixtureForTest("expected-session", tracker)
+            @Expect(truth.fixtureCalls, 1)
+            @Expect(tracker.truthForTest()[0], 1)
+
+            setGatewayAgentBridgeTrackerFixtureForTest("throw-session", { _actual: GatewayToolExecutionTracker =>
+                truth.fixtureCalls += 1
+                throw Exception("s2_i1_tracker_fixture_failure")
+            })
+            runGatewayAgentBridgeTrackerFixtureForTest("throw-session", tracker)
+            @Expect(truth.fixtureCalls, 2)
+            runGatewayAgentBridgeTrackerFixtureForTest("throw-session", tracker)
+            @Expect(truth.fixtureCalls, 2)
+            @Expect(tracker.truthForTest()[0], 1)
+        } finally {
+            clearGatewayAgentBridgeTrackerFixtureForTest()
+        }
+    }
+
+    @TestCase
+    public func e2eS201CombinedPeakBudgetsPreserveReplyAndPersistenceTruth(): Unit {
+        withAgentBridgeTempHome("metis-s2-i1-e2e", { home: Path =>
+            let truth = AgentBridgeS2I1Truth()
+            let model = AgentBridgeC2PromptAwareModel(
+                "{\"name\":\"_answer_\",\"arguments\":{\"result\":\"normalized-main-answer\"}}",
+                "S2-I1 corrected 中文🙂")
+            let modelName = "metis-test-s2-i1-${DateTime.now().toUnixTimeStamp().toNanoseconds()}"
+            ModelManager.registerChatModel(modelName, { => model })
+            writeAgentBridgePhase1FallbackAgentConfig(home, modelName, [], appServer: false)
+            let workspace = home.join("workspaces").join("phase1")
+            let memory = workspace.join("MEMORY.md")
+            agentBridgeS2I1WriteTenMiB(memory)
+            let context = gatewayResolveSessionContext(GatewaySessionRequest(
+                GatewayIngressSource.DashboardRpc, sessionHint: "s2-i1-e2e", agentId: "phase1"
+            ))
+            let store = GatewaySessionStore(home.join("sessions"), enabled: true, agentId: "phase1")
+            Directory.create(store.sessionsRoot(), recursive: true)
+            agentBridgeA2WriteHistory(store.transcriptPath(context.sessionKey), 10000)
+            try {
+                resetMetisWorkspaceBootstrapCacheForTest()
+                setMetisWorkspaceBootstrapBoundedObserverForTest(memory, {
+                scanned: Int64, normalized: Int64, maxRead: Int64, maxRetained: Int64 =>
+                truth.bootstrapCalls += 1
+                truth.bootstrapScannedBytes = scanned
+                truth.bootstrapNormalizedBytes = normalized
+                truth.bootstrapMaxReadBytes = maxRead
+                truth.bootstrapMaxRetainedBytes = maxRetained
+                })
+                setGatewayAgentBridgeTrackerFixtureForTest(context.sessionKey, { tracker: GatewayToolExecutionTracker =>
+                truth.fixtureCalls += 1
+                let probe = AgentBridgeC1ProbeTool("c1_large_tool", "z" * 8178)
+                let wrapped = agentBridgeC1WrappedTool(probe, tracker)
+                for (_ in 0..100) {
+                    let response = wrapped.invoke(HashMap<String, JsonValue>())
+                    @Expect(response.isError, false)
+                }
+                let trackerTruth = tracker.truthForTest()
+                truth.sideEffectCalls = probe.calls
+                truth.trackerEntries = trackerTruth[0]
+                truth.trackerRetainedBytes = trackerTruth[1]
+                truth.trackerAggregateBytes = trackerTruth[2]
+                truth.trackerDropped = trackerTruth[3]
+                truth.trackerOmittedBytes = trackerTruth[4]
+                })
+                setGatewayAgentBridgePostModelAnswerForTest(context.sessionKey, "functions._answer_")
+                withAgentBridgeRuntimeLogCapture(home, "s2-i1-e2e", { logPath: String =>
+                resetGatewayMemoryObservationForTest()
+                setGatewayProcessRssProviderForTest(Some({ => 4096 }))
+                agentBridgeMemorySeparateFrameworkLog(home)
+                try {
+                    let bridge = AgentBridge(sessionStore: store)
+                    let outcome = bridge.replyWithOutcome(
+                        context.sessionKey,
+                        "S2-I1 current 中文🙂",
+                        channelName: "dashboard",
+                        agentId: "phase1",
+                        turnContext: Some(context.turnContext)
+                    )
+                    let resident = bridge.residentHistoryTruthForTest(context.sessionKey)
+                    let rows = agentBridgeMemoryRows(logPath)
+                    let stages = ArrayList<String>()
+                    var correctionReadyCount: Int64 = 0
+                    var correctionContextBytes: Int64 = 0
+                    for (row in rows) {
+                        stages.add(agentBridgeJsonString(row, "stage"))
+                        if (agentBridgeJsonString(row, "stage") == "final_correction_ready") {
+                            correctionReadyCount += 1
+                            @Expect(agentBridgeJsonString(row, "status"), "success")
+                            @Expect(agentBridgeJsonString(row, "correctionStatus"), "ready")
+                            @Expect(agentBridgeJsonBool(row, "builderInvoked"), true)
+                            correctionContextBytes = agentBridgeJsonInt(row, "contextBytes")
+                        }
+                    }
+                    let full = bridge.getHistory(context.sessionKey)
+
+                    @Expect(outcome.status, "valid_text")
+                    @Expect(outcome.text, "S2-I1 corrected 中文🙂")
+                    @Expect(outcome.modelAttempts, 2)
+                    @Expect(outcome.toolExecutionObserved, true)
+                    @Expect(model.mainCompleted(), 1)
+                    @Expect(model.correctionCompleted(), 1)
+                    @Expect(model.mainHasMemoryIndexForTest(), true)
+                    @Expect(model.mainHasRecentTailForTest(), true)
+                    @Expect(model.mainHasOldHeadForTest(), false)
+                    @Expect(model.mainCurrentCountForTest(), 1)
+                    @Expect(model.correctionHasOmissionMarkerForTest(), true)
+                    @Expect(model.correctionPromptBytesForTest() > 0 &&
+                        model.correctionPromptBytesForTest() <= 64 * 1024, true)
+                    @Expect(correctionReadyCount, 1)
+                    @Expect(correctionContextBytes > 0 && correctionContextBytes <=
+                        64 * 1024 - Int64(gatewayBuildFinalAnswerCorrectionPrompt("").size), true)
+                    @Expect(model.correctionPromptBytesForTest(),
+                        Int64(gatewayBuildFinalAnswerCorrectionPrompt("").size) + correctionContextBytes)
+                    @Expect(truth.bootstrapCalls, 1)
+                    @Expect(truth.bootstrapScannedBytes, 10 * 1024 * 1024)
+                    @Expect(truth.bootstrapNormalizedBytes, 10 * 1024 * 1024)
+                    @Expect(truth.bootstrapScannedBytes, FileInfo(memory).size)
+                    @Expect(truth.bootstrapMaxReadBytes > 0 && truth.bootstrapMaxReadBytes <= 64 * 1024, true)
+                    @Expect(truth.bootstrapMaxRetainedBytes > 0 && truth.bootstrapMaxRetainedBytes <= 48 * 1024, true)
+                    @Expect(resident[0] <= 12, true)
+                    @Expect(resident[1] <= 512 * 1024, true)
+                    @Expect(truth.fixtureCalls, 1)
+                    @Expect(truth.sideEffectCalls, 100)
+                    @Expect(truth.trackerEntries, 3)
+                    @Expect(truth.trackerRetainedBytes, 24576)
+                    @Expect(truth.trackerAggregateBytes <= 32 * 1024, true)
+                    @Expect(truth.trackerDropped, 97)
+                    @Expect(truth.trackerOmittedBytes, 794724)
+                    @Expect(stages.toArray(), [
+                        "turn_enter", "history_loaded", "model_input_built", "system_prompt_built",
+                        "model_returned", "final_correction_ready", "session_persisted", "turn_exit", "turn_summary"
+                    ])
+                    @Expect(full.size, 10002)
+                    @Expect(full[10000], "user: S2-I1 current 中文🙂")
+                    @Expect(full[10001], "assistant: S2-I1 corrected 中文🙂")
+                } finally {
+                    resetGatewayMemoryObservationForTest()
+                }
+                })
+            } finally {
+                clearGatewayAgentBridgePostModelAnswerForTest()
+                clearGatewayAgentBridgeTrackerFixtureForTest()
+                clearMetisWorkspaceBootstrapBoundedObserverForTest()
+                resetMetisWorkspaceBootstrapCacheForTest()
+            }
+        })
+    }
+
     @TestCase
     public func s2C2U1PostModelAnswerFixtureIsIdentityBoundAndOneShot(): Unit {
         clearGatewayAgentBridgePostModelAnswerForTest()
