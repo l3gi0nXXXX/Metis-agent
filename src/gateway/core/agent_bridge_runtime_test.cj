@@ -796,6 +796,72 @@ private class AgentBridgeRuntimeContextProbeTool <: Tool {
     }
 }
 
+private class AgentBridgeC1ProbeTool <: Tool {
+    private let toolName: String
+    private let result: String
+    private let resultIsError: Bool
+    private let shouldThrow: Bool
+    public var calls: Int64 = 0
+
+    public init(
+        toolName: String,
+        result: String,
+        resultIsError!: Bool = false,
+        shouldThrow!: Bool = false
+    ) {
+        this.toolName = toolName
+        this.result = result
+        this.resultIsError = resultIsError
+        this.shouldThrow = shouldThrow
+    }
+
+    public prop name: String { get() { this.toolName } }
+    public prop description: String { get() { "S2-C1 tracker probe" } }
+    public prop parameters: Array<ToolParameter> { get() { [] } }
+    public prop retType: TypeSchema { get() { TypeSchema.Str } }
+    public prop examples: Array<String> { get() { [] } }
+    public prop extra: HashMap<String, String> { get() { HashMap<String, String>() } }
+
+    public func invoke(_args: HashMap<String, JsonValue>): ToolResponse {
+        this.calls += 1
+        if (this.shouldThrow) {
+            throw Exception("s2_c1_inner_throw")
+        }
+        ToolResponse(this.result, isError: this.resultIsError)
+    }
+
+    public func toJsonValue(): JsonValue { JsonString(this.name) }
+}
+
+private func agentBridgeC1WrappedTool(
+    tool: Tool,
+    tracker: GatewayToolExecutionTracker,
+    policyRoot!: JsonObject = JsonObject()
+): Tool {
+    let tools = ArrayList<Tool>()
+    tools.add(tool)
+    gatewayLifecycleWrappedTools(
+        tools,
+        policyRoot: policyRoot,
+        inventory: [tool.name],
+        executionTracker: Some(tracker)
+    )[0]
+}
+
+private func agentBridgeC1DenyPolicy(toolName: String): JsonObject {
+    let deny = JsonArray([])
+    deny.add(JsonString(toolName))
+    let tools = JsonObject()
+    tools.put("deny", deny)
+    let root = JsonObject()
+    root.put("tools", tools)
+    root
+}
+
+private func agentBridgeC1OmissionMarker(droppedResultCount: Int64, omittedBytes: Int64): String {
+    "[tool-results-omitted droppedResultCount=${droppedResultCount} omittedBytes=${omittedBytes}]"
+}
+
 private func agentBridgeRuntimeWrappedProbeForContext(context: GatewayToolRuntimeContext): Tool {
     let tools = ArrayList<Tool>()
     tools.add(AgentBridgeRuntimeContextProbeTool())
@@ -848,6 +914,178 @@ public class AgentBridgeC0ContractTest {
 
 @Test
 public class AgentBridgeRuntimeTest {
+    @TestCase
+    public func s2C1U1TrackerKeepsLatestSixteenWithExactScalarTruth(): Unit {
+        let tracker = GatewayToolExecutionTracker()
+        tracker.recordResult("tool", "oldest-secret-only")
+        for (i in 1..16) {
+            tracker.recordResult("tool", "result-${i}-中文🙂")
+        }
+        let before = tracker.truthForTest()
+        @Expect(before[0], 16)
+        @Expect(before[3], 0)
+        @Expect(before[4], 0)
+
+        tracker.recordResult("tool", "result-16-中文🙂")
+        let truth = tracker.truthForTest()
+        let omittedBytes = Int64("tool: oldest-secret-only".size)
+        let marker = agentBridgeC1OmissionMarker(1, omittedBytes)
+        let context = tracker.correctionContext()
+        @Expect(truth[0], 16)
+        @Expect(truth[3], 1)
+        @Expect(truth[4], omittedBytes)
+        @Expect(truth[2], Int64(context.size))
+        @Expect(context.startsWith(marker), true)
+        @Expect(context.split(marker).size, 2)
+        @Expect(context.contains("oldest-secret-only"), false)
+        @Expect(context.contains("tool: result-1-中文🙂"), true)
+        @Expect(context.contains("tool: result-16-中文🙂"), true)
+        @Expect(truth[0] <= 16, true)
+        @Expect(truth[2] <= 32 * 1024, true)
+    }
+
+    @TestCase
+    public func s2C1B1TrackerEnforcesExactItemAndAggregateUtf8ByteBoundaries(): Unit {
+        let exactItem = GatewayToolExecutionTracker()
+        exactItem.recordResult("t", ("🙂" * 2047) + "x")
+        let exactItemTruth = exactItem.truthForTest()
+        @Expect(exactItemTruth[0], 1)
+        @Expect(exactItemTruth[1], 8192)
+        @Expect(exactItemTruth[2], 8192)
+        @Expect(exactItemTruth[3], 0)
+        @Expect(exactItemTruth[4], 0)
+        @Expect(exactItem.correctionContext().size, 8192)
+
+        let overItem = GatewayToolExecutionTracker()
+        overItem.recordResult("t", ("🙂" * 2047) + "x🙂")
+        let overItemTruth = overItem.truthForTest()
+        let overItemMarker = agentBridgeC1OmissionMarker(0, 4)
+        @Expect(overItemTruth[0], 1)
+        @Expect(overItemTruth[1], 8192)
+        @Expect(overItemTruth[3], 0)
+        @Expect(overItemTruth[4], 4)
+        @Expect(overItem.correctionContext().startsWith(overItemMarker), true)
+        @Expect(overItem.correctionContext().contains("x🙂"), false)
+
+        let exactAggregate = GatewayToolExecutionTracker()
+        for (name in ["a", "b", "c"]) {
+            exactAggregate.recordResult(name, "v" * 8189)
+        }
+        exactAggregate.recordResult("d", "v" * 8183)
+        let exactAggregateTruth = exactAggregate.truthForTest()
+        @Expect(exactAggregateTruth[0], 4)
+        @Expect(exactAggregateTruth[1], 32762)
+        @Expect(exactAggregateTruth[2], 32768)
+        @Expect(exactAggregateTruth[3], 0)
+        @Expect(exactAggregateTruth[4], 0)
+
+        let overAggregate = GatewayToolExecutionTracker()
+        for (name in ["a", "b", "c"]) {
+            overAggregate.recordResult(name, "v" * 8189)
+        }
+        overAggregate.recordResult("d", "v" * 8184)
+        let overAggregateTruth = overAggregate.truthForTest()
+        let overAggregateContext = overAggregate.correctionContext()
+        @Expect(overAggregateTruth[0], 3)
+        @Expect(overAggregateTruth[1], 24571)
+        @Expect(overAggregateTruth[3], 1)
+        @Expect(overAggregateTruth[4], 8192)
+        @Expect(overAggregateTruth[2], Int64(overAggregateContext.size))
+        @Expect(overAggregateTruth[2] <= 32768, true)
+        @Expect(overAggregateContext.startsWith(agentBridgeC1OmissionMarker(1, 8192)), true)
+        @Expect(overAggregateContext.contains("a: "), false)
+        @Expect(overAggregateContext.contains("b: "), true)
+    }
+
+    @TestCase
+    public func s2C1P1HundredWrappedToolResultsStayBoundedWithoutRepeatingSideEffects(): Unit {
+        let tracker = GatewayToolExecutionTracker()
+        let probe = AgentBridgeC1ProbeTool("c1_large_tool", "z" * 8178)
+        let wrapped = agentBridgeC1WrappedTool(probe, tracker)
+        for (_ in 0..100) {
+            let response = wrapped.invoke(HashMap<String, JsonValue>())
+            @Expect(response.isError, false)
+            @Expect(response.content.size, 8178)
+        }
+        let truth = tracker.truthForTest()
+        let context = tracker.correctionContext()
+        @Expect(probe.calls, 100)
+        @Expect(tracker.observed, true)
+        @Expect(truth[0], 3)
+        @Expect(truth[1], 24576)
+        @Expect(truth[3], 97)
+        @Expect(truth[4], 794724)
+        @Expect(truth[2], Int64(context.size))
+        @Expect(truth[2] <= 32768, true)
+        @Expect(context.startsWith(agentBridgeC1OmissionMarker(97, 794724)), true)
+        @Expect(context.split("[tool-results-omitted ").size, 2)
+    }
+
+    @TestCase
+    public func s2C1N1WrapperPreservesSuccessErrorThrowAndPolicyTruthWhenTrackingFails(): Unit {
+        let tracker = GatewayToolExecutionTracker()
+        let success = AgentBridgeC1ProbeTool("c1_success", "success-中文🙂")
+        let successResponse = agentBridgeC1WrappedTool(success, tracker).invoke(HashMap<String, JsonValue>())
+        @Expect(successResponse.content, "success-中文🙂")
+        @Expect(successResponse.isError, false)
+
+        let error = AgentBridgeC1ProbeTool("c1_error", "typed-error", resultIsError: true)
+        let errorResponse = agentBridgeC1WrappedTool(error, tracker).invoke(HashMap<String, JsonValue>())
+        @Expect(errorResponse.content, "typed-error")
+        @Expect(errorResponse.isError, true)
+
+        tracker.failNextRecordForTest()
+        let trackedFailure = AgentBridgeC1ProbeTool("c1_tracker_failure", "side-effect-complete")
+        let trackedFailureResponse = agentBridgeC1WrappedTool(trackedFailure, tracker).invoke(HashMap<String, JsonValue>())
+        @Expect(trackedFailureResponse.content, "side-effect-complete")
+        @Expect(trackedFailureResponse.isError, false)
+        @Expect(trackedFailure.calls, 1)
+        @Expect(tracker.truthForTest()[0], 2)
+
+        tracker.failNextRecordForTest()
+        let trackedErrorFailure = AgentBridgeC1ProbeTool(
+            "c1_tracker_error_failure",
+            "error-side-effect-complete",
+            resultIsError: true
+        )
+        let trackedErrorFailureResponse = agentBridgeC1WrappedTool(
+            trackedErrorFailure,
+            tracker
+        ).invoke(HashMap<String, JsonValue>())
+        @Expect(trackedErrorFailureResponse.content, "error-side-effect-complete")
+        @Expect(trackedErrorFailureResponse.isError, true)
+        @Expect(trackedErrorFailure.calls, 1)
+        @Expect(tracker.truthForTest()[0], 2)
+
+        let throwingTracker = GatewayToolExecutionTracker()
+        let throwing = AgentBridgeC1ProbeTool("c1_throw", "not-returned", shouldThrow: true)
+        var throwMessage = ""
+        try {
+            let _ = agentBridgeC1WrappedTool(throwing, throwingTracker).invoke(HashMap<String, JsonValue>())
+        } catch (e: Exception) {
+            throwMessage = e.message
+        }
+        @Expect(throwMessage, "s2_c1_inner_throw")
+        @Expect(throwing.calls, 1)
+        @Expect(throwingTracker.observed, true)
+        @Expect(throwingTracker.truthForTest()[0], 0)
+
+        let deniedTracker = GatewayToolExecutionTracker()
+        let denied = AgentBridgeC1ProbeTool("c1_denied", "must-not-run")
+        let deniedResponse = agentBridgeC1WrappedTool(
+            denied,
+            deniedTracker,
+            policyRoot: agentBridgeC1DenyPolicy("c1_denied")
+        ).invoke(HashMap<String, JsonValue>())
+        @Expect(deniedResponse.isError, true)
+        @Expect(denied.calls, 0)
+        @Expect(deniedTracker.observed, false)
+        @Expect(deniedTracker.truthForTest()[0], 0)
+        @Expect(tracker.correctionContext().contains("side-effect-complete"), false)
+        @Expect(tracker.correctionContext().contains("error-side-effect-complete"), false)
+        @Expect(tracker.correctionContext().contains("must-not-run"), false)
+    }
+
     @TestCase
     public func s2A2U1InitialTenThousandHistoryUsesRecentResidentAndFullDiskHistory(): Unit {
         withAgentBridgeTempHome("metis-s2-a2-u1", { home: Path =>

@@ -630,16 +630,154 @@ private class GatewayLifecycleToolWrapper <: Tool {
     }
 }
 
+private const GATEWAY_TOOL_TRACKER_MAX_RESULTS: Int64 = 16
+private const GATEWAY_TOOL_TRACKER_MAX_RESULT_BYTES: Int64 = 8 * 1024
+private const GATEWAY_TOOL_TRACKER_MAX_AGGREGATE_BYTES: Int64 = 32 * 1024
+
+private class GatewayToolExecutionRecord {
+    public let rendered: String
+    public let renderedBytes: Int64
+
+    public init(rendered: String) {
+        this.rendered = rendered
+        this.renderedBytes = Int64(rendered.size)
+    }
+}
+
+private func gatewayToolTrackerSaturatingAdd(left: Int64, right: Int64): Int64 {
+    if (right <= 0) {
+        return left
+    }
+    if (left >= Int64.Max - right) {
+        return Int64.Max
+    }
+    left + right
+}
+
+private func gatewayToolTrackerAppendUtf8(
+    out: StringBuilder,
+    value: String,
+    usedBytes: Int64,
+    maxBytes: Int64
+): Int64 {
+    var used = usedBytes
+    for (rune in value.runes()) {
+        let piece = String([rune])
+        let pieceBytes = Int64(piece.size)
+        if (pieceBytes > maxBytes - used) {
+            break
+        }
+        out.append(piece)
+        used += pieceBytes
+    }
+    used
+}
+
 class GatewayToolExecutionTracker {
     public var observed: Bool = false
-    private let results = ArrayList<String>()
+    private let results = ArrayList<GatewayToolExecutionRecord>()
+    private var droppedResultCount: Int64 = 0
+    private var omittedBytes: Int64 = 0
+    private var failNextRecord: Bool = false
+
+    private func omissionMarker(): String {
+        if (this.omittedBytes <= 0) {
+            return ""
+        }
+        "[tool-results-omitted droppedResultCount=${this.droppedResultCount} omittedBytes=${this.omittedBytes}]"
+    }
+
+    private func retainedRenderedBytes(): Int64 {
+        var total: Int64 = 0
+        for (record in this.results) {
+            total += record.renderedBytes
+        }
+        total
+    }
+
+    private func aggregateBytes(): Int64 {
+        let markerBytes = Int64(this.omissionMarker().size)
+        let componentCount = Int64(this.results.size) + if (markerBytes > 0) { 1 } else { 0 }
+        let delimiterBytes = if (componentCount > 1) { (componentCount - 1) * 2 } else { 0 }
+        markerBytes + this.retainedRenderedBytes() + delimiterBytes
+    }
+
+    private func dropOldest(): Unit {
+        let removed = this.results.remove(at: 0)
+        this.droppedResultCount = gatewayToolTrackerSaturatingAdd(this.droppedResultCount, 1)
+        this.omittedBytes = gatewayToolTrackerSaturatingAdd(this.omittedBytes, removed.renderedBytes)
+    }
+
+    private func enforceBudgets(): Unit {
+        while (Int64(this.results.size) > GATEWAY_TOOL_TRACKER_MAX_RESULTS) {
+            this.dropOldest()
+        }
+        while (!this.results.isEmpty() && this.aggregateBytes() > GATEWAY_TOOL_TRACKER_MAX_AGGREGATE_BYTES) {
+            this.dropOldest()
+        }
+    }
+
+    private func recordResultUnchecked(toolName: String, content: String): Unit {
+        if (this.failNextRecord) {
+            this.failNextRecord = false
+            throw Exception("gateway_tool_tracker_test_failure")
+        }
+        let originalRenderedBytes = gatewayToolTrackerSaturatingAdd(
+            gatewayToolTrackerSaturatingAdd(Int64(toolName.size), 2),
+            Int64(content.size)
+        )
+        let out = StringBuilder()
+        var used: Int64 = 0
+        used = gatewayToolTrackerAppendUtf8(out, toolName, used, GATEWAY_TOOL_TRACKER_MAX_RESULT_BYTES)
+        used = gatewayToolTrackerAppendUtf8(out, ": ", used, GATEWAY_TOOL_TRACKER_MAX_RESULT_BYTES)
+        let _ = gatewayToolTrackerAppendUtf8(out, content, used, GATEWAY_TOOL_TRACKER_MAX_RESULT_BYTES)
+        let record = GatewayToolExecutionRecord(out.toString())
+        this.omittedBytes = gatewayToolTrackerSaturatingAdd(
+            this.omittedBytes,
+            max(0, originalRenderedBytes - record.renderedBytes)
+        )
+        this.results.add(record)
+        this.enforceBudgets()
+    }
 
     public func recordResult(toolName: String, content: String): Unit {
-        this.results.add("${toolName}: ${metisSafeRuneEllipsis(content, 8000)}")
+        try {
+            this.recordResultUnchecked(toolName, content)
+        } catch (_: Exception) {
+            this.failNextRecord = false
+        }
     }
 
     public func correctionContext(): String {
-        String.join(this.results.toArray(), delimiter: "\n\n")
+        let out = StringBuilder()
+        var hasPrevious = false
+        let marker = this.omissionMarker()
+        if (!marker.isEmpty()) {
+            out.append(marker)
+            hasPrevious = true
+        }
+        for (record in this.results) {
+            if (hasPrevious) {
+                out.append("\n\n")
+            }
+            out.append(record.rendered)
+            hasPrevious = true
+        }
+        out.toString()
+    }
+
+    func failNextRecordForTest(): Unit {
+        this.failNextRecord = true
+    }
+
+    func truthForTest(): (Int64, Int64, Int64, Int64, Int64) {
+        (
+            Int64(this.results.size),
+            this.retainedRenderedBytes(),
+            this.aggregateBytes(),
+            this.droppedResultCount,
+            this.omittedBytes
+        )
     }
 }
 
