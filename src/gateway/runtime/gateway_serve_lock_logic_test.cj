@@ -5,6 +5,7 @@ import metis.gateway.process.{gatewayStdioBrokerReady, gatewayStdioBrokerSnapsho
 import metis.gateway.service_plugin.loadServicePluginManifest
 import metis.gateway.core.GatewayStopResult
 import metis.process.{ProcessInstanceIdentity, currentProcessInstanceIdentity, managedStdioBroker, managedStdioResolveBrokerScriptPath, probeProcessInstance, processInstanceKillSignal, processInstanceTermSignal, resetManagedStdioBrokerForTest, signalProcessInstance}
+import metis.utils.ShellTimeoutException
 import std.collection.{ArrayList, HashMap, HashSet}
 import std.convert.Parsable
 import std.core.Duration
@@ -1547,12 +1548,13 @@ private func withGatewayHeartbeatProbeEnvironment(name: String, block: (Path, Pa
             gatewayReleaseServeLockQuiet()
             let finalReset = resetManagedStdioBrokerForTest()
             @Expect(finalReset.ok, true)
-            let _ = gatewayHeartbeatBrokerIsFullyStopped()
             match (oldHome) { case Some(value) => setVariable("METIS_HOME", value) case None => setVariable("METIS_HOME", "") }
             match (oldPath) { case Some(value) => setVariable("PATH", value) case None => setVariable("PATH", "") }
             CliConfig.invalidatePathCache()
             MetisConfigManager.invalidate()
             CliSettingManager.invalidate()
+            let finalStopped = gatewayHeartbeatBrokerIsFullyStopped()
+            @Expect(finalStopped, true)
             try { remove(root, recursive: true) } catch (_: Exception) { () }
         }
     }
@@ -1586,6 +1588,51 @@ private func gatewayShutdownPhaseNegativeProof(root: Path, identity: GatewayServ
 
 @Test
 public class GatewayServeLockLogicTest {
+    @TestCase
+    public func hbBrU10HeartbeatCadenceOverrideRequiresCompleteTestIdentity(): Unit {
+        synchronized(MetisProcessEnvironmentLock) {
+            let keys = [
+                "METIS_TEST_GATEWAY_HEARTBEAT_CADENCE_MODE",
+                "METIS_TEST_GATEWAY_HEARTBEAT_CADENCE_NONCE",
+                "METIS_TEST_GATEWAY_HEARTBEAT_CADENCE_POLLS"
+            ]
+            let previous = ArrayList<(String, Option<String>)>()
+            for (key in keys) { previous.add((key, getVariable(key))) }
+            try {
+                for (key in keys) { setVariable(key, "") }
+                @Expect(gatewayHeartbeatPollCadenceForTest(), 50)
+                setVariable(keys[0], "1")
+                @Expect(gatewayHeartbeatPollCadenceForTest(), 50)
+                setVariable(keys[0], "1")
+                setVariable(keys[1], "wrong-nonce")
+                setVariable(keys[2], "2")
+                @Expect(gatewayHeartbeatPollCadenceForTest(), 50)
+                setVariable(keys[0], "1")
+                setVariable(keys[1], "heartbeat-e2e-v1")
+                setVariable(keys[2], "1")
+                @Expect(gatewayHeartbeatPollCadenceForTest(), 50)
+                setVariable(keys[0], "1")
+                setVariable(keys[1], "heartbeat-e2e-v1")
+                setVariable(keys[2], "2")
+                @Expect(gatewayHeartbeatPollCadenceForTest(), 2)
+                setVariable(keys[0], "1")
+                setVariable(keys[1], "heartbeat-e2e-v1")
+                setVariable(keys[2], "5")
+                @Expect(gatewayHeartbeatPollCadenceForTest(), 5)
+                for (key in keys) {
+                    @Expect(getVariable(key).getOrDefault { "" }.trimAscii().isEmpty(), true)
+                }
+            } finally {
+                for ((key, value) in previous) {
+                    match (value) {
+                        case Some(oldValue) => setVariable(key, oldValue)
+                        case None => setVariable(key, "")
+                    }
+                }
+            }
+        }
+    }
+
     @TestCase
     public func hbBrU8FormalMetisBinaryOverrideIsStrictAndDefaultsToProjectTarget(): Unit {
         synchronized(MetisProcessEnvironmentLock) {
@@ -1980,45 +2027,22 @@ public class GatewayServeLockLogicTest {
 
     @TestCase
     public func hbBrN5SurfacePortProbeCapsHangingLsofAndFailsClosed(): Unit {
-        withGatewayHeartbeatProbeEnvironment("hb-br-n5-surface", {root, bin =>
+        withGatewayHeartbeatProbeEnvironment("hb-br-n5-surface", {root, _bin =>
             let marker = root.join("lsof-called")
-            let brokerLauncher = bin.join("node-with-isolated-path")
-            let brokerPath = getVariable("PATH").getOrDefault { "" }.trimAscii()
-            let oldNodeCommand = getVariable("METIS_STDIO_BROKER_NODE_COMMAND")
-            let oldBrokerPathCarrier = getVariable("METIS_TEST_N5_BROKER_PATH")
-            @Expect(brokerPath.isEmpty(), false)
-            if (brokerPath.isEmpty()) { return }
-            gatewayHeartbeatProbeExecutable(
-                bin.join("lsof"),
-                "printf called > '${marker.toString()}'\nsleep 2\nexit 1"
-            )
-            gatewayHeartbeatProbeExecutable(
-                brokerLauncher,
-                "export PATH=\"$METIS_TEST_N5_BROKER_PATH\"\nunset METIS_TEST_N5_BROKER_PATH\nexec node \"$@\""
-            )
+            let callCount = AtomicInt64(0)
             try {
-                setVariable("METIS_TEST_N5_BROKER_PATH", brokerPath)
-                setVariable("METIS_STDIO_BROKER_NODE_COMMAND", brokerLauncher.toString())
-                let setupReset = resetManagedStdioBrokerForTest(timeoutMs: 3000)
-                @Expect(setupReset.ok, true)
-                let setupStopped = gatewayHeartbeatBrokerIsFullyStopped()
-                if (!setupReset.ok || !setupStopped) { return }
-                let brokerReady = gatewayStdioBrokerReady(timeoutMs: 3000)
-                @Expect(brokerReady.ok, true)
-                @Expect(brokerReady.status, "ready")
-                @Expect(brokerReady.generation > 0, true)
-                @Expect(brokerReady.pid > 1, true)
-                if (!brokerReady.ok || brokerReady.status != "ready" ||
-                    brokerReady.generation <= 0 || brokerReady.pid <= 1) { return }
-                let readySnapshot = managedStdioBroker().snapshot()
-                @Expect(readySnapshot.running, true)
-                @Expect(readySnapshot.responsive, true)
-                @Expect(readySnapshot.generation, brokerReady.generation)
-                @Expect(readySnapshot.brokerPid, brokerReady.pid)
+                setGatewayServePortProbeForTest(Some({port: Int64, budgetMs: Int64 =>
+                    callCount.fetchAdd(1)
+                    @Expect(port, 49107)
+                    @Expect(budgetMs > 0 && budgetMs <= 500, true)
+                    File.writeTo(marker, "called\n".toArray())
+                    throw ShellTimeoutException("test port probe timed out")
+                }))
                 let started = MonoTime.now()
                 let result = gatewayServePortReleasedUntil(49107, MonoTime.now() + Duration.second * 5)
                 let elapsedMs = (MonoTime.now() - started).toMilliseconds()
                 @Expect(exists(marker), true)
+                @Expect(callCount.load(), 1)
                 @Expect(result.ok, false)
                 @Expect(result.status, "cleanup_pending")
                 @Expect(result.portStatus, "port_probe_timeout")
@@ -2045,17 +2069,7 @@ public class GatewayServeLockLogicTest {
                 }
                 @Expect(gatewayServeStopCompletionField(completion, "status"), "cleanup_pending")
             } finally {
-                let finalReset = resetManagedStdioBrokerForTest(timeoutMs: 3000)
-                @Expect(finalReset.ok, true)
-                let _ = gatewayHeartbeatBrokerIsFullyStopped()
-                match (oldNodeCommand) {
-                    case Some(value) => setVariable("METIS_STDIO_BROKER_NODE_COMMAND", value)
-                    case None => setVariable("METIS_STDIO_BROKER_NODE_COMMAND", "")
-                }
-                match (oldBrokerPathCarrier) {
-                    case Some(value) => setVariable("METIS_TEST_N5_BROKER_PATH", value)
-                    case None => setVariable("METIS_TEST_N5_BROKER_PATH", "")
-                }
+                setGatewayServePortProbeForTest(None<(Int64, Int64) -> (Int64, String, String)>)
             }
         })
     }
@@ -2605,6 +2619,16 @@ public class GatewayServeLockLogicTest {
             @Expect(gatewayPort != pluginPort && gatewayPort != descendantPort && pluginPort != descendantPort, true)
             let oldHome = getVariable("METIS_HOME")
             let oldRoot = getVariable("METIS_CJPM_ROOT")
+            let brokerEnvironmentKeys = [
+                "METIS_STDIO_BROKER_NODE_COMMAND", "METIS_S5_BROKER_PROXY_READY",
+                "METIS_S5_BROKER_PROXY_FAIL", "METIS_S5_BROKER_PROXY_WRITER_CLOSED",
+                "METIS_S5_BROKER_PROXY_CLEANUP", "METIS_S5_BROKER_PROXY_DROP_DELIVERY_ID",
+                "METIS_S5_BROKER_PROXY_ADMISSION_SEEN", "METIS_S5_BROKER_PROXY_COMPLETION_DROPPED",
+                "METIS_S5_BROKER_PROXY_HOLD_ENTERED", "METIS_S5_BROKER_PROXY_HOLD_RELEASE",
+                "METIS_S5_BROKER_PROXY_HOLD_RELEASED"
+            ]
+            let oldBrokerEnvironment = ArrayList<(String, Option<String>)>()
+            for (key in brokerEnvironmentKeys) { oldBrokerEnvironment.add((key, getVariable(key))) }
             let brokerScript = Path(managedStdioResolveBrokerScriptPath())
             let project = brokerScript.parent.parent
             let binaryValue = gatewayFormalMetisBinary(project)
@@ -2621,6 +2645,11 @@ public class GatewayServeLockLogicTest {
             var ownedResources = GatewayServeStopResourceCapture()
             let output = ArrayList<String>()
             try {
+                for (key in brokerEnvironmentKeys) { setVariable(key, "") }
+                let parentSetupReset = resetManagedStdioBrokerForTest(timeoutMs: 3000)
+                @Expect(parentSetupReset.ok, true)
+                let parentSetupStopped = gatewayHeartbeatBrokerIsFullyStopped()
+                if (!parentSetupReset.ok || !parentSetupStopped) { return }
                 Directory.create(home, recursive: true)
                 setVariable("METIS_HOME", home.toString())
                 let fixture = brokerScript.parent.join("metis-gateway-stop-fake-service-plugin.mjs")
@@ -2940,7 +2969,16 @@ public class GatewayServeLockLogicTest {
                 }
                 let brokerTerminalStatus = ownedResources.brokerTerminalStatus()
                 let fixtureTerminalStatus = ownedResources.fixtureTerminalStatus()
-                try { let _ = resetManagedStdioBrokerForTest(timeoutMs: 3000) } catch (_: Exception) { () }
+                let parentFinalReset = resetManagedStdioBrokerForTest(timeoutMs: 3000)
+                @Expect(parentFinalReset.ok, true)
+                for ((key, value) in oldBrokerEnvironment) {
+                    match (value) {
+                        case Some(previous) => setVariable(key, previous)
+                        case None => setVariable(key, "")
+                    }
+                }
+                let parentFinalStopped = gatewayHeartbeatBrokerIsFullyStopped()
+                @Expect(parentFinalStopped, true)
                 match (oldHome) {
                     case Some(value) => setVariable("METIS_HOME", value)
                     case None => setVariable("METIS_HOME", "")
@@ -2974,6 +3012,16 @@ public class GatewayServeLockLogicTest {
             let oldPath = getVariable("PATH")
             let oldTestDyld = getVariable("METIS_TEST_GATEWAY_DYLD_LIBRARY_PATH")
             let oldBrokerDiagnostic = getVariable("METIS_TEST_GATEWAY_BROKER_DIAGNOSTIC_MARKER")
+            let brokerEnvironmentKeys = [
+                "METIS_STDIO_BROKER_NODE_COMMAND", "METIS_S5_BROKER_PROXY_READY",
+                "METIS_S5_BROKER_PROXY_FAIL", "METIS_S5_BROKER_PROXY_WRITER_CLOSED",
+                "METIS_S5_BROKER_PROXY_CLEANUP", "METIS_S5_BROKER_PROXY_DROP_DELIVERY_ID",
+                "METIS_S5_BROKER_PROXY_ADMISSION_SEEN", "METIS_S5_BROKER_PROXY_COMPLETION_DROPPED",
+                "METIS_S5_BROKER_PROXY_HOLD_ENTERED", "METIS_S5_BROKER_PROXY_HOLD_RELEASE",
+                "METIS_S5_BROKER_PROXY_HOLD_RELEASED"
+            ]
+            let oldBrokerEnvironment = ArrayList<(String, Option<String>)>()
+            for (key in brokerEnvironmentKeys) { oldBrokerEnvironment.add((key, getVariable(key))) }
             let brokerScript = Path(managedStdioResolveBrokerScriptPath())
             let project = brokerScript.parent.parent
             let metisBinaryValue = gatewayFormalMetisBinary(project)
@@ -2999,6 +3047,7 @@ public class GatewayServeLockLogicTest {
             var businessEntered = false
             var allTerminal = false
             try {
+                for (key in brokerEnvironmentKeys) { setVariable(key, "") }
                 let parentSetupReset = resetManagedStdioBrokerForTest(timeoutMs: 3000)
                 @Expect(parentSetupReset.ok, true)
                 let parentSetupStopped = gatewayHeartbeatBrokerIsFullyStopped()
@@ -3019,6 +3068,9 @@ public class GatewayServeLockLogicTest {
                     ("#!/bin/sh\nexport DYLD_LIBRARY_PATH=\"$METIS_TEST_GATEWAY_DYLD_LIBRARY_PATH\"\n" +
                         "export METIS_STDIO_BROKER_TEST_MODE=1\n" +
                         "export METIS_STDIO_BROKER_DIAGNOSTIC_MARKER=\"$METIS_TEST_GATEWAY_BROKER_DIAGNOSTIC_MARKER\"\n" +
+                        "export METIS_TEST_GATEWAY_HEARTBEAT_CADENCE_MODE=1\n" +
+                        "export METIS_TEST_GATEWAY_HEARTBEAT_CADENCE_NONCE=heartbeat-e2e-v1\n" +
+                        "export METIS_TEST_GATEWAY_HEARTBEAT_CADENCE_POLLS=2\n" +
                         "unset METIS_TEST_GATEWAY_DYLD_LIBRARY_PATH METIS_TEST_GATEWAY_BROKER_DIAGNOSTIC_MARKER\n" +
                         "exec \"$1\" gateway run 2>\"$2\"\n").toArray()
                 )
@@ -3146,9 +3198,33 @@ public class GatewayServeLockLogicTest {
                     @Expect(firstHeartbeat.size, 1)
                     if (firstHeartbeat.size != 1) { return }
                     let firstHeartbeatValue = firstHeartbeat[0]
-                    @Expect(gatewayServeStopWaitUntil(15000, { =>
+                    liveOwner.refresh(readyzUrl)
+                    processCapture.refreshLease(home, stableGcmPid, stableGatewayPid, webhookPort)
+                    @Expect(liveOwner.httpStatus, 200)
+                    @Expect(liveOwner.running, true)
+                    @Expect(liveOwner.ownerCount, 1)
+                    @Expect(processCapture.leaseIdentityMatches, true)
+                    @Expect(processCapture.leasePidMatches, true)
+                    @Expect(processCapture.leasePortMatches, true)
+                    @Expect(processCapture.leaseRunning, true)
+                    @Expect(gatewayServeStopPidAlive(stableGatewayPid), true)
+                    @Expect(gatewayServeStopPidAlive(stableGcmPid), true)
+                    let secondHeartbeatObserved = gatewayServeStopWaitUntil(15000, { =>
                         gatewayHeartbeatRuntimeInt(runtimePath, "updatedAtMs") > firstHeartbeatValue
-                    }), true)
+                    })
+                    @Expect(secondHeartbeatObserved, true)
+                    if (!secondHeartbeatObserved) { return }
+                    liveOwner.refresh(readyzUrl)
+                    processCapture.refreshLease(home, stableGcmPid, stableGatewayPid, webhookPort)
+                    @Expect(liveOwner.httpStatus, 200)
+                    @Expect(liveOwner.running, true)
+                    @Expect(liveOwner.ownerCount, 1)
+                    @Expect(processCapture.leaseIdentityMatches, true)
+                    @Expect(processCapture.leasePidMatches, true)
+                    @Expect(processCapture.leasePortMatches, true)
+                    @Expect(processCapture.leaseRunning, true)
+                    @Expect(gatewayServeStopPidAlive(stableGatewayPid), true)
+                    @Expect(gatewayServeStopPidAlive(stableGcmPid), true)
 
                     if (generation == 0) {
                         for (_ in 0..40) {
@@ -3281,10 +3357,17 @@ public class GatewayServeLockLogicTest {
                 let dependenciesStopped = gatewayS5StopDependencies(dependencies)
                 let parentFinalReset = resetManagedStdioBrokerForTest(timeoutMs: 3000)
                 @Expect(parentFinalReset.ok, true)
-                let _ = gatewayHeartbeatBrokerIsFullyStopped()
+                for ((key, value) in oldBrokerEnvironment) {
+                    match (value) {
+                        case Some(previous) => setVariable(key, previous)
+                        case None => setVariable(key, "")
+                    }
+                }
+                match (oldPath) { case Some(value) => setVariable("PATH", value) case None => setVariable("PATH", "") }
+                let parentFinalStopped = gatewayHeartbeatBrokerIsFullyStopped()
+                @Expect(parentFinalStopped, true)
                 match (oldHome) { case Some(value) => setVariable("METIS_HOME", value) case None => setVariable("METIS_HOME", "") }
                 match (oldRoot) { case Some(value) => setVariable("METIS_CJPM_ROOT", value) case None => setVariable("METIS_CJPM_ROOT", "") }
-                match (oldPath) { case Some(value) => setVariable("PATH", value) case None => setVariable("PATH", "") }
                 match (oldTestDyld) {
                     case Some(value) => setVariable("METIS_TEST_GATEWAY_DYLD_LIBRARY_PATH", value)
                     case None => setVariable("METIS_TEST_GATEWAY_DYLD_LIBRARY_PATH", "")

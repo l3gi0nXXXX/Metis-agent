@@ -9,10 +9,26 @@ import metis.gateway.logging.{MetisLogEvent, gatewayLoggingCurrentLogFile, metis
 import metis.core.memory.{DreamingPhaseRuntime, MemoryRuntime}
 import metis.io.PrintUtils
 import metis.gateway.model.ChatType
+import std.env.{getVariable, setVariable}
 import std.time.*
 import stdx.encoding.json.JsonObject
 
 private let gatewayServeLogger = metisCreateSubsystemLogger("gateway/runtime")
+private let gatewayHeartbeatCadenceTestNonce = "heartbeat-e2e-v1"
+
+public func gatewayHeartbeatPollCadenceForTest(): Int64 {
+    let mode = getVariable("METIS_TEST_GATEWAY_HEARTBEAT_CADENCE_MODE").getOrDefault { "" }.trimAscii()
+    let nonce = getVariable("METIS_TEST_GATEWAY_HEARTBEAT_CADENCE_NONCE").getOrDefault { "" }.trimAscii()
+    let cadence = getVariable("METIS_TEST_GATEWAY_HEARTBEAT_CADENCE_POLLS").getOrDefault { "" }.trimAscii()
+    setVariable("METIS_TEST_GATEWAY_HEARTBEAT_CADENCE_MODE", "")
+    setVariable("METIS_TEST_GATEWAY_HEARTBEAT_CADENCE_NONCE", "")
+    setVariable("METIS_TEST_GATEWAY_HEARTBEAT_CADENCE_POLLS", "")
+    if (mode == "1" && nonce == gatewayHeartbeatCadenceTestNonce) {
+        if (cadence == "2") { return 2 }
+        if (cadence == "5") { return 5 }
+    }
+    50
+}
 
 private func gatewayServeNowMs(): Int64 {
     DateTime.now().toUnixTimeStamp().toNanoseconds() / 1000000
@@ -108,6 +124,7 @@ public func runGatewayP1DemoWithFeishuWebhook(): Unit {
  */
 public func runGatewayService(verbose!: Bool = false): Unit {
     let startMs = gatewayServeNowMs()
+    let heartbeatPollCadence = gatewayHeartbeatPollCadenceForTest()
     gatewayServeLogger.info(MetisLogEvent.gatewayStarting, "Gateway serve starting")
     gatewayServeTimingLog("enter", startMs)
     let persistedUser = CliSettingManager.readGatewaySettings()
@@ -267,7 +284,7 @@ public func runGatewayService(verbose!: Bool = false): Unit {
             configReloader.pollOnce()
             cronRunner.tick()
             heartbeatTick += 1
-            if (heartbeatTick % 50 == 0) {
+            if (heartbeatTick % heartbeatPollCadence == 0) {
                 gatewayRefreshServeLockMtime()
                 gatewayRuntimeHeartbeat()
                 gatewayPlatformHeartbeat(gatewayCfg)

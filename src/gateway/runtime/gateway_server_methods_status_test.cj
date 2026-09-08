@@ -5,7 +5,7 @@ import metis.gateway.config.buildGatewayConfigFromUserSettings
 import metis.gateway.core.{gatewayChannelRuntimeMarkFailure, gatewayChannelRuntimeMarkRunning, gatewayChannelRuntimeMarkStarting, gatewayChannelRuntimeRegisterAccount}
 import metis.gateway.logging.{gatewayLoggingCaptureConsoleForTest, gatewayLoggingCapturedConsoleForTest, gatewayLoggingResetForTest, gatewayLoggingResolveSettings}
 import metis.gateway.process.{gatewayStdioBrokerReady, gatewayStdioBrokerSnapshot}
-import metis.process.{ManagedStdioBrokerClient, ManagedStdioBrokerSnapshot, ManagedStdioOwnerSpec}
+import metis.process.{ManagedStdioBrokerClient, ManagedStdioBrokerSnapshot, ManagedStdioOwnerSpec, managedStdioBroker}
 import metis.process.resetManagedStdioBrokerForTest
 
 import std.env.{getVariable, setVariable}
@@ -279,7 +279,10 @@ public class GatewayServerMethodsStatusTest {
         withGatewayStatusTestSettings<Unit>("hb-s4-b1-heartbeat-lsof", { =>
             let marker = CliConfig.dotDir.join("lsof-called")
             let oldPath = getVariable("PATH")
+            let oldNodeCommand = getVariable("METIS_STDIO_BROKER_NODE_COMMAND")
+            let oldBrokerPathCarrier = getVariable("METIS_TEST_HBS4_BROKER_PATH")
             let bin = CliConfig.dotDir.join("bin")
+            let brokerLauncher = bin.join("node-with-isolated-path")
             Directory.create(bin, recursive: true)
             File.writeTo(
                 bin.join("lsof"),
@@ -288,12 +291,35 @@ public class GatewayServerMethodsStatusTest {
             @Expect(executeWithOutput("/bin/chmod", ["700", bin.join("lsof").toString()])[0], 0)
             let inherited = match (oldPath) { case Some(value) => value case None => "/usr/bin:/bin" }
             setVariable("PATH", "${bin.toString()}:${inherited}")
+            let brokerPath = getVariable("PATH").getOrDefault { "" }.trimAscii()
+            @Expect(brokerPath.isEmpty(), false)
+            File.writeTo(
+                brokerLauncher,
+                ("#!/bin/sh\nexport PATH=\"$METIS_TEST_HBS4_BROKER_PATH\"\n" +
+                    "unset METIS_TEST_HBS4_BROKER_PATH\nexec node \"$@\"\n").toArray()
+            )
+            @Expect(executeWithOutput("/bin/chmod", ["700", brokerLauncher.toString()])[0], 0)
             gatewayLoggingResetForTest()
             gatewayLoggingCaptureConsoleForTest()
             try {
+                if (brokerPath.isEmpty()) { return }
+                setVariable("METIS_TEST_HBS4_BROKER_PATH", brokerPath)
+                setVariable("METIS_STDIO_BROKER_NODE_COMMAND", brokerLauncher.toString())
                 let setupReset = resetManagedStdioBrokerForTest(timeoutMs: 3000)
                 @Expect(setupReset.ok, true)
-                if (!setupReset.ok) { return }
+                let setupStopped = gatewayStdioBrokerSnapshot()
+                @Expect(setupStopped.get("running").getOrThrow().asBool().getValue(), false)
+                @Expect(setupStopped.get("brokerPid").getOrThrow().asInt().getValue(), 0)
+                @Expect(setupStopped.get("ownerCount").getOrThrow().asInt().getValue(), 0)
+                @Expect(setupStopped.get("readerCount").getOrThrow().asInt().getValue(), 0)
+                let setupDispatcherCount = managedStdioBroker().snapshot().dispatcherCount
+                @Expect(setupDispatcherCount, 0)
+                let setupFullyStopped = !setupStopped.get("running").getOrThrow().asBool().getValue() &&
+                    setupStopped.get("brokerPid").getOrThrow().asInt().getValue() == 0 &&
+                    setupStopped.get("ownerCount").getOrThrow().asInt().getValue() == 0 &&
+                    setupStopped.get("readerCount").getOrThrow().asInt().getValue() == 0 &&
+                    setupDispatcherCount == 0
+                if (!setupReset.ok || !setupFullyStopped) { return }
                 gatewayRuntimeMarkStarting()
                 gatewayRuntimeHeartbeat()
                 let ready = gatewayStdioBrokerReady(timeoutMs: 5000)
@@ -341,12 +367,14 @@ public class GatewayServerMethodsStatusTest {
                 @Expect(stopped.get("brokerPid").getOrThrow().asInt().getValue(), 0)
                 @Expect(stopped.get("ownerCount").getOrThrow().asInt().getValue(), 0)
                 @Expect(stopped.get("readerCount").getOrThrow().asInt().getValue(), 0)
+                @Expect(managedStdioBroker().snapshot().dispatcherCount, 0)
                 gatewayRuntimeMarkStopped(reason: "hb-s4-b1-complete")
                 let terminal = gatewayStdioBrokerSnapshot()
                 @Expect(terminal.get("running").getOrThrow().asBool().getValue(), false)
                 @Expect(terminal.get("brokerPid").getOrThrow().asInt().getValue(), 0)
                 @Expect(terminal.get("ownerCount").getOrThrow().asInt().getValue(), 0)
                 @Expect(terminal.get("readerCount").getOrThrow().asInt().getValue(), 0)
+                @Expect(managedStdioBroker().snapshot().dispatcherCount, 0)
                 @Expect(
                     terminal.get("generation").getOrThrow().asInt().getValue(),
                     stopped.get("generation").getOrThrow().asInt().getValue()
@@ -354,13 +382,22 @@ public class GatewayServerMethodsStatusTest {
             } finally {
                 let finalReset = resetManagedStdioBrokerForTest(timeoutMs: 3000)
                 @Expect(finalReset.ok, true)
+                match (oldNodeCommand) {
+                    case Some(value) => setVariable("METIS_STDIO_BROKER_NODE_COMMAND", value)
+                    case None => setVariable("METIS_STDIO_BROKER_NODE_COMMAND", "")
+                }
+                match (oldBrokerPathCarrier) {
+                    case Some(value) => setVariable("METIS_TEST_HBS4_BROKER_PATH", value)
+                    case None => setVariable("METIS_TEST_HBS4_BROKER_PATH", "")
+                }
+                gatewayHeartbeatStatusRestorePath(oldPath)
                 let finalBroker = gatewayStdioBrokerSnapshot()
                 @Expect(finalBroker.get("running").getOrThrow().asBool().getValue(), false)
                 @Expect(finalBroker.get("brokerPid").getOrThrow().asInt().getValue(), 0)
                 @Expect(finalBroker.get("ownerCount").getOrThrow().asInt().getValue(), 0)
                 @Expect(finalBroker.get("readerCount").getOrThrow().asInt().getValue(), 0)
+                @Expect(managedStdioBroker().snapshot().dispatcherCount, 0)
                 gatewayLoggingResetForTest()
-                gatewayHeartbeatStatusRestorePath(oldPath)
             }
         })
     }
