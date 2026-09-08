@@ -1894,12 +1894,64 @@ public class GatewayServeLockLogicTest {
 
     @TestCase
     public func s1P1NoListenerExitIsConclusive(): Unit {
-        withGatewayHeartbeatProbeEnvironment("s1-p1", {_root, bin =>
-            gatewayHeartbeatProbeExecutable(bin.join("lsof"), "exit 1")
-            let result = gatewayFindVerifiedListenerPidsOnPortDetailed(port: 49103, timeoutMs: 800)
-            @Expect(result.conclusive, true)
-            @Expect(result.pids.size, 0)
-            @Expect(result.status, "no_listener")
+        withGatewayHeartbeatProbeEnvironment("s1-p1", {root, bin =>
+            let marker = root.join("lsof-called")
+            let brokerLauncher = bin.join("node-with-isolated-path")
+            let brokerPath = getVariable("PATH").getOrDefault { "" }.trimAscii()
+            let oldNodeCommand = getVariable("METIS_STDIO_BROKER_NODE_COMMAND")
+            let oldBrokerPathCarrier = getVariable("METIS_TEST_S1P1_BROKER_PATH")
+            @Expect(brokerPath.isEmpty(), false)
+            if (brokerPath.isEmpty()) { return }
+            gatewayHeartbeatProbeExecutable(
+                bin.join("lsof"),
+                "printf called > '${marker.toString()}'\nexit 1"
+            )
+            gatewayHeartbeatProbeExecutable(
+                brokerLauncher,
+                "export PATH=\"$METIS_TEST_S1P1_BROKER_PATH\"\nunset METIS_TEST_S1P1_BROKER_PATH\nexec node \"$@\""
+            )
+            try {
+                setVariable("METIS_TEST_S1P1_BROKER_PATH", brokerPath)
+                setVariable("METIS_STDIO_BROKER_NODE_COMMAND", brokerLauncher.toString())
+                let setupReset = resetManagedStdioBrokerForTest(timeoutMs: 3000)
+                @Expect(setupReset.ok, true)
+                let setupStopped = gatewayHeartbeatBrokerIsFullyStopped()
+                if (!setupReset.ok || !setupStopped) { return }
+                let brokerReady = gatewayStdioBrokerReady(timeoutMs: 5000)
+                @Expect(brokerReady.ok, true)
+                @Expect(brokerReady.status, "ready")
+                @Expect(brokerReady.generation > 0, true)
+                @Expect(brokerReady.pid > 1, true)
+                if (!brokerReady.ok || brokerReady.status != "ready" ||
+                    brokerReady.generation <= 0 || brokerReady.pid <= 1) { return }
+                let before = managedStdioBroker().snapshot()
+                @Expect(before.running, true)
+                @Expect(before.responsive, true)
+                @Expect(before.generation, brokerReady.generation)
+                @Expect(before.brokerPid, brokerReady.pid)
+                @Expect(before.ownerCount, 0)
+                let result = gatewayFindVerifiedListenerPidsOnPortDetailed(port: 49103, timeoutMs: 800)
+                let after = managedStdioBroker().snapshot()
+                @Expect(exists(marker), true)
+                @Expect(result.conclusive, true)
+                @Expect(result.pids.size, 0)
+                @Expect(result.status, "no_listener")
+                @Expect(after.generation, before.generation)
+                @Expect(after.brokerPid, before.brokerPid)
+                @Expect(after.ownerCount, 0)
+            } finally {
+                let finalReset = resetManagedStdioBrokerForTest(timeoutMs: 3000)
+                @Expect(finalReset.ok, true)
+                let _ = gatewayHeartbeatBrokerIsFullyStopped()
+                match (oldNodeCommand) {
+                    case Some(value) => setVariable("METIS_STDIO_BROKER_NODE_COMMAND", value)
+                    case None => setVariable("METIS_STDIO_BROKER_NODE_COMMAND", "")
+                }
+                match (oldBrokerPathCarrier) {
+                    case Some(value) => setVariable("METIS_TEST_S1P1_BROKER_PATH", value)
+                    case None => setVariable("METIS_TEST_S1P1_BROKER_PATH", "")
+                }
+            }
         })
     }
 
