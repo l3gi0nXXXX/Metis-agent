@@ -707,6 +707,7 @@ private let servicePluginDeadlineClockLock = Mutex()
 private var servicePluginLastDeadlineNowMs: Int64 = 0
 private var servicePluginDispatchRemainingForTest: Option<() -> Int64> = None<() -> Int64>
 private var servicePluginBeforeDispatchWaitForTest: Option<(Int64) -> Unit> = None<(Int64) -> Unit>
+private var servicePluginAfterIngressStopHookForTest: Option<() -> Unit> = None<() -> Unit>
 private var servicePluginDispatchSettledHookForTest: Option<() -> Unit> = None<() -> Unit>
 private var servicePluginCleanupFinalizeHookForTest: Option<(String, Int64) -> Unit> = None<(String, Int64) -> Unit>
 private var servicePluginSupervisorAutoStartForTest = true
@@ -2357,6 +2358,7 @@ private func servicePluginPublishDispatchFencedMarkerForTest(process: ServicePlu
 
 private func servicePluginDrainDispatchForStop(process: ServicePluginStdioProcess, deadlineMs: Int64, stopReserveMs: Int64): String {
     servicePluginWriteFencedEventAcks(process.fenceDispatch(), process)
+    if (process.dispatchesSettled()) { return "drained" }
     let remaining = servicePluginDispatchRemaining(deadlineMs)
     let dispatchBudget = servicePluginDispatchBudget(remaining, stopReserveMs)
     let waitBudget = if (dispatchBudget > 1) { max(1, dispatchBudget / 2) } else { dispatchBudget }
@@ -2369,6 +2371,7 @@ private func servicePluginDrainDispatchForStop(process: ServicePluginStdioProces
     if (waitBudget > 0 && process.waitDispatches(waitBudget)) { return "drained" }
     let cancelBudget = servicePluginDispatchBudget(servicePluginDispatchRemaining(deadlineMs), stopReserveMs)
     if (cancelBudget > 0 && process.cancelDispatches(cancelBudget)) { return "cancelled" }
+    if (process.dispatchesSettled()) { return "drained" }
     "dispatch_pending"
 }
 
@@ -2727,6 +2730,10 @@ public func setServicePluginBeforeDispatchWaitForTest(probe: Option<(Int64) -> U
     servicePluginBeforeDispatchWaitForTest = probe
 }
 
+func setServicePluginAfterIngressStopHookForTest(probe: Option<() -> Unit>): Unit {
+    servicePluginAfterIngressStopHookForTest = probe
+}
+
 public func setServicePluginDispatchSettledHookForTest(probe: Option<() -> Unit>): Unit {
     servicePluginDispatchSettledHookForTest = probe
 }
@@ -2835,6 +2842,7 @@ public func resetServicePluginHostForTest(): Unit {
     }
     servicePluginDispatchRemainingForTest = None<() -> Int64>
     servicePluginBeforeDispatchWaitForTest = None<(Int64) -> Unit>
+    servicePluginAfterIngressStopHookForTest = None<() -> Unit>
     servicePluginDispatchSettledHookForTest = None<() -> Unit>
     servicePluginCleanupFinalizeHookForTest = None<(String, Int64) -> Unit>
     servicePluginSupervisorAutoStartForTest = true
@@ -5261,6 +5269,10 @@ public func stopServicePlugin(serviceId: String, reason!: String = "", timeoutMi
                     let observeBudget = min(500, max(0, servicePluginDeadlineRemaining(deadlineMs) - stopReserveMs) / 2)
                     if (ingressStopStatus == "sent" && observeBudget > 0) {
                         servicePluginObserveIngressStop(sid, process, servicePluginDeadlineNowMs() + observeBudget)
+                    }
+                    match (servicePluginAfterIngressStopHookForTest) {
+                        case Some(hook) => hook()
+                        case None => ()
                     }
                     dispatchStatus = servicePluginDrainDispatchForStop(process, deadlineMs, stopReserveMs)
                     let forceReserveMs = max(1, stopReserveMs / 2)

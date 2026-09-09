@@ -4429,7 +4429,7 @@ public class ServicePluginHostTest {
                 @Expect(ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 3000).ok, true)
                 let pid = getServicePluginSnapshot("gitcode-monitor").getOrThrow().pid
                 @Expect(pid > 0, true)
-                setServicePluginBeforeDispatchWaitForTest(Some({ _waitMs: Int64 =>
+                setServicePluginAfterIngressStopHookForTest(Some({ =>
                     let leasePath = home.join("service-plugin").join("runtime").join("gitcode-monitor").join("gitcode-monitor-1.lease.json")
                     File.writeTo(
                         leasePath,
@@ -4464,7 +4464,7 @@ public class ServicePluginHostTest {
                 @Expect(servicePluginCleanupPendingCountForTest(), 1)
 
                 setServicePluginMonotonicNowForTest(None<() -> Int64>)
-                setServicePluginBeforeDispatchWaitForTest(None<(Int64) -> Unit>)
+                setServicePluginAfterIngressStopHookForTest(None<() -> Unit>)
                 setServicePluginPidProbeCommandForTest(None<(Int64, Int64) -> (Int64, String, String)>)
                 setServicePluginPortReleaseCommandForTest(None<(Int64, Int64, Int64) -> (Int64, String, String)>)
                 let leasePath = home.join("service-plugin").join("runtime").join("gitcode-monitor").join("gitcode-monitor-1.lease.json")
@@ -4482,7 +4482,7 @@ public class ServicePluginHostTest {
                 @Expect(managedStdioBroker().snapshot().ownerCount, 0)
             } finally {
                 setServicePluginMonotonicNowForTest(None<() -> Int64>)
-                setServicePluginBeforeDispatchWaitForTest(None<(Int64) -> Unit>)
+                setServicePluginAfterIngressStopHookForTest(None<() -> Unit>)
                 setServicePluginPidProbeCommandForTest(None<(Int64, Int64) -> (Int64, String, String)>)
                 setServicePluginPortReleaseCommandForTest(None<(Int64, Int64, Int64) -> (Int64, String, String)>)
                 let _ = stopServicePlugin("gitcode-monitor", reason: "test-finally", timeoutMillis: 2000)
@@ -4498,17 +4498,33 @@ public class ServicePluginHostTest {
             let oldRelease = getVariable("METIS_STDIO_FIXTURE_RELEASE_PATH")
             try {
             this.registerBrokerServiceFixture("malformed")
+            var malformedPid = Int64(0)
+            var malformedPgid = Int64(0)
             try {
+                let started = ensureRegisteredServicePluginStarted("stdio-service", startupTimeoutMs: 1000)
+                @Expect(started.ok, true)
+                malformedPid = getServicePluginSnapshot("stdio-service").getOrThrow().pid
+                malformedPgid = this.processGroupId(malformedPid)
+                @Expect(malformedPid > 1, true)
+                @Expect(malformedPgid > 0, true)
+                if (malformedPid <= 1 || malformedPgid <= 0) {
+                    throw Exception("malformed zero-budget fixture process identity is invalid")
+                }
+                setServicePluginDispatchRemainingForTest(Some({ => Int64(0) }))
                 let malformed = invokeRegisteredCapability(CapabilityInvokeRequest("stdio.monitor.status", payload: "{}"))
                 @Expect(malformed.ok, false)
                 @Expect(malformed.status, "frame_decode_failed")
             } finally {
+                setServicePluginDispatchRemainingForTest(None<() -> Int64>)
                 let cleanup = this.settleServiceOwnerCleanup("stdio-service")
                 @Expect(if (cleanup[0]) { cleanup[1] == "stopped" } else { cleanup[1] == "not_needed" }, true)
                 @Expect(cleanup[2], true)
                 @Expect(cleanup[3], true)
                 resetServicePluginHostForTest()
             }
+            @Expect(this.waitForPidGone(malformedPid), true)
+            @Expect(this.waitForProcessGroupGone(malformedPgid), true)
+            @Expect(managedStdioBroker().snapshot().ownerCount, 0)
 
             this.registerBrokerServiceFixture("invalid-utf8")
             let sentinelId = "p3-n1-sentinel-${DateTime.now().toUnixTimeStamp().toNanoseconds()}"
