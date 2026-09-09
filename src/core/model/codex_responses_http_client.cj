@@ -2,16 +2,65 @@ package metis.core.model
 
 import metis.core.config.{OpenAICodexOAuthRoute, OpenAICodexOAuthTransportConfig, buildOpenAICodexOAuthHttpClientBuilder, resolveOpenAICodexOAuthRoute}
 
-import std.collection.{ArrayList, HashMap}
+import std.collection.{ArrayList, HashMap, HashSet}
+import std.sync.Mutex
 import stdx.encoding.json.*
 import stdx.net.http.*
 
 public type CodexResponsesHttpRunner = (CodexResponsesHttpRequest) -> CodexResponsesHttpResult
 
 private var codexResponsesHttpRunnerForTest: Option<CodexResponsesHttpRunner> = None<CodexResponsesHttpRunner>
+private let codexResponsesHttpStateLock = Mutex()
+private var codexResponsesHttpActive: Int64 = 0
+private var codexResponsesHttpRegistered: Int64 = 0
+private var codexResponsesHttpSettled: Int64 = 0
+private var codexResponsesHttpMaxActive: Int64 = 0
+private var codexResponsesHttpNextIdentity: Int64 = 0
+private let codexResponsesHttpRetainedIdentities = HashSet<Int64>()
+
+public class CodexResponsesHttpRegistryTruth {
+    public let active: Int64
+    public let retained: Int64
+    public let registered: Int64
+    public let settled: Int64
+    public let maxActive: Int64
+
+    init(active: Int64, retained: Int64, registered: Int64, settled: Int64, maxActive: Int64) {
+        this.active = active
+        this.retained = retained
+        this.registered = registered
+        this.settled = settled
+        this.maxActive = maxActive
+    }
+}
 
 public func setCodexResponsesHttpRunnerForTest(runner: Option<CodexResponsesHttpRunner>): Unit {
-    codexResponsesHttpRunnerForTest = runner
+    synchronized(codexResponsesHttpStateLock) {
+        codexResponsesHttpRunnerForTest = runner
+    }
+}
+
+public func codexResponsesHttpRegistryTruthForTest(): CodexResponsesHttpRegistryTruth {
+    synchronized(codexResponsesHttpStateLock) {
+        CodexResponsesHttpRegistryTruth(
+            codexResponsesHttpActive,
+            codexResponsesHttpRetainedIdentities.size,
+            codexResponsesHttpRegistered,
+            codexResponsesHttpSettled,
+            codexResponsesHttpMaxActive
+        )
+    }
+}
+
+public func resetCodexResponsesHttpRegistryTruthForTest(): Unit {
+    synchronized(codexResponsesHttpStateLock) {
+        codexResponsesHttpActive = 0
+        codexResponsesHttpRegistered = 0
+        codexResponsesHttpSettled = 0
+        codexResponsesHttpMaxActive = 0
+        codexResponsesHttpNextIdentity = 0
+        codexResponsesHttpRetainedIdentities.clear()
+    }
 }
 
 private func codexHttpString(obj: JsonObject, key: String): String {
@@ -55,7 +104,19 @@ private func codexResponsesReadHttpBody(response: HttpResponse): String {
         }
         out.add(all: buffer[..n])
     }
-    try { String.fromUtf8(out.toArray()) } catch (_: Exception) { "" }
+    codexResponsesDecodeBodyBytes(out.toArray())
+}
+
+private func codexResponsesDecodeBodyBytes(bytes: Array<Byte>): String {
+    try {
+        String.fromUtf8(bytes)
+    } catch (_: Exception) {
+        throw CodexResponsesException("invalid_response_encoding", "Codex Responses returned invalid UTF-8")
+    }
+}
+
+public func codexResponsesDecodeBodyBytesForTest(bytes: Array<Byte>): String {
+    codexResponsesDecodeBodyBytes(bytes)
 }
 
 private func codexResponsesFlushSseData(events: ArrayList<JsonObject>, data: String): String {
@@ -164,9 +225,12 @@ public class CodexResponsesHttpClient {
         } else {
             this.transportConfig.timeoutMs
         }
-        let executionRemainingMs = currentModelExecutionRemainingMs()
-        let effectiveTimeoutMs = if (executionRemainingMs > 0) {
-            min(configuredTimeoutMs, executionRemainingMs)
+        let executionDeadline = currentModelExecutionDeadlineSnapshot()
+        if (executionDeadline.status == "expired") {
+            throw CodexResponsesException("transport_deadline_exhausted", "Codex Responses transport deadline is exhausted")
+        }
+        let effectiveTimeoutMs = if (executionDeadline.status == "active") {
+            min(configuredTimeoutMs, executionDeadline.remainingMs)
         } else {
             configuredTimeoutMs
         }
@@ -181,15 +245,43 @@ public class CodexResponsesHttpClient {
     }
 
     private func run(request: CodexResponsesHttpRequest): CodexResponsesHttpResult {
-        if (let Some(runner) <- codexResponsesHttpRunnerForTest) {
-            return runner(request)
+        let registration = synchronized(codexResponsesHttpStateLock) {
+            codexResponsesHttpNextIdentity += 1
+            let identity = codexResponsesHttpNextIdentity
+            codexResponsesHttpRetainedIdentities.add(identity)
+            codexResponsesHttpActive += 1
+            codexResponsesHttpRegistered += 1
+            codexResponsesHttpMaxActive = max(codexResponsesHttpMaxActive, codexResponsesHttpActive)
+            (codexResponsesHttpRunnerForTest, identity)
         }
+        let runner = registration[0]
+        let identity = registration[1]
         try {
-            return this.runNativePost(request)
+            let result = if (let Some(call) <- runner) {
+                call(request)
+            } else {
+                this.runNativePost(request)
+            }
+            if (currentModelExecutionDeadlineSnapshot().status == "expired") {
+                throw CodexResponsesException("transport_deadline_exhausted", "Codex Responses transport deadline is exhausted")
+            }
+            return result
         } catch (ex: CodexResponsesException) {
+            if (currentModelExecutionDeadlineSnapshot().status == "expired") {
+                throw CodexResponsesException("transport_deadline_exhausted", "Codex Responses transport deadline is exhausted")
+            }
             throw ex
         } catch (ex: Exception) {
+            if (currentModelExecutionDeadlineSnapshot().status == "expired") {
+                throw CodexResponsesException("transport_deadline_exhausted", "Codex Responses transport deadline is exhausted")
+            }
             throw CodexResponsesException("http_error", "Codex Responses HTTP request failed: ${ex.message}")
+        } finally {
+            synchronized(codexResponsesHttpStateLock) {
+                codexResponsesHttpRetainedIdentities.remove(identity)
+                codexResponsesHttpActive = max(0, codexResponsesHttpActive - 1)
+                codexResponsesHttpSettled += 1
+            }
         }
     }
 
@@ -234,6 +326,8 @@ public class CodexResponsesHttpClient {
                 return CodexResponsesHttpResult(Int64(response.status), body: body, streamEvents: codexResponsesParseSseEvents(body))
             }
             return CodexResponsesHttpResult(Int64(response.status), body: body)
+        } catch (ex: CodexResponsesException) {
+            throw ex
         } catch (ex: Exception) {
             throw CodexResponsesException(
                 "http_error",
@@ -294,9 +388,37 @@ public class CodexResponsesHttpClient {
         model!: String = ""
     ): CodexResponsesNormalized {
         let request = this.preparePostRequest(baseUrl, accessToken, payload, extraHeaders: extraHeaders, timeoutMs: timeoutMs, stream: true)
-        let first = this.run(request)
+        var first = CodexResponsesHttpResult(0)
+        try {
+            first = this.run(request)
+        } catch (ex: CodexResponsesException) {
+            if (ex.code != "http_error") {
+                throw ex
+            }
+            let route = resolveOpenAICodexOAuthRoute(request.url, this.requestTransportConfig(request))
+            if (route.mode == "unsupportedHttpsProxy" || route.mode == "unsupportedSocksProxy" || route.mode == "invalidProxy") {
+                throw ex
+            }
+            let retryRequest = this.preparePostRequest(baseUrl, accessToken, payload, extraHeaders: extraHeaders, timeoutMs: timeoutMs, stream: true)
+            try {
+                let retry = this.run(retryRequest)
+                if (!retry.error.isEmpty()) {
+                    throw CodexResponsesException("stream_transport_error", "Codex Responses stream transport failed after retry")
+                }
+                return codexNormalizeResponsesEvents(retry.streamEvents, model: model)
+            } catch (retryEx: CodexResponsesException) {
+                if (retryEx.code == "transport_deadline_exhausted") {
+                    throw retryEx
+                }
+                if (retryEx.code != "http_error") {
+                    throw retryEx
+                }
+                throw CodexResponsesException("stream_transport_error", "Codex Responses stream transport failed after retry")
+            }
+        }
         if (!first.error.isEmpty()) {
-            let retry = this.run(request)
+            let retryRequest = this.preparePostRequest(baseUrl, accessToken, payload, extraHeaders: extraHeaders, timeoutMs: timeoutMs, stream: true)
+            let retry = this.run(retryRequest)
             if (!retry.error.isEmpty()) {
                 throw CodexResponsesException("stream_transport_error", "Codex Responses stream transport failed after retry")
             }

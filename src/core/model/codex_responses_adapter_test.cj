@@ -1,11 +1,16 @@
 package metis.core.model
 
+import metis.core.config.OpenAICodexOAuthTransportConfig
+
 import magic.core.message.Message
 import magic.core.model.ChatRequest
 import magic.core.tool.{Tool, ToolParameter, ToolResponse}
 import magic.jsonable.TypeSchema
 
-import std.collection.HashMap
+import std.collection.{ArrayList, HashMap}
+import std.core.Duration
+import std.net.*
+import std.sync.{AtomicBool, AtomicInt64}
 import std.unittest.testmacro.*
 import stdx.encoding.base64.toBase64String
 import stdx.encoding.json.*
@@ -165,8 +170,645 @@ private func m2ResetHttpCapture(): Unit {
     m2LastRequestBody = JsonObject()
 }
 
+private func s4AResponsesPayload(): JsonObject {
+    let payload = JsonObject()
+    payload.put("model", JsonString("gpt-test"))
+    payload.put("instructions", JsonString("bounded"))
+    let input = JsonArray()
+    input.add(m2MessageItem("bounded"))
+    payload.put("input", input)
+    payload
+}
+
+private func s4AResponsesLoopbackClient(): CodexResponsesHttpClient {
+    CodexResponsesHttpClient(
+        transportConfig: Some(OpenAICodexOAuthTransportConfig(envProxyEnabled: false, timeoutMs: 2000))
+    )
+}
+
+private class S4ARawHttpReply {
+    let status: Int64
+    let body: Array<Byte>
+    let contentType: String
+    let dropWithoutResponse: Bool
+    let delayMs: Int64
+    let onAccepted: Option<() -> Unit>
+
+    init(
+        status: Int64,
+        body: Array<Byte>,
+        contentType!: String = "application/json",
+        dropWithoutResponse!: Bool = false,
+        delayMs!: Int64 = 0,
+        onAccepted!: Option<() -> Unit> = None<() -> Unit>
+    ) {
+        this.status = status
+        this.body = body
+        this.contentType = contentType
+        this.dropWithoutResponse = dropWithoutResponse
+        this.delayMs = delayMs
+        this.onAccepted = onAccepted
+    }
+}
+
+private class S4AStringTruth {
+    var value: String = ""
+}
+
+private class S4ARawHttpFixture {
+    private let listener = TcpServerSocket(bindAt: 0u16)
+    private let replies: Array<S4ARawHttpReply>
+    let accepted = AtomicInt64(0)
+    let closedByClient = AtomicInt64(0)
+
+    init(replies: Array<S4ARawHttpReply>) {
+        this.replies = replies
+        this.listener.bind()
+    }
+
+    prop port: Int64 {
+        get() { Int64((this.listener.localAddress as IPSocketAddress)?.port ?? 0u16) }
+    }
+
+    func serve(): Bool {
+        for (reply in this.replies) {
+            try (client = this.listener.accept(timeout: Some(Duration.second * 3))) {
+                this.accepted.fetchAdd(1)
+                if (let Some(notify) <- reply.onAccepted) {
+                    notify()
+                }
+                client.readTimeout = Some(Duration.second)
+                let request = Array<Byte>(16384, repeat: 0)
+                let _ = client.read(request)
+                if (reply.delayMs > 0) {
+                    sleep(Duration.millisecond * reply.delayMs)
+                }
+                if (reply.dropWithoutResponse) {
+                    continue
+                }
+                let reason = if (reply.status == 200) { "OK" } else { "Bad Request" }
+                let header = "HTTP/1.1 ${reply.status} ${reason}\r\ncontent-type: ${reply.contentType}\r\ncontent-length: ${reply.body.size}\r\nconnection: close\r\n\r\n"
+                try {
+                    client.write(header.toArray())
+                    let split = reply.body.size / 2
+                    if (split > 0) {
+                        client.write(reply.body[..split])
+                        sleep(Duration.millisecond)
+                    }
+                    client.write(reply.body[split..])
+                    let eofProbe = Array<Byte>(1, repeat: 0)
+                    if (client.read(eofProbe) <= 0) {
+                        this.closedByClient.fetchAdd(1)
+                    }
+                } catch (_: Exception) {
+                    this.closedByClient.fetchAdd(1)
+                }
+            }
+        }
+        true
+    }
+
+    func close(): Unit {
+        this.listener.close()
+    }
+}
+
+private func s4AWithRawResponsesLoopback<T>(replies: Array<S4ARawHttpReply>, block: (String, S4ARawHttpFixture) -> T): T {
+    let fixture = S4ARawHttpFixture(replies)
+    @Expect(fixture.port > 0, true)
+    @Expect(fixture.port == 18080 || fixture.port == 18788, false)
+    if (fixture.port <= 0 || fixture.port == 18080 || fixture.port == 18788) {
+        fixture.close()
+        throw Exception("S4A owned loopback listener unavailable")
+    }
+    let serving = spawn { fixture.serve() }
+    var expectedClientCloses: Int64 = 0
+    for (reply in replies) {
+        if (!reply.dropWithoutResponse) {
+            expectedClientCloses += 1
+        }
+    }
+    var result = None<T>
+    var primaryFailure = None<Exception>
+    try {
+        result = Some(block("http://127.0.0.1:${fixture.port}", fixture))
+    } catch (ex: Exception) {
+        primaryFailure = Some(ex)
+    }
+    var joined = false
+    var cleanupFailure = ""
+    try {
+        fixture.close()
+        let served = serving.get(Duration.second * 4)
+        joined = true
+        let closed = fixture.closedByClient.load()
+        @Expect(served, true)
+        @Expect(closed, expectedClientCloses)
+        if (!served || closed != expectedClientCloses) {
+            cleanupFailure = "S4A loopback resource terminal truth failed"
+        }
+    } catch (_: Exception) {
+        cleanupFailure = "S4A loopback resource cleanup failed"
+    } finally {
+        try {
+            fixture.close()
+        } catch (_: Exception) {
+            if (cleanupFailure.isEmpty()) {
+                cleanupFailure = "S4A loopback listener close failed"
+            }
+        }
+        if (!joined) {
+            let reaped = try {
+                let _ = serving.get(Duration.second * 2)
+                true
+            } catch (_: Exception) {
+                false
+            }
+            @Expect(reaped, true)
+            if (!reaped && cleanupFailure.isEmpty()) {
+                cleanupFailure = "S4A loopback server future did not settle"
+            }
+        }
+    }
+    if (let Some(ex) <- primaryFailure) {
+        throw ex
+    }
+    if (!cleanupFailure.isEmpty()) {
+        throw Exception(cleanupFailure)
+    }
+    match (result) {
+        case Some(value) => value
+        case None => throw Exception("S4A loopback block returned no result")
+    }
+}
+
+private func s4AVerifyChatModelCreateAndAsyncDeadline(): Unit {
+        let capturedTimeouts = ArrayList<Int64>()
+        let calls = AtomicInt64(0)
+        let output = JsonArray()
+        output.add(m2MessageItem("bounded"))
+        setCodexResponsesHttpRunnerForTest(Some({ request: CodexResponsesHttpRequest =>
+            capturedTimeouts.add(request.timeoutMs)
+            calls.fetchAdd(1)
+            CodexResponsesHttpResult(200, streamEvents: [m2CompletedEvent(output)])
+        }))
+        let model = CodexResponsesChatModel(
+            "gpt-test",
+            "https://api.openai.com/v1",
+            "test-token",
+            client: CodexResponsesHttpClient()
+        )
+        try {
+            let active = pushModelExecutionRemainingMsScope({ => 37 })
+            try {
+                @Expect(model.create(ChatRequest("sync")).message.content, "bounded")
+                var asyncCode = ""
+                try {
+                    let _ = model.asyncCreate(ChatRequest("async"))
+                } catch (ex: CodexResponsesException) {
+                    asyncCode = ex.code
+                }
+                @Expect(asyncCode, "async_response_factory_unavailable")
+            } finally {
+                @Expect(popModelExecutionRemainingMsScope(active), true)
+            }
+            @Expect(currentModelExecutionDeadlineSnapshot().status, "absent")
+            @Expect(capturedTimeouts.size, 2)
+            @Expect(capturedTimeouts[0], 37)
+            @Expect(capturedTimeouts[1], 37)
+
+            let beforeExpired = calls.load()
+            let expired = pushModelExecutionRemainingMsScope({ => 0 })
+            try {
+                for (mode in ["create", "asyncCreate"]) {
+                    var code = ""
+                    try {
+                        if (mode == "create") {
+                            let _ = model.create(ChatRequest("expired"))
+                        } else {
+                            let _ = model.asyncCreate(ChatRequest("expired"))
+                        }
+                    } catch (ex: CodexResponsesException) {
+                        code = ex.code
+                    }
+                    @Expect(code, "transport_deadline_exhausted")
+                }
+            } finally {
+                @Expect(popModelExecutionRemainingMsScope(expired), true)
+            }
+            @Expect(calls.load(), beforeExpired)
+            @Expect(currentModelExecutionDeadlineSnapshot().status, "absent")
+        } finally {
+            setCodexResponsesHttpRunnerForTest(None<CodexResponsesHttpRunner>)
+        }
+}
+
 @Test
 public class CodexResponsesAdapterTest {
+    @TestCase
+    public func s4AP1LoopbackSyncStreamAndHundredTimeoutsSettleWithoutRetainedGrowth(): Unit {
+        s4AVerifyChatModelCreateAndAsyncDeadline()
+        let syncBody = "{\"status\":\"completed\",\"model\":\"gpt-test\",\"output_text\":\"同步中文🙂\"}"
+        let syncText = s4AWithRawResponsesLoopback([S4ARawHttpReply(200, syncBody.toArray())], { baseUrl, fixture =>
+            let response = s4AResponsesLoopbackClient().postResponses(baseUrl, "test-token", s4AResponsesPayload())
+            @Expect(fixture.accepted.load(), 1)
+            m2String(response, "output_text")
+        })
+        @Expect(syncText, "同步中文🙂")
+
+        let streamOutput = JsonArray()
+        streamOutput.add(m2MessageItem("同步中文🙂"))
+        let eventJson = m2CompletedEvent(streamOutput).toJsonString()
+        let eventWire = eventJson.replace("\n", "").replace("\r", "")
+        @Expect(eventWire.isEmpty(), false)
+        @Expect(eventWire.contains("\n") || eventWire.contains("\r"), false)
+        if (eventWire.isEmpty() || eventWire.contains("\n") || eventWire.contains("\r")) {
+            throw Exception("S4A SSE event wire must be one line")
+        }
+        let streamText = s4AWithRawResponsesLoopback(
+            [S4ARawHttpReply(200, "data: ${eventWire}\n\n".toArray(), contentType: "text/event-stream")],
+            { baseUrl, fixture =>
+                let content = s4AResponsesLoopbackClient().streamResponses(
+                    baseUrl,
+                    "test-token",
+                    s4AResponsesPayload(),
+                    model: "gpt-test"
+                ).content
+                @Expect(fixture.accepted.load(), 1)
+                content
+            }
+        )
+        @Expect(streamText, "同步中文🙂")
+
+        let nativeRetry = s4AWithRawResponsesLoopback(
+            [
+                S4ARawHttpReply(0, [], dropWithoutResponse: true),
+                S4ARawHttpReply(200, "data: ${eventWire}\n\n".toArray(), contentType: "text/event-stream")
+            ],
+            { baseUrl, fixture =>
+                let scope = pushModelExecutionRemainingMsScope({ =>
+                    if (fixture.accepted.load() == 0) { 90 } else { 70 }
+                })
+                try {
+                    s4AResponsesLoopbackClient().streamResponses(
+                        baseUrl,
+                        "test-token",
+                        s4AResponsesPayload(),
+                        model: "gpt-test"
+                    ).content
+                } finally {
+                    @Expect(popModelExecutionRemainingMsScope(scope), true)
+                }
+            }
+        )
+        @Expect(nativeRetry, "同步中文🙂")
+
+        let retryEncoding = S4AStringTruth()
+        s4AWithRawResponsesLoopback(
+            [
+                S4ARawHttpReply(0, [], dropWithoutResponse: true),
+                S4ARawHttpReply(200, [0xffu8], contentType: "text/event-stream")
+            ],
+            { baseUrl, fixture =>
+                try {
+                    let _ = s4AResponsesLoopbackClient().streamResponses(
+                        baseUrl,
+                        "test-token",
+                        s4AResponsesPayload(),
+                        model: "gpt-test"
+                    )
+                } catch (ex: CodexResponsesException) {
+                    retryEncoding.value = ex.code
+                }
+                @Expect(fixture.accepted.load(), 2)
+            }
+        )
+        @Expect(retryEncoding.value, "invalid_response_encoding")
+
+        resetCodexResponsesHttpRegistryTruthForTest()
+        let proxyCode = S4AStringTruth()
+        let proxyMessage = S4AStringTruth()
+        let proxyClient = CodexResponsesHttpClient(transportConfig: Some(OpenAICodexOAuthTransportConfig(
+            proxy: "https://user:secret@127.0.0.1:7897",
+            envProxyEnabled: false,
+            timeoutMs: 2000,
+            proxySource: "test"
+        )))
+        try {
+            let _ = proxyClient.streamResponses(
+                "https://api.openai.com/v1",
+                "test-token-never-print",
+                s4AResponsesPayload(),
+                model: "gpt-test"
+            )
+        } catch (ex: CodexResponsesException) {
+            proxyCode.value = ex.code
+            proxyMessage.value = ex.message
+        }
+        @Expect(proxyCode.value, "http_error")
+        @Expect(proxyMessage.value.contains("true HTTPS proxy is not implemented"), true)
+        @Expect(proxyMessage.value.contains("unsupportedHttpsProxy"), true)
+        @Expect(proxyMessage.value.contains("[redacted]@127.0.0.1:7897"), true)
+        @Expect(proxyMessage.value.contains("secret"), false)
+        @Expect(proxyMessage.value.contains("test-token-never-print"), false)
+        let proxyTruth = codexResponsesHttpRegistryTruthForTest()
+        @Expect(proxyTruth.registered, 1)
+        @Expect(proxyTruth.settled, 1)
+        @Expect(proxyTruth.active, 0)
+        @Expect(proxyTruth.retained, 0)
+
+        let exhaustedTransport = S4AStringTruth()
+        s4AWithRawResponsesLoopback(
+            [
+                S4ARawHttpReply(0, [], dropWithoutResponse: true),
+                S4ARawHttpReply(0, [], dropWithoutResponse: true)
+            ],
+            { baseUrl, fixture =>
+                try {
+                    let _ = s4AResponsesLoopbackClient().streamResponses(
+                        baseUrl,
+                        "test-token",
+                        s4AResponsesPayload(),
+                        model: "gpt-test"
+                    )
+                } catch (ex: CodexResponsesException) {
+                    exhaustedTransport.value = "${ex.code}:${ex.message}"
+                }
+                @Expect(fixture.accepted.load(), 2)
+            }
+        )
+        @Expect(exhaustedTransport.value, "stream_transport_error:Codex Responses stream transport failed after retry")
+
+        let nativeTimeoutRemaining = AtomicInt64(20)
+        let nativeTimeoutCode = S4AStringTruth()
+        s4AWithRawResponsesLoopback(
+            [S4ARawHttpReply(
+                200,
+                syncBody.toArray(),
+                delayMs: 50,
+                onAccepted: Some({ => nativeTimeoutRemaining.store(0) })
+            )],
+            { baseUrl, fixture =>
+                let timeoutScope = pushModelExecutionRemainingMsScope({ => nativeTimeoutRemaining.load() })
+                try {
+                    try {
+                        let _ = s4AResponsesLoopbackClient().postResponses(
+                            baseUrl,
+                            "test-token",
+                            s4AResponsesPayload()
+                        )
+                    } catch (ex: CodexResponsesException) {
+                        nativeTimeoutCode.value = ex.code
+                    }
+                    @Expect(fixture.accepted.load(), 1)
+                } finally {
+                    @Expect(popModelExecutionRemainingMsScope(timeoutScope), true)
+                }
+            }
+        )
+        @Expect(nativeTimeoutCode.value, "transport_deadline_exhausted")
+
+        let remaining = AtomicInt64(90)
+        let timeouts = ArrayList<Int64>()
+        let retryCalls = AtomicInt64(0)
+        setCodexResponsesHttpRunnerForTest(Some({ request: CodexResponsesHttpRequest =>
+            timeouts.add(request.timeoutMs)
+            if (retryCalls.fetchAdd(1) == 0) {
+                remaining.store(70)
+                CodexResponsesHttpResult(0, error: "temporary")
+            } else {
+                CodexResponsesHttpResult(200, streamEvents: [m2CompletedEvent(JsonArray())])
+            }
+        }))
+        let retryScope = pushModelExecutionRemainingMsScope({ => remaining.load() })
+        try {
+            let _ = CodexResponsesHttpClient().streamResponses(
+                "https://api.openai.com/v1",
+                "test-token",
+                s4AResponsesPayload(),
+                model: "gpt-test"
+            )
+            @Expect(timeouts.size, 2)
+            @Expect(timeouts[0], 90)
+            @Expect(timeouts[1], 70)
+        } finally {
+            @Expect(popModelExecutionRemainingMsScope(retryScope), true)
+            setCodexResponsesHttpRunnerForTest(None<CodexResponsesHttpRunner>)
+        }
+
+        let syncRemaining = AtomicInt64(90)
+        let syncTimeouts = ArrayList<Int64>()
+        let syncRetryCalls = AtomicInt64(0)
+        setCodexResponsesHttpRunnerForTest(Some({ request: CodexResponsesHttpRequest =>
+            syncTimeouts.add(request.timeoutMs)
+            if (syncRetryCalls.fetchAdd(1) == 0) {
+                syncRemaining.store(70)
+                CodexResponsesHttpResult(400, body: "unsupported parameter: service_tier")
+            } else {
+                CodexResponsesHttpResult(200, body: "{\"status\":\"completed\",\"output\":[]}")
+            }
+        }))
+        let syncRetryPayload = s4AResponsesPayload()
+        syncRetryPayload.put("service_tier", JsonString("priority"))
+        let syncRetryScope = pushModelExecutionRemainingMsScope({ => syncRemaining.load() })
+        try {
+            let _ = CodexResponsesHttpClient().postResponses(
+                "https://api.openai.com/v1",
+                "test-token",
+                syncRetryPayload
+            )
+            @Expect(syncTimeouts.size, 2)
+            @Expect(syncTimeouts[0], 90)
+            @Expect(syncTimeouts[1], 70)
+        } finally {
+            @Expect(popModelExecutionRemainingMsScope(syncRetryScope), true)
+            setCodexResponsesHttpRunnerForTest(None<CodexResponsesHttpRunner>)
+        }
+
+        resetCodexResponsesHttpRegistryTruthForTest()
+        let retainedBefore = codexResponsesHttpRegistryTruthForTest()
+        @Expect(retainedBefore.active, 0)
+        @Expect(retainedBefore.retained, 0)
+        let startedTimeouts = AtomicInt64(0)
+        let releasedTimeouts = AtomicInt64(0)
+        let timeoutReplies = ArrayList<S4ARawHttpReply>()
+        for (_ in 0..100) {
+            timeoutReplies.add(S4ARawHttpReply(
+                200,
+                "{\"status\":\"completed\",\"output\":[]}".toArray(),
+                onAccepted: Some({ =>
+                    let ordinal = startedTimeouts.fetchAdd(1) + 1
+                    while (releasedTimeouts.load() < ordinal) {
+                        sleep(Duration.millisecond)
+                    }
+                })
+            ))
+        }
+        try {
+            s4AWithRawResponsesLoopback(timeoutReplies.toArray(), { baseUrl, _ =>
+                for (i in 0..100) {
+                    let remainingTimeout = AtomicInt64(500)
+                    let timedCall = spawn {
+                        let scope = pushModelExecutionRemainingMsScope({ => remainingTimeout.load() })
+                        try {
+                            try {
+                                let _ = s4AResponsesLoopbackClient().postResponses(
+                                    baseUrl,
+                                    "test-token",
+                                    s4AResponsesPayload()
+                                )
+                                "unexpected_success"
+                            } catch (ex: CodexResponsesException) {
+                                ex.code
+                            }
+                        } finally {
+                            let _ = popModelExecutionRemainingMsScope(scope)
+                        }
+                    }
+                    var polls: Int64 = 0
+                    while (startedTimeouts.load() < Int64(i + 1) && polls < 2000) {
+                        sleep(Duration.millisecond)
+                        polls += 1
+                    }
+                    @Expect(startedTimeouts.load(), Int64(i + 1))
+                    if (startedTimeouts.load() != Int64(i + 1)) {
+                        remainingTimeout.store(0)
+                        releasedTimeouts.store(Int64(i + 1))
+                        let _ = try { timedCall.get(Duration.second) } catch (_: Exception) { "reap_failed" }
+                        throw Exception("S4A controlled timeout did not start")
+                    }
+                    let inFlight = codexResponsesHttpRegistryTruthForTest()
+                    @Expect(inFlight.active, 1)
+                    @Expect(inFlight.retained, 1)
+                    remainingTimeout.store(0)
+                    releasedTimeouts.store(Int64(i + 1))
+                    var joined = false
+                    try {
+                        @Expect(timedCall.get(Duration.second * 2), "transport_deadline_exhausted")
+                        joined = true
+                    } finally {
+                        remainingTimeout.store(0)
+                        releasedTimeouts.store(Int64(i + 1))
+                        if (!joined) {
+                            let reaped = try {
+                                let _ = timedCall.get(Duration.second * 2)
+                                true
+                            } catch (_: Exception) {
+                                false
+                            }
+                            @Expect(reaped, true)
+                            if (!reaped) {
+                                throw Exception("S4A controlled timeout future did not settle")
+                            }
+                        }
+                    }
+                }
+            })
+            let truth = codexResponsesHttpRegistryTruthForTest()
+            @Expect(truth.registered, 100)
+            @Expect(truth.settled, 100)
+            @Expect(truth.active, 0)
+            @Expect(truth.retained, 0)
+            @Expect(truth.maxActive, 1)
+        } finally {
+            resetCodexResponsesHttpRegistryTruthForTest()
+        }
+    }
+
+    @TestCase
+    public func s4AN1LateHttpResultSettlesAfterTurnTerminalWithoutBusinessEffect(): Unit {
+        let started = AtomicBool(false)
+        let release = AtomicBool(false)
+        let remaining = AtomicInt64(20)
+        resetCodexResponsesHttpRegistryTruthForTest()
+        setCodexResponsesHttpRunnerForTest(Some({ _: CodexResponsesHttpRequest =>
+            started.store(true)
+            while (!release.load()) {
+                sleep(Duration.millisecond)
+            }
+            CodexResponsesHttpResult(200, body: "{\"status\":\"completed\",\"output_text\":\"late-private\"}")
+        }))
+        let call = spawn {
+            let scope = pushModelExecutionRemainingMsScope({ => remaining.load() })
+            try {
+                try {
+                    let _ = CodexResponsesHttpClient().postResponses(
+                        "https://api.openai.com/v1",
+                        "test-token",
+                        s4AResponsesPayload()
+                    )
+                    "unexpected_success"
+                } catch (ex: CodexResponsesException) {
+                    ex.code
+                }
+            } finally {
+                let _ = popModelExecutionRemainingMsScope(scope)
+            }
+        }
+        var joined = false
+        try {
+            var polls: Int64 = 0
+            while (!started.load() && polls < 1000) {
+                sleep(Duration.millisecond)
+                polls += 1
+            }
+            @Expect(started.load(), true)
+            let inFlight = codexResponsesHttpRegistryTruthForTest()
+            @Expect(inFlight.active, 1)
+            @Expect(inFlight.retained, 1)
+            @Expect(inFlight.registered, 1)
+            @Expect(inFlight.settled, 0)
+            remaining.store(0)
+            release.store(true)
+            let terminal = call.get(Duration.second * 2)
+            joined = true
+            @Expect(terminal, "transport_deadline_exhausted")
+            let truth = codexResponsesHttpRegistryTruthForTest()
+            @Expect(truth.active, 0)
+            @Expect(truth.retained, 0)
+            @Expect(truth.registered, 1)
+            @Expect(truth.settled, 1)
+        } finally {
+            release.store(true)
+            if (!joined) {
+                let reaped = try {
+                    let _ = call.get(Duration.second * 2)
+                    true
+                } catch (_: Exception) {
+                    false
+                }
+                @Expect(reaped, true)
+                if (!reaped) {
+                    throw Exception("S4A late transport future did not settle")
+                }
+            }
+            setCodexResponsesHttpRunnerForTest(None<CodexResponsesHttpRunner>)
+            resetCodexResponsesHttpRegistryTruthForTest()
+        }
+    }
+
+    @TestCase
+    public func s4AH3LoopbackUnicodeEmojiInvalidUtf8AndClientCloseAreDeterministic(): Unit {
+        let body = "{\"status\":\"completed\",\"model\":\"gpt-test\",\"output_text\":\"中文🙂\"}"
+        let content = s4AWithRawResponsesLoopback([S4ARawHttpReply(200, body.toArray())], { baseUrl, fixture =>
+            let text = m2String(s4AResponsesLoopbackClient().postResponses(baseUrl, "test-token", s4AResponsesPayload()), "output_text")
+            @Expect(fixture.accepted.load(), 1)
+            text
+        })
+        @Expect(content, "中文🙂")
+        let code = S4AStringTruth()
+        s4AWithRawResponsesLoopback([S4ARawHttpReply(200, [0xffu8])], { baseUrl, fixture =>
+            try {
+                let _ = s4AResponsesLoopbackClient().postResponses(baseUrl, "test-token", s4AResponsesPayload())
+            } catch (ex: CodexResponsesException) {
+                code.value = ex.code
+            }
+            @Expect(fixture.accepted.load(), 1)
+        })
+        @Expect(code.value, "invalid_response_encoding")
+        @Expect(codexResponsesHttpRegistryTruthForTest().active, 0)
+    }
+
     @TestCase
     public func m3N5ResponsesUsesCronRemainingTransportDeadlineAndClearsThreadScope(): Unit {
         let captured = JsonObject()
