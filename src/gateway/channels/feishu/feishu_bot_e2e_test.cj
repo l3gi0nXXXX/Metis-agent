@@ -1,7 +1,9 @@
 package metis.gateway.channels.feishu
 
 import metis.core.config.{CliConfig, CliSettingManager, MetisConfigManager, MetisProcessEnvironmentLock}
-import metis.gateway.core.{GatewayRouter, GatewayService, setGatewayAgentBridgeReplyRunnerForTest}
+import metis.gateway.core.{GatewayRouter, GatewayRuntimeHeapSnapshot, GatewayService,
+    resetGatewayModelMemoryAdmissionForTest, setGatewayAgentBridgeReplyRunnerForTest,
+    setGatewayModelMemoryAdmissionSnapshotProviderForTest}
 import metis.gateway.model.{ChannelPolicyConfig, FeishuConfig}
 import magic.core.message.Message
 import magic.core.model.{AsyncChatResponse, ChatModel, ChatRequest, ChatResponse}
@@ -15,6 +17,7 @@ import stdx.encoding.json.{JsonArray, JsonBool, JsonObject, JsonString}
 
 private const FEISHU_BOT_E2E_ACCOUNT = "tenant-a"
 private const FEISHU_BOT_E2E_CHAT = "oc_test_chat"
+private const FEISHU_BOT_E2E_GIB: Int64 = 1024 * 1024 * 1024
 
 private class FeishuBotE2eLongConnectTransport <: FeishuLongConnectTransport {
     private let events: ArrayList<JsonObject>
@@ -57,10 +60,21 @@ private func withFeishuBotE2eHome(name: String, body: () -> Unit): Unit {
         CliSettingManager.invalidate()
         MetisConfigManager.invalidate()
         MetisConfigManager.writeRoot(feishuBotE2eRoot())
+        resetGatewayModelMemoryAdmissionForTest()
+        setGatewayModelMemoryAdmissionSnapshotProviderForTest(Some({=> GatewayRuntimeHeapSnapshot(
+            2 * FEISHU_BOT_E2E_GIB,
+            FEISHU_BOT_E2E_GIB,
+            FEISHU_BOT_E2E_GIB,
+            50,
+            "ok",
+            1,
+            "ok"
+        )}))
         try {
             body()
         } finally {
             setGatewayAgentBridgeReplyRunnerForTest(None<(String, String, String, String, Bool, Option<(String) -> Unit>) -> String>)
+            resetGatewayModelMemoryAdmissionForTest()
             MetisConfigManager.invalidate()
             CliSettingManager.invalidate()
             CliConfig.invalidatePathCache()
@@ -285,8 +299,11 @@ public func sidecarTextInboundReachesGatewaySessionAndFeishuReplySend(): Unit {
 
         @Expect(transport.startCount == 1)
         @Expect(prompts.size == 1)
-        @Expect(prompts[0].contains("feishu:main:12345"))
         @Expect(apiClient.textSendCount() == 1)
+        if (prompts.size != 1 || apiClient.textSendCount() != 1) {
+            throw Exception("feishu_bot_e2e_expected_single_reply_missing")
+        }
+        @Expect(prompts[0].contains("feishu:main:12345"))
         let request = apiClient.lastTextMessageRequest()
         @Expect(feishuBotE2eString(request, "accountId") == FEISHU_BOT_E2E_ACCOUNT)
         @Expect(feishuBotE2eString(request, "receiveId") == FEISHU_BOT_E2E_CHAT)
@@ -324,6 +341,9 @@ public func duplicateSidecarInboundDoesNotSendDuplicateReply(): Unit {
 
         @Expect(agentRuns.size == 1)
         @Expect(apiClient.textSendCount() == 1)
+        if (agentRuns.size != 1 || apiClient.textSendCount() != 1) {
+            throw Exception("feishu_bot_e2e_expected_single_reply_missing")
+        }
     })
 }
 
@@ -395,6 +415,9 @@ public func sidecarTextInboundEmptyModelResponseUsesFallbackAndRepliesCronDelive
         }
 
         @Expect(apiClient.textSendCount() == 1)
+        if (apiClient.textSendCount() != 1) {
+            throw Exception("feishu_bot_e2e_expected_single_reply_missing")
+        }
         let request = apiClient.lastTextMessageRequest()
         let text = feishuBotE2eString(request, "text")
         @Expect(text.contains("telegram"))
@@ -433,6 +456,9 @@ public func sidecarTextInboundEmptyModelResponseWithoutFallbackSendsVisibleDiagn
         }
 
         @Expect(apiClient.textSendCount() == 1)
+        if (apiClient.textSendCount() != 1) {
+            throw Exception("feishu_bot_e2e_expected_single_reply_missing")
+        }
         let request = apiClient.lastTextMessageRequest()
         let text = feishuBotE2eString(request, "text")
         @Expect(text, "模型服务本轮返回空响应，未能完成回复。请稍后重试或切换模型。")
