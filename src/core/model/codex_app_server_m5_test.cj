@@ -422,6 +422,11 @@ public class CodexAppServerM5Test {
 
     @TestCase
     public func p3B3Utf8MalformedTimeoutAndDiagnosticsAreStableAndRedacted(): Unit {
+        let brokerReady = managedStdioBroker().probeBroker(timeoutMs: 2000)
+        @Expect(brokerReady.ok, true)
+        if (!brokerReady.ok) { throw Exception("P3 broker warmup failed") }
+        m5WarmBrokerDispatcher()
+        let brokerBaseline = managedStdioBroker().debugSnapshotForTest()
         let unicode = codexAppServerParseStdoutLine("{\"id\":3,\"result\":{\"text\":\"中文🙂\"}}")
         let malformed = codexAppServerParseStdoutLine("{not-json 中文🙂")
         let longText = m5RepeatedText(r'x', 256)
@@ -482,7 +487,7 @@ public class CodexAppServerM5Test {
 
         let afterDeadline = CodexAppServerClient(
             codexBin: m5FakeCodexScript(),
-            env: m5FakeCodexEnvironment("delayed-response", "after", delayMs: Some<Int64>(200))
+            env: m5FakeCodexEnvironment("delayed-response", "after", delayMs: Some<Int64>(500))
         )
         let alongside = CodexAppServerClient(
             codexBin: m5FakeCodexScript(),
@@ -497,7 +502,7 @@ public class CodexAppServerM5Test {
         try {
             afterFuture = Some(spawn {
                 try {
-                    let _ = afterDeadline.request("initialize", JsonObject(), 30)
+                    let _ = afterDeadline.request("initialize", JsonObject(), 200)
                     "unexpected_success"
                 } catch (e: Exception) { e.message }
             })
@@ -541,6 +546,7 @@ public class CodexAppServerM5Test {
             stderrBurst.close()
         }
         let burstDiagnostics = stderrBurst.diagnostics().toString()
+        let brokerAfter = managedStdioBroker().debugSnapshotForTest()
 
         @Expect(unicode.kind, "response")
         @Expect(unicode.message.toJsonString().contains("中文🙂"), true)
@@ -563,6 +569,11 @@ public class CodexAppServerM5Test {
         @Expect(burstDiagnostics.contains("中文🙂"), true)
         @Expect(burstDiagnostics.contains("secret-codex-token"), false)
         @Expect(burstDiagnostics.contains("/Users/"), false)
+        @Expect(brokerAfter.generation, brokerBaseline.generation)
+        @Expect(brokerAfter.brokerPid, brokerBaseline.brokerPid)
+        @Expect(brokerAfter.ownerCount, brokerBaseline.ownerCount)
+        @Expect(brokerAfter.readerCount, brokerBaseline.readerCount)
+        @Expect(brokerAfter.dispatcherCount, brokerBaseline.dispatcherCount)
     }
 
     @TestCase
