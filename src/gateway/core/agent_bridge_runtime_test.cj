@@ -2253,16 +2253,32 @@ public class AgentBridgeRuntimeTest {
             try {
                 client.start(1000)
                 let pidReadyDeadline = MonoTime.now() + Duration.second
-                while (!exists(pidPath) && MonoTime.now() < pidReadyDeadline) {
-                    sleep(Duration.millisecond * 10)
+                let expectedPidPath = canonicalize(home).join("owner.pid").toString()
+                while (pid <= 1 && MonoTime.now() < pidReadyDeadline) {
+                    if (exists(pidPath)) {
+                        let pidIdentityOk = try {
+                            let info = FileInfo(pidPath)
+                            info.isRegular() && !info.isSymbolicLink() &&
+                                canonicalize(pidPath).toString() == expectedPidPath
+                        } catch (_: Exception) {
+                            false
+                        }
+                        if (!pidIdentityOk) { throw Exception("S4B no-response pid identity invalid") }
+                        let pidText = try {
+                            String.fromUtf8(File.readFrom(pidPath)).trimAscii()
+                        } catch (_: Exception) {
+                            throw Exception("S4B no-response pid encoding invalid")
+                        }
+                        if (!pidText.isEmpty()) {
+                            pid = try { Int64.parse(pidText) } catch (_: Exception) { 0 }
+                        }
+                    }
+                    if (pid <= 1 && MonoTime.now() < pidReadyDeadline) {
+                        sleep(Duration.millisecond * 10)
+                    }
                 }
-                if (!exists(pidPath)) { throw Exception("S4B no-response pid missing") }
-                let pidText = try {
-                    String.fromUtf8(File.readFrom(pidPath)).trimAscii()
-                } catch (_: Exception) {
-                    throw Exception("S4B no-response pid encoding invalid")
-                }
-                pid = Int64.parse(pidText)
+                @Expect(pid > 1, true)
+                if (pid <= 1) { throw Exception("S4B no-response pid not ready") }
                 let (pgidCode, pgidText, _) = executeWithOutput("ps", ["-o", "pgid=", "-p", "${pid}"])
                 if (pgidCode != 0) { throw Exception("S4B no-response pgid missing") }
                 let pgidValue = try {
@@ -2271,6 +2287,8 @@ public class AgentBridgeRuntimeTest {
                     throw Exception("S4B no-response pgid encoding invalid")
                 }
                 pgid = Int64.parse(pgidValue)
+                @Expect(pgid > 0, true)
+                if (pgid <= 0) { throw Exception("S4B no-response pgid invalid") }
                 let _ = client.request("initialize", JsonObject(), 3000)
             } catch (e: CodexAppServerProtocolException) {
                 timeoutCode = e.code
