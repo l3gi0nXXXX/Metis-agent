@@ -1094,25 +1094,53 @@ public class ServicePluginHostTest {
 
     @TestCase
     public func stdioProcessReceivesLeaseEnvironmentAndTracksPid(): Unit {
-        let capturePath = Path("/private/tmp/metis-service-plugin-env-${DateTime.now().toUnixTimeStamp().toNanoseconds()}.txt")
+        let stamp = DateTime.now().toUnixTimeStamp().toNanoseconds()
+        let captureName = "metis-service-plugin-env-${stamp}.txt"
+        let capturePath = Path("/private/tmp").join(captureName)
+        let captureIsSymlink = try { FileInfo(capturePath).isSymbolicLink() } catch (_: Exception) { false }
+        let captureOwned = stamp > 0 && !exists(capturePath) && !captureIsSymlink &&
+            capturePath.toString() == "/private/tmp/${captureName}" && capturePath.fileName == captureName &&
+            capturePath.parent.toString() == "/private/tmp" && canonicalize(capturePath.parent).toString() == "/private/tmp"
+        @Expect(captureOwned, true)
+        if (!captureOwned) { throw Exception("service plugin environment capture path is not an absent owned file") }
         let initLine = "{\"type\":\"response\",\"frameId\":\"init-1\",\"serviceId\":\"stdio-service\",\"method\":\"initialize\",\"payload\":{\"ok\":true,\"status\":\"ready\"}}"
         let script = "printf '%s\\n' \"$METIS_SERVICE_PLUGIN_SESSION_ID|$METIS_SERVICE_PLUGIN_LEASE_PATH|$METIS_SERVICE_PLUGIN_PARENT_PID\" > '${capturePath.toString()}'; printf '%s\\n' '${initLine}'; read ignored || true"
-        this.registerStdioScript(script)
-        let started = ensureRegisteredServicePluginStarted("stdio-service", startupTimeoutMs: 2000)
-        @Expect(started.ok, true)
-        @Expect(this.waitForFile(capturePath, timeoutMillis: 2000), true)
-        let captured = String.fromUtf8(File.readFrom(capturePath)).trimAscii()
-        let parts = captured.split("|")
-        @Expect(parts.size, 3)
-        @Expect(parts[0], "stdio-service-1")
-        @Expect(parts[1].contains("/service-plugin/runtime/stdio-service/stdio-service-1.lease.json"), true)
-        @Expect(try { Int64.parse(parts[2]) > 0 } catch (_: Exception) { false }, true)
-        match (getServicePluginSnapshot("stdio-service")) {
-            case Some(snapshot) => @Expect(snapshot.pid > 0, true)
-            case None => @Expect(true, false)
+        try {
+            this.registerStdioScript(script)
+            let started = ensureRegisteredServicePluginStarted("stdio-service", startupTimeoutMs: 2000)
+            @Expect(started.ok, true)
+            @Expect(this.waitForFile(capturePath, timeoutMillis: 2000), true)
+            let captured = String.fromUtf8(File.readFrom(capturePath)).trimAscii()
+            let parts = captured.split("|")
+            @Expect(parts.size, 3)
+            @Expect(parts[0], "stdio-service-1")
+            @Expect(parts[1].contains("/service-plugin/runtime/stdio-service/stdio-service-1.lease.json"), true)
+            @Expect(try { Int64.parse(parts[2]) > 0 } catch (_: Exception) { false }, true)
+            match (getServicePluginSnapshot("stdio-service")) {
+                case Some(snapshot) => @Expect(snapshot.pid > 0, true)
+                case None => @Expect(true, false)
+            }
+            let stopped = stopServicePlugin("stdio-service", reason: "test")
+            @Expect(stopped.ok, true)
+        } finally {
+            try {
+                resetServicePluginHostForTest()
+            } finally {
+                let captureExists = exists(capturePath)
+                let captureLink = try { FileInfo(capturePath).isSymbolicLink() } catch (_: Exception) { false }
+                if (captureExists || captureLink) {
+                    let captureInfo = FileInfo(capturePath)
+                    let removable = captureExists && captureInfo.isRegular() && !captureInfo.isSymbolicLink() &&
+                        canonicalize(capturePath).toString() == capturePath.normalize().toString()
+                    @Expect(removable, true)
+                    if (!removable) { throw Exception("service_plugin_environment_capture_cleanup_identity_invalid") }
+                    remove(capturePath)
+                }
+                let remains = exists(capturePath) || try { FileInfo(capturePath).isSymbolicLink() } catch (_: Exception) { false }
+                @Expect(remains, false)
+                if (remains) { throw Exception("service_plugin_environment_capture_cleanup_failed") }
+            }
         }
-        let stopped = stopServicePlugin("stdio-service", reason: "test")
-        @Expect(stopped.ok, true)
     }
 
     @TestCase

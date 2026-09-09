@@ -1,10 +1,12 @@
 package metis.gateway.service_plugin
 
+import magic.config.Config
 import metis.core.config.{CliConfig, CliSettingManager, GatewayServicePluginUserSettings, GatewayUserSettings, MetisConfigManager, MetisProcessEnvironmentLock}
+import metis.gateway.logging.gatewayLoggingResetForTest
 
 import std.collection.ArrayList
-import std.env.{getVariable, setVariable}
-import std.fs.{Directory, File, Path, remove}
+import std.env.{getVariable, removeVariable, setVariable}
+import std.fs.{Directory, File, FileInfo, Path, canonicalize, exists, remove}
 import std.time.DateTime
 import std.unittest.testmacro.*
 import stdx.encoding.json.JsonString
@@ -25,14 +27,10 @@ private func servicePluginConfigRuntimeTempPath(label: String): Path {
     Path("/private/tmp/metis-service-plugin-config-runtime-${label}-${DateTime.now().toUnixTimeStamp().toNanoseconds()}.json")
 }
 
-private func servicePluginConfigRuntimeTempHome(label: String): Path {
-    Path("/private/tmp/metis-service-plugin-config-runtime-home-${label}-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
-}
-
 private func servicePluginConfigRuntimeRestoreEnv(name: String, value: Option<String>): Unit {
     match (value) {
         case Some(v) => setVariable(name, v)
-        case None => setVariable(name, "")
+        case None => removeVariable(name)
     }
 }
 
@@ -44,19 +42,70 @@ private func servicePluginConfigRuntimeResetCaches(): Unit {
 
 private func withServicePluginConfigRuntimeTestHome<T>(label: String, block: () -> T): T {
     synchronized(MetisProcessEnvironmentLock) {
-        let home = servicePluginConfigRuntimeTempHome(label)
-        try { remove(home, recursive: true) } catch (_: Exception) { () }
-        Directory.create(home, recursive: true)
+        let stamp = DateTime.now().toUnixTimeStamp().toNanoseconds()
+        let homeName = "metis-service-plugin-config-runtime-home-${label}-${stamp}"
+        let home = Path("/private/tmp").join(homeName)
+        let oldLogFile = Config.logFile
         let oldHome = getVariable("METIS_HOME")
-        setVariable("METIS_HOME", home.toString())
-        servicePluginConfigRuntimeResetCaches()
+        let targetIsSymlink = try { FileInfo(home).isSymbolicLink() } catch (_: Exception) { false }
+        let homeIdentityOk = stamp > 0 && home.toString() == "/private/tmp/${homeName}" &&
+            home.parent.toString() == "/private/tmp" && canonicalize(home.parent).toString() == "/private/tmp" &&
+            home.fileName == homeName && !exists(home) && !targetIsSymlink
+        @Expect(homeIdentityOk, true)
+        if (!homeIdentityOk) { throw Exception("service_plugin_config_runtime_home_identity_invalid") }
+        var homeCreated = false
         try {
+            Directory.create(home, recursive: false)
+            homeCreated = true
+            setVariable("METIS_HOME", home.toString())
+            servicePluginConfigRuntimeResetCaches()
             return block()
         } finally {
-            resetServicePluginHostForTest()
-            servicePluginConfigRuntimeRestoreEnv("METIS_HOME", oldHome)
-            servicePluginConfigRuntimeResetCaches()
-            try { remove(home, recursive: true) } catch (_: Exception) { () }
+            try {
+                resetServicePluginHostForTest()
+            } finally {
+                try {
+                    servicePluginConfigRuntimeRestoreEnv("METIS_HOME", oldHome)
+                    match (oldHome) {
+                        case Some(value) =>
+                            match (getVariable("METIS_HOME")) {
+                                case Some(actual) =>
+                                    @Expect(actual, value)
+                                    if (actual != value) { throw Exception("service_plugin_config_runtime_home_restore_mismatch") }
+                                case None => throw Exception("service_plugin_config_runtime_home_restore_missing")
+                            }
+                        case None =>
+                            let restored = getVariable("METIS_HOME")
+                            @Expect(restored.isNone(), true)
+                            if (restored.isSome()) { throw Exception("service_plugin_config_runtime_home_restore_not_absent") }
+                    }
+                } finally {
+                    try {
+                        servicePluginConfigRuntimeResetCaches()
+                    } finally {
+                        try {
+                            gatewayLoggingResetForTest()
+                        } finally {
+                            try {
+                                Config.logFile = oldLogFile
+                                @Expect(Config.logFile, oldLogFile)
+                            } finally {
+                                if (homeCreated) {
+                                    let homeInfo = FileInfo(home)
+                                    let removable = homeInfo.isDirectory() && !homeInfo.isSymbolicLink() &&
+                                        canonicalize(home).toString() == home.normalize().toString()
+                                    @Expect(removable, true)
+                                    if (!removable) { throw Exception("service_plugin_config_runtime_home_cleanup_identity_invalid") }
+                                    remove(home, recursive: true)
+                                    let remains = exists(home) || try { FileInfo(home).isSymbolicLink() } catch (_: Exception) { false }
+                                    @Expect(remains, false)
+                                    if (remains) { throw Exception("service_plugin_config_runtime_home_cleanup_failed") }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }
