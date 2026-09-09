@@ -1,9 +1,10 @@
 package metis.gateway.runtime
 
 import magic.config.Config
+import magic.jsonable.*
 
 import metis.core.config.{CliConfig, CliSettingManager, GatewayUserSettings, MetisConfigManager, MetisProcessEnvironmentLock}
-import metis.gateway.core.{gatewayChannelRuntimeMarkFailure, gatewayChannelRuntimeMarkStarting, gatewayChannelRuntimeRegisterAccount}
+import metis.gateway.core.{GatewayRuntimeHeapSnapshot, gatewayChannelRuntimeMarkFailure, gatewayChannelRuntimeMarkStarting, gatewayChannelRuntimeRegisterAccount, gatewayModelMemoryAdmissionSnapshotForTest, resetGatewayModelMemoryAdmissionForTest, setGatewayModelMemoryAdmissionSnapshotProviderForTest}
 import metis.gateway.config.buildGatewayConfigFromUserSettings
 import metis.gateway.logging.gatewayLoggingResetForTest
 
@@ -13,7 +14,7 @@ import std.fs.{Directory, Path, exists, remove}
 import std.sync.AtomicInt64
 import std.time.MonoTime
 import std.unittest.testmacro.*
-import stdx.encoding.json.JsonValue
+import stdx.encoding.json.{JsonObject, JsonValue}
 
 private func gatewayHttpSurfaceTestUser(): GatewayUserSettings {
     var user = GatewayUserSettings()
@@ -69,6 +70,108 @@ private func withGatewayHttpSurfaceTestSettings<T>(block: () -> T): T {
 
 @Test
 public class GatewayHttpSurfaceTest {
+    @TestCase
+    public func s3H3OpenAiPressureUsesNestedErrorWithoutCompletedPayloads(): Unit {
+        resetGatewayModelMemoryAdmissionForTest()
+        setGatewayModelMemoryAdmissionSnapshotProviderForTest(Some({=> GatewayRuntimeHeapSnapshot(
+            2 * 1024 * 1024 * 1024,
+            2 * 1024 * 1024 * 1024 - 1,
+            1,
+            99,
+            "ok",
+            1,
+            "ok"
+        )}))
+        try {
+            for (endpoint in ["chat.completions", "responses"]) {
+                let raw = gatewayOpenAiEndpointMemoryPressureForTest(
+                    endpoint,
+                    "agent:general:s3-openai-${endpoint}",
+                    "must not reach model"
+                )
+                let root = JsonValue.fromStr(raw).asObject()
+                let error = root.get("error").getOrThrow().asObject()
+                @Expect(error.get("message").getOrThrow().asString().getValue(),
+                    "Gateway model capacity is temporarily unavailable. Please retry later.")
+                @Expect(error.get("type").getOrThrow().asString().getValue(), "server_error")
+                @Expect(error.get("code").getOrThrow().asString().getValue(), "model_memory_pressure")
+                @Expect(error.get("errorKind").getOrThrow().asString().getValue(), "model_memory_pressure")
+                @Expect(root.get("choices").isNone(), true)
+                @Expect(root.get("output").isNone(), true)
+                @Expect(root.get("status").isNone(), true)
+            }
+        } finally {
+            resetGatewayModelMemoryAdmissionForTest()
+            setGatewayModelMemoryAdmissionSnapshotProviderForTest(Some({=> GatewayRuntimeHeapSnapshot(
+                2 * 1024 * 1024 * 1024,
+                1024 * 1024 * 1024,
+                1024 * 1024 * 1024,
+                50,
+                "ok",
+                1,
+                "ok"
+            )}))
+        }
+    }
+
+    @TestCase
+    public func s3H3HttpToolsCallUsesGatewayRpcPressureSchema(): Unit {
+        withGatewayHttpSurfaceTestSettings<Unit>({ =>
+            resetGatewayModelMemoryAdmissionForTest()
+            setGatewayModelMemoryAdmissionSnapshotProviderForTest(Some({=> GatewayRuntimeHeapSnapshot(
+                2 * 1024 * 1024 * 1024,
+                2 * 1024 * 1024 * 1024 - 1,
+                1,
+                99,
+                "ok",
+                1,
+                "ok"
+            )}))
+            try {
+                let args = JsonObject()
+                args.put("requestId", "s3-http-tools".toJsonValue())
+                args.put("caller", "test".toJsonValue())
+                args.put("repository", "owner/repo".toJsonValue())
+                args.put("issueId", "42".toJsonValue())
+                args.put("ckbStatus", "ok".toJsonValue())
+                let evidence = JsonValue.fromStr("[{\"text\":\"bounded evidence\"}]").asArray()
+                args.put("evidence", evidence)
+                let response = gatewayMcpToolCallForTest(
+                    gatewayHttpSurfaceTestUser(),
+                    "gitcode_issue_summarize",
+                    args
+                )
+                let admission = gatewayModelMemoryAdmissionSnapshotForTest()
+                @Expect(admission.rejectedOrdinary, 1)
+                @Expect(admission.acceptedOrdinary, 0)
+                @Expect(admission.active, 0)
+                @Expect(response.ok, false)
+                if (response.ok) {
+                    throw Exception("s3_http_tools_pressure_mapping_missing")
+                }
+                @Expect(response.error,
+                    "Gateway model capacity is temporarily unavailable. Please retry later.")
+                @Expect(response.errorCode, "model_memory_pressure")
+                let details = response.details.asObject()
+                @Expect(details.get("errorKind").getOrThrow().asString().getValue(), "model_memory_pressure")
+                @Expect(details.get("message").getOrThrow().asString().getValue(),
+                    "Gateway model capacity is temporarily unavailable. Please retry later.")
+                @Expect(response.toJson().get("result").isNone(), true)
+            } finally {
+                resetGatewayModelMemoryAdmissionForTest()
+                setGatewayModelMemoryAdmissionSnapshotProviderForTest(Some({=> GatewayRuntimeHeapSnapshot(
+                    2 * 1024 * 1024 * 1024,
+                    1024 * 1024 * 1024,
+                    1024 * 1024 * 1024,
+                    50,
+                    "ok",
+                    1,
+                    "ok"
+                )}))
+            }
+        })
+    }
+
     @TestCase
     public func buildChatTurnParamsPreservesUnifiedGatewayHttpIngress(): Unit {
         let params = gatewayHttpBuildChatTurnParams("agent:main:main", "ping")

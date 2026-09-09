@@ -7,7 +7,7 @@ import metis.core.config.{CliConfig, CliSettingManager, GatewayUserSettings, Met
 import metis.core.model.CliModelManager
 import metis.gateway.config.buildGatewayConfigFromUserSettings
 import metis.gateway.{gatewayMcpAppendGitCodeTools, gatewayMcpGitCodeRuntimeStatusJson, gatewayMcpIsGitCodeTool}
-import metis.gateway.core.{GatewayAgentBridgeGitCodeMcpAdapter, gatewayAgentBridgeInvokeGitCodeMcpRuntime}
+import metis.gateway.core.{GatewayAgentBridgeGitCodeMcpAdapter, GatewayModelMemoryPressureException, gatewayAgentBridgeInvokeGitCodeMcpRuntime}
 import metis.gateway.model.GatewayConfig
 import metis.gateway.openclaw_http.gatewayRegisterOpenClawHttpRoutes
 import metis.gateway.protocol.{GATEWAY_ERROR_AUTH_FAILED, GATEWAY_ERROR_INVALID_CONNECT, GatewayClientInfo, GatewayConnectParams, GatewayProtocolRequest, GatewayProtocolResponse, validateGatewayConnectParams}
@@ -662,7 +662,12 @@ private func handleChatCompletions(ctx: HttpContext, cfg: GatewayConfig): String
     if (prompt.trimAscii().isEmpty()) {
         return buildErrorJson("messages must contain a non-empty user prompt")
     }
-    let answer = requestGatewayAnswer(sessionKey, prompt)
+    let turn = requestGatewayAnswerResult(sessionKey, prompt)
+    match (gatewayHttpModelMemoryPressureResponse(turn)) {
+        case Some(response) => return response
+        case None => ()
+    }
+    let answer = requestGatewayAnswerText(turn)
     let modelName = requestModelName(ctx, root)
     let choice = JsonObject()
     choice.put("index", 0.toJsonValue())
@@ -698,7 +703,12 @@ private func handleResponses(ctx: HttpContext, cfg: GatewayConfig): String {
     if (prompt.trimAscii().isEmpty()) {
         return buildErrorJson("input must contain a non-empty prompt")
     }
-    let answer = requestGatewayAnswer(sessionKey, prompt)
+    let turn = requestGatewayAnswerResult(sessionKey, prompt)
+    match (gatewayHttpModelMemoryPressureResponse(turn)) {
+        case Some(response) => return response
+        case None => ()
+    }
+    let answer = requestGatewayAnswerText(turn)
     let modelName = requestModelName(ctx, root)
     let textItem = JsonObject()
     textItem.put("type", JsonString("output_text"))
@@ -724,11 +734,29 @@ private func handleResponses(ctx: HttpContext, cfg: GatewayConfig): String {
     out.toJsonString()
 }
 
-private func requestGatewayAnswer(sessionKey: String, prompt: String): String {
-    let result = gatewayExecuteChatTurnFromRpc(
+private func requestGatewayAnswerResult(sessionKey: String, prompt: String): JsonObject {
+    gatewayExecuteChatTurnFromRpc(
         gatewayHttpBuildChatTurnParams(sessionKey, prompt),
         fallbackSource: GatewayIngressSource.Unknown("gateway-http")
     )
+}
+
+private func gatewayHttpTurnErrorKind(result: JsonObject): String {
+    match (result.get("errorKind")) {
+        case Some(value) => try { value.asString().getValue() } catch (_e: Exception) { "" }
+        case None => ""
+    }
+}
+
+private func gatewayHttpModelMemoryPressureResponse(result: JsonObject): Option<String> {
+    if (gatewayHttpTurnErrorKind(result) == "model_memory_pressure") {
+        Some(buildModelMemoryPressureErrorJson())
+    } else {
+        None<String>
+    }
+}
+
+private func requestGatewayAnswerText(result: JsonObject): String {
     match (result.get("answer")) {
         case Some(v) =>
             try { v.asString().getValue() } catch (_: Exception) { "" }
@@ -1313,7 +1341,20 @@ private func gatewayMcpToolCall(user: GatewayUserSettings, name: String, args: J
     }
     let normalized = name.trimAscii().toAsciiLower()
     if (gatewayMcpIsGitCodeTool(normalized) || normalized.startsWith("gitcode_")) {
-        return GatewayRpcResponse(true, "tools.call", result: gatewayAgentBridgeInvokeGitCodeMcpRuntime(GatewayAgentBridgeGitCodeMcpAdapter(), normalized, args))
+        try {
+            return GatewayRpcResponse(true, "tools.call", result: gatewayAgentBridgeInvokeGitCodeMcpRuntime(GatewayAgentBridgeGitCodeMcpAdapter(), normalized, args))
+        } catch (_error: GatewayModelMemoryPressureException) {
+            let details = JsonObject()
+            details.put("errorKind", JsonString("model_memory_pressure"))
+            details.put("message", JsonString(GATEWAY_MODEL_MEMORY_BUSY_MESSAGE))
+            return GatewayRpcResponse(
+                false,
+                "tools.call",
+                error: GATEWAY_MODEL_MEMORY_BUSY_MESSAGE,
+                errorCode: "model_memory_pressure",
+                details: details
+            )
+        }
     }
     let client = gatewayBuildClient("gateway-http-mcp", "http-mcp")
     if (normalized == "gateway.status") {
@@ -1697,6 +1738,10 @@ private func gatewayMcpToolCall(user: GatewayUserSettings, name: String, args: J
     GatewayRpcResponse(false, "tools.call", error: "Unsupported MCP-over-HTTP tool: ${name}")
 }
 
+func gatewayMcpToolCallForTest(user: GatewayUserSettings, name: String, args: JsonObject): GatewayRpcResponse {
+    gatewayMcpToolCall(user, name, args)
+}
+
 private func gatewayHttpAttachmentSummary(items: Array<String>): JsonObject {
     var imageCount: Int64 = 0
     var fileUrlCount: Int64 = 0
@@ -1841,6 +1886,32 @@ private func buildErrorJson(message: String): String {
     let root = JsonObject()
     root.put("error", err)
     root.toJsonString()
+}
+
+private func buildModelMemoryPressureErrorJson(): String {
+    let err = JsonObject()
+    err.put("message", JsonString(GATEWAY_MODEL_MEMORY_BUSY_MESSAGE))
+    err.put("type", JsonString("server_error"))
+    err.put("code", JsonString("model_memory_pressure"))
+    err.put("errorKind", JsonString("model_memory_pressure"))
+    let root = JsonObject()
+    root.put("error", err)
+    root.toJsonString()
+}
+
+func gatewayModelMemoryPressureErrorJsonForTest(): String {
+    buildModelMemoryPressureErrorJson()
+}
+
+func gatewayOpenAiEndpointMemoryPressureForTest(endpoint: String, sessionKey: String, prompt: String): String {
+    if (endpoint != "chat.completions" && endpoint != "responses") {
+        return ""
+    }
+    let turn = requestGatewayAnswerResult(sessionKey, prompt)
+    match (gatewayHttpModelMemoryPressureResponse(turn)) {
+        case Some(response) => response
+        case None => ""
+    }
 }
 
 private func trimToMaxChars(text: String, maxChars: Int64): String {

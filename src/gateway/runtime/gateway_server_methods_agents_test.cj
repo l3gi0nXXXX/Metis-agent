@@ -4,7 +4,7 @@ import magic.jsonable.*
 
 import metis.core.gatewaySubagentResolveAgent
 import metis.core.config.{CliConfig, CliModelRuntimeStateManager, CliSettingManager, MetisConfigManager, MetisProcessEnvironmentLock, cliProviderApiKeyEnvAliases}
-import metis.gateway.core.{GatewayAgentRouteInput, GatewayResolvedSessionTurnResult, GatewaySessionExecutionResult, gatewayAgentTeamBroadcastAggregateJson, gatewayResolveAgentRoute, gatewayResolveAgentTeamBroadcastPlan, gatewayResolveSessionContextWithAgentRoute}
+import metis.gateway.core.{GatewayAgentRouteInput, GatewayResolvedSessionTurnResult, GatewayRuntimeHeapSnapshot, GatewaySessionExecutionResult, gatewayAgentTeamBroadcastAggregateJson, gatewayResolveAgentRoute, gatewayResolveAgentTeamBroadcastPlan, gatewayResolveSessionContextWithAgentRoute, resetGatewayModelMemoryAdmissionForTest, setGatewayModelMemoryAdmissionSnapshotProviderForTest}
 import metis.gateway.session.{GatewayIngressSource, GatewaySessionRequest}
 
 import std.collection.ArrayList
@@ -18,6 +18,55 @@ private func agentsTestString(obj: JsonObject, key: String): String {
         case Some(v) =>
             try { v.asString().getValue() } catch (_: Exception) { "" }
         case None => ""
+    }
+}
+
+@Test
+public class GatewayServerMethodsAgentMemoryAdmissionTest {
+    @TestCase
+    public func s3H3AgentInvokeUsesGatewayRpcFailureSchema(): Unit {
+        withAgentsTempHome("s3-agent-invoke-pressure", { _home: Path =>
+            resetGatewayModelMemoryAdmissionForTest()
+            setGatewayModelMemoryAdmissionSnapshotProviderForTest(Some({=> GatewayRuntimeHeapSnapshot(
+                2 * 1024 * 1024 * 1024,
+                2 * 1024 * 1024 * 1024 - 1,
+                1,
+                99,
+                "ok",
+                1,
+                "ok"
+            )}))
+            try {
+                let params = JsonObject()
+                params.put("agentId", JsonString("main"))
+                params.put("session", JsonString("agent:main:s3-agent-invoke"))
+                params.put("text", JsonString("must not reach model"))
+                let response = handleGatewayAgentsFamily(
+                    "agent.invoke",
+                    request: Some(GatewayRpcRequest("agent.invoke", params: params))
+                ).getOrThrow()
+                @Expect(response.ok, false)
+                @Expect(response.error, "Gateway model capacity is temporarily unavailable. Please retry later.")
+                @Expect(response.errorCode, "model_memory_pressure")
+                let details = response.details.asObject()
+                @Expect(agentsTestString(details, "errorKind"), "model_memory_pressure")
+                @Expect(agentsTestString(details, "message"),
+                    "Gateway model capacity is temporarily unavailable. Please retry later.")
+                let serialized = response.toJson()
+                @Expect(serialized.get("result").isNone(), true)
+            } finally {
+                resetGatewayModelMemoryAdmissionForTest()
+                setGatewayModelMemoryAdmissionSnapshotProviderForTest(Some({=> GatewayRuntimeHeapSnapshot(
+                    2 * 1024 * 1024 * 1024,
+                    1024 * 1024 * 1024,
+                    1024 * 1024 * 1024,
+                    50,
+                    "ok",
+                    1,
+                    "ok"
+                )}))
+            }
+        })
     }
 }
 

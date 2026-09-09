@@ -414,11 +414,13 @@ public class GatewayAgentBridgeGitCodeMcpAdapter <: GatewayGitCodeMcpRuntimeAdap
 }
 
 private func gatewayAgentBridgeGitCodeModelJson(toolName: String, args: JsonObject): String {
-    let requestId = match (args.get("requestId")) {
-        case Some(value) => try { value.asString().getValue() } catch (_e: Exception) { "unknown" }
-        case None => "unknown"
-    }
-    let prompt = """
+    let permit = gatewayTryAcquireModelMemoryAdmission(GatewayModelMemoryAdmissionSource.Ordinary)
+    try {
+        let requestId = match (args.get("requestId")) {
+            case Some(value) => try { value.asString().getValue() } catch (_e: Exception) { "unknown" }
+            case None => "unknown"
+        }
+        let prompt = """
 You are the Metis GitCode MCP runtime. Produce one JSON object and no prose.
 
 Tool: `${toolName}`
@@ -432,16 +434,19 @@ Required JSON shapes:
 
 Use only the supplied CKB evidence and GitCode input. If evidence is insufficient, return a conservative JSON object with readyToPost or safeToSend false.
 """
-    let store = GatewaySessionStore(Path("."), enabled: false, agentId: "gitcode-mcp")
-    let bridge = AgentBridge(sessionStore: store)
-    bridge.reply(
-        "gitcode-mcp:${requestId}",
-        prompt,
-        channelName: "gitcode-mcp",
-        agentId: "general",
-        extraSystemPrompt: "Return strict JSON only for the GitCode MCP runtime. Do not call external GitCode writeback.",
-        streamingEnabled: false
-    )
+        let store = GatewaySessionStore(Path("."), enabled: false, agentId: "gitcode-mcp")
+        let bridge = AgentBridge(sessionStore: store)
+        bridge.reply(
+            "gitcode-mcp:${requestId}",
+            prompt,
+            channelName: "gitcode-mcp",
+            agentId: "general",
+            extraSystemPrompt: "Return strict JSON only for the GitCode MCP runtime. Do not call external GitCode writeback.",
+            streamingEnabled: false
+        )
+    } finally {
+        let _ = permit.release()
+    }
 }
 
 public func gatewayAgentBridgeInvokeGitCodeMcpRuntime(

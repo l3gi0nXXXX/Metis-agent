@@ -7,11 +7,54 @@ import metis.gateway.tools.{GatewayMessageToolset, GatewayTtsToolset, debugSetGa
 import metis.gateway.session.{GatewayDeliveryTarget, GatewayIngressSource, GatewaySessionContext, GatewaySessionRequest}
 
 import std.collection.ArrayList
-import std.env.{getVariable, setVariable}
-import std.fs.{Directory, File, Path, remove}
+import std.env.{getVariable, removeVariable, setVariable}
+import std.fs.{Directory, File, Path, exists, remove}
 import std.time.DateTime
 import std.unittest.testmacro.*
 import stdx.encoding.json.{JsonArray, JsonBool, JsonInt, JsonObject, JsonString}
+
+private const S3B_SESSION_GIB: Int64 = 1024 * 1024 * 1024
+
+private class S3BSessionCancellationControl <: GatewayExecutionControl {
+    public var cancelled: Bool
+
+    init(cancelled!: Bool = false) {
+        this.cancelled = cancelled
+    }
+
+    public func remainingMs(): Int64 { if (this.cancelled) { 0 } else { 1000 } }
+    public func heartbeat(): Unit {}
+    public func isCancelled(): Bool { this.cancelled }
+    public func throwIfCancelled(): Unit {
+        if (this.cancelled) {
+            throw GatewayExecutionCancelledException("s3b-cancelled")
+        }
+    }
+}
+
+private class S3BSessionHookTruth {
+    var modelCalls: Int64 = 0
+    var deliveryCalls: Int64 = 0
+    var transcriptCalls: Int64 = 0
+    var lifecycleCalls: Int64 = 0
+}
+
+private func s3BSessionAdmissionSnapshot(available: Int64): GatewayRuntimeHeapSnapshot {
+    GatewayRuntimeHeapSnapshot(
+        2 * S3B_SESSION_GIB,
+        2 * S3B_SESSION_GIB - available,
+        available,
+        50,
+        "ok",
+        1,
+        "ok"
+    )
+}
+
+private func s3BSessionRestoreAdmissionBaseline(): Unit {
+    resetGatewayModelMemoryAdmissionForTest()
+    setGatewayModelMemoryAdmissionSnapshotProviderForTest(Some({=> s3BSessionAdmissionSnapshot(S3B_SESSION_GIB)}))
+}
 
 private func gatewaySessionTurnTtsTestHome(label: String): String {
     "/tmp/metis-gateway-session-turn-tts-${label}-${DateTime.now().toUnixTimeStamp().toMilliseconds()}"
@@ -1551,6 +1594,272 @@ public class GatewaySessionTurnRunnerTest {
         @Expect(turn.context.agentId, "general")
         @Expect(turn.execution.delivered, false)
         @Expect(turn.execution.answer.contains("这不是一个有效的命令"), true)
+    }
+
+    @TestCase
+    public func s3BU1BothPublicTurnEntrypointsRejectBeforeSessionWork(): Unit {
+        let store = GatewaySessionStore(Path("."), enabled: false, agentId: "general")
+        let bridge = AgentBridge(sessionStore: store)
+        let request = GatewaySessionRequest(
+            GatewayIngressSource.Cli,
+            channelName: "cli",
+            sessionHint: "main",
+            agentId: "general"
+        )
+        try {
+            resetGatewayModelMemoryAdmissionForTest()
+            setGatewayModelMemoryAdmissionSnapshotProviderForTest(Some({=> s3BSessionAdmissionSnapshot(1)}))
+            var directRejected = false
+            try {
+                let _ = gatewayExecuteSessionRequestTurn(bridge, request, "must-not-run")
+            } catch (error: GatewayModelMemoryPressureException) {
+                directRejected = true
+                @Expect(error.source, "ordinary")
+                @Expect(error.status, "heap_pressure")
+            }
+            @Expect(directRejected, true)
+            let directTruth = gatewayModelMemoryAdmissionSnapshotForTest()
+            @Expect(directTruth.active, 0)
+            @Expect(directTruth.rejectedOrdinary, 1)
+
+            resetGatewayModelMemoryAdmissionForTest()
+            setGatewayModelMemoryAdmissionSnapshotProviderForTest(Some({=> s3BSessionAdmissionSnapshot(1)}))
+            var userRejected = false
+            try {
+                let _ = gatewayExecuteSessionRequestTurnForUser(
+                    GatewayUserSettings(),
+                    request,
+                    "must-not-run",
+                    admissionSource: GatewayModelMemoryAdmissionSource.ServicePlugin
+                )
+            } catch (error: GatewayModelMemoryPressureException) {
+                userRejected = true
+                @Expect(error.source, "service-plugin")
+                @Expect(error.status, "heap_pressure")
+            }
+            @Expect(userRejected, true)
+            let userTruth = gatewayModelMemoryAdmissionSnapshotForTest()
+            @Expect(userTruth.active, 0)
+            @Expect(userTruth.rejectedOrdinary, 0)
+            @Expect(userTruth.rejectedServicePlugin, 1)
+        } finally {
+            s3BSessionRestoreAdmissionBaseline()
+        }
+    }
+
+    @TestCase
+    public func s3BU1ForUserRejectsBeforeSessionMigrationModelAndHooks(): Unit {
+        synchronized(MetisProcessEnvironmentLock) {
+            let home = "/tmp/metis-s3b-for-user-reject"
+            let oldHome = getVariable("METIS_HOME")
+            try { remove(Path(home), recursive: true) } catch (_e: Exception) { () }
+            Directory.create(home, recursive: true)
+            setVariable("METIS_HOME", home)
+            CliConfig.invalidatePathCache()
+            MetisConfigManager.invalidate()
+            CliSettingManager.invalidate()
+            let hookTruth = S3BSessionHookTruth()
+            setGatewayAgentBridgeReplyRunnerForTest(Some({
+                _sessionKey: String,
+                _prompt: String,
+                _channelName: String,
+                _agentId: String,
+                _streamingEnabled: Bool,
+                _streamChunkHook: Option<(String) -> Unit> =>
+                    hookTruth.modelCalls++
+                    "must-not-run"
+            }))
+            resetGatewayModelMemoryAdmissionForTest()
+            setGatewayModelMemoryAdmissionSnapshotProviderForTest(Some({=> s3BSessionAdmissionSnapshot(1)}))
+            try {
+                var rejected = false
+                try {
+                    let _ = gatewayExecuteSessionRequestTurnForUser(
+                        GatewayUserSettings(),
+                        GatewaySessionRequest(
+                            GatewayIngressSource.Cli,
+                            channelName: "cli",
+                            sessionHint: "s3b-reject",
+                            agentId: "general"
+                        ),
+                        "must not run",
+                        deliver: true,
+                        deliverHook: Some({
+                            _channel: String,
+                            _account: String,
+                            _peer: String,
+                            _text: String,
+                            _reply: Option<String>,
+                            _thread: Bool =>
+                            hookTruth.deliveryCalls++
+                            "unexpected"
+                        }),
+                        transcriptHook: Some({
+                            _context: GatewaySessionContext,
+                            _sequence: Int64,
+                            _userText: String,
+                            _assistantText: String =>
+                            hookTruth.transcriptCalls++
+                        }),
+                        lifecycleHook: Some({ _status: String => hookTruth.lifecycleCalls++ })
+                    )
+                } catch (_error: GatewayModelMemoryPressureException) {
+                    rejected = true
+                }
+                @Expect(rejected, true)
+                @Expect(hookTruth.modelCalls, 0)
+                @Expect(hookTruth.deliveryCalls, 0)
+                @Expect(hookTruth.transcriptCalls, 0)
+                @Expect(hookTruth.lifecycleCalls, 0)
+                @Expect(exists(Path(home).join("agents")), false)
+                @Expect(exists(Path(home).join("gateway-sessions")), false)
+            } finally {
+                setGatewayAgentBridgeReplyRunnerForTest(None<(String, String, String, String, Bool, Option<(String) -> Unit>) -> String>)
+                s3BSessionRestoreAdmissionBaseline()
+                match (oldHome) {
+                    case Some(value) => setVariable("METIS_HOME", value)
+                    case None => removeVariable("METIS_HOME")
+                }
+                CliConfig.invalidatePathCache()
+                MetisConfigManager.invalidate()
+                CliSettingManager.invalidate()
+                try { remove(Path(home), recursive: true) } catch (_e: Exception) { () }
+            }
+        }
+    }
+
+    @TestCase
+    public func s3BB1SuccessfulTurnReleasesAdmissionPermitExactlyOnce(): Unit {
+        s3BSessionRestoreAdmissionBaseline()
+        try {
+            let store = GatewaySessionStore(Path("."), enabled: false, agentId: "general")
+            let bridge = AgentBridge(sessionStore: store)
+            let turn = gatewayExecuteSessionRequestTurn(
+                bridge,
+                GatewaySessionRequest(
+                    GatewayIngressSource.Cli,
+                    channelName: "cli",
+                    sessionHint: "main",
+                    agentId: "general"
+                ),
+                "/unknown"
+            )
+            @Expect(turn.execution.answer.contains("这不是一个有效的命令"), true)
+            let truth = gatewayModelMemoryAdmissionSnapshotForTest()
+            @Expect(truth.active, 0)
+            @Expect(truth.acceptedOrdinary, 1)
+            @Expect(truth.released, 1)
+        } finally {
+            s3BSessionRestoreAdmissionBaseline()
+        }
+    }
+
+    @TestCase
+    public func s3BB1ThrowingTurnStillReleasesAdmissionPermit(): Unit {
+        s3BSessionRestoreAdmissionBaseline()
+        setGatewayAgentBridgeReplyRunnerForTest(Some({
+            _sessionKey: String,
+            _prompt: String,
+            _channelName: String,
+            _agentId: String,
+            _streamingEnabled: Bool,
+            _streamChunkHook: Option<(String) -> Unit> =>
+                throw Exception("s3b-generic-turn-failure")
+        }))
+        try {
+            let store = GatewaySessionStore(Path("."), enabled: false, agentId: "general")
+            let bridge = AgentBridge(sessionStore: store)
+            var thrown = false
+            try {
+                let _ = gatewayExecuteSessionRequestTurn(
+                    bridge,
+                    GatewaySessionRequest(
+                        GatewayIngressSource.Cli,
+                        channelName: "cli",
+                        sessionHint: "main",
+                        agentId: "general"
+                    ),
+                    "invoke model"
+                )
+            } catch (error: Exception) {
+                thrown = true
+                @Expect(error.message, "s3b-generic-turn-failure")
+            }
+            @Expect(thrown, true)
+            let truth = gatewayModelMemoryAdmissionSnapshotForTest()
+            @Expect(truth.active, 0)
+            @Expect(truth.acceptedOrdinary, 1)
+            @Expect(truth.released, 1)
+        } finally {
+            setGatewayAgentBridgeReplyRunnerForTest(None<(String, String, String, String, Bool, Option<(String) -> Unit>) -> String>)
+            s3BSessionRestoreAdmissionBaseline()
+        }
+    }
+
+    @TestCase
+    public func s3BB1CancellationBeforeAndInsideTurnReleasesPermit(): Unit {
+        let store = GatewaySessionStore(Path("."), enabled: false, agentId: "general")
+        let bridge = AgentBridge(sessionStore: store)
+        let request = GatewaySessionRequest(
+            GatewayIngressSource.Cli,
+            channelName: "cli",
+            sessionHint: "main",
+            agentId: "general"
+        )
+        s3BSessionRestoreAdmissionBaseline()
+        try {
+            let before = S3BSessionCancellationControl(cancelled: true)
+            var beforeCancelled = false
+            try {
+                let _ = gatewayExecuteSessionRequestTurn(
+                    bridge,
+                    request,
+                    "cancel before",
+                    executionControl: Some<GatewayExecutionControl>(before)
+                )
+            } catch (_error: GatewayExecutionCancelledException) {
+                beforeCancelled = true
+            }
+            @Expect(beforeCancelled, true)
+            @Expect(gatewayModelMemoryAdmissionSnapshotForTest().active, 0)
+            @Expect(gatewayModelMemoryAdmissionSnapshotForTest().released, 1)
+
+            let inside = S3BSessionCancellationControl()
+            setGatewayAgentBridgeReplyRunnerForTest(Some({
+                _sessionKey: String,
+                _prompt: String,
+                _channelName: String,
+                _agentId: String,
+                _streamingEnabled: Bool,
+                streamChunkHook: Option<(String) -> Unit> =>
+                    inside.cancelled = true
+                    match (streamChunkHook) {
+                        case Some(notify) => notify("partial")
+                        case None => ()
+                    }
+                    "must-not-complete"
+            }))
+            var insideCancelled = false
+            try {
+                let _ = gatewayExecuteSessionRequestTurn(
+                    bridge,
+                    request,
+                    "cancel inside",
+                    streamingEnabled: true,
+                    executionControl: Some<GatewayExecutionControl>(inside)
+                )
+            } catch (_error: GatewayExecutionCancelledException) {
+                insideCancelled = true
+            }
+            @Expect(insideCancelled, true)
+            let truth = gatewayModelMemoryAdmissionSnapshotForTest()
+            @Expect(truth.active, 0)
+            @Expect(truth.acceptedOrdinary, 2)
+            @Expect(truth.released, 2)
+        } finally {
+            setGatewayAgentBridgeReplyRunnerForTest(None<(String, String, String, String, Bool, Option<(String) -> Unit>) -> String>)
+            s3BSessionRestoreAdmissionBaseline()
+        }
     }
 
     @TestCase

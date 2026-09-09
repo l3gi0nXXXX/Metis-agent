@@ -702,12 +702,26 @@ private func gatewayBroadcastFailureResult(turn: GatewayAgentTeamBroadcastTurn, 
     )
 }
 
+private func gatewayBroadcastMemoryPressureResult(turn: GatewayAgentTeamBroadcastTurn): GatewayResolvedSessionTurnResult {
+    GatewayResolvedSessionTurnResult(
+        turn.context,
+        GatewaySessionExecutionResult(
+            "",
+            delivered: false,
+            deliveryStatus: GATEWAY_MODEL_MEMORY_PRESSURE_ERROR_KIND,
+            deliveryError: "Gateway model capacity is temporarily unavailable. Please retry later."
+        )
+    )
+}
+
 private func gatewayBroadcastExecuteOne(
     turn: GatewayAgentTeamBroadcastTurn,
     execute: (GatewayAgentTeamBroadcastTurn) -> GatewayResolvedSessionTurnResult
 ): GatewayResolvedSessionTurnResult {
     try {
         execute(turn)
+    } catch (_e: GatewayModelMemoryPressureException) {
+        gatewayBroadcastMemoryPressureResult(turn)
     } catch (e: Exception) {
         gatewayBroadcastFailureResult(turn, e.message)
     }

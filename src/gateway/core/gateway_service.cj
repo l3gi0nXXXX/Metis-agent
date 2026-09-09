@@ -21,6 +21,8 @@ import std.sync.Mutex
 import std.time.DateTime
 import stdx.encoding.json.{JsonArray, JsonBool, JsonObject, JsonString, JsonValue}
 
+private const GATEWAY_MODEL_MEMORY_BUSY_TEXT = "Gateway model capacity is temporarily unavailable. Please retry later."
+
 public class GatewayStopResult {
     public let ok: Bool
     public let status: String
@@ -571,17 +573,11 @@ public class GatewayService {
         effectiveAccountId: String,
         telegramAutoVoiceReply: Bool,
         control: GatewayInboundExecutionControl,
-        bestEffortDeliver!: Bool = false
+        bestEffortDeliver!: Bool = false,
+        plannedContext!: Option<GatewaySessionContext> = None<GatewaySessionContext>
     ): GatewayResolvedSessionTurnResult {
-        gatewayExecuteSessionRequestTurnForUser(
-            sessionUser,
-            request,
-            message.text,
-            deliver: request.deliver,
-            bestEffortDeliver: bestEffortDeliver,
-            replyToMessageId: this.telegramReplyTargetOrMessageId(message),
-            replyInThread: message.replyInThread,
-            deliverHook: Some({ channelName, deliveryAccountId, peerId, text, replyToMessageId, replyInThread =>
+        let deliverHook = Some<(String, String, String, String, Option<String>, Bool) -> String>(
+            { channelName, deliveryAccountId, peerId, text, replyToMessageId, replyInThread =>
                 if (control.isCancelled()) { return "" }
                 let (effectiveReplyToMessageId, effectiveReplyInThread, degraded, policyReason) =
                     gatewayApplyOutboundChannelPolicy(user, channelName, replyToMessageId, replyInThread)
@@ -629,24 +625,49 @@ public class GatewayService {
                     replyInThread: effectiveReplyInThread,
                     accountId: if (!deliveryAccountId.trimAscii().isEmpty()) { deliveryAccountId } else { effectiveAccountId }
                 )
-            }),
-            transcriptHook: this.transcriptPublisher,
-            lifecycleHook: if (channelToString(message.channel) == "telegram") {
-                Some({ status: String =>
+            })
+        let lifecycleHook = if (channelToString(message.channel) == "telegram") {
+            Some<(String) -> Unit>({ status: String =>
                     if (!control.isCancelled()) {
                         this.maybeSendTelegramLifecycleSignal(user, message, effectiveAccountId, status)
                     }
                 })
-            } else if (channelToString(message.channel) == "feishu" && request.deliver) {
-                Some({ status: String =>
+        } else if (channelToString(message.channel) == "feishu" && request.deliver) {
+            Some<(String) -> Unit>({ status: String =>
                     if (!control.isCancelled()) {
                         this.maybeSendFeishuAckLifecycleSignal(user, message, effectiveAccountId, status)
                     }
                 })
-            } else {
-                None<(String) -> Unit>
-            }
-        )
+        } else {
+            None<(String) -> Unit>
+        }
+        match (plannedContext) {
+            case Some(context) => gatewayExecutePlannedSessionRequestTurnForUser(
+                sessionUser,
+                request,
+                context,
+                message.text,
+                deliver: request.deliver,
+                bestEffortDeliver: bestEffortDeliver,
+                replyToMessageId: this.telegramReplyTargetOrMessageId(message),
+                replyInThread: message.replyInThread,
+                deliverHook: deliverHook,
+                transcriptHook: this.transcriptPublisher,
+                lifecycleHook: lifecycleHook
+            )
+            case None => gatewayExecuteSessionRequestTurnForUser(
+                sessionUser,
+                request,
+                message.text,
+                deliver: request.deliver,
+                bestEffortDeliver: bestEffortDeliver,
+                replyToMessageId: this.telegramReplyTargetOrMessageId(message),
+                replyInThread: message.replyInThread,
+                deliverHook: deliverHook,
+                transcriptHook: this.transcriptPublisher,
+                lifecycleHook: lifecycleHook
+            )
+        }
     }
 
     private func logInboundTurnOutcome(conversationKey: String, message: InboundMessage, turn: GatewayResolvedSessionTurnResult): Unit {
@@ -855,8 +876,15 @@ public class GatewayService {
         if (this.handleServicePluginImCommand(message, effectiveAccountId, user, conversationKey)) {
             return
         }
-        if (channelToString(message.channel) == "telegram" && this.handleTelegramNativeCommand(message, effectiveAccountId, user, conversationKey)) {
-            return
+        if (channelToString(message.channel) == "telegram") {
+            try {
+                if (this.handleTelegramNativeCommand(message, effectiveAccountId, user, conversationKey)) {
+                    return
+                }
+            } catch (_e: GatewayModelMemoryPressureException) {
+                this.handleModelMemoryPressureInbound(user, message, effectiveAccountId)
+                return
+            }
         }
         if (control.isCancelled()) { return }
         let routeRoot = match (MetisConfigManager.rawConfig()) {
@@ -902,7 +930,8 @@ public class GatewayService {
                         effectiveAccountId,
                         telegramAutoVoiceReply,
                         control,
-                        bestEffortDeliver: true
+                        bestEffortDeliver: true,
+                        plannedContext: Some(broadcastTurn.context)
                     )
                 this.logInboundTurnOutcome(broadcastConversationKey, message, turn)
                 turn
@@ -924,6 +953,10 @@ public class GatewayService {
                     .object()
             )
             let delivered = aggregate.get("delivered").getOrThrow().asBool().getValue()
+            if (this.agentTeamBroadcastHasModelMemoryPressure(aggregate)) {
+                this.handleModelMemoryPressureInbound(user, message, effectiveAccountId)
+                return
+            }
             if (!delivered && channelToString(message.channel) == "telegram") {
                 this.handleTelegramInboundExecutionError(user, message, effectiveAccountId,
                     Exception("agent team broadcast failed for all selected members"))
@@ -937,6 +970,10 @@ public class GatewayService {
         if (control.isCancelled()) { return }
         let turn = try {
             this.executeInboundSessionTurn(user, sessionUser, request, message, effectiveAccountId, telegramAutoVoiceReply, control)
+        } catch (_e: GatewayModelMemoryPressureException) {
+            if (control.isCancelled()) { return }
+            this.handleModelMemoryPressureInbound(user, message, effectiveAccountId)
+            return
         } catch (e: Exception) {
             if (control.isCancelled()) { return }
             if (channelToString(message.channel) == "telegram") {
@@ -2680,6 +2717,63 @@ public class GatewayService {
         match (message.replyTargetMessageId) {
             case Some(v) => Some(v)
             case None => Some(message.messageId)
+        }
+    }
+
+    private func agentTeamBroadcastHasModelMemoryPressure(aggregate: JsonObject): Bool {
+        let agents = match (aggregate.get("agents")) {
+            case Some(value) => try { value.asArray() } catch (_e: Exception) { JsonArray([]) }
+            case None => JsonArray([])
+        }
+        for (i in 0..agents.size()) {
+            let value = agents[i]
+            let row = try { value.asObject() } catch (_e: Exception) { JsonObject() }
+            let status = match (row.get("deliveryStatus")) {
+                case Some(item) => try { item.asString().getValue() } catch (_e: Exception) { "" }
+                case None => ""
+            }
+            if (status == GATEWAY_MODEL_MEMORY_PRESSURE_ERROR_KIND) {
+                return true
+            }
+        }
+        false
+    }
+
+    private func handleModelMemoryPressureInbound(
+        user: GatewayUserSettings,
+        message: InboundMessage,
+        accountId: String
+    ): Unit {
+        if (channelToString(message.channel) == "telegram") {
+            let threadId = match (message.threadId) {
+                case Some(value) => value
+                case None => ""
+            }
+            if (!this.telegramErrorPolicyState.shouldReply(
+                user,
+                message.peerId,
+                threadId,
+                GATEWAY_MODEL_MEMORY_PRESSURE_ERROR_KIND,
+                DateTime.now().toUnixTimeStamp().toMilliseconds()
+            )) {
+                return
+            }
+        }
+        let channel = channelToString(message.channel)
+        if (channel != "telegram" && channel != "feishu") {
+            return
+        }
+        try {
+            let _ = this.sendTextToPeerDetailed(
+                channel,
+                message.peerId,
+                GATEWAY_MODEL_MEMORY_BUSY_TEXT,
+                replyToMessageId: this.telegramReplyTargetOrMessageId(message),
+                replyInThread: message.replyInThread,
+                accountId: accountId
+            )
+        } catch (_sendError: Exception) {
+            ()
         }
     }
 

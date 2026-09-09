@@ -545,6 +545,47 @@ public class GatewayAgentTeamBroadcastTest {
     }
 
     @TestCase
+    public func s3H3TeamPreservesTypedPressureAndSuccessfulMembers(): Unit {
+        withBroadcastTempHome("s3-pressure", { home: Path =>
+            let root = broadcastRoot(home,
+                broadcastTeam(Some(JsonBool(true)), selectedMembers: ["writer", "reviewer"], strategy: "parallel"))
+            writeBroadcastRoot(root)
+            let plan = gatewayResolveAgentTeamBroadcastPlan(broadcastRequest(root))
+            let results = gatewayRunAgentTeamBroadcastPlan(plan, { turn: GatewayAgentTeamBroadcastTurn =>
+                if (turn.agentId == "writer") {
+                    throw GatewayModelMemoryPressureException(
+                        "ordinary",
+                        "capacity",
+                        2,
+                        2 * 1024 * 1024 * 1024,
+                        256 * 1024 * 1024,
+                        1024,
+                        1,
+                        1
+                    )
+                }
+                GatewayResolvedSessionTurnResult(
+                    turn.context,
+                    GatewaySessionExecutionResult("reviewer answer", delivered: true, deliveryStatus: "delivered")
+                )
+            })
+            @Expect(results.size, 2)
+            @Expect(results[0].execution.deliveryStatus, "model_memory_pressure")
+            @Expect(results[0].execution.answer, "")
+            @Expect(results[0].execution.deliveryError,
+                "Gateway model capacity is temporarily unavailable. Please retry later.")
+            @Expect(results[1].execution.deliveryStatus, "delivered")
+            @Expect(results[1].execution.answer, "reviewer answer")
+            let aggregate = gatewayAgentTeamBroadcastAggregateJson(plan, results)
+            @Expect(aggregate.get("status").getOrThrow().asString().getValue(), "partial")
+            let agents = aggregate.get("agents").getOrThrow().asArray()
+            @Expect(agents[0].asObject().get("deliveryStatus").getOrThrow().asString().getValue(),
+                "model_memory_pressure")
+            @Expect(agents[1].asObject().get("deliveryStatus").getOrThrow().asString().getValue(), "delivered")
+        })
+    }
+
+    @TestCase
     public func telegramBroadcastAggregateCarriesPerMemberRouteAndSessionEvidence(): Unit {
         withBroadcastTempHome("telegram-aggregate", { home: Path =>
             let root = broadcastRoot(

@@ -3,7 +3,7 @@ package metis.gateway.runtime
 import magic.jsonable.*
 
 import metis.core.config.{CliConfig, CliSettingManager, GatewayUserSettings}
-import metis.gateway.core.{GatewaySessionStore, gatewayBuildChatEventMessage, gatewayBuildChatEventPayload, gatewayBuildChatTurnResult, gatewayBuildSessionEventPayload, gatewayBuildSessionTranscriptEventPayload, gatewayExecuteSessionRequestTurnForUser, gatewayFindSessionConversationViewForUser, gatewayLogEventInfo, gatewayLogMeta, gatewaySessionStoreForSessionKey}
+import metis.gateway.core.{GatewayModelMemoryPressureException, GatewaySessionStore, gatewayBuildChatEventMessage, gatewayBuildChatEventPayload, gatewayBuildChatTurnResult, gatewayBuildSessionEventPayload, gatewayBuildSessionTranscriptEventPayload, gatewayExecuteSessionRequestTurnForUser, gatewayFindSessionConversationViewForUser, gatewayLogEventInfo, gatewayLogMeta, gatewaySessionStoreForSessionKey}
 import metis.gateway.session.{GatewayIngressSource, gatewayBuildSessionRpcParams, gatewayResolveSessionContext, gatewaySessionRequestFromRpcParams}
 
 import std.collection.HashMap
@@ -14,6 +14,7 @@ import stdx.encoding.json.{JsonObject, JsonString, JsonValue}
 
 public let gatewayChatTurnInvokeCache = HashMap<String, JsonObject>()
 public let gatewayChatTurnInvokeCacheLock = Mutex()
+const GATEWAY_MODEL_MEMORY_BUSY_MESSAGE = "Gateway model capacity is temporarily unavailable. Please retry later."
 
 private func gatewayRuntimeRpcString(params: JsonObject, key: String): String {
     match (params.get(key)) {
@@ -198,6 +199,12 @@ public func gatewayExecuteChatTurnFromRpc(
                 let _ = gatewayServerPublishSessionEvent(sessionPayload, detail: "chat-turn-streaming")
             })
         )
+    } catch (_ex: GatewayModelMemoryPressureException) {
+        let err = JsonObject()
+        err.put("error", JsonString(GATEWAY_MODEL_MEMORY_BUSY_MESSAGE))
+        err.put("errorKind", JsonString("model_memory_pressure"))
+        err.put("message", JsonString(GATEWAY_MODEL_MEMORY_BUSY_MESSAGE))
+        return err
     } catch (ex: Exception) {
         let err = JsonObject()
         err.put("error", JsonString(ex.message))

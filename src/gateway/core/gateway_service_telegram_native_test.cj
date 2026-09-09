@@ -16,6 +16,7 @@ import magic.model.ModelManager
 import std.collection.{ArrayList, HashMap}
 import std.env.{getVariable, setVariable}
 import std.fs.{Directory, File, Path, exists, remove}
+import std.sync.AtomicInt64
 import std.time.DateTime
 import std.unittest.testmacro.*
 import stdx.encoding.json.{JsonArray, JsonBool, JsonInt, JsonObject, JsonString, JsonValue}
@@ -42,6 +43,31 @@ private class GatewayTelegramNativeTestAdapter <: ChannelAdapter {
             text,
             false,
             DateTime.now()
+        ))
+    }
+
+    public func queueTeam(text: String): Unit {
+        let route = JsonObject()
+        route.put("channel", JsonString("telegram"))
+        route.put("accountId", JsonString("default"))
+        route.put("defaultAccountId", JsonString("default"))
+        route.put("peerKind", JsonString("direct"))
+        route.put("peerId", JsonString("8734062810"))
+        let context = JsonObject()
+        context.put("imRoute", route)
+        let mediaContext = JsonObject()
+        mediaContext.put("context", context)
+        this.inbound.add(InboundMessage(
+            ChannelType.Telegram,
+            "team-msg-${this.inbound.size}",
+            "8734062810",
+            "8734062810",
+            ChatType.Direct,
+            text,
+            false,
+            DateTime.now(),
+            accountId: "default",
+            mediaContext: mediaContext
         ))
     }
 
@@ -112,6 +138,282 @@ private class GatewayTelegramNativeTestAdapter <: ChannelAdapter {
 
     public func sentCount(): Int64 {
         this.sent.size
+    }
+}
+
+@Test
+public class GatewayServiceTelegramMemoryAdmissionTest {
+    @TestCase
+    public func s3H3TelegramTeamAllMixedNonePressureSendsAtMostOneBusy(): Unit {
+        gatewayTelegramRunTeamMemoryMode("all")
+        gatewayTelegramRunTeamMemoryMode("mixed")
+        gatewayTelegramRunTeamMemoryMode("none")
+    }
+
+    @TestCase
+    public func s3H3TelegramPressureSendsOneFixedBusyWithoutAssistantAnswer(): Unit {
+        withGatewayTelegramNativeTestHome {
+            let adapter = GatewayTelegramNativeTestAdapter()
+            let service = gatewayTelegramNativeService(adapter)
+            resetGatewayModelMemoryAdmissionForTest()
+            setGatewayModelMemoryAdmissionSnapshotProviderForTest(Some({=> GatewayRuntimeHeapSnapshot(
+                2 * 1024 * 1024 * 1024,
+                2 * 1024 * 1024 * 1024 - 1,
+                1,
+                99,
+                "ok",
+                1,
+                "ok"
+            )}))
+            service.start()
+            try {
+                adapter.queue("pressure request")
+                service.processOnceAndAwaitForTest()
+                var typingCount: Int64 = 0
+                var busyCount: Int64 = 0
+                var replyCount: Int64 = 0
+                var reactionCount: Int64 = 0
+                var unknownCount: Int64 = 0
+                for (index in 0..adapter.sentCount()) {
+                    let text = adapter.sentText(index)
+                    if (text == "[chat-action]\naction=typing") {
+                        typingCount++
+                    } else if (text == "Gateway model capacity is temporarily unavailable. Please retry later.") {
+                        busyCount++
+                        @Expect(text.contains("{"), false)
+                    } else if (text.startsWith("reply:")) {
+                        replyCount++
+                    } else if (text.startsWith("[reaction]\n")) {
+                        reactionCount++
+                    } else {
+                        unknownCount++
+                    }
+                }
+                @Expect(adapter.sentCount(), 2)
+                @Expect(typingCount, 1)
+                @Expect(busyCount, 1)
+                @Expect(replyCount, 0)
+                @Expect(reactionCount, 0)
+                @Expect(unknownCount, 0)
+                let store = gatewaySessionStoreForUser(CliSettingManager.readGatewaySettings())
+                let raw = store.readTranscriptRaw("telegram:direct:8734062810") ?? ""
+                @Expect(raw.contains("Gateway model capacity"), false)
+                @Expect(raw.contains("\"role\":\"assistant\""), false)
+            } finally {
+                service.stop()
+                resetGatewayModelMemoryAdmissionForTest()
+                setGatewayModelMemoryAdmissionSnapshotProviderForTest(Some({=> GatewayRuntimeHeapSnapshot(
+                    2 * 1024 * 1024 * 1024,
+                    1024 * 1024 * 1024,
+                    1024 * 1024 * 1024,
+                    50,
+                    "ok",
+                    1,
+                    "ok"
+                )}))
+            }
+        }
+    }
+
+    @TestCase
+    public func s3H3TelegramModelBackedSlashUsesSamePressureBusy(): Unit {
+        withGatewayTelegramNativeTestHome {
+            let adapter = GatewayTelegramNativeTestAdapter()
+            let service = gatewayTelegramNativeService(adapter)
+            resetGatewayModelMemoryAdmissionForTest()
+            setGatewayModelMemoryAdmissionSnapshotProviderForTest(Some({=> GatewayRuntimeHeapSnapshot(
+                2 * 1024 * 1024 * 1024,
+                2 * 1024 * 1024 * 1024 - 1,
+                1,
+                99,
+                "ok",
+                1,
+                "ok"
+            )}))
+            service.start()
+            try {
+                adapter.queue("/codex-runtime status")
+                service.processOnceAndAwaitForTest()
+                @Expect(adapter.sentCount(), 1)
+                @Expect(adapter.sentText(0),
+                    "Gateway model capacity is temporarily unavailable. Please retry later.")
+            } finally {
+                service.stop()
+                resetGatewayModelMemoryAdmissionForTest()
+                setGatewayModelMemoryAdmissionSnapshotProviderForTest(Some({=> GatewayRuntimeHeapSnapshot(
+                    2 * 1024 * 1024 * 1024,
+                    1024 * 1024 * 1024,
+                    1024 * 1024 * 1024,
+                    50,
+                    "ok",
+                    1,
+                    "ok"
+                )}))
+            }
+        }
+    }
+
+    @TestCase
+    public func s3H3TelegramSkillUsesSamePressureBusy(): Unit {
+        withGatewayTelegramNativeTestHome {
+            var user = GatewayUserSettings()
+            user.telegram.enabled = true
+            user.telegram.allowFrom = ["8734062810"]
+            CliSettingManager.writeGatewaySettings(user)
+            CliSettingManager.invalidate()
+            let adapter = GatewayTelegramNativeTestAdapter()
+            let service = gatewayTelegramNativeService(adapter)
+            resetGatewayModelMemoryAdmissionForTest()
+            setGatewayModelMemoryAdmissionSnapshotProviderForTest(Some({=> GatewayRuntimeHeapSnapshot(
+                2 * 1024 * 1024 * 1024,
+                2 * 1024 * 1024 * 1024 - 1,
+                1,
+                99,
+                "ok",
+                1,
+                "ok"
+            )}))
+            service.start()
+            try {
+                adapter.queue("/skill weather Shanghai")
+                service.processOnceAndAwaitForTest()
+                @Expect(adapter.sentCount(), 1)
+                @Expect(adapter.sentText(0),
+                    "Gateway model capacity is temporarily unavailable. Please retry later.")
+                for (index in 0..adapter.sentCount()) {
+                    @Expect(adapter.sentText(index).contains("not authorized for /skill"), false)
+                }
+                let admission = gatewayModelMemoryAdmissionSnapshotForTest()
+                @Expect(admission.rejectedOrdinary, 1)
+                @Expect(admission.acceptedOrdinary, 0)
+                @Expect(admission.active, 0)
+            } finally {
+                service.stop()
+                resetGatewayModelMemoryAdmissionForTest()
+                setGatewayModelMemoryAdmissionSnapshotProviderForTest(Some({=> GatewayRuntimeHeapSnapshot(
+                    2 * 1024 * 1024 * 1024,
+                    1024 * 1024 * 1024,
+                    1024 * 1024 * 1024,
+                    50,
+                    "ok",
+                    1,
+                    "ok"
+                )}))
+            }
+        }
+    }
+
+    @TestCase
+    public func s3H3TelegramCustomPromptUsesSamePressureBusy(): Unit {
+        withGatewayTelegramNativeTestHome {
+            var user = GatewayUserSettings()
+            user.telegram.enabled = true
+            user.telegram.allowFrom = ["*"]
+            user.telegram.customCommands = [
+                TelegramCustomCommandUserSettings(
+                    command: "review",
+                    description: "Review",
+                    prompt: "review this {args}"
+                )
+            ]
+            CliSettingManager.writeGatewaySettings(user)
+            let adapter = GatewayTelegramNativeTestAdapter()
+            let service = gatewayTelegramNativeService(adapter)
+            resetGatewayModelMemoryAdmissionForTest()
+            setGatewayModelMemoryAdmissionSnapshotProviderForTest(Some({=> GatewayRuntimeHeapSnapshot(
+                2 * 1024 * 1024 * 1024,
+                2 * 1024 * 1024 * 1024 - 1,
+                1,
+                99,
+                "ok",
+                1,
+                "ok"
+            )}))
+            service.start()
+            try {
+                adapter.queue("/review change")
+                service.processOnceAndAwaitForTest()
+                @Expect(adapter.sentCount(), 1)
+                @Expect(adapter.sentText(0),
+                    "Gateway model capacity is temporarily unavailable. Please retry later.")
+            } finally {
+                service.stop()
+                resetGatewayModelMemoryAdmissionForTest()
+                setGatewayModelMemoryAdmissionSnapshotProviderForTest(Some({=> GatewayRuntimeHeapSnapshot(
+                    2 * 1024 * 1024 * 1024,
+                    1024 * 1024 * 1024,
+                    1024 * 1024 * 1024,
+                    50,
+                    "ok",
+                    1,
+                    "ok"
+                )}))
+            }
+        }
+    }
+
+    @TestCase
+    public func s3H3TelegramFixedCustomAndNativeCommandsBypassAdmission(): Unit {
+        withGatewayTelegramNativeTestHome {
+            var user = GatewayUserSettings()
+            user.telegram.enabled = true
+            user.telegram.allowFrom = ["*"]
+            user.telegram.customCommands = [
+                TelegramCustomCommandUserSettings(command: "deploy", description: "Deploy", reply: "deploying {args}")
+            ]
+            CliSettingManager.writeGatewaySettings(user)
+            let modelCalls = AtomicInt64(0)
+            setGatewayAgentBridgeReplyRunnerForTest(Some({
+                _sessionKey: String,
+                _prompt: String,
+                _channelName: String,
+                _agentId: String,
+                _streamingEnabled: Bool,
+                _streamChunkHook: Option<(String) -> Unit> =>
+                    modelCalls.fetchAdd(1)
+                    "unexpected"
+            }))
+            resetGatewayModelMemoryAdmissionForTest()
+            setGatewayModelMemoryAdmissionSnapshotProviderForTest(Some({=> GatewayRuntimeHeapSnapshot(
+                2 * 1024 * 1024 * 1024,
+                2 * 1024 * 1024 * 1024 - 1,
+                1,
+                99,
+                "ok",
+                1,
+                "ok"
+            )}))
+            let adapter = GatewayTelegramNativeTestAdapter()
+            let service = gatewayTelegramNativeService(adapter)
+            service.start()
+            try {
+                adapter.queue("/deploy prod")
+                adapter.queue("/help")
+                adapter.queue("/status")
+                service.processOnceAndAwaitForTest()
+                @Expect(adapter.sentCount(), 3)
+                @Expect(adapter.sentText(0), "deploying prod")
+                @Expect(adapter.sentText(1).contains("Gateway model capacity"), false)
+                @Expect(adapter.sentText(2).contains("Gateway model capacity"), false)
+                @Expect(modelCalls.load(), 0)
+                let truth = gatewayModelMemoryAdmissionSnapshotForTest()
+                @Expect(truth.acceptedTotal(), 0)
+                @Expect(truth.rejectedTotal(), 0)
+            } finally {
+                service.stop()
+                setGatewayAgentBridgeReplyRunnerForTest(None<(String, String, String, String, Bool, Option<(String) -> Unit>) -> String>)
+                resetGatewayModelMemoryAdmissionForTest()
+                setGatewayModelMemoryAdmissionSnapshotProviderForTest(Some({=> GatewayRuntimeHeapSnapshot(
+                    2 * 1024 * 1024 * 1024,
+                    1024 * 1024 * 1024,
+                    1024 * 1024 * 1024,
+                    50,
+                    "ok",
+                    1,
+                    "ok"
+                )}))
+            }
+        }
     }
 }
 
@@ -262,6 +564,148 @@ private func gatewayTelegramNativeTestConfigRoot(): JsonObject {
     root.put("wizard", JsonObject())
     root.put("meta", JsonObject())
     root
+}
+
+private func gatewayTelegramMemoryBroadcastAgent(agentId: String, isDefault!: Bool = false): JsonObject {
+    let agent = JsonObject()
+    agent.put("id", JsonString(agentId))
+    if (isDefault) {
+        agent.put("default", JsonBool(true))
+    }
+    agent
+}
+
+private func gatewayTelegramMemoryBroadcastBinding(agentId: String): JsonObject {
+    let binding = JsonObject()
+    binding.put("type", JsonString("route"))
+    binding.put("agentId", JsonString(agentId))
+    let matchObj = JsonObject()
+    matchObj.put("channel", JsonString("telegram"))
+    matchObj.put("accountId", JsonString("*"))
+    let peer = JsonObject()
+    peer.put("kind", JsonString("direct"))
+    peer.put("id", JsonString("8734062810"))
+    matchObj.put("peer", peer)
+    binding.put("match", matchObj)
+    binding
+}
+
+private func gatewayTelegramMemoryBroadcastMember(agentId: String): JsonObject {
+    let member = JsonObject()
+    member.put("agentId", JsonString(agentId))
+    member
+}
+
+private func gatewayTelegramMemoryBroadcastRoot(): JsonObject {
+    let root = gatewayTelegramNativeTestConfigRoot()
+    let agents = JsonObject()
+    agents.put("list", JsonArray([
+        gatewayTelegramMemoryBroadcastAgent("main", isDefault: true),
+        gatewayTelegramMemoryBroadcastAgent("ops"),
+        gatewayTelegramMemoryBroadcastAgent("writer"),
+        gatewayTelegramMemoryBroadcastAgent("reviewer")
+    ]))
+    root.put("agents", agents)
+    root.put("bindings", JsonArray([gatewayTelegramMemoryBroadcastBinding("ops")]))
+    let team = JsonObject()
+    team.put("id", JsonString("content"))
+    team.put("displayName", JsonString("Content Team"))
+    team.put("defaultAgentId", JsonString("ops"))
+    team.put("members", JsonArray([
+        gatewayTelegramMemoryBroadcastMember("ops"),
+        gatewayTelegramMemoryBroadcastMember("writer"),
+        gatewayTelegramMemoryBroadcastMember("reviewer")
+    ]))
+    team.put("bindings", JsonArray([gatewayTelegramMemoryBroadcastBinding("ops")]))
+    let broadcast = JsonObject()
+    broadcast.put("enabled", JsonBool(true))
+    broadcast.put("members", JsonArray([JsonString("writer"), JsonString("reviewer")]))
+    team.put("broadcast", broadcast)
+    let teams = JsonObject()
+    teams.put("list", JsonArray([team]))
+    root.put("agentTeams", teams)
+    root
+}
+
+private func gatewayTelegramRunTeamMemoryMode(mode: String): Unit {
+    withGatewayTelegramNativeTestHome {
+        MetisConfigManager.writeRoot(gatewayTelegramMemoryBroadcastRoot())
+        MetisConfigManager.invalidate()
+        CliSettingManager.invalidate()
+        let adapter = GatewayTelegramNativeTestAdapter()
+        let service = gatewayTelegramNativeService(adapter)
+        let observedAgentIds = ArrayList<String>()
+        let observedSessionKeys = ArrayList<String>()
+        setGatewayAgentBridgeReplyRunnerForTest(Some({
+            sessionKey: String,
+            _prompt: String,
+            _channelName: String,
+            agentId: String,
+            _streamingEnabled: Bool,
+            _streamChunkHook: Option<(String) -> Unit> =>
+                observedAgentIds.add(agentId)
+                observedSessionKeys.add(sessionKey)
+                if (mode == "all" || (mode == "mixed" && agentId == "writer")) {
+                    throw GatewayModelMemoryPressureException(
+                        "ordinary", "capacity", 2, 2 * 1024 * 1024 * 1024,
+                        256 * 1024 * 1024, 1, 1, 1
+                    )
+                }
+                "reply:${agentId}"
+        }))
+        service.start()
+        try {
+            adapter.queueTeam("team ${mode}")
+            service.processOnceAndAwaitForTest()
+            var busyCount: Int64 = 0
+            var replyCount: Int64 = 0
+            var lifecycleCount: Int64 = 0
+            var unexpectedCount: Int64 = 0
+            for (index in 0..adapter.sentCount()) {
+                let text = adapter.sentText(index)
+                if (text == "Gateway model capacity is temporarily unavailable. Please retry later.") {
+                    busyCount++
+                } else if (text.startsWith("reply:")) {
+                    replyCount++
+                } else if (text.startsWith("[chat-action]\n") || text.startsWith("[reaction]\n")) {
+                    lifecycleCount++
+                } else {
+                    unexpectedCount++
+                }
+            }
+            var writerCalls: Int64 = 0
+            var reviewerCalls: Int64 = 0
+            for (agentId in observedAgentIds) {
+                if (agentId == "writer") { writerCalls++ }
+                if (agentId == "reviewer") { reviewerCalls++ }
+            }
+            @Expect(observedAgentIds.size, 2)
+            @Expect(writerCalls, 1)
+            @Expect(reviewerCalls, 1)
+            @Expect(observedSessionKeys.size, 2)
+            if (observedAgentIds.size != 2 || observedSessionKeys.size != 2) {
+                throw Exception("s3_telegram_team_identity_truth_incomplete")
+            }
+            @Expect(observedSessionKeys[0].isEmpty(), false)
+            @Expect(observedSessionKeys[1].isEmpty(), false)
+            @Expect(observedSessionKeys[0] == observedSessionKeys[1], false)
+            @Expect(lifecycleCount, 5)
+            @Expect(unexpectedCount, 0)
+            if (mode == "all") {
+                @Expect(replyCount, 0)
+                @Expect(busyCount, 1)
+            } else if (mode == "mixed") {
+                @Expect(replyCount, 1)
+                @Expect(busyCount, 1)
+            } else {
+                @Expect(replyCount, 2)
+                @Expect(busyCount, 0)
+            }
+        } finally {
+            service.stop()
+            setGatewayAgentBridgeReplyRunnerForTest(None<(String, String, String, String, Bool, Option<(String) -> Unit>) -> String>)
+        }
+    }
 }
 
 private func withGatewayTelegramNativeTestHome<T>(block: () -> T): T {

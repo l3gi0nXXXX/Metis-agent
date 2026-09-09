@@ -2529,6 +2529,59 @@ public class AgentBridgeRuntimeTest {
     }
 
     @TestCase
+    public func s3H3GitCodeMcpStandaloneModelEntryIsAdmissionBound(): Unit {
+        resetGatewayModelMemoryAdmissionForTest()
+        setGatewayModelMemoryAdmissionSnapshotProviderForTest(Some({=> GatewayRuntimeHeapSnapshot(
+            2 * 1024 * 1024 * 1024,
+            2 * 1024 * 1024 * 1024 - 1,
+            1,
+            99,
+            "ok",
+            1,
+            "ok"
+        )}))
+        try {
+            let args = JsonObject()
+            args.put("requestId", JsonString("s3-gitcode-mcp"))
+            args.put("repository", JsonString("owner/repo"))
+            args.put("issueId", JsonString("42"))
+            args.put("ckbStatus", JsonString("ok"))
+            let evidence = JsonArray([])
+            let item = JsonObject()
+            item.put("text", JsonString("bounded evidence"))
+            evidence.add(item)
+            args.put("evidence", evidence)
+            var rejected = false
+            try {
+                let _ = gatewayAgentBridgeInvokeGitCodeMcpRuntime(
+                    GatewayAgentBridgeGitCodeMcpAdapter(),
+                    "gitcode_issue_summarize",
+                    args
+                )
+            } catch (error: GatewayModelMemoryPressureException) {
+                rejected = true
+                @Expect(error.source, "ordinary")
+                @Expect(error.status, "heap_pressure")
+            }
+            @Expect(rejected, true)
+            let truth = gatewayModelMemoryAdmissionSnapshotForTest()
+            @Expect(truth.active, 0)
+            @Expect(truth.rejectedOrdinary, 1)
+        } finally {
+            resetGatewayModelMemoryAdmissionForTest()
+            setGatewayModelMemoryAdmissionSnapshotProviderForTest(Some({=> GatewayRuntimeHeapSnapshot(
+                2 * 1024 * 1024 * 1024,
+                1024 * 1024 * 1024,
+                1024 * 1024 * 1024,
+                50,
+                "ok",
+                1,
+                "ok"
+            )}))
+        }
+    }
+
+    @TestCase
     public func gatewayDefaultChatRuntimeNowIncludesProcessTool(): Unit {
         let names = gatewayDefaultChatToolNames()
         var found = false

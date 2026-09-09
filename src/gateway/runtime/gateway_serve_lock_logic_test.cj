@@ -9,7 +9,7 @@ import metis.utils.ShellTimeoutException
 import std.collection.{ArrayList, HashMap, HashSet}
 import std.convert.Parsable
 import std.core.Duration
-import std.env.{getProcessId, getVariable, setVariable}
+import std.env.{getProcessId, getVariable, removeVariable, setVariable}
 import std.fs.{Directory, File, Path, exists, remove}
 import std.net.*
 import std.process.{ProcessRedirect, SubProcess, executeWithOutput, launch}
@@ -695,6 +695,33 @@ private func gatewayFormalMetisBinary(project: Path): Option<Path> {
         return None<Path>
     }
     None<Path>
+}
+
+private func gatewayS5HeapEnvironmentMatches(expected: Option<String>): Bool {
+    match ((expected, getVariable("cjHeapSize"))) {
+        case (Some(want), Some(actual)) => want == actual
+        case (None, None) => true
+        case _ => false
+    }
+}
+
+private func gatewayS5LaunchGateway(binary: Path): SubProcess {
+    let oldHeap = getVariable("cjHeapSize")
+    setVariable("cjHeapSize", "2GB")
+    try {
+        launch(
+            binary.toString(),
+            ["gateway", "run"],
+            stdIn: ProcessRedirect.Discard,
+            stdOut: ProcessRedirect.Discard,
+            stdErr: ProcessRedirect.Discard
+        )
+    } finally {
+        match (oldHeap) {
+            case Some(value) => setVariable("cjHeapSize", value)
+            case None => removeVariable("cjHeapSize")
+        }
+    }
 }
 
 private func gatewayS5StartDependencies(
@@ -3515,13 +3542,9 @@ public class GatewayServeLockLogicTest {
                 @Expect(loaded.ok, true)
                 @Expect(loaded.status, "accepted")
 
-                let launched = launch(
-                    metisBinary.toString(),
-                    ["gateway", "run"],
-                    stdIn: ProcessRedirect.Discard,
-                    stdOut: ProcessRedirect.Discard,
-                    stdErr: ProcessRedirect.Discard
-                )
+                let parentHeapBeforeLaunch = getVariable("cjHeapSize")
+                let launched = gatewayS5LaunchGateway(metisBinary)
+                @Expect(gatewayS5HeapEnvironmentMatches(parentHeapBeforeLaunch), true)
                 gatewayPid = launched.pid
                 gatewayProcess = Some(launched)
                 gatewayIdentity = gatewayServeStopCaptureOwnedIdentity(home, gatewayPid, metisBinary, 5000)
@@ -3822,13 +3845,9 @@ public class GatewayServeLockLogicTest {
                 @Expect(loaded.ok, true)
                 @Expect(loaded.status, "accepted")
 
-                let launched = launch(
-                    metisBinary.toString(),
-                    ["gateway", "run"],
-                    stdIn: ProcessRedirect.Discard,
-                    stdOut: ProcessRedirect.Discard,
-                    stdErr: ProcessRedirect.Discard
-                )
+                let parentHeapBeforeLaunch = getVariable("cjHeapSize")
+                let launched = gatewayS5LaunchGateway(metisBinary)
+                @Expect(gatewayS5HeapEnvironmentMatches(parentHeapBeforeLaunch), true)
                 gatewayPid = launched.pid
                 gatewayProcess = Some(launched)
                 gatewayIdentity = gatewayServeStopCaptureOwnedIdentity(home, gatewayPid, metisBinary, 5000)
@@ -4163,10 +4182,9 @@ public class GatewayServeLockLogicTest {
                 gatewayS5WriteGcmManifest(manifestPath, gcmBinary)
                 @Expect(loadServicePluginManifest(manifestPath.toString()).ok, true)
 
-                let launchedOld = launch(
-                    metisBinary.toString(), ["gateway", "run"],
-                    stdIn: ProcessRedirect.Discard, stdOut: ProcessRedirect.Discard, stdErr: ProcessRedirect.Discard
-                )
+                let parentHeapBeforeOldLaunch = getVariable("cjHeapSize")
+                let launchedOld = gatewayS5LaunchGateway(metisBinary)
+                @Expect(gatewayS5HeapEnvironmentMatches(parentHeapBeforeOldLaunch), true)
                 oldGatewayProcess = Some(launchedOld)
                 let oldGatewayPid = launchedOld.pid
                 oldGatewayIdentity = gatewayServeStopCaptureOwnedIdentity(home, oldGatewayPid, metisBinary, 5000)
@@ -4349,10 +4367,9 @@ public class GatewayServeLockLogicTest {
                 stopOutput.clear()
                 for (key in proxyEnvironmentKeys) { setVariable(key, "") }
                 CliSettingManager.invalidate()
-                let launchedReplacement = launch(
-                    metisBinary.toString(), ["gateway", "run"],
-                    stdIn: ProcessRedirect.Discard, stdOut: ProcessRedirect.Discard, stdErr: ProcessRedirect.Discard
-                )
+                let parentHeapBeforeReplacementLaunch = getVariable("cjHeapSize")
+                let launchedReplacement = gatewayS5LaunchGateway(metisBinary)
+                @Expect(gatewayS5HeapEnvironmentMatches(parentHeapBeforeReplacementLaunch), true)
                 replacementGatewayProcess = Some(launchedReplacement)
                 let replacementGatewayPid = launchedReplacement.pid
                 replacementGatewayIdentity = gatewayServeStopCaptureOwnedIdentity(home, replacementGatewayPid, metisBinary, 5000)
@@ -4726,10 +4743,9 @@ public class GatewayServeLockLogicTest {
                 @Expect(exists(oldLockPath), false)
                 @Expect(exists(oldStopRequestPath), false)
                 @Expect(exists(oldCompletionPath), false)
-                let launchedOld = launch(
-                    metisBinary.toString(), ["gateway", "run"],
-                    stdIn: ProcessRedirect.Discard, stdOut: ProcessRedirect.Discard, stdErr: ProcessRedirect.Discard
-                )
+                let parentHeapBeforeOldLaunch = getVariable("cjHeapSize")
+                let launchedOld = gatewayS5LaunchGateway(metisBinary)
+                @Expect(gatewayS5HeapEnvironmentMatches(parentHeapBeforeOldLaunch), true)
                 oldGatewayPid = launchedOld.pid
                 oldProcess = Some(launchedOld)
                 oldIdentity = gatewayServeStopCaptureOwnedIdentity(oldHome, oldGatewayPid, metisBinary, 5000)
@@ -5072,10 +5088,9 @@ public class GatewayServeLockLogicTest {
                     replacementHome, replacementGatewayPort, replacementWebhookPort,
                     replacementDependencyPort, replacementGcm
                 )
-                let launchedReplacement = launch(
-                    metisBinary.toString(), ["gateway", "run"],
-                    stdIn: ProcessRedirect.Discard, stdOut: ProcessRedirect.Discard, stdErr: ProcessRedirect.Discard
-                )
+                let parentHeapBeforeReplacementLaunch = getVariable("cjHeapSize")
+                let launchedReplacement = gatewayS5LaunchGateway(metisBinary)
+                @Expect(gatewayS5HeapEnvironmentMatches(parentHeapBeforeReplacementLaunch), true)
                 replacementGatewayPid = launchedReplacement.pid
                 replacementProcess = Some(launchedReplacement)
                 replacementIdentity = gatewayServeStopCaptureOwnedIdentity(

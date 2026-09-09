@@ -3990,6 +3990,19 @@ public func handleGatewayAgentsFamily(method: String, request!: Option<GatewayRp
         match (invoke.get("error")) {
             case Some(v) =>
                 let err = try { v.asString().getValue() } catch (_e: Exception) { "agent invoke failed" }
+                let errorKind = gatewayAgentJsonString(invoke, "errorKind", "")
+                if (errorKind == "model_memory_pressure") {
+                    let details = JsonObject()
+                    details.put("errorKind", JsonString("model_memory_pressure"))
+                    details.put("message", JsonString(GATEWAY_MODEL_MEMORY_BUSY_MESSAGE))
+                    return Some(GatewayRpcResponse(
+                        false,
+                        method,
+                        error: GATEWAY_MODEL_MEMORY_BUSY_MESSAGE,
+                        errorCode: "model_memory_pressure",
+                        details: details
+                    ))
+                }
                 return Some(GatewayRpcResponse(false, method, result: result, error: err))
             case None =>
                 return Some(GatewayRpcResponse(true, method, result: result))

@@ -550,7 +550,7 @@ public func gatewayBridgeForSessionRequest(user: GatewayUserSettings, request: G
     AgentBridge(sessionStore: store)
 }
 
-public func gatewayExecuteSessionRequestTurn(
+private func gatewayExecuteSessionRequestTurnImpl(
     bridge: AgentBridge,
     request: GatewaySessionRequest,
     prompt: String,
@@ -566,9 +566,13 @@ public func gatewayExecuteSessionRequestTurn(
     streamingEnabled!: Bool = false,
     lifecycleHook!: Option<(String) -> Unit> = None<(String) -> Unit>,
     turnContextOverride!: Option<GatewayTurnContext> = None<GatewayTurnContext>,
+    resolvedContextOverride!: Option<GatewaySessionContext> = None<GatewaySessionContext>,
     executionControl!: Option<GatewayExecutionControl> = None<GatewayExecutionControl>
 ): GatewayResolvedSessionTurnResult {
-    let resolvedContext = gatewayResolveSessionContextWithAgentRoute(request)
+    let resolvedContext = match (resolvedContextOverride) {
+        case Some(context) => context
+        case None => gatewayResolveSessionContextWithAgentRoute(request)
+    }
     let context = match (turnContextOverride) {
         case Some(turnContext) => GatewaySessionContext(
             resolvedContext.source,
@@ -664,6 +668,94 @@ public func gatewayExecuteSessionRequestTurn(
     GatewayResolvedSessionTurnResult(context, execution)
 }
 
+func gatewayExecutePlannedSessionRequestTurnForUser(
+    user: GatewayUserSettings,
+    request: GatewaySessionRequest,
+    context: GatewaySessionContext,
+    prompt: String,
+    deliver!: Bool = false,
+    extraSystemPrompt!: String = "",
+    timeoutSeconds!: Int64 = 0,
+    bestEffortDeliver!: Bool = false,
+    replyToMessageId!: Option<String> = None,
+    replyInThread!: Bool = false,
+    deliverHook!: Option<(String, String, String, String, Option<String>, Bool) -> String> = None<(String, String, String, String, Option<String>, Bool) -> String>,
+    transcriptHook!: Option<(GatewaySessionContext, Int64, String, String) -> Unit> = None<(GatewaySessionContext, Int64, String, String) -> Unit>,
+    streamHook!: Option<(GatewaySessionContext, String) -> Unit> = None<(GatewaySessionContext, String) -> Unit>,
+    lifecycleHook!: Option<(String) -> Unit> = None<(String) -> Unit>,
+    executionControl!: Option<GatewayExecutionControl> = None<GatewayExecutionControl>,
+    admissionSource!: GatewayModelMemoryAdmissionSource = GatewayModelMemoryAdmissionSource.Ordinary
+): GatewayResolvedSessionTurnResult {
+    let permit = gatewayTryAcquireModelMemoryAdmission(admissionSource)
+    try {
+        let bridge = AgentBridge(sessionStore: gatewaySessionStoreForUserWithAgentId(user, context.agentId))
+        gatewayExecuteSessionRequestTurnImpl(
+            bridge,
+            request,
+            prompt,
+            deliver: deliver,
+            extraSystemPrompt: extraSystemPrompt,
+            timeoutSeconds: timeoutSeconds,
+            bestEffortDeliver: bestEffortDeliver,
+            replyToMessageId: replyToMessageId,
+            replyInThread: replyInThread,
+            deliverHook: deliverHook,
+            transcriptHook: transcriptHook,
+            streamHook: streamHook,
+            streamingEnabled: gatewayStreamingEnabledForUserChannel(user, context.channelName),
+            lifecycleHook: lifecycleHook,
+            resolvedContextOverride: Some(context),
+            executionControl: executionControl
+        )
+    } finally {
+        let _ = permit.release()
+    }
+}
+
+public func gatewayExecuteSessionRequestTurn(
+    bridge: AgentBridge,
+    request: GatewaySessionRequest,
+    prompt: String,
+    deliver!: Bool = false,
+    extraSystemPrompt!: String = "",
+    timeoutSeconds!: Int64 = 0,
+    bestEffortDeliver!: Bool = false,
+    replyToMessageId!: Option<String> = None,
+    replyInThread!: Bool = false,
+    deliverHook!: Option<(String, String, String, String, Option<String>, Bool) -> String> = None<(String, String, String, String, Option<String>, Bool) -> String>,
+    transcriptHook!: Option<(GatewaySessionContext, Int64, String, String) -> Unit> = None<(GatewaySessionContext, Int64, String, String) -> Unit>,
+    streamHook!: Option<(GatewaySessionContext, String) -> Unit> = None<(GatewaySessionContext, String) -> Unit>,
+    streamingEnabled!: Bool = false,
+    lifecycleHook!: Option<(String) -> Unit> = None<(String) -> Unit>,
+    turnContextOverride!: Option<GatewayTurnContext> = None<GatewayTurnContext>,
+    executionControl!: Option<GatewayExecutionControl> = None<GatewayExecutionControl>,
+    admissionSource!: GatewayModelMemoryAdmissionSource = GatewayModelMemoryAdmissionSource.Ordinary
+): GatewayResolvedSessionTurnResult {
+    let permit = gatewayTryAcquireModelMemoryAdmission(admissionSource)
+    try {
+        gatewayExecuteSessionRequestTurnImpl(
+            bridge,
+            request,
+            prompt,
+            deliver: deliver,
+            extraSystemPrompt: extraSystemPrompt,
+            timeoutSeconds: timeoutSeconds,
+            bestEffortDeliver: bestEffortDeliver,
+            replyToMessageId: replyToMessageId,
+            replyInThread: replyInThread,
+            deliverHook: deliverHook,
+            transcriptHook: transcriptHook,
+            streamHook: streamHook,
+            streamingEnabled: streamingEnabled,
+            lifecycleHook: lifecycleHook,
+            turnContextOverride: turnContextOverride,
+            executionControl: executionControl
+        )
+    } finally {
+        let _ = permit.release()
+    }
+}
+
 public func gatewayExecuteSessionRequestTurnForUser(
     user: GatewayUserSettings,
     request: GatewaySessionRequest,
@@ -679,26 +771,32 @@ public func gatewayExecuteSessionRequestTurnForUser(
     streamHook!: Option<(GatewaySessionContext, String) -> Unit> = None<(GatewaySessionContext, String) -> Unit>,
     lifecycleHook!: Option<(String) -> Unit> = None<(String) -> Unit>,
     turnContextOverride!: Option<GatewayTurnContext> = None<GatewayTurnContext>,
-    executionControl!: Option<GatewayExecutionControl> = None<GatewayExecutionControl>
+    executionControl!: Option<GatewayExecutionControl> = None<GatewayExecutionControl>,
+    admissionSource!: GatewayModelMemoryAdmissionSource = GatewayModelMemoryAdmissionSource.Ordinary
 ): GatewayResolvedSessionTurnResult {
-    let bridge = gatewayBridgeForSessionRequest(user, request)
-    let context = gatewayResolveSessionContextWithAgentRoute(request)
-    gatewayExecuteSessionRequestTurn(
-        bridge,
-        request,
-        prompt,
-        deliver: deliver,
-        extraSystemPrompt: extraSystemPrompt,
-        timeoutSeconds: timeoutSeconds,
-        bestEffortDeliver: bestEffortDeliver,
-        replyToMessageId: replyToMessageId,
-        replyInThread: replyInThread,
-        deliverHook: deliverHook,
-        transcriptHook: transcriptHook,
-        streamHook: streamHook,
-        streamingEnabled: gatewayStreamingEnabledForUserChannel(user, context.channelName),
-        lifecycleHook: lifecycleHook,
-        turnContextOverride: turnContextOverride,
-        executionControl: executionControl
-    )
+    let permit = gatewayTryAcquireModelMemoryAdmission(admissionSource)
+    try {
+        let bridge = gatewayBridgeForSessionRequest(user, request)
+        let context = gatewayResolveSessionContextWithAgentRoute(request)
+        gatewayExecuteSessionRequestTurnImpl(
+            bridge,
+            request,
+            prompt,
+            deliver: deliver,
+            extraSystemPrompt: extraSystemPrompt,
+            timeoutSeconds: timeoutSeconds,
+            bestEffortDeliver: bestEffortDeliver,
+            replyToMessageId: replyToMessageId,
+            replyInThread: replyInThread,
+            deliverHook: deliverHook,
+            transcriptHook: transcriptHook,
+            streamHook: streamHook,
+            streamingEnabled: gatewayStreamingEnabledForUserChannel(user, context.channelName),
+            lifecycleHook: lifecycleHook,
+            turnContextOverride: turnContextOverride,
+            executionControl: executionControl
+        )
+    } finally {
+        let _ = permit.release()
+    }
 }

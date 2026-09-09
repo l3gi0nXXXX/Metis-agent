@@ -40,6 +40,11 @@ private func s3AdmissionSetSnapshot(snapshot: GatewayRuntimeHeapSnapshot): Unit 
     setGatewayModelMemoryAdmissionSnapshotProviderForTest(Some({=> snapshot}))
 }
 
+private func s3AdmissionRestoreHealthyBaseline(): Unit {
+    resetGatewayModelMemoryAdmissionForTest()
+    s3AdmissionSetSnapshot(s3AdmissionSnapshot(2 * S3_ADMISSION_GIB, S3_ADMISSION_GIB))
+}
+
 private func s3AdmissionReject(source: GatewayModelMemoryAdmissionSource): GatewayModelMemoryPressureException {
     try {
         let permit = gatewayTryAcquireModelMemoryAdmission(source)
@@ -139,7 +144,7 @@ public class GatewayModelMemoryAdmissionTest {
             @Expect(truth.rejectedServicePlugin, 1)
             @Expect(truth.released, 3)
         } finally {
-            resetGatewayModelMemoryAdmissionForTest()
+            s3AdmissionRestoreHealthyBaseline()
             @Expect(gatewayModelMemoryAdmissionSnapshotForTest().active, 0)
         }
     }
@@ -186,7 +191,7 @@ public class GatewayModelMemoryAdmissionTest {
             @Expect(nearMaxTruth.lastReserveBytes, Int64.Max / 5)
             @Expect(nearMaxTruth.lastAvailableBytes, Int64.Max)
         } finally {
-            resetGatewayModelMemoryAdmissionForTest()
+            s3AdmissionRestoreHealthyBaseline()
         }
     }
 
@@ -255,7 +260,7 @@ public class GatewayModelMemoryAdmissionTest {
             @Expect(ordered.lastStatus, "heap_pressure")
             @Expect(ordered.active, 0)
         } finally {
-            resetGatewayModelMemoryAdmissionForTest()
+            s3AdmissionRestoreHealthyBaseline()
         }
     }
 
@@ -324,7 +329,7 @@ public class GatewayModelMemoryAdmissionTest {
             @Expect(truth.acceptedCron, 33)
             @Expect(truth.acceptedServicePlugin, 33)
         } finally {
-            resetGatewayModelMemoryAdmissionForTest()
+            s3AdmissionRestoreHealthyBaseline()
         }
     }
 
@@ -387,7 +392,7 @@ public class GatewayModelMemoryAdmissionTest {
             @Expect(truth.lastMaxHeapBytes, 2 * S3_ADMISSION_GIB)
             @Expect(truth.lastAvailableBytes, S3_ADMISSION_GIB)
         } finally {
-            resetGatewayModelMemoryAdmissionForTest()
+            s3AdmissionRestoreHealthyBaseline()
             @Expect(gatewayModelMemoryAdmissionSnapshotForTest().active, 0)
         }
     }

@@ -1,7 +1,7 @@
 package metis.gateway.runtime
 
 import metis.core.config.GatewayUserSettings
-import metis.gateway.core.gatewaySessionStoreForUserWithAgentId
+import metis.gateway.core.{GatewayRuntimeHeapSnapshot, gatewaySessionStoreForUserWithAgentId, resetGatewayModelMemoryAdmissionForTest, setGatewayModelMemoryAdmissionSnapshotProviderForTest}
 import metis.gateway.protocol.{GatewayClientInfo, GatewayConnectParams, GatewayProtocolRequest}
 
 import magic.jsonable.*
@@ -851,3 +851,44 @@ public class GatewayChatTurnRuntimeTest {
     }
 }
 */
+
+@Test
+public class GatewayChatTurnMemoryAdmissionTest {
+    @TestCase
+    public func s3H3UiRpcUsesTypedTopLevelPressureObject(): Unit {
+        resetGatewayModelMemoryAdmissionForTest()
+        setGatewayModelMemoryAdmissionSnapshotProviderForTest(Some({=> GatewayRuntimeHeapSnapshot(
+            2 * 1024 * 1024 * 1024,
+            2 * 1024 * 1024 * 1024 - 1,
+            1,
+            99,
+            "ok",
+            1,
+            "ok"
+        )}))
+        try {
+            let params = JsonObject()
+            params.put("session", JsonString("agent:general:s3-ui"))
+            params.put("text", JsonString("must not reach model"))
+            params.put("deliver", JsonBool(false))
+            let result = gatewayExecuteChatTurnFromRpc(params)
+            @Expect(runtimeTestString(result, "error"),
+                "Gateway model capacity is temporarily unavailable. Please retry later.")
+            @Expect(runtimeTestString(result, "errorKind"), "model_memory_pressure")
+            @Expect(runtimeTestString(result, "message"),
+                "Gateway model capacity is temporarily unavailable. Please retry later.")
+            @Expect(result.get("answer").isNone(), true)
+        } finally {
+            resetGatewayModelMemoryAdmissionForTest()
+            setGatewayModelMemoryAdmissionSnapshotProviderForTest(Some({=> GatewayRuntimeHeapSnapshot(
+                2 * 1024 * 1024 * 1024,
+                1024 * 1024 * 1024,
+                1024 * 1024 * 1024,
+                50,
+                "ok",
+                1,
+                "ok"
+            )}))
+        }
+    }
+}

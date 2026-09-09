@@ -129,6 +129,89 @@ private class GatewayFeishuNativeTestAdapter <: ChannelAdapter {
     }
 }
 
+@Test
+public class GatewayServiceFeishuMemoryAdmissionTest {
+    @TestCase
+    public func s3H3FeishuTeamAllMixedNonePressureSendsAtMostOneBusy(): Unit {
+        gatewayFeishuRunTeamMemoryMode("all")
+        gatewayFeishuRunTeamMemoryMode("mixed")
+        gatewayFeishuRunTeamMemoryMode("none")
+    }
+
+    @TestCase
+    public func s3H3FeishuPressureSendsFixedBusyWithoutDiagnosticPersistence(): Unit {
+        withGatewayFeishuNativeTestHome("s3-memory-pressure", gatewayFeishuNativeTestRoot(), { =>
+            let adapter = GatewayFeishuNativeTestAdapter()
+            let service = gatewayFeishuNativeService(adapter)
+            resetGatewayModelMemoryAdmissionForTest()
+            setGatewayModelMemoryAdmissionSnapshotProviderForTest(Some({=> GatewayRuntimeHeapSnapshot(
+                2 * 1024 * 1024 * 1024,
+                2 * 1024 * 1024 * 1024 - 1,
+                1,
+                99,
+                "ok",
+                1,
+                "ok"
+            )}))
+            service.start()
+            try {
+                adapter.queueDirect("pressure request")
+                service.processOnceAndAwaitForTest()
+                @Expect(adapter.sentCount(), 1)
+                @Expect(adapter.sentText(0),
+                    "Gateway model capacity is temporarily unavailable. Please retry later.")
+                let store = gatewaySessionStoreForUser(CliSettingManager.readGatewaySettings())
+                let raw = store.readTranscriptRaw("feishu:direct:ou_peer") ?? ""
+                @Expect(raw.contains("【系统诊断】"), false)
+                @Expect(raw.contains("Gateway model capacity"), false)
+            } finally {
+                service.stop()
+                resetGatewayModelMemoryAdmissionForTest()
+                setGatewayModelMemoryAdmissionSnapshotProviderForTest(Some({=> GatewayRuntimeHeapSnapshot(
+                    2 * 1024 * 1024 * 1024,
+                    1024 * 1024 * 1024,
+                    1024 * 1024 * 1024,
+                    50,
+                    "ok",
+                    1,
+                    "ok"
+                )}))
+            }
+        })
+    }
+
+    @TestCase
+    public func s3BN1GenericSameMessageIsNotClassifiedAsTypedPressure(): Unit {
+        withGatewayFeishuNativeTestHome("s3-generic-same-message", gatewayFeishuNativeTestRoot(), { =>
+            let adapter = GatewayFeishuNativeTestAdapter()
+            let service = gatewayFeishuNativeService(adapter)
+            setGatewayAgentBridgeReplyRunnerForTest(Some({
+                _sessionKey: String,
+                _prompt: String,
+                _channelName: String,
+                _agentId: String,
+                _streamingEnabled: Bool,
+                _streamChunkHook: Option<(String) -> Unit> =>
+                    throw Exception("model_memory_pressure")
+            }))
+            service.start()
+            try {
+                adapter.queueDirect("generic failure")
+                service.processOnceAndAwaitForTest()
+                @Expect(adapter.sentCount(), 1)
+                @Expect(adapter.sentText(0), "模型服务本轮调用失败，未能完成回复。请稍后重试或切换模型。")
+                @Expect(adapter.sentText(0).contains("Gateway model capacity"), false)
+                let store = gatewaySessionStoreForUser(CliSettingManager.readGatewaySettings())
+                let raw = store.readTranscriptRaw("feishu:direct:ou_peer").getOrThrow()
+                @Expect(raw.contains("errorKind=model_execution_failed"), true)
+            } finally {
+                service.stop()
+                setGatewayAgentBridgeReplyRunnerForTest(None<(String, String, String, String, Bool, Option<(String) -> Unit>) -> String>)
+            }
+        })
+    }
+}
+
 private class GatewayFeishuNativeFakeModel <: ChatModel {
     private let answer: String
     private var _maxTokens: Option<Int64> = None
@@ -275,6 +358,66 @@ private func gatewayFeishuNativeBroadcastMediaContext(): JsonObject {
     context.put("imRoute", route)
     media.put("context", context)
     media
+}
+
+private func gatewayFeishuRunTeamMemoryMode(mode: String): Unit {
+    withGatewayFeishuNativeTestHome("s3-team-${mode}", gatewayFeishuNativeBroadcastRoot(), { =>
+        let adapter = GatewayFeishuNativeTestAdapter()
+        let service = gatewayFeishuNativeService(adapter)
+        setGatewayAgentBridgeReplyRunnerForTest(Some({
+            _sessionKey: String,
+            _prompt: String,
+            _channelName: String,
+            agentId: String,
+            _streamingEnabled: Bool,
+            _streamChunkHook: Option<(String) -> Unit> =>
+                if (mode == "all" || (mode == "mixed" && agentId == "writer")) {
+                    throw GatewayModelMemoryPressureException(
+                        "ordinary", "capacity", 2, 2 * 1024 * 1024 * 1024,
+                        256 * 1024 * 1024, 1, 1, 1
+                    )
+                }
+                "reply:${agentId}"
+        }))
+        service.start()
+        try {
+            adapter.queueDirectWithRoute("team ${mode}", gatewayFeishuNativeBroadcastMediaContext())
+            service.processOnceAndAwaitForTest()
+            var busyCount: Int64 = 0
+            var replyCount: Int64 = 0
+            for (index in 0..adapter.sentCount()) {
+                let text = adapter.sentText(index)
+                if (text == "Gateway model capacity is temporarily unavailable. Please retry later.") {
+                    busyCount++
+                }
+                if (text.startsWith("reply:")) {
+                    replyCount++
+                }
+            }
+            if (mode == "all") {
+                @Expect(adapter.sentCount(), 1)
+                @Expect(replyCount, 0)
+                @Expect(busyCount, 1)
+            } else if (mode == "mixed") {
+                @Expect(adapter.sentCount(), 2)
+                @Expect(replyCount, 1)
+                @Expect(busyCount, 1)
+            } else {
+                @Expect(adapter.sentCount(), 2)
+                @Expect(replyCount, 2)
+                @Expect(busyCount, 0)
+            }
+            let user = CliSettingManager.readGatewaySettings()
+            for (agentId in ["writer", "reviewer"]) {
+                let store = gatewaySessionStoreForUserWithAgentId(user, agentId)
+                let raw = store.readTranscriptRaw("feishu:direct:ou_peer") ?? ""
+                @Expect(raw.contains("Gateway model capacity"), false)
+            }
+        } finally {
+            service.stop()
+            setGatewayAgentBridgeReplyRunnerForTest(None<(String, String, String, String, Bool, Option<(String) -> Unit>) -> String>)
+        }
+    })
 }
 
 private func withGatewayFeishuNativeTestHome<T>(label: String, root: JsonObject, block: () -> T): T {
