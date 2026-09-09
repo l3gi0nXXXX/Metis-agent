@@ -1205,14 +1205,26 @@ public class ServicePluginHostTest {
             let _ = this.writeGitCodeLeaseWithDetails(home, "gitcode-monitor-orphan", "orphan_detected", 0, parentPid: getProcessId(), port: 18080)
             let script = "printf started > '${launchMarker.toString()}'; printf '%s\\n' '${this.gitCodeInitLine()}'; read ignored || true"
             this.registerGitCodeStdioScript(script)
+            let portOwnerProbeCalls = ServicePluginTestCounter()
+            setServicePluginPortOwnerProbeForTest(Some({ port: Int64, pid: Int64 =>
+                portOwnerProbeCalls.increment()
+                @Expect(port, 18080)
+                @Expect(pid, 0)
+                false
+            }))
             try {
                 let started = ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000)
                 @Expect(started.ok, true)
                 @Expect(started.status, "running")
                 @Expect(this.waitForFile(launchMarker, timeoutMillis: 1000), true)
+                @Expect(portOwnerProbeCalls.get() > 0, true)
             } finally {
-                let _ = stopServicePlugin("gitcode-monitor", reason: "test", timeoutMillis: 1000)
-                resetServicePluginHostForTest()
+                try {
+                    let _ = stopServicePlugin("gitcode-monitor", reason: "test", timeoutMillis: 1000)
+                } finally {
+                    setServicePluginPortOwnerProbeForTest(None)
+                    resetServicePluginHostForTest()
+                }
             }
         })
     }

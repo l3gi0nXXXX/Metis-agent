@@ -11,6 +11,7 @@ import metis.gateway.logging.gatewayLoggingResetForTest
 import std.env.{getVariable, setVariable}
 import std.core.Duration
 import std.fs.{Directory, Path, exists, remove}
+import std.net.*
 import std.sync.AtomicInt64
 import std.time.MonoTime
 import std.unittest.testmacro.*
@@ -20,6 +21,19 @@ private func gatewayHttpSurfaceTestUser(): GatewayUserSettings {
     var user = GatewayUserSettings()
     user.auth.mode = "none"
     user
+}
+
+private func gatewayHttpSurfaceTemporaryPort(): Int64 {
+    for (_ in 0..8) {
+        try (socket = TcpServerSocket(bindAt: 0u16)) {
+            socket.bind()
+            let port = Int64((socket.localAddress as IPSocketAddress)?.port ?? 0u16)
+            if (port > 0 && port != 18788 && port != 18080) {
+                return port
+            }
+        }
+    }
+    0
 }
 
 private func gatewayHttpSurfaceTestResult(raw: String): JsonValue {
@@ -439,18 +453,34 @@ public class GatewayHttpSurfaceTest {
     @TestCase
     public func mcpHttpStartAndStatusForwardExistingPlatformMethods(): Unit {
         withGatewayHttpSurfaceTestSettings<Unit>({ =>
-            let expectedPort = buildGatewayConfigFromUserSettings(gatewayHttpSurfaceTestUser()).port
+            let candidatePort = gatewayHttpSurfaceTemporaryPort()
+            @Expect(candidatePort > 0 && candidatePort != 18788 && candidatePort != 18080, true)
+            if (candidatePort <= 0 || candidatePort == 18788 || candidatePort == 18080) {
+                throw Exception("gateway_http_surface_test_port_unavailable")
+            }
+            var user = gatewayHttpSurfaceTestUser()
+            user.port = candidatePort
+            user.bind = "loopback"
+            user.customBindHost = ""
+            let _ = MetisConfigManager.setGatewaySettings(user)
+            CliSettingManager.invalidate()
+            let effectiveUser = CliSettingManager.readGatewaySettings()
+            @Expect(effectiveUser.port, candidatePort)
+            if (effectiveUser.port != candidatePort) {
+                throw Exception("gateway_http_surface_test_port_not_persisted")
+            }
+            let expectedPort = buildGatewayConfigFromUserSettings(user).port
             let portProbeCalls = AtomicInt64(0)
             try {
                 let readinessResponse = gatewayHandleMcpRequest(
-                    gatewayHttpSurfaceTestUser(),
+                    user,
                     "{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"tools/call\",\"params\":{\"name\":\"gateway.readiness\",\"arguments\":{}}}"
                 )
                 @Expect(readinessResponse.contains("\"readiness\""), true)
                 @Expect(readinessResponse.contains("\"surfaces\""), true)
 
                 let configGetResponse = gatewayHandleMcpRequest(
-                    gatewayHttpSurfaceTestUser(),
+                    user,
                     "{\"jsonrpc\":\"2.0\",\"id\":12,\"method\":\"tools/call\",\"params\":{\"name\":\"gateway.config.get\",\"arguments\":{\"path\":\"gateway.enabled\"}}}"
                 )
                 let configGet = gatewayHttpSurfaceTestResult(configGetResponse).asObject()
@@ -458,19 +488,19 @@ public class GatewayHttpSurfaceTest {
                 @Expect(configGet.get("value").isSome(), true)
 
                 let schemaLookupResponse = gatewayHandleMcpRequest(
-                    gatewayHttpSurfaceTestUser(),
+                    user,
                     "{\"jsonrpc\":\"2.0\",\"id\":13,\"method\":\"tools/call\",\"params\":{\"name\":\"gateway.config.schema.lookup\",\"arguments\":{\"path\":\"gateway\"}}}"
                 )
                 @Expect(schemaLookupResponse.contains("\"schema\""), true)
 
                 let webchatStatusResponse = gatewayHandleMcpRequest(
-                    gatewayHttpSurfaceTestUser(),
+                    user,
                     "{\"jsonrpc\":\"2.0\",\"id\":14,\"method\":\"tools/call\",\"params\":{\"name\":\"gateway.webchat.status\",\"arguments\":{}}}"
                 )
                 @Expect(webchatStatusResponse.contains("\"webchat\""), true)
 
                 let webchatStartResponse = gatewayHandleMcpRequest(
-                    gatewayHttpSurfaceTestUser(),
+                    user,
                     "{\"jsonrpc\":\"2.0\",\"id\":15,\"method\":\"tools/call\",\"params\":{\"name\":\"gateway.webchat.start\",\"arguments\":{}}}"
                 )
                 let webchatStart = gatewayHttpSurfaceTestResult(webchatStartResponse).asObject()
@@ -478,7 +508,7 @@ public class GatewayHttpSurfaceTest {
                 @Expect(webchatStart.get("webchat").isSome(), true)
 
                 let startResponse = gatewayHandleMcpRequest(
-                    gatewayHttpSurfaceTestUser(),
+                    user,
                     "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"gateway.http.start\",\"arguments\":{}}}"
                 )
                 let start = gatewayHttpSurfaceTestResult(startResponse).asObject()
@@ -486,14 +516,14 @@ public class GatewayHttpSurfaceTest {
                 @Expect(start.get("http").isSome(), true)
 
                 let statusResponse = gatewayHandleMcpRequest(
-                    gatewayHttpSurfaceTestUser(),
+                    user,
                     "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"gateway.http.status\",\"arguments\":{}}}"
                 )
                 @Expect(statusResponse.contains("\"http\""), true)
                 @Expect(statusResponse.contains("\"probePaths\""), true)
 
                 let channelsAuditResponse = gatewayHandleMcpRequest(
-                    gatewayHttpSurfaceTestUser(),
+                    user,
                     "{\"jsonrpc\":\"2.0\",\"id\":16,\"method\":\"tools/call\",\"params\":{\"name\":\"gateway.channels.audit\",\"arguments\":{\"channelId\":\"telegram\"}}}"
                 )
                 @Expect(channelsAuditResponse.contains("\"gateway-channels-audit\""), true)
