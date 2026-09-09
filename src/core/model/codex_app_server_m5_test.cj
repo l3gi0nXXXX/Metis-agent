@@ -337,20 +337,46 @@ public class CodexAppServerM5Test {
 
         let client = CodexAppServerClient(codexBin: codex.toString(), cwd: Some(root.toString()))
         var error = ""
+        var parentPid: Int64 = 0
+        var childPid: Int64 = 0
+        var parentGone = false
+        var childGone = false
         try {
-            let _ = client.request("initialize", JsonObject(), 80)
-        } catch (e: Exception) {
-            error = e.message
-        }
-        client.close()
+            let setupDeadline = MonoTime.now() + Duration.second * 5
+            client.start(5000)
+            let startupMarker = "startup diagnostic from fake codex"
+            var startupReady = false
+            while (!startupReady && MonoTime.now() < setupDeadline) {
+                startupReady = client.diagnostics().toString().contains(startupMarker)
+                if (!startupReady && MonoTime.now() < setupDeadline) {
+                    sleep(Duration.millisecond * 10)
+                }
+            }
+            @Expect(startupReady, true)
+            if (!startupReady) { throw Exception("M5 client startup diagnostic not ready") }
 
-        let parentPid = m5ReadPid(parentPidPath)
-        let childPid = m5ReadPid(childPidPath)
-        let parentGone = m5WaitPidGone(parentPid, 5000)
-        let childGone = m5WaitPidGone(childPid, 5000)
-        if (!parentGone) { m5KillPid(parentPid) }
-        if (!childGone) { m5KillPid(childPid) }
-        try { remove(root, recursive: true) } catch (_: Exception) { () }
+            parentPid = m5ReadPid(parentPidPath)
+            childPid = m5ReadPid(childPidPath)
+            @Expect(parentPid > 1, true)
+            @Expect(childPid > 1, true)
+            if (parentPid <= 1 || childPid <= 1) { throw Exception("M5 client descendant identity invalid") }
+
+            try {
+                let _ = client.request("initialize", JsonObject(), 80)
+            } catch (e: Exception) {
+                error = e.message
+            }
+        } finally {
+            try {
+                client.close()
+            } finally {
+                parentGone = m5WaitPidGone(parentPid, 5000)
+                childGone = m5WaitPidGone(childPid, 5000)
+                if (!parentGone) { m5KillPid(parentPid) }
+                if (!childGone) { m5KillPid(childPid) }
+                try { remove(root, recursive: true) } catch (_: Exception) { () }
+            }
+        }
 
         @Expect(error.contains("initialize"), true)
         @Expect(error.contains("startup diagnostic from fake codex"), true)
