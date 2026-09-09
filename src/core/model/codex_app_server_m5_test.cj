@@ -4,14 +4,18 @@ import metis.process.managedStdioBroker
 
 import std.collection.{ArrayList, HashMap}
 import std.convert.Parsable
-import std.fs.{Directory, File, Path, exists, remove}
+import std.fs.{Directory, File, Path, canonicalize, exists, remove}
 import std.process.executeWithOutput
+import std.sync.{AtomicBool, AtomicInt64}
 import std.time.*
 import std.unittest.testmacro.*
 import stdx.encoding.json.{JsonArray, JsonBool, JsonInt, JsonObject, JsonString}
 
 private class M5FakeCodexTransport <: CodexAppServerTransport {
     public let requests = ArrayList<JsonObject>()
+    public let requestTimeouts = ArrayList<Int64>()
+    public let startTimeouts = ArrayList<Int64>()
+    public let readTimeouts = ArrayList<Int64>()
     public let notificationsSent = ArrayList<JsonObject>()
     public let responsesSent = ArrayList<JsonObject>()
     public let responseErrorsSent = ArrayList<JsonObject>()
@@ -41,10 +45,16 @@ private class M5FakeCodexTransport <: CodexAppServerTransport {
     }
 
     public func start(): Unit {
+        this.start(0)
+    }
+
+    public func start(timeoutMs: Int64): Unit {
+        this.startTimeouts.add(timeoutMs)
         this.started = true
     }
 
     public func request(method: String, params: JsonObject, _timeoutMs: Int64): JsonObject {
+        this.requestTimeouts.add(_timeoutMs)
         let record = JsonObject()
         record.put("method", JsonString(method))
         record.put("params", params)
@@ -87,6 +97,7 @@ private class M5FakeCodexTransport <: CodexAppServerTransport {
     }
 
     public func takeServerRequest(_timeoutMs: Int64): Option<JsonObject> {
+        this.readTimeouts.add(_timeoutMs)
         if (this.serverRequests.isEmpty()) {
             return None<JsonObject>
         }
@@ -96,6 +107,7 @@ private class M5FakeCodexTransport <: CodexAppServerTransport {
     }
 
     public func takeNotification(_timeoutMs: Int64): Option<JsonObject> {
+        this.readTimeouts.add(_timeoutMs)
         if (this.notifications.isEmpty()) {
             return None<JsonObject>
         }
@@ -681,6 +693,451 @@ public class CodexAppServerM5Test {
         @Expect(after.readerCount, 1)
         @Expect(after.dispatcherCount, 1)
     }
+
+    @TestCase
+    public func s4BU1AllSetupPollAndTerminalWaitsUseSeparateDecreasingBudgets(): Unit {
+        @Expect(codexAppServerAbsoluteDeadlineMs(500, nowMs: Int64.Max - 100), Int64.Max)
+        @Expect(codexAppServerWorkRemainingMs(10000, nowMs: 0), 9000)
+        @Expect(codexAppServerWorkRemainingMs(10000, nowMs: 100), 8900)
+        @Expect(codexAppServerWorkRemainingMs(10000, nowMs: 9000), 0)
+        @Expect(codexAppServerTerminalRemainingMs(10000, nowMs: 9000), 1000)
+        @Expect(codexAppServerTerminalRemainingMs(10000, nowMs: 10000), 0)
+
+        let fake = M5FakeCodexTransport()
+        fake.enqueueRequestResult(JsonObject())
+        fake.enqueueRequestResult(m5ThreadResultFromThread("thread.id", "s4b-thread"))
+        fake.enqueueRequestResult(m5TurnStartResult("s4b-turn"))
+        fake.enqueueNotification(m5TurnCompleted())
+        let absolute = codexAppServerAbsoluteDeadlineMs(5000)
+        let result = CodexAppServerSession(fake).runTurn(
+            "/repo",
+            "bounded",
+            timeoutMs: 5000,
+            pollMs: 10,
+            absoluteDeadlineMs: absolute
+        )
+        @Expect(result.completed, true)
+        @Expect(fake.startTimeouts.isEmpty(), false)
+        @Expect(fake.requestTimeouts.size, 3)
+        for (timeout in fake.startTimeouts) {
+            @Expect(timeout > 0 && timeout <= 4000, true)
+        }
+        for (timeout in fake.requestTimeouts) {
+            @Expect(timeout > 0 && timeout <= 4000, true)
+        }
+        for (timeout in fake.readTimeouts) {
+            @Expect(timeout > 0 && timeout <= 10, true)
+        }
+        if (fake.requestTimeouts.size != 3 || fake.readTimeouts.isEmpty()) {
+            throw Exception("S4B phase budget observations missing")
+        }
+        @Expect(fake.requestTimeouts[1] <= fake.requestTimeouts[0], true)
+        @Expect(fake.requestTimeouts[2] <= fake.requestTimeouts[1], true)
+        @Expect(fake.readTimeouts[0] <= fake.requestTimeouts[2], true)
+    }
+
+    @TestCase
+    public func s4BP1HundredTimeoutsLeaveOwnerPipeCloserAndRegistryZero(): Unit {
+        var interrupted: Int64 = 0
+        for (_ in 0..100) {
+            let fake = M5FakeCodexTransport()
+            fake.enqueueRequestResult(JsonObject())
+            fake.enqueueRequestResult(m5ThreadResultFromThread("thread.id", "s4b-thread"))
+            fake.enqueueRequestResult(m5TurnStartResult("s4b-turn"))
+            let result = CodexAppServerSession(fake).runTurn(
+                "/repo", "bounded", timeoutMs: 1050, pollMs: 0,
+                absoluteDeadlineMs: codexAppServerAbsoluteDeadlineMs(1050)
+            )
+            if (result.interrupted && result.retireReason == "turn_timeout") {
+                interrupted += 1
+            }
+            @Expect(fake.notificationsSent.isEmpty(), false)
+            if (fake.notificationsSent.isEmpty()) {
+                throw Exception("S4B timeout did not emit terminal interrupt")
+            }
+            @Expect(m5JsonString(fake.notificationsSent[fake.notificationsSent.size - 1], "method"), "turn/interrupt")
+        }
+        @Expect(interrupted, 100)
+
+        let brokerReady = managedStdioBroker().probeBroker(timeoutMs: 2000)
+        @Expect(brokerReady.ok, true)
+        if (!brokerReady.ok) { throw Exception("S4B broker warmup failed") }
+        m5WarmBrokerDispatcher()
+        let baseline = managedStdioBroker().debugSnapshotForTest()
+        let successRoot = m5TempRoot("s4b-success-owner")
+        let successPidPath = successRoot.join("owner.pid")
+        let successClient = CodexAppServerClient(
+            codexBin: m5FakeCodexScript(),
+            env: m5FakeCodexEnvironment("session", "s4b-success", parentPidPath: Some(successPidPath.toString())),
+            cwd: Some(successRoot.toString()),
+            absoluteDeadlineMs: codexAppServerAbsoluteDeadlineMs(5000)
+        )
+        var successCompleted = false
+        var successPid: Int64 = 0
+        var successPgid: Int64 = 0
+        var successGone = false
+        var successGroupGone = false
+        try {
+            let result = CodexAppServerSession(successClient).runTurn(
+                successRoot.toString(), "bounded", absoluteDeadlineMs: codexAppServerAbsoluteDeadlineMs(5000)
+            )
+            successCompleted = result.completed
+            successPid = m5ReadPid(successPidPath)
+            let ownerIdentity = successClient.debugOwnerIdentityForTest()
+            successPgid = ownerIdentity[2]
+        } finally {
+            try {
+                successClient.close()
+            } finally {
+                successGone = m5WaitPidGone(successPid, 2000)
+                successGroupGone = m5WaitPgidGone(successPgid, 2000)
+                if (!successGone) { m5KillPid(successPid) }
+                try { remove(successRoot, recursive: true) } catch (_: Exception) { () }
+            }
+        }
+        @Expect(successCompleted, true)
+        @Expect(successPid > 0, true)
+        @Expect(successPgid > 0, true)
+        @Expect(successGone, true)
+        @Expect(successGroupGone, true)
+
+        let failureRoot = m5TempRoot("s4b-setup-owner")
+        let failurePidPath = failureRoot.join("owner.pid")
+        let client = CodexAppServerClient(
+            codexBin: m5FakeCodexScript(),
+            env: m5FakeCodexEnvironment("malformed-json", "s4b-owner", parentPidPath: Some(failurePidPath.toString())),
+            cwd: Some(failureRoot.toString()),
+            absoluteDeadlineMs: codexAppServerAbsoluteDeadlineMs(3000)
+        )
+        var typedFailure = false
+        var failurePid: Int64 = 0
+        var failurePgid: Int64 = 0
+        var failureGone = false
+        var failureGroupGone = false
+        try {
+            client.start(1000)
+            let ownerIdentity = client.debugOwnerIdentityForTest()
+            failurePgid = ownerIdentity[2]
+            let _ = client.request("initialize", JsonObject(), 100)
+        } catch (e: CodexAppServerProtocolException) {
+            typedFailure = e.code == -32001 && e.message.contains("malformed_json")
+        } finally {
+            failurePid = m5ReadPid(failurePidPath)
+            try {
+                client.close()
+            } finally {
+                failureGone = m5WaitPidGone(failurePid, 2000)
+                failureGroupGone = m5WaitPgidGone(failurePgid, 2000)
+                if (!failureGone) { m5KillPid(failurePid) }
+                try { remove(failureRoot, recursive: true) } catch (_: Exception) { () }
+            }
+        }
+        let after = managedStdioBroker().debugSnapshotForTest()
+        @Expect(typedFailure, true)
+        @Expect(failurePid > 0, true)
+        @Expect(failurePgid > 0, true)
+        @Expect(failureGone, true)
+        @Expect(failureGroupGone, true)
+        @Expect(after.ownerCount, baseline.ownerCount)
+        @Expect(after.readerCount, baseline.readerCount)
+        @Expect(after.dispatcherCount, baseline.dispatcherCount)
+        @Expect(after.generation, baseline.generation)
+        @Expect(after.brokerPid, baseline.brokerPid)
+    }
+
+    @TestCase
+    public func s4BN1IgnoredInterruptMarksTurnTerminalThenSettlesWithoutLateAnswer(): Unit {
+        let root = m5TempRoot("s4b-ignored-late")
+        let codex = root.join("codex")
+        let pidPath = root.join("owner.pid")
+        let latePath = root.join("late-written")
+        File.writeTo(codex, (
+            "#!/bin/sh\n" +
+            "echo $$ > '${pidPath.toString()}'\n" +
+            "while IFS= read -r line; do\n" +
+            "  if printf '%s' \"$line\" | grep -Eq '\"method\"[[:space:]]*:[[:space:]]*\"initialize\"'; then printf '%s\\n' '{\"id\":1,\"result\":{}}'; fi\n" +
+            "  if printf '%s' \"$line\" | grep -Eq '\"method\"[[:space:]]*:[[:space:]]*\"thread/start\"'; then printf '%s\\n' '{\"id\":2,\"result\":{\"thread\":{\"id\":\"s4b-late-thread\"}}}'; fi\n" +
+            "  if printf '%s' \"$line\" | grep -Eq '\"method\"[[:space:]]*:[[:space:]]*\"turn/start\"'; then printf '%s\\n' '{\"id\":3,\"result\":{\"turnId\":\"s4b-late-turn\"}}'; fi\n" +
+            "  if printf '%s' \"$line\" | grep -Eq '\"method\"[[:space:]]*:[[:space:]]*\"turn/interrupt\"'; then sleep 0.05; printf '%s\\n' '{\"method\":\"thread/item/completed\",\"params\":{\"item\":{\"type\":\"agentMessage\",\"text\":\"late-private-answer\"}}}' '{\"method\":\"turn/completed\",\"params\":{}}'; : > '${latePath.toString()}'; fi\n" +
+            "done\n"
+        ).toArray())
+        let (_chmodCode, _, _) = executeWithOutput("chmod", ["+x", codex.toString()])
+        let brokerReady = managedStdioBroker().probeBroker(timeoutMs: 2000)
+        @Expect(brokerReady.ok, true)
+        if (!brokerReady.ok) { throw Exception("S4B broker warmup failed") }
+        m5WarmBrokerDispatcher()
+        let baseline = managedStdioBroker().debugSnapshotForTest()
+        let absoluteDeadlineMs = codexAppServerAbsoluteDeadlineMs(3000)
+        let client = CodexAppServerClient(
+            codexBin: codex.toString(), cwd: Some(root.toString()), absoluteDeadlineMs: absoluteDeadlineMs)
+        var result = CodexAppServerTurnResult(error: "fixture_not_run")
+        var lateWritten = false
+        var lateConsumed = false
+        var ownerGone = false
+        var ownerPid: Int64 = 0
+        var ownerPgid: Int64 = 0
+        var ownerGroupGone = false
+        try {
+            result = CodexAppServerSession(client).runTurn(
+                root.toString(), "bounded", timeoutMs: 3000, pollMs: 5, absoluteDeadlineMs: absoluteDeadlineMs)
+            let observationDeadlineMs = codexAppServerAbsoluteDeadlineMs(200)
+            while (true) {
+                lateWritten = exists(latePath)
+                lateConsumed = client.debugPendingNotificationCountForTest() >= 2
+                if (lateWritten && lateConsumed) {
+                    break
+                }
+                let localRemainingMs = codexAppServerTerminalRemainingMs(observationDeadlineMs)
+                let globalRemainingMs = codexAppServerTerminalRemainingMs(absoluteDeadlineMs)
+                if (localRemainingMs <= 0 || globalRemainingMs <= 800) { break }
+                sleep(Duration.millisecond * min(10, min(localRemainingMs, globalRemainingMs - 800)))
+            }
+            ownerPid = m5ReadPid(pidPath)
+            ownerPgid = client.debugOwnerIdentityForTest()[2]
+        } finally {
+            try {
+                client.close()
+            } finally {
+                ownerGone = m5WaitPidGone(ownerPid, 2000)
+                ownerGroupGone = m5WaitPgidGone(ownerPgid, 2000)
+                if (!ownerGone) { m5KillPid(ownerPid) }
+                try { remove(root, recursive: true) } catch (_: Exception) { () }
+            }
+        }
+        @Expect(result.interrupted, true)
+        @Expect(result.completed, false)
+        @Expect(result.finalText, "")
+        @Expect(result.error, "codex app-server turn timed out")
+        @Expect(lateWritten, true)
+        @Expect(lateConsumed, true)
+        @Expect(ownerGone, true)
+        @Expect(ownerPgid > 0, true)
+        @Expect(ownerGroupGone, true)
+        let after = managedStdioBroker().debugSnapshotForTest()
+        @Expect(after.ownerCount, baseline.ownerCount)
+        @Expect(after.readerCount, baseline.readerCount)
+        @Expect(after.dispatcherCount, baseline.dispatcherCount)
+        @Expect(after.generation, baseline.generation)
+        @Expect(after.brokerPid, baseline.brokerPid)
+    }
+
+    @TestCase
+    public func s4BH1ConcurrentCloserAndSetupFailureKillOnlyExactOwnerTree(): Unit {
+        let root = m5TempRoot("s4b-concurrent-close")
+        let parentPidPath = root.join("parent.pid")
+        let childPidPath = root.join("child.pid")
+        let brokerReady = managedStdioBroker().probeBroker(timeoutMs: 2000)
+        @Expect(brokerReady.ok, true)
+        if (!brokerReady.ok) { throw Exception("S4B broker warmup failed") }
+        m5WarmBrokerDispatcher()
+        let baseline = managedStdioBroker().debugSnapshotForTest()
+        let client = CodexAppServerClient(
+            codexBin: m5FakeCodexScript(),
+            env: m5FakeCodexEnvironment(
+                "hang-tree",
+                "s4b-concurrent",
+                parentPidPath: Some(parentPidPath.toString()),
+                childPidPath: Some(childPidPath.toString())
+            ),
+            cwd: Some(root.toString()),
+            absoluteDeadlineMs: codexAppServerAbsoluteDeadlineMs(5000)
+        )
+        var filesReady = false
+        var parentPid: Int64 = 0
+        var childPid: Int64 = 0
+        var parentGone = false
+        var childGone = false
+        var firstJoined = false
+        var secondJoined = false
+        var firstReaped = false
+        var secondReaped = false
+        var firstFuture: Option<Future<Unit>> = None<Future<Unit>>
+        var secondFuture: Option<Future<Unit>> = None<Future<Unit>>
+        try {
+            client.start(1000)
+            filesReady = m5WaitPathsExist([parentPidPath, childPidPath], 2000)
+            @Expect(filesReady, true)
+            if (!filesReady) {
+                throw Exception("S4B owner tree identity files missing")
+            }
+            parentPid = m5ReadPid(parentPidPath)
+            childPid = m5ReadPid(childPidPath)
+            let first = spawn { client.close() }
+            let second = spawn { client.close() }
+            firstFuture = Some(first)
+            secondFuture = Some(second)
+            firstJoined = try { let _ = first.get(Duration.second * 4); true } catch (_: Exception) { false }
+            secondJoined = try { let _ = second.get(Duration.second * 4); true } catch (_: Exception) { false }
+            firstReaped = firstJoined
+            secondReaped = secondJoined
+            parentGone = m5WaitPidGone(parentPid, 1000)
+            childGone = m5WaitPidGone(childPid, 1000)
+        } finally {
+            try { client.close() } catch (_: Exception) { () }
+            if (!firstReaped) { firstReaped = m5FutureSettled(firstFuture, 1000) }
+            if (!secondReaped) { secondReaped = m5FutureSettled(secondFuture, 1000) }
+            if (!parentGone) { m5KillPid(parentPid) }
+            if (!childGone) { m5KillPid(childPid) }
+            try { remove(root, recursive: true) } catch (_: Exception) { () }
+        }
+        let after = managedStdioBroker().debugSnapshotForTest()
+        @Expect(filesReady, true)
+        @Expect(firstJoined, true)
+        @Expect(secondJoined, true)
+        @Expect(firstReaped, true)
+        @Expect(secondReaped, true)
+        @Expect(parentGone, true)
+        @Expect(childGone, true)
+        @Expect(client.isAlive(), false)
+        @Expect(after.ownerCount, baseline.ownerCount)
+        @Expect(after.readerCount, baseline.readerCount)
+        @Expect(after.dispatcherCount, baseline.dispatcherCount)
+        @Expect(after.generation, baseline.generation)
+        @Expect(after.brokerPid, baseline.brokerPid)
+
+        let missing = CodexAppServerClient(
+            codexBin: root.join("missing-codex-app-server").toString(),
+            absoluteDeadlineMs: codexAppServerAbsoluteDeadlineMs(2000)
+        )
+        var setupFailed = false
+        try {
+            missing.start(500)
+        } catch (_: Exception) {
+            setupFailed = true
+        } finally {
+            missing.close()
+        }
+        @Expect(setupFailed, true)
+        @Expect(missing.isAlive(), false)
+        @Expect(managedStdioBroker().debugSnapshotForTest().ownerCount, baseline.ownerCount)
+
+        let unsafeRoot = m5TempRoot("s4b-unsafe-stop")
+        let unsafePidPath = unsafeRoot.join("owner.pid")
+        let unsafeClient = CodexAppServerClient(
+            codexBin: m5FakeCodexScript(),
+            env: m5FakeCodexEnvironment("session", "s4b-unsafe", parentPidPath: Some(unsafePidPath.toString())),
+            cwd: Some(unsafeRoot.toString()),
+            absoluteDeadlineMs: codexAppServerAbsoluteDeadlineMs(5000)
+        )
+        let unsafeCode = AtomicInt64(0)
+        let waiterCode = AtomicInt64(0)
+        var retained = false
+        var retryClosed = false
+        var retryIdentityCleared = false
+        var unsafePid: Int64 = 0
+        var unsafePgid: Int64 = 0
+        var unsafePidGoneBeforeRetry = false
+        var unsafePgidGoneBeforeRetry = false
+        var goneBeforeFallback = false
+        var closerReaped = false
+        var waiterReaped = false
+        var closerFuture: Option<Future<Unit>> = None<Future<Unit>>
+        var waiterFuture: Option<Future<Unit>> = None<Future<Unit>>
+        let stopEntered = AtomicBool(false)
+        let waiterEntered = AtomicBool(false)
+        let releaseStop = AtomicBool(false)
+        try {
+            unsafeClient.start(1000)
+            let beforeUnsafe = unsafeClient.debugOwnerIdentityForTest()
+            unsafePid = beforeUnsafe[1]
+            unsafePgid = beforeUnsafe[2]
+            let injected = unsafeClient.debugSetPostStopDowngradeForTest(Some("broker_exited"))
+            @Expect(injected, true)
+            if (!injected) { throw Exception("S4B unsafe stop seam unavailable") }
+            unsafeClient.debugSetBeforeStopForTest(Some({ =>
+                stopEntered.store(true)
+                while (!releaseStop.load()) { sleep(Duration.millisecond) }
+            }))
+            unsafeClient.debugSetBeforeWaitForCloserForTest(Some({ => waiterEntered.store(true) }))
+            let closer = spawn {
+                try { unsafeClient.close() } catch (e: CodexAppServerProtocolException) { unsafeCode.store(e.code) }
+            }
+            closerFuture = Some(closer)
+            let stopGateDeadline = codexAppServerAbsoluteDeadlineMs(1000)
+            while (!stopEntered.load() && codexAppServerTerminalRemainingMs(stopGateDeadline) > 0) {
+                sleep(Duration.millisecond * 5)
+            }
+            @Expect(stopEntered.load(), true)
+            if (!stopEntered.load()) { throw Exception("S4B close gate was not entered") }
+            let waiter = spawn {
+                try { unsafeClient.close() } catch (e: CodexAppServerProtocolException) { waiterCode.store(e.code) }
+            }
+            waiterFuture = Some(waiter)
+            let waiterGateDeadline = codexAppServerAbsoluteDeadlineMs(1000)
+            while (!waiterEntered.load() && codexAppServerTerminalRemainingMs(waiterGateDeadline) > 0) {
+                sleep(Duration.millisecond * 5)
+            }
+            @Expect(waiterEntered.load(), true)
+            if (!waiterEntered.load()) { throw Exception("S4B concurrent close waiter was not entered") }
+            releaseStop.store(true)
+            closerReaped = m5FutureSettled(closerFuture, 2000)
+            waiterReaped = m5FutureSettled(waiterFuture, 2000)
+            unsafeClient.debugSetBeforeStopForTest(None<() -> Unit>)
+            unsafeClient.debugSetBeforeWaitForCloserForTest(None<() -> Unit>)
+            let afterUnsafe = unsafeClient.debugOwnerIdentityForTest()
+            retained = afterUnsafe[0] == beforeUnsafe[0] && afterUnsafe[0] > 0 && afterUnsafe[1] == 0 &&
+                afterUnsafe[2] == 0 && unsafeClient.debugLifecycleForTest() == "cleanup_failed"
+            unsafePidGoneBeforeRetry = m5WaitPidGone(unsafePid, 1000)
+            unsafePgidGoneBeforeRetry = m5WaitPgidGone(unsafePgid, 1000)
+            unsafeClient.close()
+            retryClosed = unsafeClient.debugLifecycleForTest() == "closed"
+            let retryIdentity = unsafeClient.debugOwnerIdentityForTest()
+            retryIdentityCleared = retryIdentity[0] == 0 && retryIdentity[1] == 0 && retryIdentity[2] == 0
+        } finally {
+            releaseStop.store(true)
+            unsafeClient.debugSetBeforeStopForTest(None<() -> Unit>)
+            unsafeClient.debugSetBeforeWaitForCloserForTest(None<() -> Unit>)
+            let _ = unsafeClient.debugSetPostStopDowngradeForTest(None<String>)
+            if (!closerReaped) { closerReaped = m5FutureSettled(closerFuture, 1000) }
+            if (!waiterReaped) { waiterReaped = m5FutureSettled(waiterFuture, 1000) }
+            try { unsafeClient.close() } catch (_: Exception) { () }
+            goneBeforeFallback = m5WaitPidGone(unsafePid, 1000)
+            if (!goneBeforeFallback) { m5KillPid(unsafePid) }
+            try { remove(unsafeRoot, recursive: true) } catch (_: Exception) { () }
+        }
+        @Expect(unsafeCode.load(), -32004)
+        @Expect(waiterCode.load(), -32004)
+        @Expect(closerReaped, true)
+        @Expect(waiterReaped, true)
+        @Expect(retained, true)
+        @Expect(unsafePidGoneBeforeRetry, true)
+        @Expect(unsafePgidGoneBeforeRetry, true)
+        @Expect(retryClosed, true)
+        @Expect(retryIdentityCleared, true)
+        @Expect(goneBeforeFallback, true)
+        @Expect(managedStdioBroker().debugSnapshotForTest().ownerCount, baseline.ownerCount)
+    }
+
+    @TestCase
+    public func s4BH3AppServerUtf8DiagnosticsAndTailStayBoundedRedacted(): Unit {
+        let parsed = codexAppServerParseStdoutLine("{\"id\":3,\"result\":{\"text\":\"中文🙂\"}}")
+        let malformed = codexAppServerParseStdoutLine("{not-json Authorization=private-token 中文🙂")
+        let redacted = codexAppServerRedactDiagnostic(
+            "Authorization=private-token " + m5RepeatedText(r'中', 512)
+        )
+        let client = CodexAppServerClient(
+            codexBin: m5FakeCodexScript(),
+            env: m5FakeCodexEnvironment("stderr-burst", "s4b-tail"),
+            absoluteDeadlineMs: codexAppServerAbsoluteDeadlineMs(5000)
+        )
+        var result = JsonObject()
+        try {
+            result = client.request("initialize", JsonObject(), 3000)
+        } finally {
+            client.close()
+        }
+        let diagnostics = client.diagnostics().toString()
+        @Expect(parsed.kind, "response")
+        @Expect(parsed.message.toJsonString().contains("中文🙂"), true)
+        @Expect(malformed.kind, "diagnostic")
+        @Expect(malformed.diagnostic, "malformed_json")
+        @Expect(redacted.contains("private-token"), false)
+        @Expect(redacted.size <= 512, true)
+        @Expect(m5JsonString(result, "label"), "s4b-tail")
+        @Expect(diagnostics.contains("secret-codex-token"), false)
+        @Expect(diagnostics.contains("/Users/"), false)
+        @Expect(diagnostics.contains("/private/"), false)
+    }
 }
 
 private func m5TempRoot(label: String): Path {
@@ -699,8 +1156,57 @@ private func m5JoinFuture<T>(future: Option<Future<T>>, timeoutMs: Int64): Unit 
     }
 }
 
+private func m5FutureSettled<T>(future: Option<Future<T>>, timeoutMs: Int64): Bool {
+    match (future) {
+        case Some(value) => try { let _ = value.get(Duration.millisecond * timeoutMs); true } catch (_: Exception) { false }
+        case None => true
+    }
+}
+
 private func m5FakeCodexScript(): String {
-    Path("scripts").join("gateway-stdio-fake-codex-app-server.mjs").toString()
+    canonicalize(Path("scripts").join("gateway-stdio-fake-codex-app-server.mjs")).toString()
+}
+
+private func m5WarmBrokerDispatcher(): Unit {
+    let before = managedStdioBroker().debugSnapshotForTest()
+    let root = m5TempRoot("s4b-dispatcher-warmup")
+    let pidPath = root.join("owner.pid")
+    let client = CodexAppServerClient(
+        codexBin: m5FakeCodexScript(),
+        env: m5FakeCodexEnvironment("session", "s4b-dispatcher-warmup", parentPidPath: Some(pidPath.toString())),
+        cwd: Some(root.toString()),
+        absoluteDeadlineMs: codexAppServerAbsoluteDeadlineMs(3000)
+    )
+    var pid: Int64 = 0
+    var pgid: Int64 = 0
+    var pidGone = false
+    var pgidGone = false
+    try {
+        client.start(1000)
+        if (!m5WaitPathsExist([pidPath], 1000)) {
+            throw Exception("S4B dispatcher warmup pid missing")
+        }
+        pid = m5ReadPid(pidPath)
+        pgid = client.debugOwnerIdentityForTest()[2]
+        if (pid <= 0 || pgid <= 0) {
+            throw Exception("S4B dispatcher warmup identity missing")
+        }
+    } finally {
+        try {
+            client.close()
+        } finally {
+            pidGone = m5WaitPidGone(pid, 2000)
+            pgidGone = m5WaitPgidGone(pgid, 2000)
+            if (!pidGone) { m5KillPid(pid) }
+            try { remove(root, recursive: true) } catch (_: Exception) { () }
+        }
+    }
+    let after = managedStdioBroker().debugSnapshotForTest()
+    if (!pidGone || !pgidGone || after.ownerCount != before.ownerCount ||
+        after.readerCount != before.readerCount || after.generation != before.generation ||
+        after.brokerPid != before.brokerPid || after.dispatcherCount <= 0) {
+        throw Exception("S4B dispatcher warmup did not return to broker baseline")
+    }
 }
 
 private func m5FakeCodexEnvironment(
@@ -782,6 +1288,22 @@ private func m5WaitPidGone(pid: Int64, timeoutMs: Int64): Bool {
         sleep(Duration.millisecond * 25)
     }
     !m5PidAlive(pid)
+}
+
+private func m5PgidAlive(pgid: Int64): Bool {
+    if (pgid <= 0) { return false }
+    let (exitCode, _, _) = executeWithOutput("kill", ["-0", "-${pgid}"])
+    exitCode == 0
+}
+
+private func m5WaitPgidGone(pgid: Int64, timeoutMs: Int64): Bool {
+    if (pgid <= 0) { return true }
+    let deadline = codexAppServerAbsoluteDeadlineMs(timeoutMs)
+    while (codexAppServerTerminalRemainingMs(deadline) > 0) {
+        if (!m5PgidAlive(pgid)) { return true }
+        sleep(Duration.millisecond * 25)
+    }
+    !m5PgidAlive(pgid)
 }
 
 private func m5ThreadResultFromThread(field: String, value: String): JsonObject {

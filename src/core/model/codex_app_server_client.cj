@@ -9,6 +9,35 @@ import std.time.*
 import stdx.encoding.json.{JsonInt, JsonObject, JsonString, JsonValue}
 
 private const CODEX_APP_SERVER_TIMEOUT_DIAGNOSTIC_GRACE_MS: Int64 = 3000
+private const CODEX_APP_SERVER_TERMINAL_RESERVE_MS: Int64 = 1000
+
+private let codexAppServerMonotonicOrigin = MonoTime.now()
+
+public func codexAppServerNowMs(): Int64 {
+    (MonoTime.now() - codexAppServerMonotonicOrigin).toMilliseconds()
+}
+
+public func codexAppServerAbsoluteDeadlineMs(remainingMs: Int64, nowMs!: Int64 = codexAppServerNowMs()): Int64 {
+    if (remainingMs <= 0) {
+        return nowMs
+    }
+    if (nowMs > Int64.Max - remainingMs) {
+        return Int64.Max
+    }
+    nowMs + remainingMs
+}
+
+public func codexAppServerWorkRemainingMs(absoluteDeadlineMs: Int64, nowMs!: Int64 = codexAppServerNowMs()): Int64 {
+    if (absoluteDeadlineMs <= nowMs) {
+        return 0
+    }
+    let remaining = absoluteDeadlineMs - nowMs
+    if (remaining <= CODEX_APP_SERVER_TERMINAL_RESERVE_MS) { 0 } else { remaining - CODEX_APP_SERVER_TERMINAL_RESERVE_MS }
+}
+
+public func codexAppServerTerminalRemainingMs(absoluteDeadlineMs: Int64, nowMs!: Int64 = codexAppServerNowMs()): Int64 {
+    if (absoluteDeadlineMs <= nowMs) { 0 } else { absoluteDeadlineMs - nowMs }
+}
 
 private let codexAppServerOwnerIdLock = Mutex()
 private var codexAppServerOwnerIdSequence: Int64 = 0
@@ -44,7 +73,7 @@ public class CodexAppServerParsedLine {
 }
 
 public interface CodexAppServerTransport {
-    func start(): Unit
+    func start(timeoutMs: Int64): Unit
     func request(method: String, params: JsonObject, timeoutMs: Int64): JsonObject
     func notify(method: String, params: JsonObject): Unit
     func respond(id: Int64, result: JsonObject): Unit
@@ -61,6 +90,7 @@ public class CodexAppServerClient <: CodexAppServerTransport & ManagedStdioOwner
     private let extraArgs: Array<String>
     private let env: HashMap<String, String>
     private let cwd: Option<String>
+    private let absoluteDeadlineMs: Int64
     private let responses = CodexAppServerJsonQueue()
     private let serverRequests = CodexAppServerJsonQueue()
     private let notifications = CodexAppServerJsonQueue()
@@ -68,9 +98,14 @@ public class CodexAppServerClient <: CodexAppServerTransport & ManagedStdioOwner
     private let ownerId = codexAppServerNextOwnerId()
     private var ownerGeneration: Int64 = 0
     private var ownerPid: Int64 = 0
+    private var ownerPgid: Int64 = 0
     private var ownerRunning = false
     private var ownerTerminal = false
+    private var ownerStopSettledUnsafe = false
     private var lifecycle = "new"
+    private var beforeStopForTest: Option<() -> Unit> = None<() -> Unit>
+    private var beforeWaitForCloserForTest: Option<() -> Unit> = None<() -> Unit>
+    private var postStopDowngradeForTest: Option<String> = None<String>
     private var nextId: Int64 = 1
     private let lock = Mutex()
     private let closeCondition: Condition
@@ -79,16 +114,23 @@ public class CodexAppServerClient <: CodexAppServerTransport & ManagedStdioOwner
         codexBin!: String = "codex",
         extraArgs!: Array<String> = [],
         env!: HashMap<String, String> = codexAppServerBuildEnvironment(),
-        cwd!: Option<String> = None<String>
+        cwd!: Option<String> = None<String>,
+        absoluteDeadlineMs!: Int64 = 0
     ) {
         this.codexBin = if (codexBin.trimAscii().isEmpty()) { "codex" } else { codexBin.trimAscii() }
         this.extraArgs = extraArgs
         this.env = env
         this.cwd = cwd
+        this.absoluteDeadlineMs = absoluteDeadlineMs
         synchronized(this.lock) { this.closeCondition = this.lock.condition() }
     }
 
     public func start(): Unit {
+        this.start(0)
+    }
+
+    public func start(timeoutMs: Int64): Unit {
+        let effectiveTimeoutMs = this.workTimeoutMs(timeoutMs)
         synchronized(this.lock) {
             if (this.ownerRunning && !this.ownerTerminal && this.lifecycle == "running") {
                 return
@@ -110,32 +152,49 @@ public class CodexAppServerClient <: CodexAppServerTransport & ManagedStdioOwner
                     environment: environment.toArray(),
                     stdinMode: "line",
                     outputMode: "line"
-                )
+                ),
+                timeoutMs: effectiveTimeoutMs
             )
             if (!started.ok) {
                 throw CodexAppServerProtocolException("Failed to start codex app-server: ${codexAppServerRedactDiagnostic(started.status)}", code: -32000)
             }
             this.ownerGeneration = started.generation
             this.ownerPid = started.pid
+            this.ownerPgid = started.pgid
             this.ownerRunning = true
             this.ownerTerminal = false
+            this.ownerStopSettledUnsafe = false
             this.lifecycle = "running"
             let subscribed = managedStdioBroker().subscribeOwner(this.ownerId, started.generation, this)
             if (!subscribed.ok) {
-                this.ownerRunning = false
-                this.ownerTerminal = true
-                this.lifecycle = "closed"
-                let _ = managedStdioBroker().stopOwner(
+                let cleanupRemainingMs = this.terminalTimeoutMs(effectiveTimeoutMs)
+                if (cleanupRemainingMs <= 0) {
+                    this.lifecycle = "cleanup_failed"
+                    throw CodexAppServerProtocolException("Failed to cleanup codex app-server after subscribe failure", code: -32004)
+                }
+                let stopped = managedStdioBroker().stopOwner(
                     this.ownerId,
+                    timeoutMs: cleanupRemainingMs,
                     expectedGeneration: Some(started.generation)
                 )
+                if (stopped.ok) {
+                    this.ownerRunning = false
+                    this.ownerTerminal = true
+                    this.ownerPid = 0
+                    this.ownerPgid = 0
+                    this.lifecycle = "closed"
+                }
+                if (!stopped.ok) {
+                    this.lifecycle = "cleanup_failed"
+                    throw CodexAppServerProtocolException("Failed to cleanup codex app-server after subscribe failure", code: -32004)
+                }
                 throw CodexAppServerProtocolException("Failed to subscribe codex app-server: ${subscribed.status}", code: -32000)
             }
         }
     }
 
     public func request(method: String, params: JsonObject, timeoutMs: Int64): JsonObject {
-        this.start()
+        this.start(timeoutMs)
         let requestId = synchronized(this.lock) {
             let id = this.nextId
             this.nextId += 1
@@ -145,8 +204,9 @@ public class CodexAppServerClient <: CodexAppServerTransport & ManagedStdioOwner
         obj.put("id", JsonInt(requestId))
         obj.put("method", JsonString(method))
         obj.put("params", params)
-        this.send(obj)
-        let response = this.responses.readMatchingId(requestId, timeoutMs)
+        let effectiveTimeoutMs = this.workTimeoutMs(timeoutMs)
+        this.send(obj, effectiveTimeoutMs)
+        let response = this.responses.readMatchingId(requestId, effectiveTimeoutMs)
         match (response) {
             case Some(resp) =>
                 match (resp.get("error")) {
@@ -167,27 +227,44 @@ public class CodexAppServerClient <: CodexAppServerTransport & ManagedStdioOwner
                     case None => return JsonObject()
                 }
             case None =>
-                let diagnosticsBeforeClose = this.diagnosticsWithGrace(CODEX_APP_SERVER_TIMEOUT_DIAGNOSTIC_GRACE_MS)
-                try { this.closeAfterTimeoutForDiagnostics() } catch (_: Exception) { () }
+                let diagnosticGraceMs = if (this.absoluteDeadlineMs > 0) {
+                    0
+                } else {
+                    this.terminalTimeoutMs(CODEX_APP_SERVER_TIMEOUT_DIAGNOSTIC_GRACE_MS)
+                }
+                let diagnosticsBeforeClose = this.diagnosticsWithGrace(diagnosticGraceMs)
+                var cleanupFailed = false
+                try {
+                    this.closeAfterTimeoutForDiagnostics()
+                } catch (_: Exception) {
+                    cleanupFailed = true
+                }
                 let diagnosticsAfterClose = codexAppServerMergeDiagnostics(diagnosticsBeforeClose, this.diagnostics())
+                if (cleanupFailed) {
+                    throw CodexAppServerProtocolException("codex app-server cleanup failed", code: -32004)
+                }
                 let message = codexAppServerTimeoutMessage(method, diagnosticsAfterClose)
                 throw CodexAppServerProtocolException(message, code: -32001)
         }
     }
 
     public func notify(method: String, params: JsonObject): Unit {
-        this.start()
+        let terminal = method == "turn/interrupt"
+        let timeoutMs = if (terminal) { this.terminalTimeoutMs(1000) } else { this.workTimeoutMs(1000) }
+        if (!terminal) {
+            this.start(timeoutMs)
+        }
         let obj = JsonObject()
         obj.put("method", JsonString(method))
         obj.put("params", params)
-        this.send(obj)
+        this.send(obj, timeoutMs)
     }
 
     public func respond(id: Int64, result: JsonObject): Unit {
         let obj = JsonObject()
         obj.put("id", JsonInt(id))
         obj.put("result", result)
-        this.send(obj)
+        this.send(obj, this.workTimeoutMs(1000))
     }
 
     public func respondError(id: Int64, code: Int64, message: String): Unit {
@@ -197,15 +274,15 @@ public class CodexAppServerClient <: CodexAppServerTransport & ManagedStdioOwner
         let obj = JsonObject()
         obj.put("id", JsonInt(id))
         obj.put("error", error)
-        this.send(obj)
+        this.send(obj, this.workTimeoutMs(1000))
     }
 
     public func takeServerRequest(timeoutMs: Int64): Option<JsonObject> {
-        this.serverRequests.read(timeoutMs)
+        this.serverRequests.read(this.workTimeoutMs(timeoutMs))
     }
 
     public func takeNotification(timeoutMs: Int64): Option<JsonObject> {
-        this.notifications.read(timeoutMs)
+        this.notifications.read(this.workTimeoutMs(timeoutMs))
     }
 
     public func isAlive(): Bool {
@@ -218,14 +295,54 @@ public class CodexAppServerClient <: CodexAppServerTransport & ManagedStdioOwner
         this.diagnosticsBuffer.snapshot()
     }
 
+    func debugPendingNotificationCountForTest(): Int64 {
+        this.notifications.debugSizeForTest()
+    }
+
+    func debugOwnerIdentityForTest(): (Int64, Int64, Int64) {
+        synchronized(this.lock) { (this.ownerGeneration, this.ownerPid, this.ownerPgid) }
+    }
+
+    func debugLifecycleForTest(): String {
+        synchronized(this.lock) { this.lifecycle }
+    }
+
+    func debugSetBeforeStopForTest(hook: Option<() -> Unit>): Unit {
+        synchronized(this.lock) { this.beforeStopForTest = hook }
+    }
+
+    func debugSetBeforeWaitForCloserForTest(hook: Option<() -> Unit>): Unit {
+        synchronized(this.lock) { this.beforeWaitForCloserForTest = hook }
+    }
+
+    func debugSetPostStopDowngradeForTest(status: Option<String>): Bool {
+        match (status) {
+            case None =>
+                synchronized(this.lock) { this.postStopDowngradeForTest = None<String> }
+                true
+            case Some(value) =>
+                let normalized = value.trimAscii()
+                if (normalized != "broker_exited" && normalized != "broker_unresponsive" &&
+                    normalized != "malformed_json" && normalized != "invalid_response_encoding") {
+                    return false
+                }
+                synchronized(this.lock) { this.postStopDowngradeForTest = Some(normalized) }
+                true
+        }
+    }
+
     private func diagnosticsWithGrace(waitMs: Int64): Array<String> {
         var items = this.diagnostics()
         if (!items.isEmpty() || waitMs <= 0) {
             return items
         }
-        let started = DateTime.now().toUnixTimeStamp().toMilliseconds()
-        while (DateTime.now().toUnixTimeStamp().toMilliseconds() - started < waitMs) {
-            sleep(Duration.millisecond * 10)
+        let localDeadlineMs = codexAppServerAbsoluteDeadlineMs(waitMs)
+        while (true) {
+            let localRemainingMs = codexAppServerTerminalRemainingMs(localDeadlineMs)
+            let terminalRemainingMs = this.terminalTimeoutMs(10)
+            let sleepMs = min(localRemainingMs, terminalRemainingMs)
+            if (sleepMs <= 0) { return items }
+            sleep(Duration.millisecond * sleepMs)
             items = this.diagnostics()
             if (!items.isEmpty()) {
                 return items
@@ -239,7 +356,7 @@ public class CodexAppServerClient <: CodexAppServerTransport & ManagedStdioOwner
     }
 
     private func closeAfterTimeoutForDiagnostics(): Unit {
-        this.closeInternal(CODEX_APP_SERVER_TIMEOUT_DIAGNOSTIC_GRACE_MS)
+        this.closeInternal(this.terminalTimeoutMs(CODEX_APP_SERVER_TIMEOUT_DIAGNOSTIC_GRACE_MS))
     }
 
     private func closeInternal(diagnosticTailMs: Int64): Unit {
@@ -254,30 +371,88 @@ public class CodexAppServerClient <: CodexAppServerTransport & ManagedStdioOwner
                 this.lifecycle = "closing"
             }
             if (waitForCloser) {
-                while (this.lifecycle != "closed") {
-                    let _ = this.closeCondition.wait(timeout: Duration.millisecond * 100)
+                match (this.beforeWaitForCloserForTest) {
+                    case Some(hook) => hook()
+                    case None => ()
+                }
+                while (this.lifecycle == "closing") {
+                    let remaining = this.terminalTimeoutMs(100)
+                    if (remaining <= 0) { break }
+                    let _ = this.closeCondition.wait(timeout: Duration.millisecond * remaining)
+                }
+                if (this.lifecycle != "closed") {
+                    throw CodexAppServerProtocolException("codex app-server cleanup did not settle", code: -32004)
                 }
                 return
             }
-            shouldStop = this.ownerRunning && !this.ownerTerminal
+            shouldStop = this.ownerRunning && !this.ownerTerminal && !this.ownerStopSettledUnsafe
             generation = this.ownerGeneration
         }
         if (shouldStop) {
+            match (synchronized(this.lock) { this.beforeStopForTest }) {
+                case Some(hook) => hook()
+                case None => ()
+            }
+            let firstStopRemainingMs = this.terminalTimeoutMs(max(1000, diagnosticTailMs))
+            if (firstStopRemainingMs <= 0) {
+                synchronized(this.lock) {
+                    this.lifecycle = "cleanup_failed"
+                    this.closeCondition.notifyAll()
+                }
+                throw CodexAppServerProtocolException("codex app-server cleanup failed", code: -32004)
+            }
             let stopped = managedStdioBroker().stopOwner(
                 this.ownerId,
-                timeoutMs: max(1000, diagnosticTailMs),
+                timeoutMs: firstStopRemainingMs,
                 expectedGeneration: Some(generation)
             )
-            if (!stopped.ok) {
-                this.diagnosticsBuffer.append(stopped.status)
+            let downgraded = synchronized(this.lock) {
+                let selected = this.postStopDowngradeForTest
+                this.postStopDowngradeForTest = None<String>
+                selected
+            }
+            let applyDowngrade = stopped.ok && downgraded.isSome()
+            let stoppedOk = stopped.ok && !applyDowngrade
+            let stoppedStatus = if (applyDowngrade) {
+                downgraded.getOrThrow()
+            } else {
+                stopped.status
+            }
+            if (!stoppedOk) {
+                this.diagnosticsBuffer.append(codexAppServerRedactDiagnostic(stoppedStatus))
+                synchronized(this.lock) {
+                    let settledUnsafe = stoppedStatus == "broker_exited" ||
+                        stoppedStatus == "broker_unresponsive" || stoppedStatus == "malformed_json" ||
+                        stoppedStatus == "invalid_response_encoding"
+                    this.ownerStopSettledUnsafe = settledUnsafe
+                    if (settledUnsafe) {
+                        this.ownerRunning = false
+                        this.ownerTerminal = true
+                        this.ownerPid = 0
+                        this.ownerPgid = 0
+                    }
+                    this.lifecycle = "cleanup_failed"
+                    this.closeCondition.notifyAll()
+                }
+                throw CodexAppServerProtocolException("codex app-server cleanup failed", code: -32004)
             }
         }
-        this.waitForReaderDiagnosticTail(diagnosticTailMs)
-        let _ = managedStdioBroker().unsubscribeOwner(this.ownerId, generation)
+        this.waitForReaderDiagnosticTail(this.terminalTimeoutMs(diagnosticTailMs))
+        let unsubscribed = managedStdioBroker().unsubscribeOwner(this.ownerId, generation)
+        if (!unsubscribed.ok) {
+            synchronized(this.lock) {
+                this.lifecycle = "cleanup_failed"
+                this.closeCondition.notifyAll()
+            }
+            throw CodexAppServerProtocolException("codex app-server cleanup failed", code: -32004)
+        }
         synchronized(this.lock) {
             this.ownerRunning = false
             this.ownerTerminal = true
+            this.ownerGeneration = 0
             this.ownerPid = 0
+            this.ownerPgid = 0
+            this.ownerStopSettledUnsafe = false
             this.lifecycle = "closed"
             this.closeCondition.notifyAll()
         }
@@ -290,11 +465,15 @@ public class CodexAppServerClient <: CodexAppServerTransport & ManagedStdioOwner
         if (waitMs <= 0) {
             return
         }
-        let started = DateTime.now().toUnixTimeStamp().toMilliseconds()
+        let localDeadlineMs = codexAppServerAbsoluteDeadlineMs(waitMs)
         var previousCount: Int64 = -1
         var stableTicks: Int64 = 0
-        while (DateTime.now().toUnixTimeStamp().toMilliseconds() - started < waitMs) {
-            sleep(Duration.millisecond * 20)
+        while (true) {
+            let localRemainingMs = codexAppServerTerminalRemainingMs(localDeadlineMs)
+            let terminalRemainingMs = this.terminalTimeoutMs(20)
+            let sleepMs = min(localRemainingMs, terminalRemainingMs)
+            if (sleepMs <= 0) { return }
+            sleep(Duration.millisecond * sleepMs)
             let count = this.diagnostics().size
             if (count > 0 && count == previousCount) {
                 stableTicks += 1
@@ -308,20 +487,45 @@ public class CodexAppServerClient <: CodexAppServerTransport & ManagedStdioOwner
         }
     }
 
-    private func send(obj: JsonObject): Unit {
+    private func send(obj: JsonObject, timeoutMs: Int64): Unit {
         let generation = synchronized(this.lock) {
             if (!this.ownerRunning || this.ownerTerminal || this.lifecycle != "running") {
                 throw CodexAppServerProtocolException("codex app-server is not started", code: -32003)
             }
             this.ownerGeneration
         }
-        let written = managedStdioBroker().writeOwnerLine(this.ownerId, codexAppServerFrame(obj).trimAscii())
+        let written = managedStdioBroker().writeOwnerLine(
+            this.ownerId,
+            codexAppServerFrame(obj).trimAscii(),
+            timeoutMs: max(1, timeoutMs),
+            expectedGeneration: Some(generation)
+        )
         if (!written.ok || written.generation != generation) {
             throw CodexAppServerProtocolException(
                 "Failed to write codex app-server stdin: ${codexAppServerRedactDiagnostic(written.status)}",
                 code: -32002
             )
         }
+    }
+
+    private func workTimeoutMs(capMs: Int64): Int64 {
+        let cap = if (capMs > 0) { capMs } else { 30000 }
+        if (this.absoluteDeadlineMs <= 0) {
+            return cap
+        }
+        let remaining = codexAppServerWorkRemainingMs(this.absoluteDeadlineMs)
+        if (remaining <= 0) {
+            throw CodexAppServerProtocolException("codex app-server work deadline exhausted", code: -32001)
+        }
+        min(remaining, cap)
+    }
+
+    private func terminalTimeoutMs(capMs: Int64): Int64 {
+        let cap = if (capMs > 0) { capMs } else { 1 }
+        if (this.absoluteDeadlineMs <= 0) {
+            return cap
+        }
+        min(codexAppServerTerminalRemainingMs(this.absoluteDeadlineMs), cap)
     }
 
     public func onManagedStdioEvent(event: ManagedStdioEvent): Unit {
@@ -358,6 +562,7 @@ public class CodexAppServerClient <: CodexAppServerTransport & ManagedStdioOwner
                 this.ownerRunning = false
                 this.ownerTerminal = true
                 this.ownerPid = 0
+                this.ownerPgid = 0
             }
         }
         true
@@ -496,6 +701,10 @@ private class CodexAppServerJsonQueue {
             this.closed = true
             this.condition.notifyAll()
         }
+    }
+
+    public func debugSizeForTest(): Int64 {
+        synchronized(this.lock) { this.items.size }
     }
 
     private func findIndex(id: Int64): Int64 {

@@ -3,6 +3,7 @@ package metis.gateway.core
 import metis.core.model.{
     CodexAppServerClient,
     CodexAppServerSession,
+    codexAppServerAbsoluteDeadlineMs,
     codexAppServerRedactDiagnostic
 }
 import metis.gateway.session.GatewayTurnContext
@@ -152,6 +153,14 @@ public func gatewayRunCodexAppServerTurn(request: GatewayCodexAppServerTurnReque
         case Some(control) => control.throwIfCancelled()
         case None => ()
     }
+    let remainingMs = match (request.executionControl) {
+        case Some(control) => control.remainingMs()
+        case None => 600000
+    }
+    if (remainingMs <= 1000) {
+        throw Exception("codex app-server work deadline exhausted")
+    }
+    let absoluteDeadlineMs = codexAppServerAbsoluteDeadlineMs(remainingMs)
     match (gatewayCodexAppServerRunnerForTest) {
         case Some(runner) =>
             let result = runner(request)
@@ -170,17 +179,16 @@ public func gatewayRunCodexAppServerTurn(request: GatewayCodexAppServerTurnReque
     } else {
         request.workspaceDir.trimAscii()
     }
-    let client = CodexAppServerClient(cwd: Some(workspace))
+    let client = CodexAppServerClient(cwd: Some(workspace), absoluteDeadlineMs: absoluteDeadlineMs)
     let session = CodexAppServerSession(client)
+    var outcome: Option<GatewayCodexAppServerRuntimeResult> = None<GatewayCodexAppServerRuntimeResult>
+    var primaryFailure = ""
     try {
-        let timeoutMs = match (request.executionControl) {
-            case Some(control) => control.remainingMs()
-            case None => 600000
-        }
         let turn = session.runTurn(
             workspace,
             gatewayBuildCodexAppServerInput(request.systemPrompt, request.modelInput),
-            timeoutMs: timeoutMs
+            timeoutMs: remainingMs,
+            absoluteDeadlineMs: absoluteDeadlineMs
         )
         match (request.executionControl) {
             case Some(control) =>
@@ -207,7 +215,7 @@ public func gatewayRunCodexAppServerTurn(request: GatewayCodexAppServerTurnReque
             toolIterations: turn.toolIterations,
             usage: turn.usage
         )
-        return GatewayCodexAppServerRuntimeResult(
+        outcome = Some(GatewayCodexAppServerRuntimeResult(
             turn.finalText,
             threadId: turn.threadId,
             turnId: turn.turnId,
@@ -218,10 +226,27 @@ public func gatewayRunCodexAppServerTurn(request: GatewayCodexAppServerTurnReque
             completionTokens: completionTokens,
             usage: turn.usage,
             metadata: meta
-        )
+        ))
     } catch (e: Exception) {
-        throw Exception(codexAppServerRedactDiagnostic(e.message))
-    } finally {
-        try { client.close() } catch (_: Exception) { () }
+        primaryFailure = codexAppServerRedactDiagnostic(e.message)
+    }
+    var cleanupFailure = ""
+    try {
+        client.close()
+    } catch (e: Exception) {
+        cleanupFailure = codexAppServerRedactDiagnostic(e.message)
+    }
+    if (!primaryFailure.isEmpty()) {
+        if (!cleanupFailure.isEmpty()) {
+            throw Exception("${primaryFailure}; cleanup: ${cleanupFailure}")
+        }
+        throw Exception(primaryFailure)
+    }
+    if (!cleanupFailure.isEmpty()) {
+        throw Exception(cleanupFailure)
+    }
+    match (outcome) {
+        case Some(value) => value
+        case None => throw Exception("codex app-server did not produce a terminal result")
     }
 }

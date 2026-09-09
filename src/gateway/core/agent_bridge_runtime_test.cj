@@ -8,17 +8,18 @@ import magic.jsonable.TypeSchema
 import magic.model.ModelManager
 import metis.core.config.{CliConfig, CliModelRuntimeStateManager, CliSettingManager, MetisConfigManager, MetisProcessEnvironmentLock, OpenAICodexOAuthProfile, writeOpenAICodexOAuthProfile}
 import metis.core.{GatewayToolRuntimeContext, gatewayCurrentToolRuntimeContext, gatewayToolRuntimeContextDebugSummary, gatewayWithToolRuntimeContext}
-import metis.core.model.{CodexResponsesHttpRequest, CodexResponsesHttpResult, CodexResponsesHttpRunner, setCodexResponsesHttpRunnerForTest}
+import metis.core.model.{CodexAppServerClient, CodexAppServerProtocolException, CodexResponsesHttpRequest, CodexResponsesHttpResult, CodexResponsesHttpRunner, codexAppServerAbsoluteDeadlineMs, codexAppServerCurrentEnvironment, setCodexResponsesHttpRunnerForTest}
 import metis.core.prompting.{clearMetisWorkspaceBootstrapBoundedObserverForTest, resetMetisWorkspaceBootstrapCacheForTest, setMetisWorkspaceBootstrapBoundedObserverForTest}
 import metis.gateway.logging.{gatewayLoggingCaptureConsoleForTest, gatewayLoggingCapturedConsoleForTest, gatewayLoggingCurrentLogFile, gatewayLoggingResetForTest}
 import metis.gateway.session.{GatewayIngressSource, GatewaySessionRequest, GatewayTurnContext, gatewayResolveSessionContext}
 import metis.process.{managedStdioBroker, resetManagedStdioBrokerForTest}
 
 import std.collection.{ArrayList, HashMap}
+import std.convert.Parsable
 import std.env.{getVariable, setVariable}
-import std.fs.{Directory, File, FileInfo, OpenMode, Path, exists, remove}
+import std.fs.{Directory, File, FileInfo, OpenMode, Path, canonicalize, exists, remove}
 import std.process.executeWithOutput
-import std.sync.{AtomicBool, Condition, Mutex}
+import std.sync.{AtomicBool, AtomicInt64, Condition, Mutex}
 import std.time.*
 import std.unittest.testmacro.*
 import stdx.encoding.json.{JsonArray, JsonInt, JsonObject, JsonString, JsonValue}
@@ -27,8 +28,9 @@ private class AgentBridgeActivityControl <: GatewayExecutionControl {
     public var heartbeats: Int64 = 0
     public var checks: Int64 = 0
     public var cancelled: Bool = false
+    public var remaining: Int64 = 60000
 
-    public func remainingMs(): Int64 { if (this.cancelled) { 0 } else { 60000 } }
+    public func remainingMs(): Int64 { if (this.cancelled) { 0 } else { this.remaining } }
     public func heartbeat(): Unit {
         if (!this.cancelled) {
             this.heartbeats += 1
@@ -73,6 +75,18 @@ private func agentBridgeJoinFuture<T>(future: Option<Future<T>>, timeoutMs: Int6
         case Some(value) => try { let _ = value.get(Duration.millisecond * timeoutMs) } catch (_: Exception) { () }
         case None => ()
     }
+}
+
+private func agentBridgeWaitPidGone(pid: Int64, group: Bool, timeoutMs: Int64): Bool {
+    if (pid <= 0) { return false }
+    let deadline = MonoTime.now() + Duration.millisecond * timeoutMs
+    while (MonoTime.now() < deadline) {
+        let target = if (group) { "-${pid}" } else { "${pid}" }
+        let (code, _, _) = executeWithOutput("kill", ["-0", target])
+        if (code != 0) { return true }
+        sleep(Duration.millisecond * 10)
+    }
+    false
 }
 
 private func agentBridgeAgentEntry(id: String, workspace: Path, agentDir: Path, modelRef: String): JsonObject {
@@ -2179,6 +2193,106 @@ public class AgentBridgeRuntimeTest {
         }
         @Expect(error, "test_cancelled")
         @Expect(activity.heartbeats, 0)
+    }
+
+    @TestCase
+    public func s4BB1RemainingAtOrBelowTerminalReserveLaunchesNoOwner(): Unit {
+        let activity = AgentBridgeActivityControl()
+        let runnerCalls = AtomicInt64(0)
+        let before = managedStdioBroker().debugSnapshotForTest()
+        setGatewayCodexAppServerRunnerForTest(Some({ _request: GatewayCodexAppServerTurnRequest =>
+            runnerCalls.fetchAdd(1)
+            GatewayCodexAppServerRuntimeResult("must-not-run", completed: true)
+        }))
+        try {
+            for (remaining in [1000, 999, 0, -1]) {
+                activity.remaining = remaining
+                var error = ""
+                try {
+                    let _ = gatewayRunCodexAppServerTurn(GatewayCodexAppServerTurnRequest(
+                        "session-s4b-boundary",
+                        "/tmp",
+                        "cron",
+                        "writer",
+                        "openai-codex:test",
+                        "system",
+                        "input",
+                        executionControl: Some<GatewayExecutionControl>(activity)
+                    ))
+                } catch (e: Exception) {
+                    error = e.message
+                }
+                @Expect(error, "codex app-server work deadline exhausted")
+            }
+        } finally {
+            setGatewayCodexAppServerRunnerForTest(None<(GatewayCodexAppServerTurnRequest) -> GatewayCodexAppServerRuntimeResult>)
+        }
+        let after = managedStdioBroker().debugSnapshotForTest()
+        @Expect(runnerCalls.load(), 0)
+        @Expect(after.ownerCount, before.ownerCount)
+        @Expect(after.brokerPid, before.brokerPid)
+
+        withAgentBridgeTempHome("metis-s4b-no-response", { home: Path =>
+            let env = codexAppServerCurrentEnvironment()
+            let pidPath = home.join("owner.pid")
+            env["METIS_CODEX_FAKE_MODE"] = "no-response"
+            env["METIS_CODEX_FAKE_LABEL"] = "s4b-absolute-timeout"
+            env["METIS_CODEX_FAKE_PID_FILE"] = pidPath.toString()
+            let absoluteDeadlineMs = codexAppServerAbsoluteDeadlineMs(3000)
+            let client = CodexAppServerClient(
+                codexBin: canonicalize(Path("scripts").join("gateway-stdio-fake-codex-app-server.mjs")).toString(),
+                env: env,
+                cwd: Some(home.toString()),
+                absoluteDeadlineMs: absoluteDeadlineMs
+            )
+            var timeoutCode: Int64 = 0
+            var pid: Int64 = 0
+            var pgid: Int64 = 0
+            var pidGone = false
+            var pgidGone = false
+            try {
+                client.start(1000)
+                let pidReadyDeadline = MonoTime.now() + Duration.second
+                while (!exists(pidPath) && MonoTime.now() < pidReadyDeadline) {
+                    sleep(Duration.millisecond * 10)
+                }
+                if (!exists(pidPath)) { throw Exception("S4B no-response pid missing") }
+                let pidText = try {
+                    String.fromUtf8(File.readFrom(pidPath)).trimAscii()
+                } catch (_: Exception) {
+                    throw Exception("S4B no-response pid encoding invalid")
+                }
+                pid = Int64.parse(pidText)
+                let (pgidCode, pgidText, _) = executeWithOutput("ps", ["-o", "pgid=", "-p", "${pid}"])
+                if (pgidCode != 0) { throw Exception("S4B no-response pgid missing") }
+                let pgidValue = try {
+                    String.fromUtf8(pgidText).trimAscii()
+                } catch (_: Exception) {
+                    throw Exception("S4B no-response pgid encoding invalid")
+                }
+                pgid = Int64.parse(pgidValue)
+                let _ = client.request("initialize", JsonObject(), 3000)
+            } catch (e: CodexAppServerProtocolException) {
+                timeoutCode = e.code
+            } finally {
+                try {
+                    client.close()
+                } finally {
+                    pidGone = agentBridgeWaitPidGone(pid, false, 2000)
+                    pgidGone = agentBridgeWaitPidGone(pgid, true, 2000)
+                    if (!pgidGone && pgid > 0) {
+                        let _ = executeWithOutput("kill", ["-KILL", "-${pgid}"])
+                    }
+                }
+            }
+            @Expect(timeoutCode, -32001)
+            @Expect(pid > 0, true)
+            @Expect(pgid > 0, true)
+            @Expect(pidGone, true)
+            @Expect(pgidGone, true)
+            @Expect(client.isAlive(), false)
+            @Expect(managedStdioBroker().debugSnapshotForTest().ownerCount, before.ownerCount)
+        })
     }
 
     @TestCase

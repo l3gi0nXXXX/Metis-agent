@@ -71,20 +71,25 @@ public class CodexAppServerSession {
         this.projector = projector
     }
 
-    public func ensureStarted(cwd: String): String {
+    public func ensureStarted(cwd: String, absoluteDeadlineMs!: Int64 = 0): String {
         if (this.started && !this.threadId.isEmpty()) {
             return this.threadId
         }
-        this.client.start()
+        let startTimeoutMs = codexAppServerSessionWorkTimeout(absoluteDeadlineMs, 30000)
+        this.client.start(startTimeoutMs)
         let initParams = JsonObject()
         let clientInfo = JsonObject()
         clientInfo.put("name", JsonString("Metis"))
         clientInfo.put("version", JsonString("m5"))
         initParams.put("clientInfo", clientInfo)
         initParams.put("capabilities", JsonObject())
-        let _ = this.client.request("initialize", initParams, 30000)
+        let _ = this.client.request("initialize", initParams, codexAppServerSessionWorkTimeout(absoluteDeadlineMs, 30000))
         this.client.notify("initialized", JsonObject())
-        let thread = this.client.request("thread/start", codexAppServerBuildThreadStartParams(cwd), 30000)
+        let thread = this.client.request(
+            "thread/start",
+            codexAppServerBuildThreadStartParams(cwd),
+            codexAppServerSessionWorkTimeout(absoluteDeadlineMs, 30000)
+        )
         this.threadId = codexAppServerExtractThreadId(thread)
         this.started = true
         this.threadId
@@ -95,10 +100,12 @@ public class CodexAppServerSession {
         inputText: String,
         timeoutMs!: Int64 = 600000,
         pollMs!: Int64 = 10,
-        postToolQuietMs!: Int64 = 90000
+        postToolQuietMs!: Int64 = 90000,
+        absoluteDeadlineMs!: Int64 = 0
     ): CodexAppServerTurnResult {
+        let effectiveDeadlineMs = absoluteDeadlineMs
         let tid = try {
-            this.ensureStarted(cwd)
+            this.ensureStarted(cwd, absoluteDeadlineMs: effectiveDeadlineMs)
         } catch (e: Exception) {
             let msg = if (codexAppServerLooksLikeAuthFailure(e.message)) { codexAppServerLoginHint(message: e.message) } else { codexAppServerRedactDiagnostic(e.message) }
             let retire = codexAppServerRetireForFailure(if (codexAppServerLooksLikeAuthFailure(e.message)) { "oauth_failure" } else { "startup_failure" }, message: e.message)
@@ -108,7 +115,11 @@ public class CodexAppServerSession {
             return CodexAppServerTurnResult(error: "codex app-server process exited before turn/start", threadId: tid, shouldRetire: true, retireReason: "process_dead")
         }
         let startResult = try {
-            this.client.request("turn/start", codexAppServerBuildTurnStartParams(tid, inputText), 30000)
+            this.client.request(
+                "turn/start",
+                codexAppServerBuildTurnStartParams(tid, inputText),
+                codexAppServerSessionWorkTimeout(effectiveDeadlineMs, 30000)
+            )
         } catch (e: Exception) {
             let auth = codexAppServerLooksLikeAuthFailure(e.message)
             let status = if (auth) { "oauth_failure" } else { "turn_start_failed" }
@@ -137,8 +148,12 @@ public class CodexAppServerSession {
                     retireReason: "process_dead"
                 )
             }
-            let now = codexSessionNowMs()
-            if (timeoutMs > 0 && now - startedAt >= timeoutMs) {
+            let workRemainingMs = if (effectiveDeadlineMs > 0) {
+                codexAppServerWorkRemainingMs(effectiveDeadlineMs)
+            } else {
+                max(0, timeoutMs - (codexSessionNowMs() - startedAt))
+            }
+            if (workRemainingMs <= 0) {
                 this.interruptTurn(tid, turnId)
                 return CodexAppServerTurnResult(
                     finalText: finalText,
@@ -153,14 +168,20 @@ public class CodexAppServerSession {
                     retireReason: "turn_timeout"
                 )
             }
-            match (this.client.takeServerRequest(0)) {
+            match (this.client.takeServerRequest(min(workRemainingMs, max(1, pollMs)))) {
                 case Some(request) =>
                     let _ = this.handleServerRequest(request)
                     idleIterations = 0
                     continue
                 case None => ()
             }
-            match (this.client.takeNotification(0)) {
+            let notificationRemainingMs = if (effectiveDeadlineMs > 0) {
+                codexAppServerWorkRemainingMs(effectiveDeadlineMs)
+            } else {
+                max(0, timeoutMs - (codexSessionNowMs() - startedAt))
+            }
+            if (notificationRemainingMs <= 0) { continue }
+            match (this.client.takeNotification(min(notificationRemainingMs, max(1, pollMs)))) {
                 case Some(notification) =>
                     idleIterations = 0
                     let method = codexSessionJsonString(notification, "method")
@@ -240,7 +261,13 @@ public class CodexAppServerSession {
                             retireReason: "turn_timeout"
                         )
                     }
-                    sleep(Duration.millisecond * if (pollMs > 0) { pollMs } else { 1 })
+                    let sleepRemainingMs = if (effectiveDeadlineMs > 0) {
+                        codexAppServerWorkRemainingMs(effectiveDeadlineMs)
+                    } else {
+                        max(0, timeoutMs - (codexSessionNowMs() - startedAt))
+                    }
+                    if (sleepRemainingMs <= 0) { continue }
+                    sleep(Duration.millisecond * min(sleepRemainingMs, if (pollMs > 0) { pollMs } else { 1 }))
             }
         }
         CodexAppServerTurnResult()
@@ -290,6 +317,17 @@ public class CodexAppServerSession {
         }
         try { this.client.notify("turn/interrupt", params) } catch (_: Exception) { () }
     }
+}
+
+private func codexAppServerSessionWorkTimeout(absoluteDeadlineMs: Int64, capMs: Int64): Int64 {
+    if (absoluteDeadlineMs <= 0) {
+        return max(1, capMs)
+    }
+    let remaining = codexAppServerWorkRemainingMs(absoluteDeadlineMs)
+    if (remaining <= 0) {
+        throw CodexAppServerProtocolException("codex app-server work deadline exhausted", code: -32001)
+    }
+    min(remaining, max(1, capMs))
 }
 
 public func codexAppServerBuildThreadStartParams(cwd: String): JsonObject {
