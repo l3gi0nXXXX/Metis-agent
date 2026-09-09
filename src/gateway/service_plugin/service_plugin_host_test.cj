@@ -6,7 +6,7 @@ import metis.process.{ManagedStdioOwnerSpec, managedStdioBroker, managedStdioRes
 import std.collection.*
 import std.convert.Parsable
 import std.env.{getProcessId, getVariable, setVariable}
-import std.fs.{Directory, File, Path, exists, remove}
+import std.fs.{Directory, File, FileInfo, Path, canonicalize, exists, remove}
 import std.process.*
 import std.sync.*
 import std.time.*
@@ -657,7 +657,8 @@ public class ServicePluginHostTest {
     private func gitCodeIgnoringTermDispatchScript(): String {
         let initLine = this.gitCodeInitLine()
         let eventLine = this.gitCodeAcceptedEventLine(eventId: "gitcode:Cangjie/community:issue:cleanup-retry")
-        "printf '%s\n' '${initLine}'; printf '%s\n' '${eventLine}'; trap '' TERM HUP; while true; do sleep 1; done"
+        let leaseLine = "printf '{\"state\":\"running\",\"status\":\"running\",\"pluginId\":\"gitcode-monitor\",\"sessionId\":\"%s\",\"pid\":%s,\"parentPid\":%s,\"bindHost\":\"127.0.0.1\",\"port\":18189,\"startedAtMs\":1000,\"lastHeartbeatMs\":1000}\\n' \"$METIS_SERVICE_PLUGIN_SESSION_ID\" \"$$\" \"$METIS_SERVICE_PLUGIN_PARENT_PID\" > \"$METIS_SERVICE_PLUGIN_LEASE_PATH\""
+        "printf '%s\n' '${initLine}'; ${leaseLine}; printf '%s\n' '${eventLine}'; trap '' TERM HUP; while true; do sleep 1; done"
     }
 
     private func gitCodeMaintainerEmailWritebackScript(): String {
@@ -4784,8 +4785,10 @@ public class ServicePluginHostTest {
             let deliveryLock = Mutex()
             let deliveries = ArrayList<String>()
             let dispatchSettledGate = ServicePluginTestGate()
+            let staleProbeGate = ServicePluginTestGate()
             var starter = None<Future<ServiceStartResult>>
             var shutdown = None<Future<ServicePluginHostShutdownResult>>
+            var staleProbe = None<Future<ServicePluginSupervisorTickResult>>
             var cleanupPid: Int64 = 0
             let oldFixtureMarker = getVariable("METIS_STDIO_FIXTURE_MARKER_PATH")
             setVariable("METIS_STDIO_FIXTURE_MARKER_PATH", marker.toString())
@@ -4869,20 +4872,76 @@ public class ServicePluginHostTest {
                     ServicePluginEventDeliveryResult(true, "sent")
                 }))
                 setServicePluginDispatchSettledHookForTest(Some({ => dispatchSettledGate.enterAndWait() }))
-                @Expect(ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000).ok, true)
-                let explicitPid = match (getServicePluginSnapshot("gitcode-monitor")) { case Some(snapshot) => snapshot.pid case None => Int64(0) }
+                setServicePluginSupervisorConfigForTest(ServicePluginSupervisorConfig(enabled: true, intervalMs: 60000, healthTimeoutMs: 10, failureThreshold: 1, restartCooldownMs: 1000))
+                setServicePluginHealthzProbeForTest(Some({ _url: String, _timeoutMs: Int64 =>
+                    ServicePluginHealthzProbeResult(false, statusCode: 0, durationMs: 10, diagnostic: "healthz_timeout")
+                }))
+                let staleFixtureStarted = ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000)
+                @Expect(staleFixtureStarted.ok, true)
+                if (!staleFixtureStarted.ok) { throw Exception("stale supervisor probe fixture did not start") }
+                let beforeStaleProbe = match (getServicePluginSnapshot("gitcode-monitor")) {
+                    case Some(snapshot) => snapshot
+                    case None => throw Exception("stale supervisor probe fixture snapshot is missing")
+                }
+                @Expect(beforeStaleProbe.supervisorRestartCount, 0)
+                let explicitPid = beforeStaleProbe.pid
+                @Expect(explicitPid > 0, true)
+                if (explicitPid <= 0) { throw Exception("stale supervisor probe fixture pid is missing") }
+                let staleLease = home.join("service-plugin").join("runtime").join("gitcode-monitor").join("${beforeStaleProbe.instanceId}.lease.json")
                 let explicitPgid = this.processGroupId(explicitPid)
                 @Expect(explicitPgid > 0, true)
                 @Expect(this.waitForFile(marker, timeoutMillis: 3000), true)
+                setServicePluginBeforeSupervisorProbePublishHookForTest(Some({ serviceId: String =>
+                    if (serviceId == "gitcode-monitor") { staleProbeGate.enterAndWait() }
+                }))
+                staleProbe = Some(spawn { runServicePluginSupervisorTickForTest("gitcode-monitor", nowMs: 2000) })
+                let staleProbeEntered = staleProbeGate.awaitEntered(2000)
+                @Expect(staleProbeEntered, true)
+                if (!staleProbeEntered) { throw Exception("stale supervisor probe did not reach the publish gate") }
+                let staleLeaseExists = exists(staleLease)
+                @Expect(staleLeaseExists, true)
+                if (!staleLeaseExists) { throw Exception("stale supervisor probe lease is missing") }
+                let staleLeaseInfo = FileInfo(staleLease)
+                let expectedCanonicalLease = canonicalize(home).join("service-plugin").join("runtime").join("gitcode-monitor").join("${beforeStaleProbe.instanceId}.lease.json")
+                let staleLeaseOwned = staleLeaseInfo.isRegular() && !staleLeaseInfo.isSymbolicLink() &&
+                    canonicalize(staleLease).toString() == expectedCanonicalLease.normalize().toString()
+                @Expect(staleLeaseOwned, true)
+                if (!staleLeaseOwned) { throw Exception("stale supervisor probe lease identity is not owned by the fixture") }
+                remove(staleLease)
+                @Expect(exists(staleLease), false)
+                if (exists(staleLease)) { throw Exception("stale supervisor probe lease was not removed") }
                 let explicitStop = stopServicePlugin("gitcode-monitor", reason: "p3-n1-explicit-cleanup", timeoutMillis: 1)
                 @Expect(explicitStop.ok, false)
                 @Expect(explicitStop.status, "cleanup_pending")
                 @Expect(explicitStop.diagnostic.contains("dispatch_status=dispatch_pending"), true)
                 @Expect(servicePluginCleanupPendingCountForTest(), 1)
                 @Expect(managedStdioBroker().snapshot().ownerCount, 1)
+                match (getServicePluginSnapshot("gitcode-monitor")) {
+                    case Some(snapshot) =>
+                        @Expect(snapshot.status, "cleanup_pending")
+                        @Expect(snapshot.instanceId, beforeStaleProbe.instanceId)
+                    case None => @Expect(true, false)
+                }
                 let (initialPendingPidExit, _, _) = executeWithOutput("kill", ["-0", "${explicitPid}"])
                 @Expect(initialPendingPidExit, 0)
                 @Expect(ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 500).status, "cleanup_pending")
+                staleProbeGate.release()
+                let staleTick = staleProbe.getOrThrow().get(Duration.second * 3)
+                staleProbe = None<Future<ServicePluginSupervisorTickResult>>
+                @Expect(staleTick.classification.status, "degraded")
+                @Expect(staleTick.classification.shouldRecover, true)
+                @Expect(staleTick.recovered, false)
+                @Expect(staleTick.status, "cleanup_pending")
+                match (getServicePluginSnapshot("gitcode-monitor")) {
+                    case Some(snapshot) =>
+                        @Expect(snapshot.status, "cleanup_pending")
+                        @Expect(snapshot.instanceId, beforeStaleProbe.instanceId)
+                        @Expect(snapshot.pid, explicitPid)
+                        @Expect(snapshot.supervisorRestartCount, 0)
+                    case None => @Expect(true, false)
+                }
+                setServicePluginBeforeSupervisorProbePublishHookForTest(None<(String) -> Unit>)
+                setServicePluginHealthzProbeForTest(None<(String, Int64) -> ServicePluginHealthzProbeResult>)
                 File.writeTo(release, "release".toArray())
                 @Expect(dispatchSettledGate.awaitEntered(2000), true)
                 @Expect(synchronized(deliveryLock) { deliveries.size }, 0)
@@ -4971,8 +5030,10 @@ public class ServicePluginHostTest {
             } finally {
                 if (!exists(release)) { try { File.writeTo(release, "release".toArray()) } catch (_: Exception) { () } }
                 dispatchSettledGate.release()
+                staleProbeGate.release()
                 setServicePluginBeforeEventDispatchHookForTest(None<(String) -> Unit>)
                 setServicePluginDispatchSettledHookForTest(None<() -> Unit>)
+                setServicePluginBeforeSupervisorProbePublishHookForTest(None<(String) -> Unit>)
                 setServicePluginBeforeSupervisorRegisterHookForTest(None<(String) -> Unit>)
                 setServicePluginStartPhaseHookForTest(None<(String, String) -> Unit>)
                 setServicePluginWebhookSubscribersProviderForTest(None<(ServicePluginAcceptedGitCodeEvent) -> ArrayList<ServicePluginDeliveryTarget>>)
@@ -4980,6 +5041,7 @@ public class ServicePluginHostTest {
                 setServicePluginEventDeliveryForTest(None)
                 match (starter) { case Some(future) => try { let _ = future.get(Duration.second * 3) } catch (_: Exception) { try { future.cancel() } catch (_: Exception) { () } } case None => () }
                 match (shutdown) { case Some(future) => try { let _ = future.get(Duration.second * 3) } catch (_: Exception) { try { future.cancel() } catch (_: Exception) { () } } case None => () }
+                match (staleProbe) { case Some(future) => try { let _ = future.get(Duration.second * 3) } catch (_: Exception) { try { future.cancel() } catch (_: Exception) { () } } case None => () }
                 match (oldFixtureMarker) { case Some(value) => setVariable("METIS_STDIO_FIXTURE_MARKER_PATH", value) case None => setVariable("METIS_STDIO_FIXTURE_MARKER_PATH", "") }
                 resetServicePluginGeneratedReplyStateForTest()
                 resetServicePluginHostForTest()

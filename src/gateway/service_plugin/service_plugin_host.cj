@@ -1939,6 +1939,7 @@ private var servicePluginEventAckWrittenHookForTest: Option<(String, String, Str
 private var servicePluginBeforeCompletionAckHookForTest: Option<(String) -> Bool> = None<(String) -> Bool>
 private var servicePluginDispatchDiagnosticHookForTest: Option<(String, String, ServicePluginDispatchSnapshot) -> Unit> = None<(String, String, ServicePluginDispatchSnapshot) -> Unit>
 private var servicePluginBeforeSupervisorRegisterHookForTest: Option<(String) -> Unit> = None<(String) -> Unit>
+private var servicePluginBeforeSupervisorProbePublishHookForTest: Option<(String) -> Unit> = None<(String) -> Unit>
 private var servicePluginHostShuttingDown = false
 
 public func setServicePluginStartPhaseHookForTest(hook: Option<(String, String) -> Unit>): Unit { servicePluginStartPhaseHookForTest = hook }
@@ -1950,6 +1951,7 @@ public func setServicePluginEventAckWrittenHookForTest(hook: Option<(String, Str
 public func setServicePluginBeforeCompletionAckHookForTest(hook: Option<(String) -> Bool>): Unit { servicePluginBeforeCompletionAckHookForTest = hook }
 public func setServicePluginDispatchDiagnosticHookForTest(hook: Option<(String, String, ServicePluginDispatchSnapshot) -> Unit>): Unit { servicePluginDispatchDiagnosticHookForTest = hook }
 public func setServicePluginBeforeSupervisorRegisterHookForTest(hook: Option<(String) -> Unit>): Unit { servicePluginBeforeSupervisorRegisterHookForTest = hook }
+public func setServicePluginBeforeSupervisorProbePublishHookForTest(hook: Option<(String) -> Unit>): Unit { servicePluginBeforeSupervisorProbePublishHookForTest = hook }
 
 private func servicePluginRunStartPhaseHook(serviceId: String, phase: String): Unit { match (servicePluginStartPhaseHookForTest) { case Some(hook) => hook(serviceId, phase) case None => () } }
 private let servicePluginProcessLock = Mutex()
@@ -2846,6 +2848,7 @@ public func resetServicePluginHostForTest(): Unit {
     servicePluginBeforeCompletionAckHookForTest = None<(String) -> Bool>
     servicePluginDispatchDiagnosticHookForTest = None<(String, String, ServicePluginDispatchSnapshot) -> Unit>
     servicePluginBeforeSupervisorRegisterHookForTest = None<(String) -> Unit>
+    servicePluginBeforeSupervisorProbePublishHookForTest = None<(String) -> Unit>
     synchronized(servicePluginProcessLock) { servicePluginHostShuttingDown = false }
 }
 
@@ -3597,23 +3600,38 @@ private func servicePluginSupervisorProbeSummary(probe: ServicePluginHealthProbe
     "status=${classification.status} reason=${classification.reason} pidAlive=${probe.pidAlive} stdioAlive=${probe.stdioAlive} leaseState=${probe.leaseState} leaseAgeMs=${probe.leaseAgeMs} healthzOk=${probe.healthzOk} healthzDurationMs=${probe.healthzDurationMs} port=${probe.port} failureCount=${classification.failureCount} diagnostic=${diag}"
 }
 
-private func servicePluginSupervisorRecordProbe(record: ServicePluginRuntimeRecord, probe: ServicePluginHealthProbeResult, classification: ServicePluginHealthClassification, nowMs: Int64): Unit {
-    record.supervisorFailureCount = classification.failureCount
-    record.supervisorLastProbeAtMs = nowMs
-    record.supervisorLastProbe = servicePluginSupervisorProbeSummary(probe, classification)
-    if (classification.status == "healthy") {
-        record.supervisorLastDegradedReason = ""
-        if (record.status == "degraded" && servicePluginSupervisorReason(record.degradedReason)) {
-            record.status = "running"
-            record.degradedReason = ""
-            record.lastError = ""
+private func servicePluginSupervisorMayApplyLocked(serviceId: String, record: ServicePluginRuntimeRecord): Bool {
+    !servicePluginHostShuttingDown &&
+        !servicePluginHasCleanupPendingLocked(serviceId) &&
+        record.status != "cleanup_pending" &&
+        record.status != "stopping" &&
+        record.status != "stopped"
+}
+
+private func servicePluginSupervisorRecordProbe(record: ServicePluginRuntimeRecord, probe: ServicePluginHealthProbeResult, classification: ServicePluginHealthClassification, nowMs: Int64): Bool {
+    let serviceId = record.registration.manifest.pluginId
+    synchronized(servicePluginProcessLock) {
+        if (!servicePluginSupervisorMayApplyLocked(serviceId, record)) {
+            return false
         }
-        return
+        record.supervisorFailureCount = classification.failureCount
+        record.supervisorLastProbeAtMs = nowMs
+        record.supervisorLastProbe = servicePluginSupervisorProbeSummary(probe, classification)
+        if (classification.status == "healthy") {
+            record.supervisorLastDegradedReason = ""
+            if (record.status == "degraded" && servicePluginSupervisorReason(record.degradedReason)) {
+                record.status = "running"
+                record.degradedReason = ""
+                record.lastError = ""
+            }
+            return true
+        }
+        record.status = "degraded"
+        record.degradedReason = classification.reason
+        record.supervisorLastDegradedReason = classification.reason
+        record.lastError = redactServicePayload(if (classification.diagnostic.isEmpty()) { classification.reason } else { classification.diagnostic }).text
+        true
     }
-    record.status = "degraded"
-    record.degradedReason = classification.reason
-    record.supervisorLastDegradedReason = classification.reason
-    record.lastError = redactServicePayload(if (classification.diagnostic.isEmpty()) { classification.reason } else { classification.diagnostic }).text
 }
 
 private func servicePluginSupervisorStopTimeoutMs(config: ServicePluginSupervisorConfig): Int64 {
@@ -3622,6 +3640,9 @@ private func servicePluginSupervisorStopTimeoutMs(config: ServicePluginSuperviso
 
 private func recoverServicePlugin(record: ServicePluginRuntimeRecord, reason: String, nowMs!: Int64 = servicePluginNowMs()): Bool {
     let serviceId = record.registration.manifest.pluginId
+    if (!synchronized(servicePluginProcessLock) { servicePluginSupervisorMayApplyLocked(serviceId, record) }) {
+        return false
+    }
     let config = servicePluginSupervisorConfig
     let recoveryDeadline = ServicePluginProbeDeadline(
         servicePluginDeadlineNowMs() + servicePluginSupervisorStopTimeoutMs(config)
@@ -3750,12 +3771,19 @@ private func servicePluginRunSupervisorTick(serviceId: String, nowMs: Int64, all
             if (!servicePluginSupervisorConfig.enabled) {
                 let probe = ServicePluginHealthProbeResult(healthzOk: true, diagnostic: "supervisor_disabled")
                 let classification = ServicePluginHealthClassification("healthy", diagnostic: "supervisor_disabled")
-                servicePluginSupervisorRecordProbe(record, probe, classification, nowMs)
+                let _ = servicePluginSupervisorRecordProbe(record, probe, classification, nowMs)
                 return ServicePluginSupervisorTickResult(true, "disabled", probe: probe, classification: classification)
             }
             let probe = probeServicePluginHealth(record, nowMs: nowMs)
             let classification = classifyServicePluginHealth(probe, previousFailures: record.supervisorFailureCount, config: servicePluginSupervisorConfig)
-            servicePluginSupervisorRecordProbe(record, probe, classification, nowMs)
+            match (servicePluginBeforeSupervisorProbePublishHookForTest) {
+                case Some(hook) => hook(sid)
+                case None => ()
+            }
+            let applied = servicePluginSupervisorRecordProbe(record, probe, classification, nowMs)
+            if (!applied) {
+                return ServicePluginSupervisorTickResult(true, record.status, probe: probe, classification: classification, diagnostic: record.lastError)
+            }
             servicePluginFlushUnconfirmedForService(sid)
             var recovered = false
             if (allowRecover && classification.shouldRecover) {
