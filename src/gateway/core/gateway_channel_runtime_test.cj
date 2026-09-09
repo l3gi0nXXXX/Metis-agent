@@ -3,12 +3,13 @@ package metis.gateway.core
 import metis.core.config.CliConfig
 import metis.gateway.logging.{gatewayLoggingCaptureConsoleForTest, gatewayLoggingCapturedConsoleForTest, gatewayLoggingResetForTest}
 import metis.gateway.model.{ChannelType, ChatType, InboundMessage, OutboundMessage, SendResult}
+import metis.utils.ShellUtils
 import magic.config.Config
 import magic.jsonable.*
 
 import std.collection.ArrayList
-import std.env.{getVariable, setVariable}
-import std.fs.{Directory, File, Path, exists, remove}
+import std.env.{getVariable, removeVariable, setVariable}
+import std.fs.{Directory, File, FileInfo, Path, canonicalize, exists, remove}
 import std.time.DateTime
 import std.core.Duration
 import std.unittest.testmacro.*
@@ -28,23 +29,82 @@ private func gatewayChannelRuntimeTestWriteState(content: String): Unit {
 
 private func withGatewayChannelRuntimeTestHome<T>(block: () -> T): T {
     let testHome = "/tmp/metis-gateway-channel-runtime-test-home"
-    try {
-        remove(Path(testHome), recursive: true)
-    } catch (_: Exception) {
-        ()
+    let home = Path(testHome)
+    let parent = home.parent
+    let identityOk = testHome == "/tmp/metis-gateway-channel-runtime-test-home" &&
+        parent.toString() == "/tmp" && canonicalize(parent).toString() == "/private/tmp" &&
+        home.fileName == "metis-gateway-channel-runtime-test-home"
+    var existingIdentityOk = true
+    let targetIsSymlink = try { FileInfo(home).isSymbolicLink() } catch (_: Exception) { false }
+    if (exists(home)) {
+        let info = FileInfo(home)
+        existingIdentityOk = info.isDirectory() && !info.isSymbolicLink()
     }
-    Directory.create(testHome, recursive: true)
+    if (!identityOk || targetIsSymlink || !existingIdentityOk || exists(home)) {
+        throw Exception("s3j_owned_home_identity_invalid")
+    }
     let oldHome = getVariable("METIS_HOME")
-    setVariable("METIS_HOME", testHome)
-    CliConfig.invalidatePathCache()
+    let oldLogFile = Config.logFile
+    var homeCreated = false
     try {
+        Directory.create(home, recursive: false)
+        homeCreated = true
+        setVariable("METIS_HOME", testHome)
+        CliConfig.invalidatePathCache()
         return block()
     } finally {
-        match (oldHome) {
-            case Some(value) => setVariable("METIS_HOME", value)
-            case None => setVariable("METIS_HOME", "")
+        var cleanupFailure = ""
+        try {
+            try {
+                match (oldHome) {
+                    case Some(value) => setVariable("METIS_HOME", value)
+                    case None => removeVariable("METIS_HOME")
+                }
+            } catch (_: Exception) {
+                cleanupFailure = "s3j_env_restore_failed"
+            }
+        } finally {
+            try {
+                try {
+                    CliConfig.invalidatePathCache()
+                } catch (_: Exception) {
+                    if (cleanupFailure.isEmpty()) { cleanupFailure = "s3j_cache_restore_failed" }
+                }
+            } finally {
+                try {
+                    try {
+                        gatewayLoggingResetForTest()
+                    } catch (_: Exception) {
+                        if (cleanupFailure.isEmpty()) { cleanupFailure = "s3j_logging_reset_failed" }
+                    }
+                } finally {
+                    try {
+                        try {
+                            Config.logFile = oldLogFile
+                            @Expect(Config.logFile, oldLogFile)
+                            if (Config.logFile != oldLogFile && cleanupFailure.isEmpty()) {
+                                cleanupFailure = "s3j_config_restore_failed"
+                            }
+                        } catch (_: Exception) {
+                            if (cleanupFailure.isEmpty()) { cleanupFailure = "s3j_config_restore_failed" }
+                        }
+                    } finally {
+                        try {
+                            if (homeCreated && exists(home)) { remove(home, recursive: true) }
+                        } catch (_: Exception) {
+                            if (cleanupFailure.isEmpty()) { cleanupFailure = "s3j_owned_home_remove_failed" }
+                        }
+                        let remains = homeCreated && (exists(home) ||
+                            try { FileInfo(home).isSymbolicLink() } catch (_: Exception) { false })
+                        @Expect(remains, false)
+                        if (remains && cleanupFailure.isEmpty()) {
+                            cleanupFailure = "s3j_owned_home_cleanup_failed"
+                        }
+                        if (!cleanupFailure.isEmpty()) { throw Exception(cleanupFailure) }
+                    }
+                }
+            }
         }
-        CliConfig.invalidatePathCache()
     }
 }
 
@@ -291,6 +351,106 @@ private func gatewayRuntimeTestInt(obj: JsonObject, key: String): Int64 {
 
 @Test
 public class GatewayChannelRuntimeTest {
+    @TestCase
+    public func s3jU1FixedHomeRestoresStateAndRemovesOwnedDirectory(): Unit {
+        let originalHome = getVariable("METIS_HOME")
+        let originalLogFile = Config.logFile
+        try {
+            removeVariable("METIS_HOME")
+            CliConfig.invalidatePathCache()
+            let expectedDotDir = CliConfig.dotDir.toString()
+            let result = withGatewayChannelRuntimeTestHome<String>({ =>
+                Config.logFile = CliConfig.logsDir.join("s3j-channel-inner.log").toString()
+                "s3j-channel-ok"
+            })
+            @Expect(result, "s3j-channel-ok")
+            @Expect(getVariable("METIS_HOME").isNone(), true)
+            @Expect(CliConfig.dotDir.toString(), expectedDotDir)
+            @Expect(Config.logFile, originalLogFile)
+            let fixedHome = Path("/tmp/metis-gateway-channel-runtime-test-home")
+            @Expect(exists(fixedHome), false)
+
+            Directory.create(fixedHome, recursive: true)
+            let marker = fixedHome.join("s3j-real-directory.marker")
+            File.writeTo(marker, "keep".toArray())
+            var realDirectoryError = ""
+            try {
+                withGatewayChannelRuntimeTestHome<Unit>({ => () })
+            } catch (e: Exception) {
+                realDirectoryError = e.message
+            }
+            @Expect(realDirectoryError, "s3j_owned_home_identity_invalid")
+            @Expect(exists(marker), true)
+            @Expect(FileInfo(marker).size, 4)
+            let fixedInfo = FileInfo(fixedHome)
+            let fixedCleanupOk = exists(fixedHome) && fixedInfo.isDirectory() && !fixedInfo.isSymbolicLink()
+            @Expect(fixedCleanupOk, true)
+            if (!fixedCleanupOk) {
+                throw Exception("s3j_fixed_sentinel_cleanup_refused")
+            }
+            remove(fixedHome, recursive: true)
+
+            let danglingTarget = Path("/private/tmp/metis-s3j-channel-dangling-target-never-create")
+            @Expect(exists(danglingTarget), false)
+            if (exists(danglingTarget)) {
+                throw Exception("s3j_symlink_target_preexists")
+            }
+            let link = ShellUtils.execute(
+                ["ln", "-s", danglingTarget.toString(), fixedHome.toString()],
+                withWrap: false
+            )
+            @Expect(link[0], 0)
+            if (link[0] != 0) {
+                throw Exception("s3j_symlink_fixture_failed")
+            }
+            var symlinkError = ""
+            try {
+                withGatewayChannelRuntimeTestHome<Unit>({ => () })
+            } catch (e: Exception) {
+                symlinkError = e.message
+            }
+            @Expect(symlinkError, "s3j_owned_home_identity_invalid")
+            let linkPreserved = FileInfo(fixedHome).isSymbolicLink()
+            @Expect(linkPreserved, true)
+            if (!linkPreserved) {
+                throw Exception("s3j_symlink_sentinel_cleanup_refused")
+            }
+            remove(fixedHome)
+            @Expect(exists(danglingTarget), false)
+        } finally {
+            match (originalHome) {
+                case Some(value) => setVariable("METIS_HOME", value)
+                case None => removeVariable("METIS_HOME")
+            }
+            CliConfig.invalidatePathCache()
+            gatewayLoggingResetForTest()
+            Config.logFile = originalLogFile
+        }
+    }
+
+    @TestCase
+    public func s3jN1FixedHomeRethrowsAndCleansOwnedDirectory(): Unit {
+        let originalHome = getVariable("METIS_HOME")
+        let originalLogFile = Config.logFile
+        let expectedDotDir = CliConfig.dotDir.toString()
+        var observed = ""
+        try {
+            withGatewayChannelRuntimeTestHome<Unit>({ =>
+                throw Exception("s3j_fixed_body_failure")
+            })
+        } catch (e: Exception) {
+            observed = e.message
+        }
+        @Expect(observed, "s3j_fixed_body_failure")
+        match (originalHome) {
+            case Some(value) => @Expect(getVariable("METIS_HOME"), Some(value))
+            case None => @Expect(getVariable("METIS_HOME").isNone(), true)
+        }
+        @Expect(CliConfig.dotDir.toString(), expectedDotDir)
+        @Expect(Config.logFile, originalLogFile)
+        @Expect(exists(Path("/tmp/metis-gateway-channel-runtime-test-home")), false)
+    }
+
     @TestCase
     public func p4B1InboundQueueRejectionIsPersistedWithoutCountingSuccess(): Unit {
         withGatewayChannelRuntimeTestHome {

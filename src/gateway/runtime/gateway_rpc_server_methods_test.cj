@@ -3,9 +3,10 @@ package metis.gateway.runtime
 import metis.core.skills.setClawHubHttpGetForTest
 import metis.core.config.{CliConfig, CliSettingManager, MetisConfigManager, MetisProcessEnvironmentLock}
 import metis.gateway.logging.{MetisLogEvent, gatewayLoggingResetForTest, metisCreateSubsystemLogger}
+import magic.config.Config
 
-import std.env.{getVariable, setVariable}
-import std.fs.{Directory, Path, remove}
+import std.env.{getVariable, removeVariable, setVariable}
+import std.fs.{Directory, FileInfo, Path, canonicalize, exists, remove}
 import std.time.DateTime
 import std.unittest.testmacro.*
 import stdx.encoding.json.{JsonBool, JsonInt, JsonObject, JsonString}
@@ -27,25 +28,97 @@ private func gatewayRpcRestoreEnv(name: String, oldValue: Option<String>): Unit 
 
 private func withGatewayRpcTestHome<T>(label: String, block: () -> T): T {
     synchronized(MetisProcessEnvironmentLock) {
-        let home = Path("/tmp/metis-gateway-rpc-${label}-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
-        try { remove(home, recursive: true) } catch (_: Exception) { () }
-        Directory.create(home, recursive: true)
+        let stamp = DateTime.now().toUnixTimeStamp().toMilliseconds()
+        let home = Path("/tmp/metis-gateway-rpc-${label}-${stamp}")
+        let parent = home.parent
+        let labelOk = !label.isEmpty() && label.toRuneArray().size <= 128 && !label.contains("/") &&
+            !label.contains("\\") && label != "." && label != ".."
+        let identityOk = labelOk && stamp > 0 && home.toString() == "/tmp/metis-gateway-rpc-${label}-${stamp}" &&
+            parent.toString() == "/tmp" && canonicalize(parent).toString() == "/private/tmp" &&
+            home.fileName == "metis-gateway-rpc-${label}-${stamp}"
+        var existingIdentityOk = true
+        let targetIsSymlink = try { FileInfo(home).isSymbolicLink() } catch (_: Exception) { false }
+        if (exists(home)) {
+            let info = FileInfo(home)
+            existingIdentityOk = info.isDirectory() && !info.isSymbolicLink()
+        }
+        if (!identityOk || targetIsSymlink || !existingIdentityOk || exists(home)) {
+            throw Exception("s3j_owned_home_identity_invalid")
+        }
         let oldHome = getVariable("METIS_HOME")
-        setVariable("METIS_HOME", home.toString())
-        CliConfig.invalidatePathCache()
-        MetisConfigManager.invalidate()
-        CliSettingManager.invalidate()
+        let oldLogFile = Config.logFile
+        var homeCreated = false
         try {
-            return block()
-        } finally {
-            match (oldHome) {
-                case Some(value) => setVariable("METIS_HOME", value)
-                case None => setVariable("METIS_HOME", "")
-            }
+            Directory.create(home, recursive: false)
+            homeCreated = true
+            setVariable("METIS_HOME", home.toString())
             CliConfig.invalidatePathCache()
             MetisConfigManager.invalidate()
             CliSettingManager.invalidate()
-            try { remove(home, recursive: true) } catch (_: Exception) { () }
+            return block()
+        } finally {
+            var cleanupFailure = ""
+            try {
+                try {
+                    match (oldHome) {
+                        case Some(value) => setVariable("METIS_HOME", value)
+                        case None => removeVariable("METIS_HOME")
+                    }
+                } catch (_: Exception) {
+                    cleanupFailure = "s3j_env_restore_failed"
+                }
+            } finally {
+                try {
+                    try {
+                        CliConfig.invalidatePathCache()
+                    } catch (_: Exception) {
+                        if (cleanupFailure.isEmpty()) { cleanupFailure = "s3j_cache_restore_failed" }
+                    }
+                    try {
+                        MetisConfigManager.invalidate()
+                    } catch (_: Exception) {
+                        if (cleanupFailure.isEmpty()) { cleanupFailure = "s3j_cache_restore_failed" }
+                    }
+                    try {
+                        CliSettingManager.invalidate()
+                    } catch (_: Exception) {
+                        if (cleanupFailure.isEmpty()) { cleanupFailure = "s3j_cache_restore_failed" }
+                    }
+                } finally {
+                    try {
+                        try {
+                            gatewayLoggingResetForTest()
+                        } catch (_: Exception) {
+                            if (cleanupFailure.isEmpty()) { cleanupFailure = "s3j_logging_reset_failed" }
+                        }
+                    } finally {
+                        try {
+                            try {
+                                Config.logFile = oldLogFile
+                                @Expect(Config.logFile, oldLogFile)
+                                if (Config.logFile != oldLogFile && cleanupFailure.isEmpty()) {
+                                    cleanupFailure = "s3j_config_restore_failed"
+                                }
+                            } catch (_: Exception) {
+                                if (cleanupFailure.isEmpty()) { cleanupFailure = "s3j_config_restore_failed" }
+                            }
+                        } finally {
+                            try {
+                                if (homeCreated && exists(home)) { remove(home, recursive: true) }
+                            } catch (_: Exception) {
+                                if (cleanupFailure.isEmpty()) { cleanupFailure = "s3j_owned_home_remove_failed" }
+                            }
+                            let remains = homeCreated && (exists(home) ||
+                                try { FileInfo(home).isSymbolicLink() } catch (_: Exception) { false })
+                            @Expect(remains, false)
+                            if (remains && cleanupFailure.isEmpty()) {
+                                cleanupFailure = "s3j_owned_home_cleanup_failed"
+                            }
+                            if (!cleanupFailure.isEmpty()) { throw Exception(cleanupFailure) }
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -71,6 +144,55 @@ private func gatewayRpcInstallRedactionConfig(): Unit {
 
 @Test
 public class GatewayRpcServerMethodsTest {
+    @TestCase
+    public func s3jB1DynamicHomeValidatesLabelAndRestoresState(): Unit {
+        let originalHome = getVariable("METIS_HOME")
+        let originalLogFile = Config.logFile
+        try {
+            setVariable("METIS_HOME", "/tmp")
+            CliConfig.invalidatePathCache()
+            MetisConfigManager.invalidate()
+            CliSettingManager.invalidate()
+            let expectedDotDir = CliConfig.dotDir.toString()
+            let expectedConfigPath = MetisConfigManager.configPath().toString()
+            let expectedPort = CliSettingManager.readGatewaySettings().port
+            let result = withGatewayRpcTestHome<String>("s3j-边界🙂", { =>
+                Config.logFile = CliConfig.logsDir.join("s3j-rpc-inner.log").toString()
+                "s3j-rpc-ok"
+            })
+            @Expect(result, "s3j-rpc-ok")
+            @Expect(getVariable("METIS_HOME"), Some("/tmp"))
+            @Expect(CliConfig.dotDir.toString(), expectedDotDir)
+            @Expect(MetisConfigManager.configPath().toString(), expectedConfigPath)
+            @Expect(CliSettingManager.readGatewaySettings().port, expectedPort)
+            @Expect(Config.logFile, originalLogFile)
+
+            var oversized = ""
+            for (_ in 0..129) {
+                oversized += "x"
+            }
+            for (invalidLabel in ["", oversized, "../escape"]) {
+                var invalid = ""
+                try {
+                    withGatewayRpcTestHome<Unit>(invalidLabel, { => () })
+                } catch (e: Exception) {
+                    invalid = e.message
+                }
+                @Expect(invalid, "s3j_owned_home_identity_invalid")
+            }
+        } finally {
+            match (originalHome) {
+                case Some(value) => setVariable("METIS_HOME", value)
+                case None => removeVariable("METIS_HOME")
+            }
+            CliConfig.invalidatePathCache()
+            MetisConfigManager.invalidate()
+            CliSettingManager.invalidate()
+            gatewayLoggingResetForTest()
+            Config.logFile = originalLogFile
+        }
+    }
+
     @TestCase
     public func localDispatcherRoutesSkillsStatusToSkillsFamily(): Unit {
         let response = gatewayDispatchLocalMethod(GatewayRpcRequest("skills.status"))

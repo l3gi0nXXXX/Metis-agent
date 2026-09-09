@@ -12,10 +12,12 @@ import metis.gateway.openclaw_runtime.{OpenClawCompatHostClient, OpenClawCompatH
 import metis.gateway.session.{GatewayIngressSource, GatewaySessionRequest, gatewayResolveSessionContext}
 import metis.gateway.tools.{GatewayManagedSessionsToolset, debugGatewayShellExecuteForTest}
 import metis.process.{managedStdioBroker, managedStdioResolveBrokerScriptPath, resetManagedStdioBrokerForTest}
+import metis.gateway.logging.gatewayLoggingResetForTest
+import magic.config.Config
 import std.collection.{ArrayList, HashMap}
 import std.core.Duration
-import std.env.{getVariable, setVariable}
-import std.fs.{Directory, File, Path, exists, remove}
+import std.env.{getVariable, removeVariable, setVariable}
+import std.fs.{Directory, File, FileInfo, Path, canonicalize, exists, remove}
 import std.net.*
 import std.process.executeWithOutput
 import std.sync.{AtomicBool, Mutex}
@@ -26,34 +28,102 @@ import stdx.net.http.*
 
 private func withGatewayShellE2eHome<T>(body: () -> T): T {
     synchronized(MetisProcessEnvironmentLock) {
-        let home = "/tmp/metis-gateway-shell-e2e-${DateTime.now().toUnixTimeStamp().toNanoseconds()}"
-        let oldHome = getVariable("METIS_HOME")
-        try {
-            remove(Path(home), recursive: true)
-        } catch (_: Exception) {
-            ()
+        let stamp = DateTime.now().toUnixTimeStamp().toNanoseconds()
+        let home = "/tmp/metis-gateway-shell-e2e-${stamp}"
+        let homePath = Path(home)
+        let parent = homePath.parent
+        let identityOk = stamp > 0 && home == "/tmp/metis-gateway-shell-e2e-${stamp}" &&
+            parent.toString() == "/tmp" &&
+            canonicalize(parent).toString() == "/private/tmp" &&
+            homePath.fileName == "metis-gateway-shell-e2e-${stamp}"
+        var existingIdentityOk = true
+        let targetIsSymlink = try { FileInfo(homePath).isSymbolicLink() } catch (_: Exception) { false }
+        if (exists(homePath)) {
+            let info = FileInfo(homePath)
+            existingIdentityOk = info.isDirectory() && !info.isSymbolicLink()
         }
-        Directory.create(home, recursive: true)
-        setVariable("METIS_HOME", home)
-        CliConfig.invalidatePathCache()
-        MetisConfigManager.invalidate()
-        CliSettingManager.invalidate()
+        if (!identityOk || targetIsSymlink || !existingIdentityOk || exists(homePath)) {
+            throw Exception("s3j_owned_home_identity_invalid")
+        }
+        let oldHome = getVariable("METIS_HOME")
+        let oldLogFile = Config.logFile
+        var homeCreated = false
         try {
-            body()
-        } finally {
-            setGatewayAgentBridgeReplyRunnerForTest(
-                None<(String, String, String, String, Bool, Option<(String) -> Unit>) -> String>)
-            match (oldHome) {
-                case Some(value) => setVariable("METIS_HOME", value)
-                case None => setVariable("METIS_HOME", "")
-            }
+            Directory.create(homePath, recursive: false)
+            homeCreated = true
+            setVariable("METIS_HOME", home)
             CliConfig.invalidatePathCache()
             MetisConfigManager.invalidate()
             CliSettingManager.invalidate()
+            body()
+        } finally {
+            var cleanupFailure = ""
             try {
-                remove(Path(home), recursive: true)
-            } catch (_: Exception) {
-                ()
+                try {
+                    setGatewayAgentBridgeReplyRunnerForTest(
+                        None<(String, String, String, String, Bool, Option<(String) -> Unit>) -> String>)
+                } catch (_: Exception) {
+                    cleanupFailure = "s3j_hook_restore_failed"
+                }
+                try {
+                    match (oldHome) {
+                        case Some(value) => setVariable("METIS_HOME", value)
+                        case None => removeVariable("METIS_HOME")
+                    }
+                } catch (_: Exception) {
+                    if (cleanupFailure.isEmpty()) { cleanupFailure = "s3j_env_restore_failed" }
+                }
+            } finally {
+                try {
+                    try {
+                        CliConfig.invalidatePathCache()
+                    } catch (_: Exception) {
+                        if (cleanupFailure.isEmpty()) { cleanupFailure = "s3j_cache_restore_failed" }
+                    }
+                    try {
+                        MetisConfigManager.invalidate()
+                    } catch (_: Exception) {
+                        if (cleanupFailure.isEmpty()) { cleanupFailure = "s3j_cache_restore_failed" }
+                    }
+                    try {
+                        CliSettingManager.invalidate()
+                    } catch (_: Exception) {
+                        if (cleanupFailure.isEmpty()) { cleanupFailure = "s3j_cache_restore_failed" }
+                    }
+                } finally {
+                    try {
+                        try {
+                            gatewayLoggingResetForTest()
+                        } catch (_: Exception) {
+                            if (cleanupFailure.isEmpty()) { cleanupFailure = "s3j_logging_reset_failed" }
+                        }
+                    } finally {
+                        try {
+                            try {
+                                Config.logFile = oldLogFile
+                                @Expect(Config.logFile, oldLogFile)
+                                if (Config.logFile != oldLogFile && cleanupFailure.isEmpty()) {
+                                    cleanupFailure = "s3j_config_restore_failed"
+                                }
+                            } catch (_: Exception) {
+                                if (cleanupFailure.isEmpty()) { cleanupFailure = "s3j_config_restore_failed" }
+                            }
+                        } finally {
+                            try {
+                                if (homeCreated && exists(homePath)) { remove(homePath, recursive: true) }
+                            } catch (_: Exception) {
+                                if (cleanupFailure.isEmpty()) { cleanupFailure = "s3j_owned_home_remove_failed" }
+                            }
+                            let remains = homeCreated && (exists(homePath) ||
+                                try { FileInfo(homePath).isSymbolicLink() } catch (_: Exception) { false })
+                            @Expect(remains, false)
+                            if (remains && cleanupFailure.isEmpty()) {
+                                cleanupFailure = "s3j_owned_home_cleanup_failed"
+                            }
+                            if (!cleanupFailure.isEmpty()) { throw Exception(cleanupFailure) }
+                        }
+                    }
+                }
             }
         }
     }
@@ -342,6 +412,41 @@ private func gatewayP3IntegrationSettleManaged(toolset: GatewayManagedSessionsTo
 
 @Test
 public class GatewayShellNonblockingE2eTest {
+    @TestCase
+    public func s3jB1DynamicHomeRestoresStateAndRemovesOwnedDirectory(): Unit {
+        let originalHome = getVariable("METIS_HOME")
+        let originalLogFile = Config.logFile
+        try {
+            setVariable("METIS_HOME", "/tmp")
+            CliConfig.invalidatePathCache()
+            MetisConfigManager.invalidate()
+            CliSettingManager.invalidate()
+            let expectedDotDir = CliConfig.dotDir.toString()
+            let expectedConfigPath = MetisConfigManager.configPath().toString()
+            let expectedPort = CliSettingManager.readGatewaySettings().port
+            let result = withGatewayShellE2eHome<String>({ =>
+                Config.logFile = CliConfig.logsDir.join("s3j-shell-inner.log").toString()
+                "s3j-shell-ok"
+            })
+            @Expect(result, "s3j-shell-ok")
+            @Expect(getVariable("METIS_HOME"), Some("/tmp"))
+            @Expect(CliConfig.dotDir.toString(), expectedDotDir)
+            @Expect(MetisConfigManager.configPath().toString(), expectedConfigPath)
+            @Expect(CliSettingManager.readGatewaySettings().port, expectedPort)
+            @Expect(Config.logFile, originalLogFile)
+        } finally {
+            match (originalHome) {
+                case Some(value) => setVariable("METIS_HOME", value)
+                case None => removeVariable("METIS_HOME")
+            }
+            CliConfig.invalidatePathCache()
+            MetisConfigManager.invalidate()
+            CliSettingManager.invalidate()
+            gatewayLoggingResetForTest()
+            Config.logFile = originalLogFile
+        }
+    }
+
     @TestCase
     public func p4P1BlockedFeishuTurnKeepsTelegramPollAndRealHealthzResponsive(): Unit {
         withGatewayShellE2eHome({ =>

@@ -6,8 +6,8 @@ import metis.gateway.model.{ChannelPolicyConfig, ChannelType, ChatType, InboundM
 import magic.config.Config
 
 import std.collection.{ArrayList, HashMap}
-import std.env.{getVariable, setVariable}
-import std.fs.{Directory, File, Path, exists, remove}
+import std.env.{getVariable, removeVariable, setVariable}
+import std.fs.{Directory, File, FileInfo, Path, canonicalize, exists, remove}
 import std.time.DateTime
 import std.core.Duration
 import std.unittest.testmacro.*
@@ -15,23 +15,82 @@ import stdx.encoding.json.JsonObject
 
 private func withGatewayServiceStartupTestHome<T>(block: () -> T): T {
     let testHome = "/tmp/metis-gateway-service-startup-test-home"
-    try {
-        remove(Path(testHome), recursive: true)
-    } catch (_: Exception) {
-        ()
+    let home = Path(testHome)
+    let parent = home.parent
+    let identityOk = testHome == "/tmp/metis-gateway-service-startup-test-home" &&
+        parent.toString() == "/tmp" && canonicalize(parent).toString() == "/private/tmp" &&
+        home.fileName == "metis-gateway-service-startup-test-home"
+    var existingIdentityOk = true
+    let targetIsSymlink = try { FileInfo(home).isSymbolicLink() } catch (_: Exception) { false }
+    if (exists(home)) {
+        let info = FileInfo(home)
+        existingIdentityOk = info.isDirectory() && !info.isSymbolicLink()
     }
-    Directory.create(testHome, recursive: true)
+    if (!identityOk || targetIsSymlink || !existingIdentityOk || exists(home)) {
+        throw Exception("s3j_owned_home_identity_invalid")
+    }
     let oldHome = getVariable("METIS_HOME")
-    setVariable("METIS_HOME", testHome)
-    CliConfig.invalidatePathCache()
+    let oldLogFile = Config.logFile
+    var homeCreated = false
     try {
+        Directory.create(home, recursive: false)
+        homeCreated = true
+        setVariable("METIS_HOME", testHome)
+        CliConfig.invalidatePathCache()
         return block()
     } finally {
-        match (oldHome) {
-            case Some(value) => setVariable("METIS_HOME", value)
-            case None => setVariable("METIS_HOME", "")
+        var cleanupFailure = ""
+        try {
+            try {
+                match (oldHome) {
+                    case Some(value) => setVariable("METIS_HOME", value)
+                    case None => removeVariable("METIS_HOME")
+                }
+            } catch (_: Exception) {
+                cleanupFailure = "s3j_env_restore_failed"
+            }
+        } finally {
+            try {
+                try {
+                    CliConfig.invalidatePathCache()
+                } catch (_: Exception) {
+                    if (cleanupFailure.isEmpty()) { cleanupFailure = "s3j_cache_restore_failed" }
+                }
+            } finally {
+                try {
+                    try {
+                        gatewayLoggingResetForTest()
+                    } catch (_: Exception) {
+                        if (cleanupFailure.isEmpty()) { cleanupFailure = "s3j_logging_reset_failed" }
+                    }
+                } finally {
+                    try {
+                        try {
+                            Config.logFile = oldLogFile
+                            @Expect(Config.logFile, oldLogFile)
+                            if (Config.logFile != oldLogFile && cleanupFailure.isEmpty()) {
+                                cleanupFailure = "s3j_config_restore_failed"
+                            }
+                        } catch (_: Exception) {
+                            if (cleanupFailure.isEmpty()) { cleanupFailure = "s3j_config_restore_failed" }
+                        }
+                    } finally {
+                        try {
+                            if (homeCreated && exists(home)) { remove(home, recursive: true) }
+                        } catch (_: Exception) {
+                            if (cleanupFailure.isEmpty()) { cleanupFailure = "s3j_owned_home_remove_failed" }
+                        }
+                        let remains = homeCreated && (exists(home) ||
+                            try { FileInfo(home).isSymbolicLink() } catch (_: Exception) { false })
+                        @Expect(remains, false)
+                        if (remains && cleanupFailure.isEmpty()) {
+                            cleanupFailure = "s3j_owned_home_cleanup_failed"
+                        }
+                        if (!cleanupFailure.isEmpty()) { throw Exception(cleanupFailure) }
+                    }
+                }
+            }
         }
-        CliConfig.invalidatePathCache()
     }
 }
 
@@ -201,6 +260,34 @@ private func gatewayServiceStartupRuntimeAccount(channelId: String, accountId: S
 
 @Test
 public class GatewayServiceStartupTest {
+    @TestCase
+    public func s3jU1FixedHomeRestoresStateAndRemovesOwnedDirectory(): Unit {
+        let originalHome = getVariable("METIS_HOME")
+        let originalLogFile = Config.logFile
+        try {
+            setVariable("METIS_HOME", "/tmp")
+            CliConfig.invalidatePathCache()
+            let expectedDotDir = CliConfig.dotDir.toString()
+            let result = withGatewayServiceStartupTestHome<String>({ =>
+                Config.logFile = CliConfig.logsDir.join("s3j-startup-inner.log").toString()
+                "s3j-startup-ok"
+            })
+            @Expect(result, "s3j-startup-ok")
+            @Expect(getVariable("METIS_HOME"), Some("/tmp"))
+            @Expect(CliConfig.dotDir.toString(), expectedDotDir)
+            @Expect(Config.logFile, originalLogFile)
+            @Expect(exists(Path("/tmp/metis-gateway-service-startup-test-home")), false)
+        } finally {
+            match (originalHome) {
+                case Some(value) => setVariable("METIS_HOME", value)
+                case None => removeVariable("METIS_HOME")
+            }
+            CliConfig.invalidatePathCache()
+            gatewayLoggingResetForTest()
+            Config.logFile = originalLogFile
+        }
+    }
+
     @TestCase
     public func startupTimeoutDoesNotPreventPollLoopForHealthyAccount(): Unit {
         withGatewayServiceStartupTestHome<Unit>({ =>

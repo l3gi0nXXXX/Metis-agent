@@ -14,8 +14,8 @@ import magic.jsonable.*
 import magic.model.ModelManager
 
 import std.collection.{ArrayList, HashMap}
-import std.env.{getVariable, setVariable}
-import std.fs.{Directory, File, Path, exists, remove}
+import std.env.{getVariable, removeVariable, setVariable}
+import std.fs.{Directory, File, FileInfo, Path, canonicalize, exists, remove}
 import std.sync.AtomicInt64
 import std.time.DateTime
 import std.unittest.testmacro.*
@@ -711,27 +711,101 @@ private func gatewayTelegramRunTeamMemoryMode(mode: String): Unit {
 private func withGatewayTelegramNativeTestHome<T>(block: () -> T): T {
     synchronized(MetisProcessEnvironmentLock) {
         let testHome = "/tmp/metis-gateway-telegram-native-test-home"
-        try { remove(Path(testHome), recursive: true) } catch (_: Exception) { () }
-        Directory.create(testHome, recursive: true)
+        let home = Path(testHome)
+        let parent = home.parent
+        let identityOk = testHome == "/tmp/metis-gateway-telegram-native-test-home" &&
+            parent.toString() == "/tmp" && canonicalize(parent).toString() == "/private/tmp" &&
+            home.fileName == "metis-gateway-telegram-native-test-home"
+        var existingIdentityOk = true
+        let targetIsSymlink = try { FileInfo(home).isSymbolicLink() } catch (_: Exception) { false }
+        if (exists(home)) {
+            let info = FileInfo(home)
+            existingIdentityOk = info.isDirectory() && !info.isSymbolicLink()
+        }
+        if (!identityOk || targetIsSymlink || !existingIdentityOk || exists(home)) {
+            throw Exception("s3j_owned_home_identity_invalid")
+        }
         let oldHome = getVariable("METIS_HOME")
-        setVariable("METIS_HOME", testHome)
-        CliConfig.invalidatePathCache()
-        MetisConfigManager.invalidate()
-        CliSettingManager.invalidate()
-        MetisConfigManager.writeRoot(gatewayTelegramNativeTestConfigRoot())
-        CliSettingManager.applyPersistedFieldsToCliConfig()
+        let oldLogFile = Config.logFile
+        var homeCreated = false
         try {
-            return block()
-        } finally {
-            setGatewayOpenClawPluginSidecarRunnerForTest(None)
-            match (oldHome) {
-                case Some(value) => setVariable("METIS_HOME", value)
-                case None => setVariable("METIS_HOME", "")
-            }
+            Directory.create(home, recursive: false)
+            homeCreated = true
+            setVariable("METIS_HOME", testHome)
             CliConfig.invalidatePathCache()
-            try { remove(Path(testHome), recursive: true) } catch (_: Exception) { () }
             MetisConfigManager.invalidate()
             CliSettingManager.invalidate()
+            MetisConfigManager.writeRoot(gatewayTelegramNativeTestConfigRoot())
+            CliSettingManager.applyPersistedFieldsToCliConfig()
+            return block()
+        } finally {
+            var cleanupFailure = ""
+            try {
+                try {
+                    setGatewayOpenClawPluginSidecarRunnerForTest(None)
+                } catch (_: Exception) {
+                    cleanupFailure = "s3j_hook_restore_failed"
+                }
+                try {
+                    match (oldHome) {
+                        case Some(value) => setVariable("METIS_HOME", value)
+                        case None => removeVariable("METIS_HOME")
+                    }
+                } catch (_: Exception) {
+                    if (cleanupFailure.isEmpty()) { cleanupFailure = "s3j_env_restore_failed" }
+                }
+            } finally {
+                try {
+                    try {
+                        CliConfig.invalidatePathCache()
+                    } catch (_: Exception) {
+                        if (cleanupFailure.isEmpty()) { cleanupFailure = "s3j_cache_restore_failed" }
+                    }
+                    try {
+                        MetisConfigManager.invalidate()
+                    } catch (_: Exception) {
+                        if (cleanupFailure.isEmpty()) { cleanupFailure = "s3j_cache_restore_failed" }
+                    }
+                    try {
+                        CliSettingManager.invalidate()
+                    } catch (_: Exception) {
+                        if (cleanupFailure.isEmpty()) { cleanupFailure = "s3j_cache_restore_failed" }
+                    }
+                } finally {
+                    try {
+                        try {
+                            gatewayLoggingResetForTest()
+                        } catch (_: Exception) {
+                            if (cleanupFailure.isEmpty()) { cleanupFailure = "s3j_logging_reset_failed" }
+                        }
+                    } finally {
+                        try {
+                            try {
+                                Config.logFile = oldLogFile
+                                @Expect(Config.logFile, oldLogFile)
+                                if (Config.logFile != oldLogFile && cleanupFailure.isEmpty()) {
+                                    cleanupFailure = "s3j_config_restore_failed"
+                                }
+                            } catch (_: Exception) {
+                                if (cleanupFailure.isEmpty()) { cleanupFailure = "s3j_config_restore_failed" }
+                            }
+                        } finally {
+                            try {
+                                if (homeCreated && exists(home)) { remove(home, recursive: true) }
+                            } catch (_: Exception) {
+                                if (cleanupFailure.isEmpty()) { cleanupFailure = "s3j_owned_home_remove_failed" }
+                            }
+                            let remains = homeCreated && (exists(home) ||
+                                try { FileInfo(home).isSymbolicLink() } catch (_: Exception) { false })
+                            @Expect(remains, false)
+                            if (remains && cleanupFailure.isEmpty()) {
+                                cleanupFailure = "s3j_owned_home_cleanup_failed"
+                            }
+                            if (!cleanupFailure.isEmpty()) { throw Exception(cleanupFailure) }
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -1013,6 +1087,42 @@ public class GatewayServiceTelegramSendDiagnosticsTest {
 
 @Test
 public class GatewayServiceTelegramNativeTest {
+    @TestCase
+    public func s3jU1FixedHomeRestoresStateAndRemovesOwnedDirectory(): Unit {
+        let originalHome = getVariable("METIS_HOME")
+        let originalLogFile = Config.logFile
+        try {
+            setVariable("METIS_HOME", "/tmp")
+            CliConfig.invalidatePathCache()
+            MetisConfigManager.invalidate()
+            CliSettingManager.invalidate()
+            let expectedDotDir = CliConfig.dotDir.toString()
+            let expectedConfigPath = MetisConfigManager.configPath().toString()
+            let expectedPort = CliSettingManager.readGatewaySettings().port
+            let result = withGatewayTelegramNativeTestHome<String>({ =>
+                Config.logFile = CliConfig.logsDir.join("s3j-telegram-inner.log").toString()
+                "s3j-telegram-ok"
+            })
+            @Expect(result, "s3j-telegram-ok")
+            @Expect(getVariable("METIS_HOME"), Some("/tmp"))
+            @Expect(CliConfig.dotDir.toString(), expectedDotDir)
+            @Expect(MetisConfigManager.configPath().toString(), expectedConfigPath)
+            @Expect(CliSettingManager.readGatewaySettings().port, expectedPort)
+            @Expect(Config.logFile, originalLogFile)
+            @Expect(exists(Path("/tmp/metis-gateway-telegram-native-test-home")), false)
+        } finally {
+            match (originalHome) {
+                case Some(value) => setVariable("METIS_HOME", value)
+                case None => removeVariable("METIS_HOME")
+            }
+            CliConfig.invalidatePathCache()
+            MetisConfigManager.invalidate()
+            CliSettingManager.invalidate()
+            gatewayLoggingResetForTest()
+            Config.logFile = originalLogFile
+        }
+    }
+
     @TestCase
     public func p4U1PrepareInboundFreezesTelegramBindingWithoutTouchingIt(): Unit {
         withGatewayTelegramNativeTestHome {
