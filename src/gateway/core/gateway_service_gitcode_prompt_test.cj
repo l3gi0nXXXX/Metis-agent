@@ -4,8 +4,8 @@ import metis.core.config.{CliConfig, CliSettingManager, GatewayUserSettings, Met
 import metis.core.model.CodexResponsesException
 import metis.gateway.gitcode_plugin.{GITCODE_REVIEW_CONTRACT_VERSION, GitCodeReviewPromptPlan, gitCodeReviewJsonArrayString}
 import metis.gateway.model.ChannelPolicyConfig
-import metis.gateway.service_plugin.{ServicePluginAcceptedGitCodeEvent, ServicePluginDeliveryTarget}
-import std.collection.HashMap
+import metis.gateway.service_plugin.{ServicePluginAcceptedGitCodeEvent, ServicePluginDeliveryTarget, ServicePluginPendingJob}
+import std.collection.{ArrayList, HashMap}
 import std.env.{getVariable, setVariable}
 import std.fs.{Directory, File, Path, exists, remove}
 import std.time.DateTime
@@ -186,6 +186,124 @@ private func gitCodePromptTestEvent(
 
 @Test
 public class GatewayServiceGitCodePromptTest {
+    @TestCase
+    public func s3DU1PendingAndWebhookPressureMapToStableGeneratedResult(): Unit {
+        gitCodePromptTestWithHome<Unit>("s3d-u1-pressure", { _home: Path =>
+            resetGatewayModelMemoryAdmissionForTest()
+            setGatewayModelMemoryAdmissionSnapshotProviderForTest(Some({=> GatewayRuntimeHeapSnapshot(
+                2 * 1024 * 1024 * 1024,
+                2 * 1024 * 1024 * 1024,
+                0,
+                100,
+                "ok",
+                0,
+                "unsupported"
+            )}))
+            let modelCalls = ArrayList<Int64>()
+            modelCalls.add(0)
+            setGatewayAgentBridgeReplyRunnerForTest(Some({
+                _conversationKey: String,
+                _prompt: String,
+                _channelName: String,
+                _agentId: String,
+                _streamingEnabled: Bool,
+                _streamChunkHook: Option<(String) -> Unit> => modelCalls[0]++; "must-not-run"
+            }))
+            try {
+                let service = gitCodePromptTestService()
+                let event = gitCodePromptTestEvent("issue", issueKind: "bug")
+                let target = ServicePluginDeliveryTarget("telegram", "acct", "peer", replyToMessageId: "msg-1")
+                let job = ServicePluginPendingJob(jobId: "job-201", serviceId: "gitcode-monitor", capabilityId: "gitcode.monitor.scan_once", idempotencyKey: "s3d-u1", deliveryTarget: target)
+                let pending = service.debugGenerateGitCodePendingReplyDraftViaGatewayForTest(GatewayUserSettings(), event, job)
+                let webhook = service.debugGenerateGitCodeWebhookReplyDraftViaGatewayForTest(GatewayUserSettings(), event, target)
+                @Expect(pending.ok, false)
+                @Expect(pending.status, "model_memory_pressure")
+                @Expect(pending.diagnostic, "model_memory_pressure")
+                @Expect(webhook.ok, false)
+                @Expect(webhook.status, "model_memory_pressure")
+                @Expect(webhook.diagnostic, "model_memory_pressure")
+                let truth = gatewayModelMemoryAdmissionSnapshotForTest()
+                @Expect(truth.rejectedServicePlugin, 2)
+                @Expect(truth.rejectedOrdinary, 0)
+                @Expect(truth.active, 0)
+                @Expect(modelCalls[0], 0)
+            } finally {
+                setGatewayAgentBridgeReplyRunnerForTest(None<(String, String, String, String, Bool, Option<(String) -> Unit>) -> String>)
+                resetGatewayModelMemoryAdmissionForTest()
+                setGatewayModelMemoryAdmissionSnapshotProviderForTest(Some({=> GatewayRuntimeHeapSnapshot(
+                    2 * 1024 * 1024 * 1024,
+                    1024 * 1024 * 1024,
+                    1024 * 1024 * 1024,
+                    50,
+                    "ok",
+                    0,
+                    "unsupported"
+                )}))
+            }
+        })
+    }
+
+    @TestCase
+    public func s3DN1GenericAndCodexFailuresKeepExistingDegradedMapping(): Unit {
+        gitCodePromptTestWithHome<Unit>("s3d-n1-generic", { _home: Path =>
+            resetGatewayModelMemoryAdmissionForTest()
+            setGatewayModelMemoryAdmissionSnapshotProviderForTest(Some({=> GatewayRuntimeHeapSnapshot(
+                2 * 1024 * 1024 * 1024,
+                1024 * 1024 * 1024,
+                1024 * 1024 * 1024,
+                50,
+                "ok",
+                0,
+                "unsupported"
+            )}))
+            try {
+                let service = gitCodePromptTestService()
+                let event = gitCodePromptTestEvent("issue", issueKind: "bug")
+                let target = ServicePluginDeliveryTarget("telegram", "acct", "peer", replyToMessageId: "msg-1")
+                let job = ServicePluginPendingJob(jobId: "job-201", serviceId: "gitcode-monitor", capabilityId: "gitcode.monitor.scan_once", idempotencyKey: "s3d-n1", deliveryTarget: target)
+                setGatewayAgentBridgeReplyRunnerForTest(Some({
+                    _conversationKey: String,
+                    _prompt: String,
+                    _channelName: String,
+                    _agentId: String,
+                    _streamingEnabled: Bool,
+                    _streamChunkHook: Option<(String) -> Unit> => throw Exception("model_memory_pressure")
+                }))
+                let genericPending = service.debugGenerateGitCodePendingReplyDraftViaGatewayForTest(GatewayUserSettings(), event, job)
+                let genericWebhook = service.debugGenerateGitCodeWebhookReplyDraftViaGatewayForTest(GatewayUserSettings(), event, target)
+                for (result in [genericPending, genericWebhook]) {
+                    @Expect(result.status, "llm_degraded")
+                    @Expect(result.needsHumanReview, true)
+                    @Expect(result.diagnostic, "Agent Runtime failed: model_memory_pressure")
+                }
+                setGatewayAgentBridgeReplyRunnerForTest(Some({
+                    _conversationKey: String,
+                    _prompt: String,
+                    _channelName: String,
+                    _agentId: String,
+                    _streamingEnabled: Bool,
+                    _streamChunkHook: Option<(String) -> Unit> => throw CodexResponsesException("tool_protocol_unfinalized", "assistant to=functions.search raw-marker")
+                }))
+                let codexPending = service.debugGenerateGitCodePendingReplyDraftViaGatewayForTest(GatewayUserSettings(), event, job)
+                let codexWebhook = service.debugGenerateGitCodeWebhookReplyDraftViaGatewayForTest(GatewayUserSettings(), event, target)
+                for (result in [codexPending, codexWebhook]) {
+                    @Expect(result.status, "tool_protocol_unfinalized")
+                    @Expect(result.needsHumanReview, true)
+                    @Expect(result.diagnostic, "Agent Runtime failed: tool_protocol_unfinalized")
+                    @Expect(result.diagnostic.contains("functions.search"), false)
+                    @Expect(result.diagnostic.contains("raw-marker"), false)
+                }
+                @Expect(gatewayModelMemoryAdmissionSnapshotForTest().acceptedServicePlugin, 4)
+                @Expect(gatewayModelMemoryAdmissionSnapshotForTest().rejectedServicePlugin, 0)
+                @Expect(gatewayModelMemoryAdmissionSnapshotForTest().active, 0)
+            } finally {
+                setGatewayAgentBridgeReplyRunnerForTest(None<(String, String, String, String, Bool, Option<(String) -> Unit>) -> String>)
+                resetGatewayModelMemoryAdmissionForTest()
+                setGatewayModelMemoryAdmissionSnapshotProviderForTest(Some({=> GatewayRuntimeHeapSnapshot(2 * 1024 * 1024 * 1024, 1024 * 1024 * 1024, 1024 * 1024 * 1024, 50, "ok", 0, "unsupported")}))
+            }
+        })
+    }
+
     @TestCase
     public func gatewayLoadsGitCodePromptTemplatesOnceAndKeepsCacheUntilRestart(): Unit {
         gitCodePromptTestWithHome<Unit>("p2-cache", { home: Path =>

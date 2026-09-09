@@ -1541,8 +1541,11 @@ public class GatewayService {
                 request,
                 prompt,
                 deliver: false,
-                timeoutSeconds: 90
+                timeoutSeconds: 90,
+                admissionSource: GatewayModelMemoryAdmissionSource.ServicePlugin
             )
+        } catch (_: GatewayModelMemoryPressureException) {
+            return ServicePluginGeneratedReplyResult(false, status: GATEWAY_MODEL_MEMORY_PRESSURE_ERROR_KIND, diagnostic: GATEWAY_MODEL_MEMORY_PRESSURE_ERROR_KIND, needsHumanReview: true)
         } catch (e: CodexResponsesException) {
             return this.servicePluginGeneratedReplyResultFromCodexFailure(e)
         } catch (e: Exception) {
@@ -1580,8 +1583,11 @@ public class GatewayService {
                 request,
                 prompt,
                 deliver: false,
-                timeoutSeconds: 90
+                timeoutSeconds: 90,
+                admissionSource: GatewayModelMemoryAdmissionSource.ServicePlugin
             )
+        } catch (_: GatewayModelMemoryPressureException) {
+            return ServicePluginGeneratedReplyResult(false, status: GATEWAY_MODEL_MEMORY_PRESSURE_ERROR_KIND, diagnostic: GATEWAY_MODEL_MEMORY_PRESSURE_ERROR_KIND, needsHumanReview: true)
         } catch (e: CodexResponsesException) {
             return this.servicePluginGeneratedReplyResultFromCodexFailure(e)
         } catch (e: Exception) {
@@ -1764,6 +1770,14 @@ public class GatewayService {
         target: ServicePluginDeliveryTarget
     ): ServicePluginGeneratedReplyResult {
         this.servicePluginGenerateGitCodeWebhookReplyDraft(user, event, target)
+    }
+
+    public func debugGenerateGitCodePendingReplyDraftViaGatewayForTest(
+        user: GatewayUserSettings,
+        event: ServicePluginAcceptedGitCodeEvent,
+        job: ServicePluginPendingJob
+    ): ServicePluginGeneratedReplyResult {
+        this.servicePluginGenerateGitCodeReplyDraft(user, job, event)
     }
 
     private func servicePluginRenderGitCodeScanResult(payload: String): String {

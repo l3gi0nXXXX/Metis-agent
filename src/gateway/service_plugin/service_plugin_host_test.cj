@@ -1,5 +1,6 @@
 package metis.gateway.service_plugin
 
+import magic.config.Config
 import metis.gateway.logging.gatewayLoggingResetForTest
 import metis.process.{ManagedStdioOwnerSpec, managedStdioBroker, managedStdioResolveBrokerScriptPath, resetManagedStdioBrokerForTest}
 import std.collection.*
@@ -198,15 +199,91 @@ private class ServicePluginEventLedger {
 
 @Test
 public class ServicePluginHostTest {
+    @TestCase
+    public func s3H1PressureAttemptRetriesWithoutCompletionAndRecoveredAttemptCompletesOnce(): Unit {
+        withIsolatedServicePluginHostTestHome("s3-h1-pressure-retry", { home: Path =>
+            let eventId = "gitcode:Cangjie/community:issue:s3-h1"
+            let deliveryId = "s3-h1-delivery"
+            let tokenA = "s3-h1-attempt-a"
+            let tokenB = "s3-h1-attempt-b"
+            let ackMarker = home.join("acks.marker")
+            let writebackMarker = home.join("writebacks.marker")
+            let oldMarker = getVariable("METIS_STDIO_FIXTURE_MARKER_PATH")
+            let oldWriteback = getVariable("METIS_STDIO_FIXTURE_WRITEBACK_MARKER_PATH")
+            let handlerAttempts = ServicePluginEventLedger()
+            let pressureResults = ServicePluginEventLedger()
+            let healthyResults = ServicePluginEventLedger()
+            let deliveries = ServicePluginEventLedger()
+            setVariable("METIS_STDIO_FIXTURE_MARKER_PATH", ackMarker.toString())
+            setVariable("METIS_STDIO_FIXTURE_WRITEBACK_MARKER_PATH", writebackMarker.toString())
+            try {
+                let responseLine = this.gitCodeWritebackResponseLine(correlationId: "__METIS_CORRELATION__").replace("__METIS_CORRELATION__", "'\"$corr\"'")
+                let script = "printf '%s\\n' '${this.gitCodeInitLine()}'; printf '%s\\n' '${this.gitCodeAcceptedEventLine(eventId: eventId, frameId: "s3-h1-a", deliveryId: deliveryId, attemptToken: tokenA)}'; retried=0; " +
+                    "while IFS= read -r request; do case \"$request\" in *emitCapabilityEvent*) printf '%s\\n' \"$request\" >> \"$METIS_STDIO_FIXTURE_MARKER_PATH\"; if printf '%s\\n' \"$request\" | grep -Eq '\"phase\"[[:space:]]*:[[:space:]]*\"admission\"' && printf '%s\\n' \"$request\" | grep -Eq '\"status\"[[:space:]]*:[[:space:]]*\"retry\"' && printf '%s\\n' \"$request\" | grep -Eq '\"attemptToken\"[[:space:]]*:[[:space:]]*\"${tokenA}\"'; then if [ \"$retried\" = \"0\" ]; then printf '%s\\n' '${this.gitCodeAcceptedEventLine(eventId: eventId, frameId: "s3-h1-b", deliveryId: deliveryId, attemptToken: tokenB)}'; retried=1; fi; fi; if printf '%s\\n' \"$request\" | grep -Eq '\"phase\"[[:space:]]*:[[:space:]]*\"completion\"'; then ${this.gitCodeCompletionConfirmShell(expectedAttempt: tokenB)}; fi;; " +
+                    "*gitcode.writeback.apply_result*) printf '%s\\n' \"$request\" >> \"$METIS_STDIO_FIXTURE_WRITEBACK_MARKER_PATH\"; corr=$(printf '%s\\n' \"$request\" | sed -n 's/.*\\\"correlationId\\\"[[:space:]]*:[[:space:]]*\\\"\\([^\\\"]*\\)\\\".*/\\1/p'); printf '%s\\n' '${responseLine}';; *\\\"method\\\":\\\"stop\\\"*) break;; esac; done"
+                this.registerGitCodeStdioScript(script)
+                setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent =>
+                    let rows = ArrayList<ServicePluginDeliveryTarget>()
+                    rows.add(ServicePluginDeliveryTarget("telegram", "s3-h1", "peer"))
+                    rows
+                }))
+                setServicePluginWebhookGeneratedReplyHandlerForTest(Some({ event: ServicePluginAcceptedGitCodeEvent, _target: ServicePluginDeliveryTarget =>
+                    handlerAttempts.record(event.eventId)
+                    if (handlerAttempts.totalCount() == 1) {
+                        pressureResults.record(event.eventId)
+                        ServicePluginGeneratedReplyResult(false, status: "model_memory_pressure")
+                    } else {
+                        healthyResults.record(event.eventId)
+                        ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: event.eventId)
+                    }
+                }))
+                setServicePluginEventDeliveryForTest(Some({ _target: ServicePluginDeliveryTarget, text: String =>
+                    deliveries.recordMatching(text, [eventId])
+                    ServicePluginEventDeliveryResult(true, "sent")
+                }))
+                @Expect(ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000).ok, true)
+                @Expect(this.waitForAckMarkerCount(ackMarker, "admission", "accepted", 1, attemptToken: tokenA), true)
+                @Expect(this.waitForAckMarkerCount(ackMarker, "admission", "retry", 1, attemptToken: tokenA), true)
+                @Expect(this.ackMarkerCounts(ackMarker, "completion", "completed", attemptToken: tokenA)[0], 0)
+                @Expect(this.waitForAckMarkerCount(ackMarker, "admission", "accepted", 1, attemptToken: tokenB), true)
+                @Expect(this.waitForAckMarkerCount(ackMarker, "completion", "completed", 1, attemptToken: tokenB, timeoutMillis: 5000), true)
+                @Expect(deliveries.awaitTotal(1, 5000), true)
+                @Expect(this.waitForDispatchCounts("gitcode-monitor", 0, 0, timeoutMillis: 3000), true)
+                @Expect(this.ackMarkerCounts(ackMarker, "admission", "accepted", attemptToken: tokenA)[0], 1)
+                @Expect(this.ackMarkerCounts(ackMarker, "admission", "retry", attemptToken: tokenA)[0], 1)
+                @Expect(this.ackMarkerCounts(ackMarker, "admission", "accepted", attemptToken: tokenB)[0], 1)
+                @Expect(this.ackMarkerCounts(ackMarker, "completion", "completed", attemptToken: tokenB)[0], 1)
+                @Expect(this.ackMarkerCounts(ackMarker, "admission", "accepted", attemptToken: tokenA)[1], 0)
+                @Expect(handlerAttempts.totalCount(), 2)
+                @Expect(pressureResults.totalCount(), 1)
+                @Expect(healthyResults.totalCount(), 1)
+                @Expect(deliveries.countFor(eventId), 1)
+                @Expect(this.textFileCount(writebackMarker, eventId), 1)
+                @Expect(servicePluginWebhookReceiptStore().state("gitcode-monitor", deliveryId, eventId), "missing")
+            } finally {
+                setServicePluginWebhookSubscribersProviderForTest(None<(ServicePluginAcceptedGitCodeEvent) -> ArrayList<ServicePluginDeliveryTarget>>)
+                setServicePluginWebhookGeneratedReplyHandlerForTest(None<(ServicePluginAcceptedGitCodeEvent, ServicePluginDeliveryTarget) -> ServicePluginGeneratedReplyResult>)
+                setServicePluginEventDeliveryForTest(None)
+                resetServicePluginGeneratedReplyStateForTest()
+                match (oldMarker) { case Some(value) => setVariable("METIS_STDIO_FIXTURE_MARKER_PATH", value) case None => setVariable("METIS_STDIO_FIXTURE_MARKER_PATH", "") }
+                match (oldWriteback) { case Some(value) => setVariable("METIS_STDIO_FIXTURE_WRITEBACK_MARKER_PATH", value) case None => setVariable("METIS_STDIO_FIXTURE_WRITEBACK_MARKER_PATH", "") }
+            }
+        })
+    }
+
     private func withIsolatedServicePluginHostTestHome<T>(label: String, block: (Path) -> T): T {
         resetServicePluginHostForTest()
         @Expect(resetManagedStdioBrokerForTest(timeoutMs: 2000).ok, true)
         withServicePluginHostTestHome(label, { home: Path =>
+            let oldLogFile = Config.logFile
             try {
                 block(home)
             } finally {
                 resetServicePluginHostForTest()
                 @Expect(resetManagedStdioBrokerForTest(timeoutMs: 2000).ok, true)
+                gatewayLoggingResetForTest()
+                Config.logFile = oldLogFile
+                @Expect(Config.logFile, oldLogFile)
             }
         })
     }

@@ -537,6 +537,10 @@ private func recordGitCodeAcceptedEventForFutureReply(
         servicePluginGeneratedReplyDedupe.finish(key, true)
         throw e
     }
+    if (rawGenerated.status == "model_memory_pressure") {
+        servicePluginGeneratedReplyDedupe.cancel(key)
+        return servicePluginDispatchResult(frame, false, "dispatch_retry", eventId: event.eventId)
+    }
     let generated = normalizeServicePluginGeneratedReplyResult(rawGenerated)
     let writeback = servicePluginApplyGeneratedReplyWriteback(event, generated, dispatchAllowed: dispatchAllowed)
     if (writeback.status == "dispatch_cancelled") {
@@ -642,6 +646,11 @@ public func dispatchGitCodeWebhookAcceptedEvent(
     } catch (e: Exception) {
         servicePluginWebhookDispatchDedupe.finish(key, true)
         throw e
+    }
+    if (rawGenerated.status == "model_memory_pressure") {
+        servicePluginWebhookDispatchDedupe.cancel(key)
+        let abandoned = servicePluginAbandonWebhookReceipt(frame, event, receiptStore, receiptIdentity)
+        return servicePluginDispatchResult(frame, false, "dispatch_retry", diagnostic: abandoned.diagnostic, eventId: event.eventId)
     }
     let generated = normalizeServicePluginGeneratedReplyResult(rawGenerated)
     let writeback = servicePluginApplyGeneratedReplyWriteback(event, generated, dispatchAllowed: dispatchAllowed)

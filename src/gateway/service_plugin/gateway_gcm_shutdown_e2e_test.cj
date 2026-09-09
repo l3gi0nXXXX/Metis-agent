@@ -1,5 +1,6 @@
 package metis.gateway.service_plugin
 
+import magic.config.Config
 import metis.process.{managedStdioBroker, managedStdioResolveBrokerScriptPath, resetManagedStdioBrokerForTest}
 import metis.gateway.logging.gatewayLoggingResetForTest
 import std.collection.{ArrayList, HashSet}
@@ -505,6 +506,7 @@ public class GatewayGcmShutdownE2eTest {
         @Expect(resetManagedStdioBrokerForTest(timeoutMs: 3000).ok, true)
         let ownedHomes = ArrayList<Path>()
         withServicePluginHostTestHome("s5-b1-formal-gcm-32-cycles", { home: Path =>
+            let oldLogFile = Config.logFile
             ownedHomes.add(home)
             let binary = s5GcmBinary()
             let configPath = home.join("gcm-s5-config.json")
@@ -670,6 +672,8 @@ public class GatewayGcmShutdownE2eTest {
                 @Expect(ownerGone, true)
                 @Expect(allSettled, true)
                 gatewayLoggingResetForTest()
+                Config.logFile = oldLogFile
+                @Expect(Config.logFile, oldLogFile)
             }
         })
         let ownedHome = ownedHomes[0]
@@ -683,6 +687,7 @@ public class GatewayGcmShutdownE2eTest {
         @Expect(resetManagedStdioBrokerForTest(timeoutMs: 3000).ok, true)
         let ownedHomes = ArrayList<Path>()
         withServicePluginHostTestHome("s5-b1-formal-gcm-140-burst", { home: Path =>
+            let oldLogFile = Config.logFile
             ownedHomes.add(home)
             let binary = s5GcmBinary()
             let configPath = home.join("gcm-s5-config.json")
@@ -866,6 +871,8 @@ public class GatewayGcmShutdownE2eTest {
                 @Expect(resetManagedStdioBrokerForTest(timeoutMs: 3000).ok, true)
                 @Expect(s5StopOwnedProcess(dependencies), true)
                 gatewayLoggingResetForTest()
+                Config.logFile = oldLogFile
+                @Expect(Config.logFile, oldLogFile)
             }
         })
         let ownedHome = ownedHomes[0]
@@ -878,6 +885,7 @@ public class GatewayGcmShutdownE2eTest {
         resetServicePluginHostForTest()
         @Expect(resetManagedStdioBrokerForTest(timeoutMs: 3000).ok, true)
         withServicePluginHostTestHome("s5-n1-invalid-utf8-owner", { home: Path =>
+            let oldLogFile = Config.logFile
             let gcmRoot = Path(getVariable("METIS_S5_GCM_ROOT").getOrDefault { "" }.trimAscii())
             let binary = s5GcmBinary()
             let wrapper = gcmRoot.join("test").join("fixtures").join("gcm-s5-blocked-wrapper.mjs")
@@ -1064,6 +1072,9 @@ public class GatewayGcmShutdownE2eTest {
                 @Expect(oldPortReleased, true)
                 @Expect(replacementStopped, true)
                 @Expect(dependencySettled, true)
+                gatewayLoggingResetForTest()
+                Config.logFile = oldLogFile
+                @Expect(Config.logFile, oldLogFile)
             }
         })
     }
@@ -1073,6 +1084,7 @@ public class GatewayGcmShutdownE2eTest {
         resetServicePluginHostForTest()
         @Expect(resetManagedStdioBrokerForTest(timeoutMs: 3000).ok, true)
         withServicePluginHostTestHome("s5-n1-layered-terminal-failure", { home: Path =>
+            let oldLogFile = Config.logFile
             let gcmRoot = Path(getVariable("METIS_S5_GCM_ROOT").getOrDefault { "" }.trimAscii())
             let binary = s5GcmBinary()
             let wrapper = gcmRoot.join("test").join("fixtures").join("gcm-s5-blocked-wrapper.mjs")
@@ -1281,6 +1293,9 @@ public class GatewayGcmShutdownE2eTest {
                 @Expect(oldPortReleased, true)
                 @Expect(newStopped, true)
                 @Expect(dependencySettled, true)
+                gatewayLoggingResetForTest()
+                Config.logFile = oldLogFile
+                @Expect(Config.logFile, oldLogFile)
             }
         })
     }

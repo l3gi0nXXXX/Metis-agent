@@ -57,6 +57,151 @@ private class ServicePluginDedupeClaimGate {
 public class ServicePluginEventDispatcherTest {
     private let gitCodeReviewContractVersion = "gcm-metis-gitcode-review-v1"
 
+    @TestCase
+    public func s3DB1PendingAndWebhookPressureCancelDedupeBeforeSideEffects(): Unit {
+        this.resetDispatcherHooks()
+        let pendingCalls = ArrayList<Int64>()
+        pendingCalls.add(0)
+        let writebacks = ArrayList<String>()
+        let messages = ArrayList<String>()
+        this.registerGitCodeWritebackPlugin()
+        setServicePluginGeneratedReplyHandlerForTest(Some({ _job: ServicePluginPendingJob, _event: ServicePluginAcceptedGitCodeEvent =>
+            pendingCalls[0]++
+            if (pendingCalls[0] == 1) {
+                ServicePluginGeneratedReplyResult(false, status: "model_memory_pressure")
+            } else {
+                ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "healthy draft")
+            }
+        }))
+        setServicePluginEventDeliveryForTest(Some({ _target: ServicePluginDeliveryTarget, text: String =>
+            messages.add(text)
+            ServicePluginEventDeliveryResult(true, "sent")
+        }))
+        setServicePluginCapabilityInvokerForTest(Some({ _registration: ServicePluginRegistration, request: CapabilityInvokeRequest =>
+            writebacks.add(request.capabilityId)
+            CapabilityInvokeResult(true, "ok", serviceId: "gitcode-monitor", capabilityId: request.capabilityId, payload: "{\"status\":\"posted\",\"posted\":true}")
+        }))
+        let receiptPath = this.receiptPath("s3d-b1")
+        try {
+            let store = this.storeWithRunningJob(jobId: "s3d-pending")
+            let pending = this.acceptedFrame(jobId: "s3d-pending", eventId: "s3d-pending-event")
+            @Expect(dispatchServicePluginEvent(pending, store: store).status, "dispatch_retry")
+            @Expect((store.findByJobId("s3d-pending") ?? ServicePluginPendingJob()).status.endsWith("_delivered"), false)
+            @Expect(messages.size, 0)
+            @Expect(servicePluginEventDedupeSizesForTest()[0], 0)
+            @Expect(servicePluginEventDedupeSizesForTest()[1], 0)
+            let recovered = dispatchServicePluginEvent(pending, store: store)
+            @Expect(recovered.status, "generated_reply_delivered")
+            @Expect(dispatchServicePluginEvent(pending, store: store).status, "duplicate_event")
+            @Expect(pendingCalls[0], 2)
+            @Expect(writebacks.size, 1)
+            @Expect(messages.size, 1)
+            @Expect(messages[0].contains("healthy draft"), true)
+            @Expect(servicePluginEventDedupeSizesForTest()[1], 1)
+            let completed = ServiceFrame("event", "s3d-pending-completed", "gitcode-monitor", method: "emitCapabilityEvent", capabilityId: "gitcode.monitor.scan_completed", payload: "{\"ok\":true,\"status\":\"completed\",\"jobId\":\"s3d-pending\",\"accepted\":1,\"ignored\":0,\"emitted\":1,\"durationMs\":1,\"stateSaved\":true}")
+            @Expect(dispatchServicePluginEvent(completed, store: store).status, "completed_delivered")
+            @Expect(messages.size, 2)
+            @Expect(messages[1].contains("已生成草稿 1 条"), true)
+            @Expect(messages[1].contains("通知成功 1 条"), true)
+
+            let webhookCalls = ArrayList<Int64>()
+            webhookCalls.add(0)
+            setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent => this.targetRows([this.target()]) }))
+            setServicePluginWebhookGeneratedReplyHandlerForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent, _target: ServicePluginDeliveryTarget =>
+                webhookCalls[0]++
+                ServicePluginGeneratedReplyResult(false, status: "model_memory_pressure")
+            }))
+            let eventId = "gitcode:cangjie/community:pr:s3d-b1"
+            let result = dispatchServicePluginEvent(this.acceptedV2Frame("s3d-delivery", eventId, "s3d-attempt-a"), receiptStore: Some(ServicePluginWebhookReceiptStore(receiptPath.toString())))
+            @Expect(result.status, "dispatch_retry")
+            @Expect(ServicePluginWebhookReceiptStore(receiptPath.toString()).state("gitcode-monitor", "s3d-delivery", eventId), "missing")
+            @Expect(webhookCalls[0], 1)
+            @Expect(messages.size, 2)
+            let dedupe = servicePluginEventDedupeSizesForTest()
+            @Expect(dedupe[2], 0)
+            @Expect(dedupe[3], 0)
+            @Expect(servicePluginWebhookDispatchStatsSnapshot().size, 0)
+        } finally {
+            this.resetDispatcherHooks()
+            remove(receiptPath, recursive: true)
+        }
+    }
+
+    @TestCase
+    public func s3DP1AbandonedWebhookNewAttemptCompletesExactlyOnce(): Unit {
+        this.resetDispatcherHooks()
+        let models = ArrayList<String>()
+        let writebacks = ArrayList<String>()
+        let deliveries = ArrayList<String>()
+        this.registerGitCodeWritebackPlugin()
+        setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent => this.targetRows([this.target()]) }))
+        setServicePluginWebhookGeneratedReplyHandlerForTest(Some({ event: ServicePluginAcceptedGitCodeEvent, _target: ServicePluginDeliveryTarget =>
+            models.add(event.eventId)
+            if (models.size == 1) { ServicePluginGeneratedReplyResult(false, status: "model_memory_pressure") }
+            else { ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "healthy") }
+        }))
+        setServicePluginCapabilityInvokerForTest(Some({ _registration: ServicePluginRegistration, request: CapabilityInvokeRequest =>
+            writebacks.add(request.capabilityId)
+            CapabilityInvokeResult(true, "ok", serviceId: "gitcode-monitor", capabilityId: request.capabilityId, payload: "{\"status\":\"posted\",\"posted\":true}")
+        }))
+        setServicePluginEventDeliveryForTest(Some({ _target: ServicePluginDeliveryTarget, text: String =>
+            deliveries.add(text)
+            ServicePluginEventDeliveryResult(true, "sent")
+        }))
+        let path = this.receiptPath("s3d-p1")
+        try {
+            let eventId = "gitcode:Cangjie/cangjie_tools:issue:s3d-p1"
+            @Expect(dispatchServicePluginEvent(this.acceptedV2Frame("s3d-delivery", eventId, "s3d-attempt-a"), receiptStore: Some(ServicePluginWebhookReceiptStore(path.toString()))).status, "dispatch_retry")
+            @Expect(dispatchServicePluginEvent(this.acceptedV2Frame("s3d-delivery", eventId, "s3d-attempt-b"), receiptStore: Some(ServicePluginWebhookReceiptStore(path.toString()))).status, "generated_reply_delivered")
+            @Expect(dispatchServicePluginEvent(this.acceptedV2Frame("s3d-delivery", eventId, "s3d-attempt-c"), receiptStore: Some(ServicePluginWebhookReceiptStore(path.toString()))).status, "duplicate_event")
+            @Expect(models.size, 2)
+            @Expect(writebacks.size, 1)
+            @Expect(deliveries.size, 1)
+            @Expect(ServicePluginWebhookReceiptStore(path.toString()).state("gitcode-monitor", "s3d-delivery", eventId), "completed_unconfirmed")
+        } finally {
+            this.resetDispatcherHooks()
+            remove(path, recursive: true)
+        }
+    }
+
+    @TestCase
+    public func s3DN2AbandonFailureKeepsInflightAndRepeatedAttemptsRetry(): Unit {
+        this.resetDispatcherHooks()
+        let models = ArrayList<String>()
+        let deliveries = ArrayList<String>()
+        let writebacks = ArrayList<String>()
+        this.registerGitCodeWritebackPlugin()
+        setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent => this.targetRows([this.target()]) }))
+        setServicePluginWebhookGeneratedReplyHandlerForTest(Some({ event: ServicePluginAcceptedGitCodeEvent, _target: ServicePluginDeliveryTarget =>
+            models.add(event.eventId)
+            ServicePluginGeneratedReplyResult(false, status: "model_memory_pressure")
+        }))
+        setServicePluginEventDeliveryForTest(Some({ _target: ServicePluginDeliveryTarget, text: String => deliveries.add(text); ServicePluginEventDeliveryResult(true, "sent") }))
+        setServicePluginCapabilityInvokerForTest(Some({ _registration: ServicePluginRegistration, request: CapabilityInvokeRequest =>
+            writebacks.add(request.capabilityId)
+            CapabilityInvokeResult(true, "ok", serviceId: "gitcode-monitor", capabilityId: request.capabilityId)
+        }))
+        let path = this.receiptPath("s3d-n2")
+        try {
+            let eventId = "gitcode:cangjie/community:pr:s3d-n2"
+            let store = ServicePluginWebhookReceiptStore(path.toString(), persistHook: Some({ phase: String => phase != "remove" }))
+            @Expect(dispatchServicePluginEvent(this.acceptedV2Frame("s3d-delivery", eventId, "s3d-attempt-a"), receiptStore: Some(store)).status, "dispatch_retry")
+            @Expect(store.state("gitcode-monitor", "s3d-delivery", eventId), "in_flight")
+            @Expect(dispatchServicePluginEvent(this.acceptedV2Frame("s3d-delivery", eventId, "s3d-attempt-b"), receiptStore: Some(store)).status, "dispatch_retry")
+            @Expect(store.state("gitcode-monitor", "s3d-delivery", eventId), "in_flight")
+            @Expect(models.size, 1)
+            @Expect(writebacks.size, 0)
+            @Expect(deliveries.size, 0)
+            let dedupe = servicePluginEventDedupeSizesForTest()
+            @Expect(dedupe[2], 0)
+            @Expect(dedupe[3], 0)
+            @Expect(servicePluginWebhookDispatchStatsSnapshot().size, 0)
+        } finally {
+            this.resetDispatcherHooks()
+            remove(path, recursive: true)
+        }
+    }
+
     private func repeatText(text: String, count: Int64): String {
         let out = StringBuilder()
         for (_ in 0..count) {
