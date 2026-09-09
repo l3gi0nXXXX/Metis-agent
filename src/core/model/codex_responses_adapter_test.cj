@@ -192,6 +192,7 @@ private class S4ARawHttpReply {
     let contentType: String
     let dropWithoutResponse: Bool
     let delayMs: Int64
+    let initialReadBytes: Int64
     let onAccepted: Option<() -> Unit>
 
     init(
@@ -200,6 +201,7 @@ private class S4ARawHttpReply {
         contentType!: String = "application/json",
         dropWithoutResponse!: Bool = false,
         delayMs!: Int64 = 0,
+        initialReadBytes!: Int64 = 16384,
         onAccepted!: Option<() -> Unit> = None<() -> Unit>
     ) {
         this.status = status
@@ -207,6 +209,7 @@ private class S4ARawHttpReply {
         this.contentType = contentType
         this.dropWithoutResponse = dropWithoutResponse
         this.delayMs = delayMs
+        this.initialReadBytes = initialReadBytes
         this.onAccepted = onAccepted
     }
 }
@@ -238,7 +241,7 @@ private class S4ARawHttpFixture {
                     notify()
                 }
                 client.readTimeout = Some(Duration.second)
-                let request = Array<Byte>(16384, repeat: 0)
+                let request = Array<Byte>(reply.initialReadBytes, repeat: 0)
                 let _ = client.read(request)
                 if (reply.delayMs > 0) {
                     sleep(Duration.millisecond * reply.delayMs)
@@ -248,6 +251,7 @@ private class S4ARawHttpFixture {
                 }
                 let reason = if (reply.status == 200) { "OK" } else { "Bad Request" }
                 let header = "HTTP/1.1 ${reply.status} ${reason}\r\ncontent-type: ${reply.contentType}\r\ncontent-length: ${reply.body.size}\r\nconnection: close\r\n\r\n"
+                var terminalClosed = false
                 try {
                     client.write(header.toArray())
                     let split = reply.body.size / 2
@@ -256,11 +260,22 @@ private class S4ARawHttpFixture {
                         sleep(Duration.millisecond)
                     }
                     client.write(reply.body[split..])
-                    let eofProbe = Array<Byte>(1, repeat: 0)
-                    if (client.read(eofProbe) <= 0) {
-                        this.closedByClient.fetchAdd(1)
+                    let drain = Array<Byte>(4096, repeat: 0)
+                    var drained: Int64 = 0
+                    while (drained <= 65536) {
+                        let read = client.read(drain)
+                        if (read <= 0) {
+                            terminalClosed = true
+                            break
+                        }
+                        drained += read
                     }
-                } catch (_: Exception) {
+                } catch (_: SocketTimeoutException) {
+                    ()
+                } catch (_: SocketException) {
+                    terminalClosed = true
+                }
+                if (terminalClosed) {
                     this.closedByClient.fetchAdd(1)
                 }
             }
@@ -415,6 +430,20 @@ public class CodexResponsesAdapterTest {
             m2String(response, "output_text")
         })
         @Expect(syncText, "同步中文🙂")
+
+        let fragmentedText = s4AWithRawResponsesLoopback(
+            [S4ARawHttpReply(200, syncBody.toArray(), initialReadBytes: 1)],
+            { baseUrl, fixture =>
+                let response = s4AResponsesLoopbackClient().postResponses(
+                    baseUrl,
+                    "test-token",
+                    s4AResponsesPayload()
+                )
+                @Expect(fixture.accepted.load(), 1)
+                m2String(response, "output_text")
+            }
+        )
+        @Expect(fragmentedText, "同步中文🙂")
 
         let streamOutput = JsonArray()
         streamOutput.add(m2MessageItem("同步中文🙂"))
