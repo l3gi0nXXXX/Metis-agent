@@ -1,5 +1,7 @@
 package metis.gateway.runtime
 
+import magic.config.Config
+
 import metis.core.config.{CliConfig, CliSettingManager, MetisConfigManager, MetisProcessEnvironmentLock}
 import metis.core.{DuckDuckGoSearchHttpRequest, DuckDuckGoSearchHttpResponse, TavilySearchHttpRequest, TavilySearchHttpResponse, setDuckDuckGoSearchHttpRunnerForTest, setTavilySearchHttpRunnerForTest}
 import metis.gateway.tools.{
@@ -19,6 +21,8 @@ import metis.cron.{
     CronWebhookHttpRequest,
     CronWebhookHttpResponse,
     appendCronRunLog,
+    computeJobNextRun,
+    cronErrorBackoffMs,
     cronLoadOrEmpty,
     cronLoadStoreOrEmpty,
     saveCronDeliveryIntentArtifact,
@@ -27,6 +31,7 @@ import metis.cron.{
     cronSave,
     cronSaveStoreAtomic,
     cronStorePath,
+    isTransientCronError,
     readCronRunLogEntriesForJob,
     setCronWebhookHttpRunnerForTest
 }
@@ -34,9 +39,13 @@ import metis.gateway.core.{
     ChannelAdapter,
     GatewayAgentReplyOutcome,
     GatewayRouter,
+    GatewayRuntimeHeapSnapshot,
     GatewayService,
+    gatewayModelMemoryAdmissionSnapshotForTest,
     gatewayLogEventInfo,
     gatewayLogMeta,
+    resetGatewayModelMemoryAdmissionForTest,
+    setGatewayModelMemoryAdmissionSnapshotProviderForTest,
     setGatewayAgentBridgeReplyRunnerForTest
 }
 import metis.gateway.logging.gatewayLoggingResetForTest
@@ -60,6 +69,7 @@ private func withCronRunnerTestHome<T>(block: (Path) -> T): T {
         Directory.create(home, recursive: true)
         let oldHome = getVariable("METIS_HOME")
         let oldTavilyKey = getVariable("TAVILY_API_KEY")
+        let oldMagicLogFile = Config.logFile
         setVariable("METIS_HOME", home)
         setVariable("TAVILY_API_KEY", "")
         CliConfig.invalidatePathCache()
@@ -82,6 +92,8 @@ private func withCronRunnerTestHome<T>(block: (Path) -> T): T {
             setDuckDuckGoSearchHttpRunnerForTest(None<(DuckDuckGoSearchHttpRequest) -> DuckDuckGoSearchHttpResponse>)
             setTavilySearchHttpRunnerForTest(None<(TavilySearchHttpRequest) -> TavilySearchHttpResponse>)
             setCronWebhookHttpRunnerForTest(None<(CronWebhookHttpRequest) -> CronWebhookHttpResponse>)
+            resetGatewayModelMemoryAdmissionForTest()
+            setGatewayModelMemoryAdmissionSnapshotProviderForTest(Some({=> cronRunnerS3HealthySnapshot() }))
             match (oldHome) {
                 case Some(value) => setVariable("METIS_HOME", value)
                 case None => setVariable("METIS_HOME", "")
@@ -93,9 +105,56 @@ private func withCronRunnerTestHome<T>(block: (Path) -> T): T {
             CliConfig.invalidatePathCache()
             MetisConfigManager.invalidate()
             CliSettingManager.invalidate()
+            gatewayLoggingResetForTest()
+            Config.logFile = oldMagicLogFile
+            @Expect(Config.logFile, oldMagicLogFile)
             try { remove(Path(home), recursive: true) } catch (_: Exception) { () }
+            let homeAbsent = !exists(Path(home))
+            @Expect(homeAbsent, true)
+            if (!homeAbsent) {
+                throw Exception("cron_runner_test_home_cleanup_failed")
+            }
         }
     }
+}
+
+private const CRON_RUNNER_S3_MIB: Int64 = 1024 * 1024
+
+private func cronRunnerS3Snapshot(availableBytes: Int64, status!: String = "ok"): GatewayRuntimeHeapSnapshot {
+    let maxHeapBytes = 2 * 1024 * CRON_RUNNER_S3_MIB
+    let allocatedBytes = if (availableBytes >= 0 && availableBytes <= maxHeapBytes) {
+        maxHeapBytes - availableBytes
+    } else {
+        -1
+    }
+    GatewayRuntimeHeapSnapshot(
+        maxHeapBytes,
+        allocatedBytes,
+        availableBytes,
+        50,
+        status,
+        1,
+        "ok"
+    )
+}
+
+private func cronRunnerS3HealthySnapshot(): GatewayRuntimeHeapSnapshot {
+    cronRunnerS3Snapshot(1024 * CRON_RUNNER_S3_MIB)
+}
+
+private func cronRunnerS3InstallSnapshot(snapshot: GatewayRuntimeHeapSnapshot): Unit {
+    resetGatewayModelMemoryAdmissionForTest()
+    setGatewayModelMemoryAdmissionSnapshotProviderForTest(Some({=> snapshot }))
+}
+
+private func cronRunnerS3RunLogRow(storePath: Path, jobId: String): JsonObject {
+    let runs = readCronRunLogEntriesForJob(storePath, jobId, limit: 10)
+    let total = runs.get("total").getOrThrow().asInt().getValue()
+    @Expect(total, 1)
+    if (total != 1) {
+        throw Exception("s3_c_run_log_count_mismatch")
+    }
+    runs.get("entries").getOrThrow().asArray()[0].asObject()
 }
 
 @Test
@@ -2970,6 +3029,286 @@ public class CronRunnerWebhookDeliveryTest {
             let runs = readCronRunLogEntriesForJob(storePath, "webhook-delivery", limit: 10)
             let row = runs.get("entries").getOrThrow().asArray()[0].asObject()
             @Expect(row.get("deliveryStatus").getOrThrow().asString().getValue(), "delivered")
+        })
+    }
+}
+
+@Test
+public class CronRunnerModelMemoryAdmissionTest {
+    @TestCase
+    public func s3CU1MemoryPressureTokenIsTheOnlyNewTransientClassifier(): Unit {
+        @Expect(isTransientCronError("model_memory_pressure"), true)
+        for (value in [
+            "", "MODEL_MEMORY_PRESSURE", " model_memory_pressure", "model_memory_pressure ",
+            "prefix_model_memory_pressure", "model_memory_pressure_suffix", "model memory pressure"
+        ]) {
+            @Expect(isTransientCronError(value), false)
+        }
+        @Expect(isTransientCronError("request timeout"), true)
+        @Expect(isTransientCronError("connection ECONNRESET"), true)
+        @Expect(isTransientCronError("permanent baseline failure"), false)
+    }
+
+    @TestCase
+    public func s3CB1PressureRejectSkipsInternalRetriesAndFinalizesOnce(): Unit {
+        withCronRunnerTestHome({ storePath: Path =>
+            let job = CronJob(
+                "s3-c-b1-pressure",
+                "pressure",
+                CronSchedule.every(60000),
+                state: CronJobState(nextRunAtMs: 1),
+                maxRetries: 3,
+                retryBackoffMs: 5000,
+                failureDestMode: "announce",
+                failureChannel: "feishu",
+                failureTo: "failure-chat",
+                failureAccountId: "tenant-s3c",
+                failureAlertAfter: 1
+            )
+            cronSave(storePath, [job])
+            let modelCalls = AtomicInt64(0)
+            setGatewayAgentBridgeReplyRunnerForTest(Some({
+                _sessionKey, _prompt, _channel, _agentId, _streaming, _chunkHook =>
+                    modelCalls.fetchAdd(1)
+                    "must-not-run"
+            }))
+            cronRunnerS3InstallSnapshot(cronRunnerS3Snapshot(128 * CRON_RUNNER_S3_MIB))
+            let adapter = CronRunnerTestChannelAdapter("feishu")
+            let service = cronRunnerTestGateway(adapter, "feishu", "tenant-s3c")
+
+            let beganAtMs = DateTime.now().toUnixTimeStamp().toMilliseconds()
+            let _ = CronRunner.runJobOnceFromStore(Some(service), storePath, job.id, true)
+            let elapsedMs = DateTime.now().toUnixTimeStamp().toMilliseconds() - beganAtMs
+
+            let admission = gatewayModelMemoryAdmissionSnapshotForTest()
+            @Expect(admission.rejectedCron, 1)
+            @Expect(admission.rejectedOrdinary, 0)
+            @Expect(admission.active, 0)
+            @Expect(elapsedMs >= 0 && elapsedMs < 3000, true)
+            @Expect(modelCalls.load(), 0)
+            @Expect(adapter.sendCount, 0)
+            let after = cronLoadOrEmpty(storePath)[0]
+            @Expect(after.state.lastStatus, "error")
+            @Expect(after.state.lastError, "model_memory_pressure")
+            @Expect(after.state.consecutiveErrors, 1)
+            @Expect(after.state.lastFailureAlertAtMs, 0)
+            let row = cronRunnerS3RunLogRow(storePath, job.id)
+            @Expect(row.get("status").getOrThrow().asString().getValue(), "error")
+            @Expect(row.get("diagnosticCode").getOrThrow().asString().getValue(), "model_memory_pressure")
+            @Expect(row.get("summary").getOrThrow().asString().getValue(), "model_memory_pressure")
+        })
+
+        withCronRunnerTestHome({ storePath: Path =>
+            let job = CronJob(
+                "s3-c-b1-generic",
+                "generic",
+                CronSchedule.every(60000),
+                state: CronJobState(nextRunAtMs: 1),
+                maxRetries: 2,
+                retryBackoffMs: 1,
+                failureDestMode: "announce",
+                failureChannel: "feishu",
+                failureTo: "failure-chat",
+                failureAccountId: "tenant-s3c",
+                failureAlertAfter: 1
+            )
+            cronSave(storePath, [job])
+            cronRunnerS3InstallSnapshot(cronRunnerS3HealthySnapshot())
+            let hookCalls = AtomicInt64(0)
+            debugSetCronRunnerOutcomeForTest(Some({ _job, _request =>
+                hookCalls.fetchAdd(1)
+                throw Exception("model_memory_pressure")
+            }))
+            let adapter = CronRunnerTestChannelAdapter("feishu")
+            let service = cronRunnerTestGateway(adapter, "feishu", "tenant-s3c")
+
+            let _ = CronRunner.runJobOnceFromStore(Some(service), storePath, job.id, true)
+
+            @Expect(hookCalls.load(), 3)
+            let admission = gatewayModelMemoryAdmissionSnapshotForTest()
+            @Expect(admission.acceptedTotal(), 0)
+            @Expect(admission.rejectedTotal(), 0)
+            @Expect(adapter.sendCount, 1)
+            @Expect(adapter.lastText.contains("[cron-failure:s3-c-b1-generic]"), true)
+            @Expect(cronLoadOrEmpty(storePath)[0].state.consecutiveErrors, 1)
+            let _ = cronRunnerS3RunLogRow(storePath, job.id)
+        })
+    }
+
+    @TestCase
+    public func s3CP1RecoveredAtAndRecurringJobsEachSucceedExactlyOnce(): Unit {
+        withCronRunnerTestHome({ storePath: Path =>
+            let job = CronJob(
+                "s3-c-p1-at",
+                "recover at",
+                CronSchedule.at(1),
+                state: CronJobState(nextRunAtMs: 1),
+                deliveryMode: "announce",
+                deliveryChannel: "feishu",
+                deliveryTo: "success-chat",
+                deliveryAccountId: "tenant-s3c"
+            )
+            cronSave(storePath, [job])
+            let modelCalls = AtomicInt64(0)
+            setGatewayAgentBridgeReplyRunnerForTest(Some({
+                _sessionKey, _prompt, _channel, _agentId, _streaming, _chunkHook =>
+                    modelCalls.fetchAdd(1)
+                    "recovered-at"
+            }))
+            let adapter = CronRunnerTestChannelAdapter("feishu")
+            let service = cronRunnerTestGateway(adapter, "feishu", "tenant-s3c")
+            cronRunnerS3InstallSnapshot(cronRunnerS3Snapshot(128 * CRON_RUNNER_S3_MIB))
+            let _ = CronRunner.runJobOnceFromStore(Some(service), storePath, job.id, true)
+            let pressure = cronLoadOrEmpty(storePath)[0]
+            @Expect(pressure.enabled, true)
+            @Expect(pressure.state.consecutiveErrors, 1)
+            @Expect(modelCalls.load(), 0)
+            @Expect(adapter.sendCount, 0)
+
+            cronRunnerS3InstallSnapshot(cronRunnerS3HealthySnapshot())
+            let _ = CronRunner.runJobOnceFromStore(Some(service), storePath, job.id, true)
+            let recovered = cronLoadOrEmpty(storePath)[0]
+            @Expect(recovered.enabled, false)
+            @Expect(recovered.state.lastStatus, "success")
+            @Expect(recovered.state.consecutiveErrors, 0)
+            @Expect(recovered.state.nextRunAtMs, 0)
+            @Expect(modelCalls.load(), 1)
+            @Expect(adapter.sendCount, 1)
+            @Expect(adapter.lastText, "recovered-at")
+            @Expect(readCronRunLogEntriesForJob(storePath, job.id).get("total").getOrThrow().asInt().getValue(), 2)
+        })
+
+        withCronRunnerTestHome({ storePath: Path =>
+            let job = CronJob(
+                "s3-c-p1-recurring",
+                "recover recurring",
+                CronSchedule.every(60000),
+                state: CronJobState(nextRunAtMs: 1),
+                deliveryMode: "announce",
+                deliveryChannel: "feishu",
+                deliveryTo: "success-chat",
+                deliveryAccountId: "tenant-s3c"
+            )
+            cronSave(storePath, [job])
+            let modelCalls = AtomicInt64(0)
+            setGatewayAgentBridgeReplyRunnerForTest(Some({
+                _sessionKey, _prompt, _channel, _agentId, _streaming, _chunkHook =>
+                    modelCalls.fetchAdd(1)
+                    "recovered-recurring"
+            }))
+            let adapter = CronRunnerTestChannelAdapter("feishu")
+            let service = cronRunnerTestGateway(adapter, "feishu", "tenant-s3c")
+            cronRunnerS3InstallSnapshot(cronRunnerS3Snapshot(128 * CRON_RUNNER_S3_MIB))
+            let _ = CronRunner.runJobOnceFromStore(Some(service), storePath, job.id, true)
+            @Expect(modelCalls.load(), 0)
+            @Expect(adapter.sendCount, 0)
+
+            cronRunnerS3InstallSnapshot(cronRunnerS3HealthySnapshot())
+            let _ = CronRunner.runJobOnceFromStore(Some(service), storePath, job.id, true)
+            let recovered = cronLoadOrEmpty(storePath)[0]
+            @Expect(recovered.enabled, true)
+            @Expect(recovered.state.lastStatus, "success")
+            @Expect(recovered.state.consecutiveErrors, 0)
+            @Expect(recovered.state.nextRunAtMs > recovered.state.lastRunAtMs, true)
+            @Expect(modelCalls.load(), 1)
+            @Expect(adapter.sendCount, 1)
+            @Expect(adapter.lastText, "recovered-recurring")
+            @Expect(readCronRunLogEntriesForJob(storePath, job.id).get("total").getOrThrow().asInt().getValue(), 2)
+        })
+    }
+
+    @TestCase
+    public func s3CN1UnavailableSnapshotHasNoModelDeliveryOrAnswer(): Unit {
+        for (mode in ["unavailable", "invalid"]) {
+            withCronRunnerTestHome({ storePath: Path =>
+                let job = CronJob(
+                    "s3-c-n1-${mode}",
+                    "must not run secret prompt",
+                    CronSchedule.every(60000),
+                    state: CronJobState(nextRunAtMs: 1),
+                    failureDestMode: "webhook",
+                    failureTo: "https://example.invalid/failure",
+                    failureAlertAfter: 1
+                )
+                cronSave(storePath, [job])
+                let modelCalls = AtomicInt64(0)
+                let webhookCalls = AtomicInt64(0)
+                setGatewayAgentBridgeReplyRunnerForTest(Some({
+                    _sessionKey, _prompt, _channel, _agentId, _streaming, _chunkHook =>
+                        modelCalls.fetchAdd(1)
+                        "must-not-run"
+                }))
+                setCronWebhookHttpRunnerForTest(Some({ _request =>
+                    webhookCalls.fetchAdd(1)
+                    CronWebhookHttpResponse(true, statusCode: 200)
+                }))
+                if (mode == "unavailable") {
+                    cronRunnerS3InstallSnapshot(cronRunnerS3Snapshot(-1, status: "unavailable"))
+                } else {
+                    cronRunnerS3InstallSnapshot(cronRunnerS3Snapshot(3 * 1024 * CRON_RUNNER_S3_MIB))
+                }
+
+                let _ = CronRunner.runJobOnceFromStore(None<GatewayService>, storePath, job.id, true)
+
+                let admission = gatewayModelMemoryAdmissionSnapshotForTest()
+                @Expect(admission.rejectedCron, 1)
+                @Expect(admission.rejectedOrdinary, 0)
+                @Expect(admission.active, 0)
+                @Expect(admission.recoveryStreak, 0)
+                @Expect(modelCalls.load(), 0)
+                @Expect(webhookCalls.load(), 0)
+                let after = cronLoadOrEmpty(storePath)[0]
+                @Expect(after.state.lastError, "model_memory_pressure")
+                let row = cronRunnerS3RunLogRow(storePath, job.id)
+                let summary = row.get("summary").getOrThrow().asString().getValue()
+                @Expect(summary, "model_memory_pressure")
+                @Expect(summary.contains("secret prompt"), false)
+                @Expect(summary.contains("example.invalid"), false)
+            })
+        }
+    }
+
+    @TestCase
+    public func s3H2AtPressureKeepsEnabledAndUsesDurableBackoff(): Unit {
+        withCronRunnerTestHome({ storePath: Path =>
+            let atJob = CronJob(
+                "s3-c-h2-at",
+                "at pressure",
+                CronSchedule.at(1),
+                state: CronJobState(nextRunAtMs: 1)
+            )
+            cronSave(storePath, [atJob])
+            cronRunnerS3InstallSnapshot(cronRunnerS3Snapshot(128 * CRON_RUNNER_S3_MIB))
+            let _ = CronRunner.runJobOnceFromStore(None<GatewayService>, storePath, atJob.id, true)
+            let row = cronRunnerS3RunLogRow(storePath, atJob.id)
+            let endedAtMs = row.get("ts").getOrThrow().asInt().getValue()
+            let reloaded = cronLoadOrEmpty(storePath)[0]
+            @Expect(reloaded.enabled, true)
+            @Expect(reloaded.state.consecutiveErrors, 1)
+            @Expect(reloaded.state.nextRunAtMs, endedAtMs + cronErrorBackoffMs(1))
+            @Expect(reloaded.state.nextRunAtMs > endedAtMs, true)
+        })
+
+        withCronRunnerTestHome({ storePath: Path =>
+            let recurring = CronJob(
+                "s3-c-h2-recurring",
+                "recurring pressure",
+                CronSchedule.every(60000),
+                state: CronJobState(nextRunAtMs: 1)
+            )
+            cronSave(storePath, [recurring])
+            cronRunnerS3InstallSnapshot(cronRunnerS3Snapshot(128 * CRON_RUNNER_S3_MIB))
+            let _ = CronRunner.runJobOnceFromStore(None<GatewayService>, storePath, recurring.id, true)
+            let row = cronRunnerS3RunLogRow(storePath, recurring.id)
+            let endedAtMs = row.get("ts").getOrThrow().asInt().getValue()
+            let reloaded = cronLoadOrEmpty(storePath)[0]
+            let natural = computeJobNextRun(reloaded, endedAtMs).getOrThrow()
+            @Expect(
+                reloaded.state.nextRunAtMs,
+                max(natural, endedAtMs + cronErrorBackoffMs(1))
+            )
+            @Expect(reloaded.enabled, true)
+            @Expect(reloaded.state.consecutiveErrors, 1)
         })
     }
 }

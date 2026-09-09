@@ -7,7 +7,9 @@ import metis.gateway.core.{
     AgentBridge,
     GatewayAgentReplyOutcome,
     GatewayCronSessionReaperState,
+    GatewayModelMemoryPressureException,
     GatewayService,
+    GATEWAY_MODEL_MEMORY_PRESSURE_ERROR_KIND,
     gatewayBridgeForSessionRequest,
     gatewayLogEventError,
     gatewayLogEventInfo,
@@ -1245,6 +1247,7 @@ public class CronRunner {
         var diagnosticMessage = ""
         var agentOutcomeStatus = ""
         var agentExplicitSilent = false
+        var modelMemoryPressure = false
         var attempt: Int64 = 0
         let maxAttempts = max(1, j.maxRetries + 1)
         let control = match (executionControl) {
@@ -1381,6 +1384,25 @@ public class CronRunner {
                         status = "success"
                         errMsg = ""
                         break
+                    } catch (_: GatewayModelMemoryPressureException) {
+                        status = "error"
+                        errMsg = GATEWAY_MODEL_MEMORY_PRESSURE_ERROR_KIND
+                        diagnosticCode = GATEWAY_MODEL_MEMORY_PRESSURE_ERROR_KIND
+                        diagnosticMessage = "cron model admission rejected"
+                        answer = ""
+                        modelMemoryPressure = true
+                        gatewayLogEventWarn(
+                            "gateway/cron",
+                            "cron.failed",
+                            "cron model admission rejected",
+                            meta: gatewayLogMeta()
+                                .string("jobId", j.id)
+                                .int("attempt", attempt + 1)
+                                .int("maxAttempts", maxAttempts)
+                                .string("errorKind", GATEWAY_MODEL_MEMORY_PRESSURE_ERROR_KIND)
+                                .object()
+                        )
+                        break
                     } catch (e: Exception) {
                         status = "error"
                         errMsg = e.message
@@ -1438,7 +1460,7 @@ public class CronRunner {
                 this.finalizeSuccess(j, startedAtMs, afterRun)
             } else {
                 this.finalizeError(j, startedAtMs, afterRun, errMsg)
-                if (!deferSideEffects) { match (resolveCronFailurePlan(j, dplan)) {
+                if (!deferSideEffects && !modelMemoryPressure) { match (resolveCronFailurePlan(j, dplan)) {
                     case Some(fplan) =>
                         if (this.shouldSendFailureAlert(j, fplan, afterRun)) {
                             if (this.sendFailureAlert(j, fplan, errMsg, startedAtMs)) {
@@ -2005,7 +2027,15 @@ public class CronRunner {
                 )
             }
         }
-        if (firstSideEffectSettlement && artifact.status != "success") {
+        let artifactIsModelMemoryPressure =
+            artifact.error == GATEWAY_MODEL_MEMORY_PRESSURE_ERROR_KIND &&
+            artifact.diagnosticCode == GATEWAY_MODEL_MEMORY_PRESSURE_ERROR_KIND &&
+            artifact.diagnosticMessage == "cron model admission rejected"
+        if (
+            firstSideEffectSettlement &&
+            artifact.status != "success" &&
+            !artifactIsModelMemoryPressure
+        ) {
             match (resolveCronFailurePlan(result.job, dplan)) {
                 case Some(fplan) =>
                     let alertAtMs = epochMs()

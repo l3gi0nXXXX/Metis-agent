@@ -4,6 +4,7 @@ import metis.gateway.core.{
     AgentBridge,
     GatewayAgentReplyOutcome,
     GatewayExecutionControl,
+    GatewayModelMemoryAdmissionSource,
     gatewayExecuteSessionRequestTurn
 }
 import metis.gateway.session.{GatewaySessionRequest, GatewayTurnContext}
@@ -35,7 +36,8 @@ public func cronBridgeReply(
         timeoutSeconds: options.timeoutSeconds,
         bestEffortDeliver: options.bestEffortDeliver,
         turnContextOverride: turnContextOverride,
-        executionControl: Some<GatewayExecutionControl>(executionControl)
+        executionControl: Some<GatewayExecutionControl>(executionControl),
+        admissionSource: GatewayModelMemoryAdmissionSource.Cron
     ).execution
     executionControl.throwIfCancelled()
     GatewayAgentReplyOutcome(

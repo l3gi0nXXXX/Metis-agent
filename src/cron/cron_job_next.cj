@@ -12,6 +12,9 @@ public func cronErrorBackoffMs(consecutiveErrors: Int64): Int64 {
 
 /** 与参考实现的 `isTransientCronError` 子集对齐（用于一次性 `at` 任务重试）。 */
 public func isTransientCronError(message: String): Bool {
+    if (message == "model_memory_pressure") {
+        return true
+    }
     let m = message.toAsciiLower()
     if (m.isEmpty()) {
         return false
