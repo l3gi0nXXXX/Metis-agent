@@ -215,7 +215,10 @@ public func gatewayCollectHistoricalRecoveryEvidence(deadline: MonoTime): Gatewa
     if (host.terminal && host.conclusive) {
         let port = gatewayServePortReleasedUntil(gatewayConfiguredServePort(), deadline)
         rawPortStatus = port.portStatus
-        if (!port.ok) { return fail(port.portStatus, parentStatus, rawPortStatus) }
+        if (!port.ok) {
+            return GatewayHistoricalRecoveryEvidence(parsed, port.portStatus, host: Some(host), parentStatus: parentStatus,
+                rawPortStatus: rawPortStatus, brokerBasis: brokerBasis, durationMs: (MonoTime.now() - started).toMilliseconds())
+        }
     }
     // Keep the established wrapper status for absent evidence, with the precise reason retained in host.status.
     GatewayHistoricalRecoveryEvidence(parsed,
@@ -267,7 +270,8 @@ public func gatewayArchiveHistoricalServeCompletion(evidence: GatewayHistoricalR
     } catch (_: Exception) { GatewayServeCompletionReconcileResult(false, "archive_write_failed") }
 }
 
-public func gatewayCommitHistoricalRecovery(evidence: GatewayHistoricalRecoveryEvidence, deadline: MonoTime): GatewayServeCompletionReconcileResult {
+public func gatewayCommitHistoricalRecovery(evidence: GatewayHistoricalRecoveryEvidence, deadline: MonoTime,
+    afterArchive!: () -> Unit = { => }): GatewayServeCompletionReconcileResult {
     synchronized(gatewayRecoveryCommitMutex) {
         if (!gatewayOwnsCurrentServeLock()) { return GatewayServeCompletionReconcileResult(false, "lock_not_owned") }
         let current = gatewayCollectHistoricalRecoveryEvidence(deadline)
@@ -282,9 +286,11 @@ public func gatewayCommitHistoricalRecovery(evidence: GatewayHistoricalRecoveryE
         }
         let archived = gatewayArchiveHistoricalServeCompletion(current)
         if (!archived.ok) { return archived }
+        try { afterArchive() } catch (_: Exception) { return GatewayServeCompletionReconcileResult(false, "recovery_revalidation_failed") }
         // Archive first, then reobserve. A concurrent replacement is never removed using a preview result.
         let finalEvidence = gatewayCollectHistoricalRecoveryEvidence(deadline)
         if (!gatewayOwnsCurrentServeLock()) { return GatewayServeCompletionReconcileResult(false, "lock_not_owned") }
+        if (!finalEvidence.parsed.ok) { return gatewayEvaluateHistoricalRecoveryEvidence(finalEvidence) }
         if (finalEvidence.parsed.original != current.parsed.original) { return GatewayServeCompletionReconcileResult(false, "identity_changed") }
         let finalChecked = gatewayEvaluateHistoricalRecoveryEvidence(finalEvidence)
         if (!finalChecked.ok) { return finalChecked }

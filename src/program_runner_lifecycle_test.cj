@@ -1,14 +1,16 @@
 package metis
 
 import metis.core.config.{CliConfig, CliSettingManager, MetisConfigManager, MetisProcessEnvironmentLock}
-import metis.process.{ManagedStdioOperationResult, managedStdioBroker, resetManagedStdioBrokerForTest, shutdownManagedStdioBroker}
+import metis.process.{ManagedStdioBrokerClient, ManagedStdioOperationResult, managedStdioBroker, resetManagedStdioBrokerForTest, shutdownManagedStdioBroker}
+import std.collection.ArrayList
+import std.core.Duration
 import std.convert.Parsable
 import std.env.{getVariable, setVariable}
 import std.fs.{Directory, File, Path, exists, remove}
 import std.net.{IPSocketAddress, TcpServerSocket}
 import std.process.executeWithOutput
 import std.sync.AtomicInt64
-import std.time.DateTime
+import std.time.{DateTime, MonoTime}
 import std.unittest.testmacro.*
 import stdx.encoding.json.JsonValue
 
@@ -94,7 +96,7 @@ public class CliProgramLifecycleTest {
                         let stderr = try { String.fromUtf8(result[2]) } catch (_: Exception) { "invalid_response_encoding" }
                         @Expect(stderr.contains("protocol writer failed"), false)
                         @Expect(stderr == "invalid_response_encoding", false)
-                        @Expect(result[0] == 0 || command == "restart", true)
+                        @Expect(result[0], if (command == "restart") { 1 } else { 0 })
                         if (exists(diag)) {
                             for (entry in Directory.readFrom(diag)) {
                                 if (!entry.name.endsWith(".json")) { continue }
@@ -125,4 +127,74 @@ public class CliProgramLifecycleTest {
             }
         }
     }
+    @TestCase
+    public func hrS3ActualWriterFailurePreservesPrimaryOutcome(): Unit {
+        for (mode in ["success", "failed", "exception"]) {
+            let broker = ManagedStdioBrokerClient(brokerTestMode: true)
+            let results = ArrayList<ManagedStdioOperationResult>()
+            try {
+                let ready = broker.ensureBrokerRunning(timeoutMs: 2000)
+                @Expect(ready.ok, true)
+                @Expect(broker.debugDropBrokerWriterForCloseTest(), true)
+                var threw = false
+                var code: Int64 = -1
+                try {
+                    code = cliRunWithBrokerCleanup({ =>
+                        if (mode == "exception") { throw Exception("synthetic-primary") }
+                        if (mode == "failed") { 7 } else { 0 }
+                    }, { =>
+                        let result = broker.close(timeoutMs: 2000)
+                        results.add(result)
+                        result
+                    })
+                } catch (error: Exception) { threw = error.message == "synthetic-primary" }
+                @Expect(threw, mode == "exception")
+                if (mode != "exception") { @Expect(code, if (mode == "failed") { 7 } else { 1 }) }
+                @Expect(results.size, 1)
+                @Expect(results[0].ok, false)
+                @Expect(results[0].status, "broker_close_write_failed")
+                @Expect(results[0].externalTerminal, false)
+                let deadline = MonoTime.now() + Duration.second * 3
+                while (MonoTime.now() < deadline && (broker.snapshot().readerCount != 0 || broker.snapshot().dispatcherCount != 0)) {
+                    sleep(Duration.millisecond)
+                }
+                @Expect(broker.snapshot().generation, ready.generation)
+                @Expect(broker.snapshot().running, false)
+                @Expect(broker.snapshot().ownerCount, 0)
+                @Expect(broker.snapshot().readerCount, 0)
+                @Expect(broker.snapshot().dispatcherCount, 0)
+            } finally {
+                broker.debugKillBrokerForTest()
+                let _ = broker.close(timeoutMs: 3000)
+            }
+        }
+    }
+
+    @TestCase
+    public func hrS3RealCliMainFastAndUsagePathsDoNotCreateBroker(): Unit {
+        synchronized(MetisProcessEnvironmentLock) {
+            let previous = getVariable("METIS_HOME")
+            let home = Path("/tmp/metis-hr-cli-entry-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
+            Directory.create(home, recursive: true)
+            setVariable("METIS_HOME", home.toString())
+            CliConfig.invalidatePathCache()
+            MetisConfigManager.invalidate()
+            CliSettingManager.invalidate()
+            let _ = resetManagedStdioBrokerForTest(timeoutMs: 3000)
+            try {
+                @Expect(cliMain(["--help"]), 0)
+                @Expect(shutdownManagedStdioBroker().generation, 0)
+                @Expect(cliMain(["gateway", "synthetic-invalid-subcommand"]), 1)
+                @Expect(shutdownManagedStdioBroker().generation, 0)
+            } finally {
+                let _ = resetManagedStdioBrokerForTest(timeoutMs: 3000)
+                setVariable("METIS_HOME", previous.getOrDefault({ => "" }))
+                CliConfig.invalidatePathCache()
+                MetisConfigManager.invalidate()
+                CliSettingManager.invalidate()
+                remove(home, recursive: true)
+            }
+        }
+    }
+
 }
