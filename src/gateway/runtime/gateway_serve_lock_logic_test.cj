@@ -2862,8 +2862,17 @@ public class GatewayServeLockLogicTest {
 
     @TestCase
     public func s1N1ListenerDiscoveryFailureIsStableAndRedacted(): Unit {
-        withGatewayHeartbeatProbeEnvironment("s1-n1", {_root, bin =>
-            gatewayHeartbeatProbeExecutable(bin.join("lsof"), "printf 'private-detail' >&2\nexit 2")
+        withGatewayHeartbeatProbeEnvironment("s1-n1", {root, bin =>
+            if (InfoUtils.os == "macos") {
+                let source = root.join("lsof.cj")
+                File.writeTo(source, "main(): Int64 {\n    eprintln(\"private-detail\")\n    2\n}\n".toArray())
+                let compiled = executeWithOutput("cjc", [source.toString(), "-o", bin.join("lsof").toString()],
+                    workingDirectory: Some(root))
+                @Expect(compiled[0], 0)
+                if (compiled[0] != 0) { throw Exception("listener_fixture_compile_failed") }
+            } else {
+                gatewayHeartbeatProbeExecutable(bin.join("lsof"), "printf 'private-detail' >&2\nexit 2")
+            }
             let result = gatewayFindVerifiedListenerPidsOnPortDetailed(port: 49104, timeoutMs: 800)
             @Expect(result.conclusive, false)
             @Expect(result.pids.size, 0)
