@@ -232,12 +232,18 @@ public class ManagedStdioOperationResult {
     public let pid: Int64
     public let pgid: Int64
 
-    public init(ok: Bool, status: String, generation!: Int64 = 0, pid!: Int64 = 0, pgid!: Int64 = 0) {
+    public let externalTerminal: Bool
+    public let terminalBasis: String
+
+    public init(ok: Bool, status: String, generation!: Int64 = 0, pid!: Int64 = 0, pgid!: Int64 = 0,
+        externalTerminal!: Bool = false, terminalBasis!: String = "unknown") {
         this.ok = ok
         this.status = status
         this.generation = generation
         this.pid = pid
         this.pgid = pgid
+        this.externalTerminal = externalTerminal
+        this.terminalBasis = terminalBasis
     }
 }
 
@@ -426,6 +432,8 @@ public class ManagedStdioBrokerClient {
     private var brokerExitObservedGeneration: Int64 = 0
     private var brokerExitReason: String = ""
     private var closeFailureStatus: String = ""
+    private var closeExternalTerminal: Bool = false
+    private var closeTerminalBasis: String = "unknown"
     private var holdCloseReaderSettleForTest: Bool = false
     private var closeReaderSettleIsHeldForTest: Bool = false
 
@@ -553,6 +561,8 @@ public class ManagedStdioBrokerClient {
                 this.brokerExitObservedGeneration = 0
                 this.brokerExitReason = ""
                 this.closeFailureStatus = ""
+                this.closeExternalTerminal = false
+                this.closeTerminalBasis = "unknown"
                 this.helloReceived = false
                 this.brokerPid = 0
                 this.status = "starting"
@@ -1567,10 +1577,13 @@ public class ManagedStdioBrokerClient {
         }
         if (!claim[0].isEmpty()) {
             return ManagedStdioOperationResult(
-                claim[0] == "already_stopped", claim[0], generation: claim[1])
+                claim[0] == "already_stopped", claim[0], generation: claim[1],
+                externalTerminal: claim[0] == "already_stopped" || synchronized(this.lock) { this.closeExternalTerminal },
+                terminalBasis: if (claim[0] == "already_stopped") { "not_applicable" } else { synchronized(this.lock) { this.closeTerminalBasis } })
         }
         let closeGeneration = claim[1]
         let proc = claim[2]
+        var closeAcknowledged = false
         var closeStatus = "stopped"
         let frame = JsonObject()
         frame.put("type", JsonString("broker.close"))
@@ -1587,6 +1600,7 @@ public class ManagedStdioBrokerClient {
                 }
                 this.brokerClosedGeneration == closeGeneration
             }
+            closeAcknowledged = acknowledged
             if (!acknowledged) {
                 closeStatus = synchronized(this.lock) {
                     if (this.brokerExitObservedGeneration == closeGeneration) {
@@ -1660,6 +1674,12 @@ public class ManagedStdioBrokerClient {
                 "broker_close_eof_before_ack"
             }
         }
+        let externalTerminal = closeWritten && closeAcknowledged && exitObserved
+        let terminalBasis = if (externalTerminal) { "closed_ack_exit_observed" } else { "unknown" }
+        synchronized(this.lock) {
+            this.closeExternalTerminal = externalTerminal
+            this.closeTerminalBasis = terminalBasis
+        }
         if (readerJoined && dispatcherJoined) {
             synchronized(this.lock) {
                 this.process = None<SubProcess>
@@ -1688,7 +1708,8 @@ public class ManagedStdioBrokerClient {
             }
         }
         ManagedStdioOperationResult(
-            closeStatus == "stopped", closeStatus, generation: closeGeneration)
+            closeStatus == "stopped", closeStatus, generation: closeGeneration,
+            externalTerminal: externalTerminal, terminalBasis: terminalBasis)
     }
 
     public func debugDropBrokerWriterForCloseTest(): Bool {
@@ -1804,7 +1825,7 @@ public func shutdownManagedStdioBroker(timeoutMs!: Int64 = 2000): ManagedStdioOp
     let client = synchronized(managedStdioSingletonLock) { managedStdioSingleton }
     match (client) {
         case Some(value) => value.close(timeoutMs: timeoutMs)
-        case None => ManagedStdioOperationResult(true, "already_stopped")
+        case None => ManagedStdioOperationResult(true, "already_stopped", externalTerminal: true, terminalBasis: "not_applicable")
     }
 }
 

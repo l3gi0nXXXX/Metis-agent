@@ -267,7 +267,8 @@ private func managedStdioWriteCloseFixture(path: Path, mode: String, markerPath!
         "if(at<0)break;const line=pending.slice(0,at);pending=pending.slice(at+1);let frame;" +
         "try{frame=JSON.parse(line);}catch{continue;}if(frame.type!=='broker.close')continue;" +
         "if(markerPath)appendFileSync(markerPath,'1');" +
-        "if(mode==='eof'){process.exit(0);}else if(mode==='nonzero'){" +
+        "if(mode==='ackhang'){process.stdout.write(JSON.stringify({type:'broker.closed',generation,ownerCount:0})+'\\n');}" +
+        "else if(mode==='eof'){process.exit(0);}else if(mode==='nonzero'){" +
         "process.stdout.write(JSON.stringify({type:'broker.closed',generation,ownerCount:0})+'\\n',()=>process.exit(70));" +
         "}else if(mode==='invalid'){process.stdout.write(JSON.stringify({type:'broker.closed',generation,ownerCount:0})+'\\n'," +
         "()=>process.stdout.write(Buffer.from([0xc3,0x28]),()=>process.exit(0)));}}});\n" +
@@ -277,6 +278,50 @@ private func managedStdioWriteCloseFixture(path: Path, mode: String, markerPath!
 
 @Test
 public class ManagedStdioBrokerTest {
+    @TestCase
+    public func hrS0B1NonzeroExitRequiresCloseAckAndObservedExit(): Unit {
+        this.hrS1U1CloseSeparatesOperationFailureFromExternalTerminal()
+    }
+
+    @TestCase
+    public func hrS1U1CloseSeparatesOperationFailureFromExternalTerminal(): Unit {
+        for (mode in ["nonzero", "eof", "timeout", "ackhang"]) {
+            let script = Path("/tmp/metis-hr-close-${mode}-${DateTime.now().toUnixTimeStamp().toNanoseconds()}.mjs")
+            managedStdioWriteCloseFixture(script, mode)
+            let client = ManagedStdioBrokerClient(brokerScriptPath: script.toString())
+            try {
+                let started = client.ensureBrokerRunning(timeoutMs: 2000)
+                @Expect(started.ok, true)
+                let result = client.close(timeoutMs: if (mode == "nonzero" || mode == "eof") { 2000 } else { 100 })
+                @Expect(result.ok, false)
+                @Expect(result.externalTerminal, mode == "nonzero")
+                @Expect(result.terminalBasis, if (mode == "nonzero") { "closed_ack_exit_observed" } else { "unknown" })
+                if (mode == "nonzero") { @Expect(result.status, "broker_close_exit_nonzero") }
+                @Expect(managedStdioBrokerFullySettled(client, 3000), true)
+                let cached = client.close(timeoutMs: 100)
+                @Expect(cached.status, result.status)
+                @Expect(cached.externalTerminal, result.externalTerminal)
+                @Expect(cached.terminalBasis, result.terminalBasis)
+                @Expect(client.snapshot().generation, started.generation)
+                @Expect(client.snapshot().running, false)
+                @Expect(client.snapshot().ownerCount, 0)
+            } finally {
+                let _ = client.close(timeoutMs: 3000)
+                client.debugKillBrokerForTest()
+                try { remove(script) } catch (_: Exception) { () }
+            }
+        }
+        let normal = ManagedStdioBrokerClient()
+        @Expect(normal.ensureBrokerRunning(timeoutMs: 2000).ok, true)
+        let stopped = normal.close(timeoutMs: 3000)
+        @Expect(stopped.ok, true)
+        @Expect(stopped.externalTerminal, true)
+        @Expect(stopped.terminalBasis, "closed_ack_exit_observed")
+        let second = normal.close(timeoutMs: 100)
+        @Expect(second.status, "already_stopped")
+        @Expect(second.externalTerminal, true)
+    }
+
     @TestCase
     public func hbBrB1CloseFailuresRemainFailClosedAfterCleanup(): Unit {
         let suffix = DateTime.now().toUnixTimeStamp().toNanoseconds()

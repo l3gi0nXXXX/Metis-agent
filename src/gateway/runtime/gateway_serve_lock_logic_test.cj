@@ -1616,6 +1616,83 @@ private func gatewayShutdownPhaseNegativeProof(root: Path, identity: GatewayServ
 @Test
 public class GatewayServeLockLogicTest {
     @TestCase
+    public func hrS0U1HistoricalNonterminalSnapshotBlocksDespiteStoppedResources(): Unit {
+        hrRuntimeHome({ home, identity =>
+            let original = hrRuntimeWriteMarker(identity)
+            let _ = hrRuntimeWriteLease(home, identity)
+            let result = gatewayHistoricalServeCompletionRecoveryStatus()
+            @Expect(result.status, "recoverable")
+            @Expect(String.fromUtf8(File.readFrom(home.join("gateway-serve.stop-complete"))), original)
+        })
+    }
+
+    @TestCase
+    public func hrS0P1ExistingTerminalSnapshotRecoveryRemainsValid(): Unit {
+        this.s5U1StaleCleanupMarkerWithTerminalResourcesCanBeReconciled()
+    }
+
+    @TestCase
+    public func hrS0N1LiveAndUncertainResourcesRemainBlocked(): Unit {
+        this.s5N1CleanupMarkerReconciliationFailsClosed()
+        hrRuntimeHome({ home, identity =>
+            let _ = hrRuntimeWriteMarker(identity)
+            let _ = hrRuntimeWriteLease(home, identity, state: "running")
+            @Expect(gatewayHistoricalServeCompletionRecoveryStatus().ok, false)
+        })
+    }
+
+    @TestCase
+    public func hrS1U3CompletionPersistsBrokerTerminalEvidence(): Unit {
+        hrRuntimeHome({ _, identity =>
+            for (terminal in [true, false]) {
+                let text = hrRuntimeWriteMarker(identity, legacy: false, terminal: terminal)
+                @Expect(gatewayServePayloadField(text, "status"), "cleanup_pending")
+                @Expect(gatewayServePayloadField(text, "brokerStatus"), "broker_close_exit_nonzero")
+                @Expect(gatewayServePayloadField(text, "recoveryEvidenceVersion"), "1")
+                @Expect(gatewayServePayloadField(text, "brokerExternalTerminal"), if (terminal) { "1" } else { "0" })
+                @Expect(gatewayServePayloadField(text, "brokerTerminalBasis"), if (terminal) { "closed_ack_exit_observed" } else { "unknown" })
+            }
+        })
+    }
+
+    @TestCase
+    public func hrS3P1StopPreviewRestartAndDirectServeShareRecoveryGate(): Unit {
+        hrRuntimeHome({ home, identity =>
+            let original = hrRuntimeWriteMarker(identity)
+            let _ = hrRuntimeWriteLease(home, identity)
+            let output = ArrayList<String>()
+            setGatewayStopOutputForTest(Some({ line => output.add(line) }))
+            @Expect(gatewayExecuteStopServe(), 0)
+            @Expect(String.fromUtf8(File.readFrom(home.join("gateway-serve.stop-complete"))), original)
+            @Expect(gatewayExecuteRestartServe(launchServe: { => gatewayAcquireServeLockForRunningProcess() }), 0)
+            @Expect(gatewayPeekServeLockPid().getOrThrow() != identity.pid, true)
+            @Expect(exists(home.join("gateway-serve.stop-complete")), false)
+            gatewayReleaseServeLockQuiet()
+            let _ = hrRuntimeWriteMarker(identity)
+            @Expect(gatewayAcquireServeLockForRunningProcess(), true)
+            @Expect(exists(home.join("gateway-serve.stop-complete")), false)
+        })
+    }
+
+    @TestCase
+    public func hrS3N1LaunchRechecksChangedPreview(): Unit {
+        hrRuntimeHome({ home, identity =>
+            let _ = hrRuntimeWriteMarker(identity)
+            let lease = hrRuntimeWriteLease(home, identity)
+            @Expect(gatewayExecuteStopServe(), 0)
+            let original = String.fromUtf8(File.readFrom(lease))
+            let result = gatewayExecuteRestartServe(launchServe: { =>
+                File.writeTo(lease, original.replace("stopped", "running").toArray())
+                gatewayAcquireServeLockForRunningProcess()
+            })
+            @Expect(result, 1)
+            @Expect(exists(home.join("gateway-serve.stop-complete")), true)
+            @Expect(exists(home.join("gateway-serve.lock")), false)
+            @Expect(String.fromUtf8(File.readFrom(lease)).contains("running"), true)
+        })
+    }
+
+    @TestCase
     public func hbBrU10HeartbeatCadenceOverrideRequiresCompleteTestIdentity(): Unit {
         synchronized(MetisProcessEnvironmentLock) {
             let keys = [

@@ -3146,13 +3146,13 @@ private func servicePluginProcessError(prefix: String, process: ServicePluginStd
     redactServicePayload(String.join(parts.toArray(), delimiter: " ")).text
 }
 
-private func servicePluginPathSegment(raw: String): String {
+func servicePluginPathSegment(raw: String): String {
     let trimmed = raw.trimAscii()
     if (trimmed.isEmpty()) { return "service-plugin" }
     trimmed.replace("/", "_").replace("\\", "_").replace(":", "_")
 }
 
-private func servicePluginRuntimeLeaseDir(serviceId: String): Path {
+func servicePluginRuntimeLeaseDir(serviceId: String): Path {
     CliConfig.dotDir
         .join("service-plugin")
         .join("runtime")
@@ -3269,7 +3269,7 @@ private func servicePluginLeaseInt(root: JsonObject, key: String): Int64 {
     }
 }
 
-private class ServicePluginProbeDeadline {
+class ServicePluginProbeDeadline {
     public let deadlineMs: Int64
 
     public init(deadlineMs: Int64) {
@@ -3281,7 +3281,7 @@ private class ServicePluginProbeDeadline {
     }
 }
 
-private class ServicePluginPidProbeState {
+class ServicePluginPidProbeState {
     public let conclusive: Bool
     public let alive: Bool
     public let status: String
@@ -3295,7 +3295,7 @@ private class ServicePluginPidProbeState {
     }
 }
 
-private func servicePluginProbePid(
+func servicePluginProbePid(
     pid: Int64,
     deadline: ServicePluginProbeDeadline,
     maxBudgetMs!: Int64 = 0
@@ -3331,7 +3331,7 @@ private func servicePluginProbePid(
     }
 }
 
-private class ServicePluginPortReleaseState {
+class ServicePluginPortReleaseState {
     public let released: Bool
     public let conclusive: Bool
     public let status: String
@@ -3343,7 +3343,7 @@ private class ServicePluginPortReleaseState {
     }
 }
 
-private func servicePluginPortReleaseState(port: Int64, pid: Int64, deadline: ServicePluginProbeDeadline): ServicePluginPortReleaseState {
+func servicePluginPortReleaseState(port: Int64, pid: Int64, deadline: ServicePluginProbeDeadline): ServicePluginPortReleaseState {
     if (port <= 0) { return ServicePluginPortReleaseState(true, "not_applicable") }
     let remainingMs = deadline.remaining()
     if (remainingMs <= 0) { return ServicePluginPortReleaseState(false, "port_probe_timeout", conclusive: false) }
@@ -3370,7 +3370,7 @@ private func servicePluginPortReleaseState(port: Int64, pid: Int64, deadline: Se
         if (exitCode == SHELL_INVALID_RESPONSE_ENCODING_EXIT_CODE) {
             return ServicePluginPortReleaseState(false, "invalid_response_encoding", conclusive: false)
         }
-        if (exitCode == 1 && stderrText.isEmpty()) { return ServicePluginPortReleaseState(true, "released") }
+        if (exitCode == 1 && stdout.trimAscii().isEmpty() && stderrText.isEmpty()) { return ServicePluginPortReleaseState(true, "released") }
         if (!stderrText.isEmpty()) { return ServicePluginPortReleaseState(false, "port_probe_unavailable", conclusive: false) }
         if (exitCode != 0) { return ServicePluginPortReleaseState(false, "port_probe_unavailable", conclusive: false) }
         for (line in stdout.split("\n")) {
@@ -3388,7 +3388,7 @@ private func servicePluginNowMs(): Int64 {
     DateTime.now().toUnixTimeStamp().toMilliseconds()
 }
 
-private func servicePluginDeadlineNowMs(): Int64 {
+func servicePluginDeadlineNowMs(): Int64 {
     synchronized(servicePluginDeadlineClockLock) {
         let observed = match (servicePluginMonotonicNowForTest) {
             case Some(probe) => probe()
