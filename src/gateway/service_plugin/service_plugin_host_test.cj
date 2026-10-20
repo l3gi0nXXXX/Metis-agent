@@ -4820,6 +4820,159 @@ public class ServicePluginHostTest {
         })
     }
 
+    private func v7VerifyReaderSettlementAfterOwnerTerminal(releaseBeforeDeadline: Bool): Unit {
+        let label = if (releaseBeforeDeadline) { "v7-reader-release" } else { "v7-reader-deadline" }
+        withIsolatedServicePluginHostTestHome(label, { home: Path =>
+            let dispatchGate = ServicePluginTestGate()
+            let dispatchSettledGate = ServicePluginTestGate()
+            let readerGate = ServicePluginTestGate()
+            let ownerStoppedGate = ServicePluginTestGate()
+            let probeLock = Mutex()
+            let readerProbes = ArrayList<() -> Bool>()
+            let heartbeatRelease = home.join("reader-heartbeat.release")
+            var retry = None<Future<ServiceStopResult>>
+            let sentinelId = "${label}-sentinel"
+            var sentinelStarted = false
+            let initLine = this.gitCodeInitLine()
+            let eventLine = this.gitCodeAcceptedEventLine(eventId: "gitcode:Cangjie/community:issue:${label}")
+            let heartbeatLine = this.gitCodeHeartbeatLine(frameId: "${label}-heartbeat")
+            try {
+                this.registerGitCodeStdioScript(
+                    "printf '%s\\n' '${initLine}'; printf '%s\\n' '${eventLine}'; while [ ! -f '${heartbeatRelease.toString()}' ]; do sleep 0.01; done; printf '%s\\n' '${heartbeatLine}'; trap '' TERM HUP; while true; do sleep 1; done")
+                setServicePluginBeforeEventDispatchHookForTest(Some({ _serviceId: String => dispatchGate.enterAndWait() }))
+                setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent =>
+                    let rows = ArrayList<ServicePluginDeliveryTarget>()
+                    rows.add(ServicePluginDeliveryTarget("telegram", "v7-account", "v7-peer"))
+                    rows
+                }))
+                setServicePluginWebhookGeneratedReplyHandlerForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent, _target: ServicePluginDeliveryTarget =>
+                    ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "fenced 中文🙂")
+                }))
+                setServicePluginEventDeliveryForTest(Some({ _target: ServicePluginDeliveryTarget, _text: String =>
+                    throw Exception("fenced V7 dispatch must not deliver")
+                }))
+                @Expect(ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000).ok, true)
+                let dispatchEntered = dispatchGate.awaitEntered(2000)
+                @Expect(dispatchEntered, true)
+                if (!dispatchEntered) { throw Exception("V7 dispatch did not enter") }
+                let identity = servicePluginActiveIdentityForTest("gitcode-monitor").getOrThrow()
+                let pid = getServicePluginSnapshot("gitcode-monitor").getOrThrow().pid
+                let pgid = this.processGroupId(pid)
+                @Expect(pid > 1 && pgid > 0, true)
+                let baseline = managedStdioBroker().snapshot()
+                let sentinel = managedStdioBroker().startOwner(ManagedStdioOwnerSpec(
+                    sentinelId, "node",
+                    args: ["-e", "process.stdin.on('data',b=>process.stdout.write(b));setInterval(()=>{},1000)"],
+                    outputMode: "line", deadlineMs: 15000
+                ))
+                sentinelStarted = sentinel.ok
+                @Expect(sentinelStarted, true)
+                if (!sentinelStarted) { throw Exception("V7 sentinel did not start") }
+                setServicePluginBeforeReaderEndHookForTest(Some({ owner: String, probe: () -> Bool =>
+                    if (owner == identity[0]) {
+                        synchronized(probeLock) { readerProbes.add(probe) }
+                        readerGate.enterAndWait()
+                    }
+                }))
+                File.writeTo(heartbeatRelease, "release".toArray())
+                let readerHeld = readerGate.awaitEntered(2000)
+                @Expect(readerHeld, true)
+                if (!readerHeld) { throw Exception("V7 heartbeat did not reach reader barrier") }
+                setServicePluginDispatchSettledHookForTest(Some({ => dispatchSettledGate.enterAndWait() }))
+                let pending = stopServicePlugin("gitcode-monitor", reason: label, timeoutMillis: 1)
+                @Expect(pending.ok, false)
+                @Expect(pending.status, "cleanup_pending")
+                @Expect(servicePluginCleanupPendingCountForTest(), 1)
+                setServicePluginAfterOwnerStopHookForTest(Some({ owner: String, ok: Bool, _status: String =>
+                    if (owner == identity[0]) {
+                        @Expect(ok, true)
+                        let readerEntered = readerGate.awaitEntered(2000)
+                        @Expect(readerEntered, true)
+                        if (!readerEntered) { throw Exception("V7 reader did not reach endRead barrier") }
+                        ownerStoppedGate.signal()
+                    }
+                }))
+                dispatchGate.release()
+                let dispatchSettled = dispatchSettledGate.awaitEntered(2000)
+                @Expect(dispatchSettled, true)
+                if (!dispatchSettled) { throw Exception("V7 dispatch did not settle") }
+                let retryStarted = MonoTime.now()
+                retry = Some(spawn { stopServicePlugin("gitcode-monitor", reason: "${label}-retry", timeoutMillis: 2500) })
+                let ownerStopped = ownerStoppedGate.awaitEntered(2000)
+                @Expect(ownerStopped, true)
+                if (!ownerStopped) { throw Exception("V7 owner did not reach real terminal state") }
+                let probe = synchronized(probeLock) { readerProbes[0] }
+                @Expect(probe(), false)
+                if (releaseBeforeDeadline) {
+                    var finishedWhileReaderHeld = false
+                    try {
+                        let _ = retry.getOrThrow().get(Duration.millisecond * 50)
+                        finishedWhileReaderHeld = true
+                    } catch (_: Exception) { () }
+                    @Expect(finishedWhileReaderHeld, false)
+                    readerGate.release()
+                }
+                let result = retry.getOrThrow().get(Duration.second * 4)
+                retry = None<Future<ServiceStopResult>>
+                @Expect((MonoTime.now() - retryStarted).toMilliseconds() <= 3000, true)
+                if (releaseBeforeDeadline) {
+                    @Expect(result.ok, true)
+                    @Expect(result.status, "stopped")
+                    @Expect(probe(), true)
+                } else {
+                    @Expect(result.ok, false)
+                    @Expect(result.status, "cleanup_pending")
+                    @Expect(probe(), false)
+                    @Expect(servicePluginCleanupPendingCountForTest(), 1)
+                    readerGate.release()
+                    let recovered = stopServicePlugin("gitcode-monitor", reason: "${label}-released", timeoutMillis: 2500)
+                    @Expect(recovered.ok, true)
+                    @Expect(recovered.status, "stopped")
+                    @Expect(probe(), true)
+                }
+                @Expect(servicePluginCleanupPendingCountForTest(), 0)
+                @Expect(this.waitForPidGone(pid), true)
+                @Expect(this.waitForProcessGroupGone(pgid), true)
+                @Expect(managedStdioBroker().snapshot().ownerCount, 1)
+                @Expect(managedStdioBroker().snapshot().generation, baseline.generation)
+                @Expect(managedStdioBroker().snapshot().brokerPid, baseline.brokerPid)
+                @Expect(managedStdioBroker().writeOwnerLine(sentinelId, "v7-sentinel-alive", timeoutMs: 500).ok, true)
+                let sentinelReply = managedStdioBroker().readOwnerLine(sentinelId, timeoutMs: 1000).getOrThrow()
+                @Expect(sentinelReply.eventType, "owner.stdout")
+                @Expect(sentinelReply.text, "v7-sentinel-alive")
+                @Expect(managedStdioBroker().stopOwner(sentinelId, timeoutMs: 2000).ok, true)
+                while (managedStdioBroker().readOwnerLine(sentinelId, timeoutMs: 25).isSome()) { () }
+                sentinelStarted = false
+                @Expect(managedStdioBroker().snapshot().ownerCount, 0)
+                @Expect(getServicePluginSnapshot("gitcode-monitor").getOrThrow().status, "stopped")
+            } finally {
+                readerGate.release()
+                dispatchGate.release()
+                dispatchSettledGate.release()
+                setServicePluginBeforeReaderEndHookForTest(None<(String, () -> Bool) -> Unit>)
+                setServicePluginAfterOwnerStopHookForTest(None<(String, Bool, String) -> Unit>)
+                match (retry) { case Some(future) => try { let _ = future.get(Duration.second * 4) } catch (_: Exception) { () } case None => () }
+                synchronized(probeLock) { readerProbes.clear() }
+                if (sentinelStarted) {
+                    let _ = managedStdioBroker().stopOwner(sentinelId, timeoutMs: 2000)
+                    while (managedStdioBroker().readOwnerLine(sentinelId, timeoutMs: 25).isSome()) { () }
+                }
+                resetServicePluginGeneratedReplyStateForTest()
+                resetServicePluginHostForTest()
+            }
+        })
+    }
+
+    @TestCase
+    public func v7U1TerminalOwnerWaitsForExactReaderBeforeReportingStopped(): Unit {
+        this.v7VerifyReaderSettlementAfterOwnerTerminal(true)
+    }
+
+    @TestCase
+    public func v7B1HeldReaderUsesOriginalDeadlineAndRemainsCleanupPending(): Unit {
+        this.v7VerifyReaderSettlementAfterOwnerTerminal(false)
+    }
+
     @TestCase
     public func p3N1CleanupDeadlineAndHostShutdownGateAreBounded(): Unit {
         withIsolatedServicePluginHostTestHome("p3-n1-cleanup-shutdown-gate", { home: Path =>

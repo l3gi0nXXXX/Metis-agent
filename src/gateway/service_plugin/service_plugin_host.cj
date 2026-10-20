@@ -709,6 +709,8 @@ private var servicePluginDispatchRemainingForTest: Option<() -> Int64> = None<()
 private var servicePluginBeforeDispatchWaitForTest: Option<(Int64) -> Unit> = None<(Int64) -> Unit>
 private var servicePluginAfterIngressStopHookForTest: Option<() -> Unit> = None<() -> Unit>
 private var servicePluginDispatchSettledHookForTest: Option<() -> Unit> = None<() -> Unit>
+private var servicePluginBeforeReaderEndHookForTest: Option<(String, () -> Bool) -> Unit> = None<(String, () -> Bool) -> Unit>
+private var servicePluginAfterOwnerStopHookForTest: Option<(String, Bool, String) -> Unit> = None<(String, Bool, String) -> Unit>
 private var servicePluginCleanupFinalizeHookForTest: Option<(String, Int64) -> Unit> = None<(String, Int64) -> Unit>
 private var servicePluginSupervisorAutoStartForTest = true
 private var servicePluginSupervisorWorkers = HashMap<String, ServicePluginSupervisorStopFlag>()
@@ -1334,7 +1336,12 @@ private class ServicePluginStdioProcess {
             }
             None<String>
         } finally {
-            this.state.endRead()
+            try {
+                match (servicePluginBeforeReaderEndHookForTest) {
+                    case Some(hook) => hook(this.ownerId, { => this.state.readersSettled() })
+                    case None => ()
+                }
+            } finally { this.state.endRead() }
         }
     }
 
@@ -1376,6 +1383,12 @@ private class ServicePluginStdioProcess {
             timeoutMs: remaining,
             expectedGeneration: Some(this.generation)
         )
+        match (servicePluginAfterOwnerStopHookForTest) {
+            case Some(hook) => hook(this.ownerId, stopped.ok, stopped.status)
+            case None => ()
+        }
+        let readerRemaining = max(0, deadlineMs - servicePluginDeadlineNowMs())
+        if (stopped.ok && readerRemaining > 0) { this.state.stopReaders(readerRemaining) }
         var drained = this.state.readersSettled()
         while (drained) {
             let drainRemaining = max(0, deadlineMs - servicePluginDeadlineNowMs())
@@ -2742,6 +2755,14 @@ public func setServicePluginCleanupFinalizeHookForTest(probe: Option<(String, In
     servicePluginCleanupFinalizeHookForTest = probe
 }
 
+public func setServicePluginBeforeReaderEndHookForTest(probe: Option<(String, () -> Bool) -> Unit>): Unit {
+    servicePluginBeforeReaderEndHookForTest = probe
+}
+
+public func setServicePluginAfterOwnerStopHookForTest(probe: Option<(String, Bool, String) -> Unit>): Unit {
+    servicePluginAfterOwnerStopHookForTest = probe
+}
+
 public func servicePluginCleanupPendingIdentityForTest(serviceId: String): Option<(String, Int64, Int64, Int64)> {
     synchronized(servicePluginProcessLock) {
         match (servicePluginCleanupPendingForServiceLocked(serviceId)) {
@@ -2844,6 +2865,8 @@ public func resetServicePluginHostForTest(): Unit {
     servicePluginBeforeDispatchWaitForTest = None<(Int64) -> Unit>
     servicePluginAfterIngressStopHookForTest = None<() -> Unit>
     servicePluginDispatchSettledHookForTest = None<() -> Unit>
+    servicePluginBeforeReaderEndHookForTest = None<(String, () -> Bool) -> Unit>
+    servicePluginAfterOwnerStopHookForTest = None<(String, Bool, String) -> Unit>
     servicePluginCleanupFinalizeHookForTest = None<(String, Int64) -> Unit>
     servicePluginSupervisorAutoStartForTest = true
     servicePluginSupervisorConfig = ServicePluginSupervisorConfig()
