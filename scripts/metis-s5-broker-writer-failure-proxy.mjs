@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn } from 'node:child_process';
-import { closeSync, existsSync, renameSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, fstatSync, readdirSync, renameSync, writeFileSync } from 'node:fs';
 import { TextDecoder } from 'node:util';
 
 const brokerScript = process.argv[2] ?? '';
@@ -47,6 +47,23 @@ if (
 ) {
   invalidContract();
 }
+
+function sameFifoIdentity(left, right) {
+  return left.isFIFO() && right.isFIFO() && left.dev === right.dev && left.ino === right.ino &&
+    left.mode === right.mode && left.rdev === right.rdev;
+}
+
+// SDK launch can inherit the original read end as well as dup2's fd 0.
+// Capture only aliases of this input FIFO, before starting any owned children.
+const stdinIdentity = writerMode ? fstatSync(0, { bigint: true }) : null;
+const stdinFifo = stdinIdentity?.isFIFO() ? stdinIdentity : null;
+const stdinAliases = stdinFifo ? readdirSync('/dev/fd').flatMap((name) => {
+  if (!/^\d+$/.test(name)) return [];
+  const fd = Number(name);
+  if (!Number.isSafeInteger(fd) || fd === 1 || fd === 2) return [];
+  try { return sameFifoIdentity(fstatSync(fd, { bigint: true }), stdinFifo) ? [fd] : []; }
+  catch (error) { if (error?.code === 'EBADF') return []; throw error; }
+}) : [0];
 
 const broker = spawn(process.execPath, [brokerScript], {
   env: process.env,
@@ -417,8 +434,14 @@ const watcher = setInterval(() => {
     process.stdin.once('close', () => setImmediate(() => {
       // Node preserves the standard descriptor after destroying its input stream.
       // Wait until libuv finishes stream teardown before closing our owned fd 0.
-      try { closeSync(0); } catch (error) {
-        if (error?.code !== 'EBADF') throw error;
+      for (const fd of stdinAliases) {
+        try {
+          // A descriptor may have been closed and reused since startup.
+          if (stdinFifo && !sameFifoIdentity(fstatSync(fd, { bigint: true }), stdinFifo)) continue;
+          closeSync(fd);
+        } catch (error) {
+          if (error?.code !== 'EBADF') throw error;
+        }
       }
       broker.stdin.destroy();
       writeAtomic(closedPath, 'writer_closed\n');
