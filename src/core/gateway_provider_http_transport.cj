@@ -342,20 +342,24 @@ public func buildGatewayProviderHttpConnectRequest(targetHost: String, targetPor
 private func readGatewayProviderHttpConnectResponse(socket: TcpSocket): String {
     let output = ArrayList<Byte>()
     let buffer = Array<Byte>(1024, repeat: 0)
-    var total: Int64 = 0
-    while (total < 8192) {
-        let n = socket.read(buffer)
+    while (output.size < 8192) {
+        let n = socket.read(buffer[..min(buffer.size, 8192 - output.size)])
         if (n <= 0) {
-            break
+            throw Exception("proxy CONNECT incomplete_response")
         }
         output.add(all: buffer[..n])
-        total += n
-        let text = String.fromUtf8(output.toArray())
-        if (text.contains("\r\n\r\n")) {
-            return text
+        // Scan bytes first: a read may split a Chinese or emoji UTF-8 sequence.
+        for (i in 3..output.size) {
+            if (output[i - 3] == 13 && output[i - 2] == 10 && output[i - 1] == 13 && output[i] == 10) {
+                return try {
+                    String.fromUtf8(output.toArray()[..i + 1])
+                } catch (_: Exception) {
+                    throw Exception("proxy CONNECT invalid_response_encoding")
+                }
+            }
         }
     }
-    String.fromUtf8(output.toArray())
+    throw Exception("proxy CONNECT response_too_large")
 }
 
 private func openGatewayProviderHttpConnectTunnel(
@@ -371,7 +375,11 @@ private func openGatewayProviderHttpConnectTunnel(
         case None => response
     }
     if (!firstLine.contains(" 200 ")) {
-        throw Exception("provider HTTP proxy CONNECT failed: ${firstLine}")
+        let status = try {
+            let parts = firstLine.split(" ")
+            if (parts.size >= 2) { Int64.parse(parts[1]) } else { 0 }
+        } catch (_: Exception) { 0 }
+        throw Exception("provider HTTP proxy CONNECT failed (status=${status})")
     }
 }
 
@@ -401,10 +409,15 @@ public func buildGatewayProviderHttpClientBuilder(url: String, cfg: GatewayProvi
         let targetHost = route.targetHost
         let socketConnector = { _sa: SocketAddress =>
             let socket = TcpSocket(endpoint.host, endpoint.port)
-            socket.readTimeout = Duration.millisecond * connectTimeoutMs
-            socket.writeTimeout = Duration.millisecond * connectTimeoutMs
-            socket.connect(timeout: Duration.millisecond * connectTimeoutMs)
-            openGatewayProviderHttpConnectTunnel(socket, targetHost, 443u16, endpoint)
+            try {
+                socket.readTimeout = Duration.millisecond * connectTimeoutMs
+                socket.writeTimeout = Duration.millisecond * connectTimeoutMs
+                socket.connect(timeout: Duration.millisecond * connectTimeoutMs)
+                openGatewayProviderHttpConnectTunnel(socket, targetHost, 443u16, endpoint)
+            } catch (e: Exception) {
+                try { socket.close() } catch (_: Exception) { () }
+                throw e
+            }
             return socket
         }
         builder.connector(socketConnector)

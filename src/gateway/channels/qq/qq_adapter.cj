@@ -11,6 +11,7 @@ import magic.utils.http.*
 import std.collection.{ArrayList, HashMap}
 import std.convert.Parsable
 import std.time.*
+import std.sync.AtomicInt64
 import std.sync.Mutex
 import stdx.encoding.json.*
 import stdx.encoding.url.*
@@ -40,6 +41,28 @@ public class QQAdapter <: ChannelAdapter {
     private var officialSeq: Int64 = 0
     private var officialSessionId: String = ""
     private var officialConnectionSerial: Int64 = 0
+    private let officialLifecycleLock = Mutex()
+    private var officialLoopSerial: Int64 = 0
+    private var officialWebsocket: Option<WebSocket> = None
+    private var officialHttpClient: Option<Client> = None
+    private var officialWorker: Option<Future<Unit>> = None
+    private var officialHeartbeatWorker: Option<Future<Unit>> = None
+    private var officialWorkerTerminal = true
+    private var officialHeartbeatTerminal = true
+    private let officialWorkerCount = AtomicInt64(0)
+    private let officialHeartbeatCount = AtomicInt64(0)
+
+    public func debugOfficialWorkersForTest(): Int64 {
+        synchronized(this.officialLifecycleLock) {
+            max(this.officialWorkerCount.load(), if (this.officialWorkerTerminal) { 0 } else { 1 }) +
+                max(this.officialHeartbeatCount.load(), if (this.officialHeartbeatTerminal) { 0 } else { 1 })
+        }
+    }
+
+    public func debugCacheOfficialTokenForTest(token: String): Unit {
+        this.officialAccessToken = token
+        this.officialTokenExpireAtNano = DateTime.now().toUnixTimeStamp().toNanoseconds() + 3600 * 1000000000
+    }
 
     public init(config!: QQConfig = QQConfig(), accountId!: String = "") {
         let requestedAccountId = if (accountId.trimAscii().isEmpty()) { config.accountId } else { accountId.trimAscii() }
@@ -184,7 +207,11 @@ public class QQAdapter <: ChannelAdapter {
             this.logChannel("error", MetisLogEvent.channelFailed, "start", "failed", "QQ adapter start failed", errorKind: "credential", error: this.lastSendError)
             return
         }
-        this.running = true
+        if (synchronized(this.officialLifecycleLock) { this.officialWorker.isSome() }) {
+            this.lastSendError = "qq official websocket worker cleanup pending"
+            this.logChannel("warn", MetisLogEvent.channelFailed, "start", "cleanup_pending", "QQ official websocket worker cleanup pending", errorKind: "resource_cleanup")
+            return
+        }
         let extra = JsonObject()
         extra.put("mode", JsonString("official_ws"))
         this.logChannel("info", MetisLogEvent.channelStarted, "start", "started", "QQ adapter started", extra: extra)
@@ -192,8 +219,44 @@ public class QQAdapter <: ChannelAdapter {
     }
 
     public func stop(): Unit {
-        this.running = false
-        this.officialConnectionSerial += 1
+        let owned = synchronized(this.officialLifecycleLock) {
+            this.running = false
+            this.officialLoopSerial += 1
+            this.officialConnectionSerial += 1
+            let connection = this.officialWebsocket
+            let worker = this.officialWorker
+            let httpClient = this.officialHttpClient
+            this.officialHttpClient = None
+            this.officialWebsocket = None
+            (connection, worker, httpClient, this.officialLoopSerial)
+        }
+        // Closing the owned connection interrupts a blocked read before joining.
+        if (let Some(client) <- owned[2]) {
+            try { client.close() } catch (_: Exception) { () }
+        }
+        if (let Some(websocket) <- owned[0]) {
+            try { websocket.closeConn() } catch (_: Exception) { () }
+        }
+        if (let Some(worker) <- owned[1]) {
+            try { worker.get(Duration.second * 5) } catch (_: Exception) { () }
+        }
+        // The receive loop can publish a heartbeat while stop is closing its socket.
+        // Read that final handle after joining it, then retain ownership on timeout.
+        let heartbeat = synchronized(this.officialLifecycleLock) { this.officialHeartbeatWorker }
+        if (let Some(worker) <- heartbeat) {
+            try { worker.get(Duration.second) } catch (_: Exception) { () }
+        }
+        let settled = synchronized(this.officialLifecycleLock) {
+            let complete = this.officialWorkerTerminal && this.officialHeartbeatTerminal
+            if (complete && this.officialLoopSerial == owned[3]) {
+                this.officialWorker = None
+                this.officialHeartbeatWorker = None
+            }
+            complete
+        }
+        if (!settled) {
+            this.logChannel("warn", MetisLogEvent.channelFailed, "stop", "cleanup_pending", "QQ official websocket worker cleanup pending", errorKind: "resource_cleanup")
+        }
         if (let Some(server) <- this.webhookServer) {
             try {
                 server.close()
@@ -1020,25 +1083,82 @@ public class QQAdapter <: ChannelAdapter {
      * - 处理 Dispatch(0) 事件并入队
      * - 处理 Hello(10) 并定期发送 Heartbeat(1)
      */
-    private func startOfficialGatewayLoop(): Unit {
-        spawn {
-            while (this.running) {
-                try {
-                    this.logChannel("debug", MetisLogEvent.channelPull, "official_ws", "connecting", "QQ official websocket connecting")
-                    this.connectOfficialGatewayAndServe()
-                } catch (e: Exception) {
-                    this.lastSendError = "official ws loop error: ${e.message}"
-                    this.logChannel("warn", MetisLogEvent.channelFailed, "official_ws", "failed", "QQ official websocket loop error", errorKind: this.qqErrorKind(e.message), error: e.message)
-                }
-                this.logChannel("debug", MetisLogEvent.channelPull, "official_ws", "reconnect_scheduled", "QQ official websocket reconnect scheduled")
-                sleep(Duration.second * 3)
-            }
+    private func officialLoopActive(serial: Int64): Bool {
+        synchronized(this.officialLifecycleLock) {
+            this.running && this.officialLoopSerial == serial
         }
     }
 
-    private func connectOfficialGatewayAndServe(): Unit {
-        this.officialConnectionSerial += 1
-        let connectionSerial = this.officialConnectionSerial
+    private func officialConnectionActive(serial: Int64): Bool {
+        synchronized(this.officialLifecycleLock) {
+            this.running && this.officialConnectionSerial == serial && this.officialWebsocket.isSome()
+        }
+    }
+
+    private func closeOfficialConnection(connectionSerial: Int64): Unit {
+        let owned = synchronized(this.officialLifecycleLock) {
+            if (this.officialConnectionSerial == connectionSerial) {
+                this.officialConnectionSerial += 1
+                let connection = this.officialWebsocket
+                this.officialWebsocket = None
+                connection
+            } else { None<WebSocket> }
+        }
+        if (let Some(connection) <- owned) {
+            try { connection.closeConn() } catch (_: Exception) { () }
+        }
+    }
+
+    private func startOfficialGatewayLoop(): Unit {
+        synchronized(this.officialLifecycleLock) {
+            // A timed-out prior stop retains its handle until a subsequent stop settles it.
+            if (this.running || this.officialWorker.isSome()) { return }
+            this.running = true
+            this.officialLoopSerial += 1
+            let loopSerial = this.officialLoopSerial
+            this.officialWorkerTerminal = false
+            this.officialWorker = Some(spawn {
+                this.officialWorkerCount.fetchAdd(1)
+                try {
+                    while (this.officialLoopActive(loopSerial)) {
+                        // Never overlap heartbeat generations if an earlier close is still settling.
+                        if (!synchronized(this.officialLifecycleLock) { this.officialHeartbeatTerminal }) {
+                            sleep(Duration.millisecond * 100)
+                            continue
+                        }
+                        try {
+                            this.logChannel("debug", MetisLogEvent.channelPull, "official_ws", "connecting", "QQ official websocket connecting")
+                            this.connectOfficialGatewayAndServe(loopSerial)
+                        } catch (e: Exception) {
+                            this.lastSendError = "official ws loop error: ${e.message}"
+                            this.logChannel("warn", MetisLogEvent.channelFailed, "official_ws", "failed", "QQ official websocket loop error", errorKind: this.qqErrorKind(e.message), error: e.message)
+                        }
+                        // Short waits allow stop to join without waiting for reconnect backoff.
+                        for (_ in 0..30) {
+                            if (!this.officialLoopActive(loopSerial)) { break }
+                            sleep(Duration.millisecond * 100)
+                        }
+                    }
+                } finally {
+                    this.officialWorkerCount.fetchAdd(-1)
+                    synchronized(this.officialLifecycleLock) { this.officialWorkerTerminal = true }
+                }
+            })
+        }
+    }
+
+    private func connectOfficialGatewayAndServe(loopSerial: Int64): Unit {
+        let serial = synchronized(this.officialLifecycleLock) {
+            if (!this.running || this.officialLoopSerial != loopSerial) { None<Int64> }
+            else {
+                this.officialConnectionSerial += 1
+                Some(this.officialConnectionSerial)
+            }
+        }
+        let connectionSerial = match (serial) {
+            case Some(value) => value
+            case None => return
+        }
         let gatewayUrl = this.resolveOfficialGatewayWebsocketUrl()
         if (gatewayUrl.isEmpty()) {
             throw Exception("official gateway url is empty")
@@ -1053,116 +1173,151 @@ public class QQAdapter <: ChannelAdapter {
         tlsConfig.verifyMode = TrustAll
         tlsConfig.alpnProtocolsList = ["http/1.1"]
         let client = ClientBuilder().tlsConfig(tlsConfig).build()
-        let u = URL.parse(gatewayUrl)
-        let websocket: WebSocket
-        let _respHeaders: HttpHeaders
-        (websocket, _respHeaders) = WebSocket.upgradeFromClient(client, u)
-        client.close()
+        let ownsClient = synchronized(this.officialLifecycleLock) {
+            if (this.running && this.officialConnectionSerial == connectionSerial) {
+                this.officialHttpClient = Some(client)
+                true
+            } else { false }
+        }
+        if (!ownsClient) {
+            try { client.close() } catch (_: Exception) { () }
+            return
+        }
+        let upgraded = try {
+            WebSocket.upgradeFromClient(client, URL.parse(gatewayUrl))
+        } finally {
+            let ownedClient = synchronized(this.officialLifecycleLock) {
+                if (this.officialConnectionSerial == connectionSerial) {
+                    let value = this.officialHttpClient
+                    this.officialHttpClient = None
+                    value
+                } else { None<Client> }
+            }
+            if (let Some(value) <- ownedClient) {
+                try { value.close() } catch (_: Exception) { () }
+            }
+        }
+        let websocket = upgraded[0]
+        let registered = synchronized(this.officialLifecycleLock) {
+            if (this.running && this.officialLoopSerial == loopSerial && this.officialConnectionSerial == connectionSerial) {
+                this.officialWebsocket = Some(websocket)
+                true
+            } else { false }
+        }
+        if (!registered) {
+            try { websocket.closeConn() } catch (_: Exception) { () }
+            return
+        }
         this.logChannel("info", MetisLogEvent.channelStarted, "official_ws", "connected", "QQ official websocket connected")
 
         var heartbeatIntervalMs: Int64 = 30000
-        var heartbeatStarted = false
+        var heartbeatWorker: Option<Future<Unit>> = None
         var shouldReconnect = false
 
-        while (this.running) {
-            let frame = websocket.read()
-            if (frame.frameType == CloseWebFrame) {
-                let closePayload = frame.payload.toString()
-                let extra = JsonObject()
-                extra.put("payloadBytes", closePayload.size.toJsonValue())
-                this.logChannel("info", MetisLogEvent.channelStopped, "official_ws", "closed", "QQ official websocket close frame received", extra: extra)
-                shouldReconnect = true
-                break
-            }
-            if (frame.frameType != TextWebFrame) {
-                continue
-            }
-            let payload = String.fromUtf8(frame.payload)
-            let jo = try {
-                JsonValue.fromStr(payload).asObject()
-            } catch (_e: Exception) {
-                continue
-            }
-            let op = this.readIntField(jo, "op")
-            if (let Some(sVal) <- jo.get("s")) {
-                this.officialSeq = match (sVal) {
-                    case i: JsonInt => i.getValue()
-                    case f: JsonFloat => Int64(f.getValue())
-                    case _ => this.officialSeq
+        try {
+            while (this.officialConnectionActive(connectionSerial)) {
+                let frame = websocket.read()
+                if (frame.frameType == CloseWebFrame) {
+                    let closePayload = frame.payload.toString()
+                    let extra = JsonObject()
+                    extra.put("payloadBytes", closePayload.size.toJsonValue())
+                    this.logChannel("info", MetisLogEvent.channelStopped, "official_ws", "closed", "QQ official websocket close frame received", extra: extra)
+                    shouldReconnect = true
+                    break
                 }
-            }
+                if (frame.frameType != TextWebFrame) {
+                    continue
+                }
+                let payload = try {
+                    String.fromUtf8(frame.payload)
+                } catch (_: Exception) {
+                    throw Exception("qq official websocket invalid_response_encoding")
+                }
+                let jo = try {
+                    JsonValue.fromStr(payload).asObject()
+                } catch (_e: Exception) {
+                    continue
+                }
+                let op = this.readIntField(jo, "op")
+                if (let Some(sVal) <- jo.get("s")) {
+                    this.officialSeq = match (sVal) {
+                        case i: JsonInt => i.getValue()
+                        case f: JsonFloat => Int64(f.getValue())
+                        case _ => this.officialSeq
+                    }
+                }
 
-            if (op == 10) { // Hello
-                let d = match (jo.get("d")) {
-                    case Some(v) => v.asObject()
-                    case None => JsonObject(HashMap<String, JsonValue>())
-                }
-                let interval = this.readIntField(d, "heartbeat_interval")
-                if (interval > 0) {
-                    heartbeatIntervalMs = interval
-                }
-                let extra = JsonObject()
-                extra.put("heartbeatIntervalMs", heartbeatIntervalMs.toJsonValue())
-                this.logChannel("info", MetisLogEvent.channelPull, "heartbeat", "hello", "QQ official websocket hello received", extra: extra)
-                this.sendOfficialIdentifyOrResume(websocket)
-                if (!heartbeatStarted) {
-                    heartbeatStarted = true
-                    this.startHeartbeat(websocket, heartbeatIntervalMs, connectionSerial)
-                }
-                continue
-            }
-            if (op == 0) { // Dispatch
-                // 直接复用官方事件解析路径（t+d）。
-                let eventType = this.readStringField(jo, "t")
-                let dispatchMeta = JsonObject()
-                dispatchMeta.put("eventType", JsonString(eventType))
-                this.logChannel("debug", MetisLogEvent.messageInbound, "official_ws", "dispatch", "QQ official websocket dispatch event", extra: dispatchMeta)
-                if (eventType == "READY") {
-                    let data = match (jo.get("d")) {
-                        case Some(v) =>
-                            try { v.asObject() } catch (_: Exception) { JsonObject(HashMap<String, JsonValue>()) }
+                if (op == 10) { // Hello
+                    let d = match (jo.get("d")) {
+                        case Some(v) => v.asObject()
                         case None => JsonObject(HashMap<String, JsonValue>())
                     }
-                    let sessionId = this.readStringField(data, "session_id")
-                    if (!sessionId.isEmpty()) {
-                        this.officialSessionId = sessionId
-                        let sessionMeta = JsonObject()
-                        sessionMeta.put("sessionHash", JsonString(gatewayLogIdentityHash(sessionId)))
-                        this.logChannel("debug", MetisLogEvent.channelPull, "official_ws", "session_saved", "QQ official websocket session saved", extra: sessionMeta)
+                    let interval = this.readIntField(d, "heartbeat_interval")
+                    if (interval > 0) {
+                        heartbeatIntervalMs = interval
                     }
+                    let extra = JsonObject()
+                    extra.put("heartbeatIntervalMs", heartbeatIntervalMs.toJsonValue())
+                    this.logChannel("info", MetisLogEvent.channelPull, "heartbeat", "hello", "QQ official websocket hello received", extra: extra)
+                    this.sendOfficialIdentifyOrResume(websocket)
+                    if (heartbeatWorker.isNone()) {
+                        heartbeatWorker = Some(this.startHeartbeat(websocket, heartbeatIntervalMs, connectionSerial))
+                    }
+                    continue
                 }
-                let ack = this.ingestWebhookPayload(payload)
-                if (ack.contains("\"ok\":false")) {
-                    let ackMeta = JsonObject()
-                    ackMeta.put("ackBytes", ack.size.toJsonValue())
-                    this.logChannel("debug", MetisLogEvent.messageInbound, "official_ws", "dispatch_ignored", "QQ official websocket dispatch ignored", extra: ackMeta)
+                if (op == 0) { // Dispatch
+                    // 直接复用官方事件解析路径（t+d）。
+                    let eventType = this.readStringField(jo, "t")
+                    let dispatchMeta = JsonObject()
+                    dispatchMeta.put("eventType", JsonString(eventType))
+                    this.logChannel("debug", MetisLogEvent.messageInbound, "official_ws", "dispatch", "QQ official websocket dispatch event", extra: dispatchMeta)
+                    if (eventType == "READY") {
+                        let data = match (jo.get("d")) {
+                            case Some(v) =>
+                                try { v.asObject() } catch (_: Exception) { JsonObject(HashMap<String, JsonValue>()) }
+                            case None => JsonObject(HashMap<String, JsonValue>())
+                        }
+                        let sessionId = this.readStringField(data, "session_id")
+                        if (!sessionId.isEmpty()) {
+                            this.officialSessionId = sessionId
+                            let sessionMeta = JsonObject()
+                            sessionMeta.put("sessionHash", JsonString(gatewayLogIdentityHash(sessionId)))
+                            this.logChannel("debug", MetisLogEvent.channelPull, "official_ws", "session_saved", "QQ official websocket session saved", extra: sessionMeta)
+                        }
+                    }
+                    let ack = this.ingestWebhookPayload(payload)
+                    if (ack.contains("\"ok\":false")) {
+                        let ackMeta = JsonObject()
+                        ackMeta.put("ackBytes", ack.size.toJsonValue())
+                        this.logChannel("debug", MetisLogEvent.messageInbound, "official_ws", "dispatch_ignored", "QQ official websocket dispatch ignored", extra: ackMeta)
+                    }
+                    continue
                 }
-                continue
+                if (op == 11) { // Heartbeat ACK
+                    this.logChannel("debug", MetisLogEvent.channelPull, "heartbeat", "ack", "QQ official websocket heartbeat ack")
+                    continue
+                }
+                if (op == 9) { // Invalid Session
+                    this.logChannel("warn", MetisLogEvent.channelFailed, "official_ws", "failed", "QQ official websocket invalid session", errorKind: "session", error: "op=9")
+                    this.officialSessionId = ""
+                    this.officialSeq = 0
+                    shouldReconnect = true
+                    break
+                }
+                if (op == 7) { // Reconnect
+                    this.logChannel("info", MetisLogEvent.channelPull, "official_ws", "reconnect_requested", "QQ official websocket server requested reconnect")
+                    shouldReconnect = true
+                    break
+                }
+                let opMeta = JsonObject()
+                opMeta.put("op", op.toJsonValue())
+                this.logChannel("debug", MetisLogEvent.channelPull, "official_ws", "received", "QQ official websocket op received", extra: opMeta)
             }
-            if (op == 11) { // Heartbeat ACK
-                this.logChannel("debug", MetisLogEvent.channelPull, "heartbeat", "ack", "QQ official websocket heartbeat ack")
-                continue
+        } finally {
+            this.closeOfficialConnection(connectionSerial)
+            if (let Some(worker) <- heartbeatWorker) {
+                try { worker.get(Duration.second) } catch (_: Exception) { () }
             }
-            if (op == 9) { // Invalid Session
-                this.logChannel("warn", MetisLogEvent.channelFailed, "official_ws", "failed", "QQ official websocket invalid session", errorKind: "session", error: "op=9")
-                this.officialSessionId = ""
-                this.officialSeq = 0
-                shouldReconnect = true
-                break
-            }
-            if (op == 7) { // Reconnect
-                this.logChannel("info", MetisLogEvent.channelPull, "official_ws", "reconnect_requested", "QQ official websocket server requested reconnect")
-                shouldReconnect = true
-                break
-            }
-            let opMeta = JsonObject()
-            opMeta.put("op", op.toJsonValue())
-            this.logChannel("debug", MetisLogEvent.channelPull, "official_ws", "received", "QQ official websocket op received", extra: opMeta)
-        }
-        try {
-            websocket.closeConn()
-        } catch (_e: Exception) {
-            ()
         }
         if (shouldReconnect) {
             throw Exception("qq official websocket reconnect requested")
@@ -1291,21 +1446,36 @@ public class QQAdapter <: ChannelAdapter {
         this.sendOfficialIdentify(websocket)
     }
 
-    private func startHeartbeat(websocket: WebSocket, intervalMs: Int64, connectionSerial: Int64): Unit {
-        spawn {
-            while (this.running && this.officialConnectionSerial == connectionSerial) {
-                let hb = HashMap<String, JsonValue>()
-                hb["op"] = JsonInt(1)
-                hb["d"] = JsonInt(this.officialSeq)
-                let payload = JsonObject(hb).toJsonString()
-                try {
-                    websocket.write(TextWebFrame, payload.toArray())
-                } catch (_e: Exception) {
-                    this.logError("QQ official_ws: heartbeat failed, stop heartbeat loop")
-                    break
+    private func startHeartbeat(websocket: WebSocket, intervalMs: Int64, connectionSerial: Int64): Future<Unit> {
+        synchronized(this.officialLifecycleLock) { this.officialHeartbeatTerminal = false }
+        let worker = spawn {
+            this.officialHeartbeatCount.fetchAdd(1)
+            try {
+                while (this.officialConnectionActive(connectionSerial)) {
+                    let hb = HashMap<String, JsonValue>()
+                    hb["op"] = JsonInt(1)
+                    hb["d"] = JsonInt(this.officialSeq)
+                    let payload = JsonObject(hb).toJsonString()
+                    try {
+                        websocket.write(TextWebFrame, payload.toArray())
+                    } catch (_e: Exception) {
+                        this.logError("QQ official_ws: heartbeat failed, stop heartbeat loop")
+                        this.closeOfficialConnection(connectionSerial)
+                        break
+                    }
+                    var remaining = intervalMs
+                    while (remaining > 0 && this.officialConnectionActive(connectionSerial)) {
+                        let step = min(remaining, 100)
+                        sleep(Duration.millisecond * step)
+                        remaining -= step
+                    }
                 }
-                sleep(Duration.millisecond * intervalMs)
+            } finally {
+                this.officialHeartbeatCount.fetchAdd(-1)
+                synchronized(this.officialLifecycleLock) { this.officialHeartbeatTerminal = true }
             }
         }
+        synchronized(this.officialLifecycleLock) { this.officialHeartbeatWorker = Some(worker) }
+        worker
     }
 }
