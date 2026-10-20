@@ -201,7 +201,29 @@ check_file_allowlist \
   "scripts/lib/metis-sidecar-logger.mjs" \
   "scripts/metis-stdio-broker.mjs" \
   "scripts/gateway-stdio-*" \
+  "scripts/gateway-historical-recovery-broker-nonzero.mjs" \
   "scripts/metis-s5-broker-writer-failure-proxy.mjs"
+
+check_fixed_source_count \
+  "Historical recovery fixture stderr write count" \
+  "scripts/gateway-historical-recovery-broker-nonzero.mjs" \
+  "process.stderr.write" \
+  2
+check_fixed_source_count \
+  "Historical recovery fixture missing-source diagnostic" \
+  "scripts/gateway-historical-recovery-broker-nonzero.mjs" \
+  "process.stderr.write('historical broker fixture source missing\\n');" \
+  1
+check_fixed_source_count \
+  "Historical recovery fixture initialization diagnostic" \
+  "scripts/gateway-historical-recovery-broker-nonzero.mjs" \
+  "process.stderr.write('historical broker fixture initialization failed\\n');" \
+  1
+check_fixed_source_count \
+  "Historical recovery fixture direct stdout write count" \
+  "scripts/gateway-historical-recovery-broker-nonzero.mjs" \
+  "process.stdout.write" \
+  0
 
 check_fixed_source_count \
   "Gateway stop fixture stdout write count" \
