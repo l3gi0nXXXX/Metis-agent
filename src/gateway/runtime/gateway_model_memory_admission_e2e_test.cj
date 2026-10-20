@@ -882,7 +882,14 @@ public class GatewayModelMemoryAdmissionE2eTest {
                 s3IRequire(s3IJoin(routes[1]), "s3_i_cron_join_timeout")
                 ordinary = None; cron = None
                 File.writeTo(home.join("release.signal"), "release".toArray())
-                s3IRequire(s3IWaitAck(ack, { row: S3IAckTruth => row.completionB == 1 }), "s3_i_completion_ack_timeout")
+                s3IRequire(s3IWaitAck(ack, { row: S3IAckTruth =>
+                    let confirmed = match (getServicePluginSnapshot("gitcode-monitor")) {
+                        case Some(snapshot) => snapshot.dispatch.completionAck == 1
+                        case None => false
+                    }
+                    row.completionB == 1 && confirmed &&
+                        servicePluginWebhookReceiptStore().state("gitcode-monitor", S3I_DELIVERY_ID, S3I_EVENT_ID) == "missing"
+                }), "s3_i_completion_ack_timeout")
                 let wire = s3IAckTruth(ack); let calls = barrier.truth(); let admission = gatewayModelMemoryAdmissionSnapshotForTest()
                 @Expect(wire.acceptedA, 1); @Expect(wire.retryA, 1); @Expect(wire.completionA, 0)
                 @Expect(wire.acceptedB, 1); @Expect(wire.completionB, 1); @Expect(wire.invalid, 0)
