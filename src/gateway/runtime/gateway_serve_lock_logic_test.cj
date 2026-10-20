@@ -5,12 +5,12 @@ import metis.gateway.process.{gatewayStdioBrokerReady, gatewayStdioBrokerSnapsho
 import metis.gateway.service_plugin.loadServicePluginManifest
 import metis.gateway.core.GatewayStopResult
 import metis.process.{ProcessInstanceIdentity, currentProcessInstanceIdentity, managedStdioBroker, managedStdioResolveBrokerScriptPath, probeProcessInstance, processInstanceKillSignal, processInstanceTermSignal, resetManagedStdioBrokerForTest, signalProcessInstance}
-import metis.utils.ShellTimeoutException
+import metis.utils.{InfoUtils, ShellTimeoutException}
 import std.collection.{ArrayList, HashMap, HashSet}
 import std.convert.Parsable
 import std.core.Duration
 import std.env.{getProcessId, getVariable, removeVariable, setVariable}
-import std.fs.{Directory, File, Path, exists, remove}
+import std.fs.{Directory, File, Path, SymbolicLink, exists, remove}
 import std.net.*
 import std.process.{ProcessRedirect, SubProcess, executeWithOutput, launch}
 import std.sync.AtomicInt64
@@ -2536,7 +2536,11 @@ public class GatewayServeLockLogicTest {
                 setVariable("METIS_HOME", home.toString())
                 let bin = home.join("bin")
                 Directory.create(bin, recursive: true)
-                gatewayHeartbeatProbeExecutable(bin.join("lsof"), "exit 1")
+                if (InfoUtils.os == "macos") {
+                    SymbolicLink.create(bin.join("lsof"), to: Path("/usr/bin/false"))
+                } else {
+                    gatewayHeartbeatProbeExecutable(bin.join("lsof"), "exit 1")
+                }
                 let inheritedPath = match (oldPath) { case Some(value) => value case None => "/usr/bin:/bin" }
                 setVariable("PATH", "${bin.toString()}:${inheritedPath}")
                 CliConfig.invalidatePathCache()
