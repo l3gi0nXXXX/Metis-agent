@@ -2253,6 +2253,84 @@ public class GatewayServeLockLogicTest {
     }
 
     @TestCase
+    public func hrS2B2FormalArchiveBarrierRejectsCompetingServe(): Unit {
+        withHrFormalEnvironment("hr-s2b2-archive", { home, _ =>
+            let formal = HrFormalGateway(home)
+            let previousPath = getVariable("PATH")
+            let release = home.join("lsof-archive-release")
+            try {
+                let old = formal.startService("old", nonzeroBroker: true)
+                let original = formal.stopCurrent(1)
+                @Expect(gatewayServeStopCompletionField(original, "status"), "cleanup_pending")
+                @Expect(gatewayServeStopCompletionField(original, "brokerStatus"), "broker_close_exit_nonzero")
+                let business = hrFormalBusinessInput(home)
+                let ready = home.join("new.ready")
+                formal.configure(["service", ready.toString(), home.join("new.release").toString(),
+                    home.join("new.stop").toString(), home.join("business.pending").toString(),
+                    home.join("business.receipt").toString(), home.join("business.effects").toString()])
+                let bin = home.join("lsof-forwarder-bin")
+                Directory.create(bin)
+                File.writeTo(home.join("lsof-gateway-port"), "${formal.port}".toArray())
+                @Expect(executeWithOutput("/bin/ln", ["-s", formal.fixture.toString(), bin.join("lsof").toString()])[0], 0)
+                setVariable("PATH", bin.toString() + ":" + previousPath.getOrDefault { "" })
+                let first = try { formal.launchGateway(directServe: true) }
+                    finally { hrFormalRestore("PATH", previousPath) }
+                let entered = home.join("lsof-archive-entered")
+                @Expect(gatewayServeStopWaitUntil(5000, { => exists(entered) }), true)
+                @Expect(first.isAlive(), true)
+                @Expect(exists(ready), false)
+                let marker = home.join("gateway-serve.stop-complete")
+                let lock = home.join("gateway-serve.lock")
+                let locked = hrFormalRead(lock)
+                @Expect(gatewayParseServeIdentity(locked).getOrThrow().pid, first.pid)
+                @Expect(hrFormalRead(marker), original)
+                @Expect(hrFormalArchiveOriginals(home), [original])
+                @Expect(exists(home.join("business.effects")), false)
+                let competingAt = MonoTime.now()
+                let second = formal.launchGateway(directServe: true)
+                @Expect(second.wait(timeout: Some(Duration.second * 2)), 0)
+                @Expect(second.isAlive(), false)
+                @Expect(gatewayServeStopPidAlive(second.pid), false)
+                @Expect(hrFormalRead(formal.stdoutFiles.get(second.pid).getOrThrow()).contains("无法启动"), true)
+                @Expect(hrFormalRead(lock), locked)
+                @Expect(hrFormalRead(marker), original)
+                @Expect(hrFormalArchiveOriginals(home), [original])
+                @Expect(exists(ready), false)
+                @Expect(first.isAlive(), true)
+                // End only this injection. The in-flight forwarder still runs
+                // real lsof; later host shell probes resolve the system binary.
+                remove(bin.join("lsof"))
+                File.writeTo(release, "release\n".toArray())
+                let competingMs = (MonoTime.now() - competingAt).toMilliseconds()
+                let heldMs = DateTime.now().toUnixTimeStamp().toMilliseconds() - hrFormalNumber(entered, "enteredAtMs")
+                @Expect(competingMs < 500, true)
+                @Expect(heldMs >= 0 && heldMs < 500, true)
+                println("historical recovery archive window: enteredToReleaseMs=${heldMs}, competingMs=${competingMs}")
+                formal.awaitReady(first, ready)
+                @Expect(first.pid != old.pid, true)
+                @Expect(hrFormalRead(lock), locked)
+                @Expect(exists(marker), false)
+                @Expect(hrFormalArchiveOriginals(home), [original])
+                formal.assertJournal(Path(ready.toString() + ".initializations.jsonl"), hrFormalNumber(ready, "pid"))
+                hrFormalBusinessProof(home, business)
+                let final = formal.stopCurrent(0)
+                for (phase in ["status", "brokerStatus", "servicePluginDispatchStatus", "servicePluginOwnerStatus",
+                    "servicePluginLeaseStatus", "servicePluginPortStatus", "channelsStatus", "httpStatus", "canvasStatus", "gatewayServerStatus"]) {
+                    println("historical recovery final ${phase}=${gatewayServeStopCompletionField(final, phase)}")
+                }
+                @Expect(gatewayServeStopCompletionField(final, "fullTerminal"), "1")
+                hrFormalBusinessProof(home, business)
+                hrFormalAssertAllLeasesStopped(home)
+                formal.assertClean()
+            } finally {
+                hrFormalRestore("PATH", previousPath)
+                if (!exists(release)) { File.writeTo(release, "release\n".toArray()) }
+                formal.cleanup()
+            }
+        })
+    }
+
+    @TestCase
     public func hrE2e02V4AndExplicitEvidenceDirectServeRecoveryAgree(): Unit {
         for (mode in ["explicit-v1", "legacy-v4", "unsupported"]) {
             withHrFormalEnvironment("hr-e2e02-${mode}", { home, _ =>
