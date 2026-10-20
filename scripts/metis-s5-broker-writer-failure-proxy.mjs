@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn } from 'node:child_process';
-import { existsSync, renameSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, renameSync, writeFileSync } from 'node:fs';
 import { TextDecoder } from 'node:util';
 
 const brokerScript = process.argv[2] ?? '';
@@ -413,9 +413,17 @@ publishReady();
 const watcher = setInterval(() => {
   if (writerMode && !writerClosed && existsSync(failPath)) {
     writerClosed = true;
+    process.stdin.pause();
+    process.stdin.once('close', () => setImmediate(() => {
+      // Node preserves the standard descriptor after destroying its input stream.
+      // Wait until libuv finishes stream teardown before closing our owned fd 0.
+      try { closeSync(0); } catch (error) {
+        if (error?.code !== 'EBADF') throw error;
+      }
+      broker.stdin.destroy();
+      writeAtomic(closedPath, 'writer_closed\n');
+    }));
     process.stdin.destroy();
-    broker.stdin.destroy();
-    writeAtomic(closedPath, 'writer_closed\n');
   }
   if (writerMode && existsSync(cleanupPath) && broker.exitCode === null && broker.signalCode === null) {
     broker.kill('SIGKILL');
