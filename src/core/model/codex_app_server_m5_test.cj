@@ -1,6 +1,6 @@
 package metis.core.model
 
-import metis.process.managedStdioBroker
+import metis.process.{ManagedStdioEvent, managedStdioBroker}
 
 import std.collection.{ArrayList, HashMap}
 import std.convert.Parsable
@@ -729,6 +729,55 @@ public class CodexAppServerM5Test {
         @Expect(after.generation > before.generation, true)
         @Expect(after.readerCount, 1)
         @Expect(after.dispatcherCount, 1)
+    }
+
+    @TestCase
+    public func v4U1ExpiredPollsKeepLateFramesQueuedWithoutStartingOwner(): Unit {
+        let before = managedStdioBroker().debugSnapshotForTest()
+        let client = CodexAppServerClient(absoluteDeadlineMs: 1)
+        client.onManagedStdioEvent(ManagedStdioEvent("owner.stdout", text: "{\"id\":9,\"method\":\"approval\"}"))
+        client.onManagedStdioEvent(ManagedStdioEvent("owner.stdout", text: "{\"method\":\"turn/completed\"}"))
+        try {
+            for (cap in [1, 0, -1]) {
+                @Expect(client.takeServerRequest(cap).isNone(), true)
+                @Expect(client.takeNotification(cap).isNone(), true)
+            }
+            @Expect(client.debugPendingNotificationCountForTest(), 1)
+            for (operation in 0..3) {
+                var strictTimeout = false
+                try {
+                    if (operation == 0) { client.start(1) }
+                    else if (operation == 1) { let _ = client.request("initialize", JsonObject(), 1) }
+                    else { client.respond(9, JsonObject()) }
+                } catch (e: CodexAppServerProtocolException) {
+                    strictTimeout = e.code == -32001 && e.message == "codex app-server work deadline exhausted"
+                }
+                @Expect(strictTimeout, true)
+            }
+            let after = managedStdioBroker().debugSnapshotForTest()
+            @Expect(after.ownerCount, before.ownerCount)
+            @Expect(after.readerCount, before.readerCount)
+            @Expect(after.dispatcherCount, before.dispatcherCount)
+            @Expect(after.generation, before.generation)
+            @Expect(after.brokerPid, before.brokerPid)
+        } finally { client.close() }
+    }
+
+    @TestCase
+    public func v4B1LivePollsPreserveDefaultAndCappedQueueReads(): Unit {
+        for (absolute in [0, codexAppServerAbsoluteDeadlineMs(5000)]) {
+            let client = CodexAppServerClient(absoluteDeadlineMs: absolute)
+            try {
+                for (cap in [1, 0, -1]) {
+                    client.onManagedStdioEvent(ManagedStdioEvent("owner.stdout", text: "{\"id\":9,\"method\":\"approval\"}"))
+                    client.onManagedStdioEvent(ManagedStdioEvent("owner.stdout", text: "{\"method\":\"turn/completed\"}"))
+                    @Expect(client.takeServerRequest(cap).isSome(), true)
+                    @Expect(client.takeNotification(cap).isSome(), true)
+                }
+                @Expect(client.takeServerRequest(1).isNone(), true)
+                @Expect(client.takeNotification(1).isNone(), true)
+            } finally { client.close() }
+        }
     }
 
     @TestCase

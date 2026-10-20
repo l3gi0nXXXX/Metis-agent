@@ -278,11 +278,15 @@ public class CodexAppServerClient <: CodexAppServerTransport & ManagedStdioOwner
     }
 
     public func takeServerRequest(timeoutMs: Int64): Option<JsonObject> {
-        this.serverRequests.read(this.workTimeoutMs(timeoutMs))
+        let remaining = this.pollTimeoutMs(timeoutMs)
+        if (remaining <= 0) { return None<JsonObject> }
+        this.serverRequests.read(remaining)
     }
 
     public func takeNotification(timeoutMs: Int64): Option<JsonObject> {
-        this.notifications.read(this.workTimeoutMs(timeoutMs))
+        let remaining = this.pollTimeoutMs(timeoutMs)
+        if (remaining <= 0) { return None<JsonObject> }
+        this.notifications.read(remaining)
     }
 
     public func isAlive(): Bool {
@@ -506,6 +510,12 @@ public class CodexAppServerClient <: CodexAppServerTransport & ManagedStdioOwner
                 code: -32002
             )
         }
+    }
+
+    private func pollTimeoutMs(capMs: Int64): Int64 {
+        let cap = if (capMs > 0) { capMs } else { 30000 }
+        if (this.absoluteDeadlineMs <= 0) { return cap }
+        min(codexAppServerWorkRemainingMs(this.absoluteDeadlineMs), cap)
     }
 
     private func workTimeoutMs(capMs: Int64): Int64 {
