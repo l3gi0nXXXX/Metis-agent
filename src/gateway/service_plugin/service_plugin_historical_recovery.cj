@@ -192,6 +192,7 @@ public func probeServicePluginHistoricalResources(parentPid: Int64, parentStarte
                 if (lease.parentPid != parentPid) { continue }
                 if (!servicePluginHistoricalLeaseMatchesParent(lease, parentPid, parentStartedAtMs)) { return fail("identity_mismatch") }
                 evidence.add(lease)
+                if (lease.state != "stopped" && !["running", "starting", "stopping"].contains(lease.state)) { return fail("lease_state_unknown") }
                 if (lease.state != "stopped") { return ServicePluginHistoricalRecoveryResult(true, false, "lease_active", evidence: evidence.toArray(), parentPid: parentPid, parentStartedAtMs: parentStartedAtMs) }
                 let pid = servicePluginProbePid(lease.pid, hostDeadline)
                 if (!pid.conclusive) { return fail(pid.status) }
