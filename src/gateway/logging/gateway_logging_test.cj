@@ -42,6 +42,57 @@ private func loggingTestOccurrenceCount(text: String, needle: String): Int64 {
 @Test
 public class GatewayLoggingTest {
     @TestCase
+    public func hrS2U2RecoveryEventsAreStructuredRedactedAndRuneSafe(): Unit {
+        let oldHome = getVariable("METIS_HOME")
+        let oldLevel = getVariable("METIS_LOG_LEVEL")
+        let oldFile = getVariable("METIS_LOG_FILE")
+        let oldConsole = getVariable("METIS_CONSOLE_LEVEL")
+        let home = loggingTestHome("historical-recovery")
+        let file = home.join("recovery.jsonl")
+        try {
+            loggingTestReset(home)
+            setVariable("METIS_LOG_LEVEL", "debug")
+            setVariable("METIS_LOG_FILE", file.toString())
+            setVariable("METIS_CONSOLE_LEVEL", "silent")
+            gatewayLoggingCaptureConsoleForTest()
+            let logger = metisCreateSubsystemLogger("gateway/recovery")
+            let meta = JsonObject()
+            meta.put("phase", JsonString("historical_recovery"))
+            meta.put("reason", JsonString("API_TOKEN=synthetic-secret /Users/synthetic/private " + String(Array<Rune>(3000, repeat: r'中')) + "🧪"))
+            meta.put("durationMs", JsonInt(1))
+            for (event in [MetisLogEvent.gatewayRecoveryChecked, MetisLogEvent.gatewayRecoveryBlocked, MetisLogEvent.gatewayRecoveryReconciled]) {
+                @Expect(gatewayLogEventIsKnown(event), true)
+                logger.infoFileOnly(event, "恢复测试🧪", meta: meta)
+            }
+            let raw = String.fromUtf8(File.readFrom(file))
+            @Expect(raw.contains("synthetic-secret"), false)
+            @Expect(raw.contains("/Users/synthetic/private"), false)
+            @Expect(raw.contains("[truncated]"), true)
+            var count: Int64 = 0
+            for (line in raw.split("\n")) {
+                if (line.trimAscii().isEmpty()) { continue }
+                let row = JsonValue.fromStr(line).asObject()
+                @Expect(row.get("phase").getOrThrow().asString().getValue(), "historical_recovery")
+                @Expect(row.get("durationMs").getOrThrow().asInt().getValue(), 1)
+                @Expect(gatewayLogEventIsKnown(row.get("event").getOrThrow().asString().getValue()), true)
+                count += 1
+            }
+            @Expect(count, 3)
+            @Expect(gatewayLoggingCapturedConsoleForTest().size, 0)
+            @Expect(gatewayLogTruncateText("中文🧪中文🧪", limit: 17).contains("[truncated]"), true)
+        } finally {
+            loggingTestRestoreEnv("METIS_HOME", oldHome)
+            loggingTestRestoreEnv("METIS_LOG_LEVEL", oldLevel)
+            loggingTestRestoreEnv("METIS_LOG_FILE", oldFile)
+            loggingTestRestoreEnv("METIS_CONSOLE_LEVEL", oldConsole)
+            CliConfig.invalidatePathCache()
+            CliSettingManager.invalidate()
+            gatewayLoggingResetForTest()
+            remove(home, recursive: true)
+        }
+    }
+
+    @TestCase
     public func s3U2RuntimePersistenceTransitionEventsStayInDictionary(): Unit {
         @Expect(gatewayLogEventIsKnown(MetisLogEvent.gatewayRuntimeStatePersistFailed), true)
         @Expect(gatewayLogEventIsKnown(MetisLogEvent.gatewayRuntimeStatePersistRecovered), true)

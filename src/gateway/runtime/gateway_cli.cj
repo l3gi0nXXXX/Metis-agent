@@ -1334,13 +1334,20 @@ private func runGatewayStopSubcommand(): Int64 {
         case None => []
     }
     if (!exists(lockPath) && stopPids.isEmpty()) {
-        var pending = gatewayPendingServeCompletionStatus()
-        if (discovery.conclusive && listenerPids.isEmpty() && pending == "cleanup_pending" &&
-            gatewayHistoricalServeCompletionRecoveryStatus().ok) {
-            pending = "recoverable"
+        let pending = gatewayPendingServeCompletionStatus()
+        if (pending == "cleanup_pending") {
+            let preview = gatewayHistoricalServeCompletionRecoveryStatus()
+            if (discovery.conclusive && listenerPids.isEmpty() && preview.ok) {
+                gatewayStopPrintLine(gatewayStopOutcomeHumanText("recoverable"))
+                gatewayCliTimingLog("stop", "historical-recoverable", startMs)
+                return 0
+            }
+            gatewayStopPrintLine(gatewayStopOutcomeHumanText(preview.status))
+            gatewayCliTimingLog("stop", "cleanup-pending-no-lock", startMs)
+            return 1
         }
-        if (!discovery.conclusive || pending == "cleanup_pending" || pending == "malformed" || pending == "invalid_response_encoding" || !listenerPids.isEmpty()) {
-            gatewayStopPrintLine(gatewayStopOutcomeHumanText("cleanup_pending"))
+        if (!discovery.conclusive || pending == "malformed" || pending == "invalid_response_encoding" || !listenerPids.isEmpty()) {
+            gatewayStopPrintLine(gatewayStopOutcomeHumanText(if (!listenerPids.isEmpty()) { "resources_active" } else { "resources_unknown" }))
             gatewayCliTimingLog("stop", "cleanup-pending-no-lock", startMs)
             return 1
         }
@@ -1428,7 +1435,11 @@ public func gatewayStopOutcomeHumanText(status: String): String {
         case "graceful" => "[网关] 已正常停止。"
         case "force_terminated" => "[网关] 已强制停止。"
         case "stale_identity" => "[网关] 停止目标身份已变化，未向替代进程发送强制信号。"
-        case _ => "[网关] 主进程已退出但子进程清理未完成。"
+        case "recoverable" => "[网关] 未发现存活的旧网关资源，历史清理失败记录可恢复；启动时将重新核验并归档。"
+        case "identity_alive" | "pid_alive" | "lease_active" | "port_active" | "resources_active" => "[网关] 仍有进程或监听端口活动，已拒绝启动；历史记录保持不变。"
+        case "resources_unknown" | "resources_not_terminal" | "lease_evidence_missing" | "invalid_response_encoding" | "malformed" => "[网关] 无法确认历史资源已全部停止，已拒绝启动；请检查清理诊断。"
+        case "cleanup_pending" => "[网关] 主进程已退出但子进程清理未完成。"
+        case _ => "[网关] 无法确认历史资源已全部停止，已拒绝启动；请检查清理诊断。"
     }
 }
 
@@ -1438,7 +1449,7 @@ public func gatewayExecuteStopServe(): Int64 {
 }
 
 /** 与命令行 `gateway restart` 相同逻辑。 */
-public func gatewayExecuteRestartServe(): Int64 {
+public func gatewayExecuteRestartServe(launchServe!: () -> Bool = { => gatewayLaunchDedicatedConsole() }): Int64 {
     let startMs = gatewayCliNowMs()
     gatewayCliTimingLog("restart", "enter", startMs)
     match (gatewayRestartConfigValidationMessage()) {
@@ -1455,7 +1466,7 @@ public func gatewayExecuteRestartServe(): Int64 {
     }
     gatewayCliTimingLog("restart", "stop-done", startMs)
     PrintUtils.printLine("[网关] 正在另开窗口启动 gateway serve …")
-    let launched = gatewayLaunchDedicatedConsole()
+    let launched = launchServe()
     gatewayCliTimingLog("restart", if (launched) { "launch-done" } else { "launch-failed" }, startMs)
     return if (launched) {
         0

@@ -38,6 +38,8 @@ public class GatewayStopResult {
     public let servicePluginPortStatus: String
     public let servicePluginPendingCount: Int64
     public let channelsStatus: String
+    public let brokerExternalTerminal: Bool
+    public let brokerTerminalBasis: String
     public let brokerStatus: String
     public let diagnostic: String
 
@@ -57,6 +59,8 @@ public class GatewayStopResult {
         servicePluginPendingCount!: Int64 = 0,
         channelsStatus!: String = "not_checked",
         brokerStatus!: String = "not_checked",
+        brokerExternalTerminal!: Bool = false,
+        brokerTerminalBasis!: String = "unknown",
         diagnostic!: String = ""
     ) {
         this.ok = ok
@@ -74,6 +78,8 @@ public class GatewayStopResult {
         this.servicePluginPendingCount = max(0, servicePluginPendingCount)
         this.channelsStatus = channelsStatus.trimAscii()
         this.brokerStatus = brokerStatus.trimAscii()
+        this.brokerExternalTerminal = brokerExternalTerminal
+        this.brokerTerminalBasis = brokerTerminalBasis
         this.diagnostic = diagnostic.trimAscii()
     }
 }
@@ -149,6 +155,8 @@ func gatewayServiceStopOwnersThenBroker(
     var channelsStatus = "channels_failed"
     var brokerOk = false
     var brokerStatus = "broker_failed"
+    var brokerExternalTerminal = false
+    var brokerTerminalBasis = "unknown"
     gatewayServiceNotifyShutdownObserver(shutdownObserver, "owners_enter")
     try {
         let owners = stopOwners()
@@ -180,6 +188,8 @@ func gatewayServiceStopOwnersThenBroker(
         let brokerResult = stopBroker()
         brokerOk = brokerResult.ok
         brokerStatus = brokerResult.status
+        brokerExternalTerminal = brokerResult.externalTerminal
+        brokerTerminalBasis = brokerResult.terminalBasis
         if (!brokerResult.ok) {
             gatewayLogEventError(
                 "gateway/service",
@@ -211,6 +221,8 @@ func gatewayServiceStopOwnersThenBroker(
         servicePluginPendingCount: servicePluginPendingCount,
         channelsStatus: channelsStatus,
         brokerStatus: brokerStatus,
+        brokerExternalTerminal: brokerExternalTerminal,
+        brokerTerminalBasis: brokerTerminalBasis,
         diagnostic: "owners=${ownersStatus} channels=${channelsStatus} broker=${brokerStatus}"
     )
 }
@@ -475,6 +487,8 @@ public class GatewayService {
             servicePluginPendingCount: stopped.servicePluginPendingCount,
             channelsStatus: stopped.channelsStatus,
             brokerStatus: stopped.brokerStatus,
+            brokerExternalTerminal: stopped.brokerExternalTerminal,
+            brokerTerminalBasis: stopped.brokerTerminalBasis,
             diagnostic: "inbound=${inboundStop.status} compat=${compat[1]} sidecar=${sidecar[1]} ${stopped.diagnostic}"
         )
         let meta = gatewayLogMeta()

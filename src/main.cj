@@ -1,5 +1,7 @@
 package metis
 
+import metis.process.{ManagedStdioOperationResult, shutdownManagedStdioBroker}
+
 
 @When[os == "Windows"]
 import magic.utils.winGetArgs
@@ -18,5 +20,22 @@ main(args: Array<String>): Int64 {
 }
 
 func cliMain(args: Array<String>): Int64 {
-    runCliProgram(args)
+    cliRunWithBrokerCleanup({ => runCliProgram(args) }, { => shutdownManagedStdioBroker() })
+}
+
+/** Cleanup owns only this process singleton. It must never replace the primary error. */
+func cliRunWithBrokerCleanup(run: () -> Int64, cleanup: () -> ManagedStdioOperationResult): Int64 {
+    var code: Int64 = 1
+    var returned = false
+    try {
+        code = run()
+        returned = true
+    } finally {
+        let closed = try { cleanup().ok } catch (_: Exception) { false }
+        if (!closed) {
+            try { eprintln("Metis 子进程通道清理未完成。") } catch (_: Exception) { () }
+            if (returned && code == 0) { code = 1 }
+        }
+    }
+    code
 }
