@@ -2,6 +2,8 @@ package metis.gateway.runtime
 
 import metis.core.config.{CliConfig, CliSettingManager, MetisConfigManager, MetisProcessEnvironmentLock}
 import metis.gateway.core.GatewayStopResult
+import metis.gateway.logging.{gatewayLoggingResetForTest, gatewayLoggingCaptureConsoleForTest, gatewayLoggingCapturedConsoleForTest, MetisLogEvent}
+import stdx.encoding.json.JsonValue
 import metis.gateway.service_plugin.{setServicePluginPidProbeCommandForTest, setServicePluginPortReleaseCommandForTest}
 import metis.process.{ProcessInstanceIdentity, currentProcessInstanceIdentity, resetManagedStdioBrokerForTest}
 import std.core.Duration
@@ -108,6 +110,9 @@ public class GatewayHistoricalRecoveryTest {
             @Expect(gatewayHistoricalServeCompletionRecoveryStatus().status, "resources_not_terminal")
             let explicit = hrRuntimeWriteMarker(identity, legacy: false)
             @Expect(gatewayParseHistoricalCompletionStrict(explicit.replace("recoveryEvidenceVersion:1", "recoveryEvidenceVersion:2")).status, "evidence_version_unsupported")
+            @Expect(gatewayParseHistoricalCompletionStrict(explicit.replace("brokerExternalTerminal:1", "brokerExternalTerminal:0")).status, "malformed")
+            @Expect(gatewayParseHistoricalCompletionStrict(explicit.replace("brokerTerminalBasis:closed_ack_exit_observed", "brokerTerminalBasis:unknown")).status, "malformed")
+            @Expect(gatewayParseHistoricalCompletionStrict(explicit.replace("brokerTerminalBasis:closed_ack_exit_observed", "brokerTerminalBasis:untrusted")).status, "malformed")
             @Expect(gatewayParseHistoricalCompletionStrict(explicit + "pid:${identity.pid}\n").status, "malformed")
             @Expect(gatewayParseHistoricalCompletionStrict(explicit.replace("servicePluginLeaseStatus:cleanup_pending\n", "")).status, "malformed")
             File.writeTo(home.join("gateway-serve.stop-complete"), explicit.replace("servicePluginLeaseStatus:cleanup_pending", "servicePluginLeaseStatus:not_checked").toArray())
@@ -122,6 +127,13 @@ public class GatewayHistoricalRecoveryTest {
             @Expect(gatewayParseHistoricalCompletionStrict(original).identity.getOrThrow().nonce, "历史恢复-测试🧪")
             @Expect(gatewayParseHistoricalCompletionStrict(original.replace(identity.nonce, String(Array<Rune>(4097, repeat: r'中')))).status, "evidence_limit_exceeded")
             @Expect(gatewayParseHistoricalCompletionStrict(original.replace("pid:${identity.pid}\n", "pid:7\n")).status, "identity_mismatch")
+            let nonce4096 = String(Array<Rune>(1365, repeat: r'中')) + "x"
+            @Expect(nonce4096.size, 4096)
+            @Expect(gatewayParseHistoricalCompletionStrict(original.replace(identity.nonce, nonce4096)).ok, true)
+            let full = original + String(Array<Rune>(65536 - original.size, repeat: r'\n'))
+            @Expect(gatewayParseHistoricalCompletionStrict(full).ok, true)
+            @Expect(gatewayParseHistoricalCompletionStrict(full + "\n").status, "evidence_limit_exceeded")
+            @Expect(gatewayParseHistoricalCompletionStrict(original + "\u{0}").status, "malformed")
             @Expect(gatewayParseHistoricalCompletionStrict("{").ok, false)
             File.writeTo(home.join("gateway-serve.stop-complete"), [0xffu8, 0xfeu8, 0x00u8])
             @Expect(gatewayHistoricalServeCompletionRecoveryStatus().status, "invalid_response_encoding")
@@ -220,6 +232,13 @@ public class GatewayHistoricalRecoveryTest {
             let original = hrRuntimeWriteMarker(identity)
             File.writeTo(home.join("gateway-serve.stop-complete"), original.replace("httpStatus:stopped", "httpStatus:close_failed").toArray())
             @Expect(gatewayHistoricalServeCompletionRecoveryStatus().status, "resources_not_terminal")
+            for (field in ["inboundStatus:stopped", "compatStatus:stopped", "sidecarStatus:disabled", "servicePluginIngressStatus:sent", "servicePluginDispatchStatus:cleanup_pending", "servicePluginOwnerStatus:terminated", "channelsStatus:stopped", "httpStatus:stopped", "canvasStatus:stopped", "gatewayServerStatus:stopped"]) {
+                for (failure in ["close_failed", "timeout"]) {
+                    let key = field.split(":")[0]
+                    File.writeTo(home.join("gateway-serve.stop-complete"), original.replace(field, "${key}:${failure}").toArray())
+                    @Expect(gatewayHistoricalServeCompletionRecoveryStatus().status, "resources_not_terminal")
+                }
+            }
         })
     }
 
@@ -246,4 +265,157 @@ public class GatewayHistoricalRecoveryTest {
             @Expect(committed, 1)
         })
     }
+    @TestCase
+    public func hrS2ArchiveBarrierRejectsAllChangedInputs(): Unit {
+        for (fault in ["marker", "lock", "session", "encoding", "deadline", "exception"]) {
+            hrRuntimeHome({ home, identity =>
+                @Expect(gatewayAcquireServeLockForRunningProcess(), true)
+                let original = hrRuntimeWriteMarker(identity)
+                let lease = hrRuntimeWriteLease(home, identity)
+                let leaseText = String.fromUtf8(File.readFrom(lease))
+                let marker = home.join("gateway-serve.stop-complete")
+                let lock = home.join("gateway-serve.lock")
+                let lockText = String.fromUtf8(File.readFrom(lock))
+                let business = home.join("pending-business.json")
+                File.writeTo(business, "待处理🧪".toArray())
+                let evidence = gatewayCollectHistoricalRecoveryEvidence(MonoTime.now() + Duration.second)
+                let deadline = MonoTime.now() + Duration.second * 2
+                let result = gatewayCommitHistoricalRecovery(evidence, deadline, afterArchive: { =>
+                    match (fault) {
+                        case "marker" => File.writeTo(marker, original.replace(identity.nonce, "新实例🧪").toArray())
+                        case "lock" => File.writeTo(lock, lockText.replace("nonce:", "nonce:replacement-").toArray())
+                        case "session" =>
+                            remove(lease)
+                            File.writeTo(lease.parent.join("replacement-session.lease.json"),
+                                leaseText.replace("test-plugin-1", "replacement-session").toArray())
+                        case "encoding" => File.writeTo(marker, [0xffu8, 0xfeu8])
+                        case "deadline" => while (MonoTime.now() <= deadline) { sleep(Duration.millisecond * 5) }
+                        case _ => throw Exception("controlled recovery barrier failure")
+                    }
+                })
+                let expected = match (fault) {
+                    case "marker" | "session" => "identity_changed"
+                    case "lock" => "lock_not_owned"
+                    case "encoding" => "invalid_response_encoding"
+                    case "deadline" => "deadline_exceeded"
+                    case _ => "recovery_revalidation_failed"
+                }
+                @Expect(result.status, expected)
+                @Expect(result.ok, false)
+                @Expect(exists(marker), true)
+                @Expect(String.fromUtf8(File.readFrom(business)), "待处理🧪")
+                if (fault == "marker") { @Expect(String.fromUtf8(File.readFrom(marker)).contains("新实例🧪"), true) }
+                if (fault == "session") { @Expect(exists(lease.parent.join("replacement-session.lease.json")), true) }
+                if (fault != "marker" && fault != "encoding") { @Expect(String.fromUtf8(File.readFrom(marker)), original) }
+                var archived: Int64 = 0
+                for (entry in Directory.readFrom(home.join("gateway-serve.recovery-history"))) {
+                    if (entry.name.endsWith(".completion")) {
+                        archived += 1
+                        @Expect(String.fromUtf8(File.readFrom(entry.path)), original)
+                    }
+                }
+                @Expect(archived, 1)
+                if (fault == "lock") { File.writeTo(lock, lockText.toArray()) }
+            })
+        }
+    }
+
+    @TestCase
+    public func hrS2ForeignListenerAppearingAfterArchiveStaysAlive(): Unit {
+        hrRuntimeHome({ home, identity =>
+            @Expect(gatewayAcquireServeLockForRunningProcess(), true)
+            let original = hrRuntimeWriteMarker(identity)
+            let lease = hrRuntimeWriteLease(home, identity)
+            let leaseText = String.fromUtf8(File.readFrom(lease))
+            let evidence = gatewayCollectHistoricalRecoveryEvidence(MonoTime.now() + Duration.second)
+            try (listener = TcpServerSocket(bindAt: UInt16(gatewayConfiguredServePort()))) {
+                let result = gatewayCommitHistoricalRecovery(evidence, MonoTime.now() + Duration.second,
+                    afterArchive: { =>
+                        listener.bind()
+                        File.writeTo(lease, leaseText.replace("\"port\":0", "\"port\":${gatewayConfiguredServePort()}").toArray())
+                        setServicePluginPortReleaseCommandForTest(None)
+                    })
+                @Expect(result.ok, false)
+                @Expect(result.status, "port_active")
+                @Expect(String.fromUtf8(File.readFrom(home.join("gateway-serve.stop-complete"))), original)
+                // The foreign listener is still listening before test-owned cleanup closes it.
+                @Expect(Int64((listener.localAddress as IPSocketAddress).getOrThrow().port), gatewayConfiguredServePort())
+                let live = executeWithOutput("/usr/sbin/lsof", ["-nP", "-iTCP:${gatewayConfiguredServePort()}", "-sTCP:LISTEN", "-t"])
+                @Expect(live[0], 0)
+                @Expect(try { !String.fromUtf8(live[1]).trimAscii().isEmpty() } catch (_: Exception) { false }, true)
+            }
+        })
+    }
+
+    @TestCase
+    public func hrS2RealCollectorLogsSchemaClassesAndSingleReconciliation(): Unit {
+        hrRuntimeHome({ home, identity =>
+            let oldFile = getVariable("METIS_LOG_FILE")
+            let oldLevel = getVariable("METIS_LOG_LEVEL")
+            let oldConsole = getVariable("METIS_CONSOLE_LEVEL")
+            let file = home.join("recovery.jsonl")
+            try {
+                setVariable("METIS_LOG_FILE", file.toString())
+                setVariable("METIS_LOG_LEVEL", "debug")
+                setVariable("METIS_CONSOLE_LEVEL", "silent")
+                gatewayLoggingResetForTest()
+                gatewayLoggingCaptureConsoleForTest()
+                @Expect(gatewayAcquireServeLockForRunningProcess(), true)
+                let _ = hrRuntimeWriteMarker(identity)
+                let _ = hrRuntimeWriteLease(home, identity)
+                @Expect(gatewayHistoricalServeCompletionRecoveryStatus().status, "recoverable")
+                setServicePluginPidProbeCommandForTest(Some({ _, _ => (0, "", "") }))
+                @Expect(gatewayHistoricalServeCompletionRecoveryStatus().status, "pid_alive")
+                setServicePluginPidProbeCommandForTest(Some({ _, _ => (1, "", "No such process") }))
+                setGatewayServePortProbeForTest(Some({ _, _ => (1, "partial", "") }))
+                @Expect(gatewayHistoricalServeCompletionRecoveryStatus().status, "port_probe_failed")
+                setGatewayServePortProbeForTest(Some({ _, _ => (1, "", "") }))
+                let evidence = gatewayCollectHistoricalRecoveryEvidence(MonoTime.now() + Duration.second)
+                @Expect(gatewayCommitHistoricalRecovery(evidence, MonoTime.now() + Duration.second * 3).status, "reconciled")
+                let raw = String.fromUtf8(File.readFrom(file))
+                @Expect(raw.contains(home.toString()), false)
+                @Expect(raw.contains(identity.nonce), false)
+                var reconciled: Int64 = 0
+                var active: Int64 = 0
+                var unknown: Int64 = 0
+                var terminal: Int64 = 0
+                for (line in raw.split("\n")) {
+                    if (line.isEmpty()) { continue }
+                    let row = JsonValue.fromStr(line).asObject()
+                    let event = row.get("event").getOrThrow().asString().getValue()
+                    if (![MetisLogEvent.gatewayRecoveryChecked, MetisLogEvent.gatewayRecoveryBlocked, MetisLogEvent.gatewayRecoveryReconciled].contains(event)) { continue }
+                    @Expect(row.get("oldPid").getOrThrow().asInt().getValue(), identity.pid)
+                    @Expect(row.get("identityHash").getOrThrow().asString().getValue().isEmpty(), false)
+                    @Expect(row.get("historicalStatus").getOrThrow().asString().getValue(), "cleanup_pending")
+                    @Expect(row.get("phase").getOrThrow().asString().getValue(), "historical_recovery")
+                    @Expect(row.get("reason").getOrThrow().asString().getValue().isEmpty(), false)
+                    @Expect(row.get("count").getOrThrow().asInt().getValue(), 1)
+                    @Expect(row.get("durationMs").getOrThrow().asInt().getValue() >= 0, true)
+                    match (row.get("resourceStatus").getOrThrow().asString().getValue()) {
+                        case "terminal" => terminal += 1
+                        case "active" => active += 1
+                        case "unknown" => unknown += 1
+                        case _ => @Expect(false, true)
+                    }
+                    if (event == MetisLogEvent.gatewayRecoveryReconciled) { reconciled += 1 }
+                }
+                @Expect(reconciled, 1)
+                @Expect(active > 0 && unknown > 0 && terminal > 0, true)
+                @Expect(gatewayLoggingCapturedConsoleForTest().size, 0)
+                let archive = home.join("gateway-serve.recovery-history")
+                let dirMode = executeWithOutput("/usr/bin/stat", ["-f", "%Lp", archive.toString()])
+                @Expect(try { String.fromUtf8(dirMode[1]).trimAscii() } catch (_: Exception) { "invalid" }, "700")
+                for (entry in Directory.readFrom(archive)) {
+                    let mode = executeWithOutput("/usr/bin/stat", ["-f", "%Lp", entry.path.toString()])
+                    @Expect(try { String.fromUtf8(mode[1]).trimAscii() } catch (_: Exception) { "invalid" }, "600")
+                }
+            } finally {
+                setVariable("METIS_LOG_FILE", oldFile.getOrDefault({ => "" }))
+                setVariable("METIS_LOG_LEVEL", oldLevel.getOrDefault({ => "" }))
+                setVariable("METIS_CONSOLE_LEVEL", oldConsole.getOrDefault({ => "" }))
+                gatewayLoggingResetForTest()
+            }
+        })
+    }
+
 }

@@ -6,6 +6,7 @@ import std.core.Duration
 import std.env.{getVariable, setVariable}
 import std.fs.{Directory, File, Path, exists, remove}
 import std.process.executeWithOutput
+import std.posix.chmod
 import std.time.{DateTime, MonoTime}
 import std.unittest.testmacro.*
 
@@ -155,4 +156,75 @@ public class ServicePluginHistoricalRecoveryTest {
             @Expect(String.fromUtf8(File.readFrom(path)), changed)
         })
     }
+    @TestCase
+    public func hrS1ContractBranchesHavePreciseReasonsAndRegistryIsolation(): Unit {
+        hrHostHome({ home =>
+            let before = listServicePlugins().toArray()
+            let path = hrHostLease(home, "one", port: 12345)
+            for ((exit, error, expected, conclusive) in [
+                (Int64(0), "", "pid_alive", true), (Int64(1), "Operation not permitted", "pid_probe_permission_denied", false),
+                (Int64(124), "", "pid_probe_timeout", false), (SHELL_INVALID_RESPONSE_ENCODING_EXIT_CODE, "", "invalid_response_encoding", false)]) {
+                setServicePluginPidProbeCommandForTest(Some({ _, _ => (exit, "", error) }))
+                let result = probeServicePluginHistoricalResources(987654321, 1000, MonoTime.now() + Duration.second)
+                @Expect(result.status, expected)
+                @Expect(result.conclusive, conclusive)
+                @Expect(result.terminal, false)
+            }
+            setServicePluginPidProbeCommandForTest(Some({ _, _ => (1, "", "No such process") }))
+            for ((exit, output, error, expected, conclusive) in [
+                (Int64(0), "p4321", "", "port_active", true), (Int64(1), "p4321", "", "port_probe_unavailable", false),
+                (Int64(124), "", "", "port_probe_timeout", false),
+                (SHELL_INVALID_RESPONSE_ENCODING_EXIT_CODE, "", "", "invalid_response_encoding", false),
+                (Int64(1), "", "Operation not permitted", "port_probe_unavailable", false)]) {
+                setServicePluginPortReleaseCommandForTest(Some({ _, _, _ => (exit, output, error) }))
+                let result = probeServicePluginHistoricalResources(987654321, 1000, MonoTime.now() + Duration.second)
+                @Expect(result.status, expected)
+                @Expect(result.conclusive, conclusive)
+                @Expect(result.terminal, false)
+            }
+            setServicePluginPortReleaseCommandForTest(Some({ _, _, _ => (1, "", "") }))
+            chmod(path.toString(), UInt32(0o000))
+            try { @Expect(servicePluginReadHistoricalLeaseStrict(path).status, "read_failed") }
+            finally { chmod(path.toString(), UInt32(0o600)) }
+            chmod(path.parent.toString(), UInt32(0o000))
+            try {
+                let denied = probeServicePluginHistoricalResources(987654321, 1000, MonoTime.now() + Duration.second)
+                @Expect(denied.terminal, false)
+                @Expect(denied.conclusive, false)
+                @Expect(denied.status, "scan_failed")
+            } finally { chmod(path.parent.toString(), UInt32(0o700)) }
+            let _ = hrHostLease(home, "one", state: "unknown-external-state")
+            let unknown = probeServicePluginHistoricalResources(987654321, 1000, MonoTime.now() + Duration.second)
+            @Expect(unknown.status, "lease_state_unknown")
+            @Expect(unknown.conclusive, false)
+            @Expect(unknown.terminal, false)
+            remove(path)
+            @Expect(probeServicePluginHistoricalResources(987654321, 1000, MonoTime.now() + Duration.second).status, "lease_evidence_missing")
+            @Expect(listServicePlugins().size, before.size)
+            for (entry in before) {
+                let after = getServicePluginSnapshot(entry.serviceId).getOrThrow()
+                @Expect(after.instanceId, entry.instanceId)
+                @Expect(after.pid, entry.pid)
+                @Expect(after.status, entry.status)
+            }
+        })
+    }
+
+    @TestCase
+    public func hrS1N2SessionReplacementInvalidatesCompleteSnapshot(): Unit {
+        hrHostHome({ home =>
+            let old = hrHostLease(home, "old-session")
+            let evidence = probeServicePluginHistoricalResources(987654321, 1000, MonoTime.now() + Duration.second)
+            @Expect(evidence.terminal, true)
+            remove(old)
+            let replacement = hrHostLease(home, "new-session")
+            let bytes = File.readFrom(replacement)
+            let result = revalidateServicePluginHistoricalEvidence(evidence, MonoTime.now() + Duration.second)
+            @Expect(result.status, "identity_changed")
+            @Expect(result.conclusive, false)
+            @Expect(result.terminal, false)
+            @Expect(File.readFrom(replacement), bytes)
+        })
+    }
+
 }
