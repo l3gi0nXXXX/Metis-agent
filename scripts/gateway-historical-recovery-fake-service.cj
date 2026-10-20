@@ -2,9 +2,10 @@ package gateway_historical_recovery_fixture
 
 import std.convert.Parsable
 import std.env.{getProcessId, getVariable}
-import std.fs.{File, FileInfo, OpenMode, Path, canonicalize, exists, rename}
+import std.fs.{Directory, File, FileInfo, OpenMode, Path, canonicalize, exists, rename}
 import std.io.StringReader
 import std.net.*
+import std.process.{ProcessRedirect, launch}
 import std.sync.AtomicBool
 import std.time.*
 import stdx.encoding.json.*
@@ -273,10 +274,41 @@ func runDelegate(args: Array<String>): Int64 {
     0
 }
 
+// The task-owned bin/lsof link uses this native mode. It never manufactures a
+// probe result: after the controlled archive window it runs the system lsof.
+func runLsofForwarder(args: Array<String>): Int64 {
+    let home = Path(getVariable("METIS_HOME").getOrDefault { "" })
+    let target = ownedPath(home.join("lsof-gateway-port").toString())
+    let port = Int64.parse(try { String.fromUtf8(File.readFrom(target)).trimAscii() }
+        catch (_: Exception) { throw Exception("invalid_response_encoding") })
+    let history = home.join("gateway-serve.recovery-history")
+    var completions: Int64 = 0
+    var evidence: Int64 = 0
+    if (exists(history)) {
+        for (entry in Directory.readFrom(history)) {
+            if (entry.isRegular() && entry.name.endsWith(".completion")) { completions++ }
+            if (entry.isRegular() && entry.name.endsWith(".evidence")) { evidence++ }
+        }
+    }
+    let entered = home.join("lsof-archive-entered")
+    if (args.contains("-iTCP:${port}") && completions == 1 && evidence == 1 &&
+        exists(home.join("gateway-serve.stop-complete")) && !exists(entered)) {
+        let proof = JsonObject()
+        proof.put("pid", JsonInt(getProcessId()))
+        proof.put("enteredAtMs", JsonInt(DateTime.now().toUnixTimeStamp().toMilliseconds()))
+        atomicWrite(entered, proof.toJsonString())
+        waitFor(home.join("lsof-archive-release"))
+    }
+    let child = launch("/usr/sbin/lsof", args, stdIn: ProcessRedirect.Inherit,
+        stdOut: ProcessRedirect.Inherit, stdErr: ProcessRedirect.Inherit)
+    child.wait()
+}
+
 main(args: Array<String>): Int64 {
     try {
         if (args.size < 1) { return 64 }
         match (args[0]) {
+            case "-nP" => runLsofForwarder(args)
             case "service" => runService(args)
             case "worker" => runWorker(args)
             case "delegate" => runDelegate(args)
