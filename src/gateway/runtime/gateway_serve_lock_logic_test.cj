@@ -4,19 +4,25 @@ import metis.core.config.{CliConfig, CliSettingManager, GatewayServicePluginUser
 import metis.gateway.process.{gatewayStdioBrokerReady, gatewayStdioBrokerSnapshot}
 import metis.gateway.service_plugin.loadServicePluginManifest
 import metis.gateway.core.GatewayStopResult
-import metis.process.{ProcessInstanceIdentity, currentProcessInstanceIdentity, managedStdioBroker, managedStdioResolveBrokerScriptPath, probeProcessInstance, processInstanceKillSignal, processInstanceTermSignal, resetManagedStdioBrokerForTest, signalProcessInstance}
+import metis.gateway.channels.qq.QQAdapter
+import metis.gateway.channels.telegram.TelegramTransport
+import metis.gateway.model.QQConfig
+import magic.utils.http.HttpUtils
+import magic.config.Config
+import metis.gateway.logging.gatewayLoggingResetForTest
+import metis.process.{ProcessInstanceIdentity, currentProcessInstanceIdentity, managedStdioBroker, managedStdioResolveBrokerScriptPath, probeProcessInstance, processInstanceKillSignal, processInstanceTermSignal, resetManagedStdioBrokerForTest, shutdownManagedStdioBroker, signalProcessInstance}
 import metis.utils.{InfoUtils, ShellTimeoutException}
 import std.collection.{ArrayList, HashMap, HashSet}
 import std.convert.Parsable
 import std.core.Duration
 import std.env.{getProcessId, getVariable, removeVariable, setVariable}
-import std.fs.{Directory, File, Path, SymbolicLink, exists, remove}
+import std.fs.{Directory, File, FileInfo, OpenMode, Path, SymbolicLink, exists, remove}
 import std.net.*
 import std.process.{ProcessRedirect, SubProcess, executeWithOutput, launch}
 import std.sync.AtomicInt64
 import std.time.{DateTime, MonoTime}
 import std.unittest.testmacro.*
-import stdx.encoding.json.JsonValue
+import stdx.encoding.json.{JsonArray, JsonObject, JsonString, JsonValue}
 import stdx.net.http.*
 
 private func gatewayServeStopTemporaryPort(): Int64 {
@@ -1613,8 +1619,703 @@ private func gatewayShutdownPhaseNegativeProof(root: Path, identity: GatewayServ
     }
 }
 
+
+// Keep parent logging state from pointing into a home that has been removed.
+private func withHrFormalEnvironment(name: String, block: (Path, Path) -> Unit): Unit {
+    let oldLog = Config.logFile
+    let oldCurl = getVariable("CURL_HOME")
+    let oldXdg = getVariable("XDG_CONFIG_HOME")
+    try {
+        withGatewayHeartbeatProbeEnvironment(name, { home, bin =>
+            let curl = home.join("curl")
+            Directory.create(curl)
+            File.writeTo(curl.join(".curlrc"), [])
+            File.writeTo(curl.join("curlrc"), [])
+            setVariable("CURL_HOME", curl.toString())
+            setVariable("XDG_CONFIG_HOME", curl.toString())
+            block(home, bin)
+        })
+    } finally {
+        hrFormalRestore("CURL_HOME", oldCurl)
+        hrFormalRestore("XDG_CONFIG_HOME", oldXdg)
+        gatewayLoggingResetForTest()
+        Config.logFile = oldLog
+    }
+}
+
+// Formal actors use the production CLI/host/broker. Only the owned HTTP component
+// is released through a barrier; the component writes its own terminal lease.
+private func hrFormalRead(path: Path): String {
+    try { String.fromUtf8(File.readFrom(path)) } catch (_: Exception) { "" }
+}
+
+private func hrFormalNumber(path: Path, key: String): Int64 {
+    try { JsonValue.fromStr(hrFormalRead(path)).asObject().get(key).getOrThrow().asInt().getValue() }
+    catch (_: Exception) { 0 }
+}
+
+private func hrFormalRestore(key: String, old: Option<String>): Unit {
+    match (old) { case Some(value) => setVariable(key, value) case None => removeVariable(key) }
+}
+
+private func hrFormalFixture(home: Path, project: Path): Path {
+    let source = project.join("scripts").join("gateway-historical-recovery-fake-service.cj")
+    let configured = getVariable("METIS_HR_FIXTURE_BIN").getOrDefault { "" }.trimAscii()
+    if (!configured.isEmpty()) {
+        let binary = Path(configured)
+        let info = FileInfo(binary)
+        if (!binary.isAbsolute() || !info.isRegular() || info.isSymbolicLink() ||
+            info.lastModificationTime < FileInfo(source).lastModificationTime) {
+            throw Exception("historical_fixture_stale_or_unsafe")
+        }
+        return binary
+    }
+    // A normal clean/build/test invocation is self-contained. This standalone
+    // compilation belongs to this case's home and is removed by its environment.
+    let magic = Path(getVariable("MAGIC_PATH").getOrDefault { project.parent.join("CangjieMagic").toString() })
+    let stdx = magic.join("libs/cangjie-stdx-mac-aarch64-1.0.0.1/darwin_aarch64_llvm/dynamic/stdx")
+    let binary = home.join("historical-fake-service")
+    let result = executeWithOutput("cjc", [source.toString(), "--import-path", stdx.toString(), "-L", stdx.toString(),
+        "-lstdx.encoding.json", "--link-options", "-rpath ${stdx.toString()}", "-o", binary.toString()], workingDirectory: Some(home))
+    @Expect(result[0], 0)
+    if (result[0] != 0 || !exists(binary)) { throw Exception("historical_fixture_compile_failed") }
+    binary
+}
+
+private class HrFormalGateway {
+    let home: Path
+    let project: Path
+    let binary: Path
+    let fixture: Path
+    let port: Int64
+    let children = ArrayList<SubProcess>()
+    let stderrFiles = ArrayList<Path>()
+    let stdoutFiles = HashMap<Int64, Path>()
+    let brokerPids = ArrayList<Int64>()
+    let pluginPorts = ArrayList<Int64>()
+    let instances = ArrayList<ProcessInstanceIdentity>()
+    var current: Option<SubProcess> = None
+
+    init(home: Path) {
+        this.home = home
+        this.project = Path(managedStdioResolveBrokerScriptPath()).parent.parent
+        this.binary = gatewayFormalMetisBinary(this.project).getOrThrow()
+        this.fixture = hrFormalFixture(home, this.project)
+        this.port = gatewayServeStopTemporaryPort()
+        @Expect(this.port > 0, true)
+    }
+
+    func launchOwned(command: Path, args: Array<String>, name: String): SubProcess {
+        let stderrPath = this.home.join("${name}-${this.children.size}.stderr")
+        this.stderrFiles.add(stderrPath)
+        File.writeTo(stderrPath, [])
+        let stdoutPath = this.home.join("${name}-${this.children.size}.stdout")
+        File.writeTo(stdoutPath, [])
+        var owned = None<SubProcess>
+        try (input = File("/dev/null", OpenMode.Read), output = File(stdoutPath, OpenMode.Write),
+            error = File(stderrPath, OpenMode.Write)) {
+            let child = launch(command.toString(), args, stdIn: ProcessRedirect.FromFile(input),
+                stdOut: ProcessRedirect.FromFile(output), stdErr: ProcessRedirect.FromFile(error))
+            this.children.add(child)
+            this.stdoutFiles[child.pid] = stdoutPath
+            owned = Some(child)
+        }
+        owned.getOrThrow()
+    }
+
+    func configure(args: Array<String>): Unit {
+        let manifest = this.home.join("historical-service.manifest.json")
+        let root = JsonObject()
+        root.put("schema", JsonString("metis.servicePlugin.v1"))
+        root.put("pluginId", JsonString("gitcode-monitor"))
+        root.put("kind", JsonString("service"))
+        root.put("protocolVersion", JsonString("1.0"))
+        let entry = JsonObject()
+        entry.put("command", JsonString(this.fixture.toString()))
+        let items = JsonArray()
+        for (arg in args) { items.add(JsonString(arg)) }
+        entry.put("args", items)
+        root.put("entry", entry)
+        let schema = JsonObject()
+        schema.put("type", JsonString("object"))
+        root.put("configSchema", schema)
+        let declarations = JsonArray()
+        let capability = JsonObject()
+        capability.put("capabilityId", JsonString("gateway.historical.fixture"))
+        capability.put("kind", JsonString("controlAction"))
+        declarations.add(capability)
+        root.put("capabilityDeclarations", declarations)
+        File.writeTo(manifest, root.toJsonString().toArray())
+        @Expect(loadServicePluginManifest(manifest.toString()).ok, true)
+        var settings = CliSettingManager.readGatewaySettings()
+        settings.enabled = true
+        settings.port = this.port
+        settings.logging.file = this.home.join("formal-gateway.log").toString()
+        settings.logging.level = "info"
+        var plugin = GatewayServicePluginUserSettings()
+        plugin.pluginId = "gitcode-monitor"
+        plugin.enabled = true
+        plugin.autostart = true
+        plugin.startupTimeoutMs = 5000
+        plugin.manifestPath = manifest.toString()
+        settings.servicePlugins = [plugin]
+        let _ = MetisConfigManager.setGatewaySettings(settings)
+        CliSettingManager.invalidate()
+    }
+
+    func launchGateway(nonzeroBroker!: Bool = false, directServe!: Bool = false): SubProcess {
+        let oldScript = getVariable("METIS_STDIO_BROKER_SCRIPT")
+        let oldReal = getVariable("METIS_HR_REAL_BROKER")
+        let oldHeap = getVariable("cjHeapSize")
+        try {
+            setVariable("cjHeapSize", "2GB")
+            if (nonzeroBroker) {
+                setVariable("METIS_STDIO_BROKER_SCRIPT", this.project.join("scripts/gateway-historical-recovery-broker-nonzero.mjs").toString())
+                setVariable("METIS_HR_REAL_BROKER", this.project.join("scripts/metis-stdio-broker.mjs").toString())
+            }
+            this.launchOwned(this.binary, ["gateway", if (directServe) { "serve" } else { "run" }], "gateway")
+        } finally {
+            hrFormalRestore("METIS_STDIO_BROKER_SCRIPT", oldScript)
+            hrFormalRestore("METIS_HR_REAL_BROKER", oldReal)
+            hrFormalRestore("cjHeapSize", oldHeap)
+        }
+    }
+
+    func awaitReady(process: SubProcess, ready: Path): Unit {
+        let proof = GatewayServeStopLiveOwnerProof()
+        let accepted = gatewayServeStopWaitUntil(20000, { =>
+            proof.refresh("http://127.0.0.1:${this.port}/readyz")
+            process.isAlive() && exists(ready) && proof.httpStatus == 200 && proof.running && proof.ownerCount == 1
+        })
+        @Expect(accepted, true)
+        if (!accepted) {
+            throw Exception("historical_formal_not_ready alive=${process.isAlive()} ready=${exists(ready)} http=${proof.httpStatus} brokerRunning=${proof.running} ownerCount=${proof.ownerCount}")
+        }
+        let identity = gatewayParseServeIdentity(hrFormalRead(this.home.join("gateway-serve.lock")))
+        @Expect(identity.isSome(), true)
+        @Expect(identity.getOrThrow().pid, process.pid)
+        let instance = identity.getOrThrow().processIdentity.getOrThrow()
+        let probe = probeProcessInstance(instance, MonoTime.now() + Duration.second)
+        @Expect(probe.conclusive && probe.alive, true)
+        this.instances.add(instance)
+        let pluginPort = hrFormalNumber(ready, "port")
+        @Expect(pluginPort > 0 && gatewayServeStopPortListening(pluginPort), true)
+        this.pluginPorts.add(pluginPort)
+        let broker = gatewayServeStopChildPid(process.pid, "broker")
+        @Expect(broker > 1, true)
+        if (broker > 1) { this.brokerPids.add(broker) }
+        this.current = Some(process)
+    }
+
+    func startService(name: String, nonzeroBroker!: Bool = false, directServe!: Bool = false): SubProcess {
+        let ready = this.home.join("${name}.ready")
+        let args = ArrayList<String>()
+        for (arg in ["service", ready.toString(), this.home.join("${name}.release").toString(), this.home.join("${name}.stop").toString()]) { args.add(arg) }
+        this.configure(args.toArray())
+        let process = this.launchGateway(nonzeroBroker: nonzeroBroker, directServe: directServe)
+        this.awaitReady(process, ready)
+        process
+    }
+
+    func startPendingGeneration(): SubProcess {
+        let ready = this.home.join("old-worker.ready")
+        let registration = this.home.join("old-registration.json")
+        let registered = this.home.join("old-registered")
+        let worker = this.launchOwned(this.fixture, ["worker", ready.toString(), this.home.join("old-worker.release").toString(),
+            registration.toString(), registered.toString()], "worker")
+        @Expect(gatewayServeStopWaitUntil(5000, { => exists(ready) }), true)
+        this.configure(["delegate", ready.toString(), registration.toString(), registered.toString(), this.home.join("old-delegate.stop").toString()])
+        let process = this.launchGateway(nonzeroBroker: true)
+        this.awaitReady(process, ready)
+        @Expect(exists(registered), true)
+        let oldLease = gatewayS5FindLease(this.home)
+        @Expect(hrFormalRead(oldLease).contains("running"), true)
+        @Expect(hrFormalNumber(oldLease, "parentPid"), process.pid)
+        @Expect(hrFormalNumber(oldLease, "pid") > 1, true)
+        worker
+    }
+
+    func releaseWorker(worker: SubProcess): Unit {
+        let lease = gatewayS5FindLease(this.home)
+        let port = hrFormalNumber(lease, "port")
+        @Expect(worker.isAlive(), true)
+        @Expect(gatewayServeStopPortListening(port), true)
+        @Expect(hrFormalRead(lease).contains("running"), true)
+        File.writeTo(this.home.join("old-worker.release"), "release\n".toArray())
+        @Expect(worker.wait(timeout: Some(Duration.second * 2)), 0)
+        @Expect(worker.isAlive(), false)
+        @Expect(gatewayServeStopPidAlive(worker.pid), false)
+        @Expect(gatewayServeStopPortListening(port), false)
+        let terminal = JsonValue.fromStr(hrFormalRead(lease)).asObject()
+        @Expect(terminal.get("state").getOrThrow().asString().getValue(), "stopped")
+    }
+
+    func concurrentRecoveredService(name: String): SubProcess {
+        let ready = this.home.join("${name}.ready")
+        this.configure(["service", ready.toString(), this.home.join("${name}.release").toString(),
+            this.home.join("${name}.stop").toString(), this.home.join("business.pending").toString(),
+            this.home.join("business.receipt").toString(), this.home.join("business.effects").toString()])
+        // Both independent CLIs compete for the same production exclusive lock.
+        let first = this.launchGateway(directServe: true)
+        let second = this.launchGateway(directServe: true)
+        @Expect(gatewayServeStopWaitUntil(20000, { => exists(ready) }), true)
+        let lock = gatewayParseServeIdentity(hrFormalRead(this.home.join("gateway-serve.lock"))).getOrThrow()
+        @Expect(lock.pid == first.pid || lock.pid == second.pid, true)
+        let winner = if (lock.pid == first.pid) { first } else { second }
+        let loser = if (lock.pid == first.pid) { second } else { first }
+        // Existing foreground CLI semantics report lock refusal with exit zero;
+        // refusal is proved by one live lock/owner and no second initialization.
+        @Expect(loser.wait(timeout: Some(Duration.second * 2)), 0)
+        @Expect(loser.isAlive(), false)
+        @Expect(gatewayServeStopPidAlive(loser.pid), false)
+        @Expect(hrFormalRead(this.stdoutFiles.get(loser.pid).getOrThrow()).contains("无法启动"), true)
+        this.awaitReady(winner, ready)
+        @Expect(gatewayParseServeIdentity(hrFormalRead(this.home.join("gateway-serve.lock"))).getOrThrow().pid, winner.pid)
+        @Expect(exists(this.home.join("gateway-serve.stop-complete")), false)
+        @Expect(hrFormalArchiveOriginals(this.home).size, 1)
+        var reconciled: Int64 = 0
+        for (row in hrFormalRead(this.home.join("formal-gateway.log")).split("\n")) {
+            if (row.contains("gateway.recovery.reconciled")) { reconciled++ }
+        }
+        @Expect(reconciled, 1)
+        this.assertJournal(Path(ready.toString() + ".initializations.jsonl"), hrFormalNumber(ready, "pid"))
+        winner
+    }
+
+    func stopCurrent(expected: Int64): String {
+        let output = ArrayList<String>()
+        setGatewayStopOutputForTest(Some({ text => output.add(text) }))
+        let result = try { gatewayExecuteStopServe() } finally { setGatewayStopOutputForTest(None<(String) -> Unit>) }
+        @Expect(result, expected)
+        let process = this.current.getOrThrow()
+        // SubProcess has no automatic reaper; wait before its alive/PID probes.
+        @Expect(process.wait(timeout: Some(Duration.second * 2)), expected)
+        @Expect(process.isAlive(), false)
+        @Expect(gatewayServeStopPidAlive(process.pid), false)
+        @Expect(gatewayServeStopPortListening(this.port), false)
+        hrFormalRead(this.home.join("gateway-serve.stop-complete"))
+    }
+
+    func assertJournal(path: Path, pid: Int64): Unit {
+        @Expect(gatewayServeStopWaitUntil(1000, { => hrFormalRead(path).trimAscii().split("\n").size == 2 }), true)
+        let rows = hrFormalRead(path).trimAscii().split("\n")
+        @Expect(rows.size, 2)
+        var started: Int64 = 0
+        var initialized: Int64 = 0
+        for (row in rows) {
+            let root = JsonValue.fromStr(row).asObject()
+            @Expect(root.get("pid").getOrThrow().asInt().getValue(), pid)
+            let event = root.get("event").getOrThrow().asString().getValue()
+            if (event == "started") { started++ }
+            if (event == "initialized") { initialized++ }
+        }
+        @Expect(started, 1)
+        @Expect(initialized, 1)
+    }
+
+    func assertClean(): Unit {
+        // Stop CLI/probe shell commands own a separate broker in this test parent.
+        // Close that owner through the real boundary before zero-residue assertions.
+        let parent = managedStdioBroker().snapshot()
+        if (parent.brokerPid > 1) {
+            @Expect(gatewayServeStopParentPid(parent.brokerPid), getProcessId())
+            for (childBroker in this.brokerPids) { @Expect(parent.brokerPid != childBroker, true) }
+        }
+        let closed = shutdownManagedStdioBroker()
+        @Expect(closed.ok, true)
+        @Expect(closed.externalTerminal, true)
+        if (parent.brokerPid > 1) { @Expect(gatewayServeStopPidAlive(parent.brokerPid), false) }
+        // All assertions precede the finally fallback reaper.
+        for (process in this.children) {
+            @Expect(process.isAlive(), false)
+            @Expect(gatewayServeStopPidAlive(process.pid), false)
+        }
+        for (instance in this.instances) {
+            let probe = probeProcessInstance(instance, MonoTime.now() + Duration.second)
+            @Expect(probe.conclusive && !probe.alive, true)
+        }
+        for (pid in this.brokerPids) { @Expect(gatewayServeStopPidAlive(pid), false) }
+        for (port in this.pluginPorts) { @Expect(gatewayServeStopPortListening(port), false) }
+        @Expect(gatewayServeStopPortListening(this.port), false)
+        @Expect(exists(this.home.join("gateway-serve.lock")), false)
+        for (path in this.stderrFiles) { @Expect(hrFormalRead(path).contains("protocol writer failed"), false) }
+        @Expect(gatewayHeartbeatBrokerIsFullyStopped(), true)
+    }
+
+    func cleanup(): Unit {
+        setGatewayStopOutputForTest(None<(String) -> Unit>)
+        for (process in this.children) {
+            if (process.isAlive()) { try { process.terminate(force: true) } catch (_: Exception) { () } }
+            try { let _ = process.wait(timeout: Some(Duration.second * 2)) } catch (_: Exception) { () }
+        }
+    }
+}
+
+private func hrFormalArchiveOriginals(home: Path): Array<String> {
+    let result = ArrayList<String>()
+    let dir = home.join("gateway-serve.recovery-history")
+    if (!exists(dir)) { return [] }
+    for (entry in Directory.readFrom(dir)) {
+        if (entry.isRegular() && entry.name.endsWith(".completion")) { result.add(hrFormalRead(entry.path)) }
+    }
+    result.toArray()
+}
+
+
+private func hrFormalPendingProof(formal: HrFormalGateway): String {
+    let completion = formal.stopCurrent(1)
+    @Expect(gatewayServeStopCompletionField(completion, "status"), "cleanup_pending")
+    @Expect(gatewayServeStopCompletionField(completion, "fullTerminal"), "0")
+    @Expect(gatewayServeStopCompletionField(completion, "servicePluginLeaseStatus"), "cleanup_pending")
+    @Expect(gatewayServeStopCompletionField(completion, "servicePluginPortStatus"), "cleanup_pending")
+    @Expect(gatewayServeStopCompletionField(completion, "brokerStatus"), "broker_close_exit_nonzero")
+    @Expect(gatewayServeStopCompletionField(completion, "brokerExternalTerminal"), "1")
+    @Expect(gatewayServeStopCompletionField(completion, "brokerTerminalBasis"), "closed_ack_exit_observed")
+    @Expect(exists(formal.home.join("old-delegate.stop")), true)
+    completion
+}
+
+private func hrFormalBusinessInput(home: Path): String {
+    let original = "{\"id\":\"pending-中文-😀\",\"payload\":\"keep exact business truth\"}\n"
+    File.writeTo(home.join("business.pending"), original.toArray())
+    original
+}
+
+private func hrFormalBusinessProof(home: Path, original: String): Unit {
+    @Expect(hrFormalRead(home.join("business.pending")), original)
+    let rows = hrFormalRead(home.join("business.effects")).trimAscii().split("\n")
+    @Expect(rows.size, 1)
+    let effect = JsonValue.fromStr(rows[0]).asObject()
+    @Expect(effect.get("id").getOrThrow().asString().getValue(), "pending-中文-😀")
+    @Expect(effect.get("status").getOrThrow().asString().getValue(), "recovered")
+    @Expect(exists(home.join("business.receipt")), true)
+}
+
+private func hrFormalRecoveryChain(formal: HrFormalGateway): Unit {
+    let business = hrFormalBusinessInput(formal.home)
+    let worker = formal.startPendingGeneration()
+    let oldPid = formal.current.getOrThrow().pid
+    let original = hrFormalPendingProof(formal)
+    @Expect(hrFormalRead(formal.home.join("business.pending")), business)
+    @Expect(exists(formal.home.join("business.effects")), false)
+    formal.releaseWorker(worker)
+    let preview = gatewayHistoricalServeCompletionRecoveryStatus()
+    @Expect(preview.ok, true)
+    @Expect(preview.status, "recoverable")
+    @Expect(hrFormalRead(formal.home.join("gateway-serve.stop-complete")), original)
+    let winner = formal.concurrentRecoveredService("new")
+    @Expect(winner.pid != oldPid, true)
+    let archives = hrFormalArchiveOriginals(formal.home)
+    @Expect(archives.size, 1)
+    @Expect(archives[0], original)
+    @Expect(gatewayServeStopCompletionField(archives[0], "status"), "cleanup_pending")
+    @Expect(gatewayServeStopCompletionField(archives[0], "brokerStatus"), "broker_close_exit_nonzero")
+    hrFormalBusinessProof(formal.home, business)
+    let final = formal.stopCurrent(0)
+    @Expect(gatewayServeStopCompletionField(final, "status"), "graceful")
+    @Expect(gatewayServeStopCompletionField(final, "fullTerminal"), "1")
+    hrFormalBusinessProof(formal.home, business)
+    formal.assertClean()
+}
+
+// Legacy input producer: constructs the documented pre-evidence v4 format from
+// independently captured process identity. It never edits a live/new writer's marker.
+private func hrFormalLegacyProducer(identity: GatewayServeIdentity, version: String): String {
+    let instance = identity.processIdentity.getOrThrow().serialize()
+    let historical = "gateway-serve-active-v4\npid:${identity.pid}\nstartedAtMs:${identity.startedAtMs}\nnonce:${identity.nonce}\n" +
+        "processIdentity:${instance}\ngracefulShutdownTimeoutMs:60000\nstatus:cleanup_pending\nfullTerminal:0\n" +
+        "inboundStatus:stopped\ncompatStatus:stopped\nsidecarStatus:disabled\nservicePluginIngressStatus:sent\n" +
+        "servicePluginDispatchStatus:drained\nservicePluginOwnerStatus:graceful_exited\nservicePluginLeaseStatus:terminal\n" +
+        "servicePluginPortStatus:terminal\nservicePluginPendingCount:0\nchannelsStatus:stopped\nbrokerStatus:broker_close_exit_nonzero\n" +
+        "httpStatus:stopped\ncanvasStatus:already_stopped\ngatewayServerStatus:stopped\n"
+    if (version.isEmpty()) { historical }
+    else { historical + "recoveryEvidenceVersion:${version}\nbrokerExternalTerminal:1\nbrokerTerminalBasis:closed_ack_exit_observed\n" }
+}
+
+
+private func hrFormalAssertAllLeasesStopped(home: Path): Unit {
+    let dir = home.join("service-plugin/runtime/gitcode-monitor")
+    @Expect(exists(dir), true)
+    var leases: Int64 = 0
+    for (entry in Directory.readFrom(dir)) {
+        if (!entry.isRegular() || !entry.name.endsWith(".lease.json")) { continue }
+        leases++
+        let root = JsonValue.fromStr(hrFormalRead(entry.path)).asObject()
+        @Expect(root.get("state").getOrThrow().asString().getValue(), "stopped")
+        @Expect(gatewayServeStopPidAlive(root.get("pid").getOrThrow().asInt().getValue()), false)
+        @Expect(gatewayServeStopPortListening(root.get("port").getOrThrow().asInt().getValue()), false)
+    }
+    @Expect(leases > 0, true)
+}
+
+private func hrFormalFaultTraffic(): Unit {
+    // No child launch/compilation occurs in the descriptor measurement window.
+    // The peer sees EOF caused by each production transport's own failure cleanup.
+    for (kind in 0..3) {
+        let listener = TcpServerSocket(bindAt: 0u16)
+        listener.bind()
+        let port = (listener.localAddress as IPSocketAddress)?.port ?? 0u16
+        let eof = AtomicInt64(0)
+        let serving = spawn {
+            try (peer = listener.accept(timeout: Some(Duration.second * 3))) {
+                peer.readTimeout = Some(Duration.second * 5)
+                let header = ArrayList<Byte>()
+                let one = Array<Byte>(1, repeat: 0)
+                while (header.size < 8192) {
+                    if (peer.read(one) == 0) { return }
+                    header.add(one[0])
+                    let n = header.size
+                    if (n >= 4 && header[n - 4] == 13 && header[n - 3] == 10 && header[n - 2] == 13 && header[n - 1] == 10) { break }
+                }
+                if (kind == 0) { peer.write("HTTP/1.1 407 Denied\r\n\r\n".toArray()) }
+                else if (kind == 1) { peer.write("HTTP/1.1 500 Bad Gateway\r\nContent-Length: 0\r\n\r\n".toArray()) }
+                else {
+                    peer.write("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\n".toArray())
+                    peer.write([255u8, 254u8])
+                }
+                try { if (peer.read(one) == 0) { eof.fetchAdd(1) } }
+                catch (_: SocketTimeoutException) { () }
+                catch (_: SocketException) { let _ = eof.fetchAdd(1) }
+            }
+        }
+        try {
+            if (kind == 0) {
+                let response = TelegramTransport(proxy: "http://127.0.0.1:${port}", timeoutSeconds: 1,
+                    dangerouslyAllowPrivateNetwork: true).get("https://127.0.0.1/joint")
+                @Expect(response.ok, false)
+                @Expect(response.error.contains("407"), true)
+            } else if (kind == 1) {
+                let adapter = QQAdapter(config: QQConfig(enabled: true, appId: "joint-fixture", appSecret: "synthetic-only",
+                    officialWebsocketUrl: "ws://127.0.0.1:${port}/joint"))
+                adapter.debugCacheOfficialTokenForTest("joint-fixture-token")
+                try {
+                    adapter.start()
+                    serving.get(Duration.second * 8)
+                    adapter.stop()
+                    @Expect(adapter.debugOfficialWorkersForTest(), 0)
+                } finally { adapter.stop() }
+            } else {
+                var decodeFailed = false
+                try {
+                    let _ = HttpUtils.get("http://127.0.0.1:${port}/joint", HashMap<String, String>(), None, verify: false)
+                } catch (_: Exception) { decodeFailed = true }
+                // The default curl backend retains the original SDK decode error;
+                // the boundary catches it without relying on SDK-specific wording.
+                @Expect(decodeFailed, true)
+            }
+            serving.get(Duration.second * 8)
+            @Expect(eof.load(), 1)
+        } finally {
+            listener.close()
+            try { serving.get(Duration.second) } catch (_: Exception) { () }
+        }
+    }
+}
+
 @Test
 public class GatewayServeLockLogicTest {
+    @TestCase
+    public func hrS4B1FormalRecoveryFailureInjectionKeepsEvidenceAndResourcesSafe(): Unit {
+        withHrFormalEnvironment("hr-s4-b1", { home, _ =>
+            let formal = HrFormalGateway(home)
+            try {
+                let worker = formal.startPendingGeneration()
+                let original = hrFormalPendingProof(formal)
+                formal.releaseWorker(worker)
+                let sourceLease = gatewayS5FindLease(home)
+                let leaseBytes = File.readFrom(sourceLease)
+                // Negative fixture copies originate in a real stopped generation.
+                // The original home/marker is never mutated by fault injection.
+                for (mode in ["timeout", "replacement", "encoding"]) {
+                    let negative = home.join("negative-${mode}")
+                    Directory.create(negative, recursive: true)
+                    setVariable("METIS_HOME", negative.toString())
+                    CliConfig.invalidatePathCache()
+                    MetisConfigManager.invalidate()
+                    CliSettingManager.invalidate()
+                    try {
+                        var settings = CliSettingManager.readGatewaySettings()
+                        settings.enabled = true
+                        settings.port = formal.port
+                        let _ = MetisConfigManager.setGatewaySettings(settings)
+                        CliSettingManager.invalidate()
+                        @Expect(gatewayAcquireServeLockForRunningProcess(), true)
+                        let leaseDir = negative.join("service-plugin/runtime/gitcode-monitor")
+                        Directory.create(leaseDir, recursive: true)
+                        File.writeTo(leaseDir.join(sourceLease.fileName), leaseBytes)
+                        let marker = negative.join("gateway-serve.stop-complete")
+                        File.writeTo(marker, original.toArray())
+                        let evidence = gatewayCollectHistoricalRecoveryEvidence(MonoTime.now() + Duration.second * 5)
+                        @Expect(evidence.status, "recoverable")
+                        let replacement = original.replace("nonce:", "nonce:replacement-中文😀-")
+                        if (mode == "replacement") { File.writeTo(marker, replacement.toArray()) }
+                        if (mode == "encoding") { File.writeTo(marker, [255u8, 254u8]) }
+                        let deadline = if (mode == "timeout") { MonoTime.now() - Duration.millisecond } else { MonoTime.now() + Duration.second * 5 }
+                        let committed = gatewayCommitHistoricalRecovery(evidence, deadline)
+                        @Expect(committed.ok, false)
+                        @Expect(committed.status, if (mode == "timeout") { "deadline_exceeded" } else if (mode == "replacement") { "identity_changed" } else { "invalid_response_encoding" })
+                        @Expect(exists(marker), true)
+                        if (mode == "encoding") { @Expect(File.readFrom(marker), [255u8, 254u8]) }
+                        else { @Expect(hrFormalRead(marker), if (mode == "replacement") { replacement } else { original }) }
+                    } finally {
+                        gatewayReleaseServeLockQuiet()
+                        @Expect(exists(negative.join("gateway-serve.lock")), false)
+                        setVariable("METIS_HOME", home.toString())
+                        CliConfig.invalidatePathCache()
+                        MetisConfigManager.invalidate()
+                        CliSettingManager.invalidate()
+                    }
+                }
+                @Expect(hrFormalRead(home.join("gateway-serve.stop-complete")), original)
+                hrFormalAssertAllLeasesStopped(home)
+                formal.assertClean()
+            } finally { formal.cleanup() }
+        })
+    }
+
+    @TestCase
+    public func hrS4P1FormalTwoGenerationNormalRestartStaysClean(): Unit {
+        withHrFormalEnvironment("hr-s4-p1", { home, _ =>
+            let formal = HrFormalGateway(home)
+            try {
+                let first = formal.startService("first")
+                let firstPluginPid = hrFormalNumber(home.join("first.ready"), "pid")
+                let launchCount = AtomicInt64(0)
+                let restarted = gatewayExecuteRestartServe(launchServe: { =>
+                    let _ = launchCount.fetchAdd(1)
+                    @Expect(first.wait(timeout: Some(Duration.second * 2)), 0)
+                    @Expect(first.isAlive(), false)
+                    @Expect(gatewayServeStopPidAlive(first.pid), false)
+                    hrFormalAssertAllLeasesStopped(home)
+                    let old = hrFormalRead(home.join("gateway-serve.stop-complete"))
+                    @Expect(gatewayServeStopCompletionField(old, "status"), "graceful")
+                    @Expect(gatewayServeStopCompletionField(old, "brokerStatus"), "stopped")
+                    @Expect(gatewayServeStopCompletionField(old, "brokerExternalTerminal"), "1")
+                    @Expect(gatewayServeStopCompletionField(old, "brokerTerminalBasis"), "closed_ack_exit_observed")
+                    @Expect(gatewayServeStopCompletionField(old, "fullTerminal"), "1")
+                    let _ = formal.startService("second")
+                    true
+                })
+                @Expect(restarted, 0)
+                @Expect(launchCount.load(), 1)
+                @Expect(formal.current.getOrThrow().pid != first.pid, true)
+                @Expect(hrFormalNumber(home.join("second.ready"), "pid") != firstPluginPid, true)
+                formal.assertJournal(home.join("first.ready.initializations.jsonl"), firstPluginPid)
+                formal.assertJournal(home.join("second.ready.initializations.jsonl"), hrFormalNumber(home.join("second.ready"), "pid"))
+                let final = formal.stopCurrent(0)
+                @Expect(gatewayServeStopCompletionField(final, "status"), "graceful")
+                @Expect(gatewayServeStopCompletionField(final, "brokerStatus"), "stopped")
+                @Expect(gatewayServeStopCompletionField(final, "brokerExternalTerminal"), "1")
+                @Expect(gatewayServeStopCompletionField(final, "brokerTerminalBasis"), "closed_ack_exit_observed")
+                @Expect(gatewayServeStopCompletionField(final, "fullTerminal"), "1")
+                @Expect(hrFormalArchiveOriginals(home).size, 0)
+                hrFormalAssertAllLeasesStopped(home)
+                formal.assertClean()
+            } finally { formal.cleanup() }
+        })
+    }
+
+    @TestCase
+    public func hrS4N1FormalActiveCleanupStillRejectsRecovery(): Unit {
+        withHrFormalEnvironment("hr-s4-n1", { home, _ =>
+            let formal = HrFormalGateway(home)
+            try {
+                let worker = formal.startPendingGeneration()
+                let original = hrFormalPendingProof(formal)
+                let port = hrFormalNumber(home.join("old-worker.ready"), "port")
+                let checked = gatewayHistoricalServeCompletionRecoveryStatus()
+                @Expect(checked.ok, false)
+                @Expect(checked.status, "lease_active")
+                let launchCount = AtomicInt64(0)
+                @Expect(gatewayExecuteRestartServe(launchServe: { => let _ = launchCount.fetchAdd(1); true }), 1)
+                @Expect(launchCount.load(), 0)
+                @Expect(hrFormalRead(home.join("gateway-serve.stop-complete")), original)
+                @Expect(hrFormalArchiveOriginals(home).size, 0)
+                @Expect(worker.isAlive(), true)
+                @Expect(gatewayServeStopPortListening(port), true)
+                @Expect(exists(home.join("old-worker.release")), false)
+                // The real active work component self-terminates only on release.
+                // Actual blocked host dispatch is additionally covered by the S0/S3 host cases.
+                formal.releaseWorker(worker)
+                @Expect(gatewayHistoricalServeCompletionRecoveryStatus().status, "recoverable")
+                @Expect(hrFormalRead(home.join("gateway-serve.stop-complete")), original)
+                formal.assertClean()
+            } finally { formal.cleanup() }
+        })
+    }
+
+    @TestCase
+    public func hrE2e01AbnormalStopLateLeaseTerminalAndRestartPreserveBusinessTruth(): Unit {
+        withHrFormalEnvironment("hr-e2e01", { home, _ =>
+            let formal = HrFormalGateway(home)
+            try { hrFormalRecoveryChain(formal) } finally { formal.cleanup() }
+        })
+    }
+
+    @TestCase
+    public func hrE2e02V4AndExplicitEvidenceDirectServeRecoveryAgree(): Unit {
+        for (mode in ["explicit-v1", "legacy-v4", "unsupported"]) {
+            withHrFormalEnvironment("hr-e2e02-${mode}", { home, _ =>
+                let formal = HrFormalGateway(home)
+                try {
+                    let first = formal.startService("old", nonzeroBroker: mode == "explicit-v1")
+                    let identity = gatewayParseServeIdentity(hrFormalRead(home.join("gateway-serve.lock"))).getOrThrow()
+                    let stopped = formal.stopCurrent(if (mode == "explicit-v1") { 1 } else { 0 })
+                    @Expect(gatewayServeStopCompletionField(stopped, "brokerStatus"), if (mode == "explicit-v1") { "broker_close_exit_nonzero" } else { "stopped" })
+                    let marker = home.join("gateway-serve.stop-complete")
+                    let original = if (mode == "explicit-v1") { stopped } else {
+                        // Historical producer is an initial input for this direct-serve phase,
+                        // not a modified current-writer completion.
+                        let historical = hrFormalLegacyProducer(identity, if (mode == "legacy-v4") { "" } else { "99" })
+                        remove(marker)
+                        File.writeTo(marker, historical.toArray())
+                        historical
+                    }
+                    if (mode == "unsupported") {
+                        @Expect(gatewayHistoricalServeCompletionRecoveryStatus().status, "evidence_version_unsupported")
+                        let refused = formal.launchGateway(directServe: true)
+                        @Expect(refused.wait(timeout: Some(Duration.second * 2)), 0)
+                        @Expect(refused.isAlive(), false)
+                        @Expect(gatewayServeStopPidAlive(refused.pid), false)
+                        @Expect(hrFormalRead(formal.stdoutFiles.get(refused.pid).getOrThrow()).contains("无法启动"), true)
+                        @Expect(hrFormalRead(marker), original)
+                        @Expect(hrFormalArchiveOriginals(home).size, 0)
+                    } else {
+                        @Expect(gatewayHistoricalServeCompletionRecoveryStatus().status, "recoverable")
+                        let second = formal.startService("new", directServe: true)
+                        @Expect(second.pid != first.pid, true)
+                        @Expect(hrFormalArchiveOriginals(home).size, 1)
+                        @Expect(hrFormalArchiveOriginals(home)[0], original)
+                        @Expect(exists(marker), false)
+                        formal.assertJournal(home.join("new.ready.initializations.jsonl"), hrFormalNumber(home.join("new.ready"), "pid"))
+                        let final = formal.stopCurrent(0)
+                        @Expect(gatewayServeStopCompletionField(final, "fullTerminal"), "1")
+                    }
+                    hrFormalAssertAllLeasesStopped(home)
+                    formal.assertClean()
+                } finally { formal.cleanup() }
+            })
+        }
+    }
+
+    @TestCase
+    public func hrFE2e01LocalTransportFailuresThenHistoricalRecoveryAndNewGenerationStop(): Unit {
+        withHrFormalEnvironment("hr-joint-e2e01", { home, _ =>
+            let formal = HrFormalGateway(home)
+            try {
+                hrFormalFaultTraffic()
+                let before = Directory.readFrom(Path("/dev/fd")).size
+                for (_ in 0..4) { hrFormalFaultTraffic() }
+                let after = Directory.readFrom(Path("/dev/fd")).size
+                @Expect(after <= before + 1, true)
+                // This very same case continues from settled fault traffic through
+                // a real stop-produced pending marker, competing new CLIs and final stop.
+                hrFormalRecoveryChain(formal)
+            } finally { formal.cleanup() }
+        })
+    }
+
+
     @TestCase
     public func hrS0U1HistoricalNonterminalSnapshotBlocksDespiteStoppedResources(): Unit {
         hrRuntimeHome({ home, identity =>
@@ -1689,6 +2390,27 @@ public class GatewayServeLockLogicTest {
             @Expect(exists(home.join("gateway-serve.stop-complete")), true)
             @Expect(exists(home.join("gateway-serve.lock")), false)
             @Expect(String.fromUtf8(File.readFrom(lease)).contains("running"), true)
+        })
+        hrRuntimeHome({ home, identity =>
+            let originalMarker = hrRuntimeWriteMarker(identity)
+            let lease = hrRuntimeWriteLease(home, identity)
+            @Expect(gatewayExecuteStopServe(), 0)
+            let replacement = lease.parent.join("replacement-session.lease.json")
+            let payload = JsonValue.fromStr(hrFormalRead(lease)).asObject()
+            payload.put("sessionId", JsonString("replacement-session"))
+            payload.put("state", JsonString("running"))
+            if (payload.get("status").isSome()) { payload.put("status", JsonString("running")) }
+            let replacementBytes = payload.toJsonString().toArray()
+            let result = gatewayExecuteRestartServe(launchServe: { =>
+                remove(lease)
+                File.writeTo(replacement, replacementBytes)
+                gatewayAcquireServeLockForRunningProcess()
+            })
+            @Expect(result, 1)
+            @Expect(hrFormalRead(home.join("gateway-serve.stop-complete")), originalMarker)
+            @Expect(exists(home.join("gateway-serve.lock")), false)
+            @Expect(exists(lease), false)
+            @Expect(File.readFrom(replacement), replacementBytes)
         })
     }
 
