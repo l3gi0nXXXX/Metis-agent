@@ -272,9 +272,9 @@ protected func fileCreate(filePath: String, content: String): String {
     }
 
     try {
-        let file = File(filePath, Write)
-        file.write(content.toArray())
-        file.close()
+        try (file = File(filePath, Write)) {
+            file.write(content.toArray())
+        }
         let _ = gatewaySubagentAfterCurrentFileWrite(filePath, operation: "create", warning: coordination[1])
         let prefix = if (coordination[1].isEmpty()) { "" } else { "[subagent-file-coordination:warning] ${coordination[1]}\n" }
         return "${prefix}File ${filePath} created successfully!"

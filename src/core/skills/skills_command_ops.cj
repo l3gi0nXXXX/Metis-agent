@@ -9,7 +9,6 @@ import metis.utils.{InfoUtils, ShellUtils}
 import std.collection.{ArrayList, HashMap}
 import std.env.getVariable
 import std.fs.{File, OpenMode, Path, exists}
-import std.io.readToEnd
 import std.sort.sort
 import std.time.*
 import stdx.encoding.json.{JsonArray, JsonObject, JsonString, JsonValue}
@@ -335,7 +334,7 @@ private func parseFrontmatter(path: String): HashMap<String, String> {
         return fm
     }
     try {
-        let raw = String.fromUtf8(readToEnd(File(p, OpenMode.Read)))
+        let raw = String.fromUtf8(File.readFrom(p))
         let lines = raw.split("\n")
         if (lines.isEmpty() || lines[0].trimAscii() != "---") {
             return fm
@@ -393,7 +392,7 @@ private func readSkillRaw(path: String): String {
         return ""
     }
     try {
-        return String.fromUtf8(readToEnd(File(p, OpenMode.Read)))
+        return String.fromUtf8(File.readFrom(p))
     } catch (_: Exception) {
         return ""
     }

@@ -7,7 +7,6 @@ import magic.config.Config
 
 import std.env.getVariable
 import std.fs.*
-import std.io.readToEnd
 import std.collection.{map, collectArray, ArrayList, filterMap, collectArrayList}
 import std.time.DateTime
 import std.sort.*
@@ -428,7 +427,18 @@ protected class CliConfig {
     public static prop userRules: String {
         get() {
             if (exists(agentsMarkdownPath)) {
-                return String.fromUtf8(readToEnd(File(agentsMarkdownPath, OpenMode.Read)))
+                try {
+                    let bytes = File.readFrom(agentsMarkdownPath)
+                    try {
+                        return String.fromUtf8(bytes)
+                    } catch (_: Exception) {
+                        LogUtils.error("User rules unavailable: invalid_response_encoding")
+                        return ""
+                    }
+                } catch (_: Exception) {
+                    LogUtils.error("User rules unavailable: read_failed")
+                    return ""
+                }
             }
             return ""
         }

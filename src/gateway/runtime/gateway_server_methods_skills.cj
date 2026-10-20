@@ -24,7 +24,6 @@ import std.collection.{ArrayList, HashMap}
 import std.convert.Parsable
 import std.env.getVariable
 import std.fs.{File, OpenMode, Path, exists}
-import std.io.readToEnd
 import std.time.*
 import stdx.encoding.json.{JsonArray, JsonObject, JsonString, JsonValue}
 
@@ -108,7 +107,7 @@ private func gatewaySkillsReadRaw(path: String): String {
         return ""
     }
     try {
-        String.fromUtf8(readToEnd(File(p, OpenMode.Read)))
+        String.fromUtf8(File.readFrom(p))
     } catch (_: Exception) {
         ""
     }

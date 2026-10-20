@@ -8,7 +8,6 @@ import std.collection.{ArrayList, HashMap}
 import std.convert.Parsable
 import std.env.{getVariable, setVariable}
 import std.fs.{Directory, File, FileInfo, OpenMode, Path, exists}
-import std.io.readToEnd
 import std.time.DateTime
 import stdx.encoding.json.{JsonObject, JsonValue}
 
@@ -1333,9 +1332,9 @@ private func parseSkillFile(
     st: SkillsUserSettings
 ): (String, String, String, Option<String>, Option<String>, Option<String>, SkillLegacyMetadata) {
     var content = try {
-        String.fromUtf8(readToEnd(File(skillMd, OpenMode.Read)))
+        String.fromUtf8(File.readFrom(skillMd))
     } catch (ex: Exception) {
-        LogUtils.info("Skills: read failed ${skillMd}: ${ex.message}")
+        LogUtils.info("Skills: read failed: skill_file_unavailable")
         return (folderName, "", "", None, None, None, emptySkillLegacyMetadata())
     }
     let lines = content.split("\n")

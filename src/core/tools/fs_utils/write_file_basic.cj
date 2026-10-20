@@ -8,9 +8,9 @@ public func writeFileBasic(filePath: String, content: String, mode!: OpenMode = 
 
 public func writeFileBasic(filePath: Path, content: String, mode!: OpenMode = OpenMode.Write): String {
     try {
-        let file = File(filePath, mode)
-        file.write(content.toArray())
-        file.close()
+        try (file = File(filePath, mode)) {
+            file.write(content.toArray())
+        }
         return "File ${filePath} written successfully!"
     } catch (e: FSException) {
         return "Parent directory does not exist, cannot open file, write failed, partial write, or file is not writable"

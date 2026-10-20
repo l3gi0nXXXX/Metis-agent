@@ -126,11 +126,11 @@ protected class Plan <: ToString {
     public func save(): Unit {
         let path = CliConfig.todoFile
         try {
-            let file = File(path, OpenMode.Write)
-            file.write(this.toString().toArray())
-            file.close()
+            try (file = File(path, OpenMode.Write)) {
+                file.write(this.toString().toArray())
+            }
         } catch(e: Exception) {
-            LogUtils.error("Error: Unable to save plan file to ${path}. Details: ${e}")
+            LogUtils.error("Unable to save plan: write_failed")
         }
     }
 
