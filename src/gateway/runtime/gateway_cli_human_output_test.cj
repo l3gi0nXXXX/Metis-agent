@@ -159,6 +159,18 @@ private func gatewayHumanQqChannelGetRaw(): String {
 @Test
 public class GatewayCliHumanOutputTest {
     @TestCase
+    public func hrS3U1RecoveryReasonsRenderHumanOutputWithoutRawJson(): Unit {
+        for (status in ["recoverable", "lease_active", "pid_alive", "identity_alive", "resources_unknown", "resources_not_terminal", "pid_probe_permission_denied", "unsafe_path", "evidence_limit_exceeded"]) {
+            let text = gatewayStopOutcomeHumanText(status)
+            for (key in ["\"ok\"", "\"result\"", "\"sessions\""]) { @Expect(text.contains(key), false) }
+            @Expect(text.contains("主进程已退出"), false)
+            if (status == "recoverable") { @Expect(text.contains("启动时将重新核验并归档"), true) }
+            else if (!["lease_active", "pid_alive", "identity_alive"].contains(status)) { @Expect(text.contains("无法确认"), true) }
+            else { @Expect(text.contains("仍有进程"), true) }
+        }
+    }
+
+    @TestCase
     public func s4P1AndN1StopOutcomesAreHumanReadableWithoutRawJson(): Unit {
         let graceful = gatewayStopOutcomeHumanText("graceful")
         let forced = gatewayStopOutcomeHumanText("force_terminated")

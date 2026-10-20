@@ -1,0 +1,158 @@
+package metis.gateway.service_plugin
+
+import metis.core.config.{CliConfig, MetisProcessEnvironmentLock}
+import metis.utils.SHELL_INVALID_RESPONSE_ENCODING_EXIT_CODE
+import std.core.Duration
+import std.env.{getVariable, setVariable}
+import std.fs.{Directory, File, Path, exists, remove}
+import std.process.executeWithOutput
+import std.time.{DateTime, MonoTime}
+import std.unittest.testmacro.*
+
+private func hrHostHome(block: (Path) -> Unit): Unit {
+    synchronized(MetisProcessEnvironmentLock) {
+        let home = Path("/tmp/metis-hr-host-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
+        let before = getVariable("METIS_HOME")
+        Directory.create(home, recursive: true)
+        setVariable("METIS_HOME", home.toString())
+        CliConfig.invalidatePathCache()
+        setServicePluginPidProbeCommandForTest(Some({ _, _ => (1, "", "No such process") }))
+        setServicePluginPortReleaseCommandForTest(Some({ _, _, _ => (1, "", "") }))
+        try { block(home) } finally {
+            setServicePluginPidProbeCommandForTest(None)
+            setServicePluginPortReleaseCommandForTest(None)
+            setServicePluginPortOwnerProbeForTest(None)
+            setVariable("METIS_HOME", before.getOrDefault({ => "" }))
+            CliConfig.invalidatePathCache()
+            remove(home, recursive: true)
+            @Expect(exists(home), false)
+        }
+    }
+}
+
+private func hrHostLease(home: Path, session: String, parent!: Int64 = 987654321,
+    state!: String = "stopped", started!: Int64 = 2000, port!: Int64 = 0): Path {
+    let dir = home.join("service-plugin").join("runtime").join("test-plugin")
+    if (!exists(dir)) { Directory.create(dir, recursive: true) }
+    let path = dir.join("${session}.lease.json")
+    File.writeTo(path, ("{\"pluginId\":\"test-plugin\",\"sessionId\":\"${session}\",\"state\":\"${state}\"," +
+        "\"pid\":987654322,\"parentPid\":${parent},\"startedAtMs\":${started},\"port\":${port},\"note\":\"历史恢复-测试🧪\"}").toArray())
+    path
+}
+
+@Test
+public class ServicePluginHistoricalRecoveryTest {
+    @TestCase
+    public func hrS1U2CollectsAllOldParentLeaseEvidence(): Unit {
+        hrHostHome({ home =>
+            let first = hrHostLease(home, "one")
+            let second = hrHostLease(home, "two")
+            File.writeTo(first.parent.join("listener-diagnostics.log"), [0xffu8])
+            File.writeTo(first.parent.join("lease-diagnostics.log"), [0xfeu8])
+            let result = probeServicePluginHistoricalResources(987654321, 1000, MonoTime.now() + Duration.second)
+            @Expect(result.conclusive, true)
+            @Expect(result.terminal, true)
+            @Expect(result.matchedCount, 2)
+            @Expect(result.status, "terminal")
+            @Expect(servicePluginReadHistoricalLeaseStrict(second).status, "ok")
+        })
+    }
+
+    @TestCase
+    public func hrS1B1StrictLeaseScanBoundsEncodingAndPaths(): Unit {
+        hrHostHome({ home =>
+            let path = hrHostLease(home, "one")
+            let valid = String.fromUtf8(File.readFrom(path))
+            let padded = valid + String(Array<Rune>(65536 - valid.size, repeat: r' '))
+            File.writeTo(path, padded.toArray())
+            @Expect(servicePluginReadHistoricalLeaseStrict(path).status, "ok")
+            File.writeTo(path, (padded + " ").toArray())
+            @Expect(servicePluginReadHistoricalLeaseStrict(path).status, "evidence_limit_exceeded")
+            File.writeTo(path, [0xffu8, 0xfeu8, 0x00u8])
+            @Expect(servicePluginReadHistoricalLeaseStrict(path).status, "invalid_response_encoding")
+            for (invalid in ["{", "{\"state\":\"stopped\",\"state\":\"running\"}",
+                "{\"state\":\"stopped\",\"sta\\u0074e\":\"running\"}"]) {
+                File.writeTo(path, invalid.toArray())
+                @Expect(servicePluginReadHistoricalLeaseStrict(path).status, "malformed_json")
+            }
+            File.writeTo(path, valid.replace("\"one\"", "\"../escape\"").toArray())
+            @Expect(servicePluginReadHistoricalLeaseStrict(path).status, "identity_mismatch")
+            File.writeTo(path, valid.toArray())
+            let outside = home.join("outside-lease.json")
+            File.writeTo(outside, valid.toArray())
+            remove(path)
+            @Expect(executeWithOutput("/bin/ln", ["-s", outside.toString(), path.toString()])[0], 0)
+            @Expect(servicePluginReadHistoricalLeaseStrict(path).status, "unsafe_path")
+            remove(path)
+            File.writeTo(path, valid.toArray())
+            // One plugin directory plus 4095 lease entries is exactly the scan-item bound.
+            for (i in 1..4095) { let _ = hrHostLease(home, "entry-${i}") }
+            let atBound = probeServicePluginHistoricalResources(987654321, 1000, MonoTime.now() + Duration.second * 30)
+            @Expect(atBound.status, "terminal")
+            @Expect(atBound.matchedCount, 4095)
+            let _ = hrHostLease(home, "over-bound")
+            @Expect(probeServicePluginHistoricalResources(987654321, 1000, MonoTime.now() + Duration.second * 30).status, "evidence_limit_exceeded")
+        })
+        hrHostHome({ home =>
+            @Expect(probeServicePluginHistoricalResources(987654321, 1000, MonoTime.now() + Duration.second).status, "lease_evidence_missing")
+            Directory.create(home.join("service-plugin/runtime"), recursive: true)
+            @Expect(probeServicePluginHistoricalResources(987654321, 1000, MonoTime.now() + Duration.second).status, "lease_evidence_missing")
+        })
+    }
+
+    @TestCase
+    public func hrS1P1OldParentProbeIsReadOnlyAndKeepsPendingData(): Unit {
+        hrHostHome({ home =>
+            let path = hrHostLease(home, "历史恢复-测试🧪")
+            let original = File.readFrom(path)
+            let pending = home.join("business-pending.json")
+            File.writeTo(pending, "{\"pending\":\"中文🧪\"}".toArray())
+            let business = File.readFrom(pending)
+            let result = probeServicePluginHistoricalResources(987654321, 1000, MonoTime.now() + Duration.second)
+            @Expect(result.terminal, true)
+            @Expect(revalidateServicePluginHistoricalEvidence(result, MonoTime.now() + Duration.second).terminal, true)
+            @Expect(File.readFrom(path), original)
+            @Expect(File.readFrom(pending), business)
+            @Expect(probeServicePluginHistoricalResources(987654320, 1000, MonoTime.now() + Duration.second).status, "lease_evidence_missing")
+        })
+    }
+
+    @TestCase
+    public func hrS1N1LeasePidAndPortFailuresNeverBecomeTerminal(): Unit {
+        hrHostHome({ home =>
+            let path = hrHostLease(home, "one", state: "running")
+            let active = probeServicePluginHistoricalResources(987654321, 1000, MonoTime.now() + Duration.second)
+            @Expect(active.status, "lease_active")
+            @Expect(active.terminal, false)
+            let _ = hrHostLease(home, "one", port: 12345)
+            for (input in [(0, "", ""), (1, "", "Operation not permitted"), (124, "", ""), (125, "", "")]) {
+                setServicePluginPidProbeCommandForTest(Some({ _, _ => input }))
+                @Expect(probeServicePluginHistoricalResources(987654321, 1000, MonoTime.now() + Duration.second).terminal, false)
+            }
+            setServicePluginPidProbeCommandForTest(Some({ _, _ => (1, "", "No such process") }))
+            for (input in [(0, "p1234", ""), (1, "p1234", ""), (124, "", ""), (125, "", ""), (1, "", "denied")]) {
+                setServicePluginPortReleaseCommandForTest(Some({ _, _, _ => input }))
+                @Expect(probeServicePluginHistoricalResources(987654321, 1000, MonoTime.now() + Duration.second).terminal, false)
+            }
+            setServicePluginPidProbeCommandForTest(Some({ _, _ => (SHELL_INVALID_RESPONSE_ENCODING_EXIT_CODE, "", "") }))
+            @Expect(probeServicePluginHistoricalResources(987654321, 1000, MonoTime.now() + Duration.second).status, "invalid_response_encoding")
+            @Expect(exists(path), true)
+            @Expect(probeServicePluginHistoricalResources(987654321, 1000, MonoTime.now()).status, "probe_timeout")
+        })
+    }
+
+    @TestCase
+    public func hrS1N2ReplacedLeaseInvalidatesCollectedEvidence(): Unit {
+        hrHostHome({ home =>
+            let path = hrHostLease(home, "one")
+            let result = probeServicePluginHistoricalResources(987654321, 1000, MonoTime.now() + Duration.second)
+            @Expect(result.terminal, true)
+            let changed = String.fromUtf8(File.readFrom(path)).replace("2000", "2001")
+            File.writeTo(path, changed.toArray())
+            let after = revalidateServicePluginHistoricalEvidence(result, MonoTime.now() + Duration.second)
+            @Expect(after.terminal, false)
+            @Expect(after.status, "identity_changed")
+            @Expect(String.fromUtf8(File.readFrom(path)), changed)
+        })
+    }
+}

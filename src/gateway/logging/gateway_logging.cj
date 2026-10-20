@@ -2,7 +2,7 @@ package metis.gateway.logging
 
 import magic.config.Config
 
-import metis.core.metisRedactSensitiveText
+import metis.core.{metisRedactSensitiveText, metisSafeUtf8Prefix}
 import metis.core.config.{CliConfig, CliSettingManager, GatewayLoggingUserSettings}
 
 import std.collection.ArrayList
@@ -23,6 +23,9 @@ public class MetisLogLevel {
 }
 
 public class MetisLogEvent {
+    public static const gatewayRecoveryChecked: String = "gateway.recovery.checked"
+    public static const gatewayRecoveryBlocked: String = "gateway.recovery.blocked"
+    public static const gatewayRecoveryReconciled: String = "gateway.recovery.reconciled"
     public static const gatewayStarting: String = "gateway.starting"
     public static const gatewayReady: String = "gateway.ready"
     public static const gatewayShutdown: String = "gateway.shutdown"
@@ -114,6 +117,7 @@ public class MetisLogEvent {
 
     public static func all(): Array<String> {
         [
+            gatewayRecoveryChecked, gatewayRecoveryBlocked, gatewayRecoveryReconciled,
             gatewayStarting, gatewayReady, gatewayShutdown, gatewayStopped, gatewayPollStale, gatewayPollRecovered,
             gatewayRuntimeStatePersistFailed, gatewayRuntimeStatePersistRecovered,
             stdioBrokerUnresponsive, stdioBrokerDead, stdioBrokerUnavailable, channelRegistered, channelStarting,
@@ -331,7 +335,7 @@ public func gatewayLogTruncateText(text: String, limit!: Int64 = LOG_META_STRING
     if (keep <= 0) {
         return LOG_TRUNCATED_MARKER
     }
-    text[0..keep] + LOG_TRUNCATED_MARKER
+    metisSafeUtf8Prefix(text, keep, marker: LOG_TRUNCATED_MARKER)
 }
 
 public func gatewayLogRedactText(text: String): String {

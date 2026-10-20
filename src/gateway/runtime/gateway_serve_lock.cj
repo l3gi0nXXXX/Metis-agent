@@ -215,7 +215,7 @@ public func gatewayConfiguredServePort(): Int64 {
     18788
 }
 
-private func gatewayServePayloadField(text: String, key: String): String {
+func gatewayServePayloadField(text: String, key: String): String {
     for (line in text.split("\n")) {
         let t = line.trimAscii()
         let parts = t.split(":")
@@ -502,7 +502,7 @@ public func gatewayPublishShutdownPhaseForTest(identity: GatewayServeIdentity, p
     }
 }
 
-private func gatewayReadLockText(p: Path): Option<String> {
+func gatewayReadLockText(p: Path): Option<String> {
     try {
         Some(String.fromUtf8(File.readFrom(p)))
     } catch (_: Exception) {
@@ -510,7 +510,7 @@ private func gatewayReadLockText(p: Path): Option<String> {
     }
 }
 
-private func gatewayReadServeIdentity(): Option<GatewayServeIdentity> {
+func gatewayReadServeIdentity(): Option<GatewayServeIdentity> {
     match (gatewayReadLockText(gatewayServeLockPath())) {
         case Some(text) => gatewayParseServeIdentity(text)
         case None => None<GatewayServeIdentity>
@@ -525,7 +525,7 @@ public func gatewayCurrentServeIdentity(): Option<GatewayServeIdentity> {
     }
 }
 
-private func gatewayServeCompletionPath(): Path { CliConfig.dotDir.join(COMPLETION_FILE) }
+func gatewayServeCompletionPath(): Path { CliConfig.dotDir.join(COMPLETION_FILE) }
 
 private func gatewayServeStopRequestPath(): Path { CliConfig.dotDir.join(STOP_REQUEST_FILE) }
 
@@ -597,7 +597,7 @@ private func gatewayRemoveServeStopRequest(expected: GatewayServeIdentity): Bool
     }
 }
 
-private func gatewayParseServeCompletion(text: String, identity: GatewayServeIdentity): GatewayServeCompletionResult {
+func gatewayParseServeCompletion(text: String, identity: GatewayServeIdentity): GatewayServeCompletionResult {
     match (gatewayParseServeIdentity(text)) {
         case Some(found) =>
             if (!found.matches(identity)) { return GatewayServeCompletionResult(false, status: "identity_mismatch") }
@@ -640,73 +640,31 @@ private func gatewayReadServeCompletion(identity: GatewayServeIdentity): Gateway
     }
 }
 
-private func gatewayStatusIn(status: String, allowed: Array<String>): Bool {
-    allowed.contains(status.trimAscii())
-}
-
-private func gatewayServeCompletionHasTerminalExternalResources(result: GatewayServeCompletionResult): Bool {
-    result.found && result.status == "cleanup_pending" &&
-        gatewayStatusIn(result.inboundStatus, ["stopped", "not_applicable"]) &&
-        gatewayStatusIn(result.compatStatus, ["stopped", "not_applicable"]) &&
-        gatewayStatusIn(result.sidecarStatus, ["stopped", "already_stopped", "disabled", "not_applicable"]) &&
-        gatewayStatusIn(result.servicePluginIngressStatus, ["sent", "stopped", "not_applicable"]) &&
-        gatewayStatusIn(result.servicePluginDispatchStatus, ["cleanup_pending", "drained", "stopped", "not_applicable"]) &&
-        gatewayStatusIn(result.servicePluginOwnerStatus, ["stopped", "already_stopped", "terminated", "force_terminated", "not_applicable"]) &&
-        gatewayStatusIn(result.servicePluginLeaseStatus, ["stopped", "not_applicable"]) &&
-        gatewayStatusIn(result.servicePluginPortStatus, ["released", "not_applicable"]) &&
-        gatewayStatusIn(result.channelsStatus, ["stopped", "not_applicable"]) &&
-        gatewayStatusIn(result.brokerStatus, ["stopped", "not_applicable"]) &&
-        gatewayStatusIn(result.httpStatus, ["stopped", "already_stopped", "not_applicable"]) &&
-        gatewayStatusIn(result.canvasStatus, ["stopped", "already_stopped", "not_applicable"]) &&
-        gatewayStatusIn(result.gatewayServerStatus, ["stopped", "already_stopped", "not_applicable"])
-}
-
 /**
  * 仅清理 identity-bound、原进程已确定死亡且所有外部资源均终止的历史 completion。
  * durable pending 业务状态不在此文件中，不会被删除。
  */
-private func gatewayEvaluateHistoricalServeCompletion(removeMarker: Bool): GatewayServeCompletionReconcileResult {
-    if (removeMarker) {
-        let active = synchronized(gatewayServeIdentityLock) { gatewayActiveServeIdentity }
-        let ownsLock = match ((active, gatewayReadServeIdentity())) {
+func gatewayOwnsCurrentServeLock(): Bool {
+    synchronized(gatewayServeIdentityLock) {
+        let safe = try {
+            let root = FileInfo(CliConfig.dotDir)
+            let lockInfo = FileInfo(gatewayServeLockPath())
+            root.isDirectory() && !root.isSymbolicLink() && lockInfo.isRegular() && !lockInfo.isSymbolicLink()
+        } catch (_: Exception) { false }
+        if (!safe) { return false }
+        match ((gatewayActiveServeIdentity, gatewayReadServeIdentity())) {
             case (Some(expected), Some(current)) => expected.matches(current)
             case _ => false
         }
-        if (!ownsLock) { return GatewayServeCompletionReconcileResult(false, "lock_not_owned") }
     }
-    let path = gatewayServeCompletionPath()
-    if (!exists(path)) { return GatewayServeCompletionReconcileResult(false, "missing") }
-    let original = match (gatewayReadLockText(path)) {
-        case Some(text) => text
-        case None => return GatewayServeCompletionReconcileResult(false, "invalid_response_encoding")
-    }
-    let identity = match (gatewayParseServeIdentity(original)) {
-        case Some(value) => value
-        case None => return GatewayServeCompletionReconcileResult(false, "malformed")
-    }
-    let completion = gatewayParseServeCompletion(original, identity)
-    if (!gatewayServeCompletionHasTerminalExternalResources(completion)) {
-        return GatewayServeCompletionReconcileResult(false, if (completion.found) { "resources_not_terminal" } else { completion.status })
-    }
-    let instance = match (identity.processIdentity) {
-        case Some(value) => value
-        case None => return GatewayServeCompletionReconcileResult(false, "identity_unsupported")
-    }
-    let probe = probeProcessInstance(instance, MonoTime.now() + Duration.millisecond * 500)
-    if (!probe.conclusive) { return GatewayServeCompletionReconcileResult(false, probe.status) }
-    if (probe.alive) { return GatewayServeCompletionReconcileResult(false, "identity_alive") }
-    if (!removeMarker) { return GatewayServeCompletionReconcileResult(true, "recoverable") }
-    try {
-        let current = match (gatewayReadLockText(path)) {
-            case Some(text) => text
-            case None => return GatewayServeCompletionReconcileResult(false, "invalid_response_encoding")
-        }
-        if (current != original) { return GatewayServeCompletionReconcileResult(false, "identity_changed") }
-        remove(path)
-        GatewayServeCompletionReconcileResult(true, "reconciled")
-    } catch (_: Exception) {
-        GatewayServeCompletionReconcileResult(false, "remove_failed")
-    }
+}
+
+private func gatewayEvaluateHistoricalServeCompletion(removeMarker: Bool): GatewayServeCompletionReconcileResult {
+    if (removeMarker && !gatewayOwnsCurrentServeLock()) { return GatewayServeCompletionReconcileResult(false, "lock_not_owned") }
+    let deadline = MonoTime.now() + Duration.second * 5
+    let evidence = gatewayCollectHistoricalRecoveryEvidence(deadline)
+    if (removeMarker) { gatewayCommitHistoricalRecovery(evidence, deadline) }
+    else { gatewayEvaluateHistoricalRecoveryEvidence(evidence) }
 }
 
 public func gatewayHistoricalServeCompletionRecoveryStatus(): GatewayServeCompletionReconcileResult {
@@ -765,6 +723,9 @@ public func gatewayWriteServeCompletionMarker(identity: GatewayServeIdentity, re
         "servicePluginPendingCount:${result.servicePluginPendingCount}\n" +
         "channelsStatus:${result.channelsStatus}\n" +
         "brokerStatus:${result.brokerStatus}\n" +
+        "recoveryEvidenceVersion:1\n" +
+        "brokerExternalTerminal:${if (result.brokerExternalTerminal) { 1 } else { 0 }}\n" +
+        "brokerTerminalBasis:${result.brokerTerminalBasis}\n" +
         "httpStatus:${httpStatus}\n" +
         "canvasStatus:${canvasStatus}\n" +
         "gatewayServerStatus:${gatewayServerStatus}\n"
@@ -793,12 +754,18 @@ public func gatewayServePortReleasedUntil(port: Int64, deadline: MonoTime): Gate
         } catch (_: Exception) {
             return GatewaySurfaceStopResult(false, "cleanup_pending", portStatus: "port_probe_failed")
         }
-        let (exitCode, _, stderr) = result
-        if (exitCode == 1 && stderr.trimAscii().isEmpty()) {
-            return GatewaySurfaceStopResult(true, "stopped", portStatus: "released")
+        let (exitCode, stdout, stderr) = result
+        if (exitCode == 1) {
+            if (stdout.trimAscii().isEmpty() && stderr.trimAscii().isEmpty()) {
+                return GatewaySurfaceStopResult(true, "stopped", portStatus: "released")
+            }
+            return GatewaySurfaceStopResult(false, "cleanup_pending", portStatus: "port_probe_failed")
         }
-        if (exitCode != 0 && exitCode != 1) {
-            return GatewaySurfaceStopResult(false, "cleanup_pending", portStatus: if (exitCode == 124) { "port_probe_timeout" } else { "port_probe_failed" })
+        if (exitCode != 0) {
+            let status = if (exitCode == 124) { "port_probe_timeout" }
+                else if (exitCode == SHELL_INVALID_RESPONSE_ENCODING_EXIT_CODE) { "invalid_response_encoding" }
+                else { "port_probe_failed" }
+            return GatewaySurfaceStopResult(false, "cleanup_pending", portStatus: status)
         }
         sleep(Duration.millisecond * min(20, max(1, remaining)))
     }

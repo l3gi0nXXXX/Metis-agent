@@ -58,6 +58,22 @@ private func withGatewayStdioBrokerTestHome<T>(block: () -> T): T {
 @Test
 public class GatewayServiceStdioBrokerTest {
     @TestCase
+    public func hrS1U3PreservesBrokerExternalTerminalThroughGatewayStop(): Unit {
+        for (terminal in [false, true]) {
+            let result = gatewayServiceStopOwnersThenBroker(
+                { => ServicePluginHostShutdownResult(true, "stopped", ArrayList<ServiceStopResult>()) },
+                { => GatewayChannelStopSummary(true, "stopped") },
+                { => ManagedStdioOperationResult(false, "broker_close_exit_nonzero",
+                    externalTerminal: terminal, terminalBasis: if (terminal) { "closed_ack_exit_observed" } else { "unknown" }) })
+            @Expect(result.ok, false)
+            @Expect(result.status, "cleanup_pending")
+            @Expect(result.brokerStatus, "broker_close_exit_nonzero")
+            @Expect(result.brokerExternalTerminal, terminal)
+            @Expect(result.brokerTerminalBasis, if (terminal) { "closed_ack_exit_observed" } else { "unknown" })
+        }
+    }
+
+    @TestCase
     public func hbBrN7StopObserverReportsOrderedBoundariesAndIsFailureIsolated(): Unit {
         let expectedPhases = "owners_enter,owners_done,channels_enter,channels_done,broker_enter,broker_done"
         for (failure in ["none", "owners", "channels", "broker", "observer"]) {
