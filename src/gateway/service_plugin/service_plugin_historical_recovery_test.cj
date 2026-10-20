@@ -3,6 +3,8 @@ package metis.gateway.service_plugin
 import metis.core.config.{CliConfig, MetisProcessEnvironmentLock}
 import metis.utils.SHELL_INVALID_RESPONSE_ENCODING_EXIT_CODE
 import std.core.Duration
+import std.collection.ArrayList
+import std.sync.AtomicInt64
 import std.env.{getVariable, setVariable}
 import std.fs.{Directory, File, Path, exists, remove}
 import std.process.executeWithOutput
@@ -224,6 +226,59 @@ public class ServicePluginHistoricalRecoveryTest {
             @Expect(result.conclusive, false)
             @Expect(result.terminal, false)
             @Expect(File.readFrom(replacement), bytes)
+        })
+    }
+
+    @TestCase
+    public func hrS1PositiveHistoricalProbeNeverTouchesHttpOrRegistry(): Unit {
+        hrHostHome({ home =>
+            let before = listServicePlugins().toArray()
+            let first = hrHostLease(home, "positive-one")
+            let second = hrHostLease(home, "positive-two")
+            let firstBytes = File.readFrom(first)
+            let secondBytes = File.readFrom(second)
+            let business = home.join("pending-business.json")
+            File.writeTo(business, "待处理中文🧪".toArray())
+            let businessBytes = File.readFrom(business)
+            let healthCalls = AtomicInt64(0)
+            let probedPids = ArrayList<Int64>()
+            setServicePluginHealthzProbeForTest(Some({ _, _ =>
+                healthCalls.fetchAdd(1)
+                ServicePluginHealthzProbeResult(false, diagnostic: "unexpected_historical_http_probe")
+            }))
+            setServicePluginPidProbeCommandForTest(Some({ pid, _ =>
+                probedPids.add(pid)
+                (1, "", "No such process")
+            }))
+            try {
+                let found = probeServicePluginHistoricalResources(987654321, 1000, MonoTime.now() + Duration.second)
+                @Expect(found.conclusive, true)
+                @Expect(found.terminal, true)
+                @Expect(found.matchedCount, 2)
+                let again = revalidateServicePluginHistoricalEvidence(found, MonoTime.now() + Duration.second)
+                @Expect(again.conclusive, true)
+                @Expect(again.terminal, true)
+                @Expect(again.matchedCount, 2)
+                @Expect(probedPids.size, 4)
+                for (pid in probedPids) { @Expect(pid, 987654322) }
+                @Expect(healthCalls.load(), 0)
+                @Expect(listServicePlugins().size, before.size)
+                for (entry in before) {
+                    let after = getServicePluginSnapshot(entry.serviceId).getOrThrow()
+                    @Expect(after.instanceId, entry.instanceId)
+                    @Expect(after.pid, entry.pid)
+                    @Expect(after.status, entry.status)
+                    @Expect(after.enabled, entry.enabled)
+                    @Expect(after.configSummary, entry.configSummary)
+                    @Expect(after.capabilityIds, entry.capabilityIds)
+                    @Expect(after.lastHeartbeatAtMillis, entry.lastHeartbeatAtMillis)
+                    @Expect(after.lastError, entry.lastError)
+                    @Expect(after.supervisorRestartCount, entry.supervisorRestartCount)
+                }
+                @Expect(File.readFrom(first), firstBytes)
+                @Expect(File.readFrom(second), secondBytes)
+                @Expect(File.readFrom(business), businessBytes)
+            } finally { setServicePluginHealthzProbeForTest(None) }
         })
     }
 
