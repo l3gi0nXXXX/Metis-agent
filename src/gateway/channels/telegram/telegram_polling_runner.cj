@@ -2,6 +2,7 @@ package metis.gateway.channels.telegram
 
 import magic.jsonable.*
 
+import std.collection.ArrayList
 import std.sync.Mutex
 import std.time.*
 import stdx.encoding.json.*
@@ -31,6 +32,7 @@ public class TelegramPollingRunner {
     private var watchdogIntervalMs: Int64 = 500
     private var idleDelayMs: Int64 = 25
     private var loopGeneration: Int64 = 0
+    private let ownedWorkers = ArrayList<TelegramShutdownWorker>()
 
     public init(
         fetchUpdates: () -> String,
@@ -55,15 +57,14 @@ public class TelegramPollingRunner {
             if (this.running) {
                 return
             }
+            this.reapWorkers()
+            if (!this.ownedWorkers.isEmpty()) { return }
             this.running = true
             this.pollingState = "idle"
             this.lastOutcome = "idle"
             this.nextRetryAtMs = 0
             this.loopGeneration += 1
-        }
-        let generation = this.currentLoopGeneration()
-        spawn {
-            this.runLoop(generation)
+            this.spawnPollingWorker(this.loopGeneration)
         }
         this.startWatchdog()
     }
@@ -72,10 +73,44 @@ public class TelegramPollingRunner {
         synchronized(this.stateLock) {
             this.running = false
             this.watchdogRunning = false
-            this.pollingState = "stopped"
-            this.lastOutcome = "stopped"
+            this.pollingState = "stopping"
+            this.lastOutcome = "shutdown-pending"
             this.nextRetryAtMs = 0
         }
+    }
+
+    func awaitShutdown(deadline: MonoTime): Int64 {
+        var workers: Array<TelegramShutdownWorker> = []
+        synchronized(this.stateLock) { workers = this.ownedWorkers.toArray() }
+        for (worker in workers) { worker.awaitUntil(deadline) }
+        synchronized(this.stateLock) {
+            this.reapWorkers()
+            let pending = this.ownedWorkers.size
+            this.pollingState = if (pending == 0) { "stopped" } else { "stopping" }
+            this.lastOutcome = if (pending == 0) { "stopped" } else { "shutdown-pending" }
+            pending
+        }
+    }
+
+    func pendingWorkerCount(): Int64 {
+        synchronized(this.stateLock) {
+            this.reapWorkers()
+            this.ownedWorkers.size
+        }
+    }
+
+    private func reapWorkers(): Unit {
+        var i = this.ownedWorkers.size
+        while (i > 0) {
+            i -= 1
+            if (this.ownedWorkers[i].isSettled()) { this.ownedWorkers.remove(at: i) }
+        }
+    }
+
+    private func spawnPollingWorker(generation: Int64): Unit {
+        let worker = TelegramShutdownWorker()
+        this.ownedWorkers.add(worker)
+        worker.start({ => this.runLoop(generation) })
     }
 
     public func markIdle(): Unit {
@@ -153,6 +188,8 @@ public class TelegramPollingRunner {
         let out = JsonObject()
         synchronized(this.stateLock) {
             out.put("state", JsonString(this.pollingState))
+            this.reapWorkers()
+            out.put("activeWorkers", this.ownedWorkers.size.toJsonValue())
             out.put("lastError", JsonString(this.lastError))
             out.put("lastErrorAtMs", this.lastErrorAtMs.toJsonValue())
             out.put("lastSuccessAtMs", this.lastSuccessAtMs.toJsonValue())
@@ -201,7 +238,7 @@ public class TelegramPollingRunner {
             let backoffMs = this.currentBackoffMsWithJitter()
             if (backoffMs > 0) {
                 this.markBackoff(backoffMs)
-                this.waitForBackoff(backoffMs)
+                this.waitForBackoff(backoffMs, generation)
             } else {
                 this.waitForIdleDelay()
             }
@@ -242,13 +279,13 @@ public class TelegramPollingRunner {
 
     private func startWatchdog(): Unit {
         synchronized(this.stateLock) {
-            if (this.watchdogRunning) {
+            if (this.watchdogRunning || !this.running) {
                 return
             }
             this.watchdogRunning = true
-        }
-        spawn {
-            this.runWatchdogLoop()
+            let worker = TelegramShutdownWorker()
+            this.ownedWorkers.add(worker)
+            worker.start({ => this.runWatchdogLoop() })
         }
     }
 
@@ -258,7 +295,12 @@ public class TelegramPollingRunner {
             synchronized(this.stateLock) {
                 intervalMs = this.watchdogIntervalMs
             }
-            sleep(Duration.millisecond * intervalMs)
+            var remaining = intervalMs
+            while (remaining > 0 && this.watchdogShouldRun()) {
+                let chunk = min(remaining, 10)
+                sleep(Duration.millisecond * chunk)
+                remaining -= chunk
+            }
             this.checkWatchdogStall()
         }
     }
@@ -295,9 +337,11 @@ public class TelegramPollingRunner {
         }
         if (shouldRebuild) {
             this.rebuildTransport()
-            let generationToRestart = restartGeneration
-            spawn {
-                this.runLoop(generationToRestart)
+            synchronized(this.stateLock) {
+                if (this.running && this.loopGeneration == restartGeneration) {
+                    this.reapWorkers()
+                    this.spawnPollingWorker(restartGeneration)
+                }
             }
         }
     }
@@ -351,9 +395,9 @@ public class TelegramPollingRunner {
         if (normalizedOutcome.isEmpty()) { "unknown" } else { normalizedOutcome }
     }
 
-    private func waitForBackoff(backoffMs: Int64): Unit {
+    private func waitForBackoff(backoffMs: Int64, generation: Int64): Unit {
         var remaining = backoffMs
-        while (this.isActive() && remaining > 0) {
+        while (this.isActiveForGeneration(generation) && remaining > 0) {
             let chunk = if (remaining < 100) { remaining } else { 100 }
             sleep(Duration.millisecond * chunk)
             remaining -= chunk
@@ -387,14 +431,6 @@ public class TelegramPollingRunner {
             localGeneration = this.loopGeneration
         }
         localRunning && localGeneration == generation && this.shouldContinue()
-    }
-
-    private func currentLoopGeneration(): Int64 {
-        var generation: Int64 = 0
-        synchronized(this.stateLock) {
-            generation = this.loopGeneration
-        }
-        generation
     }
 
     private func watchdogShouldRun(): Bool {
