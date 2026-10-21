@@ -12,6 +12,7 @@ const [
   modelEnteredPath = "",
   modelReleasePath = "",
   modelMetricsPath = "",
+  telegramGatePath = "",
 ] = process.argv.slice(2);
 if (!readyPath || !eventsPath) {
   process.exitCode = 2;
@@ -21,6 +22,8 @@ if (!readyPath || !eventsPath) {
   let modelActive = 0;
   let modelEntered = 0;
   let modelMaxActive = 0;
+  const telegramGate = telegramGatePath ? JSON.parse(fs.readFileSync(telegramGatePath, "utf8")) : null;
+  const telegramAccounts = new Map();
   const deliveryByIid = new Map();
   const appendEvent = (event) => {
     fs.appendFileSync(eventsPath, `${JSON.stringify(event)}\n`, "utf8");
@@ -33,6 +36,53 @@ if (!readyPath || !eventsPath) {
       connection: "close",
     });
     response.end(body);
+  };
+  const writeTelegramMetrics = () => {
+    if (!telegramGate) return;
+    const temporary = `${telegramGate.metricsPath}.tmp`;
+    fs.writeFileSync(temporary, JSON.stringify({
+      accounts: Object.fromEntries(telegramAccounts),
+      pollActive: [...telegramAccounts.values()].reduce((n, row) => n + row.pollActive, 0),
+      confirmEntered: [...telegramAccounts.values()].reduce((n, row) => n + row.confirmEntered, 0),
+      active: [...telegramAccounts.values()].reduce((n, row) => n + row.pollActive + row.confirmActive, 0),
+    }), "utf8");
+    fs.renameSync(temporary, telegramGate.metricsPath);
+  };
+  const gatedTelegramUpdates = async (request, response, url) => {
+    const body = JSON.parse(await readBody(request));
+    // Only synthetic fixture identities enter the metrics; never persist a Bot API URL/token.
+    const account = url.pathname.match(/^\/bot[0-9]+:FAKE-TGSTOP-([0-9]+)\/getUpdates$/)?.[1];
+    if (account === undefined) throw new Error("invalid_fixture_account");
+    const row = telegramAccounts.get(account) ?? {
+      pollEntered: 0, pollActive: 0, confirmEntered: 0, confirmActive: 0,
+      peerClosed: 0, completed: 0, lastConfirmOffset: 0,
+    };
+    telegramAccounts.set(account, row);
+    const poll = Object.hasOwn(body, "timeout");
+    row[poll ? "pollEntered" : "confirmEntered"] += 1;
+    row[poll ? "pollActive" : "confirmActive"] += 1;
+    if (!poll) row.lastConfirmOffset = body.offset ?? 0;
+    appendEvent({ kind: poll ? "telegram_poll_enter" : "telegram_confirm_enter", account, offset: body.offset ?? 0 });
+    response.once("close", () => {
+      row[poll ? "pollActive" : "confirmActive"] -= 1;
+      row[response.writableFinished ? "completed" : "peerClosed"] += 1;
+      appendEvent({ kind: response.writableFinished ? "telegram_request_completed" : "telegram_peer_closed", account, poll });
+      writeTelegramMetrics();
+    });
+    writeTelegramMetrics();
+    if (poll) {
+      await new Promise((resolve) => setTimeout(resolve, telegramGate.pollDelayMs ?? 1000));
+    } else {
+      while (telegramGate.confirmMode === "hold" && !response.destroyed && !fs.existsSync(telegramGate.releasePath)) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+    }
+    if (response.destroyed) return;
+    if (!poll && telegramGate.failAccount === account) {
+      sendJson(response, 503, { ok: false, description: "fixture_confirmation_failed" });
+    } else {
+      sendJson(response, 200, { ok: true, result: [] });
+    }
   };
   const readBody = (request) => new Promise((resolve, reject) => {
     const chunks = [];
@@ -102,6 +152,10 @@ if (!readyPath || !eventsPath) {
         return;
       }
       if (url.pathname.endsWith("/getUpdates")) {
+        if (telegramGate) {
+          await gatedTelegramUpdates(request, response, url);
+          return;
+        }
         setTimeout(() => sendJson(response, 200, { ok: true, result: [] }), 50);
         return;
       }

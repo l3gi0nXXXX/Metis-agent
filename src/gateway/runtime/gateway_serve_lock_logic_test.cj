@@ -9,6 +9,7 @@ import metis.gateway.channels.telegram.TelegramTransport
 import metis.gateway.model.QQConfig
 import magic.utils.http.HttpUtils
 import magic.config.Config
+import magic.jsonable.*
 import metis.gateway.logging.gatewayLoggingResetForTest
 import metis.process.{ProcessInstanceIdentity, currentProcessInstanceIdentity, managedStdioBroker, managedStdioResolveBrokerScriptPath, probeProcessInstance, processInstanceKillSignal, processInstanceTermSignal, resetManagedStdioBrokerForTest, shutdownManagedStdioBroker, signalProcessInstance}
 import metis.utils.{InfoUtils, ShellTimeoutException}
@@ -738,7 +739,8 @@ private func gatewayS5StartDependencies(
     processorRelease!: Option<Path> = None<Path>,
     modelEntered!: Option<Path> = None<Path>,
     modelRelease!: Option<Path> = None<Path>,
-    modelMetrics!: Option<Path> = None<Path>
+    modelMetrics!: Option<Path> = None<Path>,
+    telegramGate!: Option<Path> = None<Path>
 ): GatewayS5DependencyProcess {
     let readyPath = home.join("s5-dependencies.ready.json")
     let eventsPath = home.join("s5-dependencies.events.jsonl")
@@ -764,6 +766,12 @@ private func gatewayS5StartDependencies(
             args.add(release.toString())
             args.add(metrics.toString())
         case _ => ()
+    }
+    match (telegramGate) {
+        case Some(path) =>
+            while (args.size < 10) { args.add("") }
+            args.add(path.toString())
+        case None => ()
     }
     let process = launch(
         "/usr/bin/env",
@@ -2112,8 +2120,290 @@ private func hrFormalFaultTraffic(): Unit {
     }
 }
 
+// These formal homes are retained for the execution ledger and removed only by
+// the task's identity-checked final cleanup. No completion/lease is synthesized.
+private func gatewayTgStopInode(path: Path): String {
+    let result = executeWithOutput("/usr/bin/stat", ["-f", "%i", path.toString()])
+    try { String.fromUtf8(result[1]).trimAscii() } catch (_: Exception) { "" }
+}
+
+private func gatewayTgStopRegister(root: Path, path: Path, state: String): Unit {
+    let registry = root.join("resource-registry.jsonl")
+    let row = JsonObject()
+    row.put("path", JsonString(path.toString()))
+    row.put("state", JsonString(state))
+    if (exists(path)) {
+        row.put("inode", JsonString(gatewayTgStopInode(path)))
+    }
+    File.writeTo(registry, (hrFormalRead(registry) + row.toJsonString() + "\n").toArray())
+}
+
+private func gatewayTgStopLaunch(binary: Path, args: Array<String>, home: Path, name: String): SubProcess {
+    let outputPath = home.join("${name}.stdout")
+    let errorPath = home.join("${name}.stderr")
+    File.writeTo(outputPath, [])
+    File.writeTo(errorPath, [])
+    var process = None<SubProcess>
+    try (input = File("/dev/null", OpenMode.Read), output = File(outputPath, OpenMode.Write),
+        error = File(errorPath, OpenMode.Write)) {
+        process = Some(launch(binary.toString(), args, stdIn: ProcessRedirect.FromFile(input),
+            stdOut: ProcessRedirect.FromFile(output), stdErr: ProcessRedirect.FromFile(error)))
+    }
+    process.getOrThrow()
+}
+
+private func gatewayTgStopScenario(name: String, accountCount: Int64, seedInbound: Bool, releaseConfirmation: Bool): Unit {
+    synchronized(MetisProcessEnvironmentLock) {
+        let evidenceRootText = getVariable("METIS_TGSTOP_EVIDENCE_ROOT").getOrDefault { "" }
+        let retainEvidence = !evidenceRootText.isEmpty()
+        let evidenceRoot = if (retainEvidence) { Path(evidenceRootText) } else {
+            Path("/tmp/metis-tgstop-evidence-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
+        }
+        if (!retainEvidence) { Directory.create(evidenceRoot) }
+        let rootInode = gatewayTgStopInode(evidenceRoot)
+        let home = evidenceRoot.join("${name}-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
+        gatewayTgStopRegister(evidenceRoot, home, "planned-absent")
+        Directory.create(home)
+        gatewayTgStopRegister(evidenceRoot, home, "created")
+        let project = Path(getVariable("METIS_CJPM_ROOT").getOrDefault { "" })
+        let binary = gatewayFormalMetisBinary(project).getOrThrow()
+        let gcmSource = gatewayS5GcmBinary()
+        let gcmBinary = home.join("gitcodemonitor")
+        let brokerScript = project.join("scripts").join("metis-stdio-broker.mjs")
+        let keys = ArrayList<String>()
+        keys.add(all: ["METIS_HOME", "CURL_HOME", "XDG_CONFIG_HOME", "METIS_LOG_FILE", "METIS_HR_FIXTURE_BIN",
+            "METIS_STDIO_BROKER_SCRIPT", "cjHeapSize", "TELEGRAM_BOT_TOKEN", "METIS_TELEGRAM_BOT_TOKEN"])
+        keys.add(all: cliProviderApiKeyEnvAliases("openai"))
+        keys.add(all: cliProviderBaseUrlEnvAliases("openai"))
+        let previous = ArrayList<(String, Option<String>)>()
+        for (key in keys) { previous.add((key, getVariable(key))) }
+        let oldLog = Config.logFile
+        let oldPrimaryModel = CliConfig._model
+        let oldFallbackModels = CliConfig.fallbackModels
+        let oldImageModel = CliConfig._imageModel
+        let oldImageFallbackModels = CliConfig.imageFallbackModels
+        let oldPdfModel = CliConfig._pdfModel
+        let oldPdfFallbackModels = CliConfig.pdfFallbackModels
+        let oldPdfMaxBytesMb = CliConfig.pdfMaxBytesMb
+        let oldPdfMaxPages = CliConfig.pdfMaxPages
+        let oldFastModel = CliConfig._fastModel
+        let oldTemperature = CliConfig.temperature
+        let oldDefaultModelInputLimit = CliConfig.defaultModelInputLimit
+        let oldDefaultModelOutputLimit = CliConfig.defaultModelOutputLimit
+        let oldWorkspaceDirOverride = CliConfig.workspaceDirOverride
+        let metrics = home.join("telegram-metrics.json")
+        let release = home.join("telegram-confirm.release")
+        let gate = home.join("telegram-gate.json")
+        let gatewayPort = gatewayServeStopTemporaryPort()
+        let webhookPort = gatewayServeStopTemporaryPort()
+        var dependencies = None<GatewayS5DependencyProcess>
+        var gatewayProcess = None<SubProcess>
+        var cliProcess = None<SubProcess>
+        var identity = None<GatewayServeIdentity>
+        var brokerPid: Int64 = 0
+        var gcmPid: Int64 = 0
+        var gcmPgid: Int64 = 0
+        var gcmStart = ""
+        var formalRecorded = false
+        try {
+            let curl = home.join("curl")
+            Directory.create(curl)
+            File.writeTo(curl.join(".curlrc"), [])
+            setVariable("METIS_HOME", home.toString())
+            setVariable("CURL_HOME", curl.toString())
+            setVariable("XDG_CONFIG_HOME", curl.toString())
+            for (key in ["METIS_LOG_FILE", "METIS_HR_FIXTURE_BIN", "METIS_STDIO_BROKER_SCRIPT",
+                "TELEGRAM_BOT_TOKEN", "METIS_TELEGRAM_BOT_TOKEN"]) { removeVariable(key) }
+            setVariable("cjHeapSize", "2GB")
+            CliConfig.invalidatePathCache()
+            MetisConfigManager.invalidate()
+            CliSettingManager.invalidate()
+            @Expect(exists(binary) && exists(gcmSource), true)
+            gatewayTgStopRegister(evidenceRoot, gcmBinary, "planned-copy")
+            @Expect(executeWithOutput("/bin/cp", [gcmSource.toString(), gcmBinary.toString()])[0], 0)
+            gatewayTgStopRegister(evidenceRoot, gcmBinary, "copied-real-gcm")
+            @Expect(gatewayPort > 0 && webhookPort > 0 && gatewayPort != webhookPort, true)
+            let config = JsonObject()
+            config.put("metricsPath", JsonString(metrics.toString()))
+            config.put("releasePath", JsonString(release.toString()))
+            config.put("confirmMode", JsonString("hold"))
+            config.put("pollDelayMs", 1000.toJsonValue())
+            File.writeTo(gate, config.toJsonString().toArray())
+            dependencies = Some(gatewayS5StartDependencies(home,
+                project.join("scripts").join("metis-s5-loopback-dependencies.mjs"), telegramGate: Some(gate)))
+            let dependency = dependencies.getOrThrow()
+            @Expect(dependency.port > 0, true)
+            if (dependency.port <= 0) { return }
+            for (key in cliProviderApiKeyEnvAliases("openai")) { setVariable(key, "fake-s5-openai-key") }
+            for (key in cliProviderBaseUrlEnvAliases("openai")) {
+                setVariable(key, "http://127.0.0.1:${dependency.port}/v1")
+            }
+            let _ = gatewayS5ConfigureFormalGateway(home, gatewayPort, webhookPort, dependency.port, gcmBinary)
+            var settings = CliSettingManager.readGatewaySettings()
+            settings.telegram.botToken = "100000:FAKE-TGSTOP-0"
+            settings.telegram.timeoutSeconds = 30
+            let accounts = JsonObject()
+            for (index in 1..accountCount) {
+                let account = JsonObject()
+                account.put("enabled", true.toJsonValue())
+                account.put("botToken", JsonString("${100000 + index}:FAKE-TGSTOP-${index}"))
+                accounts.put("tg${index}", account)
+            }
+            settings.telegram.accounts = Some(accounts)
+            let _ = MetisConfigManager.setGatewaySettings(settings)
+            CliSettingManager.invalidate()
+            if (seedInbound) {
+                for (index in 0..accountCount) {
+                    let accountId = if (index == 0) { "default" } else { "tg${index}" }
+                    let dir = home.join("gateway-telegram").join("accounts").join(accountId)
+                    Directory.create(dir, recursive: true)
+                    File.writeTo(dir.join("offset-state.json"),
+                        ("{\"version\":2,\"accountId\":\"${accountId}\",\"botId\":\"${100000 + index}\",\"lastUpdateId\":\"42\",\"lastInboundUpdateId\":\"42\"}").toArray())
+                }
+            }
+            let business = "已完成的业务🙂\n"
+            File.writeTo(home.join("business.pending"), business.toArray())
+            let launched = gatewayTgStopLaunch(binary, ["gateway", "run"], home, "gateway")
+            gatewayProcess = Some(launched)
+            identity = gatewayServeStopCaptureOwnedIdentity(home, launched.pid, binary, 10000)
+            @Expect(identity.isSome(), true)
+            if (identity.isNone()) { return }
+            let readyOwner = GatewayServeStopLiveOwnerProof()
+            let capture = GatewayS5P1Capture()
+            let ready = gatewayServeStopWaitUntil(20000, { =>
+                capture.brokerPid = gatewayServeStopChildPid(launched.pid, brokerScript.toString())
+                capture.gcmPid = gatewayServeStopChildPid(capture.brokerPid, gcmBinary.toString())
+                readyOwner.refresh("http://127.0.0.1:${gatewayPort}/readyz")
+                readyOwner.httpStatus == 200 && readyOwner.ownerCount >= 1 && capture.gcmPid > 1 &&
+                    gatewayServeStopPortListening(webhookPort) && gatewayS5JsonInt(metrics, "pollActive") == accountCount
+            })
+            brokerPid = capture.brokerPid
+            gcmPid = capture.gcmPid
+            @Expect(ready, true)
+            if (!ready) { return }
+            gcmPgid = gatewayServeStopProcessGroup(gcmPid)
+            let startProbe = executeWithOutput("/bin/ps", ["-o", "lstart=", "-p", "${gcmPid}"])
+            gcmStart = try { String.fromUtf8(startProbe[1]).trimAscii() } catch (_: Exception) { "" }
+            @Expect(gcmPgid > 1 && !gcmStart.isEmpty(), true)
+            let before = JsonValue.fromStr(hrFormalRead(metrics)).asObject().get("accounts").getOrThrow().asObject()
+            for (index in 0..accountCount) {
+                let row = before.get("${index}").getOrThrow().asObject()
+                @Expect(row.get("pollActive").getOrThrow().asInt().getValue(), 1)
+            }
+            let proof = JsonObject()
+            proof.put("gatewayPid", launched.pid.toJsonValue())
+            proof.put("brokerPid", brokerPid.toJsonValue())
+            proof.put("gcmPid", gcmPid.toJsonValue())
+            proof.put("gcmPgid", gcmPgid.toJsonValue())
+            proof.put("gatewayPort", gatewayPort.toJsonValue())
+            proof.put("webhookPort", webhookPort.toJsonValue())
+            proof.put("dependencyPort", dependency.port.toJsonValue())
+            proof.put("pollActiveBeforeStop", accountCount.toJsonValue())
+            File.writeTo(home.join("actor-proof.json"), proof.toJsonString().toArray())
+            let start = MonoTime.now()
+            let cli = gatewayTgStopLaunch(binary, ["gateway", "stop"], home, "cli-stop")
+            cliProcess = Some(cli)
+            if (seedInbound) {
+                let entered = gatewayServeStopWaitUntil(15000, { => gatewayS5JsonInt(metrics, "confirmEntered") >= 1 })
+                @Expect(entered, true)
+                if (releaseConfirmation) { File.writeTo(release, "release\n".toArray()) }
+            }
+            let cliExit = cli.wait(timeout: Some(Duration.second * 65))
+            let elapsed = (MonoTime.now() - start).toMilliseconds()
+            let completion = hrFormalRead(home.join("gateway-serve.stop-complete"))
+            proof.put("cliExit", cliExit.toJsonValue())
+            proof.put("elapsedMs", elapsed.toJsonValue())
+            proof.put("confirmEntered", gatewayS5JsonInt(metrics, "confirmEntered").toJsonValue())
+            proof.put("completionPresent", (!completion.isEmpty()).toJsonValue())
+            proof.put("fullTerminal", JsonString(gatewayServeStopCompletionField(completion, "fullTerminal")))
+            proof.put("metricsBeforeReaper", JsonValue.fromStr(hrFormalRead(metrics)))
+            File.writeTo(home.join("formal-proof.json"), proof.toJsonString().toArray())
+            formalRecorded = true
+            // Formal truth is captured and asserted before release/reaping in finally.
+            @Expect(cliExit, 0)
+            @Expect(elapsed <= 60000, true)
+            @Expect(gatewayServeStopCompletionField(completion, "fullTerminal"), "1")
+            @Expect(gatewayServeStopCompletionField(completion, "servicePluginPendingCount"), "0")
+            @Expect(hrFormalRead(home.join("business.pending")), business)
+            if (!seedInbound) { @Expect(gatewayS5JsonInt(metrics, "confirmEntered"), 0) }
+            if (seedInbound && releaseConfirmation) {
+                @Expect(gatewayS5JsonInt(metrics, "confirmEntered"), accountCount)
+                let observed = JsonValue.fromStr(hrFormalRead(metrics)).asObject()
+                    .get("accounts").getOrThrow().asObject().get("0").getOrThrow().asObject()
+                @Expect(observed.get("lastConfirmOffset").getOrThrow().asInt().getValue(), 43)
+            }
+        } finally {
+            File.writeTo(release, "release\n".toArray())
+            gatewayServeStopReapOwnedGateway(identity, binary, home)
+            gatewayServeStopReapOwnedHandle(gatewayProcess, binary)
+            @Expect(gatewayServeStopWaitOwnedProcess(gatewayProcess), true)
+            match (cliProcess) {
+                case Some(process) =>
+                    if (process.isAlive()) { process.terminate(force: true) }
+                    let _ = process.wait(timeout: Some(Duration.second * 2))
+                case None => ()
+            }
+            if (gcmPid > 1 && !gcmStart.isEmpty() && gatewayServeStopPidAlive(gcmPid)) {
+                let current = executeWithOutput("/bin/ps", ["-o", "lstart=", "-p", "${gcmPid}"])
+                let currentStart = try { String.fromUtf8(current[1]).trimAscii() } catch (_: Exception) { "" }
+                if (currentStart == gcmStart && gatewayServeStopProcessGroup(gcmPid) == gcmPgid &&
+                    gatewayServeStopCommandContains(gcmPid, gcmBinary.toString())) {
+                    let _ = executeWithOutput("/bin/kill", ["-TERM", "${gcmPid}"])
+                }
+            }
+            @Expect(gatewayS5StopDependencies(dependencies), true)
+            let capturedBrokerPid = brokerPid
+            let capturedGcmPid = gcmPid
+            let resourcesGone = gatewayServeStopWaitUntil(5000, { =>
+                !gatewayServeStopPidAlive(capturedBrokerPid) && !gatewayServeStopPidAlive(capturedGcmPid) &&
+                    !gatewayServeStopPortListening(gatewayPort) && !gatewayServeStopPortListening(webhookPort)
+            })
+            @Expect(resourcesGone, true)
+            File.writeTo(home.join("cleanup-proof.json"), ("{\"resourcesGone\":${resourcesGone}}").toArray())
+            gatewayTgStopRegister(evidenceRoot, home, "retained-for-authorized-CAS-cleanup")
+            if (!retainEvidence && formalRecorded && resourcesGone && !rootInode.isEmpty() &&
+                gatewayTgStopInode(evidenceRoot) == rootInode) {
+                remove(evidenceRoot, recursive: true)
+            }
+            for ((key, old) in previous) { hrFormalRestore(key, old) }
+            CliConfig._model = oldPrimaryModel
+            CliConfig.fallbackModels = oldFallbackModels
+            CliConfig._imageModel = oldImageModel
+            CliConfig.imageFallbackModels = oldImageFallbackModels
+            CliConfig._pdfModel = oldPdfModel
+            CliConfig.pdfFallbackModels = oldPdfFallbackModels
+            CliConfig.pdfMaxBytesMb = oldPdfMaxBytesMb
+            CliConfig.pdfMaxPages = oldPdfMaxPages
+            CliConfig._fastModel = oldFastModel
+            CliConfig.temperature = oldTemperature
+            CliConfig.defaultModelInputLimit = oldDefaultModelInputLimit
+            CliConfig.defaultModelOutputLimit = oldDefaultModelOutputLimit
+            CliConfig.workspaceDirOverride = oldWorkspaceDirOverride
+            CliConfig.invalidatePathCache()
+            MetisConfigManager.invalidate()
+            CliSettingManager.invalidate()
+            gatewayLoggingResetForTest()
+            Config.logFile = oldLog
+        }
+    }
+}
+
 @Test
 public class GatewayServeLockLogicTest {
+    @TestCase
+    public func tgStopS0B1NoInboundSkipsConfirmation(): Unit {
+        gatewayTgStopScenario("s0-b1-no-inbound", 1, false, true)
+    }
+
+    @TestCase
+    public func tgStopS0B1SeededInboundEntersConfirmation(): Unit {
+        gatewayTgStopScenario("s0-b1-seeded", 1, true, true)
+    }
+
+    @TestCase
+    public func tgStopS0R1FiveAccountsHoldRequiresTerminalCompletion(): Unit {
+        gatewayTgStopScenario("s0-r1-five-held", 5, true, false)
+    }
     @TestCase
     public func hrS4B1FormalRecoveryFailureInjectionKeepsEvidenceAndResourcesSafe(): Unit {
         withHrFormalEnvironment("hr-s4-b1", { home, _ =>
