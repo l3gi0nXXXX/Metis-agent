@@ -2127,6 +2127,15 @@ private func gatewayTgStopInode(path: Path): String {
     try { String.fromUtf8(result[1]).trimAscii() } catch (_: Exception) { "" }
 }
 
+private func gatewayTgStopSha256(path: Path): String {
+    let result = executeWithOutput("/usr/bin/shasum", ["-a", "256", path.toString()])
+    if (result[0] != 0) { return "" }
+    let text = try { String.fromUtf8(result[1]) } catch (_: Exception) { return "" }
+    let fields = text.trimAscii().split(" ")
+    if (fields.isEmpty() || fields[0].size != 64) { return "" }
+    fields[0]
+}
+
 private func gatewayTgStopRegister(root: Path, path: Path, state: String): Unit {
     let registry = root.join("resource-registry.jsonl")
     let row = JsonObject()
@@ -2135,7 +2144,7 @@ private func gatewayTgStopRegister(root: Path, path: Path, state: String): Unit 
     if (exists(path)) {
         row.put("inode", JsonString(gatewayTgStopInode(path)))
     }
-    File.writeTo(registry, (hrFormalRead(registry) + row.toJsonString() + "\n").toArray())
+    File.writeTo(registry, (hrFormalRead(registry) + row.toJsonString().replace("\n", "") + "\n").toArray())
 }
 
 private func gatewayTgStopLaunch(binary: Path, args: Array<String>, home: Path, name: String): SubProcess {
@@ -2152,7 +2161,193 @@ private func gatewayTgStopLaunch(binary: Path, args: Array<String>, home: Path, 
     process.getOrThrow()
 }
 
-private func gatewayTgStopScenario(name: String, accountCount: Int64, seedInbound: Bool, releaseConfirmation: Bool): Unit {
+private class GatewayTgStopRestartCapture {
+    var process = None<SubProcess>
+    var stopProcess = None<SubProcess>
+    var identity = None<GatewayServeIdentity>
+    var brokerPid: Int64 = 0
+    var gcmPid: Int64 = 0
+    var gcmPgid: Int64 = 0
+    var gcmStart = ""
+    var launchCount: Int64 = 0
+}
+
+private func gatewayTgStopReapGcm(pid: Int64, pgid: Int64, started: String, binary: Path): Unit {
+    if (pid <= 1 || started.isEmpty() || !gatewayServeStopPidAlive(pid)) { return }
+    let result = executeWithOutput("/bin/ps", ["-o", "lstart=", "-p", "${pid}"])
+    let current = try { String.fromUtf8(result[1]).trimAscii() } catch (_: Exception) { "" }
+    if (current == started && gatewayServeStopProcessGroup(pid) == pgid &&
+        gatewayServeStopCommandContains(pid, binary.toString())) {
+        let _ = executeWithOutput("/bin/kill", ["-TERM", "${pid}"])
+    }
+}
+
+private func gatewayTgStopRestart(home: Path, binary: Path, old: SubProcess, oldBroker: Int64, oldGcm: Int64,
+    oldGroup: Int64, gatewayPort: Int64, webhookPort: Int64, metrics: Path, events: Path,
+    statePath: Path, queuePath: Path, completedBusiness: Bool): Unit {
+    let capture = GatewayTgStopRestartCapture()
+    let output = ArrayList<String>()
+    let businessBytes = hrFormalRead(home.join("business.pending"))
+    let processed = queuePath.join("processed").join("s5-p1-8802-end.json")
+    var processedBytes = ""
+    if (completedBusiness) {
+        let posted = gatewayS5PostWebhook(webhookPort, "s5-p1-8802-end", iid: 8802)
+        @Expect(posted >= 200 && posted < 300, true)
+        @Expect(gatewayServeStopWaitUntil(20000, { =>
+            gatewayS5EventCount(events, "model_response", "s5-p1-8802-end") == 1 &&
+                gatewayS5EventCount(events, "gitcode_writeback", "s5-p1-8802-end") == 1 &&
+                gatewayS5EventCount(events, "telegram_send", "s5-p1-8802-end") == 1 && exists(processed)
+        }), true)
+        processedBytes = hrFormalRead(processed)
+        @Expect(!processedBytes.isEmpty(), true)
+    }
+    let originalProcessedBytes = processedBytes
+    @Expect(gatewayServeStopWaitUntil(5000, { => gatewayS5JsonInt(metrics, "pollActive") == 5 }), true)
+    let started = MonoTime.now()
+    try {
+        setGatewayStopOutputForTest(Some({ line => output.add(line) }))
+        let restarted = gatewayExecuteRestartServe(launchServe: { =>
+            capture.launchCount += 1
+            let completion = hrFormalRead(home.join("gateway-serve.stop-complete"))
+            File.writeTo(home.join("e2e-old-completion.snapshot"), completion.toArray())
+            let elapsed = (MonoTime.now() - started).toMilliseconds()
+            let oldExit = old.wait(timeout: Some(Duration.second * 2))
+            let oldGatewayGone = !gatewayServeStopPidAlive(old.pid)
+            let oldBrokerGone = !gatewayServeStopPidAlive(oldBroker)
+            let oldGcmGone = !gatewayServeStopPidAlive(oldGcm)
+            let oldGroupGone = gatewayServeStopGroupGone(oldGroup)
+            let oldPortsGone = !gatewayServeStopPortListening(gatewayPort) && !gatewayServeStopPortListening(webhookPort)
+            let drained = gatewayServeStopWaitUntil(1000, { => gatewayS5JsonInt(metrics, "active") == 0 })
+            let rows = JsonValue.fromStr(hrFormalRead(metrics)).asObject().get("accounts").getOrThrow().asObject()
+            var peersClosed: Int64 = 0
+            for (index in 0..5) {
+                let row = rows.get("${index}").getOrThrow().asObject()
+                peersClosed += row.get("peerClosed").getOrThrow().asInt().getValue()
+                @Expect(row.get("pollActive").getOrThrow().asInt().getValue(), 0)
+                @Expect(row.get("confirmActive").getOrThrow().asInt().getValue(), 0)
+                @Expect(row.get("confirmEntered").getOrThrow().asInt().getValue(), 1)
+                @Expect(row.get("lastConfirmOffset").getOrThrow().asInt().getValue(), 43)
+            }
+            let terminal = oldGatewayGone && oldBrokerGone && oldGcmGone && oldGroupGone && oldPortsGone && drained
+            let proof = JsonObject()
+            proof.put("formalBeforeReaper", true.toJsonValue())
+            proof.put("oldGatewayPid", old.pid.toJsonValue())
+            proof.put("oldBrokerPid", oldBroker.toJsonValue())
+            proof.put("oldGcmPid", oldGcm.toJsonValue())
+            proof.put("oldGcmPgid", oldGroup.toJsonValue())
+            proof.put("oldGatewayGone", oldGatewayGone.toJsonValue())
+            proof.put("oldBrokerGone", oldBrokerGone.toJsonValue())
+            proof.put("oldGcmGone", oldGcmGone.toJsonValue())
+            proof.put("oldGroupGone", oldGroupGone.toJsonValue())
+            proof.put("oldPortsGone", oldPortsGone.toJsonValue())
+            proof.put("oldExit", oldExit.toJsonValue())
+            proof.put("elapsedBeforeLaunchMs", elapsed.toJsonValue())
+            proof.put("beforeOriginal55sEscalation", (elapsed < 55000).toJsonValue())
+            proof.put("signalEvidenceBasis", JsonString("real_cli_return_before_original_request_deadline_and_exit0"))
+            proof.put("metricsBeforeNewGeneration", JsonValue.fromStr(hrFormalRead(metrics)))
+            proof.put("peerClosed", peersClosed.toJsonValue())
+            proof.put("fullTerminal", JsonString(gatewayServeStopCompletionField(completion, "fullTerminal")))
+            proof.put("pending", JsonString(gatewayServeStopCompletionField(completion, "servicePluginPendingCount")))
+            proof.put("gatewayBinarySha256", JsonString(gatewayTgStopSha256(binary)))
+            File.writeTo(home.join("e2e-old-terminal-proof.json"), proof.toJsonString().toArray())
+            @Expect(oldExit, 0)
+            @Expect(elapsed < 55000, true)
+            @Expect(terminal, true)
+            @Expect(peersClosed >= 5, true)
+            @Expect(gatewayServeStopCompletionField(completion, "status"), "graceful")
+            @Expect(gatewayServeStopCompletionField(completion, "fullTerminal"), "1")
+            @Expect(gatewayServeStopCompletionField(completion, "servicePluginPendingCount"), "0")
+            hrFormalAssertAllLeasesStopped(home)
+            if (completedBusiness) {
+                @Expect(rows.get("2").getOrThrow().asObject().get("confirmFailed").getOrThrow().asInt().getValue(), 1)
+                @Expect(gatewayS5EventCount(events, "telegram_confirm_failed"), 1)
+            }
+            if (!terminal || oldExit != 0 || elapsed >= 55000) { return false }
+            capture.process = Some(gatewayTgStopLaunch(binary, ["gateway", "run"], home, "new-gateway"))
+            true
+        })
+        @Expect(restarted, 0)
+        @Expect(capture.launchCount, 1)
+        @Expect(capture.process.isSome(), true)
+        if (capture.process.isNone()) { return }
+        let replacement = capture.process.getOrThrow()
+        @Expect(replacement.pid != old.pid, true)
+        capture.identity = gatewayServeStopCaptureOwnedIdentity(home, replacement.pid, binary, 10000)
+        @Expect(capture.identity.isSome(), true)
+        let readyOwner = GatewayServeStopLiveOwnerProof()
+        let newReady = gatewayServeStopWaitUntil(20000, { =>
+            capture.brokerPid = gatewayServeStopChildPid(replacement.pid, "metis-stdio-broker.mjs")
+            capture.gcmPid = gatewayServeStopChildPid(capture.brokerPid, home.join("gitcodemonitor").toString())
+            readyOwner.refresh("http://127.0.0.1:${gatewayPort}/readyz")
+            replacement.isAlive() && capture.gcmPid > 1 && capture.gcmPid != oldGcm &&
+                readyOwner.httpStatus == 200 && readyOwner.ownerCount >= 1 && gatewayServeStopPortListening(webhookPort)
+        })
+        @Expect(newReady, true)
+        capture.gcmPgid = gatewayServeStopProcessGroup(capture.gcmPid)
+        let result = executeWithOutput("/bin/ps", ["-o", "lstart=", "-p", "${capture.gcmPid}"])
+        capture.gcmStart = try { String.fromUtf8(result[1]).trimAscii() } catch (_: Exception) { "" }
+        let newProof = JsonObject()
+        newProof.put("newGenerationReady", newReady.toJsonValue())
+        newProof.put("newGatewayPid", replacement.pid.toJsonValue())
+        newProof.put("newBrokerPid", capture.brokerPid.toJsonValue())
+        newProof.put("newGcmPid", capture.gcmPid.toJsonValue())
+        newProof.put("newGcmPgid", capture.gcmPgid.toJsonValue())
+        File.writeTo(home.join("e2e-new-ready-proof.json"), newProof.toJsonString().toArray())
+        @Expect(hrFormalRead(home.join("business.pending")), businessBytes)
+        if (completedBusiness) {
+            @Expect(hrFormalRead(processed), originalProcessedBytes)
+            @Expect(gatewayS5FileContains(statePath, "gitcode:cangjie/compiler:issue:8802"), true)
+            for (kind in ["model_response", "gitcode_writeback", "telegram_send"]) {
+                @Expect(gatewayS5EventCount(events, kind, "s5-p1-8802-end"), 1)
+            }
+        }
+        let human = String.join(output.toArray(), delimiter: "\n")
+        @Expect(human.contains("已正常停止"), true)
+        for (key in ["\"ok\"", "\"result\"", "\"sessions\""]) { @Expect(human.contains(key), false) }
+        File.writeTo(home.join("telegram-confirm.release"), "release\n".toArray())
+        let stop = gatewayTgStopLaunch(binary, ["gateway", "stop"], home, "new-cli-stop")
+        capture.stopProcess = Some(stop)
+        @Expect(stop.wait(timeout: Some(Duration.second * 65)), 0)
+        @Expect(replacement.wait(timeout: Some(Duration.second * 2)), 0)
+        @Expect(gatewayServeStopCompletionField(hrFormalRead(home.join("gateway-serve.stop-complete")), "fullTerminal"), "1")
+        let newBroker = capture.brokerPid
+        let newGcm = capture.gcmPid
+        let newGroup = capture.gcmPgid
+        let newTerminal = gatewayServeStopWaitUntil(1000, { =>
+            !gatewayServeStopPidAlive(newBroker) && !gatewayServeStopPidAlive(newGcm) &&
+                gatewayServeStopGroupGone(newGroup) && !gatewayServeStopPortListening(gatewayPort) &&
+                !gatewayServeStopPortListening(webhookPort) && gatewayS5JsonInt(metrics, "active") == 0
+        })
+        newProof.put("formalBeforeReaper", true.toJsonValue())
+        newProof.put("newGenerationTerminal", newTerminal.toJsonValue())
+        File.writeTo(home.join("e2e-new-terminal-proof.json"), newProof.toJsonString().toArray())
+        @Expect(newTerminal, true)
+        hrFormalAssertAllLeasesStopped(home)
+        @Expect(hrFormalRead(home.join("business.pending")), businessBytes)
+        if (completedBusiness) {
+            @Expect(hrFormalRead(processed), originalProcessedBytes)
+            for (kind in ["model_response", "gitcode_writeback", "telegram_send"]) {
+                @Expect(gatewayS5EventCount(events, kind, "s5-p1-8802-end"), 1)
+            }
+        }
+    } finally {
+        setGatewayStopOutputForTest(None<(String) -> Unit>)
+        File.writeTo(home.join("telegram-confirm.release"), "release\n".toArray())
+        gatewayServeStopReapOwnedGateway(capture.identity, binary, home)
+        gatewayServeStopReapOwnedHandle(capture.process, binary)
+        @Expect(gatewayServeStopWaitOwnedProcess(capture.process), true)
+        gatewayTgStopReapGcm(capture.gcmPid, capture.gcmPgid, capture.gcmStart, home.join("gitcodemonitor"))
+        match (capture.stopProcess) {
+            case Some(process) =>
+                if (process.isAlive()) { process.terminate(force: true) }
+                let _ = process.wait(timeout: Some(Duration.second * 2))
+            case None => ()
+        }
+    }
+}
+
+private func gatewayTgStopScenario(name: String, accountCount: Int64, seedInbound: Bool, releaseConfirmation: Bool,
+    restart!: Bool = false, failConfirmation!: Bool = false, failSecondaryState!: Bool = false): Unit {
     synchronized(MetisProcessEnvironmentLock) {
         let evidenceRootText = getVariable("METIS_TGSTOP_EVIDENCE_ROOT").getOrDefault { "" }
         let retainEvidence = !evidenceRootText.isEmpty()
@@ -2226,7 +2421,8 @@ private func gatewayTgStopScenario(name: String, accountCount: Int64, seedInboun
             let config = JsonObject()
             config.put("metricsPath", JsonString(metrics.toString()))
             config.put("releasePath", JsonString(release.toString()))
-            config.put("confirmMode", JsonString("hold"))
+            config.put("confirmMode", JsonString(if (failConfirmation) { "success" } else { "hold" }))
+            if (failConfirmation) { config.put("failAccount", JsonString("2")) }
             config.put("pollDelayMs", 1000.toJsonValue())
             File.writeTo(gate, config.toJsonString().toArray())
             dependencies = Some(gatewayS5StartDependencies(home,
@@ -2238,7 +2434,8 @@ private func gatewayTgStopScenario(name: String, accountCount: Int64, seedInboun
             for (key in cliProviderBaseUrlEnvAliases("openai")) {
                 setVariable(key, "http://127.0.0.1:${dependency.port}/v1")
             }
-            let _ = gatewayS5ConfigureFormalGateway(home, gatewayPort, webhookPort, dependency.port, gcmBinary)
+            let configured = gatewayS5ConfigureFormalGateway(home, gatewayPort, webhookPort, dependency.port,
+                gcmBinary, liveWriteback: failConfirmation)
             var settings = CliSettingManager.readGatewaySettings()
             settings.telegram.botToken = "100000:FAKE-TGSTOP-0"
             settings.telegram.timeoutSeconds = 30
@@ -2299,13 +2496,50 @@ private func gatewayTgStopScenario(name: String, accountCount: Int64, seedInboun
             proof.put("webhookPort", webhookPort.toJsonValue())
             proof.put("dependencyPort", dependency.port.toJsonValue())
             proof.put("pollActiveBeforeStop", accountCount.toJsonValue())
+            proof.put("gatewayBinarySha256", JsonString(gatewayTgStopSha256(binary)))
+            proof.put("gcmSourceSha256", JsonString(gatewayTgStopSha256(gcmSource)))
+            proof.put("gcmCopySha256", JsonString(gatewayTgStopSha256(gcmBinary)))
+            @Expect(gatewayTgStopSha256(binary).size, 64)
+            @Expect(gatewayTgStopSha256(gcmSource).size, 64)
+            @Expect(gatewayTgStopSha256(gcmSource), gatewayTgStopSha256(gcmBinary))
+            if (restart && !failConfirmation) {
+                var successes: Int64 = 0
+                for (_ in 0..40) {
+                    if (gatewayHeartbeatHttpStatus("http://127.0.0.1:${webhookPort}/healthz") == 200) { successes++ }
+                }
+                readyOwner.refresh("http://127.0.0.1:${gatewayPort}/readyz")
+                let sameGcm = gatewayServeStopChildPid(brokerPid, gcmBinary.toString()) == gcmPid &&
+                    gatewayServeStopPidAlive(gcmPid)
+                @Expect(successes, 40)
+                @Expect(sameGcm, true)
+                @Expect(readyOwner.httpStatus, 200)
+                @Expect(readyOwner.ownerCount >= 1, true)
+                proof.put("gcmHealthzBurstSucceeded", successes.toJsonValue())
+                proof.put("gcmPidUnchangedAfterHealthz", sameGcm.toJsonValue())
+            }
             File.writeTo(home.join("actor-proof.json"), proof.toJsonString().toArray())
+            if (restart) {
+                gatewayTgStopRestart(home, binary, launched, brokerPid, gcmPid, gcmPgid, gatewayPort,
+                    webhookPort, metrics, dependency.eventsPath, configured[0], configured[1], failConfirmation)
+                formalRecorded = true
+                return
+            }
             let start = MonoTime.now()
             let cli = gatewayTgStopLaunch(binary, ["gateway", "stop"], home, "cli-stop")
             cliProcess = Some(cli)
             if (seedInbound) {
                 let entered = gatewayServeStopWaitUntil(15000, { => gatewayS5JsonInt(metrics, "confirmEntered") >= 1 })
                 @Expect(entered, true)
+                if (failSecondaryState && entered) {
+                    let secondary = home.join("gateway-platform-state.json")
+                    let backup = home.join("gateway-platform-state.pre-fault.json")
+                    gatewayTgStopRegister(evidenceRoot, secondary, "secondary-state-before-fault")
+                    gatewayTgStopRegister(evidenceRoot, backup, "planned-secondary-state-backup")
+                    @Expect(executeWithOutput("/bin/mv", [secondary.toString(), backup.toString()])[0], 0)
+                    Directory.create(secondary)
+                    gatewayTgStopRegister(evidenceRoot, backup, "secondary-state-preserved")
+                    gatewayTgStopRegister(evidenceRoot, secondary, "directory-blocks-secondary-write")
+                }
                 if (releaseConfirmation) { File.writeTo(release, "release\n".toArray()) }
             }
             let cliExit = cli.wait(timeout: Some(Duration.second * 65))
@@ -2317,6 +2551,32 @@ private func gatewayTgStopScenario(name: String, accountCount: Int64, seedInboun
             proof.put("completionPresent", (!completion.isEmpty()).toJsonValue())
             proof.put("fullTerminal", JsonString(gatewayServeStopCompletionField(completion, "fullTerminal")))
             proof.put("metricsBeforeReaper", JsonValue.fromStr(hrFormalRead(metrics)))
+            if (failSecondaryState) {
+                let failedState = hrFormalRead(home.join("s5-gateway.log")).contains("platform state persistence failed")
+                let naturalExit = launched.wait(timeout: Some(Duration.second * 2))
+                let gatewayGone = !gatewayServeStopPidAlive(launched.pid)
+                let brokerGone = !gatewayServeStopPidAlive(brokerPid)
+                let gcmGone = !gatewayServeStopPidAlive(gcmPid)
+                let groupGone = gatewayServeStopGroupGone(gcmPgid)
+                let gatewayPortGone = !gatewayServeStopPortListening(gatewayPort)
+                let webhookPortGone = !gatewayServeStopPortListening(webhookPort)
+                let activeZero = gatewayS5JsonInt(metrics, "active") == 0
+                let terminal = gatewayGone && brokerGone && gcmGone && groupGone && gatewayPortGone &&
+                    webhookPortGone && activeZero
+                proof.put("naturalExit", naturalExit.toJsonValue())
+                proof.put("gatewayGone", gatewayGone.toJsonValue())
+                proof.put("brokerGone", brokerGone.toJsonValue())
+                proof.put("gcmGone", gcmGone.toJsonValue())
+                proof.put("groupGone", groupGone.toJsonValue())
+                proof.put("gatewayPortGone", gatewayPortGone.toJsonValue())
+                proof.put("webhookPortGone", webhookPortGone.toJsonValue())
+                proof.put("activeZero", activeZero.toJsonValue())
+                proof.put("secondaryPersistenceFailed", failedState.toJsonValue())
+                proof.put("formalResourcesTerminalBeforeReaper", terminal.toJsonValue())
+                @Expect(failedState, true)
+                @Expect(terminal, true)
+                @Expect(naturalExit, 0)
+            }
             File.writeTo(home.join("formal-proof.json"), proof.toJsonString().toArray())
             formalRecorded = true
             // Formal truth is captured and asserted before release/reaping in finally.
@@ -2403,6 +2663,22 @@ public class GatewayServeLockLogicTest {
     @TestCase
     public func tgStopS0R1FiveAccountsHoldRequiresTerminalCompletion(): Unit {
         gatewayTgStopScenario("s0-r1-five-held", 5, true, false)
+    }
+
+    @TestCase
+    public func tgStopE2E01FiveAccountsRestartReapsOldGeneration(): Unit {
+        gatewayTgStopScenario("e2e-01-five-held", 5, true, false, restart: true)
+    }
+
+    @TestCase
+    public func tgStopE2E02ConfirmationFailurePreservesCompletedBusiness(): Unit {
+        gatewayTgStopScenario("e2e-02-one-confirmation-failed", 5, true, true,
+            restart: true, failConfirmation: true)
+    }
+
+    @TestCase
+    public func tgStopS2N1PlatformPersistenceFailureStillClosesResources(): Unit {
+        gatewayTgStopScenario("s2-n1-platform-write-failed", 1, true, true, failSecondaryState: true)
     }
     @TestCase
     public func hrS4B1FormalRecoveryFailureInjectionKeepsEvidenceAndResourcesSafe(): Unit {
@@ -2876,21 +3152,24 @@ public class GatewayServeLockLogicTest {
         @Expect(source.isEmpty(), false)
         if (source.isEmpty()) { return }
         let memoryStop = source.indexOf("MemoryRuntime.stopActiveMaintenance()")
-        let canvasStop = source.indexOf("GatewayCanvasHostRuntime.stopDetailed(shutdownDeadline)")
+        let memoryJoin = source.indexOf("MemoryRuntime.stopActiveMaintenanceUntil(shutdownDeadline)")
+        let canvasStop = source.indexOf("GatewayCanvasHostRuntime.stopDetailed(phaseDeadline)")
         let httpStop = source.indexOf(
-            "GatewayHttpSurface.stopDetailed(shutdownDeadline, shutdownIdentity: serveIdentity)"
+            "GatewayHttpSurface.stopDetailed(phaseDeadline, shutdownIdentity: serveIdentity)"
         )
         let serverStop = source.indexOf("GatewayServer.defaultServer().stopServerDetailed(reason: \"gateway-serve-shutdown\")")
         let gatewayStop = source.indexOf("let gatewayStop = try {")
         @Expect(memoryStop.isSome(), true)
+        @Expect(memoryJoin.isSome(), true)
         @Expect(canvasStop.isSome(), true)
         @Expect(httpStop.isSome(), true)
         @Expect(serverStop.isSome(), true)
         @Expect(gatewayStop.isSome(), true)
-        if (!memoryStop.isSome() || !canvasStop.isSome() || !httpStop.isSome() ||
+        if (!memoryStop.isSome() || !memoryJoin.isSome() || !canvasStop.isSome() || !httpStop.isSome() ||
             !serverStop.isSome() || !gatewayStop.isSome()) { return }
         let brokerBoundary = gatewayStop.getOrThrow()
         @Expect(memoryStop.getOrThrow() < brokerBoundary, true)
+        @Expect(brokerBoundary < memoryJoin.getOrThrow(), true)
         @Expect(canvasStop.getOrThrow() < brokerBoundary, true)
         @Expect(httpStop.getOrThrow() < brokerBoundary, true)
         @Expect(serverStop.getOrThrow() < brokerBoundary, true)
@@ -3016,11 +3295,11 @@ public class GatewayServeLockLogicTest {
                 }
                 @Expect(!demo.isEmpty() && !http.isEmpty(), true)
                 if (demo.isEmpty() || http.isEmpty()) { return }
-                let canvasStop = demo.indexOf("GatewayCanvasHostRuntime.stopDetailed(shutdownDeadline)")
+                let canvasStop = demo.indexOf("GatewayCanvasHostRuntime.stopDetailed(phaseDeadline)")
                 let canvasDone = demo.indexOf("gatewayPublishShutdownPhaseForTest(identity, \"canvas_done\")")
-                let httpStop = demo.indexOf("GatewayHttpSurface.stopDetailed(shutdownDeadline, shutdownIdentity: serveIdentity)")
+                let httpStop = demo.indexOf("GatewayHttpSurface.stopDetailed(phaseDeadline, shutdownIdentity: serveIdentity)")
                 let gatewayStop = demo.indexOf("gatewayPublishShutdownPhaseForTest(identity, \"gateway_stop_enter\")")
-                let observerCall = demo.indexOf("gateway.stop(shutdownObserver: shutdownObserver)")
+                let observerCall = demo.indexOf("gateway.stop(deadline: shutdownDeadline, shutdownObserver: shutdownObserver)")
                 let gatewayReturned = demo.indexOf("gatewayPublishShutdownPhaseForTest(identity, \"gateway_stop_returned\")")
                 @Expect(canvasStop.isSome() && canvasDone.isSome() && httpStop.isSome() && gatewayStop.isSome() &&
                     observerCall.isSome() && gatewayReturned.isSome(), true)
@@ -3241,6 +3520,8 @@ public class GatewayServeLockLogicTest {
             } else {
                 gatewayHeartbeatProbeExecutable(bin.join("lsof"), "printf 'private-detail' >&2\nexit 2")
             }
+            let fixtureReady = executeWithOutput(bin.join("lsof").toString(), [])
+            @Expect(fixtureReady[0], 2)
             let result = gatewayFindVerifiedListenerPidsOnPortDetailed(port: 49104, timeoutMs: 800)
             @Expect(result.conclusive, false)
             @Expect(result.pids.size, 0)
@@ -3253,6 +3534,8 @@ public class GatewayServeLockLogicTest {
     public func s1N2InconclusiveListenerProbePreservesLiveLockTruth(): Unit {
         withGatewayHeartbeatProbeEnvironment("s1-n2", {_root, bin =>
             gatewayHeartbeatProbeExecutable(bin.join("lsof"), "exit 1")
+            let fixtureReady = executeWithOutput(bin.join("lsof").toString(), [])
+            @Expect(fixtureReady[0], 1)
             @Expect(gatewayAcquireServeLockForRunningProcess(), true)
             gatewayHeartbeatProbeExecutable(bin.join("lsof"), "sleep 1\nexit 1")
             @Expect(gatewayAnotherServeInstanceSeemsRunning(), true)

@@ -55,7 +55,7 @@ if (!readyPath || !eventsPath) {
     if (account === undefined) throw new Error("invalid_fixture_account");
     const row = telegramAccounts.get(account) ?? {
       pollEntered: 0, pollActive: 0, confirmEntered: 0, confirmActive: 0,
-      peerClosed: 0, completed: 0, lastConfirmOffset: 0,
+      peerClosed: 0, completed: 0, lastConfirmOffset: 0, confirmFailed: 0,
     };
     telegramAccounts.set(account, row);
     const poll = Object.hasOwn(body, "timeout");
@@ -79,6 +79,9 @@ if (!readyPath || !eventsPath) {
     }
     if (response.destroyed) return;
     if (!poll && telegramGate.failAccount === account) {
+      row.confirmFailed += 1;
+      appendEvent({ kind: "telegram_confirm_failed", account });
+      writeTelegramMetrics();
       sendJson(response, 503, { ok: false, description: "fixture_confirmation_failed" });
     } else {
       sendJson(response, 200, { ok: true, result: [] });
