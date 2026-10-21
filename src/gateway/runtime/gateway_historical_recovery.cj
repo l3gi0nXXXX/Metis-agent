@@ -85,8 +85,15 @@ public func gatewayParseHistoricalCompletionStrict(text: String): GatewayHistori
         "inboundStatus", "compatStatus", "sidecarStatus", "servicePluginIngressStatus", "servicePluginDispatchStatus",
         "servicePluginOwnerStatus", "servicePluginLeaseStatus", "servicePluginPortStatus", "servicePluginPendingCount",
         "channelsStatus", "brokerStatus", "httpStatus", "canvasStatus", "gatewayServerStatus",
-        "recoveryEvidenceVersion", "brokerExternalTerminal", "brokerTerminalBasis"]
+        "recoveryEvidenceVersion", "brokerExternalTerminal", "brokerTerminalBasis",
+        "channelPendingCount", "shutdownPhase", "shutdownPendingCount", "cronStatus", "memoryStatus"]
     for (key in keys) { if (!known.contains(key)) { return fail("malformed") } }
+    for (key in ["channelPendingCount", "shutdownPendingCount"]) {
+        if (keys.contains(key)) {
+            let count = try { Int64.parse(gatewayServePayloadField(text, key)) } catch (_: Exception) { -1 }
+            if (count < 0) { return fail("malformed") }
+        }
+    }
     let fullTerminal = gatewayServePayloadField(text, "fullTerminal")
     if (fullTerminal != "0" && fullTerminal != "1") { return fail("malformed") }
     let nonce = gatewayServePayloadField(text, "nonce")
@@ -191,7 +198,8 @@ public func gatewayCollectHistoricalRecoveryEvidence(deadline: MonoTime): Gatewa
         rawPortStatus: rawPort, brokerBasis: brokerBasis, durationMs: (MonoTime.now() - started).toMilliseconds()) }
     if (!parsed.ok) { return fail(parsed.status, parentStatus, rawPortStatus) }
     let completion = parsed.completion
-    if (completion.status != "cleanup_pending" || !gatewayHistoricalSurfaceTerminal(completion) ||
+    if (completion.status != "cleanup_pending" || !gatewayShutdownCompletionFactsTerminal(parsed.original) ||
+        !gatewayHistoricalSurfaceTerminal(completion) ||
         !gatewayHistoricalBrokerResourceState(parsed).terminal) { return fail("resources_not_terminal", parentStatus, rawPortStatus) }
     let identity = parsed.identity.getOrThrow()
     let probe = probeProcessInstance(identity.processIdentity.getOrThrow(), deadline)

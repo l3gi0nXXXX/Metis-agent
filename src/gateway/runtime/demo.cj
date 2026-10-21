@@ -6,7 +6,7 @@ import metis.gateway.config.buildGatewayConfigFromUserSettings
 import metis.gateway.gatewayPrepareStartupAuth
 import metis.gateway.core.{GatewayStopResult, gatewayLogMeta, gatewayLogProcessMemory, gatewayRuntimeHeapSnapshot}
 import metis.gateway.logging.{MetisLogEvent, gatewayLoggingCurrentLogFile, metisCreateSubsystemLogger}
-import metis.core.memory.{DreamingPhaseRuntime, MemoryRuntime}
+import metis.core.memory.{DreamingPhaseRuntime, MemoryRuntime, MemoryMaintenanceStopResult}
 import metis.io.PrintUtils
 import metis.gateway.model.ChatType
 import metis.utils.InfoUtils
@@ -15,6 +15,17 @@ import std.time.*
 import stdx.encoding.json.JsonObject
 
 private let gatewayServeLogger = metisCreateSubsystemLogger("gateway/runtime")
+func gatewayMemoryMaintenanceStopSurface(result: MemoryMaintenanceStopResult): GatewaySurfaceStopResult {
+    // worker_failed is returned only after the worker's actual finally settled and its slot was reaped.
+    let terminal = result.pendingCount == 0 && ["stopped", "already_stopped", "worker_failed"].contains(result.status)
+    if (terminal && !result.ok) {
+        gatewayServeLogger.error(MetisLogEvent.gatewayShutdown, "Memory maintenance worker failed before shutdown settled",
+            meta: gatewayLogMeta().string("phase", "memory").string("resourceStatus", "stopped")
+                .string("operationStatus", "worker_failed").object())
+    }
+    GatewaySurfaceStopResult(terminal, if (terminal) { "stopped" } else { result.status })
+}
+
 private let gatewayHeartbeatCadenceTestNonce = "heartbeat-e2e-v1"
 private const GATEWAY_RECOMMENDED_MIN_HEAP_BYTES: Int64 = 1073741824
 private const GATEWAY_RUNTIME_MIN_HEAP_BYTES: Int64 = 4194304
@@ -204,6 +215,11 @@ public func runGatewayP1DemoWithFeishuWebhook(): Unit {
  * 配置来自 `~/.metis/metis.json` 的 `gateway` 与可选环境变量；总开关为 `gateway.enabled`。
  */
 public func runGatewayService(verbose!: Bool = false): Int64 {
+    if (gatewayHasPendingShutdownOwners()) {
+        gatewayServeLogger.error(MetisLogEvent.gatewayShutdown, "Gateway shutdown still owns unfinished work",
+            meta: gatewayLogMeta().string("phase", "start").string("status", "cleanup_pending").object())
+        return 1
+    }
     let startMs = gatewayServeNowMs()
     let startupHeap = gatewayRuntimeHeapSnapshot()
     let heapPolicy = gatewayValidateRuntimeHeapPolicy(getVariable("cjHeapSize"), startupHeap.maxHeapBytes, InfoUtils.os)
@@ -405,30 +421,31 @@ public func runGatewayService(verbose!: Bool = false): Int64 {
         }
     } finally {
         gatewayLogProcessMemory("serve:stop_begin")
-        let shutdownDeadline = MonoTime.now() + Duration.millisecond * GATEWAY_SERVE_GRACEFUL_SHUTDOWN_TIMEOUT_MS
+        let shutdownOwners = GatewayServeShutdownOwners()
+        let shutdownDeadline = gatewayServeShutdownDeadline(serveIdentity)
+        let phaseDeadline = shutdownDeadline - Duration.millisecond * min(2000, max(0, (shutdownDeadline - MonoTime.now()).toMilliseconds()))
         // Cron 清理仍可能需要 channel/session；必须在 Gateway teardown 前完成有界取消与收割。
-        let _ = cronRunner.stop(reason: "gateway_shutdown", drainTimeoutMs: 5000)
-        MetisConfigManager.setWriteRootNotificationHook(None<MetisConfigWriteNotificationListener>)
-        MemoryRuntime.stopActiveMaintenance()
-        let canvasStop = try {
-            GatewayCanvasHostRuntime.stopDetailed(shutdownDeadline)
-        } catch (_: Exception) {
-            GatewaySurfaceStopResult(false, "close_failed")
+        var cronStop = shutdownOwners.run("cron", phaseDeadline, { =>
+            let result = cronRunner.stop(reason: "gateway_shutdown", drainTimeoutMs: min(5000, max(0, (phaseDeadline - MonoTime.now()).toMilliseconds())))
+            GatewaySurfaceStopResult(result.drained, if (result.drained) { "stopped" } else { "cleanup_pending" })
+        })
+        try { MetisConfigManager.setWriteRootNotificationHook(None<MetisConfigWriteNotificationListener>) } catch (_: Exception) { () }
+        // Request cancellation now; a running maintenance command may need broker close to finish.
+        try { MemoryRuntime.stopActiveMaintenance() } catch (_: Exception) {
+            gatewayServeLogger.error(MetisLogEvent.gatewayShutdown, "Memory maintenance stop request failed",
+                meta: gatewayLogMeta().string("phase", "memory").string("status", "stop_failed").object())
         }
+        var canvasStop = shutdownOwners.run("canvas", phaseDeadline, { => GatewayCanvasHostRuntime.stopDetailed(phaseDeadline) })
         match (serveIdentity) {
             case Some(identity) => let _ = gatewayPublishShutdownPhaseForTest(identity, "canvas_done")
             case None => ()
         }
-        let httpStop = try {
-            GatewayHttpSurface.stopDetailed(shutdownDeadline, shutdownIdentity: serveIdentity)
-        } catch (_: Exception) {
-            GatewaySurfaceStopResult(false, "close_failed")
-        }
-        let gatewayServerStop = try {
+        var httpStop = shutdownOwners.run("http", phaseDeadline, { =>
+            GatewayHttpSurface.stopDetailed(phaseDeadline, shutdownIdentity: serveIdentity)
+        })
+        var gatewayServerStop = shutdownOwners.run("server", phaseDeadline, { =>
             GatewayServer.defaultServer().stopServerDetailed(reason: "gateway-serve-shutdown")
-        } catch (_: Exception) {
-            GatewaySurfaceStopResult(false, "persistence_failed")
-        }
+        })
         match (serveIdentity) {
             case Some(identity) => let _ = gatewayPublishShutdownPhaseForTest(identity, "gateway_stop_enter")
             case None => ()
@@ -440,7 +457,7 @@ public func runGatewayService(verbose!: Bool = false): Int64 {
                 })
                 case None => None<(String) -> Unit>
             }
-            let result = gateway.stop(shutdownObserver: shutdownObserver)
+            let result = gateway.stop(deadline: shutdownDeadline, shutdownObserver: shutdownObserver)
             match (serveIdentity) {
                 case Some(identity) => let _ = gatewayPublishShutdownPhaseForTest(identity, "gateway_stop_returned")
                 case None => ()
@@ -449,12 +466,37 @@ public func runGatewayService(verbose!: Bool = false): Int64 {
         } catch (_: Exception) {
             GatewayStopResult(false, "cleanup_pending", diagnostic: "gateway_stop_exception")
         }
-        gatewayClearActiveService()
-        gatewayClearSubagentNoticeDeliveryHook()
-        gatewayClearSubagentNoticeEventHook()
-        gatewayResetSubagentNoticeEventPublisherRegistration()
-        gatewayPlatformMarkStopped(gatewayCfg)
-        gatewayRuntimeMarkStopped(reason: if (gatewayStop.ok) { "shutdown" } else { "cleanup_pending" })
+        var memoryStop = shutdownOwners.run("memory", shutdownDeadline, { =>
+            let result = MemoryRuntime.stopActiveMaintenanceUntil(shutdownDeadline)
+            gatewayMemoryMaintenanceStopSurface(result)
+        })
+        // Secondary persistence and reporting must never skip the actual resource closure or completion.
+        let _ = shutdownOwners.run("state", shutdownDeadline, { =>
+            gatewayClearActiveService()
+            gatewayClearSubagentNoticeDeliveryHook()
+            gatewayClearSubagentNoticeEventHook()
+            gatewayResetSubagentNoticeEventPublisherRegistration()
+            try { gatewayPlatformMarkStopped(gatewayCfg) } catch (_: Exception) {
+                gatewayServeLogger.error(MetisLogEvent.gatewayShutdown, "Gateway shutdown platform state persistence failed",
+                    meta: gatewayLogMeta().string("phase", "state").string("step", "platform").string("status", "persistence_failed").object())
+            }
+            try { gatewayRuntimeMarkStopped(reason: if (gatewayStop.ok) { "shutdown" } else { "cleanup_pending" }) } catch (_: Exception) {
+                gatewayServeLogger.error(MetisLogEvent.gatewayShutdown, "Gateway shutdown runtime state persistence failed",
+                    meta: gatewayLogMeta().string("phase", "state").string("step", "runtime").string("status", "persistence_failed").object())
+            }
+            GatewaySurfaceStopResult(true, "stopped")
+        })
+        cronStop = shutdownOwners.result("cron", cronStop)
+        memoryStop = shutdownOwners.result("memory", memoryStop)
+        canvasStop = shutdownOwners.result("canvas", canvasStop)
+        httpStop = shutdownOwners.result("http", httpStop)
+        gatewayServerStop = shutdownOwners.result("server", gatewayServerStop)
+        let shutdownPending = shutdownOwners.reap()
+        gatewayRetainPendingShutdownOwners(shutdownOwners)
+        let shutdownPhase = if (!cronStop.ok) { "cron" } else if (!memoryStop.ok) { "memory" } else if (!canvasStop.ok) { "canvas" }
+            else if (!httpStop.ok) { "http" } else if (!gatewayServerStop.ok) { "server" }
+            else if (gatewayStop.channelsStatus != "stopped" && gatewayStop.channelsStatus != "not_applicable") { "channels" }
+            else if (!gatewayStop.ok) { "owners" } else if (shutdownPending > 0) { "state" } else { "complete" }
         match (serveIdentity) {
             case Some(identity) =>
                 let completionWritten = gatewayWriteServeCompletionMarker(
@@ -462,13 +504,17 @@ public func runGatewayService(verbose!: Bool = false): Int64 {
                     gatewayStop,
                     httpStatus: httpStop.status,
                     canvasStatus: canvasStop.status,
-                    gatewayServerStatus: gatewayServerStop.status
+                    gatewayServerStatus: gatewayServerStop.status,
+                    cronStatus: cronStop.status,
+                    memoryStatus: memoryStop.status,
+                    shutdownPendingCount: shutdownPending,
+                    shutdownPhase: shutdownPhase
                 )
                 if (completionWritten) { let _ = gatewayPublishShutdownPhaseForTest(identity, "completion_written") }
                 let _ = gatewayReleaseServeLockForIdentity(identity)
             case None => gatewayReleaseServeLockQuiet()
         }
-        if (gatewayStop.ok && canvasStop.ok && httpStop.ok && gatewayServerStop.ok) {
+        if (gatewayStop.ok && cronStop.ok && memoryStop.ok && canvasStop.ok && httpStop.ok && gatewayServerStop.ok && shutdownPending == 0) {
             gatewayServeLogger.info(MetisLogEvent.gatewayShutdown, "Gateway serve stopped")
         } else {
             gatewayServeLogger.error(MetisLogEvent.gatewayShutdown, "Gateway serve stopped with cleanup pending")
