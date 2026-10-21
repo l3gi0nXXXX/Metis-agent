@@ -1,5 +1,9 @@
 package metis.core.memory
 
+import metis.core.config.MetisProcessEnvironmentLock
+import std.sync.{Condition, Mutex}
+import std.time.MonoTime
+import std.core.Duration
 import magic.jsonable.*
 
 import metis.core.config.CliConfig
@@ -1212,6 +1216,110 @@ public class MemoryRuntimeRegistryTest {
             MemoryRuntimeRegistry.activateBackend(previousProvider, startMaintenance: false)
             if (exists(root)) {
                 remove(root, recursive: true)
+            }
+        }
+    }
+}
+
+private class MemoryShutdownBarrier {
+    private let lock = Mutex()
+    private var condition: Condition
+    private var entered = false
+    private var released = false
+    init() { synchronized(this.lock) { this.condition = this.lock.condition() } }
+    func hold(): Unit {
+        synchronized(this.lock) {
+            this.entered = true
+            this.condition.notifyAll()
+            while (!this.released) { let _ = this.condition.wait(timeout: Duration.second) }
+        }
+    }
+    func waitEntered(): Bool {
+        let deadline = MonoTime.now() + Duration.second * 2
+        synchronized(this.lock) {
+            while (!this.entered) {
+                let remaining = (deadline - MonoTime.now()).toMilliseconds()
+                if (remaining <= 0) { return false }
+                let _ = this.condition.wait(timeout: Duration.millisecond * remaining)
+            }
+            true
+        }
+    }
+    func release(): Unit { synchronized(this.lock) { this.released = true; this.condition.notifyAll() } }
+}
+
+@Test
+public class MemoryShutdownTest {
+    @TestCase
+    public func s2MuCooperativeStopActuallySettlesAndLegacyStopAllowsRestart(): Unit {
+        synchronized(MetisProcessEnvironmentLock) {
+            let _ = MemoryProviderRegistry.stopActiveMaintenanceUntil(MonoTime.now() + Duration.second * 2)
+            @Expect(memoryStartCooperativeMaintenanceForTest(), true)
+            let stopped = MemoryProviderRegistry.stopActiveMaintenanceUntil(MonoTime.now() + Duration.second * 2)
+            @Expect(stopped.ok, true)
+            @Expect(stopped.pendingCount, 0)
+            @Expect(memoryStartCooperativeMaintenanceForTest(), true)
+            MemoryProviderRegistry.stopActiveMaintenance()
+            let restartDeadline = MonoTime.now() + Duration.second * 2
+            var restarted = false
+            while (!restarted && MonoTime.now() < restartDeadline) {
+                restarted = memoryStartCooperativeMaintenanceForTest()
+                if (!restarted) { sleep(Duration.millisecond) }
+            }
+            // No bounded stop reaped the old slot: start itself must reap only its real finally.
+            @Expect(restarted, true)
+            @Expect(MemoryRuntime.stopActiveMaintenanceUntil(MonoTime.now() + Duration.second * 2).pendingCount, 0)
+            @Expect(MemoryRuntimeRegistry.stopActiveMaintenanceUntil(MonoTime.now() + Duration.second * 2).ok, true)
+        }
+    }
+
+    @TestCase
+    public func s2MbExpiredHeldWorkerRetainsOwnerAndRefusesNewGeneration(): Unit {
+        synchronized(MetisProcessEnvironmentLock) {
+            let barrier = MemoryShutdownBarrier()
+            try {
+                @Expect(memoryStartMaintenanceWorkerForTest({ => barrier.hold() }), true)
+                @Expect(barrier.waitEntered(), true)
+                let began = MonoTime.now()
+                let pending = MemoryProviderRegistry.stopActiveMaintenanceUntil(began)
+                @Expect((MonoTime.now() - began).toMilliseconds() < 100, true)
+                @Expect(pending.status, "cleanup_pending")
+                @Expect(pending.pendingCount, 1)
+                MemoryProviderRegistry.stopActiveMaintenance()
+                @Expect(memoryStartCooperativeMaintenanceForTest(), false)
+                barrier.release()
+                @Expect(MemoryProviderRegistry.stopActiveMaintenanceUntil(MonoTime.now() + Duration.second * 2).ok, true)
+                @Expect(memoryStartCooperativeMaintenanceForTest(), true)
+            } finally {
+                barrier.release()
+                let _ = MemoryProviderRegistry.stopActiveMaintenanceUntil(MonoTime.now() + Duration.second * 2)
+            }
+        }
+    }
+
+    @TestCase
+    public func s2MnWorkerExceptionAndConcurrentStopsNeverLoseTheOwner(): Unit {
+        synchronized(MetisProcessEnvironmentLock) {
+            let barrier = MemoryShutdownBarrier()
+            try {
+                @Expect(memoryStartMaintenanceWorkerForTest({ => barrier.hold(); throw Exception("中文🧪") }), true)
+                @Expect(barrier.waitEntered(), true)
+                let first = spawn { MemoryProviderRegistry.stopActiveMaintenanceUntil(MonoTime.now()) }
+                let second = spawn { MemoryProviderRegistry.stopActiveMaintenanceUntil(MonoTime.now()) }
+                @Expect(first.get(Duration.second).pendingCount, 1)
+                @Expect(second.get(Duration.second).pendingCount, 1)
+                @Expect(memoryStartCooperativeMaintenanceForTest(), false)
+                barrier.release()
+                let failed = MemoryRuntime.stopActiveMaintenanceUntil(MonoTime.now() + Duration.second * 2)
+                @Expect(failed.ok, false)
+                @Expect(failed.status, "worker_failed")
+                @Expect(failed.pendingCount, 0)
+                @Expect(MemoryRuntimeRegistry.stopActiveMaintenanceUntil(MonoTime.now()).status, "already_stopped")
+                @Expect(memoryStartCooperativeMaintenanceForTest(), true)
+                @Expect(MemoryRuntime.stopActiveMaintenanceUntil(MonoTime.now() + Duration.second * 2).ok, true)
+            } finally {
+                barrier.release()
+                let _ = MemoryProviderRegistry.stopActiveMaintenanceUntil(MonoTime.now() + Duration.second * 2)
             }
         }
     }

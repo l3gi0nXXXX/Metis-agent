@@ -17,8 +17,8 @@ import std.collection.{ArrayList, HashSet}
 import std.core.Duration
 import std.convert.Parsable
 import std.fs.{Directory, File, Path, copy, exists, remove}
-import std.sync.Mutex
-import std.time.DateTime
+import std.sync.{Condition, Mutex}
+import std.time.{DateTime, MonoTime}
 import stdx.encoding.json.{JsonArray, JsonBool, JsonObject, JsonString, JsonValue}
 
 private const GATEWAY_MODEL_MEMORY_BUSY_TEXT = "Gateway model capacity is temporarily unavailable. Please retry later."
@@ -38,6 +38,7 @@ public class GatewayStopResult {
     public let servicePluginPortStatus: String
     public let servicePluginPendingCount: Int64
     public let channelsStatus: String
+    public let channelPendingCount: Int64
     public let brokerExternalTerminal: Bool
     public let brokerTerminalBasis: String
     public let brokerStatus: String
@@ -58,6 +59,7 @@ public class GatewayStopResult {
         servicePluginPortStatus!: String = "not_checked",
         servicePluginPendingCount!: Int64 = 0,
         channelsStatus!: String = "not_checked",
+        channelPendingCount!: Int64 = 0,
         brokerStatus!: String = "not_checked",
         brokerExternalTerminal!: Bool = false,
         brokerTerminalBasis!: String = "unknown",
@@ -77,6 +79,7 @@ public class GatewayStopResult {
         this.servicePluginPortStatus = servicePluginPortStatus.trimAscii()
         this.servicePluginPendingCount = max(0, servicePluginPendingCount)
         this.channelsStatus = channelsStatus.trimAscii()
+        this.channelPendingCount = max(0, channelPendingCount)
         this.brokerStatus = brokerStatus.trimAscii()
         this.brokerExternalTerminal = brokerExternalTerminal
         this.brokerTerminalBasis = brokerTerminalBasis
@@ -137,6 +140,36 @@ func gatewayServiceStopJsonStatus(value: JsonObject): (Bool, String) {
     (terminalOk, normalizedStatus)
 }
 
+/** Same stop call only: a generic second host reap must not erase concrete pending owner evidence. */
+func gatewayServiceSelectPluginShutdownEvidence(previous: ServicePluginHostShutdownResult,
+    latest: ServicePluginHostShutdownResult): ServicePluginHostShutdownResult {
+    if (latest.ok || previous.ok || previous.status != "cleanup_pending" || latest.status != "cleanup_pending" ||
+        previous.results.size != latest.results.size || previous.results.isEmpty()) { return latest }
+    let ids = HashSet<String>()
+    for (result in previous.results) {
+        if (result.serviceId.isEmpty() || ids.contains(result.serviceId)) { return latest }
+        ids.add(result.serviceId)
+    }
+    let seen = HashSet<String>()
+    for (result in latest.results) {
+        if (!ids.contains(result.serviceId) || seen.contains(result.serviceId)) { return latest }
+        seen.add(result.serviceId)
+    }
+    let selected = ArrayList<ServiceStopResult>()
+    for (result in latest.results) {
+        var row = result
+        if (!result.ok && result.status == "cleanup_pending" && result.ingressStopStatus == "not_started" &&
+            result.dispatchStatus == "not_started" && result.ownerStopStatus == "not_started" &&
+            result.leaseStatus == "not_checked" && result.portStatus == "not_checked") {
+            for (old in previous.results) {
+                if (old.serviceId == result.serviceId && !old.ok && old.status == "cleanup_pending") { row = old }
+            }
+        }
+        selected.add(row)
+    }
+    ServicePluginHostShutdownResult(latest.ok, latest.status, selected)
+}
+
 func gatewayServiceStopOwnersThenBroker(
     stopOwners: () -> ServicePluginHostShutdownResult,
     stopChannels: () -> GatewayChannelStopSummary,
@@ -153,6 +186,7 @@ func gatewayServiceStopOwnersThenBroker(
     var servicePluginPendingCount: Int64 = 0
     var channelsOk = false
     var channelsStatus = "channels_failed"
+    var channelPendingCount: Int64 = 0
     var brokerOk = false
     var brokerStatus = "broker_failed"
     var brokerExternalTerminal = false
@@ -170,6 +204,15 @@ func gatewayServiceStopOwnersThenBroker(
         for (result in owners.results) {
             if (!result.ok) { servicePluginPendingCount += 1 }
         }
+        if (!owners.ok && owners.results.isEmpty()) {
+            // An unfinished host task has not proved that there are no resources.
+            servicePluginIngressStatus = "cleanup_pending"
+            servicePluginDispatchStatus = "cleanup_pending"
+            servicePluginOwnerStatus = "cleanup_pending"
+            servicePluginLeaseStatus = "cleanup_pending"
+            servicePluginPortStatus = "cleanup_pending"
+            servicePluginPendingCount = 1
+        }
     } catch (_: Exception) {
         ownersStatus = "owners_failed"
     }
@@ -177,8 +220,9 @@ func gatewayServiceStopOwnersThenBroker(
     gatewayServiceNotifyShutdownObserver(shutdownObserver, "channels_enter")
     try {
         let channels = stopChannels()
-        channelsOk = channels.ok
+        channelsOk = channels.ok && channels.pendingCount == 0
         channelsStatus = channels.status
+        channelPendingCount = channels.pendingCount
     } catch (_: Exception) {
         channelsStatus = "channels_failed"
     }
@@ -220,6 +264,7 @@ func gatewayServiceStopOwnersThenBroker(
         servicePluginPortStatus: servicePluginPortStatus,
         servicePluginPendingCount: servicePluginPendingCount,
         channelsStatus: channelsStatus,
+        channelPendingCount: channelPendingCount,
         brokerStatus: brokerStatus,
         brokerExternalTerminal: brokerExternalTerminal,
         brokerTerminalBasis: brokerTerminalBasis,
@@ -235,6 +280,59 @@ private func gatewayServiceNotifyShutdownObserver(observer: Option<(String) -> U
         case Some(value) => try { value(phase) } catch (_: Exception) { () }
         case None => ()
     }
+}
+
+/** Remaining time is measured against one monotonic deadline, including exhausted budgets. */
+public func gatewayShutdownRemainingMs(deadline: MonoTime, capMs!: Int64 = Int64.Max,
+    now!: MonoTime = MonoTime.now()): Int64 {
+    max(0, min(max(0, capMs), (deadline - now).toMilliseconds()))
+}
+
+private class GatewayShutdownBrokerObservation {
+    var result = ManagedStdioOperationResult(false, "not_checked")
+}
+
+private class GatewayServiceShutdownTask<T> {
+    private let lock = Mutex()
+    private var condition: Condition
+    private var settled = false
+    private var result: Option<T> = None<T>
+    private var future: Option<Future<Unit>> = None<Future<Unit>>
+
+    init(work: () -> T) {
+        synchronized(this.lock) { this.condition = this.lock.condition() }
+        this.future = Some(spawn {
+            try {
+                let value = work()
+                synchronized(this.lock) { this.result = Some(value) }
+            } catch (_: Exception) { () } finally {
+                synchronized(this.lock) {
+                    this.settled = true
+                    this.condition.notifyAll()
+                }
+            }
+        })
+    }
+
+    func hasSettled(): Bool { synchronized(this.lock) { this.settled } }
+
+    func awaitUntil(deadline: MonoTime): Option<T> {
+        synchronized(this.lock) {
+            while (!this.settled) {
+                let remaining = gatewayShutdownRemainingMs(deadline)
+                if (remaining == 0) { return None<T> }
+                let _ = this.condition.wait(timeout: Duration.millisecond * remaining)
+            }
+            this.result
+        }
+    }
+}
+
+private func gatewayShutdownPendingJson(): JsonObject {
+    let result = JsonObject()
+    result.put("ok", JsonBool(false))
+    result.put("status", JsonString("cleanup_pending"))
+    result
 }
 
 private func gatewayInboundFallbackOrderingKey(message: InboundMessage, accountId: String): String {
@@ -259,6 +357,14 @@ public class GatewayService {
     private let transcriptPublisher: Option<(GatewaySessionContext, Int64, String, String) -> Unit>
     private let inboundDispatcher: GatewayInboundDispatcher
     private let sharedStateLock = Mutex()
+    private var shutdownRunning = false
+    private var shutdownAttempted = false
+    private var shutdownTerminal = false
+    private var inboundShutdown: Option<GatewayServiceShutdownTask<GatewayInboundStopResult>> = None<GatewayServiceShutdownTask<GatewayInboundStopResult>>
+    private var compatShutdown: Option<GatewayServiceShutdownTask<JsonObject>> = None<GatewayServiceShutdownTask<JsonObject>>
+    private var sidecarShutdown: Option<GatewayServiceShutdownTask<JsonObject>> = None<GatewayServiceShutdownTask<JsonObject>>
+    private var pluginShutdown: Option<GatewayServiceShutdownTask<ServicePluginHostShutdownResult>> = None<GatewayServiceShutdownTask<ServicePluginHostShutdownResult>>
+    private var channelShutdown: Option<GatewayServiceShutdownTask<GatewayChannelStopSummary>> = None<GatewayServiceShutdownTask<GatewayChannelStopSummary>>
     private let telegramAutoTopicLabelAttempts = HashSet<String>()
     private let consumedTelegramPluginCallbackIds = HashSet<String>()
     private let telegramErrorPolicyState = GatewayTelegramErrorPolicyState()
@@ -370,6 +476,18 @@ public class GatewayService {
      * 启动所有已注册渠道。
      */
     public func start(): Unit {
+        synchronized(this.sharedStateLock) {
+            if (this.shutdownRunning || (this.shutdownAttempted && !this.shutdownTerminal)) { throw Exception("gateway_shutdown_pending") }
+            if (this.shutdownTerminal) {
+                this.inboundShutdown = None<GatewayServiceShutdownTask<GatewayInboundStopResult>>
+                this.compatShutdown = None<GatewayServiceShutdownTask<JsonObject>>
+                this.sidecarShutdown = None<GatewayServiceShutdownTask<JsonObject>>
+                this.pluginShutdown = None<GatewayServiceShutdownTask<ServicePluginHostShutdownResult>>
+                this.channelShutdown = None<GatewayServiceShutdownTask<GatewayChannelStopSummary>>
+                this.shutdownAttempted = false
+                this.shutdownTerminal = false
+            }
+        }
         let startMs = this.startNowMs()
         let startupSummary = this.channelManager.startChannels()
         let user = CliSettingManager.readGatewaySettings()
@@ -434,40 +552,135 @@ public class GatewayService {
     /**
      * 停止所有渠道。
      */
-    public func stop(shutdownObserver!: Option<(String) -> Unit> = None<(String) -> Unit>): GatewayStopResult {
-        let inboundStop = this.inboundDispatcher.stop(timeoutMs: 3000)
+    public func stop(deadline!: MonoTime = MonoTime.now() + Duration.second * 54,
+        shutdownObserver!: Option<(String) -> Unit> = None<(String) -> Unit>): GatewayStopResult {
+        synchronized(this.sharedStateLock) {
+            if (this.shutdownRunning) { return GatewayStopResult(false, "cleanup_pending", diagnostic: "shutdown_in_progress") }
+            this.shutdownRunning = true
+            this.shutdownAttempted = true
+        }
+        try { this.stopWithin(deadline, shutdownObserver) } finally {
+            synchronized(this.sharedStateLock) { this.shutdownRunning = false }
+        }
+    }
+
+    private func stopWithin(deadline: MonoTime, shutdownObserver: Option<(String) -> Unit>): GatewayStopResult {
+        // Preserve the broker's existing 2s cap within the same total work budget.
+        let brokerReserve = min(2000, gatewayShutdownRemainingMs(deadline))
+        let ownerDeadline = deadline - Duration.millisecond * brokerReserve
+        if (let Some(previous) <- this.inboundShutdown) {
+            if (previous.hasSettled()) {
+                match (previous.awaitUntil(MonoTime.now())) {
+                    case Some(value) => if (!value.ok) { this.inboundShutdown = None<GatewayServiceShutdownTask<GatewayInboundStopResult>> }
+                    case None => this.inboundShutdown = None<GatewayServiceShutdownTask<GatewayInboundStopResult>>
+                }
+            }
+        }
+        if (this.inboundShutdown.isNone()) {
+            this.inboundShutdown = Some(GatewayServiceShutdownTask<GatewayInboundStopResult>({ =>
+                this.inboundDispatcher.stop(timeoutMs: gatewayShutdownRemainingMs(ownerDeadline, capMs: 3000))
+            }))
+        }
+        var inboundStop = this.inboundShutdown.getOrThrow().awaitUntil(ownerDeadline) ??
+            GatewayInboundStopResult(false, "cleanup_pending")
         if (!inboundStop.ok) {
-            gatewayLogEventError(
-                "gateway/service",
-                "gateway.inbound.stop.failed",
-                "gateway inbound dispatcher did not drain within its deadline",
-                meta: gatewayLogMeta()
-                    .string("phase", "stop")
-                    .string("status", inboundStop.status)
-                    .int("active", inboundStop.active)
-                    .int("queued", inboundStop.queued)
-                    .object()
-            )
+            gatewayLogEventError("gateway/service", "gateway.inbound.stop.failed",
+                "gateway inbound dispatcher did not drain within its deadline", meta: gatewayLogMeta()
+                    .string("phase", "stop").string("status", inboundStop.status)
+                    .int("active", inboundStop.active).int("queued", inboundStop.queued).object())
         }
-        let compat = try {
-            gatewayServiceStopJsonStatus(gatewayOpenClawCompatHostStop(CliSettingManager.readGatewaySettings()))
-        } catch (_: Exception) {
-            (false, "stop_failed")
+        if (let Some(previous) <- this.compatShutdown) {
+            if (previous.hasSettled()) {
+                let old = previous.awaitUntil(MonoTime.now())
+                if (old.isNone() || !gatewayServiceStopJsonStatus(old.getOrDefault { gatewayShutdownPendingJson() })[0]) {
+                    this.compatShutdown = None<GatewayServiceShutdownTask<JsonObject>>
+                }
+            }
         }
-        let sidecar = try {
-            gatewayServiceStopJsonStatus(gatewayOpenClawPluginSidecarStop(CliSettingManager.readGatewaySettings()))
-        } catch (_: Exception) {
-            (false, "stop_failed")
+        if (this.compatShutdown.isNone()) {
+            this.compatShutdown = Some(GatewayServiceShutdownTask<JsonObject>({ => gatewayOpenClawCompatHostStop(CliSettingManager.readGatewaySettings()) }))
+        }
+        var compat = gatewayServiceStopJsonStatus(this.compatShutdown.getOrThrow().awaitUntil(ownerDeadline) ?? gatewayShutdownPendingJson())
+        if (let Some(previous) <- this.sidecarShutdown) {
+            if (previous.hasSettled()) {
+                let old = previous.awaitUntil(MonoTime.now())
+                if (old.isNone() || !gatewayServiceStopJsonStatus(old.getOrDefault { gatewayShutdownPendingJson() })[0]) {
+                    this.sidecarShutdown = None<GatewayServiceShutdownTask<JsonObject>>
+                }
+            }
+        }
+        if (this.sidecarShutdown.isNone()) {
+            this.sidecarShutdown = Some(GatewayServiceShutdownTask<JsonObject>({ => gatewayOpenClawPluginSidecarStop(CliSettingManager.readGatewaySettings()) }))
+        }
+        var sidecar = gatewayServiceStopJsonStatus(this.sidecarShutdown.getOrThrow().awaitUntil(ownerDeadline) ?? gatewayShutdownPendingJson())
+        if (let Some(previous) <- this.pluginShutdown) {
+            if (previous.hasSettled()) {
+                match (previous.awaitUntil(MonoTime.now())) {
+                    case Some(value) => if (!value.ok) { this.pluginShutdown = None<GatewayServiceShutdownTask<ServicePluginHostShutdownResult>> }
+                    case None => this.pluginShutdown = None<GatewayServiceShutdownTask<ServicePluginHostShutdownResult>>
+                }
+            }
+        }
+        if (let Some(previous) <- this.channelShutdown) {
+            if (previous.hasSettled()) {
+                match (previous.awaitUntil(MonoTime.now())) {
+                    case Some(value) => if (!value.ok || value.pendingCount > 0) { this.channelShutdown = None<GatewayServiceShutdownTask<GatewayChannelStopSummary>> }
+                    case None => this.channelShutdown = None<GatewayServiceShutdownTask<GatewayChannelStopSummary>>
+                }
+            }
+        }
+        if (this.pluginShutdown.isNone()) {
+            this.pluginShutdown = Some(GatewayServiceShutdownTask<ServicePluginHostShutdownResult>({ =>
+                shutdownServicePluginHost(reason: "gateway-shutdown", timeoutMillis: gatewayShutdownRemainingMs(ownerDeadline))
+            }))
+        }
+        let pluginTask = this.pluginShutdown.getOrThrow()
+        let brokerObserved = GatewayShutdownBrokerObservation()
+        let stoppedInitial = gatewayServiceStopOwnersThenBroker({ =>
+            pluginTask.awaitUntil(ownerDeadline) ?? ServicePluginHostShutdownResult(false, "cleanup_pending", ArrayList<ServiceStopResult>())
+        }, { =>
+            if (this.channelShutdown.isNone()) {
+                this.channelShutdown = Some(GatewayServiceShutdownTask<GatewayChannelStopSummary>({ =>
+                    this.channelManager.stopChannelsDetailed(reason: "shutdown", manualStop: false, deadline: ownerDeadline)
+                }))
+            }
+            this.channelShutdown.getOrThrow().awaitUntil(ownerDeadline) ?? GatewayChannelStopSummary(false, "cleanup_pending", pendingCount: 1)
+        }, { =>
+            brokerObserved.result = shutdownGatewayStdioBroker(timeoutMs: gatewayShutdownRemainingMs(deadline, capMs: 2000))
+            brokerObserved.result
+        }, shutdownObserver: shutdownObserver)
+        // Broker close may settle a previously pending process-I/O task. Reap only observed results.
+        inboundStop = this.inboundShutdown.getOrThrow().awaitUntil(deadline) ?? GatewayInboundStopResult(false, "cleanup_pending")
+        compat = gatewayServiceStopJsonStatus(this.compatShutdown.getOrThrow().awaitUntil(deadline) ?? gatewayShutdownPendingJson())
+        sidecar = gatewayServiceStopJsonStatus(this.sidecarShutdown.getOrThrow().awaitUntil(deadline) ?? gatewayShutdownPendingJson())
+        let pluginAfterBroker = this.pluginShutdown.getOrThrow().awaitUntil(deadline)
+        if (let Some(previous) <- pluginAfterBroker) {
+            if (previous.status == "cleanup_pending" && gatewayShutdownRemainingMs(deadline) > 0) {
+                this.pluginShutdown = Some(GatewayServiceShutdownTask<ServicePluginHostShutdownResult>({ =>
+                    shutdownServicePluginHost(reason: "gateway-shutdown", timeoutMillis: gatewayShutdownRemainingMs(deadline))
+                }))
+            }
+        }
+        let channelAfterBroker = this.channelShutdown.getOrThrow().awaitUntil(deadline)
+        if (let Some(previous) <- channelAfterBroker) {
+            if ((!previous.ok || previous.pendingCount > 0) && previous.status == "cleanup_pending" && gatewayShutdownRemainingMs(deadline) > 0) {
+                // Reap the same manager-owned generations; this does not start a channel generation.
+                this.channelShutdown = Some(GatewayServiceShutdownTask<GatewayChannelStopSummary>({ =>
+                    this.channelManager.stopChannelsDetailed(reason: "shutdown", manualStop: false, deadline: deadline)
+                }))
+            }
         }
         let stopped = gatewayServiceStopOwnersThenBroker({ =>
-            shutdownServicePluginHost(reason: "gateway-shutdown")
+            let latest = this.pluginShutdown.getOrThrow().awaitUntil(deadline) ??
+                ServicePluginHostShutdownResult(false, "cleanup_pending", ArrayList<ServiceStopResult>())
+            match (pluginAfterBroker) {
+                case Some(previous) => gatewayServiceSelectPluginShutdownEvidence(previous, latest)
+                case None => latest
+            }
         }, { =>
-            // Gateway process shutdown should not persist a user-level manual stop.
-            this.channelManager.stopChannelsDetailed(reason: "shutdown", manualStop: false)
-        }, { =>
-            // The broker is the final process-I/O owner. This cleanup must run even when an earlier owner stop throws.
-            shutdownGatewayStdioBroker(timeoutMs: 2000)
-        }, shutdownObserver: shutdownObserver)
+            this.channelShutdown.getOrThrow().awaitUntil(deadline) ?? GatewayChannelStopSummary(false, "cleanup_pending", pendingCount: 1)
+        }, { => brokerObserved.result })
+        let _ = stoppedInitial
         let ownersOk = compat[0] && sidecar[0] && stopped.ok
         let ownersStatus = if (ownersOk) { "stopped" } else { "cleanup_pending" }
         let ok = inboundStop.ok && compat[0] && sidecar[0] && stopped.ok
@@ -484,8 +697,9 @@ public class GatewayService {
             servicePluginOwnerStatus: stopped.servicePluginOwnerStatus,
             servicePluginLeaseStatus: stopped.servicePluginLeaseStatus,
             servicePluginPortStatus: stopped.servicePluginPortStatus,
-            servicePluginPendingCount: stopped.servicePluginPendingCount,
+            servicePluginPendingCount: max(stopped.servicePluginPendingCount, if (this.pluginShutdown.getOrThrow().hasSettled()) { 0 } else { 1 }),
             channelsStatus: stopped.channelsStatus,
+            channelPendingCount: stopped.channelPendingCount,
             brokerStatus: stopped.brokerStatus,
             brokerExternalTerminal: stopped.brokerExternalTerminal,
             brokerTerminalBasis: stopped.brokerTerminalBasis,
@@ -506,8 +720,10 @@ public class GatewayService {
             .string("servicePluginPortStatus", result.servicePluginPortStatus)
             .int("servicePluginPendingCount", result.servicePluginPendingCount)
             .string("channelsStatus", result.channelsStatus)
+            .int("channelPendingCount", result.channelPendingCount)
             .string("brokerStatus", result.brokerStatus)
             .object()
+        synchronized(this.sharedStateLock) { this.shutdownTerminal = result.ok }
         if (result.ok) {
             gatewayLogEventInfo("gateway/service", "gateway.stopped", "gateway service stopped", meta: meta)
         } else {

@@ -1400,6 +1400,7 @@ private func runGatewayStopSubcommand(): Int64 {
     let failed = ArrayList<Int64>()
     var forced = false
     var failureStatus = "cleanup_pending"
+    var failurePhase = "unknown"
     let stopResults = gatewayStopTargetsWithinDeadline(
         stopPids,
         deadline,
@@ -1411,6 +1412,7 @@ private func runGatewayStopSubcommand(): Int64 {
         if (!stopped.ok) {
             failed.add(pid)
             failureStatus = stopped.status
+            failurePhase = stopped.shutdownPhase
         } else if (stopped.status == "force_terminated") {
             forced = true
         }
@@ -1426,8 +1428,25 @@ private func runGatewayStopSubcommand(): Int64 {
         delimiter: ","
     )
     gatewayStopPrintLine("${gatewayStopOutcomeHumanText(failureStatus)} PID=${failedPidText}")
+    let phaseText = gatewayStopPhaseHumanText(failurePhase)
+    if (!phaseText.isEmpty()) { gatewayStopPrintLine(phaseText) }
     gatewayCliTimingLog("stop", "terminate-failed", startMs)
     return 1
+}
+
+public func gatewayStopPhaseHumanText(phase: String): String {
+    let label = match (phase) {
+        case "cron" => "定时任务"
+        case "memory" => "记忆后台任务"
+        case "canvas" => "Canvas服务"
+        case "http" => "HTTP服务"
+        case "server" => "网关状态保存"
+        case "channels" => "消息通道"
+        case "owners" => "插件或后台进程"
+        case "state" => "运行状态保存"
+        case _ => ""
+    }
+    if (label.isEmpty()) { "" } else { "[网关] 关闭阶段尚未完成：${label}。" }
 }
 
 public func gatewayStopOutcomeHumanText(status: String): String {

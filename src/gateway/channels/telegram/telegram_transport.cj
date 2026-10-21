@@ -13,6 +13,7 @@ import stdx.encoding.json.*
 import stdx.encoding.url.URL
 import stdx.net.http.*
 import stdx.net.tls.*
+import stdx.log.NoopLogger
 
 public class TelegramTransportRequest {
     public let method: String
@@ -122,6 +123,7 @@ public func hasTelegramTransportRunnerForTest(): Bool {
 }
 
 public class TelegramTransport {
+    private var requestOwner = TelegramRequestOwner()
     private let proxy: String
     private let envProxyEnabled: Bool
     private let timeoutSeconds: Int64
@@ -161,13 +163,9 @@ public class TelegramTransport {
             autoSelectFamily: this.autoSelectFamily,
             dnsResultOrder: this.dnsResultOrder
         )
-        match (telegramTransportRunnerOverride) {
-            case Some(runner) => return runner(request)
-            case None => ()
-        }
         let headers = HashMap<String, String>()
         headers["Accept"] = accept
-        this.sendNative(request, headers)
+        this.sendOwned(request, headers)
     }
 
     public func postJson(url: String, body: JsonObject, context!: String = "postJson"): TelegramTransportResponse {
@@ -185,14 +183,10 @@ public class TelegramTransport {
             autoSelectFamily: this.autoSelectFamily,
             dnsResultOrder: this.dnsResultOrder
         )
-        match (telegramTransportRunnerOverride) {
-            case Some(runner) => return runner(request)
-            case None => ()
-        }
         let headers = HashMap<String, String>()
         headers["Accept"] = "application/json"
         headers["Content-Type"] = "application/json; charset=utf-8"
-        this.sendNative(request, headers)
+        this.sendOwned(request, headers)
     }
 
     public func postMultipartFile(
@@ -228,27 +222,49 @@ public class TelegramTransport {
             autoSelectFamily: this.autoSelectFamily,
             dnsResultOrder: this.dnsResultOrder
         )
-        match (telegramTransportRunnerOverride) {
-            case Some(runner) => return runner(request)
-            case None => ()
-        }
         let headers = HashMap<String, String>()
         headers["Accept"] = "application/json"
         headers["Content-Type"] = request.contentType
-        this.sendNative(request, headers)
+        this.sendOwned(request, headers)
+    }
+
+    func useRequestOwner(owner: TelegramRequestOwner): Unit {
+        this.requestOwner = owner
+    }
+
+    private func cancelledResponse(): TelegramTransportResponse {
+        TelegramTransportResponse(false, error: "telegram request cancelled", outcome: "cancelled")
+    }
+
+    private func sendOwned(request: TelegramTransportRequest, headers: HashMap<String, String>): TelegramTransportResponse {
+        let scope = match (this.requestOwner.beginRequest()) {
+            case Some(value) => value
+            case None => return this.cancelledResponse()
+        }
+        try {
+            let response = match (telegramTransportRunnerOverride) {
+                case Some(runner) => runner(request)
+                case None => this.sendNative(request, headers, scope)
+            }
+            if (scope.isCancelled()) { return this.cancelledResponse() }
+            response
+        } finally {
+            scope.finish()
+        }
     }
 
     private func sendNative(
         request: TelegramTransportRequest,
-        headers: HashMap<String, String>
+        headers: HashMap<String, String>,
+        scope: TelegramRequestScope
     ): TelegramTransportResponse {
         try {
             let urlPolicyError = this.validateTelegramRequestUrl(request.url)
             if (!urlPolicyError.isEmpty()) {
                 return TelegramTransportResponse(false, error: urlPolicyError, outcome: "blocked-url", statusCode: 0)
             }
-            let client = this.buildNativeHttpClient(request.url)
-            try {
+            let client = this.buildNativeHttpClient(request.url, scope)
+            if (!scope.attachClient(client)) { return this.cancelledResponse() }
                 let response = client.send(this.buildNativeHttpRequest(request, headers))
                 let status = Int64(response.status)
                 let responseBytes = ArrayList<Byte>()
@@ -287,10 +303,8 @@ public class TelegramTransport {
                     "Http status: ${status}\nHttp response: ${responseBody}"
                 }
                 TelegramTransportResponse(false, error: detail, outcome: this.classifyStatus(status), statusCode: status)
-            } finally {
-                client.close()
-            }
         } catch (e: Exception) {
+            if (scope.isCancelled()) { return this.cancelledResponse() }
             TelegramTransportResponse(false, error: e.message, outcome: this.classifyException(e.message), statusCode: 0)
         }
     }
@@ -340,8 +354,9 @@ public class TelegramTransport {
         h.startsWith("fc") || h.startsWith("fd") || h.startsWith("fe80:")
     }
 
-    private func buildNativeHttpClient(url: String): Client {
+    private func buildNativeHttpClient(url: String, scope: TelegramRequestScope): Client {
         let builder = ClientBuilder()
+        builder.logger(NoopLogger())
         builder.readTimeout(Duration.second * (this.timeoutSeconds + 5))
         let proxy = this.effectiveProxyForUrl(url)
         let useConnectTunnel = !proxy.isEmpty() && url.startsWith("https")
@@ -363,10 +378,12 @@ public class TelegramTransport {
             let connectTimeoutSeconds = if (this.timeoutSeconds > 0) { this.timeoutSeconds } else { 30 }
             let socketConnector = { _sa: SocketAddress =>
                 let socket = TcpSocket(proxyEndpoint.host, proxyEndpoint.port)
+                if (!scope.attachSocket(socket)) { throw Exception("telegram request cancelled") }
                 try {
                     socket.readTimeout = Duration.second * (this.timeoutSeconds + 5)
                     socket.writeTimeout = Duration.second * (this.timeoutSeconds + 5)
                     socket.connect(timeout: Duration.second * connectTimeoutSeconds)
+                    if (scope.isCancelled()) { throw Exception("telegram request cancelled") }
                     this.openHttpConnectTunnel(socket, targetHost, 443u16, proxyEndpoint)
                 } catch (e: Exception) {
                     try { socket.close() } catch (_: Exception) { () }
@@ -375,10 +392,11 @@ public class TelegramTransport {
                 return socket
             }
             builder.connector(socketConnector)
-        } else if (proxy.isEmpty()) {
+        } else {
             let connectTimeoutSeconds = if (this.timeoutSeconds > 0) { this.timeoutSeconds } else { 30 }
             let socketConnector = { sa: SocketAddress =>
                 let socket = TcpSocket(sa)
+                if (!scope.attachSocket(socket)) { throw Exception("telegram request cancelled") }
                 try {
                     socket.readTimeout = Duration.second * (this.timeoutSeconds + 5)
                     socket.writeTimeout = Duration.second * (this.timeoutSeconds + 5)

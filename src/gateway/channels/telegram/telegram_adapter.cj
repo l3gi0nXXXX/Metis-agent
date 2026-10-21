@@ -2,6 +2,7 @@ package metis.gateway.channels.telegram
 
 import metis.core.{GatewayMediaGroupItem, gatewayMediaTranscribeAudioPathForRuntime, gatewayMediaUnderstandingFirstText, gatewayMediaUnderstandingForRecord, parseGatewayAudioParts, parseGatewayChatAction, parseGatewayDocumentParts, parseGatewayEditButtonsParts, parseGatewayEditMediaParts, parseGatewayEditText, parseGatewayInlineKeyboardParts, parseGatewayMediaGroupItems, parseGatewayPhotoParts, parseGatewayPinAction, parseGatewayReactionRemove, parseGatewayReactionStatus, parseGatewayReactionToken, parseGatewayStickerFileId, parseGatewayTopicCreateText, parseGatewayTopicEditText, parseGatewayVideoNoteFileId, parseGatewayVideoParts, parseGatewayVoiceParts}
 import metis.gateway.core.{ChannelAdapter, gatewayLogIdentityHash, gatewayOpenClawPluginSidecarApplyCurrentMessageReceivedHook, gatewayOpenClawPluginSidecarCommandCatalogForMenu, gatewayTelegramClassifySendError, gatewayTelegramNativeCommandMenuRows}
+import metis.gateway.core.{GatewayBoundedChannelShutdown, GatewayChannelShutdownResult}
 import metis.gateway.logging.{MetisLogEvent, metisCreateSubsystemLogger}
 import metis.gateway.model.*
 import metis.core.config.{CliConfig, CliSettingManager, MetisConfigManager}
@@ -16,6 +17,7 @@ import std.time.*
 import stdx.encoding.json.*
 import stdx.encoding.url.URL
 import stdx.net.http.*
+import stdx.log.LogLevel
 
 private let TELEGRAM_DEFAULT_ACCOUNT_ID = "default"
 
@@ -195,7 +197,7 @@ private func telegramAccountStateDirFor(rootDir: Path, accountId: String): Path 
  * - 真实 `sendMessage` Bot API 出站
  * - 为后续 inbound / topics / reactions / media 留出原生扩展点
  */
-public class TelegramAdapter <: ChannelAdapter {
+public class TelegramAdapter <: ChannelAdapter & GatewayBoundedChannelShutdown {
     private let config: TelegramConfig
     private let pairingStore: TelegramPairingStore
     private let stateRoot: Path
@@ -248,6 +250,19 @@ public class TelegramAdapter <: ChannelAdapter {
     private var lastInboundMessageIdForPolicy: String = ""
     private var lastConfirmedPollingOffset: String = ""
     private var lastRetryAfterSeconds: Int64 = 0
+    private let shutdownLock = Mutex()
+    private var requestOwner = TelegramRequestOwner()
+    private let lifecycleWorkers = ArrayList<TelegramShutdownWorker>()
+    private var shutdownStarted = false
+    private var shutdownComplete = false
+    private var shutdownDeadline: Option<MonoTime> = None
+    private var shutdownConfirmRequested = false
+    private var shutdownConfirmAttempted = false
+    private var confirmationOwner: Option<TelegramRequestOwner> = None
+    private var confirmationWorker: Option<TelegramShutdownWorker> = None
+    private var confirmationDeadline: Option<MonoTime> = None
+    private var confirmationDiagnostic = ""
+    private var lifecycleGeneration: Int64 = 0
 
     public init(
         config!: TelegramConfig = TelegramConfig(),
@@ -373,39 +388,152 @@ public class TelegramAdapter <: ChannelAdapter {
             )
             return
         }
-        this.running = true
+        synchronized(this.shutdownLock) {
+            if (this.running) { return }
+            if (this.shutdownStarted) {
+                if (!this.shutdownComplete || this.pendingShutdownCount() > 0) {
+                    throw Exception("telegram_shutdown_pending")
+                }
+                this.requestOwner = TelegramRequestOwner()
+                this.shutdownStarted = false
+                this.shutdownComplete = false
+                this.shutdownDeadline = None
+                this.shutdownConfirmRequested = false
+                this.shutdownConfirmAttempted = false
+                this.confirmationOwner = None
+                this.confirmationWorker = None
+                this.confirmationDeadline = None
+                this.confirmationDiagnostic = ""
+            }
+            this.lifecycleGeneration += 1
+            this.running = true
+        }
         this.markPollingIdle()
         let startMeta = JsonObject()
         startMeta.put("mode", JsonString(if (this.usesWebhookMode()) { "webhook" } else { "polling" }))
         if (this.usesWebhookMode()) {
             this.registerWebhookWithTelegram()
-            this.startWebhookServer()
-            this.startNativeCommandSyncIfNeeded()
+            synchronized(this.shutdownLock) {
+                if (this.shutdownStarted || !this.running) { return }
+                this.startWebhookServer()
+                this.startNativeCommandSyncIfNeeded()
+            }
             this.logChannel("info", MetisLogEvent.channelStarted, "start", "started", "Telegram adapter started", extra: startMeta)
             return
         }
-        this.startPollingLoop()
-        this.startNativeCommandSyncIfNeeded()
+        synchronized(this.shutdownLock) {
+            if (this.shutdownStarted || !this.running) { return }
+            this.startPollingLoop()
+            this.startNativeCommandSyncIfNeeded()
+        }
         this.logChannel("info", MetisLogEvent.channelStarted, "start", "started", "Telegram adapter started", extra: startMeta)
     }
 
     public func stop(): Unit {
-        let shouldConfirmOffset = this.running && !this.usesWebhookMode()
-        this.running = false
-        if (shouldConfirmOffset) {
-            this.confirmPollingOffsetOnStop()
+        let deadline = MonoTime.now() + Duration.second * 5
+        this.beginShutdown(deadline)
+        let result = this.awaitShutdown(deadline)
+        if (!result.ok || result.pendingCount > 0) { throw Exception("telegram_shutdown_pending") }
+    }
+
+    public func beginShutdown(deadline: MonoTime): Unit {
+        var owner = this.requestOwner
+        synchronized(this.shutdownLock) {
+            this.shutdownComplete = false
+            this.shutdownDeadline = Some(match (this.shutdownDeadline) {
+                case Some(previous) => if (previous < deadline) { previous } else { deadline }
+                case None => deadline
+            })
+            if (!this.shutdownStarted) {
+                this.shutdownConfirmRequested = this.running && !this.usesWebhookMode()
+                this.shutdownStarted = true
+                this.running = false
+                this.pollingRunnerOrThrow().stop()
+                if (let Some(server) <- this.webhookServer) {
+                    let worker = TelegramShutdownWorker()
+                    this.lifecycleWorkers.add(worker)
+                    worker.start({ => try { server.close() } catch (_: Exception) { () } })
+                }
+            }
+            owner = this.requestOwner
         }
-        this.markPollingStopped()
-        if (let Some(server) <- this.webhookServer) {
-            try {
-                server.close()
-            } catch (_e: Exception) {
-                ()
-            } finally {
-                this.webhookServer = None
+        owner.cancel()
+    }
+
+    public func awaitShutdown(deadline: MonoTime): GatewayChannelShutdownResult {
+        this.beginShutdown(deadline)
+        var effectiveDeadline = deadline
+        var workers: Array<TelegramShutdownWorker> = []
+        synchronized(this.shutdownLock) {
+            effectiveDeadline = this.shutdownDeadline ?? deadline
+            workers = this.lifecycleWorkers.toArray()
+        }
+        this.pollingRunnerOrThrow().awaitShutdown(effectiveDeadline)
+        for (worker in workers) { worker.awaitUntil(effectiveDeadline) }
+        this.requestOwner.awaitUntil(effectiveDeadline)
+
+        var confirm: Option<TelegramShutdownWorker> = None
+        var confirmOwner: Option<TelegramRequestOwner> = None
+        var confirmDeadline = effectiveDeadline
+        synchronized(this.shutdownLock) {
+            if (this.pendingShutdownCount() == 0 && this.shutdownConfirmRequested &&
+                !this.shutdownConfirmAttempted && effectiveDeadline - MonoTime.now() >= Duration.millisecond * 10) {
+                this.shutdownConfirmAttempted = true
+                let owner = TelegramRequestOwner()
+                let worker = TelegramShutdownWorker()
+                let childDeadline = MonoTime.now() + Duration.millisecond * 250
+                confirmDeadline = if (childDeadline < effectiveDeadline) { childDeadline } else { effectiveDeadline }
+                let generation = this.lifecycleGeneration
+                let until = confirmDeadline
+                this.confirmationOwner = Some(owner)
+                this.confirmationWorker = Some(worker)
+                this.confirmationDeadline = Some(confirmDeadline)
+                worker.start({ => this.confirmPollingOffsetOnStop(owner: Some(owner), deadline: Some(until), generation: generation); () })
+            }
+            confirm = this.confirmationWorker
+            confirmOwner = this.confirmationOwner
+            confirmDeadline = this.confirmationDeadline ?? effectiveDeadline
+        }
+        if (let Some(worker) <- confirm) {
+            if (!worker.awaitUntil(confirmDeadline)) {
+                if (let Some(owner) <- confirmOwner) { owner.cancel() }
+                synchronized(this.shutdownLock) { this.confirmationDiagnostic = "offset_confirm_timeout" }
+                worker.awaitUntil(effectiveDeadline)
             }
         }
-        this.pollingRunnerOrThrow().stop()
+        if (let Some(owner) <- confirmOwner) { owner.awaitUntil(effectiveDeadline) }
+        synchronized(this.shutdownLock) {
+            let pending = this.pendingShutdownCount()
+            if (pending == 0) {
+                this.webhookServer = None
+                this.shutdownComplete = true
+            }
+            GatewayChannelShutdownResult(
+                pending == 0,
+                if (pending == 0) { "stopped" } else { "cleanup_pending" },
+                pendingCount: pending,
+                diagnostic: if (pending > 0) { "telegram_shutdown_pending" } else { this.confirmationDiagnostic }
+            )
+        }
+    }
+
+    // Called under shutdownLock; completed execution bodies alone can release their handles.
+    private func pendingShutdownCount(): Int64 {
+        var pending = this.pollingRunnerOrThrow().pendingWorkerCount() + this.requestOwner.activeCount()
+        var i = this.lifecycleWorkers.size
+        while (i > 0) {
+            i -= 1
+            if (this.lifecycleWorkers[i].isSettled()) {
+                this.lifecycleWorkers.remove(at: i)
+            } else {
+                pending += 1
+            }
+        }
+        if (let Some(worker) <- this.confirmationWorker) {
+            if (!worker.isSettled()) { pending += 1 }
+        }
+        if (let Some(owner) <- this.confirmationOwner) { pending += owner.activeCount() }
+        pending
     }
 
     public func pullInbound(): Array<InboundMessage> {
@@ -1550,6 +1678,7 @@ public class TelegramAdapter <: ChannelAdapter {
             .addr(this.config.webhookHost)
             .port(this.config.webhookPort)
             .build()
+        server.logger.level = LogLevel.OFF
         server.distributor.register(this.config.webhookPath, { ctx =>
             let source = this.resolveWebhookSource(
                 ctx.request.headers.getFirst("X-Forwarded-For") ?? ctx.request.headers.getFirst("x-forwarded-for") ?? "",
@@ -1599,13 +1728,15 @@ public class TelegramAdapter <: ChannelAdapter {
             ctx.responseBuilder.body("ok")
         })
         this.webhookServer = Some(server)
-        spawn {
+        let worker = TelegramShutdownWorker()
+        this.lifecycleWorkers.add(worker)
+        worker.start({ =>
             try {
                 server.serve()
             } catch (_e: Exception) {
                 ()
             }
-        }
+        })
     }
 
     private func startPollingLoop(): Unit {
@@ -1742,9 +1873,12 @@ public class TelegramAdapter <: ChannelAdapter {
         if (!this.registerNativeCommandsOnStart) {
             return
         }
-        spawn {
+        let worker = TelegramShutdownWorker()
+        this.lifecycleWorkers.add(worker)
+        worker.start({ =>
             this.syncNativeCommands()
-        }
+            ()
+        })
     }
 
     private func runPollingLoop(): Unit {
@@ -1778,10 +1912,6 @@ public class TelegramAdapter <: ChannelAdapter {
 
     private func markPollingIdle(): Unit {
         this.pollingRunnerOrThrow().markIdle()
-    }
-
-    private func markPollingStopped(): Unit {
-        this.pollingRunnerOrThrow().stop()
     }
 
     private func markPollSuccess(outcome!: String = "success"): Unit {
@@ -2283,7 +2413,14 @@ public class TelegramAdapter <: ChannelAdapter {
         }
     }
 
-    private func confirmPollingOffsetOnStop(): Bool {
+    private func confirmPollingOffsetOnStop(
+        owner!: Option<TelegramRequestOwner> = None,
+        deadline!: Option<MonoTime> = None,
+        generation!: Int64 = -1
+    ): Bool {
+        if (let Some(until) <- deadline) {
+            if (MonoTime.now() >= until) { return false }
+        }
         let token = this.effectiveBotToken()
         if (token.isEmpty()) {
             return false
@@ -2296,19 +2433,51 @@ public class TelegramAdapter <: ChannelAdapter {
         let payload = JsonObject()
         payload.put("offset", nextOffset.toJsonValue())
         payload.put("limit", 1.toJsonValue())
-        let responseOpt = this.telegramJsonPost(
-            this.normalizeApiRoot() + "/bot${token}/getUpdates",
-            payload,
-            context: "getUpdates:stop-confirm"
-        )
-        match (responseOpt) {
-            case Some(raw) =>
-                if (this.parseTelegramBoolSuccess(raw, missingDetail: "telegram stop offset confirmation returned ok=false")) {
-                    this.lastConfirmedPollingOffset = "${nextOffset}"
-                    return true
+        let response = try {
+            this.telegramTransport(owner: owner).postJson(
+                this.normalizeApiRoot() + "/bot${token}/getUpdates",
+                payload,
+                context: "getUpdates:stop-confirm"
+            )
+        } catch (_: Exception) {
+            synchronized(this.shutdownLock) { this.confirmationDiagnostic = "offset_confirm_failed" }
+            return false
+        }
+        var diagnostic = "offset_confirm_failed"
+        var confirmed = false
+        if (response.ok) {
+            try {
+                let root = JsonValue.fromStr(response.body).asObject()
+                confirmed = this.readJsonBoolField(root, "ok", false)
+            } catch (_: Exception) {
+                diagnostic = "offset_confirm_malformed_json"
+            }
+        } else if (response.outcome == "cancelled" || response.outcome == "timeout") {
+            diagnostic = "offset_confirm_timeout"
+        } else if (response.outcome == "invalid-response-body") {
+            diagnostic = "offset_confirm_invalid_response_encoding"
+        }
+        synchronized(this.shutdownLock) {
+            if (generation >= 0 && generation != this.lifecycleGeneration) { return false }
+            if (let Some(until) <- deadline) {
+                if (MonoTime.now() >= until) {
+                    this.confirmationDiagnostic = "offset_confirm_timeout"
+                    return false
                 }
-                false
-            case None => false
+            }
+            if (let Some(value) <- owner) {
+                if (value.isCancelled()) {
+                    this.confirmationDiagnostic = "offset_confirm_timeout"
+                    return false
+                }
+            }
+            if (confirmed) {
+                this.lastConfirmedPollingOffset = "${nextOffset}"
+                this.confirmationDiagnostic = ""
+                return true
+            }
+            this.confirmationDiagnostic = diagnostic
+            false
         }
     }
 
@@ -8856,8 +9025,8 @@ public class TelegramAdapter <: ChannelAdapter {
         }
     }
 
-    private func telegramTransport(): TelegramTransport {
-        TelegramTransport(
+    private func telegramTransport(owner!: Option<TelegramRequestOwner> = None): TelegramTransport {
+        let transport = TelegramTransport(
             proxy: this.config.proxy,
             envProxyEnabled: this.config.network.envProxyEnabled,
             timeoutSeconds: if (this.config.timeoutSeconds > 0) { this.config.timeoutSeconds } else { 30 },
@@ -8866,6 +9035,8 @@ public class TelegramAdapter <: ChannelAdapter {
             autoSelectFamily: this.config.network.autoSelectFamily,
             dnsResultOrder: this.config.network.dnsResultOrder
         )
+        transport.useRequestOwner(owner ?? this.requestOwner)
+        transport
     }
 
     private func telegramGet(url: String, accept!: String, context!: String): Option<String> {
