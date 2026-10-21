@@ -23,6 +23,126 @@ private let GATEWAY_SERVE_STOP_REQUEST_GRACE_MS: Int64 = 55000
 private let GATEWAY_SERVE_TERM_RESERVE_MS: Int64 = 3000
 private let GATEWAY_SERVE_FORCE_KILL_RESERVE_MS: Int64 = 2000
 
+/** Derive the server budget from the original request; never restart the CLI's 55s window. */
+public func gatewayShutdownWorkRemainingMs(requestedAtMs: Int64, wallNowMs: Int64,
+    windowMs!: Int64 = 55000, completionReserveMs!: Int64 = 1000): Int64 {
+    let elapsed = if (wallNowMs > requestedAtMs) { wallNowMs - requestedAtMs } else { 0 }
+    max(0, max(0, windowMs - completionReserveMs) - min(max(0, windowMs), elapsed))
+}
+
+public func gatewayServeShutdownDeadline(identity: Option<GatewayServeIdentity>): MonoTime {
+    var remaining: Int64 = 54000
+    match (identity) {
+        case Some(expected) =>
+            match (gatewayReadLockText(gatewayServeStopRequestPath())) {
+                case Some(text) =>
+                    match (gatewayParseServeStopRequestIdentity(text)) {
+                        case Some(requested) =>
+                            if (requested.matches(expected)) {
+                                remaining = try {
+                                    gatewayShutdownWorkRemainingMs(Int64.parse(gatewayServePayloadField(text, "requestedAtMs")),
+                                        DateTime.now().toUnixTimeStamp().toMilliseconds())
+                                } catch (_: Exception) { 0 }
+                            }
+                        case None => ()
+                    }
+                case None => ()
+            }
+        case None => ()
+    }
+    MonoTime.now() + Duration.millisecond * remaining
+}
+
+/** Retained only for actual serve shutdown phases; a timed out closure still owns its resources. */
+class GatewayShutdownPhase {
+    let name: String
+    private let lock = Mutex()
+    private var condition: Condition
+    private var settled = false
+    private var result = GatewaySurfaceStopResult(false, "cleanup_pending")
+    private let ownerWork: () -> GatewaySurfaceStopResult
+    private var future: Option<Future<Unit>> = None<Future<Unit>>
+
+    init(name: String, work: () -> GatewaySurfaceStopResult) {
+        this.name = name
+        this.ownerWork = work
+        synchronized(this.lock) { this.condition = this.lock.condition() }
+        this.future = Some(spawn {
+            try {
+                let value = this.ownerWork()
+                synchronized(this.lock) { this.result = value }
+            } catch (_: Exception) {
+                synchronized(this.lock) { this.result = GatewaySurfaceStopResult(false, "stop_failed") }
+            } finally {
+                synchronized(this.lock) { this.settled = true; this.condition.notifyAll() }
+            }
+        })
+    }
+
+    func awaitUntil(deadline: MonoTime): GatewaySurfaceStopResult {
+        synchronized(this.lock) {
+            while (!this.settled) {
+                let remaining = (deadline - MonoTime.now()).toMilliseconds()
+                if (remaining <= 0) { return GatewaySurfaceStopResult(false, "cleanup_pending") }
+                let _ = this.condition.wait(timeout: Duration.millisecond * remaining)
+            }
+            this.result
+        }
+    }
+
+    func terminalObserved(): Bool {
+        synchronized(this.lock) { this.settled && (this.result.ok || this.name == "state") }
+    }
+}
+
+/** One serve invocation owns one collection, so late work cannot be mistaken for a new generation. */
+class GatewayServeShutdownOwners {
+    private let lock = Mutex()
+    private var phases = ArrayList<GatewayShutdownPhase>()
+
+    func run(name: String, deadline: MonoTime, work: () -> GatewaySurfaceStopResult): GatewaySurfaceStopResult {
+        let phase = GatewayShutdownPhase(name, work)
+        synchronized(this.lock) { this.phases.add(phase) }
+        phase.awaitUntil(deadline)
+    }
+
+    func result(name: String, fallback: GatewaySurfaceStopResult): GatewaySurfaceStopResult {
+        let current = synchronized(this.lock) { this.phases.toArray() }
+        for (phase in current) { if (phase.name == name) { return phase.awaitUntil(MonoTime.now()) } }
+        fallback
+    }
+
+    func reap(): Int64 {
+        synchronized(this.lock) {
+            let pending = ArrayList<GatewayShutdownPhase>()
+            for (phase in this.phases) { if (!phase.terminalObserved()) { pending.add(phase) } }
+            this.phases = pending
+            Int64(pending.size)
+        }
+    }
+}
+
+private let gatewayPendingShutdownOwnersLock = Mutex()
+private var gatewayPendingShutdownOwners = ArrayList<GatewayServeShutdownOwners>()
+
+func gatewayHasPendingShutdownOwners(): Bool {
+    synchronized(gatewayPendingShutdownOwnersLock) {
+        let pending = ArrayList<GatewayServeShutdownOwners>()
+        for (previous in gatewayPendingShutdownOwners) { if (previous.reap() > 0) { pending.add(previous) } }
+        gatewayPendingShutdownOwners = pending
+        !pending.isEmpty()
+    }
+}
+
+func gatewayRetainPendingShutdownOwners(owners: GatewayServeShutdownOwners): Unit {
+    synchronized(gatewayPendingShutdownOwnersLock) {
+        let pending = ArrayList<GatewayServeShutdownOwners>()
+        for (previous in gatewayPendingShutdownOwners) { if (previous.reap() > 0) { pending.add(previous) } }
+        if (owners.reap() > 0) { pending.add(owners) }
+        gatewayPendingShutdownOwners = pending
+    }
+}
+
 /** 无 pid 字段的旧版锁文件：仍用 mtime 判断；有 pid 时以进程是否存在为准。 */
 private let LEGACY_LOCK_TTL: Duration = Duration.minute * 3
 private let GATEWAY_STOP_TERM_WAIT_TOTAL: Duration = Duration.millisecond * 900
@@ -105,6 +225,7 @@ public class GatewayServeCompletionResult {
     public let found: Bool
     public let status: String
     public let fullTerminal: Bool
+    public let shutdownPhase: String
     public let inboundStatus: String
     public let compatStatus: String
     public let sidecarStatus: String
@@ -120,7 +241,7 @@ public class GatewayServeCompletionResult {
     public let canvasStatus: String
     public let gatewayServerStatus: String
 
-    public init(found: Bool, status!: String = "missing", fullTerminal!: Bool = false,
+    public init(found: Bool, status!: String = "missing", fullTerminal!: Bool = false, shutdownPhase!: String = "unknown",
         inboundStatus!: String = "not_checked", compatStatus!: String = "not_checked", sidecarStatus!: String = "not_checked",
         servicePluginIngressStatus!: String = "not_checked", servicePluginDispatchStatus!: String = "not_checked",
         servicePluginOwnerStatus!: String = "not_checked", servicePluginLeaseStatus!: String = "not_checked",
@@ -131,6 +252,7 @@ public class GatewayServeCompletionResult {
         this.found = found
         this.status = status.trimAscii()
         this.fullTerminal = fullTerminal
+        this.shutdownPhase = shutdownPhase
         this.inboundStatus = inboundStatus.trimAscii()
         this.compatStatus = compatStatus.trimAscii()
         this.sidecarStatus = sidecarStatus.trimAscii()
@@ -164,13 +286,15 @@ public class GatewayServeTerminationResult {
     public let termSent: Bool
     public let killSent: Bool
     public let pidStatus: String
+    public let shutdownPhase: String
 
-    public init(ok: Bool, status: String, termSent!: Bool = false, killSent!: Bool = false, pidStatus!: String = "not_checked") {
+    public init(ok: Bool, status: String, termSent!: Bool = false, killSent!: Bool = false, pidStatus!: String = "not_checked", shutdownPhase!: String = "unknown") {
         this.ok = ok
         this.status = status.trimAscii()
         this.termSent = termSent
         this.killSent = killSent
         this.pidStatus = pidStatus.trimAscii()
+        this.shutdownPhase = shutdownPhase
     }
 }
 
@@ -597,6 +721,21 @@ private func gatewayRemoveServeStopRequest(expected: GatewayServeIdentity): Bool
     }
 }
 
+func gatewayShutdownCompletionFactsTerminal(text: String): Bool {
+    for (key in ["channelPendingCount", "shutdownPendingCount"]) {
+        if (!text.contains("\n${key}:")) { continue }
+        let count = try { Int64.parse(gatewayServePayloadField(text, key)) } catch (_: Exception) { -1 }
+        if (count != 0) { return false }
+    }
+    for (key in ["cronStatus", "memoryStatus"]) {
+        if (!text.contains("\n${key}:")) { continue }
+        let status = gatewayServePayloadField(text, key)
+        if (status != "stopped" && status != "not_applicable" &&
+            !(key == "memoryStatus" && status == "already_stopped")) { return false }
+    }
+    true
+}
+
 func gatewayParseServeCompletion(text: String, identity: GatewayServeIdentity): GatewayServeCompletionResult {
     match (gatewayParseServeIdentity(text)) {
         case Some(found) =>
@@ -605,11 +744,18 @@ func gatewayParseServeCompletion(text: String, identity: GatewayServeIdentity): 
             if (status == "graceful" || status == "cleanup_pending") {
                 let pending = try { Int64.parse(gatewayServePayloadField(text, "servicePluginPendingCount")) } catch (_: Exception) { -1 }
                 if (pending < 0) { return GatewayServeCompletionResult(false, status: "malformed") }
-                let fullTerminal = gatewayServePayloadField(text, "fullTerminal") == "1" && pending == 0
+                for (key in ["channelPendingCount", "shutdownPendingCount"]) {
+                    let raw = gatewayServePayloadField(text, key)
+                    if (!text.contains("\n${key}:")) { continue }
+                    let count = try { Int64.parse(raw) } catch (_: Exception) { -1 }
+                    if (count < 0) { return GatewayServeCompletionResult(false, status: "malformed") }
+                }
+                let fullTerminal = gatewayServePayloadField(text, "fullTerminal") == "1" && pending == 0 && gatewayShutdownCompletionFactsTerminal(text)
                 return GatewayServeCompletionResult(
                     true,
                     status: status,
                     fullTerminal: fullTerminal,
+                    shutdownPhase: gatewayServePayloadField(text, "shutdownPhase"),
                     inboundStatus: gatewayServePayloadField(text, "inboundStatus"),
                     compatStatus: gatewayServePayloadField(text, "compatStatus"),
                     sidecarStatus: gatewayServePayloadField(text, "sidecarStatus"),
@@ -704,11 +850,14 @@ public func gatewayWriteServeCompletionMarker(identity: GatewayServeIdentity, st
 
 public func gatewayWriteServeCompletionMarker(identity: GatewayServeIdentity, result: GatewayStopResult,
     httpStatus!: String = "not_applicable", canvasStatus!: String = "not_applicable",
-    gatewayServerStatus!: String = "not_applicable"): Bool {
+    gatewayServerStatus!: String = "not_applicable", shutdownPhase!: String = "complete",
+    shutdownPendingCount!: Int64 = 0, cronStatus!: String = "not_applicable", memoryStatus!: String = "not_applicable"): Bool {
     let surfacesOk = (httpStatus == "stopped" || httpStatus == "already_stopped" || httpStatus == "not_applicable") &&
         (canvasStatus == "stopped" || canvasStatus == "already_stopped" || canvasStatus == "not_applicable") &&
         (gatewayServerStatus == "stopped" || gatewayServerStatus == "already_stopped" || gatewayServerStatus == "not_applicable")
-    let normalized = if (result.ok && result.servicePluginPendingCount == 0 && surfacesOk) { "graceful" } else { "cleanup_pending" }
+    let normalized = if (result.ok && result.servicePluginPendingCount == 0 && result.channelPendingCount == 0 &&
+        shutdownPendingCount == 0 && (cronStatus == "stopped" || cronStatus == "not_applicable") &&
+        (memoryStatus == "stopped" || memoryStatus == "already_stopped" || memoryStatus == "not_applicable") && surfacesOk) { "graceful" } else { "cleanup_pending" }
     let payload = gatewayWriteServeLockPayload(identity) +
         "status:${normalized}\n" +
         "fullTerminal:${if (normalized == "graceful") { 1 } else { 0 }}\n" +
@@ -722,6 +871,11 @@ public func gatewayWriteServeCompletionMarker(identity: GatewayServeIdentity, re
         "servicePluginPortStatus:${result.servicePluginPortStatus}\n" +
         "servicePluginPendingCount:${result.servicePluginPendingCount}\n" +
         "channelsStatus:${result.channelsStatus}\n" +
+        "channelPendingCount:${result.channelPendingCount}\n" +
+        "shutdownPhase:${shutdownPhase}\n" +
+        "shutdownPendingCount:${max(0, shutdownPendingCount)}\n" +
+        "cronStatus:${cronStatus}\n" +
+        "memoryStatus:${memoryStatus}\n" +
         "brokerStatus:${result.brokerStatus}\n" +
         "recoveryEvidenceVersion:1\n" +
         "brokerExternalTerminal:${if (result.brokerExternalTerminal) { 1 } else { 0 }}\n" +
@@ -944,7 +1098,7 @@ public func gatewayTerminateServeProcessWithPolicy(
         return if (completion.found && completion.status == "graceful" && completion.fullTerminal) {
             GatewayServeTerminationResult(true, "graceful", pidStatus: initialProbe.status)
         } else {
-            GatewayServeTerminationResult(false, "cleanup_pending", pidStatus: initialProbe.status)
+            GatewayServeTerminationResult(false, "cleanup_pending", pidStatus: initialProbe.status, shutdownPhase: completion.shutdownPhase)
         }
     }
     if (!requestStop(identity)) {
@@ -955,13 +1109,13 @@ public func gatewayTerminateServeProcessWithPolicy(
         let remaining = max(1, min(100, deadline - nowMs()))
         let probe = probePid(identity.pid, remaining)
         if (completion.found && completion.status == "cleanup_pending") {
-            return GatewayServeTerminationResult(false, "cleanup_pending", pidStatus: probe.status)
+            return GatewayServeTerminationResult(false, "cleanup_pending", pidStatus: probe.status, shutdownPhase: completion.shutdownPhase)
         }
         if (completion.found && completion.status == "graceful" && completion.fullTerminal && probe.conclusive && !probe.alive) {
             return GatewayServeTerminationResult(true, "graceful", pidStatus: probe.status)
         }
         if (probe.conclusive && !probe.alive) {
-            return GatewayServeTerminationResult(false, "cleanup_pending", pidStatus: probe.status)
+            return GatewayServeTerminationResult(false, "cleanup_pending", pidStatus: probe.status, shutdownPhase: completion.shutdownPhase)
         }
         if (nowMs() >= requestDeadline) { break }
         waitMs(max(1, min(50, requestDeadline - nowMs())))
@@ -979,13 +1133,13 @@ public func gatewayTerminateServeProcessWithPolicy(
         let remaining = max(1, min(100, deadline - nowMs()))
         let probe = probePid(identity.pid, remaining)
         if (completion.found && completion.status == "cleanup_pending") {
-            return GatewayServeTerminationResult(false, "cleanup_pending", termSent: true, pidStatus: probe.status)
+            return GatewayServeTerminationResult(false, "cleanup_pending", termSent: true, pidStatus: probe.status, shutdownPhase: completion.shutdownPhase)
         }
         if (completion.found && completion.status == "graceful" && completion.fullTerminal && probe.conclusive && !probe.alive) {
             return GatewayServeTerminationResult(true, "graceful", termSent: true, pidStatus: probe.status)
         }
         if (probe.conclusive && !probe.alive) {
-            return GatewayServeTerminationResult(false, "cleanup_pending", termSent: true, pidStatus: probe.status)
+            return GatewayServeTerminationResult(false, "cleanup_pending", termSent: true, pidStatus: probe.status, shutdownPhase: completion.shutdownPhase)
         }
         if (nowMs() >= termDeadline) { break }
         waitMs(max(1, min(50, termDeadline - nowMs())))

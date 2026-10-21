@@ -1,5 +1,7 @@
 package metis.core.memory
 
+import std.time.MonoTime
+
 import std.fs.Path
 
 /**
@@ -77,6 +79,10 @@ public class MemoryRuntime {
 
     public static func stopActiveMaintenance(): Unit {
         MemoryRuntimeRegistry.stopActiveMaintenance()
+    }
+
+    public static func stopActiveMaintenanceUntil(deadline: MonoTime): MemoryMaintenanceStopResult {
+        MemoryRuntimeRegistry.stopActiveMaintenanceUntil(deadline)
     }
 
     public static func searchEnabled(): Bool {

@@ -10,7 +10,7 @@ import std.collection.{ArrayList, HashMap}
 import std.convert.*
 import std.fs.{Path, File, Directory, FileInfo, exists, remove}
 import std.sort.sort
-import std.sync.Mutex
+import std.sync.{Condition, Mutex}
 import std.time.*
 import stdx.encoding.json.{JsonArray, JsonObject, JsonString, JsonValue}
 
@@ -2174,8 +2174,79 @@ private class QmdBackendRuntime {
     }
 }
 
+public class MemoryMaintenanceStopResult {
+    public let ok: Bool
+    public let status: String
+    public let pendingCount: Int64
+
+    public init(ok: Bool, status: String, pendingCount!: Int64 = 0) {
+        this.ok = ok
+        this.status = status
+        this.pendingCount = pendingCount
+    }
+}
+
+private class QmdMaintenanceWorker {
+    let generation: Int64
+    private let lock = Mutex()
+    private var condition: Condition
+    private var stopping = false
+    private var settled = false
+    private var failed = false
+    private var future: Option<Future<Unit>> = None<Future<Unit>>
+
+    init(generation: Int64) {
+        this.generation = generation
+        synchronized(this.lock) { this.condition = this.lock.condition() }
+    }
+
+    func start(worker: (QmdMaintenanceWorker) -> Unit): Unit {
+        this.future = Some(spawn {
+            try { worker(this) } catch (_: Exception) {
+                synchronized(this.lock) { this.failed = true }
+            } finally {
+                synchronized(this.lock) {
+                    this.settled = true
+                    this.condition.notifyAll()
+                }
+            }
+        })
+    }
+
+    func hasSettled(): Bool { synchronized(this.lock) { this.settled } }
+    func stopRequested(): Bool { synchronized(this.lock) { this.stopping } }
+
+    func requestStop(): Unit {
+        synchronized(this.lock) {
+            this.stopping = true
+            this.condition.notifyAll()
+        }
+    }
+
+    func waitForNextCycle(milliseconds: Int64): Bool {
+        synchronized(this.lock) {
+            if (!this.stopping) { let _ = this.condition.wait(timeout: Duration.millisecond * milliseconds) }
+            !this.stopping
+        }
+    }
+
+    func stopUntil(deadline: MonoTime): MemoryMaintenanceStopResult {
+        this.requestStop()
+        synchronized(this.lock) {
+            while (!this.settled) {
+                let remaining = (deadline - MonoTime.now()).toMilliseconds()
+                if (remaining <= 0) { return MemoryMaintenanceStopResult(false, "cleanup_pending", pendingCount: 1) }
+                let _ = this.condition.wait(timeout: Duration.millisecond * remaining)
+            }
+            MemoryMaintenanceStopResult(!this.failed, if (this.failed) { "worker_failed" } else { "stopped" })
+        }
+    }
+}
+
+private let qmdMaintenanceLifecycleLock = Mutex()
 private class QmdMaintenanceRuntime {
-    private static var maintenanceFuture: Option<Future<Unit>> = None
+    private static var maintenanceWorker: Option<QmdMaintenanceWorker> = None<QmdMaintenanceWorker>
+    private static var generation: Int64 = 0
     private static var lastUpdateAtMs: Int64 = 0
     private static var lastEmbedAtMs: Int64 = 0
 
@@ -2206,54 +2277,79 @@ private class QmdMaintenanceRuntime {
         }
     }
 
-    public static func startIfNeeded(): Unit {
-        synchronized(qmdMaintenanceLock) {
-            if (!qmdConfigured()) {
-                return
+    static func startWorker(worker: (QmdMaintenanceWorker) -> Unit): Bool {
+        synchronized(qmdMaintenanceLifecycleLock) {
+            if (let Some(previous) <- maintenanceWorker) {
+                if (!previous.hasSettled()) { return false }
+                maintenanceWorker = None<QmdMaintenanceWorker>
             }
-            if (let Some(_) <- maintenanceFuture) {
-                return
-            }
-            maintenanceFuture = Some(spawn {
-                if (CliConfig.qmdUpdateOnBoot) {
-                    QmdMaintenanceRuntime.run("boot", embed: CliConfig.qmdUpdateWaitForBootSync)
-                }
-                var sleepMs: Int64 = 60000
-                if (CliConfig.qmdUpdateIntervalMs > 0) {
-                    sleepMs = CliConfig.qmdUpdateIntervalMs
-                }
-                if (CliConfig.qmdUpdateEmbedIntervalMs > 0 && CliConfig.qmdUpdateEmbedIntervalMs < sleepMs) {
-                    sleepMs = CliConfig.qmdUpdateEmbedIntervalMs
-                }
-                sleepMs = max(1000, sleepMs)
-                while (!Thread.currentThread.hasPendingCancellation) {
-                    sleep(Duration.millisecond * sleepMs)
-                    let nowMs = DateTime.now().toUnixTimeStamp().toNanoseconds() / 1000000
-                    if (
-                        CliConfig.qmdUpdateIntervalMs > 0 &&
-                        (lastUpdateAtMs <= 0 || nowMs - lastUpdateAtMs >= CliConfig.qmdUpdateIntervalMs)
-                    ) {
-                        QmdMaintenanceRuntime.run("interval", embed: false)
-                    }
-                    if (
-                        CliConfig.qmdUpdateEmbedIntervalMs > 0 &&
-                        (lastEmbedAtMs <= 0 || nowMs - lastEmbedAtMs >= CliConfig.qmdUpdateEmbedIntervalMs)
-                    ) {
-                        QmdMaintenanceRuntime.run("embed-interval", embed: true)
-                    }
-                }
-            })
+            generation += 1
+            let owner = QmdMaintenanceWorker(generation)
+            maintenanceWorker = Some(owner)
+            owner.start(worker)
+            true
         }
     }
 
-    public static func stop(): Unit {
-        synchronized(qmdMaintenanceLock) {
-            if (let Some(future) <- maintenanceFuture) {
-                future.cancel()
+    public static func startIfNeeded(): Unit {
+        if (!qmdConfigured()) { return }
+        let _ = startWorker({ owner: QmdMaintenanceWorker =>
+            if (!owner.stopRequested() && CliConfig.qmdUpdateOnBoot) {
+                QmdMaintenanceRuntime.run("boot", embed: CliConfig.qmdUpdateWaitForBootSync)
             }
-            maintenanceFuture = None
+            var sleepMs: Int64 = 60000
+            if (CliConfig.qmdUpdateIntervalMs > 0) { sleepMs = CliConfig.qmdUpdateIntervalMs }
+            if (CliConfig.qmdUpdateEmbedIntervalMs > 0 && CliConfig.qmdUpdateEmbedIntervalMs < sleepMs) {
+                sleepMs = CliConfig.qmdUpdateEmbedIntervalMs
+            }
+            sleepMs = max(1000, sleepMs)
+            while (owner.waitForNextCycle(sleepMs)) {
+                let nowMs = DateTime.now().toUnixTimeStamp().toNanoseconds() / 1000000
+                if (CliConfig.qmdUpdateIntervalMs > 0 &&
+                    (lastUpdateAtMs <= 0 || nowMs - lastUpdateAtMs >= CliConfig.qmdUpdateIntervalMs)) {
+                    QmdMaintenanceRuntime.run("interval", embed: false)
+                }
+                if (CliConfig.qmdUpdateEmbedIntervalMs > 0 &&
+                    (lastEmbedAtMs <= 0 || nowMs - lastEmbedAtMs >= CliConfig.qmdUpdateEmbedIntervalMs)) {
+                    QmdMaintenanceRuntime.run("embed-interval", embed: true)
+                }
+            }
+        })
+    }
+
+    public static func stop(): Unit {
+        let owner = synchronized(qmdMaintenanceLifecycleLock) { maintenanceWorker }
+        match (owner) { case Some(value) => value.requestStop() case None => () }
+    }
+
+    static func stopUntil(deadline: MonoTime): MemoryMaintenanceStopResult {
+        let owner = synchronized(qmdMaintenanceLifecycleLock) { maintenanceWorker }
+        match (owner) {
+            case Some(value) =>
+                let result = value.stopUntil(deadline)
+                if (result.pendingCount == 0) {
+                    synchronized(qmdMaintenanceLifecycleLock) {
+                        match (maintenanceWorker) {
+                            case Some(current) => if (current.generation == value.generation) { maintenanceWorker = None<QmdMaintenanceWorker> }
+                            case None => ()
+                        }
+                    }
+                }
+                result
+            case None => MemoryMaintenanceStopResult(true, "already_stopped")
         }
     }
+
+}
+
+func memoryStartMaintenanceWorkerForTest(worker: () -> Unit): Bool {
+    QmdMaintenanceRuntime.startWorker({ _: QmdMaintenanceWorker => worker() })
+}
+
+func memoryStartCooperativeMaintenanceForTest(): Bool {
+    QmdMaintenanceRuntime.startWorker({ owner: QmdMaintenanceWorker =>
+        while (owner.waitForNextCycle(60000)) { () }
+    })
 }
 
 public class MemoryProviderRegistry {
@@ -2437,5 +2533,9 @@ public class MemoryProviderRegistry {
 
     public static func stopActiveMaintenance(): Unit {
         stopQmdMaintenance()
+    }
+
+    public static func stopActiveMaintenanceUntil(deadline: MonoTime): MemoryMaintenanceStopResult {
+        QmdMaintenanceRuntime.stopUntil(deadline)
     }
 }

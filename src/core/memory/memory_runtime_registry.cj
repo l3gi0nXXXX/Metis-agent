@@ -1,5 +1,7 @@
 package metis.core.memory
 
+import std.time.MonoTime
+
 import metis.core.config.CliConfig
 import metis.core.config.MetisConfigManager
 import metis.utils.loadMarkdown
@@ -1105,6 +1107,10 @@ public class MemoryRuntimeRegistry {
             return
         }
         MemoryProviderRegistry.stopActiveMaintenance()
+    }
+
+    public static func stopActiveMaintenanceUntil(deadline: MonoTime): MemoryMaintenanceStopResult {
+        MemoryProviderRegistry.stopActiveMaintenanceUntil(deadline)
     }
 
     public static func closeActiveSearchManagers(): Unit {

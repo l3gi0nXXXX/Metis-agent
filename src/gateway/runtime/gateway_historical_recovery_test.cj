@@ -121,6 +121,49 @@ public class GatewayHistoricalRecoveryTest {
     }
 
     @TestCase
+    public func s2N1NewShutdownFactsStayCompatibleAndFailClosed(): Unit {
+        hrRuntimeHome({ home, identity =>
+            let _ = hrRuntimeWriteLease(home, identity)
+            let written = hrRuntimeWriteMarker(identity, legacy: false)
+            @Expect(gatewayParseHistoricalCompletionStrict(written).ok, true)
+            @Expect(gatewayHistoricalServeCompletionRecoveryStatus().status, "recoverable")
+            let legacy = written.replace("channelPendingCount:0\n", "").replace("shutdownPhase:complete\n", "")
+                .replace("shutdownPendingCount:0\n", "").replace("cronStatus:not_applicable\n", "")
+                .replace("memoryStatus:not_applicable\n", "")
+            @Expect(gatewayParseHistoricalCompletionStrict(legacy).ok, true)
+            File.writeTo(home.join("gateway-serve.stop-complete"), legacy.toArray())
+            @Expect(gatewayHistoricalServeCompletionRecoveryStatus().status, "recoverable")
+            for (key in ["channelPendingCount", "shutdownPendingCount"]) {
+                for (invalid in ["", "-1", "bad"]) {
+                    let malformed = written.replace("${key}:0", "${key}:${invalid}")
+                    @Expect(gatewayParseHistoricalCompletionStrict(malformed).status, "malformed")
+                }
+                @Expect(gatewayParseHistoricalCompletionStrict(written + "${key}:0\n").status, "malformed")
+                let pending = written.replace("${key}:0", "${key}:1")
+                File.writeTo(home.join("gateway-serve.stop-complete"), pending.toArray())
+                @Expect(gatewayHistoricalServeCompletionRecoveryStatus().status, "resources_not_terminal")
+                let contradictory = pending.replace("fullTerminal:0", "fullTerminal:1").replace("status:cleanup_pending", "status:graceful")
+                    .replace("servicePluginPendingCount:1", "servicePluginPendingCount:0")
+                @Expect(gatewayParseServeCompletion(contradictory, identity).fullTerminal, false)
+            }
+            for (key in ["cronStatus", "memoryStatus"]) {
+                for (status in ["cleanup_pending", "stop_failed", "unknown", ""]) {
+                    let pending = written.replace("${key}:not_applicable", "${key}:${status}")
+                    File.writeTo(home.join("gateway-serve.stop-complete"), pending.toArray())
+                    @Expect(gatewayHistoricalServeCompletionRecoveryStatus().status, "resources_not_terminal")
+                    let contradictory = pending.replace("fullTerminal:0", "fullTerminal:1").replace("status:cleanup_pending", "status:graceful")
+                        .replace("servicePluginPendingCount:1", "servicePluginPendingCount:0")
+                    @Expect(gatewayParseServeCompletion(contradictory, identity).fullTerminal, false)
+                }
+            }
+            let diagnosticOnly = written.replace("shutdownPhase:complete", "shutdownPhase:未知🧪")
+            File.writeTo(home.join("gateway-serve.stop-complete"), diagnosticOnly.toArray())
+            @Expect(gatewayHistoricalServeCompletionRecoveryStatus().status, "recoverable")
+            @Expect(gatewayParseHistoricalCompletionStrict(written + "unknownShutdownFact:0\n").status, "malformed")
+        })
+    }
+
+    @TestCase
     public func hrS2B1StrictMarkerUnicodeEncodingAndIdentityLimits(): Unit {
         hrRuntimeHome({ home, identity =>
             let original = hrRuntimeWriteMarker(identity)

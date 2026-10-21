@@ -1,13 +1,14 @@
 package metis.gateway.core
 
+import metis.core.{metisRedactSensitiveText, metisSafeUtf8Prefix}
 import metis.gateway.logging.metisCreateSubsystemLogger
 import metis.gateway.model.*
 import magic.jsonable.*
 
-import std.collection.{ArrayList, HashMap}
+import std.collection.{ArrayList, HashMap, HashSet}
 import std.convert.Parsable
 import std.sync.{Condition, Mutex}
-import std.time.DateTime
+import std.time.{DateTime, MonoTime}
 import std.core.Duration
 import stdx.encoding.json.{JsonArray, JsonBool, JsonInt, JsonObject, JsonString, JsonValue}
 
@@ -17,13 +18,15 @@ public class GatewayChannelStopSummary {
     public let total: Int64
     public let stopped: Int64
     public let failed: Int64
+    public let pendingCount: Int64
 
-    public init(ok: Bool, status: String, total!: Int64 = 0, stopped!: Int64 = 0, failed!: Int64 = 0) {
+    public init(ok: Bool, status: String, total!: Int64 = 0, stopped!: Int64 = 0, failed!: Int64 = 0, pendingCount!: Int64 = 0) {
         this.ok = ok
         this.status = status.trimAscii()
         this.total = total
         this.stopped = stopped
         this.failed = failed
+        this.pendingCount = pendingCount
     }
 }
 
@@ -495,6 +498,76 @@ private class GatewayChannelAdapterStartProbe {
     }
 }
 
+private class GatewayChannelStopOwner {
+    let entry: GatewayRegisteredAdapter
+    private let lock = Mutex()
+    private var condition: Condition
+    private var future: Option<Future<Unit>> = None<Future<Unit>>
+    private var result: Option<GatewayChannelShutdownResult> = None<GatewayChannelShutdownResult>
+    private var waiting = false
+    private var beginFailed = false
+
+    init(entry: GatewayRegisteredAdapter) {
+        this.entry = entry
+        synchronized(this.lock) { this.condition = this.lock.condition() }
+    }
+
+    func begin(deadline: MonoTime): Unit {
+        if (let Some(bounded) <- (this.entry.adapter as GatewayBoundedChannelShutdown)) {
+            try {
+                bounded.beginShutdown(deadline)
+                synchronized(this.lock) { this.beginFailed = false }
+            } catch (_: Exception) {
+                synchronized(this.lock) { this.beginFailed = true }
+            }
+        }
+    }
+
+    func launch(deadline: MonoTime): Unit {
+        synchronized(this.lock) {
+            if (this.waiting) { return }
+            if (let Some(done) <- this.result) {
+                if (done.ok && done.pendingCount == 0) { return }
+            }
+            this.waiting = true
+            this.result = None<GatewayChannelShutdownResult>
+            this.future = Some(spawn {
+                let outcome = try {
+                    if (let Some(bounded) <- (this.entry.adapter as GatewayBoundedChannelShutdown)) {
+                        bounded.awaitShutdown(deadline)
+                    } else {
+                        this.entry.adapter.stop()
+                        GatewayChannelShutdownResult(true, "stopped")
+                    }
+                } catch (_: Exception) {
+                    GatewayChannelShutdownResult(false, "stop_failed")
+                }
+                try { synchronized(this.lock) {
+                    this.result = Some(if (this.beginFailed) {
+                        GatewayChannelShutdownResult(false, "cleanup_pending", pendingCount: max(1, outcome.pendingCount), diagnostic: "begin_failed")
+                    } else { outcome })
+                } } finally {
+                    synchronized(this.lock) {
+                        this.waiting = false
+                        this.condition.notifyAll()
+                    }
+                }
+            })
+        }
+    }
+
+    func awaitUntil(deadline: MonoTime): GatewayChannelShutdownResult {
+        synchronized(this.lock) {
+            while (this.waiting) {
+                let remaining = (deadline - MonoTime.now()).toMilliseconds()
+                if (remaining <= 0) { return GatewayChannelShutdownResult(false, "cleanup_pending", pendingCount: 1) }
+                let _ = this.condition.wait(timeout: Duration.millisecond * remaining)
+            }
+            this.result ?? GatewayChannelShutdownResult(false, "cleanup_pending", pendingCount: 1)
+        }
+    }
+}
+
 /**
  * 独立的 channel runtime manager，统一承接 adapter 的生命周期与 runtime 状态推进。
  * GatewayService 自身只保留路由和 Agent 桥接职责。
@@ -506,9 +579,23 @@ public class GatewayChannelManager {
     private let liveAccounts = HashMap<String, GatewayChannelLiveAccountState>()
     private let startupAccountTimeoutMs: Int64
     private var started = false
+    private let shutdownLock = Mutex()
+    private var shutdownInProgress = false
+    private let shutdownOwners = HashMap<String, GatewayChannelStopOwner>()
+    private let shutdownTerminal = HashSet<String>()
 
     public init(startupAccountTimeoutMs!: Int64 = 3000) {
         this.startupAccountTimeoutMs = if (startupAccountTimeoutMs >= 0) { startupAccountTimeoutMs } else { 3000 }
+    }
+
+    private func shutdownPending(entry: GatewayRegisteredAdapter): Bool {
+        synchronized(this.shutdownLock) {
+            this.shutdownInProgress || this.shutdownOwners.contains(this.liveKey(entry.channelId, entry.accountId))
+        }
+    }
+
+    private func anyShutdownPending(): Bool {
+        synchronized(this.shutdownLock) { this.shutdownInProgress || !this.shutdownOwners.isEmpty() }
     }
 
     private func timingNowMs(): Int64 {
@@ -629,6 +716,9 @@ public class GatewayChannelManager {
     }
 
     private func startRegisteredEntry(entry: GatewayRegisteredAdapter, respectRuntimeGuard: Bool): JsonObject {
+        if (this.shutdownPending(entry)) {
+            return this.lifecycleAccountRow(entry, false, "not-started", "shutdown-pending", JsonObject())
+        }
         if (!entry.enabled) {
             this.updateLiveAccount(entry.channelId, entry.accountId, { state =>
                 state.configured = entry.configured
@@ -685,6 +775,7 @@ public class GatewayChannelManager {
         gatewayChannelRuntimeMarkStarting(entry.channelId, accountId: entry.accountId)
         try {
             entry.adapter.start()
+            synchronized(this.shutdownLock) { this.shutdownTerminal.remove(this.liveKey(entry.channelId, entry.accountId)) }
             this.updateLiveAccount(entry.channelId, entry.accountId, { state =>
                 state.configured = entry.configured
                 state.running = true
@@ -732,6 +823,9 @@ public class GatewayChannelManager {
     }
 
     private func stopRegisteredEntry(entry: GatewayRegisteredAdapter, reason: String, manualStop: Bool): JsonObject {
+        if (this.shutdownPending(entry)) {
+            return this.lifecycleAccountRow(entry, false, "not-stopped", "shutdown-pending", JsonObject())
+        }
         if (!this.liveAccountRunning(entry.channelId, entry.accountId)) {
             let runtime = gatewayChannelRuntimeMarkStopped(entry.channelId, accountId: entry.accountId, reason: "already-stopped", manualStop: manualStop)
             return this.lifecycleAccountRow(entry, true, "already-stopped", "", runtime)
@@ -1129,6 +1223,9 @@ public class GatewayChannelManager {
     }
 
     private func startEntry(entry: GatewayRegisteredAdapter): JsonObject {
+        if (this.shutdownPending(entry)) {
+            return this.startupOutcome(entry, "failed", errorKind: "shutdown_pending", error: "shutdown-pending", startMs: this.timingNowMs())
+        }
         let entryStartMs = this.timingNowMs()
         if (!entry.enabled) {
             this.updateLiveAccount(entry.channelId, entry.accountId, { state =>
@@ -1210,6 +1307,7 @@ public class GatewayChannelManager {
         let adapterStartMs = this.timingNowMs()
         let (startStatus, startError) = this.runAdapterStartWithDeadline(entry)
         if (startStatus == "ok") {
+            synchronized(this.shutdownLock) { this.shutdownTerminal.remove(this.liveKey(entry.channelId, entry.accountId)) }
             this.timingLog("adapter-started", adapterStartMs, channelId: entry.channelId, accountId: entry.accountId)
             this.updateLiveAccount(entry.channelId, entry.accountId, { state =>
                 state.configured = entry.configured
@@ -1273,6 +1371,14 @@ public class GatewayChannelManager {
     }
 
     public func startChannels(): JsonObject {
+        if (this.anyShutdownPending()) {
+            let summary = JsonObject()
+            summary.put("phase", JsonString("start"))
+            summary.put("status", JsonString("cleanup_pending"))
+            summary.put("degraded", true.toJsonValue())
+            summary.put("accounts", JsonArray([]))
+            return summary
+        }
         if (this.started) {
             let summary = JsonObject()
             summary.put("phase", JsonString("start"))
@@ -1342,6 +1448,13 @@ public class GatewayChannelManager {
     }
 
     public func startChannel(channelId: String, accountId!: String = ""): JsonObject {
+        if (this.anyShutdownPending()) {
+            let result = this.channelLifecycleBase("start", channelId, accountId)
+            result.put("ok", false.toJsonValue())
+            result.put("result", JsonString("not-started"))
+            result.put("reason", JsonString("shutdown-pending"))
+            return result
+        }
         let entries = this.matchingEntries(channelId, accountId)
         if (entries.size == 0) {
             return this.lifecycleMissingResult("start", channelId, accountId)
@@ -1368,65 +1481,81 @@ public class GatewayChannelManager {
         result
     }
 
-    public func stopChannelsDetailed(reason!: String = "manual-stop", manualStop!: Bool = true): GatewayChannelStopSummary {
-        if (!this.started) {
-            return GatewayChannelStopSummary(true, "not_applicable")
+    public func stopChannelsDetailed(reason!: String = "manual-stop", manualStop!: Bool = true,
+        deadline!: MonoTime = MonoTime.now() + Duration.second * 3): GatewayChannelStopSummary {
+        let owners = ArrayList<GatewayChannelStopOwner>()
+        var alreadyStopped: Int64 = 0
+        synchronized(this.shutdownLock) {
+            if (this.shutdownInProgress) {
+                return GatewayChannelStopSummary(false, "cleanup_pending", pendingCount: Int64(this.shutdownOwners.size))
+            }
+            if (!this.started && this.shutdownOwners.isEmpty()) { return GatewayChannelStopSummary(true, "not_applicable") }
+            this.shutdownInProgress = true
+            let seen = HashSet<String>()
+            // Registration changes cannot erase an older generation's unfinished stop owner.
+            for ((key, owner) in this.shutdownOwners) {
+                seen.add(key)
+                owners.add(owner)
+            }
+            for (entry in this.adapters) {
+                let key = this.liveKey(entry.channelId, entry.accountId)
+                if (seen.contains(key)) { continue }
+                seen.add(key)
+                if (this.shutdownTerminal.contains(key)) { alreadyStopped += 1; continue }
+                let owner = match (this.shutdownOwners.get(key)) {
+                    case Some(existing) => existing
+                    case None =>
+                        let created = GatewayChannelStopOwner(entry)
+                        this.shutdownOwners[key] = created
+                        created
+                }
+                owners.add(owner)
+            }
         }
-        var stopped: Int64 = 0
+        // Broadcast cancellation before waiting on any account, including legacy stops.
+        for (owner in owners) { owner.begin(deadline) }
+        for (owner in owners) { owner.launch(deadline) }
+        var stopped: Int64 = alreadyStopped
         var failed: Int64 = 0
-        for (entry in this.adapters) {
-            try {
-                entry.adapter.stop()
+        var pending: Int64 = 0
+        for (owner in owners) {
+            let outcome = owner.awaitUntil(deadline)
+            let entry = owner.entry
+            if (outcome.ok && outcome.pendingCount == 0) {
                 this.updateLiveAccount(entry.channelId, entry.accountId, { state =>
                     state.running = false
                     state.connected = false
                     state.lastError = if (manualStop) { "" } else { reason.trimAscii() }
                 })
-                gatewayChannelRuntimeMarkStopped(entry.channelId, accountId: entry.accountId, reason: reason, manualStop: manualStop)
-                gatewayLogEventInfo(
-                    "gateway/channel/${entry.channelId}",
-                    "channel.stopped",
-                    "channel account stopped",
-                    meta: gatewayLogMeta()
-                        .string("channel", entry.channelId)
-                        .string("accountId", entry.accountId)
-                        .string("phase", "stop")
-                        .string("status", "ok")
-                        .rawString("reason", reason)
-                        .object()
-                )
-                stopped++
-            } catch (e: Exception) {
-                failed++
-                this.updateLiveAccount(entry.channelId, entry.accountId, { state =>
-                    state.running = false
-                    state.connected = false
-                    state.lastError = e.message.trimAscii()
-                })
-                gatewayChannelRuntimeMarkFailure(entry.channelId, accountId: entry.accountId, lifecycleState: "failed", error: e.message, errorKind: "stop_failed")
-                gatewayLogEventError(
-                    "gateway/channel/${entry.channelId}",
-                    "channel.failed",
-                    "channel account stop failed",
-                    meta: gatewayLogMeta()
-                        .string("channel", entry.channelId)
-                        .string("accountId", entry.accountId)
-                        .string("phase", "stop")
-                        .string("status", "failed")
-                        .string("errorKind", "stop_failed")
-                        .rawString("error", e.message)
-                        .object()
-                )
+                try { gatewayChannelRuntimeMarkStopped(entry.channelId, accountId: entry.accountId, reason: reason, manualStop: manualStop) }
+                catch (_: Exception) { () }
+                synchronized(this.shutdownLock) {
+                    let key = this.liveKey(entry.channelId, entry.accountId)
+                    this.shutdownOwners.remove(key)
+                    this.shutdownTerminal.add(key)
+                }
+                stopped += 1
+            } else {
+                failed += 1
+                pending += max(0, outcome.pendingCount)
+                this.updateLiveAccount(entry.channelId, entry.accountId, { state => state.lastError = outcome.status })
+            }
+            let meta = gatewayLogMeta().string("channel", entry.channelId).string("accountId", entry.accountId)
+                .string("phase", "stop").string("status", outcome.status).rawString("reason", reason)
+                .int("pendingCount", max(0, outcome.pendingCount))
+                .string("diagnostic", metisSafeUtf8Prefix(metisRedactSensitiveText(outcome.diagnostic), 160, marker: "...[truncated]")).object()
+            if (outcome.ok && outcome.pendingCount == 0) {
+                gatewayLogEventInfo("gateway/channel/${entry.channelId}", "channel.stopped", "channel account stopped", meta: meta)
+            } else {
+                gatewayLogEventError("gateway/channel/${entry.channelId}", "channel.failed", "channel account stop has pending cleanup", meta: meta)
             }
         }
-        this.started = false
-        GatewayChannelStopSummary(
-            failed == 0,
-            if (failed == 0) { "stopped" } else { "stop_failed" },
-            total: stopped + failed,
-            stopped: stopped,
-            failed: failed
-        )
+        synchronized(this.shutdownLock) {
+            this.shutdownInProgress = false
+            if (failed == 0) { this.started = false }
+        }
+        GatewayChannelStopSummary(failed == 0, if (pending > 0) { "cleanup_pending" } else if (failed > 0) { "stop_failed" } else { "stopped" },
+            total: Int64(owners.size) + alreadyStopped, stopped: stopped, failed: failed, pendingCount: pending)
     }
 
     public func stopChannels(reason!: String = "manual-stop", manualStop!: Bool = true): Unit {
