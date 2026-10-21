@@ -254,6 +254,7 @@ public class TelegramAdapter <: ChannelAdapter & GatewayBoundedChannelShutdown {
     private var requestOwner = TelegramRequestOwner()
     private let lifecycleWorkers = ArrayList<TelegramShutdownWorker>()
     private var shutdownStarted = false
+    private var shutdownComplete = false
     private var shutdownDeadline: Option<MonoTime> = None
     private var shutdownConfirmRequested = false
     private var shutdownConfirmAttempted = false
@@ -390,9 +391,12 @@ public class TelegramAdapter <: ChannelAdapter & GatewayBoundedChannelShutdown {
         synchronized(this.shutdownLock) {
             if (this.running) { return }
             if (this.shutdownStarted) {
-                if (this.pendingShutdownCount() > 0) { return }
+                if (!this.shutdownComplete || this.pendingShutdownCount() > 0) {
+                    throw Exception("telegram_shutdown_pending")
+                }
                 this.requestOwner = TelegramRequestOwner()
                 this.shutdownStarted = false
+                this.shutdownComplete = false
                 this.shutdownDeadline = None
                 this.shutdownConfirmRequested = false
                 this.shutdownConfirmAttempted = false
@@ -428,12 +432,14 @@ public class TelegramAdapter <: ChannelAdapter & GatewayBoundedChannelShutdown {
     public func stop(): Unit {
         let deadline = MonoTime.now() + Duration.second * 5
         this.beginShutdown(deadline)
-        this.awaitShutdown(deadline)
+        let result = this.awaitShutdown(deadline)
+        if (!result.ok || result.pendingCount > 0) { throw Exception("telegram_shutdown_pending") }
     }
 
     public func beginShutdown(deadline: MonoTime): Unit {
         var owner = this.requestOwner
         synchronized(this.shutdownLock) {
+            this.shutdownComplete = false
             this.shutdownDeadline = Some(match (this.shutdownDeadline) {
                 case Some(previous) => if (previous < deadline) { previous } else { deadline }
                 case None => deadline
@@ -498,7 +504,10 @@ public class TelegramAdapter <: ChannelAdapter & GatewayBoundedChannelShutdown {
         if (let Some(owner) <- confirmOwner) { owner.awaitUntil(effectiveDeadline) }
         synchronized(this.shutdownLock) {
             let pending = this.pendingShutdownCount()
-            if (pending == 0) { this.webhookServer = None }
+            if (pending == 0) {
+                this.webhookServer = None
+                this.shutdownComplete = true
+            }
             GatewayChannelShutdownResult(
                 pending == 0,
                 if (pending == 0) { "stopped" } else { "cleanup_pending" },

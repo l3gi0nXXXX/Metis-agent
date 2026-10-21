@@ -37,6 +37,12 @@ private func shutdownOrdinaryResponse(): TelegramTransportResponse {
     TelegramTransportResponse(true, body: "{\"ok\":true,\"result\":[]}", outcome: "ok")
 }
 
+private func shutdownExpectPendingFailure(action: () -> Unit): Unit {
+    var failure = ""
+    try { action() } catch (e: Exception) { failure = e.message }
+    @Expect(failure, "telegram_shutdown_pending")
+}
+
 private class ShutdownHeldPeer {
     let listener = TcpServerSocket(bindAt: 0u16)
     let entered = AtomicBool(false)
@@ -189,12 +195,19 @@ public class TelegramShutdownTest {
             @Expect(adapter.pullInbound().size, 1)
             let deadline = MonoTime.now() + Duration.second
             adapter.beginShutdown(deadline)
+            @Expect(shutdownWaitFor({ => adapter.debugBuildPollingDiagnosticSnapshot().get("activeWorkers").getOrThrow().asInt().getValue() == 0 }), true)
+            shutdownExpectPendingFailure({ => adapter.start() })
+            @Expect(confirmations.load(), 0)
             let result = adapter.awaitShutdown(deadline)
             @Expect(result.ok, true)
             @Expect(result.pendingCount, 0)
             @Expect(confirmations.load(), 1)
             @Expect(correctOffset.load(), true)
             @Expect(adapter.debugLastConfirmedPollingOffsetForTest(), "43")
+            @Expect(adapter.awaitShutdown(deadline).ok, true)
+            @Expect(confirmations.load(), 1)
+            adapter.beginShutdown(deadline)
+            shutdownExpectPendingFailure({ => adapter.start() })
             @Expect(adapter.awaitShutdown(deadline).ok, true)
             @Expect(confirmations.load(), 1)
             let previousPolls = polls.load()
@@ -273,7 +286,11 @@ public class TelegramShutdownTest {
             @Expect(result.status, "cleanup_pending")
             @Expect(result.pendingCount > 0, true)
             @Expect(executionFinally.load(), false)
-            adapter.start()
+            shutdownExpectPendingFailure({ => adapter.start() })
+            let legacyStarted = MonoTime.now()
+            shutdownExpectPendingFailure({ => adapter.stop() })
+            @Expect((MonoTime.now() - legacyStarted).toMilliseconds() < 100, true)
+            @Expect(executionFinally.load(), false)
             sleep(Duration.millisecond * 20)
             @Expect(polls.load(), 1)
             @Expect(adapter.awaitShutdown(deadline).pendingCount > 0, true)
@@ -284,6 +301,7 @@ public class TelegramShutdownTest {
             @Expect(shutdownWaitFor({ => polls.load() >= 2 }), true)
         } finally {
             release.store(true)
+            shutdownWaitFor({ => adapter.awaitShutdown(MonoTime.now()).pendingCount == 0 })
             adapter.stop()
             setTelegramTransportRunnerForTest(None)
             remove(root, recursive: true)
@@ -373,8 +391,8 @@ public class TelegramShutdownTest {
             @Expect(adapter.debugLastConfirmedPollingOffsetForTest(), "")
         } finally {
             release.store(true)
-            adapter.stop()
             shutdownWaitFor({ => adapter.awaitShutdown(MonoTime.now()).pendingCount == 0 })
+            adapter.stop()
             setTelegramTransportRunnerForTest(None)
             remove(root, recursive: true)
         }
@@ -408,8 +426,8 @@ public class TelegramShutdownTest {
             @Expect(finallyDone.load(), true)
         } finally {
             release.store(true)
-            adapter.stop()
             shutdownWaitFor({ => adapter.awaitShutdown(MonoTime.now()).pendingCount == 0 })
+            adapter.stop()
             setTelegramTransportRunnerForTest(None)
             remove(root, recursive: true)
         }
