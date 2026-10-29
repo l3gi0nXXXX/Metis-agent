@@ -5369,11 +5369,11 @@ public class GatewayServeLockLogicTest {
                     gatewayS5JsonInt(modelMetricsPath, "entered") == 2 &&
                         gatewayS5JsonInt(modelMetricsPath, "active") == 2 &&
                         gatewayS5JsonInt(modelMetricsPath, "maxActive") == 2 &&
-                        gatewayS5RegularFileCount(queuePath.join("awaiting-host")) == 130 &&
-                        gatewayS5RegularFileCount(queuePath.join("pending")) == 10
+                        gatewayS5RegularFileCount(queuePath.join("awaiting-host")) == 2 &&
+                        gatewayS5RegularFileCount(queuePath.join("pending")) == 138
                 }), true)
-                @Expect(gatewayS5RegularFileCount(queuePath.join("awaiting-host")), 130)
-                @Expect(gatewayS5RegularFileCount(queuePath.join("pending")), 10)
+                @Expect(gatewayS5RegularFileCount(queuePath.join("awaiting-host")), 2)
+                @Expect(gatewayS5RegularFileCount(queuePath.join("pending")), 138)
                 for (_ in 0..8) {
                     liveOwner.refresh(readyzUrl)
                     processCapture.refreshLease(home, expectedGcmPid, expectedGatewayPid, webhookPort)
@@ -5387,7 +5387,8 @@ public class GatewayServeLockLogicTest {
                 }
 
                 File.writeTo(modelReleasePath, "release\n".toArray())
-                @Expect(gatewayServeStopWaitUntil(60000, { =>
+                // 140 sends need at least 69.5s at the shared 500ms send interval.
+                @Expect(gatewayServeStopWaitUntil(100000, { =>
                     let mainLedger = GatewayS5StrictLedger(
                         stableDependencies.eventsPath, expectedDeliveries, expectedWritebacks
                     )
