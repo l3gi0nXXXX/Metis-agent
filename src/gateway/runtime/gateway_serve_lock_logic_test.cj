@@ -5818,10 +5818,12 @@ public class GatewayServeLockLogicTest {
                 oldCapture.refreshLease(home, oldGcmPid, oldGatewayPid, webhookPort)
                 @Expect(oldCapture.leaseStopped, true)
                 @Expect(gatewayServeStopRuntimeOwnerCount(home.join("gateway-runtime-state.json")), 0)
-                let pendingPath = queuePath.join("pending").join("${deliveryId}.json")
                 @Expect(gatewayServeStopWaitUntil(5000, { =>
-                    let pending = gatewayS5QueueDeliveryProof(pendingPath, deliveryId)
-                    pending[0] && pending[1] == "pending" && pending[2] == "recovered" && pending[3] == oldAttemptToken
+                    let awaiting = gatewayS5QueueDeliveryProof(awaitingPath, deliveryId)
+                    let receipt = gatewayS5ReceiptProof(receiptRoot, deliveryId)
+                    awaiting[0] && awaiting[1] == "awaiting-host" && awaiting[2] == "admitted" &&
+                        awaiting[3] == oldAttemptToken && gatewayS5RegularFileCount(queuePath.join("pending")) == 0 &&
+                        receipt[0] && receipt[3] == oldAttemptToken && receipt[4] == "completed_unconfirmed"
                 }), true)
                 let retainedReceipt = gatewayS5ReceiptProof(receiptRoot, deliveryId)
                 @Expect(retainedReceipt[0], true)
