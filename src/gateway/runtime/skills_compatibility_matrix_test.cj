@@ -1,11 +1,12 @@
 package metis.gateway.runtime
 
-import metis.core.config.{MetisConfigManager, CliConfig}
+import metis.core.config.{MetisConfigManager, CliConfig, CliSettingManager}
 import metis.core.skills.{SkillsPrompt, tryHandleSkillsCommand}
 
 import std.collection.ArrayList
-import std.env.setVariable
+import std.env.{getVariable, removeVariable, setVariable}
 import std.fs.{Directory, File, OpenMode, Path, exists, remove}
+import std.time.DateTime
 import std.unittest.testmacro.*
 import stdx.encoding.json.{JsonArray, JsonObject, JsonString, JsonValue}
 
@@ -42,11 +43,39 @@ private func matrixReportRowByName(rows: JsonArray, name: String): Option<JsonOb
 
 @Test
 public class SkillsCompatibilityMatrixTest {
+    private var originalHome: Option<String> = None
+    private var originalWorkspace = ""
+    private let fixtureRoot = Path("/tmp/metis-skills-compat-matrix-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
+
     @BeforeAll
     public func isolateMetisHome(): Unit {
-        setVariable("METIS_HOME", "/tmp/metis-skills-compatibility-matrix-test-home")
+        this.originalHome = getVariable("METIS_HOME")
+        this.originalWorkspace = CliConfig.workspaceDirOverride
+        Directory.create(this.fixtureRoot, recursive: true)
+        setVariable("METIS_HOME", this.fixtureRoot.join("metis-home").toString())
+        CliConfig.workspaceDirOverride = this.fixtureRoot.join("workspace").toString()
+        CliConfig.invalidatePathCache()
         MetisConfigManager.invalidate()
+        CliSettingManager.invalidate()
         SkillsPrompt.invalidate()
+    }
+
+    @AfterAll
+    public func restoreMetisHome(): Unit {
+        try {
+            match (this.originalHome) {
+                case Some(value) => setVariable("METIS_HOME", value)
+                case None => removeVariable("METIS_HOME")
+            }
+            CliConfig.workspaceDirOverride = this.originalWorkspace
+            CliConfig.invalidatePathCache()
+            MetisConfigManager.invalidate()
+            CliSettingManager.invalidate()
+            SkillsPrompt.invalidate()
+        } finally {
+            if (exists(this.fixtureRoot)) { remove(this.fixtureRoot, recursive: true) }
+            @Expect(exists(this.fixtureRoot), false)
+        }
     }
 
     private func clearSkill(skillDir: Path): Unit {

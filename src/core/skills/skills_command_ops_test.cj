@@ -1,18 +1,48 @@
 package metis.core.skills
 
-import metis.core.config.{CliConfig, MetisConfigManager}
+import metis.core.config.{CliConfig, CliSettingManager, MetisConfigManager}
 
-import std.env.setVariable
+import std.env.{getVariable, removeVariable, setVariable}
 import std.fs.{Directory, File, OpenMode, Path, exists, remove}
+import std.time.DateTime
 import stdx.encoding.json.{JsonObject, JsonString}
 import std.unittest.testmacro.*
 
 @Test
 public class SkillsCommandOpsTest {
+    private var originalHome: Option<String> = None
+    private var originalWorkspace = ""
+    private let fixtureRoot = Path("/tmp/metis-skills-command-ops-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
+
     @BeforeAll
     public func isolateMetisHome(): Unit {
-        setVariable("METIS_HOME", "/tmp/metis-skills-command-ops-test-home")
+        this.originalHome = getVariable("METIS_HOME")
+        this.originalWorkspace = CliConfig.workspaceDirOverride
+        Directory.create(this.fixtureRoot, recursive: true)
+        setVariable("METIS_HOME", this.fixtureRoot.join("metis-home").toString())
+        CliConfig.workspaceDirOverride = this.fixtureRoot.join("workspace").toString()
+        CliConfig.invalidatePathCache()
         MetisConfigManager.invalidate()
+        CliSettingManager.invalidate()
+        SkillsPrompt.invalidate()
+    }
+
+    @AfterAll
+    public func restoreMetisHome(): Unit {
+        try {
+            match (this.originalHome) {
+                case Some(value) => setVariable("METIS_HOME", value)
+                case None => removeVariable("METIS_HOME")
+            }
+            CliConfig.workspaceDirOverride = this.originalWorkspace
+            CliConfig.invalidatePathCache()
+            MetisConfigManager.invalidate()
+            CliSettingManager.invalidate()
+            SkillsPrompt.invalidate()
+        } finally {
+            if (exists(this.fixtureRoot)) { remove(this.fixtureRoot, recursive: true) }
+            @Expect(exists(this.fixtureRoot), false)
+        }
     }
 
     private func clearTestState(skillDir: Path): Unit {

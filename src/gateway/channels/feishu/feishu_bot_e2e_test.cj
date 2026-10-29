@@ -9,8 +9,8 @@ import magic.core.message.Message
 import magic.core.model.{AsyncChatResponse, ChatModel, ChatRequest, ChatResponse}
 import magic.model.ModelManager
 import std.collection.{ArrayList, HashMap}
-import std.env.setVariable
-import std.fs.{Directory, Path, remove}
+import std.env.{getVariable, removeVariable, setVariable}
+import std.fs.{Directory, Path, exists, remove}
 import std.time.DateTime
 import std.unittest.testmacro.*
 import stdx.encoding.json.{JsonArray, JsonBool, JsonObject, JsonString}
@@ -53,6 +53,7 @@ private func feishuBotE2eTempHome(name: String): Path {
 private func withFeishuBotE2eHome(name: String, body: () -> Unit): Unit {
     synchronized(MetisProcessEnvironmentLock) {
         let home = feishuBotE2eTempHome(name)
+        let originalHome = getVariable("METIS_HOME")
         try { remove(home, recursive: true) } catch (_e: Exception) { () }
         Directory.create(home, recursive: true)
         setVariable("METIS_HOME", home.toString())
@@ -78,8 +79,51 @@ private func withFeishuBotE2eHome(name: String, body: () -> Unit): Unit {
             MetisConfigManager.invalidate()
             CliSettingManager.invalidate()
             CliConfig.invalidatePathCache()
-            setVariable("METIS_HOME", "")
+            match (originalHome) {
+                case Some(value) => setVariable("METIS_HOME", value)
+                case None => removeVariable("METIS_HOME")
+            }
             try { remove(home, recursive: true) } catch (_e: Exception) { () }
+        }
+    }
+}
+
+@Test
+public func feishuBotE2eHomeRestoresPresentAndAbsentCallerHome(): Unit {
+    synchronized(MetisProcessEnvironmentLock) {
+        let originalHome = getVariable("METIS_HOME")
+        let outerHome = Path("/tmp/metis-feishu-home-restore-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
+        Directory.create(outerHome, recursive: true)
+        try {
+            for (present in [true, false]) {
+                if (present) { setVariable("METIS_HOME", outerHome.toString()) }
+                else { removeVariable("METIS_HOME") }
+                CliConfig.invalidatePathCache()
+                let name = "feishu_bot_e2e_home_restore_${present}"
+                let expectedInner = feishuBotE2eTempHome(name)
+                withFeishuBotE2eHome(name, { =>
+                    @Expect(getVariable("METIS_HOME"), Some(expectedInner.toString()))
+                    @Expect(CliConfig.dotDir.toString(), expectedInner.toString())
+                })
+                if (present) {
+                    @Expect(getVariable("METIS_HOME"), Some(outerHome.toString()))
+                    @Expect(CliConfig.dotDir.toString(), outerHome.toString())
+                } else {
+                    // Do not resolve dotDir when the caller deliberately has no home override.
+                    @Expect(getVariable("METIS_HOME").isNone(), true)
+                }
+                @Expect(exists(expectedInner), false)
+            }
+        } finally {
+            match (originalHome) {
+                case Some(value) => setVariable("METIS_HOME", value)
+                case None => removeVariable("METIS_HOME")
+            }
+            CliConfig.invalidatePathCache()
+            CliSettingManager.invalidate()
+            MetisConfigManager.invalidate()
+            remove(outerHome, recursive: true)
+            @Expect(exists(outerHome), false)
         }
     }
 }

@@ -355,8 +355,21 @@ public class GatewayChannelRuntimeTest {
     public func s3jU1FixedHomeRestoresStateAndRemovesOwnedDirectory(): Unit {
         let originalHome = getVariable("METIS_HOME")
         let originalLogFile = Config.logFile
+        let restoredHome = Path("/tmp/metis-s3j-channel-restore-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")
         try {
             removeVariable("METIS_HOME")
+            CliConfig.invalidatePathCache()
+            let unsetResult = withGatewayChannelRuntimeTestHome<String>({ =>
+                Config.logFile = "stderr"
+                "s3j-channel-unset-ok"
+            })
+            @Expect(unsetResult, "s3j-channel-unset-ok")
+            @Expect(getVariable("METIS_HOME").isNone(), true)
+            @Expect(Config.logFile, originalLogFile)
+
+            // Exercise the path cache only while an explicit disposable home is set.
+            Directory.create(restoredHome, recursive: true)
+            setVariable("METIS_HOME", restoredHome.toString())
             CliConfig.invalidatePathCache()
             let expectedDotDir = CliConfig.dotDir.toString()
             let result = withGatewayChannelRuntimeTestHome<String>({ =>
@@ -364,7 +377,7 @@ public class GatewayChannelRuntimeTest {
                 "s3j-channel-ok"
             })
             @Expect(result, "s3j-channel-ok")
-            @Expect(getVariable("METIS_HOME").isNone(), true)
+            @Expect(getVariable("METIS_HOME"), Some(restoredHome.toString()))
             @Expect(CliConfig.dotDir.toString(), expectedDotDir)
             @Expect(Config.logFile, originalLogFile)
             let fixedHome = Path("/tmp/metis-gateway-channel-runtime-test-home")
@@ -425,6 +438,8 @@ public class GatewayChannelRuntimeTest {
             CliConfig.invalidatePathCache()
             gatewayLoggingResetForTest()
             Config.logFile = originalLogFile
+            if (exists(restoredHome)) { remove(restoredHome, recursive: true) }
+            @Expect(exists(restoredHome), false)
         }
     }
 
