@@ -1697,6 +1697,8 @@ public class ServicePluginFlowFormalTest {
                 println("BP_NATIVE_RECOVERY processed=${bpFormalCount(queue, "processed", expectedDeliveries)} effects=${effects.snapshot()[0]} duplicates=${effects.snapshot()[1]} count=${drainedWindow[1]} bytes=${drainedWindow[2]} pid=${pid} pidStable=${currentPid == pid} boundsViolated=${boundsViolated.load()}")
                 let stopped = stopServicePlugin("gitcode-monitor", reason: "bp-restart-drained", timeoutMillis: 5000)
                 @Expect(stopped.ok, true)
+                @Expect(stopped.status, "stopped")
+                @Expect(stopped.leaseStatus, "stopped")
                 @Expect(stopped.portStatus, "released")
                 formallyStopped = stopped.ok
                 let pidGone = s5PidGone(pid)
