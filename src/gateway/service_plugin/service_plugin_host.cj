@@ -1580,6 +1580,8 @@ private class ServicePluginCleanupPendingSlot {
     public var portStatus: String
     public var terminalDiagnostic: String
     public let cleanupToken: Int64
+    public let expectedSessionId: String
+    public var lastLeaseReconcileStatus = ""
     private let finalizeLock = Mutex()
     private let finalizeCondition: Condition
     private var finalizeInProgress = false
@@ -1607,7 +1609,8 @@ private class ServicePluginCleanupPendingSlot {
         dispatchStatus: String,
         leaseStatus: String,
         portStatus: String,
-        cleanupToken: Int64
+        cleanupToken: Int64,
+        expectedSessionId: String
     ) {
         this.serviceId = serviceId.trimAscii()
         this.detached = detached
@@ -1626,6 +1629,7 @@ private class ServicePluginCleanupPendingSlot {
         this.portStatus = portStatus.trimAscii()
         this.terminalDiagnostic = diagnostic.trimAscii()
         this.cleanupToken = cleanupToken
+        this.expectedSessionId = expectedSessionId
         synchronized(this.finalizeLock) { this.finalizeCondition = this.finalizeLock.condition() }
     }
 
@@ -2187,6 +2191,173 @@ private func servicePluginHasCleanupPendingLocked(serviceId: String): Bool {
     false
 }
 
+// The cleanup slot, rather than the active-owner map, owns a detached child.
+// These immutable snapshots keep a mutable registry record from selecting a successor lease.
+class ServicePluginExitedOwnerLeaseIdentity {
+    let serviceId: String
+    let sessionId: String
+    let ownerId: String
+    let pid: Int64
+    let parentPid: Int64
+    let generation: Int64
+    let claimToken: Int64
+    let cleanupToken: Int64
+    init(serviceId: String, sessionId: String, ownerId: String, pid: Int64, parentPid: Int64,
+        generation: Int64, claimToken: Int64, cleanupToken: Int64) {
+        this.serviceId = serviceId; this.sessionId = sessionId; this.ownerId = ownerId
+        this.pid = pid; this.parentPid = parentPid; this.generation = generation
+        this.claimToken = claimToken; this.cleanupToken = cleanupToken
+    }
+}
+
+class ServicePluginExitedOwnerLeaseSnapshot {
+    let identity: ServicePluginExitedOwnerLeaseIdentity
+    let recordStatus: String
+    let recordSessionId: String
+    let recordPid: Int64
+    let finalStatus: String
+    let finalReason: String
+    let activeSuccessor: Bool
+    let startClaim: Bool
+    let dispatchSettled: Bool
+    let dispatchFenced: Bool
+    let shuttingDown: Bool
+    init(identity: ServicePluginExitedOwnerLeaseIdentity, recordStatus!: String = "cleanup_pending",
+        recordSessionId!: String = "", recordPid!: Int64 = 0, finalStatus!: String = "degraded",
+        finalReason!: String = "process_exited", activeSuccessor!: Bool = false, startClaim!: Bool = false,
+        dispatchSettled!: Bool = true, dispatchFenced!: Bool = true, shuttingDown!: Bool = false) {
+        this.identity = identity; this.recordStatus = recordStatus; this.recordSessionId = recordSessionId
+        this.recordPid = recordPid; this.finalStatus = finalStatus; this.finalReason = finalReason
+        this.activeSuccessor = activeSuccessor; this.startClaim = startClaim
+        this.dispatchSettled = dispatchSettled; this.dispatchFenced = dispatchFenced; this.shuttingDown = shuttingDown
+    }
+}
+
+func servicePluginExitedOwnerLeaseGuardMatches(expected: ServicePluginExitedOwnerLeaseIdentity,
+    current: ServicePluginExitedOwnerLeaseSnapshot): Bool {
+    let actual = current.identity
+    expected.pid > 0 && expected.parentPid > 0 && expected.generation > 0 && expected.claimToken > 0 && expected.cleanupToken > 0 &&
+        !expected.ownerId.isEmpty() && actual.serviceId == expected.serviceId && actual.sessionId == expected.sessionId &&
+        actual.ownerId == expected.ownerId && actual.pid == expected.pid && actual.parentPid == expected.parentPid &&
+        actual.generation == expected.generation && actual.claimToken == expected.claimToken && actual.cleanupToken == expected.cleanupToken &&
+        current.recordStatus == "cleanup_pending" && current.recordSessionId == expected.sessionId &&
+        (current.recordPid == 0 || current.recordPid == expected.pid) && current.finalStatus == "degraded" &&
+        current.finalReason == "process_exited" && !current.activeSuccessor && !current.startClaim &&
+        current.dispatchSettled && current.dispatchFenced && !current.shuttingDown
+}
+
+private func servicePluginExitedOwnerLeaseIdentity(slot: ServicePluginCleanupPendingSlot,
+    process: ServicePluginStdioProcess): ServicePluginExitedOwnerLeaseIdentity {
+    ServicePluginExitedOwnerLeaseIdentity(slot.serviceId, slot.expectedSessionId, slot.ownerId, process.process.pid,
+        Int64(getProcessId()), slot.generation, slot.claimToken, slot.cleanupToken)
+}
+
+// Caller holds servicePluginProcessLock.
+private func servicePluginExitedOwnerLeaseSnapshotLocked(ownerId: String): Option<ServicePluginExitedOwnerLeaseSnapshot> {
+    match (servicePluginCleanupPendingOwners.get(ownerId)) {
+        case Some(slot) =>
+            match ((slot.detached.process, servicePluginRegistry.get(slot.serviceId))) {
+                case (Some(process), Some(record)) => Some(ServicePluginExitedOwnerLeaseSnapshot(
+                    servicePluginExitedOwnerLeaseIdentity(slot, process), recordStatus: record.status,
+                    recordSessionId: record.instanceId, recordPid: record.pid, finalStatus: slot.finalStatus,
+                    finalReason: slot.finalReason, activeSuccessor: servicePluginActiveProcesses.contains(slot.serviceId),
+                    startClaim: servicePluginStartClaims.contains(slot.serviceId), dispatchSettled: process.dispatchesSettled(),
+                    dispatchFenced: !process.dispatchAllowed(), shuttingDown: servicePluginHostShuttingDown))
+                case _ => None<ServicePluginExitedOwnerLeaseSnapshot>
+            }
+        case None => None<ServicePluginExitedOwnerLeaseSnapshot>
+    }
+}
+
+private var servicePluginExitedOwnerLeaseHookForTest: Option<(String) -> Unit> = None<(String) -> Unit>
+func setServicePluginExitedOwnerLeaseHookForTest(hook: Option<(String) -> Unit>): Unit { servicePluginExitedOwnerLeaseHookForTest = hook }
+private func servicePluginExitedOwnerLeasePhase(phase: String): Unit {
+    match (servicePluginExitedOwnerLeaseHookForTest) { case Some(hook) => hook(phase) case None => () }
+}
+
+private func servicePluginExitedOwnerLeaseResources(identity: ServicePluginExitedOwnerLeaseIdentity,
+    port: Int64, deadline: ServicePluginProbeDeadline): String {
+    let pid = servicePluginProbePid(identity.pid, deadline, maxBudgetMs: max(1, deadline.remaining() / 2))
+    if (!pid.conclusive || pid.alive || pid.status != "gone") { return if (pid.alive) { "pid_alive" } else { pid.status } }
+    let released = servicePluginPortReleaseState(port, identity.pid, deadline)
+    if (!released.conclusive || !released.released || released.status != "released") { return released.status }
+    "released"
+}
+
+// stillOwned is evaluated only while the host process lock excludes legitimate
+// successors. A dead child cannot heartbeat; reread rejects external changes.
+func servicePluginRetireExitedOwnerLease(identity: ServicePluginExitedOwnerLeaseIdentity,
+    deadline: ServicePluginProbeDeadline, stillOwned: () -> Bool): String {
+    if (deadline.remaining() <= 0) { return "probe_timeout" }
+    if (identity.serviceId.isEmpty() || identity.sessionId.isEmpty() ||
+        servicePluginPathSegment(identity.serviceId) != identity.serviceId ||
+        servicePluginPathSegment(identity.sessionId) != identity.sessionId ||
+        identity.serviceId == "." || identity.serviceId == ".." || identity.sessionId == "." || identity.sessionId == "..") { return "identity_mismatch" }
+    if (!synchronized(servicePluginProcessLock) { stillOwned() }) { return "cleanup_identity_changed" }
+    let path = servicePluginRuntimeLeaseDir(identity.serviceId).join("${identity.sessionId}.lease.json")
+    let loaded = servicePluginReadHistoricalLeaseStrict(path)
+    let lease = match (loaded.evidence) { case Some(value) => value case None => return loaded.status }
+    if (lease.pluginId != identity.serviceId || lease.sessionId != identity.sessionId || lease.pid != identity.pid ||
+        lease.parentPid != identity.parentPid || lease.startedAtMs <= 0 || lease.port <= 0) { return "lease_identity_mismatch" }
+    if (lease.state == "stopped") { return "already_stopped" }
+    if (!["running", "starting", "stopping"].contains(lease.state)) { return "lease_state_unknown" }
+    let temporary = path.parent.join(".owner-reconcile-${getProcessId()}-${identity.cleanupToken}-${DateTime.now().toUnixTimeStamp().toNanoseconds()}.tmp")
+    try {
+        servicePluginExitedOwnerLeasePhase("after_read")
+        let initial = servicePluginExitedOwnerLeaseResources(identity, lease.port, deadline)
+        if (initial != "released") { return initial }
+        servicePluginExitedOwnerLeasePhase("before_temp")
+        File.create(temporary).close()
+        chmod(temporary.toString(), UInt32(0o600))
+        servicePluginExitedOwnerLeasePhase("before_write")
+        let replacement = JsonValue.fromStr(lease.original).asObject()
+        replacement.put("state", JsonString("stopped"))
+        replacement.put("status", JsonString("stopped"))
+        replacement.put("hostReconciledBasis", JsonString("owner_exit_pid_gone_port_released"))
+        let encoded = replacement.toJsonString().toArray()
+        if (encoded.size > 65536) { return "evidence_limit_exceeded" }
+        File.writeTo(temporary, encoded)
+        servicePluginExitedOwnerLeasePhase("before_commit")
+        let resources = servicePluginExitedOwnerLeaseResources(identity, lease.port, deadline)
+        if (resources != "released") { return resources }
+        synchronized(servicePluginProcessLock) {
+            servicePluginExitedOwnerLeasePhase("before_rename")
+            if (deadline.remaining() <= 0) { return "probe_timeout" }
+            if (!stillOwned()) { return "cleanup_identity_changed" }
+            let current = servicePluginReadHistoricalLeaseStrict(path)
+            match (current.evidence) {
+                case Some(value) => if (value.original != lease.original) { return "lease_identity_changed" }
+                case None => return current.status
+            }
+            rename(temporary, to: path, overwrite: true)
+        }
+        let verified = servicePluginReadHistoricalLeaseStrict(path)
+        match (verified.evidence) {
+            case Some(value) =>
+                if (value.state == "stopped" && value.pluginId == identity.serviceId && value.sessionId == identity.sessionId &&
+                    value.pid == identity.pid && value.parentPid == identity.parentPid && value.startedAtMs == lease.startedAtMs && value.port == lease.port) { "retired" }
+                else { "lease_identity_changed" }
+            case None => verified.status
+        }
+    } catch (_: Exception) { "lease_reconcile_write_failed" }
+    finally { try { if (exists(temporary)) { remove(temporary) } } catch (_: Exception) { () } }
+}
+
+private func servicePluginLogExitedOwnerLeaseReconcile(slot: ServicePluginCleanupPendingSlot, status: String): Unit {
+    if (status == "already_stopped") { return }
+    let changed = synchronized(servicePluginProcessLock) {
+        if (slot.lastLeaseReconcileStatus == status) { false } else { slot.lastLeaseReconcileStatus = status; true }
+    }
+    if (!changed) { return }
+    let meta = JsonObject()
+    meta.put("serviceId", JsonString(slot.serviceId))
+    meta.put("status", JsonString(status))
+    meta.put("generation", JsonInt(slot.generation))
+    meta.put("cleanupToken", JsonInt(slot.cleanupToken))
+    if (status == "retired") { servicePluginHostLogger.info(MetisLogEvent.loggingRaw, "service_plugin.owner.lease_reconciled", meta: meta) }
+    else { servicePluginHostLogger.warn(MetisLogEvent.loggingRaw, "service_plugin.owner.lease_reconciled", meta: meta) }
+}
+
 private func servicePluginFinalizeCleanupPending(
     serviceId: String,
     process: ServicePluginStdioProcess,
@@ -2256,6 +2427,16 @@ private func servicePluginFinalizeCleanupPending(
         let terminalReserve = min(100, max(0, remaining - 1))
         let stopped = process.stop(timeoutMs: max(1, remaining - terminalReserve))
         let cleanupRecord = synchronized(servicePluginProcessLock) { servicePluginRegistry.get(serviceId.trimAscii()) }
+        if (stopped.ok && cleanupRecord.isSome() && expectedSlot.finalStatus == "degraded" && expectedSlot.finalReason == "process_exited") {
+            let identity = servicePluginExitedOwnerLeaseIdentity(expectedSlot, process)
+            let outcome = servicePluginRetireExitedOwnerLease(identity, ServicePluginProbeDeadline(deadlineMs), { =>
+                match (servicePluginExitedOwnerLeaseSnapshotLocked(identity.ownerId)) {
+                    case Some(snapshot) => servicePluginExitedOwnerLeaseGuardMatches(identity, snapshot)
+                    case None => false
+                }
+            })
+            servicePluginLogExitedOwnerLeaseReconcile(expectedSlot, outcome)
+        }
         let terminalState = match (cleanupRecord) {
             case Some(record) => servicePluginStopTerminalState(
                 record,
@@ -2349,7 +2530,8 @@ private func servicePluginPublishCleanupPending(
             dispatchStatus,
             leaseStatus,
             portStatus,
-            servicePluginCleanupTokenSequence
+            servicePluginCleanupTokenSequence,
+            match (servicePluginRegistry.get(sid)) { case Some(record) => record.instanceId case None => "" }
         )
         match (servicePluginRegistry.get(sid)) {
             case Some(record) =>
@@ -2854,6 +3036,7 @@ public func dropServicePluginActiveProcessForTest(serviceId: String, stopProcess
 }
 
 public func resetServicePluginHostForTest(): Unit {
+    servicePluginExitedOwnerLeaseHookForTest = None<(String) -> Unit>
     stopAllServicePluginSupervisors()
     stopAllActiveServicePluginProcesses()
     let pendingCleanup = synchronized(servicePluginProcessLock) {
@@ -3835,6 +4018,23 @@ private func servicePluginRunSupervisorTick(serviceId: String, nowMs: Int64, all
                 let classification = ServicePluginHealthClassification("healthy", diagnostic: "supervisor_disabled")
                 let _ = servicePluginSupervisorRecordProbe(record, probe, classification, nowMs)
                 return ServicePluginSupervisorTickResult(true, "disabled", probe: probe, classification: classification)
+            }
+            if (allowRecover) {
+                let pending = synchronized(servicePluginProcessLock) {
+                    if (servicePluginHostShuttingDown) { None<ServicePluginCleanupPendingSlot> }
+                    else { servicePluginCleanupPendingForServiceLocked(sid) }
+                }
+                match (pending) {
+                    case Some(slot) =>
+                        if (slot.finalStatus == "degraded" && slot.finalReason == "process_exited") {
+                            match (slot.detached.process) {
+                                case Some(process) => let _ = servicePluginFinalizeCleanupPending(sid, process,
+                                    timeoutMs: servicePluginSupervisorStopTimeoutMs(servicePluginSupervisorConfig))
+                                case None => ()
+                            }
+                        }
+                    case None => ()
+                }
             }
             let probe = probeServicePluginHealth(record, nowMs: nowMs)
             let classification = classifyServicePluginHealth(probe, previousFailures: record.supervisorFailureCount, config: servicePluginSupervisorConfig)

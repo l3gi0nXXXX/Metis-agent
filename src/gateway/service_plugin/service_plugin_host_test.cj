@@ -1319,6 +1319,67 @@ public class ServicePluginHostTest {
     }
 
     @TestCase
+    public func bpS3N1SupervisorRetryAfterInitialFinalizeDeadlineWithoutFuture(): Unit {
+        withIsolatedServicePluginHostTestHome("exited-r-s-retry", { home: Path =>
+            let port = 20000 + DateTime.now().toUnixTimeStamp().toNanoseconds() % 30000
+            let script = this.gitCodeLeaseScript(port).replace(
+                "while read line; do metis_stop_lease; exit 0; done",
+                "while IFS= read -r request; do case \"$request\" in *\\\"method\\\":\\\"stop\\\"*) metis_stop_lease; exit 0;; esac; done")
+            this.registerGitCodeStdioScript(script)
+            setServicePluginSupervisorAutoStartForTest(false)
+            setServicePluginSupervisorConfigForTest(ServicePluginSupervisorConfig(enabled: true, intervalMs: 1000,
+                healthTimeoutMs: 100, failureThreshold: 1, restartCooldownMs: 1000))
+            let firstFinalize = ServicePluginTestOnce()
+            setServicePluginCleanupFinalizeHookForTest(Some({ _service: String, _token: Int64 =>
+                if (firstFinalize.take()) { sleep(Duration.millisecond * 5) }
+            }))
+            setServicePluginPortReleaseCommandForTest(Some({ _port: Int64, _pid: Int64, _timeout: Int64 => (Int64(1), "", "") }))
+            setServicePluginHealthzProbeForTest(Some({ _url: String, _timeout: Int64 => ServicePluginHealthzProbeResult(true, statusCode: 200) }))
+            try {
+                @Expect(ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000).ok, true)
+                @Expect(this.waitForGitCodeLease(home), true)
+                let before = getServicePluginSnapshot("gitcode-monitor").getOrThrow()
+                let oldLeasePath = home.join("service-plugin").join("runtime").join("gitcode-monitor").join("${before.instanceId}.lease.json")
+                let leaseDeadline = MonoTime.now() + Duration.second
+                var leaseRead = servicePluginReadHistoricalLeaseStrict(oldLeasePath)
+                while (leaseRead.evidence.isNone() && MonoTime.now() < leaseDeadline) {
+                    sleep(Duration.millisecond * 5)
+                    leaseRead = servicePluginReadHistoricalLeaseStrict(oldLeasePath)
+                }
+                @Expect(leaseRead.status, "ok")
+                let lease = leaseRead.evidence.getOrThrow()
+                @Expect(lease.pid, before.pid)
+                @Expect(lease.parentPid, Int64(getProcessId()))
+                @Expect(lease.state, "running")
+                @Expect(executeWithOutput("/bin/kill", ["-KILL", before.pid.toString()])[0], 0)
+                @Expect(this.waitForPidGone(before.pid), true)
+                @Expect(this.waitForSnapshotReason("gitcode-monitor", "cleanup_pending", timeoutMillis: 5000), true)
+                @Expect(servicePluginCleanupPendingCountForTest(), 1)
+                @Expect(servicePluginReadHistoricalLeaseStrict(oldLeasePath).evidence.getOrThrow().state, "running")
+                setServicePluginCleanupFinalizeHookForTest(None<(String, Int64) -> Unit>)
+                let recovered = runServicePluginSupervisorTickForTest("gitcode-monitor")
+                @Expect(recovered.recovered, true)
+                let after = getServicePluginSnapshot("gitcode-monitor").getOrThrow()
+                @Expect(after.status, "running")
+                @Expect(after.pid > 0 && after.pid != before.pid, true)
+                @Expect(after.instanceId != before.instanceId, true)
+                @Expect(after.supervisorRestartCount, 1)
+                @Expect(servicePluginCleanupPendingCountForTest(), 0)
+                @Expect(servicePluginReadHistoricalLeaseStrict(oldLeasePath).evidence.getOrThrow().state, "stopped")
+                @Expect(runServicePluginSupervisorTickForTest("gitcode-monitor").recovered, false)
+                @Expect(getServicePluginSnapshot("gitcode-monitor").getOrThrow().pid, after.pid)
+                let stopped = stopServicePlugin("gitcode-monitor", reason: "exited-r-s-complete", timeoutMillis: 3000)
+                @Expect(stopped.ok, true)
+                @Expect(this.waitForPidGone(after.pid), true)
+            } finally {
+                setServicePluginCleanupFinalizeHookForTest(None<(String, Int64) -> Unit>)
+                setServicePluginPortReleaseCommandForTest(None<(Int64, Int64, Int64) -> (Int64, String, String)>)
+                setServicePluginHealthzProbeForTest(None<(String, Int64) -> ServicePluginHealthzProbeResult>)
+            }
+        })
+    }
+
+    @TestCase
     public func tP4B001ForcedStopKeepsDiagnosticWhenLeaseNotStopped(): Unit {
         // METIS-ORPHAN-P-002, T-P4-B-001.
         withIsolatedServicePluginHostTestHome("service-plugin-p4-forced-stop-lease", { _home: Path =>
