@@ -1226,6 +1226,188 @@ public class CodexAppServerM5Test {
     }
 }
 
+@Test
+class CodexAppServerWarmupFixtureTest {
+    private func withOwnedFixture(label: String,
+        block: (Path, CodexAppServerClient, (Int64, Int64, Int64)) -> Unit): Unit {
+        let root = m5TempRoot("warmup-${label}")
+        let broker = managedStdioBroker()
+        @Expect(broker.probeBroker(timeoutMs: 2000).ok, true)
+        let before = broker.debugSnapshotForTest()
+        let client = CodexAppServerClient(codexBin: m5FakeCodexScript(),
+            env: m5FakeCodexEnvironment("session", "warmup-${label}"), cwd: Some(root.toString()),
+            absoluteDeadlineMs: codexAppServerAbsoluteDeadlineMs(5000))
+        var owner = (Int64(0), Int64(0), Int64(0))
+        try {
+            client.start(1000)
+            let expected = client.debugOwnerIdentityForTest()
+            owner = expected
+            @Expect(expected[0] > 0 && expected[1] > 1 && expected[2] == expected[1], true)
+            block(root, client, expected)
+        } finally {
+            try { client.close() } finally {
+                @Expect(m5WaitPidGone(owner[1], 2000), true)
+                @Expect(m5WaitPgidGone(owner[2], 2000), true)
+                let after = broker.debugSnapshotForTest()
+                @Expect(after.ownerCount, before.ownerCount)
+                @Expect(after.readerCount, before.readerCount)
+                @Expect(after.generation, before.generation)
+                @Expect(after.brokerPid, before.brokerPid)
+                @Expect(after.dispatcherCount > 0, true)
+                remove(root, recursive: true)
+            }
+        }
+    }
+
+    private func assertPublication(label: String, kind: Int64): Unit {
+        this.withOwnedFixture(label, { root: Path, client: CodexAppServerClient, expected: (Int64, Int64, Int64) =>
+            let pidPath = root.join("published.pid")
+            let initial: Array<UInt8> = match (kind) {
+                case 1 => "${expected[1] / 10}".toArray()
+                case 2 => "中文🙂".toArray()
+                case 3 => m5RepeatedText(r'中', 65536).toArray()
+                case 4 => [UInt8(0xff), UInt8(0xfe)]
+                case _ => "".toArray()
+            }
+            File.writeTo(pidPath, initial)
+            let observedInitial = AtomicBool(false)
+            let published = AtomicBool(false)
+            let readCount = AtomicInt64(0)
+            let writer = spawn {
+                let deadline = MonoTime.now() + Duration.second * 2
+                while (!observedInitial.load() && MonoTime.now() < deadline) { sleep(Duration.millisecond) }
+                if (observedInitial.load()) { File.writeTo(pidPath, "${expected[1]}\n".toArray()) }
+                published.store(true)
+            }
+            try {
+                let readyPid = m5AwaitWarmupOwnerPid(expected, codexAppServerAbsoluteDeadlineMs(3000),
+                    { =>
+                        let bytes = File.readFrom(pidPath)
+                        if (readCount.fetchAdd(1) == 0) {
+                            @Expect(bytes.size, initial.size)
+                            observedInitial.store(true)
+                            let deadline = MonoTime.now() + Duration.second * 2
+                            while (!published.load() && MonoTime.now() < deadline) { sleep(Duration.millisecond) }
+                        }
+                        bytes
+                    }, { => client.debugOwnerIdentityForTest() })
+                @Expect(readyPid, expected[1])
+                @Expect(observedInitial.load(), true)
+                @Expect(published.load(), true)
+                @Expect(readCount.load() >= 2, true)
+                let current = client.debugOwnerIdentityForTest()
+                @Expect(current[0], expected[0])
+                @Expect(current[1], expected[1])
+                @Expect(current[2], expected[2])
+            } finally {
+                observedInitial.store(true)
+                @Expect(m5FutureSettled(Some(writer), 2500), true)
+            }
+        })
+    }
+
+    @TestCase
+    public func warmupP1EmptyPublicationWaitsForMatchingOwnerPid(): Unit {
+        this.assertPublication("p1", 0)
+    }
+
+    @TestCase
+    public func warmupB1PrefixUnicodeLongAndInvalidUtf8RequireFreshValidRead(): Unit {
+        for (kind in 1..5) { this.assertPublication("b1-${kind}", kind) }
+    }
+
+    @TestCase
+    public func warmupN1PermanentInvalidUnreadableAbsentAndForeignPidFailClosed(): Unit {
+        for (kind in 0..10) {
+            this.withOwnedFixture("n1-${kind}", { root: Path, client: CodexAppServerClient, expected: (Int64, Int64, Int64) =>
+                let pidPath = root.join("invalid-${kind}.pid")
+                let input: Array<UInt8> = match (kind) {
+                    case 1 => "{not-json".toArray()
+                    case 2 => "中文🙂".toArray()
+                    case 3 => m5RepeatedText(r'中', 65536).toArray()
+                    case 4 => [UInt8(0xff), UInt8(0xfe)]
+                    case 5 => [UInt8(0), UInt8(1), UInt8(2)]
+                    case 9 => "${expected[1] + 1}\n".toArray()
+                    case _ => "".toArray()
+                }
+                if (kind != 8) { File.writeTo(pidPath, input) }
+                let reads = AtomicInt64(0)
+                let ready = m5AwaitWarmupOwnerPid(expected, codexAppServerAbsoluteDeadlineMs(3000),
+                    { =>
+                        reads.fetchAdd(1)
+                        if (kind == 6) { throw Exception("fixture_read_denied") }
+                        if (kind == 7) { File.readFrom(root) } else { File.readFrom(pidPath) }
+                    }, { => client.debugOwnerIdentityForTest() })
+                @Expect(ready, 0)
+                @Expect(reads.load() > 0, true)
+                @Expect(client.debugOwnerIdentityForTest()[1], expected[1])
+            })
+        }
+    }
+
+    @TestCase
+    public func warmupN2ChangedIdentityAndRealClosedClientNeverBecomeReady(): Unit {
+        this.withOwnedFixture("n2", { root: Path, client: CodexAppServerClient, expected: (Int64, Int64, Int64) =>
+            let pidPath = root.join("valid.pid")
+            File.writeTo(pidPath, "${expected[1]}\n".toArray())
+            let invalidExpected = [(Int64(0), expected[1], expected[2]), (expected[0], Int64(1), Int64(1)),
+                (expected[0], expected[1], Int64(0)), (expected[0], expected[1] + 1, expected[2])]
+            for (invalid in invalidExpected) {
+                let reads = AtomicInt64(0)
+                @Expect(m5AwaitWarmupOwnerPid(invalid, codexAppServerAbsoluteDeadlineMs(3000),
+                    { => reads.fetchAdd(1); File.readFrom(pidPath) }, { => client.debugOwnerIdentityForTest() }), 0)
+                @Expect(reads.load(), 0)
+            }
+            for (kind in 0..4) {
+                let checks = AtomicInt64(0)
+                let changed = match (kind) {
+                    case 0 => (expected[0] + 1, expected[1], expected[2])
+                    case 1 => (expected[0], expected[1] + 1, expected[2])
+                    case 2 => (expected[0], expected[1], expected[2] + 1)
+                    case _ => (Int64(0), Int64(0), Int64(0))
+                }
+                let ready = m5AwaitWarmupOwnerPid(expected, codexAppServerAbsoluteDeadlineMs(3000),
+                    { => File.readFrom(pidPath) }, { =>
+                        // A later apparent restoration must not revive a rejected observation.
+                        if (checks.fetchAdd(1) == 1) { changed } else { client.debugOwnerIdentityForTest() }
+                    })
+                @Expect(ready, 0)
+                @Expect(checks.load(), 2)
+            }
+            client.close()
+            @Expect(client.debugOwnerIdentityForTest()[1], 0)
+            @Expect(client.debugOwnerIdentityForTest()[2], 0)
+            let reads = AtomicInt64(0)
+            let closed = m5AwaitWarmupOwnerPid(expected, codexAppServerAbsoluteDeadlineMs(3000),
+                { => reads.fetchAdd(1); File.readFrom(pidPath) }, { => client.debugOwnerIdentityForTest() })
+            @Expect(closed, 0)
+            @Expect(reads.load(), 0)
+        })
+    }
+
+    @TestCase
+    public func warmupD1ExpiredCallerOrReadBudgetCannotBeRenewedByValidPid(): Unit {
+        this.withOwnedFixture("d1", { root: Path, client: CodexAppServerClient, expected: (Int64, Int64, Int64) =>
+            let pidPath = root.join("valid.pid")
+            File.writeTo(pidPath, "${expected[1]}\n".toArray())
+            for (kind in 0..3) {
+                let clock = AtomicInt64(0)
+                let reads = AtomicInt64(0)
+                let absoluteDeadline = if (kind == 0) { Int64(0) } else if (kind == 1) { Int64(3000) } else { Int64(500) }
+                let ready = m5AwaitWarmupOwnerPid(expected, absoluteDeadline,
+                    { =>
+                        reads.fetchAdd(1)
+                        let bytes = File.readFrom(pidPath)
+                        clock.store(if (kind == 1) { Int64(1000) } else { Int64(500) })
+                        bytes
+                    }, { => client.debugOwnerIdentityForTest() }, now: { => clock.load() })
+                @Expect(ready, 0)
+                @Expect(reads.load(), if (kind == 0) { Int64(0) } else { Int64(1) })
+            }
+        })
+    }
+}
+
 private func m5TempRoot(label: String): Path {
     let root = Path("/tmp/metis-codex-app-server-${label}-${DateTime.now().toUnixTimeStamp().toMilliseconds()}")
     if (exists(root)) {
@@ -1257,11 +1439,12 @@ private func m5WarmBrokerDispatcher(): Unit {
     let before = managedStdioBroker().debugSnapshotForTest()
     let root = m5TempRoot("s4b-dispatcher-warmup")
     let pidPath = root.join("owner.pid")
+    let absoluteDeadlineMs = codexAppServerAbsoluteDeadlineMs(3000)
     let client = CodexAppServerClient(
         codexBin: m5FakeCodexScript(),
         env: m5FakeCodexEnvironment("session", "s4b-dispatcher-warmup", parentPidPath: Some(pidPath.toString())),
         cwd: Some(root.toString()),
-        absoluteDeadlineMs: codexAppServerAbsoluteDeadlineMs(3000)
+        absoluteDeadlineMs: absoluteDeadlineMs
     )
     var pid: Int64 = 0
     var pgid: Int64 = 0
@@ -1269,12 +1452,14 @@ private func m5WarmBrokerDispatcher(): Unit {
     var pgidGone = false
     try {
         client.start(1000)
-        if (!m5WaitPathsExist([pidPath], 1000)) {
-            throw Exception("S4B dispatcher warmup pid missing")
-        }
-        pid = m5ReadPid(pidPath)
-        pgid = client.debugOwnerIdentityForTest()[2]
-        if (pid <= 0 || pgid <= 0) {
+        let expected = client.debugOwnerIdentityForTest()
+        pid = expected[1]
+        pgid = expected[2]
+        let readyPid = m5AwaitWarmupOwnerPid(expected, absoluteDeadlineMs,
+            { => File.readFrom(pidPath) }, { =>
+                if (client.debugLifecycleForTest() == "running") { client.debugOwnerIdentityForTest() } else { (Int64(0), Int64(0), Int64(0)) }
+            })
+        if (readyPid <= 0) {
             throw Exception("S4B dispatcher warmup identity missing")
         }
     } finally {
@@ -1293,6 +1478,24 @@ private func m5WarmBrokerDispatcher(): Unit {
         after.brokerPid != before.brokerPid || after.dispatcherCount <= 0) {
         throw Exception("S4B dispatcher warmup did not return to broker baseline")
     }
+}
+
+private func m5AwaitWarmupOwnerPid(expected: (Int64, Int64, Int64), absoluteDeadlineMs: Int64,
+    reader: () -> Array<UInt8>, identity: () -> (Int64, Int64, Int64), now!: () -> Int64 = { => codexAppServerNowMs() }): Int64 {
+    if (expected[0] <= 0 || expected[1] <= 1 || expected[2] != expected[1]) { return 0 }
+    let deadline = min(absoluteDeadlineMs, codexAppServerAbsoluteDeadlineMs(1000, nowMs: now()))
+    while (now() < deadline) {
+        let current = identity()
+        if (current[0] != expected[0] || current[1] != expected[1] || current[2] != expected[2]) { return 0 }
+        let pid = try { Int64.parse(String.fromUtf8(reader()).trimAscii()) } catch (_: Exception) { 0 }
+        let confirmed = identity()
+        if (now() >= deadline || confirmed[0] != expected[0] || confirmed[1] != expected[1] || confirmed[2] != expected[2]) { return 0 }
+        if (pid == expected[1]) { return pid }
+        let remaining = deadline - now()
+        if (remaining <= 0) { return 0 }
+        sleep(Duration.millisecond * min(20, remaining))
+    }
+    0
 }
 
 private func m5FakeCodexEnvironment(
