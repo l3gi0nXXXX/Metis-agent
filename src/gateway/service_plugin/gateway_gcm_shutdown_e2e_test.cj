@@ -7,7 +7,7 @@ import std.collection.{ArrayList, HashSet}
 import std.convert.Parsable
 import std.core.Duration
 import std.env.{getVariable, setVariable}
-import std.fs.{Directory, File, Path, exists, remove}
+import std.fs.{Directory, File, Path, exists, remove, rename}
 import std.net.*
 import std.process.{ProcessRedirect, SubProcess, executeWithOutput, launch}
 import std.sync.*
@@ -355,7 +355,7 @@ private func s5GcmQueueProof(queuePath: Path, expected: HashSet<String>, termina
     let seen = HashSet<String>()
     for (status in ["pending", "processing", "awaiting-host", "processed", "dead-letter", "cancelled"]) {
         for (path in bpFormalQueuePaths(queuePath, status, expected, terminal: terminal)) {
-            let rootValue = bpFormalReadKnown(path)
+            let rootValue = bpFormalReadKnown(path, terminal: terminal)
             if (rootValue.isNone()) { continue }
             match (status) {
                 case "pending" => pending++
@@ -1296,8 +1296,10 @@ public class GatewayGcmShutdownE2eTest {
 
 // Formal cases deliberately use the real native host, broker and rebuilt GCM.
 // All durable payloads are synthetic; the helper never reads a user's queue.
-private func bpFormalRead(path: Path): String {
-    try { String.fromUtf8(File.readFrom(path)) } catch (_: Exception) { "invalid_response_encoding" }
+private func bpFormalRead(path: Path,
+    readBytes!: (Path) -> Array<Byte> = { target: Path => File.readFrom(target) }): String {
+    let bytes = readBytes(path)
+    try { String.fromUtf8(bytes) } catch (_: Exception) { throw Exception("formal_invalid_response_encoding") }
 }
 
 private func bpFormalArtifact(): Path {
@@ -1395,14 +1397,26 @@ private func bpFormalQueuePaths(queue: Path, status: String, expected: HashSet<S
     paths
 }
 
-private func bpFormalReadKnown(path: Path): Option<JsonObject> {
-    if (!exists(path)) { return None<JsonObject> }
-    try {
-        Some(JsonValue.fromStr(bpFormalRead(path)).asObject())
-    } catch (e: Exception) {
-        if (exists(path)) { throw e }
-        None<JsonObject>
+private func bpFormalReadKnown(path: Path, terminal!: Bool = false,
+    readBytes!: (Path) -> Array<Byte> = { target: Path => File.readFrom(target) }): Option<JsonObject> {
+    if (!terminal && !exists(path)) { return None<JsonObject> }
+    let attempts: Int64 = if (terminal) { 1 } else { 2 }
+    for (attempt in 0..attempts) {
+        try {
+            let text = bpFormalRead(path, readBytes: readBytes)
+            let row = try { JsonValue.fromStr(text).asObject() } catch (_: Exception) {
+                throw Exception("formal_malformed_json")
+            }
+            return Some(row)
+        } catch (e: Exception) {
+            if (terminal) { throw e }
+            if (!exists(path)) { return None<JsonObject> }
+            // An atomic queue transition can replace this same pathname. Only a
+            // successful second real read makes that observation usable.
+            if (attempt + 1 == attempts) { throw e }
+        }
     }
+    throw Exception("formal_queue_read_attempts_exhausted")
 }
 
 private func bpFormalCount(queue: Path, status: String, expected: HashSet<String>): Int64 {
@@ -1421,7 +1435,7 @@ private func bpFormalIdentityProof(queue: Path, expected: HashSet<String>,
     var unknown: Int64 = 0
     for (status in ["pending", "processing", "awaiting-host", "processed", "dead-letter", "cancelled"]) {
         for (path in bpFormalQueuePaths(queue, status, expected, terminal: terminal)) {
-            let rowValue = bpFormalReadKnown(path)
+            let rowValue = bpFormalReadKnown(path, terminal: terminal)
             if (rowValue.isNone()) { continue }
             let row = rowValue.getOrThrow()
             let id = row.get("deliveryId").getOrThrow().asString().getValue()
@@ -1915,5 +1929,218 @@ public class ServicePluginFlowUnexpectedExitTest {
             }
         })
         @Expect(s5RemoveOwnedTempHome(ownedHomes[0]), true)
+    }
+}
+
+@Test
+public class ServicePluginQueueObserverReadTest {
+    private func failureOf(block: () -> Unit): String {
+        try { block(); "" } catch (e: Exception) { "threw:${e.message}" }
+    }
+
+    private func validRecord(): Array<Byte> {
+        "{\"deliveryId\":\"observer-中文🙂\",\"status\":\"pending\"}".toArray()
+    }
+
+    @TestCase
+    public func obs03U1MissingAndSameNameReplacementUseRealReads(): Unit {
+        withServicePluginHostTestHome("s5-obs03-u1", { home: Path =>
+            let path = home.join("known.json")
+            let replacement = home.join("replacement.json")
+            File.writeTo(path, this.validRecord())
+            File.writeTo(replacement, this.validRecord())
+            let reads = AtomicInt64(0)
+            let value = bpFormalReadKnown(path, readBytes: { target: Path =>
+                if (reads.fetchAdd(1) == 0) {
+                    remove(target)
+                    try { let _ = File.readFrom(target) } finally { rename(replacement, to: target) }
+                }
+                File.readFrom(target)
+            })
+            @Expect(reads.load(), 2)
+            @Expect(value.getOrThrow().get("deliveryId").getOrThrow().asString().getValue(), "observer-中文🙂")
+            let absentReads = AtomicInt64(0)
+            let missing = bpFormalReadKnown(home.join("absent.json"), readBytes: { target: Path =>
+                absentReads.fetchAdd(1)
+                File.readFrom(target)
+            })
+            @Expect(missing.isNone(), true)
+            @Expect(absentReads.load(), 0)
+        })
+    }
+
+    @TestCase
+    public func obs03P1UnicodeAndLongFieldsAreReadOnceIntact(): Unit {
+        withServicePluginHostTestHome("s5-obs03-p1", { home: Path =>
+            let path = home.join("known.json")
+            var longText = ""
+            for (_ in 0..4096) { longText += "中文🙂" }
+            let expected = longText
+            let row = JsonObject()
+            row.put("text", JsonString(expected))
+            File.writeTo(path, row.toJsonString().toArray())
+            let reads = AtomicInt64(0)
+            let value = bpFormalReadKnown(path, readBytes: { target: Path =>
+                reads.fetchAdd(1)
+                File.readFrom(target)
+            })
+            @Expect(reads.load(), 1)
+            @Expect(value.getOrThrow().get("text").getOrThrow().asString().getValue(), expected)
+        })
+    }
+
+    @TestCase
+    public func obs03B1ReplacedUtf8AndJsonFailuresRequireSuccessfulSecondRead(): Unit {
+        withServicePluginHostTestHome("s5-obs03-b1", { home: Path =>
+            for ((name, bytes) in [("utf8", [0xffu8]), ("json", "{".toArray())]) {
+                let path = home.join("${name}.json")
+                let replacement = home.join("${name}-replacement.json")
+                File.writeTo(path, bytes)
+                File.writeTo(replacement, this.validRecord())
+                let reads = AtomicInt64(0)
+                let value = bpFormalReadKnown(path, readBytes: { target: Path =>
+                    let captured = File.readFrom(target)
+                    if (reads.fetchAdd(1) == 0) { rename(replacement, to: target, overwrite: true) }
+                    captured
+                })
+                @Expect(reads.load(), 2)
+                @Expect(value.getOrThrow().get("deliveryId").getOrThrow().asString().getValue(), "observer-中文🙂")
+                @Expect(File.readFrom(path), this.validRecord())
+            }
+        })
+    }
+
+    @TestCase
+    public func obs03N1PersistentIoUtf8AndJsonFailuresPreserveFiles(): Unit {
+        withServicePluginHostTestHome("s5-obs03-n1", { home: Path =>
+            let path = home.join("known.json")
+            let original = this.validRecord()
+            File.writeTo(path, original)
+            let ioReads = AtomicInt64(0)
+            let ioError = this.failureOf({ =>
+                let _ = bpFormalReadKnown(path, readBytes: { _target: Path =>
+                    ioReads.fetchAdd(1)
+                    // A real FS failure at the injected read boundary; the known
+                    // target remains present, so it cannot become a missing row.
+                    File.readFrom(home.join("absent-read-source"))
+                })
+            })
+            @Expect(ioError.startsWith("threw:"), true)
+            @Expect(ioError.contains("formal_malformed_json"), false)
+            @Expect(ioError.contains("formal_invalid_response_encoding"), false)
+            @Expect(ioReads.load(), 2)
+            @Expect(File.readFrom(path), original)
+            for ((name, bytes, status) in [("utf8", [0xffu8], "formal_invalid_response_encoding"),
+                ("json", "invalid_response_encoding".toArray(), "formal_malformed_json")]) {
+                let badPath = home.join("${name}.json")
+                File.writeTo(badPath, bytes)
+                let reads = AtomicInt64(0)
+                let error = this.failureOf({ =>
+                    let _ = bpFormalReadKnown(badPath, readBytes: { target: Path =>
+                        reads.fetchAdd(1)
+                        File.readFrom(target)
+                    })
+                })
+                @Expect(error, "threw:${status}")
+                @Expect(reads.load(), 2)
+                @Expect(File.readFrom(badPath), bytes)
+            }
+        })
+    }
+
+    @TestCase
+    public func obs03N2RepeatedReplacementHasOnlyTwoAttempts(): Unit {
+        withServicePluginHostTestHome("s5-obs03-n2", { home: Path =>
+            for (keepPresent in [true, false]) {
+                let path = home.join(if (keepPresent) { "present.json" } else { "missing.json" })
+                File.writeTo(path, this.validRecord())
+                let reads = AtomicInt64(0)
+                let read = { target: Path =>
+                    let attempt = reads.fetchAdd(1)
+                    remove(target)
+                    try { let _ = File.readFrom(target) } finally {
+                        if (keepPresent || attempt == 0) { File.writeTo(target, this.validRecord()) }
+                    }
+                    File.readFrom(target)
+                }
+                if (keepPresent) {
+                    @Expect(this.failureOf({ => let _ = bpFormalReadKnown(path, readBytes: read) }).startsWith("threw:"), true)
+                    @Expect(File.readFrom(path), this.validRecord())
+                } else {
+                    @Expect(bpFormalReadKnown(path, readBytes: read).isNone(), true)
+                    @Expect(exists(path), false)
+                }
+                @Expect(reads.load(), 2)
+            }
+        })
+    }
+
+    @TestCase
+    public func obs03T1TerminalReadsAndStrictIdentityProofRejectEveryInvalidState(): Unit {
+        withServicePluginHostTestHome("s5-obs03-t1", { home: Path =>
+            let queue = home.join("queue")
+            let expected = bpFormalSeed(queue, 1)
+            let path = queue.join("pending/bp-formal-0.json")
+            let original = File.readFrom(path)
+            let valid = bpFormalIdentityProof(queue, expected, terminal: true)
+            @Expect(valid[0], 1)
+            @Expect(valid[1], 0)
+            @Expect(valid[2], 0)
+            let validReads = AtomicInt64(0)
+            @Expect(bpFormalReadKnown(path, terminal: true, readBytes: { target: Path =>
+                validReads.fetchAdd(1)
+                File.readFrom(target)
+            }).isSome(), true)
+            @Expect(validReads.load(), 1)
+            let ioReads = AtomicInt64(0)
+            @Expect(this.failureOf({ =>
+                let _ = bpFormalReadKnown(path, terminal: true, readBytes: { _target: Path =>
+                    ioReads.fetchAdd(1)
+                    File.readFrom(home.join("absent-read-source"))
+                })
+            }).startsWith("threw:"), true)
+            @Expect(ioReads.load(), 1)
+            @Expect(File.readFrom(path), original)
+            let foreignPath = queue.join("pending/foreign.json")
+            File.writeTo(foreignPath, "{\"deliveryId\":\"foreign\",\"status\":\"pending\"}".toArray())
+            let unknown = bpFormalIdentityProof(queue, expected, terminal: true)
+            @Expect(unknown[1], 1)
+            @Expect(unknown[2], 1)
+            remove(foreignPath)
+            let duplicate = queue.join("processing/bp-formal-0.json")
+            let duplicateRow = JsonValue.fromStr(bpFormalRead(path)).asObject()
+            duplicateRow.put("status", JsonString("processing"))
+            File.writeTo(duplicate, duplicateRow.toJsonString().toArray())
+            @Expect(bpFormalIdentityProof(queue, expected, terminal: true)[1], 1)
+            remove(duplicate)
+            remove(path)
+            @Expect(bpFormalIdentityProof(queue, expected, terminal: true)[0], 0)
+            let missingReads = AtomicInt64(0)
+            @Expect(this.failureOf({ =>
+                let _ = bpFormalReadKnown(path, terminal: true, readBytes: { target: Path =>
+                    missingReads.fetchAdd(1)
+                    File.readFrom(target)
+                })
+            }).startsWith("threw:"), true)
+            @Expect(missingReads.load(), 1)
+            for ((name, bytes, status) in [("utf8", [0xffu8], "formal_invalid_response_encoding"),
+                ("json", "{".toArray(), "formal_malformed_json")]) {
+                File.writeTo(path, bytes)
+                @Expect(this.failureOf({ => let _ = bpFormalIdentityProof(queue, expected, terminal: true) }), "threw:${status}")
+                let replacement = home.join("${name}-valid.json")
+                File.writeTo(replacement, original)
+                let reads = AtomicInt64(0)
+                @Expect(this.failureOf({ =>
+                    let _ = bpFormalReadKnown(path, terminal: true, readBytes: { target: Path =>
+                        let captured = File.readFrom(target)
+                        reads.fetchAdd(1)
+                        rename(replacement, to: target, overwrite: true)
+                        captured
+                    })
+                }), "threw:${status}")
+                @Expect(reads.load(), 1)
+                @Expect(File.readFrom(path), original)
+            }
+        })
     }
 }
