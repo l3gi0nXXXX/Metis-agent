@@ -1378,7 +1378,15 @@ private func bpFormalCount(queue: Path, status: String): Int64 {
     var count: Int64 = 0
     let path = queue.join(status)
     if (!exists(path)) { return 0 }
-    for (entry in Directory.readFrom(path)) { if (entry.isRegular() && entry.name.endsWith(".json")) { count++ } }
+    for (entry in Directory.readFrom(path)) {
+        if (!entry.name.endsWith(".json")) { continue }
+        try {
+            if (entry.isRegular()) { count++ }
+        } catch (e: Exception) {
+            // Queue transitions may remove an entry after directory enumeration.
+            if (exists(entry.path)) { throw e }
+        }
+    }
     count
 }
 
