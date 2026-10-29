@@ -13,7 +13,7 @@ import std.process.{ProcessRedirect, SubProcess, executeWithOutput, launch}
 import std.sync.*
 import std.time.MonoTime
 import std.unittest.testmacro.*
-import stdx.encoding.json.JsonValue
+import stdx.encoding.json.{JsonValue, JsonObject, JsonString, JsonInt}
 import stdx.net.http.*
 
 private class S5HttpResult {
@@ -762,39 +762,26 @@ public class GatewayGcmShutdownE2eTest {
                     @Expect(posted.status >= 200 && posted.status < 300, true)
                 }
                 @Expect(expectedDeliveries.size, 140)
+                // Admission is now bounded by the shared sender rather than host queue saturation.
                 @Expect(s5WaitUntil(15000, { =>
-                    let queue = s5GcmQueueProof(queuePath, expectedDeliveries)
-                    match (servicePluginDispatchSchedulerSnapshotForTest("gitcode-monitor")) {
-                        case Some(row) => row.active == 2 && row.queued == 128 && row.accepted == 130 &&
-                            row.futures == 2 && row.queueHighWatermark == 128 && row.queueFull >= 10 &&
-                            queue.awaiting == 130 && queue.pending == 10 && queue.processing == 0 &&
-                            queue.processed == 0 && queue.deadLetter == 0 && queue.cancelled == 0 &&
-                            queue.unique == 140 && queue.attemptOne == 140 && queue.invalid == 0
-                        case None => false
-                    }
+                    bpFormalCount(queuePath, "awaiting-host") == 2 && bpFormalCount(queuePath, "pending") == 138 &&
+                        bpFormalCount(queuePath, "processing") == 0 && gate.snapshot()[1] == 2
                 }), true)
-                let saturatedQueue = s5GcmQueueProof(queuePath, expectedDeliveries)
-                @Expect(saturatedQueue.awaiting, 130)
-                @Expect(saturatedQueue.pending, 10)
-                @Expect(saturatedQueue.processing, 0)
-                @Expect(saturatedQueue.processed, 0)
-                @Expect(saturatedQueue.deadLetter, 0)
-                @Expect(saturatedQueue.cancelled, 0)
-                @Expect(saturatedQueue.unique, 140)
-                @Expect(saturatedQueue.attemptOne, 140)
-                @Expect(saturatedQueue.invalid, 0)
+                @Expect(bpFormalCount(queuePath, "awaiting-host"), 2)
+                @Expect(bpFormalCount(queuePath, "pending"), 138)
+                @Expect(bpFormalCount(queuePath, "processing"), 0)
+                @Expect(bpFormalCount(queuePath, "processed"), 0)
+                @Expect(bpFormalCount(queuePath, "dead-letter"), 0)
+                @Expect(bpFormalCount(queuePath, "cancelled"), 0)
+                @Expect(bpFormalOutstandingBytes(queuePath) <= 524288, true)
+                let saturatedIdentities = bpFormalIdentityProof(queuePath, expectedDeliveries)
+                @Expect(saturatedIdentities[0], 140)
+                @Expect(saturatedIdentities[1], 0)
                 let saturatedScheduler = servicePluginDispatchSchedulerSnapshotForTest("gitcode-monitor").getOrThrow()
-                let saturated = getServicePluginSnapshot("gitcode-monitor").getOrThrow()
                 @Expect(saturatedScheduler.active, 2)
-                @Expect(saturatedScheduler.queued, 128)
+                @Expect(saturatedScheduler.queued, 0)
                 @Expect(saturatedScheduler.futures, 2)
-                @Expect(saturatedScheduler.queueHighWatermark, 128)
-                @Expect(saturatedScheduler.queueFull >= 10, true)
-                @Expect(saturated.dispatch.active, 2)
-                @Expect(saturated.dispatch.queued, 128)
-                @Expect(saturated.dispatch.highWater, 128)
-                @Expect(saturated.dispatch.queueFull >= 10, true)
-                @Expect(saturated.dispatch.admissionRetried >= 10, true)
+                @Expect(saturatedScheduler.queueFull, 0)
                 @Expect(gate.snapshot()[1], 2)
                 @Expect(gate.snapshot()[2], 2)
 
@@ -811,7 +798,8 @@ public class GatewayGcmShutdownE2eTest {
                 }
 
                 gate.release()
-                let allRetriesCompleted = s5WaitUntil(60000, { =>
+                // 140 sends at500ms require >=69.5s;100s includes durable/ACK margin.
+                let allRetriesCompleted = s5WaitUntil(100000, { =>
                     let queue = s5GcmQueueProof(queuePath, expectedDeliveries)
                     gate.snapshot()[0] == 140 && queue.pending == 0 && queue.processing == 0 &&
                         queue.awaiting == 0 && queue.processed == 140 && queue.deadLetter == 0 &&
@@ -836,9 +824,9 @@ public class GatewayGcmShutdownE2eTest {
                 let drained = getServicePluginSnapshot("gitcode-monitor").getOrThrow()
                 @Expect(drained.dispatch.active, 0)
                 @Expect(drained.dispatch.queued, 0)
-                @Expect(drained.dispatch.highWater, 128)
-                @Expect(drained.dispatch.queueFull >= 10, true)
-                @Expect(drained.dispatch.admissionRetried >= 10, true)
+                @Expect(drained.dispatch.highWater <= 2, true)
+                @Expect(drained.dispatch.queueFull, 0)
+                @Expect(drained.dispatch.admissionRetried, 0)
                 @Expect(drained.dispatch.completionAck, 140)
                 @Expect(gate.snapshot()[0], 140)
                 @Expect(gate.snapshot()[1], 0)
@@ -1297,6 +1285,371 @@ public class GatewayGcmShutdownE2eTest {
                 Config.logFile = oldLogFile
                 @Expect(Config.logFile, oldLogFile)
             }
+        })
+    }
+}
+
+// Formal cases deliberately use the real native host, broker and rebuilt GCM.
+// All durable payloads are synthetic; the helper never reads a user's queue.
+private func bpFormalRead(path: Path): String {
+    try { String.fromUtf8(File.readFrom(path)) } catch (_: Exception) { "invalid_response_encoding" }
+}
+
+private func bpFormalArtifact(): Path {
+    let root = getVariable("METIS_S5_GCM_ROOT").getOrDefault { "" }.trimAscii()
+    let expectedCommit = getVariable("METIS_BP_GCM_COMMIT").getOrDefault { "" }.trimAscii()
+    let expectedHash = getVariable("METIS_BP_GCM_ARTIFACT_SHA256").getOrDefault { "" }.trimAscii()
+    if (root.isEmpty() || expectedCommit.isEmpty() || expectedHash.isEmpty()) {
+        throw Exception("formal_gcm_artifact_identity_required")
+    }
+    let binary = Path(root).join("target/release/bin/gitcodemonitor")
+    let head = executeWithOutput("git", ["-C", root, "rev-parse", "HEAD"])
+    let hash = executeWithOutput("/usr/bin/shasum", ["-a", "256", binary.toString()])
+    let stamp = executeWithOutput("/usr/bin/stat", ["-f", "%m", binary.toString()])
+    let binaryMtime = try { Int64.parse(String.fromUtf8(stamp[1]).trimAscii()) } catch (_: Exception) { 0 }
+    for (source in ["host_event_flow_control.cj", "host_event_sender.cj", "webhook_config.cj", "core.cj",
+        "webhook_queue.cj", "webhook_processor.cj", "webhook_processor_loop.cj", "plugin_runtime.cj",
+        "plugin_jobs.cj", "webhook_http_server.cj"]) {
+        let sourceStamp = executeWithOutput("/usr/bin/stat", ["-f", "%m", Path(root).join("src").join(source).toString()])
+        let sourceMtime = try { Int64.parse(String.fromUtf8(sourceStamp[1]).trimAscii()) } catch (_: Exception) { 0 }
+        if (sourceStamp[0] != 0 || sourceMtime <= 0 || binaryMtime < sourceMtime) {
+            throw Exception("formal_gcm_artifact_older_than_source")
+        }
+    }
+    let headText = try { String.fromUtf8(head[1]).trimAscii() } catch (_: Exception) { "" }
+    let hashText = try { String.fromUtf8(hash[1]).trimAscii() } catch (_: Exception) { "" }
+    if (head[0] != 0 || hash[0] != 0 || stamp[0] != 0 || headText != expectedCommit ||
+        !hashText.startsWith(expectedHash + " ")) {
+        throw Exception("formal_gcm_artifact_identity_mismatch")
+    }
+    binary
+}
+
+// Healthz keeps its existing plain-text body; flow telemetry uses response headers.
+private func bpFormalHealthWindow(port: Int64): (Int64, Int64, Int64) {
+    let builder = ClientBuilder()
+    builder.readTimeout(Duration.second)
+    let client = builder.build()
+    try {
+        let response = client.send(HttpRequestBuilder().url("http://127.0.0.1:${port}/healthz").get().build())
+        let count = Int64.parse(response.headers.getFirst("X-Gcm-Host-Window-Count") ?? "-1")
+        let bytes = Int64.parse(response.headers.getFirst("X-Gcm-Host-Window-Bytes") ?? "-1")
+        let _ = s5ReadBody(response)
+        (Int64(response.status), count, bytes)
+    } catch (_: Exception) {
+        (0, -1, -1)
+    } finally {
+        client.close()
+    }
+}
+
+private func bpFormalSeed(queue: Path, count: Int64): Unit {
+    for (name in ["pending", "processing", "awaiting-host", "processed", "dead-letter", "cancelled", "payload", "host-frame"]) {
+        Directory.create(queue.join(name), recursive: true)
+    }
+    for (index in 0..count) {
+        let id = "bp-formal-${index}"
+        let eventId = "gitcode:synthetic/project:issue:${index}"
+        let payload = JsonObject()
+        for ((key, value) in [("jobId", "webhook-${id}"), ("eventId", eventId), ("deliveryId", id),
+            ("attemptToken", "seed-${index}"), ("repo", "synthetic/project"), ("kind", "issue"),
+            ("number", "${index}"), ("title", "历史中文🙂 ${index}"), ("content", "synthetic bounded event"),
+            ("url", "https://example.invalid/issues/${index}"), ("author", "synthetic-user")]) {
+            payload.put(key, JsonString(value))
+        }
+        let frame = JsonObject()
+        for ((key, value) in [("type", "event"), ("frameId", "seed-${index}"), ("serviceId", "gitcode-monitor"),
+            ("method", "emitCapabilityEvent"), ("capabilityId", "gitcode.event.accepted"), ("correlationId", "seed-${index}")]) {
+            frame.put(key, JsonString(value))
+        }
+        frame.put("payload", payload)
+        let framePath = queue.join("host-frame").join("${id}.jsonl")
+        File.writeTo(framePath, (frame.toJsonString() + "\n").toArray())
+        let metadata = JsonObject()
+        for ((key, value) in [("deliveryId", id), ("endpointId", "main"), ("eventName", "Issue Hook"),
+            ("bodyHash", "synthetic-hash"), ("payloadPath", ""), ("status", "pending"), ("lastError", "host_retry"),
+            ("sourceIpHash", "synthetic-source"), ("processedEventId", ""), ("hostFramePath", framePath.toString()),
+            ("hostEventId", eventId), ("admissionToken", "seed-${index}"), ("admissionState", "retry"), ("admittedSessionId", "")]) {
+            metadata.put(key, JsonString(value))
+        }
+        for (key in ["receivedAtMs", "attempts", "nextAttemptAtMs", "admissionAttempt"]) { metadata.put(key, JsonInt(0)) }
+        File.writeTo(queue.join("pending").join("${id}.json"), metadata.toJsonString().toArray())
+    }
+}
+
+private func bpFormalCount(queue: Path, status: String): Int64 {
+    var count: Int64 = 0
+    let path = queue.join(status)
+    if (!exists(path)) { return 0 }
+    for (entry in Directory.readFrom(path)) { if (entry.isRegular() && entry.name.endsWith(".json")) { count++ } }
+    count
+}
+
+// Conservation check supports both never-sent pending rows and admitted rows.
+private func bpFormalIdentityProof(queue: Path, expected: HashSet<String>): (Int64, Int64) {
+    let seen = HashSet<String>()
+    var invalid: Int64 = 0
+    for (status in ["pending", "processing", "awaiting-host", "processed", "dead-letter", "cancelled"]) {
+        for (entry in Directory.readFrom(queue.join(status))) {
+            if (!entry.isRegular()) { continue }
+            try {
+                let row = JsonValue.fromStr(bpFormalRead(entry.path)).asObject()
+                let id = row.get("deliveryId").getOrThrow().asString().getValue()
+                let storedStatus = row.get("status").getOrThrow().asString().getValue()
+                if (!expected.contains(id) || seen.contains(id) || entry.name != "${id}.json" || storedStatus != status) {
+                    invalid++
+                } else {
+                    seen.add(id)
+                }
+            } catch (_: Exception) { invalid++ }
+        }
+    }
+    (seen.size, invalid)
+}
+
+private func bpFormalOutstandingBytes(queue: Path): Int64 {
+    var bytes: Int64 = 0
+    for (entry in Directory.readFrom(queue.join("awaiting-host"))) {
+        let metadata = JsonValue.fromStr(bpFormalRead(entry.path)).asObject()
+        let path = metadata.get("hostFramePath").getOrThrow().asString().getValue()
+        // The fixture authorizes only its own host-frame directory.
+        if (!path.startsWith(queue.join("host-frame").toString() + "/")) { throw Exception("foreign_frame_path") }
+        bytes += File.readFrom(Path(path)).size
+    }
+    bytes
+}
+
+private class BpFormalEffects {
+    private let lock = Mutex()
+    private let seen = HashSet<String>()
+    private var duplicates: Int64 = 0
+    func record(id: String): Unit {
+        synchronized(this.lock) {
+            if (this.seen.contains(id)) { this.duplicates++ } else { this.seen.add(id) }
+        }
+    }
+    func snapshot(): (Int64, Int64) { synchronized(this.lock) { (this.seen.size, this.duplicates) } }
+}
+
+private func bpFormalInstall(gate: S5GeneratedReplyGate, effects: BpFormalEffects): Unit {
+    setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent =>
+        let rows = ArrayList<ServicePluginDeliveryTarget>()
+        rows.add(ServicePluginDeliveryTarget("telegram", "bp-formal", "synthetic-peer"))
+        rows
+    }))
+    setServicePluginWebhookGeneratedReplyHandlerForTest(Some({ event: ServicePluginAcceptedGitCodeEvent, _target: ServicePluginDeliveryTarget =>
+        gate.enterAndWait()
+        effects.record(event.eventId)
+        ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "bounded 中文🙂")
+    }))
+    setServicePluginEventDeliveryForTest(Some({ _target: ServicePluginDeliveryTarget, _text: String =>
+        ServicePluginEventDeliveryResult(true, "sent")
+    }))
+}
+
+private func bpFormalReset(gate: S5GeneratedReplyGate): Unit {
+    gate.release()
+    setServicePluginBeforeCompletionAckHookForTest(None<(String) -> Bool>)
+    setServicePluginWebhookSubscribersProviderForTest(None<(ServicePluginAcceptedGitCodeEvent) -> ArrayList<ServicePluginDeliveryTarget>>)
+    setServicePluginWebhookGeneratedReplyHandlerForTest(None<(ServicePluginAcceptedGitCodeEvent, ServicePluginDeliveryTarget) -> ServicePluginGeneratedReplyResult>)
+    setServicePluginEventDeliveryForTest(None)
+    resetServicePluginGeneratedReplyStateForTest()
+}
+
+@Test
+public class ServicePluginFlowFormalTest {
+    @TestCase
+    public func bpS3B1E2E01E2E02TenThousandDurableEventsStayBoundedAndHttpSurvives(): Unit {
+        resetServicePluginHostForTest()
+        @Expect(resetManagedStdioBrokerForTest(timeoutMs: 3000).ok, true)
+        var ownedHome = Path("")
+        withServicePluginHostTestHome("s5-bp-ten-thousand", { home: Path =>
+            ownedHome = home
+            let oldLogFile = Config.logFile
+            let gate = S5GeneratedReplyGate()
+            let effects = BpFormalEffects()
+            let queue = home.join("bp-queue")
+            var pid: Int64 = 0
+            var port: Int64 = 0
+            var formallyStopped = false
+            try {
+                let binary = bpFormalArtifact()
+                bpFormalSeed(queue, 10000)
+                @Expect(bpFormalCount(queue, "pending"), 10000)
+                port = s5TemporaryPort()
+                let config = home.join("bp-config.json")
+                s5WriteGcmConfig(config, home.join("bp-state.json"), queue, port, s5TemporaryPort())
+                @Expect(registerServicePlugin(ServicePluginRegistration(s5GcmManifest(binary), configRef: ServicePluginConfigRef(
+                    configPath: config.toString(), workingDirectory: binary.parent.toString()))).ok, true)
+                bpFormalInstall(gate, effects)
+                @Expect(ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 5000).ok, true)
+                pid = getServicePluginSnapshot("gitcode-monitor").getOrThrow().pid
+                @Expect(s5WaitUntil(10000, { => gate.snapshot()[0] == 2 && bpFormalCount(queue, "awaiting-host") == 2 }), true)
+                @Expect(pid > 1, true)
+                for (_ in 0..100) {
+                    let health = bpFormalHealthWindow(port)
+                    @Expect(health[0], 200)
+                    @Expect(health[1], 2)
+                    @Expect(health[2] > 0 && health[2] <= 524288, true)
+                    @Expect(getServicePluginSnapshot("gitcode-monitor").getOrThrow().pid, pid)
+                    @Expect(getServicePluginSnapshot("gitcode-monitor").getOrThrow().lastError.contains("subscriber_capacity_exceeded"), false)
+                    @Expect(getServicePluginSnapshot("gitcode-monitor").getOrThrow().lastError.contains("stdout_protocol_violation"), false)
+                    @Expect(bpFormalCount(queue, "awaiting-host"), 2)
+                    @Expect(bpFormalOutstandingBytes(queue) <= 524288, true)
+                }
+                for (index in 0..100) { @Expect(s5PostWebhook(port, "bp-new-${index}", 20000 + index).status, 202) }
+                sleep(Duration.second * 3)
+                @Expect(gate.snapshot()[0], 2)
+                @Expect(bpFormalCount(queue, "pending"), 10098)
+                @Expect(bpFormalCount(queue, "processing"), 0)
+                @Expect(bpFormalCount(queue, "awaiting-host"), 2)
+                @Expect(bpFormalCount(queue, "dead-letter"), 0)
+                @Expect(bpFormalCount(queue, "processed"), 0)
+                @Expect(effects.snapshot()[0], 0)
+                // Release blocked test business work, then use the real formal stop.
+                gate.release()
+                let stopped = stopServicePlugin("gitcode-monitor", reason: "bp-formal-complete", timeoutMillis: 5000)
+                @Expect(stopped.ok, true)
+                @Expect(stopped.status, "stopped")
+                @Expect(stopped.portStatus, "released")
+                @Expect(stopped.leaseStatus, "stopped")
+                formallyStopped = stopped.ok
+                @Expect(s5PidGone(pid), true)
+                @Expect(s5CanBindPort(port), true)
+                @Expect(managedStdioBroker().snapshot().ownerCount, 0)
+            } finally {
+                bpFormalReset(gate)
+                // Assertions above establish formal truth before any fallback cleanup.
+                if (!formallyStopped) { let _ = stopServicePlugin("gitcode-monitor", reason: "bp-failure-cleanup", timeoutMillis: 5000) }
+                resetServicePluginHostForTest()
+                @Expect(resetManagedStdioBrokerForTest(timeoutMs: 3000).ok, true)
+                gatewayLoggingResetForTest()
+                Config.logFile = oldLogFile
+            }
+        })
+        @Expect(s5RemoveOwnedTempHome(ownedHome), true)
+    }
+
+    @TestCase
+    public func bpS3P1E2E03OneHundredResumeAfterLostCompletionWithoutDuplicateEffects(): Unit {
+        resetServicePluginHostForTest()
+        @Expect(resetManagedStdioBrokerForTest(timeoutMs: 3000).ok, true)
+        var ownedHome = Path("")
+        withServicePluginHostTestHome("s5-bp-receipt-restart", { home: Path =>
+            ownedHome = home
+            let oldLogFile = Config.logFile
+            let gate = S5GeneratedReplyGate()
+            let effects = BpFormalEffects()
+            let queue = home.join("bp-queue")
+            var formallyStopped = false
+            var pid: Int64 = 0
+            var port: Int64 = 0
+            try {
+                let binary = bpFormalArtifact()
+                bpFormalSeed(queue, 100)
+                port = s5TemporaryPort()
+                let config = home.join("bp-config.json")
+                s5WriteGcmConfig(config, home.join("bp-state.json"), queue, port, s5TemporaryPort())
+                @Expect(registerServicePlugin(ServicePluginRegistration(s5GcmManifest(binary), configRef: ServicePluginConfigRef(
+                    configPath: config.toString(), workingDirectory: binary.parent.toString()))).ok, true)
+                bpFormalInstall(gate, effects)
+                gate.release()
+                setServicePluginBeforeCompletionAckHookForTest(Some({ _frameId: String => false }))
+                @Expect(ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 5000).ok, true)
+                pid = getServicePluginSnapshot("gitcode-monitor").getOrThrow().pid
+                @Expect(s5WaitUntil(10000, { => effects.snapshot()[0] == 2 }), true)
+                sleep(Duration.second * 2)
+                @Expect(effects.snapshot()[0], 2)
+                @Expect(bpFormalCount(queue, "processed"), 0)
+                @Expect(bpFormalCount(queue, "awaiting-host"), 2)
+                let firstStop = stopServicePlugin("gitcode-monitor", reason: "bp-lost-completion-restart", timeoutMillis: 5000)
+                @Expect(firstStop.ok, true)
+                @Expect(s5PidGone(pid), true)
+                @Expect(s5CanBindPort(port), true)
+                // Preserve disk receipts while reconstructing host/GCM in-memory generations.
+                resetServicePluginHostForTest()
+                @Expect(resetManagedStdioBrokerForTest(timeoutMs: 3000).ok, true)
+                @Expect(registerServicePlugin(ServicePluginRegistration(s5GcmManifest(binary), configRef: ServicePluginConfigRef(
+                    configPath: config.toString(), workingDirectory: binary.parent.toString()))).ok, true)
+                bpFormalInstall(gate, effects)
+                setServicePluginBeforeCompletionAckHookForTest(None<(String) -> Bool>)
+                @Expect(ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 5000).ok, true)
+                let newPid = getServicePluginSnapshot("gitcode-monitor").getOrThrow().pid
+                @Expect(newPid > 1 && newPid != pid, true)
+                pid = newPid
+                // 100 messages require >=49.5s at the production500ms spacing.
+                // 90s includes process startup, receipt reconciliation and disk IO margin.
+                @Expect(s5WaitUntil(90000, { => bpFormalCount(queue, "processed") == 100 }), true)
+                @Expect(effects.snapshot()[0], 100)
+                @Expect(effects.snapshot()[1], 0)
+                @Expect(bpFormalCount(queue, "pending"), 0)
+                @Expect(bpFormalCount(queue, "awaiting-host"), 0)
+                @Expect(bpFormalCount(queue, "processing"), 0)
+                @Expect(bpFormalCount(queue, "dead-letter"), 0)
+                @Expect(s5Get("http://127.0.0.1:${port}/healthz").status, 200)
+                let stopped = stopServicePlugin("gitcode-monitor", reason: "bp-restart-drained", timeoutMillis: 5000)
+                @Expect(stopped.ok, true)
+                @Expect(stopped.portStatus, "released")
+                formallyStopped = stopped.ok
+                @Expect(s5PidGone(pid), true)
+                @Expect(s5CanBindPort(port), true)
+                @Expect(managedStdioBroker().snapshot().ownerCount, 0)
+            } finally {
+                bpFormalReset(gate)
+                if (!formallyStopped) { let _ = stopServicePlugin("gitcode-monitor", reason: "bp-failure-cleanup", timeoutMillis: 5000) }
+                resetServicePluginHostForTest()
+                @Expect(resetManagedStdioBrokerForTest(timeoutMs: 3000).ok, true)
+                gatewayLoggingResetForTest()
+                Config.logFile = oldLogFile
+            }
+        })
+        @Expect(s5RemoveOwnedTempHome(ownedHome), true)
+    }
+}
+
+@Test
+public class ServicePluginFlowArchitectureTest {
+    @TestCase
+    public func bpArch01AcceptedProducersUseSenderAndBrokerRemainsNeutral(): Unit {
+        let root = Path(getVariable("METIS_S5_GCM_ROOT").getOrDefault { "" })
+        let sender = bpFormalRead(root.join("src/host_event_sender.cj"))
+        let jobs = bpFormalRead(root.join("src/plugin_jobs.cj"))
+        let processor = bpFormalRead(root.join("src/webhook_processor.cj"))
+        let runtime = bpFormalRead(root.join("src/plugin_runtime.cj"))
+        @Expect(sender.contains("class GcmHostEventSender"), true)
+        @Expect(processor.contains("writer.ensureHostSender"), true)
+        @Expect(processor.contains("resumePending"), true)
+        @Expect(processor.contains("stageAndTrySend"), true)
+        @Expect(jobs.contains("sharedHostSender"), true)
+        @Expect(jobs.contains("writer.writeFrame(gcmAcceptedScanEventFrame"), false)
+        @Expect(processor.contains("writer.writeFrame(retryFrame)"), false)
+        @Expect(processor.contains("writer.writeFrame(acceptedFrame)"), false)
+        @Expect(runtime.contains("import metis."), false)
+        @Expect(jobs.contains("import metis."), false)
+        let metisRoot = Path(managedStdioResolveBrokerScriptPath()).parent.parent
+        let broker = bpFormalRead(metisRoot.join("src/process/managed_stdio_broker.cj"))
+        @Expect(broker.contains("gitcode.event.accepted"), false)
+        @Expect(broker.contains("GcmHostEventSender"), false)
+    }
+
+    @TestCase
+    public func bpArch03FormalFixturesAuthorizeTemporaryQueueAndRandomPortsOnly(): Unit {
+        withServicePluginHostTestHome("s5-bp-path-audit", { home: Path =>
+            @Expect(home.toString().startsWith("/tmp/metis-service-plugin-s5-bp-"), true)
+            let queue = home.join("bp-path-audit")
+            bpFormalSeed(queue, 3)
+            @Expect(bpFormalCount(queue, "pending"), 3)
+            for (entry in Directory.readFrom(queue.join("pending"))) {
+                let metadata = JsonValue.fromStr(bpFormalRead(entry.path)).asObject()
+                let framePath = metadata.get("hostFramePath").getOrThrow().asString().getValue()
+                @Expect(framePath.startsWith(queue.join("host-frame").toString() + "/"), true)
+                let frame = JsonValue.fromStr(bpFormalRead(Path(framePath))).asObject()
+                @Expect(frame.get("serviceId").getOrThrow().asString().getValue(), "gitcode-monitor")
+                let payload = frame.get("payload").getOrThrow().asObject()
+                @Expect(payload.get("url").getOrThrow().asString().getValue().startsWith("https://example.invalid/"), true)
+            }
+            let port = s5TemporaryPort()
+            @Expect(port > 0 && port != 18080 && port != 18788 && port != 60271, true)
         })
     }
 }
