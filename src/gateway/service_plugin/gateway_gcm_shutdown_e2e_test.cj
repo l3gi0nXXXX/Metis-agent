@@ -1469,6 +1469,7 @@ public class ServicePluginFlowFormalTest {
     @TestCase
     public func bpS3B1E2E01E2E02TenThousandDurableEventsStayBoundedAndHttpSurvives(): Unit {
         resetServicePluginHostForTest()
+        resetServicePluginGeneratedReplyStateForTest()
         @Expect(resetManagedStdioBrokerForTest(timeoutMs: 3000).ok, true)
         let ownedHomes = ArrayList<Path>()
         withServicePluginHostTestHome("s5-bp-ten-thousand", { home: Path =>
@@ -1494,8 +1495,10 @@ public class ServicePluginFlowFormalTest {
                 pid = getServicePluginSnapshot("gitcode-monitor").getOrThrow().pid
                 @Expect(s5WaitUntil(10000, { => gate.snapshot()[0] == 2 && bpFormalCount(queue, "awaiting-host") == 2 }), true)
                 @Expect(pid > 1, true)
+                var healthyRequests: Int64 = 0
                 for (_ in 0..100) {
                     let health = bpFormalHealthWindow(port)
+                    if (health[0] == 200) { healthyRequests++ }
                     @Expect(health[0], 200)
                     @Expect(health[1], 2)
                     @Expect(health[2] > 0 && health[2] <= 524288, true)
@@ -1505,7 +1508,12 @@ public class ServicePluginFlowFormalTest {
                     @Expect(bpFormalCount(queue, "awaiting-host"), 2)
                     @Expect(bpFormalOutstandingBytes(queue) <= 524288, true)
                 }
-                for (index in 0..100) { @Expect(s5PostWebhook(port, "bp-new-${index}", 20000 + index).status, 202) }
+                var acceptedWebhooks: Int64 = 0
+                for (index in 0..100) {
+                    let posted = s5PostWebhook(port, "bp-new-${index}", 20000 + index)
+                    if (posted.status == 202) { acceptedWebhooks++ }
+                    @Expect(posted.status, 202)
+                }
                 sleep(Duration.second * 3)
                 @Expect(gate.snapshot()[0], 2)
                 @Expect(bpFormalCount(queue, "pending"), 10098)
@@ -1514,6 +1522,9 @@ public class ServicePluginFlowFormalTest {
                 @Expect(bpFormalCount(queue, "dead-letter"), 0)
                 @Expect(bpFormalCount(queue, "processed"), 0)
                 @Expect(effects.snapshot()[0], 0)
+                let fullWindow = bpFormalHealthWindow(port)
+                let currentPid = getServicePluginSnapshot("gitcode-monitor").getOrThrow().pid
+                println("BP_NATIVE_WINDOW seeded=10000 healthz200=${healthyRequests} webhook202=${acceptedWebhooks} count=${fullWindow[1]} bytes=${fullWindow[2]} pending=${bpFormalCount(queue, "pending")} awaiting=${bpFormalCount(queue, "awaiting-host")} pid=${pid} pidStable=${currentPid == pid} effects=${effects.snapshot()[0]}")
                 // Release blocked test business work, then use the real formal stop.
                 gate.release()
                 let stopped = stopServicePlugin("gitcode-monitor", reason: "bp-formal-complete", timeoutMillis: 5000)
@@ -1522,9 +1533,13 @@ public class ServicePluginFlowFormalTest {
                 @Expect(stopped.portStatus, "released")
                 @Expect(stopped.leaseStatus, "stopped")
                 formallyStopped = stopped.ok
-                @Expect(s5PidGone(pid), true)
-                @Expect(s5CanBindPort(port), true)
-                @Expect(managedStdioBroker().snapshot().ownerCount, 0)
+                let pidGone = s5PidGone(pid)
+                let portReleased = s5CanBindPort(port)
+                let remainingOwners = managedStdioBroker().snapshot().ownerCount
+                println("BP_NATIVE_FORMAL_STOP ok=${stopped.ok} status=${stopped.status} port=${stopped.portStatus} lease=${stopped.leaseStatus} pidGone=${pidGone} portReleased=${portReleased} owners=${remainingOwners}")
+                @Expect(pidGone, true)
+                @Expect(portReleased, true)
+                @Expect(remainingOwners, 0)
             } finally {
                 bpFormalReset(gate)
                 // Assertions above establish formal truth before any fallback cleanup.
@@ -1541,6 +1556,7 @@ public class ServicePluginFlowFormalTest {
     @TestCase
     public func bpS3P1E2E03OneHundredResumeAfterLostCompletionWithoutDuplicateEffects(): Unit {
         resetServicePluginHostForTest()
+        resetServicePluginGeneratedReplyStateForTest()
         @Expect(resetManagedStdioBrokerForTest(timeoutMs: 3000).ok, true)
         let ownedHomes = ArrayList<Path>()
         withServicePluginHostTestHome("s5-bp-receipt-restart", { home: Path =>
@@ -1576,8 +1592,19 @@ public class ServicePluginFlowFormalTest {
                 @Expect(firstStop.ok, true)
                 @Expect(s5PidGone(pid), true)
                 @Expect(s5CanBindPort(port), true)
-                // Preserve disk receipts while reconstructing host/GCM in-memory generations.
+                // Preserve the external effect witness and disk receipts, but erase all
+                // process-local dedupe so durable receipts alone prevent replay effects.
                 resetServicePluginHostForTest()
+                resetServicePluginGeneratedReplyStateForTest()
+                let dedupeAfterRestart = servicePluginEventDedupeSizesForTest()
+                @Expect(dedupeAfterRestart[0], 0)
+                @Expect(dedupeAfterRestart[1], 0)
+                @Expect(dedupeAfterRestart[2], 0)
+                @Expect(dedupeAfterRestart[3], 0)
+                @Expect(bpFormalCompletedReceiptCount(queue), 2)
+                @Expect(effects.snapshot()[0], 2)
+                @Expect(effects.snapshot()[1], 0)
+                println("BP_NATIVE_RESTART_ISOLATION dedupe=${dedupeAfterRestart[0]},${dedupeAfterRestart[1]},${dedupeAfterRestart[2]},${dedupeAfterRestart[3]} completedReceipts=${bpFormalCompletedReceiptCount(queue)} effects=${effects.snapshot()[0]} duplicates=${effects.snapshot()[1]}")
                 @Expect(resetManagedStdioBrokerForTest(timeoutMs: 3000).ok, true)
                 @Expect(registerServicePlugin(ServicePluginRegistration(s5GcmManifest(binary), configRef: ServicePluginConfigRef(
                     configPath: config.toString(), workingDirectory: binary.parent.toString()))).ok, true)
@@ -1606,13 +1633,21 @@ public class ServicePluginFlowFormalTest {
                 @Expect(bpFormalCount(queue, "processing"), 0)
                 @Expect(bpFormalCount(queue, "dead-letter"), 0)
                 @Expect(s5Get("http://127.0.0.1:${port}/healthz").status, 200)
+                let drainedWindow = bpFormalHealthWindow(port)
+                let currentPid = getServicePluginSnapshot("gitcode-monitor").getOrThrow().pid
+                @Expect(currentPid, pid)
+                println("BP_NATIVE_RECOVERY processed=${bpFormalCount(queue, "processed")} effects=${effects.snapshot()[0]} duplicates=${effects.snapshot()[1]} count=${drainedWindow[1]} bytes=${drainedWindow[2]} pid=${pid} pidStable=${currentPid == pid} boundsViolated=${boundsViolated.load()}")
                 let stopped = stopServicePlugin("gitcode-monitor", reason: "bp-restart-drained", timeoutMillis: 5000)
                 @Expect(stopped.ok, true)
                 @Expect(stopped.portStatus, "released")
                 formallyStopped = stopped.ok
-                @Expect(s5PidGone(pid), true)
-                @Expect(s5CanBindPort(port), true)
-                @Expect(managedStdioBroker().snapshot().ownerCount, 0)
+                let pidGone = s5PidGone(pid)
+                let portReleased = s5CanBindPort(port)
+                let remainingOwners = managedStdioBroker().snapshot().ownerCount
+                println("BP_NATIVE_FORMAL_STOP ok=${stopped.ok} status=${stopped.status} port=${stopped.portStatus} lease=${stopped.leaseStatus} pidGone=${pidGone} portReleased=${portReleased} owners=${remainingOwners}")
+                @Expect(pidGone, true)
+                @Expect(portReleased, true)
+                @Expect(remainingOwners, 0)
             } finally {
                 bpFormalReset(gate)
                 if (!formallyStopped) { let _ = stopServicePlugin("gitcode-monitor", reason: "bp-failure-cleanup", timeoutMillis: 5000) }
@@ -1670,5 +1705,150 @@ public class ServicePluginFlowArchitectureTest {
             let port = s5TemporaryPort()
             @Expect(port > 0 && port != 18080 && port != 18788 && port != 60271, true)
         })
+    }
+}
+
+@Test
+public class ServicePluginFlowUnexpectedExitTest {
+    @TestCase
+    public func bpS3N1NativeFullWindowUnexpectedExitRecoversWithoutRepeatedEffects(): Unit {
+        resetServicePluginHostForTest()
+        resetServicePluginGeneratedReplyStateForTest()
+        @Expect(resetManagedStdioBrokerForTest(timeoutMs: 3000).ok, true)
+        let ownedHomes = ArrayList<Path>()
+        withServicePluginHostTestHome("s5-bp-native-unexpected-exit", { home: Path =>
+            ownedHomes.add(home)
+            let oldLogFile = Config.logFile
+            let gate = S5GeneratedReplyGate()
+            let effects = BpFormalEffects()
+            let queue = home.join("bp-queue")
+            var formallyStopped = false
+            var pid: Int64 = 0
+            var port: Int64 = 0
+            try {
+                let binary = bpFormalArtifact()
+                bpFormalSeed(queue, 6)
+                port = s5TemporaryPort()
+                let stablePort = port
+                let config = home.join("bp-config.json")
+                s5WriteGcmConfig(config, home.join("bp-state.json"), queue, port, s5TemporaryPort())
+                @Expect(registerServicePlugin(ServicePluginRegistration(s5GcmManifest(binary), configRef: ServicePluginConfigRef(
+                    configPath: config.toString(), workingDirectory: binary.parent.toString()))).ok, true)
+                setServicePluginSupervisorAutoStartForTest(false)
+                bpFormalInstall(gate, effects)
+                gate.release()
+                setServicePluginBeforeCompletionAckHookForTest(Some({ _frameId: String => false }))
+                @Expect(ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 5000).ok, true)
+                let initial = getServicePluginSnapshot("gitcode-monitor").getOrThrow()
+                pid = initial.pid
+                let capturedPid = pid
+                let lease = home.join("service-plugin/runtime/gitcode-monitor").join("${initial.instanceId}.lease.json")
+                @Expect(s5WaitUntil(10000, { => effects.snapshot()[0] == 2 && bpFormalCount(queue, "awaiting-host") == 2 &&
+                    bpFormalCompletedReceiptCount(queue) == 2 &&
+                    servicePluginDispatchSchedulerSnapshotForTest("gitcode-monitor").getOrThrow().settled }), true)
+                let fullWindow = bpFormalHealthWindow(port)
+                @Expect(fullWindow[0], 200)
+                @Expect(fullWindow[1], 2)
+                @Expect(fullWindow[2] > 0 && fullWindow[2] <= 524288, true)
+                @Expect(bpFormalCount(queue, "pending"), 4)
+                @Expect(bpFormalCount(queue, "processed"), 0)
+                @Expect(effects.snapshot()[1], 0)
+                // Ownership is checked immediately before signalling only this native child.
+                let owned = capturedPid > 1 && getServicePluginSnapshot("gitcode-monitor").getOrThrow().pid == capturedPid &&
+                    s5LeaseInt(lease, "pid") == capturedPid && s5LeaseInt(lease, "port") == port &&
+                    s5LeaseString(lease, "state") == "running"
+                @Expect(owned, true)
+                if (!owned) { return }
+                println("BP_NATIVE_CRASH_BEFORE count=${fullWindow[1]} bytes=${fullWindow[2]} pending=${bpFormalCount(queue, "pending")} awaiting=${bpFormalCount(queue, "awaiting-host")} receipts=${bpFormalCompletedReceiptCount(queue)} effects=${effects.snapshot()[0]} duplicates=${effects.snapshot()[1]} pid=${capturedPid}")
+                let killExit = executeWithOutput("kill", ["-KILL", "${capturedPid}"])[0]
+                @Expect(killExit, 0)
+                if (killExit != 0) { return }
+                let childGone = s5WaitUntil(5000, { => s5PidGone(capturedPid) && s5CanBindPort(stablePort) })
+                @Expect(childGone, true)
+                if (!childGone) { return }
+                // Let EOF ownership handling publish its actual state. Never race a
+                // manual stop/reset against a still-running event-pump cleanup.
+                let detachedPublished = s5WaitUntil(5000, { =>
+                    let row = getServicePluginSnapshot("gitcode-monitor").getOrThrow()
+                    managedStdioBroker().snapshot().ownerCount == 0 &&
+                        servicePluginActiveIdentityForTest("gitcode-monitor").isNone() &&
+                        row.status != "running" &&
+                        (row.status == "cleanup_pending" || s5LeaseString(lease, "state") == "stopped")
+                })
+                let afterExit = getServicePluginSnapshot("gitcode-monitor").getOrThrow()
+                println("BP_NATIVE_CRASH_OWNER_TERMINAL published=${detachedPublished} status=${afterExit.status} reason=${afterExit.degradedReason} leaseState=${s5LeaseString(lease, "state")} leasePidMatches=${s5LeaseInt(lease, "pid") == capturedPid} pidGone=${s5PidGone(capturedPid)} portReleased=${s5CanBindPort(port)} owners=${managedStdioBroker().snapshot().ownerCount} pendingCleanup=${servicePluginCleanupPendingCountForTest()}")
+                @Expect(detachedPublished, true)
+                if (!detachedPublished) { return }
+                @Expect(s5LeaseInt(lease, "pid"), capturedPid)
+                @Expect(s5LeaseString(lease, "sessionId"), initial.instanceId)
+                let crashCleanup = stopServicePlugin("gitcode-monitor", reason: "bp-owned-unexpected-exit", timeoutMillis: 5000)
+                println("BP_NATIVE_CRASH_FORMAL_CLEANUP ok=${crashCleanup.ok} status=${crashCleanup.status} port=${crashCleanup.portStatus} lease=${crashCleanup.leaseStatus} pidGone=${s5PidGone(capturedPid)} portReleased=${s5CanBindPort(port)} owners=${managedStdioBroker().snapshot().ownerCount}")
+                // Record formal truth before reset/fallback. A stale lease must fail here.
+                let cleanupTruth = crashCleanup.ok && crashCleanup.status == "stopped" &&
+                    s5PidGone(capturedPid) && s5CanBindPort(port) &&
+                    managedStdioBroker().snapshot().ownerCount == 0 && servicePluginCleanupPendingCountForTest() == 0 &&
+                    s5LeaseString(lease, "state") == "stopped"
+                @Expect(cleanupTruth, true)
+                if (!cleanupTruth) { return }
+                resetServicePluginHostForTest()
+                resetServicePluginGeneratedReplyStateForTest()
+                let dedupe = servicePluginEventDedupeSizesForTest()
+                @Expect(dedupe[0], 0)
+                @Expect(dedupe[1], 0)
+                @Expect(dedupe[2], 0)
+                @Expect(dedupe[3], 0)
+                @Expect(bpFormalCompletedReceiptCount(queue), 2)
+                @Expect(effects.snapshot()[0], 2)
+                @Expect(resetManagedStdioBrokerForTest(timeoutMs: 3000).ok, true)
+                @Expect(registerServicePlugin(ServicePluginRegistration(s5GcmManifest(binary), configRef: ServicePluginConfigRef(
+                    configPath: config.toString(), workingDirectory: binary.parent.toString()))).ok, true)
+                setServicePluginSupervisorAutoStartForTest(false)
+                bpFormalInstall(gate, effects)
+                setServicePluginBeforeCompletionAckHookForTest(None<(String) -> Bool>)
+                @Expect(ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 5000).ok, true)
+                pid = getServicePluginSnapshot("gitcode-monitor").getOrThrow().pid
+                @Expect(pid > 1 && pid != capturedPid, true)
+                let boundsViolated = AtomicBool(false)
+                // Six sends need >=2.5s;15s includes startup/receipt/disk margins.
+                @Expect(s5WaitUntil(15000, { =>
+                    let health = bpFormalHealthWindow(stablePort)
+                    if (health[0] == 200 && (health[1] < 0 || health[1] > 2 || health[2] < 0 || health[2] > 524288)) {
+                        boundsViolated.store(true)
+                    }
+                    bpFormalCount(queue, "processed") == 6
+                }), true)
+                @Expect(boundsViolated.load(), false)
+                @Expect(effects.snapshot()[0], 6)
+                @Expect(effects.snapshot()[1], 0)
+                @Expect(bpFormalCount(queue, "pending"), 0)
+                @Expect(bpFormalCount(queue, "processing"), 0)
+                @Expect(bpFormalCount(queue, "awaiting-host"), 0)
+                @Expect(bpFormalCount(queue, "dead-letter"), 0)
+                let drained = bpFormalHealthWindow(port)
+                println("BP_NATIVE_CRASH_RECOVERED processed=${bpFormalCount(queue, "processed")} effects=${effects.snapshot()[0]} duplicates=${effects.snapshot()[1]} count=${drained[1]} bytes=${drained[2]} boundsViolated=${boundsViolated.load()}")
+                let stopped = stopServicePlugin("gitcode-monitor", reason: "bp-unexpected-exit-recovered", timeoutMillis: 5000)
+                @Expect(stopped.ok, true)
+                @Expect(stopped.status, "stopped")
+                @Expect(stopped.portStatus, "released")
+                @Expect(stopped.leaseStatus, "stopped")
+                let pidGone = s5PidGone(pid)
+                let portReleased = s5CanBindPort(port)
+                let owners = managedStdioBroker().snapshot().ownerCount
+                println("BP_NATIVE_CRASH_FINAL_STOP ok=${stopped.ok} status=${stopped.status} pidGone=${pidGone} portReleased=${portReleased} owners=${owners}")
+                let finalTruth = stopped.ok && stopped.status == "stopped" && stopped.portStatus == "released" &&
+                    stopped.leaseStatus == "stopped" && pidGone && portReleased && owners == 0
+                @Expect(finalTruth, true)
+                formallyStopped = finalTruth
+                if (!finalTruth) { return }
+            } finally {
+                bpFormalReset(gate)
+                if (!formallyStopped) { let _ = stopServicePlugin("gitcode-monitor", reason: "bp-unexpected-exit-fallback", timeoutMillis: 5000) }
+                resetServicePluginHostForTest()
+                @Expect(resetManagedStdioBrokerForTest(timeoutMs: 3000).ok, true)
+                gatewayLoggingResetForTest()
+                Config.logFile = oldLogFile
+            }
+        })
+        @Expect(s5RemoveOwnedTempHome(ownedHomes[0]), true)
     }
 }
