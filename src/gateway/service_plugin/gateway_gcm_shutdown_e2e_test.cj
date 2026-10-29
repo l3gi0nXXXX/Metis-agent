@@ -1790,7 +1790,8 @@ public class ServicePluginFlowUnexpectedExitTest {
                     s5LeaseString(lease, "state") == "stopped"
                 @Expect(cleanupTruth, true)
                 if (!cleanupTruth) { return }
-                resetServicePluginHostForTest()
+                // Keep the real host registry/broker so the next instance receives
+                // a new session; only dispatcher memory dedupe is erased.
                 resetServicePluginGeneratedReplyStateForTest()
                 let dedupe = servicePluginEventDedupeSizesForTest()
                 @Expect(dedupe[0], 0)
@@ -1799,15 +1800,14 @@ public class ServicePluginFlowUnexpectedExitTest {
                 @Expect(dedupe[3], 0)
                 @Expect(bpFormalCompletedReceiptCount(queue), 2)
                 @Expect(effects.snapshot()[0], 2)
-                @Expect(resetManagedStdioBrokerForTest(timeoutMs: 3000).ok, true)
-                @Expect(registerServicePlugin(ServicePluginRegistration(s5GcmManifest(binary), configRef: ServicePluginConfigRef(
-                    configPath: config.toString(), workingDirectory: binary.parent.toString()))).ok, true)
-                setServicePluginSupervisorAutoStartForTest(false)
                 bpFormalInstall(gate, effects)
                 setServicePluginBeforeCompletionAckHookForTest(None<(String) -> Bool>)
                 @Expect(ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 5000).ok, true)
-                pid = getServicePluginSnapshot("gitcode-monitor").getOrThrow().pid
+                let replacement = getServicePluginSnapshot("gitcode-monitor").getOrThrow()
+                pid = replacement.pid
                 @Expect(pid > 1 && pid != capturedPid, true)
+                @Expect(replacement.instanceId != initial.instanceId, true)
+                @Expect(s5LeaseString(lease, "state"), "stopped")
                 let boundsViolated = AtomicBool(false)
                 // Six sends need >=2.5s;15s includes startup/receipt/disk margins.
                 @Expect(s5WaitUntil(15000, { =>
