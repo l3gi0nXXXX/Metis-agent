@@ -1419,6 +1419,17 @@ private func bpFormalOutstandingBytes(queue: Path): Int64 {
     bytes
 }
 
+private func bpFormalCompletedReceiptCount(queue: Path): Int64 {
+    var count: Int64 = 0
+    for (entry in Directory.readFrom(queue.join("awaiting-host"))) {
+        let row = JsonValue.fromStr(bpFormalRead(entry.path)).asObject()
+        let id = row.get("deliveryId").getOrThrow().asString().getValue()
+        let eventId = row.get("hostEventId").getOrThrow().asString().getValue()
+        if (servicePluginWebhookReceiptStore().state("gitcode-monitor", id, eventId) == "completed_unconfirmed") { count++ }
+    }
+    count
+}
+
 private class BpFormalEffects {
     private let lock = Mutex()
     private let seen = HashSet<String>()
@@ -1562,6 +1573,8 @@ public class ServicePluginFlowFormalTest {
                 @Expect(effects.snapshot()[0], 2)
                 @Expect(bpFormalCount(queue, "processed"), 0)
                 @Expect(bpFormalCount(queue, "awaiting-host"), 2)
+                @Expect(s5WaitUntil(5000, { => bpFormalCompletedReceiptCount(queue) == 2 &&
+                    servicePluginDispatchSchedulerSnapshotForTest("gitcode-monitor").getOrThrow().settled }), true)
                 let firstStop = stopServicePlugin("gitcode-monitor", reason: "bp-lost-completion-restart", timeoutMillis: 5000)
                 @Expect(firstStop.ok, true)
                 @Expect(s5PidGone(pid), true)
@@ -1579,7 +1592,15 @@ public class ServicePluginFlowFormalTest {
                 pid = newPid
                 // 100 messages require >=49.5s at the production500ms spacing.
                 // 90s includes process startup, receipt reconciliation and disk IO margin.
-                @Expect(s5WaitUntil(90000, { => bpFormalCount(queue, "processed") == 100 }), true)
+                let boundsViolated = AtomicBool(false)
+                @Expect(s5WaitUntil(90000, { =>
+                    let health = bpFormalHealthWindow(port)
+                    if (health[0] == 200 && (health[1] < 0 || health[1] > 2 || health[2] < 0 || health[2] > 524288)) {
+                        boundsViolated.store(true)
+                    }
+                    bpFormalCount(queue, "processed") == 100
+                }), true)
+                @Expect(boundsViolated.load(), false)
                 @Expect(effects.snapshot()[0], 100)
                 @Expect(effects.snapshot()[1], 0)
                 @Expect(bpFormalCount(queue, "pending"), 0)
