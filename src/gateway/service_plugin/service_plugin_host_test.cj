@@ -1389,6 +1389,127 @@ public class ServicePluginHostTest {
         port
     }
 
+    private func r3StopPendingHandoff(expireDeadline: Bool, blockDispatch: Bool): Unit {
+        withIsolatedServicePluginHostTestHome("r3-stop-late-pending-${expireDeadline}-${blockDispatch}", { home: Path =>
+            let counter = home.join("launch-count")
+            let release = home.join("exit.release")
+            let waitForExit = "while [[ ! -f '${release.toString()}' ]]; do /bin/sleep 0.01; done"
+            let event = this.gitCodeAcceptedEventLine(eventId: "gitcode:Cangjie/community:issue:r3-owned-dispatch")
+            let beforeExit = if (blockDispatch) { "printf '%s\\n' '${event}'; ${waitForExit}" } else { waitForExit }
+            this.registerGitCodeStdioScript(this.gitCodeCountingLeaseScript(counter,
+                this.r2UnusedListenerPort(), keepAlive: false).replace("exit 0", beforeExit))
+            setServicePluginSupervisorAutoStartForTest(false)
+            let stopClaim = ServicePluginTestGate()
+            let dispatchGate = ServicePluginTestGate()
+            let settled = ServicePluginTestGate()
+            let deliveries = ServicePluginTestCounter()
+            let expireClock = ServicePluginTestCounter()
+            let firstFinalize = ServicePluginTestOnce()
+            var stopper = None<Future<ServiceStopResult>>
+            setServicePluginBeforeStopClaimHookForTest(Some({ _sid: String => stopClaim.enterAndWait() }))
+            setServicePluginCleanupFinalizeHookForTest(Some({ _sid: String, _token: Int64 =>
+                if (firstFinalize.take()) { sleep(Duration.millisecond * 5) }
+            }))
+            if (blockDispatch) {
+                setServicePluginBeforeEventDispatchHookForTest(Some({ _sid: String => dispatchGate.enterAndWait() }))
+                setServicePluginDispatchWorkerSettledHookForTest(Some({ _frame: String => settled.signal() }))
+                setServicePluginWebhookSubscribersProviderForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent =>
+                    let targets = ArrayList<ServicePluginDeliveryTarget>()
+                    targets.add(ServicePluginDeliveryTarget("telegram", "fake", "fake-peer"))
+                    targets
+                }))
+                setServicePluginWebhookGeneratedReplyHandlerForTest(Some({ _event: ServicePluginAcceptedGitCodeEvent, _target: ServicePluginDeliveryTarget =>
+                    ServicePluginGeneratedReplyResult(true, status: "draft_generated", draft: "must stay fenced")
+                }))
+                setServicePluginEventDeliveryForTest(Some({ _target: ServicePluginDeliveryTarget, _text: String =>
+                    deliveries.increment()
+                    ServicePluginEventDeliveryResult(true, "sent")
+                }))
+            }
+            try {
+                @Expect(ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 1000).ok, true)
+                @Expect(this.waitForGitCodeLease(home), true)
+                if (blockDispatch) { @Expect(dispatchGate.awaitEntered(2000), true) }
+                let before = getServicePluginSnapshot("gitcode-monitor").getOrThrow()
+                stopper = Some(spawn { stopServicePlugin("gitcode-monitor", reason: "r3-late-pending", timeoutMillis: 3000) })
+                @Expect(stopClaim.awaitEntered(1000), true)
+                File.writeTo(release, "release".toArray())
+                @Expect(this.r2WaitPendingReadyIdle(), true)
+                @Expect(servicePluginCleanupPendingCountForTest(), 1)
+                @Expect(getServicePluginSnapshot("gitcode-monitor").getOrThrow().instanceId, before.instanceId)
+                @Expect(this.waitForPidGone(before.pid), true)
+                let leasePath = home.join("service-plugin").join("runtime").join("gitcode-monitor").join("${before.instanceId}.lease.json")
+                @Expect(servicePluginReadHistoricalLeaseStrict(leasePath).evidence.getOrThrow().state, "running")
+                if (expireDeadline) {
+                    let baseline = servicePluginDeadlineNowMs()
+                    let origin = MonoTime.now()
+                    setServicePluginMonotonicNowForTest(Some({ =>
+                        baseline + (MonoTime.now() - origin).toMilliseconds() +
+                            if (expireClock.get() > 0) { Int64(1000000) } else { Int64(0) }
+                    }))
+                    expireClock.increment()
+                }
+                setServicePluginCleanupFinalizeHookForTest(None<(String, Int64) -> Unit>)
+                setServicePluginBeforeStopClaimHookForTest(None<(String) -> Unit>)
+                stopClaim.release()
+                let stopped = stopper.getOrThrow().get(Duration.second * 4)
+                stopper = None<Future<ServiceStopResult>>
+                if (expireDeadline || blockDispatch) {
+                    @Expect(stopped.ok, false)
+                    @Expect(stopped.status, "cleanup_pending")
+                    @Expect(stopped.stateFlushed, false)
+                    @Expect(servicePluginCleanupPendingCountForTest(), 1)
+                    @Expect(getServicePluginSnapshot("gitcode-monitor").getOrThrow().instanceId, before.instanceId)
+                    @Expect(servicePluginReadHistoricalLeaseStrict(leasePath).evidence.getOrThrow().state, "running")
+                    if (blockDispatch) {
+                        let held = servicePluginCleanupDispatchSnapshotForTest("gitcode-monitor").getOrThrow()
+                        @Expect(held.accepted > 0, true)
+                        @Expect(held.futures > 0, true)
+                    }
+                } else {
+                    @Expect(stopped.ok, true)
+                    @Expect(stopped.status, "stopped")
+                    @Expect(stopped.leaseStatus, "stopped")
+                    @Expect(stopped.portStatus, "released")
+                    @Expect(stopped.dispatchStatus, "drained")
+                    @Expect(servicePluginCleanupPendingCountForTest(), 0)
+                }
+                @Expect(managedStdioBroker().snapshot().ownerCount, 0)
+                @Expect(this.readCounterFile(counter), 1)
+            } finally {
+                setServicePluginMonotonicNowForTest(None<() -> Int64>)
+                File.writeTo(release, "release".toArray())
+                stopClaim.release()
+                dispatchGate.release()
+                setServicePluginBeforeStopClaimHookForTest(None<(String) -> Unit>)
+                setServicePluginCleanupFinalizeHookForTest(None<(String, Int64) -> Unit>)
+                match (stopper) { case Some(future) => let _ = future.get(Duration.second * 4) case None => () }
+                if (blockDispatch) { @Expect(settled.awaitEntered(3000), true) }
+                let cleanup = stopServicePlugin("gitcode-monitor", reason: "r3-fixture-complete", timeoutMillis: 2500)
+                @Expect(cleanup.ok, true)
+                @Expect(servicePluginCleanupPendingCountForTest(), 0)
+                @Expect(deliveries.get(), 0)
+                setServicePluginBeforeEventDispatchHookForTest(None<(String) -> Unit>)
+                setServicePluginDispatchWorkerSettledHookForTest(None<(String) -> Unit>)
+                setServicePluginWebhookSubscribersProviderForTest(None<(ServicePluginAcceptedGitCodeEvent) -> ArrayList<ServicePluginDeliveryTarget>>)
+                setServicePluginWebhookGeneratedReplyHandlerForTest(None<(ServicePluginAcceptedGitCodeEvent, ServicePluginDeliveryTarget) -> ServicePluginGeneratedReplyResult>)
+                setServicePluginEventDeliveryForTest(None)
+                resetServicePluginGeneratedReplyStateForTest()
+                resetServicePluginHostForTest()
+                @Expect(managedStdioBroker().snapshot().ownerCount, 0)
+            }
+        })
+    }
+
+    @TestCase
+    public func r3StopJoinsCleanupPublishedAfterLookup(): Unit { this.r3StopPendingHandoff(false, false) }
+
+    @TestCase
+    public func r3StopLateCleanupKeepsOriginalCallerDeadline(): Unit { this.r3StopPendingHandoff(true, false) }
+
+    @TestCase
+    public func r3StopLateCleanupRetainsUnsettledDispatch(): Unit { this.r3StopPendingHandoff(false, true) }
+
     private func r2WaitPendingReadyIdle(): Bool {
         for (_ in 0..1500) {
             if (servicePluginCleanupReadyIdleForTest("gitcode-monitor")) { return true }

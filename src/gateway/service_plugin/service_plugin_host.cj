@@ -713,6 +713,7 @@ private var servicePluginDispatchSettledHookForTest: Option<() -> Unit> = None<(
 private var servicePluginBeforeReaderEndHookForTest: Option<(String, () -> Bool) -> Unit> = None<(String, () -> Bool) -> Unit>
 private var servicePluginAfterOwnerStopHookForTest: Option<(String, Bool, String) -> Unit> = None<(String, Bool, String) -> Unit>
 private var servicePluginCleanupFinalizeHookForTest: Option<(String, Int64) -> Unit> = None<(String, Int64) -> Unit>
+private var servicePluginBeforeStopClaimHookForTest: Option<(String) -> Unit> = None<(String) -> Unit>
 private var servicePluginSupervisorAutoStartForTest = true
 private var servicePluginSupervisorWorkers = HashMap<String, ServicePluginSupervisorStopFlag>()
 private let servicePluginSupervisorLock = Mutex()
@@ -3105,6 +3106,10 @@ public func setServicePluginDispatchSettledHookForTest(probe: Option<() -> Unit>
     servicePluginDispatchSettledHookForTest = probe
 }
 
+func setServicePluginBeforeStopClaimHookForTest(probe: Option<(String) -> Unit>): Unit {
+    servicePluginBeforeStopClaimHookForTest = probe
+}
+
 public func setServicePluginCleanupFinalizeHookForTest(probe: Option<(String, Int64) -> Unit>): Unit {
     servicePluginCleanupFinalizeHookForTest = probe
 }
@@ -3226,6 +3231,7 @@ public func resetServicePluginHostForTest(): Unit {
     servicePluginBeforeReaderEndHookForTest = None<(String, () -> Bool) -> Unit>
     servicePluginAfterOwnerStopHookForTest = None<(String, Bool, String) -> Unit>
     servicePluginCleanupFinalizeHookForTest = None<(String, Int64) -> Unit>
+    servicePluginBeforeStopClaimHookForTest = None<(String) -> Unit>
     servicePluginSupervisorAutoStartForTest = true
     servicePluginSupervisorConfig = ServicePluginSupervisorConfig()
     servicePluginStartPhaseHookForTest = None<(String, String) -> Unit>
@@ -5747,6 +5753,89 @@ public func stopServicePlugin(serviceId: String, reason!: String = "", timeoutMi
     servicePluginStopOwned(serviceId, reason, timeoutMillis, None<ServicePluginRuntimeRecord>, "", None<(String, Int64, Int64)>)
 }
 
+private func servicePluginStopPendingCleanup(sid: String, record: ServicePluginRuntimeRecord,
+    expectedSessionId: String, slot: ServicePluginCleanupPendingSlot, reason: String, deadlineMs: Int64): ServiceStopResult {
+    let sameOwner = synchronized(servicePluginProcessLock) {
+        let current = servicePluginRegistry.get(sid)
+        let pending = servicePluginCleanupPendingOwners.get(slot.ownerId)
+        current.isSome() && refEq(current.getOrThrow(), record) && record.instanceId == expectedSessionId &&
+            slot.expectedSessionId == expectedSessionId && pending.isSome() &&
+            pending.getOrThrow().cleanupToken == slot.cleanupToken && pending.getOrThrow().generation == slot.generation &&
+            pending.getOrThrow().claimToken == slot.claimToken && pending.getOrThrow().serviceId == sid &&
+            !servicePluginActiveProcesses.contains(sid) && !servicePluginStartClaims.contains(sid) &&
+            (match (slot.detached.process) {
+                case Some(process) => servicePluginCleanupOriginMatchesLocked(process) && refEq(process.originatingRecord, record)
+                case None => false
+            })
+    }
+    let remaining = servicePluginDeadlineRemaining(deadlineMs)
+    if (!sameOwner || remaining <= 0) {
+        return ServiceStopResult(false, sid, "cleanup_pending", stateFlushed: false,
+            diagnostic: if (sameOwner) { "cleanup retry exhausted stop deadline" } else { "cleanup owner identity changed" },
+            ingressStopStatus: slot.ingressStopStatus, dispatchStatus: slot.dispatchStatus,
+            ownerStopStatus: slot.ownerStopStatus, leaseStatus: slot.leaseStatus, portStatus: slot.portStatus)
+    }
+    match (slot.detached.process) {
+        case Some(process) =>
+            let finalized = servicePluginFinalizeCleanupPending(sid, process, timeoutMs: remaining)
+            if (finalized.finalized) {
+                let published = synchronized(servicePluginProcessLock) {
+                    match (servicePluginRegistry.get(sid)) {
+                        case Some(current) =>
+                            if (refEq(current, record) && current.instanceId == slot.expectedSessionId &&
+                                !servicePluginActiveProcesses.contains(sid) && !servicePluginStartClaims.contains(sid) &&
+                                !servicePluginHasCleanupPendingLocked(sid) && current.pid == 0) {
+                                current.status = "stopped"
+                                current.degradedReason = reason.trimAscii()
+                                current.stateFlushed = true
+                                true
+                            } else { false }
+                        case None => false
+                    }
+                }
+                if (!published) {
+                    return ServiceStopResult(
+                        false,
+                        sid,
+                        "cleanup_pending",
+                        stateFlushed: false,
+                        diagnostic: "cleanup finalized but service identity changed",
+                        ingressStopStatus: finalized.ingressStopStatus,
+                        dispatchStatus: finalized.dispatchStatus,
+                        ownerStopStatus: finalized.ownerStopStatus,
+                        leaseStatus: finalized.leaseStatus,
+                        portStatus: finalized.portStatus
+                    )
+                }
+                return ServiceStopResult(
+                    true,
+                    sid,
+                    "stopped",
+                    stateFlushed: true,
+                    diagnostic: "${slot.diagnostic} cleanup_retry_stop_status=${finalized.ownerStopStatus} ${finalized.diagnostic} cleanup_finalized",
+                    ingressStopStatus: finalized.ingressStopStatus,
+                    dispatchStatus: finalized.dispatchStatus,
+                    ownerStopStatus: finalized.ownerStopStatus,
+                    leaseStatus: finalized.leaseStatus,
+                    portStatus: finalized.portStatus
+                )
+            }
+        case None => ()
+    }
+    return ServiceStopResult(
+        false,
+        sid,
+        "cleanup_pending",
+        stateFlushed: false,
+        diagnostic: "${slot.diagnostic} ${slot.terminalDiagnostic} cleanup_retry_pending",
+        ingressStopStatus: slot.ingressStopStatus,
+        dispatchStatus: slot.dispatchStatus,
+        ownerStopStatus: slot.ownerStopStatus,
+        leaseStatus: slot.leaseStatus,
+        portStatus: slot.portStatus
+    )
+}
+
 private func servicePluginStopOwned(serviceId: String, reason: String, timeoutMillis: Int64,
     expectedRecord: Option<ServicePluginRuntimeRecord>, expectedInstanceId: String,
     expectedOwner: Option<(String, Int64, Int64)>): ServiceStopResult {
@@ -5775,71 +5864,18 @@ private func servicePluginStopOwned(serviceId: String, reason: String, timeoutMi
                 return ServiceStopResult(false, sid, "degraded", diagnostic: record.degradedReason)
             }
             let effectiveTimeoutMillis = min(timeoutMillis, 30000)
-            let pendingCleanup = synchronized(servicePluginProcessLock) { servicePluginCleanupPendingForServiceLocked(sid) }
-            match (pendingCleanup) {
-                case Some(slot) =>
-                    match (slot.detached.process) {
-                        case Some(process) =>
-                            let finalized = servicePluginFinalizeCleanupPending(sid, process, timeoutMs: effectiveTimeoutMillis)
-                            if (finalized.finalized) {
-                                let published = synchronized(servicePluginProcessLock) {
-                                    match (servicePluginRegistry.get(sid)) {
-                                        case Some(current) =>
-                                            if (refEq(current, record) && current.instanceId == slot.expectedSessionId &&
-                                                !servicePluginActiveProcesses.contains(sid) && !servicePluginStartClaims.contains(sid) &&
-                                                !servicePluginHasCleanupPendingLocked(sid) && current.pid == 0) {
-                                                current.status = "stopped"
-                                                current.degradedReason = reason.trimAscii()
-                                                current.stateFlushed = true
-                                                true
-                                            } else { false }
-                                        case None => false
-                                    }
-                                }
-                                if (!published) {
-                                    return ServiceStopResult(
-                                        false,
-                                        sid,
-                                        "cleanup_pending",
-                                        stateFlushed: false,
-                                        diagnostic: "cleanup finalized but service identity changed",
-                                        ingressStopStatus: finalized.ingressStopStatus,
-                                        dispatchStatus: finalized.dispatchStatus,
-                                        ownerStopStatus: finalized.ownerStopStatus,
-                                        leaseStatus: finalized.leaseStatus,
-                                        portStatus: finalized.portStatus
-                                    )
-                                }
-                                return ServiceStopResult(
-                                    true,
-                                    sid,
-                                    "stopped",
-                                    stateFlushed: true,
-                                    diagnostic: "${slot.diagnostic} cleanup_retry_stop_status=${finalized.ownerStopStatus} ${finalized.diagnostic} cleanup_finalized",
-                                    ingressStopStatus: finalized.ingressStopStatus,
-                                    dispatchStatus: finalized.dispatchStatus,
-                                    ownerStopStatus: finalized.ownerStopStatus,
-                                    leaseStatus: finalized.leaseStatus,
-                                    portStatus: finalized.portStatus
-                                )
-                            }
-                        case None => ()
-                    }
-                    return ServiceStopResult(
-                        false,
-                        sid,
-                        "cleanup_pending",
-                        stateFlushed: false,
-                        diagnostic: "${slot.diagnostic} ${slot.terminalDiagnostic} cleanup_retry_pending",
-                        ingressStopStatus: slot.ingressStopStatus,
-                        dispatchStatus: slot.dispatchStatus,
-                        ownerStopStatus: slot.ownerStopStatus,
-                        leaseStatus: slot.leaseStatus,
-                        portStatus: slot.portStatus
-                    )
+            let deadlineMs = servicePluginDeadlineNowMs() + effectiveTimeoutMillis
+            let pendingLookup = synchronized(servicePluginProcessLock) {
+                (servicePluginCleanupPendingForServiceLocked(sid), record.instanceId)
+            }
+            match (pendingLookup[0]) {
+                case Some(slot) => return servicePluginStopPendingCleanup(sid, record, pendingLookup[1], slot, reason, deadlineMs)
                 case None => ()
             }
-            let deadlineMs = servicePluginDeadlineNowMs() + effectiveTimeoutMillis
+            match (servicePluginBeforeStopClaimHookForTest) {
+                case Some(hook) => hook(sid)
+                case None => ()
+            }
             let terminalDeadline = ServicePluginProbeDeadline(deadlineMs)
             let stopReserveMs = max(1, effectiveTimeoutMillis / 2)
             var selectedProcess = None<ServicePluginStdioProcess>
@@ -5847,21 +5883,31 @@ private func servicePluginStopOwned(serviceId: String, reason: String, timeoutMi
             var pendingClaim = None<ServicePluginStartClaim>
             var stopClaimed = false
             var staleRecovery = false
+            var latePending = None<ServicePluginCleanupPendingSlot>
             synchronized(servicePluginProcessLock) {
                 let current = servicePluginRegistry.get(sid)
                 let recordMatches = current.isSome() && refEq(current.getOrThrow(), record)
+                let currentPending = servicePluginCleanupPendingForServiceLocked(sid)
                 let recoveryMatches = match (expectedRecord) {
                     case Some(expected) => recordMatches && refEq(record, expected) && record.instanceId == expectedInstanceId &&
                         (match (expectedOwner) {
-                            case Some(identity) => servicePluginOwnerMatchesLocked(sid, identity[0], identity[1], claimToken: identity[2])
+                            case Some(identity) => servicePluginOwnerMatchesLocked(sid, identity[0], identity[1], claimToken: identity[2]) ||
+                                (match (currentPending) {
+                                    case Some(slot) => slot.ownerId == identity[0] && slot.generation == identity[1] &&
+                                        slot.claimToken == identity[2] && slot.expectedSessionId == expectedInstanceId
+                                    case None => false
+                                })
                             case None => !servicePluginActiveProcesses.contains(sid)
                         })
                     case None => recordMatches
                 }
                 if (!recoveryMatches) {
                     staleRecovery = true
-                } else if (servicePluginHasCleanupPendingLocked(sid)) {
-                    ()
+                } else if (currentPending.isSome()) {
+                    let slot = currentPending.getOrThrow()
+                    if (record.instanceId == pendingLookup[1] && slot.expectedSessionId == pendingLookup[1]) {
+                        latePending = Some(slot)
+                    } else { staleRecovery = true }
                 } else if (record.status != "stopping") {
                     stopClaimed = true
                     record.status = "stopping"
@@ -5881,6 +5927,10 @@ private func servicePluginStopOwned(serviceId: String, reason: String, timeoutMi
             }
             if (staleRecovery) {
                 return ServiceStopResult(false, sid, "stale_owner", diagnostic: "service plugin recovery owner changed")
+            }
+            match (latePending) {
+                case Some(slot) => return servicePluginStopPendingCleanup(sid, record, pendingLookup[1], slot, reason, deadlineMs)
+                case None => ()
             }
             let _ = servicePluginCancelCompletionWaits(sid)
             match (selectedProcess) { case Some(process) => servicePluginWriteFencedEventAcks(fencedTasks, process) case None => () }
