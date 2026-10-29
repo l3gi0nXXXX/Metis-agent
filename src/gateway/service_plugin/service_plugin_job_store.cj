@@ -394,6 +394,18 @@ public class ServicePluginWebhookReceiptStore {
         }
     }
 
+    // Admission replay must be backed by the current durable completion, not
+    // merely by an in-memory receipt from a previous attempt.
+    public func matchesCompletedReceipt(receipt: ServicePluginWebhookReceipt): Bool {
+        if (receipt.state != "completed_unconfirmed" ||
+            !servicePluginWebhookReceiptIdentityValid(receipt.serviceId, receipt.deliveryId, receipt.eventId) ||
+            !servicePluginWebhookReceiptTokenValid(receipt.attemptToken)) { return false }
+        synchronized(this.guard.lock) {
+            let current = this.readLocked(ServicePluginWebhookReceiptIdentity(receipt.serviceId, receipt.deliveryId, receipt.eventId))
+            current.state == "completed_unconfirmed" && current.attemptToken == receipt.attemptToken
+        }
+    }
+
     public func listUnconfirmed(limit!: Int64 = 8): ServicePluginWebhookReceiptListResult {
         let out = ArrayList<ServicePluginWebhookReceipt>()
         synchronized(this.guard.lock) {

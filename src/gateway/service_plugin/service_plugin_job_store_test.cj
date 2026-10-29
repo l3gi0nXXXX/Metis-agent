@@ -249,4 +249,25 @@ public class ServicePluginJobStoreTest {
             @Expect(store.reserve("gitcode-monitor", "delivery-2", "event-2", attemptToken: "attempt-other").status, "reserved")
         } finally { remove(path, recursive: true) }
     }
+
+    @TestCase
+    public func bpS2P1DurableReplayRequiresExactCompletedReceipt(): Unit {
+        let path = this.receiptPath("bp-s2-p1")
+        try {
+            let store = ServicePluginWebhookReceiptStore(path.toString())
+            let receipt = ServicePluginWebhookReceipt("gitcode-monitor", "delivery-中文🙂", "event-1", "attempt-1", "completed_unconfirmed")
+            @Expect(store.matchesCompletedReceipt(receipt), false)
+            @Expect(store.reserve(receipt.serviceId, receipt.deliveryId, receipt.eventId, attemptToken: receipt.attemptToken).status, "reserved")
+            @Expect(store.matchesCompletedReceipt(receipt), false)
+            @Expect(store.complete(receipt.serviceId, receipt.deliveryId, receipt.eventId, attemptToken: receipt.attemptToken).status, "completed_unconfirmed")
+            @Expect(store.matchesCompletedReceipt(receipt), true)
+            @Expect(store.matchesCompletedReceipt(ServicePluginWebhookReceipt("other-service", receipt.deliveryId, receipt.eventId, receipt.attemptToken, receipt.state)), false)
+            @Expect(store.matchesCompletedReceipt(ServicePluginWebhookReceipt(receipt.serviceId, "other-delivery", receipt.eventId, receipt.attemptToken, receipt.state)), false)
+            @Expect(store.matchesCompletedReceipt(ServicePluginWebhookReceipt(receipt.serviceId, receipt.deliveryId, "other-event", receipt.attemptToken, receipt.state)), false)
+            @Expect(store.matchesCompletedReceipt(ServicePluginWebhookReceipt(receipt.serviceId, receipt.deliveryId, receipt.eventId, "stale-attempt", receipt.state)), false)
+            @Expect(store.matchesCompletedReceipt(ServicePluginWebhookReceipt(receipt.serviceId, receipt.deliveryId, receipt.eventId, receipt.attemptToken, "in_flight")), false)
+            @Expect(store.confirmAndRemove(receipt.serviceId, receipt.deliveryId, receipt.eventId, receipt.attemptToken).status, "confirmed")
+            @Expect(store.matchesCompletedReceipt(receipt), false)
+        } finally { remove(path, recursive: true) }
+    }
 }

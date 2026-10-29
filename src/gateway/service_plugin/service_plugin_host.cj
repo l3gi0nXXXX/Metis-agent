@@ -1431,6 +1431,9 @@ private class ServicePluginStdioProcess {
         } else if (event.eventType == "owner.timeout") {
             this.state.cacheTerminal(if (event.status.isEmpty()) { "timed_out" } else { event.status })
         } else if (event.eventType == "owner.error") {
+            if (event.status == "subscriber_capacity_exceeded") {
+                servicePluginLogCapacityDiagnostic(this.serviceId, event.text)
+            }
             this.state.cacheTerminal(if (event.status.isEmpty()) { "process_error" } else { event.status })
         } else {
             this.state.cacheTerminal("broker_protocol_error")
@@ -1971,6 +1974,34 @@ private func servicePluginRunStartPhaseHook(serviceId: String, phase: String): U
 private let servicePluginProcessLock = Mutex()
 private let servicePluginRuntimeRecordLock = Mutex()
 private let servicePluginHostLogger = metisCreateSubsystemLogger("gateway/service-plugin/host")
+
+// Rebuild the broker's neutral diagnostic from an allowlist. Never forward
+// arbitrary plugin text, even when it accompanies a capacity terminal.
+func servicePluginCapacityDiagnostic(raw: String): Option<JsonObject> {
+    if (raw.size > 512) { return None<JsonObject> }
+    try {
+        let root = JsonValue.fromStr(raw).asObject()
+        let kind = root.get("limitKind").getOrThrow().asString().getValue()
+        if (kind != "owner_events" && kind != "owner_bytes" && kind != "dispatch_events" && kind != "dispatch_bytes") { return None<JsonObject> }
+        let meta = JsonObject()
+        meta.put("limitKind", JsonString(kind))
+        for (key in ["queuedBytes", "regularQueued", "regularDispatchPending", "attemptedBytes"]) {
+            let value = root.get(key).getOrThrow().asInt().getValue()
+            if (value < 0 || value > 1099511627776) { return None<JsonObject> }
+            meta.put(key, JsonInt(value))
+        }
+        Some(meta)
+    } catch (_: Exception) { None<JsonObject> }
+}
+
+private func servicePluginLogCapacityDiagnostic(serviceId: String, raw: String): Unit {
+    match (servicePluginCapacityDiagnostic(raw)) {
+        case Some(meta) =>
+            meta.put("serviceId", JsonString(serviceId))
+            servicePluginHostLogger.warn(MetisLogEvent.loggingRaw, "service_plugin.owner.capacity_exceeded", meta: meta)
+        case None => ()
+    }
+}
 
 private func servicePluginFlushDispatchDiagnostics(process: ServicePluginStdioProcess): Unit {
     let transitions = process.takeDispatchDiagnosticTransitions()
@@ -4799,7 +4830,8 @@ private func servicePluginWriteEventAck(task: ServicePluginDispatchTask, phase: 
 
 private func servicePluginCompletionConfirmationPayloadValid(
     payload: String,
-    receipt: ServicePluginWebhookReceipt
+    receipt: ServicePluginWebhookReceipt,
+    missingAdmission!: Bool = false
 ): Bool {
     try {
         let root = JsonValue.fromStr(payload).asObject()
@@ -4809,9 +4841,44 @@ private func servicePluginCompletionConfirmationPayloadValid(
         let deliveryId = root.get("deliveryId").getOrThrow().asString().getValue().trimAscii()
         let eventId = root.get("eventId").getOrThrow().asString().getValue().trimAscii()
         let attemptToken = root.get("attemptToken").getOrThrow().asString().getValue().trimAscii()
-        ok && (status == "host_completed" || status == "already_completed") &&
-            protocolVersion == METIS_SERVICE_PLUGIN_PROTOCOL_VERSION &&
+        let outcomeMatches = if (missingAdmission) { !ok && status == "completion_before_admission" }
+            else { ok && (status == "host_completed" || status == "already_completed") }
+        outcomeMatches && protocolVersion == METIS_SERVICE_PLUGIN_PROTOCOL_VERSION &&
             deliveryId == receipt.deliveryId && eventId == receipt.eventId && attemptToken == receipt.attemptToken
+    } catch (_: Exception) { false }
+}
+
+private func servicePluginReplayReceiptAdmissionAck(
+    record: ServicePluginRuntimeRecord,
+    process: ServicePluginStdioProcess,
+    receipt: ServicePluginWebhookReceipt,
+    frameId: String,
+    deadlineMs: Int64,
+    requireDispatchAllowed!: Bool = false
+): Bool {
+    if (receipt.serviceId != record.registration.manifest.pluginId ||
+        !servicePluginWebhookReceiptStore().matchesCompletedReceipt(receipt)) { return false }
+    let current = synchronized(servicePluginProcessLock) {
+        servicePluginOwnerMatchesLocked(receipt.serviceId, process.ownerId, process.generation, claimToken: process.claimToken)
+    }
+    if (!current || (requireDispatchAllowed && !process.dispatchAllowed())) { return false }
+    let sequence = process.nextInvokeSequence()
+    let ack = ServiceEventAck(METIS_SERVICE_PLUGIN_PROTOCOL_VERSION, receipt.deliveryId, receipt.eventId, receipt.attemptToken, "admission", "accepted")
+    let frame = ServiceFrame(
+        "response", "receipt-admission-${process.generation}-${sequence}", receipt.serviceId,
+        method: "emitCapabilityEvent", capabilityId: "gitcode.event.accepted",
+        correlationId: receipt.attemptToken, payload: encodeServiceEventAckPayload(ack)
+    )
+    try {
+        let remaining = servicePluginDeadlineRemaining(deadlineMs)
+        if (remaining <= 0) { return false }
+        process.writeLine(encodeServiceFrame(frame).trimAscii(), timeoutMs: min(1000, remaining))
+        process.recordEventAckWritten("admission", "accepted")
+        match (servicePluginEventAckWrittenHookForTest) {
+            case Some(hook) => hook(frameId, "admission", "accepted", process.dispatchSchedulerSnapshotForTest())
+            case None => ()
+        }
+        true
     } catch (_: Exception) { false }
 }
 
@@ -4824,66 +4891,60 @@ private func servicePluginConfirmCompletedReceipt(
     timeoutMs!: Int64 = 3000,
     requireDispatchAllowed!: Bool = false
 ): Bool {
+    let deadlineMs = servicePluginDeadlineNowMs() + max(1, timeoutMs)
     let allowed = match (servicePluginBeforeCompletionAckHookForTest) {
         case Some(hook) => hook(frameId)
         case None => true
     }
     if (!allowed) { return false }
-    let current = synchronized(servicePluginProcessLock) {
-        servicePluginOwnerMatchesLocked(record.registration.manifest.pluginId, process.ownerId, process.generation, claimToken: process.claimToken)
+    // Keep normal admission ACKs unchanged. A peer's exact negative response
+    // permits one durable-backed repair, within this same monotonic deadline.
+    for (confirmationAttempt in 0..2) {
+        let current = synchronized(servicePluginProcessLock) {
+            servicePluginOwnerMatchesLocked(record.registration.manifest.pluginId, process.ownerId, process.generation, claimToken: process.claimToken)
+        }
+        if (!current || (requireDispatchAllowed && !process.dispatchAllowed()) || servicePluginDeadlineRemaining(deadlineMs) <= 0) { return false }
+        let sequence = process.nextInvokeSequence()
+        let correlationId = "event-confirm-${process.ownerId}-${process.generation}-${sequence}"
+        let ack = ServiceEventAck(METIS_SERVICE_PLUGIN_PROTOCOL_VERSION, receipt.deliveryId, receipt.eventId, receipt.attemptToken, "completion", "completed")
+        let request = ServiceFrame(
+            "request", "event-confirm-${process.generation}-${sequence}", record.registration.manifest.pluginId,
+            method: "emitCapabilityEvent", capabilityId: "gitcode.event.accepted",
+            correlationId: correlationId, payload: encodeServiceEventAckPayload(ack)
+        )
+        if (!queue.registerCorrelation(correlationId)) { return false }
+        if (requireDispatchAllowed && !process.dispatchAllowed()) {
+            queue.cancelCorrelation(correlationId, status: "dispatch_fenced")
+            return false
+        }
+        try {
+            let remaining = servicePluginDeadlineRemaining(deadlineMs)
+            if (remaining <= 0) { queue.cancelCorrelation(correlationId, status: "timeout"); return false }
+            process.writeLine(encodeServiceFrame(request).trimAscii(), timeoutMs: min(1000, remaining))
+        } catch (_: Exception) {
+            queue.cancelCorrelation(correlationId, status: "write_failed")
+            return false
+        }
+        let remaining = servicePluginDeadlineRemaining(deadlineMs)
+        if (remaining <= 0) { queue.cancelCorrelation(correlationId, status: "timeout"); return false }
+        let response = queue.readResponse(correlationId, record.registration.manifest.pluginId,
+            "emitCapabilityEvent", "gitcode.event.accepted", remaining)
+        if (!response.ok) { return false }
+        if (!servicePluginCompletionConfirmationPayloadValid(response.frame.payload, receipt)) {
+            if (confirmationAttempt != 0 || !servicePluginCompletionConfirmationPayloadValid(response.frame.payload, receipt, missingAdmission: true)) { return false }
+            if (!servicePluginReplayReceiptAdmissionAck(record, process, receipt, frameId, deadlineMs, requireDispatchAllowed: requireDispatchAllowed)) { return false }
+            continue
+        }
+        let removed = servicePluginWebhookReceiptStore().confirmAndRemove(receipt.serviceId, receipt.deliveryId, receipt.eventId, receipt.attemptToken)
+        if (removed.status != "confirmed") { return false }
+        process.recordCompletionConfirmed()
+        match (servicePluginEventAckWrittenHookForTest) {
+            case Some(hook) => hook(frameId, "completion", "completed", process.dispatchSchedulerSnapshotForTest())
+            case None => ()
+        }
+        return true
     }
-    if (!current || (requireDispatchAllowed && !process.dispatchAllowed())) { return false }
-    let sequence = process.nextInvokeSequence()
-    let correlationId = "event-confirm-${process.ownerId}-${process.generation}-${sequence}"
-    let ack = ServiceEventAck(
-        METIS_SERVICE_PLUGIN_PROTOCOL_VERSION,
-        receipt.deliveryId,
-        receipt.eventId,
-        receipt.attemptToken,
-        "completion",
-        "completed"
-    )
-    let request = ServiceFrame(
-        "request",
-        "event-confirm-${process.generation}-${sequence}",
-        record.registration.manifest.pluginId,
-        method: "emitCapabilityEvent",
-        capabilityId: "gitcode.event.accepted",
-        correlationId: correlationId,
-        payload: encodeServiceEventAckPayload(ack)
-    )
-    if (!queue.registerCorrelation(correlationId)) { return false }
-    if (requireDispatchAllowed && !process.dispatchAllowed()) {
-        queue.cancelCorrelation(correlationId, status: "dispatch_fenced")
-        return false
-    }
-    try {
-        process.writeLine(encodeServiceFrame(request).trimAscii())
-    } catch (_: Exception) {
-        queue.cancelCorrelation(correlationId, status: "write_failed")
-        return false
-    }
-    let response = queue.readResponse(
-        correlationId,
-        record.registration.manifest.pluginId,
-        "emitCapabilityEvent",
-        "gitcode.event.accepted",
-        max(1, timeoutMs)
-    )
-    if (!response.ok || !servicePluginCompletionConfirmationPayloadValid(response.frame.payload, receipt)) { return false }
-    let removed = servicePluginWebhookReceiptStore().confirmAndRemove(
-        receipt.serviceId,
-        receipt.deliveryId,
-        receipt.eventId,
-        receipt.attemptToken
-    )
-    if (removed.status != "confirmed") { return false }
-    process.recordCompletionConfirmed()
-    match (servicePluginEventAckWrittenHookForTest) {
-        case Some(hook) => hook(frameId, "completion", "completed", process.dispatchSchedulerSnapshotForTest())
-        case None => ()
-    }
-    true
+    false
 }
 
 private func servicePluginFlushUnconfirmedReceipts(

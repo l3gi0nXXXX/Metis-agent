@@ -887,12 +887,18 @@ public class ManagedStdioBrokerClient {
         true
     }
 
-    private func enqueueSyntheticCapacityTerminalLocked(state: ManagedStdioOwnerState): Unit {
+    private func enqueueSyntheticCapacityTerminalLocked(state: ManagedStdioOwnerState, limitKind: String, attemptedBytes: Int64): Unit {
         if (state.terminalQueued) { return }
         state.status = "subscriber_capacity_exceeded"
         state.capacityFailed = true
+        let diagnostic = JsonObject()
+        diagnostic.put("limitKind", JsonString(limitKind))
+        diagnostic.put("queuedBytes", JsonInt(state.queuedBytes))
+        diagnostic.put("regularQueued", JsonInt(state.regularQueued))
+        diagnostic.put("regularDispatchPending", JsonInt(state.regularDispatchPending))
+        diagnostic.put("attemptedBytes", JsonInt(attemptedBytes))
         let _ = this.enqueueTerminalLocked(state, ManagedStdioEvent(
-            "owner.error", ownerId: state.ownerId, status: "subscriber_capacity_exceeded"
+            "owner.error", ownerId: state.ownerId, status: "subscriber_capacity_exceeded", text: managedStdioCompactJson(diagnostic)
         ))
         state.condition.notifyAll()
     }
@@ -1356,14 +1362,16 @@ public class ManagedStdioBrokerClient {
         if (state.subscriberFailed || state.subscriptionRejected || state.capacityFailed) { return true }
         let regularLimit = max(0, this.ownerQueueLimit - 1)
         if (state.regularQueued + state.regularDispatchPending >= regularLimit || state.queuedBytes + eventBytes > state.maxBufferedBytes) {
-            this.enqueueSyntheticCapacityTerminalLocked(state)
+            this.enqueueSyntheticCapacityTerminalLocked(state,
+                if (state.regularQueued + state.regularDispatchPending >= regularLimit) { "owner_events" } else { "owner_bytes" }, eventBytes)
             return false
         }
         state.queuedBytes += eventBytes
         if (state.subscriber.isSome()) {
             if (!this.enqueueRegularDispatchLocked(state, event, eventBytes)) {
                 state.queuedBytes -= eventBytes
-                this.enqueueSyntheticCapacityTerminalLocked(state)
+                this.enqueueSyntheticCapacityTerminalLocked(state,
+                    if (this.dispatchRegularCount >= this.regularDispatchFrameLimit()) { "dispatch_events" } else { "dispatch_bytes" }, eventBytes)
                 return false
             }
         } else {

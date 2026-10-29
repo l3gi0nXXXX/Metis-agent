@@ -6,6 +6,7 @@ import std.fs.{File, Path, exists, remove}
 import std.sync.*
 import std.time.DateTime
 import std.unittest.testmacro.*
+import stdx.encoding.json.JsonValue
 
 private class RecordingManagedStdioPlatformRunner <: ManagedStdioPlatformRunner {
     let calls = ArrayList<String>()
@@ -1268,7 +1269,14 @@ public class ManagedStdioBrokerTest {
             @Expect(managedStdioWaitUntil(3000, {
                 =>
                 match (client.readOwnerLine("limit-1", timeoutMs: 50)) {
-                    case Some(event) => event.status == "subscriber_capacity_exceeded"
+                    case Some(event) =>
+                        if (event.status != "subscriber_capacity_exceeded") { return false }
+                        let diagnostic = JsonValue.fromStr(event.text).asObject()
+                        @Expect(diagnostic.get("limitKind").getOrThrow().asString().getValue(), "owner_events")
+                        @Expect(diagnostic.get("queuedBytes").getOrThrow().asInt().getValue(), 1)
+                        @Expect(diagnostic.get("regularQueued").getOrThrow().asInt().getValue(), 1)
+                        @Expect(diagnostic.get("attemptedBytes").getOrThrow().asInt().getValue(), 1)
+                        true
                     case None => false
                 }
             }), true)
@@ -1291,7 +1299,14 @@ public class ManagedStdioBrokerTest {
                 =>
                 match (byteBounded.readOwnerLine("byte-limit", timeoutMs: 50)) {
                     case Some(event) =>
-                        if (event.status == "subscriber_capacity_exceeded") { sawByteOverflow.value = true }
+                        if (event.status == "subscriber_capacity_exceeded") {
+                            let diagnostic = JsonValue.fromStr(event.text).asObject()
+                            @Expect(diagnostic.get("limitKind").getOrThrow().asString().getValue(), "owner_bytes")
+                            @Expect(diagnostic.get("queuedBytes").getOrThrow().asInt().getValue(), 8)
+                            @Expect(diagnostic.get("regularQueued").getOrThrow().asInt().getValue(), 2)
+                            @Expect(diagnostic.get("attemptedBytes").getOrThrow().asInt().getValue(), 4)
+                            sawByteOverflow.value = true
+                        }
                     case None => ()
                 }
                 sawByteOverflow.value
