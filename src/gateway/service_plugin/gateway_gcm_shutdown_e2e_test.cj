@@ -343,7 +343,7 @@ private class S5GcmQueueProof {
     }
 }
 
-private func s5GcmQueueProof(queuePath: Path, expected: HashSet<String>): S5GcmQueueProof {
+private func s5GcmQueueProof(queuePath: Path, expected: HashSet<String>, terminal!: Bool = false): S5GcmQueueProof {
     var pending: Int64 = 0
     var processing: Int64 = 0
     var awaiting: Int64 = 0
@@ -354,65 +354,61 @@ private func s5GcmQueueProof(queuePath: Path, expected: HashSet<String>): S5GcmQ
     var invalid: Int64 = 0
     let seen = HashSet<String>()
     for (status in ["pending", "processing", "awaiting-host", "processed", "dead-letter", "cancelled"]) {
-        let directory = queuePath.join(status)
-        if (!exists(directory)) { continue }
-        try {
-            for (entry in Directory.readFrom(directory)) {
-                if (!entry.isRegular()) { continue }
-                match (status) {
-                    case "pending" => pending++
-                    case "processing" => processing++
-                    case "awaiting-host" => awaiting++
-                    case "processed" => processed++
-                    case "dead-letter" => deadLetter++
-                    case "cancelled" => cancelled++
-                    case _ => ()
+        for (path in bpFormalQueuePaths(queuePath, status, expected, terminal: terminal)) {
+            let rootValue = bpFormalReadKnown(path)
+            if (rootValue.isNone()) { continue }
+            match (status) {
+                case "pending" => pending++
+                case "processing" => processing++
+                case "awaiting-host" => awaiting++
+                case "processed" => processed++
+                case "dead-letter" => deadLetter++
+                case "cancelled" => cancelled++
+                case _ => ()
+            }
+            if (!path.fileName.endsWith(".json")) {
+                invalid++
+                continue
+            }
+            try {
+                let root = rootValue.getOrThrow()
+                let deliveryId = root.get("deliveryId").getOrThrow().asString().getValue()
+                let storedStatus = root.get("status").getOrThrow().asString().getValue()
+                let admissionAttempt = root.get("admissionAttempt").getOrThrow().asInt().getValue()
+                let admissionState = root.get("admissionState").getOrThrow().asString().getValue()
+                let hostEventId = root.get("hostEventId").getOrThrow().asString().getValue()
+                let admissionToken = root.get("admissionToken").getOrThrow().asString().getValue()
+                let processedEventId = root.get("processedEventId").getOrThrow().asString().getValue()
+                let identityValid = expected.contains(deliveryId) && path.fileName == "${deliveryId}.json" &&
+                    !seen.contains(deliveryId)
+                let stateValid = admissionAttempt > 0 && match (status) {
+                    case "pending" => storedStatus == "pending" && admissionState == "retry" &&
+                        !hostEventId.isEmpty() && !admissionToken.isEmpty() && processedEventId.isEmpty()
+                    case "processing" => storedStatus == "processing"
+                    case "awaiting-host" => storedStatus == "awaiting-host" && admissionState == "admitted" &&
+                        !hostEventId.isEmpty() && !admissionToken.isEmpty() && processedEventId.isEmpty()
+                    case "processed" => storedStatus == "processed" && admissionState == "completed" &&
+                        !hostEventId.isEmpty() && !admissionToken.isEmpty() && processedEventId == hostEventId
+                    case "dead-letter" => storedStatus == "dead-letter"
+                    case "cancelled" => storedStatus == "cancelled"
+                    case _ => false
                 }
-                if (!entry.name.endsWith(".json")) {
+                if (!identityValid || !stateValid) {
                     invalid++
                     continue
                 }
-                try {
-                    let root = JsonValue.fromStr(String.fromUtf8(File.readFrom(entry.path))).asObject()
-                    let deliveryId = root.get("deliveryId").getOrThrow().asString().getValue()
-                    let storedStatus = root.get("status").getOrThrow().asString().getValue()
-                    let admissionAttempt = root.get("admissionAttempt").getOrThrow().asInt().getValue()
-                    let admissionState = root.get("admissionState").getOrThrow().asString().getValue()
-                    let hostEventId = root.get("hostEventId").getOrThrow().asString().getValue()
-                    let admissionToken = root.get("admissionToken").getOrThrow().asString().getValue()
-                    let processedEventId = root.get("processedEventId").getOrThrow().asString().getValue()
-                    let identityValid = expected.contains(deliveryId) && entry.name == "${deliveryId}.json" &&
-                        !seen.contains(deliveryId)
-                    let stateValid = admissionAttempt > 0 && match (status) {
-                        case "pending" => storedStatus == "pending" && admissionState == "retry" &&
-                            !hostEventId.isEmpty() && !admissionToken.isEmpty() && processedEventId.isEmpty()
-                        case "processing" => storedStatus == "processing"
-                        case "awaiting-host" => storedStatus == "awaiting-host" && admissionState == "admitted" &&
-                            !hostEventId.isEmpty() && !admissionToken.isEmpty() && processedEventId.isEmpty()
-                        case "processed" => storedStatus == "processed" && admissionState == "completed" &&
-                            !hostEventId.isEmpty() && !admissionToken.isEmpty() && processedEventId == hostEventId
-                        case "dead-letter" => storedStatus == "dead-letter"
-                        case "cancelled" => storedStatus == "cancelled"
-                        case _ => false
-                    }
-                    if (!identityValid || !stateValid) {
-                        invalid++
-                        continue
-                    }
-                    seen.add(deliveryId)
-                    if (admissionAttempt == 1) { attemptOne++ }
-                } catch (_: Exception) {
-                    invalid++
-                }
+                seen.add(deliveryId)
+                if (admissionAttempt == 1) { attemptOne++ }
+            } catch (e: Exception) {
+                if (exists(path)) { throw e }
             }
-        } catch (_: Exception) {
-            invalid++
         }
     }
     S5GcmQueueProof(
         pending, processing, awaiting, processed, deadLetter, cancelled, Int64(seen.size), attemptOne, invalid
     )
 }
+
 
 private class S5GeneratedReplyGate {
     private let lock = Mutex()
@@ -764,16 +760,16 @@ public class GatewayGcmShutdownE2eTest {
                 @Expect(expectedDeliveries.size, 140)
                 // Admission is now bounded by the shared sender rather than host queue saturation.
                 @Expect(s5WaitUntil(15000, { =>
-                    bpFormalCount(queuePath, "awaiting-host") == 2 && bpFormalCount(queuePath, "pending") == 138 &&
-                        bpFormalCount(queuePath, "processing") == 0 && gate.snapshot()[1] == 2
+                    bpFormalCount(queuePath, "awaiting-host", expectedDeliveries) == 2 && bpFormalCount(queuePath, "pending", expectedDeliveries) == 138 &&
+                        bpFormalCount(queuePath, "processing", expectedDeliveries) == 0 && gate.snapshot()[1] == 2
                 }), true)
-                @Expect(bpFormalCount(queuePath, "awaiting-host"), 2)
-                @Expect(bpFormalCount(queuePath, "pending"), 138)
-                @Expect(bpFormalCount(queuePath, "processing"), 0)
-                @Expect(bpFormalCount(queuePath, "processed"), 0)
-                @Expect(bpFormalCount(queuePath, "dead-letter"), 0)
-                @Expect(bpFormalCount(queuePath, "cancelled"), 0)
-                @Expect(bpFormalOutstandingBytes(queuePath) <= 524288, true)
+                @Expect(bpFormalCount(queuePath, "awaiting-host", expectedDeliveries), 2)
+                @Expect(bpFormalCount(queuePath, "pending", expectedDeliveries), 138)
+                @Expect(bpFormalCount(queuePath, "processing", expectedDeliveries), 0)
+                @Expect(bpFormalCount(queuePath, "processed", expectedDeliveries), 0)
+                @Expect(bpFormalCount(queuePath, "dead-letter", expectedDeliveries), 0)
+                @Expect(bpFormalCount(queuePath, "cancelled", expectedDeliveries), 0)
+                @Expect(bpFormalOutstandingBytes(queuePath, expectedDeliveries) <= 524288, true)
                 let saturatedIdentities = bpFormalIdentityProof(queuePath, expectedDeliveries)
                 @Expect(saturatedIdentities[0], 140)
                 @Expect(saturatedIdentities[1], 0)
@@ -848,6 +844,15 @@ public class GatewayGcmShutdownE2eTest {
                 @Expect(portReleased, true)
                 @Expect(s5LeaseString(leasePath, "state"), "stopped")
                 @Expect(managedStdioBroker().snapshot().ownerCount, 0)
+                let terminalTruth = stopped.ok && stopped.status == "stopped" && stopped.leaseStatus == "stopped" &&
+                    stopped.portStatus == "released" && pidGone && groupGone && portReleased &&
+                    managedStdioBroker().snapshot().ownerCount == 0
+                if (!terminalTruth) { return }
+                let terminalQueue = s5GcmQueueProof(queuePath, expectedDeliveries, terminal: true)
+                @Expect(terminalQueue.processed, 140)
+                @Expect(terminalQueue.unique, 140)
+                @Expect(terminalQueue.invalid, 0)
+                bpFormalExpectTerminalProof(queuePath, expectedDeliveries)
             } finally {
                 gate.release()
                 setServicePluginWebhookSubscribersProviderForTest(None<(ServicePluginAcceptedGitCodeEvent) -> ArrayList<ServicePluginDeliveryTarget>>)
@@ -1343,12 +1348,14 @@ private func bpFormalHealthWindow(port: Int64): (Int64, Int64, Int64) {
     }
 }
 
-private func bpFormalSeed(queue: Path, count: Int64): Unit {
+private func bpFormalSeed(queue: Path, count: Int64): HashSet<String> {
+    let expected = HashSet<String>()
     for (name in ["pending", "processing", "awaiting-host", "processed", "dead-letter", "cancelled", "payload", "host-frame"]) {
         Directory.create(queue.join(name), recursive: true)
     }
     for (index in 0..count) {
         let id = "bp-formal-${index}"
+        expected.add(id)
         let eventId = "gitcode:synthetic/project:issue:${index}"
         let payload = JsonObject()
         for ((key, value) in [("jobId", "webhook-${id}"), ("eventId", eventId), ("deliveryId", id),
@@ -1372,64 +1379,93 @@ private func bpFormalSeed(queue: Path, count: Int64): Unit {
         for (key in ["receivedAtMs", "attempts", "nextAttemptAtMs", "admissionAttempt"]) { metadata.put(key, JsonInt(0)) }
         File.writeTo(queue.join("pending").join("${id}.json"), metadata.toJsonString().toArray())
     }
+    expected
 }
 
-private func bpFormalCount(queue: Path, status: String): Int64 {
+// Live observations use only fixture-authorized paths; directory enumeration is
+// reserved for the strict proof after the native producer has formally stopped.
+private func bpFormalQueuePaths(queue: Path, status: String, expected: HashSet<String>,
+    terminal!: Bool = false): ArrayList<Path> {
+    let paths = ArrayList<Path>()
+    if (terminal) {
+        for (entry in Directory.readFrom(queue.join(status))) { paths.add(entry.path) }
+    } else {
+        for (id in expected) { paths.add(queue.join(status).join("${id}.json")) }
+    }
+    paths
+}
+
+private func bpFormalReadKnown(path: Path): Option<JsonObject> {
+    if (!exists(path)) { return None<JsonObject> }
+    try {
+        Some(JsonValue.fromStr(bpFormalRead(path)).asObject())
+    } catch (e: Exception) {
+        if (exists(path)) { throw e }
+        None<JsonObject>
+    }
+}
+
+private func bpFormalCount(queue: Path, status: String, expected: HashSet<String>): Int64 {
     var count: Int64 = 0
-    let path = queue.join(status)
-    if (!exists(path)) { return 0 }
-    for (entry in Directory.readFrom(path)) {
-        if (!entry.name.endsWith(".json")) { continue }
-        try {
-            if (entry.isRegular()) { count++ }
-        } catch (e: Exception) {
-            // Queue transitions may remove an entry after directory enumeration.
-            if (exists(entry.path)) { throw e }
-        }
+    for (id in expected) {
+        if (exists(queue.join(status).join("${id}.json"))) { count++ }
     }
     count
 }
 
-// Conservation check supports both never-sent pending rows and admitted rows.
-private func bpFormalIdentityProof(queue: Path, expected: HashSet<String>): (Int64, Int64) {
+// Both live known identities and the stable terminal scan reject duplicate IDs.
+private func bpFormalIdentityProof(queue: Path, expected: HashSet<String>,
+    terminal!: Bool = false): (Int64, Int64, Int64) {
     let seen = HashSet<String>()
     var invalid: Int64 = 0
+    var unknown: Int64 = 0
     for (status in ["pending", "processing", "awaiting-host", "processed", "dead-letter", "cancelled"]) {
-        for (entry in Directory.readFrom(queue.join(status))) {
-            if (!entry.isRegular()) { continue }
-            try {
-                let row = JsonValue.fromStr(bpFormalRead(entry.path)).asObject()
-                let id = row.get("deliveryId").getOrThrow().asString().getValue()
-                let storedStatus = row.get("status").getOrThrow().asString().getValue()
-                if (!expected.contains(id) || seen.contains(id) || entry.name != "${id}.json" || storedStatus != status) {
-                    invalid++
-                } else {
-                    seen.add(id)
-                }
-            } catch (_: Exception) { invalid++ }
+        for (path in bpFormalQueuePaths(queue, status, expected, terminal: terminal)) {
+            let rowValue = bpFormalReadKnown(path)
+            if (rowValue.isNone()) { continue }
+            let row = rowValue.getOrThrow()
+            let id = row.get("deliveryId").getOrThrow().asString().getValue()
+            let storedStatus = row.get("status").getOrThrow().asString().getValue()
+            if (!expected.contains(id)) { unknown++ }
+            if (!expected.contains(id) || path.fileName != "${id}.json" || seen.contains(id) || storedStatus != status) {
+                invalid++
+            } else {
+                seen.add(id)
+            }
         }
     }
-    (seen.size, invalid)
+    (seen.size, invalid, unknown)
 }
 
-private func bpFormalOutstandingBytes(queue: Path): Int64 {
+private func bpFormalExpectTerminalProof(queue: Path, expected: HashSet<String>): Unit {
+    let proof = bpFormalIdentityProof(queue, expected, terminal: true)
+    @Expect(proof[0], Int64(expected.size))
+    @Expect(proof[1], 0)
+    @Expect(proof[2], 0)
+    println("BP_NATIVE_TERMINAL_IDENTITIES expected=${expected.size} unique=${proof[0]} invalid=${proof[1]} unknown=${proof[2]}")
+}
+
+private func bpFormalOutstandingBytes(queue: Path, expected: HashSet<String>): Int64 {
     var bytes: Int64 = 0
-    for (entry in Directory.readFrom(queue.join("awaiting-host"))) {
-        let metadata = JsonValue.fromStr(bpFormalRead(entry.path)).asObject()
-        let path = metadata.get("hostFramePath").getOrThrow().asString().getValue()
-        // The fixture authorizes only its own host-frame directory.
+    for (id in expected) {
+        let metadataPath = queue.join("awaiting-host").join("${id}.json")
+        let metadata = bpFormalReadKnown(metadataPath)
+        if (metadata.isNone()) { continue }
+        let path = metadata.getOrThrow().get("hostFramePath").getOrThrow().asString().getValue()
         if (!path.startsWith(queue.join("host-frame").toString() + "/")) { throw Exception("foreign_frame_path") }
-        bytes += File.readFrom(Path(path)).size
+        try { bytes += File.readFrom(Path(path)).size } catch (e: Exception) {
+            if (exists(metadataPath) || exists(Path(path))) { throw e }
+        }
     }
     bytes
 }
 
-private func bpFormalCompletedReceiptCount(queue: Path): Int64 {
+private func bpFormalCompletedReceiptCount(queue: Path, expected: HashSet<String>): Int64 {
     var count: Int64 = 0
-    for (entry in Directory.readFrom(queue.join("awaiting-host"))) {
-        let row = JsonValue.fromStr(bpFormalRead(entry.path)).asObject()
-        let id = row.get("deliveryId").getOrThrow().asString().getValue()
-        let eventId = row.get("hostEventId").getOrThrow().asString().getValue()
+    for (id in expected) {
+        let rowValue = bpFormalReadKnown(queue.join("awaiting-host").join("${id}.json"))
+        if (rowValue.isNone()) { continue }
+        let eventId = rowValue.getOrThrow().get("hostEventId").getOrThrow().asString().getValue()
         if (servicePluginWebhookReceiptStore().state("gitcode-monitor", id, eventId) == "completed_unconfirmed") { count++ }
     }
     count
@@ -1491,8 +1527,8 @@ public class ServicePluginFlowFormalTest {
             var formallyStopped = false
             try {
                 let binary = bpFormalArtifact()
-                bpFormalSeed(queue, 10000)
-                @Expect(bpFormalCount(queue, "pending"), 10000)
+                let expectedDeliveries = bpFormalSeed(queue, 10000)
+                @Expect(bpFormalCount(queue, "pending", expectedDeliveries), 10000)
                 port = s5TemporaryPort()
                 let config = home.join("bp-config.json")
                 s5WriteGcmConfig(config, home.join("bp-state.json"), queue, port, s5TemporaryPort())
@@ -1501,7 +1537,7 @@ public class ServicePluginFlowFormalTest {
                 bpFormalInstall(gate, effects)
                 @Expect(ensureRegisteredServicePluginStarted("gitcode-monitor", startupTimeoutMs: 5000).ok, true)
                 pid = getServicePluginSnapshot("gitcode-monitor").getOrThrow().pid
-                @Expect(s5WaitUntil(10000, { => gate.snapshot()[0] == 2 && bpFormalCount(queue, "awaiting-host") == 2 }), true)
+                @Expect(s5WaitUntil(10000, { => gate.snapshot()[0] == 2 && bpFormalCount(queue, "awaiting-host", expectedDeliveries) == 2 }), true)
                 @Expect(pid > 1, true)
                 var healthyRequests: Int64 = 0
                 for (_ in 0..100) {
@@ -1513,26 +1549,31 @@ public class ServicePluginFlowFormalTest {
                     @Expect(getServicePluginSnapshot("gitcode-monitor").getOrThrow().pid, pid)
                     @Expect(getServicePluginSnapshot("gitcode-monitor").getOrThrow().lastError.contains("subscriber_capacity_exceeded"), false)
                     @Expect(getServicePluginSnapshot("gitcode-monitor").getOrThrow().lastError.contains("stdout_protocol_violation"), false)
-                    @Expect(bpFormalCount(queue, "awaiting-host"), 2)
-                    @Expect(bpFormalOutstandingBytes(queue) <= 524288, true)
+                    @Expect(bpFormalCount(queue, "awaiting-host", expectedDeliveries), 2)
+                    @Expect(bpFormalOutstandingBytes(queue, expectedDeliveries) <= 524288, true)
                 }
                 var acceptedWebhooks: Int64 = 0
                 for (index in 0..100) {
-                    let posted = s5PostWebhook(port, "bp-new-${index}", 20000 + index)
+                    let deliveryId = "bp-new-${index}"
+                    expectedDeliveries.add(deliveryId)
+                    let posted = s5PostWebhook(port, deliveryId, 20000 + index)
                     if (posted.status == 202) { acceptedWebhooks++ }
                     @Expect(posted.status, 202)
                 }
                 sleep(Duration.second * 3)
                 @Expect(gate.snapshot()[0], 2)
-                @Expect(bpFormalCount(queue, "pending"), 10098)
-                @Expect(bpFormalCount(queue, "processing"), 0)
-                @Expect(bpFormalCount(queue, "awaiting-host"), 2)
-                @Expect(bpFormalCount(queue, "dead-letter"), 0)
-                @Expect(bpFormalCount(queue, "processed"), 0)
+                @Expect(bpFormalCount(queue, "pending", expectedDeliveries), 10098)
+                @Expect(bpFormalCount(queue, "processing", expectedDeliveries), 0)
+                @Expect(bpFormalCount(queue, "awaiting-host", expectedDeliveries), 2)
+                @Expect(bpFormalCount(queue, "dead-letter", expectedDeliveries), 0)
+                @Expect(bpFormalCount(queue, "processed", expectedDeliveries), 0)
                 @Expect(effects.snapshot()[0], 0)
+                let saturatedIdentities = bpFormalIdentityProof(queue, expectedDeliveries)
+                @Expect(saturatedIdentities[0], 10100)
+                @Expect(saturatedIdentities[1], 0)
                 let fullWindow = bpFormalHealthWindow(port)
                 let currentPid = getServicePluginSnapshot("gitcode-monitor").getOrThrow().pid
-                println("BP_NATIVE_WINDOW seeded=10000 healthz200=${healthyRequests} webhook202=${acceptedWebhooks} count=${fullWindow[1]} bytes=${fullWindow[2]} pending=${bpFormalCount(queue, "pending")} awaiting=${bpFormalCount(queue, "awaiting-host")} pid=${pid} pidStable=${currentPid == pid} effects=${effects.snapshot()[0]}")
+                println("BP_NATIVE_WINDOW seeded=10000 healthz200=${healthyRequests} webhook202=${acceptedWebhooks} count=${fullWindow[1]} bytes=${fullWindow[2]} pending=${bpFormalCount(queue, "pending", expectedDeliveries)} awaiting=${bpFormalCount(queue, "awaiting-host", expectedDeliveries)} pid=${pid} pidStable=${currentPid == pid} effects=${effects.snapshot()[0]}")
                 // Release blocked test business work, then use the real formal stop.
                 gate.release()
                 let stopped = stopServicePlugin("gitcode-monitor", reason: "bp-formal-complete", timeoutMillis: 5000)
@@ -1548,6 +1589,9 @@ public class ServicePluginFlowFormalTest {
                 @Expect(pidGone, true)
                 @Expect(portReleased, true)
                 @Expect(remainingOwners, 0)
+                if (!stopped.ok || stopped.status != "stopped" || stopped.leaseStatus != "stopped" ||
+                    stopped.portStatus != "released" || !pidGone || !portReleased || remainingOwners != 0) { return }
+                bpFormalExpectTerminalProof(queue, expectedDeliveries)
             } finally {
                 bpFormalReset(gate)
                 // Assertions above establish formal truth before any fallback cleanup.
@@ -1578,7 +1622,7 @@ public class ServicePluginFlowFormalTest {
             var port: Int64 = 0
             try {
                 let binary = bpFormalArtifact()
-                bpFormalSeed(queue, 100)
+                let expectedDeliveries = bpFormalSeed(queue, 100)
                 port = s5TemporaryPort()
                 let config = home.join("bp-config.json")
                 s5WriteGcmConfig(config, home.join("bp-state.json"), queue, port, s5TemporaryPort())
@@ -1592,14 +1636,20 @@ public class ServicePluginFlowFormalTest {
                 @Expect(s5WaitUntil(10000, { => effects.snapshot()[0] == 2 }), true)
                 sleep(Duration.second * 2)
                 @Expect(effects.snapshot()[0], 2)
-                @Expect(bpFormalCount(queue, "processed"), 0)
-                @Expect(bpFormalCount(queue, "awaiting-host"), 2)
-                @Expect(s5WaitUntil(5000, { => bpFormalCompletedReceiptCount(queue) == 2 &&
+                @Expect(bpFormalCount(queue, "processed", expectedDeliveries), 0)
+                @Expect(bpFormalCount(queue, "awaiting-host", expectedDeliveries), 2)
+                @Expect(s5WaitUntil(5000, { => bpFormalCompletedReceiptCount(queue, expectedDeliveries) == 2 &&
                     servicePluginDispatchSchedulerSnapshotForTest("gitcode-monitor").getOrThrow().settled }), true)
                 let firstStop = stopServicePlugin("gitcode-monitor", reason: "bp-lost-completion-restart", timeoutMillis: 5000)
                 @Expect(firstStop.ok, true)
                 @Expect(s5PidGone(pid), true)
                 @Expect(s5CanBindPort(port), true)
+                let firstTerminalTruth = firstStop.ok && firstStop.status == "stopped" &&
+                    firstStop.leaseStatus == "stopped" && firstStop.portStatus == "released" &&
+                    s5PidGone(pid) && s5CanBindPort(port) && managedStdioBroker().snapshot().ownerCount == 0
+                @Expect(firstTerminalTruth, true)
+                if (!firstTerminalTruth) { return }
+                bpFormalExpectTerminalProof(queue, expectedDeliveries)
                 // Preserve the external effect witness and disk receipts, but erase all
                 // process-local dedupe so durable receipts alone prevent replay effects.
                 resetServicePluginHostForTest()
@@ -1609,10 +1659,10 @@ public class ServicePluginFlowFormalTest {
                 @Expect(dedupeAfterRestart[1], 0)
                 @Expect(dedupeAfterRestart[2], 0)
                 @Expect(dedupeAfterRestart[3], 0)
-                @Expect(bpFormalCompletedReceiptCount(queue), 2)
+                @Expect(bpFormalCompletedReceiptCount(queue, expectedDeliveries), 2)
                 @Expect(effects.snapshot()[0], 2)
                 @Expect(effects.snapshot()[1], 0)
-                println("BP_NATIVE_RESTART_ISOLATION dedupe=${dedupeAfterRestart[0]},${dedupeAfterRestart[1]},${dedupeAfterRestart[2]},${dedupeAfterRestart[3]} completedReceipts=${bpFormalCompletedReceiptCount(queue)} effects=${effects.snapshot()[0]} duplicates=${effects.snapshot()[1]}")
+                println("BP_NATIVE_RESTART_ISOLATION dedupe=${dedupeAfterRestart[0]},${dedupeAfterRestart[1]},${dedupeAfterRestart[2]},${dedupeAfterRestart[3]} completedReceipts=${bpFormalCompletedReceiptCount(queue, expectedDeliveries)} effects=${effects.snapshot()[0]} duplicates=${effects.snapshot()[1]}")
                 @Expect(resetManagedStdioBrokerForTest(timeoutMs: 3000).ok, true)
                 @Expect(registerServicePlugin(ServicePluginRegistration(s5GcmManifest(binary), configRef: ServicePluginConfigRef(
                     configPath: config.toString(), workingDirectory: binary.parent.toString()))).ok, true)
@@ -1631,20 +1681,20 @@ public class ServicePluginFlowFormalTest {
                     if (health[0] == 200 && (health[1] < 0 || health[1] > 2 || health[2] < 0 || health[2] > 524288)) {
                         boundsViolated.store(true)
                     }
-                    bpFormalCount(queue, "processed") == 100
+                    bpFormalCount(queue, "processed", expectedDeliveries) == 100
                 }), true)
                 @Expect(boundsViolated.load(), false)
                 @Expect(effects.snapshot()[0], 100)
                 @Expect(effects.snapshot()[1], 0)
-                @Expect(bpFormalCount(queue, "pending"), 0)
-                @Expect(bpFormalCount(queue, "awaiting-host"), 0)
-                @Expect(bpFormalCount(queue, "processing"), 0)
-                @Expect(bpFormalCount(queue, "dead-letter"), 0)
+                @Expect(bpFormalCount(queue, "pending", expectedDeliveries), 0)
+                @Expect(bpFormalCount(queue, "awaiting-host", expectedDeliveries), 0)
+                @Expect(bpFormalCount(queue, "processing", expectedDeliveries), 0)
+                @Expect(bpFormalCount(queue, "dead-letter", expectedDeliveries), 0)
                 @Expect(s5Get("http://127.0.0.1:${port}/healthz").status, 200)
                 let drainedWindow = bpFormalHealthWindow(port)
                 let currentPid = getServicePluginSnapshot("gitcode-monitor").getOrThrow().pid
                 @Expect(currentPid, pid)
-                println("BP_NATIVE_RECOVERY processed=${bpFormalCount(queue, "processed")} effects=${effects.snapshot()[0]} duplicates=${effects.snapshot()[1]} count=${drainedWindow[1]} bytes=${drainedWindow[2]} pid=${pid} pidStable=${currentPid == pid} boundsViolated=${boundsViolated.load()}")
+                println("BP_NATIVE_RECOVERY processed=${bpFormalCount(queue, "processed", expectedDeliveries)} effects=${effects.snapshot()[0]} duplicates=${effects.snapshot()[1]} count=${drainedWindow[1]} bytes=${drainedWindow[2]} pid=${pid} pidStable=${currentPid == pid} boundsViolated=${boundsViolated.load()}")
                 let stopped = stopServicePlugin("gitcode-monitor", reason: "bp-restart-drained", timeoutMillis: 5000)
                 @Expect(stopped.ok, true)
                 @Expect(stopped.portStatus, "released")
@@ -1656,6 +1706,9 @@ public class ServicePluginFlowFormalTest {
                 @Expect(pidGone, true)
                 @Expect(portReleased, true)
                 @Expect(remainingOwners, 0)
+                if (!stopped.ok || stopped.status != "stopped" || stopped.leaseStatus != "stopped" ||
+                    stopped.portStatus != "released" || !pidGone || !portReleased || remainingOwners != 0) { return }
+                bpFormalExpectTerminalProof(queue, expectedDeliveries)
             } finally {
                 bpFormalReset(gate)
                 if (!formallyStopped) { let _ = stopServicePlugin("gitcode-monitor", reason: "bp-failure-cleanup", timeoutMillis: 5000) }
@@ -1699,10 +1752,10 @@ public class ServicePluginFlowArchitectureTest {
         withServicePluginHostTestHome("s5-bp-path-audit", { home: Path =>
             @Expect(home.toString().startsWith("/tmp/metis-service-plugin-s5-bp-"), true)
             let queue = home.join("bp-path-audit")
-            bpFormalSeed(queue, 3)
-            @Expect(bpFormalCount(queue, "pending"), 3)
-            for (entry in Directory.readFrom(queue.join("pending"))) {
-                let metadata = JsonValue.fromStr(bpFormalRead(entry.path)).asObject()
+            let expectedDeliveries = bpFormalSeed(queue, 3)
+            @Expect(bpFormalCount(queue, "pending", expectedDeliveries), 3)
+            for (id in expectedDeliveries) {
+                let metadata = bpFormalReadKnown(queue.join("pending").join("${id}.json")).getOrThrow()
                 let framePath = metadata.get("hostFramePath").getOrThrow().asString().getValue()
                 @Expect(framePath.startsWith(queue.join("host-frame").toString() + "/"), true)
                 let frame = JsonValue.fromStr(bpFormalRead(Path(framePath))).asObject()
@@ -1735,7 +1788,7 @@ public class ServicePluginFlowUnexpectedExitTest {
             var port: Int64 = 0
             try {
                 let binary = bpFormalArtifact()
-                bpFormalSeed(queue, 6)
+                let expectedDeliveries = bpFormalSeed(queue, 6)
                 port = s5TemporaryPort()
                 let stablePort = port
                 let config = home.join("bp-config.json")
@@ -1751,15 +1804,15 @@ public class ServicePluginFlowUnexpectedExitTest {
                 pid = initial.pid
                 let capturedPid = pid
                 let lease = home.join("service-plugin/runtime/gitcode-monitor").join("${initial.instanceId}.lease.json")
-                @Expect(s5WaitUntil(10000, { => effects.snapshot()[0] == 2 && bpFormalCount(queue, "awaiting-host") == 2 &&
-                    bpFormalCompletedReceiptCount(queue) == 2 &&
+                @Expect(s5WaitUntil(10000, { => effects.snapshot()[0] == 2 && bpFormalCount(queue, "awaiting-host", expectedDeliveries) == 2 &&
+                    bpFormalCompletedReceiptCount(queue, expectedDeliveries) == 2 &&
                     servicePluginDispatchSchedulerSnapshotForTest("gitcode-monitor").getOrThrow().settled }), true)
                 let fullWindow = bpFormalHealthWindow(port)
                 @Expect(fullWindow[0], 200)
                 @Expect(fullWindow[1], 2)
                 @Expect(fullWindow[2] > 0 && fullWindow[2] <= 524288, true)
-                @Expect(bpFormalCount(queue, "pending"), 4)
-                @Expect(bpFormalCount(queue, "processed"), 0)
+                @Expect(bpFormalCount(queue, "pending", expectedDeliveries), 4)
+                @Expect(bpFormalCount(queue, "processed", expectedDeliveries), 0)
                 @Expect(effects.snapshot()[1], 0)
                 // Ownership is checked immediately before signalling only this native child.
                 let owned = capturedPid > 1 && getServicePluginSnapshot("gitcode-monitor").getOrThrow().pid == capturedPid &&
@@ -1767,7 +1820,7 @@ public class ServicePluginFlowUnexpectedExitTest {
                     s5LeaseString(lease, "state") == "running"
                 @Expect(owned, true)
                 if (!owned) { return }
-                println("BP_NATIVE_CRASH_BEFORE count=${fullWindow[1]} bytes=${fullWindow[2]} pending=${bpFormalCount(queue, "pending")} awaiting=${bpFormalCount(queue, "awaiting-host")} receipts=${bpFormalCompletedReceiptCount(queue)} effects=${effects.snapshot()[0]} duplicates=${effects.snapshot()[1]} pid=${capturedPid}")
+                println("BP_NATIVE_CRASH_BEFORE count=${fullWindow[1]} bytes=${fullWindow[2]} pending=${bpFormalCount(queue, "pending", expectedDeliveries)} awaiting=${bpFormalCount(queue, "awaiting-host", expectedDeliveries)} receipts=${bpFormalCompletedReceiptCount(queue, expectedDeliveries)} effects=${effects.snapshot()[0]} duplicates=${effects.snapshot()[1]} pid=${capturedPid}")
                 let killExit = executeWithOutput("kill", ["-KILL", "${capturedPid}"])[0]
                 @Expect(killExit, 0)
                 if (killExit != 0) { return }
@@ -1798,6 +1851,7 @@ public class ServicePluginFlowUnexpectedExitTest {
                     s5LeaseString(lease, "state") == "stopped"
                 @Expect(cleanupTruth, true)
                 if (!cleanupTruth) { return }
+                bpFormalExpectTerminalProof(queue, expectedDeliveries)
                 // Keep the real host registry/broker so the next instance receives
                 // a new session; only dispatcher memory dedupe is erased.
                 resetServicePluginGeneratedReplyStateForTest()
@@ -1806,7 +1860,7 @@ public class ServicePluginFlowUnexpectedExitTest {
                 @Expect(dedupe[1], 0)
                 @Expect(dedupe[2], 0)
                 @Expect(dedupe[3], 0)
-                @Expect(bpFormalCompletedReceiptCount(queue), 2)
+                @Expect(bpFormalCompletedReceiptCount(queue, expectedDeliveries), 2)
                 @Expect(effects.snapshot()[0], 2)
                 bpFormalInstall(gate, effects)
                 setServicePluginBeforeCompletionAckHookForTest(None<(String) -> Bool>)
@@ -1823,17 +1877,17 @@ public class ServicePluginFlowUnexpectedExitTest {
                     if (health[0] == 200 && (health[1] < 0 || health[1] > 2 || health[2] < 0 || health[2] > 524288)) {
                         boundsViolated.store(true)
                     }
-                    bpFormalCount(queue, "processed") == 6
+                    bpFormalCount(queue, "processed", expectedDeliveries) == 6
                 }), true)
                 @Expect(boundsViolated.load(), false)
                 @Expect(effects.snapshot()[0], 6)
                 @Expect(effects.snapshot()[1], 0)
-                @Expect(bpFormalCount(queue, "pending"), 0)
-                @Expect(bpFormalCount(queue, "processing"), 0)
-                @Expect(bpFormalCount(queue, "awaiting-host"), 0)
-                @Expect(bpFormalCount(queue, "dead-letter"), 0)
+                @Expect(bpFormalCount(queue, "pending", expectedDeliveries), 0)
+                @Expect(bpFormalCount(queue, "processing", expectedDeliveries), 0)
+                @Expect(bpFormalCount(queue, "awaiting-host", expectedDeliveries), 0)
+                @Expect(bpFormalCount(queue, "dead-letter", expectedDeliveries), 0)
                 let drained = bpFormalHealthWindow(port)
-                println("BP_NATIVE_CRASH_RECOVERED processed=${bpFormalCount(queue, "processed")} effects=${effects.snapshot()[0]} duplicates=${effects.snapshot()[1]} count=${drained[1]} bytes=${drained[2]} boundsViolated=${boundsViolated.load()}")
+                println("BP_NATIVE_CRASH_RECOVERED processed=${bpFormalCount(queue, "processed", expectedDeliveries)} effects=${effects.snapshot()[0]} duplicates=${effects.snapshot()[1]} count=${drained[1]} bytes=${drained[2]} boundsViolated=${boundsViolated.load()}")
                 let stopped = stopServicePlugin("gitcode-monitor", reason: "bp-unexpected-exit-recovered", timeoutMillis: 5000)
                 @Expect(stopped.ok, true)
                 @Expect(stopped.status, "stopped")
@@ -1848,6 +1902,7 @@ public class ServicePluginFlowUnexpectedExitTest {
                 @Expect(finalTruth, true)
                 formallyStopped = finalTruth
                 if (!finalTruth) { return }
+                bpFormalExpectTerminalProof(queue, expectedDeliveries)
             } finally {
                 bpFormalReset(gate)
                 if (!formallyStopped) { let _ = stopServicePlugin("gitcode-monitor", reason: "bp-unexpected-exit-fallback", timeoutMillis: 5000) }
