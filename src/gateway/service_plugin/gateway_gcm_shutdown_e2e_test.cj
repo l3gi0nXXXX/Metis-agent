@@ -1357,14 +1357,11 @@ private func bpFormalSeed(queue: Path, count: Int64): Unit {
             ("url", "https://example.invalid/issues/${index}"), ("author", "synthetic-user")]) {
             payload.put(key, JsonString(value))
         }
-        let frame = JsonObject()
-        for ((key, value) in [("type", "event"), ("frameId", "seed-${index}"), ("serviceId", "gitcode-monitor"),
-            ("method", "emitCapabilityEvent"), ("capabilityId", "gitcode.event.accepted"), ("correlationId", "seed-${index}")]) {
-            frame.put(key, JsonString(value))
-        }
-        frame.put("payload", payload)
+        let frame = ServiceFrame("event", "seed-${index}", "gitcode-monitor",
+            method: "emitCapabilityEvent", capabilityId: "gitcode.event.accepted",
+            correlationId: "seed-${index}", payload: payload.toJsonString())
         let framePath = queue.join("host-frame").join("${id}.jsonl")
-        File.writeTo(framePath, (frame.toJsonString() + "\n").toArray())
+        File.writeTo(framePath, encodeServiceFrame(frame).toArray())
         let metadata = JsonObject()
         for ((key, value) in [("deliveryId", id), ("endpointId", "main"), ("eventName", "Issue Hook"),
             ("bodyHash", "synthetic-hash"), ("payloadPath", ""), ("status", "pending"), ("lastError", "host_retry"),
@@ -1473,9 +1470,9 @@ public class ServicePluginFlowFormalTest {
     public func bpS3B1E2E01E2E02TenThousandDurableEventsStayBoundedAndHttpSurvives(): Unit {
         resetServicePluginHostForTest()
         @Expect(resetManagedStdioBrokerForTest(timeoutMs: 3000).ok, true)
-        var ownedHome = Path("")
+        let ownedHomes = ArrayList<Path>()
         withServicePluginHostTestHome("s5-bp-ten-thousand", { home: Path =>
-            ownedHome = home
+            ownedHomes.add(home)
             let oldLogFile = Config.logFile
             let gate = S5GeneratedReplyGate()
             let effects = BpFormalEffects()
@@ -1538,16 +1535,16 @@ public class ServicePluginFlowFormalTest {
                 Config.logFile = oldLogFile
             }
         })
-        @Expect(s5RemoveOwnedTempHome(ownedHome), true)
+        @Expect(s5RemoveOwnedTempHome(ownedHomes[0]), true)
     }
 
     @TestCase
     public func bpS3P1E2E03OneHundredResumeAfterLostCompletionWithoutDuplicateEffects(): Unit {
         resetServicePluginHostForTest()
         @Expect(resetManagedStdioBrokerForTest(timeoutMs: 3000).ok, true)
-        var ownedHome = Path("")
+        let ownedHomes = ArrayList<Path>()
         withServicePluginHostTestHome("s5-bp-receipt-restart", { home: Path =>
-            ownedHome = home
+            ownedHomes.add(home)
             let oldLogFile = Config.logFile
             let gate = S5GeneratedReplyGate()
             let effects = BpFormalEffects()
@@ -1593,8 +1590,9 @@ public class ServicePluginFlowFormalTest {
                 // 100 messages require >=49.5s at the production500ms spacing.
                 // 90s includes process startup, receipt reconciliation and disk IO margin.
                 let boundsViolated = AtomicBool(false)
+                let stablePort = port
                 @Expect(s5WaitUntil(90000, { =>
-                    let health = bpFormalHealthWindow(port)
+                    let health = bpFormalHealthWindow(stablePort)
                     if (health[0] == 200 && (health[1] < 0 || health[1] > 2 || health[2] < 0 || health[2] > 524288)) {
                         boundsViolated.store(true)
                     }
@@ -1624,7 +1622,7 @@ public class ServicePluginFlowFormalTest {
                 Config.logFile = oldLogFile
             }
         })
-        @Expect(s5RemoveOwnedTempHome(ownedHome), true)
+        @Expect(s5RemoveOwnedTempHome(ownedHomes[0]), true)
     }
 }
 
