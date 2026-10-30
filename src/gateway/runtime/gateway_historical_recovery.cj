@@ -136,9 +136,9 @@ private func gatewayHistoricalSurfaceTerminal(completion: GatewayServeCompletion
     ["stopped", "not_applicable"].contains(completion.inboundStatus) &&
         ["stopped", "not_applicable"].contains(completion.compatStatus) &&
         ["stopped", "already_stopped", "disabled", "not_applicable"].contains(completion.sidecarStatus) &&
-        ["sent", "stopped", "not_applicable", "terminal"].contains(completion.servicePluginIngressStatus) &&
+        ["sent", "stopped", "not_applicable", "terminal", "cleanup_pending"].contains(completion.servicePluginIngressStatus) &&
         ["cleanup_pending", "drained", "cancelled", "stopped", "not_applicable", "terminal"].contains(completion.servicePluginDispatchStatus) &&
-        ["stopped", "already_stopped", "graceful_exited", "terminated", "force_terminated", "not_applicable", "terminal"].contains(completion.servicePluginOwnerStatus) &&
+        ["stopped", "already_stopped", "graceful_exited", "terminated", "force_terminated", "not_applicable", "terminal", "cleanup_pending"].contains(completion.servicePluginOwnerStatus) &&
         ["stopped", "not_applicable"].contains(completion.channelsStatus) &&
         ["stopped", "already_stopped", "not_applicable"].contains(completion.httpStatus) &&
         ["stopped", "already_stopped", "not_applicable"].contains(completion.canvasStatus) &&
@@ -206,6 +206,10 @@ public func gatewayCollectHistoricalRecoveryEvidence(deadline: MonoTime): Gatewa
     parentStatus = probe.status
     if (!probe.conclusive) { return fail(probe.status, parentStatus, rawPortStatus) }
     if (probe.alive) { return fail("identity_alive", parentStatus, rawPortStatus) }
+    // An interrupted owner shutdown needs live lease/PID/port proof, even when
+    // the old aggregate lease fields claim terminal. Never trust that shortcut.
+    let allowStaleActiveLease = completion.servicePluginIngressStatus == "cleanup_pending" ||
+        completion.servicePluginOwnerStatus == "cleanup_pending"
     let leaseTerminal = ["stopped", "not_applicable", "terminal"].contains(completion.servicePluginLeaseStatus) &&
         ["released", "not_applicable", "terminal"].contains(completion.servicePluginPortStatus)
     if (!leaseTerminal &&
@@ -213,13 +217,14 @@ public func gatewayCollectHistoricalRecoveryEvidence(deadline: MonoTime): Gatewa
         !["released", "not_applicable", "terminal", "cleanup_pending"].contains(completion.servicePluginPortStatus))) {
         return fail("resources_not_terminal", parentStatus, rawPortStatus)
     }
-    if (leaseTerminal) {
+    if (leaseTerminal && !allowStaleActiveLease) {
         let port = gatewayServePortReleasedUntil(gatewayConfiguredServePort(), deadline)
         rawPortStatus = port.portStatus
         if (!port.ok) { return fail(port.portStatus, parentStatus, rawPortStatus) }
         return fail("recoverable", parentStatus, rawPortStatus)
     }
-    let host = probeServicePluginHistoricalResources(identity.pid, identity.startedAtMs, deadline)
+    let host = probeServicePluginHistoricalResources(identity.pid, identity.startedAtMs, deadline,
+        allowStaleActiveLease: allowStaleActiveLease)
     if (host.terminal && host.conclusive) {
         let port = gatewayServePortReleasedUntil(gatewayConfiguredServePort(), deadline)
         rawPortStatus = port.portStatus
@@ -265,8 +270,8 @@ public func gatewayArchiveHistoricalServeCompletion(evidence: GatewayHistoricalR
             case Some(host) =>
                 detail += "leaseCount:${host.matchedCount}\n"
                 for (lease in host.evidence) {
-                    // Numeric identity and fixed terminal state only: no paths, argv, or business payload.
-                    detail += "lease:${lease.pid}:${lease.parentPid}:${lease.startedAtMs}:${lease.port}:stopped\n"
+                    // Keep the validated historical state distinct from the observed terminal resources.
+                    detail += "lease:${lease.pid}:${lease.parentPid}:${lease.startedAtMs}:${lease.port}:${lease.state}\n"
                 }
             case None => detail += "leaseCount:0\n"
         }
@@ -286,9 +291,12 @@ public func gatewayCommitHistoricalRecovery(evidence: GatewayHistoricalRecoveryE
         let checked = gatewayEvaluateHistoricalRecoveryEvidence(current)
         if (!checked.ok) { return checked }
         if (current.parsed.original != evidence.parsed.original) { return GatewayServeCompletionReconcileResult(false, "identity_changed") }
+        let allowStaleActiveLease = current.parsed.completion.servicePluginIngressStatus == "cleanup_pending" ||
+            current.parsed.completion.servicePluginOwnerStatus == "cleanup_pending"
         match (evidence.host) {
             case Some(host) =>
-                let revalidated = revalidateServicePluginHistoricalEvidence(host, deadline)
+                let revalidated = revalidateServicePluginHistoricalEvidence(host, deadline,
+                    allowStaleActiveLease: allowStaleActiveLease)
                 if (!revalidated.terminal) { return GatewayServeCompletionReconcileResult(false, revalidated.status) }
             case None => ()
         }
@@ -304,7 +312,8 @@ public func gatewayCommitHistoricalRecovery(evidence: GatewayHistoricalRecoveryE
         if (!finalChecked.ok) { return finalChecked }
         match (current.host) {
             case Some(host) =>
-                let revalidated = revalidateServicePluginHistoricalEvidence(host, deadline)
+                let revalidated = revalidateServicePluginHistoricalEvidence(host, deadline,
+                    allowStaleActiveLease: allowStaleActiveLease)
                 if (!revalidated.terminal) { return GatewayServeCompletionReconcileResult(false, revalidated.status) }
             case None => ()
         }

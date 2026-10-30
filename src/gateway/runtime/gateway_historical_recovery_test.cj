@@ -15,6 +15,177 @@ import std.sync.AtomicInt64
 import std.time.{DateTime, MonoTime}
 import std.unittest.testmacro.*
 
+// This is the historical snapshot shape left by an interrupted plugin shutdown.
+private func hr30WritePendingMarker(home: Path, identity: GatewayServeIdentity): String {
+    let original = hrRuntimeWriteMarker(identity, legacy: false, broker: "stopped")
+        .replace("servicePluginIngressStatus:sent", "servicePluginIngressStatus:cleanup_pending")
+        .replace("servicePluginOwnerStatus:terminated", "servicePluginOwnerStatus:cleanup_pending")
+        .replace("canvasStatus:stopped", "canvasStatus:already_stopped")
+    File.writeTo(home.join("gateway-serve.stop-complete"), original.toArray())
+    original
+}
+
+@Test
+public class GatewayHistoricalPendingRecoveryTest {
+    @TestCase
+    public func hr30U1PendingSnapshotAndRunningLeaseAreRecoverable(): Unit {
+        hrRuntimeHome({ home, identity =>
+            let original = hr30WritePendingMarker(home, identity)
+            let lease = hrRuntimeWriteLease(home, identity, state: "running")
+            let leaseBytes = File.readFrom(lease)
+            let evidence = gatewayCollectHistoricalRecoveryEvidence(MonoTime.now() + Duration.second)
+            @Expect(evidence.parsed.ok, true)
+            @Expect(evidence.status, "recoverable")
+            @Expect(evidence.parsed.completion.status, "cleanup_pending")
+            @Expect(File.readFrom(lease), leaseBytes)
+            @Expect(String.fromUtf8(File.readFrom(home.join("gateway-serve.stop-complete"))), original)
+        })
+    }
+
+    @TestCase
+    public func hr30P1ArchivePreservesPendingHistoryAndRunningLease(): Unit {
+        hrRuntimeHome({ home, identity =>
+            @Expect(gatewayAcquireServeLockForRunningProcess(), true)
+            let original = hr30WritePendingMarker(home, identity)
+            let lease = hrRuntimeWriteLease(home, identity, state: "running")
+            let leaseBytes = File.readFrom(lease)
+            let business = home.join("pending-business.json")
+            File.writeTo(business, "待处理中文🧪".toArray())
+            let evidence = gatewayCollectHistoricalRecoveryEvidence(MonoTime.now() + Duration.second)
+            @Expect(evidence.status, "recoverable")
+            @Expect(gatewayCommitHistoricalRecovery(evidence, MonoTime.now() + Duration.second * 3).status, "reconciled")
+            @Expect(exists(home.join("gateway-serve.stop-complete")), false)
+            @Expect(File.readFrom(lease), leaseBytes)
+            @Expect(String.fromUtf8(File.readFrom(business)), "待处理中文🧪")
+            var originals: Int64 = 0
+            var summaries: Int64 = 0
+            for (entry in Directory.readFrom(home.join("gateway-serve.recovery-history"))) {
+                let text = String.fromUtf8(File.readFrom(entry.path))
+                if (entry.name.endsWith(".completion")) {
+                    originals += 1
+                    @Expect(text, original)
+                } else if (entry.name.endsWith(".evidence")) {
+                    summaries += 1
+                    @Expect(text.contains("resourceStatus:terminal"), true)
+                    @Expect(text.contains("lease:987654322:${identity.pid}:2000:0:running\n"), true)
+                    @Expect(text.contains("lease:987654322:${identity.pid}:2000:0:stopped\n"), false)
+                    @Expect(text.contains(home.toString()), false)
+                    @Expect(text.contains(identity.nonce), false)
+                }
+            }
+            @Expect(originals, 1)
+            @Expect(summaries, 1)
+        })
+    }
+
+    @TestCase
+    public func hr30B1PendingSurfaceCannotSkipLeaseEvidence(): Unit {
+        hrRuntimeHome({ home, identity =>
+            let pending = hr30WritePendingMarker(home, identity)
+            let aggregate = pending.replace("servicePluginLeaseStatus:cleanup_pending", "servicePluginLeaseStatus:terminal")
+                .replace("servicePluginPortStatus:cleanup_pending", "servicePluginPortStatus:terminal")
+            File.writeTo(home.join("gateway-serve.stop-complete"), aggregate.toArray())
+            @Expect(gatewayHistoricalServeCompletionRecoveryStatus().status, "resources_not_terminal")
+            let _ = hrRuntimeWriteLease(home, identity, state: "running")
+            setServicePluginPidProbeCommandForTest(Some({ _, _ => (0, "", "") }))
+            @Expect(gatewayHistoricalServeCompletionRecoveryStatus().status, "pid_alive")
+            setServicePluginPidProbeCommandForTest(Some({ _, _ => (1, "", "No such process") }))
+            @Expect(gatewayHistoricalServeCompletionRecoveryStatus().status, "recoverable")
+            @Expect(gatewayCollectHistoricalRecoveryEvidence(MonoTime.now()).status, "deadline_exceeded")
+            @Expect(String.fromUtf8(File.readFrom(home.join("gateway-serve.stop-complete"))), aggregate)
+        })
+    }
+
+    @TestCase
+    public func hr30N1ActiveOrUnknownResourcesKeepRestartBlocked(): Unit {
+        hrRuntimeHome({ home, identity =>
+            let original = hr30WritePendingMarker(home, identity)
+            let lease = hrRuntimeWriteLease(home, identity, state: "running")
+            let leaseText = String.fromUtf8(File.readFrom(lease))
+            let launches = AtomicInt64(0)
+            setServicePluginPidProbeCommandForTest(Some({ _, _ => (0, "", "") }))
+            @Expect(gatewayHistoricalServeCompletionRecoveryStatus().status, "pid_alive")
+            @Expect(gatewayExecuteRestartServe(launchServe: { => launches.fetchAdd(1); true }), 1)
+            @Expect(launches.load(), 0)
+            setServicePluginPidProbeCommandForTest(Some({ _, _ => (1, "", "Operation not permitted") }))
+            @Expect(gatewayHistoricalServeCompletionRecoveryStatus().status, "pid_probe_permission_denied")
+            setServicePluginPidProbeCommandForTest(Some({ _, _ => (1, "", "No such process") }))
+            File.writeTo(lease, leaseText.replace("\"port\":0", "\"port\":${gatewayConfiguredServePort()}").toArray())
+            setServicePluginPortReleaseCommandForTest(Some({ _, _, _ => (0, "p123", "") }))
+            @Expect(gatewayHistoricalServeCompletionRecoveryStatus().status, "port_active")
+            setServicePluginPortReleaseCommandForTest(Some({ _, _, _ => (1, "", "") }))
+            File.writeTo(lease, leaseText.toArray())
+            setGatewayServePortProbeForTest(Some({ _, _ => (0, "123", "") }))
+            @Expect(gatewayHistoricalServeCompletionRecoveryStatus().status, "port_release_timeout")
+            setGatewayServePortProbeForTest(Some({ _, _ => (1, "partial output", "") }))
+            @Expect(gatewayHistoricalServeCompletionRecoveryStatus().status, "port_probe_failed")
+            setGatewayServePortProbeForTest(Some({ _, _ => (1, "", "") }))
+            for (field in ["servicePluginIngressStatus:cleanup_pending", "servicePluginOwnerStatus:cleanup_pending"]) {
+                for (invalid in ["close_failed", "timeout", "unknown"]) {
+                    File.writeTo(home.join("gateway-serve.stop-complete"), original.replace(field, "${field.split(":")[0]}:${invalid}").toArray())
+                    @Expect(gatewayHistoricalServeCompletionRecoveryStatus().status, "resources_not_terminal")
+                }
+            }
+            File.writeTo(home.join("gateway-serve.stop-complete"), original.toArray())
+            let current = currentProcessInstanceIdentity().getOrThrow()
+            let alive = GatewayServeIdentity(current.pid, 1000, "活跃父实例🧪", processIdentity: Some(current))
+            let _ = hr30WritePendingMarker(home, alive)
+            @Expect(gatewayHistoricalServeCompletionRecoveryStatus().status, "identity_alive")
+        })
+    }
+
+    @TestCase
+    public func hr30N2PendingCommitRejectsReplacedLeaseAfterArchive(): Unit {
+        hrRuntimeHome({ home, identity =>
+            @Expect(gatewayAcquireServeLockForRunningProcess(), true)
+            let original = hr30WritePendingMarker(home, identity)
+            let lease = hrRuntimeWriteLease(home, identity, state: "running")
+            let before = String.fromUtf8(File.readFrom(lease))
+            let evidence = gatewayCollectHistoricalRecoveryEvidence(MonoTime.now() + Duration.second)
+            @Expect(evidence.status, "recoverable")
+            let replacement = before.replace("2000", "2001")
+            let result = gatewayCommitHistoricalRecovery(evidence, MonoTime.now() + Duration.second * 3,
+                afterArchive: { => File.writeTo(lease, replacement.toArray()) })
+            @Expect(result.status, "identity_changed")
+            @Expect(result.ok, false)
+            @Expect(String.fromUtf8(File.readFrom(lease)), replacement)
+            @Expect(String.fromUtf8(File.readFrom(home.join("gateway-serve.stop-complete"))), original)
+        })
+    }
+
+    @TestCase
+    public func hr30E2eRestartReconcilesPendingSnapshotBeforeLaunch(): Unit {
+        hrRuntimeHome({ home, identity =>
+            let original = hr30WritePendingMarker(home, identity)
+            let lease = hrRuntimeWriteLease(home, identity, state: "running")
+            let leaseBytes = File.readFrom(lease)
+            @Expect(gatewayExecuteStopServe(), 0)
+            @Expect(String.fromUtf8(File.readFrom(home.join("gateway-serve.stop-complete"))), original)
+            @Expect(exists(home.join("gateway-serve.recovery-history")), false)
+            let launches = AtomicInt64(0)
+            @Expect(gatewayExecuteRestartServe(launchServe: { =>
+                launches.fetchAdd(1)
+                gatewayAcquireServeLockForRunningProcess()
+            }), 0)
+            @Expect(launches.load(), 1)
+            @Expect(gatewayOwnsCurrentServeLock(), true)
+            @Expect(exists(home.join("gateway-serve.stop-complete")), false)
+            @Expect(File.readFrom(lease), leaseBytes)
+            gatewayReleaseServeLockQuiet()
+            @Expect(gatewayPendingServeCompletionStatus(), "missing")
+            @Expect(gatewayAcquireServeLockForRunningProcess(), true)
+            var archived: Int64 = 0
+            for (entry in Directory.readFrom(home.join("gateway-serve.recovery-history"))) {
+                if (entry.name.endsWith(".completion")) {
+                    archived += 1
+                    @Expect(String.fromUtf8(File.readFrom(entry.path)), original)
+                }
+            }
+            @Expect(archived, 1)
+        })
+    }
+}
+
 func hrRuntimeHome(block: (Path, GatewayServeIdentity) -> Unit): Unit {
     synchronized(MetisProcessEnvironmentLock) {
         let home = Path("/tmp/metis-hr-runtime-${DateTime.now().toUnixTimeStamp().toNanoseconds()}")

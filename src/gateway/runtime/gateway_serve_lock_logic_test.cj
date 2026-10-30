@@ -2651,6 +2651,79 @@ private func gatewayTgStopScenario(name: String, accountCount: Int64, seedInboun
 @Test
 public class GatewayServeLockLogicTest {
     @TestCase
+    public func hr30E2eNativePendingHistoryStartsAndStopsCleanly(): Unit {
+        withHrFormalEnvironment("hr30-native-pending", { home, _ =>
+            let formal = HrFormalGateway(home)
+            try {
+                let ready = home.join("hr30-recovered.ready")
+                formal.configure(["service", ready.toString(), home.join("hr30-recovered.release").toString(),
+                    home.join("hr30-recovered.stop").toString()])
+                let platform = currentProcessInstanceIdentity().getOrThrow().platform
+                let identity = GatewayServeIdentity(987654321, 1000, "历史未完成🧪",
+                    processIdentity: Some(ProcessInstanceIdentity(platform, 987654321)))
+                @Expect(gatewayServeStopPidAlive(identity.pid), false)
+                @Expect(gatewayServeStopPidAlive(987654322), false)
+                let original = hrRuntimeWriteMarker(identity, legacy: false, broker: "stopped")
+                    .replace("servicePluginIngressStatus:sent", "servicePluginIngressStatus:cleanup_pending")
+                    .replace("servicePluginOwnerStatus:terminated", "servicePluginOwnerStatus:cleanup_pending")
+                File.writeTo(home.join("gateway-serve.stop-complete"), original.toArray())
+                let oldPort = gatewayServeStopTemporaryPort()
+                @Expect(oldPort > 0, true)
+                @Expect(gatewayServeStopPortListening(oldPort), false)
+                let directory = home.join("service-plugin/runtime/gitcode-monitor")
+                Directory.create(directory, recursive: true)
+                // A separate historical session preserves its bytes when the new session starts.
+                let lease = directory.join("gitcode-monitor-history-hr30.lease.json")
+                let leaseBytes = ("{\"pluginId\":\"gitcode-monitor\",\"sessionId\":\"gitcode-monitor-history-hr30\"," +
+                    "\"pid\":987654322,\"parentPid\":${identity.pid},\"startedAtMs\":2000,\"port\":${oldPort},\"state\":\"running\"}").toArray()
+                File.writeTo(lease, leaseBytes)
+                let business = home.join("historical-business.pending")
+                File.writeTo(business, "历史待处理中文🧪".toArray())
+                @Expect(gatewayExecuteStopServe(), 0)
+                @Expect(hrFormalRead(home.join("gateway-serve.stop-complete")), original)
+                @Expect(File.readFrom(lease), leaseBytes)
+                let launches = AtomicInt64(0)
+                @Expect(gatewayExecuteRestartServe(launchServe: { =>
+                    launches.fetchAdd(1)
+                    let _ = formal.startService("hr30-recovered")
+                    true
+                }), 0)
+                @Expect(launches.load(), 1)
+                @Expect(exists(home.join("gateway-serve.stop-complete")), false)
+                let originals = hrFormalArchiveOriginals(home)
+                @Expect(originals.size, 1)
+                @Expect(originals[0], original)
+                @Expect(File.readFrom(lease), leaseBytes)
+                @Expect(hrFormalRead(business), "历史待处理中文🧪")
+                var reconciled: Int64 = 0
+                for (row in hrFormalRead(home.join("formal-gateway.log")).split("\n")) {
+                    if (row.contains("gateway.recovery.reconciled")) { reconciled += 1 }
+                }
+                @Expect(reconciled, 1)
+                var summaries: Int64 = 0
+                for (entry in Directory.readFrom(home.join("gateway-serve.recovery-history"))) {
+                    if (entry.name.endsWith(".evidence")) {
+                        summaries += 1
+                        @Expect(hrFormalRead(entry.path).contains("lease:987654322:${identity.pid}:2000:${oldPort}:running\n"), true)
+                    }
+                }
+                @Expect(summaries, 1)
+                let newPid = hrFormalNumber(ready, "pid")
+                @Expect(newPid > 1 && newPid != 987654322, true)
+                let stopped = formal.stopCurrent(0)
+                @Expect(gatewayServePayloadField(stopped, "status"), "graceful")
+                @Expect(gatewayServePayloadField(stopped, "fullTerminal"), "1")
+                @Expect(gatewayServeStopPidAlive(newPid), false)
+                let newLease = directory.join("gitcode-monitor-1.lease.json")
+                @Expect(JsonValue.fromStr(hrFormalRead(newLease)).asObject().get("state").getOrThrow().asString().getValue(), "stopped")
+                @Expect(File.readFrom(lease), leaseBytes)
+                @Expect(hrFormalRead(business), "历史待处理中文🧪")
+                formal.assertClean()
+            } finally { formal.cleanup() }
+        })
+    }
+
+    @TestCase
     public func tgStopS0B1NoInboundSkipsConfirmation(): Unit {
         gatewayTgStopScenario("s0-b1-no-inbound", 1, false, true)
     }
